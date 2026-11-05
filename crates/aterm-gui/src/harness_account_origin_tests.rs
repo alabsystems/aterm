@@ -315,7 +315,7 @@ fn the_exit_relaunch_waits_for_fallback_and_updates_its_saved_snapshot() {
         asked: None,
     });
     let calls = AtomicUsize::new(0);
-    let act = |snap: &Snapshot| {
+    let act = |snap: &Snapshot, _: Option<&relaunch::Admission<'_>>| {
         calls.fetch_add(1, Ordering::SeqCst);
         assert!(snap.login.is_none());
         "adopted".to_string()
@@ -423,7 +423,7 @@ fn the_host_exit_loop_retries_a_blocked_account_fallback() {
     let counted = Arc::clone(&relaunched);
     let world = Arc::clone(&a);
     let writer = Arc::clone(&held);
-    hooks.acts.relaunch = Arc::new(move |sid, _, snap, _, _, _, _| {
+    hooks.acts.relaunch = Arc::new(move |sid, _, snap, _, _, _, _, _| {
         assert!(writer.lock().unwrap().is_none());
         assert!(
             snap.login.is_none(),

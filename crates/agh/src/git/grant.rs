@@ -292,6 +292,7 @@ pub(crate) fn write(
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(&tmp)
         .and_then(|mut file| file.write_all(grant.to_json().as_bytes()))
         .and_then(|()| std::fs::hard_link(&tmp, &path));
@@ -338,6 +339,7 @@ pub(crate) fn sweep(dirs: &Dirs, now: u64) {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
+    let judged = aterm_uds::private_file::JudgedDir::judge(&dir).ok();
     for entry in entries.flatten().take(SWEEP_MAX) {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -350,7 +352,10 @@ pub(crate) fn sweep(dirs: &Dirs, now: u64) {
         let Some(nonce) = name.strip_suffix(GRANT_SUFFIX) else {
             continue;
         };
-        let Ok(bytes) = aterm_uds::private_file::read_private(&dir, name, GRANT_FILE_MAX) else {
+        let Some(Ok(bytes)) = judged
+            .as_ref()
+            .map(|judged| judged.read(name, GRANT_FILE_MAX))
+        else {
             continue;
         };
         let stale = Grant::from_json(nonce, &bytes).is_none_or(|grant| grant.expires_at < now);
@@ -368,7 +373,7 @@ fn is_stale_staging(entry: &std::fs::DirEntry, name: &str, now: u64) -> bool {
         .strip_prefix('.')
         .and_then(|rest| rest.strip_suffix(TMP_SUFFIX))
         .is_some_and(is_nonce);
-    if !staged {
+    if !staged || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
         return false;
     }
     let Ok(meta) = entry.metadata() else {

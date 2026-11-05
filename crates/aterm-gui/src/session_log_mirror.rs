@@ -523,7 +523,7 @@ struct Copied {
     copy: BusCopy,
 }
 
-/// `log-take …`: the bridge-only take ([`crate::control`]'s dispatch hands it the lane's generation), answered `OK <bytes> slots=<k> [more=1] [due=<ms>]`: `due=` says when the soonest snapshot a session's mail rate held back is due (`aterm_slog::BusCopy::due_in_ms`), so the bridge takes again then.
+/// `log-take …`: the bridge-only take ([`crate::control`]'s dispatch hands it the lane's generation), answered `OK <bytes> slots=<k> [more=1] [due=<ms>] [held=<sid>[,<sid>…]]`: `due=` says when the soonest snapshot a session's mail rate held back is due (`aterm_slog::BusCopy::due_in_ms`), so the bridge takes again then, and `held=` names every session whose snapshot it held back, since the rate is each session's own: a wake of any other session may owe its snapshot at once (critic item E04c's review).
 pub(crate) fn cmd_log_take(
     store: &crate::session_store::Store,
     rest: &str,
@@ -570,6 +570,8 @@ fn take_owned(store: &crate::session_store::Store, req: TakeRequest) -> String {
     let mut room = req.n;
     let mut more = false;
     let mut due = u64::MAX;
+    // The rate is each session's own, so the answer names whose snapshot it holds back.
+    let mut held: Vec<String> = Vec::new();
     let mut copies: Vec<Copied> = Vec::new();
     for (_, sid, ctx) in &live {
         if room == 0 {
@@ -588,7 +590,10 @@ fn take_owned(store: &crate::session_store::Store, req: TakeRequest) -> String {
         let copy = tl.slog_mut().mirror_log().bus_copy(room, now);
         drop(tl);
         more |= copy.more();
-        due = due.min(copy.due_in_ms().unwrap_or(u64::MAX));
+        if let Some(ms) = copy.due_in_ms() {
+            due = due.min(ms);
+            held.push(sid.clone());
+        }
         room = room.saturating_sub(copy.len());
         if !copy.is_empty() {
             copies.push(Copied {
@@ -609,7 +614,10 @@ fn take_owned(store: &crate::session_store::Store, req: TakeRequest) -> String {
             }
             let copy = tail.log.bus_copy(room, now);
             more |= copy.more();
-            due = due.min(copy.due_in_ms().unwrap_or(u64::MAX));
+            if let Some(ms) = copy.due_in_ms() {
+                due = due.min(ms);
+                held.push(tail.sid.clone());
+            }
             room = room.saturating_sub(copy.len());
             if !copy.is_empty() {
                 copies.push(Copied {
@@ -647,7 +655,12 @@ fn take_owned(store: &crate::session_store::Store, req: TakeRequest) -> String {
     } else {
         format!(" due={due}")
     };
-    format!("OK {} slots={slots}{more}{due}\n{body}", body.len())
+    let held = if held.is_empty() {
+        String::new()
+    } else {
+        format!(" held={}", held.join(","))
+    };
+    format!("OK {} slots={slots}{more}{due}{held}\n{body}", body.len())
 }
 
 fn push_slot(out: &mut String, sid: &str, s: &Slot) {

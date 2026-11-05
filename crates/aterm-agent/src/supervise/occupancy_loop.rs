@@ -1018,8 +1018,7 @@ impl<C: Ctl> Session<'_, C> {
         guards.halted = seen.halted;
         // A line this loop gave up on undrawn holds every line at a break as a draft does: it may
         // still come, and a line behind it would join it (`turn_end_loop::Custody`).
-        guards.draft |=
-            seen.input_unread || self.custody.is_some() || self.door_draft(screen) != Some(false);
+        guards.draft |= seen.input_unread || self.custody.is_some() || self.door_draft(screen);
         guards.taskless |= host.taskless();
         // The reach read afresh too: the loop's own is its last point's, spent once the agent
         // moves on from it (a typed act, restart or dialog key there, or a turn read running:
@@ -1057,16 +1056,20 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Whether the composer the break's screen draws holds a draft: `Some(true)` a draft,
-    /// `None` unknown — which the door reads as a draft.
-    pub(super) fn door_draft(&mut self, screen: &Screen) -> Option<bool> {
+    /// Whether the composer the break's screen draws holds a draft as the door reads it: typed
+    /// text, or a read that cannot say, which is no empty composer to write into. Where the rows
+    /// and the cursor alone say typed ([`draft_read`]) no cell is asked; elsewhere the glyph's
+    /// cell says ([`Self::composer_draft`]). No composer drawn holds none.
+    pub(super) fn door_draft(&mut self, screen: &Screen) -> bool {
         let reader = self.reader(&screen.rows);
-        let reading = reader.read(&screen.rows, Some(screen.cursor_col));
-        let (placeholder, hint_fg) = (
-            reading.program.reader().placeholder(),
-            reading.program.reader().placeholder_fg(),
-        );
-        self.composer_draft(reading.composer.as_ref(), placeholder, hint_fg, screen)
+        let composer = reader.composer(&screen.rows);
+        draft_read(composer.as_ref(), reader.placeholder(), screen) == Some(true)
+            || self.composer_draft(
+                composer.as_ref(),
+                reader.placeholder(),
+                reader.placeholder_fg(),
+                screen,
+            ) != Some(false)
     }
 
     /// The write itself, every guard passed: the intent row, the fenced write, and after it the

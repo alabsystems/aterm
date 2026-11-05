@@ -338,3 +338,89 @@ fn a_blind_try_on_a_witness_landing_as_it_is_typed_latches_nothing() {
         "the measured line on a witness is said"
     );
 }
+
+/// A RESUME DECIDED ON A WITNESS LATCHES THE OUTAGE WHATEVER IT TYPED (the post-landing review,
+/// 2026-11-02): under Land before its instruction was given, the witness's resume types Land's
+/// instruction (rule `outage-resume@v1`), and under Cruise past the person's grace it sends the
+/// person's draft (a `Submit` under that rule); either way the same wall met again is left to the
+/// ladder, and a later witness clears nothing until the agent works again.
+/// Negative control: the latch read off the measured line's text (`types_measured_outage_line`,
+/// `origin/main` `21b1e42025`) leaves both unlatched: the later witness clears the wall
+/// (`witness_clearing` is `Some`) and the act is the measured line typed at once.
+#[test]
+fn a_witness_resume_of_any_text_latches_the_outage() {
+    let t = t0();
+    let grace = Duration::from_secs(u64::from(cfg().human_grace_s)) + SEC;
+    // The case's mode, and its reading at the witness (the person's draft past their grace).
+    type Mode = fn(TurnEndReading) -> TurnEndReading;
+    type Drafted = fn(TurnEndReading, Duration) -> TurnEndReading;
+    let cases: [(&str, Mode, Drafted); 2] = [
+        ("Land's instruction", land, |r, _| r),
+        (
+            "the person's draft",
+            |r| r,
+            |r, grace| TurnEndReading {
+                composer: Composer::Typed,
+                person: Some(grace),
+                ..r
+            },
+        ),
+    ];
+    for (case, mode, drafted) in cases {
+        let wall = mode(walled(WallKind::Overloaded, OVERLOADED, Some(3 * MIN)));
+        let mut st = TurnEndState::default();
+        assert!(
+            waits_for(&act(&mut st, &wall, t), Outage::Overload).is_some(),
+            "{case}: the wall waits"
+        );
+        let first = act(
+            &mut st,
+            &drafted(witnessed(&wall, t + 20 * SEC), grace),
+            t + 30 * SEC,
+        );
+        assert_eq!(
+            first.rule_id(),
+            Some(RULE_OUTAGE_RESUME),
+            "{case}: {first:?}"
+        );
+        assert_ne!(
+            first,
+            resumed(Outage::Overload, Clearing::Measured),
+            "{case}: not the measured line"
+        );
+        let met = TurnEndReading {
+            worked: Some(Duration::from_secs(4)),
+            ..wall.clone()
+        };
+        let back = t + 40 * SEC;
+        act(&mut st, &met, back);
+        assert!(st.retry_witnessed(), "{case}: latched");
+        let late = witnessed(&wall, back + MIN);
+        assert_eq!(st.witness_clearing(&late), None, "{case}");
+        let a = act(&mut st, &late, back + MIN);
+        assert!(waits_for(&a, Outage::Overload).is_some(), "{case}: {a:?}");
+    }
+}
+
+/// THE LATCH RIDES THE LOOP THAT FOLLOWS (the post-landing review, 2026-11-02): a track seeded
+/// with its outage's witness latch ([`TurnEndState::seed_retry_witnessed`], a retry mark's
+/// ` witnessed=yes`) clears on no witness; one seeded without it clears on the first.
+#[test]
+fn a_seeded_witness_latch_leaves_the_outage_to_the_ladder() {
+    let t = t0();
+    let wall = walled(WallKind::Overloaded, OVERLOADED, Some(3 * MIN));
+    for latched in [true, false] {
+        let mut st = TurnEndState::default();
+        st.seed_retry(WallKind::Overloaded, 1, 0, MIN, false, false, t);
+        if latched {
+            st.seed_retry_witnessed();
+        }
+        assert_eq!(st.retry_witnessed(), latched);
+        let late = witnessed(&wall, t + 10 * SEC);
+        assert_eq!(
+            st.witness_clearing(&late).is_some(),
+            !latched,
+            "latched {latched}"
+        );
+    }
+}

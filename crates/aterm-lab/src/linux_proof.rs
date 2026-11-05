@@ -2248,9 +2248,12 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         );
         let built = out.ok();
         // The GUI rows that follow are timed: they run on the quiet machine, from here to the
-        // end of this arch ([`crate::admission`]).
+        // end of this arch ([`crate::admission`]), sharing the native-window lane
+        // with both Timing and functional Instances in other lab runs.
         let quiet = if built {
-            crate::admission::quiet(&format!("{tag} GUI rows")).map(Some)
+            crate::admission::window_lane()
+                .and_then(|()| crate::admission::quiet(&format!("{tag} GUI rows")))
+                .map(Some)
         } else {
             Ok(None)
         };
@@ -2588,7 +2591,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
     let report = render(&rows, &disk, t0.elapsed().as_secs_f64());
     print!("\n{report}");
     let path = results.join("report.txt");
-    if let Err(e) = std::fs::write(&path, &report) {
+    if let Err(e) = crate::util::write_fresh(&path, &report) {
         eprintln!("aterm-lab: linux: {}: {e}", path.display());
     } else {
         println!("report and frames: {}", results.display());

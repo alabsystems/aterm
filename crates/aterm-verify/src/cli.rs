@@ -36,6 +36,10 @@ pub struct Args {
     pub cursor_pacing: bool,
     /// Compile selected tests without executing them or qualifying a release.
     pub compile_only: bool,
+    /// `--as-release`: with `test` or `doc` and `--all`, that check as `release` runs it, pulling
+    /// nothing ([`Args::wanted`]), the command a release's red row prints; with
+    /// `test --all --compile-only`, what it compiles.
+    pub as_release: bool,
     /// `--admit now|wait`: whether the run waits for room for the disk it will write, each stage
     /// for room for its memory, and its timed stages for a quiet machine (the default), or starts
     /// at once, saying what it lacks. Neither lifts the run's own memory budget
@@ -49,6 +53,15 @@ pub struct Args {
 }
 
 impl Args {
+    /// The checks this command runs over a selection `holds` reads: those it names and what they
+    /// pull ([`crate::checks::with_pulled`]). `release` pulls nothing, and so neither does
+    /// `--as-release`, which is one of its checks as it ran: a pulled check's verdict would answer
+    /// for something no release runs.
+    #[must_use]
+    pub fn wanted(&self, holds: impl Fn(&str) -> bool) -> Vec<Check> {
+        crate::checks::with_pulled(&self.checks, self.release || self.as_release, holds)
+    }
+
     /// Does any selected check read the selection (the cone, `-p`, `--all`)? `cells` reads `-p`
     /// alone: named with no `-p`, it judges every cell's whole graph.
     #[must_use]
@@ -124,6 +137,7 @@ where
             "--no-windows" => a.no_windows = true,
             "--cursor-pacing" => a.cursor_pacing = true,
             "--compile-only" => a.compile_only = true,
+            "--as-release" => a.as_release = true,
             "--admit" => {
                 let v = value("--admit")?;
                 match aterm_capacity::Admit::parse(&v) {
@@ -213,6 +227,15 @@ where
             "--compile-only requires test or checkers; it cannot qualify a release".into(),
         );
     }
+    if a.as_release
+        && (!a.all
+            || a.checks.is_empty()
+            || a.checks
+                .iter()
+                .any(|c| !matches!(c, Check::Test | Check::Doc)))
+    {
+        return usage("--as-release goes with `test` or `doc`, and `--all`".into());
+    }
     if a.cursor_pacing && (a.release || a.checks != [Check::Measure] || a.app.is_none()) {
         return usage(
             "--cursor-pacing requires only measure and --app; it cannot qualify a release".into(),
@@ -295,10 +318,10 @@ Run aterm's checks in place, alone or in any combination.
                                   machine's recovery ledger, not the tree
   verify glue <in.wasm> <out-dir>
                                   a wasm module's ES module glue (`verify glue --help`)
-  verify provision [--linux] [--record] [--check] [ROW...]
+  verify provision [--linux] [--check] [ROW...]
                                   the tools this checkout pins (fish, bash
                                   5.3, pwsh, binaryen, the browsers, rustup's
-                                  stock exceptions; lima, wasm-bindgen),
+                                  stock exceptions; lima),
                                   fetched or built into this user's cache
   verify browser-site DIR         the browser check's first half: both web
                                   modules built and the site laid in DIR
@@ -327,6 +350,9 @@ Options:
       --fix               with fmt alone: rewrite the files it finds unformatted
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)
       --compile-only      with test/checkers: compile tests without executing them
+      --as-release        with test or doc and --all: as release runs them, with
+                          aterm-spec/checkers on, and test owes the golden frame
+                          test (--compile-only: what release's test stage compiles)
       --cursor-pacing     with measure --app: run only the GUI pacing burst
       --no-windows        skip each stage that opens a window (a named skip)
       --admit <wait|now>  wait for room for the disk the run will write, for
@@ -508,6 +534,29 @@ mod cursor_pacing_tests {
             vec!["release", "--app", "/test.app", "--compile-only"],
             vec!["test", "lint", "--compile-only"],
             vec!["--compile-only"],
+        ] {
+            assert!(super::parse(args).is_err());
+        }
+        for args in [
+            vec!["test", "--all", "--compile-only", "--as-release"],
+            vec!["test", "--all", "--as-release"],
+            vec!["doc", "--all", "--as-release"],
+        ] {
+            assert!(super::parse(args).unwrap().as_release);
+        }
+        for args in [
+            vec!["test", "--as-release"],
+            vec!["--all", "--as-release"],
+            vec!["lint", "--all", "--as-release"],
+            vec!["test", "--compile-only", "--as-release"],
+            vec![
+                "test",
+                "checkers",
+                "--all",
+                "--compile-only",
+                "--as-release",
+            ],
+            vec!["release", "--app", "/test.app", "--as-release"],
         ] {
             assert!(super::parse(args).is_err());
         }

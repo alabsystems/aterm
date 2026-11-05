@@ -10,6 +10,8 @@ use aterm_json::{Value, json};
 use crate::state::{File, Latest, Release, Repo, State};
 use crate::{CompareSpec, DigestSpec, FakeOrigin, Fault, ReleaseSpec, Seen};
 
+mod atomic_refs;
+
 /// GitHub's documentation link, on every error body.
 const DOCS: &str = "https://docs.github.com/rest";
 /// The reset every rate header names.
@@ -136,7 +138,7 @@ impl Request {
     }
 
     /// The query's pairs as sent.
-    fn raw_query(&self) -> Vec<(&str, &str)> {
+    fn raw_query(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
         self.target
             .split_once('?')
             .map(|(_, q)| q)
@@ -144,14 +146,12 @@ impl Request {
             .split('&')
             .filter(|p| !p.is_empty())
             .map(|p| p.split_once('=').unwrap_or((p, "")))
-            .collect()
     }
 
     /// The value of query parameter `name`, form-decoded as GitHub reads a query: a `+` is a
     /// space, and `%2B` a `+`.
     pub(crate) fn query(&self, name: &str) -> Option<String> {
         self.raw_query()
-            .into_iter()
             .find(|(k, _)| *k == name)
             .map(|(_, v)| aterm_codec::pct::decode(&v.replace('+', " ")))
     }
@@ -231,6 +231,9 @@ const TOKEN_SHOWN: &str = "<token>";
 
 /// The request target with every registered token replaced by `TOKEN_SHOWN`, longest first.
 fn shown_target(state: &State, req: &Request) -> String {
+    if !target_credential(state, req) {
+        return req.target.clone();
+    }
     let mut tokens: Vec<&str> = state
         .tokens
         .iter()
@@ -297,7 +300,10 @@ fn violations(state: &mut State, req: &Request) {
     }
     if foreign {
         for (name, _) in &req.headers {
-            if name.to_ascii_lowercase().starts_with("x-github-") {
+            if name
+                .get(..9)
+                .is_some_and(|p| p.eq_ignore_ascii_case("x-github-"))
+            {
                 found.push(format!("{name} sent to the {o} origin: {m} {path}"));
             }
         }
@@ -676,7 +682,12 @@ fn finish_with(
 
 /// Rate-limit resource bucket for a request.
 fn resource_of(req: &Request) -> &'static str {
-    if segments(req.path()).first() == Some(&"search") {
+    let mut segs = req
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty());
+    if segs.next() == Some("search") {
         "search"
     } else {
         "core"
@@ -685,7 +696,13 @@ fn resource_of(req: &Request) -> &'static str {
 
 /// Whether the rate leaves `req` uncharged.
 fn is_free(req: &Request, ctx: &Ctx, status: Option<u16>) -> bool {
-    segments(req.path()) == ["rate_limit"] || (ctx.token.is_some() && status == Some(304))
+    let mut segs = req
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty());
+    let is_rate_limit = segs.next() == Some("rate_limit") && segs.next().is_none();
+    is_rate_limit || (ctx.token.is_some() && status == Some(304))
 }
 
 /// Use up one of the rate's requests for `req` on the api origin.
@@ -744,8 +761,7 @@ fn segment(text: &str) -> String {
 
 /// The api origin's routes.
 fn api(state: &State, req: &Request, ctx: &Ctx) -> Answer {
-    let path = req.path().to_string();
-    let segs = segments(&path);
+    let segs = segments(req.path());
     match segs.as_slice() {
         ["rate_limit"] => rate_limit(state, ctx),
         ["user"] => match ctx.login() {
@@ -877,6 +893,7 @@ fn repo_json(state: &State, repo: &Repo, login: Option<&str>) -> Value {
     };
     let mut value = json!({
         "id": repo.id,
+        "node_id": format!("R_{}", repo.id),
         "name": repo.name,
         "full_name": full,
         "owner": owner_json(state, &repo.owner),
@@ -944,7 +961,6 @@ impl Paging {
         let (per_page, number, last) = (self.per_page, self.number, self.last);
         let kept: String = req
             .raw_query()
-            .into_iter()
             .filter(|(k, _)| *k != "per_page" && *k != "page")
             .map(|(k, v)| format!("{k}={v}&"))
             .collect();
@@ -1867,6 +1883,9 @@ fn text_field(body: &Value, name: &str) -> Result<Option<String>, ()> {
 /// `{"message":"Reference does not exist"}`); and add (`POST /user/keys`) and delete (`DELETE
 /// /user/keys/{id}`) an SSH key.
 fn write(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
+    if req.path() == "/graphql" && req.method == "POST" {
+        return atomic_refs::update(state, req, ctx);
+    }
     let path = req.path().to_string();
     let segs = segments(&path);
     if let ["user", "keys", rest @ ..] = segs.as_slice() {

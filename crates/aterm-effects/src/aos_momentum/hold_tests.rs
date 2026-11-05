@@ -7,9 +7,10 @@
 
 use aterm_time::Instant;
 
-use super::test_fixtures::{LANE, TAU, attached, cfg, draw, geom, hosted, ms};
+use super::test_fixtures::{LANE, Seen, TAU, attached, cfg, draw, geom, hosted, ms};
 use super::{
-    MomentumCode, MomentumEvent, MomentumHost, MomentumSchema, MomentumState, PAST_HORIZON, RAW_KEY,
+    KeyEcho, MomentumCode, MomentumEvent, MomentumHost, MomentumSchema, MomentumState,
+    PAST_HORIZON, RAW_KEY,
 };
 
 /// The host's log since its ancestor checkpoint.
@@ -101,6 +102,57 @@ fn a_hold_appends_nothing_and_a_release_appends_keys_at_the_release_instant() {
             "frames log again after the release"
         );
     }
+}
+
+#[test]
+fn a_held_glow_holds_still_on_the_caret_the_echo_moves() {
+    let t0 = Instant::now();
+    // Six keys 30 ms apart and a frame at the caret they were typed at, (4, 10).
+    let typed = |host: &mut MomentumHost| {
+        for i in 0..6 {
+            host.on_key(t0 + ms(10 + 30 * i), TAU);
+        }
+        frame(host, t0 + ms(162));
+    };
+    let mut held = attached(t0, MomentumCode::Shipped);
+    typed(&mut held);
+    held.aos_hold(t0 + ms(1_160));
+    let before = log(&held);
+    // The echo moves the caret, and later frames find it further on.
+    for (cur, now) in [
+        ((4, 10), t0 + ms(170)),
+        ((4, 11), t0 + ms(180)),
+        ((4, 12), t0 + ms(900)),
+    ] {
+        let mut never_held = MomentumHost::default();
+        typed(&mut never_held);
+        let still = draw(
+            &mut never_held,
+            Some(cur),
+            t0 + ms(162),
+            geom(),
+            &cfg(true),
+            1,
+        );
+        let got = draw(&mut held, Some(cur), now, geom(), &cfg(true), 1);
+        assert!(
+            matches!(&got, Seen::Frame { frame, out, .. } if frame.hot && !out.is_empty()),
+            "the glow is lit at {cur:?}"
+        );
+        assert_eq!(
+            got, still,
+            "at {cur:?}: the glow as it stood at its last tick, drawn on the caret"
+        );
+        let flowing = draw(&mut never_held, Some(cur), now, geom(), &cfg(true), 1);
+        if now > t0 + ms(500) {
+            assert_ne!(got, flowing, "held still, not cooling with the clock");
+        }
+    }
+    assert_eq!(
+        log(&held),
+        before,
+        "nothing reached the boundary while held"
+    );
 }
 
 #[test]
@@ -286,4 +338,71 @@ fn a_release_with_no_hold_reaches_only_the_glow() {
     assert!(!direct.aos_holding(), "an unattached host holds nothing");
     direct.aos_release(t0 + ms(10), 1, TAU, None);
     assert!(direct.aos_tainted() && direct.value(t0 + ms(10), TAU) > 0.0);
+}
+
+#[test]
+fn a_hold_released_unseen_logs_its_keys_unseen_at_that_instant_and_taints() {
+    let t0 = Instant::now();
+    for unseen in [true, false] {
+        let mut host = attached(t0, MomentumCode::Shipped);
+        host.aos_hold(t0 + ms(1_010));
+        let release = t0 + ms(400);
+        if unseen {
+            host.aos_release_unseen(release, 2, TAU);
+        } else {
+            host.aos_release(release, 2, TAU, None);
+        }
+        assert!(
+            host.aos_attached() && !host.aos_holding(),
+            "unseen={unseen}"
+        );
+        let keys: Vec<_> = log(&host)
+            .iter()
+            .filter_map(|e| match *e {
+                MomentumEvent::Key { at, echo, .. } => Some((at, echo)),
+                _ => None,
+            })
+            .collect();
+        let echo = if unseen {
+            KeyEcho::Unseen
+        } else {
+            KeyEcho::Seen
+        };
+        assert_eq!(
+            keys,
+            [(400_000_000, echo); 2],
+            "unseen={unseen}: both keys at the release, never their presses"
+        );
+        assert_eq!(
+            hosted(&host).state().unseen(),
+            if unseen { 2 } else { 0 },
+            "unseen={unseen}: the state counts them"
+        );
+        assert_eq!(
+            host.aos_tainted(),
+            unseen,
+            "unseen={unseen}: only an unseen release taints (negative control: a proven one)"
+        );
+        let epoch = t0 + ms(500);
+        host.aos_attach(epoch, MomentumCode::Shipped, super::test_fixtures::BUILD, 2);
+        assert_eq!(
+            hosted(&host).state().unseen(),
+            0,
+            "unseen={unseen}: a new recording starts its count at zero"
+        );
+        assert_eq!(
+            checkpoint_rate_at(&host, epoch).is_none(),
+            unseen,
+            "unseen={unseen}: the next attach starts from rest only after unseen keys"
+        );
+    }
+
+    let mut host = attached(t0, MomentumCode::Shipped);
+    host.aos_release_unseen(t0 + ms(10), 1, TAU);
+    assert!(
+        !host.aos_attached(),
+        "with no hold open it stops the recording"
+    );
+    assert_eq!(host.aos_take_detached(), Some(RAW_KEY));
+    assert!(host.aos_tainted());
 }

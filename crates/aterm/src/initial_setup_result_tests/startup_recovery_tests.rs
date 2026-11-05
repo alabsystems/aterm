@@ -810,22 +810,28 @@ fn startup_recovery_restore_falls_back_on_its_released_worker_when_spawn_is_refu
 /// nothing set aside (the person chose, or Restore ran), it is cleared, once, and a later
 /// set-aside raises it again. At launch an earlier launch's entry may stand, so it is cleared
 /// at the first reading with nothing set aside.
+///
+/// The flag is the test's own: the process's [`SET_ASIDE_SAID`] is read by every
+/// `initial_setup_status`, which other tests' setup workers call while this one runs.
 #[test]
 fn the_set_aside_digest_entry_goes_once_the_person_chooses() {
     let _globals = globals();
     let clears = std::cell::Cell::new(0_usize);
-    let read = |recovered| set_aside_as_read(recovered, || clears.set(clears.get() + 1));
-    SET_ASIDE_SAID.store(true, Ordering::Release);
+    let said = std::sync::atomic::AtomicBool::new(true);
+    let read = |recovered| set_aside_read_in(&said, recovered, || clears.set(clears.get() + 1));
     read(Some(true));
     read(None);
     assert_eq!(clears.get(), 0, "the set-aside still stands");
     read(Some(false));
     read(Some(false));
     assert_eq!(clears.get(), 1, "cleared once the person chose");
-    note_setup_set_aside(&aterm_cli::macos_doctor::SetAside {
-        kept: vec!["first-run.json.unreadable".to_owned()],
-        stop_target: 1,
-    });
+    note_set_aside_in(
+        &said,
+        &aterm_cli::macos_doctor::SetAside {
+            kept: vec!["first-run.json.unreadable".to_owned()],
+            stop_target: 1,
+        },
+    );
     read(Some(true));
     assert_eq!(clears.get(), 1);
     read(Some(false));

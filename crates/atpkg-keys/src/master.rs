@@ -362,10 +362,12 @@ pub fn format_phrase_line(chars: &[u8; MASTER_PHRASE_LEN]) -> [u8; GROUPED_PHRAS
 impl Tty {
     /// Opens `/dev/tty` and verifies it is a terminal.
     pub fn open() -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt as _;
         use std::os::unix::io::AsRawFd as _;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open("/dev/tty")
             .map_err(|e| {
                 let mut s = String::from(

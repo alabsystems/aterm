@@ -26,6 +26,21 @@ fn setup_with(stages: Vec<StageRow>, finished: bool) -> Setup {
     }
 }
 
+#[test]
+fn a_finished_record_does_not_hide_unfinished_stages() {
+    let setup = setup_with(
+        vec![stage(
+            "GitHub repositories",
+            "waiting",
+            "Waiting for credentials",
+        )],
+        true,
+    );
+    let area = setup_area(&setup).unwrap();
+    assert_eq!(area.level, Level::Due);
+    assert!(area.says.contains("GitHub repositories"));
+}
+
 /// The setup records before aterm.app's first launch: none, the default plan's stages pending.
 fn unbegun() -> Setup {
     Setup::Read {

@@ -15,7 +15,8 @@ use crate::toolchain::Toolchain;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
     pub name: String,
-    /// Repo-relative directory of its manifest.
+    /// Repo-relative directory of its manifest, which is what says a package is this member: a
+    /// package outside the workspace can have its name ([`Members::at`]).
     pub dir: String,
     /// Whether the member declares a library target.
     pub has_lib: bool,
@@ -56,6 +57,17 @@ impl Members {
         self.0.iter().map(|m| m.name.clone()).collect()
     }
 
+    /// The name of the member whose manifest is in `dir`. A name cannot say this:
+    /// `crates/aterm-windows-sys` is excluded from the workspace because it has the name of the
+    /// member `crates/aterm-windows-sys-052`.
+    #[must_use]
+    pub fn at(&self, dir: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|m| m.dir == dir)
+            .map(|m| m.name.as_str())
+    }
+
     /// Whether any member in `crates` declares a library target.
     #[must_use]
     pub fn any_has_lib(&self, crates: &[String]) -> bool {
@@ -68,9 +80,9 @@ impl Members {
     }
 }
 
-/// Map from repo-relative directory to its `Cargo.toml` `[package].name`.
+/// The repo-relative directories that hold a `Cargo.toml`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Manifests(BTreeMap<String, Option<String>>);
+pub struct Manifests(BTreeSet<String>);
 
 impl Manifests {
     #[must_use]
@@ -78,22 +90,22 @@ impl Manifests {
         Self::default()
     }
 
-    pub fn insert(&mut self, dir: impl Into<String>, package: Option<String>) {
-        self.0.insert(dir.into(), package);
+    pub fn insert(&mut self, dir: impl Into<String>) {
+        self.0.insert(dir.into());
     }
 
-    /// Look up the package name declared by the manifest at `dir`.
+    /// Whether a manifest is in `dir`.
     #[must_use]
-    pub fn package_at(&self, dir: &str) -> Option<Option<&str>> {
-        self.0.get(dir).map(|p| p.as_deref())
+    pub fn holds(&self, dir: &str) -> bool {
+        self.0.contains(dir)
     }
 }
 
-impl<S: Into<String>> FromIterator<(S, Option<S>)> for Manifests {
-    fn from_iter<I: IntoIterator<Item = (S, Option<S>)>>(it: I) -> Self {
+impl<S: Into<String>> FromIterator<S> for Manifests {
+    fn from_iter<I: IntoIterator<Item = S>>(it: I) -> Self {
         let mut m = Self::new();
-        for (dir, pkg) in it {
-            m.insert(dir, pkg.map(Into::into));
+        for dir in it {
+            m.insert(dir);
         }
         m
     }
@@ -104,24 +116,42 @@ impl<S: Into<String>> FromIterator<(S, Option<S>)> for Manifests {
 pub enum Selection {
     /// The cone widened to the entire workspace for the given reason.
     Widened(String),
-    /// The cone narrowed to changed seeds and their reverse dependencies.
+    /// The cone narrowed to the seeds and what each reaches ([`Reach`]).
     Narrowed {
-        /// Packages whose own files changed.
+        /// What the change itself touched: members whose own files changed, the packages a lock or
+        /// root manifest row names, and vendored packages whose files changed.
         seeds: Vec<String>,
-        /// `seeds` plus every workspace crate that depends on them.
+        /// By `-p` spec, the members among `seeds`, those a seed reaches, and those [`TESTED_BY`] a
+        /// changed file.
         crates: Vec<String>,
         /// Whether any selected crate declares a library target ([`Members::any_has_lib`]).
         any_lib: bool,
+        /// The members, by name, whose test, bench and example targets the cone's lint compiles:
+        /// those whose own files changed and those [`TESTED_BY`] a changed file. A root manifest
+        /// row, a lock row other than a touched member's own entry, or a fork moves code under any
+        /// member's tests, so any of those makes this the whole cone.
+        all_targets: Vec<String>,
+        /// The members, by name, the cone's lint leaves out: those it holds only by a dev edge
+        /// ([`Reach::dev_only`]) and not in `all_targets`. Their libraries and binaries link
+        /// nothing that changed, and the test compile, which takes all of `crates`, fires any
+        /// compile error in their tests.
+        unlinted: Vec<String>,
     },
 }
 
-/// Repo-relative paths whose changes can replan or re-flag the workspace.
-pub const REPLANNING_PATHS: [&str; 5] = [
+/// Repo-relative paths whose changes can replan or re-flag the workspace, or change what its lint
+/// denies: clippy reads the nearest config above a manifest, so a root one is the lint of every
+/// member without its own, which no member's files say. A rustfmt config is not here: no compile
+/// reads it, and `fmt` reads the whole tree whatever the selection.
+pub const REPLANNING_PATHS: [&str; 8] = [
     "Cargo.lock",
     "Cargo.toml",
+    "rust-toolchain",
     "rust-toolchain.toml",
     ".cargo/config",
     ".cargo/config.toml",
+    "clippy.toml",
+    ".clippy.toml",
 ];
 
 #[must_use]
@@ -149,6 +179,17 @@ pub fn tested_by(path: &str) -> impl Iterator<Item = &'static str> + '_ {
         .map(|(_, member)| *member)
 }
 
+/// The members a change to one package reaches ([`reached`]), by name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reach {
+    /// Of the package and what closes over normal and build edges from it, the members: their
+    /// libraries and binaries link the change.
+    pub links: Vec<String>,
+    /// The member dev dependents of those that are not among them: only their test, bench and
+    /// example targets link the change.
+    pub dev_only: Vec<String>,
+}
+
 /// Impact of a change to one of [`REPLANNING_PATHS`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Replan {
@@ -156,14 +197,14 @@ pub enum Replan {
     Nothing,
     /// Specific packages whose build inputs changed.
     Packages(BTreeSet<String>),
-    /// Every crate may build differently for the given reason.
+    /// Every crate may build or lint differently for the given reason.
     Everything(String),
 }
 
 /// Replan that widens to the entire workspace.
 #[must_use]
 pub fn replan_everything() -> Replan {
-    Replan::Everything("it can change how every crate is built".to_string())
+    Replan::Everything("it can change how every crate is built or linted".to_string())
 }
 
 /// Compute the [`Replan`] for a root `Cargo.toml` diff from `base` to `work`.
@@ -327,20 +368,21 @@ fn parent_dir(path: &str) -> &str {
     }
 }
 
-/// Nearest ancestor workspace member owning repo-relative `path`. The spec table at a
-/// manifest's own root (`<dir>/SPECS.md`) is owned by none, as `docs/*.md` is: no build,
-/// include or test reads it.
+/// The workspace member owning repo-relative `path`: the one whose manifest ([`Members::at`]) is
+/// the nearest above it, so a manifest that is no member's owns its subtree for no member. The
+/// spec table at a manifest's own root (`<dir>/SPECS.md`) is owned by none, as `docs/*.md` is: no
+/// build, include or test reads it.
 #[must_use]
 pub fn owning_member<'a>(
     path: &str,
-    manifests: &'a Manifests,
-    members: &BTreeSet<String>,
+    manifests: &Manifests,
+    members: &'a Members,
 ) -> Option<&'a str> {
     let dir = owning_dir(path, manifests)?;
     if path.strip_prefix(dir) == Some("/SPECS.md") {
         return None;
     }
-    manifests.package_at(dir)?.filter(|n| members.contains(*n))
+    members.at(dir)
 }
 
 /// Select the workspace crates that the change cone must build and test.
@@ -350,7 +392,7 @@ pub fn select(
     manifests: &Manifests,
     members: &Members,
     path_packages: &dyn Fn() -> Option<Vec<(String, String)>>,
-    dependents: &dyn Fn(&str) -> Option<Vec<String>>,
+    dependents: &dyn Fn(&str) -> Option<Reach>,
     replan: &dyn Fn(&str) -> Replan,
 ) -> Selection {
     if members.is_empty() {
@@ -358,14 +400,20 @@ pub fn select(
     }
     let names = members.names();
 
-    let (seeds, _) = seeds(paths, manifests, &names);
+    let (seeds, _) = seeds(paths, manifests, members);
     let mut replanned: BTreeSet<String> = BTreeSet::new();
+    // A root manifest row changes how every dependent builds the package it names, whichever files
+    // changed beside it.
+    let mut root_row = false;
     for p in paths.iter().filter(|p| replans_everything(p)) {
         match replan(p) {
             Replan::Everything(why) => {
                 return Selection::Widened(format!("{p} changed: {why}"));
             }
-            Replan::Packages(packages) => replanned.extend(packages),
+            Replan::Packages(packages) => {
+                root_row |= p == "Cargo.toml";
+                replanned.extend(packages);
+            }
             Replan::Nothing => {}
         }
     }
@@ -378,28 +426,50 @@ pub fn select(
     };
     let mut cone: BTreeSet<String> = seeds.clone();
     cone.extend(replanned.iter().filter(|p| names.contains(*p)).cloned());
+    let own = seeds.clone();
     let mut seeds = seeds;
     seeds.extend(replanned);
-    seeds.extend(
-        forks_touched(paths, &packages)
-            .into_iter()
-            .filter(|p| !names.contains(p)),
-    );
+    seeds.extend(forks_touched(paths, &packages));
+    let mut dev_only: BTreeSet<String> = BTreeSet::new();
     for seed in &seeds {
         let Some(found) = dependents(seed.as_str()) else {
             return Selection::Widened(format!(
-                "`targo tree --invert {seed}` failed, so its dependents are unknown"
+                "`targo tree --invert {seed}` failed or could not be read, so its dependents are \
+                 unknown"
             ));
         };
-        cone.extend(found.into_iter().filter(|n| names.contains(n)));
-    }
-    cone.extend(
-        paths
+        if !found
+            .links
             .iter()
-            .flat_map(|p| tested_by(p))
-            .map(str::to_string)
-            .filter(|n| names.contains(n)),
-    );
+            .chain(&found.dev_only)
+            .any(|n| names.contains(n))
+        {
+            return Selection::Widened(format!(
+                "`targo tree --invert {seed}` reaches no member: this host's graph does not hold \
+                 it, so what depends on it on another target is unknown"
+            ));
+        }
+        cone.extend(found.links.into_iter().filter(|n| names.contains(n)));
+        dev_only.extend(found.dev_only.into_iter().filter(|n| names.contains(n)));
+    }
+    dev_only.retain(|n| !cone.contains(n));
+    cone.extend(dev_only.iter().cloned());
+    let tested: BTreeSet<String> = paths
+        .iter()
+        .flat_map(|p| tested_by(p))
+        .map(str::to_string)
+        .filter(|n| names.contains(n))
+        .collect();
+    cone.extend(tested.iter().cloned());
+    let (all_targets, unlinted) = if root_row || !seeds.is_subset(&own) {
+        (cone.iter().cloned().collect(), Vec::new())
+    } else {
+        let every: BTreeSet<&String> = own.iter().chain(&tested).collect();
+        (
+            every.into_iter().cloned().collect(),
+            dev_only.difference(&tested).cloned().collect(),
+        )
+    };
 
     let named: Vec<String> = cone.into_iter().collect();
     let any_lib = members.any_has_lib(&named);
@@ -407,6 +477,8 @@ pub fn select(
         seeds: seeds.into_iter().collect(),
         crates: named.iter().map(|n| members.spec(n).to_string()).collect(),
         any_lib,
+        all_targets,
+        unlinted,
     }
 }
 
@@ -415,7 +487,7 @@ pub fn select(
 pub fn seeds(
     paths: &[String],
     manifests: &Manifests,
-    members: &BTreeSet<String>,
+    members: &Members,
 ) -> (BTreeSet<String>, Option<String>) {
     let mut replanned: Option<String> = None;
     let mut seeds: BTreeSet<String> = BTreeSet::new();
@@ -434,7 +506,7 @@ pub fn seeds(
 fn owning_dir<'a>(path: &'a str, manifests: &Manifests) -> Option<&'a str> {
     let mut dir = parent_dir(path);
     while !dir.is_empty() {
-        if manifests.package_at(dir).is_some() {
+        if manifests.holds(dir) {
             return Some(dir);
         }
         dir = parent_dir(dir);
@@ -476,6 +548,8 @@ pub fn cone(base: &str, sel: &Selection) -> (Scope, String) {
             seeds,
             crates,
             any_lib,
+            all_targets,
+            unlinted,
         } => {
             let dependents = crates.iter().filter(|c| !seeds.contains(c)).count();
             let more = if dependents == 0 {
@@ -484,7 +558,10 @@ pub fn cone(base: &str, sel: &Selection) -> (Scope, String) {
                 format!(" + {dependents} dependent(s)")
             };
             (
-                Scope::changed(base, crates.clone(), *any_lib),
+                Scope::changed(base, crates.clone(), *any_lib)
+                    .with_seeds(seeds.clone())
+                    .with_all_targets(all_targets.clone())
+                    .with_unlinted(unlinted.clone()),
                 format!("the change cone since {base}: {}{more}", seeds.join(" ")),
             )
         }
@@ -532,7 +609,7 @@ pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> 
         &manifests,
         &members,
         &|| read_path_packages(root, tools, path_env, &members),
-        &|c| invert(root, &tools.targo, path_env, members.spec(c)),
+        &|c| invert(root, &tools.targo, path_env, members.spec(c), &members),
         &|p| replan_of(root, path_env, &merge_base, p),
     )
 }
@@ -619,6 +696,24 @@ fn with_shared_inputs(
     Ok(paths)
 }
 
+/// The path a literal continues from a directory it does not spell: what follows its leading `/`
+/// (`concat!(env!("CARGO_MANIFEST_DIR"), "/../b/x")`) or its leading format argument and `/`
+/// (`format!("{}/../b/x", env!("CARGO_MANIFEST_DIR"))`, `format!("{dir}/../b/x")`).
+fn continued_path(literal: &str) -> Option<&str> {
+    let after_argument = literal
+        .strip_prefix('{')
+        .and_then(|rest| rest.split_once('}'))
+        .map(|(_, rest)| rest);
+    after_argument.unwrap_or(literal).strip_prefix('/')
+}
+
+/// Whether `text`, a source of the member at `member`, names something outside that member that
+/// changed through a quoted `../` literal. A literal that continues a directory
+/// ([`continued_path`]) starts at the member: each such literal here that names a real file
+/// continues the manifest directory, and any other matches nothing while no such path exists. Any
+/// other literal may start at the source's folder (`include_str!`) or the member (`Path::join`, a build
+/// script). The literal names one file unless it ends in `/`, which names a folder: a change
+/// under `steps` selects no reader of `"/../a/steps"`, and one of `"/../a/steps/"` does.
 fn shares_changed_input(
     source: &Path,
     text: &str,
@@ -632,13 +727,17 @@ fn shares_changed_input(
         if !literal.contains("../") {
             return false;
         }
-        let folder = literal.ends_with('/')
-            && literal
+        let (path, start) = match continued_path(literal) {
+            Some(path) => (path, member),
+            None => (literal, parent),
+        };
+        let folder = path.ends_with('/')
+            && path
                 .split('/')
                 .any(|segment| !segment.is_empty() && segment != "." && segment != "..");
-        [parent, member].into_iter().any(|base| {
+        [start, member].into_iter().any(|base| {
             let mut target = std::path::PathBuf::new();
-            for component in base.join(literal).components() {
+            for component in base.join(path).components() {
                 match component {
                     std::path::Component::ParentDir => {
                         target.pop();
@@ -813,8 +912,14 @@ fn stdout_of(cmd: &mut Command, root: &Path, path_env: &OsStr) -> Option<String>
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// One `cargo tree` read, in plain text whatever colour the environment or a cargo config asks for
+/// ([`reached`] reads its prefixes by column).
 fn targo_tree(root: &Path, targo: &Path, path_env: &OsStr, args: &[&str]) -> Option<String> {
-    stdout_of(Command::new(targo).args(args), root, path_env)
+    stdout_of(
+        Command::new(targo).args(args).args(["--color", "never"]),
+        root,
+        path_env,
+    )
 }
 
 /// Parse `(name, manifest_dir)` entries from `cargo tree` output.
@@ -948,6 +1053,8 @@ pub fn lock_shared_names(lock: &str) -> BTreeSet<String> {
     shared
 }
 
+/// The path packages outside the workspace, on any target's graph ([`outside_packages`]): a change
+/// to one this host's graph does not hold is still a seed, which [`select`] then widens on.
 fn read_path_packages(
     root: &Path,
     tools: &Toolchain,
@@ -967,25 +1074,57 @@ fn read_path_packages(
             "{p}",
             "--edges",
             "normal,build,dev",
+            "--target",
+            "all",
         ],
     )?;
+    outside_packages(&out, &tree_root_prefix(root), members)
+}
+
+/// Of one `cargo tree --format {p}` printout, the in-repo packages whose directory is no member's,
+/// each as `(spec, dir)`: its name, or `name@version` where a member has that name, because
+/// [`Members::spec`] answers a bare name with that member. `None` on a line it cannot read the
+/// version of, which widens.
+fn outside_packages(
+    tree: &str,
+    root_prefix: &str,
+    members: &Members,
+) -> Option<Vec<(String, String)>> {
     let names = members.names();
-    let prefix = tree_root_prefix(root);
-    let mut found: Vec<(String, String)> = parse_graph_entries(&out, &prefix)
-        .into_iter()
-        .filter(|(name, _)| !names.contains(name))
-        .map(|(name, dir)| (name, normalize_manifest_dir(dir)))
-        .collect();
+    let mut found = Vec::new();
+    for line in tree.lines() {
+        let Some((name, dir)) = parse_graph_entries(line, root_prefix).pop() else {
+            continue;
+        };
+        let dir = normalize_manifest_dir(dir);
+        if members.at(&dir).is_some() {
+            continue;
+        }
+        let spec = if names.contains(&name) {
+            let (_, version) = tree_package(line)?.split_once(" v")?;
+            format!("{name}@{version}")
+        } else {
+            name
+        };
+        found.push((spec, dir));
+    }
     found.sort();
     found.dedup();
     Some(found)
 }
 
-/// The workspace members that depend on `crate_name`, it among them, over normal, build and dev
-/// edges. A member that links it only for its own tests is one: aterm-models dev-depends on every
-/// crate that anchors a model, so a change to any of them brings its source-spec closure test
-/// into the cone.
-fn invert(root: &Path, targo: &Path, path_env: &OsStr, crate_name: &str) -> Option<Vec<String>> {
+/// The members a change to `crate_name` reaches ([`reached`]); `None` when `cargo tree` failed or
+/// printed what [`reached`] cannot read. The one tree has dev edges in it for two reasons: they
+/// are the final hop, and asking for them is what resolves features with dev units on, so a normal
+/// edge only a dev-dependency's feature turns on (`aterm-wasm-abi` on its macros, by its
+/// dev-dependency on itself) is in the tree at all.
+fn invert(
+    root: &Path,
+    targo: &Path,
+    path_env: &OsStr,
+    crate_name: &str,
+    members: &Members,
+) -> Option<Reach> {
     let out = targo_tree(
         root,
         targo,
@@ -995,21 +1134,102 @@ fn invert(root: &Path, targo: &Path, path_env: &OsStr, crate_name: &str) -> Opti
             "--workspace",
             "--invert",
             crate_name,
-            "--prefix",
-            "none",
+            "--charset",
+            "ascii",
             "--format",
             "{p}",
             "--edges",
             "normal,build,dev",
         ],
     )?;
-    let prefix = tree_root_prefix(root);
-    Some(
-        parse_graph_entries(&out, &prefix)
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect(),
-    )
+    reached(&out, &tree_root_prefix(root), members)
+}
+
+/// The `name vX.Y.Z` that opens a `cargo tree` entry, or `None` when it opens with anything else.
+fn tree_package(entry: &str) -> Option<&str> {
+    let (name, rest) = entry.split_once(' ')?;
+    let version = rest.split(' ').next()?;
+    let named = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'));
+    let versioned = version
+        .strip_prefix('v')
+        .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()));
+    (named && versioned).then(|| &entry[..name.len() + 1 + version.len()])
+}
+
+/// Of one `cargo tree --invert <X>` printout (`--charset ascii`, each level four columns, each
+/// package's edges printed once), the members that build differently when X changes, each known by
+/// its directory ([`Members::at`]): X, whatever closes over normal and build edges from it, and
+/// then every dev dependent of any of those. A dev edge is the final hop and never transit: a
+/// member that dev-depends on X links it for its own tests (aterm-models dev-depends on every crate
+/// that anchors a model, so a change to any of them brings its source-spec closure test into the
+/// cone), but its own dependents build no dev-dependency of it. X is in the closure as the tree's
+/// root, so a package only dev edges reach (`astream-term`, which `aterm-conformance`'s differential
+/// oracle runs on a bump of) still reaches its dev dependents.
+///
+/// `None` on a non-empty line that is neither a section header nor a package one level under what
+/// is printed above it: a misread must widen the cone, never narrow it to whatever did parse. An
+/// empty printout reads as empty: `cargo tree` found no such package on this host ([`select`]).
+fn reached(tree: &str, root_prefix: &str, members: &Members) -> Option<Reach> {
+    let mut member_of: BTreeMap<&str, String> = BTreeMap::new();
+    let mut closure: BTreeSet<&str> = BTreeSet::new();
+    let mut edges: Vec<(&str, &str, bool)> = Vec::new();
+    // The package at each depth of the line being read, and whether the edges below it are dev.
+    let mut path: Vec<(&str, bool)> = Vec::new();
+    for line in tree.lines().filter(|line| !line.is_empty()) {
+        let entry = line.trim_start_matches(['|', '`', '-', ' ']);
+        let indent = line.len() - entry.len();
+        if indent % 4 != 0 {
+            return None;
+        }
+        let depth = indent / 4;
+        if matches!(entry, "[dev-dependencies]" | "[build-dependencies]") {
+            path.get_mut(depth)?.1 = entry == "[dev-dependencies]";
+            continue;
+        }
+        if depth > path.len() {
+            return None;
+        }
+        let package = tree_package(entry)?;
+        if let Some((_, dir)) = parse_graph_entries(entry, root_prefix).pop()
+            && let Some(name) = members.at(&normalize_manifest_dir(dir))
+        {
+            member_of.insert(package, name.to_string());
+        }
+        path.truncate(depth);
+        match path.last() {
+            Some((dependency, dev)) => edges.push((*dependency, package, *dev)),
+            None => {
+                closure.insert(package);
+            }
+        }
+        path.push((package, false));
+    }
+    while edges
+        .iter()
+        .fold(false, |grew, (dependency, dependent, dev)| {
+            (!*dev && closure.contains(dependency) && closure.insert(dependent)) || grew
+        })
+    {}
+    let final_hop: BTreeSet<&str> = edges
+        .iter()
+        .filter(|(dependency, dependent, dev)| {
+            *dev && closure.contains(dependency) && !closure.contains(dependent)
+        })
+        .map(|(_, dependent, _)| *dependent)
+        .collect();
+    let names = |packages: &BTreeSet<&str>| {
+        packages
+            .iter()
+            .filter_map(|package| member_of.get(package).cloned())
+            .collect()
+    };
+    Some(Reach {
+        links: names(&closure),
+        dev_only: names(&final_hop),
+    })
 }
 
 fn manifests_near(root: &Path, paths: &[String]) -> Manifests {
@@ -1019,9 +1239,9 @@ fn manifests_near(root: &Path, paths: &[String]) -> Manifests {
         let mut dir = parent_dir(p);
         while !dir.is_empty() {
             if seen.insert(dir.to_string())
-                && let Ok(text) = crate::read_regular_text(root.join(dir).join("Cargo.toml"))
+                && crate::read_regular_text(root.join(dir).join("Cargo.toml")).is_ok()
             {
-                m.insert(dir, manifest_package_name(&text));
+                m.insert(dir);
             }
             dir = parent_dir(dir);
         }
@@ -1080,6 +1300,13 @@ pub fn crate_dir_has_lib(root: &std::path::Path, name: &str) -> bool {
     }
     if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
         for entry in entries.flatten() {
+            if !entry
+                .file_type()
+                .map(|ft| ft.is_dir() || ft.is_symlink())
+                .unwrap_or(true)
+            {
+                continue;
+            }
             let member_dir = entry.path();
             if let Ok(manifest) = crate::read_regular_text(member_dir.join("Cargo.toml"))
                 && manifest_package_name(&manifest).as_deref() == Some(name)
@@ -1107,9 +1334,16 @@ mod tests {
             manifests,
             members,
             path_packages,
-            dependents,
+            &|name| dependents(name).map(linking),
             &|_| replan_everything(),
         )
+    }
+
+    fn linking(links: Vec<String>) -> Reach {
+        Reach {
+            links,
+            dev_only: Vec::new(),
+        }
     }
 
     const MANIFEST: &str = r#"# The workspace.
@@ -1273,7 +1507,7 @@ checksum = "aaa"
                 &manifests(),
                 &m,
                 &no_packages,
-                &graph(edges),
+                &|name| graph(edges)(name).map(linking),
                 &|_| replan.clone(),
             )
         };
@@ -1291,6 +1525,155 @@ checksum = "aaa"
             pick(Replan::Everything("[patch] changed".into())),
             Selection::Widened(why) if why == "Cargo.toml changed: [patch] changed"
         ));
+    }
+
+    /// A cone's lint compiles every target of a crate whose own files changed and of one a changed
+    /// file is tested by. CONTROL: a seed the change reached any other way (a lock row, a root
+    /// manifest row, a fork) can move code under any member's tests, so the whole cone keeps its
+    /// test targets, and a root manifest row does so whichever files changed beside it.
+    #[test]
+    fn only_what_the_change_touched_has_all_its_targets_linted() {
+        let m = members(&["aterm-grid", "aterm-gui", "aterm-update", "aterm-release"]);
+        let edges: &'static [(&str, &str)] = &[("ring", "aterm-grid"), ("aterm-grid", "aterm-gui")];
+        let forks = || Some(vec![("ring".to_string(), "vendor/ring".to_string())]);
+        let all_targets = |changed: &[&str], replan: Replan| match super::select(
+            &paths(changed),
+            &manifests(),
+            &m,
+            &forks,
+            &|name| graph(edges)(name).map(linking),
+            &|_| replan.clone(),
+        ) {
+            Selection::Narrowed { all_targets, .. } => all_targets,
+            Selection::Widened(why) => panic!("widened unexpectedly: {why}"),
+        };
+        assert_eq!(
+            all_targets(&["crates/aterm-grid/src/lib.rs"], Replan::Nothing),
+            ["aterm-grid"],
+            "its dependent aterm-gui is in the cone for its default targets"
+        );
+        assert_eq!(
+            all_targets(&["publish/config.sh"], Replan::Nothing),
+            ["aterm-release"]
+        );
+        assert_eq!(
+            all_targets(
+                &["crates/aterm-grid/src/lib.rs", "publish/config.sh"],
+                Replan::Nothing
+            ),
+            ["aterm-grid", "aterm-release"]
+        );
+        let cone_of_ring = ["aterm-grid", "aterm-gui"];
+        let lock_row = Replan::Packages(BTreeSet::from(["ring".to_string()]));
+        assert_eq!(all_targets(&["Cargo.lock"], lock_row.clone()), cone_of_ring);
+        assert_eq!(
+            all_targets(&["Cargo.toml"], lock_row),
+            cone_of_ring,
+            "a [workspace.dependencies] row"
+        );
+        assert_eq!(
+            all_targets(&["vendor/ring/src/lib.rs"], Replan::Nothing),
+            cone_of_ring
+        );
+        assert_eq!(
+            all_targets(
+                &["Cargo.toml"],
+                Replan::Packages(BTreeSet::from(["aterm-grid".to_string()]))
+            ),
+            cone_of_ring,
+            "a row naming a member changes how its dependents build it"
+        );
+        assert_eq!(
+            all_targets(
+                &["Cargo.toml", "crates/aterm-grid/src/lib.rs"],
+                Replan::Packages(BTreeSet::from(["aterm-grid".to_string()]))
+            ),
+            cone_of_ring,
+            "and still does when that member's own files changed with it"
+        );
+        assert_eq!(
+            all_targets(
+                &["crates/aterm-grid/Cargo.toml", "Cargo.lock"],
+                Replan::Packages(BTreeSet::from(["aterm-grid".to_string()]))
+            ),
+            ["aterm-grid"],
+            "a member's own lock entry, from its own manifest, reaches no one else's tests"
+        );
+    }
+
+    /// A crate the cone holds only by a dev edge leaves the lint, because its library and binaries
+    /// link nothing that changed, and stays in the test compile, which takes its tests. One a seed
+    /// also links keeps its default targets, and one a changed file is tested by keeps all its
+    /// targets. CONTROL: a fork keeps the whole cone in the first pass, those crates included.
+    #[test]
+    fn a_crate_the_cone_holds_only_by_a_dev_edge_leaves_the_lint() {
+        let m = members(&["seed", "seed-two", "normal", "dev", "both", "aterm-update"]);
+        let reach = |name: &str| {
+            let (links, dev_only): (&[&str], &[&str]) = match name {
+                "seed" => (&["seed", "normal"], &["dev", "both", "aterm-update"]),
+                "ring" => (&["normal"], &["dev"]),
+                _ => (&["seed-two", "both"], &[]),
+            };
+            let owned = |names: &[&str]| names.iter().map(ToString::to_string).collect();
+            Some(Reach {
+                links: owned(links),
+                dev_only: owned(dev_only),
+            })
+        };
+        let forks = || Some(vec![("ring".to_string(), "vendor/ring".to_string())]);
+        let pick = |changed: &[&str]| {
+            let manifests: Manifests = ["crates/seed", "crates/seed-two"].into_iter().collect();
+            super::select(&paths(changed), &manifests, &m, &forks, &reach, &|_| {
+                Replan::Nothing
+            })
+        };
+        let touched = [
+            "crates/seed/src/lib.rs",
+            "crates/seed-two/src/lib.rs",
+            "tools/install.sh",
+        ];
+        let selection = pick(&touched);
+        let Selection::Narrowed {
+            crates,
+            all_targets,
+            unlinted,
+            ..
+        } = &selection
+        else {
+            panic!("widened unexpectedly: {selection:?}");
+        };
+        let cone_of_all = ["aterm-update", "both", "dev", "normal", "seed", "seed-two"];
+        assert_eq!(crates, &cone_of_all);
+        assert_eq!(all_targets, &["aterm-update", "seed", "seed-two"]);
+        assert_eq!(unlinted, &["dev"]);
+        let (scope, _) = cone("main", &selection);
+        let linted = crate::stages::tippy_passes(&scope)
+            .into_iter()
+            .flat_map(|pass| pass.args)
+            .collect::<Vec<_>>();
+        assert!(
+            !linted.iter().any(|arg| arg == "dev"),
+            "the lint leaves it out: {linted:?}"
+        );
+        assert!(
+            crate::stages::test_compile_args(&scope)
+                .iter()
+                .any(|arg| arg == "dev"),
+            "the test compile keeps it"
+        );
+        let Selection::Narrowed {
+            all_targets,
+            unlinted,
+            ..
+        } = pick(&["crates/seed/src/lib.rs", "vendor/ring/src/lib.rs"])
+        else {
+            panic!("widened unexpectedly");
+        };
+        assert_eq!(
+            all_targets,
+            ["aterm-update", "both", "dev", "normal", "seed"]
+        );
+        assert!(unlinted.is_empty(), "{unlinted:?}");
     }
 
     #[test]
@@ -1407,16 +1790,13 @@ checksum = "aaa"
 
     fn manifests() -> Manifests {
         [
-            ("crates/aterm-grid", Some("aterm-grid")),
-            ("crates/aterm-gui", Some("aterm-gui")),
-            ("crates/aterm-render", Some("aterm-render")),
-            (
-                "crates/aterm-render/tests/font_oracle/recorder",
-                Some("font-oracle-recorder"),
-            ),
-            ("crates/aterm-scrollback", Some("aterm-scrollback")),
-            ("crates/aterm-lab", Some("aterm-lab")),
-            ("libc-oracle", Some("libc-oracle")),
+            "crates/aterm-grid",
+            "crates/aterm-gui",
+            "crates/aterm-render",
+            "crates/aterm-render/tests/font_oracle/recorder",
+            "crates/aterm-scrollback",
+            "crates/aterm-lab",
+            "libc-oracle",
         ]
         .into_iter()
         .collect()
@@ -1464,16 +1844,31 @@ checksum = "aaa"
 
     #[test]
     fn a_path_is_owned_by_the_member_whose_manifest_is_nearest() {
-        let names = members(&[
-            "aterm-grid",
-            "aterm-gui",
-            "aterm-render",
-            "aterm-scrollback",
-            "aterm-lab",
-        ])
-        .names();
+        let m = Members::new(
+            [
+                "aterm-grid",
+                "aterm-gui",
+                "aterm-render",
+                "aterm-scrollback",
+                "aterm-lab",
+            ]
+            .into_iter()
+            .map(|name| Member {
+                name: name.to_string(),
+                dir: format!("crates/{name}"),
+                has_lib: true,
+            })
+            .chain([Member {
+                name: "windows-sys".to_string(),
+                dir: "crates/aterm-windows-sys-052".to_string(),
+                has_lib: true,
+            }])
+            .collect(),
+        );
         let mut mf = manifests();
-        mf.insert("", None);
+        mf.insert("");
+        mf.insert("crates/aterm-windows-sys-052");
+        mf.insert("crates/aterm-windows-sys");
         for (path, want) in [
             ("crates/aterm-grid/src/lib.rs", Some("aterm-grid")),
             ("crates/aterm-grid/tests/deep/nested.rs", Some("aterm-grid")),
@@ -1495,13 +1890,18 @@ checksum = "aaa"
             ("tools/install.sh", None),
             ("README.md", None),
             ("AGENTS.md", None),
+            (
+                "crates/aterm-windows-sys-052/src/lib.rs",
+                Some("windows-sys"),
+            ),
+            ("crates/aterm-windows-sys/src/lib.rs", None),
         ] {
-            assert_eq!(owning_member(path, &mf, &names), want, "{path}");
+            assert_eq!(owning_member(path, &mf, &m), want, "{path}");
         }
     }
 
     #[test]
-    fn the_cone_is_the_seeds_closed_under_reverse_dependency() {
+    fn the_cone_is_the_seeds_and_what_builds_on_them() {
         let m = members(&["aterm-grid", "aterm-gui", "aterm-cli", "aterm-bench"]);
         let pick = |p: &[&str], dependents: &dyn Fn(&str) -> Option<Vec<String>>| {
             narrowed(&select(
@@ -1533,39 +1933,78 @@ checksum = "aaa"
             ["aterm-grid"]
         );
         assert_eq!(
-            pick(&["crates/aterm-grid/src/lib.rs"], &|_| Some(vec![])).1,
-            ["aterm-grid"]
-        );
-        assert_eq!(
             pick(&["crates/aterm-grid/src/lib.rs"], &|_| {
-                Some(vec!["aterm-grid".into(), "some-registry-crate".into()])
+                Some(vec!["aterm-gui".into(), "some-registry-crate".into()])
             })
             .1,
-            ["aterm-grid"]
+            ["aterm-grid", "aterm-gui"],
+            "a changed crate stays in the cone though the answer leaves it out"
         );
         let (seeds, crates) = pick(&["docs/PROCESS.md", "tools/install.sh"], &graph(EDGES));
         assert!(seeds.is_empty() && crates.is_empty());
     }
 
-    /// The graph the cone closes over, read from a real workspace: a member that names a crate
-    /// only among its dev-dependencies (as aterm-models names every anchored crate, for its
-    /// source-spec closure test) depends on it; an unrelated member does not.
+    /// The graph the cone closes over, read from a real workspace. A member that names a crate only
+    /// among its dev-dependencies (as aterm-models names every anchored crate, for its source-spec
+    /// closure test) reaches it, and so does one that dev-depends on what links it normally. A dev
+    /// edge is the final hop: nothing that depends on that member links the crate, so `downstream`
+    /// and `tested_closure` stay out. A package only a dev edge reaches still reaches its dev
+    /// dependent (`astream-term` and `aterm-conformance`), and a normal edge that only a
+    /// dev-dependency's feature turns on still counts (`aterm-wasm-abi` on its macros). The whole
+    /// fixture asks cargo for colour by its config, which the read must not obey. A package only
+    /// another target's graph holds reads as reaching nothing here, so a change to its files widens,
+    /// where a change to a member's narrows.
     #[test]
-    fn a_member_that_links_a_crate_only_for_its_tests_depends_on_it() {
+    fn a_dev_edge_is_the_final_hop_of_the_cone() {
         let made = crate::mktemp_dir("atv-changed-dev-edge").expect("mktemp");
         let root = std::fs::canonicalize(&made).expect("the fixture's own path");
         std::fs::write(
             root.join("Cargo.toml"),
-            "[workspace]\nresolver='2'\nmembers=['anchored','closure','other']\n",
+            "[workspace]\nresolver='2'\nexclude=['vendored','offhost']\nmembers=['anchored','closure',\
+             'downstream','tested_closure','linked','tested_linked','conformance','macros','abi',\
+             'consumer','other']\n",
         )
         .expect("workspace manifest");
+        std::fs::create_dir_all(root.join(".cargo")).expect("config dir");
+        std::fs::write(root.join(".cargo/config.toml"), "[term]\ncolor='always'\n")
+            .expect("config");
         for (name, deps) in [
             ("anchored", ""),
             (
                 "closure",
                 "[dev-dependencies]\nanchored={path='../anchored'}\n",
             ),
-            ("other", ""),
+            (
+                "downstream",
+                "[dependencies]\nclosure={path='../closure'}\n",
+            ),
+            (
+                "tested_closure",
+                "[dev-dependencies]\nclosure={path='../closure'}\n",
+            ),
+            ("linked", "[dependencies]\nanchored={path='../anchored'}\n"),
+            (
+                "tested_linked",
+                "[dev-dependencies]\nlinked={path='../linked'}\n",
+            ),
+            ("vendored", ""),
+            (
+                "conformance",
+                "[dev-dependencies]\nvendored={path='../vendored'}\n",
+            ),
+            ("macros", ""),
+            (
+                "abi",
+                "[dependencies]\nmacros={path='../macros',optional=true}\n\
+                 [features]\nexport=['dep:macros']\n\
+                 [dev-dependencies]\nabi={path='.',features=['export']}\n",
+            ),
+            ("consumer", "[dependencies]\nabi={path='../abi'}\n"),
+            ("offhost", ""),
+            (
+                "other",
+                "[target.'cfg(target_os=\"hermit\")'.dependencies]\noffhost={path='../offhost'}\n",
+            ),
         ] {
             let package = root.join(name);
             std::fs::create_dir_all(package.join("src")).expect("fixture source dir");
@@ -1577,19 +2016,331 @@ checksum = "aaa"
             .expect("package manifest");
         }
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let found = invert(&root, Path::new(env!("CARGO")), &path, "anchored");
-        let _ = std::fs::remove_dir_all(&made);
-        let found: BTreeSet<String> = found
-            .expect("the inverted graph reads")
-            .into_iter()
-            .collect();
-        assert_eq!(
-            found,
-            ["anchored", "closure"]
-                .map(String::from)
-                .into_iter()
-                .collect()
+        let m = Members::new(
+            [
+                "anchored",
+                "closure",
+                "downstream",
+                "tested_closure",
+                "linked",
+                "tested_linked",
+                "conformance",
+                "macros",
+                "abi",
+                "consumer",
+                "other",
+            ]
+            .map(|name| Member {
+                name: name.to_string(),
+                dir: name.to_string(),
+                has_lib: true,
+            })
+            .to_vec(),
         );
+        let found = |of: &str| {
+            invert(&root, Path::new(env!("CARGO")), &path, of, &m)
+                .expect("the inverted graph reads")
+        };
+        let owned = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|n| (*n).to_string()).collect::<Vec<_>>()
+        };
+        let reach = |links: &[&str], dev_only: &[&str]| Reach {
+            links: owned(links),
+            dev_only: owned(dev_only),
+        };
+        let (anchored, vendored, macros) = (found("anchored"), found("vendored"), found("macros"));
+        let offhost = found("offhost");
+        let unknown = invert(
+            &root,
+            Path::new(env!("CARGO")),
+            &path,
+            "no-such-package",
+            &m,
+        );
+        let after_change_to = committed_fixture(&root);
+        let member_file = after_change_to("anchored/src/lib.rs");
+        let offhost_file = after_change_to("offhost/src/lib.rs");
+        let _ = std::fs::remove_dir_all(&made);
+        assert_eq!(
+            anchored,
+            reach(&["anchored", "linked"], &["closure", "tested_linked"])
+        );
+        assert_eq!(vendored, reach(&[], &["conformance"]));
+        assert_eq!(macros, reach(&["abi", "consumer", "macros"], &[]));
+        assert_eq!(
+            offhost,
+            Reach::default(),
+            "this host's graph does not hold it"
+        );
+        assert_eq!(unknown, None, "a spec the graph cannot answer widens");
+        assert!(
+            matches!(&member_file, Selection::Narrowed { seeds, .. } if seeds == &["anchored"]),
+            "{member_file:?}"
+        );
+        assert!(
+            matches!(&offhost_file, Selection::Widened(why) if why.contains("offhost")),
+            "{offhost_file:?}"
+        );
+    }
+
+    /// `root`, whose lock cargo has written, committed as the branch `base`: what [`resolve`] selects
+    /// on it, run with this test's cargo, after a change to one file.
+    fn committed_fixture(root: &Path) -> impl Fn(&str) -> Selection + '_ {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let git = {
+            let path = path.clone();
+            move |args: &[&str]| {
+                let out = git(root, &path)
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                    .args(args)
+                    .output()
+                    .expect("git runs");
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+            }
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "base"]);
+        let mut tools = Toolchain::discover(
+            Some(Path::new("/nonexistent")),
+            Path::new("/nonexistent"),
+            OsStr::new(""),
+            None,
+        );
+        tools.targo = env!("CARGO").into();
+        tools.refused = None;
+        move |file: &str| {
+            std::fs::write(root.join(file), "pub fn changed() {}\n").expect("the change");
+            let selection = resolve(root, &tools, &path, "base");
+            git(&["checkout", "-q", "--", "."]);
+            selection
+        }
+    }
+
+    /// A package outside the workspace can have a member's name, as `crates/aterm-windows-sys` has
+    /// `crates/aterm-windows-sys-052`'s, so a directory says which is which. A change to the one
+    /// outside is a seed of its own, named with its version since its bare name is the member's: it
+    /// widens where only another target's graph holds it, and where this host's does, it selects
+    /// what depends on it and not the member. CONTROL: a change to the member narrows to it and what
+    /// builds on it, and a version the read cannot follow widens.
+    #[test]
+    fn a_same_named_package_outside_the_workspace_is_no_member() {
+        let made = crate::mktemp_dir("atv-changed-same-name").expect("mktemp");
+        let root = std::fs::canonicalize(&made).expect("the fixture's own path");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver='2'\nexclude=['crates/shared','crates/held']\n\
+             members=['crates/shared-052','crates/user','crates/far','crates/held-052',\
+             'crates/near']\n",
+        )
+        .expect("workspace manifest");
+        for (dir, name, version, rest) in [
+            ("shared-052", "shared", "0.52.0", ""),
+            ("shared", "shared", "0.61.2", "[workspace]\n"),
+            (
+                "user",
+                "user",
+                "1.0.0",
+                "[dependencies]\nshared={path='../shared-052'}\n",
+            ),
+            (
+                "far",
+                "far",
+                "1.0.0",
+                "[target.'cfg(target_os=\"hermit\")'.dependencies]\n\
+                 shared={path='../shared'}\n",
+            ),
+            ("held-052", "held", "0.52.0", ""),
+            ("held", "held", "0.61.2", "[workspace]\n"),
+            (
+                "near",
+                "near",
+                "1.0.0",
+                "[dependencies]\nheld={path='../held'}\n",
+            ),
+        ] {
+            let package = root.join("crates").join(dir);
+            std::fs::create_dir_all(package.join("src")).expect("fixture source dir");
+            std::fs::write(package.join("src/lib.rs"), "").expect("empty library");
+            std::fs::write(
+                package.join("Cargo.toml"),
+                format!("[package]\nname='{name}'\nversion='{version}'\nedition='2021'\n{rest}"),
+            )
+            .expect("package manifest");
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        targo_tree(
+            &root,
+            Path::new(env!("CARGO")),
+            &path,
+            &["tree", "--workspace"],
+        )
+        .expect("cargo writes the lock");
+        let after_change_to = committed_fixture(&root);
+        let member = after_change_to("crates/shared-052/src/lib.rs");
+        let off_host = after_change_to("crates/shared/src/lib.rs");
+        let on_host = after_change_to("crates/held/src/lib.rs");
+        let _ = std::fs::remove_dir_all(&made);
+        assert_eq!(
+            narrowed(&member),
+            (paths(&["shared"]), paths(&["shared@0.52.0", "user"]))
+        );
+        assert!(
+            matches!(&off_host, Selection::Widened(why) if why.contains("shared@0.61.2")),
+            "{off_host:?}"
+        );
+        assert_eq!(
+            narrowed(&on_host),
+            (paths(&["held@0.61.2"]), paths(&["near"]))
+        );
+        let m = Members::new(vec![Member {
+            name: "shared".into(),
+            dir: "crates/shared-052".into(),
+            has_lib: true,
+        }]);
+        assert_eq!(
+            outside_packages(
+                "shared v0.52.0 (/r/crates/shared-052)\nshared v0.61.2 (/r/crates/shared)\n",
+                "/r/",
+                &m,
+            ),
+            Some(vec![(
+                "shared@0.61.2".to_string(),
+                "crates/shared".to_string()
+            )])
+        );
+        assert_eq!(
+            outside_packages("shared 0.61.2 (/r/crates/shared)\n", "/r/", &m),
+            None
+        );
+    }
+
+    /// The tree's prefixes say what depends on what, so a line that reads as neither a section
+    /// header nor a package one level under what it follows fails the whole read, which widens:
+    /// parsing past it would narrow the cone to whatever did parse. An ANSI-coloured tree (these
+    /// lines are cargo's under `CARGO_TERM_COLOR=always`) would otherwise read as one root per line.
+    /// An empty printout is cargo's `nothing to print`, which [`select`] widens on instead. CONTROL:
+    /// the same tree in plain text reads.
+    #[test]
+    fn a_tree_read_it_cannot_follow_fails_rather_than_narrowing() {
+        let m = Members::new(
+            ["x", "a", "b", "c", "d", "e"]
+                .map(|name| Member {
+                    name: name.to_string(),
+                    dir: name.to_string(),
+                    has_lib: true,
+                })
+                .to_vec(),
+        );
+        let read = |tree: &str| reached(tree, "/r/", &m);
+        let plain = "x v1.0.0 (/r/x)\n\
+                     |-- a v1.0.0 (/r/a)\n\
+                     |   [dev-dependencies]\n\
+                     |   `-- b v1.0.0 (/r/b)\n\
+                     `-- c v1.0.0 (proc-macro) (/r/c) (*)\n\
+                     [dev-dependencies]\n\
+                     `-- d v1.0.0 (/r/d)\n\
+                     \x20   `-- e v1.0.0 (/r/e)\n\
+                     \n\
+                     registry v2.0.0\n";
+        assert_eq!(
+            read(plain),
+            Some(Reach {
+                links: ["a", "c", "x"].map(String::from).to_vec(),
+                dev_only: ["b", "d"].map(String::from).to_vec(),
+            })
+        );
+        let coloured = "x v1.0.0 (/r/x)\n\
+                        \x1b[2m|--\x1b[0m a v1.0.0 (/r/a)\n\
+                        \x1b[2m|\x1b[0m   \x1b[96m\x1b[1m[dev-dependencies]\x1b[39m\x1b[22m\n\
+                        \x1b[2m|\x1b[0m   \x1b[1m\x1b[36m`--\x1b[0m b v1.0.0 (/r/b)\n";
+        assert_eq!(read(coloured), None);
+        assert_eq!(
+            read("x v1.0.0 (/r/x)\n\x1b[2m|--\x1b[0m a v1.0.0 (/r/a)\n"),
+            None,
+            "a prefix alone"
+        );
+        for misread in [
+            "x v1.0.0 (/r/x)\nwarning: not a package\n",
+            "x v1.0.0 (/r/x)\n|--\n",
+            "x v1.0.0 (/r/x)\n|       `-- deep v1.0.0 (/r/d)\n",
+            "x v1.0.0 (/r/x)\n  a v1.0.0 (/r/a)\n",
+            "x v1.0.0 (/r/x)\n[unknown-dependencies]\n",
+            "[dev-dependencies]\n",
+            "|   [dev-dependencies]\n",
+        ] {
+            assert_eq!(read(misread), None, "{misread:?}");
+        }
+        assert_eq!(read(""), Some(Reach::default()));
+        assert_eq!(read("\n"), Some(Reach::default()));
+    }
+
+    /// A seed whose answer holds no member says this host's graph does not hold it, so the seed is
+    /// not read as selecting nothing. A lock row off this host's graph is the real case.
+    #[test]
+    fn a_seed_this_hosts_graph_does_not_hold_widens() {
+        let m = members(&["aterm-grid", "aterm-gui"]);
+        let row = Replan::Packages(BTreeSet::from(["offhost".to_string()]));
+        let pick = |dependents: &dyn Fn(&str) -> Option<Vec<String>>| {
+            super::select(
+                &paths(&["Cargo.lock"]),
+                &manifests(),
+                &m,
+                &no_packages,
+                &|name| dependents(name).map(linking),
+                &|_| row.clone(),
+            )
+        };
+        for answer in [vec![], vec!["offhost".to_string()]] {
+            let sel = pick(&|_| Some(answer.clone()));
+            assert!(
+                matches!(&sel, Selection::Widened(why) if why.contains("offhost")),
+                "{answer:?}: {sel:?}"
+            );
+            assert!(cone("main", &sel).0.is_workspace());
+        }
+        assert_eq!(
+            narrowed(&pick(&|_| Some(vec!["aterm-gui".to_string()]))),
+            (vec!["offhost".to_string()], vec!["aterm-gui".to_string()]),
+            "one that reaches a member narrows"
+        );
+    }
+
+    /// clippy reads the nearest config above a manifest, so a root one is every other member's
+    /// lint, and no member owns it: it widens, through the replan a checkout answers. CONTROL: a
+    /// member's own config is that member's, and a rustfmt config selects nothing, because no
+    /// compile reads it and `fmt` takes the whole tree whatever the selection.
+    #[test]
+    fn a_root_lint_config_widens_and_a_members_own_selects_that_member() {
+        let m = members(&["aterm-grid", "aterm-link"]);
+        let pick = |changed: &str| {
+            super::select(
+                &paths(&[changed]),
+                &manifests(),
+                &m,
+                &no_packages,
+                &|name| graph(EDGES)(name).map(linking),
+                &|p| replan_of(Path::new("/no-such-checkout"), OsStr::new(""), "HEAD", p),
+            )
+        };
+        for config in ["clippy.toml", ".clippy.toml", "rust-toolchain"] {
+            assert_eq!(
+                pick(config),
+                Selection::Widened(format!(
+                    "{config} changed: it can change how every crate is built or linted"
+                ))
+            );
+        }
+        assert_eq!(
+            narrowed(&pick("crates/aterm-grid/clippy.toml")).0,
+            ["aterm-grid"]
+        );
+        for formatting in ["rustfmt.toml", ".rustfmt.toml"] {
+            let (seeds, crates) = narrowed(&pick(formatting));
+            assert!(seeds.is_empty() && crates.is_empty(), "{formatting}");
+        }
+        assert!(!crate::checks::Check::Fmt.reads(&Scope::changed("main", Vec::new(), false)));
     }
 
     #[test]
@@ -1763,6 +2514,11 @@ checksum = "aaa"
             ["aterm", "aterm-link"],
             "a vendored seed is no crate of the cone"
         );
+        assert!(
+            cone("origin/main", &bump).0.touches("astream-cap"),
+            "and is still what the change touched"
+        );
+        assert!(!cone("origin/main", &bump).0.touches("aterm-link"));
         assert_eq!(
             narrowed(&pick(&["vendor/indexmap/src/map.rs"])).1,
             ["aterm-gui"]
@@ -1799,10 +2555,18 @@ checksum = "aaa"
             "crates/e/src/lib.rs",
             "const QUOTE: &str = \"\\\"\"; include_str!(\"../../a/assets/font.bin\");",
         );
+        write(
+            "crates/f/tests/pin.rs",
+            "include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../a/assets/font.bin\"));",
+        );
+        write(
+            "crates/g/tests/pin.rs",
+            "format!(\"{}/../a/assets/font.bin\", env!(\"CARGO_MANIFEST_DIR\"));",
+        );
         let status = git(&repo, &path_env).args(["init", "-q"]).status().unwrap();
         assert!(status.success());
         let m = Members::new(
-            ["a", "b", "c", "d", "e"]
+            ["a", "b", "c", "d", "e", "f", "g"]
                 .into_iter()
                 .map(|name| Member {
                     name: name.into(),
@@ -1828,7 +2592,9 @@ checksum = "aaa"
             paths(&[
                 "crates/a/assets/font.bin",
                 "crates/d/src/lib.rs",
-                "crates/e/src/lib.rs"
+                "crates/e/src/lib.rs",
+                "crates/f/tests/pin.rs",
+                "crates/g/tests/pin.rs"
             ])
         );
         let docs = paths(&["docs/PROCESS.md"]);
@@ -1856,6 +2622,68 @@ checksum = "aaa"
         assert!(!shares_changed_input(&build, folder, &member, &elsewhere));
     }
 
+    /// A literal that continues the manifest directory, by `concat!` or a format argument, names
+    /// what the same path spelled relatively names, and starts at the member and never at the
+    /// source's folder. It names a folder as any literal does, by a trailing `/`. CONTROL: another
+    /// file, a path that stays in the member, and a `{}` that does not lead a path segment name
+    /// nothing.
+    #[test]
+    fn a_literal_that_continues_the_manifest_dir_starts_at_the_member() {
+        let root = Path::new("/repo");
+        let member = root.join("crates/a");
+        let test = member.join("tests/pin.rs");
+        let lib = member.join("src/lib.rs");
+        let changed = [root.join("crates/b/x")];
+        for text in [
+            "include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../b/x\"));",
+            "format!(\"{}/../b/x\", env!(\"CARGO_MANIFEST_DIR\"));",
+            "format!(\"{dir}/../b/x\");",
+            "format!(\"{dir:?}/../b/x\");",
+            "concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../b/\", \"x\");",
+            "format!(\"{}/../b/\", dir);",
+        ] {
+            for source in [&test, &lib] {
+                assert!(
+                    shares_changed_input(source, text, &member, &changed),
+                    "{text} in {}",
+                    source.display()
+                );
+            }
+        }
+
+        let continued = "concat!(dir, \"/../../b/x\");";
+        let relative = "include_str!(\"../../b/x\");";
+        let above = [root.join("b/x")];
+        assert!(shares_changed_input(&lib, relative, &member, &changed));
+        assert!(shares_changed_input(&lib, relative, &member, &above));
+        assert!(!shares_changed_input(&lib, continued, &member, &changed));
+        assert!(shares_changed_input(&lib, continued, &member, &above));
+
+        let under_a_folder = [root.join("crates/b/steps/one.jsonl")];
+        let folder = "concat!(dir, \"/../b/steps/\");";
+        let no_slash = "concat!(dir, \"/../b/steps\");";
+        assert!(shares_changed_input(&lib, folder, &member, &under_a_folder));
+        assert!(!shares_changed_input(
+            &lib,
+            no_slash,
+            &member,
+            &under_a_folder
+        ));
+
+        for text in [
+            "concat!(dir, \"/../c/x\");",
+            "concat!(dir, \"/x/../b\");",
+            "format!(\"{}/x/../b\", dir);",
+            "format!(\"{}../b/x\", dir);",
+            "format!(\"{{}}/../b/x\");",
+        ] {
+            assert!(
+                !shares_changed_input(&test, text, &member, &changed),
+                "{text}"
+            );
+        }
+    }
+
     #[test]
     fn a_bare_parent_literal_seeds_nothing() {
         let root = Path::new("/repo");
@@ -1867,6 +2695,10 @@ checksum = "aaa"
             "let up = \"../../\";",
             "let crates = \"../\";",
             "let here = \"./../\";",
+            "concat!(dir, \"/../\");",
+            "concat!(dir, \"/../../\");",
+            "format!(\"{}/../\", dir);",
+            "format!(\"{dir}/../../\");",
         ] {
             assert!(
                 !shares_changed_input(&lib, text, &member, &changed),
@@ -1902,7 +2734,7 @@ checksum = "aaa"
         let edges: &'static [(&str, &str)] = &[("rustix", "aterm-gui")];
         let sel = select(
             &paths(&["crates/rustix/src/lib.rs"]),
-            &[("crates/rustix", Some("rustix"))].into_iter().collect(),
+            &["crates/rustix"].into_iter().collect(),
             &m,
             &no_packages,
             &graph(edges),

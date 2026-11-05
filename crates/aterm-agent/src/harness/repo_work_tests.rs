@@ -385,18 +385,24 @@ fn app_with_lib(tmp: &Path) -> (PathBuf, PathBuf) {
     (lib, app)
 }
 
-/// Every read of a probe of `dir` cut in turn ([`read_stall`], on the probe's clock): none reads
-/// clean, `what` naming the work it holds.
+/// Every read of a probe of `dir` cut in turn ([`read_stall`], on the probe's clock), as far as the
+/// first probe that ends before its cut: none reads clean, `what` naming the work it holds. THE GAP:
+/// a probe that reads fewer on one run than on the next stops the sweep there, and the reads only
+/// the longer run takes are not cut.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn never_clean_when_cut(dir: &Path, used: &Used, what: &str) {
     for k in 0..40 {
         read_stall::set_after(k, 11_000);
         let read = probe_session(dir, Some(dir), used, Duration::from_secs(10));
+        let past_the_last_read = read_stall::pending();
         read_stall::set(0);
         assert!(
             !read.is_clean(),
             "read {k} cut: {read:?} over {what} read as clean"
         );
+        if past_the_last_read {
+            break;
+        }
     }
 }
 
@@ -1402,8 +1408,9 @@ fn a_stopped_asker_is_not_kept_waiting() {
 /// over a repository holding one unpushed commit and over one holding one
 /// changed file, a probe whose `k`-th read is starved past its limit (on the
 /// probe's clock, no sleep) reads as the work it found or as unread, for
-/// every `k`. NEGATIVE CONTROL: the same repositories pushed and clean, with
-/// no read starved, read clean.
+/// every `k` as far as the first the probe never reached, which reads whole
+/// and has no later `k` to differ from. NEGATIVE CONTROL: the same repositories
+/// pushed and clean, with no read starved, read clean.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_probe_cut_at_any_read_is_never_a_clean_repository() {
@@ -1422,13 +1429,22 @@ fn a_probe_cut_at_any_read_is_never_a_clean_repository() {
         for k in 0..24 {
             read_stall::set_after(k, 11_000);
             let read = probe(work, Some(work), Duration::from_secs(10));
+            let past_the_last_read = read_stall::pending();
             read_stall::set(0);
-            match read {
+            match &read {
                 RepoRead::Clean | RepoRead::Checked(_) | RepoRead::Gone(_) => {
                     panic!("read {k} cut: read as clean over {whole:?}")
                 }
                 RepoRead::Unread => unread += 1,
                 RepoRead::Found(_) => {}
+            }
+            if past_the_last_read {
+                assert_eq!(
+                    read,
+                    RepoRead::Found(whole.clone()),
+                    "read {k} never reached, so nothing was cut"
+                );
+                break;
             }
         }
         assert!(unread > 0, "the first read cut reads as unread");

@@ -561,6 +561,9 @@ pub(crate) struct LazyBuffer {
     /// Running sum of [`DeferredLine::link_bytes`] over `lines`: the staged
     /// rows' share of the history link budget (`Grid::history_link_budget`).
     link_bytes: usize,
+    /// Number of staged rows with image spans, so [`any_image`](Self::any_image) skips a text-only
+    /// backlog without visiting a row.
+    image_rows: usize,
     /// `lines[..linkless_front]` hold no link bytes: where the next
     /// [`strip_oldest_links`](Self::strip_oldest_links) resumes, so a flood
     /// visits each staged row once.
@@ -569,10 +572,6 @@ pub(crate) struct LazyBuffer {
     /// ([`take_arrivals`](Self::take_arrivals)): the stream's rate, as
     /// `Grid::trickle_lazy_bounded` judges it.
     arrivals_since_drain: u64,
-    /// `lines[..held]` are rows a drain left staged ([`hold`](Self::hold)): a
-    /// replay trimmed between input slices discards them first, so they count as
-    /// drained and [`should_drain`](Self::should_drain) weighs only the rest.
-    held: usize,
 }
 
 /// A hole at the front of the staged lines (the rows the flood path dropped
@@ -723,7 +722,7 @@ impl CellPool {
 impl LazyBuffer {
     /// Whether a staged row holds an image accepted by `selected`.
     pub(crate) fn any_image(&self, selected: &dyn Fn(&ImageSpan) -> bool) -> bool {
-        self.lines.iter().any(|line| line.any_image(selected))
+        self.image_rows != 0 && self.lines.iter().any(|line| line.any_image(selected))
     }
 
     /// Retain accepted image spans without materializing or draining staged text.
@@ -731,7 +730,9 @@ impl LazyBuffer {
         let mut changed = false;
         for line in &mut self.lines {
             let before = line.staged_bytes();
+            let had_images = usize::from(line.image_spans().is_some());
             if line.retain_images(keep) {
+                self.image_rows -= had_images - usize::from(line.image_spans().is_some());
                 self.staged_bytes = self
                     .staged_bytes
                     .saturating_sub(before)
@@ -750,9 +751,9 @@ impl LazyBuffer {
             cut: None,
             staged_bytes: 0,
             link_bytes: 0,
+            image_rows: 0,
             linkless_front: 0,
             arrivals_since_drain: 0,
-            held: 0,
         }
     }
 
@@ -767,6 +768,7 @@ impl LazyBuffer {
     fn stage(&mut self, deferred: DeferredLine) {
         self.staged_bytes += deferred.staged_bytes();
         self.link_bytes += deferred.link_bytes();
+        self.image_rows += usize::from(deferred.image_spans().is_some());
         self.arrivals_since_drain = self.arrivals_since_drain.saturating_add(1);
         self.lines.push_back(deferred);
     }
@@ -872,7 +874,7 @@ impl LazyBuffer {
         self.staged_bytes
     }
 
-    /// Test-only: both running sums equal a fresh walk, whichever path moved the rows, and the strip cursor's prefix holds no link.
+    /// Test-only: running counts equal a fresh walk, whichever path moved the rows, and the strip cursor's prefix holds no link.
     #[cfg(test)]
     pub(crate) fn assert_running_sums(&self) {
         assert_eq!(
@@ -897,7 +899,14 @@ impl LazyBuffer {
                 .all(|line| line.link_bytes() == 0),
             "a staged row before the strip cursor still holds a link"
         );
-        assert!(self.held <= self.lines.len(), "more rows held than staged");
+        assert_eq!(
+            self.image_rows,
+            self.lines
+                .iter()
+                .filter(|line| line.image_spans().is_some())
+                .count(),
+            "the image-row count drifted from staged rows"
+        );
     }
 
     /// Whether a flood cut is open at the front (see [`FloodCut`]).
@@ -907,27 +916,11 @@ impl LazyBuffer {
         self.cut.is_some()
     }
 
-    /// Whether the rows staged since the last drain, held ones apart ([`hold`](Self::hold)), have exceeded the drain threshold.
+    /// Whether the buffer has exceeded the drain threshold.
     #[inline]
     #[must_use]
     pub(crate) fn should_drain(&self) -> bool {
-        self.lines.len() - self.held > DRAIN_THRESHOLD
-    }
-
-    /// Whether a drain due now may [`hold`](Self::hold) the staged rows instead for a replay that trims history to `trim` rows: no more than `trim` rows and one drain's worth are staged, they weigh no more than `headroom` bytes, and none is a flood marker or holds a link or an image, which the store and the link budget treat otherwise than staging does.
-    #[must_use]
-    pub(crate) fn may_hold(&self, trim: usize, headroom: usize) -> bool {
-        self.cut.is_none()
-            && self.link_bytes == 0
-            && self.staged_bytes <= headroom
-            && self.lines.len() <= trim.saturating_add(DRAIN_THRESHOLD)
-            && !self.any_image(&|_| true)
-    }
-
-    /// Leave every staged row in place as though drained: the rows the replay's next trim discards first ([`Grid::trim_replay_history`](crate::Grid::trim_replay_history)), which a drain would store only for that trim to drop.
-    #[inline]
-    pub(crate) fn hold(&mut self) {
-        self.held = self.lines.len();
+        self.lines.len() > DRAIN_THRESHOLD
     }
 
     /// Drain all pending lines as materialized [`Line`]s, oldest first.
@@ -935,8 +928,8 @@ impl LazyBuffer {
         let marker = self.cut.take().map(FloodCut::into_line);
         self.staged_bytes = 0;
         self.link_bytes = 0;
+        self.image_rows = 0;
         self.linkless_front = 0;
-        self.held = 0;
         let pool = &mut self.pool;
         marker.into_iter().chain(
             self.lines
@@ -956,9 +949,9 @@ impl LazyBuffer {
             cut: self.cut.take(),
             staged_bytes: std::mem::take(&mut self.staged_bytes),
             link_bytes: std::mem::take(&mut self.link_bytes),
+            image_rows: std::mem::take(&mut self.image_rows),
             linkless_front: std::mem::take(&mut self.linkless_front),
             arrivals_since_drain: 0,
-            held: std::mem::take(&mut self.held),
         }
     }
 
@@ -971,14 +964,20 @@ impl LazyBuffer {
             None
         };
         let n = n - usize::from(marker.is_some());
-        let (leaving, leaving_links) =
-            self.lines.range(..n).fold((0, 0), |(bytes, links), line| {
-                (bytes + line.staged_bytes(), links + line.link_bytes())
-            });
+        let (leaving, leaving_links, leaving_images) =
+            self.lines
+                .range(..n)
+                .fold((0, 0, 0), |(bytes, links, images), line| {
+                    (
+                        bytes + line.staged_bytes(),
+                        links + line.link_bytes(),
+                        images + usize::from(line.image_spans().is_some()),
+                    )
+                });
         self.staged_bytes -= leaving;
         self.link_bytes -= leaving_links;
+        self.image_rows -= leaving_images;
         self.linkless_front = self.linkless_front.saturating_sub(n);
-        self.held = self.held.saturating_sub(n);
         let pool = &mut self.pool;
         marker.into_iter().chain(
             self.lines
@@ -990,16 +989,20 @@ impl LazyBuffer {
     /// Drain up to `n` of the newest staged rows, oldest first, never the flood marker: a width resize taking back the overflow it staged itself (`Grid::restore_reflowed_scrollback`).
     pub(crate) fn drain_back(&mut self, n: usize) -> impl Iterator<Item = Line> + '_ {
         let start = self.lines.len() - n.min(self.lines.len());
-        let (leaving, leaving_links) = self
-            .lines
-            .range(start..)
-            .fold((0, 0), |(bytes, links), line| {
-                (bytes + line.staged_bytes(), links + line.link_bytes())
-            });
+        let (leaving, leaving_links, leaving_images) =
+            self.lines
+                .range(start..)
+                .fold((0, 0, 0), |(bytes, links, images), line| {
+                    (
+                        bytes + line.staged_bytes(),
+                        links + line.link_bytes(),
+                        images + usize::from(line.image_spans().is_some()),
+                    )
+                });
         self.staged_bytes -= leaving;
         self.link_bytes -= leaving_links;
+        self.image_rows -= leaving_images;
         self.linkless_front = self.linkless_front.min(start);
-        self.held = self.held.min(start);
         let pool = &mut self.pool;
         self.lines
             .drain(start..)
@@ -1048,7 +1051,10 @@ impl LazyBuffer {
         let Some(deferred) = deferred else {
             return false;
         };
+        let had_images = usize::from(deferred.image_spans().is_some());
         let (before, after) = deferred.set_images(spans);
+        self.image_rows =
+            self.image_rows - had_images + usize::from(deferred.image_spans().is_some());
         self.staged_bytes = self
             .staged_bytes
             .saturating_sub(before)
@@ -1062,8 +1068,8 @@ impl LazyBuffer {
         self.lines.clear();
         self.staged_bytes = 0;
         self.link_bytes = 0;
+        self.image_rows = 0;
         self.linkless_front = 0;
-        self.held = 0;
         self.pool.clear();
         self.cut = None;
     }
@@ -1127,21 +1133,11 @@ impl LazyBuffer {
         for mut deferred in self.lines.drain(..n) {
             self.staged_bytes -= deferred.staged_bytes();
             self.link_bytes -= deferred.link_bytes();
+            self.image_rows -= usize::from(deferred.image_spans().is_some());
             pool.put(std::mem::take(&mut deferred.cells));
         }
         self.linkless_front = self.linkless_front.saturating_sub(n);
-        self.held = self.held.saturating_sub(n);
         n
-    }
-
-    /// Retain a suffix for a replay engine: remove oldest logical rows without
-    /// manufacturing a flood-loss marker or materializing their cells.
-    pub(crate) fn discard_retained_prefix(&mut self, n: usize) -> usize {
-        if n == 0 {
-            return 0;
-        }
-        let marker = usize::from(self.cut.take().is_some());
-        marker + self.discard_front(n.saturating_sub(marker))
     }
 
     /// The staged rows' OSC 8 payload (the running sum), O(1).

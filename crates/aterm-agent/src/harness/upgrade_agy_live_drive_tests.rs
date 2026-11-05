@@ -717,6 +717,7 @@ impl LiveRig {
         let opts = Opts {
             home: base.join("user"),
             state,
+            account_roster: None,
             sock: Some(sock),
             token: None,
             only_sid: Some(TAB.to_string()),

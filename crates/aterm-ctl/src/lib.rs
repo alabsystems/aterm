@@ -20,6 +20,9 @@ use aterm_types::control_socket;
 use aterm_types::control_verbs::{MAX_REQUEST_LINE, MAX_TASK_BYTES};
 use aterm_uds::CtlStream;
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 #[cfg(unix)]
 pub mod allocation_monitor;
 /// The `aterm-askpass` role.
@@ -32,6 +35,7 @@ pub use conn::conn_main_entry;
 pub use conn::resource_run_main_entry;
 mod await_legs;
 mod await_task;
+pub mod board;
 mod drift;
 /// The `amacs` client's `edit` and `await edit` exchanges with the window hosting its tab, the wait re-armed past every bound and every update.
 pub mod edit;
@@ -75,12 +79,18 @@ OPTIONS:
                   spawn agent=claude [cwd=<absolute>] - < task, await task
                   @<w> since=0 (the first wait; later ones @<w>:<rev>),
                   @<w> result|status|text|screen|turn|key|send|close,
-                  hold <w> on|off (its sid bare, no @). `aterm help workers`.
+                  hold <w> on|off (its sid bare, no @), and board or await
+                  task board, its board of the workers it started (a spawn's
+                  label=<word> stays on this Mac's). `aterm help workers`.
                   `--host any spawn agent=<claude|codex> - < task` picks the
                   member: of those that let this Mac drive them and have an
-                  enrolled, unwalled account of that program, the least used
-                  week, then five hours, then the fewest busy sessions, named
-                  on stderr (`--host any: chose <host> (<addr>): …`).
+                  enrolled, unwalled account of that program, one read working
+                  before an unseen one and an unseen one before a low one, then
+                  the least used week, five hours and the fewest busy sessions,
+                  named on stderr (`--host any: chose <host> (<addr>): …`). An
+                  account that says `usable` and not when it was read, from an
+                  aterm too old to say, is never chosen: update that member, or
+                  name it with `--host <node>`.
                   `--host H survey` is `survey --host H`, a fleet read that
                   needs no drive grant (and names no --fleet or --host of
                   its own).
@@ -197,10 +207,20 @@ STDIN PAYLOADS:
                   paste the STDIN bytes (<= 256 KiB) with the server's paste
                   handling (control bytes sanitized; ESC[200~/201~ bracketing
                   when the app enabled DECSET 2004), not as a raw feed.
-    spawn agent=<a> [model=<m>] [cwd=<path>] -
+    spawn agent=<a> [model=<m>] [cwd=<path>] [label=<word>] -
                   the worker's task (1 byte to 64 KiB); the client writes len=
                   itself, adds from=$ATERM_PARENT_SESSION_ID and cwd=<this
                   directory> when absent, and makes a relative cwd= absolute.
+                  Each worker it starts, here or with --host, gets a row on
+                  this Mac's board (`board`), with label=<word> (1-64 of
+                  A-Z a-z 0-9 . _ -), which it never sends.
+    board [--json] [from=<sid>] [label=<word>|<prefix>*]
+                  this Mac's board, read from its state folder (with --host,
+                  that Mac's, over a drive); `board accept <@sid|label>
+                  <word>` records a package's accept result on a row here.
+    await task board [any|all] [since=<rev>] [from=] [label=]
+                  await task over every open row of the board, each worker
+                  where it runs (with --host, that Mac's board).
 
 SOCKET RESOLUTION:
     --sock PATH, else --pid PID (<dir>/aterm-<PID>.sock), else, for a request
@@ -247,9 +267,13 @@ PUSH FRAMES (subscribe):
     and stdout carries these frames (as OUTPUT above), each tagged with a
     <local> channel id, not the sid. A BYTES body may contain newlines: once
     `bytes` is requested, do not parse the stream line by line.
-      sub <local> <sid>[ log_seq=<seq> log_ep=<e> log_base=<b>]
+      sub <local> <sid>[ log_seq=<seq> log_ep=<e> log_base=<b>][ role=<pct|->
+          attention=<pct|-> user_title=<pct|->]
                                  one per target, right after the ack; log_seq=,
-                                 log_ep= and log_base= only with the `log` stream.
+                                 log_ep= and log_base= only with the `log` stream;
+                                 role=, attention= and user_title= (as `meta`
+                                 prints them, read as the target's events start)
+                                 only with `events`.
       DELTA <local> seq=<n> screen <nrows>   then <nrows> rows: a screen
                                  snapshot at seq <n> (a skipped seq is
                                  coalescing, not loss).
@@ -1100,6 +1124,10 @@ fn targets_own_session_implicitly(parts: &[String], sock: Option<&str>, pid: Opt
     {
         return false;
     }
+    // A board's wait names its workers by the board, never this session.
+    if await_task::is_board_wait(parts) {
+        return false;
+    }
     let allow_rev = await_task::is_await_task(parts);
     let selector = selector_index(parts).map(|idx| parts[idx].as_str());
     let unpinned = sock.is_none() && pid.is_none();
@@ -1203,11 +1231,14 @@ fn claim_mux_notice_at(stamp: &Path) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(stamp)
-        .is_ok()
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    }
+    opts.open(stamp).is_ok()
 }
 
 fn announce_mux_boundary(nesting: Option<&MuxNesting>, already_said: bool) {
@@ -3152,17 +3183,18 @@ const MAX_CONTROL_TOKEN_FILE_BYTES: u64 = 256;
     any(target_os = "linux", target_os = "android"),
     any(target_arch = "x86", target_arch = "x86_64", target_arch = "riscv64"),
 ))]
-const TOKEN_FILE_OPEN_FLAGS: i32 = 0x0002_0000 | 0x0000_0800; // O_NOFOLLOW | O_NONBLOCK
+const TOKEN_FILE_OPEN_FLAGS: i32 = 0x0002_0000 | 0x0000_0800 | 0x0008_0000; // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
 
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     any(target_arch = "aarch64", target_arch = "arm"),
 ))]
-const TOKEN_FILE_OPEN_FLAGS: i32 = 0x0000_8000 | 0x0000_0800; // O_NOFOLLOW | O_NONBLOCK
+const TOKEN_FILE_OPEN_FLAGS: i32 = 0x0000_8000 | 0x0000_0800 | 0x0008_0000; // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const TOKEN_FILE_OPEN_FLAGS: i32 = 0x0000_0100 | 0x0000_0004 | 0x0100_0000; // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
 
 #[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
@@ -3973,6 +4005,16 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     if let Some(code) = drift::offline_entry(&request_parts, &local)? {
         return Ok(code);
     }
+    if board::is_board_verb(&request_parts) {
+        if sock.is_some() || pid.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "board reads this Mac's board, in its state folder; --sock and --pid name an \
+                 instance (`--host <h> board` reads another Mac's)",
+            ));
+        }
+        return board::run_read(&request_parts, None);
+    }
 
     let pinned = sock.is_some() || pid.is_some();
     let joined = request_parts.join(" ");
@@ -3983,6 +4025,21 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         redial::target_sid(&joined),
     )?;
 
+    if await_task::is_board_wait(&request_parts) {
+        validate_request_parts(&request_parts)?;
+        let dial = targets.probed_dial();
+        return await_task::run_board_wait(
+            &request_parts,
+            timeout_explicit.then_some(deadline),
+            &await_task::BoardSite {
+                at: await_task::BoardAt::Here,
+                here: Some(&dial.path),
+                own: local.fleet_node.and_then(|node| node()),
+            },
+            local.fleet_drive,
+            &redial::Redial::new(dial.follow),
+        );
+    }
     if await_task::is_await_task(&request_parts) {
         validate_request_parts(&request_parts)?;
         let dial = targets.probed_dial();
@@ -4030,17 +4087,42 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         return targets.run(|t| feed_bin_exchange(&t.path, t.origin, &prefix, &payload, deadline));
     }
     if verb_tok == Some("spawn") && verb_args.iter().any(|a| a.starts_with("agent=")) {
+        let (mut verb_args, label) = board::take_label(verb_args)?;
         let starter = worker_starter(env::var(SELF_SID_ENV).ok());
         let selector = worker_selector(selector, pinned, starter.as_deref());
+        let here = env::current_dir().ok();
         let head = worker_spawn_head(
             selector.as_deref(),
-            verb_args,
+            &verb_args,
             starter.as_deref(),
-            env::current_dir().ok().as_deref(),
+            here.as_deref(),
         )?;
         let payload = read_task_payload()?;
         let head = format!("{head} len={}", payload.len());
-        return targets.run(|t| worker_exchange(&t.path, t.origin, &head, &payload, deadline));
+        let spawned = std::cell::RefCell::new(None);
+        let code = targets
+            .run(|t| worker_exchange(&t.path, t.origin, (&head, &payload), deadline, &spawned))?;
+        if let Some(sid) = spawned.into_inner() {
+            // The row names the folder the worker was sent, as the request's head resolved it.
+            let folder = worker_folder(&verb_args, here.as_deref());
+            verb_args.retain(|a| !a.starts_with("cwd="));
+            if let Some(dir) = folder.as_deref().and_then(Path::to_str) {
+                verb_args.push(format!("cwd={dir}"));
+            }
+            board::record_spawned(&board::spawned(
+                &sid,
+                board::Placed {
+                    node: None,
+                    host: board::host_name(),
+                    account: None,
+                },
+                label,
+                (&verb_args, &payload),
+                starter.as_deref(),
+                board::now_ms(),
+            ));
+        }
+        return Ok(code);
     }
 
     {
@@ -4315,6 +4397,26 @@ fn worker_selector(given: Option<&str>, pinned: bool, starter: Option<&str>) -> 
     }
 }
 
+/// The folder a worker spawn's words (`args`) send it to, as [`worker_spawn_head`] resolves
+/// them: the last `cwd=`, a relative one under `pwd`, or `pwd` where none is named.
+fn worker_folder(args: &[String], pwd: Option<&Path>) -> Option<PathBuf> {
+    let given = args
+        .iter()
+        .rev()
+        .find_map(|a| a.strip_prefix("cwd="))
+        .map(|v| {
+            v.strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(v)
+        });
+    match given {
+        Some("") => None,
+        Some(dir) if Path::new(dir).is_relative() => Some(pwd?.join(dir).components().collect()),
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => pwd.map(Path::to_path_buf),
+    }
+}
+
 fn worker_spawn_head(
     selector: Option<&str>,
     args: &[String],
@@ -4325,7 +4427,8 @@ fn worker_spawn_head(
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "spawn agent=: {why} (aterm ctl @self spawn agent=claude [model=<m>] [cwd=<path>] - < task)"
+                "spawn agent=: {why} (aterm ctl @self spawn agent=claude [model=<m>] [cwd=<path>] \
+                 [label=<word>] - < task)"
             ),
         )
     };
@@ -4460,12 +4563,30 @@ fn feed_bin_exchange(
     Ok(served.unwrap_or_else(std::convert::identity))
 }
 
+/// What a worker's spawn adds after the usage line of an instance that predates workers
+/// ([`usage_predates_workers`]).
+const PREDATES_WORKERS: &str = "the instance does not take a worker's task (it predates \
+                                `spawn agent=`): no byte of the task was sent; update it first";
+
+/// Whether `answer` to a worker's spawn line is the usage line of an instance that predates
+/// workers: one whose spawn grammar names no `agent=`. A current instance refuses a word of the
+/// line with the same `ERR usage: spawn` line, which names `agent=` and the word refused; the
+/// server's tests hold every usage line it sends to this reading.
+#[must_use]
+pub fn usage_predates_workers(answer: &str) -> bool {
+    answer
+        .strip_prefix("ERR usage: spawn")
+        .is_some_and(|grammar| !grammar.contains("agent="))
+}
+
+/// A worker's spawn over the instance at `path`: `head`, then its task once the instance asks
+/// for it, and the answer printed; the sid it answers `OK <sid>` with goes in `spawned`.
 fn worker_exchange(
     path: &str,
     origin: TargetOrigin,
-    head: &str,
-    task: &[u8],
+    (head, task): (&str, &[u8]),
     deadline: Option<std::time::Duration>,
+    spawned: &std::cell::RefCell<Option<String>>,
 ) -> io::Result<ExitCode> {
     let path = &aterm_uds::latest::resolve(path);
     let go = aterm_types::control_verbs::task_frame_go(task.len());
@@ -4479,12 +4600,9 @@ fn worker_exchange(
         let mut reader = reply_on(&stream);
         let mut answer = read_frame_answer(&mut reader)?;
         if answer != go {
-            if answer.starts_with("ERR usage: spawn") {
+            if usage_predates_workers(&answer) {
                 stderr_line(&answer)?;
-                stderr_line(
-                    "the instance does not take a worker's task (it predates `spawn agent=`): \
-                     no byte of the task was sent; update it first",
-                )?;
+                stderr_line(PREDATES_WORKERS)?;
                 return Ok(ExitCode::FAILURE);
             }
             return print_frame_answer(&answer);
@@ -4495,6 +4613,7 @@ fn worker_exchange(
         while answer == go {
             answer = read_frame_answer(&mut reader)?;
         }
+        *spawned.borrow_mut() = remote::spawned_sid_from_answer(&answer);
         print_frame_answer(&answer)
     })?;
     Ok(served.unwrap_or_else(std::convert::identity))
@@ -5430,8 +5549,31 @@ fn acknowledge_artifact_reply(
     stream.flush()
 }
 
+#[cfg(test)]
+thread_local! {
+    static STDERR_LINES: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn stderr_line(msg: &str) -> io::Result<()> {
+    #[cfg(test)]
+    if STDERR_LINES
+        .with_borrow_mut(|lines| lines.as_mut().map(|lines| lines.push(msg.to_string())))
+        .is_some()
+    {
+        return Ok(());
+    }
     stderr_prefixed("aterm-ctl: ", msg).map_err(worded)
+}
+
+/// `act`, and the lines it told the person on this thread ([`stderr_line`]), kept from stderr.
+#[cfg(all(test, unix))]
+fn stderr_lines_of<R>(act: impl FnOnce() -> R) -> (R, Vec<String>) {
+    let before = STDERR_LINES.replace(Some(Vec::new()));
+    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(act));
+    let lines = STDERR_LINES.replace(before).unwrap_or_default();
+    let done = done.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    (done, lines)
 }
 
 fn stderr_prefixed(prefix: &str, msg: &str) -> io::Result<()> {

@@ -111,3 +111,68 @@ fn the_changed_names_are_the_committed_and_the_working_trees_once_each() {
         "CONTROL: nothing changed"
     );
 }
+
+/// A record of `common_dir` on `host` naming `paths`.
+fn at(host: &str, common_dir: &str, paths: &[&str]) -> WorkRecord {
+    WorkRecord {
+        host: host.into(),
+        common_dir: common_dir.into(),
+        paths: paths.iter().map(|p| (*p).to_string()).collect(),
+        files: u32::try_from(paths.len()).unwrap_or(u32::MAX),
+        ..WorkRecord::default()
+    }
+}
+
+/// TWO SESSIONS IN ONE REPOSITORY COUNT EACH OTHER ([`overlap`]): two records of one common dir on
+/// one host, from two worktrees, that share `src/lib.rs` and `CHANGELOG.md` count 2 each, each
+/// naming the other, and a third session there that shares no file is named by neither.
+/// NEGATIVE CONTROLS: two records in different repositories count 0, and so do two at one common
+/// dir on two hosts.
+#[test]
+fn two_sessions_in_one_repository_count_each_other() {
+    let a = WorkRecord {
+        tree: "/repo/wa".into(),
+        ..at(
+            "m1.local",
+            "/repo/.git",
+            &["CHANGELOG.md", "src/a.rs", "src/lib.rs"],
+        )
+    };
+    let b = WorkRecord {
+        tree: "/repo/wb".into(),
+        ..at(
+            "m1.local",
+            "/repo/.git",
+            &["CHANGELOG.md", "src/b.rs", "src/lib.rs"],
+        )
+    };
+    let c = at("m1.local", "/repo/.git", &["docs/c.md"]);
+    let from_a = overlap(&a, [("s-b", &b), ("s-c", &c)]);
+    let from_b = overlap(&b, [("s-a", &a), ("s-c", &c)]);
+    assert_eq!(
+        from_a,
+        Overlap {
+            files: 2,
+            peers: vec!["s-b"]
+        }
+    );
+    assert_eq!(
+        from_b,
+        Overlap {
+            files: 2,
+            peers: vec!["s-a"]
+        }
+    );
+    let elsewhere = at("m1.local", "/other/.git", &["CHANGELOG.md", "src/lib.rs"]);
+    assert_eq!(
+        overlap(&a, [("s-x", &elsewhere)]),
+        Overlap::default(),
+        "CONTROL: another repository counts 0"
+    );
+    let other_host = at("m2.local", "/repo/.git", &["CHANGELOG.md", "src/lib.rs"]);
+    assert_eq!(
+        overlap(&a, [("s-y", &other_host)]),
+        Overlap::default(),
+        "CONTROL: one common dir on two hosts counts 0"
+    );
+}

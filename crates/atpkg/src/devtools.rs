@@ -1165,7 +1165,7 @@ fn write_marker_with(
         .prefix(".page-marker-")
         .tempdir_in(dir)?;
     let staged = staging.path().join("marker");
-    let mut file = std::fs::File::create_new(&staged)?;
+    let mut file = crate::platform::open_create_new_write(&staged, 0o600)?;
     file.write_all(text.as_bytes())?;
     flush(&file)?;
     std::fs::rename(&staged, path)
@@ -1610,7 +1610,8 @@ fn prime() -> Result<(), RefreshFailed> {
         let remove = crate::prereq::RemoveOnDrop(&dir);
         let name = format!("aterm-devtools-{token}");
         let program = dir.join(&name);
-        std::fs::copy("/usr/bin/true", &program).map_err(|e| failed(format!("copy: {e}")))?;
+        crate::metadata_io::copy_regular_file(std::path::Path::new("/usr/bin/true"), &program)
+            .map_err(|e| failed(format!("copy: {e}")))?;
         let program = program
             .to_str()
             .ok_or_else(|| failed("the private directory's path is not UTF-8".into()))?;

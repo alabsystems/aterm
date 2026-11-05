@@ -8,7 +8,11 @@ pub(super) fn verify(signed: &str) -> Result<Vec<u8>, String> {
     if signed.len() > 16 * 1024 {
         return Err("SRP modulus exceeds limit".into());
     }
-    let signed = signed.replace("\r\n", "\n");
+    let signed: std::borrow::Cow<'_, str> = if signed.contains('\r') {
+        std::borrow::Cow::Owned(signed.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(signed)
+    };
     let body = signed
         .strip_prefix("-----BEGIN PGP SIGNED MESSAGE-----\n")
         .ok_or("Missing signed SRP modulus")?;
@@ -22,8 +26,7 @@ pub(super) fn verify(signed: &str) -> Result<Vec<u8>, String> {
     if text.contains(['\n', '\r']) {
         return Err("Malformed SRP modulus text".into());
     }
-    let signature = format!("-----BEGIN PGP SIGNATURE-----{signature}");
-    let signature = armor(&signature, "SIGNATURE")?;
+    let signature = armor_body(signature, "SIGNATURE")?;
     let (tag, sig, rest) = packet(&signature)?;
     if tag != 2 || !rest.is_empty() || sig.len() < 10 || sig[..3] != [4, 1, 22] {
         return Err("Unsupported SRP modulus signature".into());
@@ -80,9 +83,11 @@ pub(super) fn verify(signed: &str) -> Result<Vec<u8>, String> {
     {
         return Err("Invalid pinned Proton modulus key".into());
     }
-    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key[19..])
-        .verify(digest.as_ref(), &raw_signature)
-        .map_err(|_| "Proton modulus signature did not verify")?;
+    if !<&[u8; 32]>::try_from(&key[19..])
+        .is_ok_and(|key| astream_aead::signature::verify(key, digest.as_ref(), &raw_signature))
+    {
+        return Err("Proton modulus signature did not verify".into());
+    }
     let modulus = aterm_codec::base64::decode(text).map_err(|_| "Invalid SRP modulus encoding")?;
     if modulus.len() != 256 {
         return Err("Invalid SRP modulus length".into());
@@ -91,22 +96,49 @@ pub(super) fn verify(signed: &str) -> Result<Vec<u8>, String> {
 }
 
 pub(super) fn armor(text: &str, label: &str) -> Result<Vec<u8>, String> {
-    let start = format!("-----BEGIN PGP {label}-----");
-    let end = format!("-----END PGP {label}-----");
-    let text = text.strip_prefix(&start).ok_or("Invalid PGP armor")?;
-    let (body, trailing) = text.split_once(&end).ok_or("Unclosed PGP armor")?;
+    let text = text
+        .strip_prefix("-----BEGIN PGP ")
+        .and_then(|s| s.strip_prefix(label))
+        .and_then(|s| s.strip_prefix("-----"))
+        .ok_or("Invalid PGP armor")?;
+    armor_body(text, label)
+}
+
+fn armor_body(text: &str, label: &str) -> Result<Vec<u8>, String> {
+    let (body, trailing) = split_armor_end(text, label).ok_or("Unclosed PGP armor")?;
     if !trailing.trim().is_empty() {
         return Err("Trailing data in PGP armor".into());
     }
-    let body = body.replace("\r\n", "\n");
+    let body: std::borrow::Cow<'_, str> = if body.contains('\r') {
+        std::borrow::Cow::Owned(body.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    };
     let (_, body) = body
         .split_once("\n\n")
         .ok_or("Missing PGP armor separator")?;
-    let encoded: String = body
-        .lines()
-        .take_while(|line| !line.starts_with('='))
-        .collect();
+    let mut encoded = zeroize::Zeroizing::new(String::with_capacity(body.len()));
+    for line in body.lines().take_while(|line| !line.starts_with('=')) {
+        encoded.push_str(line);
+    }
     aterm_codec::base64::decode(encoded.trim()).map_err(|_| "Invalid PGP armor encoding".into())
+}
+
+fn split_armor_end<'a>(text: &'a str, label: &str) -> Option<(&'a str, &'a str)> {
+    const PREFIX: &str = "-----END PGP ";
+    const SUFFIX: &str = "-----";
+    let mut offset = 0;
+    while let Some(pos) = text[offset..].find(PREFIX) {
+        let start = offset + pos;
+        let after_prefix = &text[start + PREFIX.len()..];
+        if let Some(after_label) = after_prefix.strip_prefix(label)
+            && let Some(trailing) = after_label.strip_prefix(SUFFIX)
+        {
+            return Some((&text[..start], trailing));
+        }
+        offset = start + PREFIX.len();
+    }
+    None
 }
 
 pub(super) fn packet(input: &[u8]) -> Result<(u8, &[u8], &[u8]), String> {

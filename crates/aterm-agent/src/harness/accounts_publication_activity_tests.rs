@@ -6,6 +6,10 @@ use super::*;
 const NOW: i64 = 1_790_000_000;
 
 fn publication_case(cli: Cli, case: i64) -> [bool; 3] {
+    publication_case_with_unread_policy(cli, case, 0)
+}
+
+fn publication_case_with_unread_policy(cli: Cli, case: i64, unread: u8) -> [bool; 3] {
     let root = aterm_tempfile::TempDir::new().unwrap();
     let store = accounts::Store::at_for(&root.path().join("state"), cli, &root.path().join("home"));
     let path = root.path().join(cli.accounts().roster_file);
@@ -176,7 +180,21 @@ fn publication_case(cli: Cli, case: i64) -> [bool; 3] {
             20 => "enabled = false",
             _ => "accounts = \"off\"",
         };
-        fs::write(config_beside(&path), format!("[harness]\n{setting}\n")).unwrap();
+        aterm_uds::atomic_file::write(
+            &config_beside(&path),
+            format!("[harness]\n{setting}\n").as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        if unread == 1 {
+            fs::remove_file(config_beside(&path)).unwrap();
+            fs::create_dir(config_beside(&path)).unwrap();
+        }
+        #[cfg(unix)]
+        if unread == 2 {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(config_beside(&path), fs::Permissions::from_mode(0o664)).unwrap();
+        }
         let cooldown = std::sync::Mutex::new(None);
         let rediscovery = std::sync::Mutex::new(Rediscovery::default());
         let fx = UpkeepEffects {
@@ -207,7 +225,7 @@ fn publication_case(cli: Cli, case: i64) -> [bool; 3] {
                 (&path, NOW + 2, UpkeepStep::Renew),
                 &fx,
             );
-            assert_eq!(result == Upkept::Off, case == 21);
+            assert_eq!(result == Upkept::Off, matches!(case, 20 | 21));
         }
         if case == 19 {
             assert!(!store.sync_needs_recovery());
@@ -263,6 +281,23 @@ fn publication_case(cli: Cli, case: i64) -> [bool; 3] {
         ladder("local"),
         activity("foreign") && ladder("foreign"),
     ]
+}
+
+#[test]
+fn unavailable_policy_cannot_observe_publications_as_an_explicit_master_switch() {
+    for cli in [Cli::Claude].into_iter().chain(OTHER_CLIS) {
+        assert_eq!(publication_case(cli, 20), [false, false, true]);
+        assert_eq!(publication_case(cli, 21), [true, true, true]);
+        assert_eq!(
+            publication_case_with_unread_policy(cli, 20, 1),
+            [true, true, true]
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            publication_case_with_unread_policy(cli, 20, 2),
+            [true, true, true]
+        );
+    }
 }
 
 pub(crate) fn publication_transition(

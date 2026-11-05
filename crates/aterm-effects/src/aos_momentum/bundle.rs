@@ -558,7 +558,7 @@ fn decode_kind(d: &mut Dec<'_>) -> Result<ItemKind, WireFault> {
 }
 
 #[inline]
-pub(super) fn encode_row(e: &mut Enc, r: &Row) {
+fn encode_row(e: &mut Enc, r: &Row) {
     e.str(&r.item);
     e.u8(r.split.tag());
     encode_kind(e, r.kind);
@@ -574,7 +574,7 @@ pub(super) fn encode_row(e: &mut Enc, r: &Row) {
 }
 
 #[inline]
-pub(super) fn decode_row(d: &mut Dec<'_>) -> Result<Row, WireFault> {
+fn decode_row(d: &mut Dec<'_>) -> Result<Row, WireFault> {
     let item = d.str("row.item")?.to_owned();
     let split = match d.u8("row.split")? {
         0 => CorpusSplit::Train,
@@ -1063,14 +1063,6 @@ fn check_proposer(b: &UncheckedBundle) -> Result<(), BundleRefusal> {
     let ok = match b.selection.mode {
         Mode::OnDemand => b.proposer == ProposerId::on_demand() && b.round == 0 && b.index == 0,
         Mode::Search => b.round < MAX_ROUNDS,
-        Mode::Distributed => {
-            b.round == 0
-                && (b.proposer != GridProposer::new().id()
-                    || usize::try_from(b.index)
-                        .ok()
-                        .and_then(GridProposer::plan_at)
-                        .is_some_and(|p| p == b.plan.as_slice()))
-        }
     };
     if ok {
         Ok(())
@@ -1188,7 +1180,7 @@ fn check_rows(
 /// firings.
 #[inline]
 #[must_use]
-pub(super) fn row_difference(r: &Row, again: &Row) -> Option<BundleField> {
+fn row_difference(r: &Row, again: &Row) -> Option<BundleField> {
     if r.item != again.item || r.split != again.split || r.kind != again.kind {
         Some(BundleField::Row)
     } else if r.run != again.run {
@@ -1214,16 +1206,6 @@ pub(super) fn row_difference(r: &Row, again: &Row) -> Option<BundleField> {
     }
 }
 
-/// Whether `r` is a passing row, as [`check_rows`] reads one: its run and `NoStrandedLight`
-/// passed, and lane fidelity did not fail.
-#[inline]
-#[must_use]
-pub(super) const fn row_passes(r: &Row) -> bool {
-    r.run.passed()
-        && r.stranded_light.passed()
-        && !matches!(r.lane_fidelity, RowVerdict::Fail { .. })
-}
-
 #[inline]
 fn check_selection(b: &UncheckedBundle, ev: &Evaluator) -> Result<(), BundleRefusal> {
     let s = &b.selection;
@@ -1237,14 +1219,11 @@ fn check_selection(b: &UncheckedBundle, ev: &Evaluator) -> Result<(), BundleRefu
     };
     let counts_ok = match s.mode {
         Mode::OnDemand => *st == SearchStats::ONE,
-        Mode::Search | Mode::Distributed => {
+        Mode::Search => {
             st.rounds == MAX_ROUNDS
                 && counted == Some(st.proposed)
                 && st.distinct <= wide(MAX_DISTINCT)
                 && (1..=st.distinct).contains(&st.admitted)
-                && (s.mode == Mode::Search
-                    || b.proposer != GridProposer::new().id()
-                    || grid_counts(st))
         }
     };
     if !counts_ok || s.held_out_looks != 1 || b.index >= st.proposed {
@@ -1258,7 +1237,7 @@ fn check_selection(b: &UncheckedBundle, ev: &Evaluator) -> Result<(), BundleRefu
     if s.train != train
         || s.held_out != held_out
         || s.s0 != story
-        || (matches!(s.mode, Mode::Search | Mode::Distributed) && !train.beats())
+        || (s.mode == Mode::Search && !train.beats())
     {
         return Err(forged(BundleField::Sums));
     }
@@ -1269,17 +1248,6 @@ fn check_selection(b: &UncheckedBundle, ev: &Evaluator) -> Result<(), BundleRefu
         return Err(forged(BundleField::Gain));
     }
     Ok(())
-}
-
-/// Whether `st` are the counts of the grid's one round: every plan proposed is distinct.
-#[inline]
-const fn grid_counts(st: &SearchStats) -> bool {
-    let plans = wide(GridProposer::len());
-    st.proposed == plans
-        && st.distinct == plans
-        && st.oversized == 0
-        && st.duplicates == 0
-        && st.over_budget == 0
 }
 
 /// `a + b`, field by field, saturating.

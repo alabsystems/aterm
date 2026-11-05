@@ -404,6 +404,88 @@ GOTCHAS
         body: None, // generated — see `sys_page()`
     },
     Topic {
+        name: "telemetry",
+        tagline: "one row per action this Mac ran: commands, agent calls, spawns, admissions (`aterm ctl telemetry`)",
+        body: Some(
+            r#"telemetry — one versioned row for each action aterm watched, in a local log
+
+  aterm ctl telemetry                    one line a kind: count, failures, p50 and p90
+  aterm ctl telemetry --since 1d         only rows from the last day (s, m, h, d, unix ms)
+  aterm ctl telemetry rows --kind command --limit 20    the newest rows themselves
+  aterm ctl telemetry --json             one object: kinds, host facts (and `rows` under rows)
+
+WHAT IS AN ACTION
+  command     each command a tab's shell ran (its OSC 133 block, from C to D), closed
+              by the tab-status sweep: `tab_status = false` in aterm.toml writes none
+  agent-call  each agent tool call the jobs engine saw end (`aterm ctl sys jobs`)
+  spawn       each `aterm ctl spawn` this aterm answered, ok or refused
+  admission   each claim decided in this account's capacity ledger (aterm-capacity), in
+              the claimant's own process: admitted, refused or ended while it waited
+  Rows come from what aterm already measures: there is no second sampler.
+
+THE ROW (schema=1; one line, space-separated key=value, a checksum last)
+  at=<unix ms> kind= key=<digest> dir=<digest> label=<program> sid=<session> host=
+  facts=<digest> wall_ms= cpu_ms= peak_bytes= wait_ms= cache= outcome= stop= code= sig=
+  meter= sum=
+  key     a digest of the kind, the command line and its folder: the same action keeps
+          its key on every host, and no row holds a command line, an environment value or
+          a path. Each NAME=value assignment is dropped before the digest, and a command
+          whose program aterm did not confirm gets key=- (its line may be a password typed
+          at a prompt). The digest is unsalted: whoever can guess every word of a command,
+          a secret passed as an argument included, can confirm the guess from its key
+  label   one word: for a command, a program the kernel saw run (its own, or the wrapper
+          or interpreter that ran it) or a shell builtin or keyword aterm knows (`while`),
+          `-` when none was confirmed; for an agent call, the name the kernel showed its
+          job; for a spawn, the agent; for an admission, the first word of the description
+          its claimant wrote (`targo`, `lab`)
+  sid     the session's public id (`s-…`, as `aterm ctl @<sid>` and the survey name it),
+          `-` for a spawn or an admission, or before the sweep has read the session
+  facts   a digest of the host's facts: machine model, CPU, cores, memory, OS and aterm
+          version, spelled once at the head of each log file in a `kind=host` line
+  outcome ok, fail, refused or unknown
+  stop    exit, signal (sig= says which), stalled (the jobs engine judged it stuck),
+          pressure (killed under memory pressure; the schema's word, though nothing aterm
+          reads tells a pressure kill from another SIGKILL yet, so one reads signal sig=9)
+          or unknown
+  meter   exact (read at the action's own edges), sampled (read at the jobs engine's 2 s
+          passes: wall an upper bound, CPU and peak memory lower bounds) or stamped
+          (timed around the call; nothing to sample)
+  A figure aterm cannot know reads ?<source>, naming what would supply it
+  (wait_ms=?aterm-capacity, cache=?targo); na means it has no meaning for the kind.
+  aterm never guesses a figure.
+
+WHERE THE FIGURES COME FROM
+  command     wall from the block's C and D times; CPU from the shell's own rusage and
+              what it reaped, read at C and at D (unknown when both arrive in one read
+              of the tab's output); peak memory and stalled from the jobs engine
+  agent-call  the jobs engine's job: its open and end, its members' CPU and peak memory
+  spawn       the spawn verb's own time; CPU, memory and cache are na
+  admission   wall_ms and wait_ms are both the admission's wait: an admitted claim's own
+              clock (meter=exact), a refused or ended one's stopwatch (stamped); CPU and
+              peak memory are na (they are the work's, which its command row carries)
+  A command's CPU is unknown, not charged, when a job of the shell's that ran beside it
+  (`make &` from before) was reaped while it ran; a job a command leaves running spends
+  its CPU after the command, which its row does not hold.
+
+THE LOG
+  <state>/telemetry/rows.log, rotated at 4 MiB into rows.1.log … rows.3.log (four files,
+  oldest dropped): 16 MiB, about 55,000 rows at about 300 bytes a row. How far back that
+  reaches is the Mac's own rate; the summary's oldest= says it, and its dir= names the
+  folder, which only this account can read (0700, its files 0600). A writer thread
+  appends a batch at a time under the folder's lock, so a session never waits on the
+  disk; when its queue is full it drops rows and writes a `kind=gap dropped=<n>` line,
+  which the reader counts as dropped=. A line a crash cut is mended on the next append
+  and counted as torn= when read, never read as a row.
+
+THE SUMMARY
+  telemetry schema=1 rows= dropped= torn= files= bytes= since= oldest= host= facts= dir=
+  kind=<k> n= failed= stalled= wall_p50_ms= wall_p90_ms= wall_unknown= cpu_p50_ms=
+  cpu_p90_ms= cpu_unknown= peak_p50_mib= peak_p90_mib= peak_unknown=
+  Percentiles are nearest-rank over the rows that knew the figure; *_unknown counts the
+  rest. `-` means no row knew it."#,
+        ),
+    },
+    Topic {
         name: "abrew",
         tagline: "native brew compatibility inside atpkg, with no Homebrew fallback",
         body: Some(
@@ -1421,12 +1503,15 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   facts [true]                    a prompt aterm types anyway (a continuation, a done
                                   check, a land act) may end with `(aterm: <fact>)`
                                   for a hung background call (once each time it stops
-                                  making progress) or for programs of its calls macOS's
-                                  program check holds (once until none is held), whole
-                                  or not at all, never on an answer (false: none)
+                                  making progress), for programs of its calls macOS's
+                                  program check holds (once until none is held), or for
+                                  other sessions of this aterm changing a file its
+                                  branch changes (a count and their ids, once per set
+                                  of sessions), whole or not at all, never on an
+                                  answer (false: none)
   stuck_break_note [true]         at a break of the agent's background work,
-                                  type that fact as one line of aterm's own, as often
-                                  (Cruise or Land, with `facts` on)
+                                  type the first two facts as one line of aterm's own,
+                                  as often (Cruise or Land, with `facts` on)
 
   Per-agent switch: `[harness.<agent>] enabled = false` (`claude`, `codex`, `agy`,
   `muse`) stops supervising that agent alone; for `claude` and `codex` it also turns
@@ -2650,14 +2735,19 @@ READ — `aterm ctl @self sys [<view>] [--json] [since=<cursor>]`
   aterm ctl @self sys jobs          this tab's commands and agent calls: whether
                                     each still makes progress (fine, quiet, busy,
                                     slow, stuck, never-returns, waiting-you,
-                                    parked, exited) and the wait it is in
+                                    parked, exited) and the wait it is in; once
+                                    one ends, `aterm ctl telemetry` keeps its row
+                                    (`aterm help telemetry`)
   aterm ctl @self sys left          what this tab and its verify runs left
                                     running, and what macOS's program check
                                     holds, each with its proof and tier;
                                     scope=aterm lists every tab's (owner only)
+  aterm ctl end <token>...          end each row named by its end= token,
+                                    re-proven before every signal (no all, no
+                                    pattern, no bare pid; a held row has none)
   aterm ctl @self sys since=<c>     only what changed since the reply that printed
                                     next=<c>, plus the events since (pressure,
-                                    throttle, swap, disk, load, tab, orphan,
+                                    thermal, swap, disk, load, tab, orphan,
                                     lane, job)
   Views: overview tab aterm global jobs cores gpu mem disk net procs why report
   left;
@@ -2703,16 +2793,20 @@ WAIT — `aterm ctl @self await sys <condition> [for=<dur>] [timeout=<ms>]`
   aterm ctl @self await sys job=a40977 done,stuck timeout=600000
   aterm ctl @self await sys 'slots>=1' and 'avail>=8GiB' for=20m timeout=600000
   Terms: cpu, cpu.<cluster>, aterm, tab, wait, gpu, mem (normal|warn|critical),
-  swap, decompress, thrash, tab.mem, aterm.mem, throttle, jobs.stuck, jobs.quiet,
-  jobs.running, load (1-minute load per core), cores_idle (cores less the
-  5-minute load), avail (memory free without paging), slots (build slots
-  proven free); job=<id> or task=<id> then verdicts (done is exited) or
-  class=<classes>; free/disk= alone wait on a volume. Quote a term with < or >
-  (`'cpu<30%'`): the shell reads them as redirections. It answers `OK sys …`
-  with the reading that met it, or `OK timeout` (exit 124) after at most 600 s.
-  A job that exited meets done even after it leaves `sys jobs`; one that cannot
-  meet the wait, or that nobody knows, is `ERR gone job=<id>`. scope=aterm
-  (owner) reads every tab.
+  swap, decompress, thrash, tab.mem, aterm.mem, thermal (the OS's level,
+  nominal|fair|serious|critical; Linux's estimate none|light|heavy|severe ranks
+  alike), jobs.stuck, jobs.quiet, jobs.running, load (1-minute load per core),
+  cores_idle (cores less the 5-minute load), avail (memory free without
+  paging), slots (build slots proven free); job=<id> or task=<id> then
+  verdicts (done is exited) or class=<classes>; free/disk= alone wait on a
+  volume. Quote a term with < or > (`'cpu<30%'`): the shell reads them as
+  redirections. It answers `OK sys …` with the reading that met it, or
+  `OK timeout` (exit 124) after at most 600 s. A job that exited meets done
+  even after it leaves `sys jobs`; one that cannot meet the wait, or that
+  nobody knows, is `ERR gone job=<id>`. scope=aterm (owner) reads every tab.
+  quiet is cpu<25%, wait<0.25, gpu<10%, swap<1MB/s and a thermal level that
+  claims no throttling: below serious, or for Linux's estimate none, so a Mac
+  at fair can read quiet. A term after quiet replaces its term for that metric.
 
   Low-free observers (`free<` and `free<=`) take an explicit whole size with
   units, never `room`, and never request cache cleanup. They may combine with
@@ -2724,7 +2818,10 @@ WAIT — `aterm ctl @self await sys <condition> [for=<dur>] [timeout=<ms>]`
 FRESHNESS
   Sampled on demand: no Deck needs to be on screen. A request whose snapshot is
   older than fresh= pulls a reading and waits up to 1 s (1.5 s cold), else answers
-  the last one with state=stale and its age. At most four pulls a second.
+  the last one with state=stale and its age. At most four pulls a second. `sys
+  cores` and `sys report` also pull, waiting as a cold pull, whenever the held
+  snapshot has no CPU hardware sample, whatever fresh= says; so does a forced
+  `sys why` (fresh=0), which then prints the sample.
 
 PRIVACY
   No other process's arguments, environment or title is ever printed: a process
@@ -3029,10 +3126,15 @@ WHERE THEY OPEN
 
 CLOSING A TAB
   On Unix, closing a tab, its window or aterm hangs up the tab's terminal: the
-  shell gets SIGHUP, and its process group is SIGKILLed if still there about
-  250 ms later. As the shell ends, the system hangs up the job in front, and the
-  shell passes the hang-up on to its other jobs. A program that ignores SIGHUP
-  has asked to outlive its terminal, and it does:
+  shell gets SIGHUP. A shell that already ignored it has its process group
+  SIGKILLed about 250 ms later. Any other gets about 1.5 s to finish its
+  `trap ... HUP`, `zshexit` or EXIT trap before the same; one that catches SIGHUP
+  and carries on holds aterm's quit that long. Closing a tab or window also closes
+  the terminal, and that second hang-up can end a `zshexit` or bash EXIT trap
+  sooner (ATERM-KI-1104-7). As the shell ends, the system
+  hangs up the job in front, and the shell passes the hang-up on to its other
+  jobs. A program that ignores SIGHUP has asked to outlive its terminal, and it
+  does:
     make                  in front: ended
     make &                behind: ended
     nohup make [&]        ignores SIGHUP: survives, in front or behind
@@ -3057,7 +3159,9 @@ KEY USAGE (`aterm ctl help <verb>` has every flag)
   <task: up to 64 KiB>
   EOF
                              start a worker in a background tab (`OK <sid>`); also
-                             `cwd=<path>`, `model=<m>`, `autopilot=land|cruise`
+                             `cwd=<path>`, `model=<m>`, `autopilot=land|cruise`, and
+                             `label=<word>`, the package it works on, kept on this Mac's
+                             board alone
   aterm ctl await task @<a>,@<b>,… since=0 [all] [timeout=<ms>]
                              the first wait (run it in the background): wakes when a
                              worker is `done`, `exited` or `stalled`, or says `NEEDS YOU:`
@@ -3077,6 +3181,23 @@ KEY USAGE (`aterm ctl help <verb>` has every flag)
   aterm ctl @<sid> signal term
                              stop the worker; `aterm ctl @<sid> close` closes its pane
 
+THE BOARD (this Mac's record of every worker it started, here or on another Mac)
+  aterm ctl board [--json] [from=<sid>] [label=<word>|<prefix>*]
+                             one row per worker: its label, Mac (`node=`, `host=`),
+                             program, model, account, Autopilot, folder, the brief's
+                             SHA-256 (never its text), state, `rev=`, conclusion, `why=`,
+                             `checked=`, the commit it landed and the accept result;
+                             the aterm serving this Mac keeps it current, as does a
+                             wait here that asks a worker where its row says it runs
+  aterm ctl await task board [any|all] [since=0] [from=<sid>] [label=<word>]
+                             wait on every open row, each where it runs, without its
+                             sid (with no `since=`, from what the board last read)
+  aterm ctl --host <h> board | await task board since=0
+                             the same of `<h>`'s board over a drive: a dispatcher started
+                             again on another Mac resumes its predecessor's waits
+  aterm ctl board accept <@sid|label> <word>
+                             record what the package's accept test showed
+
 AGENTS
   Each agent starts interactive with the task as its first prompt, and trusts the
   spawned `cwd=` for that worker alone: `agent=claude` (Claude Code; `result` reads its
@@ -3089,11 +3210,12 @@ AGENTS
   `stalled why=signin` before anything is installed (only a person signs in: signed
   out, it opens xAI's sign-in page by itself). Any agent whose program atpkg's store
   does not hold yet (a fresh Mac before the update pass lands it) is then installed
-  by atpkg's verified install (a failed install is `stalled why=install`); where
-  `[packages] exclude`, a person's removal or a no to unattended installs (Keep ALab
-  tools up to date or Install ALab tools off in Settings ▸ Packages, or the toolset
-  removed by `aterm pkg uninstall --all`) keeps it off, nothing is installed, the
-  launch says so and the line runs any copy of the shell's own.
+  by atpkg's verified install (a failed install is `stalled why=install`, and one
+  that makes no progress for 45 minutes `stalled why=startup`, naming the install);
+  where `[packages] exclude`, a person's removal or a no to unattended installs (Keep
+  ALab tools up to date or Install ALab tools off in Settings ▸ Packages, or the
+  toolset removed by `aterm pkg uninstall --all`) keeps it off, nothing is installed,
+  the launch says so and the line runs any copy of the shell's own.
   `agent=gemini`, the retired Gemini CLI, is refused by name: agy replaces it.
 
 ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>`)
@@ -3103,21 +3225,36 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>
   answer to is refused, naming both; a word no peer answers to is refused, except by
   `survey --host`, which looks it up as a host.
   aterm ctl --host <h> spawn agent=<word> [model=<m>] [autopilot=land|cruise]
-                       [cwd=<abs-path>] - < task
+                       [cwd=<abs-path>|'cwd=~/<path>'] - < task
                              the worker's Autopilot is named here alone: a drive serves
                              no `meta`, so `meta set autopilot` runs on that Mac; each
-                             refusal names the word it refused
+                             refusal names the word it refused. `'cwd=~/<path>'` is a
+                             folder in that Mac's home, resolved there: refused where the
+                             path leaves the home (a `..`, a link out, `~user`), lies in a
+                             folder macOS guards, or is not there. Quote it: bash turns an
+                             unquoted `cwd=~/…` into this Mac's own home before aterm sees
+                             it, and that Mac gets this Mac's path
   aterm ctl --host any spawn agent=<claude|codex> [model=<m>] [autopilot=land|cruise]
-                         [cwd=<abs-path>] - < task
+                         [need=repo:<name>[,free:<n>g]] [cwd=<abs-path>|'cwd=~/<path>']
+                         - < task
                              one survey of every member picks the Mac: of those that let
-                             this Mac drive them and have an enrolled, unwalled account of
-                             that program, one read working before an unseen one, then the
-                             least used week, then five hours, then the
-                             fewest busy sessions, then by host. It says on stderr which
-                             (`--host any: chose <host> (<addr>): …`), prints `OK <sid>` as
-                             `--host <that Mac>` does, and refuses with counts where none can.
-                             The worker's `await task` and `@<sid>` verbs under `--host any`
-                             follow it to that Mac
+                             this Mac drive them, meet every `need=` by their own survey
+                             facts and have an enrolled, unwalled account of that program,
+                             one read working before an unseen one and an unseen one before
+                             a low one, then the least used week, then five hours, then the
+                             fewest busy sessions, then by host. `repo:<name>`: a checkout
+                             `~/<name>` its last read, within 30 min on its clock, found with
+                             a HEAD; `free:<n>m|g|t`: that much free on its home's volume
+                             (binary units: 150g is 150 GiB); a `cwd=~/…` needs a Mac that
+                             names its home. A Mac whose aterm is too old to say, or whose
+                             read is older, is never chosen for a need. Nor is an account
+                             that says `usable` and not when it was read, from an aterm too
+                             old to say: update that Mac, or name it with `--host <node>`.
+                             The spawn says on stderr which it chose (`--host any: chose
+                             <host> (<addr>): …`, with what it has of each need), prints
+                             `OK <sid>` as `--host <that Mac>` does, and refuses with counts
+                             where none can. The worker's `await task` and `@<sid>` verbs
+                             under `--host any` follow it to that Mac by this Mac's board
   aterm ctl --host <h> await task @<w>,… since=0 [all] [timeout=<ms>]
   aterm ctl --host <h> await task @<w>:<rev>,… [all] [timeout=<ms>]
   aterm ctl --host <h> @<w> result | status | text | screen
@@ -3144,7 +3281,19 @@ THE SURVEY & CHANNELS
                              (`  accounts: claude main 7d 42% 5h 10%, work-2 walled 3h`),
                              each by its label, never its email, and a pool it could not
                              read as `unread`; `--json` carries every row
-                             (`"accounts":null` from an aterm before 0.146)
+                             (`"accounts":null` from an aterm before 0.146). Then its home,
+                             the free space on its volume and when its checkouts were read
+                             (`  home /Users//a, 812 GiB free · checkouts read 3m ago`), and a
+                             line for each checkout aterm's setup cloned there (`~/<name>`,
+                             from github.com/<owner>/<name>; `    trust main@0123456789ab 3
+                             behind origin/main, fetched 2h ago, dirty`), read with git
+                             beside the survey at most every 10 min, offline (a survey never
+                             fetches, so `behind` is as of its last fetch of origin's main);
+                             a Mac says these at content (a grant of facts alone reads none);
+                             `--json` carries `home=`, `home_free_mb=`, `repos=`, `repos_at=`
+                             and `repos_cut=` on the instance and `"repos":[…]` (`null` from
+                             an aterm before them, at facts, before its first read, or where
+                             its rows did not all come: unknown, never none)
   Topic channels (with `aterm fabric on`, this machine only): `aterm ctl @self topic add
   <t>`, wait in the background with `aterm ctl @self await inbox since=<id> topic=<t>`,
   and broadcast with `aterm ctl @self post to=say:<t> kind=note -- '<text>'`.
@@ -3446,6 +3595,8 @@ SLOW FIRST RUNS (macOS's first-run check, not a wall)
   3. A tab adopted across an in-place update (`attribution=adopted`) still gets scans;
      open a fresh tab for heavy builds. When `syspolicyd` deadlocks with `tccd`
      (`syspolicyd=stuck` in `status`), only a restart of the Mac clears it.
+  4. A held program gets no token and is never ended: `aterm ctl @self sys left` shows
+     what waits (`state=program-check`, `end=-`) and what waits behind it.
 
 GOTCHAS
   * `probe=pending` or a folder's `unknown` means unmeasured, not `denied`.
@@ -3508,10 +3659,12 @@ MEMBERSHIP
 
   Default fleet joining chooses this machine's LAN address and reserves a free
   listener port automatically. Its stable temporary name is node-<node-id>.
-  `aterm fleet name` shows the name and alias; `aterm fleet name set m62` assigns
-  a primary name while retaining the temporary alias. Names travel in signed
-  membership entries. Conflicting primary names refuse ambiguous lookups;
-  the permanent node aliases continue to work.
+  `aterm fleet name` shows the name and alias; `aterm fleet name set studio`
+  assigns a primary name while retaining the temporary alias. An `m<N>` name is
+  the swarm roster's label: where the roster gives this Mac another label, the
+  name follows it. Names travel in signed membership entries. Conflicting
+  primary names refuse ambiguous lookups; the permanent node aliases continue
+  to work.
 
   For a separate, manually configured fleet, `aterm fleet init` on the first
   machine mints the secret, writes the join code (the secret alone) to a 0600
@@ -4975,11 +5128,19 @@ fn agent_page(sid: Option<&str>) -> String {
          nobody is using until it is, and the wait answers `OK sys …` (exit 0), `ERR unmet …`\n  \
          (exit 1: what is left is not aterm's to free; `aterm harness disk` names the largest\n  \
          holders), or exits 124 (still short: run it again). `ERR unavailable … why=no-watch`:\n  \
-         this aterm's harness is off, so nothing frees space for you. `timeout=` goes up to\n  \
-         600000; a tool that ends commands sooner needs a shorter one. aterm removes only\n  \
-         build caches no build holds and no process uses, never source, and records each\n  \
-         removal in `aterm harness ledger disk`. A build directory you delete by hand may be\n  \
-         one another session's build is using.\n",
+         this aterm's harness is off, so nothing frees space for you. `why=watch-stalled`:\n  \
+         aterm's disk watch has made no progress for two minutes, so nothing frees space for\n  \
+         you now. `timeout=` goes up to 600000; a tool that ends commands sooner needs a\n  \
+         shorter one. aterm removes only build caches no build holds and no process uses,\n  \
+         never source, and records each removal in `aterm harness ledger disk`. A build\n  \
+         directory you delete by hand may be one another session's build is using.\n",
+    );
+    s.push_str(
+        "\nLEFTOVERS (what your tab and its verify runs left running)\n  \
+         `aterm ctl @self sys left` lists them and what macOS's program check holds, each with\n  \
+         its proof; `aterm ctl end <token>` ends one row, re-proven first. Never pkill.\n  \
+         `aterm ctl @self status`'s `left=<n>:<oldest_ms>` counts the ones you started, each\n  \
+         marked `left_of=<your sid>` there.\n",
     );
     if cfg!(target_os = "macos") {
         push_macos_walls(&mut s);
@@ -5333,22 +5494,15 @@ fn init_page() -> String {
     aterm_machines::init::usage()
 }
 
-/// `aterm help init` where `aterm init` does not run.
+/// `aterm help init` where `aterm init` does not run: the roster's synopsis and description,
+/// as `aterm --help` lists them, and the refusal `aterm init` answers here.
 #[cfg(not(unix))]
 fn init_page() -> String {
-    r#"init — set up this machine from a terminal (macOS and Linux)
-
-`aterm init` configures macOS and Linux workstation defaults, shell integration,
-managed packages, secrets sync, and fleet membership. It does not run on Windows.
-
-WINDOWS SETUP
-  aterm --window --write-config   write a documented starter `aterm.toml`
-  aterm doctor                    check the resolved shell, config, and session
-  aterm help config               list every `aterm.toml` key and its precedence
-  aterm help secrets              vault enrollment and secret synchronization
-  aterm help fleet                peer discovery and remote session grants
-"#
-    .to_owned()
+    format!(
+        "init — set up a Mac or a Linux machine from a terminal; Unix only.\n\n{}\n\
+         On this platform `aterm init` is not available: it exits 2 and changes nothing.\n",
+        crate::verb_help_block(crate::Verb::Init)
+    )
 }
 
 /// Render the manual: `topic` is the optional `help <topic>` argument, `session` the caller's

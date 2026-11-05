@@ -93,14 +93,38 @@ const HEAD: usize = 8 + 16 * 32;
 /// Read `path`'s object format and architectures from its header.
 #[must_use]
 pub fn read(path: &Path) -> Option<Object> {
-    let (mut f, _) = crate::identity::open_regular_nonblock(path).ok()?;
-    let mut b = Vec::with_capacity(HEAD + 1);
-    f.by_ref().take(HEAD as u64).read_to_end(&mut b).ok()?;
+    read_with_meta(path).map(|(obj, _)| obj)
+}
+
+/// [`read`] together with the opened descriptor's `fstat` metadata.
+#[must_use]
+pub(crate) fn read_with_meta(path: &Path) -> Option<(Object, std::fs::Metadata)> {
+    let (mut f, meta) = crate::identity::open_regular_nonblock(path).ok()?;
+    let mut buf = [0u8; HEAD];
+    let n = read_up_to(&mut f, &mut buf).ok()?;
+    let obj = parse_header(&mut f, &buf[..n])?;
+    Some((obj, meta))
+}
+
+fn read_up_to(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+fn parse_header(f: &mut std::fs::File, b: &[u8]) -> Option<Object> {
     if b.len() < 20 {
         return None;
     }
     if b.starts_with(b"\x7fELF") {
-        return Some(read_elf(&b));
+        return Some(read_elf(b));
     }
     if matches!(b[0], 0xcf | 0xce) && b[1..4] == [0xfa, 0xed, 0xfe] {
         let cpu = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
@@ -110,10 +134,10 @@ pub fn read(path: &Path) -> Option<Object> {
         });
     }
     if b[..3] == [0xca, 0xfe, 0xba] && matches!(b[3], 0xbe | 0xbf) {
-        return read_fat(&b);
+        return read_fat(b);
     }
     if b.starts_with(b"MZ") {
-        return read_pe(&mut f, &b);
+        return read_pe(f, b);
     }
     None
 }
@@ -281,6 +305,35 @@ impl From<Refusal> for Error {
     }
 }
 
+/// Verify that every pre-read `(file, Object)` in `objects` matches `triple`'s format and
+/// architecture.
+///
+/// # Errors
+///
+/// The first file that is mismatched, or an empty list.
+pub fn gate_objects(triple: Triple, objects: &[(PathBuf, Object)]) -> Result<usize, Refusal> {
+    if objects.is_empty() {
+        return Err(Refusal::NoObjects { triple, scripts: 0 });
+    }
+    let (want_format, want_cpu) = expect(triple);
+    for (file, got) in objects {
+        if got.format != want_format {
+            return Err(Refusal::FormatMismatch {
+                file: file.clone(),
+                got: got.clone(),
+                triple,
+            });
+        }
+        if !got.cpus.contains(&want_cpu) {
+            return Err(Refusal::ArchMismatch {
+                file: file.clone(),
+                got: got.clone(),
+                triple,
+            });
+        }
+    }
+    Ok(objects.len())
+}
 /// Verify that every file in `files` matches `triple`'s format and architecture.
 ///
 /// # Errors
@@ -335,13 +388,12 @@ pub fn gate_tree(triple: Triple, dir: &Path) -> Result<TreeGate, Refusal> {
         dir: dir.to_path_buf(),
     })?;
     let mut scripts = Vec::new();
-    let mut objects = Vec::new();
+    let mut objects: Vec<(PathBuf, Option<Object>)> = Vec::new();
     for rel in files {
         let path = dir.join(&rel);
-        if is_script(&path) {
-            scripts.push(rel.to_string_lossy().into_owned());
-        } else {
-            objects.push(path);
+        match inspect_tree_file(&path) {
+            TreeFile::Script => scripts.push(rel.to_string_lossy().into_owned()),
+            TreeFile::Object(obj) => objects.push((path, obj)),
         }
     }
     if objects.is_empty() {
@@ -350,13 +402,51 @@ pub fn gate_tree(triple: Triple, dir: &Path) -> Result<TreeGate, Refusal> {
             scripts: scripts.len(),
         });
     }
-    let objects = gate(triple, &objects)?;
-    Ok(TreeGate { objects, scripts })
+    let (want_format, want_cpu) = expect(triple);
+    for (file, got) in &objects {
+        let Some(got) = got.clone() else {
+            return Err(Refusal::Unreadable {
+                file: file.clone(),
+                triple,
+            });
+        };
+        if got.format != want_format {
+            return Err(Refusal::FormatMismatch {
+                file: file.clone(),
+                got,
+                triple,
+            });
+        }
+        if !got.cpus.contains(&want_cpu) {
+            return Err(Refusal::ArchMismatch {
+                file: file.clone(),
+                got,
+                triple,
+            });
+        }
+    }
+    Ok(TreeGate {
+        objects: objects.len(),
+        scripts,
+    })
 }
 
-fn is_script(path: &Path) -> bool {
-    let mut two = [0u8; 2];
-    crate::identity::open_regular_nonblock(path)
-        .and_then(|(mut f, _)| f.read_exact(&mut two))
-        .is_ok_and(|()| two == *b"#!")
+enum TreeFile {
+    Script,
+    Object(Option<Object>),
+}
+
+fn inspect_tree_file(path: &Path) -> TreeFile {
+    let Ok((mut f, _)) = crate::identity::open_regular_nonblock(path) else {
+        return TreeFile::Object(None);
+    };
+    let mut buf = [0u8; HEAD];
+    let Ok(n) = read_up_to(&mut f, &mut buf) else {
+        return TreeFile::Object(None);
+    };
+    if buf[..n].starts_with(b"#!") {
+        TreeFile::Script
+    } else {
+        TreeFile::Object(parse_header(&mut f, &buf[..n]))
+    }
 }

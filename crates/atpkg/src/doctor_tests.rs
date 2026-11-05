@@ -295,6 +295,7 @@ fn a_foreign_rustup_trust_entry_is_named_with_its_repoint_and_never_repointed() 
     let build = l.build_dir("trust", 6808);
     std::fs::create_dir_all(build.join("bin")).unwrap();
     std::fs::write(build.join("bin").join("trustc"), b"trustc").unwrap();
+    std::fs::create_dir_all(build.join("lib").join("rustlib")).unwrap();
     crate::activate::atomic_symlink(&build, &crate::seam::store_current(&l)).unwrap();
     let home = synthetic_home("foreign-seam");
     let rustup = home.join(".rustup");
@@ -2588,6 +2589,7 @@ fn tippy_sibling_store(
 ) {
     let l = layout(label);
     install(&l, "trust", 8589);
+    std::fs::create_dir_all(l.build_dir("trust", 8589).join("lib").join("rustlib")).unwrap();
     let home = synthetic_home(label);
     let path = on_bin(&l);
     let bin = l.build_dir("trust", 8589).join("bin");

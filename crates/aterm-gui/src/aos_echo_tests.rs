@@ -12,7 +12,7 @@ use aterm_session::sink::SinkWriter;
 use super::super::AosWindow;
 use super::{
     ECHO_PROOF_BOUND, Echo, EchoView, HOLD_CAP, KeyRoute, Press, PressRow, admit_key, echo_verdict,
-    next_site, typed_echo_cells,
+    next_site, typed_echo_cells, unseen_verdict,
 };
 
 /// A terminal at a prompt with no shell integration, a recording attached, and the window's hold.
@@ -65,24 +65,47 @@ impl Fixture {
 
     /// Types `ch` as a raw key whose press saw `press`.
     fn admit(&mut self, ch: char, press: &Press) -> KeyRoute {
+        self.admit_as(ch, press, false)
+    }
+
+    /// Types `ch` as a raw key whose press saw `press`, under the person's grant when `covered`.
+    fn admit_as(&mut self, ch: char, press: &Press, covered: bool) -> KeyRoute {
         admit_key(
             &mut self.aos,
             &mut self.host,
             Some(RAW_KEY),
             press,
             |cells| typed_echo_cells(Some(ch), None, false, cells),
+            covered,
         )
     }
 
     /// Types `text`'s chars as raw keys, `at` and a millisecond apart.
     fn type_raw(&mut self, text: &str, at: Instant) -> Vec<KeyRoute> {
+        self.type_as(text, at, false)
+    }
+
+    /// [`Self::type_raw`] under the person's grant.
+    fn type_granted(&mut self, text: &str, at: Instant) -> Vec<KeyRoute> {
+        self.type_as(text, at, true)
+    }
+
+    fn type_as(&mut self, text: &str, at: Instant, covered: bool) -> Vec<KeyRoute> {
         text.chars()
             .enumerate()
             .map(|(i, ch)| {
                 let press = self.press_of(at + ms(u64::try_from(i).expect("short")));
-                self.admit(ch, &press)
+                self.admit_as(ch, &press, covered)
             })
             .collect()
+    }
+
+    /// What a frame at `now` proves of the open hold the person's grant opened.
+    fn unseen_at(&self, now: Instant) -> Echo {
+        let hold = self.aos.hold.as_ref().expect("a hold is open");
+        let mut view = EchoView::default();
+        view.read(&self.t, SESSION, hold);
+        unseen_verdict(hold, &view, now)
     }
 
     /// What a frame at `now` that read the terminal as `session` proves.
@@ -301,11 +324,17 @@ fn a_proof_is_bounded_from_the_first_key_and_a_late_one_releases_at_its_frame() 
 }
 
 #[test]
-fn a_run_continues_only_on_a_glyph_that_is_not_a_mask() {
+fn a_run_continues_only_on_a_glyph_that_is_neither_a_blank_nor_a_mask() {
+    // A blank the program never printed: the cursor steps past it (CSI C) and a status line is
+    // redrawn elsewhere, so the cell reads ' ' and the terminal printed since the press.
+    let stepped_past = &b"\x1b[C\x1b7\x1b[3;1Hzz\x1b8"[..];
     for (typed, shown, want) in [
         ("c", &b"c"[..], Echo::Release(1)),
         ("*", b"*", Echo::Pending),
         ("c", b"\x1b[1;3HaXc", Echo::Pending),
+        (" ", stepped_past, Echo::Pending),
+        (" ", b" ", Echo::Pending),
+        (" c", b" c", Echo::Release(2)),
     ] {
         let mut f = Fixture::new(4);
         f.t.process(b"ab");
@@ -317,6 +346,13 @@ fn a_run_continues_only_on_a_glyph_that_is_not_a_mask() {
             want,
             "{typed:?} after the run 'ab', shown {shown:?}"
         );
+        if want == Echo::Pending {
+            assert_eq!(
+                f.verdict(f.t0 + ECHO_PROOF_BOUND),
+                Echo::Refute,
+                "{typed:?} shown {shown:?}: unproven at the bound"
+            );
+        }
     }
     for (what, between, want) in [
         ("no input between", false, Echo::Release(2)),
@@ -340,9 +376,14 @@ fn a_press_off_the_live_screen_without_cells_or_past_the_cap_is_refused() {
     let refused = KeyRoute::Private(RAW_KEY);
     let raw = |f: &mut Fixture, typed: Option<char>, ime: Option<&str>| {
         let press = f.press_of(f.t0);
-        admit_key(&mut f.aos, &mut f.host, Some(RAW_KEY), &press, |cells| {
-            typed_echo_cells(typed, ime, false, cells)
-        })
+        admit_key(
+            &mut f.aos,
+            &mut f.host,
+            Some(RAW_KEY),
+            &press,
+            |cells| typed_echo_cells(typed, ime, false, cells),
+            false,
+        )
     };
     let mut f = Fixture::new(4);
     assert_eq!(raw(&mut f, Some('\r'), None), refused, "Enter has no cells");
@@ -411,15 +452,25 @@ fn a_press_off_the_live_screen_without_cells_or_past_the_cap_is_refused() {
 
     let mut f = Fixture::new(4);
     let press = f.press_of(f.t0);
-    let echoed = admit_key(&mut f.aos, &mut f.host, None, &press, |_| {
-        unreachable!("an echoed key with no hold reads no cells")
-    });
+    let echoed = admit_key(
+        &mut f.aos,
+        &mut f.host,
+        None,
+        &press,
+        |_| unreachable!("an echoed key with no hold reads no cells"),
+        false,
+    );
     assert_eq!(echoed, KeyRoute::Record);
     let _ = f.type_raw("a", f.t0);
     let press = f.press_of(f.t0);
-    let joined = admit_key(&mut f.aos, &mut f.host, None, &press, |cells| {
-        typed_echo_cells(Some('b'), None, false, cells)
-    });
+    let joined = admit_key(
+        &mut f.aos,
+        &mut f.host,
+        None,
+        &press,
+        |cells| typed_echo_cells(Some('b'), None, false, cells),
+        false,
+    );
     assert_eq!(
         joined,
         KeyRoute::Hold,
@@ -429,20 +480,277 @@ fn a_press_off_the_live_screen_without_cells_or_past_the_cap_is_refused() {
 
 #[test]
 fn no_debug_form_carries_a_held_char() {
+    for covered in [false, true] {
+        let mut f = Fixture::new(4);
+        let _ = f.type_as("Zq", f.t0, covered);
+        f.t.process(b"Zq");
+        let hold = f.aos.hold.as_ref().expect("held");
+        let mut view = EchoView::default();
+        view.read(&f.t, SESSION, hold);
+        for shown in [
+            format!("{hold:?}"),
+            format!("{view:?}"),
+            format!("{:?}", f.aos),
+        ] {
+            assert!(
+                !shown.contains('Z') && !shown.contains('q'),
+                "a held char escaped (granted: {covered}): {shown}"
+            );
+        }
+    }
+}
+
+/// A raw key with no cells, as the press path routes it.
+fn blind(f: &mut Fixture, typed: Option<char>, ime: Option<&str>, covered: bool) -> KeyRoute {
+    let press = f.press_of(f.t0);
+    admit_key(
+        &mut f.aos,
+        &mut f.host,
+        Some(RAW_KEY),
+        &press,
+        |cells| typed_echo_cells(typed, ime, false, cells),
+        covered,
+    )
+}
+
+#[test]
+fn under_the_grant_only_a_key_with_no_cells_is_held_blind() {
+    let refused = KeyRoute::Private(RAW_KEY);
     let mut f = Fixture::new(4);
-    let _ = f.type_raw("Zq", f.t0);
-    f.t.process(b"Zq");
+    assert_eq!(
+        blind(&mut f, Some('\r'), None, true),
+        KeyRoute::Hold,
+        "Enter"
+    );
+    assert_eq!(
+        blind(&mut f, Some('\u{301}'), None, true),
+        KeyRoute::Hold,
+        "a lone combining mark joins it"
+    );
     let hold = f.aos.hold.as_ref().expect("held");
-    let mut view = EchoView::default();
-    view.read(&f.t, SESSION, hold);
-    for shown in [
-        format!("{hold:?}"),
-        format!("{view:?}"),
-        format!("{:?}", f.aos),
+    assert!(
+        hold.unseen_ok && hold.blind == 2 && hold.cells.is_empty() && hold.keys.is_empty(),
+        "{hold:?}"
+    );
+    assert!(f.host.aos_holding(), "the host holds for the blind keys");
+    assert_eq!(
+        f.type_granted("a", f.t0),
+        [KeyRoute::Hold],
+        "a key with cells joins the granted hold with them"
+    );
+    assert_eq!(f.aos.hold.as_ref().expect("held").cells, ['a']);
+
+    let mut f = Fixture::new(4);
+    assert_eq!(
+        blind(&mut f, Some('\r'), None, false),
+        refused,
+        "negative control: without the grant a key with no cells stops the recording"
+    );
+    let _ = f.type_raw("a", f.t0);
+    assert_eq!(
+        blind(&mut f, Some('\r'), None, true),
+        refused,
+        "a blind key never joins a hold the grant did not open"
+    );
+
+    let mut f = Fixture::new(4);
+    let typed: String = ('a'..='z').chain('A'..='F').collect();
+    assert!(
+        f.type_granted(&typed, f.t0)
+            .iter()
+            .all(|r| *r == KeyRoute::Hold)
+    );
+    assert_eq!(
+        blind(&mut f, Some('\r'), None, true),
+        refused,
+        "a blind key past the cap"
+    );
+
+    // Text that shows a glyph beside a char with no column is no blind key: a field that masks it
+    // shows the mask, and no cell of the hold would read it.
+    for (what, ime) in [
+        ("an emoji with its variation selector", "\u{2764}\u{fe0f}"),
+        ("a letter and its combining accent", "e\u{301}"),
     ] {
-        assert!(
-            !shown.contains('Z') && !shown.contains('q'),
-            "a held char escaped: {shown}"
+        let mut f = Fixture::new(4);
+        assert_eq!(blind(&mut f, None, Some(ime), true), refused, "{what}");
+        assert!(f.aos.hold.is_none(), "{what}: nothing held");
+    }
+    let mut f = Fixture::new(4);
+    assert_eq!(
+        blind(&mut f, None, Some("\u{301}\u{200d}"), true),
+        KeyRoute::Hold,
+        "negative control: text whose every char takes no column is held blind"
+    );
+}
+
+#[test]
+fn under_the_grant_a_key_with_cells_is_held_with_them_or_stops_the_recording() {
+    let refused = KeyRoute::Private(RAW_KEY);
+
+    // Over its own glyph: held with its cells, where a mask can still refute it.
+    let mut f = Fixture::new(4);
+    f.t.process(b"ab\x1b[1;3H");
+    assert_eq!(
+        f.type_granted("a", f.t0),
+        [KeyRoute::Hold],
+        "'a' over its own 'a'"
+    );
+    assert_eq!(f.aos.hold.as_ref().expect("held").cells, ['a']);
+    let mut g = Fixture::new(4);
+    g.t.process(b"ab\x1b[1;3H");
+    assert_eq!(
+        g.type_raw("a", g.t0),
+        [refused],
+        "negative control: without the grant it stops at its press"
+    );
+
+    let mut f = Fixture::new(4);
+    f.t.process(&[b'*'; 38]);
+    assert!(f.t.grid().pending_wrap(), "the cursor waits at the margin");
+    assert_eq!(
+        f.type_granted("a", f.t0),
+        [refused],
+        "a deferred wrap, though a field shows masks"
+    );
+
+    let mut f = Fixture::new(3);
+    f.t.process(b"\r\n\r\n\r\n$ ");
+    f.t.scroll_display(1);
+    assert_eq!(
+        f.type_granted("a", f.t0),
+        [refused],
+        "a scrolled-back viewport"
+    );
+
+    let mut f = Fixture::new(4);
+    let mut press = f.press_of(f.t0);
+    press.row = PressRow::NONE;
+    assert_eq!(
+        f.admit_as('a', &press, true),
+        refused,
+        "a press that read no row"
+    );
+    let _ = f.type_granted("a", f.t0);
+    let mut press = f.press_of(f.t0);
+    press.row = PressRow::read(&f.t, Some((0, 7)));
+    assert_eq!(
+        f.admit_as('b', &press, true),
+        refused,
+        "a row read at another column than the hold's next"
+    );
+    let press = f.press_of(f.t0);
+    assert_eq!(
+        f.admit_as('b', &press, true),
+        KeyRoute::Hold,
+        "negative control: read at the hold's next column it joins"
+    );
+
+    let mut f = Fixture::new(4);
+    let typed: String = ('a'..='z').chain('A'..='F').collect();
+    assert!(
+        f.type_granted(&typed, f.t0)
+            .iter()
+            .all(|r| *r == KeyRoute::Hold)
+    );
+    assert_eq!(
+        f.type_granted("G", f.t0),
+        [refused],
+        "one column past the cap"
+    );
+
+    let mut f = Fixture::new(4);
+    let _ = f.type_granted("a", f.t0);
+    f.t.process(b"\x1b[?1049h");
+    assert_eq!(
+        f.type_granted("b", f.t0),
+        [refused],
+        "another screen than the hold's"
+    );
+
+    let mut f = Fixture::new(4);
+    let _ = f.type_raw("a", f.t0);
+    assert_eq!(
+        f.type_granted("b", f.t0),
+        [refused],
+        "a granted key never joins a hold the grant did not open"
+    );
+    let mut f = Fixture::new(4);
+    let _ = f.type_granted("a", f.t0);
+    assert_eq!(
+        f.type_raw("b", f.t0),
+        [refused],
+        "nor an ungranted key one it did"
+    );
+}
+
+#[test]
+fn a_granted_hold_logs_unseen_what_no_frame_proves_unless_a_mask_shows_in_its_cells() {
+    // Proven keys release as seen, as without the grant.
+    let mut f = Fixture::new(4);
+    let at = f.t0 + ms(10);
+    let _ = f.type_granted("ab", at);
+    f.t.process(b"ab");
+    assert_eq!(f.unseen_at(at + ms(5)), Echo::Release(2), "a proven pair");
+
+    // Nothing shown: pending to the bound, then unseen.
+    let mut f = Fixture::new(4);
+    let _ = f.type_granted("ab", at);
+    assert_eq!(f.unseen_at(at + ECHO_PROOF_BOUND - ms(1)), Echo::Pending);
+    assert_eq!(
+        f.unseen_at(at + ECHO_PROOF_BOUND),
+        Echo::Unseen,
+        "at the bound"
+    );
+    assert_eq!(
+        f.verdict(at + ECHO_PROOF_BOUND),
+        Echo::Refute,
+        "negative control: the same hold without the grant is refuted"
+    );
+
+    // A mask in any held cell refutes at once, wherever the cursor is.
+    for (what, fed) in [
+        ("in place", &b"*b"[..]),
+        ("the cursor parked elsewhere", b"a*\x1b[3;1H"),
+        ("the cursor back at the start", b"\x1b[1;3H\xe2\x80\xa2"),
+    ] {
+        let mut f = Fixture::new(4);
+        let _ = f.type_granted("ab", at);
+        f.t.process(fed);
+        assert_eq!(f.unseen_at(at + ms(5)), Echo::Refute, "{what}");
+        assert_eq!(
+            f.unseen_at(at + ECHO_PROOF_BOUND),
+            Echo::Refute,
+            "{what}, at the bound"
         );
     }
+    let mut f = Fixture::new(4);
+    let _ = f.type_granted("*", at);
+    f.t.process(b"*");
+    assert_eq!(
+        f.unseen_at(at + ECHO_PROOF_BOUND),
+        Echo::Unseen,
+        "a typed mask glyph shown as itself is no mask"
+    );
+
+    // A view of another session or a moved screen proves nothing: unseen, unless masked.
+    let mut f = Fixture::new(4);
+    let _ = f.type_granted("ab", at);
+    f.t.process(b"\x1b[?1049h");
+    assert_eq!(f.unseen_at(at + ms(5)), Echo::Unseen, "the screen swapped");
+
+    // A blind hold waits to its bound, or until the view moves, and is never released as seen.
+    let mut f = Fixture::new(4);
+    assert_eq!(blind(&mut f, Some('\r'), None, true), KeyRoute::Hold);
+    assert_eq!(f.unseen_at(f.t0 + ECHO_PROOF_BOUND - ms(1)), Echo::Pending);
+    assert_eq!(f.unseen_at(f.t0 + ECHO_PROOF_BOUND), Echo::Unseen);
+    let _ = f.type_granted("ab", f.t0);
+    f.t.process(b"ab");
+    assert_eq!(
+        f.unseen_at(f.t0 + ms(5)),
+        Echo::Pending,
+        "a proven pair behind a blind key waits with it"
+    );
+    f.t.process(b"\x1b[?1049h");
+    assert_eq!(f.unseen_at(f.t0 + ms(5)), Echo::Unseen, "the view moved");
 }

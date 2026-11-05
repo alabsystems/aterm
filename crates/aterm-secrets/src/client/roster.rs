@@ -124,7 +124,12 @@ fn base_swarm_roster_for_denial_snapshot(paths: &Paths) -> crate::Result<Option<
     )
 }
 
-pub fn swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
+/// Negative control restoring the old read that confuses a writer with an absent roster.
+///
+/// # Errors
+/// Local state or the verified cache cannot be read safely, or the roster is malformed.
+#[cfg(any(test, debug_assertions))]
+pub fn test_unwaited_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
     swarm_roster_with(paths, || {}, || {})
 }
 
@@ -165,6 +170,7 @@ pub(crate) fn with_roster_observation<T>(
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 fn swarm_roster_with(
     paths: &Paths,
     after_config: impl FnOnce(),
@@ -180,7 +186,6 @@ fn swarm_roster_with(
 }
 
 /// Read while the caller retains the state lock for this vault, shared or exclusive.
-#[cfg(test)]
 pub(super) fn swarm_roster_held(
     paths: &Paths,
     lock: &StateLock,
@@ -688,6 +693,21 @@ pub(super) fn overlay_log_membership(
         .flat_map(|m| m.node_id.iter().chain(m.node_key.iter()))
         .map(|n| n.trim().to_ascii_lowercase())
         .collect();
+    // The node keys current seats hold in the log: a removed row that names one is the seat that
+    // held it before a move (one-mesh A15), whose node key is the moved seat's now, so that row
+    // denies it nothing. A seat the roster denies otherwise stays denied by its own rows.
+    let seated_nodes: BTreeSet<String> = membership
+        .nodes()
+        .iter()
+        .filter(|(_, standing)| {
+            matches!(standing, crate::membership_log::NodeStanding::Member(actor)
+            if membership.get(actor).is_some_and(|m| {
+                !log.recipient_is_removed(&m.binding.recipient())
+                    && !left_out(&m.binding.recipient())
+            }))
+        })
+        .map(|(nk, _)| aterm_codec::hex::encode_lower(nk))
+        .collect();
     for m in log_removed_rows {
         removed_labels.insert(m.label);
         for alias in m.aliases {
@@ -706,6 +726,7 @@ pub(super) fn overlay_log_membership(
         }
         if let Some(node_key) = m.node_key
             && !active_nodes.contains(&node_key.trim().to_ascii_lowercase())
+            && !seated_nodes.contains(&node_key.trim().to_ascii_lowercase())
         {
             roster.deny_nodes.push(node_key);
         }
@@ -1056,8 +1077,10 @@ pub(super) fn overlay_log_membership(
 /// Read the verified `aterm-swarm-lease` `holder` label from the locally applied vault copy, if present.
 ///
 /// # Errors
-/// Local state or the verified cache cannot be read safely, or `aterm-swarm-lease` is malformed.
+/// Local state or the verified cache cannot be read safely, the roster remains busy, or
+/// `aterm-swarm-lease` or `aterm-swarm-roster` is malformed.
 pub fn swarm_lease_holder(paths: &Paths) -> crate::Result<Option<String>> {
+    let roster = swarm_roster_until(paths, Instant::now() + Duration::from_millis(250))?;
     let Some(expected) = config(paths)? else {
         return Ok(None);
     };
@@ -1086,7 +1109,7 @@ pub fn swarm_lease_holder(paths: &Paths) -> crate::Result<Option<String>> {
     {
         return Ok(None);
     }
-    if let Ok(Some(roster)) = swarm_roster(paths) {
+    if let Some(roster) = roster {
         if roster.is_label_denied(&holder) || roster.is_node_denied(&holder) {
             return Ok(None);
         }
@@ -1116,6 +1139,7 @@ pub fn resolve_local_swarm_label(
     paths: &Paths,
     hostnames: &[String],
 ) -> crate::Result<Option<String>> {
+    let roster_opt = swarm_roster_until(paths, Instant::now() + Duration::from_millis(250))?;
     let Some(expected) = config(paths)? else {
         return Ok(None);
     };
@@ -1126,7 +1150,6 @@ pub fn resolve_local_swarm_label(
         return Ok(None);
     }
     let recipient = identity.recipient().to_bech32();
-    let roster_opt = swarm_roster(paths)?;
     if let Some(roster) = &roster_opt
         && let Some(member) = roster.member_by_recipient(&recipient)
     {
@@ -1310,7 +1333,7 @@ pub fn admin_seed_swarm_roster(
 ) -> crate::Result<SwarmRoster> {
     let admin = admin_open(paths)?;
     let mut doc = admin.doc.clone();
-    let log = log_labels(paths);
+    let log = log_labels(paths)?;
     let roster = build_seeded_roster(&admin, &doc, bonjour_hosts, &log)?;
     doc.set_entry(
         &Audience::Everyone,
@@ -1389,12 +1412,14 @@ pub(super) fn load_or_seed_swarm_roster_with_log(
 /// The labels the membership log at `paths` holds (F15: the allowing member assigns `m<N>` in
 /// its `Admit`): each member's by its age recipient, and every label any founder or `Admit`
 /// claims. Empty where this Mac holds no log.
-pub(super) fn log_labels(paths: &Paths) -> (BTreeMap<String, String>, Vec<String>) {
-    let Ok(store) = load_records(paths) else {
-        return (BTreeMap::new(), Vec::new());
+pub(super) fn log_labels(paths: &Paths) -> crate::Result<(BTreeMap<String, String>, Vec<String>)> {
+    let Some(config) = config(paths)? else {
+        return Ok((BTreeMap::new(), Vec::new()));
     };
+    let store = super::load_records_for(paths, &config)?;
+    let store = log_entries::checked_author_projection_for(paths, &config, &store)?;
     let Some(log) = store.log() else {
-        return (BTreeMap::new(), Vec::new());
+        return Ok((BTreeMap::new(), Vec::new()));
     };
     let membership = log.membership();
     let mut active_members: Vec<_> = membership
@@ -1439,7 +1464,7 @@ pub(super) fn log_labels(paths: &Paths) -> (BTreeMap<String, String>, Vec<String
         )
         .collect();
     let all = membership.claimed_labels().iter().cloned().collect();
-    (by_recipient, all)
+    Ok((by_recipient, all))
 }
 
 /// Update `aterm-swarm-roster` in `doc` when the approver admits `newly_approved`
@@ -1627,7 +1652,14 @@ mod tests {
         let raw = base_swarm_roster(paths).unwrap().unwrap();
         assert!(raw.member_by_label_or_alias("m7").is_some());
         assert!(!raw.is_label_denied("m7"));
-        assert!(safe(Some(&swarm_roster(paths).unwrap().unwrap())));
+        assert!(safe(Some(
+            &swarm_roster_until(
+                paths,
+                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+            )
+            .unwrap()
+            .unwrap()
+        )));
 
         let mut exposed = Vec::new();
         for after_base in [false, true] {
@@ -1668,7 +1700,14 @@ mod tests {
             if !safe(raced.as_ref()) {
                 exposed.push(after_base);
             }
-            assert!(safe(Some(&swarm_roster(paths).unwrap().unwrap())));
+            assert!(safe(Some(
+                &swarm_roster_until(
+                    paths,
+                    std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+                )
+                .unwrap()
+                .unwrap()
+            )));
         }
         macs.server.stop();
         assert!(
@@ -1935,7 +1974,12 @@ email = "one@example.org"
         );
         {
             let lock = StateLock::take(&member_m4_paths).unwrap();
-            assert!(swarm_roster(&member_m4_paths).unwrap().is_none());
+            assert_eq!(
+                swarm_roster_until(&member_m4_paths, std::time::Instant::now())
+                    .unwrap_err()
+                    .kind(),
+                crate::ErrorKind::VaultBusy,
+            );
             let under_lock = swarm_roster_held(&member_m4_paths, &lock)
                 .unwrap()
                 .expect("roster remains readable by same-thread StateLock holder");
@@ -2347,7 +2391,14 @@ email = "one@example.org"
         .unwrap();
         let _ = admin_seed_swarm_roster(&admin_paths, &[]).unwrap();
 
-        assert!(swarm_roster(&admin_paths).unwrap().is_some());
+        assert!(
+            swarm_roster_until(
+                &admin_paths,
+                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+            )
+            .unwrap()
+            .is_some()
+        );
         assert_eq!(
             resolve_local_swarm_label(&admin_paths, &["m22.local".to_owned()])
                 .unwrap()
@@ -2362,7 +2413,12 @@ email = "one@example.org"
         failed_state.failed = true;
         save_state(&admin_paths, &failed_state).unwrap();
         assert!(
-            swarm_roster(&admin_paths).unwrap().is_none(),
+            swarm_roster_until(
+                &admin_paths,
+                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+            )
+            .unwrap()
+            .is_none(),
             "failed apply state must not expose un-overlaid base_swarm_roster"
         );
         assert_eq!(
@@ -2376,7 +2432,12 @@ email = "one@example.org"
             .insert("other".to_owned(), "00".repeat(32));
         save_state(&admin_paths, &pending_state).unwrap();
         assert!(
-            swarm_roster(&admin_paths).unwrap().is_none(),
+            swarm_roster_until(
+                &admin_paths,
+                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+            )
+            .unwrap()
+            .is_none(),
             "pending apply state must not expose un-overlaid base_swarm_roster"
         );
         assert_eq!(
@@ -2388,7 +2449,14 @@ email = "one@example.org"
         let mut unpinned_cfg = clean_cfg.clone();
         unpinned_cfg.signer = None;
         save_config(&admin_paths, &unpinned_cfg).unwrap();
-        assert!(swarm_roster(&admin_paths).unwrap().is_none());
+        assert!(
+            swarm_roster_until(
+                &admin_paths,
+                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+            )
+            .unwrap()
+            .is_none()
+        );
         assert_eq!(
             resolve_local_swarm_label(&admin_paths, &["m22.local".to_owned()]).unwrap(),
             None

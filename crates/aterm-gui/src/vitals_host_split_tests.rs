@@ -424,18 +424,6 @@ fn a_pull_is_cold_for_the_split_a_margin_inside_the_longest_window() {
     assert!(!split.cold(inside), "the margin and more inside");
 }
 
-#[test]
-fn a_kernel_name_is_the_swept_one_whole_or_cut_by_one() {
-    assert!(names_the_same("mds_stores", "mds_stores"));
-    assert!(names_the_same("SetStoreUpdateSe", "SetStoreUpdateS"));
-    let swept = String::from_utf8_lossy(&"Приложен".as_bytes()[..15]);
-    assert_eq!(swept, "Приложе\u{FFFD}");
-    assert!(names_the_same("Приложен", &swept));
-    assert!(!names_the_same("Приложен", "Приложе"));
-    assert!(!names_the_same("mds_stores", "mds"));
-    assert!(!names_the_same("mds", "mds_stores"));
-}
-
 /// THE KERNEL'S READERS READ THIS PROCESS AS A SPLIT TICK TAKES IT (macOS,
 /// live, [`CoalProbe::KERNEL`]): the self-check passes and launchd reads as
 /// Apple's, so the lane is on and vouches; the sweep asked for coalitions
@@ -444,9 +432,10 @@ fn a_kernel_name_is_the_swept_one_whole_or_cut_by_one() {
 /// version and launchd's read, its own the same twice; and its birth reads
 /// the same in unix ms through its record, through the table and through
 /// its BSD info (`aterm_uds::process::read_process_birth`), under a name
-/// that is the sweep's for it, which the sweep holds cut (the test binary,
-/// `aterm_gui-<hash>`, is named past the short info's 15 bytes). NEGATIVE
-/// CONTROL: launchd's record names another process than this one's row.
+/// that is the sweep's for it, which the record holds cut and the sweep
+/// whole (the test binary, `aterm_gui-<hash>`, is named past `p_comm`'s 16
+/// bytes). NEGATIVE CONTROL: launchd's record names another process than
+/// this one's row.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_kernels_readers_read_this_process_as_a_split_tick_takes_it() {
@@ -488,14 +477,17 @@ fn the_kernels_readers_read_this_process_as_a_split_tick_takes_it() {
         (kernel.births)().and_then(|table| table.get(&me).cloned()),
         Some((name.clone(), ms))
     );
-    assert!(row.name.len() < name.len(), "{name:?} swept {:?}", row.name);
+    assert!(name.len() < row.name.len(), "{name:?} swept {:?}", row.name);
     assert!(
-        names_the_same(&name, &row.name),
+        aterm_vitals::model::same_process_name(&name, &row.name),
         "{name:?} swept {:?}",
         row.name
     );
     let (launchd, _) = (kernel.birth)(1).expect("launchd's record");
-    assert!(!names_the_same(&launchd, &row.name), "{launchd:?}");
+    assert!(
+        !aterm_vitals::model::same_process_name(&launchd, &row.name),
+        "{launchd:?}"
+    );
     let version = (kernel.version)(me).expect("this process's pid version");
     assert_eq!((kernel.version)(me), Some(version), "no exec between");
     assert_eq!(version, swept_version, "the sweep's");
@@ -1315,6 +1307,7 @@ fn the_why_fixture_reads_its_scene_over_the_hosts_own_split_ticks() {
             label: "Tab 1".into(),
             program: String::new(),
             tab_id: None,
+            agent_leader: None,
         }],
         ..live.clone()
     };

@@ -712,7 +712,7 @@ fn about_and_legacy_settings_drafts_survive_split_restore_and_update_carry() {
         );
         assert_eq!(settings_snapshot(&app, settings_view), before);
 
-        let captured = app.capture_manifest(true);
+        let captured = app.capture_manifest(true, false);
         assert_eq!(captured.windows[0].restored_tabs[0].root, root);
         assert_eq!(
             captured.windows[0].restored_tabs[0].focused_path,
@@ -948,6 +948,117 @@ fn native_only_restore_never_discards_a_seamlessly_adopted_bootstrap() {
     assert!(app.structural_invariants_ok());
 }
 
+/// A lone Workers list in window 0: the person never had a shell there, so the bootstrap goes and
+/// the list is what stands, with the window's focus.
+#[test]
+fn a_successors_fresh_bootstrap_is_retired_by_a_lone_workers_list_in_window_0() {
+    for (path, successor) in [("cold", false), ("successor", true)] {
+        let mut app = App::headless_for_test();
+        app.handoff_successor = successor;
+        app.frontmost_window = None;
+        app.restore_into_window(
+            WindowId(0),
+            restore::WindowLayout::lone_workers_list(24, 80),
+        );
+        assert_eq!(app.frontmost_window, Some(WindowId(0)), "{path}");
+        let window = &app.windows[&WindowId(0)];
+        assert_eq!(window.tab_set.len(), 1, "{path}: only the list");
+        assert_eq!(window.tab_set.home(), window.tab_set.active_id(), "{path}");
+        assert!(window.tab_set.home().is_some(), "{path}");
+        assert!(window.layouts.is_empty(), "{path}");
+        assert!(window.front_terminal().is_none(), "{path}");
+        assert_eq!(app.focused_session_id(WindowId(0)), None, "{path}");
+        assert!(
+            app.pool.get(0).is_none(),
+            "{path}: the fresh bootstrap retired"
+        );
+        assert!(
+            app.store.read().unwrap().snapshot().is_empty(),
+            "{path}: no session registered in its place"
+        );
+        let (_, view) = app
+            .active_native_view(WindowId(0))
+            .expect("the list restored");
+        assert_eq!(
+            app.windows[&WindowId(0)].window_focus,
+            crate::front_content::WindowFocus::Content(view),
+            "{path}: the list owns window focus"
+        );
+        assert!(
+            matches!(
+                app.native_runtime.view_state(view),
+                Some(crate::native_app::AppViewState::Workers(_))
+            ),
+            "{path}"
+        );
+        assert!(app.structural_invariants_ok(), "{path}");
+    }
+}
+
+/// A shell handed over in that window stays, as any restore keeps one (the row's own window never
+/// names one, so this holds a desk the parent did not write).
+#[test]
+fn a_lone_workers_list_never_discards_an_adopted_bootstrap() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.handoff_successor = true;
+    adopt_as(&mut app, 0, 0);
+    app.restore_into_window(wid, restore::WindowLayout::lone_workers_list(24, 80));
+    let ws = &app.windows[&wid];
+    assert_eq!(ws.tab_set.len(), 1, "no list took its place");
+    assert_eq!(ws.tab_set.home(), None);
+    assert_eq!(ws.layouts.len(), 1);
+    assert!(
+        app.pool.get(0).is_some(),
+        "an adopted session is never torn down"
+    );
+    assert!(app.structural_invariants_ok());
+}
+
+/// A later window has no bootstrap: it is built with no shell, around the list alone.
+#[test]
+fn a_later_lone_workers_list_restores_without_a_bootstrap() {
+    let mut app = App::headless_for_test();
+    let row = restore::WindowLayout::lone_workers_list(24, 80);
+    assert!(app.restores_without_bootstrap(&row));
+    assert!(
+        !app.restores_without_bootstrap(&restore::WindowLayout {
+            workers_in_front: false,
+            ..row.clone()
+        }),
+        "CONTROL: a bare row builds nothing"
+    );
+    let sessions = app.pool.iter().count();
+    let wid = app.create_native_restore_window(row.rows, row.cols);
+    app.restore_into_window(wid, row);
+    let ws = &app.windows[&wid];
+    assert_eq!(ws.tab_set.len(), 1, "only the list");
+    assert_eq!(ws.tab_set.home(), ws.tab_set.active_id());
+    assert!(ws.layouts.is_empty());
+    assert_eq!(
+        app.pool.iter().count(),
+        sessions,
+        "no shell was made for it"
+    );
+    assert!(app.structural_invariants_ok());
+}
+
+/// An install that fails leaves the bootstrap: a tab set never stands empty, in which state a
+/// window never paints and the handoff never proves.
+#[test]
+fn a_lone_workers_list_that_cannot_install_keeps_the_bootstrap() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.tab_ids.exhaust_for_test();
+    app.restore_into_window(wid, restore::WindowLayout::lone_workers_list(24, 80));
+    let ws = &app.windows[&wid];
+    assert_eq!(ws.tab_set.len(), 1, "the bootstrap stands");
+    assert_eq!(ws.tab_set.home(), None);
+    assert_eq!(ws.layouts.len(), 1);
+    assert!(app.pool.get(0).is_some());
+    assert!(app.structural_invariants_ok());
+}
+
 #[test]
 fn a_successors_fresh_bootstrap_is_retired_by_a_native_only_window_0() {
     use crate::native_settings::SettingsRoute::{About, SoftwareUpdate};
@@ -1055,6 +1166,7 @@ fn recursive_mixed_restore_keeps_topology_and_substitutes_only_failed_leaf() {
         focused_path: vec![restore::RestoreBranch::Second],
         zoomed: true,
         parked: false,
+        ephemeral: false,
     };
     app.restore_into_window(
         wid,
@@ -1137,6 +1249,7 @@ fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
                     focused_path: Vec::new(),
                     zoomed: false,
                     parked: false,
+                    ephemeral: false,
                 },
                 restore::RestoredTab {
                     root: restore::RestoredSplitTree::Split {
@@ -1148,12 +1261,14 @@ fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
                     focused_path: vec![restore::RestoreBranch::Second],
                     zoomed: false,
                     parked: false,
+                    ephemeral: false,
                 },
                 restore::RestoredTab {
                     root: restored_terminal(2, "CHARLIE"),
                     focused_path: Vec::new(),
                     zoomed: false,
                     parked: false,
+                    ephemeral: false,
                 },
             ],
             ..single_leaf_window(bare_leaf())
@@ -1546,6 +1661,7 @@ fn reopening_a_restored_document_focuses_its_leaf_before_revealing_a_line() {
                     focused_path: vec![restore::RestoreBranch::Second],
                     zoomed,
                     parked: false,
+                    ephemeral: false,
                 }],
                 ..single_leaf_window(bare_leaf())
             },
@@ -1716,6 +1832,7 @@ fn single_leaf_window(leaf: restore::TerminalLeafRestore) -> restore::WindowLayo
             focused_path: Vec::new(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         }],
     }
 }
@@ -2041,12 +2158,14 @@ fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
             focused_path: vec![restore::RestoreBranch::Second],
             zoomed: false,
             parked: false,
+            ephemeral: false,
         },
         restore::RestoredTab {
             root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(bare_leaf())),
             focused_path: Vec::new(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         },
     ];
     old.restore_into_window(WindowId(0), layout);
@@ -2201,6 +2320,7 @@ fn a_handed_shells_frozen_flag_reaches_both_adoption_paths() {
 
 fn dead_agent() -> restore::AgentRestore {
     restore::AgentRestore {
+        claude_auth: None,
         word: String::new(),
         pid: 4242,
         start: "Sat Sep 27 01:02:03 2026".into(),
@@ -2254,6 +2374,8 @@ const OWED_LOGIN: &str = "/Users//me/logins/work-2";
 #[cfg(unix)]
 fn owed_relaunch(tab: &str) -> aterm_agent::harness::relaunch::Snapshot {
     aterm_agent::harness::relaunch::Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: tab.to_string(),
@@ -2544,7 +2666,7 @@ fn an_owed_relaunch_in_a_claim_folder_is_no_claim_workers() {
     );
     let marks = |cwd: &str| {
         let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-            std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+            std::sync::Arc::new(|_, _, _, _, _| "wait:shell-prompt".to_string()),
         );
         let mut app = App::headless_for_test();
         let sid = {
@@ -3023,7 +3145,7 @@ fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
     let tried = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let t = std::sync::Arc::clone(&tried);
     let host = crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(
-        move |_, _, _, _| {
+        move |_, _, _, _, _| {
             t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             "wait:shell-prompt".to_string()
         },
@@ -3105,7 +3227,7 @@ fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
         "the Commit's re-capture reads what the park froze"
     );
     assert!(
-        agents(&app.capture_manifest(false))
+        agents(&app.capture_manifest(false, false))
             .iter()
             .all(|(_, agent)| agent.is_none()),
         "only the handoff layout names an owed agent"
@@ -3133,7 +3255,7 @@ fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
 fn a_relaunch_owed_between_the_two_captures_refuses_the_commit_by_name() {
     use crate::app_update_handoff::{commit_agent_carry, commit_layout_topology};
     let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-        std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+        std::sync::Arc::new(|_, _, _, _, _| "wait:shell-prompt".to_string()),
     );
     let mut app = App::headless_for_test();
     let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
@@ -3178,7 +3300,7 @@ fn an_owed_relaunch_keeps_its_home_login_and_cause_across_the_commit() {
     use aterm_agent::harness::restart_stamp::Cause;
     let handed = |asked: Option<Cause>| -> (Snapshot, Option<Cause>, bool) {
         let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-            std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+            std::sync::Arc::new(|_, _, _, _, _| "wait:shell-prompt".to_string()),
         );
         let mut app = App::headless_for_test();
         let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
@@ -3232,7 +3354,7 @@ fn an_owed_relaunch_keeps_its_home_login_and_cause_across_the_commit() {
 fn a_crash_during_a_successful_commits_hold_is_relaunched_by_the_successor() {
     use aterm_agent::harness::relaunch::Snapshot;
     let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-        std::sync::Arc::new(|_, _, _, _| "refused:inert".to_string()),
+        std::sync::Arc::new(|_, _, _, _, _| "refused:inert".to_string()),
     );
     let mut app = App::headless_for_test();
     let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
@@ -3321,7 +3443,7 @@ fn the_handoff_leaf_names_the_supervised_agent_where_nothing_is_owed() {
     use crate::app_update_handoff::{commit_agent_carry, commit_layout_topology};
     use aterm_agent::harness::relaunch::Snapshot;
     let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-        std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+        std::sync::Arc::new(|_, _, _, _, _| "wait:shell-prompt".to_string()),
     );
     let mut app = App::headless_for_test();
     let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
@@ -3401,7 +3523,7 @@ fn the_handoff_leaf_carries_the_lost_word_and_the_successor_stands_it() {
     use crate::app_update_handoff::{commit_agent_carry, commit_layout_topology};
     let act = || {
         crate::harness_host::HostHandle::for_restored_test_with_open_tabs(std::sync::Arc::new(
-            |_, _, _, _| "wait:shell-prompt".to_string(),
+            |_, _, _, _, _| "wait:shell-prompt".to_string(),
         ))
     };
     let host = act();
@@ -3515,7 +3637,7 @@ fn the_successors_commit_carries_the_stamps_and_words_before_its_host_resumes() 
     let dir = crate::control_auth::socket_dir().expect("a private control dir");
     let commit = |carried: bool| {
         let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-            std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+            std::sync::Arc::new(|_, _, _, _, _| "wait:shell-prompt".to_string()),
         );
         let mut successor = App::headless_for_test();
         successor.handoff_successor = true;
@@ -3589,7 +3711,7 @@ fn the_handoff_leaf_follows_its_agents_record_and_a_move_refuses_nothing() {
     let dir = tmp.path().join(".claude");
     std::fs::create_dir_all(dir.join("sessions")).expect("the records' dir");
     let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-        std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+        std::sync::Arc::new(|_, _, _, _, _| "wait:shell-prompt".to_string()),
     );
     let mut app = App::headless_for_test();
     let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
@@ -3656,7 +3778,7 @@ fn the_handoff_leaf_follows_its_agents_record_and_a_move_refuses_nothing() {
 fn a_durable_layout_never_carries_the_explicit_restarts_cause() {
     use aterm_agent::harness::restart_stamp::Cause;
     let host = crate::harness_host::HostHandle::for_restored_test_with_open_tabs(
-        std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+        std::sync::Arc::new(|_, _, _, _, _| "wait:shell-prompt".to_string()),
     );
     let mut app = App::headless_for_test();
     let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
@@ -3821,7 +3943,7 @@ fn a_held_tabs_agent_left_at_its_shell_is_said_on_record() {
         origin: "fleet".into(),
     };
     let host =
-        crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(|_, _, _, _| {
+        crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(|_, _, _, _, _| {
             "wait:shell-prompt".to_string()
         }));
     let mut cold = App::headless_for_test();
@@ -3933,7 +4055,7 @@ fn a_held_tabs_agent_has_its_earlier_tab_noted_as_the_restore_says_it() {
         type Noted = std::sync::Mutex<Vec<(String, String)>>;
         let noted: std::sync::Arc<Noted> = std::sync::Arc::default();
         let host = crate::harness_host::HostHandle::for_restored_test_noting(
-            std::sync::Arc::new(|_, _, _, _| "wait:shell-prompt".to_string()),
+            std::sync::Arc::new(|_, _, _, _, _| "wait:shell-prompt".to_string()),
             std::sync::Arc::clone(&noted),
         );
         let mut cold = App::headless_for_test();
@@ -4055,6 +4177,7 @@ fn a_held_tabs_record_is_its_own_agents() {
         ..dead_agent()
     };
     let codex = restore::AgentRestore {
+        claude_auth: None,
         pid: 4343,
         program: "/opt/codex/bin/codex".into(),
         argv: vec!["/opt/codex/bin/codex".into()],
@@ -4092,7 +4215,7 @@ fn a_held_tabs_record_is_its_own_agents() {
     };
     run.alab.as_mut().unwrap().codex_home = Some(String::new());
     let host =
-        crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(|_, _, _, _| {
+        crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(|_, _, _, _, _| {
             "wait:shell-prompt".to_string()
         }));
     let mut cold = App::headless_for_test();
@@ -4722,6 +4845,7 @@ impl Successor {
         let parent = JournalId::now(cj::reaped_pid());
         let mut desk = cj::layout(&[("/a", "zsh"), ("/b", "claude")]);
         let claude = restore::AgentRestore {
+            claude_auth: None,
             word: String::new(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),
@@ -5119,6 +5243,7 @@ fn window_of(roots: Vec<restore::RestoredSplitTree>) -> restore::WindowLayout {
                 focused_path,
                 zoomed: false,
                 parked: false,
+                ephemeral: false,
             }
         })
         .collect();
@@ -6036,6 +6161,7 @@ fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
         focused_path: Vec::new(),
         zoomed: false,
         parked: false,
+        ephemeral: false,
     });
     app.restore_into_window(WindowId(0), layout);
     let session = timed_session(&app, passed).expect("the spawned shell carries the pair");
@@ -6100,6 +6226,7 @@ fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
         focused_path: Vec::new(),
         zoomed: false,
         parked: false,
+        ephemeral: false,
     };
     app.restore_closed_tab_into_window(WindowId(0), &record, 1)
         .expect("reopened");
@@ -6118,6 +6245,7 @@ fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
         focused_path: Vec::new(),
         zoomed: false,
         parked: false,
+        ephemeral: false,
     };
     app.restore_closed_tab_into_window(WindowId(0), &record, 1)
         .expect("reopened");
@@ -6252,6 +6380,7 @@ fn the_setter_rides_the_cold_restore_the_reopen_and_the_graft() {
         focused_path: Vec::new(),
         zoomed: false,
         parked: false,
+        ephemeral: false,
     });
     app.restore_into_window(WindowId(0), layout);
     let session = app
@@ -6294,6 +6423,7 @@ fn the_setter_rides_the_cold_restore_the_reopen_and_the_graft() {
             focused_path: Vec::new(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         };
         app.restore_closed_tab_into_window(WindowId(0), &record, 1)
             .expect("reopened");
@@ -6366,6 +6496,7 @@ fn a_setter_beside_a_word_this_build_cannot_read_is_not_stored() {
             focused_path: Vec::new(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         });
         app.restore_into_window(WindowId(0), layout);
         let session = app
@@ -6546,6 +6677,7 @@ fn lineage_tab(local: u64, sid: Option<&str>, lineage: Option<&str>) -> restore:
         focused_path: Vec::new(),
         zoomed: false,
         parked: false,
+        ephemeral: false,
     }
 }
 
@@ -6627,6 +6759,7 @@ fn a_cold_restore_opens_with_prev_and_lineage() {
                     focused_path: Vec::new(),
                     zoomed: false,
                     parked: false,
+                    ephemeral: false,
                 },
             ],
             ..single_leaf_window(bare_leaf())
@@ -8152,6 +8285,7 @@ fn a_parked_tab_comes_back_parked_behind_the_shown_tabs_with_its_list_opened_aga
         focused_path: Vec::new(),
         zoomed: false,
         parked,
+        ephemeral: parked,
     };
     app.restore_into_window(
         wid,
@@ -8278,10 +8412,13 @@ fn a_parked_workers_record_crosses_a_cold_restart() {
     );
 }
 
-/// A RESTORED PARKED TAB WITH NO RECORD UNPARKS: it would have no row to say what it is.
+/// A RESTORED WORKER'S TAB KEEPS ITS BITS ONLY WITH A RECORD: a parked tab comes back parked and
+/// marked, one in the strip marked, and a parked tab an older build wrote with no mark comes back
+/// marked, since every parked tab is a worker's. CONTROL: a tab with no record, or one whose
+/// record does not read, comes back a person's: it would have no row to say what it is.
 #[test]
-fn a_restored_parked_tab_keeps_the_bit_only_with_a_record() {
-    let parked_of = |task: Option<&str>| {
+fn a_restored_workers_tab_keeps_its_bits_only_with_a_record() {
+    let bits_of = |task: Option<&str>, parked: bool, ephemeral: bool| {
         let record = restore::RestoredTab {
             root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
                 restore::TerminalLeafRestore {
@@ -8292,7 +8429,8 @@ fn a_restored_parked_tab_keeps_the_bit_only_with_a_record() {
             )),
             focused_path: Vec::new(),
             zoomed: false,
-            parked: true,
+            parked,
+            ephemeral,
         };
         let mut app = App::headless_for_test();
         let wid = *app.windows.keys().next().expect("a window");
@@ -8304,13 +8442,28 @@ fn a_restored_parked_tab_keeps_the_bit_only_with_a_record() {
                 crate::app_restore::LeafIds::Retired,
             )
             .expect("built");
-        tab.parked
+        (tab.parked, tab.ephemeral)
     };
-    assert!(parked_of(Some(
-        "rev=7 state=done from=ctl since=1700000000000 result_bytes=0 attention=0"
-    )));
-    assert!(!parked_of(None));
-    assert!(!parked_of(Some("not a row")));
+    let row = Some("rev=7 state=done from=ctl since=1700000000000 result_bytes=0 attention=0");
+    assert_eq!(bits_of(row, true, true), (true, true));
+    assert_eq!(
+        bits_of(row, false, true),
+        (false, true),
+        "in the strip, marked"
+    );
+    assert_eq!(
+        bits_of(row, true, false),
+        (true, true),
+        "an older build's parked tab"
+    );
+    assert_eq!(bits_of(row, false, false), (false, false), "a person's tab");
+    for (parked, ephemeral) in [(true, true), (false, true)] {
+        assert_eq!(bits_of(None, parked, ephemeral), (false, false));
+        assert_eq!(
+            bits_of(Some("not a row"), parked, ephemeral),
+            (false, false)
+        );
+    }
 }
 
 /// A RESTORED WORKER WHOSE AGENT DOES NOT COME BACK READS EXITED, on each path the window sees: no
@@ -8517,13 +8670,84 @@ fn a_cold_restart_does_not_resume_the_disk_worker() {
 
     let shell = crate::stub_session(9);
     assert!(
-        !crate::task_record::seed_restored(&shell.ctx, &row(&disk), false, true),
+        !crate::task_record::seed_restored(&shell.ctx, &row(&disk), true, true),
         "CONTROL: a shell that came back running keeps its worker"
     );
     assert_eq!(
         shell.ctx.timeline.lock().unwrap().task().map(|t| t.state),
         Some(Working)
     );
+}
+
+/// A WORKER NO AGENT WAS FOLLOWED IN CAN HAVE NEVER STARTED, and the launcher that would type its
+/// line ended with the process: a keeper hands its shell back, so `why=restored`, which no deadline
+/// reads, would leave it `working` for good. It reads as one just spawned, from now, so the startup
+/// deadline judges what its screen shows. CONTROL: one whose agent was followed stays `restored`.
+#[test]
+fn a_kept_worker_no_agent_was_followed_in_goes_back_under_the_startup_deadline() {
+    use crate::task_record::TaskState::Working;
+    let state = aterm_tempfile::Builder::new()
+        .prefix("aterm-restored-unstarted")
+        .tempdir()
+        .expect("scratch state home");
+    crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+        let worker = crate::stub_session(9);
+        crate::task_record::mark_session_task(
+            &worker.ctx,
+            9,
+            &crate::task_record::TaskMark::new(Working),
+        )
+        .expect("unfenced");
+        let row = crate::task_record::restore_row(&worker.ctx).expect("a row");
+        let before = std::time::Instant::now();
+
+        let shell = crate::stub_session(10);
+        assert!(!crate::task_record::seed_restored(
+            &shell.ctx, &row, true, true
+        ));
+        let record = shell.ctx.timeline.lock().unwrap().task().cloned().unwrap();
+        assert_eq!(
+            (record.state, record.why),
+            (Working, Some(crate::task_record::WHY_RESTORED)),
+            "CONTROL: its agent was followed"
+        );
+
+        let shell = crate::stub_session(11);
+        assert!(!crate::task_record::seed_restored(
+            &shell.ctx, &row, false, true
+        ));
+        let record = shell.ctx.timeline.lock().unwrap().task().cloned().unwrap();
+        assert_eq!((record.state, record.why), (Working, None));
+        assert!(record.since >= before, "judged from now");
+
+        // A `why=` says it ran (a turn reopened it), so what its screen shows is no failed start.
+        let ran = crate::stub_session(13);
+        let mut reopened = crate::task_record::TaskMark::new(Working);
+        reopened.why = Some("turn");
+        crate::task_record::mark_session_task(&ran.ctx, 13, &reopened).expect("unfenced");
+        let ran_row = crate::task_record::restore_row(&ran.ctx).expect("a row");
+        let shell = crate::stub_session(14);
+        assert!(!crate::task_record::seed_restored(
+            &shell.ctx, &ran_row, false, true
+        ));
+        let record = shell.ctx.timeline.lock().unwrap().task().cloned().unwrap();
+        assert_eq!(
+            (record.state, record.why),
+            (Working, Some(crate::task_record::WHY_RESTORED)),
+            "CONTROL: it had started"
+        );
+
+        let shell = crate::stub_session(12);
+        assert!(!crate::task_record::seed_restored(
+            &shell.ctx, &row, false, false
+        ));
+        let record = shell.ctx.timeline.lock().unwrap().task().cloned().unwrap();
+        assert_eq!(
+            record.state,
+            crate::task_record::TaskState::Exited,
+            "CONTROL: no shell came back and no agent will"
+        );
+    });
 }
 
 /// A COLD RESTART KEEPS A WORKER'S MANAGER: every session comes back with a new sid, and a record

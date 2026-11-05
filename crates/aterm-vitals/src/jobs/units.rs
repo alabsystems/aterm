@@ -10,11 +10,12 @@ use std::sync::Arc;
 use super::step::{self, Cx, Evidence, Fault, Progress, Track};
 use super::wait::{self, JobFacts, Scene};
 use super::{
-    BUSY_ORPHAN_MS, Block, Class, ClassTable, Consumer, Demand, EXITED_KEEP_MS, Findings, GateWord,
-    HELD_AT_ONCE, HeldEpisode, HeldProc, Holder, InputGate, JobCounters, JobKind, JobProc, JobRow,
-    JobTab, JobTick, JobsView, KERNEL_WAIT_MS, MemberMap, Named, NamedRow, NamedWait, ProcState,
-    Standing, StartWait, Stop, StoppedUnstarted, SweepProc, TermWord, TierB, TtyMode, Verdict,
-    WaitName, Want, ZOMBIE_AGE_MS, ZombieParent, Zombies, command_class,
+    BUSY_ORPHAN_MS, Block, BlockMeter, Class, ClassTable, Consumer, Demand, EXITED_KEEP_MS, Ended,
+    Findings, GateWord, HELD_AT_ONCE, HeldEpisode, HeldProc, Holder, InputGate, JobCounters,
+    JobKind, JobProc, JobRow, JobTab, JobTick, JobsView, KERNEL_WAIT_MS, MemberMap, Named,
+    NamedRow, NamedWait, ProcState, Standing, StartWait, Stop, StoppedUnstarted, SweepProc,
+    TermWord, TierB, TtyMode, Verdict, WaitName, Want, ZOMBIE_AGE_MS, ZombieParent, Zombies,
+    command_class,
 };
 
 #[cfg(test)]
@@ -270,6 +271,43 @@ struct Job {
     /// class ([`demand_of`]).
     person_read: bool,
     row: Option<JobRow>,
+    /// What its passes read of its cost ([`JobMeter`]).
+    meter: JobMeter,
+}
+
+/// What a job's passes read of its cost, for its telemetry row once it ends ([`Ended`]): lower
+/// bounds, each the most any one pass read, since nothing reads a process after its last pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct JobMeter {
+    /// The largest lifetime-peak footprint a pass read of a member other than the block's shell.
+    peak: Option<u64>,
+    /// The most CPU a pass read its members other than the block's shell to have spent, their
+    /// own plus the children each reaped, ns.
+    cpu_ns: Option<u64>,
+    /// The verdict of its last pass was `stuck`.
+    stuck: bool,
+}
+
+impl JobMeter {
+    fn read(&mut self, now: &MemberMap, shell: Option<u32>) {
+        let mut tree: Option<u64> = None;
+        for (pid, m) in now {
+            if Some(*pid) == shell {
+                continue;
+            }
+            let Some(c) = m.counters else {
+                continue;
+            };
+            let spent = c.cpu_ns.saturating_add(c.child_cpu_ns.unwrap_or(0));
+            tree = Some(tree.unwrap_or(0).saturating_add(spent));
+            if let Some(p) = c.peak_footprint {
+                self.peak = Some(self.peak.map_or(p, |q| q.max(p)));
+            }
+        }
+        if let Some(t) = tree {
+            self.cpu_ns = Some(self.cpu_ns.map_or(t, |c| c.max(t)));
+        }
+    }
 }
 
 /// What a tick read of a job's system calls. A block's shell waiting on its command (woken to
@@ -780,7 +818,13 @@ pub struct Jobs {
     adopted: BTreeSet<u64>,
     #[cfg(any(test, debug_assertions))]
     fault: Option<Fault>,
+    /// The jobs that ended since the host last took them ([`Jobs::take_ended`]), at most
+    /// [`ENDED_KEEP`].
+    ended: Vec<Ended>,
 }
+
+/// The most ended jobs [`Jobs`] keeps for a host that does not take them.
+pub const ENDED_KEEP: usize = 256;
 
 /// A tab's processes in its shell's own group, by pid and known birth.
 #[derive(Clone, Debug, Default)]
@@ -1026,6 +1070,29 @@ impl Jobs {
         {
             None
         }
+    }
+
+    /// The jobs that ended since the last call, oldest first ([`Ended`]).
+    pub fn take_ended(&mut self) -> Vec<Ended> {
+        std::mem::take(&mut self.ended)
+    }
+
+    /// What the passes read so far of each job that is a tab's block's foreground job, live or
+    /// ended and still kept ([`BlockMeter`]).
+    #[must_use]
+    pub fn block_meters(&self) -> Vec<BlockMeter> {
+        self.jobs
+            .iter()
+            .filter(|j| j.kind == JobKind::Shell)
+            .filter_map(|j| {
+                Some(BlockMeter {
+                    tab: j.key.tab,
+                    block: j.block.or(j.key.block)?,
+                    peak_bytes: j.meter.peak,
+                    stuck: j.meter.stuck,
+                })
+            })
+            .collect()
     }
 
     /// Returns the learned command-class table.
@@ -2703,10 +2770,32 @@ impl Jobs {
                 job.member_name.clone_from(&leader_name);
             }
             job.last_name.clone_from(&leader_name);
+            job.meter.read(&now, job.shell);
+            job.meter.stuck = out.verdict == Verdict::Stuck;
+            let last_read = job.last_tick_ms;
             job.members = now;
             job.last_tick_ms = Some(at);
             if exited {
                 job.exited_ms = Some(at);
+                if self.ended.len() == ENDED_KEEP {
+                    self.ended.remove(0);
+                }
+                self.ended.push(Ended {
+                    tab: job.key.tab,
+                    block: job.block.or(job.key.block),
+                    kind: job.kind,
+                    consumer: job.consumer,
+                    id: job.id.clone(),
+                    command: job.command.clone(),
+                    name: job.last_name.clone(),
+                    opened_ms: job.track.opened_ms,
+                    last_read_ms: last_read,
+                    ended_ms: at,
+                    exit: job.exit,
+                    peak_bytes: job.meter.peak,
+                    cpu_ns: job.meter.cpu_ns,
+                    stuck: job.meter.stuck,
+                });
             }
 
             if job.kind == JobKind::Orphan
@@ -3089,7 +3178,7 @@ impl Jobs {
                 exec_version: h.exec_version,
                 name: h.name.clone(),
                 tab: tab_of(&h.pid).or(h.tab),
-                job: kind_of(&h.pid),
+                job: kind_of(&h.pid).or(h.job),
                 for_ms,
             };
             match h.wait {
@@ -3193,6 +3282,7 @@ impl Job {
             busy_since: None,
             person_read: false,
             row: None,
+            meter: JobMeter::default(),
         }
     }
 
@@ -3265,6 +3355,7 @@ impl Job {
             busy_since: None,
             person_read: false,
             row: None,
+            meter: JobMeter::default(),
         }
     }
 }

@@ -28,6 +28,13 @@ mod signing;
 pub use signing::test_signing_observation;
 pub use signing::{SigningStatus, effective_signing_identity, signing_status, sync_signing};
 
+/// The retained release-roster generation, read without changing vault or ring state.
+/// # Errors
+/// The retained floor is unreadable or is not a valid unsigned generation.
+pub fn roster_floor(paths: &Paths) -> crate::Result<u64> {
+    super::release_migration::roster_floor(paths)
+}
+
 /// The vault entry this reads.
 pub(crate) const ENTRY: &str = crate::need::catalog::NOTARY_ENTRY;
 
@@ -420,18 +427,8 @@ fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: boo
     };
     let (roster, signature) = candidates.swap_remove(index);
     let floor_path = paths.dir.join("release-ring-roster-floor");
-    let floor = match fsx::read_private(&floor_path, 32) {
-        Ok(Some(bytes)) => match bytes
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            Some(floor) => floor,
-            None => return false,
-        },
-        Ok(None) => 0,
-        Err(_) => return false,
+    let Ok(floor) = roster_floor(paths) else {
+        return false;
     };
     let Ok(signer) = crate::release_ring::authorize_with(
         profile.as_slice(),

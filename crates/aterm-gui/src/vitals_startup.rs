@@ -60,7 +60,11 @@ impl PriorStop {
 
 /// When `path` was last written, in milliseconds since the epoch.
 pub(crate) fn written_ms(path: &Path) -> Option<i64> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let modified = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?
+        .modified()
+        .ok()?;
     let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     i64::try_from(since.as_millis()).ok()
 }

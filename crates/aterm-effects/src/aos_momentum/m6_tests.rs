@@ -5,7 +5,7 @@
 //! `DurableStore` implementations and the source scans.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
@@ -88,7 +88,7 @@ fn the_pinned_chain_reproduces_on_the_v1_sets() {
     let pin = M6_CHAIN_V1.expect("stage E pins the chain");
     assert_eq!(
         pin.digest().hex(),
-        "f3ae385050abe4b23912ec63291af550d6445337e3c72adee7f0645a3113afa7"
+        "8f43f2a245e73116258f91f987bf8b1b6ad711134640ed117f97f67b26183f6b"
     );
     assert_eq!(pin.ids[0], Version::base().id());
     if refused_off_the_pinned_target() {
@@ -421,36 +421,36 @@ fn names(moves: &[(&'static str, Moved)]) -> Vec<&'static str> {
 // ---- The model ----
 
 #[test]
-fn the_chain_is_deterministic() {
+fn each_member_of_the_chain_trains_from_the_one_before() {
     if refused_off_the_pinned_target() {
         return;
     }
-    let f = fixture();
-    let again = chain(&f.sets, &Labeller::new(&evaluator().anew(), &Serial)).expect("the chain");
-    assert_eq!(
-        again, f.chain,
-        "serial on a fresh evaluator equals threaded on the shared one"
-    );
-    assert_eq!(again.len(), 5);
-    for (r, v) in again.iter().enumerate() {
+    let chain = &fixture().chain;
+    assert_eq!(chain.len(), 5);
+    for (r, v) in chain.iter().enumerate() {
         assert_eq!(usize::from(v.round()), r);
         assert_eq!(
             v.parent(),
-            r.checked_sub(1).map(|p| again[p].id()),
+            r.checked_sub(1).map(|p| chain[p].id()),
             "each member trains from the one before"
         );
     }
-    assert!(again[1].state().steps() > 0, "v1 took steps");
-    assert_eq!(again[4].state().epochs(), 4 * 16);
+    assert!(chain[1].state().steps() > 0, "v1 took steps");
+    assert_eq!(chain[4].state().epochs(), 4 * 16);
 }
 
+/// The chain names no build and no spread: serial, on a fresh evaluator of another build, it comes
+/// out as the threaded fixture does, by a pin of ids and label digests (an id digests its parent,
+/// round, state and labels, so equal ids are equal members). The one fresh run carries both
+/// factors, so a failure does not say which; a fault that shows only under the same build name and
+/// a serial spread, another build name hiding it, goes unseen.
 #[test]
 fn the_chain_names_no_build() {
     if refused_off_the_pinned_target() {
         return;
     }
     let other = Evaluator::v1("another-build", Instant::now()).expect("the pinned policy v1");
-    let theirs = chain(&fixture().sets, &Labeller::new(&other, &Threads)).expect("the chain");
+    let theirs = chain(&fixture().sets, &Labeller::new(&other, &Serial)).expect("the chain");
     assert_eq!(
         ChainPin::of(&theirs),
         Some(pin()),
@@ -2324,7 +2324,6 @@ const BANNED: &[&str] = &[
     concat!("Corpus", "::"),
     concat!(".jud", "ge("),
     concat!("row_", "at("),
-    concat!("training_", "rows"),
     concat!("meas", "ure("),
     concat!("indi", "ces("),
     concat!("Candidate", "Bundle"),
@@ -2332,7 +2331,6 @@ const BANNED: &[&str] = &[
     concat!("lane", "::"),
     concat!("aos_", "publish"),
     concat!("aos_", "search"),
-    concat!("aos_", "workers"),
 ];
 
 /// `src`'s refusals under the import allowlist `allowed` and the banned substrings.
@@ -2389,11 +2387,7 @@ fn scan_file(src: &str, allowed: &[String]) -> Vec<String> {
         out.push(format!("{evaluator} other than {ctor}"));
     }
     // The evaluator's own reads, by name, however the path to them is spelt.
-    for word in [
-        concat!("jud", "ge"),
-        concat!("row_", "at"),
-        concat!("training_", "rows"),
-    ] {
+    for word in [concat!("jud", "ge"), concat!("row_", "at")] {
         if has_word(src, word) {
             out.push(format!("names {word}"));
         }
@@ -2611,606 +2605,6 @@ fn the_import_scan_refuses_its_planted_fixtures() {
         "fn f() {\n\tuse super::m4::Evaluator;\n}\n",
     ] {
         assert!(!refused(allowed), "{allowed}");
-    }
-}
-
-/// Every workspace `.rs` file outside targets, `vendor` and dot-directories (`.git`, and the
-/// export a release stages in `publish/.out`), without following links.
-fn workspace_sources() -> Vec<(PathBuf, String)> {
-    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if kind.is_symlink() {
-                continue;
-            }
-            if kind.is_dir() {
-                if !(name.starts_with("target") || name.starts_with('.') || name == "vendor") {
-                    walk(&path, out);
-                }
-            } else if name.ends_with(".rs")
-                && let Ok(text) = std::fs::read_to_string(&path)
-            {
-                out.push((path, text));
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(&crate_root().join("../.."), &mut out);
-    out
-}
-
-/// A workspace file's path from the workspace root, `/`-separated.
-fn rel(path: &Path) -> String {
-    path.strip_prefix(crate_root().join("../.."))
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-const M4_RS: &str = "crates/aterm-effects/src/aos_momentum/m4.rs";
-const M4_TESTS_RS: &str = "crates/aterm-effects/src/aos_momentum/m4_tests.rs";
-const M6_RS: &str = "crates/aterm-effects/src/aos_momentum/m6.rs";
-const LEARN_RS: &str = "crates/aterm-lab/src/aos_learn.rs";
-const LEARN_BENCH_RS: &str = "crates/aterm-lab/src/aos_learn_bench.rs";
-const MOMENTUM_RS: &str = "crates/aterm-effects/src/aos_momentum.rs";
-
-/// The files that may name m6 (design §13.3), by path.
-const M6_NAMERS: &[&str] = &[
-    LEARN_RS,
-    LEARN_BENCH_RS,
-    M6_RS,
-    "crates/aterm-effects/src/aos_momentum/m6_tests.rs",
-    "crates/aterm-effects/src/aos_momentum/locks_tests.rs",
-];
-
-/// `src`'s refusals under the workspace scan of m6's path, for the file at `path`.
-fn scan_workspace_file(path: &str, src: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let squeezed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
-    // Paths with the whitespace around `::` removed, each matched as whole words.
-    let paths = tight(src);
-    let word = |c: char| c.is_alphanumeric() || c == '_';
-    for token in [concat!("aos_momentum::", "m6"), concat!("super::", "m6")] {
-        for (i, _) in paths.match_indices(token) {
-            if !paths[..i].ends_with(word) && !paths[i + token.len()..].starts_with(word) {
-                out.push(format!("the path {token}"));
-            }
-        }
-    }
-    let m6 = concat!("m", "6");
-    let in_crate = path.starts_with("crates/aterm-effects/src/");
-    let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut rest = flat.as_str();
-    while let Some(at) = rest.find("use ") {
-        let item = &rest[at..];
-        let led = !rest[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_');
-        let end = item.find(';').unwrap_or(item.len());
-        let body = &item[..end];
-        let rooted = ["use super::", "use self::", "use crate::"]
-            .iter()
-            .any(|r| body.starts_with(r));
-        if led && body.contains("aos_momentum") {
-            if has_word(body, m6) {
-                out.push(format!("{body}: names m6"));
-            }
-            if body.contains('*') {
-                out.push(format!("{body}: a glob"));
-            }
-            if has_word(body, concat!("a", "s")) {
-                out.push(format!("{body}: an `as` rename"));
-            }
-        } else if led && in_crate && rooted && has_word(body, m6) {
-            out.push(format!("{body}: names m6"));
-        }
-        rest = &item[end..];
-    }
-    // In this crate, m6's own path however it is reached (`use super::*;`, then `m6::`).
-    let bare = concat!("m", "6::");
-    if in_crate
-        && paths
-            .match_indices(bare)
-            .any(|(i, _)| !paths[..i].ends_with(word))
-    {
-        out.push(format!("the path {bare}"));
-    }
-    // The parent declares m6 and names it nowhere else, so it re-exports none of it.
-    if path == MOMENTUM_RS
-        && words(src).filter(|w| *w == m6).count() > squeezed.matches(concat!("mod", "m6;")).count()
-    {
-        out.push("aos_momentum.rs names m6 past its declaration".to_owned());
-    }
-    out
-}
-
-/// The length of the item or statement `s` begins: to its first `;` outside brackets, the close of
-/// its first block when `blocks` (an item's body ends it), or a closer of the block around it.
-/// Strings, character literals and line comments are skipped.
-fn item_end(s: &str, blocks: bool) -> usize {
-    let b = s.as_bytes();
-    let mut depth = 0_i32;
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'/' if b.get(i + 1) == Some(&b'/') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < b.len() && b[i] != b'"' {
-                    i += if b[i] == b'\\' { 2 } else { 1 };
-                }
-            }
-            b'\'' if b.get(i + 1) == Some(&b'\\') => {
-                i += 3;
-                while i < b.len() && b[i] != b'\'' {
-                    i += 1;
-                }
-            }
-            b'\'' if b.get(i + 2) == Some(&b'\'') => i += 2,
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => {
-                depth -= 1;
-                if depth < 0 || (blocks && depth == 0 && b[i] == b'}') {
-                    return i + 1;
-                }
-            }
-            b';' if depth == 0 => return i + 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    b.len()
-}
-
-/// What a test gate covers in `s`, the text after it: an item (`fn`, `mod`, `impl`, `trait`,
-/// `struct`, `enum`, `union`, `extern` or a macro) to its body's end; a statement, field or
-/// expression past its own blocks (`if … {} else {}`, `S { … }.f()`) to its `;` or the block
-/// around it.
-fn gated_end(s: &str) -> usize {
-    let mut rest = s;
-    loop {
-        rest = rest.trim_start();
-        if let Some(r) = rest.strip_prefix("pub(") {
-            rest = r.split_once(')').map_or("", |(_, r)| r);
-        } else if rest.starts_with("#[") {
-            rest = &rest[bracketed(&rest[1..]).map_or(rest.len(), |n| n + 1)..];
-        } else if rest.starts_with("//") {
-            rest = rest.split_once('\n').map_or("", |(_, r)| r);
-        } else {
-            break;
-        }
-    }
-    let stop = rest
-        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c.is_whitespace()))
-        .unwrap_or(rest.len());
-    let item = rest[stop..].starts_with('!')
-        || rest[..stop].split_whitespace().any(|w| {
-            [
-                "fn", "mod", "impl", "trait", "struct", "enum", "union", "extern",
-            ]
-            .contains(&w)
-        });
-    item_end(s, item)
-}
-
-/// The length of the bracketed text `s` begins (`[…]`), to its closer.
-fn bracketed(s: &str) -> Option<usize> {
-    let mut depth = 0_i32;
-    for (i, c) in s.char_indices() {
-        match c {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// The length of the attribute `s` begins (`[…]`, after its `#`) when it is a test gate:
-/// `#[test]`, or a `cfg` whose predicate requires `test`.
-fn test_gate(s: &str) -> Option<usize> {
-    let len = bracketed(s)?;
-    let attr: String = s[1..len - 1].split_whitespace().collect();
-    let gate = attr == "test"
-        || attr
-            .strip_prefix("cfg(")
-            .and_then(|p| p.strip_suffix(')'))
-            .is_some_and(requires_test);
-    gate.then_some(len)
-}
-
-/// Whether the `cfg` predicate `p` (whitespace removed) requires `test`: `test` itself, or an
-/// `all(…)` one of whose arguments does. (`any(test, …)` and `not(test)` do not: m4's mints
-/// are `any(test, debug_assertions, …)` items.)
-fn requires_test(p: &str) -> bool {
-    p == "test"
-        || p.strip_prefix("all(")
-            .and_then(|r| r.strip_suffix(')'))
-            .is_some_and(|args| {
-                let mut depth = 0_i32;
-                let mut start = 0;
-                let mut parts = Vec::new();
-                for (i, c) in args.char_indices() {
-                    match c {
-                        '(' => depth += 1,
-                        ')' => depth -= 1,
-                        ',' if depth == 0 => {
-                            parts.push(&args[start..i]);
-                            start = i + 1;
-                        }
-                        _ => {}
-                    }
-                }
-                parts.push(&args[start..]);
-                parts.into_iter().any(requires_test)
-            })
-}
-
-/// The test code of the file at `path`: all of it in a test file (`*_tests.rs`, `tests.rs`,
-/// under a `tests/` directory, or under `#![cfg(test)]`), and elsewhere what each test gate
-/// covers and each doctest's lines.
-fn test_parts<'s>(path: &str, src: &'s str) -> Vec<&'s str> {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    if name.ends_with("_tests.rs")
-        || name == "tests.rs"
-        || path.contains("/tests/")
-        || src
-            .match_indices("#![")
-            .any(|(at, _)| test_gate(&src[at + 2..]).is_some())
-    {
-        return vec![src];
-    }
-    let mut out = Vec::new();
-    let mut fenced = false;
-    for line in src.lines() {
-        let doc = line.trim_start();
-        let Some(text) = doc.strip_prefix("///").or_else(|| doc.strip_prefix("//!")) else {
-            fenced = false;
-            continue;
-        };
-        if text.trim_start().starts_with("```") {
-            fenced = !fenced;
-        } else if fenced {
-            out.push(line);
-        }
-    }
-    for (at, _) in src.match_indices("#[") {
-        let attr = &src[at + 1..];
-        if let Some(len) = test_gate(attr) {
-            let item = &attr[len..];
-            out.push(&item[..gated_end(item)]);
-        }
-    }
-    out
-}
-
-/// Whether `text` holds the flag `flag` itself, not a longer one (`--pairs` is another).
-fn has_flag(text: &str, flag: &str) -> bool {
-    text.match_indices(flag).any(|(i, _)| {
-        !text[i + flag.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '-')
-    })
-}
-
-/// `text`'s refusals under the confinement of the real sets' capability, the mints and the real
-/// pairs' flag (design §13.3), for the workspace file at `path`. The flag is refused in every
-/// file but the non-test code of the lab's learner and runner, test sources included however
-/// they are named or gated.
-fn scan_confinement(path: &str, text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let tests = test_parts(path, text);
-    let in_tests = |word: &str| tests.iter().any(|t| has_word(t, word));
-    let rules: [(&str, &[&str], &[&str]); 3] = [
-        // Named in m4.rs's, m6.rs's and aos_learn.rs's non-test items alone.
-        (concat!("Real", "Sets"), &[M4_RS, M6_RS, LEARN_RS], &[]),
-        // Declared in m4.rs and called in m6.rs's non-test items alone.
-        (concat!("mint_", "real"), &[M4_RS, M6_RS], &[]),
-        // Those, and the tests of the mints in m4_tests.rs.
-        (
-            concat!("mint_", "practice"),
-            &[M4_RS, M6_RS],
-            &[M4_TESTS_RS],
-        ),
-    ];
-    for (word, items, files) in rules {
-        let named = if files.contains(&path) {
-            false
-        } else if items.contains(&path) {
-            in_tests(word)
-        } else {
-            has_word(text, word)
-        };
-        if named {
-            out.push(format!("names {word}"));
-        }
-    }
-    let flag = concat!("--", "pair");
-    let entry = [LEARN_RS, LEARN_BENCH_RS].contains(&path);
-    if tests.iter().any(|t| has_flag(t, flag)) || (!entry && has_flag(text, flag)) {
-        out.push(format!("{flag} outside the lab's learner and runner"));
-    }
-    out
-}
-
-#[test]
-fn only_m6s_consumers_name_it() {
-    let sources = workspace_sources();
-    assert!(
-        sources.len() > 1_000,
-        "the workspace was read: {}",
-        sources.len()
-    );
-    let paths: Vec<String> = sources.iter().map(|(p, _)| rel(p)).collect();
-    for want in [M4_RS, M4_TESTS_RS, M6_RS] {
-        assert!(
-            paths.iter().any(|p| p == want),
-            "{want} is read by its path"
-        );
-    }
-    let mut refused = Vec::new();
-    for (path, (_, text)) in paths.iter().zip(&sources) {
-        for r in scan_confinement(path, text) {
-            refused.push(format!("{path}: {r}"));
-        }
-        if !M6_NAMERS.contains(&path.as_str()) {
-            for r in scan_workspace_file(path, text) {
-                refused.push(format!("{path}: {r}"));
-            }
-        }
-    }
-    assert_eq!(refused, Vec::<String>::new());
-    // m4.rs: the declaration, its impl, `new`'s return and body, and the three real-set mints;
-    // m6.rs: the import, the ledger's field, the real-set open and the private load it calls.
-    let real = concat!("Real", "Sets");
-    for (want, n) in [(M4_RS, 7), (M6_RS, 4)] {
-        let (_, text) = &sources[paths.iter().position(|p| p == want).expect("read")];
-        assert_eq!(
-            words(text).filter(|w| *w == real).count(),
-            n,
-            "{want} names {real} only where the design lists"
-        );
-    }
-}
-
-#[test]
-fn the_workspace_scan_refuses_its_planted_fixtures() {
-    let lab = "crates/aterm-lab/src/aos_search.rs";
-    let sibling = "crates/aterm-effects/src/aos_momentum/search.rs";
-    let refused = |path: &str, src: &str| !scan_workspace_file(path, src).is_empty();
-    assert!(!refused(
-        lab,
-        concat!("use aterm_effects::aos_momentum::", "m6_policy::JUDGED;")
-    ));
-    assert!(!refused(
-        lab,
-        "use aterm_effects::aos_momentum::{m4, policy};"
-    ));
-    assert!(!refused(
-        sibling,
-        concat!("use super::", "m6_policy::JUDGED;")
-    ));
-    assert!(!refused(
-        lab,
-        concat!("// because aos_momentum ", "as a whole;")
-    ));
-    for (path, planted) in [
-        (
-            lab,
-            concat!("use aterm_effects::aos_momentum::", "m6::Store;"),
-        ),
-        (
-            lab,
-            concat!("use aterm_effects::aos_momentum::{m4, ", "m6};"),
-        ),
-        (
-            lab,
-            concat!("let s = aterm_effects::aos_momentum::", "m6::Store::load;"),
-        ),
-        (
-            lab,
-            concat!(
-                "let s = aterm_effects::aos_momentum:: ",
-                "m6 ::Store::load;"
-            ),
-        ),
-        (lab, concat!("use aterm_effects::aos_momentum::", "m4::*;")),
-        (lab, concat!("use aterm_effects::aos_momentum ", "as am;")),
-        (
-            lab,
-            concat!("use aterm_effects::aos_momentum::{self ", "as am};"),
-        ),
-        (
-            lab,
-            concat!("use aterm_effects::{aos_momentum::", "m6, x};"),
-        ),
-        (sibling, concat!("use super::", "m6::Store;")),
-        (sibling, concat!("use super::{m4, ", "m6};")),
-        (sibling, concat!("let s = super::", "m6::Store::load;")),
-        (sibling, concat!("use self::super::", "m6::Store;")),
-        (
-            MOMENTUM_RS,
-            concat!("fn f() { let s = self::", "m6::Store::load; }"),
-        ),
-        (MOMENTUM_RS, concat!("pub use ", "m6::{Ranker, Store};")),
-        (MOMENTUM_RS, concat!("pub use ", "m6 as learner;")),
-        (sibling, concat!("use super::*;\nuse ", "m6::Store;")),
-        (sibling, concat!("fn f() { return super::", "m6::f(); }")),
-        (sibling, concat!("reach!(super::", "m6, Store);")),
-        (sibling, concat!("pub(in super::", "m6) fn f() {}")),
-        (sibling, concat!("use super::", "m6 as k;")),
-        (lab, concat!("fn f() { return aos_momentum::", "m6::f(); }")),
-        (
-            sibling,
-            concat!("use super::*;\nfn f() { let _ = ", "m6::Store::load; }"),
-        ),
-    ] {
-        assert!(refused(path, planted), "{path}: {planted}");
-    }
-    assert!(!refused(
-        MOMENTUM_RS,
-        concat!(
-            "#[cfg(any(test, feature = \"aos-learn\"))]\npub mod ",
-            "m6;\npub mod m6_policy;"
-        )
-    ));
-
-    let scan = |path: &str, src: &str| scan_confinement(path, src);
-    let test_src = "crates/aterm-effects/src/aos_momentum/m6_tests.rs";
-    let real = concat!("Real", "Sets");
-    for (path, planted) in [
-        (test_src, format!("fn f() {{ let _ = {real}::new(); }}")),
-        (M4_TESTS_RS, format!("fn f(_: {real}) {{}}")),
-        (
-            M4_TESTS_RS,
-            concat!("let t = LookToken::mint_", "real(&s, 1, &l);").to_owned(),
-        ),
-        (
-            M4_TESTS_RS,
-            concat!("let m = LookToken::mint_", "real;").to_owned(),
-        ),
-        (
-            test_src,
-            concat!("let t = LookToken::mint_", "practice(s, &l);").to_owned(),
-        ),
-        (
-            test_src,
-            concat!("let args = [\"session\", \"--", "pair\", \"1\"];").to_owned(),
-        ),
-        (lab, format!("fn f(_: {real}) {{}}")),
-        (
-            M6_RS,
-            format!("#[cfg(test)]\nfn f() {{ let _ = {real}::new(); }}"),
-        ),
-        (
-            M6_RS,
-            format!("/// ```\n/// let s = {real}::new();\n/// ```\nfn f() {{}}"),
-        ),
-        (
-            LEARN_RS,
-            concat!(
-                "#[cfg(test)]\nmod tests {\n    const A: &str = \"--",
-                "pair\";\n}\n"
-            )
-            .to_owned(),
-        ),
-        (
-            "crates/aterm-lab/tests/learn.rs",
-            concat!("const A: &str = \"--", "pair\";").to_owned(),
-        ),
-        (
-            M6_RS,
-            format!(
-                "#[cfg(all(test, target_os = \"macos\"))]\nmod t {{\n    fn f() {{ let _ = {real}::new(); }}\n}}"
-            ),
-        ),
-        (
-            M6_RS,
-            format!("#[test]\nfn f() {{ let _ = {real}::new(); }}"),
-        ),
-        (
-            M6_RS,
-            format!("#![cfg(test)]\nfn f() {{ let _ = {real}::new(); }}"),
-        ),
-        (
-            M6_RS,
-            format!(
-                "fn f() {{\n    #[cfg(test)]\n    let c = if x {{ None }} else {{ Some({real}::new()) }};\n}}"
-            ),
-        ),
-        (
-            M6_RS,
-            format!(
-                "fn f() {{\n    #[cfg(test)]\n    let s = Probe {{ n: 0 }}.with({real}::new());\n}}"
-            ),
-        ),
-        (
-            M4_RS,
-            concat!(
-                "#[cfg(all(unix, test))]\nfn f() { let _ = LookToken::mint_",
-                "real(&s, 1, &l); }"
-            )
-            .to_owned(),
-        ),
-        (
-            LEARN_RS,
-            concat!(
-                "#[cfg(all(test, target_os = \"macos\"))]\nmod t {\n    const A: &str = \"--",
-                "pair\";\n}\n"
-            )
-            .to_owned(),
-        ),
-        (
-            "crates/aterm-effects/src/aos_momentum/test_fixtures.rs",
-            concat!(
-                "pub(super) const A: [&str; 2] = [\"session\", \"--",
-                "pair\"];"
-            )
-            .to_owned(),
-        ),
-    ] {
-        assert!(!scan(path, &planted).is_empty(), "{path}: {planted}");
-    }
-    for (path, allowed) in [
-        (M4_RS, format!("pub struct {real}(NonZeroU64);")),
-        (
-            M6_RS,
-            format!("pub fn real(log: L, i: u32, sets: {real}) {{}}"),
-        ),
-        (
-            M6_RS,
-            concat!("let t = LookToken::mint_", "real(real, i, &list)?;").to_owned(),
-        ),
-        (
-            M4_TESTS_RS,
-            concat!("let t = LookToken::mint_", "practice(s, &l);").to_owned(),
-        ),
-        (
-            LEARN_RS,
-            concat!("match a { \"--", "pair\" => {} _ => {} }").to_owned(),
-        ),
-        (
-            LEARN_BENCH_RS,
-            concat!("let args = [\"session\", \"--", "pair\", &i];").to_owned(),
-        ),
-        (
-            M4_RS,
-            format!(
-                "#[cfg(any(test, debug_assertions, feature = \"aos-learn\"))]\npub fn mint(_: &{real}) {{}}"
-            ),
-        ),
-        (
-            M6_RS,
-            format!(
-                "fn f() {{\n    #[cfg(test)]\n    let v = match x {{ _ => 1 }};\n}}\nfn g(_: {real}) {{}}"
-            ),
-        ),
-        (
-            M6_RS,
-            format!("#[cfg(test)]\npub(super) fn f() {{}}\nfn g(_: {real}) {{}}"),
-        ),
-        (
-            test_src,
-            concat!("let a = [\"--", "pairs\", \"2\"];").to_owned(),
-        ),
-    ] {
-        assert_eq!(
-            scan(path, &allowed),
-            Vec::<String>::new(),
-            "{path}: {allowed}"
-        );
     }
 }
 

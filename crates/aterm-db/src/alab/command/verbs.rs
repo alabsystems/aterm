@@ -19,7 +19,7 @@ use crate::{
             seen::{Seen, Usage, WindowQuota},
         },
         mail,
-        registry::{self, ACCOUNT, ADDRESS, MACHINE, MAILBOX, MODEL, PREFERENCE},
+        registry::{self, ACCOUNT, ADDRESS, MACHINE, MAILBOX, MODEL, PHONE, PREFERENCE},
         view::LabView,
     },
     att::{self, Handle},
@@ -263,6 +263,15 @@ pub(super) fn runs_on(
         "status": row.map_or(Value::Null, |r| text(r, "status")),
         "role": row.map_or(Value::Null, |r| text(r, "role")),
         "model": row.map_or(Value::Null, |r| text(r, "model")),
+        "make": row.map_or(Value::Null, |r| text(r, "make")),
+        "arch": row.map_or(Value::Null, |r| text(r, "arch")),
+        "os": row.map_or(Value::Null, |r| text(r, "os")),
+        "chip": row.map_or(Value::Null, |r| text(r, "chip")),
+        "ram_gb": row.map_or(Value::Null, |r| text(r, "ram_gb")),
+        "disk_gb": row.map_or(Value::Null, |r| text(r, "disk_gb")),
+        "nickname": row.map_or(Value::Null, |r| text(r, "nickname")),
+        "nickname_aliases": row.map_or(Value::Null, |r| text(r, "nickname_aliases")),
+        "location": row.map_or(Value::Null, |r| text(r, "location")),
         "row": row.and_then(cell::Row::lifecycle),
         "facts": bound_facts,
         "prefers": prefers,
@@ -329,6 +338,15 @@ pub(super) fn machines(paths: &Paths, args: &Args, io: &Io<'_>, now_ms: u64) -> 
             "status": row.map_or(Value::Null, |r| text(r, "status")),
             "role": row.map_or(Value::Null, |r| text(r, "role")),
             "model": row.map_or(Value::Null, |r| text(r, "model")),
+            "make": row.map_or(Value::Null, |r| text(r, "make")),
+            "arch": row.map_or(Value::Null, |r| text(r, "arch")),
+            "os": row.map_or(Value::Null, |r| text(r, "os")),
+            "chip": row.map_or(Value::Null, |r| text(r, "chip")),
+            "ram_gb": row.map_or(Value::Null, |r| text(r, "ram_gb")),
+            "disk_gb": row.map_or(Value::Null, |r| text(r, "disk_gb")),
+            "nickname": row.map_or(Value::Null, |r| text(r, "nickname")),
+            "nickname_aliases": row.map_or(Value::Null, |r| text(r, "nickname_aliases")),
+            "location": row.map_or(Value::Null, |r| text(r, "location")),
             "row": row.and_then(cell::Row::lifecycle),
             "prefers": prefers,
             "uuids": uuids,
@@ -421,6 +439,10 @@ pub(super) fn mail(paths: &Paths) -> Result<Value> {
         out.push(json!({
             "ad": pk,
             "kind": text(row, "kind"),
+            "provider": text(row, "provider"),
+            "status": text(row, "status"),
+            "phone": text(row, "phone"),
+            "protected": text(row, "protected"),
             "row": row.lifecycle(),
             "alias_of": text(row, "alias_of"),
             "mailbox": effective.as_ref().map(|e| json!({
@@ -451,6 +473,28 @@ pub(super) fn mail(paths: &Paths) -> Result<Value> {
         })
         .collect();
     Ok(json!({"complete": view.complete, "addresses": out, "mailboxes": boxes}))
+}
+
+/// `phones`: every phone row by key and label, last4, carrier, line type and device.
+pub(super) fn phones(paths: &Paths) -> Result<Value> {
+    let (view, _) = lab(paths)?;
+    let phones = view.project(&PHONE);
+    let out: Vec<Value> = phones
+        .rows
+        .iter()
+        .map(|(pk, row)| {
+            json!({
+                "ph": pk,
+                "label": text(row, "label"),
+                "last4": text(row, "last4"),
+                "carrier": text(row, "carrier"),
+                "line_type": text(row, "line_type"),
+                "device": text(row, "device"),
+                "row": row.lifecycle(),
+            })
+        })
+        .collect();
+    Ok(json!({"complete": view.complete, "phones": out}))
 }
 
 fn usage_json(lab: &LabView, q: &WindowQuota, now: u64) -> Value {
@@ -1007,6 +1051,7 @@ pub(super) fn edit(paths: &Paths, args: &Args, io: &mut Io<'_>) -> Result<Value>
         collection,
         &[],
         args.reveal,
+        None,
         &mut *io.open,
         &mut report,
     )?;

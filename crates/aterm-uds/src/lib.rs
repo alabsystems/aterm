@@ -193,7 +193,9 @@ pub use win::{CtlListener, CtlStream};
 /// Leaving a file or a folder out of backups, behind an injected platform field.
 pub mod backup;
 
-/// Bounded regular-file reads on every platform; on unix also the one writer of a whole file (a new temp beside it, its mode on the descriptor, synced, renamed) and aterm.toml's, under the config service's write lock.
+/// Bounded regular-file reads on every platform; the whole-file writer on Unix and Windows
+/// (a new temporary beside it, synced and renamed; Unix modes apply on Unix), and aterm.toml's
+/// Unix editor under the config service's write lock.
 pub mod atomic_file;
 
 /// This account's own home as the account database has it ([`account::home`]), whatever `$HOME` says: what a launchd job of this login runs with.
@@ -281,9 +283,11 @@ pub mod procwatch;
 /// macOS's program check (`syspolicyd`) read from outside: its thread pool, by one bounded setuid `ps` of its pid, for the wedge judge.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod program_check;
+/// Whether a long step on this thread is still going, told only to what that thread asked to tell.
+pub mod progress;
 /// `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`: a child that inherits nothing but a `/dev/null` stdio (the PTY keeper's one spawn).
 pub mod pspawn;
-/// macOS-only: the calling thread's requested QoS class, and its lift to the default class while it does short work a thread at a higher class waits on ([`qos::lift`], [`qos::restore`]: a holder of a lock another thread wants, a fork in flight).
+/// macOS-only: the calling thread's requested QoS class, and its lift to the default class while it does short work a thread at a higher class waits on ([`qos::lift`], [`qos::restore`]: a holder of a lock another thread wants, a fork in flight); and the base priority each thread of a process runs at, read from outside it ([`qos::thread_base_priorities`]).
 #[cfg(target_os = "macos")]
 pub mod qos;
 pub mod rand;

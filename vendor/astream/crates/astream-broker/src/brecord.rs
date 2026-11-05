@@ -105,6 +105,10 @@ pub const CONTINUES_TAG: u8 = 0xB4;
 /// trailer (`[BT_TAG, bt_ms_le_8]`) written immediately before the batch `Mark`
 /// (`REQUIREMENTS` R3). Pre-R3 builds omit this trailer (`bt = None`).
 pub const BT_TAG: u8 = 0xB6;
+/// Tag of the origin trailer on a wire `Delivery` that asked for it
+/// (`[ORIGIN_TAG, producer_id_le_8, producer_seq_le_8]`, after any `bt=` trailer): who published
+/// the record, and under which sequence. Never written to a log.
+pub const ORIGIN_TAG: u8 = 0xB7;
 /// Byte length of a broker-stamped wall-clock trailer: `BT_TAG` (1) + `u64` LE (8).
 pub const BT_LEN: usize = 9;
 /// The commit-tag byte on a writer-staged `/a/retire` record (`DESIGN-aterm-fabric`

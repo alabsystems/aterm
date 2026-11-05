@@ -241,6 +241,16 @@ pub struct Reading {
 /// a line of its own all the same.
 pub type Apart = fn(&str, &str) -> bool;
 
+/// What joins a turn's earlier messages into one text ([`ScreenReader::turn_said_before`]): a
+/// blank line, as a message's own paragraphs are joined.
+pub const MESSAGE_GAP: &str = "\n\n";
+
+/// A turn's earlier `messages` as one text ([`MESSAGE_GAP`]).
+#[must_use]
+pub fn join_messages(messages: &[String]) -> String {
+    messages.join(MESSAGE_GAP)
+}
+
 /// Per-program screen grammar.
 pub trait ScreenReader: Sync {
     fn program(&self) -> Program;
@@ -332,9 +342,15 @@ pub trait ScreenReader: Sync {
     fn said_history_stop(&self, row: &str) -> bool {
         !row.is_empty() && !row.starts_with(char::is_whitespace)
     }
-    /// Earlier agent messages from the same turn above [`Self::said_tail`], joined by blank lines.
+    /// Earlier agent messages from the same turn above [`Self::said_tail`], joined by blank lines
+    /// ([`join_messages`]).
     fn turn_said_before(&self, _rows: &[String]) -> Option<String> {
         None
+    }
+    /// [`Self::turn_said_before`] message by message, oldest first: the texts it joins. A reader
+    /// that cannot tell its messages apart answers the joined text as one message.
+    fn turn_messages_before(&self, rows: &[String]) -> Option<Vec<String>> {
+        self.turn_said_before(rows).map(|t| vec![t])
     }
     /// [`Self::said_tail`], each line the program wrapped across rows read as one by the pane's
     /// width, every other row, and each row `apart` sets apart ([`Apart`]), a line of its own.
@@ -344,6 +360,11 @@ pub trait ScreenReader: Sync {
     /// [`Self::turn_said_before`], its lines read as [`Self::said_lines`] reads them.
     fn turn_lines_before(&self, rows: &[String], _apart: Apart) -> Option<String> {
         self.turn_said_before(rows)
+    }
+    /// [`Self::turn_lines_before`] message by message, oldest first
+    /// ([`Self::turn_messages_before`]).
+    fn turn_message_lines_before(&self, rows: &[String], apart: Apart) -> Option<Vec<String>> {
+        self.turn_lines_before(rows, apart).map(|t| vec![t])
     }
     /// Whether the entire turn ending at [`Self::said_tail`] is visible on `rows`.
     fn turn_whole(&self, rows: &[String]) -> bool {
@@ -610,11 +631,17 @@ impl ScreenReader for ClaudeReader {
     fn turn_said_before(&self, rows: &[String]) -> Option<String> {
         crate::turn::turn_said_before(rows)
     }
+    fn turn_messages_before(&self, rows: &[String]) -> Option<Vec<String>> {
+        crate::turn::turn_messages_before(rows)
+    }
     fn said_lines(&self, rows: &[String], apart: Apart) -> Option<String> {
         crate::turn::said_lines(rows, apart)
     }
     fn turn_lines_before(&self, rows: &[String], apart: Apart) -> Option<String> {
         crate::turn::turn_lines_before(rows, apart)
+    }
+    fn turn_message_lines_before(&self, rows: &[String], apart: Apart) -> Option<Vec<String>> {
+        crate::turn::turn_message_lines_before(rows, apart)
     }
     fn turn_whole(&self, rows: &[String]) -> bool {
         crate::turn::turn_whole(rows)
@@ -777,11 +804,17 @@ impl ScreenReader for AgyReader {
     fn turn_said_before(&self, rows: &[String]) -> Option<String> {
         agy::turn_said_before(rows)
     }
+    fn turn_messages_before(&self, rows: &[String]) -> Option<Vec<String>> {
+        agy::turn_messages_before(rows)
+    }
     fn said_lines(&self, rows: &[String], apart: Apart) -> Option<String> {
         agy::said_lines(rows, apart)
     }
     fn turn_lines_before(&self, rows: &[String], apart: Apart) -> Option<String> {
         agy::turn_lines_before(rows, apart)
+    }
+    fn turn_message_lines_before(&self, rows: &[String], apart: Apart) -> Option<Vec<String>> {
+        agy::turn_message_lines_before(rows, apart)
     }
     fn turn_whole(&self, rows: &[String]) -> bool {
         agy::turn_whole(rows)
@@ -891,11 +924,17 @@ impl ScreenReader for MuseReader {
     fn turn_said_before(&self, rows: &[String]) -> Option<String> {
         muse::turn_said_before(rows)
     }
+    fn turn_messages_before(&self, rows: &[String]) -> Option<Vec<String>> {
+        muse::turn_messages_before(rows)
+    }
     fn said_lines(&self, rows: &[String], apart: Apart) -> Option<String> {
         muse::said_lines(rows, apart)
     }
     fn turn_lines_before(&self, rows: &[String], apart: Apart) -> Option<String> {
         muse::turn_lines_before(rows, apart)
+    }
+    fn turn_message_lines_before(&self, rows: &[String], apart: Apart) -> Option<Vec<String>> {
+        muse::turn_message_lines_before(rows, apart)
     }
     fn turn_whole(&self, rows: &[String]) -> bool {
         muse::turn_whole(rows)

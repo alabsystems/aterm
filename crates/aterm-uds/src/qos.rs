@@ -8,7 +8,8 @@
 //!
 //! macOS runs every thread of a process in its background band (darwin-bg: a launchd job of
 //! `ProcessType` `Background`, a `taskpolicy -b` child) at the band's priority whatever class the
-//! thread requests, so a lift there changes the class it reads back and nothing it runs at.
+//! thread requests, so a lift there changes the class it reads back and nothing it runs at. What
+//! each thread of a process runs at is read from outside it ([`thread_base_priorities`]).
 
 use std::ffi::c_void;
 
@@ -83,6 +84,59 @@ unsafe fn requested_class_of_thread(
     // valid across the call.
     let rc = unsafe { pthread_get_qos_class_np(thread, &mut class, &mut relative) };
     (rc == 0).then_some((class, relative))
+}
+
+/// The base priority each thread of the process `pid` runs at now (`<sys/proc_info.h>`'s
+/// `pth_priority`), read from outside it, in the order the kernel lists the threads: every one
+/// reads 4 in the background band (darwin-bg), and a thread at the default class outside any band
+/// and clamp reads 31. A thread that ends between the listing and its read is left out. `None`
+/// where the process is gone or the kernel declined to list its threads (another user's).
+#[must_use]
+pub fn thread_base_priorities(pid: i32) -> Option<Vec<i32>> {
+    /// `<sys/proc_info.h>`'s flavor listing a process's thread handles (`u64` each).
+    const PROC_PIDLISTTHREADS: libc::c_int = 6;
+    let record = libc::c_int::try_from(size_of::<libc::proc_threadinfo>()).ok()?;
+    let mut handles: Vec<u64> = vec![0; 64];
+    let listed = loop {
+        let bytes = libc::c_int::try_from(handles.len() * size_of::<u64>()).ok()?;
+        // SAFETY: `handles` is `bytes` writable bytes of `u64` slots, which this flavor fills.
+        let wrote = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADS,
+                0,
+                handles.as_mut_ptr().cast(),
+                bytes,
+            )
+        };
+        if wrote <= 0 {
+            return None;
+        }
+        // A full buffer may have cut the list short: ask again with room to spare.
+        if wrote < bytes {
+            break usize::try_from(wrote).ok()? / size_of::<u64>();
+        }
+        handles.resize(handles.len() * 2, 0);
+    };
+    let priorities = handles[..listed]
+        .iter()
+        .filter_map(|&handle| {
+            let mut info = std::mem::MaybeUninit::<libc::proc_threadinfo>::uninit();
+            // SAFETY: `info` is `record` writable bytes laid out as the record this flavor fills.
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTHREADINFO,
+                    handle,
+                    info.as_mut_ptr().cast(),
+                    record,
+                )
+            };
+            // SAFETY: an exact-size read initialized every (integer and byte) field.
+            (read == record).then(|| unsafe { info.assume_init() }.pth_priority)
+        })
+        .collect();
+    Some(priorities)
 }
 
 unsafe extern "C" {

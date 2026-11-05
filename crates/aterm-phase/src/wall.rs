@@ -3,6 +3,8 @@
 
 //! Classifies the wall a worker's turn ended on: usage window, model bucket, spend, full context, expired login, API error, overload, or Claude Code's critical-memory banner ([`memory_wall`], detected by screen position rather than [`PHRASES`]).
 
+use crate::phase::Transcript;
+
 /// Which wall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WallKind {
@@ -621,17 +623,20 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
     memory_wall(rows).or_else(|| crate::phase::notice(rows))
 }
 
-/// Whether the screen says the login is back: the last thing said is the vendor's own word that a `/login` finished — `⎿  Login successful`, or `⎿  Login successful · account or organization changed` — hanging from the `❯ /login` a person typed.
+/// Whether the screen says the login is back: the last thing said is the vendor's own word that a `/login` finished — `⎿  Login successful`, or `⎿  Login successful · account or organization changed` — hanging from the `❯ /login` a person typed, each row read up to the side panel's rule ([`crate::phase::Transcript`]).
 #[must_use]
 pub fn login_restored(rows: &[String]) -> bool {
-    use crate::phase::{gutter_open, last_said_index, line_at};
-    let Some(last) = last_said_index(rows) else {
+    use crate::phase::{gutter_open, last_said_in, line_at};
+    let transcript = Transcript::of(rows);
+    let Some(last) = last_said_in(rows, &transcript) else {
         return false;
     };
+    let width = transcript.room(crate::question::screen_width(rows));
+    let rows: &[String] = &transcript.rows;
     let Some(open) = gutter_open(rows, last) else {
         return false;
     };
-    let (end, line) = line_at(rows, open, rows.len(), crate::question::screen_width(rows));
+    let (end, line) = line_at(rows, open, rows.len(), width);
     let restored = end >= last
         && crate::text::trim_start(&line)
             .strip_prefix('⎿')
@@ -646,7 +651,7 @@ pub fn login_restored(rows: &[String]) -> bool {
 
 const NOTICE_ROWS: usize = 3;
 
-/// The days Claude Code says the stored login has left — its own `Your login expires in N days · run /login to renew` (anchors `login.expires_in`, `login.renew_hint`, N from 1 to 3) — or `None`.
+/// The days Claude Code says the stored login has left — its own `Your login expires in N days · run /login to renew` (anchors `login.expires_in`, `login.renew_hint`, N from 1 to 3) — or `None`. A row over the composer is read up to the side panel's rule and against its room ([`crate::phase::Transcript`]), as the right edge such a hint stands against there; a footer row whole, against the composer's width.
 #[must_use]
 pub fn login_expires_in(rows: &[String]) -> Option<u32> {
     use crate::phase::{HINT_COLUMN, composer_frame, is_against_right_edge};
@@ -654,10 +659,12 @@ pub fn login_expires_in(rows: &[String]) -> Option<u32> {
     let hint = const { crate::anchor!("login.renew_hint") };
     let frame = composer_frame(rows)?;
     let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
-    let above = frame.top.saturating_sub(NOTICE_ROWS)..frame.top;
-    let footer = frame.bottom + 1..rows.len();
-    above.chain(footer).find_map(|i| {
-        let row = crate::text::trim_end(&rows[i]);
+    let transcript = Transcript::of(rows);
+    let above = (frame.top.saturating_sub(NOTICE_ROWS)..frame.top)
+        .map(|i| (transcript.rows[i].as_str(), transcript.room(width)));
+    let footer = rows[frame.bottom + 1..].iter().map(|r| (r.as_str(), width));
+    above.chain(footer).find_map(|(row, width)| {
+        let row = crate::text::trim_end(row);
         let (column, segment) = right_segment(row);
         if column < HINT_COLUMN && !is_against_right_edge(row, width) {
             return None;
@@ -688,29 +695,40 @@ pub enum AutoContinue {
     Armed,
 }
 
-/// What the screen last says of Claude Code's own auto-continue, once the limit it was armed for has left the screen: Esc on `Continuing automatically at 3:50pm · esc to cancel` draws `⏺ Automatic continue cancelled · /rate-limit-options to re-arm` in the transcript and as the footer's notification; at the reset the vendor draws `⏺ Usage limit reset · continuing automatically` and sends the continuation itself, with no `❯` row, its reply under it.
+/// What the screen last says of Claude Code's own auto-continue, once the limit it was armed for has left the screen: Esc on `Continuing automatically at 3:50pm · esc to cancel` draws `⏺ Automatic continue cancelled · /rate-limit-options to re-arm` in the transcript and as the footer's notification; at the reset the vendor draws `⏺ Usage limit reset · continuing automatically` and sends the continuation itself, with no `❯` row, its reply under it. The transcript's rows are read up to the side panel's rule and in its room ([`Transcript`]), the footer's whole.
 #[must_use]
 pub fn auto_continue_end(rows: &[String]) -> Option<AutoContinue> {
+    auto_continue_end_on(rows, &Transcript::of(rows))
+}
+
+/// [`auto_continue_end`] on `rows`, whose transcript the caller holds.
+fn auto_continue_end_on(rows: &[String], transcript: &Transcript<'_>) -> Option<AutoContinue> {
     if let Some(end) = auto_continue_toast(rows) {
         return Some(end);
     }
-    auto_continue_said_row(rows).and_then(|(end, _)| end)
+    auto_continue_said_row(rows, transcript).and_then(|(end, _)| end)
 }
 
-fn auto_continue_said_row(rows: &[String]) -> Option<(Option<AutoContinue>, usize)> {
+/// The transcript's row, up from the composer and short of a person's prompt, that says how the
+/// auto-continue ended or names a limit, read on the transcript's rows ([`Transcript`]).
+fn auto_continue_said_row(
+    rows: &[String],
+    transcript: &Transcript<'_>,
+) -> Option<(Option<AutoContinue>, usize)> {
     use crate::phase::line_at;
     let frame = crate::phase::composer_frame(rows)?;
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
-    for (i, row) in rows[..frame.top].iter().enumerate().rev() {
+    let width = transcript.room(crate::text::trim_end(&rows[frame.bottom]).chars().count());
+    let said: &[String] = &transcript.rows;
+    for (i, row) in said[..frame.top].iter().enumerate().rev() {
         if crate::phase::leading_spaces(row) == 0 && crate::text::trim_start(row).starts_with('❯')
         {
             return None;
         }
-        let (_, line) = line_at(rows, i, frame.top, width);
+        let (_, line) = line_at(said, i, frame.top, width);
         for item in gapped_items(&line) {
             let end = auto_continue_said(item);
             let limit = end.is_none() && classify_wall(item).is_some_and(|k| k.reads_limited());
-            if (end.is_some() || limit) && crate::phase::programs_words(rows, i) {
+            if (end.is_some() || limit) && crate::phase::programs_words(said, i) {
                 break;
             }
             if end.is_some() || limit {
@@ -730,17 +748,19 @@ pub struct WordsAbove {
     pub end: usize,
 }
 
-/// The row a limit reader decided on without its owner: the newest limit notice [`since_limit`] reads, its `/goal` echo, or the transcript's row [`auto_continue_end`] reads — where the walk that tells a program's words from Claude Code's own reached the first of `rows` undecided ([`crate::phase::WordsOf::Above`]), the lowest such row.
+/// The row a limit reader decided on without its owner: the newest limit notice [`since_limit`] reads, its `/goal` echo, or the transcript's row [`auto_continue_end`] reads — where the walk that tells a program's words from Claude Code's own reached the first of `rows` undecided ([`crate::phase::WordsOf::Above`]), the lowest such row, each read on the transcript's rows ([`Transcript`]).
 #[must_use]
 pub fn limit_words_above(rows: &[String]) -> Option<WordsAbove> {
     let frame = crate::phase::composer_frame(rows)?;
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
-    let newest = newest_limit(rows);
+    let transcript = Transcript::of(rows);
+    let width = transcript.room(crate::text::trim_end(&rows[frame.bottom]).chars().count());
+    let newest = newest_limit(rows, &transcript);
     let said = auto_continue_toast(rows)
         .is_none()
-        .then(|| auto_continue_said_row(rows))
+        .then(|| auto_continue_said_row(rows, &transcript))
         .flatten()
         .map(|(_, i)| i);
+    let rows: &[String] = &transcript.rows;
     newest
         .iter()
         .flat_map(|n| [Some(n.row), n.echo])
@@ -786,10 +806,10 @@ pub struct SinceLimit {
     pub generic: bool,
 }
 
-/// The newest usage limit notice the screen draws and whether a turn was served since it ([`SinceLimit`]): up from the composer, the first line (or wide-gapped item) Claude Code's limit notice opens (`You've hit your session limit · …`, its `Usage limit reached · continuing automatically …` row; a line that names no reset — the `/goal` echo of the notice above it — takes its reset from that notice), and the rows below it.
+/// The newest usage limit notice the screen draws and whether a turn was served since it ([`SinceLimit`]): up from the composer, the first line (or wide-gapped item) Claude Code's limit notice opens (`You've hit your session limit · …`, its `Usage limit reached · continuing automatically …` row; a line that names no reset — the `/goal` echo of the notice above it — takes its reset from that notice), and the rows below it. Each row over the composer is read up to the side panel's rule and wrapped in its room ([`Transcript`]), so the panel's text beside it, which the wide gaps of the row's padding set apart as an item, is none of its words.
 #[must_use]
 pub fn since_limit(rows: &[String]) -> Option<SinceLimit> {
-    newest_limit(rows).map(|newest| newest.since)
+    newest_limit(rows, &Transcript::of(rows)).map(|newest| newest.since)
 }
 
 fn dotted_said<'a>(row: &str, line: &'a str) -> Option<&'a str> {
@@ -808,10 +828,14 @@ struct Newest {
     echo: Option<usize>,
 }
 
-fn newest_limit(rows: &[String]) -> Option<Newest> {
+/// [`since_limit`]'s walk, on the transcript's rows, each up to the side panel's rule and wrapped
+/// in its room ([`Transcript`]), which the caller holds for `rows`.
+fn newest_limit(rows: &[String], transcript: &Transcript<'_>) -> Option<Newest> {
     use crate::phase::line_at;
     let frame = crate::phase::composer_frame(rows)?;
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    let width = transcript.room(crate::text::trim_end(&rows[frame.bottom]).chars().count());
+    let screen = rows;
+    let rows: &[String] = &transcript.rows;
     let words = |item: &str| {
         item.trim_start_matches(|c: char| !c.is_alphanumeric())
             .to_string()
@@ -871,7 +895,8 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
             match crate::phase::notice_reset(item) {
                 Some(reset) => {
                     let found = named_by_the_turn(
-                        rows,
+                        screen,
+                        transcript,
                         Wall {
                             kind,
                             message: words(item),
@@ -936,8 +961,8 @@ fn reset_clock_words(reset: &str) -> String {
     crate::text::trim(&reset[..cut]).to_ascii_lowercase()
 }
 
-/// The wall a generic banner stands for: `found` is the notice the reader placed (`crate::phase::notice`'s placement: the footer, a banner) and, where it is the generic `Usage limit reached` ([`generic_limit`]), the kind is the turn's own notice's — the newest limit notice above the composer that names its limit, read as [`since_limit`] reads one (each row as the line it opens, across the rows Ink wrapped it onto), up through local commands (`❯ /rate-limit-options`, which Claude Code types itself to open its dialog) but no person's prompt, and naming the same reset as `found` (the zone aside): the notice of this limit, never an older one a `/resume`d history redraws.
-pub(crate) fn named_by_the_turn(rows: &[String], found: Wall) -> Wall {
+/// The wall a generic banner stands for: `found` is the notice the reader placed (`crate::phase::notice`'s placement: the footer, a banner) and, where it is the generic `Usage limit reached` ([`generic_limit`]), the kind is the turn's own notice's — the newest limit notice above the composer that names its limit, read as [`since_limit`] reads one (each row as the line it opens, across the rows Ink wrapped it onto, on the transcript's rows, each up to the side panel's rule and wrapped in its room: [`Transcript`], which the caller holds for `rows`), up through local commands (`❯ /rate-limit-options`, which Claude Code types itself to open its dialog) but no person's prompt, and naming the same reset as `found` (the zone aside): the notice of this limit, never an older one a `/resume`d history redraws.
+pub(crate) fn named_by_the_turn(rows: &[String], transcript: &Transcript<'_>, found: Wall) -> Wall {
     if !generic_limit(&found.message) {
         return found;
     }
@@ -947,9 +972,9 @@ pub(crate) fn named_by_the_turn(rows: &[String], found: Wall) -> Wall {
     let Some(frame) = crate::phase::composer_frame(rows) else {
         return found;
     };
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    let width = transcript.room(crate::text::trim_end(&rows[frame.bottom]).chars().count());
     let top = frame.top.min(found.row);
-    let named = turns_notice(rows, top, width)
+    let named = turns_notice(&transcript.rows, top, width)
         .and_then(|(kind, notice)| names_the_reset(&notice, kind, &said, found.kind));
     match named {
         Some((kind, words)) => Wall {
@@ -1006,16 +1031,19 @@ fn names_the_reset(
     (same && kind != generic).then(|| (kind, words.to_string()))
 }
 
-/// The limit a cancel left on the screen: the vendor's own word that its auto-continue will not go on ([`auto_continue_end`] `Unkept`: Esc on its countdown, `⏺ Automatic continue cancelled · /rate-limit-options to re-arm`) drawn as the last thing said, its `⏺` row in column 0, right under the screen's newest usage limit notice ([`since_limit`]: the first thing said above the cancel is that notice's block, or its `/goal` echo) — a notice that names its reset and that no turn has been served since — read as the wall that notice was before the cancel took it off the screen's end: its kind, its words, its reset, the row it opens on ([`Placement::ErrorRow`] for the vendor's `⏺` row, its countdown's `Usage limit reached · continuing automatically at …`; [`Placement::Gutter`] for a `⎿` notice), never under a call.
+/// The limit a cancel left on the screen: the vendor's own word that its auto-continue will not go on ([`auto_continue_end`] `Unkept`: Esc on its countdown, `⏺ Automatic continue cancelled · /rate-limit-options to re-arm`) drawn as the last thing said, its `⏺` row in column 0, right under the screen's newest usage limit notice ([`since_limit`]: the first thing said above the cancel is that notice's block, or its `/goal` echo) — a notice that names its reset and that no turn has been served since — read as the wall that notice was before the cancel took it off the screen's end: its kind, its words, its reset, the row it opens on ([`Placement::ErrorRow`] for the vendor's `⏺` row, its countdown's `Usage limit reached · continuing automatically at …`; [`Placement::Gutter`] for a `⎿` notice), never under a call. Each row over the composer is read up to the side panel's rule and wrapped in its room ([`Transcript`]).
 #[must_use]
 pub fn left_wall(rows: &[String]) -> Option<Wall> {
-    use crate::phase::{is_said, leading_spaces, line_at};
-    if auto_continue_end(rows)? != AutoContinue::Unkept {
+    use crate::phase::{is_said, last_said_in, leading_spaces, line_at};
+    let transcript = Transcript::of(rows);
+    if auto_continue_end_on(rows, &transcript)? != AutoContinue::Unkept {
         return None;
     }
     let frame = crate::phase::composer_frame(rows)?;
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
-    let last = crate::phase::last_said_index(rows)?;
+    let width = transcript.room(crate::text::trim_end(&rows[frame.bottom]).chars().count());
+    let last = last_said_in(rows, &transcript)?;
+    let newest = newest_limit(rows, &transcript)?;
+    let rows: &[String] = &transcript.rows;
     let cancel = (0..=last)
         .rev()
         .find(|&i| rows[i].starts_with(['⏺', '●']))?;
@@ -1024,7 +1052,6 @@ pub fn left_wall(rows: &[String]) -> Option<Wall> {
     if end < last || auto_continue_said(said) != Some(AutoContinue::Unkept) {
         return None;
     }
-    let newest = newest_limit(rows)?;
     if newest.since.served || newest.row >= cancel {
         return None;
     }
@@ -1152,27 +1179,31 @@ pub fn memory_banner_head(message: &str) -> &str {
         .trim_end()
 }
 
-/// Claude Code's critical-memory banner, as a [`WallKind::Memory`] wall.
+/// Claude Code's critical-memory banner, as a [`WallKind::Memory`] wall, its rows over the
+/// composer read up to the side panel's rule and against its room ([`crate::phase::Transcript`]),
+/// the right edge the banner stands against beside the panel.
 #[must_use]
 pub fn memory_wall(rows: &[String]) -> Option<Wall> {
     use crate::phase::{HINT_COLUMN, composer_frame, is_against_right_edge, status_block};
     let anchor = const { crate::anchor!("wall.memory") };
     let frame = composer_frame(rows)?;
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    let transcript = Transcript::of(rows);
+    let width = transcript.room(crate::text::trim_end(&rows[frame.bottom]).chars().count());
     let block = status_block(rows, frame.top);
     let from = block
         .status
         .unwrap_or(block.from)
         .max(frame.top.saturating_sub(MEMORY_ROWS));
+    let said: &[String] = &transcript.rows;
     (from..frame.top).rev().find_map(|i| {
-        let row = crate::text::trim_end(&rows[i]);
+        let row = crate::text::trim_end(&said[i]);
         if row.chars().count() + 3 < width {
             return None;
         }
         let (column, segment) = right_segment(row);
         let live = block
             .status
-            .is_some_and(|s| s < i && !in_queued_message(rows, s, i));
+            .is_some_and(|s| s < i && !in_queued_message(said, s, i));
         if !live && column < HINT_COLUMN && !is_against_right_edge(row, width) {
             return None;
         }
@@ -2113,6 +2144,77 @@ mod tests {
         assert_eq!(wall(&back), None);
         assert!(login_restored(&back));
         assert!(!login_restored(&screen_with("⏺ Bash(tail -2 login.log)")));
+    }
+
+    /// A LOGIN BACK BESIDE THE SIDE PANEL IS READ: its rows are read up to the panel's rule
+    /// ([`crate::phase::Transcript`]). Read whole before (KI-1101-3), the person's `❯ /login` row
+    /// ended in its padding and the rule, so it was no `/login` and the login read as never back.
+    /// No capture draws a login beside the panel, so these screens are CONSTRUCTED: the measured
+    /// 2.1.316 panel capture's rows above its last waiting row, then the login rows of
+    /// [`the_workers_words_and_a_finished_login_are_no_login_wall`] and a done row, each padded to
+    /// the measured rule with no panel text beside it or the panel's measured heading, and the
+    /// capture's composer, emptied, and its footer, bare. CONTROL: the same rows with no panel
+    /// (each cut at the rule) read the same, and a tool's call under the same rows is no `/login`.
+    #[test]
+    fn a_login_back_beside_the_side_panel_is_read() {
+        use crate::prompt::fixtures::WAITING_AGENTS_WORKFLOWS_2_1_316;
+        let panel = screen(WAITING_AGENTS_WORKFLOWS_2_1_316);
+        let at = panel
+            .iter()
+            .rposition(|r| r.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let (head, _) = panel[at].split_once('│').expect("the panel's rule");
+        let rule = head.chars().count();
+        let heading = panel[1].split_once('│').expect("the heading").1;
+        let beside = |call: &str, side: &str| {
+            let mut v = panel[..at].to_vec();
+            for row in [
+                "⏺ Login expired · Please run /login",
+                "",
+                call,
+                "  ⎿  Login successful",
+                "",
+                "✻ Worked for 12s · done 4:57 PM",
+                "",
+            ] {
+                v.push(format!("{row:<rule$}│{side}"));
+            }
+            let top = at
+                + 1
+                + panel[at + 1..]
+                    .iter()
+                    .position(|r| r.starts_with('─'))
+                    .expect("the composer's top rule");
+            v.extend([
+                panel[top].clone(),
+                "❯".to_string(),
+                panel[top + 2].clone(),
+                String::new(),
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+            ]);
+            v
+        };
+        let no_panel = |v: &[String]| -> Vec<String> {
+            v.iter()
+                .map(|r| {
+                    r.split_once('│')
+                        .map_or(r.as_str(), |(left, _)| crate::text::trim_end(left))
+                        .to_string()
+                })
+                .collect()
+        };
+        for side in ["", heading] {
+            let back = beside("❯ /login", side);
+            let call = beside("⏺ Bash(tail -2 login.log)", side);
+            for (name, back, call) in [
+                ("beside the panel", back.clone(), call.clone()),
+                ("no panel", no_panel(&back), no_panel(&call)),
+            ] {
+                assert_eq!(wall(&back), None, "{name} │{side}");
+                assert!(login_restored(&back), "{name} │{side}: {back:#?}");
+                assert!(!login_restored(&call), "CONTROL {name} │{side}");
+            }
+        }
     }
 
     #[test]

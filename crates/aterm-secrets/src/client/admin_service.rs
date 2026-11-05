@@ -6,7 +6,7 @@
 //! proves publication observed at the source, not delivery to the joining machine.
 
 use super::*;
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 
 const DOMAIN: &[u8] = b"aterm/vault/admission-receipt/1\0";
 
@@ -77,9 +77,9 @@ pub fn verify_receipt(text: &str, signer: &[u8; 32]) -> crate::Result<aterm_json
         .as_str()
         .and_then(crate::b64::decode_padded)
         .ok_or_else(|| Error::new("receipt has no signature"))?;
-    UnparsedPublicKey::new(&ED25519, signer)
-        .verify(&[DOMAIN, payload.as_bytes()].concat(), &signature)
-        .map_err(|_| Error::new("admission receipt signature failed"))?;
+    if !crate::ed25519::verifies(signer, &[DOMAIN, payload.as_bytes()].concat(), &signature) {
+        return Err(Error::new("admission receipt signature failed"));
+    }
     aterm_json::from_str(payload).map_err(|_| Error::new("invalid signed admission payload"))
 }
 

@@ -275,7 +275,7 @@ pub fn bump(root: &Path, git: &dyn GitRunner, released: (&str, &str)) -> Result<
         let new = rewritten(&text, o.to).ok_or_else(|| {
             Error::new(format!("harness-bump: {path} declares no HARNESS_VER line"))
         })?;
-        std::fs::write(root.join(path), new)
+        crate::durable::write_fresh(&root.join(path), new)
             .map_err(|e| Error::new(format!("cannot write {path}: {e}")))?;
     }
     if !owed.is_empty() {
@@ -303,7 +303,7 @@ pub fn bump(root: &Path, git: &dyn GitRunner, released: (&str, &str)) -> Result<
                 "harness-bump: {path} has no `## [Unreleased]` section"
             ))
         })?;
-        std::fs::write(root.join(path), new)
+        crate::durable::write_fresh(&root.join(path), new)
             .map_err(|e| Error::new(format!("cannot write {path}: {e}")))?;
     }
     Ok(owed)

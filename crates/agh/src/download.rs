@@ -218,6 +218,11 @@ impl Part {
         remove_quietly(&path).map_err(|e| local("cannot remove the old part file", &path, &e))?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -387,7 +392,7 @@ fn is_symlink_open_refusal(error: &std::io::Error) -> bool {
 }
 
 /// Open destination `path` for digest inspection without waiting on a FIFO or following a symlink.
-fn open_regular_dest_nonblocking(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_regular_dest_nonblocking(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -401,6 +406,7 @@ fn open_regular_dest_nonblocking(path: &Path) -> std::io::Result<File> {
 /// Anything there other than a regular file is usage (`refuse_non_file`), judged unfollowed and on
 /// the open handle.
 fn file_digest(path: &Path) -> Result<Option<Sha256Digest>> {
+    #[cfg(not(unix))]
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_file() => {}
         Ok(_) => return Err(not_a_file(path)),
@@ -535,7 +541,9 @@ fn fetch_inner(
             dest: path,
             clobber,
         },
-        Sink::Bounded(_) => Dest::Memory(Vec::new()),
+        Sink::Bounded(_) => Dest::Memory(Vec::with_capacity(
+            usize::try_from(expect.size.min(limit).min(64 * 1024)).unwrap_or(0),
+        )),
         Sink::Writer(writer) => Dest::Writer(writer),
     };
     let streamed = gh.call_stream(&call)?;

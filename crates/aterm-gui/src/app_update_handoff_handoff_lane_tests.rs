@@ -17,6 +17,7 @@ fn eligible() -> HandoffLaneFacts {
         sessions: 3,
         grant_chunks: false,
         grant_empty: false,
+        grant_desk: false,
         environment_is_a_merge: true,
     }
 }
@@ -250,6 +251,7 @@ fn carried_alone() -> SessionlessFacts {
     SessionlessFacts {
         window: true,
         layout: true,
+        workers_alone: false,
         lane: HandoffLaneFacts {
             sessions: 0,
             grant_empty: true,
@@ -279,8 +281,104 @@ fn the_sessionless_lane_is_the_launched_lane_with_windows_to_hand_over() {
         edit(&mut facts.lane);
         facts
     };
-    let rows: [(&str, SessionlessFacts, SessionlessLane); 17] = [
+    let no_tab = "no open tab is one the new build can restore";
+    let lists = SessionlessFacts {
+        layout: false,
+        workers_alone: true,
+        ..base
+    };
+    let declared = |facts: SessionlessFacts| {
+        let mut facts = facts;
+        facts.lane.grant_desk = true;
+        facts
+    };
+    let rows: [(&str, SessionlessFacts, SessionlessLane); 27] = [
         ("carried", base, Takes),
+        (
+            "lone lists: only the target's read says whether it declares desk1",
+            SessionlessFacts {
+                verdict: None,
+                ..lists
+            },
+            Unread,
+        ),
+        (
+            "lone lists to a target that declares desk1",
+            declared(lists),
+            Takes,
+        ),
+        (
+            "lone lists to a target that does not",
+            lists,
+            Cannot(no_tab),
+        ),
+        (
+            "tabless, not all lists: no read can change it",
+            SessionlessFacts {
+                layout: false,
+                verdict: None,
+                ..base
+            },
+            Cannot(no_tab),
+        ),
+        (
+            "tabless, not all lists, to a target that declares desk1",
+            declared(SessionlessFacts {
+                layout: false,
+                ..base
+            }),
+            Cannot(no_tab),
+        ),
+        (
+            "lone lists, a failed verdict on a kept image: the attempt's own failure",
+            SessionlessFacts {
+                verdict: Some(false),
+                ..lists
+            },
+            Takes,
+        ),
+        (
+            "lone lists, a failed verdict on a replaceable image: the cold lane's",
+            SessionlessFacts {
+                verdict: Some(false),
+                image_kept: false,
+                ..lists
+            },
+            Cannot("the new build failed its pre-park verification"),
+        ),
+        (
+            "lone lists to a target with desk1 and no empty1",
+            SessionlessFacts {
+                lane: HandoffLaneFacts {
+                    grant_empty: false,
+                    grant_desk: true,
+                    ..lists.lane
+                },
+                ..lists
+            },
+            Cannot("the successor does not read a grant with no terminal session"),
+        ),
+        (
+            "lone lists, the same image: it has no verdict to read",
+            declared(SessionlessFacts {
+                same_image: true,
+                verdict: None,
+                ..lists
+            }),
+            Takes,
+        ),
+        (
+            "lone lists, unbundled: a cause no read changes, before any wait",
+            SessionlessFacts {
+                verdict: None,
+                lane: HandoffLaneFacts {
+                    bundled: false,
+                    ..lists.lane
+                },
+                ..lists
+            },
+            Cannot("this process does not run from a .app bundle"),
+        ),
         (
             "no window",
             SessionlessFacts {
@@ -421,7 +519,8 @@ fn the_sessionless_lane_is_the_launched_lane_with_windows_to_hand_over() {
     ];
     for (label, facts, expected) in rows {
         assert_eq!(sessionless_lane(facts), expected, "{label}");
-        if facts.window && facts.layout && facts.verdict == Some(true) {
+        let a_desk_to_hand = facts.layout || (facts.workers_alone && facts.lane.grant_desk);
+        if facts.window && a_desk_to_hand && facts.verdict == Some(true) {
             assert_eq!(
                 expected == Takes,
                 out_of_band_lane_refusal(facts.lane).is_none(),
@@ -534,6 +633,7 @@ fn a_kept_image_with_no_live_terminal_is_handed_over_not_refused() {
                     policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
                     grant_chunks: false,
                     grant_empty,
+                    grant_desk: false,
                 },
                 crate::running_build_number(),
                 "the test candidate",
@@ -573,6 +673,254 @@ fn a_kept_image_with_no_live_terminal_is_handed_over_not_refused() {
          which would close its held panes"
     );
     assert!(!app.kept_image_installs_at_next_launch());
+}
+
+/// THE LAST HOLD (2026-11-03): a kept image whose only window held an empty Workers list waited
+/// for the person to open a tab or quit. A target that declares `desk1` is handed the list, and
+/// one that does not leaves the update to the next launch, naming the desk.
+#[test]
+fn a_kept_image_holding_only_its_workers_list_is_handed_over() {
+    use crate::native_update_admission::ApplyLane;
+    let mut app = crate::app_workers_tests::app_with_a_lone_list();
+    app.launch_image_kept = true;
+    assert!(
+        app.handoff_live_sessions().is_empty(),
+        "PRECONDITION: no live session"
+    );
+    assert!(
+        app.capture_handoff_layout().is_empty(),
+        "PRECONDITION: no tab to hand over"
+    );
+    let ticket =
+        crate::native_updater_service::ApplyAttemptTicket::for_test(7, "", &"ab".repeat(32));
+    let publish = |app: &crate::App, grant_desk: bool| {
+        super::PreverifyPublisher::for_attempt(&app.handoff_preverified, Some(&ticket))
+            .expect("an attempt names its artifact")
+            .publish_pass(
+                &aterm_update::HandoffCandidateFacts {
+                    policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
+                    grant_chunks: false,
+                    grant_empty: true,
+                    grant_desk,
+                },
+                crate::running_build_number(),
+                "the test candidate",
+            );
+    };
+    let carried = HandoffLaneFacts {
+        sessions: 0,
+        grant_empty: true,
+        grant_desk: true,
+        ..eligible()
+    };
+    publish(&app, true);
+    assert_eq!(
+        admit(&mut app, carried, Some(&ticket)).ok(),
+        Some(ApplyLane::Seamless),
+        "a target that declares desk1 is handed the list"
+    );
+    assert_eq!(app.sessionless_handoff_refused, None);
+    assert!(!app.kept_image_installs_at_next_launch());
+
+    publish(&app, false);
+    let refused = admit(
+        &mut app,
+        HandoffLaneFacts {
+            grant_desk: false,
+            ..carried
+        },
+        Some(&ticket),
+    )
+    .expect_err("CONTROL: a target that does not declare it never gets a row it cannot place");
+    assert_eq!(
+        refused.into_message(),
+        "The update waits for the next launch: no open tab is one the new build can restore"
+    );
+    assert!(app.kept_image_installs_at_next_launch());
+
+    assert_eq!(
+        admit(&mut app, carried, None).ok(),
+        Some(ApplyLane::Seamless),
+        "a same-image renewal targets this build, which rebuilds the list"
+    );
+    assert!(!app.kept_image_installs_at_next_launch());
+}
+
+/// The way a real update goes: what the target's read declared, through the lane's own reading of
+/// it, to the admission. A same-image handoff has no read, and targets this very build.
+#[test]
+fn a_targets_read_reaches_the_admission_through_the_lanes_facts() {
+    use crate::native_update_admission::ApplyLane;
+    let mut app = crate::app_workers_tests::app_with_a_lone_list();
+    app.launch_image_kept = true;
+    let ticket =
+        crate::native_updater_service::ApplyAttemptTicket::for_test(7, "", &"ab".repeat(32));
+    let read = |app: &crate::App, grant_desk: bool| {
+        super::PreverifyPublisher::for_attempt(&app.handoff_preverified, Some(&ticket))
+            .expect("an attempt names its artifact")
+            .publish_pass(
+                &aterm_update::HandoffCandidateFacts {
+                    policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
+                    grant_chunks: false,
+                    grant_empty: true,
+                    grant_desk,
+                },
+                crate::running_build_number(),
+                "the test candidate",
+            );
+    };
+    // Whether this machine's socket path fits is no part of the question.
+    let facts = |app: &crate::App, attempt, same_image| HandoffLaneFacts {
+        socket_path_fits: true,
+        ..app.launched_lane_facts(attempt, same_image, true, true, 0, true)
+    };
+
+    read(&app, false);
+    let undeclared = facts(&app, Some(&ticket), None);
+    assert!(undeclared.grant_empty && !undeclared.grant_desk);
+    assert!(
+        admit(&mut app, undeclared, Some(&ticket)).is_err(),
+        "CONTROL: a read that did not declare it"
+    );
+
+    read(&app, true);
+    let declared = facts(&app, Some(&ticket), None);
+    assert!(declared.grant_desk);
+    assert_eq!(
+        admit(&mut app, declared, Some(&ticket)).ok(),
+        Some(ApplyLane::Seamless),
+        "a read that declared it"
+    );
+
+    let same_image = facts(&app, None, Some(SameImageHandoff::DebugSeam));
+    assert!(same_image.grant_empty && same_image.grant_desk);
+    assert_eq!(
+        admit(&mut app, same_image, None).ok(),
+        Some(ApplyLane::Seamless),
+        "this very build"
+    );
+}
+
+/// The chunk grant is the target's read or a launch-record renewal's: a renewal targets this very
+/// build, and any other same-image handoff has only what a read says.
+#[test]
+fn the_lanes_chunk_grant_is_a_reads_or_a_renewals() {
+    let app = crate::App::headless_for_test();
+    let ticket =
+        crate::native_updater_service::ApplyAttemptTicket::for_test(7, "", &"ab".repeat(32));
+    let chunks = |attempt, same_image| {
+        app.launched_lane_facts(attempt, same_image, true, true, 0, true)
+            .grant_chunks
+    };
+    assert!(!chunks(Some(&ticket), None), "nothing read yet");
+    assert!(chunks(None, Some(SameImageHandoff::RenewLaunchRecord)));
+    assert!(!chunks(None, Some(SameImageHandoff::DebugSeam)));
+    super::PreverifyPublisher::for_attempt(&app.handoff_preverified, Some(&ticket))
+        .expect("an attempt names its artifact")
+        .publish_pass(
+            &aterm_update::HandoffCandidateFacts {
+                policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
+                grant_chunks: true,
+                grant_empty: false,
+                grant_desk: false,
+            },
+            crate::running_build_number(),
+            "the test candidate",
+        );
+    assert!(chunks(Some(&ticket), None), "a read that declared it");
+}
+
+/// The desk grant is learned only from a passed read of the very artifact: a read that ended
+/// passing writes nothing, and a refusal or another artifact's pass says nothing about this one.
+#[test]
+fn only_a_passed_read_of_this_artifact_says_the_target_declares_the_desk() {
+    let app = crate::App::headless_for_test();
+    let ticket =
+        crate::native_updater_service::ApplyAttemptTicket::for_test(7, "", &"ab".repeat(32));
+    let facts = aterm_update::HandoffCandidateFacts {
+        policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
+        grant_chunks: false,
+        grant_empty: false,
+        grant_desk: true,
+    };
+    let publisher = super::PreverifyPublisher::for_attempt(&app.handoff_preverified, Some(&ticket))
+        .expect("an attempt names its artifact");
+    assert!(
+        !app.park_policy(Some(&ticket)).grant_desk,
+        "nothing read yet"
+    );
+    publisher.publish_pass(&facts, crate::running_build_number(), "the test candidate");
+    assert!(app.park_policy(Some(&ticket)).grant_desk, "a passed read");
+    let other =
+        crate::native_updater_service::ApplyAttemptTicket::for_test(7, "", &"cd".repeat(32));
+    assert!(
+        !app.park_policy(Some(&other)).grant_desk,
+        "another artifact's read says nothing about this one"
+    );
+    publisher.publish_refusal(&format!(
+        "lock: could not take the apply lock within 10s ({})",
+        aterm_update::PASSING_REFUSAL_KEY
+    ));
+    assert!(
+        app.park_policy(Some(&ticket)).grant_desk,
+        "a read that ended passing leaves what was known"
+    );
+    publisher.publish_refusal("the install location is not writable");
+    let refused = app.park_policy(Some(&ticket));
+    assert!(
+        !refused.grant_desk && !refused.known,
+        "a refusal says nothing about what it declares"
+    );
+}
+
+/// A target that does not declare `desk1` refuses a layout of lone lists whole and opens a new
+/// shell for one beside a tab, so whatever the capture holds, the parent sends it neither.
+#[test]
+fn a_lone_workers_list_goes_on_the_wire_only_to_a_target_that_declares_it() {
+    use crate::restore::{RestoreManifest, WindowLayout};
+    let lone = WindowLayout::lone_workers_list(24, 80);
+    let alone = RestoreManifest::new(vec![lone.clone()]);
+    let undeclared = "the handoff layout carries a Workers list the successor does not declare";
+    assert_eq!(
+        super::outgoing_layout_wire(&alone, false),
+        Err(undeclared),
+        "no tab beside it"
+    );
+    let wire = super::outgoing_layout_wire(&alone, true).expect("a target that declares it");
+    assert_eq!(RestoreManifest::from_toml(&wire).as_ref(), Some(&alone));
+
+    let mut tabbed = WindowLayout {
+        workers_in_front: false,
+        ..lone
+    };
+    tabbed.restored_tabs = vec![crate::restore::RestoredTab {
+        root: crate::restore::RestoredSplitTree::leaf(crate::restore::RestoredView::Native(
+            crate::restore::NativeLeafRestore::settings("/".to_string()),
+        )),
+        focused_path: Vec::new(),
+        zoomed: false,
+        parked: false,
+        ephemeral: false,
+    }];
+    tabbed.active_item = Some(0);
+    let mixed = RestoreManifest::new(vec![tabbed.clone(), alone.windows[0].clone()]);
+    assert_eq!(
+        super::outgoing_layout_wire(&mixed, false),
+        Err(undeclared),
+        "beside a tab too: a new shell the person never had"
+    );
+    assert!(super::outgoing_layout_wire(&mixed, true).is_ok());
+
+    let plain = RestoreManifest::new(vec![tabbed]);
+    assert!(
+        super::outgoing_layout_wire(&plain, false).is_ok(),
+        "CONTROL: a desk with no lone list needs no declaration"
+    );
+    assert_eq!(
+        super::outgoing_layout_wire(&RestoreManifest::new(Vec::new()), true),
+        Err("could not persist the bounded handoff layout"),
+        "CONTROL: nothing to place is still the producer's fault"
+    );
 }
 
 /// REVIEW FINDING (2026-11-03): a replaceable image (one a cold relaunch can replace) with no

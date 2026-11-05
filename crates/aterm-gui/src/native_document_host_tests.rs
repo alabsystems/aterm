@@ -21,7 +21,7 @@ fn unique_file(name: &str, bytes: &[u8]) -> PathBuf {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("hello world.md");
-    fs::write(&path, bytes).unwrap();
+    crate::test_scratch::write_config(&path, bytes);
     path
 }
 

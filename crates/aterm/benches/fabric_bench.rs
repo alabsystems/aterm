@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FABRIC MEASUREMENT. `verify perf fabric` runs it with the words of
-//! one run in `FABRIC_BENCH` (`spec::parse`): `out=` (required),
+//! THE FABRIC MEASUREMENT. `verify perf fabric` supplies measurement knobs in
+//! `FABRIC_BENCH` (`spec::parse`):
 //! `scenario=` (all, messaging, pingpong, attach, handoff or ask),
 //! `samples=`, `warmup=`, `burst=`, `pingpong=`, `paced=`, `attach=`,
 //! `rounds=`, `bystanders=`, `durability=`, `horizon_ms=`, `retention=`,
@@ -15,8 +15,11 @@
 //! `tally=on` booting the messaging, attach, handoff and ask worlds with
 //! both tallies on and reporting each round's rows. The ask
 //! scenario also boots two nodes on one broker and times `samples=` posts of
-//! each address form and a `burst=` of each. It measures, and never asserts a
-//! floor.
+//! each address form and a `burst=` of each. `broker_process=background` or
+//! `interactive` serves every world's broker as `aterm link broker` in a process of its own,
+//! started as the shipped `Background` job's task type or an `Interactive` one's, and measures
+//! the messaging, ping-pong and attach worlds' outside stamps. It measures, and never asserts a
+//! floor. The OS-native report directory is required separately in `FABRIC_BENCH_OUT`.
 
 #[cfg(unix)]
 #[path = "../tests/fabric_world/harness.rs"]

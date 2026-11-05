@@ -13,9 +13,10 @@ use super::super::config::{Autopilot, SupervisorConfig};
 use super::notice::{self, Notice, NoticeText};
 use super::outlook::ExceptionKind;
 use super::turn_end::{
-    Composer, ContextFill, GO_AHEAD_REFUSED, RULE_LOGIN, RosterWord, SAME_REPLY, TurnEndAction,
-    TurnEndReading, TurnEndState, Unmade, bucket_model, decide_turn_end, decide_turn_end_traced,
-    login_wall_moves, login_wall_waits, renewed_draft_holds, sign_in_how, waited_login,
+    Composer, ContextFill, Diversion, GO_AHEAD_REFUSED, RULE_LOGIN, RosterWord, SAME_REPLY,
+    TurnEndAction, TurnEndReading, TurnEndState, Unmade, bucket_model, decide_turn_end,
+    decide_turn_end_traced, login_wall_moves, login_wall_waits, renewed_draft_holds, sign_in_how,
+    waited_login,
 };
 use crate::harness::acts::HeldBy;
 
@@ -670,6 +671,7 @@ const fn draft_notice_text(text: &NoticeText, composer: &Composer) -> NoticeText
         todo: match composer {
             Composer::Diverted(by) => by.todo(),
             Composer::Own => "Clear aterm's unsent text in the tab.",
+            Composer::Command(..) => notice::COMMAND_TODO,
             _ => text.todo,
         },
         todo_as: None,
@@ -705,7 +707,11 @@ pub(crate) fn draft_holds_limit_switch(
     )
 }
 
-/// Exception when the owner is in `/login` at a usage limit ([`notice::LOGIN_STOPPED`]).
+/// Exception when the owner is in `/login` at a usage limit ([`notice::LOGIN_STOPPED`]): their
+/// sign-in under way ends the chain with none, and one that failed is told. A managed worker's
+/// tab is no exception: a `/login` dialog standing over its wall keeps its work from concluding
+/// there ([`super::turn_end::managed_wall_ends`]), so the sign-in a person makes in it is theirs to
+/// hear of, and once a far wall concluded the work (`task_done`) nothing here is told.
 fn claude_limit_login(
     state: &TurnEndState,
     reading: &TurnEndReading,
@@ -825,15 +831,15 @@ fn limit_roster_step<'a>(
                 let text = match composer {
                     Composer::Own => &notice::LIMIT_DRAFT_OWN,
                     Composer::Diverted(_) => &notice::LIMIT_DRAFT_MENU,
+                    Composer::Command(..) => &notice::LIMIT_DRAFT_COMMAND,
                     _ => &notice::LIMIT_DRAFT,
                 };
                 (text, Some(ready.label.as_str()), None)
             }),
         },
-        // The next row to sign in asks no one: aterm's sign-in ladder signs a row with an email
-        // in first, as a walled session's successor (`crate::harness::accounts_sync`'s tier 0),
-        // and the tab is decided again at the accounts' news; where no route can, the routes it
-        // tried are on record, as a signed-out row with no email is.
+        // A row still to sign in raises no notice: nothing here signs in a row no session here
+        // runs on (`crate::harness::sign_in_ladder`), a report a person reads names its sign-in,
+        // and the tab is decided again at the accounts' news or resumes at the reset.
         (Ok(()), None, Some(_)) => None,
     })
 }
@@ -848,6 +854,10 @@ fn claude_login(
     if !super::login::carried(reading.program) {
         return None;
     }
+    // A pinned login whose notice left the screen before its point is told as on screen: the
+    // point was decided off the track, `/login` left to the person.
+    let left = state.pinned_login_left(reading);
+    let reading = left.as_ref().unwrap_or(reading);
     let track = state.wall_attempts(WallKind::Auth);
     let typed = track.is_some_and(|n| n > 0);
     let walled = reading.wall == Some(WallKind::Auth);
@@ -941,6 +951,11 @@ fn claude_login(
             "the composer empty, or the agent working",
         )));
     }
+    let not_run = if reading.composer == Composer::Diverted(Diversion::Search) {
+        &LOGIN_NOT_RUN_SEARCH
+    } else {
+        &notice::LOGIN_NOT_RUN
+    };
     match decide_turn_end(state, reading, cfg, now) {
         TurnEndAction::TypeCommand {
             rule_id: RULE_LOGIN,
@@ -951,31 +966,51 @@ fn claude_login(
         TurnEndAction::Escalate { .. } if reading.composer == Composer::Absent => {
             told(&notice::LOGIN_STOPPED, None, None)
         }
-        TurnEndAction::Escalate { .. } if reading.composer.drafted() => {
+        // What stands in or over the composer asks its own question first (`Composer::asks`),
+        // decided again once it goes: the login is told then, not as a draft that is none.
+        TurnEndAction::Escalate { reason } if reading.composer.asks() == Some(reason.as_str()) => {
+            Some(None)
+        }
+        // Text standing in the composer, which the person clears before `/login`: theirs (a menu
+        // open over it or not), aterm's own, or an old prompt the search left. The search over
+        // the composer is no draft: what held `/login` back (the budget, `retry_api_errors` off)
+        // is told as over an empty composer, the search closed first.
+        TurnEndAction::Escalate { .. }
+            if reading.composer.drafted()
+                && reading.composer != Composer::Diverted(Diversion::Search) =>
+        {
             told(&notice::LOGIN_NOT_RUN_DRAFT, roster, None)
         }
         TurnEndAction::Escalate { .. } => {
-            let why = if cfg.retry_api_errors {
-                notice::WHY_BUDGET
-            } else {
+            let why = if !cfg.retry_api_errors {
                 notice::WHY_RETRY_OFF
+            } else if let Some(why) = reading.login_pin.why() {
+                why
+            } else {
+                notice::WHY_BUDGET
             };
-            told(&notice::LOGIN_NOT_RUN, roster, Some(why))
+            told(not_run, roster, Some(why))
         }
         TurnEndAction::Nothing if reading.taskless => {
-            told(&notice::LOGIN_NOT_RUN, roster, Some(notice::WHY_NO_TASK))
+            told(not_run, roster, Some(notice::WHY_NO_TASK))
         }
-        TurnEndAction::Nothing if state.landed() => told(
-            &notice::LOGIN_NOT_RUN,
-            roster,
-            Some(notice::WHY_TASK_LANDED),
-        ),
+        TurnEndAction::Nothing if state.landed() => {
+            told(not_run, roster, Some(notice::WHY_TASK_LANDED))
+        }
         TurnEndAction::Nothing if state.task_done() => {
-            told(&notice::LOGIN_NOT_RUN, roster, Some(notice::WHY_TURN_YOURS))
+            told(not_run, roster, Some(notice::WHY_TURN_YOURS))
         }
         _ => Some(None),
     }
 }
+
+/// [`notice::LOGIN_NOT_RUN`] with the prompt-history search open over the composer, whose query a
+/// typed `/login` would go into (`super::turn_end::SEARCH_DIVERTS`): the search is closed first.
+const LOGIN_NOT_RUN_SEARCH: NoticeText = NoticeText {
+    todo: "Close the prompt-history search in the tab, then type /login and sign in again.",
+    todo_as: Some("Sign in to {label}: close the prompt-history search, then type /login."),
+    ..notice::LOGIN_NOT_RUN
+};
 
 /// The exception that stands at this point.
 #[must_use]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `spec-check`: the obligations only the Trust checkers can discharge, run on purpose.
+//! `spec-check`: model law audits and the obligations the Trust checkers discharge.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -62,7 +62,8 @@ const CHECKS: &[Check] = &[
     Check {
         name: "models",
         needs: Tool::Ty,
-        what: "ty agrees with the interpreter on every registered model, in each configuration \
+        what: "declared bounds are ranges no mutant breaks, and each design claim has a mutant; \
+               ty agrees with the interpreter on every registered model, in each configuration \
                it declares and at each mutant dial, over the same reachable space; a \
                function-valued model holds and has each design claim broken by a mutant; a \
                search ty stops short is never a verdict",
@@ -346,8 +347,8 @@ fn a_stopped_search_is_refused(ty: &Path) -> Option<String> {
     let dir = verify::scratch_dir("aterm-stop", m.name);
     let (spec, cfg) = (dir.join("Ring.tla"), dir.join("Ring.cfg"));
     let laid = std::fs::create_dir_all(&dir)
-        .and_then(|()| std::fs::write(&spec, m.to_tla()))
-        .and_then(|()| std::fs::write(&cfg, m.to_cfg()));
+        .and_then(|()| verify::write_scratch(&spec, m.to_tla()))
+        .and_then(|()| verify::write_scratch(&cfg, m.to_cfg()));
     if let Err(e) = laid {
         return Some(format!("scratch {}: {e}", dir.display()));
     }
@@ -381,7 +382,7 @@ fn models(ty: &Path, _: &Options) -> Verdict {
         return Verdict::Fail(findings);
     }
     Verdict::Pass(format!(
-        "{} models, {} configuration/dial checks agree with the interpreter",
+        "{} models pass the law audit; {} configuration/dial checks agree with the interpreter",
         registry.len(),
         configs.into_inner(),
     ))
@@ -389,6 +390,17 @@ fn models(ty: &Path, _: &Options) -> Verdict {
 
 fn model_under_ty(ty: &Path, all: &[Model]) -> (Vec<String>, usize) {
     let m = &all[0];
+    // Agreement on the first failed law cannot establish that a later law is a bound or
+    // that every claim has a witness. Walk all laws before accepting either checker's verdict.
+    let findings = attempt(|| verify::sweep_faults(all)).unwrap_or_else(|why| {
+        vec![format!(
+            "{}: the model law audit could not run: {why}",
+            m.name
+        )]
+    });
+    if !findings.is_empty() {
+        return (findings, 0);
+    }
     if m.is_function_valued() {
         return function_valued_under_ty(ty, all);
     }
@@ -428,7 +440,15 @@ fn model_under_ty(ty: &Path, all: &[Model]) -> (Vec<String>, usize) {
                     "{label}: both tiers find `{inv}` violated with no mutant on, at \
                      {state:?}\n{evidence}"
                 )),
-                (Err(_), false) => {}
+                (Err((state, inv)), false) => {
+                    let named = verify::ty_violated_law(&evidence);
+                    if !at.invariants.iter().any(|law| Some(law.name) == named) {
+                        findings.push(format!(
+                            "{label} at Buggy={dial}: ty failed without refuting a law, where \
+                             the interpreter refutes `{inv}` at {state:?}\n{evidence}"
+                        ));
+                    }
+                }
                 (Ok(states), false) => findings.push(format!(
                     "{label} at Buggy={dial}: ty refutes what the interpreter proves over \
                      {states} states\n{evidence}"
@@ -530,8 +550,8 @@ fn vacuity_of(ty: &Path, all: &[Model]) -> Result<usize, String> {
         std::fs::create_dir_all(&dir).map_err(|e| format!("scratch {}: {e}", dir.display()))?;
         let tla = dir.join(format!("{}.tla", config.name));
         let cfg = dir.join(format!("{}.cfg", config.name));
-        std::fs::write(&tla, config.to_tla()).map_err(|e| e.to_string())?;
-        std::fs::write(&cfg, config.to_cfg()).map_err(|e| e.to_string())?;
+        verify::write_scratch(&tla, config.to_tla()).map_err(|e| e.to_string())?;
+        verify::write_scratch(&cfg, config.to_cfg()).map_err(|e| e.to_string())?;
         let mut cmd = verify::TyCommand::check(ty, &tla, &cfg);
         cmd.arg("--strict-vacuity").arg("--coverage");
         if auditable {
@@ -663,8 +683,8 @@ fn trace(ty: &Path, _: &Options) -> Verdict {
     let spec = dir.join(format!("{}.tla", m.name));
     let cfg = dir.join(format!("{}.cfg", m.name));
     let trace = dir.join("t.json");
-    let laid = std::fs::write(&spec, m.transition_spec()).and_then(|()| {
-        std::fs::write(
+    let laid = verify::write_scratch(&spec, m.transition_spec()).and_then(|()| {
+        verify::write_scratch(
             &cfg,
             m.transition_cfg(&[("MaxWin", 1_000_000), ("MaxId", 1_000_000_000)]),
         )
@@ -683,7 +703,7 @@ fn trace(ty: &Path, _: &Options) -> Verdict {
     let validate = |prev: [i64; 4], next: [i64; 4]| -> Result<(bool, String), String> {
         let json =
             verify::transition_trace_json(&m, &state(prev), &state(next), Some("CloseWindow"));
-        std::fs::write(&trace, json).map_err(|e| e.to_string())?;
+        verify::write_scratch(&trace, json).map_err(|e| e.to_string())?;
         let out = verify::TyCommand::trace_validate(ty, &trace, &spec, &cfg)
             .output()
             .map_err(|e| e.to_string())?;
@@ -771,29 +791,157 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_interpreter_panic_is_a_failed_model_check_at_every_dial() {
+    fn an_interpreter_panic_fails_the_law_audit_before_running_ty() {
         let mut model = crate::test_models::ring_model();
         model.invariants[0].expr = crate::derive::Expr::Eq(
             Box::new(crate::derive::Expr::Var("not_a_model_variable")),
             Box::new(crate::derive::Expr::Int(0)),
         );
-        let dials = std::iter::once(0)
-            .chain(model.mutant_dials())
-            .collect::<Vec<_>>();
         let (findings, compared) = model_under_ty(
             Path::new("/this-test-must-not-run-an-external-checker"),
             &[model],
         );
         assert_eq!(compared, 0, "the model could not be interpreted");
-        for dial in dials {
-            assert!(
-                findings.iter().any(|finding| {
-                    finding.contains(&format!("Buggy={dial}"))
-                        && finding.contains("not_a_model_variable")
-                }),
-                "the interpreter error at Buggy={dial} must fail the requested check: {findings:?}"
-            );
+        assert!(
+            findings.iter().any(|finding| {
+                finding.contains("model law audit could not run")
+                    && finding.contains("not_a_model_variable")
+            }),
+            "the interpreter error must fail the requested check: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_mutant_cannot_hide_a_broken_bound_behind_its_first_failed_claim() {
+        let model = crate::ty_model! {
+            HiddenBoundViolation {
+                const Buggy = 0;
+                var count = 0;
+                action Step when (3 > count) {
+                    count = if Buggy == 1 { count + 1 } else { 0 };
+                }
+                invariant Untouched: count == 0;
+                bound Finite: count <= 2;
+            }
+        };
+        assert!(interp::bmc(&model).is_ok());
+        let (first_state, first_law) = interp::bmc(&interp::with_buggy(&model, 1))
+            .expect_err("the mutant must fail its claim before leaving the bound");
+        assert_eq!(first_law, "Untouched");
+        assert!(model.check_invariant("Finite", &first_state));
+        let (findings, compared) = model_under_ty(
+            Path::new("/this-test-must-not-run-an-external-checker"),
+            std::slice::from_ref(&model),
+        );
+        assert_eq!(compared, 0);
+        assert!(
+            findings.iter().any(|finding| {
+                finding.contains("HiddenBoundViolation::Finite")
+                    && finding.contains("declared `bound`, but a mutant breaks it")
+            }),
+            "the later bound violation must fail the standard check: {findings:?}"
+        );
+
+        let mut valid = model;
+        valid.invariants[1].expr =
+            crate::derive::le(crate::derive::var("count"), crate::derive::int(3));
+        assert!(verify::sweep_faults(&[valid]).is_empty());
+    }
+
+    #[test]
+    fn a_search_limit_cannot_turn_an_unexamined_bound_into_a_pass() {
+        let model = crate::ty_model! {
+            BoundPastSearchLimit {
+                const Buggy = 0;
+                var count = 0;
+                action Step when (2000002 > count) {
+                    count = if Buggy == 1 { count + 1 } else { 0 };
+                }
+                invariant Untouched: count == 0;
+                bound Finite: count <= 2000001;
+            }
+        };
+        assert!(interp::bmc(&model).is_ok());
+        let (findings, compared) = model_under_ty(
+            Path::new("/this-test-must-not-run-an-external-checker"),
+            &[model],
+        );
+        assert_eq!(compared, 0);
+        assert!(
+            findings.iter().any(|finding| {
+                finding.contains("BoundPastSearchLimit")
+                    && finding.contains("model law audit could not run")
+                    && finding.contains("state space unexpectedly large")
+            }),
+            "a partial law walk must fail the standard check: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_declared_bounds_fail_before_running_ty() {
+        use crate::derive::{FnVar, Invariant, cst, eq, int, le, or_, var};
+
+        for expr in [
+            or_(le(var("seq"), int(3)), le(var("seq"), int(6))),
+            eq(var("seq"), int(0)),
+            le(var("seq"), cst("Buggy")),
+        ] {
+            let mut model = crate::test_models::ring_model();
+            model.invariants.push(Invariant {
+                name: "Finite",
+                kind: InvariantKind::Bound,
+                expr,
+            });
+            for function_valued in [false, true] {
+                let mut at = model.clone();
+                if function_valued {
+                    at.fn_vars.push(FnVar {
+                        name: "live",
+                        range: "Cap",
+                    });
+                }
+                let (findings, compared) = model_under_ty(
+                    Path::new("/this-test-must-not-run-an-external-checker"),
+                    &[at],
+                );
+                assert_eq!(compared, 0);
+                assert!(
+                    findings.iter().any(|finding| {
+                        finding.contains("Ring::Finite") && finding.contains("not a range atom")
+                    }),
+                    "a malformed bound must fail the standard check: {findings:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn a_bound_must_remain_a_range_in_every_declared_scenario() {
+        let model = crate::ty_model! {
+            BoundScenario {
+                const Cap = 2;
+                var count = 0;
+                action Stay { count = 0; }
+                bound Finite: count <= Cap;
+            }
+        };
+        let pinned = interp::with_consts(&model, &[("Cap", 0)]);
+        assert!(model.malformed_bounds().is_empty());
+        assert!(interp::bmc(&model).is_ok());
+        assert!(interp::bmc(&pinned).is_ok());
+        let (findings, compared) = model_under_ty(
+            Path::new("/this-test-must-not-run-an-external-checker"),
+            &[model, pinned],
+        );
+        assert_eq!(compared, 0);
+        assert!(
+            findings.iter().any(|finding| {
+                finding.contains("BoundScenario::Finite")
+                    && finding.contains("pinned to 0..=0")
+                    && finding.contains("Cap\", 0")
+            }),
+            "the scenario that pins a bound must be identified: {findings:?}"
+        );
     }
 
     #[test]

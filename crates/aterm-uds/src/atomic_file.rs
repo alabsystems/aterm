@@ -4,11 +4,18 @@
 //! FILES, WRITTEN THE CAREFUL WAY AND READ WITHIN A BOUND.
 //!
 //! The bounded regular-file readers ([`read_regular`], [`read_regular_text`]) run on every
-//! platform. The whole-file writer and aterm.toml's (`ConfigFile`, under the config service's
-//! write lock) are unix-only, since their modes and `flock` have no counterpart elsewhere.
+//! platform. The whole-file writer runs on Unix and Windows; Unix modes apply only on Unix.
+//! aterm.toml's (`ConfigFile`, under the config service's write lock) is Unix-only, since its
+//! modes and `flock` have no counterpart elsewhere.
 
 use std::io;
 use std::path::Path;
+
+#[cfg(any(unix, windows))]
+#[path = "atomic_file_write.rs"]
+mod writer;
+#[cfg(any(unix, windows))]
+pub use writer::*;
 
 #[cfg(unix)]
 #[path = "atomic_file_unix.rs"]

@@ -329,7 +329,15 @@ fn run_once(
         ))));
     }
     let mut sending = joiner::Sending::default();
-    let accepts = |bundle: &super::Bundle| client::accepts_bundle(paths, bundle);
+    // A seatless recipient takes its seat's records alone (one-mesh S1): it holds the vault.
+    let seatless = client::seat(paths) == client::Seat::Seatless;
+    let accepts = |bundle: &super::Bundle| {
+        if seatless {
+            client::accepts_seat(paths, bundle)
+        } else {
+            client::accepts_bundle(paths, bundle)
+        }
+    };
     let ran = joiner::run_noting_send(
         &mut stream,
         &greeting,
@@ -392,8 +400,10 @@ impl Drop for ProofLock {
 /// tried one after another in address order, never at once, and none after one that may have
 /// signed (its possession write began): two members removing one old seat at one cutoff would
 /// make a quorum `Remove`, which no Allow undoes, and the next try reaches the same member first,
-/// which then signs nothing new. Where none let it in, why each refused, by address: this Mac then
-/// asks a person as before.
+/// which then signs nothing new. A bundle of another vault than the one this Mac is configured
+/// for is refused before anything is written (`client::readmit_from_log_bundle`): a proof lets a
+/// Mac back into its own vault, and only a person's phrase moves it to another. Where none let it
+/// in, why each refused, by address: this Mac then asks a person as before.
 ///
 /// # Errors
 /// No member let it in ([`Missed`]).
@@ -420,7 +430,14 @@ pub fn prove_first(
                     "a member handed files, not the log, for a proof",
                 ));
             }
-            let report = client::write_from_log_bundle(paths, &bundle)?;
+            // A seatless recipient holds the vault already and only takes its seat's records
+            // (one-mesh S1); a new Mac writes the vault from the bundle, which a proof never
+            // moves to another vault than the one it is configured for.
+            let report = if client::seat(paths) == client::Seat::Seatless {
+                client::take_seat(paths, &bundle)?
+            } else {
+                client::readmit_from_log_bundle(paths, &bundle)?
+            };
             // Best effort, as after a phrase: the servers and this Mac's subscriber follow on.
             drop(client::sync(paths, None));
             drop(client::ask_allowed(paths));
@@ -472,7 +489,11 @@ fn written(
 ) -> Result<Joined> {
     let (report, admission) = match bundle.handed {
         Handed::Log { .. } => {
-            let report = client::write_from_log_bundle(paths, &bundle)?;
+            let report = if client::seat(paths) == client::Seat::Seatless {
+                client::take_seat(paths, &bundle)?
+            } else {
+                client::write_from_log_bundle(paths, &bundle)?
+            };
             // Best effort: the vault's servers follow from here, and an admin's approver names
             // this Mac in `[machines]` from its `Allowed`; this Mac's subscriber keeps trying.
             drop(client::sync(paths, None));

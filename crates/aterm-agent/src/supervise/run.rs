@@ -21,7 +21,9 @@ use super::config::{Autopilot, SupervisorConfig};
 use super::fx::Fx;
 use super::journal::{CLEARED_MEMORY, CLEARED_TURN_END, Journal};
 use super::limit::{self, ResetSpec};
-use super::phase::{Phase, busy_signal, last_said_index, last_said_row, status_row};
+use super::phase::{
+    Phase, busy_signal, last_said_index, last_said_line, last_said_row, status_row,
+};
 use super::policy::approval::{Decision, footer_mode, readings_read_only};
 use super::policy::exception::Exception;
 use super::policy::reset::{
@@ -590,6 +592,9 @@ impl Guard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HoldSaid {
     Point(&'static str),
+    /// A person's command standing in the composer held the point's act (v6 §14.17.5.8): said
+    /// once while it holds, naming its form and never its words.
+    Command(aterm_phase::DraftCommand),
     NoHostStep,
     Held(Guard),
 }
@@ -598,6 +603,11 @@ impl HoldSaid {
     fn words(self) -> String {
         match self {
             HoldSaid::Point(why) => format!("point nothing why={why}"),
+            HoldSaid::Command(form) => format!(
+                "point nothing why=command a person's {} {}",
+                form.words(),
+                super::policy::turn_end::COMMAND_STANDS
+            ),
             HoldSaid::NoHostStep => "background no-host-step".to_string(),
             HoldSaid::Held(guard) => format!("background held why={}", guard.word()),
         }
@@ -633,6 +643,10 @@ pub(super) struct Due {
     pub(super) unix_ms: i64,
     pub(super) why: String,
     pub(super) wait: WaitKind,
+    /// The restart (its [`Restart::word`](super::policy::turn_end::Restart::word)) whose host's
+    /// word this due waits out ([`Session::restart_later`]); any other due the loop stands
+    /// replaces it, whatever the restart's run counters still hold.
+    pub(super) put_off: Option<&'static str>,
 }
 
 const ACCOUNT_NEWS_EVERY: Duration = Duration::from_secs(60);
@@ -1738,6 +1752,7 @@ fn retry_held(hold: &Hold, timing: &TurnEndTiming) -> Option<approvals::RetryMar
         ups: 0,
         since_ms: hold.until_ms + 500 - wait_ms,
         down: false,
+        witnessed: false,
     })
 }
 
@@ -2191,7 +2206,25 @@ pub struct Session<'a, C: Ctl> {
     /// How the Mac has spent the last few minutes, by the loop's own clocks ([`Self::watch_sleep`]).
     sleep_window: turn_end_loop::SleepWindow,
     restart_waits: u32,
-    restart_run: Option<(&'static str, i64)>,
+    /// The loop's restart run ([`turn_end_loop::RestartRun`]): the kind and second its asks
+    /// carry (`policy::turn_end::RestartAsk::of`), and the second the live claim of the
+    /// conversation's record it holds was taken (`policy::turn_end::RestartClaim`).
+    restart_run: Option<turn_end_loop::RestartRun>,
+    /// THE RUN SET ASIDE, with its back-off step ([`Self::restart_run`], [`Self::restart_waits`]),
+    /// of a restart beside a move onto another account
+    /// ([`super::policy::turn_end::Restart::moves_account`]): the one the move's point goes on
+    /// with where the host puts the move off, or one standing when the move's run took the slot
+    /// (`turn_end_loop::Session::aside_for`), holding the claim it held. Between points the move's
+    /// run stands in the slot and this one here; while that restart acts at the move's point, its
+    /// run is back in the slot and the move's is held by the act
+    /// (`turn_end_loop::Session::set_aside_run`). Each, asked again at a later point, is so the
+    /// same ask on its own back-off (a run minted afresh at every point would hold the point's wait
+    /// at the ladder's first step, and the move's with it), and the one set aside, asked on its
+    /// own, takes the slot. It ends with the move's run where that is made or another restart's
+    /// run takes its place, and at an act that is no restart unless it outlives that act by what it
+    /// is and holds (`turn_end_loop::Session::outlives_act`); a refused move leaves it to the
+    /// restart its point goes on with.
+    restart_aside: Option<(turn_end_loop::RestartRun, u32)>,
     /// The last Unix second a restart run of this loop was minted at or restored to
     /// ([`Self::restart_run`]), seeded from the newest run's second the journal beside the ledger
     /// shows asked, which its note names by the run's ask
@@ -2261,6 +2294,9 @@ pub struct Session<'a, C: Ctl> {
     pub(super) first_frame: FirstFrame,
     pub(super) left_keys: Vec<String>,
     pub(super) repo_seen: Option<(Option<u64>, Instant, crate::harness::repo_work::RepoRead)>,
+    /// The agent's left rows the host last read for the same done words, as [`Self::repo_seen`]
+    /// keeps the repository's ([`Session::left_read`]).
+    pub(super) left_seen: Option<(Option<u64>, Instant, crate::harness::leftover::LeftRead)>,
     /// A fresh repository probe read [`crate::harness::repo_work::RepoRead::Unread`], not yet journaled.
     pub(super) repo_unread_unsaid: bool,
     pub(super) left_at_wall_seq: Option<u64>,
@@ -2334,6 +2370,10 @@ pub struct Session<'a, C: Ctl> {
     /// cell has told of it ([`Self::see_draft`], [`Self::cell_saw`]). Whether it is a person's is
     /// [`Self::person_at`]'s to say: the loop's own words are none.
     draft_seen: Option<(String, Instant, turn_end_loop::DraftCell)>,
+    /// WHAT THE PROMPT-HISTORY SEARCH SHOWED IN THE COMPOSER, read by read ([`Self::see_draft`]):
+    /// while it stands, and the old prompt it left there unedited once it went, which no person
+    /// typed (`Diversion::Recall`, [`Self::left_composer`]).
+    searched: Option<turn_end_loop::Searched>,
     held: bool,
     rejudge: bool,
     host_held: bool,
@@ -2379,6 +2419,11 @@ pub struct Session<'a, C: Ctl> {
     /// it. One whose read could not say ([`Composer::Unknown`]) is looked at again at each wait step
     /// too ([`Self::wait_for_next`]): a cell unread moves no content seq when it comes back.
     draft_held: Option<Composer>,
+    /// WHETHER THE PERSON'S COMMAND IS WHY THE POINT IS HELD (v6 §14.17.5.8): the decision that
+    /// did nothing over a command standing ([`Composer::Command`]) sends the same draft read as a
+    /// prompt, so the hold's journal line names the command ([`HoldSaid::Command`]); a hold for
+    /// anything else (a read that cannot say, a rest, the same reply) is said as its own.
+    command_why: bool,
     /// THE TEXT A DECISION HELD THE POINT ON ([`Self::hold_on`]): that hold's, as its last look read
     /// it, or a draft a person's grace waits on, and what its glyph's cell had told of it. None where
     /// it is the loop's own line ([`Self::own_line_shown`]), which no person's grace waits on.
@@ -2396,6 +2441,10 @@ pub struct Session<'a, C: Ctl> {
     /// Gone at the loop's next write, once the worker works, or (the accounts probe's `/usage`)
     /// once the probe ends.
     own_line: Option<turn_end_loop::OwnLine>,
+    /// The accounts probe's write the ledger books as owed at this process's start
+    /// ([`approvals::probe_wrote`]): the proof a `/usage` found standing is still that write's,
+    /// weighed once ([`Self::probe_seed_claims`]).
+    probe_seed: Option<approvals::ProbeWrote>,
     /// The model the handed point's footer named ([`named_model`]), or the first a read of that
     /// point named where its own read named none: the one baseline every read of the point is
     /// weighed against at a limit wall ([`Self::point_model_moved`]).
@@ -2486,6 +2535,9 @@ pub struct Session<'a, C: Ctl> {
     reset_passed: Option<String>,
     reset_again: u8,
     reset_fallback: Option<Decision>,
+    /// The `what` and key of each sighting of the reset program this loop kept a capture of
+    /// ([`Session::reset_capture`]), at most `RESET_CAPTURES` of each `what`.
+    reset_captured: Vec<(String, String)>,
     decided_on: Option<super::policy::box_facts::BoxFacts>,
     focus_key_tried: bool,
     halted: bool,
@@ -2618,6 +2670,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             sleep_window: turn_end_loop::SleepWindow::default(),
             restart_waits: 0,
             restart_run: None,
+            restart_aside: None,
             restart_floor: 0,
             look_at: None,
             word_at: None,
@@ -2667,6 +2720,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             first_frame: FirstFrame::Owed { held: false },
             left_keys: Vec::new(),
             repo_seen: None,
+            left_seen: None,
             repo_unread_unsaid: false,
             left_at_wall_seq: None,
             box_reason: None,
@@ -2702,6 +2756,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             launch_used: None,
             guards_told: None,
             draft_seen: None,
+            searched: None,
             held: false,
             rejudge: false,
             host_held: false,
@@ -2712,11 +2767,13 @@ impl<'a, C: Ctl> Session<'a, C> {
             host_follows: None,
             agent_woke: None,
             draft_held: None,
+            command_why: false,
             held_text: None,
             draft_left: None,
             unauthoritative_held: false,
             left_line: None,
             own_line: None,
+            probe_seed: None,
             point_model: None,
             left_went: None,
             box_first_seen: None,
@@ -2798,6 +2855,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             reset_passed: None,
             reset_again: 0,
             reset_fallback: None,
+            reset_captured: Vec::new(),
             decided_on: None,
             focus_key_tried: false,
             halted: false,
@@ -3592,10 +3650,40 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// text a read has said typed was no suggestion, whatever words follow it. Nor does the loop's own
     /// line going, which no decision holds the point on. A frame with no composer drawn neither
     /// marks nor forgets: the read after it says.
+    ///
+    /// So too what a prompt-history search showed there ([`Self::searched`]): the text its row last
+    /// showed while it stood, kept once it went while the composer still shows it, unless the
+    /// composer held that text before it opened (a query that matched nothing over a draft leaves
+    /// the draft).
     fn see_draft(&mut self, reader: &dyn ScreenReader, screen: &Screen) {
         let composer = reader.composer(&screen.rows);
         let typed = draft_read(composer.as_ref(), reader.placeholder(), screen);
         let draft = composer.as_ref().map(|(_, lines)| lines.join("\n"));
+        if let (Some((caret, _)), Some(shown)) = (composer.as_ref(), draft.as_deref()) {
+            // What the composer held before: the last read's text (`draft_seen`, not yet moved on
+            // by this one) where a read said it typed, by its glyph's cell or, no cell asked, by
+            // the rows and the cursor (`DraftCell::Unasked`): no grey suggestion read with the
+            // cursor home. A suggestion read with the cursor past it, as a frame read before its
+            // program placed the cursor could show it, would pass; no measured frame shows one
+            // (docs/measured/draft-hold-findings-2026-11-04.md, §2).
+            let typed_before = || {
+                self.draft_seen
+                    .as_ref()
+                    .filter(|(.., cell)| *cell != turn_end_loop::DraftCell::Unsaid)
+                    .map(|(text, ..)| text.clone())
+            };
+            let was = self.searched.take();
+            let open = matches!(was, Some(turn_end_loop::Searched::Open { .. }));
+            // The search opens where its own row stands (the reader's `history_search`) with the
+            // cursor under the composer, not on the cursor alone: a read inside Muse Code's
+            // unbracketed redraw finds a whole composer with the cursor still on the footer
+            // (docs/measured/half-drawn-frame-2026-10-22.md). Once open, the cursor keeps it so.
+            let under = screen.cursor_under(*caret);
+            let opens = under && !open && reader.history_search(&screen.rows);
+            let before = opens.then(typed_before).flatten();
+            self.searched =
+                turn_end_loop::Searched::seen(was, shown, under && (open || opens), before);
+        }
         let seen = self.draft_seen.take();
         self.draft_seen = match (typed, draft) {
             (_, Some(shown)) if seen.as_ref().is_some_and(|(text, ..)| *text == shown) => seen,
@@ -4978,6 +5066,9 @@ impl<'a, C: Ctl> Session<'a, C> {
                 mark.down,
                 self.fx.mono(),
             );
+            if mark.witnessed {
+                self.turn_end.seed_retry_witnessed();
+            }
         }
         if let Some(key) = older.and_then(|j| journaled_left(j, self.setup.sid.as_deref()))
             && !left_keys.contains(&key)
@@ -5088,6 +5179,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             self.restart_floor = self.restart_floor.max(newest);
         }
         self.seed_model_switch_in(body, older);
+        if let Some(journal) = journal.as_deref() {
+            self.seed_open_move_in(journal);
+        }
         let moves = approvals::account_moves_in(body, self.setup.sid.as_deref());
         let ago = |ts: i64| {
             (now_ms >= ts)
@@ -5224,11 +5318,12 @@ impl<'a, C: Ctl> Session<'a, C> {
             let lifted_off = opts.idle_host.as_ref().is_some_and(|h| h.lifted_off());
             open_wall = self.seed_from_ledger_text(path, &body, now_ms, lifted_off);
             self.hold_seed_from(&body, start, now_ms, lifted_off, &opts.policy, review);
-            if approvals::probe_owed(&body, self.setup.sid.as_deref()) {
+            if let Some(wrote) = approvals::probe_wrote(&body, self.setup.sid.as_deref()) {
                 self.probe = UsageProbe::Owed {
                     own: false,
                     since: self.fx.mono(),
                 };
+                self.probe_seed = Some(wrote);
             }
             if review.unattended()
                 && let Some(open) = approvals::reset_owed(&body, self.setup.sid.as_deref())
@@ -5353,6 +5448,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         if self.stopped() {
             return Ok(Some(End::Quit));
         }
+        self.reset_capture(&turn.screen, opts, review);
         let off = self.autopilot(opts) == Autopilot::Off;
         if review.unattended()
             && !turn.timed_out
@@ -5582,7 +5678,12 @@ impl<'a, C: Ctl> Session<'a, C> {
             if review.unattended() {
                 // A person told now to close their own `/login` over the limit
                 // ([`Exception::tells_login_over_limit`]) is the limit's answer: no second notice.
-                let handled = point_escalated
+                // A managed worker whose usage wall ended its work (`failed why=usage-limit` past
+                // the horizon under Land, [`TurnEndState::conclude_at_wall`]) has its manager's
+                // report, so no limit badge is raised for it. One its wall did not conclude (under
+                // Cruise, or at a wall it waits out) has its limit episode as any tab does.
+                let handled = self.turn_end.gave_up() == Some(GaveUp::UsageLimit)
+                    || point_escalated
                     || !matches!(
                         turn_end,
                         TurnEndAction::Nothing | TurnEndAction::Escalate { .. }
@@ -7034,20 +7135,24 @@ impl<C: Ctl> Session<'_, C> {
         {
             return false;
         }
-        // A TURN END'S WAIT UNDER THE MOVE ITS SESSION YIELDS ITS ACCOUNT BY (F19's `yields`) ENDS
-        // AT ITS INSTANT: what keeps that move unmade (a live job, a refusal, the hour's moves) is
-        // no news of the accounts, but the host's strike of the unmade move is (`Kind::Struck`
-        // wakes), and news would ask the move again at once, its strike news again.
-        let yield_waits = self.turn_end_due.is_some()
-            && matches!(
-                &self.account_seen,
-                Some((_, AccountPoint::TurnEnd, Some(advice)))
-                    if matches!(
-                        advice.past_probe(),
-                        Some(AccountAdvice::Move { yields: Some(_), .. })
-                    )
-            );
-        if yield_waits && !own_login {
+        // A TURN END'S WAIT UNDER THE MOVE ITS SESSION YIELDS ITS ACCOUNT BY (F19's `yields`), OR
+        // UNDER A MOVE ITS HOST'S WORD PUTS OFF (`Self::restart_later`'s due), ENDS AT ITS
+        // INSTANT: what keeps that move unmade (a live job, a person's hand, a missing socket, the
+        // hour's moves) is no news of the accounts, but the host's strike of the row the unmade
+        // move took is (`Kind::Struck` wakes), and news would ask the move again at once, its
+        // strike news again: 371 asks in 288 s in `claude-rotation-proof`'s R6 (rp1103a,
+        // 2026-11-03), the back-off never reached.
+        let waits_out = self.account_restart_waits()
+            || (self.turn_end_due.is_some()
+                && matches!(
+                    &self.account_seen,
+                    Some((_, AccountPoint::TurnEnd, Some(advice)))
+                        if matches!(
+                            advice.past_probe(),
+                            Some(AccountAdvice::Move { yields: Some(_), .. })
+                        )
+                ));
+        if waits_out && !own_login {
             return false;
         }
         let Some(host) = opts.idle_host.as_ref() else {
@@ -7067,6 +7172,15 @@ impl<C: Ctl> Session<'_, C> {
             self.account_news_at = Some(self.fx.mono());
         }
         true
+    }
+
+    /// The standing due waits out a host's word on a move onto another account
+    /// ([`Self::restart_later`]).
+    fn account_restart_waits(&self) -> bool {
+        self.turn_end_due
+            .as_ref()
+            .and_then(|due| due.put_off)
+            .is_some_and(super::policy::turn_end::Restart::moves_account)
     }
 
     fn renewal_made(&mut self, opts: &SuperviseOpts) -> bool {
@@ -8282,15 +8396,7 @@ fn said_summary(reader: &dyn ScreenReader, turn: &Turn) -> String {
                 or_dash(&clip_tail(&said_line(reader, rows, width)))
             }
             Program::Claude => {
-                let line = last_said_index(rows).map_or_else(String::new, |last| {
-                    let first = width.map_or(last, |w| aterm_phase::line_start(rows, last, w));
-                    rows[first..=last]
-                        .iter()
-                        .map(|r| r.trim())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                });
-                or_dash(&clip_tail(&line))
+                or_dash(&clip_tail(&last_said_line(rows, width).unwrap_or_default()))
             }
             Program::Generic => or_dash(&clip(last_said_row(rows).unwrap_or("").trim())),
         },
@@ -8704,8 +8810,8 @@ mod stall;
 #[path = "task_mark.rs"]
 mod task_mark;
 pub use task_mark::{
-    COULD_NOT_FINISH_WHY, HELD_HEAD, REPEATED_WHY, STARTUP_HEAD, deadline_attention,
-    mark_task_exited,
+    COULD_NOT_FINISH_WHY, HELD_HEAD, REPEATED_WHY, STARTUP_HEAD, USAGE_LIMIT_WHY,
+    deadline_attention, mark_task_exited,
 };
 #[path = "turn_end_loop.rs"]
 mod turn_end_loop;

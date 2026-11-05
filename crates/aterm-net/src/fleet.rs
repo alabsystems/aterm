@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Mutual exporter-bound HMAC handshake over TLS 1.3 for fleet TCP connections.
+//! Mutual exporter-bound handshakes over TLS 1.3 for fleet TCP connections: the fleet's
+//! (`atf/2`, `atf/1`), which proves one shared secret by HMAC and, under `atf/2`, each end's node
+//! key; and the mesh's (`atm/1`, `docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4), which proves no
+//! shared secret: the listener proves its node key first, the dialer judges that key by its own
+//! membership log before it proves its own, and the listener judges the dialer's the same way.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -12,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use aterm_codec::hex;
 use aterm_digest::{hkdf_expand_32, hkdf_extract, hmac_sha256_parts};
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
+use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection, StreamOwned};
 
@@ -52,6 +56,20 @@ pub const ALPN_DATABASE_DELTA: &[u8] = b"atdb/5";
 
 const PROTOCOLS: [&[u8]; 2] = [ALPN_NODES, ALPN];
 
+/// The mesh's ALPN protocol (`atm/1`, `docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4): the
+/// listener proves its node key first, over [`MESH_EXPORTER_LABEL`]'s exporter and bound to its
+/// role; the dialer proves its own only once its membership log seats a member under the
+/// listener's key ([`Denied::seat`]), and the listener admits it only once its own log does. No
+/// shared secret is proved. A listener with a node offers it before [`ALPN_NODES`], so a dialer that
+/// offers it ([`NodeIdentity::dialing_mesh`]) speaks it, and every other dialer negotiates what it
+/// did before.
+pub const ALPN_MESH: &[u8] = b"atm/1";
+
+/// What a dialer whose node dials the mesh, and a listener with a node, offer: [`ALPN_MESH`]
+/// first, then the fleet's, so an older listener answers a mesh dialer on [`ALPN_NODES`], and a
+/// dialer that does not offer the mesh negotiates exactly what it did before.
+const PROTOCOLS_MESH: [&[u8]; 3] = [ALPN_MESH, ALPN_NODES, ALPN];
+
 /// ALPN protocol (`atf-ask/1`) of a Mac asking to join ALab (`docs/DESIGN-fluid-swarm-2026-10-28.md`
 /// F10): the one path a caller without the fleet secret reaches. It is not in [`PROTOCOLS`], so no
 /// fleet dialer offers it, and only a listener given an ask handler ([`serve_offering_with_ask`])
@@ -62,7 +80,14 @@ pub const ALPN_ASK: &[u8] = b"atf-ask/1";
 /// never offers [`ALPN_ASK`], negotiates exactly what it did before.
 const PROTOCOLS_ASKED: [&[u8]; 3] = [ALPN_NODES, ALPN, ALPN_ASK];
 
+/// [`PROTOCOLS_MESH`] and [`ALPN_ASK`], for a listener with a node and an ask handler.
+const PROTOCOLS_MESH_ASKED: [&[u8]; 4] = [ALPN_MESH, ALPN_NODES, ALPN, ALPN_ASK];
+
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-fleet-v1";
+
+/// The TLS exporter label of an [`ALPN_MESH`] connection, so no fleet proof's exporter is ever a
+/// mesh proof's.
+const MESH_EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-mesh-v1";
 
 /// Shared self-signed Ed25519 DER certificate (`CN=aterm-fleet`) pinned by fleet dialers.
 pub const CERT_DER: &[u8] = include_bytes!("fleet_cert.der");
@@ -142,6 +167,17 @@ pub enum FleetOp {
     /// fleet's key and this node key, to be let back into the vault with nobody's Allow
     /// (`aterm_secrets::client::readmit`, `aterm_agent::vault_join`).
     VaultJoin,
+    /// Hold a persistent neighbour link ([`link`]) that carries the other mesh ops as streams
+    /// and re-proves its peer (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4, §11 B5).
+    Neighbour,
+    /// An astream stream of one of the lab's logs ([`link::BusLog`]), served by that log's broker.
+    Bus,
+    /// One digest exchange of one store with one neighbour.
+    Inventory,
+    /// Join asks, re-admission proofs and unbound `Node` records, from a member.
+    Desk,
+    /// atpkg's content-addressed toolset units (`atpkg::peers`), in place of port 7487.
+    Units,
 }
 
 impl FleetOp {
@@ -159,6 +195,11 @@ impl FleetOp {
             Self::MailCode => "mail-code",
             Self::Census => "census",
             Self::VaultJoin => "vault-join",
+            Self::Neighbour => "neighbour",
+            Self::Bus => "bus",
+            Self::Inventory => "inventory",
+            Self::Desk => "desk",
+            Self::Units => "units",
         }
     }
 
@@ -176,9 +217,38 @@ impl FleetOp {
             Self::MailCode,
             Self::Census,
             Self::VaultJoin,
+            Self::Neighbour,
+            Self::Bus,
+            Self::Inventory,
+            Self::Desk,
+            Self::Units,
         ]
         .into_iter()
         .find(|op| op.word() == word)
+    }
+
+    /// Whether [`ALPN_MESH`] carries it: every op but the three bound to the fleet's secret or
+    /// its own protocols. [`Self::Join`] registers with the issuer under the join key,
+    /// [`Self::VaultJoin`] proves the vault's current fleet code (the desk takes it over the mesh's
+    /// `Desk` op, `docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4), and [`Self::Database`] keeps its
+    /// own `atdb` protocols on the old listener. A dialer offers the mesh only for an op it
+    /// carries, so neither end ever needs another try for one it does not.
+    #[inline]
+    #[must_use]
+    pub const fn meshed(self) -> bool {
+        !matches!(self, Self::Join | Self::VaultJoin | Self::Database)
+    }
+
+    /// Whether only [`ALPN_MESH`] carries it: the ops the mesh brought ([`Self::Neighbour`],
+    /// [`Self::Bus`], [`Self::Inventory`], [`Self::Desk`], [`Self::Units`]), which no `atf/2`
+    /// listener serves and no dialer offers on any other protocol.
+    #[inline]
+    #[must_use]
+    pub const fn mesh_only(self) -> bool {
+        matches!(
+            self,
+            Self::Neighbour | Self::Bus | Self::Inventory | Self::Desk | Self::Units
+        )
     }
 }
 
@@ -239,6 +309,16 @@ impl fmt::Debug for FleetSecret {
 }
 
 impl FleetSecret {
+    /// A secret no handshake proves: what a dial that offers [`ALPN_MESH`] alone passes, whose
+    /// handshake proves node keys and never a fleet secret ([`FleetOp::mesh_only`]).
+    pub(crate) const fn unproved() -> Self {
+        Self {
+            server: [0; 32],
+            client: [0; 32],
+            join: [0; 32],
+        }
+    }
+
     /// Which fleet this secret is.
     #[must_use]
     pub fn mark(&self) -> FleetMark {
@@ -305,7 +385,8 @@ impl NodeKey {
 
     /// The key whose raw bytes are `bytes`, as a membership log binds it
     /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.2). Nothing checks that they are a point of
-    /// the curve: a key that is none verifies no signature.
+    /// the curve: a key that is none verifies no signature, and nor does a point of small order
+    /// ([`NodeKey::verifies`]).
     #[inline]
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
@@ -339,6 +420,16 @@ impl NodeKey {
     pub fn short(&self) -> String {
         hex::encode_lower(&self.0[..4])
     }
+
+    /// Whether `sig` is this key's Ed25519 signature of `message`, strictly
+    /// ([`astream_aead::signature::verify`]): a small-order key or commitment, which signs every
+    /// message under a lax check, verifies nothing, and so does a signature that is not
+    /// [`SIG_LEN`] bytes.
+    #[must_use]
+    pub fn verifies(&self, message: &[u8], sig: &[u8]) -> bool {
+        sig.try_into()
+            .is_ok_and(|sig| astream_aead::signature::verify(&self.0, message, sig))
+    }
 }
 
 impl fmt::Debug for NodeKey {
@@ -350,10 +441,19 @@ impl fmt::Debug for NodeKey {
 /// Every member of the fleet, rather than one named node, in `drive_from`.
 pub const ALL_MEMBERS: &str = "*";
 
-/// A `[fleet] drive_from` grant binding a node id to the [`NodeKey`] approved to drive this host.
+/// Whether `word` is a legacy node id or a key-derived mesh principal.
+#[must_use]
+pub fn is_node_id(word: &str) -> bool {
+    hex::is_lower(word, 32)
+        || word
+            .strip_prefix("n-")
+            .is_some_and(|id| hex::is_lower(id, 16))
+}
+
+/// A `[fleet] drive_from` grant for the [`NodeKey`] approved to drive this host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DriveGrant {
-    /// Granted 32-hex-digit node id, or [`ALL_MEMBERS`].
+    /// Node id recorded as a display hint, or [`ALL_MEMBERS`].
     pub node: String,
     /// Public key bound to `node` when the grant was recorded; zero for all members.
     pub key: NodeKey,
@@ -376,10 +476,10 @@ impl DriveGrant {
         self.node == ALL_MEMBERS
     }
 
-    /// Whether it admits `node` bound to `key`: it names that node with that key, or every member.
+    /// Whether it admits the verified `key`, or every member. The node id is a display hint.
     #[must_use]
-    pub fn admits(&self, node: &str, key: NodeKey) -> bool {
-        self.all() || (self.node == node && self.key == key)
+    pub fn admits(&self, _node: &str, key: NodeKey) -> bool {
+        self.all() || self.key == key
     }
 
     /// The grant among `grants` that admits `node` bound to `key` ([`Self::admits`]), the one
@@ -404,7 +504,7 @@ impl DriveGrant {
         }
         let (node, key) = word.split_once(':')?;
         let node = node.to_ascii_lowercase();
-        if !hex::is_lower(&node, 32) {
+        if !is_node_id(&node) {
             return None;
         }
         Some(Self {
@@ -423,19 +523,24 @@ impl DriveGrant {
     }
 }
 
-/// Local node id and Ed25519 key pair used to sign [`ALPN_NODES`] channel proofs.
+/// Local node id and Ed25519 key pair used to sign [`ALPN_NODES`] and [`ALPN_MESH`] channel
+/// proofs, and, where it dials the mesh, the verdict it judges each listener by
+/// ([`Self::dialing_mesh`]).
 #[derive(Clone)]
 pub struct NodeIdentity {
     node: String,
     key: NodeKey,
     pair: Arc<Ed25519KeyPair>,
+    /// This Mac's membership verdict, read fresh for each dial, where this node dials
+    /// [`ALPN_MESH`] first; `None` where it dials [`ALPN_NODES`] alone.
+    mesh: Option<DenyFn>,
 }
 
 impl NodeIdentity {
-    /// Construct from a 32-lowercase-hex-digit `node` id and 32-byte Ed25519 `seed`.
+    /// Construct from a legacy or mesh `node` id and 32-byte Ed25519 `seed`.
     #[must_use]
     pub fn from_seed(node: &str, seed: &[u8]) -> Option<Self> {
-        if !hex::is_lower(node, 32) {
+        if !is_node_id(node) {
             return None;
         }
         let pair = Ed25519KeyPair::from_seed_unchecked(seed).ok()?;
@@ -444,10 +549,32 @@ impl NodeIdentity {
             node: node.to_owned(),
             key,
             pair: Arc::new(pair),
+            mesh: None,
         })
     }
 
-    /// This machine's 32-hex-digit node id.
+    /// This node dialing [`ALPN_MESH`] first where `verdict` is given: each listener's key is
+    /// judged by the verdict it returns, this Mac's membership log read fresh for that dial
+    /// ([`Denied::under`]), and this end proves its own key only to a listener the log seats a
+    /// member under ([`Denied::seat`]). With `None` it dials [`ALPN_NODES`] alone, as before the
+    /// mesh. The dialer that configures it passes `aterm_types::mesh_switch::MESH.then(..)`, so the
+    /// switch is read once, into this field, and a test sets the field either way.
+    #[must_use]
+    pub fn dialing_mesh(self, verdict: Option<DenyFn>) -> Self {
+        Self {
+            mesh: verdict,
+            ..self
+        }
+    }
+
+    /// Whether this node dials [`ALPN_MESH`] first ([`Self::dialing_mesh`]).
+    #[inline]
+    #[must_use]
+    pub const fn dials_mesh(&self) -> bool {
+        self.mesh.is_some()
+    }
+
+    /// This machine's legacy or mesh node id.
     #[inline]
     #[must_use]
     pub fn node(&self) -> &str {
@@ -459,6 +586,12 @@ impl NodeIdentity {
     #[must_use]
     pub const fn key(&self) -> NodeKey {
         self.key
+    }
+
+    /// The verdict this node judges an [`ALPN_MESH`] listener by, read now; `None` where it
+    /// does not dial the mesh.
+    fn verdict(&self) -> Option<Arc<Denied>> {
+        self.mesh.as_ref().map(|verdict| verdict())
     }
 
     fn sign(&self, end: Signer, exporter: &[u8]) -> [u8; SIG_LEN] {
@@ -498,9 +631,7 @@ pub fn record_message(domain: &str, body: &[u8]) -> Vec<u8> {
 /// Whether `sig` is `key`'s signature of `body` as a record of `domain` ([`record_message`]).
 #[must_use]
 pub fn verifies_record(key: &NodeKey, domain: &str, body: &[u8], sig: &[u8; SIG_LEN]) -> bool {
-    UnparsedPublicKey::new(&ED25519, key.bytes())
-        .verify(&record_message(domain, body), sig)
-        .is_ok()
+    key.verifies(&record_message(domain, body), sig)
 }
 
 impl fmt::Debug for NodeIdentity {
@@ -512,7 +643,7 @@ impl fmt::Debug for NodeIdentity {
 /// Verified possession proof of a peer's claimed `node` id and Ed25519 `key` on one connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeProof {
-    /// Claimed 32-hex-digit node id.
+    /// Claimed legacy or mesh node id.
     pub node: String,
     /// Public key whose private half signed the connection's exporter.
     pub key: NodeKey,
@@ -522,6 +653,14 @@ pub struct NodeProof {
 enum Signer {
     Dialer,
     Listener,
+    /// An [`ALPN_MESH`] dialer.
+    MeshDialer,
+    /// An [`ALPN_MESH`] listener.
+    MeshListener,
+    /// An [`ALPN_MESH`] dialer re-proving its key on a neighbour link ([`link`]).
+    ReproveDialer,
+    /// An [`ALPN_MESH`] listener re-proving its key on a neighbour link ([`link`]).
+    ReproveListener,
 }
 
 impl Signer {
@@ -530,6 +669,24 @@ impl Signer {
         match self {
             Self::Dialer => b"aterm-fleet/v2 node dialer",
             Self::Listener => b"aterm-fleet/v2 node listener",
+            Self::MeshDialer => b"aterm-mesh/1 node dialer",
+            Self::MeshListener => b"aterm-mesh/1 node listener",
+            Self::ReproveDialer => b"aterm-mesh/1 reproof dialer",
+            Self::ReproveListener => b"aterm-mesh/1 reproof listener",
+        }
+    }
+
+    /// The other end's role on the same [`ALPN_MESH`] channel, whose proof sent back is a
+    /// reflection ([`FleetError::Reflection`]); `None` under [`ALPN_NODES`], whose node proofs
+    /// keep the refusal they always had.
+    #[inline]
+    const fn mirrored(self) -> Option<Self> {
+        match self {
+            Self::MeshDialer => Some(Self::MeshListener),
+            Self::MeshListener => Some(Self::MeshDialer),
+            Self::ReproveDialer => Some(Self::ReproveListener),
+            Self::ReproveListener => Some(Self::ReproveDialer),
+            Self::Dialer | Self::Listener => None,
         }
     }
 }
@@ -558,8 +715,10 @@ fn node_line(me: Option<&NodeIdentity>, end: Signer, exporter: &[u8]) -> String 
 /// `node -`.
 ///
 /// # Errors
-/// [`FleetError::NodeProof`] for a signature that does not verify, [`FleetError::Malformed`] for a
-/// line that is no node line, or the read's own error.
+/// [`FleetError::NodeProof`] for a signature that does not verify, [`FleetError::Reflection`] for
+/// one that verifies only as the other end's role on an [`ALPN_MESH`] channel
+/// ([`Signer::mirrored`]), [`FleetError::Malformed`] for a line that is no node line, or the read's
+/// own error.
 fn read_node_proof<S: Read>(
     stream: &mut S,
     end: Signer,
@@ -582,13 +741,18 @@ fn read_node_proof<S: Read>(
         return Err(malformed());
     };
     let key = NodeKey::from_hex(key).ok_or_else(malformed)?;
-    if !hex::is_lower(node, 32) || !hex::is_lower(sig, 2 * SIG_LEN) {
+    if !is_node_id(node) || !hex::is_lower(sig, 2 * SIG_LEN) {
         return Err(malformed());
     }
     let sig = crate::hex_decode(sig).ok_or_else(malformed)?;
-    UnparsedPublicKey::new(&ED25519, key.bytes())
-        .verify(&node_message(end, exporter, node), &sig)
-        .map_err(|_| FleetError::NodeProof)?;
+    let signs = |end: Signer| key.verifies(&node_message(end, exporter, node), &sig);
+    if !signs(end) {
+        return Err(if end.mirrored().is_some_and(signs) {
+            FleetError::Reflection
+        } else {
+            FleetError::NodeProof
+        });
+    }
     Ok(Some(NodeProof {
         node: node.to_owned(),
         key,
@@ -610,8 +774,9 @@ pub enum FleetError {
     AddressBusy,
     /// Peer's node id is on the swarm roster's deny-list (`NO denied`).
     DeniedNode,
-    /// The listener has not read its deny list yet, so it refuses every peer until it has: a
-    /// refusal to dial again later, never a verdict on this machine. A listener names it to
+    /// The listener has not read its deny list, or a verdict from the membership log it holds,
+    /// yet, so it refuses every peer until it has: a refusal to dial again later, never a verdict
+    /// on this machine. A listener names it to
     /// itself; on the wire it answers `NO capacity` ([`Self::AddressBusy`]), which every dialer,
     /// one older than this build included, takes as "busy, dial again" and which disowns no one.
     /// A dialer from this build on also reads `NO unread` as this, so a later listener can name it
@@ -625,6 +790,19 @@ pub enum FleetError {
     UnknownScope(String),
     /// Peer's Ed25519 node signature failed verification (`NO node`).
     NodeProof,
+    /// The [`ALPN_MESH`] listener's membership log seats no member under this end's node key, nor
+    /// took it out (`NO unknown`): such a key reaches only the desk, over [`ALPN_ASK`], which
+    /// takes a seated member's `Node` record that binds it.
+    UnknownKey,
+    /// The [`ALPN_MESH`] listener proved a node key this Mac's membership log seats no member
+    /// under, nor took out: this end proved nothing to it.
+    ListenerUnknown,
+    /// The [`ALPN_MESH`] listener proved a node key this Mac's membership log took out, or whose
+    /// node or key the swarm roster denies: this end proved nothing to it.
+    ListenerOut,
+    /// This Mac has not read its deny list or membership log yet, so it judges no
+    /// [`ALPN_MESH`] listener's key and proved nothing to it.
+    VerdictUnread,
     /// Peer negotiated neither `atf/2` nor `atf/1`.
     Alpn,
     /// Protocol line violated framing or syntax rules.
@@ -649,10 +827,27 @@ impl FleetError {
         }
     }
 
+    /// Whether an [`ALPN_MESH`] dial that ended so goes again on [`ALPN_NODES`] at the same
+    /// address: one end's log binds the other's key to no seat (a seat with no `Node` record yet,
+    /// one whose record has not reached this Mac or the listener), or this Mac cannot judge the
+    /// listener now. Its proof of the fleet's secret then admits it as before the mesh. A key out
+    /// of either log, a roster deny, a forged or reflected proof, and every other refusal stand.
+    #[must_use]
+    pub const fn falls_back(&self) -> bool {
+        matches!(
+            self,
+            Self::UnknownKey | Self::ListenerUnknown | Self::VerdictUnread
+        )
+    }
+
     /// The same failure again, for each dial that shares one handshake (the Unix member's).
     #[cfg(unix)]
     pub(crate) fn copied(&self) -> Self {
         match self {
+            Self::UnknownKey => Self::UnknownKey,
+            Self::ListenerUnknown => Self::ListenerUnknown,
+            Self::ListenerOut => Self::ListenerOut,
+            Self::VerdictUnread => Self::VerdictUnread,
             Self::ListenerWrongSecret => Self::ListenerWrongSecret,
             Self::DialerWrongSecret => Self::DialerWrongSecret,
             Self::DialerHungUp => Self::DialerHungUp,
@@ -706,8 +901,8 @@ impl fmt::Display for FleetError {
                      membership log)",
             ),
             Self::DenyListUnread => f.write_str(
-                "the listener has not read its deny list yet, so it admits no one; try again \
-                 once it has",
+                "the listener has not read its deny list or membership log yet, so it admits no \
+                 one; try again once it has",
             ),
             Self::Reflection => f.write_str("the peer sent back a proof of this end's own role"),
             Self::UnknownOp(op) => write!(f, "the listener does not serve fleet op `{op}`"),
@@ -718,6 +913,22 @@ impl fmt::Display for FleetError {
             ),
             Self::NodeProof => f.write_str(
                 "a node proof does not verify: the signature is not its key's over this channel",
+            ),
+            Self::UnknownKey => f.write_str(
+                "the listener's membership log binds this machine's node key to no seat: it \
+                 reaches only the listener's desk until a `Node` record binds it",
+            ),
+            Self::ListenerUnknown => f.write_str(
+                "the listener proved a node key this machine's membership log binds to no seat; \
+                 nothing was sent",
+            ),
+            Self::ListenerOut => f.write_str(
+                "the listener proved a node key this machine's membership log took out (or the \
+                 swarm roster denies); nothing was sent",
+            ),
+            Self::VerdictUnread => f.write_str(
+                "this machine has not read its deny list or membership log yet, so it judges no \
+                 mesh listener; nothing was sent",
             ),
             Self::Alpn => f.write_str(
                 "the peer does not speak the fleet protocol (ALPN atf/2 or atf/1): a pre-fleet \
@@ -756,6 +967,34 @@ fn server_config_asked() -> Arc<ServerConfig> {
     test_socket_headroom();
     static CONFIG: OnceLock<Arc<ServerConfig>> = OnceLock::new();
     Arc::clone(CONFIG.get_or_init(|| listener_config(&PROTOCOLS_ASKED)))
+}
+
+/// [`server_config`] that offers [`ALPN_MESH`] first, for a listener with a node.
+fn server_config_meshed() -> Arc<ServerConfig> {
+    #[cfg(all(test, unix))]
+    test_socket_headroom();
+    static CONFIG: OnceLock<Arc<ServerConfig>> = OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| listener_config(&PROTOCOLS_MESH)))
+}
+
+/// [`server_config_meshed`] that also offers [`ALPN_ASK`], for a listener with a node and an ask
+/// handler.
+fn server_config_meshed_asked() -> Arc<ServerConfig> {
+    #[cfg(all(test, unix))]
+    test_socket_headroom();
+    static CONFIG: OnceLock<Arc<ServerConfig>> = OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| listener_config(&PROTOCOLS_MESH_ASKED)))
+}
+
+/// What a listener serving `ask` (or not) with a node (or none) offers: [`ALPN_MESH`] only where
+/// it holds a node to prove first.
+fn served_config(asked: bool, node: bool) -> Arc<ServerConfig> {
+    match (asked, node) {
+        (true, true) => server_config_meshed_asked(),
+        (true, false) => server_config_asked(),
+        (false, true) => server_config_meshed(),
+        (false, false) => server_config(),
+    }
 }
 
 fn listener_config(protocols: &[&[u8]]) -> Arc<ServerConfig> {
@@ -822,6 +1061,23 @@ fn ask_client_config() -> Arc<ClientConfig> {
     test_socket_headroom();
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     Arc::clone(CONFIG.get_or_init(|| dialer_config(&[ALPN_ASK])))
+}
+
+/// [`client_config`] offering [`ALPN_MESH`] first, for a node that dials the mesh
+/// ([`NodeIdentity::dialing_mesh`]).
+fn mesh_client_config() -> Arc<ClientConfig> {
+    #[cfg(all(test, unix))]
+    test_socket_headroom();
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| dialer_config(&PROTOCOLS_MESH)))
+}
+
+/// The dialer's for an op only [`ALPN_MESH`] carries ([`FleetOp::mesh_only`]): no other protocol is
+/// offered, so a listener that does not speak it refuses the TLS handshake, and no fleet secret is
+/// ever proved.
+fn mesh_only_client_config() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| dialer_config(&[ALPN_MESH])))
 }
 
 fn dialer_config(protocols: &[&[u8]]) -> Arc<ClientConfig> {
@@ -901,6 +1157,8 @@ pub struct Accepted {
     pub op: FleetOp,
     /// Node proof presented by the dialer under a node-proof protocol, if any.
     pub peer: Option<NodeProof>,
+    /// The two ends spoke [`ALPN_MESH`]: the dialer's key is one the log seats a member under.
+    pub mesh: bool,
 }
 
 /// Whether `node` matches any entry in `denied_nodes` (ASCII case-insensitive, trimmed).
@@ -922,31 +1180,97 @@ pub fn is_denied_key(key: &NodeKey, denied_nodes: &[String]) -> bool {
 /// Whom a listener refuses before any op (`NO denied`): node ids on the swarm roster's deny-list,
 /// and the node keys this Mac's membership log took out (`docs/DESIGN-fluid-swarm-2026-10-28.md`
 /// §3.3.7, F17: "the node key in the removed Mac's `Admit` is refused by every listener at once").
-/// While `unread`, the listener has never read its deny list, so it refuses every dialer that
-/// proved the fleet secret ([`FleetError::DenyListUnread`], `NO capacity` on the wire) rather than
-/// admit one the list it could not read names.
+/// While `unread`, the listener has never read its deny list, or its membership log exists but
+/// gave no verdict yet, so it refuses every dialer that proved the fleet secret
+/// ([`FleetError::DenyListUnread`], `NO capacity` on the wire) rather than admit one the list or
+/// the log it could not read names.
+///
+/// It is also the standing [`ALPN_MESH`] judges a peer's key by, at either end ([`Self::seat`]):
+/// `members` holds the keys the log seats a member under, so a key it names neither way is
+/// unknown, and reaches only the desk.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Denied {
     /// Node ids, as [`is_denied_node`] matches them.
     pub nodes: Vec<String>,
     /// Node keys.
     pub keys: Vec<NodeKey>,
-    /// No deny list has been read yet: every proved dialer is refused, to dial again later.
+    /// No deny list or log verdict has been read yet: every proved dialer is refused, to dial
+    /// again later.
     pub unread: bool,
+    /// The node keys the membership log seats a current member under: the only keys
+    /// [`ALPN_MESH`] admits, at either end. Empty with no log.
+    pub members: Vec<NodeKey>,
+}
+
+/// Where a node key a peer proved stands for [`ALPN_MESH`], as one [`Denied`] verdict says it
+/// ([`Denied::seat`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seat {
+    /// The membership log seats a current member under it, and the roster denies neither its node
+    /// nor its key.
+    Member,
+    /// The log took it out (its Mac removed, its member bound another key since, or two members
+    /// claim it), or the roster denies its node or key.
+    Out,
+    /// No record the verdict was read from binds it: a seat with no `Node` record yet, one whose
+    /// record has not arrived, or no member at all. It reaches only the desk.
+    Unknown,
+    /// No deny list or log verdict was read yet: nothing is judged.
+    Unread,
 }
 
 impl Denied {
+    /// What a listener refuses under the deny list `nodes` (`None` while none was read) and the
+    /// membership log's verdict `log` (`None` on a Mac with no log): the list's nodes and each
+    /// key the log took out, or every proved dialer while either is unread
+    /// ([`crate::fleet_member::MemberKeys::unreadable`]); and the keys the log seats a member
+    /// under, which [`ALPN_MESH`] admits ([`Self::seat`]). Read for each connection, so a key the
+    /// log takes out is refused from the first handshake after its `Remove` arrives.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn under(nodes: Option<&[String]>, log: Option<&crate::fleet_member::MemberKeys>) -> Self {
+        match nodes {
+            Some(nodes) if !log.is_some_and(|log| log.unread().is_some()) => Self {
+                nodes: nodes.to_vec(),
+                keys: log
+                    .map(crate::fleet_member::MemberKeys::out)
+                    .unwrap_or_default(),
+                unread: false,
+                members: log
+                    .map(crate::fleet_member::MemberKeys::members)
+                    .unwrap_or_default(),
+            },
+            _ => Self::not_yet_read(),
+        }
+    }
+
+    /// Where the key `proof` proved stands for [`ALPN_MESH`]: nothing is judged while unread;
+    /// out where this verdict refuses it ([`Self::refuses`]: a roster-denied node or key, or a key
+    /// the log took out); a member's where the log seats a member under it; else unknown.
+    #[must_use]
+    pub fn seat(&self, proof: &NodeProof) -> Seat {
+        if self.unread {
+            Seat::Unread
+        } else if self.refuses(Some(proof)) {
+            Seat::Out
+        } else if self.members.contains(&proof.key) {
+            Seat::Member
+        } else {
+            Seat::Unknown
+        }
+    }
+
     /// The roster's node ids alone.
     #[must_use]
     pub fn nodes(nodes: &[String]) -> Self {
         Self {
             nodes: nodes.to_vec(),
-            keys: Vec::new(),
-            unread: false,
+            ..Self::default()
         }
     }
 
-    /// A listener's that has not read its deny list yet: it refuses every proved dialer.
+    /// A listener's that has not read its deny list or a log verdict yet: it refuses every
+    /// proved dialer.
     #[must_use]
     pub fn not_yet_read() -> Self {
         Self {
@@ -1181,8 +1505,9 @@ impl<T: Read + Write + ?Sized> Duplex for T {}
 /// exchange runs inside the handshake's watchdog, so it holds its slot no longer than a fleet
 /// handshake may, and a listener given no ask handler does not offer the protocol at all.
 /// `deny` is called at most once, and only for a dialer that proved the fleet secret (and its node,
-/// under a node-proof protocol) ([`listener_proves`]): a socket that proves nothing (a peer that
-/// gave up, a wrong secret, an ask caller) costs no deny-list lookup.
+/// under a node-proof protocol) ([`listener_proves`]), or its node under [`ALPN_MESH`]
+/// ([`listener_meets`]): a socket that proves nothing (a peer that gave up, a wrong secret, an ask
+/// caller) costs no deny-list lookup.
 #[expect(
     clippy::too_many_arguments,
     reason = "handshake binds transport, watchdog, deadline, credentials, scope, admission, TLS config and optional ask handler"
@@ -1197,10 +1522,25 @@ fn server_handshake_or_ask<D: std::ops::Deref<Target = Denied>>(
     config: Arc<ServerConfig>,
     ask: Option<(&AskHandler, SocketAddr)>,
 ) -> Result<Handshook, FleetError> {
+    let mut mesh = false;
     let (mut transport, proved) = bounded(tcp, watchdog, within, |tcp| {
         let (mut conn, exporter, spoken) = accept_tls_on(tcp, config)?;
         let nodes = match spoken {
             Spoken::Fleet { nodes } => nodes,
+            Spoken::Mesh => {
+                // Only a listener with a node offers the mesh ([`served_config`]).
+                let me = me.ok_or(FleetError::Alpn)?;
+                mesh = true;
+                let proved = listener_meets(
+                    &mut rustls::Stream::new(&mut conn, tcp),
+                    &exporter,
+                    me,
+                    (scope, serves),
+                    deny,
+                    admit,
+                )?;
+                return Ok((conn, exporter, Some(proved)));
+            }
             Spoken::Ask => {
                 let Some((ask, peer)) = ask else {
                     return Err(FleetError::Alpn);
@@ -1232,6 +1572,7 @@ fn server_handshake_or_ask<D: std::ops::Deref<Target = Denied>>(
         transport,
         op,
         peer,
+        mesh,
     })))
 }
 
@@ -1264,6 +1605,9 @@ pub struct Dialed {
     pub scope: FleetScope,
     /// Node proof presented by the listener under a node-proof protocol, if any.
     pub peer: Option<NodeProof>,
+    /// The two ends spoke [`ALPN_MESH`]: the listener's key is one this Mac's log seats a member
+    /// under, and no fleet secret was proved.
+    pub mesh: bool,
 }
 
 /// Complete the dialer TLS and fleet handshake on `tcp` within `within`, verifying the listener
@@ -1375,6 +1719,11 @@ pub struct Undialed {
 /// [`client_handshake_as`], with the node that refused this end, when the listener proved one.
 /// # Errors
 /// As [`client_handshake_as`].
+///
+/// Where `me` dials the mesh ([`NodeIdentity::dialing_mesh`]) and the mesh carries `op`
+/// ([`FleetOp::meshed`]), it offers [`ALPN_MESH`] first: a listener that speaks it proves its
+/// node first, and this end proves its own only once its verdict seats a member under the
+/// listener's key. An older listener answers on [`ALPN_NODES`], proved as before.
 pub fn client_handshake_by(
     tcp: TcpStream,
     secret: &FleetSecret,
@@ -1382,7 +1731,41 @@ pub fn client_handshake_by(
     op: FleetOp,
     within: Duration,
 ) -> Result<Dialed, Undialed> {
-    client_handshake_by_on(tcp, secret, me, op, within, client_config())
+    let dials_mesh = me.is_some_and(NodeIdentity::dials_mesh);
+    let config = if op.mesh_only() {
+        if !dials_mesh {
+            // Only the mesh carries it, and a node that judges no mesh listener cannot dial it.
+            return Err(Undialed {
+                error: FleetError::Alpn,
+                refused_by: None,
+            });
+        }
+        mesh_only_client_config()
+    } else if op.meshed() && dials_mesh {
+        mesh_client_config()
+    } else {
+        client_config()
+    };
+    client_handshake_by_on(tcp, secret, me, op, within, config)
+}
+
+/// Dial `op`, an op only the mesh carries ([`FleetOp::mesh_only`]), as `me`: the listener proves
+/// its node first, and `me` proves its own only once its verdict seats a member under the
+/// listener's key. No fleet secret is proved.
+/// # Errors
+/// As [`client_handshake_by`]; [`FleetError::Alpn`] where `me` dials no mesh.
+pub fn dial_mesh_op(
+    tcp: TcpStream,
+    me: &NodeIdentity,
+    op: FleetOp,
+    within: Duration,
+) -> Result<Dialed, Undialed> {
+    debug_assert!(
+        op.mesh_only(),
+        "`{}` is not an op only the mesh carries",
+        op.word()
+    );
+    client_handshake_by(tcp, &FleetSecret::unproved(), Some(me), op, within)
 }
 
 fn client_handshake_by_on(
@@ -1407,20 +1790,33 @@ fn client_handshake_by_on(
         error,
     };
     let watchdog = arm(&tcp, within).map_err(|e| undialed(e, None))?;
-    let (mut transport, (scope, peer)) = bounded(tcp, watchdog, within, |tcp| {
+    let (mut transport, (scope, peer, mesh)) = bounded(tcp, watchdog, within, |tcp| {
         let (mut conn, exporter, spoken) = connect_tls_on(tcp, config)?;
-        let Spoken::Fleet { nodes } = spoken else {
-            return Err(FleetError::Alpn);
+        let nodes = match spoken {
+            Spoken::Fleet { nodes } => nodes,
+            Spoken::Mesh => {
+                // Only a node that dials the mesh offers it ([`client_handshake_by`]).
+                let me = me.filter(|me| me.dials_mesh()).ok_or(FleetError::Alpn)?;
+                let (scope, peer) = dialer_meets(
+                    &mut rustls::Stream::new(&mut conn, tcp),
+                    &exporter,
+                    me,
+                    op,
+                    &mut refused_by,
+                )?;
+                return Ok((conn, exporter, (scope, Some(peer), true)));
+            }
+            Spoken::Ask => return Err(FleetError::Alpn),
         };
         let me = me.filter(|_| nodes);
-        let proved = dialer_proves(
+        let (scope, peer) = dialer_proves(
             &mut rustls::Stream::new(&mut conn, tcp),
             &exporter,
             (secret, me, nodes),
             op,
             &mut refused_by,
         )?;
-        Ok((conn, exporter, proved))
+        Ok((conn, exporter, (scope, peer, false)))
     })
     .map_err(|e| undialed(e, refused_by.take()))?;
     release_deadlines(transport.stream().get_ref()).map_err(|e| undialed(e, None))?;
@@ -1428,6 +1824,7 @@ fn client_handshake_by_on(
         transport,
         scope,
         peer,
+        mesh,
     })
 }
 
@@ -1457,8 +1854,10 @@ pub fn ask_handshake(
 pub const HANDSHAKE_WITHIN: Duration = Duration::from_secs(3);
 
 /// The dev seam that sets, in milliseconds, how long a listener gives each connection's handshake
-/// and a dialer each address's, in place of [`HANDSHAKE_WITHIN`]: a test world whose every peer is
-/// an aterm on the same machine, and so must finish its handshake however loaded the machine is,
+/// (and aterm's fleet listener each read and write of an op it answers itself: join, book, facts,
+/// mail code, census and vault join) and a dialer each address's, in place of
+/// [`HANDSHAKE_WITHIN`]: a test world whose every peer is an aterm on
+/// the same machine, and so must finish its handshake and exchange however loaded the machine is,
 /// gives it its hang detector.
 pub const HANDSHAKE_SEAM: &str = "ATERM_DEBUG_FLEET_HANDSHAKE_MS";
 
@@ -1680,6 +2079,7 @@ pub struct Served {
     peer: Option<NodeProof>,
     scope: FleetScope,
     admission: Admission,
+    mesh: bool,
 }
 
 impl Served {
@@ -1701,6 +2101,13 @@ impl Served {
         self.scope
     }
 
+    /// Whether the connection spoke [`ALPN_MESH`]: its peer proved a key this Mac's membership
+    /// log seats a member under ([`Self::peer_node`]), and proved no fleet secret.
+    #[must_use]
+    pub const fn meshed(&self) -> bool {
+        self.mesh
+    }
+
     /// Relay the connection to `local` via [`tls::relay_answers`], releasing the listener hold
     /// before EOF.
     /// # Errors
@@ -1713,6 +2120,36 @@ impl Served {
         let result = tls::relay_answers(self.transport, local, self.release);
         self.admission.recheck()?;
         result
+    }
+
+    /// Hold this [`FleetOp::Neighbour`] connection as a link ([`link::Link`]) run as `cfg` says,
+    /// with `me` the listener's node. It gives back its handshake slot, since a link is no
+    /// handshake, and no longer counts toward its source's share or the listener's lifetime: a
+    /// [`link::Neighbours`] table bounds links, and the listener's stop still cuts it.
+    /// # Errors
+    /// [`io::ErrorKind::InvalidInput`] for a connection that is no [`ALPN_MESH`] one with a proven
+    /// peer; changed native locality evidence; or where the link could not start.
+    pub fn into_link(
+        self,
+        me: &NodeIdentity,
+        cfg: &link::LinkConfig,
+    ) -> io::Result<Arc<link::Link>> {
+        let Some(peer) = self.peer.filter(|_| self.mesh) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a neighbour link is an atm/1 connection with a proven peer",
+            ));
+        };
+        self.admission.recheck()?;
+        let Release { _slot, tenure } = self.release;
+        drop(_slot);
+        link::Link::start(
+            self.transport.into_stream(),
+            me,
+            (peer, false),
+            cfg,
+            Box::new((tenure, self.admission)),
+        )
     }
 
     /// Serve a direct response via `write` ([`tls::answer`]), flushing and releasing the listener
@@ -2042,7 +2479,9 @@ pub fn serve_lan_within<H, E>(
 // (`listener_proves`), so a socket whose peer gave up, or that proves nothing,
 // costs its worker no lookup.
 type OfferFn = Arc<dyn Fn() -> (FleetScope, &'static [FleetOp]) + Send + Sync>;
-type DenyFn = Arc<dyn Fn() -> Arc<Denied> + Send + Sync>;
+/// A verdict read fresh for each connection: what a listener refuses ([`Denied::under`]), and
+/// what a dialer that meets the mesh judges a listener by ([`NodeIdentity::dialing_mesh`]).
+pub type DenyFn = Arc<dyn Fn() -> Arc<Denied> + Send + Sync>;
 
 /// Keep the borrowed descriptor alive until its watchdog joins, including unwinding a
 /// policy callback or dropping an unstarted worker. Drop prevents disjoint closure capture.
@@ -2203,6 +2642,9 @@ fn serve_inner<H, E>(
                             (&secret, node.as_ref()),
                             (scope, serves, || deny()),
                             |op| {
+                                if op == FleetOp::Neighbour {
+                                    return release.tenure.linked();
+                                }
                                 let drive = op == FleetOp::Drive;
                                 let share = if drive {
                                     drive_per_source(most)
@@ -2211,11 +2653,7 @@ fn serve_inner<H, E>(
                                 };
                                 release.tenure.proved(drive, share)
                             },
-                            if ask.is_some() {
-                                server_config_asked()
-                            } else {
-                                server_config()
-                            },
+                            served_config(ask.is_some(), node.is_some()),
                             ask.as_ref().map(|ask| (ask, peer)),
                         )
                     })?;
@@ -2232,6 +2670,7 @@ fn serve_inner<H, E>(
                             transport,
                             op,
                             peer: proof,
+                            mesh,
                         } = *accepted;
                         tell(FleetEvent::Admitted { peer, op });
                         let served = Served {
@@ -2240,6 +2679,7 @@ fn serve_inner<H, E>(
                             peer: proof,
                             scope,
                             admission,
+                            mesh,
                         };
                         FleetEvent::Closed {
                             peer,
@@ -2354,6 +2794,14 @@ impl LiveTenure {
         }
     }
 
+    /// This connection proved a [`FleetOp::Neighbour`] link ([`Served::into_link`]): from its
+    /// proof on, no lifetime cuts it and no source's share counts it, since a
+    /// [`link::Neighbours`] table bounds links. The listener's stop still cuts it. `false` where
+    /// a cut already removed it.
+    fn linked(&self) -> bool {
+        self.live.lock().iter().any(|live| live.id == self.id)
+    }
+
     fn proved(&self, drive: bool, most: usize) -> bool {
         let now = Instant::now();
         let mut held = self.live.lock();
@@ -2437,11 +2885,18 @@ fn rustls_error(e: &io::Error) -> Option<&rustls::Error> {
         .and_then(|inner| inner.downcast_ref::<rustls::Error>())
 }
 
-fn export<C, S>(conn: &C) -> Result<[u8; EXPORTER_LEN], FleetError>
+/// The channel's exporter under the label of what its ends agreed to speak: a mesh proof's never
+/// a fleet proof's.
+fn export<C, S>(conn: &C, spoken: Spoken) -> Result<[u8; EXPORTER_LEN], FleetError>
 where
     C: std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
 {
-    conn.export_keying_material([0u8; EXPORTER_LEN], EXPORTER_LABEL, None)
+    let label = if spoken == Spoken::Mesh {
+        MESH_EXPORTER_LABEL
+    } else {
+        EXPORTER_LABEL
+    };
+    conn.export_keying_material([0u8; EXPORTER_LEN], label, None)
         .map_err(|e| FleetError::Tls(io::Error::other(e)))
 }
 
@@ -2477,7 +2932,7 @@ fn accept_tls_on(
     let Some(spoken) = spoken(conn.alpn_protocol()) else {
         return Err(FleetError::Alpn);
     };
-    let exporter = export(&conn)?;
+    let exporter = export(&conn, spoken)?;
     Ok((conn, exporter, spoken))
 }
 
@@ -2486,6 +2941,8 @@ fn accept_tls_on(
 enum Spoken {
     /// The fleet handshake, with node proofs under [`ALPN_NODES`] or [`ALPN_DATABASE_REPAIR`].
     Fleet { nodes: bool },
+    /// The mesh handshake, under [`ALPN_MESH`]: node proofs alone, the listener's first.
+    Mesh,
     /// A Mac asking to join, under [`ALPN_ASK`]: no secret, no proof, no op.
     Ask,
 }
@@ -2500,6 +2957,7 @@ const fn spoken(alpn: Option<&[u8]>) -> Option<Spoken> {
             | ALPN_DATABASE_DELTA,
         ) => Some(Spoken::Fleet { nodes: true }),
         Some(ALPN) => Some(Spoken::Fleet { nodes: false }),
+        Some(ALPN_MESH) => Some(Spoken::Mesh),
         Some(ALPN_ASK) => Some(Spoken::Ask),
         _ => None,
     }
@@ -2545,7 +3003,7 @@ fn connect_tls_on(
     let Some(spoken) = spoken(conn.alpn_protocol()) else {
         return Err(FleetError::Alpn);
     };
-    let exporter = export(&conn)?;
+    let exporter = export(&conn, spoken)?;
     Ok((conn, exporter, spoken))
 }
 
@@ -2608,7 +3066,8 @@ fn listener_proves<S: Read + Write, D: std::ops::Deref<Target = Denied>>(
     if denied.refuses(peer.as_ref()) {
         return refuse_as(stream, "denied", FleetError::DeniedNode, node);
     }
-    let Some(op) = FleetOp::from_word(word).filter(|op| serves.contains(op)) else {
+    let Some(op) = FleetOp::from_word(word).filter(|op| !op.mesh_only() && serves.contains(op))
+    else {
         return refuse_as(stream, "op", FleetError::UnknownOp(word.to_owned()), node);
     };
     if !admit(op) {
@@ -2710,6 +3169,139 @@ fn dialer_proves<S: Read + Write>(
     Ok((scope, peer))
 }
 
+/// The listener's half of [`ALPN_MESH`]. It proves its node `me` first, over this channel's
+/// exporter and bound to the listener's role, and the level it serves; then reads the dialer's op
+/// and node proof, and judges the key that proof proved by `deny`'s verdict ([`Denied::seat`]),
+/// looked up only once that proof verified: a dialer the roster or the log refuses is answered
+/// `NO denied`, one whose key the log binds to no seat `NO unknown` (it reaches only the desk, on
+/// [`ALPN_ASK`]), and an unread verdict `NO capacity`, as under [`ALPN_NODES`]. A proof that does
+/// not verify, or verifies only as the listener's own role (a reflection), is answered `NO node`.
+fn listener_meets<S: Read + Write, D: std::ops::Deref<Target = Denied>>(
+    stream: &mut S,
+    exporter: &[u8],
+    me: &NodeIdentity,
+    (scope, serves): (FleetScope, &[FleetOp]),
+    deny: impl FnOnce() -> D,
+    admit: impl FnOnce(FleetOp) -> bool,
+) -> Result<(FleetOp, Option<NodeProof>), FleetError> {
+    send(
+        stream,
+        &format!(
+            "{}{}\n",
+            node_line(Some(me), Signer::MeshListener, exporter),
+            scope.word()
+        ),
+    )?;
+    let Some(word) = read_line(stream)? else {
+        return Err(FleetError::DialerHungUp);
+    };
+    if !is_word(&word) {
+        return refuse(
+            stream,
+            "op",
+            FleetError::Malformed("the dialer's op is not a word"),
+        );
+    }
+    let peer = match read_node_proof(stream, Signer::MeshDialer, exporter) {
+        Ok(Some(peer)) => peer,
+        Ok(None) => {
+            return refuse(
+                stream,
+                "node",
+                FleetError::Malformed("a mesh dialer proves a node"),
+            );
+        }
+        Err(
+            error @ (FleetError::NodeProof | FleetError::Reflection | FleetError::Malformed(_)),
+        ) => {
+            return refuse(stream, "node", error);
+        }
+        Err(error) => return Err(error),
+    };
+    match deny().seat(&peer) {
+        Seat::Member => {}
+        // `NO capacity`, as under [`ALPN_NODES`]: dial again once the verdict is read.
+        Seat::Unread => return refuse(stream, "capacity", FleetError::DenyListUnread),
+        Seat::Out => return refuse(stream, "denied", FleetError::DeniedNode),
+        Seat::Unknown => return refuse(stream, "unknown", FleetError::UnknownKey),
+    }
+    let Some(op) = FleetOp::from_word(&word).filter(|op| op.meshed() && serves.contains(op)) else {
+        return refuse(stream, "op", FleetError::UnknownOp(word));
+    };
+    if !admit(op) {
+        return refuse(stream, "capacity", FleetError::AddressBusy);
+    }
+    send(stream, "OK\n")?;
+    Ok((op, Some(peer)))
+}
+
+/// The dialer's half of [`ALPN_MESH`]. It reads the listener's node proof and checks it: a
+/// signature that does not verify is [`FleetError::NodeProof`], and one that verifies only as the
+/// dialer's own role [`FleetError::Reflection`]. Then it judges the key that proof proved by `me`'s
+/// verdict, read now ([`NodeIdentity::dialing_mesh`]), and proves `op` and its own node only to a
+/// listener that verdict seats a member under: to any other, this end sends nothing at all, so a
+/// client never names itself to an unproven server. The listener's node, proved and judged, is
+/// `refused_by` when it refuses this end.
+fn dialer_meets<S: Read + Write>(
+    stream: &mut S,
+    exporter: &[u8],
+    me: &NodeIdentity,
+    op: FleetOp,
+    refused_by: &mut Option<NodeProof>,
+) -> Result<(FleetScope, NodeProof), FleetError> {
+    let Some(listener) = read_node_proof(stream, Signer::MeshListener, exporter)? else {
+        return Err(FleetError::Malformed(
+            "a mesh listener proves its node first",
+        ));
+    };
+    match me.verdict().map(|verdict| verdict.seat(&listener)) {
+        Some(Seat::Member) => {}
+        Some(Seat::Out) => return Err(FleetError::ListenerOut),
+        Some(Seat::Unknown) | None => return Err(FleetError::ListenerUnknown),
+        Some(Seat::Unread) => return Err(FleetError::VerdictUnread),
+    }
+    let Some(word) = read_line(stream)? else {
+        return Err(FleetError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the listener closed the connection before naming its level",
+        )));
+    };
+    let Some(scope) = FleetScope::from_word(&word) else {
+        return Err(FleetError::UnknownScope(word));
+    };
+    send(
+        stream,
+        &format!(
+            "{}\n{}",
+            op.word(),
+            node_line(Some(me), Signer::MeshDialer, exporter)
+        ),
+    )?;
+    let refusal = match read_line(stream)?.as_deref() {
+        Some("OK") => return Ok((scope, listener)),
+        Some("NO op") => FleetError::UnknownOp(op.word().to_owned()),
+        Some("NO capacity") => FleetError::AddressBusy,
+        Some("NO denied") => FleetError::DeniedNode,
+        Some("NO unread") => FleetError::DenyListUnread,
+        Some("NO unknown") => FleetError::UnknownKey,
+        Some("NO node") => FleetError::NodeProof,
+        Some(verdict) if verdict.strip_prefix("NO ").is_some_and(is_word) => FleetError::Refused,
+        Some(_) => {
+            return Err(FleetError::Malformed(
+                "the listener's answer is neither `OK` nor `NO <why>`",
+            ));
+        }
+        None => {
+            return Err(FleetError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the listener hung up without answering this machine's proof",
+            )));
+        }
+    };
+    *refused_by = Some(listener);
+    Err(refusal)
+}
+
 const fn tag(key: &[u8; 32], exporter: &[u8], word: &str) -> [u8; TAG_LEN] {
     hmac_sha256_parts(key, &[exporter, word.as_bytes()])
 }
@@ -2801,6 +3393,12 @@ fn read_line_within<R: Read>(stream: &mut R, max: usize) -> Result<Option<String
         _ => Err(FleetError::Malformed("a line that is not ASCII")),
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "fleet_mesh_tests.rs"]
+mod mesh_tests;
+
+pub mod link;
 
 #[cfg(test)]
 mod tests {
@@ -3190,7 +3788,7 @@ mod tests {
                 while conn.is_handshaking() {
                     conn.complete_io(&mut tcp).unwrap();
                 }
-                let exporter = export(&conn).unwrap();
+                let exporter = export(&conn, Spoken::Fleet { nodes: false }).unwrap();
                 let mut stream = StreamOwned::new(conn, tcp);
                 listener_proves(
                     &mut stream,
@@ -5366,5 +5964,62 @@ mod tests {
             *listening.ops.lock().unwrap(),
             [FleetOp::Survey, FleetOp::Drive]
         );
+    }
+
+    /// The identity point `01 00..00` as a key: a small-order key.
+    const SMALL_ORDER_KEY: [u8; NodeKey::LEN] = {
+        let mut key = [0; NodeKey::LEN];
+        key[0] = 1;
+        key
+    };
+
+    /// The identity as commitment and `s = 0`: under ring alone, [`SMALL_ORDER_KEY`]'s signature
+    /// of every message (astream-aead's `a_small_order_key_signs_nothing`).
+    const FORGED: [u8; SIG_LEN] = {
+        let mut sig = [0; SIG_LEN];
+        sig[0] = 1;
+        sig
+    };
+
+    /// A node line whose key is small-order proves nothing, in each end's role: its signature
+    /// would verify every exporter under ring alone, so it binds the key to no channel.
+    ///
+    /// NEGATIVE CONTROL: `NodeKey::verifies` through ring's `UnparsedPublicKey`: every role
+    /// takes the line as a proof.
+    #[test]
+    fn a_small_order_key_proves_no_node_line() {
+        let key = NodeKey::from_bytes(SMALL_ORDER_KEY);
+        let line = format!(
+            "node {} {} {}\n",
+            "10".repeat(16),
+            key.hex(),
+            hex::encode_lower(&FORGED)
+        );
+        for end in [
+            Signer::Dialer,
+            Signer::Listener,
+            Signer::MeshDialer,
+            Signer::MeshListener,
+        ] {
+            let proved = read_node_proof(&mut line.as_bytes(), end, &[0xa5; EXPORTER_LEN]);
+            assert!(
+                matches!(proved, Err(FleetError::NodeProof)),
+                "{end:?}: {proved:?}"
+            );
+        }
+    }
+
+    /// A small-order key signs no record: not a book entry's name, not a membership node proof.
+    ///
+    /// NEGATIVE CONTROL: `NodeKey::verifies` through ring's `UnparsedPublicKey`: both verify.
+    #[test]
+    fn a_small_order_key_signs_no_record() {
+        let key = NodeKey::from_bytes(SMALL_ORDER_KEY);
+        for domain in ["book name", "membership node"] {
+            assert!(
+                !verifies_record(&key, domain, b"a record body", &FORGED),
+                "{domain}"
+            );
+        }
     }
 }

@@ -12,7 +12,14 @@
 //! ([`Row::Park`](crate::wait_tally::Row::Park), [`Row::TallyWrite`](crate::wait_tally::Row::TallyWrite)). The line's head ([`FORMAT`](crate::wait_tally::FORMAT)) names how many rows
 //! follow, so a reader built for another count refuses the line, and carries the process's
 //! `astream_sys::flush_tally` beside the word that says which flushes it counts
-//! ([`Tally::flushes`](crate::wait_tally::Tally::flushes), `aterm_durable::ASTREAM_COUNTS`).
+//! ([`Tally::flushes`](crate::wait_tally::Tally::flushes), `aterm_durable::ASTREAM_COUNTS`), then
+//! how long they took and how many were slow (`astream_sys::flush_times`,
+//! [`Tally::times`](crate::wait_tally::Tally::times)). The tail after the rows carries the
+//! process's last slow calls ([`Tally::calls`](crate::wait_tally::Tally::calls): each call of
+//! [`SLOW_CALL_BAND`](crate::wait_tally::SLOW_CALL_BAND) or slower, its row, its start on
+//! `astream_sys::clock_ns`'s clock and its length) and astream-sys's ring of its last slow
+//! flushes, each with its index, so every slow call can be lined up with the flushes that ran
+//! under it and a reader can say which slow flushes the ring lost ([`Flushed::missed`](crate::wait_tally::Flushed::missed)).
 
 use std::io;
 use std::path::Path;
@@ -33,7 +40,7 @@ pub const FILE: &str = "wait-tally";
 
 /// What the line starts with: the format's name and version. The head's fields follow it,
 /// each fixed-width, the row count ([`ROWS`]) first.
-pub const FORMAT: &str = "wait-tally v=4";
+pub const FORMAT: &str = "wait-tally v=7";
 
 /// What `astream_sys::flush_tally`, in the head, counts of this build's flushes
 /// (`aterm_durable::ASTREAM_COUNTS`): one word for every line a build writes, so every line
@@ -79,9 +86,14 @@ pub enum Row {
     SetPostPin,
     /// `StateDir::set_in_flight`.
     SetInFlight,
-    /// `StateDir::clear_in_flight`.
+    /// `StateDir::clear_in_flight`: an in-flight entry ended alone. Every own record's but a
+    /// landed post's, whose entry ends with its group ([`Row::ClearPostSeq`]); and a landed
+    /// post's its group left standing: one a drain releases once aterm no longer lists the
+    /// post (left by the attach's replay, or by aterm gone before it answered), and one a
+    /// delivery ends after the disk refused its group's write or its self-lane offset.
     ClearInFlight,
-    /// `StateDir::clear_post_seq`.
+    /// `StateDir::clear_post_seq`, and `StateDir::settle_posts`: an ack pass's landed posts in one
+    /// write, their entries' ends with their reservations' (critic item E07).
     ClearPostSeq,
     /// `StateDir::append_self_acked`.
     AppendSelfAcked,
@@ -239,6 +251,22 @@ impl Row {
                 | Row::LogpinFence
         )
     }
+
+    /// Whether its spans are calls, which [`Tally::calls`] keeps when slow: every time row but
+    /// the loop's park (its idle wait for work) and the mailbox's queue waits (how long an
+    /// item waited for the loop, not a call it made).
+    #[must_use]
+    pub const fn is_call(self) -> bool {
+        !matches!(
+            self,
+            Row::DrainPosts
+                | Row::Park
+                | Row::WakeEvent
+                | Row::WakeRecord
+                | Row::QueuedEvent
+                | Row::QueuedRecord
+        )
+    }
 }
 
 /// The row a verb-lane request is counted in, by its verb head: for a verb addressed to one
@@ -285,17 +313,232 @@ pub struct Tally {
     /// The flushes this process had asked astream-sys for at the write
     /// (`astream_sys::flush_tally`), of which [`FLUSHES_COUNTED`] says which kinds it counts.
     pub flushes: astream_sys::FlushTally,
+    /// How long those flushes took, and the last slow ones, at the write
+    /// (`astream_sys::flush_times`).
+    pub times: Flushed,
     /// Each [`Row`], at its [`Row::index`].
     pub rows: [Hist; ROWS],
+    /// The process's slow calls: how many, and its last [`CALLS_KEPT`] with their starts on
+    /// [`FLUSH_CLOCK`].
+    pub calls: SlowCalls,
+}
+
+/// The clock [`Tally::calls`] and [`Tally::times`] are on: astream-sys's, the machine's on
+/// Apple (so another process's flushes compare), this process's elsewhere.
+pub const FLUSH_CLOCK: astream_sys::FlushClock = astream_sys::FLUSH_CLOCK;
+
+/// The band a call reaches to be a slow one ([`Tally::calls`]): band 11, 2^20 ns (1.05 ms)
+/// and more, so the calls a window kept number at most its call rows' values from this band
+/// up ([`Hist::at_least`]).
+pub const SLOW_CALL_BAND: usize = 11;
+
+/// How many slow calls a line carries: the process's last ones.
+pub const CALLS_KEPT: usize = 128;
+
+// A place writes its row's index in two digits.
+const _: () = assert!(ROWS < 100);
+
+/// One call of [`SLOW_CALL_BAND`] or slower: its row, and its start and length on
+/// [`FLUSH_CLOCK`] (its start is the clock at its end less its length, the length read on
+/// std's `Instant`, which reads the same clock on Apple).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlowCall {
+    /// The row it was counted in ([`Row::is_call`]).
+    pub row: Row,
+    /// When it began, in nanoseconds on [`FLUSH_CLOCK`].
+    pub start_ns: u64,
+    /// How long it took.
+    pub ns: u64,
+}
+
+impl SlowCall {
+    /// When it ended.
+    #[must_use]
+    pub const fn end_ns(self) -> u64 {
+        self.start_ns.saturating_add(self.ns)
+    }
+}
+
+/// A process's slow calls ([`SlowCall`]): how many it made, and its last [`CALLS_KEPT`] in the
+/// order they ended, fixed-size so a [`Tally`] stays `Copy` and its line one length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlowCalls {
+    /// The slow calls counted, kept or not; in a difference ([`Tally::since`]), the window's.
+    pub count: u64,
+    /// The last ones, oldest first, then `None`s; in a difference, those of the window the
+    /// later write still kept.
+    pub kept: [Option<SlowCall>; CALLS_KEPT],
+}
+
+impl Default for SlowCalls {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            kept: [None; CALLS_KEPT],
+        }
+    }
+}
+
+impl SlowCalls {
+    /// The calls it keeps, oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = SlowCall> + '_ {
+        self.kept.iter().map_while(|c| *c)
+    }
+
+    /// How many it keeps.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    /// Whether it keeps none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.kept[0].is_none()
+    }
+
+    /// Count `call`, which ended after every call it keeps, and keep it, the oldest leaving a
+    /// full ring.
+    fn push(&mut self, call: SlowCall) {
+        self.count = self.count.saturating_add(1);
+        let n = self.len();
+        if n == CALLS_KEPT {
+            self.kept.copy_within(1.., 0);
+            self.kept[CALLS_KEPT - 1] = Some(call);
+        } else {
+            self.kept[n] = Some(call);
+        }
+    }
+
+    /// Its last `n`, oldest first (all it keeps when it keeps fewer).
+    fn last(&self, n: u64) -> [Option<SlowCall>; CALLS_KEPT] {
+        let len = self.len();
+        let skip = len.saturating_sub(usize::try_from(n).unwrap_or(usize::MAX));
+        let mut out = [None; CALLS_KEPT];
+        out[..len - skip].copy_from_slice(&self.kept[skip..len]);
+        out
+    }
+
+    /// Its calls and `other`'s, each in the order they ended, merged by end (its own first on a
+    /// tie): the last [`CALLS_KEPT`] of both, which each one's last ones hold, and both counts.
+    #[must_use]
+    pub fn merged(&self, other: &SlowCalls) -> SlowCalls {
+        let (mut a, mut b) = (self.iter().peekable(), other.iter().peekable());
+        let mut all = Vec::with_capacity(2 * CALLS_KEPT);
+        while let Some(next) = match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) if y.end_ns() < x.end_ns() => b.next(),
+            (Some(_), _) => a.next(),
+            (None, _) => b.next(),
+        } {
+            all.push(next);
+        }
+        let mut kept = [None; CALLS_KEPT];
+        let skip = all.len().saturating_sub(CALLS_KEPT);
+        for (slot, call) in kept.iter_mut().zip(&all[skip..]) {
+            *slot = Some(*call);
+        }
+        SlowCalls {
+            count: self.count.saturating_add(other.count),
+            kept,
+        }
+    }
+}
+
+/// Whether another process's times on [`FLUSH_CLOCK`] line up with this one's: on the machine's
+/// clock they do (one boot); on a process's own they do not.
+pub const ACROSS_PROCESSES: bool = matches!(FLUSH_CLOCK, astream_sys::FlushClock::Machine);
+
+/// A slow flush as the ring keeps it, its kind, and the clock it is on (astream-sys's).
+pub use astream_sys::{clock_ns, FlushKind, SlowFlush};
+
+/// How many slow flushes a line carries: astream-sys's ring, whole.
+pub const RING: usize = astream_sys::SLOW_FLUSHES_KEPT;
+
+/// The process's flush times at a write (`astream_sys::flush_times`), fixed-size so a [`Tally`]
+/// stays `Copy` and its line one length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Flushed {
+    /// Nanoseconds in full flushes (`full_sync`, `full_sync_data`) that returned.
+    pub full_ns: u64,
+    /// Nanoseconds in barriers that returned.
+    pub barrier_ns: u64,
+    /// Nanoseconds in plain flushes that returned.
+    pub plain_ns: u64,
+    /// The flushes slower than `astream_sys::SLOW_FLUSH_NS` that returned, kept or not; in a
+    /// difference, the window's.
+    pub slow_count: u64,
+    /// The ring's slow flushes, oldest first (by their indices, each once), then `None`s: the
+    /// process's last [`RING`] at the write (a difference keeps the later write's).
+    pub slow: [Option<astream_sys::SlowFlush>; RING],
+    /// The calls into astream-sys that had begun and not yet returned at the write
+    /// (`astream_sys::FlushTimes::running`): flushes no count or ring here has yet, which may
+    /// have begun at any time before it; 0, every slow flush begun by then is indexed below
+    /// [`Flushed::slow_count`] (a difference keeps the later write's).
+    pub running: u64,
+}
+
+impl Default for Flushed {
+    fn default() -> Self {
+        Self {
+            full_ns: 0,
+            barrier_ns: 0,
+            plain_ns: 0,
+            slow_count: 0,
+            slow: [None; RING],
+            running: 0,
+        }
+    }
+}
+
+impl Flushed {
+    /// `t`, kept: its first [`RING`] slow flushes (astream-sys keeps no more).
+    #[must_use]
+    pub fn of(t: &astream_sys::FlushTimes) -> Self {
+        let mut slow = [None; RING];
+        for (slot, f) in slow.iter_mut().zip(&t.slow) {
+            *slot = Some(*f);
+        }
+        Self {
+            full_ns: t.full_ns,
+            barrier_ns: t.barrier_ns,
+            plain_ns: t.plain_ns,
+            slow_count: t.slow_count,
+            slow,
+            running: t.running,
+        }
+    }
+
+    /// This process's, now.
+    #[must_use]
+    pub fn now() -> Self {
+        Self::of(&astream_sys::flush_times())
+    }
+
+    /// The slow flushes it holds, oldest first.
+    pub fn slow(&self) -> impl Iterator<Item = astream_sys::SlowFlush> + '_ {
+        self.slow.iter().map_while(|f| *f)
+    }
+
+    /// How many of the slow flushes indexed from `from` (an earlier reading's
+    /// [`Flushed::slow_count`]) up to this one's count its ring does not hold: 0 exactly when it
+    /// holds that window whole (`astream_sys::slow_flushes_missed`). Of a whole reading (a
+    /// line's, or [`Flushed::now`]); a difference's count is the window's, so judge its window
+    /// by the later reading's whole.
+    #[must_use]
+    pub fn missed(&self, from: u64) -> u64 {
+        astream_sys::slow_flushes_missed(self.slow(), self.slow_count, from)
+    }
 }
 
 /// The head: the format, the row count, the pid, the cursor, the clock, the dir flag, the
-/// flush counts and the word that says what they count, zero-padded decimal so its length is
+/// flush counts and the word that says what they count, then the flush clock's word, the
+/// flush times, the slow count and the calls running, zero-padded decimal so its length is
 /// fixed.
 fn head_text(t: &Tally) -> String {
     format!(
         "{FORMAT} rows={ROWS:03} pid={:010} committed={:020} at={:020} dir={} full={:020} \
-         barrier={:020} plain={:020} counted={FLUSHES_COUNTED}",
+         barrier={:020} plain={:020} counted={FLUSHES_COUNTED} clock={} full_ns={:020} \
+         barrier_ns={:020} plain_ns={:020} slow={:020} running={:020}",
         t.pid,
         t.committed,
         t.at_ns,
@@ -303,13 +546,75 @@ fn head_text(t: &Tally) -> String {
         t.flushes.full,
         t.flushes.barrier,
         t.flushes.plain,
+        FLUSH_CLOCK.word(),
+        t.times.full_ns,
+        t.times.barrier_ns,
+        t.times.plain_ns,
+        t.times.slow_count,
+        t.times.running,
     )
+}
+
+/// A slow flush's kind as the ring writes it, `-` for an empty place.
+const fn kind_letter(f: Option<astream_sys::SlowFlush>) -> u8 {
+    match f {
+        Some(f) => match f.kind {
+            astream_sys::FlushKind::Full => b'f',
+            astream_sys::FlushKind::Barrier => b'b',
+            astream_sys::FlushKind::Plain => b'p',
+        },
+        None => b'-',
+    }
+}
+
+/// The tail after the rows: ` slow_calls=` the slow calls' count ([`SlowCalls::count`]) in
+/// twenty decimal digits, then ` calls=` each place of [`Tally::calls`]'s ring as its row's
+/// index in two decimal digits (`--` for none), its start and its length in sixteen hex digits
+/// each, joined by `+`, the places joined by `.`; then ` ring=` each place of the flush ring
+/// ([`Flushed::slow`]) as its kind's letter (`f`, `b`, `p`, `-` for none), its index, `@`, and
+/// its start and end, joined by `-`, each in sixteen hex digits, the places joined by `.`.
+fn tail_text(t: &Tally) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(tail_len());
+    let _ = write!(out, " slow_calls={:020} calls=", t.calls.count);
+    for (i, c) in t.calls.kept.iter().enumerate() {
+        if i > 0 {
+            out.push('.');
+        }
+        match c {
+            Some(c) => {
+                let _ = write!(out, "{:02}{:016x}+{:016x}", c.row.index(), c.start_ns, c.ns);
+            }
+            None => {
+                let _ = write!(out, "--{:016x}+{:016x}", 0, 0);
+            }
+        }
+    }
+    out.push_str(" ring=");
+    for (i, f) in t.times.slow.iter().enumerate() {
+        if i > 0 {
+            out.push('.');
+        }
+        let (index, start, end) = f.map_or((0, 0, 0), |f| (f.index, f.start_ns, f.end_ns));
+        out.push(char::from(kind_letter(*f)));
+        let _ = write!(out, "{index:016x}@{start:016x}-{end:016x}");
+    }
+    out
+}
+
+/// [`tail_text`]'s length.
+const fn tail_len() -> usize {
+    " slow_calls=".len() + 20 + " calls=".len() + CALLS_KEPT * (2 + 16 + 1 + 16 + 1) - 1
+        + " ring=".len()
+        + RING * (1 + 16 + 1 + 16 + 1 + 16 + 1)
+        - 1
 }
 
 /// Every line's length ([`Tally::render`]): the head's ([`head_text`]: the
 /// format, three digits of row count, ten of pid, twenty of cursor, twenty of clock, one of dir
-/// flag, twenty of each flush count and the counted word), each row's ([`row_len`]) and the
-/// checksum's ([`sum_text`]).
+/// flag, twenty of each flush count and the counted word, the flush clock's word, and twenty
+/// of each flush time and of the slow count), each row's ([`row_len`]), the tail's
+/// ([`tail_text`]) and the checksum's ([`sum_text`]).
 fn line_len() -> usize {
     let head = FORMAT.len()
         + " rows=".len()
@@ -329,9 +634,21 @@ fn line_len() -> usize {
         + " plain=".len()
         + 20
         + " counted=".len()
-        + FLUSHES_COUNTED.len();
+        + FLUSHES_COUNTED.len()
+        + " clock=".len()
+        + FLUSH_CLOCK.word().len()
+        + [
+            " full_ns=",
+            " barrier_ns=",
+            " plain_ns=",
+            " slow=",
+            " running=",
+        ]
+        .iter()
+        .map(|k| k.len() + 20)
+        .sum::<usize>();
     let rows: usize = Row::ALL.iter().map(|&row| row_len(row.name())).sum();
-    head + rows + " sum=".len() + 16 + "\n".len()
+    head + rows + tail_len() + " sum=".len() + 16 + "\n".len()
 }
 
 impl Tally {
@@ -365,6 +682,7 @@ impl Tally {
         for row in Row::ALL {
             body.extend_from_slice(&row_text(row.name(), self.row(row)));
         }
+        body.extend_from_slice(tail_text(self).as_bytes());
         let sum = sum_text(&body);
         body.extend_from_slice(sum.as_bytes());
         String::from_utf8(body).unwrap_or_default()
@@ -373,8 +691,9 @@ impl Tally {
     /// Read a line [`Tally::render`] wrote.
     ///
     /// # Errors
-    /// A line that is not one, one of another row count, or one whose flush counts count other
-    /// flushes than this build's ([`FLUSHES_COUNTED`]).
+    /// A line that is not one, one of another row count, one whose flush counts count other
+    /// flushes than this build's ([`FLUSHES_COUNTED`]), or one whose times are on another clock
+    /// than this build's ([`FLUSH_CLOCK`]).
     pub fn parse(text: &str) -> Result<Tally, String> {
         let mut words = Words::of(text, FORMAT)?;
         let count = words.dec("rows")?;
@@ -404,9 +723,145 @@ impl Tally {
                  `{FLUSHES_COUNTED}`: another build's tally: {text:?}"
             ));
         }
+        let clock = words.next("clock")?;
+        if clock != FLUSH_CLOCK.word() {
+            return Err(format!(
+                "a tally line whose times are on the `{clock}` clock, and this reader's on the \
+                 `{}` clock: another build's tally: {text:?}",
+                FLUSH_CLOCK.word()
+            ));
+        }
+        let mut times = Flushed {
+            full_ns: words.dec("full_ns")?,
+            barrier_ns: words.dec("barrier_ns")?,
+            plain_ns: words.dec("plain_ns")?,
+            slow_count: words.dec("slow")?,
+            running: words.dec("running")?,
+            ..Flushed::default()
+        };
         let mut rows = [Hist::default(); ROWS];
         for (slot, row) in rows.iter_mut().zip(Row::ALL) {
             *slot = words.hist(row.name())?;
+        }
+        let hex = |v: &str, what: &str| -> Result<u64, String> {
+            if v.len() == 16 && v.bytes().all(|b| b.is_ascii_hexdigit()) {
+                u64::from_str_radix(v, 16).map_err(|e| format!("{what}: {e}"))
+            } else {
+                Err(format!(
+                    "a tally line whose {what} is not 16 hex digits: {text:?}"
+                ))
+            }
+        };
+        let mut calls = SlowCalls {
+            count: words.dec("slow_calls")?,
+            ..SlowCalls::default()
+        };
+        let mut each = words.next("calls")?.split('.');
+        let (mut calls_ended, mut last_end) = (false, 0u64);
+        for slot in &mut calls.kept {
+            let place = each.next().ok_or_else(|| {
+                format!("a tally line with fewer than {CALLS_KEPT} slow-call places: {text:?}")
+            })?;
+            let bad =
+                || format!("a tally line whose slow-call place {place:?} is no call's: {text:?}");
+            let (index, span) = place.split_at_checked(2).ok_or_else(bad)?;
+            let (start, ns) = span.split_once('+').ok_or_else(bad)?;
+            let (start_ns, ns) = (hex(start, "a call's start")?, hex(ns, "a call's length")?);
+            if index == "--" && (start_ns, ns) == (0, 0) {
+                calls_ended = true;
+                continue;
+            }
+            let row = index
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| index.parse::<usize>().ok())
+                .flatten()
+                .and_then(|i| Row::ALL.get(i).copied())
+                .filter(|row| row.is_call())
+                .ok_or_else(bad)?;
+            let call = SlowCall { row, start_ns, ns };
+            if calls_ended || Hist::band(ns, Unit::Ns) < SLOW_CALL_BAND || call.end_ns() < last_end
+            {
+                return Err(format!(
+                    "a tally line whose slow-call place {place:?} is out of its place, not slow, \
+                     or ends before the call before it: {text:?}"
+                ));
+            }
+            last_end = call.end_ns();
+            *slot = Some(call);
+        }
+        if each.next().is_some() {
+            return Err(format!(
+                "a tally line with more than {CALLS_KEPT} slow-call places: {text:?}"
+            ));
+        }
+        if u64::try_from(calls.len()).ok() != Some(calls.count.min(CALLS_KEPT as u64)) {
+            return Err(format!(
+                "a tally line that counts {} slow calls and keeps {}: {text:?}",
+                calls.count,
+                calls.len()
+            ));
+        }
+        let mut places = words.next("ring")?.split('.');
+        let mut ended = false;
+        let mut last: Option<u64> = None;
+        for slot in &mut times.slow {
+            let place = places.next().ok_or_else(|| {
+                format!("a tally line with fewer than {RING} ring places: {text:?}")
+            })?;
+            let (letter, rest) = place
+                .split_at_checked(1)
+                .ok_or_else(|| format!("a tally line with an empty ring place: {text:?}"))?;
+            let (index, span) = rest
+                .split_once('@')
+                .ok_or_else(|| format!("a tally line whose ring place {place:?} has no index"))?;
+            let (start, end) = span
+                .split_once('-')
+                .ok_or_else(|| format!("a tally line whose ring place {place:?} has no end"))?;
+            let (index, start_ns, end_ns) = (
+                hex(index, "a ring index")?,
+                hex(start, "a ring start")?,
+                hex(end, "a ring end")?,
+            );
+            let kind = match letter {
+                "f" => astream_sys::FlushKind::Full,
+                "b" => astream_sys::FlushKind::Barrier,
+                "p" => astream_sys::FlushKind::Plain,
+                "-" if (index, start_ns, end_ns) == (0, 0, 0) => {
+                    ended = true;
+                    continue;
+                }
+                _ => {
+                    return Err(format!(
+                        "a tally line whose ring place {place:?} is no flush's: {text:?}"
+                    ));
+                }
+            };
+            if ended || end_ns < start_ns {
+                return Err(format!(
+                    "a tally line whose ring place {place:?} is out of its place or ends before \
+                     it starts: {text:?}"
+                ));
+            }
+            if last.is_some_and(|l| index <= l) || index >= times.slow_count {
+                return Err(format!(
+                    "a tally line whose ring place {place:?} is not past the one before it or \
+                     not below the {} slow flushes the line counts: {text:?}",
+                    times.slow_count
+                ));
+            }
+            last = Some(index);
+            *slot = Some(astream_sys::SlowFlush {
+                index,
+                kind,
+                start_ns,
+                end_ns,
+            });
+        }
+        if places.next().is_some() {
+            return Err(format!(
+                "a tally line with more than {RING} ring places: {text:?}"
+            ));
         }
         words.end()?;
         Ok(Tally {
@@ -415,15 +870,18 @@ impl Tally {
             at_ns,
             dir,
             flushes,
+            times,
             rows,
+            calls,
         })
     }
 
     /// What the loop did between `earlier` and this tally.
     ///
     /// # Errors
-    /// Two processes' tallies (a relaunched bridge counts from zero again), or a clock, a flush
-    /// count or a row that went backwards.
+    /// Two processes' tallies (a relaunched bridge counts from zero again), a changed dir flag,
+    /// or a clock, a flush count, a flush time, a slow flush or slow call count or a row that
+    /// went backwards.
     pub fn since(&self, earlier: &Tally) -> Result<Tally, String> {
         if self.pid != earlier.pid {
             return Err(format!(
@@ -451,19 +909,41 @@ impl Tally {
             barrier: flush("barrier", earlier.flushes.barrier, self.flushes.barrier)?,
             plain: flush("plain", earlier.flushes.plain, self.flushes.plain)?,
         };
+        let time = |what: &str, then: u64, now: u64| {
+            now.checked_sub(then)
+                .ok_or_else(|| format!("the tally's {what} went backwards, {then} to {now}"))
+        };
+        let (was, is) = (&earlier.times, &self.times);
+        let times = Flushed {
+            full_ns: time("full flush time", was.full_ns, is.full_ns)?,
+            barrier_ns: time("barrier time", was.barrier_ns, is.barrier_ns)?,
+            plain_ns: time("plain flush time", was.plain_ns, is.plain_ns)?,
+            slow_count: time("slow flush count", was.slow_count, is.slow_count)?,
+            slow: is.slow,
+            running: is.running,
+        };
         let mut rows = [Hist::default(); ROWS];
         for (i, slot) in rows.iter_mut().enumerate() {
             *slot = self.rows[i]
                 .since(&earlier.rows[i])
                 .map_err(|why| format!("the tally's `{}`: {why}", Row::ALL[i].name()))?;
         }
+        // Every call the window made ended after every call the earlier write kept, so the
+        // window's are the later ring's last ones.
+        let new = time("slow call count", earlier.calls.count, self.calls.count)?;
+        let calls = SlowCalls {
+            count: new,
+            kept: self.calls.last(new),
+        };
         Ok(Tally {
             pid: self.pid,
             committed: self.committed,
             at_ns,
             dir: self.dir,
             flushes,
+            times,
             rows,
+            calls,
         })
     }
 
@@ -482,6 +962,33 @@ impl Tally {
 /// `d` in nanoseconds, saturating.
 fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Whether a span of `row` that took `ns` is a slow call ([`Tally::calls`]): a call row's, in
+/// [`SLOW_CALL_BAND`] or past it.
+fn is_slow(row: Row, ns: u64) -> bool {
+    row.is_call() && Hist::band(ns, Unit::Ns) >= SLOW_CALL_BAND
+}
+
+/// When a span of `row` that took `ns` and ends now ended, on astream-sys's clock, read only
+/// for a slow call ([`is_slow`]), so a span of two rows can share one reading.
+fn end_of(row: Row, ns: u64) -> Option<u64> {
+    is_slow(row, ns).then(astream_sys::clock_ns)
+}
+
+/// Count a span of `row` that took `ns` in `h`, and keep it in `calls` when it is a slow call
+/// that ended at `end` ([`end_of`]): its start is `end` less `ns` (the clock std's `Instant`
+/// reads on Apple, so the span's own clock and this one agree there to the gap between two
+/// readings).
+fn add_span(h: &mut Hist, calls: &mut SlowCalls, row: Row, ns: u64, end: Option<u64>) {
+    if let Some(end) = end.filter(|_| is_slow(row, ns)) {
+        calls.push(SlowCall {
+            row,
+            start_ns: end.saturating_sub(ns),
+            ns,
+        });
+    }
+    h.add(ns, row.unit());
 }
 
 /// When an item was queued for the loop, and whether the loop was parked on its mailbox then.
@@ -511,7 +1018,8 @@ impl Stamp {
 #[derive(Debug, Default)]
 pub(crate) struct Kept {
     on: AtomicBool,
-    rows: Mutex<[Hist; ROWS]>,
+    /// The rows, and the slow calls among them ([`Tally::calls`]).
+    rows: Mutex<([Hist; ROWS], SlowCalls)>,
 }
 
 #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
@@ -531,18 +1039,24 @@ impl Kept {
     }
 
     fn note(&self, row: Row, ns: u64) {
-        let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
-        rows[row.index()].add(ns, row.unit());
+        let mut kept = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+        let (rows, calls) = &mut *kept;
+        // Its end is read under the lock, so the calls this keeps are in the order they ended,
+        // and one [`Kept::copy_into`] holds every call that ended before it and none after.
+        add_span(&mut rows[row.index()], calls, row, ns, end_of(row, ns));
     }
 
-    /// Copy every row this keeps that holds a value into `t`.
+    /// Copy every row this keeps that holds a value into `t`, and merge its slow calls into
+    /// `t`'s (the recorder's own, [`SlowCalls::merged`]).
     pub(crate) fn copy_into(&self, t: &mut Tally) {
-        let rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+        let (rows, calls) = &*kept;
         for (i, h) in rows.iter().enumerate() {
             if h.count > 0 {
                 t.rows[i] = *h;
             }
         }
+        t.calls = t.calls.merged(calls);
     }
 }
 
@@ -572,6 +1086,9 @@ pub(crate) struct Recorder {
     /// When the recorder started.
     started: Instant,
     tally: Tally,
+    /// The slow calls of the rows this records itself; a write's [`Tally::calls`] is these
+    /// merged with the ones the outside keeps ([`Kept::copy_into`]).
+    calls: SlowCalls,
     /// What the file holds: the last tally written, and its line.
     written: Option<(Tally, Vec<u8>)>,
 }
@@ -582,6 +1099,7 @@ impl Default for Recorder {
             out: None,
             started: Instant::now(),
             tally: Tally::default(),
+            calls: SlowCalls::default(),
             written: None,
         }
     }
@@ -613,6 +1131,7 @@ impl Recorder {
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)?;
         Ok(Self {
             out: Some(out),
@@ -622,6 +1141,7 @@ impl Recorder {
                 dir: cfg!(any(test, debug_assertions, feature = "dev-seams")),
                 ..Tally::default()
             },
+            calls: SlowCalls::default(),
             written: None,
         })
     }
@@ -639,8 +1159,24 @@ impl Recorder {
     /// The span [`Recorder::starts`] began has ended now.
     pub(crate) fn note(&mut self, row: Row, started: Option<Instant>) {
         if let Some(started) = started {
-            self.tally.rows[row.index()].add(nanos(started.elapsed()), row.unit());
+            self.span(row, nanos(started.elapsed()));
         }
+    }
+
+    /// A span of `row` that took `ns` and ended now.
+    fn span(&mut self, row: Row, ns: u64) {
+        self.span_ended(row, ns, end_of(row, ns));
+    }
+
+    /// A span of `row` that took `ns` and ended at `end` ([`end_of`]).
+    fn span_ended(&mut self, row: Row, ns: u64, end: Option<u64>) {
+        add_span(
+            &mut self.tally.rows[row.index()],
+            &mut self.calls,
+            row,
+            ns,
+            end,
+        );
     }
 
     /// Count `n` in a row of counts ([`Unit::Count`]).
@@ -666,9 +1202,11 @@ impl Recorder {
     pub(crate) fn ack(&mut self, started: Option<Instant>, commit: bool) {
         if let Some(started) = started {
             let ns = nanos(started.elapsed());
-            self.tally.rows[Row::Ack.index()].add(ns, Unit::Ns);
+            // One span, two rows: one reading of its end, so a slow commit is its ack's span.
+            let end = end_of(Row::Ack, ns);
+            self.span_ended(Row::Ack, ns, end);
             if commit {
-                self.tally.rows[Row::Commit.index()].add(ns, Unit::Ns);
+                self.span_ended(Row::Commit, ns, end);
             }
         }
     }
@@ -682,6 +1220,7 @@ impl Recorder {
         let began = Instant::now();
         self.tally.committed = committed;
         self.tally.flushes = astream_sys::flush_tally();
+        self.tally.calls = self.calls;
         outside(&mut self.tally);
         if self
             .written
@@ -690,6 +1229,8 @@ impl Recorder {
         {
             return;
         }
+        // Read only for a write: a flush alone is no move, and its times ride the next write.
+        self.tally.times = Flushed::now();
         self.tally.at_ns = nanos(self.started.elapsed());
         let line = match self.written.take() {
             Some((last, mut line)) => {
@@ -703,6 +1244,11 @@ impl Recorder {
                     }
                     at += len;
                 }
+                if self.tally.calls != last.calls || self.tally.times.slow != last.times.slow {
+                    let tail = tail_text(&self.tally);
+                    line[at..at + tail.len()].copy_from_slice(tail.as_bytes());
+                }
+                at += tail_len();
                 let sum = sum_text(&line[..at]);
                 line[at..].copy_from_slice(sum.as_bytes());
                 line
@@ -765,7 +1311,53 @@ mod tests {
         t.rows[Row::DirReplace.index()] = hist(&[200_000], Unit::Ns);
         t.rows[Row::DrainPosts.index()] = hist(&[0, 1, 1, 3], Unit::Count);
         t.rows[Row::Park.index()] = hist(&[500_000_000], Unit::Ns);
+        // Its three calls past 1.05 ms, in the order they ended; the park is no call.
+        for c in [
+            call(Row::Request, 7_000_000_000, 31_000_000),
+            call(Row::Ack, 7_020_000_000, 18_000_000),
+            call(Row::LaneDeliver, 7_100_000_000, 40_000_000),
+        ] {
+            t.calls.push(c);
+        }
+        t.times = Flushed {
+            full_ns: 12_500_000,
+            barrier_ns: 3_000_000,
+            plain_ns: 0,
+            slow_count: 2,
+            running: 1,
+            ..Flushed::default()
+        };
+        t.times.slow[0] = Some(slow(
+            0,
+            astream_sys::FlushKind::Full,
+            7_000_002_000,
+            7_009_000_000,
+        ));
+        t.times.slow[1] = Some(slow(
+            1,
+            astream_sys::FlushKind::Barrier,
+            7_100_000_000,
+            7_101_500_000,
+        ));
         t
+    }
+
+    fn slow(
+        index: u64,
+        kind: astream_sys::FlushKind,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> astream_sys::SlowFlush {
+        astream_sys::SlowFlush {
+            index,
+            kind,
+            start_ns,
+            end_ns,
+        }
+    }
+
+    const fn call(row: Row, start_ns: u64, ns: u64) -> SlowCall {
+        SlowCall { row, start_ns, ns }
     }
 
     /// THE BANDS ARE LOG2, and the edges are where the unit says: under a
@@ -811,23 +1403,50 @@ mod tests {
         assert_eq!(Hist::default().top(Unit::Ns), None);
     }
 
-    /// THE V=4 LINE READS BACK AS WRITTEN, AND EVERY LINE IS ONE LENGTH, so a
+    /// THE V=6 LINE READS BACK AS WRITTEN, AND EVERY LINE IS ONE LENGTH, so a
     /// write at offset 0 always replaces the line whole: the smallest tally
-    /// and the largest render to the same width.
+    /// and the largest render to the same width, a full ring of slow calls and
+    /// a full flush ring included.
     #[test]
     fn a_tally_line_reads_back_as_written_and_every_line_is_one_length() {
         let t = sample();
         let line = t.render();
         assert!(
-            line.starts_with("wait-tally v=4 rows=030 pid=0000004242 "),
+            line.starts_with("wait-tally v=7 rows=030 pid=0000004242 "),
             "{line}"
         );
         assert!(
             line.contains(&format!(
                 " full=00000000000000000003 barrier=00000000000000000040 \
-                 plain=00000000000000000005 counted={FLUSHES_COUNTED} request="
+                 plain=00000000000000000005 counted={FLUSHES_COUNTED} clock={} \
+                 full_ns=00000000000012500000 barrier_ns=00000000000003000000 \
+                 plain_ns=00000000000000000000 slow=00000000000000000002 \
+                 running=00000000000000000001 request=",
+                FLUSH_CLOCK.word()
             )),
-            "the flush counts and what they count end the head: {line}"
+            "the flush counts, what they count, their clock and times end the head: {line}"
+        );
+        assert!(
+            line.contains(&format!(
+                " slow_calls=00000000000000000003 calls=00{:016x}+{:016x}.01{:016x}+{:016x}.\
+                 06{:016x}+{:016x}.--0000000000000000+0000000000000000.",
+                7_000_000_000u64,
+                31_000_000u64,
+                7_020_000_000u64,
+                18_000_000u64,
+                7_100_000_000u64,
+                40_000_000u64
+            )) && line.contains(&format!(
+                " ring=f{:016x}@{:016x}-{:016x}.b{:016x}@{:016x}-{:016x}.\
+                 -0000000000000000@0000000000000000-0000000000000000.",
+                0u64, 7_000_002_000u64, 7_009_000_000u64, 1u64, 7_100_000_000u64, 7_101_500_000u64
+            )),
+            "the slow calls, then the flush ring, each oldest first, then its empty places: {line}"
+        );
+        assert_eq!(
+            (t.times.slow().count(), t.calls.len()),
+            (2, 3),
+            "each ring's entries end at its first empty place"
         );
         assert_eq!(Tally::parse(&line), Ok(t));
         assert_eq!(t.blocked_ns(), 31_000_000 + 18_009_000);
@@ -842,12 +1461,32 @@ mod tests {
                 barrier: u64::MAX,
                 plain: u64::MAX,
             },
+            times: Flushed {
+                full_ns: u64::MAX,
+                barrier_ns: u64::MAX,
+                plain_ns: u64::MAX,
+                slow_count: u64::MAX,
+                slow: std::array::from_fn(|i| {
+                    let index = u64::MAX - RING as u64 + i as u64;
+                    Some(slow(
+                        index,
+                        astream_sys::FlushKind::Plain,
+                        u64::MAX,
+                        u64::MAX,
+                    ))
+                }),
+                running: u64::MAX,
+            },
             rows: [Hist {
                 count: u64::MAX,
                 total: u64::MAX,
                 max: u64::MAX,
                 buckets: [u32::MAX; BUCKETS],
             }; ROWS],
+            calls: SlowCalls {
+                count: u64::MAX,
+                kept: [Some(call(Row::TallyWrite, u64::MAX, u64::MAX)); CALLS_KEPT],
+            },
         };
         assert_eq!(zero.render().len(), full.render().len());
         assert_eq!(
@@ -890,6 +1529,155 @@ mod tests {
         );
         let why = Tally::parse(&resummed(word)).expect_err("another flush word");
         assert!(why.contains(&format!("count `{other}`")), "{why}");
+        // Times on another build's clock do not line up with this build's: refused by the word.
+        let other = match FLUSH_CLOCK {
+            astream_sys::FlushClock::Machine => astream_sys::FlushClock::Process,
+            astream_sys::FlushClock::Process => astream_sys::FlushClock::Machine,
+        };
+        let clock = body.replacen(
+            &format!(" clock={} ", FLUSH_CLOCK.word()),
+            &format!(" clock={} ", other.word()),
+            1,
+        );
+        let why = Tally::parse(&resummed(clock)).expect_err("another clock");
+        assert!(
+            why.contains(&format!("the `{}` clock", other.word())),
+            "{why}"
+        );
+    }
+
+    /// NEGATIVE CONTROL: a checksummed line whose flush ring or slow-call ring is no writer's is
+    /// refused, never read as flushes or calls: a flush place of no kind, an empty place with a
+    /// span, a flush after an empty place, one that ends before it starts, a short or a long
+    /// ring; a call of a row that is no call's or of none, one under 1.05 ms, a call after an
+    /// empty place, one that ends before the call before it, a start that is not 16 hex digits,
+    /// a short or a long ring, and a count the kept calls do not match.
+    #[test]
+    fn a_flush_ring_or_a_call_ring_no_writer_wrote_is_refused() {
+        let line = sample().render();
+        let (body, _) = line.trim_end().rsplit_once(" sum=").expect("a sum");
+        let resummed = |body: String| format!("{body} sum={:016x}\n", checksum(body.as_bytes()));
+        let (head, ring) = body.rsplit_once(" ring=").expect("a ring");
+        let places: Vec<&str> = ring.split('.').collect();
+        assert_eq!(places.len(), RING);
+        let with = |places: &[String]| resummed(format!("{head} ring={}", places.join(".")));
+        let owned: Vec<String> = places.iter().map(|p| (*p).to_string()).collect();
+        assert_eq!(Tally::parse(&with(&owned)), Ok(sample()), "the control");
+        let mut each: Vec<(String, Vec<String>)> = Vec::new();
+        let mut put = |why: &str, at: usize, place: String| {
+            let mut p = owned.clone();
+            p[at] = place;
+            each.push((why.to_string(), p));
+        };
+        put("a place of no kind", 0, owned[0].replacen('f', "x", 1));
+        put(
+            "an empty place with a span",
+            2,
+            format!("-{:016x}@{:016x}-{:016x}", 0, 1, 2),
+        );
+        put("a flush after an empty place", 3, owned[0].clone());
+        put(
+            "an end before its start",
+            0,
+            format!("f{:016x}@{:016x}-{:016x}", 0, 9, 8),
+        );
+        put("a place with no end", 0, format!("f{:016x}@{:016x}", 0, 9));
+        put(
+            "a place with no index (a v=6 line's)",
+            0,
+            format!("f{:016x}-{:016x}", 1, 2),
+        );
+        let second = |index: u64| {
+            format!(
+                "b{index:016x}@{:016x}-{:016x}",
+                7_100_000_000u64, 7_101_500_000u64
+            )
+        };
+        assert_eq!(second(1), owned[1], "the control's second place");
+        put("an index not past the one before it", 1, second(0));
+        put("an index at the line's slow count", 1, second(2));
+        let mut short = owned.clone();
+        short.pop();
+        each.push(("a short ring".to_string(), short));
+        let mut long = owned.clone();
+        long.push(owned[RING - 1].clone());
+        each.push(("a long ring".to_string(), long));
+        for (why, places) in each {
+            assert!(Tally::parse(&with(&places)).is_err(), "{why}");
+        }
+
+        let (before, rest) = body.split_once(" slow_calls=").expect("the slow calls");
+        let (count, rest) = rest.split_once(" calls=").expect("the call ring");
+        let (calls, after) = rest.split_once(" ring=").expect("the flush ring");
+        let places: Vec<String> = calls.split('.').map(str::to_string).collect();
+        assert_eq!((count, places.len()), ("00000000000000000003", CALLS_KEPT));
+        let with = |count: &str, places: &[String]| {
+            resummed(format!(
+                "{before} slow_calls={count} calls={} ring={after}",
+                places.join(".")
+            ))
+        };
+        assert_eq!(
+            Tally::parse(&with(count, &places)),
+            Ok(sample()),
+            "the control"
+        );
+        let place = |row: &str, start: u64, ns: u64| format!("{row}{start:016x}+{ns:016x}");
+        let mut each: Vec<(&str, Vec<String>)> = Vec::new();
+        let mut put = |why: &'static str, at: usize, p: String| {
+            let mut all = places.clone();
+            all[at] = p;
+            each.push((why, all));
+        };
+        let park = format!("{:02}", Row::Park.index());
+        put(
+            "the park, no call",
+            2,
+            place(&park, 7_100_000_000, 40_000_000),
+        );
+        put(
+            "a row past the last",
+            2,
+            place("30", 7_100_000_000, 40_000_000),
+        );
+        put(
+            "a row not in digits",
+            2,
+            place("0x", 7_100_000_000, 40_000_000),
+        );
+        put(
+            "a call under 1.05 ms",
+            2,
+            place("06", 7_100_000_000, (1 << 20) - 1),
+        );
+        put(
+            "a call that ends before the one before it",
+            2,
+            place("06", 7_000_000_000, 20_000_000),
+        );
+        put("a call after an empty place", 4, places[2].clone());
+        put("an empty place with a span", 3, place("--", 0, 1));
+        put(
+            "a start not in hex",
+            2,
+            format!("06{}+{:016x}", "00000001a2b3c4dz", 40_000_000),
+        );
+        put("a place with no length", 2, places[2].replace('+', ""));
+        let mut short = places.clone();
+        short.pop();
+        each.push(("a short ring", short));
+        let mut long = places.clone();
+        long.push(places[CALLS_KEPT - 1].clone());
+        each.push(("a long ring", long));
+        for (why, all) in each {
+            assert!(Tally::parse(&with(count, &all)).is_err(), "{why}");
+        }
+        for other in ["00000000000000000002", "00000000000000000004"] {
+            assert!(
+                Tally::parse(&with(other, &places)).is_err(),
+                "a count of {other} with three kept"
+            );
+        }
     }
 
     /// NEGATIVE CONTROL: a line whose checksum was corrupted is refused, and so
@@ -936,14 +1724,14 @@ mod tests {
         );
         for bad in [
             "",
-            "wait-tally v=4\n",
+            "wait-tally v=7\n",
             &old[..old.len() - 1],
-            &old.replace("wait-tally v=4", "wait-tally v=3"),
+            &old.replace("wait-tally v=7", "wait-tally v=6"),
             &old.replace(" sum=", " sum=0"),
         ] {
             assert!(Tally::parse(bad).is_err(), "{bad:?}");
         }
-        for body in ["wait-tally v=4 rows=030 pid=1 requests=1".to_string(), {
+        for body in ["wait-tally v=7 rows=030 pid=1 requests=1".to_string(), {
             let (body, _) = old.trim_end().rsplit_once(" sum=").expect("a sum");
             body.rsplit_once('.').expect("a band").0.to_string()
         }] {
@@ -1010,6 +1798,223 @@ mod tests {
             .since(&earlier)
             .unwrap_err()
             .contains("`full` flushes"));
+
+        // EVERY SLOW CALL THE WINDOW MADE IS THE WINDOW'S, the slowest of its row or not: the
+        // 90 ms ack above and a 2 ms delivery under the 40 ms one before the window are both
+        // in the difference, and none of the calls the earlier write kept is. The flush times
+        // subtract, the slow count with them, and the flush ring is the later write's whole.
+        later.calls.push(call(Row::Ack, 7_400_000_000, 90_000_000));
+        later.rows[Row::LaneDeliver.index()].add(2_000_000, Unit::Ns);
+        later
+            .calls
+            .push(call(Row::LaneDeliver, 7_600_000_000, 2_000_000));
+        later.times.full_ns += 9_000_000;
+        later.times.slow_count += 1;
+        later.times.running = 2;
+        later.times.slow[2] = Some(slow(
+            2,
+            astream_sys::FlushKind::Full,
+            7_500_000_100,
+            7_509_000_000,
+        ));
+        let d = later.since(&earlier).expect("one process");
+        assert_eq!(
+            d.row(Row::LaneDeliver).max,
+            0,
+            "its largest not the window's"
+        );
+        assert_eq!(
+            (d.calls.count, d.calls.iter().collect::<Vec<_>>()),
+            (
+                2,
+                vec![
+                    call(Row::Ack, 7_400_000_000, 90_000_000),
+                    call(Row::LaneDeliver, 7_600_000_000, 2_000_000)
+                ]
+            ),
+            "the window's slow calls, the one under its row's earlier largest included"
+        );
+        assert_eq!(
+            d.calls.count,
+            Row::ALL
+                .iter()
+                .filter(|r| r.is_call())
+                .map(|&r| d.row(r).at_least(SLOW_CALL_BAND))
+                .sum::<u64>(),
+            "as many as its call rows counted from 1.05 ms up"
+        );
+        assert_eq!(
+            (d.times.full_ns, d.times.barrier_ns, d.times.slow_count),
+            (9_000_000, 0, 1)
+        );
+        assert_eq!(d.times.slow, later.times.slow, "the later ring, whole");
+        assert_eq!(
+            d.times.running, 2,
+            "the later write's calls running, not a difference"
+        );
+        assert!(
+            later
+                .since(&later)
+                .is_ok_and(|d| d.calls.count == 0 && d.calls.is_empty()),
+            "no window, no calls"
+        );
+        let mut times_back = later;
+        times_back.times.full_ns = 0;
+        assert!(times_back
+            .since(&earlier)
+            .unwrap_err()
+            .contains("full flush time"));
+        let calls_back = Tally {
+            calls: SlowCalls::default(),
+            ..later
+        };
+        assert!(calls_back
+            .since(&earlier)
+            .unwrap_err()
+            .contains("slow call count"));
+
+        // A WINDOW OF MORE SLOW CALLS THAN A LINE KEEPS counts them all and keeps the last ones.
+        let mut busy = earlier;
+        for i in 0..CALLS_KEPT as u64 + 2 {
+            busy.calls.push(call(
+                Row::DirAppend,
+                8_000_000_000 + i * 3_000_000,
+                2_000_000,
+            ));
+        }
+        let d = busy.since(&earlier).expect("one process");
+        assert_eq!(
+            (d.calls.count, d.calls.len()),
+            (CALLS_KEPT as u64 + 2, CALLS_KEPT)
+        );
+        assert_eq!(
+            d.calls.iter().next().map(|c| c.start_ns),
+            Some(8_000_000_000 + 2 * 3_000_000),
+            "the window's first two left the ring"
+        );
+    }
+
+    /// TWO SOURCES MERGE BY END: the recorder's own calls and the state dir's, each in the order
+    /// it ended, merge into one ring in end order, the recorder's first on a tie, both counts
+    /// summed, and a merge past the ring keeps the last [`CALLS_KEPT`] of both.
+    #[test]
+    fn two_sources_of_slow_calls_merge_by_their_ends() {
+        let of = |calls: &[SlowCall]| {
+            let mut out = SlowCalls::default();
+            for &c in calls {
+                out.push(c);
+            }
+            out
+        };
+        let own = of(&[
+            call(Row::Ack, 100, 2_000_000),
+            call(Row::Commit, 100, 2_000_000),
+            call(Row::Request, 5_000_000, 3_000_000),
+        ]);
+        let dir = of(&[
+            call(Row::DirAppend, 0, 2_000_100),
+            call(Row::LogpinFence, 1_000_000, 1_100_000),
+        ]);
+        let m = own.merged(&dir);
+        assert_eq!(m.count, 5);
+        assert_eq!(
+            m.iter().map(|c| c.row).collect::<Vec<_>>(),
+            [
+                Row::Ack,
+                Row::Commit,
+                Row::DirAppend,
+                Row::LogpinFence,
+                Row::Request
+            ],
+            "{m:?}"
+        );
+        assert_eq!(dir.merged(&own).count, 5);
+        let many = of(&(0..CALLS_KEPT as u64)
+            .map(|i| call(Row::DirAppend, i * 10_000_000, 2_000_000))
+            .collect::<Vec<_>>());
+        let m = many.merged(&own);
+        assert_eq!((m.count, m.len()), (CALLS_KEPT as u64 + 3, CALLS_KEPT));
+        assert_eq!(
+            m.iter().last(),
+            many.iter().last(),
+            "the last to end is the last kept"
+        );
+        assert!(
+            m.iter().all(|c| c.row != Row::Ack),
+            "the earliest ends left the ring"
+        );
+    }
+
+    /// EVERY SLOW CALL IS KEPT WITH ITS START ON THE FLUSH CLOCK: a call of 1.05 ms or more is
+    /// kept, its start inside the clock readings taken around it less its length, whether or
+    /// not it is its row's slowest; a faster one, the park and a count row are not. An ack that
+    /// commits is one span in two rows, with one start. The write carries the recorder's calls
+    /// merged with the state dir's and the process's flush times, a flush ring that holds every
+    /// slow flush this test made (read after the write) among its last ones.
+    #[test]
+    fn every_slow_call_is_kept_with_its_start_on_the_flush_clock() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let path = dir.path().join(FILE);
+        let mut on = Recorder::at(&path).expect("open");
+        let slow_ns = Hist::floor(SLOW_CALL_BAND, Unit::Ns);
+        assert_eq!(slow_ns, 1 << 20, "1.05 ms");
+        let before = astream_sys::clock_ns();
+        on.span(Row::LaneSent, 3 * slow_ns);
+        let after = astream_sys::clock_ns();
+        let first = on.calls.iter().next().expect("kept");
+        assert_eq!((first.row, first.ns), (Row::LaneSent, 3 * slow_ns));
+        assert!(
+            (before - 3 * slow_ns..=after - 3 * slow_ns).contains(&first.start_ns),
+            "{first:?} does not start its length before a reading in {before}..={after}"
+        );
+        on.span(Row::LaneSent, slow_ns);
+        on.span(Row::LaneSent, slow_ns - 1);
+        let ago = |ms| Instant::now().checked_sub(Duration::from_millis(ms));
+        on.note(Row::Park, ago(5));
+        on.count(Row::DrainPosts, 3);
+        assert_eq!(
+            on.calls.iter().map(|c| (c.row, c.ns)).collect::<Vec<_>>(),
+            [(Row::LaneSent, 3 * slow_ns), (Row::LaneSent, slow_ns)],
+            "the second, under the row's largest, kept; the faster one, the park and the count not"
+        );
+        on.ack(ago(2), true);
+        let (ack, commit) = (
+            on.calls.kept[2].expect("the ack"),
+            on.calls.kept[3].expect("the commit"),
+        );
+        assert_eq!(
+            (ack.row, commit.row, ack.start_ns, ack.ns),
+            (Row::Ack, Row::Commit, commit.start_ns, commit.ns),
+            "one span"
+        );
+        let kept = Kept::default();
+        kept.turn_on(true);
+        let opened = astream_sys::clock_ns();
+        kept.note(Row::AppendSelfAcked, 2 * slow_ns);
+        let closed = astream_sys::clock_ns();
+        kept.note(Row::DirAppend, 5_000);
+        on.idle(3, |t| kept.copy_into(t));
+        let written = Tally::parse(&std::fs::read_to_string(&path).expect("read")).expect("a line");
+        assert_eq!(written.calls.count, 5);
+        let dir_call = written
+            .calls
+            .iter()
+            .find(|c| c.row == Row::AppendSelfAcked)
+            .expect("the state dir's slow call");
+        assert!(
+            (opened - 2 * slow_ns..=closed - 2 * slow_ns).contains(&dir_call.start_ns),
+            "the kept row's start: {written:?}"
+        );
+        assert_eq!(written.calls.iter().last(), Some(dir_call), "it ended last");
+        let times = astream_sys::flush_times();
+        assert!(
+            written.times.full_ns <= times.full_ns && written.times.slow_count <= times.slow_count
+        );
+        assert!(
+            written.times.slow().all(|f| times.slow.contains(&f)
+                || times.slow.first().is_some_and(|g| f.start_ns <= g.start_ns)),
+            "the written ring is the process's: {written:?}"
+        );
     }
 
     /// THE PARTITION: the rows the loop is in one at a time, and only those,

@@ -3,6 +3,7 @@
 
 //! Process-wide reaper of children nobody else waits for.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -28,6 +29,7 @@ const WNOHANG: i32 = 1;
 
 /// Wait off-thread for a child until `settled` returns `true`.
 /// Polls must not block. Polling and releasing a finished callback hold no ledger lock.
+/// A panicking poll retains its callback for retry; only a returned `true` releases it.
 pub fn hand_off(settled: impl FnMut() -> bool + Send + 'static) {
     let settled: Settled = Box::new(settled);
     let mut ledger = LEDGER
@@ -70,25 +72,51 @@ fn run() {
     }
 }
 
+/// A panic payload can itself panic when dropped. Contain that destructor too; retain
+/// its replacement payload rather than let another destructor unwind pending custody.
+fn discard_panic(payload: Box<dyn std::any::Any + Send>) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        std::mem::forget(payload);
+    }
+}
+
 /// Poll and release one batch outside the metadata lock. If work remains, return whether
 /// any waiter settled; otherwise mark this worker stopped and return `None`.
 fn reap_ready(ledger: &Mutex<Ledger>) -> Option<bool> {
-    let mut waiting = {
+    let waiting = {
         let mut ledger = ledger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut ledger.waiting)
     };
-    let before = waiting.len();
-    waiting.retain_mut(|settled| !settled());
-    let progressed = waiting.len() < before;
+    let mut pending = Vec::with_capacity(waiting.len());
+    let mut progressed = false;
+    for mut settled in waiting {
+        match catch_unwind(AssertUnwindSafe(&mut settled)) {
+            Ok(true) => {
+                progressed = true;
+                // Only this positively settled callback moves into the unwind boundary.
+                // A destructor cannot unwind the other callbacks or the reaper worker.
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(settled))) {
+                    discard_panic(payload);
+                }
+            }
+            Ok(false) => pending.push(settled),
+            Err(payload) => {
+                // A panic supplies no settlement evidence. Keep this same callback,
+                // including its child and guards, in its original queue position.
+                pending.push(settled);
+                discard_panic(payload);
+            }
+        }
+    }
     let pending = {
         let mut ledger = ledger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Keep older unfinished waiters before arrivals queued during this pass.
-        waiting.append(&mut ledger.waiting);
-        std::mem::swap(&mut waiting, &mut ledger.waiting);
+        pending.append(&mut ledger.waiting);
+        std::mem::swap(&mut pending, &mut ledger.waiting);
         if ledger.waiting.is_empty() {
             ledger.running = false;
             false
@@ -110,6 +138,78 @@ mod tests {
             waiting: Vec::new(),
             running: true,
         }))
+    }
+
+    struct Dropped(Arc<AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    struct PanickingPayload(Arc<AtomicBool>);
+
+    impl Drop for PanickingPayload {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            panic!("injected panic payload destructor");
+        }
+    }
+
+    #[test]
+    fn a_panicking_poll_preserves_pending_custody_and_retries() {
+        let ledger = ledger();
+        let first_dropped = Arc::new(AtomicBool::new(false));
+        let second_dropped = Arc::new(AtomicBool::new(false));
+        let payload_dropped = Arc::new(AtomicBool::new(false));
+        let release_second = Arc::new(AtomicBool::new(false));
+        let first = Dropped(Arc::clone(&first_dropped));
+        let second = Dropped(Arc::clone(&second_dropped));
+        let payload = Arc::clone(&payload_dropped);
+        let release = Arc::clone(&release_second);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first_order = Arc::clone(&order);
+        let second_order = Arc::clone(&order);
+        let mut first_poll = true;
+        let queue = Arc::clone(&ledger);
+        ledger.lock().unwrap().waiting.push(Box::new(move || {
+            let _keep = &first;
+            first_order.lock().unwrap().push("first");
+            assert!(queue.try_lock().is_ok(), "poll holds no ledger lock");
+            if first_poll {
+                first_poll = false;
+                std::panic::panic_any(PanickingPayload(Arc::clone(&payload)));
+            }
+            true
+        }));
+        ledger.lock().unwrap().waiting.push(Box::new(move || {
+            let _keep = &second;
+            second_order.lock().unwrap().push("second");
+            release.load(Ordering::Acquire)
+        }));
+
+        assert_eq!(reap_ready(&ledger), Some(false));
+        assert!(payload_dropped.load(Ordering::Acquire));
+        assert!(!first_dropped.load(Ordering::Acquire));
+        assert!(!second_dropped.load(Ordering::Acquire));
+        assert_eq!(ledger.lock().unwrap().waiting.len(), 2);
+        assert!(ledger.lock().unwrap().running);
+        assert_eq!(*order.lock().unwrap(), ["first", "second"]);
+
+        assert_eq!(reap_ready(&ledger), Some(true));
+        assert!(first_dropped.load(Ordering::Acquire));
+        assert!(!second_dropped.load(Ordering::Acquire));
+        assert_eq!(ledger.lock().unwrap().waiting.len(), 1);
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["first", "second", "first", "second"]
+        );
+
+        release_second.store(true, Ordering::Release);
+        assert_eq!(reap_ready(&ledger), None);
+        assert!(second_dropped.load(Ordering::Acquire));
+        assert!(!ledger.lock().unwrap().running);
     }
 
     #[test]
@@ -156,6 +256,51 @@ mod tests {
                 self.returned.store(true, Ordering::Release);
             }
         }
+    }
+
+    struct PanickingCustody(ReturnCustody);
+
+    impl Drop for PanickingCustody {
+        fn drop(&mut self) {
+            assert!(
+                self.0.ledger.try_lock().is_ok(),
+                "drop holds no ledger lock"
+            );
+            panic!("injected settled callback destructor");
+        }
+    }
+
+    #[test]
+    fn a_panicking_settled_destructor_preserves_pending_and_returned_custody() {
+        let ledger = ledger();
+        let returned = Arc::new(AtomicBool::new(false));
+        let other_dropped = Arc::new(AtomicBool::new(false));
+        let release_other = Arc::new(AtomicBool::new(false));
+        let custody = PanickingCustody(ReturnCustody {
+            ledger: Arc::clone(&ledger),
+            returned: Arc::clone(&returned),
+        });
+        let other = Dropped(Arc::clone(&other_dropped));
+        let release = Arc::clone(&release_other);
+        ledger.lock().unwrap().waiting.push(Box::new(move || {
+            let _keep = &custody;
+            true
+        }));
+        ledger.lock().unwrap().waiting.push(Box::new(move || {
+            let _keep = &other;
+            release.load(Ordering::Acquire)
+        }));
+
+        assert_eq!(reap_ready(&ledger), Some(true));
+        assert!(returned.load(Ordering::Acquire));
+        assert!(!other_dropped.load(Ordering::Acquire));
+        assert_eq!(ledger.lock().unwrap().waiting.len(), 2);
+        assert!(ledger.lock().unwrap().running);
+
+        release_other.store(true, Ordering::Release);
+        assert_eq!(reap_ready(&ledger), None);
+        assert!(other_dropped.load(Ordering::Acquire));
+        assert!(!ledger.lock().unwrap().running);
     }
 
     #[test]

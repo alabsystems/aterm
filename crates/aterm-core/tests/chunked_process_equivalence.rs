@@ -790,3 +790,435 @@ fn random_streams_are_read_boundary_invariant() {
         }
     }
 }
+
+/// `s` with each `..._time_ms: Some(<n>)` written `..._time_ms: _`: a block's and a mark's clock
+/// times are the wall clock's, which no read boundary decides.
+fn untimed(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("_time_ms: Some(") {
+        let head = at + "_time_ms: ".len();
+        out.push_str(&rest[..head]);
+        out.push('_');
+        let tail = &rest[head + "Some(".len()..];
+        rest = tail.find(')').map_or("", |close| &tail[close + 1..]);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `payload` of an OSC 133 app event without its `;row=`/`;col=` coordinates: the host takes them
+/// in the row numbering of its drain, which a later splice or renumbering in one read moves.
+fn uncoordinated(payload: &str) -> String {
+    payload
+        .split(';')
+        .filter(|field| !field.starts_with("row=") && !field.starts_with("col="))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// What the host reads after `chunks`: the grid's [`state`] and replies, the unasked reports
+/// apart from them (a read drains replies before reports, so their interleaving is the reads'),
+/// each kind of report apart from the others,
+/// whether the bell rang,
+/// the app events, the title, the cwd, the colour scheme, the shell's blocks and marks with each
+/// block's text, the program's named marks and annotations, and the history's rows. With
+/// `drain`, the bell and the events are taken after each read, as the host's poll takes them;
+/// without it, once at the end.
+fn host_fold(rows: u16, cols: u16, chunks: &[&[u8]], drain: bool) -> String {
+    let mut t = Terminal::new(rows, cols);
+    let mut host = Host::default();
+    host.attach(&mut t);
+    for ch in chunks {
+        host.read(&mut t, ch, drain);
+    }
+    host.report(&mut t)
+}
+
+/// What a host took from its terminals so far, for [`host_fold`] and [`handed_over_fold`].
+#[derive(Default)]
+struct Host {
+    replies: Vec<u8>,
+    reports: Vec<u8>,
+    rang: bool,
+    events: Vec<(u32, String)>,
+    notified: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Host {
+    /// Wire `t` as the host does: notifications allowed, the callback into this host's list.
+    fn attach(&self, t: &mut Terminal) {
+        t.set_allow_notifications(true);
+        let sink = std::sync::Arc::clone(&self.notified);
+        t.set_notification_callback(move |text| {
+            sink.lock()
+                .expect("the notification sink")
+                .push(text.to_owned());
+        });
+    }
+
+    /// One read of `bytes`: the replies and reports taken after it, the bell and the events too
+    /// with `drain`.
+    fn read(&mut self, t: &mut Terminal, bytes: &[u8], drain: bool) {
+        t.process(bytes);
+        self.reports.extend(t.take_reports().unwrap_or_default());
+        if let Some(r) = t.take_response() {
+            self.replies.extend_from_slice(&r);
+        }
+        if drain {
+            self.take(t);
+        }
+    }
+
+    /// Take the bell and the app events.
+    fn take(&mut self, t: &mut Terminal) {
+        self.rang |= t.drain_bell();
+        while let Some((code, payload)) = t.take_osc_event() {
+            self.events.push((code, uncoordinated(&payload)));
+        }
+    }
+
+    /// Everything the host has read, with what `t` shows now.
+    fn report(&mut self, t: &mut Terminal) -> String {
+        use std::fmt::Write as _;
+        self.take(t);
+        let mut s = state(t, &self.replies);
+        // Each kind of report is its own stream: a DEC 2031 push waits for its stretch's end
+        // while a DEC 2048 size report goes out at once, so how the two interleave is the reads'.
+        let reports = String::from_utf8_lossy(&self.reports).into_owned();
+        let pushed: Vec<_> = reports
+            .match_indices("\x1b[?997;")
+            .map(|(at, _)| &reports[at..at + 9])
+            .collect();
+        let _ = writeln!(
+            s,
+            "2031 pushes={pushed:?} other reports={:?}",
+            reports
+                .replace("\x1b[?997;1n", "")
+                .replace("\x1b[?997;2n", "")
+        );
+        let _ = writeln!(s, "bell={}", self.rang);
+        for (code, payload) in &self.events {
+            let _ = writeln!(s, "event {code} {payload:?}");
+        }
+        let _ = writeln!(
+            s,
+            "title={:?} cwd={:?} scheme={:?}",
+            t.title(),
+            t.current_working_directory(),
+            t.color_scheme()
+        );
+        let _ = writeln!(
+            s,
+            "notified={:?} total={} progress={:?}",
+            self.notified.lock().expect("the notification sink"),
+            t.notify_total(),
+            t.taskbar_progress()
+        );
+        let _ = writeln!(
+            s,
+            "keyboard={:?} cursor={:?} modes={:?}",
+            t.kitty_keyboard_flags(),
+            t.cursor_style(),
+            t.modes()
+        );
+        for block in t.all_blocks() {
+            let _ = writeln!(
+                s,
+                "block {} command={:?} output={:?}",
+                untimed(&format!("{block:?}")),
+                t.block_command_text(block),
+                t.block_output_text(block)
+            );
+        }
+        for mark in t.command_marks() {
+            let _ = writeln!(s, "mark {}", untimed(&format!("{mark:?}")));
+        }
+        let _ = writeln!(s, "named {:?}", t.terminal_marks());
+        let _ = writeln!(s, "notes {:?}", t.annotations());
+        let g = t.grid();
+        for abs in g.oldest_absolute_row()..g.visible_to_absolute(0) {
+            let _ = writeln!(s, "history {abs} {:?}", t.abs_row_text(abs));
+        }
+        s
+    }
+}
+
+/// [`host_fold`] of `head` then `tail` with a seamless handoff between them: the outgoing
+/// terminal reads `head` and the host drains it, the successor is built from its carry
+/// (`restore_checkpoint` onto a fresh terminal, or `from_checkpoint`), the host wires it again,
+/// and it reads `tail`. `None` where the parser holds a sequence no carry can.
+fn handed_over_fold(
+    rows: u16,
+    cols: u16,
+    head: &[u8],
+    tail: &[u8],
+    rebuilt: bool,
+) -> Option<String> {
+    let mut outgoing = Terminal::new(rows, cols);
+    let mut host = Host::default();
+    host.attach(&mut outgoing);
+    host.read(&mut outgoing, head, true);
+    let carry = outgoing.checkpoint_carry(usize::MAX)?;
+    let mut successor = if rebuilt {
+        Terminal::from_checkpoint(&carry)
+    } else {
+        let mut fresh = Terminal::new(rows, cols);
+        fresh.restore_checkpoint(&carry);
+        fresh
+    };
+    host.attach(&mut successor);
+    host.read(&mut successor, tail, true);
+    Some(host.report(&mut successor))
+}
+
+/// Panic with the first line `other` differs from `whole` at, unless they agree.
+fn assert_same_reads(whole: &str, other: &str, what: &str) {
+    if whole == other {
+        return;
+    }
+    let (a, b): (Vec<_>, Vec<_>) = (whole.lines().collect(), other.lines().collect());
+    let at = a
+        .iter()
+        .zip(&b)
+        .position(|(x, y)| x != y)
+        .unwrap_or(a.len().min(b.len()));
+    panic!(
+        "{what}: the reads differ at line {at}:\n  one read: {:?}\n  this:     {:?}",
+        a.get(at),
+        b.get(at)
+    );
+}
+
+/// A seeded xorshift draw: `next(n)` is in `0..n`.
+fn xorshift(seed: u64) -> impl FnMut(usize) -> usize {
+    let mut state_word = seed;
+    move |n: usize| {
+        state_word ^= state_word << 13;
+        state_word ^= state_word >> 7;
+        state_word ^= state_word << 17;
+        usize::try_from(state_word % n as u64).unwrap_or(0)
+    }
+}
+
+/// The control tokens of [`host_stream`].
+const HOST_TOKENS: &[&str] = &[
+    "\x1bc",
+    "\x1b[!p",
+    "\x07",
+    "\x1b]0;one\x07",
+    "\x1b]2;two\x1b\\",
+    "\x1b]7;file://h/tmp/a\x07",
+    "\x1b]7;file://h/var\x1b\\",
+    "\x1b]52;c;aGk=\x07",
+    "\x1b]133;A\x07",
+    "\x1b]133;B\x07",
+    "\x1b]133;C\x07",
+    "\x1b]133;D;0\x07",
+    "\x1b]133;D;2\x07",
+    "\x1b]1337;SetMark\x07",
+    "\x1b[2J",
+    "\x1b[3J",
+    "\x1b[H",
+    "\x1b[2S",
+    "\x1b[?1049h",
+    "\x1b[?1049l",
+    "\x1b[?2026h",
+    "\x1b[?2026l",
+    "\x1b[?2031h",
+    "\x1b[?2031l",
+    "\x1b[?996n",
+    "\x1b[?2048h",
+    "\x1b[?2048l",
+    "\x1b[?1000;2031;2004s",
+    "\x1b[?1000;2031;2004r",
+    "\x1b[?1000h",
+    "\x1b[?1006h",
+    "\x1b[?1000l",
+    "\x1b[?2004h",
+    "\x1b[?2004l",
+    "\x1b[?1004h",
+    "\x1b[?25l",
+    "\x1b[?25h",
+    "\x1b[5 q",
+    "\x1b[0 q",
+    "\x1b[22;0t",
+    "\x1b[23;0t",
+    "\x1b[>1u",
+    "\x1b[<u",
+    "\x1b[=5;1u",
+    "\x1b]9;hello\x07",
+    "\x1b]777;notify;t;b\x07",
+    "\x1b]9;4;1;50\x07",
+    "\x1b]9;4;0\x07",
+    "\x1b]1337;SetUserVar=foo=YmFy\x07",
+    "\x1b[c",
+    "\x1b[>c",
+    "\x1b[6n",
+    "\x1b[?2026$p",
+    "\x1b]10;?\x07",
+    "\x1b]4;1;?\x07",
+    "\x1b7",
+    "\x1b8",
+    "\x1b[2;5r",
+    "\x1b[1;3r",
+    "\x1b[3H",
+    "\x1b[r",
+    "\x1b[1;31m",
+    "\x1b[0m",
+    "\x1b]11;#ffffff\x07",
+    "\x1b]11;#000000\x07",
+    "\x1b]111\x07",
+    "\r\n",
+    "\r\n\r\n\r\n\r\n",
+    "\n",
+];
+
+/// The text of [`host_stream`].
+const HOST_TEXT: &[&str] = &[
+    "a",
+    "$ ",
+    "ls -l",
+    "out",
+    "\u{4E2D}\u{6587}",
+    "abcdefghijklmnop",
+];
+
+/// One random stream of [`HOST_TOKENS`] among [`HOST_TEXT`], drawn by `next`.
+fn host_stream(next: &mut impl FnMut(usize) -> usize) -> Vec<u8> {
+    let mut input = Vec::new();
+    let (mut moved_scheme, mut alt) = (false, false);
+    for _ in 0..4 + next(24) {
+        let token = HOST_TOKENS[next(HOST_TOKENS.len())];
+        // One background change a stream: a DEC 2031 push coalesces the changes one stretch
+        // of output makes (light then dark again pushes nothing), wherever the reads end.
+        let moves_scheme = token.starts_with("\x1b]11");
+        // No prompt on the alternate screen: it proves the app dead and drops the reports
+        // still queued (a 2031 push, a 2048 size report), which a read that ended earlier had
+        // already sent.
+        let proves_dead = token == "\x1b]133;A\x07" && alt;
+        if next(10) < 5 && !(moves_scheme && moved_scheme) && !proves_dead {
+            moved_scheme |= moves_scheme;
+            match token {
+                "\x1b[?1049h" => alt = true,
+                "\x1b[?1049l" | "\x1bc" => alt = false,
+                _ => {}
+            }
+            input.extend_from_slice(token.as_bytes());
+        } else {
+            input.extend_from_slice(HOST_TEXT[next(HOST_TEXT.len())].as_bytes());
+        }
+    }
+    input
+}
+
+/// What the host reads does not depend on where the program's output was cut into reads, whether
+/// the host drains the bell and the events between them or not. A reset (RIS, DECSTR) is the
+/// program's: it lands the same at the head of a read as in its middle, and leaves the bell, the
+/// undrained events and the shell's state it does not own as a drain before it would have.
+/// Seeded over shell marks, resets, erases, region scrolls, screen switches, titles, cwds,
+/// clipboard writes, background changes, DEC 2031, DSR 996 and bells among text and newlines
+/// that scroll the history.
+/// NEGATIVE CONTROL: with `TransientState::reset` clearing `bell_pending` again, `` drained true ``
+/// fails on a case whose BEL precedes a RIS in one read; with the `?2031` arm not settling the
+/// scheme, a case whose background change precedes its `?2031h` in one read fails.
+#[test]
+fn random_streams_leave_the_host_the_same_reads_at_any_read_boundary() {
+    let mut next = xorshift(0x2545_F491_4F6C_DD1D);
+    for case in 0..3000 {
+        let input = host_stream(&mut next);
+        let shown = String::from_utf8_lossy(&input).escape_debug().to_string();
+        let whole = host_fold(6, 12, &[&input], false);
+        let bytes: Vec<&[u8]> = input.chunks(1).collect();
+        for drain in [false, true] {
+            assert_same_reads(
+                &whole,
+                &host_fold(6, 12, &bytes, drain),
+                &format!("case {case}: {shown} one byte at a time, drained {drain}"),
+            );
+        }
+        for _ in 0..3 {
+            let cut = next(input.len() + 1);
+            let (a, b) = input.split_at(cut);
+            for drain in [false, true] {
+                assert_same_reads(
+                    &whole,
+                    &host_fold(6, 12, &[a, b], drain),
+                    &format!("case {case}: {shown} cut at {cut}, drained {drain}"),
+                );
+            }
+        }
+    }
+}
+
+/// `reads` as a carry keeps them. A visible row's `len=` is dropped, and its text's and each
+/// history row's trailing blanks are trimmed: a carry keeps a row the next row continues (a soft
+/// wrap) at its share of the logical line, blanks included (`Row::continued_len`), so an erased
+/// row a wide character wrapped off comes back written with blanks; the logical line, which
+/// reflow and copy read, is the same. The notification count is the engine's: a successor counts
+/// from 0, and `aterm-gui`'s session log re-bases on a decrease (`session_log_observed`).
+fn as_carried(reads: &str) -> String {
+    reads
+        .lines()
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix("history ") {
+                let (abs, text) = rest.split_once(' ').unwrap_or((rest, ""));
+                let text = text
+                    .strip_prefix("Some(\"")
+                    .and_then(|t| t.strip_suffix("\")"))
+                    .map_or_else(|| text.to_owned(), |t| t.trim_end_matches(' ').to_owned());
+                return format!("history {abs} {text:?}");
+            }
+            if let Some((head, tail)) = line.split_once(" total=") {
+                let rest = tail.split_once(' ').map_or("", |(_, rest)| rest);
+                return format!("{head} total=_ {rest}");
+            }
+            let Some(rest) = line.strip_prefix("row ") else {
+                return line.to_owned();
+            };
+            let (row, rest) = rest.split_once(" len=").unwrap_or((rest, ""));
+            let text = rest.split_once(" text=").map_or("", |(_, text)| text);
+            let text = text
+                .strip_prefix("Some(\"")
+                .and_then(|t| t.strip_suffix("\")"))
+                .map_or_else(|| text.to_owned(), |t| t.trim_end_matches(' ').to_owned());
+            format!("row {row} text={text:?}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A seamless handoff is one more read boundary: a successor built from the outgoing terminal's
+/// carry, after the host drained it, leaves the host the reads one terminal would have, whether
+/// it is restored onto a fresh terminal or rebuilt from the carry, rows read as their logical
+/// line's share ([`as_carried`]), on the main screen or the alternate one (whose carry holds the
+/// saved primary's history).
+#[test]
+fn a_handoff_between_reads_leaves_the_host_the_same_reads() {
+    let mut next = xorshift(0x5DEE_CE66_D1CE_4E5B);
+    let mut carried = 0_usize;
+    for case in 0..1500 {
+        let input = host_stream(&mut next);
+        let shown = String::from_utf8_lossy(&input).escape_debug().to_string();
+        let whole = as_carried(&host_fold(6, 12, &[&input], false));
+        for _ in 0..2 {
+            let cut = next(input.len() + 1);
+            let (head, tail) = input.split_at(cut);
+            for rebuilt in [false, true] {
+                let Some(after) = handed_over_fold(6, 12, head, tail, rebuilt) else {
+                    continue;
+                };
+                carried += 1;
+                assert_same_reads(
+                    &whole,
+                    &as_carried(&after),
+                    &format!("case {case}: {shown} handed over at {cut}, rebuilt {rebuilt}"),
+                );
+            }
+        }
+    }
+    assert!(
+        carried > 4000,
+        "PRECONDITION: most cuts carry ({carried} of 6000)"
+    );
+}

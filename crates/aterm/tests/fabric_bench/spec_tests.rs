@@ -4,13 +4,19 @@
 //! The fabric measurement's grammar ([`crate::spec`]), checked; mounted only by the ordinary
 //! fabric_bench test target.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::spec::*;
 
 #[test]
+fn an_output_path_is_required_separately_from_the_knobs() {
+    assert!(parse("", Path::new("")).is_err());
+    assert!(parse("out=/retired", Path::new("/typed-output")).is_err());
+}
+
+#[test]
 fn the_defaults_fill_what_the_words_leave_out() {
-    let spec = parse("out=/tmp/x").expect("parses");
+    let spec = parse("", Path::new("/tmp/x")).expect("parses");
     assert_eq!(spec.out, PathBuf::from("/tmp/x"));
     assert_eq!(spec.scenario, Scenario::All);
     assert!(
@@ -18,7 +24,7 @@ fn the_defaults_fill_what_the_words_leave_out() {
         "default words stay compatible"
     );
     assert_eq!(
-        parse("out=/tmp/x scenario=all").expect("explicit all"),
+        parse("scenario=all", Path::new("/tmp/x")).expect("explicit all"),
         spec
     );
     assert_eq!(spec.samples, DEFAULT_SAMPLES);
@@ -37,14 +43,17 @@ fn the_defaults_fill_what_the_words_leave_out() {
         "what ships: the default rules at every open, the auto mirror, astream's minute"
     );
     assert!(spec.at_rest, "what ships: a fabric root's log is sealed");
-    let again = parse(&format!("out=/tmp/x {}", spec.words())).expect("round trip");
+    let again = parse(&spec.words(), Path::new("/tmp/x")).expect("round trip");
     assert_eq!(again, spec);
 }
 
 #[test]
 fn every_knob_is_read_and_a_bad_word_is_refused() {
-    let spec =
-        parse("out=/o samples=7 warmup=0 burst=101 pingpong=9 attach=2,4 rounds=1").expect("ok");
+    let spec = parse(
+        "samples=7 warmup=0 burst=101 pingpong=9 attach=2,4 rounds=1",
+        Path::new("/tmp/x"),
+    )
+    .expect("ok");
     assert_eq!(
         (
             spec.samples,
@@ -65,33 +74,32 @@ fn every_knob_is_read_and_a_bad_word_is_refused() {
         Scenario::Ask,
     ] {
         let word = scenario.word();
-        let spec = parse(&format!("out=/o scenario={word}")).expect(word);
+        let spec = parse(&format!("scenario={word}"), Path::new("/tmp/x")).expect(word);
         assert_eq!(spec.scenario, scenario);
         assert!(spec.words().contains(&format!(" scenario={word} ")));
         assert_eq!(
-            parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+            parse(&spec.words(), Path::new("/tmp/x")).expect("round trip"),
             spec
         );
     }
     for bad in [
-        "samples=5",
-        "out=/o samples=0",
-        "out=/o burst=x",
-        "out=/o pingpong=0",
-        "out=/o pingpong=-1",
-        "out=/o attach=8,1",
-        "out=/o attach=1,1",
-        "out=/o attach=1,999",
-        "out=/o burst=999999",
-        "out=/o speed=11",
-        "out=/o samples",
+        "samples=0",
+        "burst=x",
+        "pingpong=0",
+        "pingpong=-1",
+        "attach=8,1",
+        "attach=1,1",
+        "attach=1,999",
+        "burst=999999",
+        "speed=11",
+        "samples",
         "out=",
-        "out=/o scenario=",
-        "out=/o scenario=Pingpong",
-        "out=/o scenario=pingpong,attach",
-        "out=/o scenario=unknown",
+        "scenario=",
+        "scenario=Pingpong",
+        "scenario=pingpong,attach",
+        "scenario=unknown",
     ] {
-        assert!(parse(bad).is_err(), "{bad}");
+        assert!(parse(bad, Path::new("/tmp/x")).is_err(), "{bad}");
     }
 }
 
@@ -104,7 +112,7 @@ fn retention_the_mirror_and_the_tick_are_named_and_reproduce() {
         ("retention=off log=off", false, Log::Off, None),
         ("retention_interval_ms=1000", true, Log::Auto, Some(1000)),
     ] {
-        let spec = parse(&format!("out=/o {words}")).expect(words);
+        let spec = parse(words, Path::new("/tmp/x")).expect(words);
         assert_eq!(
             (spec.retention, spec.log, spec.retention_interval_ms),
             (retention, log, every),
@@ -120,7 +128,7 @@ fn retention_the_mirror_and_the_tick_are_named_and_reproduce() {
             "{said}"
         );
         assert_eq!(
-            parse(&format!("out=/o {said}")).expect("round trip"),
+            parse(&said, Path::new("/tmp/x")).expect("round trip"),
             spec,
             "{said}"
         );
@@ -134,7 +142,7 @@ fn retention_the_mirror_and_the_tick_are_named_and_reproduce() {
         "retention_interval_ms=soon",
         "retention=off retention_interval_ms=1000",
     ] {
-        let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+        let err = parse(bad, Path::new("/tmp/x")).expect_err(bad);
         assert!(
             err.contains("retention") || err.contains("log="),
             "{bad}: {err}"
@@ -145,15 +153,15 @@ fn retention_the_mirror_and_the_tick_are_named_and_reproduce() {
 #[test]
 fn the_durability_word_names_the_tier_and_nothing_else() {
     for (word, tier) in [("strict", Tier::Strict), ("relaxed", Tier::Relaxed)] {
-        let spec = parse(&format!("out=/o durability={word}")).expect(word);
+        let spec = parse(&format!("durability={word}"), Path::new("/tmp/x")).expect(word);
         assert_eq!(spec.durability, tier, "{word}");
         assert_eq!(spec.horizon_ms, None, "{word}: no horizon");
         assert_eq!(tier.word(), word);
         assert!(spec.words().ends_with(&format!(" durability={word}")));
-        let again = parse(&format!("out=/o {}", spec.words())).expect("round trip");
+        let again = parse(&spec.words(), Path::new("/tmp/x")).expect("round trip");
         assert_eq!(again, spec);
     }
-    let ordered = parse("out=/o durability=ordered").expect("ordered");
+    let ordered = parse("durability=ordered", Path::new("/tmp/x")).expect("ordered");
     assert_eq!(
         (ordered.durability, ordered.horizon_ms),
         (Tier::Ordered, Some(ORDERED_HORIZON_MS))
@@ -161,26 +169,26 @@ fn the_durability_word_names_the_tier_and_nothing_else() {
     assert!(ordered.words().ends_with(&format!(
         " durability=ordered horizon_ms={ORDERED_HORIZON_MS}"
     )));
-    let fast = parse("out=/o durability=ordered horizon_ms=1000").expect("1 s");
+    let fast = parse("durability=ordered horizon_ms=1000", Path::new("/tmp/x")).expect("1 s");
     assert_eq!(fast.horizon_ms, Some(1000));
     assert_eq!(
-        parse(&format!("out=/o {}", fast.words())).expect("round trip"),
+        parse(&fast.words(), Path::new("/tmp/x")).expect("round trip"),
         fast
     );
     for bad in [
         "durability=strict horizon_ms=100",
         "durability=relaxed horizon_ms=100",
     ] {
-        let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+        let err = parse(bad, Path::new("/tmp/x")).expect_err(bad);
         assert!(err.contains("horizon_ms="), "{bad}: {err}");
     }
     assert_eq!(
-        parse("out=/o horizon_ms=1000")
+        parse("horizon_ms=1000", Path::new("/tmp/x"))
             .expect("the default arm's")
             .horizon_ms,
         Some(1000)
     );
-    assert!(parse("out=/o durability=ordered horizon_ms=soon").is_err());
+    assert!(parse("durability=ordered horizon_ms=soon", Path::new("/tmp/x")).is_err());
     for bad in [
         "Strict",
         "RELAXED",
@@ -189,7 +197,7 @@ fn the_durability_word_names_the_tier_and_nothing_else() {
         "",
         "relaxed,strict",
     ] {
-        let err = parse(&format!("out=/o durability={bad}")).expect_err(bad);
+        let err = parse(&format!("durability={bad}"), Path::new("/tmp/x")).expect_err(bad);
         assert!(err.contains("durability="), "{bad}: {err}");
     }
 }
@@ -198,7 +206,7 @@ fn the_durability_word_names_the_tier_and_nothing_else() {
 /// the ping-pong arm's paced rounds.
 #[test]
 fn the_bystanders_and_the_paced_rounds_are_named_and_reproduce() {
-    let bare = parse("out=/o").expect("bare");
+    let bare = parse("", Path::new("/tmp/x")).expect("bare");
     assert_eq!((bare.bystanders, bare.paced), (0, DEFAULT_PACED));
     assert!(
         bare.words()
@@ -211,14 +219,14 @@ fn the_bystanders_and_the_paced_rounds_are_named_and_reproduce() {
         ("bystanders=16 paced=0", 16, 0),
         ("paced=10", 0, 10),
     ] {
-        let spec = parse(&format!("out=/o {words}")).expect(words);
+        let spec = parse(words, Path::new("/tmp/x")).expect(words);
         assert_eq!(
             (spec.bystanders, spec.paced),
             (bystanders, paced),
             "{words}"
         );
         assert_eq!(
-            parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+            parse(&spec.words(), Path::new("/tmp/x")).expect("round trip"),
             spec,
             "{words}"
         );
@@ -229,7 +237,7 @@ fn the_bystanders_and_the_paced_rounds_are_named_and_reproduce() {
         "paced=many",
         "bystanders=999",
     ] {
-        assert!(parse(&format!("out=/o {bad}")).is_err(), "{bad}");
+        assert!(parse(bad, Path::new("/tmp/x")).is_err(), "{bad}");
     }
 }
 
@@ -237,7 +245,7 @@ fn the_bystanders_and_the_paced_rounds_are_named_and_reproduce() {
 /// escalated mix puts a person-lane post before an ordinary message.
 #[test]
 fn the_asks_and_the_mix_are_named_and_reproduce() {
-    let bare = parse("out=/o").expect("bare");
+    let bare = parse("", Path::new("/tmp/x")).expect("bare");
     assert_eq!(
         (bare.asks, bare.mix_every),
         (DEFAULT_ASKS, DEFAULT_MIX_EVERY)
@@ -254,16 +262,16 @@ fn the_asks_and_the_mix_are_named_and_reproduce() {
         ("mix_every=1", DEFAULT_ASKS, 1),
         ("scenario=ask asks=7 mix_every=3", 7, 3),
     ] {
-        let spec = parse(&format!("out=/o {words}")).expect(words);
+        let spec = parse(words, Path::new("/tmp/x")).expect(words);
         assert_eq!((spec.asks, spec.mix_every), (asks, mix_every), "{words}");
         assert_eq!(
-            parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+            parse(&spec.words(), Path::new("/tmp/x")).expect("round trip"),
             spec,
             "{words}"
         );
     }
     for bad in ["asks=0", "asks=x", "mix_every=0", "mix_every=-2"] {
-        let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+        let err = parse(bad, Path::new("/tmp/x")).expect_err(bad);
         assert!(err.contains("positive"), "{bad}: {err}");
     }
 }
@@ -272,7 +280,7 @@ fn the_asks_and_the_mix_are_named_and_reproduce() {
 /// so every entry without it keeps its words.
 #[test]
 fn the_attach_backlog_is_named_only_when_set_and_reproduces() {
-    let bare = parse("out=/o").expect("bare");
+    let bare = parse("", Path::new("/tmp/x")).expect("bare");
     assert_eq!(bare.backlog, 0);
     assert!(!bare.words().contains("backlog"), "{}", bare.words());
     for (words, backlog) in [
@@ -281,7 +289,7 @@ fn the_attach_backlog_is_named_only_when_set_and_reproduces() {
         ("scenario=attach attach=8,32 backlog=500000", 500_000),
         (&*format!("backlog={}", backlog_max(3)), backlog_max(3)),
     ] {
-        let spec = parse(&format!("out=/o {words}")).expect(words);
+        let spec = parse(words, Path::new("/tmp/x")).expect(words);
         assert_eq!(spec.backlog, backlog, "{words}");
         assert_eq!(
             spec.words().contains(&format!(" backlog={backlog}")),
@@ -289,7 +297,7 @@ fn the_attach_backlog_is_named_only_when_set_and_reproduces() {
             "{words}"
         );
         assert_eq!(
-            parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+            parse(&spec.words(), Path::new("/tmp/x")).expect("round trip"),
             spec,
             "{words}"
         );
@@ -303,7 +311,7 @@ fn the_attach_backlog_is_named_only_when_set_and_reproduces() {
         "scenario=pingpong backlog=10",
         "scenario=handoff backlog=10",
     ] {
-        let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+        let err = parse(bad, Path::new("/tmp/x")).expect_err(bad);
         assert!(err.contains("backlog="), "{bad}: {err}");
     }
 }
@@ -312,7 +320,7 @@ fn the_attach_backlog_is_named_only_when_set_and_reproduces() {
 /// is there, so every entry without it keeps its words.
 #[test]
 fn the_asked_prefill_is_named_only_when_set_and_reproduces() {
-    let bare = parse("out=/o").expect("bare");
+    let bare = parse("", Path::new("/tmp/x")).expect("bare");
     assert_eq!(bare.asked_prefill, 0);
     assert!(!bare.words().contains("asked_prefill"), "{}", bare.words());
     for (words, rows) in [
@@ -323,7 +331,7 @@ fn the_asked_prefill_is_named_only_when_set_and_reproduces() {
             ASKED_PREFILL_MAX,
         ),
     ] {
-        let spec = parse(&format!("out=/o {words}")).expect(words);
+        let spec = parse(words, Path::new("/tmp/x")).expect(words);
         assert_eq!(spec.asked_prefill, rows, "{words}");
         assert_eq!(
             spec.words().contains(&format!(" asked_prefill={rows}")),
@@ -331,7 +339,7 @@ fn the_asked_prefill_is_named_only_when_set_and_reproduces() {
             "{words}"
         );
         assert_eq!(
-            parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+            parse(&spec.words(), Path::new("/tmp/x")).expect("round trip"),
             spec,
             "{words}"
         );
@@ -343,7 +351,7 @@ fn the_asked_prefill_is_named_only_when_set_and_reproduces() {
         "scenario=attach asked_prefill=10",
         "scenario=messaging asked_prefill=10",
     ] {
-        let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+        let err = parse(bad, Path::new("/tmp/x")).expect_err(bad);
         assert!(err.contains("asked_prefill="), "{bad}: {err}");
     }
 }
@@ -352,7 +360,7 @@ fn the_asked_prefill_is_named_only_when_set_and_reproduces() {
 /// entry without them keeps its words; refused past their cap and on a run with no messaging.
 #[test]
 fn the_paced_notes_are_named_only_when_set_and_reproduce() {
-    let bare = parse("out=/o").expect("bare");
+    let bare = parse("", Path::new("/tmp/x")).expect("bare");
     assert_eq!(bare.paced_notes, 0);
     assert!(!bare.words().contains("paced_notes"), "{}", bare.words());
     for (words, notes) in [
@@ -364,7 +372,7 @@ fn the_paced_notes_are_named_only_when_set_and_reproduce() {
             PACED_NOTES_MAX,
         ),
     ] {
-        let spec = parse(&format!("out=/o {words}")).expect(words);
+        let spec = parse(words, Path::new("/tmp/x")).expect(words);
         assert_eq!(spec.paced_notes, notes, "{words}");
         assert_eq!(
             spec.words().contains(&format!(" paced_notes={notes}")),
@@ -372,7 +380,7 @@ fn the_paced_notes_are_named_only_when_set_and_reproduce() {
             "{words}"
         );
         assert_eq!(
-            parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+            parse(&spec.words(), Path::new("/tmp/x")).expect("round trip"),
             spec,
             "{words}"
         );
@@ -384,7 +392,7 @@ fn the_paced_notes_are_named_only_when_set_and_reproduce() {
         "scenario=pingpong paced_notes=10",
         "scenario=ask paced_notes=10",
     ] {
-        let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+        let err = parse(bad, Path::new("/tmp/x")).expect_err(bad);
         assert!(err.contains("paced_notes="), "{bad}: {err}");
     }
 }
@@ -393,13 +401,13 @@ fn the_paced_notes_are_named_only_when_set_and_reproduce() {
 /// and a word it does not know is refused.
 #[test]
 fn the_at_rest_word_round_trips() {
-    let plain = parse("out=/tmp/x").expect("parses");
+    let plain = parse("", Path::new("/tmp/x")).expect("parses");
     assert!(plain.at_rest, "what ships");
     assert!(plain.words().contains(" at_rest=on"), "{}", plain.words());
-    let off = parse("out=/tmp/x at_rest=off").expect("parses");
+    let off = parse("at_rest=off", Path::new("/tmp/x")).expect("parses");
     assert!(!off.at_rest);
     assert!(off.words().contains(" at_rest=off"), "{}", off.words());
-    assert!(parse("out=/tmp/x at_rest=sealed").is_err());
+    assert!(parse("at_rest=sealed", Path::new("/tmp/x")).is_err());
 }
 
 /// D02's knob: both tallies in the messaging, attach, handoff and ask worlds, named only when it
@@ -407,7 +415,7 @@ fn the_at_rest_word_round_trips() {
 /// ping-pong world, which counts with both tallies in every run.
 #[test]
 fn the_tally_is_named_only_when_on_and_reproduces() {
-    let bare = parse("out=/o").expect("bare");
+    let bare = parse("", Path::new("/tmp/x")).expect("bare");
     assert!(
         !bare.tally,
         "off by default: the worlds boot as their baselines did"
@@ -422,12 +430,12 @@ fn the_tally_is_named_only_when_on_and_reproduces() {
         ("scenario=ask tally=on", true),
         ("scenario=pingpong tally=off", false),
     ] {
-        let spec = parse(&format!("out=/o {words}")).expect(words);
+        let spec = parse(words, Path::new("/tmp/x")).expect(words);
         assert_eq!(spec.tally, on, "{words}");
         assert_eq!(spec.words().contains(" tally=on"), on, "{words}");
         assert!(!spec.words().contains("tally=off"), "{words}");
         assert_eq!(
-            parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+            parse(&spec.words(), Path::new("/tmp/x")).expect("round trip"),
             spec,
             "{words}"
         );
@@ -438,7 +446,69 @@ fn the_tally_is_named_only_when_on_and_reproduces() {
         "tally=1",
         "scenario=pingpong tally=on",
     ] {
-        let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+        let err = parse(bad, Path::new("/tmp/x")).expect_err(bad);
         assert!(err.contains("tally="), "{bad}: {err}");
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_broker_process_is_named_only_out_of_process_and_refuses_what_its_argv_cannot_carry() {
+    let out = Path::new("/tmp/x");
+    let inproc = parse("", out).expect("the default");
+    assert_eq!(inproc.broker_process, BrokerProcess::Inproc);
+    assert!(
+        !inproc.words().contains("broker_process="),
+        "an in-process run's words stay what every earlier entry's were"
+    );
+    assert_eq!(
+        parse("broker_process=inproc", out).expect("explicit"),
+        inproc
+    );
+    for (word, process) in [
+        ("background", BrokerProcess::Background),
+        ("interactive", BrokerProcess::Interactive),
+    ] {
+        let spec = parse(&format!("broker_process={word} attach=8,32"), out).expect(word);
+        assert_eq!(spec.broker_process, process);
+        assert!(spec.words().contains(&format!(" broker_process={word}")));
+        assert_eq!(parse(&spec.words(), out).expect("round trip"), spec);
+        for tier in ["strict", "relaxed"] {
+            let tiered = format!("broker_process={word} durability={tier}");
+            assert!(
+                parse(&tiered, out).is_ok(),
+                "{tiered}: the argv names a tier"
+            );
+        }
+        assert!(parse(&format!("broker_process={word} at_rest=off"), out).is_ok());
+        for refused in [
+            "scenario=handoff",
+            "scenario=ask",
+            "horizon_ms=1000",
+            "retention=off",
+            "retention_interval_ms=1000",
+            "rate_limit=off",
+            "log=off",
+            "backlog=10 scenario=attach",
+            "paced_notes=1 scenario=messaging",
+            "bystanders=4",
+            "tally=on",
+        ] {
+            let run = format!("broker_process={word} {refused}");
+            let why = parse(&run, out).expect_err(&run);
+            assert!(
+                why.contains("runs `aterm link broker` as it ships"),
+                "{run}: {why}"
+            );
+        }
+        assert!(
+            parse(
+                &format!("broker_process={word} horizon_ms={ORDERED_HORIZON_MS}"),
+                out
+            )
+            .is_ok(),
+            "the shipped horizon named is the shipped horizon"
+        );
+    }
+    assert!(parse("broker_process=launchd", out).is_err());
 }

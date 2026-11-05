@@ -609,9 +609,11 @@ fn start_preview() -> bool {
                     WorkstationSetupDecision::Unavailable => "unavailable\n".to_owned(),
                 };
                 let result = format!("{word}elapsed_ms={}\n", started.elapsed().as_millis());
-                if let Err(error) =
-                    std::fs::write(root.join("workstation-setup-preview-result"), result)
-                {
+                if let Err(error) = aterm_uds::atomic_file::write(
+                    &root.join("workstation-setup-preview-result"),
+                    result.as_bytes(),
+                    0o600,
+                ) {
                     aterm_log::warn!("Mac setup preview could not write its result: {error}");
                 }
             }
@@ -787,9 +789,9 @@ impl App {
         self.workstation_setup.permissions.person_asked();
     }
 
-    /// Whether permission acquisition was explicitly chosen by the person.
-    pub(crate) fn person_permission_admission_stands(&self) -> bool {
-        self.workstation_setup.permissions.person_admission_stands()
+    /// Whether the admitted setup can start its permission steps automatically.
+    pub(crate) fn permission_steps_admitted(&self) -> bool {
+        self.workstation_setup.permissions.steps_admitted()
     }
 
     pub(crate) fn tick_workstation_setup(&mut self, now: Instant) {
@@ -858,18 +860,18 @@ mod tests {
     }
 
     #[test]
-    fn automatic_setup_cannot_authorize_a_permission_prompt() {
+    fn automatic_setup_starts_permission_steps() {
         let mut gate = PermissionGate::default();
         gate.apply_started(true, PagePress::Nobody);
         gate.accepted();
         gate.observe(policy(7, true));
         assert!(gate.own_admission_stands());
-        assert!(!gate.person_admission_stands());
+        assert!(gate.steps_admitted());
 
         gate.apply_started(false, PagePress::Person);
         gate.accepted();
         gate.observe(policy(8, true));
-        assert!(gate.person_admission_stands());
+        assert!(gate.steps_admitted());
     }
 
     #[test]
@@ -973,16 +975,13 @@ mod tests {
         let mut gate = PermissionGate::default();
         assert!(apply(&mut gate, true, PagePress::Nobody, 3));
         assert!(
-            gate.own_admission_stands() && !gate.person_admission_stands(),
-            "automatic setup grants no permission capability"
+            gate.own_admission_stands() && gate.steps_admitted(),
+            "automatic setup starts permission acquisition"
         );
 
         let mut gate = PermissionGate::default();
         assert!(apply(&mut gate, false, PagePress::Person, 4));
-        assert!(
-            gate.person_admission_stands(),
-            "a person's press on the page"
-        );
+        assert!(gate.steps_admitted(), "a person's press on the page");
 
         // A newer status naming another plan, a held intent, a plan withdrawn
         // or an unreadable status each end it.
@@ -1088,15 +1087,15 @@ mod tests {
             receipt.accept();
             app.tick_system_state(start + Duration::from_secs(1));
             app.observe_initial_setup_permissions(policy(3, true));
-            let admitted = app.person_permission_admission_stands();
+            let admitted = app.permission_steps_admitted();
             if on_page {
-                assert!(!admitted, "a control client touched the page first");
+                assert!(admitted, "the admitted plan starts automatically");
                 assert!(
                     app.workstation_setup.permissions.allowed(),
                     "the plan stands"
                 );
             } else {
-                assert!(!admitted, "elsewhere {elsewhere}");
+                assert!(admitted, "elsewhere {elsewhere}");
             }
         }
     }
@@ -1139,7 +1138,7 @@ mod tests {
             app.access_revision().is_none(),
             "a withdrawn offer must not release the earlier local Stop"
         );
-        assert!(!app.person_permission_admission_stands());
+        assert!(!app.permission_steps_admitted());
         assert!(app.workstation_setup.suppresses_permissions());
     }
 
@@ -1180,10 +1179,7 @@ mod tests {
         );
         app.observe_initial_setup_permissions(policy(5, true));
         assert_eq!(app.access_revision(), Some(5));
-        assert!(
-            app.person_permission_admission_stands(),
-            "a person's own admission"
-        );
+        assert!(app.permission_steps_admitted(), "a person's own admission");
     }
 
     #[test]

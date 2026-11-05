@@ -24,6 +24,16 @@ impl Home {
     /// A cache folder `rel` under the home, holding one file of `len` bytes.
     fn cache(&self, rel: &str, len: usize) -> PathBuf {
         let dir = self.path.join(rel);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .expect("private cache folders");
+        }
+        #[cfg(not(unix))]
         std::fs::create_dir_all(&dir).expect("cache folder");
         std::fs::write(dir.join("blob"), vec![7u8; len]).expect("cache file");
         dir
@@ -111,7 +121,7 @@ fn registered_custody_without_an_embedded_marker_and_unknown_records_still_refus
     let parent = home.cache(".cache/tool", 1024);
     let target = parent.join("registered");
     let owner = home.path.join("source");
-    std::fs::create_dir(&owner).unwrap();
+    aterm_uds::private_file::ensure_private_dir(&owner).unwrap();
     std::fs::write(owner.join("Cargo.toml"), b"[workspace]\n").unwrap();
     assert!(atpkg::build_cache::registered::create_checked(&home.path, &target, &owner).unwrap());
     std::fs::write(target.join("payload"), b"keep").unwrap();

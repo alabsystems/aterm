@@ -318,79 +318,108 @@ impl Prefix {
                 }
                 continue;
             }
-            let version_rows = match std::fs::read_dir(entry.path()) {
-                Ok(rows) => rows,
-                Err(e) if complete => return Err(format!("abrew: {e}")),
-                Err(_) => continue,
-            };
-            let mut versions = Vec::new();
-            for row in version_rows {
-                let row = match row {
-                    Ok(row) => row,
-                    Err(e) if complete => return Err(format!("abrew: {e}")),
-                    Err(_) => continue,
-                };
-                let ft = match row.file_type() {
-                    Ok(ft) => ft,
-                    Err(e) if complete => return Err(format!("abrew: {e}")),
-                    Err(_) => continue,
-                };
-                if complete && ft.is_symlink() {
-                    return Err(format!(
-                        "abrew: aliased installed version: {}",
-                        row.path().display()
-                    ));
-                }
-                if ft.is_dir() {
-                    let raw_version = row.file_name();
-                    let version = if complete {
-                        raw_version
-                            .into_string()
-                            .map_err(|_| "abrew: installed version is not UTF-8".to_string())?
-                    } else {
-                        raw_version.to_string_lossy().into_owned()
-                    };
-                    if is_staging_name(&version) {
-                        continue;
-                    }
-                    // brew's per-cask metadata container is
-                    // not an installed version.
-                    if kind == Kind::Cask && version == ".metadata" {
-                        continue;
-                    }
-                    if !super::valid_cask_version(&version)
-                        || !owned_receipt(&row.path(), kind, &name, &version)
-                    {
-                        if complete {
-                            return Err(format!(
-                                "abrew: incomplete or unowned installed row: {}",
-                                row.path().display()
-                            ));
-                        }
-                        continue;
-                    }
-                    versions.push(version);
-                }
+            if let Some(inst) = Self::scan_installed_versions(&entry.path(), kind, name, complete)?
+            {
+                out.push(inst);
             }
-            if versions.is_empty() {
-                continue;
-            }
-            versions.sort_by(|a, b| super::formula::version_cmp(a, b));
-            out.push(Installed {
-                name,
-                version: versions.last().cloned().unwrap_or_default(),
-                kind,
-                versions,
-            });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
 
+    fn scan_installed_versions(
+        dir: &Path,
+        kind: Kind,
+        name: String,
+        complete: bool,
+    ) -> Result<Option<Installed>, String> {
+        let version_rows = match std::fs::read_dir(dir) {
+            Ok(rows) => rows,
+            Err(e) if complete => return Err(format!("abrew: {e}")),
+            Err(_) => return Ok(None),
+        };
+        let mut versions = Vec::new();
+        for row in version_rows {
+            let row = match row {
+                Ok(row) => row,
+                Err(e) if complete => return Err(format!("abrew: {e}")),
+                Err(_) => continue,
+            };
+            let ft = match row.file_type() {
+                Ok(ft) => ft,
+                Err(e) if complete => return Err(format!("abrew: {e}")),
+                Err(_) => continue,
+            };
+            if complete && ft.is_symlink() {
+                return Err(format!(
+                    "abrew: aliased installed version: {}",
+                    row.path().display()
+                ));
+            }
+            if ft.is_dir() {
+                let raw_version = row.file_name();
+                let version = if complete {
+                    raw_version
+                        .into_string()
+                        .map_err(|_| "abrew: installed version is not UTF-8".to_string())?
+                } else {
+                    raw_version.to_string_lossy().into_owned()
+                };
+                if is_staging_name(&version) {
+                    continue;
+                }
+                // brew's per-cask metadata container is
+                // not an installed version.
+                if kind == Kind::Cask && version == ".metadata" {
+                    continue;
+                }
+                if !super::valid_cask_version(&version)
+                    || !owned_receipt(&row.path(), kind, &name, &version)
+                {
+                    if complete {
+                        return Err(format!(
+                            "abrew: incomplete or unowned installed row: {}",
+                            row.path().display()
+                        ));
+                    }
+                    continue;
+                }
+                versions.push(version);
+            }
+        }
+        if versions.is_empty() {
+            return Ok(None);
+        }
+        versions.sort_by(|a, b| super::formula::version_cmp(a, b));
+        Ok(Some(Installed {
+            name,
+            version: versions.last().cloned().unwrap_or_default(),
+            kind,
+            versions,
+        }))
+    }
+
     /// Returns the installed record for `name`, if any version is admitted.
     #[must_use]
     pub fn installed_one(&self, kind: Kind, name: &str) -> Option<Installed> {
-        self.installed(kind).into_iter().find(|i| i.name == name)
+        if is_staging_name(name) || !super::valid_component(name) {
+            return None;
+        }
+        let base = match kind {
+            Kind::Formula => self.cellar(),
+            Kind::Cask => self.caskroom(),
+        };
+        real_base(&self.root).ok()?;
+        real_base(&base).ok()?;
+        let dir = base.join(name);
+        if !std::fs::symlink_metadata(&dir)
+            .is_ok_and(|m| m.file_type().is_dir() && !crate::platform::is_reparse(&m))
+        {
+            return None;
+        }
+        Self::scan_installed_versions(&dir, kind, name.to_string(), false)
+            .ok()
+            .flatten()
     }
 
     /// Returns the first name in `names` already installed as a formula or cask.
@@ -810,10 +839,10 @@ impl Prefix {
                 continue;
             };
             for entry in entries.flatten() {
-                if !is_staging_name(&entry.file_name().to_string_lossy())
-                    || !entry
-                        .file_type()
-                        .is_ok_and(|t| t.is_dir() && !t.is_symlink())
+                if !entry
+                    .file_type()
+                    .is_ok_and(|t| t.is_dir() && !t.is_symlink())
+                    || !entry.file_name().to_str().is_some_and(is_staging_name)
                 {
                     continue;
                 }
@@ -938,14 +967,7 @@ pub(super) fn write_metadata(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .prefix(".abrew-metadata-")
         .tempdir_in(parent)?;
     let staged = stage.path().join("metadata");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&staged)?;
+    let mut file = crate::platform::open_create_new_write(&staged, 0o600)?;
     file.write_all(bytes)?;
     aterm_durable::durable(&file)?;
     drop(file);
@@ -980,66 +1002,60 @@ fn real_base(path: &Path) -> Result<(), String> {
     }
 }
 
+fn read_receipt(dir: &Path, limit: usize) -> Option<aterm_json::Value> {
+    let bytes =
+        crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), limit).ok()?;
+    aterm_json::from_slice(&bytes).ok()
+}
+
+/// Reads string fields `keys` from `INSTALL_RECEIPT.json` in `dir` in a single read.
+pub(super) fn receipt_words<const N: usize>(dir: &Path, keys: [&str; N]) -> [Option<String>; N] {
+    let Some(receipt) = read_receipt(dir, 64 * 1024) else {
+        return std::array::from_fn(|_| None);
+    };
+    keys.map(|key| {
+        receipt
+            .get(key)
+            .and_then(aterm_json::Value::as_str)
+            .map(str::to_string)
+    })
+}
+
 /// Returns whether the receipt in `dir` marks the package as installed on request.
 #[must_use]
 pub(super) fn receipt_on_request(dir: &Path) -> bool {
-    let Ok(bytes) =
-        crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)
-    else {
-        return false;
-    };
-    let Ok(receipt) = aterm_json::from_slice::<aterm_json::Value>(&bytes) else {
-        return false;
-    };
-    receipt
-        .get("installed_on_request")
-        .and_then(aterm_json::Value::as_str)
-        == Some("true")
+    receipt_word(dir, "installed_on_request").as_deref() == Some("true")
 }
 
 fn receipt_identity(dir: &Path, kind: Kind) -> Option<(String, String)> {
-    let bytes =
-        crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)
-            .ok()?;
-    let receipt = aterm_json::from_slice::<aterm_json::Value>(&bytes).ok()?;
-    let word = |key| receipt.get(key).and_then(aterm_json::Value::as_str);
-    if word("installed_by") != Some("abrew") {
+    let [by, name, version] = receipt_words(
+        dir,
+        [
+            "installed_by",
+            match kind {
+                Kind::Formula => "name",
+                Kind::Cask => "token",
+            },
+            "version",
+        ],
+    );
+    if by.as_deref() != Some("abrew") {
         return None;
     }
-    let name = word(match kind {
-        Kind::Formula => "name",
-        Kind::Cask => "token",
-    })?;
-    let version = word("version")?;
-    if !super::valid_component(name) || !super::valid_cask_version(version) {
+    let (name, version) = (name?, version?);
+    if !super::valid_component(&name) || !super::valid_cask_version(&version) {
         return None;
     }
-    Some((name.to_string(), version.to_string()))
+    Some((name, version))
 }
 
 /// Reads string field `key` from `INSTALL_RECEIPT.json` in `dir`.
 pub(super) fn receipt_word(dir: &Path, key: &str) -> Option<String> {
-    let bytes =
-        crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)
-            .ok()?;
-    let receipt = aterm_json::from_slice::<aterm_json::Value>(&bytes).ok()?;
-    receipt
-        .get(key)
-        .and_then(aterm_json::Value::as_str)
-        .map(str::to_string)
+    let [word] = receipt_words(dir, [key]);
+    word
 }
 
-/// The keg tab's `used_options` names (leading dashes stripped,
-/// as brew's `Option#name`), for `bundle dump` args.
-pub(super) fn receipt_used_options(dir: &Path) -> Vec<String> {
-    let Ok(bytes) =
-        crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)
-    else {
-        return Vec::new();
-    };
-    let Ok(receipt) = aterm_json::from_slice::<aterm_json::Value>(&bytes) else {
-        return Vec::new();
-    };
+fn parse_used_options(receipt: &aterm_json::Value) -> Vec<String> {
     receipt
         .get("used_options")
         .and_then(aterm_json::Value::as_array)
@@ -1058,27 +1074,14 @@ pub(super) fn receipt_used_options(dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Reads boolean field `key` from `INSTALL_RECEIPT.json` in
-/// `dir` (brew tabs store real booleans; abrew receipts may
-/// store the string form).
-pub(super) fn receipt_bool(dir: &Path, key: &str) -> Option<bool> {
-    let bytes =
-        crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)
-            .ok()?;
-    let receipt = aterm_json::from_slice::<aterm_json::Value>(&bytes).ok()?;
+fn parse_bool(receipt: &aterm_json::Value, key: &str) -> Option<bool> {
     let value = receipt.get(key)?;
     value
         .as_bool()
         .or_else(|| value.as_str().map(|s| s == "true"))
 }
 
-/// The keg tab's recorded runtime dependency full names, when
-/// the receipt carries the list (`bundle dump` graph input).
-pub(super) fn receipt_runtime_deps(dir: &Path) -> Option<Vec<String>> {
-    let bytes =
-        crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 1024 * 1024)
-            .ok()?;
-    let receipt = aterm_json::from_slice::<aterm_json::Value>(&bytes).ok()?;
+fn parse_runtime_deps(receipt: &aterm_json::Value) -> Option<Vec<String>> {
     let items = receipt.get("runtime_dependencies")?.as_array()?;
     Some(
         items
@@ -1089,40 +1092,77 @@ pub(super) fn receipt_runtime_deps(dir: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// Replace one string-valued receipt word in place, preserving
+/// Reads `(installed_on_request != "false", runtime_dependencies, used_options)` from
+/// `INSTALL_RECEIPT.json` in `dir` in a single read (`bundle dump`).
+pub(super) fn receipt_dump_fields(dir: &Path) -> (bool, Option<Vec<String>>, Vec<String>) {
+    let Some(receipt) = read_receipt(dir, 1024 * 1024) else {
+        return (true, None, Vec::new());
+    };
+    let on_request = receipt
+        .get("installed_on_request")
+        .and_then(aterm_json::Value::as_str)
+        != Some("false");
+    (
+        on_request,
+        parse_runtime_deps(&receipt),
+        parse_used_options(&receipt),
+    )
+}
+
+/// Reads `(runtime_dependencies, poured_from_bottle)` from `INSTALL_RECEIPT.json` in `dir` in a
+/// single read (`bundle cleanup`).
+pub(super) fn receipt_cleanup_fields(dir: &Path) -> (Option<Vec<String>>, bool) {
+    let Some(receipt) = read_receipt(dir, 1024 * 1024) else {
+        return (None, false);
+    };
+    (
+        parse_runtime_deps(&receipt),
+        parse_bool(&receipt, "poured_from_bottle").unwrap_or(false),
+    )
+}
+
+/// Replace string-valued receipt words in place, preserving
 /// every other byte (the migration receipt fix-up). Returns false
-/// when the receipt or key is absent.
-pub(super) fn replace_receipt_word(dir: &Path, key: &str, value: &str) -> Result<bool, String> {
+/// when the receipt is absent or none of `pairs` matched.
+pub(super) fn replace_receipt_words(dir: &Path, pairs: &[(&str, &str)]) -> Result<bool, String> {
     let path = dir.join("INSTALL_RECEIPT.json");
     let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 64 * 1024) else {
         return Ok(false);
     };
-    let text = String::from_utf8_lossy(&bytes);
-    let needle = format!("\"{key}\"");
-    let Some(key_at) = text.find(&needle) else {
-        return Ok(false);
-    };
-    let after = &text[key_at + needle.len()..];
-    let Some(colon) = after.find(':') else {
-        return Ok(false);
-    };
-    let rest = &after[colon + 1..];
-    let token = rest.trim_start();
-    if !token.starts_with('"') {
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    let mut changed = false;
+    for &(key, value) in pairs {
+        let needle = format!("\"{key}\"");
+        let Some(key_at) = text.find(&needle) else {
+            continue;
+        };
+        let after = &text[key_at + needle.len()..];
+        let Some(colon) = after.find(':') else {
+            continue;
+        };
+        let rest = &after[colon + 1..];
+        let token = rest.trim_start();
+        if !token.starts_with('"') {
+            continue;
+        }
+        let token_at = text.len() - token.len();
+        let Some(close) = token[1..].find('"') else {
+            continue;
+        };
+        let mut out = String::with_capacity(text.len());
+        out.push_str(&text[..token_at]);
+        out.push_str(&format!(
+            "\"{}\"",
+            value.replace('\\', "\\\\").replace('"', "\\\"")
+        ));
+        out.push_str(&text[token_at + close + 2..]);
+        text = out;
+        changed = true;
+    }
+    if !changed {
         return Ok(false);
     }
-    let token_at = text.len() - token.len();
-    let Some(close) = token[1..].find('"') else {
-        return Ok(false);
-    };
-    let mut out = String::with_capacity(text.len());
-    out.push_str(&text[..token_at]);
-    out.push_str(&format!(
-        "\"{}\"",
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    ));
-    out.push_str(&text[token_at + close + 2..]);
-    write_metadata(&path, out.as_bytes())
+    write_metadata(&path, text.as_bytes())
         .map_err(|e| format!("abrew: cannot write receipt in {}: {e}", dir.display()))?;
     Ok(true)
 }
@@ -1206,21 +1246,7 @@ fn resolve_link_target(parent: &Path, target: &Path) -> PathBuf {
 }
 
 pub(super) fn owned_receipt(dir: &Path, kind: Kind, name: &str, version: &str) -> bool {
-    let Ok(bytes) =
-        crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)
-    else {
-        return false;
-    };
-    let Ok(receipt) = aterm_json::from_slice::<aterm_json::Value>(&bytes) else {
-        return false;
-    };
-    let word = |key| receipt.get(key).and_then(aterm_json::Value::as_str);
-    word("installed_by") == Some("abrew")
-        && word(match kind {
-            Kind::Formula => "name",
-            Kind::Cask => "token",
-        }) == Some(name)
-        && word("version") == Some(version)
+    receipt_identity(dir, kind).is_some_and(|(n, v)| n == name && v == version)
 }
 
 /// Creates a directory symlink `link -> target`.

@@ -25,6 +25,9 @@ pub struct LocalVerbs {
     /// The fleet client `--host` drives another Mac's aterm through (the
     /// step-in: the fleet's `drive` op, [`crate::FleetDriveFn`]).
     pub fleet_drive: Option<crate::FleetDriveFn>,
+    /// This Mac's fleet node id, where it has one: a fleet task board's row on it is waited on
+    /// here, never over a drive to itself ([`crate::board`]).
+    pub fleet_node: Option<fn() -> Option<String>>,
 }
 
 impl LocalVerbs {
@@ -33,6 +36,7 @@ impl LocalVerbs {
         cast_drift: None,
         fleet_survey: None,
         fleet_drive: None,
+        fleet_node: None,
     };
 }
 
@@ -214,11 +218,12 @@ const MAX_SCREEN_FILE_BYTES: u64 = 8 * 1024 * 1024;
         target_arch = "arm",
     ),
 ))]
-const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800;
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800 | 0x0008_0000;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004 | 0x0100_0000;
 
 #[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
@@ -811,8 +816,7 @@ mod tests {
         let path = sock.to_str().expect("utf8").to_string();
         let local = LocalVerbs {
             cast_drift: Some(echo_pre_undo),
-            fleet_survey: None,
-            fleet_drive: None,
+            ..LocalVerbs::NONE
         };
         let code = live_with(
             &path,
@@ -860,8 +864,7 @@ mod tests {
         let with_sel = strings(&["@s-a", "cast", "drift", "--file", "x"]);
         let local = LocalVerbs {
             cast_drift: Some(echo),
-            fleet_survey: None,
-            fleet_drive: None,
+            ..LocalVerbs::NONE
         };
         assert!(offline_entry(&with_sel, &local).is_err());
         let live_form = strings(&["@s-a", "cast", "drift", "rows=2"]);
@@ -877,8 +880,7 @@ mod tests {
         let saved = strings(&["cast", "drift", "--file", file.to_str().expect("utf8")]);
         let unknown = LocalVerbs {
             cast_drift: Some(echo_unknown),
-            fleet_survey: None,
-            fleet_drive: None,
+            ..LocalVerbs::NONE
         };
         assert_eq!(
             offline_entry(&saved, &unknown).expect("computed offline"),
@@ -886,8 +888,7 @@ mod tests {
         );
         let pre_undo = LocalVerbs {
             cast_drift: Some(echo_pre_undo),
-            fleet_survey: None,
-            fleet_drive: None,
+            ..LocalVerbs::NONE
         };
         assert_eq!(
             offline_entry(&saved, &pre_undo).expect("refused by the analyzer"),

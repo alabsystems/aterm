@@ -9,15 +9,14 @@
 //! share of the per-Mac quota, only when what the list says changed: at once for a birth, else at
 //! most monthly per mailbox.
 //!
-//! A mailbox's own login never enters Commons (§4.9), so the observation leaves out the address
-//! the Mac signed in with and every address Proton calls the account's own (its original, the
-//! short-domain twin, an outside sign-in address): listing one would let a member test which
-//! member-readable address is a mailbox login. Only addresses the registry already holds are
-//! listed, and only the address being signed in is born, so the owner's other aliases stay out
-//! of a lab-wide table that never compacts. Which mailbox row the open mailbox is comes from this
-//! Mac's mailbox keys (the importer's own record) or, failing that, from the owner's `mailbox`
-//! cell on a listed address; nothing else names it, and an address text never reaches a key, a
-//! finding or a log line.
+//! A mailbox's login is an address row like any other (docs/DESIGN-alab-one-mesh-2026-11-05.md
+//! §4.7), so the observation lists every receiving address the registry already holds, the
+//! login and the account's own addresses among them. Only addresses the registry already holds
+//! are listed, and only the address being signed in is born, so the owner's other aliases stay
+//! out of a lab-wide table that never compacts. Which mailbox row the open mailbox is comes from
+//! its login (a mailbox's key derives from its login's address key, `keys::mailbox_pk`) or,
+//! failing that, from the owner's `mailbox` cell on a listed address; an address text never
+//! reaches a key, a finding or a log line.
 //!
 //! [`plan`] is pure over the registry; `Registry::observe_mailbox` runs it under the writer.
 
@@ -60,8 +59,6 @@ pub const PROTON_API: &str = "proton-api";
 #[derive(Clone, PartialEq, Eq)]
 pub struct Listed {
     pub addr: String,
-    /// The account's own address (its login, or a twin of it): never observed.
-    pub own: bool,
     /// Mail sent to it lands in this mailbox.
     pub receives: bool,
 }
@@ -87,8 +84,8 @@ pub enum Outcome {
     NotHeld,
     /// This Mac's history of the registry waits on a record.
     Incomplete,
-    /// No live mailbox row is this mailbox: the importer's keys are not on this Mac and no listed
-    /// address carries the owner's mailbox link.
+    /// No live mailbox row is this mailbox: none is keyed by its login and no listed address
+    /// carries the owner's mailbox link.
     Unknown,
     /// The owner's links on listed addresses name more than one mailbox; the findings say which.
     Held,
@@ -152,26 +149,23 @@ pub struct Input<'a> {
     /// This Mac's Commons uuid, 32 hex: the suffix of every observation it writes.
     pub uuid: &'a str,
     pub listing: &'a Listing,
-    /// The mailbox key this Mac's mailbox keys give the login, where they give one.
+    /// The mailbox key the login derives (`keys::mailbox_pk`), where it is an address.
     pub keyed: Option<&'a str>,
     pub now_ms: u64,
 }
 
-/// The addresses the list receives for others, by key: enabled, receiving, not the account's own
-/// and not the login, each in the claims spelling.
+/// The addresses the list receives, by key, each in the claims spelling.
 fn receiving(listing: &Listing) -> BTreeMap<String, String> {
-    let login = keys::address(&listing.login).ok();
     listing
         .listed
         .iter()
-        .filter(|listed| listed.receives && !listed.own)
+        .filter(|listed| listed.receives)
         .filter_map(|listed| keys::address(&listed.addr).ok())
-        .filter(|addr| Some(addr) != login.as_ref())
         .filter_map(|addr| Some((keys::address_pk(&addr).ok()?, addr)))
         .collect()
 }
 
-/// The mailbox row the open mailbox is: this Mac's key for it when that row is live, else the one
+/// The mailbox row the open mailbox is: its login's derived key when that row is live, else the one
 /// live mailbox the owner linked a listed address to. `Err` holds the candidates when the links
 /// name several.
 fn identify(
@@ -316,12 +310,20 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
         None if listed.is_empty() => return Ok(Plan::quiet(Outcome::Empty)),
         None => {}
         Some(row) => {
-            let says = |column: &str| row.get(column).cloned().unwrap_or(Value::Null);
-            let same = says("mailbox") == Value::from(mailbox.as_str())
-                && says("method") == Value::from(PROTON_API)
-                && says("complete") == Value::from(complete)
-                && says("addresses")
-                    == Value::Array(listed.iter().map(|pk| Value::from(pk.as_str())).collect());
+            let says_str = |column: &str| row.get(column).and_then(Value::as_str);
+            let same = says_str("mailbox") == Some(mailbox.as_str())
+                && says_str("method") == Some(PROTON_API)
+                && row.get("complete").and_then(Value::as_bool) == Some(complete)
+                && row
+                    .get("addresses")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| {
+                        arr.len() == listed.len()
+                            && arr
+                                .iter()
+                                .zip(&listed)
+                                .all(|(v, pk)| v.as_str() == Some(pk.as_str()))
+                    });
             if same {
                 return Ok(Plan::quiet(Outcome::Unchanged));
             }

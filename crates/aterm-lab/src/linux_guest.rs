@@ -444,6 +444,25 @@ sudo ln -sfn "$dir/bin/bash" "/usr/local/bin/$link"
 /// Webster's Second International (`web2`), the public-domain word list aterm-lexicon's dictionary gates walk: their allowlists are curated against it, so another list decides nothing and they answer COULD NOT RUN without it (`crates/aterm-lexicon/tests/lexicon_suite.rs`). macOS ships it here and Ubuntu packages no web2 (its `wamerican` is another list), so the guest gets this Mac's copy at the same path.
 pub const WEB2: &str = aterm_uds::os_path!("web2");
 
+/// THE GUEST'S SWAP, IN GIB: a compile's peak outgrows the guest's RAM ([`crate::linux::MEMORY_GIB`]),
+/// whose size every Mac that runs the lane must spare. The kernel killed `rustc` building
+/// aterm-gui's x86_64 tests at 15.7 GiB resident (2026-11-05), so a compile pages rather than dies;
+/// a run's timed rows follow its builds, with the pages freed.
+pub const SWAP_GIB: u32 = 16;
+
+/// Makes the swap file once and keeps it on across boots, since the plan's stamp re-runs no step
+/// at a boot.
+const SWAP_ON: &str = r#"set -eu
+swap=/swap.aterm-lane
+if [ ! -f "$swap" ]; then
+  fallocate -l "$1G" "$swap"
+  chmod 0600 "$swap"
+  mkswap "$swap" >/dev/null
+fi
+swapon --noheadings --show=NAME | grep -Fxq "$swap" || swapon "$swap"
+grep -Fq "$swap " /etc/fstab || printf '%s none swap sw 0 0\n' "$swap" >>/etc/fstab
+"#;
+
 /// One provisioning step: an argv run in the guest, with an optional stdin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
@@ -532,7 +551,13 @@ pub fn provision_plan_for(web2: Option<String>, x86_64: bool) -> Vec<Step> {
             ),
         ]);
     }
+    let swap_gib = SWAP_GIB.to_string();
     steps.extend([
+        step(
+            "swap",
+            &["sudo", "sh", "-s", "--", swap_gib.as_str()],
+            Some(SWAP_ON),
+        ),
         // A VM stopped mid-install (the Mac restarted under it) leaves dpkg interrupted, and
         // apt refuses every install until its unpacked packages are configured; with nothing
         // pending this does nothing.

@@ -1641,6 +1641,19 @@ fn what_the_harness_did_counts_the_occupancy_facts() {
     );
     assert_eq!(numbers(&words("Idle while ready")), [12], "{rows:?}");
 
+    week.facts_told.insert("overlap".to_string(), 1);
+    state.stats.report = report(&today, &week, Some(12));
+    let rows = state.projection().did_rows;
+    assert!(
+        rows.iter().any(|(l, _)| l == "Facts told (overlap)"),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|(l, _)| l != "Facts it would tell (overlap)"),
+        "CONTROL: a kind no week would tell has no would-be row: {rows:?}"
+    );
+
     week.facts_would.clear();
     week.facts_told.clear();
     today.facts_would.clear();

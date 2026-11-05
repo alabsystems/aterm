@@ -73,7 +73,21 @@ impl Flush {
             seam::note(self);
             return Ok(());
         }
-        self.file(&File::open(dir)?)
+        #[cfg(unix)]
+        let opened = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            #[cfg(target_vendor = "apple")]
+            const NONBLOCK_FLAG: i32 = 0x0004;
+            #[cfg(not(target_vendor = "apple"))]
+            const NONBLOCK_FLAG: i32 = 0o4000;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(NONBLOCK_FLAG)
+                .open(dir)?
+        };
+        #[cfg(not(unix))]
+        let opened = File::open(dir)?;
+        self.file(&opened)
     }
 
     /// [`Flush::dir`] for a writer that goes on where the directory's entries cannot be

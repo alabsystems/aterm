@@ -27,6 +27,17 @@ aterm-agent-names = { workspace = true }
 # `text_hash` is spelled out, so the library stays clear of astream-wire, which the prover its
 # floors.tsv row names cannot compile; a test holds it to the workspace's FNV-1a.
 aterm-hash = { workspace = true }
+# The grid's layout of a row (`aterm_grapheme::str_grid_columns`, the model of aterm-core's
+# write path, and the tables it reads: `char_width`, `is_vs16_emoji_capable`,
+# `is_emoji_modifier_base`): `question::Columns` and its tables are spelled out, so the library
+# stays clear of aterm-types and astream-wire, and tests hold them to these over every code point.
+aterm-grapheme = { workspace = true }
+# The grid itself (`aterm_core::terminal::Terminal`): the readers count a row as the grid reads
+# it back (`Terminal::row_text`, the text the server's `screen_rows` hands them), which is not
+# the text written to it where a VS15 narrows a two-cell character, so tests write rows through
+# it and hold `question::Columns` to the columns it paints. A dev-dependency only, so the library
+# keeps its one dependency.
+aterm-core = { workspace = true }
 aterm-regex = { workspace = true }
 aterm-tempfile = { workspace = true }
 # The explicit vendor_drift bench resolves managed builds through

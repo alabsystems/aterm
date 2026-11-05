@@ -29,13 +29,13 @@ pub(crate) use startup::{
     ClaimStamp, StartupAttachMilestones, StartupPresentTiming, StartupWorkerLegs, leg_elapsed_ns,
     mark_backend_worker_done, mark_backend_worker_spawn, mark_first_window_visible,
     mark_first_winit_resumed, mark_gui_ready_for_winit, mark_initial_surface_ready,
-    mark_process_start, mark_rust_main_start, record_backend_worker_legs,
+    mark_keeper_served, mark_process_start, mark_rust_main_start, record_backend_worker_legs,
     record_initial_attach_milestones, stamp_claim,
 };
 #[cfg(unix)]
 pub(crate) use startup::{
     keeper_seam, mark_keeper_hello, mark_keeper_imported, mark_keeper_placed,
-    record_keeper_admitted,
+    record_keeper_admitted, record_keeper_cohort,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use startup::{mark_handoff_claimed, process_main_start};
@@ -751,6 +751,7 @@ label_enum! {
     pub(crate) enum TermWaitSite {
         Redraw => "redraw",
         Press => "press",
+        Mouse => "mouse",
     }
 }
 

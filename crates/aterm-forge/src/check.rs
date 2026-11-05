@@ -1199,6 +1199,11 @@ fn dev_dependency_oracles(root: &Path, name: &str) -> Vec<(String, String)> {
     if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
         let mut members: Vec<PathBuf> = entries
             .flatten()
+            .filter(|e| {
+                e.file_type()
+                    .map(|ft| ft.is_dir() || ft.is_symlink())
+                    .unwrap_or(true)
+            })
             .map(|e| e.path().join("Cargo.toml"))
             .filter(|p| p.is_file())
             .collect();

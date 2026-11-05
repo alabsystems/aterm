@@ -231,7 +231,7 @@ pub(crate) trait AppRt {
         None
     }
 
-    /// Register the whole-app quit confirmation for AppKit `terminate:` gestures that bypass the application menu's Quit item: the Dock-icon "Quit", AppleScript `quit`, and logout/restart/shutdown. macOS wires winit's synchronous `applicationShouldTerminate:` to a typed event-loop deferral, where `App` runs the same in-window question and document-durability barrier as ⌘Q.
+    /// Register the whole-app quit confirmation for AppKit `terminate:` gestures that bypass the application menu's Quit item: the Dock-icon "Quit", AppleScript `quit`, and logout/restart/shutdown. macOS wires winit's synchronous `applicationShouldTerminate:` to a typed event-loop deferral, where `App` asks the same question and runs the same document-durability barrier as ⌘Q.
     fn install_quit_confirm(&self);
 
     /// Query the OS motion preference. macOS reads `NSWorkspace.accessibilityDisplayShouldReduceMotion`.
@@ -786,13 +786,7 @@ impl Windowed {
     /// Mint the proof at a windowed launch, before its AppKit event loop is built.
     pub(crate) fn launch() -> Self {
         WINDOWED_LAUNCH.store(true, std::sync::atomic::Ordering::Release);
-        aterm_window::platform::macos::set_window_key_classifier(|key| {
-            crate::hwkey::event_posted(crate::hwkey::PostedKey {
-                kind: key.kind,
-                keycode: key.keycode,
-                timestamp: key.timestamp,
-            })
-        });
+        aterm_window::platform::macos::set_window_input_classifier(window_input_origin);
         Self(())
     }
 
@@ -802,6 +796,21 @@ impl Windowed {
             .load(std::sync::atomic::Ordering::Acquire)
             .then_some(Self(()))
     }
+}
+
+/// The classifier [`Windowed::launch`] installs, which each native key, click and scroll meets
+/// before AppKit can generate a window callback from it: whether a burst or another process
+/// posted it ([`crate::hwkey::classify`]).
+#[cfg(target_os = "macos")]
+pub(crate) fn window_input_origin(
+    event: aterm_window::platform::macos::NativeInputEvent,
+) -> aterm_window::event::InputOrigin {
+    crate::hwkey::classify(crate::hwkey::NativeInput {
+        kind: event.kind,
+        keycode: event.keycode,
+        timestamp: event.timestamp,
+        source_pid: event.source_pid,
+    })
 }
 
 /// The modifier state winit last DERIVED FROM AN EVENT for `window`.
@@ -953,12 +962,13 @@ pub(crate) fn nsevent_queue_age_ns(timestamp: f64, uptime: f64) -> Option<u64> {
         .then(|| (age_s.max(0.0) * 1e9) as u64)
 }
 
-/// The key event AppKit is dispatching now (`-[NSApp currentEvent]`), as `hwkey` records the
-/// events it posts ([`crate::hwkey::PostedKey`]); `None` headless, off the main thread, outside a
-/// dispatch, or for an event that is not a key-down or key-up.
+/// The key or mouse event AppKit is dispatching now (`-[NSApp currentEvent]`), as `hwkey`
+/// records the events it posts ([`crate::hwkey::NativeInput`]); `None` headless, off the main
+/// thread, outside a dispatch, or for an event that is neither a key-down or key-up nor a mouse
+/// button's down or up ([`input_event`]).
 #[cfg(target_os = "macos")]
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) fn current_key_event() -> Option<crate::hwkey::PostedKey> {
+pub(crate) fn current_input_event() -> Option<crate::hwkey::NativeInput> {
     use aterm_objc::{class, sel};
 
     use crate::appkit::{self, MainThread};
@@ -966,24 +976,47 @@ pub(crate) fn current_key_event() -> Option<crate::hwkey::PostedKey> {
     let _windowed = Windowed::get()?;
     let _main_thread = MainThread::new()?;
     // SAFETY: `+sharedApplication` is `-(id)`, the main-thread AppKit singleton (`_main_thread`
-    // is the witness); `-currentEvent` is `-(id)` and nil outside a dispatch; `-type` is
-    // `-(NSEventType)`, an `NSUInteger`, valid on any event; `-keyCode` is `-(unsigned short)`
-    // and `-timestamp` `-(NSTimeInterval)`, read only once `-type` said key-down or key-up, the
-    // kinds `-keyCode` is defined for (it raises on others).
+    // is the witness); `-currentEvent` is `-(id)`, +0 for this dispatch, and nil outside one.
     unsafe {
         let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
         if app.is_null() {
             return None;
         }
-        let event = appkit::send_id(app, sel!(currentEvent));
-        if event.is_null() {
-            return None;
-        }
+        input_event(appkit::send_id(app, sel!(currentEvent)))
+    }
+}
+
+/// `event` as `hwkey` records the events it posts ([`crate::hwkey::NativeInput`]), with the
+/// process it came from ([`aterm_cg::event_source_pid`]); `None` for nil or an event that can
+/// choose no menu item: neither a key-down or key-up nor a mouse button's down or up
+/// ([`crate::hwkey::is_chooser_kind`]).
+///
+/// # Safety
+/// `event` is nil or a live `NSEvent`, read on the main thread.
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn input_event(event: aterm_objc::Id) -> Option<crate::hwkey::NativeInput> {
+    use aterm_objc::sel;
+
+    use crate::appkit;
+
+    if event.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's live event. `-type` is `-(NSEventType)`, an `NSUInteger`, and
+    // `-timestamp` `-(NSTimeInterval)`, both valid on any event; `-keyCode` is
+    // `-(unsigned short)`, read only once `-type` said key-down or key-up, the kinds `-keyCode` is
+    // defined for (it raises on others); `event_source_pid` reads any live event.
+    unsafe {
         let kind = appkit::send_usize(event, sel!(type));
-        crate::hwkey::is_key_kind(kind).then(|| crate::hwkey::PostedKey {
+        crate::hwkey::is_chooser_kind(kind).then(|| crate::hwkey::NativeInput {
             kind,
-            keycode: appkit::send_u16(event, sel!(keyCode)),
+            keycode: if crate::hwkey::is_key_kind(kind) {
+                appkit::send_u16(event, sel!(keyCode))
+            } else {
+                0
+            },
             timestamp: appkit::send_f64(event, sel!(timestamp)),
+            source_pid: aterm_cg::event_source_pid(event),
         })
     }
 }

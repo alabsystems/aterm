@@ -17,6 +17,22 @@ mod artifact_serve;
 mod abrew_admission;
 #[cfg(target_os = "macos")]
 mod admission;
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod window_custody;
+#[cfg(target_os = "macos")]
+mod window_guards;
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+mod window_custody {
+    pub fn cmd(_: &[String]) -> crate::Res {
+        Err(crate::Fail::die("window-custody needs a debug lab image"))
+    }
+    pub fn owner(args: &[String]) -> crate::Res {
+        cmd(args)
+    }
+    pub fn app_band(args: &[String]) -> crate::Res {
+        cmd(args)
+    }
+}
 #[cfg(target_os = "macos")]
 mod agy;
 #[cfg(target_os = "macos")]
@@ -40,15 +56,13 @@ mod aos_repair;
 #[cfg(target_os = "macos")]
 mod aos_search;
 #[cfg(target_os = "macos")]
-mod aos_workers;
-#[cfg(target_os = "macos")]
-mod aos_workers_bench;
-#[cfg(target_os = "macos")]
 mod autopilot_captures;
 #[cfg(target_os = "macos")]
 mod autopilot_scenes;
 #[cfg(target_os = "macos")]
 mod band;
+#[cfg(target_os = "macos")]
+mod bench_stats;
 #[cfg(all(target_os = "macos", debug_assertions))]
 mod build_admit;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
@@ -60,12 +74,12 @@ mod build_admit {
     }
 }
 #[cfg(all(target_os = "macos", debug_assertions))]
-mod alab_roll;
+mod reveal_tab;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
-mod alab_roll {
+mod reveal_tab {
     pub fn cmd(_: &[String]) -> crate::Res {
         Err(crate::Fail::die(
-            "alab-roll needs a debug lab image for its scratch-registry seams",
+            "reveal-tab needs a debug lab image for its scratch-registry seams",
         ))
     }
 }
@@ -162,6 +176,8 @@ mod lab_build;
 #[cfg(target_os = "macos")]
 mod link;
 #[cfg(target_os = "macos")]
+mod link_notice;
+#[cfg(target_os = "macos")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod linux_a11y;
@@ -191,6 +207,24 @@ mod linux_vz_driver;
 mod linux_vz_host;
 #[cfg(target_os = "macos")]
 mod linux_xwire;
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod local_signins;
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+mod local_signins {
+    pub fn cmd(_: &[String]) -> crate::Res {
+        Err(crate::Fail::die(
+            "local-signins needs a debug lab image for its lapse-fixture seam",
+        ))
+    }
+
+    pub fn is_standin(_: &str) -> bool {
+        false
+    }
+
+    pub fn standin_main(_: &str, _: &[String]) -> i32 {
+        1
+    }
+}
 #[cfg(target_os = "macos")]
 mod look_away;
 #[cfg(target_os = "macos")]
@@ -201,6 +235,8 @@ mod mac_nux;
 mod mac_nux_guest;
 #[cfg(target_os = "macos")]
 mod measure;
+#[cfg(target_os = "macos")]
+mod mesh_churn;
 #[cfg(target_os = "macos")]
 mod meta_keys;
 #[cfg(target_os = "macos")]
@@ -347,6 +383,8 @@ mod windows_smoke;
 mod windows_uia;
 #[cfg(target_os = "macos")]
 mod windows_window;
+#[cfg(target_os = "macos")]
+mod work_overlap;
 #[cfg(target_os = "macos")]
 mod workers;
 
@@ -519,10 +557,15 @@ usage: targo --unverified lab <command> [tag] [args]
                                  Ctrl-C interrupting a streaming turn and the wheel (`--vim`: NORMAL's motions stay dark, `i`
                                  and `a` light typing again); exit 1 on a mismatch, 3 when it could not run (~1 min a mode)
   trail-replay [tag] --out DIR --text ASCII --cadence-ms N [--no-images]
+               [--expect-trail-landing ROW,COL]
                                  attach an existing isolated lab and record 1..4096 printable ASCII edit keys without Enter
                                  or paste; explicit cadence 1..60000 ms, no catch-up; DIR must be new with an existing parent.
                                  Buffers replies/admissions during typing, then reads metrics before effect/clean images;
                                  --no-images skips both captures/files and retains metrics/drains/status/cursor/text/dims.
+                                 --expect-trail-landing observes a fresh source-bound admission at the explicit 0-based
+                                 row,column plus a matching closed-frame cursor before metrics, with a 60-second hang
+                                 detector. Licensed or declined verdicts are retained with separate observation timing;
+                                 separate reads establish observed agreement, not an atomic snapshot or glyph delivery.
                                  exit 0 means recording complete, 1 inconclusive, never a pixel-continuity or latency verdict.
   first-key [--aterm PATH] [--arm NAME=REST:PRESSES[:burst]]... [--arm-toml NAME=LINE]...
             [--min-quiet SECS] [--settle LO..HI] [--no-pet] [--toml LINE]... [--seed N] --out DIR
@@ -550,12 +593,13 @@ usage: targo --unverified lab <command> [tag] [args]
                                  egress, no owner's keychain item; a verdict table, exit 1 on FAIL (--keep: judged live)
   claude-rotation-proof [tag] [--keep] [--no-route-seam]
                                  the real Claude Code moved between the roster accounts a fleet file names, end to end
-                                 (~25 min): a wall moves the tab with its conversation (R1), no usable row waits for the
+                                 (~32 min): a wall moves the tab with its conversation (R1), no usable row waits for the
                                  first to open and moves back (R3), a row whose login directory is gone gets an automatic
                                  sign-in attempt (recorded no-route) while the tab waits on its own reset and resumes
                                  (R4), a sign-in on the default login makes its row usable and displaces the one it held,
-                                 there and back (R5a, R5b), the usage tap's high figure moves it before any wall (R2);
-                                 nobody asked, no /login, no browser, no egress; a verdict table, exit 1 on FAIL
+                                 there and back (R5a, R5b), the usage tap's high figure moves it before any wall (R2), a
+                                 wall during the tab's own background job moves it only once the job ran to its end
+                                 (R6); nobody asked, no /login, no browser, no egress; a verdict table, exit 1 on FAIL
                                  (--no-route-seam: the live negative control, R1 must FAIL and its control row PASS)
   nudge-trial [tag] [--mode on|log|off] [--trials N] [--expect on|log|off] [--via mode|key] [--no-hold]
                                  force N (1-3) PTY displacements on real Claude Code and verify the repaint nudge (~2.5 min)
@@ -567,7 +611,7 @@ usage: targo --unverified lab <command> [tag] [args]
                                  `step=done:taskless`; --land: the landed tab stays `task=landed` with
                                  `step=done:said-done`; --land-open: mid-work Land settles `step=continued`, the
                                  relaunch's facts typed once with no done check)
-  forever --harness <claude|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-redraw|wall-switch|wall-unread|wall-cruise|wall-relaunch|wall-tap|wall-tap-narrow|resid|ladder|angles|switch|outage-land|outage-cruise|sysmsg] [--chains a,b] [--no-surfaces] [--window] [--untapped] [--token-login] [--no-ready-gate] [tag] [--keep]
+  forever --harness <claude|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-redraw|wall-switch|wall-unread|wall-cruise|wall-relaunch|wall-tap|wall-tap-narrow|resid|ladder|angles|switch|outage-land|outage-cruise|sysmsg|dialog] [--chains a,b] [--no-surfaces] [--window] [--untapped] [--token-login|--forced-login] [--no-ready-gate] [tag] [--keep]
                                  supervised Autopilot Land and Cruise scenario chains against real TUIs in scratch git
                                  repos (~15-30 min/harness):
                                  - land / cruise / both: L1-L11, L16-L19, C1-C2, HL/HC (same-land, same-cruise), P4,
@@ -604,7 +648,12 @@ usage: targo --unverified lab <command> [tag] [args]
                                    inside the wall, then Land lands); sys-login and sys-land-login an expired login
                                    (Claude Code on a stored fake subscription login, the environment's token with
                                    --token-login: /login once, its picker left to the person, the browser never run on
-                                   aterm's key, one quiet need; then the person signs in and the tab goes on once)
+                                   aterm's key, one quiet need; then the person signs in and the tab goes on once;
+                                   --forced-login: the stored login under settings that pin its method, where /login
+                                   opens the browser on its Enter: no /login of aterm's, one quiet need naming the pin)
+                                 - dialog: L20 a question dialog under Land answered by the land text
+                                   (`answer-land@v1`, never handed over, landed), C5 the same under Cruise answered by
+                                   its Recommended option, Off control (Claude Code only)
                                  - resid / ladder: residual and backoff-ladder scenario slices
                                  - angles: cruise-angles, each done claim after real work asked another of the six kinds
                                    of work in turn, never held past the sixth; the back-off ladder at an eighth (~30 min)
@@ -640,6 +689,9 @@ usage: targo --unverified lab <command> [tag] [args]
   agy-relaunch [tag] [--keep]    live agy crash/resume/Ctrl-Z/quit/aterm-restart lane (~10 min)
   workers [tag] [--keep] [--early] [--upgrade <newer-claude-bin>]
                                  manager Claude Code spawns 3 real Claude Code workers, awaits all, and verifies results (~20 s)
+  work-overlap [tag] [--keep]    two real Claude Code workers change one function of one file in two worktrees of a
+                                 scratch repository: the second is told the overlap with the first's sid, the first
+                                 lands and its work= row clears (~2 min)
   twin [tag] <claude-bin>|--crashing [ver]
                                  stage <claude-bin> (or a crashing stand-in) as a newer managed store build to wake live upgrade
   scn list|run|show|agg ...      survey scenario runner (`scn run <scenario> [--n N] [--start K]`, `show <run>`, `agg [<scenario>]`)
@@ -669,13 +721,18 @@ Outside any lab (no jail, no stub):
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the
                                  named facts replaced, or this one (--this-machine)
-  alab-roll [--json]             the registry roll's three-Mac partition (design §3.8): three scratch Commons
-                                 custodies in this process, repaired over loopback, never a real Mac's state;
-                                 the seal waits for every Writer, m1 seals in the cut, m2 edits the sealed
-                                 generation, the late roll carries it (debug lab image)
-  commons-lan prepare-recipient|prepare-source|join|run|follow|stop|db|declare|write|read …
+  reveal-tab [--json] [ATERM]     one-mesh A17 on a private window: synthetic logins sealed in a scratch Commons;
+                                 `aterm db emails --show-passwords` prints outside aterm and, in a tab, opens a
+                                 read-only Editor tab that `text|screen|image|window|video|key|doc read` refuse,
+                                 leaving no value in the tab's text, blocks or log (debug lab image)
+  commons-lan prepare-recipient|prepare-source|join|run|node|pair|follow|stop|db|declare|write|read|emails-* …
                                  prepare preserved private profiles on separate LAN hosts; synthetic prior vault approval,
                                  ordinary executable startup, exact generic table readback, no installed state changes
+                                 pair: run the owner and a local follower under one capacity reservation
+                                 node: the headless node service in a profile, its LAN use charged to the caller
+                                 emails-fixture|emails-set|emails-wait: the owner's emails table across the
+                                 profiles (seeded fleet_db replica and flag-only sheet, stdin-only edits,
+                                 keyed-digest waits); no value crosses Macs or reaches a report
                                  db: run the shipped proposal/data CLI in that profile, online or offline
                                  a world on the live default ALab vault (one an earlier run left admitted there) opens for no
                                  verb but behind --live-alab-vault-keeps-member: no run takes that member out again
@@ -690,6 +747,11 @@ Outside any lab (no jail, no stub):
   fleet-menu <aterm> <new-output-directory>
                                  run an isolated reader window and a peer with a sibling on loopback; retain the
                                  peer's two-instance survey, the reader's menu dump and frame (all private worlds kept)
+  local-signins [--aterm PATH] [--n N] [--hold S] [--keep] [--out FILE]
+                                 one-mesh E4: two jailed private aterms on loopback, each with claude, codex, grok and
+                                 agy logins signed in, out and expired; judge that survey, report, upkeep and fleet
+                                 survey read each state from local files alone, contact no provider, open nothing,
+                                 sign nothing in, and carry only their own Mac's rows (debug lab image)
   fleet-sim [--n N] [--runs R] [--keep] [--record]
                                  run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
                                  `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (--record:
@@ -708,6 +770,15 @@ Outside any lab (no jail, no stub):
                                  drives every other and is read for whom its heartbeat reached (--one-url: F8's negative
                                  control; --minter-away: a1's instance stops before the heal; --record: write
                                  docs/measured/, its name carrying --label's WORD)
+  mesh churn [--n N] [--seed S] [--minutes M] [--negative-control NAME] [--aterm PATH] [--keep] [--record] [--label WORD]
+                                 found a membership log on N private Macs (default 30) on loopback, each its own vault
+                                 server and subscriber on the run's genesis; let each in by Allow and the phrase, stop
+                                 two for M minutes, remove two at once, restart two, split two islands (a remover killed
+                                 mid-batch on one; a write, a newcomer and a rebuild on the other), heal, and judge the
+                                 frontier, newest key, Wrap bound, removed seats and the per-seat view, every time a
+                                 measurement (--negative-control old-gap-rule|unsettled-ok: a run that holds only when
+                                 its check fails, refused until A3 lands their reader; --record: write docs/measured/,
+                                 its name carrying --label's WORD)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
   disk-ask [tag] [--keep] [--scenario clear|partial|unanswered|exhausted|worker]
@@ -757,9 +828,13 @@ Outside any lab (no jail, no stub):
                                  instance at a time, into contact sheets, and judge each frame from the page's own
                                  layout: text >= 4.5:1, glyph >= 3:1, card >= 1.2:1, no clipped text, a 4 pt rhythm
                                  (`--help` for details)
-  allocation-monitor --aterm PATH --targo PATH --out DIR [--look dark|light] [--keep]
+  allocation-monitor --aterm PATH --targo PATH --sdk-bin ABS --out DIR [--look dark|light] [--keep]
                                  one attachment observes actual two-to-one fenced Targo builds in a private Allocation
                                  window; preserve both frames/audits, close the panel before peer release, run both outputs
+  window-custody --aterm ABS --out ABS [--band agent|app]
+                                 actual GUI retains its original lane/memory after keeper and owner crash; debug lab
+  window-handoff-app --aterm ABS --out ABS [--cut-keeper]
+                                 authenticated launchd handoff and normal Quit or keeper-lifeline closure; debug lab
   trail-census <png> [--dims FILE|--origin X,Y --cell WxH] [--clean PNG] [--caret ROW,COL] [--pet X0,Y0,X1,Y1]...
                [--selection RRGGBB] [--pixels FILE] [--mud-max N] [--glyph-min X] ...
                                  the Prism Glass census of a trail frame and its clean twin, layer by layer: OKLab mud,
@@ -775,12 +850,10 @@ Outside any lab (no jail, no stub):
                                  (HEAD~1), run both on the scripts and compare main's state and streams (`--help` for details)
   aos-repair [--aterm PATH] [--control | --publish PLAN_HEX] [--keep] [--out DIR]
                                  OPENS A WINDOW: verify Aos M2 live repair of a stranded momentum glow, or publish an Aos M4 plan against a control (~25 s; `--help` for details)
-  aos-cadence --a PATH --b PATH [--no-attach] [--keep]
+  aos-cadence --a PATH --b PATH [--no-attach] [--silent] [--keep]
                                  OPENS A WINDOW, four in turn: typing latency to the glass with a recording holding each key for its echo, builds A B B A (~3 min plus each window's wait for a quiet Mac; `--help` for details)
   aos-search [--grid] [--plans FILE] --out DIR [--toolchain LINE] | aos-search --verify FILE
                                  run Aos M4's candidate search under the pinned policy, or verify a bundle FILE offline (`--help` for details)
-  aos-workers-bench --plans FILE --out DIR [--lab PATH] [--faults] [--rounds N]
-                                 design §11.8's pre-registered M5b measurement: six aos-search arms in a Williams order, gates and criteria in DIR/record.txt (~60 min, ~70 with --faults; `--help` for details)
   aos-gpu-bench --harness PATH --out DIR [--rounds N]
                                  design §12.9's pre-registered M5a measurement: four aos_gpu arms (F I T G) in a Williams order, gates and criteria in DIR/record.md (~25 min; `--help` for details)
   aos-learn VERB ...
@@ -817,17 +890,23 @@ Outside any lab (no jail, no stub):
                                  OPENS A WINDOW (with --window): verify predictive editing over a simulated RTT `link` in
                                  single and split panes (defaults: both shells, 100 ms, both modes, 2 rounds)
   codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--expect-rollout bound|partial]
-                   [--policy-only|--terminals-only|--upgrade-only|--raw-upgrade-only|--window-only]
+                   [--policy-only|--terminals-only|--facts-only|--upgrade-only|--raw-upgrade-only|--window-only
+                    |--capacity-only]
                                  end-to-end native harness proof on the real codex-alab package against a loopback fake
                                  model (~11 min; --policy-only: the cybersecurity-refusal leg alone; --terminals-only:
-                                 the background terminals leg alone, about 1 min; --upgrade-only: one live handoff;
+                                 the background terminals leg alone, about 1 min; --facts-only: the facts leg alone
+                                 (a stalled call's no-progress fact riding one continuation), about 7 min, not yet in
+                                 the default run; --upgrade-only: one live handoff;
                                  --raw-upgrade-only: started through the produced primary with its managed entry
                                  absent, automatic crash repair, then a live handoff; --window-only: the window
                                  pass, four tabs' chip lines, pads, state lines, hovers, This Mac and menu rows, judged by
                                  what the package's build tells, then END's idle window with Settings ▸ Harness open and
-                                 shut; the default run leaves it out); its scratch world is kept
-                                 once its bus stands; the rollout leg expects what --expect-rollout says, else what the lab's compiled
-                                 CODEX_MEASURED_BUILDS says of the package's build; one proof at a time on this Mac (it
+                                 shut; the default run leaves it out; --capacity-only: the full proof's last leg alone,
+                                 the package's `codex exec` recovering from a 503 with Retry-After and refusing a 403
+                                 in a jail of its own against the lab's loopback model, ~10 s, no aterm; one lane a
+                                 run); its scratch world is kept once its bus stands; the rollout leg expects what
+                                 --expect-rollout says, else what the lab's compiled CODEX_MEASURED_BUILDS says of the
+                                 package's build; one proof at a time on this Mac (it
                                  waits up to 20 min for another to end, then is NOT RUN); an --aterm older than the
                                  lifeline every lab launch is armed with (its broker refuses --lifeline-fd) is NOT RUN
   codex-boxes [--runs N] [--package DIR] [--aterm PATH] [--keep]
@@ -907,11 +986,11 @@ Outside any lab (no jail, no stub):
   windows up|down|status|exec|smoke|window|destroy
                                  manage and run the Windows 11 arm64 QEMU VM runtime lane on aarch64 and Prism x86_64 (`windows help`)
 
-Every verb that opens a window (--window, and the Linux lane's GUI rows) first waits for a quiet machine: alone
-among quiet claims in the per-user capacity ledger, until the 1-minute load is low or, next in line, its patience
-runs out. Once a minute it says what it waits for, when it holds back claimed work that asks after it, and when it
-starts whatever the load. `--admit now` (or `--admit=now`), given to any verb, starts it at once, and a lane's VM
-boot without waiting for disk.
+Windowed Instances coordinate one original lab run at a time through the account's window lane.
+Ordinary windows request measured Timing admission; unknown CPU observation, expired patience or
+`--admit now` cannot qualify them. The explicit functional allocation-monitor window reserves memory
+without a quiet-CPU requirement or timing claim and also refuses `--admit now`. Other resource-only
+lanes retain their own --admit policy. Admission says once a minute what it is waiting for.
 
 Exit: 0 pass, 1 a finding or a refusal (also an unknown command and, on many verbs, a bad argument), 2 usage,
 3 could not run, 128+N cut short by signal N (INT, TERM, HUP).
@@ -1048,10 +1127,12 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "service-acceptance" => service_acceptance::cmd(args),
         "artifact-serve" => artifact_serve::cmd(args),
         "fleet-menu" => fleet_menu::cmd(args),
-        "alab-roll" => alab_roll::cmd(args),
+        "local-signins" => local_signins::cmd(args),
+        "reveal-tab" => reveal_tab::cmd(args),
         "commons-lan" => commons_lan::cmd(args),
         "commons-startup" => commons_startup::cmd(args),
         "swarm" => swarm::cmd_swarm(args),
+        "mesh" => mesh_churn::cmd(args),
         "mode" => verbs::cmd_mode(args),
         "limit" => verbs::cmd_limit(args),
         "tool" => verbs::cmd_tool(args),
@@ -1101,6 +1182,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "crash" => crash::cmd_crash(args),
         "sleep" => sleep::cmd_sleep(args),
         "workers" => workers::cmd_workers(args),
+        "work-overlap" => work_overlap::cmd_work_overlap(args),
         "git-starts" => git_starts::cmd_git_starts(args),
         "footers" => footers::cmd_footers(args),
         "halfdraw" => halfdraw::cmd_halfdraw(args),
@@ -1123,6 +1205,9 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "video-sheet" => video_sheet::cmd(args),
         "system-state-gallery" => system_state_gallery::cmd_system_state_gallery(args),
         "allocation-monitor" => allocation_monitor::cmd(args),
+        "window-custody" => window_custody::cmd(args),
+        "window-custody-owner" => window_custody::owner(args),
+        "window-handoff-app" => window_custody::app_band(args),
         "trail-diff" => trail_diff::cmd_trail_diff(args),
         "trail-census" => trail_census::cmd_trail_census(args),
         "trail-companion" => trail_companion::cmd_trail_companion(args),
@@ -1133,7 +1218,6 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "aos-repair" => aos_repair::cmd_aos_repair(args),
         "aos-cadence" => aos_cadence::cmd_aos_cadence(args),
         "aos-search" => aos_search::cmd_aos_search(args),
-        "aos-workers-bench" => aos_workers_bench::cmd_aos_workers_bench(args),
         "aos-gpu-bench" => aos_gpu_bench::cmd_aos_gpu_bench(args),
         "aos-learn" => aos_learn::cmd_aos_learn(args),
         "aos-learn-bench" => aos_learn_bench::cmd_aos_learn_bench(args),
@@ -1228,6 +1312,10 @@ fn main() -> std::process::ExitCode {
         Some(name @ ("zsh" | "-zsh" | "bash" | "-bash")) => link::as_shell(name, &args),
         Some("security") => tripwire::main(&args),
         Some("open") => recorder::main(&args),
+        #[cfg(target_os = "macos")]
+        Some("claude" | "codex" | "grok" | "agy") if local_signins::is_standin(&argv0) => {
+            local_signins::standin_main(&argv0, &args)
+        }
         Some("claude") => {
             if swarm::standin_configured() {
                 swarm::claude_main(&args)
@@ -1240,6 +1328,7 @@ fn main() -> std::process::ExitCode {
         Some("build-loop") => fleet_fixture::build_loop(&args),
         Some("ps") => codex_rig::ps_main(&args),
         _ => {
+            link_notice::arm();
             let cmd = args.first().cloned().unwrap_or_default();
             let rest = args.get(1..).unwrap_or_default();
             match cmd.as_str() {
@@ -1257,11 +1346,15 @@ fn main() -> std::process::ExitCode {
                 "band-standin" => band::standin_main(rest),
                 "presence-standin" => presence::standin_main(rest),
                 slot_lane::HOLD_VERB => slot_lane::hold_main(rest),
-                aos_workers::WORKER_VERB => aos_workers::worker_main(rest),
                 swarm::partition::AGENT_VERB => swarm::partition::agent_main(rest),
                 swarm::partition::ACT_VERB => swarm::partition::act_main(rest),
                 "init" if std::env::var_os(swarm::partition::AGENT_SEAM).is_some() => {
                     swarm::partition::converge_standin(rest).unwrap_or(2)
+                }
+                mesh_churn::MEMBER_VERB => mesh_churn::member_main(rest),
+                mesh_churn::ACT_VERB => mesh_churn::act_main(rest),
+                "init" if std::env::var_os(mesh_churn::MEMBER_SEAM).is_some() => {
+                    mesh_churn::converge_standin(rest).unwrap_or(2)
                 }
                 "key-dump" => meta_keys::keydump_main(rest),
                 "mcp-standin" => codex_rig::mcp_main(rest),
@@ -1280,6 +1373,7 @@ fn main() -> std::process::ExitCode {
                                 | "fleet-sim"
                                 | "artifact-serve"
                                 | "swarm"
+                                | "mesh"
                                 | "reduce"
                                 | "trail-contrast"
                                 | "video-sheet"

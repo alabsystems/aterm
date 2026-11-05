@@ -220,6 +220,7 @@ fn an_acts_row_replays_in_the_boot_spelling_its_tape_recorded() {
                 &row,
                 Some(&count),
                 spelling.as_deref(),
+                None,
                 &mut io::sink(),
             )
             .expect("a named ledger returns its row without opening it");
@@ -293,6 +294,7 @@ fn an_acts_row_replays_in_the_boot_spelling_its_tape_recorded() {
                     &row,
                     Some(&count),
                     Some(other),
+                    None,
                     &mut io::sink(),
                 ),
                 Some(row.to_json_counted(1_790_000_000_000, Some("s-1"), Some(&count))),

@@ -386,8 +386,8 @@ impl Rig {
             std::fs::create_dir_all(dir.join("zdot"))?;
             std::fs::create_dir_all(&proj)?;
             let q = |p: &Path| crate::util::shell_quote(&p.to_string_lossy());
-            std::fs::write(
-                dir.join("zdot/.zshrc"),
+            crate::util::write_fresh(
+                &dir.join("zdot/.zshrc"),
                 format!(
                     "PS1='%# '\nunsetopt PROMPT_SP\nHISTFILE=/dev/null\n\
                      export PATH={}:{}:/usr/bin:/bin:/usr/sbin:/sbin\n\
@@ -612,10 +612,7 @@ impl Rig {
 
     /// How many starts the stand-in has logged.
     fn starts(&self) -> usize {
-        crate::util::scratch_text(&self.standin_log)
-            .lines()
-            .filter(|l| l.split_whitespace().nth(1) == Some("start"))
-            .count()
+        judge::starts_of(&crate::util::scratch_text(&self.standin_log)).len()
     }
 
     /// The tab's harness acts as aterm's timeline books them (informational: aterm books acts
@@ -680,11 +677,20 @@ impl Rig {
         Ok(self.wait_frame(sid, MUST, |f| Some(f.pid) != old)?)
     }
 
-    /// Whether the stand-in started again (a start logged past `starts`) within the harness's
-    /// look window after an intended end.
-    fn relaunched_after(&self, starts: usize) -> Result<bool, Stopped> {
+    /// Whether harness `harness` started the stand-in again (a start logged past `starts` whose
+    /// parent it is, [`judge::started_by`]) within its look window after an intended end. A start
+    /// someone else made (aterm's built-in lane typing its resume line) is said, not judged.
+    fn relaunched_after(&self, starts: usize, harness: Option<u32>) -> Result<bool, Stopped> {
         stop::sleep(self.play.settle + Duration::from_secs(3))?;
-        Ok(self.starts() > starts)
+        let all = judge::starts_of(&crate::util::scratch_text(&self.standin_log));
+        let since = all.get(starts..).unwrap_or_default();
+        let by = judge::started_by(since, harness);
+        if !by && !since.is_empty() {
+            println!(
+                "      info: the stand-in started again after the end, not by the harness: {since:?}"
+            );
+        }
+        Ok(by)
     }
 
     /// Wait for the tab's newest block running the harness to end, and read its exit.
@@ -740,9 +746,12 @@ impl Rig {
         }
     }
 
-    fn end(mut self) -> PathBuf {
-        self.inst.stop();
-        self.world.dir.clone()
+    fn end(mut self) -> (PathBuf, Result<(), String>) {
+        let cleanup = self.inst.stop();
+        if cleanup.is_err() {
+            self.world.keep();
+        }
+        (self.world.dir.clone(), cleanup)
     }
 }
 
@@ -960,9 +969,10 @@ fn serving_legs(rig: &Rig, built: &Built, r: &mut Report) -> Result<(), Fail> {
         ),
     );
     let starts = rig.starts();
+    let harness = rig.leader(&sid);
     rig.type_line(&sid, "/exit 130")?;
     let exit = rig.harness_exit(&sid)?;
-    let again = rig.relaunched_after(starts)?;
+    let again = rig.relaunched_after(starts, harness)?;
     r.leg(
         LEGS[7],
         &judge::ended("the child's own exit 130", exit, 130, None, again),
@@ -982,7 +992,7 @@ fn serving_legs(rig: &Rig, built: &Built, r: &mut Report) -> Result<(), Fail> {
         let starts = rig.starts();
         let sent = rig.on(&sid, &["signal", word, &format!("pid={pid}")]);
         let exit = rig.harness_exit(&sid)?;
-        let again = rig.relaunched_after(starts)?;
+        let again = rig.relaunched_after(starts, Some(pid))?;
         let said = judge::said_signal(&rig.screen(&sid), name);
         r.leg(
             leg,
@@ -1181,15 +1191,15 @@ pub fn cmd_harness_proof(args: &[String]) -> Res {
     println!("serving aterm (contract=2,3):");
     let rig = Rig::start(s, play, &aterm, &standin, &built.plain, true)?;
     let outcome = serving_legs(&rig, &built, &mut r);
-    let kept = rig.end();
+    let (kept, cleanup) = rig.end();
     println!("  kept {}", kept.display());
-    outcome?;
+    crate::instance::after_stop(outcome, cleanup)?;
     println!("negative control (ATERM_DEV_NO_CONTRACT3=1: no contract= served):");
     let rig = Rig::start(s, play, &aterm, &standin, &built.plain, false)?;
     let outcome = control_legs(&rig, &mut r);
-    let kept = rig.end();
+    let (kept, cleanup) = rig.end();
     println!("  kept {}", kept.display());
-    outcome?;
+    crate::instance::after_stop(outcome, cleanup)?;
     let failed: Vec<&str> = r
         .legs
         .iter()

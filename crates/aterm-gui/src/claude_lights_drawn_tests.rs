@@ -563,6 +563,28 @@ fn chrome_says_the_chips_description_as_its_node_does() {
         node_description(&app, wid, session),
         "{line}"
     );
+    // The entry's own tail, as the title words it (the post-landing review, 2026-11-02).
+    need(
+        &mut app,
+        session,
+        Some("claude needs you: approve the 0.48.0 release notes \u{2014} waits on you"),
+    );
+    frame(&mut app, wid);
+    let line = line_of(&app, session);
+    assert_eq!(
+        quoted(&line, "description"),
+        Some(format!(
+            "Needs you: approve the 0.48.0 release notes. {}",
+            crate::needs::NeedTail::WaitsOnYou.sentence()
+        )),
+        "{line}"
+    );
+    #[cfg(a11y_tree)]
+    assert_eq!(
+        quoted(&line, "description"),
+        node_description(&app, wid, session),
+        "{line}"
+    );
     set_word(&app, session, Autopilot::Land);
     assert!(crate::harness_glass::on_land_held(
         &mut app,

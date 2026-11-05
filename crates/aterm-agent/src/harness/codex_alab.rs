@@ -22,10 +22,28 @@ pub const ALAB_BUILD_JSON: &str = "alab-build.json";
 const MAX_PACKAGE_BYTES: u64 = atpkg::alab::MAX_PACKAGE_JSON_BYTES as u64;
 
 fn package_text(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(not(unix))]
     if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
         return None;
     }
-    let text = super::footer::read_small(path, MAX_PACKAGE_BYTES + 1)?;
+    let file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_PACKAGE_BYTES {
+        return None;
+    }
+    let cap = usize::try_from(meta.len().saturating_add(1)).unwrap_or(0);
+    let mut text = String::with_capacity(cap);
+    file.take(MAX_PACKAGE_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
     (text.len() as u64 <= MAX_PACKAGE_BYTES).then_some(text)
 }
 
@@ -85,13 +103,10 @@ pub fn linked_package_versions(layout: &atpkg::Layout, program: &str) -> Option<
 fn package_versions(exe: &Path) -> Option<(String, String)> {
     let (root, manifest) = package_root(exe)?;
     let marker_path = root.join(ALAB_BUILD_JSON);
-    let marker = std::fs::symlink_metadata(&marker_path).ok()?;
-    if !marker.file_type().is_file() {
-        return None;
-    }
+    let marker_text = package_text(&marker_path)?;
     let v: Value = aterm_json::from_str(&manifest).ok()?;
     let version = v.get("version")?.as_str()?;
-    let record: Value = aterm_json::from_str(&package_text(&marker_path)?).ok()?;
+    let record: Value = aterm_json::from_str(&marker_text).ok()?;
     let record = record.as_object()?;
     if record
         .get("version")

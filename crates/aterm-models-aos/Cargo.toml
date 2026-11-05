@@ -8,7 +8,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "aterm's models of Aos hosted execution (ty_model!): the boundary publication, for aterm-aos's Tier-1 test, M5b's worker-lease ledger and the key hold, for aterm-effects' and aterm-gui's Tier-1 tests; and spec-check"
+description = "aterm's models of Aos hosted execution (ty_model!): the boundary publication, for aterm-aos's Tier-1 test, and the key hold, for aterm-effects' and aterm-gui's Tier-1 tests; and spec-check"
 # The Tier-0 tests compile as ONE suite (tests/suite.rs): a tests/*.rs that is neither
 # the suite nor a `mod` of it compiles into nothing.
 autotests = false

@@ -8,18 +8,20 @@
 //! A control client works an Editor buffer with the window's rights: the `edit` verb (`amacs
 //! --no-wait`) opens a file in one, `act` presses Settings ▸ Harness's Open aterm.toml, the
 //! `key`, `text` and `paste` verbs type into the front native view
-//! ([`crate::App::input_to_session`]), and a key, `act` or `invoke Save` saves it. An Editor also
-//! saves its document when its tab closes or the app quits, whoever closed it. So a save of the
-//! aterm.toml in force whose owner keys differ from the file's is refused when a control client
-//! made the save, or when an edit no person here is known to have made reached the buffer
-//! ([`Unvouched`]); a save queued behind one in flight is replayed under the mark of whoever
-//! asked for it ([`queued_by_controller`]). An accessibility client's edit or press counts as a
-//! control client's here ([`Unvouched::Assistive`]): every tab's program reaches the window's
-//! accessibility tree with aterm's own grant, so aterm cannot tell its request from a screen
-//! reader's. While the aterm.toml in force names no file, a save that makes one in the folder it
-//! would be made in counts as a save of it, whatever the new file's name ([`is_in_force`]).
-//! Discarding the mark's buffer starts its undo at the file's text ([`discard_starts_history`]).
-//! Every other save goes on as before.
+//! ([`crate::App::input_to_session`]), and a key, `act` or `invoke Save` saves it. A key, click or
+//! scroll another process posts into the window (System Events, `CGEventPost` from a program in a
+//! tab) is no person's here either ([`Unvouched::Relayed`], [`crate::hwkey::classify`]). An Editor
+//! also saves its document when its tab closes or the app quits, whoever closed it. So a save of
+//! the aterm.toml in force whose owner keys differ from the file's is refused when a control
+//! client or another process's input made the save, or when an edit no person here is known to
+//! have made reached the buffer ([`Unvouched`]); a save queued behind one in flight is replayed
+//! under the mark of whoever asked for it ([`queued_by_controller`]). An accessibility client's
+//! edit or press counts as a control client's here ([`Unvouched::Assistive`]): every tab's
+//! program reaches the window's accessibility tree with aterm's own grant, so aterm cannot tell
+//! its request from a screen reader's. While the aterm.toml in force names no file, a save that
+//! makes one in the folder it would be made in counts as a save of it, whatever the new file's
+//! name ([`is_in_force`]). Discarding the mark's buffer starts its undo at the file's text
+//! ([`discard_starts_history`]). Every other save goes on as before.
 
 use std::path::{Path, PathBuf};
 
@@ -35,6 +37,12 @@ pub(crate) enum Unvouched {
     /// holding aterm's Accessibility grant, as every tab's program does through aterm, send the
     /// same request ([`crate::App::with_assistive_source`]).
     Assistive,
+    /// A key, click or scroll another process posted into the window made it
+    /// ([`crate::hwkey::NativeInput`]'s source is neither the HID system nor aterm): a person
+    /// relaying their own input (Screen Sharing, an on-screen keyboard) and a program holding
+    /// aterm's Accessibility grant, as every tab's program does through aterm, post the same
+    /// events ([`crate::App::with_origin_mark`]).
+    Relayed,
     /// A journal's draft put it there when the document opened: the process that wrote the
     /// journal knew who typed it, this one does not.
     Recovered,
@@ -48,8 +56,8 @@ pub(crate) struct Provenance {
 }
 
 impl Provenance {
-    /// A save a control client or an accessibility client made (`controller_save`) of a buffer
-    /// `edit` reached.
+    /// A save a control client, an accessibility client or another process's input made
+    /// (`controller_save`) of a buffer `edit` reached.
     pub(crate) fn new(controller_save: bool, edit: Option<Unvouched>) -> Self {
         Self {
             controller_save: controller_save && !fault::armed(fault::Fault::SaveIgnoresSource),
@@ -90,6 +98,12 @@ impl Provenance {
                  from Disk’, then edit them yourself"
                     .to_string()
             }
+            (false, Some(Unvouched::Relayed)) => {
+                "Save blocked · aterm.toml's [harness] occupancy keys are the owner's, and \
+                 another program's keys or clicks edited this buffer; choose ‘Discard Changes \
+                 and Reload from Disk’, then edit them yourself"
+                    .to_string()
+            }
             (false, Some(Unvouched::Recovered)) => {
                 "Save blocked · aterm.toml's [harness] occupancy keys are the owner's, and this \
                  buffer is a recovered draft; choose ‘Discard Changes and Reload from Disk’, \
@@ -104,9 +118,9 @@ impl Provenance {
     }
 }
 
-/// Whether a save queued behind one in flight is a control client's or an accessibility
-/// client's (`controller`): its replay, when the one in flight lands, is made under a control
-/// client's mark.
+/// Whether a save queued behind one in flight is a control client's, an accessibility client's
+/// or another process's input's (`controller`): its replay, when the one in flight lands, is made
+/// under a control client's mark.
 pub(crate) fn queued_by_controller(controller: bool) -> bool {
     controller && !fault::armed(fault::Fault::QueueDropsSource)
 }
@@ -212,8 +226,8 @@ pub(crate) mod fault {
     pub(crate) enum Fault {
         /// [`super::Provenance`] takes a control client's save for a person's.
         SaveIgnoresSource,
-        /// [`super::Provenance`] takes a buffer a control client or an accessibility client
-        /// edited, or a recovered draft, for one a person typed.
+        /// [`super::Provenance`] takes a buffer a control client, an accessibility client or
+        /// another process's input edited, or a recovered draft, for one a person typed.
         SaveIgnoresEdits,
         /// A save queued behind one in flight forgets the control client that asked for it.
         QueueDropsSource,

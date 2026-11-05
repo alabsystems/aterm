@@ -629,17 +629,30 @@ fn opts_for(sc: &Scenario, host: Option<&Arc<AccountHost>>) -> SuperviseOpts {
     }
 }
 
+/// The scenario's host, answering `answers` with `claims` ([`AccountHost::claiming`]).
 fn host_for(
     sc: &Scenario,
     answers: &[&'static str],
     tail: Option<String>,
+    claims: &[RestartClaim],
 ) -> Option<Arc<AccountHost>> {
     sc.host.as_ref().map(|_| {
-        let h = AccountHost::scripted(&[None], answers);
+        let h = AccountHost::claiming(&[None], answers, claims);
         *h.tail.lock().unwrap() = tail;
         h
     })
 }
+
+/// What the first loop's relaunch says of the conversation's record (`RestartAnswer::claim`):
+/// every answer a scenario's relaunch gives comes after its ask claimed the record
+/// (`wait:resume`, `relaunched`), the first taking the claim and each after it holding it.
+const FIRST_CLAIMS: [RestartClaim; 2] = [RestartClaim::Taken, RestartClaim::Held];
+
+/// What a successor's relaunch says of the record: its ask meets the record the first loop's ask
+/// claimed (`RestartClaim::Held`), the claim the successor restored from the journal; a run of
+/// its own the successor minted holds it from its own second, as the first loop's first ask takes
+/// it at its own.
+const SUCCESSOR_CLAIMS: [RestartClaim; 1] = [RestartClaim::Held];
 
 struct First {
     events: Vec<(i64, String, Ev, Option<usize>)>,
@@ -665,6 +678,7 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
         sc,
         sc.host.as_ref().map_or(&[][..], |(a, _)| a.as_slice()),
         sc.host.as_ref().and_then(|(_, t)| t.clone()),
+        &FIRST_CLAIMS,
     );
     let opts = opts_for(sc, host.as_ref());
     let mut m = Mock::new(vec![Vec::new()]);
@@ -1023,7 +1037,7 @@ fn run_follower_cut(
         .map(|(t, ..)| *t)
         .max()
         .map(|k| k + first.slept_between(k, h));
-    let host = host_for(sc, &["relaunched"], tail);
+    let host = host_for(sc, &["relaunched"], tail, &SUCCESSOR_CLAIMS);
     let opts = opts_for(sc, host.as_ref());
     let mut m = Mock::new(vec![Vec::new()]);
     let mut l = Loop {
@@ -7344,12 +7358,7 @@ fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
             let (rule, reason) = (text("rule_id"), text("reason"));
             let row = match (text("decision"), rule) {
                 (_, r) if records.contains(&r) => return None,
-                ("waiting", RULE_MODEL_FALLBACK)
-                    if reason == FALLBACK_ASKED
-                        || reason.starts_with("the fallback's relaunch was asked") =>
-                {
-                    return None;
-                }
+                ("waiting", RULE_MODEL_FALLBACK) if reason == FALLBACK_ASKED => return None,
                 ("typed", _) if reason.starts_with("the turn-end policy") => {
                     let mut r = reason.to_string();
                     for mark in MARKS {

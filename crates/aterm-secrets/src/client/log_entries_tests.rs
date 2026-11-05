@@ -1557,6 +1557,20 @@ fn a_mac_the_envelope_admits_stays_in_while_the_log_holds_no_wrap_for_it() {
     let m9_rec = machine_identity(&m9).unwrap().recipient().to_bech32();
     let aside = root.path().join("m22.records.aside");
     std::fs::rename(m22.records_file(), &aside).unwrap();
+    // The simulated 0.145 admin predates retained-history enrollment as well as records.
+    let frontier_files = [
+        "records.frontiers",
+        "frontiers.anchor",
+        "frontiers.astream",
+        "frontiers.checkpoint",
+    ];
+    for name in frontier_files {
+        std::fs::rename(
+            m22.dir.join(name),
+            m22.dir.join(format!("{name}.legacy-test")),
+        )
+        .unwrap();
+    }
     {
         let admin = admin_open(&m22).unwrap();
         let mut doc = admin.doc.clone();
@@ -1564,6 +1578,13 @@ fn a_mac_the_envelope_admits_stays_in_while_the_log_holds_no_wrap_for_it() {
         admin_publish_approved(&m22, &admin, &doc, std::slice::from_ref(&m9_rec)).unwrap();
     }
     std::fs::rename(&aside, m22.records_file()).unwrap();
+    for name in frontier_files {
+        std::fs::rename(
+            m22.dir.join(format!("{name}.legacy-test")),
+            m22.dir.join(name),
+        )
+        .unwrap();
+    }
 
     // m9 joins before any record reaches it, and reads the envelope.
     join_host(&m9, &pinned, "m9");
@@ -2961,6 +2982,7 @@ pub(super) fn hand(
                 crate::members::bundle::Reader::Files
             },
             restore: false,
+            node_proven: false,
             held: None,
         },
     )
@@ -3018,6 +3040,7 @@ fn a_bundle_built_under_the_desks_hold_names_the_policys_servers() {
                     crate::members::bundle::Reader::Files
                 },
                 restore: false,
+                node_proven: false,
                 held: Some(&hold),
             },
         )
@@ -3341,6 +3364,7 @@ pub(super) fn hand_result(
                 crate::members::bundle::Reader::Files
             },
             restore: false,
+            node_proven: false,
             held: None,
         },
     )
@@ -3423,6 +3447,7 @@ fn a_mac_the_log_removed_is_not_let_back_in_by_a_members_allow() {
             allowed: &allowed3,
             reader: crate::members::bundle::Reader::LegacyLog,
             restore: false,
+            node_proven: false,
             held: None,
         },
     )
@@ -3541,6 +3566,7 @@ fn join_reader_capacity_is_checked_before_and_after_admission() {
                     allowed: &allowed,
                     reader,
                     restore: false,
+                    node_proven: false,
                     held: None,
                 },
             )
@@ -3682,6 +3708,7 @@ fn join_bundles_keep_waiting_records_local_and_fit_the_advertised_history() {
                     allowed: &allowed,
                     reader,
                     restore: false,
+                    node_proven: false,
                     held: None,
                 },
             )
@@ -3899,6 +3926,84 @@ fn a_new_mac_takes_alabs_genesis_only_from_keys_its_build_names() {
         );
     }
     drop(root);
+}
+
+/// A Mac another member removes in the log is not let back into the vault by its Allow, though
+/// the admin's approver still holds the request the Mac queued with it and the admin's own
+/// `code-only` never named its key (only the admin's own removal does): the approver judges it
+/// once and approves nothing, pass after pass. The mesh churn lab found the loop this ends (`lab
+/// mesh churn --n 30 --seed 1793870641921`): the removed Mac let back in by its old Allow, left
+/// out by the next version, let back in again, for good.
+///
+/// NEGATIVE CONTROL: drop the `recipient_is_removed` look from `auto_approve_listed`'s `allowed`:
+/// the approver lets m40 back in and the `"nothing for the removed m40"` assert fails
+/// (`left: ["m40"]`).
+#[test]
+fn a_mac_another_member_removed_is_not_let_back_in_by_the_allow_it_queued() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let (m40, request, allowed) = newcomer(macs.root.path(), m7, "m40");
+    let (bundle, logged) = hand(m7, &request, &allowed, true);
+    assert!(logged);
+    post_records_to_servers(m7).expect("m7 posts the admission");
+    write_from_log_bundle(&m40, &bundle).expect("m40 writes from the log");
+    let recipient = request.binding().recipient().to_bech32();
+    let queued = || {
+        requests_for(m22, &config(m22).unwrap().unwrap(), None)
+            .unwrap()
+            .into_iter()
+            .filter(|asked| asked.recipient == recipient && asked.allowed.is_some())
+            .collect::<Vec<_>>()
+    };
+    ask_again_if_due(&m40, &config(&m40).unwrap().unwrap(), &|_| {});
+    let asked = queued();
+    assert_eq!(asked.len(), 1, "CONTROL: m40's Allowed is queued");
+
+    // m7 removes m40 in the log, and the admin reads the removal; its own `code-only` does not
+    // name m40's key.
+    remove_member_in_log(m7, request.binding().actor()).expect("m7 removes m40");
+    post_records_to_servers(m7).expect("m7 posts the removal");
+    sync_records(m22, None).expect("m22 pulls the removal");
+    let admin = admin_open(m22).unwrap();
+    assert!(
+        !admin.published_doc.code_only().contains(&recipient),
+        "CONTROL: the admin's own list never let m40's key go"
+    );
+    assert!(
+        !admin
+            .published_doc
+            .machines()
+            .iter()
+            .any(|machine| machine.recipient == recipient),
+        "CONTROL: m40 is in no [machines] the admin publishes"
+    );
+    for pass in 0..2 {
+        let done = auto_approve_listed(
+            m22,
+            &admin_open(m22).unwrap(),
+            &asked,
+            &mut false,
+            &mut BTreeSet::new(),
+            (&mut JoinKeys::default(), None),
+        )
+        .unwrap();
+        assert_eq!(
+            done.approved,
+            Vec::<String>::new(),
+            "nothing for the removed m40 (pass {pass})"
+        );
+    }
+    assert!(
+        !admin_open(m22)
+            .unwrap()
+            .doc
+            .machines()
+            .iter()
+            .any(|machine| machine.recipient == recipient),
+        "m40 stays out of the vault"
+    );
+    macs.server.stop();
+    drop(macs.root);
 }
 
 /// A Mac the log let in keeps its `Allowed` and posts it to its source each hour until an
@@ -4242,7 +4347,7 @@ fn admitted_beside_a_concurrent_epoch(
         .open_audience_entries(&read_identity(m7).unwrap().unwrap())
         .unwrap()
         .unwrap();
-    let gaps = log.wrap_gaps(&opened, &[crate::membership_log::EpochAudience::Everyone]);
+    let gaps = log.wrap_gaps(&opened, &[crate::membership_log::SeatAudience::Everyone]);
     assert_eq!(gaps.len(), 1, "{gaps:?}");
     let gap = gaps[0].clone();
     let (_, a7, _) = member_key(m7);
@@ -4317,6 +4422,19 @@ fn a_wrap_gap_after_a_concurrent_epoch_is_closed_by_one_holder() {
     drop(macs.root);
 }
 
+/// Unproved founders (Genesis v2 founders with no seat yet) respect the Commons audience: `m7` and
+/// `m9`, in Commons control's host list, open Commons from the log and may enroll; vault-only
+/// `v1` does neither. Under one-mesh M1 and M4 an unproved founder is no member, so the next
+/// rotation's carry (the current seats) drops it: `m9` keeps Commons across `m7`'s retirement only
+/// because it first takes a seat through log enrollment (the design's step 0: each live seatless
+/// recipient asks the desk for a seat). Retiring the still-unproved `m7` rotates both audiences
+/// away from it and bars it from enrollment; revoking the seated `m9` does the same; a concurrent
+/// non-retiring Commons epoch merged in does not undo `m7`'s retirement; a post-genesis vault
+/// machine `p1` is barred the moment it is retired.
+///
+/// NEGATIVE CONTROL: skip `m9`'s `enroll_commons_member_in_log` (leave it an unproved founder):
+/// `m7`'s retirement carries only the current seats, drops the seatless `m9`, and the
+/// `log_after_retire.wraps_maximal_audience_to(&EpochAudience::Commons, &m9_rec)` assert fails.
 #[test]
 fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_enrollment() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4446,8 +4564,35 @@ fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_en
         "vault-only founder v1 must be refused Commons enrollment"
     );
 
+    // One-mesh M1: an unproved founder holds no seat, so it is no current recipient and the next
+    // rotation drops it. `m9` takes a seat through log enrollment (an `Evidence::Listed` `Admit`
+    // on its possession proof); `m7` stays unproved.
+    assert!(
+        !log_initial
+            .current_recipients(&EpochAudience::Commons)
+            .contains(&m9_rec),
+        "CONTROL: unproved founder m9 holds no seat before it enrolls"
+    );
+    let (mut pending9, challenge9) = Pending::issue(&req9, trust.network, trust.authority).unwrap();
+    let answer9 = Device::open(&m9)
+        .unwrap()
+        .unwrap()
+        .answer(&req9, &challenge9)
+        .unwrap();
+    let possession9 = pending9.verify(&answer9).unwrap();
+    enroll_commons_member_in_log(&m22, trust, req9.clone(), possession9)
+        .expect("unproved founder m9 takes a seat");
+    let log_seated = load_records(&m22).unwrap().log().unwrap().clone();
+    let seats = log_seated.current_recipients(&EpochAudience::Commons);
+    assert!(seats.contains(&m9_rec), "enrolled m9 holds a current seat");
+    assert!(
+        !seats.contains(&m7_rec),
+        "m7, never enrolled, is still seatless"
+    );
+
     // Retiring unproved founder `m7` via `admin_retire` rotates `EpochAudience::Commons` and
-    // `EpochAudience::Everyone` away from `m7` while preserving unproved founder `m9`'s wraps.
+    // `EpochAudience::Everyone` away from `m7` while the carry, the current seats, keeps the
+    // seated `m9`'s wraps.
     let admin = admin_open(&m22).unwrap();
     let retired_m7 = admin_retire(&m22, &admin, &["m7".to_owned()]).expect("retire unproved m7");
     assert!(retired_m7.changed);
@@ -4478,9 +4623,10 @@ fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_en
     );
     check_log_commons_enrollment(&m22, trust, req9.binding()).expect("m9 still eligible");
 
-    // Revoking unproved founder `m9` via `admin_revoke` rotates `EpochAudience::Commons` away from
-    // `m9` and bars `m9` from Commons enrollment, while keeping previously retired `m7` out of
-    // `commons_eligibility`, `EpochAudience::Commons`, and `EpochAudience::Everyone`.
+    // Revoking listed founder `m9` (seated above) via `admin_revoke` rotates
+    // `EpochAudience::Commons` away from `m9` and bars `m9` from Commons enrollment, while keeping
+    // previously retired unproved founder `m7` out of `commons_eligibility`,
+    // `EpochAudience::Commons`, and `EpochAudience::Everyone`.
     let admin = admin_open(&m22).unwrap();
     assert!(
         !admin.commons_eligibility.includes("m7", m7_rec),
@@ -4691,9 +4837,12 @@ fn the_tender_coalesces_concurrent_remove_epochs_and_skips_superseded_everyone_e
     // log-admitted members into `swarm_roster`, and resolves its own canonical `m<N>` label.
     let wire22 = load_records(m22).unwrap().encode();
     save_records(&_m10, &wire22).unwrap();
-    let roster10 = super::roster::swarm_roster(&_m10)
-        .unwrap()
-        .expect("log-only member swarm_roster");
+    let roster10 = swarm_roster_until(
+        &_m10,
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    .expect("log-only member swarm_roster");
     let labels10: BTreeSet<String> = roster10.members.iter().map(|m| m.label.clone()).collect();
     assert!(labels10.contains("m22"));
     assert!(labels10.contains("m7"));
@@ -4924,6 +5073,7 @@ fn a_busy_member_ends_a_log_run_with_the_refusal_inside_the_ask_exchanges_bound(
                 allowed: &allowed,
                 reader: crate::members::bundle::Reader::LegacyLog,
                 restore: false,
+                node_proven: false,
                 held: None,
             },
         );
@@ -5217,40 +5367,28 @@ fn second_member_remove_after_sync_forms_quorum_and_voids_post_cutoff_records() 
     post_records_to_servers(m7).expect("m7 posts admit records");
     sync_records(m22, None).expect("m22 pulls admit records");
 
-    // 0. Before any `Body::Remove`, if `m22` rotates `Everyone` and `Commons` epochs leaving `m40`
-    //    out on purpose (`left_out`), the vault passes must not re-wrap them to `m40`,
-    //    `check_log_commons_enrollment` must refuse `m40`, and `admit_by_phrase` must keep `m40`
-    //    out even if it asks under a new device writer seed with the same age recipient.
+    // 0. Before any `Body::Remove`, a re-key by `m22` that leaves `m40` out of `Everyone` and
+    //    `Commons` is no revocation (one-mesh M1): `m40` still holds a seat no `Remove` names, so
+    //    each missing `Wrap` is a gap and the vault passes heal it. Only the `Remove` below keeps
+    //    `m40` out.
     let rec_m40 = request.binding().recipient();
-    let trust = Bootstrap::required(m22).unwrap().trust();
     {
         let lock = StateLock::take(m22).unwrap();
         log_entries::retire_recipients_in_log_local(m22, &lock, &[], &BTreeSet::from([rec_m40]))
             .expect("rotate epochs excluding m40");
     }
-    assert!(
-        vault_passes(m22).is_empty(),
-        "the vault passes must not re-wrap epochs to a left-out member"
-    );
-    assert!(
-        log_entries::check_log_commons_enrollment(m22, trust, request.binding()).is_err(),
-        "Commons enrollment must refuse a member left out of Commons on purpose"
-    );
-    sync_records(m7, None).expect("m7 pulls left-out epoch rotation");
-    let id_m40 = read_identity(&m40).unwrap().unwrap();
-    let rotated_dev_req = crate::commons::binding::Request::create(
-        trust.network,
-        trust.authority,
-        [0x91; 16],
-        [0x92; 16],
-        &id_m40,
-        &[0x93; 32],
-    )
-    .unwrap();
-    assert!(matches!(
-        admit::admit_by_phrase(m7, &rotated_dev_req, [0x99; 32], "m40", 500).unwrap(),
-        admit::ByLog::KeptOut(_)
-    ));
+    let healed = vault_passes(m22);
+    let log22 = load_records(m22).unwrap().log().unwrap().clone();
+    for audience in [EpochAudience::Everyone, EpochAudience::Commons] {
+        assert!(
+            log22.wraps_maximal_audience_to(&audience, &rec_m40),
+            "the vault passes heal m40 into the newest {audience:?} epoch: {} signed",
+            healed.len()
+        );
+    }
+    // `vault_pass_at` leaves posting to its caller; m22's later records build on the heals.
+    post_records_to_servers(m22).expect("m22 posts the re-key and its heals");
+    sync_records(m7, None).expect("m7 pulls the re-key and its heals");
 
     // 1. `m40` has signed no records of its own. `m22` removes `m40` first.
     let minted22 = remove_member_in_log(m22, actor_m40).expect("m22 removes m40");
@@ -5329,9 +5467,20 @@ fn second_member_remove_after_sync_forms_quorum_and_voids_post_cutoff_records() 
     drop(macs.root);
 }
 
+/// One-mesh M1, M3 and M5: narrowing `aterm-commons-control-v1` to fewer hosts than the vault's
+/// members is no revocation. The narrowing still mints a Commons epoch its batch wraps to `m22`
+/// alone, but `m7` is a current seat (no `Remove` names it), so its missing `Wrap` is a gap: the
+/// vault pass of the same publish heals it, the overlay puts `m7` back into Commons control,
+/// and `m7` reads, writes and observes Commons as before. Only an explicit removal keeps `m7`
+/// out: a generic `[machines]` removal is refused while `m7` is still in Commons, the log
+/// `Remove` re-keys both audiences without it, and no heal wraps a removed seat back.
+///
+/// NEGATIVE CONTROL: set `crate::membership_log::admission::OLD_GAP_RULE` around step 1's
+/// publish (0.154.0's rule: an omission the minter knew is a revocation): `m22`'s vault pass then
+/// reads `m7`'s omission from the narrowed epoch as a leaving out, no heal wraps it, and the
+/// first assert of step 1 fails.
 #[test]
-fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_across_overlay_and_admit()
- {
+fn narrowing_commons_control_is_a_gap_the_heal_closes_and_only_a_remove_keeps_the_member_out() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let (m22, m7) = (&macs.m22, &macs.m7);
     let m7_id = read_identity(m7).unwrap().unwrap();
@@ -5346,8 +5495,9 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
     let init_commons_basis = init_commons_view.basis;
 
     // 1. Admin m22 narrows `aterm-commons-control-v1` to `["m22"]` (keeping `m7` in `[machines]`
-    //    and `[everyone]`) and publishes. `draft_document_diff` must rotate `EpochAudience::Commons`
-    //    without wrapping `m7`.
+    //    and `[everyone]`) and publishes. `draft_document_diff` rotates `EpochAudience::Commons`
+    //    with a batch that omits `m7`; the publish's vault pass (`close_wrap_gaps`, m22 ranked
+    //    first as the minter its own batch wraps) heals that gap at once.
     {
         let admin = admin_open(m22).unwrap();
         let mut doc = admin.doc.clone();
@@ -5376,35 +5526,40 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
         .expect("m7 remains a vault member")
         .0;
     assert!(
-        log_after.audience_left_out(&crate::membership_log::EpochAudience::Commons, &actor_m7),
-        "narrowing aterm-commons-control must leave m7 out of EpochAudience::Commons"
+        !log_after.audience_left_out(&crate::membership_log::EpochAudience::Commons, &actor_m7),
+        "a narrowed Commons control is no Remove: m7's missing Wrap is a gap the heal closes"
     );
     assert!(
-        !log_after.wraps_maximal_audience_to(
+        log_after.wraps_maximal_audience_to(
             &crate::membership_log::EpochAudience::Commons,
             &m7_recipient
         ),
-        "new maximal Commons epoch must not wrap m7"
+        "the healed newest Commons epoch wraps current seat m7"
     );
-    assert!(
-        log_after.commons_epoch_view(&m7_id).unwrap().is_none(),
-        "left-out m7 must have no current Commons epoch view"
+    let healed_view = log_after
+        .commons_epoch_view(&m7_id)
+        .unwrap()
+        .expect("healed m7 has a current Commons epoch view");
+    assert_ne!(
+        healed_view.basis, init_commons_basis,
+        "the narrowing rotated Commons; m7 holds the rotated epoch through the heal"
     );
     assert!(
         log_after
             .unwrap_commons_epoch(&init_commons_basis, &m7_id)
             .unwrap()
-            .is_none(),
-        "left-out m7 must not unwrap historical Commons epochs either"
+            .is_some(),
+        "m7, still a member, keeps the Commons history it was wrapped"
     );
 
-    // 2. Subsequent `admin_open` (which runs `overlay_log_onto_document`) and publish must NOT
-    //    re-add `m7` back into `aterm-commons-control-v1` or `EpochAudience::Commons`.
+    // 2. Subsequent `admin_open` (which runs `overlay_log_onto_document`) puts `m7` back into
+    //    `aterm-commons-control-v1` from the log, and a publish keeps it in
+    //    `EpochAudience::Commons`.
     {
         let admin = admin_open(m22).unwrap();
         assert!(
-            !admin.commons_eligibility.includes("m7", m7_recipient),
-            "overlay_log_onto_document must not restore left-out m7 into commons_eligibility"
+            admin.commons_eligibility.includes("m7", m7_recipient),
+            "overlay_log_onto_document restores healed m7 into commons_eligibility"
         );
         let mut doc = admin.doc.clone();
         doc.set_entry(&Audience::Everyone, "shared", b"everyone-v2")
@@ -5413,58 +5568,72 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
     }
     let log_v2 = load_records(m22).unwrap().log().unwrap().clone();
     assert!(
-        !log_v2.wraps_maximal_audience_to(
+        log_v2.wraps_maximal_audience_to(
             &crate::membership_log::EpochAudience::Commons,
             &m7_recipient
         ),
-        "subsequent admin publish must keep m7 out of EpochAudience::Commons"
+        "subsequent admin publish keeps member m7 in EpochAudience::Commons"
     );
 
     // 3. On m22, `Bootstrap::access` (`current_from_loaded_log`) and `historical_commons_writers`
-    //    for the rotated Commons epoch must not list left-out m7 as a Commons Writer, while
-    //    `historical_commons_writers` for `init_commons_basis` still includes m7.
+    //    list m7 as a Commons Writer of the rotated epoch, as they do of `init_commons_basis`.
     let boot22 = Bootstrap::required(m22).expect("m22 bootstrap");
     let access22 = boot22.access().unwrap().expect("m22 access");
     assert!(
-        !access22
+        access22
             .members()
             .iter()
             .any(|m| m.binding().recipient() == m7_recipient),
-        "current_from_loaded_log must exclude members left out of EpochAudience::Commons"
+        "current_from_loaded_log lists healed member m7"
     );
     let (_, init_writers) = log_v2
         .historical_commons_writers(&init_commons_basis)
         .expect("init commons writers");
     assert!(
         init_writers.iter().any(|b| b.recipient() == m7_recipient),
-        "m7 was a writer in init_commons_basis before exclusion"
+        "m7 was a writer in init_commons_basis"
     );
     let (_, rotated_writers) = log_v2
         .historical_commons_writers(access22.basis())
         .expect("rotated commons writers");
     assert!(
-        !rotated_writers
+        rotated_writers
             .iter()
             .any(|b| b.recipient() == m7_recipient),
-        "left-out m7 must not be a historical writer in the rotated Commons epoch"
+        "healed m7 is a writer in the rotated Commons epoch"
     );
 
-    // 4. `admit_by_phrase` and `admit_member_in_log` for already-active m7 must not wrap
-    //    `EpochAudience::Commons` back to m7, and a newcomer `m8` admitted after the rotation must
-    //    not be listed as a writer in the superseded `init_commons_basis` epoch.
+    // 4. m7 holds its heal and observes Commons control through the envelope and through the log
+    //    alone; `admit_by_phrase` and `admit_member_in_log` for already-active m7 are no-ops for
+    //    Commons, and a newcomer `m8` admitted after the rotation is not listed as a writer in the
+    //    superseded `init_commons_basis` epoch.
     let boot7 = Bootstrap::required(m7).expect("m7 bootstrap");
     let m7_req = boot7.request().expect("m7 request");
+    sync_records(m7, None).expect("m7 pulls m22's heal");
     sync(m7, None).expect("m7 syncs v2");
     assert_eq!(
         std::fs::read(m7.home.join(".secrets/shared")).unwrap(),
         b"everyone-v2"
     );
+    assert!(
+        load_records(m7)
+            .unwrap()
+            .log()
+            .unwrap()
+            .wraps_maximal_audience_to(
+                &crate::membership_log::EpochAudience::Commons,
+                &m7_recipient
+            ),
+        "m7's own log holds the Wrap that healed it"
+    );
     let records_before = std::fs::read(m7.records_file()).unwrap();
-    let crate::commons::Observation::Unavailable(reason) = crate::commons::observe(m7).unwrap()
-    else {
-        panic!("the excluded member must not observe Commons control");
-    };
-    assert_eq!(reason.code(), "control-excluded");
+    assert!(
+        matches!(
+            crate::commons::observe(m7).unwrap(),
+            crate::commons::Observation::Visible(_)
+        ),
+        "a narrowed Commons control excludes no member: healed m7 observes Commons control"
+    );
     assert!(matches!(
         status(m7).unwrap().membership,
         Membership::In { .. }
@@ -5479,10 +5648,13 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
     let log_only_observation = crate::commons::observe(m7);
     save_state(m7, &original_state).unwrap();
     std::fs::rename(retained_cache, m7.cache_file()).unwrap();
-    assert!(matches!(
-        log_only_observation.unwrap(),
-        crate::commons::Observation::Unavailable(crate::commons::Unavailable::ControlExcluded)
-    ));
+    assert!(
+        matches!(
+            log_only_observation.unwrap(),
+            crate::commons::Observation::Visible(_)
+        ),
+        "from the log alone, healed m7 observes Commons control"
+    );
     assert_eq!(std::fs::read(m7.records_file()).unwrap(), records_before);
     assert!(matches!(
         admit::admit_by_phrase(m22, &m7_req, [0u8; 32], "m7", 700).unwrap(),
@@ -5499,15 +5671,15 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
         .expect("admit_member_in_log for already-active m7");
     let log_after_admit = load_records(m22).unwrap().log().unwrap().clone();
     assert!(
-        !log_after_admit.wraps_maximal_audience_to(
+        log_after_admit.wraps_maximal_audience_to(
             &crate::membership_log::EpochAudience::Commons,
             &m7_recipient
         ),
-        "admit_by_phrase and admit_member_in_log must not wrap Commons back to Commons-left-out m7"
+        "admit_by_phrase and admit_member_in_log leave already-wrapped m7 in Commons"
     );
     assert!(
         vault_passes(m22).is_empty(),
-        "the vault passes must be a clean no-op when Commons-left-out m7 is already wrapped in Everyone"
+        "the vault passes are a clean no-op once m7 is wrapped in Everyone and Commons"
     );
 
     let (m8, req8, _) = newcomer(macs.root.path(), m22, "m8");
@@ -5586,30 +5758,51 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
     .unwrap();
     assert_eq!(forged_verdicts, vec![false, false]);
     assert!(load_records(&m9).unwrap().is_empty());
-    assert!(
-        check_log_commons_enrollment(m7, trust, req8.binding()).is_err(),
-        "member excluded from EpochAudience::Commons must not serve Commons enrollment"
-    );
 
-    // 6. Generic vault removal of m7 succeeds once m7 was already excluded from
-    //    `EpochAudience::Commons` (its Commons membership is already retired), rotates
-    //    `EpochAudience::Everyone` leaving m7 out, does not re-add m7 on subsequent
-    //    `admin_open`, and revokes m7's read access in `open_entries` / `sight` / `sync`.
+    // 6. The narrowing retired nothing: a generic vault removal of m7, still a Commons member,
+    //    is refused until Commons membership is retired. The explicit log `Remove` is what takes
+    //    m7 out: it re-keys `EpochAudience::Everyone` and `EpochAudience::Commons` without m7,
+    //    no vault pass heals the removed seat back, the generic removal then succeeds, a
+    //    subsequent `admin_open` does not re-add m7, and m7 loses read access in `open_entries` /
+    //    `sight` / `sync` and can no longer serve Commons enrollment.
     let pre_removal_log7 = load_records(m7).unwrap().log().unwrap().clone();
-    let admin = admin_open(m22).unwrap();
-    let mut doc_without_m7 = admin.doc.clone();
-    doc_without_m7.remove_machine("m7", false).unwrap();
-    admin_publish(m22, &admin, &doc_without_m7)
-        .expect("generic removal of m7 succeeds after Commons exclusion");
     let id7 = machine_identity(m7).unwrap();
     let r7 = id7.recipient();
+    {
+        let admin = admin_open(m22).unwrap();
+        let mut doc_without_m7 = admin.doc.clone();
+        doc_without_m7.remove_machine("m7", false).unwrap();
+        assert!(
+            admin_publish(m22, &admin, &doc_without_m7).is_err(),
+            "a generic removal of a Commons member is refused: the narrowing retired nothing"
+        );
+    }
+    remove_member_in_log(m22, actor_m7).expect("m22 removes m7 in log");
+    let _ = vault_passes(m22);
+    let log_removed = load_records(m22).unwrap().log().unwrap().clone();
+    assert!(
+        !log_removed.wraps_maximal_audience_to(&crate::membership_log::EpochAudience::Commons, &r7),
+        "the explicit Remove re-keys Commons without m7, and no heal wraps a removed seat back"
+    );
+    assert!(
+        !log_removed
+            .wraps_maximal_audience_to(&crate::membership_log::EpochAudience::Everyone, &r7),
+        "the explicit Remove re-keys Everyone without m7"
+    );
+    let admin = admin_open(m22).unwrap();
+    let mut doc_without_m7 = admin.doc.clone();
+    // admin_open's overlay may already have dropped the log-removed m7 from [machines]; the
+    // [machines] edit then publishes nothing new, and the rotation below is the log Remove's.
+    doc_without_m7.remove_machine("m7", false).unwrap();
+    admin_publish(m22, &admin, &doc_without_m7)
+        .expect("the [machines] removal of m7 publishes once the log removed it");
     assert!(
         load_records(m22)
             .unwrap()
             .log()
             .unwrap()
             .audience_left_out_recipient(&crate::membership_log::EpochAudience::Everyone, &r7),
-        "removing m7 from [machines] must rotate EpochAudience::Everyone leaving m7 out"
+        "the log Remove rotated EpochAudience::Everyone leaving m7 out"
     );
     assert!(
         admin_open(m22)
@@ -5633,11 +5826,15 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
             .is_none(),
         "member left out of EpochAudience::Everyone must not read stale entries from older epochs"
     );
+    assert!(
+        check_log_commons_enrollment(m7, trust, req8.binding()).is_err(),
+        "removed m7 must not serve Commons enrollment"
+    );
 
     // 7. An `Admit` signed by `m7` outside `m22`'s removal cutoff is accepted into `m22`'s
     //    store (`m7` held a seat in its causal past) but is cut off (`!has_historical_seat`),
     //    so `admin_retire` must not treat `m11` as a known Commons identity.
-    remove_member_in_log(m22, actor_m7).expect("m22 removes m7 in log");
+    remove_member_in_log(m22, actor_m7).expect("m22's repeat of the log Remove is idempotent");
     let m11 = Paths::for_home(&macs.root.path().join("m11"));
     let _ = machine_identity(&m11).unwrap();
     let dev11 = crate::commons::bootstrap::Device::open(&m11)
@@ -6222,9 +6419,12 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
         .unwrap()
         .expect("primed swarm_denied_nodes_now");
     assert!(!primed.contains(&hex(&[0x60; 32])));
-    let primed_roster = swarm_roster_now(m22)
-        .unwrap()
-        .expect("primed swarm_roster_now");
+    let primed_roster = swarm_roster_until(
+        m22,
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    .expect("primed swarm_roster_now");
     assert!(!primed_roster.deny_labels.contains(&"m60".to_owned()));
     admit_member_in_log(
         m22,
@@ -6240,9 +6440,14 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
     remove_member_in_log(m22, actor60).unwrap();
 
     // Even before `steward_finish_revokes` mirrors `m60`'s removal into `aterm-swarm-roster`,
-    // `swarm_roster(m22)` and `swarm_denied_nodes(m22)` immediately include `m60` and `[0x60; 32]`
-    // from the local membership log.
-    let pre_mirror_roster = swarm_roster(m22).unwrap().expect("pre-mirror swarm_roster");
+    // The bounded roster read and `swarm_denied_nodes` immediately include `m60` and
+    // `[0x60; 32]` from the local membership log.
+    let pre_mirror_roster = swarm_roster_until(
+        m22,
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    .expect("pre-mirror swarm_roster");
     assert!(pre_mirror_roster.deny_labels.contains(&"m60".to_owned()));
     assert!(pre_mirror_roster.deny_nodes.contains(&hex(&[0x60; 32])));
     let pre_mirror_denied = fleet::swarm_denied_nodes(m22)
@@ -6256,9 +6461,12 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
         pre_mirror_denied
     );
     assert_eq!(
-        swarm_roster_now(m22)
-            .unwrap()
-            .expect("memoized swarm_roster_now"),
+        swarm_roster_until(
+            m22,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+        )
+        .unwrap()
+        .expect("memoized swarm_roster_now"),
         pre_mirror_roster
     );
 
@@ -6301,7 +6509,9 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
     //    via `retire_recipients_in_log_local` without a `Body::Remove` record (as in a half-done
     //    revoke of an unproved founder), `observe_commons` on `m7` must report
     //    `Observation::Unavailable(Unavailable::Revoked)` rather than falling back to decrypting
-    //    the cached envelope's locker.
+    //    the cached envelope's locker. `m7` still holds a seat no `Remove` names, so the omission
+    //    is a gap, not a revocation (one-mesh M1): the vault pass of the steward's publish heals
+    //    it, and the roster the publish mirrors denies no `m7`.
     let m7_rec = read_identity(m7).unwrap().unwrap().recipient();
     {
         let lock = StateLock::take(m22).unwrap();
@@ -6338,12 +6548,18 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
     let roster = crate::swarm_roster::SwarmRoster::from_document(&admin.published_doc)
         .unwrap()
         .expect("roster after m7 steward_finish_revokes");
-    assert!(roster.deny_labels.contains(&"m7".to_owned()));
+    let log_now = load_records(m22).unwrap().log().unwrap().clone();
+    assert!(
+        log_now.wraps_maximal_audience_to(&EpochAudience::Everyone, &m7_rec),
+        "the heal wraps m7 into the newest [everyone] epoch"
+    );
+    assert!(!roster.deny_labels.contains(&"m7".to_owned()));
 
     // 8. `machine_denied_by_roster_or_log` honors an active log/roster seat (`m22`) even when
     //    passed a stale denied `[machines]` host name (`"m7"`), while denying a seatless
     //    recipient whose `[machines]` host name is denied.
-    let log_now = load_records(m22).unwrap().log().unwrap().clone();
+    let mut roster = roster;
+    roster.deny_labels.push("m7".to_owned());
     let m22_rec = read_identity(m22).unwrap().unwrap().recipient();
     let seatless_rec = Identity::from_secret_bytes([0x99; 32]).recipient();
     assert!(
@@ -6737,4 +6953,101 @@ fn an_admins_approved_recipient_is_not_pending_while_enrollment_is_unfinished() 
             .contains(&recipient),
         "filtering a request must not enroll its recipient"
     );
+}
+
+/// One-mesh M4's pending writes ([`log_entries::wait_for_key`]): each set waits on its own version
+/// and lands when a server is seen to hold that version, whatever became of the others. A
+/// person's later write of a name wins whichever version is read first, as it does where two
+/// servers took different versions of one sequence: a later version that lands takes its names
+/// out of every earlier set. A version this publish builds on, or a parent of it, lands its set
+/// before the publish. The oldest past [`log_entries::MAX_PENDING_SETS`] is dropped, and a pending
+/// file that cannot be read never refuses a publish.
+///
+/// NEGATIVE CONTROL: `land_sets` without the `retain` that takes a landing set's names out of
+/// the earlier sets (restored with cp from a backup plus touch, confirmed with cmp): v1's set keeps
+/// `shared`, which, read second, would put it back to `v1`, and the test fails "v1's set stays
+/// pending, less the name v2 wrote".
+#[test]
+fn pending_waiting_sets_land_by_version_and_a_later_write_of_a_name_wins() {
+    let macs = two_macs(&[]);
+    let m22 = &macs.m22;
+    let identity = read_identity(m22).unwrap().unwrap();
+    let state = || log_entries::waiting_and_pending(m22, &identity);
+    let values = |pairs: &[(&str, &[u8])]| -> BTreeMap<String, Vec<u8>> {
+        pairs
+            .iter()
+            .map(|&(name, value)| (name.to_owned(), value.to_vec()))
+            .collect()
+    };
+    let wait = |writes: &[(&str, &[u8])], version: u8, stored: &[[u8; 32]]| {
+        log_entries::wait_for_key(
+            m22,
+            &identity,
+            &log_entries::Waiting::of_puts(writes),
+            &[version; 32],
+            stored,
+            None,
+        )
+        .expect("pending");
+    };
+
+    // Two publishes from one text: v1 (`shared` = v1, `only1`), then v2 (`shared` = v2).
+    wait(&[("shared", b"v1"), ("only1", b"a")], 1, &[]);
+    wait(&[("shared", b"v2")], 2, &[]);
+    let (waiting, pending) = state();
+    assert!(
+        waiting.is_empty(),
+        "CONTROL: nothing waits before a server is seen"
+    );
+    assert_eq!(pending.len(), 2, "CONTROL: both sets are pending");
+
+    // One server holds v2, read first; another holds v1, read after.
+    log_entries::land_waiting(m22, &identity, &[[2; 32]], None).expect("land v2");
+    let (waiting, pending) = state();
+    assert_eq!(waiting, values(&[("shared", b"v2")]));
+    assert_eq!(
+        pending,
+        vec![([1; 32], values(&[("only1", b"a")]))],
+        "v1's set stays pending, less the name v2 wrote"
+    );
+    log_entries::land_waiting(m22, &identity, &[[1; 32]], None).expect("land v1");
+    let (waiting, pending) = state();
+    assert_eq!(
+        waiting.get("shared").map(Vec::as_slice),
+        Some(b"v2".as_slice()),
+        "the later publish's write of shared wins"
+    );
+    assert_eq!(waiting, values(&[("shared", b"v2"), ("only1", b"a")]));
+    assert!(pending.is_empty(), "nothing is pending after both land");
+
+    // A publish built on a version whose parent is pending lands that parent's set first.
+    wait(&[("x", b"3")], 3, &[]);
+    wait(&[("y", b"4")], 4, &[[9; 32], [3; 32]]);
+    let (waiting, pending) = state();
+    assert_eq!(
+        waiting.get("x").map(Vec::as_slice),
+        Some(b"3".as_slice()),
+        "the parent's set lands"
+    );
+    assert_eq!(pending, vec![([4; 32], values(&[("y", b"4")]))]);
+
+    // Past the bound the oldest goes.
+    for version in 10..10 + log_entries::MAX_PENDING_SETS as u8 {
+        wait(&[("z", &[version])], version, &[]);
+    }
+    let (_, pending) = state();
+    assert_eq!(pending.len(), log_entries::MAX_PENDING_SETS);
+    assert!(
+        pending.iter().all(|(version, _)| *version != [4; 32]),
+        "the oldest set is dropped past the bound"
+    );
+
+    // A pending file that cannot be read is started again, and a refusal drops only its set.
+    std::fs::write(m22.dir.join("everyone.waiting.pending"), b"not sealed").unwrap();
+    wait(&[("w", b"5")], 5, &[]);
+    wait(&[("v", b"6")], 6, &[]);
+    log_entries::forget_waiting(m22, &identity, &[6; 32]);
+    let (_, pending) = state();
+    assert_eq!(pending, vec![([5; 32], values(&[("w", b"5")]))]);
+    macs.server.stop();
 }

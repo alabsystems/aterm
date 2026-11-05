@@ -16,21 +16,31 @@
 //! that names that crate, and by its module's path (`facts::SEAM`) anywhere. A binding itself is
 //! no mention. It fails a mention a release build compiles, and a seam it finds no mention of
 //! outside its bindings (renamed: name it here again).
+//!
+//! `ATERM_TEST_NEGATIVE_CONTROL` is the other seam: it turns a negative control on for a whole
+//! lab process (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §9), restoring an old trust rule (the
+//! gap rule that read an omitted seat as revoked, a batch read as settled before it is). Its one
+//! reader is `aterm_types::negative_control::on`, under `cfg(any(test, debug_assertions))`; a
+//! lab lane that sets it on a child names it under the same kind of `cfg`.
 
 use super::rules::{CENSUS_CRATE, PRODUCT, TestCode};
 use super::{Finding, Rule, Tree};
 use crate::lex::Lexed;
 
 /// The seams only a debug build may read: each variable's name.
-const DEBUG_ONLY: &[&str] = &["ATERM_DEBUG_NETPLACE"];
+const DEBUG_ONLY: &[&str] = &["ATERM_DEBUG_NETPLACE", "ATERM_TEST_NEGATIVE_CONTROL"];
 
 pub(super) const DEBUG_SEAM: Rule = Rule {
     id: "debug-seam",
-    why: "a debug-only seam (ATERM_DEBUG_NETPLACE scripts where this Mac is on the network) named \
-          by a release build lets an environment variable lie to every reporter and to the \
-          vault's admission; name it only under a cfg that entails debug_assertions or test \
-          (never dev_seam!, whose dev-seams feature a release build can turn on)",
-    scope: &["crates/aterm-netplace/src/facts.rs"],
+    why: "a debug-only seam (ATERM_DEBUG_NETPLACE scripts where this Mac is on the network; \
+          ATERM_TEST_NEGATIVE_CONTROL restores an old trust rule for a lab process) named by a \
+          release build lets an environment variable lie to every reporter and to the vault's \
+          admission; name it only under a cfg that entails debug_assertions or test (never \
+          dev_seam!, whose dev-seams feature a release build can turn on)",
+    scope: &[
+        "crates/aterm-netplace/src/facts.rs",
+        "crates/aterm-types/src/negative_control.rs",
+    ],
     check: debug_seam,
 };
 
@@ -339,6 +349,7 @@ mod tests {
         let found = run(
             &DEBUG_SEAM,
             &[
+                ("crates/aterm-types/src/negative_control.rs", READER),
                 ("crates/aterm-netplace/src/facts.rs", facts),
                 ("crates/aterm-lab/src/away.rs", lab),
                 ("crates/aterm-gui/src/net_place_tests.rs", test_file),
@@ -370,8 +381,62 @@ mod tests {
         );
     }
 
+    /// The negative-control variable's one reader, as `aterm_types::negative_control::on` reads
+    /// it: under a `cfg` no release build satisfies.
+    const READER: &str = "#[cfg(any(test, debug_assertions))]\n\
+                          pub fn on(name: &str) -> bool {\n\
+                          \x20   std::env::var_os(\"ATERM_TEST_NEGATIVE_CONTROL\").is_some_and(|v| v == name)\n\
+                          }\n";
+
+    /// `ATERM_TEST_NEGATIVE_CONTROL` is named only by its reader and by code a release build
+    /// never compiles: a lab lane that sets it on a child process under a debug `cfg` passes,
+    /// and the same lane setting it ungated, and a constant bound to it and read in a release
+    /// build, are each found.
+    /// NEGATIVE CONTROL: without `ATERM_TEST_NEGATIVE_CONTROL` in `DEBUG_ONLY` neither is
+    /// found.
+    #[test]
+    fn the_negative_control_variable_is_named_only_by_its_reader() {
+        let lane = "fn instance(cmd: &mut Command, control: Option<&str>) {\n\
+                    \x20   #[cfg(debug_assertions)]\n\
+                    \x20   if let Some(name) = control {\n\
+                    \x20       cmd.env(\"ATERM_TEST_NEGATIVE_CONTROL\", name);\n\
+                    \x20   }\n\
+                    \x20   cmd.env(\"ATERM_TEST_NEGATIVE_CONTROL\", \"old-gap-rule\");\n\
+                    }\n";
+        let bound = "pub const CONTROLS: &str = \"ATERM_TEST_NEGATIVE_CONTROL\";\n\
+                     fn controls() -> bool { std::env::var_os(CONTROLS).is_some() }\n";
+        let netplace = "#[cfg(debug_assertions)]\n\
+                        fn f() { let _ = std::env::var_os(\"ATERM_DEBUG_NETPLACE\"); }\n";
+        let found = run(
+            &DEBUG_SEAM,
+            &[
+                ("crates/aterm-types/src/negative_control.rs", READER),
+                ("crates/aterm-lab/src/mesh_churn.rs", lane),
+                (
+                    "crates/aterm-secrets/src/membership_log/admission.rs",
+                    bound,
+                ),
+                ("crates/aterm-netplace/src/facts.rs", netplace),
+            ],
+        );
+        assert_eq!(
+            spots(&found),
+            [
+                "crates/aterm-lab/src/mesh_churn.rs:6",
+                "crates/aterm-secrets/src/membership_log/admission.rs:2",
+            ],
+            "{found:#?}"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|f| f.detail.contains("ATERM_TEST_NEGATIVE_CONTROL"))
+        );
+    }
+
     /// A seam the rule finds no mention of outside its bindings is a finding of its own, so a
-    /// renamed variable or constant cannot leave the rule holding nothing.
+    /// renamed variable or constant cannot leave the rule holding nothing: here neither seam is
+    /// read, the netplace one renamed and the negative-control one absent.
     /// NEGATIVE CONTROL: dropping the unseen-seam loop leaves this corpus with no finding, and
     /// "a seam with no read is named" fails.
     #[test]
@@ -384,8 +449,17 @@ mod tests {
                  fn f() { let _ = std::env::var_os(SCRIPT); }\n",
             )],
         );
-        assert_eq!(found.len(), 1, "a seam with no read is named: {found:#?}");
-        assert!(found[0].detail.contains("ATERM_DEBUG_NETPLACE"));
+        assert_eq!(
+            found.len(),
+            2,
+            "each seam with no read is named: {found:#?}"
+        );
+        for seam in DEBUG_ONLY {
+            assert!(
+                found.iter().any(|f| f.line == 0 && f.detail.contains(seam)),
+                "{seam} is named: {found:#?}"
+            );
+        }
     }
 
     /// Which cfg predicates keep code out of every release build.

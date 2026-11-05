@@ -593,6 +593,9 @@ pub(crate) fn sweep_stale_graph(sock_dir: &Path) {
         return;
     };
     for ent in entries.flatten() {
+        if !ent.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
         let path = ent.path();
         if let Ok(body) = read_private_text(&path)
             && let Some((sock, _nonce)) = parse_graph_entry(&body)
@@ -689,6 +692,9 @@ fn sweep_dead_edge_files(dir: &Path) {
         return;
     };
     for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else {
             continue;
         };

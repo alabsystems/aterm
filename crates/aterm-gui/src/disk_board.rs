@@ -22,9 +22,10 @@ pub(crate) const MAX_SPELLED: usize = 256;
 pub(crate) enum Watch {
     /// No disk look has started yet.
     NotStarted,
-    /// Disk look is active with last progress at `beat`.
+    /// The watch runs, with its last progress at `beat`; a look may or may not be in flight
+    /// ([`Board::look_in_flight`]).
     Running { beat: Instant },
-    /// Host is suspended; no look runs.
+    /// Host is suspended: no beat moves and nothing reads one, whatever look still runs.
     Suspended,
 }
 
@@ -247,6 +248,9 @@ fn volume_name(mount: &Path) -> String {
 pub(crate) struct Board {
     /// Current watch progress state.
     pub(crate) watch: Watch,
+    /// A look is running ([`Shelf::look_began`], [`Shelf::look_ended`]), so an old beat says it is
+    /// hung. Between looks an old beat says only that none has started.
+    pub(crate) look_in_flight: bool,
     /// Whether a disk watch runs in this process.
     pub(crate) watched: bool,
     /// Mount table from the last look.
@@ -259,6 +263,10 @@ pub(crate) struct Board {
     pub(crate) spelled: BTreeMap<u64, (PathBuf, PathBuf)>,
     /// Summary of the last reclamation pass.
     pub(crate) last_pass: Option<PassSummary>,
+    /// The checkouts' `target*` links whose target a pass's search found not there, kept while
+    /// each look finds them still dangling ([`Shelf::keep_dangling`]; the leftover view's `link`
+    /// rows).
+    pub(crate) dangling: Vec<aterm_agent::harness::disk::discover::Dangling>,
     /// Active unmet free-space demands.
     pub(crate) demands: Vec<Demand>,
     /// Full-disk episode state.
@@ -369,9 +377,19 @@ pub(crate) struct AskOwed {
 }
 
 impl Board {
+    /// The watch made progress. A suspended watch stays suspended.
+    fn beat(&mut self) {
+        if self.watch != Watch::Suspended {
+            self.watch = Watch::Running {
+                beat: Instant::now(),
+            };
+        }
+    }
+
     const fn new() -> Self {
         Self {
             watch: Watch::NotStarted,
+            look_in_flight: false,
             watched: false,
             table: Table {
                 mounts: Vec::new(),
@@ -382,6 +400,7 @@ impl Board {
             sessions: BTreeMap::new(),
             spelled: BTreeMap::new(),
             last_pass: None,
+            dangling: Vec::new(),
             demands: Vec::new(),
             episode: DiskEpisode {
                 level: None,
@@ -576,6 +595,28 @@ impl Shelf {
         self.board.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The watch made progress.
+    pub(crate) fn beat(&self) {
+        #[cfg(test)]
+        BEATS_HERE.set(BEATS_HERE.get() + 1);
+        self.board_lock().beat();
+    }
+
+    /// A look starts. Its flag and its beat move under one lock: a waiter that read the flag with
+    /// the old beat beside it would answer a stall for a look that has only just begun.
+    pub(crate) fn look_began(&self) {
+        let mut b = self.board_lock();
+        b.look_in_flight = true;
+        b.beat();
+    }
+
+    /// A look ended, under one lock for the same reason as [`Self::look_began`].
+    pub(crate) fn look_ended(&self) {
+        let mut b = self.board_lock();
+        b.look_in_flight = false;
+        b.beat();
+    }
+
     /// Mutate the [`Board`] under its lock and notify all parked waiters.
     pub(crate) fn publish(&self, f: impl FnOnce(&mut Board)) {
         {
@@ -594,6 +635,41 @@ impl Shelf {
         let mut b = self.board_lock();
         for &(bytes, what) in removals {
             b.freed.add(bytes, what, &now);
+        }
+    }
+
+    /// The build directories the last reclamation pass left and must keep (the `disk.low` hogs
+    /// line's), on any volume.
+    pub(crate) fn kept_build_dirs(&self) -> Vec<String> {
+        self.board_lock()
+            .last_pass
+            .as_ref()
+            .map(|p| {
+                p.left
+                    .iter()
+                    .map(|h| h.path.display().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The dangling `target*` links the disk watch's searches recorded ([`Board::dangling`]).
+    pub(crate) fn dangling(&self) -> Vec<aterm_agent::harness::disk::discover::Dangling> {
+        self.board_lock().dangling.clone()
+    }
+
+    /// Keeps on the board each dangling link that still dangles, with those `found` by a look's
+    /// search added ([`aterm_agent::harness::disk::discover::still_dangling`], read with no lock
+    /// held); publishes only a change. Each look calls it, so a link fixed since drops off with
+    /// no search, and a search that walked some checkouts drops none that still dangles.
+    pub(crate) fn keep_dangling(&self, found: Vec<aterm_agent::harness::disk::discover::Dangling>) {
+        let kept = self.dangling();
+        if kept.is_empty() && found.is_empty() {
+            return;
+        }
+        let now = aterm_agent::harness::disk::discover::still_dangling(kept.clone(), found);
+        if now != kept {
+            self.publish(|b| b.dangling = now);
         }
     }
 
@@ -636,14 +712,22 @@ pub(crate) fn publish(f: impl FnOnce(&mut Board)) {
     SHELF.publish(f);
 }
 
-/// Record a disk-watch progress heartbeat on [`SHELF`].
+#[cfg(test)]
+thread_local! {
+    /// This thread's [`Shelf::beat`]s ([`beats_here`]).
+    static BEATS_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Record a disk-watch progress heartbeat on [`SHELF`]: what a look's thread hears from
+/// [`aterm_uds::progress`].
 pub(crate) fn beat() {
-    let mut b = SHELF.board_lock();
-    if b.watch != Watch::Suspended {
-        b.watch = Watch::Running {
-            beat: Instant::now(),
-        };
-    }
+    SHELF.beat();
+}
+
+/// This thread's [`Shelf::beat`]s so far.
+#[cfg(test)]
+pub(crate) fn beats_here() -> u32 {
+    BEATS_HERE.get()
 }
 
 /// Set whether the disk watch on [`SHELF`] is suspended.
@@ -683,6 +767,74 @@ pub(crate) fn status_fields(session: u64, cwd: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A DANGLING LINK STAYS ON THE BOARD WHILE IT DANGLES, AND ONLY THEN: a search that walked
+    /// another checkout adds its link and drops none, a look with no search keeps both, and once
+    /// one's target is back (a rebuild made `target.noindex` again) or the other link is gone,
+    /// the next look drops it. NEGATIVE CONTROL: take each search's links as the whole list, and
+    /// the first checkout's link is dropped while it still dangles.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_stays_on_the_board_while_it_dangles() {
+        use aterm_agent::harness::disk::discover::Dangling;
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        let link = |repo: &str| {
+            let checkout = tmp.path().join(repo);
+            std::fs::create_dir_all(&checkout).expect("checkout");
+            let link = checkout.join("target");
+            std::os::unix::fs::symlink("target.noindex", &link).expect("link");
+            Dangling {
+                link,
+                target: PathBuf::from("target.noindex"),
+                checkout,
+                state: aterm_vitals::left::LinkTarget::Gone,
+            }
+        };
+        let (a, b) = (link("a"), link("b"));
+        let shelf = Shelf::new();
+        shelf.keep_dangling(vec![a.clone()]);
+        shelf.keep_dangling(vec![b.clone()]);
+        assert_eq!(
+            shelf.dangling(),
+            vec![a.clone(), b.clone()],
+            "a search of b alone"
+        );
+        shelf.keep_dangling(Vec::new());
+        assert_eq!(
+            shelf.dangling(),
+            vec![a.clone(), b.clone()],
+            "a look with no search"
+        );
+        std::fs::create_dir(a.checkout.join("target.noindex")).expect("rebuilt");
+        std::fs::remove_file(&b.link).expect("removed");
+        shelf.keep_dangling(Vec::new());
+        assert_eq!(shelf.dangling(), Vec::<Dangling>::new(), "both fixed since");
+    }
+
+    /// A BEAT FRESHENS AN OLD ONE, however it comes, or a look that began over an old beat would
+    /// answer a stall at once; and a suspended watch stays suspended, though a look can run there.
+    #[test]
+    fn a_beat_freshens_the_watch_unless_it_is_suspended() {
+        let stall = crate::control::control_disk::STALL;
+        let Some(old) = Instant::now().checked_sub(stall + Duration::from_secs(1)) else {
+            aterm_spec::host::could_not_run("the monotonic clock here cannot reach back a stall");
+        };
+        let fresh = |shelf: &Shelf| matches!(shelf.board_lock().watch, Watch::Running { beat } if beat.elapsed() < stall);
+        let moves = [
+            ("a heard beat", Shelf::beat as fn(&Shelf)),
+            ("a look's start", Shelf::look_began),
+            ("a look's end", Shelf::look_ended),
+        ];
+        for (what, step) in moves {
+            let shelf = Shelf::new();
+            shelf.publish(|b| b.watch = Watch::Running { beat: old });
+            step(&shelf);
+            assert!(fresh(&shelf), "{what} freshens an old beat");
+            shelf.publish(|b| b.watch = Watch::Suspended);
+            step(&shelf);
+            assert_eq!(shelf.board_lock().watch, Watch::Suspended, "{what}");
+        }
+    }
 
     fn row(mount: &str, key: VolumeKey, free: u64, level: Level) -> VolumeRow {
         VolumeRow {

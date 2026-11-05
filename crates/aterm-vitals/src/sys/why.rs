@@ -14,7 +14,7 @@ use crate::explain::{
     Account, Bare, CauseId, CoalRow, Context, Evidence, Lead, Part, Role, Shown, Via, WakeFact,
     WhySubject, account_of, bare_subject,
 };
-use crate::model::{Snapshot, Throttle};
+use crate::model::Snapshot;
 use crate::services::{Restart, RowOver};
 use crate::words;
 
@@ -24,6 +24,11 @@ pub const REPLY_MAX: usize = 2048;
 /// The `who` rows a reply keeps before the CPU-hardware block gives way to one line pointing
 /// at `sys cores`, which prints it whole.
 const WHO_BEFORE_HARDWARE: usize = 3;
+
+/// The CPU-hardware line of a reply whose snapshot took no CPU Stats sample, in place of the
+/// clauses that need one: an unforced `sys why` pulls for none, and the deck's readings take
+/// none (A2 §6.4).
+const HARDWARE_NOT_SAMPLED: &str = "CPU hardware: not sampled; `sys cores` reads it";
 
 fn resolve(q: &SysQuery, snap: Option<&Snapshot>) -> Bare {
     match (q.subject, snap) {
@@ -242,10 +247,8 @@ impl<'a> Reading<'a> {
             }
             CauseId::Context(c) => {
                 return match (c, shown.map(|c| &c.cause.evidence)) {
-                    (Context::Throttled, Some(Evidence::Throttled { level, .. }))
-                        if *level >= Throttle::Light =>
-                    {
-                        format!("throttled: {}", level.word())
+                    (Context::Throttled, Some(Evidence::Throttled(t))) if t.throttled() => {
+                        t.phrase()
                     }
                     (Context::Throttled, _) => "throttled: low power".into(),
                     (Context::Pressure, _) if subject == WhySubject::Mem => {
@@ -557,10 +560,10 @@ impl<'a> Reading<'a> {
                 level.word(),
                 rec(*swap_bps, "not_sampled")
             )),
-            (_, Evidence::Throttled { level, low_power }) => t.push_str(&format!(
+            (_, Evidence::Throttled(th)) => t.push_str(&format!(
                 " level={} low_power={}",
-                level.word(),
-                rec(low_power.map(u8::from), "unsupported")
+                th.word(),
+                rec(th.low_power.map(u8::from), "unsupported")
             )),
             _ => {}
         }
@@ -751,6 +754,9 @@ pub fn why_text(
     hw_notes: &mut Vec<Line>,
     events: &[Line],
 ) {
+    if s.hardware.is_none() {
+        hw_notes.insert(0, line("cpu_hardware", HARDWARE_NOT_SAMPLED));
+    }
     let subject = match resolve(q, Some(s)) {
         Bare::Calm => {
             let w = Reading::new(ctx, s, WhySubject::Cpu);
@@ -1160,12 +1166,12 @@ impl Reading<'_> {
                     "kernel",
                 ));
             }
-            (_, Evidence::Throttled { level, low_power }) => {
-                evidence.push(fact("throttle", "level", Jv::s(level.word()), "kernel"));
+            (_, Evidence::Throttled(t)) => {
+                evidence.push(fact("thermal", "level", Jv::s(t.word()), "kernel"));
                 evidence.push(fact(
                     "low_power",
                     "low_power",
-                    low_power.map_or_else(|| Jv::why("unsupported"), Jv::Bool),
+                    t.low_power.map_or_else(|| Jv::why("unsupported"), Jv::Bool),
                     "kernel",
                 ));
             }

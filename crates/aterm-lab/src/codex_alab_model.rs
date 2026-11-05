@@ -25,6 +25,15 @@ pub mod terminals;
 /// Legacy continuation substring shared with [`CONTINUE_TEXT`].
 pub const KEEP_GOING: &str = "keep going";
 
+/// The two forms of the one line codex-alab types at a usage limit's resume, after its
+/// `[codex-alab]` mark (codex-alab `alab/forever-cruise`, aterm `77161d6432`'s `cleared_text`):
+/// the reset was named, or the try is blind. Cruise's continuation waits for the agent's own
+/// next turn end.
+pub const LIMIT_CLEARED: [&str; 2] = [
+    "The usage limit has cleared; continue where you stopped.",
+    "The usage limit may have cleared; continue where you stopped.",
+];
+
 /// Legacy done-check prefix recognized for negative-control classification.
 pub const RETIRED_CHECK: &str = "If the task is finished and verified";
 
@@ -147,6 +156,53 @@ pub const STEP_ONE: &str = "Here is step one of the plan. I will continue when a
 /// Continuation leg reply claiming completion with the retired done token.
 pub const CONTINUED_DONE: &str = "Continued as asked. All done.\n\nATERM-TASK-DONE";
 
+/// The facts leg's first turn's reply once both its calls run (gap 23, `codex-alab-proof
+/// --facts-only`): no done claim, so Cruise continues it.
+pub const FACTS_STARTED: &str = "Started the watcher; step one is next.";
+
+/// The ordinal words [`facts_step`] counts with: words, never digits, since codex-alab's reply
+/// mark keeps only a word's letters and folds every word holding a digit into one `#`
+/// (`replies::mark_of`). A reply that repeats holds the point: codex-alab paces it 120 s and then
+/// types its forward recovery, which is no continuation.
+const FACTS_ORDINALS: [&str; 10] = [
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+];
+
+/// The facts leg's reply to its `n`th continuation (from 1): no done claim, so Cruise continues it
+/// again, and in words no earlier continuation's reply had (to the tenth), so codex-alab never reads
+/// a repeated report and paces it.
+#[must_use]
+pub fn facts_step(n: usize) -> String {
+    let at = n.saturating_sub(1).min(FACTS_ORDINALS.len() - 1);
+    format!(
+        "Took the {} step of the plan; the step after it is next.",
+        FACTS_ORDINALS[at]
+    )
+}
+
+/// The tag a request whose user text carries aterm's fact rider gets (`turn_end::FACT_OPEN`).
+pub const FACT_TAG: &str = "+fact";
+
+/// The file the facts leg's holder call locks and its waiter call blocks on, in the leg's folder.
+pub const FACTS_LOCK: &str = "facts.lock";
+
+/// Where the facts leg's holder call writes its pid before it stops itself holding the lock.
+pub const FACTS_HOLDER_PID: &str = "facts-holder.pid";
+
+/// Where the facts leg's waiter call writes its pid before its rhythm.
+pub const FACTS_WAITER_PID: &str = "facts-waiter.pid";
+
+/// The regular file the facts leg's waiter call prints its rhythm into: codex's own pipe carries
+/// no progress the jobs engine reads, a file does (`aterm-vitals`' facts scenario).
+pub const FACTS_TICKS: &str = "facts-ticks.log";
+
+/// How many ticks the facts leg's waiter prints, one every [`FACTS_TICK_MS`]: 15 s of rhythm, so
+/// the engine's 2 s readings see well over the three intervals its own μ needs.
+pub const FACTS_TICK_COUNT: usize = 60;
+
+/// The gap between two of the facts leg's waiter's ticks, ms.
+pub const FACTS_TICK_MS: u64 = 250;
+
 /// Carry leg reply after crash relaunch.
 pub const CARRIED_DONE: &str = "Carried on after the relaunch. All done.\n\nATERM-TASK-DONE";
 
@@ -219,6 +275,8 @@ pub enum Step {
     Reopen,
     /// Cruise continuation prompt (`continue@v1`).
     Continue,
+    /// A usage limit's resume, its one cleared line ([`LIMIT_CLEARED`], `usage-resume@v1`).
+    Cleared,
     /// Cruise defend-and-find-more prompt (`continue-done-check@v1`).
     Defend,
     /// Legacy `codex-alab` done-check prompt.
@@ -243,6 +301,7 @@ impl Step {
             Step::Person => "person".to_string(),
             Step::Reopen => "reopen".to_string(),
             Step::Continue => "continue".to_string(),
+            Step::Cleared => "cleared".to_string(),
             Step::Defend => "defend".to_string(),
             Step::RetiredCheck => "retired-check".to_string(),
             Step::Land => "land".to_string(),
@@ -303,6 +362,9 @@ pub fn step_of(body: &J) -> Step {
     }
     if last.contains(CONTINUE_TEXT) || last.contains(KEEP_GOING) {
         return Step::Continue;
+    }
+    if LIMIT_CLEARED.iter().any(|line| last.contains(line)) {
+        return Step::Cleared;
     }
     if last.contains(REOPEN) {
         return Step::Reopen;
@@ -396,6 +458,44 @@ fn failing_call() -> J {
         "exec_command",
         &J::obj([("cmd", J::s("exit 3")), ("login", J::Bool(false))]),
     )
+}
+
+/// One of the facts leg's calls: `cmd` in codex's unified exec with no terminal (its default
+/// `tty=false`: a session of its own, stdin `/dev/null`) and no login shell, yielding after 1 s.
+fn facts_call(cmd: String) -> J {
+    call_item(
+        "exec_command",
+        &J::obj([
+            ("cmd", J::s(cmd)),
+            ("yield_time_ms", J::Int(1000)),
+            ("login", J::Bool(false)),
+        ]),
+    )
+}
+
+/// The facts leg's first call: a process that takes [`FACTS_LOCK`], writes its pid and stops
+/// itself (`SIGSTOP`) holding the lock, so nothing but the proof's kill ever lets it go.
+fn facts_holder_call() -> J {
+    facts_call(format!(
+        "exec perl -MFcntl=:flock -e '$| = 1; open(my $l, \">>\", \"{FACTS_LOCK}\") or die \"open: $!\"; \
+         flock($l, LOCK_EX) or die \"flock: $!\"; open(my $p, \">\", \"{FACTS_HOLDER_PID}\") or die \"pid: $!\"; \
+         print $p \"$$\\n\"; close $p; print \"holding {FACTS_LOCK}\\n\"; kill \"STOP\", $$; sleep 3600'"
+    ))
+}
+
+/// The facts leg's second call (the one aterm's fact names): a process that writes its pid,
+/// prints [`FACTS_TICK_COUNT`] ticks [`FACTS_TICK_MS`] apart into [`FACTS_TICKS`], then blocks in
+/// `flock` on [`FACTS_LOCK`] behind the stopped holder: unnamed and quiet, the shape the jobs
+/// engine reads `no_progress` once φ reaches 8 over its own μ (`aterm-vitals`'
+/// `a_codex_pipe_call_blocked_on_a_stopped_holders_lock_reads_no_progress_after_its_rhythm`).
+fn facts_waiter_call() -> J {
+    let tick = format!("{}.{:03}", FACTS_TICK_MS / 1000, FACTS_TICK_MS % 1000);
+    facts_call(format!(
+        "exec perl -MFcntl=:flock -e '$| = 1; open(my $p, \">\", \"{FACTS_WAITER_PID}\") or die \"pid: $!\"; \
+         print $p \"$$\\n\"; close $p; for my $i (1..{FACTS_TICK_COUNT}) {{ print \"tick $i\\n\"; \
+         select(undef, undef, undef, {tick}) }} open(my $l, \">>\", \"{FACTS_LOCK}\") or die \"open: $!\"; \
+         flock($l, LOCK_EX) or die \"flock: $!\"; print \"locked\\n\"' >{FACTS_TICKS} 2>&1"
+    ))
 }
 
 /// How many of a request's user texts are a continuation's ([`step_of`]'s Continue words).
@@ -531,6 +631,9 @@ fn answer(body: &J, resets: &Mutex<Vec<(String, i64)>>, now: &dyn Fn() -> i64) -
     if user.contains(REPO_SUFFIX_HEAD) {
         name.push_str("+repo");
     }
+    if user.contains(turn_end::FACT_OPEN) {
+        name.push_str(FACT_TAG);
+    }
     name.push_str(contradiction_tag(&user));
     let mut a = match (leg.as_str(), step) {
         ("first", Step::Person) => say(FIRST_DONE),
@@ -552,6 +655,16 @@ fn answer(body: &J, resets: &Mutex<Vec<(String, i64)>>, now: &dyn Fn() -> i64) -
             name = "fail".to_string();
             Answered::items(vec![failing_call()])
         }
+        ("facts", Step::Person) if tool_outputs(body) == 0 => {
+            name = "holder".to_string();
+            Answered::items(vec![facts_holder_call()])
+        }
+        ("facts", Step::Person) if tool_outputs(body) == 1 => {
+            name = "waiter".to_string();
+            Answered::items(vec![facts_waiter_call()])
+        }
+        ("facts", Step::Person) => slow(FACTS_STARTED, SLOW_TURN),
+        ("facts", Step::Continue) => slow(&facts_step(continuations(body)), SLOW_TURN),
         ("hold", Step::Person) => slow(STEP_ONE, HOLD_FIRST_TURN),
         ("off", Step::Person) => slow(STEP_ONE, SLOW_TURN),
         ("exchange" | "control", Step::Person) => slow(EXCHANGE_REPLY, SLOW_TURN),
@@ -588,7 +701,7 @@ fn answer(body: &J, resets: &Mutex<Vec<(String, i64)>>, now: &dyn Fn() -> i64) -
                 gate: None,
             }
         }
-        ("usage", Step::Continue) => say("Resumed after the reset."),
+        ("usage", Step::Cleared) => say("Resumed after the reset."),
         ("land", Step::Person) => say("Started on the landing."),
         ("land", Step::Land) => {
             let (text, hold) = land_reply(0);
@@ -741,6 +854,12 @@ mod tests {
             Step::Continue
         );
         assert_eq!(step_of(&body(&[p, "keep going"], None)), Step::Continue);
+        for line in LIMIT_CLEARED {
+            assert_eq!(
+                step_of(&body(&[p, &format!("[codex-alab] {line}")], None)),
+                Step::Cleared
+            );
+        }
         assert_eq!(
             step_of(&body(
                 &[
@@ -1180,8 +1299,13 @@ mod tests {
                 .iter()
                 .any(|(k, _)| k == "x-codex-primary-used-percent")
         );
-        let after = answer(&body(&["LEG-usage Start the task.", CONTINUE_TEXT], None));
-        assert_eq!((after.status, after.tag.as_str()), (200, "usage:continue"));
+        let cleared = format!("[codex-alab] {}", LIMIT_CLEARED[0]);
+        let after = answer(&body(&["LEG-usage Start the task.", &cleared], None));
+        assert_eq!((after.status, after.tag.as_str()), (200, "usage:cleared"));
+        // NEGATIVE CONTROL: Cruise's continuation at the reset is no resume this leg answers.
+        let continued = answer(&body(&["LEG-usage Start the task.", CONTINUE_TEXT], None));
+        assert_eq!(continued.tag, "usage:continue");
+        assert!(!text_of(&continued).contains("Resumed after the reset."));
     }
 
     #[test]
@@ -1284,5 +1408,117 @@ mod tests {
             step_of(&body(&[p, DONE_CHECK_FIXED_BEFORE], None)),
             Step::Defend
         );
+    }
+
+    /// The `exec_command` line an answer asks for.
+    fn command_of(a: &Answered) -> String {
+        a.body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|l| J::parse(l).ok())
+            .find_map(|event| {
+                let item = event.get("item")?;
+                (item.get("type").and_then(J::as_str) == Some("function_call")).then_some(())?;
+                let args = J::parse(item.get("arguments").and_then(J::as_str)?).ok()?;
+                args.get("cmd").and_then(J::as_str).map(str::to_owned)
+            })
+            .unwrap_or_default()
+    }
+
+    /// codex-alab's reply mark (`replies::mark_of`, a6430a662d): each word's letters and digits, a
+    /// word holding a digit one `#`, nothing between them.
+    fn mark(said: &str) -> String {
+        said.split_whitespace()
+            .map(|w| {
+                if w.contains(char::is_numeric) {
+                    "#".to_string()
+                } else {
+                    w.chars().filter(|c| c.is_alphanumeric()).collect()
+                }
+            })
+            .collect()
+    }
+
+    /// GAP 23'S FACTS LEG: the model asks for the holder's call, then the waiter's, then ends the
+    /// turn slowly with no done claim, and answers every continuation slowly with none, so Cruise
+    /// continues it at each turn end; a request whose user text carries aterm's rider is tagged
+    /// `+fact`, and no other is. The holder stops itself holding the lock, and the waiter prints
+    /// its rhythm into the ticks file (not codex's pipe), then blocks on that lock. Each of the
+    /// first ten continuations' replies has a mark no other has, so codex-alab never paces one as
+    /// a repeated report. NEGATIVE CONTROLS: the same continuation without the rider tags no fact,
+    /// and steps counted in digits would share one mark.
+    #[test]
+    fn the_facts_leg_runs_its_two_calls_then_its_steps_and_tags_a_fact() {
+        let p = "LEG-facts Start the watcher, then work through the plan.";
+        let output = |n: usize| {
+            J::obj([
+                ("type", J::s("function_call_output")),
+                ("call_id", J::s(format!("call_{n}"))),
+                ("output", J::s("Process running with session ID 1")),
+            ])
+        };
+        let holder = answer(&body(&[p], None));
+        assert_eq!(holder.tag, "facts:holder");
+        let cmd = command_of(&holder);
+        for want in [FACTS_LOCK, FACTS_HOLDER_PID, "LOCK_EX", "kill \"STOP\", $$"] {
+            assert!(cmd.contains(want), "{want}: {cmd}");
+        }
+        let waiter = answer(&J::obj([("input", J::Arr(vec![user(p), output(1)]))]));
+        assert_eq!(waiter.tag, "facts:waiter");
+        let cmd = command_of(&waiter);
+        for want in [
+            FACTS_LOCK,
+            FACTS_WAITER_PID,
+            "LOCK_EX",
+            &format!("for my $i (1..{FACTS_TICK_COUNT})"),
+            "select(undef, undef, undef, 0.250)",
+        ] {
+            assert!(cmd.contains(want), "{want}: {cmd}");
+        }
+        assert!(
+            cmd.starts_with("exec perl ") && cmd.ends_with(&format!(" >{FACTS_TICKS} 2>&1")),
+            "the waiter is the call's leader, its rhythm in the ticks file: {cmd}"
+        );
+        let started = answer(&J::obj([(
+            "input",
+            J::Arr(vec![user(p), output(1), output(2)]),
+        )]));
+        assert_eq!(
+            (started.tag.as_str(), started.delay),
+            ("facts:person", SLOW_TURN)
+        );
+        assert!(text_of(&started).contains(FACTS_STARTED));
+        let plain = answer(&body(&[p, CONTINUE_TEXT], None));
+        assert_eq!(
+            (plain.tag.as_str(), plain.delay),
+            ("facts:continue", SLOW_TURN)
+        );
+        assert!(text_of(&plain).contains(&facts_step(1)));
+        let third = answer(&body(
+            &[p, CONTINUE_TEXT, CONTINUE_TEXT, CONTINUE_TEXT],
+            None,
+        ));
+        assert!(
+            text_of(&third).contains(&facts_step(3)),
+            "{}",
+            text_of(&third)
+        );
+        let steps: Vec<String> = (1..=10).map(facts_step).collect();
+        let marks: std::collections::BTreeSet<String> = steps.iter().map(|s| mark(s)).collect();
+        assert_eq!(marks.len(), steps.len(), "{steps:?}");
+        assert_eq!(
+            mark("Took step 3 of the plan."),
+            mark("Took step 4 of the plan.")
+        );
+        let rider = " (aterm: a background call (pid 4200) has made no progress for 4 min)";
+        let ridden = answer(&body(&[p, &format!("{CONTINUE_TEXT}{rider}")], None));
+        assert_eq!(
+            (ridden.tag.as_str(), ridden.delay),
+            ("facts:continue+fact", SLOW_TURN)
+        );
+        for said in std::iter::once(FACTS_STARTED).chain(steps.iter().map(String::as_str)) {
+            assert!(!says_done(Some(said)), "{said}");
+            assert_eq!(classify_said(Some(said)), Said::Plain, "{said}");
+        }
     }
 }

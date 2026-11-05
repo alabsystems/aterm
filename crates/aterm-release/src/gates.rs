@@ -264,7 +264,7 @@ pub fn run_all(
         )));
     }
     own_cutter_gate(git, &head, opts.allow_stale_cutter)?;
-    tag_free(git, &opts.version)?;
+    tag_gate(git, &opts.version, !opts.offline)?;
     let github_login = github_identity_gate(opts.offline)?;
     let free_disk_gib = disk_gate(tree)?;
     let processes_checked =
@@ -1685,7 +1685,7 @@ fn locked_metadata_gate_with(
     let lock_after = match read_bounded_bytes(&lock_path, 64 << 20) {
         Ok(bytes) => bytes,
         Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {
-            fs::write(&lock_path, &lock_before).map_err(|restore_error| {
+            crate::durable::write_fresh(&lock_path, &lock_before).map_err(|restore_error| {
                 Lockfile(format!(
                     "Cargo.lock disappeared during locked metadata ({read_error}) and restoring \
                      its exact prior bytes failed: {restore_error}"
@@ -1703,7 +1703,7 @@ fn locked_metadata_gate_with(
         }
     };
     if lock_after != lock_before {
-        fs::write(&lock_path, &lock_before).map_err(|error| {
+        crate::durable::write_fresh(&lock_path, &lock_before).map_err(|error| {
             Lockfile(format!(
                 "locked Cargo metadata changed Cargo.lock and restoring its exact prior bytes \
                  failed: {error}"
@@ -2154,8 +2154,12 @@ pub fn current_own_cutter_gate(git: &dyn GitRunner) -> Result<()> {
     own_cutter_gate(git, &rev_parse(git, "HEAD")?, false)
 }
 
-/// Tag vX.Y.Z must be absent locally and on origin.
-pub fn tag_free(git: &dyn GitRunner, version: &str) -> Result<()> {
+/// A publishing cut requires an unused tag locally and on origin. A signing
+/// rehearsal claims no tag and does not need to query either namespace.
+fn tag_gate(git: &dyn GitRunner, version: &str, publishes: bool) -> Result<()> {
+    if !publishes {
+        return Ok(());
+    }
     let tag = format!("v{version}");
     let local = git.git(&["rev-parse", "-q", "--verify", &format!("refs/tags/{tag}")])?;
     let remote = git_ok(
@@ -2775,13 +2779,13 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
     let setup = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(dir.join("src"))?;
         std::fs::create_dir_all(dir.join(".cargo"))?;
-        std::fs::write(
-            dir.join("Cargo.toml"),
+        crate::durable::write_fresh(
+            &dir.join("Cargo.toml"),
             "[package]\nname = \"aterm-trust-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
-             [workspace]\n",
+              [workspace]\n",
         )?;
-        std::fs::write(dir.join("src/main.rs"), PROBE_SRC)?;
-        std::fs::copy(
+        crate::durable::write_fresh(&dir.join("src/main.rs"), PROBE_SRC)?;
+        crate::durable::copy_regular_fresh(
             repo.join(".cargo/config.toml"),
             dir.join(".cargo/config.toml"),
         )?;
@@ -3462,7 +3466,7 @@ mod native_lane_probe_tests {
 }
 
 #[cfg(test)]
-mod tag_free_tests {
+mod tag_gate_tests {
     use super::*;
     use crate::ledger::RunOut;
 
@@ -3491,14 +3495,28 @@ mod tag_free_tests {
 
     #[test]
     fn a_taken_tag_refuses_the_cut() {
-        for (local, on_origin) in [(true, true), (true, false)] {
-            tag_free(&Tags { local, on_origin }, "0.97.0").expect_err("a taken tag is refused");
+        for (local, on_origin) in [(true, true), (true, false), (false, true)] {
+            tag_gate(&Tags { local, on_origin }, "0.97.0", true)
+                .expect_err("a taken tag is refused");
         }
         let free = Tags {
             local: false,
             on_origin: false,
         };
-        tag_free(&free, "0.97.0").expect("a free tag passes");
+        tag_gate(&free, "0.97.0", true).expect("a free tag passes");
+    }
+
+    #[test]
+    fn a_signing_rehearsal_neither_claims_nor_queries_tags() {
+        struct NoTagQueries;
+
+        impl GitRunner for NoTagQueries {
+            fn git(&self, args: &[&str]) -> Result<RunOut> {
+                panic!("a non-publishing rehearsal must not query tags: {args:?}");
+            }
+        }
+
+        tag_gate(&NoTagQueries, "0.97.0", false).unwrap();
     }
 }
 

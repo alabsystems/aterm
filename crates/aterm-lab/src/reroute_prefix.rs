@@ -104,7 +104,7 @@ pub fn lay(home: &Path, source: &Path, hold: Option<&Path>) -> Result<Laid, Stri
         let name = |dir: &Path| dir.with_file_name(format!("{build}.{sidecar}"));
         let (src, dest) = (name(from), name(&build_dir));
         if src.is_file() {
-            std::fs::copy(&src, &dest)
+            crate::util::copy_regular_file(&src, &dest)
                 .map_err(|e| format!("cannot copy {}: {e}", src.display()))?;
         }
     }

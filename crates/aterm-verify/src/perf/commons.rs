@@ -78,11 +78,14 @@ fn measure(json_out: Option<&Path>, sustained: bool, catalog: bool) -> Result<St
     };
     let mut run = command(executable);
     targo.environment(&mut run);
-    run.current_dir(&root)
-        .args([test, "--exact", "--nocapture", "--test-threads=1"]);
-    if sustained {
-        run.arg("--ignored");
-    }
+    // Every measurement is ignored in a plain run; `--exact` keeps this to the one named.
+    run.current_dir(&root).args([
+        test,
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
     let entry = super::measurement_entry().map_err(Halt::Timing)?;
     let before = load_average();
     let output = run
@@ -137,7 +140,7 @@ fn measure(json_out: Option<&Path>, sustained: bool, catalog: bool) -> Result<St
         "measurement": measurement,
     });
     if let Some(path) = json_out {
-        std::fs::write(path, format!("{report}\n"))
+        crate::write_fresh(path, format!("{report}\n"))
             .map_err(|error| format!("could not write {}: {error}", path.display()))?;
         Ok(format!("{summary}; report in {}", path.display()))
     } else {

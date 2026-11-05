@@ -182,9 +182,9 @@ fn parse_file_into(
 }
 
 #[cfg(target_os = "macos")]
-const NONBLOCK_OPEN_FLAG: i32 = 0x0004;
+const NONBLOCK_OPEN_FLAG: i32 = 0x0004 | 0x0100_0000;
 #[cfg(all(unix, not(target_os = "macos")))]
-const NONBLOCK_OPEN_FLAG: i32 = 0o4000;
+const NONBLOCK_OPEN_FLAG: i32 = 0o4000 | 0o2_000_000;
 
 /// Reads a regular file at `path` if its size is at most `limit` bytes.
 pub fn read_regular_file(path: &Path, limit: u64) -> Option<Vec<u8>> {

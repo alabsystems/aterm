@@ -5,8 +5,8 @@
 
 use super::{MACOS_HOSTS, Pin, Provider, Tool, When};
 
-/// A program macOS (or, for a Linux lane, Linux) ships: spawned by absolute path where the
-/// code has one. Windows ships none of these: a Windows path in `at` is where its usual
+/// A program macOS (or, for a Linux lane, Linux) ships and Windows does not: spawned by
+/// absolute path where the code has one. A Windows path in `at` is where its usual
 /// third-party copy lives.
 const fn os(name: &'static str, at: &'static [&'static str], why: &'static str) -> Tool {
     Tool {
@@ -17,6 +17,19 @@ const fn os(name: &'static str, at: &'static [&'static str], why: &'static str) 
         pin: None,
         provider: Provider::Os,
         in_guest: false,
+    }
+}
+
+/// A program every operating system aterm runs on ships, Windows as `<name>.exe` on its
+/// `PATH` ([`Provider::OsAndWindows`]); `at` holds its Unix places.
+const fn os_and_windows(
+    name: &'static str,
+    at: &'static [&'static str],
+    why: &'static str,
+) -> Tool {
+    Tool {
+        provider: Provider::OsAndWindows,
+        ..os(name, at, why)
     }
 }
 
@@ -124,8 +137,9 @@ const fn unprovided(
     }
 }
 
-/// `tool`, a [`Provider::Workspace`] row whose pin the Linux guest's provisioning builds too, at
-/// the first of its `at` (`aterm-lab`'s `linux_guest::provision_plan`).
+/// `tool`, which the Linux guest's provisioning provides too, at the first of its `at`
+/// (`aterm-lab`'s `linux_guest::provision_plan`): a [`Provider::Workspace`] row's pin it
+/// builds, or a Mac's copy of a [`Provider::Os`] row only macOS ships.
 const fn in_guest(tool: Tool) -> Tool {
     Tool {
         in_guest: true,
@@ -408,7 +422,7 @@ pub const TOOLS: &[Tool] = &[
         &["/usr/bin/uname", "/bin/uname"],
         "the kernel and machine a child sees",
     ),
-    os(
+    os_and_windows(
         "hostname",
         &["/bin/hostname"],
         "the host name a lab tape or agent records",
@@ -463,7 +477,7 @@ pub const TOOLS: &[Tool] = &[
         &["/usr/bin/unzip"],
         "unpacks the pinned browser archives",
     ),
-    os(
+    os_and_windows(
         "tar",
         &["/usr/bin/tar"],
         "install.sh unpacks the Linux release archive; `verify provision` rewrites fish's .tar.xz \
@@ -504,14 +518,14 @@ pub const TOOLS: &[Tool] = &[
         &["/usr/bin/vim"],
         "what people run in a tab: the foreground handback lane runs it as a job (row 5)",
     ),
-    os(
+    in_guest(os(
         "web2",
         &["/usr/share/dict/web2", r"C:\usr\share\dict\web2"],
         "Webster's Second, the word list aterm-lexicon's dictionary gates are curated against, so \
          another list decides nothing; macOS ships it, and the Linux and Windows lanes lay the \
          Mac's copy (row 5)",
-    ),
-    os(
+    )),
+    os_and_windows(
         "curl",
         &["/usr/bin/curl"],
         "the product's hardened network transport (the updater, atpkg, abrew, init's GitHub check, \
@@ -534,27 +548,27 @@ pub const TOOLS: &[Tool] = &[
         &["/usr/bin/sandbox-exec"],
         "every contained tab runs under it; an in-process `sandbox_init` calls the same API (row 2)",
     ),
-    os(
+    os_and_windows(
         "ssh",
         &["/usr/bin/ssh"],
         "the machines and fleet transport (row 4)",
     ),
-    os(
+    os_and_windows(
         "scp",
         &["/usr/bin/scp"],
         "the machines controller copies an enrolment payload (row 4)",
     ),
-    os(
+    os_and_windows(
         "ssh-keygen",
         &["/usr/bin/ssh-keygen"],
         "signs and checks the machines envelope, and makes a host key (row 4)",
     ),
-    os(
+    os_and_windows(
         "ssh-keyscan",
         &["/usr/bin/ssh-keyscan"],
         "the machines controller pins a discovered host's key (row 4)",
     ),
-    os(
+    os_and_windows(
         "ssh-add",
         &["/usr/bin/ssh-add"],
         "the machines controller's agent-held key (row 4)",
@@ -862,8 +876,8 @@ pub const TOOLS: &[Tool] = &[
     toolset(
         "ty",
         "ty",
-        "checks every registered model under `verify spec` and `verify checkers` (release); plain \
-         tests never run it",
+        "checks every registered model under `verify spec`, and each step of the tiered tests under \
+         `verify checkers` and a release's test run; plain tests never run it",
     ),
     toolset(
         "ay",
@@ -934,20 +948,6 @@ pub const TOOLS: &[Tool] = &[
         &[],
         "binaryen's optimizer: the site ships the engine only after its -O3 pass, and the perf lane \
          measures what ships; an optimizer is not worth rebuilding (row 21)",
-    ),
-    workspace(
-        "wasm-bindgen",
-        When::Record,
-        Some(Pin {
-            package: "wasm-bindgen",
-            version: "0.2.108",
-            exe: "bin/wasm-bindgen",
-            built: true,
-            hosts: &[],
-        }),
-        &[],
-        "the wasm-glue oracle, only to re-record its goldens: no module aterm ships is bound with it \
-         (row 20)",
     ),
     workspace(
         "limactl",
@@ -1062,7 +1062,7 @@ pub const TOOLS: &[Tool] = &[
     hardware(
         "gpu",
         "a GPU adapter",
-        "the gpu-oracle lane renders on a real adapter",
+        "a release's test run holds this host's GPU arm to its CPU twins on a real adapter",
     ),
     hardware(
         "desktop",

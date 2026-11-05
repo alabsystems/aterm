@@ -259,19 +259,7 @@ pub fn bundle_json(b: &Bundle) -> Jv {
                                 "thermal",
                                 f.thermal.map_or_else(
                                     || Jv::why("not_sampled"),
-                                    |t| {
-                                        Jv::obj([
-                                            ("raw", Jv::u(u64::from(t.raw))),
-                                            ("level", Jv::s(t.level.word())),
-                                            (
-                                                "low_power",
-                                                t.low_power.map_or_else(
-                                                    || Jv::why("not_sampled"),
-                                                    Jv::Bool,
-                                                ),
-                                            ),
-                                        ])
-                                    },
+                                    super::view::thermal_json,
                                 ),
                             ),
                             (
@@ -426,7 +414,11 @@ pub fn current_report_json(s: &Snapshot) -> Jv {
     ])
 }
 
-/// Report clauses shared by the control interface and the resource panel.
+/// Report clauses shared by the control interface and the resource panel. The CPU Stats
+/// clauses (the IOReport window, online CPUs and the CLPC mask, power limits, channels, and the
+/// pointer to inspect and resample them) need a sample, which a snapshot holds only where a
+/// lens, the recorder or a pull took one (A2 §6.4); the thermal state, a prior process's report,
+/// saved underuse and the policy collection do not.
 #[must_use]
 pub fn lines(s: &Snapshot) -> Vec<String> {
     let mut policy = Vec::new();
@@ -444,65 +436,70 @@ pub fn lines(s: &Snapshot) -> Vec<String> {
         policy.push(format!("Authorized CPU policy collection: {state}; see exported incident for per-selector observations/errors and exact window"));
         policy.push("A zero-hit census means no active flags observed across the checked processes during that window; it is not an atomic global all-clear.".into());
     }
-    let Some(h) = &s.hardware else {
-        return policy;
-    };
-    let mut out = vec![format!(
-        "CPU hardware: native IOReport, {} ms window; cause not established",
-        h.window_ns / 1_000_000
-    )];
+    let h = s.hardware.as_ref();
+    let mut out = Vec::new();
+    if let Some(h) = h {
+        out.push(format!(
+            "CPU hardware: native IOReport, {} ms window; cause not established",
+            h.window_ns / 1_000_000
+        ));
+    }
     if s.historical_cpu_report.is_some() {
         out.push("A prior process's anomaly report is retained for export; it is historical, not a current diagnosis".into());
     }
     out.extend(policy);
-    let mut channels_text = Vec::new();
-    match &h.channels {
-        Err(why) => channels_text.push(format!("CPU frequency/residency unavailable ({why})")),
-        Ok(channels) => {
-            for c in channels {
-                let active = c.active.as_ref().map_or_else(
-                    |e| format!("unavailable ({e})"),
-                    |v| format!("{:.1}% active", v * 100.0),
-                );
-                let frequency = c.active_mhz.as_ref().map_or_else(
-                    |e| format!("frequency unavailable ({e})"),
-                    |v| format!("estimated {v:.0} MHz while active"),
-                );
-                channels_text.push(format!("{}: {active}, {frequency}", c.name));
+    if let Some(h) = h {
+        let controls = &h.controls;
+        out.push(format!(
+            "Online CPUs: {}; requested CLPC mask: {}; effective mask unavailable",
+            controls
+                .active_cpus
+                .as_ref()
+                .map_or_else(|e| format!("unavailable ({e})"), ToString::to_string),
+            controls
+                .requested_recommended_mask
+                .as_ref()
+                .map_or_else(|e| format!("unavailable ({e})"), |v| format!("0x{v:x}"))
+        ));
+    }
+    if let Some(t) = s.thermal {
+        out.push(format!("OS thermal state {} ({}); low power {}; nominal thermal state does not exclude another limit",
+            t.raw, t.word(), t.low_power.map_or("unavailable", |v| if v { "on" } else { "off" })));
+    }
+    if let Some(h) = h {
+        out.push(match &h.controls.power_limits {
+            Err(e) => format!("Public CPU power limits unavailable ({e}); no unrestricted claim"),
+            Ok(p) => format!(
+                "Public CPU speed/scheduler limits: {:?} / {:?}; other limits may exist",
+                p.speed_percent, p.scheduler_percent
+            ),
+        });
+        match &h.channels {
+            Err(why) => out.push(format!("CPU frequency/residency unavailable ({why})")),
+            Ok(channels) => {
+                for c in channels {
+                    let active = c.active.as_ref().map_or_else(
+                        |e| format!("unavailable ({e})"),
+                        |v| format!("{:.1}% active", v * 100.0),
+                    );
+                    let frequency = c.active_mhz.as_ref().map_or_else(
+                        |e| format!("frequency unavailable ({e})"),
+                        |v| format!("estimated {v:.0} MHz while active"),
+                    );
+                    out.push(format!("{}: {active}, {frequency}", c.name));
+                }
             }
         }
     }
-    let controls = &h.controls;
-    out.push(format!(
-        "Online CPUs: {}; requested CLPC mask: {}; effective mask unavailable",
-        controls
-            .active_cpus
-            .as_ref()
-            .map_or_else(|e| format!("unavailable ({e})"), ToString::to_string),
-        controls
-            .requested_recommended_mask
-            .as_ref()
-            .map_or_else(|e| format!("unavailable ({e})"), |v| format!("0x{v:x}"))
-    ));
-    if let Some(t) = s.thermal {
-        out.push(format!("OS thermal state {} ({}); low power {}; nominal thermal state does not exclude another limit",
-            t.raw, t.level.word(), t.low_power.map_or("unavailable", |v| if v { "on" } else { "off" })));
-    }
-    out.push(match &controls.power_limits {
-        Err(e) => format!("Public CPU power limits unavailable ({e}); no unrestricted claim"),
-        Ok(p) => format!(
-            "Public CPU speed/scheduler limits: {:?} / {:?}; other limits may exist",
-            p.speed_percent, p.scheduler_percent
-        ),
-    });
-    out.extend(channels_text);
     if let Some(b) = &s.cpu_diagnostics {
         out.push(format!(
             "Saved CPU underuse: {} frames (P mean <=25%, every E >=90%, wait >=1 core, >=30s); cause not established",
             b.frames.len()
         ));
     }
-    out.push("Inspect/export: aterm ctl @self sys cores --json. Resample: aterm ctl @self sys cores fresh=0 --json. Administrator frequency/thermal trace may be needed; no reboot or policy change is automatic.".into());
+    if h.is_some() {
+        out.push("Inspect/export: aterm ctl @self sys cores --json. Resample: aterm ctl @self sys cores fresh=0 --json. Administrator frequency/thermal trace may be needed; no reboot or policy change is automatic.".into());
+    }
     out
 }
 

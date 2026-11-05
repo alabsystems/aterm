@@ -543,9 +543,10 @@ fn the_trace_hex_ask_exports_the_trace_file_its_summary_counts() {
     let trace = MomentumTrace::decode(&file).expect("a sealed momentum trace file");
     let counts = trace.read(t0).expect("its log reads whole").counts;
     assert_eq!(counts.keys, 6, "each key once");
+    let unseen = trace.unseen_keys(t0).expect("its checkpoint restores");
     assert!(
         summary.ends_with(&format!(
-            " sealed=true keys={} resets={} ticks={} queries={}",
+            " sealed=true keys={} resets={} ticks={} queries={} unseen={unseen}",
             counts.keys, counts.resets, counts.ticks, counts.queries
         )),
         "the summary counts the exported log: {summary}"

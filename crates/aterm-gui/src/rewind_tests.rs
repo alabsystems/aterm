@@ -466,7 +466,7 @@ fn start_recording_session(app: &App, session: u64) {
     };
     let mut rec = s.ctx.temporal.lock().expect("recorder");
     rec.record_keyframe(keyframe);
-    rec.spine_watermark().seed(pre);
+    rec.seed_spine(pre);
 }
 
 /// Feed `bytes` to session 0's engine and, as its reader does, through a spine mark into its recorder, as one slice at a later instant than any before it; that instant.
@@ -500,7 +500,7 @@ fn slice_clocked(app: &App, session: u64, bytes: &[u8], clock: ClockReading) -> 
         );
     }
     while let Some(msg) = rx.try_recv() {
-        rec.apply_inline(msg);
+        rec.apply(msg);
     }
     rec.latest_tick()
 }
@@ -520,13 +520,13 @@ fn advance_recording_clocks(app: &App, sessions: &[u64], ms: u64) {
 }
 
 /// Record a live witness of `term`'s screen on session 0's spine, at a later instant than any before it, as the reader does.
-fn witness(app: &App, term: &Terminal) {
+pub(crate) fn witness(app: &App, term: &Terminal) {
     let s = app.pool.get(0).expect("session 0");
     let mut rec = s.ctx.temporal.lock().expect("recorder");
     let last = rec.latest_tick();
     while rec.now() <= last {}
     let live = term.checkpoint_visible().expect("a visible checkpoint");
-    rec.apply_inline(TemporalMsg::Witness(Arc::new(live)));
+    rec.apply(TemporalMsg::Witness(Arc::new(live)));
 }
 
 fn replay(app: &App, at: Option<Ticks>) -> Terminal {
@@ -1280,7 +1280,8 @@ fn the_past_screen_scrolls_its_own_scrollback_up_to_its_cap() {
 /// A fold from the fork cache shows what the straight fold from the base does, at the cache's own end and between its forks.
 #[test]
 fn a_fold_from_the_fork_cache_shows_what_the_fold_from_the_base_does() {
-    use crate::rewind_worker::{FORK_EVERY, show_inline, warmed_show};
+    use crate::rewind_worker::{show_inline, warmed_show};
+    use crate::temporal::FORK_EVERY;
     let app = scripted_app();
     start_recording(&app);
     let (mut ticks, mut total, mut widest) = (Vec::new(), 0, 0);
@@ -4353,6 +4354,87 @@ fn b_stops_at_a_diverged_chain_and_credits_no_slice_with_its_mistake() {
     );
 }
 
+/// A cell search does not trust a replay a pending witness contradicts: the bounded fold passes a witness of a screen the replay never reaches, so the history from the chain's base is unknown, no slice is credited with the change, and the search posts no verdict.
+#[test]
+fn b_stops_at_an_unjudged_witness_that_differs() {
+    let mut app = scripted_app();
+    start_recording(&app);
+    let _ = slice(&app, b"recorded");
+    unrecorded(&app, b"\x1b[5;1Hunrecorded");
+    witness(&app, &term_lock(&live_term(&app)));
+    let _ = slice(&app, b"\x1b[3;1Hone");
+    let two = slice(&app, b"\x1b[6;1Htwo");
+    let found = changed_at_latest(&mut app, (2, 0));
+    assert!(
+        found.contains(&format!(" at={} ", two.0)) && found.contains(" changed=unknown "),
+        "the history before the shown state is unknown: {found}"
+    );
+    let rec = app
+        .pool
+        .get(0)
+        .expect("session 0")
+        .ctx
+        .temporal
+        .lock()
+        .expect("recorder");
+    assert_eq!(
+        (rec.pending(), rec.witnessed()),
+        (1, 0),
+        "the witness is still pending: the search posted no verdict"
+    );
+}
+
+/// A search credits no slice when the shown instant's own replay is untrusted: a pending witness its chain's fold passes after the shown instant differs from the replay, though the witness before matched, so the reading at the shown instant is contradicted and the search answers that instant, change unknown, posting no verdict.
+#[test]
+fn b_answers_unknown_when_the_shown_instants_own_replay_is_contradicted() {
+    use crate::rewind_worker::{Change, Changed, FoldToken, search_to_end};
+    use crate::temporal::{TemporalRecorder, keyframe_of};
+    let mut live = Terminal::new(6, 30);
+    let mut r = TemporalRecorder::new();
+    r.record_keyframe(keyframe_of(&live, usize::MAX).expect("keyable"));
+    let put = |r: &mut TemporalRecorder, live: &mut Terminal, bytes: &[u8]| {
+        let at = ClockReading::now();
+        live.process_at(bytes, at);
+        r.apply(TemporalMsg::RawIn(InputSlice::at(bytes, at)));
+        r.latest_tick()
+    };
+    let see = |r: &mut TemporalRecorder, live: &Terminal| {
+        let last = r.latest_tick();
+        while r.now() <= last {}
+        r.apply(TemporalMsg::Witness(Arc::new(
+            live.checkpoint_visible().expect("visible"),
+        )));
+    };
+    let wrote = put(&mut r, &mut live, b"\x1b[3;1HA");
+    see(&mut r, &live);
+    live.process(b"\x1b[3;1HZ");
+    let at = put(&mut r, &mut live, b"\x1b[6;1Hx");
+    see(&mut r, &live);
+    let instants: Vec<_> = r
+        .rewind_instants()
+        .into_iter()
+        .filter(|i| i.at <= at)
+        .collect();
+    let contradicted = r.contradicted(&instants);
+    let found = search_to_end(Changed {
+        session: 0,
+        token: FoldToken { view: 0, serial: 0 },
+        chains: r.chain_plans(at),
+        instants: instants.into_iter().zip(contradicted).collect(),
+        at,
+        cell: (2, 0),
+        skip_own: false,
+    })
+    .expect("searched");
+    assert_ne!(found.at, Some(wrote), "no slice is credited with the cell");
+    assert_eq!(
+        (found.at, found.change),
+        (Some(at), Change::Unknown),
+        "the shown instant's replay is untrusted"
+    );
+    assert_eq!(r.pending(), 2, "the search posts no verdict");
+}
+
 /// When the shown state itself changed the cell, B answers that state; B again goes on past it, and says so.
 #[test]
 fn b_answers_the_shown_state_when_it_changed_the_cell_and_b_again_the_one_before() {
@@ -4568,8 +4650,8 @@ fn a_slice_on_a_live_keyframes_tick_brings_its_bytes_to_the_change() {
         let mut term = term_lock(&live);
         let clock = ClockReading::now();
         term.process_at(b"\x1b[1;1Hx", clock);
-        rec.apply_inline(TemporalMsg::RawIn(InputSlice::at(b"\x1b[1;1Hx", clock)));
-        rec.apply_inline(TemporalMsg::LiveKeyframe(
+        rec.apply(TemporalMsg::RawIn(InputSlice::at(b"\x1b[1;1Hx", clock)));
+        rec.apply(TemporalMsg::LiveKeyframe(
             Arc::new(term.checkpoint()).into(),
             crate::temporal::SliceMarks::default(),
         ));
@@ -4621,7 +4703,7 @@ fn a_witness_on_the_shown_states_own_tick_is_judged() {
             let mut term = term_lock(&live);
             let clock = ClockReading::now();
             term.process_at(b"\x1b[2J\x1b[Hshown", clock);
-            rec.apply_inline(TemporalMsg::RawIn(InputSlice::at(
+            rec.apply(TemporalMsg::RawIn(InputSlice::at(
                 b"\x1b[2J\x1b[Hshown",
                 clock,
             )));
@@ -4632,7 +4714,7 @@ fn a_witness_on_the_shown_states_own_tick_is_judged() {
             } else {
                 term.checkpoint_visible()
             };
-            rec.apply_inline(TemporalMsg::Witness(Arc::new(seen.expect("visible"))));
+            rec.apply(TemporalMsg::Witness(Arc::new(seen.expect("visible"))));
             rec.freeze_now_for_test(None);
             assert_eq!(
                 (rec.latest_tick(), rec.fidelity_at(tie)),
@@ -4806,7 +4888,7 @@ fn the_idle_judge_folds_and_posts_its_verdicts_in_parts() {
         let lines: String = (0..3000)
             .map(|n| format!("part {k} line {n:04} ......\r\n"))
             .collect();
-        assert!(lines.len() > crate::rewind_worker::FORK_EVERY, "fixture");
+        assert!(lines.len() > crate::temporal::FORK_EVERY, "fixture");
         last = slice(&app, lines.as_bytes());
         witness(&app, &term_lock(&live_term(&app)));
     }
@@ -4841,7 +4923,8 @@ fn the_idle_judge_folds_and_posts_its_verdicts_in_parts() {
 /// The warm ends when the fork it wants lies more than a pass behind its front and past every fork it holds: each pass that stops short carries on from where it stopped.
 #[test]
 fn the_warm_ends_when_the_fork_it_wants_lies_far_behind_its_front() {
-    use crate::rewind_worker::{FORK_EVERY, MAX_FORKS, warm_passes};
+    use crate::rewind_worker::{MAX_FORKS, warm_passes};
+    use crate::temporal::FORK_EVERY;
     let app = scripted_app();
     *app.pool
         .get(0)
@@ -4875,7 +4958,8 @@ fn the_warm_ends_when_the_fork_it_wants_lies_far_behind_its_front() {
 /// Steps from an idle view each fold at most a fork's spacing and a slice, across a keyframe too: the cache keeps forks along the chain before the shown one.
 #[test]
 fn each_step_folds_from_a_fork_within_its_spacing_across_two_chains() {
-    use crate::rewind_worker::{FORK_EVERY, show_inline, warmed_shows};
+    use crate::rewind_worker::{show_inline, warmed_shows};
+    use crate::temporal::FORK_EVERY;
     let app = scripted_app();
     start_recording(&app);
     let mut widest = 0;
@@ -5010,7 +5094,7 @@ fn rewind_view_renders_past_inline_and_kitty_images_across_keyframes_and_scrollb
     let past_img = slice(&app, &first);
     witness(&app, &term_lock(&live_term(&app)));
 
-    // Mint a mid-session keyframe carrying the placed OSC 1337 + Kitty store/relations/floating.
+    // Record a mid-session keyframe of the live engine carrying the placed OSC 1337 + Kitty store/relations/floating.
     {
         let s = app.pool.get(0).expect("session 0");
         let kf = {
@@ -5160,7 +5244,7 @@ fn autonomous_kitty_animation_ticks_step_rewind_instants_and_pass_pane_chains() 
         let s = app.pool.get(0).expect("session 0");
         let mut rec = s.ctx.temporal.lock().expect("recorder");
         while let Some(msg) = rx.try_recv() {
-            rec.apply_inline(msg);
+            rec.apply(msg);
         }
         rec.latest_tick()
     };

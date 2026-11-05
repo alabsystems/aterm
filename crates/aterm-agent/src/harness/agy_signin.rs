@@ -229,17 +229,154 @@ pub struct VerifiedGoogleGrant {
     digest: [u8; 32],
 }
 
-/// Worker launch prepared from a canonically verified native grant. Retains the profile
-/// claim and checks the exact binding and grant again when its starter is requested.
-pub struct VerifiedGoogleWorker {
-    grant: VerifiedGoogleGrant,
+/// A native grant this Mac signed in, proved and published, checked again at a launch on this
+/// Mac alone (design 2026-11-05 §4.15 rule 6): its explicit identity binding is current and its
+/// grant file is present and opens. Its account is the one Google's userinfo proved when the
+/// login was signed in, which the pool binding recorded; a launch never contacts Google and never
+/// reads the grant's contents. It can start a worker but, unlike a [`VerifiedGoogleGrant`], it
+/// never publishes a login. The native profile stays claimed until this value is dropped.
+pub struct PublishedGoogleGrant {
+    grant: UnverifiedGoogleGrant,
+}
+
+/// Why a published native grant cannot start a launch, judged locally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishedRefusal {
+    /// The profile holds no grant file that is present and opens: the row is signed out here.
+    SignedOut,
+    /// The binding, program or profile does not permit this launch.
+    Refused(&'static str),
+}
+
+impl PublishedRefusal {
+    /// The refusal's message, with no credential value or address.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::SignedOut => "Published native Google grant is absent or unusable",
+            Self::Refused(message) => message,
+        }
+    }
+}
+
+impl From<&'static str> for PublishedRefusal {
+    fn from(message: &'static str) -> Self {
+        Self::Refused(message)
+    }
+}
+
+impl std::fmt::Display for PublishedRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// Negative control for the local launch check: when set, the check also requires the grant's
+    /// contents to hold a consumer access token, the first step of the userinfo request a launch
+    /// once made with it. No release build carries it.
+    static LAUNCH_READS_GRANT_CONTENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam: runs `body` with the negative control [`LAUNCH_READS_GRANT_CONTENTS`] set.
+#[cfg(test)]
+pub(super) fn with_launch_reading_grant_contents<R>(body: impl FnOnce() -> R) -> R {
+    LAUNCH_READS_GRANT_CONTENTS.with(|set| set.set(true));
+    let out = body();
+    LAUNCH_READS_GRANT_CONTENTS.with(|set| set.set(false));
+    out
+}
+
+impl PublishedGoogleGrant {
+    pub(super) fn account_label(&self) -> &str {
+        &self.grant.account
+    }
+
+    /// Recheck the binding and the grant file's presence immediately before use.
+    ///
+    /// # Errors
+    ///
+    /// The binding changed, or the grant file is no longer present and openable.
+    pub fn check_current(&self) -> Result<(), PublishedRefusal> {
+        self.grant
+            .check_binding()
+            .map_err(|_| "Google binding changed")?;
+        let path = self.grant.path();
+        if !super::agy_quota_store::usable_grant(path) {
+            return Err(PublishedRefusal::SignedOut);
+        }
+        #[cfg(any(test, debug_assertions))]
+        if LAUNCH_READS_GRANT_CONTENTS.with(std::cell::Cell::get) {
+            native_access_token(grant_bytes(path)?.as_slice())?;
+        }
+        Ok(())
+    }
+
+    /// Carry the published profile into a worker, replacing inherited profile routing.
+    /// The native executable is the managed program that produced the grant.
+    ///
+    /// # Errors
+    ///
+    /// The grant is no longer current, or the inherited flags cannot be rebound to the profile.
+    pub fn prepare_worker(
+        self,
+        mut starter: super::worker::Starter,
+    ) -> Result<PublishedGoogleWorker, &'static str> {
+        self.check_current().map_err(PublishedRefusal::message)?;
+        let path = self.grant.path();
+        let gemini = path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("Native agy profile path is unavailable")?;
+        let home = gemini
+            .parent()
+            .and_then(Path::to_str)
+            .ok_or("Native agy profile home is unavailable")?;
+        let flags = starter
+            .args
+            .as_ref()
+            .map_err(|_| "Inherited agy flags are unavailable")?;
+        starter.args = Ok(super::upgrade_agy::bound_worker_flags(flags, gemini)?);
+        starter.exe = self.grant.native.program.clone();
+        starter.env.retain(|(name, _)| {
+            name != "HOME" && name != "SSH_CONNECTION" && name != "AGY_CLI_DISABLE_AUTO_UPDATE"
+        });
+        starter.env.extend([
+            ("HOME".into(), home.into()),
+            ("SSH_CONNECTION".into(), "127.0.0.1 1 127.0.0.1 22".into()),
+            ("AGY_CLI_DISABLE_AUTO_UPDATE".into(), "true".into()),
+        ]);
+        for name in crate::ai::connector::AGY.credential_env {
+            starter.env.retain(|(key, _)| key != name);
+            if !starter.unset.contains(name) {
+                starter.unset.push(name);
+            }
+        }
+        Ok(PublishedGoogleWorker {
+            grant: self,
+            starter,
+        })
+    }
+}
+
+/// Worker launch prepared from a published native grant. Retains the profile claim and checks
+/// the exact binding and the grant file's presence again when its starter is requested.
+pub struct PublishedGoogleWorker {
+    grant: PublishedGoogleGrant,
     starter: super::worker::Starter,
 }
 
-impl VerifiedGoogleWorker {
+impl PublishedGoogleWorker {
     /// Recheck immediately before admitting/writing this worker's launch line.
+    ///
+    /// # Errors
+    ///
+    /// The binding changed or the grant file is no longer present and openable.
     pub fn starter(&self) -> Result<&super::worker::Starter, &'static str> {
-        self.grant.check_current()?;
+        self.grant
+            .check_current()
+            .map_err(PublishedRefusal::message)?;
         Ok(&self.starter)
     }
 }
@@ -269,46 +406,6 @@ impl VerifiedGoogleGrant {
             self.grant.revision.ok_or("Google binding changed")?,
         )
         .ok_or("Google checkpoint root is unavailable")
-    }
-    /// Carry the verified profile into a worker, replacing inherited profile routing.
-    /// The native executable is the same managed program that produced the grant.
-    pub fn prepare_worker(
-        self,
-        mut starter: super::worker::Starter,
-    ) -> Result<VerifiedGoogleWorker, &'static str> {
-        let path = self.path()?;
-        let gemini = path
-            .parent()
-            .and_then(Path::parent)
-            .ok_or("Native agy profile path is unavailable")?;
-        let home = gemini
-            .parent()
-            .and_then(Path::to_str)
-            .ok_or("Native agy profile home is unavailable")?;
-        let flags = starter
-            .args
-            .as_ref()
-            .map_err(|_| "Inherited agy flags are unavailable")?;
-        starter.args = Ok(super::upgrade_agy::bound_worker_flags(flags, gemini)?);
-        starter.exe = self.grant.native.program.clone();
-        starter.env.retain(|(name, _)| {
-            name != "HOME" && name != "SSH_CONNECTION" && name != "AGY_CLI_DISABLE_AUTO_UPDATE"
-        });
-        starter.env.extend([
-            ("HOME".into(), home.into()),
-            ("SSH_CONNECTION".into(), "127.0.0.1 1 127.0.0.1 22".into()),
-            ("AGY_CLI_DISABLE_AUTO_UPDATE".into(), "true".into()),
-        ]);
-        for name in crate::ai::connector::AGY.credential_env {
-            starter.env.retain(|(key, _)| key != name);
-            if !starter.unset.contains(name) {
-                starter.unset.push(name);
-            }
-        }
-        Ok(VerifiedGoogleWorker {
-            grant: self,
-            starter,
-        })
     }
     /// Provider-confirmed account identity.
     pub fn profile(&self) -> &super::google_profile::GoogleProfile {
@@ -596,17 +693,24 @@ fn native_profile(
         .join(aterm_codec::hex::encode_lower(&digest.finalize()))
 }
 
-/// Revalidate a published native grant without running a CLI, opening a browser or
-/// requesting a password. Expired/rejected grants require the pool's staged renewal path.
-pub fn verify_google_existing(
+/// Check, at a launch, a native grant this Mac published, on this Mac alone (design 2026-11-05
+/// §4.15 rule 6): the program and profile are in place, the row's explicit Google binding is
+/// current, the profile can be claimed, and its grant file is present and opens. It runs no CLI,
+/// opens no browser, contacts no provider and never reads the grant's contents: the account was
+/// proved by Google's userinfo when it was signed in, and agy renews its own access token. A grant
+/// file that is absent or does not open answers [`PublishedRefusal::SignedOut`], which the pool's
+/// staged renewal takes as the launch's sign-in.
+///
+/// # Errors
+///
+/// The row is signed out here, or the program, profile or binding does not permit the launch.
+pub fn check_google_published(
     program: &Path,
     state: &Path,
     account: &str,
     expected_email: &str,
     profile: &Path,
-    deadline: Instant,
-) -> Result<VerifiedGoogleGrant, super::google_profile::Error> {
-    remaining(deadline).map_err(|_| "Google verification deadline expired")?;
+) -> Result<PublishedGoogleGrant, PublishedRefusal> {
     if !program.is_absolute()
         || !program.is_file()
         || !state.is_absolute()
@@ -627,20 +731,23 @@ pub fn verify_google_existing(
     }
     let claim = super::browser_window::ProfileLock::claim(profile)
         .map_err(|_| "Published native Google profile is held or unavailable")?;
-    UnverifiedGoogleGrant {
-        native: UnverifiedGrant {
-            session: None,
-            path: profile.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-            program: program.into(),
-            _claim: claim,
+    let published = PublishedGoogleGrant {
+        grant: UnverifiedGoogleGrant {
+            native: UnverifiedGrant {
+                session: None,
+                path: super::upgrade_agy::profile_grant(profile),
+                program: program.into(),
+                _claim: claim,
+            },
+            expected_email: expected_email.into(),
+            state: state.into(),
+            account: account.into(),
+            revision: registry.binding_revision("agy", account),
+            recovery: None,
         },
-        expected_email: expected_email.into(),
-        state: state.into(),
-        account: account.into(),
-        revision: registry.binding_revision("agy", account),
-        recovery: None,
-    }
-    .verify_classified(deadline)
+    };
+    published.check_current()?;
+    Ok(published)
 }
 
 /// Approve a native agy login using its explicitly bound Google identity and registered
@@ -886,14 +993,14 @@ fn stage_profile(
 ) -> Result<super::browser_window::ProfileLock, Error> {
     aterm_types::fs_restricted::ensure_private_dir(profile).map_err(|_| Error::Profile)?;
     let claim = super::browser_window::ProfileLock::claim(profile).map_err(|_| Error::Profile)?;
-    let token = profile.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    let token = super::upgrade_agy::profile_grant(profile);
     // A staging home is owned by this attempt. Never overwrite a grant left by another
     // attempt, and never let native refresh mutate the currently published home.
     if token.try_exists().map_err(|_| Error::Profile)? {
         return Err(Error::Profile);
     }
     if let Some(previous) = previous {
-        let source = previous.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        let source = super::upgrade_agy::profile_grant(previous);
         if let Some(bytes) = aterm_secrets::fsx::read_private(&source, LIMIT)
             .map_err(|_| Error::Profile)?
             .filter(|bytes| !bytes.is_empty())
@@ -923,7 +1030,7 @@ fn prepare_rejected_staging(
     if !(recovery.current)() {
         return Err(Error::Authorization);
     }
-    let path = profile.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    let path = super::upgrade_agy::profile_grant(profile);
     let bytes = grant_bytes(&path).map_err(|_| Error::Native)?;
     let token = native_access_token(bytes.as_slice()).map_err(|_| Error::Native)?;
     let rejected = matches!(
@@ -1182,7 +1289,9 @@ fn run_attempt(
     let status = child.child.wait().map_err(|_| Error::Process)?;
     // No live group member remains before wait reaps its leader; Drop must not signal a reused
     // pid after wait releases that leader's reserved group id.
-    let path = gemini.join("antigravity-cli/antigravity-oauth-token");
+    let path = gemini
+        .join(super::upgrade_agy::APP_DATA_DIR)
+        .join(super::upgrade_agy::GRANT_FILE);
     let grant = aterm_secrets::fsx::read_private(&path, LIMIT).map_err(|_| Error::Native)?;
     if !status.success() || grant.is_none_or(|bytes| bytes.is_empty()) {
         return Err(Error::Native);
@@ -1221,6 +1330,19 @@ pub(super) fn publication_fixture(
             principal: [1; 32],
         },
         digest: grant_digest(bytes),
+    }
+}
+
+/// Synthetic published grant for launch tests: a grant file is written and claimed, never read.
+#[cfg(test)]
+pub(super) fn published_fixture(
+    state: &Path,
+    profile: &Path,
+    account: &str,
+    email: &str,
+) -> PublishedGoogleGrant {
+    PublishedGoogleGrant {
+        grant: publication_fixture(state, profile, account, email).grant,
     }
 }
 
@@ -1666,25 +1788,117 @@ mod tests {
         assert!(verified.path().is_err());
         aterm_secrets::fsx::write_atomic(&path, bytes, 0o600).unwrap();
         assert!(verified.path().is_ok());
-        let prepared = verified
-            .prepare_worker(super::super::worker::Starter {
-                exe: PathBuf::from("/inherited/agy"),
-                env: vec![
-                    ("HOME".into(), "/inherited/home".into()),
-                    ("GEMINI_API_KEY".into(), "synthetic-key".into()),
-                ],
-                args: Ok(vec![
-                    "-gemini_dir=/inherited".into(),
-                    "--app_data_dir".into(),
-                    "old".into(),
-                    "--mode".into(),
-                    "plan".into(),
-                ]),
-                unset: Vec::new(),
-            })
-            .unwrap();
+        aterm_secrets::fsx::write_atomic(
+            &config,
+            text.replace("person@", "other@").as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        assert!(verified.path().is_err());
+    }
+
+    const BINDING: &str = "[[identities]]\nid='one'\nemail='person@example.com'\n[[bindings]]\nprovider='agy'\naccount='one'\nidentity='one'\nexpected_email='person@example.com'\n";
+
+    /// A bound state root, a published profile and a program file that is never run.
+    fn published_world() -> (aterm_tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let profile = root.path().join("profile");
+        for dir in [&state, &profile] {
+            aterm_secrets::fsx::ensure_private_dir(dir).unwrap();
+        }
+        aterm_secrets::fsx::write_atomic(
+            &state.join("google-identities.toml"),
+            BINDING.as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let program = root.path().join("agy");
+        aterm_secrets::fsx::write_atomic(&program, b"never run", 0o600).unwrap();
+        (root, state, profile, program)
+    }
+
+    fn write_grant(profile: &Path, bytes: &[u8]) -> PathBuf {
+        let path = super::super::upgrade_agy::profile_grant(profile);
+        aterm_secrets::fsx::ensure_private_dir(path.parent().unwrap()).unwrap();
+        aterm_secrets::fsx::write_atomic(&path, bytes, 0o600).unwrap();
+        path
+    }
+
+    /// The launch check of a published grant answers from this Mac alone (§4.15 rule 6): a grant
+    /// whose bytes hold no token at all is still a signed-in row, because the check asks only
+    /// that the file is present and opens, so it holds nothing a provider request could carry,
+    /// and records no probe.
+    #[test]
+    fn a_launch_checks_a_published_grant_locally_without_its_contents() {
+        let (_root, state, profile, program) = published_world();
+        write_grant(&profile, b"opaque bytes no request can carry");
+        let (checked, probes) = super::super::provider_read::captured(|| {
+            check_google_published(&program, &state, "one", "person@example.com", &profile)
+        });
+        assert!(checked.is_ok(), "{:?}", checked.err());
+        assert!(probes.is_empty());
+    }
+
+    /// CONTROL: with the launch reading the grant's contents, as the userinfo request it once
+    /// made had to, the same grant is refused, so the test above holds only because nothing reads
+    /// them.
+    #[test]
+    fn control_a_launch_reading_grant_contents_refuses_the_same_grant() {
+        let (_root, state, profile, program) = published_world();
+        write_grant(&profile, b"opaque bytes no request can carry");
+        let checked = with_launch_reading_grant_contents(|| {
+            check_google_published(&program, &state, "one", "person@example.com", &profile)
+        });
+        assert!(matches!(checked, Err(PublishedRefusal::Refused(_))));
+    }
+
+    #[test]
+    fn a_published_grant_that_is_absent_or_does_not_open_is_signed_out_here() {
+        let (_root, state, profile, program) = published_world();
+        let check =
+            || check_google_published(&program, &state, "one", "person@example.com", &profile);
+        assert_eq!(check().err(), Some(PublishedRefusal::SignedOut));
+        let path = write_grant(&profile, b"");
+        assert_eq!(check().err(), Some(PublishedRefusal::SignedOut));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(check().err(), Some(PublishedRefusal::SignedOut));
+        std::fs::remove_dir(&path).unwrap();
+        write_grant(&profile, b"grant");
+        assert!(check().is_ok());
+        assert!(matches!(
+            check_google_published(&program, &state, "one", "other@example.com", &profile),
+            Err(PublishedRefusal::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn a_published_worker_rebinds_its_profile_and_rechecks_before_admission() {
+        let (_root, state, profile, program) = published_world();
+        let path = write_grant(&profile, b"grant");
+        let gemini = profile.join(".gemini");
+        let prepared =
+            check_google_published(&program, &state, "one", "person@example.com", &profile)
+                .unwrap()
+                .prepare_worker(super::super::worker::Starter {
+                    exe: PathBuf::from("/inherited/agy"),
+                    env: vec![
+                        ("HOME".into(), "/inherited/home".into()),
+                        ("GEMINI_API_KEY".into(), "synthetic-key".into()),
+                    ],
+                    args: Ok(vec![
+                        "-gemini_dir=/inherited".into(),
+                        "--app_data_dir".into(),
+                        "old".into(),
+                        "--mode".into(),
+                        "plan".into(),
+                    ]),
+                    unset: Vec::new(),
+                })
+                .unwrap();
         let starter = prepared.starter().unwrap();
-        assert_eq!(starter.exe, Path::new("/synthetic/agy"));
+        assert_eq!(starter.exe, program);
         assert_eq!(
             starter.args.as_ref().unwrap(),
             &vec![
@@ -1699,17 +1913,20 @@ mod tests {
             starter
                 .env
                 .iter()
-                .any(|(k, v)| k == "HOME" && v == profile.path().to_str().unwrap())
+                .any(|(k, v)| k == "HOME" && v == profile.to_str().unwrap())
         );
         assert!(!starter.env.iter().any(|(k, _)| k == "GEMINI_API_KEY"));
         assert!(starter.unset.contains(&"GEMINI_API_KEY"));
-        assert!(super::super::browser_window::ProfileLock::claim(profile.path()).is_err());
-        aterm_secrets::fsx::write_atomic(&path, b"replacement", 0o600).unwrap();
+        assert!(super::super::browser_window::ProfileLock::claim(&profile).is_err());
+        // agy rewrites its own grant as it renews its token: that is still this row's login.
+        aterm_secrets::fsx::write_atomic(&path, b"renewed by agy", 0o600).unwrap();
+        assert!(prepared.starter().is_ok());
+        std::fs::remove_file(&path).unwrap();
         assert!(prepared.starter().is_err());
-        aterm_secrets::fsx::write_atomic(&path, bytes, 0o600).unwrap();
+        write_grant(&profile, b"grant");
         aterm_secrets::fsx::write_atomic(
-            &config,
-            text.replace("person@", "other@").as_bytes(),
+            &state.join("google-identities.toml"),
+            BINDING.replace("person@", "other@").as_bytes(),
             0o600,
         )
         .unwrap();

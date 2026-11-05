@@ -43,6 +43,14 @@ impl Descriptor {
         descriptor.validate()?;
         Ok(descriptor)
     }
+    pub(crate) fn is_twin_of(&self, retired: &Self) -> bool {
+        retired.version.checked_add(1) == Some(self.version)
+            && self.scope == retired.scope
+            && self.application == retired.application
+            && self.role == retired.role
+            && self.name == retired.name
+            && self.deterministic == retired.deterministic
+    }
     fn validate(&self) -> Result<()> {
         if !crate::crypto::name(&self.application)
             || !crate::crypto::name(&self.role)
@@ -131,16 +139,17 @@ impl Descriptor {
 }
 
 fn application_scope(trust: Trust, application: &str, role: &str) -> Result<Scope> {
-    let mut bytes = b"aterm/commons/application-table/1\0".to_vec();
-    bytes.extend_from_slice(&trust.network);
-    bytes.extend_from_slice(&trust.authority);
-    bytes.extend_from_slice(&trust.genesis);
+    let mut sha = aterm_digest::Sha256::new();
+    sha.update(b"aterm/commons/application-table/1\0");
+    sha.update(trust.network);
+    sha.update(trust.authority);
+    sha.update(trust.genesis);
     for word in [application, role] {
-        bytes.extend_from_slice(&(word.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(word.as_bytes());
+        sha.update((word.len() as u64).to_le_bytes());
+        sha.update(word.as_bytes());
     }
-    bytes.extend_from_slice(&1u64.to_le_bytes());
-    let hash = aterm_digest::Sha256::digest(&bytes);
+    sha.update(1u64.to_le_bytes());
+    let hash = sha.finalize();
     let mut table: [u8; 16] = hash[..16].try_into().expect("fixed digest width");
     table[0] |= 0x80;
     Scope::new(trust, table, 1)

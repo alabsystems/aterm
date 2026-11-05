@@ -2085,3 +2085,339 @@ fn the_step_never_escapes_an_answer_kept_for_good_by_its_label() {
         }
     }
 }
+
+fn captures(run: &ResetRun) -> Vec<crate::supervise::journal::Capture> {
+    run.journal
+        .iter()
+        .filter_map(|line| crate::supervise::journal::Capture::of_line(line))
+        .collect()
+}
+
+/// The rows of `rows` a capture keeps (from the sighting's `top`), trimmed, and that `top`.
+fn capture_rows(rows: &[String]) -> (Vec<String>, usize) {
+    let top = aterm_phase::reset_sighting(rows).expect("a sight").top;
+    let rows = rows[top..]
+        .iter()
+        .map(|row| row.trim_end().to_string())
+        .collect();
+    (rows, top)
+}
+
+/// Every screen of the reset program the loop meets is kept once as a `CAPTURED` journal record,
+/// from the rule over the box to the screen's foot: with the key on, the dialog, the pending lines
+/// and the confirmation the step reads; with the key off, the dialog alone, and its wait row is the
+/// only row taken (the capture presses nothing). Each record reads back to the rows drawn, its
+/// fixture to the same rows, and those rows to the same sight. NEGATIVE CONTROLS: the key-off
+/// watch, which draws no pending line and no confirmation, keeps a capture of neither; and the
+/// reply drawn over the confirmation is none of its capture's rows.
+#[test]
+fn each_screen_of_the_reset_program_is_kept_once_as_a_capture() {
+    use aterm_phase::prompt::fixtures::screen;
+    let host = ResetHost::reading(spent());
+    let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
+    let drawn = reset_world(&mut m).dialog();
+    let run = reset_watch(
+        "capture-on",
+        &mut m,
+        reset_opts(&host, true, 120),
+        &fresh,
+        |_| {},
+    );
+    let on = captures(&run);
+    let whats: Vec<&str> = on.iter().map(|c| c.what.as_str()).collect();
+    assert_eq!(
+        whats,
+        [
+            "reset-offer",
+            "reset-checking",
+            "reset-confirmation",
+            "reset-resetting"
+        ],
+        "{:#?}",
+        run.journal
+    );
+    assert_eq!((on[0].rows.clone(), on[0].first), capture_rows(&drawn));
+    let confirm = screen(aterm_phase::reset::fixtures::CONFIRM);
+    assert_eq!((on[2].rows.clone(), on[2].first), capture_rows(&confirm));
+    assert!(confirm.iter().any(|row| row.starts_with("⏺ Suites")));
+    assert!(!on[2].rows.iter().any(|row| row.starts_with("⏺ Suites")));
+    for c in &on {
+        assert_eq!(c.program, "claude");
+        assert_eq!(c.version, None, "the scripted host keeps no transcript");
+        let sight = aterm_phase::reset_sighting(&c.rows).expect("a sight");
+        assert_eq!(format!("reset-{}", sight.sight.word()), c.what);
+        assert_eq!(screen(&c.fixture("2026-11-04")), c.rows);
+        assert!(
+            c.fixture("2026-11-04")
+                .starts_with("# claude-code unknown-version · CAPTURED 2026-11-04 "),
+            "{}",
+            c.fixture("2026-11-04")
+        );
+    }
+    assert_eq!(reset_world(&mut m).yes_taken, 1, "the key on spends");
+
+    let off_host = ResetHost::reading(ResetOutcome::Unread);
+    let mut off = reset_mock(vec![], &RESET_ROWS, 0, &off_host);
+    let off_run = reset_watch(
+        "capture-off",
+        &mut off,
+        reset_opts(&off_host, false, 120),
+        &fresh,
+        |_| {},
+    );
+    let kept = captures(&off_run);
+    assert_eq!(
+        kept.iter().map(|c| c.what.as_str()).collect::<Vec<_>>(),
+        ["reset-offer"],
+        "{:#?}",
+        off_run.journal
+    );
+    assert_eq!(kept[0].rows, on[0].rows);
+    assert_eq!(
+        reset_keys(&off),
+        ["down@dialog", "down@dialog", "enter@dialog"]
+    );
+    assert_eq!(reset_world(&mut off).chosen, [RESET_WAIT]);
+    assert_eq!(reset_world(&mut off).yes_taken, 0);
+}
+
+/// A host whose agent's transcript ends on a row of `version`.
+#[derive(Debug)]
+struct Transcribed(&'static str);
+
+impl IdleHost for Transcribed {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn transcript_tail(&self) -> Option<String> {
+        Some(format!(
+            "{{\"type\":\"user\",\"version\":\"2.1.312\"}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\
+             \"input\":{{\"version\":\"9.9\"}}}}]}},\"version\":\"{}\"}}\n\
+             {{\"type\":\"queue-operation\"}}\n",
+            self.0
+        ))
+    }
+}
+
+#[derive(Default)]
+struct NoteSink(Vec<String>);
+
+impl Review for NoteSink {
+    fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn say(&mut self, line: &str) -> Result<(), String> {
+        crate::supervise::ledger::assert_marked(line);
+        self.0.push(line.to_string());
+        Ok(())
+    }
+    fn note(&mut self, line: &str) {
+        crate::supervise::ledger::assert_marked(line);
+        self.0.push(line.to_string());
+    }
+    fn unattended(&self) -> bool {
+        true
+    }
+}
+
+/// A capture names the version the agent's newest transcript row names, and the grid; the same
+/// sighting is kept once however often it is read; a loop keeps at most `RESET_CAPTURES` of each
+/// sight, and a sight whose room is used up leaves another's: a dialog with no reset on offer and
+/// an answer are still kept after the offers' room is gone. NEGATIVE CONTROLS: an agy session's
+/// screen of the same rows, and a Claude Code screen with no reset program, are kept never.
+#[test]
+fn a_capture_names_its_build_and_a_loop_keeps_each_sighting_once() {
+    use aterm_phase::prompt::fixtures::{limit_options_panel, screen};
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::new(Transcribed("2.1.318")) as Arc<dyn IdleHost>),
+        ..auto(60)
+    };
+    let dialog = |grant: &str| {
+        let rows = [RESET_STOP, grant, RESET_WAIT, RESET_CREDITS];
+        Screen {
+            rows: limit_options_panel(&rows, 0, true),
+            cols: Some(144),
+            pane_rows: Some(50),
+            seq: 7,
+            ..Screen::default()
+        }
+    };
+    let mut m = Mock::new(Vec::new());
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.program = Some("claude".to_string());
+    let mut noted = NoteSink::default();
+    s.reset_capture(&dialog(RESET_GRANT), &opts, &mut noted);
+    s.reset_capture(&dialog(RESET_GRANT), &opts, &mut noted);
+    let idle = Screen {
+        rows: idle_screen(),
+        ..Screen::default()
+    };
+    s.reset_capture(&idle, &opts, &mut noted);
+    assert_eq!(noted.0.len(), 1, "{:#?}", noted.0);
+    let c = crate::supervise::journal::Capture::of_line(&noted.0[0]).expect("a capture");
+    assert_eq!(c.what, "reset-offer");
+    assert_eq!(c.version.as_deref(), Some("2.1.318"));
+    assert_eq!(c.grid, Some((144, 50)));
+    assert_eq!(c.seq, 7);
+    assert_eq!(
+        (c.rows.clone(), c.first),
+        capture_rows(&dialog(RESET_GRANT).rows)
+    );
+    assert!(
+        c.fixture("2026-11-04")
+            .starts_with("# claude-code 2.1.318 · CAPTURED 2026-11-04 by the harness's journal"),
+        "{}",
+        c.fixture("2026-11-04")
+    );
+    assert_eq!(screen(&c.fixture("2026-11-04")), c.rows);
+    for n in 0..2 * crate::supervise::run::reset_loop::RESET_CAPTURES {
+        let grant = format!("Use a weekly reset ({} left, until Oct 5)", n + 3);
+        s.reset_capture(&dialog(&grant), &opts, &mut noted);
+    }
+    assert_eq!(
+        noted.0.len(),
+        crate::supervise::run::reset_loop::RESET_CAPTURES,
+        "{:#?}",
+        noted.0.len()
+    );
+    let plain = Screen {
+        rows: limit_options_panel(&[RESET_STOP, RESET_WAIT, RESET_CREDITS], 0, true),
+        ..dialog(RESET_GRANT)
+    };
+    s.reset_capture(&plain, &opts, &mut noted);
+    let answer = Screen {
+        rows: screen(aterm_phase::reset::fixtures::SPENT_SESSION_2_1_312),
+        ..Screen::default()
+    };
+    s.reset_capture(&answer, &opts, &mut noted);
+    s.reset_capture(
+        &dialog("Use a weekly reset (99 left, until Oct 5)"),
+        &opts,
+        &mut noted,
+    );
+    let whats: Vec<String> = noted.0[crate::supervise::run::reset_loop::RESET_CAPTURES..]
+        .iter()
+        .filter_map(|line| crate::supervise::journal::Capture::of_line(line))
+        .map(|c| c.what)
+        .collect();
+    assert_eq!(whats, ["reset-dialog", "reset-answer-spent"], "{whats:?}");
+
+    let mut m = Mock::new(Vec::new());
+    let mut agy = session(&mut m, Some("@s-2".to_string()));
+    agy.program = Some("agy".to_string());
+    let mut none = NoteSink::default();
+    agy.reset_capture(&dialog(RESET_GRANT), &opts, &mut none);
+    assert!(none.0.is_empty(), "{:#?}", none.0);
+}
+
+/// A capture's line reads back whole, a row holding the line's own words or JSON's quotes and
+/// backslashes included. NEGATIVE CONTROLS: another word's line, a line with a field cut, and one
+/// whose rows are no JSON array read as no capture.
+#[test]
+fn a_capture_line_reads_back_whole() {
+    use crate::supervise::journal::{CAPTURED, Capture, JournalRecord};
+    let c = Capture {
+        seq: 41,
+        what: "reset-answer-spent".to_string(),
+        program: "claude".to_string(),
+        version: Some("2.1.318".to_string()),
+        grid: Some((80, 24)),
+        first: 3,
+        masked: 1,
+        rows: vec![
+            "❯ /limit-reset weekly".to_string(),
+            "  ⎿  Weekly limits reset · \"quoted\" \\ rows=[] grid=1x1".to_string(),
+            String::new(),
+            "   ❯ 1. Stop".to_string(),
+        ],
+    };
+    let line = c.line();
+    assert!(line.starts_with(&format!("{CAPTURED} seq=41 reset-answer-spent ")));
+    assert_eq!(Capture::of_line(&line), Some(c.clone()));
+    let rec = JournalRecord::of_line(1, Some("@s-1"), &line, None);
+    assert_eq!(rec.kind, "other");
+    let back = JournalRecord::from_json(&rec.to_json()).expect("the record");
+    assert_eq!(Capture::of_line(&back.line), Some(c.clone()));
+    let unknown = Capture {
+        version: None,
+        grid: None,
+        ..c.clone()
+    };
+    assert_eq!(Capture::of_line(&unknown.line()), Some(unknown));
+    for bad in [
+        line.replacen(CAPTURED, "CAPTURE", 1),
+        line.replacen(" program=claude", "", 1),
+        line.replacen("rows=[", "rows=", 1),
+        format!("NOTE seq=41 {}", &line[CAPTURED.len() + 1..]),
+    ] {
+        assert_eq!(Capture::of_line(&bad), None, "{bad}");
+    }
+}
+
+/// A capture names no login: each e-mail address on the screen is masked letter for letter, its
+/// width and the rows' other words kept, and the line counts them: two addresses in one word, and
+/// an address the screen wrapped across two rows, in its host or in its name, are each masked
+/// whole. NEGATIVE CONTROLS: a session's `@s-1`, a bare `@`, `a@b` with no domain dot and a
+/// `user@` left as typed.
+#[test]
+fn a_capture_masks_the_logins_address() {
+    use crate::supervise::journal::{Capture, mask_addresses};
+    let rows = [
+        " ▝▜██████▀  Opus 5.5 · Claude Max · owner.name@example.com's Organization",
+        "   (signed in as dev+2@mail.example.org) and @s-1, a@b, user@ and @ kept",
+        "   · a@x.com,b@y.com and (me@x.com/you@y.org)",
+        "   Claude Max · owner.name@exam",
+        "ple.com's Organization",
+        "   ⎿  as owner.na",
+        "     me@example.com's login",
+    ]
+    .map(str::to_string);
+    let c = Capture::of_screen(
+        5,
+        "reset-dialog".to_string(),
+        "claude".to_string(),
+        None,
+        None,
+        0,
+        &rows,
+    );
+    assert_eq!(c.masked, 8);
+    assert_eq!(
+        c.rows,
+        [
+            " ▝▜██████▀  Opus 5.5 · Claude Max · xxxxx.xxxx@xxxxxxx.xxx's Organization",
+            "   (signed in as xxx+x@xxxx.xxxxxxx.xxx) and @s-1, a@b, user@ and @ kept",
+            "   · x@x.xxx,x@x.xxx and (xx@x.xxx/xxx@x.xxx)",
+            "   Claude Max · xxxxx.xxxx@xxxx",
+            "xxx.xxx's Organization",
+            "   ⎿  as xxxxx.xx",
+            "     xx@xxxxxxx.xxx's login",
+        ]
+        .map(str::to_string)
+    );
+    for (row, mask) in rows.iter().zip(&c.rows) {
+        assert_eq!(row.chars().count(), mask.chars().count());
+    }
+    for name in ["example", "owner", "you@", "me@", "dev+2"] {
+        assert!(!c.line().contains(name), "{name}: {}", c.line());
+    }
+    assert!(c.line().contains(" masked=8 "), "{}", c.line());
+    assert!(
+        c.fixture("2026-11-04")
+            .contains("8 e-mail addresses masked")
+    );
+    for kept in ["@s-1 waits", "a@b", "user@ here", "@", "x @ y.z"] {
+        let kept = [kept.to_string()];
+        assert_eq!(mask_addresses(&kept), (kept.to_vec(), 0), "{kept:?}");
+    }
+}

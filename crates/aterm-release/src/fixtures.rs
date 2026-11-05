@@ -137,6 +137,13 @@ fn desks_in(dir: &Path) -> std::io::Result<Vec<String>> {
     let mut desks = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        if !entry
+            .file_type()
+            .map(|ft| ft.is_dir() || ft.is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
         if entry.path().join("parent.toml").is_file() {
             desks.push(entry.file_name().to_string_lossy().into_owned());
         }
@@ -229,7 +236,7 @@ pub fn stage(
     // separately keyed by all release pins, and are regenerated above for each new identity.
     fs::create_dir_all(&target).map_err(|e| io("cannot create", &target, e))?;
     stamp_hold(&target).map_err(|e| io("cannot stamp before execution", &target, e))?;
-    fs::write(&unjudged, b"").map_err(|e| io("cannot write", &unjudged, e))?;
+    crate::durable::write_fresh(&unjudged, b"").map_err(|e| io("cannot write", &unjudged, e))?;
     println!(
         "==> handoff fixtures: {} build {} ({}) written by its own producer (targo \
          --unverified test -p aterm-gui --lib -- {})",
@@ -388,7 +395,7 @@ pub fn stage(
         }
     }
     let mark = at.join(STAGED_MARK);
-    fs::write(&mark, pins.mark()).map_err(|e| io("cannot write", &mark, e))?;
+    crate::durable::write_fresh(&mark, pins.mark()).map_err(|e| io("cannot write", &mark, e))?;
     Ok(Staged {
         dir,
         desks,

@@ -10,6 +10,10 @@ use aterm_update_core::roster::{Attribution, Roster, verify_roster};
 
 use crate::ledger::{Error, Result};
 
+#[cfg(unix)]
+#[path = "machines/current_roster.rs"]
+pub(crate) mod current_roster;
+
 /// This machine's public identity, as `atpkg-keys setup`/`join` recorded it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct MachineIdentity {

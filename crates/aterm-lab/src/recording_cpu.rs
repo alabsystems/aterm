@@ -4,9 +4,7 @@
 //! External observations of an unchanged recording subject; never an acceptance verdict.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -29,6 +27,8 @@ const METRICS: &[&str] = &[
     "keyframes",
     "witnessed",
     "diverged",
+    "pending",
+    "unjudged_evicted",
     "dropped_input",
     "dropped_events",
     "dropped_replies",
@@ -218,12 +218,8 @@ pub fn cmd(args: &[String]) -> Res {
         ));
     }
     let mut control = connect(&args, identity)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&args.output)
-        .map_err(|e| e.to_string())?;
+    let mut file =
+        crate::util::create_new_regular_file(&args.output, 0o600).map_err(|e| e.to_string())?;
     write_record(
         &mut file,
         &json!({
@@ -320,7 +316,12 @@ pub fn cmd(args: &[String]) -> Res {
         .map(|(key, metric)| {
             let counter = matches!(
                 *key,
-                "witnessed" | "diverged" | "dropped_input" | "dropped_events" | "dropped_replies"
+                "witnessed"
+                    | "diverged"
+                    | "unjudged_evicted"
+                    | "dropped_input"
+                    | "dropped_events"
+                    | "dropped_replies"
             );
             json!({"field": key, "kind": if counter {"counter"} else {"gauge"},
             "first": metric.first, "last": metric.last, "max_observed": metric.max_observed,

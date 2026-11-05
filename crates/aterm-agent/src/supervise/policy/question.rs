@@ -29,10 +29,19 @@ pub const SHORT_TERM_TEXT: &str = "Decide yourself: choose the option that gets 
                                    (Answered by the aterm harness by policy. The user was not \
                                    asked.)";
 
+/// Autopilot Land's policy text ([`QuestionPriority::Land`]) for a question's free-text row: Land's
+/// answer ([`super::turn_end::LAND_ANSWER`]) under the policy texts' rules (no comma, semicolon,
+/// hyphen or digit), opening `Decide yourself:` so no reader of a land act takes it for one.
+pub const LAND_TEXT: &str = "Decide yourself: take the option that lands all of this work on \
+                             remote main soonest and starts no new work. Never force push or \
+                             delete work. Say which and why in one line and continue without \
+                             asking again. (Answered by the aterm harness by policy. The user was \
+                             not asked.)";
+
 /// Whether `rule_id` is a question dialog's answer — under any [`QuestionPriority`].
 #[must_use]
 pub fn is_question_rule(rule_id: &str) -> bool {
-    QuestionPriority::ALL
+    QuestionPriority::EVERY
         .into_iter()
         .any(|p| p.rule_id() == rule_id)
 }
@@ -264,6 +273,13 @@ const WRAP_MARGIN: usize = 4;
 const FIT: &str = "the answer would not fit the pane";
 
 const FIT_KEPT: &str = "the answer would not fit the pane when this tab was begun";
+
+const LAND_KEPT: &str = "the land policy text could not be used on this tab";
+
+/// The fail-closed person row ([`text_instead`]): a tab the policy text fell back on, where a
+/// person keyed since the loop's text, is theirs.
+const POLICY_PERSON: &str = "a person keyed on this question after the policy text was written: \
+                           the recommended answer is not pressed over their input";
 
 const OVERDRAWN: &str = "the answer would not fit the pane: the dialog would draw its button over \
                          the text's last row once the focus left it";
@@ -710,16 +726,20 @@ const fn moved_off(focus: QuestionFocus) -> Option<&'static str> {
     }
 }
 
-/// The decision on one question dialog (module header).
+/// The decision on one question dialog (module header). `person`: a person gave input since the
+/// loop's first policy text on this dialog ([`text_instead`]).
 #[must_use]
 pub fn answer_question(
     prompt: &PromptV2,
     rows: &[String],
     priority: QuestionPriority,
     own: Option<QuestionPriority>,
-    fell_back: bool,
+    (fell_back, person): (bool, bool),
     pane: Pane,
 ) -> Decision {
+    if priority.text().is_some() && fell_back && person {
+        return Decision::escalate(POLICY_PERSON);
+    }
     let Some(dialog) = prompt.question_dialog.as_ref() else {
         // Muse Code's review of its answers: sent only when it holds the
         // note the loop wrote and nothing else.
@@ -736,7 +756,7 @@ pub fn answer_question(
             )),
             None => answer_by_role(prompt, rows),
             Some(_) if is_muse_question(prompt) || prompt.select == Select::Digits => {
-                note_answer(prompt, rows, priority, own, fell_back)
+                note_answer(prompt, rows, priority, own, (fell_back, person))
             }
             Some(_) => fall_back_to(
                 answer_by_role(prompt, rows),
@@ -775,24 +795,45 @@ pub fn answer_question(
                 (priority, text),
                 (own, fell_back),
                 pane,
-            ),
+            )
+            .or_else(|why| text_instead(dialog, priority, own, person, why)),
         },
     };
+    let chosen = match chosen {
+        Ok(chosen) => chosen,
+        Err(why) => return Decision::escalate(why),
+    };
+    let own_text = chosen.typed || matches!(chosen.target, AnswerTarget::OwnText(_));
+    let placed = placed(dialog, (focus, from), chosen, priority, &guard).or_else(|why| {
+        if !own_text {
+            return Err(why);
+        }
+        let instead = text_instead(dialog, priority, own, person, why)?;
+        placed(dialog, (focus, from), instead, priority, &guard)
+    });
+    placed.unwrap_or_else(Decision::escalate)
+}
+
+/// The keys of `chosen` from the focus at `from`, or why they are not moved.
+fn placed(
+    dialog: &QuestionDialog,
+    (focus, from): (QuestionFocus, i32),
+    chosen: TextChosen,
+    priority: QuestionPriority,
+    guard: &str,
+) -> Result<Decision, String> {
     let TextChosen {
         target,
         typed,
         subject,
         unproven,
-    } = match chosen {
-        Ok(chosen) => chosen,
-        Err(why) => return Decision::escalate(why),
-    };
+    } = chosen;
     let Some(to) = focus_position(dialog, target_focus(target)) else {
-        return Decision::escalate("a question whose chosen row is not in its focus order");
+        return Err("a question whose chosen row is not in its focus order".to_string());
     };
     let steps = to - from;
     if steps.unsigned_abs() > MAX_QUESTION_FOCUS_STEPS {
-        return Decision::escalate(format!(
+        return Err(format!(
             "a question whose focus is {} rows from the option to answer (at most \
              {MAX_QUESTION_FOCUS_STEPS} are moved)",
             steps.unsigned_abs()
@@ -812,13 +853,13 @@ pub fn answer_question(
     } else {
         Answer::FocusEnter { steps, target }
     };
-    Decision::Approve {
+    Ok(Decision::Approve {
         rule_id: priority.rule_id(),
         choice: Choice::Answer(answer),
-        guard,
+        guard: guard.to_string(),
         subject,
         unproven: Some(unproven),
-    }
+    })
 }
 
 fn said_fallback(subject: &str, word: &str, why: &str, how: &str) -> (String, String) {
@@ -863,6 +904,42 @@ struct TextChosen {
     unproven: String,
 }
 
+/// The recommended answer taken under the text word `word` instead, because `why`.
+fn recommended_instead(
+    dialog: &QuestionDialog,
+    word: &str,
+    why: &str,
+) -> Result<TextChosen, String> {
+    let (target, subject, how) = choose(dialog)?;
+    let (subject, unproven) = said_fallback(&subject, word, why, &how);
+    Ok(TextChosen {
+        target,
+        typed: false,
+        subject,
+        unproven,
+    })
+}
+
+/// A TEXT PRIORITY LEAVES NO DIALOG THE RECOMMENDED ANSWER WOULD TAKE. A refusal
+/// of the text path (its text gone or not drawn, an option
+/// checked, its row read unticked, a review with a question unanswered) takes the recommended
+/// answer instead, ledgered under that priority's rule, and stays a person's only where that answer
+/// refuses too. Two refusals stand, fail-closed: a latch moved mid-dialog (`own` another word's)
+/// and a person's input since the loop's first text on the dialog (`person`).
+fn text_instead(
+    dialog: &QuestionDialog,
+    priority: QuestionPriority,
+    own: Option<QuestionPriority>,
+    person: bool,
+    why: String,
+) -> Result<TextChosen, String> {
+    if priority.text().is_none() || person || own.is_some_and(|o| o != priority) {
+        return Err(why);
+    }
+    recommended_instead(dialog, priority.word(), &why)
+        .map_err(|rec| format!("{why}; the recommended answer cannot stand in for it: {rec}"))
+}
+
 fn choose_text(
     prompt: &PromptV2,
     dialog: &QuestionDialog,
@@ -872,15 +949,11 @@ fn choose_text(
     pane: Pane,
 ) -> Result<TextChosen, String> {
     let word = priority.word();
-    let fallback = |why: &str| -> Result<TextChosen, String> {
-        let (target, subject, how) = choose(dialog)?;
-        let (subject, unproven) = said_fallback(&subject, word, why, &how);
-        Ok(TextChosen {
-            target,
-            typed: false,
-            subject,
-            unproven,
-        })
+    let fallback = |why: &str| recommended_instead(dialog, word, why);
+    let kept = if priority == QuestionPriority::Land {
+        LAND_KEPT
+    } else {
+        FIT_KEPT
     };
     let write = |question: &QuestionText| TextChosen {
         target: AnswerTarget::OwnText(priority),
@@ -928,7 +1001,7 @@ fn choose_text(
                 return fallback(&why);
             }
             if fell_back {
-                return fallback(FIT_KEPT);
+                return fallback(kept);
             }
             if free_text.pristine {
                 if own_here {
@@ -957,7 +1030,7 @@ fn choose_text(
                 return fallback(&why);
             }
             if fell_back {
-                return fallback(FIT_KEPT);
+                return fallback(kept);
             }
             let checked = options.iter().find(|o| o.checked == Some(true));
             let text_only = |n: u8| {
@@ -1267,7 +1340,7 @@ fn note_answer(
     rows: &[String],
     priority: QuestionPriority,
     own: Option<QuestionPriority>,
-    fell_back: bool,
+    (fell_back, person): (bool, bool),
 ) -> Decision {
     if prompt.head_off_screen {
         return Decision::escalate(format!(
@@ -1311,6 +1384,11 @@ fn note_answer(
         }
     }
     if let Err(why) = note_step(prompt, rows, priority, own) {
+        // The text stand-in ([`text_instead`]) where the notes field is shut: an Enter on an open
+        // one would send what it holds.
+        if priority.text().is_some() && !open && !person && own.is_none_or(|o| o == priority) {
+            return fallback(&why);
+        }
         return Decision::escalate(why);
     }
     let Some(guard) = rows

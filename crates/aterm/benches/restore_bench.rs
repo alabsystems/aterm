@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! THE RESTORE MEASUREMENT. `verify perf restore-e2e` runs it with the words of one run in
-//! `RESTORE_BENCH` (`spec::parse`): `out=` (required), `sessions=`, `rounds=`, `lines=`, `arm=`
-//! (clean, copy or lookalike) and the look-alike arm's `lookalike_kib=`. Each round SIGKILLs a
+//! `RESTORE_BENCH` (`spec::parse`): `sessions=`, `rounds=`, `lines=`, `arm=` (clean, copy or
+//! lookalike) and the look-alike arm's `lookalike_kib=`. The OS-native report path is supplied
+//! separately in `RESTORE_BENCH_OUT` (required). Each round SIGKILLs a
 //! headless instance holding the sessions and times its successor's recovery of them, from the
 //! successor's spawn to its tabs back (`restore_bench/run.rs`). It measures, and never asserts a
 //! floor. macOS only, as the crash-restore live lane is.

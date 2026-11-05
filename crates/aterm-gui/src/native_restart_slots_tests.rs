@@ -27,6 +27,7 @@ fn no_go_forward_closes_only_after_prefix_and_lost_rollback_go_retains_watch() {
     request.expected_human_seq = Some(ctx.human_input.seq());
     request.duty = Scope::Relaunch;
     request.plan = NativePlan::Restart {
+        cold: None,
         observation: None,
         process: old,
         shell,

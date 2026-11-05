@@ -913,7 +913,10 @@ mod unix {
     }
 
     fn sync_dir(dir: &Path, flush: Option<Flush>) -> std::io::Result<()> {
-        let handle = File::open(dir)?;
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)?;
         match flush {
             Some(flush) => crate::durable::finish(&handle, flush),
             None => fsync(&handle),
@@ -941,7 +944,7 @@ mod unix {
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(&candidate)
             {
                 Ok(file) => return Ok((candidate, file)),
@@ -1002,42 +1005,52 @@ mod unix {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Ok(meta) = entry.metadata() else { continue };
-            if !meta.file_type().is_file() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
                 continue;
             }
             if name == panic_report || name == consumed_report {
-                if meta.len() > 0
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.file_type().is_file()
+                    && meta.len() > 0
                     && let Ok(modified) = meta.modified()
                 {
                     reports.push((modified, name == consumed_report, entry.path()));
                 }
             } else if let Some(marker) = markers::parse(name) {
-                if marker.pid == id.pid && marker.nanos > id.nanos {
-                    next_run = Some(next_run.map_or(marker.nanos, |n| n.min(marker.nanos)));
+                if marker.pid != id.pid {
+                    continue;
                 }
-                if marker.pid == id.pid
-                    && marker.nanos <= id.nanos
-                    && own_marker.is_none_or(|(nanos, _)| marker.nanos > nanos)
+                if marker.nanos > id.nanos {
+                    next_run = Some(next_run.map_or(marker.nanos, |n| n.min(marker.nanos)));
+                } else if own_marker.is_none_or(|(nanos, _)| marker.nanos > nanos)
+                    && let Ok(meta) = entry.metadata()
+                    && meta.file_type().is_file()
                 {
                     own_marker = Some((marker.nanos, meta.len()));
                 }
             } else if let Some(consumed) = name.strip_suffix(".seen").and_then(markers::parse) {
-                if consumed.pid == id.pid && consumed.nanos > id.nanos {
-                    next_run = Some(next_run.map_or(consumed.nanos, |n| n.min(consumed.nanos)));
+                if consumed.pid != id.pid {
+                    continue;
                 }
-                if consumed.pid == id.pid && consumed.nanos == id.nanos {
+                if consumed.nanos > id.nanos {
+                    next_run = Some(next_run.map_or(consumed.nanos, |n| n.min(consumed.nanos)));
+                } else if consumed.nanos == id.nanos
+                    && let Ok(meta) = entry.metadata()
+                    && meta.file_type().is_file()
+                {
                     own_consumed = Some(meta.len());
                 }
             } else if name.starts_with(&legacy_prefix)
                 && name.ends_with(".log")
-                && meta.len() > 0
                 && {
                     let s = &name[legacy_prefix.len()..name.len() - 4];
                     !s.is_empty()
                         && s.bytes().all(|b| b.is_ascii_digit())
                         && s.parse::<u128>().is_ok_and(|nanos| nanos <= id.nanos)
                 }
+                && entry
+                    .metadata()
+                    .is_ok_and(|meta| meta.file_type().is_file() && meta.len() > 0)
             {
                 class = class.max(Some(DeathClass::Signal));
             }
@@ -1270,33 +1283,36 @@ mod unix {
         use std::os::unix::fs::PermissionsExt as _;
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(taken)
             .ok()?;
         let kept = dir.join(id.unreadable_name());
-        let private = file
-            .metadata()
-            .is_ok_and(|meta| meta.file_type().is_file() && meta.nlink() == 1)
-            && file
-                .set_permissions(fs::Permissions::from_mode(0o600))
-                .is_ok();
+        let private = file.metadata().is_ok_and(|meta| {
+            meta.file_type().is_file()
+                && meta.nlink() == 1
+                && (meta.permissions().mode() & 0o7777 == 0o600
+                    || file
+                        .set_permissions(fs::Permissions::from_mode(0o600))
+                        .is_ok())
+        });
         if !private || fs::rename(taken, &kept).is_err() {
             return None;
         }
-        let mut aside: Vec<(JournalId, PathBuf)> = fs::read_dir(dir)
+        let mut aside: Vec<(JournalId, std::ffi::OsString)> = fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
             .filter_map(|entry| {
-                let other = JournalId::parse_unreadable(entry.file_name().to_str()?)?;
-                Some((other, entry.path()))
+                let name = entry.file_name();
+                let other = JournalId::parse_unreadable(name.to_str()?)?;
+                Some((other, name))
             })
             .collect();
         aside.sort_unstable_by_key(|(other, _)| std::cmp::Reverse(other.nanos));
-        for (_, path) in aside.into_iter().skip(KEEP_UNREADABLE) {
-            let _ = fs::remove_file(path);
+        for (_, name) in aside.into_iter().skip(KEEP_UNREADABLE) {
+            let _ = fs::remove_file(dir.join(name));
         }
-        kept.exists().then_some(kept)
+        fs::symlink_metadata(&kept).is_ok().then_some(kept)
     }
 
     fn clear_leftovers(dir: &Path, names: &[String]) {
@@ -2628,14 +2644,16 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             focused_path: fa,
             zoomed: za,
             parked: pa,
+            ephemeral: ea,
         } = a;
         let RestoredTab {
             root: rb,
             focused_path: fb,
             zoomed: zb,
             parked: pb,
+            ephemeral: eb,
         } = b;
-        za == zb && pa == pb && fa == fb && same_tree(ra, rb)
+        za == zb && pa == pb && ea == eb && fa == fb && same_tree(ra, rb)
     }
     fn same_window(a: &WindowLayout, b: &WindowLayout) -> bool {
         let WindowLayout {
@@ -3098,6 +3116,7 @@ pub(crate) mod fixtures {
                     focused_path: Vec::new(),
                     zoomed: false,
                     parked: false,
+                    ephemeral: false,
                 })
                 .collect(),
         }])
@@ -3295,6 +3314,7 @@ pub(crate) mod tests {
     #[test]
     fn only_an_agent_with_a_conversation_is_resumed_and_only_when_relaunching() {
         let claude = |session: Option<&str>| restore::AgentRestore {
+            claude_auth: None,
             word: String::new(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),
@@ -3372,6 +3392,7 @@ pub(crate) mod tests {
         assert_eq!(row.title, "Tabs restored, claude lost");
         assert_eq!(only.resumed(true), vec![(0, 1)], "the layout itself kept");
         let codex = restore::AgentRestore {
+            claude_auth: None,
             word: String::new(),
             pid: 4343,
             program: "/opt/codex/bin/codex".into(),
@@ -4526,6 +4547,7 @@ pub(crate) mod tests {
     fn a_successors_own_fact_about_a_tab_ends_what_it_carries_for_good() {
         use super::{HandedSession, Runs};
         let record = |session: &str| restore::AgentRestore {
+            claude_auth: None,
             word: String::new(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),
@@ -4627,6 +4649,7 @@ pub(crate) mod tests {
         use super::Runs;
         use aterm_phase::Program;
         let record = |word: &str| restore::AgentRestore {
+            claude_auth: None,
             word: word.into(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),

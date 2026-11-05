@@ -1525,6 +1525,23 @@ fn exact_token_and_worker_group_bind_subsequent_compiler_publication() {
     assert!(!publication_matches(&active, workspace, None, Some(101)));
 }
 
+/// A FOOTPRINT SAYS IT IS STILL GOING: it reads every entry of a target, however many.
+#[test]
+fn a_footprint_ticks_for_each_entry() {
+    const ENTRIES: usize = 5;
+    let world = World::new();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&world.target)
+        .unwrap();
+    for n in 0..ENTRIES {
+        std::fs::write(world.target.join(n.to_string()), b"x").unwrap();
+    }
+    let before = aterm_uds::progress::ticks_here();
+    assert!(footprint(&world.target).is_some());
+    assert!(aterm_uds::progress::ticks_here() - before > ENTRIES);
+}
+
 #[test]
 fn allocated_footprint_counts_directory_blocks_and_deduplicates_hardlinks() {
     let world = World::new();

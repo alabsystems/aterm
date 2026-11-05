@@ -72,11 +72,19 @@ impl Lifeline {
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
         make_fifo(&path)?;
+        use std::os::unix::fs::OpenOptionsExt as _;
         let opened = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
-            .and_then(|held| File::open(&path).map(|far| (held, far)));
+            .and_then(|held| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&path)
+                    .map(|far| (held, far))
+            });
         let unlinked = std::fs::remove_file(&path);
         let (held, far) = opened?;
         unlinked?;
@@ -138,9 +146,11 @@ pub fn check(number: RawFd) -> io::Result<()> {
 pub fn adopt(number: RawFd) -> io::Result<OwnedFd> {
     let copy = validated_copy(number)?;
     if number <= 2 {
+        use std::os::unix::fs::OpenOptionsExt as _;
         let null = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open("/dev/null")?;
         // SAFETY: both descriptors are open; `dup2` atomically replaces `number` with `/dev/null`.
         if unsafe { dup2(null.as_raw_fd(), number) } == -1 {

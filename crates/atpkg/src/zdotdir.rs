@@ -243,6 +243,21 @@ const ASK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const ASK_BUDGET: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
+/// TEST SEAM ([`aterm_types::dev_seam!`]): a count of milliseconds, [`ask_zsh`] waits that long
+/// for zsh where it is longer than [`ASK_BUDGET`], so a test whose dev `atpkg` must hear zsh's
+/// answer waits out only its hang detector on a loaded machine.
+pub const ASK_WITHIN_ENV: &str = "ATPKG_ZSH_ASK_WITHIN_MS";
+
+/// [`ask_zsh`]'s wait for zsh: [`ASK_BUDGET`], or the longer [`ASK_WITHIN_ENV`] a debug build
+/// was given.
+fn ask_within() -> std::time::Duration {
+    aterm_types::dev_seam!(ASK_WITHIN_ENV)
+        .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+        .map_or(ASK_BUDGET, |ms| {
+            ASK_BUDGET.max(std::time::Duration::from_millis(ms))
+        })
+}
+
 /// The answer marker's prefix; each query adds a fresh nonce to distinguish startup output.
 const MARK: &str = "atpkg-zdotdir:";
 
@@ -361,7 +376,7 @@ fn account_zsh() -> Option<PathBuf> {
 }
 
 /// `zsh -c` in `home` with no `ZDOTDIR` in its environment: the `ZDOTDIR` its zshenv files
-/// leave (empty when they set none), within [`ASK_BUDGET`].
+/// leave (empty when they set none), within [`ask_within`].
 ///
 /// # Errors
 /// Why there is no answer: zsh did not start, did not finish in time, printed no complete reply,
@@ -380,7 +395,7 @@ pub(crate) fn ask_zsh(zsh: &Path, home: &Path) -> Result<PathBuf, String> {
         .env_remove("ZDOTDIR")
         .env("HOME", home)
         .current_dir(home);
-    let out = aterm_uds::deadline::output_within(&mut cmd, ASK_BUDGET).map_err(|e| {
+    let out = aterm_uds::deadline::output_within(&mut cmd, ask_within()).map_err(|e| {
         format!(
             "{} -c, asked which folder zsh reads .zshrc from, {e}",
             zsh.display()

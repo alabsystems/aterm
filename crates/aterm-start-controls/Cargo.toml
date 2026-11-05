@@ -8,11 +8,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Dev-only controls for `verify perf cli-start`: empty programs that link nothing, all the dylibs aterm links, or all but the window-only ones"
+description = "Dev-only controls for `verify perf cli-start`: programs that do no work and link nothing, all the dylibs aterm links, all but the window-only ones, or all of them and bind every symbol aterm imports"
 
-# Every program is an empty `main`. What `start-control-all` and `start-control-cli` link comes
-# from the lane at build time (build.rs), read from aterm's own load commands, so nothing here
-# lists a framework.
+# No program's `main` does any work: `start-control-binds`' hands its table of addresses to
+# `black_box`, and every other one is empty. What
+# `start-control-all`, `start-control-cli` and `start-control-binds` link, and the symbols
+# `start-control-binds` imports, come from the lane at build time (build.rs), read from aterm's own
+# load commands and chained-fixup imports, so nothing here lists a framework or a symbol.
 
 [lints]
 workspace = true

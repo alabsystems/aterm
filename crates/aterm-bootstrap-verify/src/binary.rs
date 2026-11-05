@@ -5,7 +5,7 @@
 //! header and digest before anything runs it ([`verify_binary`]).
 
 use std::ffi::OsStr;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::Read as _;
 
 use crate::chain::open_file;
 use crate::py::{PyPath, bare_os_error, os_error};
@@ -60,11 +60,10 @@ pub fn verify_binary(path: &OsStr, arch: &str, digest: &str, size: u64) -> Verdi
         half(18) == machine,
         "Linux artifact ELF architecture mismatch",
     )?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| bare_os_error(&e))?;
     let mut hasher = aterm_digest::Sha256::new();
+    hasher.update(&header);
     let mut buffer = vec![0u8; 1 << 16];
-    let mut read_total: u64 = 0;
+    let mut read_total: u64 = 64;
     loop {
         let n = file.read(&mut buffer).map_err(|e| bare_os_error(&e))?;
         if n == 0 {

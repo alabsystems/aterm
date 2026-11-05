@@ -125,7 +125,12 @@ fn hello_with(server: AppServer, deadline: Instant, hello: Value) -> Option<Rpc>
 
 /// The whole dialogue's budget: host start, the mint's network read, and the answer. A
 /// hang detector, not a latency expectation (a live read answers in seconds).
+#[cfg(not(test))]
 pub const BUDGET: Duration = Duration::from_secs(20);
+/// The whole dialogue's budget: the unit tests' stand-in hosts end on their own, so one a loaded
+/// machine holds is waited for by the one-minute hang detector, not killed before it ran.
+#[cfg(test)]
+pub const BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// One fresh Muse subscription reading ([`fetch`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,7 +255,28 @@ pub fn read_usage(server: AppServer, deadline: Instant) -> Option<Reading> {
 /// error discarded, within [`BUDGET`]; the host is ended once the reading returns.
 /// Memory-only sessions: the fetch starts none and writes no session log.
 #[must_use]
-pub fn fetch(exe: &Path, env: Vec<(&str, std::ffi::OsString)>, cwd: &Path) -> Option<Reading> {
+pub fn fetch(
+    exe: &Path,
+    env: Vec<(&str, std::ffi::OsString)>,
+    cwd: &Path,
+    permit: super::provider_read::Permit,
+) -> Option<Reading> {
+    let home = env
+        .iter()
+        .rev()
+        .find(|(key, _)| *key == "HOME")
+        .map(|(_, value)| std::path::PathBuf::from(value))?;
+    let config = env
+        .iter()
+        .rev()
+        .find(|(key, _)| *key == "XDG_CONFIG_HOME")
+        .map(|(_, value)| std::path::PathBuf::from(value))
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
+        .join("muse");
+    if !permit.matches(super::provider_read::Read::MuseUsage, &config) {
+        return None;
+    }
     use aterm_uds::spawnfd::Stdio;
     let mut cmd = aterm_uds::spawnfd::command(exe);
     cmd.arg("serve")

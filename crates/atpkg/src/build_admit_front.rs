@@ -199,26 +199,26 @@ fn install(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) -> Option<libc
 
 /// A non-blocking pipe, both ends close-on-exec: its read end and write end.
 fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    // SAFETY: `pipe` writes two descriptors into the two-element array.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: both descriptors are this process's own, each owned once here.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    for fd in [read.as_raw_fd(), write.as_raw_fd()] {
-        // SAFETY: `fcntl` on a descriptor this function owns, with plain integers.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+    aterm_uds::kept_out(|| {
+        let mut fds = [0; 2];
+        // SAFETY: `pipe` writes two descriptors into the two-element array.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-    }
-    let _ = aterm_uds::keep_out_of_children(&read);
-    let _ = aterm_uds::keep_out_of_children(&write);
-    // SAFETY: as above.
-    if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((read, write))
+        // SAFETY: both descriptors are this process's own, each owned once here.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        for fd in [read.as_raw_fd(), write.as_raw_fd()] {
+            // SAFETY: `fcntl` on a descriptor this function owns, with plain integers.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        // SAFETY: as above.
+        if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((read, write))
+    })
 }
 
 /// The byte [`Front::disarm`] writes to end the forwarding thread: no signal's number.
@@ -311,7 +311,9 @@ impl Front {
             use std::os::unix::fs::OpenOptionsExt as _;
             std::fs::OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+                .custom_flags(
+                    libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
                 .open("/dev/tty")
                 .ok()
         };

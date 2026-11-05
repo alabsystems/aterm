@@ -136,10 +136,10 @@ impl LaneState {
         read_number(&self.index_seen).map(|n| n.unwrap_or(0))
     }
 
-    /// Refuse an index head below the one this lane last processed.
+    /// Refuse an index head below the one this lane last processed, returning the floor.
     /// # Errors
     /// The downgrade refusal.
-    pub fn check_index(&self, head: u64) -> Result<()> {
+    pub fn check_index(&self, head: u64) -> Result<u64> {
         let seen = self.index_seen()?;
         if head < seen {
             return Err(Error::refused(format!(
@@ -149,7 +149,7 @@ impl LaneState {
                 self.index_seen.display()
             )));
         }
-        Ok(())
+        Ok(seen)
     }
 
     /// Hold `pins` (resolved for `targets`) to the pins this lane last saw.

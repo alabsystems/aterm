@@ -107,11 +107,27 @@ pub fn stand_in(from: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+fn copy_regular_fresh(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<u64> {
+    let (mut reader, meta) = crate::regular_file::open(from)?;
+    let _ = std::fs::remove_file(to);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(crate::atomic_file::LOCK_OPEN_FLAGS);
+    }
+    let mut writer = opts.open(to)?;
+    let copied = std::io::copy(&mut reader, &mut writer)?;
+    writer.set_permissions(meta.permissions())?;
+    Ok(copied)
+}
+
 /// Copy the Apple binary `from` to `to`, signed ad hoc: a plain copy of its [`stand_in`], for a test that needs the executable at a path of its own (in a bundle, renamed over).
 #[track_caller]
 pub fn ad_hoc_copy(from: &std::path::Path, to: &std::path::Path) {
     let from = stand_in(from);
-    std::fs::copy(&from, to)
+    copy_regular_fresh(&from, to)
         .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), to.display()));
 }
 
@@ -194,18 +210,36 @@ fn prints_judged(
     let (tx, seen) = std::sync::mpsc::channel();
     let wanted = line.as_bytes().to_vec();
     std::thread::spawn(move || {
+        use std::io::Read as _;
         let mut from = std::io::BufReader::new(from);
-        let mut tx = Some(tx);
-        let mut got = Vec::new();
+        let limit = u64::try_from(wanted.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(2);
+        let mut got = Vec::with_capacity(wanted.len().saturating_add(2));
         loop {
             got.clear();
-            match from.read_until(b'\n', &mut got) {
+            match (&mut from).take(limit).read_until(b'\n', &mut got) {
                 Ok(0) | Err(_) => break,
+                Ok(_) if !got.ends_with(b"\n") => loop {
+                    match from.fill_buf() {
+                        Ok([]) | Err(_) => return,
+                        Ok(buf) => {
+                            if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                                from.consume(pos + 1);
+                                break;
+                            }
+                            let len = buf.len();
+                            from.consume(len);
+                        }
+                    }
+                },
                 Ok(_) => {
-                    if got.strip_suffix(b"\n") == Some(wanted.as_slice())
-                        && let Some(tx) = tx.take()
-                    {
+                    if got.strip_suffix(b"\n") == Some(wanted.as_slice()) {
                         let _ = tx.send(());
+                        drop(tx);
+                        drop(got);
+                        let _ = std::io::copy(&mut from, &mut std::io::sink());
+                        break;
                     }
                 }
             }
@@ -471,7 +505,7 @@ fn signed_stand_in(
         }
     }
     let _fresh = Fresh(&fresh);
-    std::fs::copy(from, &fresh)
+    copy_regular_fresh(from, &fresh)
         .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), fresh.display()));
     sign(&fresh);
     let parent = signed.parent().expect("stand-in has a version directory");

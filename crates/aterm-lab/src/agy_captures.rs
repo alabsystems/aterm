@@ -337,7 +337,7 @@ fn long_reply() -> String {
 /// of a turn and the same end under a paste of 60 lines.
 fn composer_frames(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
     let ended = |run: &Run| -> Result<(), Fail> {
-        std::fs::write(run.w.join("reply.txt"), long_reply())
+        crate::util::write_fresh(&run.w.join("reply.txt"), long_reply())
             .map_err(|e| Fail::die(format!("cannot write the stub's reply: {e}")))?;
         c.settle(run, 15)?;
         c.turn(run, "carry on with the task")?;

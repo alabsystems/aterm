@@ -37,6 +37,8 @@ pub(crate) const BOOT_GRACE: Duration = Duration::from_secs(1);
 const SPARE_FORK_PARK_WAIT: Duration = Duration::from_millis(20);
 /// Settle delay after a tab landing or input before booking the next spare.
 pub(crate) const SETTLE: Duration = Duration::from_millis(150);
+/// How often a parked spare held by an update handoff looks again while that handoff lasts.
+const UPDATE_RECHECK: Duration = Duration::from_secs(5);
 /// Input idle duration required before warm promotion.
 pub(crate) const PROMOTE_IDLE: Duration = Duration::from_secs(1);
 /// Folder stability duration required before warm promotion.
@@ -845,7 +847,9 @@ impl GateBook {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+                options
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
             }
             let mut file = match options.open(&tmp) {
                 Ok(file) => file,
@@ -2041,8 +2045,9 @@ pub(crate) fn kill_session(pid: i32) {
 #[cfg(not(unix))]
 pub(crate) fn kill_session(_pid: i32) {}
 
+/// Every process on the host (`reveal` reads the tree under a session's shell from it).
 #[cfg(target_os = "macos")]
-fn host_pids() -> Vec<i32> {
+pub(crate) fn host_pids() -> Vec<i32> {
     // SAFETY: a null buffer asks for the count only.
     let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     let Ok(count) = usize::try_from(count) else {
@@ -2056,9 +2061,16 @@ fn host_pids() -> Vec<i32> {
     pids
 }
 
+/// Every process on the host.
 #[cfg(target_os = "linux")]
-fn host_pids() -> Vec<i32> {
+pub(crate) fn host_pids() -> Vec<i32> {
     Procfs.list().unwrap_or_default()
+}
+
+/// No process table is read here.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn host_pids() -> Vec<i32> {
+    Vec::new()
 }
 
 /// Background job to spawn a spare shell on the `aterm-spare` thread.
@@ -2780,6 +2792,7 @@ impl Wake {
             Wake::QueuedKeyDelivered { session, .. } => Some(*session),
             Wake::MetaChanged { session, .. } => Some(*session),
             Wake::TaskChanged { session } => Some(*session),
+            Wake::RestoredWorkerEnded(check) => Some(check.session),
             Wake::InputWatch { session, .. } => Some(*session),
             Wake::ClaudeFooter { session, .. } => Some(*session),
             Wake::SessionLogMoved { session, .. } => Some(*session),
@@ -2880,6 +2893,7 @@ impl Wake {
             | Wake::TypingMomentum { .. }
             | Wake::PaneRegridOwed { .. }
             | Wake::ReadSessionStatus { .. }
+            | Wake::ReadSetupStatus { .. }
             | Wake::ReadSessionStatuses { .. }
             | Wake::Story { .. }
             | Wake::ReadSessionWindows { .. }
@@ -3019,6 +3033,8 @@ impl Wake {
             Wake::AskpassWithdraw { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::PasteConfirmed { .. } => None,
+            #[cfg(target_os = "macos")]
+            Wake::CloseSheetAnswered { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::StatusAction { .. } => None,
             #[cfg(target_os = "macos")]
@@ -3178,6 +3194,9 @@ pub(crate) type PowerProbe = fn() -> bool;
 
 /// Whether the host is in Low Power Mode or serious thermal state.
 pub(crate) fn power_constrained() -> bool {
+    if aterm_types::dev_seam!("ATERM_DEBUG_SPARE_POWER").is_some_and(|v| v == "clear") {
+        return false;
+    }
     #[cfg(target_os = "macos")]
     {
         use aterm_objc::{class, sel};
@@ -3906,6 +3925,22 @@ impl App {
         None
     }
 
+    /// When a parked spare held at gate `why` should look again, for the gates whose clearing
+    /// reaches the spare by no event of its own. The others' clearing arms a tick where it happens.
+    fn spare_recheck_at(&self, why: &str, now: Instant) -> Option<Instant> {
+        match why {
+            "budget" => self
+                .spares
+                .warm_discards
+                .iter()
+                .find(|at| now.saturating_duration_since(**at) < HOUR)
+                .map(|oldest| *oldest + HOUR),
+            // A handoff ends at many sites, and this timer lives only while one is in flight.
+            "update" => Some(now + UPDATE_RECHECK),
+            _ => None,
+        }
+    }
+
     fn spare_promote(&mut self, now: Instant) {
         match self.spare_promote_check(now) {
             BookCheck::Go { .. } => {}
@@ -3913,7 +3948,13 @@ impl App {
                 self.spares.arm(at);
                 return;
             }
-            BookCheck::NotAtPrompt(_) | BookCheck::No(_) => return,
+            BookCheck::No(why) => {
+                if let Some(at) = self.spare_recheck_at(why, now) {
+                    self.spares.arm(at);
+                }
+                return;
+            }
+            BookCheck::NotAtPrompt(_) => return,
         }
         if !self.spare_fresh(now) {
             return;
@@ -4218,6 +4259,13 @@ impl App {
     }
 
     /// Schedule a spare check after a tab lands or window focus changes.
+    /// The host's Low Power or thermal state changed: the `power` gate arms no tick of its own
+    /// when it refuses, so its clearing has to re-run the gates.
+    #[cfg(any(target_os = "macos", windows, test))]
+    pub(crate) fn spare_host_power_changed(&self) {
+        self.spares.arm(Instant::now());
+    }
+
     pub(crate) fn spare_poke(&self) {
         let settle = debug_ms("SETTLE").unwrap_or(SETTLE);
         self.spares.arm(Instant::now() + settle);

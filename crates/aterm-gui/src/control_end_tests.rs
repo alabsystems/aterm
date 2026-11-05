@@ -69,6 +69,7 @@ fn offered(pid: i32, from: Source) -> LeftRow {
         teller: None,
         token: Some(token(pid)),
         foreground: false,
+        after_agent: false,
     }
 }
 
@@ -103,7 +104,7 @@ fn view(rows: Vec<LeftRow>) -> LeftView {
             shell_uniqueid: 1_000,
             horizon: 2_000,
             closed_ms: NOW - 7_200_000,
-            agent_since: None,
+            agent_spans: Vec::new(),
             left: 1,
         }],
         ..LeftView::default()
@@ -296,7 +297,7 @@ fn end_during_transition(transition: Transition) -> (Answer, Vec<(i32, i32)>) {
             shell_pid: 600,
             shell_uniqueid: Some(1_000),
             fg_pgid: Some(600),
-            agent_since: None,
+            agent_spans: Vec::new(),
         }],
         ..LeftView::default()
     };
@@ -367,14 +368,15 @@ fn end_during_transition(transition: Transition) -> (Answer, Vec<(i32, i32)>) {
                     // host capture prevents KILL after this handoff during the expensive read.
                     foreground.set(2_600);
                 }
-                Some(LeftView {
-                    rows: vec![judge(live, closed)?],
+                Reread::Read(judge(live, closed).map(|row| LeftView {
+                    rows: vec![row],
                     live: live.to_vec(),
                     closed: closed.to_vec(),
                     ..LeftView::default()
-                })
+                }))
             },
         )
+        .view()
     };
     let after_term = || {
         let mut current = store.try_write().expect("no Store guard during signal");
@@ -995,4 +997,209 @@ fn a_caller_that_hung_up_ends_no_further_token() {
             token(4100)
         )
     );
+}
+
+/// THE LEFT DOOR RE-PROVES EACH ROW AT THE YIELD (the harness's `IdleHost::leftover`, over a fake
+/// view and a fake re-read): of a whole view, the agent's rows that re-prove as the same token
+/// from the same source hold, its tab's and its dead run's; a row whose identity moved since the
+/// view, or that is gone, holds nothing; a `name` row and another session's are never the
+/// agent's; a partial view, or none, is unchecked, and so is a whole one where any row's read
+/// could not be made.
+/// NEGATIVE CONTROL: skip the re-read, and the moved row holds; read an unread row as gone, and the
+/// whole view reads two rows.
+#[test]
+fn the_left_door_reproves_each_row_at_the_yield() {
+    use aterm_agent::harness::leftover::LeftRead;
+    use aterm_vitals::left::LiveTab;
+    let tab = |key: u64, sid: &str| LiveTab {
+        key,
+        sid: sid.into(),
+        shell_pid: 40 + u32::try_from(key).expect("a key"),
+        shell_uniqueid: Some(key),
+        fg_pgid: None,
+        agent_spans: Vec::new(),
+    };
+    let live = vec![tab(7, "s-a7"), tab(1, "s-a1")];
+    let whole = |rows: Vec<LeftRow>| LeftView {
+        live: live.clone(),
+        complete: true,
+        ..view(rows)
+    };
+    let name = named(105, State::Left, Tier::Name, Why::Daemon);
+    let rows = vec![
+        offered(101, Source::Tab(7)),
+        offered(102, Source::Tab(7)),
+        offered(103, Source::Tab(7)),
+        offered(104, Source::Run(RUN.into())),
+        name.clone(),
+        offered(106, Source::Tab(1)),
+    ];
+    let reread = |pid: u32| -> Reread {
+        let row = match pid {
+            101 => offered(101, Source::Tab(7)),
+            // Another process now holds the pid: its birth moved.
+            102 => LeftRow {
+                token: Some(
+                    Identity {
+                        birth: Birth(1_792_198_840_004_410),
+                        ..ident(102)
+                    }
+                    .token(),
+                ),
+                ..offered(102, Source::Tab(7))
+            },
+            104 => offered(104, Source::Run(RUN.into())),
+            _ => return Reread::Read(None),
+        };
+        Reread::Read(Some(whole(vec![row])))
+    };
+    assert_eq!(
+        left_at_yield(Some(&whole(rows.clone())), "s-a7", &reread),
+        LeftRead::Rows(vec![ident(101), ident(104)])
+    );
+    assert_eq!(
+        left_at_yield(
+            Some(&whole(vec![name, offered(106, Source::Tab(1))])),
+            "s-a7",
+            &reread
+        ),
+        LeftRead::Rows(Vec::new()),
+        "a name row and another session's are never the agent's"
+    );
+    let unread = |pid: u32| {
+        if pid == 103 {
+            Reread::Unread
+        } else {
+            reread(pid)
+        }
+    };
+    assert_eq!(
+        left_at_yield(Some(&whole(rows.clone())), "s-a7", &unread),
+        LeftRead::Unchecked,
+        "a row whose read could not be made is no row gone"
+    );
+    for partial in [
+        LeftView {
+            complete: false,
+            ..whole(rows.clone())
+        },
+        LeftView {
+            bounded: true,
+            ..whole(rows.clone())
+        },
+    ] {
+        assert_eq!(
+            left_at_yield(Some(&partial), "s-a7", &reread),
+            LeftRead::Unchecked
+        );
+    }
+    assert_eq!(left_at_yield(None, "s-a7", &reread), LeftRead::Unchecked);
+}
+
+/// THE LEFT DOOR'S READ OF A ROW IS UNREAD WHERE THE HOST'S TABS ARE (`reread_current`): a context
+/// that could not be captured, before or after the row's read, or one that changed between the
+/// two captures, makes the row's read unread, and the yield over it unchecked rather than clean;
+/// two captures that agree pass the read through. NEGATIVE CONTROL: read a first capture that
+/// failed as the row gone (`Reread::Read(None)`), and its case reads gone, not unread.
+#[test]
+fn a_row_read_over_tabs_that_could_not_be_captured_leaves_the_yield_unchecked() {
+    use aterm_agent::harness::leftover::LeftRead;
+    use aterm_vitals::left::LiveTab;
+    let store = crate::session_store::new_store();
+    let tab = |fg: u32| LiveTab {
+        key: 7,
+        sid: "s-a7".into(),
+        shell_pid: 47,
+        shell_uniqueid: Some(7),
+        fg_pgid: Some(fg),
+        agent_spans: Vec::new(),
+    };
+    let row = offered(101, Source::Tab(7));
+    let fresh = LeftView {
+        live: vec![tab(47)],
+        complete: true,
+        ..view(vec![row.clone()])
+    };
+    let captures = Cell::new(0);
+    // Which capture fails (`Some(n)`: the n-th of a row's two), and from which capture the
+    // foreground moves.
+    let read_with = |fails: Option<u32>, moves_from: Option<u32>| {
+        captures.set(0);
+        reread_current(
+            &store,
+            &|| {
+                captures.set(captures.get() + 1);
+                let n = captures.get();
+                if fails == Some(n) {
+                    return None;
+                }
+                let fg = if moves_from.is_some_and(|from| n >= from) {
+                    2_600
+                } else {
+                    47
+                };
+                Some((Vec::new(), vec![tab(fg)], Vec::new()))
+            },
+            &|_, _| Reread::Read(Some(fresh.clone())),
+        )
+    };
+    assert_eq!(read_with(None, None), Reread::Read(Some(fresh.clone())));
+    for (what, fails, moves) in [
+        ("no first capture", Some(1), None),
+        ("no second capture", Some(2), None),
+        ("a foreground handoff during the read", None, Some(2)),
+    ] {
+        assert_eq!(read_with(fails, moves), Reread::Unread, "{what}");
+        let at_yield = left_at_yield(
+            Some(&LeftView {
+                live: vec![tab(47)],
+                complete: true,
+                ..view(vec![row.clone()])
+            }),
+            "s-a7",
+            &|_| read_with(fails, moves),
+        );
+        assert_eq!(at_yield, LeftRead::Unchecked, "{what}");
+    }
+}
+
+/// THE LEFT DOOR READS ONLY A FRESH VIEW (`fresh_left`): of the snapshot `SYS.fresh` answers, a
+/// fresh one's left view is read, and a stale or warming one's is none, so the yield over it is
+/// unchecked: a view older than a row born since would read that row's absence as clean.
+/// NEGATIVE CONTROL: take the view whatever its freshness, and the stale view is read.
+#[test]
+fn the_left_door_reads_only_a_fresh_view() {
+    use aterm_agent::harness::leftover::LeftRead;
+    use aterm_vitals::sys::Freshness;
+    let empty = LeftView {
+        complete: true,
+        ..LeftView::default()
+    };
+    let held = || {
+        Some(crate::sys_host::Held {
+            snap: Arc::new(aterm_vitals::model::Snapshot {
+                left: Some(Arc::new(empty.clone())),
+                ..aterm_vitals::model::Snapshot::default()
+            }),
+            unix_ms: 0,
+            at: std::time::Instant::now(),
+        })
+    };
+    let gone = |_: u32| Reread::Read(None);
+    let fresh = fresh_left((held(), Freshness::Fresh));
+    assert_eq!(fresh.as_deref(), Some(&empty));
+    assert_eq!(
+        left_at_yield(fresh.as_deref(), "s-a7", &gone),
+        LeftRead::Rows(Vec::new())
+    );
+    for state in [Freshness::Stale, Freshness::Warming] {
+        let old = fresh_left((held(), state));
+        assert_eq!(old, None, "{state:?}");
+        assert_eq!(
+            left_at_yield(old.as_deref(), "s-a7", &gone),
+            LeftRead::Unchecked,
+            "{state:?}"
+        );
+    }
+    assert_eq!(fresh_left((None, Freshness::Fresh)), None);
 }

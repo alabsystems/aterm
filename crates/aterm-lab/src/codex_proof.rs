@@ -88,7 +88,7 @@ fn decoy_state(run: &Run) -> String {
         .map(|rd| {
             rd.flatten()
                 .map(|e| {
-                    let m = e.path().symlink_metadata().ok();
+                    let m = e.metadata().ok();
                     format!(
                         "{} {:?} {} {:?}",
                         e.file_name().to_string_lossy(),
@@ -479,7 +479,7 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
         "== isolation probes (the rules of this lab's jail, Codex's among them, rendered for a replica home: nothing of the owner's is touched)"
     );
     let (iso, probe_text) = crate::probe::run_captured(&run.tag, true)?;
-    let _ = fs::write(run.run.join("probe.txt"), &probe_text);
+    let _ = crate::util::write_fresh(&run.run.join("probe.txt"), &probe_text);
     for l in probe_text.lines() {
         println!("  {l}");
     }

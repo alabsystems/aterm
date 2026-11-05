@@ -304,8 +304,8 @@ impl Ctx {
         std::thread::sleep(std::time::Duration::from_millis(500));
         if let Some(d) = &self.dir {
             let cast = self.ctl(&["cast"]).stdout;
-            let _ = fs::write(d.join("cast.jsonl"), cast);
-            let _ = fs::write(d.join("status.txt"), self.ctl(&["status"]).stdout);
+            let _ = crate::util::write_fresh(&d.join("cast.jsonl"), cast);
+            let _ = crate::util::write_fresh(&d.join("status.txt"), self.ctl(&["status"]).stdout);
             let sl = self.run.w.join("stub.log");
             if let Ok(Some(t)) = crate::sys::scratch_read(&sl)
                 .map(|b| b.map(|b| String::from_utf8_lossy(&b).into_owned()))
@@ -315,7 +315,7 @@ impl Ctx {
                     .filter(|l| !l.contains("PROXY refused"))
                     .map(|l| format!("{l}\n"))
                     .collect();
-                let _ = fs::write(d.join("stub.log"), kept);
+                let _ = crate::util::write_fresh(&d.join("stub.log"), kept);
             }
         }
         if let Some(mut r) = self.rec.take() {
@@ -609,15 +609,18 @@ impl Ctx {
     /// `timeline.txt`.
     pub fn save_timeline(&self) {
         if let Some(d) = &self.dir {
-            let _ = fs::write(d.join("timeline.txt"), format!("{}\n", self.timeline(None)));
+            let _ = crate::util::write_fresh(
+                &d.join("timeline.txt"),
+                format!("{}\n", self.timeline(None)),
+            );
         }
     }
 
     /// `summary.json`.
     pub fn save_summary(&self) {
         if let Some(d) = &self.dir {
-            let _ = fs::write(
-                d.join("summary.json"),
+            let _ = crate::util::write_fresh(
+                &d.join("summary.json"),
                 format!("{}\n", self.sumd.dump(SUMMARY)),
             );
         }

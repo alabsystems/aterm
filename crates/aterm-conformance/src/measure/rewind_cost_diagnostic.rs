@@ -24,9 +24,9 @@ const STAGES: &[&str] = &[
     "parse",
     "record",
     "witness",
+    "rekey",
     "apply",
-    "mint",
-    "commit",
+    "judge",
 ];
 
 fn sha256(path: &Path) -> Result<String, CouldNotRun> {
@@ -125,9 +125,12 @@ fn reference_roles(subject: &Value, driver: &Value) -> bool {
 }
 
 /// Collect eight fresh 64MiB takes: recording OFF then ON, each with probe OFF/ON/ON/OFF.
+/// Each take ends with `temporal judge`, its wall time and CPU recorded; witnesses evicted
+/// unjudged are recorded, not refused.
 /// No ratio, threshold, or passing acceptance verdict is produced. Scratch worlds are kept.
 /// # Errors
-/// I/O, launch, missing/malformed evidence, changed process/image identity, or recorded loss.
+/// I/O, launch, missing/malformed evidence, changed process/image identity, recorded loss, or a
+/// kept witness that diverged or is still unjudged after `temporal judge`.
 pub fn collect(rig: &Rig, directory: &Path) -> Result<(), CouldNotRun> {
     collect_plan(rig, directory, Plan::Tax)
 }
@@ -153,6 +156,7 @@ fn collect_plan(rig: &Rig, directory: &Path, plan: Plan) -> Result<(), CouldNotR
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(directory.join("diagnostic.jsonl"))
         .map_err(|e| CouldNotRun::Refused(e.to_string()))?;
     let subject_hash = sha256(&rig.aterm)?;
@@ -161,7 +165,7 @@ fn collect_plan(rig: &Rig, directory: &Path, plan: Plan) -> Result<(), CouldNotR
     record(
         &mut out,
         &json!({
-            "event": "plan", "schema": 2, "diagnostic_only": true, "bytes_requested": BYTES,
+            "event": "plan", "schema": 3, "diagnostic_only": true, "bytes_requested": BYTES,
             "plan": if plan.reference() { "reference_four_arms" } else { "instrumentation_tax_eight_arms" },
             "arms": arms.iter().map(|&(recording, probe)| json!({"recording":recording,"probe":probe})).collect::<Vec<_>>(),
             "planned_arms": arms.len(),
@@ -173,7 +177,7 @@ fn collect_plan(rig: &Rig, directory: &Path, plan: Plan) -> Result<(), CouldNotR
             "source_profile_provenance": "see separately retained frozen build manifests; current checkout is not compiled source proof",
             "launch": "canonical Take/World/Instance lifeline, role take/refusal; only explicit diagnostic child env differs",
             "scope": "CPU brackets include setup and polling; stage scopes inclusive, polling nonatomic, boundary probe overhead; not drain-only CPU",
-            "timing_acceptance": "not_evaluated; original five-ABBA/970 row unchanged",
+            "timing_acceptance": "not_evaluated",
         }),
     )?;
     let budget = Budget::from_now(BUDGET_SECS);
@@ -265,13 +269,32 @@ fn collect_plan(rig: &Rig, directory: &Path, plan: Plan) -> Result<(), CouldNotR
                 return could_not_run("reference roles changed or became unknown during arm");
             }
             trace_fields(&completed, probe)?;
+            let cpu_before_judge = cpu_ns(take.inst.pid());
+            let judge_started = Instant::now();
+            let judge_reply = take.inst.ctl.ok(&["temporal", "judge"])?;
+            let judge_wall_us = judge_started.elapsed().as_micros();
+            let cpu_after_judge = cpu_ns(take.inst.pid());
+            let judged = take.inst.ctl.ok(&["temporal", "status"])?;
+            record(
+                &mut out,
+                &json!({
+                    "event": "arm-judged", "diagnostic_only": true, "arm": arm,
+                    "recording": recording, "probe": probe, "judge_reply": judge_reply,
+                    "judge_wall_us": judge_wall_us, "cpu_before_judge_ns": cpu_before_judge,
+                    "cpu_after_judge_ns": cpu_after_judge,
+                    "unjudged_evicted": field(&judged, "unjudged_evicted"),
+                    "status_judged": judged,
+                }),
+            )?;
+            trace_fields(&judged, probe)?;
             for key in [
                 "dropped_input",
                 "dropped_events",
                 "dropped_replies",
                 "diverged",
+                "pending",
             ] {
-                if field(&completed, key).and_then(|value| value.parse::<u64>().ok()) != Some(0) {
+                if field(&judged, key).and_then(|value| value.parse::<u64>().ok()) != Some(0) {
                     return could_not_run(format!("diagnostic refused missing or nonzero {key}"));
                 }
             }

@@ -336,11 +336,7 @@ pub fn jailed_file(run_dir: &Path) -> PathBuf {
 pub fn record_jailed(run_dir: &Path, pid: i32) {
     use std::io::Write as _;
     let line = format!("{pid}\t{}\n", start_time(pid));
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(jailed_file(run_dir))
-    {
+    if let Ok(mut f) = crate::util::append_regular_file(&jailed_file(run_dir)) {
         let _ = f.write_all(line.as_bytes());
     }
 }

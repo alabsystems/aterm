@@ -109,16 +109,16 @@ fn request(method: Method, path: &str) -> Result<Value, String> {
         ProxyMode::Environment,
         Duration::from_secs(30),
     );
-    let platform = if cfg!(target_os = "macos") {
-        "macos"
+    let app_version = if cfg!(target_os = "macos") {
+        "macos-bridge@3.27.1"
     } else if cfg!(target_os = "windows") {
-        "windows"
+        "windows-bridge@3.27.1"
     } else {
-        "linux"
+        "linux-bridge@3.27.1"
     };
     let response = client
         .request(method, &format!("https://mail.proton.me/api{path}"))
-        .header("x-pm-appversion", &format!("{platform}-bridge@3.27.1"))
+        .header("x-pm-appversion", app_version)
         .header(
             "User-Agent",
             concat!("aterm-mail/", env!("CARGO_PKG_VERSION")),

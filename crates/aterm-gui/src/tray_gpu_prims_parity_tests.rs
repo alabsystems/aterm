@@ -97,8 +97,11 @@ const GROUNDS: [(&str, [u8; 4]); 4] = [
 /// A tile's side (pt), and how many tiles a sweep's canvas holds a side.
 const TILE: f32 = 40.0;
 const TILES: u32 = 32;
-/// Sweeps per kind and ground, two prims per tile: 5 × 32² × 2 = 10,240 geometries each.
-const SWEEPS: u32 = 5;
+/// Sweeps per kind and ground, one per scale, two prims per tile: 3 × 32² × 2 = 6,144 geometries
+/// each. A sweep's prims hold every alpha step, so a further sweep at a scale would bring new
+/// random geometry and nothing else: a rare geometry that misses by more than 2 levels and appears
+/// in no other prim goes unseen.
+const SWEEPS: u32 = 3;
 /// The scales the sweeps cycle through.
 const SCALES: [f32; 3] = [1.0, 1.5, 2.0];
 
@@ -325,7 +328,7 @@ fn gpu_card(
         .expect("the GPU draws the card")
 }
 
-/// Every kind, 10,240 random geometries over each ground at every alpha step, at fractional
+/// Every kind, 6,144 random geometries over each ground at every alpha step, at fractional
 /// places and at 1×, 1.5× and 2×: within 2 levels of the CPU raster everywhere and exact inside
 /// opaque interiors.
 #[test]

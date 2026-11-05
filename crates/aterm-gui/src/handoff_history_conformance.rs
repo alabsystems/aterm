@@ -195,6 +195,7 @@ impl Real {
                     mirror_dropped: Vec::new(),
                     mirror_served: false,
                     machine_names: Vec::new(),
+                    retired_workers: Vec::new(),
                 };
                 stamp_manifest(
                     &mut manifest,

@@ -147,7 +147,7 @@ impl Cycle<'_> {
         launch.run.clone_from(&self.recipient.run);
         let executable = self.window.aterm.clone();
         let keeper = self.window.pid;
-        self.window.stop();
+        self.window.stop().map_err(fail)?;
         absent(&[pid as i32, keeper, source_pid as i32], self.out)?;
         // This is the read-only projection of a completed checkpoint. The replacement owner
         // will independently reopen the astream journal; no live producer is running here.

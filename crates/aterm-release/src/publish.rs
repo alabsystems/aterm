@@ -10,7 +10,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aterm_digest::Sha256;
 use aterm_uds::spawnfd::command;
-use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use aterm_update_core::Manifest;
@@ -2823,15 +2822,21 @@ pub fn verify_detached_manifest_signature(
     let canonical = canonical_update_pubkey(encoded_pubkey)?;
     let pubkey = aterm_codec::base64::decode_strict(canonical.as_bytes())
         .map_err(|_| Error::new("canonical update public key failed to decode"))?;
-    if signature.len() != 64 {
-        return Err(Error::new(format!(
+    let pubkey = <&[u8; 32]>::try_from(pubkey.as_slice())
+        .map_err(|_| Error::new("canonical update public key is not 32 bytes"))?;
+    let signature = <&[u8; 64]>::try_from(signature).map_err(|_| {
+        Error::new(format!(
             "manifest signature is {} bytes, not an Ed25519 64-byte signature",
             signature.len()
-        )));
+        ))
+    })?;
+    if astream_aead::signature::verify(pubkey, manifest, signature) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "manifest signature does not verify under the channel public key",
+        ))
     }
-    UnparsedPublicKey::new(&ED25519, pubkey)
-        .verify(manifest, signature)
-        .map_err(|_| Error::new("manifest signature does not verify under the channel public key"))
 }
 
 /// The exact-head signature check, with the asset download injected so the decision runs without GitHub.
@@ -4294,9 +4299,11 @@ fn preflight_signature_policy(
     creds: Option<&sign::ReleaseCredentials>,
     duty: RosterDuty,
 ) -> Result<SigningVerdict> {
+    let home = aterm_types::dirs::home_dir();
     signing_verdict(
         creds,
         &SigningAnchors {
+            home: home.as_deref(),
             master_pubkeys: aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
             identity_path: machines::conventional_identity_path().as_deref(),
             now_unix: roster_now_unix(),
@@ -4315,24 +4322,59 @@ const fn roster_duty(build_done: bool) -> RosterDuty {
 
 /// The anchors and ambient inputs [`signing_verdict`] resolves against.
 pub struct SigningAnchors<'a> {
+    pub home: Option<&'a Path>,
     pub master_pubkeys: &'a [&'a str],
     pub identity_path: Option<&'a Path>,
     pub now_unix: i64,
     pub duty: RosterDuty,
 }
 
+/// [`signing_verdict`]'s refusal of an armed cut whose anchors name no home.
+#[cfg(unix)]
+pub(crate) const NO_HOME_CONTEXT: &str = "current signing authority needs an explicit home context";
+
 pub fn signing_verdict(
     creds: Option<&sign::ReleaseCredentials>,
     anchors: &SigningAnchors<'_>,
 ) -> Result<SigningVerdict> {
     let armed = !anchors.master_pubkeys.is_empty() && anchors.duty == RosterDuty::Sign;
-    let document = match (
-        armed,
-        creds.and_then(sign::ReleaseCredentials::machine_roster),
-    ) {
-        (true, Some(path)) => Some(machines::RosterDocument::read(path)?),
-        _ => None,
+    #[cfg(not(unix))]
+    if armed {
+        return Err(Error::new(
+            "current roster signing authority is unavailable on this platform",
+        ));
+    }
+    #[cfg(unix)]
+    let current = if armed {
+        let home = anchors.home.ok_or_else(|| Error::new(NO_HOME_CONTEXT))?;
+        let named = creds
+            .and_then(sign::ReleaseCredentials::machine_roster)
+            .ok_or_else(|| Error::new("current signing authority needs a named roster pair"))?;
+        // A configured missing pair remains an error, not permission to fall back.
+        if machines::current_roster::read_local_candidate_with(named, anchors.master_pubkeys)?
+            .is_none()
+        {
+            return Err(Error::new(
+                "the profile's named public roster pair is absent",
+            ));
+        }
+        let canonical = home.join(atpkg_keys::provision::RELEASE_ROSTER_REL);
+        Some(machines::current_roster::resolve(
+            home,
+            &[named, &canonical],
+            anchors.master_pubkeys,
+            Ok(None),
+            aterm_secrets::client::current_public_roster,
+        )?)
+    } else {
+        None
     };
+    #[cfg(unix)]
+    let document = current
+        .as_ref()
+        .map(machines::current_roster::CurrentRoster::document);
+    #[cfg(not(unix))]
+    let document = None;
     let declared = if armed {
         machines::declared_machine_id(
             creds.and_then(sign::ReleaseCredentials::machine_id),
@@ -4353,6 +4395,13 @@ pub fn signing_verdict(
             duty: anchors.duty,
         },
     )?;
+    #[cfg(unix)]
+    if let Some(current) = current.as_ref() {
+        current.recheck(
+            anchors.home.expect("current authority has a home"),
+            anchors.master_pubkeys,
+        )?;
+    }
     Ok(SigningVerdict {
         roster: attribution.as_ref().and(document),
         attribution,
@@ -4384,7 +4433,7 @@ fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
     let manifest_bytes = gates::read_bounded_bytes(manifest, 16 << 20)
         .map_err(|error| Error::new(format!("read {}: {error}", manifest.display())))?;
     let signature_bytes = creds.sign(&manifest_bytes).map_err(Error::new)?;
-    fs::write(&signature, &signature_bytes)
+    crate::durable::write_fresh(&signature, &signature_bytes)
         .map_err(|error| Error::new(format!("write {}: {error}", signature.display())))?;
     verify_detached_manifest_signature(expected_pubkey, &manifest_bytes, &signature_bytes)?;
     step(
@@ -4395,6 +4444,15 @@ fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
         ),
     );
     Ok(signature)
+}
+
+fn sign_ctx_manifest(
+    ctx: &CutCtx,
+    manifest: &Path,
+    validate: impl FnOnce(&CutCtx) -> Result<()>,
+) -> Result<PathBuf> {
+    validate(ctx)?;
+    sign_manifest_with_policy(ctx, manifest)
 }
 
 /// Assemble the manifest, stamp the attribution into it, prove the bytes and write them, in that order.
@@ -5799,7 +5857,7 @@ fn recover_published_cut(
             destination,
         )
     })?;
-    fs::copy(&recovered_dmg, dist.join(channel::stable_dmg_asset_name()))
+    crate::durable::copy_regular_fresh(&recovered_dmg, dist.join(channel::stable_dmg_asset_name()))
         .map_err(|error| Error::new(format!("reconstruct stable dmg twin: {error}")))?;
     verify_release_asset_digest_for_release_id_to(
         slug,
@@ -5809,7 +5867,7 @@ fn recover_published_cut(
         &recovered_zip_sha256,
         &dist.join(&recovered_zip),
     )?;
-    fs::copy(
+    crate::durable::copy_regular_fresh(
         dist.join(&recovered_zip),
         dist.join(channel::stable_zip_asset_name()),
     )
@@ -5825,16 +5883,16 @@ fn recover_published_cut(
     ];
     for (name, sha) in sidecar_records {
         let sidecar = channel::sha256_sidecar_name(name);
-        fs::write(
-            dist.join(&sidecar),
+        crate::durable::write_fresh(
+            &dist.join(&sidecar),
             channel::sha256_sidecar_contents(sha, name),
         )
         .map_err(|error| Error::new(format!("reconstruct {sidecar}: {error}")))?;
     }
-    fs::write(dist.join(manifest_out::MANIFEST_ASSET), &manifest_bytes)
+    crate::durable::write_fresh(&dist.join(manifest_out::MANIFEST_ASSET), &manifest_bytes)
         .map_err(|error| Error::new(format!("reconstruct manifest: {error}")))?;
     if let Some(signature) = &signature_bytes {
-        fs::write(dist.join(manifest_out::MANIFEST_SIG_ASSET), signature)
+        crate::durable::write_fresh(&dist.join(manifest_out::MANIFEST_SIG_ASSET), signature)
             .map_err(|error| Error::new(format!("reconstruct signature: {error}")))?;
     } else {
         match fs::remove_file(dist.join(manifest_out::MANIFEST_SIG_ASSET)) {
@@ -6329,10 +6387,15 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         published: published.clone(),
     };
     let gr = gates::run_all(&git, &tree, repo, &gate_opts)?;
+    let tag = if gate_opts.offline {
+        "no tag claimed (dry-run)".to_string()
+    } else {
+        format!("tag v{version} free (local+remote)")
+    };
     step(
         "gates",
         &format!(
-            "clean tree · HEAD {} ({}) · tag v{version} free (local+remote)",
+            "clean tree · HEAD {} ({}) · {tag}",
             if gr.published.is_some() {
                 "== the published commit"
             } else {
@@ -6919,6 +6982,16 @@ fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
     ensure_ctx_release_lease(ctx)?;
     let duty = roster_duty(ctx.is_done("sign"));
     let observed = preflight_signature_policy(ctx.credentials.as_ref(), duty)?;
+    revalidate_observed_signature_policy(ctx, &observed, duty)?;
+    ensure_ctx_release_lease(ctx)
+}
+
+/// Compare the fresh signing observation with this cut's captured inputs.
+fn revalidate_observed_signature_policy(
+    ctx: &CutCtx,
+    observed: &SigningVerdict,
+    duty: RosterDuty,
+) -> Result<()> {
     if observed.policy.required != ctx.signature_required
         || observed.policy.pubkey.as_deref() != ctx.signature_pubkey.as_deref()
     {
@@ -6932,8 +7005,34 @@ fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
             ctx.signature_machine_id.as_deref(),
             observed.machine_id().as_deref(),
         )?;
+        if observed.attribution != ctx.attribution
+            || observed.roster.as_ref().map(|document| &document.bytes)
+                != ctx.roster.as_ref().map(|document| &document.bytes)
+        {
+            return Err(Error::new(
+                "current signing roster or attribution changed after this cut captured its \
+                 signing inputs; refusing to stage or sign stale authority",
+            ));
+        }
     }
-    ensure_ctx_release_lease(ctx)
+    Ok(())
+}
+
+/// Stage this cut's actual manifest and roster after the caller's fresh admission.
+fn stage_ctx_signing_inputs(
+    ctx: &CutCtx,
+    inputs: &manifest_out::ManifestInputs<'_>,
+    validate: impl FnOnce(&CutCtx) -> Result<()>,
+) -> Result<PathBuf> {
+    validate(ctx)?;
+    let manifest = stage_manifest(
+        &ctx.dist,
+        inputs,
+        ctx.attribution.as_ref(),
+        ctx.linux.as_ref(),
+    )?;
+    stage_roster_assets(&ctx.dist, ctx.roster.as_ref())?;
+    Ok(manifest)
 }
 
 fn step_lock(ctx: &mut CutCtx) -> Result<()> {
@@ -6985,6 +7084,9 @@ pub trait Packager {
     fn zip(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged>;
     fn sha256(&self, path: &Path) -> Result<String>;
     fn size(&self, path: &Path) -> Result<u64>;
+    fn sha256_and_size(&self, path: &Path) -> Result<(String, u64)> {
+        Ok((self.sha256(path)?, self.size(path)?))
+    }
 }
 
 /// The real packaging tools. The only implementation the pipeline constructs.
@@ -7001,9 +7103,12 @@ impl Packager for RealPackager {
         dmg::sha256_file(path).map_err(Error::new)
     }
     fn size(&self, path: &Path) -> Result<u64> {
-        Ok(fs::metadata(path)
-            .map_err(|e| Error::new(format!("stat {}: {e}", path.display())))?
-            .len())
+        crate::durable::open_regular_file_with_meta(path)
+            .map(|(_, meta)| meta.len())
+            .map_err(|e| Error::new(format!("stat {}: {e}", path.display())))
+    }
+    fn sha256_and_size(&self, path: &Path) -> Result<(String, u64)> {
+        dmg::sha256_and_size(path).map_err(Error::new)
     }
 }
 
@@ -7055,7 +7160,7 @@ pub fn notarize_and_package(
     let dmg_notarized =
         sign::sign_and_notarize_dmg(&dmg_out.path, tier, tools).map_err(Error::new)?;
     let (dmg_sha256, dmg_size) = if dmg_notarized {
-        (pack.sha256(&dmg_out.path)?, pack.size(&dmg_out.path)?)
+        pack.sha256_and_size(&dmg_out.path)?
     } else {
         (dmg_out.sha256.clone(), dmg_out.size_bytes)
     };
@@ -7091,7 +7196,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
             ),
             Some(record) => {
                 let at = ctx.dist.join(crate::buildplan::linux::PIN_RECORD);
-                fs::write(&at, record.to_toml())
+                crate::durable::write_fresh(&at, record.to_toml())
                     .map_err(|e| Error::new(format!("write {}: {e}", at.display())))?;
                 println!(
                     "==> install.sh's bootstrap verifier pin for v{} is in {}, and the signed \
@@ -7226,7 +7331,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         (&dout.path, ctx.stable_dmg_path()),
         (&zout.path, ctx.stable_zip_path()),
     ] {
-        fs::copy(source, &twin).map_err(|e| {
+        crate::durable::copy_regular_fresh(source, &twin).map_err(|e| {
             Error::new(format!(
                 "copy {} -> {}: {e}",
                 source.display(),
@@ -7247,7 +7352,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
                 ))
             })?;
         provenance.push_str(&format!("update_pubkey_fingerprint_sha256={fingerprint}\n"));
-        fs::write(&provenance_path, provenance).map_err(|error| {
+        crate::durable::write_fresh(&provenance_path, provenance).map_err(|error| {
             Error::new(format!(
                 "write {} update-pin provenance: {error}",
                 provenance_path.display()
@@ -7295,7 +7400,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         ),
     ];
     for (path, sha, name) in sidecars {
-        fs::write(&path, channel::sha256_sidecar_contents(sha, &name))
+        crate::durable::write_fresh(&path, channel::sha256_sidecar_contents(sha, &name))
             .map_err(|e| Error::new(format!("write {}: {e}", path.display())))?;
     }
     step(
@@ -7306,8 +7411,8 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
     let cl_text = gates::read_bounded_string(&ctx.tree.join(changelog::CHANGELOG_FILE), 64 << 20)
         .map_err(|e| Error::new(format!("read {}: {e}", changelog::CHANGELOG_FILE)))?;
     let body = changelog::rolled_body(&cl_text, &ctx.notes_section)?;
-    fs::write(
-        ctx.notes_path(),
+    crate::durable::write_fresh(
+        &ctx.notes_path(),
         changelog::release_notes_document(&ctx.version, &body),
     )
     .map_err(|e| Error::new(format!("write {}: {e}", ctx.notes_path().display())))?;
@@ -7331,12 +7436,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         min_build: ctx.min_build,
         changelog: &body,
     };
-    let mpath = stage_manifest(
-        &ctx.dist,
-        &inputs,
-        ctx.attribution.as_ref(),
-        ctx.linux.as_ref(),
-    )?;
+    let mpath = stage_ctx_signing_inputs(ctx, &inputs, revalidate_ctx_signature_policy)?;
     crate::service_qualification::produce(
         &ctx.repo,
         &published,
@@ -7347,7 +7447,6 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         &ctx.commit,
         &mpath,
     )?;
-    stage_roster_assets(&ctx.dist, ctx.roster.as_ref())?;
     let sig_path = mpath.with_extension("toml.sig");
     match fs::remove_file(&sig_path) {
         Ok(()) => {}
@@ -7360,7 +7459,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         }
     }
     if ctx.signature_required {
-        let produced = sign_manifest_with_policy(ctx, &mpath)?;
+        let produced = sign_ctx_manifest(ctx, &mpath, revalidate_ctx_signature_policy)?;
         if produced != sig_path || !sig_path.is_file() {
             return Err(Error::new(
                 "signature-required build did not produce the exact manifest signature asset",
@@ -7583,7 +7682,7 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
         ),
     ] {
         if !twin.exists() {
-            fs::copy(&source, &twin).map_err(|e| {
+            crate::durable::copy_regular_fresh(&source, &twin).map_err(|e| {
                 Error::new(format!(
                     "self-check: copy {} -> {}: {e}",
                     source.display(),
@@ -7629,7 +7728,7 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
     for (path, sha, name) in sidecar_checks {
         let expected = channel::sha256_sidecar_contents(sha, name);
         if !path.exists() {
-            fs::write(&path, &expected)
+            crate::durable::write_fresh(&path, &expected)
                 .map_err(|e| Error::new(format!("self-check: write {}: {e}", path.display())))?;
         }
         let observed = gates::read_bounded_string(&path, 16 << 20)
@@ -7662,7 +7761,7 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         .output()
         .map_err(|e| Error::new(format!("spawn aterm --diagnose: {e}")))?;
     if diag.status.code().is_some() {
-        let _ = fs::write(staging.join(aterm_uds::deadline::RAN), "");
+        let _ = aterm_uds::deadline::try_mark_ran(&staging);
     }
     if !diag.status.success() {
         return Err(Error::new(format!(
@@ -9400,6 +9499,243 @@ mod roster_wiring_tests {
             journal: None,
             notes_section: "0.5.0".to_string(),
         }
+    }
+
+    #[cfg(unix)]
+    struct CurrentRosterCut {
+        home: aterm_tempfile::TempDir,
+        cut: CutCtx,
+        master_key: Vec<u8>,
+        master: String,
+        signer: String,
+        canonical: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl CurrentRosterCut {
+        fn new() -> Self {
+            let home = aterm_tempfile::tempdir().unwrap();
+            let (master_key, master) = atpkg_keys::generate().unwrap();
+            let (key, signer) = atpkg_keys::generate().unwrap();
+            let canonical = home.path().join(atpkg_keys::provision::RELEASE_ROSTER_REL);
+            let profile = home.path().join("credentials.toml");
+            let encoded = aterm_codec::base64::encode(&key).unwrap();
+            fs::write(
+                &profile,
+                format!(
+                    "signing_key = \"{encoded}\"\nmachine_roster = \"{}\"\n",
+                    canonical.display()
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let mut cut = ctx(Some("m3"));
+            cut.credentials =
+                Some(sign::ReleaseCredentials::load(&profile, Some(home.path())).unwrap());
+            cut.dist = home.path().join("unchanged");
+            cut.journal_path = cut.dist.join("cut-state.toml");
+            cut.manifest_signed = false;
+            let mut fixture = Self {
+                home,
+                cut,
+                master_key,
+                master,
+                signer,
+                canonical,
+            };
+            fixture.advance(3, false);
+            let observed = fixture.observe(RosterDuty::Sign);
+            fixture.cut.signature_required = observed.policy.required;
+            fixture.cut.signature_pubkey = observed.policy.pubkey.clone();
+            fixture.cut.signature_machine_id = observed.machine_id();
+            fixture.cut.attribution = observed.attribution;
+            fixture.cut.roster = observed.roster;
+            fixture
+        }
+
+        fn advance(&self, generation: u64, revoke_other: bool) {
+            let body = roster::Roster {
+                schema: 1,
+                roster_seq: generation,
+                valid_until: "9999-12-31T00:00:00Z".into(),
+                machines: vec![
+                    roster::Machine {
+                        id: "m3".into(),
+                        pubkey: self.signer.clone(),
+                        added_at: String::new(),
+                        not_after: None,
+                    },
+                    roster::Machine {
+                        id: "m11".into(),
+                        pubkey: aterm_codec::base64::encode(&[0x42; 32]).unwrap(),
+                        added_at: String::new(),
+                        not_after: None,
+                    },
+                ],
+                revoked: if revoke_other {
+                    vec!["m11".into()]
+                } else {
+                    Vec::new()
+                },
+            }
+            .to_toml()
+            .unwrap();
+            let signature = atpkg_keys::sign(&self.master_key, body.as_bytes()).unwrap();
+            crate::provision::publish_proven_pair(&self.canonical, body.as_bytes(), &signature)
+                .unwrap();
+        }
+
+        fn observe(&self, duty: RosterDuty) -> SigningVerdict {
+            signing_verdict(
+                self.cut.credentials.as_ref(),
+                &SigningAnchors {
+                    home: Some(self.home.path()),
+                    master_pubkeys: &[&self.master],
+                    identity_path: None,
+                    now_unix: 1_793_000_000,
+                    duty,
+                },
+            )
+            .unwrap()
+        }
+
+        fn stage(&self, observed: &SigningVerdict, duty: RosterDuty) -> Result<PathBuf> {
+            let inputs = manifest_out::ManifestInputs {
+                version: &self.cut.version,
+                build_number: self.cut.build,
+                commit: &self.cut.commit,
+                dmg_name: "aterm-0.5.0.dmg",
+                dmg_sha256: &"a".repeat(64),
+                zip_name: "aterm-0.5.0-mac.zip",
+                zip_sha256: &"b".repeat(64),
+                repo_slug: "owner/repo",
+                min_os: "11.0",
+                team_id: "",
+                pub_date: "2026-10-26T00:00:00Z",
+                min_build: None,
+                changelog: "fixture",
+            };
+            stage_ctx_signing_inputs(&self.cut, &inputs, |cut| {
+                revalidate_observed_signature_policy(cut, observed, duty)
+            })
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_roster_change_after_staging_refuses_signature_but_a_signed_cut_can_finish() {
+        let fixture = CurrentRosterCut::new();
+        let captured = fixture.observe(RosterDuty::Sign);
+        let manifest = fixture.stage(&captured, RosterDuty::Sign).unwrap();
+        fixture.advance(4, true);
+        let changed = fixture.observe(RosterDuty::Sign);
+        assert!(
+            sign_ctx_manifest(&fixture.cut, &manifest, |cut| {
+                revalidate_observed_signature_policy(cut, &changed, RosterDuty::Sign)
+            })
+            .is_err()
+        );
+        assert!(!manifest.with_extension("toml.sig").exists());
+
+        // A separate cut really signs before gaining the completed-receipt semantics.
+        let mut signed = CurrentRosterCut::new();
+        let current = signed.observe(RosterDuty::Sign);
+        let manifest = signed.stage(&current, RosterDuty::Sign).unwrap();
+        let signature = sign_ctx_manifest(&signed.cut, &manifest, |cut| {
+            revalidate_observed_signature_policy(cut, &current, RosterDuty::Sign)
+        })
+        .unwrap();
+        verify_detached_manifest_signature(
+            signed.cut.signature_pubkey.as_deref().unwrap(),
+            &fs::read(&manifest).unwrap(),
+            &fs::read(&signature).unwrap(),
+        )
+        .unwrap();
+        signed.cut.manifest_signed = true;
+        signed.cut.journal = Some(Journal {
+            format: JOURNAL_FORMAT,
+            version: signed.cut.version.clone(),
+            build_number: signed.cut.build,
+            commit: signed.cut.commit.clone(),
+            min_build: None,
+            artifact: signed.cut.artifact.clone(),
+            macho_sha256: signed.cut.macho_sha256.clone(),
+            linux: None,
+            manifest_signed: true,
+            signature_required: signed.cut.signature_required,
+            signature_pubkey: signed.cut.signature_pubkey.clone(),
+            verify_pubkey: signed.cut.verify_pubkey.clone(),
+            signature_machine_id: signed.cut.signature_machine_id.clone(),
+            release_id: None,
+            release_intent: false,
+            upload_intents: Vec::new(),
+            done: vec!["lock".into()],
+        });
+        signed.cut.mark("sign").unwrap();
+        signed.advance(4, true);
+        let duty = roster_duty(signed.cut.is_done("sign"));
+        assert_eq!(duty, RosterDuty::Finish);
+        let finish = signed.observe(duty);
+        assert!(finish.attribution.is_none());
+        assert!(finish.roster.is_none());
+        revalidate_observed_signature_policy(&signed.cut, &finish, duty).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_fresh_roster_for_the_same_signer_refuses_the_captured_context_before_staging() {
+        let mut fixture = CurrentRosterCut::new();
+        let unchanged = fixture.observe(RosterDuty::Sign);
+        let manifest = fixture.stage(&unchanged, RosterDuty::Sign).unwrap();
+        assert_eq!(
+            Manifest::parse(&fs::read_to_string(&manifest).unwrap())
+                .unwrap()
+                .roster_seq,
+            Some(3)
+        );
+        assert_eq!(
+            machines::RosterDocument::read(&fixture.cut.dist.join(roster::ROSTER_ASSET)).unwrap(),
+            fixture.cut.roster.clone().unwrap()
+        );
+        fixture.cut.dist = fixture.home.path().join("changed");
+        fixture.advance(4, true);
+        let fresh = fixture.observe(RosterDuty::Sign);
+        assert_eq!(fresh.policy.required, fixture.cut.signature_required);
+        assert_eq!(fresh.policy.pubkey, fixture.cut.signature_pubkey);
+        assert_eq!(fresh.machine_id(), fixture.cut.signature_machine_id);
+        assert_eq!(fresh.attribution.as_ref().unwrap().roster_seq, 4);
+        assert_eq!(fixture.cut.attribution.as_ref().unwrap().roster_seq, 3);
+        let result = fixture.stage(&fresh, RosterDuty::Sign);
+        if let Ok(path) = result.as_ref() {
+            assert_eq!(
+                Manifest::parse(&fs::read_to_string(path).unwrap())
+                    .unwrap()
+                    .roster_seq,
+                Some(3)
+            );
+            assert_eq!(
+                machines::RosterDocument::read(&fixture.cut.dist.join(roster::ROSTER_ASSET))
+                    .unwrap(),
+                fixture.cut.roster.clone().unwrap()
+            );
+        }
+        assert!(
+            result.is_err(),
+            "fresh authority must not admit a different captured roster"
+        );
+        assert!(!fixture.cut.manifest_path().exists());
+        assert!(!fixture.cut.dist.join(roster::ROSTER_ASSET).exists());
+        assert!(
+            !fixture
+                .cut
+                .manifest_path()
+                .with_extension("toml.sig")
+                .exists()
+        );
     }
 
     fn names(paths: &[PathBuf]) -> Vec<String> {

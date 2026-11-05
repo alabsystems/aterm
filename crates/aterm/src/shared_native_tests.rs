@@ -244,7 +244,7 @@ fn native_fleet_fixture(members: usize) -> (aterm_tempfile::TempDir, Vec<Paths>,
         db.issue(&admin, [n as u8 + 33; 16], request).unwrap();
     }
     let config = temp.path().join("aterm.toml");
-    std::fs::write(&config, "").unwrap();
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
     (temp, paths, config)
 }
 
@@ -303,7 +303,12 @@ fn native_policy_and_member_follow_real_successors_and_recheck_generation() {
             .binding(),
         &replacement
     );
-    let roster = client::swarm_roster(&selected).unwrap().unwrap();
+    let roster = client::swarm_roster_until(
+        &selected,
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    .unwrap();
     let expected_label = &roster
         .member_by_recipient(&replacement.recipient().to_bech32())
         .unwrap()
@@ -459,7 +464,7 @@ fn fixture(provider: Provider, intent: bool) -> (aterm_tempfile::TempDir, Approv
     .unwrap();
     client::admin_publish(&paths, &admin, &doc).unwrap();
     let config = home.join("aterm.toml");
-    std::fs::write(&config, "").unwrap();
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
     let expected = client::config(&paths).unwrap().unwrap();
     Proposals::at(paths.clone())
         .write(
@@ -1604,7 +1609,7 @@ fn native_launch_without_shared_selection_does_not_require_commons() {
     )
     .unwrap();
     let config = temp.path().join("aterm.toml");
-    std::fs::write(&config, "").unwrap();
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
     assert!(Bootstrap::required_until(&paths, deadline()).is_err());
     for provider in [Provider::Google, Provider::Meta] {
         assert!(!selected_launch(&paths, &config, provider, deadline()).unwrap());

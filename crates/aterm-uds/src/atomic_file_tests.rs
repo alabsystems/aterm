@@ -685,3 +685,72 @@ fn a_lock_refused_for_another_reason_is_not_waited_on() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn nofollow_modes_recover_unreadable_entries_harden_sockets_and_refuse_links() {
+    let scratch = Scratch::new("nofollow-modes");
+    let file = scratch.0.join("file");
+    std::fs::write(&file, b"untouched").unwrap();
+    let directory = scratch.0.join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    for (entry, mode) in [(&file, 0o600), (&directory, 0o700)] {
+        std::fs::set_permissions(entry, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = if entry == &directory {
+            crate::private_file::set_dir_mode_nofollow(entry, mode)
+        } else {
+            set_mode_nofollow(entry, mode)
+        };
+        let observed = std::fs::metadata(entry).unwrap().permissions().mode() & 0o7777;
+        std::fs::set_permissions(entry, std::fs::Permissions::from_mode(mode)).unwrap();
+        result.unwrap();
+        assert_eq!(observed, mode);
+        let link = scratch.0.join(format!("link-{mode:o}"));
+        std::os::unix::fs::symlink(entry, &link).unwrap();
+        assert!(set_mode_nofollow(&link, 0o777).is_err());
+        assert!(crate::private_file::set_dir_mode_nofollow(&link, 0o777).is_err());
+        assert_eq!(
+            std::fs::metadata(entry).unwrap().permissions().mode() & 0o7777,
+            mode
+        );
+    }
+    // Unix socket names have a much smaller cap than filesystem paths on macOS.
+    let sockets = aterm_tempfile::Builder::new()
+        .prefix("cm.")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = sockets.path().join("socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    set_mode_nofollow(&socket, 0o600).unwrap();
+    assert_eq!(
+        std::fs::metadata(&socket).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    assert!(crate::private_file::set_dir_mode_nofollow(&socket, 0o777).is_err());
+    assert_eq!(
+        std::fs::metadata(&socket).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    assert!(set_mode_nofollow(&scratch.0.join("absent"), 0o600).is_err());
+}
+
+#[test]
+fn chmod_replacement_link_never_changes_the_target() {
+    let scratch = Scratch::new("chmod-replacement");
+    let entry = scratch.0.join("entry");
+    let target = scratch.0.join("target");
+    std::fs::write(&entry, b"original").unwrap();
+    std::fs::write(&target, b"outside").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(std::fs::symlink_metadata(&entry).unwrap().is_file());
+    // This is precisely the state after the wrapper's metadata read and before
+    // its chmod: another writer exchanged the checked entry for a link.
+    std::fs::remove_file(&entry).unwrap();
+    std::os::unix::fs::symlink(&target, &entry).unwrap();
+    // Apple can chmod the link itself; Linux may refuse it. Neither may touch target.
+    let _ = chmod_entry_nofollow(&entry, 0o777);
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+        0o600,
+        "replacement link target changed"
+    );
+}

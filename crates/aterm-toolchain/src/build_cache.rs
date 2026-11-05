@@ -87,7 +87,7 @@ pub fn shim_root(home: &Path, path: &std::ffi::OsStr) -> PathBuf {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt as _;
-                options.custom_flags(libc::O_NONBLOCK);
+                options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
             }
             let file = options.open(shim).ok()?;
             let meta = file.metadata().ok()?;
@@ -722,7 +722,7 @@ pub fn read_config(path: &Path) -> Result<Option<String>, ()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = match options.open(path) {
         Ok(file) => file,
@@ -731,12 +731,15 @@ pub fn read_config(path: &Path) -> Result<Option<String>, ()> {
         Err(e) if e.raw_os_error() == Some(libc::ENXIO) => return Ok(None),
         Err(_) => return Err(()),
     };
-    match file.metadata() {
-        Ok(meta) if meta.is_file() => {}
+    let meta = match file.metadata() {
+        Ok(meta) if meta.is_file() => meta,
         Ok(_) => return Ok(None),
         Err(_) => return Err(()),
+    };
+    if meta.len() > MAX_CONFIG_BYTES {
+        return Err(());
     }
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(MAX_CONFIG_BYTES.saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(|_| ())?;

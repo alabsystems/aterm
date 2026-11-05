@@ -361,6 +361,9 @@ struct Mock {
     /// served: a glyph's cell unread on that screen alone.
     cell_unread_on: std::collections::BTreeSet<usize>,
     cells: BTreeMap<(usize, usize), String>,
+    /// The measured cells a `cell` read answers while the script's screen `i` is the one last
+    /// served, in place of [`Self::cells`].
+    cells_on: BTreeMap<usize, BTreeMap<(usize, usize), String>>,
     history_cells: BTreeMap<(usize, usize), String>,
     human_ms_reads: VecDeque<Option<u64>>,
     status_human_from: BTreeMap<usize, u64>,
@@ -1230,6 +1233,7 @@ impl Mock {
             cell_unreadable: false,
             cell_unread_on: std::collections::BTreeSet::new(),
             cells: BTreeMap::new(),
+            cells_on: BTreeMap::new(),
             history_cells: BTreeMap::new(),
             human_ms_reads: VecDeque::new(),
             status_human_from: BTreeMap::new(),
@@ -1567,15 +1571,17 @@ impl Mock {
     fn measured_cell(&self, tail: &[&str]) -> Option<String> {
         let [row, col] = tail else { return None };
         let col = col.parse().ok()?;
+        let shown = self.served.saturating_sub(1).min(self.screens.len() - 1);
+        let cells = self.cells_on.get(&shown).unwrap_or(&self.cells);
         let Some(abs) = row.strip_prefix("abs=") else {
-            return self.cells.get(&(row.parse().ok()?, col)).cloned();
+            return cells.get(&(row.parse().ok()?, col)).cloned();
         };
         let abs: usize = abs.parse().ok()?;
         let above = self.history().len();
         if abs < above {
             self.history_cells.get(&(abs, col)).cloned()
         } else {
-            self.cells.get(&(abs - above, col)).cloned()
+            cells.get(&(abs - above, col)).cloned()
         }
     }
 
@@ -1783,6 +1789,16 @@ impl Mock {
                 .is_some_and(|n| self.reads.len() >= n)
         {
             caret()
+        } else if crate::supervise::screen::cursor_under_composer(
+            &self.screens[i],
+            Some(10),
+            caret(),
+        ) {
+            // Row 10 stands for a cursor off the composer, a frame read before its program placed
+            // it. Under the composer's bottom rule it would be a history search's
+            // (`screen::cursor_under_composer`), so there it stands above the top rule, off the
+            // box as under it (`aterm_phase::phase::prompt_box_holds` vouches for neither).
+            caret().saturating_sub(2)
         } else {
             10
         };
@@ -4928,7 +4944,7 @@ impl Ctl for MarkFake {
 
 #[test]
 fn a_refused_act_mark_latches_the_rest_off() {
-    let first = "@s-1 mark - act word=approve rule=read-only.classify-v11";
+    let first = "@s-1 mark - act word=approve rule=read-only.classify-v12";
     for (err, latched) in [
         ("ERR unknown verb 'mark' (help lists them)", true),
         ("ERR usage: mark <node|-> <kind> [word=<w>] …", true),
@@ -4945,7 +4961,7 @@ fn a_refused_act_mark_latches_the_rest_off() {
         };
         let mut s = Session::new(&mut fake, Some("@s-1".to_string()));
         s.act_marks
-            .queue("act word=approve rule=read-only.classify-v11".to_string());
+            .queue("act word=approve rule=read-only.classify-v12".to_string());
         s.act_marks.queue("act word=escalate".to_string());
         s.send_act_marks();
         s.act_marks.queue("act word=deny rule=write.v1".to_string());
@@ -4997,7 +5013,7 @@ fn supervise_auto_approves_reads_guarded_and_hands_over_writes() {
             "@s-9 key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "@s-9 await seq 101 timeout 20000",
             "@s-9 text --json tail=40",
-            "@s-9 mark - act word=approve rule=read-only.classify-v11",
+            "@s-9 mark - act word=approve rule=read-only.classify-v12",
             "@s-9 await idle 500 timeout 1500",
             "@s-9 text --json tail=40",
             "@s-9 status",
@@ -5148,7 +5164,7 @@ fn the_same_box_is_never_pressed_twice_on_an_unchanged_screen() {
             "key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "await seq 101 timeout 20000",
             "text --json tail=40",
-            "mark - act word=approve rule=read-only.classify-v11",
+            "mark - act word=approve rule=read-only.classify-v12",
         ],
         "{:?}",
         m.requests
@@ -5886,6 +5902,77 @@ fn the_event_summary_joins_the_replys_wrapped_rows() {
     );
 }
 
+/// THE EVENT SUMMARY BESIDE THE SIDE PANEL IS THE AGENT'S WORDS UP TO ITS RULE: Claude Code
+/// 2.1.310 and later pad each row above the composer out to the panel's rule `│` and draw the
+/// panel's text after it, and the summary of a turn (the journal's `EVENT` line and the point's
+/// key, [`said_summary`]) is the last line the agent said, read on the screen's transcript
+/// ([`aterm_phase::phase::last_said_line`]): each row up to the rule, its wrap in the rule's room.
+/// Read whole before (KI-1101-3), it ended in the padding, the rule and the panel's text. On the
+/// three MEASURED panel captures, at their own width (146 columns) and with none; CONTROL: the
+/// same rows with no panel (each cut at its first `│`, the panel's rule in these captures) in a
+/// pane as wide as the rule's column read the same.
+#[test]
+fn the_event_summary_beside_the_side_panel_is_the_agents_words_up_to_its_rule() {
+    use aterm_phase::prompt::fixtures::{
+        INFERRING_OVER_BACKGROUND_2_1_316, WAITING_AGENTS_WORKFLOWS_2_1_316,
+        WAITING_WORKFLOWS_2_1_310, screen,
+    };
+    let no_panel = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .map(|row| {
+                row.split_once('│')
+                    .map_or(row.as_str(), |(left, _)| left.trim_end())
+                    .to_string()
+            })
+            .collect()
+    };
+    for (name, capture, said) in [
+        (
+            "2.1.310 waiting",
+            WAITING_WORKFLOWS_2_1_310,
+            Some("I'll keep going as each one reports."),
+        ),
+        (
+            "2.1.316 waiting",
+            WAITING_AGENTS_WORKFLOWS_2_1_316,
+            Some("NEEDS YOU: an xAI account for Grok on m21."),
+        ),
+        ("2.1.316 inferring", INFERRING_OVER_BACKGROUND_2_1_316, None),
+    ] {
+        let rows = screen(capture);
+        let rule = rows[0]
+            .split_once('│')
+            .expect("the panel's rule")
+            .0
+            .chars()
+            .count();
+        let turn = |rows: &[String], cols: Option<usize>| Turn {
+            phase: worker_phase(rows),
+            screen: Screen {
+                rows: rows.to_vec(),
+                seq: 7,
+                cols: cols.map(|c| u16::try_from(c).expect("a pane's width")),
+                ..Screen::default()
+            },
+            timed_out: false,
+        };
+        let width = rows.iter().map(|r| r.chars().count()).max();
+        for cols in [width, None] {
+            let event = event_line(&turn(&rows, cols), &[]);
+            assert!(!event.contains('│'), "{name}, {cols:?}: {event}");
+            if let Some(said) = said {
+                assert_eq!(
+                    event,
+                    format!("EVENT busy seq=7 {said}"),
+                    "{name}, {cols:?}"
+                );
+            }
+            let control = event_line(&turn(&no_panel(&rows), cols.map(|_| rule)), &[]);
+            assert_eq!(event, control, "the control: {name}, {cols:?}");
+        }
+    }
+}
+
 #[test]
 fn supervise_hands_a_limit_notice_over_like_idle() {
     let mut m = Mock::new(vec![busy_screen(), limited_screen()]);
@@ -6160,7 +6247,7 @@ fn nothing_happens_after_the_budget() {
     assert_eq!(m.requests.len(), 9, "nothing read after: {:?}", m.requests);
     assert_eq!(
         m.requests.last().map(String::as_str),
-        Some("mark - act word=approve rule=read-only.classify-v11")
+        Some("mark - act word=approve rule=read-only.classify-v12")
     );
 }
 
@@ -9021,14 +9108,14 @@ impl IdleHost for ProbeHost {
         &self,
         why: &super::super::policy::turn_end::Restart,
         _: &super::super::policy::turn_end::RestartAsk,
-    ) -> Option<String> {
-        use super::super::policy::turn_end::Restart;
+    ) -> Option<super::super::policy::turn_end::RestartAnswer> {
+        use super::super::policy::turn_end::{Restart, RestartAnswer};
         let what = match why {
             Restart::Account { to, .. } => format!("restart:{}:{to}", why.word()),
             other => format!("restart:{}", other.word()),
         };
         self.said.lock().unwrap().push(what);
-        self.answer.lock().unwrap().map(str::to_string)
+        self.answer.lock().unwrap().map(RestartAnswer::unread)
     }
     fn turn_ran(&self) {
         self.said.lock().unwrap().push("turn-ran".to_string());
@@ -9053,7 +9140,7 @@ impl IdleHost for ProbeHost {
         self.tail_asks.fetch_add(1, Ordering::SeqCst);
         self.tail.lock().unwrap().clone()
     }
-    fn account_probe(&self) -> Result<(), ProbeNo> {
+    fn account_probe(&self) -> Result<crate::harness::provider_read::Use, ProbeNo> {
         self.asks_at_claims
             .lock()
             .unwrap()
@@ -9069,7 +9156,15 @@ impl IdleHost for ProbeHost {
             "probe:declined"
         };
         self.said.lock().unwrap().push(word.to_string());
-        if *last { Ok(()) } else { Err(ProbeNo::NotDue) }
+        if *last {
+            Ok(crate::harness::provider_read::Use::fixture(
+                crate::harness::provider_read::Read::ClaudePanel,
+                Path::new("fixture"),
+                Some("fixture"),
+            ))
+        } else {
+            Err(ProbeNo::NotDue)
+        }
     }
     fn account_probed(&self, read: Result<&crate::harness::accounts::Sample, ProbeMiss>) {
         self.shared.tolds.fetch_add(1, Ordering::SeqCst);

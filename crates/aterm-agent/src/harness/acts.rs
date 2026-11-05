@@ -5,7 +5,7 @@
 
 use crate::supervise::approvals::Outcome;
 use crate::supervise::policy::approval::{
-    QuestionPriority, RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM, RULE_PLAN,
+    QuestionPriority, RULE_ANSWER_LAND, RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM, RULE_PLAN,
     RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM,
 };
 use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
@@ -249,6 +249,7 @@ pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
         RULE_ANSWER_RECOMMENDED
         | RULE_ANSWER_LONG_TERM
         | RULE_ANSWER_SHORT_TERM
+        | RULE_ANSWER_LAND
         | RULE_LAND_ANSWER
         | RULE_GO_AHEAD
         | RULE_ANSWER
@@ -460,6 +461,9 @@ pub struct LandHeld {
     /// session used (`RepoWork::sub_unpushed`, `RepoWork::parked`).
     pub sub_unpushed: u16,
     pub parked: u16,
+    /// The processes the session's agent started that still ran, unkept, at that yield
+    /// ([`HoldLeg::Left`]).
+    pub left: u16,
 }
 
 impl LandHeld {
@@ -492,6 +496,9 @@ pub enum HoldLeg {
     Repo,
     /// The repository probe could not read the repository: what it holds is unknown.
     Unread,
+    /// Processes the session's agent started still run, neither ended nor kept by a `keep
+    /// <token>` line under its defense (`aterm ctl @self sys left`).
+    Left,
     /// The agent's own answer to the land check listed what is left (`land-check@v1`).
     Open,
     /// No `Nothing left:` defense in the reply.
@@ -502,10 +509,11 @@ pub enum HoldLeg {
 
 impl HoldLeg {
     /// Every leg, in the order the owner can act on them.
-    pub const ALL: [HoldLeg; 6] = [
+    pub const ALL: [HoldLeg; 7] = [
         HoldLeg::Needs,
         HoldLeg::Repo,
         HoldLeg::Unread,
+        HoldLeg::Left,
         HoldLeg::Open,
         HoldLeg::Defense,
         HoldLeg::Cut,
@@ -521,6 +529,7 @@ impl HoldLeg {
             HoldLeg::Defense => 8,
             HoldLeg::Cut => 16,
             HoldLeg::Unread => 32,
+            HoldLeg::Left => 64,
         }
     }
 
@@ -534,6 +543,7 @@ impl HoldLeg {
             HoldLeg::Defense => "defense",
             HoldLeg::Cut => "cut",
             HoldLeg::Unread => "repo-unread",
+            HoldLeg::Left => "left",
         }
     }
 
@@ -545,14 +555,15 @@ impl HoldLeg {
 
     /// Its words where they name nothing the reply held, the same in every written form (the
     /// title, the state line, the hover and a row's tip); `None` for the legs whose words name
-    /// what the reply or the repository held (a need, the repository's counts, the open words).
+    /// what the reply, the repository or the processes held (a need, the repository's counts, the
+    /// open words, how many processes are left).
     #[must_use]
     pub const fn fixed_words(self) -> Option<&'static str> {
         match self {
             HoldLeg::Unread => Some("a repository that could not be read"),
             HoldLeg::Defense => Some("no \u{201c}Nothing left:\u{201d} defense yet"),
             HoldLeg::Cut => Some("a reply too tall to read whole"),
-            HoldLeg::Needs | HoldLeg::Repo | HoldLeg::Open => None,
+            HoldLeg::Needs | HoldLeg::Repo | HoldLeg::Open | HoldLeg::Left => None,
         }
     }
 }
@@ -584,6 +595,17 @@ pub fn held_tip(legs: &str, nudges: u32) -> String {
     match nudge_words(nudges) {
         Some(n) => format!("{NOT_LANDED_YET}: {legs}{FACT_SEPARATOR}{n}"),
         None => format!("{NOT_LANDED_YET}: {legs}"),
+    }
+}
+
+/// THE LEFT LEG'S WORDS ([`HoldLeg::Left`]), the same in every written form: how many processes
+/// the session's agent started that still run, neither ended nor kept (`1 process left running`,
+/// `3 processes left running`).
+#[must_use]
+pub fn left_words(left: u16) -> String {
+    match left {
+        1 => "1 process left running".to_owned(),
+        n => format!("{n} processes left running"),
     }
 }
 
@@ -783,15 +805,33 @@ mod tests {
     }
 
     /// `status land_held=` and `meta set harness_land legs=` read back to the leg each word
-    /// names, and no other word, nor a word in another case, names one.
+    /// names, and no other word, nor a word in another case, names one; each leg has a bit of its
+    /// own, the left leg 64.
     #[test]
     fn a_holds_leg_round_trips_its_word() {
         for leg in HoldLeg::ALL {
             assert_eq!(HoldLeg::of_word(leg.word()), Some(leg));
         }
-        for word in ["", "-", "unread", "REPO", "repo,open", "needs "] {
+        for word in [
+            "",
+            "-",
+            "unread",
+            "REPO",
+            "repo,open",
+            "needs ",
+            "LEFT",
+            "leftover",
+        ] {
             assert_eq!(HoldLeg::of_word(word), None, "{word:?}");
         }
+        assert_eq!((HoldLeg::Left.bit(), HoldLeg::Left.word()), (64, "left"));
+        let every = HoldLeg::ALL.iter().fold(0u16, |bits, leg| {
+            assert_eq!(bits & u16::from(leg.bit()), 0, "{leg:?} shares a bit");
+            bits | u16::from(leg.bit())
+        });
+        assert_eq!(every, 127);
+        assert_eq!(left_words(1), "1 process left running");
+        assert_eq!(left_words(3), "3 processes left running");
     }
 
     #[test]
@@ -1397,6 +1437,45 @@ mod tests {
                 "{act}: counted once"
             );
         }
+    }
+
+    /// LAND'S DIALOG ANSWER (`answer-land@v1`) IS AN ANSWER: its approved key lights Answered and
+    /// counts nothing, as every dialog key does; a self-claim of it is an answer counted once,
+    /// which starts no turn; its log mark is `act word=answer`. NEGATIVE CONTROL: the recommended
+    /// answer's rows sort as before. MUTANT: Land left out of `QuestionPriority::EVERY` in
+    /// `is_question_rule`.
+    #[test]
+    fn lands_dialog_answer_sorts_as_an_answer() {
+        let land = "answer-land@v1";
+        assert_eq!(land, RULE_ANSWER_LAND);
+        for rule in [land, RULE_ANSWER_RECOMMENDED] {
+            assert_eq!(
+                sort(rule, Outcome::Approved, ""),
+                Sorted {
+                    act: Some(Act::Answered),
+                    counter: None,
+                },
+                "{rule}"
+            );
+            assert_eq!(
+                self_claim_sort(rule),
+                Sorted {
+                    act: Some(Act::Answered),
+                    counter: Some(Counter::Answered),
+                },
+                "{rule}"
+            );
+            assert_eq!(
+                self_claim_act(rule).map(|(w, _)| w),
+                Some("answer"),
+                "{rule}"
+            );
+            assert!(!self_claim_types_turn(rule), "{rule}");
+        }
+        assert_eq!(
+            log_mark(land, Outcome::Approved, "").as_deref(),
+            Some("act word=answer rule=answer-land.v1")
+        );
     }
 
     /// A HOLDER'S NAME DROPS ONLY THE PID ITS PROOF NAMES. NEGATIVE CONTROL: a suffix that is

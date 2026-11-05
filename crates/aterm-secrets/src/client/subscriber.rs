@@ -82,6 +82,7 @@ mod tests {
             &paths,
             &Config {
                 source: Source::Url("https://example.invalid/vault".into()),
+                mirrors: Vec::new(),
                 name: crate::ALAB_VAULT.into(),
                 signer: Some(signer.try_into().unwrap()),
                 followed: Vec::new(),

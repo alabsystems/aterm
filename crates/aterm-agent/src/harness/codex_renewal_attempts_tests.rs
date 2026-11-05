@@ -27,6 +27,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
         image: image.clone(),
     };
     let command = RestartCommand {
+        account_intent: None,
         image: image.clone(),
         program: "/fixture/codex".into(),
         argv: vec!["resume".into(), "original-thread".into()],
@@ -58,6 +59,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
             launcher: image,
             socket: "/fixture/control.sock".into(),
             forward: Box::new(command),
+            cold: None,
             rollback: None,
         },
     };

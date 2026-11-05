@@ -6,73 +6,27 @@ use crate::age::Identity;
 use crate::commons::binding::Request;
 use crate::membership_log::{Draft, Entrant, Inserted, Log, MAX_WEIGHED_RECORDS};
 
+/// What a weighing holds of its relations.
 struct Sample {
-    records: usize,
     extracted: usize,
     apart: usize,
-    accepted: usize,
     undoes: usize,
     strips: usize,
-    pair_slots: usize,
-    relation_key_bytes: usize,
-    grounded_edge_slots: usize,
-    grounded_row_header_bytes: usize,
     packed_row_bytes: usize,
-    packed_metadata_bytes: usize,
     packed_rows: usize,
 }
 
-impl std::fmt::Debug for Sample {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Sample")
-            .field("records", &self.records)
-            .field("extracted", &self.extracted)
-            .field("apart", &self.apart)
-            .field("accepted", &self.accepted)
-            .field("undoes", &self.undoes)
-            .field("strips", &self.strips)
-            .field("pair_slots", &self.pair_slots)
-            .field("relation_key_bytes", &self.relation_key_bytes)
-            .field("grounded_edge_slots", &self.grounded_edge_slots)
-            .field("grounded_row_header_bytes", &self.grounded_row_header_bytes)
-            .field("packed_row_bytes", &self.packed_row_bytes)
-            .field("packed_metadata_bytes", &self.packed_metadata_bytes)
-            .field("packed_rows", &self.packed_rows)
-            .finish()
-    }
-}
-
 fn sample(log: &Log) -> Sample {
-    let records = &log.order;
     let graph = Graph::new(log.history());
     let candidates = graph.candidates();
-    let (accepted, apart, relations) =
+    let (_, apart, relations) =
         graph.weigh_all(&candidates, &mut Memo::new(), &mut graph.scratch());
-    let undoes: BTreeSet<_> = relations.undoes_pairs().collect();
-    let strips: BTreeSet<_> = relations.strips_pairs().collect();
-    let defeats = undoes
-        .iter()
-        .filter(|&&(one, other)| {
-            !undoes.contains(&(other, one))
-                || strips.contains(&(one, other)) && !strips.contains(&(other, one))
-        })
-        .count();
     Sample {
-        records: records.len(),
         extracted: candidates.len(),
         apart: apart.weighed.len(),
-        accepted: accepted.len(),
-        undoes: undoes.len(),
-        strips: strips.len(),
-        pair_slots: apart.weighed.len() * apart.weighed.len().saturating_sub(1),
-        // Logical old BTreeSet key payload for comparison; node/allocator overhead is additional.
-        relation_key_bytes: (undoes.len() + strips.len()) * std::mem::size_of::<(usize, usize)>(),
-        // Logical old-grounder payload for comparison, not an allocation in this implementation.
-        grounded_edge_slots: defeats,
-        grounded_row_header_bytes: apart.weighed.len() * std::mem::size_of::<Vec<usize>>(),
+        undoes: relations.undoes_pairs().count(),
+        strips: relations.strips_pairs().count(),
         packed_row_bytes: relations.payload_bytes(),
-        packed_metadata_bytes: relations.metadata_bytes(),
         packed_rows: relations.allocated_rows(),
     }
 }
@@ -99,6 +53,12 @@ fn founder(tag: u8) -> (MemberId, Entrant) {
     )
 }
 
+/// A log at the weighed record bound, each quorum candidate a signed group, weighs every one of
+/// them. THE GAP: its pins on the packed relations read a shape that weighs one group apart and
+/// has no relation, so they say only that nothing is allocated for none. How wide a row packs and
+/// what the budget refuses is `relations::tests`' (the maximum layout's exact size, its rows
+/// allocated where a bit landed): no log here counts its rows against the budget, and nor does
+/// the §4.2 flood, whose 256 candidates have no relation either.
 #[test]
 fn signed_candidate_groups_reach_the_record_bound() {
     const K: usize = 2_047;
@@ -141,26 +101,10 @@ fn signed_candidate_groups_reach_the_record_bound() {
     assert_eq!(log.waiting(), 0);
     let measured = sample(&log);
     assert_eq!(measured.extracted, K);
-    eprintln!("RELATION_BASELINE signed_bound {measured:?}");
-}
-
-#[test]
-fn real_weigh_corpus_reports_extraction_and_relation_density() {
-    for (name, log) in crate::membership_log::tests::weigh::relation_baseline_corpus() {
-        let measured = sample(&log);
-        assert!(measured.accepted <= measured.apart);
-        assert!(measured.apart <= measured.extracted);
-        assert!(measured.undoes <= measured.pair_slots);
-        assert!(measured.strips <= measured.pair_slots);
-        assert_eq!(measured.records, log.held_count());
-        assert!(measured.grounded_edge_slots <= measured.undoes);
-        assert!(measured.packed_row_bytes <= 1024 * 1024);
-        assert!(measured.packed_rows <= 2 * measured.apart);
-        if measured.undoes + measured.strips == 0 {
-            assert_eq!(measured.packed_row_bytes, 0);
-            assert_eq!(measured.packed_rows, 0);
-        }
-        assert!(measured.packed_metadata_bytes >= measured.apart * std::mem::size_of::<usize>());
-        eprintln!("RELATION_BASELINE {name} {measured:?}");
+    assert!(measured.packed_row_bytes <= 1024 * 1024);
+    assert!(measured.packed_rows <= 2 * measured.apart);
+    if measured.undoes + measured.strips == 0 {
+        assert_eq!(measured.packed_row_bytes, 0);
+        assert_eq!(measured.packed_rows, 0);
     }
 }

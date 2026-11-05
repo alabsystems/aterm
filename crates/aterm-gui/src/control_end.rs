@@ -19,6 +19,7 @@ use aterm_uds::process::{EndControl, EndRefusal, Identity, ProcessPresence, end_
 use aterm_vitals::left::{LeftRow, LeftView, Proof, Source, State, Tier, Why};
 
 use crate::message_reporters::{EndOutcome, end_record};
+use crate::vitals_left::Reread;
 
 /// The most tokens one request names.
 pub(crate) const MAX_TOKENS: usize = 16;
@@ -357,7 +358,7 @@ fn fresh_context_with(
             .ok()
             .filter(|pid| *pid > 0)?;
         let uniqueid = shell(handle.shell_identity);
-        let agent_since = offered
+        let agent_spans = offered
             .live
             .iter()
             .find(|old| {
@@ -367,14 +368,15 @@ fn fresh_context_with(
                     && uniqueid.is_some()
                     && old.shell_uniqueid == uniqueid
             })
-            .and_then(|old| old.agent_since);
+            .map(|old| old.agent_spans.clone())
+            .unwrap_or_default();
         live.push(aterm_vitals::left::LiveTab {
             key: handle.local_id,
             sid: handle.sid.as_str().to_owned(),
             shell_pid,
             shell_uniqueid: uniqueid,
             fg_pgid: Some(foreground(handle)?),
-            agent_since,
+            agent_spans,
         });
     }
     same_roster(store, &handles).then_some((handles, live, closed))
@@ -397,21 +399,30 @@ fn same_roster(
         })
 }
 
-type CandidateRead<'a> = dyn Fn(&[aterm_vitals::left::LiveTab], &[aterm_vitals::left::ClosedTab]) -> Option<LeftView>
-    + 'a;
+type CandidateRead<'a> =
+    dyn Fn(&[aterm_vitals::left::LiveTab], &[aterm_vitals::left::ClosedTab]) -> Reread + 'a;
 
 /// Bracket expensive process/record reads with the host's current shell and foreground
-/// context. A roster check alone misses a foreground handoff on the same live PTY. Any
-/// context change refuses this signal; every capture and read releases its guards first.
+/// context. A roster check alone misses a foreground handoff on the same live PTY. A context
+/// that could not be captured, or that changed, makes the read [`Reread::Unread`], which refuses
+/// a signal; every capture and read releases its guards first.
 fn reread_current(
     store: &crate::session_store::Store,
     capture: &dyn Fn() -> Option<HostContext>,
     read: &CandidateRead<'_>,
-) -> Option<LeftView> {
-    let (handles, live, closed) = capture()?;
-    let fresh = read(&live, &closed)?;
-    let (_, after_live, after_closed) = capture()?;
-    (live == after_live && closed == after_closed && same_roster(store, &handles)).then_some(fresh)
+) -> Reread {
+    let Some((handles, live, closed)) = capture() else {
+        return Reread::Unread;
+    };
+    let fresh = read(&live, &closed);
+    let Some((_, after_live, after_closed)) = capture() else {
+        return Reread::Unread;
+    };
+    if live == after_live && closed == after_closed && same_roster(store, &handles) {
+        fresh
+    } else {
+        Reread::Unread
+    }
 }
 
 /// Answers `end <token>…` for `caller` in `w`: every token parsed and gated before any signal,
@@ -506,6 +517,7 @@ pub(crate) fn cmd_end(
                 )
             },
         )
+        .view()
     };
     let mut post = |record: Message| {
         let _ = proxy.send_event(crate::Wake::Record(record));
@@ -526,6 +538,82 @@ pub(crate) fn cmd_end(
             hung_up: &super::caller_hung_up,
         },
     )
+}
+
+/// THE AGENT'S LEFT ROWS OF SESSION `sid` AT A YIELD (the harness's `IdleHost::leftover`, read
+/// where the repository is): of `view`, the rows [`aterm_vitals::left::agents_left_read`] gives
+/// `sid` (the ones `status left=` counts), each re-proved as `end` re-proves a row before its
+/// signal ([`proved`]: the same token, a tier an end takes, the same source and, unless C-tree
+/// vouches for it on both readings, the same executable) on `reread`'s fresh read and judgment of
+/// its one pid, and still `sid`'s agent's there. A row that does not re-prove holds nothing: a
+/// moved identity is another process, and a lost one is gone or no longer the agent's. No view, a
+/// partial one (which can say a row is left but never that none is), or a row whose read could
+/// not be made ([`Reread::Unread`]: whether it still runs is unknown) is unchecked.
+pub(crate) fn left_at_yield(
+    view: Option<&LeftView>,
+    sid: &str,
+    reread: &dyn Fn(u32) -> Reread,
+) -> aterm_agent::harness::leftover::LeftRead {
+    use aterm_agent::harness::leftover::{LeftRead, token_of};
+    let Some(rows) = view.and_then(|view| aterm_vitals::left::agents_left_read(view, sid)) else {
+        return LeftRead::Unchecked;
+    };
+    let mut held = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(token) = row.token.as_deref().and_then(token_of) else {
+            continue;
+        };
+        let fresh = match reread(row.pid) {
+            Reread::Unread => return LeftRead::Unchecked,
+            Reread::Read(None) => continue,
+            Reread::Read(Some(fresh)) => fresh,
+        };
+        let again = aterm_vitals::left::agents_left(&fresh, sid)
+            .into_iter()
+            .find(|r| r.pid == row.pid);
+        if proved(row, again) == Proved::Holds {
+            held.push(token);
+        }
+    }
+    LeftRead::Rows(held)
+}
+
+/// THE LEFT VIEW A YIELD READS of what `SYS.fresh` answered: only a fresh snapshot's
+/// ([`aterm_vitals::sys::Freshness::Fresh`]). A stale one (the sampler did not refresh it in time,
+/// or stopped) or a warming one predates any row born since, so it says nothing of the yield.
+fn fresh_left(
+    (held, freshness): (Option<crate::sys_host::Held>, aterm_vitals::sys::Freshness),
+) -> Option<Arc<LeftView>> {
+    held.filter(|_| freshness == aterm_vitals::sys::Freshness::Fresh)
+        .and_then(|held| held.snap.left.clone())
+}
+
+/// [`left_at_yield`] live for session `sid`: the view as fresh as `sys left`'s default asks
+/// (pulled when older; none unless fresh, [`fresh_left`]), each row re-proved on a fresh read of
+/// its one pid against the host's freshly captured tabs ([`reread_current`], [`fresh_context`]),
+/// as [`cmd_end`] re-proves each before a signal. It ends nothing.
+pub(crate) fn agents_left_now(
+    store: &crate::session_store::Store,
+    sid: &str,
+) -> aterm_agent::harness::leftover::LeftRead {
+    let readers = crate::vitals_left::LeftReaders::kernel();
+    let fresh =
+        aterm_vitals::sys::SysQuery::parse("left").map_or(2_000, |q| q.freshness_default_ms());
+    let Some(view) = fresh_left(crate::sys_host::SYS.fresh(Duration::from_millis(fresh), false))
+    else {
+        return aterm_agent::harness::leftover::LeftRead::Unchecked;
+    };
+    let now_ms = aterm_time::unix_millis().unwrap_or(0);
+    let reread = |pid: u32| {
+        reread_current(
+            store,
+            &|| fresh_context(store, &view, &readers),
+            &|live, closed| {
+                crate::vitals_left::reread(&readers, live, closed, std::process::id(), pid, now_ms)
+            },
+        )
+    };
+    left_at_yield(Some(&view), sid, &reread)
 }
 
 #[cfg(test)]

@@ -34,8 +34,17 @@ fn fill_file(lines: u64) -> Result<PathBuf, String> {
     if !path.is_file() {
         eprintln!("generating the {lines}-line fill corpus");
         let part = path.with_extension("part");
+        let _ = std::fs::remove_file(&part);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
         let mut f = std::io::BufWriter::new(
-            std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?,
+            opts.open(&part)
+                .map_err(|e| format!("{}: {e}", part.display()))?,
         );
         for n in 0..lines {
             f.write_all(fill_line(n).as_bytes())
@@ -148,10 +157,10 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
         private(d)?;
     }
-    std::fs::write(config.join("aterm/aterm.toml"), self::config())
+    crate::write_fresh(config.join("aterm/aterm.toml"), self::config())
         .map_err(|e| format!("could not write the config: {e}"))?;
     let sock = sockets.sock("scroll.sock")?;
-    let log = std::fs::File::create(root.join("gui.log")).map_err(|e| format!("log: {e}"))?;
+    let log = crate::create_stdio_file(root.join("gui.log")).map_err(|e| format!("log: {e}"))?;
     let log_err = log.try_clone().map_err(|e| format!("log: {e}"))?;
     let mut cmd = command(&aterm.bin);
     in_scratch_world(&mut cmd, &home)?

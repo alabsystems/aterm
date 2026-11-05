@@ -316,6 +316,52 @@ fn a_foreground_server_never_lifts_the_persons_off() {
     );
 }
 
+/// A private aterm (this Cargo test binary) neither listens on nor dials the person's toolset
+/// port at any address, however a listen or a peer names it: each is refused before a socket is
+/// made, and a port of the test's own is bound and dialed as before. A rule that let the port
+/// through reaches no socket of the person's here either: each listen names a store not made
+/// yet, which `open` turns away before its bind, and each dial goes through a `dial` that makes
+/// no socket.
+///
+/// NEGATIVE CONTROL (2026-11-04): with `open` or `connect_by` asking no rule, the shape before, or
+/// a rule that holds the fleet's port alone, a listen fails `NotFound` (no store), a dial reaches
+/// the panicking `dial`, and this fails without a sandbox.
+#[test]
+fn a_test_binary_listens_on_and_dials_no_default_port_and_its_own_as_before() {
+    let absent = crate::testdir::absent_layout("atpkg-peers-persons-port-");
+    let refused = |e: io::Error| assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+    for at in ["127.0.0.1", "[::1]", "0.0.0.0"] {
+        let at: SocketAddr = format!("{at}:{DEFAULT_PORT}").parse().unwrap();
+        refused(open(&absent, at).expect_err("a listen on the person's port"));
+        let served = serve(&absent, at, |bound| {
+            panic!("a private aterm served {bound}")
+        });
+        refused(served.expect_err("a foreground server on the person's port"));
+    }
+    let named: Vec<String> = ["127.0.0.1", "[::1]", "localhost"]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let peers = configured(&named);
+    assert_eq!(peers.len(), named.len(), "each peer is dialed: {peers:?}");
+    for peer in peers {
+        let dialed = connect_by(&peer, None, |addr| panic!("a private aterm dialed {addr}"));
+        let Err(dialed) = dialed else {
+            panic!("a private aterm reached {peer}")
+        };
+        refused(dialed);
+    }
+
+    let layout = crate::testdir::layout("atpkg-peers-own-port-");
+    let own = open(&layout, SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("the control: a port of its own");
+    let at = own.local_addr().unwrap();
+    assert!(
+        connect(&at.to_string(), None).is_ok(),
+        "the control: {at} is dialed"
+    );
+}
+
 #[test]
 fn the_status_read_says_where_serving_stands_as_the_doctor_does_from_the_two_records() {
     let layout = crate::testdir::layout("atpkg-peers-status-");
@@ -721,7 +767,7 @@ fn a_client_that_trickles_its_request_holds_no_server_slot() {
     };
     let (done, ended) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = done.send(answer(&conn, &dir, &pace).map_err(|e| e.kind()));
+        let _ = done.send(answer(&conn, Some(&dir), &pace).map_err(|e| e.kind()));
     });
     let began = std::time::Instant::now();
     let request = format!("GET /unit/{} HTTP/1.1\r\n", "0".repeat(64)).into_bytes();
@@ -899,4 +945,96 @@ fn turn_off_never_follows_symlinked_store_programs_or_units() {
         "outside target untouched"
     );
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// Where this test's mesh `Units` dialer opens its stream ([`set_units_dialer`]).
+static MESH_UNITS: Mutex<Option<(IpAddr, SocketAddr)>> = Mutex::new(None);
+
+/// A dialer that opens a `Units` stream to the member at `ip` where the test named one: a plain
+/// socket stands for the mesh's stream, which atpkg sees only as a [`UnitConn`].
+fn mesh_units(ip: IpAddr) -> Option<Box<dyn UnitConn>> {
+    let (member, at) = (*MESH_UNITS.lock().unwrap())?;
+    (member == ip).then(|| Box::new(TcpStream::connect(at).unwrap()) as Box<dyn UnitConn>)
+}
+
+#[test]
+fn a_download_takes_a_unit_over_the_mesh_units_stream_first_and_port_7487_after() {
+    let layout = crate::testdir::layout("atpkg-peers-units-op-");
+    let unit = b"the signed toolset archive, over Units".to_vec();
+    let (build, dl) = staged(&layout, 7, &unit);
+    let sha = sha256_hex(&unit);
+    as_if_serving(&layout);
+    keep_with_free(&layout, &dl, &sha, &build, ROOM);
+    // The member's `Units` op: each stream answered by `answer_unit`, as the node service does.
+    let stream_end = TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = stream_end.local_addr().unwrap();
+    let served = std::thread::spawn({
+        let layout = layout.clone();
+        move || {
+            let (conn, _) = stream_end.accept().unwrap();
+            answer_unit(&conn, &layout).unwrap();
+        }
+    });
+    // The member's port 7487 takes no connection: only the stream can land the unit.
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = closed.local_addr().unwrap().to_string();
+    drop(closed);
+    *MESH_UNITS.lock().unwrap() = Some((IpAddr::from([127, 0, 0, 1]), at));
+    let dest = layout.prefix.join("got.tar.zst");
+    let got = with_units_dialer(mesh_units, || {
+        race_paced(
+            std::slice::from_ref(&dead),
+            &sha,
+            unit.len() as u64,
+            &dest,
+            release_host(b"never written", until_stopped),
+            &ANSWERS,
+        )
+    });
+    assert_eq!(got, Ok(()));
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        unit,
+        "served over the Units stream"
+    );
+    served.join().unwrap();
+
+    // A member with no stream to give (`None`) is dialed at its port, the fallback.
+    *MESH_UNITS.lock().unwrap() = None;
+    let (peer, judged) = one_shot_peer(unit.clone());
+    let fallback = layout.prefix.join("fallback.tar.zst");
+    let got = with_units_dialer(mesh_units, || {
+        race_paced(
+            std::slice::from_ref(&peer),
+            &sha,
+            unit.len() as u64,
+            &fallback,
+            release_host(b"never written", until_stopped),
+            &ANSWERS,
+        )
+    });
+    assert_eq!(got, Ok(()));
+    assert_eq!(
+        std::fs::read(&fallback).unwrap(),
+        unit,
+        "served from port 7487's stand-in"
+    );
+    judged.recv_timeout(HANG).unwrap();
+}
+
+#[test]
+fn a_store_whose_person_turned_sharing_off_answers_no_units_stream() {
+    let layout = crate::testdir::layout("atpkg-peers-units-off-");
+    as_if_serving(&layout);
+    turn_off(&layout).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    client.set_read_timeout(Some(HANG)).unwrap();
+    let (conn, _) = listener.accept().unwrap();
+    write!(client, "GET /unit/{} HTTP/1.1\r\n\r\n", "0".repeat(64)).unwrap();
+    answer_unit(&conn, &layout).unwrap();
+    drop(conn);
+    let mut answer = String::new();
+    client.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 404"), "{answer:?}");
 }

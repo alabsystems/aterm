@@ -17,13 +17,15 @@
 //!
 //! ```text
 //! grant := [ ("rw" | "ro") { "," field } ":" ] <filter>
-//! field := "p=" <principal> | "exp=" <unix-ms>     each at most once, either order
+//! field := "p=" <principal> | "exp=" <unix-ms> | "relay"     each at most once, any order
 //!   /f/F/pub/>            read-write, unbound, never expires (the bare-filter form)
 //!   ro:/f/F/fleet/>       read-only: subscribe/fetch, never publish or commit
 //!   rw,p=n-a1b2c3d4:/f/F/in/*/*/n-a1b2c3d4/*
 //!                         read-write, and only as producer_id_of("n-a1b2c3d4")
 //!   rw,exp=1700000000000:/f/lab/>
 //!                         read-write until that instant, and nothing from it on
+//!   rw,relay,p=n-a1b2c3d4:/m/>
+//!                         only carry other nodes' records, each under its origin's id
 //! ```
 //!
 //! The prefix is unambiguous *because* [`Filter::new`] rejects any string without
@@ -182,6 +184,11 @@ pub struct Grant {
     /// field existed, and the deliberate shape for a fleet root an operator
     /// rotates by changing the secret.
     pub expires_at: Option<u64>,
+    /// A RELAY grant (`relay`): it authorizes the broker's `Relay` verb and no other write. Its
+    /// bearer carries records under their origin's producer id, and only where a subject's
+    /// owner segment names that origin ([`relay_owner`], [`grants_relay`]). Any `p=` names who
+    /// carries them, never whose they are.
+    pub relay: bool,
 }
 
 impl Grant {
@@ -193,7 +200,7 @@ impl Grant {
     /// no field value may contain one, and a filter that does is only ever
     /// reached after the prefix has been consumed.
     ///
-    /// The fields are `p=<principal>`, `exp=<unix-ms>`, and `via=<hex-parent-grant>`
+    /// The fields are `p=<principal>`, `exp=<unix-ms>`, `relay`, and `via=<hex-parent-grant>`
     /// (for offline-attenuated Macaroon capabilities), each at most once and in any
     /// order. A REPEATED field is refused rather than last-wins: two `exp=` values
     /// in one string is not a grant whose meaning anyone should have to guess, and
@@ -275,6 +282,7 @@ fn parse_single_grant(
             principal: None,
             filter: grant.to_string(),
             expires_at: None,
+            relay: false,
         };
         return Ok((g, f, None));
     }
@@ -289,8 +297,16 @@ fn parse_single_grant(
     let mut principal: Option<String> = None;
     let mut expires_at: Option<u64> = None;
     let mut via_parent: Option<String> = None;
+    let mut relay = false;
     for field in fields {
-        if let Some(p) = field.strip_prefix("p=") {
+        if field == "relay" {
+            if relay {
+                return Err(format!(
+                    "invalid grant prefix {prefix:?}: repeated \"relay\""
+                ));
+            }
+            relay = true;
+        } else if let Some(p) = field.strip_prefix("p=") {
             if principal.is_some() {
                 return Err(format!("invalid grant prefix {prefix:?}: repeated \"p=\""));
             }
@@ -342,7 +358,7 @@ fn parse_single_grant(
         } else {
             return Err(format!(
                 "invalid grant prefix {prefix:?}: expected \",p=<principal>\", \
-                 \",exp=<unix-ms>\", or \",via=<hex>\""
+                 \",exp=<unix-ms>\", \",relay\", or \",via=<hex>\""
             ));
         }
     }
@@ -355,6 +371,11 @@ fn parse_single_grant(
             ))
         }
     };
+    if relay && mode != Mode::ReadWrite {
+        return Err(format!(
+            "invalid grant prefix {prefix:?}: \"relay\" writes, so it needs \"rw\""
+        ));
+    }
     let f = match Filter::new(filter) {
         Ok(f) => f,
         Err(e) => return Err(format!("invalid filter: {e}")),
@@ -364,6 +385,7 @@ fn parse_single_grant(
         principal,
         filter: filter.to_string(),
         expires_at,
+        relay,
     };
     Ok((g, f, via_parent))
 }
@@ -1013,13 +1035,101 @@ fn authentic_grant(secret: &[u8], cap: &Capability, now_ms: u64) -> Option<(Gran
 /// The one place the write half of the §8.2 matrix is decided.
 fn rw_matches(secret: &[u8], cap: &Capability, subject: &str, now_ms: u64) -> Option<Grant> {
     let (grant, filter) = authentic_grant(secret, cap, now_ms)?;
-    if grant.mode != Mode::ReadWrite {
+    // A relay grant writes through [`grants_relay`] alone: not a publish, a commit or a will.
+    if grant.mode != Mode::ReadWrite || grant.relay {
         return None;
     }
     match Subject::new(subject) {
         Ok(s) if filter.matches(&s) => Some(grant),
         _ => None,
     }
+}
+
+/// The node that owns `subject`: the segment that says whose record it is, on the subject shapes
+/// that replicate between machines. `None` for every other subject, which no relay carries:
+///
+/// ```text
+/// /t/<table>/<n-node>[/…]             a node's rows of a table
+/// /m/<n-node>[/…]                     a node's metrics
+/// /f/<fleet>/pub/<n-node>[/…]         a node's presence and its sessions' topics
+/// /f/<fleet>/cur/<n-node>[/…]         a node's cursors
+/// /f/<fleet>/halt/<n-node>[/…]        a node's halts
+/// /f/<fleet>/in/<class>/<to>/<n-node>/<kind>   mail, owned by its sender
+/// ```
+///
+/// An owner is a node because a relayed record is signed by its node's key, whose
+/// `identity_principal` is this segment. A person has no such key, so a person's subjects travel
+/// under a node's, or by a mirror.
+#[must_use]
+pub fn relay_owner(subject: &str) -> Option<&str> {
+    let mut segs = subject.strip_prefix('/')?.split('/');
+    let owner = match segs.next()? {
+        "t" => {
+            segs.next()?;
+            segs.next()?
+        }
+        "m" => segs.next()?,
+        "f" => {
+            segs.next()?;
+            match segs.next()? {
+                "pub" | "cur" | "halt" => segs.next()?,
+                "in" => {
+                    segs.next()?;
+                    segs.next()?;
+                    let src = segs.next()?;
+                    segs.next()?;
+                    if segs.next().is_some() {
+                        return None;
+                    }
+                    src
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if owner.starts_with("n-") && valid_principal(owner) {
+        Some(owner)
+    } else {
+        None
+    }
+}
+
+/// The producer id a record of `subject` must carry to be relayed: its owner's
+/// ([`relay_owner`]).
+#[must_use]
+pub fn relay_producer_of(subject: &str) -> Option<u64> {
+    relay_owner(subject).map(producer_id_of)
+}
+
+/// Whether `cap` authorizes carrying a record of `subject` under `producer_id`: it is genuine,
+/// read-write, a relay grant or unbound (the god cap holds every write), its filter matches the
+/// subject, and the id is the subject's owner's ([`relay_producer_of`]). So a relay can write
+/// under an origin's id only where a subject names that origin. It is an authorization of the
+/// carrier, not a proof of the origin: the broker also checks each record against the origin's
+/// own signature before it appends it.
+#[must_use]
+pub fn grants_relay(
+    secret: &[u8],
+    cap: &Capability,
+    subject: &str,
+    producer_id: u64,
+    now_ms: u64,
+) -> bool {
+    let Some((grant, filter)) = authentic_grant(secret, cap, now_ms) else {
+        return false;
+    };
+    if grant.mode != Mode::ReadWrite || (!grant.relay && grant.principal.is_some()) {
+        return false;
+    }
+    let Ok(s) = Subject::new(subject) else {
+        return false;
+    };
+    filter.matches(&s)
+        && match relay_producer_of(subject) {
+            Some(owner_id) => producer_id_matches(owner_id, producer_id),
+            None => false,
+        }
 }
 
 /// Whether `cap` (verified under `secret`) authorizes `subject` for a WRITE — it is
@@ -1096,6 +1206,19 @@ fn check_attenuation_parsed(
             "cannot attenuate mode: parent {parent_grant:?} is ReadOnly, child {child_grant:?} requests ReadWrite"
         ));
     }
+    // A relay grant and an ordinary write authorize different things: a relay writes under other
+    // ids, an ordinary write under one. Only an unbound parent, which may write under any id,
+    // holds both, so only it may hand down a relay; a writing child of a relay stays one.
+    if cg.relay && !pg.relay && pg.principal.is_some() {
+        return Err(format!(
+            "cannot attenuate to a relay: parent {parent_grant:?} writes only as its principal, child {child_grant:?} would write under other ids"
+        ));
+    }
+    if pg.relay && cg.mode == Mode::ReadWrite && !cg.relay {
+        return Err(format!(
+            "cannot attenuate a relay: parent {parent_grant:?} carries others' records, child {child_grant:?} would publish"
+        ));
+    }
     if let Some(pp) = &pg.principal {
         if cg.principal.as_ref() != Some(pp) {
             return Err(format!(
@@ -1141,6 +1264,8 @@ fn check_attenuation_parsed(
 ///    parent (`None`) may remain non-expiring or add an expiry.
 /// 4. **Filter**: `parent_filter.contains(&child_filter)` — every subject matched by
 ///    `child_grant` is matched by `parent_grant`.
+/// 5. **Relay**: a relay child needs a relay or an unbound parent; a read-write child of a relay
+///    is a relay. A relay may attenuate to `ReadOnly`.
 pub fn can_attenuate(parent_grant: &str, child_grant: &str) -> Result<(), String> {
     let (pg, pf) = parse_grant(parent_grant)?;
     let (cg, cf) = parse_grant(child_grant)?;
@@ -1219,6 +1344,9 @@ pub fn attenuate_offline(
     }
     if let Some(exp) = cg.expires_at {
         prefix.push_str(&format!(",exp={exp}"));
+    }
+    if cg.relay {
+        prefix.push_str(",relay");
     }
     prefix.push_str(",via=");
     let Some(parent_hex_len) = parent.filter.len().checked_mul(2) else {
@@ -2320,5 +2448,134 @@ mod tests {
             roundtrip,
             "ASTREAM_CAP_UTF8_OFFLINE_PARENT_CHAIN_FAILED: {child:?}"
         );
+    }
+
+    #[test]
+    fn a_relay_field_parses_once_and_only_on_a_write_grant() {
+        let g = Grant::parse("rw,relay,p=n-a1:/m/>").unwrap();
+        assert!(g.relay);
+        assert!(!Grant::parse("rw,p=n-a1:/m/>").unwrap().relay);
+        assert!(Grant::parse("rw,relay,relay:/m/>").is_err());
+        assert!(Grant::parse("ro,relay:/m/>").is_err());
+    }
+
+    #[test]
+    fn a_subject_owner_is_the_segment_that_says_whose_it_is() {
+        for (subject, owner) in [
+            ("/t/rows/n-a1", Some("n-a1")),
+            ("/t/rows/n-a1/k", Some("n-a1")),
+            ("/m/n-a1", Some("n-a1")),
+            ("/m/n-a1/cpu/5m", Some("n-a1")),
+            ("/f/lab/pub/n-a1/s-1/ev", Some("n-a1")),
+            ("/f/lab/cur/n-a1/c", Some("n-a1")),
+            ("/f/lab/halt/n-a1/now", Some("n-a1")),
+            // A shape with no owner, or an owner of the wrong class.
+            ("/t/rows", None),
+            ("/t/rows/h-amy", None),
+            ("/m/h-amy/x", None),
+            ("/m", None),
+            ("/f/lab/pub/s-1", None),
+            ("/f/lab/pub/p/n-a1", None),
+            ("/f/lab/fleet/n-a1", None),
+            ("/f/lab/in/human/h-amy/n-a1", None),
+            ("/f/lab/in/human/h-amy/n-a1/note/more", None),
+            ("/f/lab/other/n-a1", None),
+            ("/x/n-a1", None),
+            ("/g/relay/1", None),
+        ] {
+            assert_eq!(relay_owner(subject), owner, "{subject}");
+        }
+    }
+
+    #[test]
+    fn a_relay_writes_under_the_owners_id_and_only_through_grants_relay() {
+        let secret = b"s";
+        let a = producer_id_of("n-a1");
+        let relay = mint(secret, "rw,relay,p=n-c1:/m/>").unwrap();
+        assert!(grants_relay(secret, &relay, "/m/n-a1/x", a, 0));
+        assert!(!grants_relay(
+            secret,
+            &relay,
+            "/m/n-a1/x",
+            producer_id_of("n-c1"),
+            0
+        ));
+        assert!(!grants_relay(secret, &relay, "/m/n-b1/x", a, 0));
+        assert!(
+            !grants_relay(secret, &relay, "/t/rows/n-a1", a, 0),
+            "filter"
+        );
+        assert!(
+            !grants_relay(secret, &relay, "/m/plain/x", a, 0),
+            "no owner"
+        );
+        // No other write.
+        assert!(!grants(secret, &relay, "/m/n-a1/x", 0));
+        assert!(!grants_commit(secret, &relay, "/m/n-a1/g", 0));
+        assert!(!grants_publish(
+            secret,
+            &relay,
+            "/m/n-c1/x",
+            producer_id_of("n-c1"),
+            0
+        ));
+        // Reading is a read.
+        assert!(grants_filter(secret, &relay, "/m/>", 0));
+
+        let bound = mint(secret, "rw,p=n-a1:/m/n-a1/>").unwrap();
+        assert!(!grants_relay(secret, &bound, "/m/n-a1/x", a, 0));
+        let read = mint(secret, "ro:/m/>").unwrap();
+        assert!(!grants_relay(secret, &read, "/m/n-a1/x", a, 0));
+        let root = mint(secret, "rw:/>").unwrap();
+        assert!(grants_relay(secret, &root, "/m/n-a1/x", a, 0));
+        assert!(!grants_relay(secret, &root, "/m/n-a1/x", 1, 0));
+        let lapsed = mint(secret, "rw,relay,exp=10:/m/>").unwrap();
+        assert!(grants_relay(secret, &lapsed, "/m/n-a1/x", a, 9));
+        assert!(!grants_relay(secret, &lapsed, "/m/n-a1/x", a, 10));
+    }
+
+    #[test]
+    fn a_relay_attenuates_to_a_narrower_relay_or_a_read() {
+        let secret = b"s";
+        let root = mint(secret, "rw:/>").unwrap();
+        let relay = attenuate(secret, &root, "rw,relay:/m/>", 0).unwrap();
+        let narrower = attenuate(secret, &relay, "rw,relay:/m/n-a1/>", 0).unwrap();
+        assert!(grants_relay(
+            secret,
+            &narrower,
+            "/m/n-a1/x",
+            producer_id_of("n-a1"),
+            0
+        ));
+        assert!(!grants_relay(
+            secret,
+            &narrower,
+            "/m/n-b1/x",
+            producer_id_of("n-b1"),
+            0
+        ));
+        attenuate(secret, &relay, "ro:/m/>", 0).unwrap();
+
+        // Not into a publish, nor out of a principal's own writes.
+        assert!(attenuate(secret, &relay, "rw:/m/>", 0).is_err());
+        assert!(attenuate(secret, &relay, "rw,p=n-a1:/m/n-a1/>", 0).is_err());
+        let bound = mint(secret, "rw,p=n-a1:/m/n-a1/>").unwrap();
+        assert!(attenuate(secret, &bound, "rw,relay,p=n-a1:/m/n-a1/>", 0).is_err());
+
+        let offline = attenuate_offline(&relay, "rw,relay:/m/n-a1/>", 0).unwrap();
+        assert!(grants_relay(
+            secret,
+            &offline,
+            "/m/n-a1/x",
+            producer_id_of("n-a1"),
+            0
+        ));
+        assert!(!grants_relay(
+            secret,
+            &offline,
+            "/m/n-b1/x",
+            producer_id_of("n-b1"),
+            0
+        ));
     }
 }

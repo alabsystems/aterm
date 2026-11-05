@@ -23,7 +23,7 @@ const KVK_KEYPAD_ENTER: u16 = 0x4c;
 const KVK_ESCAPE: u16 = 0x35;
 
 /// What a keystroke means to a native confirmation alert, `posted` being whether a control
-/// client posted it (`crate::hwkey::event_posted`).
+/// client posted it (`crate::hwkey::classify`).
 pub(crate) fn confirm_key(
     confirmation_attached: bool,
     posted: bool,
@@ -129,9 +129,11 @@ pub(crate) fn confirmation_up() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use macos::{ConfirmKeyWatch as PasswordKeyWatch, watch_password_keys};
+pub(crate) use macos::{
+    ConfirmKeyWatch, PasteConfirm, next_confirm_id, sheet_outstanding, watch_alert_keys,
+};
 #[cfg(target_os = "macos")]
-pub(crate) use macos::{PasteConfirm, next_confirm_id, watch_alert_keys};
+pub(crate) use macos::{ConfirmKeyWatch as PasswordKeyWatch, watch_password_keys};
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -170,7 +172,7 @@ mod macos {
     /// Is `panel` still outstanding on `parent`: attached, or queued behind another sheet?
     /// AppKit queues a `beginSheetModalForWindow:` sent to a window that already presents a
     /// sheet, and `-attachedSheet` names only the front one, so `-sheets` is walked too.
-    fn sheet_outstanding(parent: Id, panel: Id) -> bool {
+    pub(crate) fn sheet_outstanding(parent: Id, panel: Id) -> bool {
         if panel.is_null() {
             return false;
         }
@@ -243,23 +245,18 @@ mod macos {
     }
 
     /// Whether `event`, held by a native key monitor before dispatch, is a key a control client
-    /// posted with `aterm ctl hwkey`.
+    /// posted with `aterm ctl hwkey` ([`crate::hwkey::classify`]). A key another process posted
+    /// answers as the person's here, as their on-screen keyboard's or Screen Sharing's does: the
+    /// relayed mark fences only the owner's keys ([`crate::owner_keys_save`]).
     ///
     /// # Safety
     /// `event` is a live `NSEvent` the monitor was handed, read on the main thread.
     unsafe fn posted_key(event: Id) -> bool {
-        // SAFETY: `-type` is `-(NSEventType)`, valid on any event; `-keyCode` and `-timestamp`
-        // are read only once `-type` said key-down or key-up, the kinds `-keyCode` is defined
-        // for (it raises on others).
-        unsafe {
-            let kind = appkit::send_usize(event, sel!(type));
-            crate::hwkey::is_key_kind(kind)
-                && crate::hwkey::event_posted(crate::hwkey::PostedKey {
-                    kind,
-                    keycode: appkit::send_u16(event, sel!(keyCode)),
-                    timestamp: appkit::send_f64(event, sel!(timestamp)),
-                })
-        }
+        // SAFETY: the caller's live event, on the main thread.
+        unsafe { crate::platform::input_event(event) }.is_some_and(|key| {
+            crate::hwkey::is_key_kind(key.kind)
+                && crate::hwkey::classify(key) == aterm_window::event::InputOrigin::Posted
+        })
     }
 
     fn click(button: Id) {

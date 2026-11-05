@@ -106,11 +106,13 @@ pub(crate) fn io(what: &str, path: &std::path::Path, e: &std::io::Error) -> Erro
 
 /// Lowercase hex of `bytes`.
 pub(crate) fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut out, b| {
-        let _ = write!(out, "{b:02x}");
-        out
-    })
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
 }
 
 /// Whether `text` is a lowercase-hex digest of `len` digits.
@@ -121,29 +123,18 @@ pub(crate) fn is_hex(text: &str, len: usize) -> bool {
 /// Read a small UTF-8 regular file without following a terminal symlink or blocking on a FIFO.
 pub(crate) fn read_small_text(path: &std::path::Path, max_bytes: usize) -> Option<String> {
     use std::io::Read as _;
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(path)
-            .ok()?
-    };
-    #[cfg(not(unix))]
-    let file = {
-        if !std::fs::symlink_metadata(path).ok()?.is_file() {
-            return None;
-        }
-        std::fs::File::open(path).ok()?
-    };
-    if !file.metadata().ok()?.is_file() {
+    let (file, meta) = open_regular_nonblock_with_meta(path).ok()?;
+    let max_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if meta.len() > max_u64 {
         return None;
     }
-    let cap = u64::try_from(max_bytes)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let mut bytes = Vec::new();
+    let cap = max_u64.saturating_add(1);
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(meta.len())
+            .unwrap_or(0)
+            .min(max_bytes)
+            .saturating_add(1),
+    );
     file.take(cap).read_to_end(&mut bytes).ok()?;
     if bytes.len() > max_bytes {
         return None;
@@ -229,11 +220,15 @@ fn chmod_regular(path: &std::path::Path, mode: u32, what: &str) -> Result<(), Er
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| io(what, path, &e))?;
-    if !file.metadata().map_err(|e| io(what, path, &e))?.is_file() {
+    let meta = file.metadata().map_err(|e| io(what, path, &e))?;
+    if !meta.is_file() {
         return Err(Error::Io(format!(
             "could not {what} {}: not a regular file",
             path.display()
         )));
+    }
+    if meta.permissions().mode() & 0o7777 == mode & 0o7777 {
+        return Ok(());
     }
     file.set_permissions(std::fs::Permissions::from_mode(mode))
         .map_err(|e| io(what, path, &e))

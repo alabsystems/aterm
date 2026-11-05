@@ -339,7 +339,7 @@ pub fn ensure_shared_dir(dir: &Path) -> std::io::Result<()> {
     }
     aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o755)?;
     if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o755) {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+        set_mode(dir, 0o755)?;
     }
     Ok(())
 }
@@ -529,12 +529,41 @@ pub fn remove_link(link: &Path) {
 
 /// Force a file to `0600`.
 pub fn harden_file(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, Permissions::from_mode(0o600))
+    crate::metadata_io::open_regular_with_meta(path)?
+        .0
+        .set_permissions(Permissions::from_mode(0o600))
 }
 
-/// Set a file's permission bits to `mode`.
+/// Set a regular file's or directory's permission bits to `mode`, refusing symlinks and special files.
 pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
-    fs::set_permissions(path, Permissions::from_mode(mode))
+    let perms = Permissions::from_mode(mode);
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => {
+            let meta = f.metadata()?;
+            if !meta.is_file() && !meta.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{}: not a regular file or directory", path.display()),
+                ));
+            }
+            f.set_permissions(perms)
+        }
+        Err(e) => {
+            if e.kind() != io::ErrorKind::PermissionDenied
+                || !fs::symlink_metadata(path).is_ok_and(|m| m.is_file() || m.is_dir())
+            {
+                return Err(e);
+            }
+            // An owner may chmod an unreadable entry. Keep that recovery, but never
+            // follow a link exchanged in after the metadata check. A platform that
+            // cannot honor NOFOLLOW refuses instead of falling back to chmod(path).
+            aterm_uds::atomic_file::set_mode_nofollow(path, mode)
+        }
+    }
 }
 
 /// Set an open file's permission bits to `mode` (`fchmod(2)`) for `crate::extract::write_capped`.
@@ -566,7 +595,7 @@ pub fn open_create_write(path: &Path, mode: u32) -> io::Result<File> {
         .write(true)
         .create(true)
         .mode(mode)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
     let meta = f.metadata()?;
     if !meta.is_file() {
@@ -590,12 +619,16 @@ pub fn open_create_new_write(path: &Path, mode: u32) -> io::Result<File> {
         .write(true)
         .create_new(true)
         .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
 }
 
 /// Open `path` for [`sync_file_contents`].
 pub fn open_for_sync(path: &Path) -> io::Result<File> {
-    File::open(path)
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
 }
 
 /// Push one open file's contents out of the page cache.
@@ -770,15 +803,36 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
     crate::lay::write_in_process(&crate::lay::Executable::new(shim, script.as_bytes()))
 }
 
+/// What a single read of `shim` ([`super::ShimRead`]) learns.
+#[must_use]
+pub fn read_shim(shim: &Path) -> super::ShimRead {
+    match crate::metadata_io::read_bounded_regular_utf8(shim, super::MAX_SHIM_BYTES) {
+        Ok(body) => super::ShimRead {
+            target: super::parse_sh_shim_target(&body),
+            env: super::parse_sh_shim_env(&body),
+            body: Some(body),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => super::ShimRead {
+            target: None,
+            env: crate::shim_env::ShimEnv::NONE,
+            body: None,
+        },
+        Err(_) => super::ShimRead {
+            target: fs::read_link(shim).ok(),
+            env: crate::shim_env::ShimEnv::NONE,
+            body: None,
+        },
+    }
+}
+
 /// Resolve the store/checkout target a `bin/<tool>` shim execs, or `None` for no shim or a tombstone (no `exec` line).
 #[must_use]
 pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
-    if let Ok(target) = fs::read_link(shim) {
-        return Some(target);
+    match crate::metadata_io::read_bounded_regular_utf8(shim, super::MAX_SHIM_BYTES) {
+        Ok(content) => super::parse_sh_shim_target(&content),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => fs::read_link(shim).ok(),
     }
-    let content =
-        crate::metadata_io::read_bounded_regular_utf8(shim, super::MAX_SHIM_BYTES).ok()?;
-    super::parse_sh_shim_target(&content)
 }
 
 /// The environment the shim at `shim` exports before it execs.

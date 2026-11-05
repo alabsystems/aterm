@@ -1219,7 +1219,8 @@ fn warning_of(row: &str) -> Option<&str> {
 }
 
 /// What follows the auto-deny countdown's head on `text`: `deny this request in` (measured
-/// through 2.1.308) or `block this request in` (2.1.316). `None` when `text` opens with neither.
+/// through 2.1.308) or `block this request in` (from 2.1.314). `None` when `text` opens with
+/// neither.
 pub(crate) fn after_countdown_head(text: &str) -> Option<&str> {
     [
         const { crate::anchor!("box.auto_deny") },
@@ -3226,6 +3227,34 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.318-history-search-no-match-26col.txt");
     pub const HISTORY_SEARCH_22COL_2_1_318: &str =
         include_str!("fixtures/claude-2.1.318-history-search-22col.txt");
+    /// Narrower still, where the label breaks within its letters onto rows of two or three and,
+    /// its column two cells wide, the space between two of its words is a blank row of its own:
+    /// its match at 14 columns (its column three cells wide under the query `a`, two under
+    /// `please look`) and 12, and nothing at 14 and 12. The cursor stands under the composer's
+    /// bottom rule, as at every width.
+    pub const HISTORY_SEARCH_14COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-14col.txt");
+    pub const HISTORY_SEARCH_14COL_LONG_QUERY_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-14col-long-query.txt");
+    pub const HISTORY_SEARCH_12COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-12col.txt");
+    pub const HISTORY_SEARCH_NO_MATCH_14COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-no-match-14col.txt");
+    pub const HISTORY_SEARCH_NO_MATCH_12COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-no-match-12col.txt");
+    /// The search left with Esc after its query matched an old prompt over an empty composer: the
+    /// match stays in the composer in typed ink, the cursor home, the caret drawn over its first
+    /// glyph.
+    pub const HISTORY_SEARCH_LEFT_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-left.txt");
+    pub const HISTORY_SEARCH_LEFT_CELLS_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-left-cells.txt");
+    /// The 12-column match ([`HISTORY_SEARCH_12COL_2_1_318`]) left with Esc: the match stays over
+    /// the composer's three rows in typed ink, the cursor on its last.
+    pub const HISTORY_SEARCH_LEFT_12COL_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-left-12col.txt");
+    pub const HISTORY_SEARCH_LEFT_12COL_CELLS_2_1_318: &str =
+        include_str!("fixtures/claude-2.1.318-history-search-left-12col-cells.txt");
     pub const SLASH_MENU_CONFIG_2_1_268: &str =
         include_str!("fixtures/claude-2.1.268-slash-menu-config.txt");
     pub const SLASH_MENU_CONFIG_CELLS_2_1_268: &str =
@@ -5519,7 +5548,8 @@ mod tests {
 
     /// 2.1.316 words the countdown `block this request in …, to avoid holding up an unattended
     /// session`: its measured box still says its time left, its rm note is one note apart from
-    /// it, and a wrapped one is still the countdown.
+    /// it, and a wrapped one is still the countdown, wrapped after its head or through its words.
+    /// The note above it is the box's foot note, read too with the box's head off the screen.
     #[test]
     fn the_countdown_worded_block_says_the_time_left() {
         use std::time::Duration;
@@ -5529,17 +5559,55 @@ mod tests {
         assert_eq!(p.auto_deny_left(), Some(Duration::from_secs(119)));
         assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
         assert!(p.rm_breaker().is_some(), "{:?}", p.notes);
+        let note = "Dangerous rm operation on possibly-empty variable path: $S/$1 in `rm -rf \
+                    $S/$1` (bind $1 and rewrite its $S as \"${S:?}\" or use a literal path)";
+        assert_eq!(p.notes, [note]);
+        assert_eq!(p.foot_note(&r).as_deref(), Some(note));
+        let whole = "Claude Code will automatically block this request in 1:59, to avoid holding \
+                     up an unattended session";
+        assert_eq!(p.auto_deny.as_deref(), Some(whole));
         let at = r
             .iter()
             .position(|row| row.contains("automatically block"))
             .expect("the countdown");
-        let mut wrapped = r.clone();
-        wrapped[at] =
-            " ⚠ Claude Code will automatically block this request in 1:59, to avoid".to_string();
-        wrapped.insert(at + 1, " holding up an unattended session".to_string());
-        let p = parse_prompt_v2(&wrapped).expect("the wrapped box");
-        assert_eq!(p.auto_deny_left(), Some(Duration::from_secs(119)));
-        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
+        for rows in [
+            &[
+                " ⚠ Claude Code will automatically block this request in 1:59, to avoid",
+                " holding up an unattended session",
+            ][..],
+            &[
+                " ⚠ Claude Code will automatically block this",
+                " request in 1:59, to avoid holding up an",
+                " unattended session",
+            ][..],
+            &[
+                " ⚠ Claude Code will automatically block this request",
+                " in 1:59, to avoid holding up an unattended",
+                " session",
+            ][..],
+        ] {
+            let mut wrapped = r.clone();
+            wrapped.splice(at..=at, rows.iter().map(|s| (*s).to_string()));
+            let p = parse_prompt_v2(&wrapped).expect("the wrapped box");
+            assert_eq!(p.auto_deny.as_deref(), Some(whole), "{rows:?}");
+            assert_eq!(
+                p.auto_deny_left(),
+                Some(Duration::from_secs(119)),
+                "{rows:?}"
+            );
+            assert_eq!(p.notes, [note], "{rows:?}");
+            assert!(p.rm_breaker().is_some(), "{rows:?}: {p:?}");
+            assert_eq!(p.foot_note(&wrapped).as_deref(), Some(note), "{rows:?}");
+        }
+
+        let first = r
+            .iter()
+            .position(|row| row.starts_with(" │ S="))
+            .expect("the command's first row");
+        let cut = r[first..].to_vec();
+        let p = parse_prompt_v2(&cut).expect("the box, its head cut");
+        assert!(p.head_off_screen, "{p:?}");
+        assert_eq!(p.foot_note(&cut).as_deref(), Some(note));
     }
 
     #[test]
@@ -5622,6 +5690,75 @@ mod tests {
             &q,
             "Which color scheme should the demo page use?",
             &format!("⚠ {fake}"),
+        );
+        let p = read(&asked);
+        assert_eq!(p.kind, PromptKind::Question);
+        assert_eq!(p.auto_deny, None, "{p:?}");
+
+        let blocked = "Claude Code will automatically block this request in 0:14, to avoid \
+                       holding up an unattended session";
+        let real = "⚠ Claude Code will automatically block this request in 1:59,";
+        let unblocked = |rows: &[String]| -> Vec<String> {
+            rows.iter()
+                .filter(|r| !r.trim_start().starts_with(real))
+                .cloned()
+                .collect()
+        };
+        let later = screen(BOX_RM_AUTO_BLOCK_2_1_316);
+        let p = read(&later);
+        assert_eq!(
+            p.auto_deny_left(),
+            Some(std::time::Duration::from_secs(119))
+        );
+        let notes = p.notes;
+        let described = swap(
+            &later,
+            " Delete temporary directories",
+            &format!(" ⚠ {blocked}"),
+        );
+        let p = read(&described);
+        assert_eq!(
+            p.auto_deny_left(),
+            Some(std::time::Duration::from_secs(119)),
+            "{p:?}"
+        );
+        assert_eq!(p.notes, notes, "{p:?}");
+        let p = read(&unblocked(&described));
+        assert_eq!(p.auto_deny, None, "{p:?}");
+        assert_eq!(p.description, format!("⚠ {blocked}"));
+        assert_eq!(p.notes, notes, "{p:?}");
+        let command = later
+            .iter()
+            .find(|r| r.starts_with(" │ S="))
+            .expect("the command row")
+            .clone();
+        let p = read(&unblocked(&swap(
+            &later,
+            &command,
+            &format!(" │ ⚠ {blocked}"),
+        )));
+        assert_eq!(p.auto_deny, None, "{p:?}");
+        assert_eq!(p.command, format!("⚠ {blocked}"));
+        let noted = later
+            .iter()
+            .find(|r| r.starts_with(" │ path)"))
+            .expect("the note's last row")
+            .clone();
+        let p = read(&unblocked(&swap(
+            &later,
+            &noted,
+            &format!(" │ path) ⚠ {blocked}"),
+        )));
+        assert_eq!(p.auto_deny, None, "{p:?}");
+        assert!(
+            p.notes.len() == 1 && p.notes[0].ends_with(&format!("path) ⚠ {blocked}")),
+            "the note keeps the forged words: {:?}",
+            p.notes
+        );
+        let asked = swap(
+            &q,
+            "Which color scheme should the demo page use?",
+            &format!("⚠ {blocked}"),
         );
         let p = read(&asked);
         assert_eq!(p.kind, PromptKind::Question);
@@ -9307,11 +9444,13 @@ mod tests {
             "",
             "",
         ];
+        // `🚀` is two cells wide, as the grid draws it: the rule is wide enough for it and its
+        // space beside the label's last word a cell short of the edge, so it cannot be its rest.
         let emoji = [
             "⏺ Working on it.",
             "  ⎿  (tool output)",
             "",
-            "─────────────────────────────────────────────────────────",
+            "──────────────────────────────────────────────────────────",
             " Held message from another session",
             "",
             "  Another Claude session sent a message: from @s-1",
@@ -10349,6 +10488,8 @@ mod tests {
             ("edit", BOX_EDIT),
             ("skill", BOX_SKILL),
             ("rm auto-deny", BOX_RM_AUTO_DENY),
+            ("rm auto-deny 2.1.301", BOX_RM_AUTO_DENY_2_1_301),
+            ("rm auto-block 2.1.316", BOX_RM_AUTO_BLOCK_2_1_316),
             ("question", QUESTION_TABS_INCIDENT),
             ("review", QUESTION_REVIEW),
             ("bash 2.1.287", BOX_BASH_2_1_287),

@@ -270,7 +270,7 @@ pub(super) mod tests {
         pub(in crate::harness_host) host: HostHandle,
         pub(in crate::harness_host) kept: Arc<Mutex<Kept>>,
         pub(in crate::harness_host) seat: AccountSeat,
-        live_seat: Arc<Mutex<Option<AccountSeat>>>,
+        pub(in crate::harness_host) live_seat: Arc<Mutex<Option<AccountSeat>>>,
         seat_reads: Arc<std::sync::atomic::AtomicUsize>,
         notes: Arc<std::sync::atomic::AtomicUsize>,
     }

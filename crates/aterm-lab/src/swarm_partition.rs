@@ -1549,8 +1549,15 @@ impl Lane {
             .current_dir(root.join("home"));
         let input = match stdin {
             Some(text) => {
+                use std::os::unix::fs::OpenOptionsExt as _;
                 let file = root.join("tmp/lab-stdin");
-                match std::fs::write(&file, text).and_then(|()| std::fs::File::open(&file)) {
+                let opened = crate::util::write_fresh(&file, text).and_then(|()| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(&file)
+                });
+                match opened {
                     Ok(f) => Stdio::from(f),
                     Err(e) => {
                         return world::Out {
@@ -1609,7 +1616,7 @@ impl Lane {
         log: &str,
     ) -> Result<i32, Fail> {
         let root = self.root(mac);
-        let out = std::fs::File::create(root.join(log))
+        let out = crate::util::create_stdio_file(&root.join(log))
             .map_err(|e| Fail::die(format!("{mac}: its {log}: {e}")))?;
         let err = out.try_clone().map_err(|e| Fail::die(e.to_string()))?;
         let (lifeline, far) = aterm_uds::lifeline::Lifeline::open(&root)
@@ -1822,10 +1829,12 @@ impl Lane {
             Paths::for_home(&self.home(mac)),
         );
         let local = desk::Local::of(&by)
-            .map_err(|e| format!("{member}'s Commons state: {e}"))?
-            .ok_or_else(|| format!("{member} holds no Commons control"))?;
+            .map_err(|e| format!("{member}'s membership: {e}"))?
+            .ok_or_else(|| format!("{member} is no member"))?;
         if !local.can_allow() {
-            return Err(format!("no Commons roster binds {member}"));
+            return Err(format!(
+                "neither the membership log seats {member} nor a Commons roster binds it"
+            ));
         }
         let desk = std::sync::Mutex::new(desk::Desk::new(local));
         let device = Device::open(&paths)
@@ -2028,9 +2037,10 @@ impl Lane {
     /// How old `mac`'s copy of the issuer's book is.
     fn copy_age(&self, mac: &str) -> Option<Duration> {
         let file = self.root(mac).join("state").join("fleet-issuer-book");
-        std::fs::metadata(file)
-            .and_then(|m| m.modified())
+        std::fs::symlink_metadata(file)
             .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| m.modified().ok())
             .and_then(|t| t.elapsed().ok())
     }
 
@@ -2243,11 +2253,12 @@ fn write_whole(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let new = path.with_extension("new");
+    let _ = std::fs::remove_file(&new);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(mode)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(&new)?;
     file.write_all(bytes)?;
     drop(file);
@@ -2408,7 +2419,7 @@ fn found_vault(lane: &mut Lane) -> Result<(), Fail> {
             lane.url(Island::B)
         );
         let file = lane.root("a1").join("tmp/aterm-swarm-policy.toml");
-        std::fs::write(&file, policy).map_err(|e| Fail::die(e.to_string()))?;
+        crate::util::write_fresh(&file, policy).map_err(|e| Fail::die(e.to_string()))?;
         let file = file.to_string_lossy().into_owned();
         lane.aterm_ok(
             "a1",
@@ -2503,7 +2514,7 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
     let t0_ms = u64::try_from(crate::util::now_ms()).unwrap_or(0) - ms_since(lane.t0);
     let mut load = Vec::new();
     let mut mark = |at: &str| {
-        if let Ok(l) = crate::aos_workers_bench::load_average() {
+        if let Ok(l) = crate::bench_stats::load_average() {
             load.push((at.to_owned(), l));
         }
     };
@@ -2639,7 +2650,7 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
                     "the fleet was not whole within {}s, so there was no whole fleet to cut: {}{}",
                     HANG.as_secs(),
                     why.join("; "),
-                    crate::aos_workers_bench::load_average().map_or(String::new(), |l| format!(
+                    crate::bench_stats::load_average().map_or(String::new(), |l| format!(
                         " (this Mac's 1-minute load {l:.1} on {} cores)",
                         std::thread::available_parallelism().map_or(0, std::num::NonZero::get)
                     ))
@@ -3804,7 +3815,7 @@ fn write_record(
         let _ = writeln!(body, "{line}");
     }
     let _ = writeln!(body, "```");
-    std::fs::write(&path, body).map_err(|e| e.to_string())?;
+    crate::util::atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -3880,10 +3891,7 @@ pub fn converge_standin(args: &[String]) -> Option<i32> {
         .unwrap_or_default();
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let line = format!("{} {trigger}\n", crate::util::now_ms());
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(home.join(RUNNERS_FILE));
+    let file = crate::util::append_regular_file(&home.join(RUNNERS_FILE));
     Some(match file {
         Ok(mut f) => {
             use std::io::Write as _;

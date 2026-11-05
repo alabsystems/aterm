@@ -2231,6 +2231,7 @@ mod network_tests {
             last_seen_ms: 1_793_040_000_000,
             last_checked_ms: None,
             last_repair: Some(RepairObservation {
+                cause: None,
                 completed_at_ms: 1_793_000_000_000,
                 outbound: true,
                 stage: Some(RepairStage::Application),
@@ -3168,6 +3169,12 @@ fn writing_section(c: Ctx<'_>) -> Section<'_> {
     )
 }
 
+/// The CPU lens's ⌘⇧P line: what the key does and what it does not, one row in the two-column
+/// lens's 476 pt column at a 1036.5 pt Folded deck; a narrower column wraps it.
+#[cfg(target_os = "macos")]
+const CPU_POLICY_KEY: &str =
+    "\u{2318}\u{21e7}P reads CPU policy once, by password; changes no policy, keeps no password.";
+
 /// The CPU lens (§11.4).
 fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
     let snap = c.snap;
@@ -3240,19 +3247,33 @@ fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
         line_section("Over max", "Over max", vec![over_words], true),
     ];
     if snap.hardware.is_some() || snap.authorized_cpu_policy.is_some() {
-        let mut text = aterm_vitals::sys::hardware::lines(snap);
+        let text = aterm_vitals::sys::hardware::lines(snap);
         // The full report preserves every channel. Keep the panel's recovery
-        // actions first so smaller lenses do not hide them below the channel list.
+        // actions first so smaller lenses do not hide them below the channel
+        // list, each wrapped to the column so no width cuts what one says.
         #[cfg(target_os = "macos")]
-        text.insert(0, if crate::cpu_policy_authorization::pending() {
-            "Authorized collection pending; ⌘⇧X cancels. No new collection until its exact collector exits.".into()
+        let policy = Some(if crate::cpu_policy_authorization::pending() {
+            "Authorized collection pending; ⌘⇧X cancels. No new collection until its exact collector exits.".to_owned()
         } else {
-            "⌘⇧P authorizes one bounded, read-only CPU policy collection in aterm's password sheet. No policy changes or credential cache.".into()
+            CPU_POLICY_KEY.to_owned()
         });
-        text.insert(0, "\u{2318}\u{21e7}C copies the diagnostic report; \u{2318}R resamples. Cause not established.".into());
+        #[cfg(not(target_os = "macos"))]
+        let policy: Option<String> = None;
+        let keys: Vec<String> = std::iter::once(
+            "\u{2318}\u{21e7}C copies the diagnostic report. Cause not established.".to_owned(),
+        )
+        .chain(policy)
+        .collect();
+        let items = keys
+            .iter()
+            .map(|k| wrap(c.m, k, c.cw, BODY_PT))
+            .chain(text.iter().map(|l| vec![l.clone()]))
+            .collect();
+        let line = keys.first().cloned().into_iter().collect();
+        let words = keys.into_iter().chain(text).collect();
         sections.insert(
             0,
-            lines_section("Hardware & limits", text.clone(), text, true),
+            rows_section("Hardware & limits", items, line, words, true),
         );
     }
     sections.extend(why);
@@ -4527,7 +4548,7 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
         (
             2,
             [
-                "live now at the left, then 2 s and wider cells further back".into(),
+                "live now at the left, then 1 s and wider cells further back".into(),
                 "left cell: live now".into(),
             ],
         ),
@@ -5226,10 +5247,24 @@ fn lines_section<'d>(
     words: Vec<String>,
     right: bool,
 ) -> Section<'d> {
+    let line: Vec<String> = lines.first().cloned().into_iter().collect();
+    let items = lines.into_iter().map(|l| vec![l]).collect();
+    rows_section(name, items, line, words, right)
+}
+
+/// A heading over `items`, each one or more rows: its forms show the first k items whole, from
+/// all of them down to one (a row wider than the column cut), then `line` on one line.
+fn rows_section<'d>(
+    name: &'static str,
+    items: Vec<Vec<String>>,
+    line: Vec<String>,
+    words: Vec<String>,
+    right: bool,
+) -> Section<'d> {
     let mut forms = Vec::new();
-    for k in (1..=lines.len()).rev() {
-        let shown = lines[..k].to_vec();
-        forms.push(form(rows_h(k, false), move |pen, p| {
+    for k in (1..=items.len()).rev() {
+        let shown = items[..k].concat();
+        forms.push(form(rows_h(shown.len(), false), move |pen, p| {
             heading(pen, p, name, &[]);
             let ink = pen.inks.words2;
             for (i, l) in shown.iter().enumerate() {
@@ -5245,7 +5280,6 @@ fn lines_section<'d>(
             }
         }));
     }
-    let line: Vec<String> = lines.first().cloned().into_iter().collect();
     forms.push(line_form(name, line));
     Section {
         name: name.into(),
@@ -5928,6 +5962,21 @@ impl crate::App {
         self.windows.values().any(|ws| ws.stats_lens.open.is_some())
     }
 
+    /// The rows whose lens a window holds open, each once ([`crate::vitals_host::Request::lenses`]).
+    pub(crate) fn open_lens_rows(&self) -> Vec<Resource> {
+        let mut rows = Vec::new();
+        for row in self
+            .windows
+            .values()
+            .filter_map(|ws| ws.stats_lens.open?.focus.resource())
+        {
+            if !rows.contains(&row) {
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
     /// The pointer in `wid`'s lens card pixels, while it is over the lens.
     fn lens_card_point(&self, wid: crate::WindowId) -> Option<(f64, f64)> {
         let ws = self.windows.get(&wid)?;
@@ -6118,10 +6167,7 @@ impl crate::App {
             .paste_banner
             .as_ref()
             .is_some_and(|banner| banner.wid == wid)
-            || self
-                .close_banner
-                .as_ref()
-                .is_some_and(|banner| banner.wid == wid)
+            || self.close_band(wid).is_some()
             || self
                 .autopilot_menu
                 .as_ref()
@@ -6298,10 +6344,6 @@ impl crate::App {
             #[cfg(target_os = "macos")]
             if open.focus == Instrument::Cpu && command("x") && mods.shift_key() {
                 self.cancel_cpu_policy(wid);
-                return true;
-            }
-            if open.focus == Instrument::Cpu && command("r") {
-                let _ = self.resample_cpu_diagnostics();
                 return true;
             }
             if open.focus == Instrument::NetworkState

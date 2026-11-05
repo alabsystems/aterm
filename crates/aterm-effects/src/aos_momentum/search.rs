@@ -156,10 +156,6 @@ pub enum Mode {
     Search,
     /// On-demand re-evaluation of one candidate (`m4::Evaluator::admit_one`).
     OnDemand,
-    /// A search whose training judgments ran in workers and were checked here only as far as
-    /// the winner needs, so its admitted count rests on their claims (`m4::Distributed`, design
-    /// §11.3).
-    Distributed,
 }
 
 impl Mode {
@@ -170,18 +166,17 @@ impl Mode {
         match self {
             Mode::Search => 0,
             Mode::OnDemand => 1,
-            Mode::Distributed => 2,
         }
     }
 
-    /// The mode a bundle's tag names.
+    /// The mode a bundle's tag names; none for another tag. Tag 2 named the distributed search
+    /// removed with design §11's workers, so a bundle that carries it no longer decodes.
     #[inline]
     #[must_use]
     pub const fn from_tag(tag: u8) -> Option<Mode> {
         match tag {
             0 => Some(Mode::Search),
             1 => Some(Mode::OnDemand),
-            2 => Some(Mode::Distributed),
             _ => None,
         }
     }
@@ -249,27 +244,6 @@ impl GridProposer {
     #[must_use]
     pub const fn new() -> GridProposer {
         GridProposer
-    }
-
-    /// How many plans [`Self::plans`] proposes.
-    #[inline]
-    #[must_use]
-    pub(super) const fn len() -> usize {
-        GRID_V1.len()
-    }
-
-    /// The encoded plan at `index` in [`GRID_V1`] order.
-    #[inline]
-    #[must_use]
-    pub(super) const fn plan_at(index: usize) -> Option<[u8; PLAN_LEN]> {
-        if index >= GRID_V1.len() {
-            return None;
-        }
-        let (split, wake) = GRID_V1[index];
-        match SchedulePlan::new(split, wake) {
-            Ok(p) => Some(p.encode()),
-            Err(_) => None,
-        }
     }
 
     /// Encoded plan bytes in [`GRID_V1`] order (54 plans).

@@ -376,27 +376,73 @@ fn a_push_the_rate_limit_refused_goes_out_once_the_bucket_refills() {
     assert_eq!(t.take_response().unwrap_or_default(), PUSH_LIGHT);
 }
 
-/// A push the policy refused is dropped by a batch that ends with 2031 off, before a host
-/// colour call announces it; one that turns it off and on again keeps it owed, and the same
-/// host call announces it then (the negative control).
+/// A push the rate limit refused stays owed to the program that set 2031: its own `?2031l` at a
+/// clock that finds room sends it (the change was made while 2031 was set), while a handback's
+/// `?2031l` at the same clock sends the shell nothing.
+/// NEGATIVE CONTROL: with the handback not latching quietly first, `` a handback `` pushes.
+#[test]
+fn an_owed_push_goes_to_the_program_that_set_2031_never_to_a_handback() {
+    for program_turns_it_off in [true, false] {
+        let mut t = Terminal::new(8, 40);
+        t.apply_config(&dark_theme());
+        let clock = ClockReading::now();
+        t.process_at(&b"\x1b[6n".repeat(20_000), clock);
+        let _ = t.take_response();
+        t.process_at(b"\x1b[?2031h\x1b]11;#ffffff\x07", clock);
+        assert!(
+            !has_997(&t.take_response().unwrap_or_default()),
+            "PRECONDITION: the spent bucket refuses the push"
+        );
+        let later = ClockReading {
+            monotonic: clock.monotonic + std::time::Duration::from_secs(2),
+            wall_ms: clock.wall_ms,
+        };
+        let who = if program_turns_it_off {
+            t.process_at(b"\x1b[?2031l", later);
+            "the program's ?2031l"
+        } else {
+            let handback = t.manual_handback_at(later);
+            assert!(
+                handback.reverted.contains(&"color-scheme-reports"),
+                "PRECONDITION: the handback turns 2031 off: {:?}",
+                handback.reverted
+            );
+            "a handback"
+        };
+        assert_eq!(
+            has_997(&t.take_response().unwrap_or_default()),
+            program_turns_it_off,
+            "{who}"
+        );
+    }
+}
+
+/// A push the policy refused is dropped where the output turns 2031 off, before a host colour
+/// call announces it, however the batches fall; one 2031 never left stays owed, and the same host
+/// call announces it then (the negative control).
 #[test]
 fn turning_2031_off_drops_an_owed_push() {
-    for off_at_batch_end in [true, false] {
+    let cases: [(&str, &[&[u8]]); 3] = [
+        (
+            "off and on in two batches",
+            &[b"\x1b[?2031l", b"\x1b[?2031h"],
+        ),
+        ("off and on in one batch", &[b"\x1b[?2031l\x1b[?2031h"]),
+        ("never off", &[b"x"]),
+    ];
+    for (case, batches) in cases {
         let mut t = Terminal::new(8, 40);
         t.apply_config(&dark_theme());
         t.apply_policy_engine(silencing_policy());
         assert!(!has_997(&reply(&mut t, b"\x1b[?2031h\x1b]11;#ffffff\x07")));
-        if off_at_batch_end {
-            assert!(reply(&mut t, b"\x1b[?2031l").is_empty());
-            assert!(reply(&mut t, b"\x1b[?2031h").is_empty());
-        } else {
-            assert!(reply(&mut t, b"\x1b[?2031l\x1b[?2031h").is_empty());
+        for batch in batches {
+            assert!(reply(&mut t, batch).is_empty(), "{case}");
         }
         t.apply_config(&light_theme());
         assert_eq!(
             has_997(&t.take_response().unwrap_or_default()),
-            !off_at_batch_end,
-            "owed only while no batch ended with 2031 off"
+            case == "never off",
+            "{case}: owed only while 2031 stayed set"
         );
     }
 }

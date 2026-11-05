@@ -40,7 +40,7 @@ pub(super) fn client(
     let peer = authenticate(endpoint.trust, endpoint.actor, proof, &hello)?;
     let actor = peer.actor;
     verify_peer_against_local_log(
-        endpoint.paths.as_ref(),
+        endpoint.custody(),
         endpoint.trust,
         &peer.request,
         peer.log.as_deref(),

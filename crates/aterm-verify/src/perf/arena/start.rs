@@ -728,11 +728,11 @@ impl Launcher {
                 .map_err(|e| format!("could not create {}: {e}", d.display()))?;
             private(d)?;
         }
-        std::fs::write(root.join("config/aterm/aterm.toml"), config())
+        crate::write_fresh(root.join("config/aterm/aterm.toml"), config())
             .map_err(|e| format!("could not write the config: {e}"))?;
         let _ = std::fs::remove_file(sock);
         let log_path = root.join("aterm.log");
-        let log = std::fs::File::create(&log_path)
+        let log = crate::create_stdio_file(&log_path)
             .map_err(|e| format!("could not create {}: {e}", log_path.display()))?;
         let log_err = log
             .try_clone()
@@ -899,7 +899,8 @@ pub(crate) fn freeze(label: &str, source: &Path, dir: &Path) -> Result<Frozen, S
     let before = sha256_file(&source)?;
     let version = identity(&source)?;
     let frozen = dir.join(format!("{label}-aterm"));
-    std::fs::copy(&source, &frozen).map_err(|e| format!("{label}: could not stage: {e}"))?;
+    crate::copy_regular_fresh(&source, &frozen)
+        .map_err(|e| format!("{label}: could not stage: {e}"))?;
     let after = sha256_file(&source)?;
     let staged = sha256_file(&frozen)?;
     if before != after || before != staged {
@@ -948,7 +949,19 @@ pub(crate) fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String
         .tempdir_in(parent)
         .map_err(|e| format!("could not stage {}: {e}", path.display()))?;
     let tmp = tmp_dir.path().join("out.json");
-    std::fs::write(&tmp, text).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    }
+    opts.open(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(text.as_bytes())
+        })
+        .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("could not place {}: {e}", path.display()))?;
     eprintln!("json_result: {}", path.display());
     Ok(())

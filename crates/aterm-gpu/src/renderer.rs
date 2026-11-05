@@ -6820,6 +6820,15 @@ impl GpuRenderer {
         self.shimmer_phase_pin = phase;
     }
 
+    /// Test seam: whether `input` feeds the bloom, the one thing the bloom's switch adds to a
+    /// frame ([`fx_gpu::bloom_source_live`]).
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn bloom_source_live_for_test(input: &RenderInput) -> bool {
+        fx_gpu::bloom_source_live(input)
+    }
+
     /// Test helper.
     #[doc(hidden)]
     #[must_use]

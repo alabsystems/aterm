@@ -152,8 +152,9 @@ fn tell(dir: &Path, sid: &str, lines: &[String], deadline: Instant) -> std::io::
     stream.set_read_timeout(Some(left()))?;
     let mut reader = std::io::BufReader::new(&stream);
     for _ in lines {
+        use std::io::Read as _;
         let mut reply = String::new();
-        if reader.read_line(&mut reply)? == 0 || Instant::now() >= deadline {
+        if (&mut reader).take(64 * 1024).read_line(&mut reply)? == 0 || Instant::now() >= deadline {
             break;
         }
     }

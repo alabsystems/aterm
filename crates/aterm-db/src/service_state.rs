@@ -22,46 +22,67 @@ use std::{
 
 const CURRENT_FOR: Duration = Duration::from_secs(60);
 
-/// Service facts and the original process-local start of their metadata read.
-/// Cache readers retain this publication; reading it never renews its age.
+/// One service's facts and the process-local start of the read that produced them.
 #[derive(Clone, Debug)]
-pub struct Publication {
-    states: ServiceStates,
+struct Sample {
+    state: ServiceState,
     sampled_at: Instant,
 }
 
-impl Publication {
-    pub fn new(states: ServiceStates, sampled_at: Instant) -> Self {
-        Self { states, sampled_at }
+impl Sample {
+    /// Expire this service, preserving all its last-observed metadata.
+    fn current_at(&self, now: Instant, wall_ms: Option<u64>) -> ServiceState {
+        let mut service = self.state.clone();
+        let current = now
+            .checked_duration_since(self.sampled_at)
+            .is_some_and(|age| age <= CURRENT_FOR);
+        let recent = current
+            && wall_ms.is_some_and(|wall| {
+                service.observed_at_ms != 0
+                    && wall
+                        .checked_sub(service.observed_at_ms)
+                        .is_some_and(|age| age <= 60_000)
+            });
+        if service.availability != ServiceAvailability::Unknown && !recent {
+            service.detail = format!(
+                "This service observation is no longer current. Last observed {:?}: {}",
+                service.availability, service.detail
+            );
+            service.availability = ServiceAvailability::Unknown;
+        }
+        service
     }
+}
 
-    pub const fn sampled_at(&self) -> Instant {
-        self.sampled_at
+/// Each service's own sample. A slow read of one ages only that one, which expires on its own.
+/// Cache readers retain this publication; reading it never renews an age.
+#[derive(Clone, Debug)]
+pub struct Publication {
+    accounts: Sample,
+    secrets: Sample,
+}
+
+impl Publication {
+    /// Both services as sampled together at one instant.
+    pub fn new(states: ServiceStates, sampled_at: Instant) -> Self {
+        Self {
+            accounts: Sample {
+                state: states.accounts,
+                sampled_at,
+            },
+            secrets: Sample {
+                state: states.secrets,
+                sampled_at,
+            },
+        }
     }
 
     /// Expire each service independently, preserving all last-observed metadata.
     pub fn current_at(&self, now: Instant, wall_ms: Option<u64>) -> ServiceStates {
-        let mut states = self.states.clone();
-        let current = now
-            .checked_duration_since(self.sampled_at)
-            .is_some_and(|age| age <= CURRENT_FOR);
-        for service in [&mut states.accounts, &mut states.secrets] {
-            let recent = current
-                && wall_ms.is_some_and(|wall| {
-                    service.observed_at_ms != 0
-                        && wall
-                            .checked_sub(service.observed_at_ms)
-                            .is_some_and(|age| age <= 60_000)
-                });
-            if service.availability != ServiceAvailability::Unknown && !recent {
-                service.detail = format!(
-                    "This service observation is no longer current. Last observed {:?}: {}",
-                    service.availability, service.detail
-                );
-                service.availability = ServiceAvailability::Unknown;
-            }
+        ServiceStates {
+            accounts: self.accounts.current_at(now, wall_ms),
+            secrets: self.secrets.current_at(now, wall_ms),
         }
-        states
     }
 }
 
@@ -93,28 +114,35 @@ impl ObservationHandle {
 }
 
 fn sample_with(
-    clock: impl FnOnce() -> (Instant, Option<u64>),
-    read: impl FnOnce(u64) -> ServiceStates,
+    clock: impl Fn() -> (Instant, Option<u64>),
+    read_accounts: impl FnOnce(u64) -> ServiceState,
+    read_secrets: impl FnOnce(u64) -> ServiceState,
 ) -> Publication {
-    let (at, wall) = clock();
-    Publication::new(read(wall.unwrap_or(0)), at)
+    fn sampled(
+        clock: &impl Fn() -> (Instant, Option<u64>),
+        read: impl FnOnce(u64) -> ServiceState,
+    ) -> Sample {
+        let (sampled_at, wall) = clock();
+        Sample {
+            state: read(wall.unwrap_or(0)),
+            sampled_at,
+        }
+    }
+    Publication {
+        accounts: sampled(&clock, read_accounts),
+        secrets: sampled(&clock, read_secrets),
+    }
 }
 
-/// Capture the sample start before either potentially slow service read.
+/// Read service metadata off the window thread, each service's sample starting just before its
+/// own potentially slow read. Existing table reads use the ordinary authenticated Commons custody
+/// path; no application table is created.
 pub fn observe_publication(paths: &Paths, config: &Path) -> Publication {
     sample_with(
         || (Instant::now(), aterm_time::unix_millis()),
-        |wall| observe(paths, config, wall),
+        |wall| accounts(paths, config, wall),
+        |wall| secrets(paths, wall),
     )
-}
-
-/// Read service metadata off the window thread. Existing table reads use the
-/// ordinary authenticated Commons custody path; no application table is created.
-pub fn observe(paths: &Paths, config: &Path, now_ms: u64) -> ServiceStates {
-    ServiceStates {
-        accounts: accounts(paths, config, now_ms),
-        secrets: secrets(paths, now_ms),
-    }
 }
 
 fn state(availability: ServiceAvailability, now_ms: u64, detail: &str) -> ServiceState {
@@ -133,11 +161,19 @@ fn failed_observation(now_ms: u64, detail: &str) -> ServiceState {
     }
 }
 
-fn control_busy(now_ms: u64) -> ServiceState {
+pub(crate) fn control_busy(now_ms: u64) -> ServiceState {
     state(
         ServiceAvailability::Unknown,
         now_ms,
         "Commons custody, control history or the account table is busy; waiting to check account access",
+    )
+}
+
+fn out_of_time(now_ms: u64) -> ServiceState {
+    state(
+        ServiceAvailability::Unknown,
+        now_ms,
+        "Ran out of time before account access could be read; this machine may be heavily loaded",
     )
 }
 
@@ -320,31 +356,52 @@ fn secret_metadata(
     }
 }
 
-fn accounts(paths: &Paths, config: &Path, now_ms: u64) -> ServiceState {
-    // This observer runs off the window thread. Give an active local batch time
-    // to release custody, then obtain fresh authorization within the same wait.
-    accounts_until(
-        paths,
-        config,
-        now_ms,
-        std::time::Instant::now() + Duration::from_secs(2),
-    )
+pub(crate) fn accounts(paths: &Paths, config: &Path, now_ms: u64) -> ServiceState {
+    // This observer runs off the window thread. Give an active local batch the short admission
+    // time to release custody, and let the read go on until its sample would no longer be current.
+    let read_by = Instant::now() + CURRENT_FOR;
+    accounts_until(paths, config, now_ms, &crate::admission::deadline, read_by)
 }
 
-fn accounts_until(
+/// Two bounds for two things. `wait` is asked as each stage that waits for a holder starts, and
+/// says when that stage's waits end: the vault and custody locks of this home and, on a successor
+/// home, of each predecessor. One answer covers a stage's locks and the reading between them, so
+/// reading before the stage costs it nothing and reading inside the stage can spend it. An attempt
+/// is made however late it is, so a read says busy only on meeting a holder. Control history and
+/// the tables have no wait: they read beside their writers, and a vault writer or a newer witness
+/// met there is busy at once.
+///
+/// `read_by` is when the read says it ran out of time rather than calling the machine's pace
+/// contention. It is a gate, not a limit on reading: selection and the session refuse past it, as
+/// do a successor home's generation checks at each table it opens. An ordinary home's last gate
+/// is the session, so a read past that finishes. Either way a finished read is true however late
+/// it finished: a sample starts ageing when it is taken ([`Sample`]), so one read too slowly just
+/// shows as no longer current.
+pub(crate) fn accounts_until(
     paths: &Paths,
     config: &Path,
     now_ms: u64,
-    deadline: std::time::Instant,
+    wait: &dyn Fn() -> Instant,
+    read_by: Instant,
 ) -> ServiceState {
-    let expired = || Instant::now() >= deadline;
-    if expired() {
-        return control_busy(now_ms);
-    }
-    let selected = match crate::generation::observed_paths_until(paths, deadline) {
+    // A holder or the read's own time stopped it short, so it learned nothing. Any other
+    // error is a finding.
+    let stopped = |error: &crate::Error| {
+        if error.is_busy() {
+            Some(control_busy(now_ms))
+        } else if Instant::now() >= read_by {
+            Some(out_of_time(now_ms))
+        } else {
+            None
+        }
+    };
+    let selected = match crate::generation::observed_paths_within(paths, read_by, wait) {
         Ok(paths) => paths,
-        Err(error) if error.is_busy() || expired() => return control_busy(now_ms),
-        Err(_) => return failed_observation(now_ms, "Commons writer recovery is pending"),
+        Err(error) => {
+            return stopped(&error).unwrap_or_else(|| {
+                failed_observation(now_ms, "Commons writer recovery is pending")
+            });
+        }
     };
     let paths = &selected;
     match commons::observe(paths) {
@@ -377,14 +434,12 @@ fn accounts_until(
     }
     // Observation must not establish missing current or predecessor custody.
     let bootstrap =
-        match commons::bootstrap::Bootstrap::established_with_journal_until(paths, deadline) {
+        match commons::bootstrap::Bootstrap::established_with_journal_until(paths, wait()) {
             Ok((bootstrap, _)) => bootstrap,
             Err(error) => {
-                return if crate::table::failure(error).is_busy() || expired() {
-                    control_busy(now_ms)
-                } else {
+                return stopped(&crate::table::failure(error)).unwrap_or_else(|| {
                     failed_observation(now_ms, "Commons custody could not be verified")
-                };
+                });
             }
         };
     let directory = crate::catalog::Directory::new(paths, bootstrap.trust());
@@ -401,35 +456,39 @@ fn accounts_until(
     };
     #[cfg(test)]
     tests::bootstrapped();
-    let session = match crate::table::Session::observe_until(&bootstrap, deadline) {
+    let session = match crate::table::Session::observe_within(&bootstrap, read_by, wait) {
         Ok(session) => session,
-        Err(error) if error.is_busy() || expired() => return control_busy(now_ms),
-        Err(_) => {
-            return failed_observation(now_ms, "Account access could not be verified");
+        Err(error) => {
+            return stopped(&error).unwrap_or_else(|| {
+                failed_observation(now_ms, "Account access could not be verified")
+            });
         }
     };
     #[cfg(test)]
     tests::observed();
     // The session and table snapshots read beside writers. A newer control
     // history or table witness makes this observation stale; read it afresh.
-    // Within the budget, changed claims refuse and damaged custody remains a failure.
-    let moved = || {
-        expired()
-            || match crate::table::Session::observe_until(&bootstrap, deadline)
+    // Otherwise changed claims refuse and damaged custody remains a failure.
+    let stale = |error: &crate::Error| {
+        stopped(error).or_else(|| {
+            match crate::table::Session::observe_within(&bootstrap, read_by, wait)
                 .and_then(|now| now.observation())
             {
                 Ok(current) => session
                     .observation()
-                    .is_ok_and(|previous| current != previous),
-                Err(error) => error.is_busy(),
+                    .is_ok_and(|previous| current != previous)
+                    .then(|| control_busy(now_ms)),
+                Err(error) => stopped(&error),
             }
+        })
     };
     // A retained enrollment claim can outlive its data directory.
     let catalog = match directory.observe_with_config(&session, config) {
         Ok(catalog) => catalog,
-        Err(error) if error.is_busy() || moved() => return control_busy(now_ms),
-        Err(_) => {
-            return failed_observation(now_ms, "Shared catalog metadata could not be read");
+        Err(error) => {
+            return stale(&error).unwrap_or_else(|| {
+                failed_observation(now_ms, "Shared catalog metadata could not be read")
+            });
         }
     };
     let blocker = match catalog.entries.get(&descriptor.scope.digest()) {
@@ -468,9 +527,10 @@ fn accounts_until(
                 "Account proposals not retained locally; harness rosters are separate",
             );
         }
-        Err(error) if error.is_busy() || moved() => return control_busy(now_ms),
-        Err(_) => {
-            return failed_observation(now_ms, "Retained account storage could not be opened");
+        Err(error) => {
+            return stale(&error).unwrap_or_else(|| {
+                failed_observation(now_ms, "Retained account storage could not be opened")
+            });
         }
     };
     #[cfg(test)]
@@ -478,14 +538,12 @@ fn accounts_until(
     let snapshot =
         match crate::accounts::proposals::Proposals::snapshot_from_store(&session, &store) {
             Ok(snapshot) => snapshot,
-            Err(error) if error.is_busy() || moved() => return control_busy(now_ms),
-            Err(_) => {
-                return failed_observation(now_ms, "Retained account records could not be read");
+            Err(error) => {
+                return stale(&error).unwrap_or_else(|| {
+                    failed_observation(now_ms, "Retained account records could not be read")
+                });
             }
         };
-    if expired() {
-        return control_busy(now_ms);
-    }
     let counts = account_counts(&snapshot.cells);
     let mut result = state(
         ServiceAvailability::Cached,
@@ -595,8 +653,20 @@ impl Drop for Runtime {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A read's own bound where a test holds it to none: the hang detector.
+    fn hang_detector() -> Instant {
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN
+    }
+
+    fn observe(paths: &Paths, config: &Path, now_ms: u64) -> ServiceStates {
+        ServiceStates {
+            accounts: accounts(paths, config, now_ms),
+            secrets: secrets(paths, now_ms),
+        }
+    }
 
     fn sampled_states(wall: u64) -> ServiceStates {
         let service = ServiceState {
@@ -685,28 +755,35 @@ mod tests {
                 .availability,
             ServiceAvailability::Unknown
         );
-        assert_eq!(publication.states, states);
+        assert_eq!(publication.accounts.state, states.accounts);
+        assert_eq!(publication.secrets.state, states.secrets);
     }
 
+    /// Each sample starts before its own read, so a read past the lease expires its own service
+    /// and leaves the next one, read after it, current.
     #[test]
-    fn sample_clock_is_taken_before_the_metadata_reader_runs() {
+    fn a_slow_accounts_read_expires_accounts_and_leaves_secrets_cached() {
         let at = Instant::now();
-        let now = std::cell::Cell::new(at);
+        let now = std::cell::Cell::new((at, 100_000));
         let publication = sample_with(
-            || (now.get(), Some(100_000)),
-            |wall| {
-                now.set(at + Duration::from_secs(70));
-                sampled_states(wall)
+            || {
+                let (at, wall) = now.get();
+                (at, Some(wall))
             },
+            |wall| {
+                now.set((at + Duration::from_secs(70), 170_000));
+                sampled_states(wall).accounts
+            },
+            |wall| sampled_states(wall).secrets,
         );
-        assert_eq!(publication.sampled_at(), at);
-        assert_eq!(
-            publication
-                .current_at(now.get(), Some(110_000))
-                .secrets
-                .availability,
-            ServiceAvailability::Unknown
-        );
+        assert_eq!(publication.accounts.sampled_at, at);
+        let (read_at, wall) = now.get();
+        assert_eq!(publication.secrets.sampled_at, read_at);
+        let current = publication.current_at(read_at, Some(wall));
+        assert_eq!(current.accounts.availability, ServiceAvailability::Unknown);
+        assert_eq!(current.accounts.observed_at_ms, 100_000);
+        assert_eq!(current.secrets.availability, ServiceAvailability::Cached);
+        assert_eq!(current.secrets.observed_at_ms, 170_000);
     }
 
     #[test]
@@ -725,7 +802,7 @@ mod tests {
             ServiceAvailability::Unknown
         );
         drop(held);
-        assert_eq!(handle.try_publication().unwrap().sampled_at(), at);
+        assert_eq!(handle.try_publication().unwrap().accounts.sampled_at, at);
         handle.replace(Publication::new(
             sampled_states(120_000),
             at + Duration::from_secs(61),
@@ -1463,20 +1540,53 @@ mod tests {
         assert!(!home.exists());
     }
 
+    /// A read that runs out of its own time reports that, not a holder and not a verdict: it read
+    /// nothing, and nothing holds this home.
     #[test]
-    fn expired_account_observation_does_not_report_unread_state_as_unavailable() {
+    fn a_read_out_of_time_says_so_rather_than_busy_or_unavailable() {
         let root = aterm_tempfile::tempdir().unwrap();
         let paths = Paths::for_home(&root.path().join("not-observed"));
-        let state = accounts_until(
-            &paths,
-            &paths.home.join("config.toml"),
-            1000,
-            Instant::now(),
-        );
-        assert_eq!(state.availability, ServiceAvailability::Unknown);
-        assert!(!state.refresh_failed);
-        assert_eq!(state.last_success_ms, None);
+        let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
+        for paths in [&paths, &lab.paths[0]] {
+            let config = paths.home.join("config.toml");
+            let spent = Instant::now();
+            let state = accounts_until(paths, &config, 1000, &hang_detector, spent);
+            assert_eq!(state, out_of_time(1000), "{}", paths.home.display());
+        }
         assert!(!paths.home.exists());
+    }
+
+    /// A slow machine is not a holder. With every wait for a holder already spent as it starts, a
+    /// read nothing holds up still finishes, and what it read is the answer: no wall-clock gate on
+    /// the way can refuse it, on whatever load.
+    #[test]
+    fn a_spent_holder_wait_still_reads_what_nobody_holds() {
+        use crate::accounts::proposals::Proposals;
+        use aterm_secrets::commons::roster::Role;
+        let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+        let paths = &lab.paths[0];
+        let config = paths.home.join("config.toml");
+        Proposals::at(paths.clone()).initialize().unwrap();
+        let read = accounts_until(paths, &config, 1000, &Instant::now, hang_detector());
+        assert_eq!(read.availability, ServiceAvailability::Cached, "{read:?}");
+        assert_eq!(read.last_success_ms, Some(1000));
+    }
+
+    /// The wait for a holder starts when it is needed, so what the read did before custody cannot
+    /// use it up: a read that never reaches custody never starts one.
+    #[test]
+    fn the_wait_for_a_holder_is_not_taken_before_the_custody_stage() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(&root.path().join("home"));
+        let config = paths.home.join("config.toml");
+        let read = accounts_until(
+            &paths,
+            &config,
+            1000,
+            &|| panic!("a read that stops before custody took a wait for a holder"),
+            hang_detector(),
+        );
+        assert_eq!(read.availability, ServiceAvailability::Unavailable);
     }
 
     #[test]
@@ -1679,12 +1789,7 @@ mod tests {
                 Proposals::at(paths.clone()).initialize().unwrap();
             }
             let before = table_storage_bytes(&paths.dir);
-            let observed = accounts_until(
-                paths,
-                &config,
-                1000,
-                Instant::now() + Duration::from_secs(60),
-            );
+            let observed = accounts(paths, &config, 1000);
             assert_eq!(table_storage_bytes(&paths.dir), before, "{case}");
             assert!(!observed.refresh_failed, "{case}");
             if case == "usable" {
@@ -1759,6 +1864,10 @@ mod tests {
             hook();
         }
     }
+    /// Run `hook` once this thread's next read has admitted its home's custody.
+    pub(crate) fn after_custody(hook: impl FnMut() + 'static) {
+        BOOTSTRAPPED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
     pub(super) fn observed() {
         let hook = OBSERVED.with(|hook| hook.borrow_mut().take());
         if let Some(mut hook) = hook {
@@ -1806,9 +1915,7 @@ mod tests {
         });
         let busy = accounts(&paths, &config, 1000);
         assert!(BOOTSTRAPPED.with(|hook| hook.borrow().is_none()));
-        assert_eq!(busy.availability, ServiceAvailability::Unknown, "{busy:?}");
-        assert!(!busy.refresh_failed, "{busy:?}");
-        assert_eq!(busy.last_success_ms, None);
+        assert_eq!(busy, control_busy(1000), "{busy:?}");
         drop(held.borrow_mut().take());
         assert_eq!(
             accounts(&paths, &config, 2000).availability,
@@ -1836,9 +1943,8 @@ mod tests {
             "held",
         )
         .unwrap();
-        let busy = accounts(paths, &config, 1000);
-        assert_eq!(busy.availability, ServiceAvailability::Unknown, "{busy:?}");
-        assert!(!busy.refresh_failed);
+        let busy = accounts_until(paths, &config, 1000, &Instant::now, hang_detector());
+        assert_eq!(busy, control_busy(1000), "{busy:?}");
         drop(custody);
 
         // A writer in either journal leaves its witnessed account prefix readable.

@@ -274,7 +274,7 @@ mod apple {
             Err(TryLockError::Poisoned(held)) => held.into_inner(),
             Err(TryLockError::WouldBlock) => {
                 #[cfg(any(test, debug_assertions))]
-                let _queued = super::seam::Queued::exclusive();
+                let _waiting = super::seam::Waiting::exclusive();
                 SPAWN_LOCK.write().unwrap_or_else(PoisonError::into_inner)
             }
         };
@@ -290,13 +290,18 @@ mod apple {
 /// can tell whose hold a spawn or a creation waits behind.
 #[cfg(any(test, debug_assertions))]
 pub mod seam {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, PoisonError};
     use std::thread::ThreadId;
 
     static QUEUED: Mutex<Vec<ThreadId>> = Mutex::new(Vec::new());
 
-    /// The threads waiting to hold the lock exclusively.
-    static EXCLUSIVE_QUEUED: Mutex<Vec<ThreadId>> = Mutex::new(Vec::new());
+    /// How many threads wait to hold the lock exclusively. A count, not a list: a wait here sits
+    /// in every creation's path (a records write, a socket), and a list's first push leaves its
+    /// buffer and Darwin's boxed mutex allocated on the waiting thread for good, the 96 bytes a
+    /// test counting one records write's retained heap caught whenever another test's creation
+    /// held the lock (aterm-secrets' `server_record_persistence_memory`, 6 of 24 runs).
+    static EXCLUSIVE_WAITING: AtomicUsize = AtomicUsize::new(0);
 
     /// The thread holding the lock exclusively (a creation or a spawn handing a kept-out
     /// descriptor), set while it holds it.
@@ -317,10 +322,7 @@ pub mod seam {
     /// nothing takes it.
     #[must_use]
     pub fn exclusive_waiters() -> usize {
-        EXCLUSIVE_QUEUED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len()
+        EXCLUSIVE_WAITING.load(Ordering::SeqCst)
     }
 
     /// The thread that holds the lock exclusively now, if any. Always `None` off Apple, where
@@ -345,18 +347,32 @@ pub mod seam {
     impl Queued {
         /// A spawn waiting behind a creation ([`spawn_waits`]).
         pub(super) fn here() -> Self {
-            Self::on(&QUEUED)
-        }
-
-        /// A thread waiting to hold the lock exclusively ([`exclusive_waiters`]).
-        pub(super) fn exclusive() -> Self {
-            Self::on(&EXCLUSIVE_QUEUED)
-        }
-
-        fn on(list: &'static Mutex<Vec<ThreadId>>) -> Self {
             let me = std::thread::current().id();
-            list.lock().unwrap_or_else(PoisonError::into_inner).push(me);
-            Self(list, me)
+            QUEUED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(me);
+            Self(&QUEUED, me)
+        }
+    }
+
+    /// A thread counted while it waits to hold the lock exclusively ([`exclusive_waiters`]).
+    #[cfg(target_vendor = "apple")]
+    pub(super) struct Waiting(());
+
+    #[cfg(target_vendor = "apple")]
+    impl Waiting {
+        /// Count this thread until the guard drops.
+        pub(super) fn exclusive() -> Self {
+            EXCLUSIVE_WAITING.fetch_add(1, Ordering::SeqCst);
+            Self(())
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            EXCLUSIVE_WAITING.fetch_sub(1, Ordering::SeqCst);
         }
     }
 

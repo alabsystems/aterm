@@ -119,8 +119,10 @@ fn only_the_switch_chains_switch_and_only_the_measured_land_chains_land_at_once(
 }
 
 #[test]
-fn the_switch_mode_runs_its_five_cruise_chains_and_the_off_control() {
-    use Chain::{Off, SwitchAgent, SwitchBusy, SwitchFlip, SwitchOverHeld, SwitchSeq};
+fn the_switch_mode_runs_its_six_cruise_chains_and_the_off_control() {
+    use Chain::{
+        CommandDraft, Off, SwitchAgent, SwitchBusy, SwitchFlip, SwitchOverHeld, SwitchSeq,
+    };
     assert_eq!(
         Chain::of_mode(crate::forever::Mode::Switch),
         [
@@ -129,11 +131,12 @@ fn the_switch_mode_runs_its_five_cruise_chains_and_the_off_control() {
             SwitchSeq,
             SwitchFlip,
             SwitchBusy,
+            CommandDraft,
             Off
         ],
         "the held chain first: its row on the Harness page's first screen"
     );
-    for c in &Chain::SWITCH[..5] {
+    for c in &Chain::SWITCH[..6] {
         assert_eq!(c.autopilot(), "cruise", "{c:?}");
         assert!(
             Chain::every().contains(c) && !Chain::ALL.contains(c),
@@ -142,11 +145,11 @@ fn the_switch_mode_runs_its_five_cruise_chains_and_the_off_control() {
     }
     assert!(SwitchOverHeld.same_reply() && !SwitchAgent.same_reply());
     assert_eq!(
-        Chain::SWITCH[..5]
+        Chain::SWITCH[..6]
             .iter()
             .map(|c| c.scenarios()[0].id())
             .collect::<Vec<_>>(),
-        ["SWO", "SWA", "SWS", "SWF", "SWB"]
+        ["SWO", "SWA", "SWS", "SWF", "SWB", "SWC"]
     );
 }
 
@@ -537,6 +540,7 @@ fn a_switch_at_rest_lands_within_five_seconds_and_before_the_back_offs_due() {
 fn drafted(land_at: i64) -> Seen {
     let mut seen = at_rest(land_at);
     seen.cover.draft = Some(Draft {
+        text: String::new(),
         typed_ms: T0 + 8_700,
         stood: true,
         cleared_ms: Some(T0 + 23_700),
@@ -1174,4 +1178,104 @@ fn the_tapes_witness_is_each_wait_that_carried_the_word_and_woke_on_another() {
     assert!(woke_line(Some(&[]), T0).starts_with("no wait at rest"));
     assert!(woke_of(&text.replace("OK autopilot land", "OK idle")).is_empty());
     assert!(woke_in(Path::new("/nonexistent/aterm-lab-switch-tapes")).is_none());
+}
+
+/// `command-draft`'s run: [`COMMAND_DRAFT`] typed at +8.7 s into the back-off at rest, its hold
+/// journalled at the person's grace's end (+128.7 s) where `held`, `sent_at` an act the draft
+/// step's Enter sent it at (main's), cleared at +158.7 s, and the loop's next act at `next_at`.
+fn commanded(held: bool, sent_at: Option<i64>, next_at: Option<i64>) -> Seen {
+    let mut journal = vec![
+        j(
+            REST_AT,
+            "EVENT idle seq=882 ⏺ Implemented the parser module.",
+        ),
+        j(REST_AT, WAITING),
+    ];
+    if held {
+        journal.push(j(
+            128_700,
+            &format!(
+                "HOLD seq=882 point nothing why=command a person's slash command {}",
+                turn_end::COMMAND_STANDS
+            ),
+        ));
+    }
+    if let Some(t) = sent_at {
+        journal.push(j(
+            t,
+            &format!("CONTINUED seq=882 rule=continue@v1 {COMMAND_DRAFT}"),
+        ));
+    }
+    if let Some(t) = next_at {
+        journal.push(j(t, "CONTINUED seq=882 rule=continue@v1 keep going"));
+    }
+    Seen {
+        journal,
+        end_ms: T0 + 320_000,
+        cover: Cover {
+            draft: Some(Draft {
+                text: COMMAND_DRAFT.to_string(),
+                typed_ms: T0 + 8_700,
+                stood: true,
+                cleared_ms: Some(T0 + 158_700),
+                emptied: true,
+            }),
+            ..Cover::default()
+        },
+        ..Seen::default()
+    }
+}
+
+/// SWC's commands (v6 §14.17.5.8): each harness's is one its reader holds as a command, harmless
+/// where a build sends it, and agy's goes in as a paste, the one `!` form agy's composer keeps as
+/// text. Negative control: agy given the typed `/help` the others take: the paste check fails.
+#[test]
+fn each_harness_command_draft_is_a_command_its_reader_holds() {
+    use crate::forever::Harness;
+    for h in Harness::ALL {
+        let (text, pasted) = command_draft(h);
+        assert!(
+            aterm_phase::draft_command(h.program(), &[text.to_string()]).is_some(),
+            "{}: {text:?} reads as a command",
+            h.name()
+        );
+        assert_eq!(pasted, h == Harness::Agy, "{}", h.name());
+    }
+    assert_eq!(
+        aterm_phase::draft_command(aterm_phase::Program::Agy, &[AGY_COMMAND_DRAFT.to_string()]),
+        Some(aterm_phase::DraftCommand::Shell)
+    );
+}
+
+/// SWC (v6 §14.17.5.8): a person's command standing past their grace is never sent, its hold is
+/// journalled once, and once they clear it the loop's next act comes past their grace from the
+/// clearing (+278.7 s), within [`CLEAR_READ_MS`]. Controls: main's run, whose draft step sent it
+/// at the grace's end and journalled no hold; an act inside the grace from the clearing; no act
+/// past it (a loop parked for good); the hold journalled twice.
+#[test]
+fn a_persons_command_is_held_never_sent_and_the_loop_goes_on_once_it_clears() {
+    let v = judge_command(&commanded(true, None, Some(280_000)), T0);
+    assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
+    assert!(v.why().contains("held +128.7"), "{v:?}");
+    let Verdict::Fail(why) = judge_command(&commanded(false, Some(128_700), Some(280_000)), T0)
+    else {
+        panic!("main's run, its command sent, passed");
+    };
+    assert!(why.contains("typed while the command stood"), "{why}");
+    assert!(why.contains("no hold journaled"), "{why}");
+    let Verdict::Fail(why) = judge_command(&commanded(true, None, Some(200_000)), T0) else {
+        panic!("an act inside the person's grace passed");
+    };
+    assert!(why.contains("inside the person's grace"), "{why}");
+    let Verdict::Fail(why) = judge_command(&commanded(true, None, None), T0) else {
+        panic!("a loop that never went on passed");
+    };
+    assert!(why.contains("did not go on"), "{why}");
+    let mut twice = commanded(true, None, Some(280_000));
+    let hold = twice.journal[2].clone();
+    twice.journal.insert(3, (hold.0 + 1_000, hold.1));
+    let Verdict::Fail(why) = judge_command(&twice, T0) else {
+        panic!("a hold journalled twice passed");
+    };
+    assert!(why.contains("journaled 2 times"), "{why}");
 }

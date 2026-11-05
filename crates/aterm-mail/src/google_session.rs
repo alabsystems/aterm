@@ -44,35 +44,32 @@ fn email(value: &str) -> Result<String, String> {
 }
 
 fn location(home: &Path, email: &str) -> PathBuf {
-    let mut hash = aterm_digest::Sha256::new();
-    hash.update(email.as_bytes());
-    let key: String = hash
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let key = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(email.as_bytes()));
     home.join(".config/aterm/mail/google")
         .join(format!("{key}.age"))
 }
 
 #[cfg(any(unix, test))]
 fn encode(grant: &Grant) -> Result<Zeroizing<Vec<u8>>, String> {
-    let mut bytes = Zeroizing::new(b"aterm-google-mail-v1\0".to_vec());
-    for (index, field) in [
+    let fields = [
         grant.email.as_str(),
         grant.client_id.as_str(),
         grant.client_secret.as_ref().map_or("", Secret::expose),
         grant.refresh.expose(),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ];
+    let mut cap = 21 + 4 * 4;
+    for (index, field) in fields.into_iter().enumerate() {
         if (field.is_empty() && index != 2)
             || field.len() > 8192
             || field.chars().any(char::is_control)
         {
             return Err("Invalid Google mail credential".into());
         }
+        cap += field.len();
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(cap));
+    bytes.extend_from_slice(b"aterm-google-mail-v1\0");
+    for field in fields {
         bytes.extend_from_slice(&(field.len() as u32).to_le_bytes());
         bytes.extend_from_slice(field.as_bytes());
     }
@@ -198,9 +195,10 @@ pub fn accounts(home: &Path) -> Vec<String> {
         .filter_map(Result::ok)
         .filter(|entry| {
             entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "age")
+                .file_name()
+                .as_os_str()
+                .as_encoded_bytes()
+                .ends_with(b".age")
         })
         .take(128)
         .filter_map(|entry| {

@@ -160,10 +160,7 @@ struct Take(Option<std::fs::File>);
 impl Take {
     fn open(path: Option<&str>) -> Take {
         Take(path.and_then(|p| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(p)
+            crate::util::append_regular_file(std::path::Path::new(p))
                 .map_err(|e| eprintln!("\r\nlink: the take {p}: {e}\r"))
                 .ok()
         }))

@@ -321,7 +321,7 @@ pub fn signed_out(env: &[(String, String)], user: Option<&Path>) -> Option<Strin
              no worker was started. {SIGN_IN_IS_A_PERSONS}"
         ));
     };
-    match std::fs::metadata(&auth) {
+    match std::fs::symlink_metadata(&auth) {
         Ok(meta) if meta.is_file() && meta.len() > 0 => {
             (!crate::harness::grok_signin::login_accepted(&auth)).then(|| {
                 format!(

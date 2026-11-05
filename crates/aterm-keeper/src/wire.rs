@@ -364,7 +364,7 @@ pub enum RefuseCode {
     NoDescriptor = 6,
     /// A COMPANION whose descriptor is not a read-only POSIX shared-memory object of the kind and length it claims, within the keeper's bounds.
     NotAJournal = 7,
-    /// A COMPANION or COMPANION_RELEASE named a master the keeper holds no record of.
+    /// A COMPANION, COMPANION_RELEASE or RELEASE named a master the keeper holds no record of.
     NoSuchRecord = 8,
     /// A code this build does not know (a newer keeper).
     Other = 255,

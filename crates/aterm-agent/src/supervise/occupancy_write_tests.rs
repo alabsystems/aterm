@@ -42,8 +42,15 @@ struct DoorHost {
     /// The held programs the host's facts reading names (`FactsReading::held`); `None`, the part
     /// unread. With either set the host answers a reading.
     held: Mutex<Option<Vec<crate::supervise::HeldCall>>>,
+    /// How many processes the agent left that the host's facts reading names
+    /// (`FactsReading::left`, the oldest 20 minutes old); `None`, the part unread. Set, the host
+    /// answers a reading.
+    left: Mutex<Option<u32>>,
     /// The wall (unix ms) of the read the run is at, when the facts reading is taken.
     facts_at: Mutex<i64>,
+    /// The overlap the host reads ([`IdleHost::overlap`]): how many files, shared with which
+    /// sessions' sids, as of [`Self::facts_at`]; `None`, no reading, and the ask not booked.
+    overlap: Mutex<Option<(u32, Vec<String>)>>,
     calls: Mutex<Vec<String>>,
     /// The exceptions the loop put on the host ([`IdleHost::exception`]), each by its `why`, and
     /// `None` for one ended, in order.
@@ -174,7 +181,8 @@ impl IdleHost for DoorHost {
         self.called("facts".to_string());
         let calls = self.facts.lock().expect("facts").clone();
         let held = self.held.lock().expect("held").clone();
-        if calls.is_none() && held.is_none() {
+        let left = *self.left.lock().expect("left");
+        if calls.is_none() && held.is_none() && left.is_none() {
             return None;
         }
         let as_of_ms = *self.facts_at.lock().expect("facts_at");
@@ -182,7 +190,19 @@ impl IdleHost for DoorHost {
             as_of_ms,
             no_progress: calls.unwrap_or_default(),
             held: held.map(|programs| crate::supervise::HeldReading { as_of_ms, programs }),
+            left: left.map(|count| crate::supervise::LeftoverReading {
+                as_of_ms,
+                count,
+                oldest_ms: Some(20 * 60_000),
+            }),
         })
+    }
+    fn overlap(&self) -> Option<crate::supervise::overlap::OverlapReading> {
+        let (files, peers) = self.overlap.lock().expect("overlap").clone()?;
+        self.called("overlap".to_string());
+        let peers: Vec<&str> = peers.iter().map(String::as_str).collect();
+        let as_of_ms = *self.facts_at.lock().expect("facts_at");
+        crate::supervise::overlap::OverlapReading::new(as_of_ms, files, &peers)
     }
     fn occupancy_said(&self, said: &OccupancySaid) {
         self.said.lock().expect("said").push(said.clone());

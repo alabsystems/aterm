@@ -676,7 +676,7 @@ pub(crate) struct SessionJournal {
     ledger_moved: AtomicBool,
     control: Mutex<Control>,
     turn_ids: Mutex<TurnCountCustody>,
-    recovery_count: OnceLock<Arc<AtomicBool>>,
+    recovery_count: OnceLock<Arc<aterm_keeper::client::ReadObserver>>,
 }
 
 #[cfg(unix)]
@@ -857,7 +857,10 @@ impl SessionJournal {
             .map(|held| (held.region, held.len))
     }
 
-    pub(crate) fn bind_recovery_count(&self, accepted: Option<Arc<AtomicBool>>) {
+    pub(crate) fn bind_recovery_count(
+        &self,
+        accepted: Option<Arc<aterm_keeper::client::ReadObserver>>,
+    ) {
         if let Some(accepted) = accepted {
             let _ = self.recovery_count.set(accepted);
         }

@@ -471,7 +471,7 @@ impl Proton {
         self.persist_dirty()?;
         let mut nonce = [0; 32];
         aterm_uds::rand::fill(&mut nonce).map_err(|_| "Could not generate session nonce")?;
-        let state: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        let state = aterm_codec::hex::encode_lower(&nonce);
         let response = self.call(
             Method::Post,
             "/auth/v4/refresh",
@@ -817,20 +817,19 @@ impl Proton {
             );
         }
         let endpoint = format!("{API}{path}");
-        let platform = if cfg!(target_os = "macos") {
-            "macos"
-        } else if cfg!(target_os = "windows") {
-            "windows"
-        } else {
-            "linux"
-        };
         // The API validates a fixed product vocabulary. This selects its mail
         // compatibility protocol; User-Agent identifies our actual client.
-        let app_version = format!("{platform}-bridge@3.27.1");
+        let app_version = if cfg!(target_os = "macos") {
+            "macos-bridge@3.27.1"
+        } else if cfg!(target_os = "windows") {
+            "windows-bridge@3.27.1"
+        } else {
+            "linux-bridge@3.27.1"
+        };
         let mut request = self
             .client
             .request(method, &endpoint)
-            .header("x-pm-appversion", &app_version)
+            .header("x-pm-appversion", app_version)
             .header(
                 "User-Agent",
                 concat!("aterm-mail/", env!("CARGO_PKG_VERSION")),
@@ -855,13 +854,12 @@ impl Proton {
         // Proton's refresh endpoint authenticates the credentials in its body.
         // An expired access token must not become the refresh request's bearer.
         if !self.access.expose().is_empty() && path != "/auth/v4/refresh" {
+            let access = self.access.expose().as_bytes();
+            let mut bearer = Vec::with_capacity(7 + access.len());
+            bearer.extend_from_slice(b"Bearer ");
+            bearer.extend_from_slice(access);
             request = request
-                .secret_header(
-                    "Authorization",
-                    aterm_uds::secret::Secret::from_vec(
-                        format!("Bearer {}", self.access.expose()).into_bytes(),
-                    ),
-                )
+                .secret_header("Authorization", aterm_uds::secret::Secret::from_vec(bearer))
                 .secret_header(
                     "x-pm-uid",
                     aterm_uds::secret::Secret::new(self.uid.expose().as_bytes()),
@@ -1080,7 +1078,9 @@ fn project_body(mime: &str, body: &str) -> String {
     let media = mime.split(';').next().unwrap_or("").trim();
     if media.eq_ignore_ascii_case("text/html") {
         crate::mime::html_text(body)
-    } else if media.to_ascii_lowercase().starts_with("multipart/")
+    } else if media
+        .get(..10)
+        .is_some_and(|p| p.eq_ignore_ascii_case("multipart/"))
         && let Ok(parsed) = crate::mime::parse(body.as_bytes())
     {
         parsed.text

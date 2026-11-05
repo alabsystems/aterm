@@ -12,11 +12,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use aterm_agent::harness::disk::discover::Dangling;
 use aterm_sysprobe::procs::ProcessReading;
 use aterm_uds::left::{Inert, Known, LeftKernel, Live, Reader, Row};
 use aterm_uds::runs::Record;
 use aterm_vitals::jobs::{JobKind, JobsView, Verdict};
-use aterm_vitals::left::{self, ClosedTab, LeftRow, LeftView, LiveTab, RunRow, Source, Tier};
+use aterm_vitals::left::{
+    self, ClosedTab, LeftRow, LeftView, LinkRow, LiveTab, RunRow, Source, Tier,
+};
 
 use crate::vitals_host::Request;
 
@@ -35,6 +38,12 @@ pub(crate) struct LeftReaders {
     pub(crate) records: Option<PathBuf>,
     /// This boot's id ([`aterm_uds::process::boot_id`]).
     pub(crate) boot: fn() -> Option<String>,
+    /// The build directories the disk watch's last pass must keep
+    /// ([`crate::disk_board::Shelf::kept_build_dirs`]).
+    pub(crate) kept: fn() -> Vec<String>,
+    /// The dangling `target*` links the disk watch's last search recorded
+    /// ([`crate::disk_board::Shelf::dangling`]).
+    pub(crate) dangling: fn() -> Vec<Dangling>,
 }
 
 impl LeftReaders {
@@ -51,6 +60,8 @@ impl LeftReaders {
                 aterm_uds::runs::records_dir(&dir, aterm_uds::process::pid_namespace().as_deref())
             }),
             boot: aterm_uds::process::boot_id,
+            kept: || crate::disk_board::SHELF.kept_build_dirs(),
+            dangling: || crate::disk_board::SHELF.dangling(),
         }
     }
 
@@ -60,6 +71,8 @@ impl LeftReaders {
             kernel: Arc::new(Inert),
             records: None,
             boot: || None,
+            kept: Vec::new,
+            dangling: Vec::new,
         }
     }
 }
@@ -73,8 +86,8 @@ struct Tab {
     shell_uniqueid: Option<u64>,
     label: String,
     number: Option<usize>,
-    /// The lowest unique id among the agent calls seen in it.
-    agent_since: Option<u64>,
+    /// The stretches an agent ran in it ([`left::fold_agent`]).
+    agent_spans: Vec<left::AgentSpan>,
 }
 
 /// The run records last read, and when.
@@ -95,20 +108,8 @@ pub(crate) struct LeftPass {
     /// Programs outside every job that have not started (held, translating, not started, or
     /// stopped or traced) that W-session ties to a live tab, by pid: the jobs pass names them by
     /// that tab ([`Self::ties`]).
-    ties: BTreeMap<u32, u64>,
+    ties: BTreeMap<u32, left::Tie>,
     view: Option<Arc<LeftView>>,
-}
-
-/// A sweep row of this uid in the reader's form.
-fn row_of(p: &ProcessReading) -> Row {
-    Row {
-        pid: p.pid,
-        ppid: p.ppid,
-        pgid: p.pgid,
-        start: p.start,
-        cpu_ns: p.cpu_ns,
-        birth_ms: p.birth_ms,
-    }
 }
 
 /// The pids `jobs` names as not started for another reason than macOS's program check
@@ -151,8 +152,9 @@ impl LeftPass {
     }
 
     /// The live tab a session-mate's environment ties each program that has not started to, by
-    /// pid, as the last reading judged it (W-session: orphaned, born in that tab's window).
-    pub(crate) fn ties(&self) -> BTreeMap<u32, u64> {
+    /// pid, as the last reading judged it (W-session: orphaned, born in that tab's window), with
+    /// whether it was born after that tab's agent started ([`left::Tie::after_agent`]).
+    pub(crate) fn ties(&self) -> BTreeMap<u32, left::Tie> {
         self.ties.clone()
     }
 
@@ -198,16 +200,7 @@ impl LeftPass {
         let Some(sweep) = sweep else {
             return self.view.clone();
         };
-        let uid = sweep
-            .iter()
-            .find(|p| p.pid == req.self_pid)
-            .and_then(|p| p.uid);
-        let rows: Vec<Row> = sweep
-            .iter()
-            .filter(|p| uid.is_some() && p.uid == uid)
-            .filter(|p| p.state != aterm_sysprobe::jobs::RunState::Zombie)
-            .map(row_of)
-            .collect();
+        let rows: Vec<Row> = aterm_uds::left::rows_of(sweep, req.self_pid);
         self.refresh_records(at_ms);
         let held = jobs
             .map(|v| left::held_of(v, jobs_age_ms))
@@ -231,9 +224,9 @@ impl LeftPass {
             shells: &shells,
         };
         let kernel = Arc::clone(&self.readers.kernel);
-        let reading = self.reader.read(&*kernel, &rows, &known);
+        let mut reading = self.reader.read(&*kernel, &rows, &known);
         self.see_tabs(&*kernel, sweep, req, jobs, reading.horizon, at_ms);
-        self.append_dead_seen(&*kernel, req.self_pid, &reading.runs, at_ms);
+        self.append_dead_seen(&*kernel, req.self_pid, &mut reading.runs, at_ms);
 
         let fg: BTreeMap<u64, u32> = jobs
             .map(left::foreground_groups)
@@ -249,7 +242,7 @@ impl LeftPass {
                 shell_pid: t.shell_pid,
                 shell_uniqueid: t.shell_uniqueid,
                 fg_pgid: fg.get(&key).copied(),
-                agent_since: t.agent_since,
+                agent_spans: t.agent_spans.clone(),
             })
             .collect();
         let closed: Vec<ClosedTab> = self.closed.iter().cloned().collect();
@@ -273,7 +266,7 @@ impl LeftPass {
             .filter(|f| f.held.is_some() || unstarted.contains(&f.pid))
             .filter_map(|f| {
                 let tie = left::session_of(f, &ctx)?;
-                (!tie.closed).then_some((f.pid, tie.key))
+                (!tie.closed).then_some((f.pid, tie))
             })
             .collect();
         for tab in &mut self.closed {
@@ -314,18 +307,26 @@ impl LeftPass {
         self.view = Some(Arc::new(LeftView {
             rows,
             runs,
-            links: Vec::new(),
+            links: link_rows(&(self.readers.dangling)()),
             closed: self.closed.iter().cloned().collect(),
             live,
             complete,
             bounded: reading.bounded,
+            as_of_ms: at_ms,
+            build_dirs: (self.readers.kept)(),
         }));
         self.view.clone()
     }
 
-    /// Takes this reading's tabs: a tab first seen has its shell's unique id read once; a tab
-    /// the last reading had and this one lacks closed, and keeps its shell's unique id and this
-    /// reading's horizon, unless its shell was never read.
+    /// Takes this reading's tabs: a tab first seen has its shell's unique id read once; its agent
+    /// stretches fold in this reading's word on its agent ([`left::fold_agent`]): the lowest
+    /// unique id among each agent call the jobs view names in it and the agent group leader the
+    /// host names ([`aterm_vitals::model::TabRoot::agent_leader`]), so a process a short call left
+    /// that no jobs pass saw still reads as born while the agent ran, and with neither named the
+    /// open stretch closes at this reading's horizon, so what the person starts once the agent is
+    /// gone reads as theirs; a tab the last reading had and this one lacks closed, and keeps its
+    /// shell's unique id, its stretches and this reading's horizon, unless its shell was never
+    /// read.
     fn see_tabs(
         &mut self,
         kernel: &dyn LeftKernel,
@@ -358,14 +359,20 @@ impl LeftPass {
             if let Some(p) = req.layout.iter().find(|p| p.key == t.key) {
                 tab.number = Some(p.tab);
             }
-            for call in jobs.into_iter().flat_map(|v| &v.rows).filter(|r| {
-                r.tab == t.key && r.kind == JobKind::AgentCall && r.verdict != Verdict::Exited
-            }) {
-                let leader = call.leader.0;
-                if let Some(id) = self.reader.uniqueid(kernel, leader, start_of(leader)) {
-                    tab.agent_since = Some(tab.agent_since.map_or(id, |a| a.min(id)));
-                }
-            }
+            let leaders: Vec<u32> = jobs
+                .into_iter()
+                .flat_map(|v| &v.rows)
+                .filter(|r| {
+                    r.tab == t.key && r.kind == JobKind::AgentCall && r.verdict != Verdict::Exited
+                })
+                .map(|call| call.leader.0)
+                .chain(t.agent_leader)
+                .collect();
+            let since = leaders
+                .iter()
+                .filter_map(|&leader| self.reader.uniqueid(kernel, leader, start_of(leader)))
+                .min();
+            left::fold_agent(&mut tab.agent_spans, !leaders.is_empty(), since, horizon);
             now.insert(t.key, tab);
         }
         for (key, tab) in std::mem::replace(&mut self.live, now) {
@@ -380,7 +387,7 @@ impl LeftPass {
                 shell_uniqueid,
                 horizon,
                 closed_ms: at_ms,
-                agent_since: tab.agent_since,
+                agent_spans: tab.agent_spans,
                 left: 0,
             });
             while self.closed.len() > CLOSED_KEPT {
@@ -389,47 +396,76 @@ impl LeftPass {
         }
     }
 
-    /// Appends the `dead_seen` line to each dead run's record that has none: the highest unique
-    /// id of a table of this uid read after this reading found the launcher dead
-    /// ([`aterm_uds::runs::table`]), never the sweep's, which was read before, so whatever the
-    /// run started before it died is inside its window. A table that does not read whole writes
-    /// none, and a later reading tries again. A record keeps its first such line; the record as
-    /// read takes the line too, so the readings until the next read of the folder append none.
+    /// Records the first `dead_seen` observation of each dead run's record that has none
+    /// ([`aterm_uds::left::append_dead_seen`]), and caches only the pair a record actually keeps
+    /// into the records as read, so the readings until the next read of the folder append none.
     fn append_dead_seen(
         &mut self,
         kernel: &dyn LeftKernel,
         self_pid: u32,
-        runs: &[aterm_uds::left::RunRead],
+        runs: &mut [aterm_uds::left::RunRead],
         at_ms: u64,
     ) {
-        let mut dead = runs
-            .iter()
-            .filter(|r| r.dead && r.record.dead_seen.is_none())
-            .peekable();
-        if dead.peek().is_none() {
-            return;
-        }
-        let Some((_, horizon)) = i32::try_from(self_pid)
-            .ok()
-            .and_then(|me| aterm_uds::runs::table(kernel, me))
-        else {
-            return;
-        };
-        for run in dead {
-            let Ok(recorded) =
-                aterm_uds::runs::append_dead_seen(&run.path, &run.record, horizon, at_ms)
-            else {
-                continue;
-            };
+        aterm_uds::left::append_dead_seen(kernel, self_pid, runs, at_ms);
+        for run in runs.iter().filter(|r| r.record.dead_seen.is_some()) {
             if let Some((_, rec)) = self
                 .records
                 .list
                 .iter_mut()
-                .find(|(path, _)| *path == run.path)
+                .find(|(path, rec)| *path == run.path && rec.dead_seen.is_none())
             {
-                rec.dead_seen = Some(recorded.horizon);
-                rec.dead_seen_ms = Some(recorded.at_ms);
+                rec.dead_seen = run.record.dead_seen;
+                rec.dead_seen_ms = run.record.dead_seen_ms;
             }
+        }
+    }
+}
+
+/// The view's `link` rows of the disk watch's dangling links, each checkout numbered 1-based in
+/// the order the links first name it.
+fn link_rows(dangling: &[Dangling]) -> Vec<LinkRow> {
+    let mut checkouts: Vec<&std::path::Path> = Vec::new();
+    dangling
+        .iter()
+        .map(|d| {
+            let root = match checkouts.iter().position(|c| *c == d.checkout.as_path()) {
+                Some(at) => at + 1,
+                None => {
+                    checkouts.push(&d.checkout);
+                    checkouts.len()
+                }
+            };
+            LinkRow {
+                root,
+                checkout: d.checkout.display().to_string(),
+                path: d.link.display().to_string(),
+                kind: "target".to_owned(),
+                target: d.state,
+                seen: "disk".to_owned(),
+            }
+        })
+        .collect()
+}
+
+/// ONE PID READ AGAIN ([`reread`]): whether the read was made, and what it found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Reread {
+    /// The read was made: the pid's view, `None` where it is gone, is no candidate or is this
+    /// process.
+    Read(Option<LeftView>),
+    /// The read could not be made: the process table did not list, the run records did not read,
+    /// or the host's tabs could not be captured or changed during it. Whether the row still runs
+    /// is unknown.
+    Unread,
+}
+
+impl Reread {
+    /// The view read, as `end`'s re-proof takes it: none where the read could not be made, which
+    /// proves nothing.
+    pub(crate) fn view(self) -> Option<LeftView> {
+        match self {
+            Self::Read(view) => view,
+            Self::Unread => None,
         }
     }
 }
@@ -437,9 +473,10 @@ impl LeftPass {
 /// `pid` read again on fresh state and judged against the host's freshly captured live and
 /// confirmed closed tabs: the `end` verb's re-proof before each signal. No cached jobs view
 /// supplies foreground, held or waiting authority. Every kernel read is made anew
-/// ([`aterm_uds::left::read_one`]), and the run records are read again from the rendezvous; none
-/// read is no record, so a run's tie then proves nothing. `None` when the pid is gone, is no
-/// candidate, or is this process.
+/// ([`aterm_uds::left::read_one`]), and the run records are read again from the rendezvous (an
+/// instance with no rendezvous holds none). [`Reread::Read`] of `None` when the pid is gone, is
+/// no candidate, or is this process; [`Reread::Unread`] when the process table or the run records
+/// do not read.
 pub(crate) fn reread(
     readers: &LeftReaders,
     live: &[LiveTab],
@@ -447,15 +484,19 @@ pub(crate) fn reread(
     self_pid: u32,
     pid: u32,
     now_ms: u64,
-) -> Option<LeftView> {
+) -> Reread {
     if pid == self_pid {
-        return None;
+        return Reread::Read(None);
     }
-    let records = readers
+    let records = match readers
         .records
         .as_deref()
-        .and_then(|dir| aterm_uds::runs::read_records(dir).ok())
-        .unwrap_or_default();
+        .map(aterm_uds::runs::read_records)
+    {
+        None => Vec::new(),
+        Some(Ok(records)) => records,
+        Some(Err(_)) => return Reread::Unread,
+    };
     let shells: Vec<(u64, u32)> = live
         .iter()
         .filter(|t| t.shell_pid > 0)
@@ -472,7 +513,11 @@ pub(crate) fn reread(
         shells: &shells,
     };
     let kernel = &*readers.kernel;
-    let facts = aterm_uds::left::read_one(kernel, pid, &known)?;
+    let facts = match aterm_uds::left::read_one(kernel, pid, &known) {
+        Ok(Some(facts)) => facts,
+        Ok(None) => return Reread::Read(None),
+        Err(aterm_uds::left::Unread) => return Reread::Unread,
+    };
     let spared = [self_pid];
     let ctx = left::Ctx {
         launchd: kernel.launchd_version(),
@@ -481,7 +526,9 @@ pub(crate) fn reread(
         spared: &spared,
         tellers: &[],
     };
-    let row = left::judge(&facts, &ctx)?;
+    let Some(row) = left::judge(&facts, &ctx) else {
+        return Reread::Read(None);
+    };
     let runs = facts
         .runs
         .iter()
@@ -508,13 +555,13 @@ pub(crate) fn reread(
             })
         })
         .collect();
-    Some(LeftView {
+    Reread::Read(Some(LeftView {
         rows: vec![row],
         runs,
         live: live.to_vec(),
         closed: closed.to_vec(),
         ..LeftView::default()
-    })
+    }))
 }
 
 #[cfg(test)]

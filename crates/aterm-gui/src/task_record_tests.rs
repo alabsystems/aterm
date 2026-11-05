@@ -136,6 +136,7 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
             from: Some(SID.to_string()),
             why: Some("landed"),
             checked: None,
+            left: None,
             exit: Some(0),
             result_bytes: 12,
             result_path: Some(path),
@@ -292,6 +293,7 @@ fn a_carried_record_keeps_only_the_time_it_was_awake() {
         from: "ctl".into(),
         why: Some("held"),
         checked: None,
+        left: None,
         exit: None,
         finished: false,
         result_bytes: 0,
@@ -352,6 +354,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         from: SID.to_string(),
         why: Some("exit"),
         checked: None,
+        left: None,
         exit: Some(-2),
         finished: false,
         result_bytes: 9,
@@ -513,6 +516,7 @@ fn the_reply_event_and_status_spellings() {
         from: "ctl".into(),
         why: Some("landed"),
         checked: None,
+        left: None,
         exit: None,
         finished: false,
         result_bytes: 120,
@@ -1614,6 +1618,7 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         from: "ctl".into(),
         why: None,
         checked: None,
+        left: None,
         exit: None,
         finished: false,
         result_bytes: 0,
@@ -2104,6 +2109,91 @@ fn a_done_marks_what_aterm_checked_and_the_record_carries_it() {
     );
 }
 
+/// A LANDING'S MARK KEEPS ITS LEFT WORD (`docs/DESIGN-leftovers-by-default-2026-10-30.md` §2):
+/// `task mark done left=<word>` keeps what the landing read of the agent's left processes on the
+/// record, which `task` (its wire fields), a carry row and an `await task` row say after
+/// `checked=`, and a carry row reads it back; the next mark clears it. Each word the done line
+/// writes is taken (`0`, `kept:<n>`, `<n>`, `unchecked`) and nothing else, nor on a mark that is
+/// not done, nor from a hand. NEGATIVE CONTROL: a word taken unread takes the malformed ones.
+#[test]
+fn a_landing_mark_keeps_its_left_word() {
+    use crate::control::{Principal, ServingPrincipal};
+    let t0 = Instant::now();
+    let mark = parse("done why=landed left=kept:2 result_bytes=12").expect("a mark");
+    assert_eq!(mark.left.as_deref(), Some("kept:2"));
+    let working = TaskMark::new(TaskState::Working)
+        .apply(None, false, t0, 9_000)
+        .0;
+    let (record, moved) = mark.apply(Some(&working), false, t0, 10_000);
+    assert!(moved);
+    assert_eq!(record.left.as_deref(), Some("kept:2"));
+    assert!(
+        record.wire_fields().contains(" why=landed left=kept:2"),
+        "{}",
+        record.wire_fields()
+    );
+    let row = record.carry_row(t0);
+    let back = TaskRecord::from_carry_row(&row, Some(&tasks()), t0, 10_000).expect("reads");
+    assert_eq!(back.carry_row(t0), row);
+    assert_eq!(back.left.as_deref(), Some("kept:2"));
+    let waited = await_row(SID, Some(&record), "idle", "-", "-", false);
+    assert!(waited.contains(" left=kept:2"), "{waited}");
+    let (reopened, _) =
+        parse("working why=turn")
+            .expect("a reopening")
+            .apply(Some(&record), false, t0, 12_000);
+    assert_eq!(reopened.left, None, "{reopened:?}");
+    for word in ["0", "kept:1", "3", "unchecked"] {
+        assert_eq!(
+            parse(&format!("done left={word}")).map(|m| m.left),
+            Ok(Some(word.to_string())),
+            "{word}"
+        );
+    }
+    for bad in [
+        "",
+        "-1",
+        "01",
+        "kept:0",
+        "kept:",
+        "some",
+        "unchecked:1",
+        "65536",
+    ] {
+        assert_eq!(
+            parse(&format!("done left={bad}")).map(|m| m.left),
+            Err("ERR task mark: left= is 0, kept:<n>, <n> or unchecked\n".to_string()),
+            "{bad:?}"
+        );
+        assert_eq!(
+            TaskRecord::from_carry_row(
+                &row.replace("left=kept:2", &format!("left={bad}")),
+                Some(&tasks()),
+                t0,
+                10_000
+            ),
+            None,
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        parse("working left=0").map(|m| m.left),
+        Err("ERR task mark: left= marks a done task\n".to_string())
+    );
+    let handle = crate::session_store::test_handle(7);
+    let ctx = &handle.ctx;
+    {
+        let _hand = ServingPrincipal::enter(Principal::Instance);
+        assert_eq!(
+            cmd_task(ctx, 7, Scope::Owner, "mark done why=landed left=0"),
+            LEFT_BY_HAND
+        );
+    }
+    let _harness = ServingPrincipal::enter(Principal::Harness);
+    let marked = cmd_task(ctx, 7, Scope::Owner, "mark done why=landed left=0");
+    assert!(marked.contains(" left=0"), "{marked}");
+}
+
 #[test]
 fn unicode_receipts_mark_done_and_roundtrip_through_records_and_result_sidecars() {
     use aterm_agent::harness::acts::{LandReceipt, ReceiptLeg};
@@ -2311,6 +2401,26 @@ fn the_wire_says_how_a_task_ended() {
     }
 }
 
+/// EVERY ENDING AUTOPILOT LAND MARKS IS A WORD THE RECORD TAKES: aterm-agent's supervisor marks a
+/// managed worker's task `failed why=<word>` for each of its endings (`GaveUp::ALL`, the usage
+/// limit's among them), so each parses as a mark, is a closed `why=` word, and has a person's
+/// words of its own; a word this record refused would leave the record `working` while the loop
+/// types nothing more. NEGATIVE CONTROL: a word no ending names is refused.
+#[test]
+fn every_ending_the_supervisor_marks_is_a_word_the_record_takes() {
+    use aterm_agent::supervise::policy::turn_end::GaveUp;
+    for ending in GaveUp::ALL {
+        let word = ending.word();
+        assert!(TASK_WHY.contains(&word), "{word}");
+        let mark = parse(&format!(" failed why={word}")).expect(word);
+        assert_eq!((mark.state, mark.why), (TaskState::Failed, Some(word)));
+        let said = failed_words(TaskState::Failed, Some(word));
+        assert!(!said.starts_with("ended unfinished"), "{word}: {said}");
+    }
+    assert_eq!(WHY_USAGE_LIMIT, GaveUp::UsageLimit.word());
+    assert!(parse(" failed why=usage-limits").is_err(), "CONTROL");
+}
+
 /// AN EXIT DOES NOT REWRITE HOW THE TASK ENDED: a landing's `why=` and `checked=` and a failure's
 /// `why=` outlive it, and a look at them stays a look. NEGATIVE CONTROL: an agent that exits while
 /// its task works reads failed, its own `why=exit` kept.
@@ -2329,6 +2439,7 @@ fn an_exit_keeps_how_the_task_ended() {
     let landed = TaskMark {
         why: Some(WHY_LANDED),
         checked: Some("abc@origin/main".to_string()),
+        left: Some("kept:1".to_string()),
         ..TaskMark::new(TaskState::Done)
     }
     .apply(Some(&working), false, t0, 2_000)
@@ -2337,6 +2448,7 @@ fn an_exit_keeps_how_the_task_ended() {
     assert!(moved);
     assert_eq!(gone.why, Some(WHY_LANDED));
     assert_eq!(gone.checked.as_deref(), Some("abc@origin/main"));
+    assert_eq!(gone.left.as_deref(), Some("kept:1"));
     assert_eq!(gone.entered, landed.entered, "a look stays a look");
     assert_eq!(gone.conclusion(), Some(Conclusion::Finished));
     assert!(gone.finished);

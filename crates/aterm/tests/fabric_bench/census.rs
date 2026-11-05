@@ -22,6 +22,9 @@ pub struct Rec {
     pub head: String,
     /// The consumer-group commit it carries: `(group, upto)`.
     pub commit: Option<(String, u64)>,
+    /// Its `subject + body` bytes: what astream's byte bucket counts of a publish
+    /// (`RateLimit::bytes_per_sec`).
+    pub bytes: usize,
 }
 
 impl Rec {
@@ -54,6 +57,7 @@ pub fn read_log(path: &Path, at_rest: Option<[u8; 32]>) -> Vec<Rec> {
                 text: body.text,
                 head: head_line(&r.body),
                 commit: r.commit.as_ref().map(|c| (c.group.clone(), c.upto)),
+                bytes: r.subject.len() + r.body.len(),
             }
         })
         .collect()
@@ -104,6 +108,12 @@ pub struct Census {
     pub commits: usize,
     /// Every kind ([`class_of`]) and how many of it.
     pub by_class: BTreeMap<String, usize>,
+    /// Every kind ([`class_of`]) and its records' bytes ([`Rec::bytes`]).
+    pub bytes_by_class: BTreeMap<String, usize>,
+    /// Every record's bytes.
+    pub bytes: usize,
+    /// The largest record's bytes.
+    pub largest: usize,
 }
 
 /// The records with offsets in `lo..=hi`.
@@ -119,7 +129,11 @@ pub fn census<'a>(recs: impl IntoIterator<Item = &'a Rec>) -> Census {
         c.total += 1;
         c.hidden += usize::from(is_hidden_subject(&r.subject));
         c.commits += usize::from(r.commits());
-        *c.by_class.entry(class_of(&r.subject)).or_default() += 1;
+        let class = class_of(&r.subject);
+        *c.by_class.entry(class.clone()).or_default() += 1;
+        *c.bytes_by_class.entry(class).or_default() += r.bytes;
+        c.bytes += r.bytes;
+        c.largest = c.largest.max(r.bytes);
     }
     c
 }
@@ -198,9 +212,10 @@ pub fn to_json(c: &Census, messages: usize, window: (u64, u64)) -> aterm_json::V
     };
     let mut classes = aterm_json::Map::new();
     for (class, n) in &c.by_class {
+        let bytes = c.bytes_by_class.get(class).copied().unwrap_or_default();
         classes.insert(
             class.clone(),
-            aterm_json::json!({"records": n, "per_message": per(*n)}),
+            aterm_json::json!({"records": n, "per_message": per(*n), "bytes": bytes}),
         );
     }
     aterm_json::json!({
@@ -211,11 +226,14 @@ pub fn to_json(c: &Census, messages: usize, window: (u64, u64)) -> aterm_json::V
         "hidden": c.hidden,
         "commit_records": c.commits,
         "commit_records_per_message": per(c.commits),
+        "bytes": c.bytes,
+        "largest_record_bytes": c.largest,
         "by_class": aterm_json::Value::Object(classes),
     })
 }
 
-/// The census as markdown rows: one per kind, then the totals.
+/// The census as markdown rows: one per kind, then the totals. A kind's bytes are its records'
+/// `subject + body`, as astream's byte bucket counts them ([`Rec::bytes`]).
 #[must_use]
 pub fn rows(c: &Census, messages: usize) -> Vec<String> {
     let per = |n: usize| {
@@ -226,21 +244,25 @@ pub fn rows(c: &Census, messages: usize) -> Vec<String> {
         }
     };
     let mut out = vec![
-        "| record kind | records | per message |".to_string(),
-        "|---|---:|---:|".to_string(),
+        "| record kind | records | per message | bytes |".to_string(),
+        "|---|---:|---:|---:|".to_string(),
     ];
     for (class, n) in &c.by_class {
-        out.push(format!("| `{class}` | {n} | {} |", per(*n)));
+        let bytes = c.bytes_by_class.get(class).copied().unwrap_or_default();
+        out.push(format!("| `{class}` | {n} | {} | {bytes} |", per(*n)));
     }
     out.push(format!(
-        "| **all records** | {} | {} |",
+        "| **all records** | {} | {} | {} |",
         c.total,
-        per(c.total)
+        per(c.total),
+        c.bytes
     ));
     out.push(format!(
-        "| of which commit records | {} | {} |",
+        "| of which commit records | {} | {} | – |",
         c.commits,
         per(c.commits)
     ));
+    out.push(String::new());
+    out.push(format!("The largest record: {} bytes.", c.largest));
     out
 }

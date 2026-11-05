@@ -12,7 +12,8 @@ pub struct Connector {
     pub product: &'static str,
     /// Where the CLI keeps its state.
     pub home: Home,
-    /// Files under the home whose existence indicates a stored login (`stat`ed, never opened).
+    /// Files under the home whose existence indicates a stored login (`stat`ed; only
+    /// [`stored_login_lapsed`] opens one, Claude Code's, for its token fields).
     pub stores: &'static [&'static str],
     /// Credential variables the CLI reads in place of or beside its stored login;
     /// [`crate::harness::relaunch::ahead_env`] names those a pooled launch removes.
@@ -1407,12 +1408,15 @@ pub fn ids() -> Vec<&'static str> {
     connections().map(|c| c.id).collect()
 }
 
-fn is_kimi_env_credential(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
+fn is_kimi_env_credential_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
         .and_then(|name| name.strip_prefix("kimi-code-env-"))
         .and_then(|name| name.strip_suffix(".json"))
         .is_some_and(|id| id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn is_kimi_env_credential(path: &std::path::Path) -> bool {
+    path.file_name().is_some_and(is_kimi_env_credential_name)
 }
 
 /// The stored login file under `home` (`stat`ed, never opened): a connector's literal path, or
@@ -1433,13 +1437,102 @@ pub fn stored_login_file(c: &Connector, home: &std::path::Path) -> Option<std::p
     std::fs::read_dir(home.join("credentials"))
         .ok()?
         .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && is_kimi_env_credential(path))
-        .max_by(|a, b| {
-            let ma = std::fs::metadata(a).ok().and_then(|m| m.modified().ok());
-            let mb = std::fs::metadata(b).ok().and_then(|m| m.modified().ok());
-            ma.cmp(&mb).then_with(|| a.file_name().cmp(&b.file_name()))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            if !is_kimi_env_credential_name(&name)
+                || !entry.file_type().is_ok_and(|kind| kind.is_file())
+            {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            meta.is_file()
+                .then(|| (meta.modified().ok(), name, entry.path()))
         })
+        .max_by(|(ma, na, _), (mb, nb, _)| ma.cmp(mb).then_with(|| na.cmp(nb)))
+        .map(|(_, _, path)| path)
+}
+
+/// The most bytes of a Claude Code credential file [`stored_login_lapsed`] reads.
+const CLAUDE_CREDENTIAL_MAX: u64 = 1 << 20;
+
+/// Whether the stored login file under `home` ([`stored_login_file`]) shows its own login
+/// lapsed, read from that file alone (its metadata and the fields named here; no value leaves
+/// this function, and no process, network or browser is asked): Grok Build's `auth.json` grok
+/// does not start on ([`crate::harness::grok_signin::login_accepted`]: empty, or its refusal
+/// marker at least as new as it), and Claude Code's `.credentials.json` whose `claudeAiOauth`
+/// holds neither an access token nor a refresh token. A login that keeps a refresh token is not
+/// lapsed, whatever its access token's expiry: the CLI renews it. `false` where `home` holds no
+/// stored login file, for a file these rules cannot read (an unreadable, oversized or unparsed
+/// one, or one with no `claudeAiOauth`, as a keyring-held login leaves it), and for every other
+/// CLI: agy's grant file counts by its presence alone, never its contents.
+#[must_use]
+pub fn stored_login_lapsed(c: &Connector, home: &std::path::Path) -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if UNREAD_LAPSE.with(std::cell::Cell::get) {
+        return false;
+    }
+    let Some(file) = stored_login_file(c, home) else {
+        return false;
+    };
+    match c.id {
+        "grok" => !crate::harness::grok_signin::login_accepted(&file),
+        "claude" => claude_credentials_lapsed(&file),
+        _ => false,
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static UNREAD_LAPSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `read` with [`stored_login_lapsed`] answering `false` on this thread, as the readers did
+/// before it (every stored login file read as a live login): the lapsed-login tests' negative
+/// control.
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "negative control called by tests, retained in debug lab builds"
+    )
+)]
+pub(crate) fn test_without_lapse<R>(read: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNREAD_LAPSE.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(UNREAD_LAPSE.with(|flag| flag.replace(true)));
+    read()
+}
+
+/// Whether Claude Code's credential file `file` holds a `claudeAiOauth` login with neither a
+/// non-empty `accessToken` nor a non-empty `refreshToken` ([`stored_login_lapsed`]). The bytes
+/// and the parsed tree are scrubbed before it returns.
+fn claude_credentials_lapsed(file: &std::path::Path) -> bool {
+    if !std::fs::symlink_metadata(file)
+        .is_ok_and(|m| m.is_file() && m.len() <= CLAUDE_CREDENTIAL_MAX)
+    {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(file) else {
+        return false;
+    };
+    let bytes = aterm_uds::secret::Secret::from_vec(bytes);
+    let Ok(value) = aterm_json::from_slice::<aterm_json::Value>(bytes.expose()) else {
+        return false;
+    };
+    let held = |name: &str| {
+        value["claudeAiOauth"][name]
+            .as_str()
+            .is_some_and(|token| !token.is_empty())
+    };
+    let lapsed =
+        value["claudeAiOauth"].is_object() && !held("accessToken") && !held("refreshToken");
+    crate::harness::cli::shared_provider::wipe_json(value);
+    lapsed
 }
 
 /// Whose OAuth login the home path `name` (`~/…`) is, by the product's name, as the connector

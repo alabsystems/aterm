@@ -4,6 +4,10 @@
 //! Isolated private `aterm` instance runner for `lab instance` and lab proof lanes.
 
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use aterm_uds::spawnfd::{Child, Stdio};
@@ -12,6 +16,10 @@ use crate::band::{Band, Job};
 use crate::paths::{from_caller, paths};
 use crate::stop::{self, Stopped};
 use crate::{Fail, LAB, Res};
+
+#[path = "instance_cleanup.rs"]
+mod cleanup;
+pub(crate) use cleanup::after_stop;
 
 /// The automatic lanes off.
 pub const CONFIG_OFF: &str = "agents_auto_prime = false\n\
@@ -38,22 +46,28 @@ pub fn bell_off(config: &str) -> String {
 pub(crate) fn write_aterm_toml(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let mut f = opts.open(path)?;
-    f.write_all(text.as_bytes())?;
-    drop(f);
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
     // The creating mode is umask-masked and a pre-existing file keeps its own: pin it.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    Ok(())
+    f.set_len(0)?;
+    f.write_all(text.as_bytes())
 }
 
 /// One-minute hang detector for startup: a version probe or an instance listening.
@@ -69,9 +83,19 @@ pub struct World {
     pub run: PathBuf,
     pub sock: PathBuf,
     keep: bool,
+    cleanup_failed: Arc<AtomicBool>,
 }
 
 impl World {
+    fn retain_start_failure(&self, error: String) -> String {
+        self.cleanup_failed.store(true, Ordering::Release);
+        eprintln!(
+            "aterm-lab: instance startup failed; keeping {}: {error}",
+            self.dir.display()
+        );
+        error
+    }
+
     /// Lay out a fresh world whose `aterm.toml` is `config` with the audible bell off.
     /// Its short `/tmp` root ends in `.noindex` and uses the shared root's quiet routing.
     /// # Errors
@@ -101,21 +125,20 @@ impl World {
             sock: dir.join("run/a.sock"),
             dir,
             keep,
+            cleanup_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn lay_out(dir: PathBuf, config: &str, keep: bool) -> Result<Self, String> {
         let w = Self::in_dir(dir, keep);
         let made = (|| -> std::io::Result<()> {
-            use std::os::unix::fs::PermissionsExt as _;
             for d in [&w.home, &w.cfg.join("aterm"), &w.run] {
-                std::fs::create_dir_all(d)?;
-                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
+                crate::util::create_private_dir_all(d)?;
             }
             write_aterm_toml(&w.cfg.join("aterm/aterm.toml"), &bell_off(config))?;
             private_home_roots(&w.home)?;
-            std::fs::write(w.home.join(".profile"), "PS1='$ '\n")?;
-            std::fs::write(w.home.join(".shrc"), "PS1='$ '\n")
+            crate::util::write_fresh(&w.home.join(".profile"), "PS1='$ '\n")?;
+            crate::util::write_fresh(&w.home.join(".shrc"), "PS1='$ '\n")
         })();
         made.map_err(|e| format!("cannot lay out {}: {e}", w.dir.display()))?;
         Ok(w)
@@ -127,7 +150,7 @@ impl World {
     /// The directory already exists, cannot be created privately or resolved, its socket paths
     /// exceed the platform's address bound, or its profile and marker cannot be written.
     pub fn create_at(dir: &Path, config: &str) -> Result<Self, String> {
-        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        use std::os::unix::fs::DirBuilderExt as _;
         let parent = std::fs::canonicalize(
             dir.parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
@@ -143,8 +166,7 @@ impl World {
             .map_err(|error| format!("cannot create fresh lab world {}: {error}", dir.display()))?;
         let dir = std::fs::canonicalize(&dir).map_err(|error| error.to_string())?;
         let world = Self::lay_out(dir, config, true)?;
-        std::fs::set_permissions(&world.cfg, std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?;
+        crate::util::set_dir_mode_nofollow(&world.cfg, 0o700).map_err(|error| error.to_string())?;
         aterm_uds::private_file::write_private(&world.dir, "lab-world", b"aterm-lab-world/1\n")
             .map_err(|error| error.to_string())?;
         Ok(world)
@@ -158,7 +180,6 @@ impl World {
     /// cannot be resolved, or its identifying marker is missing or invalid.
     pub fn open_at(dir: &Path) -> Result<Self, String> {
         use aterm_uds::private_file::{check_private_dir, read_private};
-        check_private_dir(dir).map_err(|error| error.to_string())?;
         let marker = read_private(dir, "lab-world", 64).map_err(|error| error.to_string())?;
         if marker.as_slice() != b"aterm-lab-world/1\n" {
             return Err("not a prepared lab world".into());
@@ -192,13 +213,13 @@ impl World {
     /// The folder already exists, or it or its profile could not be made.
     pub fn rehome(&mut self, home: &Path) -> Result<(), String> {
         let made = (|| -> std::io::Result<PathBuf> {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::create_dir(home)?;
-            std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new().mode(0o700).create(home)?;
+            crate::util::set_dir_mode_nofollow(home, 0o700)?;
             let home = std::fs::canonicalize(home)?;
             private_home_roots(&home)?;
-            std::fs::write(home.join(".profile"), "PS1='$ '\n")?;
-            std::fs::write(home.join(".shrc"), "PS1='$ '\n")?;
+            crate::util::write_fresh(&home.join(".profile"), "PS1='$ '\n")?;
+            crate::util::write_fresh(&home.join(".shrc"), "PS1='$ '\n")?;
             Ok(home)
         })();
         self.home = made.map_err(|e| format!("cannot make the home {}: {e}", home.display()))?;
@@ -348,7 +369,6 @@ pub(crate) fn standins_seam() -> (String, String) {
 
 /// Roots for a newly owned HOME, on its volume even when `rehome` moved it.
 fn private_home_roots(home: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
     for path in [
         home.join(".cache"),
         home.join(".local/share"),
@@ -356,8 +376,7 @@ fn private_home_roots(home: &Path) -> std::io::Result<()> {
         home.join("tmp"),
         private_state_home(home),
     ] {
-        std::fs::create_dir_all(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        crate::util::create_private_dir_all(&path)?;
     }
     Ok(())
 }
@@ -372,7 +391,7 @@ fn private_state_home(home: &Path) -> PathBuf {
 
 impl Drop for World {
     fn drop(&mut self) {
-        if self.keep {
+        if self.keep || self.cleanup_failed.load(Ordering::Acquire) {
             eprintln!("aterm-lab: kept {}", self.dir.display());
         } else {
             let _ = std::fs::remove_dir_all(&self.dir);
@@ -452,6 +471,8 @@ fn line(l: &Launch, via: Via, keeper: &Path, sock: &Path) -> Vec<String> {
             aterm_uds::lifeline::FLAG.to_string(),
             aterm_uds::lifeline::STDIN.to_string(),
         ]);
+    } else {
+        line.push("--window".to_string());
     }
     if !l.reroute {
         line.push("--no-reroute".to_string());
@@ -464,19 +485,110 @@ fn line(l: &Launch, via: Via, keeper: &Path, sock: &Path) -> Vec<String> {
     line
 }
 
-/// A windowed `l`'s quiet claim, taken before it starts: a window's frames and input are timed, so
-/// it starts alone among quiet claims on a quiet machine ([`crate::admission`]). A headless
-/// instance takes none.
+/// The admission a caller requests for its window. Timing stays the default;
+/// functional work must name its memory reservation explicitly.
+#[derive(Clone, Copy)]
+enum WindowWork {
+    Timing,
+    Functional { memory_bytes: u64, retain: bool },
+}
+
+enum WindowAdmission {
+    Timing {
+        _claim: aterm_capacity::Claim,
+    },
+    Retained {
+        memory: aterm_capacity::RetainedClaim,
+    },
+    Functional {
+        _claim: aterm_capacity::Claim,
+    },
+}
+
+impl WindowAdmission {
+    fn memory(&self) -> Option<&aterm_capacity::RetainedClaim> {
+        match self {
+            Self::Retained { memory } => Some(memory),
+            Self::Timing { .. } | Self::Functional { .. } => None,
+        }
+    }
+}
+
+/// Take the shared run's window lane, then the window's resource claim before
+/// starting any child. Headless work takes neither. Functional admission supplies
+/// no timing evidence; ordinary window launches keep their measured Timing guard.
 /// # Errors
 /// An interrupt ended the wait: why, and the run's interrupt path has it, so the run ends NOT
 /// RUN ([`crate::stop::note`]).
-fn windowed_quiet(l: &Launch) -> Result<Option<aterm_capacity::Claim>, String> {
+fn windowed_admission(l: &Launch, work: WindowWork) -> Result<Option<WindowAdmission>, String> {
     if l.headless {
         return Ok(None);
     }
-    crate::admission::quiet(&format!("a window of {}", l.aterm.display()))
-        .map(Some)
-        .map_err(|f| f.msg.unwrap_or_default())
+    crate::admission::window_lane().map_err(|f| f.msg.unwrap_or_default())?;
+    let what = format!("a window of {}", l.aterm.display());
+    let admitted = match work {
+        WindowWork::Timing => crate::admission::quiet(&what)
+            .map(|claim| WindowAdmission::Timing { _claim: claim })
+            .map_err(|fail| fail.msg.unwrap_or_default()),
+        WindowWork::Functional {
+            memory_bytes,
+            retain,
+        } => {
+            let claim = crate::admission::functional(&what, memory_bytes)
+                .map_err(|fail| fail.msg.unwrap_or_default())?;
+            if !retain {
+                return Ok(Some(WindowAdmission::Functional { _claim: claim }));
+            }
+            claim
+                .into_retained_guard()
+                .map(|memory| WindowAdmission::Retained { memory })
+                .map_err(|(original, why)| {
+                    drop(original);
+                    format!("memory custody refused before native spawn: {why}")
+                })
+        }
+    }?;
+    Ok(Some(admitted))
+}
+
+#[cfg(test)]
+mod window_admission_tests {
+    use super::*;
+
+    fn launch(world: &World, headless: bool) -> Launch {
+        Launch {
+            aterm: world.dir.join("must-not-start"),
+            headless,
+            args: Vec::new(),
+            env: world.env(),
+            cwd: world.home.clone(),
+            sandbox: None,
+            reroute: false,
+        }
+    }
+
+    #[test]
+    fn headless_work_takes_no_window_lane_or_capacity_claim() {
+        let world = World::new(CONFIG_OFF).unwrap();
+        assert!(
+            windowed_admission(&launch(&world, true), WindowWork::Timing)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!world.dir.join("aterm.log").exists());
+    }
+
+    #[test]
+    fn functional_window_rejects_headless_and_zero_before_starting() {
+        let world = World::new(CONFIG_OFF).unwrap();
+        for (headless, bytes) in [(true, 1024), (false, 0)] {
+            let why = Instance::start_functional(&world, launch(&world, headless), bytes)
+                .err()
+                .expect("invalid functional request refused before spawn");
+            assert!(why.contains("started nothing"), "{why}");
+            assert!(!world.dir.join("aterm.log").exists());
+        }
+    }
 }
 
 /// A running private instance.
@@ -494,8 +606,10 @@ pub struct Instance {
     /// The instance's stdout and stderr.
     pub log: PathBuf,
     env: Vec<(String, String)>,
-    /// A windowed instance's quiet claim, held while it lives ([`crate::admission`]).
-    _quiet: Option<aterm_capacity::Claim>,
+    /// The window's resource claim, held while it lives ([`crate::admission`]).
+    _admission: Option<WindowAdmission>,
+    cleanup: cleanup::StopRecord,
+    gui: Option<aterm_uds::process::Identity>,
 }
 
 /// What one `ctl` client run said.
@@ -577,44 +691,110 @@ pub(crate) fn terminal_request(mut ctl: impl FnMut(&[&str]) -> Reply, args: &[&s
     ctl(&selected)
 }
 
+/// The effective environment keeps every required root, and any explicit state root,
+/// in this world. A repeated environment name uses its last value, as the child does.
+fn ordinary_roots_match(world: &World, env: &[(String, String)]) -> bool {
+    let root = |name| {
+        env.iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| Path::new(value))
+    };
+    [
+        ("HOME", &world.home),
+        ("XDG_CONFIG_HOME", &world.cfg),
+        ("XDG_RUNTIME_DIR", &world.run),
+    ]
+    .into_iter()
+    .all(|(name, expected)| root(name) == Some(expected.as_path()))
+        && root("ATERM_STATE_HOME").is_none_or(|state| state == world.state())
+}
+
 impl Instance {
     /// Start `l` in `world`, its output in `<world>/aterm.log`.
     /// # Errors
     /// The log, the lifeline or the process could not be made.
     pub fn start(world: &World, l: Launch) -> Result<Instance, String> {
-        Self::start_on_socket(world, l, &world.sock)
+        Self::start_on_socket(world, l, &world.sock, WindowWork::Timing)
+    }
+
+    /// Start a functional window with a nonzero memory reservation and the
+    /// shared run's window lane. This supplies no timing qualification and is
+    /// only for checks whose verdict makes no latency or throughput claim.
+    /// # Errors
+    /// A headless launch, zero reservation, unavailable resources, or a failure
+    /// named by [`Self::start`]. No child starts when admission fails.
+    pub fn start_functional(
+        world: &World,
+        l: Launch,
+        memory_bytes: u64,
+    ) -> Result<Instance, String> {
+        Self::start_functional_in(world, l, memory_bytes, Band::Agent)
+    }
+
+    /// Functional admission in the selected scheduling band, with the same
+    /// original lane custody. App-band handoff completes before GO; neither
+    /// route supplies Timing evidence.
+    /// # Errors
+    /// As [`Self::start_functional`] and [`Self::start_in`].
+    pub fn start_functional_in(
+        world: &World,
+        l: Launch,
+        memory_bytes: u64,
+        band: Band,
+    ) -> Result<Instance, String> {
+        Self::start_functional_custody(world, l, memory_bytes, band, false)
+    }
+
+    /// Explicit private qualification of a detached original reservation.
+    /// Ordinary Functional launches await coordinated reader rollout.
+    pub(crate) fn start_retained_functional_in(
+        world: &World,
+        l: Launch,
+        memory_bytes: u64,
+        band: Band,
+    ) -> Result<Instance, String> {
+        Self::start_functional_custody(world, l, memory_bytes, band, true)
+    }
+
+    fn start_functional_custody(
+        world: &World,
+        l: Launch,
+        memory_bytes: u64,
+        band: Band,
+        retain: bool,
+    ) -> Result<Instance, String> {
+        if l.headless || memory_bytes == 0 {
+            return Err("functional window needs a window and a nonzero memory reservation; it started nothing".into());
+        }
+        Self::start_in_on_socket(
+            world,
+            l,
+            band,
+            &world.sock,
+            WindowWork::Functional {
+                memory_bytes,
+                retain,
+            },
+        )
     }
 
     /// Start an app-band window as its own responsible process through the ordinary
     /// executable entry point, using its default socket beneath this world's private
-    /// runtime directory. The caller
-    /// supplies an environment without `ATERM_STATE_HOME` or `CI`, and confines
-    /// any automatic network lanes the measurement enables.
+    /// runtime directory. The caller supplies the private environment and confines
+    /// any automatic network lanes the measurement enables. The executable decides
+    /// which lanes that environment admits, including guarded debug attachments.
     /// # Errors
-    /// A headless launch, mismatched private roots, a suppressed runtime,
+    /// A headless launch, mismatched private roots,
     /// or any failure named by [`Self::start_in`].
     pub fn start_ordinary(world: &World, l: Launch) -> Result<Instance, String> {
-        if l.headless
-            || l.env
-                .iter()
-                .any(|(key, _)| key == "ATERM_STATE_HOME" || key == "CI")
-            || [
-                ("HOME", &world.home),
-                ("XDG_CONFIG_HOME", &world.cfg),
-                ("XDG_RUNTIME_DIR", &world.run),
-            ]
-            .into_iter()
-            .any(|(wanted, path)| {
-                !l.env
-                    .iter()
-                    .any(|(key, value)| key == wanted && Path::new(value) == path)
-            })
-        {
-            return Err("ordinary instance needs a window and its private home, config and runtime directories, without runtime-suppression variables".into());
+        if l.headless || !ordinary_roots_match(world, &l.env) {
+            return Err("ordinary instance needs a window and its private home, config and runtime directories".into());
         }
         // Empty means the ordinary per-instance socket, rather than an explicit
         // socket that would suppress Commons startup in the executable.
-        let mut instance = Self::start_in_on_socket(world, l, Band::App, Path::new(""))?;
+        let mut instance =
+            Self::start_in_on_socket(world, l, Band::App, Path::new(""), WindowWork::Timing)?;
         instance.sock = world
             .run
             .join("aterm")
@@ -622,19 +802,46 @@ impl Instance {
         Ok(instance)
     }
 
-    fn start_on_socket(world: &World, l: Launch, socket: &Path) -> Result<Instance, String> {
-        let quiet = windowed_quiet(&l)?;
+    fn start_on_socket(
+        world: &World,
+        l: Launch,
+        socket: &Path,
+        work: WindowWork,
+    ) -> Result<Instance, String> {
+        let admission = windowed_admission(&l, work)?;
         let log = world.dir.join("aterm.log");
-        let out = std::fs::File::create(&log)
+        let out = crate::util::create_stdio_file(&log)
             .map_err(|e| format!("cannot create {}: {e}", log.display()))?;
         let err = out
             .try_clone()
             .map_err(|e| format!("cannot share the instance log: {e}"))?;
         let (lifeline, far) = aterm_uds::lifeline::Lifeline::open(&world.dir)
             .map_err(|e| format!("the lifeline: {e}"))?;
-        let line = line(&l, Via::Child, &paths().exe, socket);
+        let mut line = line(&l, Via::Child, &paths().exe, socket);
+        let mut command = aterm_uds::spawnfd::command(&line[0]);
+        if !l.headless {
+            let lane =
+                crate::admission::window_descriptor().map_err(|why| why.msg.unwrap_or_default())?;
+            let guards = crate::window_guards::WindowGuards::from_original(
+                lane,
+                admission.as_ref().and_then(WindowAdmission::memory),
+            )?;
+            let claim = guards.claim().map(str::to_owned);
+            command
+                .inherit_guards(guards.into_descriptors())
+                .map_err(|why| format!("window guard inheritance: {why}"))?;
+            let slots: Vec<_> = command.guard_targets().collect();
+            let at = line
+                .iter()
+                .position(|word| word == "--")
+                .ok_or("keeper has no command boundary")?;
+            line.splice(
+                at..at,
+                crate::window_guards::WindowGuards::arguments(&slots, claim.as_deref())?,
+            );
+        }
         let (program, argv) = line.split_first().ok_or("an empty command line")?;
-        let child = aterm_uds::spawnfd::command(program)
+        let child = command
             .env_clear()
             .envs(l.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .args(argv)
@@ -644,7 +851,7 @@ impl Instance {
             .stdout(out)
             .stderr(err)
             .spawn()
-            .map_err(|e| format!("cannot start {program}: {e}"))?;
+            .map_err(|e| world.retain_start_failure(format!("cannot start {program}: {e}")))?;
         let pid = i32::try_from(child.id()).unwrap_or(0);
         Ok(Instance {
             child: Proc::Child(child),
@@ -656,7 +863,9 @@ impl Instance {
             sock: world.sock.clone(),
             log,
             env: world.env(),
-            _quiet: quiet,
+            _admission: admission,
+            cleanup: cleanup::StopRecord::new(&world.dir, world.cleanup_failed.clone(), pid),
+            gui: None,
         })
     }
 
@@ -666,7 +875,7 @@ impl Instance {
     /// # Errors
     /// As [`Instance::start`]; a sandboxed `l` in the app band; the job could not start.
     pub fn start_in(world: &World, l: Launch, band: Band) -> Result<Instance, String> {
-        Self::start_in_on_socket(world, l, band, &world.sock)
+        Self::start_in_on_socket(world, l, band, &world.sock, WindowWork::Timing)
     }
 
     fn start_in_on_socket(
@@ -674,17 +883,32 @@ impl Instance {
         l: Launch,
         band: Band,
         socket: &Path,
+        work: WindowWork,
     ) -> Result<Instance, String> {
         if Via::of(&l, band)? == Via::Child {
-            return Self::start_on_socket(world, l, socket);
+            return Self::start_on_socket(world, l, socket, work);
         }
-        let quiet = windowed_quiet(&l)?;
+        let admission = windowed_admission(&l, work)?;
         let log = world.dir.join("aterm.log");
-        std::fs::File::create(&log).map_err(|e| format!("cannot create {}: {e}", log.display()))?;
+        crate::util::create_stdio_file(&log)
+            .map_err(|e| format!("cannot create {}: {e}", log.display()))?;
         let line = line(&l, Via::Job, &paths().exe, socket);
-        let job = Job::start(&world.dir, &line, &l.env, &l.cwd, &log)?;
+        let job = if l.headless {
+            Job::start(&world.dir, &line, &l.env, &l.cwd, &log)
+                .map_err(|error| world.retain_start_failure(error))?
+        } else {
+            let lane =
+                crate::admission::window_descriptor().map_err(|why| why.msg.unwrap_or_default())?;
+            let guards = crate::window_guards::WindowGuards::from_original(
+                lane,
+                admission.as_ref().and_then(WindowAdmission::memory),
+            )?;
+            Job::start_with_guards(&world.dir, &line, &l.env, &l.cwd, &log, guards)
+                .map_err(|error| world.retain_start_failure(error))?
+        };
+        let pid = job.pid;
         Ok(Instance {
-            pid: job.pid,
+            pid,
             child: Proc::Job(job),
             lifeline: None,
             kept: !l.headless,
@@ -693,7 +917,9 @@ impl Instance {
             sock: world.sock.clone(),
             log,
             env: world.env(),
-            _quiet: quiet,
+            _admission: admission,
+            cleanup: cleanup::StopRecord::new(&world.dir, world.cleanup_failed.clone(), pid),
+            gui: None,
         })
     }
 
@@ -718,6 +944,9 @@ impl Instance {
                 true
             };
             if ready_socket && self.sock.exists() && self.ctl(&["version"]).code == 0 {
+                if self.kept {
+                    self.gui = self.aterm_pid().and_then(aterm_uds::process::read_identity);
+                }
                 return Ok(());
             }
             if let Some(status) = self.exited() {
@@ -834,6 +1063,91 @@ impl Instance {
         aterm_uds::process::child_pids(self.pid)?.into_iter().next()
     }
 
+    /// Observe the exact original detached reservation without exporting a copy
+    /// to the independent crash verifier.
+    #[cfg(any(test, debug_assertions))]
+    pub fn memory_for_qualification(
+        &self,
+    ) -> Result<crate::window_guards::MemoryObservation, String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let memory = self
+            ._admission
+            .as_ref()
+            .and_then(WindowAdmission::memory)
+            .ok_or("window has no original detached memory custody")?;
+        let metadata = memory.metadata().map_err(|why| why.to_string())?;
+        let record = memory.record();
+        if record.accounting != aterm_capacity::Accounting::Detached || record.need.mem == 0 {
+            return Err("window memory is not the original detached reservation".into());
+        }
+        Ok(crate::window_guards::MemoryObservation {
+            claim: memory
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("invalid original claim leaf")?
+                .to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: record.need.mem,
+            pid: record.pid,
+            start_ms: record.start_ms,
+            sequence: record.seq,
+        })
+    }
+
+    /// Original launchd job locator for the private custody qualifier.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn qualification_job_label(&self) -> Option<&str> {
+        match &self.child {
+            Proc::Job(job) => Some(&job.label),
+            Proc::Child(_) => None,
+        }
+    }
+
+    /// Crash the exact original keeper for the maintained native custody qualifier.
+    /// Child custody requires its actual SIGKILL wait status; launchd custody requires
+    /// authenticated job identity and positive native absence, never a Child receipt.
+    /// The GUI is deliberately left alive to test its original guard custody.
+    #[cfg(any(test, debug_assertions))]
+    pub fn crash_keeper_for_qualification(
+        &mut self,
+        expected: aterm_uds::process::Identity,
+    ) -> Result<(), String> {
+        if !self.kept
+            || expected.pid != self.pid
+            || aterm_uds::process::read_identity(self.pid) != Some(expected)
+        {
+            return Err(
+                "custody qualification requires its exact original native window keeper".into(),
+            );
+        }
+        let child = match &mut self.child {
+            Proc::Job(job) => return job.crash_for_qualification(expected),
+            Proc::Child(child) => child,
+        };
+        if child.try_wait().map_err(|why| why.to_string())?.is_some() {
+            return Err("the owned keeper ended before the crash cut".into());
+        }
+        child.kill().map_err(|why| why.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|why| why.to_string())? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                return Err("one-minute hang detector: owned keeper SIGKILL/reap".into());
+            }
+            stop::sleep(Duration::from_millis(20))
+                .map_err(|why| format!("interrupted: {why:?}"))?;
+        };
+        use std::os::unix::process::ExitStatusExt as _;
+        if status.signal() != Some(libc::SIGKILL) {
+            return Err(format!("owned keeper did not die by SIGKILL: {status}"));
+        }
+        Ok(())
+    }
+
     /// How it ended, once it has.
     fn exited(&mut self) -> Option<String> {
         match &mut self.child {
@@ -853,43 +1167,165 @@ impl Instance {
         lines[lines.len().saturating_sub(n)..].join("\n")
     }
 
-    /// End it: cut its lifeline.
-    pub fn stop(&mut self) {
-        if let Some(l) = self.lifeline.take() {
-            l.cut();
+    /// Cut the lifeline and record one bounded stop attempt for the original process/job.
+    /// Repeated calls, including Drop, return the recorded result without another timeout.
+    /// # Errors
+    /// The child cannot be reaped, the job registration/absence is unknown, an operation
+    /// fails or is interrupted, or the common one-minute deadline expires (native helper
+    /// termination/reap has its separate finite grace). Failure retains this Instance's
+    /// custody while borrowed and keeps its private World and immutable diagnostics.
+    pub fn stop(&mut self) -> Result<(), String> {
+        if self.kept && self.gui.is_none() {
+            self.gui = self.aterm_pid().and_then(aterm_uds::process::read_identity);
         }
-        if let Proc::Job(j) = &mut self.child {
-            j.cut();
-            let end = Instant::now() + Duration::from_secs(8);
-            while Instant::now() < end && j.running() {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            j.remove();
-            return;
+        self.cleanup.attempt(|| {
+            stop_process(
+                &mut self.child,
+                &mut self.lifeline,
+                self.pid,
+                self.kept,
+                self.gui,
+            )
+        })
+    }
+}
+
+fn stop_process(
+    child: &mut Proc,
+    lifeline: &mut Option<aterm_uds::lifeline::Lifeline>,
+    pid: i32,
+    kept: bool,
+    gui: Option<aterm_uds::process::Identity>,
+) -> Result<(), String> {
+    use aterm_uds::process::{ProcessPresence, process_presence};
+    let deadline = Instant::now() + BOOT;
+    if let Some(lifeline) = lifeline.take() {
+        lifeline.cut();
+    }
+    if let Proc::Job(job) = child {
+        job.cut();
+        let grace = (Instant::now() + Duration::from_secs(8)).min(deadline);
+        while Instant::now() < grace && job.running() {
+            stop::sleep(Duration::from_millis(20))
+                .map_err(|why| format!("interrupted during job lifeline grace: {why:?}"))?;
         }
-        for (grace, sig) in [(8, libc::SIGTERM), (5, libc::SIGKILL)] {
-            let end = Instant::now() + Duration::from_secs(grace);
-            while Instant::now() < end && self.running() {
-                std::thread::sleep(Duration::from_millis(50));
+        job.remove_until(deadline).map_err(|why| why.to_string())?;
+        loop {
+            match process_presence(pid) {
+                ProcessPresence::Absent => return wait_gui_absent(kept, gui, deadline),
+                ProcessPresence::Unknown => {
+                    return Err("original job process absence remains unknown after removal".into());
+                }
+                ProcessPresence::Present | ProcessPresence::Exited => {}
             }
-            if !self.running() {
+            if Instant::now() >= deadline {
+                return Err("one-minute hang detector: original job native absence".into());
+            }
+            stop::sleep(Duration::from_millis(20))
+                .map_err(|why| format!("interrupted during job native absence: {why:?}"))?;
+        }
+    }
+    let Proc::Child(child) = child else {
+        unreachable!()
+    };
+    for (grace, signal) in [(8, libc::SIGTERM), (5, libc::SIGKILL)] {
+        let until = (Instant::now() + Duration::from_secs(grace)).min(deadline);
+        loop {
+            if child
+                .try_wait()
+                .map_err(|why| format!("cannot observe original child: {why}"))?
+                .is_some()
+            {
+                return wait_gui_absent(kept, gui, deadline);
+            }
+            if Instant::now() >= until {
                 break;
             }
-            let _ = crate::sys::kill_group(self.pid, sig);
+            stop::sleep(Duration::from_millis(20))
+                .map_err(|why| format!("interrupted during child grace: {why:?}"))?;
         }
-        match &mut self.child {
-            Proc::Child(c) => {
-                let _ = c.kill();
-                let _ = c.wait();
+        if let Err(error) = crate::sys::kill_group(pid, signal) {
+            if child.try_wait().map_err(|why| why.to_string())?.is_some() {
+                return wait_gui_absent(kept, gui, deadline);
             }
-            Proc::Job(j) => j.remove(),
+            return Err(format!("cannot signal original child group: {error}"));
         }
+    }
+    loop {
+        if child
+            .try_wait()
+            .map_err(|why| format!("cannot reap original child: {why}"))?
+            .is_some()
+        {
+            return wait_gui_absent(kept, gui, deadline);
+        }
+        if Instant::now() >= deadline {
+            return Err("one-minute hang detector: original child reap".into());
+        }
+        stop::sleep(Duration::from_millis(20))
+            .map_err(|why| format!("interrupted during child reap: {why:?}"))?;
+    }
+}
+
+fn gui_closed(
+    required: bool,
+    known: bool,
+    presence: aterm_uds::process::ProcessPresence,
+) -> Result<bool, String> {
+    use aterm_uds::process::ProcessPresence;
+    if !required {
+        return Ok(true);
+    }
+    if !known {
+        return Err(
+            "original GUI identity was not established; keeper closure proves no GUI closure"
+                .into(),
+        );
+    }
+    match presence {
+        ProcessPresence::Absent => Ok(true),
+        ProcessPresence::Unknown => Err("original GUI native absence remains unknown".into()),
+        ProcessPresence::Present | ProcessPresence::Exited => Ok(false),
+    }
+}
+
+fn wait_gui_absent(
+    required: bool,
+    gui: Option<aterm_uds::process::Identity>,
+    deadline: Instant,
+) -> Result<(), String> {
+    use aterm_uds::process::{ProcessPresence, process_presence, read_identity};
+    loop {
+        let presence = gui.map_or(ProcessPresence::Unknown, |gui| process_presence(gui.pid));
+        if gui_closed(required, gui.is_some(), presence)? {
+            return Ok(());
+        }
+        if let Some(gui) = gui
+            && presence == ProcessPresence::Present
+            && read_identity(gui.pid) != Some(gui)
+        {
+            return Err(
+                "original GUI identity changed or became unreadable before absence was observed"
+                    .into(),
+            );
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "one-minute hang detector: original GUI native absence after keeper closure".into(),
+            );
+        }
+        stop::sleep(Duration::from_millis(20))
+            .map_err(|why| format!("interrupted during GUI native absence: {why:?}"))?;
     }
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            // stop records evidence once; a prior explicit failure must not trigger another
+            // full cleanup operation from this destructor.
+            eprintln!("aterm-lab: instance cleanup unresolved: {error}");
+        }
     }
 }
 
@@ -1116,7 +1552,8 @@ pub fn cmd_instance(args: &[String]) -> Res {
         if shot.code != 0 || path.is_empty() {
             return Err(Fail::die(format!("instance: image: {}", shot.first())));
         }
-        std::fs::copy(&path, &dest).map_err(|e| format!("instance: cannot write {dest}: {e}"))?;
+        crate::util::copy_regular_file(&path, &dest)
+            .map_err(|e| format!("instance: cannot write {dest}: {e}"))?;
         println!("{} -> {dest}", shot.first());
         run_verbs(&inst, &post);
         return Ok(0);
@@ -1274,18 +1711,27 @@ fn prove_cold_version(
 
 /// Copy `from` to the new path `to`: a directory's tree, its symbolic links as links.
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(from)?;
-    if meta.file_type().is_symlink() {
+    copy_tree_kind(from, to, std::fs::symlink_metadata(from)?.file_type())
+}
+
+fn copy_tree_kind(from: &Path, to: &Path, kind: std::fs::FileType) -> std::io::Result<()> {
+    if kind.is_symlink() {
         std::os::unix::fs::symlink(std::fs::read_link(from)?, to)
-    } else if meta.is_dir() {
+    } else if kind.is_dir() {
         std::fs::create_dir(to)?;
         for entry in std::fs::read_dir(from)? {
             let entry = entry?;
-            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+            let ft = entry.file_type()?;
+            copy_tree_kind(&entry.path(), &to.join(entry.file_name()), ft)?;
         }
         Ok(())
+    } else if kind.is_file() {
+        crate::util::copy_regular_file(from, to).map(drop)
     } else {
-        std::fs::copy(from, to).map(drop)
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing nonregular file {}", from.display()),
+        ))
     }
 }
 
@@ -1401,20 +1847,86 @@ const DISCLAIM: &str = "--disclaim";
 #[must_use]
 pub fn keeper_main(args: &[String]) -> i32 {
     let split = args.iter().position(|a| a == "--").and_then(|at| {
-        let (flags, rest) = (&args[..at], &args[at + 1..]);
-        let disclaim = match flags {
+        let mut flags: Vec<std::ffi::OsString> = args[..at].iter().map(Into::into).collect();
+        let guard = aterm_types::lab_window_guard::take(&mut flags).ok()?;
+        let disclaim = match flags.as_slice() {
             [] => false,
             [flag] if flag == DISCLAIM => true,
             _ => return None,
         };
-        rest.split_first()
-            .map(|(prog, rest)| (disclaim, prog, rest))
+        args[at + 1..]
+            .split_first()
+            .map(|(prog, rest)| (disclaim, guard, prog, rest))
     });
-    let Some((disclaim, prog, rest)) = split else {
+    let Some((disclaim, offered_guard, prog, rest)) = split else {
         eprintln!(
             "aterm-lab keeper: usage: keeper [{DISCLAIM}] -- PROGRAM ARGS (the lifeline on stdin)"
         );
         return 2;
+    };
+    let window_at = rest.iter().position(|word| word == "--window");
+    if offered_guard.is_some() != window_at.is_some() {
+        eprintln!("aterm-lab keeper: an explicit window requires its original lane description");
+        return 2;
+    }
+    let window_guard = match offered_guard {
+        Some(bundle) => {
+            let expected = match crate::admission::window_path() {
+                Ok(path) => path,
+                Err(why) => {
+                    eprintln!("aterm-lab keeper: window lane: {why}");
+                    return 2;
+                }
+            };
+            // SAFETY: keeper dispatch is before application threads/spawns. This is the
+            // explicitly inherited, exclusively offered descriptor from the original run
+            // (or its authenticated launchd transfer); that run retains genuine close-only
+            // custody. The canonical account path is independently resolved. Adoption
+            // consumes only a validated original slot and marks its retained copy CLOEXEC.
+            #[allow(unsafe_code)]
+            match unsafe {
+                aterm_toolchain::record_lock::CloseOnlyLock::adopt_inherited(bundle.lane, &expected)
+            } {
+                Ok(guard) => {
+                    let memory = if let Some(memory) = bundle.memory {
+                        let ledger = match expected.parent() {
+                            Some(directory) => aterm_capacity::Ledger::at(directory),
+                            None => {
+                                eprintln!(
+                                    "aterm-lab keeper: original memory ledger is unavailable"
+                                );
+                                return 2;
+                            }
+                        };
+                        // SAFETY: the exact second role was offered exclusively by the same
+                        // original native handoff before threads, with continuous genuine
+                        // detached claim custody. Core verifies its record, not argv budget.
+                        #[allow(unsafe_code)]
+                        match unsafe {
+                            aterm_capacity::RetainedClaim::adopt_inherited(
+                                memory.descriptor,
+                                &ledger,
+                                &memory.claim,
+                            )
+                        } {
+                            Ok(memory) => Some(memory),
+                            Err(why) => {
+                                eprintln!("aterm-lab keeper: memory guard adoption: {why}");
+                                return 2;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    Some((guard, memory))
+                }
+                Err(why) => {
+                    eprintln!("aterm-lab keeper: window guard adoption: {why}");
+                    return 2;
+                }
+            }
+        }
+        None => None,
     };
     let lifeline = match aterm_uds::lifeline::adopt(aterm_uds::lifeline::STDIN) {
         Ok(fd) => fd,
@@ -1432,8 +1944,46 @@ pub fn keeper_main(args: &[String]) -> i32 {
                 return 1;
             }
         };
-    let mut child = match aterm_uds::spawnfd::command(prog)
-        .args(rest)
+    let mut command = aterm_uds::spawnfd::command(prog);
+    if let Some((lane, memory)) = &window_guard {
+        // The GUI owns an independent lifetime after either controller dies. In the
+        // app band, launchd retires the keeper's process group on death/restart; leave
+        // that group before executing the GUI while retaining the exact original FDs.
+        // Normal keeper teardown still signals and reaps its actual GUI Child below.
+        command.setsid(true);
+        let forwarded = lane
+            .try_clone_fd()
+            .map_err(|why| why.to_string())
+            .and_then(|lane| {
+                crate::window_guards::WindowGuards::from_original(lane, memory.as_ref())
+            });
+        let guards = match forwarded {
+            Ok(guards) => guards,
+            Err(why) => {
+                eprintln!("aterm-lab keeper: original guard duplication: {why}");
+                return 1;
+            }
+        };
+        let claim = guards.claim().map(str::to_owned);
+        if let Err(why) = command.inherit_guards(guards.into_descriptors()) {
+            eprintln!("aterm-lab keeper: GUI guard inheritance: {why}");
+            return 1;
+        }
+        let slots: Vec<_> = command.guard_targets().collect();
+        let arguments =
+            match crate::window_guards::WindowGuards::arguments(&slots, claim.as_deref()) {
+                Ok(arguments) => arguments,
+                Err(why) => {
+                    eprintln!("aterm-lab keeper: GUI guard roles: {why}");
+                    return 1;
+                }
+            };
+        let at = window_at.expect("guarded window boundary was checked");
+        command.args(&rest[..at]).args(arguments).args(&rest[at..]);
+    } else {
+        command.args(rest);
+    }
+    let mut child = match command
         .stdin(Stdio::null())
         .disclaim_responsibility(disclaim)
         .spawn()
@@ -1810,7 +2360,7 @@ mod launch_line_tests {
             ["/s/aterm-lab", "keeper"]
                 .iter()
                 .chain(keeper_flags)
-                .chain(&["--", "/b/aterm"])
+                .chain(&["--", "/b/aterm", "--window"])
                 .chain(&tail)
                 .map(|a| (*a).to_string())
                 .collect()
@@ -1859,6 +2409,29 @@ mod band_tests {
 #[cfg(test)]
 mod world_tests {
     use super::*;
+
+    #[test]
+    fn ordinary_roots_reject_a_foreign_state_root_or_a_later_foreign_override() {
+        let world = World::new(CONFIG_OFF).expect("fresh private world");
+        let env = world.env();
+        assert!(ordinary_roots_match(&world, &env));
+        let mut unmarked = env.clone();
+        unmarked.retain(|(name, _)| name != "ATERM_STATE_HOME");
+        assert!(ordinary_roots_match(&world, &unmarked));
+        for name in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_RUNTIME_DIR",
+            "ATERM_STATE_HOME",
+        ] {
+            let mut overridden = env.clone();
+            overridden.push((
+                name.into(),
+                world.dir.join("elsewhere").display().to_string(),
+            ));
+            assert!(!ordinary_roots_match(&world, &overridden), "{name}");
+        }
+    }
 
     #[test]
     fn a_released_world_goes_when_it_drops() {

@@ -107,6 +107,155 @@ fn completion_row(
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn epoch_rows(epoch: &aterm_capacity::host_protocol::Epoch) -> [(String, String); 4] {
+    let key = |part| format!("monitor/epoch/{}/{part}", epoch.sequence);
+    let yes = |value| if value { "yes" } else { "no" };
+    let launch = if epoch.cancellation_started {
+        " · launch cancellation started"
+    } else if epoch.not_spawned {
+        " · no child spawned; cancellation pending"
+    } else if epoch.unbound {
+        " · child held; durable binding pending"
+    } else {
+        ""
+    };
+    let fault = if epoch.faulted {
+        " · protocol fault"
+    } else {
+        ""
+    };
+    let failure = epoch.failure.map_or_else(String::new, |failure| {
+        format!(" · owner error {:?}", failure.kind)
+    });
+    // Endpoint cleanup follows the original claim's group-drain check. The
+    // snapshot exposes their combined gate, not an independent group probe.
+    let cleanup = match (epoch.cancellation_started, epoch.endpoint_cleaned) {
+        (true, true) => "unlaunched cleanup confirmed",
+        (true, false) => "unlaunched cleanup pending",
+        (false, true) => "group drain + endpoint cleanup confirmed",
+        (false, false) => "group drain + endpoint cleanup pending",
+    };
+    [
+        (
+            key("budget"),
+            format!(
+                "Epoch {} · CPU backing N={} · root slots R={} · original admitted memory peak {} bytes ({:.1} GiB)",
+                epoch.sequence,
+                epoch.backing,
+                epoch.roots,
+                epoch.reserved_bytes,
+                epoch.reserved_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            ),
+        ),
+        (
+            key("roots"),
+            format!(
+                "Roots: {} completed of {} slots · {} failed{launch}{fault}{failure}",
+                epoch.completed_roots, epoch.roots, epoch.failed_roots
+            ),
+        ),
+        (
+            key("transport"),
+            format!(
+                "Transport: opened {} · Retired {} · helper exited {} · output ended {}",
+                yes(epoch.opened),
+                yes(epoch.retired),
+                yes(epoch.helper_exited),
+                yes(epoch.control_eof)
+            ),
+        ),
+        (
+            key("backing"),
+            format!(
+                "CPU backing: {} returned · {} remaining · {} uncertain · {cleanup}",
+                epoch.settled_units, epoch.remaining_units, epoch.uncertain_units
+            ),
+        ),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn cache_work_rows(epoch: &aterm_capacity::host_protocol::Epoch) -> Vec<(String, String)> {
+    use aterm_capacity::cache_work::{Availability, UnavailableReason};
+    let mut rows = Vec::new();
+    let mut records: Vec<_> = epoch.cache_work.iter().collect();
+    records.sort_unstable_by_key(|record| record.root);
+    for record in records {
+        let key = |part| {
+            format!(
+                "monitor/epoch/{}/root/{}/cache/{part}",
+                epoch.sequence, record.root
+            )
+        };
+        let prefix = format!("Root {} · Historical cache validation", record.root);
+        if let Some(reason) = record.unavailable {
+            let reason = match reason {
+                UnavailableReason::NotRecorded => "not recorded",
+                UnavailableReason::UnsupportedDriver => "unsupported driver",
+                UnavailableReason::MissingSession => "session marker missing",
+                UnavailableReason::AmbiguousSession => "session marker ambiguous",
+                UnavailableReason::QueryFailed => "report query failed",
+                UnavailableReason::InvalidReport => "invalid report",
+                UnavailableReason::PersistenceFailed => "report persistence failed",
+            };
+            rows.push((
+                key("availability"),
+                format!("{prefix}: unavailable · {reason}"),
+            ));
+            continue;
+        }
+        let Some(summary) = record
+            .summary
+            .as_ref()
+            .filter(|summary| summary.validate().is_ok())
+        else {
+            rows.push((
+                key("availability"),
+                format!("{prefix}: unavailable · invalid summary"),
+            ));
+            continue;
+        };
+        let availability = match summary.availability {
+            Availability::Complete => "complete",
+            Availability::UnavailableLegacyLog => "legacy log unavailable",
+        };
+        rows.push((
+            key("availability"),
+            format!(
+                "{prefix} · run {} · scope {} · {availability}",
+                summary.run_id,
+                summary.scope()
+            ),
+        ));
+        if let Some(work) = summary.totals {
+            let d = summary.denominators;
+            rows.push((key("coverage"), format!("Build-script input work: {} observed of {} script units · {} registered units · {} capture attempts · {} uncacheable", d.observed_units, d.run_script_units, d.registered_units, d.attempts_finished, d.uncacheable_attempts)));
+            rows.push((
+                key("work"),
+                format!(
+                    "Inputs: {} bytes hashed · {} metadata reads · {} revalidations",
+                    work.bytes_hashed, work.metadata_reads, work.revalidations
+                ),
+            ));
+        }
+    }
+    let not_recorded = epoch
+        .completed_roots
+        .saturating_sub(epoch.cache_work.len() as u32);
+    if not_recorded != 0 || epoch.cache_work.is_empty() {
+        rows.push((
+            format!("monitor/epoch/{}/cache/not-recorded", epoch.sequence),
+            if not_recorded == 0 {
+                "Cache validation: no completed-root report recorded".into()
+            } else {
+                format!("Cache validation: not recorded for {not_recorded} completed roots")
+            },
+        ));
+    }
+    rows
+}
+
 fn age(at: Option<Instant>, now: Instant) -> String {
     match at {
         None => "Awaiting observation".into(),
@@ -226,7 +375,7 @@ impl AllocationApp {
                 },
             ),
         ));
-        rows.push(("limits".into(), "Build identities, demand, grants, wait reasons and arena accounting are not yet provided by the host service.".into()));
+        rows.push(("limits".into(), "Computer-wide demand, wait reasons and arena accounting are not yet provided by the host service.".into()));
         rows
     }
 
@@ -359,7 +508,25 @@ impl AllocationApp {
         if snapshot.jobs.is_empty() {
             native.push((
                 "monitor/roots".into(),
-                "No owned native roots in this snapshot; retained work may remain".into(),
+                "No native job rows in this snapshot; epoch work may remain".into(),
+            ));
+        }
+        native.push(("monitor/epochs".into(), "Private compile epochs".into()));
+        let mut epochs: Vec<_> = snapshot.epochs.iter().collect();
+        epochs.sort_unstable_by_key(|epoch| epoch.sequence);
+        for epoch in epochs {
+            native.extend(epoch_rows(epoch));
+            native.extend(cache_work_rows(epoch));
+        }
+        if snapshot.epochs.is_empty() {
+            native.push((
+                "monitor/epochs-empty".into(),
+                "No private compile epochs in this snapshot".into(),
+            ));
+        } else {
+            native.push((
+                "monitor/epochs-basis".into(),
+                "Retired confirms helper/token retirement. CPU backing returns after group drain and durable cleanup, or genuine no-child cancellation. Root outcomes remain separate.".into(),
             ));
         }
         native.push((
@@ -383,7 +550,7 @@ impl AllocationApp {
                 "No delivered outcomes retained".into(),
             ));
         }
-        native.push(("monitor/limits".into(), "Session observation does not establish CPU grants, current computer leadership or proof status.".into()));
+        native.push(("monitor/limits".into(), "Session observations report original reservations and custody, not measured CPU use, current computer leadership or proof status.".into()));
         rows.splice(1..1, native);
     }
 }
@@ -429,7 +596,10 @@ impl NativeAppModel for AllocationApp {
         for (key, text) in std::iter::once(("title".into(), "Allocation · This computer".into()))
             .chain(self.rows(Instant::now()))
         {
-            let heading = key == "title" || key == "monitor/completions";
+            let heading = matches!(
+                key.as_str(),
+                "title" | "monitor/epochs" | "monitor/completions"
+            );
             let role = if heading {
                 SemanticRole::Heading
             } else {
@@ -545,6 +715,93 @@ mod tests {
         ActionInvocation, AppViewState, NativeApp, NativeRuntime, ViewId, ViewMotionCx,
     };
     use crate::native_ui::{LogicalRect, UiKey};
+
+    #[test]
+    fn control_scroll_moves_allocation_without_a_pty_and_keeps_session_pins() {
+        use crate::control::{NativeControlPrincipal, sessionless_front_scroll_event};
+        use crate::input::{InputEvent, InputOutcome, ScrollIntent, Source};
+        use crate::{App, WindowId};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let terminal = app.pool.get(0).unwrap().term.clone();
+        assert_eq!(app.pool.get(0).unwrap().master, -1);
+        app.open_allocation(false).unwrap();
+        assert!(app.front_terminal(wid).is_none());
+        assert!(app.active_handle.lock().unwrap().is_none());
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let cx = ViewCx {
+            viewport: LogicalRect::new(0.0, 0.0, 400.0, 120.0),
+            animation_phase_ms: 0,
+            motion: ViewMotionCx::default(),
+            terminal_font_px: 16.0,
+            terminal_scale: 1.0,
+            semantic_font: None,
+            document: None,
+        };
+        app.native_runtime
+            .render(instance, view, &cx)
+            .unwrap()
+            .compile(cx.viewport)
+            .unwrap();
+        let position = |app: &App| match app.native_runtime.view_state(view).unwrap() {
+            AppViewState::Allocation(state) => (state.scroll, state.limit.get()),
+            _ => panic!("expected Allocation"),
+        };
+        assert!(
+            position(&app).1 > 28.0,
+            "real rendered rows must exceed the viewport"
+        );
+        let deliver = |app: &mut App, rest| {
+            let event =
+                sessionless_front_scroll_event(rest, None, false, NativeControlPrincipal::Owner)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                app.input_to_session(
+                    wid,
+                    event,
+                    Source::Controller,
+                    None,
+                    crate::app_input::PressPhase::Initial,
+                ),
+                InputOutcome::Ok
+            );
+        };
+        deliver(&mut app, "down");
+        assert!(position(&app).0 > 0.0);
+        deliver(&mut app, "top");
+        assert_eq!(position(&app).0, 0.0);
+        deliver(&mut app, "-1");
+        assert_eq!(position(&app).0, 28.0);
+        deliver(&mut app, "up");
+        assert_eq!(position(&app).0, 0.0);
+        deliver(&mut app, "bottom");
+        assert_eq!(position(&app).0, position(&app).1);
+        deliver(&mut app, "top");
+        deliver(&mut app, "-2147483648");
+        assert_eq!(position(&app).0, position(&app).1);
+        let before = position(&app);
+        for session in [0, 999] {
+            assert_eq!(
+                app.input_to_session(
+                    wid,
+                    InputEvent::ScrollView(ScrollIntent::Top),
+                    Source::Controller,
+                    Some(session),
+                    crate::app_input::PressPhase::Initial,
+                ),
+                InputOutcome::Ok
+            );
+            assert_eq!(
+                position(&app),
+                before,
+                "hidden or stale session pins cannot scroll the foreground native app"
+            );
+        }
+        assert_eq!(crate::term_lock(&terminal).grid().display_offset(), 0);
+        assert!(app.front_terminal(wid).is_none());
+    }
 
     #[test]
     fn lease_state_never_invents_capacity_or_running_work() {

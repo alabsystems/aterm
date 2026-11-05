@@ -161,7 +161,8 @@ impl Recorder {
         }
         let shared: Arc<(Mutex<Shared>, Condvar)> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
-        let mut file = out.and_then(|d| std::fs::File::create(d.join("frames.jsonl")).ok());
+        let mut file =
+            out.and_then(|d| crate::util::create_regular_file(&d.join("frames.jsonl")).ok());
         let (sh, st) = (Arc::clone(&shared), Arc::clone(&stop));
         let thread = std::thread::spawn(move || {
             let mut p = StreamParser::new();
@@ -351,7 +352,8 @@ impl Journal {
     pub fn start(path: PathBuf, out: Option<&Path>) -> Journal {
         let lines: Arc<Mutex<Vec<(f64, J)>>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
-        let mut file = out.and_then(|d| std::fs::File::create(d.join("journal.jsonl")).ok());
+        let mut file =
+            out.and_then(|d| crate::util::create_regular_file(&d.join("journal.jsonl")).ok());
         let (l, s) = (Arc::clone(&lines), Arc::clone(&stop));
         let thread = std::thread::spawn(move || {
             let mut cursor = crate::util::LineTailCursor::default();

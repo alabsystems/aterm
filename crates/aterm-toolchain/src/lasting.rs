@@ -64,7 +64,7 @@ fn is_cache_dir(dir: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     #[cfg(not(unix))]
     if !std::fs::symlink_metadata(&tag).is_ok_and(|meta| meta.file_type().is_file()) {

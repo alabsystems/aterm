@@ -145,35 +145,37 @@ fn witness(root: &Path, files: &[PathBuf], pid: u32) -> Option<(String, PathBuf)
     found.next().is_none().then_some(one)
 }
 
+fn child_dirs(p: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(p)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect()
+}
+
 /// The sessions whose lock under `root` names `pid`, written no earlier than `since_ms`.
 fn locks_naming(root: &Path, pid: u32, since_ms: u64) -> Vec<(String, PathBuf)> {
-    let dirs = |p: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(p)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect()
-    };
     let written_ms = |lock: &Path| -> Option<u64> {
-        let at = std::fs::metadata(lock).ok()?.modified().ok()?;
+        let at = std::fs::symlink_metadata(lock).ok()?.modified().ok()?;
         u64::try_from(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis()).ok()
     };
-    dirs(root)
+    child_dirs(root)
         .iter()
-        .flat_map(|y| dirs(y))
-        .flat_map(|m| dirs(&m))
-        .flat_map(|d| dirs(&d))
+        .flat_map(|y| child_dirs(y))
+        .flat_map(|m| child_dirs(&m))
+        .flat_map(|d| child_dirs(&d))
         .map(|s| s.join(mz::LOCK))
         .filter_map(|lock| {
             let session = mz::session_of_lock(root, &lock)?;
+            if !written_ms(&lock).is_some_and(|at| at.saturating_add(1000) >= since_ms) {
+                return None;
+            }
             let body = super::super::accounts::read_bounded(&lock, 64 * 1024)
                 .ok()
                 .flatten()?;
-            (mz::lock_pid(&body) == Some(pid)
-                && written_ms(&lock).is_some_and(|at| at.saturating_add(1000) >= since_ms))
-            .then_some((session, lock))
+            (mz::lock_pid(&body) == Some(pid)).then_some((session, lock))
         })
         .collect()
 }
@@ -183,19 +185,10 @@ fn find_lock(root: &Path, session: &str) -> Option<PathBuf> {
     if !mz::is_session_uuid(session) {
         return None;
     }
-    let dirs = |p: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(p)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect()
-    };
-    dirs(root)
+    child_dirs(root)
         .iter()
-        .flat_map(|y| dirs(y))
-        .flat_map(|m| dirs(&m))
+        .flat_map(|y| child_dirs(y))
+        .flat_map(|m| child_dirs(&m))
         .map(|d| d.join(session).join(mz::LOCK))
         .find(|lock| mz::session_of_lock(root, lock).is_some() && lock.is_file())
 }
@@ -209,7 +202,7 @@ fn session_log_tail(lock: &Path, cap: u64) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let mut f = options.open(log).ok()?;
     let meta = f.metadata().ok()?;
@@ -301,6 +294,8 @@ pub(super) fn snapshot(
     let cwd = k.cwd(pid).unwrap_or_default();
     let started_ms = k.started_ms(pid).unwrap_or(0);
     Ok(super::super::relaunch::Snapshot {
+        auth_observed: false,
+        launch_env: None,
         tab: tab.to_string(),
         pid,
         start,
@@ -771,6 +766,7 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn MuseKernel) -> Result<Plan, NoP
         detail: e,
     })?;
     Ok(Plan {
+        cold: None,
         command: None,
         shell: st.shell,
         dialect,
@@ -1133,17 +1129,14 @@ fn carry_in_flight_with(
 
 /// Whether Muse Code's composer on `scr` is empty ([`aterm_phase::ScreenReader::placeholder_fg`]),
 /// its first glyph read as the loop reads it ([`crate::supervise::screen::composer_glyph_cell`]),
-/// and no prompt-history search stands over it ([`aterm_phase::muse::history_search`]): keys would
-/// type into its query.
+/// and the cursor is not under it ([`crate::supervise::screen::cursor_under_composer`]), where the
+/// prompt-history search leaves it: keys would type into its query.
 fn composer_empty(c: &mut Client, tab: &str, scr: &super::Screen) -> bool {
-    if aterm_phase::muse::history_search(&scr.rows) {
-        return false;
-    }
     let Some((caret, lines)) = aterm_phase::muse::composer_draft(&scr.rows) else {
         return false;
     };
     let hint = aterm_phase::Program::Muse.reader().placeholder_fg();
-    crate::supervise::screen::composer_holds_no_draft(scr.cursor, caret, &lines, || {
+    crate::supervise::screen::composer_holds_no_draft(&scr.rows, scr.cursor, caret, &lines, || {
         scr.first.checked_add(caret).is_some_and(|at| {
             crate::supervise::screen::composer_glyph_cell(|col| {
                 c.request_line(&format!("@{tab} cell {at} {col}")).ok()

@@ -84,18 +84,17 @@ pub(super) fn publish(parent: &File, key: &str) -> io::Result<Published> {
     let (gate, text, before) = match open(&directory, GATE, false, false) {
         Ok(file) => {
             let (text, before) = bytes(&file, GATE_BODY.len())?;
-            if !GATE_BODY.starts_with(text.as_str())
-                || !matches!(file.metadata()?.mode() & 0o7777, 0o400 | 0o600)
-            {
+            let mode = before.mode() & 0o7777;
+            if !GATE_BODY.starts_with(text.as_str()) || !matches!(mode, 0o400 | 0o600) {
                 return Err(bad(
                     "unpublished gate is not a private non-executable constant prefix",
                 ));
             }
             unchanged(parent, &temporary, &directory, &id, origin)?;
-            if text.len() != GATE_BODY.len() && file.metadata()?.mode() & 0o7777 != 0o600 {
+            if text.len() != GATE_BODY.len() && mode != 0o600 {
                 return Err(bad("a partial sealed gate is not an owned write prefix"));
             }
-            if file.metadata()?.mode() & 0o7777 == 0o600 {
+            if mode == 0o600 {
                 let writer = File::from(fd::openat(
                     &directory,
                     GATE,

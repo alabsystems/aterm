@@ -142,6 +142,16 @@ pub struct BrokerHealth {
     /// (one from before the tally joined the file, under the same header): the counts
     /// are unknown, never zero.
     pub process_flushes: Option<astream_sys::FlushTally>,
+    /// How long those flushes took and when the slow ones ran, as the writing process
+    /// read them for the snapshot (`astream_sys::flush_times`: the total nanoseconds of
+    /// each kind, the clock they are on, how many flushes were slower than
+    /// `astream_sys::SLOW_FLUSH_NS`, and the last `astream_sys::SLOW_FLUSHES_KEPT` of them,
+    /// each with its index, kind, start and end, and how many calls were still running), so a
+    /// reader can line a stall it saw up with the flushes that ran under it and say which of
+    /// them the ring lost (`astream_sys::FlushTimes::missed`) or could not hold yet
+    /// (`astream_sys::FlushTimes::running`). `None` in a snapshot an older build wrote:
+    /// unknown, never zero.
+    pub process_flush_times: Option<astream_sys::FlushTimes>,
     /// What of the retained history the log keeps decoded in memory when the snapshot
     /// was taken ([`Broker::residency`](crate::Broker::residency)): every retained record
     /// with no residency budget, the hot window at the head under one
@@ -196,6 +206,7 @@ impl Default for BrokerHealth {
             parked_tails: 0,
             flushes: FlushCounts::default(),
             process_flushes: None,
+            process_flush_times: None,
             resident: None,
             poisoned: None,
         }
@@ -216,6 +227,59 @@ fn tally_counts(t: &astream_sys::FlushTally) -> [(&'static str, u64); 3] {
 /// an older build) not at all.
 fn residency_counts(r: &Residency) -> [(&'static str, u64); 2] {
     [("resident_records", r.records), ("resident_bytes", r.bytes)]
+}
+
+/// The keys of [`BrokerHealth::process_flush_times`], each with its value: written together
+/// or (by an older build) not at all. The ring is one value, `-` when it holds nothing, else
+/// each slow flush as `<index>:<kind>:<start>-<end>` (its index among the process's slow
+/// flushes, then nanoseconds on the clock the snapshot names), oldest first, joined by commas;
+/// the calls still running as the times were read follow it.
+fn flush_time_values(t: &astream_sys::FlushTimes) -> [(&'static str, String); 7] {
+    let ring = if t.slow.is_empty() {
+        "-".to_string()
+    } else {
+        t.slow
+            .iter()
+            .map(|f| format!("{}:{}:{}-{}", f.index, f.kind.word(), f.start_ns, f.end_ns))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    [
+        ("process_flush_clock", t.clock.word().to_string()),
+        ("process_flush_full_ns", t.full_ns.to_string()),
+        ("process_flush_barrier_ns", t.barrier_ns.to_string()),
+        ("process_flush_plain_ns", t.plain_ns.to_string()),
+        ("process_slow_flushes", t.slow_count.to_string()),
+        ("process_slow_flush_ring", ring),
+        ("process_flushes_running", t.running.to_string()),
+    ]
+}
+
+/// The ring [`flush_time_values`] writes, or `None` for one no writer wrote: a malformed
+/// entry (an entry with no index among them), an end before its start, an index not past
+/// the one before it, or more entries than the ring keeps. Whether each index is below the
+/// snapshot's slow count is [`BrokerHealth::parse`]'s to judge, once both keys are read.
+fn parse_slow_ring(v: &str) -> Option<Vec<astream_sys::SlowFlush>> {
+    if v == "-" {
+        return Some(Vec::new());
+    }
+    let ring = v
+        .split(',')
+        .map(|entry| {
+            let (index, rest) = entry.split_once(':')?;
+            let (kind, span) = rest.split_once(':')?;
+            let (start, end) = span.split_once('-')?;
+            let f = astream_sys::SlowFlush {
+                index: index.parse().ok()?,
+                kind: astream_sys::FlushKind::from_word(kind)?,
+                start_ns: start.parse().ok()?,
+                end_ns: end.parse().ok()?,
+            };
+            (f.start_ns <= f.end_ns).then_some(f)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let rising = ring.windows(2).all(|p| p[0].index < p[1].index);
+    (rising && ring.len() <= astream_sys::SLOW_FLUSHES_KEPT).then_some(ring)
 }
 
 /// Whether the broker that wrote a `<log>.health` still serves its log
@@ -330,9 +394,9 @@ impl BrokerHealth {
     }
 
     /// The file's text: its first line, `astream-broker-health 1` (the format's
-    /// version), then one `key=value` line each, the process's flush tally and the
-    /// log's residency when they are known, the poison's reason (when there is one)
-    /// last. Every key [`parse`](Self::parse) needs is always written.
+    /// version), then one `key=value` line each, the process's flush tally, its flush
+    /// times and the log's residency when they are known, the poison's reason (when
+    /// there is one) last. Every key [`parse`](Self::parse) needs is always written.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(512);
@@ -362,6 +426,11 @@ impl BrokerHealth {
                 kv(k, &v.to_string());
             }
         }
+        if let Some(times) = &self.process_flush_times {
+            for (k, v) in flush_time_values(times) {
+                kv(k, &v);
+            }
+        }
         if let Some(resident) = &self.resident {
             for (k, v) in residency_counts(resident) {
                 kv(k, &v.to_string());
@@ -380,10 +449,14 @@ impl BrokerHealth {
     /// The snapshot in `text`, or `None` for text that is not one this build reads:
     /// another first line (another format, or a file cut short), a key it needs
     /// missing, or a value that does not parse. Keys it does not know are skipped, so a
-    /// later build that adds one is still read. The process's flush tally and the log's
-    /// residency are the facts an older build under this header did not write: each
-    /// one's keys are all present (`process_flushes`, `resident` is `Some`) or all absent
-    /// (`None`), never some of them.
+    /// later build that adds one is still read. The process's flush tally, its flush
+    /// times and the log's residency are the facts an older build under this header did
+    /// not write: each one's keys are all present (`process_flushes`,
+    /// `process_flush_times`, `resident` is `Some`) or all absent (`None`), never some of
+    /// them. A flush ring that is not one a writer wrote (an entry that does not parse or
+    /// names no index, an end before its start, an index not past the one before it or not
+    /// below the slow flushes it counts, more entries than `astream_sys::SLOW_FLUSHES_KEPT`)
+    /// is no snapshot.
     #[must_use]
     pub fn parse(text: &str) -> Option<BrokerHealth> {
         let mut lines = text.lines();
@@ -392,9 +465,18 @@ impl BrokerHealth {
         }
         let mut h = BrokerHealth::default();
         // Every key `render` writes but `reason` (present exactly when poisoned), the
-        // tally's (bits 26 to 28, all or none) and the residency's (bits 29 and 30, both
-        // or neither).
-        let mut seen = 0u32;
+        // tally's (bits 26 to 28, all or none), the residency's (bits 29 and 30, both or
+        // neither) and the flush times' (bits 31 to 37, all or none).
+        let mut seen = 0u64;
+        let mut times = astream_sys::FlushTimes {
+            clock: astream_sys::FLUSH_CLOCK,
+            full_ns: 0,
+            barrier_ns: 0,
+            plain_ns: 0,
+            slow_count: 0,
+            slow: Vec::new(),
+            running: 0,
+        };
         let mut tally = astream_sys::FlushTally::default();
         let mut resident = Residency::default();
         let mut poisoned = None;
@@ -542,17 +624,46 @@ impl BrokerHealth {
                     resident.bytes = num()?;
                     30
                 }
+                "process_flush_clock" => {
+                    times.clock = astream_sys::FlushClock::from_word(v)?;
+                    31
+                }
+                "process_flush_full_ns" => {
+                    times.full_ns = num()?;
+                    32
+                }
+                "process_flush_barrier_ns" => {
+                    times.barrier_ns = num()?;
+                    33
+                }
+                "process_flush_plain_ns" => {
+                    times.plain_ns = num()?;
+                    34
+                }
+                "process_slow_flushes" => {
+                    times.slow_count = num()?;
+                    35
+                }
+                "process_slow_flush_ring" => {
+                    times.slow = parse_slow_ring(v)?;
+                    36
+                }
+                "process_flushes_running" => {
+                    times.running = num()?;
+                    37
+                }
                 "reason" => {
                     reason = Some(v.to_string());
                     continue;
                 }
                 _ => continue,
             };
-            seen |= 1u32 << bit;
+            seen |= 1u64 << bit;
         }
-        const NEEDED: u32 = (1u32 << 26) - 1;
-        const TALLY: u32 = 0b111 << 26;
-        const RESIDENT: u32 = 0b11 << 29;
+        const NEEDED: u64 = (1u64 << 26) - 1;
+        const TALLY: u64 = 0b111 << 26;
+        const RESIDENT: u64 = 0b11 << 29;
+        const TIMES: u64 = 0b111_1111 << 31;
         if seen & NEEDED != NEEDED {
             return None;
         }
@@ -563,6 +674,11 @@ impl BrokerHealth {
         };
         h.resident = match seen & RESIDENT {
             RESIDENT => Some(resident),
+            0 => None,
+            _ => return None,
+        };
+        h.process_flush_times = match seen & TIMES {
+            TIMES if times.slow.iter().all(|f| f.index < times.slow_count) => Some(times),
             0 => None,
             _ => return None,
         };
@@ -805,6 +921,28 @@ mod tests {
                 barrier: 13,
                 plain: 17,
             }),
+            process_flush_times: Some(astream_sys::FlushTimes {
+                clock: astream_sys::FlushClock::Machine,
+                full_ns: 41_000_000,
+                barrier_ns: 2_600_000,
+                plain_ns: 0,
+                slow_count: 3,
+                slow: vec![
+                    astream_sys::SlowFlush {
+                        index: 1,
+                        kind: astream_sys::FlushKind::Full,
+                        start_ns: 900_000_000,
+                        end_ns: 907_500_000,
+                    },
+                    astream_sys::SlowFlush {
+                        index: 2,
+                        kind: astream_sys::FlushKind::Barrier,
+                        start_ns: 910_000_000,
+                        end_ns: 911_250_000,
+                    },
+                ],
+                running: 1,
+            }),
             resident: Some(Residency {
                 records: 5,
                 bytes: 619,
@@ -863,7 +1001,11 @@ mod tests {
         );
         // A broker built before the tally joined the file writes the same header and no
         // tally: read, its tally unknown (never zero), and it renders the same text back.
-        let older = without(&["process_flush_"]);
+        let older = without(&[
+            "process_flush_full=",
+            "process_flush_barrier=",
+            "process_flush_plain=",
+        ]);
         let mut unknown = healthy.clone();
         unknown.process_flushes = None;
         assert_eq!(BrokerHealth::parse(&older), Some(unknown.clone()));
@@ -879,6 +1021,101 @@ mod tests {
                 "a tally without {key} is no writer's"
             );
         }
+        // The flush times the same way: the totals, the clock, the slow count and the ring,
+        // oldest first; an older broker's snapshot carries none and reads with them unknown.
+        assert!(
+            ht.contains(
+                "\nprocess_flush_clock=machine\nprocess_flush_full_ns=41000000\n\
+                 process_flush_barrier_ns=2600000\nprocess_flush_plain_ns=0\n\
+                 process_slow_flushes=3\nprocess_slow_flush_ring=1:full:900000000-907500000,\
+                 2:barrier:910000000-911250000\nprocess_flushes_running=1\n"
+            ),
+            "the process's flush times, each kind's total, the ring and the calls running: {ht}"
+        );
+        let times_keys = [
+            "process_flush_clock=",
+            "process_flush_full_ns=",
+            "process_flush_barrier_ns=",
+            "process_flush_plain_ns=",
+            "process_slow_flushes=",
+            "process_slow_flush_ring=",
+            "process_flushes_running=",
+        ];
+        let older = without(&times_keys);
+        let mut unknown = healthy.clone();
+        unknown.process_flush_times = None;
+        assert_eq!(BrokerHealth::parse(&older), Some(unknown.clone()));
+        assert_eq!(
+            unknown.render(),
+            older,
+            "no flush times, no flush time keys"
+        );
+        for key in times_keys {
+            assert_eq!(
+                BrokerHealth::parse(&without(&[key])),
+                None,
+                "flush times without {key} are no writer's"
+            );
+        }
+        let mut empty = healthy.clone();
+        if let Some(t) = empty.process_flush_times.as_mut() {
+            t.slow.clear();
+        }
+        let et = empty.render();
+        assert!(et.contains("\nprocess_slow_flush_ring=-\n"), "{et}");
+        assert_eq!(BrokerHealth::parse(&et), Some(empty), "an empty ring reads");
+        let ring =
+            "process_slow_flush_ring=1:full:900000000-907500000,2:barrier:910000000-911250000";
+        for (bad, why) in [
+            (
+                "process_slow_flush_ring=1:full:907500000-900000000",
+                "an end before its start",
+            ),
+            ("process_slow_flush_ring=1:fsync:1-2", "a kind no flush has"),
+            ("process_slow_flush_ring=1:full:1", "an entry with no end"),
+            (
+                "process_slow_flush_ring=full:900000000-907500000,barrier:910000000-911250000",
+                "entries with no index (an E09 build's ring)",
+            ),
+            (
+                "process_slow_flush_ring=2:full:1-2,1:barrier:3-4",
+                "an index not past the one before it",
+            ),
+            (
+                "process_slow_flush_ring=1:full:1-2,1:barrier:3-4",
+                "one index twice",
+            ),
+            ("process_slow_flush_ring=", "an empty ring that is not `-`"),
+        ] {
+            assert_eq!(BrokerHealth::parse(&ht.replace(ring, bad)), None, "{why}");
+        }
+        assert_eq!(
+            BrokerHealth::parse(&ht.replace("process_slow_flushes=3", "process_slow_flushes=2")),
+            None,
+            "a ring holding an index at its count, one no reading had counted"
+        );
+        let too_many = format!(
+            "process_slow_flush_ring={}",
+            (0..=astream_sys::SLOW_FLUSHES_KEPT)
+                .map(|i| format!("{i}:plain:1-2"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(
+            BrokerHealth::parse(
+                &ht.replace(ring, &too_many)
+                    .replace("process_slow_flushes=3", "process_slow_flushes=99")
+            ),
+            None,
+            "a ring longer than the ring keeps"
+        );
+        assert_eq!(
+            BrokerHealth::parse(
+                &ht.replace("process_flush_clock=machine", "process_flush_clock=wall")
+            ),
+            None,
+            "a clock no build reads"
+        );
         // Residency the same way: an older broker's snapshot carries none, and reads with
         // it unknown, never a log that holds nothing resident.
         assert!(

@@ -209,10 +209,27 @@ fn callbacks_run_outside_state_lock_and_last_host_drop_cancels_without_join() {
     let callbacks = Arc::clone(&called);
     let callback = Notify::Callback(Arc::new(move || {
         let control = weak.upgrade().unwrap();
-        assert!(control.shared.state.try_lock().is_ok());
+        // The worker may hold this lock on another thread. Acquiring it proves
+        // reentrancy; try_lock would also reject ordinary concurrent publication.
+        let _state = control.shared.state.lock().unwrap();
         callbacks.fetch_add(1, Ordering::AcqRel);
     }));
-    host.attach(client, source.generation, callback).unwrap();
+    // If attach itself held the state lock during the callback, this completion
+    // would never arrive. Bound that deadlock without a timing assertion about
+    // how quickly another thread releases the lock.
+    let (completed, completion) = std::sync::mpsc::sync_channel(1);
+    let attaching = host.clone();
+    let generation = source.generation;
+    let attacher = std::thread::spawn(move || {
+        completed
+            .send(attaching.attach(client, generation, callback))
+            .unwrap();
+    });
+    completion
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("monitor callback must return without holding the state lock")
+        .unwrap();
+    attacher.join().unwrap();
     until(&host, |view| view.phase == Phase::Reading);
     assert!(called.load(Ordering::Acquire) > 0);
     let shared = Arc::clone(&host.0.shared);

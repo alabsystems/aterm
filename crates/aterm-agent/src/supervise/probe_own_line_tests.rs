@@ -6,10 +6,13 @@
 //! line is the one this loop left ([`turn_end_loop::OwnLine`]), as an act's is since slice at1, so
 //! a draft equal to it is no person's ([`Session::person_at`]): drawn late, it holds nothing for a
 //! person's grace, and the probe's own Enter sends it when it draws. A probe the ledger seeds
-//! after a restart claims no draft, a person's keys still hold, and the probe's end ends the
+//! after a restart claims only the `/usage` its ledger row proves the previous loop's, with no
+//! person's key since (v6 §14.17.5.8), a person's keys still hold, and the probe's end ends the
 //! claim.
 
-use super::super::super::turn_end_loop::{ECHO_HANG, ECHO_HUNG, OwnBy, OwnLine, Written};
+use super::super::super::turn_end_loop::{
+    ECHO_HANG, ECHO_HUNG, OwnBy, OwnLine, PROBE_SEED_PROVEN, PROBE_SEED_UNPROVEN, Written,
+};
 use super::*;
 use crate::harness::usage::USAGE_COMMAND;
 use crate::supervise::policy::turn_end::{PERSON_TYPING, RULE_USAGE_PROBE};
@@ -26,6 +29,20 @@ fn probe_run_over(
     policy: SupervisorConfig,
     max_s: u64,
 ) -> (Vec<String>, Vec<String>) {
+    probe_run_over_at(tag, m, host, ledger, policy, max_s, None)
+}
+
+/// [`probe_run_over`] with its wall clock standing at `stamped` (unix seconds), the rows it writes
+/// stamped by that clock too, not the system's (`None`: [`PROBE_NOW`], rows the system's).
+fn probe_run_over_at(
+    tag: &str,
+    m: &mut Mock,
+    host: &Arc<ProbeHost>,
+    ledger: &Path,
+    policy: SupervisorConfig,
+    max_s: u64,
+    stamped: Option<i64>,
+) -> (Vec<String>, Vec<String>) {
     let (dir, path) = journal_file(tag);
     let opts = SuperviseOpts {
         idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
@@ -34,7 +51,10 @@ fn probe_run_over(
         ..hosted(max_s)
     };
     let (lines, _) = watch_lines_with(m, &opts, |s| {
-        s.set_clock(PROBE_NOW, PDT);
+        s.set_clock(stamped.unwrap_or(PROBE_NOW), PDT);
+        if stamped.is_some() {
+            s.test_clock().stamp_by_script();
+        }
         s.set_approval_ledger(Some(ledger.to_path_buf()));
         probe_waits(s);
     });
@@ -236,7 +256,7 @@ fn a_usage_draft_is_no_persons_only_while_the_probe_that_left_it_lasts() {
         since: s.fx.mono(),
     };
     assert_eq!(s.person_at(), Some(seen), "a seeded probe claims no draft");
-    s.own_line = Some(OwnLine::of(USAGE_COMMAND, OwnBy::Probe));
+    s.own_line = Some(OwnLine::of(USAGE_COMMAND, OwnBy::Probe, Some(0)));
     assert_eq!(s.person_at(), None, "the probe's own line is no person's");
     s.fx.sleep(Duration::from_secs(3));
     let key = s.fx.mono();
@@ -248,6 +268,7 @@ fn a_usage_draft_is_no_persons_only_while_the_probe_that_left_it_lasts() {
     s.own_line = Some(OwnLine::of(
         USAGE_COMMAND,
         OwnBy::Act(TurnEndAction::Nothing),
+        Some(0),
     ));
     s.probe = UsageProbe::Owed {
         own: true,
@@ -300,16 +321,19 @@ fn a_line_a_write_leaves_is_no_persons_draft_when_it_draws() {
     assert!(s.person_at().is_some(), "a person's key holds");
 }
 
-/// A PROBE THE LEDGER SEEDS AFTER A RESTART PRESSES NO ENTER OF ITS OWN ON A `/usage` IT FINDS
-/// STANDING ([`Session::probe_left_stands`]): the first loop leaves its `/usage` typed and ends;
-/// the next loop's probe, seeded owed from the ledger (`UsageProbe::Owed` with `own: false`), finds
-/// it standing, a line no write of this process left: it holds for a person's grace as any
-/// person's draft does, and past the grace no `TYPED … usage-probe@v1 /usage left typed` is the
-/// seeded probe's. Negative control by mutation: the probe's Enter on any `/usage` standing while
-/// a probe is owed (its own line unasked): the seeded probe's `TYPED … left typed` past the grace.
-#[test]
-fn a_probe_the_ledger_seeds_presses_no_enter_on_a_usage_it_did_not_write() {
-    let (dir, ledger) = ledger_at("probe-seeded-past-grace");
+/// The restart of [`a_probe_the_ledger_seeds_sends_only_the_usage_its_row_proves`]: the first loop
+/// leaves its `/usage` typed and ends; the next loop, its probe seeded owed from the ledger
+/// (`UsageProbe::Owed` with `own: false`), finds it standing ten minutes later (both runs' rows
+/// stamped by their own clock, so the span is the runs'), the window's
+/// gesture count moved by `keyed` since the first loop's write and its typing stamp
+/// (`human_typed_ms`) `typed_ms` (`None`: a window that stamps none). Its run's journal, the
+/// probe's ledger rows and every write.
+fn seeded_restart(
+    tag: &str,
+    keyed: u64,
+    typed_ms: Option<u64>,
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let (dir, ledger) = ledger_at(tag);
     let host = ProbeHost::probing(true);
     let mut m = probe_world(
         &[panel_fx::USAGE_REFRESHING, panel_fx::USAGE_SETTLED],
@@ -317,25 +341,36 @@ fn a_probe_the_ledger_seeds_presses_no_enter_on_a_usage_it_did_not_write() {
     );
     m.tick_at_key = 1;
     m.exit_when = Some(|m| m.keys >= 1);
-    let _ = probe_run_over(
-        "te-probe-seeded-past-grace",
+    let _ = probe_run_over_at(
+        &format!("te-{tag}"),
         &mut m,
         &host,
         &ledger,
         probe_policy(120),
         60,
+        Some(PROBE_NOW),
     );
     m.exit_when = None;
     assert_eq!(
         probe_writes(&m),
         [USAGE_COMMAND],
-        "the first loop's, left typed"
+        "{tag}: the first loop's, left typed"
+    );
+    let typed = std::fs::read_to_string(&ledger).unwrap_or_default();
+    assert!(
+        typed.contains(&format!(
+            ",\"{}\":0",
+            crate::supervise::approvals::PROBE_HUMAN
+        )),
+        "{tag}: the write's key count booked: {typed}"
     );
     let standing = m.screens.last().cloned().expect("a screen");
     m.screens.push(with_draft(&busy_screen(), USAGE_COMMAND));
     m.screens.push(standing);
     m.served = m.screens.len() - 2;
     m.stalls = 0;
+    m.human_seq = m.human_seq.map(|n| n + keyed);
+    m.typed_ms = typed_ms;
     // The grace is what this run waits out, and nothing here reads a time finer than it: the nap
     // caps how far the virtual clock moves, so it overshoots no wake the loop asked for. What it
     // gives up: a transition between two of these steps, or a defect only the thousands of reads
@@ -343,42 +378,144 @@ fn a_probe_the_ledger_seeds_presses_no_enter_on_a_usage_it_did_not_write() {
     m.stall_sleep = Some(Duration::from_secs(5));
     m.exit_when = Some(|m| probe_writes(m).contains(&"esc"));
     let next = ProbeHost::probing(true);
-    let (lines, journal) = probe_run_over(
-        "te-probe-seeded-past-grace-next",
+    let (lines, journal) = probe_run_over_at(
+        &format!("te-{tag}-next"),
         &mut m,
         &next,
         &ledger,
         probe_policy(120),
         600,
+        Some(PROBE_NOW + 600),
     );
     let rows = probe_rows(&ledger);
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        !person_waits(&journal).is_empty(),
-        "no line of this process's: a person's grace first: {journal:#?}"
-    );
+    (lines, journal, rows, m.writes())
+}
+
+/// A PROBE THE LEDGER SEEDS AFTER A RESTART SENDS ONLY THE `/usage` ITS ROW PROVES (v6 §14.17.5.8,
+/// [`Session::probe_seed_claims`]). The probe's `typed` row books the key count its write was
+/// fenced on; a restart that finds a `/usage` standing with the window's count unmoved since claims
+/// it as the probe's own line (`NOTE … is the previous loop's write`), sends it by the probe's own
+/// Enter (`TYPED … left typed`) with no person's grace waited on it and no continuation's booking,
+/// and closes the panel it opens. With a person's key since (the count moved), the `/usage` is the
+/// person's command: no Enter, the hold journalled once, and the seeded probe ends (`SKIPPED … no
+/// proof`, its `closed` row), so it closes no panel of theirs. On origin/main (9c586c9ad0) the
+/// seeded probe claimed no `/usage` and held any it found for a person's grace
+/// (`the_probe_is_not_typed_again_over_its_own_text_left_typed`), and the draft step then sent a
+/// person's `/usage` (`usage_left_typed_is_sent_as_the_probes_own_and_its_panel_is_closed`:
+/// `CONTINUED … rule=continue@v1 /usage`). Negative controls by mutation: the claim taken with no
+/// proof (the count's comparison dropped): the keyed arm journals the claim and no `SKIPPED` (its
+/// `/usage` still held, by `OwnLine::unkeyed`); the row's key count unbooked
+/// (`approvals::with_human` writing no field): no `"human"` in the row; the claim weighed at the
+/// look's top (`composer_settles`), where the books of the busy spell after it end the line: the
+/// proven arm's `/usage` held a person's grace and then as their command.
+#[test]
+fn a_probe_the_ledger_seeds_sends_only_the_usage_its_row_proves() {
     let typed = format!(" rule={RULE_USAGE_PROBE} {USAGE_COMMAND} left typed");
+    let (lines, journal, rows, writes) = seeded_restart("probe-seeded-proven", 0, None);
+    assert!(
+        journal.iter().any(|l| l.starts_with("NOTE ")
+            && l.contains(&format!(
+                "rule={RULE_USAGE_PROBE} {USAGE_COMMAND} {PROBE_SEED_PROVEN}"
+            ))),
+        "the previous loop's write, claimed: {journal:#?}"
+    );
+    assert_eq!(
+        person_waits(&journal),
+        Vec::<&String>::new(),
+        "no person's grace on the loop's own line: {journal:#?}\n{lines:#?}"
+    );
+    assert_eq!(
+        journal
+            .iter()
+            .filter(|l| l.starts_with("TYPED ") && l.contains(&typed))
+            .count(),
+        1,
+        "the probe's own Enter: {journal:#?}"
+    );
     assert!(
         !journal
             .iter()
-            .any(|l| l.starts_with("TYPED ") && l.contains(&typed)),
-        "the seeded probe's own Enter on a `/usage` it did not write: {journal:#?}"
-    );
-    // Past the grace the policy's draft step sends it as any person's draft (the act's text, as
-    // `probe-left-not-ours` has it), and the seeded probe closes the panel that opens.
-    assert!(
-        journal.iter().any(|l| l.starts_with("CONTINUED ")
-            && l.ends_with(&format!(" rule={RULE_CONTINUE} {USAGE_COMMAND}"))),
-        "{journal:#?}"
+            .any(|l| l.starts_with("CONTINUED ") && l.contains(USAGE_COMMAND)),
+        "`/usage` is no continuation: {journal:#?}"
     );
     assert_eq!(
-        m.writes(),
+        writes,
         ["text:/usage", "enter", "enter", "esc"],
         "{lines:#?}"
     );
     assert_eq!(
         rows,
         ["typed /usage the accounts probe", "waiting /usage closed"]
+    );
+
+    let (lines, journal, rows, writes) = seeded_restart("probe-seeded-keyed", 1, None);
+    assert!(
+        journal.iter().any(|l| l.starts_with("SKIPPED ")
+            && l.contains(&format!("rule={RULE_USAGE_PROBE} {USAGE_COMMAND}"))
+            && l.contains(PROBE_SEED_UNPROVEN)),
+        "the seeded probe ends: {journal:#?}"
+    );
+    assert_eq!(
+        writes,
+        ["text:/usage", "enter"],
+        "nothing pressed on the person's `/usage`: {lines:#?}\n{journal:#?}"
+    );
+    assert_eq!(
+        journal
+            .iter()
+            .filter(|l| l.starts_with("HOLD ") && l.contains("why=command"))
+            .count(),
+        1,
+        "the person's hold, journalled once: {journal:#?}"
+    );
+    assert_eq!(
+        rows,
+        ["typed /usage the accounts probe", "waiting /usage closed"]
+    );
+}
+
+/// THE RESTART'S PROOF GOES BY THE WINDOW'S TYPING STAMP, NOT ITS GESTURE COUNT (v6 §14.17.5.8,
+/// `typed_since_ms`): a seeded probe finds the first loop's `/usage` standing ten minutes after
+/// its row. The window's gesture count moved by three since the write (a scroll, a click), its
+/// typing stamp putting the person's last typing an hour back, before the row: no person typed
+/// since, so the line is the probe's, claimed and sent by its own Enter, its panel closed. Their
+/// typing a minute back, after the row, makes it theirs: no Enter on it and the seeded probe ends.
+/// Negative controls by mutation: the stamp ignored (the gesture count alone): the scroll's
+/// `/usage` held as the person's, `SKIPPED`; `typed_since_ms` saying no typing whatever the stamp:
+/// the typed `/usage` claimed.
+#[test]
+fn a_seeded_probe_proves_its_usage_by_the_typing_stamp_not_the_gesture_count() {
+    let (lines, journal, rows, writes) =
+        seeded_restart("probe-seeded-scrolled", 3, Some(3_600_000));
+    assert!(
+        journal.iter().any(|l| l.starts_with("NOTE ")
+            && l.contains(&format!(
+                "rule={RULE_USAGE_PROBE} {USAGE_COMMAND} {PROBE_SEED_PROVEN}"
+            ))),
+        "a scroll since is no typing: {journal:#?}"
+    );
+    assert_eq!(
+        writes,
+        ["text:/usage", "enter", "enter", "esc"],
+        "{lines:#?}\n{journal:#?}"
+    );
+    assert_eq!(
+        rows,
+        ["typed /usage the accounts probe", "waiting /usage closed"]
+    );
+
+    let (lines, journal, _, writes) = seeded_restart("probe-seeded-typed", 1, Some(60_000));
+    assert!(
+        journal.iter().any(|l| l.starts_with("SKIPPED ")
+            && l.contains(&format!("rule={RULE_USAGE_PROBE} {USAGE_COMMAND}"))
+            && l.contains(PROBE_SEED_UNPROVEN)),
+        "typing since the row: {journal:#?}"
+    );
+    assert_eq!(
+        writes,
+        ["text:/usage", "enter"],
+        "nothing pressed on the person's `/usage`: {lines:#?}\n{journal:#?}"
     );
 }
 

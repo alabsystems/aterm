@@ -6,11 +6,13 @@ use crate::native_updater_service::ApplyMode;
 #[test]
 fn a_worker_that_skips_verification_offers_the_grant_the_lane_admitted() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-    for (grant_chunks, grant_empty, sessionless) in [
-        (true, false, false),
-        (false, false, false),
-        (false, true, true),
-        (true, true, false),
+    for (grant_chunks, grant_empty, grant_desk, sessionless) in [
+        (true, false, false, false),
+        (false, false, false, false),
+        (false, true, false, true),
+        (true, true, false, false),
+        (false, true, true, true),
+        (false, false, true, false),
     ] {
         let mut app = crate::App::headless_for_test();
         let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
@@ -36,6 +38,7 @@ fn a_worker_that_skips_verification_offers_the_grant_the_lane_admitted() {
             verify_staged_candidate: false,
             grant_chunks,
             grant_empty,
+            grant_desk,
             sessionless,
             installed_activation: false,
             bundle: None,
@@ -49,8 +52,12 @@ fn a_worker_that_skips_verification_offers_the_grant_the_lane_admitted() {
         let job = job_rx.try_recv().expect("the worker's job was sent");
         assert!(!job.verify_staged_candidate, "PRECONDITION");
         assert_eq!(
-            (job.successor_grant_chunks, job.successor_grant_empty),
-            (grant_chunks, grant_empty),
+            (
+                job.successor_grant_chunks,
+                job.successor_grant_empty,
+                job.successor_grant_desk
+            ),
+            (grant_chunks, grant_empty, grant_desk),
             "the successor is offered exactly the grant the lane admitted"
         );
         assert_eq!(
@@ -91,6 +98,7 @@ fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
         verify_staged_candidate: false,
         grant_chunks: false,
         grant_empty: false,
+        grant_desk: false,
         sessionless: false,
         installed_activation: false,
         bundle: None,
@@ -195,6 +203,79 @@ fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
     app.update_handoff_prelaunch = None;
 }
 
+/// A worker that verifies takes each grant off the bundle it read, not the lane's guess from
+/// before the read.
+#[test]
+fn a_worker_that_verifies_takes_the_grants_its_read_declared() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = crate::App::headless_for_test();
+    let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+        crate::running_build_number().saturating_add(1),
+        "",
+        &"ab".repeat(32),
+    );
+    let (cancel, cancelled) = std::sync::mpsc::sync_channel(1);
+    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<super::HandoffWorkerJob>(1);
+    let (reconcile_worker, _reconcile_rx) = std::sync::mpsc::sync_channel(1);
+    let reconcile_ticket = app
+        .mint_native_update_reconcile_ticket()
+        .expect("a reconcile ticket");
+    app.prelaunch_out_of_band_handoff(super::PrelaunchArgs {
+        attempt_id: 34,
+        build: crate::running_build_number(),
+        mode: ApplyMode::Automatic,
+        apply_attempt: Some(ticket.clone()),
+        same_image: None,
+        target_build: ticket.target_build(),
+        target_commit: String::new(),
+        command: std::process::Command::new("/usr/bin/true"),
+        verify_staged_candidate: true,
+        grant_chunks: false,
+        grant_empty: false,
+        grant_desk: false,
+        sessionless: false,
+        installed_activation: false,
+        bundle: None,
+        cancel,
+        cancelled,
+        job_tx,
+        reconcile_worker,
+        reconcile_ticket,
+    })
+    .expect("the launched lane records its attempt");
+    let mut job = job_rx.try_recv().expect("the worker's job was sent");
+    assert!(job.verify_staged_candidate, "PRECONDITION");
+    for (grant_chunks, grant_empty, grant_desk) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (false, false, false),
+    ] {
+        let checked = super::worker_pre_park_check(
+            &mut job,
+            |_| {
+                Ok(aterm_update::HandoffCandidateFacts {
+                    policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
+                    grant_chunks,
+                    grant_empty,
+                    grant_desk,
+                })
+            },
+            |_, _| panic!("the full check reads the floor itself"),
+        );
+        assert!(checked.is_ok(), "{checked:?}");
+        assert_eq!(
+            (
+                job.successor_grant_chunks,
+                job.successor_grant_empty,
+                job.successor_grant_desk
+            ),
+            (grant_chunks, grant_empty, grant_desk)
+        );
+    }
+    app.update_handoff_prelaunch = None;
+}
+
 #[test]
 fn a_worker_that_verifies_keeps_its_verdict_for_the_booking() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -222,6 +303,7 @@ fn a_worker_that_verifies_keeps_its_verdict_for_the_booking() {
         verify_staged_candidate: true,
         grant_chunks: false,
         grant_empty: false,
+        grant_desk: false,
         sessionless: false,
         installed_activation: false,
         bundle: None,

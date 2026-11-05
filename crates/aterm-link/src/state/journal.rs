@@ -5,8 +5,10 @@
 //! reservation (`sent/<sid>.<id>`) and per own-lane record in flight (`inflight/<seq>`).
 //!
 //! A post cost the state dir two replaces (a temp written and renamed over the target) and two
-//! unlinks; it costs this journal four appends to one held descriptor (B19, after B10 ranked the
-//! state dir's writes at 36% of an ordered request/reply round trip and 46% of a relaxed one).
+//! unlinks; it costs this journal four records appended to one held descriptor (B19, after B10
+//! ranked the state dir's writes at 36% of an ordered request/reply round trip and 46% of a
+//! relaxed one), its landing and its retirement in one write with every other post its ack pass
+//! landed (critic item E07, [`super::StateDir::settle_posts`]).
 //!
 //! Each fact is one [`astream_wire::steps`] record: a CRC frame whose steps run densely from 0
 //! in each file, so a cut append reads as a torn tail and damage before an intact record reads
@@ -101,13 +103,14 @@ pub(crate) enum Frame {
         pin: PublishPin,
     },
     /// A post's reservation forgotten, once aterm retired the post
-    /// ([`super::StateDir::clear_post_seq`]), or once its session ended in an earlier boot
-    /// ([`super::StateDir::sweep_sessions_of_an_earlier_boot`]).
+    /// ([`super::StateDir::clear_post_seq`], [`super::StateDir::settle_posts`]), or once its
+    /// session ended in an earlier boot ([`super::StateDir::sweep_sessions_of_an_earlier_boot`]).
     Retire { sid: String, id: u64 },
     /// A record in flight onto this node's own lanes ([`super::StateDir::set_in_flight`]); a later
     /// one at the same sequence replaces it.
     InFlight(InFlight),
-    /// The record in flight at this sequence landed ([`super::StateDir::clear_in_flight`]).
+    /// The record in flight at this sequence landed ([`super::StateDir::clear_in_flight`]); a
+    /// post's, once aterm answered its `outbox sent` ([`super::StateDir::settle_posts`]).
     Landed(u64),
     /// The record in flight at this sequence is dropped for good, and the journal flushed after
     /// it ([`super::StateDir::drop_in_flight`]).
@@ -583,20 +586,6 @@ fn next_record(bytes: &[u8], from: usize, first: u64, budget: &mut usize) -> Opt
         }
     }
     None
-}
-
-/// How many of a journal's intact records name an attach and how many record anything else: a
-/// test's count of the writes a post cost, where the first record after an attach carries the
-/// attach's name in the same write ([`super::StateDir::append_post_frame`]).
-#[cfg(test)]
-pub(crate) fn records_and_attaches(bytes: &[u8]) -> (u64, u64) {
-    let scan = scan_steps_from(bytes, 0);
-    let attaches = scan
-        .steps
-        .iter()
-        .filter(|(_, body)| matches!(record::<Frame>(bytes, body), Some(Frame::Attached(_))))
-        .count() as u64;
-    (scan.steps.len() as u64 - attaches, attaches)
 }
 
 /// Whether `tail` is the record at `step` cut short: non-empty, as much of a frame header as it

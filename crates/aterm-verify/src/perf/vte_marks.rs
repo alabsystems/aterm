@@ -137,18 +137,15 @@ fn conjoining(text: &str) -> String {
 /// The SHA-256 prefix of the corpora, each name and line, and their size: the cache folder's
 /// name, so a folder found there holds these bytes.
 fn digest(corpora: &[(&str, String)]) -> String {
-    let mut all = CORPUS_MB.to_le_bytes().to_vec();
+    let mut hasher = aterm_digest::Sha256::new();
+    hasher.update(CORPUS_MB.to_le_bytes());
     for (name, unit) in corpora {
         for part in [name.as_bytes(), unit.as_bytes()] {
-            all.extend_from_slice(&(part.len() as u64).to_le_bytes());
-            all.extend_from_slice(part);
+            hasher.update((part.len() as u64).to_le_bytes());
+            hasher.update(part);
         }
     }
-    aterm_digest::Sha256::digest(all)
-        .iter()
-        .take(6)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    aterm_codec::hex::encode_lower(&hasher.finalize()[..6])
 }
 
 /// Write each corpus to `<dir>/<name>.vt`.
@@ -157,7 +154,14 @@ fn write_corpora(dir: &Path, corpora: &[(&str, String)]) -> Result<(), String> {
     for (name, unit) in corpora {
         let path = dir.join(format!("{name}.vt"));
         let fail = |e: std::io::Error| format!("{}: {e}", path.display());
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&path).map_err(fail)?);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
+        let mut f = std::io::BufWriter::new(opts.open(&path).map_err(fail)?);
         generate(unit.as_bytes(), CORPUS_MB, &mut f).map_err(fail)?;
         f.flush().map_err(fail)?;
     }

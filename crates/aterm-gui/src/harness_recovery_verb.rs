@@ -62,7 +62,7 @@ fn reply(progress: Option<&AccountProgress>) -> String {
             .unwrap_or("-".into())
     };
     let mut line = format!(
-        "OK recovery version=1 available=1 phase={phase} account={} target={} route={} known={} eligible={} wall={} observed_at={} next_at={} forecasts_paused={} detail_count={} login_diagnostic_count={}",
+        "OK recovery version=1 available=1 phase={phase} account={} target={} route={} known={} eligible={} wall={} observed_at={} next_at={} forecasts_paused={} detail_count={} login_diagnostic_count={} independent_work_count={}",
         text(progress.account.as_deref()),
         text(target),
         text(route),
@@ -73,7 +73,8 @@ fn reply(progress: Option<&AccountProgress>) -> String {
         time(progress.next_at),
         u8::from(progress.forecasts_paused),
         progress.details.len(),
-        progress.login_diagnostics.len()
+        progress.login_diagnostics.len(),
+        progress.independent_work.len()
     );
     for (index, detail) in progress.details.iter().enumerate() {
         line.push_str(&format!(
@@ -87,6 +88,14 @@ fn reply(progress: Option<&AccountProgress>) -> String {
             crate::control::pct_encode(diagnostic.label()),
             time(Some(diagnostic.completed_at)),
             crate::control::pct_encode(&diagnostic.words()),
+        ));
+    }
+    for (index, work) in progress.independent_work.iter().enumerate() {
+        line.push_str(&format!(
+            " independent_work_{index}_phase=signing-in independent_work_{index}_account={} independent_work_{index}_route={} independent_work_{index}_observed_at={}",
+            text(Some(&work.label)),
+            text(work.route.as_deref()),
+            time(Some(work.observed_at)),
         ));
     }
     line.push('\n');

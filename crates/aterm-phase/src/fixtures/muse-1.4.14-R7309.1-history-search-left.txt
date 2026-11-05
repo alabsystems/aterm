@@ -1,0 +1,51 @@
+# muse 1.4.14-R7309.1 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (144x50, aterm 0.154.0) running the real Muse Code, launched by path with the lab fake key and `--base-url` the local stub of the API (crates/aterm-lab) · the prompt-history search (ctrl+r) left with Esc after its query alpha matched alpha old prompt one over an empty composer: the match stays in the composer in typed ink, the cursor home · cursor=14,2
+
+  Muse Code 1.4.14
+
+❯ alpha old prompt one
+
+◆ Hi! I am the local lab stub, not a model. (reply 1)
+
+❯ beta old prompt two
+
+◆ Hi! I am the local lab stub, not a model. (reply 2)
+
+◆ Recap: ok
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ alpha old prompt one
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.wZJk/proj · Auto-review
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

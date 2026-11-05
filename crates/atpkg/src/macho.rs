@@ -543,13 +543,17 @@ pub(crate) fn foreign_executables(root: &Path) -> Result<Vec<PathBuf>, StageErro
 /// # Errors
 /// [`StageError::Io`] when the tree cannot be read or a mode cannot be set.
 pub(crate) fn demote_foreign_executables(root: &Path) -> Result<bool, StageError> {
-    let foreign = foreign_executables(root)?;
-    for path in &foreign {
-        let meta = std::fs::symlink_metadata(path).map_err(StageError::Io)?;
-        let mode = crate::platform::permission_mode(&meta) & 0o7777;
-        crate::platform::set_mode(path, mode & !0o111).map_err(StageError::Io)?;
+    let mut demoted = false;
+    for path in executable_files(root)? {
+        let (head, meta) =
+            crate::metadata_io::read_head_with_meta(&path, 8).map_err(StageError::Io)?;
+        if !is_native_executable(&head) {
+            let mode = crate::platform::permission_mode(&meta) & 0o7777;
+            crate::platform::set_mode(&path, mode & !0o111).map_err(StageError::Io)?;
+            demoted = true;
+        }
     }
-    Ok(!foreign.is_empty())
+    Ok(demoted)
 }
 
 /// Mach-O fixtures built from their load commands, for this reader's tests and for the

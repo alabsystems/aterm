@@ -43,6 +43,8 @@
 //! The `handshake` and `identity` features still delegate raw X25519 and Ed25519 to
 //! `x25519-dalek` and `ed25519-dalek`: ring cannot build an X25519 secret from bytes
 //! (its agreement keys come only from its own RNG). Both features are off by default.
+//! `signature`, the raw Ed25519 astream-broker's `relay` checks a record's origin with, is
+//! ring's: it adds no crate.
 //!
 //! # Keys in memory
 //! The pre-shared key a [`SealedStream`] holds, each per-message subkey, and
@@ -84,6 +86,8 @@ pub use handshake::{
 
 #[cfg(feature = "identity")]
 mod identity;
+#[cfg(feature = "signature")]
+pub mod signature;
 #[cfg(feature = "identity")]
 pub use identity::{
     client_identity_handshake, identity_auth_msg_len_valid, identity_clamp_ctx_len,

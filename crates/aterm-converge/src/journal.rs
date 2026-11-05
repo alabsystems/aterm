@@ -101,17 +101,10 @@ impl FileJournal {
         make_dir(&self.dir).map_err(|e| shown(e, &self.dir))?;
         let lock_path = self.dir.join(Self::LOCK);
         let _held = Held::take(&lock_path, self.wait).map_err(|e| shown(e, &lock_path))?;
-        let held = match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.is_file() => {
-                #[cfg(unix)]
-                ensure_effective_owner(&meta, "journal file").map_err(|e| shown(e, &path))?;
-                meta.len()
-            }
-            Ok(_) => return Err(format!("{}: not a regular file", path.display())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
-            Err(e) => return Err(shown(e, &path)),
-        };
+        let (mut file, held) = open_append(&path).map_err(|e| shown(e, &path))?;
+        let fresh = held == 0 || held.saturating_add(len) > self.bound;
         if held > 0 && held.saturating_add(len) > self.bound {
+            drop(file);
             let rotated = self.rotated();
             match fs::symlink_metadata(&rotated) {
                 Ok(meta) if meta.is_file() => {
@@ -130,9 +123,8 @@ impl FileJournal {
                     rotated.display()
                 )
             })?;
+            (file, _) = open_append(&path).map_err(|e| shown(e, &path))?;
         }
-        let fresh = held == 0 || held.saturating_add(len) > self.bound;
-        let mut file = open_append(&path).map_err(|e| shown(e, &path))?;
         file.write_all(line).map_err(|e| shown(e, &path))?;
         aterm_durable::durable_data(&file).map_err(|e| shown(e, &path))?;
         if fresh {
@@ -253,6 +245,7 @@ struct Held(File);
 
 impl Held {
     fn take(path: &Path, wait: Duration) -> io::Result<Self> {
+        #[cfg(not(unix))]
         match fs::symlink_metadata(path) {
             Ok(meta) if !meta.is_file() => {
                 return Err(io::Error::new(
@@ -271,10 +264,19 @@ impl Held {
             std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
             std::os::unix::fs::OpenOptionsExt::custom_flags(
                 &mut options,
-                libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
             );
         }
-        let file: std::fs::File = options.open(path)?;
+        let file: std::fs::File = options.open(path).map_err(|e| match e.raw_os_error() {
+            #[cfg(unix)]
+            Some(libc::ELOOP | libc::EISDIR) => {
+                io::Error::new(io::ErrorKind::InvalidInput, "not a regular file")
+            }
+            _ if fs::symlink_metadata(path).is_ok_and(|m| !m.is_file()) => {
+                io::Error::new(io::ErrorKind::InvalidInput, "not a regular file")
+            }
+            _ => e,
+        })?;
         let meta = file.metadata()?;
         if !meta.is_file() {
             return Err(io::Error::new(
@@ -325,7 +327,19 @@ impl Drop for Held {
     }
 }
 
-fn open_append(path: &Path) -> io::Result<File> {
+fn open_append(path: &Path) -> io::Result<(File, u64)> {
+    #[cfg(not(unix))]
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut options = OpenOptions::new();
     options.append(true).create(true);
     #[cfg(unix)]
@@ -333,10 +347,19 @@ fn open_append(path: &Path) -> io::Result<File> {
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         std::os::unix::fs::OpenOptionsExt::custom_flags(
             &mut options,
-            libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         );
     }
-    let file = options.open(path)?;
+    let file = options.open(path).map_err(|e| match e.raw_os_error() {
+        #[cfg(unix)]
+        Some(libc::ELOOP | libc::EISDIR) => {
+            io::Error::new(io::ErrorKind::InvalidInput, "not a regular file")
+        }
+        _ if fs::symlink_metadata(path).is_ok_and(|m| !m.is_file()) => {
+            io::Error::new(io::ErrorKind::InvalidInput, "not a regular file")
+        }
+        _ => e,
+    })?;
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(io::Error::new(
@@ -352,7 +375,7 @@ fn open_append(path: &Path) -> io::Result<File> {
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
     }
-    Ok(file)
+    Ok((file, meta.len()))
 }
 
 #[cfg(test)]

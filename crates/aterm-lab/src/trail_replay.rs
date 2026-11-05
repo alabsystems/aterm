@@ -16,6 +16,35 @@ use crate::{Fail, Res};
 const MAX_KEYS: usize = 4096;
 const MAX_RETAINED_BYTES: usize = 128 * 1024 * 1024;
 const RING: usize = 32;
+const REQUEST_BOUND: Duration = Duration::from_secs(60);
+// A hang detector for an explicitly requested observation, never a latency budget.
+const LANDING_HANG: Duration = Duration::from_secs(60);
+const LANDING_POLL: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Landing {
+    row: u16,
+    col: u16,
+}
+
+impl Landing {
+    fn parse(value: &str) -> Result<Self, String> {
+        let (row, col) = value
+            .split_once(',')
+            .ok_or("landing must be zero-based ROW,COL")?;
+        let coordinate = |word: &str| {
+            if word.is_empty() || !word.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("landing coordinates must be integers in 0..=65535");
+            }
+            word.parse::<u16>()
+                .map_err(|_| "landing coordinates must be integers in 0..=65535")
+        };
+        Ok(Self {
+            row: coordinate(row)?,
+            col: coordinate(col)?,
+        })
+    }
+}
 
 struct Options {
     tag: String,
@@ -23,6 +52,7 @@ struct Options {
     text: String,
     cadence: Duration,
     no_images: bool,
+    expect_trail_landing: Option<Landing>,
 }
 
 impl Options {
@@ -31,6 +61,7 @@ impl Options {
         let tag = crate::run::take_only_tag(&mut args)?;
         let (mut out, mut text, mut cadence) = (None, None, None);
         let mut no_images = false;
+        let mut expect_trail_landing = None;
         let mut args = args.iter();
         while let Some(option) = args.next() {
             if option == "--no-images" {
@@ -46,6 +77,9 @@ impl Options {
             match option.as_str() {
                 "--out" if out.is_none() && !value.is_empty() => out = Some(PathBuf::from(value)),
                 "--text" if text.is_none() => text = Some(value.clone()),
+                "--expect-trail-landing" if expect_trail_landing.is_none() => {
+                    expect_trail_landing = Some(Landing::parse(value)?);
+                }
                 "--cadence-ms" if cadence.is_none() => {
                     let ms = value
                         .parse::<u64>()
@@ -66,6 +100,7 @@ impl Options {
             text,
             cadence: cadence.ok_or("--cadence-ms is required")?,
             no_images,
+            expect_trail_landing,
         })
     }
 }
@@ -137,6 +172,7 @@ trait Clock {
 
 trait Wire {
     fn request(&mut self, request: &Request) -> Result<Reply, String>;
+    fn bound_by(&mut self, remaining: Duration);
 }
 
 struct Live {
@@ -145,6 +181,10 @@ struct Live {
 }
 
 impl Wire for Live {
+    fn bound_by(&mut self, remaining: Duration) {
+        self.wire.bound_by(remaining);
+    }
+
     fn request(&mut self, request: &Request) -> Result<Reply, String> {
         let words = request.words();
         let args: Vec<_> = words.iter().map(String::as_str).collect();
@@ -211,6 +251,96 @@ struct Admission {
     immutable: String,
     view: Option<u64>,
     session: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureKind {
+    Deadline,
+    Source,
+    Refused,
+    Malformed,
+    Transport,
+    Retention,
+    Clock,
+    Interrupted,
+    Superseded,
+}
+
+impl FailureKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline",
+            Self::Source => "source",
+            Self::Refused => "refused",
+            Self::Malformed => "malformed",
+            Self::Transport => "transport",
+            Self::Retention => "retention",
+            Self::Clock => "clock",
+            Self::Interrupted => "interrupted",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Failure {
+    kind: FailureKind,
+    detail: String,
+}
+
+impl Failure {
+    fn new(kind: FailureKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandingVerdict {
+    Licensed,
+    Declined,
+}
+
+impl LandingVerdict {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Licensed => "licensed",
+            Self::Declined => "declined",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LandingEvidence {
+    seq: u64,
+    verdict: LandingVerdict,
+}
+
+struct LandingObservation {
+    expected: Landing,
+    after_seq: u64,
+    started: Duration,
+    ended: Duration,
+    evidence: Option<LandingEvidence>,
+    failure: Option<Failure>,
+}
+
+fn closed_cursor(reply: &str) -> Result<Option<Landing>, Failure> {
+    let words: Vec<_> = reply.split_whitespace().take(7).collect();
+    let malformed = || Failure::new(FailureKind::Malformed, "invalid landing cursor reply");
+    if reply.lines().count() != 1
+        || !(words.len() == 5 || words.len() == 6)
+        || words[0] != "OK"
+        || !matches!(words[3], "0" | "1")
+        || words[4].contains('=')
+        || (words.len() == 6 && words[5] != "frame=open")
+    {
+        return Err(malformed());
+    }
+    let landing = Landing::parse(&format!("{},{}", words[1], words[2])).map_err(|_| malformed())?;
+    Ok((words.len() == 5).then_some(landing))
 }
 
 fn batch(body: &str) -> Result<(Target, Vec<Admission>), String> {
@@ -295,10 +425,13 @@ impl Admissions {
         rows: Vec<Admission>,
         target: Target,
         baseline: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), Failure> {
         let last = rows.last().map_or(0, |row| row.seq);
         if !baseline && last < self.latest {
-            return Err("admission sequence reset; coverage is unobserved".into());
+            return Err(Failure::new(
+                FailureKind::Source,
+                "admission sequence reset; coverage is unobserved",
+            ));
         }
         let previous = self.latest;
         if !baseline && last.saturating_sub(previous) > RING as u64 {
@@ -309,15 +442,18 @@ impl Admissions {
         for row in rows {
             if let Some(held) = self.rows.get(&row.seq) {
                 if held.immutable != row.immutable {
-                    return Err("an admission sequence changed immutable facts".into());
+                    return Err(Failure::new(
+                        FailureKind::Malformed,
+                        "an admission sequence changed immutable facts",
+                    ));
                 }
                 continue;
             }
             if !baseline && row.seq > self.latest {
                 if row.view != Some(target.view) || row.session != Some(target.session) {
-                    return Err(format!(
-                        "admission {} has an unbound or changed source",
-                        row.seq
+                    return Err(Failure::new(
+                        FailureKind::Source,
+                        format!("admission {} has an unbound or changed source", row.seq),
                     ));
                 }
                 if self.latest.checked_add(1) != Some(row.seq) {
@@ -325,7 +461,10 @@ impl Admissions {
                 }
                 self.latest = row.seq;
             } else if !baseline {
-                return Err("an older uncollected admission appeared".into());
+                return Err(Failure::new(
+                    FailureKind::Malformed,
+                    "an older uncollected admission appeared",
+                ));
             }
             self.bytes += row.immutable.len();
             self.rows.insert(row.seq, row);
@@ -365,7 +504,9 @@ struct Recording {
     bytes: usize,
     finished: Duration,
     replay_last_seq: u64,
+    pre_final_key_seq: u64,
     replay_complete: bool,
+    landing: Option<LandingObservation>,
     error: Option<String>,
 }
 
@@ -377,6 +518,17 @@ impl Recording {
         request: Request,
         phase: &'static str,
     ) -> Result<Reply, String> {
+        self.exchange(clock, wire, request, phase)
+            .map_err(|failure| failure.detail)
+    }
+
+    fn exchange(
+        &mut self,
+        clock: &impl Clock,
+        wire: &mut impl Wire,
+        request: Request,
+        phase: &'static str,
+    ) -> Result<Reply, Failure> {
         let start = clock.now();
         let reply = wire.request(&request);
         let end = clock.now();
@@ -392,7 +544,10 @@ impl Recording {
             .saturating_add(self.admissions.bytes)
             > MAX_RETAINED_BYTES
         {
-            return Err("recorder retention bound exceeded; response was not retained".into());
+            return Err(Failure::new(
+                FailureKind::Retention,
+                "recorder retention bound exceeded; response was not retained",
+            ));
         }
         self.bytes += bytes;
         self.exchanges.push(Exchange {
@@ -403,13 +558,16 @@ impl Recording {
             reply: reply.clone(),
         });
         if end < start {
-            return Err("controller monotonic clock regressed".into());
+            return Err(Failure::new(
+                FailureKind::Clock,
+                "controller monotonic clock regressed",
+            ));
         }
-        let reply = reply?;
+        let reply = reply.map_err(|detail| Failure::new(FailureKind::Transport, detail))?;
         if reply.code != 0 {
-            return Err(format!(
-                "control request refused: {}{}",
-                reply.stdout, reply.stderr
+            return Err(Failure::new(
+                FailureKind::Refused,
+                format!("control request refused: {}{}", reply.stdout, reply.stderr),
             ));
         }
         Ok(reply)
@@ -423,16 +581,172 @@ impl Recording {
         baseline: bool,
     ) -> Result<(), String> {
         let reply = self.request(clock, wire, Request::Drain, phase)?;
-        let (target, rows) = batch(&reply.stdout)?;
+        self.receive_admissions(&reply.stdout, baseline)
+            .map_err(|failure| failure.detail)
+    }
+
+    fn receive_admissions(&mut self, body: &str, baseline: bool) -> Result<(), Failure> {
+        let (target, rows) =
+            batch(body).map_err(|detail| Failure::new(FailureKind::Malformed, detail))?;
         if self.target.is_some_and(|held| held != target) {
-            return Err("global-front window/view/session changed".into());
+            return Err(Failure::new(
+                FailureKind::Source,
+                "global-front window/view/session changed",
+            ));
         }
         self.target = Some(target);
         self.admissions.observe(rows, target, baseline)?;
         if self.bytes.saturating_add(self.admissions.bytes) > MAX_RETAINED_BYTES {
-            return Err("recorder retention bound exceeded".into());
+            return Err(Failure::new(
+                FailureKind::Retention,
+                "recorder retention bound exceeded",
+            ));
         }
         Ok(())
+    }
+
+    fn landing_request(
+        &mut self,
+        clock: &impl Clock,
+        wire: &mut impl Wire,
+        request: Request,
+        phase: &'static str,
+        deadline: Duration,
+    ) -> Result<Reply, Failure> {
+        let remaining = deadline
+            .checked_sub(clock.now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| {
+                Failure::new(
+                    FailureKind::Deadline,
+                    "expected trail landing remained unobserved at the hang detector",
+                )
+            })?;
+        wire.bound_by(remaining.min(REQUEST_BOUND));
+        let reply = self.exchange(clock, wire, request, phase);
+        if clock.now() >= deadline {
+            return Err(Failure::new(
+                FailureKind::Deadline,
+                "landing reply reached or exceeded the observation deadline",
+            ));
+        }
+        reply
+    }
+
+    fn landing_drain(
+        &mut self,
+        clock: &impl Clock,
+        wire: &mut impl Wire,
+        phase: &'static str,
+        deadline: Duration,
+    ) -> Result<(), Failure> {
+        let reply = self.landing_request(clock, wire, Request::Drain, phase, deadline)?;
+        self.receive_admissions(&reply.stdout, false)
+    }
+
+    fn landing_candidate(&self, expected: Landing) -> Result<Option<LandingEvidence>, Failure> {
+        for (&seq, row) in self.admissions.rows.range(self.pre_final_key_seq..) {
+            if seq <= self.pre_final_key_seq {
+                continue;
+            }
+            let endpoint = field(&row.immutable, "target")
+                .and_then(Landing::parse)
+                .map_err(|detail| Failure::new(FailureKind::Malformed, detail))?;
+            if endpoint != expected {
+                continue;
+            }
+            let verdict = match field(&row.immutable, "phase")
+                .map_err(|detail| Failure::new(FailureKind::Malformed, detail))?
+            {
+                "licensed" => LandingVerdict::Licensed,
+                "declined" => LandingVerdict::Declined,
+                _ => {
+                    return Err(Failure::new(
+                        FailureKind::Malformed,
+                        "invalid landing admission phase",
+                    ));
+                }
+            };
+            return Ok(Some(LandingEvidence { seq, verdict }));
+        }
+        Ok(None)
+    }
+
+    fn observe_landing(&mut self, expected: Landing, clock: &mut impl Clock, wire: &mut impl Wire) {
+        let started = clock.now();
+        let mut evidence = None;
+        let result = (|| -> Result<Duration, Failure> {
+            if started < self.finished {
+                return Err(Failure::new(
+                    FailureKind::Clock,
+                    "landing observation clock precedes submission end",
+                ));
+            }
+            let deadline = started
+                .checked_add(LANDING_HANG)
+                .ok_or_else(|| Failure::new(FailureKind::Clock, "landing deadline overflow"))?;
+            loop {
+                self.landing_drain(clock, wire, "landing-before-cursor", deadline)?;
+                if evidence.is_none() {
+                    evidence = self.landing_candidate(expected)?;
+                }
+                if evidence.is_some_and(|held| held.seq != self.admissions.latest) {
+                    return Err(Failure::new(
+                        FailureKind::Superseded,
+                        "landing admission was superseded before closed-frame agreement",
+                    ));
+                }
+                let before_cursor = self.admissions.latest;
+                let reply =
+                    self.landing_request(clock, wire, Request::Cursor, "landing-cursor", deadline)?;
+                let cursor = closed_cursor(&reply.stdout)?;
+                self.landing_drain(clock, wire, "landing-after-cursor", deadline)?;
+                if evidence.is_none() {
+                    evidence = self.landing_candidate(expected)?;
+                }
+                if evidence.is_some_and(|held| held.seq != self.admissions.latest) {
+                    return Err(Failure::new(
+                        FailureKind::Superseded,
+                        "landing admission was superseded before closed-frame agreement",
+                    ));
+                }
+                if evidence.is_some()
+                    && before_cursor == self.admissions.latest
+                    && cursor == Some(expected)
+                {
+                    let accepted = clock.now();
+                    if accepted >= deadline {
+                        return Err(Failure::new(
+                            FailureKind::Deadline,
+                            "landing agreement reached or exceeded the observation deadline",
+                        ));
+                    }
+                    return Ok(accepted);
+                }
+                let now = clock.now();
+                let due = now
+                    .checked_add(LANDING_POLL)
+                    .unwrap_or(deadline)
+                    .min(deadline);
+                clock
+                    .sleep_until(due)
+                    .map_err(|detail| Failure::new(FailureKind::Interrupted, detail))?;
+            }
+        })();
+        let accepted = result.as_ref().ok().copied();
+        wire.bound_by(REQUEST_BOUND);
+        let failure = result.err();
+        if let Some(failure) = &failure {
+            self.error = Some(failure.detail.clone());
+        }
+        self.landing = Some(LandingObservation {
+            expected,
+            after_seq: self.pre_final_key_seq,
+            started,
+            ended: accepted.unwrap_or_else(|| clock.now()),
+            evidence,
+            failure,
+        });
     }
 }
 
@@ -451,9 +765,12 @@ fn record(
         recording.drain(clock, wire, "baseline", true)?;
         let target = recording.target.ok_or("no replay target")?;
         let mut planned = clock.now();
-        for byte in text.bytes() {
+        for (index, byte) in text.bytes().enumerate() {
             clock.sleep_until(planned)?;
             recording.drain(clock, wire, "before-key", false)?;
+            if index + 1 == text.len() {
+                recording.pre_final_key_seq = recording.admissions.latest;
+            }
             if clock.now() < planned {
                 return Err("controller wait ended before the planned key time".into());
             }
@@ -511,11 +828,17 @@ fn run(
     text: &str,
     cadence: Duration,
     capture_images: bool,
+    expect_trail_landing: Option<Landing>,
     clock: &mut impl Clock,
     wire: &mut impl Wire,
     sink: &mut impl Sink,
 ) -> Result<Recording, String> {
     let mut recording = record(text, cadence, clock, wire);
+    if recording.error.is_none()
+        && let Some(expected) = expect_trail_landing
+    {
+        recording.observe_landing(expected, clock, wire);
+    }
     if recording.error.is_none() {
         let post = (|| -> Result<(), String> {
             // These are retained instance metrics, read before PNG work can perturb them.
@@ -646,12 +969,32 @@ impl Sink for Files<'_> {
             write(&format!("{stem}.png"), png)?;
             write(&format!("{stem}.image-meta.txt"), metadata.as_bytes())?;
         }
+        let landing = recording.landing.as_ref().map_or_else(
+            || json!({
+                "status":if self.options.expect_trail_landing.is_some() {"not-started"} else {"not-requested"},
+                "expected":self.options.expect_trail_landing.map(|at|json!({"row":at.row,"col":at.col})),
+            }),
+            |observation| json!({
+                "status":if observation.failure.is_some() {"unobserved"} else {"agreement-observed"},
+                "expected":{"row":observation.expected.row,"col":observation.expected.col},
+                "source":recording.target.map(|target|json!({"window":target.window,"view":target.view,"local_session":target.session})),
+                "after_admission_seq":observation.after_seq,
+                "observation_start_us":micros(observation.started),
+                "observation_end_us":micros(observation.ended),
+                "admission_seq":observation.evidence.map(|held|held.seq),
+                "admission_phase":observation.evidence.map(|held|held.verdict.name()),
+                "failure_kind":observation.failure.as_ref().map(|failure|failure.kind.name()),
+                "failure":observation.failure.as_ref().map(|failure|failure.detail.as_str()),
+                "scope":"Fresh source-bound admission and matching closed-frame cursor, bracketed by observed target/sequence fences. Not atomic, glyph delivery, input latency or display evidence.",
+            }),
+        );
         let summary = json!({
             "tag":self.options.tag,"text":self.options.text,"cadence_us":micros(self.options.cadence),
             "image_capture_mode":if self.options.no_images {"no-images"} else {"effect-and-clean"},
             "images_skipped":self.options.no_images,"images_retained":recording.images.len(),
             "instance_window":self.window,"capture_scope":match self.window {"1"=>"native instance; key acknowledgments are control acceptance only","0"=>"headless functional capture; no native display-latency evidence",_=>"instance window mode unknown; no native display-latency evidence"},
             "controller_replay_complete":recording.replay_complete,"error":recording.error,
+            "trail_landing_observation":landing,
             "keys_requested":self.options.text.len(),"keys_acknowledged":recording.events.iter().filter(|event|event.ack.is_some()).count(),
             "late_starts":recording.events.iter().filter(|event|event.start > event.planned).count(),"replay_end_us":micros(recording.finished),
             "target":recording.target.map(|target|json!({"window":target.window,"view":target.view,"local_session":target.session})),
@@ -659,7 +1002,7 @@ impl Sink for Files<'_> {
             "admission_coverage_inconclusive":recording.error.is_some() || !recording.admissions.gaps.is_empty(),"coverage_notes":recording.admissions.gaps,
             "admission_scope":"Observed move verdicts, not one record per key; zero immediate records can be pending. Ring gaps are not key-drop verdicts. Front/source fences are observed, not atomic.",
             "timing_scope":"Controller monotonic planned/start/ack/drain times; acknowledgments do not establish glyph echo or input-to-display latency. No catch-up cadence.",
-            "metrics_scope":"Retained instance counters and percentiles read after replay, before optional images. This recorder does not reset counters; document any preceding caller reset. No interval-specific latency attribution is inferred.",
+            "metrics_scope":"Retained instance counters and percentiles read after replay and any requested landing observation, before optional images. This recorder does not reset counters; document any preceding caller reset. No interval-specific latency attribution is inferred.",
             "image_scope":if self.options.no_images {"Image requests skipped by --no-images. Cursor/text/status/dims are separate later state."} else {"Post-replay captures; raw metadata retained, effect/clean comparability not evaluated. Cursor/text/status/dims are separate later state."},
             "pixel_continuity":"not judged"
         });
@@ -679,10 +1022,7 @@ pub fn cmd(args: &[String]) -> Res {
     let options = Options::parse(args).map_err(Fail::usage)?;
     let run_record = crate::run::Run::load(&options.tag).map_err(Fail::die)?;
     let door = crate::door::Door::new(&run_record).map_err(Fail::die)?;
-    let wire = door
-        .connect()
-        .map_err(Fail::die)?
-        .bounded(Duration::from_secs(60));
+    let wire = door.connect().map_err(Fail::die)?.bounded(REQUEST_BOUND);
     let out = crate::sys::NewOutputDir::create(&options.out).map_err(|e| {
         Fail::die(format!(
             "--out must name a new directory with an existing parent: {e}"
@@ -696,6 +1036,7 @@ pub fn cmd(args: &[String]) -> Res {
         &options.text,
         options.cadence,
         !options.no_images,
+        options.expect_trail_landing,
         &mut clock,
         &mut live,
         &mut Files {
@@ -706,9 +1047,37 @@ pub fn cmd(args: &[String]) -> Res {
     )
     .map_err(Fail::die)?;
     let complete = recording.error.is_none() && recording.admissions.gaps.is_empty();
+    let landing_status = if options.expect_trail_landing.is_some() {
+        let outcome = recording.landing.as_ref().map_or_else(
+            || "landing agreement not started".to_string(),
+            |observation| {
+                if let Some(failure) = &observation.failure {
+                    format!("landing agreement unobserved ({})", failure.kind.name())
+                } else if let Some(evidence) = observation.evidence {
+                    format!(
+                        "landing agreement observed, admission {}",
+                        evidence.verdict.name()
+                    )
+                } else {
+                    "landing agreement unobserved".to_string()
+                }
+            },
+        );
+        format!(
+            "; controller replay {}; {outcome}",
+            if recording.replay_complete {
+                "complete"
+            } else {
+                "incomplete"
+            }
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "trail-replay: {} recording; {} accepted keys, {} coverage notes; pixel continuity not judged; {}",
+        "trail-replay: {} recording{}; {} accepted keys, {} coverage notes; pixel continuity not judged; {}",
         if complete { "complete" } else { "inconclusive" },
+        landing_status,
         recording
             .events
             .iter()
@@ -804,6 +1173,8 @@ mod tests {
     }
 
     impl Wire for FakeWire {
+        fn bound_by(&mut self, _: Duration) {}
+
         fn request(&mut self, request: &Request) -> Result<Reply, String> {
             self.trace.borrow_mut().push(request.words().join(" "));
             let mut reply = Reply {
@@ -903,6 +1274,578 @@ mod tests {
         )
     }
 
+    #[derive(Clone, Copy)]
+    enum ObserverFault {
+        Transport,
+        Refused,
+        Target,
+        Malformed,
+    }
+
+    // A PTY-like delayed producer: the final key is acknowledged before either its
+    // cursor state or its admission is published. It drives the actual recorder flow.
+    struct LandingWire {
+        base: FakeWire,
+        rows: Vec<String>,
+        final_at: Option<Duration>,
+        delay: Duration,
+        final_published: bool,
+        phase: &'static str,
+        source_view: u64,
+        final_col: u16,
+        coalesced: bool,
+        suppress_final: bool,
+        cursor_matches_early: bool,
+        cursor_open: bool,
+        close_after: Option<Duration>,
+        cursor_override: Option<String>,
+        supersede_on_cursor: bool,
+        observing: bool,
+        calls: usize,
+        bounds: Vec<Duration>,
+        costs: VecDeque<Duration>,
+        fault: Option<(usize, ObserverFault)>,
+    }
+
+    impl LandingWire {
+        fn new(base: FakeWire) -> Self {
+            Self {
+                base: FakeWire {
+                    emit: false,
+                    ..base
+                },
+                rows: Vec::new(),
+                final_at: None,
+                delay: Duration::from_millis(100),
+                final_published: false,
+                phase: "licensed",
+                source_view: 2,
+                final_col: 100,
+                coalesced: false,
+                suppress_final: false,
+                cursor_matches_early: false,
+                cursor_open: false,
+                close_after: None,
+                cursor_override: None,
+                supersede_on_cursor: false,
+                observing: false,
+                calls: 0,
+                bounds: Vec::new(),
+                costs: VecDeque::new(),
+                fault: None,
+            }
+        }
+
+        fn push(&mut self, phase: &str, origin_col: u16, target_col: u16, source_view: u64) {
+            let seq = self.rows.len() + 1;
+            self.rows.push(format!("admission seq={seq} phase={phase} reason=fixture age_ms=0 origin=10,{origin_col} target=10,{target_col} alt=1 licence=key source=bound source_view={source_view} source_session=3\n"));
+        }
+    }
+
+    impl Wire for LandingWire {
+        fn bound_by(&mut self, remaining: Duration) {
+            self.observing = true;
+            self.bounds.push(remaining);
+        }
+
+        fn request(&mut self, request: &Request) -> Result<Reply, String> {
+            if self.observing {
+                self.calls += 1;
+                if let Some(cost) = self.costs.pop_front() {
+                    // Deliberately permit a late reply: the recorder must reject it,
+                    // independently of a transport's own deadline enforcement.
+                    self.base.advance(cost);
+                }
+            }
+            let mut reply = self.base.request(request)?;
+            if self.final_at.is_some_and(|at| self.base.now.get() >= at) && !self.final_published {
+                self.final_published = true;
+                self.push(
+                    self.phase,
+                    if self.coalesced { 98 } else { 99 },
+                    self.final_col,
+                    self.source_view,
+                );
+            }
+            match request {
+                Request::Key(..) => {
+                    if self.base.keys == 1 && !self.coalesced {
+                        self.push("licensed", 98, 99, 2);
+                    } else if self.base.keys == 2 && !self.suppress_final {
+                        self.final_at = Some(self.base.now.get() + self.delay);
+                    }
+                }
+                Request::Drain => {
+                    reply.stdout =
+                        "trail-target selection=front window=1 view=2 session=3\n".into();
+                    for row in self.rows.iter().rev().take(RING).rev() {
+                        reply.stdout.push_str(row);
+                    }
+                }
+                Request::Cursor => {
+                    let col = if self.final_published || self.cursor_matches_early {
+                        100
+                    } else {
+                        99
+                    };
+                    let open = self.cursor_open
+                        || self.close_after.is_some_and(|at| self.base.now.get() < at);
+                    reply.stdout = self.cursor_override.clone().unwrap_or_else(|| {
+                        format!(
+                            "OK 10 {col} 1 blinking_block{}\n",
+                            if open { " frame=open" } else { "" }
+                        )
+                    });
+                    if self.observing && self.final_published && self.supersede_on_cursor {
+                        self.supersede_on_cursor = false;
+                        self.push("licensed", 99, 100, 2);
+                    }
+                }
+                Request::Metrics | Request::Percentiles => {
+                    reply.stdout =
+                        format!("OK n_input={}\n", if self.final_published { 2 } else { 1 });
+                }
+                _ => {}
+            }
+            if let Some((at, fault)) = self.fault
+                && self.observing
+                && self.calls == at
+            {
+                match fault {
+                    ObserverFault::Transport => {
+                        return Err("fixture observation transport failed".into());
+                    }
+                    ObserverFault::Refused => {
+                        reply.code = 1;
+                        reply.stdout = "ERR terminal busy\n".into();
+                    }
+                    ObserverFault::Target => {
+                        reply.stdout = reply.stdout.replace("window=1", "window=9")
+                    }
+                    ObserverFault::Malformed => reply.stdout = "not a trail reply\n".into(),
+                }
+            }
+            Ok(reply)
+        }
+    }
+
+    const EXPECTED_LANDING: Landing = Landing { row: 10, col: 100 };
+
+    fn landing_run(
+        wire: &mut LandingWire,
+        clock: &mut FakeClock,
+        sink: &mut FakeSink,
+        expected: Option<Landing>,
+    ) -> Recording {
+        run(
+            "a ",
+            Duration::from_millis(1),
+            false,
+            expected,
+            clock,
+            wire,
+            sink,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn requested_landing_observes_delayed_final_move_before_metrics_without_extending_submission() {
+        let (mut old_clock, old_wire, mut old_sink) = rig();
+        let mut old_wire = LandingWire::new(old_wire);
+        let old = landing_run(&mut old_wire, &mut old_clock, &mut old_sink, None);
+        assert!(old.replay_complete && old.error.is_none());
+        assert!(old.landing.is_none());
+        assert_eq!(old.admissions.latest, 1);
+        assert_eq!(
+            old.exchanges
+                .iter()
+                .find(|exchange| exchange.request == "metrics")
+                .unwrap()
+                .reply
+                .as_ref()
+                .unwrap()
+                .stdout,
+            "OK n_input=1\n"
+        );
+        assert!(old_wire.bounds.is_empty());
+
+        let (mut clock, wire, mut sink) = rig();
+        let mut wire = LandingWire::new(wire);
+        let recording = landing_run(&mut wire, &mut clock, &mut sink, Some(EXPECTED_LANDING));
+        assert!(recording.replay_complete && recording.error.is_none());
+        assert_eq!(recording.finished, old.finished);
+        assert_eq!(recording.replay_last_seq, old.replay_last_seq);
+        assert_eq!(recording.pre_final_key_seq, 1);
+        let observation = recording.landing.as_ref().unwrap();
+        assert!(observation.failure.is_none());
+        assert_eq!(
+            observation.evidence,
+            Some(LandingEvidence {
+                seq: 2,
+                verdict: LandingVerdict::Licensed
+            })
+        );
+        assert!(observation.ended > recording.finished);
+        let metrics = recording
+            .exchanges
+            .iter()
+            .find(|exchange| exchange.request == "metrics")
+            .unwrap();
+        assert!(metrics.start >= observation.ended);
+        assert_eq!(metrics.reply.as_ref().unwrap().stdout, "OK n_input=2\n");
+        assert!(
+            recording
+                .exchanges
+                .iter()
+                .any(|exchange| exchange.phase == "landing-after-cursor"
+                    && exchange.end <= metrics.start)
+        );
+        assert!(recording.images.is_empty() && sink.saved);
+    }
+
+    #[test]
+    fn landing_admission_can_coalesce_keys_or_be_declined_without_inventing_delivery() {
+        for verdict in [LandingVerdict::Licensed, LandingVerdict::Declined] {
+            let (mut clock, wire, mut sink) = rig();
+            let mut wire = LandingWire::new(wire);
+            wire.coalesced = true;
+            wire.phase = verdict.name();
+            let recording = landing_run(&mut wire, &mut clock, &mut sink, Some(EXPECTED_LANDING));
+            assert!(recording.error.is_none());
+            assert_eq!(recording.events.len(), 2);
+            assert_eq!(recording.admissions.rows.len(), 1);
+            assert_eq!(
+                recording.landing.as_ref().unwrap().evidence,
+                Some(LandingEvidence { seq: 1, verdict })
+            );
+        }
+    }
+
+    #[test]
+    fn existing_endpoint_and_matching_cursor_cannot_replace_a_fresh_final_admission() {
+        let (mut clock, wire, mut sink) = rig();
+        let mut wire = LandingWire::new(wire);
+        wire.push("licensed", 99, 100, 2);
+        wire.coalesced = true;
+        wire.suppress_final = true;
+        wire.cursor_matches_early = true;
+        let recording = landing_run(&mut wire, &mut clock, &mut sink, Some(EXPECTED_LANDING));
+        let observation = recording.landing.as_ref().unwrap();
+        assert_eq!(observation.after_seq, 1);
+        assert!(observation.evidence.is_none());
+        assert_eq!(
+            observation.failure.as_ref().unwrap().kind,
+            FailureKind::Deadline
+        );
+        assert_eq!(observation.ended - observation.started, LANDING_HANG);
+        assert!(recording.replay_complete && sink.saved);
+        assert!(
+            recording
+                .exchanges
+                .iter()
+                .all(|exchange| exchange.request != "metrics")
+        );
+        assert!(wire.bounds.iter().all(|bound| !bound.is_zero()));
+
+        let (mut clock, wire, mut sink) = rig();
+        let mut wire = LandingWire::new(wire);
+        wire.final_col = 101;
+        let recording = landing_run(&mut wire, &mut clock, &mut sink, Some(EXPECTED_LANDING));
+        let observation = recording.landing.as_ref().unwrap();
+        assert_eq!(recording.admissions.latest, 2);
+        assert!(observation.evidence.is_none());
+        assert_eq!(
+            observation.failure.as_ref().unwrap().kind,
+            FailureKind::Deadline
+        );
+    }
+
+    #[test]
+    fn open_frames_wait_for_closed_agreement_and_supersession_retains_the_original_decline() {
+        let (mut clock, wire, mut sink) = rig();
+        let mut wire = LandingWire::new(wire);
+        wire.close_after = Some(Duration::from_millis(201));
+        let recording = landing_run(&mut wire, &mut clock, &mut sink, Some(EXPECTED_LANDING));
+        let observation = recording.landing.as_ref().unwrap();
+        assert!(observation.failure.is_none());
+        assert!(observation.ended >= Duration::from_millis(201));
+        assert!(
+            recording
+                .exchanges
+                .iter()
+                .filter(|exchange| exchange.phase == "landing-cursor")
+                .any(|exchange| exchange
+                    .reply
+                    .as_ref()
+                    .unwrap()
+                    .stdout
+                    .contains("frame=open"))
+        );
+
+        let (mut clock, wire, mut sink) = rig();
+        let mut wire = LandingWire::new(wire);
+        wire.phase = "declined";
+        wire.supersede_on_cursor = true;
+        let recording = landing_run(&mut wire, &mut clock, &mut sink, Some(EXPECTED_LANDING));
+        let observation = recording.landing.as_ref().unwrap();
+        assert_eq!(
+            observation.failure.as_ref().unwrap().kind,
+            FailureKind::Superseded
+        );
+        assert_eq!(
+            observation.evidence,
+            Some(LandingEvidence {
+                seq: 2,
+                verdict: LandingVerdict::Declined
+            })
+        );
+        assert_eq!(recording.admissions.latest, 3);
+        assert!(observation.ended < observation.started + LANDING_HANG);
+        assert!(
+            recording
+                .exchanges
+                .iter()
+                .all(|exchange| exchange.request != "metrics")
+        );
+    }
+
+    #[test]
+    fn open_or_nonmatching_cursors_never_satisfy_the_observation() {
+        for open in [true, false] {
+            let (mut clock, wire, mut sink) = rig();
+            let mut wire = LandingWire::new(wire);
+            wire.cursor_open = open;
+            if !open {
+                wire.cursor_override = Some("OK 10 99 1 blinking_block\n".into());
+            }
+            let recording = landing_run(&mut wire, &mut clock, &mut sink, Some(EXPECTED_LANDING));
+            let observation = recording.landing.as_ref().unwrap();
+            assert_eq!(
+                observation.failure.as_ref().unwrap().kind,
+                FailureKind::Deadline
+            );
+            assert_eq!(observation.evidence.unwrap().seq, 2);
+            assert!(sink.saved && recording.replay_complete);
+        }
+    }
+
+    #[test]
+    fn observation_failures_keep_partial_exchanges_and_stop_before_metrics() {
+        for (fault, kind, call) in [
+            (ObserverFault::Transport, FailureKind::Transport, 1),
+            (ObserverFault::Refused, FailureKind::Refused, 2),
+            (ObserverFault::Target, FailureKind::Source, 3),
+            (ObserverFault::Malformed, FailureKind::Malformed, 3),
+        ] {
+            let (mut clock, wire, mut sink) = rig();
+            let mut wire = LandingWire::new(wire);
+            wire.fault = Some((call, fault));
+            let recording = landing_run(&mut wire, &mut clock, &mut sink, Some(EXPECTED_LANDING));
+            assert_eq!(
+                recording
+                    .landing
+                    .as_ref()
+                    .unwrap()
+                    .failure
+                    .as_ref()
+                    .unwrap()
+                    .kind,
+                kind
+            );
+            assert_eq!(wire.calls, call);
+            assert!(recording.replay_complete && sink.saved);
+            assert!(recording.exchanges.last().is_some());
+            assert!(
+                recording
+                    .exchanges
+                    .iter()
+                    .all(|exchange| exchange.request != "metrics")
+            );
+        }
+        let (mut clock, wire, mut sink) = rig();
+        let mut wire = LandingWire::new(wire);
+        wire.source_view = 9;
+        let recording = landing_run(&mut wire, &mut clock, &mut sink, Some(EXPECTED_LANDING));
+        assert_eq!(
+            recording
+                .landing
+                .as_ref()
+                .unwrap()
+                .failure
+                .as_ref()
+                .unwrap()
+                .kind,
+            FailureKind::Source
+        );
+        assert!(sink.saved);
+    }
+
+    #[test]
+    fn malformed_cursor_samples_fail_instead_of_becoming_closed_landings() {
+        for reply in [
+            "OK 10 100\n",
+            "OK 10\n100 1 blinking_block\n",
+            "OK 10 100 2 blinking_block\n",
+            "OK 10 100 1 blinking_block frame=closed\n",
+        ] {
+            let (mut clock, wire, mut sink) = rig();
+            let mut wire = LandingWire::new(wire);
+            wire.cursor_override = Some(reply.into());
+            let recording = landing_run(&mut wire, &mut clock, &mut sink, Some(EXPECTED_LANDING));
+            assert_eq!(
+                recording
+                    .landing
+                    .as_ref()
+                    .unwrap()
+                    .failure
+                    .as_ref()
+                    .unwrap()
+                    .kind,
+                FailureKind::Malformed
+            );
+            assert_eq!(wire.calls, 2);
+            assert!(sink.saved);
+        }
+    }
+
+    #[test]
+    fn the_whole_observation_deadline_bounds_each_rpc_and_rejects_a_late_matching_fence() {
+        let (mut clock, wire, mut sink) = rig();
+        let mut wire = LandingWire::new(wire);
+        wire.costs = [
+            Duration::from_secs(20),
+            Duration::from_secs(20),
+            Duration::from_secs(21),
+        ]
+        .into();
+        let recording = landing_run(&mut wire, &mut clock, &mut sink, Some(EXPECTED_LANDING));
+        let observation = recording.landing.as_ref().unwrap();
+        assert_eq!(
+            observation.failure.as_ref().unwrap().kind,
+            FailureKind::Deadline
+        );
+        assert_eq!(wire.calls, 3);
+        assert_eq!(
+            &wire.bounds[..3],
+            &[
+                Duration::from_secs(60),
+                Duration::from_secs(40),
+                Duration::from_secs(20)
+            ]
+        );
+        assert_eq!(observation.evidence.unwrap().seq, 2);
+        assert!(recording.exchanges.last().unwrap().reply.is_ok());
+        assert!(
+            recording
+                .exchanges
+                .iter()
+                .all(|exchange| exchange.request != "metrics")
+        );
+
+        let (mut clock, wire, _) = rig();
+        let mut wire = LandingWire::new(wire);
+        let mut recording = record("a ", Duration::from_millis(1), &mut clock, &mut wire);
+        let now = clock.now();
+        let prior_requests = recording.exchanges.len();
+        assert_eq!(
+            recording
+                .landing_request(&clock, &mut wire, Request::Drain, "landing-expired", now)
+                .unwrap_err()
+                .kind,
+            FailureKind::Deadline
+        );
+        assert_eq!(recording.exchanges.len(), prior_requests);
+        assert!(wire.bounds.is_empty());
+    }
+
+    #[test]
+    fn every_observed_landing_ends_inside_its_whole_observation_deadline() {
+        // Time can pass while replies are decoded and agreement is evaluated,
+        // not only while an RPC is blocked. Sweep elapsed time between clock
+        // samples without depending on a particular number of samples or RPCs.
+        struct TickingClock {
+            now: Rc<Cell<Duration>>,
+            step: Duration,
+        }
+
+        impl Clock for TickingClock {
+            fn now(&self) -> Duration {
+                let at = self.now.get();
+                self.now.set(at + self.step);
+                at
+            }
+
+            fn sleep_until(&mut self, due: Duration) -> Result<(), String> {
+                self.now.set(self.now.get().max(due));
+                Ok(())
+            }
+        }
+
+        let mut observed = false;
+        let mut timed_out = false;
+        let mut late_agreements = Vec::new();
+        for divisor in (3..=257).step_by(2) {
+            let (base_clock, wire, mut sink) = rig();
+            let mut clock = TickingClock {
+                now: Rc::clone(&base_clock.now),
+                step: LANDING_HANG * 2 / divisor,
+            };
+            let mut wire = LandingWire::new(wire);
+            let recording = run(
+                "a ",
+                Duration::from_millis(1),
+                false,
+                Some(EXPECTED_LANDING),
+                &mut clock,
+                &mut wire,
+                &mut sink,
+            )
+            .unwrap();
+            assert!(recording.replay_complete && sink.saved);
+            let observation = recording.landing.as_ref().unwrap();
+            if let Some(failure) = &observation.failure {
+                assert_eq!(failure.kind, FailureKind::Deadline);
+                timed_out = true;
+            } else {
+                observed = true;
+                assert!(observation.evidence.is_some());
+                if observation.ended >= observation.started + LANDING_HANG {
+                    late_agreements.push((divisor, observation.ended - observation.started));
+                }
+            }
+        }
+        assert!(observed && timed_out);
+        assert!(
+            late_agreements.is_empty(),
+            "late agreements: {late_agreements:?}"
+        );
+    }
+
+    #[test]
+    fn observer_retention_failure_preserves_the_already_recorded_submission() {
+        let (mut clock, wire, _) = rig();
+        let mut wire = LandingWire::new(wire);
+        let mut recording = record("a ", Duration::from_millis(1), &mut clock, &mut wire);
+        let prior_requests = recording.exchanges.len();
+        recording.bytes = MAX_RETAINED_BYTES;
+        recording.observe_landing(EXPECTED_LANDING, &mut clock, &mut wire);
+        assert_eq!(
+            recording
+                .landing
+                .as_ref()
+                .unwrap()
+                .failure
+                .as_ref()
+                .unwrap()
+                .kind,
+            FailureKind::Retention
+        );
+        assert_eq!(recording.exchanges.len(), prior_requests);
+        assert!(recording.replay_complete);
+        assert_eq!(recording.bytes, MAX_RETAINED_BYTES);
+    }
+
     fn output_options(out: PathBuf) -> Options {
         Options {
             tag: "test".into(),
@@ -910,7 +1853,183 @@ mod tests {
             text: "A ".into(),
             cadence: Duration::from_millis(1),
             no_images: false,
+            expect_trail_landing: None,
         }
+    }
+
+    #[test]
+    fn landing_option_requires_one_literal_zero_based_coordinate_pair() {
+        let good = ["test", "--out", "take", "--text", "a ", "--cadence-ms", "1"]
+            .map(String::from)
+            .to_vec();
+        assert!(
+            Options::parse(&good)
+                .unwrap()
+                .expect_trail_landing
+                .is_none()
+        );
+        for (value, expected) in [
+            ("0,0", Landing { row: 0, col: 0 }),
+            ("10,100", EXPECTED_LANDING),
+            (
+                "65535,65535",
+                Landing {
+                    row: u16::MAX,
+                    col: u16::MAX,
+                },
+            ),
+        ] {
+            let mut args = good.clone();
+            args.extend(["--expect-trail-landing".into(), value.into()]);
+            assert_eq!(
+                Options::parse(&args).unwrap().expect_trail_landing,
+                Some(expected)
+            );
+            args.extend(["--expect-trail-landing".into(), value.into()]);
+            assert!(Options::parse(&args).is_err());
+        }
+        for value in [
+            "", "10", "10,", ",100", "-1,100", "1,-1", "+1,100", "1, 2", "1,2,3", "65536,0",
+            "0,65536",
+        ] {
+            let mut args = good.clone();
+            args.extend(["--expect-trail-landing".into(), value.into()]);
+            assert!(Options::parse(&args).is_err());
+        }
+        let mut missing = good;
+        missing.push("--expect-trail-landing".into());
+        assert!(Options::parse(&missing).is_err());
+    }
+
+    #[test]
+    fn persisted_landing_observation_keeps_the_submission_watermark_and_diagnostic_phase() {
+        for verdict in [LandingVerdict::Licensed, LandingVerdict::Declined] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let mut options = output_options(scratch.path().join("take"));
+            options.no_images = true;
+            options.expect_trail_landing = Some(EXPECTED_LANDING);
+            let mut files = Files {
+                out: crate::sys::NewOutputDir::create(&options.out).unwrap(),
+                options: &options,
+                window: "1",
+            };
+            let (mut clock, wire, _) = rig();
+            let mut wire = LandingWire::new(wire);
+            wire.coalesced = true;
+            wire.phase = verdict.name();
+            let recording = run(
+                &options.text,
+                options.cadence,
+                false,
+                options.expect_trail_landing,
+                &mut clock,
+                &mut wire,
+                &mut files,
+            )
+            .unwrap();
+            let summary: aterm_json::Value =
+                aterm_json::from_slice(&std::fs::read(options.out.join("summary.json")).unwrap())
+                    .unwrap();
+            assert_eq!(summary["controller_replay_complete"].as_bool(), Some(true));
+            assert_eq!(summary["replay_last_admission_seq"].as_u64(), Some(0));
+            assert_eq!(
+                summary["replay_end_us"].as_u64(),
+                Some(micros(recording.finished))
+            );
+            let observation = &summary["trail_landing_observation"];
+            assert_eq!(observation["status"].as_str(), Some("agreement-observed"));
+            assert_eq!(observation["expected"]["row"].as_u64(), Some(10));
+            assert_eq!(observation["expected"]["col"].as_u64(), Some(100));
+            assert_eq!(observation["source"]["view"].as_u64(), Some(2));
+            assert_eq!(observation["source"]["local_session"].as_u64(), Some(3));
+            assert_eq!(observation["after_admission_seq"].as_u64(), Some(0));
+            assert_eq!(observation["admission_seq"].as_u64(), Some(1));
+            assert_eq!(
+                observation["admission_phase"].as_str(),
+                Some(verdict.name())
+            );
+            assert!(
+                observation["observation_end_us"].as_u64().unwrap()
+                    > summary["replay_end_us"].as_u64().unwrap()
+            );
+            assert!(observation["failure_kind"].is_null());
+            assert!(summary["error"].is_null());
+            let replies = std::fs::read_to_string(options.out.join("replies.jsonl")).unwrap();
+            let replies: Vec<aterm_json::Value> = replies
+                .lines()
+                .map(|line| aterm_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(replies.len(), recording.exchanges.len());
+            let metrics = replies
+                .iter()
+                .position(|reply| reply["request"].as_str() == Some("metrics"))
+                .unwrap();
+            assert_eq!(
+                replies[metrics - 1]["phase"].as_str(),
+                Some("landing-after-cursor")
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_unobserved_landing_keeps_the_failing_fence_reply() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let mut options = output_options(scratch.path().join("take"));
+        options.expect_trail_landing = Some(EXPECTED_LANDING);
+        let mut files = Files {
+            out: crate::sys::NewOutputDir::create(&options.out).unwrap(),
+            options: &options,
+            window: "1",
+        };
+        let (mut clock, wire, _) = rig();
+        let mut wire = LandingWire::new(wire);
+        wire.fault = Some((3, ObserverFault::Target));
+        let recording = run(
+            &options.text,
+            options.cadence,
+            true,
+            options.expect_trail_landing,
+            &mut clock,
+            &mut wire,
+            &mut files,
+        )
+        .unwrap();
+        let summary: aterm_json::Value =
+            aterm_json::from_slice(&std::fs::read(options.out.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary["controller_replay_complete"].as_bool(), Some(true));
+        assert_eq!(
+            summary["trail_landing_observation"]["status"].as_str(),
+            Some("unobserved")
+        );
+        assert_eq!(
+            summary["trail_landing_observation"]["failure_kind"].as_str(),
+            Some("source")
+        );
+        assert!(!summary["error"].is_null());
+        let replies: Vec<aterm_json::Value> =
+            std::fs::read_to_string(options.out.join("replies.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| aterm_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(replies.len(), recording.exchanges.len());
+        assert_eq!(
+            replies.last().unwrap()["phase"].as_str(),
+            Some("landing-after-cursor")
+        );
+        assert!(
+            replies.last().unwrap()["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("window=9")
+        );
+        assert!(
+            replies
+                .iter()
+                .all(|reply| reply["request"].as_str() != Some("metrics"))
+        );
+        assert_eq!(summary["images_retained"].as_u64(), Some(0));
     }
 
     #[test]
@@ -930,6 +2049,7 @@ mod tests {
             &options.text,
             options.cadence,
             !options.no_images,
+            options.expect_trail_landing,
             &mut clock,
             &mut wire,
             &mut files,
@@ -1009,6 +2129,7 @@ mod tests {
             &options.text,
             options.cadence,
             !options.no_images,
+            options.expect_trail_landing,
             &mut clock,
             &mut wire,
             &mut files,
@@ -1222,6 +2343,7 @@ mod tests {
             "A +",
             Duration::from_millis(10),
             true,
+            None,
             &mut clock,
             &mut wire,
             &mut sink,
@@ -1283,6 +2405,7 @@ mod tests {
             "abc",
             Duration::from_millis(10),
             true,
+            None,
             &mut clock,
             &mut wire,
             &mut sink,
@@ -1452,6 +2575,7 @@ mod tests {
                 "abc",
                 Duration::from_millis(1),
                 true,
+                None,
                 &mut clock,
                 &mut wire,
                 &mut sink,

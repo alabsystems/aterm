@@ -447,14 +447,17 @@ fn a_why_arms_the_split_while_it_waits() {
                 while let Ok(msg) = rx.recv() {
                     assert!(matches!(msg, Msg::Pull));
                     seen.push(ARMED.armed());
-                    shared.publish_for_test(with_split(7301, Some(7301)), Vec::new());
+                    // A forced `sys why` waits for a CPU Stats sample too.
+                    let mut snap = with_split(7301, Some(7301));
+                    snap.hardware = Some(aterm_vitals::hardware::Sample::unavailable("warming"));
+                    shared.publish_for_test(snap, Vec::new());
                 }
                 seen
             })
         };
         shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
         let q = SysQuery::parse(text).expect("query");
-        let (held, state) = shared.fresh_for(&q, &ARMED, &Arming::new());
+        let (held, state) = shared.fresh_for(&q, &ARMED, &Arming::new(), &Arming::new());
         assert_eq!(
             (held.map(|h| h.snap.seq), state),
             (Some(7301), Freshness::Fresh),
@@ -464,6 +467,129 @@ fn a_why_arms_the_split_while_it_waits() {
         shared.lock().tx = None;
         assert_eq!(probe.join().unwrap(), [armed], "{text}");
     }
+}
+
+/// A snapshot with a CPU Stats sample where `sampled`.
+fn with_hardware(seq: u64, sampled: bool) -> Snapshot {
+    let mut s = synthetic(seq, 0.1);
+    s.hardware = sampled.then(|| aterm_vitals::hardware::Sample::unavailable("warming"));
+    s
+}
+
+/// `sys cores`, `sys report` and a forced `sys why` print CPU hardware, which no deck reading
+/// samples any more (A2 §6.4): over a held snapshot without a sample they pull, whatever its age
+/// or their `fresh=`, with CPU Stats armed while they wait, and answer from the pull's reading,
+/// never from a deck reading without a sample that lands first; over one with a sample, the two
+/// unforced views answer at once. An unforced `sys why` pulls for no sample; every other view
+/// arms nothing. NEGATIVE CONTROL: judge `sys cores` by the snapshot's landing, as the host before
+/// A2 did, and it answers the held snapshot at once, fresh, with no pull and no hardware; judge a
+/// forced `sys why` by its split alone, as the S2 commit did, and it answers the deck reading
+/// (7301), which has none.
+#[test]
+fn sys_cores_and_report_force_a_pull_when_the_held_snapshot_has_no_hardware() {
+    static HARDWARE: Arming = Arming::new();
+    let run = |text: &str, held_sampled: bool| {
+        let shared = Arc::new(Shared::paced(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        shared.install(tx);
+        let probe = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                let mut seq = 7300;
+                while let Ok(msg) = rx.recv() {
+                    assert!(matches!(msg, Msg::Pull));
+                    let armed = HARDWARE.armed();
+                    seen.push(armed);
+                    if armed {
+                        // A deck reading already in flight lands first, with no sample.
+                        seq += 1;
+                        shared.publish_for_test(with_hardware(seq, false), Vec::new());
+                    }
+                    seq += 1;
+                    shared.publish_for_test(with_hardware(seq, armed), Vec::new());
+                }
+                seen
+            })
+        };
+        shared.publish_for_test(with_hardware(7300, held_sampled), Vec::new());
+        let q = SysQuery::parse(text).expect("query");
+        let (held, state) = shared.fresh_for(&q, &Arming::new(), &Arming::new(), &HARDWARE);
+        assert!(!HARDWARE.armed(), "{text}: disarmed once answered");
+        shared.lock().tx = None;
+        let sampled = held.as_ref().is_some_and(|h| h.snap.hardware.is_some());
+        (
+            held.map(|h| h.snap.seq),
+            state,
+            sampled,
+            probe.join().unwrap(),
+        )
+    };
+    let pulled = (Some(7302), Freshness::Fresh, true, vec![true]);
+    for text in ["cores", "report", "cores fresh=60000", "report fresh=60000"] {
+        assert_eq!(run(text, false), pulled, "{text}: pulled, CPU Stats armed");
+    }
+    assert_eq!(run("cores fresh=0", true), pulled, "forced");
+    let held = (Some(7300), Freshness::Fresh, true, vec![]);
+    assert_eq!(run("cores", true), held, "a held sample answers at once");
+    assert_eq!(run("report", true), held);
+    let unsampled = (Some(7300), Freshness::Fresh, false, vec![]);
+    assert_eq!(run("why", false), unsampled, "a why forces no pull for it");
+    assert_eq!(run("global", false), unsampled);
+    assert_eq!(
+        run("why fresh=0", false),
+        pulled,
+        "a forced why arms CPU Stats and waits for a sample"
+    );
+    assert_eq!(
+        run("global fresh=0", false),
+        (Some(7301), Freshness::Fresh, false, vec![false]),
+        "another forced view arms nothing"
+    );
+}
+
+/// A reply that needs a CPU Stats sample the held snapshot lacks (`sys cores`, `sys report`, a
+/// forced `sys why`) waits as a cold pull does, since its pull reads a pair where no sample is
+/// warm: allowed no wait at all for a warm pull, each still answers from its pull. CONTROL: a
+/// forced `sys global` over the same warm snapshot needs no sample, waits as a warm pull, and so
+/// answers stale at once, as the S2 commit's forced `sys why` did.
+#[test]
+fn a_reply_that_needs_cpu_stats_waits_as_a_cold_pull() {
+    static HARDWARE: Arming = Arming::new();
+    let run = |text: &str| {
+        let shared = Arc::new(Shared::paced(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+        ));
+        shared.lock().pacing.wait = Duration::ZERO;
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        shared.install(tx);
+        let probe = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                while rx.recv().is_ok() {
+                    shared.publish_for_test(with_hardware(7301, HARDWARE.armed()), Vec::new());
+                }
+            })
+        };
+        shared.publish_for_test(with_hardware(7300, false), Vec::new());
+        let q = SysQuery::parse(text).expect("query");
+        let (held, state) = shared.fresh_for(&q, &Arming::new(), &Arming::new(), &HARDWARE);
+        shared.lock().tx = None;
+        probe.join().unwrap();
+        (held.map(|h| h.snap.seq), state)
+    };
+    for text in ["cores", "report", "why fresh=0"] {
+        assert_eq!(run(text), (Some(7301), Freshness::Fresh), "{text}");
+    }
+    assert_eq!(
+        run("global fresh=0"),
+        (Some(7300), Freshness::Stale),
+        "control: a warm pull's wait"
+    );
 }
 
 /// A snapshot carrying a jobs view the engine's pass made `age_ms` before its reading.
@@ -502,7 +628,7 @@ fn sys_jobs_is_as_fresh_as_its_jobs_view_and_arms_the_engine_while_it_waits() {
         };
         shared.publish_for_test(with_jobs_aged(7300, 25_000), Vec::new());
         let q = SysQuery::parse(text).expect("query");
-        let (held, state) = shared.fresh_for(&q, &Arming::new(), &JOBS);
+        let (held, state) = shared.fresh_for(&q, &Arming::new(), &JOBS, &Arming::new());
         assert!(!JOBS.armed(), "{text}: disarmed once answered");
         shared.lock().tx = None;
         (held.map(|h| h.snap.seq), state, probe.join().unwrap())
@@ -597,7 +723,7 @@ fn the_machine_wait_meets_refuses_times_out_and_sees_its_session_exit() {
     );
     let quiet = await_machine(&shared, 0, &wait("sys quiet"), &alive);
     assert!(
-        quiet.contains(" skipped=gpu:unsupported,throttle:unsupported,swap:not_sampled "),
+        quiet.contains(" skipped=gpu:unsupported,thermal:unsupported,swap:not_sampled "),
         "{quiet}"
     );
     assert_eq!(

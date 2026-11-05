@@ -304,6 +304,9 @@ pub(crate) struct EditHeader {
     /// The program the edit is for (the request's `for=`), when it named one.
     pub(crate) for_word: Option<String>,
     pub(crate) waiter: EditWaiter,
+    /// The document opened read-only (`edit … ro=1`): there is nothing to save or discard, and
+    /// done only closes it.
+    pub(crate) read_only: bool,
 }
 
 /// Whether a program waits on an `edit` ticket's answer.
@@ -320,6 +323,12 @@ pub(crate) enum EditWaiter {
 impl EditHeader {
     /// The row's words, before its parts.
     pub(crate) fn words(&self) -> String {
+        if self.read_only {
+            return match self.for_word.as_deref() {
+                Some(program) => format!("Read only, shown for {program}: close it when done"),
+                None => "Read only: close it when done".to_string(),
+            };
+        }
         match (self.waiter, self.for_word.as_deref()) {
             (EditWaiter::Waiting, Some(program)) => format!("Editing for {program}"),
             (EditWaiter::Waiting, None) => "Editing for a waiting program".to_string(),
@@ -333,12 +342,15 @@ impl EditHeader {
 
     /// Whether the row offers abort.
     pub(crate) fn offers_abort(&self) -> bool {
-        self.waiter == EditWaiter::Waiting
+        self.waiter == EditWaiter::Waiting && !self.read_only
     }
 
     /// The done part's spoken label: its visible words first, as every
     /// control's name holds what it paints.
     fn done_label(&self) -> String {
+        if self.read_only {
+            return format!("{EDIT_DONE_WORDS}: close");
+        }
         match (self.waiter, self.for_word.as_deref()) {
             (EditWaiter::Waiting, Some(program)) => {
                 format!("{EDIT_DONE_WORDS}: save and close, and tell {program} the edit is done")
@@ -10153,6 +10165,7 @@ mod markdown_reader_tests {
         view.edit_header = Some(EditHeader {
             for_word: Some("git".to_string()),
             waiter: EditWaiter::Waiting,
+            read_only: false,
         });
         for (scale, listed, header) in [
             (1.0_f32, true, true),

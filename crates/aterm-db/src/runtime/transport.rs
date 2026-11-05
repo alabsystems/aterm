@@ -141,6 +141,16 @@ impl Worker {
                     }
                     unreachable!("the second exchange always returns")
                 })();
+                if let Err(error) = &result
+                    && matches!(
+                        error.repair_cause(),
+                        aterm_types::network_state::RepairCause::LegacyPastCrossing
+                    )
+                {
+                    // A protocol fence can refuse control before entering application repair.
+                    // Preserve its cause without fabricating an application exchange.
+                    repair.failure_cause(error);
+                }
                 let mut control = control.lock().unwrap_or_else(|p| p.into_inner());
                 let success =
                     result.is_ok() && !control.stopped && repair.authenticated_actor().is_some();
@@ -165,6 +175,7 @@ impl Worker {
                     membership_error: repair.membership_error().map(bounded_error),
                     application: repair.application(),
                     application_error: repair.application_error().map(bounded_error),
+                    application_cause: repair.application_cause(),
                     application_interrupted: repair.application_interrupted(),
                     application_deferral: repair.application_deferral().cloned().map(|mut why| {
                         why.local_error = why.local_error.map(bounded_error);
@@ -340,6 +351,7 @@ pub(super) struct Transport {
     beacon: Instant,
     dial: Instant,
     rotate: Instant,
+    versions_at: Instant,
     scope: Scope,
     /// The group's port: [`PORT`] on a LAN, an isolated test attachment's own on loopback.
     port: u16,
@@ -362,6 +374,10 @@ pub(super) struct Transport {
     permission: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     observed: std::collections::BTreeMap<astream_wire::sync::Digest, usize>,
+    /// Application rounds that completed since [`Self::take_finished_rounds`] (tests), including
+    /// one that selected no table or deferred its table. A failed round is none of them.
+    #[cfg(test)]
+    finished_rounds: u64,
 }
 impl Transport {
     /// A transport on an isolated loopback attachment at `port` (tests), opened as a LAN one is:
@@ -417,6 +433,13 @@ impl Transport {
         &self.observed
     }
 
+    /// Application rounds that completed since the last call, whichever table each took or none
+    /// ([`Self::finished_rounds`]).
+    #[cfg(test)]
+    pub(super) fn take_finished_rounds(&mut self) -> u64 {
+        std::mem::take(&mut self.finished_rounds)
+    }
+
     pub(super) fn open(endpoint: Endpoint, addresses: &[SocketAddr]) -> Result<Self> {
         Self::open_mode(Some(endpoint), addresses)
     }
@@ -451,6 +474,7 @@ impl Transport {
             beacon: now + BEACON,
             dial: now,
             rotate: now + Duration::from_secs(300),
+            versions_at: now,
             scope,
             port,
             contacts: Vec::new(),
@@ -464,6 +488,8 @@ impl Transport {
             permission: None,
             #[cfg(test)]
             observed: std::collections::BTreeMap::new(),
+            #[cfg(test)]
+            finished_rounds: 0,
         })
     }
     /// Open a link on each address in `addresses` that has none. A link counts once its first
@@ -621,10 +647,14 @@ impl Transport {
                     }
                 }
                 #[cfg(test)]
-                if let Some(report) = repair.application()
-                    && let Some(table) = report.table
-                {
-                    self.observed.insert(table, report.retained_after);
+                if let Some(report) = repair.application() {
+                    self.finished_rounds += 1;
+                    // A round that deferred its table read no inventory: it knows no count.
+                    if let Some(table) = report.table
+                        && report.local_known.is_some()
+                    {
+                        self.observed.insert(table, report.retained_after);
+                    }
                 }
                 if let Some(address) = target {
                     let outcome =
@@ -684,6 +714,19 @@ impl Transport {
         Ok(())
     }
     pub(super) fn tick(&mut self, now: Instant) -> io::Result<()> {
+        if now >= self.versions_at {
+            self.versions_at = now + Duration::from_secs(2);
+            // This reads a local cache only: Commons never polls the fleet for versions.
+            // Isolated attachments and unit tests must not consult the live lab.
+            #[cfg(not(test))]
+            if self.scope == Scope::Lan
+                && let Some(state) = aterm_types::dirs::state_dir()
+                && let Some(endpoint) = &self.endpoint
+            {
+                self.hints
+                    .advertised_versions(endpoint.advertised_versions(&state), now);
+            }
+        }
         self.hints.expire_presence(now);
         if self.endpoint.is_none() {
             self.hints.expire_listen_only(now);

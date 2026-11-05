@@ -338,6 +338,7 @@ fn exec_descriptor_words(auxv: &[u8], word: usize) -> Option<Option<i32>> {
 /// inode and executable mapping must still match before either spelling is accepted.
 #[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
 fn maps_image(mut maps: impl std::io::BufRead, path: &Path, image: FileIdentity) -> bool {
+    use std::io::{BufRead as _, Read as _};
     use std::os::unix::ffi::OsStrExt as _;
     let Some(device) = image.device else {
         return false;
@@ -361,7 +362,8 @@ fn maps_image(mut maps: impl std::io::BufRead, path: &Path, image: FileIdentity)
     let mut row = Vec::new();
     loop {
         row.clear();
-        if maps
+        if (&mut maps)
+            .take(64 * 1024)
             .read_until(b'\n', &mut row)
             .map_or(true, |len| len == 0)
         {

@@ -240,6 +240,16 @@ pub(super) struct WorkerPermit {
 }
 
 impl WorkerPermit {
+    pub(super) fn source_scope(&self) -> producer::SourceScope {
+        producer::SourceScope {
+            home: self.request.home.clone(),
+            config: self.request.config.clone(),
+            lease: self.request.lease.clone(),
+            guardian: Identity::parse(&self.request.guardian)
+                .expect("worker gate checked guardian identity"),
+        }
+    }
+
     pub(super) fn package_scope(&self) -> producer::PackageScope {
         producer::PackageScope {
             cache: producer::cache_root(&self.request.config),

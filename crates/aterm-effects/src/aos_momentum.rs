@@ -44,10 +44,6 @@ pub mod corpus;
 #[cfg(test)]
 mod corpus_tests;
 #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
-pub mod dist;
-#[cfg(test)]
-mod dist_tests;
-#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
 pub mod fidelity;
 #[cfg(test)]
 mod fidelity_tests;
@@ -60,12 +56,6 @@ mod host_tests;
 pub mod lane;
 #[cfg(test)]
 mod lane_tests;
-#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
-pub mod lease;
-#[cfg(test)]
-mod lease_conformance_tests;
-#[cfg(test)]
-mod lease_tests;
 #[cfg(test)]
 mod locks_tests;
 #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
@@ -118,7 +108,7 @@ pub use trace::{
 pub use watch::{Segment, SegmentJudgement};
 
 /// The version of the input and observation encodings ([`MomentumSchema`]).
-pub const MOMENTUM_EVENT_ENCODING: u16 = 2;
+pub const MOMENTUM_EVENT_ENCODING: u16 = 3;
 
 /// The task artifact's name.
 pub const TASK_NAME: &str = "aterm.cursor.momentum-glow";
@@ -195,19 +185,35 @@ fn instant_of(epoch: Instant, at: i128) -> Option<Instant> {
     }
 }
 
-/// The task's owned state: the engine and the latest admitted input's time.
+/// The task's owned state: the engine, the latest admitted input's time and how many of its
+/// keys aterm could not see echoed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MomentumState {
     glow: MomentumGlow,
     clock: Option<i128>,
+    /// Keys this state took that were logged [`KeyEcho::Unseen`], since its recording began: every
+    /// checkpoint and state digest carries the count, so a trace cut anywhere says it.
+    unseen: u32,
 }
 
 impl MomentumState {
-    /// A state over `glow` that has seen no input since the epoch.
+    /// A state over `glow` that has seen no input since the epoch, and so no unseen key: each new
+    /// recording starts its count from zero.
     #[inline]
     #[must_use]
     pub const fn new(glow: MomentumGlow) -> Self {
-        MomentumState { glow, clock: None }
+        MomentumState {
+            glow,
+            clock: None,
+            unseen: 0,
+        }
+    }
+
+    /// How many keys this state took that were logged [`KeyEcho::Unseen`].
+    #[inline]
+    #[must_use]
+    pub const fn unseen(&self) -> u32 {
+        self.unseen
     }
 
     /// The engine.
@@ -414,6 +420,17 @@ impl ConfigRecord {
     }
 }
 
+/// Whether aterm saw a typed key echoed before its recording logged it (ATERM-KI-1025-1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyEcho {
+    /// Logged at its press where the tty or an open prompt of aterm's shell echoes it (or it
+    /// carries no text), or at the frame that proved its own echo.
+    Seen,
+    /// Logged under the person's grant for its attach ([`MomentumHost::aos_release_unseen`]), at a
+    /// frame that showed neither its echo nor a mask where it was typed: it may be a password key.
+    Unseen,
+}
+
 /// One input to the task: one host call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MomentumEvent {
@@ -422,6 +439,9 @@ pub enum MomentumEvent {
         at: i128,
         /// `tau_s`, as `f32` bits.
         tau_bits: u32,
+        /// Whether aterm saw it echoed: every code applies an unseen key exactly as a seen one,
+        /// and the state counts it ([`MomentumState::unseen`]).
+        echo: KeyEcho,
     },
     /// `reset()`.
     Reset,
@@ -743,6 +763,7 @@ impl Schema for MomentumSchema {
             Err(_) => e.raw(&[0u8; MomentumGlowSnapshot::LEN]),
         }
         e.opt(s.clock, |e, c| e.offset(c));
+        e.u32(s.unseen);
     }
 
     #[inline]
@@ -751,14 +772,22 @@ impl Schema for MomentumSchema {
         let snap = MomentumGlowSnapshot::decode(bytes).map_err(snapshot_fault)?;
         let glow = MomentumGlow::restore(&snap, self.epoch).map_err(snapshot_fault)?;
         let clock = d.opt("state.clock", |d| d.offset("state.clock"))?;
-        Ok(MomentumState { glow, clock })
+        let unseen = d.u32("state.unseen")?;
+        Ok(MomentumState {
+            glow,
+            clock,
+            unseen,
+        })
     }
 
     #[inline]
     fn encode_input(&self, i: &MomentumEvent, e: &mut Enc) {
         match *i {
-            MomentumEvent::Key { at, tau_bits } => {
-                e.u8(0);
+            MomentumEvent::Key { at, tau_bits, echo } => {
+                e.u8(match echo {
+                    KeyEcho::Seen => 0,
+                    KeyEcho::Unseen => 4,
+                });
                 e.offset(at);
                 e.u32(tau_bits);
             }
@@ -806,9 +835,14 @@ impl Schema for MomentumSchema {
     #[inline]
     fn decode_input(&self, d: &mut Dec<'_>) -> Result<MomentumEvent, WireFault> {
         match d.u8("event.tag")? {
-            0 => Ok(MomentumEvent::Key {
+            tag @ (0 | 4) => Ok(MomentumEvent::Key {
                 at: d.offset("event.key.at")?,
                 tau_bits: d.u32("event.key.tau")?,
+                echo: if tag == 0 {
+                    KeyEcho::Seen
+                } else {
+                    KeyEcho::Unseen
+                },
             }),
             1 => Ok(MomentumEvent::Reset),
             2 => {
@@ -934,15 +968,16 @@ pub fn task_artifact() -> ArtifactId {
     ArtifactId::new(ArtifactKind::Task, TASK_NAME, 1, e.as_bytes())
 }
 
-/// The schema artifact `momentum-glow.state+events` v2.
+/// The schema artifact `momentum-glow.state+events` v3: an older build refuses a v3 trace by its
+/// identity, so it never misreads an unseen key or the state's count.
 #[inline]
 #[must_use]
 pub fn schema_artifact() -> ArtifactId {
     let mut e = Enc::new();
     e.u16(MOMENTUM_GLOW_SNAPSHOT_SCHEMA);
     e.u16(MOMENTUM_EVENT_ENCODING);
-    e.str("state: snapshot then optional clock; inputs Key|Reset|Tick|Query; observations Keyed|WasReset|Frame|Schedule|Refused");
-    ArtifactId::new(ArtifactKind::Schema, SCHEMA_NAME, 2, e.as_bytes())
+    e.str("state: snapshot, optional clock, unseen-key count; inputs Key (seen tag 0, unseen tag 4)|Reset|Tick|Query; observations Keyed|WasReset|Frame|Schedule|Refused");
+    ArtifactId::new(ArtifactKind::Schema, SCHEMA_NAME, 3, e.as_bytes())
 }
 
 /// The profile artifact.
@@ -1237,7 +1272,7 @@ impl Sched {
         }
         let p = &MOMENTUM_PROFILE;
         match *ev {
-            MomentumEvent::Key { at, tau_bits } => {
+            MomentumEvent::Key { at, tau_bits, echo } => {
                 let tau = f32::from_bits(tau_bits);
                 let now = match admit_at(p, s, epoch, at) {
                     Ok(now) => match admit_tau(p, tau) {
@@ -1248,6 +1283,7 @@ impl Sched {
                 };
                 s.glow.on_key(now, tau);
                 s.clock = Some(at);
+                s.unseen = s.unseen.saturating_add(u32::from(echo == KeyEcho::Unseen));
                 Applied::Keyed
             }
             MomentumEvent::Reset => {
@@ -1961,6 +1997,33 @@ impl Hosted {
         self.boundary.pair().head.input_cursor
     }
 
+    /// What a tick draws while a key is held: the code's own frame for the tick's caret, geometry
+    /// and config at the latest instant the boundary admitted, drawn on a copy of its state, so
+    /// nothing reaches the boundary, the glow holds still, and it stays on the caret the held
+    /// key's echo moved (the last delivered frame stays on the cell that echo printed into).
+    #[inline]
+    fn held_still(
+        &self,
+        cur: Option<(u16, u16)>,
+        geom: &Geom,
+        cfg: &MomentumGlowConfig,
+        out: &mut Vec<GlowQuad>,
+        under: &mut Vec<GlowQuad>,
+    ) -> MomentumGlowFrame {
+        let epoch = self.epoch();
+        let mut state = *self.state();
+        let ev = MomentumEvent::Tick {
+            cur,
+            at: state.last_time(epoch).unwrap_or(0).max(0),
+            geom: GeomRecord::from(geom),
+            cfg: ConfigRecord::from(cfg),
+        };
+        match self.sched().apply(&mut state, epoch, &ev, out, under) {
+            Applied::Frame(frame) => frame,
+            _ => MomentumGlowFrame::default(),
+        }
+    }
+
     /// The logical time of a live call the host stamped `now`.
     #[inline]
     fn logical(&self, now: Instant) -> (i128, bool) {
@@ -2211,6 +2274,7 @@ impl MomentumHost {
                 let ev = MomentumEvent::Key {
                     at,
                     tau_bits: tau_s.to_bits(),
+                    echo: KeyEcho::Seen,
                 };
                 let _ = h.deliver(&ev, moved, &mut Vec::new(), &mut Vec::new());
             }
@@ -2247,7 +2311,9 @@ impl MomentumHost {
     }
 
     /// One frame (`MomentumGlow::tick`). While a key is held nothing is delivered: the frame is the
-    /// last delivered tick's where it is still shown, as while paused.
+    /// code's own for this caret, geometry and config at the latest admitted instant, drawn on a
+    /// copy of the state, so the glow holds still on the caret. While paused it is the last
+    /// delivered tick's where that is still shown.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2270,7 +2336,7 @@ impl MomentumHost {
         match &mut self.mode {
             HostMode::Direct(g) => g.tick(cur, now, geom, cfg, out, under),
             HostMode::Hosted(h) if h.awaiting_echo.is_some() && !held_tick_delivers() => {
-                held_frame(h.held.as_ref(), cur, &geom, cfg, out, under)
+                h.held_still(cur, &geom, cfg, out, under)
             }
             HostMode::Hosted(h) => {
                 let (at, moved) = h.logical(now);
@@ -2358,9 +2424,10 @@ impl MomentumHost {
     }
 
     /// Holds the recording while a typed key waits for its program's echo: until
-    /// [`Self::aos_release`] or a detach no input reaches the boundary (a tick draws the last
-    /// frame, [`Self::next_change_deadline`] names `deadline`), and a key or a reset stops the
-    /// recording ([`RAW_KEY`]). Unattached or paused it does nothing.
+    /// [`Self::aos_release`] or a detach no input reaches the boundary (a tick draws the glow as it
+    /// stood at the latest admitted instant, on the tick's caret; [`Self::next_change_deadline`]
+    /// names `deadline`), and a key or a reset stops the recording ([`RAW_KEY`]). Unattached or
+    /// paused it does nothing.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2391,6 +2458,40 @@ impl MomentumHost {
     )]
     #[inline]
     pub fn aos_release(&mut self, now: Instant, keys: u32, tau_s: f32, rest: Option<Instant>) {
+        self.release_held(now, keys, tau_s, KeyEcho::Seen, rest);
+    }
+
+    /// Ends a hold whose keys no frame proved, under the person's grant for this attach: the
+    /// `keys` held keys are logged as [`KeyEcho::Unseen`] inputs, all at `now` (the count and one
+    /// frame instant, never their presses), and the glow is tainted, so the next attach starts it
+    /// from rest and no later recording carries an unseen key's momentum unmarked. With no hold
+    /// open the keys reach only the glow, a recording stopped first ([`RAW_KEY`]), as
+    /// [`Self::aos_release`] does.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AosKeyHold",
+            action = "Unproven",
+            project = "aterm_effects::aos_momentum::hold_conformance_tests::Real::project"
+        )
+    )]
+    #[inline]
+    pub fn aos_release_unseen(&mut self, now: Instant, keys: u32, tau_s: f32) {
+        self.release_held(now, keys, tau_s, KeyEcho::Unseen, None);
+        self.tainted = true;
+    }
+
+    /// [`Self::aos_release`]'s and [`Self::aos_release_unseen`]'s body: `keys` held keys logged at
+    /// `now` as `echo`, the hold then open until `rest`.
+    #[inline]
+    fn release_held(
+        &mut self,
+        now: Instant,
+        keys: u32,
+        tau_s: f32,
+        echo: KeyEcho,
+        rest: Option<Instant>,
+    ) {
         self.expire_past_horizon(now);
         if let HostMode::Hosted(h) = &mut self.mode
             && h.awaiting_echo.take().is_some()
@@ -2399,6 +2500,7 @@ impl MomentumHost {
             let ev = MomentumEvent::Key {
                 at,
                 tau_bits: tau_s.to_bits(),
+                echo,
             };
             for _ in 0..keys {
                 let _ = h.deliver(&ev, moved, &mut Vec::new(), &mut Vec::new());

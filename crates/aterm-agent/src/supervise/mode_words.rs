@@ -9,6 +9,7 @@
 
 use super::Autopilot;
 use crate::harness::acts::{FACT_SEPARATOR, LandReceipt, ReceiptLeg};
+use crate::harness::hold_said::NeedTail;
 
 /// One mode's sentence in the form each surface renders it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,16 +235,18 @@ pub const CARRIES_ON: &str = "carries on meanwhile";
 /// leg is its needs, §14.7), after the program's own name and `'s`.
 pub const LANDING_WAITS_ALONE: &str = "landing waits on this alone";
 
-/// A REPORT'S WORDS, ONE FUNCTION (§14.7): `<product> carries on meanwhile`, or, where the need
-/// alone holds its session's landing (`alone`), `<product>'s landing waits on this alone`. The
-/// window's hover and the menu bar's tip say them, and the forever lab judges the menu's tip
-/// against them.
+/// A REPORT'S WORDS, ONE FUNCTION (§14.7): `<product> carries on meanwhile`; where the need alone
+/// holds its session's landing (`alone`), `<product>'s landing waits on this alone`; and where the
+/// need's entry says the work waits on the person (`tail`, [`NeedTail::WaitsOnYou`]: the loop
+/// stopped typing, or Land rests on the need or landed beside it), `<product> waits on you`, as
+/// the entry and the chip say it (the post-landing review, 2026-11-02). The window's hover and the
+/// menu bar's tip say them, and the forever lab judges the menu's tip against them.
 #[must_use]
-pub fn report_words(product: &str, alone: bool) -> String {
-    if alone {
-        format!("{product}'s {LANDING_WAITS_ALONE}")
-    } else {
-        format!("{product} {CARRIES_ON}")
+pub fn report_words(product: &str, tail: NeedTail, alone: bool) -> String {
+    match (alone, tail) {
+        (true, _) => format!("{product}'s {LANDING_WAITS_ALONE}"),
+        (false, NeedTail::WaitsOnYou) => format!("{product} {}", tail.words()),
+        (false, NeedTail::CarryingOn) => format!("{product} {CARRIES_ON}"),
     }
 }
 

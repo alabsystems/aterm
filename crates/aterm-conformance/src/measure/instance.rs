@@ -254,18 +254,25 @@ impl World {
     /// # Errors
     /// A file or directory could not be written, or the platform keeps no state under HOME.
     pub fn prepare(root: &Path, config_head: &str) -> std::io::Result<Self> {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt};
         let home = root.join("home");
         let state = aterm_types::world::state_home(&home).ok_or_else(|| {
             std::io::Error::other("this platform keeps no aterm state under a world's HOME")
         })?;
         for dir in [home.clone(), root.join("cfg/aterm"), root.join("run")] {
-            std::fs::create_dir_all(&dir)?;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)?;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&dir)?
+                .set_permissions(std::fs::Permissions::from_mode(0o700))?;
         }
-        std::fs::write(home.join(".profile"), "PS1='$ '\n")?;
-        std::fs::write(home.join(".shrc"), "PS1='$ '\n")?;
-        std::fs::write(
+        super::write_fresh(home.join(".profile"), "PS1='$ '\n")?;
+        super::write_fresh(home.join(".shrc"), "PS1='$ '\n")?;
+        super::write_fresh(
             root.join("cfg/aterm/aterm.toml"),
             format!(
                 "bell_sound = false\n{config_head}\n{}",
@@ -454,7 +461,7 @@ impl Instance {
         face: Face,
         cost_probe: bool,
     ) -> Result<Self, CouldNotRun> {
-        let log = std::fs::File::create(&world.log).map_err(|e| {
+        let log = super::create_stdio_file(&world.log).map_err(|e| {
             CouldNotRun::Refused(format!("cannot create {}: {e}", world.log.display()))
         })?;
         let err = log
@@ -785,17 +792,19 @@ impl Ctl {
     }
 }
 
-/// The session's replay checks as `temporal status` counts them, `witnessed=<n> diverged=<n>` (`-` for a count it does not report).
-/// Folds `temporal` first so witnesses recorded during the row are judged before `temporal status` is read.
+/// The session's replay checks as `temporal status` counts them, `witnessed=<n> diverged=<n> pending=<n> unjudged_evicted=<n>` (`-` for a count it does not report).
+/// Runs `temporal judge` first so every witness recorded during the row and still kept is judged before `temporal status` is read.
 #[must_use]
 pub fn replay_checks(ctl: &Ctl) -> String {
-    let _ = ctl.call(&["temporal"]);
+    let _ = ctl.call(&["temporal", "judge"]);
     let reply = ctl.call(&["temporal", "status"]);
     let line = if reply.ok() { reply.line() } else { "" };
     format!(
-        "witnessed={} diverged={}",
+        "witnessed={} diverged={} pending={} unjudged_evicted={}",
         field(line, "witnessed").unwrap_or("-"),
-        field(line, "diverged").unwrap_or("-")
+        field(line, "diverged").unwrap_or("-"),
+        field(line, "pending").unwrap_or("-"),
+        field(line, "unjudged_evicted").unwrap_or("-")
     )
 }
 
@@ -1068,14 +1077,14 @@ mod tests {
     }
 
     #[test]
-    fn replay_checks_folds_temporal_before_reading_status() {
+    fn replay_checks_judges_before_reading_status() {
         let dir = aterm_tempfile::tempdir().expect("scratch");
         let log = dir.path().join("calls.log");
         let stand_in = dir.path().join("temporal-ctl");
         std::fs::write(
             &stand_in,
             format!(
-                "#!/bin/sh\nshift 5\necho \"$*\" >> '{}'\nif [ \"$*\" = 'temporal status' ]; then\n  echo 'OK recording=on witnessed=7 diverged=0'\nelse\n  echo 'OK states=3'\nfi\n",
+                "#!/bin/sh\nshift 5\necho \"$*\" >> '{}'\nif [ \"$*\" = 'temporal status' ]; then\n  echo 'OK recording=on witnessed=7 diverged=0 pending=0 unjudged_evicted=2'\nelse\n  echo 'OK judged=7 diverged=0 pending=0 unjudged_evicted=2'\nfi\n",
                 log.display()
             ),
         )
@@ -1091,10 +1100,13 @@ mod tests {
             home: PathBuf::from("/"),
             budget: Budget::from_now(60),
         };
-        assert_eq!(replay_checks(&ctl), "witnessed=7 diverged=0");
+        assert_eq!(
+            replay_checks(&ctl),
+            "witnessed=7 diverged=0 pending=0 unjudged_evicted=2"
+        );
         assert_eq!(
             std::fs::read_to_string(&log).expect("calls"),
-            "temporal\ntemporal status\n"
+            "temporal judge\ntemporal status\n"
         );
     }
 

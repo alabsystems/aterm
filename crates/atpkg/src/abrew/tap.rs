@@ -687,20 +687,26 @@ pub fn list(prefix: &Prefix) -> Vec<Tap> {
         return out;
     };
     for u in users.flatten() {
+        if !u.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Some(user) = u.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
         let Ok(repos) = std::fs::read_dir(u.path()) else {
             continue;
         };
         for r in repos.flatten() {
-            let fname = r.file_name().to_string_lossy().into_owned();
-            let user = u.file_name().to_string_lossy().into_owned();
-            if let Some(repo) = fname.strip_prefix("homebrew-")
+            if !r.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let fname = r.file_name();
+            if let Some(repo) = fname.to_str().and_then(|s| s.strip_prefix("homebrew-"))
                 && let Ok(path) = tap_path(prefix, &user, repo)
-                && u.file_type().is_ok_and(|t| t.is_dir())
-                && r.file_type().is_ok_and(|t| t.is_dir())
                 && std::fs::symlink_metadata(r.path().join(".git")).is_ok_and(|m| m.is_dir())
             {
                 out.push(Tap {
-                    user,
+                    user: user.clone(),
                     repo: repo.to_owned(),
                     path,
                 });
@@ -725,11 +731,25 @@ pub(super) fn setting_bool(prefix: &Prefix, name: &str) -> bool {
 }
 
 pub(super) fn set_setting_bool(prefix: &Prefix, name: &str, value: bool) -> Result<(), String> {
+    use std::io::Write as _;
     let path = prefix.root.join("var/homebrew").join(name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("abrew: {e}"))?;
     }
-    std::fs::write(&path, if value { "true" } else { "false" }).map_err(|e| format!("abrew: {e}"))
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut f = opts.open(&path).map_err(|e| format!("abrew: {e}"))?;
+    if !f.metadata().map_err(|e| format!("abrew: {e}"))?.is_file() {
+        return Err(format!("abrew: {} is not a regular file", path.display()));
+    }
+    f.set_len(0).map_err(|e| format!("abrew: {e}"))?;
+    f.write_all(if value { b"true" } else { b"false" })
+        .map_err(|e| format!("abrew: {e}"))
 }
 
 pub(super) fn completions_linked(prefix: &Prefix) -> bool {
@@ -887,19 +907,11 @@ fn report_link_conflicts(conflicts: &[PathBuf], command: &str) {
 /// Whether the one-time completions hint has been shown
 /// (brew's `completionsmessageshown` setting, same store).
 fn completions_message_shown(prefix: &Prefix) -> bool {
-    crate::metadata_io::read_bounded_regular_utf8(
-        &prefix.root.join("var/homebrew/completionsmessageshown"),
-        1024,
-    )
-    .is_ok_and(|v| v.trim() == "true")
+    setting_bool(prefix, "completionsmessageshown")
 }
 
 fn mark_completions_message_shown(prefix: &Prefix) {
-    let path = prefix.root.join("var/homebrew/completionsmessageshown");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, "true");
+    let _ = set_setting_bool(prefix, "completionsmessageshown", true);
 }
 
 /// Destination dirs for linked tap files, brew's layout.

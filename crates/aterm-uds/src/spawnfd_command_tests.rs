@@ -1636,6 +1636,264 @@ fn a_disclaimed_child_is_its_own_responsible_process() {
     );
 }
 
+/// The base priority the calling thread runs at once it asks for the default class (macOS's
+/// `pth_priority`, read for this thread by its id): 31 outside a band, 4 in the background band.
+#[cfg(target_vendor = "apple")]
+fn base_priority_at_the_default_class() -> i32 {
+    unsafe extern "C" {
+        fn pthread_threadid_np(thread: *mut core::ffi::c_void, id: *mut u64) -> libc::c_int;
+    }
+    /// `<sys/proc_info.h>`'s by-thread-id flavor of `PROC_PIDTHREADINFO`.
+    const PROC_PIDTHREADID64INFO: libc::c_int = 15;
+    // SAFETY: sets this thread's own class; takes no pointers.
+    let set =
+        unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_DEFAULT, 0) };
+    assert_eq!(set, 0, "this thread asks for the default class");
+    let mut id = 0u64;
+    // SAFETY: a null thread names the calling one; `id` is a writable slot.
+    assert_eq!(
+        unsafe { pthread_threadid_np(std::ptr::null_mut(), &mut id) },
+        0
+    );
+    let mut info = std::mem::MaybeUninit::<libc::proc_threadinfo>::uninit();
+    let size = libc::c_int::try_from(size_of::<libc::proc_threadinfo>()).expect("a small record");
+    // SAFETY: `info` is `size` writable bytes laid out as the record this flavor fills.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            PROC_PIDTHREADID64INFO,
+            id,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    assert_eq!(read, size, "this thread's record reads");
+    // SAFETY: the exact-size read initialized every (integer) field.
+    unsafe { info.assume_init() }.pth_priority
+}
+
+/// What a band READER (the calling test run again as its [`BAND_READER`] stage) said its thread
+/// runs at once it asks for the default class ([`base_priority_at_the_default_class`]), `who`
+/// naming it in a failure.
+#[cfg(target_vendor = "apple")]
+fn band_reader_reads(command: &mut Command, test: &str, who: &str) -> i32 {
+    let out = crate::deadline::ends_within(
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(STAGE_ENV, BAND_READER),
+        crate::deadline::ECHO_HANG,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the {who} reader: {:?}\nstdout: {stdout}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout
+        .lines()
+        .find_map(|line| line.split_once(BAND_READ).map(|(_, said)| said))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the {who} reader said no priority: {stdout}"))
+}
+
+/// The stage a band test runs as a [`band_reader_reads`] reader.
+#[cfg(target_vendor = "apple")]
+const BAND_READER: &str = "band-read";
+
+/// What a band reader prints before the priority it read.
+#[cfg(target_vendor = "apple")]
+const BAND_READ: &str = "BAND read default=";
+
+/// The calling band test's stage, if this process is one: a reader prints its priority and
+/// `true` comes back, the test's body done.
+#[cfg(target_vendor = "apple")]
+fn band_read_staged() -> bool {
+    if std::env::var(STAGE_ENV).as_deref() == Ok(BAND_READER) {
+        println!("{BAND_READ}{}", base_priority_at_the_default_class());
+        return true;
+    }
+    false
+}
+
+/// What a reader this test starts outside any band reads (31; under a clamp the test runs in,
+/// the clamp's, which a child keeps), which a band test compares with.
+#[cfg(target_vendor = "apple")]
+fn read_outside_any_band(test: &str) -> i32 {
+    let exe = std::env::current_exe().expect("the test binary");
+    let outside = band_reader_reads(&mut command(&exe), test, "outside");
+    assert!(
+        outside > 4,
+        "a reader this test starts runs outside the background band (it read {outside}), as \
+         this test needs to tell the band from outside it"
+    );
+    outside
+}
+
+/// A band stage's hang detector: the stage starts its two readers one after the other, each
+/// under its own [`ECHO_HANG`](crate::deadline::ECHO_HANG), so its own covers both readers and
+/// its own start. A stage held to one `ECHO_HANG` was cut off while its readers still ran, on a
+/// Mac with all 14 cores busy (2026-11-04).
+#[cfg(target_vendor = "apple")]
+const BAND_STAGE_HANG: Duration = Duration::from_secs(3 * crate::deadline::ECHO_HANG.as_secs());
+
+/// The stage `stage` of `test`, started by `command` (the test binary), and what its readers
+/// read: the line after `STAGED band `.
+#[cfg(target_vendor = "apple")]
+fn band_stage_says(command: &mut Command, test: &str, stage: &str) -> String {
+    let out = crate::deadline::ends_within(
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(STAGE_ENV, stage),
+        BAND_STAGE_HANG,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find_map(|line| {
+            line.split_once("STAGED band ")
+                .map(|(_, said)| said.to_owned())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the stage said nothing: {:?}\nstdout: {stdout}\nstderr: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+}
+
+/// A stage's two readers, a PLAIN one and one started with [`Command::leave_background_band`],
+/// printed as `STAGED band plain=<p> left=<p>`.
+#[cfg(target_vendor = "apple")]
+fn read_plain_and_left(test: &str) {
+    let exe = std::env::current_exe().expect("the test binary");
+    let plain = band_reader_reads(&mut command(&exe), test, "plain");
+    let left = band_reader_reads(
+        command(&exe).leave_background_band(true),
+        test,
+        "band-leaving",
+    );
+    println!("STAGED band plain={plain} left={left}");
+}
+
+/// **A CHILD STARTED OUT OF THE BACKGROUND BAND RUNS AT THE CLASS IT ASKS FOR.** This test
+/// binary, started IN the band ([`Command::enter_background_band`], the task type launchd starts a
+/// `Background` job as), is a STAGE that starts two READERS (this test again), each reading the
+/// priority its thread runs at once it asks for the default class: a PLAIN one, which stays in the
+/// band and reads 4 (the negative control, true only if the stage really was in it), and one
+/// started with [`Command::leave_background_band`], which reads what a reader this test starts
+/// outside any band reads ([`read_outside_any_band`]).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_child_started_out_of_the_background_band_runs_at_the_class_it_asks_for() {
+    const NAME: &str = "spawnfd::command_tests::a_child_started_out_of_the_background_band_runs_at_the_class_it_asks_for";
+    const STAGE: &str = "band";
+    if band_read_staged() {
+        return;
+    }
+    if std::env::var(STAGE_ENV).as_deref() == Ok(STAGE) {
+        read_plain_and_left(NAME);
+        return;
+    }
+    let outside = read_outside_any_band(NAME);
+    let exe = std::env::current_exe().expect("the test binary");
+    assert_eq!(
+        band_stage_says(command(&exe).enter_background_band(), NAME, STAGE),
+        format!("plain=4 left={outside}"),
+        "CONTROL: a plain child of the band stays in it (4); a child started out of it reads \
+         what one outside any band reads ({outside})"
+    );
+}
+
+/// **A PROCESS THAT STARTS ITS CHILDREN IN THE BACKGROUND BAND STARTS EACH THERE, BUT ONE TOLD TO
+/// LEAVE IT.** This test binary, started outside any band, is a STAGE that calls
+/// [`start_children_in_background_band`] and starts two READERS: a PLAIN one, which reads 4, the
+/// band's priority, and one started with [`Command::leave_background_band`], which reads what a
+/// reader this test starts outside any band reads. NEGATIVE CONTROL: with the stage's call taken
+/// out, its plain reader reads the outside value too, and this fails.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_process_that_starts_its_children_in_the_band_starts_each_there_but_one_told_to_leave() {
+    const NAME: &str = "spawnfd::command_tests::a_process_that_starts_its_children_in_the_band_starts_each_there_but_one_told_to_leave";
+    const STAGE: &str = "children";
+    if band_read_staged() {
+        return;
+    }
+    if std::env::var(STAGE_ENV).as_deref() == Ok(STAGE) {
+        start_children_in_background_band();
+        read_plain_and_left(NAME);
+        return;
+    }
+    let outside = read_outside_any_band(NAME);
+    let exe = std::env::current_exe().expect("the test binary");
+    assert_eq!(
+        band_stage_says(&mut command(&exe), NAME, STAGE),
+        format!("plain=4 left={outside}"),
+        "a plain child of a process that starts its children in the band runs there (4); one \
+         told to leave it reads what one outside any band reads ({outside})"
+    );
+}
+
+/// **A CHILD OF THE BACKGROUND BAND RUNS EVERY THREAD AT 4, AND ONE STARTED AS AN INTERACTIVE
+/// DAEMON LEAVES THE BAND, READ FROM OUTSIDE EACH.** This test binary, started IN the band
+/// ([`Command::enter_background_band`], the task type launchd starts a `Background` job as), is a
+/// STAGE that starts two `cat` stand-ins, a PLAIN one and one with
+/// [`Command::start_as_interactive_daemon`] (an `Interactive` job's), each shown to have run by a
+/// line it echoed, and reads each one's threads by pid ([`crate::qos::thread_base_priorities`])
+/// while they wait on their input. The plain one reads 4 on every thread, and the interactive
+/// one's highest reads what a reader this test starts outside any band reads. NEGATIVE CONTROL:
+/// the plain reading is true only if the stage was in the band, and it is what an interactive
+/// builder that set no type would read, so either builder made a no-op fails; a reader that read
+/// nothing of the child fails one of the two. A thread's priority does not tell an interactive
+/// daemon from a standard one, so this shows the type leaves the band and no more.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_child_of_the_band_reads_4_and_one_started_as_an_interactive_daemon_leaves_it() {
+    const NAME: &str = "spawnfd::command_tests::a_child_of_the_band_reads_4_and_one_started_as_an_interactive_daemon_leaves_it";
+    const STAGE: &str = "interactive";
+    if band_read_staged() {
+        return;
+    }
+    if std::env::var(STAGE_ENV).as_deref() == Ok(STAGE) {
+        let cat = crate::deadline::stand_in(Path::new("/bin/cat"));
+        let read = |cmd: &mut Command, who: &str| -> Vec<i32> {
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|e| panic!("start the {who} cat: {e}"));
+            let input = crate::deadline::cat_echoes(&mut child);
+            let pid = i32::try_from(child.id()).expect("a pid");
+            let read = crate::qos::thread_base_priorities(pid);
+            drop(input);
+            let status = child.wait().expect("the cat's exit");
+            assert!(status.success(), "the {who} cat: {status:?}");
+            let mut read = read
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| panic!("the {who} cat's threads read nothing"));
+            read.sort_unstable();
+            read.dedup();
+            read
+        };
+        let plain = read(&mut command(&cat), "plain");
+        let interactive = read(command(&cat).start_as_interactive_daemon(), "interactive");
+        println!(
+            "STAGED band plain={plain:?} interactive={:?}",
+            interactive.last()
+        );
+        return;
+    }
+    let outside = read_outside_any_band(NAME);
+    let exe = std::env::current_exe().expect("the test binary");
+    assert_eq!(
+        band_stage_says(command(&exe).enter_background_band(), NAME, STAGE),
+        format!("plain=[4] interactive=Some({outside})"),
+        "CONTROL: every thread of a plain child of the band stays in it (4); the highest of one \
+         started as an interactive daemon reads what one outside any band reads ({outside})"
+    );
+}
+
 #[test]
 fn a_disclaim_the_os_cannot_honour_starts_nothing() {
     const ABSENT: &core::ffi::CStr = c"responsibility_spawnattrs_setdisclaim_absent";
@@ -1781,10 +2039,19 @@ fn an_exec_hands_over_a_close_on_exec_source() {
 /// refuses its exec (`ETXTBSY`) while anything holds it open for writing — a child another
 /// thread forked while it was being written holds that descriptor until its own exec — and
 /// the spawn tries again after the pause between tries, here the moment this test's writer
-/// lets go.
+/// lets go. A tethered spawn forks each try on a spawner and pauses on the calling thread, so
+/// it starts the same way.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_spawn_refused_as_text_busy_starts_once_the_writer_lets_go() {
+    for tethered in [false, true] {
+        starts_once_the_writer_lets_go(tethered);
+    }
+}
+
+/// [`a_spawn_refused_as_text_busy_starts_once_the_writer_lets_go`], its spawns `tethered` or not.
+#[cfg(target_os = "linux")]
+fn starts_once_the_writer_lets_go(tethered: bool) {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
     let path = dir.path().join("busy");
@@ -1801,24 +2068,293 @@ fn a_spawn_refused_as_text_busy_starts_once_the_writer_lets_go() {
             drop(writer);
         }));
     });
-    let status = command(&path)
+    let busy = || {
+        let mut busy = command(&path);
+        if tethered {
+            busy.tether();
+        }
+        busy
+    };
+    let status = busy()
         .status()
-        .expect("started once the writer let go");
-    assert_eq!(status.code(), Some(7));
+        .unwrap_or_else(|e| panic!("started once the writer let go (tethered: {tethered}): {e}"));
+    assert_eq!(status.code(), Some(7), "tethered: {tethered}");
     assert!(
         tried_again.load(std::sync::atomic::Ordering::SeqCst),
-        "the first try was refused and the spawn paused"
+        "the first try was refused and the spawn paused (tethered: {tethered})"
     );
     let _stays = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .expect("a writer that stays");
-    let refused = command(&path)
-        .status()
-        .expect_err("refused once the window passed");
+    let refused = busy().status().expect_err("refused once the window passed");
     assert_eq!(
         refused.kind(),
         io::ErrorKind::ExecutableFileBusy,
-        "{refused}"
+        "tethered: {tethered}: {refused}"
+    );
+}
+
+/// What a tethered stage says of its child once the thread that spawned it is gone, after this
+/// mark: `alive <token>` or `gone`; and `exec` from the image an exec put in a stage's place.
+#[cfg(target_os = "linux")]
+const TIED_SAID: &str = "STAGED tied ";
+
+/// A group a stage of this test leads, with the stage, its leader, held unreaped until the group
+/// holds no live process: the unreaped leader keeps its pid, and with it the group's number, from
+/// being reused, so a signal to the group reaches the stage's own. Dropped with its leader
+/// unreaped, it `SIGKILL`s the group and reaps the leader, so a failing run leaves nothing the
+/// stage started.
+#[cfg(target_os = "linux")]
+struct StageGroup {
+    leader: Child,
+    reaped: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl StageGroup {
+    /// `SIGKILL` the leader alone, leaving it unreaped.
+    fn kill_leader(&mut self) {
+        self.leader.kill().expect("SIGKILL the stage");
+    }
+
+    /// Waits until the group holds no live process ([`crate::process::group_members`], which
+    /// skips a zombie: the unreaped leader's, or an orphan's its new parent has not reaped), then
+    /// reaps the leader and answers how it ended; `None` when a live member was still there after
+    /// `hang`.
+    fn empties_within(&mut self, hang: Duration) -> Option<std::process::ExitStatus> {
+        let pgid = self.leader.id();
+        let since = Instant::now();
+        while !crate::process::group_members(pgid).is_some_and(|members| members.pids.is_empty()) {
+            if since.elapsed() >= hang {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.reaped = true;
+        Some(self.leader.wait().expect("reap the stage"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StageGroup {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // The leader is unreaped, so the group's number is still its own.
+            if let Ok(pgid) = i32::try_from(self.leader.id()) {
+                let _ = crate::process::kill_group_until_empty(pgid);
+            }
+            let _ = self.leader.wait();
+        }
+    }
+}
+
+/// The stage: spawn a tethered `sh` from a thread, join it, wait until the kernel has let that
+/// thread's task go (its exit sends the parent-death signal first, and `join` can return before
+/// it), then ask the `sh` for a line. `alive <token>` when it answered, else `gone`.
+#[cfg(target_os = "linux")]
+fn tied_child_after_its_thread(on_its_thread: bool, hang: Duration) -> String {
+    use std::io::BufRead as _;
+    let spawning = std::thread::spawn(move || {
+        // SAFETY: `gettid` takes no argument and cannot fail.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        let mut sh = command("/bin/sh");
+        sh.args(["-c", "read line; echo got; exec sleep 600"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .tether();
+        if on_its_thread {
+            sh.tie_to_this_thread();
+        }
+        (tid, sh.spawn().expect("spawn the tethered sh"))
+    });
+    let (tid, mut child) = spawning.join().expect("the spawning thread");
+    let task = PathBuf::from(format!("/proc/self/task/{tid}"));
+    let since = Instant::now();
+    while task.exists() {
+        assert!(
+            since.elapsed() < hang,
+            "the spawning thread's task {} never went",
+            task.display()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let pid = i32::try_from(child.id()).expect("a pid");
+    let mut stdin = child.stdin.take().expect("its stdin");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("its stdout"));
+    // A child that is gone refuses the line (`EPIPE`) and its stdout reads end-of-file.
+    let _ = stdin.write_all(b"go\n");
+    let mut line = String::new();
+    let _ = stdout.read_line(&mut line);
+    if line != "got\n" {
+        return "gone".to_owned();
+    }
+    let identity = crate::process::read_identity(pid).expect("the child that answered reads");
+    format!("alive {}", identity.token())
+}
+
+/// The stage's lifeline: the parent holds its stdin, so it reads end-of-file once the parent is
+/// gone, however that ended.
+#[cfg(target_os = "linux")]
+fn until_the_parent_is_gone() {
+    let _ = std::io::stdin().read_to_end(&mut Vec::new());
+}
+
+/// This test binary run as the stage `stage` of test `name`, in a group of its own, its stdin
+/// held here as its lifeline, and each word it says after [`TIED_SAID`].
+#[cfg(target_os = "linux")]
+fn tied_stage(name: &str, stage: &str) -> (StageGroup, std::sync::mpsc::Receiver<String>) {
+    use std::io::BufRead as _;
+    let mut leader = command(std::env::current_exe().expect("the test binary"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(STAGE_ENV, stage)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("re-run this test binary as the stage");
+    let out = std::io::BufReader::new(leader.stdout.take().expect("the stage's stdout"));
+    let (said, words) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in out.lines().map_while(Result::ok) {
+            if let Some((_, word)) = line.split_once(TIED_SAID)
+                && said.send(word.to_owned()).is_err()
+            {
+                return;
+            }
+        }
+    });
+    (
+        StageGroup {
+            leader,
+            reaped: false,
+        },
+        words,
+    )
+}
+
+/// The token after `alive ` in `word`, a stage's word of its child.
+#[cfg(target_os = "linux")]
+fn alive(word: &str) -> Option<crate::process::Identity> {
+    word.strip_prefix("alive ")
+        .and_then(crate::process::Identity::parse)
+}
+
+/// Waits until `identity`'s pid no longer reads it, within `hang`; `what` says what should have
+/// ended it.
+#[cfg(target_os = "linux")]
+fn ends_within(identity: crate::process::Identity, hang: Duration, what: &str) {
+    let since = Instant::now();
+    while crate::process::read_identity(identity.pid) == Some(identity) {
+        assert!(
+            since.elapsed() < hang,
+            "the tethered child {} outlived {what}",
+            identity.token()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// On Linux a tethered child outlives the thread that spawned it, since its fork ran on one of
+/// the tether's spawners, and ends with its process: it still runs while its stage, the process
+/// that spawned it, does, and once the stage is `SIGKILL`ed its pid no longer reads its token.
+/// The control ties the child to its spawning thread (`tie_to_this_thread`), and it is gone once
+/// that thread is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_linux_child_outlives_its_spawning_thread_but_not_its_process() {
+    const NAME: &str =
+        "spawnfd::command_tests::a_linux_child_outlives_its_spawning_thread_but_not_its_process";
+    const ON_THE_SPAWNER: &str = "tied-on-the-spawner";
+    const ON_ITS_THREAD: &str = "tied-on-its-thread";
+    let hang = Duration::from_secs(60);
+    match std::env::var(STAGE_ENV).as_deref() {
+        Ok(ON_THE_SPAWNER) => {
+            println!("{TIED_SAID}{}", tied_child_after_its_thread(false, hang));
+            until_the_parent_is_gone();
+            return;
+        }
+        Ok(ON_ITS_THREAD) => {
+            println!("{TIED_SAID}{}", tied_child_after_its_thread(true, hang));
+            return;
+        }
+        Ok(_) => return,
+        Err(_) => {}
+    }
+
+    let (mut group, words) = tied_stage(NAME, ON_THE_SPAWNER);
+    let word = words
+        .recv_timeout(hang)
+        .expect("the stage said nothing of its child in a minute");
+    let Some(identity) = alive(&word) else {
+        panic!("a child forked on the spawner is alive after its spawning thread: {word:?}");
+    };
+    assert_eq!(
+        crate::process::read_identity(identity.pid),
+        Some(identity),
+        "the tethered child still runs while its process does"
+    );
+    group.kill_leader();
+    ends_within(identity, hang, "its SIGKILLed process");
+    assert!(
+        group.empties_within(hang).is_some(),
+        "the stage's group still holds a process"
+    );
+
+    let (mut group, words) = tied_stage(NAME, ON_ITS_THREAD);
+    let word = words
+        .recv_timeout(hang)
+        .expect("the control stage said nothing of its child in a minute");
+    assert_eq!(
+        word, "gone",
+        "CONTROL: a child tied to its spawning thread is gone once that thread is"
+    );
+    let status = group
+        .empties_within(hang)
+        .expect("the control stage's group still holds a process");
+    assert!(status.success(), "the control stage: {status:?}");
+}
+
+/// On Linux an exec in a process's place ends its tethered children: the exec ends every other
+/// thread, the spawner that forked each child among them, and with it sends the parent-death
+/// signal. The stage says its child still runs just before its exec; the image the exec put in
+/// its place says `exec`, and the child's pid then stops reading its token.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_linux_exec_in_place_ends_a_tethered_child() {
+    const NAME: &str = "spawnfd::command_tests::a_linux_exec_in_place_ends_a_tethered_child";
+    const ACROSS_AN_EXEC: &str = "tied-across-an-exec";
+    let hang = Duration::from_secs(60);
+    match std::env::var(STAGE_ENV).as_deref() {
+        Ok(ACROSS_AN_EXEC) => {
+            let word = tied_child_after_its_thread(false, hang);
+            let runs = alive(&word).is_some_and(|identity| {
+                crate::process::read_identity(identity.pid) == Some(identity)
+            });
+            println!("{TIED_SAID}{}", if runs { word.as_str() } else { "gone" });
+            let replaced = format!("echo '{TIED_SAID}exec'; read line");
+            let error = command("/bin/sh").args(["-c", &replaced]).exec();
+            panic!("the exec in the stage's place: {error}");
+        }
+        Ok(_) => return,
+        Err(_) => {}
+    }
+
+    let (mut group, words) = tied_stage(NAME, ACROSS_AN_EXEC);
+    let word = words
+        .recv_timeout(hang)
+        .expect("the stage said nothing of its child in a minute");
+    let Some(identity) = alive(&word) else {
+        panic!("a tethered child runs until its process's exec: {word:?}");
+    };
+    let word = words
+        .recv_timeout(hang)
+        .expect("the image the exec put in the stage's place said nothing in a minute");
+    assert_eq!(word, "exec", "the image the exec put in the stage's place");
+    ends_within(identity, hang, "its process's exec");
+    group.kill_leader();
+    assert!(
+        group.empties_within(hang).is_some(),
+        "the stage's group still holds a process"
     );
 }

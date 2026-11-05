@@ -617,6 +617,26 @@ pub const EXPIRY_MELT_GAMMA: f32 = 1.6;
 /// The coverage share the run's outer tail boundary keeps, ramping to full across the tail cell, so the oldest edge feathers out.
 pub const RUN_TAIL_EASE: f32 = 0.10;
 
+/// The cells over which a run the quad budget cuts thins to [`RUN_TAIL_EASE`] at the cut, so the
+/// end the budget chose is a feather like the end the band chose ([`Ribbon::lay_capped`]). Six,
+/// fitted against the two steps the asserts below hold: the baseline strip rides the same ramp, so
+/// each level of it prints `1 + STRIP_LIFT_GAIN` levels, and at four or five cells the first steps
+/// read as an edge.
+pub const BUDGET_FEATHER_CELLS: usize = 6;
+
+const _: () = assert!(
+    (1.0 - RUN_TAIL_EASE) / BUDGET_FEATHER_CELLS as f32 * (1.0 + STRIP_LIFT_GAIN) * UNDER_COV_CAP
+        <= 60.0,
+    "the budget feather's step from one column to the next must stay under 60 levels"
+);
+const _: () = assert!(
+    (RUN_TAIL_EASE + (1.0 - RUN_TAIL_EASE) / (2.0 * BUDGET_FEATHER_CELLS as f32))
+        * (1.0 + STRIP_LIFT_GAIN)
+        * UNDER_COV_CAP
+        <= 60.0,
+    "the budget feather's first printed column, a slab's centre, must stay under 60 levels"
+);
+
 /// The instant a cell's expiry is measured from.
 #[inline]
 #[must_use]
@@ -9130,11 +9150,17 @@ impl Ribbon {
                 };
                 let mut complete = lay.lay(out, clip, &verts, stride, budget);
                 let head = verts.len().saturating_sub(1 + head_rev);
-                if !complete && head + 1 < verts.len() {
+                if !complete {
                     out.truncate(start);
                     verts.reverse();
                     complete = Self::repaint_capped_run_from_head(
-                        out, clip, &mut verts, head, lay, stride, budget,
+                        out,
+                        clip,
+                        &mut verts,
+                        head,
+                        lay,
+                        (stride, budget),
+                        BUDGET_FEATHER_CELLS as f32 * ctx.geom.cw as f32,
                     );
                 }
                 let end = out.mark();
@@ -9370,14 +9396,59 @@ impl Ribbon {
         verts: &mut [RibbonVertex],
         head: usize,
         lay: BodyLay,
-        stride: usize,
-        budget: usize,
+        priced: (usize, usize),
+        feather_px: f32,
     ) -> bool {
         debug_assert!(head < verts.len());
         verts[..=head].reverse();
-        let left_complete = lay.lay(out, clip, &verts[..=head], stride, budget);
+        let left_complete =
+            Self::lay_capped(out, clip, &mut verts[..=head], lay, priced, feather_px);
         verts[..=head].reverse();
-        left_complete && lay.lay(out, clip, &verts[head..], stride, budget)
+        left_complete && Self::lay_capped(out, clip, &mut verts[head..], lay, priced, feather_px)
+    }
+
+    /// Lays `verts` in order, or as many as `priced` (the stride and the budget) carries whole, the
+    /// last of them thinned over `feather_px` to [`RUN_TAIL_EASE`] so the cut reads as the band
+    /// thinning away. `false` where it cut. Each segment is laid to learn the price, as the sink
+    /// folds rows; thinning can only drop a row, so what fit still fits.
+    #[inline]
+    fn lay_capped(
+        out: &mut RampSink<'_>,
+        clip: BeamClip,
+        verts: &mut [RibbonVertex],
+        lay: BodyLay,
+        (stride, budget): (usize, usize),
+        feather_px: f32,
+    ) -> bool {
+        let start = out.mark();
+        let mut fit = 1;
+        while fit < verts.len() && lay.lay(out, clip, &verts[fit - 1..=fit], stride, budget) {
+            fit += 1;
+        }
+        if fit >= verts.len() {
+            return true;
+        }
+        out.truncate(start);
+        Self::thin_toward_cut(&mut verts[..fit], feather_px);
+        let _ = lay.lay(out, clip, &verts[..fit], stride, budget);
+        false
+    }
+
+    /// Thins `verts` toward its last, the cut, over `feather_px` or the whole span where that is
+    /// shorter: its first stays whole, since a run's head is shared with the half laid before it.
+    #[inline]
+    fn thin_toward_cut(verts: &mut [RibbonVertex], feather_px: f32) {
+        let (Some(first), Some(last)) = (verts.first(), verts.last()) else {
+            return;
+        };
+        let cut = last.x;
+        let feather = feather_px.min((first.x - cut).abs()).max(1.0);
+        for vertex in verts {
+            let inward = ((vertex.x - cut).abs() / feather).min(1.0);
+            let share = RUN_TAIL_EASE + (1.0 - RUN_TAIL_EASE) * inward;
+            vertex.cov *= share;
+            vertex.lift *= share;
+        }
     }
 
     /// How many of the last frame's ribbon quads read as band ink on the glass.
@@ -22520,7 +22591,7 @@ mod tests {
         owner_frame(&mut rib, &mut sink, &c, at(t0, ms - 20 + 100), col, 0.7);
         assert_eq!(rib.slabs_per_cell(), 1, "327 retina cells plan at one slab");
         assert!(
-            sink.under.len() + 2 > RIBBON_QUAD_BUDGET - 200,
+            sink.under.len() + 2 > RIBBON_QUAD_BUDGET - 400,
             "the frame is at the budget's edge: {} quads",
             sink.under.len()
         );
@@ -22596,11 +22667,85 @@ mod tests {
         let mut sink = Sink::default();
         rib.emit(&cx, &mut sink.frame());
         assert!(
-            sink.under.len() + 2 >= RIBBON_QUAD_BUDGET,
+            sink.under.len() + 2 * g.ch >= RIBBON_QUAD_BUDGET,
             "precondition: the real quad ceiling was reached ({})",
             sink.under.len()
         );
         (sink.under, g.cw as u16)
+    }
+
+    /// A frame out of budget ends the run it cuts in a feather. The beam's own stop, handed the
+    /// whole run, printed a step of the whole band's light in one column.
+    #[test]
+    fn a_cut_near_the_head_leaves_the_head_whole() {
+        let vertex = |x: f32| RibbonVertex {
+            x,
+            spine: 0.0,
+            up: 1.0,
+            dn: 1.0,
+            core_up: 0.0,
+            core_dn: 0.0,
+            color: 0,
+            cov: 200.0,
+            lift: 100.0,
+            lift_span: 1.0,
+        };
+        let near = [100.0, 110.0, 120.0];
+        let mut verts = near.map(vertex);
+        Ribbon::thin_toward_cut(&mut verts, 60.0);
+        assert_eq!(
+            verts[0].cov, 200.0,
+            "the head is shared with the other half"
+        );
+        assert_eq!(
+            verts[0].lift, 100.0,
+            "the head is shared with the other half"
+        );
+        assert!(verts[0].cov > verts[1].cov && verts[1].cov > verts[2].cov);
+        assert!((verts[2].cov - 200.0 * RUN_TAIL_EASE).abs() < 1e-3);
+        let far = [100.0, 150.0, 200.0];
+        let mut verts = far.map(vertex);
+        Ribbon::thin_toward_cut(&mut verts, 60.0);
+        assert_eq!(verts[0].cov, 200.0, "beyond the feather nothing thins");
+        assert!(verts[1].cov < 200.0 && verts[1].cov > verts[2].cov);
+    }
+
+    #[test]
+    fn a_capped_runs_cut_end_is_a_feather_not_a_cliff() {
+        for (what, head_col, head, stream_dir) in [
+            ("a leftward wake", 0u16, 0usize, 1i8),
+            ("a midline edit", 30, 31, -1),
+        ] {
+            let (quads, cw) = capped_wide_run(head_col, head, stream_dir);
+            let cw = usize::from(cw);
+            let mut light = vec![0u8; 180 * cw];
+            for quad in &quads {
+                for x in usize::from(quad.x)..usize::from(quad.x) + usize::from(quad.w) {
+                    if let Some(at) = light.get_mut(x) {
+                        *at = (*at).max(quad.alpha.max(quad.alpha2));
+                    }
+                }
+            }
+            let last = light
+                .iter()
+                .rposition(|&level| level > 0)
+                .expect("the frame laid light");
+            assert!(last < 178 * cw, "{what}: the distant tail paid the budget");
+            let tail = &light[last + 1 - (BUDGET_FEATHER_CELLS + 2) * cw..=last];
+            assert!(
+                tail.windows(2).all(|pair| pair[0].abs_diff(pair[1]) <= 60),
+                "{what}: a step of over 60 levels in {tail:?}"
+            );
+            assert!(
+                light[last] <= 60,
+                "{what}: the cut lands on {}",
+                light[last]
+            );
+            assert!(
+                tail[..cw].iter().all(|&level| level >= 150),
+                "{what}: a feather, whole light inward of it: {tail:?}"
+            );
+        }
     }
 
     #[test]
@@ -22657,7 +22802,7 @@ mod tests {
         let mut sink = Sink::default();
         rib.emit(&cx, &mut sink.frame());
         assert!(
-            sink.under.len() + 2 >= RIBBON_QUAD_BUDGET,
+            sink.under.len() + 2 * g.ch >= RIBBON_QUAD_BUDGET,
             "precondition: body plus rail must fill the budget ({})",
             sink.under.len()
         );

@@ -144,7 +144,7 @@ impl Receipt {
             use std::os::unix::fs::OpenOptionsExt as _;
             options
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
         let mut file = options.open(&staged)?;
         let written = file.write_all(text.as_bytes()).and_then(|()| {
@@ -219,7 +219,7 @@ impl Receipt {
             use std::os::unix::fs::OpenOptionsExt as _;
             options
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
         let mut file = options.open(&self.path)?;
         file.write_all(self.text.as_bytes())?;

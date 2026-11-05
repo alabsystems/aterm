@@ -284,7 +284,7 @@ fn sync_node_installs_respects_off_and_fleet_leave_removes_job() {
     let config = tmp.path().join("aterm.toml");
     let prog = tmp.path().join("aterm-bin");
     std::fs::write(&prog, b"stub").unwrap();
-    std::fs::write(&config, "[fleet]\nlisten = \"0.0.0.0:7100\"\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[fleet]\nlisten = \"0.0.0.0:7100\"\n", 0o600).unwrap();
     let sup = FakeSupervisor::new(None);
 
     // Without fleet.key, sync.node is NotApplicable.
@@ -704,7 +704,7 @@ fn sync_node_is_due_for_a_fleet_formed_after_a_leave() {
     let config = tmp.path().join("aterm.toml");
     let prog = tmp.path().join("aterm-bin");
     std::fs::write(&prog, b"stub").unwrap();
-    std::fs::write(&config, "[fleet]\nlisten = \"0.0.0.0:7100\"\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[fleet]\nlisten = \"0.0.0.0:7100\"\n", 0o600).unwrap();
     aterm_uds::private_file::ensure_private_dir(&state).unwrap();
     std::fs::write(state.join(aterm_net::fleet_member::OFF_FILE), b"").unwrap();
     let sup = FakeSupervisor::new(None);
@@ -995,7 +995,7 @@ fn sync_node_renews_a_replaced_build_and_moves_a_misplaced_job() {
     let config = tmp.path().join("aterm.toml");
     let prog = tmp.path().join("aterm-bin");
     std::fs::write(&prog, b"stub").unwrap();
-    std::fs::write(&config, "[fleet]\nlisten = \"0.0.0.0:7100\"\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[fleet]\nlisten = \"0.0.0.0:7100\"\n", 0o600).unwrap();
     aterm_uds::private_file::ensure_private_dir(&state).unwrap();
     {
         use std::io::Write as _;
@@ -1050,7 +1050,7 @@ fn rewrites_the_unit(earlier: impl Fn(&Path, &Path, &Path) -> String) {
     let config = tmp.path().join("aterm.toml");
     let prog = tmp.path().join("aterm-bin");
     std::fs::write(&prog, b"stub").unwrap();
-    std::fs::write(&config, "[fleet]\nlisten = \"0.0.0.0:7100\"\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[fleet]\nlisten = \"0.0.0.0:7100\"\n", 0o600).unwrap();
     aterm_uds::private_file::ensure_private_dir(&state).unwrap();
     {
         use std::io::Write as _;

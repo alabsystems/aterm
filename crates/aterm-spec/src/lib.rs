@@ -17,6 +17,7 @@ extern crate self as aterm_spec;
 #[cfg(feature = "anchors")]
 pub use aterm_spec_macros::{liveness, model, ty_model};
 
+mod bound_projection;
 pub mod check;
 mod compiled;
 pub mod derive;

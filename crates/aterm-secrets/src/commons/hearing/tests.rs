@@ -44,6 +44,27 @@ fn a_version_report_verifies_only_as_its_signer_wrote_it() {
     assert!(reported(&wire[..REPORT_LEN - 1], TRUST.network, &actor).is_err());
 }
 
+/// An actor whose writer key is of small order reports no version: the identity's forgery, which
+/// ring alone takes for every message, is no report of [`LIFTED`].
+///
+/// NEGATIVE CONTROL: `ed25519::verifies` through ring's `UnparsedPublicKey`: the forged report
+/// reads as `LIFTED`.
+#[test]
+fn a_small_order_key_reports_no_version() {
+    use crate::ed25519::{FORGED, SMALL_ORDER_KEY};
+    let (binding, _) = member(1);
+    let mut actor = binding.actor();
+    actor[..32].copy_from_slice(&SMALL_ORDER_KEY);
+    let mut wire = b"ACV1".to_vec();
+    wire.extend_from_slice(&LIFTED.bytes());
+    wire.extend_from_slice(&FORGED);
+    assert_eq!(wire.len(), REPORT_LEN);
+    let error = reported(&wire, TRUST.network, &actor)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error, "Commons version report signature did not verify");
+}
+
 #[test]
 fn versions_read_their_release_and_order_by_it() {
     assert_eq!(Version::parse("0.146.0+g1a2b3c"), Some(LIFTED));

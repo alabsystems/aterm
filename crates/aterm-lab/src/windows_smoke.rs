@@ -277,8 +277,8 @@ fn arch_rows(up: &Up, arch: Arch, repo: &Path, results: &Path) -> Vec<Row> {
         copied_frame(&detail, &local, &copied)
     });
     if verdict.is_err() {
-        let _ = std::fs::write(
-            results.join(format!("{}-session.txt", arch.name())),
+        let _ = crate::util::write_fresh(
+            &results.join(format!("{}-session.txt", arch.name())),
             &session.text,
         );
     }
@@ -350,7 +350,7 @@ pub fn cmd_smoke(args: &[String]) -> Res {
         report.push('\n');
     }
     let path = results.join("smoke.txt");
-    let _ = std::fs::write(&path, &report);
+    let _ = crate::util::write_out(&path, report.as_bytes());
     println!("windows: report {}", path.display());
     windows::released(i32::from(failed > 0), cleanup)
 }

@@ -248,7 +248,7 @@ None remain (the 4 historical non-spec tests were deleted during the 2026-10-16.
 2. ~~**A source-text census stands in for a behavioural spec.**~~ Fixed: `sink::every_production_master_write_is_ledgered`
    (an `include_str!` line count) is gone; `Shared::ledgered` and `Shared::ledgered_nonparking` write the
    bracket around every production master write, so `sink-ledger-complete` holds by construction.
-3. ~~**A heap-plateau sampler in `tests/spill_bound.rs`.**~~ Fixed: `tests/spill_bound.rs` now synchronizes deterministically on `Seam::{DrainPark, FrameLock, SpillCapPark}`, asserts `SinkWriter::SPILL_CAP <= sink.spilled_bytes() <= SinkWriter::SPILL_CAP + FRAME + 12` alongside the heap ceiling, and severs/joins the producer and pipe descriptors cleanly.
+3. ~~**A heap-plateau sampler in `tests/spill_bound.rs`.**~~ Fixed: `tests/spill_bound.rs` synchronizes on `Seam::SpillCapPark` and reads `|Spill|` there, under the spill's lock, asserting `SinkWriter::SPILL_CAP < |Spill| <= SinkWriter::SPILL_CAP + FRAME + 12` where the producer parks and the upper bound again afterwards, alongside the heap ceiling; it severs/joins the producer and pipe descriptors cleanly. A read after the park is no lower bound: a macOS pipe's buffer can grow, and the drainer then completes chunks under the cap.
 4. ~~**A timing-dependent precondition.**~~ Fixed: `sink::a_stop_reaches_a_paste_parked_on_a_tty_that_is_not_draining`
    synchronizes deterministically on `Seam::WriterPark` (`parked_after(&parks)`) before requesting a stop.
 5. ~~**A test-only accessor.**~~ Fixed 2026-10-28: `WriteReceiptError::accepted()` (`#[cfg(test)]`) is removed;

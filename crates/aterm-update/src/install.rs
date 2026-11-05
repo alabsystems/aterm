@@ -43,16 +43,28 @@ impl IsolatedCopy {
             .mode(0o700)
             .create(&root)
             .map_err(|error| format!("create isolated copy directory: {error}"))?;
-        if let Err(error) = std::fs::write(root.join("copy-layout"), "aterm-copy-v1\n") {
+        if let Err(error) = write_isolated_marker(&root.join("copy-layout"), "aterm-copy-v1\n") {
             let _ = std::fs::remove_dir(&root);
             return Err(format!("record isolated copy layout: {error}"));
         }
-        let _ = std::fs::write(root.join(COPY_OWNER), format!("{}\n", std::process::id()));
+        let _ = write_isolated_marker(&root.join(COPY_OWNER), &format!("{}\n", std::process::id()));
         Ok(Self {
             payload: root.join("payload"),
             root,
         })
     }
+}
+
+fn write_isolated_marker(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    f.write_all(text.as_bytes())
 }
 
 const COPY_OWNER: &str = "owner";
@@ -107,20 +119,24 @@ pub(crate) fn reap_abandoned_copy_attempts(parent: &Path) {
         if !aterm_codec::hex::is_hex(nonce, 32) {
             continue;
         }
-        let root = entry.path();
-        let Ok(metadata) = std::fs::symlink_metadata(&root) else {
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
             continue;
         };
+        let root = entry.path();
         if !metadata.is_dir()
             || metadata.uid() != owner
             || metadata.permissions().mode() & 0o077 != 0
+            || !copy_attempt_lapsed(&root)
             || crate::read_ledger_text(&root.join("copy-layout")).as_deref()
                 != Some("aterm-copy-v1\n")
         {
             continue;
         }
         let abandoned = crate::read_ledger_text(&root.join("abandoned")).as_deref() == Some("1\n");
-        if copy_attempt_lapsed(&root) && (abandoned || copy_owner_gone(&root)) {
+        if abandoned || copy_owner_gone(&root) {
             let _ = std::fs::remove_dir_all(&root);
         }
     }
@@ -145,7 +161,7 @@ fn copy_into_isolated_destination(
     let result = match completed {
         Err(failure) if failure.writer_stopped => Err(failure.message),
         Err(failure) => {
-            let marker_error = std::fs::write(attempt.root.join("abandoned"), "1\n")
+            let marker_error = write_isolated_marker(&attempt.root.join("abandoned"), "1\n")
                 .err()
                 .map(|error| format!("; could not mark abandoned copy: {error}"))
                 .unwrap_or_default();
@@ -302,12 +318,14 @@ fn tree_bytes(root: &Path) -> u64 {
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else {
+            let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            if meta.is_dir() {
+            if kind.is_dir() {
                 stack.push(entry.path());
-            } else if meta.is_file() {
+            } else if kind.is_file()
+                && let Ok(meta) = entry.metadata()
+            {
                 total = total.saturating_add(meta.len());
             }
         }
@@ -2242,12 +2260,14 @@ fn sweep_left_incoming(
         else {
             continue;
         };
-        let path = entry.path();
         if let Some(nonce) = rest.strip_suffix(".app.exec") {
+            if !aterm_codec::hex::is_hex(nonce, 32) {
+                continue;
+            }
+            let path = entry.path();
             let bundle = path.with_file_name(format!(".aterm-incoming-{nonce}.app"));
-            if aterm_codec::hex::is_hex(nonce, 32)
-                && std::fs::symlink_metadata(&bundle)
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            if std::fs::symlink_metadata(&bundle)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
             {
                 let _ = std::fs::remove_dir_all(&path);
             }
@@ -2256,11 +2276,10 @@ fn sweep_left_incoming(
         let Some(nonce) = rest.strip_suffix(".app") else {
             continue;
         };
-        if !aterm_codec::hex::is_hex(nonce, 32)
-            || !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir())
-        {
+        if !aterm_codec::hex::is_hex(nonce, 32) || !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
         }
+        let path = entry.path();
         let home = incoming_exec_home(&path);
         let held = if std::fs::symlink_metadata(&home).is_err() {
             stamp_incoming_exec(&path)
@@ -5666,7 +5685,8 @@ fn pay_owed_trial_launches(staging: &Staging, sentinel: &Sentinel) {
     for entry in entries.flatten().take(MAX_OWED_GIVE_BACKS) {
         let path = entry.path();
         if entry.file_name().to_string_lossy().starts_with('.') {
-            let stale = std::fs::symlink_metadata(&path)
+            let stale = entry
+                .metadata()
                 .and_then(|metadata| metadata.modified())
                 .ok()
                 .and_then(|at| at.elapsed().ok())

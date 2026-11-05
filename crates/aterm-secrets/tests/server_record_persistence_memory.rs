@@ -19,7 +19,14 @@ use std::cell::Cell;
 use std::net::TcpListener;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
+
+/// One test at a time. A measured pass counts its own thread's bytes, but `aterm_uds::spawn_lock`'s
+/// debug seam (`seam::Queued`) keeps a 64-byte mutex and a 32-byte list from the first wait on that
+/// process-wide lock: another test's open beside a measured write read as 96 bytes that write
+/// retained, in 18 of 40 runs of this binary.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
@@ -281,6 +288,7 @@ fn measured(
 }
 
 fn exercise(known_prefix: bool) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let fixture = Fixture::new();
     let prefix = Store::for_vault(NAME)
         .unwrap()

@@ -28,6 +28,27 @@ pub(super) const RESET_STALE: Duration = Duration::from_secs(RESET_CLAIM_S.unsig
 /// From which failed Escape on the host is told the dialog is stuck ([`IdleHost::inform`], once).
 pub(super) const RESET_STUCK_AT: u32 = 2;
 
+/// How many captures of each sight of the reset program one loop keeps
+/// ([`Session::reset_capture`]): a wall's dialog, its answer and a step's pending lines and
+/// confirmation are one or two each, a person moving the dialog's cursor row by row is bounded, and
+/// the walls with no reset on offer, which come most often, never use up an offer's or an
+/// answer's room.
+pub(super) const RESET_CAPTURES: usize = 8;
+
+/// The Claude Code version the newest transcript row of `tail` names (each row's `version`).
+fn transcript_version(tail: &str) -> Option<String> {
+    tail.lines().rev().find_map(|row| {
+        let v = aterm_json::from_str::<aterm_json::Value>(row).ok()?;
+        let version = v.get("version")?.as_str()?;
+        (!version.is_empty()
+            && version.len() <= 32
+            && version
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())))
+        .then(|| version.to_string())
+    })
+}
+
 const RESET_UNTITLED: &str = "the reset confirmation";
 
 const RESET_STUCK: &str = "The limit-reset confirmation did not close\nPress Esc in this tab.";
@@ -537,6 +558,7 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(true);
             };
             let seq = screen.seq;
+            self.reset_capture(&screen, opts, review);
             let shows = self.reset_shows(&screen, before.map(|(shown, _)| shown));
             let shown = match &shows {
                 Shows::Pending(ResetPending::Checking, _) => Some(ResetShown::Checking),
@@ -1055,6 +1077,68 @@ impl<C: Ctl> Session<'_, C> {
             review.note(&line);
         }
         Ok(())
+    }
+
+    /// Keep a capture of a Claude Code screen that shows the reset program
+    /// ([`aterm_phase::reset_sighting`]: the usage-limit dialog, with a reset on offer or none, a
+    /// confirmation, the chooser, a pending line, an answer), once per sighting and at most
+    /// [`RESET_CAPTURES`] of each `what` a loop, as a `CAPTURED` journal record
+    /// ([`crate::supervise::journal::Capture`]) a fixture is made from: the rows from the
+    /// sighting's `top` (the rule over the box or the command row) to the screen's foot, the
+    /// transcript above cut, their e-mail addresses masked. It reads and records; it presses
+    /// nothing, whatever `[harness] limit_reset` says.
+    pub(super) fn reset_capture(
+        &mut self,
+        screen: &Screen,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) {
+        // Only Claude Code draws the reset program; a new program names itself here.
+        match aterm_phase::identify(self.program.as_deref(), &screen.rows).program() {
+            aterm_phase::Program::Claude => {}
+            aterm_phase::Program::Codex
+            | aterm_phase::Program::Agy
+            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Grok
+            | aterm_phase::Program::Kimi
+            | aterm_phase::Program::Generic => return,
+        }
+        let Some(seen) = aterm_phase::reset_sighting(&screen.rows) else {
+            return;
+        };
+        let read = match seen.sight {
+            aterm_phase::ResetSight::Answer(line) => match line {
+                aterm_phase::ResetLine::Spent { .. } => "-spent",
+                aterm_phase::ResetLine::Walled { .. } => "-walled",
+                aterm_phase::ResetLine::Lifted { .. } => "-lifted",
+                aterm_phase::ResetLine::Kept => "-kept",
+                aterm_phase::ResetLine::Login => "-login",
+                aterm_phase::ResetLine::Other => "-other",
+            },
+            _ => "",
+        };
+        let what = format!("reset-{}{read}", seen.sight.word());
+        let kept = self.reset_captured.iter().filter(|(w, _)| *w == what);
+        if kept.clone().any(|(_, key)| *key == seen.key) || kept.count() >= RESET_CAPTURES {
+            return;
+        }
+        let version = opts
+            .idle_host
+            .as_deref()
+            .and_then(|host| host.transcript_tail())
+            .as_deref()
+            .and_then(transcript_version);
+        let capture = crate::supervise::journal::Capture::of_screen(
+            screen.seq,
+            what.clone(),
+            "claude".to_string(),
+            version,
+            screen.cols.zip(screen.pane_rows),
+            screen.first + seen.top,
+            screen.rows.get(seen.top..).unwrap_or_default(),
+        );
+        review.note(&capture.line());
+        self.reset_captured.push((what, seen.key));
     }
 
     /// End an owed reset step when the worker is observed busy during `await_turn_from`.

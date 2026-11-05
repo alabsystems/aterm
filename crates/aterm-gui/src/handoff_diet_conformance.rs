@@ -155,11 +155,19 @@ fn drive(rig: &mut Rig, action: &'static str, ev: &mut StepEvidence) {
         }
         "LayoutMoves" => rig.moved = true,
         "DiskDisturbed" => {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&rig.path)
-                .expect("the speculative file");
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+            }
+            let mut file = opts.open(&rig.path).expect("the speculative file");
+            assert!(
+                file.metadata().expect("metadata").is_file(),
+                "the speculative file must be a regular file"
+            );
+            file.set_len(0).expect("truncate the speculative file");
             file.write_all(b"schema = 0\n")
                 .expect("overwrite the speculative file");
         }

@@ -5,6 +5,7 @@
 //! shell rc file from `getpwuid` (via [`atpkg::hooks::LOGIN_SHELL_SEAM`]), never `$SHELL`.
 
 #![cfg(unix)]
+use aterm_spec::wait::MUST_HAPPEN;
 use aterm_uds::spawnfd::{Command, Stdio};
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -55,6 +56,12 @@ impl Fixture {
         };
         seed.env("HOME", &self.home)
             .env_remove("ZDOTDIR")
+            // zsh, asked for the ZDOTDIR a scratch .zshenv sets, always answers: the seed
+            // waits the hang detector for it, never its 5 s budget.
+            .env(
+                atpkg::zdotdir::ASK_WITHIN_ENV,
+                MUST_HAPPEN.as_millis().to_string(),
+            )
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_STATE_HOME", self.home.join(".local/state"))
             .env(atpkg::hooks::LOGIN_SHELL_SEAM, login)
@@ -83,6 +90,11 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))
             .env_remove("ZDOTDIR")
+            // As in the seed: zsh's answer waits the hang detector.
+            .env(
+                atpkg::zdotdir::ASK_WITHIN_ENV,
+                MUST_HAPPEN.as_millis().to_string(),
+            )
             .env(atpkg::hooks::LOGIN_SHELL_SEAM, login)
             .env("SHELL", shell)
             .env_remove("ATERM_CHILD")

@@ -11,6 +11,7 @@ use std::time::Instant;
 use crate::headless_boot;
 
 use aterm_shell_integration::ShellType;
+use aterm_uds::process::{Identity, Lineage, ProcessPresence};
 use headless_boot::{Instance, LoginShell, boot_session, boot_with, ctl_ok, field, status};
 
 const SCAN_MS: &str = "100";
@@ -51,6 +52,8 @@ fn boot_spare(prefix: &str, rc: &str, config: &str, seams: &[(&str, &str)]) -> I
             std::fs::write(&toml, format!("{config}\n{base}")).expect("aterm.toml");
             cmd.env("SHELL", shell().path);
             cmd.env("ATERM_LOG", "info");
+            // This Mac's Low Power and thermal state is not a test's input.
+            cmd.env("ATERM_DEBUG_SPARE_POWER", "clear");
             cmd.env("ATERM_DEBUG_SPARE_SCAN_MS", SCAN_MS);
             cmd.env(
                 "ATERM_DEBUG_SPARE_PARKED_MS",
@@ -1021,24 +1024,229 @@ fn spare_entries(dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A spare's shell, proven while its instance lived ([`proven_spare`]). Its drop ends it only
+/// through [`aterm_uds::process::end_proven`] on that identity, re-read on each side of a read
+/// that it still runs the login shell.
 struct Leftover {
-    pid: i32,
-    birth: u64,
+    identity: Identity,
+    shell: PathBuf,
 }
 
 impl Leftover {
-    fn alive(&self) -> bool {
-        aterm_pty::process_birth(self.pid) == Some(self.birth)
+    /// The spare whose pid its rc wrote, once the kernel names it the instance's own child running
+    /// the login shell.
+    ///
+    /// # Panics
+    /// When the login shell's path does not resolve, or the kernel does not name `pid` so.
+    fn proven(inst: &Instance, pid: i32) -> Self {
+        use aterm_uds::process::{read_identity, read_lineage, read_process_path};
+        let shell = std::fs::canonicalize(shell().path).expect("the login shell's path resolves");
+        let identity = proven_spare(
+            inst.child.id(),
+            pid,
+            &shell,
+            read_lineage,
+            read_process_path,
+            read_identity,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "the ready spare (pid {pid}) is not proven the instance's own child running {}: \
+                 lineage {:?}, path {:?}",
+                shell.display(),
+                read_lineage(pid),
+                read_process_path(pid)
+            )
+        });
+        Self { identity, shell }
+    }
+
+    /// Whether the kernel says this spare ended ([`ended`]).
+    fn ended(&self) -> bool {
+        let pid = self.identity.pid;
+        ended(
+            self.identity,
+            aterm_uds::process::read_identity(pid),
+            || aterm_uds::process::process_presence(pid),
+        )
     }
 }
 
 impl Drop for Leftover {
     fn drop(&mut self) {
-        if self.alive() {
-            // SAFETY: sends SIGKILL to the shell pid spawned by this test's instance.
-            let _ = unsafe { libc::kill(self.pid, libc::SIGKILL) };
-        }
+        let shell = self.shell.as_path();
+        // An interactive shell ignores SIGTERM: no grace before the SIGKILL.
+        let _ = aterm_uds::process::end_proven(
+            self.identity,
+            std::time::Duration::ZERO,
+            &mut aterm_uds::process::EndControlLive,
+            |id| aterm_uds::process::read_process_path(id.pid).as_deref() == Some(shell),
+        );
     }
+}
+
+/// `pid`'s identity when the kernel names it `parent`'s own child running `shell`, the identity
+/// read on each side of the path read, so a reuse or an exec between them proves nothing; `None`
+/// otherwise. `lineage`, `path` and `identity` are the kernel's reads.
+fn proven_spare(
+    parent: u32,
+    pid: i32,
+    shell: &Path,
+    lineage: impl Fn(i32) -> Option<Lineage>,
+    path: impl Fn(i32) -> Option<PathBuf>,
+    identity: impl Fn(i32) -> Option<Identity>,
+) -> Option<Identity> {
+    let before = lineage(pid).filter(|lineage| lineage.parent == parent)?;
+    (path(pid).as_deref() == Some(shell) && identity(pid) == Some(before.identity))
+        .then_some(before.identity)
+}
+
+/// Whether the kernel says the process `token` names ended: `now`, its pid's identity read now,
+/// names another birth, or none and `presence` finds no live process. An identity read can fail
+/// for a live process, and an exec keeps the birth, so neither ends it.
+fn ended(
+    token: Identity,
+    now: Option<Identity>,
+    presence: impl FnOnce() -> ProcessPresence,
+) -> bool {
+    match now {
+        Some(now) => now.birth != token.birth,
+        None => matches!(
+            presence(),
+            ProcessPresence::Exited | ProcessPresence::Absent
+        ),
+    }
+}
+
+/// The identity the rule tests below read for pid 4242.
+const PROVEN: Identity = Identity {
+    pid: 4242,
+    birth: aterm_uds::process::Birth(7),
+    idversion: Some(1),
+};
+
+/// [`proven_spare`] of pid 4242 for an instance of pid 9 running `/login/shell`, over reads that
+/// give the lineage of [`PROVEN`] with `parent`, the executable `path` and then `again`.
+fn proof(parent: u32, path: Option<&str>, again: Option<Identity>) -> Option<Identity> {
+    let lineage = Lineage {
+        identity: PROVEN,
+        uniqueid: 1,
+        parent,
+        pgid: PROVEN.pid.unsigned_abs(),
+        launcher_version: None,
+        tty: None,
+    };
+    proven_spare(
+        9,
+        PROVEN.pid,
+        Path::new("/login/shell"),
+        |_| Some(lineage),
+        |_| path.map(PathBuf::from),
+        |_| again,
+    )
+}
+
+#[test]
+fn a_spare_is_proven_only_as_its_instances_own_child_running_the_login_shell() {
+    assert_eq!(
+        proof(9, Some("/login/shell"), Some(PROVEN)),
+        Some(PROVEN),
+        "the instance's own child running the login shell"
+    );
+    assert_eq!(
+        proof(8, Some("/login/shell"), Some(PROVEN)),
+        None,
+        "another process's child"
+    );
+    assert_eq!(
+        proof(9, Some("/other/program"), Some(PROVEN)),
+        None,
+        "another program"
+    );
+    assert_eq!(
+        proof(9, None, Some(PROVEN)),
+        None,
+        "a path that does not read"
+    );
+    assert_eq!(
+        proven_spare(
+            9,
+            PROVEN.pid,
+            Path::new("/login/shell"),
+            |_| None,
+            |_| None,
+            |_| None
+        ),
+        None,
+        "no lineage"
+    );
+}
+
+#[test]
+fn a_spare_whose_identity_moves_across_its_proof_is_not_proven() {
+    assert_eq!(
+        proof(
+            9,
+            Some("/login/shell"),
+            Some(Identity {
+                idversion: Some(2),
+                ..PROVEN
+            })
+        ),
+        None,
+        "an exec between the reads"
+    );
+    assert_eq!(
+        proof(9, Some("/login/shell"), None),
+        None,
+        "gone after the path read"
+    );
+}
+
+#[test]
+fn a_spare_has_ended_only_when_the_kernel_says_so() {
+    fn unasked() -> ProcessPresence {
+        panic!("an identity that reads answers alone")
+    }
+    assert!(!ended(PROVEN, Some(PROVEN), unasked), "the same process");
+    assert!(
+        !ended(
+            PROVEN,
+            Some(Identity {
+                idversion: Some(2),
+                ..PROVEN
+            }),
+            unasked
+        ),
+        "an exec keeps the birth"
+    );
+    assert!(
+        !ended(PROVEN, None, || ProcessPresence::Present),
+        "a failed identity read of a live process"
+    );
+    assert!(
+        !ended(PROVEN, None, || ProcessPresence::Unknown),
+        "a presence query that failed"
+    );
+    assert!(
+        ended(PROVEN, None, || ProcessPresence::Absent),
+        "no process"
+    );
+    assert!(
+        ended(PROVEN, None, || ProcessPresence::Exited),
+        "an exited process"
+    );
+    assert!(
+        ended(
+            PROVEN,
+            Some(Identity {
+                birth: aterm_uds::process::Birth(8),
+                ..PROVEN
+            }),
+            unasked
+        ),
+        "the pid reused"
+    );
 }
 
 /// An rc whose warm spare ignores the hangup and writes its pid to `~/spare-pid`, so the hangup a
@@ -1062,27 +1270,37 @@ fn boot_hup_deaf_spare(prefix: &str) -> (Instance, Leftover) {
         .trim()
         .parse()
         .expect("a pid");
-    let spare = Leftover {
-        pid,
-        birth: aterm_pty::process_birth(pid).expect("the ready spare runs"),
-    };
+    let spare = Leftover::proven(&inst, pid);
     (inst, spare)
 }
 
 #[test]
-fn a_crashed_instances_spare_ends_itself_and_the_next_launch_sweeps_its_fifo() {
+fn a_ready_spare_ends_with_its_sigkilled_instance() {
+    let (mut inst, spare) = boot_hup_deaf_spare("aterm-spare-l15");
+    inst.child.kill().expect("SIGKILL the instance");
+    inst.child.wait().expect("reap the instance");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the spare outlived its instance",
+        || spare.ended().then_some(()),
+    );
+}
+
+#[test]
+fn a_crashed_instances_spare_fifo_is_swept_by_the_next_launch() {
     let (mut crashed, spare) = boot_hup_deaf_spare("aterm-spare-l12");
     let spare_dir = crashed.tmp.join("run/aterm/spare");
     crashed.child.kill().expect("SIGKILL the instance");
     crashed.child.wait().expect("reap the instance");
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
-        "the HUP-ignoring spare ends at its hold once its instance is gone",
-        || (!spare.alive()).then_some(()),
+        "the crashed instance's spare to end at its hold",
+        || spare.ended().then_some(()),
     );
     assert!(
         !spare_entries(&spare_dir).is_empty(),
-        "its FIFO outlives it: only the instance's own drop unlinks it"
+        "the crashed instance's spare ended and left its FIFO: only the instance's own drop \
+         unlinks it"
     );
 
     let run = crashed.tmp.join("run");
@@ -1164,7 +1382,7 @@ fn quitting_with_a_spare_retires_it_before_the_exit() {
         Vec::<String>::new(),
         "the quit retired the spare: its FIFO and link are gone"
     );
-    while spare.alive() {
+    while !spare.ended() {
         assert!(
             Instant::now() < give_up,
             "the spare's shell outlived the quit"

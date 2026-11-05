@@ -162,12 +162,15 @@ impl AsRef<Path> for WriteTarget {
 
 fn writer_lock(entry: &Path) -> Result<WriterLock> {
     let context = Context::new(entry)?;
-    let file = File::from(syscall(fd::openat(
-        &context.parent,
-        format!("{}.writing", context.name).as_str(),
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::RUSR | Mode::WUSR,
-    ))?);
+    let file: std::fs::File = aterm_uds::kept_out(|| {
+        syscall(fd::openat(
+            &context.parent,
+            format!("{}.writing", context.name).as_str(),
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::RUSR | Mode::WUSR,
+        ))
+        .map(File::from)
+    })?;
     private_file(&file, 0)?;
     #[expect(
         clippy::disallowed_methods,
@@ -737,7 +740,7 @@ fn copy_digest(input: &mut File, output: &mut dyn std::io::Write) -> Result<(usi
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    aterm_codec::hex::encode_lower(bytes)
 }
 
 fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {

@@ -29,6 +29,9 @@ mod launch_isolation;
 #[cfg(unix)]
 #[path = "support/live_ctl.rs"]
 mod live_ctl;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "support/native_claude.rs"]
+mod native_claude;
 #[cfg(unix)]
 #[path = "support/standin.rs"]
 mod standin;

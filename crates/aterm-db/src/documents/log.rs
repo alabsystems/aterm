@@ -211,15 +211,12 @@ impl Log {
                     .get(target)
                     .and_then(|(_, command)| command.as_ref())
                     .and_then(Command::changes);
-                let keys = |changes: &[Change]| {
-                    changes
-                        .iter()
-                        .map(|c| (c.collection.clone(), c.key.clone()))
-                        .collect::<BTreeSet<_>>()
-                };
                 if !self.index.observes(&id, target)
                     || !structural.contains(target)
-                    || !target_changes.is_some_and(|target| keys(target) == keys(changes))
+                    || !target_changes.is_some_and(|target| {
+                        crate::database::change_keys(target)
+                            == crate::database::change_keys(changes)
+                    })
                 {
                     refusals.insert(
                         id,
@@ -352,9 +349,21 @@ impl Log {
         awaited
     }
     pub(crate) fn writable(&self, actor: Actor) -> Result<()> {
-        if self.snapshot().operations.iter().any(|op| {
-            op.header.actor == actor
-                && (!op.available || !op.catalog_eligible || op.refusal.is_some())
+        if self.opaque_authors.contains(&actor)
+            || self.records.values().any(|(op, _)| {
+                op.header.actor == actor
+                    && (!op.available || !op.catalog_eligible || op.refusal.is_some())
+            })
+        {
+            return Err(Error::new(
+                "local proposal writer has withheld, unavailable or refused history; recovery required",
+            ));
+        }
+        let (_, refusals, _) = self.project(None, &BTreeSet::new());
+        if refusals.keys().any(|id| {
+            self.records
+                .get(id)
+                .is_some_and(|(op, _)| op.header.actor == actor)
         }) {
             return Err(Error::new(
                 "local proposal writer has withheld, unavailable or refused history; recovery required",
@@ -462,17 +471,18 @@ impl Log {
             }
         }
         let (past, _, _) = self.project(Some(target), excluded);
-        let mut restored = Vec::new();
+        let mut restored = Vec::with_capacity(changes.len());
         for change in changes {
-            let old = past.get(&(change.collection.clone(), change.key.clone()));
+            let key = (change.collection.clone(), change.key.clone());
+            let old = past.get(&key);
             if old.is_some_and(|cell| cell.stopped || cell.candidates.len() > 1) {
                 return Err(Error::new(
                     "previous proposal is stopped or conflicted; resolve it explicitly",
                 ));
             }
             restored.push(Change {
-                collection: change.collection.clone(),
-                key: change.key.clone(),
+                collection: key.0,
+                key: key.1,
                 value: old
                     .and_then(|cell| cell.candidates.first())
                     .map(|c| c.value.clone())

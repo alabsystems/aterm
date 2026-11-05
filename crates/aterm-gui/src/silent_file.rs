@@ -36,7 +36,7 @@ impl SilentFile {
             || {
                 std::fs::OpenOptions::new()
                     .write(true)
-                    .custom_flags(libc::O_NONBLOCK)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
                     .open(&self.0)
                     .ok()
             },

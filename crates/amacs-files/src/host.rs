@@ -24,6 +24,9 @@ use crate::io::{
 /// The save-side half of admission's decoding ([`Decoded::hold`]).
 pub use crate::io::encode_for_disk;
 
+mod folder;
+use folder::Folder;
+
 pub const DEFAULT_DOCUMENT_LIMIT: usize = 32 * 1024 * 1024;
 /// Maximum bytes a single atomic save or proof observation accepts.
 const MAX_ATOMIC_SAVE_BYTES: usize = DEFAULT_DOCUMENT_LIMIT;
@@ -1204,7 +1207,17 @@ fn open_regular_read(path: &Path) -> Result<RegularReadHandle, DocumentHostError
     options
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let file = match options.open(path) {
+    regular_read_opened(path, options.open(path))
+}
+
+/// What a no-follow, non-blocking open for reading of the target at `path` met: the regular
+/// file, nothing there, or why not.
+#[cfg(unix)]
+fn regular_read_opened(
+    path: &Path,
+    opened: std::io::Result<File>,
+) -> Result<RegularReadHandle, DocumentHostError> {
+    let file = match opened {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(RegularReadHandle::Missing);
@@ -1673,7 +1686,16 @@ pub fn observe_file(path: &Path, content_limit: usize) -> Result<ObservedFileVer
 /// [`observe_file`], its failure keeping the I/O error behind a refused read
 /// for a commit to report ([`StepFailure::read`]).
 fn observe_target(path: &Path, content_limit: usize) -> Result<ObservedFileVersion, StepFailure> {
-    let opened = open_regular_read(path).map_err(|error| StepFailure::read(&error))?;
+    observe_opened(path, open_regular_read(path), content_limit)
+}
+
+/// [`observe_target`] of the target at `path` as its open for reading met it (`opened`).
+fn observe_opened(
+    path: &Path,
+    opened: Result<RegularReadHandle, DocumentHostError>,
+    content_limit: usize,
+) -> Result<ObservedFileVersion, StepFailure> {
+    let opened = opened.map_err(|error| StepFailure::read(&error))?;
     let RegularReadHandle::Open { mut file, metadata } = opened else {
         return Ok(ObservedFileVersion::missing());
     };
@@ -1782,7 +1804,12 @@ fn write_lock_not_regular(path: &Path) -> String {
 /// sibling of it.
 fn save_lock_path(path: &Path, parent: &Path) -> PathBuf {
     let name = path.file_name().unwrap_or_else(|| OsStr::new("document"));
-    parent.join(format!(".{}.aterm-write.lock", name.to_string_lossy()))
+    parent.join(save_lock_name(name))
+}
+
+/// The name of the save lock of the file `name`, beside it.
+fn save_lock_name(name: &OsStr) -> String {
+    format!(".{}.aterm-write.lock", name.to_string_lossy())
 }
 
 /// The save lock a commit of `path` takes, which a person may have to remove when it is another user's ([`SaveTouch::Lock`]).
@@ -1792,6 +1819,7 @@ pub fn save_lock_of(path: &Path) -> Option<PathBuf> {
 
 /// What a failed open of the save lock at `path` was doing: opening the lock
 /// already there (another user's, say), or making it in the folder.
+#[cfg(not(unix))]
 fn lock_open_touch(path: &Path) -> SaveTouch {
     if fs::symlink_metadata(path).is_ok() {
         SaveTouch::Lock
@@ -1818,25 +1846,25 @@ fn ensure_write_lock_owner(
     Ok(())
 }
 
-#[cfg(unix)]
+/// The save lock at `path`, opened in its folder (by its canonical path, as a commit's target
+/// names it) as a commit opens it ([`Folder::open_write_lock`]).
+#[cfg(all(test, unix))]
 fn open_write_lock(path: &Path) -> Result<File, StepFailure> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(StepFailure::own("save lock has no folder"));
+    };
+    let folder = fs::canonicalize(parent)
+        .and_then(|parent| Folder::open(&parent, false))
+        .map_err(|error| StepFailure::io(SaveTouch::Folder, error.to_string(), &error))?;
+    folder.open_write_lock(name, path)
+}
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| {
-            StepFailure::io(
-                lock_open_touch(path),
-                format!("could not open save lock {}: {error}", path.display()),
-                &error,
-            )
-        })?;
+/// Keep the save lock just opened at `path` only if it is a regular file this user owns, made
+/// owner-only.
+#[cfg(unix)]
+fn admit_write_lock(file: File, path: &Path) -> Result<File, StepFailure> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
     let metadata = file.metadata().map_err(|error| {
         StepFailure::io(
             SaveTouch::Lock,
@@ -1850,14 +1878,16 @@ fn open_write_lock(path: &Path) -> Result<File, StepFailure> {
     // SAFETY: `geteuid` takes no pointers or preconditions and always returns the effective UID.
     let effective_uid = unsafe { libc::geteuid() };
     ensure_write_lock_owner(path, metadata.uid(), effective_uid)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|error| {
-            StepFailure::io(
-                SaveTouch::Lock,
-                format!("could not protect save lock {}: {error}", path.display()),
-                &error,
-            )
-        })?;
+    if metadata.permissions().mode() & 0o7777 != 0o600 {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                StepFailure::io(
+                    SaveTouch::Lock,
+                    format!("could not protect save lock {}: {error}", path.display()),
+                    &error,
+                )
+            })?;
+    }
     Ok(file)
 }
 
@@ -2108,15 +2138,94 @@ fn acquire_write_lock(lock_file: File) -> Result<HeldAdvisoryLock, StepFailure> 
     acquire_write_lock_within(lock_file, WRITE_LOCK_RETRY_BUDGET)
 }
 
-/// Bounded retry for the pre-publication phase of a commit.
+/// Bounded retry for the pre-publication phase of a commit: a failed preflight is tried again
+/// at least once, then while this budget from the first attempt lasts, so a transient (a lock
+/// held a moment, a folder replaced between its open and its lock) fails no save on a host
+/// whose first attempt alone outran the budget.
 const PREFLIGHT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// THE POINTS OF A COMMIT A TEST ACTS AT: what another process may do to the folder between
+/// one step of a commit and the next.
+#[cfg(test)]
+pub(crate) mod seam {
+    use std::cell::RefCell;
+
+    /// The step a commit is about to take.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Step {
+        /// Open the target's folder, which every later step works in ([`super::Folder`]).
+        Folder,
+        /// Check by path the binding the folder was just opened by.
+        Opened,
+        /// Open (or make) the save lock in it.
+        Lock,
+        /// Create the temporary that holds the new bytes.
+        Temporary,
+        /// Check the binding a last time before publishing.
+        Validate,
+        /// Publish the temporary at the target's name.
+        Publish,
+        /// Check, once it is published, that the path still reaches the folder it is in.
+        Observe,
+    }
+
+    type Hook = Box<dyn FnMut(Step)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `f` with `hook` called at every step a commit on this thread takes, cleared after
+    /// it even on unwind. Unix's alone: the tests that act at the steps swap folders for links.
+    #[cfg(unix)]
+    pub(crate) fn with<T>(hook: impl FnMut(Step) + 'static, f: impl FnOnce() -> T) -> T {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                HOOK.with(|h| h.replace(None));
+            }
+        }
+        HOOK.with(|h| h.replace(Some(Box::new(hook))));
+        let _clear = Clear;
+        f()
+    }
+
+    /// A commit on this thread is about to take `step`.
+    pub(crate) fn reached(step: Step) {
+        HOOK.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook(step);
+            }
+        });
+    }
+}
+
+/// The points of a commit: none acts outside the tests.
+#[cfg(not(test))]
+mod seam {
+    #[derive(Clone, Copy)]
+    pub(crate) enum Step {
+        Folder,
+        Opened,
+        Lock,
+        Temporary,
+        Validate,
+        Publish,
+        Observe,
+    }
+
+    /// Nothing acts here.
+    #[inline]
+    pub(crate) const fn reached(_: Step) {}
+}
+
 /// Take the write lock and prove the target is still the generation the plan was built
-/// on.
+/// on: the lock, the observation limit, and the target's folder ([`Folder`]), which every
+/// later step of the commit works in.
 fn lock_and_verify_target(
     baseline: &AtomicFileBaseline,
     directories: Directories,
-) -> Result<(HeldAdvisoryLock, usize), AtomicCommitResult> {
+) -> Result<(HeldAdvisoryLock, usize, Folder), AtomicCommitResult> {
     let target = &baseline.target;
     if let Err(error) = validate_atomic_target(target) {
         return Err(atomic_validation_failure(
@@ -2126,38 +2235,47 @@ fn lock_and_verify_target(
         ));
     }
     let path = target.target_path();
-    let Some(parent) = path.parent() else {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(atomic_failed(
             AtomicSaveStage::CreateTemporary,
             StepFailure::own("target has no parent"),
         ));
     };
-    match directories {
-        Directories::Create => {
-            if let Err(error) = fs::create_dir_all(parent) {
-                return Err(atomic_failed(
+    seam::reached(seam::Step::Folder);
+    let folder = match Folder::open(parent, directories == Directories::Create) {
+        Ok(folder) => folder,
+        Err(error) if folder::is_link(&error) => {
+            return Err(atomic_validation_failure(
+                target,
+                AtomicSaveStage::Preflight,
+                DocumentHostError::SymlinkComponent {
+                    path: parent.to_path_buf(),
+                    dangling: false,
+                },
+            ));
+        }
+        Err(error) if directories == Directories::Existing && folder::is_missing(&error) => {
+            let message = format!("{}{MISSING_SUFFIX}", parent.display());
+            return Err(if baseline.observed.exists {
+                AtomicCommitResult::Conflict {
+                    observed: ObservedFileVersion::missing(),
+                    message,
+                }
+            } else {
+                atomic_failed(
                     AtomicSaveStage::CreateTemporary,
-                    StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
-                ));
-            }
+                    StepFailure::met(SaveTouch::Folder, message, std::io::ErrorKind::NotFound),
+                )
+            });
         }
-        Directories::Existing => {
-            if !fs::metadata(parent).is_ok_and(|metadata| metadata.is_dir()) {
-                let message = format!("{}{MISSING_SUFFIX}", parent.display());
-                return Err(if baseline.observed.exists {
-                    AtomicCommitResult::Conflict {
-                        observed: ObservedFileVersion::missing(),
-                        message,
-                    }
-                } else {
-                    atomic_failed(
-                        AtomicSaveStage::CreateTemporary,
-                        StepFailure::met(SaveTouch::Folder, message, std::io::ErrorKind::NotFound),
-                    )
-                });
-            }
+        Err(error) => {
+            return Err(atomic_failed(
+                AtomicSaveStage::CreateTemporary,
+                StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
+            ));
         }
-    }
+    };
+    seam::reached(seam::Step::Opened);
     if let Err(error) = validate_atomic_target(target) {
         return Err(atomic_validation_failure(
             target,
@@ -2165,8 +2283,12 @@ fn lock_and_verify_target(
             error,
         ));
     }
-    let lock_path = save_lock_path(path, parent);
-    let lock_file = open_write_lock(&lock_path)
+    seam::reached(seam::Step::Lock);
+    let lock_file = folder
+        .open_write_lock(
+            OsStr::new(&save_lock_name(name)),
+            &save_lock_path(path, parent),
+        )
         .map_err(|failure| atomic_failed(AtomicSaveStage::Preflight, failure))?;
     let lock = acquire_write_lock(lock_file)
         .map_err(|failure| atomic_failed(AtomicSaveStage::Preflight, failure))?;
@@ -2178,8 +2300,10 @@ fn lock_and_verify_target(
             error,
         ));
     }
+    hold_folder(&folder, path)
+        .map_err(|failure| atomic_failed(AtomicSaveStage::Preflight, failure))?;
     let baseline_limit = observation_limit(baseline.observed.len);
-    let actual = observe_target(path, baseline_limit)
+    let actual = observe_in(&folder, path, baseline_limit)
         .map_err(|failure| atomic_failed(AtomicSaveStage::Preflight, failure))?;
     if crate::io::detect_version_conflict(baseline.observed, actual).is_some() {
         return Err(AtomicCommitResult::Conflict {
@@ -2187,7 +2311,43 @@ fn lock_and_verify_target(
             message: "target changed since it was read".to_string(),
         });
     }
-    Ok((lock, baseline_limit))
+    Ok((lock, baseline_limit, folder))
+}
+
+/// Whether the folder of the target at `path` is still `folder`, the one the commit opened and
+/// works in (device and inode): a folder moved or replaced since, or reached through a link
+/// now, fails the step as a folder that went missing while saving, and the next Save opens the
+/// folder the path names then.
+fn hold_folder(folder: &Folder, path: &Path) -> Result<(), StepFailure> {
+    let Some(parent) = path.parent() else {
+        return Err(StepFailure::own("target has no parent"));
+    };
+    match folder.is_reached_by(parent) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(StepFailure::met(
+            SaveTouch::Folder,
+            format!(
+                "{} is no longer the folder this save opened",
+                parent.display()
+            ),
+            std::io::ErrorKind::NotFound,
+        )),
+        Err(error) => Err(StepFailure::io(
+            SaveTouch::Folder,
+            format!("could not check {}: {error}", parent.display()),
+            &error,
+        )),
+    }
+}
+
+/// [`observe_target`] of the target at `path`, read through `folder`.
+fn observe_in(
+    folder: &Folder,
+    path: &Path,
+    content_limit: usize,
+) -> Result<ObservedFileVersion, StepFailure> {
+    let name = path.file_name().unwrap_or_else(|| OsStr::new("document"));
+    observe_opened(path, folder.open_regular_read(name, path), content_limit)
 }
 
 fn commit_atomic_bytes_with_seed(
@@ -2209,17 +2369,12 @@ fn commit_atomic_bytes_with_seed(
     }
     let target = &baseline.target;
     let path = target.target_path();
-    let Some(parent) = path.parent() else {
-        return atomic_failed(
-            AtomicSaveStage::CreateTemporary,
-            StepFailure::own("target has no parent"),
-        );
-    };
     let name = path.file_name().unwrap_or_else(|| OsStr::new("document"));
 
     let deadline = std::time::Instant::now().checked_add(PREFLIGHT_RETRY_BUDGET);
     let mut backoff = std::time::Duration::from_millis(1);
-    let (_lock_file, baseline_limit) = loop {
+    let mut retried = false;
+    let (_lock_file, baseline_limit, folder) = loop {
         match lock_and_verify_target(baseline, directories) {
             Ok(ready) => break ready,
             Err(verdict) => {
@@ -2235,9 +2390,10 @@ fn commit_atomic_bytes_with_seed(
                 let remaining = deadline.map_or(PREFLIGHT_RETRY_BUDGET, |deadline| {
                     deadline.saturating_duration_since(std::time::Instant::now())
                 });
-                if remaining.is_zero() {
+                if remaining.is_zero() && retried {
                     return verdict;
                 }
+                retried = true;
                 std::thread::sleep(backoff.min(remaining));
                 backoff = backoff
                     .saturating_mul(2)
@@ -2246,22 +2402,20 @@ fn commit_atomic_bytes_with_seed(
         }
     };
 
+    seam::reached(seam::Step::Temporary);
     let (temporary, mut file) =
-        match create_unique_temporary(parent, name, seed, directories.new_file_mode()) {
+        match folder.create_temporary(name, seed, directories.new_file_mode()) {
             Ok(created) => created,
             Err(failure) => return atomic_failed(AtomicSaveStage::CreateTemporary, failure),
         };
     let result: Result<AtomicSaveProof, AtomicCommitResult> = (|| {
-        if let Ok(metadata) = fs::symlink_metadata(path)
-            && metadata.file_type().is_file()
-        {
-            file.set_permissions(metadata.permissions())
-                .map_err(|error| {
-                    atomic_failed(
-                        AtomicSaveStage::CreateTemporary,
-                        StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
-                    )
-                })?;
+        if let Some(permissions) = folder.regular_permissions(name) {
+            file.set_permissions(permissions).map_err(|error| {
+                atomic_failed(
+                    AtomicSaveStage::CreateTemporary,
+                    StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
+                )
+            })?;
         }
         file.write_all(bytes).map_err(|error| {
             atomic_failed(
@@ -2277,10 +2431,13 @@ fn commit_atomic_bytes_with_seed(
         })?;
         drop(file);
 
+        seam::reached(seam::Step::Validate);
         validate_atomic_target(target).map_err(|error| {
             atomic_validation_failure(target, AtomicSaveStage::RenameTarget, error)
         })?;
-        let before_rename = observe_target(path, baseline_limit)
+        hold_folder(&folder, path)
+            .map_err(|failure| atomic_failed(AtomicSaveStage::RenameTarget, failure))?;
+        let before_rename = observe_in(&folder, path, baseline_limit)
             .map_err(|failure| atomic_failed(AtomicSaveStage::RenameTarget, failure))?;
         if let Some(conflict) = crate::io::detect_version_conflict(baseline.observed, before_rename)
         {
@@ -2289,15 +2446,17 @@ fn commit_atomic_bytes_with_seed(
                 message: format!("target changed before rename: {conflict:?}"),
             });
         }
-        if let Err(error) = replace_file(&temporary, path, before_rename.exists) {
-            let after_error = observe_file(path, bytes.len()).map_err(|message| {
+        seam::reached(seam::Step::Publish);
+        if let Err(error) = folder.publish(&temporary, name, before_rename.exists) {
+            let after_error = observe_in(&folder, path, bytes.len()).map_err(|failure| {
                 atomic_published_unverified(
                     AtomicSaveStage::RenameTarget,
                     None,
                     StepFailure::io(
                         SaveTouch::Replace,
                         format!(
-                            "replacement reported {error}; its target could not be reconciled: {message}"
+                            "replacement reported {error}; its target could not be reconciled: {}",
+                            failure.message
                         ),
                         &error,
                     ),
@@ -2332,21 +2491,25 @@ fn commit_atomic_bytes_with_seed(
                 StepFailure::io(SaveTouch::Replace, error.to_string(), &error),
             ));
         }
-        sync_directory(parent, flush).map_err(|error| {
+        folder.sync(flush).map_err(|error| {
             atomic_published_unverified(
                 AtomicSaveStage::SyncDirectory,
-                observe_file(path, bytes.len()).ok(),
+                observe_in(&folder, path, bytes.len()).ok(),
                 StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
             )
         })?;
-        validate_atomic_target(target).map_err(|error| {
-            atomic_published_unverified(
-                AtomicSaveStage::ObserveCommitted,
-                observe_file(path, bytes.len()).ok(),
-                StepFailure::read(&error),
-            )
-        })?;
-        let observed = observe_target(path, bytes.len()).map_err(|failure| {
+        seam::reached(seam::Step::Observe);
+        validate_atomic_target(target)
+            .map_err(|error| StepFailure::read(&error))
+            .and_then(|()| hold_folder(&folder, path))
+            .map_err(|failure| {
+                atomic_published_unverified(
+                    AtomicSaveStage::ObserveCommitted,
+                    observe_in(&folder, path, bytes.len()).ok(),
+                    failure,
+                )
+            })?;
+        let observed = observe_in(&folder, path, bytes.len()).map_err(|failure| {
             atomic_published_unverified(AtomicSaveStage::ObserveCommitted, None, failure)
         })?;
         if !observed.exists
@@ -2367,51 +2530,12 @@ fn commit_atomic_bytes_with_seed(
         })
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = folder.remove(&temporary);
     }
     match result {
         Ok(proof) => AtomicCommitResult::Committed(proof),
         Err(verdict) => verdict,
     }
-}
-
-/// A fresh sibling temporary for `name` in `parent`, created with `mode` (Unix: narrowed by the
-/// umask; elsewhere unused).
-fn create_unique_temporary(
-    parent: &Path,
-    name: &OsStr,
-    seed: u64,
-    mode: u32,
-) -> Result<(PathBuf, File), StepFailure> {
-    for attempt in 0_u64..64 {
-        let temporary = parent.join(format!(
-            ".{}.aterm-{}-{}-{}.tmp",
-            name.to_string_lossy(),
-            std::process::id(),
-            seed,
-            attempt
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
-        #[cfg(not(unix))]
-        let _ = mode;
-        match options.open(&temporary) {
-            Ok(file) => return Ok((temporary, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(StepFailure::io(
-                    SaveTouch::Folder,
-                    error.to_string(),
-                    &error,
-                ));
-            }
-        }
-    }
-    Err(StepFailure::own(
-        "could not allocate a unique sibling temporary file",
-    ))
 }
 
 fn next_temporary_seed() -> u64 {
@@ -3651,7 +3775,8 @@ mod tests {
             path.file_name().unwrap().to_string_lossy()
         ));
 
-        let Ok((held, _)) = lock_and_verify_target(&contents.baseline, Directories::Create) else {
+        let Ok((held, _, _)) = lock_and_verify_target(&contents.baseline, Directories::Create)
+        else {
             panic!("an uncontended preflight takes the save lock");
         };
         let forked_copy = held.0.try_clone().unwrap();
@@ -4254,6 +4379,658 @@ mod tests {
             "theme = \"Default\"\n"
         );
         assert_eq!(fs::read_link(&alias).unwrap(), real);
+    }
+
+    /// The names in `folder`, sorted.
+    #[cfg(unix)]
+    fn names_in(folder: &Path) -> Vec<std::ffi::OsString> {
+        let mut names = fs::read_dir(folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// Put a link to the folder `to` where the folder `at` is, `at` moved to `aside`: what a
+    /// process that may write `at`'s parent, but not `to`, can do between two steps of a commit.
+    #[cfg(unix)]
+    fn link_in(at: &Path, aside: &Path, to: &Path) {
+        fs::rename(at, aside).unwrap();
+        std::os::unix::fs::symlink(to, at).unwrap();
+    }
+
+    /// Undo [`link_in`]: the folder at `aside` back at `at`, in place of the link.
+    #[cfg(unix)]
+    fn folder_back(at: &Path, aside: &Path) {
+        fs::remove_file(at).unwrap();
+        fs::rename(aside, at).unwrap();
+    }
+
+    /// A commit's steps as a hook saw them, and the hook that records them before it runs
+    /// `act` at each.
+    #[cfg(unix)]
+    fn recording(
+        mut act: impl FnMut(seam::Step) + 'static,
+    ) -> (
+        std::rc::Rc<std::cell::RefCell<Vec<seam::Step>>>,
+        impl FnMut(seam::Step) + 'static,
+    ) {
+        let steps = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&steps);
+        (steps, move |step| {
+            seen.borrow_mut().push(step);
+            act(step);
+        })
+    }
+
+    /// While the file a document names is missing, a process that swaps the document's folder
+    /// for a link to a folder it may not write, between a commit's steps (the link in while the
+    /// temporary is made, the folder back for the last check, the link in again for the
+    /// publish), never makes the file, or anything else, in that folder: the folder the missing
+    /// aterm.toml in force would be made in, say, where a save checked as some other file's
+    /// would otherwise make it. Every step works in the folder the commit opened, so the bytes
+    /// land in the document's own folder, wherever it was moved, and the save reports the
+    /// binding it no longer holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_for_a_link_mid_commit_never_makes_the_missing_file_elsewhere() {
+        use seam::Step;
+
+        let dir = crate::test_scratch_dir("swap-mid-commit");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let scratch = root.join("scratch");
+        let aside = root.join("scratch.aside");
+        let kept = root.join("kept");
+        fs::create_dir(&scratch).unwrap();
+        fs::create_dir(&kept).unwrap();
+        let path = scratch.join("aterm.toml");
+        let text = "[harness]\noccupancy = \"cruise\"\n";
+        let mut opened = open_document(&path, ALLOW_MISSING);
+        opened.set_text(text);
+
+        let (at, away, to) = (scratch.clone(), aside.clone(), kept.clone());
+        let (steps, hook) = recording(move |step| match step {
+            Step::Folder | Step::Opened | Step::Lock | Step::Observe => {}
+            Step::Temporary | Step::Publish => link_in(&at, &away, &to),
+            Step::Validate => folder_back(&at, &away),
+        });
+        let reduction = seam::with(hook, || opened.save());
+
+        assert_eq!(
+            *steps.borrow(),
+            [
+                Step::Folder,
+                Step::Opened,
+                Step::Lock,
+                Step::Temporary,
+                Step::Validate,
+                Step::Publish,
+                Step::Observe
+            ]
+        );
+        assert_eq!(
+            names_in(&kept),
+            Vec::<std::ffi::OsString>::new(),
+            "a commit put an entry in the folder its document's folder was swapped for a link to"
+        );
+        assert!(
+            matches!(reduction, SaveReduction::ReconcileRequired { .. }),
+            "{reduction:?}"
+        );
+        assert_eq!(fs::read_to_string(aside.join("aterm.toml")).unwrap(), text);
+    }
+
+    /// NEGATIVE CONTROL for [`a_folder_swapped_for_a_link_mid_commit_never_makes_the_missing_file_elsewhere`]:
+    /// the same save with nothing swapped takes the same steps and makes the file in the
+    /// document's folder.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_commit_with_no_swap_makes_the_missing_file_in_its_folder() {
+        use seam::Step;
+
+        let dir = crate::test_scratch_dir("no-swap");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let scratch = root.join("scratch");
+        let kept = root.join("kept");
+        fs::create_dir(&scratch).unwrap();
+        fs::create_dir(&kept).unwrap();
+        let path = scratch.join("aterm.toml");
+        let text = "[harness]\noccupancy = \"cruise\"\n";
+        let mut opened = open_document(&path, ALLOW_MISSING);
+        opened.set_text(text);
+
+        let (steps, hook) = recording(|_| {});
+        let reduction = seam::with(hook, || opened.save());
+
+        assert_eq!(
+            *steps.borrow(),
+            [
+                Step::Folder,
+                Step::Opened,
+                Step::Lock,
+                Step::Temporary,
+                Step::Validate,
+                Step::Publish,
+                Step::Observe
+            ]
+        );
+        assert!(
+            matches!(reduction, SaveReduction::Durable(_)),
+            "{reduction:?}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(names_in(&kept), Vec::<std::ffi::OsString>::new());
+    }
+
+    /// A link put in place of a folder above the document's folder just before a commit opens
+    /// its folder, and the folder put back just after (before any check by path can see the
+    /// link), is refused there: the commit opens its folder without following a link at any
+    /// level, so it never works in the folder such a link names, whose own name matches
+    /// (`aterm`), not even for its save lock.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_on_the_path_only_while_the_commit_opens_its_folder_is_refused() {
+        use seam::Step;
+
+        let dir = crate::test_scratch_dir("link-on-open");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let agent = root.join("agent");
+        let aside = root.join("agent.aside");
+        let home = root.join("home");
+        let kept = home.join("aterm");
+        fs::create_dir_all(agent.join("aterm")).unwrap();
+        fs::create_dir_all(&kept).unwrap();
+        let path = agent.join("aterm").join("aterm.toml");
+        let mut opened = open_document(&path, ALLOW_MISSING);
+        opened.set_text("[harness]\noccupancy = \"cruise\"\n");
+
+        let (at, away, to) = (agent.clone(), aside.clone(), home.clone());
+        let (steps, hook) = recording(move |step| match step {
+            Step::Folder => link_in(&at, &away, &to),
+            Step::Opened => folder_back(&at, &away),
+            Step::Lock | Step::Temporary | Step::Validate | Step::Publish | Step::Observe => {}
+        });
+        let reduction = seam::with(hook, || opened.save());
+
+        assert_eq!(*steps.borrow(), [Step::Folder]);
+        assert_eq!(
+            names_in(&kept),
+            Vec::<std::ffi::OsString>::new(),
+            "a commit put an entry in the folder a link above its document's folder named"
+        );
+        assert!(
+            matches!(reduction, SaveReduction::Conflict(_)),
+            "{reduction:?}"
+        );
+        assert!(!aside.join("aterm").join("aterm.toml").exists());
+    }
+
+    /// While the file a document names is missing, its folder swapped for a link to another
+    /// folder just before any one step of a commit, and the link left there, never gets anything
+    /// in the folder it names, and the save is never reported durable: before the folder is
+    /// opened the link refuses it, after it each step works in the folder opened (the bytes land
+    /// there when the link came only for the publish), and a check by path sees the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_put_in_place_of_the_folder_before_any_step_gets_nothing_in_the_folder_it_names() {
+        use seam::Step;
+
+        for at_step in [
+            Step::Folder,
+            Step::Opened,
+            Step::Lock,
+            Step::Temporary,
+            Step::Validate,
+            Step::Publish,
+            Step::Observe,
+        ] {
+            let dir = crate::test_scratch_dir("link-each-step");
+            let root = fs::canonicalize(dir.path()).unwrap();
+            let scratch = root.join("scratch");
+            let aside = root.join("scratch.aside");
+            let kept = root.join("kept");
+            fs::create_dir(&scratch).unwrap();
+            fs::create_dir(&kept).unwrap();
+            let path = scratch.join("aterm.toml");
+            let mut opened = open_document(&path, ALLOW_MISSING);
+            opened.set_text("[harness]\noccupancy = \"cruise\"\n");
+
+            let (at, away, to) = (scratch.clone(), aside.clone(), kept.clone());
+            let (_, hook) = recording(move |step| {
+                if step == at_step {
+                    link_in(&at, &away, &to);
+                }
+            });
+            let reduction = seam::with(hook, || opened.save());
+
+            assert_eq!(
+                names_in(&kept),
+                Vec::<std::ffi::OsString>::new(),
+                "{at_step:?}: a commit put an entry in the folder a link in its folder's place named"
+            );
+            assert!(
+                !matches!(reduction, SaveReduction::Durable(_)),
+                "{at_step:?}: {reduction:?}"
+            );
+        }
+    }
+
+    /// A document's folder moved away, and a real folder made in its place, between a commit's
+    /// steps (after its temporary, before its last check) fails the save before anything is
+    /// published, as a folder that went missing while saving: the path no longer reaches the
+    /// folder the commit holds (device and inode), so neither that folder, wherever it went, nor
+    /// the new one gets the file, and the temporary goes with the failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_replaced_mid_commit_is_refused_before_anything_is_published() {
+        use seam::Step;
+
+        let dir = crate::test_scratch_dir("replaced-mid-commit");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let scratch = root.join("scratch");
+        let aside = root.join("scratch.aside");
+        fs::create_dir(&scratch).unwrap();
+        let path = scratch.join("aterm.toml");
+        let mut opened = open_document(&path, ALLOW_MISSING);
+        opened.set_text("[harness]\noccupancy = \"cruise\"\n");
+
+        let (at, away) = (scratch.clone(), aside.clone());
+        let (steps, hook) = recording(move |step| {
+            if step == Step::Validate {
+                fs::rename(&at, &away).unwrap();
+                fs::create_dir(&at).unwrap();
+            }
+        });
+        let reduction = seam::with(hook, || opened.save());
+
+        assert_eq!(
+            *steps.borrow(),
+            [
+                Step::Folder,
+                Step::Opened,
+                Step::Lock,
+                Step::Temporary,
+                Step::Validate
+            ]
+        );
+        assert!(
+            matches!(
+                reduction,
+                SaveReduction::Failed {
+                    stage: AtomicSaveStage::RenameTarget,
+                    cause: Some(SaveCause {
+                        kind: std::io::ErrorKind::NotFound,
+                        touch: SaveTouch::Folder,
+                    }),
+                    ..
+                }
+            ),
+            "{reduction:?}"
+        );
+        assert_eq!(names_in(&scratch), Vec::<std::ffi::OsString>::new());
+        assert_eq!(
+            names_in(&aside),
+            [std::ffi::OsString::from(".aterm.toml.aterm-write.lock")],
+            "only the save lock stays in the folder the commit held"
+        );
+    }
+
+    /// A document's folder moved away, and a real folder made in its place, once the file is
+    /// published in it (before the commit's last check) is never reported durable: the file is
+    /// in the folder the commit held, wherever it went, and the path names another folder now,
+    /// so the save asks to be reconciled.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_replaced_once_the_file_is_published_is_never_reported_durable() {
+        use seam::Step;
+
+        let dir = crate::test_scratch_dir("replaced-published");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let scratch = root.join("scratch");
+        let aside = root.join("scratch.aside");
+        fs::create_dir(&scratch).unwrap();
+        let path = scratch.join("aterm.toml");
+        let text = "[harness]\noccupancy = \"cruise\"\n";
+        let mut opened = open_document(&path, ALLOW_MISSING);
+        opened.set_text(text);
+
+        let (at, away) = (scratch.clone(), aside.clone());
+        let (steps, hook) = recording(move |step| {
+            if step == Step::Observe {
+                fs::rename(&at, &away).unwrap();
+                fs::create_dir(&at).unwrap();
+            }
+        });
+        let reduction = seam::with(hook, || opened.save());
+
+        assert_eq!(
+            *steps.borrow(),
+            [
+                Step::Folder,
+                Step::Opened,
+                Step::Lock,
+                Step::Temporary,
+                Step::Validate,
+                Step::Publish,
+                Step::Observe
+            ]
+        );
+        assert!(
+            matches!(reduction, SaveReduction::ReconcileRequired { .. }),
+            "{reduction:?}"
+        );
+        assert_eq!(fs::read_to_string(aside.join("aterm.toml")).unwrap(), text);
+        assert_eq!(names_in(&scratch), Vec::<std::ffi::OsString>::new());
+    }
+
+    /// A document's folder moved away, and a real folder made in its place, just before the
+    /// commit takes its save lock leaves that lock guarding no save of the path: the commit's
+    /// check after the lock sees the path reach another folder, and the commit starts again in
+    /// the folder the path names now, where the save lands. It starts again however long that
+    /// first attempt took: here past the whole retry budget, as on a loaded host.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_replaced_before_the_lock_starts_the_commit_again_in_the_new_folder() {
+        use seam::Step;
+
+        let dir = crate::test_scratch_dir("replaced-before-lock");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let scratch = root.join("scratch");
+        let aside = root.join("scratch.aside");
+        fs::create_dir(&scratch).unwrap();
+        let path = scratch.join("aterm.toml");
+        let text = "[harness]\noccupancy = \"cruise\"\n";
+        let mut opened = open_document(&path, ALLOW_MISSING);
+        opened.set_text(text);
+
+        let (at, away) = (scratch.clone(), aside.clone());
+        let mut replaced = false;
+        let (steps, hook) = recording(move |step| {
+            if step == Step::Lock && !replaced {
+                replaced = true;
+                fs::rename(&at, &away).unwrap();
+                fs::create_dir(&at).unwrap();
+                std::thread::sleep(PREFLIGHT_RETRY_BUDGET + std::time::Duration::from_millis(1));
+            }
+        });
+        let reduction = seam::with(hook, || opened.save());
+
+        assert_eq!(
+            *steps.borrow(),
+            [
+                Step::Folder,
+                Step::Opened,
+                Step::Lock,
+                Step::Folder,
+                Step::Opened,
+                Step::Lock,
+                Step::Temporary,
+                Step::Validate,
+                Step::Publish,
+                Step::Observe
+            ]
+        );
+        assert!(
+            matches!(reduction, SaveReduction::Durable(_)),
+            "{reduction:?}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(
+            names_in(&aside),
+            [std::ffi::OsString::from(".aterm.toml.aterm-write.lock")],
+            "only the first attempt's save lock stays in the folder moved away"
+        );
+    }
+
+    /// A commit's folder is reached by its path alone, never through a link: the path it was
+    /// opened by reaches it, and so does the path it was moved to; nothing there, or another
+    /// folder, does not; and a link in its place is refused as a link even when the link names
+    /// the folder itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_folder_is_never_reached_through_a_link_even_to_itself() {
+        let dir = crate::test_scratch_dir("held-folder");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let scratch = root.join("scratch");
+        let aside = root.join("scratch.aside");
+        fs::create_dir(&scratch).unwrap();
+        let held = Folder::open(&scratch, false).unwrap();
+        assert!(held.is_reached_by(&scratch).unwrap(), "its own path");
+
+        fs::rename(&scratch, &aside).unwrap();
+        assert!(
+            !held.is_reached_by(&scratch).unwrap(),
+            "nothing at its path"
+        );
+        assert!(held.is_reached_by(&aside).unwrap(), "the path it moved to");
+
+        std::os::unix::fs::symlink(&aside, &scratch).unwrap();
+        let through_link = held.is_reached_by(&scratch);
+        assert!(
+            through_link.as_ref().is_err_and(folder::is_link),
+            "a link to it: {through_link:?}"
+        );
+
+        fs::remove_file(&scratch).unwrap();
+        fs::create_dir(&scratch).unwrap();
+        assert!(!held.is_reached_by(&scratch).unwrap(), "another folder");
+    }
+
+    /// A config commit (`Settings`, which makes the folders a missing aterm.toml belongs in) whose
+    /// path has a folder swapped for a link just before it reaches into it, and back just after,
+    /// makes nothing where the link points, not even a folder: the missing folders are made one
+    /// by one, each in the folder above it as opened with no link on its path.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_commit_never_makes_its_missing_folders_where_a_link_points() {
+        use seam::Step;
+
+        let dir = crate::test_scratch_dir("config-swap");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let agent = root.join("agent");
+        let aside = root.join("agent.aside");
+        let home = root.join("home");
+        fs::create_dir(&agent).unwrap();
+        fs::create_dir(&home).unwrap();
+        let path = agent.join("aterm").join("aterm.toml");
+        let missing = read_config_atomic_file(&path, DEFAULT_DOCUMENT_LIMIT, true).unwrap();
+
+        let (at, away, to) = (agent.clone(), aside.clone(), home.clone());
+        let (steps, hook) = recording(move |step| match step {
+            Step::Folder => link_in(&at, &away, &to),
+            Step::Opened => folder_back(&at, &away),
+            Step::Lock | Step::Temporary | Step::Validate | Step::Publish | Step::Observe => {}
+        });
+        let result = seam::with(hook, || {
+            commit_atomic_bytes(&missing.baseline, b"[harness]\noccupancy = \"cruise\"\n")
+        });
+
+        assert_eq!(*steps.borrow(), [Step::Folder]);
+        assert_eq!(
+            names_in(&home),
+            Vec::<std::ffi::OsString>::new(),
+            "a config commit made an entry where a link on its path pointed"
+        );
+        assert!(
+            matches!(result, AtomicCommitResult::Conflict { .. }),
+            "{result:?}"
+        );
+        assert_eq!(names_in(&aside), Vec::<std::ffi::OsString>::new());
+    }
+
+    /// NEGATIVE CONTROL for [`a_config_commit_never_makes_its_missing_folders_where_a_link_points`]:
+    /// the same commit with nothing swapped makes the folder and the file where its path names.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_config_commit_with_no_swap_makes_its_folder_and_file() {
+        use seam::Step;
+
+        let dir = crate::test_scratch_dir("config-no-swap");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let agent = root.join("agent");
+        fs::create_dir(&agent).unwrap();
+        let path = agent.join("aterm").join("aterm.toml");
+        let missing = read_config_atomic_file(&path, DEFAULT_DOCUMENT_LIMIT, true).unwrap();
+
+        let (steps, hook) = recording(|_| {});
+        let result = seam::with(hook, || {
+            commit_atomic_bytes(&missing.baseline, b"font_px = 14\n")
+        });
+
+        assert_eq!(
+            *steps.borrow(),
+            [
+                Step::Folder,
+                Step::Opened,
+                Step::Lock,
+                Step::Temporary,
+                Step::Validate,
+                Step::Publish,
+                Step::Observe
+            ]
+        );
+        assert!(
+            matches!(result, AtomicCommitResult::Committed(_)),
+            "{result:?}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "font_px = 14\n");
+    }
+
+    /// The two openers of a commit's folder, the one-call open (macOS's `O_NOFOLLOW_ANY`) and
+    /// the name-by-name walk (Linux's), answer alike: the folder where the path reaches it by
+    /// real folders alone; a link in the place of the folder or of any folder above it is
+    /// refused as a link; a file where a folder of the path would be, or nothing there, as
+    /// missing.
+    #[cfg(unix)]
+    #[test]
+    fn both_folder_openers_refuse_a_link_anywhere_on_the_path() {
+        let dir = crate::test_scratch_dir("openers");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(root.join("real").join("inner")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        fs::write(root.join("file"), "").unwrap();
+
+        type Answer = fn(&std::io::Error) -> bool;
+        let cases: [(PathBuf, Option<Answer>); 6] = [
+            (root.join("real").join("inner"), None),
+            (root.clone(), None),
+            (root.join("link"), Some(folder::is_link)),
+            (root.join("link").join("inner"), Some(folder::is_link)),
+            (root.join("file"), Some(folder::is_missing)),
+            (root.join("file").join("inner"), Some(folder::is_missing)),
+        ];
+        for (path, refused) in cases {
+            let walked = folder::walk(&path).map(|_| ());
+            let opened = Folder::open(&path, false).map(|_| ());
+            for (opener, answer) in [("walk", walked), ("open", opened)] {
+                match (refused, answer) {
+                    (None, Ok(())) => {}
+                    (Some(expected), Err(error)) if expected(&error) => {}
+                    (_, answer) => panic!("{opener} {}: {answer:?}", path.display()),
+                }
+            }
+        }
+        assert!(
+            folder::is_missing(&Folder::open(&root.join("nothing"), false).err().unwrap()),
+            "nothing there is missing"
+        );
+    }
+
+    /// A document under a folder this user may only search (`--x`, no read) saves, as it did when
+    /// a commit worked by path: opening the commit's folder with no link on its path needs only
+    /// the permissions a path's lookup needs (macOS's one open, Linux's walk by `O_PATH`).
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_document_under_a_folder_this_user_may_only_search_saves() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// Gives `above` its read bit back however the test ends, so its scratch can go.
+        struct Readable(PathBuf);
+        impl Drop for Readable {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let dir = crate::test_scratch_dir("search-only-above");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let above = root.join("above");
+        let docs = above.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        let path = docs.join("note.md");
+        fs::write(&path, "before\n").unwrap();
+        let mut opened = open_document(&path, AdmitOptions::DOCUMENT);
+        opened.set_text("after\n");
+
+        let _readable = Readable(above.clone());
+        fs::set_permissions(&above, fs::Permissions::from_mode(0o100)).unwrap();
+        assert_eq!(
+            fs::read_dir(&above).err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "the folder above is search-only for this user"
+        );
+        let reduction = opened.save();
+        assert!(
+            matches!(reduction, SaveReduction::Durable(_)),
+            "{reduction:?}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
+    }
+
+    /// A document in a folder this user may write and search but not list (`-wx`, a drop box)
+    /// saves, as it did when a commit worked by path: the commit holds its folder to look names
+    /// up in alone (macOS's `O_SEARCH`, Linux's `O_PATH`), never for reading. macOS syncs the
+    /// folder through that handle, so the save is durable; Linux opens the folder for reading
+    /// to sync it, which it may not, so there the bytes are published and the save says it
+    /// could not sync the folder.
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_document_in_a_folder_this_user_may_write_and_search_but_not_list_saves() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// Gives `docs` its read bit back however the test ends, so its scratch can go.
+        struct Listable(PathBuf);
+        impl Drop for Listable {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let dir = crate::test_scratch_dir("write-search-only");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let docs = root.join("docs");
+        fs::create_dir(&docs).unwrap();
+        let path = docs.join("note.md");
+        fs::write(&path, "before\n").unwrap();
+        let mut opened = open_document(&path, AdmitOptions::DOCUMENT);
+        opened.set_text("after\n");
+
+        let _listable = Listable(docs.clone());
+        fs::set_permissions(&docs, fs::Permissions::from_mode(0o300)).unwrap();
+        assert_eq!(
+            fs::read_dir(&docs).err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "the document's folder is write and search only for this user"
+        );
+        let reduction = opened.save();
+        #[cfg(target_vendor = "apple")]
+        assert!(
+            matches!(reduction, SaveReduction::Durable(_)),
+            "{reduction:?}"
+        );
+        #[cfg(not(target_vendor = "apple"))]
+        assert!(
+            matches!(
+                reduction,
+                SaveReduction::ReconcileRequired {
+                    stage: AtomicSaveStage::SyncDirectory,
+                    ..
+                }
+            ),
+            "{reduction:?}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
     }
 
     /// NEGATIVE CONTROL: a save lock owned by another UID must be refused with

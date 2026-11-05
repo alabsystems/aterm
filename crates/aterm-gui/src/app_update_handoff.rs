@@ -273,6 +273,8 @@ struct HandoffWorkerJob {
     parked_under: Option<aterm_update_core::handoff_policy::CarryCeiling>,
     successor_grant_chunks: bool,
     successor_grant_empty: bool,
+    /// The target declares `desk1`: a layout may carry a lone Workers list to it.
+    successor_grant_desk: bool,
     command: aterm_uds::spawnfd::StdCommand,
     capture: Option<HandoffCapture>,
     #[cfg(target_os = "macos")]
@@ -304,6 +306,9 @@ pub(crate) struct ParkPolicy {
     /// The successor reads a sessionless grant (`empty1`), so a park with no terminal session
     /// may still hand over.
     pub(crate) grant_empty: bool,
+    /// The successor rebuilds a window that held only an empty Workers list (`desk1`), so a park
+    /// carries that window's row.
+    pub(crate) grant_desk: bool,
 }
 
 #[cfg(unix)]
@@ -400,6 +405,7 @@ impl PreverifyPublisher {
                 policy,
                 grant_chunks: facts.grant_chunks,
                 grant_empty: facts.grant_empty,
+                grant_desk: facts.grant_desk,
             });
         policy
     }
@@ -422,6 +428,7 @@ impl PreverifyPublisher {
                 policy: None,
                 grant_chunks: false,
                 grant_empty: false,
+                grant_desk: false,
             });
     }
 
@@ -437,6 +444,7 @@ impl PreverifyPublisher {
                 policy: read.clone(),
                 grant_chunks: false,
                 grant_empty: false,
+                grant_desk: false,
             },
             current_build,
             candidate,
@@ -497,6 +505,7 @@ struct HandoffLaneFacts {
     sessions: usize,
     grant_chunks: bool,
     grant_empty: bool,
+    grant_desk: bool,
     environment_is_a_merge: bool,
 }
 
@@ -552,8 +561,8 @@ enum SessionlessLane {
 #[cfg(target_os = "macos")]
 const NO_WINDOW: &str = "no window is open to hand over";
 
-/// The sessionless lane's refusal when no open tab is one the successor restores
-/// ([`held_by_the_desk`]).
+/// The sessionless lane's refusal when no open tab is one the successor restores and it rebuilds
+/// no lone Workers list ([`held_by_the_desk`]).
 #[cfg(target_os = "macos")]
 const NO_RESTORABLE_TAB: &str = "no open tab is one the new build can restore";
 
@@ -575,6 +584,9 @@ struct SessionlessFacts {
     window: bool,
     /// The handed layout holds a tab the successor restores (`App::capture_handoff_layout`).
     layout: bool,
+    /// An empty Workers list is all every window holds
+    /// (`app_workers::workers_list_stands_alone`), which a target that declares `desk1` rebuilds.
+    workers_alone: bool,
     /// The launched lane's facts for this attempt.
     lane: HandoffLaneFacts,
     /// A same-image handoff, whose target is this very build: it has no verdict to read.
@@ -589,9 +601,11 @@ struct SessionlessFacts {
 /// lane choice ([`out_of_band_lane_refusal`]) will judge it. A cause of this process or machine,
 /// which nothing at the desk clears, is named before the desk's (no window, no restorable tab),
 /// so a renewal it refuses is counted however the desk stands; and a cause the verdict cannot
-/// change is named before an unread verdict is waited for. A failed verdict is the attempt's
-/// own failure only on a kept image; a replaceable image leaves it to the cold lane, which lets
-/// a person's press relaunch and verify the stage again.
+/// change is named before an unread verdict is waited for. A desk of lone Workers lists is not
+/// such a cause: only the target's read says whether it declares `desk1`, so that desk waits for
+/// the read and names itself after it. A failed verdict is the attempt's own failure only on a
+/// kept image; a replaceable image leaves it to the cold lane, which lets a person's press
+/// relaunch and verify the stage again.
 #[cfg(target_os = "macos")]
 #[must_use]
 const fn sessionless_lane(facts: SessionlessFacts) -> SessionlessLane {
@@ -605,7 +619,7 @@ const fn sessionless_lane(facts: SessionlessFacts) -> SessionlessLane {
     if !facts.window {
         return SessionlessLane::Cannot(NO_WINDOW);
     }
-    if !facts.layout {
+    if !facts.layout && !facts.workers_alone {
         return SessionlessLane::Cannot(NO_RESTORABLE_TAB);
     }
     if !facts.same_image {
@@ -617,6 +631,9 @@ const fn sessionless_lane(facts: SessionlessFacts) -> SessionlessLane {
             }
             Some(true) => {}
         }
+    }
+    if !facts.layout && !facts.lane.grant_desk {
+        return SessionlessLane::Cannot(NO_RESTORABLE_TAB);
     }
     match out_of_band_lane_refusal(facts.lane) {
         Some(reason) => SessionlessLane::Cannot(reason),
@@ -1001,25 +1018,24 @@ impl HandoffWorkerCleanup {
 
 #[cfg(unix)]
 fn make_cloexec_pipe() -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
-    use std::os::fd::FromRawFd as _;
-    let mut raw = [0i32; 2];
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let created = unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC) };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let created = unsafe { libc::pipe(raw.as_mut_ptr()) };
-    if created != 0 {
-        return None;
-    }
-    // SAFETY: fresh pipe fds, exclusively owned from here.
-    let rd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw[0]) };
-    let wr = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw[1]) };
-    use std::os::fd::AsRawFd as _;
-    if aterm_pty::set_cloexec(rd.as_raw_fd(), true).is_err()
-        || aterm_pty::set_cloexec(wr.as_raw_fd(), true).is_err()
-    {
-        return None;
-    }
-    Some((rd, wr))
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    aterm_uds::kept_out(|| {
+        let mut raw = [0i32; 2];
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let created = unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC) };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let created = unsafe { libc::pipe(raw.as_mut_ptr()) };
+        if created != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fresh pipe fds, exclusively owned from here.
+        let rd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw[0]) };
+        let wr = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw[1]) };
+        aterm_pty::set_cloexec(rd.as_raw_fd(), true)?;
+        aterm_pty::set_cloexec(wr.as_raw_fd(), true)?;
+        Ok((rd, wr))
+    })
+    .ok()
 }
 
 #[cfg(unix)]
@@ -1918,6 +1934,7 @@ impl ColdRelaunch {
                 policy: None,
                 grant_chunks: false,
                 grant_empty: false,
+                grant_desk: false,
             },
             roster_wait,
             dmg_sha256: crate::app_native::decode_dmg_sha256(&self.artifact),
@@ -2290,6 +2307,7 @@ fn worker_pre_park_check(
         };
         job.successor_grant_chunks = facts.grant_chunks;
         job.successor_grant_empty = facts.grant_empty;
+        job.successor_grant_desk = facts.grant_desk;
         let adopted = job.preverified.as_ref().and_then(|publisher| {
             publisher.publish_pass(
                 &facts,
@@ -2573,6 +2591,27 @@ fn preparation_failure_of_write(
     }
 }
 
+/// The wire form of the layout a park captured, or why it may not go. A target that does not
+/// declare `desk1` refuses a layout of lone Workers lists whole and opens a new shell for one
+/// beside a tab, so it is never sent one, whatever the capture holds.
+#[cfg(unix)]
+fn outgoing_layout_wire(
+    layout: &crate::restore::RestoreManifest,
+    target_declares_desk: bool,
+) -> Result<String, &'static str> {
+    if layout.carries_lone_workers_list() && !target_declares_desk {
+        return Err("the handoff layout carries a Workers list the successor does not declare");
+    }
+    layout
+        .to_toml()
+        .ok()
+        .filter(|wire| {
+            !layout.is_empty()
+                && crate::restore::RestoreManifest::from_toml(wire).as_ref() == Some(layout)
+        })
+        .ok_or("could not persist the bounded handoff layout")
+}
+
 #[cfg(unix)]
 fn prepare_outgoing_artifacts(
     job: &mut HandoffWorkerJob,
@@ -2582,18 +2621,13 @@ fn prepare_outgoing_artifacts(
     let started = std::time::Instant::now();
     let target_build = job.target_build;
     let target_commit = job.target_commit.clone();
+    let target_declares_desk = job.successor_grant_desk;
     let capture = job
         .capture
         .as_mut()
         .expect("the artifacts are prepared from the park's capture");
-    let Some(layout_wire) = capture.layout.to_toml().ok().filter(|wire| {
-        !capture.layout.is_empty()
-            && crate::restore::RestoreManifest::from_toml(wire).as_ref() == Some(&capture.layout)
-    }) else {
-        return Err(PreparationFailure::Producer(
-            "could not persist the bounded handoff layout".to_string(),
-        ));
-    };
+    let layout_wire = outgoing_layout_wire(&capture.layout, target_declares_desk)
+        .map_err(|why| PreparationFailure::Producer(why.to_string()))?;
     if crate::seamless::layout_wire_digest(&layout_wire) != Some(capture.layout_digest) {
         return Err(PreparationFailure::Producer(
             "handoff layout carry did not match the committed layout digest".to_string(),
@@ -4937,6 +4971,34 @@ impl App {
         }
     }
 
+    /// The launched lane's facts, with the target's grants as a passed read of it declared them.
+    #[cfg(target_os = "macos")]
+    fn launched_lane_facts(
+        &self,
+        apply_attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
+        same_image: Option<SameImageHandoff>,
+        bundled: bool,
+        target_not_older: bool,
+        sessions: usize,
+        environment_is_a_merge: bool,
+    ) -> HandoffLaneFacts {
+        let policy = self.park_policy(apply_attempt);
+        HandoffLaneFacts {
+            bundled,
+            launcher_available: true,
+            socket_path_fits: crate::handoff_rendezvous::rendezvous_path_fits(),
+            target_not_older,
+            sessions,
+            grant_chunks: policy.grant_chunks
+                || same_image.is_some_and(SameImageHandoff::renews_launch_record),
+            // A same-image handoff (`DebugSeam`, a launch-record renewal) targets this very
+            // build, which reads a sessionless grant and rebuilds a lone Workers list.
+            grant_empty: policy.grant_empty || same_image.is_some(),
+            grant_desk: policy.grant_desk || same_image.is_some(),
+            environment_is_a_merge,
+        }
+    }
+
     #[cfg(unix)]
     fn start_unix_update_handoff(
         &mut self,
@@ -4990,21 +5052,14 @@ impl App {
         let bundle = app_bundle_root(&exe);
         // One reading of the launched lane's facts, for the admission and the lane choice alike.
         #[cfg(target_os = "macos")]
-        let lane_facts = {
-            let policy = self.park_policy(apply_attempt.as_ref());
-            HandoffLaneFacts {
-                bundled: bundle.is_some(),
-                launcher_available: true,
-                socket_path_fits: crate::handoff_rendezvous::rendezvous_path_fits(),
-                target_not_older: target_build >= build,
-                sessions: live.len(),
-                grant_chunks: policy.grant_chunks || renewal,
-                // A same-image handoff (`DebugSeam`, a launch-record renewal) targets this very
-                // build, which reads a sessionless grant.
-                grant_empty: policy.grant_empty || same_image.is_some(),
-                environment_is_a_merge: launch_environment(&command).is_some(),
-            }
-        };
+        let lane_facts = self.launched_lane_facts(
+            apply_attempt.as_ref(),
+            same_image,
+            bundle.is_some(),
+            target_build >= build,
+            live.len(),
+            launch_environment(&command).is_some(),
+        );
         let lane = self.admit_update_handoff(
             &live,
             AdmissionInputs {
@@ -5270,6 +5325,7 @@ impl App {
                 verify_staged_candidate,
                 grant_chunks: lane_facts.grant_chunks,
                 grant_empty: lane_facts.grant_empty,
+                grant_desk: lane_facts.grant_desk,
                 sessionless: live.is_empty(),
                 installed_activation,
                 bundle,
@@ -5462,6 +5518,7 @@ impl App {
             target_build,
             target_commit: target_commit.clone(),
             layout: layout.clone(),
+            carry_lone_lists: false,
             layout_digest,
             screen_digest,
             activity_epoch,
@@ -5490,6 +5547,7 @@ impl App {
             parked_under: Some(ceiling),
             successor_grant_chunks: false,
             successor_grant_empty: false,
+            successor_grant_desk: false,
             command,
             capture: Some(HandoffCapture {
                 #[cfg(target_os = "macos")]
@@ -6367,6 +6425,7 @@ impl App {
             verify_staged_candidate,
             grant_chunks,
             grant_empty,
+            grant_desk,
             sessionless,
             installed_activation,
             bundle,
@@ -6378,7 +6437,7 @@ impl App {
         } = args;
         let nonce = crate::seamless::mint_outgoing_nonce();
         let warm_hint = self.handoff_warm_hint();
-        let speculative_layout = Some(self.capture_handoff_layout());
+        let speculative_layout = Some(self.capture_handoff_layout_for(grant_desk));
         let (stand_down_tx, stand_down_rx) = std::sync::mpsc::sync_channel(1);
         let (stand_down_ack_tx, stand_down_ack_rx) = std::sync::mpsc::sync_channel(1);
         let (transfer_tx, transfer_rx) = std::sync::mpsc::sync_channel(1);
@@ -6443,6 +6502,7 @@ impl App {
             parked_under: None,
             successor_grant_chunks: grant_chunks,
             successor_grant_empty: grant_empty,
+            successor_grant_desk: grant_desk,
             command,
             capture: None,
             prelaunch: Some(HandoffPrelaunchLane {
@@ -7076,7 +7136,8 @@ impl App {
         let carried_claims = stamp_claim_banners(carried_claims, &status);
         let manifest = stamp_autopilot_end(manifest, &self.end_carry_rows());
         let manifest = stamp_fleet_told(manifest, self.fleet_told_rows());
-        let layout = self.capture_handoff_layout();
+        let carry_lone_lists = policy.grant_desk || same_image.is_some();
+        let layout = self.capture_handoff_layout_for(carry_lone_lists);
         let layout_digest = match commit_handoff_layout(&layout) {
             Ok(digest) => digest,
             Err(refusal) => {
@@ -7107,6 +7168,7 @@ impl App {
             target_build,
             target_commit,
             layout: layout.clone(),
+            carry_lone_lists,
             layout_digest,
             screen_digest,
             activity_epoch,
@@ -7414,6 +7476,7 @@ impl App {
         let pending_target_build = pending.target_build;
         let pending_target_commit = pending.target_commit.clone();
         let pending_layout = pending.layout.clone();
+        let pending_carry_lone_lists = pending.carry_lone_lists;
         let pending_layout_digest = pending.layout_digest;
         let pending_screen_digest = pending.screen_digest;
         let pending_activity_epoch = pending.activity_epoch;
@@ -7478,7 +7541,9 @@ impl App {
         let mut expected_live = pending_live.clone();
         expected_live.sort_unstable();
         let exact_sessions = current_live == expected_live;
-        let live_layout = self.capture_handoff_layout();
+        // As the park captured: a window that went lone in the freeze changes the topology either
+        // way, so it still stands down.
+        let live_layout = self.capture_handoff_layout_for(pending_carry_lone_lists);
         let exact_layout =
             commit_layout_topology(&live_layout) == commit_layout_topology(&pending_layout);
         let exact_agent_carry =
@@ -8572,8 +8637,8 @@ impl App {
     }
 
     /// How an attempt with no live terminal session stands: only the launched lane carries one,
-    /// to a successor that reads a sessionless grant, and only windows with a restorable tab
-    /// give it something to hand over.
+    /// to a successor that reads a sessionless grant, and only windows with a restorable tab, or
+    /// lone Workers lists for a target that declares desk1, give it something to hand over.
     #[cfg(target_os = "macos")]
     fn sessionless_lane(
         &self,
@@ -8584,6 +8649,10 @@ impl App {
         sessionless_lane(SessionlessFacts {
             window: !self.windows.is_empty(),
             layout: !self.capture_handoff_layout().is_empty(),
+            workers_alone: self
+                .windows
+                .values()
+                .all(|ws| crate::app_workers::workers_list_stands_alone(ws)),
             lane,
             same_image: same_image.is_some(),
             verdict: attempt.and_then(|attempt| self.cached_handoff_preverification(attempt)),
@@ -8731,6 +8800,7 @@ impl App {
                 known: true,
                 grant_chunks: entry.grant_chunks,
                 grant_empty: entry.grant_empty,
+                grant_desk: entry.grant_desk,
             })
     }
 
@@ -9701,6 +9771,7 @@ struct PrelaunchArgs {
     verify_staged_candidate: bool,
     grant_chunks: bool,
     grant_empty: bool,
+    grant_desk: bool,
     sessionless: bool,
     installed_activation: bool,
     bundle: Option<std::path::PathBuf>,
@@ -10115,7 +10186,7 @@ pub(crate) const MESSAGES_FLUSH_COMMIT_WAIT: std::time::Duration =
     std::time::Duration::from_millis(250);
 
 #[cfg(all(unix, not(test)))]
-const COLD_EXEC_REAP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const COLD_EXEC_REAP_WAIT: std::time::Duration = aterm_pty::REAP_GRACE_WAIT;
 #[cfg(all(unix, test))]
 const COLD_EXEC_REAP_WAIT: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 

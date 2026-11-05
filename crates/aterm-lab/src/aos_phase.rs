@@ -876,6 +876,7 @@ mod tests {
             input: MomentumEvent::Key {
                 at: at_ms * 1_000_000,
                 tau_bits: 1.2f32.to_bits(),
+                echo: aterm_effects::aos_momentum::KeyEcho::Seen,
             },
             obs: MomentumObservation::Keyed,
         }
@@ -1333,9 +1334,10 @@ mod tests {
     /// `ev` with its time moved `by` ns later: a lane's call (ns from the lane's origin) as the log records it (ns from the attach epoch).
     fn later(ev: MomentumEvent, by: i128) -> MomentumEvent {
         match ev {
-            MomentumEvent::Key { at, tau_bits } => MomentumEvent::Key {
+            MomentumEvent::Key { at, tau_bits, echo } => MomentumEvent::Key {
                 at: at + by,
                 tau_bits,
+                echo,
             },
             MomentumEvent::Tick { cur, at, geom, cfg } => MomentumEvent::Tick {
                 cur,

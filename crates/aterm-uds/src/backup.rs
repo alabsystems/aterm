@@ -67,7 +67,17 @@ impl Backups {
         if self.arm == Arm::Inert {
             return Ok(());
         }
-        self.exclude(&File::open(path)?)
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(path)?
+        };
+        #[cfg(not(unix))]
+        let file = File::open(path)?;
+        self.exclude(&file)
     }
 
     /// Whether the open `file` is left out of backups: never on a system with no mark.

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What one run measures, read from `ENV`.
+//! Measurement knobs read from [`ENV`], with an OS-native output path from [`OUT_ENV`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The variable that names the run.
 pub const ENV: &str = "FABRIC_BENCH";
+
+/// The OS-native output directory, separate from measurement knobs.
+pub const OUT_ENV: &str = "FABRIC_BENCH_OUT";
 
 /// Maximum posts one sender session queues in a burst.
 pub const PER_SENDER: usize = 100;
@@ -74,6 +77,10 @@ pub struct Spec {
     pub horizon_ms: Option<u64>,
     /// Whether each world's broker retains its log by default rules.
     pub retention: bool,
+    /// Whether each world's broker limits each producer's publishes by aterm's default rate limit
+    /// (`aterm_link::broker_rules::limit`), as `aterm link broker` opens every broker: on unless a
+    /// run names it off.
+    pub rate_limit: bool,
     /// Whether each world's log is sealed at rest under a key, as `aterm link broker` opens a log
     /// with a `rest.key` beside it: on unless a run names it off, what a fabric root ships.
     pub at_rest: bool,
@@ -113,6 +120,70 @@ pub struct Spec {
     /// every round's rows. Off (the default) boots those worlds as before, since the tally's own
     /// idle writes move what they measure; the ping-pong world counts with both always.
     pub tally: bool,
+    /// Where each world's broker runs (F02): in this process at its priority (the default), or
+    /// as this build's `aterm link broker` started with the argv its launchd job runs, in the
+    /// task type of a `Background` job or of an `Interactive` one.
+    pub broker_process: BrokerProcess,
+}
+
+/// Where a world's broker runs (`broker_process=`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BrokerProcess {
+    /// astream's `Broker` served inside the bench process, at the bench's own priority: every
+    /// broker-atomic stamp (acked, durable, flushes, ticks) is read off it.
+    #[default]
+    Inproc,
+    /// `aterm link broker` started as a background daemon, as the shipped `ProcessType`
+    /// `Background` job starts it: every thread at priority 4 (darwin-bg).
+    Background,
+    /// `aterm link broker` started as an interactive daemon, as a `ProcessType` `Interactive`
+    /// job starts it: each thread at the class it asks for (31 at the default class).
+    Interactive,
+}
+
+impl BrokerProcess {
+    /// The word [`parse`] reads and the report prints.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Inproc => "inproc",
+            Self::Background => "background",
+            Self::Interactive => "interactive",
+        }
+    }
+
+    /// Parse `inproc`, `background` or `interactive`.
+    ///
+    /// # Errors
+    /// Any other word.
+    pub fn parse(word: &str) -> Result<Self, String> {
+        match word {
+            "inproc" => Ok(Self::Inproc),
+            "background" => Ok(Self::Background),
+            "interactive" => Ok(Self::Interactive),
+            _ => Err(format!(
+                "{ENV}: `broker_process=` is `inproc`, `background` or `interactive`, not \
+                 `{word}`"
+            )),
+        }
+    }
+
+    /// Whether the broker runs in a process of its own.
+    #[must_use]
+    pub const fn outside(self) -> bool {
+        !matches!(self, Self::Inproc)
+    }
+
+    /// What the arm's broker runs as, in a report's prose: `a background daemon`, `an
+    /// interactive daemon`, or astream's broker in the bench's process.
+    #[must_use]
+    pub const fn runs_as(self) -> &'static str {
+        match self {
+            Self::Inproc => "astream's `Broker` in the bench's process",
+            Self::Background => "a background daemon",
+            Self::Interactive => "an interactive daemon",
+        }
+    }
 }
 
 /// The scenarios measured in one run.
@@ -260,7 +331,8 @@ impl Spec {
         self.burst.div_ceil(PER_SENDER)
     }
 
-    /// Formats the spec as key=value words that [`parse`] reads.
+    /// Formats the measurement knobs as key=value words that [`parse`] reads. The output
+    /// directory is supplied separately and is not part of the workload.
     #[must_use]
     pub fn words(&self) -> String {
         let attach: Vec<String> = self.attach.iter().map(usize::to_string).collect();
@@ -301,6 +373,12 @@ impl Spec {
         if self.tally {
             words.push_str(" tally=on");
         }
+        // Always named: an entry from before the default limit names none and ran unlimited.
+        words.push_str(if self.rate_limit {
+            " rate_limit=on"
+        } else {
+            " rate_limit=off"
+        });
         if self.scenario != Scenario::All {
             words.push_str(&format!(" scenario={}", self.scenario.word()));
         }
@@ -308,11 +386,14 @@ impl Spec {
         if let Some(ms) = self.horizon_ms {
             words.push_str(&format!(" horizon_ms={ms}"));
         }
+        if self.broker_process.outside() {
+            words.push_str(&format!(" broker_process={}", self.broker_process.word()));
+        }
         words
     }
 }
 
-/// Parse a `FABRIC_BENCH` specification string.
+/// Parse `FABRIC_BENCH` measurement knobs with their separate output path.
 ///
 /// # Errors
 /// A word or value it does not know, a count that is not a positive integer
@@ -324,11 +405,15 @@ impl Spec {
 /// its attach sizes or on a run that measures no attach, an asked prefill past
 /// [`ASKED_PREFILL_MAX`] or on a run that measures no ask, paced notes past
 /// [`PACED_NOTES_MAX`] or on a run that measures no messaging, `tally=on` on a run that measures
-/// only the ping-pong world (which counts with both tallies anyway), or no `out=`.
-pub fn parse(raw: &str) -> Result<Spec, String> {
-    let mut out = None;
+/// only the ping-pong world (which counts with both tallies anyway), a broker in a process of its
+/// own with a knob its shipped argv cannot carry or a world it does not measure
+/// ([`outside_refusal`]), or an empty output path.
+pub fn parse(raw: &str, out: &Path) -> Result<Spec, String> {
+    if out.as_os_str().is_empty() {
+        return Err(format!("{OUT_ENV} names where the report goes"));
+    }
     let mut spec = Spec {
-        out: PathBuf::new(),
+        out: out.to_path_buf(),
         scenario: Scenario::default(),
         samples: DEFAULT_SAMPLES,
         warmup: DEFAULT_WARMUP,
@@ -339,6 +424,7 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         durability: Tier::default(),
         horizon_ms: None,
         retention: true,
+        rate_limit: true,
         at_rest: true,
         log: Log::default(),
         retention_interval_ms: None,
@@ -350,6 +436,7 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         asked_prefill: 0,
         paced_notes: 0,
         tally: false,
+        broker_process: BrokerProcess::default(),
     };
     let count = |key: &str, v: &str, zero_ok: bool| -> Result<usize, String> {
         match v.parse::<usize>() {
@@ -365,7 +452,6 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
             .split_once('=')
             .ok_or_else(|| format!("{ENV}: `{word}` is not a key=value word"))?;
         match key {
-            "out" if !v.is_empty() => out = Some(PathBuf::from(v)),
             "scenario" => spec.scenario = Scenario::parse(v)?,
             "samples" => spec.samples = count(key, v, false)?,
             "warmup" => spec.warmup = count(key, v, true)?,
@@ -381,8 +467,10 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
             "paced_notes" => spec.paced_notes = count(key, v, true)?,
             "durability" => spec.durability = Tier::parse(v)?,
             "retention" => spec.retention = on_off(key, v)?,
+            "rate_limit" => spec.rate_limit = on_off(key, v)?,
             "at_rest" => spec.at_rest = on_off(key, v)?,
             "tally" => spec.tally = on_off(key, v)?,
+            "broker_process" => spec.broker_process = BrokerProcess::parse(v)?,
             "log" => spec.log = Log::parse(v)?,
             "retention_interval_ms" => {
                 spec.retention_interval_ms = Some(count(key, v, false)? as u64);
@@ -401,7 +489,6 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
             _ => return Err(format!("{ENV}: unknown word `{word}`")),
         }
     }
-    spec.out = out.ok_or_else(|| format!("{ENV}: `out=<dir>` names where the report goes"))?;
     match (spec.durability, spec.horizon_ms) {
         (Tier::Ordered, None) => spec.horizon_ms = Some(ORDERED_HORIZON_MS),
         (Tier::Ordered, Some(_)) | (_, None) => {}
@@ -480,15 +567,61 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
              ping-pong world counts with both tallies on in every run"
         ));
     }
+    if let Some(why) = outside_refusal(&spec) {
+        return Err(format!(
+            "{ENV}: broker_process={} runs `aterm link broker` as it ships, {why}",
+            spec.broker_process.word()
+        ));
+    }
     Ok(spec)
+}
+
+/// Why a run with its broker in a process of its own ([`BrokerProcess::outside`]) cannot be the
+/// one `spec` names: the shipped argv takes a tier and a key beside the log and nothing else of
+/// what the bench sets on an in-process broker, and the out-of-process worlds are the messaging,
+/// ping-pong and attach worlds' outside stamps only (`run::outside`).
+fn outside_refusal(spec: &Spec) -> Option<String> {
+    if !spec.broker_process.outside() {
+        return None;
+    }
+    let refused = |what: &str| Some(what.to_string());
+    if !cfg!(target_os = "macos") {
+        return refused("as the task type of a macOS launchd job, which this system has none of");
+    }
+    if matches!(spec.scenario, Scenario::Handoff | Scenario::Ask) {
+        return refused("which measures the messaging, ping-pong and attach worlds only");
+    }
+    if spec.horizon_ms.is_some_and(|ms| ms != ORDERED_HORIZON_MS) {
+        return Some(format!(
+            "whose ordered horizon is {ORDERED_HORIZON_MS} ms: name no horizon_ms="
+        ));
+    }
+    if !spec.retention || spec.retention_interval_ms.is_some() {
+        return refused("retained by aterm's default rules on astream's minute tick");
+    }
+    if !spec.rate_limit {
+        return refused("under aterm's default rate limit");
+    }
+    if spec.log != Log::Auto {
+        return refused("with the bridge's auto mirror");
+    }
+    if spec.backlog > 0 || spec.paced_notes > 0 || spec.bystanders > 0 || spec.tally {
+        return refused(
+            "and its worlds take no backlog=, paced_notes=, bystanders= or tally=on: they read \
+             the outside stamps alone",
+        );
+    }
+    None
 }
 
 /// Parse [`Spec`] from [`ENV`].
 ///
 /// # Errors
-/// Missing, non-Unicode or malformed input.
+/// Missing knobs or output path, non-Unicode knobs, or malformed input.
 pub fn from_env() -> Result<Spec, String> {
     let raw = std::env::var(ENV)
         .map_err(|e| format!("{ENV} is required (`verify perf fabric` sets it): {e}"))?;
-    parse(&raw)
+    let out = std::env::var_os(OUT_ENV)
+        .ok_or_else(|| format!("{OUT_ENV} is required (`verify perf fabric` sets it)"))?;
+    parse(&raw, Path::new(&out))
 }

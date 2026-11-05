@@ -662,10 +662,16 @@ fn files_named(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
-    entries.sort();
-    for p in entries {
-        if p.is_dir() {
+    let mut entries: Vec<(PathBuf, Option<std::fs::FileType>)> = rd
+        .flatten()
+        .map(|e| (e.path(), e.file_type().ok()))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (p, ft) in entries {
+        let is_dir = ft
+            .map(|ft| ft.is_dir() || (ft.is_symlink() && p.is_dir()))
+            .unwrap_or(false);
+        if is_dir {
             if p.file_name().is_some_and(|n| n != "subagent") {
                 files_named(&p, name, out);
             }

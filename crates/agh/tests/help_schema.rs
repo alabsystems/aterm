@@ -249,7 +249,11 @@ fn schema_nouns_and_verbs() {
     let (_, captured) = run(&["schema", "verbs"]);
     let verbs = common::stdout_json(&captured);
     let verbs = verbs.as_array().expect("an array");
-    assert_eq!(verbs.len(), 45);
+    let paths: std::collections::BTreeSet<_> = verbs
+        .iter()
+        .map(|verb| verb["path"].as_str().expect("a verb path"))
+        .collect();
+    assert_eq!(paths.len(), verbs.len(), "verb paths must be unambiguous");
     let download = verbs
         .iter()
         .find(|v| v["path"] == Value::from("release.download"))

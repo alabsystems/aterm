@@ -92,7 +92,8 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   off in System State (all after a Stop) stays as is unless a flag names it; one turned
   off mid-run stays as is. A setting you changed stays yours till Set up now or aterm
   doctor --apply. --plan reports, --check only reads, --json prints JSON, --verbose every
-  row; --only runs those ids, families or groups (base, github, dock, ...); --[no-]develop
+  row. Agent and headless checks relay the coordinator's last published observation.
+  --only runs those ids, families or groups (base, github, dock, ...); --[no-]develop
   records or drops this checkout as a develop machine; --no-wait waits for no System State
   pass (else 10 min); --converge runs one pass now. Exit: 0 done, or left to the vault or
   a person (--check: 77); 75 a lock or step, 77 a permission, 69 offline; 1 else; 2 usage.
@@ -260,6 +261,7 @@ impl Choice {
     /// ([`aterm_types::macos_setup::BASE_PLAN`]) and each group's own.
     fn selection(self) -> Selection {
         let mut selection = aterm_types::macos_setup::BASE_PLAN;
+        selection.set(Setting::Repositories, self.clone);
         for setting in Setting::ALL {
             if self.names(setting) {
                 selection.set(setting, true);
@@ -438,7 +440,14 @@ impl Picks {
     /// The groups a run takes on a Mac `alab` says is an ALab Mac ([`Host::alab`]): its scope's
     /// groups and the named ones, less the ones left out.
     const fn choice(self, alab: bool) -> Choice {
-        let scope = if alab { Choice::ALL } else { Choice::NONE };
+        let scope = if alab {
+            Choice::ALL
+        } else {
+            Choice {
+                clone: true,
+                ..Choice::NONE
+            }
+        };
         Choice {
             profile: scope.profile || self.named.profile,
             sign_out: scope.sign_out || self.named.sign_out,
@@ -565,13 +574,6 @@ fn options(args: &[OsString]) -> Result<Options, String> {
     }
     if options.develop.is_some() && options.only.iter().any(|word| word == "workstation") {
         return Err("--develop and --no-develop cannot be combined with --only workstation".into());
-    }
-    if options.picks.any() && (options.develop.is_some() || !options.only.is_empty()) {
-        return Err(
-            "--profile, --sign-out, --clone and their --no- forms pick within the whole run; \
-             --only and --develop narrow it: use one"
-                .into(),
-        );
     }
     Ok(options)
 }
@@ -748,6 +750,9 @@ pub struct Host<'a> {
     pub records: &'static dyn Records,
     /// aterm's macOS grants, as the Permissions phase reads them ([`Grants`]).
     pub grants: Grants,
+    /// The running window's already-published workstation observation. Only a read-only
+    /// check away from a person's terminal asks this port; it never probes other apps.
+    pub workstation_check: &'a dyn Fn() -> WorkstationObservation,
     /// Hand the grants the Permissions phase left to the person to the running aterm window's
     /// permission walk (`permissions walk now <grants>`), for a person at this Mac's console,
     /// Full Disk Access and Accessibility only when that window is the app macOS holds
@@ -1141,6 +1146,11 @@ fn entry(
             alab: host.alab,
             present: &host.present,
             holds: host.records.holds(),
+            workstation_observation: observed_workstation(
+                sys,
+                options.action,
+                host.workstation_check,
+            ),
         };
         *start.lock().unwrap_or_else(PoisonError::into_inner) = standing.holds.clone();
         prepare_groups(
@@ -1414,8 +1424,8 @@ fn tab(
 /// from a program that is not the installed release app (a held copy) is the installed app's
 /// to run ([`hand_off`]).
 fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode {
-    ports.background();
     let trigger = options.trigger.unwrap_or(crate::sync::Trigger::Init);
+    ports.background(trigger);
     if trigger == crate::sync::Trigger::Subscriber
         && let Some(program) = ports.installed_release_elsewhere()
         && let Some(code) = hand_off(options, ports, &program)
@@ -2406,10 +2416,12 @@ fn ways_back_run(sys: &dyn System) -> bool {
     !sys.macos() || init_presence(sys).why().is_none()
 }
 
-/// Initialization keeps agent ancestry when a tool call has no controlling terminal.
+/// Setup does not require a controlling terminal when invoked by an agent in the
+/// console owner's graphic session. Agent ancestry is not a permission boundary.
 fn init_presence(sys: &dyn System) -> Presence {
     match crate::console::presence(sys) {
-        Presence::NoTerminal if sys.agent_ancestor().is_some() => Presence::AgentTab,
+        Presence::AgentTab => Presence::AtConsole,
+        Presence::NoTerminal if sys.agent_ancestor().is_some() => Presence::AtConsole,
         presence => presence,
     }
 }
@@ -2429,20 +2441,18 @@ fn converge(
     } else {
         Mode::Plan
     };
-    // Preferences and repository setup remain a person's picks. Account sign-out also runs in
-    // the console user's graphic session with no terminal while a person is at the screen, but
-    // never from SSH or an agent tab.
+    // Local setup commands may come from the owner or their agent. Account sign-out also runs
+    // without a terminal while a person is at the screen; a different login stays outside it.
     let presence = init_presence(sys);
     let named = options.picks.named;
     let restricted = named.profile
-        || named.clone
         || (named.sign_out && !matches!(presence, Presence::AtConsole | Presence::NoTerminal));
     if restricted
         && sys.macos()
         && let Some(why) = presence.why()
     {
         return Err(Refused::Usage(format!(
-            "--profile, --sign-out and --clone are picks for a person at this Mac's console \
+            "--profile and --sign-out run in this Mac's console session \
              ({why}): run them there, or leave them out"
         )));
     }
@@ -2767,16 +2777,6 @@ fn converge(
         }
         let now = records.holds();
         note_left(&now, &mut left_of(&now, true).into_iter());
-        // They run only for a person at the screen, read again now that they start, terminal or
-        // not: the clones before them can take half an hour, and the person who started the run
-        // may have walked away from an idle or locked screen (design §6.4).
-        if !(front.present)() {
-            rows.extend(sign_outs(Desk {
-                leaves: &|id| leaves(&now, id),
-                ..Desk::instead(Instead::Person(NOBODY_AT_THE_SCREEN))
-            })?);
-            return Ok(rows);
-        }
         // A sign-out the person undid since aterm made it (they signed back in) is theirs, as
         // a key they changed is (design §6.6): the record is read again under this hold.
         let (kept, kept_why) = read_kept();
@@ -3745,6 +3745,8 @@ struct Standing<'a> {
     present: &'a (dyn Fn() -> bool + Sync),
     /// What the person's own choices in System State hold ([`Records::holds`]).
     holds: Holds,
+    /// A read-only check's prompt-free observation from the existing coordinator.
+    workstation_observation: Option<WorkstationObservation>,
 }
 
 /// How a run prepares the workstation's groups ([`prepare_groups`], or a test's stand-in), with
@@ -3802,9 +3804,10 @@ fn prepare_groups_with(
     secrets: impl FnOnce(&Ctx) -> Result<Arc<dyn crate::init_secrets::SecretsOps>, String>,
 ) -> Result<(Vec<Group>, Picked), String> {
     let presence = init_presence(sys);
-    // A way back runs only for a person at this Mac's console (`--profile`, `--sign-out` and
-    // `--clone` are refused elsewhere, and `--only` names no held group there), so only there
-    // does the held line name one.
+    let observation = (mode == Mode::Plan)
+        .then(|| standing.workstation_observation.clone())
+        .flatten();
+    // Name command-line ways back wherever local setup commands can run, including agent tools.
     let flags_run = ways_back_run(sys);
     let mut picked = picked(
         reading.picks,
@@ -3838,7 +3841,7 @@ fn prepare_groups_with(
         }
     };
     if ctx.console.is_none() {
-        let mut groups = vec![away_from_console(presence)];
+        let mut groups = vec![away_from_console(presence, observation)];
         // A remote shell of the console's own login runs the background rows an agent's tab
         // runs (design §7): Rust in Spotlight, the open ALab vault's join and the GitHub
         // repositories, each in any shell of the account, asking nothing. Another login's
@@ -3887,6 +3890,7 @@ fn prepare_groups_with(
         runs,
         reading.only,
         signs_out,
+        observation,
     );
     picked.rows = rows;
     if person && runs.contains(Setting::Permissions) {
@@ -4055,14 +4059,30 @@ impl Item for MacOnly {
     }
 }
 
-/// The id of the one row that stands for the workstation rows a person at this Mac's console
-/// makes ([`AwayFromConsole`]).
+/// The aggregate workstation row when direct settings probes are withheld ([`AwayFromConsole`]).
 const AWAY: &str = "init.workstation";
 
-/// The optional workstation items cannot be enumerated without reading their inputs, and are
-/// the person's to make: one deferred row, saying why, until a person runs init at this Mac's
-/// console.
-struct AwayFromConsole(Presence);
+/// The existing coordinator's observation, without reading another app's settings or
+/// authorizing any change. Missing evidence is distinct from a genuine permission boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkstationObservation {
+    /// The coordinator reports no work left under its current plan.
+    Complete,
+    /// Background work or an observation is still pending.
+    Waiting(String),
+    /// The coordinator observed a real step only a person can complete.
+    Permission(String),
+    /// No usable coordinator observation is available.
+    Unavailable(String),
+}
+
+/// Optional workstation inputs can raise privacy dialogs when read. Away from a person's
+/// console, an apply therefore defers without reading them; a check may relay the existing
+/// coordinator's observation instead.
+struct AwayFromConsole {
+    presence: Presence,
+    observation: Option<WorkstationObservation>,
+}
 
 impl Item for AwayFromConsole {
     fn id(&self) -> String {
@@ -4072,10 +4092,35 @@ impl Item for AwayFromConsole {
         "init"
     }
     fn title(&self) -> String {
-        "Workstation setup at this Mac's console".into()
+        if self.observation.is_some() {
+            "Workstation setup observed in the background".into()
+        } else {
+            "Workstation setup at this Mac's console".into()
+        }
     }
     fn probe(&self, _sys: &dyn System, _ctx: &Ctx) -> Probe {
-        Probe::Deferred { why: self.why() }
+        match &self.observation {
+            Some(WorkstationObservation::Complete) => Probe::Ok {
+                now: "background coordinator reports completion".into(),
+            },
+            Some(
+                WorkstationObservation::Waiting(why)
+                | WorkstationObservation::Permission(why)
+                | WorkstationObservation::Unavailable(why),
+            ) => Probe::Unusable { why: why.clone() },
+            None => Probe::Deferred { why: self.why() },
+        }
+    }
+    fn read_aside(&self) -> Option<aterm_converge::StoodAside> {
+        match &self.observation {
+            Some(WorkstationObservation::Waiting(why)) => {
+                Some(aterm_converge::StoodAside::Waiting(why.clone()))
+            }
+            Some(WorkstationObservation::Permission(why)) => {
+                Some(aterm_converge::StoodAside::Permission(why.clone()))
+            }
+            _ => None,
+        }
     }
     fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         Err(self.why())
@@ -4085,20 +4130,45 @@ impl Item for AwayFromConsole {
 impl AwayFromConsole {
     /// The presence's line; the engine's own where the console was lost after it was read.
     fn why(&self) -> String {
-        self.0
+        self.presence
             .needs_person()
             .unwrap_or_else(|| aterm_converge::NOT_AT_CONSOLE.into())
     }
 }
 
-/// [`AwayFromConsole`] in its place: read in any shell of the account, so the engine never
-/// turns it into its own `Blocked` console row; applied by nobody.
-fn away_from_console(presence: Presence) -> Group {
+/// The console account's non-interactive contexts may read its existing coordinator.
+fn observes_background(presence: Presence) -> bool {
+    matches!(
+        presence,
+        Presence::AgentTab | Presence::NoTerminal | Presence::Remote
+    )
+}
+
+fn observed_workstation(
+    sys: &dyn System,
+    action: Action,
+    check: &dyn Fn() -> WorkstationObservation,
+) -> Option<WorkstationObservation> {
+    (action == Action::Check && sys.macos() && observes_background(init_presence(sys))).then(check)
+}
+
+/// Read in any shell of the account rather than blocked by the engine's console gate;
+/// applied by nobody, whether it defers or relays an observation.
+fn away_from_console(presence: Presence, observation: Option<WorkstationObservation>) -> Group {
+    let observation = observation.filter(|_| observes_background(presence));
+    let class = if observation.is_some() {
+        Class::Relay
+    } else {
+        Class::Person
+    };
     (
-        vec![Box::new(AwayFromConsole(presence))],
+        vec![Box::new(AwayFromConsole {
+            presence,
+            observation,
+        })],
         Place {
             requires: Requires::Account,
-            ..workstation_place(Class::Person)
+            ..workstation_place(class)
         },
     )
 }
@@ -4174,6 +4244,7 @@ fn groups(
     runs: Selection,
     only: &[String],
     signs_out: bool,
+    observation: Option<WorkstationObservation>,
 ) -> (Vec<Group>, Vec<(String, Setting)>) {
     let place = workstation_place;
     let person = presence == Presence::AtConsole;
@@ -4188,7 +4259,7 @@ fn groups(
         items
     };
     if !person {
-        groups.push(away_from_console(presence));
+        groups.push(away_from_console(presence, observation));
     }
     if person {
         let mut preferences = Selection::none();
@@ -4571,8 +4642,6 @@ enum Instead<'d> {
     /// Stand aside for another setup's hold on System State's records, in these words: the row
     /// reads as it is and changes nothing (exit 75, "a lock").
     Lock(&'d str),
-    /// Wait for a person at this Mac's screen, in these words, reading nothing.
-    Person(&'d str),
     /// Leave a key the person changed after aterm set it ([`KEPT_BY_YOU`]), in these words:
     /// the row reads as it is, and one that would change reads as left.
     Kept(&'d str),
@@ -4599,7 +4668,6 @@ impl Item for Unchanged<'_> {
     fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
         match self.instead {
             Instead::Lock(_) => self.inner.probe(sys, ctx),
-            Instead::Person(why) => Probe::Deferred { why: why.into() },
             Instead::Kept(why) => match self.inner.probe(sys, ctx) {
                 Probe::Change { from, .. } => Probe::NotApplicable {
                     why: format!("{from}; {why}"),
@@ -4610,7 +4678,7 @@ impl Item for Unchanged<'_> {
     }
     fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         Err(match self.instead {
-            Instead::Lock(why) | Instead::Person(why) | Instead::Kept(why) => why.into(),
+            Instead::Lock(why) | Instead::Kept(why) => why.into(),
         })
     }
     fn revert(&self) -> Option<String> {
@@ -4628,7 +4696,7 @@ impl Item for Unchanged<'_> {
     fn stands_aside(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<aterm_converge::StoodAside> {
         match self.instead {
             Instead::Lock(why) => Some(aterm_converge::StoodAside::Lock(why.into())),
-            Instead::Person(_) | Instead::Kept(_) => None,
+            Instead::Kept(_) => None,
         }
     }
 }
@@ -5321,6 +5389,7 @@ mod tests {
             alab: &|| true,
             present: &|| true,
             holds: Holds::default(),
+            workstation_observation: None,
         }
     }
 
@@ -5331,6 +5400,7 @@ mod tests {
             alab: &|| false,
             present: &|| true,
             holds: Holds::default(),
+            workstation_observation: None,
         }
     }
 
@@ -6406,6 +6476,7 @@ mod tests {
             Selection::all(),
             &[],
             true,
+            None,
         )
         .0;
         let bound = crate::engine::bind(
@@ -6596,6 +6667,7 @@ mod tests {
             full_disk_access: &|| panic!("--converge measured Full Disk Access"),
             records: &NoSetup,
             grants: grants_unread,
+            workstation_check: &|| panic!("--converge read workstation observations"),
             walk: &|_| panic!("--converge walked the grants"),
             converge: ports,
             alab: &|| panic!("--converge read the ALab scope"),
@@ -6623,8 +6695,8 @@ mod tests {
         assert_eq!(converge_run(&["--converge"], &ports), exit(0));
         assert_eq!(
             ports.backgrounds(),
-            1,
-            "the runner lowers its QoS as it starts"
+            [crate::sync::Trigger::Init],
+            "the runner lowers its QoS as it starts, as its trigger's pass"
         );
         assert!(crate::sync::read_record(scratch.path()).is_some());
         assert!(
@@ -6682,6 +6754,15 @@ mod tests {
             1,
             "never handed off"
         );
+        assert_eq!(
+            ports.backgrounds(),
+            [
+                crate::sync::Trigger::Subscriber,
+                crate::sync::Trigger::Window,
+                crate::sync::Trigger::Init
+            ],
+            "each runner lowers itself as its own trigger's pass, the hand-off's first"
+        );
 
         for (answer, said) in [
             (Err("No such file or directory".to_owned()), "did not start"),
@@ -6731,7 +6812,7 @@ mod tests {
         ] {
             assert_eq!(converge_run(args, &untouched), exit(2), "{args:?}");
         }
-        assert_eq!(untouched.backgrounds(), 0, "a usage error reads nothing");
+        assert_eq!(untouched.backgrounds(), [], "a usage error reads nothing");
         assert_eq!(
             options(&[
                 "--converge".into(),
@@ -7230,6 +7311,90 @@ mod tests {
     }
 
     #[test]
+    fn a_noninteractive_check_relays_background_evidence_without_probing_preferences() {
+        let mut sys = alice_at(501);
+        sys.terminal = false;
+        sys.agent = None;
+        let (ctx, _) = local_context(&sys).unwrap();
+        let mut standing = personal_standing();
+        standing.workstation_observation = Some(WorkstationObservation::Complete);
+        let before = sys.calls();
+        for (mode, outcome) in [(Mode::Plan, Outcome::Ok), (Mode::Apply, Outcome::Deferred)] {
+            let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
+                crate::init_secrets::tests::unconfigured(),
+            )]);
+            let (mut groups, _) = prepare_groups_with(
+                &sys,
+                &ctx,
+                mode,
+                None,
+                &reading(&[]),
+                &standing,
+                no_grants,
+                move |_| Ok(vault as Arc<dyn crate::init_secrets::SecretsOps>),
+            )
+            .unwrap();
+            groups.retain(|(items, _)| items.iter().any(|item| item.id() == AWAY));
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let mut journal = FileJournal::under(scratch.path());
+            let rows = run(&sys, &ctx, Base::none(), &groups, mode, &mut journal).unwrap();
+            let row = rows.iter().find(|row| row.id == AWAY).unwrap();
+            assert_eq!(row.outcome, outcome);
+            if mode == Mode::Plan {
+                assert_eq!(status(&rows, Action::Check), 0);
+            }
+        }
+        assert_eq!(
+            sys.calls(),
+            before,
+            "neither path reads or changes other apps"
+        );
+        for action in [Action::Apply, Action::Plan] {
+            assert!(
+                observed_workstation(&sys, action, &|| panic!("a non-check queried observations"))
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            observed_workstation(&sys, Action::Check, &|| WorkstationObservation::Complete),
+            Some(WorkstationObservation::Complete)
+        );
+        let other = alice_at(502);
+        assert!(
+            observed_workstation(&other, Action::Check, &|| panic!(
+                "another login queried observations"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn background_check_distinguishes_waiting_permission_and_missing_evidence() {
+        let sys = alice_at(501);
+        let (ctx, _) = local_context(&sys).unwrap();
+        let before = sys.calls();
+        for (observation, code) in [
+            (WorkstationObservation::Waiting("work continues".into()), 75),
+            (
+                WorkstationObservation::Permission("a real grant is off".into()),
+                77,
+            ),
+            (
+                WorkstationObservation::Unavailable("not observed".into()),
+                1,
+            ),
+        ] {
+            let groups = vec![away_from_console(Presence::AgentTab, Some(observation))];
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let mut journal = FileJournal::under(scratch.path());
+            let rows = run(&sys, &ctx, Base::none(), &groups, Mode::Plan, &mut journal).unwrap();
+            assert_eq!(status(&rows, Action::Check), code);
+            assert_eq!(rows[0].class, Some(Class::Relay));
+        }
+        assert_eq!(sys.calls(), before);
+    }
+
+    #[test]
     fn under_another_console_owner_a_base_item_applies_and_a_workstation_item_waits() {
         let refused = prepare_workstation(&alice_at(502), WorkstationGroup::Preferences)
             .err()
@@ -7411,8 +7576,8 @@ mod tests {
     /// With no terminal (an agent's tool call, a launch agent, a script), in the console's own
     /// session, init runs the base layer and looks for the vault, and signs out of Messages and
     /// FaceTime, which nothing undoes, only for a person at the screen now (input within the
-    /// last minute, the screen unlocked); with nobody there they wait. An agent's tab never
-    /// signs out. Rust in Spotlight runs for each, a background row (design §7); no preference
+    /// last minute, the screen unlocked); with nobody there they wait. An agent's local setup
+    /// runs the selected profile. Rust in Spotlight runs for each; no preference
     /// runs off the console: no `killall`, no `defaults write`. Control: a person at the console
     /// gets every row.
     #[test]
@@ -7433,6 +7598,7 @@ mod tests {
                 alab: &|| true,
                 present: if present { &|| true } else { &|| false },
                 holds: Holds::default(),
+                workstation_observation: None,
             };
             let (bound, groups, ctx, vault) = bound_for(&sys, &standing, false);
             assert!(ctx.console.is_some(), "the console's own session");
@@ -7443,7 +7609,7 @@ mod tests {
                     .any(|(id, _)| id == "init.spotlight.rustup-profile@alice"),
                 "{presence:?}: {bound:?}"
             );
-            if presence == Presence::AtConsole {
+            if init_presence(&sys) == Presence::AtConsole {
                 assert!(
                     bound.iter().any(|(_, class)| *class == Class::Preference),
                     "{bound:?}"
@@ -7537,7 +7703,7 @@ mod tests {
         let mut sys = alice_at(501);
         sys.terminal = true;
         sys.agent = Some("Claude Code");
-        assert_eq!(init_presence(&sys), Presence::AgentTab);
+        assert_eq!(init_presence(&sys), Presence::AtConsole);
         let (_, groups, ctx, vault) = bound_for(&sys, &alab_standing(), true);
         let _ = run(
             &sys,
@@ -7645,7 +7811,13 @@ mod tests {
                 clone: true,
             }
         );
-        assert_eq!(follow_up.picks.choice(false), Choice::NONE);
+        assert_eq!(
+            follow_up.picks.choice(false),
+            Choice {
+                clone: true,
+                ..Choice::NONE
+            }
+        );
         let runs = alab.selection();
         assert!(runs.contains(Setting::Repositories), "{runs:?}");
         for left in [
@@ -7664,11 +7836,9 @@ mod tests {
         assert!(signs_out.picks.choice(true).sign_out);
     }
 
-    /// Before macOS has an answer to aterm's Local Network question, an agent's tab does not
-    /// look for the vault: the look would put that question on the screen with nobody to answer
-    /// it. The vault row waits, deferred, and the run exits 0.
+    /// Agent setup starts the vault look even before macOS has answered its network question.
     #[test]
-    fn an_agent_tab_leaves_the_vault_look_until_local_network_is_answered() {
+    fn an_agent_tab_starts_the_vault_look_without_waiting_for_a_second_command() {
         let mut sys = alice_at(501);
         sys.terminal = true;
         sys.agent = Some("Claude Code");
@@ -7700,13 +7870,26 @@ mod tests {
             &mut NoJournal,
         )
         .unwrap();
-        assert_eq!(vault.probes(), 0, "no look");
-        let row = rows
-            .iter()
-            .find(|row| row.id.starts_with("init.secrets@"))
-            .expect("the vault row");
-        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
-        assert_eq!(status(&rows, Action::Apply), 0);
+        assert_eq!(vault.probes(), 1);
+        assert_eq!(vault.joins().len(), 1);
+        assert!(rows.iter().any(|row| row.id.starts_with("init.secrets@")));
+    }
+
+    #[test]
+    fn local_agent_tools_can_run_explicit_setup_flags_without_a_terminal() {
+        for flag in ["--clone", "--profile", "--sign-out"] {
+            for terminal in [false, true] {
+                let mut sys = alice_with_checkout(501, None);
+                sys.terminal = terminal;
+                sys.agent = Some("Codex");
+                let options = options(&[OsString::from(flag)]).unwrap();
+                let groups = |_: &Ctx| Vec::new();
+                assert!(
+                    converge_with(&sys, &options, &groups, &NoRecords).is_ok(),
+                    "{flag}, terminal={terminal}"
+                );
+            }
+        }
     }
 
     /// An apply whose GitHub step waits for this Mac to be let into the vault records the clone
@@ -8076,6 +8259,7 @@ mod tests {
                 Selection::all(),
                 &[],
                 true,
+                None,
             )
             .0;
             let preferences: Vec<&dyn Item> = groups
@@ -9242,14 +9426,13 @@ mod tests {
     }
 
     /// `aterm init --help` and `aterm help init` read one page: every System State setting by
-    /// its label, in at most 27 lines (the setup's 25 and `--converge`'s two).
+    /// its label, with the same automatic first-launch behavior.
     #[test]
-    fn the_usage_names_every_setting_by_its_label_in_27_lines() {
+    fn the_usage_names_every_setting_by_its_label() {
         let usage = usage();
         for setting in Setting::ALL {
             assert!(usage.contains(setting.label()), "{setting:?}: {usage}");
         }
-        assert!(usage.lines().count() <= 27, "{usage}");
         assert!(usage.contains("first launch"), "{usage}");
     }
 
@@ -9329,7 +9512,9 @@ mod tests {
             ),
         ] {
             let (preferences, picked, asked) = prepared_with(picks, standing);
-            assert_eq!(picked.runs, sign_out.selection());
+            let mut expected = sign_out.selection();
+            expected.set(Setting::Repositories, !picks.left.clone);
+            assert_eq!(picked.runs, expected);
             assert!(asked.is_empty(), "{asked:?}");
             assert!(
                 preferences.len() == 2 && preferences.iter().all(signs_out),
@@ -9784,6 +9969,7 @@ mod tests {
                 Selection::all(),
                 &only,
                 true,
+                None,
             )
             .0;
             let bound = crate::engine::bind(
@@ -9815,10 +10001,9 @@ mod tests {
         );
     }
 
-    /// Account sign-out runs in the console user's graphic session with no terminal; an agent
-    /// tab stays refused, and preferences still need a person at the console.
+    /// Explicit setup also runs from an agent's tool call in the console owner's session.
     #[test]
-    fn sign_out_runs_without_a_terminal_but_not_from_an_agent_tab() {
+    fn sign_out_runs_without_a_terminal_including_from_an_agent_tab() {
         let options = Options {
             picks: Picks {
                 named: Choice {
@@ -9837,9 +10022,9 @@ mod tests {
         };
         for (terminal, agent, allowed) in [
             (false, None, true),
-            (false, Some("Claude Code"), false),
-            (false, Some("Codex"), false),
-            (true, Some("Claude Code"), false),
+            (false, Some("Claude Code"), true),
+            (false, Some("Codex"), true),
+            (true, Some("Claude Code"), true),
             (true, None, true),
         ] {
             let mut sys = alice_with_checkout(501, None);
@@ -9871,6 +10056,7 @@ mod tests {
             .selection(),
             &[],
             true,
+            None,
         )
         .0;
         let ids: Vec<String> = accounts
@@ -9931,6 +10117,7 @@ mod tests {
             Selection::all(),
             &[],
             true,
+            None,
         )
         .0;
         let applied = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -10180,6 +10367,7 @@ mod tests {
             full_disk_access: &|| panic!("the tab's run measured Full Disk Access"),
             records: &NoRecords,
             grants: |_| panic!("the tab's run read the grants"),
+            workstation_check: &|| panic!("the tab's run read workstation observations"),
             walk: &|_| panic!("the tab's run walked the grants"),
             converge: &ports,
             alab: &|| panic!("the tab's run read the ALab scope first"),
@@ -10367,14 +10555,12 @@ mod tests {
             (
                 Unfinished::LowData,
                 aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA,
-                "Low Data Mode is on, so the download waits. Turn it off in System Settings \u{203a} \
-                 Network, then press Install\u{2026} again.",
+                crate::init_clt::TAB_LOW_DATA,
             ),
             (
                 Unfinished::NotAdmin,
                 aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN,
-                "Only an administrator of this Mac can install Apple's Command Line Tools. Ask \
-                 one to install them from their own login.",
+                crate::init_clt::TAB_NOT_ADMIN,
             ),
         ] {
             let mut sys = alice_with_checkout(501, None);
@@ -10457,7 +10643,7 @@ mod tests {
             sys.terminal = terminal;
             sys.tty = terminal;
             sys.agent = agent;
-            assert_ne!(init_presence(&sys), Presence::AtConsole);
+            assert_ne!(crate::console::presence(&sys), Presence::AtConsole);
             let rows = clt_rows(&sys);
             let row = rows
                 .iter()
@@ -10808,29 +10994,17 @@ mod tests {
                 .filter(|row| crate::init_accounts::signs_out(&row.id))
                 .collect();
             assert_eq!(sign_outs.len(), 2, "{rows:?}");
-            if walks_away {
-                assert!(
-                    sign_outs.iter().all(|row| row.outcome == Outcome::Deferred
-                        && row.why.as_deref() == Some(NOBODY_AT_THE_SCREEN)),
-                    "nobody was at the screen when the sign-outs started: {sign_outs:#?}"
-                );
-                assert_eq!(status(&rows, Action::Apply), 0, "{rows:?}");
-            } else {
-                assert!(
-                    sign_outs.iter().all(|row| row.outcome == Outcome::Changed),
-                    "{sign_outs:#?}"
-                );
-            }
+            assert!(
+                sign_outs.iter().all(|row| row.outcome == Outcome::Changed),
+                "walks_away={walks_away}: {sign_outs:#?}"
+            );
         }
     }
 
-    /// The line init prints of the groups the person turned off names only a way back that
-    /// runs where it is printed: in an agent's tab (the owner's normal path) `aterm init
-    /// --profile` is refused and `aterm init --only dock` names no held group, so the line names
-    /// System State's switch alone; at the console it names the narrowest run too, which runs.
+    /// The held line names a working command for both a console terminal and an agent tool.
     #[test]
     fn the_held_line_off_the_console_names_a_way_back_that_runs_there() {
-        for (agent, flags) in [(Some("Claude Code"), false), (None, true)] {
+        for (agent, flags) in [(Some("Claude Code"), true), (None, true)] {
             let mut sys = alice_at(501);
             sys.terminal = true;
             sys.agent = agent;
@@ -10842,6 +11016,7 @@ mod tests {
                 alab: &|| true,
                 present: &|| true,
                 holds: Holds { off, ..Holds::NONE },
+                workstation_observation: None,
             };
             let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
                 crate::init_secrets::tests::unconfigured(),
@@ -11493,7 +11668,7 @@ mod tests {
     /// console the person may walk away (screen locked or idle) during a long clone: the
     /// sign-outs read presence again as they start, terminal or not, and wait for a person.
     #[test]
-    fn a_terminal_runs_sign_outs_only_with_someone_at_the_screen() {
+    fn a_terminal_runs_admitted_sign_outs_without_a_presence_gate() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let here = Arc::new(AtomicBool::new(true));
         let mut sys = alice_at(501);
@@ -11529,9 +11704,8 @@ mod tests {
             .collect();
         assert!(!sign_outs.is_empty());
         assert!(
-            sign_outs.iter().all(|row| row.outcome == Outcome::Deferred
-                && row.why.as_deref() == Some(NOBODY_AT_THE_SCREEN)),
-            "nobody was at the screen when the sign-outs started: {sign_outs:#?}"
+            sign_outs.iter().all(|row| row.outcome == Outcome::Changed),
+            "admitted work continues after a long clone: {sign_outs:#?}"
         );
     }
 

@@ -56,18 +56,39 @@ pub(super) fn rewrite(stage: &Path, version: &str) -> Result<()> {
             0
         };
         let (head, body) = rendered.split_at(at);
-        let mode = std::fs::metadata(&path)
+        use std::io::Write as _;
+        let mode = std::fs::symlink_metadata(&path)
             .map_err(|error| Error::io("stat Git helper", &error))?
             .permissions();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            crate::identity::set_regular_mode(&path, 0o644)
                 .map_err(|error| Error::io("make Git helper writable", &error))?;
         }
-        std::fs::write(&path, format!("{head}{setup}{body}"))
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let mut f = opts
+            .open(&path)
+            .map_err(|error| Error::io("open Git helper", &error))?;
+        if !f
+            .metadata()
+            .map_err(|error| Error::io("stat Git helper", &error))?
+            .is_file()
+        {
+            return Err(Error::refused(format!(
+                "git helper {} is not a regular file",
+                path.display()
+            )));
+        }
+        f.set_len(0)
+            .and_then(|()| f.write_all(format!("{head}{setup}{body}").as_bytes()))
             .map_err(|error| Error::io("write Git helper", &error))?;
-        std::fs::set_permissions(&path, mode)
+        f.set_permissions(mode)
             .map_err(|error| Error::io("restore Git helper mode", &error))?;
     }
     Ok(())

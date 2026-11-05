@@ -229,6 +229,7 @@ impl InitialHost for Host {
 /// The base plan and the Dock: a Workstation stage for the Secrets lane to run beside.
 fn plan() -> Plan {
     let mut selection = BASE_PLAN;
+    selection.set(Setting::Repositories, false);
     selection.set(Setting::Dock, true);
     Plan::from(selection)
 }

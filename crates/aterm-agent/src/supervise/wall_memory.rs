@@ -52,9 +52,10 @@ pub(super) struct WallMemory {
 /// ([`Session::stuck_climb`]), that the agent does not work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Witness {
-    /// Claude Code's own terminal title rests on `✳` (one `status` read): it
-    /// animates while the agent works, and a screen no reader names says
-    /// nothing either way.
+    /// Claude Code's own terminal title rests on `✳` (one `title` read, the
+    /// program's OSC title: `status`'s `subject=` answers a person's rename
+    /// first and nothing while the terminal is held): it animates while the
+    /// agent works, and a screen no reader names says nothing either way.
     Title,
     /// The agent's own words stood still since the episode began
     /// ([`still_words`]): its reader read the turn's end as evidence and names
@@ -724,7 +725,7 @@ impl<C: Ctl> Session<'_, C> {
         let paced = self.stuck_asked.is_some_and(|t| self.fx.since(t) < after);
         // A rung said with no call named (`STUCK`, or a `STALLED` in today's words) does not
         // hold back a call the reading names since: it is told at once (the hung-call design's
-        // R1), not one status pace after that rung's read. Every other rung keeps the pace.
+        // R1), not one pace after that rung's read. Every other rung keeps the pace.
         let unnamed = self.stuck_rung == StuckRung::Said
             || (self.stuck_rung == StuckRung::Told
                 && self.stuck_told.is_some_and(|(_, pgid)| pgid.is_none()));
@@ -764,18 +765,26 @@ impl<C: Ctl> Session<'_, C> {
             Witness::Words(_) => String::new(),
             Witness::Title => {
                 self.stuck_asked = Some(self.fx.mono());
-                let Ok(r) = self.call(&["status"]) else {
+                let Some(title) = self.stuck_look("title") else {
                     return;
                 };
-                if !title_rests(&r.stdout) {
+                let title = title.strip_prefix("OK").unwrap_or(&title);
+                if !title.trim_start().starts_with(IDLE_TITLE_GLYPH) {
                     self.stuck_over(screen.seq, "the agent's title moves: it works", review);
                     return;
                 }
-                if dialog && !names_claude(&r.stdout) {
-                    self.stuck_over(screen.seq, "the tab runs no Claude", review);
-                    return;
+                if dialog {
+                    let Some(status) = self.stuck_look("status") else {
+                        return;
+                    };
+                    if !names_claude(&status) {
+                        self.stuck_over(screen.seq, "the tab runs no Claude", review);
+                        return;
+                    }
+                    status
+                } else {
+                    String::new()
                 }
-                r.stdout
             }
         };
         let minutes = self.fx.since(at).as_secs() / 60;
@@ -899,6 +908,13 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
+    /// One read of the canary's look at the tab: its answer, or `None` where it got none, which is
+    /// no evidence either way, so the rung stands.
+    fn stuck_look(&mut self, verb: &str) -> Option<String> {
+        let reply = self.call(&[verb]).ok()?;
+        reply.ok().then_some(reply.stdout)
+    }
+
     fn raise_stuck(
         &mut self,
         seq: u64,
@@ -942,14 +958,6 @@ impl<C: Ctl> Session<'_, C> {
             }
         }
     }
-}
-
-fn title_rests(stdout: &str) -> bool {
-    let field = |f: &str| crate::supervise::screen::status_field(stdout, f);
-    field("subject_source") == Some("osc")
-        && field("subject")
-            .map(crate::supervise::report::pct_decode)
-            .is_some_and(|t| t.trim_start().starts_with(IDLE_TITLE_GLYPH))
 }
 
 fn names_claude(stdout: &str) -> bool {

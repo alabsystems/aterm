@@ -736,6 +736,27 @@ fn the_lockup_names_alab_only_on_an_alab_mac() {
     };
     assert!(alab("set-up"));
     assert!(!alab("non-alab"));
+
+    // Isolate vault evidence from the profile selection's independent ALab signal.
+    let mut selection = Selection::none();
+    selection.set(Setting::Secrets, true);
+    let mut status = status_of("set-up");
+    status.plan = Some(Plan::from(selection));
+    status
+        .observed
+        .retain(|row| row.subject == Subject::Setting(Setting::Secrets));
+    let vault = status
+        .observed
+        .first_mut()
+        .expect("the fixture reads the vault");
+    vault.standing = Standing::InPlace;
+    vault.now = Some(Setting::Secrets.wanted().to_owned());
+    vault.wanted = Setting::Secrets.wanted().to_owned();
+    assert!(lines::alab_lockup(&status, selection));
+    for now in [Some(aterm_types::macos_setup::SYNC_OFF), None] {
+        status.observed[0].now = now.map(str::to_owned);
+        assert!(!lines::alab_lockup(&status, selection), "{now:?}");
+    }
 }
 
 /// A short window (a split pane, a small screen) keeps the headline, the card's buttons, the

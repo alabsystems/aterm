@@ -13,6 +13,12 @@ use aterm_types::control_verbs::{framing_of, Framing};
 /// The largest request line this client will write, newline excluded.
 pub const REQUEST_LINE_MAX: usize = aterm_types::control_verbs::MAX_REQUEST_LINE - 1;
 
+/// The most bytes [`Ctl::pipeline`] writes at once: what an empty Unix stream socket takes in
+/// one `write(2)` without waiting for its peer to read, on every platform this client runs on.
+/// macOS's is the least: its default buffer (`net.local.stream.sendspace`), 8 KiB. Linux's
+/// default is larger.
+pub const PIPELINE_WRITE_MAX: usize = 8 * 1024;
+
 /// The largest framed body this client will read, and the ceiling on the byte count a reply header may declare.
 pub const REPLY_BYTES_MAX: usize = 16 * 1024 * 1024;
 
@@ -297,10 +303,7 @@ impl Ctl {
             ));
         }
         if self.lost {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "aterm control connection lost",
-            ));
+            return Err(connection_lost());
         }
         let sent = (|| {
             let s = self.stream.get_mut();
@@ -315,6 +318,84 @@ impl Ctl {
         let verb = request_verb(line);
         let reply = self.read_reply(verb, line);
         self.guarded(reply)
+    }
+
+    /// Send `lines` in as few writes as an empty socket takes whole ([`PIPELINE_WRITE_MAX`]),
+    /// each write's replies read before the next goes, and answer each line in order: a round
+    /// trip a write, where [`Ctl::request`] takes one a line. aterm serves a connection's
+    /// requests in the order they arrive and answers each before it reads the next, so each
+    /// reply is its own line's, and once a write's replies are read aterm has read every byte of
+    /// it: the next write starts on an empty socket. `each(i)` runs once line `i`'s reply has
+    /// been read. A line that would not frame refuses the whole batch before a byte moves
+    /// (`InvalidInput` for every line), as [`Ctl::request`] refuses it alone.
+    ///
+    /// NO WRITE IS CUT INSIDE A LINE. aterm serves the bytes a peer left before its end as a
+    /// request even with no newline after them, so a writer killed while its write waited for
+    /// aterm to read would leave aterm a line's prefix to take as the whole line. A write of
+    /// whole lines that an empty socket takes at once never waits, so a kill lands before it or
+    /// after it. A line longer than that goes in a write of its own, which can wait, as
+    /// [`Ctl::request`]'s write of it can.
+    ///
+    /// # Errors
+    /// Per line: as [`Ctl::request`]. An I/O failure latches the connection lost, and every line
+    /// whose reply was not read answers it.
+    pub fn pipeline(
+        &mut self,
+        lines: &[&str],
+        mut each: impl FnMut(usize),
+    ) -> Vec<io::Result<Reply>> {
+        if let Some(bad) = lines
+            .iter()
+            .find(|line| line.len() > REQUEST_LINE_MAX || misframing_char(line).is_some())
+        {
+            let why = format!(
+                "a pipelined request does not frame: {}",
+                bad.chars().take(60).collect::<String>()
+            );
+            return lines
+                .iter()
+                .map(|_| Err(io::Error::new(io::ErrorKind::InvalidInput, why.clone())))
+                .collect();
+        }
+        let mut replies = Vec::with_capacity(lines.len());
+        while replies.len() < lines.len() && !self.lost {
+            let at = replies.len();
+            let end = write_end(lines, at);
+            let mut joined = Vec::with_capacity(lines[at..end].iter().map(|l| l.len() + 1).sum());
+            for line in &lines[at..end] {
+                joined.extend_from_slice(line.as_bytes());
+                joined.push(b'\n');
+            }
+            let sent = (|| {
+                let s = self.stream.get_mut();
+                s.write_all(&joined)?;
+                s.flush()
+            })();
+            if let Err(e) = self.guarded(sent) {
+                let why = e.to_string();
+                replies.extend(
+                    lines[at..]
+                        .iter()
+                        .map(|_| Err(io::Error::new(e.kind(), why.clone()))),
+                );
+                return replies;
+            }
+            for (i, line) in lines.iter().enumerate().take(end).skip(at) {
+                if self.lost {
+                    replies.push(Err(connection_lost()));
+                    continue;
+                }
+                let reply = self.read_reply(request_verb(line), line);
+                replies.push(self.guarded(reply));
+                each(i);
+            }
+        }
+        replies.extend(
+            lines[replies.len()..]
+                .iter()
+                .map(|_| Err(connection_lost())),
+        );
+        replies
     }
 
     fn read_line(&mut self) -> io::Result<String> {
@@ -347,7 +428,7 @@ impl Ctl {
             }
             Framing::Bytes => {
                 let n = count_after_ok(&header, REPLY_BYTES_MAX)?;
-                let mut body = Vec::new();
+                let mut body = Vec::with_capacity(n.saturating_add(1));
                 let read = std::io::Read::by_ref(&mut self.stream)
                     .take(n as u64)
                     .read_to_end(&mut body)?;
@@ -362,6 +443,26 @@ impl Ctl {
             Framing::Status => Ok(Reply::Status(header)),
         }
     }
+}
+
+/// Where the write [`Ctl::pipeline`] starts at line `at` of `lines` ends: the most whole lines
+/// from `at` whose bytes, a newline each, an empty socket takes at once
+/// ([`PIPELINE_WRITE_MAX`]), and at least line `at` itself, however long.
+fn write_end(lines: &[&str], at: usize) -> usize {
+    let mut end = at + 1;
+    let mut bytes = lines[at].len() + 1;
+    while let Some(line) = lines.get(end) {
+        bytes += line.len() + 1;
+        if bytes > PIPELINE_WRITE_MAX {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
+fn connection_lost() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "aterm control connection lost")
 }
 
 /// The first character of `line` that aterm would read as framing rather than
@@ -569,6 +670,175 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
         drop(ctl);
         server.join().expect("server thread");
+    }
+
+    /// A pipelined batch is one write whose replies are each its own line's, in order; a batch
+    /// with a line that would not frame writes nothing; and a peer that goes after answering
+    /// the first line leaves every later one lost, the connection latched.
+    #[test]
+    fn a_pipelined_batch_is_answered_line_by_line_and_a_misframed_one_writes_nothing() {
+        let (near, far) = UnixStream::pair().expect("socketpair");
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(far.try_clone().expect("clone"));
+            let mut writer = far;
+            let mut line = String::new();
+            let mut seen = Vec::new();
+            while reader.read_line(&mut line).expect("read") > 0 {
+                let asked = line.trim_end().to_string();
+                if asked == "deliver s-a off=9" {
+                    seen.push(asked);
+                    return seen;
+                }
+                writer
+                    .write_all(format!("OK {}\n", seen.len()).as_bytes())
+                    .expect("write");
+                seen.push(asked);
+                line.clear();
+            }
+            seen
+        });
+        let mut ctl = Ctl::from_stream(near).expect("client");
+        let mut read = Vec::new();
+        let replies = ctl.pipeline(&["deliver s-a off=1", "deliver s-a off=2"], |i| {
+            read.push(i)
+        });
+        let headers: Vec<String> = replies
+            .into_iter()
+            .map(|r| r.expect("answered").header().to_string())
+            .collect();
+        assert_eq!(headers, ["OK 0", "OK 1"], "each reply is its own line's");
+        assert_eq!(read, [0, 1], "each line's reply is read in order");
+        let refused = ctl.pipeline(&["deliver s-a off=3", "deliver s-a off=4\tx"], |_| {});
+        assert!(
+            refused.iter().all(|r| r
+                .as_ref()
+                .is_err_and(|e| e.kind() == io::ErrorKind::InvalidInput)),
+            "a misframed line refuses its whole batch: {refused:?}"
+        );
+        assert!(!ctl.lost(), "a refusal is not a lost connection");
+        let cut = ctl.pipeline(
+            &[
+                "deliver s-a off=5",
+                "deliver s-a off=9",
+                "deliver s-a off=6",
+            ],
+            |_| {},
+        );
+        assert!(cut[0].as_ref().is_ok_and(Reply::ok), "{cut:?}");
+        assert!(cut[1..].iter().all(Result::is_err), "{cut:?}");
+        assert!(ctl.lost(), "the failure latches");
+        drop(ctl);
+        assert_eq!(
+            server.join().expect("server thread"),
+            [
+                "deliver s-a off=1",
+                "deliver s-a off=2",
+                "deliver s-a off=5",
+                "deliver s-a off=9"
+            ],
+            "a refused batch never reached the peer"
+        );
+    }
+
+    /// 32 `deliver` lines of 273 bytes, 8,736 in all: more than an empty socket takes at once.
+    fn a_burst_of_deliveries() -> Vec<String> {
+        let text = "x".repeat(200);
+        let lines: Vec<String> = (0..32)
+            .map(|i| {
+                format!(
+                    "deliver s-worker1 off={} from=s-lead@n-mac1 kind=msg trust=agent text={text}",
+                    1000 + i
+                )
+            })
+            .collect();
+        assert!(
+            lines.iter().map(|line| line.len() + 1).sum::<usize>() > PIPELINE_WRITE_MAX,
+            "the batch is more than one write"
+        );
+        lines
+    }
+
+    /// A PIPELINED BATCH IS NEVER CUT INSIDE A LINE, WHEREVER ITS WRITER DIES (C08r review).
+    /// aterm serves the bytes a peer left before its end as a request even with no newline
+    /// after them, so a writer killed inside a line would have aterm take that line's prefix
+    /// as a whole `deliver`. Here a batch longer than an empty socket takes at once goes to a
+    /// peer that answers nothing, on a nonblocking socket: where a write would wait for the
+    /// peer it fails instead, and the writer is dropped there, as a kill there leaves it. What
+    /// the peer reads to its end is whole lines, the batch's first ones.
+    #[test]
+    fn a_pipelined_batch_leaves_whole_lines_wherever_its_writer_dies() {
+        let (near, far) = UnixStream::pair().expect("socketpair");
+        near.set_nonblocking(true).expect("a nonblocking writer");
+        let lines = a_burst_of_deliveries();
+        let batch: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut ctl = Ctl::from_stream(near).expect("client");
+        let replies = ctl.pipeline(&batch, |_| {});
+        assert!(replies.iter().all(Result::is_err), "nobody answered");
+        assert!(ctl.lost(), "the failure latches");
+        drop(ctl);
+        let mut left = Vec::new();
+        BufReader::new(far)
+            .read_to_end(&mut left)
+            .expect("the peer reads to the writer's end");
+        let text = String::from_utf8(left).expect("UTF-8");
+        assert!(
+            text.ends_with('\n'),
+            "the peer was left a line cut at {} bytes: ...{}",
+            text.rsplit('\n').next().map_or(0, str::len),
+            &text[text.len().saturating_sub(60)..]
+        );
+        let served: Vec<&str> = text.lines().collect();
+        assert!(!served.is_empty(), "the first write went whole");
+        assert_eq!(served, batch[..served.len()], "the batch's first lines");
+    }
+
+    /// A batch of several writes is answered line by line, in order, by a peer that answers
+    /// each line as it reads it.
+    #[test]
+    fn a_pipelined_batch_of_several_writes_is_answered_in_order() {
+        let (near, far) = UnixStream::pair().expect("socketpair");
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(far.try_clone().expect("clone"));
+            let mut writer = far;
+            let mut line = String::new();
+            let mut seen = 0usize;
+            while reader.read_line(&mut line).expect("read") > 0 {
+                writer
+                    .write_all(format!("OK {seen}\n").as_bytes())
+                    .expect("write");
+                seen += 1;
+                line.clear();
+            }
+            seen
+        });
+        let lines = a_burst_of_deliveries();
+        let batch: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut ctl = Ctl::from_stream(near).expect("client");
+        let mut read = Vec::new();
+        let headers: Vec<String> = ctl
+            .pipeline(&batch, |i| read.push(i))
+            .into_iter()
+            .map(|r| r.expect("answered").header().to_string())
+            .collect();
+        let want: Vec<String> = (0..batch.len()).map(|i| format!("OK {i}")).collect();
+        assert_eq!(headers, want, "each reply is its own line's");
+        assert_eq!(read, (0..batch.len()).collect::<Vec<_>>());
+        drop(ctl);
+        assert_eq!(server.join().expect("server thread"), batch.len());
+    }
+
+    /// Each write of a batch is the most whole lines an empty socket takes at once, and a line
+    /// longer than that is a write of its own.
+    #[test]
+    fn a_pipelined_write_is_the_most_whole_lines_an_empty_socket_takes() {
+        let lines = a_burst_of_deliveries();
+        let batch: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let per_write = PIPELINE_WRITE_MAX / (batch[0].len() + 1);
+        assert_eq!(write_end(&batch, 0), per_write);
+        assert_eq!(write_end(&batch, per_write), batch.len());
+        let long = "x".repeat(PIPELINE_WRITE_MAX);
+        assert_eq!(write_end(&[&long, "a", "b"], 0), 1, "alone");
+        assert_eq!(write_end(&[&long, "a", "b"], 1), 3);
     }
 
     /// The first I/O failure latches the connection as lost.

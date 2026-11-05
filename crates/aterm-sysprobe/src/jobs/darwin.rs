@@ -137,6 +137,8 @@ pub const KINFO_FLAG_AT: usize = 32;
 pub const KINFO_STAT_AT: usize = 36;
 /// `… kp_proc.p_pid`.
 pub const KINFO_PID_AT: usize = 40;
+/// `… kp_proc.p_sigignore` (`sigset_t`): bit `n - 1` for each signal `n` the process ignores.
+pub const KINFO_SIGIGNORE_AT: usize = 232;
 /// `… kp_proc.p_comm` (`MAXCOMLEN + 1` bytes).
 pub const KINFO_COMM_AT: usize = 243;
 /// `… kp_eproc.e_pcred.p_ruid`.
@@ -331,6 +333,10 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     (
         "offsetof(struct kinfo_proc, kp_proc.p_pid)",
         KINFO_PID_AT as i64,
+    ),
+    (
+        "offsetof(struct kinfo_proc, kp_proc.p_sigignore)",
+        KINFO_SIGIGNORE_AT as i64,
     ),
     (
         "offsetof(struct kinfo_proc, kp_proc.p_comm)",

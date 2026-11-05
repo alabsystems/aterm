@@ -1059,6 +1059,50 @@ fn a_held_fact_is_typed_at_a_break_only_under_the_key() {
     );
 }
 
+/// A run whose host reads one process the agent left running, and nothing else.
+fn leftover_run<'a>(tag: &'a str, policy: SupervisorConfig, steps: &[(i64, Step)]) -> Run<'a> {
+    let run = Run::new(tag, policy, steps);
+    *run.host.facts.lock().expect("facts") = None;
+    *run.host.left.lock().expect("left") = Some(1);
+    run
+}
+
+/// A LEFTOVER RIDES THE NEXT PROMPT, NEVER A BREAK: under the key, a settled break whose only
+/// untold fact is a process the agent left types nothing and books no row of the kind, and the
+/// turn end after it carries ` (aterm: 1 process this session started still runs, for 20 m; …)`,
+/// booked at `door=turn-end`. NEGATIVE CONTROL: let the break door take any kind
+/// (`FactsState::pending`), and the break types the leftover's line.
+#[test]
+fn a_leftover_rides_the_next_prompt_and_never_a_break() {
+    let ran = leftover_run(
+        "facts-leftover-door",
+        keyed(Occupancy::Off, true),
+        &[(0, Step::Break), (60, Step::End)],
+    )
+    .run(&[], &mut taking);
+    let told = crate::supervise::LeftoverReading {
+        as_of_ms: T0,
+        count: 1,
+        oldest_ms: Some(20 * MIN.unsigned_abs()),
+    }
+    .told();
+    assert!(ran.sent[0].is_empty(), "the break: {:#?}", ran.sent);
+    assert!(
+        ran.sent[1].len() == 1 && ran.sent[1][0].ends_with(&format!(" (aterm: {told})")),
+        "the turn end: {:#?}",
+        ran.sent
+    );
+    assert!(ran.facts("break").is_empty(), "{:#?}", ran.ran.noted);
+    let rows = ran.kind_rows(FactKind::Leftover);
+    assert!(
+        !rows.is_empty()
+            && rows
+                .iter()
+                .all(|(_, _, reason)| reason.contains(" door=turn-end")),
+        "{rows:#?}"
+    );
+}
+
 /// §2.1 AT A BREAK WITH NO HOST STEP, RANKS 2 AND 4: a wake's line and a hung call's fact due at
 /// one break, the wake's line is the break's one line and the stuck fact is not asked for there.
 /// NEGATIVE CONTROL: the book empty, the stuck fact goes at that break.
@@ -1092,6 +1136,225 @@ fn a_due_wake_goes_before_the_stuck_fact_at_a_break() {
         [stuck(BORN)],
         "CONTROL: {:#?}",
         alone.ran.noted
+    );
+}
+
+/// A peer's minted sid, as the host's overlap names it.
+const PEER: &str = "s-0a1b2c3d4e5f60718293";
+
+/// The overlap sentence of one file shared with [`PEER`].
+fn overlap_told() -> String {
+    format!("1 file this branch changes is also changed by {PEER}")
+}
+
+/// A run whose host reads no call at no progress and an overlap of one file with [`PEER`].
+fn overlap_run<'a>(tag: &'a str, policy: SupervisorConfig, steps: &[(i64, Step)]) -> Run<'a> {
+    let run = Run::new(tag, policy, steps);
+    *run.host.facts.lock().expect("facts") = None;
+    *run.host.overlap.lock().expect("overlap") = Some((1, vec![PEER.to_string()]));
+    run
+}
+
+/// How many times a run asked the host's overlap.
+fn overlap_asks(calls: &[String]) -> usize {
+    calls.iter().filter(|c| *c == "overlap").count()
+}
+
+/// AN OVERLAP RIDES A CONTINUATION AND NEVER A BREAK LINE: the first turn end's continuation ends
+/// with ` (aterm: 1 file this branch changes is also changed by <sid>)`, booked as its intent then
+/// its `fact-overlap@v1` row typed at `door=turn-end` (the Harness page counts it under
+/// `overlap`), and the next turn end, the same peer still overlapping, carries none. NEGATIVE
+/// CONTROLS: breaks of the agent's background work with only an overlap open, under the stuck
+/// line's key and `prompt`, type nothing and never ask it; an answer carries none and asks
+/// nothing, while a continuation at the same session does; and with `[harness] facts = false` a
+/// turn end carries none and asks nothing.
+#[test]
+fn an_overlap_rides_a_continuation_and_never_a_break_line() {
+    let ran = overlap_run(
+        "facts-overlap-rider",
+        keyed(Occupancy::Off, false),
+        &[(0, Step::End), (60, Step::End)],
+    )
+    .run(&[], &mut taking);
+    let riding = format!(" (aterm: {})", overlap_told());
+    assert!(
+        ran.sent[0].len() == 1 && ran.sent[0][0].ends_with(&riding),
+        "{:#?}",
+        ran.sent
+    );
+    assert!(
+        ran.sent[1].len() == 1 && !ran.sent[1][0].contains(" (aterm: "),
+        "told once: {:#?}",
+        ran.sent
+    );
+    let rows = ran.kind_rows(FactKind::Overlap);
+    assert_eq!(
+        decided(&rows),
+        [
+            (INTENT.to_string(), "waiting".to_string()),
+            ("fact-overlap@v1".to_string(), "typed".to_string()),
+        ]
+    );
+    assert!(
+        rows.iter()
+            .all(|(_, _, reason)| reason.contains(" door=turn-end")),
+        "{rows:#?}"
+    );
+    let mut stats = crate::harness::stats::HarnessStats::new(0);
+    for line in ran.ran.ledger.lines() {
+        crate::harness::stats::fold_ledger_line(&mut stats, line);
+    }
+    assert_eq!(stats.facts_told.get("overlap"), Some(&1), "{stats:#?}");
+
+    let breaks = overlap_run(
+        "facts-overlap-breaks",
+        keyed(Occupancy::Prompt, true),
+        &[(0, Step::Break), (60, Step::Break)],
+    )
+    .run(&[], &mut taking);
+    assert!(
+        breaks.sends().is_empty(),
+        "CONTROL: a break types no overlap: {:#?}",
+        breaks.ran.noted
+    );
+    assert_eq!(
+        overlap_asks(&breaks.ran.calls),
+        0,
+        "CONTROL: a break never asks it"
+    );
+    assert!(breaks.kind_rows(FactKind::Overlap).is_empty());
+
+    let host = Arc::new(DoorHost::default());
+    *host.overlap.lock().expect("overlap") = Some((1, vec![PEER.to_string()]));
+    let opts = SuperviseOpts {
+        policy: keyed(Occupancy::Off, false),
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let mut m = Mock::new(Vec::new());
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    *host.facts_at.lock().expect("facts_at") = s.now_unix_ms();
+    let answer = TurnEndAction::Type {
+        text: "2".to_string(),
+        rule_id: crate::supervise::policy::turn_end::RULE_ANSWER,
+    };
+    assert_eq!(s.overlap_for(&answer, &opts), None, "CONTROL: an answer");
+    assert_eq!(
+        overlap_asks(&host.calls()),
+        0,
+        "CONTROL: an answer asks none"
+    );
+    let carry = TurnEndAction::Type {
+        text: opts.policy.continue_text.clone(),
+        rule_id: RULE_CONTINUE,
+    };
+    assert_eq!(
+        s.overlap_for(&carry, &opts).map(|f| f.text),
+        Some(overlap_told()),
+        "the continuation at the same session"
+    );
+
+    let off = overlap_run(
+        "facts-overlap-off",
+        SupervisorConfig {
+            facts: false,
+            ..keyed(Occupancy::Off, false)
+        },
+        &[(0, Step::End)],
+    )
+    .run(&[], &mut taking);
+    assert!(
+        off.sent[0].len() == 1 && !off.sent[0][0].contains(" (aterm: "),
+        "CONTROL: facts off: {:#?}",
+        off.sent
+    );
+    assert_eq!(
+        overlap_asks(&off.ran.calls),
+        0,
+        "CONTROL: facts off asks none"
+    );
+    assert!(off.kind_rows(FactKind::Overlap).is_empty());
+}
+
+/// A SUCCESSOR DOES NOT RETELL A TOLD OVERLAP: a loop seeded from the ledger of one that typed the
+/// overlap on its continuation holds that episode told (its key is the peers' sids, which the
+/// successor names again), and its continuation carries none. NEGATIVE CONTROL: a ledger whose
+/// typed row is gone, its intent standing (the loop died between), leaves the episode untold, and
+/// the successor's continuation carries it.
+#[test]
+fn a_successor_does_not_retell_a_told_overlap() {
+    let riding = format!(" (aterm: {})", overlap_told());
+    let first = overlap_run(
+        "facts-overlap-seed-1",
+        keyed(Occupancy::Off, false),
+        &[(0, Step::End)],
+    )
+    .run(&[], &mut taking);
+    assert!(
+        first.sent[0].len() == 1 && first.sent[0][0].ends_with(&riding),
+        "{:#?}",
+        first.sent
+    );
+    let successor = |tag: &str, body: &str| {
+        let at_ms = T0 + 2 * MIN;
+        Run {
+            seed: Some((stamped(body, at_ms - MIN), at_ms)),
+            ..overlap_run(tag, keyed(Occupancy::Off, false), &[(0, Step::End)])
+        }
+        .run(&[], &mut taking)
+    };
+    let kept = successor("facts-overlap-seed-2", &first.ran.ledger);
+    assert!(
+        kept.sent[0].len() == 1 && !kept.sent[0][0].contains(" (aterm: "),
+        "{:#?}",
+        kept.sent
+    );
+    let crashed: String = first
+        .ran
+        .ledger
+        .lines()
+        .filter(|l| !l.contains("\"rule_id\":\"fact-overlap@v1\""))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(crashed.contains("kind=overlap"), "the intent stands");
+    let retold = successor("facts-overlap-seed-3", &crashed);
+    assert!(
+        retold.sent[0].len() == 1 && retold.sent[0][0].ends_with(&riding),
+        "CONTROL: an intent with no outcome is untold: {:#?}",
+        retold.sent
+    );
+}
+
+/// THE OVERLAP WAITS BEHIND A HUNG CALL'S FACT, AS THE KINDS RANK: at a turn end where a call at
+/// no progress and an overlap are both untold, the continuation carries the call's fact alone and
+/// the overlap is not asked; the next turn end, the call told, carries the overlap. NEGATIVE
+/// CONTROL: an overlap asked before, or in place of, the jobs reading's fact rides the first
+/// continuation.
+#[test]
+fn the_overlap_waits_behind_a_hung_calls_fact() {
+    let run = Run::new(
+        "facts-overlap-after-jobs",
+        keyed(Occupancy::Off, false),
+        &[(0, Step::End), (60, Step::End)],
+    );
+    *run.host.overlap.lock().expect("overlap") = Some((1, vec![PEER.to_string()]));
+    let ran = run.run(&[], &mut taking);
+    let sent = &ran.sent;
+    assert!(
+        sent[0].len() == 1
+            && sent[0][0].ends_with(&riding(BORN))
+            && sent[0][0].matches(" (aterm: ").count() == 1,
+        "CONTROL: the call's fact first, alone: {sent:#?}"
+    );
+    let overlap = format!(" (aterm: {})", overlap_told());
+    assert!(
+        sent[1].len() == 1 && sent[1][0].ends_with(&overlap),
+        "the call told, the overlap next: {sent:#?}"
+    );
+    assert_eq!(
+        overlap_asks(&ran.ran.calls),
+        1,
+        "asked only where the jobs reading gave no fact"
     );
 }
 

@@ -123,7 +123,7 @@ impl Args {
             return Err("`--lookalike-kib` is the lookalike arm's: name it in `--arm`".to_string());
         }
         for arm in a.plan() {
-            bench_spec::parse(&a.bench_words(Path::new("/scratch"), arm))
+            bench_spec::parse(&a.bench_words(arm), Path::new("/scratch"))
                 .map_err(|why| format!("the restore bench refuses this run: {why}"))?;
         }
         if a.json_out.is_some() && a.plan().len() > 1 {
@@ -155,9 +155,9 @@ impl Args {
             .collect()
     }
 
-    /// The bench's words for `arm`, writing to `out`.
-    pub(crate) fn bench_words(&self, out: &Path, arm: Arm) -> String {
-        let mut words = vec![format!("out={}", out.display())];
+    /// The bench's measurement knobs for `arm`.
+    pub(crate) fn bench_words(&self, arm: Arm) -> String {
+        let mut words = Vec::new();
         if let Some(sizes) = &self.sessions {
             let sizes: Vec<String> = sizes.iter().map(u32::to_string).collect();
             words.push(format!("sessions={}", sizes.join(",")));
@@ -259,14 +259,15 @@ fn run_arm(
         .prefix("aterm-restore-")
         .tempdir()
         .map_err(|e| format!("could not make a scratch directory: {e}"))?;
-    let words = args.bench_words(scratch.path(), arm);
+    let words = args.bench_words(arm);
     bench_build::run_bench(
         targo,
         &args.build_args(),
-        bench_spec::ENV,
-        &words,
+        (bench_spec::ENV, &words),
+        (bench_spec::OUT_ENV, scratch.path()),
         PROGRESS,
         "the restore bench",
+        bench_build::Entry::Timed,
     )?;
     let read = |name: &str| {
         let path = scratch.path().join(name);
@@ -328,9 +329,9 @@ fn run_arm(
     }
     .render();
     let (md_path, json_path) = ledger_paths(ledger_dir, &date, "restore-e2e");
-    std::fs::write(&md_path, format!("{header}\n{tables}\n"))
+    crate::write_fresh(&md_path, format!("{header}\n{tables}\n"))
         .map_err(|e| format!("could not write {}: {e}", md_path.display()))?;
-    std::fs::write(&json_path, &json)
+    crate::write_fresh(&json_path, &json)
         .map_err(|e| format!("could not write {}: {e}", json_path.display()))?;
     eprintln!(
         "ledger entry written: {} (+ {}) — commit both to record the run",
@@ -338,7 +339,7 @@ fn run_arm(
         json_path.display()
     );
     if let Some(out) = &args.json_out {
-        std::fs::write(out, &json)
+        crate::write_fresh(out, &json)
             .map_err(|e| format!("could not write {}: {e}", out.display()))?;
         eprintln!("json written: {}", out.display());
     }
@@ -402,6 +403,29 @@ mod tests {
         pairs.iter().map(|(k, v)| (*k, (*v).to_string())).collect()
     }
 
+    fn assert_output_path_round_trip(out: PathBuf) {
+        let args = Args::default();
+        let plain = Path::new("/scratch/plain");
+        let control = bench_spec::parse(&args.bench_words(Arm::Clean), plain).unwrap();
+        assert_eq!(control.out, plain);
+        let decoded = bench_spec::parse(&args.bench_words(Arm::Clean), &out).unwrap();
+        assert_eq!(decoded.out, out);
+    }
+
+    #[test]
+    fn output_path_with_spaces_round_trips() {
+        assert_output_path_round_trip(PathBuf::from("/scratch/with spaces"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_path_with_non_utf8_bytes_round_trips() {
+        use std::os::unix::ffi::OsStringExt as _;
+        assert_output_path_round_trip(
+            std::ffi::OsString::from_vec(b"/scratch/non-utf8-\xff".to_vec()).into(),
+        );
+    }
+
     #[test]
     fn ledger_acceptance_requires_observed_application_not_the_requested_arm() {
         let report = |applied: Applied| {
@@ -455,10 +479,7 @@ mod tests {
     fn the_default_plan_is_every_arm_with_the_bench_s_defaults() {
         let a = Args::from_options(&options(&[("--no-windows", "")])).expect("parses");
         assert_eq!(a.plan(), Arm::ALL);
-        assert_eq!(
-            a.bench_words(Path::new("/s"), Arm::Clean),
-            "out=/s arm=clean"
-        );
+        assert_eq!(a.bench_words(Arm::Clean), "arm=clean");
         assert_eq!(
             a.command_line(Arm::Lookalike),
             "targo --unverified verify perf restore-e2e --no-windows --arm lookalike"
@@ -474,7 +495,7 @@ mod tests {
                 "restore_bench"
             ]
         );
-        let spec = bench_spec::parse(&a.bench_words(Path::new("/s"), Arm::Lookalike))
+        let spec = bench_spec::parse(&a.bench_words(Arm::Lookalike), Path::new("/s"))
             .expect("the bench reads the lane's words");
         assert_eq!((spec.sessions, spec.arm), (vec![1, 8, 32], Arm::Lookalike));
     }
@@ -497,12 +518,12 @@ mod tests {
             "A B B A"
         );
         assert_eq!(
-            a.bench_words(Path::new("/s"), Arm::Lookalike),
-            "out=/s sessions=2,16 rounds=5 lines=800 arm=lookalike lookalike_kib=64"
+            a.bench_words(Arm::Lookalike),
+            "sessions=2,16 rounds=5 lines=800 arm=lookalike lookalike_kib=64"
         );
         assert_eq!(
-            a.bench_words(Path::new("/s"), Arm::Clean),
-            "out=/s sessions=2,16 rounds=5 lines=800 arm=clean",
+            a.bench_words(Arm::Clean),
+            "sessions=2,16 rounds=5 lines=800 arm=clean",
             "the plant is the lookalike arm's alone"
         );
         assert_eq!(

@@ -164,8 +164,17 @@ impl Seed {
     /// # Errors
     /// A file could not be written.
     pub fn write_to(&self, dir: &Path) -> std::io::Result<()> {
+        use std::io::Write as _;
         for (name, text) in self.files() {
-            std::fs::write(dir.join(name), text)?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            }
+            let mut f = opts.open(dir.join(name))?;
+            f.write_all(text.as_bytes())?;
         }
         Ok(())
     }

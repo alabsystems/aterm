@@ -75,14 +75,17 @@ fn a_park_on_a_need_alone_or_in_an_earlier_message_gets_the_go_ahead() {
     assert!(!text.contains(GO_AHEAD_DROP), "no need to drop: {text}");
 }
 
-/// A NEED THE TURN'S LAST WORD RETRACTED PARKS NO GO-AHEAD (the second review, 2026-11-01): an
-/// earlier message asks the go-ahead, then the agent did that work itself and said `NEEDS YOU:
-/// nothing` (in its last message, or in an earlier one), so a go-ahead for it would be a prompt
-/// it cannot act on: none is read and none typed, under Cruise and under Land, at a turn end and
-/// at a break of its background work. CONTROL: the same need unretracted gets the go-ahead
-/// (`a_park_on_a_need_alone_or_in_an_earlier_message_gets_the_go_ahead`). Negative control: the
-/// go-ahead reader reading the earlier messages raw (`turn_go_ahead` without
-/// `needs::retracted_cut`) parks on the retracted need and types `go-ahead@v1`.
+/// A NEED THE AGENT'S WORD RETRACTED PARKS NO GO-AHEAD (the second review, 2026-11-01; the review
+/// of 2026-11-02): an earlier message asks the go-ahead, then the agent did that work itself and
+/// said `NEEDS YOU: nothing`, in its last message or later in the need's own message, so a
+/// go-ahead for it would be a prompt it cannot act on: none is read and none typed, under Cruise
+/// and under Land, at a turn end and at a break of its background work. A none in a message of
+/// its own, not the last, is no word on another message's need (`needs::standing_before`): that
+/// need stands, and the go-ahead parks on it. CONTROL: the same need unretracted gets the
+/// go-ahead (`a_park_on_a_need_alone_or_in_an_earlier_message_gets_the_go_ahead`). Negative
+/// controls: the go-ahead reader reading the earlier messages raw (`turn_go_ahead` without
+/// `needs::retracted_cut`) parks on the retracted need and types `go-ahead@v1`; so does the last
+/// message read alone (this branch's first cut, d55d270c1a) on the need's own message's none.
 #[test]
 fn a_need_the_turns_last_word_retracted_parks_no_go_ahead() {
     let need = "NEEDS YOU: say \"rerun the checks\" when the Mac has memory to spare. I'll run the \
@@ -102,7 +105,7 @@ fn a_need_the_turns_last_word_retracted_parks_no_go_ahead() {
         assert_eq!(r.go_ahead(), None, "{before:?} / {last:?}");
         let st = TurnEndState::default();
         assert_eq!(
-            st.go_ahead_at_break(Some(&before), &last, false),
+            st.go_ahead_at_break(Some(before.as_str().into()), &last, false),
             None,
             "at a break: {before:?}"
         );
@@ -117,6 +120,22 @@ fn a_need_the_turns_last_word_retracted_parks_no_go_ahead() {
         let a = act(&mut st, &land(r.clone()), t0() + 3 * MIN);
         assert!(!is_go_ahead(&a), "Land: {a:?}");
     }
+    let (said, breaks) = needs::joined(Some(vec![
+        need.to_string(),
+        format!("{did} NEEDS YOU: nothing"),
+    ]));
+    let apart = TurnEndReading {
+        turn_said: said,
+        turn_breaks: needs::Breaks {
+            said: breaks,
+            lines: Vec::new(),
+        },
+        ..idle("Removed the worktree and the branch.", Some(3 * MIN))
+    };
+    assert!(
+        apart.go_ahead().is_some(),
+        "a none in a message of its own is no word on another's need"
+    );
 }
 
 #[test]

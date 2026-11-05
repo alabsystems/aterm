@@ -82,7 +82,7 @@ impl Image {
             ],
             Some(file),
         )?;
-        std::fs::write(mnt.join(NEVER_INDEX), b"")
+        crate::util::write_fresh(&mnt.join(NEVER_INDEX), b"")
             .map_err(|e| format!("cannot write {}: {e}", mnt.join(NEVER_INDEX).display()))?;
         Ok(image)
     }
@@ -168,7 +168,8 @@ pub(crate) fn fill(path: &Path, bytes: u64) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let mut f = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut f =
+        crate::util::create_regular_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let chunk = vec![0xa5u8; 1 << 20];
     let mut left = bytes;
     while left > 0 {
@@ -202,8 +203,9 @@ pub(crate) fn lay_target_sized(dir: &Path, deps: u64, incremental: u64) -> Resul
     ] {
         std::fs::create_dir_all(debug.join(d)).map_err(|e| format!("{}: {e}", debug.display()))?;
     }
-    let write =
-        |p: PathBuf, b: &[u8]| std::fs::write(&p, b).map_err(|e| format!("{}: {e}", p.display()));
+    let write = |p: PathBuf, b: &[u8]| {
+        crate::util::write_fresh(&p, b).map_err(|e| format!("{}: {e}", p.display()))
+    };
     write(
         dir.join("CACHEDIR.TAG"),
         b"Signature: 8a477f597d28d172789f06886806bc55\n# a cargo target directory\n",
@@ -249,8 +251,9 @@ pub(crate) fn lay_checkout(dir: &Path) -> Result<(), String> {
 /// # Errors
 /// A file could not be written.
 pub(crate) fn lay_source(dir: &Path) -> Result<(), String> {
-    let write =
-        |p: PathBuf, b: &[u8]| std::fs::write(&p, b).map_err(|e| format!("{}: {e}", p.display()));
+    let write = |p: PathBuf, b: &[u8]| {
+        crate::util::write_fresh(&p, b).map_err(|e| format!("{}: {e}", p.display()))
+    };
     std::fs::create_dir_all(dir.join(".git/logs"))
         .map_err(|e| format!("{}: {e}", dir.display()))?;
     std::fs::create_dir_all(dir.join("src")).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -276,16 +279,27 @@ fn backdate(root: &Path, days: u64) -> Result<(), String> {
             }
             continue;
         }
-        std::fs::File::open(&p)
+        open_nofifo_nofollow(&p)
             .and_then(|f| f.set_modified(when))
             .map_err(|e| format!("cannot date {}: {e}", p.display()))?;
     }
     Ok(())
 }
 
+fn open_nofifo_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    opts.open(path)
+}
+
 fn touch_now(path: &Path) -> Result<(), String> {
-    std::fs::File::open(path)
-        .and_then(|f| f.set_modified(SystemTime::now()))
+    aterm_uds::regular_file::open(path)
+        .and_then(|(f, _)| f.set_modified(SystemTime::now()))
         .map_err(|e| format!("cannot touch {}: {e}", path.display()))
 }
 
@@ -373,7 +387,7 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
         lay_checkout(&home.join(c))?;
     }
     std::fs::create_dir_all(home.join("idle/target/doc/lay")).map_err(|e| format!("doc: {e}"))?;
-    std::fs::write(home.join("idle/target/doc/lay/index.html"), b"<html>")
+    crate::util::write_fresh(&home.join("idle/target/doc/lay/index.html"), b"<html>")
         .map_err(|e| format!("doc: {e}"))?;
     fill(
         &home.join("idle/target/criterion/bench/base/estimates.json"),
@@ -398,9 +412,10 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
         &home.join("Library/Caches/aterm/disk-reserve.noindex/reserve"),
         256 << 20,
     )?;
-    let lock = std::fs::File::open(home.join("locked/target/debug/.cargo-lock"))
-        .map_err(|e| format!("lock: {e}"))?;
-    aterm_uds::keep_out_of_children(&lock).map_err(|e| format!("lock clofork: {e}"))?;
+    let lock: std::fs::File = aterm_uds::kept_out(|| {
+        crate::util::open_regular_file(&home.join("locked/target/debug/.cargo-lock"))
+    })
+    .map_err(|e| format!("lock: {e}"))?;
     #[expect(
         clippy::disallowed_methods,
         reason = "the lane's build holds the lock for its life"
@@ -449,11 +464,14 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
     }
     let mut v = Verdict::default();
     let verdict = lane(&inst, &home, &mirror, &mut v);
-    inst.stop();
+    let cleanup = inst.stop();
     drop(lock);
     drop(image);
     if let Err(why) = verdict {
         v.check("the lane ran to its end", false, || why);
+    }
+    if let Err(why) = cleanup {
+        v.check("the private instance cleanup completed", false, || why);
     }
     if v.passed() {
         println!("disk-lane: PASS ({} checks)", v.rows.len());

@@ -304,6 +304,7 @@ impl Rig {
             create: false,
             for_word: None,
             wait: true,
+            read_only: false,
         }
     }
 

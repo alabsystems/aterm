@@ -179,18 +179,14 @@ fn copy_image(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::io::Read as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    let input = crate::util::open_regular_file(source)?;
-    let meta = input.metadata()?;
+    let (input, meta) = crate::util::open_regular_file_with_meta(source)?;
     let limit = crate::util::MAX_LAB_PROGRAM_BYTES;
     if meta.len() > limit {
         return Err(std::io::Error::other(
             "app image exceeds the lab program limit",
         ));
     }
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
+    let mut output = crate::util::create_new_regular_file(destination, 0o600)?;
     if std::io::copy(&mut input.take(limit + 1), &mut output)? > limit {
         return Err(std::io::Error::other(
             "app image grew past the lab program limit",
@@ -236,7 +232,6 @@ pub fn world_env(root: &Path, bin: &Path) -> Vec<(String, String)> {
 /// # Errors
 /// A directory or the config could not be made.
 pub fn make_world(root: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
     for d in [
         "",
         "home",
@@ -250,8 +245,7 @@ pub fn make_world(root: &Path) -> std::io::Result<()> {
         "tmp",
     ] {
         let dir = root.join(d);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        crate::util::create_private_dir_all(&dir)?;
     }
     crate::instance::write_aterm_toml(
         &root.join("cfg/aterm/aterm.toml"),
@@ -361,7 +355,8 @@ impl World {
         make_world(&root).map_err(|e| format!("m{i:02}: cannot make its world: {e}"))?;
         let sock = root.join("run/aterm/aterm.sock");
         let log = root.join("gui.log");
-        let out = std::fs::File::create(&log).map_err(|e| format!("m{i:02}: its log: {e}"))?;
+        let out =
+            crate::util::create_stdio_file(&log).map_err(|e| format!("m{i:02}: its log: {e}"))?;
         let err = out.try_clone().map_err(|e| e.to_string())?;
         let home = root.join("home");
         let mut cmd = limited("fleet-sim-instance", &self.aterm);

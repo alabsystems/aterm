@@ -4,19 +4,15 @@
 use super::*;
 use crate::accounts::broker::{Grant, Policy as BrokerPolicy, Publication};
 
-pub(crate) fn publication_transition(
-    before: &aterm_spec::interp::State,
-    action: &str,
-) -> aterm_spec::interp::State {
-    transition_with(before, action, false)
+/// A published policy of two grants, the first with a refresh waiting to be published.
+pub(crate) struct World {
+    world: super::broker_tests::World,
+    other: Grant,
 }
 
-fn transition_with(
-    before: &aterm_spec::interp::State,
-    action: &str,
-    bypass_review: bool,
-) -> aterm_spec::interp::State {
-    let (f, broker, _, old) = super::broker_tests::setup();
+fn world() -> World {
+    let world = super::broker_tests::setup();
+    let (f, _, _, old) = &world;
     let other = Grant {
         id: [71; 16],
         producer: [72; 32],
@@ -26,13 +22,33 @@ fn transition_with(
         },
         ..old.clone()
     };
-    super::broker_tests::publish(&f, vec![old.clone(), other.clone()]);
+    super::broker_tests::publish(f, vec![old.clone(), other.clone()]);
     f.issue(
         31,
         0,
         f.policy("example-v1").reference([41; 32]).unwrap(),
         vec![old.binding.revision],
     );
+    World { world, other }
+}
+
+pub(crate) fn publication_transition(
+    world: &World,
+    before: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    transition_with(world, before, action, false)
+}
+
+fn transition_with(
+    World {
+        world: (f, broker, _, old),
+        other,
+    }: &World,
+    before: &aterm_spec::interp::State,
+    action: &str,
+    bypass_review: bool,
+) -> aterm_spec::interp::State {
     let refresh = broker.refresh_proposal_until(old.id, deadline()).unwrap();
     let base = if action == "StaleBase" {
         [99; 32]
@@ -62,7 +78,7 @@ fn transition_with(
     if action == "ForeignActor" {
         let mut foreign = old.clone();
         foreign.actor = [97; 48];
-        super::broker_tests::publish(&f, vec![foreign, other.clone()]);
+        super::broker_tests::publish(f, vec![foreign, other.clone()]);
     }
     let mut stored = 0;
     if bypass_review {
@@ -120,7 +136,7 @@ fn transition_with(
         .grants()
         .find(|g| g.id == old.id)
         .is_some_and(|g| g.producer == old.producer);
-    let kept = policy.grants().any(|g| g == &other);
+    let kept = policy.grants().any(|g| g == other);
     let used = f
         .source(31, 0)
         .prepare_until(deadline())
@@ -153,21 +169,39 @@ fn transition_with(
     next
 }
 
+/// The model's steps on four worlds: the three publications refused before any write, then `Apply`
+/// on the same world, whose success shows they left the base and the head usable; `Repeat`,
+/// `MovedHead` and `ForeignActor` each on its own, since each changes the world first.
+/// GAP: a refused publication's effect on a later one on the same world could stand in for that
+/// later step's result. `Repeat` still publishes first on a pristine world.
 #[test]
 fn publication_conforms_and_unreviewed_root_write_changes_identity() {
     let model = aterm_models_db::broker_publication_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let initial = model.init_state();
-    aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &model.actions, |action| {
-        let next = super::publication_transition(&initial, action.name);
-        assert!(
-            model.successors(action.name, &initial).contains(&next),
-            "{}: {next:?}",
-            action.name
-        );
-        next
+    let worlds: [&[&str]; 4] = [
+        &["Producer", "OtherGrant", "StaleBase", "Apply"],
+        &["Repeat"],
+        &["MovedHead"],
+        &["ForeignActor"],
+    ];
+    // A new action falls out of the walk here, not silently.
+    let mut named: Vec<_> = worlds.iter().copied().flatten().copied().collect();
+    let mut actions: Vec<_> = model.actions.iter().map(|action| action.name).collect();
+    named.sort_unstable();
+    actions.sort_unstable();
+    assert_eq!(named, actions);
+    aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &worlds, |steps| {
+        let world = world();
+        for action in *steps {
+            let next = super::publication_transition(&world, &initial, action);
+            assert!(
+                model.successors(action, &initial).contains(&next),
+                "{action}: {next:?}"
+            );
+        }
     });
-    let bad = transition_with(&initial, "Producer", true);
+    let bad = transition_with(&world(), &initial, "Producer", true);
     assert!(!model.check_invariant("ReviewedOnly", &bad));
     assert!(!model.check_invariant("IdentityStable", &bad));
 }

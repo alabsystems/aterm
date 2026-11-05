@@ -72,23 +72,35 @@ fn keeper_role() -> ! {
     std::process::exit(1)
 }
 
-fn stepped_keeper_role() -> ! {
+/// A keeper the test parks with a `pause` note and lets go with a `resume` one: between two
+/// turns, or with `in_turn` inside one, after its poll returned and before it reads anything
+/// (`Server::step_parked`), so what the test does meanwhile lands between that poll and the
+/// turn's sweep of its exit watches.
+fn stepped_keeper_role(in_turn: bool) -> ! {
     let talk = PathBuf::from(std::env::var(TALK).expect("talk"));
     let note = |ext: &str| talk.with_extension(ext);
+    let park = || {
+        std::fs::remove_file(note("pause")).expect("take the pause");
+        std::fs::write(note("paused"), b"paused").expect("say parked");
+        let resumed = within(HANG * 5, Duration::from_millis(5), || {
+            note("resume").exists().then_some(())
+        });
+        assert!(resumed.is_some(), "never resumed");
+        std::fs::remove_file(note("resume")).expect("take the resume");
+    };
     let mut server = Server::bind(keeper_config()).expect("bind");
     report("ready");
     loop {
         let parked = note("pause").exists();
-        if parked {
-            std::fs::remove_file(note("pause")).expect("take the pause");
-            std::fs::write(note("paused"), b"paused").expect("say parked");
-            let resumed = within(HANG * 5, Duration::from_millis(5), || {
-                note("resume").exists().then_some(())
-            });
-            assert!(resumed.is_some(), "never resumed");
-            std::fs::remove_file(note("resume")).expect("take the resume");
-        }
-        if server.step(20).is_err() {
+        let turned = if parked && in_turn {
+            server.step_parked(20, park)
+        } else {
+            if parked {
+                park();
+            }
+            server.step(20)
+        };
+        if turned.is_err() {
             std::process::exit(1)
         }
         if parked {
@@ -479,7 +491,8 @@ fn await_go() -> String {
 fn dispatch_role() {
     match role().as_deref() {
         Some("keeper") => keeper_role(),
-        Some("keeper-stepped") => stepped_keeper_role(),
+        Some("keeper-stepped") => stepped_keeper_role(false),
+        Some("keeper-parked-in-turn") => stepped_keeper_role(true),
         Some("window") => window_role(false),
         Some("window-holder") => window_role(true),
         Some(
@@ -972,10 +985,22 @@ fn a_marked_window_killed_is_an_orphan_and_its_dead_shell_is_pruned() {
     );
 }
 
+/// Where the keeper is parked while the next window writes its frames and exits.
+#[derive(Clone, Copy)]
+enum Park {
+    /// Between two turns: the next turn's poll finds the frames and the exit together, and the
+    /// turn's own read takes the frames before it judges the exit.
+    BetweenTurns,
+    /// Inside a turn, after its poll returned: the turn's read skips the connection, which was
+    /// quiet at the poll, and its sweep of the exit watches finds the exit, so only the drain
+    /// behind that exit (`Server::drain_pid`) reads the frames before the death is judged.
+    InTurn,
+}
+
 struct Overtaken {
     /// The keeper's status once the next window's end is judged.
     status: String,
-    /// The status's `frames_behind_exit`.
+    /// How far the status's `frames_behind_exit` moved over the next window's end.
     behind: u64,
     /// The crashes judged at the next window's end.
     crashes: u64,
@@ -985,8 +1010,17 @@ struct Overtaken {
     keeper_pid: u32,
 }
 
-fn an_exit_that_overtakes_its_frames(s: &mut Scratch, test: &str, role: &str) -> Overtaken {
-    let keeper = s.spawn(test, "keeper-stepped", &[]);
+fn an_exit_that_overtakes_its_frames(
+    s: &mut Scratch,
+    test: &str,
+    role: &str,
+    park: Park,
+) -> Overtaken {
+    let keeper_role = match park {
+        Park::BetweenTurns => "keeper-stepped",
+        Park::InTurn => "keeper-parked-in-turn",
+    };
+    let keeper = s.spawn(test, keeper_role, &[]);
     s.line(keeper, "ready");
     let keeper_pid = s.kids[keeper].id();
     let (mut leaders, mut rdevs, mut windows) = (Vec::new(), Vec::new(), Vec::new());
@@ -1013,6 +1047,7 @@ fn an_exit_that_overtakes_its_frames(s: &mut Scratch, test: &str, role: &str) ->
         assert_eq!(w.exit_status(), None, "the leaders live:\n{st}");
     }
     let crashes_before = ends(&st, "crash");
+    let behind_before = status_count(&st, "frames_behind_exit");
 
     s.pause(keeper);
     s.say(next, "go");
@@ -1022,11 +1057,7 @@ fn an_exit_that_overtakes_its_frames(s: &mut Scratch, test: &str, role: &str) ->
     let status = s.await_status("the window's end judged", |t| {
         t.contains("claimed=0") && t.contains("offered=0") && t.contains("windows=0")
     });
-    let behind = status
-        .lines()
-        .find_map(|l| l.strip_prefix("frames_behind_exit="))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| panic!("frames_behind_exit in\n{status}"));
+    let behind = status_count(&status, "frames_behind_exit") - behind_before;
     let crashes = ends(&status, "crash") - crashes_before;
     Overtaken {
         status,
@@ -1059,11 +1090,16 @@ fn ends(status: &str, key: &str) -> u64 {
 
 const T_OVERTAKE: &str = "a_quit_whose_exit_overtakes_its_claims_hangs_both_shells_up";
 
+/// The next window claims both offered masters, says BYE and exits while the keeper is parked
+/// inside a turn after its poll ([`Park::InTurn`]), so the turn's sweep of its exit watches
+/// finds the exit with all three frames still unread: the drain behind it hands the core both
+/// REGISTERs and the BYE before the death is judged, and the quit hangs both shells up. Without
+/// that drain the exit is judged first, as a crash with its claims unread.
 #[test]
 fn a_quit_whose_exit_overtakes_its_claims_hangs_both_shells_up() {
     dispatch_role();
     let mut s = Scratch::new("overtake");
-    let o = an_exit_that_overtakes_its_frames(&mut s, T_OVERTAKE, "next-window");
+    let o = an_exit_that_overtakes_its_frames(&mut s, T_OVERTAKE, "next-window", Park::InTurn);
     let st = &o.status;
     assert!(
         st.contains("masters=0"),
@@ -1074,7 +1110,10 @@ fn a_quit_whose_exit_overtakes_its_claims_hangs_both_shells_up() {
     assert!(st.contains("custody_copies=0"), "{st}");
     assert_eq!(ends(st, "quit"), 2, "{st}");
     assert_eq!(o.crashes, 0, "{st}");
-    assert!(o.behind >= 2, "two frames read behind the exit:\n{st}");
+    assert_eq!(
+        o.behind, 3,
+        "both REGISTERs and the BYE drained behind the exit:\n{st}"
+    );
     for w in &o.leaders {
         assert_eq!(await_exit(w), 1, "the leader was hung up (SIGHUP)");
     }
@@ -1088,19 +1127,24 @@ fn a_quit_whose_exit_overtakes_its_claims_hangs_both_shells_up() {
 
 const T_OVERTAKE_CONTROL: &str = "without_a_bye_an_overtaken_claim_keeps_both_shells";
 
+/// The control of [`a_quit_whose_exit_overtakes_its_claims_hangs_both_shells_up`]: the same
+/// overtaken exit with no BYE. Both claims are drained behind it and the death is a crash, so
+/// both shells are kept as orphans.
 #[test]
 fn without_a_bye_an_overtaken_claim_keeps_both_shells() {
     dispatch_role();
     let mut s = Scratch::new("overtake-ctl");
-    let o = an_exit_that_overtakes_its_frames(&mut s, T_OVERTAKE_CONTROL, "next-window-no-bye");
+    let o = an_exit_that_overtakes_its_frames(
+        &mut s,
+        T_OVERTAKE_CONTROL,
+        "next-window-no-bye",
+        Park::InTurn,
+    );
     let st = &o.status;
     assert!(st.contains("orphaned=2"), "{st}");
     assert!(st.contains("custody_copies=2"), "{st}");
     assert_eq!(o.crashes, 2, "both claims read, then judged a crash:\n{st}");
-    assert!(
-        o.behind >= 1,
-        "the second claim read behind the exit:\n{st}"
-    );
+    assert_eq!(o.behind, 2, "both REGISTERs drained behind the exit:\n{st}");
     for w in &o.leaders {
         assert_eq!(w.exit_status(), None, "the leader lives:\n{st}");
     }
@@ -1120,7 +1164,8 @@ const T_REPLY: &str = "a_reply_the_dead_window_cannot_read_loses_none_of_its_fra
 fn a_reply_the_dead_window_cannot_read_loses_none_of_its_frames() {
     dispatch_role();
     let mut s = Scratch::new("reply");
-    let o = an_exit_that_overtakes_its_frames(&mut s, T_REPLY, "next-window-adopt");
+    let o =
+        an_exit_that_overtakes_its_frames(&mut s, T_REPLY, "next-window-adopt", Park::BetweenTurns);
     let st = &o.status;
     assert!(
         st.contains("masters=0"),
@@ -1141,7 +1186,12 @@ const T_REPLY_CONTROL: &str = "without_a_bye_a_reply_lost_to_the_dead_keeps_both
 fn without_a_bye_a_reply_lost_to_the_dead_keeps_both_shells() {
     dispatch_role();
     let mut s = Scratch::new("reply-ctl");
-    let o = an_exit_that_overtakes_its_frames(&mut s, T_REPLY_CONTROL, "next-window-adopt-no-bye");
+    let o = an_exit_that_overtakes_its_frames(
+        &mut s,
+        T_REPLY_CONTROL,
+        "next-window-adopt-no-bye",
+        Park::BetweenTurns,
+    );
     let st = &o.status;
     assert!(st.contains("orphaned=2"), "{st}");
     assert!(st.contains("custody_copies=2"), "{st}");

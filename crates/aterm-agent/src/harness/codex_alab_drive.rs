@@ -169,8 +169,8 @@ pub(super) fn find_rollout(home: &Path, thread: &str) -> Option<PathBuf> {
         std::fs::read_dir(p)
             .map(|d| {
                 d.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
                     .map(|e| e.path())
-                    .filter(|p| p.is_dir())
                     .collect()
             })
             .unwrap_or_default()
@@ -264,6 +264,7 @@ pub(super) fn self_claimed_plan(
         detail: e,
     })?;
     Ok(Plan {
+        cold: None,
         command: None,
         shell,
         dialect,
@@ -981,6 +982,8 @@ pub(super) fn snapshot_with_claim(
         },
     };
     Ok(super::super::relaunch::Snapshot {
+        auth_observed: false,
+        launch_env: None,
         tab: tab.to_string(),
         pid,
         start,

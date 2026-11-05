@@ -35,7 +35,7 @@ fn stated(endpoint: &Endpoint, wire: Wire) -> usize {
     let metadata = 4 + HELLO_FIXED + 6;
     match wire {
         Wire::Whole => metadata,
-        Wire::Delta => metadata + 4 + 13 + 32 * View::of(endpoint).have().len(),
+        Wire::Delta => metadata + 4 + 13 + 32 * View::of(endpoint).unwrap().have().len(),
     }
 }
 
@@ -1343,7 +1343,7 @@ fn pushed_to(
         &Evidence::Log(Arc::new(witness.clone())),
         &lab.requests[member],
         Wire::Delta,
-        &View::of(receiver).have(),
+        &View::of(receiver).unwrap().have(),
     );
     let header = receive_frame(&mut stream, 22).unwrap();
     u32::from_be_bytes(header[10..14].try_into().unwrap()) as usize
@@ -1963,4 +1963,218 @@ fn a_full_mac_judges_a_peer_on_the_push_it_has_room_for() {
             None
         );
     });
+}
+
+/// One session from `initiator` to `responder` under `wire` over loopback, with `mutant` on in
+/// the responder's thread: what the responder returned, and its repair.
+fn answered(
+    initiator: &Endpoint,
+    responder: &Endpoint,
+    wire: Wire,
+    unread: bool,
+    mutant: Option<mutants::Mutant>,
+) -> (Result<Report>, Repair) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let run = |endpoint: &Endpoint, peer: &Endpoint, mut stream: TcpStream, side: Side| {
+        stream
+            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .unwrap();
+        let mut repair = Repair::default();
+        let result = endpoint.connected_until(
+            &mut stream,
+            Some(&proof_of(peer)),
+            side,
+            &mut repair,
+            Instant::now() + EXCHANGE,
+            Protocol::Frontier(wire),
+        );
+        (result, repair)
+    };
+    thread::scope(|scope| {
+        let answered = scope.spawn(|| {
+            let stream = listener.accept().unwrap().0;
+            let answer = || run(responder, initiator, stream, Side::Responder);
+            let checked = || match mutant {
+                Some(mutant) => mutants::with(mutant, answer),
+                None => answer(),
+            };
+            if unread {
+                crate::control::faults::records_unread(checked)
+            } else {
+                checked()
+            }
+        });
+        let _ = run(
+            initiator,
+            responder,
+            TcpStream::connect(address).unwrap(),
+            Side::Initiator,
+        );
+        answered.join().unwrap()
+    })
+}
+
+/// Lab Macs 1 and 2 founded together, and Mac 1's `Remove` of Mac 2 after the genesis: the
+/// genesis log, which seats Mac 2 and is all its own evidence, and the log holding the `Remove`.
+fn founded_then_removed(lab: &Lab) -> (Log, Log) {
+    use aterm_secrets::membership_log::EpochAudience;
+    let genesis = Record::found(&ROOT, vec![entrant(lab, 0), entrant(lab, 1)], 1).unwrap();
+    let mut founded = log_of(std::slice::from_ref(&genesis));
+    let actor = lab.requests[0].binding().actor();
+    let (draft, key) = founded
+        .draft_epoch(&actor, 2, EpochAudience::Commons, 1)
+        .unwrap();
+    let epoch = draft.sign(&[31; 32], [3; 16]).unwrap();
+    let epoch_id = *epoch.id();
+    founded.insert(epoch).unwrap();
+    for identity in &lab.identities {
+        let wrap = founded
+            .draft_wrap(&actor, 3, epoch_id, &key, identity.recipient())
+            .unwrap()
+            .sign(&[31; 32], [3; 16])
+            .unwrap();
+        founded.insert(wrap).unwrap();
+    }
+    let mut removed = founded.clone();
+    let remove = removed
+        .draft(
+            &lab.requests[0].binding().actor(),
+            2,
+            Body::Remove {
+                member: lab.requests[1].binding().actor(),
+                cutoff: *genesis.id(),
+            },
+        )
+        .sign(&[31; 32], [3; 16])
+        .unwrap();
+    removed.insert(remove).unwrap();
+    (founded, removed)
+}
+
+/// X1: a Mac this Mac removed is refused at the handshake while this Mac's membership records do
+/// not read, under either wire. Its own evidence (the genesis) seats it; only this Mac's records
+/// say it is out, so a check that cannot read them refuses rather than passing it. Every read of
+/// the responder's records by a peer check fails for the whole session
+/// ([`crate::control::faults::records_unread`], as a read fails while a writer replaces the file
+/// under it), while its roster and deny list read as they do: the bad interleaving, held for every
+/// check of the session. With the records read it is refused too, and a Mac they do not remove is
+/// let in.
+///
+/// Measured before the fix: `two_islands_admit_and_remove_then_tables_continue_after_the_heal`
+/// failed 1 run in 3 on m20, its responder completing a session with the Mac it had just revoked.
+/// The session's view read the records with `load_records(..).ok()`, judging a push from its own
+/// genesis when they did not read, and the local log check answered `Ok(())` when
+/// `trusted_commons_log` failed, so one moment the records did not read passed every check.
+///
+/// NEGATIVE CONTROL (in the test): with a failed read passing the peer
+/// ([`mutants::Mutant::UnreadCustodyAdmits`], as both checks did before X1), the removed Mac is
+/// authenticated and the responder's session completes, under both wires.
+#[test]
+fn a_removed_mac_is_refused_while_its_responders_records_do_not_read() {
+    let lab = Lab::new();
+    drop(lab.journal(1));
+    let (founded, removed) = founded_then_removed(&lab);
+    let mac2 = witnessed(&lab, 1, founded.clone());
+    let actor = lab.requests[1].binding().actor();
+    let kept = custodied(&lab, 0, "kept", founded.clone(), &founded);
+    let responder = custodied(&lab, 0, "responder", founded, &removed);
+    for wire in [Wire::Delta, Wire::Whole] {
+        let (result, repair) = answered(&mac2, &kept, wire, false, None);
+        assert!(
+            result.is_ok(),
+            "{wire:?}: a Mac no record removes: {result:?}"
+        );
+        assert_eq!(repair.authenticated_actor(), Some(actor), "{wire:?}");
+        let (result, repair) = answered(&mac2, &responder, wire, false, None);
+        assert!(result.is_err(), "{wire:?}: the records it reads refuse it");
+        assert_eq!(repair.authenticated_actor(), None, "{wire:?}");
+
+        let (result, repair) = answered(&mac2, &responder, wire, true, None);
+        assert!(
+            result.is_err(),
+            "{wire:?}: a responder whose records do not read refuses the Mac they remove"
+        );
+        assert_eq!(repair.authenticated_actor(), None, "{wire:?}");
+
+        let (result, repair) = answered(
+            &mac2,
+            &responder,
+            wire,
+            true,
+            Some(mutants::Mutant::UnreadCustodyAdmits),
+        );
+        assert!(
+            result.is_ok(),
+            "CONTROL {wire:?}: a failed read passed the removed Mac: {result:?}"
+        );
+        assert_eq!(
+            repair.authenticated_actor(),
+            Some(actor),
+            "CONTROL {wire:?}"
+        );
+    }
+}
+
+/// X1: a `Remove` this Mac made durable and has not acknowledged yet refuses its Mac at the
+/// handshake, under either wire: a writer cut short between writing the records file and
+/// acknowledging it (or whose acknowledgement failed) leaves the acknowledged history without it,
+/// and the local log check reads every record held, as admission holds out what records ahead
+/// of their acknowledgement hold out. The records file is written here as that writer leaves it,
+/// so the `Remove` is ahead of the acknowledged history at every check.
+///
+/// NEGATIVE CONTROL (in the test): judging by the acknowledged records alone
+/// ([`mutants::Mutant::AcknowledgedOnly`], as the check did before X1) authenticates the removed
+/// Mac under `atdb/4`, where no view of the records judges its push.
+#[test]
+fn a_remove_not_yet_acknowledged_refuses_its_mac_at_the_handshake() {
+    let lab = Lab::new();
+    drop(lab.journal(1));
+    let (founded, removed) = founded_then_removed(&lab);
+    let mac2 = witnessed(&lab, 1, founded.clone());
+    let actor = lab.requests[1].binding().actor();
+    let responder = custodied(&lab, 0, "responder", founded.clone(), &founded);
+    let paths = responder.paths.clone().unwrap();
+    aterm_secrets::fsx::write_atomic(
+        &paths.records_file(),
+        &encode_records(removed.records()),
+        0o600,
+    )
+    .unwrap();
+    let read = client::load_acknowledged_and_ahead(&paths).unwrap();
+    let heads = |store: &aterm_secrets::membership_log::Store| store.log().map(Log::heads);
+    assert_eq!(
+        heads(&read.acknowledged),
+        Some(founded.heads()),
+        "the acknowledged history holds no Remove"
+    );
+    assert_eq!(
+        read.ahead.as_ref().and_then(heads),
+        Some(removed.heads()),
+        "the Remove is durable, ahead of it"
+    );
+    assert_eq!(
+        client::trusted_commons_log(&paths, lab.trust)
+            .unwrap()
+            .map(|(log, _)| log.heads()),
+        Some(founded.heads()),
+        "the log the check judges by is the acknowledged one"
+    );
+    for wire in [Wire::Delta, Wire::Whole] {
+        let (result, repair) = answered(&mac2, &responder, wire, false, None);
+        assert!(result.is_err(), "{wire:?}: the durable Remove refuses it");
+        assert_eq!(repair.authenticated_actor(), None, "{wire:?}");
+    }
+    let (result, repair) = answered(
+        &mac2,
+        &responder,
+        Wire::Whole,
+        false,
+        Some(mutants::Mutant::AcknowledgedOnly),
+    );
+    assert!(
+        result.is_ok(),
+        "CONTROL: the acknowledged records alone passed the removed Mac: {result:?}"
+    );
+    assert_eq!(repair.authenticated_actor(), Some(actor), "CONTROL");
 }

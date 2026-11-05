@@ -189,6 +189,7 @@ fn snapshot(identity: &Identity, descriptor: &Descriptor) -> Snapshot {
     Snapshot {
         source_config: Box::new(client::Config {
             source: crate::transport::Source::Path(PathBuf::from("test.vault")),
+            mirrors: Vec::new(),
             name: "test".into(),
             signer: Some(descriptor.trust().authority),
             followed: vec![],

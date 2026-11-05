@@ -1475,21 +1475,21 @@ pub fn record(
 ) -> std::io::Result<()> {
     let log = &f.job.log;
     let beside = |ext: &str| PathBuf::from(format!("{}.{ext}", log.display()));
-    fs::write(beside("rc"), format!("{}\n", f.ended.code))?;
-    fs::write(beside("pace"), format!("{}\n", pace_of(f, cores).text()))?;
+    crate::durable::write_fresh(&beside("rc"), format!("{}\n", f.ended.code))?;
+    crate::durable::write_fresh(&beside("pace"), format!("{}\n", pace_of(f, cores).text()))?;
     if f.over_budget {
-        fs::write(beside("budget"), format!("{}\n", budget.as_secs()))?;
+        crate::durable::write_fresh(&beside("budget"), format!("{}\n", budget.as_secs()))?;
     }
     let text = crate::durable::read_file(log).unwrap_or_default();
     let refused = String::from_utf8_lossy(&text).contains(trust_facts::TRUSTD_REFUSED);
     if refused {
-        fs::write(beside("trustd"), format!("{}\n", probe()))?;
+        crate::durable::write_fresh(&beside("trustd"), format!("{}\n", probe()))?;
     }
     if f.trustd_lost {
         // What serves the socket now that the trustd the check ran beside went away.
         let now = probe();
         let what = now.split_once('\t').map_or(now.as_str(), |(_, what)| what);
-        fs::write(beside("trustd-lost"), format!("{what}\n"))?;
+        crate::durable::write_fresh(&beside("trustd-lost"), format!("{what}\n"))?;
     }
     if let Some(lock) = &f.job.lock
         && lock.created
@@ -2090,7 +2090,8 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     let (admit_lines, refusals) = parsed.admit(&peaks)?;
     plan.push_str(&admit_lines);
     let plan_path = logdir.join(".plan");
-    fs::write(&plan_path, &plan).map_err(|e| format!("{}: {e}", plan_path.display()))?;
+    crate::durable::write_fresh(&plan_path, &plan)
+        .map_err(|e| format!("{}: {e}", plan_path.display()))?;
     let refused: BTreeSet<String> = refusals.iter().map(|(n, _)| n.clone()).collect();
     if !refusals.is_empty() {
         for (_, l) in &refusals {
@@ -2283,7 +2284,8 @@ fn check_and_conclude(
             push_kv(&mut plan, k, &v);
         }
     }
-    fs::write(&prep.plan_path, &plan).map_err(|e| format!("{}: {e}", prep.plan_path.display()))?;
+    crate::durable::write_fresh(&prep.plan_path, &plan)
+        .map_err(|e| format!("{}: {e}", prep.plan_path.display()))?;
     let mut parsed = Plan::parse(&plan)?;
     let update = if cfg.update_ratchet {
         Update {
@@ -2465,7 +2467,7 @@ fn write_cost_file(path: &Path, header: &str, all: &BTreeMap<String, Cost>, out:
     let written = path
         .parent()
         .map_or(Ok(()), fs::create_dir_all)
-        .and_then(|()| fs::write(&tmp, text))
+        .and_then(|()| write_new_temp(&tmp, text.as_bytes()))
         .and_then(|()| fs::rename(&tmp, path));
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
@@ -2496,8 +2498,8 @@ fn reduce_report(job: &Job, repo: &Path) {
         )),
     };
     if let Err(why) = crate::trust_oblig::write_record(&args) {
-        let _ = fs::write(
-            format!("{}.oblig.err", job.log.display()),
+        let _ = crate::durable::write_fresh(
+            Path::new(&format!("{}.oblig.err", job.log.display())),
             format!(
                 "{why}\nraw report cleanup skipped for {}\n",
                 report.display()
@@ -2550,6 +2552,7 @@ fn disk_run(cfg: &Config, root: &Path) -> atpkg::admit_disk::Run {
         cold: COLD_DISK,
         on: root.to_path_buf(),
         stuck_ends: None,
+        machine: None,
     }
 }
 
@@ -2956,7 +2959,7 @@ fn keep_in_record(record: &Path, reached: &[(i32, u64)]) -> bool {
         let mut name = std::ffi::OsString::from(".new");
         name.push(record.file_name().unwrap_or_default());
         let new = record.with_file_name(name);
-        fs::write(&new, rec.text())
+        write_new_temp(&new, rec.text().as_bytes())
             .and_then(|()| fs::rename(&new, record))
             .inspect_err(|_| {
                 let _ = fs::remove_file(&new);
@@ -3050,13 +3053,17 @@ fn driver_ceiling(
         let written = cache
             .parent()
             .map_or(Ok(()), fs::create_dir_all)
-            .and_then(|()| fs::write(&tmp, body))
+            .and_then(|()| write_new_temp(&tmp, body.as_bytes()))
             .and_then(|()| fs::rename(&tmp, &cache));
         if written.is_err() {
             let _ = fs::remove_file(&tmp);
         }
     }
     takes
+}
+
+fn write_new_temp(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    crate::durable::write_fresh(tmp, bytes)
 }
 
 /// Returns this host's RAM in bytes and whether it was read from Linux `MemTotal`.
@@ -3396,6 +3403,7 @@ fn prepare_cache_lock(root: &Path) -> std::io::Result<()> {
                     .create_new(true)
                     .write(true)
                     .mode(0o600)
+                    .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
                     .open(path)?,
             );
             Ok(())
@@ -3430,10 +3438,7 @@ fn write_checkout_record(root: &Path, repo: &Path) -> std::io::Result<()> {
         .prefix(".checkout-")
         .tempdir_in(root)?;
     let at = scratch.path().join("record");
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&at)?;
+    let mut file = crate::durable::open_create_new(&at)?;
     file.set_permissions(fs::Permissions::from_mode(0o644))?;
     file.write_all(&checkout_record(repo))?;
     drop(file);
@@ -3619,7 +3624,7 @@ pub(crate) fn toolchain_refusal(bin: &Path) -> Option<Refused> {
                 .flatten()
                 .find_map(|e| {
                     let path = e.path();
-                    let md = fs::symlink_metadata(&path).ok()?;
+                    let md = e.metadata().ok()?;
                     if !md.is_file() && !md.is_dir() {
                         return Some(Refused {
                             dir: path,
@@ -3874,7 +3879,7 @@ impl Checks for RealChecks<'_> {
             return Err(e);
         }
         job.target.clone_from(&target);
-        let log = fs::File::create(&job.log)?;
+        let log = crate::durable::create_fresh(&job.log)?;
         job.lock = fork_lock(self.repo, &job.argv);
         if let Some(l) = &job.lock {
             self.locks.entry(l.path.clone()).or_insert(l.created);
@@ -3932,11 +3937,7 @@ impl Checks for RealChecks<'_> {
         // The record holds the slot before the root can run, and never replaces another
         // run's: a slot whose record is left is held ([`slot_held`]).
         let record = self.root.join(format!(".check.{}", job.slot));
-        let written = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&record)?
-            .write_all(rec.text().as_bytes());
+        let written = crate::durable::open_create_new(&record)?.write_all(rec.text().as_bytes());
         let mut child = match written.and_then(|()| cmd.spawn()) {
             Ok(child) => child,
             Err(e) => {
@@ -3958,7 +3959,7 @@ impl Checks for RealChecks<'_> {
                 "its root, pid {pid}, could not be identified, so it was ended"
             )))
         } else {
-            fs::write(&record, rec.text()).and_then(|()| open(&mut child))
+            crate::durable::write_fresh(&record, rec.text()).and_then(|()| open(&mut child))
         };
         if let Err(e) = ready {
             let _ = child.kill();
@@ -5242,7 +5243,7 @@ pub mod trustd {
     /// SHA-256 hex digest of `exe` used by `trustd` for `IDENTITY`.
     #[must_use]
     pub fn build_digest(exe: &Path) -> String {
-        std::fs::read(exe)
+        crate::durable::read_file(exe)
             .map(|b| crate::trust_facts::hex(&aterm_digest::Sha256::digest(&b)))
             .unwrap_or_default()
     }
@@ -5803,7 +5804,7 @@ pub mod trustd {
                     );
                     if ask(&mut s, &req).is_ok_and(|r| r.starts_with("GRANTED ")) {
                         grants += 1;
-                        let _ = std::fs::write(grants_out, format!("{grants}\n"));
+                        let _ = crate::durable::write_fresh(grants_out, format!("{grants}\n"));
                         held.store(true, Ordering::SeqCst);
                         let _ = s.get_ref().set_read_timeout(Some(tick));
                         let mut buf = [0u8; 256];
@@ -5835,7 +5836,7 @@ pub mod trustd {
                         held.store(false, Ordering::SeqCst);
                     }
                 } else {
-                    let _ = std::fs::write(seen_out, format!("{}\n", p.line()));
+                    let _ = crate::durable::write_fresh(seen_out, format!("{}\n", p.line()));
                 }
             }
             if !stop.load(Ordering::SeqCst) {
@@ -8256,6 +8257,7 @@ mod tests {
                 cold: COLD_DISK,
                 on: root.clone(),
                 stuck_ends: None,
+                machine: None,
             }
         );
         assert!(root.join("logs").is_dir(), "{}", root.display());

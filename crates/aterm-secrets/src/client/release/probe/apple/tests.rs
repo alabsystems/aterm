@@ -46,6 +46,21 @@ fn subprocess_diagnostics_keep_only_fixed_step_program_and_error_class() {
         after.to_string(),
         "probe step=sign program=codesign class=reader-spawn"
     );
+    let capture = ToolError::observed(
+        &command,
+        &aterm_uds::deadline::CompleteOutputError::Run(aterm_uds::deadline::RunError::Capture(
+            std::io::Error::other("PRIVATE-CAPTURE-DIAGNOSTIC"),
+        )),
+        false,
+    );
+    assert!(
+        !capture.not_started(),
+        "a dispatched capture failure outranks a missing start observer"
+    );
+    assert_eq!(
+        capture.to_string(),
+        "probe step=sign program=codesign class=capture"
+    );
 }
 
 struct Fake {

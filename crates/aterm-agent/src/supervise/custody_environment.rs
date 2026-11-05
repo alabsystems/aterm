@@ -93,7 +93,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "ProgramEnds",
-        reason = "The agent's process ending of itself (a crash, an exit), at any state: the program's. The host's upgrade, which LineHeld::Stands holds, is HostUpgrades, anchored on line_held. The Tier-1 bind has the host name another agent process exactly there."
+        reason = "The agent's process ending of itself (a crash, an exit), at any state where no ask awaits the host's answer (asked = 0; a restart deferred and standing, restart = 3, included): the program's. The loop's ask is one call the host answers before the loop reads again (IdleHost::restart), so an end during it is read as one after the answer. The host's upgrade, which LineHeld::Stands holds, is HostUpgrades, anchored on line_held. The Tier-1 bind has the host name another agent process exactly there."
     )
 )]
 #[cfg_attr(

@@ -314,9 +314,14 @@ fn retirement_appends_conform_and_catalog_negative_control_is_detected() {
     assert_eq!(walked, steps);
     assert_eq!(steps.len(), 24, "6 environments, 3 appends in each");
     // Each environment builds its own Lab in its own temporary home, on the lane's places, and a
-    // step reads the world it runs on. An accepted append changes that world, so each later append
-    // of modes 1-4 gets a fresh one; modes 5 and 6 refuse all three on one world, so a refusal
+    // step reads the world it runs on. An accepted append changes that world. In modes 1-4 `Record`
+    // only adds the observation of a debit the fixture already counted, so `Reserve` follows it on
+    // its world with the same budget, and `Dispatch` runs first on a fresh one, so a first append
+    // on a retired frontier stays held. Modes 5 and 6 refuse all three on one world, so a refusal
     // that latched could stand in for a later one's.
+    // GAP: a `Reserve` that succeeds only because a `Record` ran before it is seen only if
+    // `Dispatch` shares the defect, and the foreign-parents check on the `Reserve` step also reads
+    // `Record`'s append.
     aterm_spec::fs_lane::each(&environments, |(environment, seeded)| {
         let mode = seeded["mode"];
         let check = |world: &mut Fixture, state: &aterm_spec::interp::State, action: &str| {
@@ -328,12 +333,13 @@ fn retirement_appends_conform_and_catalog_negative_control_is_detected() {
         };
         let mut world = fixture(mode);
         check(&mut world, &init, environment);
-        for (n, action) in enabled(seeded).into_iter().enumerate() {
-            if n > 0 && mode <= 4 {
-                world = fixture(mode);
-            }
+        for action in ["Record", "Reserve"] {
             check(&mut world, seeded, action);
         }
+        if mode <= 4 {
+            world = fixture(mode);
+        }
+        check(&mut world, seeded, "Dispatch");
     });
     // Conformance is the walk's; this asks only the model.
     let mut blocked = sole("Reserve", &sole("LegacyPeer", &init));

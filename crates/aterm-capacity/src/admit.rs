@@ -143,10 +143,15 @@ fn trace(phase: &str) {
         let Some(path) = std::env::var_os(TRACE_ENV).filter(|path| !path.is_empty()) else {
             return;
         };
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
+        if let Ok(mut file) = opts.open(path)
+            && file.metadata().is_ok_and(|m| m.is_file())
         {
             let line = format!("{} {} {phase}\n", now_ms(), std::process::id());
             let _ = file.write_all(line.as_bytes());
@@ -617,12 +622,12 @@ pub(crate) fn others<'r>(
             }
             Other {
                 record: r,
-                used: if r.accounting == crate::Accounting::Whole {
+                used: if r.accounting != crate::Accounting::Holder {
                     TreeUse::default()
                 } else {
                     trees.get(&r.pid).copied().unwrap_or_default()
                 },
-                credited: if r.accounting == crate::Accounting::Whole {
+                credited: if r.accounting != crate::Accounting::Holder {
                     TreeUse::default()
                 } else {
                     credited
@@ -665,7 +670,11 @@ fn reservations(ahead: &[&Other<'_>], volume: Option<&Volume>) -> Vec<Reserve> {
         } else {
             0
         };
-        if record.accounting == crate::Accounting::Whole {
+        // Neither durable cohort custody nor a transferred ordinary guard may use a
+        // numeric holder's tree as credit. That PID can have died and been reused while
+        // the actual native guard still holds the original admitted memory reservation.
+        // Their different lifetime/reap protocols remain the ledger's responsibility.
+        if record.accounting != crate::Accounting::Holder {
             out[i] = Reserve {
                 mem: record.need.mem,
                 disk: on.map(|_| disk),
@@ -696,6 +705,10 @@ fn reservations(ahead: &[&Other<'_>], volume: Option<&Volume>) -> Vec<Reserve> {
     out
 }
 
+#[cfg(test)]
+#[path = "admit_detached_tests.rs"]
+mod detached_accounting_tests;
+
 /// Whether `record` waits for more disk than `volume` holds above the floor now (UNSERVABLE,
 /// [`Short::unservable`]): its own look holds its whole need to that room, so it is admitted
 /// only once space is freed, whatever claim ends first. A held claim never is.
@@ -717,6 +730,25 @@ pub(crate) fn covered(pid: u32, records: &[&Record], procs: Option<&Procs>) -> b
         .collect();
     holders.contains(&pid)
         || procs.is_some_and(|p| p.ancestors(pid).iter().any(|a| holders.contains(a)))
+}
+
+/// Whether the process `pid` or one of its ancestors in `procs` holds a measured claim admitted
+/// loaded at its patience bound ([`crate::TimingCause::Loaded`]): the machine stayed busy through
+/// that claim's patience, so work under it waits for none of its own ([`crate::AtBound`]). An
+/// expired loaded claim its process still holds counts too: its replacement decides on a fresh
+/// window at once rather than wait out the same busy machine again.
+fn loaded_cover(pid: u32, records: &[&Record], procs: Option<&Procs>) -> bool {
+    let line = std::cell::OnceCell::new();
+    records.iter().any(|r| {
+        r.held.is_some()
+            && r.accounting == crate::Accounting::Holder
+            && r.need.quiet_policy == crate::QuietPolicy::Timing
+            && r.timing.cause == crate::TimingCause::Loaded
+            && (r.pid == pid
+                || line
+                    .get_or_init(|| procs.map(|p| p.ancestors(pid)).unwrap_or_default())
+                    .contains(&r.pid))
+    })
 }
 
 /// The claim among `records` that covers the builds of the process `pid` ([`covered_memory`]):
@@ -1138,9 +1170,69 @@ pub struct Claim {
     short: Option<Shortfall>,
     /// This process actually admitted this claim; descriptor adoption supplies no new timing observation.
     entry_custody: bool,
+    /// A loaded claim of its process or an ancestor spent its patience ([`loaded_cover`]): a
+    /// stated entry decides on its first window, as for a loaded admission.
+    spent: bool,
 }
 
 impl Claim {
+    /// Consume this original ordinary, admitted, non-covering memory-only claim into
+    /// close-only custody. Its exact declared peak remains in the original ledger until the
+    /// final actual guard closes; detached accounting grants no numeric holder discounts.
+    ///
+    /// # Errors
+    /// Returns this original claim with the error, including all cohort writer/recovery
+    /// custody unchanged when that claim kind is unsupported. A partial ordinary intent
+    /// remains error-closed and can only be retried by this same original claim.
+    #[cfg(unix)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "returning original Claim preserves its exact writer and pending custody on refusal"
+    )]
+    pub fn into_retained_guard(mut self) -> Result<crate::RetainedClaim, (Self, io::Error)> {
+        if self.laid.is_cohort()
+            || !self.entry_custody
+            || self.record.accounting != crate::Accounting::Holder
+            || self.record.held.is_none()
+            || !crate::ledger::memory_only(&self.record.need)
+        {
+            return Err((
+                self,
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "only an original admitted non-covering ordinary memory-only claim can detach",
+                ),
+            ));
+        }
+        let prepared = (|| -> io::Result<()> {
+            if !self.laid.detach_pending() {
+                let record = crate::retained_claim::read_record(self.descriptor()?, self.path())?;
+                crate::retained_claim::check_record(
+                    &record,
+                    self.path(),
+                    crate::Accounting::Holder,
+                )?;
+                if record != self.record {
+                    return Err(io::Error::other(
+                        "the original admitted record changed before detachment",
+                    ));
+                }
+            }
+            self.laid.detach_memory()
+        })();
+        if let Err(error) = prepared {
+            return Err((self, error));
+        }
+        self.record.accounting = crate::Accounting::Detached;
+        let path = self.path().to_owned();
+        let Self { laid, record, .. } = self;
+        Ok(crate::RetainedClaim::original(
+            laid.into_close_only(),
+            path,
+            record,
+        ))
+    }
+
     #[cfg(unix)]
     pub(crate) fn check_retained_description(&self) -> io::Result<()> {
         if !self.entry_custody {
@@ -1160,33 +1252,22 @@ impl Claim {
         self.laid.check_cohort_namespace(namespace)
     }
 
-    /// The observed resource-admission CPU interval, not a fresh measurement-entry permit.
-    /// # Errors
-    /// Missing/forced/adopted provenance, a weak policy, unavailable load, or expired hold.
-    pub fn timing_admission(&self) -> Result<crate::CpuWindow, crate::TimingIssue> {
-        use crate::{QuietPolicy, TimingCause, TimingIssue};
-        if !self.entry_custody || self.record.need.quiet_policy != QuietPolicy::Timing {
-            return Err(TimingIssue::UnknownAdmission);
-        }
-        match self.record.timing.cause {
-            TimingCause::Now => return Err(TimingIssue::Now),
-            TimingCause::Bound => return Err(TimingIssue::Bound),
-            TimingCause::Unknown => return Err(TimingIssue::UnknownAdmission),
-            TimingCause::Wait => {}
-        }
+    /// Its measured hold: the actual admission time, its patience and its quiet bound, while that
+    /// hold lasts.
+    fn timing_hold(&self) -> Result<(u64, crate::Patience, f64), crate::TimingIssue> {
+        use crate::TimingIssue;
         let admitted = self
             .record
             .timing
             .admitted_ms
             .filter(|at| Some(*at) == self.record.held.map(|h| h.admitted_ms))
             .ok_or(TimingIssue::UnknownAdmission)?;
-        let hold = self
+        let patience = self
             .record
             .need
             .patience
-            .ok_or(TimingIssue::UnknownAdmission)?
-            .hold;
-        if now_ms() < admitted || now_ms() >= admitted.saturating_add(millis(hold)) {
+            .ok_or(TimingIssue::UnknownAdmission)?;
+        if now_ms() < admitted || now_ms() >= admitted.saturating_add(millis(patience.hold)) {
             return Err(TimingIssue::Expired);
         }
         let max = self
@@ -1194,25 +1275,70 @@ impl Claim {
             .need
             .quiet
             .ok_or(TimingIssue::UnknownAdmission)?;
-        if !self
+        Ok((admitted, patience, max))
+    }
+
+    /// The observed resource-admission CPU interval, not a fresh measurement-entry permit.
+    /// # Errors
+    /// Missing/forced/loaded/adopted provenance, a weak policy, unavailable load, or expired hold.
+    pub fn timing_admission(&self) -> Result<crate::CpuWindow, crate::TimingIssue> {
+        match self.timing_protection()? {
+            crate::Protection::Qualified(window) => Ok(window),
+            crate::Protection::Loaded(_) => Err(crate::TimingIssue::Loaded),
+        }
+    }
+
+    /// What its measured admission protects: a quiet window ([`crate::Protection::Qualified`]), or
+    /// a machine that stayed busy through its patience, for a need that runs loaded
+    /// ([`crate::Protection::Loaded`]): its work runs and states it.
+    /// # Errors
+    /// Missing/forced/adopted provenance, a weak policy, unavailable load, or expired hold.
+    pub fn timing_protection(&self) -> Result<crate::Protection, crate::TimingIssue> {
+        use crate::{QuietPolicy, TimingCause, TimingIssue};
+        if !self.entry_custody || self.record.need.quiet_policy != QuietPolicy::Timing {
+            return Err(TimingIssue::UnknownAdmission);
+        }
+        match self.record.timing.cause {
+            TimingCause::Now => return Err(TimingIssue::Now),
+            TimingCause::Unknown => return Err(TimingIssue::UnknownAdmission),
+            TimingCause::Wait | TimingCause::Loaded => {}
+        }
+        let (_, _, max) = self.timing_hold()?;
+        let load1 = self
             .record
             .timing
             .admission_load1
-            .is_some_and(|n| n.is_finite() && n >= 0.0 && n <= max)
-        {
-            return Err(TimingIssue::LoadUnknown);
-        }
-        self.record
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .ok_or(TimingIssue::LoadUnknown)?;
+        let window = self
+            .record
             .timing
             .admission
-            .filter(|w| w.ready())
-            .ok_or(TimingIssue::UnknownAdmission)
+            .ok_or(TimingIssue::UnknownAdmission)?;
+        if self.record.timing.cause == TimingCause::Loaded {
+            return Ok(crate::Protection::Loaded(crate::Observed {
+                window,
+                load1,
+                max,
+            }));
+        }
+        if load1 > max {
+            return Err(TimingIssue::LoadUnknown);
+        }
+        if window.ready() {
+            Ok(crate::Protection::Qualified(window))
+        } else {
+            Err(TimingIssue::UnknownAdmission)
+        }
     }
+
     /// Observe CPU readiness after all compilation, immediately before measurement callbacks.
     /// A retained parent/admission sample is never reused as this observation.
     /// # Errors
-    /// Unknown/forced/adopted admission, expired protection, unavailable/reset CPU or load,
-    /// interruption, or failure to retain the observation. No callback has run on failure.
+    /// Unknown/forced/loaded/adopted admission, expired protection, unavailable/reset CPU or load,
+    /// a machine still busy at its entry's patience ([`crate::TimingIssue::Loaded`]) or with no
+    /// window then ([`crate::TimingIssue::Blind`]), interruption, or failure to retain the
+    /// observation. No callback has run on failure.
     pub fn measurement_entry(&mut self) -> Result<crate::CpuWindow, crate::TimingIssue> {
         let watch = aterm_toolchain::interrupt::Watch::enter();
         self.measurement_entry_on(&crate::Live, Pace::default(), &mut |d| {
@@ -1226,75 +1352,148 @@ impl Claim {
         pace: Pace,
         sleep: &mut dyn FnMut(Duration) -> bool,
     ) -> Result<crate::CpuWindow, crate::TimingIssue> {
-        use crate::{QuietPolicy, TimingCause, TimingIssue};
-        let _ = self.timing_admission()?;
-        if !self.entry_custody || self.record.need.quiet_policy != QuietPolicy::Timing {
-            return Err(TimingIssue::UnknownAdmission);
-        }
-        match self.record.timing.cause {
-            TimingCause::Now => return Err(TimingIssue::Now),
-            TimingCause::Bound => return Err(TimingIssue::Bound),
-            TimingCause::Unknown => return Err(TimingIssue::UnknownAdmission),
-            TimingCause::Wait => {}
-        }
-        let admitted = self
-            .record
-            .timing
-            .admitted_ms
-            .filter(|at| Some(*at) == self.record.held.map(|h| h.admitted_ms))
-            .ok_or(TimingIssue::UnknownAdmission)?;
-        let patience = self
-            .record
-            .need
-            .patience
-            .ok_or(TimingIssue::UnknownAdmission)?;
+        self.entry_on(machine, pace, sleep, false)
+            .map(|entry| entry.window)
+    }
+
+    /// [`Self::measurement_entry`] for work that runs on a busy machine and states it
+    /// ([`crate::AtBound::RunLoaded`]): a loaded admission enters on one fresh window, and a quiet
+    /// one whose entry stays busy through its entry's patience enters then; each says why in
+    /// [`crate::StatedEntry::unqualified`] (owner ruling 2026-11-05: a busy machine never blocks a
+    /// release).
+    /// # Errors
+    /// What [`Self::measurement_entry`] refuses, but a busy machine: no window at its entry's
+    /// patience ([`crate::TimingIssue::Blind`]) included.
+    pub fn stated_entry(&mut self) -> Result<crate::StatedEntry, crate::TimingIssue> {
+        let watch = aterm_toolchain::interrupt::Watch::enter();
+        self.stated_entry_on(&crate::Live, Pace::default(), &mut |d| {
+            watch.nap(d, &|| false)
+        })
+    }
+
+    pub(crate) fn stated_entry_on(
+        &mut self,
+        machine: &dyn Machine,
+        pace: Pace,
+        sleep: &mut dyn FnMut(Duration) -> bool,
+    ) -> Result<crate::StatedEntry, crate::TimingIssue> {
+        self.entry_on(machine, pace, sleep, true)
+    }
+
+    /// The measurement entry: strict ([`Self::measurement_entry`]) or `stated`
+    /// ([`Self::stated_entry`]).
+    fn entry_on(
+        &mut self,
+        machine: &dyn Machine,
+        pace: Pace,
+        sleep: &mut dyn FnMut(Duration) -> bool,
+        stated: bool,
+    ) -> Result<crate::StatedEntry, crate::TimingIssue> {
+        use crate::{Observed, Protection, TimingIssue, Unqualified};
+        let protection = if stated {
+            self.timing_protection()?
+        } else {
+            Protection::Qualified(self.timing_admission()?)
+        };
+        let admitted_loaded = match protection {
+            Protection::Qualified(_) => None,
+            Protection::Loaded(observed) => Some(observed),
+        };
+        let (admitted, patience, bound) = self.timing_hold()?;
         let expires = admitted.saturating_add(millis(patience.hold));
-        let bound = self
-            .record
-            .need
-            .quiet
-            .ok_or(TimingIssue::UnknownAdmission)?;
         self.record.timing.entry = None;
         self.record.timing.entry_load1 = None;
         self.laid
             .append(&Record::timing_line(self.record.timing))
             .map_err(|_| TimingIssue::Persistence)?;
-        let mut previous = None;
-        let began = Instant::now();
+        let mut unqualified: Vec<Unqualified> = admitted_loaded
+            .map(Unqualified::Admission)
+            .into_iter()
+            .collect();
+        let mut previous: Option<crate::CpuPoint> = None;
+        // The last read's window, if it formed one, with its load: what a busy entry enters on.
+        let mut last: Option<Observed> = None;
+        // The entry's patience counts on the counters' own clock, from its first point.
+        let mut began = None;
         loop {
             if now_ms() < admitted || now_ms() >= expires {
                 return Err(TimingIssue::Expired);
             }
-            if began.elapsed() >= patience.start {
-                return Err(TimingIssue::Bound);
-            }
             let point = machine.cpu_point().ok_or(TimingIssue::Unavailable)?;
+            let first = *began.get_or_insert(point.at);
+            let spent = point
+                .at
+                .checked_duration_since(first)
+                .is_some_and(|d| d >= patience.start);
             let window = previous
                 .as_ref()
                 .and_then(|from| crate::CpuWindow::between(from, &point));
-            previous = Some(point);
-            if let Some(window) = window {
-                let reading = machine.read(None);
-                let load = reading
-                    .load1
-                    .filter(|n| n.is_finite() && *n >= 0.0)
-                    .ok_or(TimingIssue::LoadUnknown)?;
-                if window.ready() && load <= bound {
-                    if now_ms() < admitted || now_ms() >= expires {
-                        return Err(TimingIssue::Expired);
+            let had_previous = previous.replace(point).is_some();
+            match window {
+                Some(window) => {
+                    let load1 = machine
+                        .read(None)
+                        .load1
+                        .filter(|n| n.is_finite() && *n >= 0.0)
+                        .ok_or(TimingIssue::LoadUnknown)?;
+                    let observed = Observed {
+                        window,
+                        load1,
+                        max: bound,
+                    };
+                    if window.ready() && load1 <= bound {
+                        return self.enter(observed, unqualified, expires);
                     }
-                    self.record.timing.entry = Some(window);
-                    self.record.timing.entry_load1 = Some(load);
-                    self.laid
-                        .append(&Record::timing_line(self.record.timing))
-                        .map_err(|_| TimingIssue::Persistence)?;
-                    return Ok(window);
+                    // A loaded admission, or one a loaded claim above it spared its wait, has
+                    // spent its patience already: its first window decides, and a busy one is
+                    // stated.
+                    if stated && (admitted_loaded.is_some() || self.spent) {
+                        unqualified.push(Unqualified::Entry(observed));
+                        return self.enter(observed, unqualified, expires);
+                    }
+                    last = Some(observed);
                 }
+                // A read after another that formed no window: the counters broke.
+                None if had_previous => last = None,
+                None => {}
+            }
+            // At its entry's patience, once a window could have formed, the last read decides.
+            if had_previous && spent {
+                return match last {
+                    Some(observed) if stated => {
+                        unqualified.push(Unqualified::Entry(observed));
+                        self.enter(observed, unqualified, expires)
+                    }
+                    Some(_) => Err(TimingIssue::Loaded),
+                    None => Err(TimingIssue::Blind),
+                };
             }
             if sleep(pace.poll) {
                 return Err(TimingIssue::Interrupted);
             }
         }
+    }
+
+    /// Enter the measurement on `observed`, retained under the claim with why it is unqualified.
+    fn enter(
+        &mut self,
+        observed: crate::Observed,
+        unqualified: Vec<crate::Unqualified>,
+        expires: u64,
+    ) -> Result<crate::StatedEntry, crate::TimingIssue> {
+        if now_ms() >= expires {
+            return Err(crate::TimingIssue::Expired);
+        }
+        self.record.timing.entry = Some(observed.window);
+        self.record.timing.entry_load1 = Some(observed.load1);
+        self.laid
+            .append(&Record::timing_line(self.record.timing))
+            .map_err(|_| crate::TimingIssue::Persistence)?;
+        Ok(crate::StatedEntry {
+            window: observed.window,
+            load1: observed.load1,
+            unqualified,
+        })
     }
     /// How its memory was admitted ALONE ([`Alone`]): while it is held, no other memory claim is
     /// admitted. `None` for a claim admitted beside others.
@@ -1416,6 +1615,7 @@ impl Claim {
             alone: None,
             short: None,
             entry_custody: false,
+            spent: false,
         })
     }
 
@@ -1471,6 +1671,7 @@ impl Claim {
             alone: None,
             short: None,
             entry_custody: false,
+            spent: false,
         })
     }
 
@@ -1732,10 +1933,9 @@ impl Waiter {
         if found.next && waiter.laid.append(&Record::next_line(found.now)).is_ok() {
             waiter.record.next_ms = Some(found.now);
         }
+        let timed = found.timed();
         let polled = match found.decided {
-            Ok((granted, quiet)) => {
-                waiter.grant(granted, quiet, found.cpu, found.load1, forced_now)
-            }
+            Ok((granted, quiet)) => waiter.grant(granted, quiet, timed, forced_now),
             Err(mut short) => {
                 let stuck = waiter.read_holders(&mut short, found.procs.as_ref());
                 waiter.stuck_looks = if stuck.is_some() {
@@ -1765,12 +1965,12 @@ impl Waiter {
         procs: Option<&Procs>,
     ) -> Option<aterm_toolchain::waits::Stuck> {
         let now = Instant::now();
-        let dir = self.ledger.dir().to_path_buf();
+        let dir = self.ledger.dir();
         let mut stalls = STALLS.lock().unwrap_or_else(PoisonError::into_inner);
         for h in short.holders.iter_mut().filter(|h| h.held) {
             let work = procs.and_then(|p| p.work(h.pid, &h.credit));
             let (stall, read) = stalls
-                .entry((dir.clone(), h.pid))
+                .entry((dir.to_path_buf(), h.pid))
                 .or_insert_with(|| (aterm_toolchain::stall::Stall::default(), now));
             *read = now;
             h.stalled = stall.stuck(h.pid, work, now, self.stalled_after);
@@ -1849,30 +2049,52 @@ impl Waiter {
                 .patience
                 .zip(self.record.next_ms)
                 .is_some_and(|(p, next)| now >= next.saturating_add(millis(p.start)));
+        // A loaded claim its own process or an ancestor holds has already spent the patience of
+        // the work under it: this need's first window decides, quiet or loaded.
+        let spent = measured
+            && self.record.need.at_bound == crate::AtBound::RunLoaded
+            && loaded_cover(self.record.pid, &records, procs.as_ref());
+        let past = past || spent;
         if past && need.quiet.is_some() {
             need.quiet = Some(f64::INFINITY);
         }
         let records = counted(records, self.record.pid, procs.as_ref());
-        let mut claimants: Vec<u32> = records.iter().map(|r| r.pid).collect();
-        claimants.push(self.record.pid);
-        let mut roots = claimants.clone();
-        roots.extend(records.iter().flat_map(|r| r.credit.iter().copied()));
-        let trees = procs.as_ref().map(|p| p.trees(&roots)).unwrap_or_default();
-        let others = others(&records, claimants.into_iter().collect(), &trees);
+        let mut claimants = HashSet::with_capacity(records.len() + 1);
+        claimants.extend(records.iter().map(|r| r.pid));
+        claimants.insert(self.record.pid);
+        let trees = procs
+            .as_ref()
+            .map(|p| {
+                let mut roots: Vec<u32> = Vec::with_capacity(claimants.len());
+                roots.extend(claimants.iter().copied());
+                roots.extend(records.iter().flat_map(|r| r.credit.iter().copied()));
+                p.trees(&roots)
+            })
+            .unwrap_or_default();
+        let others = others(&records, claimants, &trees);
         let mut decided = decide(&need, mine, &reading, &others, now);
+        let mut loaded = None;
         if measured {
-            let issue = if !past {
-                if !reading.load1.is_some_and(|n| n.is_finite() && n >= 0.0) {
-                    Some(crate::TimingIssue::LoadUnknown)
-                } else {
-                    match cpu {
-                        Ok(w) if w.ready() => None,
-                        Ok(_) => Some(crate::TimingIssue::Busy),
-                        Err(e) => Some(e),
+            use crate::TimingIssue;
+            let load = reading.load1.filter(|n| n.is_finite() && *n >= 0.0);
+            // Before its bound a busy or broken window is waited out; at it a busy one is the
+            // machine's load, stated or refused, and a missing one ends the wait (blind).
+            let issue = match (load, cpu) {
+                (None, _) => Some(TimingIssue::LoadUnknown),
+                (Some(_), Err(TimingIssue::CounterChanged)) if past => Some(TimingIssue::Blind),
+                (Some(_), Err(e)) => Some(e),
+                (Some(load1), Ok(window)) if past => {
+                    let max = self.record.need.quiet.unwrap_or(f64::INFINITY);
+                    if window.ready() && load1 <= max {
+                        None
+                    } else if self.record.need.at_bound == crate::AtBound::RunLoaded {
+                        loaded = Some(crate::Observed { window, load1, max });
+                        None
+                    } else {
+                        Some(TimingIssue::Loaded)
                     }
                 }
-            } else {
-                None
+                (Some(_), Ok(window)) => (!window.ready()).then_some(TimingIssue::Busy),
             };
             if let Some(issue) = issue {
                 match &mut decided {
@@ -1966,6 +2188,8 @@ impl Waiter {
             decided,
             cpu: cpu.ok(),
             load1: reading.load1,
+            loaded: loaded.is_some(),
+            spent,
             next,
             now,
             procs,
@@ -1978,11 +2202,16 @@ impl Waiter {
         self,
         granted: Grant,
         quiet: Option<QuietStart>,
-        cpu: Option<crate::CpuWindow>,
-        load1: Option<f64>,
+        timed: Timed,
         forced_now: bool,
     ) -> Polled {
         trace("grant.begin");
+        let Timed {
+            cpu,
+            load1,
+            loaded,
+            spent,
+        } = timed;
         let Waiter {
             ledger,
             mut record,
@@ -2004,12 +2233,12 @@ impl Waiter {
         let admitted = ledger.admit(&mut laid, &mut record, held).and_then(|()| {
             if record.need.quiet_policy == crate::QuietPolicy::Timing {
                 record.timing = crate::TimingEvidence {
+                    // A grant that is neither forced nor loaded is a quiet one: a window that does
+                    // not say so leaves its admission unqualified (the check below refuses it).
                     cause: if forced_now {
                         crate::TimingCause::Now
-                    } else if quiet.is_some_and(|q| q.at_bound)
-                        || !cpu.is_some_and(crate::CpuWindow::ready)
-                    {
-                        crate::TimingCause::Bound
+                    } else if loaded {
+                        crate::TimingCause::Loaded
                     } else {
                         crate::TimingCause::Wait
                     },
@@ -2034,9 +2263,14 @@ impl Waiter {
                     alone: granted.alone,
                     short: None,
                     entry_custody: true,
+                    spent,
+                };
+                let checked = match claim.record.need.at_bound {
+                    crate::AtBound::RunLoaded => claim.timing_protection().map(drop),
+                    crate::AtBound::Refuse => claim.timing_admission().map(drop),
                 };
                 if claim.record.need.quiet_policy == crate::QuietPolicy::Timing
-                    && let Err(issue) = claim.timing_admission()
+                    && let Err(issue) = checked
                 {
                     Polled::Unqualified(issue)
                 } else {
@@ -2099,11 +2333,16 @@ impl Waiter {
             alone: None,
         };
         let found = self.look(machine)?;
+        let timed = Timed {
+            loaded: false,
+            spent: false,
+            ..found.timed()
+        };
         let (granted, would) = match found.decided {
             Ok((granted, _)) => (granted, None),
             Err(short) => (asked, Some(short)),
         };
-        let polled = self.grant(granted, None, found.cpu, found.load1, true);
+        let polled = self.grant(granted, None, timed, true);
         drop(turn);
         match polled {
             Polled::Admitted(claim) => Ok(Forced::Admitted(claim, would)),
@@ -2116,7 +2355,8 @@ impl Waiter {
     /// Its wait line: for a disk need no claim's end can meet, that only space freed admits it
     /// and `--admit now` starts it ([`UNSERVABLE`]); for a quiet claim next for the quiet
     /// machine, when its patience reserves the machine and when its wait reaches the bound.
-    /// Timing refuses unqualified work there; load-only admission may start.
+    /// A measured need that runs loaded starts there on a busy machine and says so, a strict one
+    /// is refused; load-only admission starts whatever the load.
     pub(crate) fn line(&self, short: &Shortfall) -> String {
         let mut line = format!(
             "capacity: {} waits ({}): {short}",
@@ -2140,10 +2380,14 @@ impl Waiter {
                 Duration::from_secs(ms.div_ceil(1000))
             };
             let start = span(at(p.start));
-            let ending = if self.record.need.quiet_policy == crate::QuietPolicy::Timing {
-                format!("Timing refuses unqualified work at its bound in {start}")
-            } else {
+            let ending = if self.record.need.quiet_policy != crate::QuietPolicy::Timing {
                 format!("starts whatever the load in {start}")
+            } else if self.record.need.at_bound == crate::AtBound::RunLoaded {
+                format!(
+                    "starts loaded at its bound in {start}, saying so, unless the machine is quiet first"
+                )
+            } else {
+                format!("refuses its work at its bound in {start} unless the machine is quiet")
             };
             match at(p.reserve) {
                 Duration::ZERO => {
@@ -2200,12 +2444,38 @@ struct Found {
     decided: Result<(Grant, Option<QuietStart>), Shortfall>,
     cpu: Option<crate::CpuWindow>,
     load1: Option<f64>,
+    /// A measured need that runs loaded met its bound on a busy machine ([`crate::AtBound`]).
+    loaded: bool,
+    /// A loaded claim of its process or an ancestor spent its patience ([`loaded_cover`]).
+    spent: bool,
     /// The waiter is first next for the quiet machine at this look ([`Record::next_ms`]).
     next: bool,
     /// When it looked, unix ms.
     now: u64,
     /// The processes it read: `None` where it read none (no claim ahead, or no sweep).
     procs: Option<Procs>,
+}
+
+/// What a look found of a measured need's CPU and load, for its grant.
+#[derive(Clone, Copy)]
+struct Timed {
+    cpu: Option<crate::CpuWindow>,
+    load1: Option<f64>,
+    /// It met its bound on a busy machine and runs loaded.
+    loaded: bool,
+    /// A loaded claim above it spent its patience ([`loaded_cover`]).
+    spent: bool,
+}
+
+impl Found {
+    const fn timed(&self) -> Timed {
+        Timed {
+            cpu: self.cpu,
+            load1: self.load1,
+            loaded: self.loaded,
+            spent: self.spent,
+        }
+    }
 }
 
 /// What one forced look found ([`Waiter::force`]).
@@ -2329,6 +2599,16 @@ pub trait Relief {
     /// Words a wait line ends with: what holds the rest (the largest users of a short volume).
     fn holders(&mut self, short: &Shortfall, stopped: &dyn Fn() -> bool) -> Option<String>;
 
+    /// Asked at each look that waits short of something a relief can free once a relief has run:
+    /// whether what it may take grew since its last call (a workspace removed meanwhile, whose
+    /// build directory nobody builds into again), so it runs again at once. It is asked as often
+    /// as the wait looks, so it is cheap and frees nothing itself. `false`, as by default,
+    /// waits.
+    fn renewed(&mut self, stopped: &dyn Fn() -> bool) -> bool {
+        let _ = stopped;
+        false
+    }
+
     /// Asked after each [`Self::relieve`], and at the look that admits a claim that waited
     /// (before it is returned): the waiter's disk need sized again, saying through `say` why,
     /// since a relief, or any pass that ran while it waited, can remove what it was sized on (a
@@ -2443,11 +2723,35 @@ pub fn admit_until(
 /// ([`Waiter::stuck`]), whatever that look is short of. Under `now` it waits only for the
 /// ledger's lock, holding a watch from the first look that met it, so an interrupt or `stopped`
 /// ends that wait the same way.
+///
+/// Each decision, admitted or not, is one `kind=admission` row in this Mac's telemetry log where
+/// `ledger` is this user's own ([`crate::telemetry`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "admission's six, the relief that frees room and the interrupt that ends its wait"
 )]
 fn admit_waiting(
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    need: Need,
+    mode: Admit,
+    pace: Pace,
+    relief: &mut dyn Relief,
+    say: &mut dyn FnMut(&str),
+    stopped: &dyn Fn() -> bool,
+) -> Result<Claim, Error> {
+    let asked = crate::telemetry::Asked::of(&need);
+    let decided = admit_deciding(ledger, machine, need, mode, pace, relief, say, stopped);
+    crate::telemetry::decided(ledger, &asked, &decided);
+    decided
+}
+
+/// [`admit_waiting`]'s decision, before its row.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "admission's six, the relief that frees room and the interrupt that ends its wait"
+)]
+fn admit_deciding(
     ledger: &Ledger,
     machine: &dyn Machine,
     need: Need,
@@ -2666,8 +2970,9 @@ fn admit_waiting(
                 nap(pace.turn_gap());
             }
             Polled::Waiting(w, short)
-                if relieve_now(sized_for.as_deref(), unservable, &short)
-                    && short.shorts.iter().any(Short::relievable) =>
+                if short.shorts.iter().any(Short::relievable)
+                    && (relieve_now(sized_for.as_deref(), unservable, &short)
+                        || relief.renewed(&interrupted)) =>
             {
                 waited = true;
                 sized_for = Some(disk_reservers(&short));

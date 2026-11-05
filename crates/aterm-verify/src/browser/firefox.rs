@@ -162,7 +162,19 @@ pub(crate) fn make_profile(profile: &Path) -> Result<(), String> {
     std::fs::create_dir_all(&home)
         .map_err(|e| format!("could not create {}: {e}", home.display()))?;
     let prefs = profile.join("user.js");
-    std::fs::write(&prefs, PREFS).map_err(|e| format!("could not write {}: {e}", prefs.display()))
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    }
+    opts.open(&prefs)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(PREFS.as_bytes())
+        })
+        .map_err(|e| format!("could not write {}: {e}", prefs.display()))
 }
 
 /// The scratch home inside `profile` that Firefox runs under.

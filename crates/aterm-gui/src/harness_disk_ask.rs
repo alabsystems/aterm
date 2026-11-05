@@ -175,6 +175,10 @@ impl crate::App {
                 return;
             }
         };
+        let _act = crate::tab_marks::ActScope::enter(
+            crate::session_store::ExitActor::Harness,
+            "free-disk",
+        );
         self.book_spawn(
             plan,
             booking,

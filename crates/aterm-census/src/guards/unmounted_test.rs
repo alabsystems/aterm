@@ -64,8 +64,8 @@ fn unmounted_test(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                          Cargo target (missing `[[test]]` or `mod` mount)"
                     ),
                 ));
-            } else if let Some(line) = first_test_attr_line(file)
-                && !libtest_reach.contains(&file.rel)
+            } else if !libtest_reach.contains(&file.rel)
+                && let Some(line) = first_test_attr_line(file)
             {
                 out.push(file.finding(
                     UNMOUNTED_TEST.id,

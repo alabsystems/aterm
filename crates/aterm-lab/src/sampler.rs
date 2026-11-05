@@ -41,15 +41,15 @@ pub fn keep_from_the_cleaner(run_dir: &Path, sockdir: &str, now: SystemTime) -> 
             continue;
         };
         for e in entries.flatten() {
-            let path = e.path();
-            let Ok(m) = std::fs::symlink_metadata(&path) else {
+            let Ok(m) = e.metadata() else {
                 continue;
             };
             if m.file_type().is_dir() {
+                let path = e.path();
                 if path != scratch && depth < 8 {
                     todo.push((path, depth + 1));
                 }
-            } else if file_stale(&m) && touch_now(&path, Touch::Accessed).unwrap_or(false) {
+            } else if file_stale(&m) && touch_now(&e.path(), Touch::Accessed).unwrap_or(false) {
                 made += 1;
             }
         }
@@ -179,12 +179,7 @@ pub fn main(args: &[String]) -> i32 {
             return 2;
         }
     }
-    let open = |name: &str| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(name))
-    };
+    let open = |name: &str| crate::util::append_regular_file(&dir.join(name));
     let (Ok(mut sockets), Ok(mut egress)) = (open("sockets.log"), open("egress.log")) else {
         return 1;
     };

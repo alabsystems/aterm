@@ -11,10 +11,15 @@ use aterm_uds::spawnfd::command;
 #[cfg(unix)]
 use aterm_update_core::pins;
 #[cfg(unix)]
-use aterm_update_core::roster::{self, Roster};
+use aterm_update_core::roster;
 
 #[cfg(unix)]
 use crate::ledger::{Error, Result};
+#[cfg(unix)]
+use crate::machines::current_roster::{
+    Candidate, admit_candidate, read_local_candidate_with, require_public_pair,
+    require_public_pair_held, require_public_source, same_candidate, utf8_path,
+};
 #[cfg(unix)]
 use crate::publish::step;
 #[cfg(unix)]
@@ -168,8 +173,14 @@ fn roster_only_in(
     if read_local_candidate_with(input, masters)?.is_none() {
         return Err(Error::new("--roster public pair is absent"));
     }
-    let selected = newest_local_candidate(&[&dist, &kept, input], masters)?
-        .ok_or_else(|| Error::new("no admitted public roster pair"))?;
+    let current = machines::current_roster::resolve(
+        home,
+        &[&dist, &kept, input],
+        masters,
+        Ok(None),
+        aterm_secrets::client::current_public_roster,
+    )?;
+    let selected = current.selected.clone();
     let authorize = |candidate: Candidate| {
         let who = machines::authorize_cut(
             masters,
@@ -186,26 +197,17 @@ fn roster_only_in(
         }
         Ok(who)
     };
-    // Authorize the newest effective document, including a newer removal or revocation.
-    let bytes = selected.bytes.clone();
-    let sig = selected.sig.clone();
-    let who = authorize(selected)?;
+    // Persist verified public denials before asking whether this signer is admitted.
+    current.recheck(home, masters)?;
     if let Some(lock) = lock.as_ref() {
-        let unchanged = read_local_candidate_with(&kept, masters)?
-            .is_some_and(|c| c.bytes == bytes && c.sig == sig);
-        if !unchanged {
-            write_pair(lock, &kept, &bytes, &sig)?;
-        }
+        promote_public_pair_held(lock, &kept, &selected, masters)?;
+        current.recheck(home, masters)?;
+        require_public_pair_held(&kept, &selected, masters)?;
         let effective = read_local_candidate_with(&kept, masters)?
             .ok_or_else(|| Error::new("canonical public pair vanished after publication"))?;
-        if effective.bytes != bytes || effective.sig != sig {
-            return Err(Error::new(
-                "canonical public pair changed during publication",
-            ));
-        }
         return authorize(effective);
     }
-    Ok(who)
+    authorize(selected)
 }
 
 /// POSIX-only, exactly like the engine it drives.
@@ -259,66 +261,56 @@ pub fn run_provision(
     }
     let roster_path = repo.join("dist").join(roster::ROSTER_ASSET);
     let kept_path = kept_roster_path(&home);
-    let (chosen, channel_unreadable) = {
-        let roster_lock = if check_only {
-            atpkg_keys::provision::refuse_pending_roster_transaction(&utf8_path(&roster_path)?)
-                .map_err(Error::new)?;
-            None
-        } else {
-            Some(lock_roster_pair(&roster_path)?)
-        };
-        if let Some(lock) = roster_lock.as_ref()
-            && restore_kept_pair(lock, &kept_path, &roster_path)?
-        {
-            step(
-                "roster",
-                &format!(
-                    "dist/ was empty — restored this machine's copy from {}",
-                    kept_path.display()
-                ),
-            );
-        }
-        let local = read_local_candidate(&roster_path)?;
-        let fetched = fetch_channel_candidate(&slug);
-        let seeded_from_channel = local.is_none() && fetched.is_ok();
-        let channel_unreadable = match &fetched {
-            Err(e) if !e.starts_with(NO_CHANNEL_ROSTER) => Some(e.clone()),
-            _ => None,
-        };
-        if let Some(why) = channel_unreadable.as_ref() {
-            step(
-                "roster",
-                &format!(
-                    "the public channel could not be read ({why}); a mint will be REFUSED until it \
-                     answers — auditing the rest, minting nothing"
-                ),
-            );
-        }
-        let (chosen, install, how) = choose_candidate(&roster_path, &slug, local, fetched)?;
-        if install && let Some(lock) = roster_lock.as_ref() {
-            install_pair(lock, &roster_path, &chosen)?;
-        }
+    let paths = aterm_secrets::client::Paths::for_home(Path::new(&home));
+    let fetched = fetch_channel_candidate(&slug);
+    let channel_unreadable = match &fetched {
+        Err(error) if !error.starts_with(NO_CHANNEL_ROSTER) => Some(error.clone()),
+        _ => None,
+    };
+    if let Some(why) = channel_unreadable.as_ref() {
         step(
             "roster",
-            &if install && check_only {
-                format!("{how} — not written (--check)")
-            } else {
-                how
-            },
+            &format!("the public channel could not be read ({why}); minting remains refused"),
         );
-        if seeded_from_channel {
-            step(
-                "",
-                "note: the channel cannot show an incumbent's UNPUBLISHED roster edit — if \
-                 one exists, STOP and copy that machine's dist/ pair here instead",
-            );
-        }
-        (chosen, channel_unreadable)
-    };
+    }
+    let current = machines::current_roster::resolve(
+        Path::new(&home),
+        &[&roster_path, &kept_path],
+        pins::PAPER_MASTER_PUBKEYS,
+        fetched.map(Some),
+        aterm_secrets::client::current_public_roster,
+    )?;
+    current.recheck(Path::new(&home), pins::PAPER_MASTER_PUBKEYS)?;
+    if !check_only {
+        // Public denial evidence must survive this signer's failed authorization.
+        promote_public_pair(&kept_path, &current.selected, pins::PAPER_MASTER_PUBKEYS)?;
+        promote_public_pair(&roster_path, &current.selected, pins::PAPER_MASTER_PUBKEYS)?;
+        current.require_canonical(Path::new(&home), pins::PAPER_MASTER_PUBKEYS)?;
+    }
+    step(
+        "roster",
+        &format!(
+            "selected newest admitted public roster_seq {}{}",
+            current.selected.roster.roster_seq,
+            if check_only {
+                " — not written (--check)"
+            } else {
+                ""
+            }
+        ),
+    );
+    let machines::current_roster::CurrentRoster {
+        selected: mut chosen,
+        observed: observed_vault,
+        floor: observed_floor,
+    } = current;
 
     let key_path = Path::new(&home).join(atpkg_keys::provision::MACHINE_KEY_REL);
     let identity_path = Path::new(&home).join(atpkg_keys::provision::MACHINE_PUB_REL);
 
+    if !check_only {
+        require_public_pair(&kept_path, &chosen, pins::PAPER_MASTER_PUBKEYS)?;
+    }
     let resolved = sign::ReleaseCredentials::resolve(None, repo)?;
     let mut attributed: Option<roster::Attribution> = None;
     let already = if key_path.exists() {
@@ -489,7 +481,7 @@ pub fn run_provision(
     let blocking = blockers(&checks);
     let host_cannot_cut = checks.iter().any(|(_, c)| matches!(c, Check::Skip(_)));
 
-    let report = if already || check_only || blocking > 0 {
+    let minted_result = if already || check_only || blocking > 0 {
         None
     } else if let Some(why) = channel_unreadable.as_ref() {
         return Err(Error::new(format!(
@@ -507,9 +499,43 @@ pub fn run_provision(
                  one. Ctrl-C now costs nothing — nothing has been written yet."
             ),
         );
-        Some(mint(repo, id, &roster_path)?)
+        Some(mint(repo, id, &roster_path, || {
+            require_public_source(
+                &paths,
+                observed_vault.as_ref(),
+                observed_floor,
+                pins::PAPER_MASTER_PUBKEYS,
+                aterm_secrets::client::current_public_roster,
+            )?;
+            require_public_pair(&roster_path, &chosen, pins::PAPER_MASTER_PUBKEYS)?;
+            require_public_pair(&kept_path, &chosen, pins::PAPER_MASTER_PUBKEYS)
+        })?)
+    };
+    let (report, minted_pair) = match minted_result {
+        Some((report, pair)) => (Some(report), Some(pair)),
+        None => (None, None),
     };
     let minted = report.is_some();
+    if let Some(pair) = minted_pair {
+        let completed =
+            admit_candidate(pins::PAPER_MASTER_PUBKEYS, pair.raw, pair.sig).map_err(Error::new)?;
+        require_public_pair(&roster_path, &completed, pins::PAPER_MASTER_PUBKEYS)?;
+        let report = report.as_ref().expect("a completed mint has its report");
+        let who = machines::authorize_cut(
+            pins::PAPER_MASTER_PUBKEYS,
+            completed.bytes.clone(),
+            &completed.sig,
+            &report.machine_pubkey,
+            now_unix()? as i64,
+        )
+        .map_err(|error| Error::new(error.to_string()))?;
+        if who.roster_seq != report.roster_seq || who.machine_id != report.id {
+            return Err(Error::new(
+                "minted public roster disagrees with the completed ceremony",
+            ));
+        }
+        chosen = completed;
+    }
 
     let derived_pubkey = if minted {
         sign::ReleaseCredentials::resolve(None, repo)?.map(|c| c.pubkey().to_string())
@@ -559,13 +585,13 @@ pub fn run_provision(
     };
 
     let roster_kept = if key_path.exists() && !check_only {
-        match keep_roster_pair(&roster_path, &kept_path) {
+        match keep_roster_pair(&roster_path, &kept_path, pins::PAPER_MASTER_PUBKEYS) {
             Ok(true) => Some(format!(
                 "kept at {} — dist/ is sweepable",
                 kept_path.display()
             )),
             Ok(false) => None,
-            Err(e) => Some(format!("could not keep a copy: {e}")),
+            Err(e) => return Err(e),
         }
     } else {
         None
@@ -574,6 +600,32 @@ pub fn run_provision(
     if !check_only && helper_ready {
         for (label, check) in layer::audit_source_signing(&host) {
             record(label, check, &mut checks);
+        }
+    }
+    require_public_source(
+        &paths,
+        observed_vault.as_ref(),
+        observed_floor,
+        pins::PAPER_MASTER_PUBKEYS,
+        aterm_secrets::client::current_public_roster,
+    )?;
+    if key_path.exists() && !check_only {
+        require_public_pair(&roster_path, &chosen, pins::PAPER_MASTER_PUBKEYS)?;
+        require_public_pair(&kept_path, &chosen, pins::PAPER_MASTER_PUBKEYS)?;
+        let identity = machines::MachineIdentity::read(&identity_path)?
+            .ok_or_else(|| Error::new("canonical signer identity disappeared"))?;
+        let who = machines::authorize_cut(
+            pins::PAPER_MASTER_PUBKEYS,
+            chosen.bytes.clone(),
+            &chosen.sig,
+            &identity.pubkey,
+            now_unix()? as i64,
+        )
+        .map_err(|error| Error::new(error.to_string()))?;
+        if who.machine_id != identity.id {
+            return Err(Error::new(
+                "effective public roster changed signer identity",
+            ));
         }
     }
     let (fails, waiting) = tally(&checks);
@@ -845,7 +897,15 @@ fn close(c: Closing<'_>) -> Result<()> {
 
 /// The in-process join ceremony.
 #[cfg(unix)]
-fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<atpkg_keys::provision::Report> {
+fn mint(
+    repo: &Path,
+    id: &str,
+    roster_path: &Path,
+    validate: impl FnOnce() -> Result<()>,
+) -> Result<(
+    atpkg_keys::provision::Report,
+    atpkg_keys::provision::RosterSnapshot,
+)> {
     use atpkg_keys::{master, provision as prov};
 
     master::forbid_core_dumps();
@@ -867,8 +927,23 @@ fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<atpkg_keys::provisi
         })
     })?;
     let planned = prov::plan(pre, &seed, now_unix()?).map_err(Error::new)?;
-    prov::write_pins(&planned).map_err(Error::new)?;
-    prov::write_rest(planned).map_err(Error::new)
+    publish_mint_plan(planned, validate)
+}
+
+/// Validate after planning and immediately before the first ceremony publication.
+#[cfg(unix)]
+fn publish_mint_plan(
+    planned: atpkg_keys::provision::Planned,
+    validate: impl FnOnce() -> Result<()>,
+) -> Result<(
+    atpkg_keys::provision::Report,
+    atpkg_keys::provision::RosterSnapshot,
+)> {
+    let public_pair = planned.public_roster();
+    validate()?;
+    atpkg_keys::provision::write_pins(&planned).map_err(Error::new)?;
+    let report = atpkg_keys::provision::write_rest(planned).map_err(Error::new)?;
+    Ok((report, public_pair))
 }
 
 /// Ask for the paper master on the transcript's grid, and give a mistype another go.
@@ -905,108 +980,42 @@ fn prompt_master_with_retries() -> Result<atpkg_keys::master::MasterPhrase> {
     unreachable!("the loop returns on every arm")
 }
 
-/// A roster pair that verified under the committed paper master and parsed.
+/// Promote verified public evidence before asking whether it authorizes this signer.
 #[cfg(unix)]
-#[derive(Debug)]
-struct Candidate {
-    bytes: Vec<u8>,
-    sig: Vec<u8>,
-    roster: Roster,
+fn promote_public_pair(path: &Path, selected: &Candidate, masters: &[&str]) -> Result<bool> {
+    let lock = lock_roster_pair(path)?;
+    promote_public_pair_held(&lock, path, selected, masters)
 }
 
-/// Verify-then-parse.
+/// Promote under the caller's existing writer custody without acquiring it again.
 #[cfg(unix)]
-fn admit_candidate(
-    master_pubkeys: &[&str],
-    bytes: Vec<u8>,
-    sig: Vec<u8>,
-) -> std::result::Result<Candidate, String> {
-    let verified = roster::verify_roster(master_pubkeys, bytes.clone(), &sig).map_err(|e| {
-        format!("the roster did not verify under the committed paper master ({e:?})")
-    })?;
-    let parsed = Roster::parse(&verified)
-        .map_err(|e| format!("the roster verified but did not parse ({e:?})"))?;
-    Ok(Candidate {
-        bytes,
-        sig,
-        roster: parsed,
-    })
-}
-
-/// A local pair admitted under the release's paper-master anchors.
-#[cfg(unix)]
-fn read_local_candidate(roster_path: &Path) -> Result<Option<Candidate>> {
-    read_local_candidate_with(roster_path, pins::PAPER_MASTER_PUBKEYS)
-}
-
-/// Read a local pair under the supplied anchors, without changing either half.
-#[cfg(unix)]
-fn read_local_candidate_with(
-    roster_path: &Path,
-    master_pubkeys: &[&str],
-) -> Result<Option<Candidate>> {
-    let sig_path = machines::RosterDocument::signature_path(roster_path);
-    let body = roster_path.exists();
-    let sig = sig_path.exists();
-    if !body && !sig {
-        return Ok(None);
-    }
-    if body != sig {
-        let (present, absent) = if body {
-            (roster_path.display(), sig_path.display())
-        } else {
-            (sig_path.display(), roster_path.display())
-        };
-        return Err(Error::new(format!(
-            "half a roster pair: {present} exists but {absent} is missing. The pair is \
-             one authorization document — re-copy BOTH files from the machine that has \
-             them, or remove the stray file to accept the channel release's pair",
-        )));
-    }
-    let doc = machines::RosterDocument::read(roster_path)?;
-    let c = admit_candidate(master_pubkeys, doc.bytes, doc.signature).map_err(|e| {
-        Error::new(format!(
-            "the roster pair at {} is unusable: {e}. Refusing to overwrite local \
-                 roster state this tool cannot prove — if it was a hand-copy, re-copy \
-                 BOTH files from the source machine; remove both files to accept the \
-                 channel release's pair instead",
-            roster_path.display(),
-        ))
-    })?;
-    Ok(Some(c))
-}
-
-/// Audit every supplied local pair, keeping the newest admitted generation. A damaged
-/// pair or two different documents at one generation refuses instead of falling back.
-#[cfg(unix)]
-fn newest_local_candidate(paths: &[&Path], master_pubkeys: &[&str]) -> Result<Option<Candidate>> {
-    let mut selected: Option<(&Path, Candidate)> = None;
-    for &path in paths {
-        atpkg_keys::provision::refuse_pending_roster_transaction(&utf8_path(path)?)
-            .map_err(Error::new)?;
-        let Some(candidate) = read_local_candidate_with(path, master_pubkeys)? else {
-            continue;
-        };
-        if let Some((previous_path, previous)) = &selected {
-            if previous.roster.roster_seq == candidate.roster.roster_seq
-                && previous.bytes != candidate.bytes
-            {
-                return Err(Error::new(format!(
-                    "LINEAGE FORK: local roster pairs {} and {} both carry roster_seq {} \
-                     but their bytes differ — resolve the conflicting master-signed \
-                     documents before releasing",
-                    previous_path.display(),
-                    path.display(),
-                    candidate.roster.roster_seq,
-                )));
-            }
-            if previous.roster.roster_seq >= candidate.roster.roster_seq {
-                continue;
-            }
+fn promote_public_pair_held(
+    lock: &atpkg_keys::provision::RosterLock,
+    path: &Path,
+    selected: &Candidate,
+    masters: &[&str],
+) -> Result<bool> {
+    let current = read_local_candidate_with(path, masters)?;
+    if let Some(current) = current.as_ref() {
+        if current.roster.roster_seq > selected.roster.roster_seq {
+            return Err(Error::new(
+                "a newer public roster appeared during provisioning",
+            ));
         }
-        selected = Some((path, candidate));
+        if current.roster.roster_seq == selected.roster.roster_seq
+            && current.bytes != selected.bytes
+        {
+            return Err(Error::new(
+                "LINEAGE FORK: public roster changed at the selected generation",
+            ));
+        }
     }
-    Ok(selected.map(|(_, candidate)| candidate))
+    if same_candidate(current.as_ref(), Some(selected)) {
+        return Ok(false);
+    }
+    write_pair(lock, path, &selected.bytes, &selected.sig)?;
+    require_public_pair_held(path, selected, masters)?;
+    Ok(true)
 }
 
 /// The latest channel release's pair, fetched anonymously and admitted.
@@ -1070,73 +1079,6 @@ fn curl_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
-/// Newest generation wins between `dist/` and the channel.
-#[cfg(unix)]
-fn choose_candidate(
-    roster_path: &Path,
-    slug: &str,
-    local: Option<Candidate>,
-    fetched: std::result::Result<Candidate, String>,
-) -> Result<(Candidate, bool, String)> {
-    match (local, fetched) {
-        (None, Err(e)) => Err(Error::new(format!(
-            "no roster pair anywhere: {} is absent and the channel fetch failed ({e}). \
-             Copy aterm-machines.toml AND aterm-machines.toml.sig into dist/ from a \
-             provisioned machine or from a release's assets ({} and …sig), then re-run",
-            roster_path.display(),
-            release_asset_url(slug, roster::ROSTER_ASSET),
-        ))),
-        (None, Ok(f)) => {
-            let how = format!(
-                "the latest channel release's pair is the only one here (roster_seq {})",
-                f.roster.roster_seq
-            );
-            Ok((f, true, how))
-        }
-        (Some(l), Err(e)) => {
-            let how = format!(
-                "using the dist/ pair (roster_seq {}); channel fetch failed ({e})",
-                l.roster.roster_seq
-            );
-            Ok((l, false, how))
-        }
-        (Some(l), Ok(f)) => {
-            let (ls, fs) = (l.roster.roster_seq, f.roster.roster_seq);
-            if fs > ls {
-                Ok((
-                    f,
-                    true,
-                    format!("the channel release is newer than dist/: roster_seq {ls} → {fs}"),
-                ))
-            } else if fs < ls {
-                Ok((
-                    l,
-                    false,
-                    format!(
-                        "the dist/ pair (roster_seq {ls}) is AHEAD of the channel ({fs}) — an \
-                         unpublished roster edit; keeping the newer generation"
-                    ),
-                ))
-            } else if l.bytes == f.bytes {
-                Ok((
-                    l,
-                    false,
-                    format!("the dist/ pair is byte-identical to the channel's (roster_seq {ls})"),
-                ))
-            } else {
-                Err(Error::new(format!(
-                    "LINEAGE FORK: the dist/ pair and the channel's both carry roster_seq \
-                     {ls} but their bytes differ — two master-signed rosters at one \
-                     generation de-authorize each other's successors. Do not mint. \
-                     Determine which document is authoritative (compare machine lists \
-                     with the master's holder), put THAT pair in dist/ everywhere, and \
-                     republish it before any further roster edit",
-                )))
-            }
-        }
-    }
-}
-
 /// Take the roster pair's writer lock.
 #[cfg(unix)]
 fn lock_roster_pair(roster_path: &Path) -> Result<atpkg_keys::provision::RosterLock> {
@@ -1164,16 +1106,6 @@ fn pair_premise(roster_path: &Path) -> Result<Option<atpkg_keys::provision::Rost
             roster_path.display()
         ))),
     }
-}
-
-/// Write the chosen pair into `dist/` under the caller's roster lock.
-#[cfg(unix)]
-fn install_pair(
-    lock: &atpkg_keys::provision::RosterLock,
-    roster_path: &Path,
-    c: &Candidate,
-) -> Result<()> {
-    write_pair(lock, roster_path, &c.bytes, &c.sig)
 }
 
 /// The write itself, over bytes a caller has already proven.
@@ -1210,8 +1142,8 @@ pub(crate) fn publish_proven_pair(
 ) -> crate::ledger::Result<()> {
     let mut sig_path = roster_path.as_os_str().to_owned();
     sig_path.push(".sig");
-    std::fs::write(roster_path, bytes)
-        .and_then(|()| std::fs::write(std::path::PathBuf::from(sig_path), sig))
+    crate::durable::write_fresh(roster_path, bytes)
+        .and_then(|()| crate::durable::write_fresh(&std::path::PathBuf::from(sig_path), sig))
         .map_err(|e| crate::ledger::Error::new(format!("write {}: {e}", roster_path.display())))
 }
 
@@ -1223,48 +1155,10 @@ fn kept_roster_path(home: &str) -> PathBuf {
 
 /// Copy the pair `authorize_cut` just accepted into `~/.aterm/release-ring/roster`.
 #[cfg(unix)]
-fn keep_roster_pair(roster_path: &Path, kept_path: &Path) -> Result<bool> {
-    let doc = machines::RosterDocument::read(roster_path)?;
-    let kept_lock = lock_roster_pair(kept_path)?;
-    if let Ok(kept) = machines::RosterDocument::read(kept_path) {
-        if kept.bytes == doc.bytes && kept.signature == doc.signature {
-            return Ok(false);
-        }
-        let seq = |bytes: Vec<u8>, sig: Vec<u8>| {
-            admit_candidate(pins::PAPER_MASTER_PUBKEYS, bytes, sig)
-                .ok()
-                .map(|c| c.roster.roster_seq)
-        };
-        let newer_kept = matches!(
-            (
-                seq(kept.bytes, kept.signature),
-                seq(doc.bytes.clone(), doc.signature.clone()),
-            ),
-            (Some(k), Some(d)) if k > d
-        );
-        if newer_kept {
-            return Ok(false);
-        }
-    }
-    write_pair(&kept_lock, kept_path, &doc.bytes, &doc.signature)?;
-    Ok(true)
-}
-
-/// Restore `dist/` from the kept copy.
-#[cfg(unix)]
-fn restore_kept_pair(
-    lock: &atpkg_keys::provision::RosterLock,
-    kept_path: &Path,
-    roster_path: &Path,
-) -> Result<bool> {
-    if roster_path.exists() || machines::RosterDocument::signature_path(roster_path).exists() {
-        return Ok(false);
-    }
-    let Ok(Some(kept)) = read_local_candidate(kept_path) else {
-        return Ok(false);
-    };
-    install_pair(lock, roster_path, &kept)?;
-    Ok(true)
+fn keep_roster_pair(roster_path: &Path, kept_path: &Path, masters: &[&str]) -> Result<bool> {
+    let candidate = read_local_candidate_with(roster_path, masters)?
+        .ok_or_else(|| Error::new("selected public roster pair is absent"))?;
+    promote_public_pair(kept_path, &candidate, masters)
 }
 
 /// One audit line: proven, missing-with-remedy, or impossible on this host.
@@ -1896,13 +1790,18 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
         {
             paths.push(named);
         }
-        let local = newest_local_candidate(&paths, pins::PAPER_MASTER_PUBKEYS)?;
         let fetched = fetch_channel_candidate(&slug);
-        let (chosen, _, _) = choose_candidate(&roster_path, &slug, local, fetched)?;
         let pubkey = derived.clone().ok_or_else(|| {
             Error::new("this machine holds no release key (~/.aterm/release-ring/machine.key)")
         })?;
-        authorize(chosen.bytes, &chosen.sig, &pubkey)
+        audit_roster_at(
+            Path::new(&home),
+            &paths,
+            pins::PAPER_MASTER_PUBKEYS,
+            fetched,
+            &pubkey,
+            now_unix()? as i64,
+        )
     });
     found.push((
         "roster",
@@ -1924,6 +1823,36 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
             state: audited(check),
         })
         .collect()
+}
+
+/// The release audit's roster decision, separated from machine and provider probes.
+#[cfg(unix)]
+fn audit_roster_at(
+    home: &Path,
+    paths: &[&Path],
+    masters: &[&str],
+    fetched: std::result::Result<Candidate, String>,
+    pubkey: &str,
+    now: i64,
+) -> Result<roster::Attribution> {
+    let current = machines::current_roster::resolve(
+        home,
+        paths,
+        masters,
+        fetched.map(Some),
+        aterm_secrets::client::current_public_roster,
+    )?;
+    let who = machines::authorize_cut(
+        masters,
+        current.selected.bytes.clone(),
+        &current.selected.sig,
+        pubkey,
+        now,
+    )
+    .map_err(|error| Error::new(error.to_string()))?;
+    current.require_canonical(home, masters)?;
+    current.recheck(home, masters)?;
+    Ok(who)
 }
 
 /// [`audit`] off unix.
@@ -2437,7 +2366,9 @@ fn channel_token_check_at(
     let tightened = present
         && open
         && may_change
-        && std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_ok();
+        && crate::durable::open_regular_file(path)
+            .and_then(|f| f.set_permissions(std::fs::Permissions::from_mode(0o600)))
+            .is_ok();
     channel_token_verdict(
         &where_it_lives,
         slug,
@@ -2479,13 +2410,6 @@ fn channel_token_verdict(
         };
     }
     Check::Pass(format!("{where_it_lives}  0600, owner-only"))
-}
-
-#[cfg(unix)]
-fn utf8_path(p: &Path) -> Result<String> {
-    p.to_str()
-        .map(str::to_string)
-        .ok_or_else(|| Error::new(format!("{} is not valid UTF-8", p.display())))
 }
 
 /// Unix seconds, failing rather than guessing.
@@ -2560,6 +2484,7 @@ mod tests {
         std::fs::write(&identity, &identity_bytes).unwrap();
         std::fs::remove_file(machines::RosterDocument::signature_path(&input)).unwrap();
         assert!(run("m3", false).is_err(), "unsigned input must refuse");
+        assert_eq!(machines::RosterDocument::read(&kept).unwrap(), original);
         let mut renamed = member();
         renamed.id = "m4".into();
         write(&input, roster_with(4, vec![renamed], vec![]));
@@ -2567,13 +2492,28 @@ mod tests {
             run("m3", false).is_err(),
             "the same key under a different id must refuse"
         );
-        write(&input, roster_with(4, vec![], vec!["m3".into()]));
+        assert_eq!(
+            machines::RosterDocument::read(&kept).unwrap(),
+            machines::RosterDocument::read(&input).unwrap()
+        );
+        write(&input, roster_with(5, vec![], vec!["m3".into()]));
         assert!(run("m3", false).is_err());
-        assert_eq!(machines::RosterDocument::read(&kept).unwrap(), original);
-        let mut expired = roster_with(4, vec![member()], vec![]);
+        let denied = machines::RosterDocument::read(&input).unwrap();
+        assert_eq!(machines::RosterDocument::read(&kept).unwrap(), denied);
+        write(&input, roster_with(3, vec![member()], vec![]));
+        assert!(
+            run("m3", false).is_err(),
+            "the old grant cannot revive the denied signer"
+        );
+        assert_eq!(machines::RosterDocument::read(&kept).unwrap(), denied);
+        let mut expired = roster_with(6, vec![member()], vec![]);
         expired.valid_until = "2026-01-01T00:00:00Z".into();
         write(&input, expired);
         assert!(run("m3", false).is_err());
+        assert_eq!(
+            machines::RosterDocument::read(&kept).unwrap(),
+            machines::RosterDocument::read(&input).unwrap()
+        );
         write(&input, roster_with(3, vec![member()], vec![]));
         write(&kept, roster_with(7, vec![member()], vec![]));
         let newer = machines::RosterDocument::read(&kept).unwrap();
@@ -3097,7 +3037,8 @@ mod tests {
             assert_eq!(outcome.need, NotaryNeed::Unchanged);
         }
     }
-    use aterm_update_core::roster::{Machine, SUPPORTED_SCHEMA};
+    use crate::machines::current_roster::{public_vault_candidate, require_roster_floor};
+    use aterm_update_core::roster::{Machine, Roster, SUPPORTED_SCHEMA};
 
     fn seed() -> atpkg_keys::master::MasterSeed {
         let phrase = "2".repeat(52);
@@ -3141,6 +3082,296 @@ mod tests {
         (s.pubkey_b64().expect("pubkey"), bytes, sig)
     }
 
+    fn newest_fixture_candidate(paths: &[&Path], masters: &[&str]) -> Result<Option<Candidate>> {
+        let mut candidates = Vec::new();
+        for path in paths {
+            candidates.extend(read_local_candidate_with(path, masters)?);
+        }
+        machines::current_roster::select_all(candidates)
+    }
+
+    #[test]
+    fn the_release_roster_audit_refuses_authority_below_its_retained_floor() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = aterm_secrets::client::Paths::for_home(home.path());
+        let dist = home.path().join("dist/aterm-machines.toml");
+        let kept = home.path().join(atpkg_keys::provision::RELEASE_ROSTER_REL);
+        let (master, bytes, sig) = signed_candidate(3);
+        let grant = admit_candidate(&[&master], bytes, sig).unwrap();
+        promote_public_pair(&dist, &grant, &[&master]).unwrap();
+        promote_public_pair(&kept, &grant, &[&master]).unwrap();
+        let audit = || {
+            audit_roster_at(
+                home.path(),
+                &[&dist, &kept],
+                &[&master],
+                Ok(grant.clone()),
+                &pubkey_of(0x42),
+                1_793_000_000,
+            )
+        };
+        assert_eq!(audit().unwrap().roster_seq, 3);
+        aterm_uds::private_file::ensure_private_dir(&paths.dir).unwrap();
+        aterm_uds::private_file::write_private(&paths.dir, "release-ring-roster-floor", b"5\n")
+            .unwrap();
+        assert!(
+            audit().is_err(),
+            "an old grant must not bypass the retained roster floor"
+        );
+    }
+
+    #[test]
+    fn ordinary_provisioning_selects_a_newer_kept_roster_beside_existing_dist() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let dist = scratch.path().join("dist/aterm-machines.toml");
+        let kept = scratch.path().join("kept/aterm-machines.toml");
+        let write = |path: &Path, seq| {
+            let (master, bytes, sig) = signed_candidate(seq);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+            std::fs::write(machines::RosterDocument::signature_path(path), sig).unwrap();
+            master
+        };
+        let master = write(&dist, 3);
+        assert_eq!(
+            newest_fixture_candidate(&[&dist, &kept], &[&master])
+                .unwrap()
+                .unwrap()
+                .roster
+                .roster_seq,
+            3
+        );
+        write(&kept, 2);
+        assert_eq!(
+            newest_fixture_candidate(&[&dist, &kept], &[&master])
+                .unwrap()
+                .unwrap()
+                .roster
+                .roster_seq,
+            3
+        );
+        write(&kept, 5);
+        let local = newest_fixture_candidate(&[&dist, &kept], &[&master]).unwrap();
+        let (_, bytes, sig) = signed_candidate(3);
+        let fetched = admit_candidate(&[&master], bytes, sig).unwrap();
+        let selected =
+            machines::current_roster::select_all(local.into_iter().chain([fetched]).collect())
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.roster.roster_seq, 5);
+        promote_public_pair(&dist, &selected, &[&master]).unwrap();
+        require_public_pair(&dist, &selected, &[&master]).unwrap();
+    }
+
+    #[test]
+    fn authenticated_public_pair_input_is_admitted_before_real_promotion() {
+        use aterm_secrets::client::{Paths, PublicRosterPair, PublicRosterRead};
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        let dist = home.path().join("dist/aterm-machines.toml");
+        let kept = home.path().join("kept/aterm-machines.toml");
+        let (master, raw, sig) = signed_candidate(3);
+        let old = admit_candidate(&[&master], raw, sig).unwrap();
+        promote_public_pair(&dist, &old, &[&master]).unwrap();
+        promote_public_pair(&kept, &old, &[&master]).unwrap();
+        let (_, raw, sig) = signed_candidate(5);
+        let read = || {
+            PublicRosterRead::Pair(PublicRosterPair {
+                roster: raw.clone(),
+                signature: sig.clone(),
+            })
+        };
+        let (candidate, floor) =
+            public_vault_candidate(&paths, &[&master], |_| Ok(read())).unwrap();
+        assert_eq!(floor, 0);
+        let local = newest_fixture_candidate(&[&dist, &kept], &[&master]).unwrap();
+        let selected =
+            machines::current_roster::select_all(local.into_iter().chain(candidate).collect())
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.roster.roster_seq, 5);
+        promote_public_pair(&kept, &selected, &[&master]).unwrap();
+        promote_public_pair(&dist, &selected, &[&master]).unwrap();
+        require_public_pair(&kept, &selected, &[&master]).unwrap();
+        require_public_pair(&dist, &selected, &[&master]).unwrap();
+        assert!(public_vault_candidate(&paths, &["not a master"], |_| Ok(read())).is_err());
+        assert!(
+            public_vault_candidate(&paths, &[&master], |_| Err(aterm_secrets::Error::new(
+                "unavailable"
+            )))
+            .is_err()
+        );
+        aterm_uds::private_file::ensure_private_dir(&paths.dir).unwrap();
+        aterm_uds::private_file::write_private(&paths.dir, "release-ring-roster-floor", b"7\n")
+            .unwrap();
+        let (_, floor) = public_vault_candidate(&paths, &[&master], |_| Ok(read())).unwrap();
+        assert_eq!(floor, 7);
+        assert!(require_roster_floor(&selected, floor).is_err());
+        require_public_pair(&kept, &selected, &[&master]).unwrap();
+        aterm_uds::private_file::write_private(&paths.dir, "release-ring-roster-floor", b"invalid")
+            .unwrap();
+        assert!(public_vault_candidate(&paths, &[&master], |_| Ok(read())).is_err());
+    }
+
+    #[test]
+    fn final_pair_read_refuses_a_committed_transaction_even_while_old_bytes_match() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let path = scratch.path().join("aterm-machines.toml");
+        let (master, bytes, sig) = signed_candidate(3);
+        let old = admit_candidate(&[&master], bytes, sig).unwrap();
+        promote_public_pair(&path, &old, &[&master]).unwrap();
+        let (_, bytes, sig) = signed_candidate(5);
+        let next = admit_candidate(&[&master], bytes, sig).unwrap();
+        let lock = lock_roster_pair(&path).unwrap();
+        let expected = pair_premise(&path).unwrap();
+        let committed = atpkg_keys::provision::commit_roster_pair(
+            &lock,
+            &utf8_path(&path).unwrap(),
+            expected.as_ref(),
+            &next.bytes,
+            &next.sig,
+        )
+        .unwrap();
+        drop(lock);
+        assert_eq!(std::fs::read(&path).unwrap(), old.bytes);
+        assert!(require_public_pair(&path, &old, &[&master]).is_err());
+        drop(committed);
+        drop(lock_roster_pair(&path).unwrap());
+        require_public_pair(&path, &next, &[&master]).unwrap();
+        assert!(require_public_pair(&path, &old, &[&master]).is_err());
+    }
+
+    #[test]
+    fn changed_authority_refuses_a_planned_mint_before_any_publication() {
+        use aterm_secrets::client::{Paths, PublicRosterPair, PublicRosterRead};
+        use atpkg_keys::provision as prov;
+        for (source_changed, floor_changed, pair_changed) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let path = |name| scratch.path().join(name).to_str().unwrap().to_owned();
+            let paths = prov::Paths {
+                pins: path("pins.rs"),
+                roster: path("roster.toml"),
+                key: path("machine.key"),
+                machine_pub: path("machine.toml"),
+                pins_explicit: true,
+            };
+            let pins = b"pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\n";
+            std::fs::write(&paths.pins, pins).unwrap();
+            let pre = prov::preflight(prov::Verb::Setup, "m3", &paths).unwrap();
+            let planned = prov::plan(pre, &seed(), 1_793_000_000).unwrap();
+            let home = Paths::for_home(scratch.path());
+            let canonical = scratch.path().join("canonical/roster.toml");
+            let (master, raw, sig) = signed_candidate(3);
+            let observed = admit_candidate(&[&master], raw.clone(), sig.clone()).unwrap();
+            promote_public_pair(&canonical, &observed, &[&master]).unwrap();
+            let (_, next_raw, next_sig) = signed_candidate(5);
+            if pair_changed {
+                let next = admit_candidate(&[&master], next_raw.clone(), next_sig.clone()).unwrap();
+                promote_public_pair(&canonical, &next, &[&master]).unwrap();
+            }
+            if floor_changed {
+                aterm_uds::private_file::ensure_private_dir(&home.dir).unwrap();
+                aterm_uds::private_file::write_private(
+                    &home.dir,
+                    "release-ring-roster-floor",
+                    b"5\n",
+                )
+                .unwrap();
+            }
+            let result = publish_mint_plan(planned, || {
+                let (roster, signature) = if source_changed {
+                    (next_raw, next_sig)
+                } else {
+                    (raw, sig)
+                };
+                require_public_source(&home, Some(&observed), 0, &[&master], |_| {
+                    Ok(PublicRosterRead::Pair(PublicRosterPair {
+                        roster,
+                        signature,
+                    }))
+                })?;
+                require_public_pair(&canonical, &observed, &[&master])
+            });
+            if !source_changed && !floor_changed && !pair_changed {
+                let (_, expected) = result.unwrap();
+                assert_eq!(std::fs::read(&paths.roster).unwrap(), expected.raw);
+                assert_eq!(
+                    std::fs::read(machines::RosterDocument::signature_path(Path::new(
+                        &paths.roster
+                    )))
+                    .unwrap(),
+                    expected.sig
+                );
+                assert!(Path::new(&paths.key).is_file());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(&paths.pins).unwrap(), pins);
+                for file in [&paths.roster, &paths.key, &paths.machine_pub] {
+                    assert!(!Path::new(file).exists());
+                }
+                assert!(
+                    !machines::RosterDocument::signature_path(Path::new(&paths.roster)).exists()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn newer_public_denials_survive_failed_authorization_and_dist_cleanup() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let dist = scratch.path().join("dist/aterm-machines.toml");
+        let kept = scratch.path().join("kept/aterm-machines.toml");
+        let (master, bytes, sig) = signed_candidate(3);
+        let old = admit_candidate(&[&master], bytes, sig).unwrap();
+        promote_public_pair(&kept, &old, &[&master]).unwrap();
+        promote_public_pair(&dist, &old, &[&master]).unwrap();
+        let bytes = roster_with(5, vec![machine("m3", 0x42)], vec!["m3".into()])
+            .to_toml()
+            .unwrap()
+            .into_bytes();
+        let sig = seed().sign(&bytes).unwrap();
+        let denied = admit_candidate(&[&master], bytes.clone(), sig).unwrap();
+        promote_public_pair(&kept, &denied, &[&master]).unwrap();
+        promote_public_pair(&dist, &denied, &[&master]).unwrap();
+        assert!(
+            machines::authorize_cut(
+                &[&master],
+                denied.bytes.clone(),
+                &denied.sig,
+                &pubkey_of(0x42),
+                100
+            )
+            .is_err()
+        );
+        std::fs::remove_file(&dist).unwrap();
+        std::fs::remove_file(machines::RosterDocument::signature_path(&dist)).unwrap();
+        require_public_pair(&kept, &denied, &[&master]).unwrap();
+        assert!(promote_public_pair(&kept, &old, &[&master]).is_err());
+        assert!(require_public_pair(&kept, &old, &[&master]).is_err());
+        let (_, fork, sig) = signed_candidate(5);
+        let fork = admit_candidate(&[&master], fork, sig).unwrap();
+        assert!(promote_public_pair(&kept, &fork, &[&master]).is_err());
+        let retained = read_local_candidate_with(&kept, &[&master])
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.bytes, bytes);
+        assert!(
+            machines::authorize_cut(
+                &[&master],
+                retained.bytes,
+                &retained.sig,
+                &pubkey_of(0x42),
+                100
+            )
+            .is_err()
+        );
+    }
+
     /// The selected profile's valid pair is considered alongside the other local copies.
     /// Newer removal, a fork, a damaged signature and a half-pair all refuse admission.
     #[test]
@@ -3160,7 +3391,7 @@ mod tests {
             std::fs::write(path, bytes).unwrap();
             std::fs::write(machines::RosterDocument::signature_path(path), sig).unwrap();
         };
-        let choose = || newest_local_candidate(&[&dist, &kept, &named], &[&master]);
+        let choose = || newest_fixture_candidate(&[&dist, &kept, &named], &[&master]);
         let authorize = |candidate: Candidate| {
             machines::authorize_cut(
                 &[&master],
@@ -3217,59 +3448,35 @@ mod tests {
 
     #[test]
     fn the_newest_generation_wins_and_never_downgrades() {
-        let (master, b, s) = signed_candidate(3);
-        let older = admit_candidate(&[&master], b, s).unwrap();
-        let (_, b, s) = signed_candidate(5);
-        let newer = admit_candidate(&[&master], b, s).unwrap();
-        let path = Path::new("dist/aterm-machines.toml");
-
-        let (_, b, s) = signed_candidate(3);
-        let local = admit_candidate(&[&master], b, s).unwrap();
-        let (chosen, install, _) = choose_candidate(path, "o/r", Some(local), Ok(newer)).unwrap();
-        assert_eq!(chosen.roster.roster_seq, 5);
-        assert!(install);
-
-        let (_, b, s) = signed_candidate(9);
-        let local = admit_candidate(&[&master], b, s).unwrap();
-        let (chosen, install, _) = choose_candidate(path, "o/r", Some(local), Ok(older)).unwrap();
-        assert_eq!(chosen.roster.roster_seq, 9);
-        assert!(!install);
-
-        let (_, b, s) = signed_candidate(4);
-        let local = admit_candidate(&[&master], b.clone(), s.clone()).unwrap();
-        let fetched = admit_candidate(&[&master], b, s).unwrap();
-        let (_, install, _) = choose_candidate(path, "o/r", Some(local), Ok(fetched)).unwrap();
-        assert!(!install);
-
-        let (_, b, s) = signed_candidate(2);
-        let fetched = admit_candidate(&[&master], b, s).unwrap();
-        let (_, install, _) = choose_candidate(path, "o/r", None, Ok(fetched)).unwrap();
-        assert!(install);
-
-        let (_, b, s) = signed_candidate(2);
-        let local = admit_candidate(&[&master], b, s).unwrap();
-        let (_, install, _) =
-            choose_candidate(path, "o/r", Some(local), Err("offline".into())).unwrap();
-        assert!(!install);
-
-        assert!(choose_candidate(path, "owner/repo", None, Err("offline".into())).is_err());
+        let master = seed().pubkey_b64().unwrap();
+        let candidate = |seq| {
+            let (_, bytes, sig) = signed_candidate(seq);
+            admit_candidate(&[&master], bytes, sig).unwrap()
+        };
+        for generations in [vec![3, 5], vec![9, 3], vec![4, 4], vec![2]] {
+            let expected = *generations.iter().max().unwrap();
+            let selected = machines::current_roster::select_all(
+                generations.into_iter().map(candidate).collect(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(selected.roster.roster_seq, expected);
+        }
+        assert!(
+            machines::current_roster::select_all(Vec::new())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn equal_generation_with_different_bytes_is_a_lineage_fork_and_a_hard_stop() {
-        let (master, b, s) = signed_candidate_with(4, vec![machine("m3", 0x42)]);
-        let local = admit_candidate(&[&master], b, s).unwrap();
-        let (_, b, s) = signed_candidate_with(4, vec![machine("m3", 0x42), machine("mx", 0x43)]);
-        let fetched = admit_candidate(&[&master], b, s).unwrap();
-        assert!(
-            choose_candidate(
-                Path::new("dist/aterm-machines.toml"),
-                "o/r",
-                Some(local),
-                Ok(fetched),
-            )
-            .is_err()
-        );
+        let (master, bytes, sig) = signed_candidate_with(4, vec![machine("m3", 0x42)]);
+        let local = admit_candidate(&[&master], bytes, sig).unwrap();
+        let (_, bytes, sig) =
+            signed_candidate_with(4, vec![machine("m3", 0x42), machine("mx", 0x43)]);
+        let other = admit_candidate(&[&master], bytes, sig).unwrap();
+        assert!(machines::current_roster::select_all(vec![local, other]).is_err());
     }
 
     #[test]
@@ -3280,14 +3487,14 @@ mod tests {
         let path = dir.join("aterm-machines.toml");
 
         std::fs::write(&path, b"schema = 1\n").unwrap();
-        assert!(read_local_candidate(&path).is_err());
+        assert!(read_local_candidate_with(&path, pins::PAPER_MASTER_PUBKEYS).is_err());
 
         std::fs::remove_file(&path).unwrap();
         std::fs::write(machines::RosterDocument::signature_path(&path), [0u8; 64]).unwrap();
-        assert!(read_local_candidate(&path).is_err());
+        assert!(read_local_candidate_with(&path, pins::PAPER_MASTER_PUBKEYS).is_err());
 
         std::fs::write(&path, b"schema = 1\n").unwrap();
-        assert!(read_local_candidate(&path).is_err());
+        assert!(read_local_candidate_with(&path, pins::PAPER_MASTER_PUBKEYS).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3559,41 +3766,48 @@ mod tests {
         let kept = kept_roster_path(home.to_str().unwrap());
         let lock = lock_roster_pair(&dist).unwrap();
 
-        assert!(!restore_kept_pair(&lock, &kept, &dist).unwrap());
-
         let (master, bytes, sig) = signed_candidate(6);
+        assert!(
+            newest_fixture_candidate(&[&dist, &kept], &[&master])
+                .unwrap()
+                .is_none()
+        );
         let c = admit_candidate(&[&master], bytes, sig).unwrap();
-        install_pair(&lock, &dist, &c).unwrap();
+        write_pair(&lock, &dist, &c.bytes, &c.sig).unwrap();
+        drop(lock);
 
-        assert!(keep_roster_pair(&dist, &kept).unwrap());
+        assert!(keep_roster_pair(&dist, &kept, &[&master]).unwrap());
         let (a, b) = (
             machines::RosterDocument::read(&dist).unwrap(),
             machines::RosterDocument::read(&kept).unwrap(),
         );
         assert_eq!(a.bytes, b.bytes);
         assert_eq!(a.signature, b.signature);
-        assert!(!keep_roster_pair(&dist, &kept).unwrap());
+        assert!(!keep_roster_pair(&dist, &kept, &[&master]).unwrap());
 
-        assert!(!restore_kept_pair(&lock, &kept, &dist).unwrap());
+        require_public_pair(&dist, &c, &[&master]).unwrap();
 
         let kept_sig = machines::RosterDocument::signature_path(&kept);
         let sig_bytes = std::fs::read(&kept_sig).unwrap();
         std::fs::remove_file(&kept_sig).unwrap();
-        keep_roster_pair(&dist, &kept).unwrap_err();
+        keep_roster_pair(&dist, &kept, &[&master]).unwrap_err();
         assert!(!kept_sig.exists(), "a refused copy wrote nothing");
         std::fs::write(&kept_sig, &sig_bytes).unwrap();
         assert!(
-            !keep_roster_pair(&dist, &kept).unwrap(),
+            !keep_roster_pair(&dist, &kept, &[&master]).unwrap(),
             "and it is whole again"
         );
 
         std::fs::remove_file(&dist).unwrap();
         std::fs::remove_file(machines::RosterDocument::signature_path(&dist)).unwrap();
-        assert!(!restore_kept_pair(&lock, &kept, &dist).unwrap());
-        assert!(!dist.exists());
+        let selected = newest_fixture_candidate(&[&dist, &kept], &[&master])
+            .unwrap()
+            .unwrap();
+        promote_public_pair(&dist, &selected, &[&master]).unwrap();
+        require_public_pair(&dist, &c, &[&master]).unwrap();
 
         std::fs::remove_file(machines::RosterDocument::signature_path(&kept)).unwrap();
-        assert!(!restore_kept_pair(&lock, &kept, &dist).unwrap());
+        assert!(newest_fixture_candidate(&[&dist, &kept], &[&master]).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3758,7 +3972,8 @@ mod tests {
         let (master, six, six_sig) = signed_candidate(6);
         let chosen = admit_candidate(&[&master], six.clone(), six_sig.clone()).unwrap();
         let lock = lock_roster_pair(&dist).expect("the phase's writer lock");
-        install_pair(&lock, &dist, &chosen).expect("phase 1 installs the chosen pair");
+        write_pair(&lock, &dist, &chosen.bytes, &chosen.sig)
+            .expect("phase 1 installs the chosen pair");
         assert_eq!(std::fs::read(&dist).unwrap(), six);
         assert_eq!(std::fs::read(&sig_path).unwrap(), six_sig);
 

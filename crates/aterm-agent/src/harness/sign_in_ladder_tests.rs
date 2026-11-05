@@ -631,30 +631,43 @@ fn the_log_line_names_the_row_how_it_ended_and_the_routes() {
 }
 
 #[test]
-fn a_peer_heard_ends_every_wait_but_that_of_a_row_a_page_stopped() {
+fn a_move_ends_every_wait_but_that_of_a_row_a_page_stopped() {
     let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(6 * 60 * 60);
     let mut ladder = Ladder::default();
     assert_eq!(ladder.vault_turn(Some([1; 32]), t0), VaultTurn::Due);
     ladder.vault_done(Vault::Unchanged(51));
     ladder.failed("stopped", "mailbox", t0);
-    ladder.page_stopped("stopped");
+    ladder.page_stopped("stopped", until);
     ladder.failed("relay", "mailbox", t0);
     let later = t0 + Duration::from_secs(60);
-    ladder.peer_heard(later);
+    assert_eq!(
+        ladder.retry_at("stopped", later),
+        Some(until),
+        "what a person is told the next try is"
+    );
+    ladder.moved(later);
     assert!(ladder.held("stopped", "mailbox", later), "the page stands");
     assert!(
         !ladder.held("relay", "mailbox", later),
         "NEGATIVE CONTROL: a peer may be what this row was waiting for"
     );
-    ladder.moved(later);
-    assert!(
-        !ladder.held("stopped", "mailbox", later),
-        "a move may change what the page judges"
-    );
     assert_eq!(
         ladder.vault_turn(Some([1; 32]), later),
         VaultTurn::Due,
         "the vault is asked at once"
+    );
+
+    ladder.failed("relay", "mailbox", later);
+    ladder.page_ended("relay");
+    assert!(
+        ladder.held("relay", "mailbox", later),
+        "NEGATIVE CONTROL: no page stopped this row"
+    );
+    ladder.page_ended("stopped");
+    assert!(
+        !ladder.held("stopped", "mailbox", later),
+        "the record says go"
     );
 }
 
@@ -681,5 +694,135 @@ fn a_run_with_no_exit_says_why_it_failed() {
         how_it_ended_because(Renewal::Failed, None, Some(&met), Some("past its deadline")),
         how_it_ended(Renewal::Failed, None, Some(&met)),
         "what the page met says more than the deadline"
+    );
+}
+
+/// THE SPACING LAW: another account's start holds an automatic sign-in for ten minutes, either
+/// way round a clock set back; the same account's never does (its ladder's backoff spaces it).
+/// CONTROL: exactly ten minutes after another account's start admits it.
+#[test]
+fn another_accounts_start_holds_a_sign_in_ten_minutes_and_the_same_accounts_does_not() {
+    use super::super::accounts::Cli;
+    let now = 1_800_000_000;
+    let at = |cli, label: &str, at| Started::new(cli, label, at);
+    assert_eq!(spaced_until(None, Cli::Claude, "a", now), None);
+    let other = at(Cli::Claude, "b", now - (SPACING_S - 1));
+    assert_eq!(
+        spaced_until(Some(&other), Cli::Claude, "a", now),
+        Some(now + 1)
+    );
+    assert_eq!(
+        spaced_until(
+            Some(&at(Cli::Claude, "b", now - SPACING_S)),
+            Cli::Claude,
+            "a",
+            now
+        ),
+        None,
+        "CONTROL: ten minutes on, another account's sign-in may start"
+    );
+    assert_eq!(
+        spaced_until(Some(&at(Cli::Claude, "a", now - 1)), Cli::Claude, "a", now),
+        None,
+        "the same account's retry is the ladder's to space"
+    );
+    assert_eq!(
+        spaced_until(Some(&at(Cli::Kimi, "a", now - 1)), Cli::Claude, "a", now),
+        Some(now - 1 + SPACING_S),
+        "one label in another CLI's pool is another account"
+    );
+    assert_eq!(
+        spaced_until(
+            Some(&at(Cli::Claude, "b", now + 300)),
+            Cli::Claude,
+            "a",
+            now
+        ),
+        Some(now + 300 + SPACING_S),
+        "a clock set back holds it ten minutes past the record"
+    );
+    assert_eq!(
+        spaced_until(
+            Some(&at(Cli::Claude, "b", now + 3_600)),
+            Cli::Claude,
+            "a",
+            now
+        ),
+        None,
+        "and never longer"
+    );
+}
+
+/// The spacing record reads back only as it is written: anything else is no record.
+#[test]
+fn the_spacing_record_reads_back_only_as_written() {
+    use super::super::accounts::Cli;
+    let started = Started::new(Cli::Codex, "codex-2", 1_800_000_000);
+    assert_eq!(Started::parse(&started.text()), Some(started.clone()));
+    for text in [
+        String::new(),
+        "aterm-signin-spacing-v0\ncodex codex-2 1800000000\n".to_owned(),
+        format!("{}extra\n", started.text()),
+        "aterm-signin-spacing-v1\ncodex codex-2 1800000000 9\n".to_owned(),
+        "aterm-signin-spacing-v1\ncodex codex-2 soon\n".to_owned(),
+        "aterm-signin-spacing-v1\ncodex ../up 1800000000\n".to_owned(),
+    ] {
+        assert_eq!(Started::parse(&text), None, "{text:?}");
+    }
+}
+
+/// A started sign-in is spaced from the record every process on this Mac keeps: an automatic one
+/// of another account within ten minutes is refused and records nothing; a person's named one
+/// starts when asked and sets the clock; a token for another account starts nothing.
+#[test]
+fn begin_keeps_one_spacing_clock_for_the_mac_and_refuses_a_token_for_another_account() {
+    use super::super::accounts::{Cli, Store};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let store = Store::at_for(&dir.path().join("state"), Cli::Claude, dir.path());
+    std::fs::create_dir_all(store.shared_dir()).unwrap();
+    let now = 1_800_000_000;
+    let begin = |label: &str, why: Why, named: &str, at: i64| {
+        let lock = store
+            .signin_now()
+            .unwrap()
+            .expect("the sign-in lock is free");
+        SignIn::fixture(Cli::Claude, label, why)
+            .begin(Cli::Claude, named, lock, &store, at)
+            .map(|begun| assert!(begun.names(Cli::Claude, named)))
+    };
+    let last = || last_started(&store).unwrap();
+    assert!(matches!(
+        begin("a", Why::Due, "b", now),
+        Err(Refused::Another)
+    ));
+    assert_eq!(last(), None, "a refused token records nothing");
+    begin("a", Why::Due, "a", now).unwrap();
+    assert_eq!(last(), Some(Started::new(Cli::Claude, "a", now)));
+    assert!(matches!(
+        begin("b", Why::Due, "b", now + 60),
+        Err(Refused::Spaced { until }) if until == now + SPACING_S
+    ));
+    assert!(matches!(
+        begin("b", Why::Session, "b", now + 60),
+        Err(Refused::Spaced { .. })
+    ));
+    assert_eq!(last(), Some(Started::new(Cli::Claude, "a", now)));
+    begin("a", Why::Due, "a", now + 60).unwrap();
+    begin("b", Why::Asked, "b", now + 120).unwrap();
+    assert_eq!(
+        last(),
+        Some(Started::new(Cli::Claude, "b", now + 120)),
+        "a person's sign-in starts at once and sets the clock"
+    );
+    assert!(begin("a", Why::Due, "a", now + 120 + SPACING_S - 1).is_err());
+    begin("a", Why::Due, "a", now + 120 + SPACING_S).unwrap();
+    let kimi = Store::at_for(&dir.path().join("state"), Cli::Kimi, dir.path());
+    assert_eq!(kimi.shared_dir(), store.shared_dir());
+    assert!(
+        matches!(
+            SignIn::fixture(Cli::Kimi, "k", Why::Due).spaced(&kimi, now + 120 + SPACING_S + 1),
+            Ok(Some(_))
+        ),
+        "every CLI's store shares the one sign-in lock, and with it this clock"
     );
 }

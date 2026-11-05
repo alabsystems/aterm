@@ -312,12 +312,12 @@ fn arch_rows(
         }
     };
     let text = fresh.render();
-    let _ = std::fs::write(results.join(format!("{}-uia.txt", arch.name())), &text);
+    let _ = crate::util::write_fresh(&results.join(format!("{}-uia.txt", arch.name())), &text);
     rows.push((name("record"), Ok(summary(&fresh))));
     let committed = repo.join(DIR).join(format!("{}.txt", arch.name()));
     if record_it {
         let wrote = std::fs::create_dir_all(repo.join(DIR))
-            .and_then(|()| std::fs::write(&committed, &text))
+            .and_then(|()| crate::util::write_out(&committed, text.as_bytes()))
             .map(|()| format!("wrote {}", committed.display()))
             .map_err(|e| format!("{}: {e}", committed.display()));
         rows.push((name("recorded"), wrote));
@@ -441,7 +441,7 @@ pub fn cmd_uia(args: &[String]) -> Res {
     }
     print!("{report}");
     let path = results.join("uia.txt");
-    let _ = std::fs::write(&path, &report);
+    let _ = crate::util::write_out(&path, report.as_bytes());
     println!(
         "windows: {} rows, {failed} failed, {:.0} s, tree {tree}; report {}",
         rows.len(),

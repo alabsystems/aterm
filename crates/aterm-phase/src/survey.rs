@@ -4,7 +4,7 @@
 //! Claude Code's rating cards and the other blocks parked above the composer.
 
 use crate::phase::{
-    composer_frame, is_against_right_edge, is_glyph_row, is_rule, is_transcript_row,
+    Transcript, composer_frame, is_against_right_edge, is_glyph_row, is_rule, is_transcript_row,
 };
 
 /// Which card a block is, by its question row.
@@ -87,15 +87,15 @@ fn option_keys(row: &str) -> Option<Vec<usize>> {
     row.strip_prefix("  1:")?;
     let chars: Vec<char> = row.chars().collect();
     let mut starts = Vec::new();
-    let mut cell = 0;
+    let mut columns = crate::question::Columns::default();
     for (i, &c) in chars.iter().enumerate() {
         let key = c.is_ascii_digit()
             && chars.get(i + 1) == Some(&':')
             && (i == 0 || !chars[i - 1].is_ascii_digit());
         if key {
-            starts.push(cell);
+            starts.push(columns.column());
         }
-        cell += crate::question::cells(c.encode_utf8(&mut [0; 4]));
+        columns.step(c);
     }
     (starts.first() == Some(&2)).then_some(starts)
 }
@@ -132,11 +132,31 @@ fn is_parked(row: &str, width: usize) -> bool {
             .is_some_and(|g| crate::text::trim_start(g).starts_with("Tip:"))
 }
 
-/// The open rating card above the composer: its options ([`options_line`]) with only parked rows between them and the composer's top rule, a `●` question row in column 0 within [`MAX_ABOVE_OPTIONS`] rows above them, and only blank or column-2 rows between the two.
+/// The open rating card above the composer: its options ([`options_line`]) with only parked rows between them and the composer's top rule, a `●` question row in column 0 within [`MAX_ABOVE_OPTIONS`] rows above them, and only blank or column-2 rows between the two, each row read on the screen's transcript ([`card_rows`]).
 #[must_use]
 pub fn survey_block(rows: &[String]) -> Option<SurveyBlock> {
+    survey_block_on(&Transcript::of(rows))
+}
+
+/// THE ROWS A CARD OVER THE COMPOSER IS READ ON: the screen's transcript ([`Transcript`], each
+/// row above the composer's top rule cut at the side panel's rule) and the room those rows are
+/// laid out in, the rule's column beside the panel and the composer's width with none. Claude Code
+/// 2.1.310 and later draw the panel beside every row down to that top rule, the cards' included,
+/// and pad each out to the rule, so read whole a card row ended in its padding and the rule: a
+/// blank row under the card was no parked row and its rows were no card's (found in review,
+/// 2026-11-05; `a_card_parked_over_the_composer_beside_the_side_panel_is_parked`).
+fn card_rows<'t>(
+    transcript: &'t Transcript<'_>,
+) -> Option<(&'t [String], crate::phase::Frame, usize)> {
+    let rows: &[String] = &transcript.rows;
     let frame = composer_frame(rows)?;
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    let width = transcript.room(crate::text::trim_end(&rows[frame.bottom]).chars().count());
+    Some((rows, frame, width))
+}
+
+/// [`survey_block`] on a screen's transcript.
+fn survey_block_on(transcript: &Transcript<'_>) -> Option<SurveyBlock> {
+    let (rows, frame, width) = card_rows(transcript)?;
     let parked_under = |last: usize| {
         rows[last + 1..frame.top]
             .iter()
@@ -219,11 +239,15 @@ fn guard_of(question: &str) -> String {
     format!("^●.{}", crate::anchors::guard_regex(&words.join(" ")))
 }
 
-/// The Claude-drafted-feedback card (`✻ Bug report drafted: <title>` over its preview and `1 to review · 2 to send · 0 to dismiss`), parked in the same slot.
+/// The Claude-drafted-feedback card (`✻ Bug report drafted: <title>` over its preview and `1 to review · 2 to send · 0 to dismiss`), parked in the same slot, read on the screen's transcript ([`card_rows`]).
 #[must_use]
 pub fn drafts_card(rows: &[String]) -> Option<(usize, usize)> {
-    let frame = composer_frame(rows)?;
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    drafts_card_on(&Transcript::of(rows))
+}
+
+/// [`drafts_card`] on a screen's transcript.
+fn drafts_card_on(transcript: &Transcript<'_>) -> Option<(usize, usize)> {
+    let (rows, frame, width) = card_rows(transcript)?;
     let hint = (1..frame.top).rev().find_map(|i| {
         if is_drafts_hint(&rows[i]) {
             Some(Some(i))
@@ -275,10 +299,15 @@ fn is_drafts_hint(row: &str) -> bool {
 /// at column 2, `  y: Yes    n: No     d: Don't ask again`) and the web-setup offer
 /// (`⏺ Pushed to GitHub. Connect GitHub to claude.ai …?` over
 /// `  1: Yes, run /web-setup   2: Not now   3: Don't ask again`).
+/// Each row is read on the screen's transcript ([`card_rows`]).
 #[must_use]
 pub fn ask_card(rows: &[String]) -> Option<(usize, usize)> {
-    let frame = composer_frame(rows)?;
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    ask_card_on(&Transcript::of(rows))
+}
+
+/// [`ask_card`] on a screen's transcript.
+fn ask_card_on(transcript: &Transcript<'_>) -> Option<(usize, usize)> {
+    let (rows, frame, width) = card_rows(transcript)?;
     let options = (1..frame.top).rev().find_map(|i| {
         if is_ask_options_row(&rows[i]) {
             Some(Some(i))
@@ -357,11 +386,9 @@ fn is_thanks_second_row(row: &str) -> bool {
         || row == const { crate::anchor!("survey.feedback_anytime") }
 }
 
-/// The rating's own aftermath, parked in the card's slot above the composer: the pending step (`Feedback: Bad · Esc to undo`, 3 s), then the thanks (`Thanks for the feedback!` over the follow-up offer, 5 s).
-#[must_use]
-pub(crate) fn rating_aftermath(rows: &[String]) -> Option<(usize, usize)> {
-    let frame = composer_frame(rows)?;
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+/// The rating's own aftermath, parked in the card's slot above the composer: the pending step (`Feedback: Bad · Esc to undo`, 3 s), then the thanks (`Thanks for the feedback!` over the follow-up offer, 5 s), read on a screen's transcript ([`card_rows`]).
+fn rating_aftermath(transcript: &Transcript<'_>) -> Option<(usize, usize)> {
+    let (rows, frame, width) = card_rows(transcript)?;
     let last = (1..frame.top)
         .rev()
         .find(|&i| !is_parked(&rows[i], width))?;
@@ -375,14 +402,15 @@ pub(crate) fn rating_aftermath(rows: &[String]) -> Option<(usize, usize)> {
     }
 }
 
-/// The rows the readers step over as one parked block: the open rating card ([`survey_block`]), the drafts card ([`drafts_card`]), an ask card ([`ask_card`]) or the rating's own aftermath ([`rating_aftermath`]).
+/// The rows the readers step over as one parked block: the open rating card ([`survey_block`]), the drafts card ([`drafts_card`]), an ask card ([`ask_card`]) or the rating's own aftermath ([`rating_aftermath`]), each read on the screen's transcript ([`card_rows`]; rows already cut are their own transcript).
 #[must_use]
 pub(crate) fn parked_span(rows: &[String]) -> Option<(usize, usize)> {
-    survey_block(rows)
+    let transcript = Transcript::of(rows);
+    survey_block_on(&transcript)
         .map(|b| (b.head, b.options))
-        .or_else(|| drafts_card(rows))
-        .or_else(|| ask_card(rows))
-        .or_else(|| rating_aftermath(rows))
+        .or_else(|| drafts_card_on(&transcript))
+        .or_else(|| ask_card_on(&transcript))
+        .or_else(|| rating_aftermath(&transcript))
 }
 
 #[cfg(test)]
@@ -634,13 +662,17 @@ mod tests {
             ),
         ] {
             let done = screen(text);
-            assert_eq!(rating_aftermath(&done), Some(span), "{text:.90}");
+            assert_eq!(
+                rating_aftermath(&Transcript::of(&done)),
+                Some(span),
+                "{text:.90}"
+            );
             assert!(!survey_open(&done));
             assert_eq!(worker_phase(&done), Phase::Idle);
             assert_eq!(last_said_row(&done), Some(REPLY));
             let mut esc = done.clone();
             esc[9] = INTERRUPTED.to_string();
-            assert_eq!(rating_aftermath(&esc), Some(span));
+            assert_eq!(rating_aftermath(&Transcript::of(&esc)), Some(span));
             assert_eq!(last_said_row(&esc), Some(INTERRUPTED), "{text:.90}");
             assert!(transcript_end(&esc) <= span.0, "{text:.90}");
             let quoted: Vec<String> = esc
@@ -654,7 +686,7 @@ mod tests {
                     }
                 })
                 .collect();
-            assert_eq!(rating_aftermath(&quoted), None);
+            assert_eq!(rating_aftermath(&Transcript::of(&quoted)), None);
             assert_eq!(
                 last_said_row(&quoted),
                 Some(quoted[span.1].as_str()),
@@ -662,7 +694,11 @@ mod tests {
             );
             let mut other = esc.clone();
             other[span.0] = "Feedback: Great · Esc to undo".to_string();
-            assert_eq!(rating_aftermath(&other), None, "{text:.90}");
+            assert_eq!(
+                rating_aftermath(&Transcript::of(&other)),
+                None,
+                "{text:.90}"
+            );
         }
     }
 

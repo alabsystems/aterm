@@ -164,7 +164,9 @@ fn removal_preflight_reports_the_exact_batch_without_writing_it() {
 
 /// A removal plan that would pass one of the log's budgets is refused whole, before anything is
 /// written, with that budget named: each budget alone refuses, set one record short of what the
-/// plan needs of it.
+/// plan needs of it. Of the keyed budget the plan needs its own records and the room of the
+/// re-keys its removal makes due (one-mesh §8, `client::remove::RemovalFill`): with only its own
+/// room it refuses with that fill, and a keyed record short of the fill's room it refuses so too.
 ///
 /// NEGATIVE CONTROL (in the test): under budgets with exactly the plan's need of room in each,
 /// the same plan is prepared, so each refusal is its own budget's boundary.
@@ -186,11 +188,29 @@ fn a_removal_plan_that_would_pass_a_budget_is_refused_whole() {
         will.weighed > was.weighed && will.keyed > was.keyed,
         "{was:?} to {will:?}"
     );
-    let exact = RecordBudgets {
+    let own = RecordBudgets {
         weighed: will.weighed,
         keyed: will.keyed,
         held: will.held(),
     };
+    let Err(reserved) = own.within(prepare) else {
+        panic!("a plan with no room for the re-keys it makes due was prepared");
+    };
+    let fill: Vec<usize> = reserved
+        .to_string()
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|word| !word.is_empty())
+        .map(|word| word.parse().unwrap())
+        .collect();
+    let [held_keyed, batch, worst, _] = fill.as_slice() else {
+        panic!("the fill: {reserved}");
+    };
+    let room = held_keyed + batch + worst;
+    assert!(
+        reserved.to_string().contains("the membership log is full") && room > will.keyed,
+        "the reserve binds the keyed budget: {reserved}"
+    );
+    let exact = RecordBudgets { keyed: room, ..own };
     assert!(
         exact.within(prepare).is_ok(),
         "the plan fits budgets with exactly its room"
@@ -205,7 +225,7 @@ fn a_removal_plan_that_would_pass_a_budget_is_refused_whole() {
         ),
         (
             RecordBudgets {
-                keyed: will.keyed - 1,
+                keyed: room - 1,
                 ..exact
             },
             Budget::Keyed,
@@ -221,6 +241,14 @@ fn a_removal_plan_that_would_pass_a_budget_is_refused_whole() {
         let Err(error) = short.within(prepare) else {
             panic!("a plan past its {budget:?} budget was prepared");
         };
+        if budget == Budget::Keyed {
+            assert!(
+                error.to_string().contains("the membership log is full"),
+                "{budget:?}: {error}"
+            );
+            assert_eq!(std::fs::read(paths.records_file()).unwrap(), records);
+            continue;
+        }
         assert_eq!(
             error.kind(),
             crate::ErrorKind::MembershipCapacity,

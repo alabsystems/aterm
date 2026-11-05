@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `codex-alab-proof`: the codex-alab native harness, end to end (its contract, `alab/CONTRACT.md` §9.3, and Autopilot Cruise / Land, the owner's its §5 ports), against the REAL package in a private headless aterm sandboxed to one loopback port where the lab answers as the model ([`crate::codex_rig`], [`crate::codex_alab_model`]): no key, no account, no byte off the machine, nothing of the owner's touched. `--upgrade-package` selects another package for the handoff; `--upgrade-only` runs only that lane; `--terminals-only` runs only the background terminals leg (survey `bg=` from codex-alab's own record, `codex_alab_terminals_proof.rs`).
+//! `codex-alab-proof`: the codex-alab native harness, end to end (its contract, `alab/CONTRACT.md` §9.3, and Autopilot Cruise / Land, the owner's its §5 ports), against the REAL package in a private headless aterm sandboxed to one loopback port where the lab answers as the model ([`crate::codex_rig`], [`crate::codex_alab_model`]): no key, no account, no byte off the machine, nothing of the owner's touched. `--upgrade-package` selects another package for the handoff; `--upgrade-only` runs only that lane; `--terminals-only` runs only the background terminals leg (survey `bg=` from codex-alab's own record, `codex_alab_terminals_proof.rs`); `--facts-only` runs only the facts leg (aterm's no-progress fact riding codex-alab's continuation once per stall, `codex_alab_facts_proof.rs`, gap 23), which the default run does not include yet; `--capacity-only` runs only the capacity lane (the package's `codex exec` recovering from a capacity answer in a jail of its own, no aterm, `codex_alab_capacity_proof.rs`), which the full proof runs last, once its instance is gone. One run takes at most one `--*-only` lane ([`Lane`]).
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,10 @@ use crate::codex_rig;
 
 #[path = "codex_boxes.rs"]
 mod boxes;
+#[path = "codex_alab_capacity_proof.rs"]
+mod capacity_proof;
+#[path = "codex_alab_facts_proof.rs"]
+mod facts_proof;
 #[path = "codex_alab_policy_proof.rs"]
 mod policy_proof;
 #[path = "codex_alab_terminals_proof.rs"]
@@ -150,12 +154,14 @@ struct Opening {
 
 /// The legs whose scenes `autopilot-captures` shows ([`Proof::open_leg`]): `land` (landing, then
 /// its nudges), `reland` (a clean defense: landed), `off` (Autopilot Off on its first turn),
-/// `needs` (a `NEEDS YOU:` need) and `continue` (Cruise). The model answers each by its name
-/// ([`model::answerer`]). `continue` runs under the jail alone: its continuation's failing command
-/// must really exit 3, and codex's own sandbox cannot apply inside the instance's jail, where its
-/// 71 says `Operation not permitted`, which codex's denial check reads as a denial and asks to
-/// escalate ([`CodexSandbox`]). The others run no command, or escalate each.
-const OPENINGS: [(&str, Opening); 5] = [
+/// `needs` (a `NEEDS YOU:` need), `continue` (Cruise) and `facts` (`--facts-only`, gap 23: a
+/// call stalled behind a stopped holder's lock). The model answers each by its name
+/// ([`model::answerer`]). `continue` and `facts` run under the jail alone: their calls must really
+/// run (`continue`'s failing command must exit 3, `facts`' two calls must take and wait on a
+/// lock), and codex's own sandbox cannot apply inside the instance's jail, where its 71 says
+/// `Operation not permitted`, which codex's denial check reads as a denial and asks to escalate
+/// ([`CodexSandbox`]). The others run no command, or escalate each.
+const OPENINGS: [(&str, Opening); 6] = [
     (
         "land",
         Opening {
@@ -197,6 +203,15 @@ const OPENINGS: [(&str, Opening); 5] = [
         Opening {
             prompt: "Write a plan, then stop.",
             folder: Folder::Scratch,
+            autopilot: None,
+            sandbox: CodexSandbox::Jail,
+        },
+    ),
+    (
+        "facts",
+        Opening {
+            prompt: "Start the watcher, then work through the plan.",
+            folder: Folder::Plain,
             autopilot: None,
             sandbox: CodexSandbox::Jail,
         },
@@ -463,6 +478,27 @@ fn nudges_before_landing(acts: &[String]) -> usize {
         .count()
 }
 
+/// Whether `program`'s bytes hold either form of codex-alab's cleared line.
+fn holds_cleared_line(program: &[u8]) -> bool {
+    crate::codex_alab_model::LIMIT_CLEARED.iter().any(|line| {
+        program
+            .windows(line.len())
+            .any(|window| window == line.as_bytes())
+    })
+}
+
+/// Whether an `await task` row is its task's last word: a reaped worker's reads `state=closed`,
+/// and what ended it is in `conclusion=` and `why=` either way.
+fn concluded(row: &str) -> bool {
+    field(row, "conclusion").is_some_and(|word| word != "-")
+}
+
+/// Whether an `await task` row says its worker's work landed.
+fn landed_row(row: &str) -> bool {
+    field(row, "conclusion").as_deref() == Some("finished")
+        && field(row, "why").as_deref() == Some("landed")
+}
+
 fn first_at(rows: &[J], tag: &str) -> Option<i64> {
     rows.iter()
         .find(|r| {
@@ -523,8 +559,9 @@ fn ms_of(d: Duration) -> i64 {
 /// fetch writes the remote's reflog, never this one). A commit's own date holds whole seconds,
 /// which reads a commit up to a second past a hold as inside it.
 fn committed_ms(proj: &Path) -> Option<i64> {
-    let at = std::fs::metadata(proj.join(".git/logs/refs/heads/main"))
-        .ok()?
+    let at = std::fs::symlink_metadata(proj.join(".git/logs/refs/heads/main"))
+        .ok()
+        .filter(std::fs::Metadata::is_file)?
         .modified()
         .ok()?;
     i64::try_from(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis()).ok()
@@ -1167,7 +1204,7 @@ impl Proof {
 
     fn lay_folder(&self, dir: &Path, proj: &Path, folder: Folder) -> Result<(), String> {
         let readme = proj.join("README.md");
-        std::fs::write(&readme, "# lab scratch project\n")
+        crate::util::write_fresh(&readme, "# lab scratch project\n")
             .map_err(|e| format!("{}: {e}", readme.display()))?;
         match folder {
             Folder::Plain => Ok(()),
@@ -1183,7 +1220,7 @@ impl Proof {
                 self.git(proj, &["push", "-q", "-u", "origin", "main"])?;
                 self.git(proj, &["remote", "set-head", "origin", "main"])?;
                 let notes = proj.join(NOTES);
-                std::fs::write(&notes, "# release notes\n\n- the lab's change\n")
+                crate::util::write_fresh(&notes, "# release notes\n\n- the lab's change\n")
                     .map_err(|e| format!("{}: {e}", notes.display()))
             }
         }
@@ -1282,6 +1319,13 @@ impl Proof {
             .map_or_else(PathBuf::new, |d| d.join("images"))
     }
 
+    /// Whether the package under proof holds codex-alab's one cleared line. A package that cannot
+    /// be read is held to the line, so a broken rig fails rather than skips.
+    fn package_holds_cleared_line(&self) -> bool {
+        std::fs::read(self.s.join("pkg-a").join("bin").join("codex"))
+            .map_or(true, |program| holds_cleared_line(&program))
+    }
+
     /// The package's version (`alab-build.json`'s), for the captures' headers.
     pub(crate) fn package_version(&self) -> String {
         crate::util::read_regular_text(
@@ -1364,8 +1408,8 @@ impl Proof {
             let proj = std::fs::canonicalize(&proj).map_err(io)?;
             let dir = std::fs::canonicalize(&dir).map_err(io)?;
             self.lay_folder(&dir, &proj, folder)?;
-            std::fs::write(
-                home.join("config.toml"),
+            crate::util::write_fresh(
+                &home.join("config.toml"),
                 codex_config(self.port, &proj, &home, self.sandbox, extra),
             )
             .map_err(io)?;
@@ -1446,8 +1490,8 @@ impl Proof {
             std::fs::create_dir_all(&proj).map_err(io)?;
             let proj = std::fs::canonicalize(&proj).map_err(io)?;
             self.lay_folder(&dir, &proj, Folder::Plain)?;
-            std::fs::write(
-                home.join("config.toml"),
+            crate::util::write_fresh(
+                &home.join("config.toml"),
                 codex_config(self.port, &proj, &home, self.sandbox, ""),
             )
             .map_err(io)?;
@@ -1480,6 +1524,18 @@ impl Proof {
             ),
             sid.is_some(),
         );
+        if let Some(sid) = &sid {
+            // Read here, not at the worker's leg: a worker that landed is reaped by then, and a
+            // closed tab has no `autopilot=`.
+            let land = Self::wait_for(Duration::from_secs(60), Duration::from_millis(250), || {
+                field(&self.status(sid), "autopilot").as_deref() == Some("land")
+            })?;
+            let word = field(&self.status(sid), "autopilot").unwrap_or_default();
+            self.check(
+                &format!("worker: its tab runs under Autopilot Land (status autopilot={word})"),
+                land,
+            );
+        }
         Ok(sid.map(|sid| {
             println!("  leg {name}: tab {sid}");
             Leg {
@@ -1496,11 +1552,6 @@ impl Proof {
     /// `await task` wakes on its task `done why=landed`, and `result` reads
     /// its report out of codex's own rollout.
     fn worker_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
-        let word = field(&self.status(&leg.sid), "autopilot").unwrap_or_default();
-        self.check(
-            &format!("worker: its tab runs under Autopilot Land (status autopilot={word})"),
-            word == "land",
-        );
         let at = format!("@{}", leg.sid);
         let (mut since, mut row) = (0_u64, String::new());
         let end = Instant::now() + Duration::from_secs(240);
@@ -1515,7 +1566,7 @@ impl Proof {
                 .find(|l| l.starts_with(&format!("{at} ")))
                 .unwrap_or_default()
                 .to_string();
-            if field(&row, "state").as_deref() == Some("done") || !matches!(woke.code, 0 | 124) {
+            if concluded(&row) || !matches!(woke.code, 0 | 124) {
                 break;
             }
             since = field(&row, "rev")
@@ -1528,7 +1579,7 @@ impl Proof {
             &format!(
                 "worker: `await task` wakes on its landing and the task reads done why=landed ({row}; {task})"
             ),
-            field(&row, "state").as_deref() == Some("done")
+            landed_row(&row)
                 && field(&task, "state").as_deref() == Some("done")
                 && field(&task, "why").as_deref() == Some("landed"),
         );
@@ -1970,18 +2021,47 @@ impl Proof {
         self.claimed_boxes_hold(leg, Some(1))
     }
 
+    /// Whether the codex-alab under test reads `land_question_text`, the harness policy verb's
+    /// key for Land's dialog text: its entrypoint names the key.
+    fn reads_land_question_text(&self) -> bool {
+        let root = self.s.join("pkg-a");
+        let key = b"land_question_text";
+        std::fs::read_to_string(root.join(aterm_agent::harness::codex_alab::PACKAGE_JSON))
+            .ok()
+            .and_then(|t| aterm_agent::harness::codex_alab::package_entrypoint(&t))
+            .and_then(|e| std::fs::read(root.join(e)).ok())
+            .is_some_and(|bin| bin.windows(key.len()).any(|w| w == key))
+    }
+
     fn question_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        // The leg runs under Land: a codex-alab that reads Land's dialog text answers the overlay
+        // with it (answer-land@v1, as aterm's loop does), one before it with the (Recommended)
+        // option, today's pick.
+        let land = self.reads_land_question_text();
+        let (rule, said, how) = if land {
+            (
+                aterm_agent::supervise::policy::RULE_ANSWER_LAND,
+                aterm_agent::supervise::policy::question::LAND_TEXT,
+                "Land's dialog text",
+            )
+        } else {
+            (
+                "answer-recommended@v1",
+                "Postgres (Recommended)",
+                "its (Recommended) option: this codex-alab reads no land_question_text",
+            )
+        };
         let answered = Self::wait_for(Duration::from_secs(180), Duration::from_secs(1), || {
             self.requests("question").iter().any(|r| {
                 r.get("tool_output")
                     .and_then(J::as_str)
-                    .is_some_and(|o| o.contains("Postgres (Recommended)"))
+                    .is_some_and(|o| o.contains(said))
             })
         })?;
         let acts = self.acts(&leg.sid);
         self.check(
-            "question: the overlay is answered with its (Recommended) option (answer-recommended@v1: codex-alab's box answer under every word)",
-            answered && acts.iter().any(|a| a == "answer-recommended@v1"),
+            &format!("question: under Land the overlay is answered with {how} ({rule})"),
+            answered && acts.iter().any(|a| a == rule),
         );
         let land_answer = self.await_act(leg, "land-answer@v1", Duration::from_secs(240))?;
         let asked = self.await_tag(leg, "land-answer", Duration::from_secs(60))?;
@@ -2303,7 +2383,20 @@ impl Proof {
 
     fn usage_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
         let resumed_act = self.await_act(leg, "usage-resume@v1", Duration::from_secs(300))?;
-        let asked = self.await_tag(leg, "continue", Duration::from_secs(60))?;
+        // The resume types the one cleared line, never Cruise's continuation (codex-alab's
+        // `alab/forever-cruise`, aterm `77161d6432`). A package built before that lane holds
+        // neither form and types Cruise's continuation: a named skip, never a pass, with the wait
+        // judged on what it typed; a package that holds the line and types anything else fails.
+        let cleared_line = self.package_holds_cleared_line();
+        let step = if cleared_line { "cleared" } else { "continue" };
+        let asked = self.await_tag(leg, step, Duration::from_secs(60))?;
+        let resume_tag = format!("usage:{step}");
+        if !cleared_line {
+            self.unobserved(
+                "usage: no cleared line typed (this codex-alab package holds neither form; it \
+                 types Cruise's continuation at the reset until alab/forever-cruise ships)",
+            );
+        }
         let rows = self.requests("usage");
         let limited: Vec<&J> = rows.iter().filter(|r| int_of(r, "status") == 429).collect();
         let limit_at = limited.first().map(|r| int_of(r, "t"));
@@ -2321,7 +2414,7 @@ impl Proof {
             })
             .map(|r| str_of(r, "tag"))
             .collect();
-        let resumed = first_at(&rows, "usage:continue");
+        let resumed = first_at(&rows, &resume_tag);
         if let (Some(reset), Some(at)) = (reset, resumed) {
             println!(
                 "    usage: resets_at={reset}; resumed {} after it",
@@ -2339,7 +2432,7 @@ impl Proof {
         );
         let sent: Vec<(String, i64)> = rows
             .iter()
-            .filter(|r| str_of(r, "tag").starts_with("usage:continue"))
+            .filter(|r| str_of(r, "tag").starts_with(&resume_tag))
             .map(|r| (str_of(r, "turn"), int_of(r, "n")))
             .collect();
         let twice = sent.iter().enumerate().any(|(i, s)| sent[..i].contains(s));
@@ -2347,7 +2440,7 @@ impl Proof {
         let resumes = acts.iter().filter(|a| *a == "usage-resume@v1").count();
         self.check(
             &format!(
-                "usage: then resumed once (usage-resume@v1 x{resumes}) and the model asked again, no request sent twice (turn, items: {sent:?}; acts: {})",
+                "usage: then resumed once (usage-resume@v1 x{resumes}) with `{resume_tag}`, and the model asked again, no request sent twice (turn, items: {sent:?}; acts: {})",
                 acts.join(" ")
             ),
             resumed_act && asked && resumes == 1 && !twice,
@@ -3666,7 +3759,11 @@ impl Proof {
 
     fn end_all(&mut self) {
         codex_rig::end_all(self.inst.pid, &self.s);
-        self.inst.stop();
+        if let Err(why) = self.inst.stop() {
+            self._world.keep();
+            self.check("private instance cleanup completed", false);
+            eprintln!("codex-alab-proof: instance cleanup failed: {why}");
+        }
         self.fabric.stop();
     }
 }
@@ -3782,49 +3879,110 @@ pub(crate) fn proof_lock(path: &Path, limit: Duration) -> Result<crate::aos_lear
     })
 }
 
-/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|partial] [--policy-only|--terminals-only|--upgrade-only|--raw-upgrade-only|--window-only]`
-/// (`--terminals-only`: the background terminals leg alone, about 1 min).
+/// The one lane a `codex-alab-proof` run is narrowed to, or the whole proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lane {
+    /// Every leg ([`legs`]), then the capacity lane once the instance is gone.
+    Full,
+    /// `--policy-only`: the cybersecurity-refusal leg ([`policy_proof`]).
+    Policy,
+    /// `--terminals-only`: the background terminals leg ([`terminals_proof`]).
+    Terminals,
+    /// `--facts-only`: the facts leg ([`facts_proof`]).
+    Facts,
+    /// `--upgrade-only`: one live handoff ([`upgrade_proof::legs`]).
+    Upgrade,
+    /// `--raw-upgrade-only`: started through the produced primary with its managed entry absent,
+    /// then a live handoff ([`upgrade_proof::raw_legs`]).
+    RawUpgrade,
+    /// `--window-only`: the window leg ([`window_proof`]).
+    Window,
+    /// `--capacity-only`: the capacity lane alone ([`capacity_proof`]), with no aterm.
+    Capacity,
+}
+
+impl Lane {
+    /// Whether `--upgrade-package` means anything to it: only a run that hands off does.
+    const fn hands_off(self) -> bool {
+        matches!(self, Self::Full | Self::Upgrade | Self::RawUpgrade)
+    }
+
+    /// Whether the capacity lane runs once its legs (`legs`) are done ([`settle`]): it is the
+    /// capacity lane, or the full proof whose legs came back `Ok` (one that failed or was
+    /// interrupted ends there).
+    const fn runs_capacity(self, legs: &Result<(), Fail>) -> bool {
+        match self {
+            Self::Capacity => true,
+            Self::Full => legs.is_ok(),
+            Self::Policy
+            | Self::Terminals
+            | Self::Facts
+            | Self::Upgrade
+            | Self::RawUpgrade
+            | Self::Window => false,
+        }
+    }
+}
+
+/// Each `--*-only` flag and the lane it narrows a run to.
+const ONLY: [(&str, Lane); 7] = [
+    ("--policy-only", Lane::Policy),
+    ("--terminals-only", Lane::Terminals),
+    ("--facts-only", Lane::Facts),
+    ("--upgrade-only", Lane::Upgrade),
+    ("--raw-upgrade-only", Lane::RawUpgrade),
+    ("--window-only", Lane::Window),
+    ("--capacity-only", Lane::Capacity),
+];
+
+/// What one `codex-alab-proof` command line asks for.
+#[derive(Debug, PartialEq, Eq)]
+struct Asked {
+    keep: bool,
+    lane: Lane,
+    aterm: Option<String>,
+    package: Option<String>,
+    upgrade_package: Option<String>,
+    expect: Option<bool>,
+}
+
+/// Read a `codex-alab-proof` command line: at most one `--*-only` flag ([`ONLY`]),
+/// `--upgrade-package` only where the run hands off ([`Lane::hands_off`]), and no `--aterm` or
+/// `--expect-rollout` beside `--capacity-only`, which runs no aterm and no rollout leg.
 /// # Errors
-/// Usage, a run that could not start, or an interrupt.
-pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
-    stop::install();
+/// Usage: two lanes, an option its lane does not take, a value missing, or an unknown word.
+fn asked(args: &[String]) -> Result<Asked, Fail> {
     let mut a = args.to_vec();
     let keep = instance::take_flag(&mut a, "--keep");
-    let policy_only = instance::take_flag(&mut a, "--policy-only");
-    let terminals_only = instance::take_flag(&mut a, "--terminals-only");
-    let upgrade_only = instance::take_flag(&mut a, "--upgrade-only");
-    let raw_upgrade_only = instance::take_flag(&mut a, "--raw-upgrade-only");
-    let window_only = instance::take_flag(&mut a, "--window-only");
+    let named: Vec<(&str, Lane)> = ONLY
+        .into_iter()
+        .filter(|(flag, _)| instance::take_flag(&mut a, flag))
+        .collect();
     let aterm = instance::take_value(&mut a, "--aterm")?;
-    let given = instance::take_value(&mut a, "--package")?;
-    let upgrade_given = instance::take_value(&mut a, "--upgrade-package")?;
+    let package = instance::take_value(&mut a, "--package")?;
+    let upgrade_package = instance::take_value(&mut a, "--upgrade-package")?;
     let expect = expect_rollout(instance::take_value(&mut a, "--expect-rollout")?.as_deref())?;
-    if policy_only && (upgrade_only || raw_upgrade_only || upgrade_given.is_some()) {
+    let lane = match named.as_slice() {
+        [] => Lane::Full,
+        [(_, lane)] => *lane,
+        more => {
+            return Err(Fail::usage(format!(
+                "codex-alab-proof: choose one lane, not {}",
+                more.iter()
+                    .map(|(flag, _)| *flag)
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )));
+        }
+    };
+    if upgrade_package.is_some() && !lane.hands_off() {
         return Err(Fail::usage(
-            "codex-alab-proof: --policy-only cannot be combined with upgrade options",
+            "codex-alab-proof: --upgrade-package goes with the full proof, --upgrade-only or --raw-upgrade-only",
         ));
     }
-    if terminals_only
-        && (policy_only || upgrade_only || raw_upgrade_only || upgrade_given.is_some())
-    {
+    if lane == Lane::Capacity && (aterm.is_some() || expect.is_some()) {
         return Err(Fail::usage(
-            "codex-alab-proof: --terminals-only cannot be combined with --policy-only or upgrade options",
-        ));
-    }
-    if upgrade_only && raw_upgrade_only {
-        return Err(Fail::usage(
-            "codex-alab-proof: choose one upgrade-only mode",
-        ));
-    }
-    if window_only
-        && (policy_only
-            || terminals_only
-            || upgrade_only
-            || raw_upgrade_only
-            || upgrade_given.is_some())
-    {
-        return Err(Fail::usage(
-            "codex-alab-proof: --window-only cannot be combined with another lane or upgrade options",
+            "codex-alab-proof: --capacity-only runs no aterm and no rollout leg",
         ));
     }
     if let Some(extra) = a.first() {
@@ -3832,7 +3990,37 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
             "codex-alab-proof: unexpected '{extra}' ({LAB} help)"
         )));
     }
+    Ok(Asked {
+        keep,
+        lane,
+        aterm,
+        package,
+        upgrade_package,
+        expect,
+    })
+}
+
+/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|partial] [--policy-only|--terminals-only|--facts-only|--upgrade-only|--raw-upgrade-only|--window-only|--capacity-only]`
+/// (`--terminals-only`: the background terminals leg alone, about 1 min; `--facts-only`: the facts
+/// leg alone, about 7 min; `--capacity-only`: the capacity lane alone, with no aterm, about 10 s).
+/// # Errors
+/// Usage, a run that could not start, or an interrupt.
+pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
+    stop::install();
+    let Asked {
+        keep,
+        lane,
+        aterm,
+        package: given,
+        upgrade_package: upgrade_given,
+        expect,
+    } = asked(args)?;
     let not_run = |why: String| Fail::exit(3, format!("NOT RUN: {why}"));
+    if lane == Lane::Capacity {
+        let home = crate::paths::paths().need_store_home().map_err(not_run)?;
+        let pkg = package(given.as_deref(), home).map_err(not_run)?;
+        return capacity_alone(&pkg);
+    }
     let aterm = instance::resolve_aterm(aterm).map_err(not_run)?;
     let home = crate::paths::paths().need_store_home().map_err(not_run)?;
     let pkg = package(given.as_deref(), home).map_err(not_run)?;
@@ -3861,7 +4049,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     );
     if let Some(upgrade_pkg) = &upgrade_pkg {
         upgrade_proof::describe_package(upgrade_pkg)?;
-    } else if upgrade_only || raw_upgrade_only {
+    } else if matches!(lane, Lane::Upgrade | Lane::RawUpgrade) {
         println!("upgrade target: the same package bytes at another private path");
     }
     let mut proof = start(
@@ -3877,31 +4065,63 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     )?;
     proof.expect = expect;
     let (pkg_a, pkg_b) = (proof.s.join("pkg-a"), proof.s.join("pkg-b"));
-    let outcome = if raw_upgrade_only {
-        upgrade_proof::raw_legs(&mut proof, &pkg_a, &pkg_b)
-    } else if upgrade_only {
-        upgrade_proof::legs(&mut proof, &pkg_a, &pkg_b)
-    } else if policy_only {
-        policy_proof::legs(&mut proof, &pkg_a)
-    } else if terminals_only {
-        terminals_proof::legs(&mut proof, &pkg_a)
-    } else if window_only {
-        window_proof::legs(&mut proof, &pkg_a)
-    } else {
-        legs(&mut proof, &pkg_a, &pkg_b)
+    let outcome = match lane {
+        Lane::RawUpgrade => upgrade_proof::raw_legs(&mut proof, &pkg_a, &pkg_b),
+        Lane::Upgrade => upgrade_proof::legs(&mut proof, &pkg_a, &pkg_b),
+        Lane::Policy => policy_proof::legs(&mut proof, &pkg_a),
+        Lane::Terminals => terminals_proof::legs(&mut proof, &pkg_a),
+        Lane::Facts => facts_proof::legs(&mut proof, &pkg_a),
+        Lane::Window => window_proof::legs(&mut proof, &pkg_a),
+        Lane::Full => legs(&mut proof, &pkg_a, &pkg_b),
+        Lane::Capacity => unreachable!("--capacity-only returned before any instance started"),
     };
     proof.end_all();
-    if let Err(f) = outcome
-        && (f.stopped.is_some() || proof.fails.is_empty())
+    // The last leg, where the lane runs it ([`Lane::runs_capacity`]) and once the instance is
+    // gone: codex exec, alone in a jail of its own.
+    let s = proof.s.clone();
+    let jail = |port: u16| policy(port, crate::paths::paths(), &s);
+    settle(
+        lane,
+        outcome,
+        (&mut proof.oks, &mut proof.fails, &proof.unobserved),
+        || capacity_proof::lane(&pkg_a, &s.join("capacity"), &jail),
+    )
+}
+
+/// THE RUN'S END, once its legs (`legs`) are done and its instance is gone: the capacity lane
+/// (`capacity`) where `lane` runs it ([`Lane::runs_capacity`]), each of its checks counted into
+/// `oks` or `fails`; then the verdict. An interrupt, of a leg or of the capacity lane, ends the
+/// run as one; a leg's other `Err` ends it unless checks failed, which are then the verdict:
+/// exit 1 with each failure named, or 0 and the verdict line ([`verdict_line`]) naming every
+/// want the run could not observe (`unobserved`).
+/// # Errors
+/// An interrupt, or the legs' `Err` with no check failed.
+fn settle(
+    lane: Lane,
+    legs: Result<(), Fail>,
+    (oks, fails, unobserved): (&mut usize, &mut Vec<String>, &[String]),
+    capacity: impl FnOnce() -> Result<Vec<(String, bool)>, Stopped>,
+) -> Res {
+    if lane.runs_capacity(&legs) {
+        for (label, held) in capacity()? {
+            if held {
+                *oks += 1;
+            } else {
+                fails.push(label);
+            }
+        }
+    }
+    if let Err(f) = legs
+        && (f.stopped.is_some() || fails.is_empty())
     {
         return Err(f);
     }
-    if proof.fails.is_empty() {
-        println!("{}", verdict_line(&proof.unobserved));
+    if fails.is_empty() {
+        println!("{}", verdict_line(unobserved));
         Ok(0)
     } else {
-        println!("FAIL: {} check(s)", proof.fails.len());
-        for f in &proof.fails {
+        println!("FAIL: {} check(s)", fails.len());
+        for f in fails.iter() {
             println!("  - {f}");
         }
         Ok(1)
@@ -4015,8 +4235,8 @@ fn start(
         let log = Arc::clone(&api_log);
         let answer = model::answerer();
         std::thread::spawn(move || codex_rig::serve(listener, log, answer));
-        std::fs::write(
-            s.join("zdot/.zshrc"),
+        crate::util::write_fresh(
+            &s.join("zdot/.zshrc"),
             format!(
                 "PS1='%# '\nunsetopt PROMPT_SP\nHISTFILE=/dev/null\n\
                  export PATH=\"{bin}:{agents}:/usr/bin:/bin:/usr/sbin:/sbin\"\n\
@@ -4102,6 +4322,24 @@ fn start(
         sandbox: CodexSandbox::WorkspaceWrite,
         _world: world,
         _lock: lock,
+    })
+}
+
+/// `--capacity-only`: the capacity lane ([`capacity_proof`]) alone, in a scratch world of its own
+/// (always kept, as every proof's is), holding [`PROOF_LOCK`] as every proof run does, ended as
+/// every run is ([`settle`]).
+fn capacity_alone(pkg: &Path) -> Res {
+    let _lock = proof_lock(
+        &crate::paths::state_root(crate::sys::getuid()).join(PROOF_LOCK),
+        PROOF_LOCK_WAIT,
+    )?;
+    let mut world = World::new("")?;
+    world.keep();
+    let s = world.dir.clone();
+    let jail = |port: u16| policy(port, crate::paths::paths(), &s);
+    let (mut oks, mut fails) = (0, Vec::new());
+    settle(Lane::Capacity, Ok(()), (&mut oks, &mut fails, &[]), || {
+        capacity_proof::lane(pkg, &s.join("capacity"), &jail)
     })
 }
 
@@ -4328,6 +4566,42 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A WORKER'S LANDING READS LANDED WHATEVER BECAME OF ITS TAB: live or reaped. NEGATIVE CONTROLS:
+    /// a closed tab that did not land, a failed conclusion, and a row still running.
+    #[test]
+    fn a_landed_row_reads_landed_live_or_reaped() {
+        let row = |rest: &str| format!("@s-1 rev=2 {rest} task_news=1");
+        for landed in [
+            row("state=done conclusion=finished why=landed"),
+            row("state=closed conclusion=finished why=landed"),
+        ] {
+            assert!(concluded(&landed) && landed_row(&landed), "{landed}");
+        }
+        for ended in [
+            row("state=closed conclusion=failed why=exited"),
+            row("state=closed conclusion=finished why=exited"),
+        ] {
+            assert!(concluded(&ended) && !landed_row(&ended), "{ended}");
+        }
+        for running in [row("state=working"), row("state=working conclusion=-")] {
+            assert!(!concluded(&running) && !landed_row(&running), "{running}");
+        }
+    }
+
+    /// EITHER FORM OF THE CLEARED LINE COUNTS AS THE PACKAGE HOLDING IT. NEGATIVE CONTROL: Cruise's
+    /// continuation, which a package from before the line types, does not.
+    #[test]
+    fn a_package_holds_the_cleared_line_in_either_form() {
+        for line in crate::codex_alab_model::LIMIT_CLEARED {
+            let program = format!("\u{0}\u{1}[codex-alab] {line}\u{0}");
+            assert!(holds_cleared_line(program.as_bytes()), "{line}");
+        }
+        assert!(!holds_cleared_line(
+            crate::codex_alab_model::KEEP_GOING.as_bytes()
+        ));
+        assert!(!holds_cleared_line(b""));
+    }
 
     /// A PASS NAMES WHAT IT DID NOT OBSERVE: the land check's skip (no codex-alab build types it
     /// yet) rides the verdict line, never a bare `PASS`. Negative control: the line without the
@@ -5365,6 +5639,147 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
                 .is_some_and(|m| m.contains("not 'measured'")),
             "{:?}",
             f.msg
+        );
+    }
+
+    /// ONE LANE A RUN: each `--*-only` flag alone narrows the run to its lane and none runs the
+    /// full proof; any two together are refused, `--capacity-only` beside `--terminals-only`,
+    /// `--facts-only` or `--window-only` as beside the lanes its first port knew. Only a run that
+    /// hands off takes `--upgrade-package`, and `--capacity-only`, which starts no aterm and has
+    /// no rollout leg, takes neither `--aterm` nor `--expect-rollout`.
+    #[test]
+    fn a_run_takes_one_lane_and_only_the_options_that_lane_reads() {
+        let run =
+            |words: &[&str]| asked(&words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>());
+        let usage = |words: &[&str]| {
+            run(words).map_or_else(|f| f.code, |got| panic!("{words:?} was taken: {got:?}"))
+        };
+        assert_eq!(run(&[]).expect("the full proof").lane, Lane::Full);
+        for (flag, lane) in ONLY {
+            assert_eq!(run(&[flag]).expect(flag).lane, lane, "{flag}");
+            for (other, _) in ONLY.into_iter().filter(|(o, _)| *o != flag) {
+                assert_eq!(usage(&[flag, other]), 2, "{flag} {other}");
+            }
+        }
+        for lane in ["--upgrade-only", "--raw-upgrade-only"] {
+            assert!(run(&[lane, "--upgrade-package", "b"]).is_ok(), "{lane}");
+        }
+        assert!(
+            run(&["--upgrade-package", "b"]).is_ok(),
+            "the full proof hands off"
+        );
+        for lane in [
+            "--policy-only",
+            "--terminals-only",
+            "--facts-only",
+            "--window-only",
+            "--capacity-only",
+        ] {
+            assert_eq!(usage(&[lane, "--upgrade-package", "b"]), 2, "{lane}");
+        }
+        assert_eq!(usage(&["--capacity-only", "--aterm", "/a"]), 2);
+        assert_eq!(usage(&["--capacity-only", "--expect-rollout", "bound"]), 2);
+        let alone = run(&["--capacity-only", "--package", "/p", "--keep"]).expect("its package");
+        assert_eq!(
+            alone,
+            Asked {
+                keep: true,
+                lane: Lane::Capacity,
+                aterm: None,
+                package: Some("/p".to_string()),
+                upgrade_package: None,
+                expect: None,
+            }
+        );
+        assert_eq!(usage(&["--capacity-only", "extra"]), 2);
+    }
+
+    /// THE RUN'S END (review F2, F4): the capacity lane runs alone and as the full proof's last
+    /// leg once its legs held, each of its checks counted among the run's (a failed one named,
+    /// the run then exit 1); never after a leg failed or was interrupted, nor in another lane;
+    /// an interrupt during it ends the run as one (128 + the signal), never PASS. A leg's other
+    /// `Err` ends the run unless checks failed, which are then its verdict.
+    #[test]
+    fn the_runs_end_runs_the_capacity_lane_last_and_counts_its_checks() {
+        /// End a run in `lane` whose legs came back `legs` with `fails` failed and 5 held, the
+        /// capacity lane answering `capacity`: its result, whether the lane ran, and the
+        /// tally.
+        fn end(
+            lane: Lane,
+            legs: Result<(), Fail>,
+            fails: &[&str],
+            capacity: Result<Vec<(String, bool)>, Stopped>,
+        ) -> (Res, bool, usize, Vec<String>) {
+            let ran = std::cell::Cell::new(false);
+            let (mut oks, mut fails) = (5, fails.iter().map(ToString::to_string).collect());
+            let res = settle(lane, legs, (&mut oks, &mut fails, &[]), || {
+                ran.set(true);
+                capacity
+            });
+            (res, ran.get(), oks, fails)
+        }
+        let checks = |held: &[bool]| -> Result<Vec<(String, bool)>, Stopped> {
+            Ok(held
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (format!("capacity {i}"), *h))
+                .collect())
+        };
+
+        let (res, ran, oks, fails) = end(Lane::Full, Ok(()), &[], checks(&[true, true]));
+        assert!(ran && fails.is_empty());
+        assert_eq!(
+            (res.ok(), oks),
+            (Some(0), 7),
+            "the full proof counts its checks"
+        );
+        let (res, ran, oks, fails) = end(Lane::Full, Ok(()), &[], checks(&[true, false]));
+        assert!(ran);
+        assert_eq!((res.ok(), oks), (Some(1), 6));
+        assert_eq!(fails, ["capacity 1"], "a failed check is named");
+        let (res, ran, _, fails) = end(Lane::Capacity, Ok(()), &[], checks(&[false]));
+        assert!(ran);
+        assert_eq!((res.ok(), fails.len()), (Some(1), 1), "alone");
+        let (res, ran, ..) = end(Lane::Capacity, Ok(()), &[], checks(&[true]));
+        assert!(ran);
+        assert_eq!(res.ok(), Some(0));
+
+        let (res, ran, ..) = end(Lane::Full, Err(Fail::die("a leg")), &[], checks(&[true]));
+        assert!(!ran, "after a leg that failed");
+        assert_eq!(res.err().map(|f| (f.code, f.stopped)), Some((1, None)));
+        let stopped = Fail::from(Stopped(libc::SIGINT));
+        let (res, ran, ..) = end(
+            Lane::Full,
+            Err(stopped),
+            &["a leg's check"],
+            checks(&[true]),
+        );
+        assert!(!ran, "after an interrupted leg");
+        assert_eq!(
+            res.err().and_then(|f| f.stopped),
+            Some(libc::SIGINT),
+            "the interrupt wins over the failed checks"
+        );
+        let (res, ran, ..) = end(
+            Lane::Full,
+            Err(Fail::die("a leg")),
+            &["a leg's check"],
+            checks(&[true]),
+        );
+        assert!(!ran);
+        assert_eq!(res.ok(), Some(1), "the failed checks are the verdict");
+        for (flag, lane) in ONLY.into_iter().filter(|(_, l)| *l != Lane::Capacity) {
+            let (res, ran, oks, _) = end(lane, Ok(()), &[], checks(&[false]));
+            assert!(!ran, "{flag}");
+            assert_eq!((res.ok(), oks), (Some(0), 5), "{flag}");
+        }
+
+        let (res, ran, ..) = end(Lane::Full, Ok(()), &[], Err(Stopped(libc::SIGINT)));
+        assert!(ran);
+        assert_eq!(
+            res.err().map(|f| (f.code, f.stopped)),
+            Some((128 + libc::SIGINT, Some(libc::SIGINT))),
+            "an interrupt during the capacity lane ends the run as one"
         );
     }
 

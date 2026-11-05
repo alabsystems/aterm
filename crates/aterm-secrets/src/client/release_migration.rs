@@ -133,7 +133,7 @@ impl Rounds {
     }
 }
 
-fn roster_floor(paths: &Paths) -> crate::Result<u64> {
+pub(super) fn roster_floor(paths: &Paths) -> crate::Result<u64> {
     match fsx::read_private(&paths.dir.join("release-ring-roster-floor"), 32)? {
         None => Ok(0),
         Some(bytes) => bytes

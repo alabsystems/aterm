@@ -12,6 +12,7 @@ pub mod auto_mode;
 pub mod autocompact;
 pub mod chrome_intro;
 pub mod codex;
+pub mod command;
 pub mod credits;
 pub mod disk_full;
 pub mod grok;
@@ -46,6 +47,7 @@ pub use announcement::{
     announcement_scrolled, announcement_unmoved,
 };
 pub use autocompact::{Offer, OfferFocus};
+pub use command::{CLAUDE_EXIT_WORDS, DraftCommand, draft_command};
 pub use harness_version::{
     CliHarness, HarnessVersion, cli_build_later, cli_version_build, cli_version_core,
     cli_version_later, cli_version_offered,
@@ -78,9 +80,9 @@ pub use reader::{
     retired_agent, shell_alone,
 };
 pub use reset::{
-    ConfirmRead, ResetConfirm, ResetKind, ResetLine, ResetPending, ResetRow, reset_confirm,
-    reset_limit_name, reset_limit_names, reset_line, reset_pending, reset_row, reset_title,
-    spends_reset, uses_a_reset,
+    ConfirmRead, ResetConfirm, ResetKind, ResetLine, ResetPending, ResetRow, ResetSight,
+    ResetSighting, reset_confirm, reset_limit_name, reset_limit_names, reset_line, reset_pending,
+    reset_row, reset_sighting, reset_title, spends_reset, uses_a_reset,
 };
 pub use retry_after::retry_after;
 pub use survey::{SurveyBlock, SurveyKind, survey_block};

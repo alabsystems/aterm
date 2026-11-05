@@ -54,16 +54,16 @@ pub(super) fn lab_read(
     complete: bool,
     inventory: impl FnOnce() -> Inventory,
     held: Option<Inventory>,
-    project: impl FnOnce() -> LabView,
-) -> LabRead {
+    project: impl FnOnce() -> Result<LabView>,
+) -> Result<LabRead> {
     if !complete {
-        return LabRead::Partial;
+        return Ok(LabRead::Partial);
     }
     let inventory = inventory();
     if held == Some(inventory) {
-        return LabRead::Unchanged;
+        return Ok(LabRead::Unchanged);
     }
-    LabRead::Projected(Box::new(project()), inventory)
+    Ok(LabRead::Projected(Box::new(project()?), inventory))
 }
 
 /// The declaration of the registry generation `compiled`.
@@ -100,12 +100,12 @@ fn quota_room(session: &Session<'_>, log: &Log, view: &View, reserve: usize) -> 
 }
 
 /// The Commons uuids of the current members.
-fn live_uuids(session: &Session<'_>) -> BTreeSet<String> {
-    session
-        .members()
+fn live_uuids(session: &Session<'_>) -> Result<BTreeSet<String>> {
+    Ok(session
+        .members()?
         .iter()
         .map(|binding| keys::uuid32(binding.machine()))
-        .collect()
+        .collect())
 }
 
 /// The label a row of this Mac carries: the membership log's, else the vault roster's row for this
@@ -144,7 +144,7 @@ fn me(
     trust: aterm_secrets::commons::journal::Trust,
     probe: &Probe,
 ) -> Result<Me> {
-    let members = session.members();
+    let members = session.members()?;
     let actor = session.actor();
     let binding = members
         .iter()
@@ -156,7 +156,8 @@ fn me(
         .flatten()
         .and_then(|(log, _)| log.membership().label(&actor).map(str::to_owned));
     let recipient = binding.recipient().to_bech32();
-    let roster = aterm_secrets::client::swarm_roster(paths).ok().flatten();
+    let roster = aterm_secrets::client::swarm_roster_until(paths, crate::admission::deadline())
+        .map_err(crate::table::failure)?;
     let (rostered, enrolled_ms) = roster_identity(roster.as_ref(), &recipient);
     Ok(Me {
         uuid: keys::uuid32(binding.machine()),
@@ -184,7 +185,7 @@ fn planned(
     now_ms: u64,
 ) -> Result<register::Plan> {
     let me = me(session, trust, probe)?;
-    let live = live_uuids(session);
+    let live = live_uuids(session)?;
     let input = Input {
         me: &me,
         probe,
@@ -271,11 +272,20 @@ impl Registry {
     /// reveal a held cell; or the next seed and its causal joins exceed this Mac's remaining
     /// automatic-record quota.
     pub fn seed(&self) -> Result<Seeded> {
+        self.seed_until(crate::admission::deadline())
+    }
+
+    /// [`Self::seed`] held to `deadline`, for a command a person runs and waits on.
+    ///
+    /// # Errors
+    /// As [`Self::seed`], and `deadline` passes first.
+    pub fn seed_until(&self, deadline: std::time::Instant) -> Result<Seeded> {
         let compiled = self.generation();
-        application::with_store(
+        application::with_store_until(
             &self.paths,
             true,
             descriptor(compiled),
+            deadline,
             |session, store, scope| {
                 session.writer()?;
                 let mut seeded = Seeded::default();
@@ -324,6 +334,19 @@ impl Registry {
         Ok(Some(compiled.descriptor(bootstrap.trust())?.scope.digest()))
     }
 
+    /// What this Mac's catalog says of the registry: the catalog's table id, and whether a Mac
+    /// other than this one declared the registry in it. Only an owner's import declares it, so a
+    /// declaration from another Mac says the lab holds the registry. A Mac that holds it holds
+    /// that declaration, so where none is here a peer's fresh round over the catalog that brought
+    /// nothing says that peer holds none of the registry (the import's empty-view guard,
+    /// `alab::command`). `None` where there is no Commons here.
+    ///
+    /// # Errors
+    /// Custody, membership or the catalog's storage cannot be read.
+    pub fn catalog_word(&self) -> Result<Option<(Digest, bool)>> {
+        application::peek_declared_elsewhere(&self.paths, descriptor(self.generation()))
+    }
+
     /// The Commons uuids of the current members, what `check` calls live.
     ///
     /// # Errors
@@ -331,7 +354,7 @@ impl Registry {
     pub fn live_uuids(&self) -> Result<BTreeSet<String>> {
         let compiled = self.generation();
         application::observe_store(&self.paths, descriptor(compiled), |session, _, _| {
-            Ok(live_uuids(session))
+            live_uuids(session)
         })
     }
 
@@ -410,12 +433,12 @@ impl Registry {
     /// `mailbox-obs` row and the birth of the address being signed in, in one record within
     /// discovery's share of this Mac's quota ([`discover::REGISTRATION_RESERVE`]), only where the
     /// row's content changed ([`discover::plan`]). It reads `[commons]` first, as a registration pass does, and never
-    /// declares the registry. The mailbox is this Mac's mailbox key for the login
-    /// ([`super::command::MAILBOX_KEYS`]) where the importer left one here.
+    /// declares the registry. The mailbox is the row its login's address key derives
+    /// ([`keys::mailbox_pk`]).
     ///
     /// # Errors
-    /// `config` is not a valid file; this Mac holds no catalog yet or is no Writer; the registry
-    /// or this Mac's mailbox keys cannot be read; or the registry cannot be written.
+    /// `config` is not a valid file; this Mac holds no catalog yet or is no Writer; or the
+    /// registry cannot be read or written.
     pub fn observe_mailbox(
         &self,
         config: &Path,
@@ -434,20 +457,10 @@ impl Registry {
                 _ => discover::Outcome::NotHeld,
             }));
         }
-        let mailbox_keys = super::command::read_keys(&self.paths)?;
-        let keyed = mailbox_keys.pk_of(&listing.login).or_else(|| {
-            let own: std::collections::BTreeSet<&str> = listing
-                .listed
-                .iter()
-                .filter(|listed| listed.own)
-                .filter_map(|listed| mailbox_keys.pk_of(&listed.addr))
-                .collect();
-            if own.len() == 1 {
-                own.into_iter().next()
-            } else {
-                None
-            }
-        });
+        // The open mailbox's key derives from its login's address key (`keys::mailbox_pk`).
+        let keyed = keys::address_pk(&listing.login)
+            .and_then(|login| keys::mailbox_pk(&login))
+            .ok();
         application::with_store(
             &self.paths,
             false,
@@ -462,7 +475,7 @@ impl Registry {
                 }
                 let actor = session.actor();
                 let uuid = session
-                    .members()
+                    .members()?
                     .iter()
                     .find(|binding| binding.actor() == actor)
                     .map(|binding| keys::uuid32(binding.machine()))
@@ -475,7 +488,7 @@ impl Registry {
                 let input = discover::Input {
                     uuid: &uuid,
                     listing,
-                    keyed,
+                    keyed: keyed.as_deref(),
                     now_ms,
                 };
                 let plan = discover::plan(&input, &view.cells, &obs)?;
@@ -570,19 +583,19 @@ impl Registry {
                 let project = || {
                     let actor = session.actor();
                     let uuid = session
-                        .members()
+                        .members()?
                         .iter()
                         .find(|binding| binding.actor() == actor)
                         .map(|binding| keys::uuid32(binding.machine()));
                     let owned = |name: &str| view.owned.get(name).cloned().unwrap_or_default();
-                    LabView::read(
+                    Ok(LabView::read(
                         &view.cells,
                         &owned(MACHINE_FACTS.name),
                         &owned(MAILBOX_OBS.name),
                         uuid.as_deref(),
-                    )
+                    ))
                 };
-                Ok(lab_read(view.complete, inventory, held, project))
+                lab_read(view.complete, inventory, held, project)
             },
         )?;
         Ok(seen)
@@ -629,9 +642,8 @@ impl Registry {
     }
 
     /// Append `records` as this Mac, one record each (tests drive owner edits, births and
-    /// owned rows with it, and `lab alab-roll` on its scratch custodies). Absent from release builds.
-    #[cfg(any(test, debug_assertions))]
-    #[doc(hidden)]
+    /// owned rows with it).
+    #[cfg(test)]
     pub fn write(&self, records: Vec<Vec<crate::database::Change>>) -> Result<()> {
         let compiled = self.generation();
         application::with_store(

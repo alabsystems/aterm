@@ -95,7 +95,8 @@ pub(crate) fn fold_range(lo: char, hi: char, out: &mut Vec<(char, char)>) {
     }
 }
 
-/// Cycle-linked simple-case-folding orbits (`(code_point, next_in_orbit)`), sorted by code point.
+/// Cycle-linked simple-case-folding orbits (`(code_point, next_in_orbit)`), sorted by code point: the
+/// orbits of Unicode 18.0.0 `CaseFolding.txt`'s `C` and `S` rows.
 static FOLD: &[(u32, u32)] = &[
     (0x00041, 0x00061),
     (0x00042, 0x00062),
@@ -1451,7 +1452,7 @@ static FOLD: &[(u32, u32)] = &[
     (0x01e94, 0x01e95),
     (0x01e95, 0x01e94),
     (0x01e9b, 0x01e60),
-    (0x01e9e, 0x000df),
+    (0x01e9e, 0x1df95),
     (0x01ea0, 0x01ea1),
     (0x01ea1, 0x01ea0),
     (0x01ea2, 0x01ea3),
@@ -3063,6 +3064,7 @@ static FOLD: &[(u32, u32)] = &[
     (0x1df7d, 0x1df7c),
     (0x1df7e, 0x1df7f),
     (0x1df7f, 0x1df7e),
+    (0x1df95, 0x000df),
     (0x1e900, 0x1e922),
     (0x1e901, 0x1e923),
     (0x1e902, 0x1e924),
@@ -3548,15 +3550,38 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
+    /// Unicode 18.0.0's `CaseFolding.txt`, the source of [`FOLD`]: its `C` and `S` rows are default
+    /// simple case folding (`T`, the Turkic rows, and `F`, full folding, are not).
+    const CASE_FOLDING: &str = include_str!("../tests/fixtures/CaseFolding-18.0.0.txt");
+
     /// The one Turkic-only mapping (`T` in `CaseFolding.txt`), excluded from default simple folding.
     const TURKIC_ONLY: &[char] = &['\u{131}'];
 
-    /// The three `CaseFolding.txt` `C` edges whose `std` case mappings are multi-code-point.
+    /// The four `CaseFolding.txt` `C` and `S` edges whose `std` case mappings are multi-code-point.
     const NON_DERIVABLE: &[(char, char)] = &[
         ('\u{0390}', '\u{1fd3}'),
         ('\u{03b0}', '\u{1fe3}'),
         ('\u{fb05}', '\u{fb06}'),
+        ('\u{1df95}', '\u{df}'),
     ];
+
+    /// The `C` and `S` rows of [`CASE_FOLDING`], each a code point and its simple fold.
+    fn simple_folds() -> Vec<(char, char)> {
+        let scalar = |hex: &str| {
+            u32::from_str_radix(hex, 16)
+                .ok()
+                .and_then(char::from_u32)
+                .expect("CaseFolding.txt names scalar values")
+        };
+        CASE_FOLDING
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('#').next()?.split(';').map(str::trim);
+                let (code, status, fold) = (fields.next()?, fields.next()?, fields.next()?);
+                matches!(status, "C" | "S").then(|| (scalar(code), scalar(fold)))
+            })
+            .collect()
+    }
 
     fn single_lower(c: char) -> Option<char> {
         let mut it = c.to_lowercase();
@@ -3570,9 +3595,9 @@ mod tests {
         it.next().is_none().then_some(first)
     }
 
-    /// Re-derive every fold orbit from `std` and assert [`FOLD`] matches.
+    /// Derive every fold orbit from `CaseFolding.txt`'s simple folding and assert [`FOLD`] matches.
     #[test]
-    fn fold_table_matches_std() {
+    fn fold_table_is_case_foldings_simple_orbits() {
         let mut parent: BTreeMap<char, char> = BTreeMap::new();
         fn root(parent: &mut BTreeMap<char, char>, x: char) -> char {
             let mut r = x;
@@ -3584,29 +3609,19 @@ mod tests {
             }
             r
         }
-        let join = |parent: &mut BTreeMap<char, char>, a: char, b: char| {
+        let folds = simple_folds();
+        assert!(
+            folds.len() > 1_500,
+            "CaseFolding.txt read whole: {}",
+            folds.len()
+        );
+        for (a, b) in folds {
             parent.entry(a).or_insert(a);
             parent.entry(b).or_insert(b);
-            let (ra, rb) = (root(parent, a), root(parent, b));
+            let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
             if ra != rb {
                 parent.insert(ra, rb);
             }
-        };
-        for cp in 0u32..0x11_0000 {
-            let Some(c) = char::from_u32(cp) else {
-                continue;
-            };
-            if TURKIC_ONLY.contains(&c) {
-                continue;
-            }
-            for mapped in [single_lower(c), single_upper(c)].into_iter().flatten() {
-                if mapped != c && !TURKIC_ONLY.contains(&mapped) {
-                    join(&mut parent, c, mapped);
-                }
-            }
-        }
-        for &(a, b) in NON_DERIVABLE {
-            join(&mut parent, a, b);
         }
 
         let keys: Vec<char> = parent.keys().copied().collect();
@@ -3626,8 +3641,8 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(
             FOLD, expected,
-            "the baked fold table no longer matches the standard library's case \
-             mappings plus the three non-derivable CaseFolding.txt edges"
+            "the baked fold table is no longer Unicode 18.0.0's simple case-folding orbits \
+             (CaseFolding.txt's C and S rows)"
         );
 
         for &(a, b) in NON_DERIVABLE {
@@ -3639,6 +3654,42 @@ mod tests {
                 b as u32
             );
         }
+    }
+
+    /// The toolchain's own case mappings never split a [`FOLD`] orbit: a single-code-point
+    /// `to_lowercase` or `to_uppercase` edge between two code points the table folds stays inside
+    /// one orbit. A `std` built from older or newer Unicode tables than the table's knows fewer or
+    /// more cased code points, so an edge reaching a code point the table leaves alone is not judged.
+    #[test]
+    fn std_never_joins_two_fold_orbits() {
+        let folded = |c: char| FOLD.binary_search_by_key(&(c as u32), |&(k, _)| k).is_ok();
+        let mut judged = 0_usize;
+        for cp in 0u32..0x11_0000 {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            for mapped in [single_lower(c), single_upper(c)].into_iter().flatten() {
+                if mapped == c
+                    || TURKIC_ONLY.contains(&c)
+                    || TURKIC_ONLY.contains(&mapped)
+                    || !folded(c)
+                    || !folded(mapped)
+                {
+                    continue;
+                }
+                judged += 1;
+                assert!(
+                    fold_orbit(c).any(|o| o == mapped),
+                    "std maps U+{:04X} to U+{:04X}, outside its fold orbit",
+                    c as u32,
+                    mapped as u32
+                );
+            }
+        }
+        assert!(
+            judged > 2_000,
+            "std's case mappings reached the table: {judged}"
+        );
     }
 
     /// Every fold orbit is symmetric and closed.
@@ -3667,7 +3718,7 @@ mod tests {
         assert_eq!(orbit('\u{212a}'), vec!['K', 'k', '\u{212a}']);
         assert_eq!(orbit('s'), vec!['S', 's', '\u{17f}']);
         assert_eq!(orbit('\u{3c3}'), vec!['\u{3a3}', '\u{3c2}', '\u{3c3}']);
-        assert_eq!(orbit('\u{df}'), vec!['\u{df}', '\u{1e9e}']);
+        assert_eq!(orbit('\u{df}'), vec!['\u{df}', '\u{1e9e}', '\u{1df95}']);
         assert_eq!(
             orbit('\u{131}'),
             vec!['\u{131}'],

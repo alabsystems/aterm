@@ -12,6 +12,29 @@ pub const MAX_TASK_BYTES: usize = 64 * 1024;
 /// The longest `timeout=` a `turn` over another Mac's drive takes (the step-in).
 pub const DRIVE_TURN_MAX_MS: u64 = 22_000;
 
+/// A fleet spawn's `cwd=` in the driven Mac's own home (`~` or `~/<path>`): the path under that
+/// home, relative (empty for the home itself; no leading or trailing `/`). `None` where `value`
+/// names no folder in a home; an error, saying why, where it names one no spawn takes: another
+/// account's home (`~user`), or a path with a `..` in it, which could leave the home. The driven
+/// Mac resolves the path against its home and refuses it where it does not stay there or does
+/// not exist.
+#[must_use]
+pub fn home_cwd(value: &str) -> Option<Result<&str, &'static str>> {
+    let rest = value.strip_prefix('~')?;
+    if rest.is_empty() {
+        return Some(Ok(""));
+    }
+    let Some(path) = rest.strip_prefix('/') else {
+        return Some(Err(
+            "names another account's home: a fleet spawn takes ~ or ~/<path>, in the driven Mac's",
+        ));
+    };
+    if path.split('/').any(|part| part == "..") {
+        return Some(Err("may leave the home: a ~/ folder holds no `..`"));
+    }
+    Some(Ok(path.trim_matches('/')))
+}
+
 /// How long a `turn` waits for a Claude Code composer to show the text it typed, from the first look that finds the program has read the text and again from each look that finds it unread, a minute after the typing at most; a text the composer does not show by then leaves the screen to judge the Enter.
 pub const TURN_ECHO_CAP_MS: u64 = 5_000;
 
@@ -19,7 +42,7 @@ pub const TURN_ECHO_CAP_MS: u64 = 5_000;
 pub const DRIVE_UNGRANTED: &str = "ERR denied grant=none: ";
 
 /// The options a `turn` reads before its text, past its leading `id=`, `if-supervisor=` and `cause=`.
-pub const TURN_OPTIONS: [&str; 15] = [
+pub const TURN_OPTIONS: [&str; 16] = [
     "idle",
     "timeout",
     "submit",
@@ -34,6 +57,7 @@ pub const TURN_OPTIONS: [&str; 15] = [
     "yield",
     "if-gen",
     "if-rows",
+    "if-human",
     "cause",
 ];
 
@@ -915,8 +939,8 @@ pub const VERBS: &[VerbSpec] = &[
          `aterm fleet allow drive --from`, or under `--all` any member the issuer's book binds, \
          proved by its key, also runs, as Owner, `@<sid> \
          status|text|screen|result|turn|key|send` on a hosted session, `hold <sid> on|off`, \
-         `spawn agent=<claude|codex|agy|muse|grok>` with its task, `await task`, and `@<sid> close` \
-         on a worker it spawned (`aterm help fleet`).",
+         `spawn agent=<claude|codex|agy|muse|grok>` with its task, `await task`, `board`, and \
+         `@<sid> close` on a worker it spawned (`aterm help fleet`).",
     )
     .input(Input::NONE)
     .for_fleet(),
@@ -1063,7 +1087,10 @@ pub const VERBS: &[VerbSpec] = &[
          count (`aterm ctl` notes it on stderr), and `--json`'s stamps are taken after that \
          wait. `cursor`, `cell`, `screen`, `line`, `search`, `offscreen screen=1`, `blocktext`, \
          `select`, `selection`, `copy`, `turn` and `cast drift` read the same way; `blocks` and \
-         `wait` never wait for a frame.",
+         `wait` never wait for a frame. With no terminal in front and a private edit's document \
+         (one in a `*.private.noindex` folder) focused, `text`, `screen` and every other bare \
+         session verb but `end` and `resize` answer `ERR refused private view: the front tab \
+         shows a private document`, and controller input to it is refused at delivery.",
     )
     .json(Json::Emits),
     v(
@@ -1382,7 +1409,9 @@ pub const VERBS: &[VerbSpec] = &[
          2`, the `image-meta` row, then the PNG row; \
          `frame-phase=destination|presented|staged|unknown`; `identity=unavailable` when \
          provenance was not kept). `image plain` leaves out the \
-         visual effects; `image read` returns the session's inline OSC 1337 images as base64.",
+         visual effects; `image read` returns the session's inline OSC 1337 images as base64. \
+         While a private edit's document shows in any pane of the front tab, every capture form \
+         but `image read` is `ERR refused private view: …`.",
     )
     .ack()
     .forms(&[
@@ -1404,7 +1433,8 @@ pub const VERBS: &[VerbSpec] = &[
             "). A bare filename lands in `images/` and needs an extension in `<target>`'s slot \
              (`ERR unknown window target '<word>' …` otherwise). A target other than `front` must \
              already be open in the front window (`ERR <target> is not open in the front window; \
-             use `open <target>` first`)."
+             use `open <target>` first`). While a private edit's document shows in the window's \
+             front tab, it is `ERR refused private view: …`."
         ),
     )
     .ack()
@@ -1429,7 +1459,10 @@ pub const VERBS: &[VerbSpec] = &[
          `ring_skipped`, `covered_us`, `requested_ms`, `keys_requested`, `inputs_logged`, \
          `unlogged_inputs`), `ticks[]` (unchanged redraw instants under `pace` or headless) and \
          `analysis` (at `fps=N` the key-to-frame floor is `~1000/N` ms; typing latency is \
-         `metrics percentiles` `input_*`).",
+         `metrics percentiles` `input_*`). A take does not start while a private edit's \
+         document shows in the front tab (`ERR video: refused private view: …`), and one it \
+         reaches ends with its folder removed (`ERR video: recording aborted: a private \
+         document came to the front`).",
     )
     .lane(Wait)
     .ack()
@@ -1459,7 +1492,8 @@ pub const VERBS: &[VerbSpec] = &[
          Settings ▸ Messages and `appstatus` (`kind=harness` on the `harness` lane) without \
          raising a band row (`OK recorded`). On `toolchain`, `managed-current: …` and \
          `machine-settings: …` update those `atpkg` markers. On `proc`, a verify run's line of \
-         a process it ended unasked is a `proc.auto-end` record.",
+         a process it ended unasked is a `proc.auto-end` record, and a line opening `lab` (a \
+         link the lab refused) a `proc.lab-link` one.",
     )
     .input(Input::NONE),
     v(
@@ -1552,6 +1586,22 @@ pub const VERBS: &[VerbSpec] = &[
          story=<n>`.",
     )
     .input(Input::NONE),
+    va(
+        "setup",
+        Read,
+        Status,
+        App,
+        AnyScopeMeta,
+        "setup status: the background coordinator's last published observation",
+        "— read-only instance posture, including with no terminal selected. Replies \
+         `OK schema=1 setup=<state>` with the same `setup=` state as `status`: `done`, \
+         `pending[:<rows>][;needs:<rows>]`, or `-` before any observation; `done` may carry \
+         `;asking:<rows>` for automatic work still continuing and `;offered:<rows>` for grants \
+         which hold nothing back. Starts no probe or setup, requests no permission, changes \
+         no focus and counts as no input.",
+    )
+    .input(Input::NONE)
+    .for_fleet(),
     va(
         "devtools",
         Write,
@@ -1687,14 +1737,16 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "aos [status|ls|attach|pause|repair|resume|detach|trace|export|check]: the glow as an Aos task",
         "— hosts the front window's typing-momentum glow as an Aos task, in every build. `aos \
-         [status]` answers `OK window=<id> attached=<bool> code=<name> …` (revision, pause queue, \
-         trace cursor, hot/active/settling flags, `cold_at=`, last wake and boundary counters). \
+         [status]` answers `OK window=<id> attached=<bool> code=<name> …` (hot/active/settling \
+         flags, then while attached `unseen=on|off`, revision, pause queue, trace cursor, \
+         `cold_at=`, last wake and boundary counters). \
          `aos ls` answers `OK <n>` and n rows: `tasks=<n>`, then per window a `slot=<id> \
          kind=effect task=<name> code= attached= paused= rev= log_epoch= log= waiting= kept= rows= \
          dropped=` row and its timeline rows, `slot=<id> row=<k> segment \
          cause=full|broken|restored|committed code= \
          log_epoch= range=<a>..<b> judged=pass|fail:<law>@<cursor>|unjudged:<why> kept=<id>|no` \
-         or `slot=<id> row=<k> detached why=<why>`: an online watcher judges each retired log \
+         or `slot=<id> row=<k> detached why=<why>` or `slot=<id> row=<k> unseen=on|off \
+         why=person|program_left`: an online watcher judges each retired log \
          epoch on a host worker and keeps a failing one as a fault (at most 4, timeline rows \
          only, no alert). `aos attach [code=<name>]` checkpoints the glow and records keys, \
          resets, frame ticks and scheduler queries (refused while Secure Keyboard Entry is on or \
@@ -1704,7 +1756,13 @@ pub const VERBS: &[VerbSpec] = &[
          own integrated shell open for it is held, logging nothing, until a frame shows its own \
          echo visibly where it was typed, and is logged at that frame, while one shown masked, \
          hidden or not at all within 1 s detaches the recording, as at an ssh, sudo or Node \
-         password prompt; an attach after a detached key starts the glow from rest); `aos pause` \
+         password prompt; an attach after a detached key starts the glow from rest). On macOS \
+         the person alone, at View \u{25b8} Record Keys Not Echoed\u{2026} and aterm's alert, can \
+         let one recording also keep keys aterm cannot see echoed until it ends or the program \
+         leaves the front of its tab (no verb, invoke or setting grants it): a key no frame \
+         proves is then logged unseen, each burst's keys at the frame that settles them, while a \
+         mask glyph where it was typed, a no-echo key and Secure Keyboard Entry still detach; \
+         `aos pause` \
          holds at the step boundary; `aos repair \
          [code=<name>]` shadow-replays live and candidate code over the trace from the attach \
          checkpoint on a host worker and, back on the main thread, swaps the candidate in only \
@@ -1714,14 +1772,17 @@ pub const VERBS: &[VerbSpec] = &[
          ends `main_us=<n> off_main=<bool>`; on a refusal a glow the repair paused resumes on the \
          old code, and one `aos pause` held stays paused); `aos resume` drops a pending update; \
          `aos detach` stops hosting; `aos trace` reports the log length, the trace and \
-         checkpoint digests and the broken flag, and `aos trace hex` adds the exported trace \
+         checkpoint digests, the broken flag and the event counts with `unseen=<n>`, the keys \
+         logged unseen, and `aos trace hex` adds the exported trace \
          file's bytes. `aos export [kept=<n>]` writes the live trace, or kept fault `<n>`, as a \
          new 0600 file in the state directory's `aos/` (`OK window=<id> exported kept= \
-         log_epoch= identity= bytes= mode=0600 file=<name> path=<path>`, the path last); `aos \
+         log_epoch= identity= bytes= unseen= mode=0600 file=<name> path=<path>`, the path last); \
+         `aos \
          check <file>` (a bare export name, or an absolute path) replays a trace file under this \
          build with no live effect, refusing one recorded under an identity this build does not \
          run (`ERR aos check refused=identity: …`), and answers `OK checked code= log_epoch= \
-         first= keys= resets= ticks= queries= checkpoint= state= chain= verdict= bytes= file=`; \
+         first= keys= resets= ticks= queries= unseen= checkpoint= state= chain= verdict= bytes= \
+         file=`; \
          a pane trace (`rewind check export`) answers `OK checked task=aterm.pane.screen \
          code=this-build slices= resizes= witnesses= matched= replies= start= state= chain= \
          verdict=pass|fail:<law>@<cursor> bytes= file=`. Debug builds only, each answering `ERR aos <form> needs a debug build` in a release \
@@ -1862,7 +1923,7 @@ pub const VERBS: &[VerbSpec] = &[
              `controls overview` is Owner-escalated and includes remote fabric needs (`overview \
              fabric chip node=<id> sid=<sid> need=<word> age=<s|-> mark=<decide|stuck> \
              older=<0|1> selected=<bool>`, header `fabric=<n> \
-             fabric_error=<run|refused|no-brief|->`). Off macOS `front` ends with `confirm \
+             fabric_error=<run|refused|no-brief|->`). `front` ends with `confirm \
              open=<true|false>` (`by=`, `answer=\"confirm yes\"`, `cancel=\"confirm no\"`, or `-` \
              when a person asked)."
         ),
@@ -1934,23 +1995,29 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Bytes,
         Session,
-        "temporal [status|<tick>] [trim]: the screen reconstructed at a past instant",
+        "temporal [status|judge|<tick>] [trim]: the screen reconstructed at a past instant",
         "— `<tick>` is µs since the session started (default: the latest recorded instant); a \
          replay needs `temporal_recording = true` (`ERR temporal: this session is not \
          recording; …`). Each slice replays at the clock reading it was parsed at live. \
          `temporal status` answers `enabled= latest_tick= reachable_from=<tick|-> keyframes= \
          live_events= dropped_events= lost_resizes= dropped_input= dropped_replies= \
-         pending_resizes= witnessed= diverged= pool_used= pool_limit=` (`reachable_from=-`: \
-         nothing replays; `pool_used=`/`pool_limit=`: the bytes every session's history and \
-         its unwritten output hold, and `rewind_total_mb`, past which the panes focused \
-         longest ago shed theirs first; \
+         pending_resizes= witnessed= diverged= pending= unjudged_evicted= pool_used= \
+         pool_limit=` (`reachable_from=-`: nothing replays; `pool_used=`/`pool_limit=`: the \
+         bytes every session's history and its unwritten output hold, and `rewind_total_mb`, \
+         past which the panes focused longest ago shed theirs first; \
          `witnessed=`: snapshots of the live screen, taken every 256 KiB of output or 1 s, that \
          a replay has been checked against, and `diverged=` those it did not equal, after each \
-         of which the recording takes a live keyframe); a replay at the spine's end adds \
+         of which the recording takes a live keyframe; `pending=`: kept snapshots no replay \
+         has checked yet, and `unjudged_evicted=` those the history dropped unchecked); \
+         `temporal judge` checks every kept snapshot still pending and answers `OK judged=<n> \
+         diverged=<n> pending=<n> unjudged_evicted=<n>`; a replay at the spine's end adds \
          `pending_resizes=` to its header. `trim` drops trailing blank rows (`OK <nbytes> \
          trimmed=<k>`).",
     )
-    .forms(&[form(Word("status")).framing(Status)]),
+    .forms(&[
+        form(Word("status")).framing(Status),
+        form(Word("judge")).framing(Status),
+    ]),
     v(
         "rewind",
         Read,
@@ -1977,7 +2044,8 @@ pub const VERBS: &[VerbSpec] = &[
          the kept history as an asciicast v2 file, mode 0600, under the state directory's \
          `rewind/` and answers `OK events=<n> bytes=<n> dropped_input=<n> lost_resizes=<n> \
          path=<file>`; like `cast`, it keeps what paints and drops the shell marks' nonce. \
-         `rewind check` replays each kept chain (a keyframe and the output, resizes and live \
+         `rewind check` first checks every kept live witness still pending (as `temporal \
+         judge`), then replays each kept chain (a keyframe and the output, resizes and live \
          witnesses after it) step by step as the Aos pane task under this build, with no live \
          effect, and judges it by `pane.faithful-replay` (`WitnessMatches`, `RepliesMatch`, \
          `ClockRecorded`): `OK chains=<n> slices= resizes= witnesses= matched= replies= \
@@ -2073,16 +2141,17 @@ pub const VERBS: &[VerbSpec] = &[
          claim (its release or replacement, its connection's close, its process gone; the claim \
          after a `ttl=` lapse starts with none). HARNESS_LAND: `meta set harness_land \
          since=<ms> nudges=<n> [read=1 legs=<leg>[,<leg>…] [open=<word>[,<word>…]] \
-         [changed=<n>] [untracked=<n>] [stashes=<n>] [unpushed=<n>] [unlanded=<n>]]` / `meta \
-         unset harness_land` (`OK`; `ERR denied` as for HARNESS_HELD; `ERR usage: …`, with or \
-         without a claim, for an unknown or repeated token, a missing `since=` or `nudges=`, a \
-         count or `since=` that is not plain digits or a `since=` past an i64, a `read=` other \
-         than `1`, a leg word other than `needs`, `repo`, `repo-unread`, `open`, `defense`, \
-         `cut`, `read=1` and `legs=` without each other, `open=` or a repository count without \
-         `read=1`, or any token after `unset harness_land`) tell why that claim's own Land \
-         still holds: when its land act was typed (unix ms), the nudges since, and once a \
-         yield was judged its legs, up to four percent-encoded open words and the \
-         repository's counts. While the claim stands it is `status land_held= land_nudges= \
+         [changed=<n>] [untracked=<n>] [stashes=<n>] [unpushed=<n>] [unlanded=<n>] [left=<n>]]` \
+         / `meta unset harness_land` (`OK`; `ERR denied` as for HARNESS_HELD; `ERR usage: …`, \
+         with or without a claim, for an unknown or repeated token, a missing `since=` or \
+         `nudges=`, a count or `since=` that is not plain digits or a `since=` past an i64, a \
+         `read=` other than `1`, a leg word other than `needs`, `repo`, `repo-unread`, `left`, \
+         `open`, `defense`, `cut`, `read=1` and `legs=` without each other, `open=`, a \
+         repository count or `left=` without `read=1`, or any token after `unset \
+         harness_land`) tell why that claim's own Land still holds: when its land act was typed \
+         (unix ms), the nudges since, and once a yield was judged its legs, up to four \
+         percent-encoded open words, the repository's counts and the processes its agent left \
+         running, neither ended nor kept (`left`). While the claim stands it is `status land_held= land_nudges= \
          land_since=`, the menu bar's `landing`, and the hold the worker row, the Overview, \
          the tab's hover and the Settings ▸ Harness state line say in codex-alab's name, only \
          while the tab reads Land and neither landed nor quiet, as for aterm's own hold, and \
@@ -2132,16 +2201,26 @@ pub const VERBS: &[VerbSpec] = &[
          Cruise/Land prompts: `done_check_text=` (the first angle's whole check), `land_text=`, \
          `land_nudge_text=`, `land_answer_text=`, `needs_hint_text=`, `needs_ack_text=`, then \
          `done_check_angles=` (the done check's six angles in turn, one per line), \
-         `done_check_tail=` (what follows each) and `land_check_text=` (the land check, \
+         `done_check_tail=` (what follows each), `land_check_text=` (the land check, \
          `land-check@v1`, typed once at a `Nothing left:` defense over a clean repository: a reply \
          of only `LANDED` lands, a `NEEDS YOU:` line is a need, anything else is the agent's list \
-         of what is left). Edge tokens receive only `OK \
-         effective=<on|off>`. Owner-only `recovery` reads the account menu's cached, current-foreground \
+         of what is left), `land_question_text=` (the policy text Land writes into a question \
+         dialog's free-text row, `answer-land@v1`), then `land_checks=git,left`: the checks Land \
+         makes before a landing, `git` the session repository and `left` the processes the \
+         session's agent started that still run (`sys left`; each ended with `end <token>` or kept \
+         by a `keep <token>` line under `Nothing left:`), which a harness that supervises itself \
+         makes the same. Edge tokens receive only `OK effective=<on|off>`. Owner-only `recovery` \
+         reads the account menu's cached, current-foreground \
          observation without probing or retrying: `OK recovery version=1 available=0` when absent; \
          otherwise `available=1 phase= account= target= route= known= eligible= wall= observed_at= \
          next_at= forecasts_paused= detail_count= detail_0= ... login_diagnostic_count= \
          login_diagnostic_0_account= login_diagnostic_0_completed_at= login_diagnostic_0_words= \
-         ...`. Indexed login diagnostics retain the captured account label, original completion \
+         ... independent_work_count= independent_work_0_phase= independent_work_0_account= \
+         independent_work_0_route= independent_work_0_observed_at= ...`. Indexed independent work \
+         is currently observed local pool sign-in, separate from the primary decision's phase, \
+         inventory and deadline. It carries no eligibility, claim, retry or credential authority; \
+         zero means no separate work observed, not proof that no work exists. Indexed login \
+         diagnostics retain the captured account label, original completion \
          time and validated outcome words, never raw provider output. They are history and \
          grant no retry or sign-in authority, including while paused or busy. `forecasts_paused=1` means the \
          session policy withdrew future recovery promises independently of current work; 0 \
@@ -2248,6 +2327,7 @@ pub const VERBS: &[VerbSpec] = &[
          input=<clear|pending|typeahead|stalled|stopped|-> input_bytes= input_wait_ms= \
          fg_rss_mb= disk=<ok|low|short|emergency|-> disk_free_mb= disk_room_mb= disk_age_ms= \
          job=<verdict|none> job_quiet_ms= program_check=<n>:<oldest_ms>|0|- \
+         left=<n>:<oldest_ms>|0:-|- \
          syspolicyd=<-|ok|full|stuck> syspolicyd_workers= syspolicyd_full_ms= \
          service_mem=<-|ok|large|huge> service_mem_top=<name>:<MiB>|- \
          occupancy=<off|observe|prompt> occupancy_hold=<declared|undeclared|none> ready= slots= \
@@ -2257,7 +2337,12 @@ pub const VERBS: &[VerbSpec] = &[
          (the one that watches), and `service_mem_top=` that service with its footprint; `program_check=` counts this tab's programs \
          macOS's program check holds now, members of its jobs and their orphans, this user's \
          only, so a lower bound, with the oldest held to now in ms; `-` off macOS or with no \
-         reading that speaks for now; `occupancy why` explains `occupancy_hold=` to \
+         reading that speaks for now; `left=` counts the processes this session's agent started \
+         that still run and `sys left` offers to end (born while an agent ran in the tab, or \
+         after the shell in a tab where none was seen, and a dead verify run's that rode in this \
+         session; `sys left` marks each `left_of=<sid>`), with the oldest's age in ms, `0:-` with \
+         none, `-` with no whole reading that speaks for now; \
+         `occupancy why` explains `occupancy_hold=` to \
          `idle_ready_min=`; `waits=` counts the session's declared wakes still to be told and \
          `waits_ready=` those whose condition held, which `waits` lists). Harness and records: \
          `supervisor= supervisor_proven= supervisor_version= supervisor_vendor= \
@@ -2290,7 +2375,8 @@ pub const VERBS: &[VerbSpec] = &[
          or with the session in no window; \
          `land_held=`, `land_nudges=` and `land_since=` are Land's hold, aterm's \
          own while it holds the claim or, under its own proven claim, codex-alab's (`meta set \
-         harness_land`): the legs of its last judged yield, the nudges since its land act and \
+         harness_land`): the legs of its last judged yield (`left` where processes its agent \
+         started still ran, neither ended nor kept), the nudges since its land act and \
          that act's unix second, `-` each where no landing holds or its tab reads another mode, \
          landed or quiet; `held=` is the hold that stopped the typing, aterm's own while it holds \
          the claim or, under its own proven claim, codex-alab's (`meta set harness_held`), `-` \
@@ -2492,7 +2578,7 @@ pub const VERBS: &[VerbSpec] = &[
         "render/latency counters [reset|percentiles]",
         "— `percentiles` prints `n_<x>=` and `<x>_p50/_p95/_p99_ms=` for `input`, `present`, \
          `render`, `key_write`, `key_queue`, `pre_present`, `acquire`, `acquire_queue`, `resize`, \
-         `reflow`, `present_tainted`, `term_wait_redraw`/`term_wait_press`, `echo`, \
+         `reflow`, `present_tainted`, `term_wait_redraw`/`term_wait_press`/`term_wait_mouse`, `echo`, \
          `present_glass`, `out_req`, `ime`, `status_glance` (`max_status_glance_ms=`), \
          `need_publish` (`max_need_publish_ms=`), and `tx_chunk`/`tx_last` (`max_tx_hold_ms=`), \
          plus `turns_by_root=<root>:<n>/<p50>/<p95>/<p99>` and counters `input_edges_dropped= \
@@ -2502,8 +2588,11 @@ pub const VERBS: &[VerbSpec] = &[
          `*_schema=`/`*_valid=` flags, `process_birth_to_rust_main_ms=`, \
          `rust_main_to_first_present_ms=`), the keeper's boot recovery (`startup_keeper_offers= \
          startup_keeper_hello_ms= startup_keeper_admit_ms= startup_keeper_admit_max_ms= \
-         startup_keeper_placed_ms= startup_keeper_imported_ms=`, `none` where no keeper \
-         answered, and a dev build's `startup_keeper_seam_copies= …_plants= …_ms=`), the PTY \
+         startup_keeper_placed_ms= startup_keeper_imported_ms=`, then the recovery-count fence's \
+         `startup_keeper_fence_cohort= startup_keeper_sync_sent_ms= \
+         startup_keeper_sync_answer_max_ms= startup_keeper_fence_ms= startup_keeper_served_ms=`, \
+         `none` where no keeper answered, and a dev build's `startup_keeper_seam_copies= \
+         …_plants= …_ms=`), the PTY \
          child round trip (`n_echo= echo_p50_ms=` … \
          `echo_dropped_locked=`), the main-loop census (`max_turn_ms= max_turn_owner= … \
          main_busy_ms_per_s=`), the update handoff counters (`input_dropped= input_incoherent= \
@@ -2516,6 +2605,34 @@ pub const VERBS: &[VerbSpec] = &[
          without one, and `key_write_unavailable=` their write completions excluded from \
          `key_write`. Both counters are in the summary and percentiles and reset with them. \
          Quote `n_*` with every percentile; these are application metrics, not HID/scanout proof.",
+    )
+    .json(Json::Emits),
+    v(
+        "telemetry",
+        Read,
+        Lines,
+        App,
+        "telemetry [rows] [--since <t>] [--kind <k>] [--limit <n>]: this Mac's action rows by kind",
+        "— `--since` takes `<n>s|m|h|d` or a unix ms time. The per-action telemetry log (Continuum TM-0): `<state>/telemetry/rows.log`, rotated \
+         at 4 MiB into at most four files, one `schema=1` row for each command a tab's shell \
+         ran (`kind=command`: wall time from its OSC 133 C to D, the CPU the shell and what it \
+         reaped spent between them), each agent tool call the jobs engine saw end \
+         (`kind=agent-call`, sampled at its 2 s passes: wall an upper bound, CPU and peak \
+         memory lower bounds), each `spawn` (`kind=spawn`) and each claim decided in this \
+         account's capacity ledger (`kind=admission`, written by the claimant: `wall_ms` and \
+         `wait_ms` its wait, CPU and peak `na`). The first line is `telemetry \
+         schema=1 rows= dropped= torn= files= bytes= since= oldest= host= facts= dir=` \
+         (`dropped=`: rows the writer lost, said by its `gap` lines; `torn=`: lines a crash cut, \
+         skipped), then `kind=<k> n= failed= stalled= wall_p50_ms= wall_p90_ms= wall_unknown= \
+         cpu_p50_ms= cpu_p90_ms= cpu_unknown= peak_p50_mib= peak_p90_mib= peak_unknown=` per \
+         kind. `telemetry rows` prints the newest `--limit` rows (50) as the log spells them: \
+         `key=` and `dir=` are digests (`key=-` for a command no program was confirmed for), \
+         `label=` one word (a confirmed program, a shell builtin or keyword, an admission's \
+         claimant) and `sid=` the session's public id, never a command line; \
+         a figure aterm cannot know reads `?<source>`, naming what would supply it \
+         (`cache=?targo`), and `na` where it means nothing for the kind. `--json` answers one \
+         object (`kinds`, `host`, and `rows` under `rows`). `aterm help telemetry` has the \
+         schema.",
     )
     .json(Json::Emits),
     v(
@@ -2626,11 +2743,14 @@ pub const VERBS: &[VerbSpec] = &[
          `scope=aterm`, Owner's alone) lists what closed tabs and dead verify runs left running \
          and what macOS's program check holds, each with its proof, never a name: `proc pid= \
          state=program-check|waiting|orphaned|left … tier=auto|offer|name|never \
-         why=live|orphaned|owner-gone|launcher-dead|daemon proof=<w,…|-> from= end=<token|->` \
+         why=live|orphaned|owner-gone|launcher-dead|daemon proof=<w,…|-> from= \
+         [left_of=<sid>] end=<token|->` (`left_of=` on a row that counts in that session's \
+         `status left=`) \
          and `run id= state=live|dead … left=<n> [next=verify]`; `end <token>` ends an \
          offered row by its `end=` token, re-proven first (`aterm ctl help end`). See `aterm \
          help sys` and `await sys`.",
     )
+    .forms(&[form(Word("name")).framing(Status)])
     .lane(Wait)
     .json(Json::Emits),
     v(
@@ -2647,7 +2767,8 @@ pub const VERBS: &[VerbSpec] = &[
              [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] \
              [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] \
              [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] \
-             [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>]`; they end at the first \
+             [if-rows=<first>-<last>:<hex16>] [if-human=<n>] [cause=@<off>|<seq>]`; they end at \
+             the first \
              word that is not one of them, or at a `--` after one of them. A `--` before all of \
              them (first, or after only a leading `id=`, `if-supervisor=` or `cause=`) ends only \
              those leading ones, and the turn's options are read after it: text that starts \
@@ -2698,6 +2819,11 @@ pub const VERBS: &[VerbSpec] = &[
              look finds the fence spanning a composer box (rules at `<first>` and `<last>`) in an \
              unfinished DEC 2026 frame waits within `timeout=` for it to close and judges the \
              fence on it; any other turn waits as `text` does, and a frame still open has moved. \
+             `if-human=<n>` (`status human_seq=`, the `text --json` read's `human_seq`) fences on \
+             the person: any gesture since, one that moves no fenced row among them, is `OK 0 \
+             turn skipped reason=person submitted=0 seq=<n> id=<n>`, judged under the fence's \
+             lock, and again before a paste and before the first submit press (`reason=person \
+             typed=<k> pasted=<p>`, the text left unsubmitted). \
              The settled screen is read on a whole frame too (` frame=open` when not). \
              `if-supervisor=<holder>` fences on the live supervisor claim; `cause=` links the \
              turn in `log` to held mail (`@<off>`) or a log record (`<seq>`; `ERR cause` when it \
@@ -2769,7 +2895,8 @@ pub const VERBS: &[VerbSpec] = &[
          that never reached for the PTY, or whose first write the input queue or the \
          `if-supervisor=` fence refused, whatever it answered (`ERR halted`, `ERR yield`, `ERR exited`, an \
          `OK 0 turn skipped` before its first paste or key: the `if-gen=`/`if-rows=` fence's \
-         `reason=changed` with no `typed=`, or `typed=0 pasted=0`); any other attempt that did \
+         `reason=changed`, or the `if-human=` fence's `reason=person`, with no `typed=`, or \
+         `typed=0 pasted=0`); any other attempt that did \
          not finish `OK` leaves it `ERR in-doubt seq=<n>`. \
          `if=<re>`, `if-gen=`, `if-fp=`, `if-human=` and `if-supervisor=` fence under the \
          terminal/meta lock (see `key`). `unread=ok` bypasses the `input=stalled|stopped` refusal \
@@ -2872,7 +2999,9 @@ pub const VERBS: &[VerbSpec] = &[
          event, so layout and Option dead keys compose), to measure hardware-path typing latency \
          in `metrics percentiles` (`n_key_write`). Replies `OK posted=<n> key=<0|1>`. Takes a \
          leading `unread=ok`; `ERR hwkey` while a palette, Overview or tab menu is open, or \
-         System State is the front window's active view.",
+         System State is the front window's active view, and `ERR hwkey: refused private view: \
+         the front window holds a private document` while any of its tabs holds a private \
+         edit's document (one in a `*.private.noindex` folder).",
     )
     .input(Input::PTY.with(Input::WRITES).with(Input::APP_UNREAD)),
     va(
@@ -2963,7 +3092,9 @@ pub const VERBS: &[VerbSpec] = &[
          [unit=lines|pt] [key=<ui-key>|xy=<x>,<y>]` scrolls (each `|n|<=10000`, not both 0). \
          `mods <list>` (Owner-only) holds modifiers (`cmd`/`super`, `ctrl`, `alt`/`option`, \
          `shift`, `link`, or `none`) until the next physical event (`cell <r> <c>` `link=` reads a \
-         hovered link). Takes a leading `unread=ok`.",
+         hovered link). Takes a leading `unread=ok`. While a private edit's document shows in \
+         any pane of the front tab, every form is `ERR pointer command failed: refused private \
+         view: …`.",
     )
     .forms(&[form(AnyOf(&["click", "mods"])).owner_only()])
     .input(Input::PTY.with(Input::WRITES).with(Input::APP_UNREAD)),
@@ -3048,12 +3179,11 @@ pub const VERBS: &[VerbSpec] = &[
         form(Word("constructors")).op(Read),
         form(Word("cancel-support")).op(Read),
     ]),
-    va(
+    v(
         "native-observe",
         Read,
         Status,
         Session,
-        OwnerOnly,
         "retain a passive crash witness",
         "Private Harness only. `register|refresh` v=1 captures an exact live vendor and a bounded \
          kernel death witness. This creates no native operation, input custody or mutation budget; \
@@ -3212,7 +3342,10 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "@<sid> edit <file-uri> [line=<L>[:<C>]]: open it in a new Editor tab beside <sid>",
         "— also `[create=1]` (a missing file opens empty and its first save creates it), \
-         `[for=<word>]` (the program it is for, shown in the view's header) and `[wait=0]`. \
+         `[for=<word>]` (the program it is for, shown in the view's header), `[wait=0]` and \
+         `[ro=1]` (the document opens read-only: no typing, pasting or saving changes it and \
+         its header says so; a file a buffer already holds is `ERR refused open: a read-only \
+         edit opens a file no buffer holds`). \
          Owner only (`ERR scope`). Replies `OK edit ticket=<t> view=<v> doc=<d> \
          uri=<canonical-uri>` once the tab opens to the right of `<sid>`'s, and holds `<sid>` \
          (`status editing=`; its typing is `ERR busy editing`) until `await edit ticket=<t>` \
@@ -3235,7 +3368,8 @@ pub const VERBS: &[VerbSpec] = &[
          sel=<view>:<L>:<C>-<L>:<C>|-`. `doc read` replies `OK <nbytes> doc=<d>`, \
          `<n>:<h6>|<text>` lines (`<h6>` = 6-hex FNV-1a-64 of line), and `-- lines=<total> \
          seq=<s> [next=<n>] [cut=<n>]` (256 KiB cap per read; `ERR unknown doc <ref>` if not \
-         open; `doc apply|save|log` answer `ERR unsupported`).",
+         open; `ERR refused private doc` for a private edit's document, one in a \
+         `*.private.noindex` folder; `doc apply|save|log` answer `ERR unsupported`).",
     )
     .forms(&[
         form(Word("read")).framing(Bytes),
@@ -3249,7 +3383,8 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "act app/v1 view <view-id> <ui-key> <action> [value]: one native-app action",
-        "",
+        "— on a private edit's document's view (one in a `*.private.noindex` folder) every \
+         action is `ERR refused private view: …`.",
     )
     .input(Input::NONE),
     v(
@@ -3274,11 +3409,13 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "invoke <action>: fire a menu action by name (enabled-gated; names via `controls menu`)",
         "— `Paste` honors the unread-input gate (it takes a leading `unread=ok`). A close or \
-         quit that needs confirmation parks an in-window question and replies `OK confirm \
+         quit that needs confirmation parks a question (a sheet on macOS) and replies `OK confirm \
          pending kind=<quit|close-window|close-tab|close-pane> window=<n>; …`; `confirm \
          yes|no` answers a control client's question. The main thread keeps serving other \
          requests. A macOS windowed `Quit` always asks; Windows also asks for a multi-tab \
-         quit, and running jobs require confirmation. A `--headless` instance asks nothing.",
+         quit, and running jobs require confirmation. A `--headless` instance asks nothing. \
+         While a private edit's document shows in any pane of the front tab, every action is \
+         `ERR refused private view: …`.",
     )
     .input(Input::PTY.with(Input::APP_UNREAD)),
     v(
@@ -3286,8 +3423,8 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "confirm yes|no: answer a close or quit waiting in the window",
-        "— answers an in-window confirmation (`controls front` `confirm open=true`) raised by a \
+        "confirm yes|no: answer a close or quit waiting for an answer",
+        "— answers a close or quit confirmation (`controls front` `confirm open=true`) raised by a \
          control client (`invoke CloseTab|Quit`): `OK answered=<yes|no> \
          kind=<quit|close-window|close-tab|close-pane>`. Refuses confirmations raised by a human \
          at the window (`ERR a quit is waiting for the person at the window`) or when none is \
@@ -3483,8 +3620,12 @@ pub const VERBS: &[VerbSpec] = &[
          later, on this Mac alone: a fleet drive names it at spawn and serves no `meta`); \
          marks `stalled why=shell` if its shell ends or a person uses it before its first \
          prompt, `stalled why=startup` if no agent composer (for `codex`, no proven \
-         claim) within 120 s of `since_ms=`, a shell still drawing no prompt included, or \
-         `stalled why=held` if stuck 120 s at an unhandled screen. Refuses with `ERR \
+         claim) within 120 s of `since_ms=` or sooner if its launcher gives up, with what held it in \
+         `attention=` (three name the member too, where its label is known: a launch refused for \
+         a cause no wait ends; a launch held because no account of its pool can take it now, and \
+         when the first opens, which never starts later; and `no shell prompt`, with what the \
+         shell showed: one that drew nothing and used no CPU is stuck at its start, as on a Mac \
+         that needs a restart), or `stalled why=held` if stuck 120 s at an unhandled screen. Refuses with `ERR \
          unsupervised: <switch>` when the window harness cannot supervise (`[harness] enabled = \
          false`, `headless = false`, or `autopilot = \"off\"`), and with `ERR spawn \
          agent=<word>: <why>` for an agent whose turn end no reader sees yet (`grok`, until \
@@ -3499,18 +3640,29 @@ pub const VERBS: &[VerbSpec] = &[
          installs (Keep ALab tools up to date or Install ALab tools off in Settings ▸ \
          Packages, or the toolset removed by `aterm pkg uninstall --all`) keeps it off, nothing \
          is installed, the launch note says so and the line runs any copy of the shell's own. \
-         The startup deadline waits while it installs, and a launcher whose task is no longer \
-         `working` types nothing. Over an authenticated fleet drive, a worker's spawn takes \
-         `agent=`, `model=`, `autopilot=`, an absolute `cwd=`, `from=` and `raise=false` alone, \
-         and each `ERR denied:` names the word it refused. There, `aterm ctl --host <h> spawn \
-         cwd=/absolute` opens a background plain shell with no task or AI requirement. \
+         The startup deadline waits while it installs, until the install makes no progress for \
+         45 minutes, and a launcher whose task is no longer `working` types nothing, so a launch \
+         that stalled while held or installing never starts later. Over \
+         an authenticated fleet drive, a worker's spawn takes \
+         `agent=`, `model=`, `autopilot=`, an absolute `cwd=` or `'cwd=~/<path>'` (a folder in \
+         the driven Mac's home, resolved there and refused where it leaves the home, lies in a \
+         folder macOS guards, or is not there; quoted, since bash turns an unquoted `cwd=~/…` \
+         into this Mac's own home before aterm sees it), `from=` and `raise=false` alone, and \
+         each `ERR denied:` names the word it refused. `aterm ctl … spawn agent=… \
+         label=<word>` keeps the label on this Mac's `board` and never sends it. There, `aterm \
+         ctl --host <h> spawn cwd=/absolute|'cwd=~/<path>'` opens a background plain shell \
+         with no task or AI requirement. \
          It requires the named folder, clears the host's global `-e` command, and accepts only \
          `cwd=` and optional `raise=false`; no stdin frame, command, model or implicit folder. \
          The creating node can close this shell while no person has adopted it and no foreground job runs. \
          On its own untouched shell it may also read `blocks [n] [--json]`, \
          `blocktext <id> [trim]`, and `await idle <0..22000>|block timeout=<0..22000>`. Zero timeout \
          checks once without waiting. Ownership is \
-         checked again after each read or wait. `--host any` still requires an AI worker.",
+         checked again after each read or wait. `--host any` still requires an AI worker, and \
+         takes `need=repo:<name>[,free:<n>m|g|t]`: the Mac it picks lists the checkout \
+         `~/<name>` with a HEAD in a read of its own within 30 min and has that much free on its \
+         home's volume, and one whose survey cannot say is never chosen (`aterm help \
+         workers`).",
     )
     .input(Input::NONE),
     v(
@@ -3536,7 +3688,7 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "task [mark <state> …]: a worker's task record: OK task rev= state= from= since_ms=",
         concat!(
-            "— `result_bytes= [conclusion=] [why=] [checked=] [exit=] [result_path=] [fact= fact_rev=] agent= program_state= \
+            "— `result_bytes= [conclusion=] [why=] [checked=] [left=] [exit=] [result_path=] [fact= fact_rev=] agent= program_state= \
          attention=` (or `OK task -` when the session has no task; `program_state=` is `status \
          program_state=`, a codex's or Grok Build's own report, `-` otherwise). `state=`: `working`, `done` (under Land, a clean `Nothing left:` \
          defense and a `git` check that found nothing left to land where it could read; `aterm help \
@@ -3561,7 +3713,11 @@ pub const VERBS: &[VerbSpec] = &[
          main git named (`3f9a1c2e4b7d@origin/main`), else `pushed`, `no-remote`, `no-repo` or \
          `gone`; none where ",
             no_checked_record!(),
-            ". `rev=` increments on \
+            ". `left=` is what that landing read of the processes its agent started that still \
+         ran (also on `await task` rows): `0`, `kept:<n>` (none but those a `keep <token>` line \
+         under its `Nothing left:` kept running), `<n>` (left running once Land had held three \
+         times on them) or `unchecked` (no whole reading); none where nothing was read. `rev=` \
+         increments on \
          record changes and when the record's attention flag flips: an ask under \
          `owner=supervisor|needs|codex-alab` raises it and a `kind=wait` entry there never does \
          (`status` and `sessions` carry `task_state=<state|-> task_rev=<n>`, `subscribe … events` \
@@ -3571,9 +3727,9 @@ pub const VERBS: &[VerbSpec] = &[
          owner's `[harness] occupancy = \"prompt\"` alone), shown once first edited on the reply, \
          `await task` rows and the event (`fact= fact_rev=` at their end); `fact_rev=` moves on its \
          own, never `rev=`, and no verb takes `fact=` as input. `task mark <working|done|exited|stalled|failed> [from=<s-…|ctl>] \
-         [why=<word>] [checked=<word>] [exit=<n>] [result_bytes=<n>] [result_path=<pct>]` \
-         (Owner-only; `checked=` on `done` alone and from aterm's own loop alone: a hand mark \
-         naming it is refused, `ERR task mark: ",
+         [why=<word>] [checked=<word>] [left=<word>] [exit=<n>] [result_bytes=<n>] \
+         [result_path=<pct>]` (Owner-only; `checked=` and `left=` on `done` alone and from \
+         aterm's own loop alone: a hand mark naming either is refused, `ERR task mark: ",
             checked_by_hand!(),
             "`; a hand's `failed` is refused while a loop carries the session, whose Autopilot Off \
          stops the typing and fails the task; `ERR denied` \
@@ -3635,7 +3791,8 @@ pub const VERBS: &[VerbSpec] = &[
          already finished). `await sys <condition> \
          [for=<dur>] [scope=tab|aterm]`: the terms `aterm help sys` lists, joined by `and`; a \
          bare `quiet` is `cpu<25% wait<0.25 \
-         gpu<10% throttle=none swap<1MB/s`, a term it cannot measure dropped as \
+         gpu<10% swap<1MB/s` and a `thermal` level that claims no throttling (below serious; \
+         Linux's estimate at none), a term it cannot measure dropped as \
          `skipped=<metric>:<why>` (`OK sys <metric>=<value> … held_ms= as_of= next=`, a `job=` \
          term's reading `job=<id> verdict= class= [wait=] [quiet_ms=] [phi=] [exit=]`; `ERR \
          unavailable <metric> why=<…>`, `ERR gone job=<id>`). On a volume, one or two of \
@@ -3676,10 +3833,12 @@ pub const VERBS: &[VerbSpec] = &[
          session closing (`OK <n>`, or `OK <n> status=timeout`, then `@<sid> rev=<n> \
          state=<working|done|exited|stalled|failed|-|closed> agent=<word> \
          program_state=<word|-> attention=<pct|-> result_bytes=<n> \
-         [conclusion=<finished|failed>] [why=<word>] [checked=<word>] [fact=<word|-> \
-         fact_rev=<n>] task_news=<0|1>` rows, `conclusion=`, `why=` and `checked=` as `task` says \
+         [conclusion=<finished|failed>] [why=<word>] [checked=<word>] [left=<word>] \
+         [fact=<word|-> fact_rev=<n>] task_news=<0|1>` rows, `conclusion=`, `why=`, `checked=` \
+         and `left=` as `task` says \
          (a tab closed on a task with no conclusion reads `conclusion=failed`); \
-         `program_state=` is `status program_state=`, a claim that never wakes it). \
+         `program_state=` is `status program_state=`, a claim that never wakes it). `aterm ctl \
+         [--host <h>] await task board …` waits on a `board`'s open rows instead of named sids. \
          `await wake [timeout=<ms>]`: \
          the session's next ready wake (`wake`), its `need=` holding, a build slot reserved where \
          that names `slots` (`OK wake #<n> ready since=<ms>[ slots=<usable>/<n>]`), or its last \
@@ -3730,7 +3889,10 @@ pub const VERBS: &[VerbSpec] = &[
          `since-block=<id>` for `events`' turns and blocks, or `since-log=<seq> log-ep=<e> \
          [log-base=<b>]` for `log`, an anchor needing a single target (`log-base=` names the \
          log the cursor is of, so another log's reads as a reset); each target acks `sub \
-         <local> <sid>[ log_seq=<seq> log_ep=<e> log_base=<b>]`; `every-frame` re-reads `cells` \
+         <local> <sid>[ log_seq=<seq> log_ep=<e> log_base=<b>][ role=<pct|-> attention=<pct|-> \
+         user_title=<pct|->]` (the second part for `events`: the three as `meta` prints them, \
+         read in one hold with the point its events start, so each later change is an `EVENT \
+         <local> meta`); `every-frame` re-reads `cells` \
          on every wake and sends a frame only when it changed). `log` pushes `LOG <local> \
          <record>` (`log:lvl=<session|run|turn|step>` and `log:class=turn` filter) and `GAP \
          <local> log-lost=<n> why=<evicted|handoff|reset|…> resync_to=<seq> ep=<e> base=<b>`. \
@@ -3754,7 +3916,7 @@ pub const VERBS: &[VerbSpec] = &[
          view of the session `log`, and a GAP counts the rows past the watermark it no longer \
          holds). `sessions` (Owner-only) \
          pushes `EVENT * session-created <sid>[ watch=deferred]`, `EVENT * session-exited <sid> \
-         reason=<shell-exit|ctl-close|ui-close|window-close|unknown>`, `EVENT * \
+         reason=<shell-exit|ctl-close|ui-close|window-close|reaper|unknown>`, `EVENT * \
          fabric-retire <sid>`, and `EVENT * bye <quit|handoff>`. `mail` pushes live `MAIL <local> \
          id=<n> off=<n> from=<p> kind=<k>[ re=<n>][ topic=<t>]` (filtered by `mail:kinds=<k,..>`, \
          `mail:from=<class|principal>`, `mail:topic=<t>`) and `GAP <local> mail-dropped=<n>`. \
@@ -4153,8 +4315,10 @@ pub const VERBS: &[VerbSpec] = &[
          (it moves when a session comes, goes or changes its row). `sessions status` returns `<local> <sid> <nonce> \
          sid=<local> revision=<n> hold=<0|1> hold_origin=<person|remote|fleet|local, \
          comma-joined, or -> detail=<pct|-> agent=<word|->` (`agent_deferred=1` in its place \
-         while the session's timeline is busy) `gen=<epoch>.<seq>|-` (the screen's generation, \
-         as `status gen=`, `-` while the terminal is busy).",
+         while the session's timeline is busy) `role=<pct|-> attention=<pct|-> \
+         user_title=<pct|->` (as `meta` prints them; all three left out while a writer holds \
+         the session's meta) `gen=<epoch>.<seq>|-` (the screen's generation, as `status gen=`, \
+         `-` while the terminal is busy).",
     )
     .input(Input::NONE),
     va(
@@ -4168,6 +4332,24 @@ pub const VERBS: &[VerbSpec] = &[
          `nonce=<hex32>`, `fgpgid=<pid|->`.",
     ),
     va(
+        "reveal",
+        Read,
+        Lines,
+        Meta,
+        OwnerOnly,
+        "OK 1 verdict=<word> session=<sid|->: may the asking process see a secret",
+        "— Owner-only and local (never a fleet peer's): whether the process asking may be shown a \
+         secret in plaintext, decided by the session of this instance its process lineage leads \
+         to, never by its environment. One line, `verdict=` the first of: `remote` (asked through \
+         the bridge or by a fleet driver), `indirect` (the kernel names no peer process), `none` \
+         (no session here is its ancestor), `spawned` (`ctl spawn` started the session, here or \
+         through `--host`), `carried` (an aterm update carried the session over, with no record \
+         of who started or drove it), `held` (under the `origin=remote` hold), `driven` (a control \
+         client other than aterm's own was admitted to type into it), `agent` (an agent runs in its process tree), \
+         else `allowed`. `aterm db emails --show-passwords`, `phones --show-numbers` and `--edit` \
+         show plaintext only on `allowed`.",
+    ),
+    va(
         "survey",
         Read,
         Lines,
@@ -4178,14 +4360,19 @@ pub const VERBS: &[VerbSpec] = &[
          `survey [facts|content]`. It replies `OK <n>`, an `instance pid= \
          host=<pct> version= sessions=<n> level=<facts|content> cut=<n> at_ms=<unix ms> node=<32 \
          hex|-> instances=<n> label=<pct|-> window=<0|1> window_last=<unix s|-> \
-         ssh_host_key=<pct|-> accounts=<n> accounts_unread=<cli>[,…]|->[ drive=1]` header \
+         ssh_host_key=<pct|-> accounts=<n> accounts_unread=<cli>[,…]|-> moves_7d=<n|-> \
+         move_tries_7d=<n|-> last_move=<unix s|->[ drive=1]` header \
          (`drive=1`: a fleet reader this machine lets drive it), one `session` row per session, \
          then one `account` row per row of each pooled CLI's pool as `aterm harness accounts \
          --json` lists it (`accounts=` counts them; `accounts_unread=` names each pool that could \
-         not be read, whose rows are unknown): `account pool=<cli> id=<pct> condition=<word> \
+         not be read, whose rows are unknown; `moves_7d=` and `last_move=` are the rotations \
+         a session proved on its ledgers, `move_tries_7d=` those it tried, `-` where it cannot say): `account pool=<cli> id=<pct> condition=<word> \
          enrolled=<0|1> pct5=<n|-> pct7=<n|-> week_reset=<unix s|-> walled_until=<unix s|-> \
-         last_used=<unix s|->` (on this machine's clock; an id holding an `@` is sent as \
-         `ab…@…`, so no email is), and one `server_heard vault=<pct> subject=<age1…> at=<unix s>` \
+         last_used=<unix s|-> read_at=<unix s|->` (on this machine's clock; an id holding an `@` \
+         is sent as `ab…@…`, so no email is; `read_at`: when its figures were last read, from the \
+         records or a Codex row's own rollouts, since a survey asks no provider: a row with a \
+         window read full says `limited`, and one with no reading in six hours says `unseen`, \
+         not `usable`), and one `server_heard vault=<pct> subject=<age1…> at=<unix s>` \
          row per subscriber a vault served here last heard from. A `session` row is `local= \
          sid= state= \
          program=<pct|-> program_kind=<agent|shell|program|-> wait=<memory|-> \
@@ -4233,6 +4420,30 @@ pub const VERBS: &[VerbSpec] = &[
     )
     .for_fleet(),
     va(
+        "board",
+        Read,
+        Lines,
+        Meta,
+        OwnerOnly,
+        "board [--json]: every worker this Mac started, its Mac, state, landing and accept",
+        "— Owner-only; a member this Mac lets drive it reads it over a drive (`aterm ctl --host \
+         <h> board`). Replies `OK <n>`, a `board host=<pct|-> rows=<n> shown=<n> open=<n> \
+         unread=<n>` header, then one `worker` row per worker, oldest first, every open row \
+         and then the newest closed ones, at most 512 in 192 KiB: \
+         `sid= label= node=<32 hex|-> host= program= model= account= autopilot= cwd= \
+         brief=sha256:<64 hex> brief_bytes= from= started_ms= \
+         state=<working|done|exited|stalled|failed|closed> rev= conclusion= why= \
+         checked=<12 hex>@<ref>|pushed|no-remote|no-repo|gone landed=<12 hex> attention= \
+         accept= accept_ms= heard_ms= after= area=`, values percent-encoded, `-` for none \
+         (`node=-`: this Mac; never the brief's text). A row is written when `aterm ctl \
+         [--host <h>|any] spawn agent=… [label=<word>]` starts a worker (`label=` stays on \
+         this Mac), and moved on by the aterm serving it, which waits on each open row, and \
+         by a wait here that asks a worker where its row says it runs. `aterm ctl board \
+         accept <@sid|label> <word>` records the package's accept result on this Mac's board, \
+         and `aterm ctl [--host <h>] await task board [any|all] [since=<rev>]` waits on every \
+         open row (`docs/DESIGN-fleet-task-board-2026-11-04.md`).",
+    ),
+    va(
         "exits",
         Owner,
         Lines,
@@ -4240,11 +4451,16 @@ pub const VERBS: &[VerbSpec] = &[
         OwnerOnly,
         "exits [<n>] [since=<id>]: the instance EXIT LEDGER (Owner-only)",
         "— one `exit <id> t=<ms> sid=<sid> local=<n> \
-         reason=<shell-exit|ctl-close|ui-close|window-close|unknown> exit_code=<n|-> \
-         by=<sid|human|ctl|bridge|harness|->` line per exited session, read from the closed-session \
-         index (its last 512 closes, in the order they left the registry; also pushed live via \
-         `subscribe @<sid> events` `closing reason= by=` and `subscribe … sessions` \
-         `session-exited <sid> reason=`).",
+         reason=<shell-exit|ctl-close|ui-close|window-close|reaper|unknown> exit_code=<n|-> \
+         by=<sid|human|ctl|bridge|harness|fleet:<host>|-> left=<n|->` line per exited session \
+         (`by=` the session that asked, an owner-token `aterm ctl` run from a tab included; `ctl` \
+         a client in no tab; `fleet:<host>` another Mac's drive; the closed tab's own `tab \
+         act=close` mark in its `log` names the same actor), read from \
+         the closed-session index (its last 512 closes, in the order they left the registry; also \
+         pushed live via `subscribe @<sid> events` `closing reason= by=` and `subscribe … \
+         sessions` `session-exited <sid> reason=`). `left=` counts the processes the tab left \
+         running that `end` takes (`sys left scope=aterm` lists them), `-` where the leftover \
+         view keeps no record of the close.",
     )
     .input(Input::NONE),
     va(
@@ -4637,6 +4853,51 @@ pub fn catalog_lines_full() -> impl Iterator<Item = String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn wait_naming_uses_status_framing_except_for_json() {
+        use super::{Framing, framing_of};
+        for request in ["sys name job=b1", "@s-a sys name task=7"] {
+            assert_eq!(framing_of("sys", request), Framing::Status, "{request}");
+        }
+        for request in [
+            "sys name job=b1 --json",
+            "@s-a sys name task=7 json",
+            "sys jobs",
+            "sys why",
+        ] {
+            assert_eq!(framing_of("sys", request), Framing::Lines, "{request}");
+        }
+    }
+
+    /// A home-relative `cwd=` is `~` or `~/<path>` with no `..`; another account's home and a
+    /// path that may climb out are refused; an absolute or plain path is no home-relative one.
+    #[test]
+    fn a_home_cwd_stays_in_the_driven_macs_home() {
+        use super::home_cwd;
+        for (value, path) in [
+            ("~", ""),
+            ("~/", ""),
+            ("$HOME/trust", "trust"),
+            ("$HOME/trust/", "trust"),
+            ("~/My Project/src", "My Project/src"),
+            ("~/a..b", "a..b"),
+            ("~//etc", "etc"),
+            ("~///", ""),
+        ] {
+            assert_eq!(home_cwd(value), Some(Ok(path)), "{value}");
+        }
+        for refused in ["~bob/trust", "~bob", "~/..", "~/a/../../etc", "~/../x"] {
+            assert!(
+                matches!(home_cwd(refused), Some(Err(_))),
+                "{refused}: {:?}",
+                home_cwd(refused)
+            );
+        }
+        for other in ["/Users//a/trust", "trust", "", "./~"] {
+            assert_eq!(home_cwd(other), None, "{other}");
+        }
+    }
+
+    #[test]
     fn the_host_gone_line_round_trips_and_nothing_else_reads_as_it() {
         use super::{host_gone, host_gone_line};
         let sock = "/Users//a b/Library/Application Support/aterm/aterm-4242.sock";
@@ -4766,6 +5027,7 @@ mod tests {
         assert_eq!(framing_of("temporal", "temporal"), Bytes);
         assert_eq!(framing_of("temporal", "temporal 1200"), Bytes);
         assert_eq!(framing_of("temporal", "@s-a temporal status"), Status);
+        assert_eq!(framing_of("temporal", "temporal judge"), Status);
         assert_eq!(framing_of("rewind", "rewind"), Status);
         assert_eq!(framing_of("rewind", "rewind open ago=30"), Status);
         assert_eq!(framing_of("rewind", "rewind step -1"), Status);

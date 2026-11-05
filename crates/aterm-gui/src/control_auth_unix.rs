@@ -108,7 +108,7 @@ pub(crate) fn provision_token(path: &Path) -> Option<String> {
 pub(super) fn write_fresh_token(path: &Path, token: &str) -> Option<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
-    opts.custom_flags(libc::O_NOFOLLOW);
+    opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     let f = opts.open(path).ok()?;
     f.set_permissions(std::fs::Permissions::from_mode(0o600))
         .ok()?;
@@ -117,12 +117,48 @@ pub(super) fn write_fresh_token(path: &Path, token: &str) -> Option<()> {
     f.flush().ok()
 }
 
+/// How long [`SocketOwner::hold`] waits out another launch's probe, which holds a free lock only
+/// from its `try_lock` to its `unlock`.
+const SOCKET_OWNER_PATIENCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// This instance's hold on its control socket while it serves it: the `flock` on the socket's
+/// token file, which [`socket_is_live`](super::socket_is_live) probes. A stopped or unscheduled
+/// instance refuses a connect once its queue fills, exactly as a dead socket does; the lock tells
+/// them apart, and the kernel lets go when the process ends, however it ends.
+#[derive(Debug)]
+pub(crate) struct SocketOwner {
+    _held: crate::native_document_host::HeldAdvisoryLock,
+}
+
+impl SocketOwner {
+    /// Take the lock on the token file this instance just wrote: `None`, holding nothing, if it
+    /// cannot be taken (a filesystem with no `flock`), which leaves the socket judged by a connect
+    /// alone.
+    pub(crate) fn hold(token_path: &Path) -> Option<Self> {
+        use crate::native_document_host::{AdvisoryLockRefusal, acquire_advisory_lock_within};
+        let taken = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(token_path)
+            .map_err(AdvisoryLockRefusal::Failed)
+            .and_then(|file| acquire_advisory_lock_within(file, SOCKET_OWNER_PATIENCE));
+        let why = match taken {
+            Ok(held) => return Some(Self { _held: held }),
+            Err(AdvisoryLockRefusal::Busy) => "another holder".to_string(),
+            Err(AdvisoryLockRefusal::Failed(error)) => error.to_string(),
+        };
+        aterm_log::info!(
+            "control socket owner lock on {} not held: {why}",
+            token_path.display()
+        );
+        None
+    }
+}
+
 /// Tighten the bound socket file to mode `0600` so only the owner can connect even if it somehow
 /// lands in a shared directory.
 pub(crate) fn lock_socket_file(path: &str) {
-    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    let _ = aterm_uds::atomic_file::set_mode_nofollow(Path::new(path), 0o600);
 }
 
 /// The connecting peer's effective uid (`getpeereid(2)` on macOS/BSD, `SO_PEERCRED` on Linux) via

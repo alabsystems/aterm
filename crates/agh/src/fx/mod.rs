@@ -300,12 +300,38 @@ fn not_read(path: &Path, e: &std::io::Error) -> Error {
 }
 
 #[cfg(target_os = "macos")]
-const NONBLOCK_OPEN_FLAG: i32 = 0x0004;
+const NONBLOCK_OPEN_FLAG: i32 = 0x0004 | 0x0100_0000;
 #[cfg(all(unix, not(target_os = "macos")))]
-const NONBLOCK_OPEN_FLAG: i32 = 0o4000;
+const NONBLOCK_OPEN_FLAG: i32 = 0o4000 | 0o2_000_000;
 
 #[cfg(unix)]
 const TAPE_STREAM_BUDGET: Duration = Duration::from_secs(5);
+
+/// The budget a test set for reading a piped tape, in milliseconds (0: none set).
+#[cfg(all(unix, any(test, debug_assertions)))]
+static TAPE_STREAM_BUDGET_FOR_TEST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Read a piped tape within `budget` instead of `TAPE_STREAM_BUDGET`, for this process.
+///
+/// A test whose own writer must finish the tape sets the hang detector here: a loaded machine
+/// that stalls that writer past the product's 5 s would otherwise read the tape as timed out.
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[doc(hidden)]
+pub fn set_tape_stream_budget_for_test(budget: Duration) {
+    let ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1);
+    TAPE_STREAM_BUDGET_FOR_TEST_MS.store(ms, Ordering::Relaxed);
+}
+
+/// `TAPE_STREAM_BUDGET`, or the budget a test set with [`set_tape_stream_budget_for_test`].
+#[cfg(unix)]
+fn tape_stream_budget() -> Duration {
+    #[cfg(any(test, debug_assertions))]
+    match TAPE_STREAM_BUDGET_FOR_TEST_MS.load(Ordering::Relaxed) {
+        0 => {}
+        ms => return Duration::from_millis(ms),
+    }
+    TAPE_STREAM_BUDGET
+}
 
 #[cfg(unix)]
 fn read_pipe(file: &std::fs::File, budget: Duration) -> std::io::Result<Vec<u8>> {
@@ -344,7 +370,8 @@ fn read_pipe(file: &std::fs::File, budget: Duration) -> std::io::Result<Vec<u8>>
 }
 
 /// The tape at `path`, read whole (at most `tape::TAPE_MAX` bytes) and parsed.
-/// Unix pipes are nonblocking and must finish within five seconds.
+/// Unix pipes are nonblocking and must finish within five seconds (a test's own bound where it
+/// set one, [`set_tape_stream_budget_for_test`]).
 /// # Errors
 /// CouldNotRun, `Sub::Local`, why `the tape {path} could not be read: {e}`.
 pub(crate) fn read_tape(path: &Path) -> Result<(tape::TapeHeader, Vec<EffectRecord>)> {
@@ -380,12 +407,21 @@ pub(crate) fn read_tape(path: &Path) -> Result<(tape::TapeHeader, Vec<EffectReco
     let mut bytes = Vec::new();
     #[cfg(unix)]
     if pipe {
-        bytes = read_pipe(&file, TAPE_STREAM_BUDGET).map_err(|e| not_read(path, &e))?;
+        bytes = read_pipe(&file, tape_stream_budget()).map_err(|e| not_read(path, &e))?;
     }
     if !pipe {
-        bytes.reserve(
-            usize::try_from(meta.len().min(tape::TAPE_MAX).saturating_add(1)).unwrap_or(0),
-        );
+        if meta.len() > tape::TAPE_MAX {
+            return Err(Error::replay(
+                Replay::Format,
+                format!(
+                    "the tape {} is over {} bytes, the most a replay reads",
+                    path.display(),
+                    tape::TAPE_MAX
+                ),
+            )
+            .with_next(tape::RECORD_AGAIN));
+        }
+        bytes.reserve(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
         file.take(tape::TAPE_MAX.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|e| not_read(path, &e))?;

@@ -240,7 +240,12 @@ fn the_report_replays_under_the_windows_mode() {
     ] {
         let tmp = tmp_dir("accounts-outlook-mode");
         let env = env_at(&tmp);
-        std::fs::write(env.config.as_ref().expect("a config path"), toml).expect("write");
+        aterm_uds::atomic_file::write(
+            env.config.as_ref().expect("a config path"),
+            (toml).as_ref(),
+            0o600,
+        )
+        .expect("write");
         seeded(&tmp, &env);
         let (_, text, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
         assert!(

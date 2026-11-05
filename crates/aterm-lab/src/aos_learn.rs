@@ -24,6 +24,7 @@ use aterm_effects::aos_momentum::m6::{
     session_a, session_b,
 };
 use aterm_effects::aos_momentum::m6_policy::{RANKER_POLICY_NAME, RANKER_POLICY_VERSION};
+use aterm_uds::atomic_file::read_regular;
 
 use crate::instance::take_value;
 use crate::lab_build::{LAB_BUILD, check_build};
@@ -164,20 +165,11 @@ fn create_linked(temps: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// `path`'s bytes, at most `cap` of them; `None` when it does not exist.
 fn read_capped(path: &Path, cap: u64) -> io::Result<Option<Vec<u8>>> {
-    let f = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let mut bytes = Vec::new();
-    f.take(cap + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > cap {
-        return Err(io::Error::other(format!(
-            "{} holds more than {cap} bytes",
-            path.display()
-        )));
+    match read_regular(path, cap) {
+        Ok((bytes, _)) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-    Ok(Some(bytes))
 }
 
 /// The most bytes a store file may hold as read (a version directory's cap, design §13.6).
@@ -277,9 +269,9 @@ impl LabLog {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
-        let f = match open.open(&path) {
+        let f: std::fs::File = match aterm_uds::kept_out(|| open.open(&path)) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(format!("no runner has run under {}", root.display()));
@@ -293,8 +285,6 @@ impl LabLog {
         {
             return Err(format!("{} is not a regular file", path.display()));
         }
-        aterm_uds::keep_out_of_children(&f)
-            .map_err(|e| format!("cannot configure {}: {e}", path.display()))?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the guard's own take: its Drop releases by LOCK_UN"
@@ -407,10 +397,9 @@ pub(crate) fn lock_within(
     {
         use std::os::unix::fs::OpenOptionsExt;
         open.mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
-    let f = open
-        .open(path)
+    let f: std::fs::File = aterm_uds::kept_out(|| open.open(path))
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     if !f
         .metadata()
@@ -419,8 +408,6 @@ pub(crate) fn lock_within(
     {
         return Err(format!("{} is not a regular file", path.display()));
     }
-    aterm_uds::keep_out_of_children(&f)
-        .map_err(|e| format!("cannot configure {}: {e}", path.display()))?;
     let start = Instant::now();
     loop {
         #[expect(
@@ -1003,8 +990,7 @@ fn head_of(verb: &str, root: &Path, pair: Pair) -> Result<Digest, Fail> {
 /// A nonce from the system's random source, for a store's id.
 fn nonce() -> Result<u64, Fail> {
     let mut bytes = [0_u8; 8];
-    File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
+    aterm_uds::rand::fill(&mut bytes)
         .map_err(|e| Fail::die(format!("aos-learn: cannot read /dev/urandom: {e}")))?;
     Ok(u64::from_le_bytes(bytes))
 }

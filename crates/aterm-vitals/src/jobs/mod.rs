@@ -87,7 +87,7 @@ pub struct SweepProc {
     pub pgid: u32,
     /// Its user; `None` where unread.
     pub uid: Option<u32>,
-    /// Its short name.
+    /// Its name ([`crate::model::ProcSample::name`]).
     pub name: String,
     /// Its state.
     pub state: ProcState,
@@ -122,6 +122,9 @@ pub struct JobCounters {
     pub runnable_ns: Option<u64>,
     /// Page-ins.
     pub pageins: Option<u64>,
+    /// The largest physical footprint it has had (`ri_lifetime_max_phys_footprint`); `None`
+    /// where unread.
+    pub peak_footprint: Option<u64>,
 }
 
 /// One thread.
@@ -406,6 +409,9 @@ pub struct HeldProc {
     /// The tab of the session a group-mate's environment ties it to while that session lives,
     /// for one outside every job (the host's W-session read; its own environment is never read).
     pub tab: Option<u64>,
+    /// The kind of job that tie names it by, for one outside every job: an agent's call where it
+    /// was born after that session's agent started (`left::Tie::after_agent`), else none.
+    pub job: Option<JobKind>,
     /// When it forked, unix ms; `None` where unread.
     pub started_ms: Option<u64>,
 }
@@ -680,6 +686,54 @@ pub struct Want {
     pub pid: u32,
     /// Whether its descriptors are needed.
     pub fds: bool,
+}
+
+/// A job that ended, as its passes read it ([`Jobs::take_ended`]): what its telemetry row is
+/// made of. Its figures are the passes' (every 2 s while a job runs): `ended_ms` is the pass that
+/// found it gone, `peak_bytes` and `cpu_ns` the most any pass read, so lower bounds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ended {
+    /// Its tab's key (the session id).
+    pub tab: u64,
+    /// The OSC 133 block it was the foreground job of, if one.
+    pub block: Option<u64>,
+    /// Its kind.
+    pub kind: JobKind,
+    /// Who waited for it.
+    pub consumer: Consumer,
+    /// Its id.
+    pub id: String,
+    /// Its command, as the join named it (an agent call's) or the block read it; may be empty.
+    pub command: String,
+    /// The program name its last pass showed.
+    pub name: String,
+    /// The pass that first tracked it, host ms.
+    pub opened_ms: u64,
+    /// The last pass that read it alive, host ms.
+    pub last_read_ms: Option<u64>,
+    /// The pass that found it gone, host ms.
+    pub ended_ms: u64,
+    /// Its exit status, where its block said it.
+    pub exit: Option<i32>,
+    /// The largest lifetime-peak footprint a pass read of a member, bytes.
+    pub peak_bytes: Option<u64>,
+    /// The most CPU a pass read its members (and the children they reaped) to have spent, ns.
+    pub cpu_ns: Option<u64>,
+    /// Its last pass judged it stuck.
+    pub stuck: bool,
+}
+
+/// What the passes read so far of a block's foreground job ([`Jobs::block_meters`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockMeter {
+    /// Its tab's key (the session id).
+    pub tab: u64,
+    /// The block.
+    pub block: u64,
+    /// The largest lifetime-peak footprint a pass read of a member other than the shell, bytes.
+    pub peak_bytes: Option<u64>,
+    /// Its last pass judged it stuck.
+    pub stuck: bool,
 }
 
 /// What kind of unit a job is.

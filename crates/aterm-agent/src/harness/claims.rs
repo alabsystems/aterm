@@ -1404,9 +1404,14 @@ fn on_table<T>(f: impl FnOnce(&dyn Table) -> T) -> Option<T> {
 
 /// Every row the table under `home` holds and how this Mac sees them, where this process has a
 /// table and it is readable.
-#[must_use]
-pub fn read_book(home: &std::path::Path) -> Option<(View, Book)> {
-    let read = on_table(|table| table.read(home))?.ok()?;
+///
+/// # Errors
+/// The installed table cannot be read, including a busy membership roster. Absence means no
+/// table is installed, never a transient failure of the table's read.
+pub fn read_book(home: &std::path::Path) -> Result<Option<(View, Book)>, String> {
+    let Some(read) = on_table(|table| table.read(home)).transpose()? else {
+        return Ok(None);
+    };
     let view = View {
         me: read.me,
         presence: presence_now(),
@@ -1417,7 +1422,7 @@ pub fn read_book(home: &std::path::Path) -> Option<(View, Book)> {
             .collect(),
         held: holds(&read.held, &homes_at(home)),
     };
-    Some((view, read.book))
+    Ok(Some((view, read.book)))
 }
 
 /// Claim or look at `cli`'s accounts for this Mac at `now` (`act`), and record in its accounts

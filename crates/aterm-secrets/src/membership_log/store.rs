@@ -489,6 +489,30 @@ impl Store {
         self.lineage.as_deref()
     }
 
+    /// The exact genesis this empty store requires, independently of signer-key admission.
+    #[must_use]
+    pub const fn pinned_network(&self) -> Option<RecordId> {
+        self.compiled
+    }
+
+    /// Keep an already-verified causal projection with this store's admission context.
+    #[cfg(unix)]
+    pub(crate) fn projected(mut self, log: Log) -> Result<Self> {
+        if self
+            .log()
+            .is_none_or(|held| held.network() != log.network())
+            || self.budgets != log.budgets()
+        {
+            return Err(Error::new(
+                "membership projection changed its root or budgets",
+            ));
+        }
+        self.network = Some(*log.network());
+        self.log = Some(log);
+        self.unrooted.clear();
+        Ok(self)
+    }
+
     /// Decode and verify a persisted record stream for vault `name`.
     ///
     /// # Errors

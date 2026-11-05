@@ -63,10 +63,11 @@ pub const USAGE: &str = "\
                 --repeat N: each row N times, each in its own clone. Every row also reads the dialog census
                 (each window owner that appears, the guest helper polling the window list every 250 ms with
                 no Screen Recording grant), tccd's consent prompts, xcode-select -p, and the ALab guard:
-                alab-secrets.local unreached and no _alab-vault._tcp advert in the guest, none from a guest
-                on this Mac's tart bridge (an advert whose host resolves to this Mac's own addresses is this
-                Mac's, named and never a failure; the vault port is null-routed in every guest but to
-                loopback and tart's own network). Rows (default all), each step under a 300 s hang detector:
+                alab-secrets.local unreached and no _alab-vault._tcp or _alab._tcp (ALab's members) advert
+                in the guest, none of either from a guest on this Mac's tart bridge (an advert whose host
+                resolves to this Mac's own addresses is this Mac's, named and never a failure; the vault
+                port 7484 and the members' port 7100 are null-routed in every guest but to loopback and
+                tart's own network). Rows (default all), each step under a 300 s hang detector:
                   init-apply       aterm init --json on a terminal, each prompt answered with its default
                                    (a vault join password with none): first byte, end, prompts, lines,
                                    exit, every row's elapsed_ms (the slowest named), Dock/Finder/
@@ -231,15 +232,27 @@ const SETUP_RECORD: &str = "Library/Application Support/aterm/doctor/initial-set
 /// How often the wait on setup looks at the guest.
 const SETUP_POLL: Duration = Duration::from_secs(1);
 
-/// The guest's packet filter: the ALab vault's port refused to every address but loopback and
-/// tart's own network (where a lab vault of another guest lives), the host's end of it included,
-/// so no guest reaches a vault on this Mac's LAN whatever its names resolve to. Names are left as
-/// they are, so a guest off the ALab LAN looks the ALab vault up as such a Mac does.
+/// The guest's packet filter: the ALab vault's port and its members' (the fleet port, where each
+/// member's join desk answers [`ALAB_MEMBER_SERVICE`]) each refused to every address but loopback
+/// and tart's own network (where a lab vault or lab member of another guest lives), the host's
+/// end of it included, so no guest reaches a vault or a member on this Mac's LAN whatever its
+/// names resolve to (A12: a lab identity never joins the live log). Names are left as they are,
+/// so a guest off the ALab LAN looks the ALab vault up as such a Mac does.
 const PF_GUARD: &str = "block return out quick proto tcp from any to 192.168.64.1 port 7484
 pass out quick proto tcp from any to 127.0.0.0/8 port 7484
 pass out quick proto tcp from any to 192.168.64.0/24 port 7484
 block return out quick proto tcp from any to any port 7484
+block return out quick proto tcp from any to 192.168.64.1 port 7100
+pass out quick proto tcp from any to 127.0.0.0/8 port 7100
+pass out quick proto tcp from any to 192.168.64.0/24 port 7100
+block return out quick proto tcp from any to any port 7100
 ";
+
+/// The ports [`PF_GUARD`] refuses: the vault's and the members' (fleet) port.
+const PF_GUARDED: [u16; 2] = [
+    aterm_secrets::DEFAULT_PORT,
+    aterm_net::fleet_member::DEFAULT_PORT,
+];
 
 /// The ceiling of `first-launch`'s wait on setup: past it the wait ends even while setup still
 /// moves (it ends sooner once setup is done, or stood still a minute with nothing new from the
@@ -272,6 +285,10 @@ const LATEST_POINTER: &str =
 /// The ALab vault's host and service type: a guest that reaches either never runs the vault row.
 const ALAB_HOST: &str = "alab-secrets.local";
 const ALAB_SERVICE: &str = "_alab-vault._tcp";
+
+/// ALab's members service, whose join desks a lab identity never asks: a guest that hears another
+/// Mac answer it, or advertises it, fails the row.
+const ALAB_MEMBER_SERVICE: &str = aterm_secrets::discover::MEMBER_SERVICE;
 
 /// The pty driver: `drive.exp <record> <limit_s> <cmd> [arg...]`. A known prompt is answered at
 /// once; any other partial line left 1.5 s is a prompt, answered with Enter (its default). Each
@@ -2782,6 +2799,34 @@ pub fn alab_probe_verdict(
     ))
 }
 
+/// What the guest heard of ALab's members ([`ALAB_MEMBER_SERVICE`], whose join desks a lab
+/// identity never asks): no advert, or only this Mac's own, whose member port the guest's
+/// [`PF_GUARD`] refuses.
+///
+/// # Errors
+/// The guest heard a member that is not this Mac answer, or its browse did not run, so no advert
+/// is unproven: the row must not go on.
+pub fn member_probe_verdict(adverts: &Result<advert::Split, String>) -> Result<String, String> {
+    let adverts = adverts.as_ref().map_err(|why| {
+        format!(
+            "the guest's browse of {ALAB_MEMBER_SERVICE} did not run ({why}), so no advert is unproven"
+        )
+    })?;
+    if !adverts.others.is_empty() {
+        return Err(format!(
+            "the guest heard an ALab member answer ({} {ALAB_MEMBER_SERVICE} advert(s): {})",
+            adverts.others.len(),
+            adverts.others.join(", ")
+        ));
+    }
+    let own = adverts.this_macs_text();
+    Ok(if own.is_empty() {
+        format!("no {ALAB_MEMBER_SERVICE} advert")
+    } else {
+        format!("no {ALAB_MEMBER_SERVICE} advert but {own}")
+    })
+}
+
 /// Whether a `dns-sd -B` transcript shows a browse that ran: its `...STARTING...` line, which
 /// `dns-sd` prints once its browse call succeeded, and no failed call (`DNSService call failed`,
 /// mDNSResponder unreachable) or error code. A browse that hears nothing prints no line after
@@ -2838,8 +2883,8 @@ pub fn bridge_heard(browse: &str, name_of: &dyn Fn(u32) -> Option<String>) -> Ve
 }
 
 /// The ALab guard every row ends with: the guest's look at the ALab vault ([`alab_probe_verdict`])
-/// and this Mac's for a guest's production advert ([`host_guests`]); either one failing fails
-/// the row.
+/// and at ALab's members ([`member_probe_verdict`]), and this Mac's for a guest's production
+/// advert of either ([`host_guests`]); any one failing fails the row.
 fn alab_guard(g: &Guest, run: &Path, row: &mut Row) -> Result<(), Fail> {
     let seen = g.run(
         &format!(
@@ -2857,25 +2902,34 @@ fn alab_guard(g: &Guest, run: &Path, row: &mut Row) -> Result<(), Fail> {
         Ok(text) => row.cell("ALab probe", Value::Text(text)),
         Err(why) => row.fail(why),
     }
-    match host_guests(run, ALAB_SERVICE)? {
-        Err(why) => row.fail(format!(
-            "this Mac's browse of {ALAB_SERVICE} did not run ({why}), so no advert from a guest is unproven"
-        )),
-        Ok(heard) if heard.others.is_empty() => {
-            let own = heard.this_macs_text();
-            row.cell(
-                "production adverts from guests",
-                Value::Text(if own.is_empty() {
-                    "none".into()
-                } else {
-                    format!("none ({own})")
-                }),
-            );
+    match member_probe_verdict(&guest_heard(g, ALAB_MEMBER_SERVICE)?) {
+        Ok(text) => row.cell("ALab members probe", Value::Text(text)),
+        Err(why) => row.fail(why),
+    }
+    for (service, cell) in [
+        (ALAB_SERVICE, "production adverts from guests"),
+        (ALAB_MEMBER_SERVICE, "member adverts from guests"),
+    ] {
+        match host_guests(run, service)? {
+            Err(why) => row.fail(format!(
+                "this Mac's browse of {service} did not run ({why}), so no advert from a guest is unproven"
+            )),
+            Ok(heard) if heard.others.is_empty() => {
+                let own = heard.this_macs_text();
+                row.cell(
+                    cell,
+                    Value::Text(if own.is_empty() {
+                        "none".into()
+                    } else {
+                        format!("none ({own})")
+                    }),
+                );
+            }
+            Ok(heard) => row.fail(format!(
+                "this Mac heard a guest advertise {service}: {}",
+                heard.others.join(", ")
+            )),
         }
-        Ok(heard) => row.fail(format!(
-            "this Mac heard a guest advertise {ALAB_SERVICE}: {}",
-            heard.others.join(", ")
-        )),
     }
     Ok(())
 }
@@ -3210,9 +3264,12 @@ fn guest(
         ),
         STEP,
     )?;
-    if !rules.contains("7484") {
+    if let Some(port) = PF_GUARDED
+        .iter()
+        .find(|port| !rules.contains(&format!("port = {port}")))
+    {
         return Err(Fail::die(format!(
-            "the guest's packet filter did not take the vault port's null route: {}",
+            "the guest's packet filter did not take port {port}'s null route: {}",
             squeeze(rules.trim(), 200)
         )));
     }
@@ -5801,7 +5858,8 @@ fn build_helper(share: &Path) -> Result<(), Fail> {
         )));
     };
     let copy = share.join(GUEST_HELPER);
-    std::fs::copy(&built, &copy).map_err(|e| format!("{}: {e}", built.display()))?;
+    crate::util::copy_regular_file(&built, &copy)
+        .map_err(|e| format!("{}: {e}", built.display()))?;
     Ok(())
 }
 
@@ -5867,11 +5925,8 @@ fn record(file: &Path, text: &str) -> Result<(), Fail> {
     if let Some(dir) = file.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(file)
-        .map_err(|e| format!("{}: {e}", file.display()))?;
+    let mut f =
+        crate::util::append_regular_file(file).map_err(|e| format!("{}: {e}", file.display()))?;
     f.write_all(text.as_bytes())
         .map_err(|e| Fail::die(format!("{}: {e}", file.display())))
 }
@@ -5899,10 +5954,10 @@ pub fn cmd_nux(args: &[String]) -> Res {
     let share = run.join("share");
     std::fs::create_dir(&share).map_err(|e| format!("{}: {e}", share.display()))?;
     for (name, text) in [("drive.exp", DRIVE), ("notty.pl", NOTTY)] {
-        std::fs::write(share.join(name), text).map_err(|e| format!("{name}: {e}"))?;
+        crate::util::write_fresh(&share.join(name), text).map_err(|e| format!("{name}: {e}"))?;
     }
     let install = paths().repo.join("tools/install.sh");
-    std::fs::copy(&install, share.join("install.sh"))
+    crate::util::copy_regular_file(&install, share.join("install.sh"))
         .map_err(|e| format!("{}: {e}", install.display()))?;
     build_helper(&share)?;
     let app = if ask.scenarios.iter().any(|s| s.needs_app()) {
@@ -6269,6 +6324,69 @@ mod tests {
             "4 entries; doctor/: initial-setup.json, first-run.json"
         );
         assert_eq!(state_summary("./pkg\n"), "1 entries; doctor/: none");
+    }
+
+    /// A12: the guest's packet filter refuses both ALab ports, the vault's and its members'
+    /// (each as its crate names it), to this Mac and to every address off tart's network, the
+    /// host's refusal before tart's pass (a `quick` rule ends the match), loopback passed.
+    #[test]
+    fn the_guests_packet_filter_refuses_the_vault_and_member_ports_off_tarts_network() {
+        assert_eq!(ALAB_MEMBER_SERVICE, "_alab._tcp");
+        let lines: Vec<&str> = PF_GUARD.lines().collect();
+        assert_eq!(lines.len(), 4 * PF_GUARDED.len(), "{PF_GUARD}");
+        for port in PF_GUARDED {
+            let at = |verb: &str, to: &str| {
+                let rule = format!("{verb} out quick proto tcp from any to {to} port {port}");
+                lines
+                    .iter()
+                    .position(|line| *line == rule)
+                    .unwrap_or_else(|| panic!("no rule {rule:?} in {PF_GUARD}"))
+            };
+            let host = at("block return", "192.168.64.1");
+            assert!(host < at("pass", "192.168.64.0/24"), "port {port}");
+            assert!(
+                at("pass", "127.0.0.0/8") < at("block return", "any"),
+                "port {port}"
+            );
+            assert!(
+                at("pass", "192.168.64.0/24") < at("block return", "any"),
+                "port {port}"
+            );
+        }
+    }
+
+    /// A12: the guest's look at ALab's members fails the row on any answer that is not this
+    /// Mac's own (whose member port the packet filter refuses), and on a browse that did not run.
+    #[test]
+    fn the_members_probe_fails_a_row_that_heard_another_mac_answer_alabs_members() {
+        let none = Ok(advert::Split::default());
+        assert_eq!(member_probe_verdict(&none).unwrap(), "no _alab._tcp advert");
+        let this_macs = Ok(advert::Split {
+            others: Vec::new(),
+            this_macs: vec!["alab-1a2b3c4d heard over the guest's interface 6".into()],
+        });
+        assert_eq!(
+            member_probe_verdict(&this_macs).unwrap(),
+            "no _alab._tcp advert but this Mac's own alab-1a2b3c4d heard over the guest's \
+             interface 6"
+        );
+        // NEGATIVE CONTROLS: another Mac's answer, or a browse that did not run, fails the row.
+        let another = Ok(advert::Split {
+            others: vec![
+                "alab-9f8e7d6c on the guest's interface 1 (m22.local 192.168.1.40)".into(),
+            ],
+            this_macs: Vec::new(),
+        });
+        assert_eq!(
+            member_probe_verdict(&another).unwrap_err(),
+            "the guest heard an ALab member answer (1 _alab._tcp advert(s): alab-9f8e7d6c on the \
+             guest's interface 1 (m22.local 192.168.1.40))"
+        );
+        assert_eq!(
+            member_probe_verdict(&Err("its transcript is empty".into())).unwrap_err(),
+            "the guest's browse of _alab._tcp did not run (its transcript is empty), so no advert \
+             is unproven"
+        );
     }
 
     #[test]

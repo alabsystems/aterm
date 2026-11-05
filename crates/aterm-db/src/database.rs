@@ -9,7 +9,7 @@ use crate::{
     Error, Result,
     crypto::{self, Opened},
 };
-use astream_wire::sync::{Actor, Digest, Index, Projection};
+use astream_wire::sync::{Actor, Digest, Header, Index, Projection, sequence_follows};
 use aterm_codec::hex;
 use aterm_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,6 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const MAX_RECORDS: usize = 20_000;
 /// Largest local atomic write set.
 pub const MAX_WRITES: usize = 64;
+/// Most retained operations one writer may hold in a generation.
+pub const MAX_WRITER_OPERATIONS: usize = 4096;
+/// Most retained ciphertext one writer may hold in a generation.
+pub const MAX_WRITER_BYTES: usize = 8 * 1024 * 1024;
 
 /// One key change within a locally atomic transaction. `None` is a permanent stop
 /// in the private database and reversible absence in Commons account proposals.
@@ -110,6 +114,10 @@ impl Command {
             _ => None,
         }
     }
+    /// Whether this write stops a key forever rather than giving it a value.
+    pub(crate) fn stops(&self) -> bool {
+        matches!(self, Self::Write { changes, .. } if changes.iter().any(|c| c.value.is_none()))
+    }
     /// Decisions signed on the authority's independent hash chain.
     pub fn is_control(&self) -> bool {
         matches!(self, Self::Budget { .. } | Self::Revoke { .. })
@@ -191,16 +199,16 @@ impl Command {
                     .and_then(Value::as_array)
                     .filter(|c| !c.is_empty() && c.len() <= MAX_WRITES)
                     .ok_or_else(|| Error::new("invalid transaction write count"))?;
-                let mut changes = Vec::new();
+                let mut changes = Vec::with_capacity(raw.len());
                 let mut unique = BTreeSet::new();
                 for c in raw {
                     keys(c, &["collection", "key", "value"])?;
-                    let collection = field(c, "collection")?.to_owned();
-                    let key = field(c, "key")?.to_owned();
-                    if !crypto::name(&collection)
+                    let collection = field(c, "collection")?;
+                    let key = field(c, "key")?;
+                    if !crypto::name(collection)
                         || collection.starts_with('_')
-                        || !crypto::name(&key)
-                        || !unique.insert((collection.clone(), key.clone()))
+                        || !crypto::name(key)
+                        || !unique.insert((collection, key))
                     {
                         return Err(Error::new("invalid or duplicate transaction key"));
                     }
@@ -211,17 +219,18 @@ impl Command {
                         crate::accounts::validate(v)?;
                     }
                     if let Some(v) = &value {
-                        match collection.as_str() {
-                            "machines" => crate::machines::validate(&key, v)?,
+                        match collection {
+                            "machines" => crate::machines::validate(key, v)?,
+                            "emails" => crate::fleet_db::validate_email_record(key, v)?,
                             "mailboxes" | "email-addresses" | "phones" => {
-                                crate::contacts::validate(&collection, v)?
+                                crate::contacts::validate(collection, v)?
                             }
                             _ => {}
                         }
                     }
                     changes.push(Change {
-                        collection,
-                        key,
+                        collection: collection.to_owned(),
+                        key: key.to_owned(),
                         value,
                     });
                 }
@@ -354,6 +363,7 @@ pub struct History {
     records: BTreeMap<Digest, (Opened, Command)>,
     refused: BTreeMap<Digest, (Opened, String)>,
     root: [u8; 32],
+    no_authority: bool,
 }
 impl History {
     /// Empty history for this dataset's admission authority.
@@ -363,7 +373,28 @@ impl History {
             records: BTreeMap::new(),
             refused: BTreeMap::new(),
             root,
+            no_authority: false,
         }
+    }
+    /// Empty history for a dataset with no authority stream: every member can derive its root
+    /// key, so a control certificate proves nothing and [`History::insert`] keeps one as inert
+    /// evidence, a causal node what a replica wrote after seeing it can still rest on.
+    pub(crate) fn without_authority(root: [u8; 32]) -> Self {
+        Self {
+            no_authority: true,
+            ..Self::new(root)
+        }
+    }
+    /// The operations and ciphertext bytes retained for `actor`, which its quotas bound.
+    pub(crate) fn writer_usage(&self, actor: &Actor) -> (usize, usize) {
+        self.records
+            .values()
+            .map(|(o, _)| o)
+            .chain(self.refused.values().map(|(o, _)| o))
+            .filter(|old| old.header.actor == *actor)
+            .fold((0, 0), |(count, bytes), old| {
+                (count + 1, usize::saturating_add(bytes, old.wire.len()))
+            })
     }
     /// Retain an authenticated causal record without applying side effects.
     /// Unsupported or unauthorized application payloads are inert evidence. They
@@ -373,26 +404,35 @@ impl History {
         if self.index.get(&id).is_some() {
             return Ok(false);
         }
-        if !opened.control {
-            let mut count = 0usize;
-            let mut bytes = opened.wire.len();
-            for old in self
-                .records
-                .values()
-                .map(|(o, _)| o)
-                .chain(self.refused.values().map(|(o, _)| o))
-                .filter(|old| old.header.actor == opened.header.actor)
+        if !opened.control || self.no_authority {
+            let (count, bytes) = self.writer_usage(&opened.header.actor);
+            if count >= MAX_WRITER_OPERATIONS
+                || bytes.saturating_add(opened.wire.len()) > MAX_WRITER_BYTES
             {
-                count += 1;
-                bytes = bytes.saturating_add(old.wire.len());
-            }
-            if count >= 4096 || bytes > 8 * 1024 * 1024 {
                 return Err(Error::new(
                     "writer's retained history quota is exhausted; preserve evidence and reconcile before admitting more",
                 ));
             }
         }
+        self.retain(opened)
+    }
+    /// A record already in this replica's journal. An earlier build kept a control record outside
+    /// the writer quotas, so counting it now would refuse the whole folder, its rekey included.
+    pub(crate) fn replay(&mut self, opened: Opened) -> Result<bool> {
+        if opened.control {
+            self.retain(opened)
+        } else {
+            self.insert(opened)
+        }
+    }
+    fn retain(&mut self, opened: Opened) -> Result<bool> {
+        let id = opened.header.id;
         let decoded = Command::decode(&opened.plaintext).and_then(|command| {
+            if opened.control && self.no_authority {
+                return Err(Error::new(
+                    "this dataset has no authority stream; a control record has no effect in it",
+                ));
+            }
             if command.is_control() != opened.control {
                 return Err(Error::new(
                     "application command is signed under the wrong authority domain",
@@ -402,6 +442,13 @@ impl History {
                 && *actor == opened.header.actor
             {
                 return Err(Error::new("authority stream cannot revoke itself"));
+            }
+            // A stop cannot be undone and every member can sign one: with no authority stream it
+            // would hide a row for good on every replica, so it stays inert evidence.
+            if self.no_authority && command.stops() {
+                return Err(Error::new(
+                    "this dataset has no authority stream; a permanent stop has no effect in it",
+                ));
             }
             Ok(command)
         });
@@ -442,7 +489,7 @@ impl History {
             .get(id)
             .map(|(o, _)| o)
             .or_else(|| self.refused.get(id).map(|(o, _)| o))?;
-        let projection = self.index.project();
+        let projection = self.project(&BTreeSet::new());
         let reverts = self.command(id).and_then(|(_, c)| match c {
             Command::Revert { operation, .. } => Some(hex::encode_lower(operation)),
             _ => None,
@@ -484,7 +531,10 @@ impl History {
         if self.index.get(id).is_none() {
             return Err(Error::new("operation is not retained"));
         }
-        let mut past = Self::new(self.root);
+        let mut past = Self {
+            no_authority: self.no_authority,
+            ..Self::new(self.root)
+        };
         for prior in self
             .index
             .inventory()
@@ -496,7 +546,7 @@ impl History {
                 .map(|(o, _)| o)
                 .or_else(|| self.refused.get(prior).map(|(o, _)| o))
                 .ok_or_else(|| Error::new("causal record has no retained ciphertext"))?;
-            past.insert(opened.clone())?;
+            past.replay(opened.clone())?;
         }
         Ok(past.view())
     }
@@ -524,6 +574,104 @@ impl History {
         }
         Ok(found.map(|(_, id)| id))
     }
+    /// The causal projection. Where every member can mint a writer, one member's fork must not
+    /// withhold what the others wrote after seeing it.
+    fn project(&self, excluded: &BTreeSet<Digest>) -> Projection {
+        if self.no_authority {
+            self.project_own_effects(excluded)
+        } else {
+            self.index.project_excluding(excluded)
+        }
+    }
+    /// [`Index::project_excluding`] for a dataset with no authority stream. A forked writer loses
+    /// only its records from the first disputed sequence on, the ones its two branches disagree
+    /// about, and an excluded record only itself. A record that named a withheld one as a parent
+    /// stays visible, ordered after what the withheld record depended on. So a folder restored
+    /// from a backup, which then writes the sequences it wrote before, costs what it wrote since.
+    fn project_own_effects(&self, excluded: &BTreeSet<Digest>) -> Projection {
+        let headers: BTreeMap<&Digest, &Header> = self
+            .index
+            .inventory()
+            .filter_map(|id| self.index.get(id).map(|header| (id, header)))
+            .collect();
+        let mut claims = BTreeMap::<(Actor, u64), Digest>::new();
+        let mut disputed = BTreeMap::<Actor, u64>::new();
+        for header in headers.values() {
+            let earlier = header.previous.map(|id| (header.sequence - 1, id));
+            for (sequence, id) in std::iter::once((header.sequence, header.id)).chain(earlier) {
+                if *claims.entry((header.actor, sequence)).or_insert(id) != id {
+                    let from = disputed.entry(header.actor).or_insert(sequence);
+                    *from = (*from).min(sequence);
+                }
+            }
+        }
+        let withheld = |header: &Header| {
+            excluded.contains(&header.id)
+                || disputed
+                    .get(&header.actor)
+                    .is_some_and(|from| header.sequence >= *from)
+        };
+        let mut out = Projection {
+            quarantined: disputed.keys().copied().collect(),
+            ..Projection::default()
+        };
+        let mut waiting = BTreeMap::<Digest, usize>::new();
+        let mut children = BTreeMap::<Digest, Vec<Digest>>::new();
+        let mut edges = BTreeMap::<Digest, BTreeSet<Digest>>::new();
+        let mut ready = BTreeSet::new();
+        for header in headers.values() {
+            out.pending.insert(header.id);
+            if withheld(header)
+                || header.previous.is_some_and(|previous| {
+                    !headers.get(&previous).is_some_and(|parent| {
+                        parent.actor == header.actor
+                            && sequence_follows(parent.sequence, header.sequence)
+                    })
+                })
+            {
+                continue;
+            }
+            let mut parents = BTreeSet::new();
+            let mut walked = BTreeSet::new();
+            let mut todo = header.parents.clone();
+            while let Some(parent) = todo.pop() {
+                if !walked.insert(parent) {
+                    continue;
+                }
+                match headers.get(&parent) {
+                    Some(hidden) if withheld(hidden) => todo.extend(&hidden.parents),
+                    _ => {
+                        parents.insert(parent);
+                    }
+                }
+            }
+            waiting.insert(header.id, parents.len());
+            if parents.is_empty() {
+                ready.insert(header.id);
+            }
+            for parent in &parents {
+                children.entry(*parent).or_default().push(header.id);
+            }
+            edges.insert(header.id, parents);
+        }
+        while let Some(id) = ready.pop_first() {
+            out.pending.remove(&id);
+            out.ordered.push(id);
+            out.heads.insert(id);
+            for parent in edges.get(&id).into_iter().flatten() {
+                out.heads.remove(parent);
+            }
+            for child in children.get(&id).into_iter().flatten() {
+                if let Some(count) = waiting.get_mut(child) {
+                    *count -= 1;
+                    if *count == 0 {
+                        ready.insert(*child);
+                    }
+                }
+            }
+        }
+        out
+    }
     /// Pure deterministic view. Invalid accounting never creates usable capacity.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -550,12 +698,13 @@ impl History {
         )
     )]
     pub fn view(&self) -> View {
-        let evidence = self.index.project();
-        let mut authority_fault = evidence
-            .quarantined
-            .iter()
-            .any(|actor| actor[..32] == self.root)
-            || self.refused.values().any(|(opened, _)| opened.control);
+        let evidence = self.project(&BTreeSet::new());
+        let mut authority_fault = !self.no_authority
+            && (evidence
+                .quarantined
+                .iter()
+                .any(|actor| actor[..32] == self.root)
+                || self.refused.values().any(|(opened, _)| opened.control));
         let mut requests = BTreeMap::<(Actor, [u8; 16]), Vec<Digest>>::new();
         for (id, (opened, command)) in &self.records {
             requests
@@ -606,7 +755,7 @@ impl History {
                 denied.then_some(*id)
             })
             .collect();
-        let causal = self.index.project_excluding(&excluded);
+        let causal = self.project(&excluded);
         let eligible: BTreeSet<_> = causal.ordered.iter().copied().collect();
         let mut view = View {
             causal,
@@ -685,12 +834,6 @@ impl History {
                     }
                     let reverting = matches!(command, Command::Revert { .. });
                     if let Command::Revert { operation, .. } = command {
-                        let keys = |items: &[Change]| {
-                            items
-                                .iter()
-                                .map(|c| (c.collection.clone(), c.key.clone()))
-                                .collect::<BTreeSet<_>>()
-                        };
                         let target_changes = self.command(operation).and_then(|(_, c)| match c {
                             Command::Write { changes, .. }
                                 if changes.iter().all(|c| c.value.is_some()) =>
@@ -704,7 +847,8 @@ impl History {
                             || !self.index.observes(id, operation)
                             || !eligible.contains(operation)
                             || view.invalid.contains(operation)
-                            || !target_changes.is_some_and(|target| keys(target) == keys(changes))
+                            || !target_changes
+                                .is_some_and(|target| change_keys(target) == change_keys(changes))
                         {
                             view.invalid.insert(*id);
                             continue;
@@ -768,6 +912,12 @@ impl History {
         }
         view
     }
+}
+pub(crate) fn change_keys(items: &[Change]) -> BTreeSet<(&str, &str)> {
+    items
+        .iter()
+        .map(|c| (c.collection.as_str(), c.key.as_str()))
+        .collect()
 }
 pub(crate) fn field<'a>(v: &'a Value, name: &str) -> Result<&'a str> {
     v.get(name)

@@ -2905,6 +2905,37 @@ pub(crate) fn turns_whose_edges_share_one_batch_clock_are_paired_in_order() {
     late.ordered();
 }
 
+/// An earlier engine beginning leaves a distant future vendor span for its own beginning.
+#[test]
+fn an_earlier_engine_beginning_does_not_consume_a_future_vendor_turn() {
+    let mut r = Rig::bound_at(TxState::Partial);
+    r.now = 20_000;
+    r.tx(prompt("future"));
+    let vendor = r.turn();
+    r.now = 20_020;
+    r.tx(END);
+    let vendor_records = r.records();
+    assert_eq!(r.tr.untaken().collect::<Vec<_>>(), [vendor]);
+
+    r.edge(Claimed::Working, 1_000, true);
+    assert_eq!(
+        r.tr.untaken().collect::<Vec<_>>(),
+        [vendor],
+        "an earlier beginning cannot spend a future vendor span"
+    );
+    assert!(
+        vendor_records
+            .iter()
+            .all(|record| r.records().contains(record))
+    );
+    r.edge(Claimed::Rested, 1_100, true);
+    r.edge(Claimed::Working, 20_005, true);
+    assert!(
+        r.tr.untaken().next().is_none(),
+        "its own beginning takes the span"
+    );
+}
+
 /// A REST LEAVES A LATER VENDOR TURN OPEN: the tap read the next vendor turn's prompt (its turn
 /// open, fix E1) before the parse reached the engine's end of the turn before it. That end
 /// writes nothing, the next beginning takes the open turn as its span's, and the next end closes

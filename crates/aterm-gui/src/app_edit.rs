@@ -76,6 +76,9 @@ struct OpenTicket {
     /// A program waits on the answer, or will (its `await edit` is on its
     /// way): false for an `edit … wait=0` until a waiter adopts it.
     awaited: bool,
+    /// `ro=1`: the document opens read-only, a fresh buffer nothing can change or save
+    /// (`amacs::store::DocumentStore::set_read_only`).
+    read_only: bool,
     phase: Phase,
     /// Since when no waiter has been parked on it: the orphan clock.
     unwaited_since: Option<Instant>,
@@ -117,6 +120,7 @@ impl OpenTicket {
     fn header(&self) -> crate::native_app::EditHeader {
         crate::native_app::EditHeader {
             for_word: self.for_word.clone(),
+            read_only: self.read_only,
             waiter: if !self.awaited {
                 crate::native_app::EditWaiter::Never
             } else if self.orphaned {
@@ -267,6 +271,11 @@ impl EditTickets {
             .any(|waiter| waiter.covers(ticket, entry))
     }
 
+    /// Whether `ticket` asked for its document read-only (`edit … ro=1`).
+    pub(crate) fn read_only(&self, ticket: Ticket) -> bool {
+        self.open.get(&ticket).is_some_and(|entry| entry.read_only)
+    }
+
     fn ticket_of_view(&self, view: ViewId) -> Option<Ticket> {
         self.open
             .iter()
@@ -403,6 +412,7 @@ impl App {
                 create: request.create,
                 for_word: request.for_word,
                 awaited: request.wait,
+                read_only: request.read_only,
                 phase: Phase::Admitting { reply },
                 unwaited_since: None,
                 orphaned: false,
@@ -537,6 +547,7 @@ impl App {
         let reveal = entry.line;
         let session = entry.session;
         let attention = entry.attention;
+        let awaited = entry.awaited;
         let start = self
             .document_store
             .checkpoint_seq(installed.document)
@@ -570,13 +581,15 @@ impl App {
             self.refresh_window_tabs(wid);
             self.request_native_redraw(wid);
         }
-        hold::set(
-            session,
-            hold::Hold {
-                ticket,
-                view: installed.view.get(),
-            },
-        );
+        if awaited {
+            hold::set(
+                session,
+                hold::Hold {
+                    ticket,
+                    view: installed.view.get(),
+                },
+            );
+        }
         self.start_edit_orphan_clock_if_unwaited(ticket, Instant::now());
         self.sync_edit_header(ticket);
         let ok = EditOk {
@@ -1523,6 +1536,7 @@ mod tests {
             create: false,
             for_word: None,
             wait: true,
+            read_only: false,
         }
     }
 

@@ -94,6 +94,7 @@ fn manifest(ids: &[u64]) -> SessionHandoff {
         mirror_dropped: Vec::new(),
         mirror_served: false,
         machine_names: Vec::new(),
+        retired_workers: Vec::new(),
     }
 }
 
@@ -442,10 +443,14 @@ fn a_tab_on_the_alternate_screen_carries_its_shells_whole_history() {
     let crossed = cross(dir.path(), &term, |_| {});
     assert_eq!(
         carried_history(&crossed.checkpoint),
-        0,
-        "the screen carry holds none of the saved primary's history"
+        256,
+        "the screen carry holds the newest of the saved primary's history"
     );
-    assert_eq!(crossed.joined.take as usize, crossed.parent_history.len());
+    assert_eq!(
+        crossed.joined.take as usize,
+        crossed.parent_history.len() - 256,
+        "the sidecar takes the rest"
+    );
     let (successor, report) = receive(dir.path(), &crossed);
     assert_eq!(report.lost(), 0);
     let mut successor = successor.lock().unwrap();
@@ -454,6 +459,39 @@ fn a_tab_on_the_alternate_screen_carries_its_shells_whole_history() {
         history(&successor),
         crossed.parent_history,
         "the shell's history is there when the program exits"
+    );
+}
+
+#[test]
+fn a_tab_on_the_alternate_screen_keeps_the_bounded_carry_when_the_sidecar_falls_back() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    {
+        let mut t = term.lock().unwrap();
+        write_lines(&mut t, "shell", 0, 800);
+        t.process(b"\x1b[?1049h");
+        write_lines(&mut t, "tui", 0, 30);
+    }
+    let crossed = cross(dir.path(), &term, |t| t.resize(8, 33));
+    assert_eq!(crossed.joined.fallback, Some(Fallback::FenceMoved));
+    let carried = carried_history(&crossed.checkpoint);
+    assert_eq!(
+        carried, 256,
+        "the screen carry's bound, as on the main screen"
+    );
+    assert_eq!(
+        crossed.joined.dropped,
+        crossed.parent_history.len() as u64 - carried,
+        "only what the carry does not hold is counted"
+    );
+    let (successor, report) = receive(dir.path(), &crossed);
+    assert_eq!(report.dropped, crossed.joined.dropped);
+    let mut successor = successor.lock().unwrap();
+    successor.process(b"\x1b[?1049l");
+    assert_eq!(
+        history(&successor),
+        crossed.parent_history[crossed.parent_history.len() - 256..],
+        "the shell keeps the newest of its history when the program exits"
     );
 }
 

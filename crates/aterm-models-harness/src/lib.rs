@@ -17,11 +17,16 @@
 //! and those tests, never a library.
 
 mod models_account_adopt_identity;
+mod models_account_continuation;
+pub use models_account_continuation::account_continuation_model;
+mod models_native_observation_continuity;
 mod models_scoped_input;
 mod models_scoped_native;
+pub use models_native_observation_continuity::native_observation_continuity_model;
 pub use models_scoped_input::{scoped_input_drain_model, scoped_input_seal_model};
 pub use models_scoped_native::{
-    initial_prepare_cancellation_model, native_restart_slots_model, scoped_native_handoff_model,
+    deferred_restart_resolution_model, initial_prepare_cancellation_model,
+    native_restart_slots_model, scoped_native_handoff_model,
 };
 mod models_native_preparation_queue;
 pub use models_native_preparation_queue::native_preparation_queue_model;
@@ -56,6 +61,7 @@ mod models_account_controls;
 mod models_account_create_label;
 mod models_account_dashboard;
 mod models_account_directory_admission;
+mod models_account_execution;
 mod models_account_execution_visibility;
 mod models_account_explicit_signin;
 mod models_account_gui_read;
@@ -142,6 +148,31 @@ mod models_account_usage_observation;
 mod models_account_worker_environment;
 mod models_account_workflow_scope;
 mod models_agent_verdict;
+mod models_claude_cold_admission;
+mod models_claude_live_admission;
+mod models_claude_restore_auth;
+mod models_closed_restart;
+pub use models_closed_restart::closed_restart_model;
+mod models_continuation_phase;
+pub use models_continuation_phase::continuation_phase_model;
+mod models_noexec_receipt;
+pub use models_noexec_receipt::{noexec_flight_model, noexec_receipt_model};
+mod models_issuer_journal;
+pub use models_issuer_journal::issuer_journal_model;
+mod models_issuer_grant;
+pub use models_issuer_grant::issuer_grant_model;
+mod models_terminal_publication;
+pub use models_terminal_publication::terminal_publication_model;
+mod models_noexec_successor;
+pub use models_noexec_successor::noexec_successor_model;
+mod models_native_retirement_debt;
+pub use models_native_retirement_debt::native_retirement_debt_model;
+mod models_native_account_recipe;
+pub use models_native_account_recipe::native_account_successor_recipe_model;
+mod models_preparation_publication;
+pub use models_preparation_publication::preparation_publication_model;
+mod models_native_replay_publication;
+pub use models_native_replay_publication::native_replay_publication_model;
 mod models_codex_login_publication;
 mod models_codex_refresh_authority;
 mod models_codex_refresh_identity;
@@ -150,6 +181,7 @@ mod models_codex_refresh_result;
 mod models_codex_row_identity;
 mod models_codex_stored_identity;
 mod models_codex_usage_walls;
+mod models_cold_launch_admission;
 mod models_cold_resume_capability;
 mod models_cold_resume_environment;
 mod models_custody;
@@ -205,6 +237,7 @@ pub use models_account_controls::account_controls_model;
 pub use models_account_create_label::account_create_label_model;
 pub use models_account_dashboard::account_dashboard_model;
 pub use models_account_directory_admission::account_directory_admission_model;
+pub use models_account_execution::account_execution_model;
 pub use models_account_execution_visibility::account_execution_visibility_model;
 pub use models_account_explicit_signin::account_explicit_signin_model;
 pub use models_account_gui_read::account_gui_read_model;
@@ -293,6 +326,9 @@ pub use models_account_workflow_scope::{
     account_workflow_runtime_model, account_workflow_scope_model,
 };
 pub use models_agent_verdict::claude_idle_at_composer_model;
+pub use models_claude_cold_admission::claude_cold_admission_model;
+pub use models_claude_live_admission::claude_live_admission_model;
+pub use models_claude_restore_auth::claude_restore_auth_model;
 pub use models_codex_login_publication::codex_login_publication_model;
 pub use models_codex_refresh_authority::codex_refresh_authority_model;
 pub use models_codex_refresh_identity::codex_refresh_identity_model;
@@ -301,6 +337,7 @@ pub use models_codex_refresh_result::codex_refresh_result_model;
 pub use models_codex_row_identity::codex_row_identity_model;
 pub use models_codex_stored_identity::codex_stored_identity_model;
 pub use models_codex_usage_walls::codex_usage_walls_model;
+pub use models_cold_launch_admission::cold_launch_admission_model;
 pub use models_cold_resume_capability::cold_resume_capability_model;
 pub use models_cold_resume_environment::cold_resume_environment_model;
 pub use models_custody::line_custody_model;

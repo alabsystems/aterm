@@ -13,11 +13,44 @@ use crate::transport::{self, Closer, Conn};
 /// The bridge's doors.
 #[derive(Clone, Debug)]
 pub(crate) struct Fx {
-    /// The rule a unit test switched off on the live world, for a negative control the
+    /// The rules a unit test switched off on the live world, for a negative control the
     /// seeded worlds do not reach ([`Fx::os_without`]); the simulated world reads its own.
     #[cfg(test)]
-    off: Option<crate::sim::world::Mutant>,
+    off: Vec<crate::sim::world::Mutant>,
+    /// The clock a unit test holds for the live world ([`Fx::on_a_held_clock`]); the simulated
+    /// world keeps its own.
+    #[cfg(test)]
+    held: Option<Arc<HeldClock>>,
     world: World,
+}
+
+/// A CLOCK A UNIT TEST HOLDS (critic item E04d): the live world's monotonic clock, moved only
+/// by the test ([`Fx::advance`]) and by the waits the bridge itself waits out (a park that took
+/// nothing, a sleep), never by the wall clock between them. So a grace the loop reads off it
+/// (`bridge::IDLE_ACK_GRACE`) cannot lapse while a loaded machine runs the test's steps
+/// slowly, and lapses the moment the test moves the clock past it, with no wait.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct HeldClock(std::sync::Mutex<Instant>);
+
+#[cfg(test)]
+impl HeldClock {
+    /// The held instant.
+    pub(crate) fn now(&self) -> Instant {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Move the held instant on by `by`.
+    pub(crate) fn advance(&self, by: Duration) {
+        let mut at = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *at += by;
+    }
 }
 
 /// One step of a session's refill, as the bridge took it (`Bridge::refill`, `refill_together`):
@@ -65,7 +98,9 @@ impl Fx {
         Self {
             world: World::Os,
             #[cfg(test)]
-            off: None,
+            off: Vec::new(),
+            #[cfg(test)]
+            held: None,
         }
     }
 
@@ -74,7 +109,8 @@ impl Fx {
     pub(crate) fn sim(process: Arc<crate::sim::Process>) -> Self {
         Self {
             world: World::Sim(process),
-            off: None,
+            off: Vec::new(),
+            held: None,
         }
     }
 
@@ -83,15 +119,61 @@ impl Fx {
     pub(crate) fn os_without(rule: crate::sim::world::Mutant) -> Self {
         Self {
             world: World::Os,
-            off: Some(rule),
+            off: vec![rule],
+            held: None,
         }
+    }
+
+    /// The live world with each of `rules` switched off: one negative control whose rule
+    /// another rule would mask.
+    #[cfg(test)]
+    pub(crate) fn os_without_each(rules: &[crate::sim::world::Mutant]) -> Self {
+        Self {
+            world: World::Os,
+            off: rules.to_vec(),
+            held: None,
+        }
+    }
+
+    /// This live world on a clock the test holds ([`HeldClock`]), starting at the wall clock's
+    /// now: for a rig whose mailbox only the test fills, so a park finds queued whatever it is
+    /// to take. Every clone shares the one clock.
+    #[cfg(test)]
+    pub(crate) fn on_a_held_clock(self) -> Self {
+        assert!(
+            matches!(self.world, World::Os),
+            "a simulated world keeps its own clock"
+        );
+        Self {
+            held: Some(Arc::new(HeldClock(std::sync::Mutex::new(Instant::now())))),
+            ..self
+        }
+    }
+
+    /// The clock the test holds ([`Fx::on_a_held_clock`]), to share with a fake peer that
+    /// spends the bridge's time.
+    #[cfg(test)]
+    pub(crate) fn held_clock(&self) -> Option<Arc<HeldClock>> {
+        self.held.clone()
+    }
+
+    /// Move the clock the test holds on by `by` ([`HeldClock::advance`]).
+    ///
+    /// # Panics
+    /// When this door's clock is not held ([`Fx::on_a_held_clock`]).
+    #[cfg(test)]
+    pub(crate) fn advance(&self, by: Duration) {
+        self.held
+            .as_ref()
+            .expect("only a held clock is moved by a test")
+            .advance(by);
     }
 
     /// Whether the simulated world (or a unit test, [`Fx::os_without`]) switched `rule` off.
     #[cfg(test)]
     pub(crate) fn mutant(&self, rule: crate::sim::world::Mutant) -> bool {
         match &self.world {
-            World::Os => self.off == Some(rule),
+            World::Os => self.off.contains(&rule),
             World::Sim(p) => p.mutant(rule),
         }
     }
@@ -107,7 +189,13 @@ impl Fx {
     /// The monotonic clock.
     pub(crate) fn now(&self) -> Instant {
         match &self.world {
-            World::Os => Instant::now(),
+            World::Os => {
+                #[cfg(test)]
+                if let Some(clock) = &self.held {
+                    return clock.now();
+                }
+                Instant::now()
+            }
             #[cfg(test)]
             World::Sim(p) => p.now(),
         }
@@ -123,10 +211,21 @@ impl Fx {
     }
 
     /// THE PARK: take one input, waiting at most `wait` for it, the inbox face's wait judged by
-    /// this world's clock ([`Mailbox::take`]).
+    /// this world's clock ([`Mailbox::take`]). On a clock a test holds ([`Fx::on_a_held_clock`])
+    /// the live park waits as ever, and one that took nothing moves the clock on by its wait.
     pub(crate) fn take(&self, mailbox: &Mailbox, wait: Duration) -> Option<Item> {
         match &self.world {
-            World::Os => mailbox.take(wait, self.now()),
+            World::Os => {
+                #[cfg(test)]
+                if let Some(clock) = &self.held {
+                    let item = mailbox.take(wait, clock.now());
+                    if item.is_none() {
+                        clock.advance(wait);
+                    }
+                    return item;
+                }
+                mailbox.take(wait, self.now())
+            }
             #[cfg(test)]
             World::Sim(p) => {
                 let item = mailbox.take(Duration::ZERO, p.now());
@@ -138,10 +237,18 @@ impl Fx {
         }
     }
 
-    /// A PARK WITH NO INPUT TO TAKE.
+    /// A PARK WITH NO INPUT TO TAKE. On a clock a test holds ([`Fx::on_a_held_clock`]) the live
+    /// sleep runs as ever (what it waits for, a broker's rate or a marker, keeps the wall
+    /// clock), and the clock then moves on by it.
     pub(crate) fn sleep(&self, wait: Duration) {
         match &self.world {
-            World::Os => std::thread::sleep(wait),
+            World::Os => {
+                std::thread::sleep(wait);
+                #[cfg(test)]
+                if let Some(clock) = &self.held {
+                    clock.advance(wait);
+                }
+            }
             #[cfg(test)]
             World::Sim(p) => p.idle(wait),
         }
@@ -210,7 +317,9 @@ impl Fx {
         }
     }
 
-    /// ONE REQUEST ON THE VERB LANE, `op` being the request itself.
+    /// ONE TRIP ON THE VERB LANE, `op` being the trip itself: one request, or a pipelined batch
+    /// of them ([`crate::ctl::Ctl::pipeline`], `Bridge::send_rows`). The simulation's kill
+    /// points are before and after the whole trip: none falls between two lines of a batch.
     pub(crate) fn lane<T>(&self, op: impl FnOnce() -> T) -> T {
         match &self.world {
             World::Os => op(),

@@ -532,6 +532,19 @@ fn watchdog_exit(code: i32) -> ! {
 
 /// Validate fixed dispatch before any GUI or per-user state is initialized.
 pub fn collector_entry(args: &[std::ffi::OsString]) -> u8 {
+    collector_entry_within(
+        args,
+        COLLECT_FOR + Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+}
+
+/// [`collector_entry`] with the whole-role deadline `role` ([`DEADLINE_EXIT`]) and the wait
+/// `ack` for the parent's ack in place of `COLLECT_FOR` + 5 s and 5 s: a dev build a test starts
+/// as this role, the test its parent, passes the test's hang detector. `role` wraps `ack` and
+/// the collection after it, so it must cover `ack` plus [`COLLECT_FOR`], as `COLLECT_FOR` + 5 s
+/// does for 5 s.
+pub fn collector_entry_within(args: &[std::ffi::OsString], role: Duration, ack: Duration) -> u8 {
     use std::io::{Read, Write};
     use std::sync::{
         Arc,
@@ -559,7 +572,7 @@ pub fn collector_entry(args: &[std::ffi::OsString]) -> u8 {
                 if watchdog_closed.load(Ordering::Acquire) || parent_gone {
                     watchdog_exit(PARENT_LOSS_EXIT);
                 }
-                if role_started.elapsed() >= COLLECT_FOR + Duration::from_secs(5) {
+                if role_started.elapsed() >= role {
                     watchdog_exit(DEADLINE_EXIT);
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -609,7 +622,7 @@ pub fn collector_entry(args: &[std::ffi::OsString]) -> u8 {
     }
     // No privileged observation until our parent has bound this exact generation.
     // A dead/unresponsive parent cannot leave this helper waiting indefinitely.
-    if ack_rx.recv_timeout(Duration::from_secs(5)) != Ok(true) {
+    if ack_rx.recv_timeout(ack) != Ok(true) {
         return 2;
     }
     let capture = collect(|| {

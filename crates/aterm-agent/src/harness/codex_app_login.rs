@@ -55,6 +55,14 @@ const AUTH_FILE_MAX: usize = 2 * 1024 * 1024;
 /// Maximum loopback HTTP callback request head read from the local browser redirect.
 const CALLBACK_REQ_MAX: usize = 16 * 1024;
 const CALLBACK_IO_WAIT: Duration = Duration::from_secs(2);
+/// How long the callback reads an accepted connection's request head.
+#[cfg(not(test))]
+const CALLBACK_HEAD_WAIT: Duration = CALLBACK_IO_WAIT;
+/// How long the callback reads an accepted connection's request head: the unit tests' clients
+/// send theirs right after they connect, or close at once, so a head a loaded machine holds is
+/// waited for by the hang detector, not answered `400`.
+#[cfg(test)]
+const CALLBACK_HEAD_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 const CALLBACK_DRAIN_WAIT: Duration = Duration::from_millis(50);
 const CALLBACK_DRAIN_MAX: usize = 16 * 1024;
 
@@ -335,6 +343,19 @@ fn load_stored_auth(home: &Path) -> Option<StoredAuth> {
     read_stored_auth(home).filter(|stored| !conflicting_users(stored))
 }
 
+/// The account and user the login stored in `home` names, read from its auth file alone, with no
+/// network and no renewal: a read of who a row is, never of its credential. `None` where it holds
+/// no login, its tokens name different users, or it does not name both.
+pub(crate) fn stored_login_key(home: &Path) -> Option<super::profile::AccountKey> {
+    let stored = load_stored_auth(home)?;
+    let TokenUser::Known(user) =
+        token_user_claims(stored.id_claims.as_ref(), stored.access_claims.as_ref())
+    else {
+        return None;
+    };
+    super::profile::AccountKey::codex(stored.account_id.as_deref()?, &user)
+}
+
 fn check_stored_identity(stored: &StoredAuth, expected_email: Option<&str>) -> std::io::Result<()> {
     if conflicting_users(stored) {
         return Err(std::io::Error::new(
@@ -490,6 +511,43 @@ const MIN_REFRESH_BUDGET: Duration = Duration::from_secs(3);
 /// answer was lost (`docs/KNOWN_ISSUES.md` ATERM-KI-1027-12) is refused with no rotation to find.
 const SIGNED_OUT_CONFIRM: Duration = Duration::from_secs(2);
 
+#[cfg(test)]
+thread_local! {
+    static SIGNED_OUT_LOOK: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// While held, this thread's [`confirmed_signed_out`] looks for another writer's rotation for the
+/// time it was set with, in place of [`SIGNED_OUT_CONFIRM`]: the hang detector, for a test whose
+/// own writer lands the rotation, which a loaded machine can hold past the shipped look. Its
+/// drop, a panic's unwind included, puts back the look it replaced.
+#[cfg(test)]
+struct SignedOutLook(Option<Duration>);
+
+#[cfg(test)]
+impl SignedOutLook {
+    fn set(look: Duration) -> Self {
+        Self(SIGNED_OUT_LOOK.replace(Some(look)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for SignedOutLook {
+    fn drop(&mut self) {
+        SIGNED_OUT_LOOK.set(self.0);
+    }
+}
+
+/// How long [`confirmed_signed_out`] looks for a rotation: [`SIGNED_OUT_CONFIRM`], or the look a
+/// test set on this thread ([`SignedOutLook`]).
+fn signed_out_look() -> Duration {
+    #[cfg(test)]
+    if let Some(look) = SIGNED_OUT_LOOK.get() {
+        return look;
+    }
+    SIGNED_OUT_CONFIRM
+}
+
 /// `auth.json`'s name in `home` with `suffix` after it, in the same directory.
 fn beside_auth(home: &Path, suffix: &str) -> PathBuf {
     let auth = auth_path_in_home(home);
@@ -525,7 +583,7 @@ impl AuthLock {
             use std::os::unix::fs::OpenOptionsExt as _;
             options
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
         #[cfg(windows)]
         {
@@ -796,7 +854,7 @@ impl RefreshJournal {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         #[cfg(windows)]
         {
@@ -1952,7 +2010,8 @@ impl From<Option<Usage>> for Reading {
 
 /// [`read_login_with`]'s usage for a login no row constrains.
 #[must_use]
-pub fn read_usage_with(
+#[cfg(test)]
+fn read_usage_with(
     home: &Path,
     usage_url: &str,
     fallback_token_url: &str,
@@ -1964,14 +2023,7 @@ pub fn read_usage_with(
 
 /// Read usage using snapshots constrained by a managed row's expected email
 /// ([`read_login_with`]'s usage).
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "CodexRowIdentity",
-        action = "Poll",
-        project = "aterm_agent::harness::codex_app_login::tests::row_identity_tests::row_identity_transition"
-    )
-)]
+#[cfg(test)]
 fn read_usage_with_expected_email(
     home: &Path,
     usage_url: &str,
@@ -1998,7 +2050,7 @@ fn read_usage_with_expected_email(
 /// records without it. Contradictory known token users, or a token email other than
 /// `expected_email` (a managed row's), are refused before any HTTP request.
 #[must_use]
-pub fn read_login_with(
+fn read_login_with(
     home: &Path,
     usage_url: &str,
     fallback_token_url: &str,
@@ -2028,7 +2080,7 @@ pub struct IdentifiedUsage {
 /// Read usage as [`read_login_with`] does, retaining the exact request identity.
 /// A successful response without known account and user claims yields `None`.
 #[must_use]
-pub fn read_identified_login_with(
+fn read_identified_login_with(
     home: &Path,
     usage_url: &str,
     fallback_token_url: &str,
@@ -2050,6 +2102,14 @@ pub fn read_identified_login_with(
     })
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "CodexRowIdentity",
+        action = "Poll",
+        project = "aterm_agent::harness::codex_app_login::tests::row_identity_tests::row_identity_transition"
+    )
+)]
 fn read_login_snapshot(
     home: &Path,
     usage_url: &str,
@@ -2203,7 +2263,7 @@ fn confirmed_signed_out(
     usage_client: Option<&Client>,
 ) -> LoginSnapshot {
     let Some(end) = Instant::now()
-        .checked_add(SIGNED_OUT_CONFIRM)
+        .checked_add(signed_out_look())
         .filter(|end| *end < deadline)
     else {
         return LoginSnapshot::unread();
@@ -2247,8 +2307,9 @@ pub fn read_usage_in_home(
     user_home: &Path,
     wait: Duration,
     now: i64,
+    use_token: super::provider_read::Use,
 ) -> Option<Usage> {
-    read_usage_in_home_for(home, user_home, wait, now, None)
+    read_usage_in_home_for(home, user_home, wait, now, None, use_token)
 }
 
 /// [`read_usage_in_home`] for a row that expects `expected_email`.
@@ -2258,8 +2319,9 @@ pub(super) fn read_usage_in_home_for(
     wait: Duration,
     now: i64,
     expected_email: Option<&str>,
+    use_token: super::provider_read::Use,
 ) -> Option<Usage> {
-    read_login_in_home(home, user_home, wait, now, expected_email).usage()
+    read_login_in_home(home, user_home, wait, now, expected_email, use_token).usage()
 }
 
 /// [`read_usage_in_home_for`]'s [`Reading`] ([`read_login_with`]).
@@ -2270,7 +2332,14 @@ pub fn read_login_in_home(
     wait: Duration,
     now: i64,
     expected_email: Option<&str>,
+    use_token: super::provider_read::Use,
 ) -> Reading {
+    if use_token
+        .begin_home(super::provider_read::Read::CodexEndpoint, home, now)
+        .is_err()
+    {
+        return Reading::Unread;
+    }
     let usage_url = resolve_usage_url(home, user_home);
     let token_url = format!("{DEFAULT_ISSUER}/oauth/token");
     read_login_snapshot(home, &usage_url, &token_url, wait, now, expected_email).reading
@@ -2283,7 +2352,14 @@ pub(crate) fn observed_in_home(
     wait: Duration,
     now: i64,
     expected_email: Option<&str>,
+    use_token: super::provider_read::Use,
 ) -> ObservedLogin {
+    if use_token
+        .begin_home(super::provider_read::Read::CodexEndpoint, home, now)
+        .is_err()
+    {
+        return LoginSnapshot::unread().observed();
+    }
     if !file_context_available(home) {
         return LoginSnapshot::unread().observed();
     }
@@ -2341,7 +2417,11 @@ pub fn read_identified_login_with_config(
     wait: Duration,
     now: i64,
     expected_email: Option<&str>,
+    use_token: super::provider_read::Use,
 ) -> Option<IdentifiedUsage> {
+    use_token
+        .begin_home(super::provider_read::Read::CodexEndpoint, home, now)
+        .ok()?;
     let usage_url = resolve_usage_url(config_home, user_home);
     let token_url = format!("{DEFAULT_ISSUER}/oauth/token");
     read_identified_login_with(home, &usage_url, &token_url, wait, now, expected_email)
@@ -2352,6 +2432,10 @@ pub fn read_identified_login_with_config(
 /// Installed release builds cannot select this path.
 #[cfg(debug_assertions)]
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the native fixture carries explicit trust roots and consumed account authority"
+)]
 pub fn read_identified_login_with_fixture_roots(
     home: &Path,
     config_home: &Path,
@@ -2360,7 +2444,11 @@ pub fn read_identified_login_with_fixture_roots(
     now: i64,
     expected_email: Option<&str>,
     roots: Vec<Vec<u8>>,
+    use_token: super::provider_read::Use,
 ) -> Option<IdentifiedUsage> {
+    use_token
+        .begin_home(super::provider_read::Read::CodexEndpoint, home, now)
+        .ok()?;
     let usage_url = resolve_usage_url(config_home, user_home);
     if !usage_url.starts_with("https://") || !is_loopback_endpoint(&usage_url) {
         return None;
@@ -2751,7 +2839,7 @@ fn serve_callback_loop(
                 let target = read_request_target(
                     &mut callback_reader(
                         &mut stream,
-                        deadline.min(Instant::now() + CALLBACK_IO_WAIT),
+                        deadline.min(Instant::now() + CALLBACK_HEAD_WAIT),
                     ),
                     port,
                 );

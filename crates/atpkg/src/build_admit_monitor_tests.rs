@@ -30,6 +30,7 @@ fn publication(source: &Source, revision: u64, first: u64, count: usize) {
         revision,
         closed: false,
         jobs: Vec::new(),
+        epochs: Vec::new(),
     });
     state.events = (0..count)
         .map(|index| Record {
@@ -278,7 +279,9 @@ fn large_snapshot_writes_remain_bounded_and_disconnect_has_no_native_effect() {
                 failure: None,
             })
             .collect(),
+        epochs: Vec::new(),
     });
+    let original = source.observer.latest().unwrap().0;
     assert!(source.observer.latest().unwrap().0.encode().unwrap().len() > WRITE_TURN);
     let (mut stream, mut server) = raw_pair(&source);
     write_all(
@@ -288,11 +291,35 @@ fn large_snapshot_writes_remain_bounded_and_disconnect_has_no_native_effect() {
     )
     .unwrap();
     assert_eq!(server.step().unwrap(), Progress::Pending);
-    assert!(matches!(&server.phase, Phase::Reply { sent, .. } if *sent <= WRITE_TURN));
+    assert!(matches!(&server.phase, Phase::Reply { sent, .. } if *sent > 0 && *sent <= WRITE_TURN));
     drop(stream);
-    assert!(server.step().is_err());
+    // A peer close may leave buffered writes successful before the next write
+    // fails or the completed reply reaches idle EOF. Pump the actual transport
+    // to either disconnect outcome; the deadline detects a hang, not latency.
+    let until = deadline();
+    loop {
+        assert!(Instant::now() < until, "monitor did not observe disconnect");
+        match server.step() {
+            Ok(Progress::Complete) => break,
+            Ok(Progress::Pending) => server.wait(until).unwrap(),
+            Err(error) => {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                    ),
+                    "expected disconnect, got {error:?}"
+                );
+                break;
+            }
+        }
+    }
+    assert_eq!(server.step().unwrap(), Progress::Complete);
     assert_eq!(source.active.load(Ordering::Acquire), 0);
-    assert!(!source.observer.latest().unwrap().0.closed);
+    assert_eq!(source.observer.latest().unwrap().0, original);
+    assert!(!original.closed);
 }
 
 #[test]

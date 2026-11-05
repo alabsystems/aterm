@@ -89,6 +89,7 @@ fn reading(st: &State, now: i64) -> FactsReading {
             .map(call)
             .collect(),
         held: None,
+        left: None,
     }
 }
 

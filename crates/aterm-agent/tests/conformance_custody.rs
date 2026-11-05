@@ -19,8 +19,8 @@
 //! alone, the report naming none. At every state the
 //! core is probed on copies, so a look settles, a turn settles, a write is held or lost, a box's
 //! answer goes, a loss is restarted or waits, and the host is let type or move exactly where the
-//! model says. Each walk runs in the committed configuration and in each scenario (a host that
-//! serves no input word, no restart lane), under six renderings: the unread word (`pending`,
+//! model says. Each clean walk runs in the committed configuration and in each scenario (a host
+//! that serves no input word, no restart lane), under six renderings: the unread word (`pending`,
 //! `typeahead`), for the line queued or input queued behind it, or the unserved one (none, `-`); a
 //! draw whole, arriving, joined to a person's words, or garbled with no person's key; each read
 //! under the model's box over the composer (`dlg`), the line drawn under it or not, as one that
@@ -709,32 +709,24 @@ fn runs(fault: Option<Fault>) -> Vec<Run> {
         .collect()
 }
 
-#[test]
-fn tier1_the_core_holds_and_settles_exactly_where_the_model_does() {
-    let runs = runs(None);
-    let walked =
-        aterm_spec::check::each(&runs, |&run| walk(&run.model(), true, run, &mut Ev(None)));
-    for (run, w) in runs.iter().zip(walked) {
-        let m = run.model();
-        assert_eq!(
-            w.fired,
-            interp::fired_actions(&m),
-            "{run:?}: the steps mirrored"
-        );
-        assert_eq!(
-            w.states,
-            interp::reachable_states(&m).len(),
-            "{run:?}: every state the model reaches is walked"
-        );
-    }
-}
-
 /// Where a planted defect may disagree, in the model's terms.
 type Where = fn(&State, Run) -> bool;
 
 /// Which configurations a planted defect shows in.
 type Applies = fn(Run) -> bool;
 
+/// The renderings a planted defect is walked under. The model reads only `(served, lane)`, and a
+/// fault flips one decision of the core that reads no rendering, so renderings 0 and 1 take both
+/// words of `v % 2` and the zero and one arm of every other modulus a reading has.
+const PLANTED_RENDERINGS: usize = 2;
+
+/// Each planted defect, under each configuration it shows in at [`PLANTED_RENDERINGS`], disagrees
+/// with the model only where the model says. THE GAP: no control here proves a walk sees a planted
+/// defect under renderings 2 to 5 (no composer or no key count under the box, a draw joined or
+/// garbled, the causes of not at rest and of no lane that `v % 6` and `v % 3` reach only there), so
+/// a judge blind only at those renderings passes. The strict clean walk of
+/// [`tier1_every_anchored_step_enters_its_own_function`] keeps all six, and a reading that misreads
+/// there fails it.
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
     let controls: [(Fault, Applies, Where); 14] = [
@@ -848,7 +840,7 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
         .flat_map(|(fault, applies, at)| {
             runs(Some(fault))
                 .into_iter()
-                .filter(move |&run| applies(run))
+                .filter(move |&run| run.v < PLANTED_RENDERINGS && applies(run))
                 .map(move |run| (fault, at, run))
         })
         .collect();
@@ -871,13 +863,26 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
     }
 }
 
+/// The core holds and settles exactly where the model does, at every state it reaches under every
+/// rendering and with every step mirrored, and each anchored step enters its own function. THE GAP:
+/// these walks run one after another, so a disagreement that only walks side by side would show is
+/// not run; the core they drive holds no state between walks.
 #[test]
 fn tier1_every_anchored_step_enters_its_own_function() {
     let mut ev = Ev(Some(StepEvidence::new("LineCustody")));
     for run in runs(None) {
         let m = run.model();
         let w = walk(&m, true, run, &mut ev);
-        assert_eq!(w.states, interp::reachable_states(&m).len(), "{run:?}");
+        assert_eq!(
+            w.fired,
+            interp::fired_actions(&m),
+            "{run:?}: the steps mirrored"
+        );
+        assert_eq!(
+            w.states,
+            interp::reachable_states(&m).len(),
+            "{run:?}: every state the model reaches is walked"
+        );
     }
     let audit = ev.0.expect("the audited walk's evidence").audit();
     assert_eq!(

@@ -415,11 +415,12 @@ fn loopback_round(
 }
 
 /// What a Commons repair round that moves nothing costs: a converged loopback pair of log-backed
-/// writers sharing one table, over the current protocol (`atdb/3`). It prints the process CPU
+/// writers sharing one table, over the current database protocol. It prints the process CPU
 /// both sides of each round spent together (run it alone, so no other test's work is counted),
 /// beside the cost of the CPU reading itself, and asserts only that the measured rounds moved
-/// nothing: a time is never a pass condition.
+/// nothing: a time is never a pass condition. `verify perf commons-quiet` runs it.
 #[test]
+#[ignore = "isolated CPU measurement; run with verify perf commons-quiet"]
 fn a_round_that_moves_nothing_reports_its_cpu() {
     quiet_rounds(8, false);
 }
@@ -435,14 +436,133 @@ fn a_sustained_quiet_pair_reports_its_cpu() {
 /// Ordinary catalog discovery and subscription are part of this workload;
 /// neither side receives an explicit application table list.
 #[test]
+#[ignore = "isolated CPU measurement; run with verify perf commons-quiet --catalog"]
 fn a_quiet_catalog_pair_reports_its_cpu() {
     quiet_rounds(8, true);
+}
+
+/// What the suite keeps of the measurements above: a converged catalog pair's rounds move nothing
+/// and visit both its tables. The asserts are a superset of the explicit pair's.
+/// GAP: the explicit pair runs only when measured, so a defect that moves records only on an
+/// explicitly listed table is not seen here, and neither is the `WitnessLogs` loop at the end of
+/// `quiet_rounds` (`control::tests` holds its round robin).
+#[test]
+fn quiet_catalog_rounds_move_nothing_and_visit_both_tables() {
+    quiet_rounds(2, true);
 }
 
 #[test]
 #[ignore = "sustained isolated CPU measurement; run with verify perf commons-quiet --catalog --sustained"]
 fn a_sustained_quiet_catalog_pair_reports_its_cpu() {
     quiet_rounds(256, true);
+}
+
+#[test]
+#[ignore = "process-wide retained-history diagnostic; run this exact test alone with --ignored --nocapture"]
+fn a_quiet_catalog_pair_reports_retained_history_reads() {
+    quiet_rounds_observed(8, true, true);
+}
+
+#[test]
+#[ignore = "process-wide single-root policy diagnostic; run this exact test alone with --ignored --nocapture"]
+fn one_root_policy_reads_report_their_retained_history_work() {
+    let pair = catalog_pair();
+    let bootstrap = pair.lab.bootstrap(0);
+    let _source = bootstrap.local_source_read().unwrap();
+    let session = Session::observe(&bootstrap).unwrap();
+    let directory = crate::catalog::Directory::new(&pair.lab.paths[0], bootstrap.trust());
+    let policy = crate::catalog::policy::Policy::default();
+    let catalog = directory.catalog_scope();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let inventories = || {
+        [catalog, pair.scope].map(|scope| {
+            directory
+                .observe_table(&session, scope)
+                .unwrap()
+                .inventory(&session)
+                .unwrap()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        })
+    };
+    let before_inventory = inventories();
+    let catalog_path = directory.path(catalog).unwrap();
+    let journal_paths = [
+        catalog_path.join("table.astream"),
+        catalog_path.join("table.checkpoint"),
+        pair.paths[0].join("table.astream"),
+        pair.paths[0].join("table.checkpoint"),
+    ];
+    let journal_images = || {
+        journal_paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let before_images = journal_images();
+    assert!(
+        directory
+            .permits(&session, &policy, pair.scope.digest(), now)
+            .unwrap()
+    );
+    // Amortize the process-clock sweep over enough calls to report the policy path,
+    // rather than setup or a single timer reading. Run this test alone.
+    let calls = 128_u32;
+    let clock_start = process_cpu();
+    let clock_read = process_cpu() - clock_start;
+    let observe = |id| {
+        let before = aterm_secrets::client::test_retained_history_read_counts();
+        let start = process_cpu();
+        let mut allowed = true;
+        for _ in 0..calls {
+            allowed &= directory.permits(&session, &policy, id, now).unwrap();
+        }
+        let cpu = process_cpu() - start;
+        let counts = aterm_secrets::client::test_retained_history_read_counts()
+            .checked_delta(before)
+            .expect("single-root counters did not decrease");
+        (allowed, counts, cpu)
+    };
+    let (catalog_allowed, catalog_reads, catalog_cpu) = observe(catalog.digest());
+    let (application_allowed, application_reads, application_cpu) = observe(pair.scope.digest());
+    assert!(catalog_allowed && application_allowed);
+    assert_eq!(catalog_reads, Default::default());
+    assert!(application_reads.journal_read_attempts > 0);
+    assert_eq!(application_reads.empty, Default::default());
+    assert_eq!(application_reads.other_directory, Default::default());
+    assert_eq!(application_reads.unavailable, Default::default());
+    assert_eq!(application_reads.same_directory.rebuilt, 0);
+    assert_eq!(application_reads.same_directory.extended, 0);
+    assert_eq!(application_reads.same_directory.errors, 0);
+    assert_eq!(application_reads.replay_records_attempted, 0);
+    assert_eq!(application_reads.publications, 0);
+    assert_eq!(inventories(), before_inventory);
+    assert!(
+        journal_images() == before_images,
+        "policy observation changed journal bytes"
+    );
+    eprintln!(
+        "\nCOMMONS-POLICY-READS {}",
+        aterm_json::json!({
+            "schema": 2,
+            "scope": "retained-history-read-cache",
+            "workload": "single-root-policy-permits",
+            "calls_per_case": calls,
+            "clock_read_cpu_ns": u64::try_from(clock_read.as_nanos()).unwrap(),
+            "catalog_process_cpu_ns": u64::try_from(catalog_cpu.as_nanos()).unwrap(),
+            "application_process_cpu_ns": u64::try_from(application_cpu.as_nanos()).unwrap(),
+            "source_guard_held": true,
+            "catalog_allowed": catalog_allowed,
+            "application_allowed": application_allowed,
+            "catalog_counts": history_read_counts_value(catalog_reads),
+            "application_counts": history_read_counts_value(application_reads),
+            "source_inventories_unchanged": true,
+            "source_journal_images_unchanged": true,
+        })
+    );
 }
 
 fn catalog_pair() -> Pair {
@@ -485,6 +605,10 @@ fn catalog_inventories(pair: &Pair) -> [BTreeMap<Digest, BTreeSet<Digest>>; 2] {
 }
 
 fn quiet_rounds(measured: u32, catalog: bool) {
+    quiet_rounds_observed(measured, catalog, false);
+}
+
+fn quiet_rounds_observed(measured: u32, catalog: bool, history_reads: bool) {
     let warm = if catalog { 8 } else { 2 };
     let pair = if catalog { catalog_pair() } else { log_pair() };
     let endpoint = |n| {
@@ -523,6 +647,7 @@ fn quiet_rounds(measured: u32, catalog: bool) {
             aterm_json::json!({"pid": std::process::id(), "rounds": measured})
         );
     }
+    let reads_before = history_reads.then(aterm_secrets::client::test_retained_history_read_counts);
     let reading = process_cpu();
     let start = process_cpu();
     let reading = start - reading;
@@ -550,10 +675,37 @@ fn quiet_rounds(measured: u32, catalog: bool) {
         }
     }
     let spent = process_cpu() - start;
+    // Every round has joined its responder. End the read-count interval before
+    // inventory verification and the separate witness microchecks below.
+    let reads = reads_before.map(|before| {
+        aterm_secrets::client::test_retained_history_read_counts()
+            .checked_delta(before)
+            .expect("retained-history counters never reset or wrap in this diagnostic")
+    });
     if let Some(before) = &inventories {
         let [left, _] = before;
         assert_eq!(visited, left.keys().copied().collect());
         assert_eq!(&catalog_inventories(&pair), before);
+    }
+    if let Some(reads) = reads {
+        assert!(
+            reads.journal_read_attempts > 0,
+            "the actual cache must be observed"
+        );
+        eprintln!(
+            "\nCOMMONS-HISTORY-READS {}",
+            aterm_json::json!({
+                "schema": 1,
+                "scope": "retained-history-read-cache",
+                "workload": if catalog { "catalog" } else { "explicit" },
+                "tables": if catalog { 2 } else { 1 },
+                "warmup_rounds": warm,
+                "rounds": measured,
+                "moved_records": 0,
+                "counts": history_read_counts_value(reads),
+            })
+        );
+        return;
     }
     eprintln!(
         "COMMONS-QUIET {}",
@@ -574,6 +726,10 @@ fn quiet_rounds(measured: u32, catalog: bool) {
          (one CPU reading costs {reading:?})",
         spent / measured,
     );
+    // A measuring run only: the witness costs below are numbers nothing here asserts on.
+    if measured < 8 {
+        return;
+    }
     // What a round paid for its peer's witness when it was not held: before the cache held one
     // log per roster peer, every round with more than 16 peers round-robin paid it.
     let peer = pair.lab.bootstrap(1);
@@ -602,4 +758,67 @@ fn quiet_rounds(measured: u32, catalog: bool) {
         missed / CHECKS,
         hit / CHECKS,
     );
+}
+
+fn history_read_counts_value(
+    counts: aterm_secrets::client::RetainedHistoryReadCounts,
+) -> aterm_json::Value {
+    use aterm_secrets::client::RetainedHistoryReadOutcomes;
+
+    let rows = [
+        counts.empty,
+        counts.same_directory,
+        counts.other_directory,
+        counts.unavailable,
+    ];
+    assert_eq!(
+        counts.journal_read_attempts,
+        rows.iter().map(|row| row.lookups).sum::<u64>()
+    );
+    for row in rows {
+        assert_eq!(
+            row.lookups,
+            row.unchanged + row.extended + row.rebuilt + row.errors
+        );
+    }
+    for row in [counts.empty, counts.other_directory, counts.unavailable] {
+        assert_eq!(
+            row.unchanged, 0,
+            "unchanged reuse requires a supplied prefix"
+        );
+        assert_eq!(row.extended, 0, "suffix replay requires a supplied prefix");
+    }
+    assert_eq!(
+        counts.replay_records_attempted,
+        counts.replay_records_accepted + counts.replay_failures
+    );
+    assert!(counts.replacements <= counts.publications);
+    assert!(
+        counts.publications
+            <= rows
+                .iter()
+                .map(|row| row.extended + row.rebuilt)
+                .sum::<u64>()
+    );
+    let row = |value: RetainedHistoryReadOutcomes| {
+        aterm_json::json!({
+            "lookups": value.lookups,
+            "unchanged": value.unchanged,
+            "extended": value.extended,
+            "rebuilt": value.rebuilt,
+            "errors": value.errors,
+        })
+    };
+    aterm_json::json!({
+        "empty": row(counts.empty),
+        "same_directory": row(counts.same_directory),
+        "other_directory": row(counts.other_directory),
+        "unavailable": row(counts.unavailable),
+        "journal_read_attempts": counts.journal_read_attempts,
+        "replay_records_attempted": counts.replay_records_attempted,
+        "replay_records_accepted": counts.replay_records_accepted,
+        "replay_failures": counts.replay_failures,
+        "publications": counts.publications,
+        "replacements": counts.replacements,
+    })
 }

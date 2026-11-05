@@ -4,8 +4,8 @@
 //! Claude Code launch-card geometry, continuation suggestions, `/goal` indicators, and turn-end reply extraction.
 
 use crate::phase::{
-    composer_frame, composer_text, is_against_right_edge, is_placeholder, is_tool_call,
-    last_said_index, leading_spaces, status_block, transcript_end,
+    Transcript, composer_frame, composer_text, is_against_right_edge, is_placeholder, is_tool_call,
+    last_said_in, leading_spaces, status_block, transcript_end_in,
 };
 use crate::prompt::parse_prompt;
 
@@ -499,7 +499,10 @@ pub fn continuation_suggestion(rows: &[String], cursor_col: usize) -> Option<Str
 const GOAL_MARK: &str = "◎ /goal active";
 
 /// Returns whether Claude Code's `◎ /goal active` indicator is present in the live zone: against
-/// the right edge on a hint row over the composer or a footer row under it ([`goal_mark`]).
+/// the right edge on a hint row over the composer or a footer row under it ([`goal_mark`]). A row
+/// over the composer is read up to the side panel's rule and against its room ([`Transcript`]),
+/// the right edge a hint stands against beside the panel; a footer row, which the panel is drawn
+/// beside in no capture, whole and against the composer's width.
 #[must_use]
 pub fn goal_active(rows: &[String]) -> bool {
     let Some(frame) = composer_frame(rows) else {
@@ -507,10 +510,12 @@ pub fn goal_active(rows: &[String]) -> bool {
     };
     let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
     let from = status_block(rows, frame.top).from;
+    let transcript = Transcript::of(rows);
+    let room = transcript.room(width);
     let at_edge = |r: &str| crate::text::trim_end(r).chars().count() + 3 >= width;
-    rows[from..frame.top]
+    transcript.rows[from..frame.top]
         .iter()
-        .any(|r| goal_mark(r) && is_against_right_edge(r, width))
+        .any(|r| goal_mark(r) && is_against_right_edge(r, room))
         || rows[frame.bottom + 1..]
             .iter()
             .any(|r| goal_mark(r) && at_edge(r))
@@ -540,42 +545,70 @@ pub(crate) fn asks(said: &str) -> bool {
         .is_some_and(|l| crate::text::trim_end(l).ends_with('?'))
 }
 
-/// Extracts the worker's final `⏺` message from the last turn on `rows`.
+/// Extracts the worker's final `⏺` message from the last turn on `rows`, each of its rows read up
+/// to the side panel's rule ([`Transcript`]), as every reader of the turn's words here reads them.
 #[must_use]
 pub fn said_tail(rows: &[String]) -> Option<String> {
-    said_message(rows).map(|(_, said)| said)
+    let transcript = Transcript::of(rows);
+    said_message(rows, &transcript).map(|(_, said)| said)
 }
 
 /// Returns whether the `⏺` header of [`said_tail`] is visible on `rows`.
 #[must_use]
 pub fn said_whole(rows: &[String]) -> bool {
-    said_message(rows).is_some_and(|(head, _)| rows[head].starts_with(['⏺', '●']))
+    let transcript = Transcript::of(rows);
+    said_message_rows(rows, &transcript).is_some_and(|(head, _)| rows[head].starts_with(['⏺', '●']))
 }
 
-/// [`said_tail`], each line Ink wrapped across rows read as one ([`crate::wrap::said_lines`]).
+/// [`said_tail`], each line Ink wrapped across rows read as one ([`crate::wrap::said_lines`]),
+/// beside the side panel in the room its rows wrap in, up to its rule ([`Transcript::margin`]).
 #[must_use]
 pub fn said_lines(rows: &[String], apart: crate::reader::Apart) -> Option<String> {
-    said_message_rows(rows).map(|(_, said)| crate::wrap::said_lines(rows, &said, 0, apart))
+    let transcript = Transcript::of(rows);
+    let margin = transcript.margin();
+    said_message_rows(rows, &transcript)
+        .map(|(_, said)| crate::wrap::said_lines(&transcript.rows, &said, margin, apart))
 }
 
-/// Extracts earlier `⏺` messages from the same turn above [`said_tail`].
+/// Extracts earlier `⏺` messages from the same turn above [`said_tail`], joined
+/// ([`crate::reader::join_messages`]).
 #[must_use]
 pub fn turn_said_before(rows: &[String]) -> Option<String> {
-    let (_, said) = turn_before(rows, crate::wrap::said_rows)?;
-    (!said.is_empty()).then(|| said.join("\n\n"))
+    turn_messages_before(rows).map(|m| crate::reader::join_messages(&m))
+}
+
+/// [`turn_said_before`] message by message, oldest first.
+#[must_use]
+pub fn turn_messages_before(rows: &[String]) -> Option<Vec<String>> {
+    let (_, said) = turn_before(rows, &Transcript::of(rows), crate::wrap::said_rows)?;
+    (!said.is_empty()).then_some(said)
 }
 
 /// [`turn_said_before`], its lines read as [`said_lines`] reads them.
 #[must_use]
 pub fn turn_lines_before(rows: &[String], apart: crate::reader::Apart) -> Option<String> {
-    let (_, said) = turn_before(rows, |said| crate::wrap::said_lines(rows, said, 0, apart))?;
-    (!said.is_empty()).then(|| said.join("\n\n"))
+    turn_message_lines_before(rows, apart).map(|m| crate::reader::join_messages(&m))
+}
+
+/// [`turn_lines_before`] message by message, oldest first.
+#[must_use]
+pub fn turn_message_lines_before(
+    rows: &[String],
+    apart: crate::reader::Apart,
+) -> Option<Vec<String>> {
+    let transcript = Transcript::of(rows);
+    let margin = transcript.margin();
+    let (_, said) = turn_before(rows, &transcript, |said| {
+        crate::wrap::said_lines(&transcript.rows, said, margin, apart)
+    })?;
+    (!said.is_empty()).then_some(said)
 }
 
 /// Returns whether the entire last turn (from the user's `❯` prompt through [`said_tail`]) fits on `rows`.
 #[must_use]
 pub fn turn_whole(rows: &[String]) -> bool {
-    turn_before(rows, crate::wrap::said_rows).is_some_and(|(opened, _)| opened)
+    turn_before(rows, &Transcript::of(rows), crate::wrap::said_rows)
+        .is_some_and(|(opened, _)| opened)
 }
 
 /// Returns whether the last turn on `rows` ran a tool: a call's row (`⏺ Bash(…)`, [`bare_call`]), a collapsed tool group's ([`tool_group`]) or a background task's end ([`task_notice`]) under the `❯` prompt that opened it.
@@ -1326,15 +1359,20 @@ fn is_monitor_event(row: &str) -> bool {
         .is_some_and(|rest| crate::text::trim_start(rest).starts_with("Monitor event:"))
 }
 
-fn turn_before(
-    rows: &[String],
-    read: impl Fn(&[(usize, &str)]) -> String,
+/// The turn's messages above [`said_tail`]'s, each read by `read`, and whether the turn's opening
+/// row is on `rows`: the transcript's rows read up to the side panel's rule, in its room
+/// ([`Transcript`]).
+fn turn_before<'a>(
+    screen: &[String],
+    transcript: &'a Transcript<'_>,
+    read: impl Fn(&[(usize, &'a str)]) -> String,
 ) -> Option<(bool, Vec<String>)> {
-    let (head, _) = said_message_rows(rows)?;
+    let (head, _) = said_message_rows(screen, transcript)?;
+    let rows: &'a [String] = &transcript.rows;
     if !rows[head].starts_with(['⏺', '●']) {
         return None;
     }
-    let width = crate::question::screen_width(rows);
+    let width = transcript.room(crate::question::screen_width(rows));
     let mut said: Vec<String> = Vec::new();
     let mut opened = false;
     let mut below = head;
@@ -1372,12 +1410,18 @@ fn turn_before(
     Some((opened, said))
 }
 
-fn said_message(rows: &[String]) -> Option<(usize, String)> {
-    said_message_rows(rows).map(|(head, said)| (head, crate::wrap::said_rows(&said)))
+fn said_message(rows: &[String], transcript: &Transcript<'_>) -> Option<(usize, String)> {
+    said_message_rows(rows, transcript).map(|(head, said)| (head, crate::wrap::said_rows(&said)))
 }
 
-fn said_message_rows(rows: &[String]) -> Option<(usize, Vec<(usize, &str)>)> {
-    let (head, said) = message_rows(rows, last_said_index(rows)?)?;
+/// The rows of the agent's last message on `screen` and its head row, read on the transcript's
+/// rows up to the side panel's rule ([`Transcript`]).
+fn said_message_rows<'a>(
+    screen: &[String],
+    transcript: &'a Transcript<'_>,
+) -> Option<(usize, Vec<(usize, &'a str)>)> {
+    let rows: &'a [String] = &transcript.rows;
+    let (head, said) = message_rows(rows, last_said_in(screen, transcript)?)?;
     let (head, said) = if is_idle_notice(&crate::wrap::said_rows(&said)) {
         let above = before_idle_compaction(rows, head);
         let last = (0..above)
@@ -1409,7 +1453,9 @@ fn is_hook_verdict(said: &str) -> bool {
 #[must_use]
 pub fn answered_prompt(rows: &[String]) -> Option<String> {
     let frame = composer_frame(rows)?;
-    let (head, _) = said_message(rows)?;
+    let transcript = Transcript::of(rows);
+    let (head, _) = said_message(rows, &transcript)?;
+    let rows: &[String] = &transcript.rows;
     if head >= frame.top || !rows[head].starts_with(['⏺', '●']) {
         return None;
     }
@@ -1512,6 +1558,11 @@ fn is_idle_notice_row(line: &str) -> bool {
         .is_some_and(|said| is_idle_notice(said.trim_start()))
 }
 
+/// The first row an idle compaction drew, its notice opening on row `head`: walking up from it
+/// over the rows the compaction drew above its notice (blank rows, `⎿` rows and the rows their
+/// text wrapped onto, a `※ recap`, a restored task's row, an earlier compaction's notice). `rows`
+/// are the transcript's, each cut at the side panel's rule ([`Transcript`]), so a row blank up to
+/// the rule is a blank row and a task row's words end at the rule.
 fn before_idle_compaction(rows: &[String], head: usize) -> usize {
     let recap = const { crate::anchor!("turn.recap") };
     let mut k = head;
@@ -1554,8 +1605,9 @@ fn before_idle_compaction(rows: &[String], head: usize) -> usize {
 
 /// Where the rows Claude Code's idle compaction drew begin, its notice being the last thing said.
 pub(crate) fn idle_compaction_from(rows: &[String]) -> Option<usize> {
-    let (head, said) = message_at(rows, last_said_index(rows)?)?;
-    is_idle_notice(&said).then(|| before_idle_compaction(rows, head))
+    let transcript = Transcript::of(rows);
+    let (head, said) = message_at(&transcript.rows, last_said_in(rows, &transcript)?)?;
+    is_idle_notice(&said).then(|| before_idle_compaction(&transcript.rows, head))
 }
 
 /// Returns whether the last turn ended on Claude Code's idle context-compaction notice.
@@ -1564,10 +1616,15 @@ pub fn idle_compacted(rows: &[String]) -> bool {
     idle_compaction_from(rows).is_some()
 }
 
-/// Returns whether the last turn was interrupted by the user (`⎿  Interrupted`).
+/// Returns whether the last turn was interrupted by the user (`⎿  Interrupted`), or ended on a
+/// question the person declined with Esc (`⏺ User declined to answer questions`, the anchor
+/// `question.declined`). The last block is read on the transcript ([`Transcript`]), each row up
+/// to the side panel's rule, so beside the panel the declined row is its words alone.
 #[must_use]
 pub fn interrupted(rows: &[String]) -> bool {
-    let end = transcript_end(rows).min(rows.len());
+    let transcript = Transcript::of(rows);
+    let end = transcript_end_in(rows, &transcript).min(rows.len());
+    let rows = &transcript.rows;
     let Some(block) = (0..end)
         .rev()
         .find(|&i| rows[i].starts_with(['⏺', '●', '❯']))
@@ -2365,6 +2422,23 @@ mod tests {
         assert_eq!(
             turn_said_before(&turn).as_deref(),
             Some("Merged the lexer.\nNEEDS YOU: the signing credential\n\nPushed the docs too.")
+        );
+        // Message by message, as the readers of a turn's needs tell them apart.
+        let messages = [
+            "Merged the lexer.\nNEEDS YOU: the signing credential",
+            "Pushed the docs too.",
+        ]
+        .map(str::to_string);
+        assert_eq!(turn_messages_before(&turn).as_deref(), Some(&messages[..]));
+        let reader = crate::reader::ClaudeReader;
+        assert_eq!(
+            crate::reader::ScreenReader::turn_messages_before(&reader, &turn).as_deref(),
+            Some(&messages[..])
+        );
+        assert_eq!(
+            crate::reader::ScreenReader::turn_message_lines_before(&reader, &turn, |_, _| false)
+                .map(|m| m.len()),
+            Some(2)
         );
         let alone = framed(
             &[
@@ -4101,5 +4175,86 @@ mod tests {
             );
             assert_eq!(said_tail(&mine).as_deref(), Some(own), "{own}");
         }
+    }
+
+    /// THE AGENT'S WORDS BESIDE THE SIDE PANEL ARE READ UP TO ITS RULE: its last message
+    /// ([`said_tail`], [`said_lines`], [`said_whole`]), the turn's earlier messages
+    /// ([`turn_said_before`], [`turn_lines_before`], [`turn_whole`]) and the person's message the
+    /// turn answers ([`answered_prompt`]) are read on the transcript's rows ([`Transcript`]), each
+    /// cut at the panel's rule and wrapped in the rule's room. Read whole before (KI-1101-3), each
+    /// row of every one carried its padding, the rule and the panel's text after it, on each
+    /// MEASURED panel capture (2.1.310's and both of 2.1.316's, as captured): the words the needs
+    /// fold, the done and go-ahead readers and the question's reader (`asked_by`) read ended in
+    /// `│` on every row, the first message beside the panel's heading carried `1 file changed …`,
+    /// and no line Ink wrapped at the rule was read whole, so a `NEEDS YOU:` item wrapped there was
+    /// read as its first row. CONTROL: each capture with no panel (each row cut at the rule) reads
+    /// the same words.
+    #[test]
+    fn the_agents_words_beside_the_side_panel_are_read_up_to_its_rule() {
+        use crate::prompt::fixtures::{
+            INFERRING_OVER_BACKGROUND_2_1_316, WAITING_AGENTS_WORKFLOWS_2_1_316,
+            WAITING_WORKFLOWS_2_1_310,
+        };
+        fn apart(_: &str, _: &str) -> bool {
+            false
+        }
+        let no_panel = |rows: &[String]| -> Vec<String> {
+            rows.iter()
+                .map(|row| {
+                    row.split_once('│')
+                        .map_or(row.as_str(), |(left, _)| crate::text::trim_end(left))
+                        .to_string()
+                })
+                .collect()
+        };
+        for (name, capture) in [
+            ("2.1.310 waiting", WAITING_WORKFLOWS_2_1_310),
+            ("2.1.316 waiting", WAITING_AGENTS_WORKFLOWS_2_1_316),
+            ("2.1.316 inferring", INFERRING_OVER_BACKGROUND_2_1_316),
+        ] {
+            let panel = screen(capture);
+            let alone = no_panel(&panel);
+            let tail = said_tail(&panel).expect("the last message");
+            let before = turn_said_before(&panel).expect("the turn's earlier messages");
+            for words in [
+                tail.as_str(),
+                before.as_str(),
+                &said_lines(&panel, apart).expect("its lines"),
+                &turn_lines_before(&panel, apart).expect("their lines"),
+            ] {
+                assert!(!words.contains('│'), "{name}: {words}");
+            }
+            assert_eq!(said_tail(&alone).as_deref(), Some(tail.as_str()), "{name}");
+            assert_eq!(
+                turn_said_before(&alone).as_deref(),
+                Some(before.as_str()),
+                "{name}"
+            );
+            assert_eq!(said_whole(&panel), said_whole(&alone), "{name}");
+            assert_eq!(turn_whole(&panel), turn_whole(&alone), "{name}");
+            assert_eq!(answered_prompt(&panel), answered_prompt(&alone), "{name}");
+            assert!(
+                answered_prompt(&panel).is_none_or(|p| !p.contains('│')),
+                "{name}"
+            );
+        }
+        let waiting = screen(WAITING_AGENTS_WORKFLOWS_2_1_316);
+        let lines = said_lines(&waiting, apart).expect("its lines");
+        for need in [
+            "NEEDS YOU: one sign-in for the Claude account row m21 (aterm harness accounts browser m21).",
+            "NEEDS YOU: an xAI account for Grok on m21.",
+        ] {
+            assert!(lines.lines().any(|l| l == need), "{need}: {lines}");
+        }
+        assert_eq!(
+            answered_prompt(&waiting).as_deref(),
+            Some(
+                "[aterm harness] Autopilot is Cruise: your turn ended while your own background \
+                 work runs. Check on that work, then keep going with everything else in hand; \
+                 never wait idle for it. Put what only a person can give on a line starting \
+                 NEEDS YOU: and carry on. A go-ahead for your own reversible work is never a \
+                 NEEDS YOU item."
+            )
+        );
     }
 }

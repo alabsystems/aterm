@@ -403,11 +403,11 @@ fn a_valid_authority_signature_cannot_override_invalid_certificate_fields() {
         let mut signed = DOMAIN.to_vec();
         signed.extend_from_slice(&wire);
         let signature = signer.sign(&signed);
-        assert!(
-            UnparsedPublicKey::new(&ED25519, root())
-                .verify(&signed, signature.as_ref())
-                .is_ok()
-        );
+        assert!(crate::ed25519::verifies(
+            &root(),
+            &signed,
+            signature.as_ref()
+        ));
         wire.extend_from_slice(signature.as_ref());
         assert!(
             Certificate::verify(&wire, NETWORK, root()).is_err(),

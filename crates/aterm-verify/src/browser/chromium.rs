@@ -21,7 +21,7 @@ pub(crate) const FETCH_FIX: &str =
     "targo --unverified verify provision, or set ATERM_BROWSER to a Chromium executable";
 
 /// The cache the pinned browser is unpacked into, aterm's `browser` in this host's user cache
-/// ([`crate::user_cache`]): on macOS `~/Library/Caches/aterm/browser.noindex`, elsewhere
+/// ([`crate::host_user_cache`]): on macOS `~/Library/Caches/aterm/browser.noindex`, elsewhere
 /// `$XDG_CACHE_HOME/aterm/browser`, else `~/.cache/aterm/browser`.
 pub(crate) fn host_cache_root() -> Option<PathBuf> {
     crate::host_user_cache("browser")

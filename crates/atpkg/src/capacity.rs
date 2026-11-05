@@ -6,7 +6,9 @@
 //! nothing and removes no dead holder's file. Every claim's line, held or waiting, says what it
 //! reserves against the claims behind it, as their looks reckon it
 //! ([`aterm_capacity::reserved`]): its memory (`mem <need>, reserves <bytes>`: its peak less what
-//! its holder's tree and the processes credited to it hold in memory, `aterm_capacity::Proc`)
+//! its holder's tree and the processes credited to it hold in memory, `aterm_capacity::Proc`,
+//! only where holder accounting permits that credit; whole and detached claims keep their
+//! full peak)
 //! and its disk on its own volume (`disk <need> on <mount>, reserves <bytes> against the claims
 //! behind it`: its need less what it has written). A waiting claim's disk is marked
 //! [`UNSERVABLE`] where its need is more than that volume has free above the floor now: no
@@ -21,7 +23,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use aterm_capacity::{
-    Ledger, Live, Machine as _, Reading, Record, Reserve, TreeUse, Volume, gib, span,
+    Accounting, Ledger, Live, Machine as _, Reading, Record, Reserve, TreeUse, Volume, gib, span,
 };
 use aterm_json::{Map, Value};
 
@@ -212,7 +214,11 @@ fn lines(
 }
 
 /// What the processes `c` is credited with ([`Record::credit`]) use: `None` without a sweep.
+/// Whole and detached accounting never attribute current numeric PIDs to their records.
 fn credited(c: &Record, trees: Option<&HashMap<u32, TreeUse>>) -> Option<u64> {
+    if c.accounting != Accounting::Holder {
+        return None;
+    }
     trees.map(|t| {
         c.credit
             .iter()
@@ -222,24 +228,51 @@ fn credited(c: &Record, trees: Option<&HashMap<u32, TreeUse>>) -> Option<u64> {
     })
 }
 
+/// Current accounting and lifetime policy, not a new observation of closure.
+/// Holder accounting alone does not distinguish an ordinary claim from a live cohort
+/// description, so its lifetime remains the original claim protocol's decision.
+fn accounting(c: &Record) -> (&'static str, &'static str) {
+    match c.accounting {
+        Accounting::Holder => ("holder", "claim-protocol"),
+        Accounting::Whole => ("whole", "cohort-closure"),
+        Accounting::Detached => ("detached", "final-guard-close"),
+    }
+}
+
+/// Only holder accounting can associate a current PID's tree with this record.
+fn tree_use(c: &Record, trees: Option<&HashMap<u32, TreeUse>>) -> Option<TreeUse> {
+    if c.accounting != Accounting::Holder {
+        return None;
+    }
+    trees.map(|t| t.get(&c.pid).copied().unwrap_or_default())
+}
+
 /// One claim's line, `reserve` what it reserves against the claims behind it, held or waiting:
 /// its memory where it needs any, and its disk where it needs any, marked [`UNSERVABLE`] only
-/// for a waiter ([`Reserve::unservable`] is a waiter's alone). Its holder's tree
-/// ([`aterm_capacity::Procs::trees`]) is the same for every claim that process holds.
+/// for a waiter ([`Reserve::unservable`] is a waiter's alone). Only holder accounting uses
+/// the current holder's tree ([`aterm_capacity::Procs::trees`]); the other policies retain an
+/// original record PID without attributing a current process to it.
 fn claim_line(
     c: &Record,
     reserve: Reserve,
     trees: Option<&HashMap<u32, TreeUse>>,
     now: u64,
 ) -> String {
+    let (accounting, lifetime) = accounting(c);
+    let pid_role = if c.accounting == Accounting::Holder {
+        "pid"
+    } else {
+        "original pid"
+    };
     let mut parts = vec![format!(
-        "  {:<8} pid {:<7} for {:<7}",
+        "  {:<8} {pid_role} {:<7} for {:<7}",
         if c.held.is_some() { "held" } else { "waiting" },
         c.pid,
         span(Duration::from_millis(now.saturating_sub(c.start_ms)))
     )];
+    parts.push(format!("accounting {accounting}, lifetime {lifetime}"));
     if c.need.mem > 0 {
-        let using = trees.map(|t| t.get(&c.pid).map_or(0, |u| u.footprint));
+        let using = tree_use(c, trees).map(|u| u.footprint);
         let vm = credited(c, trees).filter(|_| !c.credit.is_empty());
         parts.push(format!(
             "mem {}{}, reserves {}",
@@ -322,7 +355,9 @@ fn volume_json(v: &Volume) -> Value {
 /// one of `volumes`; `null` where it needs no disk or that volume could not be read); and
 /// `unservable` whether it is a waiter whose disk need is more than that volume has free above
 /// the floor now (`null` where it needs disk on a volume that could not be read, so it is not
-/// judged).
+/// judged). `accounting` and `lifetime` identify the current reservation policy;
+/// `pid_role` distinguishes a holder PID from an original record PID. `tree_held` and
+/// `credited_held` are null unless holder accounting permits those observations.
 fn json_of(
     r: &Reading,
     volumes: &[Volume],
@@ -366,9 +401,20 @@ fn json_of(
                 .iter()
                 .zip(reserves(r, volumes, claims, trees))
                 .map(|(c, reserve)| {
-                    let used = trees.map(|t| t.get(&c.pid).copied().unwrap_or_default());
+                    let used = tree_use(c, trees);
+                    let (accounting, lifetime) = accounting(c);
                     let mut m = Map::new();
                     m.insert("pid".to_owned(), Value::from(c.pid));
+                    m.insert(
+                        "pid_role".to_owned(),
+                        Value::from(if c.accounting == Accounting::Holder {
+                            "holder"
+                        } else {
+                            "original-record"
+                        }),
+                    );
+                    m.insert("accounting".to_owned(), Value::from(accounting));
+                    m.insert("lifetime".to_owned(), Value::from(lifetime));
                     m.insert(
                         "state".to_owned(),
                         Value::from(if c.held.is_some() { "held" } else { "waiting" }),

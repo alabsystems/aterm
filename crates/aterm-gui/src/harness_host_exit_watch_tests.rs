@@ -624,7 +624,7 @@ fn a_restored_agent_that_crashes_before_a_pass_names_it_is_relaunched() {
     let n = Arc::clone(&steps);
     let p = panicking_host_hooked(None, move |a, h| {
         let a = Arc::clone(a);
-        h.acts.relaunch_restored = Arc::new(move |sid, _, _, _| {
+        h.acts.relaunch_restored = Arc::new(move |sid, _, _, _, _| {
             n.fetch_add(1, Ordering::SeqCst);
             a.adopted_in(sid, false);
             "adopted".to_string()
@@ -748,7 +748,7 @@ fn an_asked_exit_carried_through_a_hold_across_a_commit_is_relaunched_once_it_li
     let (steps, looks) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let mut h = b.hooks();
     let (world, n, l) = (Arc::clone(&b), Arc::clone(&steps), Arc::clone(&looks));
-    h.acts.relaunch_restored = Arc::new(move |sid, _, _, _| {
+    h.acts.relaunch_restored = Arc::new(move |sid, _, _, _, _| {
         n.fetch_add(1, Ordering::SeqCst);
         l.fetch_add(1, Ordering::SeqCst);
         if world.held.load(Ordering::SeqCst) {
@@ -947,7 +947,7 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
     let mut h = a.hooks();
     let steps = Arc::new(AtomicUsize::new(0));
     let (world, n) = (Arc::clone(&a), Arc::clone(&steps));
-    h.acts.relaunch_restored = Arc::new(move |sid, _, _, _| {
+    h.acts.relaunch_restored = Arc::new(move |sid, _, _, _, _| {
         n.fetch_add(1, Ordering::SeqCst);
         world.adopted_in(sid, false);
         "adopted".to_string()
@@ -1108,7 +1108,7 @@ fn the_landings_of_round_eighteen_conform_to_the_commit_owed_model() {
     let mut h = a.hooks();
     let steps = Arc::new(AtomicUsize::new(0));
     let (world, n) = (Arc::clone(&a), Arc::clone(&steps));
-    h.acts.relaunch_restored = Arc::new(move |sid, _, _, _| {
+    h.acts.relaunch_restored = Arc::new(move |sid, _, _, _, _| {
         n.fetch_add(1, Ordering::SeqCst);
         world.adopted_in(sid, false);
         *world.holds.lock().unwrap() = Some(true);

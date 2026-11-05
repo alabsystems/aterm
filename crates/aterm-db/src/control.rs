@@ -46,6 +46,13 @@ pub(crate) mod mutants {
         /// Refuse a whole `atdb/5` push at a record its receiver has no room for, rather than
         /// judge the peer on the records that fit.
         CapacityRefusesPush,
+        /// Pass a peer while this Mac's membership records do not read, as the peer check did
+        /// before X1: the session's view states nothing, so a push is judged from its own
+        /// genesis, and the local log check lets the peer through.
+        UnreadCustodyAdmits,
+        /// Judge a peer by the records this Mac acknowledged alone, as the local log check did
+        /// before X1, so a `Remove` made durable here and not yet acknowledged takes no one out.
+        AcknowledgedOnly,
     }
 
     thread_local! {
@@ -67,6 +74,39 @@ pub(crate) mod mutants {
     /// Whether `mutant` is on in this thread.
     pub(crate) fn on(mutant: Mutant) -> bool {
         ON.with(|slot| slot.get() == Some(mutant))
+    }
+}
+
+/// Faults a test holds on this Mac's own reads for a whole session, the interleavings a race
+/// would give only at its moment.
+#[cfg(test)]
+pub(crate) mod faults {
+    thread_local! {
+        static RECORDS_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Run `run` with every read of this Mac's membership records by a peer check failing in
+    /// this thread, as a read fails while a writer replaces the file under it.
+    pub(crate) fn records_unread<T>(run: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                RECORDS_UNREAD.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = Restore(RECORDS_UNREAD.with(|slot| slot.replace(true)));
+        run()
+    }
+
+    /// What a peer check's read of this Mac's membership records meets in this thread: an
+    /// error under [`records_unread`].
+    pub(crate) fn records_read() -> aterm_secrets::Result<()> {
+        if RECORDS_UNREAD.with(std::cell::Cell::get) {
+            return Err(aterm_secrets::Error::new(
+                "membership records changed between reads",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -276,6 +316,7 @@ pub struct Repair {
     membership_error: Option<String>,
     said: Said,
     application_error: Option<String>,
+    application_cause: Option<aterm_types::network_state::RepairCause>,
     handoff: Option<std::result::Result<usize, String>>,
 }
 impl Repair {
@@ -290,6 +331,7 @@ impl Repair {
         self.membership_error = None;
         self.said = Said::Unknown;
         self.application_error = None;
+        self.application_cause = None;
         self.handoff = None;
         self.data.retry_probe = false;
         self.data.deferral = None;
@@ -386,6 +428,17 @@ impl Repair {
     /// [`Self::application`] separately. Starting another round clears it.
     pub fn application_error(&self) -> Option<&str> {
         self.application_error.as_deref()
+    }
+    /// Value-free application refusal, independent of local diagnostic text.
+    pub fn application_cause(&self) -> Option<aterm_types::network_state::RepairCause> {
+        self.application_cause
+    }
+    pub(crate) fn application_failed(&mut self, error: Error) {
+        self.failure_cause(&error);
+        self.application_error = Some(error.to_string());
+    }
+    pub(crate) fn failure_cause(&mut self, error: &Error) {
+        self.application_cause = Some(error.repair_cause());
     }
     /// An unavailable inventory in a completed application round. This preserves
     /// a local refusal separately from a peer's unexplained unavailable inventory.
@@ -518,8 +571,9 @@ impl Protocol {
 
 fn require_legacy_bound(bound: aterm_secrets::crossing::RecordsBound) -> Result<()> {
     if bound.crossed {
-        return Err(Error::new(
+        return Err(Error::repair(
             "crossed membership history requires a database protocol newer than atdb/3",
+            aterm_types::network_state::RepairCause::LegacyPastCrossing,
         ));
     }
     Ok(())
@@ -536,6 +590,30 @@ thread_local! {
 }
 
 impl Endpoint {
+    /// Local signed fleet advertisements, bound to current seats by this endpoint's log.
+    /// Neither an IP address nor a self-signed unknown node can select a seat's build.
+    #[cfg(not(test))]
+    pub(crate) fn advertised_versions(
+        &self,
+        state: &Path,
+    ) -> std::collections::BTreeMap<Actor, (std::net::IpAddr, String)> {
+        use aterm_secrets::membership_log::NodeStanding;
+        let Some(log) = &self.snapshot_log else {
+            return std::collections::BTreeMap::new();
+        };
+        let membership = log.membership();
+        aterm_net::fleet_member::read_peers(state)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|peer| peer.signature_holds())
+            .filter_map(|peer| {
+                let NodeStanding::Member(actor) = membership.node(peer.key?.bytes()) else {
+                    return None;
+                };
+                Some((actor, (peer.addr?, peer.version?)))
+            })
+            .collect()
+    }
     /// Legacy protocols carry no crossed-state metadata. Read the durable mark even when
     /// the endpoint's cached witness or the current records file is short.
     #[cfg_attr(
@@ -1243,7 +1321,7 @@ impl Endpoint {
         let peer = authenticate(self.trust, self.actor, proof, &hello)?;
         let actor = peer.actor;
         verify_peer_against_local_log(
-            self.paths.as_ref(),
+            self.custody(),
             self.trust,
             &peer.request,
             peer.log.as_deref(),
@@ -1509,7 +1587,7 @@ impl Endpoint {
         if !matches!(protocol, Protocol::Frontier(_))
             && let Err(error) = self.require_legacy_records()
         {
-            repair.application_error = Some(error.to_string());
+            repair.application_failed(error);
             return;
         }
         if let Some(application) = &self.application {
@@ -1519,6 +1597,7 @@ impl Endpoint {
                 let result =
                     application.exchange_legacy_projection(stream, actor, side, &mut repair.data);
                 repair.application_error = result.as_ref().err().map(ToString::to_string);
+                repair.application_cause = result.as_ref().err().map(Error::repair_cause);
                 repair.application = result.ok();
                 return;
             }
@@ -1528,6 +1607,7 @@ impl Endpoint {
                 application.exchange_with_compatibility(stream, actor, side, &mut repair.data)
             };
             repair.application_error = result.as_ref().err().map(ToString::to_string);
+            repair.application_cause = result.as_ref().err().map(Error::repair_cause);
             repair.application = result.ok();
         }
     }
@@ -1724,12 +1804,7 @@ fn admit_by_log_witness(
     binding: &aterm_secrets::commons::binding::Binding,
 ) -> Result<()> {
     if !log.has_historical_seat(binding)
-        || log.membership().removal(&binding.actor()).is_some()
-        || log.recipient_is_removed(&binding.recipient())
-        || matches!(
-            log.membership().node(binding.writer()),
-            aterm_secrets::membership_log::NodeStanding::Removed(_)
-        )
+        || removed_in(log, binding)
         || log.audience_left_out(
             &aterm_secrets::membership_log::EpochAudience::Commons,
             &binding.actor(),
@@ -1746,20 +1821,31 @@ fn admit_by_log_witness(
             &aterm_secrets::membership_log::EpochAudience::Everyone,
             &binding.recipient(),
         )
-        || log.membership().members().iter().any(|(m_actor, m)| {
-            (*m_actor == binding.actor() || m.binding.recipient() == binding.recipient())
-                && m.node_key.is_some_and(|nk| {
-                    nk != [0; 32]
-                        && matches!(
-                            log.membership().nodes().get(&nk),
-                            Some(aterm_secrets::membership_log::NodeStanding::Removed(_))
-                        )
-                })
-        })
     {
         return Err(Error::new("Commons peer lacks historical log approval"));
     }
     Ok(())
+}
+
+/// Whether `log` takes the Mac of `binding` out: an effective `Remove` of its actor, its
+/// recipient bound to a Mac now out, its writer key, or the node key of a seat that shares its
+/// actor or recipient, one a Mac now out bound.
+fn removed_in(
+    log: &aterm_secrets::membership_log::Log,
+    binding: &aterm_secrets::commons::binding::Binding,
+) -> bool {
+    use aterm_secrets::membership_log::NodeStanding;
+    let membership = log.membership();
+    membership.removal(&binding.actor()).is_some()
+        || log.recipient_is_removed(&binding.recipient())
+        || matches!(membership.node(binding.writer()), NodeStanding::Removed(_))
+        || membership.members().iter().any(|(m_actor, m)| {
+            (*m_actor == binding.actor() || m.binding.recipient() == binding.recipient())
+                && m.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(membership.nodes().get(&nk), Some(NodeStanding::Removed(_)))
+                })
+        })
 }
 
 /// How many vault folders [`LastRead`] keeps an answer for: a process reads one; tests read many.
@@ -1812,24 +1898,32 @@ impl<T: Clone> LastRead<T> {
     }
 }
 
-/// This vault's roster ([`aterm_secrets::client::swarm_roster_now`]), as [`roster_after`] keeps
+/// This vault's bounded roster read, as [`roster_after`] keeps
 /// it for this process.
 pub(crate) fn roster_or_last(
     paths: &aterm_secrets::client::Paths,
+) -> Option<Option<aterm_secrets::swarm_roster::SwarmRoster>> {
+    roster_or_last_until(paths, Instant::now() + Duration::from_millis(250))
+}
+
+fn roster_or_last_until(
+    paths: &aterm_secrets::client::Paths,
+    deadline: Instant,
 ) -> Option<Option<aterm_secrets::swarm_roster::SwarmRoster>> {
     static LAST: LastRead<Option<aterm_secrets::swarm_roster::SwarmRoster>> = LastRead::new();
     roster_after(
         &LAST,
         &paths.dir,
-        aterm_secrets::client::swarm_roster_now(paths),
+        aterm_secrets::client::swarm_roster_until(paths, deadline),
     )
 }
 
 /// The roster to check a peer by after `read`, a read of `dir`'s (`Some(None)`: no roster): a
-/// roster read now, kept in `last`; while a read gives none (`Ok(None)`: a vault sync applying,
-/// which saves `pending` ahead of its writes, or a vault that holds no roster entry) the last
-/// answer kept, and no roster, kept as the answer, while there was none; after a failed read the
-/// last answer kept, and `None` while there was none.
+/// roster read now, kept in `last`; while a settled read gives none (`Ok(None)`: an incomplete
+/// applied copy, or a vault that holds no roster entry) the last answer kept, and no roster,
+/// kept as the answer, while there was none. A busy writer always gives `None` without changing
+/// the memo, so a security check cannot pass on an older permissive roster under that writer.
+/// Other failed reads retain the last answer, or give `None` while there was none.
 ///
 /// The roster is only ever checked for whom it denies, so keeping the last one through an
 /// `Ok(None)` never admits anyone it would not: a read that gives none never replaces a roster
@@ -1842,6 +1936,7 @@ pub(crate) fn roster_after(
     match read {
         Ok(Some(roster)) => last.keep(dir, Some(Some(roster))),
         Ok(None) => Some(last.keep_unless_kept(dir, None)),
+        Err(error) if error.kind() == aterm_secrets::ErrorKind::VaultBusy => None,
         Err(_) => last.keep(dir, None),
     }
 }
@@ -1910,18 +2005,84 @@ fn roster_to_check(
     Ok(Some(roster))
 }
 
-/// Check the authenticated `peer_req` against this device's own membership log and
+/// What a peer check reads of this Mac's own membership records ([`Endpoint::custody`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Custody<'a> {
+    /// No records custody: the peer's own evidence is all the check has.
+    None,
+    /// The records of an endpoint built from its control journal: a pending device, or one
+    /// whose records gave it no seat when it was built. Its journal judges its peers: a member
+    /// its records remove keeps control repair, which is how that member takes its own `Remove`
+    /// (`automatic_application_refusal_preserves_control_for_retired_members`), and where its
+    /// records do not read, this exchange is how it recovers them
+    /// (`unreadable_membership_recovery_preserves_control_but_never_reports_application_success`),
+    /// so a read that fails leaves the peer to the journal.
+    Journal(&'a aterm_secrets::client::Paths),
+    /// The records of an endpoint built from its membership log ([`Endpoint::snapshot_log`]).
+    /// They are what says a peer was removed, so while they do not read no peer passes.
+    Log(&'a aterm_secrets::client::Paths),
+}
+
+impl Custody<'_> {
+    /// What a check does after this Mac's records failed to read with `error`: a log
+    /// endpoint refuses the peer, since the records it cannot read may remove it; a journal
+    /// endpoint leaves the peer to its journal (`Ok`).
+    fn unread(self, error: aterm_secrets::Error) -> Result<()> {
+        #[cfg(test)]
+        if mutants::on(mutants::Mutant::UnreadCustodyAdmits) {
+            return Ok(());
+        }
+        match self {
+            Self::Log(_) => Err(local_failure("records read for a peer check", error)),
+            Self::None | Self::Journal(_) => Ok(()),
+        }
+    }
+}
+
+impl Endpoint {
+    /// What this endpoint's peer checks read of its own records.
+    pub(crate) fn custody(&self) -> Custody<'_> {
+        match (&self.paths, &self.snapshot_log) {
+            (None, _) => Custody::None,
+            (Some(paths), Some(_)) => Custody::Log(paths),
+            (Some(paths), None) => Custody::Journal(paths),
+        }
+    }
+}
+
+/// Every membership record this Mac holds ([`aterm_secrets::client::load_records`]), as a peer
+/// check reads them.
+fn held_records(
+    paths: &aterm_secrets::client::Paths,
+) -> aterm_secrets::Result<aterm_secrets::membership_log::Store> {
+    #[cfg(test)]
+    faults::records_read()?;
+    aterm_secrets::client::load_records(paths)
+}
+
+/// Check the authenticated `peer_req` against this device's own membership records and
 /// roster. `peer_log` is the log its `ACX2` witness decoded to when [`authenticate`] checked it
 /// in this same round, so the witness is hashed and looked up once per round.
+///
+/// At a [`Custody::Log`] endpoint every record this Mac holds can take the peer out
+/// ([`removed_in`]), acknowledged or not: a `Remove` stands from the moment it is durable here,
+/// as admission holds out what records ahead of their acknowledgement hold out
+/// ([`aterm_secrets::client::load_acknowledged_and_ahead`]). The rest of the judgement reads the
+/// acknowledged log ([`aterm_secrets::client::trusted_commons_log`]).
+///
+/// # Errors
+/// The roster or the records remove the peer, its witness belongs to another log, or, for a
+/// [`Custody::Log`] endpoint, this Mac's records do not read.
 fn verify_peer_against_local_log(
-    paths: Option<&aterm_secrets::client::Paths>,
+    custody: Custody<'_>,
     trust: Trust,
     peer_req: &Request,
     peer_log: Option<&aterm_secrets::membership_log::Log>,
 ) -> Result<()> {
     let actor = peer_req.binding().actor();
-    let Some(paths) = paths else {
-        return Ok(());
+    let paths = match custody {
+        Custody::None => return Ok(()),
+        Custody::Journal(paths) | Custody::Log(paths) => paths,
     };
     let recipient = peer_req.binding().recipient();
     // A roster or deny list this device fails to read now is the last one it read
@@ -1934,22 +2095,48 @@ fn verify_peer_against_local_log(
             "Commons peer was removed from the membership log",
         ));
     }
-    let Ok(Some((local_log, _))) = aterm_secrets::client::trusted_commons_log(paths, trust) else {
-        return Ok(());
+    #[cfg(test)]
+    let acknowledged_only = mutants::on(mutants::Mutant::AcknowledgedOnly);
+    #[cfg(not(test))]
+    let acknowledged_only = false;
+    if matches!(custody, Custody::Log(_)) && !acknowledged_only {
+        match held_records(paths) {
+            Ok(held) => {
+                if let Some(log) = held.log()
+                    && matches!(
+                        log.genesis().body(),
+                        aterm_secrets::membership_log::Body::Genesis { root, .. }
+                            if root.network == trust.network
+                                && root.authority == trust.authority
+                    )
+                    && removed_in(log, peer_req.binding())
+                {
+                    return Err(Error::new(
+                        "Commons peer was removed from the membership log",
+                    ));
+                }
+            }
+            Err(error) => return custody.unread(error),
+        }
+    }
+    #[cfg(test)]
+    let judged = faults::records_read()
+        .and_then(|()| aterm_secrets::client::trusted_commons_log(paths, trust));
+    #[cfg(not(test))]
+    let judged = aterm_secrets::client::trusted_commons_log(paths, trust);
+    let local_log = match judged {
+        Ok(Some((log, _))) => log,
+        Ok(None) => return Ok(()),
+        Err(error) => return custody.unread(error),
     };
     let denied_by = |log: &aterm_secrets::membership_log::Log| {
-        use aterm_secrets::membership_log::{EpochAudience, NodeStanding};
+        use aterm_secrets::membership_log::EpochAudience;
         let Ok(log_roster) = aterm_secrets::client::local_swarm_roster_for_log(paths, log) else {
             return true;
         };
         let log_roster = log_roster.or_else(|| roster.clone());
         let membership = log.membership();
-        membership.removal(&actor).is_some()
-            || log.recipient_is_removed(&recipient)
-            || matches!(
-                membership.node(peer_req.binding().writer()),
-                NodeStanding::Removed(_)
-            )
+        removed_in(log, peer_req.binding())
             || log.audience_left_out_recipient(&EpochAudience::Commons, &recipient)
             || log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
             || log_roster
@@ -1959,13 +2146,6 @@ fn verify_peer_against_local_log(
                 (*m_actor == actor || m.binding.recipient() == recipient)
                     && (log.audience_left_out(&EpochAudience::Commons, m_actor)
                         || log.audience_left_out(&EpochAudience::Everyone, m_actor)
-                        || m.node_key.is_some_and(|nk| {
-                            nk != [0; 32]
-                                && matches!(
-                                    membership.nodes().get(&nk),
-                                    Some(NodeStanding::Removed(_))
-                                )
-                        })
                         || log_roster
                             .as_ref()
                             .is_some_and(|r| aterm_secrets::client::member_denied_by_roster(r, m)))

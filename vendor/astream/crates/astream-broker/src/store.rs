@@ -205,6 +205,10 @@ pub const BIND_SUBJECT: &str = "/a/bind";
 /// and `ev` faces) from the last-value index (`last` / `carried_last`) and decrements
 /// `subjects_per_producer` both live and on rebuild across restarts and compaction.
 pub const RETIRE_SUBJECT: &str = "/a/retire";
+/// The hidden record of a log's first relayed record from an origin, in that record's batch: what
+/// tells an open or a replica, with the record format unchanged, that this producer's keys are an
+/// origin's, whose cuts raise a floor (`relay_floor.rs`). Hidden like [`COMMIT_SUBJECT`].
+pub const RELAY_MARK_SUBJECT: &str = "/a/relay";
 
 pub use crate::brecord::RETIRE_PRODUCER_SEQ;
 
@@ -217,7 +221,7 @@ pub use crate::brecord::RETIRE_PRODUCER_SEQ;
 pub fn is_hidden_subject(subject: &str) -> bool {
     matches!(
         subject,
-        COMMIT_SUBJECT | WILL_SUBJECT | BIND_SUBJECT | RETIRE_SUBJECT
+        COMMIT_SUBJECT | WILL_SUBJECT | BIND_SUBJECT | RETIRE_SUBJECT | RELAY_MARK_SUBJECT
     )
 }
 
@@ -251,7 +255,7 @@ fn retire_target(rec: &BrokerRecord) -> Option<&str> {
 #[must_use]
 pub fn is_hidden_record(rec: &BrokerRecord) -> bool {
     match rec.subject.as_str() {
-        COMMIT_SUBJECT | WILL_SUBJECT | BIND_SUBJECT => true,
+        COMMIT_SUBJECT | WILL_SUBJECT | BIND_SUBJECT | RELAY_MARK_SUBJECT => true,
         RETIRE_SUBJECT => is_retire_record(rec),
         _ => false,
     }
@@ -677,6 +681,7 @@ struct RebuiltIndices {
     carried_last_bt: BTreeMap<String, u64>,
     carried_charges: BTreeMap<String, u64>,
     uncarried_cut_tainted: bool,
+    relay_floors: crate::relay_floor::RelayFloors,
     bind: HashMap<u64, (String, Offset)>,
     group_commits: HashMap<String, u64>,
     producer_last_bt: HashMap<u64, u64>,
@@ -821,6 +826,15 @@ pub struct BrokerLog {
     /// True when the log was cut above 0 without a `<log>.state` carrying `carried_charges`
     /// (e.g. plain `retain_before`), making `Retire` refuse with `RETIRE_CUT_PREFIX`.
     uncarried_cut_tainted: bool,
+    /// How far retention cuts have taken each origin (`relay_floor.rs`), which a relayed record
+    /// at or below answers to in place of the dedup key the cut dropped.
+    relay_floors: crate::relay_floor::RelayFloors,
+    /// The producer ids of the origin keys the broker has held in this run, which may never have
+    /// relayed here: an origin's home log holds its plain publishes, and a replay of one needs a
+    /// floor. A publish under one marks it durably, as a first relayed record does, so the next
+    /// open knows it before anyone has said its key again.
+    #[cfg(feature = "relay")]
+    relay_origin_ids: HashSet<u64>,
     /// The path this log was opened from: the log's own name, the stem the replica
     /// marker beside it is derived from, and what the retention compaction rewrites
     /// (with its base sidecar).
@@ -1247,6 +1261,8 @@ pub(crate) struct Compaction {
     /// written in the unlocked half before the copy, applied in memory at the finish.
     /// `None` for a log no rules retain.
     held: Option<crate::held::HeldJob>,
+    /// The relay floors once this cut has happened (`relay_floor.rs`).
+    relay_floors: crate::relay_floor::RelayFloors,
     /// The seam crashed the unlocked half: nothing more is done or undone.
     crashed: bool,
 }
@@ -1337,6 +1353,7 @@ struct CompactedState {
     carried_last_bt: BTreeMap<String, u64>,
     carried_charges: BTreeMap<String, u64>,
     uncarried_cut_tainted: bool,
+    relay_floors: crate::relay_floor::RelayFloors,
 }
 
 #[cfg(feature = "retention")]
@@ -1507,6 +1524,9 @@ impl CompactedState {
             out.extend_from_slice(&encode_u32_le_bytes(slen));
             out.extend_from_slice(subj.as_bytes());
         }
+        if !self.relay_floors.is_empty() && self.relay_floors.encode(&mut out).is_none() {
+            return Err(FrameError::TooLarge);
+        }
         Ok(out)
     }
 
@@ -1610,6 +1630,13 @@ impl CompactedState {
             expected_base > 0
         };
 
+        // A log with no origin ends here.
+        let relay_floors = if pos < bytes.len() {
+            crate::relay_floor::RelayFloors::decode(bytes, &mut pos)?
+        } else {
+            crate::relay_floor::RelayFloors::default()
+        };
+
         if pos != bytes.len() {
             return None;
         }
@@ -1622,6 +1649,7 @@ impl CompactedState {
             carried_last_bt,
             carried_charges,
             uncarried_cut_tainted,
+            relay_floors,
         })
     }
 }
@@ -4132,6 +4160,50 @@ pub(crate) fn open_log_file(
     Ok((file, created))
 }
 
+/// The principal a subject names as its owner when `producer_id` derives from it. An origin's id
+/// has no binding on a broker it never attached to, as on a relay's destination, and this is what
+/// the id still proves there: a record is escalated the same wherever it lands.
+#[cfg(feature = "cap")]
+fn subject_owner_of(subject: &str, producer_id: u64) -> Option<&str> {
+    let owner = astream_cap::relay_owner(subject)?;
+    (astream_cap::producer_id_of(owner) == producer_id).then_some(owner)
+}
+
+/// No capabilities, no owners: only a binding names a producer's principal.
+#[cfg(not(feature = "cap"))]
+const fn subject_owner_of(_subject: &str, _producer_id: u64) -> Option<&str> {
+    None
+}
+
+/// A filter's answer for each subject a scan passes, asked once a run of records naming one
+/// subject. The tier holds each subject once and every summary names it by that one string,
+/// so a record whose subject is the very string the last one's was has the last one's answer
+/// (the same address and length is the same text while the scan borrows the tier); any other
+/// asks the filter. A refill's scan over a backlog of one subject asks it each time the subject
+/// changes, where it asked once a record (aterm D10f).
+struct Matches<'f, 's> {
+    filter: &'f Filter,
+    last: Option<(&'s str, bool)>,
+}
+
+impl<'f, 's> Matches<'f, 's> {
+    fn of(filter: &'f Filter) -> Self {
+        Matches { filter, last: None }
+    }
+
+    /// Whether the filter matches `subject`.
+    fn subject(&mut self, subject: &'s str) -> bool {
+        if let Some((name, hit)) = self.last {
+            if std::ptr::eq(name, subject) {
+                return hit;
+            }
+        }
+        let hit = self.filter.matches_str(subject);
+        self.last = Some((subject, hit));
+        hit
+    }
+}
+
 impl BrokerLog {
     /// Open (creating if absent) the log at `path` with Strict durability.
     pub fn open(path: impl AsRef<Path>) -> io::Result<BrokerLog> {
@@ -4924,6 +4996,9 @@ impl BrokerLog {
             carried_last_bt: rebuilt.carried_last_bt,
             carried_charges: rebuilt.carried_charges,
             uncarried_cut_tainted: rebuilt.uncarried_cut_tainted,
+            relay_floors: rebuilt.relay_floors,
+            #[cfg(feature = "relay")]
+            relay_origin_ids: HashSet::new(),
             bind: rebuilt.bind,
             producer_last_bt: rebuilt.producer_last_bt,
             group_commits: rebuilt.group_commits,
@@ -5160,6 +5235,7 @@ impl BrokerLog {
         let mut carried_last_bt: BTreeMap<String, u64> = compacted.carried_last_bt;
         let carried_charges: BTreeMap<String, u64> = compacted.carried_charges;
         let uncarried_cut_tainted: bool = compacted.uncarried_cut_tainted;
+        let mut relay_floors = compacted.relay_floors;
         let mut pending_carried_charges: BTreeMap<String, u64> = carried_charges.clone();
         let mut producer_last_bt: HashMap<u64, u64> = HashMap::new();
         let mut max_bt: u64 = 0;
@@ -5213,6 +5289,9 @@ impl BrokerLog {
                         bind.insert(r.producer_id, (principal.to_string(), r.seq));
                     }
                 }
+            }
+            if r.subject == RELAY_MARK_SUBJECT {
+                relay_floors.mark(r.producer_id);
             }
             if let Some(target) = retire_target(r) {
                 pending_carried_charges.remove(target);
@@ -5274,6 +5353,7 @@ impl BrokerLog {
             carried_last_bt,
             carried_charges,
             uncarried_cut_tainted,
+            relay_floors,
             bind,
             group_commits,
             producer_last_bt,
@@ -5784,7 +5864,7 @@ impl BrokerLog {
         }
         let principal = match self.binding(producer_id) {
             Some((p, _)) => Some(p),
-            None => None,
+            None => subject_owner_of(subject, producer_id),
         };
         self.rules.matches(subject, principal, group)
     }
@@ -6212,12 +6292,9 @@ impl BrokerLog {
         self.durable_len = keep as u64;
         self.newest_at = new_newest_at;
         self.log_id = new_log_id;
-        self.tier = crate::tier::Tier::from_parts(
-            rebuilt.records,
-            kept_bts_vec,
-            kept_at_vec,
-            self.tier.budget(),
-        );
+        self.tier = self
+            .tier
+            .rebuilt(rebuilt.records, kept_bts_vec, kept_at_vec);
         self.next = target_head;
         self.durable_head = target_head.0;
         self.held_from = None;
@@ -6234,6 +6311,7 @@ impl BrokerLog {
         self.carried_last_bt = rebuilt.carried_last_bt;
         self.carried_charges = rebuilt.carried_charges;
         self.uncarried_cut_tainted = rebuilt.uncarried_cut_tainted;
+        self.relay_floors = rebuilt.relay_floors;
         self.bind = rebuilt.bind;
         self.producer_last_bt = rebuilt.producer_last_bt;
         self.last_bt_ms = broker_bt_advance(self.last_bt_ms, rebuilt.max_bt);
@@ -6643,10 +6721,8 @@ impl BrokerLog {
         let max_idx = usize::try_from(visible.saturating_sub(self.base.0))
             .unwrap_or(usize::MAX)
             .min(self.tier.len());
-        for i in 0..max_idx {
-            if let Some(s) = self.tier.summary(i) {
-                accumulate_face_stat(&mut by_face, filter, s.is_hidden(), s.subject(), s.bytes());
-            }
+        for s in self.tier.summaries(0, max_idx).iter() {
+            accumulate_face_stat(&mut by_face, filter, s.is_hidden(), s.subject(), s.bytes());
         }
         let mut out = Vec::new();
         for (face, (recs, bytes)) in by_face {
@@ -6967,6 +7043,115 @@ impl BrokerLog {
         self.stage_publish_bounded(producer_id, producer_seq, subject, body, true)
     }
 
+    /// Stage a record that originated elsewhere ([`Request::Relay`]) under its origin's key:
+    /// [`stage_publish`](Self::stage_publish), charged to the origin's subject budget as any
+    /// record is to its producer's. A key this log holds, whichever path brought it, appends
+    /// nothing, which is what ends a record's trip around a cycle of bridges. Past the
+    /// retained dedup window a floor answers for the key (below).
+    ///
+    /// MONOTONE `Last`. On a subject whose rule keeps `Last` ([`Keep::Last`]) a subject's reader
+    /// wants its owner's newest row, and two paths may bring an origin's rows in either order. A
+    /// row at or below the one the subject holds appends nothing and answers as a duplicate at
+    /// that row's offset, so the log stays in origin order per subject and everything that reads
+    /// it (the index, recovery, compaction, the `Last` face) needs no second rule. It also ends a
+    /// late copy of a row whose key compaction has cut. A subject that keeps every record takes
+    /// each one in arrival order: mail must arrive. On either, a record a retention cut has passed
+    /// answers as a duplicate just below the log's base (`relay_floor.rs`): its key is gone, and a
+    /// signature has no age.
+    ///
+    /// [`Request::Relay`]: crate::proto::Request::Relay
+    /// [`Keep::Last`]: crate::retention::Keep::Last
+    pub(crate) fn stage_relay(
+        &mut self,
+        producer_id: u64,
+        producer_seq: u64,
+        subject: String,
+        body: Vec<u8>,
+    ) -> Result<(Offset, bool), StageErr> {
+        self.check_poisoned_stage()?;
+        if self
+            .staged_or_durable_dup((producer_id, producer_seq))
+            .is_none()
+        {
+            if self.keeps_last(&subject) {
+                if let Some(off) = self.row_at_or_past(&subject, producer_id, producer_seq) {
+                    self.note_dedup(off, &subject, producer_id, None);
+                    return Ok((off, true));
+                }
+            }
+            if self
+                .relay_floors
+                .passed(producer_id, &subject, producer_seq)
+            {
+                return Ok((Offset(self.base.0.saturating_sub(1)), true));
+            }
+            self.stage_relay_mark(producer_id)?;
+        }
+        self.stage_publish(producer_id, producer_seq, subject, body)
+    }
+
+    /// Make `producer_id` an origin of this log durably, in the batch being staged, unless it is
+    /// one already.
+    fn stage_relay_mark(&mut self, producer_id: u64) -> Result<(), StageErr> {
+        let staged = self
+            .staged
+            .iter()
+            .any(|rec| rec.subject == RELAY_MARK_SUBJECT && rec.producer_id == producer_id);
+        if staged || self.relay_floors.marked(producer_id) {
+            return Ok(());
+        }
+        let seq = self.next_staged_seq().ok_or(StageErr::TooLarge)?;
+        self.stage_record(BrokerRecord {
+            seq,
+            producer_id,
+            producer_seq: 0,
+            subject: RELAY_MARK_SUBJECT.to_string(),
+            body: Vec::new(),
+            commit: None,
+        })
+        .map(drop)
+    }
+
+    /// Say which producers' keys the broker holds now
+    /// ([`Broker::set_origin_keys`](crate::Broker::set_origin_keys)). One whose key is withdrawn
+    /// stays an origin for this run: its records are still in the log, and it may come back.
+    #[cfg(feature = "relay")]
+    pub(crate) fn add_relay_origin_ids(&mut self, ids: impl IntoIterator<Item = u64>) {
+        self.relay_origin_ids.extend(ids);
+    }
+
+    /// Whether the rules this log was last given keep only `subject`'s `Last` row.
+    #[cfg(feature = "retention")]
+    fn keeps_last(&self, subject: &str) -> bool {
+        self.retention().is_some_and(|r| r.keeps_last(subject))
+    }
+
+    /// A log without retention keeps every record.
+    #[cfg(not(feature = "retention"))]
+    const fn keeps_last(&self, _subject: &str) -> bool {
+        false
+    }
+
+    /// The offset of `subject`'s current row when it is `producer_id`'s, at `producer_seq` or
+    /// past it. Rows of two producers are not ordered by their sequences, an ack's sequence
+    /// ([`ACK_SEQ_BASE`]) is a source offset and orders nothing, and a row this cannot read
+    /// orders nothing either: a record is then taken, not lost.
+    fn row_at_or_past(&self, subject: &str, producer_id: u64, producer_seq: u64) -> Option<Offset> {
+        let (off, _) = self.batch_subject_state(subject)?;
+        let (id, seq) = match self.staged.iter().find(|rec| rec.seq == off) {
+            Some(rec) => (rec.producer_id, rec.producer_seq),
+            None => {
+                let rec = self.last_indexed_record(subject, off.0).ok()??;
+                (rec.producer_id, rec.producer_seq)
+            }
+        };
+        (id == producer_id
+            && seq < ACK_SEQ_BASE
+            && producer_seq < ACK_SEQ_BASE
+            && seq >= producer_seq)
+            .then_some(off)
+    }
+
     /// [`stage_publish`](Self::stage_publish) with the distinct-subject bound made
     /// explicit. `enforce_bound: false` is for the ONE record whose subject was already
     /// checked, and answered for, at an earlier verb: a will FIRING (see
@@ -6986,6 +7171,10 @@ impl BrokerLog {
         if let Some(off) = self.staged_or_durable_dup((producer_id, producer_seq)) {
             self.note_dedup(off, &subject, producer_id, None);
             return Ok((off, true));
+        }
+        #[cfg(feature = "relay")]
+        if self.relay_origin_ids.contains(&producer_id) {
+            self.stage_relay_mark(producer_id)?;
         }
         let seq = self.next_staged_seq().ok_or(StageErr::TooLarge)?;
         self.stage_record_bounded(
@@ -7036,6 +7225,10 @@ impl BrokerLog {
         if let Some(off) = self.staged_or_durable_dup((producer_id, producer_seq)) {
             self.note_dedup(off, &out_subject, producer_id, Some(&group));
             return Ok((off, true));
+        }
+        #[cfg(feature = "relay")]
+        if self.relay_origin_ids.contains(&producer_id) {
+            self.stage_relay_mark(producer_id)?;
         }
         let seq = self.next_staged_seq().ok_or(StageErr::TooLarge)?;
         self.stage_record(BrokerRecord {
@@ -7408,13 +7601,8 @@ impl BrokerLog {
     /// record (including wills carried across compaction via `<log>.state`).
     fn latest_wills(&self) -> Vec<(Offset, WillRecord)> {
         let mut latest: HashMap<u64, (Offset, WillRecord)> = self.carried_wills.clone();
-        for i in 0..self.tier.len() {
-            let Some(s) = self.tier.summary(i) else {
-                continue;
-            };
-            if s.subject() != WILL_SUBJECT {
-                continue;
-            }
+        // Only the pages that name the will subject are read.
+        for i in self.tier.naming(WILL_SUBJECT, 0, self.tier.len()) {
             let Some(rec) = self.record_arc(i) else {
                 continue;
             };
@@ -8001,6 +8189,9 @@ impl BrokerLog {
                 if let Some(will) = WillRecord::from_record(&rec) {
                     self.reserve_will_subject(&will);
                 }
+            }
+            if rec.subject == RELAY_MARK_SUBJECT {
+                self.relay_floors.mark(rec.producer_id);
             }
             if rec.subject == BIND_SUBJECT {
                 if let Ok(principal) = std::str::from_utf8(&rec.body) {
@@ -8932,13 +9123,18 @@ impl BrokerLog {
         let limit = start.saturating_add(budget as u64).min(visible);
         let mut next = start;
         let mut off = start;
+        // The summaries from `start`, one an offset, read page by page; past the records
+        // held the scan ends, as a summary there answers none.
+        let index = |o: u64| usize::try_from(o.saturating_sub(self.base.0)).unwrap_or(usize::MAX);
+        let mut rows = self.tier.scan(index(start), index(limit));
+        let mut matches = Matches::of(filter);
         while off < limit {
             next = off.saturating_add(1);
-            let Some(s) = self.summary_at(off) else {
+            let Some(Some(s)) = rows.next() else {
                 next = off;
                 break;
             };
-            if s.is_hidden() || !filter.matches_str(s.subject()) {
+            if s.is_hidden() || !matches.subject(s.subject()) {
                 off = next;
                 continue;
             }
@@ -9082,12 +9278,16 @@ impl BrokerLog {
         let to = from.saturating_add(max_scan).min(end_rel);
         let mut out = Vec::new();
         let mut scanned_to = *cursor;
+        let mut rows = self.tier.scan(from, to);
+        let mut matches = Matches::of(filter);
         for i in from..to {
             let off = self.base.0.saturating_add(i as u64);
+            // One summary an index, read whether or not `also_at` decides this one.
+            let summary = rows.next().flatten();
             let want = match also_at {
                 Some(a) if a == off => true,
-                _ => match self.tier.summary(i) {
-                    Some(s) => !s.is_hidden() && filter.matches_str(s.subject()),
+                _ => match summary {
+                    Some(s) => !s.is_hidden() && matches.subject(s.subject()),
                     None => true,
                 },
             };
@@ -9197,16 +9397,6 @@ impl BrokerLog {
         }
     }
 
-    /// The retained record's summary at ABSOLUTE offset `off`, or `None` if it was pruned
-    /// or is not committed.
-    fn summary_at(&self, off: u64) -> Option<crate::tier::Summary<'_>> {
-        let rel = off.checked_sub(self.base.0)?;
-        let Ok(i) = usize::try_from(rel) else {
-            return None;
-        };
-        self.tier.summary(i)
-    }
-
     /// The retained record at ABSOLUTE offset `off` (records are held base-relative),
     /// or `None` if it was pruned or is not committed.
     fn record_at(&self, off: u64) -> Option<Arc<BrokerRecord>> {
@@ -9254,12 +9444,21 @@ impl BrokerLog {
 
     /// The records this open has read back from the file because the residency budget left
     /// them cold ([`set_resident_budget`](Self::set_resident_budget)): one for every frame
-    /// [`record_arc`](Self::record_arc) read, whether it decoded or not, since the open (or, in
+    /// `record_arc` read, whether it decoded or not, since the open (or, in
     /// a unit test, the last `reset_cold_reads`). Every retained record resident (no budget)
     /// keeps it at 0.
     #[must_use]
     pub fn cold_reads(&self) -> u64 {
         self.cold_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What this log's residency tier did since the open ([`TierTally`](crate::TierTally)):
+    /// its pushes, one-record reads by index, walks and the rows they read, subject walks and
+    /// the pages they read, and wide values read. A test or debug build only.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn tier_tally(&self) -> crate::TierTally {
+        self.tier.tally()
     }
 
     /// Reset the positional cold-read counter to zero.
@@ -9338,7 +9537,8 @@ impl BrokerLog {
     /// REFUSED (`InvalidInput`, naming the offset — the highest floor it can take)
     /// when the dropped prefix holds a producer binding or a will that could still
     /// fire: those live only in their own records unless carried in a `<log>.state`
-    /// sidecar (see [`Self::retain_before_carrying_state`]). Group commits are not held
+    /// sidecar (see [`Self::retain_before_carrying_state`]). A log that holds relay origins
+    /// always carries state, and so is not refused. Group commits are not held
     /// back: after a reopen, a group whose last commit record was dropped resumes from
     /// the base (the earliest retained record), and may re-read records it had already
     /// committed.
@@ -9437,7 +9637,7 @@ impl BrokerLog {
             self.hold
                 .unplanned_job(&self.path, at_rest_ref, &perms, self.base.0, min)?
         };
-        let carry = carry_state || self.hold.active;
+        let carry = carry_state || self.hold.active || self.holds_origins();
         self.compact_open(min, carry, held).map(Some)
     }
 
@@ -9455,6 +9655,11 @@ impl BrokerLog {
             self.refuse_retention_blocker(min)?;
         }
         let drop_count = min.saturating_sub(self.base.0);
+        let relay_floors = if carry {
+            self.relay_floors_past(min)
+        } else {
+            self.relay_floors.clone()
+        };
         let perms = self.file.os()?.metadata()?.permissions();
         let copy = crate::compact::KeptCopy::begin(
             &self.path,
@@ -9471,8 +9676,59 @@ impl BrokerLog {
             perms,
             copy,
             held,
+            relay_floors,
             crashed: false,
         })
+    }
+
+    /// Whether a cut of this log must carry state, or a reopen would forget its origins' floors.
+    #[cfg(all(feature = "retention", feature = "relay"))]
+    fn holds_origins(&self) -> bool {
+        !self.relay_floors.is_empty() || !self.relay_origin_ids.is_empty()
+    }
+
+    /// A build that cannot relay still carries what a log already holds.
+    #[cfg(all(feature = "retention", not(feature = "relay")))]
+    fn holds_origins(&self) -> bool {
+        !self.relay_floors.is_empty()
+    }
+
+    /// The floors once a cut to `min` has dropped every key below it. Each key names its record's
+    /// offset, and the tier that record's subject, so no cold frame is decoded. Only an origin's
+    /// keys raise a floor: nothing else can ever relay.
+    #[cfg(all(feature = "retention", feature = "relay"))]
+    fn relay_floors_past(&self, min: u64) -> crate::relay_floor::RelayFloors {
+        let mut floors = self.relay_floors.clone();
+        for &id in &self.relay_origin_ids {
+            floors.mark(id);
+        }
+        if floors.is_empty() {
+            return floors;
+        }
+        self.dedup
+            .each_below(min, |producer_id, producer_seq, off| {
+                if producer_seq >= ACK_SEQ_BASE {
+                    return;
+                }
+                let summary = off
+                    .checked_sub(self.base.0)
+                    .and_then(|i| usize::try_from(i).ok())
+                    .and_then(|i| self.tier.summary(i));
+                if let Some(summary) = summary.filter(|s| !s.is_hidden()) {
+                    floors.raise(producer_id, summary.subject(), producer_seq);
+                }
+            });
+        floors.bound(
+            crate::relay_floor::SUBJECTS_PER_ORIGIN,
+            crate::relay_floor::MAX_ENCODED_BYTES,
+        );
+        floors
+    }
+
+    /// A broker that cannot relay raises no floor; what a log already holds stays.
+    #[cfg(all(feature = "retention", not(feature = "relay")))]
+    fn relay_floors_past(&self, _min: u64) -> crate::relay_floor::RelayFloors {
+        self.relay_floors.clone()
     }
 
     #[cfg(feature = "retention")]
@@ -9491,7 +9747,7 @@ impl BrokerLog {
                 ..crate::retention::Plan::default()
             };
         };
-        // The planner reads each retained record's slot in the tier (offset, subject, bytes,
+        // The planner reads each retained record's summary in the tier (offset, subject, bytes,
         // broker time), and loads a whole record only to carry it below the cut: a log with
         // a residency budget plans without decoding its cold records.
         let scene = crate::retention::Scene {
@@ -9792,6 +10048,8 @@ impl BrokerLog {
                 "retention: could not locate the cut point in the durable log",
             ));
         };
+        // An origin first marked during the unlocked copy stays one: its mark is above the cut.
+        c.relay_floors.keep_origins_of(&self.relay_floors);
         // 2) The carried state, staged at the new base: written BEFORE the intent, so an
         //    intent that carries state always has it beside it.
         let carried = if c.carry {
@@ -9805,6 +10063,7 @@ impl BrokerLog {
                 carried_last_bt: last_bt.clone(),
                 carried_charges: charges.clone(),
                 uncarried_cut_tainted: self.uncarried_cut_tainted,
+                relay_floors: c.relay_floors.clone(),
             };
             let staged = staged_state_path(&self.path);
             let key = self.at_rest_ref();
@@ -9857,6 +10116,7 @@ impl BrokerLog {
         //    entry whose retained offset lies below `c.min` without decoding dropped
         //    cold frames from disk, then take the carried state and the new identity.
         self.dedup.retain_from(c.min);
+        self.relay_floors = std::mem::take(&mut c.relay_floors);
         let drain_len = usize::try_from(c.drop_count)
             .unwrap_or(self.tier.len())
             .min(self.tier.len());
@@ -9957,10 +10217,7 @@ impl BrokerLog {
             }
         }
         let mut carried_charges: CarriedCharges = self.carried_charges.clone();
-        for i in 0..self.tier.len() {
-            let Some(s) = self.tier.summary(i) else {
-                continue;
-            };
+        for (i, s) in self.tier.summaries(0, self.tier.len()).indexed() {
             if s.offset() >= min {
                 break;
             }
@@ -11603,6 +11860,59 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(base_path(&path));
         (guard, path)
+    }
+
+    /// An origin first marked while a compaction copies is above that cut: its finish keeps the
+    /// mark, in memory and in the state it writes, so the next cut floors the origin's keys.
+    #[cfg(all(feature = "retention", feature = "relay"))]
+    #[test]
+    fn an_origin_marked_during_the_copy_survives_the_finish() {
+        let (_tmp, path) = retained_path("markcopy");
+        let mut log = BrokerLog::open(&path).unwrap();
+        log.publish(1, 1, "/a/s/x".into(), b"x".to_vec()).unwrap();
+        let mut c = log
+            .compact_begin(Offset(1), true)
+            .unwrap()
+            .expect("one record to drop");
+        c.copy().unwrap();
+        log.stage_relay(7, 5, "/m/o/x".into(), b"r".to_vec())
+            .unwrap();
+        log.commit_batch().unwrap();
+        assert_eq!(log.compact_finish(c).unwrap(), 1);
+        assert!(log.relay_floors.marked(7), "in memory");
+        let cut = log.head();
+        assert_eq!(log.retain_before(cut).unwrap(), cut.0 - 1);
+        assert!(
+            log.relay_floors.passed(7, "/m/o/x", 5),
+            "the next cut floors it"
+        );
+        drop(log);
+        let log = BrokerLog::open(&path).unwrap();
+        assert!(
+            log.relay_floors.passed(7, "/m/o/x", 5),
+            "and a reopen keeps it"
+        );
+        drop(log);
+    }
+
+    /// A log that knows no origin writes its state as it did, and a state with no floors reads.
+    #[cfg(feature = "retention")]
+    #[test]
+    fn a_state_with_no_origin_has_no_floors_section() {
+        let state = CompactedState::default();
+        let without = state.encode(0).unwrap();
+        let mut floored = CompactedState::default();
+        floored.relay_floors.mark(7);
+        let with = floored.encode(0).unwrap();
+        assert!(with.len() > without.len());
+        assert!(CompactedState::decode(&without, 0)
+            .unwrap()
+            .relay_floors
+            .is_empty());
+        assert!(CompactedState::decode(&with, 0)
+            .unwrap()
+            .relay_floors
+            .marked(7));
     }
 
     /// A producer binding lives only in its `/a/bind` record, so retention refuses

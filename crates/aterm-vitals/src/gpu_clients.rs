@@ -140,7 +140,7 @@ impl GpuShares {
         self.held().then(|| {
             self.rates
                 .get(&pid)
-                .filter(|(n, _)| same_comm(n, name))
+                .filter(|(n, _)| crate::model::same_process_name(n, name))
                 .map_or(0.0, |(_, share)| *share)
         })
     }
@@ -150,15 +150,6 @@ impl GpuShares {
         self.held()
             .then(|| self.rates.values().map(|(_, s)| *s).sum())
     }
-}
-
-/// Whether two short names are one process's: equal in their first 16 bytes (`MAXCOMLEN`, where
-/// macOS cuts `p_comm`).
-fn same_comm(a: &str, b: &str) -> bool {
-    fn cut(s: &str) -> &[u8] {
-        &s.as_bytes()[..s.len().min(16)]
-    }
-    cut(a) == cut(b)
 }
 
 #[cfg(test)]
@@ -336,6 +327,10 @@ mod tests {
         let long = "com.apple.WebKit.GPU";
         g.absorb(Some(&read(18, &[(1, 7, &long[..16], 4 * S)])), 18 * S);
         assert!(close(g.share(7, long), 0.5), "a cut p_comm is its name");
+        assert!(
+            close(g.share(7, "com.apple.WebKi\u{2026}"), 0.5),
+            "so is a name the sweep marked cut"
+        );
     }
 
     #[test]

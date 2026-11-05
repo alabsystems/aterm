@@ -461,6 +461,36 @@ fn writer_refs<'w>(w: &'w Write<'_>) -> Result<crate::github::Refs<'w>> {
     Ok(w.gh.refs(&w.slug).how(w.writer_how()))
 }
 
+/// The real atomic update's guard reads and open-intent rule, without opening
+/// a journal or posting. GitHub judges ancestry and protections on the real call.
+pub(super) fn ref_update_atomic(
+    w: &Write<'_>,
+    permit: &crate::policy::Permit,
+    batch: &crate::github::refs::AtomicRefBatch,
+    report: &WriteReport,
+) -> Result<Answer> {
+    use crate::github::refs::ATOMIC_KEY;
+    w.gh.refs(&w.slug)
+        .how(w.writer_how())
+        .check_atomic(permit, batch)?;
+    let journal = readable_journal(w)?;
+    if let Some(view) = journal.latest(WriteOp::RefUpdateAtomic, ATOMIC_KEY)?
+        && view.open
+    {
+        let id = view.intent.id;
+        return Err(Error::new(
+            Kind::OutcomeUnknown,
+            "an atomic ref update intent is still open",
+        )
+        .with_sub(crate::error::Sub::IntentOpen {
+            intent: id.to_string(),
+        })
+        .with_next(format!("agh intent show {} {id}", w.slug))
+        .with_repo(w.slug.to_string()));
+    }
+    Ok(done(as_outcome(report.clone(), ReportOutcome::WouldSend)))
+}
+
 /// `ref create --dry-run`: the repository, then `Refs::get`, as the writer. NotFound →
 /// `would_send`; the same sha → `converged`; another sha → Conflict `already_exists`.
 ///

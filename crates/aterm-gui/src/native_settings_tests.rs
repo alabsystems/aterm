@@ -5067,6 +5067,51 @@ fn top_settings_cards_show_one_preview_each() {
     }
 }
 
+/// Whether Settings stands in a `width`x`height` view at text scale `scale`: a window holding it
+/// is held to its least view ([`least_view`], `App::hold_least_window_size`), it takes the
+/// window's whole view, and no shipped request splits it (`App::open_allocation` splits only a
+/// terminal, `App::split_refusal` refuses every other split). The laws that take
+/// [`narrow::narrow_widths`], [`paging::short_sizes`] or [`held_to_least`] hold to these sizes, so
+/// a word cut, a blank screen or a control never whole under them goes unseen by those laws.
+///
+/// Under the floor a view is still drawn: where a window manager ignores the least size hint (a
+/// tiling one on X11 or Wayland), and in a Settings|Allocation split a saved window manifest
+/// restores. Other tests of `narrow`, `paging` and `rows` draw there, so they are no repeats of
+/// those laws. Two go over every page: `every_pages_first_frame_compiles_under_the_floor` compiles
+/// each first frame at 164x96, and `the_person_moves_on_from_a_press_by_keyboard_or_page` presses
+/// at 178x348, on all but Messages and Themes (raised to the least view it saves 8%, so it stays).
+/// Sweeps of one page or control take sizes there too:
+/// `the_search_field_keeps_a_typed_query_readable`,
+/// `messages_list_holds_an_entry_whole_in_a_short_window`,
+/// `a_status_bars_stacked_buttons_keep_their_words`,
+/// `a_messages_chip_breaks_a_word_only_where_its_room_cannot_hold_it` and
+/// `a_theme_not_in_use_gives_its_name_the_check_slot`, among others. And tests of one row hold a
+/// size there, many where a fault was found, such as 178x152 at 2× and 164x96.
+fn reachable(scale: f32, width: f32, height: f32) -> bool {
+    let (least_width, least_height) = least_view(scale);
+    width >= least_width && height >= least_height
+}
+
+/// `sizes` as Settings stands them at text scale `scale`: each raised to the least view
+/// ([`reachable`]), so a width of 0 asks for the least, a width within 14pt above the least taken
+/// as the least (as in [`narrow::narrow_widths`]), and the repeats dropped, first kept.
+fn held_to_least(scale: f32, sizes: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    let (least_width, least_height) = least_view(scale);
+    let mut held = Vec::new();
+    for &(width, height) in sizes {
+        let width = if width <= least_width + 14.0 {
+            least_width
+        } else {
+            width
+        };
+        let size = (width, height.max(least_height));
+        if !held.contains(&size) {
+            held.push(size);
+        }
+    }
+    held
+}
+
 fn at_each_text_scale(rungs: &[f32], what: &str, rung: impl Fn(f32) + Sync) {
     let rung = &rung;
     let failed = std::thread::scope(|scope| {
@@ -5507,7 +5552,14 @@ fn every_settings_list_bounds_the_reducer_at_its_last_full_screen() {
 fn list_bound_sweep(scale: f32) {
     let (mut runtime, instance, view) = setup();
     const WIDTHS: [f32; 6] = [320.0, 480.0, 744.0, 760.0, 1040.0, 1200.0];
-    const HEIGHTS: [f32; 9] = [98.0, 200.0, 240.0, 320.0, 420.0, 437.0, 522.0, 700.0, 900.0];
+    // The least height Settings stands at, then those above it ([`reachable`]).
+    let heights: Vec<f32> = std::iter::once(least_view(scale).1)
+        .chain(
+            [240.0, 320.0, 420.0, 437.0, 522.0, 700.0, 900.0]
+                .into_iter()
+                .filter(|height| reachable(scale, 320.0, *height)),
+        )
+        .collect();
     let mut cell = 0usize;
     for (query, routes) in [
         ("", SettingsRoute::ALL.as_slice()),
@@ -5517,7 +5569,7 @@ fn list_bound_sweep(scale: f32) {
     ] {
         for route in routes.iter().copied() {
             for width in WIDTHS {
-                for height in HEIGHTS {
+                for &height in &heights {
                     cell += 1;
                     let cx = view_cx_at(width, height);
                     {
@@ -7595,6 +7647,106 @@ fn cursor_styles_land_with_a_list_in_view_at_common_sizes() {
 }
 
 #[test]
+fn cursor_style_status_names_the_one_actionable_visibility_gate() {
+    type MotionCase<'a> = (
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        fn(&mut crate::native_app::ViewMotionCx),
+    );
+    let cases: [MotionCase; 7] = [
+        ("normal", "", None, |_| {}),
+        ("off", "cursor_trail_style = \"off\"\n", None, |_| {}),
+        (
+            "serious",
+            "serious_mode = true\n",
+            Some(SERIOUS_STYLE_NOTE),
+            |motion| motion.serious = true,
+        ),
+        (
+            "reduced",
+            "motion = \"reduced\"\n",
+            Some(REDUCED_STYLE_NOTE),
+            |motion| motion.mode = crate::motion::MotionMode::Reduced,
+        ),
+        (
+            "dim",
+            "cursor_trail_intensity = 0\n",
+            Some(DIM_STYLE_NOTE),
+            |_| {},
+        ),
+        ("busy", "", Some(BUSY_STYLE_NOTE), |motion| {
+            motion.shed = true
+        }),
+        (
+            "settings focus does not hide the rule",
+            "",
+            None,
+            |motion| motion.focused = false,
+        ),
+    ];
+    for (name, toml, expected, prepare) in cases {
+        let (runtime, _instance, view) = cursor_styles_runtime(&trail_drawn(toml));
+        let mut motion = view_cx_at(1_024.0, 768.0).motion;
+        prepare(&mut motion);
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        let note = cursor_style_status(state, motion).map(|(note, _)| note);
+        assert_eq!(note.as_deref(), expected, "{name}");
+    }
+}
+
+#[test]
+fn cursor_tuning_reset_clears_only_the_selected_styles_knobs() {
+    let (mut runtime, instance, view) = cursor_styles_runtime(
+        "cursor_trail_style = \"rainbow kitty underline\"\n\
+         cursor_trail_intensity = 0\n\
+         cursor_trail_ms = 900\n\
+         cursor_trail_accent = \"#112233\"\n\
+         cursor_trail_bloom = false\n",
+    );
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        let card = cursor_style_tuning_card(
+            state,
+            "rainbow kitty underline",
+            SettingsWidth::Wide,
+            560.0,
+            2_000.0,
+        )
+        .expect("the advanced card");
+        assert!(
+            card.rows
+                .iter()
+                .any(|(node, _)| node.key.as_str() == "settings/reset-cursor-tuning")
+        );
+    }
+    let outcome = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("settings/reset-cursor-tuning"),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let patch = emitted_config_patch(&outcome);
+    let keys: BTreeSet<&str> = patch.edits.iter().map(|edit| edit.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            prefs::EDIT_CURSOR_TRAIL_BLOOM,
+            prefs::EDIT_CURSOR_TRAIL_INTENSITY,
+        ])
+    );
+    assert!(patch.edits.iter().all(|edit| edit.value.is_none()));
+}
+
+#[test]
 fn the_serious_mode_note_stays_in_view_while_styles_are_tried() {
     for (width, height) in [(584.0, 348.0), (738.0, 418.0)] {
         let (mut runtime, instance, view) = cursor_styles_runtime("serious_mode = true\n");
@@ -8157,7 +8309,7 @@ fn the_serious_mode_note_a_choice_retires_keeps_its_place_until_the_page_is_left
         let note = UiKey::new("settings/cursor-styles/status");
         let before = lab.compile(width, height);
         let was = before.semantic(&note).expect("the note leads the list");
-        assert!(was.label.starts_with("Serious Mode is on"), "{}", was.label);
+        assert_eq!(was.label, SERIOUS_STYLE_NOTE);
         let style = before
             .semantics
             .iter()
@@ -8170,13 +8322,16 @@ fn the_serious_mode_note_a_choice_retires_keeps_its_place_until_the_page_is_left
         lab.commit(&style, None);
         let after = lab.compile(width, height);
         let now = after.semantic(&note).expect("the note keeps its place");
-        assert_ne!(now.label, was.label, "it no longer says Serious Mode is on");
+        assert_eq!(now.label, "Serious Mode is off now.");
         assert_eq!(now.rect, was.rect, "{width}: {style}");
         lab.state_mut().navigate(SettingsRoute::Appearance);
         let _ = lab.compile(width, height);
         lab.state_mut().navigate(SettingsRoute::CursorStyles);
         let back = lab.compile(width, height);
-        assert!(back.semantic(&note).is_none(), "a new visit has no note");
+        assert!(
+            back.semantic(&note).is_none(),
+            "a new visit has no suppression note"
+        );
     }
 }
 

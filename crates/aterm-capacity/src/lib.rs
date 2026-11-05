@@ -28,8 +28,11 @@
 //! Explicit load-only quiet work waits within its [`Patience`] and may start at its bound.
 //! [`Need::timing`] additionally requires measured CPU readiness, reserves claimed work from
 //! actual admission for the existing bounded hold, and requires [`Claim::measurement_entry`]
-//! after compilation before accepting measurements. Forced, unknown and expired admissions
-//! do not qualify. A sampled CPU interval promises neither continuous quiet nor GPU quiet;
+//! after compilation before accepting measurements. Forced, unknown, expired and loaded
+//! admissions do not qualify. At its bound on a machine that stayed busy a strict need is
+//! refused, and one that runs loaded ([`Need::runs_loaded`]) starts and states it
+//! ([`Claim::timing_protection`], [`Claim::stated_entry`]); with no CPU window or no load either
+//! is refused. A sampled CPU interval promises neither continuous quiet nor GPU quiet;
 //! unclaimed work and old clients that do not implement this policy remain outside its protection.
 //!
 //! An ordinary holder-based claim's memory reservation is its declared peak less what its holder's process tree
@@ -62,11 +65,18 @@ use std::time::Duration;
 
 pub mod admit;
 pub mod book;
+pub mod cache_work;
+#[cfg(unix)]
+pub mod canonical_ingress;
 pub mod cpu_observation;
 #[cfg(unix)]
 pub mod epoch_controller;
 #[cfg(unix)]
 mod epoch_endpoint;
+#[cfg(unix)]
+pub mod epoch_recipe;
+#[cfg(unix)]
+pub mod epoch_target;
 #[cfg(unix)]
 mod epoch_wire;
 pub mod host_protocol;
@@ -75,8 +85,17 @@ pub mod leadership;
 #[cfg(unix)]
 pub mod retained_cohort;
 pub use cpu_observation::{CpuHolder, CpuObservation};
+#[cfg(unix)]
+mod retained_claim;
 mod timing;
-pub use timing::{CpuPoint, CpuWindow, QuietPolicy, TimingCause, TimingEvidence, TimingIssue};
+#[cfg(unix)]
+pub use retained_claim::RetainedClaim;
+#[cfg(all(test, unix))]
+mod retained_claim_tests;
+pub use timing::{
+    CpuPoint, CpuWindow, Observed, Protection, QuietPolicy, StatedEntry, TimingCause,
+    TimingEvidence, TimingIssue, Unqualified,
+};
 mod cohort_reference;
 pub use cohort_reference::CohortClosureRef;
 #[cfg(unix)]
@@ -95,8 +114,11 @@ pub mod cohort_namespace;
 pub mod floor;
 pub mod footprint;
 pub mod ledger;
+pub mod machine_footprint;
 pub mod reading;
 pub mod room;
+/// Each admission's `kind=admission` row in this Mac's telemetry log (Continuum TM-0).
+mod telemetry;
 pub mod tree_meter;
 
 /// Core Trust's native CPU lease pool, shared with toolchain schedulers.
@@ -119,6 +141,7 @@ pub use footprint::{Estimate, Footprint, Footprints, Meter, allocated, allocated
 #[cfg(any(test, debug_assertions))]
 pub use ledger::Turn;
 pub use ledger::{Accounting, ClaimGuardIdentity, CohortClaimState, Held, Ledger, Record};
+pub use machine_footprint::{Cover, Kept, MachineFootprints, Selection};
 #[cfg(any(test, debug_assertions))]
 pub use reading::Fixed;
 pub use reading::{
@@ -271,6 +294,26 @@ pub struct Need {
     /// End its wait behind holders that make no progress ([`Self::ends_when_stuck`]): how long
     /// they may make none first. The waiter's own, never in a [`Record`].
     pub stuck_ends: Option<std::time::Duration>,
+    /// What a measured claim ([`QuietPolicy::Timing`]) does when the machine stays busy through
+    /// its patience ([`AtBound`], [`Self::runs_loaded`]). The waiter's own, never in a [`Record`]:
+    /// the fact a record keeps is its cause ([`TimingCause::Loaded`]).
+    pub at_bound: AtBound,
+}
+
+/// What a measured claim does at its patience bound on a machine that stayed busy: a valid CPU
+/// window and a readable load that fail the quiet criterion. With no window or no load it is
+/// refused either way ([`TimingIssue::Blind`], [`TimingIssue::LoadUnknown`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AtBound {
+    /// Refuse it ([`TimingIssue::Loaded`]) before it holds anything: a perf baseline, a lab
+    /// window whose latency people quote.
+    #[default]
+    Refuse,
+    /// Admit it loaded ([`TimingCause::Loaded`]): its work runs and states that it ran without a
+    /// qualified quiet admission (owner ruling 2026-11-05: a busy machine never blocks a release).
+    /// A loaded claim held by its own process or an ancestor spends this one's patience: its first
+    /// window decides, quiet or loaded.
+    RunLoaded,
 }
 
 impl Need {
@@ -408,6 +451,14 @@ impl Need {
         self.stuck_ends = Some(after);
         self
     }
+
+    /// Admit this measured need loaded when the machine stays busy through its patience
+    /// ([`AtBound::RunLoaded`]), rather than refuse it.
+    #[must_use]
+    pub const fn runs_loaded(mut self) -> Need {
+        self.at_bound = AtBound::RunLoaded;
+        self
+    }
 }
 
 /// THE COVER MARKER: what a holder of a covering claim ([`Need::covers`]) exports to the work it
@@ -485,8 +536,11 @@ pub struct Patience {
     /// cores or disk, outside its own process tree and ancestry) waits, naming it, so no new
     /// grant or admission adds load while it waits.
     pub reserve: Duration,
-    /// Next for this long, a load-only claim starts whatever the load. Timing instead refuses
-    /// unqualified work at this bound; an override supplies no CPU readiness.
+    /// Next for this long, a load-only claim starts whatever the load. A measured claim
+    /// ([`Need::timing`]) at this bound on a valid CPU window and a readable load that fail the
+    /// quiet criterion is refused ([`TimingIssue::Loaded`]), or admitted loaded if it runs loaded
+    /// ([`AtBound::RunLoaded`]); with no window or no load it is refused either way. An override
+    /// supplies no CPU readiness.
     pub start: Duration,
     /// Its reservation lasts this long into the work once it starts, at most, so what it held back
     /// does not start in a burst beside the work's first minutes; it ends sooner when the claim

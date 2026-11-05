@@ -133,18 +133,23 @@ mod last_view;
 pub use last_view::{LastStep, LastView, LastViewError, LastViewGarbage};
 mod dedup;
 pub mod logid;
+#[cfg(feature = "relay")]
+pub mod origin;
 /// The power-loss model of a compaction's files, for its crash tests.
 #[cfg(all(test, unix, feature = "retention"))]
 mod power_loss;
 pub mod proto;
 mod recover;
 pub mod refill;
+mod relay_floor;
 #[cfg(feature = "retention")]
 pub mod retention;
 pub mod sharded;
 pub mod sticky_fence;
 mod storage;
 pub mod store;
+#[cfg(feature = "stream")]
+mod stream_link;
 mod tier;
 #[cfg(test)]
 mod tier_tests;
@@ -162,6 +167,8 @@ pub use broker::{
     tail_wake_is_caught_up, Broker, BrokerHandle, BrokerStats, FollowerTransport, IDLE_MARK,
     IDLE_MARK_DEADLINE, KEEPALIVE_DEADLINE, KEEPALIVE_INTERVAL,
 };
+#[cfg(feature = "stream")]
+pub use client::connect_stream;
 pub use client::{
     ack, acks_owed, broker_refusal, client_walk_page_advance, client_walk_within_limit, connect,
     drain, protocol_mismatch, take, AcksOwed, AnyClient, AnyStream, AnySubscription, BrokerRefusal,
@@ -172,14 +179,19 @@ pub use client::{
 pub use federation::{
     federation_cursor_advance, federation_hop_allowed, federation_incarnation_fresh,
     federation_route_preferred, federation_seq_clamp, parse_federation_rules, parse_rewrite_spec,
-    FederatedCut, FederationBridge, FederationConfig, FederationDirectory, FederationEndpoint,
-    FederationError, FederationLink, FederationMesh, FederationMeshConfig, FederationMeshReport,
-    FederationReport, FederationRule, FederationRunner, FederationRunnerCloser, FederationWire,
-    PeerAdvertisement, PeerHealthState, PeerRouteEntry, PeerTransportKind, RegionRouteDecision,
-    SubjectRewrite, DEFAULT_FEDERATION_BATCH, DEFAULT_PEER_REGISTRY_PREFIX,
-    DEFAULT_ROUTE_HYSTERESIS_US, MAX_FEDERATION_PEERS, MAX_FEDERATION_REGIONS,
-    MAX_FEDERATION_RTT_US, MAX_FEDERATION_RULES, MAX_PEER_EXPORT_PREFIXES,
+    FederatedCut, FederationBridge, FederationBridgeCloser, FederationConfig, FederationDirectory,
+    FederationEndpoint, FederationError, FederationLink, FederationMesh, FederationMeshConfig,
+    FederationMeshReport, FederationReport, FederationRule, FederationRunner,
+    FederationRunnerCloser, FederationWire, PeerAdvertisement, PeerHealthState, PeerRouteEntry,
+    PeerTransportKind, RegionRouteDecision, SubjectRewrite, DEFAULT_FEDERATION_BATCH,
+    DEFAULT_PEER_REGISTRY_PREFIX, DEFAULT_ROUTE_HYSTERESIS_US, MAX_FEDERATION_PEERS,
+    MAX_FEDERATION_REGIONS, MAX_FEDERATION_RTT_US, MAX_FEDERATION_RULES, MAX_PEER_EXPORT_PREFIXES,
 };
+#[cfg(feature = "stream")]
+pub use stream_link::{StreamDial, StreamLink};
+/// What a log's residency tier did, counted: `Broker::tier_tally` reads it in a test or debug
+/// build, and the type is compiled in every build so a caller names it rather than a copy.
+pub use tier::TierTally;
 
 /// Capability minting and principal derivation (`cap` feature), re-exported so
 /// callers of [`Broker::open_guarded`] / [`Client::attach`] can mint and derive
@@ -215,8 +227,8 @@ pub use logid::{
 pub use proto::{
     AttachedProducerStats, FaceStats, Gap, HelloHealth, NonceExt, Request, Response, ServedInfo,
     ServedReason, Tier, WireStats, ERR_RATE_LIMITED, ERR_RETIRE_REFUSED, HELLO_REASON_MAX,
-    RATE_LIMITED_PREFIX, REQUEST_BROKER_TIMES, REQUEST_GAP_FENCES, REQUEST_GAP_NOTICES,
-    REQUEST_RETIRE, REQUEST_STATS, REQUEST_TOLD_FETCH,
+    RATE_LIMITED_PREFIX, REQUEST_BROKER_TIMES, REQUEST_BURST_MARKS, REQUEST_GAP_FENCES,
+    REQUEST_GAP_NOTICES, REQUEST_RELAY, REQUEST_RETIRE, REQUEST_STATS, REQUEST_TOLD_FETCH,
 };
 pub use recover::{recover_keep_within_len, recover_unit_start_advance};
 pub use refill::{

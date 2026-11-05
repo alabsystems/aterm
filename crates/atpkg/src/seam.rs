@@ -134,8 +134,7 @@ fn mirror_tree(layout: &Layout, src: &Path, dst: &Path) -> io::Result<()> {
         let entry = entry?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
-        let meta = std::fs::symlink_metadata(&from)?;
-        let kind = meta.file_type();
+        let kind = entry.file_type()?;
         if kind.is_symlink() {
             let target = std::fs::read_link(&from)?;
             #[cfg(unix)]
@@ -245,19 +244,17 @@ fn bin_plan(src_bin: &Path) -> io::Result<BinPlan> {
     let mut tools = 0usize;
     for entry in std::fs::read_dir(src_bin)? {
         let entry = entry?;
-        let src = entry.path();
-        if !std::fs::symlink_metadata(&src)?.is_file() {
+        if !entry.file_type()?.is_file() {
             continue;
         }
-        entries.insert(entry.file_name(), src);
+        entries.insert(entry.file_name(), entry.path());
         tools += 1;
     }
     let mut stock = Vec::new();
     for (public, trust) in STOCK_NAMES {
-        let trust_tool = src_bin.join(trust);
-        if !std::fs::symlink_metadata(&trust_tool).is_ok_and(|m| m.is_file()) {
+        let Some(trust_tool) = entries.get(std::ffi::OsStr::new(trust)).cloned() else {
             continue;
-        }
+        };
         entries.insert(std::ffi::OsString::from(public), trust_tool);
         stock.push((*public, *trust));
     }
@@ -460,8 +457,8 @@ fn top_files_mismatch(src: &Path, dst: &Path) -> Option<PathBuf> {
         let Ok(entry) = entry else {
             return Some(src.to_path_buf());
         };
-        let from = entry.path();
-        if std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_file()) {
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            let from = entry.path();
             let to = dst.join(entry.file_name());
             if !crate::clone::is_clone_of(&from, &to) {
                 return Some(to);
@@ -484,14 +481,13 @@ fn tree_mismatch(src: &Path, dst: &Path) -> Option<PathBuf> {
         };
         let from = entry.path();
         let to = dst.join(entry.file_name());
-        let Ok(meta) = std::fs::symlink_metadata(&from) else {
+        let Ok(kind) = entry.file_type() else {
             return Some(from);
         };
-        let kind = meta.file_type();
         if kind.is_symlink() {
             let same = matches!(
-                (std::fs::read_link(&from), std::fs::symlink_metadata(&to), std::fs::read_link(&to)),
-                (Ok(a), Ok(m), Ok(b)) if m.file_type().is_symlink() && a == b
+                (std::fs::read_link(&from), std::fs::read_link(&to)),
+                (Ok(a), Ok(b)) if a == b
             );
             if !same {
                 return Some(to);
@@ -525,9 +521,91 @@ fn tree_mismatch(src: &Path, dst: &Path) -> Option<PathBuf> {
     None
 }
 
+/// What a view cannot be laid without, as [`build_lacks`] finds it in the store's build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildLack {
+    /// Nothing holds a tree at its name: removed, or its link names an aside that is gone.
+    Tree,
+    /// Something other than its own tree stands at its name, such as a link to another tree.
+    OwnTree,
+    /// It has no `bin/`, or has lost a tool its ready record names.
+    Bin,
+    /// It has no `lib/rustlib`, the sysroot its `trustc` runs on.
+    Lib,
+}
+
+impl BuildLack {
+    fn what(self) -> &'static str {
+        match self {
+            Self::Tree => "is gone",
+            Self::OwnTree => "is not a tree of its own",
+            Self::Bin => "has lost its bin/ or a tool in it",
+            Self::Lib => "has no lib/rustlib",
+        }
+    }
+
+    /// What lays the build again. A build without its tree or a recorded tool reads as not
+    /// installed, so an install stages it. One that keeps them reads as complete
+    /// ([`crate::store::build_is_complete`] sees only `bin/`), so until the channel's pin
+    /// moves an update or an install leaves it as current, and only a reinstall stages it.
+    /// An uninstall also retires the machine's toolset adoption, which `--default-set` records
+    /// again and a plain `install trust` does not.
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::Tree | Self::Bin => "`aterm pkg install trust` lays it again",
+            Self::OwnTree | Self::Lib => {
+                "an update or an install leaves a build that reads as installed: `aterm pkg \
+                 uninstall trust`, which removes every Trust build and rustup's `trust` until \
+                 the install finishes, then `aterm pkg install --default-set`, lays it again"
+            }
+        }
+    }
+}
+
+/// What keeps a view from being laid from the store build `build`, or `None`: the build must
+/// stand ([`crate::store::build_stands`]), hold a `bin/` with every tool its ready record names,
+/// and ship `lib/rustlib`, without which its `trustc` has no sysroot.
+///
+/// Asked of the build alone, before anything of the view moves, because a lay drops each part
+/// its build lacks: right for a whole build with no `etc/`, ruinous for one that lost what it
+/// runs on. A view already stripped still hears why. A part is asked as the lay asks it,
+/// following a link.
+///
+/// # Errors
+/// A stat failed other than by the path being absent, which says nothing of the build.
+fn build_lacks(build: &Path) -> io::Result<Option<BuildLack>> {
+    if !crate::store::build_stands(build)? {
+        return Ok(Some(if crate::store::tree_absent(build) {
+            BuildLack::Tree
+        } else {
+            BuildLack::OwnTree
+        }));
+    }
+    let missing = |part: &Path| match std::fs::metadata(build.join(part)) {
+        Ok(meta) => Ok(!meta.is_dir()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    };
+    if missing(Path::new("bin"))? || crate::store::lost_a_recorded_tool(build) {
+        return Ok(Some(BuildLack::Bin));
+    }
+    if missing(&Path::new("lib").join("rustlib"))? {
+        return Ok(Some(BuildLack::Lib));
+    }
+    Ok(None)
+}
+
 /// Builds or refreshes the view for `name` from `store/trust/current`.
 /// # Errors
-/// Returns an error if `store/trust/current` is unreadable or the view cannot be written or cloned.
+/// Returns an error if `store/trust/current` is unreadable, its build lacks what the view needs
+/// ([`build_lacks`], the view left as it stands), or the view cannot be written or cloned.
 pub fn refresh_view(layout: &Layout, name: &str) -> io::Result<Refreshed> {
     refresh_view_with(layout, name, &crate::gc::process_table)
 }
@@ -548,6 +626,12 @@ pub(crate) fn refresh_view_with(
     let build = verified_store_current_build(layout, &current)?;
     let src_bin = build.join("bin");
     let view = view_dir(layout, name);
+    if let Some(lacks) = build_lacks(&build)? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            Refusal::NoBuild { build, lacks }.to_string(),
+        ));
+    }
     layout.ensure_dir(&views_root(layout))?;
     // A view that is not laid aside yet is laid whole, aside, when it is laid at all.
     let lay_whole =
@@ -856,9 +940,6 @@ fn bin_holds_exactly(bin: &Path, plan: &BinPlan) -> bool {
     let mut seen = 0usize;
     for entry in listing.flatten() {
         let path = entry.path();
-        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
-            return false;
-        }
         let Some(stub) = want.iter().find(|e| e.path == path) else {
             return false;
         };
@@ -951,7 +1032,7 @@ fn same_bin(live: &Path, staged: &Path) -> bool {
             let mut out = std::collections::BTreeMap::new();
             for entry in std::fs::read_dir(dir).ok()? {
                 let entry = entry.ok()?;
-                let meta = std::fs::symlink_metadata(entry.path()).ok()?;
+                let meta = entry.metadata().ok()?;
                 out.insert(
                     entry.file_name(),
                     (meta.len(), meta.permissions(), meta.modified().ok()),
@@ -1489,6 +1570,9 @@ pub enum Refusal {
     BadName(String),
     /// `<prefix>/store/trust/current` does not exist.
     NotInstalled { target: PathBuf },
+    /// `current` names a `build` no view can be laid from ([`BuildLack`]). The view keeps the
+    /// clones it was last laid with, which still run.
+    NoBuild { build: PathBuf, lacks: BuildLack },
     /// Dev-linked checkout is not a valid sysroot.
     LinkedNoSysroot { checkout: PathBuf },
     /// Entry exists and is not owned by atpkg (fix: [`DETACH_FIX`]).
@@ -1517,6 +1601,13 @@ impl fmt::Display for Refusal {
                 f,
                 "trust is not installed ({} absent) — nothing to point rustup `trust` at",
                 target.display()
+            ),
+            Refusal::NoBuild { build, lacks } => write!(
+                f,
+                "the store's current trust build {} {} — rustup `trust` is left as it stands; {}",
+                build.display(),
+                lacks.what(),
+                lacks.remedy()
             ),
             Refusal::LinkedNoSysroot { checkout } => write!(
                 f,
@@ -1633,6 +1724,10 @@ fn attach_reporting(
             let current = store_current(layout);
             if std::fs::symlink_metadata(&current).is_err() {
                 return Err(Refusal::NotInstalled { target: current });
+            }
+            let build = verified_store_current_build(layout, &current)?;
+            if let Some(lacks) = build_lacks(&build)? {
+                return Err(Refusal::NoBuild { build, lacks });
             }
         }
     }
@@ -2587,6 +2682,153 @@ mod tests {
             "no dangling link laid"
         );
         assert!(fx.seams_recorded().is_empty());
+    }
+
+    /// A view laid from a whole `current`, whose build `lose` then breaks: both doors refuse
+    /// to lay from it and record why, and the view keeps its clones, which still run. A whole
+    /// `current` ends the refusal.
+    #[cfg(unix)]
+    fn a_broken_build_keeps_the_view(label: &str, lacks: BuildLack, lose: impl FnOnce(&Path)) {
+        let fx = Fixture::new(label);
+        let build = fx.install_trust(9192);
+        let _ = reassert(&fx.layout, &fx.rustup);
+        let view = seam_target(&fx.layout, "trust");
+        let driver = || std::fs::read_to_string(view.join("lib").join("libtrust.dylib")).ok();
+        assert_eq!(driver().as_deref(), Some("driver of 9192"), "PRECONDITION");
+
+        lose(&build);
+        for door in [reassert, repair] {
+            let events = door(&fx.layout, &fx.rustup);
+            assert_eq!(driver().as_deref(), Some("driver of 9192"), "{events:?}");
+            assert!(view.join("bin").join("trustc").is_file(), "{events:?}");
+            let refused = refusals(&fx.layout);
+            assert!(
+                refused.len() == 1 && refused[0].1.contains(&build.display().to_string()),
+                "{refused:?} {events:?}"
+            );
+            assert!(
+                events.len() == 1
+                    && matches!(
+                        refusal(&events[0]),
+                        Some(Refusal::NoBuild { lacks: said, .. }) if *said == lacks
+                    ),
+                "{events:?}"
+            );
+        }
+
+        fx.install_trust(9200);
+        let _ = reassert(&fx.layout, &fx.rustup);
+        assert_eq!(driver().as_deref(), Some("driver of 9200"));
+        assert!(refusals(&fx.layout).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_removed_build_is_refused_and_the_view_kept() {
+        a_broken_build_keeps_the_view("gone", BuildLack::Tree, |build| {
+            std::fs::remove_dir_all(build).unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_link_to_a_removed_aside_is_refused_and_the_view_kept() {
+        a_broken_build_keeps_the_view("aside", BuildLack::Tree, |build| {
+            std::fs::remove_dir_all(build).unwrap();
+            crate::store::link_aside(build).unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_link_to_another_tree_is_refused_and_the_view_kept() {
+        a_broken_build_keeps_the_view("elsewhere", BuildLack::OwnTree, |build| {
+            let elsewhere = build.with_file_name("elsewhere");
+            std::fs::rename(build, &elsewhere).unwrap();
+            std::fs::write(elsewhere.join("lib").join("libtrust.dylib"), "another tree").unwrap();
+            link(&elsewhere, build);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_that_lost_only_its_lib_is_refused_and_the_view_kept() {
+        a_broken_build_keeps_the_view("nolib", BuildLack::Lib, |build| {
+            std::fs::remove_dir_all(build.join("lib")).unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_that_lost_its_bin_is_refused_and_the_view_kept() {
+        a_broken_build_keeps_the_view("nobin", BuildLack::Bin, |build| {
+            std::fs::remove_dir_all(build.join("bin")).unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_that_lost_its_sysroot_is_refused_and_the_view_kept() {
+        a_broken_build_keeps_the_view("norustlib", BuildLack::Lib, |build| {
+            std::fs::remove_dir_all(build.join("lib").join("rustlib")).unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_that_lost_a_recorded_tool_is_refused_and_the_view_kept() {
+        a_broken_build_keeps_the_view("notool", BuildLack::Bin, |build| {
+            std::fs::write(
+                build.with_file_name("9192.ready"),
+                "ok\ncontents=bin:targo,trustc\n",
+            )
+            .unwrap();
+            std::fs::remove_file(build.join("bin").join("trustc")).unwrap();
+        });
+    }
+
+    /// The machine an earlier pass already stripped: nothing of the view is left to keep, and
+    /// it is still told what its build lacks.
+    #[cfg(unix)]
+    #[test]
+    fn a_view_already_stripped_still_hears_what_its_build_lacks() {
+        let fx = Fixture::new("stripped");
+        let build = fx.install_trust(9192);
+        let _ = reassert(&fx.layout, &fx.rustup);
+        std::fs::remove_dir_all(build.join("lib")).unwrap();
+        std::fs::remove_dir_all(seam_target(&fx.layout, "trust").join("lib")).unwrap();
+
+        let events = reassert(&fx.layout, &fx.rustup);
+
+        assert!(
+            events.len() == 1
+                && matches!(
+                    refusal(&events[0]),
+                    Some(Refusal::NoBuild {
+                        lacks: BuildLack::Lib,
+                        ..
+                    })
+                ),
+            "{events:?}"
+        );
+        assert_eq!(refusals(&fx.layout).len(), 1);
+    }
+
+    /// `refresh_view` guards itself: the record's doors stop first, and only this stops a
+    /// caller that reaches it another way.
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_asked_directly_keeps_the_view_of_a_broken_build() {
+        let fx = Fixture::new("direct");
+        let build = fx.install_trust(9192);
+        refresh_view(&fx.layout, "trust").unwrap();
+        std::fs::remove_dir_all(build.join("lib")).unwrap();
+
+        let err = refresh_view(&fx.layout, "trust").unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        let view = seam_target(&fx.layout, "trust");
+        assert!(view.join("lib").join("libtrust.dylib").is_file());
     }
 
     #[cfg(unix)]

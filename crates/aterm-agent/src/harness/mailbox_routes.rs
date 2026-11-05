@@ -79,6 +79,27 @@ pub struct MailboxRoute {
     /// The normalized patterns of the addresses whose mail this mailbox receives
     /// ([`normalize_pattern`]).
     pub receives: Vec<String>,
+    /// Where the lab registry describes this mailbox ([`Registered`]): its key and which of its
+    /// credentials the registry holds, revealed only when a sign-in types one.
+    pub registry: Option<Registered>,
+}
+
+/// A mailbox the lab registry describes ([`super::alab_roster::LabMailbox`]): its key and which
+/// credentials its cells hold, so a route counts as ready without revealing anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Registered {
+    /// The registry key (`mb-…`) [`super::alab_roster::reveal`] names it by.
+    pub mailbox: String,
+    /// The parts the registry holds a value for.
+    pub held: Vec<super::alab_roster::Part>,
+}
+
+impl Registered {
+    /// Whether the registry holds `part`.
+    #[must_use]
+    pub fn holds(&self, part: super::alab_roster::Part) -> bool {
+        self.held.contains(&part)
+    }
 }
 
 impl std::fmt::Debug for MailboxRoute {
@@ -93,15 +114,52 @@ impl std::fmt::Debug for MailboxRoute {
             .field("mailbox_password", &self.mailbox_password.is_some())
             .field("totp_secret", &self.totp_secret.is_some())
             .field("receives", &self.receives.len())
+            .field("registry", &self.registry.is_some())
             .finish()
     }
 }
 
 impl MailboxRoute {
-    /// Whether this mailbox may be tried at all: it has a login and a non-empty password.
+    /// Whether this mailbox may be tried at all: it has a login and a non-empty password, here
+    /// or in the lab registry.
     #[must_use]
     pub fn ready(&self) -> bool {
-        !self.login.trim().is_empty() && self.password.as_deref().is_some_and(|p| !p.is_empty())
+        !self.login.trim().is_empty()
+            && (self.password.as_deref().is_some_and(|p| !p.is_empty())
+                || self.registry_holds(super::alab_roster::Part::Password))
+    }
+
+    /// Whether the lab registry holds `part` for this mailbox and the route itself does not.
+    #[must_use]
+    pub fn registry_holds(&self, part: super::alab_roster::Part) -> bool {
+        use super::alab_roster::Part;
+        let own = match part {
+            Part::Password => &self.password,
+            Part::MailboxPassword => &self.mailbox_password,
+            Part::Totp => &self.totp_secret,
+        };
+        own.as_deref().is_none_or(str::is_empty)
+            && self.registry.as_ref().is_some_and(|r| r.holds(part))
+    }
+
+    /// The registry's mailbox as a route ([`merge_lab`]): its login, its webmail and its
+    /// patterns, with no value in it.
+    #[must_use]
+    pub fn from_lab(mailbox: &super::alab_roster::LabMailbox) -> Self {
+        Self {
+            login: mailbox.login.clone(),
+            webmail_url: mailbox.webmail.clone(),
+            receives: mailbox
+                .receives
+                .iter()
+                .filter_map(|pattern| normalize_pattern(pattern))
+                .collect(),
+            registry: Some(Registered {
+                mailbox: mailbox.pk.clone(),
+                held: mailbox.held.clone(),
+            }),
+            ..Self::default()
+        }
     }
 
     /// Its login, masked ([`mask_login`]).
@@ -305,6 +363,58 @@ fn best_route(routes: &[MailboxRoute], target: Option<&str>) -> Option<(Tier, us
     best
 }
 
+/// `routes` (the `[[mailboxes]]` entries of the mailbox files) with the lab registry's mailboxes
+/// ahead of them (one-mesh design step A9): the registry decides, and the files stay a fallback
+/// until their entry is deleted (B13). An entry whose login is a registry mailbox's fills only
+/// what the registry leaves empty (a URL, a credential the registry holds no cell for, its
+/// patterns where the registry lists none) and is then that mailbox, so one login is one route
+/// and, among equal patterns, the registry's comes first.
+#[must_use]
+pub fn merge_lab(
+    routes: Vec<MailboxRoute>,
+    lab: &[super::alab_roster::LabMailbox],
+) -> Vec<MailboxRoute> {
+    use super::alab_roster::Part;
+    if lab.is_empty() {
+        return routes;
+    }
+    let mut files = routes;
+    let mut out = Vec::with_capacity(lab.len() + files.len());
+    for mailbox in lab {
+        let mut route = MailboxRoute::from_lab(mailbox);
+        if route.login.trim().is_empty() {
+            continue;
+        }
+        if let Some(at) = files
+            .iter()
+            .position(|file| file.login.trim().eq_ignore_ascii_case(route.login.trim()))
+        {
+            let file = files.remove(at);
+            if !route.names_a_url() {
+                route.webmail_url = file.webmail_url;
+                route.imap_url = file.imap_url;
+                route.http_url = file.http_url;
+            }
+            let held = |part| mailbox.held.contains(&part);
+            if !held(Part::Password) {
+                route.password = file.password;
+            }
+            if !held(Part::MailboxPassword) {
+                route.mailbox_password = file.mailbox_password;
+            }
+            if !held(Part::Totp) {
+                route.totp_secret = file.totp_secret;
+            }
+            if route.receives.is_empty() {
+                route.receives = file.receives;
+            }
+        }
+        out.push(route);
+    }
+    out.extend(files);
+    out
+}
+
 /// A mailbox login (or any address) as aterm prints it: at most its first two characters, then
 /// `…@…`; the domain is never shown. An empty login is `(no login)`.
 #[must_use]
@@ -434,6 +544,7 @@ fn parse_entry(
             ],
         ),
         receives: Vec::new(),
+        registry: None,
     };
     if let Some(url) = get(&["url"]) {
         let lower = url.to_ascii_lowercase();

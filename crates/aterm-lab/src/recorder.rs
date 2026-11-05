@@ -109,6 +109,7 @@ pub fn logged(arg: &str) -> Option<String> {
 /// `open …` as the recorder answers it: 0, having logged each argument.
 #[must_use]
 pub fn main(args: &[String]) -> i32 {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let log = std::env::var("LAB_OPEN_LOG").unwrap_or_else(|_| "/dev/null".into());
     let ts = crate::util::hms(crate::util::now_secs());
     for a in args {
@@ -116,6 +117,7 @@ pub fn main(args: &[String]) -> i32 {
             && let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(&log)
         {
             let _ = f.write_all(format!("{ts} open {what}\n").as_bytes());

@@ -180,10 +180,11 @@ fn streamed(
     let (tx, rx) = std::sync::mpsc::channel::<Event>();
     let lines = tx.clone();
     std::thread::spawn(move || {
+        use std::io::Read as _;
         let mut reader = BufReader::new(reader);
         loop {
             let mut line = Vec::new();
-            match reader.read_until(b'\n', &mut line) {
+            match (&mut reader).take(1024 * 1024).read_until(b'\n', &mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     if lines.send(Event::Line(line)).is_err() {

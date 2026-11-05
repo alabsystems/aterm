@@ -41,11 +41,11 @@ pub const POLICY_VERSION: u32 = 1;
 /// The digest of [`AcceptancePolicy::v1`]'s artifact, pinned, which only a reviewed source commit
 /// moves.
 pub const M4_POLICY_V1_DIGEST: Digest =
-    hex_digest("eec55f48cc48f699695e580cd921ececc9d2a8e94292f65174e7fb0e7ed9ab37");
+    hex_digest("0186b34776a3a0df030da6db31a7efa6b80e843b009cdd57eec40c08d5101591");
 
 /// The corpus digest generator v1 makes ([`Corpus::digest`]), pinned.
 pub const CORPUS_V1_DIGEST: Digest =
-    hex_digest("5ff4befccd385e929592626d775ad6d8a9df530cf0546991d468b2f092cbc2a5");
+    hex_digest("4527f2cc8869063498df51119b5cf5db62b49f809c981d2985180d16a7a83ff5");
 
 /// The training items: the golden trace and the 16 generated training seeds.
 pub const TRAIN_COUNT: usize = 17;
@@ -256,7 +256,7 @@ pub const ITEMS_V1: &[ItemPin] = &[
         "golden",
         ItemKind::GoldenTrace,
         CorpusSplit::Train,
-        "a2b1a1140c0579afe449c2a5d900ea9dd495cb318de5b535f16aef1932549a2e",
+        "45336f0d46065d05f9ac31cfd4940023bb2aa098c2ba0e82b13c7e1bd789c14a",
         (154, 130, 24),
         None,
         "90a74ca21311491a8deaaeb9bac9e17bf1af694dbeeff9258a395d32d8170f71",

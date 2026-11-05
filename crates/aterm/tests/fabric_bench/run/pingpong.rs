@@ -9,9 +9,10 @@ use std::time::Duration;
 use astream_broker::{Broker, FlushCounts};
 use aterm_json::{Value, json};
 use aterm_link::ctl::Ctl;
-use aterm_link::wait_tally::{self, Hist, Row as TallyRow, Tally, Unit};
+use aterm_link::wait_tally::{self, Flushed, Hist, Row as TallyRow, Tally, Unit};
 use aterm_types::wait_tally::{HANDLER_FILE, HANDLER_SEAM, HandlerRow, HandlerTally};
 
+use super::tallies::{self, Mark, SlowRound};
 use super::{
     DEADLINE, FLEET, Row, Ruler, Ticks, World, await_durable, await_note, boot_world, bystanders,
     calibrate, flushes_between, flushes_json, fmt_x, listing_since, ms, ms_opt, newest_id,
@@ -25,24 +26,24 @@ use crate::stats;
 
 const TALLY_POLL: Duration = Duration::from_millis(1);
 
-const PACE: Duration = Duration::from_millis(20);
+pub(super) const PACE: Duration = Duration::from_millis(20);
 
 /// One round, as the bench saw it.
 #[derive(Debug, Clone)]
-struct Round {
+pub(super) struct Round {
     ping: String,
     pong: String,
     /// A's post: before the request, after its `OK`.
-    t_call: u64,
+    pub(super) t_call: u64,
     t_ret: u64,
     /// B's `await inbox` answering with the ping, and its `inbox` listing it.
-    t_b_seen: u64,
+    pub(super) t_b_seen: u64,
     t_b_listed: u64,
     /// B's post of the reply: before the request, after its `OK`.
     t_b_call: u64,
-    t_b_ret: u64,
+    pub(super) t_b_ret: u64,
     /// A's `await inbox` answering with the reply, and its `inbox` listing it.
-    t_a_seen: u64,
+    pub(super) t_a_seen: u64,
     t_a_listed: u64,
     /// The rows' `off=`: each message's record offset.
     ping_off: u64,
@@ -70,9 +71,75 @@ struct Raw {
     paced_end: Option<Tally>,
     /// The handler tally past the last paced reply (its window runs from `handlers_end`).
     paced_handlers_end: Option<HandlerTally>,
+    /// This process's flush times and the clock after them, read after each of the three wait
+    /// tallies (`start`, `end`, `paced_end`): its broker's ring and the bench's side of each
+    /// reading's mark ([`bench_now`]).
+    start_bench: (Flushed, u64),
+    end_bench: (Flushed, u64),
+    paced_bench: Option<(Flushed, u64)>,
 }
 
-fn one_round(
+/// The group ping-pong's slow calls are reported under.
+const SLOW_GROUP: &str = "ping-pong";
+
+/// This process's flush times now, then the clock: its in-process broker's ring and the
+/// bench's side of a reading's [`Mark`], read after the bridge's line (E09c).
+fn bench_now() -> (Flushed, u64) {
+    let flushed = Flushed::now();
+    (flushed, wait_tally::clock_ns())
+}
+
+/// The rounds whose slow calls the report lines up with the flushes under them ([`slow_rounds_of`]
+/// of `raw`'s readings).
+fn slow_rounds(raw: &Raw) -> Vec<SlowRound> {
+    slow_rounds_of(
+        (&raw.start, raw.start_bench),
+        (&raw.end, raw.end_bench),
+        raw.paced_end.as_ref().zip(raw.paced_bench),
+    )
+}
+
+/// The rounds whose slow calls the report lines up with the flushes under them, from the
+/// readings `start` (the bridge's tally past the warm-up and this process's flush times and
+/// clock after it), `end` (past the last reply) and, when the paced sub-phase ran, `paced` (past
+/// its last reply): the back-to-back rounds, from `start` to `end`, judged by `start`'s mark,
+/// and the paced ones, from `end` to `paced`, by both (a call that began before `end` is judged
+/// from `start`'s).
+///
+/// # Panics
+///
+/// Two of the bridge's tallies that do not pair (a relaunch, a count that went backwards).
+fn slow_rounds_of(
+    start: (&Tally, (Flushed, u64)),
+    end: (&Tally, (Flushed, u64)),
+    paced: Option<(&Tally, (Flushed, u64))>,
+) -> Vec<SlowRound> {
+    let mark = |t: &Tally, (bench, at): (Flushed, u64)| Mark::of(t, &bench, at);
+    let round = |name: &str,
+                 (earlier, from): (&Tally, (Flushed, u64)),
+                 (later, to): (&Tally, (Flushed, u64)),
+                 marks: Vec<Mark>| SlowRound {
+        group: SLOW_GROUP.to_string(),
+        round: name.to_string(),
+        calls: later
+            .since(earlier)
+            .unwrap_or_else(|e| panic!("ping-pong, {name}: the wait tallies do not pair: {e}"))
+            .calls,
+        bridge_pid: later.pid,
+        bridge: later.times,
+        bench: to.0,
+        window: (from.1, to.1),
+        marks,
+    };
+    let opened = mark(start.0, start.1);
+    let mut out = vec![round("back-to-back", start, end, vec![opened])];
+    if let Some(paced) = paced {
+        out.push(round("paced", end, paced, vec![opened, mark(end.0, end.1)]));
+    }
+    out
+}
+
+pub(super) fn one_round(
     ctl: &mut Ctl,
     clock: Clock,
     a: &str,
@@ -202,6 +269,7 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
             broker.flush_counts(),
             ticks(broker),
             handler_tally(&mut ctl, &handlers, gui, a, a_since),
+            bench_now(),
         ))
     } else {
         None
@@ -215,6 +283,7 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
                 broker.flush_counts(),
                 ticks(broker),
                 handler_tally(&mut ctl, &handlers, gui, a, a_since),
+                bench_now(),
             ));
         }
         if i >= spec.warmup {
@@ -223,10 +292,11 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
     }
     let last = measured.last().expect("at least one measured round");
     let end = await_tally(&path, pid, last.pong_off, "ping-pong, after the last round");
+    let end_bench = bench_now();
     let flushes_end = broker.flush_counts();
     let ticks_end = ticks(broker);
     let handlers_end = handler_tally(&mut ctl, &handlers, gui, a, a_since);
-    let (start, flushes_start, ticks_start, handlers_start) =
+    let (start, flushes_start, ticks_start, handlers_start, start_bench) =
         start.expect("taken before the first measured round");
     let first = spec.warmup + spec.pingpong;
     let paced: Vec<Round> = (first..first + spec.paced)
@@ -243,6 +313,7 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
             "ping-pong, after the last paced round",
         )
     });
+    let paced_bench = paced_end.map(|_| bench_now());
     let paced_handlers_end = paced_end.map(|_| handler_tally(&mut ctl, &handlers, gui, a, a_since));
     Raw {
         rounds: measured,
@@ -255,6 +326,9 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
         paced,
         paced_end,
         paced_handlers_end,
+        start_bench,
+        end_bench,
+        paced_bench,
     }
 }
 
@@ -430,8 +504,8 @@ pub(super) fn describe(row: TallyRow) -> &'static str {
         TallyRow::DirFlush => "state dir: flushes, of a file in place or a directory",
         TallyRow::SetPostPin => "of the dir's: a post's reservation (`set_post_pin`)",
         TallyRow::SetInFlight => "of the dir's: a self-lane post's entry (`set_in_flight`)",
-        TallyRow::ClearInFlight => "of the dir's: the entry's removal (`clear_in_flight`)",
-        TallyRow::ClearPostSeq => "of the dir's: the reservation forgotten (`clear_post_seq`)",
+        TallyRow::ClearInFlight => "of the dir's: an entry's removal alone (`clear_in_flight`)",
+        TallyRow::ClearPostSeq => "of the dir's: posts settled (`settle_posts`, `clear_post_seq`)",
         TallyRow::AppendSelfAcked => "of the dir's: the landed offset (`append_self_acked`)",
         TallyRow::LogpinFence => "of the dir's: the mirror pin's fence, once an open (`logpin`)",
         TallyRow::WakeEvent => "wake: an aterm event queued while the loop was parked",
@@ -1201,6 +1275,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let per_rt = |v: f64| (n > 0).then(|| stats::round3(v / n as f64));
     let rt_mean = stats::summarize(&round_trip).map(|s| s.mean);
     let (paced_json, paced_md) = paced_report(&raw);
+    let slow = slow_rounds(&raw);
 
     let json = json!({
         "node": w.node.clone(),
@@ -1262,6 +1337,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "handlers": handlers_json,
         "bystanders": spec.bystanders,
         "paced": paced_json,
+        "slow_calls": tallies::slow_calls_json(&slow),
         "census": census::to_json(&pp_census, 2 * n, (lo, hi)),
     });
 
@@ -1373,11 +1449,114 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         ),
     ]);
     md.extend(paced_md);
+    md.push(String::new());
+    md.extend(tallies::slow_calls_tables(SLOW_GROUP, &slow));
     (json, md)
 }
 
 #[cfg(test)]
 mod tests {
+    /// PING-PONG'S SLOW-CALL ROUNDS AND THEIR MARKS (E09c): the back-to-back round runs from
+    /// the reading past the warm-up to the one past the last reply and is judged by the first
+    /// reading's mark; the paced round runs from there to the reading past its last reply and is
+    /// judged by both earlier marks, oldest first; each round's rings are its closing reading's,
+    /// the bridge's from its tally and the bench's from the flush times read after it, and its
+    /// calls the tallies' difference. With no paced sub-phase there is one round.
+    #[test]
+    fn the_slow_call_rounds_run_between_the_readings_and_are_judged_by_the_marks_before() {
+        use super::*;
+        let ms = 1_000_000;
+        let tally = |slow_count: u64, calls: u64| {
+            let mut t = Tally {
+                pid: 5,
+                ..Tally::default()
+            };
+            t.times.slow_count = slow_count;
+            for i in 0..calls {
+                let (start_ns, ns) = (i * 10 * ms, 2 * ms);
+                t.rows[TallyRow::Ack.index()].add(ns, Unit::Ns);
+                t.calls.kept[i as usize] = Some(wait_tally::SlowCall {
+                    row: TallyRow::Ack,
+                    start_ns,
+                    ns,
+                });
+                t.calls.count += 1;
+            }
+            t
+        };
+        let bench = |slow_count: u64, at: u64| {
+            (
+                Flushed {
+                    slow_count,
+                    ..Flushed::default()
+                },
+                at,
+            )
+        };
+        let (start, end, paced) = (tally(2, 0), tally(4, 1), tally(7, 3));
+        let readings = [bench(3, 10 * ms), bench(5, 20 * ms), bench(9, 30 * ms)];
+        let rounds = slow_rounds_of(
+            (&start, readings[0]),
+            (&end, readings[1]),
+            Some((&paced, readings[2])),
+        );
+        let mark = |at: u64, bench: u64, bridge: u64| Mark {
+            at,
+            bench,
+            bridge_pid: 5,
+            bridge,
+        };
+        let seen: Vec<_> = rounds
+            .iter()
+            .map(|r| {
+                (
+                    r.round.as_str(),
+                    r.window,
+                    r.marks.clone(),
+                    r.calls.count,
+                    r.bridge.slow_count,
+                    r.bench.slow_count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (
+                    "back-to-back",
+                    (10 * ms, 20 * ms),
+                    vec![mark(10 * ms, 3, 2)],
+                    1,
+                    4,
+                    5
+                ),
+                (
+                    "paced",
+                    (20 * ms, 30 * ms),
+                    vec![mark(10 * ms, 3, 2), mark(20 * ms, 5, 4)],
+                    2,
+                    7,
+                    9
+                ),
+            ]
+        );
+        assert!(
+            rounds
+                .iter()
+                .all(|r| r.bridge_pid == 5 && r.group == SLOW_GROUP),
+            "the bridge's pid and the report's group"
+        );
+        let back_to_back = slow_rounds_of((&start, readings[0]), (&end, readings[1]), None);
+        assert_eq!(
+            back_to_back
+                .iter()
+                .map(|r| r.round.as_str())
+                .collect::<Vec<_>>(),
+            ["back-to-back"],
+            "no paced sub-phase, one round"
+        );
+    }
+
     #[test]
     fn a_tally_is_taken_only_once_it_is_this_bridges_and_past_the_message() {
         use super::*;
@@ -1429,6 +1608,7 @@ mod tests {
             text: String::new(),
             head: String::new(),
             commit: upto.map(|u| (group.to_string(), u)),
+            bytes: 0,
         };
         let landed = |seq: u64| Some(seq * 1_000);
 

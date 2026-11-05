@@ -1176,7 +1176,7 @@ fn a_reviews_refreshed_row_says_whether_the_pool_picks() {
     let pool = ReviewPool::new(crate::harness::accounts::Cli::Claude, None);
     let config = pool.config.join("aterm.toml");
     let picks = |text: &str| {
-        std::fs::write(&config, text).unwrap();
+        aterm_uds::atomic_file::write(&config, text.as_bytes(), 0o600).unwrap();
         let mut facts = pool.facts();
         review_row(&mut facts, ReviewPool::NOW, Some(&config)).unwrap();
         facts.accounts.unwrap().pool_picks
@@ -4458,6 +4458,12 @@ fn review_cases() -> [ReviewCase; 11] {
 /// label not listed,
 /// refused every launch while the review ran on another row or on this machine's own login, and
 /// with `main` held for another Mac a launch took `work` while the review ran on `main`.
+///
+/// Both read every switch through `accounts_for`, whose forms `supervise::config` holds, so the
+/// harness's switch and the agent's run at the two cases that tell rotation off from on (each takes
+/// another row by rotation). THE GAP: a new read of `enabled` that goes around `accounts_for`, in
+/// either path, shows only at those two, and a wall or a sign-out under those two switches no
+/// longer runs.
 #[test]
 fn a_pooled_review_takes_what_a_launch_takes() {
     use crate::harness::accounts::Cli;
@@ -4473,13 +4479,18 @@ fn a_pooled_review_takes_what_a_launch_takes() {
             continue;
         }
         let agent_off = format!("[harness.{}]\nenabled = false\n", cli.program().name());
-        for switch in [
-            "",
-            "[harness]\naccounts = \"off\"\n",
-            "[harness]\nenabled = false\n",
-            agent_off.as_str(),
+        for (switch, every_case) in [
+            ("", true),
+            ("[harness]\naccounts = \"off\"\n", true),
+            ("[harness]\nenabled = false\n", false),
+            (agent_off.as_str(), false),
         ] {
             for (case, set) in review_cases() {
+                if !every_case
+                    && !matches!(case, "work active, no pin" | "main held for another Mac")
+                {
+                    continue;
+                }
                 let at = format!("{} on {reads:?}, {switch:?}, {case}", cli.id());
                 let ready = || {
                     let pool = ReviewPool::new(cli, reads);
@@ -4487,14 +4498,13 @@ fn a_pooled_review_takes_what_a_launch_takes() {
                     set(&pool);
                     pool
                 };
+                let reviewed = ready();
                 let off = {
-                    let pool = ready();
                     let (config, _) = crate::supervise::config::SupervisorConfig::from_path(Some(
-                        &pool.config.join("aterm.toml"),
+                        &reviewed.config.join("aterm.toml"),
                     ));
                     config.accounts_for(cli.program()) == crate::harness::accounts::Mode::Off
                 };
-                let reviewed = ready();
                 let (answer, envs) = reviewed.review();
                 let launched = ready();
                 let launch = launched.launch();
@@ -4574,9 +4584,288 @@ fn a_pooled_review_takes_what_a_launch_takes() {
 
 /// A LAUNCH OF A POOL WHOSE ONE ROW IS THIS MACHINE'S OWN LOGIN TAKES NO ROW WHILE NO PIN STANDS,
 /// AND THE FACTS A REVIEW READS AGREE: for Kimi Code, Grok Build and Codex on either build, with
-/// `main` alone walled or signed out, a launch (`accounts_pool::launch_env_for`) runs on that
-/// login as it is, and the facts record no refusal (`launch_refused`). CONTROL: with `work`
-/// listed beside it and walled too, the launch is refused and the facts record it.
+/// `main` alone signed out, and for the first two with it walled, a launch
+/// (`accounts_pool::launch_env_for`) runs on that login as it is, and the facts record no refusal
+/// (`launch_refused`). A wall on a lone Codex row refuses the launch and the facts record that,
+/// until the read a launch or a review makes first (`accounts_pool::lift_lone_wall`) shows it gone.
+/// CONTROL: with `work` listed beside it and walled too, the launch is refused and the facts record
+/// it.
+/// A READ THAT LIFTED A LONE ROW'S WALL ALSO ANSWERS FOR ITS ROLLOUTS: nothing rewrites a rollout and
+/// a session stopped at its wall writes no later reading, so the full reading it left stays the
+/// newest thing on disk and the review's facts would skip the row a launch now runs on. A later
+/// rollout's lower share leaves that window's largest share where it was, read when it was read.
+/// CONTROL: a full reading from after the read speaks, and so does the first before any read.
+#[test]
+fn a_read_with_room_outranks_a_full_rollout_reading_older_than_it() {
+    use crate::harness::accounts::Cli;
+    use crate::harness::codex_rollout::fixtures::{meta_as, rate};
+    let now = ReviewPool::NOW;
+    let reset = now + 3600;
+    let pool = ReviewPool::new(Cli::Codex, Some(true));
+    pool.main_alone();
+    let codex = pool.b.home.join(".codex");
+    let day = codex.join("sessions/2027/01/15");
+    std::fs::create_dir_all(&day).unwrap();
+    let write = |thread: &str, at: i64, used: f64| {
+        let log = day.join(format!("rollout-2027-01-15T10-00-00-{thread}.jsonl"));
+        let body = [
+            meta_as(
+                (at - 1) * 1000,
+                thread,
+                thread,
+                None,
+                Some(crate::harness::codex_rollout::PAGINATED),
+                Some(("account", "user")),
+            ),
+            rate(at * 1000, "codex", Some((used, 300, reset)), None),
+        ]
+        .concat();
+        std::fs::write(&log, body).unwrap();
+        std::fs::File::open(&log)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(at as u64))
+            .unwrap();
+    };
+    write("01900000-0000-7000-8000-00000000a001", now - 30, 100.0);
+    assert_eq!(
+        pool.facts().limited_until,
+        Some(reset),
+        "CONTROL: with no read after it the rollout's wall stands"
+    );
+
+    pool.wall("main");
+    let seat = crate::harness::accounts_pool::Seat {
+        config_dir: &pool.config,
+        state: &pool.b.state,
+        home: &pool.b.home,
+        now,
+    };
+    let room = |_: Cli, _: &Path, _: Option<&str>, _: i64| {
+        Some(crate::harness::codex_app_login::Usage {
+            sample: crate::harness::accounts::Sample {
+                session_pct: Some(10),
+                at: now,
+                ..crate::harness::accounts::Sample::default()
+            },
+            walls: Vec::new(),
+        })
+    };
+    assert!(crate::harness::accounts_pool::lift_lone_wall(
+        &seat,
+        Cli::Codex,
+        &room,
+        pool.program().as_deref()
+    ));
+    assert_eq!(pool.facts().limited_until, None, "lifted");
+
+    write("01900000-0000-7000-8000-00000000a002", now, 5.0);
+    assert_eq!(
+        pool.facts().limited_until,
+        None,
+        "a later rollout's lower share does not bring the older full one back"
+    );
+
+    // A later read rounding a session up to full speaks for itself; the older reading stays gone.
+    pool.state(|state| {
+        crate::harness::accounts::note_sample(
+            state,
+            "main",
+            crate::harness::accounts::Sample {
+                session_pct: Some(100),
+                week_pct: Some(12),
+                at: now + 1,
+                ..crate::harness::accounts::Sample::default()
+            },
+            now + 1,
+        );
+    });
+    assert_eq!(pool.facts().limited_until, None, "a read kept its word");
+
+    write("01900000-0000-7000-8000-00000000a003", now, 100.0);
+    assert_eq!(
+        pool.facts().limited_until,
+        Some(reset),
+        "CONTROL: a wall read since speaks"
+    );
+}
+
+/// A review's first wave holds its reviewer only if a limit is all that keeps it out and enough
+/// room is left when those that will run have gone first.
+#[test]
+fn a_reviewer_is_read_only_where_its_first_wave_would_start_it() {
+    let shim = PathBuf::from("/x");
+    let now = 1_800_000_000;
+    let ready = |c: &'static Connector| {
+        let mut facts = facts_of(c, shim.clone());
+        facts.login_file = Some((PathBuf::from("/x/login"), Some(now - 60)));
+        crate::ai::state::assess(&facts, true, now)
+    };
+    let claude = ready(&CLAUDE);
+    let mut codex = ready(&CODEX);
+    codex.limited_until = Some(now + 60);
+    let rows = [claude, codex];
+    let reviewers = [&CLAUDE, &CODEX];
+    let cands = candidates(&reviewers, None, "agy", &rows, now);
+    assert_eq!(
+        cands
+            .iter()
+            .map(|(_, skip)| skip.is_some())
+            .collect::<Vec<_>>(),
+        [false, true],
+        "CONTROL: Claude runs and Codex sits out: {cands:?}"
+    );
+    let first = |id, count| first_wave_but_for_its_limit(&cands, id, count, Level::Yolo, now);
+    assert!(first("codex", 2), "room beside Claude");
+    assert!(!first("codex", 1), "Claude takes the only place");
+    assert!(!first("kimi", 2), "not among them");
+    assert!(!first("claude", 2), "no limit keeps it out");
+    assert!(
+        !first_wave_but_for_its_limit(&cands, "codex", 2, Level::Yolo, now + 60),
+        "a limit that has ended keeps nothing out"
+    );
+}
+
+/// THE READ A REVIEW MAKES HOLDS AN ACCOUNT IN USE, as a launch's does ([`crate::harness::provider_read`]):
+/// it comes after every refusal, and only for the row the review would start on, so a command that
+/// starts nothing there asks the provider nothing. CONTROL: one that would start on it reads once,
+/// the wall lifts, and it asks that reviewer.
+#[test]
+fn a_review_reads_a_lone_walled_row_only_on_its_way_to_start_on_it() {
+    use crate::ai::facts::LiveRunner;
+    use crate::ai::permission::Asker;
+    use crate::harness::accounts::Cli;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Git as it is, in the scratch repository, and a reviewer that answers.
+    struct OnlyGit;
+    impl Runner for OnlyGit {
+        fn run(&self, job: &Job<'_>) -> Result<Ran, RunFailed> {
+            if job.program.file_name().is_some_and(|name| name == "git") {
+                LiveRunner.run(job)
+            } else {
+                Ok(ran(0, "fine", ""))
+            }
+        }
+        fn terminal(
+            &self,
+            _: &Path,
+            _: &[String],
+            _: &[(String, String)],
+            _: Option<&Path>,
+        ) -> Result<i32, String> {
+            Ok(0)
+        }
+    }
+
+    let pool = ReviewPool::new(Cli::Codex, Some(true));
+    pool.main_alone();
+    pool.wall("main");
+    let repo = pool.b.dir.path().join("repo");
+    let git = |args: &[&str]| {
+        let status = aterm_uds::spawnfd::command(crate::test_program::git())
+            .args(args)
+            .current_dir(&repo)
+            .env("HOME", &pool.b.home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    };
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "a@example.test"]);
+    git(&["config", "user.name", "a"]);
+    std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+    git(&["add", "a.rs"]);
+    git(&["commit", "-q", "-m", "a"]);
+    std::fs::write(repo.join("a.rs"), "fn a() { b() }\n").unwrap();
+    let outside = pool.b.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let reads = AtomicUsize::new(0);
+    let room = |_: Cli, _: &Path, _: Option<&str>, _: i64| {
+        reads.fetch_add(1, Ordering::SeqCst);
+        Some(crate::harness::codex_app_login::Usage {
+            sample: crate::harness::accounts::Sample {
+                session_pct: Some(10),
+                at: ReviewPool::NOW,
+                ..crate::harness::accounts::Sample::default()
+            },
+            walls: Vec::new(),
+        })
+    };
+    let run = |config: &str, cwd: &Path, asker: Asker, args: &[&str]| {
+        let cfg = pool.config.join("aterm.toml");
+        std::fs::write(&cfg, config).unwrap();
+        let env = crate::ai::cli::Env {
+            now: ReviewPool::NOW,
+            home: Some(pool.b.home.clone()),
+            vars: vec![
+                ("HOME".to_string(), pool.b.home.display().to_string()),
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ],
+            config: Some(cfg),
+            aterm_state: Some(pool.b.state.clone()),
+            harness_state: Some(pool.b.state.clone()),
+            pkg: Some(pool.b.pkg.clone()),
+            exclude: Vec::new(),
+            cwd: cwd.to_path_buf(),
+            stdin_tty: false,
+            exe: Some(PathBuf::from("/app/aterm")),
+            asker,
+        };
+        let words: Vec<String> = args.iter().map(ToString::to_string).collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let _ = crate::ai::cli::review_reading(&env, &OnlyGit, &words, &mut out, &mut err, &room);
+        String::from_utf8(err).expect("UTF-8")
+    };
+
+    for (config, cwd, args, why) in [
+        (
+            "[ai]\nreviews = false\n",
+            &repo,
+            &["--with", "codex"][..],
+            "reviews are off",
+        ),
+        (
+            "[ai]\n",
+            &repo,
+            &["--with", "codex,gpt"][..],
+            "is no AI CLI",
+        ),
+        (
+            "[ai]\n",
+            &outside,
+            &["--with", "codex"][..],
+            "git repository",
+        ),
+    ] {
+        let said = run(config, cwd, Asker::Person, args);
+        assert!(said.contains(why), "{args:?}: {said}");
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "refused: {args:?}: {said}");
+    }
+    for (config, asker, args) in [
+        (
+            "[ai]\nreviewers = [\"claude\"]\n",
+            Asker::Person,
+            &["--all"][..],
+        ),
+        ("[ai]\n[ai.codex]\nuse = false\n", Asker::Person, &[][..]),
+        ("[ai]\n", Asker::Agent("codex", Level::Yolo), &[][..]),
+    ] {
+        let said = run(config, &repo, asker, args);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "{config:?} {args:?} starts nothing on it: {said}"
+        );
+    }
+
+    let said = run("[ai]\n", &repo, Asker::Person, &["--with", "codex"]);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "CONTROL: {said}");
+    assert!(said.contains("asking codex"), "lifted, so asked: {said}");
+}
+
 #[test]
 fn a_lone_default_row_launch_takes_no_row_and_the_facts_refuse_none() {
     use crate::harness::accounts::Cli;
@@ -4593,6 +4882,48 @@ fn a_lone_default_row_launch_takes_no_row_and_the_facts_refuse_none() {
             let pool = ReviewPool::new(cli, reads);
             pool.main_alone();
             set(&pool);
+            if cli == Cli::Codex && case == "walled" {
+                let refused = pool.launch().expect_err(&at);
+                assert!(refused.contains("no usable account"), "{at}: {refused}");
+                let facts = pool.facts();
+                let accounts = facts.pool.as_ref().expect("the pool");
+                assert!(
+                    accounts.launch_refused.is_some(),
+                    "{at}: the facts agree: {accounts:?}"
+                );
+                // What the review's own read does first where the wall has gone.
+                let seat = crate::harness::accounts_pool::Seat {
+                    config_dir: &pool.config,
+                    state: &pool.b.state,
+                    home: &pool.b.home,
+                    now: ReviewPool::NOW,
+                };
+                let room = |_: Cli, _: &Path, _: Option<&str>, _: i64| {
+                    Some(crate::harness::codex_app_login::Usage {
+                        sample: crate::harness::accounts::Sample {
+                            session_pct: Some(10),
+                            at: ReviewPool::NOW,
+                            ..crate::harness::accounts::Sample::default()
+                        },
+                        walls: Vec::new(),
+                    })
+                };
+                assert!(
+                    crate::harness::accounts_pool::lift_lone_wall(
+                        &seat,
+                        cli,
+                        &room,
+                        pool.program().as_deref()
+                    ),
+                    "{at}"
+                );
+                assert_eq!(pool.launch(), Ok(None), "{at}: lifted");
+                let facts = pool.facts();
+                let accounts = facts.pool.as_ref().expect("the pool");
+                assert_eq!(accounts.launch_refused, None, "{at}: lifted: {accounts:?}");
+                assert_eq!(facts.limited_until, None, "{at}: lifted");
+                continue;
+            }
             assert_eq!(pool.launch(), Ok(None), "{at}");
             let witness = crate::harness::accounts_sync::capture_current_review(
                 &pool.store(),

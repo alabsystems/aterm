@@ -88,6 +88,9 @@ fn renewed(at: i64) -> (State, Logins) {
         Some("max"),
         at,
     );
+    // A session here ran on it and has ended: this Mac uses the login ([`used_here`]).
+    let _ = note_session(&mut state, "s-main", "main", None, at);
+    state.sessions.clear();
     (state, logins)
 }
 
@@ -1155,6 +1158,7 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
             outcome: AttemptOutcome::NoRoute,
             routes: routes.to_owned(),
             since: NOW,
+            tried_at: NOW,
         }),
         "since when it has been so"
     );
@@ -1345,5 +1349,53 @@ fn claude_codes_own_warning_is_read_at_any_percent_until_its_window_ends() {
     assert!(
         !account.warned(NOW + 4 * HOUR),
         "five hours after it was read"
+    );
+}
+
+/// RULE 4's USE CONDITION (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15): a due login is renewed
+/// here only while a session here ran on it within a week and no other Mac holds its senior
+/// claim. NEGATIVE CONTROL: without the use condition the idle login is due again.
+#[test]
+fn a_due_login_is_renewed_only_while_this_mac_uses_it() {
+    let r = roster();
+    let enrolled = every(&r);
+    let (mut state, mut logins) = renewed(NOW);
+    note_login_end(&mut state, &mut logins, "main", NOW + HOUR);
+    let due = |state: &State, at: i64| renew_due(&r, &logins, state, &enrolled, at);
+    assert_eq!(due(&state, NOW + HOUR), ["main"]);
+    assert_eq!(due(&state, NOW + USED_WITHIN_S - 1), ["main"]);
+    assert!(
+        due(&state, NOW + USED_WITHIN_S).is_empty(),
+        "a week with no session here"
+    );
+    let mut never = state.clone();
+    never.accounts.get_mut("main").unwrap().ran_at = None;
+    assert!(due(&never, NOW + HOUR).is_empty(), "never run on here");
+    let mut theirs = state.clone();
+    theirs.machine = "this-mac".into();
+    theirs.leases.insert(
+        "main".into(),
+        AccountLease {
+            holder: "claim:other-mac".into(),
+            until: NOW + 2 * HOUR,
+            at: NOW,
+        },
+    );
+    assert!(
+        due(&theirs, NOW + HOUR).is_empty(),
+        "another Mac holds its senior claim"
+    );
+    let mut ours = theirs.clone();
+    ours.leases.get_mut("main").unwrap().holder = "this-mac".into();
+    assert_eq!(due(&ours, NOW + HOUR), ["main"], "this Mac's own claim");
+    assert_eq!(
+        due(&theirs, NOW + 3 * HOUR),
+        ["main"],
+        "a lapsed claim is no claim"
+    );
+    assert_eq!(
+        without_use_condition(|| due(&never, NOW + HOUR)),
+        ["main"],
+        "CONTROL: the timer renewal the use condition stops"
     );
 }

@@ -32,7 +32,7 @@ pub const WRITE_MIN_INTERVAL_MS: u64 = 100;
 pub enum Phase {
     /// Planned, not yet started.
     Queued,
-    /// Bytes moving from the network into the staged `.part`.
+    /// Bytes moving from the network into a staged partial: the release host's `.part` or a LAN peer's `.peer.part`.
     Download,
     /// Full-asset sha256 against the signed manifest (label-only; no byte meter).
     Verify,
@@ -67,7 +67,7 @@ pub struct Overall {
 pub struct ProgramProgress {
     /// Where this program is now.
     pub phase: Phase,
-    /// Bytes landed in the current metered phase (download: `.part` size on disk; extract: bytes written).
+    /// Bytes landed in the current metered phase (download: the size on disk of the partial [`watch_download`] shows; extract: bytes written).
     #[serde(default)]
     pub bytes_done: u64,
     /// The metered phase's denominator: the signed `artifact.size` for download, the signed uncompressed size for extract.
@@ -100,7 +100,7 @@ pub struct ProgressFile {
     /// The writing installer's pid while the pass is live; `None` once it ended cleanly.
     #[serde(default)]
     pub pid: Option<u32>,
-    /// Which pass is writing: `"net"` (the default-set pass), or a typed pass that plans no default set, `"update"` (the channel apply) or `"install"` (one program).
+    /// Which pass is writing: `"net"` (the default-set pass), or a pass that plans no default set, `"update"` (a person's channel apply) or `"install"` (one program, a person's or a worker's launcher's).
     #[serde(default)]
     pub pass: String,
     /// Unix seconds when the pass started.
@@ -411,7 +411,7 @@ impl ProgressSink {
         });
     }
 
-    /// Download meter: `done` of `total` bytes landed in the staged `.part`.
+    /// Download meter: `done` of `total` bytes landed in a staged partial ([`watch_download`]).
     pub fn download_bytes(&self, program: &str, done: u64, total: u64) {
         self.with(|s| {
             let done = if total > 0 { done.min(total) } else { done };
@@ -718,7 +718,7 @@ fn quiet_stdio(log: &Path) {
         .append(true)
         .create(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(log)
     else {
         return;
@@ -995,7 +995,59 @@ impl Drop for ExtractScope {
 
 const PART_POLL_TICK_MS: u64 = 100;
 
-/// Flow hook: watch a growing `<asset>.part` while a download runs.
+/// How long a partial may stand still and still be what a download's meter shows: longer than a
+/// transfer that still runs goes without a byte (curl's patient `--speed-time`, 120 s; a LAN peer's
+/// 2 s), and far short of what a reader waits on the meter for (aterm-gui's
+/// `harness_host::INSTALL_QUIET_LIMIT`).
+const PARTIAL_QUIET: Duration = Duration::from_secs(150);
+
+/// One partial's size at the last look, and since when it has had that size.
+#[derive(Clone, Copy)]
+struct Partial {
+    len: u64,
+    since: Instant,
+}
+
+/// What a download's meter shows of the two partials its bytes land in at once
+/// ([`crate::peers::race`]). Both hold the same signed bytes at the same offsets, so the furthest
+/// says what has landed. A transfer that failed can leave its partial behind, though (the release
+/// host's, for the next call to resume), with a live one still short of it, so the meter leaves a
+/// partial that has gone quiet for one that moves: whatever transfer still runs moves the meter
+/// within [`PARTIAL_QUIET`].
+struct Partials([Partial; 2]);
+
+impl Partials {
+    const fn new(now: Instant) -> Self {
+        Self([Partial { len: 0, since: now }; 2])
+    }
+
+    /// What to show at `now` for each partial's size `lens`: the furthest of those that moved
+    /// within [`PARTIAL_QUIET`], or the furthest of all where neither did.
+    fn shown(&mut self, lens: [u64; 2], now: Instant) -> u64 {
+        for (partial, len) in self.0.iter_mut().zip(lens) {
+            if partial.len != len {
+                *partial = Partial { len, since: now };
+            }
+        }
+        let moving = self
+            .0
+            .iter()
+            .filter(|partial| now.saturating_duration_since(partial.since) < PARTIAL_QUIET)
+            .map(|partial| partial.len)
+            .max();
+        moving.unwrap_or_else(|| lens.into_iter().max().unwrap_or(0))
+    }
+}
+
+/// `path`'s size where it is a regular file, else 0: never follow a symlink out of the prefix.
+fn regular_len(path: &Path) -> u64 {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.file_type().is_file())
+        .map_or(0, |meta| meta.len())
+}
+
+/// Flow hook: watch `asset_path`'s growing partials while a download runs, the release host's `<asset>.part` and a LAN peer's ([`crate::peers::arrival_paths`], [`Partials`]). A transfer's bytes are what moves `progress.json` for a reader judging whether the pass still works, so neither may land unseen.
 #[must_use]
 pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadWatch {
     let Some(sink) = active() else {
@@ -1006,15 +1058,7 @@ pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadW
     };
     sink.phase(program, Phase::Download);
     sink.download_bytes(program, 0, total);
-    let Some(name) = asset_path.file_name() else {
-        return DownloadWatch {
-            stop: Arc::new(AtomicBool::new(true)),
-            handle: None,
-        };
-    };
-    let mut part = name.to_os_string();
-    part.push(".part");
-    let part = asset_path.with_file_name(part);
+    let [part, peer_part, _] = crate::peers::arrival_paths(asset_path);
     let program = program.to_string();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
@@ -1022,15 +1066,11 @@ pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadW
     let handle = std::thread::Builder::new()
         .name("atpkg-part-poll".into())
         .spawn(move || {
+            let mut partials = Partials::new(Instant::now());
             while !stop2.load(Ordering::Acquire) {
-                // Regular files only: never follow a symlink out of the prefix.
-                if let Ok(m) = std::fs::symlink_metadata(&part)
-                    && m.file_type().is_file()
-                {
-                    sink.download_bytes(&program, m.len(), total);
-                } else {
-                    sink.download_bytes(&program, 0, total);
-                }
+                let lens = [regular_len(&part), regular_len(&peer_part)];
+                let done = partials.shown(lens, Instant::now());
+                sink.download_bytes(&program, done, total);
                 tick_or_stop(&stop2, tick);
             }
         })
@@ -1677,6 +1717,75 @@ mod writer_tests {
         pass.join().unwrap();
         assert_eq!(ended.pid, None, "the terminal snapshot landed");
         let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A LAN PEER'S TRANSFER MOVES THE FILE. After the release host fails, a peer may go on sending
+    /// a build for over an hour at its pace's floor, landing only in `.peer.part`, and what judges
+    /// an install reads `progress.json`. CONTROLS: the release host's partial moves it as ever, the
+    /// further of the two shows, and the release host's shows again once a failed peer's has gone.
+    #[test]
+    fn a_download_watch_writes_what_a_lan_peers_partial_lands() {
+        let _slot = own_pass_slot();
+        let l = layout("peer-partial");
+        let asset = l.prefix.join("muse-1.tar.zst");
+        let [part, peer_part, _] = crate::peers::arrival_paths(&asset);
+        let landed = |want: u64| {
+            let by = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            loop {
+                let read = read_progress(&l)
+                    .and_then(|file| file.programs.get("muse").map(|row| row.bytes_done));
+                if read == Some(want) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < by,
+                    "progress.json says {read:?}, not {want}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert!(begin_pass(&l.progress_file(), "install"));
+        let watch = watch_download("muse", &asset, 1000);
+
+        std::fs::write(&peer_part, [0u8; 7]).unwrap();
+        landed(7);
+        std::fs::write(&peer_part, [0u8; 12]).unwrap();
+        landed(12);
+
+        std::fs::write(&part, [0u8; 40]).unwrap();
+        landed(40);
+        std::fs::write(&peer_part, [0u8; 90]).unwrap();
+        landed(90);
+        std::fs::remove_file(&peer_part).unwrap();
+        std::fs::write(&part, [0u8; 41]).unwrap();
+        landed(41);
+
+        drop(watch);
+        end_pass();
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A PARTIAL LEFT BEHIND HIDES NO TRANSFER. A release host that failed keeps its `.part` for
+    /// the next call, and a peer's transfer behind it would land hundreds of MB unseen: past
+    /// [`PARTIAL_QUIET`] the meter follows what moves, each byte moving it. CONTROLS: within that,
+    /// and while both grow, the meter shows the furthest and does not flicker; the other partial
+    /// moving again takes it back; and with nothing moving it stands at the furthest.
+    #[test]
+    fn a_partial_that_went_quiet_leaves_the_meter_to_the_one_that_moves() {
+        let t0 = Instant::now();
+        let mut partials = Partials::new(t0);
+        assert_eq!(partials.shown([0, 0], t0), 0);
+        assert_eq!(partials.shown([300, 10], t0), 300);
+        let quiet = t0 + PARTIAL_QUIET;
+        let short = quiet - Duration::from_secs(1);
+        assert_eq!(partials.shown([300, 20], short), 300, "not yet quiet");
+        assert_eq!(partials.shown([300, 30], quiet), 30, "the peer's bytes");
+        let on = quiet + Duration::from_secs(1);
+        assert_eq!(partials.shown([300, 31], on), 31, "each moves the meter");
+        assert_eq!(partials.shown([301, 32], on), 301, "both move: the further");
+        let still = on + PARTIAL_QUIET;
+        assert_eq!(partials.shown([301, 32], still), 301, "nothing moves");
+        assert_eq!(partials.shown([0, 0], still), 0, "the partials went");
     }
 
     #[test]

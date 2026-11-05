@@ -310,48 +310,585 @@ fn cpu_hardware_report_refuses_future_damaged_unbounded_and_deep_records() {
     );
 }
 
+thread_local! {
+    /// [`FAKE_HARDWARE`]'s last snapshot and the gap each of its samples was asked under.
+    static FAKE_HW: std::cell::RefCell<(Option<Instant>, Vec<Duration>)> =
+        const { std::cell::RefCell::new((None, Vec::new())) };
+    /// [`held_clock`]'s reading, which a test sets.
+    static HELD_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The fake reader's clock: [`HELD_NOW`] where the test set it, else the machine's.
+fn fake_now() -> Instant {
+    HELD_NOW
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(Instant::now)
+}
+
+/// A stand-in for the IOReport reader under its gap rule: a sample pairs with the previous one
+/// within the gap it is asked under (its window then read, its channels read), else it reads
+/// `warming`; it is cold where none is held within a gap. It records each sample's gap, and
+/// reads [`fake_now`].
+const FAKE_HARDWARE: HardwareProbe = HardwareProbe {
+    sample: |_, _, gap| {
+        FAKE_HW.with(|f| {
+            let mut f = f.borrow_mut();
+            let now = fake_now();
+            f.1.push(gap);
+            let window =
+                f.0.map(|t| now.saturating_duration_since(t))
+                    .filter(|w| *w <= gap);
+            f.0 = Some(now);
+            let mut s = aterm_sysprobe::cpu_hardware::Sample::unavailable("not_sampled");
+            match window {
+                Some(w) => {
+                    s.window_ns = u64::try_from(w.as_nanos()).unwrap_or(u64::MAX);
+                    s.channels = Ok(Vec::new());
+                }
+                None => s.channels = Err("warming".into()),
+            }
+            s
+        })
+    },
+    cold: |_, gap| {
+        FAKE_HW.with(|f| {
+            f.borrow()
+                .0
+                .is_none_or(|t| fake_now().saturating_duration_since(t) > gap)
+        })
+    },
+    free: false,
+};
+
+/// The gaps [`FAKE_HARDWARE`] was asked under since [`fake_hardware_reset`]: one per sample.
+fn fake_hardware_gaps() -> Vec<Duration> {
+    FAKE_HW.with(|f| f.borrow().1.clone())
+}
+
+fn fake_hardware_reset() {
+    FAKE_HW.with(|f| *f.borrow_mut() = (None, Vec::new()));
+}
+
+/// A reader clock that reads what the test set ([`HELD_NOW`]), so a plan's "due" never rides on
+/// how long a reading took.
+fn held_clock() -> Instant {
+    HELD_NOW.with(|n| n.get().expect("the test set the clock"))
+}
+
+/// Sets [`HELD_NOW`].
+fn hold_clock(at: Instant) {
+    HELD_NOW.with(|n| n.set(Some(at)));
+}
+
+/// A reader with [`FAKE_HARDWARE`], reset.
+fn hardware_reader() -> Reader {
+    fake_hardware_reset();
+    let mut reader = Reader::new(Arc::default());
+    reader.hardware_read = FAKE_HARDWARE;
+    reader
+}
+
+/// A whole reading at `t_s` s, asked at `cadence_ms`, whose E cores (0, 1) are wholly busy and
+/// whose one worker waits two cores' worth, with the P cores (2, 3) at `p_ticks` busy ticks: held
+/// still, they idle, and from the second such reading on it is the E-busy, P-idle recorder's
+/// observation (`aterm_vitals::hardware`); moved by a whole interval, they are busy, which ends it.
+fn e_busy_p_idle(t_s: u64, cadence_ms: u32, p_ticks: u64) -> Sample {
+    let total = t_s * 100;
+    let e = Ticks { busy: total, total };
+    let p = Ticks {
+        busy: p_ticks,
+        total,
+    };
+    Sample {
+        at_ns: t_s * 1_000_000_000,
+        at_unix_ms: 1_790_000_000_000 + i64::try_from(t_s * 1_000).unwrap(),
+        mono_ms: t_s * 1_000,
+        cadence_ms,
+        cores: Some(vec![e, e, p, p]),
+        clusters: vec![
+            ClusterSpec {
+                name: "Performance".into(),
+                logical: vec![2, 3],
+            },
+            ClusterSpec {
+                name: "Efficiency".into(),
+                logical: vec![0, 1],
+            },
+        ],
+        procs: Some(vec![ProcSample {
+            pid: 201,
+            ppid: 200,
+            start: Some(1),
+            cpu_ns: Some(0),
+            runnable_ns: Some(t_s * 2_000_000_000),
+            name: "worker".into(),
+            ..ProcSample::default()
+        }]),
+        self_pid: 100,
+        ..Sample::default()
+    }
+}
+
+/// What [`Reader::read`] does with whole reading `sample` past its counters: attaches CPU Stats
+/// as `req` and the reader's own model ask, then absorbs it.
+fn attach_and_absorb(reader: &mut Reader, mut sample: Sample, req: &Request) -> Snapshot {
+    reader.attach_hardware(&mut sample, req);
+    reader.vitals.absorb(&sample)
+}
+
 #[test]
 fn cpu_hardware_is_sampled_after_complete_machine_and_process_counters() {
     fn hardware(
         _: &mut aterm_sysprobe::cpu_hardware::Probe,
         sample: &Sample,
+        _: Duration,
     ) -> aterm_sysprobe::cpu_hardware::Sample {
         assert_eq!(sample.at_ns, 123);
         assert_eq!(sample.cores.as_ref().unwrap()[0].total, 456);
-        assert_eq!(sample.procs.is_some(), !sample.machine_only);
+        assert!(sample.procs.is_some());
         assert!(
             sample.hardware.is_none(),
             "no stale hardware sample is passed forward"
         );
         aterm_sysprobe::cpu_hardware::Sample::unavailable("not_sampled")
     }
-    let mut probe = aterm_sysprobe::cpu_hardware::Probe::default();
-    for machine_only in [false, true] {
-        let mut sample = Sample {
-            at_ns: 123,
-            machine_only,
-            cores: Some(vec![Ticks {
-                busy: 100,
-                total: 456,
-            }]),
-            procs: (!machine_only).then(|| {
-                vec![ProcSample {
-                    pid: 999,
-                    cpu_ns: Some(777),
-                    ..ProcSample::default()
-                }]
-            }),
-            ..Sample::default()
-        };
-        let before = sample.clone();
-        attach_hardware(&mut sample, &mut probe, hardware);
-        assert!(sample.hardware.is_some());
-        sample.hardware = None;
-        assert_eq!(
-            sample, before,
-            "hardware collection changes no captured value or timestamp"
-        );
+    let mut reader = Reader::new(Arc::default());
+    reader.hardware_read = HardwareProbe {
+        sample: hardware,
+        ..HardwareProbe::INERT
+    };
+    let mut sample = Sample {
+        at_ns: 123,
+        cores: Some(vec![Ticks {
+            busy: 100,
+            total: 456,
+        }]),
+        procs: Some(vec![ProcSample {
+            pid: 999,
+            cpu_ns: Some(777),
+            ..ProcSample::default()
+        }]),
+        ..Sample::default()
+    };
+    let before = sample.clone();
+    let lens = Request {
+        lenses: vec![Resource::Cpu],
+        ..Request::default()
+    };
+    reader.attach_hardware(&mut sample, &lens);
+    assert!(sample.hardware.is_some());
+    sample.hardware = None;
+    assert_eq!(
+        sample, before,
+        "hardware collection changes no captured value or timestamp"
+    );
+}
+
+/// A focused deck's reading and a hidden window's take no CPU Stats sample and carry none: the
+/// deck draws nothing from it (A2 §6.4). CONTROL: the same reader samples once the CPU lens
+/// opens, so the count sees a sample where one is taken; the reader before A2 sampled every deck
+/// and hidden reading, which fails the first count.
+#[test]
+fn the_deck_reading_takes_no_cpu_stats_sample() {
+    let mut reader = hardware_reader();
+    let deck = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        deck: true,
+        ..Request::default()
+    };
+    for _ in 0..2 {
+        assert!(reader.read(&deck).hardware.is_none(), "the deck's reading");
     }
+    let hidden = Request {
+        cadence_ms: 10_000,
+        machine_only: true,
+        ..deck.clone()
+    };
+    assert!(
+        reader.read_machine(&hidden).hardware.is_none(),
+        "a hidden one"
+    );
+    assert!(fake_hardware_gaps().is_empty(), "no CPU Stats sample");
+    let lens = Request {
+        lenses: vec![Resource::Cpu],
+        ..deck
+    };
+    assert!(reader.read(&lens).hardware.is_some());
+    assert_eq!(
+        fake_hardware_gaps().len(),
+        1,
+        "control: the CPU lens samples"
+    );
+}
+
+/// Where no source answers (off macOS), a sample reads nothing and says `unsupported`, so every
+/// whole reading carries one, the deck's included, and `sys cores` finds it held instead of
+/// pulling for it; a hidden reading still takes none. CONTROL: the same reader with a source
+/// that could answer (macOS's) takes none for the deck.
+#[test]
+fn a_source_that_costs_nothing_rides_every_whole_reading() {
+    let mut reader = hardware_reader();
+    reader.hardware_read.free = true;
+    let deck = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        deck: true,
+        ..Request::default()
+    };
+    for _ in 0..2 {
+        assert!(reader.read(&deck).hardware.is_some(), "the deck's reading");
+    }
+    let hidden = Request {
+        cadence_ms: 10_000,
+        machine_only: true,
+        ..deck.clone()
+    };
+    assert!(
+        reader.read_machine(&hidden).hardware.is_none(),
+        "a hidden one"
+    );
+    assert_eq!(fake_hardware_gaps().len(), 2, "one per whole reading");
+    reader.hardware_read.free = false;
+    assert!(
+        reader.read(&deck).hardware.is_none(),
+        "control: a source that answers"
+    );
+    assert_eq!(fake_hardware_gaps().len(), 2);
+}
+
+/// CPU Stats is read only for its demands (A2 §6.4): the CPU lens open (no other lens), the
+/// recorder pending, and a pull a hardware query armed; a pull no query armed reads none.
+/// Between samples a standing demand's reading carries the last one, so the lens's section never
+/// blinks, and the lens at its 500 ms cadence samples every other reading. CONTROL: the reader's
+/// count rises for the lens and the armed pull, so it sees each sample taken; the rule before A2,
+/// a sample on every deck or pull reading, fails its deck and unarmed-pull counts.
+#[test]
+fn cpu_stats_read_only_for_the_cpu_lens_a_pull_or_the_recorder() {
+    use HardwareDemand::{Free, Lens, Pull, Recorder};
+    use HardwarePlan::Carry;
+    let base = Request {
+        deck: true,
+        cadence_ms: 1_000,
+        ..Request::default()
+    };
+    let with = |lenses: &[Resource], hardware: bool| Request {
+        lenses: lenses.to_vec(),
+        pull: hardware,
+        hardware,
+        ..base.clone()
+    };
+    assert!(
+        hardware_demands(&base, false, false).is_empty(),
+        "the deck asks none"
+    );
+    let others = with(&[Resource::Gpu, Resource::Memory, Resource::Disk], false);
+    assert!(
+        hardware_demands(&others, false, false).is_empty(),
+        "no other lens"
+    );
+    let cpu = with(&[Resource::Gpu, Resource::Cpu], false);
+    assert_eq!(hardware_demands(&cpu, false, false), [Lens]);
+    assert_eq!(hardware_demands(&base, true, false), [Recorder]);
+    let unarmed = Request {
+        pull: true,
+        ..base.clone()
+    };
+    assert!(
+        hardware_demands(&unarmed, false, false).is_empty(),
+        "unarmed pull"
+    );
+    assert_eq!(hardware_demands(&with(&[], true), false, false), [Pull]);
+    assert_eq!(hardware_demands(&base, false, true), [Free]);
+    assert_eq!(
+        hardware_demands(&with(&[Resource::Cpu], true), true, false),
+        [Lens, Recorder, Pull]
+    );
+
+    let half = crate::stats_lens::LENS_PERIOD;
+    let t0 = Instant::now();
+    let gap = HardwarePlan::Sample(Duration::from_millis(2_500));
+    let mut last = None;
+    let plans: Vec<_> = (0..6u32)
+        .map(|i| {
+            let now = t0 + half * i;
+            let plan = hardware_plan(&[Lens], half, last, now);
+            if plan != Carry {
+                last = Some(now);
+            }
+            plan
+        })
+        .collect();
+    assert_eq!(plans, [gap, Carry, gap, Carry, gap, Carry], "every other");
+    assert_eq!(hardware_plan(&[], half, last, t0), HardwarePlan::None);
+    assert_eq!(
+        hardware_plan(&[Lens, Pull], half, Some(t0), t0),
+        HardwarePlan::Sample(Duration::from_millis(7_500)),
+        "a pull samples at once"
+    );
+    assert!(
+        matches!(
+            hardware_plan(&[Free], half, Some(t0), t0),
+            HardwarePlan::Sample(_)
+        ),
+        "a free source at every reading"
+    );
+
+    let mut reader = hardware_reader();
+    reader.clock = held_clock;
+    let t0 = Instant::now();
+    let lens = Request {
+        lenses: vec![Resource::Cpu],
+        cadence_ms: 500,
+        ..base.clone()
+    };
+    hold_clock(t0);
+    let sampled = reader.read(&lens).hardware;
+    hold_clock(t0 + half);
+    let carried = reader.read(&lens).hardware;
+    assert!(sampled.is_some() && carried == sampled, "the lens carries");
+    assert_eq!(fake_hardware_gaps().len(), 1);
+    hold_clock(t0 + half * 2);
+    assert!(reader.read(&lens).hardware.is_some());
+    assert_eq!(fake_hardware_gaps().len(), 2, "and samples a second on");
+    assert!(reader.read(&base).hardware.is_none(), "the deck's reading");
+    assert!(reader.read(&unarmed).hardware.is_none(), "an unarmed pull");
+    assert_eq!(fake_hardware_gaps().len(), 2, "neither samples");
+    assert!(
+        reader.read(&with(&[], true)).hardware.is_some(),
+        "an armed one"
+    );
+    assert_eq!(fake_hardware_gaps().len(), 3, "control: it samples");
+}
+
+/// The gap rule's threshold is 2.5 of its demand's periods (A2 §6.4): 2.5 s for the lens and a
+/// focused recorder, 12.5 s for a background one (5 s readings), 7.5 s for a pull (warm within
+/// [`COLD_AFTER`]); a reading serving several asks under the widest, and the reader asks the
+/// probe under it. A background recorder's samples 5 s apart therefore pair, where one gap of
+/// 2.5 s for every demand would leave each `warming`. CONTROL: its sample 13 s after the last,
+/// past 12.5 s, reads `warming`, so the fake applies the gap it is asked under.
+#[test]
+fn the_cpu_stats_gap_scales_with_its_demands_period() {
+    use HardwareDemand::{Lens, Pull, Recorder};
+    let ms = Duration::from_millis;
+    let focused = FOCUSED_PERIOD;
+    let background = BACKGROUND_PERIOD;
+    let lens = crate::stats_lens::LENS_PERIOD;
+    assert_eq!(Lens.gap(lens), ms(2_500));
+    assert_eq!(Recorder.gap(focused), ms(2_500));
+    assert_eq!(Recorder.gap(background), ms(12_500));
+    assert_eq!(Recorder.gap(lens), ms(2_500), "never finer than its frames");
+    assert_eq!(Pull.gap(focused), ms(7_500));
+    let t0 = Instant::now();
+    assert_eq!(
+        hardware_plan(&[Lens, Recorder], background, None, t0),
+        HardwarePlan::Sample(ms(12_500)),
+        "the widest"
+    );
+
+    let mut reader = hardware_reader();
+    reader.clock = held_clock;
+    let req = Request {
+        lenses: vec![Resource::Cpu],
+        cadence_ms: 500,
+        ..Request::default()
+    };
+    hold_clock(t0);
+    let _ = reader.read(&req);
+    let _ = reader.read(&Request {
+        pull: true,
+        hardware: true,
+        ..req.clone()
+    });
+    assert_eq!(fake_hardware_gaps(), [ms(2_500), ms(7_500)]);
+
+    let mut reader = hardware_reader();
+    reader.clock = held_clock;
+    let cadence_ms = u32::try_from(background.as_millis()).unwrap();
+    let deck = Request {
+        deck: true,
+        cadence_ms,
+        ..Request::default()
+    };
+    let mut hardware_at = |t_s: u64| {
+        hold_clock(t0 + Duration::from_secs(t_s));
+        attach_and_absorb(&mut reader, e_busy_p_idle(t_s, cadence_ms, 0), &deck).hardware
+    };
+    for t_s in [10, 15] {
+        assert!(hardware_at(t_s).is_none(), "{t_s} s: not pending yet");
+    }
+    let first = hardware_at(20).expect("pending: a sample");
+    assert_eq!(first.channels, Err("warming".to_owned()), "the first warms");
+    let paired = hardware_at(25).expect("a sample");
+    assert!(paired.channels.is_ok(), "5 s apart: {:?}", paired.channels);
+    assert_eq!(paired.window_ns, 5_000_000_000);
+    let late = hardware_at(38).expect("a sample");
+    assert_eq!(
+        late.channels,
+        Err("warming".to_owned()),
+        "control: 13 s apart"
+    );
+    assert!(fake_hardware_gaps().iter().all(|g| *g == ms(12_500)));
+}
+
+/// While the E-busy, P-idle recorder is pending, each whole reading takes a CPU Stats sample at
+/// the reading cadence (A2 §6.4), so its frames after the first carry hardware, and those after
+/// the second a delta; once the observation ends, the deck's readings take none again.
+/// CONTROL: before the observation, the same readings take none; a reader that never asked the
+/// model whether its recorder is pending leaves every frame without hardware.
+#[test]
+fn the_recorder_asks_cpu_stats_while_its_observation_is_pending() {
+    let mut reader = hardware_reader();
+    reader.clock = held_clock;
+    let t0 = Instant::now();
+    let deck = Request {
+        deck: true,
+        cadence_ms: 1_000,
+        ..Request::default()
+    };
+    let mut read = |t_s: u64, p_ticks: u64| {
+        hold_clock(t0 + Duration::from_secs(t_s));
+        let snap = attach_and_absorb(&mut reader, e_busy_p_idle(t_s, 1_000, p_ticks), &deck);
+        (snap, reader.vitals.cpu_recorder_pending())
+    };
+    let (first, pending) = read(10, 0);
+    assert!(
+        first.hardware.is_none() && !pending,
+        "control: no interval yet"
+    );
+    let (observed, pending) = read(11, 0);
+    assert!(pending, "the first anomalous reading");
+    assert!(
+        observed.hardware.is_none(),
+        "it was asked before the model saw it"
+    );
+    assert!(
+        fake_hardware_gaps().is_empty(),
+        "control: nothing asked yet"
+    );
+    let mut last = observed;
+    for t_s in 12..=45 {
+        let (snap, pending) = read(t_s, 0);
+        assert!(pending, "{t_s} s");
+        assert!(snap.hardware.is_some(), "{t_s} s: a sample");
+        last = snap;
+    }
+    assert_eq!(fake_hardware_gaps().len(), 34, "one each reading");
+    let bundle = last.cpu_diagnostics.expect("sustained 30 s");
+    let frames = &bundle.frames;
+    assert!(frames.len() > 2, "{}", frames.len());
+    assert!(frames[0].hardware.is_none(), "the first frame, before any");
+    assert!(
+        frames[1..]
+            .iter()
+            .all(|f| f.hardware.as_ref().is_some_and(|h| h.channels.is_ok())),
+        "every later frame retained carries a delta"
+    );
+    let (ended, pending) = read(46, 100);
+    assert!(!pending && ended.hardware.is_some(), "asked while pending");
+    hold_clock(t0 + Duration::from_secs(47));
+    let mut after = e_busy_p_idle(47, 1_000, 200);
+    reader.attach_hardware(&mut after, &deck);
+    assert!(after.hardware.is_none(), "ended: the deck asks none");
+}
+
+/// A pull a hardware query armed, finding no CPU Stats sample warm, reads its pair
+/// [`COLD_PAIR`] apart even when its whole reading is warm, so its reply's sample is the delta
+/// over the pair, not `warming`; with a sample warm it reads once; unarmed it takes no sample.
+/// CONTROL: a pull judged cold by the whole reading alone, as before A2, read once, and its only
+/// sample said `warming`.
+#[test]
+fn a_pull_that_prints_hardware_reads_a_warm_pair() {
+    let mut reader = hardware_reader();
+    let mut req = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        deck: true,
+        ..Request::default()
+    };
+    let armed = reader.hardware_armed.arm();
+    assert!(reader.hardware_cold(), "nothing held");
+    let snap = pull(&mut reader, &mut req, Some(Instant::now()), false);
+    assert_eq!(fake_hardware_gaps().len(), 2, "a pair");
+    let hardware = snap.hardware.expect("the pair's second sample");
+    assert!(hardware.channels.is_ok(), "{:?}", hardware.channels);
+    assert!(hardware.window_ns >= u64::try_from(COLD_PAIR.as_nanos()).unwrap());
+    assert!(!reader.hardware_cold(), "the pair left a sample warm");
+    let snap = pull(&mut reader, &mut req, Some(Instant::now()), false);
+    assert_eq!(fake_hardware_gaps().len(), 3, "warm: one reading");
+    assert!(snap.hardware.is_some_and(|h| h.channels.is_ok()));
+    drop(armed);
+    let snap = pull(&mut reader, &mut req, Some(Instant::now()), false);
+    assert!(snap.hardware.is_none());
+    assert_eq!(fake_hardware_gaps().len(), 3, "unarmed: no sample");
+
+    let mut before = hardware_reader();
+    before.hardware_read.cold = |_, _| false;
+    let _armed = before.hardware_armed.arm();
+    let snap = pull(&mut before, &mut req, Some(Instant::now()), false);
+    assert_eq!(fake_hardware_gaps().len(), 1, "control: one reading");
+    assert_eq!(
+        snap.hardware.map(|h| h.channels),
+        Some(Err("warming".to_owned())),
+        "control: its only sample warms"
+    );
+}
+
+/// A reader on which a hardware query arms once the pull's first reading has begun.
+struct ArmedMidPull<'a> {
+    reader: &'a mut Reader,
+    armed: Option<crate::occupancy_host::Armed<'static>>,
+}
+
+impl Source for ArmedMidPull<'_> {
+    fn reading(&mut self, req: &Request) -> Snapshot {
+        let arming = self.reader.hardware_armed;
+        self.armed.get_or_insert_with(|| arming.arm());
+        self.reader.reading(req)
+    }
+
+    fn model(&mut self) -> &mut aterm_vitals::Vitals {
+        self.reader.model()
+    }
+
+    fn hardware_armed(&self) -> bool {
+        self.reader.hardware_armed()
+    }
+
+    fn hardware_cold(&self) -> bool {
+        self.reader.hardware_cold()
+    }
+}
+
+/// A pull reads its CPU Stats arming once, as it begins: a pull begun before a `sys cores`
+/// armed takes no sample, so the query answers from its own pull, which reads a pair, never from
+/// one unpaired sample that says `warming`. CONTROL: the query's own pull, armed as it began,
+/// takes its pair; the S2 commit read the arming afresh as it attached the sample, so the first
+/// pull took one sample and fails the first count.
+#[test]
+fn a_pull_reads_its_cpu_stats_arming_once_as_it_begins() {
+    let mut reader = hardware_reader();
+    let mut req = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        deck: true,
+        ..Request::default()
+    };
+    let mut source = ArmedMidPull {
+        reader: &mut reader,
+        armed: None,
+    };
+    let snap = pull(&mut source, &mut req, Some(Instant::now()), false);
+    assert!(source.armed.is_some(), "armed during the pull");
+    assert!(snap.hardware.is_none(), "begun unarmed: no sample");
+    assert!(fake_hardware_gaps().is_empty());
+    let snap = pull(&mut source, &mut req, Some(Instant::now()), false);
+    assert_eq!(
+        fake_hardware_gaps().len(),
+        2,
+        "control: its own pull's pair"
+    );
+    assert!(snap.hardware.is_some_and(|h| h.channels.is_ok()));
 }
 
 #[test]
@@ -1374,6 +1911,55 @@ fn a_twin_showing_a_split_tabs_least_pane_leaves_each_tab_its_key() {
     );
 }
 
+/// THE REQUEST NAMES EACH SESSION'S AGENT GROUP LEADER for the leftover pass
+/// ([`aterm_vitals::model::TabRoot::agent_leader`]): a tab in a window and a windowless session,
+/// each whose foreground group runs an agent its screen names (`claude`, `codex`), name that
+/// group; a windowless session whose program is no agent, and one whose group is launchd's, name
+/// none. NEGATIVE CONTROL: name no leader for a windowed tab, or skip the windowless sessions'
+/// fill, and that root names none.
+#[test]
+fn the_request_names_each_sessions_agent_leader() {
+    let mut app = crate::App::headless_for_test();
+    let name = |app: &crate::App, id: u64, pgid: i32, program: &str| {
+        let entry = app.pool.get(id).expect("session");
+        let mut tl = entry
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        tl.note_foreground_group(pgid);
+        assert!(tl.set_program(pgid, Some(program.to_owned())));
+    };
+    for pooled in app.pool.sessions.values_mut() {
+        pooled.session.pid = 40_000;
+    }
+    name(&app, 0, 4242, "claude");
+    for (id, pgid, program) in [(71, 4343, "codex"), (72, 4444, "zsh"), (73, 1, "claude")] {
+        let mut session = crate::stub_session(id);
+        session.pid = 50_000 + i32::try_from(id).expect("an id");
+        crate::App::register_session(&app.store, &session, None);
+        app.pool.insert(session);
+        name(&app, id, pgid, program);
+    }
+    let req = app.vitals_request(FOCUSED_PERIOD, false);
+    let mut leaders: Vec<(u64, bool, Option<u32>)> = req
+        .tabs
+        .iter()
+        .map(|t| (t.key, t.tab_id.is_some(), t.agent_leader))
+        .collect();
+    leaders.sort_unstable();
+    assert_eq!(
+        leaders,
+        [
+            (0, true, Some(4242)),
+            (71, false, Some(4343)),
+            (72, false, None),
+            (73, false, None)
+        ],
+        "a windowed tab and the windowless sessions"
+    );
+}
+
 #[test]
 fn every_pane_counts_and_the_plan_is_the_frontmost_windows() {
     let mut app = crate::App::headless_for_test();
@@ -2238,6 +2824,98 @@ fn only_a_focused_window_that_wakes_asks_a_reading() {
         Some(at),
         "a focused window's output wake asks a reading at once"
     );
+}
+
+/// The rest slows the one shared reading stream only while no page reads it: a Tab Control page
+/// on screen beside a resting focused window, or in that window's front tab, keeps the reading a
+/// second a focused window gives it, and so does an Allocation view on screen. A page in a tab
+/// behind a terminal tab is not on screen and keeps nothing: the stream reads every five seconds.
+#[cfg(unix)]
+#[test]
+fn a_page_on_screen_keeps_a_focused_cadence_beside_a_resting_window() {
+    use crate::native_settings::SettingsRoute;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let _bars = crate::stats_deck::tests::attach_stats();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    // Rest is for a window on screen: a headless instance's never rests. It is off unless set.
+    app.headless = false;
+    app.config.idle_rest_secs = Some(30.0);
+    let wid = crate::WindowId(0);
+    let beside = crate::WindowId(1);
+    app.install_window_state(beside, crate::stub_session(91), 24, 80);
+    assert!(app.open_settings_tab_in_window(beside, SettingsRoute::Tabs));
+    // The focused window is the front one, where a page the menu opens goes.
+    app.frontmost_window = Some(wid);
+    app.windows.get_mut(&wid).expect("the window").focused = true;
+    let t0 = Instant::now();
+    app.service_vitals(t0);
+    assert_eq!(read_req(&rx, "read at once").cadence_ms, 1000);
+
+    let rest_at = t0 + Duration::from_secs(31);
+    app.settle_rest(rest_at);
+    assert!(app.windows[&wid].rest.resting());
+    app.service_vitals(rest_at);
+    assert_eq!(
+        read_req(&rx, "the page's reading").cadence_ms,
+        1000,
+        "the page beside the resting window"
+    );
+    assert_eq!(app.vitals_deadline(), Some(rest_at + FOCUSED_PERIOD));
+    assert_eq!(app.vitals_audience(), Audience::Shown);
+
+    // The page in the resting window's front tab, the other window's out of sight.
+    app.windows
+        .get_mut(&beside)
+        .expect("the page's window")
+        .occluded = true;
+    assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Tabs));
+    assert!(app.windows[&wid].rest.resting());
+    assert_eq!(
+        app.vitals_audience(),
+        Audience::Shown,
+        "the page in the resting window"
+    );
+    let same = rest_at + FOCUSED_PERIOD;
+    app.service_vitals(same);
+    assert_eq!(
+        read_req(&rx, "the same window's page's reading").cadence_ms,
+        1000,
+        "the page in the resting window"
+    );
+    assert_eq!(app.vitals_deadline(), Some(same + FOCUSED_PERIOD));
+
+    app.switch_tab_in(wid, 0);
+    assert!(app.tabs_page_shown(), "the page is still open");
+    assert_eq!(
+        app.vitals_audience(),
+        Audience::Background,
+        "the page behind a terminal tab"
+    );
+    let later = rest_at + BACKGROUND_PERIOD;
+    app.service_vitals(later);
+    assert_eq!(read_req(&rx, "the deck's resting reading").cadence_ms, 5000);
+    assert_eq!(app.vitals_deadline(), Some(later + BACKGROUND_PERIOD));
+
+    app.open_allocation(false).expect("an Allocation view");
+    assert!(
+        app.active_native_view(wid).is_some(),
+        "the Allocation tab is in front"
+    );
+    assert!(app.windows[&wid].rest.resting());
+    assert_eq!(
+        app.vitals_audience(),
+        Audience::Shown,
+        "an Allocation view in the resting window"
+    );
+    let shown = later + FOCUSED_PERIOD;
+    app.service_vitals(shown);
+    assert_eq!(
+        read_req(&rx, "the Allocation view's reading").cadence_ms,
+        1000,
+        "an Allocation view in the resting window"
+    );
+    assert_eq!(app.vitals_deadline(), Some(shown + FOCUSED_PERIOD));
 }
 
 /// With a window showing the bars, their cadence reads at once and then a period on; the disk
@@ -4981,6 +5659,7 @@ fn a_program_first_named_as_not_started_is_recorded_once() {
         aterm: true,
         wait,
         tab: None,
+        job: None,
         started_ms: None,
     };
     let x86 = row(7010, "x86tool", StartWait::Translating);
@@ -5543,6 +6222,7 @@ fn net_probe_seam_and_socket_attribution_reach_the_snapshot() {
         shell_pid: 200,
         label: "Tab 1".into(),
         program: String::new(),
+        agent_leader: None,
     }];
     let (aterm_sockets, tab_sockets) = read_sockets(&procs, 100, &tabs, |pid| match pid {
         100 => Some(2),
@@ -6643,4 +7323,118 @@ fn cold_pull_feeds_noted_gaps_and_events_once_and_facts_preserves_them() {
     );
     assert_eq!(snap.time_gaps.len(), 1);
     assert_eq!(snap.strip_events.len(), 2);
+}
+
+/// A leftover view `gone_ms` after tab 2 (session `s-closed`) closed: it left `sleep`, idle,
+/// first, then `ugrep` twice, `node`, `yes` and `perl`, each burning; and a row nothing ties.
+fn leftovers_view(gone_ms: u64) -> aterm_vitals::left::LeftView {
+    use aterm_vitals::left::{ClosedTab, LeftRow, LeftView, Proof, Source, State, Tier, Why};
+    let closed_ms = 1_792_000_000_000;
+    let row = |pid: u32, exe: &str, cpu_ms: u64| LeftRow {
+        pid,
+        state: State::Left,
+        peer: None,
+        check_ms: None,
+        started_ms: Some(7_200_000),
+        cpu_ms: Some(cpu_ms),
+        exe_judged: Some(format!("/opt/bin/{exe}")),
+        tier: Tier::Offer,
+        why: Why::OwnerGone,
+        proof: vec![Proof::Env, Proof::Time],
+        listen: false,
+        from: Source::Closed(5),
+        teller: None,
+        token: Some(format!("{pid}@1792098840004410:331")),
+        foreground: false,
+        after_agent: false,
+    };
+    let unknown = LeftRow {
+        why: Why::Orphaned,
+        from: Source::Unknown,
+        tier: Tier::Name,
+        token: None,
+        ..row(2700, "cat", 7_000_000)
+    };
+    LeftView {
+        rows: vec![
+            row(2605, "sleep", 0),
+            row(2606, "ugrep", 9_000),
+            row(2607, "ugrep", 9_000),
+            row(2608, "node", 9_000),
+            row(2609, "yes", 7_000_000),
+            row(2610, "perl", 9_000),
+            unknown,
+        ],
+        closed: vec![ClosedTab {
+            key: 5,
+            sid: "s-closed".into(),
+            label: "Tab 2".into(),
+            number: Some(2),
+            shell_uniqueid: 1_000,
+            horizon: 2_000,
+            closed_ms,
+            agent_spans: Vec::new(),
+            left: 6,
+        }],
+        as_of_ms: closed_ms + gone_ms,
+        ..LeftView::default()
+    }
+}
+
+/// `app`'s adopted view holds `view`, and the host states what it makes of it.
+fn adopt_leftovers(app: &mut crate::App, view: aterm_vitals::left::LeftView) {
+    let mut snap = Snapshot::default();
+    snap.set_left(Some(Arc::new(view)));
+    app.vitals.snapshot = Some(Arc::new(snap));
+    app.note_leftovers();
+}
+
+/// THE ENTRY NAMES UP TO THREE SOURCES AND CLEARS WHEN NONE IS ELIGIBLE: a closed tab's
+/// leftovers that burn, an hour after the close, raise one `vitals.proc.<sid>.leftovers` entry
+/// whose detail names at most three of its four burning sources by executable, and never the
+/// idle `sleep` that comes before them; a view whose rows are no longer eligible states the
+/// family's whole answer, none, and the entry ends. NEGATIVE CONTROL: speak the family by event,
+/// and the pass refuses to raise it at all; count an idle survivor as costing, and `sleep` takes
+/// the first line.
+#[test]
+fn the_entry_names_up_to_three_sources_and_clears_when_none_is_eligible() {
+    use std::time::Duration;
+    let key = "vitals.proc.s-closed.leftovers";
+    let mut app = crate::App::headless_for_test();
+    adopt_leftovers(
+        &mut app,
+        leftovers_view(aterm_vitals::left::ENTRY_AFTER_MS - 1),
+    );
+    assert!(app.messages.digest().entries.is_empty(), "within the hour");
+    adopt_leftovers(&mut app, leftovers_view(aterm_vitals::left::ENTRY_AFTER_MS));
+    let entries = app.messages.digest().entries;
+    assert_eq!(
+        entries.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+        [key]
+    );
+    let open = &entries[0];
+    assert_eq!(open.title, "Processes outlived their tab or run");
+    let lines: Vec<&str> = open.detail.iter().skip(2).map(String::as_str).collect();
+    assert_eq!(
+        lines,
+        [
+            "ugrep ×2 from Tab 2, 1 h",
+            "node from Tab 2, 1 h",
+            "yes from Tab 2, 1 h"
+        ],
+        "three sources at most, the idle one never"
+    );
+    let mut quiet = leftovers_view(aterm_vitals::left::ENTRY_AFTER_MS);
+    for row in &mut quiet.rows {
+        row.cpu_ms = Some(0);
+    }
+    adopt_leftovers(&mut app, quiet);
+    let due = app
+        .messages_deadline()
+        .expect("the level pass that named none arms the entry's end");
+    let _ = app.settle_messages(due + Duration::from_secs(1));
+    assert!(
+        app.messages.digest().entries.iter().all(|e| e.key != key),
+        "cleared once none is eligible"
+    );
 }

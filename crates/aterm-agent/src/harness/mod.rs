@@ -79,6 +79,7 @@ pub mod journal;
 pub mod land_receipt;
 pub mod lanes;
 pub mod laps;
+pub mod leftover;
 pub mod lights;
 pub mod login_drive;
 pub mod login_latch;
@@ -88,10 +89,13 @@ pub mod mailbox_needs;
 pub mod mailbox_routes;
 pub mod mailbox_seen;
 pub mod muse_usage;
+mod native_account_recipe;
 pub mod native_act;
 pub mod native_keys;
 #[cfg(unix)]
 mod native_launch;
+#[cfg(unix)]
+pub mod native_receipts;
 #[cfg(unix)]
 mod pending_native_store;
 #[cfg(all(unix, debug_assertions))]

@@ -13,6 +13,19 @@ use aterm_dbus::{Connection, Message, Type, Value, address};
 
 const LISTEN_LIMIT: Duration = Duration::from_secs(600);
 
+pub(crate) fn create_fresh(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
+    let path = path.as_ref();
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    opts.open(path)
+}
+
 const HANG: Duration = Duration::from_secs(60);
 
 /// Every peer a verb calls is the lane's own compositor, bus or application, which must
@@ -812,11 +825,26 @@ fn listen(app: &str, out: &Path, stop: &Path) -> Result<(), Fail> {
     let mut conn = a11y_bus()?;
     conn.add_match("type='signal'", CALL).map_err(Fail::fault)?;
     let registry = owner(&mut conn, REGISTRY).unwrap_or_default();
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(out)
-        .map_err(|e| Fail::Fault(format!("{}: {e}", out.display())))?;
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(out)
+            .map_err(|e| Fail::Fault(format!("{}: {e}", out.display())))?;
+        if !file
+            .metadata()
+            .map_err(|e| Fail::Fault(format!("{}: {e}", out.display())))?
+            .is_file()
+        {
+            return Err(Fail::Fault(format!(
+                "{}: not a regular file",
+                out.display()
+            )));
+        }
+        file
+    };
     let started = Instant::now();
     let mut names: Vec<(String, Option<u32>)> = Vec::new();
     while !stop.exists() {
@@ -1394,7 +1422,7 @@ fn read_small_text(path: &str) -> Result<String, String> {
     let go = || -> std::io::Result<String> {
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
         let meta = file.metadata()?;
         if !meta.is_file() {
@@ -1449,9 +1477,7 @@ fn xseat(app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     }
     for step in steps {
         let done = match step {
-            Step::Touch(path) => std::fs::File::create(path)
-                .map(drop)
-                .map_err(|e| e.to_string()),
+            Step::Touch(path) => create_fresh(path).map(drop).map_err(|e| e.to_string()),
             Step::Wait(path) => {
                 await_file(path, LISTEN_LIMIT)?;
                 Ok(())
@@ -1575,9 +1601,7 @@ fn run_steps(
     };
     for step in steps {
         let done = match step {
-            Step::Touch(path) => std::fs::File::create(path)
-                .map(drop)
-                .map_err(|e| e.to_string()),
+            Step::Touch(path) => create_fresh(path).map(drop).map_err(|e| e.to_string()),
             Step::Wait(path) => {
                 await_file(path, LISTEN_LIMIT)?;
                 Ok(())

@@ -25,6 +25,15 @@ pub enum Outcome {
         reason = "only the conformance matrices ask a subject that may predate a row; the other benches that mount this runner build what they measure"
     )]
     Unanswered(String),
+    /// The row measured, and its takes are no evidence either way on this machine's load (an
+    /// interval too wide, a starved driver). It is stated beside the rows that passed, never a
+    /// finding and never a refusal (owner ruling 2026-11-05: a busy machine never blocks a
+    /// release). A row that could not measure at all is `CouldNotRun`.
+    #[allow(
+        dead_code,
+        reason = "only paint and rewind judge takes a machine's load can leave undecided; spin and aos mount the same runner"
+    )]
+    Undecided(String),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -34,9 +43,13 @@ struct Counts {
     failed: usize,
     refused: usize,
     unanswered: usize,
+    undecided: usize,
 }
 
 impl Counts {
+    /// 1 for a finding; 3 where a row could not run or went unanswered, or the matrix is empty;
+    /// else 0, undecided rows included, a wholly undecided matrix too: a busy machine is stated,
+    /// never a refusal (owner ruling 2026-11-05).
     fn exit_code(&self) -> u8 {
         if self.failed != 0 {
             1
@@ -152,14 +165,23 @@ fn run_into<R>(
                 counts.unanswered += 1;
                 ("UNANSWERED", detail)
             }
+            Outcome::Undecided(detail) => {
+                counts.undecided += 1;
+                ("UNDECIDED", detail)
+            }
         };
         writeln!(out, "measure row: {target}::{name} {status}\n{detail}")?;
         out.flush()?;
     }
     writeln!(
         out,
-        "measure result: {target} planned={} passed={} failed={} refused={} unanswered={}",
-        counts.planned, counts.passed, counts.failed, counts.refused, counts.unanswered
+        "measure result: {target} planned={} passed={} failed={} refused={} unanswered={} undecided={}",
+        counts.planned,
+        counts.passed,
+        counts.failed,
+        counts.refused,
+        counts.unanswered,
+        counts.undecided
     )?;
     Ok(counts)
 }
@@ -204,13 +226,18 @@ mod tests {
                 failed: 1,
                 refused: 1,
                 unanswered: 1,
+                undecided: 0,
             }
         );
         assert_eq!(counts.exit_code(), 1);
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("measure row: fixture::panic FAIL\nmeasurement panicked:"));
         assert!(output.contains("measure row: fixture::unasked UNANSWERED\nno such verb"));
-        assert!(output.ends_with("fixture planned=5 passed=2 failed=1 refused=1 unanswered=1\n"));
+        assert!(
+            output.ends_with(
+                "fixture planned=5 passed=2 failed=1 refused=1 unanswered=1 undecided=0\n"
+            )
+        );
     }
 
     #[test]
@@ -254,6 +281,41 @@ mod tests {
         .unwrap();
         assert_eq!(unanswered.unanswered, rows.len());
         assert_eq!(unanswered.exit_code(), 3);
+        let undecided = run_into(
+            "undecided",
+            &rows,
+            |_| Outcome::Undecided("interval too wide".into()),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(undecided.undecided, rows.len());
+        assert_eq!(
+            undecided.exit_code(),
+            0,
+            "a wholly undecided matrix is stated, never a refusal"
+        );
+        let mut first = true;
+        let beside = run_into(
+            "beside",
+            &rows,
+            |_| {
+                if std::mem::take(&mut first) {
+                    Outcome::Pass("measured".into())
+                } else {
+                    Outcome::Undecided("interval too wide".into())
+                }
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!((beside.passed, beside.undecided), (1, 1));
+        assert_eq!(
+            beside.exit_code(),
+            0,
+            "an undecided row beside a pass is stated"
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("measure row: beside::two UNDECIDED\ninterval too wide"));
     }
 }
 

@@ -1759,8 +1759,9 @@ pub(crate) fn manages(selection: Selection, subject: Subject) -> bool {
             selection.contains(Setting::Permissions) && access.needed_for(selection)
         }
         Subject::Setting(setting) => selection.contains(setting),
-        // A Sync row manages nothing of its own: it rides Secrets and reads as not-applicable
-        // until SYNC-1 fills its behaviour, so it never counts toward the page's managed rows.
+        // Account provisioning rides Secrets and is supplied by its live base-layer reader.
+        // Other sync categories remain absent until they have an implementation.
+        Subject::Sync(SyncKind::Accounts) => selection.contains(Setting::Secrets),
         Subject::Sync(_) => false,
     }
 }
@@ -2429,10 +2430,24 @@ fn rows_as_they_stand(status: &SetupStatus) -> Vec<RowView> {
 
 /// Every row of the page, in page order.
 pub(crate) fn rows(status: &SetupStatus, selection: Selection) -> Vec<RowView> {
-    Subject::all()
+    visible_subjects(status)
         .into_iter()
         .map(|subject| row_view(subject, status, selection))
         .collect()
+}
+
+/// Live provisioning readers can add evidenced rows without inventing success for an
+/// unimplemented sync category.
+fn visible_subjects(status: &SetupStatus) -> Vec<Subject> {
+    let mut subjects = Subject::all();
+    if status
+        .observed
+        .iter()
+        .any(|reading| reading.subject == Subject::Sync(SyncKind::Accounts))
+    {
+        subjects.push(Subject::Sync(SyncKind::Accounts));
+    }
+    subjects
 }
 
 /// A group's choice, read from the plan's bits (a test's read of the plan).
@@ -3894,7 +3909,7 @@ impl SystemStateApp {
     }
 
     fn reviewed_rows(&self) -> Vec<RowView> {
-        Subject::all()
+        visible_subjects(&self.status)
             .into_iter()
             .map(|subject| self.reviewed_row(subject))
             .collect()
@@ -3915,7 +3930,7 @@ impl SystemStateApp {
 
     /// The rows `plan` reads ([`Self::judged_plan`]).
     fn judged_rows(&self, plan: &Plan) -> Vec<RowView> {
-        Subject::all()
+        visible_subjects(&self.status)
             .into_iter()
             .map(|subject| {
                 row_view_for_source(subject, &self.status, plan.selection, Some(&plan.vault_url))
@@ -4651,8 +4666,9 @@ pub(crate) const GITHUB_TOKEN_REFUSED: &str = aterm_types::macos_setup::GITHUB_T
 /// test that sweeps the scenarios sweeps it. `older-cancel` is a Cancel an older aterm recorded.
 /// Debug and dev-seam builds only.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
-pub(crate) const FIXTURES: [&str; 65] = [
+pub(crate) const FIXTURES: [&str; 66] = [
     "checking",
+    "account-provisioning",
     "plan-unread",
     "vault-source-mismatch",
     "check-failed",
@@ -4749,7 +4765,10 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
         now: now.map(str::to_owned),
         after_login: None,
         wanted: subject.wanted().to_owned(),
-        note: None,
+        note: (subject == Subject::Setting(Setting::Secrets)
+            && standing == Standing::InPlace
+            && now == Some(Setting::Secrets.wanted()))
+        .then(|| aterm_types::macos_setup::VAULT_LOCAL_READY_NOTE.to_owned()),
         detail: None,
     };
     // A value live until the next login, as `init_observe` marks it right after a Restore: the
@@ -5048,6 +5067,19 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 ],
             );
         }
+        "account-provisioning" => {
+            status.finished = true;
+            status.observed = in_place();
+            status.observed.push(Observation {
+                subject: Subject::Sync(SyncKind::Accounts),
+                standing: Standing::Waiting,
+                now: Some("Not provisioned".to_owned()),
+                after_login: None,
+                wanted: "Provisioned".to_owned(),
+                note: Some("No active Claude account is assigned to this Mac. Automatic provisioning resumes when the synced account roster changes.".to_owned()),
+                detail: None,
+            });
+        }
         "non-alab" => {
             // The base plan aterm admits by itself on a Mac with no ALab signal (§3.5), set up
             // where the ALab vault did not answer: aterm's permissions and Spotlight in place,
@@ -5071,7 +5103,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                     setting(Setting::Messages, Differs, Some("Signed in")),
                     setting(Setting::FaceTime, Differs, Some("Signed in")),
                     vault,
-                    setting(Setting::Repositories, Unknown, None),
+                    setting(Setting::Repositories, InPlace, Some("All")),
                 ],
             );
         }

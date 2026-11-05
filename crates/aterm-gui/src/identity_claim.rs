@@ -112,37 +112,14 @@ fn epoch_record_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
 #[cfg(any(unix, windows))]
 fn read_claim_record(path: &Path) -> Option<String> {
     use std::io::Read as _;
-    if !std::fs::symlink_metadata(path).ok()?.is_file() {
-        return None;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.custom_flags(0x0020_0000);
-    }
-    let file = options.open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > 16 {
+    let (file, metadata) = aterm_uds::regular_file::open(path).ok()?;
+    if metadata.len() > 16 {
         return None;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         if metadata.uid() != crate::control_auth::our_uid() || metadata.nlink() != 1 {
-            return None;
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        if metadata.file_attributes() & 0x0000_0400 != 0 {
             return None;
         }
     }
@@ -171,7 +148,9 @@ fn write_claim_record(path: &Path, text: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let mut file = options.open(&staged)?;
     file.write_all(text.as_bytes())?;
@@ -497,20 +476,21 @@ pub(crate) fn hold_transferred(sid: &SessionId) {
 #[cfg(unix)]
 fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+    let file = aterm_uds::kept_out(|| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+    })?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("{} is not a regular file", path.display()),
         ));
     }
-    aterm_uds::keep_out_of_children(&file)?;
     Ok(file)
 }
 

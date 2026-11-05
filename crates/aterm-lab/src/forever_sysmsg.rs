@@ -474,7 +474,7 @@ pub(super) fn open_gate(run: &Run, tab: &Tab) {
         return;
     };
     let path = crate::stub::gate_path(&run.w.join("modes"), &gate);
-    match std::fs::write(&path, b"") {
+    match crate::util::write_fresh(&path, b"") {
         Ok(()) => println!(
             "  [{}] +{} gate    the stand-in stands: the first prompt's answer goes",
             tab.chain.name(),

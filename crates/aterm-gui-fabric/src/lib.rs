@@ -1447,6 +1447,8 @@ pub struct TopicEntry {
 /// The per-session fabric state, hung on aterm-gui's `SessionCtx` ([`FabricSession`]).
 #[derive(Default)]
 pub struct SessionFabric {
+    #[cfg(unix)]
+    mesh: fleet_mail::MeshPolicy,
     inbox: Mutex<Inbox>,
     changed: Condvar,
     direct_epoch: AtomicU64,

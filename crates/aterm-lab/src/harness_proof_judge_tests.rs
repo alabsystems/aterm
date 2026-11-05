@@ -508,8 +508,45 @@ fn the_signal_and_exit_judges_want_the_childs_status_and_no_relaunch() {
     );
     fails_on(
         &ended("SIGHUP", Some(129), 129, Some(("SIGHUP", true)), true),
-        "nothing was relaunched",
+        "relaunched nothing",
     );
+}
+
+/// THE START LOG: each start's pid and parent are read as the stand-in writes them; a start after
+/// an intended end is the harness's relaunch only when the harness is its parent, so a resume line
+/// aterm's built-in lane typed at the shell is not blamed on the harness, and an unread harness
+/// pid counts every start.
+#[test]
+fn a_relaunch_after_an_end_is_the_harness_only_when_it_spawned_the_child() {
+    let log = "1793303431118348 start pid=601 ppid=500 pgid=500 exe=/s/muse version=1 session=x start=1 argv=\n\
+               1793303432569372 submit pid=601 session=x text=hello\n\
+               1793303433084109 help pid=602 exe=/s/muse\n\
+               1793303434000000 start pid=603 ppid=420 pgid=603 exe=/s/muse version=1 session=x start=2 argv=resume,x\n\
+               1793303435000000 start pid=bad ppid=500\n";
+    let starts = starts_of(log);
+    assert_eq!(
+        starts,
+        [
+            Start {
+                pid: 601,
+                ppid: 500
+            },
+            Start {
+                pid: 603,
+                ppid: 420
+            }
+        ]
+    );
+    assert!(started_by(&starts[..1], Some(500)), "the harness's child");
+    assert!(
+        !started_by(&starts[1..], Some(500)),
+        "the shell's resume line is not the harness's"
+    );
+    assert!(
+        started_by(&starts[1..], None),
+        "an unread harness pid counts it"
+    );
+    assert!(!started_by(&[], None), "no start, no relaunch");
 }
 
 /// THE HARNESS'S OWN RE-EXEC: the same pid on the new image, claimed again with the new version,

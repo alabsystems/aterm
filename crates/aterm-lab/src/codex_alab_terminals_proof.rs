@@ -74,7 +74,7 @@ fn await_bg(proof: &Proof, leg: &Leg, bg: &str) -> Result<(bool, Look), Stopped>
 }
 
 fn stop_file(leg: &Leg, file: &str) -> bool {
-    std::fs::write(leg.proj.join(file), "").is_ok()
+    crate::util::write_fresh(&leg.proj.join(file), "").is_ok()
 }
 
 pub(super) fn legs(proof: &mut Proof, package: &Path) -> Result<(), Fail> {

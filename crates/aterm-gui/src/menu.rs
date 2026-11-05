@@ -260,6 +260,10 @@ pub(crate) enum MenuAction {
     ForgetPaneHistory,
     /// View ▸ Forget All History: drop every pane's kept history (`App::forget_all_history`).
     ForgetAllHistory,
+    /// View ▸ Record Keys Not Echoed…: the person's own grant, in aterm's owner alert, for the
+    /// front window's live recording to also keep the keys aterm cannot see echoed while the
+    /// program in front of its tab stays there, or its stop (`App::toggle_unseen_keys`).
+    RecordUnseenKeys,
     /// Open Settings at the Packages route.
     Packages,
     /// Open Settings at the Messages route.
@@ -407,6 +411,7 @@ impl MenuAction {
             MenuAction::ExportPaneHistory => 94,
             MenuAction::ForgetPaneHistory => 96,
             MenuAction::ForgetAllHistory => 97,
+            MenuAction::RecordUnseenKeys => 101,
             MenuAction::DeckSizeAuto => 88,
             MenuAction::DeckSizeFull => 89,
             MenuAction::DeckSizeFolded => 90,
@@ -503,6 +508,7 @@ impl MenuAction {
             94 => MenuAction::ExportPaneHistory,
             96 => MenuAction::ForgetPaneHistory,
             97 => MenuAction::ForgetAllHistory,
+            101 => MenuAction::RecordUnseenKeys,
             _ => return None,
         })
     }
@@ -566,6 +572,7 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             | MenuAction::RewindPane
             | MenuAction::ExportPaneHistory
             | MenuAction::ForgetPaneHistory
+            | MenuAction::RecordUnseenKeys
     )
 }
 
@@ -840,6 +847,10 @@ pub(crate) struct MenuLive {
     pub front_tab_split: bool,
     /// The focused pane records its screen, so Rewind can open on it.
     pub can_rewind: bool,
+    /// The front window's glow is recorded (`aos attach`), so Record Keys Not Echoed… can grant.
+    pub aos_attached: bool,
+    /// The front window's recording carries the person's grant (its checkmark).
+    pub aos_unseen: bool,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -858,6 +869,8 @@ impl MenuLive {
         kitty_favourited: false,
         front_tab_split: false,
         can_rewind: false,
+        aos_attached: false,
+        aos_unseen: false,
     };
 
     const fn bits(self) -> u16 {
@@ -873,6 +886,8 @@ impl MenuLive {
             | (self.can_find as u16) << 9
             | (self.can_find_again as u16) << 10
             | (self.can_rewind as u16) << 11
+            | (self.aos_attached as u16) << 12
+            | (self.aos_unseen as u16) << 13
     }
 
     const fn from_bits(b: u16) -> MenuLive {
@@ -889,6 +904,8 @@ impl MenuLive {
             kitty_favourited: b & (1 << 6) != 0,
             front_tab_split: b & (1 << 7) != 0,
             can_rewind: b & (1 << 11) != 0,
+            aos_attached: b & (1 << 12) != 0,
+            aos_unseen: b & (1 << 13) != 0,
         }
     }
 }
@@ -924,6 +941,7 @@ pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
         MenuAction::ToggleSeriousMode => Some(menu_live().serious_mode),
         MenuAction::ToggleMatrixRain => Some(menu_live().rain_on),
         MenuAction::FavouriteKitty => Some(menu_live().kitty_favourited),
+        MenuAction::RecordUnseenKeys => Some(menu_live().aos_unseen),
         _ => None,
     }
 }
@@ -986,6 +1004,7 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
         MenuAction::RewindPane | MenuAction::ExportPaneHistory | MenuAction::ForgetPaneHistory => {
             live.can_rewind
         }
+        MenuAction::RecordUnseenKeys => live.aos_attached,
         _ => true,
     };
     precondition
@@ -1060,7 +1079,9 @@ impl MenuAction {
             MenuAction::DeckSizeAuto | MenuAction::DeckSizeFull | MenuAction::DeckSizeFolded => {
                 ConfigWrite
             }
-            MenuAction::ToggleStatsLens | MenuAction::ExportPaneHistory => PersonOnly,
+            MenuAction::ToggleStatsLens
+            | MenuAction::ExportPaneHistory
+            | MenuAction::RecordUnseenKeys => PersonOnly,
             MenuAction::ForgetAllHistory => OwnerOnly,
             MenuAction::ChooseTheme => ConfigWrite,
             MenuAction::About
@@ -1121,7 +1142,8 @@ impl MenuAction {
             | MenuAction::RewindPane
             | MenuAction::ExportPaneHistory
             | MenuAction::ForgetPaneHistory
-            | MenuAction::ForgetAllHistory => false,
+            | MenuAction::ForgetAllHistory
+            | MenuAction::RecordUnseenKeys => false,
             MenuAction::About
             | MenuAction::SoftwareUpdate
             | MenuAction::Version
@@ -1358,6 +1380,11 @@ impl MenuAction {
             MenuAction::ForgetAllHistory => {
                 "Drop the kept screen history of every pane; each keeps recording from now."
             }
+            MenuAction::RecordUnseenKeys => {
+                "Keep this window's recording going through keys aterm cannot see echoed, such as \
+                 vim's normal mode, while the program in front of this tab stays there. aterm \
+                 asks first, and marks each such key in the recording."
+            }
             MenuAction::Help => "Open the aterm guide.",
         }
     }
@@ -1367,7 +1394,7 @@ impl MenuAction {
     pub(crate) const fn offered_on_this_platform(self) -> bool {
         match self {
             MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => aterm_update::enabled(),
-            MenuAction::SystemState => cfg!(target_os = "macos"),
+            MenuAction::SystemState | MenuAction::RecordUnseenKeys => cfg!(target_os = "macos"),
             _ => true,
         }
     }
@@ -1453,6 +1480,7 @@ impl MenuAction {
             "ExportPaneHistory" => Some(MenuAction::ExportPaneHistory),
             "ForgetPaneHistory" => Some(MenuAction::ForgetPaneHistory),
             "ForgetAllHistory" => Some(MenuAction::ForgetAllHistory),
+            "RecordUnseenKeys" => Some(MenuAction::RecordUnseenKeys),
             "ResetTerminal" => Some(MenuAction::ResetTerminal),
             "ChooseTabTheme" => Some(MenuAction::ChooseTabTheme),
             "ClearTabTheme" => Some(MenuAction::ClearTabTheme),
@@ -1895,6 +1923,12 @@ const VIEW_MENU: &[MenuEntry] = &[
     Item {
         label: "Forget All History",
         action: MenuAction::ForgetAllHistory,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Record Keys Not Echoed\u{2026}",
+        action: MenuAction::RecordUnseenKeys,
         key: "",
         mods: MenuMods::None,
     },
@@ -3180,14 +3214,35 @@ mod macos {
 
     /// Who asked for the `terminate:` AppKit is deciding, by the sender and the quit reason of
     /// the Apple event it answers ([`crate::system_quit::asker_of`]); with no event, a person.
+    /// The quit reason (`why?`) and sender pid (`spid`) attributes of a quit Apple event.
+    ///
+    /// # Safety
+    /// `event` is a live `NSAppleEventDescriptor`.
+    unsafe fn quit_event_facts(event: Id) -> (Option<u32>, Option<i32>) {
+        // SAFETY: `-attributeDescriptorForKeyword:` is `-(NSAppleEventDescriptor *)(AEKeyword)`,
+        // `@@:I`: an `AEKeyword` is a 32-bit `FourCharCode`. It returns a descriptor the event
+        // keeps (or nil), borrowed for this frame. `-enumCodeValue` is `-(OSType)` (`I@:`) and
+        // `-int32Value` `-(SInt32)` (`i@:`).
+        unsafe {
+            let attribute_for: unsafe extern "C-unwind" fn(Id, Sel, u32) -> Id =
+                aterm_objc::checked_msg();
+            let attribute = |keyword: u32| {
+                let descriptor =
+                    attribute_for(event, sel!(attributeDescriptorForKeyword:), keyword);
+                (!descriptor.is_null()).then_some(descriptor)
+            };
+            let reason = attribute(crate::system_quit::KEY_QUIT_REASON)
+                .map(|descriptor| appkit::send_u32(descriptor, sel!(enumCodeValue)));
+            let sender = attribute(crate::quit_reopen::KEY_SENDER_PID)
+                .map(|descriptor| appkit::send_i32(descriptor, sel!(int32Value)));
+            (reason, sender)
+        }
+    }
+
     fn terminate_asker() -> crate::system_quit::Asker {
-        // SAFETY: Foundation sends on the main thread inside
-        // `applicationShouldTerminate:`. `+sharedAppleEventManager` and
-        // `-currentAppleEvent` return BORROWED objects (nil outside an event);
-        // `-attributeDescriptorForKeyword:` takes an `AEKeyword` (a 32-bit
-        // `FourCharCode`, passed in a full register) and returns a borrowed
-        // descriptor or nil; `-enumCodeValue` returns an `OSType` and
-        // `-int32Value` an `SInt32`, each the low 32 bits of the return register.
+        // SAFETY: Foundation sends on the main thread inside `applicationShouldTerminate:`.
+        // `+sharedAppleEventManager` and `-currentAppleEvent` return BORROWED objects (nil outside
+        // an event); the event is live for this pool.
         let read = autoreleasepool(|_| unsafe {
             let manager = appkit::send_id(
                 class(c"NSAppleEventManager").as_id(),
@@ -3200,20 +3255,7 @@ mod macos {
             if event.is_null() {
                 return None;
             }
-            let attribute = |keyword: u32| {
-                let descriptor = appkit::send_id_usize(
-                    event,
-                    sel!(attributeDescriptorForKeyword:),
-                    keyword as usize,
-                );
-                (!descriptor.is_null()).then_some(descriptor)
-            };
-            let reason = attribute(crate::system_quit::KEY_QUIT_REASON).map(|descriptor| {
-                (appkit::send_usize(descriptor, sel!(enumCodeValue)) & 0xFFFF_FFFF) as u32
-            });
-            let sender = attribute(crate::quit_reopen::KEY_SENDER_PID)
-                .map(|descriptor| appkit::send_i32(descriptor, sel!(int32Value)));
-            Some((reason, sender))
+            Some(quit_event_facts(event))
         });
         let Some((reason, pid)) = read else {
             return crate::system_quit::Asker::Person;
@@ -3473,6 +3515,64 @@ mod macos {
 
         use super::MenuTarget;
         use crate::appkit;
+
+        /// A quit Apple event's reason and sender read back through prototypes the runtime
+        /// agrees with: `-attributeDescriptorForKeyword:` takes a 32-bit `AEKeyword` and
+        /// `-enumCodeValue` answers a 32-bit `OSType`. NEGATIVE CONTROL: with the keyword passed
+        /// as an `NSUInteger` (`@@:Q`, as this read sent it at d7d33a47f3) the debug-build send
+        /// check panics, as it did inside `applicationShouldTerminate:` for every Dock quit.
+        #[test]
+        fn a_quit_events_reason_and_sender_read_with_the_runtimes_prototypes() {
+            let code = |s: &[u8; 4]| u32::from_be_bytes(*s);
+            // SAFETY: Foundation constructors and setters on live descriptors this pool keeps:
+            // `+descriptorWithEnumCode:` is `(OSType) -> id`, `+appleEventWithEventClass:eventID:
+            // targetDescriptor:returnID:transactionID:` is `(AEEventClass, AEEventID, id,
+            // AEReturnID, AETransactionID) -> id`, and `-setAttributeDescriptor:forKeyword:` is
+            // `(id, AEKeyword)`.
+            aterm_objc::autoreleasepool(|_| unsafe {
+                let descriptor = class(c"NSAppleEventDescriptor").as_id();
+                let make: unsafe extern "C-unwind" fn(
+                    aterm_objc::Id,
+                    aterm_objc::Sel,
+                    u32,
+                    u32,
+                    aterm_objc::Id,
+                    i16,
+                    i32,
+                ) -> aterm_objc::Id = aterm_objc::checked_msg();
+                let event = make(
+                    descriptor,
+                    sel!(appleEventWithEventClass:eventID:targetDescriptor:returnID:transactionID:),
+                    code(b"aevt"),
+                    code(b"quit"),
+                    aterm_objc::Id::NIL,
+                    -1,
+                    0,
+                );
+                assert!(!event.is_null());
+                assert_eq!(super::quit_event_facts(event), (None, None), "a bare quit");
+                let with_enum: unsafe extern "C-unwind" fn(
+                    aterm_objc::Id,
+                    aterm_objc::Sel,
+                    u32,
+                ) -> aterm_objc::Id = aterm_objc::checked_msg();
+                let set: unsafe extern "C-unwind" fn(
+                    aterm_objc::Id,
+                    aterm_objc::Sel,
+                    aterm_objc::Id,
+                    u32,
+                ) = aterm_objc::checked_msg();
+                set(
+                    event,
+                    sel!(setAttributeDescriptor:forKeyword:),
+                    with_enum(descriptor, sel!(descriptorWithEnumCode:), code(b"rlgo")),
+                    crate::system_quit::KEY_QUIT_REASON,
+                );
+                // The Apple Event Manager stamps `spid` only on an event it delivers, so a built
+                // one carries no sender: the real Dock quit reads that one.
+                assert_eq!(super::quit_event_facts(event), (Some(code(b"rlgo")), None));
+            });
+        }
 
         #[test]
         fn an_unavailable_menu_confirmation_never_supplies_approval() {
@@ -3975,9 +4075,47 @@ mod tests {
             kitty_favourited: true,
             front_tab_split: true,
             can_rewind: false,
+            aos_attached: false,
+            aos_unseen: false,
         };
         set_menu_live(idle);
         assert_eq!(menu_live(), idle, "every bit round-trips");
+        assert!(
+            !native_menu_action_enabled(MenuAction::RecordUnseenKeys),
+            "Record Keys Not Echoed… needs a recording"
+        );
+        assert_eq!(
+            native_menu_checked(MenuAction::RecordUnseenKeys),
+            Some(false)
+        );
+        set_menu_live(MenuLive {
+            aos_attached: true,
+            aos_unseen: true,
+            ..idle
+        });
+        assert_eq!(
+            (menu_live().aos_attached, menu_live().aos_unseen),
+            (true, true),
+            "the recording's bits round-trip"
+        );
+        assert!(native_menu_action_enabled(MenuAction::RecordUnseenKeys));
+        assert_eq!(
+            native_menu_checked(MenuAction::RecordUnseenKeys),
+            Some(true),
+            "its checkmark is the grant"
+        );
+        assert_eq!(
+            MenuAction::RecordUnseenKeys.invoke_authority(),
+            super::InvokeAuthority::PersonOnly,
+            "only the person at the window grants it"
+        );
+        assert!(!MenuAction::RecordUnseenKeys.writes_pty_input());
+        assert!(super::requires_terminal_tab(MenuAction::RecordUnseenKeys));
+        assert_eq!(
+            MenuAction::RecordUnseenKeys.offered_on_this_platform(),
+            cfg!(target_os = "macos"),
+            "aterm's alert, the one door to the grant, is macOS's"
+        );
         assert!(!native_menu_action_enabled(MenuAction::Save));
         assert!(!native_menu_action_enabled(MenuAction::RewindPane));
         assert!(!native_menu_action_enabled(MenuAction::ForgetPaneHistory));

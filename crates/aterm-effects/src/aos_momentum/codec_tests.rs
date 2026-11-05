@@ -13,7 +13,7 @@ use aterm_time::Instant;
 
 use super::test_fixtures::{BUILD, Call, cfg, geom, headed_geom, play, random_stream};
 use super::{
-    CONTRACT_NAME, ConfigRecord, GeomRecord, MomentumCode, MomentumEvent, MomentumHost,
+    CONTRACT_NAME, ConfigRecord, GeomRecord, KeyEcho, MomentumCode, MomentumEvent, MomentumHost,
     MomentumObservation, MomentumSchema, MomentumState, NUMERIC_PROFILE, NoStrandedLight,
     PrebuiltMomentum, SCHEMA_NAME, TASK_NAME, momentum_identity, profile_artifact, schema_artifact,
     task_artifact,
@@ -99,14 +99,22 @@ fn inputs() -> Vec<MomentumEvent> {
         MomentumEvent::Key {
             at: 0,
             tau_bits: MOMENTUM_GLOW_TAU_S.to_bits(),
+            echo: super::KeyEcho::Seen,
         },
         MomentumEvent::Key {
             at: i128::MAX,
             tau_bits: f32::NAN.to_bits(),
+            echo: super::KeyEcho::Seen,
         },
         MomentumEvent::Key {
             at: -1,
             tau_bits: u32::MAX,
+            echo: super::KeyEcho::Seen,
+        },
+        MomentumEvent::Key {
+            at: 7,
+            tau_bits: MOMENTUM_GLOW_TAU_S.to_bits(),
+            echo: KeyEcho::Unseen,
         },
         MomentumEvent::Reset,
         MomentumEvent::Tick {
@@ -161,9 +169,65 @@ fn every_input_round_trips_through_its_encoding_including_extremes() {
 }
 
 #[test]
+fn a_seen_key_encodes_as_before_and_an_unseen_key_differs_only_in_its_tag() {
+    let schema = MomentumSchema::new(Instant::now());
+    let key = |echo| MomentumEvent::Key {
+        at: 3,
+        tau_bits: 0x3F80_0000,
+        echo,
+    };
+    let seen = encode_input(&schema, &key(KeyEcho::Seen));
+    let mut want = vec![0u8];
+    want.extend_from_slice(&3i128.to_le_bytes());
+    want.extend_from_slice(&0x3F80_0000u32.to_le_bytes());
+    assert_eq!(seen, want, "a seen key is v2's bytes, tag 0");
+    let unseen = encode_input(&schema, &key(KeyEcho::Unseen));
+    assert_eq!(unseen[0], 4, "an unseen key is tag 4");
+    assert_eq!(unseen[1..], seen[1..], "with the same payload");
+    assert_eq!(decode_input(&schema, &unseen), Ok(key(KeyEcho::Unseen)));
+    assert_eq!(decode_input(&schema, &seen), Ok(key(KeyEcho::Seen)));
+}
+
+#[test]
+fn the_state_carries_its_unseen_count() {
+    let t0 = Instant::now();
+    let schema = MomentumSchema::new(t0);
+    let mut state = MomentumState::new(MomentumGlow::default());
+    assert_eq!(state.unseen(), 0, "a new recording starts at zero");
+    let code = PrebuiltMomentum::new(MomentumCode::Shipped, BUILD);
+    for (at, echo) in [
+        (1_000_000, KeyEcho::Seen),
+        (2_000_000, KeyEcho::Unseen),
+        (3_000_000, KeyEcho::Unseen),
+    ] {
+        let _ = aterm_aos::task::Code::step(
+            &code,
+            &schema,
+            &mut state,
+            &MomentumEvent::Key {
+                at,
+                tau_bits: MOMENTUM_GLOW_TAU_S.to_bits(),
+                echo,
+            },
+            &mut aterm_aos::effects::NoEffects,
+        );
+    }
+    assert_eq!(state.unseen(), 2, "only the unseen keys count");
+    let back = decode_state(&schema, &encode_state(&schema, &state)).expect("decodes");
+    assert_eq!(back.unseen(), 2);
+    let none = MomentumState::new(MomentumGlow::default());
+    let bytes = encode_state(&schema, &none);
+    assert_eq!(
+        bytes[bytes.len() - 4..],
+        [0; 4],
+        "negative control: a state that took no unseen key encodes 0"
+    );
+}
+
+#[test]
 fn an_unknown_input_tag_is_refused_naming_it() {
     let schema = MomentumSchema::new(Instant::now());
-    for tag in [4u8, 5, 0x7F, 0xFF] {
+    for tag in [5u8, 6, 0x7F, 0xFF] {
         assert_eq!(
             decode_input(&schema, &[tag]),
             Err(WireFault::BadTag {
@@ -334,16 +398,26 @@ fn every_reachable_state_round_trips_byte_for_byte() {
             for k in (0..=calls.len()).step_by(7) {
                 let mut glow = MomentumGlow::default();
                 let _ = play(&mut glow, t0, &calls[..k]);
-                for clock in [None, Some(0), Some(i128::MIN), Some(i128::MAX)] {
-                    let s = MomentumState { glow, clock };
+                for (clock, unseen) in [
+                    (None, 0),
+                    (Some(0), 1),
+                    (Some(i128::MIN), u32::MAX),
+                    (Some(i128::MAX), 0),
+                ] {
+                    let s = MomentumState {
+                        glow,
+                        clock,
+                        unseen,
+                    };
                     let bytes = encode_state(&schema, &s);
                     assert_eq!(
                         bytes.len(),
-                        MomentumGlowSnapshot::LEN + 1 + 16 * usize::from(clock.is_some())
+                        MomentumGlowSnapshot::LEN + 1 + 16 * usize::from(clock.is_some()) + 4
                     );
                     let back = decode_state(&schema, &bytes)
                         .unwrap_or_else(|f| panic!("seed {seed} at {k}: {f}"));
                     assert_eq!(back.clock(), clock);
+                    assert_eq!(back.unseen(), unseen);
                     assert_eq!(encode_state(&schema, &back), bytes);
                     assert_eq!(state_digest(&schema, &back), state_digest(&schema, &s));
                 }
@@ -363,9 +437,20 @@ fn a_state_that_is_not_canonical_or_not_reachable_is_refused_naming_its_field() 
         &MomentumState {
             glow,
             clock: Some(3),
+            unseen: 0,
         },
     );
     assert_eq!(state_fault(&schema, &good), None);
+    assert!(
+        matches!(
+            state_fault(&schema, &good[..good.len() - 1]),
+            Some(WireFault::Truncated {
+                field: "state.unseen",
+                ..
+            })
+        ),
+        "the unseen count is part of every state"
+    );
     assert_eq!(
         state_fault(&schema, &good[..40]),
         Some(WireFault::Truncated {
@@ -397,6 +482,7 @@ fn a_state_that_is_not_canonical_or_not_reachable_is_refused_naming_its_field() 
     let mut e = Enc::new();
     e.raw(&unreachable.encode());
     e.opt(None::<i128>, |e, c| e.offset(c));
+    e.u32(0);
     assert_eq!(
         state_fault(&schema, e.as_bytes()),
         Some(WireFault::NonCanonical { field: "rate_at" })
@@ -546,7 +632,7 @@ fn the_artifacts_name_their_kinds_and_bind_what_they_declare() {
     let schema = schema_artifact();
     assert_eq!(
         (schema.kind, schema.name.as_str(), schema.version),
-        (ArtifactKind::Schema, SCHEMA_NAME, 2)
+        (ArtifactKind::Schema, SCHEMA_NAME, 3)
     );
     assert_eq!(MomentumSchema::new(Instant::now()).id(), &schema);
     let contract = NoStrandedLight::artifact();

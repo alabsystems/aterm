@@ -16,7 +16,10 @@
 //! - aterm's log ([`held_lines`]): the line a proven contract 3 claim writes, with its versions and
 //!   scope, and the acts of the built-in engine's relaunch and upgrade lanes ([`builtin_acts`]);
 //! - `blocks --json` ([`blocks_of`]): each command the tab's shell ran, its exit, and the line
-//!   aterm's built-in relaunch lane typed.
+//!   aterm's built-in relaunch lane typed;
+//! - beside aterm, the stand-in's own start log ([`starts_of`]): each start's parent, so a start
+//!   after an intended end is the harness's relaunch only when the harness spawned it, never one
+//!   aterm's built-in lane typed at the shell.
 
 use crate::pyjson::J;
 use crate::screen::field;
@@ -79,6 +82,36 @@ pub(crate) fn frame_of(screen: &str) -> Option<Frame> {
         start: start.strip_prefix("start ")?.trim().parse().ok()?,
         composer,
     })
+}
+
+/// One start of the stand-in as its log (`$ATERM_LAB_STANDIN_LOG`) wrote it:
+/// `<us> start pid=<pid> ppid=<ppid> …`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Start {
+    pub pid: u32,
+    /// Its parent: the harness that spawned it, or the shell (or `exec` line) that ran it.
+    pub ppid: u32,
+}
+
+/// The stand-in's starts in its log, oldest first.
+#[must_use]
+pub(crate) fn starts_of(log: &str) -> Vec<Start> {
+    log.lines()
+        .filter(|l| l.split_whitespace().nth(1) == Some("start"))
+        .filter_map(|l| {
+            Some(Start {
+                pid: field(l, "pid")?.parse().ok()?,
+                ppid: field(l, "ppid")?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Whether harness `harness` started a child among `starts` (a start whose parent it is); an
+/// unread harness pid counts every start, so an unread pid never passes for a quiet harness.
+#[must_use]
+pub(crate) fn started_by(starts: &[Start], harness: Option<u32>) -> bool {
+    starts.iter().any(|s| harness.is_none_or(|h| s.ppid == h))
 }
 
 /// Whether the screen shows the stand-in saying it got `signal` (`standin: got SIGTERM`).
@@ -431,7 +464,8 @@ pub(crate) fn interrupted(before: &Frame, after: &After<'_>, said: bool) -> Vec<
 }
 
 /// EXIT PROPAGATION: the shell saw `want` for the harness's command (`exit`), the child said it got
-/// `signal` when one was sent, and nothing came back after (`relaunched`).
+/// `signal` when one was sent, and the harness started no child after it (`relaunched`,
+/// [`started_by`]).
 #[must_use]
 pub(crate) fn ended(
     what: &str,
@@ -451,7 +485,10 @@ pub(crate) fn ended(
             exit.map_or_else(|| "none".to_string(), |e| e.to_string())
         ),
     ));
-    checks.push(check(!relaunched, "nothing was relaunched after it"));
+    checks.push(check(
+        !relaunched,
+        "the harness relaunched nothing after it",
+    ));
     checks
 }
 

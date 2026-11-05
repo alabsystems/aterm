@@ -26,7 +26,7 @@ fn app_with(shown: usize, workers: usize) -> (App, Vec<u64>, Vec<u64>) {
     (app, tabs, parked)
 }
 
-fn person_tab(app: &mut App) -> u64 {
+pub(crate) fn person_tab(app: &mut App) -> u64 {
     let id = app.next_session_id;
     app.push_stub_tab(WID, stub_session(id));
     app.sync_window(WID);
@@ -40,6 +40,24 @@ fn land_worker(app: &mut App) -> u64 {
     app.install_tab_session_parked(WID, stub_session(id), parent);
     app.sync_window(WID);
     id
+}
+
+/// An app whose one window holds only its empty Workers list: the person's tab closed, then its
+/// last worker.
+#[cfg(unix)]
+pub(crate) fn app_with_a_lone_list() -> App {
+    let (mut app, tabs, workers) = app_with(1, 1);
+    assert!(app.close_session_tab_for_test(tabs[0]));
+    app.sync_window(WID);
+    assert!(app.close_session_tab_for_test(workers[0]));
+    app.sync_window(WID);
+    assert_eq!(
+        set(&app).len(),
+        1,
+        "PRECONDITION: the list stays with no worker"
+    );
+    assert_eq!(set(&app).home(), set(&app).active_id());
+    app
 }
 
 fn set(app: &App) -> &crate::tab_model::TabSet {
@@ -224,18 +242,22 @@ fn next_previous_and_the_number_keys_reach_only_what_the_strip_draws() {
     assert_eq!(active_session(&app), Some(tabs[0]));
 }
 
+/// KEEP AS TAB IS THE ONE WAY OUT, AND IT MAKES THE TAB A PERSON'S: the worker leaves the parked
+/// tabs with its mark, keeping the front. CONTROL: kept twice, or a person's own tab, nothing moves.
 #[test]
-fn move_to_tab_is_the_way_out_and_keeps_the_front() {
+fn keep_as_tab_is_the_way_out_and_keeps_the_front() {
     let (mut app, tabs, workers) = app_with(1, 2);
-    assert!(app.unpark_session(workers[0]));
+    assert!(app.session_is_ephemeral(workers[0]));
+    assert!(app.keep_as_tab(workers[0]));
     assert!(!app.session_is_parked(workers[0]));
+    assert!(!app.session_is_ephemeral(workers[0]), "a person's tab now");
     assert_eq!(active_session(&app), Some(tabs[0]));
     assert_eq!(set(&app).parked().len(), 1);
     assert!(set(&app).invariant_holds(&app.view_store));
-    assert!(!app.unpark_session(workers[0]), "already a tab");
-    assert!(!app.unpark_session(tabs[0]), "a person's tab has no way in");
+    assert!(!app.keep_as_tab(workers[0]), "already a tab");
+    assert!(!app.keep_as_tab(tabs[0]), "a person's tab has no way in");
 
-    assert!(app.unpark_session(workers[1]));
+    assert!(app.keep_as_tab(workers[1]));
     app.sync_window(WID);
     assert_eq!(set(&app).home(), None, "no worker is left for the list");
     assert_eq!(set(&app).len(), 3);
@@ -243,10 +265,10 @@ fn move_to_tab_is_the_way_out_and_keeps_the_front() {
 }
 
 #[test]
-fn a_worker_on_show_moved_to_a_tab_stays_on_show() {
+fn a_worker_on_show_kept_as_a_tab_stays_on_show() {
     let (mut app, _, workers) = app_with(1, 1);
     assert!(app.focus_session_preferring(Some(WID), workers[0]));
-    assert!(app.unpark_session(workers[0]));
+    assert!(app.keep_as_tab(workers[0]));
     app.sync_window(WID);
     assert_eq!(active_session(&app), Some(workers[0]));
     assert_eq!(set(&app).strip_active(), set(&app).active_index());
@@ -338,8 +360,8 @@ fn the_workers_chrome_line_gives_each_its_canonical_index() {
         line.starts_with("toolbar-workers first=2 selected=3 "),
         "{line}"
     );
-    app.unpark_session(workers[0]);
-    app.unpark_session(workers[1]);
+    app.keep_as_tab(workers[0]);
+    app.keep_as_tab(workers[1]);
     assert_eq!(app.workers_chrome_line(), None, "no parked tab, no line");
 }
 
@@ -466,10 +488,11 @@ fn press_control(app: &mut App, key: &str) {
 }
 
 #[test]
-fn a_rows_move_to_tab_button_unparks_it_and_the_rows_follow() {
+fn a_rows_keep_as_tab_button_keeps_it_and_the_rows_follow() {
     let (mut app, _, workers) = listing(2);
-    press_control(&mut app, &format!("workers/move/{}", workers[0]));
+    press_control(&mut app, &format!("workers/keep/{}", workers[0]));
     assert!(!app.session_is_parked(workers[0]));
+    assert!(!app.session_is_ephemeral(workers[0]));
     assert!(app.session_is_parked(workers[1]));
     assert_eq!(
         set(&app).active_id(),
@@ -482,6 +505,94 @@ fn a_rows_move_to_tab_button_unparks_it_and_the_rows_follow() {
     );
 }
 
+/// A REAPED WORKER'S ROW READS FINISHED UNTIL A PERSON DISMISSES OR CLEARS IT: the list stays
+/// while a Finished row does, even with no worker left parked, Dismiss takes its one row off the
+/// page and Clear Finished the rest, and the list goes with the last of them; what each left is
+/// still kept for its manager, a Workers tab's close dropping none of it either. CONTROL: a worker
+/// a person closed leaves no Finished row; a row's Read Result with no result to read is refused.
+#[test]
+fn finished_rows_stay_until_dismissed_or_cleared() {
+    let (mut app, _, workers) = listing(4);
+    assert!(app.close_session_tab_for_test(workers[3]));
+    for &worker in &workers[..3] {
+        mark(&app, worker, TaskState::Done);
+    }
+    let steps = app.reap_workers(std::time::Instant::now() + crate::worker_reaper::LINGER);
+    assert_eq!(steps.len(), 3, "{steps:?}");
+    assert_eq!(set(&app).parked().len(), 0);
+    assert!(
+        set(&app).home().is_some(),
+        "the list stays for its Finished rows"
+    );
+    let finished = |app: &App| {
+        rows(app)
+            .iter()
+            .filter(|row| row.finished)
+            .map(|row| row.session)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        finished(&app),
+        workers[..3],
+        "CONTROL: a person's close keeps no row"
+    );
+    assert!(
+        app.read_result(WID, workers[0]).is_err(),
+        "no result was left to read"
+    );
+
+    let kept = |app: &App| {
+        let store = app.store.read().unwrap_or_else(|p| p.into_inner());
+        workers[..3]
+            .iter()
+            .filter(|&&worker| store.retired_workers().by_local(worker).is_some())
+            .count()
+    };
+    press_control(&mut app, &format!("workers/dismiss/{}", workers[0]));
+    assert_eq!(finished(&app), workers[1..3]);
+    assert!(set(&app).home().is_some());
+    assert_eq!(
+        kept(&app),
+        3,
+        "Dismiss takes a row off the page, not its result"
+    );
+    press_control(&mut app, "workers/clear-finished");
+    assert_eq!(finished(&app), Vec::<u64>::new());
+    assert_eq!(set(&app).home(), None, "the list went with its last row");
+    assert_eq!(
+        kept(&app),
+        3,
+        "Clear Finished drops nothing its managers read"
+    );
+}
+
+/// CLOSING THE WORKERS TAB TAKES ITS FINISHED ROWS OFF ITS PAGE AND KEEPS WHAT THEY LEFT: a
+/// person's close of a list that shows only Finished rows ends the list, and each row still
+/// answers its manager. CONTROL: no row is listed any more, so no sync opens the list again.
+#[test]
+fn closing_the_workers_tab_keeps_what_its_finished_rows_left() {
+    let (mut app, _, workers) = listing(2);
+    for &worker in &workers {
+        mark(&app, worker, TaskState::Done);
+    }
+    let steps = app.reap_workers(std::time::Instant::now() + crate::worker_reaper::LINGER);
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    let at = home_index(&app).expect("the list stays for its Finished rows");
+    app.switch_tab_in(WID, at);
+    app.close_active_native_tab_keeping(WID, None)
+        .expect("a list of Finished rows alone closes");
+    app.sync_window(WID);
+    assert_eq!(set(&app).home(), None, "CONTROL: nothing opens it again");
+    let store = app.store.read().unwrap_or_else(|p| p.into_inner());
+    for &worker in &workers {
+        let row = store
+            .retired_workers()
+            .by_local(worker)
+            .expect("what it left is kept");
+        assert_eq!(row.window, None, "listed on no page");
+    }
+}
+
 #[test]
 fn a_rows_press_opens_its_worker_in_place() {
     let (mut app, _, workers) = listing(2);
@@ -491,7 +602,7 @@ fn a_rows_press_opens_its_worker_in_place() {
 }
 
 #[test]
-fn a_worker_has_move_to_tab_on_its_menu_and_a_persons_tab_does_not() {
+fn a_worker_has_keep_as_tab_on_its_menu_and_a_persons_tab_does_not() {
     use crate::session_chrome::{ConnVerb, TabMenuEntry};
     let (mut app, _, _) = app_with(1, 1);
     let offered = |entries: &[TabMenuEntry]| {
@@ -499,7 +610,7 @@ fn a_worker_has_move_to_tab_on_its_menu_and_a_persons_tab_does_not() {
             matches!(
                 entry,
                 TabMenuEntry::ConnectionAction {
-                    verb: ConnVerb::MoveToTab,
+                    verb: ConnVerb::KeepAsTab,
                     ..
                 }
             )
@@ -661,7 +772,7 @@ fn every_row_of_the_chips_menu_acts_on_the_worker_it_shows() {
 }
 
 #[test]
-fn moving_a_worker_out_refreshes_the_chip_while_the_list_is_behind() {
+fn keeping_a_worker_refreshes_the_chip_while_the_list_is_behind() {
     let (mut app, _, workers) = app_with(1, 2);
     mark(&app, workers[0], TaskState::Working);
     mark(&app, workers[1], TaskState::Done);
@@ -677,7 +788,7 @@ fn moving_a_worker_out_refreshes_the_chip_while_the_list_is_behind() {
     };
     assert!(home_presentation(&app).indicators.busy, "one is working");
 
-    assert!(app.unpark_session(workers[0]));
+    assert!(app.keep_as_tab(workers[0]));
     assert_eq!(
         app.native_runtime.workers_listed(instance),
         [workers[1]],
@@ -771,6 +882,163 @@ fn a_window_holding_only_an_empty_list_is_not_captured() {
     );
 }
 
+/// A handoff carries a lone list only for a target that rebuilds it, as the row the successor
+/// reads, and with the window's frame. A quit, whose next launch opens its own window, never does.
+#[test]
+#[cfg(unix)]
+fn a_handoff_carries_a_lone_list_only_for_a_target_that_rebuilds_it() {
+    let app = app_with_a_lone_list();
+    assert_eq!(app.capture_restore_manifest().windows.len(), 0, "a quit");
+    assert_eq!(
+        app.capture_handoff_layout().windows.len(),
+        0,
+        "a target with no desk1, whose emptiness tells the lane the desk holds no tab"
+    );
+    let carried = app.capture_handoff_layout_for(true);
+    assert_eq!(carried.windows.len(), 1, "a target that declares desk1");
+    let row = &carried.windows[0];
+    assert!(row.is_lone_workers_list(), "{row:?}");
+    assert_eq!(row.active_item, None, "the read-back's shape check holds");
+    assert!(!carried.is_empty());
+    let wire = carried.to_toml().expect("the row serializes");
+    assert_eq!(
+        crate::restore::RestoreManifest::from_toml(&wire).as_ref(),
+        Some(&carried)
+    );
+
+    let (with_a_tab, _, _) = app_with(1, 1);
+    let tabbed = with_a_tab.capture_handoff_layout_for(true);
+    assert!(
+        !tabbed.carries_lone_workers_list(),
+        "CONTROL: a list with a worker behind it is not lone"
+    );
+    assert_eq!(
+        (row.rows, row.cols),
+        (tabbed.windows[0].rows, tabbed.windows[0].cols),
+        "the row keeps the window's grid"
+    );
+}
+
+/// Allocation opens as its own tab rather than split a Workers list: a pane beside the list would
+/// go with its tab, which no capture can describe, and an empty list would still read as all its
+/// window holds. Beside a list with workers behind it, the list stays as it was.
+#[cfg(unix)]
+#[test]
+fn allocation_never_splits_a_workers_list() {
+    let mut app = app_with_a_lone_list();
+    app.frontmost_window = Some(WID);
+    app.open_allocation(true).expect("Allocation opens");
+    app.sync_window(WID);
+    assert_eq!(
+        set(&app).home(),
+        None,
+        "the empty list retires beside a tab"
+    );
+    assert_eq!(set(&app).shown_len(), 1);
+    let tab = set(&app).active().expect("Allocation's tab");
+    assert_eq!(tab.root.leaves().len(), 1, "Allocation alone");
+    let (instance, _) = app.active_native_view(WID).expect("a native tab");
+    assert_eq!(
+        app.native_runtime.app(instance).expect("its app").kind(),
+        crate::native_app::AppKind::Allocation
+    );
+
+    let (mut app, _, _) = app_with(1, 1);
+    app.frontmost_window = Some(WID);
+    app.bring_workers_list_front(WID);
+    assert!(app.workers_list_on_screen(WID), "PRECONDITION");
+    let home = set(&app).home().expect("PRECONDITION: a worker's list");
+    app.open_allocation(true).expect("Allocation opens");
+    app.sync_window(WID);
+    assert_eq!(
+        set(&app).home(),
+        Some(home),
+        "the list stands for its worker"
+    );
+    let list = set(&app)
+        .tabs()
+        .iter()
+        .find(|tab| tab.id == home)
+        .expect("the list");
+    assert_eq!(list.root.leaves().len(), 1, "with no pane beside it");
+}
+
+/// The desk's facts read the window, not the row: a list stands alone with no tab beside it and
+/// no worker behind it.
+#[test]
+#[cfg(target_os = "macos")]
+fn a_list_stands_alone_only_with_nothing_else_in_its_window() {
+    let alone = |app: &App| crate::app_workers::workers_list_stands_alone(&app.windows[&WID]);
+    assert!(alone(&app_with_a_lone_list()));
+    assert!(!alone(&App::headless_for_test()), "CONTROL: no list");
+    assert!(!alone(&app_with(1, 1).0), "CONTROL: a tab and a worker");
+    let (mut app, tabs, _) = app_with(1, 1);
+    assert!(app.close_session_tab_for_test(tabs[0]));
+    app.sync_window(WID);
+    assert_eq!(set(&app).shown_len(), 1, "PRECONDITION");
+    assert!(!alone(&app), "CONTROL: a worker behind the list");
+}
+
+/// What a lone list comes back as is a working list, and the next handoff carries it the same.
+#[test]
+#[cfg(unix)]
+fn a_lone_list_round_trips_a_handoff() {
+    let parent = app_with_a_lone_list();
+    let wire = parent
+        .capture_handoff_layout_for(true)
+        .to_toml()
+        .expect("the row serializes");
+    let mut layout =
+        crate::restore::RestoreManifest::from_toml(&wire).expect("the successor reads it");
+    let mut successor = App::headless_for_test();
+    successor.handoff_successor = true;
+    successor.restore_into_window(WID, layout.windows.remove(0));
+    assert_eq!(
+        successor.capture_handoff_layout_for(true),
+        parent.capture_handoff_layout_for(true),
+        "the next handoff carries the same row"
+    );
+    assert_eq!(
+        successor.capture_handoff_layout().windows.len(),
+        0,
+        "and a target with no desk1 is still handed nothing"
+    );
+    let home = set(&successor).home().expect("a list");
+    assert!(
+        !successor.workers_tab_holds(WID, home),
+        "the person may close it"
+    );
+    assert!(
+        set(&successor).tabs()[0].presentation.closable,
+        "and its tab says so"
+    );
+    successor
+        .open_workers_tab()
+        .expect("Agents > Workers finds it");
+    let tab = person_tab(&mut successor);
+    assert_eq!(
+        set(&successor).home(),
+        None,
+        "a person's tab retires the list"
+    );
+    assert_eq!(active_session(&successor), Some(tab));
+}
+
+/// A successor's lone list reaches the glass: its window paints, so the handoff's paint proof can
+/// go. A window whose tab set stood empty would present nothing.
+#[test]
+fn a_lone_list_reaches_the_glass() {
+    use crate::scripted_redraw_fixture::scripted_app;
+    let mut app = scripted_app();
+    let serial = |app: &App| app.windows[&WID].capture_present_serial;
+    let before = serial(&app);
+    app.restore_into_window(WID, crate::restore::WindowLayout::lone_workers_list(24, 80));
+    assert_eq!(set(&app).home(), set(&app).active_id());
+    app.redraw_window(WID);
+    assert!(serial(&app) > before, "the list presented");
+    assert!(app.windows[&WID].painted_for_handoff());
+}
+
 fn parked_record(app: &App) -> crate::restore::RestoredTab {
     let tab = set(app).parked().first().expect("a worker");
     app.tab_restore_descriptor(tab).expect("captured")
@@ -797,13 +1065,16 @@ fn a_parked_tab_captures_its_workers_record_and_a_persons_does_not() {
         !row.contains("age_ms"),
         "its ages would write every image anew: {row}"
     );
+    assert!(record.parked && record.ephemeral, "a worker's tab, marked");
     let shown = app
         .tab_restore_descriptor(&set(&app).tabs()[0])
         .expect("captured");
     assert_eq!(terminal_leaf(&shown).task, None);
+    assert!(!shown.parked && !shown.ephemeral, "CONTROL: a person's tab");
     let wrote = aterm_toml::to_string(&record).expect("written");
     let read: crate::restore::RestoredTab = aterm_toml::from_str(&wrote).expect("read");
     assert_eq!(terminal_leaf(&read).task, Some(row));
+    assert!(read.ephemeral);
 }
 
 #[test]
@@ -903,7 +1174,7 @@ fn two_windows_workers_pages_keep_their_own_actions_and_revisions() {
             instance1,
             view1,
             crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
-                id: crate::native_ui::ActionId::new(format!("workers/move/{worker1}")),
+                id: crate::native_ui::ActionId::new(format!("workers/keep/{worker1}")),
                 value: None,
             }),
         )
@@ -919,7 +1190,7 @@ fn two_windows_workers_pages_keep_their_own_actions_and_revisions() {
     app.drain_workers_actions(other, instance1);
     assert!(
         !app.session_is_parked(worker1),
-        "CONTROL: draining window 1 runs its queued MoveToTab"
+        "CONTROL: draining window 1 runs its queued Keep as Tab"
     );
 }
 
@@ -1041,4 +1312,50 @@ fn a_worker_whose_agent_has_gone_keeps_its_agents_name() {
         assert_ne!(title(running), "Claude Code");
     }
     assert_eq!(title(workers[3]), "release notes", "a pinned title wins");
+}
+
+/// A candidate that ends before its Commit adopted its predecessor's Finished rows and owns none
+/// of what they left: the predecessor still lists them and answers from the same result files, and
+/// nothing can write those again. CONTROL: past the Commit a quit drops the rows and the files.
+#[test]
+fn a_candidate_that_ends_before_its_commit_leaves_its_predecessors_results() {
+    let state = aterm_tempfile::tempdir().expect("tempdir");
+    crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+        let mut app = App::headless_for_test();
+        let sid = aterm_session::SessionId::new("s-c0de");
+        let dir = crate::task_record::tasks_dir().expect("a state directory");
+        std::fs::create_dir_all(&dir).expect("the tasks directory");
+        let result = dir.join(format!("{}-2.result.md", sid.as_str()));
+        std::fs::write(&result, b"what it left").expect("the result file");
+        let (record, _) =
+            TaskMark::new(TaskState::Done).apply(None, false, std::time::Instant::now(), 1_000);
+        let row = crate::retired_workers::Retired {
+            sid: sid.clone(),
+            local: None,
+            window: None,
+            title: "a worker".to_owned(),
+            last_words: None,
+            record,
+            closed_unix_ms: 1_000,
+        };
+        let kept = |app: &App| {
+            app.store
+                .read()
+                .unwrap()
+                .retired_workers()
+                .by_sid(&sid)
+                .is_some()
+        };
+        app.store.write().unwrap().retired_workers_mut().keep(row);
+
+        app.incoming_handoff_pending = true;
+        app.forget_retired_workers_at_quit();
+        assert!(kept(&app), "the row stays before the Commit");
+        assert!(result.exists(), "and what it left");
+
+        app.incoming_handoff_pending = false;
+        app.forget_retired_workers_at_quit();
+        assert!(!kept(&app), "a quit drops the row");
+        assert!(!result.exists(), "and what it left");
+    });
 }

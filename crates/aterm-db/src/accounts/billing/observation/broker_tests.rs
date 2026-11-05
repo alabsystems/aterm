@@ -6,7 +6,9 @@ use crate::accounts::broker::{self, Broker, Grant, Token};
 use crate::resources::{BoundRequest, Observation, RequestKey};
 use aterm_secrets::commons::bootstrap::Bootstrap;
 
-pub(super) fn setup() -> (Fixture, Broker, Token, Grant) {
+pub(crate) type World = (Fixture, Broker, Token, Grant);
+
+pub(super) fn setup() -> World {
     setup_on(1)
 }
 

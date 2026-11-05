@@ -23,8 +23,8 @@ pub const RESET_SETTLE_S: i64 = 60;
 /// A read lock older than this is a crashed reader's and is taken over.
 pub const LOCK_STALE_S: u64 = 90;
 
-/// After a failed read, how long the next one waits (unless forced): a home agy is not signed
-/// in to answers only after the read's whole budget, so it is not asked at every idle point.
+/// After a failed read, how long the next one waits (unless forced): a read that ran out its
+/// budget, or found agy asking for a sign-in, is not repeated at every idle point.
 pub const FAIL_BACKOFF_S: i64 = 5 * 60;
 
 /// History lines kept per home; past twice this, the oldest are dropped down to it.
@@ -156,6 +156,16 @@ pub fn machine_state() -> Option<PathBuf> {
     aterm_types::dirs::state_dir().map(|s| s.join("harness").join(super::cli::HARNESS))
 }
 
+pub(super) struct LaunchUse(());
+
+pub(super) struct WallUse(provider_read::Account);
+
+impl provider_read::WallDoor for WallUse {
+    fn account(self) -> provider_read::Account {
+        self.0
+    }
+}
+
 /// Where one home's readings live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Store {
@@ -171,6 +181,10 @@ impl Store {
             dir: state.join(DIR),
             key: key.to_owned(),
         }
+    }
+
+    pub(super) fn provider_account(&self) -> provider_read::Account {
+        provider_read::Account::in_home(provider_read::Read::AgyUsage, Path::new(&self.key), None)
     }
 
     /// The last reading's file.
@@ -355,7 +369,8 @@ impl Store {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt as _;
-                open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+                open.mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
             }
             open.open(&path).ok()
         };
@@ -514,23 +529,152 @@ pub fn burn(history: &[Sample], id: &str) -> Option<Burn> {
     Some(Burn { per_hour, empty_at })
 }
 
+/// The word every signed-out read failure carries: agy holds no usable Google grant for the
+/// read, so it would only ask for a sign-in a background read must never start.
+pub const SIGNED_OUT: &str = "signed-out";
+
+/// What agy prints ahead of its Google authorization URL when it holds no usable grant
+/// (`Authentication required. Please visit the URL to log in: …`, then `Waiting for
+/// authentication (timeout 60s)...`): a read stops the moment it appears.
+pub const SIGN_IN_PROMPT: &[u8] = b"Authentication required";
+
+/// Whether the read failure `why` says agy is signed out ([`SIGNED_OUT`]).
+#[must_use]
+pub fn is_signed_out(why: &str) -> bool {
+    why.contains(SIGNED_OUT)
+}
+
+/// The variables that give agy a credential other than its Google grant (an API key, Vertex AI,
+/// an Enterprise gateway, application default credentials): with one set, a missing grant file
+/// does not mean agy cannot answer.
+const OTHER_CREDENTIALS: [&str; 7] = [
+    super::witness::AGY_API_KEYS[0],
+    super::witness::AGY_API_KEYS[1],
+    super::witness::AGY_VERTEX,
+    super::witness::AGY_ENTERPRISE,
+    super::witness::AGY_GATEWAY_URL,
+    "AGY_ADC_AUTH",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+];
+
 /// Where a reading comes from: agy itself, or (in tests) a recorded document.
 pub trait Source {
-    /// One `agy -p /usage --output-format json`.
-    ///
-    /// # Errors
-    ///
-    /// The read failed; the text says why.
-    fn read(&self) -> Result<String, String>;
+    /// Why a read cannot be signed in, known without running agy ([`SIGNED_OUT`]); `None` when
+    /// nothing local says so.
+    fn signed_out(&self) -> Option<String> {
+        None
+    }
 
-    /// agy's default model id (`agy -p /model --output-format json`).
+    /// One `agy -p /usage --output-format json`, under the permit of this use of the home.
     ///
     /// # Errors
     ///
-    /// The read failed, or this source cannot say.
-    fn default_model(&self) -> Result<String, String> {
+    /// The read failed, or the permit is another home's; the text says why.
+    fn read(&self, permit: &provider_read::Permit) -> Result<String, String>;
+
+    /// agy's default model id (`agy -p /model --output-format json`), under the permit of this
+    /// use of the home, as [`Source::read`].
+    ///
+    /// # Errors
+    ///
+    /// The read failed, the permit is another home's, or this source cannot say.
+    fn default_model(&self, _permit: &provider_read::Permit) -> Result<String, String> {
         Err("this source names no default model".to_owned())
     }
+}
+
+/// One use's authority to ask agy about one home: the unspent token until agy is first asked,
+/// then the permit that first ask journaled. Every later ask in the same use (the `/model` read
+/// after its `/usage` read) goes through that permit and notes its own probe, so agy is asked
+/// only about the home in use and no ask goes unjournaled.
+pub struct Asking(Held);
+
+enum Held {
+    Token(provider_read::Use),
+    Begun(provider_read::Permit),
+    Spent,
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// Negative control, on this thread: a later ask in one use rides the first ask's probe,
+    /// noting none of its own.
+    pub(super) static UNNOTED_LATER_ASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl Asking {
+    /// The authority `use_token` carries, not yet spent.
+    #[must_use]
+    pub fn new(use_token: provider_read::Use) -> Self {
+        Self(Held::Token(use_token))
+    }
+
+    /// No authority: a use whose one ask is already spent (a wall read once), so agy is asked
+    /// nothing.
+    #[must_use]
+    pub fn spent() -> Self {
+        Self(Held::Spent)
+    }
+
+    /// Whether this authority may ask about `store`'s home.
+    fn permits(&self, store: &Store) -> bool {
+        match &self.0 {
+            Held::Token(token) => token.permits(&store.provider_account()),
+            Held::Begun(permit) => {
+                permit.matches(provider_read::Read::AgyUsage, Path::new(&store.key))
+            }
+            Held::Spent => false,
+        }
+    }
+
+    /// The permit for one ask of agy about `store`'s home at `now`, its probe noted before agy is
+    /// asked. Authority for another home is spent without a probe.
+    fn ask(&mut self, store: &Store, now: i64) -> Result<&provider_read::Permit, String> {
+        let permit = match std::mem::replace(&mut self.0, Held::Spent) {
+            Held::Token(token) => token
+                .begin(store.provider_account(), now, None)
+                .map_err(str::to_owned)?,
+            Held::Begun(permit) => {
+                if !permit.matches(provider_read::Read::AgyUsage, Path::new(&store.key)) {
+                    return Err("provider read token belongs to another agy home".into());
+                }
+                #[cfg(any(test, debug_assertions))]
+                let noted = !UNNOTED_LATER_ASK.get();
+                #[cfg(not(any(test, debug_assertions)))]
+                let noted = true;
+                if noted {
+                    permit.note_contact(now);
+                }
+                permit
+            }
+            Held::Spent => return Err("this use has no authority left to ask agy".into()),
+        };
+        self.0 = Held::Begun(permit);
+        match &self.0 {
+            Held::Begun(permit) => Ok(permit),
+            Held::Token(_) | Held::Spent => Err("this use has no authority left to ask agy".into()),
+        }
+    }
+}
+
+/// agy's default model for `store`'s home, asked under this use's authority with its probe
+/// noted. A home signed out here answers locally ([`Source::signed_out`]): agy is not run and
+/// nothing is noted.
+///
+/// # Errors
+///
+/// The home is signed out here, the use holds no authority for it, or the read failed.
+pub fn default_model(
+    store: &Store,
+    source: &dyn Source,
+    asking: &mut Asking,
+    now: i64,
+) -> Result<String, String> {
+    if let Some(why) = source.signed_out() {
+        return Err(why);
+    }
+    let permit = asking.ask(store, now)?;
+    source.default_model(permit)
 }
 
 /// agy on PATH, or a named program, under extra environment pairs and leading flags (the home a
@@ -544,27 +688,202 @@ pub struct Agy {
     pub flags: Vec<String>,
     /// How long one read may take.
     pub budget: std::time::Duration,
+    /// The `HOME` the read's agy inherits where `env` sets none: this process's own, which
+    /// [`super::align::capture_bounded`] passes to every child.
+    pub inherited_home: Option<String>,
+    /// The variables the person's environment sets but the read does not pass, names only and
+    /// never a value: the credential variables ([`OTHER_CREDENTIALS`],
+    /// [`crate::ai::connector::AGY`]'s `credential_env`), with one of which the person's agy
+    /// answers, and [`MOVED`], which takes the person's agy off the default home's config. With
+    /// one set, a missing grant file does not say the person's agy is signed out
+    /// ([`Agy::grant_file`]).
+    pub credentials_set: Vec<&'static str>,
+}
+
+/// The variable of the person's own environment, beside `HOME`, that places agy's credential,
+/// passed to the read's agy so the read and the local signed-out check ([`Agy::grant_file`])
+/// see one backend: `SSH_CONNECTION` selects agy's file backend. It holds no credential.
+const PLACEMENT: [&str; 1] = ["SSH_CONNECTION"];
+
+/// The variable that moves the person's agy onto another config than the default home's,
+/// kept by name ([`Agy::credentials_set`]) and never passed: the command's read, its store and
+/// its token are the default home's ([`launch_key`]), so a read of the config it names would be
+/// booked as the default home's reading (the window's footers and launch rotation read that
+/// one), and its grant placement is unmeasured, so it gives no local answer either.
+const MOVED: [&str; 1] = ["AGY_CLI_CONFIG_DIR"];
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of [`Agy::of_person`] ([`with_person_env_dropped`]).
+    static PERSON_ENV_DROPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f` with every [`Agy::of_person`] this thread builds blind to the environment it is given
+/// but its `HOME`, as the command's agy was once built (no file backend, so no local signed-out
+/// answer): the negative control of the tests that hold it to the person's environment.
+#[cfg(any(test, debug_assertions))]
+pub fn with_person_env_dropped<T>(f: impl FnOnce() -> T) -> T {
+    let was = PERSON_ENV_DROPPED.replace(true);
+    let got = f();
+    PERSON_ENV_DROPPED.set(was);
+    got
+}
+
+/// Whether this thread runs under [`with_person_env_dropped`].
+#[cfg(any(test, debug_assertions))]
+fn person_env_dropped() -> bool {
+    PERSON_ENV_DROPPED.get()
+}
+
+/// A release build has no negative control.
+#[cfg(not(any(test, debug_assertions)))]
+const fn person_env_dropped() -> bool {
+    false
 }
 
 impl Agy {
-    /// The `agy` on PATH under this process's own HOME.
+    /// The `agy` on PATH as the person's own environment `vars` (this process's, for `aterm
+    /// harness agy`) configures it: the variable that places its credential ([`PLACEMENT`])
+    /// passes to the read, `HOME` is the one it inherits ([`Agy::inherited_home`]; set as no pair,
+    /// so the read stays the default home's, which the command's store and token name,
+    /// [`launch_key`]), and of the credential variables only which are set is kept, never a
+    /// value. A name or value that is not UTF-8, or a blank value, counts as unset.
     #[must_use]
-    pub fn on_path() -> Self {
+    pub fn of_person(
+        vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    ) -> Self {
+        let dropped = person_env_dropped();
+        let mut env: Vec<(String, String)> = Vec::new();
+        let mut inherited_home = None;
+        let mut credentials_set: Vec<&'static str> = Vec::new();
+        for (name, value) in vars {
+            let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
+                continue;
+            };
+            if value.trim().is_empty() {
+                continue;
+            }
+            if name == super::upgrade_agy::HOME_ENV {
+                inherited_home = Some(value.to_owned());
+            } else if !dropped && PLACEMENT.contains(&name) {
+                env.retain(|(n, _)| n != name);
+                env.push((name.to_owned(), value.to_owned()));
+            } else if !dropped
+                && let Some(&credential) = OTHER_CREDENTIALS
+                    .iter()
+                    .chain(crate::ai::connector::AGY.credential_env)
+                    .chain(MOVED.iter())
+                    .find(|&&credential| credential == name)
+                && !credentials_set.contains(&credential)
+            {
+                credentials_set.push(credential);
+            }
+        }
         Self {
             program: "agy".into(),
-            env: Vec::new(),
+            env,
             flags: Vec::new(),
             budget: agy_quota::READ_BUDGET,
+            inherited_home,
+            credentials_set,
         }
     }
 
+    /// The value the read's agy sees for `name`: the last pair that sets it, else, for `HOME`,
+    /// the one it inherits ([`Agy::inherited_home`]); `None` when unset or blank.
+    fn var(&self, name: &str) -> Option<String> {
+        self.env
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+            .or_else(|| {
+                (name == super::upgrade_agy::HOME_ENV)
+                    .then(|| self.inherited_home.clone())
+                    .flatten()
+            })
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// The grant file this read's agy signs in with, where that file is the whole answer: agy's
+    /// native file backend (selected by `SSH_CONNECTION`, as `aterm harness agy login` and the
+    /// account workers it starts run it), its config placed by `HOME`, `--gemini_dir` and
+    /// `--app_data_dir`, and no other credential in the environment or set beside it
+    /// ([`Agy::credentials_set`]). `None` where agy keeps its grant in the OS keyring (no
+    /// `SSH_CONNECTION`), which nothing here may ask, or where its config cannot be placed
+    /// (`AGY_CLI_CONFIG_DIR`, whose grant placement is unmeasured).
+    #[must_use]
+    pub fn grant_file(&self) -> Option<PathBuf> {
+        self.var("SSH_CONNECTION")?;
+        if self.var("AGY_CLI_CONFIG_DIR").is_some()
+            || !self.credentials_set.is_empty()
+            || OTHER_CREDENTIALS
+                .iter()
+                .chain(crate::ai::connector::AGY.credential_env)
+                .any(|name| self.var(name).is_some())
+        {
+            return None;
+        }
+        let home = self.var(super::upgrade_agy::HOME_ENV);
+        let argv: Vec<String> = std::iter::once(super::upgrade_agy::PROGRAM.to_owned())
+            .chain(self.flags.iter().cloned())
+            .collect();
+        let config = super::upgrade_agy::config_dir_or(&argv, home.as_deref(), None)?;
+        Some(config.join(super::upgrade_agy::GRANT_FILE))
+    }
+
+    /// [`Self::run`] when `permit` is this home's: the one door to running this agy.
+    fn run_permitted(
+        &self,
+        permit: &provider_read::Permit,
+        args: &[&str],
+    ) -> Result<String, String> {
+        let home = self
+            .env
+            .iter()
+            .rev()
+            .find(|(n, _)| n == super::upgrade_agy::HOME_ENV)
+            .map(|(_, v)| v.as_str());
+        if !permit.matches(
+            provider_read::Read::AgyUsage,
+            Path::new(&launch_key(home, &self.flags)),
+        ) {
+            return Err("provider read token belongs to another agy home".into());
+        }
+        self.run(args)
+    }
+
     fn run(&self, args: &[&str]) -> Result<String, String> {
+        if let Some(why) = self.signed_out() {
+            return Err(why);
+        }
         let mut cmd = aterm_uds::spawnfd::Command::new(&self.program);
         cmd.args(&self.flags).args(args);
         for (n, v) in &self.env {
             cmd.env(n, v);
         }
-        let got = super::align::capture_bounded(cmd, self.budget, agy_quota::MAX_STDOUT)?;
+        let got = match super::align::capture_bounded_until(
+            cmd,
+            self.budget,
+            agy_quota::MAX_STDOUT,
+            SIGN_IN_PROMPT,
+        )? {
+            super::align::Ended::Exited(got) => got,
+            super::align::Ended::Stopped => {
+                return Err(if self.grant_file().is_some() {
+                    format!(
+                        "{SIGNED_OUT} (expired): agy asked for a Google sign-in although its grant \
+                         file is here, so the grant is expired or revoked; `aterm harness agy \
+                         login <account>` signs it in again"
+                    )
+                } else {
+                    format!(
+                        "{SIGNED_OUT}: agy asked for a Google sign-in (it holds no usable grant \
+                         here); `aterm harness agy login <account>` signs it in"
+                    )
+                });
+            }
+        };
         if !got.success() {
             return Err(format!(
                 "`agy {}` exited {}",
@@ -577,19 +896,57 @@ impl Agy {
     }
 }
 
+/// Whether `path` is a non-empty regular file this process can open: its metadata and an open,
+/// never its contents. A FIFO or a directory is no grant (and is never opened).
+pub(super) fn usable_grant(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .and_then(|f| f.metadata())
+            .is_ok_and(|m| m.is_file() && m.len() > 0)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+            && std::fs::File::open(path).is_ok()
+    }
+}
+
 impl Source for Agy {
-    fn read(&self) -> Result<String, String> {
-        self.run(&agy_quota::USAGE_ARGS)
+    fn signed_out(&self) -> Option<String> {
+        let path = self.grant_file()?;
+        (!usable_grant(&path)).then(|| {
+            let dir = path.parent().unwrap_or(&path).display();
+            format!(
+                "{SIGNED_OUT}: agy is signed out on this machine (no usable {} in {dir}); `aterm \
+                 harness agy login <account>` signs it in",
+                super::upgrade_agy::GRANT_FILE
+            )
+        })
     }
 
-    fn default_model(&self) -> Result<String, String> {
-        self.run(&agy_quota::MODEL_ARGS)
+    fn read(&self, permit: &provider_read::Permit) -> Result<String, String> {
+        self.run_permitted(permit, &agy_quota::USAGE_ARGS)
+    }
+
+    fn default_model(&self, permit: &provider_read::Permit) -> Result<String, String> {
+        self.run_permitted(permit, &agy_quota::MODEL_ARGS)
             .and_then(|doc| agy_quota::parse_model(&doc))
     }
 }
 
 /// How long a worker's launch waits on one agy read before it launches as asked.
+#[cfg(not(test))]
 pub const LAUNCH_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a worker's launch waits on one agy read before it launches as asked: the unit tests'
+/// stand-in agys exit on their own (most after printing their doc), so a run a loaded machine
+/// holds is waited for by the hang detector, not cut off before it ran.
+#[cfg(test)]
+pub const LAUNCH_READ_BUDGET: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// Where a [`current`] reading came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,23 +972,31 @@ impl Got {
 }
 
 /// The current reading for `store`: the kept one while fresh (unless `force`), else one read
-/// from `source` under the read lock and kept, reported as `why` ([`provider_read::note`]); a
-/// failed read falls back to the stale reading.
+/// from `source` under the read lock and kept, asking under `asking` and recording its probe; a
+/// failed read falls back to the stale reading. `asking` stays this use's authority for a later
+/// ask about the same home ([`default_model`]).
 ///
 /// # Errors
 ///
-/// No reading was kept and none could be made; the text says why.
+/// The token names another account, or no reading was kept and none could be made; the text says why.
 pub fn current(
     store: &Store,
     source: &dyn Source,
     now: i64,
     low: f64,
     force: bool,
-    why: provider_read::InUse,
+    asking: &mut Asking,
 ) -> Result<(Reading, Got), String> {
+    if !asking.permits(store) {
+        return Err("provider read token belongs to another account".into());
+    }
     let kept = store.last();
     if let Some(r) = kept.as_ref().filter(|r| !force && r.fresh(now, low)) {
         return Ok((r.clone(), Got::Kept));
+    }
+    // Known here without running agy, so neither journalled as a read nor backed off.
+    if let Some(why) = source.signed_out() {
+        return kept.map(|r| (r, Got::Stale)).ok_or(why);
     }
     if !force && let Some((_, why)) = store.recent_failure(now) {
         return kept
@@ -643,14 +1008,8 @@ pub fn current(
             "another reader is asking agy now, and nothing was kept yet".to_owned()
         });
     };
-    provider_read::note(&provider_read::ProbeEvent {
-        at: now,
-        read: provider_read::Read::AgyUsage,
-        account: None,
-        login: None,
-        why,
-    });
-    let read = source.read().and_then(|doc| {
+    let permit = asking.ask(store, now)?;
+    let read = source.read(permit).and_then(|doc| {
         agy_quota::parse(&doc).map(|quota| Reading {
             as_of: now,
             quota,
@@ -726,29 +1085,34 @@ pub fn rotate_launch_at(
         return None;
     }
     let kept = store.last();
-    let (reading, got) = if at_wall && store.wall_read_spent(kept.as_ref(), now) {
+    let (reading, got, mut asking) = if at_wall && store.wall_read_spent(kept.as_ref(), now) {
         let reading = kept?;
         let got = on_record(&reading, now, rotation.low);
-        (reading, got)
+        (reading, got, Asking::spent())
     } else {
         let force = store.recent_failure(now).is_none()
             && kept.as_ref().map_or(at_wall, |r| {
                 r.refill_crossed(now)
                     || (at_wall && now.saturating_sub(r.as_of) >= WALL_FORCE_FLOOR_S)
             });
-        let why = if at_wall {
-            provider_read::InUse::AtWall
+        let use_token = if at_wall {
+            provider_read::Use::wall_read_use(WallUse(store.provider_account()))
         } else {
-            provider_read::InUse::Launching
+            provider_read::Use::launch_read_use(
+                &mut provider_read::Launch::launch_use(LaunchUse(())),
+                store.provider_account(),
+            )?
         };
-        let current_res = current(store, source, now, rotation.low, force, why);
+        let mut asking = Asking::new(use_token);
+        let current_res = current(store, source, now, rotation.low, force, &mut asking);
         // A read that failed spent this wall's read too (even with nothing kept yet): it asked agy.
         let asked = matches!(current_res, Ok((_, Got::Read)))
             || store.recent_failure(now).is_some_and(|(at, _)| at == now);
         if at_wall && asked {
             store.note_wall_read(now);
         }
-        current_res.ok()?
+        let (reading, got) = current_res.ok()?;
+        (reading, got, asking)
     };
     // At a live quota wall, a stale reading past any recorded refill cannot justify restarting the
     // running session.
@@ -763,7 +1127,7 @@ pub fn rotate_launch_at(
                 .filter(|_| !(at_wall && got == Got::Read));
             let model = match kept {
                 Some(m) => m,
-                None => match source.default_model() {
+                None => match default_model(store, source, &mut asking, now) {
                     Ok(m) => {
                         store.keep_default(&m, now);
                         m
@@ -971,6 +1335,8 @@ fn worker_read(
         env: env.to_vec(),
         flags: flags.to_vec(),
         budget: LAUNCH_READ_BUDGET,
+        inherited_home: std::env::var(super::upgrade_agy::HOME_ENV).ok(),
+        credentials_set: Vec::new(),
     };
     let (rotation, _) =
         agy_quota::Rotation::from_path(aterm_types::dirs::aterm_config_path().as_deref());

@@ -4,7 +4,11 @@
 use super::*;
 use crate::control_input_ack::{InputMark, testing};
 use crate::input::{Delivery, EgressReceipt};
+use aterm_agent::harness::native_receipts::testing::{Append, Journal, State as Stored};
 use aterm_agent::harness::{accounts, cli::Env, codex_renewal as recovery};
+
+#[path = "native_resume_phase_tests.rs"]
+mod phase;
 
 struct World {
     _root: aterm_tempfile::TempDir,
@@ -17,6 +21,19 @@ struct World {
     original: Prepare,
     old: Binding,
     seal: renewal::Seal,
+}
+
+fn use_real_journal(world: &mut World) -> aterm_tempfile::TempDir {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let journal = Journal::new(home.path());
+    journal
+        .record(&world.original, &world.old, Append::Prepare)
+        .unwrap();
+    journal
+        .record(&world.original, &world.old, Append::NoExec)
+        .unwrap();
+    world.facts.native_journal = Some(journal);
+    home
 }
 
 fn auth(home: &std::path::Path) {
@@ -37,16 +54,19 @@ fn world(local: u64) -> World {
 }
 
 fn world_with_retirement(local: u64, retired: bool) -> World {
+    world_with_signal(local, retired, true)
+}
+
+fn world_with_signal(local: u64, retired: bool, signal: bool) -> World {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let mut env = Env::from_process().unwrap();
     env.home = Some(tmp.path().join("home"));
     env.state = tmp.path().join("harness");
     env.config = Some(tmp.path().join("aterm.toml"));
-    std::fs::write(
+    crate::test_scratch::write_config(
         env.config.as_ref().unwrap(),
         "[harness]\nhuman_grace_s=0\nlogins='renew'\n",
-    )
-    .unwrap();
+    );
     let old = tmp.path().join("auth-old");
     let new = tmp.path().join("auth-new");
     auth(&old);
@@ -116,7 +136,7 @@ fn world_with_retirement(local: u64, retired: bool) -> World {
         successor_pid: None,
         successor_birth: None,
         accepted_turn: None,
-        launch_attempted: true,
+        launch_attempted: signal,
         candidate: None,
         current_attempt: None,
         revoked: false,
@@ -159,15 +179,17 @@ fn world_with_retirement(local: u64, retired: bool) -> World {
         Request::prepare(original.clone()),
         actor.clone(),
     ));
-    assert_eq!(
-        run(
-            &handle.ctx,
-            &facts,
-            Request::Signal(old_binding.clone()),
-            actor.clone()
-        ),
-        "OK native-act state=signalled\n"
-    );
+    if signal {
+        assert_eq!(
+            run(
+                &handle.ctx,
+                &facts,
+                Request::Signal(old_binding.clone()),
+                actor.clone()
+            ),
+            "OK native-act state=signalled\n"
+        );
+    }
     // The unit kernel supplies the original authorized source; this injection
     // does not bypass any new dead-source admission or permit an actual effect.
     let operation = lookup(&handle.ctx, &old_binding).unwrap();
@@ -179,8 +201,10 @@ fn world_with_retirement(local: u64, retired: bool) -> World {
         home,
     );
     operation.lock().unwrap().authority.renewal = Some(seal.clone());
-    facts.processes.lock().unwrap().remove(&4242);
-    facts.foreground.store(400, Ordering::SeqCst);
+    if signal {
+        facts.processes.lock().unwrap().remove(&4242);
+        facts.foreground.store(400, Ordering::SeqCst);
+    }
     if retired {
         assert_eq!(
             run(
@@ -264,6 +288,15 @@ fn fresh_resume_only_admission_preserves_old_budget_and_never_resignals() {
     ));
     assert_ne!(binding.id, world.old.id);
     assert_ne!(binding.capability, world.old.capability);
+    {
+        let journal = world.facts.journal.lock().unwrap();
+        assert_eq!(journal[&world.old.id].successor.as_ref(), Some(&binding.id));
+        assert_eq!(
+            journal[&binding.id].predecessor.as_ref(),
+            Some(&world.old.id)
+        );
+        assert_eq!(journal[&world.old.id].state, JournalState::NoExec);
+    }
     assert_eq!(
         run(
             &world.handle.ctx,
@@ -336,6 +369,773 @@ fn fresh_resume_only_admission_preserves_old_budget_and_never_resignals() {
     );
     assert_eq!(reply, "OK native-act state=resumed phase=forward\n");
     assert_eq!(testing::byte(&mut world.reader), b'R');
+}
+
+#[test]
+fn swept_noexec_is_persisted_before_claim_and_failure_preserves_the_slot() {
+    let world = world(8027);
+    // A GUI sweep established the same positive closure, but no control worker
+    // has yet recorded its terminal fact. Disk still contains only Prepared.
+    world
+        .facts
+        .journal
+        .lock()
+        .unwrap()
+        .get_mut(&world.old.id)
+        .unwrap()
+        .state = JournalState::Prepared;
+    world.facts.receipt_history.lock().unwrap().clear();
+    let (root, attempt, request) = publish(&world, "cd");
+    renewal::stage_continuation(&world.handle.ctx, &root, &attempt, &world.facts).unwrap();
+    world.facts.receipt_allowed.store(false, Ordering::SeqCst);
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request.clone()),
+            world.actor.clone()
+        ),
+        UNKNOWN
+    );
+    assert!(
+        lookup(&world.handle.ctx, &world.old)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .closed_restart
+            .as_ref()
+            .unwrap()
+            .available()
+    );
+    assert!(
+        !world
+            .facts
+            .journal
+            .lock()
+            .unwrap()
+            .contains_key(&request.id)
+    );
+    world.facts.receipt_allowed.store(true, Ordering::SeqCst);
+    let binding = admitted_binding(&run(
+        &world.handle.ctx,
+        &world.facts,
+        Request::prepare(request),
+        world.actor.clone(),
+    ));
+    let journal = world.facts.journal.lock().unwrap();
+    assert_eq!(journal[&world.old.id].state, JournalState::NoExec);
+    assert_eq!(journal[&world.old.id].successor.as_ref(), Some(&binding.id));
+}
+
+#[test]
+fn predecessor_publication_holds_no_native_or_gui_mutex() {
+    let mut world = world(8028);
+    let (root, attempt, request) = publish(&world, "ce");
+    renewal::stage_continuation(&world.handle.ctx, &root, &attempt, &world.facts).unwrap();
+    let (entered, receiver) = mpsc::sync_channel(1);
+    let proceed = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    world.facts.receipt_gate = Some((entered, proceed.clone()));
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            run(
+                &world.handle.ctx,
+                &world.facts,
+                Request::prepare(request),
+                world.actor.clone(),
+            )
+        });
+        receiver.recv_timeout(PATIENCE).unwrap();
+        assert!(world.handle.ctx.meta.try_lock().is_ok());
+        assert!(world.handle.ctx.fenced_writes.native.try_lock().is_ok());
+        assert_eq!(
+            world
+                .handle
+                .ctx
+                .fenced_writes
+                .native
+                .lock()
+                .unwrap()
+                .receipt_flights
+                .get(&world.old.id),
+            Some(&1)
+        );
+        assert!(
+            lookup(&world.handle.ctx, &world.old)
+                .unwrap()
+                .try_lock()
+                .is_ok()
+        );
+        *proceed.0.lock().unwrap() = true;
+        proceed.1.notify_all();
+        admitted_binding(&worker.join().unwrap());
+    });
+}
+
+#[test]
+fn successor_claim_io_is_unlocked_and_failure_never_admits_a_child() {
+    let mut world = world(8029);
+    let (root, attempt, request) = publish(&world, "cf");
+    renewal::stage_continuation(&world.handle.ctx, &root, &attempt, &world.facts).unwrap();
+    let (entered, receiver) = mpsc::sync_channel(1);
+    let proceed = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    world.facts.prepare_journal_gate = Some((entered, proceed.clone()));
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            run(
+                &world.handle.ctx,
+                &world.facts,
+                Request::prepare(request.clone()),
+                world.actor.clone(),
+            )
+        });
+        receiver.recv_timeout(PATIENCE).unwrap();
+        assert!(world.handle.ctx.meta.try_lock().is_ok());
+        assert!(world.handle.ctx.fenced_writes.native.try_lock().is_ok());
+        {
+            let mut table = world.handle.ctx.fenced_writes.native.lock().unwrap();
+            assert_eq!(table.receipt_flights.get(&world.old.id), Some(&1));
+            assert_eq!(table.receipt_flights.get(&request.id), Some(&1));
+            let retired = table.reclaim(world.facts.clock.load(Ordering::SeqCst));
+            assert!(table.by_id.contains_key(&world.old.id));
+            drop(table);
+            drop(retired);
+        }
+        assert!(
+            lookup(&world.handle.ctx, &world.old)
+                .unwrap()
+                .try_lock()
+                .is_ok()
+        );
+        world
+            .facts
+            .prepare_journal_allowed
+            .store(false, Ordering::SeqCst);
+        *proceed.0.lock().unwrap() = true;
+        proceed.1.notify_all();
+        assert_eq!(worker.join().unwrap(), UNKNOWN);
+    });
+    assert!(
+        !world
+            .facts
+            .journal
+            .lock()
+            .unwrap()
+            .contains_key(&request.id)
+    );
+    assert!(
+        world.facts.journal.lock().unwrap()[&world.old.id]
+            .successor
+            .is_none()
+    );
+    assert_eq!(world.facts.signals.load(Ordering::SeqCst), 1);
+    assert_eq!(world.facts.grant_journal_calls.load(Ordering::SeqCst), 0);
+    let operation =
+        world.handle.ctx.fenced_writes.native.lock().unwrap().by_id[&request.id].clone();
+    let binding = operation.lock().unwrap().binding.clone();
+    assert_eq!(operation.lock().unwrap().phase, Phase::Queued);
+    assert!(operation.lock().unwrap().custody.is_none());
+    connection_closed_by(
+        &world.handle.ctx,
+        world.actor.connection.unwrap(),
+        &world.facts,
+    );
+    world.facts.prepare_journal_gate = None;
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request.clone()),
+            world.actor.clone()
+        ),
+        UNKNOWN
+    );
+    assert!(
+        !lookup(&world.handle.ctx, &world.old)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .closed_restart
+            .as_ref()
+            .unwrap()
+            .available()
+    );
+    world
+        .facts
+        .prepare_journal_allowed
+        .store(true, Ordering::SeqCst);
+    let reconnected = SupervisorInputCaller {
+        connection: Some(72),
+        ..world.actor.clone()
+    };
+    assert_eq!(
+        admitted_binding(&run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request),
+            reconnected
+        )),
+        binding,
+        "an exact retry confirms the already claimed candidate"
+    );
+}
+
+#[test]
+fn a_lost_successor_append_ack_retries_without_sealing_the_committed_child() {
+    let mut world = world(8115);
+    let _journal_home = use_real_journal(&mut world);
+    let (root, attempt, request) = publish(&world, "d1");
+    renewal::stage_continuation(&world.handle.ctx, &root, &attempt, &world.facts).unwrap();
+    world
+        .facts
+        .prepare_journal_ack
+        .store(false, Ordering::SeqCst);
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request.clone()),
+            world.actor.clone()
+        ),
+        UNKNOWN
+    );
+    let binding = world.facts.journal.lock().unwrap()[&request.id]
+        .binding
+        .clone();
+    assert_eq!(
+        world.facts.journal.lock().unwrap()[&request.id].state,
+        JournalState::Prepared
+    );
+    assert!(world.facts.sealed_history.lock().unwrap().is_empty());
+    assert_eq!(
+        world
+            .facts
+            .native_journal
+            .as_ref()
+            .unwrap()
+            .state(&binding)
+            .unwrap(),
+        Some(Stored::Prepared)
+    );
+    let operation = lookup(&world.handle.ctx, &binding).unwrap();
+    assert_eq!(operation.lock().unwrap().phase, Phase::Queued);
+    assert!(operation.lock().unwrap().custody.is_none());
+    connection_closed_by(
+        &world.handle.ctx,
+        world.actor.connection.unwrap(),
+        &world.facts,
+    );
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::Reconcile(binding.clone()),
+            world.actor.clone()
+        ),
+        UNKNOWN
+    );
+    world
+        .facts
+        .prepare_journal_ack
+        .store(true, Ordering::SeqCst);
+    let reconnected = SupervisorInputCaller {
+        connection: Some(72),
+        ..world.actor.clone()
+    };
+    assert_eq!(
+        admitted_binding(&run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request),
+            reconnected
+        )),
+        binding
+    );
+    assert_eq!(
+        world
+            .facts
+            .prepared_history
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, b)| b == &binding)
+            .count(),
+        1
+    );
+    assert_eq!(world.facts.signals.load(Ordering::SeqCst), 1);
+    assert_eq!(world.facts.grant_journal_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn an_expired_successor_can_repair_its_append_but_cannot_gain_admission() {
+    let mut world = world(8116);
+    let _journal_home = use_real_journal(&mut world);
+    let (root, attempt, request) = publish(&world, "d2");
+    renewal::stage_continuation(&world.handle.ctx, &root, &attempt, &world.facts).unwrap();
+    world
+        .facts
+        .prepare_journal_ack
+        .store(false, Ordering::SeqCst);
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request.clone()),
+            world.actor.clone()
+        ),
+        UNKNOWN
+    );
+    world
+        .facts
+        .prepare_journal_ack
+        .store(true, Ordering::SeqCst);
+    world
+        .facts
+        .clock
+        .store(request.deadline_us + 1, Ordering::SeqCst);
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request.clone()),
+            world.actor.clone()
+        ),
+        NOEXEC
+    );
+    let journal = world.facts.journal.lock().unwrap();
+    assert_eq!(journal[&request.id].state, JournalState::NoExec);
+    assert_eq!(
+        world
+            .facts
+            .native_journal
+            .as_ref()
+            .unwrap()
+            .state(&journal[&request.id].binding)
+            .unwrap(),
+        Some(Stored::NoExec)
+    );
+    assert_eq!(journal[&world.old.id].successor.as_ref(), Some(&request.id));
+    assert_eq!(world.facts.signals.load(Ordering::SeqCst), 1);
+    assert_eq!(world.facts.grant_journal_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_writer_panic_after_commit_releases_custody_and_preserves_retry() {
+    let mut world = world(8117);
+    let _journal_home = use_real_journal(&mut world);
+    let (root, attempt, request) = publish(&world, "d3");
+    renewal::stage_continuation(&world.handle.ctx, &root, &attempt, &world.facts).unwrap();
+    world
+        .facts
+        .prepare_journal_panic
+        .store(true, Ordering::SeqCst);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request.clone()),
+            world.actor.clone()
+        )))
+        .is_err()
+    );
+    let operation =
+        world.handle.ctx.fenced_writes.native.lock().unwrap().by_id[&request.id].clone();
+    let binding = operation.lock().unwrap().binding.clone();
+    assert_eq!(operation.lock().unwrap().phase, Phase::Queued);
+    assert!(operation.lock().unwrap().custody.is_none());
+    assert_eq!(
+        world
+            .facts
+            .native_journal
+            .as_ref()
+            .unwrap()
+            .state(&binding)
+            .unwrap(),
+        Some(Stored::Prepared)
+    );
+    world
+        .facts
+        .prepare_journal_panic
+        .store(false, Ordering::SeqCst);
+    assert_eq!(
+        admitted_binding(&run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request),
+            world.actor.clone()
+        )),
+        binding
+    );
+}
+
+#[test]
+fn an_abandoned_successor_waits_for_its_cohort_instead_of_sealing_opaque() {
+    let mut world = world(8118);
+    let _journal_home = use_real_journal(&mut world);
+    let (root, attempt, request) = publish(&world, "d4");
+    renewal::stage_continuation(&world.handle.ctx, &root, &attempt, &world.facts).unwrap();
+    world
+        .facts
+        .prepare_journal_ack
+        .store(false, Ordering::SeqCst);
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request.clone()),
+            world.actor.clone()
+        ),
+        UNKNOWN
+    );
+    let binding = world.facts.journal.lock().unwrap()[&request.id]
+        .binding
+        .clone();
+    world
+        .facts
+        .prepare_journal_ack
+        .store(true, Ordering::SeqCst);
+    world
+        .facts
+        .clock
+        .store(request.deadline_us + 1, Ordering::SeqCst);
+    world
+        .facts
+        .processes
+        .lock()
+        .unwrap()
+        .insert(911, process(911, 1, 4242, 400, 9));
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::Reconcile(binding.clone()),
+            world.actor.clone()
+        ),
+        UNKNOWN
+    );
+    assert_eq!(
+        world
+            .facts
+            .native_journal
+            .as_ref()
+            .unwrap()
+            .state(&binding)
+            .unwrap(),
+        Some(Stored::Prepared)
+    );
+    let operation = lookup(&world.handle.ctx, &binding).unwrap();
+    assert_eq!(operation.lock().unwrap().phase, Phase::Queued);
+    assert!(operation.lock().unwrap().custody.is_none());
+    world.facts.processes.lock().unwrap().remove(&911);
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::Reconcile(binding.clone()),
+            world.actor.clone()
+        ),
+        NOEXEC
+    );
+    assert_eq!(
+        world
+            .facts
+            .native_journal
+            .as_ref()
+            .unwrap()
+            .state(&binding)
+            .unwrap(),
+        Some(Stored::NoExec)
+    );
+}
+
+#[test]
+fn a_first_leg_root_retires_only_after_positive_native_no_start() {
+    let world = world_with_signal(8121, false, false);
+    assert!(!renewal::fixture_retire_unstarted(
+        &world.handle.ctx,
+        &world.env,
+        &world.root
+    ));
+    assert_eq!(
+        recovery::read_receipt(&world.env, &world.root.id).unwrap(),
+        world.root
+    );
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::Abort(world.old.clone()),
+            world.actor.clone()
+        ),
+        ROLLBACK_SAFE
+    );
+    assert!(renewal::fixture_retire_unstarted(
+        &world.handle.ctx,
+        &world.env,
+        &world.root
+    ));
+    let retired = recovery::read_receipt(&world.env, &world.root.id).unwrap();
+    assert_eq!(retired.phase, recovery::Phase::Retired);
+    assert!(!retired.launch_attempted);
+    assert!(
+        !renewal::fixture_retire_unstarted(&world.handle.ctx, &world.env, &world.root),
+        "old root cannot replace a changed record"
+    );
+}
+
+#[test]
+fn a_retry_captures_connection_loss_during_publication() {
+    let mut world = world(8122);
+    let (root, attempt, request) = publish(&world, "d5");
+    renewal::stage_continuation(&world.handle.ctx, &root, &attempt, &world.facts).unwrap();
+    world
+        .facts
+        .prepare_journal_allowed
+        .store(false, Ordering::SeqCst);
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request.clone()),
+            world.actor.clone()
+        ),
+        UNKNOWN
+    );
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request.clone()),
+            SupervisorInputCaller {
+                connection: None,
+                ..world.actor.clone()
+            }
+        ),
+        DENIED
+    );
+    world
+        .facts
+        .prepare_journal_allowed
+        .store(true, Ordering::SeqCst);
+    let (entered, receiver) = mpsc::sync_channel(1);
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    world.facts.prepare_journal_gate = Some((entered, Arc::clone(&gate)));
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            run(
+                &world.handle.ctx,
+                &world.facts,
+                Request::prepare(request.clone()),
+                SupervisorInputCaller {
+                    connection: Some(72),
+                    ..world.actor.clone()
+                },
+            )
+        });
+        receiver.recv_timeout(PATIENCE).unwrap();
+        assert!(
+            world
+                .handle
+                .ctx
+                .fenced_writes
+                .native
+                .lock()
+                .unwrap()
+                .coordinated_connections
+                .contains(&72)
+        );
+        connection_closed_by(&world.handle.ctx, 72, &world.facts);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert_eq!(worker.join().unwrap(), NOEXEC);
+    });
+    assert_eq!(world.facts.grant_journal_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn cancellation_keeps_settling_an_unacknowledged_native_journal() {
+    let mut world = world(8123);
+    let _journal_home = use_real_journal(&mut world);
+    let (root, attempt, request) = publish(&world, "d6");
+    renewal::stage_continuation(&world.handle.ctx, &root, &attempt, &world.facts).unwrap();
+    world
+        .facts
+        .prepare_journal_ack
+        .store(false, Ordering::SeqCst);
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request.clone()),
+            world.actor.clone()
+        ),
+        UNKNOWN
+    );
+    let binding = world.facts.journal.lock().unwrap()[&request.id]
+        .binding
+        .clone();
+    world.seal.cancel(recovery::CancellationKind::OwnerStop);
+    assert!(!renewal::fixture_settle_terminal_native(
+        &world.handle.ctx,
+        &world.seal,
+        &world.facts
+    ));
+    assert_eq!(
+        world
+            .facts
+            .native_journal
+            .as_ref()
+            .unwrap()
+            .state(&binding)
+            .unwrap(),
+        Some(Stored::Prepared)
+    );
+    world
+        .facts
+        .prepare_journal_ack
+        .store(true, Ordering::SeqCst);
+    assert!(renewal::fixture_settle_terminal_native(
+        &world.handle.ctx,
+        &world.seal,
+        &world.facts
+    ));
+    assert_eq!(
+        world
+            .facts
+            .native_journal
+            .as_ref()
+            .unwrap()
+            .state(&binding)
+            .unwrap(),
+        Some(Stored::NoExec)
+    );
+    assert_eq!(
+        lookup(&world.handle.ctx, &binding)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .phase,
+        Phase::Completed(Decision::Retired(Retirement::NotGranted))
+    );
+    assert_eq!(world.facts.grant_journal_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_reconcile_disconnect_does_not_cancel_a_valid_preparation() {
+    use std::os::fd::AsRawFd;
+
+    let (handle, facts, prepare, actor) = super::closed_restart::fixture(8124);
+    facts.prepare_journal_ack.store(false, Ordering::SeqCst);
+    assert_eq!(
+        run(
+            &handle.ctx,
+            &facts,
+            Request::prepare(prepare.clone()),
+            actor.clone()
+        ),
+        UNKNOWN
+    );
+    let operation = handle.ctx.fenced_writes.native.lock().unwrap().by_id[&prepare.id].clone();
+    let binding = operation.lock().unwrap().binding.clone();
+    facts.prepare_journal_ack.store(true, Ordering::SeqCst);
+    let (client, server) = aterm_uds::CtlStream::pair().unwrap();
+    drop(client);
+    aterm_spec::wait::until_peer_closed(&server);
+    {
+        let _serving = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+        assert!(aterm_control::hangup::caller_hung_up());
+        assert_eq!(
+            run(
+                &handle.ctx,
+                &facts,
+                Request::Reconcile(binding.clone()),
+                actor.clone()
+            ),
+            UNKNOWN
+        );
+    }
+    assert_eq!(operation.lock().unwrap().phase, Phase::Queued);
+    assert_eq!(
+        admitted_binding(&run(&handle.ctx, &facts, Request::prepare(prepare), actor)),
+        binding
+    );
+}
+
+#[test]
+fn cancellation_waits_for_reserved_but_unpublished_preparation() {
+    let world = world(8125);
+    let (root, attempt, request) = publish(&world, "d7");
+    renewal::stage_continuation(&world.handle.ctx, &root, &attempt, &world.facts).unwrap();
+    let slot = PrepareSlot::reserve(
+        &world.handle.ctx,
+        &request.id,
+        world.facts.clock.load(Ordering::SeqCst),
+        false,
+    )
+    .unwrap();
+    world.seal.cancel(recovery::CancellationKind::OwnerStop);
+    assert!(!renewal::fixture_settle_terminal_native(
+        &world.handle.ctx,
+        &world.seal,
+        &world.facts
+    ));
+    assert!(
+        world
+            .handle
+            .ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .renewal_seals
+            .contains_key(&request.id)
+    );
+    drop(slot);
+    assert!(renewal::fixture_settle_terminal_native(
+        &world.handle.ctx,
+        &world.seal,
+        &world.facts
+    ));
+}
+
+#[test]
+fn a_staged_candidate_id_does_not_authorize_predecessor_publication() {
+    let world = world(8030);
+    let (root, attempt, request) = publish(&world, "d0");
+    renewal::stage_continuation(&world.handle.ctx, &root, &attempt, &world.facts).unwrap();
+    // If an unauthorized request reached the receipt writer, it would observe
+    // this failure as Unknown instead of being rejected before I/O.
+    world.facts.receipt_allowed.store(false, Ordering::SeqCst);
+    let unauthorized = SupervisorInputCaller {
+        principal: Principal::Instance,
+        ..world.actor.clone()
+    };
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::prepare(request.clone()),
+            unauthorized
+        ),
+        DENIED
+    );
+    assert!(
+        !world
+            .facts
+            .journal
+            .lock()
+            .unwrap()
+            .contains_key(&request.id)
+    );
+    assert!(
+        lookup(&world.handle.ctx, &world.old)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .closed_restart
+            .as_ref()
+            .unwrap()
+            .available()
+    );
 }
 
 #[test]
@@ -818,6 +1618,13 @@ fn cancelled_service_releases_staged_seals_and_history_watch_pins() {
         crate::app_overview::stop_worker_in(-1, &world.handle.ctx, aterm_slog::Actor::Human),
         Ok("recovery cancelled".into())
     );
+    // Stop uses the production journal, while this fixture's native operations
+    // were issued by Facts. Complete the same cleanup with their owning kernel.
+    assert!(renewal::fixture_observe_terminal(
+        &world.handle.ctx,
+        &world.root.id,
+        &world.facts
+    ));
     assert!(
         world
             .handle

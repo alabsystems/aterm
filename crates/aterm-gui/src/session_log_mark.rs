@@ -112,7 +112,7 @@ const fn reserved_burst(by: &Actor) -> Option<usize> {
         Actor::Bridge => Some(1),
         Actor::Ctl => Some(2),
         Actor::Human => Some(3),
-        Actor::Aterm | Actor::Vendor | Actor::Sid(_) | Actor::Nobody => None,
+        Actor::Aterm | Actor::Vendor | Actor::Sid(_) | Actor::Fleet(_) | Actor::Nobody => None,
     }
 }
 

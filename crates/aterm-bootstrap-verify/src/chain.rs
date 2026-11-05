@@ -42,16 +42,24 @@ fn canonical_key(key: &str) -> Option<Vec<u8>> {
 }
 
 /// Whether `signature` is `key`'s Ed25519 signature over `data`: a canonical 32-byte key,
-/// a 64-byte signature, and ring's verification (the updater's).
+/// a 64-byte signature, and ring's verification. The updater verifies with astream's strict
+/// check, which also refuses a small-order key; the keys here are the pinned master's and the
+/// machines its signed roster names.
 #[must_use]
 pub fn verify_ed25519(key: &str, data: &[u8], signature: &[u8]) -> bool {
     let Some(raw) = canonical_key(key) else {
         return false;
     };
-    signature.len() == 64
-        && UnparsedPublicKey::new(&ED25519, raw)
-            .verify(data, signature)
-            .is_ok()
+    if signature.len() != 64 {
+        return false;
+    }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "install.sh pins this static verifier's SHA-256, so it keeps its dependency set; \
+                  its keys are the pinned master's and those the master's roster names"
+    )]
+    let key = UnparsedPublicKey::new(&ED25519, raw);
+    key.verify(data, signature).is_ok()
 }
 
 /// The Unix second a roster's `valid_until` or a machine's `not_after` names, an exclusive

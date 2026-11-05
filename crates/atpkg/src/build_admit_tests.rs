@@ -29,6 +29,10 @@ mod host_table;
 mod host_service;
 
 #[cfg(target_os = "macos")]
+#[path = "build_admit_epoch_tests.rs"]
+mod host_epochs;
+
+#[cfg(target_os = "macos")]
 #[path = "build_admit_terminal_tests.rs"]
 mod terminal;
 
@@ -1070,15 +1074,19 @@ fn a_front_ends_what_its_signalled_build_left_running() {
 /// tree is actually drained: with the escalation grace far away the front, its claim still
 /// in the ledger, waits while the deaf `cat` lives and ends once the cat is killed; with a
 /// short grace the front kills the cat itself before the claim ends, though the cat's stdin
-/// (this test's pipe) is still open, so nothing else could have ended it. NEGATIVE CONTROL
-/// (the source this test was written against first, where the claim ended once
-/// [`super::TREE_ENDS_WITHIN`] passed, whatever still ran): the short-grace front never
-/// killed the cat, and this test failed with the front not yet ended at its hang detector.
+/// (this test's pipe) is still open, so nothing else could have ended it. The front is signalled
+/// only once the cat's shell said its trap stands. NEGATIVE CONTROLS (the source this test was
+/// written against first, where the claim ended once [`super::TREE_ENDS_WITHIN`] passed, whatever
+/// still ran): the short-grace front never killed the cat, and this test failed with the front not
+/// yet ended at its hang detector; the front signalled once the pids are said, the subshell 0.3 s
+/// late to its trap, and the cat dies with its root (as `verify --all` saw at load 44).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_front_holds_its_claim_until_a_deaf_leftover_is_drained() {
     use std::os::unix::process::ExitStatusExt as _;
-    const DEAF: &str = "exec 3<&0; (trap '' TERM; exec cat <&3) & \
+    // The leftover says it is deaf once its trap stands: a TERM forwarded before that (a loaded
+    // host can run the subshell late) ends it as any process, and the test would read no leftover.
+    const DEAF: &str = "exec 3<&0; (trap '' TERM; echo ATPKG_DEAF; exec cat <&3) & \
                         echo \"ATPKG_CHILD $!\"; echo \"ATPKG_ROOT $$\"; wait";
     let alive = |pid: i32| {
         // SAFETY: `kill` with signal 0 sends nothing: it asks whether `pid` still exists.
@@ -1112,7 +1120,7 @@ fn a_front_holds_its_claim_until_a_deaf_leftover_is_drained() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut lines = std::io::BufReader::new(out).lines();
-            let (mut child, mut root) = (None, None);
+            let (mut child, mut root, mut deaf) = (None, None, false);
             for line in lines.by_ref() {
                 let Ok(line) = line else { break };
                 for (mark, slot) in [("ATPKG_CHILD ", &mut child), ("ATPKG_ROOT ", &mut root)] {
@@ -1120,7 +1128,8 @@ fn a_front_holds_its_claim_until_a_deaf_leftover_is_drained() {
                         *slot = line[at + mark.len()..].trim().parse::<i32>().ok();
                     }
                 }
-                if let (Some(child), Some(root)) = (child, root) {
+                deaf |= line.contains("ATPKG_DEAF");
+                if let (Some(child), Some(root), true) = (child, root, deaf) {
                     let _ = tx.send(Some((child, root)));
                     lines.for_each(drop);
                     return;

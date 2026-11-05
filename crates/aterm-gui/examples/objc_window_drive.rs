@@ -57,6 +57,9 @@ mod macos {
     const NS_EVENT_TYPE_KEY_UP: usize = 11;
     const NS_EVENT_MODIFIER_FLAG_COMMAND: usize = 1 << 20;
 
+    /// `NSAlertFirstButtonReturn`, what `-runModal` answers for a click on the first button.
+    const NS_ALERT_FIRST_BUTTON_RETURN: isize = 1000;
+
     /// # Safety
     /// `delegate` and `info` must be live Objective-C objects matching `-draggingEntered:`.
     unsafe fn dragging_entered(delegate: Id, info: Id) -> usize {
@@ -104,6 +107,36 @@ mod macos {
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             aterm_objc::ns_string_to_rust(f(window, sel!(title)))
+        }
+    }
+
+    /// # Safety
+    /// `obj` must be a live object.
+    unsafe fn class_name_of(obj: Id) -> String {
+        // SAFETY: `-className` is `@16@0:8` on every `NSObject` and answers its class's name (a
+        // KVO subclass answers the class it was made from).
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            aterm_objc::ns_string_to_rust(f(obj, sel!(className)))
+        }
+    }
+
+    /// Every window in `-[NSApp windows]`, in its order: its address and its class name.
+    fn app_windows() -> Vec<(usize, String)> {
+        // SAFETY: `+sharedApplication` and `-windows` are `@16@0:8` (+0), `-count` is
+        // `Q16@0:8` and `-objectAtIndex:` is `@24@0:8Q16` (+0) on the live array.
+        unsafe {
+            let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            let count: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
+            let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = checked_msg();
+            let app = get(class(c"NSApplication").as_id(), sel!(sharedApplication));
+            let windows = get(app, sel!(windows));
+            (0..count(windows, sel!(count)))
+                .map(|i| {
+                    let window = at(windows, sel!(objectAtIndex:), i);
+                    (window.addr(), class_name_of(window))
+                })
+                .collect()
         }
     }
 
@@ -409,6 +442,17 @@ mod macos {
         /// Key-up events that came back through the swizzled `-sendEvent:`.
         key_ups: usize,
         posted_cmd_key_up: bool,
+        /// What a click on the stage-16 alert's button made `-runModal` answer.
+        alert_answer: Option<isize>,
+        /// The windows in `-[NSApp windows]` when the loop was told to exit, by class name.
+        windows_at_exit: Vec<String>,
+        /// The answered alert's own panel was one of [`Self::windows_at_exit`], by identity.
+        alert_panel_listed: bool,
+        /// Each window that posted `NSWindowWillCloseNotification` once the loop was told to
+        /// exit, by class name.
+        closed_at_exit: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        /// The observer recording [`Self::closed_at_exit`], removed after the pump.
+        exit_close_observer: Option<Obj>,
         done: bool,
         stage: usize,
     }
@@ -534,6 +578,7 @@ mod macos {
                             self.proxy_events
                         ),
                     );
+                    self.stage_alert_answered_in_the_exit_turn();
                     self.done = true;
                     el.exit();
                 }
@@ -1282,6 +1327,209 @@ mod macos {
             self.report
                 .note("posted a Cmd-modified keyUp to [NSApp sendEvent:]; checked after the pump");
         }
+
+        /// A real `NSAlert` answered by a click in the turn that then exits the loop, as a Quit
+        /// confirmation is: the exit (`crates/aterm-window`'s `notify_windows_of_exit`) must close
+        /// only winit's own windows. The answered alert's panel (and, on macOS 27, its
+        /// `_NSGlassEffectWindow` child) is still in `-[NSApp windows]` until this turn's pool
+        /// pops; closing that child freed it under the panel's frame view, and the pool's
+        /// release of the frame view then crashed (aterm 0.110.0 on macOS 27.2). No inner pool
+        /// here: the alert must go the way the confirmation's does, into the turn's own.
+        fn stage_alert_answered_in_the_exit_turn(&mut self) {
+            println!(
+                "\n[16] an NSAlert answered in the exit turn — winit's event_loop.rs exit close"
+            );
+            let (Some(message), Some(quit), Some(mode)) = (
+                ns_string("Quit objc-window-drive?"),
+                ns_string("Quit"),
+                ns_string("NSModalPanelRunLoopMode"),
+            ) else {
+                self.report
+                    .check(false, "Foundation accepts the alert's strings");
+                return;
+            };
+            // SAFETY: `+new` is `@16#0:8` and answers a +1 `NSAlert`; `-setMessageText:` is
+            // `v24@0:8@16` and copies; `-addButtonWithTitle:` is `@24@0:8@16` and answers the
+            // alert's +0 button, retained here.
+            let made = unsafe {
+                let new: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+                let set: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+                let add: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
+                Obj::from_owned(new(class(c"NSAlert").as_id(), sel!(new))).and_then(|alert| {
+                    set(alert.id(), sel!(setMessageText:), message.id());
+                    let button =
+                        Obj::retain(add(alert.id(), sel!(addButtonWithTitle:), quit.id()))?;
+                    Some((alert, button))
+                })
+            };
+            let Some((alert, button)) = made else {
+                self.report
+                    .check(false, "AppKit makes an NSAlert with a Quit button");
+                return;
+            };
+            // Weak, so the check cannot keep the panel alive and listed by itself.
+            // SAFETY: `-window` is `@16@0:8` and answers the panel the live alert holds (+0),
+            // live and not deallocating while `alert` is.
+            let panel = unsafe {
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+                WeakObj::new(f(alert.id(), sel!(window)))
+            };
+            // SAFETY: `+arrayWithObject:` is `@24@0:8@16` (+0); `-performSelector:withObject:
+            // afterDelay:inModes:` is `v48@0:8:16@24d32@40` on `NSObject`, and the run loop
+            // retains its target and modes until it sends; `-runModal` is `q16@0:8`; `+[NSObject
+            // cancelPreviousPerformRequestsWithTarget:]` is `v24@0:8@16`.
+            let answer = unsafe {
+                let one: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
+                let later: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64, Id) = checked_msg();
+                let run: unsafe extern "C-unwind" fn(Id, Sel) -> isize = checked_msg();
+                let cancel: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+                let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+                let modes = one(class(c"NSArray").as_id(), sel!(arrayWithObject:), mode.id());
+                let app = get(class(c"NSApplication").as_id(), sel!(sharedApplication));
+                // The person's click, once the modal loop runs.
+                later(
+                    button.id(),
+                    sel!(performSelector:withObject:afterDelay:inModes:),
+                    sel!(performClick:),
+                    Id::NIL,
+                    0.2,
+                    modes,
+                );
+                // The hang detector: a click that never answers ends the loop a minute on.
+                later(
+                    app,
+                    sel!(performSelector:withObject:afterDelay:inModes:),
+                    sel!(abortModal),
+                    Id::NIL,
+                    BUDGET.as_secs_f64(),
+                    modes,
+                );
+                let answer = run(alert.id(), sel!(runModal));
+                cancel(
+                    class(c"NSObject").as_id(),
+                    sel!(cancelPreviousPerformRequestsWithTarget:),
+                    app,
+                );
+                answer
+            };
+            self.alert_answer = Some(answer);
+            drop(button);
+            drop(alert);
+            let listed = app_windows();
+            // SAFETY: the word is only compared, never messaged; the runtime nils it once the
+            // panel deallocates.
+            let panel_at = unsafe { panel.peek() };
+            self.alert_panel_listed =
+                !panel_at.is_null() && listed.iter().any(|(addr, _)| *addr == panel_at.addr());
+            self.windows_at_exit = listed.into_iter().map(|(_, name)| name).collect();
+
+            let closed = std::rc::Rc::clone(&self.closed_at_exit);
+            let record = move |note: Id| {
+                // SAFETY: the notification centre calls this with the live `NSNotification`,
+                // whose `-object` (`@16@0:8`, +0) is the closing window.
+                let window = unsafe {
+                    let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+                    f(note, sel!(object))
+                };
+                if !window.is_null() {
+                    // SAFETY: `window` is the live window the notification names.
+                    closed.borrow_mut().push(unsafe { class_name_of(window) });
+                }
+            };
+            // SAFETY: `void (^)(NSNotification *)` is the block `-addObserverForName:object:
+            // queue:usingBlock:` calls.
+            let block = unsafe { aterm_objc::RcBlock::new1(record) };
+            let Some((block, name)) = block.zip(ns_string("NSWindowWillCloseNotification")) else {
+                self.report
+                    .check(false, "a will-close observer could be built");
+                return;
+            };
+            // SAFETY: `+defaultCenter` is `@16@0:8` (+0); `-addObserverForName:object:queue:
+            // usingBlock:` is `@48@0:8@16@24@32@?40`, copies the block and answers the +0 token,
+            // retained here until `-removeObserver:` after the pump.
+            self.exit_close_observer = unsafe {
+                let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+                let add: unsafe extern "C-unwind" fn(
+                    Id,
+                    Sel,
+                    Id,
+                    Id,
+                    Id,
+                    aterm_objc::BlockPtr,
+                ) -> Id = checked_msg();
+                let center = get(class(c"NSNotificationCenter").as_id(), sel!(defaultCenter));
+                Obj::retain(add(
+                    center,
+                    sel!(addObserverForName:object:queue:usingBlock:),
+                    name.id(),
+                    Id::NIL,
+                    Id::NIL,
+                    block.as_block_ptr(),
+                ))
+            };
+            self.report.note(&format!(
+                "the alert answered {answer}; at exit -[NSApp windows] held {:?}",
+                self.windows_at_exit
+            ));
+        }
+
+        /// What the exit closed, against stage 16's alert.
+        fn judge_exit_closes(&mut self) {
+            println!("\n[16b] the windows the exit closed");
+            if let Some(token) = self.exit_close_observer.take() {
+                // SAFETY: `+defaultCenter` is `@16@0:8`; `-removeObserver:` is `v24@0:8@16` with
+                // the token `-addObserverForName:…` answered.
+                unsafe {
+                    let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+                    let remove: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+                    let center = get(class(c"NSNotificationCenter").as_id(), sel!(defaultCenter));
+                    remove(center, sel!(removeObserver:), token.id());
+                }
+            } else {
+                self.report
+                    .check(false, "stage 16 armed its will-close observer");
+                return;
+            }
+            let own = "WinitWindow";
+            let closed = self.closed_at_exit.borrow().clone();
+            let foreign: Vec<&String> = self.windows_at_exit.iter().filter(|c| *c != own).collect();
+            self.report.check(
+                self.alert_answer == Some(NS_ALERT_FIRST_BUTTON_RETURN),
+                &format!(
+                    "a click on Quit answered the alert (runModal answered {:?})",
+                    self.alert_answer
+                ),
+            );
+            self.report.check(
+                self.alert_panel_listed,
+                &format!(
+                    "the answered alert's own panel was still in -[NSApp windows] at exit, the \
+                     state the exit must leave alone ({:?})",
+                    self.windows_at_exit
+                ),
+            );
+            let glass = "AppKit._NSGlassEffectWindow";
+            if self.windows_at_exit.iter().any(|c| c == glass) {
+                self.report.note(&format!(
+                    "{glass}, the panel's child the old exit close freed, was listed too"
+                ));
+            } else {
+                self.report.note(&format!(
+                    "no {glass} was listed: this macOS gives alerts none"
+                ));
+            }
+            self.report.check(
+                closed.iter().any(|c| c == own),
+                &format!("the exit closed winit's own window (closed {closed:?})"),
+            );
+            self.report.check(
+                closed.iter().all(|c| c == own),
+                &format!(
+                    "the exit closed no window AppKit owns (closed {closed:?}; AppKit's were \
+                     {foreign:?})"
+                ),
+            );
+        }
     }
 
     /// Drive the window loop through every verification stage and return an exit code.
@@ -1309,6 +1557,11 @@ mod macos {
             hovered: Vec::new(),
             key_ups: 0,
             posted_cmd_key_up: false,
+            alert_answer: None,
+            windows_at_exit: Vec::new(),
+            alert_panel_listed: false,
+            closed_at_exit: std::rc::Rc::default(),
+            exit_close_observer: None,
             done: false,
             stage: 0,
         };
@@ -1358,6 +1611,10 @@ mod macos {
             driver
                 .report
                 .note("no key window; nothing was posted, so nothing is asserted");
+        }
+
+        if driver.report.blocked.is_none() {
+            driver.judge_exit_closes();
         }
 
         drop(driver.window.take());

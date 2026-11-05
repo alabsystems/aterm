@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The alt blob of a checkpoint taken on the alternate screen has exactly `rows` records.
+//! The inactive blob of a checkpoint: the saved primary's under the alternate screen, its rows and
+//! its carried history; the parked alternate screen's after a 1047 exit, exactly its rows.
 
 use aterm_core::scrollback::{deserialize_lines_strict, serialize_lines};
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
@@ -32,13 +33,26 @@ fn carry(t: &Terminal) -> TerminalCheckpoint {
 }
 
 #[test]
-fn the_alt_blob_is_exactly_rows_records() {
-    for (name, bytes) in [
-        ("1049 up", &b"\x1b[?1049ha full-screen app draws here"[..]),
-        ("1047 up", b"\x1b[?1047ha full-screen app draws here"),
+fn the_inactive_blob_is_its_rows_and_the_saved_primarys_carried_history() {
+    // (the case, its bytes, the inactive blob's history, the active blob's)
+    for (name, bytes, inactive, active) in [
+        (
+            "1049 up",
+            &b"\x1b[?1049ha full-screen app draws here"[..],
+            CARRY,
+            0,
+        ),
+        (
+            "1047 up",
+            b"\x1b[?1047ha full-screen app draws here",
+            CARRY,
+            0,
+        ),
         (
             "after a 1047 exit",
             b"\x1b[?1047ha full-screen app draws here\x1b[?1047l",
+            0,
+            CARRY,
         ),
     ] {
         let mut t = primary_with_history();
@@ -46,10 +60,36 @@ fn the_alt_blob_is_exactly_rows_records() {
         let cp = carry(&t);
         let alt = cp.alt_grid.as_ref().expect("a parked alt_grid");
         assert!(
-            is_canonical(alt, usize::from(cp.rows), cp.cols),
-            "{name}: the alt blob must hold exactly `rows` records"
+            is_canonical(alt, usize::from(cp.rows) + inactive, cp.cols),
+            "{name}: the inactive blob must hold its rows and {inactive} history records"
+        );
+        assert_eq!(
+            cp.history_lines as usize, active,
+            "{name}: the history goes to the grid that holds it"
         );
     }
+}
+
+#[test]
+fn the_saved_primarys_carried_history_is_the_shells_once_the_app_leaves() {
+    let mut t = primary_with_history();
+    t.process(b"\x1b[?1049ha full-screen app draws here");
+    let mut successor = Terminal::from_checkpoint(&carry(&t));
+    successor.process(b"\x1b[?1049l");
+    t.process(b"\x1b[?1049l");
+    let g = successor.grid();
+    let carried: Vec<_> = (g.oldest_absolute_row()..g.visible_to_absolute(0))
+        .map(|abs| successor.abs_row_text(abs))
+        .collect();
+    let live = t.grid();
+    let newest: Vec<_> = (live.visible_to_absolute(0) - CARRY as u64..live.visible_to_absolute(0))
+        .map(|abs| t.abs_row_text(abs))
+        .collect();
+    assert_eq!(carried.len(), CARRY, "the carry's whole budget");
+    assert_eq!(
+        carried, newest,
+        "the newest of the shell's history, in order"
+    );
 }
 
 #[test]

@@ -67,10 +67,14 @@ aterm-toml = { workspace = true }
 # carries the digest of the bytes we hashed.
 aterm-digest = { workspace = true }
 # Release-channel signatures are verified in the cutter: the external signer's exit status
-# would not bind the uploaded bytes to the public key compiled into clients. `ship site`
-# signs its Firebase Hosting deploy's OAuth2 assertion (RS256) with the deployer's
-# service-account key, which needs `alloc`'s RsaKeyPair; atpkg-keys already unifies ring's
-# default features (alloc among them) into this binary's graph, so naming it changes no build.
+# would not bind the uploaded bytes to the public key compiled into clients. The Ed25519
+# check is astream's strict verify, which refuses the small-order keys and commitments ring
+# alone takes (`signature`: ring, zeroize and getrandom, all already in this graph).
+astream-aead = { path = "../../vendor/astream/crates/astream-aead", default-features = false, features = ["signature"] }
+# `ship site` signs its Firebase Hosting deploy's OAuth2 assertion (RS256) with the
+# deployer's service-account key, which needs `alloc`'s RsaKeyPair; atpkg-keys already
+# unifies ring's default features (alloc among them) into this binary's graph, so naming it
+# changes no build.
 ring = { workspace = true, features = ["alloc"] }
 # Standard padded Base64 — first-party; its one dependency is astream-wire
 # (dependency-free, vendor/astream). `decode_strict` is

@@ -3544,7 +3544,7 @@ ink = "rainbow"
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, "qqq_unknown = 1\n").unwrap();
+        crate::test_scratch::write_config(&path, "qqq_unknown = 1\n");
         let (message, valid) = validate_config_path(&path);
         assert!(valid, "{message}");
         assert!(message.contains("qqq_unknown"), "{message}");

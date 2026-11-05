@@ -132,8 +132,12 @@ pub fn could_not_run_as_root(fixture: &str) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
     /// A Unix operating system ships it (macOS, or for a Linux lane Linux), and that OS is
-    /// the answer there; Windows ships none.
+    /// the answer there. Windows ships none: a Windows place in `at` is where its usual
+    /// third-party copy lives.
     Os,
+    /// Every operating system aterm runs on ships it: a Unix one as [`Provider::Os`] says, and
+    /// Windows as `<name>.exe` on its `PATH` (System32's curl, tar, OpenSSH and hostname).
+    OsAndWindows,
     /// Windows ships it, and Windows is the answer.
     Windows,
     /// Apple's Command Line Tools (the `base.clt` item), which nobody may redistribute.
@@ -168,8 +172,6 @@ pub enum When {
     Always,
     /// The Linux lane's own (`--linux`).
     Linux,
-    /// Only to re-record a golden (`--record`).
-    Record,
     /// Only to prepare a release host (`--release`).
     Release,
 }
@@ -181,7 +183,6 @@ impl When {
         match self {
             Self::Always => None,
             Self::Linux => Some("--linux"),
-            Self::Record => Some("--record"),
             Self::Release => Some("--release"),
         }
     }
@@ -252,8 +253,10 @@ pub struct Tool {
     pub pin: Option<Pin>,
     /// Who provides it.
     pub provider: Provider,
-    /// The Linux lane's guest builds this row's pin too, at the first of `at`: on a Linux host
-    /// the pin does not cover, the guest is its provider ([`Tool::remedy_on`]).
+    /// The Linux lane's guest provides this row too, at the first of `at`: it builds a
+    /// [`Provider::Workspace`] row's pin, and lays a Mac's copy of an [`Provider::Os`] row only
+    /// macOS ships. On a Linux host without it (for a pin, one the pin does not cover), the
+    /// guest is its provider ([`Tool::remedy_on`]).
     pub in_guest: bool,
 }
 
@@ -373,16 +376,48 @@ impl Tool {
         {
             return Ok(Some(pinned));
         }
-        if let Some(found) = self.at.iter().map(Path::new).find(|at| runnable(at)) {
+        if let Some(found) = self.places().map(Path::new).find(|at| runnable(at)) {
             return Ok(Some(found.to_path_buf()));
         }
         let Some(path) = lookup.path.as_ref() else {
             return Ok(None);
         };
+        let file = self.path_file_on(std::env::consts::OS);
         Ok(std::env::split_paths(path)
             .filter(|dir| dir.is_absolute())
-            .map(|dir| dir.join(self.name))
+            .map(|dir| dir.join(&file))
             .find(|candidate| runnable(candidate)))
+    }
+
+    /// The places in `at` a host whose OS is `os` (`macos`, `linux`, `windows`, as
+    /// [`std::env::consts::OS`] names it) can name: off Windows the `/`-rooted ones, on Windows
+    /// the rest (`C:\…`). Neither family's path is a place on the other: a Windows path is a
+    /// relative name on Unix, and a `/`-rooted one names no drive on Windows.
+    pub fn places_on(&self, os: &str) -> impl Iterator<Item = &'static str> + use<> {
+        let windows = os == "windows";
+        self.at
+            .iter()
+            .copied()
+            .filter(move |at| at.starts_with('/') != windows)
+    }
+
+    /// [`Tool::places_on`] this host.
+    pub fn places(&self) -> impl Iterator<Item = &'static str> + use<> {
+        self.places_on(std::env::consts::OS)
+    }
+
+    /// The file a `$PATH` directory holds this tool as on a host whose OS is `os`
+    /// ([`Tool::places_on`]): a program Windows ships is `<name>.exe` there, where the row's
+    /// name carries no extension; any other is the row's name. A Unix row's name is not looked
+    /// for as an `.exe` on Windows, where System32's `bash.exe` is WSL's.
+    #[must_use]
+    pub fn path_file_on(&self, os: &str) -> String {
+        let ships = matches!(self.provider, Provider::OsAndWindows | Provider::Windows);
+        if ships && os == "windows" && Path::new(self.name).extension().is_none() {
+            format!("{}.exe", self.name)
+        } else {
+            self.name.to_string()
+        }
     }
 
     /// This tool on the host `lookup` describes, in the one order every gate resolves.
@@ -449,7 +484,7 @@ impl Tool {
                 None => format!("the stamped {} in this user's tooling cache", pin.version),
             });
         }
-        places.extend(self.at.iter().map(|at| (*at).to_string()));
+        places.extend(self.places().map(str::to_string));
         places.push("$PATH".to_string());
         let last = places.pop().unwrap_or_default();
         if places.is_empty() {
@@ -479,15 +514,11 @@ impl Tool {
     /// [`Tool::remedy`] on the host `platform` (`<os>-<arch>`).
     #[must_use]
     pub fn remedy_on(&self, platform: &str) -> String {
-        let windows = platform.starts_with("windows-");
+        let os = platform.split_once('-').map_or(platform, |(os, _)| os);
+        let windows = os == "windows";
         match self.provider {
             Provider::Os if windows => {
-                let looked: Vec<&str> = self
-                    .at
-                    .iter()
-                    .copied()
-                    .filter(|path| path.as_bytes().get(1) == Some(&b':'))
-                    .collect();
+                let looked: Vec<&str> = self.places_on(os).collect();
                 if looked.is_empty() {
                     "Windows ships none, and aterm provides none".into()
                 } else {
@@ -497,8 +528,16 @@ impl Tool {
                     )
                 }
             }
-            Provider::Os => "it comes with the operating system, and no command adds it".into(),
-            Provider::Windows if windows => "it comes with Windows, and no command adds it".into(),
+            Provider::Os if self.in_guest && os == "linux" => format!(
+                "the Linux guest lays a Mac's copy at {}: {GUEST_RUNS}",
+                self.places_on(os).next().unwrap_or(self.name)
+            ),
+            Provider::OsAndWindows | Provider::Windows if windows => {
+                "it comes with Windows, and no command adds it".into()
+            }
+            Provider::Os | Provider::OsAndWindows => {
+                "it comes with the operating system, and no command adds it".into()
+            }
             Provider::Windows => format!("only Windows ships it, and this host is {platform}"),
             Provider::Clt => "Apple's Command Line Tools provide it (`aterm init --only base.clt` \
                               installs them, asking one password in the terminal)"
@@ -563,7 +602,7 @@ impl Tool {
     #[must_use]
     pub fn provided_by(&self) -> String {
         match self.provider {
-            Provider::Os => "OS".to_string(),
+            Provider::Os | Provider::OsAndWindows => "OS".to_string(),
             Provider::Windows => "Windows".to_string(),
             Provider::Clt => "CLT".to_string(),
             Provider::Toolset { .. } => "default set".to_string(),
@@ -631,7 +670,10 @@ pub const fn os_path(name: &'static str) -> &'static str {
         let row = &TOOLS[i];
         if same_str(row.name, name) {
             assert!(
-                matches!(row.provider, Provider::Os | Provider::Clt),
+                matches!(
+                    row.provider,
+                    Provider::Os | Provider::OsAndWindows | Provider::Clt
+                ),
                 "an aterm_uds::host::TOOLS row the OS does not provide has no fixed path"
             );
             assert!(

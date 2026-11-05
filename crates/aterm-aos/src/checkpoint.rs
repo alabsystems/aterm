@@ -191,7 +191,7 @@ impl Checkpoint {
     /// `Digest::of(b"aterm-aos-checkpoint-v1\0", [encoded provenance, state digest])`.
     #[must_use]
     pub fn digest(&self) -> Digest {
-        let mut e = Enc::new();
+        let mut e = Enc::with_capacity(320);
         encode_provenance(&mut e, &self.provenance);
         Digest::of(CHECKPOINT_DOMAIN, &[e.as_bytes(), &self.state_digest.0])
     }

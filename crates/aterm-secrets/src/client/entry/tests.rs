@@ -72,6 +72,242 @@ fn set_state(paths: &Paths, change: impl FnOnce(&mut State)) {
     save_state(paths, &state).unwrap();
 }
 
+fn publish_public_pair(f: &Fixture, roster: &[u8], signature: &[u8]) {
+    f.publish(|doc| {
+        for (index, value) in [roster, signature].into_iter().enumerate() {
+            doc.set_entry_with(
+                &Audience::Everyone,
+                PUBLIC_ROSTER_NAMES[index],
+                value,
+                true,
+                None,
+            )
+            .unwrap();
+        }
+        for (index, value) in [roster, signature].into_iter().enumerate() {
+            doc.set_entry_with(
+                &Audience::Everyone,
+                PUBLIC_ROSTER_NAMES[index],
+                value,
+                true,
+                Some(PUBLIC_ROSTER_NAMES[1 - index]),
+            )
+            .unwrap();
+        }
+    });
+}
+
+#[test]
+fn public_roster_reads_current_pair_without_adopting_stale_files() {
+    let f = Fixture::new();
+    for name in PUBLIC_ROSTER_NAMES {
+        let path = materialize::target_path(&f.paths.home, name).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fsx::write_atomic(&path, b"personal old pair", 0o600).unwrap();
+    }
+    let signature = [7; 64];
+    publish_public_pair(&f, b"new public roster including a revocation", &signature);
+    let before = f.bytes();
+    let state = load_state(&f.paths).unwrap();
+    assert!(
+        PUBLIC_ROSTER_NAMES
+            .iter()
+            .all(|name| !state.manifest.files.contains_key(*name))
+    );
+    assert!(
+        read_verified_entry(
+            &f.paths,
+            &config(&f.paths).unwrap().unwrap(),
+            PUBLIC_ROSTER_NAMES[0]
+        )
+        .unwrap()
+        .is_none()
+    );
+    let PublicRosterRead::Pair(pair) = current_public_roster(&f.paths).unwrap() else {
+        panic!("current public pair unavailable");
+    };
+    assert_eq!(pair.roster, b"new public roster including a revocation");
+    assert_eq!(pair.signature, signature);
+    assert_eq!(f.bytes(), before, "observation changes no vault state");
+    for name in PUBLIC_ROSTER_NAMES {
+        assert_eq!(
+            std::fs::read(materialize::target_path(&f.paths.home, name).unwrap()).unwrap(),
+            b"personal old pair"
+        );
+    }
+}
+
+#[test]
+fn public_roster_absence_is_authenticated_and_partial_pairs_are_errors() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    assert!(matches!(
+        current_public_roster(&Paths::for_home(root.path())).unwrap(),
+        PublicRosterRead::Unconfigured
+    ));
+    let f = Fixture::new();
+    assert!(matches!(
+        current_public_roster(&f.paths).unwrap(),
+        PublicRosterRead::Absent
+    ));
+    f.publish(|doc| {
+        doc.set_entry(&Audience::Everyone, PUBLIC_ROSTER_NAMES[0], b"only body")
+            .unwrap();
+    });
+    assert!(current_public_roster(&f.paths).is_err());
+    publish_public_pair(&f, b"body", b"short signature");
+    let PublicRosterRead::Pair(pair) = current_public_roster(&f.paths).unwrap() else {
+        panic!("opaque pair unavailable");
+    };
+    assert_eq!(
+        pair.signature, b"short signature",
+        "the release admission policy, not this source reader, rejects invalid signatures"
+    );
+    let hidden = Fixture::new();
+    hidden.publish(|doc| {
+        for name in PUBLIC_ROSTER_NAMES {
+            doc.set_entry(
+                &Audience::Hosts(vec!["peer".into()]),
+                name,
+                b"other recipient's entry",
+            )
+            .unwrap();
+        }
+    });
+    assert!(matches!(
+        current_public_roster(&hidden.paths).unwrap(),
+        PublicRosterRead::Absent
+    ));
+}
+
+#[test]
+fn public_roster_refuses_unavailable_or_noncanonical_source() {
+    for fault in [
+        "busy", "pending", "failed", "revoked", "denied", "source", "audience",
+    ] {
+        let f = Fixture::new();
+        publish_public_pair(&f, b"public body", &[8; 64]);
+        assert!(matches!(
+            current_public_roster(&f.paths).unwrap(),
+            PublicRosterRead::Pair(_)
+        ));
+        let guard = match fault {
+            "busy" => Some(StateLock::take(&f.paths).unwrap()),
+            "pending" => {
+                set_state(&f.paths, |s| {
+                    s.pending.insert("token".into(), "pending".into());
+                });
+                None
+            }
+            "failed" => {
+                set_state(&f.paths, |s| s.failed = true);
+                None
+            }
+            "revoked" => {
+                set_state(&f.paths, |s| s.membership = Stored::Revoked);
+                None
+            }
+            "denied" => {
+                f.publish(|doc| {
+                    let roster = crate::swarm_roster::SwarmRoster {
+                        deny_labels: vec!["m22".into()],
+                        members: vec![crate::swarm_roster::SwarmMember {
+                            recipient: read_identity(&f.paths)
+                                .unwrap()
+                                .unwrap()
+                                .recipient()
+                                .to_bech32(),
+                            vault_name: "admin".into(),
+                            label: "m22".into(),
+                            aliases: Vec::new(),
+                            hint: None,
+                            hw_hint: None,
+                            admitted_ms: 1,
+                            claimed_label: None,
+                            claimed_at_ms: None,
+                            node_id: None,
+                            node_key: None,
+                        }],
+                        ..Default::default()
+                    };
+                    assert!(roster.is_member_denied(&roster.members[0]));
+                    doc.set_entry(
+                        &Audience::Everyone,
+                        crate::SWARM_ROSTER_ENTRY,
+                        roster.to_toml().as_bytes(),
+                    )
+                    .unwrap();
+                });
+                None
+            }
+            "source" => {
+                let mut changed = config(&f.paths).unwrap().unwrap();
+                changed.source = Source::Path(f.paths.home.join("other.vault"));
+                save_config(&f.paths, &changed).unwrap();
+                None
+            }
+            "audience" => {
+                f.publish(|doc| {
+                    doc.set_entry_with(
+                        &Audience::Hosts(vec!["admin".into()]),
+                        PUBLIC_ROSTER_NAMES[0],
+                        b"host override",
+                        true,
+                        None,
+                    )
+                    .unwrap();
+                });
+                None
+            }
+            _ => unreachable!(),
+        };
+        assert!(
+            current_public_roster_until(&f.paths, Instant::now()).is_err(),
+            "{fault}"
+        );
+        drop(guard);
+    }
+}
+
+/// A release's stage read the roster at the moment the running aterm's vault sync held the
+/// state, and refused the cut as `busy or unavailable` (0.155.0, 2026-11-04). A hold that ends
+/// while the read waits lets it go ahead. The hold ends on the reader's first blocked try, in
+/// the reader's own thread, so no scheduling races the wait. CONTROL: the same hold kept past a
+/// deadline already reached still refuses as busy.
+#[test]
+fn public_roster_waits_out_a_writer_holding_the_vault_state() {
+    let f = Fixture::new();
+    publish_public_pair(&f, b"public body", &[8; 64]);
+    let held = StateLock::take(&f.paths).unwrap();
+    let err = current_public_roster_until(&f.paths, Instant::now()).unwrap_err();
+    assert!(err.to_string().contains("busy or unavailable"), "{err}");
+
+    let paths = &f.paths;
+    let (read, blocked) = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let blocked = std::rc::Rc::new(std::cell::Cell::new(0));
+                let count = std::rc::Rc::clone(&blocked);
+                let mut held = Some(held);
+                crate::client::OBSERVE_BLOCKED.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        count.set(count.get() + 1);
+                        drop(held.take());
+                    }));
+                });
+                let read = current_public_roster(paths);
+                crate::client::OBSERVE_BLOCKED.with(|hook| hook.borrow_mut().take());
+                (read, blocked.get())
+            })
+            .join()
+            .unwrap()
+    });
+    assert_eq!(blocked, 1, "the read found the state held once");
+    let PublicRosterRead::Pair(pair) = read.unwrap() else {
+        panic!("the pair once the writer let go");
+    };
+    assert_eq!(pair.roster, b"public body");
+}
+
 #[test]
 fn mailbox_component_index_is_bound_to_verified_source_and_exact_fields() {
     use crate::mailbox_component::{Component, Part, SOURCE_ENTRY};
@@ -1388,6 +1624,7 @@ fn unsigned_and_unconfigured_reads_create_nothing() {
     let paths = Paths::for_home(&root.path().join("absent"));
     let mut expected = Config {
         source: Source::Path(root.path().join("plain.secrets")),
+        mirrors: Vec::new(),
         name: "plain".into(),
         signer: Some([5; 32]),
         followed: vec![],

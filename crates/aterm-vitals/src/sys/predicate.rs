@@ -5,7 +5,7 @@
 //! and its `OK sys` reply.
 
 use crate::jobs::{Class, JobRow, Verdict};
-use crate::model::{SlotsUnread, SlotsView, Snapshot, Throttle};
+use crate::model::{SlotsUnread, SlotsView, Snapshot};
 
 /// The usage line a refused `await sys` answers.
 pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<n>(ms|s|m|h)] [scope=tab|aterm] \
@@ -19,7 +19,8 @@ pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<n>(ms|s|m|h)] [s
                          aterm tab wait cores_idle <n>[c], load jobs.stuck jobs.quiet \
                          jobs.running slots <n>, tab.mem aterm.mem avail <size>, \
                          swap <size>[/s], decompress <n>[/s], mem normal|warn|critical, \
-                         throttle none|light|heavy|severe, thrash yes|no (= and != take a \
+                         thermal nominal|fair|serious|critical (the heuristic's \
+                         none|light|heavy|severe rank alike), thrash yes|no (= and != take a \
                          comma list; thrash takes no other <op>); \
                          <volume> := free>=<size|room> | free><size|room> | free<<size> | free<=<size> \
                          | disk=ok|low|short|emergency[,…], never with quiet, a <term>, for= or \
@@ -70,8 +71,8 @@ pub enum Metric {
     TabMem,
     /// aterm's footprint, bytes.
     AtermMem,
-    /// The thermal level.
-    Throttle,
+    /// The thermal level, ranked 0 to 3 ([`crate::model::Throttle::rank`]).
+    Thermal,
     /// A count of the target tab's jobs, every tab's under `scope=aterm` (`jobs.stuck`,
     /// `jobs.quiet`, `jobs.running`).
     Jobs(JobCount),
@@ -173,7 +174,7 @@ impl Metric {
             Self::Thrash => "thrash".into(),
             Self::TabMem => "tab.mem".into(),
             Self::AtermMem => "aterm.mem".into(),
-            Self::Throttle => "throttle".into(),
+            Self::Thermal => "thermal".into(),
             Self::Jobs(c) => format!("jobs.{}", c.word()),
             Self::Job(_) => "job".into(),
             Self::Load => "load".into(),
@@ -194,7 +195,7 @@ impl Metric {
             Self::Cpu => Kind::CpuPct,
             Self::CpuLevel { .. } | Self::Gpu => Kind::Pct,
             Self::Aterm | Self::Tab | Self::Wait | Self::CoresIdle => Kind::Cores,
-            Self::Mem | Self::Throttle => Kind::Ordered,
+            Self::Mem | Self::Thermal => Kind::Ordered,
             Self::Swap => Kind::Bps,
             Self::Decompress => Kind::PerS,
             Self::Thrash => Kind::YesNo,
@@ -208,10 +209,23 @@ impl Metric {
     fn levels(&self) -> &'static [&'static str] {
         match self {
             Self::Mem => &["normal", "warn", "critical"],
-            Self::Throttle => &["none", "light", "heavy", "severe"],
+            Self::Thermal => &["nominal", "fair", "serious", "critical"],
             Self::Thrash => &["no", "yes"],
             _ => &[],
         }
+    }
+
+    /// A level word's rank: one of [`Self::levels`], or for `thermal` the counter heuristic's
+    /// word for the same rank.
+    fn rank_of(&self, w: &str) -> Option<usize> {
+        let alias: &[&str] = match self {
+            Self::Thermal => &["none", "light", "heavy", "severe"],
+            _ => &[],
+        };
+        self.levels()
+            .iter()
+            .position(|l| *l == w)
+            .or_else(|| alias.iter().position(|l| *l == w))
     }
 }
 
@@ -313,6 +327,11 @@ pub enum Want {
     Verdicts(Vec<Verdict>),
     /// A job's class, one of these.
     Classes(Vec<Class>),
+    /// The `quiet` preset's `thermal` term: a level that claims no throttling
+    /// ([`crate::model::Thermal::throttled`] false: below serious where the OS's level is exact,
+    /// none where it is the counter heuristic's). No spelling parses to it; an explicit `thermal`
+    /// term replaces it.
+    Unthrottled,
 }
 
 /// One term.
@@ -362,7 +381,7 @@ impl Term {
                     .collect();
                 format!("{}{}{}", metric.name(), op.word(), words(named))
             }
-            (metric, Want::Verdicts(_) | Want::Classes(_)) => metric.name(),
+            (metric, Want::Verdicts(_) | Want::Classes(_) | Want::Unthrottled) => metric.name(),
         }
     }
 }
@@ -587,11 +606,7 @@ fn want(metric: &Metric, op: Op, value: &str) -> Result<Want, String> {
     let usage = || USAGE.to_owned();
     match metric.kind() {
         Kind::Ordered | Kind::YesNo => {
-            let levels = metric.levels();
-            let ranks: Option<Vec<usize>> = value
-                .split(',')
-                .map(|w| levels.iter().position(|l| *l == w))
-                .collect();
+            let ranks: Option<Vec<usize>> = value.split(',').map(|w| metric.rank_of(w)).collect();
             let ranks = ranks.filter(|r| !r.is_empty()).ok_or_else(usage)?;
             let ordered_ok = matches!(op, Op::Eq | Op::Ne)
                 || (metric.kind() == Kind::Ordered && ranks.len() == 1);
@@ -700,7 +715,7 @@ fn term(tok: &str) -> Result<Tok, String> {
         "thrash" => Metric::Thrash,
         "tab.mem" => Metric::TabMem,
         "aterm.mem" => Metric::AtermMem,
-        "throttle" => Metric::Throttle,
+        "thermal" => Metric::Thermal,
         "load" => Metric::Load,
         "cores_idle" => Metric::CoresIdle,
         "avail" => Metric::Avail,
@@ -741,7 +756,9 @@ pub fn quiet_cpu_percent(percent: f64) -> bool {
     percent.is_finite() && (0.0..QUIET_CPU_PERCENT).contains(&percent)
 }
 
-/// The `quiet` preset's terms.
+/// The `quiet` preset's terms: `cpu<25%`, `wait<0.25`, `gpu<10%`, a thermal level that claims no
+/// throttling ([`Want::Unthrottled`]; a benchmark run under throttling measures the throttle, and
+/// fair claims none), and `swap<1MB/s`.
 #[must_use]
 pub fn quiet_terms() -> Vec<Term> {
     let num = |metric, op, v| Term {
@@ -758,11 +775,8 @@ pub fn quiet_terms() -> Vec<Term> {
         num(Metric::Wait, Op::Lt, 0.25),
         num(Metric::Gpu, Op::Lt, 10.0),
         Term {
-            metric: Metric::Throttle,
-            want: Want::Levels {
-                op: Op::Eq,
-                ranks: vec![0],
-            },
+            metric: Metric::Thermal,
+            want: Want::Unthrottled,
             preset: true,
         },
         num(Metric::Swap, Op::Lt, 1e6),
@@ -1060,13 +1074,8 @@ fn read(metric: &Metric, s: &Snapshot, tab_keys: &[u64], cores_want: bool) -> Re
             None => jobs_missing(s),
         },
         Metric::Job(_) => Reading::Unavailable("not_sampled"),
-        Metric::Throttle => s.thermal.map_or(Reading::Unavailable("unsupported"), |t| {
-            Reading::Rank(match t.level {
-                Throttle::None => 0,
-                Throttle::Light => 1,
-                Throttle::Heavy => 2,
-                Throttle::Severe => 3,
-            })
+        Metric::Thermal => s.thermal.map_or(Reading::Unavailable("unsupported"), |t| {
+            Reading::Rank(t.level.rank())
         }),
         Metric::Load | Metric::CoresIdle => {
             let Some(l) = s.load else {
@@ -1221,10 +1230,14 @@ fn value_word(metric: &Metric, r: Reading, cores_want: bool) -> String {
 }
 
 /// A term's `<value>` on `s`: [`value_word`], but `slots` says how many of
-/// how many (`slots=1/3`).
+/// how many (`slots=1/3`), and `thermal` the OS's own word where its level is exact and the
+/// counter heuristic's where not ([`crate::model::Thermal::word`]).
 fn term_word(metric: &Metric, r: Reading, cores_want: bool, s: &Snapshot) -> String {
     match (metric, r, s.slots) {
         (Metric::Slots, Reading::Num(v), Some(SlotsView::Read { n, .. })) => format!("{v:.0}/{n}"),
+        (Metric::Thermal, Reading::Rank(_), _) => s
+            .thermal
+            .map_or_else(|| value_word(metric, r, cores_want), |t| t.word().into()),
         _ => value_word(metric, r, cores_want),
     }
 }
@@ -1376,6 +1389,9 @@ pub fn evaluate_with(
                 lo,
                 lo + f64::from(unproven_slots(s)),
             )),
+            (Metric::Thermal, Want::Unthrottled, Reading::Rank(_)) => {
+                s.thermal.map(|th| !th.throttled())
+            }
             _ => holds(&t.want, r),
         };
         if met != Some(true) {
@@ -1436,7 +1452,7 @@ mod tests {
     use super::*;
     use crate::model::{
         ClusterView, CoreView, CpuView, GpuView, MemCounters, MemRates, MemSample, MemView,
-        Pressure, ScopeView, TabView, Thermal,
+        Pressure, ScopeView, TabView, Thermal, Throttle,
     };
     use crate::trend::TrendView;
 
@@ -1533,8 +1549,9 @@ mod tests {
             "sys thrash=no",
             "sys tab.mem<2GB",
             "sys aterm.mem<4GiB",
-            "sys throttle=none",
-            "sys throttle<heavy",
+            "sys thermal=nominal",
+            "sys thermal<serious",
+            "sys thermal<heavy",
             "sys quiet",
             "sys quiet for=20s timeout=600000",
             "sys quiet cpu<30%",
@@ -1901,7 +1918,7 @@ mod tests {
             "sys aterm<1c and tab<0.5c for=10s",
             "sys wait<0.25",
             "sys mem=normal,warn",
-            "sys mem<critical and throttle!=severe",
+            "sys mem<critical and thermal!=critical",
             "sys swap<1.5MB/s for=30s scope=aterm",
             "sys decompress<100/s and thrash=no",
             "sys tab.mem<2GB and aterm.mem<4GiB",
@@ -2011,7 +2028,7 @@ mod tests {
                 "cpu=10%",
                 "wait=0.05",
                 "gpu=2%",
-                "throttle=none",
+                "thermal=none",
                 "swap=0B/s"
             ]
         );
@@ -2025,10 +2042,10 @@ mod tests {
         s.thermal = None;
         let o = evaluate(&machine("sys quiet"), &s, &[7]);
         assert!(o.holds);
-        assert_eq!(o.skipped, ["gpu:unsupported", "throttle:unsupported"]);
+        assert_eq!(o.skipped, ["gpu:unsupported", "thermal:unsupported"]);
         assert_eq!(
             met_reply(&o, 20_007, 1_792_185_697_412, "2b11.310"),
-            "OK sys cpu=10% wait=0.05 swap=0B/s skipped=gpu:unsupported,throttle:unsupported \
+            "OK sys cpu=10% wait=0.05 swap=0B/s skipped=gpu:unsupported,thermal:unsupported \
              held_ms=20007 as_of=21:21:37 next=2b11.310\n"
         );
         let o = evaluate(&machine("sys gpu<10%"), &s, &[7]);
@@ -2054,19 +2071,108 @@ mod tests {
     fn ordered_levels_compare_by_rank() {
         let mut s = snap(0.1);
         s.mem.as_mut().unwrap().sample.pressure = Pressure::Warn;
-        s.thermal = Some(Thermal {
-            level: Throttle::Light,
-            raw: 1,
-            low_power: None,
-            exact: true,
-        });
         assert!(evaluate(&machine("sys mem<critical"), &s, &[]).holds);
         assert!(!evaluate(&machine("sys mem=normal"), &s, &[]).holds);
         assert!(evaluate(&machine("sys mem=normal,warn"), &s, &[]).holds);
         assert!(evaluate(&machine("sys mem!=critical"), &s, &[]).holds);
-        assert!(evaluate(&machine("sys throttle<heavy"), &s, &[]).holds);
-        assert!(!evaluate(&machine("sys throttle=none"), &s, &[]).holds);
         assert!(evaluate(&machine("sys thrash=no"), &s, &[]).holds);
+    }
+
+    /// `thermal` ranks the level 0 to 3 and prints the OS's own word where the level is exact
+    /// and the counter heuristic's where not; either word set names the same rank, and the
+    /// retired `throttle` is refused. Control: the code before A2 S3 refused `thermal` and
+    /// answered `throttle=light` at Fair.
+    #[test]
+    fn the_thermal_metric_ranks_the_os_level() {
+        let mut s = snap(0.1);
+        let fair = Thermal {
+            level: Throttle::Light,
+            raw: 1,
+            low_power: Some(false),
+            exact: true,
+        };
+        s.thermal = Some(fair);
+        let o = evaluate(&machine("sys thermal<serious"), &s, &[]);
+        assert!(o.holds, "{o:?}");
+        assert_eq!(o.values, ["thermal=fair"]);
+        assert!(evaluate(&machine("sys thermal<heavy"), &s, &[]).holds);
+        assert!(evaluate(&machine("sys thermal>nominal"), &s, &[]).holds);
+        assert!(!evaluate(&machine("sys thermal=nominal"), &s, &[]).holds);
+        assert!(!evaluate(&machine("sys thermal>=serious"), &s, &[]).holds);
+        assert!(evaluate(&machine("sys thermal=fair,serious"), &s, &[]).holds);
+        s.thermal = Some(Thermal {
+            level: Throttle::Severe,
+            raw: 3,
+            ..fair
+        });
+        let o = evaluate(&machine("sys thermal>=serious"), &s, &[]);
+        assert!(o.holds);
+        assert_eq!(o.values, ["thermal=critical"]);
+        s.thermal = Some(Thermal {
+            level: Throttle::Light,
+            raw: 1,
+            low_power: None,
+            exact: false,
+        });
+        let o = evaluate(&machine("sys thermal=fair"), &s, &[]);
+        assert!(o.holds, "the heuristic's light is rank 1 too");
+        assert_eq!(o.values, ["thermal=light"]);
+        assert_eq!(
+            machine("sys thermal<heavy").canonical(),
+            "sys thermal<serious"
+        );
+        for retired in [
+            "sys throttle=none",
+            "sys throttle<heavy",
+            "sys thermal=warm",
+        ] {
+            assert_eq!(AwaitSys::parse(retired), Err(USAGE.to_owned()), "{retired}");
+        }
+    }
+
+    /// `quiet`'s thermal term waits out throttling, not fair: it holds at the OS's nominal and
+    /// fair and at the heuristic's none, and not at serious or above, nor at the heuristic's
+    /// light, which counts throttling. Its reading prints the snapshot's word, and an explicit
+    /// `thermal` term replaces it. Control: a preset that wants rank 0 (`thermal=nominal`) never
+    /// holds at fair, where this Mac sits all day.
+    #[test]
+    fn the_quiet_preset_waits_out_throttling_not_fair() {
+        let mut s = snap(0.1);
+        let at = |level, raw, exact| Thermal {
+            level,
+            raw,
+            low_power: Some(false),
+            exact,
+        };
+        for (thermal, met) in [
+            (at(Throttle::None, 0, true), true),
+            (at(Throttle::Light, 1, true), true),
+            (at(Throttle::Heavy, 2, true), false),
+            (at(Throttle::Severe, 3, true), false),
+            (at(Throttle::None, 0, false), true),
+            (at(Throttle::Light, 1, false), false),
+        ] {
+            s.thermal = Some(thermal);
+            let o = evaluate(&machine("sys quiet"), &s, &[7]);
+            assert_eq!(o.holds, met, "{thermal:?}: {o:?}");
+            assert!(o.skipped.is_empty(), "{o:?}");
+        }
+        s.thermal = Some(at(Throttle::Light, 1, true));
+        let o = evaluate(&machine("sys quiet"), &s, &[7]);
+        assert_eq!(
+            o.values,
+            [
+                "cpu=10%",
+                "wait=0.05",
+                "gpu=2%",
+                "thermal=fair",
+                "swap=0B/s"
+            ]
+        );
+        assert!(!evaluate(&machine("sys quiet thermal=nominal"), &s, &[7]).holds);
+        s.thermal = Some(at(Throttle::Heavy, 2, true));
+        assert!(evaluate(&machine("sys quiet thermal<critical"), &s, &[7]).holds);
+        assert_eq!(machine("sys quiet thermal<critical").terms.len(), 5);
     }
 
     #[test]

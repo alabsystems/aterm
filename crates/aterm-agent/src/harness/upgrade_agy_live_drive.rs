@@ -313,7 +313,7 @@ pub(super) fn transcript_look(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let mut f = options.open(&path).map_err(|_| Open::Unreadable)?;
     let meta = f.metadata().map_err(|_| Open::Unreadable)?;
@@ -371,19 +371,20 @@ pub(super) fn messages_look(config: &Path, conversation: &str, now_ms: u64) -> O
     };
     let mut messages = Vec::new();
     for entry in entries {
-        let path = entry.ok()?.path();
-        let Some(id) = path
-            .file_name()
-            .and_then(|n| n.to_str())
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
             .and_then(|n| n.strip_suffix(".json"))
             .filter(|id| *id != "read")
         else {
             continue;
         };
-        let meta = std::fs::metadata(&path).ok()?;
-        if !meta.is_file() {
+        if !entry.file_type().ok()?.is_file() {
             continue;
         }
+        let meta = entry.metadata().ok()?;
+        let path = entry.path();
         messages.push(Message {
             id: id.to_owned(),
             body: super::super::super::accounts::read_bounded(&path, 1024 * 1024)

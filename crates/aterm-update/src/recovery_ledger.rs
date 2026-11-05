@@ -534,7 +534,7 @@ impl Row {
     /// Parse one line; `None` for anything that is not a complete version-1 row.
     #[must_use]
     pub fn parse(line: &str) -> Option<Self> {
-        let mut fields = std::collections::BTreeMap::new();
+        let mut fields: Vec<(&str, &str)> = Vec::with_capacity(18);
         for pair in line.split_whitespace() {
             let (key, value) = pair.split_once('=')?;
             if key.is_empty()
@@ -545,14 +545,15 @@ impl Row {
             {
                 return None;
             }
-            if fields.insert(key, value).is_some() {
+            if fields.iter().any(|(k, _)| *k == key) {
                 return None;
             }
+            fields.push((key, value));
         }
-        if crate::parse_uint::<u32>(fields.get("v")?)? != ROW_VERSION {
+        let get = |key: &str| fields.iter().find_map(|(k, v)| (*k == key).then_some(*v));
+        if crate::parse_uint::<u32>(get("v")?)? != ROW_VERSION {
             return None;
         }
-        let get = |key: &str| fields.get(key).copied();
         let uptime = match get("prev_uptime")? {
             "?" => None,
             token => {
@@ -661,17 +662,18 @@ pub fn read_rows_checked(path: &Path) -> std::io::Result<Checked> {
 }
 
 fn read_text(path: &Path) -> std::io::Result<String> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
-        Err(error) => return Err(error),
-    };
-    if !meta.file_type().is_file() {
-        return Err(std::io::Error::other(
-            "recovery ledger is not a regular file",
-        ));
+    match open_for_read(path) {
+        Ok(file) => read_opened_text(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => {
+            if std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.file_type().is_file()) {
+                return Err(std::io::Error::other(
+                    "recovery ledger is not a regular file",
+                ));
+            }
+            Err(error)
+        }
     }
-    read_opened_text(open_for_read(path)?)
 }
 
 /// Admission and the tail bound belong to the descriptor actually read. The
@@ -731,12 +733,14 @@ pub fn append_row(path: &Path, row: &Row) -> std::io::Result<()> {
     let mut line = row.to_line();
     line.push('\n');
     for _ in 0..4 {
-        let file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(path)?;
+        let file = aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(path)
+        })?;
         let ours = file.metadata()?;
         if !ours.file_type().is_file() {
             return Err(std::io::Error::new(
@@ -744,7 +748,6 @@ pub fn append_row(path: &Path, row: &Row) -> std::io::Result<()> {
                 "recovery ledger is not a regular file",
             ));
         }
-        aterm_uds::keep_out_of_children(&file)?;
         let lock = lock_briefly(&file);
         let same_inode = match std::fs::symlink_metadata(path) {
             Ok(now) => ours.ino() == now.ino() && ours.dev() == now.dev(),
@@ -806,7 +809,7 @@ fn trim_locked(path: &Path) {
     use std::os::unix::fs::OpenOptionsExt as _;
     let rows = read_rows(path);
     let keep = &rows[rows.len().saturating_sub(KEEP_ROWS)..];
-    let mut text = String::new();
+    let mut text = String::with_capacity(keep.len().saturating_mul(160));
     for row in keep {
         text.push_str(&row.to_line());
         text.push('\n');

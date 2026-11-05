@@ -509,13 +509,13 @@ impl Drop for Watch {
 
 /// The checks, as they are printed.
 #[derive(Default)]
-struct Checks {
-    n: u32,
-    bad: u32,
+pub(crate) struct Checks {
+    pub(crate) n: u32,
+    pub(crate) bad: u32,
 }
 
 impl Checks {
-    fn check(&mut self, ok: bool, label: &str) -> bool {
+    pub(crate) fn check(&mut self, ok: bool, label: &str) -> bool {
         self.n += 1;
         if ok {
             println!("  ok   {label}");
@@ -532,7 +532,7 @@ pub const WORKER_TEXTS: &str = "workers-text.txt";
 
 /// A FAILED RUN KEEPS WHAT EACH WORKER'S TAB SHOWS: its `status` line and its `text`, printed and
 /// in the run's [`WORKER_TEXTS`].
-fn keep_worker_texts(run: &Run, door: &Door, sids: &[String]) {
+pub(crate) fn keep_worker_texts(run: &Run, door: &Door, sids: &[String]) {
     let mut all = String::new();
     for sid in sids {
         let at = format!("@{sid}");
@@ -576,7 +576,7 @@ fn transcript_at<'a>(
 }
 
 /// The rows of the transcript whose first prompt holds `token`.
-fn transcript_of<'a>(all: &'a [(PathBuf, Vec<Row>)], token: &str) -> Option<&'a [Row]> {
+pub(crate) fn transcript_of<'a>(all: &'a [(PathBuf, Vec<Row>)], token: &str) -> Option<&'a [Row]> {
     transcript_at(all, token).map(|(_, r)| r.as_slice())
 }
 
@@ -621,7 +621,7 @@ fn rides_parent_mode(argv: &[String]) -> bool {
 }
 
 /// The sids of the manager's spawn results, in order (`OK <sid>`), each tool result once.
-fn spawned(mgr: &[Row]) -> Vec<String> {
+pub(crate) fn spawned(mgr: &[Row]) -> Vec<String> {
     let mut seen: Vec<&str> = Vec::new();
     let mut out = Vec::new();
     for r in mgr {
@@ -697,10 +697,13 @@ const AWAIT_OUTPUT_MAX: u64 = 64 * 1024;
 /// path, the lab user's regular file with one name), read only while it is
 /// at most `max` bytes; why it was not read otherwise.
 fn read_bounded(path: &Path, max: u64) -> Result<String, String> {
-    let file = crate::sys::scratch_file(path)
+    let (file, meta) = crate::sys::scratch_file_with_meta(path)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("nothing at {}", path.display()))?;
-    let mut bytes = Vec::new();
+    if meta.len() > max {
+        return Err(format!("{} holds more than {max} bytes", path.display()));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     std::io::Read::read_to_end(&mut std::io::Read::take(file, max + 1), &mut bytes)
         .map_err(|e| format!("reading {}: {e}", path.display()))?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max {
@@ -710,7 +713,10 @@ fn read_bounded(path: &Path, max: u64) -> Result<String, String> {
 }
 
 /// Wait, in slices that an interrupt ends, until `ready` holds or `limit` passes; whether it held.
-fn wait_for(limit: Duration, mut ready: impl FnMut() -> bool) -> Result<bool, stop::Stopped> {
+pub(crate) fn wait_for(
+    limit: Duration,
+    mut ready: impl FnMut() -> bool,
+) -> Result<bool, stop::Stopped> {
     let end = std::time::Instant::now() + limit;
     loop {
         if ready() {

@@ -251,6 +251,7 @@ fn the_wait_wakes_on_a_moved_login_reading_the_profile_at_a_pace() {
         unix_ms: s.unix_of(until) * 1000,
         why,
         wait,
+        put_off: None,
     });
     let asked = host.asks();
     assert!(!s.login_edge(&opts));
@@ -377,6 +378,7 @@ fn a_replay_without_the_door_reads_no_account() {
         unix_ms: TEST_NOW * 1000,
         why: "a wait".to_owned(),
         wait: WaitKind::Other,
+        put_off: None,
     });
     assert!(!s.login_edge(&opts));
     assert_eq!(host.asks(), 0);
@@ -458,6 +460,7 @@ fn a_moved_login_off_a_limit_the_screen_left_resumes_it_once() {
         unix_ms: TEST_NOW * 1000,
         why: "a wait".to_owned(),
         wait: WaitKind::Other,
+        put_off: None,
     });
     s.login_looked_at = None;
     assert!(!s.login_edge(&opts), "taken: the edge wakes no more");

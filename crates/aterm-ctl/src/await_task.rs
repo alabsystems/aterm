@@ -212,28 +212,25 @@ struct Group {
     sock: String,
     targets: Vec<Target>,
     order: Vec<usize>,
+    /// For targets read off a board ([`run_board_wait`]), each one's row as the board last
+    /// knew it: a worker gone from its Mac before the first answer closes, and a Mac that does
+    /// not answer before it keeps these rows, instead of either ending the wait.
+    recorded: Option<Vec<String>>,
 }
 
-fn group(
-    targets: Vec<Target>,
-    pinned: bool,
-    default: &str,
-    dir: Option<&Path>,
-) -> io::Result<Vec<Group>> {
+/// Group `targets` by the instance that answers for each: a global sid's host, found in `dir`'s
+/// graph, unless the socket is `pinned`; every other target, and a sid no live instance hosts, at
+/// `default`. A worker whose tab the caller's own instance closed once its task concluded is
+/// hosted nowhere, but that instance keeps its end and answers for it; a sid nothing kept is that
+/// instance's `ERR no such session` to say.
+fn group(targets: Vec<Target>, pinned: bool, default: &str, dir: Option<&Path>) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     for (pos, target) in targets.into_iter().enumerate() {
         let sock = match global_sid(&target.selector) {
             Some(sid) if !pinned => dir
                 .and_then(|dir| self_instance_sock_in(dir, Some(sid)))
                 .filter(|sock| aterm_uds::CtlStream::connect(sock).is_ok())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "ERR no such session @{sid}: no live aterm instance on this machine hosts it"
-                        ),
-                    )
-                })?,
+                .unwrap_or_else(|| default.to_string()),
             _ => default.to_string(),
         };
         match groups.iter_mut().find(|g| same_socket_path(&g.sock, &sock)) {
@@ -245,10 +242,11 @@ fn group(
                 sock,
                 targets: vec![target],
                 order: vec![pos],
+                recorded: None,
             }),
         }
     }
-    Ok(groups)
+    groups
 }
 
 enum Leg {
@@ -484,7 +482,7 @@ fn read_leg<R: io::BufRead>(reader: &mut R, max_bytes: usize, hung_up: impl Fn()
     }
 }
 
-fn row_field<'a>(row: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn row_field<'a>(row: &'a str, key: &str) -> Option<&'a str> {
     row.split_whitespace()
         .find_map(|t| t.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
 }
@@ -533,6 +531,12 @@ fn row_news(row: &str, target: &Target, facts: bool) -> bool {
     terminal || fact
 }
 
+/// The row a wait makes for `target` once its Mac no longer hosts it. From `last`, the last row
+/// that Mac answered for it, it is that row with `state=closed` and its `task_news=` as `1`: its
+/// rev is the Mac's, which a board takes as one its worker reported ([`crate::board::Row::merge`];
+/// a row from a Mac too old to write `task_news=` stays without one, and is taken as below). With
+/// none read, it is a row of every column a server's has, at the asker's edge and with no
+/// `task_news=`, which a board reads as no rev its worker reported.
 fn closed_row(last: Option<&str>, target: &Target) -> String {
     match last {
         Some(row) => row
@@ -554,6 +558,12 @@ fn closed_row(last: Option<&str>, target: &Target) -> String {
             target.since.unwrap_or(0)
         ),
     }
+}
+
+/// Whether `e` is a Mac's answer that no window is open on it: its node job's, which hosts no
+/// session.
+fn is_windowless(e: &io::Error) -> bool {
+    e.to_string().starts_with("ERR no window open on this Mac")
 }
 
 fn gone_target(e: &io::Error, targets: &[Target], live: &[usize]) -> Option<usize> {
@@ -607,18 +617,22 @@ enum Report {
 enum End {
     Answered(Vec<String>),
     TimedOut(Vec<String>),
-    /// Past the baseline, its peer served no leg from `since` to the timeout (`why`: the last's).
+    /// Past the baseline (or a board's group before it), its peer served no leg from `since`
+    /// to the timeout (`why`: the last's); `served` whether it served the baseline.
     Unanswered {
         rows: Vec<String>,
         since: Instant,
         why: io::Error,
+        served: bool,
     },
     Failed(io::Error),
-    /// Past the baseline, its peer refused this Mac's drive ([`Leg::Ungranted`]).
+    /// Past the baseline (or a board's group before it), its peer refused this Mac's drive
+    /// ([`Leg::Ungranted`]); `served` whether it served the baseline.
     Ungranted {
         rows: Vec<String>,
         why: io::Error,
         lowered: bool,
+        served: bool,
     },
     Code(ExitCode),
 }
@@ -641,7 +655,20 @@ fn run_group(
 ) -> End {
     use std::sync::atomic::Ordering::Relaxed;
     let n = group.targets.len();
-    let mut rows: Vec<Option<String>> = vec![None; n];
+    // A board's targets start from the rows it knows, which a Mac that never answers leaves: no
+    // failure of its Mac ends the other Macs' wait.
+    let tolerant = group.recorded.is_some();
+    let failed = |rows: Vec<Option<String>>, (asked, served): (Instant, bool), e: io::Error| {
+        if tolerant {
+            ran_out((served, true), rows, (Some(asked), e))
+        } else {
+            End::Failed(e)
+        }
+    };
+    let mut rows: Vec<Option<String>> = match group.recorded.clone() {
+        Some(known) if known.len() == n => known.into_iter().map(Some).collect(),
+        _ => vec![None; n],
+    };
     let mut ready = vec![false; n];
     let mut baseline_read = false;
     let mut unserved_since: Option<Instant> = None;
@@ -672,31 +699,53 @@ fn run_group(
         let (answered, latest) = match (legs.send)(&group.sock, &request, wait) {
             Leg::Answered(latest) => (true, latest),
             Leg::TimedOut(latest) => (false, latest),
+            Leg::Failed(e) if tolerant && is_windowless(&e) => {
+                // A Mac with no window open hosts no worker: each is gone, as a closed tab.
+                for &i in &live {
+                    ready[i] = true;
+                    let last = rows[i].as_deref().filter(|_| baseline_read);
+                    rows[i] = Some(closed_row(last, &group.targets[i]));
+                }
+                continue;
+            }
             Leg::Failed(e) => {
-                let Some(i) = baseline_read
+                let Some(i) = (baseline_read || tolerant)
                     .then(|| gone_target(&e, &group.targets, &live))
                     .flatten()
                 else {
-                    return End::Failed(e);
+                    return failed(rows, (asked, baseline_read), e);
                 };
                 ready[i] = true;
-                rows[i] = Some(closed_row(rows[i].as_deref(), &group.targets[i]));
+                let last = rows[i].as_deref().filter(|_| baseline_read);
+                rows[i] = Some(closed_row(last, &group.targets[i]));
                 continue;
             }
+            Leg::Code(_) if tolerant => {
+                let why =
+                    io::Error::other(format!("the aterm at {} did not take the wait", group.sock));
+                return ran_out((baseline_read, true), rows, (Some(asked), why));
+            }
             Leg::Code(code) => return End::Code(code),
-            Leg::Ungranted { why, lowered } if baseline_read => {
+            Leg::Ungranted { why, lowered } if baseline_read || tolerant => {
                 return End::Ungranted {
                     rows: rows.into_iter().flatten().collect(),
                     why,
                     lowered,
+                    served: baseline_read,
                 };
             }
             Leg::Ungranted { why, .. } => return End::Failed(why),
             Leg::Cut(e) => {
                 let since = *unserved_since.get_or_insert(asked);
-                return ran_out(baseline_read, rows, (Some(since), e));
+                return ran_out((baseline_read, tolerant), rows, (Some(since), e));
             }
-            Leg::Spent(e) => return ran_out(baseline_read, rows, (unserved_since, e)),
+            Leg::Spent(e) => {
+                let since = unserved_since.or(tolerant.then_some(asked));
+                return ran_out((baseline_read, tolerant), rows, (since, e));
+            }
+            Leg::Silent(e) if !baseline_read && tolerant => {
+                return ran_out((false, true), rows, (Some(asked), e));
+            }
             Leg::Silent(e) if !baseline_read => return End::Failed(e),
             Leg::Again(e) | Leg::Silent(e) => {
                 if baseline_read && stop.load(Relaxed) {
@@ -705,7 +754,7 @@ fn run_group(
                 let now = Instant::now();
                 let since = *unserved_since.get_or_insert(asked);
                 if until.is_some_and(|until| now >= until) {
-                    return ran_out(baseline_read, rows, (Some(since), e));
+                    return ran_out((baseline_read, tolerant), rows, (Some(since), e));
                 }
                 // Past the baseline, a wait with a timeout asks until it; one with none, as long
                 // as one before it would.
@@ -713,7 +762,7 @@ fn run_group(
                 if (!baseline_read || until.is_none())
                     && now.saturating_duration_since(since) >= most
                 {
-                    return ran_out(baseline_read, rows, (Some(since), e));
+                    return ran_out((baseline_read, tolerant), rows, (Some(since), e));
                 }
                 std::thread::sleep(until.map_or(after, |until| {
                     until.saturating_duration_since(now).min(after)
@@ -722,7 +771,7 @@ fn run_group(
                     return End::TimedOut(rows.into_iter().flatten().collect());
                 }
                 if until.is_some_and(|until| Instant::now() >= until) {
-                    return ran_out(baseline_read, rows, (Some(since), e));
+                    return ran_out((baseline_read, tolerant), rows, (Some(since), e));
                 }
                 continue;
             }
@@ -747,30 +796,47 @@ fn run_group(
                         waited,
                         by_deadline,
                     } => {
-                        let _ = stderr_line(&redial::gone_note(
-                            server,
-                            waited,
-                            by_deadline,
-                            policy.unfollowed(),
-                        ));
+                        let note =
+                            redial::gone_note(server, waited, by_deadline, policy.unfollowed());
+                        if tolerant {
+                            return ran_out(
+                                (baseline_read, true),
+                                rows,
+                                (Some(asked), io::Error::other(note)),
+                            );
+                        }
+                        let _ = stderr_line(&note);
                         return End::Code(ExitCode::from(redial::EXIT_REPLACED));
                     }
                     redial::Hangup::StillServing | redial::Hangup::Unknown => {
-                        return End::Failed(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "server closed the connection without responding",
-                        ));
+                        return failed(
+                            rows,
+                            (asked, baseline_read),
+                            io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "server closed the connection without responding",
+                            ),
+                        );
                     }
                 }
             }
         };
         unserved_since = None;
         if latest.len() != live.len() {
-            return End::Failed(malformed(&format!(
-                "{} rows for {} targets",
-                latest.len(),
-                live.len()
-            )));
+            let e = malformed(&format!("{} rows for {} targets", latest.len(), live.len()));
+            return failed(rows, (asked, baseline_read), e);
+        }
+        // A worker asked by its global sid is answered by a row naming it: a row naming another
+        // is no answer for it, and would make one Mac's answer another worker's state.
+        if let Some(row) = live
+            .iter()
+            .zip(&latest)
+            .find(|&(&i, row)| {
+                global_sid(&group.targets[i].selector).is_some_and(|sid| row_sid(row) != Some(sid))
+            })
+            .map(|(_, row)| row.clone())
+        {
+            return failed(rows, (asked, baseline_read), malformed(&row));
         }
         for (&i, row) in live.iter().zip(latest) {
             if !baseline_read {
@@ -803,17 +869,18 @@ fn run_group(
 /// A wait whose deadline ran out at a leg the peer did not answer (`e`): with the rows read, and
 /// since when none was served (`unserved`), or before the baseline that leg's cause.
 fn ran_out(
-    baseline_read: bool,
+    (served, tolerant): (bool, bool),
     rows: Vec<Option<String>>,
     (unserved, e): (Option<Instant>, io::Error),
 ) -> End {
     let rows = rows.into_iter().flatten().collect();
     match unserved {
-        _ if !baseline_read => End::Failed(e),
+        _ if !served && !tolerant => End::Failed(e),
         Some(since) => End::Unanswered {
             rows,
             since,
             why: e,
+            served,
         },
         None => End::TimedOut(rows),
     }
@@ -830,6 +897,7 @@ enum Waited {
         rows: Vec<String>,
         since: Instant,
         why: io::Error,
+        served: bool,
     },
     /// A wait over a drive that ended as [`End::Ungranted`].
     Ungranted {
@@ -837,6 +905,7 @@ enum Waited {
         rows: Vec<String>,
         why: io::Error,
         lowered: bool,
+        served: bool,
     },
     Code(ExitCode),
 }
@@ -919,17 +988,19 @@ fn wait_task_groups(
                         rows: latest,
                         since,
                         why,
+                        served,
                     } => {
                         rows[index] = latest;
-                        unanswered = Some((group_socks[index].clone(), since, why));
+                        unanswered = Some((group_socks[index].clone(), since, why, served));
                     }
                     End::Ungranted {
                         rows: latest,
                         why,
                         lowered,
+                        served,
                     } => {
                         rows[index] = latest;
-                        ungranted = Some((group_socks[index].clone(), why, lowered));
+                        ungranted = Some((group_socks[index].clone(), why, lowered, served));
                     }
                     End::Failed(e) => {
                         stop.store(true, Ordering::Relaxed);
@@ -964,17 +1035,19 @@ fn wait_task_groups(
             rows,
             answered: true,
         },
-        (Some((at, why, lowered)), _) => Waited::Ungranted {
+        (Some((at, why, lowered, served)), _) => Waited::Ungranted {
             at,
             rows,
             why,
             lowered,
+            served,
         },
-        (None, Some((at, since, why))) => Waited::Unanswered {
+        (None, Some((at, since, why, served))) => Waited::Unanswered {
             at,
             rows,
             since,
             why,
+            served,
         },
         (None, None) => Waited::Rows {
             rows,
@@ -1008,7 +1081,7 @@ pub(crate) fn run_await_task(
             fact_since: t.fact_since.or(request.fact_since),
         })
         .collect();
-    let groups = group(targets, pinned, default, dir.as_deref())?;
+    let groups = group(targets, pinned, default, dir.as_deref());
     let legs = Legs {
         max: LEG_MAX,
         send: Arc::new(socket_leg),
@@ -1017,6 +1090,7 @@ pub(crate) fn run_await_task(
     print_waited(
         wait_task_groups(groups, request.combine, request.facts, until, follow, &legs)?,
         default,
+        crate::board::Writes::Here,
     )
 }
 
@@ -1027,7 +1101,13 @@ pub(crate) fn run_driven(
     host: &str,
     drive: crate::FleetDriveFn,
 ) -> io::Result<ExitCode> {
-    print_waited(driven_wait(parts, total, host, drive)?, host)
+    // A Mac a person named answers for whatever sids it is asked: the board's keeper, which
+    // asks each worker at its own Mac, keeps their rows.
+    print_waited(
+        driven_wait(parts, total, host, drive)?,
+        host,
+        crate::board::Writes::Nothing,
+    )
 }
 
 /// `await task …` under `--host any`, resolving each `@s-<hex>` target to the peer hosting it.
@@ -1038,7 +1118,8 @@ pub(crate) fn run_driven_any(
     survey: Option<crate::FleetSurveyFn>,
 ) -> io::Result<ExitCode> {
     let (waited, at) = driven_wait_any(parts, total, drive, survey)?;
-    print_waited(waited, &at)
+    // Each worker the board holds was asked at the Mac its row names.
+    print_waited(waited, &at, crate::board::Writes::Rows)
 }
 
 fn driven_wait_any(
@@ -1102,6 +1183,7 @@ fn driven_wait_any(
                 sock: host.clone(),
                 targets: vec![target],
                 order: vec![pos],
+                recorded: None,
             });
         }
     }
@@ -1192,6 +1274,7 @@ fn driven_wait(
         sock: host,
         targets,
         order,
+        recorded: None,
     }];
     wait_task_groups(
         groups,
@@ -1203,9 +1286,510 @@ fn driven_wait(
     )
 }
 
+/// Where the board a wait reads is kept ([`run_board_wait`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoardAt<'a> {
+    /// This Mac's.
+    Here,
+    /// The Mac `--host <h>` names, read over a drive.
+    Host(&'a str),
+}
+
+/// Whether `parts` is `await task board …` ([`run_board_wait`]).
+pub(crate) fn is_board_wait(parts: &[String]) -> bool {
+    is_await_task(parts)
+        && parts.first().is_some_and(|word| word == "await")
+        && parts.get(2).is_some_and(|word| word == "board")
+}
+
+/// The most targets one `await task` leg names: the server's limit (`MAX_AWAIT_TARGETS`).
+const LEG_TARGETS_MAX: usize = 64;
+
+/// Where one group of a board's workers is waited on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Reach {
+    /// This Mac's instance at a socket.
+    Socket(String),
+    /// Another Mac, over a drive, by the word `--host` takes (its node id, or a host).
+    Drive(String),
+    /// Nowhere this client can reach, and why.
+    Nowhere(String),
+}
+
+impl Reach {
+    /// The group key a wait's legs are sent by.
+    fn key(&self) -> String {
+        match self {
+            Self::Socket(sock) => sock.clone(),
+            Self::Drive(host) => format!("drive:{host}"),
+            Self::Nowhere(why) => format!("nowhere:{why}"),
+        }
+    }
+}
+
+/// Where the worker of `row` is waited on: a sid an instance of this Mac hosts (the socket
+/// folder `dir` names it) over that instance's socket, or nowhere while it does not answer
+/// (an instance restarting, whose workers are not gone); a row of this Mac (`node=-` on its own
+/// board, or this Mac's node `own`) over its instance at `here`, which answers for a worker no
+/// instance hosts any longer that it is gone, never over a drive to itself; `node=-` on another
+/// Mac's board (`at`) over a drive to that Mac; any other node over a drive.
+fn reach_of(
+    row: &crate::board::Row,
+    at: BoardAt<'_>,
+    dir: Option<&Path>,
+    (here, own): (Option<&str>, Option<&str>),
+) -> Reach {
+    if let Some(sock) = dir.and_then(|dir| self_instance_sock_in(dir, Some(&row.sid))) {
+        if aterm_uds::CtlStream::connect(&sock).is_ok() {
+            return Reach::Socket(sock);
+        }
+        return Reach::Nowhere(format!(
+            "the aterm instance of this Mac hosting @{} does not answer",
+            row.sid
+        ));
+    }
+    let this_mac = match (&row.node, at) {
+        (Some(node), _) => own == Some(node.as_str()),
+        (None, BoardAt::Here) => true,
+        (None, BoardAt::Host(_)) => false,
+    };
+    if this_mac {
+        return here.map_or_else(
+            || Reach::Nowhere("no aterm instance on this Mac answers".to_owned()),
+            |sock| Reach::Socket(sock.to_owned()),
+        );
+    }
+    match (&row.node, at) {
+        (Some(node), _) => Reach::Drive(node.clone()),
+        (None, BoardAt::Host(host)) => Reach::Drive(host.to_owned()),
+        (None, BoardAt::Here) => unreachable!("a row of this Mac is waited on here"),
+    }
+}
+
+/// How a person names `reach` in a note: the Mac's host as a row names it, else its word.
+fn reach_name(reach: &Reach, rows: &[crate::board::Row]) -> String {
+    match reach {
+        Reach::Socket(_) => "this Mac".to_owned(),
+        Reach::Drive(word) => rows
+            .iter()
+            .find(|row| row.node.as_deref() == Some(word.as_str()))
+            .and_then(|row| row.host.clone())
+            .unwrap_or_else(|| word.clone()),
+        Reach::Nowhere(why) => why.clone(),
+    }
+}
+
+/// One leg to `reach`: over its socket, over a drive (`drive`, cut by `cut`), or nowhere.
+fn reach_leg(
+    reach: &Reach,
+    drive: Option<crate::FleetDriveFn>,
+    (request, wait): (&str, Duration),
+    (cut, longer): (Option<(Instant, Duration)>, Option<crate::remote::Longer>),
+) -> Leg {
+    match (reach, drive) {
+        (Reach::Socket(sock), _) => socket_leg(sock, request, wait),
+        (Reach::Drive(host), Some(drive)) => {
+            driven_leg(drive, (host, request), wait, (cut, longer))
+        }
+        (Reach::Drive(_), None) => Leg::Silent(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this aterm-ctl links no fleet, so it reaches no other Mac: run `aterm ctl`",
+        )),
+        (Reach::Nowhere(why), _) => Leg::Silent(io::Error::other(why.clone())),
+    }
+}
+
+/// The groups a wait over `rows` (a board's open rows) sends its legs to, at most
+/// [`LEG_TARGETS_MAX`] targets each, every target with `since` (else its row's revision) and
+/// `fact_since` and its row as the board knows it ([`Group::recorded`]), with each group's
+/// [`Reach`] by its key; `here` is this Mac's instance socket and fleet node ([`reach_of`]).
+fn board_groups(
+    rows: &[crate::board::Row],
+    at: BoardAt<'_>,
+    here: (Option<&str>, Option<&str>),
+    (since, fact_since): (Option<u64>, Option<u64>),
+) -> (Vec<Group>, Vec<(String, Reach)>) {
+    let dir = socket_dir();
+    let mut groups: Vec<Group> = Vec::new();
+    let mut reaches: Vec<(String, Reach)> = Vec::new();
+    for (pos, row) in rows.iter().enumerate() {
+        let reach = reach_of(row, at, dir.as_deref(), here);
+        let key = reach.key();
+        if !reaches.iter().any(|(k, _)| *k == key) {
+            reaches.push((key.clone(), reach));
+        }
+        // With no `since=`, a worker's edge is its row's: news the board lacks.
+        let target = Target {
+            selector: row.sid.clone(),
+            since: since.or(Some(row.rev)),
+            fact_since,
+        };
+        match groups
+            .iter_mut()
+            .find(|g| g.sock == key && g.targets.len() < LEG_TARGETS_MAX)
+        {
+            Some(group) => {
+                group.targets.push(target);
+                group.order.push(pos);
+                if let Some(known) = group.recorded.as_mut() {
+                    known.push(row.await_row());
+                }
+            }
+            None => groups.push(Group {
+                sock: key,
+                targets: vec![target],
+                order: vec![pos],
+                recorded: Some(vec![row.await_row()]),
+            }),
+        }
+    }
+    (groups, reaches)
+}
+
+/// How long a board's wait asks again a Mac that answered `Again` before its first answer:
+/// briefly, so an `any` is not held by a Mac that is down.
+const BOARD_AGAIN_FOR: Duration = Duration::from_secs(5);
+
+/// Where a board's wait runs: the board (`at`), this Mac's instance socket (`here`) and its
+/// fleet node (`own`), where it has them.
+pub(crate) struct BoardSite<'a> {
+    pub(crate) at: BoardAt<'a>,
+    pub(crate) here: Option<&'a str>,
+    pub(crate) own: Option<String>,
+}
+
+/// `aterm ctl [--host <h>] await task board [any|all] [since=<rev>] [facts=1 …] [timeout=<ms>]
+/// [from=<sid>] [label=<word>|<prefix>*]`: `await task` over every open row of a board (this
+/// Mac's, or `<h>`'s read over a drive) that the filter takes, each worker where it runs
+/// ([`reach_of`]), so a session waits on everything a dispatcher started without knowing a sid.
+/// With no `since=`, each worker's edge is its row's revision: news the board lacks. A Mac that
+/// fails, refuses or does not answer keeps the board's rows for its workers (`read=board`); it
+/// never ends the others' wait. `follow` is how a local leg follows its instance's successor.
+/// # Errors
+/// The words are no `await task board …`, the board cannot be read, or the wait fails.
+pub(crate) fn run_board_wait(
+    parts: &[String],
+    total: Option<Option<Duration>>,
+    site: &BoardSite<'_>,
+    drive: Option<crate::FleetDriveFn>,
+    follow: &redial::Redial,
+) -> io::Result<ExitCode> {
+    let at = site.at;
+    let mut words = parts.to_vec();
+    words.remove(2);
+    let (words, filter) = crate::board::Filter::take(&words)?;
+    if words.iter().any(|word| word.starts_with('@')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ERR usage: aterm ctl [--host <h>] await task board [any|all] [since=<rev>] \
+             [timeout=<ms>] [from=<sid>] [label=<word>]: the board names the workers, so it \
+             takes no @<sid>",
+        ));
+    }
+    let request = parse(&words)?;
+    let start = Instant::now();
+    let read = match at {
+        BoardAt::Here => {
+            let board = crate::board::Board::here().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Unsupported, "this Mac keeps no board")
+            })?;
+            crate::board::Read {
+                header: crate::board::host_name()
+                    .map(|host| vec![("host".to_owned(), host)])
+                    .unwrap_or_default(),
+                rows: board.scan().rows,
+            }
+        }
+        BoardAt::Host(host) => {
+            let drive = drive.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "--host reads another Mac's board over the fleet, which this aterm-ctl does \
+                     not link: run `aterm ctl --host …`",
+                )
+            })?;
+            let read = crate::remote::read_board(host, total, drive)?;
+            let shown_open = read.rows.iter().filter(|row| row.is_open()).count();
+            let open = read
+                .header
+                .iter()
+                .find(|(key, _)| key == "open")
+                .and_then(|(_, n)| parse_u64(n));
+            if let Some(open) = open.filter(|&open| open > shown_open as u64) {
+                stderr_line(&format!(
+                    "note: {host}'s board holds {open} open rows and showed {shown_open}: the \
+                     wait is on those"
+                ))?;
+            }
+            read
+        }
+    };
+    let board_host = match at {
+        BoardAt::Here => read.host().map(str::to_owned),
+        BoardAt::Host(host) => Some(read.host().unwrap_or(host).to_owned()),
+    };
+    let open: Vec<crate::board::Row> = read
+        .rows
+        .into_iter()
+        .filter(|row| row.is_open() && row.matches(&filter))
+        .collect();
+    if open.is_empty() {
+        stderr_line("OK board: no open worker")?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let cut = total
+        .flatten()
+        .map(|flag| (instant_after(start, flag), flag));
+    let whole = match (request.timeout, total) {
+        (Some(verb), _) => Some(verb),
+        (None, Some(flag)) => flag,
+        (None, None) => Some(DEFAULT_TOTAL),
+    };
+    let inside = cut.map(|(_, flag)| flag.saturating_sub(cut_reserve(flag)));
+    let until = whole.map(|t| instant_after(start, inside.map_or(t, |inside| t.min(inside))));
+    let longer = inside
+        .filter(|&inside| whole.is_some_and(|t| inside < t))
+        .map(|_| crate::remote::Longer::Wait(request.timeout));
+    let (groups, reaches) = board_groups(
+        &open,
+        at,
+        (site.here, site.own.as_deref()),
+        (request.since, request.fact_since),
+    );
+    let names: Vec<(String, String)> = reaches
+        .iter()
+        .map(|(key, reach)| (key.clone(), reach_name(reach, &open)))
+        .collect();
+    let legs = Legs {
+        max: DRIVEN_LEG_MAX,
+        // A key no reach names is a local instance's successor (`Redial`), at its socket.
+        send: Arc::new(move |key: &str, req: &str, wait: Duration| {
+            match reaches.iter().find(|(k, _)| k == key) {
+                Some((_, reach)) => reach_leg(reach, drive, (req, wait), (cut, longer)),
+                None => socket_leg(key, req, wait),
+            }
+        }),
+        again: (AGAIN_AFTER, BOARD_AGAIN_FOR),
+    };
+    let waited = wait_task_groups(groups, request.combine, request.facts, until, follow, &legs)?;
+    let tails: Vec<(String, String)> = open
+        .iter()
+        .map(|row| (row.sid.clone(), row.wait_tail(board_host.as_deref())))
+        .collect();
+    let at_word = match at {
+        BoardAt::Here => "board".to_owned(),
+        BoardAt::Host(host) => host.to_owned(),
+    };
+    let waited = with_tails(waited, &tails);
+    // Another Mac's board names where its workers run, not this one's.
+    let writes = match at {
+        BoardAt::Here => crate::board::Writes::Rows,
+        BoardAt::Host(_) => crate::board::Writes::Nothing,
+    };
+    print_waited(named_at(waited, &names), &at_word, writes)
+}
+
+/// `waited`'s note names the Mac that failed it as a person names it, not by its group's key.
+fn named_at(waited: Waited, names: &[(String, String)]) -> Waited {
+    let name = |at: String| {
+        names
+            .iter()
+            .find(|(key, _)| *key == at)
+            .map_or(at, |(_, name)| name.clone())
+    };
+    match waited {
+        Waited::Unanswered {
+            at,
+            rows,
+            since,
+            why,
+            served,
+        } => Waited::Unanswered {
+            at: name(at),
+            rows,
+            since,
+            why,
+            served,
+        },
+        Waited::Ungranted {
+            at,
+            rows,
+            why,
+            lowered,
+            served,
+        } => Waited::Ungranted {
+            at: name(at),
+            rows,
+            why,
+            lowered,
+            served,
+        },
+        waited => waited,
+    }
+}
+
+/// `waited` with each row of a board's worker ending in its label and Mac ([`Row::wait_tail`]).
+///
+/// [`Row::wait_tail`]: crate::board::Row::wait_tail
+fn with_tails(waited: Waited, tails: &[(String, String)]) -> Waited {
+    let tail = |rows: Vec<String>| -> Vec<String> {
+        rows.into_iter()
+            .map(|row| {
+                let sid = row_sid(&row).map(str::to_owned);
+                match sid.and_then(|sid| tails.iter().find(|(s, _)| *s == sid)) {
+                    Some((_, tail)) => format!("{row}{tail}"),
+                    None => row,
+                }
+            })
+            .collect()
+    };
+    match waited {
+        Waited::Rows { rows, answered } => Waited::Rows {
+            rows: tail(rows),
+            answered,
+        },
+        Waited::Unanswered {
+            at,
+            rows,
+            since,
+            why,
+            served,
+        } => Waited::Unanswered {
+            at,
+            rows: tail(rows),
+            since,
+            why,
+            served,
+        },
+        Waited::Ungranted {
+            at,
+            rows,
+            why,
+            lowered,
+            served,
+        } => Waited::Ungranted {
+            at,
+            rows: tail(rows),
+            why,
+            lowered,
+            served,
+        },
+        Waited::Code(code) => Waited::Code(code),
+    }
+}
+
+/// What one round of a board's keeper read ([`keep_round`]).
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct Round {
+    /// Every row a Mac answered, as `await task` gives it, and a closed row for each worker its
+    /// Mac no longer hosts.
+    pub(crate) seen: Vec<String>,
+    /// The drive words (node ids, hosts) of the Macs that did not answer.
+    pub(crate) unanswered: Vec<String>,
+}
+
+/// One round of a board's keeper over `rows`: for each Mac, one `await task @<sid>:<rev>,… any
+/// timeout=<wait>` leg, each sid's rev the row's, so a Mac answers at once with news the board
+/// lacks and otherwise at the leg's end with every row. A worker its Mac no longer hosts (`ERR no
+/// such session`, or no window open there) comes back closed; `here` is this Mac's own instance
+/// socket and fleet node ([`reach_of`]).
+#[cfg(unix)]
+pub(crate) fn keep_round(
+    rows: &[crate::board::Row],
+    drive: Option<crate::FleetDriveFn>,
+    here: (Option<&str>, Option<&str>),
+    wait: Duration,
+) -> Round {
+    let dir = socket_dir();
+    let mut groups: Vec<(Reach, Vec<Target>)> = Vec::new();
+    for row in rows {
+        let reach = reach_of(row, BoardAt::Here, dir.as_deref(), here);
+        if matches!(reach, Reach::Nowhere(_))
+            || (matches!(reach, Reach::Drive(_)) && drive.is_none())
+        {
+            continue;
+        }
+        let target = Target {
+            selector: row.sid.clone(),
+            since: Some(row.rev),
+            fact_since: None,
+        };
+        match groups
+            .iter_mut()
+            .find(|(r, targets)| *r == reach && targets.len() < LEG_TARGETS_MAX)
+        {
+            Some((_, targets)) => targets.push(target),
+            None => groups.push((reach, vec![target])),
+        }
+    }
+    let handles: Vec<_> = groups
+        .into_iter()
+        .filter_map(|(reach, targets)| {
+            std::thread::Builder::new()
+                .name("aterm-board-keeper-leg".into())
+                .spawn(move || keep_group(&reach, targets, drive, wait))
+                .ok()
+        })
+        .collect();
+    let mut round = Round::default();
+    for handle in handles {
+        if let Ok((seen, unanswered)) = handle.join() {
+            round.seen.extend(seen);
+            round.unanswered.extend(unanswered);
+        }
+    }
+    round
+}
+
+/// One keeper leg to `reach` over `targets`, asked again past each worker its Mac no longer
+/// hosts: the rows read, and the reach's drive word where it did not answer.
+#[cfg(unix)]
+fn keep_group(
+    reach: &Reach,
+    mut targets: Vec<Target>,
+    drive: Option<crate::FleetDriveFn>,
+    wait: Duration,
+) -> (Vec<String>, Vec<String>) {
+    let mut seen = Vec::new();
+    let unanswered = || match reach {
+        Reach::Drive(host) => vec![host.clone()],
+        _ => Vec::new(),
+    };
+    while !targets.is_empty() {
+        let request = leg_request(targets.iter(), Combine::Any, false, wait);
+        match reach_leg(reach, drive, (&request, wait), (None, None)) {
+            Leg::Answered(rows) | Leg::TimedOut(rows)
+                if rows.len() == targets.len()
+                    && rows
+                        .iter()
+                        .zip(&targets)
+                        .all(|(row, target)| row_sid(row) == Some(target.selector.as_str())) =>
+            {
+                seen.extend(rows);
+                return (seen, Vec::new());
+            }
+            Leg::Failed(e) if is_windowless(&e) => {
+                seen.extend(targets.iter().map(|gone| closed_row(None, gone)));
+                return (seen, Vec::new());
+            }
+            Leg::Failed(e) => {
+                let live: Vec<usize> = (0..targets.len()).collect();
+                let Some(i) = gone_target(&e, &targets, &live) else {
+                    return (seen, unanswered());
+                };
+                let gone = targets.remove(i);
+                seen.push(closed_row(None, &gone));
+            }
+            _ => return (seen, unanswered()),
+        }
+    }
+    (seen, Vec::new())
+}
+
 /// The rows on stdout, then `OK timeout` (124), [`unanswered`] at `at` (75, as a blocking read
 /// whose instance went away), or [`ungranted`] at `at` (1, as a denial).
-fn print_waited(waited: Waited, at: &str) -> io::Result<ExitCode> {
+fn print_waited(waited: Waited, at: &str, writes: crate::board::Writes) -> io::Result<ExitCode> {
     let (rows, end) = match waited {
         Waited::Rows {
             rows,
@@ -1217,11 +1801,15 @@ fn print_waited(waited: Waited, at: &str) -> io::Result<ExitCode> {
             rows,
             since,
             why,
+            served,
         } => {
             let target = if group_at.is_empty() { at } else { &group_at };
             (
                 rows,
-                Some((unanswered(target, since, &why), redial::EXIT_REPLACED)),
+                Some((
+                    unanswered(target, since, &why, served),
+                    redial::EXIT_REPLACED,
+                )),
             )
         }
         Waited::Ungranted {
@@ -1229,12 +1817,14 @@ fn print_waited(waited: Waited, at: &str) -> io::Result<ExitCode> {
             rows,
             why,
             lowered,
+            served,
         } => {
             let target = if group_at.is_empty() { at } else { &group_at };
-            (rows, Some((ungranted(target, &why, lowered), 1)))
+            (rows, Some((ungranted(target, &why, lowered, served), 1)))
         }
         Waited::Code(code) => return Ok(code),
     };
+    crate::board::apply_seen(&rows, writes);
     let stdout = stdout_handle();
     let mut out = StdoutSink::new(stdout.lock());
     for row in &rows {
@@ -1251,9 +1841,10 @@ fn print_waited(waited: Waited, at: &str) -> io::Result<ExitCode> {
     }
 }
 
-/// Why a wait over a drive ended with the rows it read before: `at`, which served its baseline,
-/// refused this Mac's drive since (`why`), its fleet level below drive now where `lowered`.
-fn ungranted(at: &str, why: &io::Error, lowered: bool) -> String {
+/// Why a wait over a drive ended with the rows it read before: `at` refused this Mac's drive
+/// (`why`), its fleet level below drive now where `lowered`, after serving the wait's baseline
+/// where `served`, or before it, on a board's wait, which keeps the board's rows.
+fn ungranted(at: &str, why: &io::Error, lowered: bool, served: bool) -> String {
     let cause = if lowered {
         "its person took back this Mac's grant: its [fleet] allow is below drive now (`aterm fleet \
          allow content` or `facts` there)"
@@ -1265,18 +1856,34 @@ fn ungranted(at: &str, why: &io::Error, lowered: bool) -> String {
                 .trim_start_matches(aterm_types::control_verbs::DRIVE_UNGRANTED)
         )
     };
-    format!(
-        "{at} served this wait's baseline and refuses this Mac's drive since ({cause}), so the \
-         rows are the last it read there"
-    )
+    if served {
+        format!(
+            "{at} served this wait's baseline and refuses this Mac's drive since ({cause}), so \
+             the rows are the last it read there"
+        )
+    } else {
+        format!(
+            "{at} refuses this Mac's drive ({}), so its workers' rows are the board's record \
+             (`read=board`)",
+            why.to_string()
+                .trim_start_matches(aterm_types::control_verbs::DRIVE_UNGRANTED)
+        )
+    }
 }
 
 /// Why a wait over a drive ended with the rows it read before: nothing answered at `at` since
-/// `since`.
-fn unanswered(at: &str, since: Instant, why: &io::Error) -> String {
+/// `since`, after it served the wait's baseline where `served`, or before it, on a board's wait,
+/// which keeps the board's rows.
+fn unanswered(at: &str, since: Instant, why: &io::Error, served: bool) -> String {
+    let rows = if served {
+        "the rows are the last it read there"
+    } else {
+        "its workers' rows are the board's record (`read=board`), or closed where it said they \
+         are gone"
+    };
     format!(
-        "nothing answered at {at} for the last {:.1} s of this wait ({why}), so the rows are the \
-         last it read there; `aterm ctl survey --host {at}` says whether that Mac answers again",
+        "nothing answered at {at} for the last {:.1} s of this wait ({why}), so {rows}; `aterm \
+         ctl survey --host {at}` says whether that Mac answers again",
         since.elapsed().as_secs_f64()
     )
 }
@@ -1505,11 +2112,95 @@ mod tests {
             "a row the client writes has every column a server row has"
         );
         assert!(row_closed(&closed_row(None, &targets[0])));
+        assert!(
+            row_field(&closed_row(None, &targets[0]), "task_news").is_none(),
+            "a row the client writes says so by having no `task_news=`, which the board reads \
+             as a rev no worker reported"
+        );
         let refusal = io::Error::other("ERR no such session @s-a");
         assert_eq!(gone_target(&refusal, &targets, &[0, 1]), Some(0));
         assert_eq!(gone_target(&refusal, &targets, &[1]), None, "not live");
         let other = io::Error::other("ERR denied");
         assert_eq!(gone_target(&other, &targets, &[0, 1]), None);
+    }
+
+    /// A close a wait builds from the last row the worker's Mac answered keeps that row's rev and
+    /// `task_news=`, so a board takes the rev as one its worker reported: a live row read before
+    /// the close, at a lower rev, does not reopen the row and drop the conclusion and receipt the
+    /// close kept (the loss 6a8935aa23 stopped for a close the Mac wrote, which dropping
+    /// `task_news=` here would bring back on this path), and the worker's own row at the close's
+    /// rev still reopens it. NEGATIVE CONTROL: the close a wait builds from no row carries the
+    /// asker's edge and no `task_news=`, which leaves the board's rev, so the worker's own answer
+    /// below that edge still reopens the row.
+    #[test]
+    fn a_close_from_the_macs_last_row_keeps_its_rev_and_one_from_none_does_not() {
+        let target = Target {
+            selector: "s-0a1".into(),
+            since: Some(9),
+            fact_since: None,
+        };
+        let open = |rev: u64| crate::board::Row {
+            rev,
+            ..crate::board::Row::started("s-0a1", 1)
+        };
+        let last = "@s-0a1 rev=5 state=done agent=- program_state=- attention=- result_bytes=4 \
+                    conclusion=finished checked=0123456789ab@origin/main task_news=0";
+        let closed = closed_row(Some(last), &target);
+        assert_eq!(
+            (row_rev(&closed), row_field(&closed, "task_news")),
+            (Some(5), Some("1")),
+            "the Mac's rev, marked as the Mac's: {closed}"
+        );
+        let mut row = open(3);
+        assert!(row.merge(&closed, 10));
+        assert_eq!(
+            (row.state.as_str(), row.rev, row.landed.as_deref()),
+            ("closed", 5, Some("0123456789ab"))
+        );
+        assert!(
+            !row.merge(
+                "@s-0a1 rev=4 state=working agent=- program_state=- attention=- result_bytes=0 \
+                 task_news=0",
+                20
+            ),
+            "a read from before the close changes nothing"
+        );
+        assert_eq!(
+            (
+                row.state.as_str(),
+                row.conclusion.as_deref(),
+                row.checked.as_deref()
+            ),
+            ("closed", Some("finished"), Some("0123456789ab@origin/main"))
+        );
+        assert!(
+            row.merge(last, 30),
+            "the worker's own row at the close's rev reopens it: its tab came back"
+        );
+        assert_eq!((row.state.as_str(), row.rev), ("done", 5));
+
+        let gone = closed_row(None, &target);
+        assert_eq!(
+            (row_rev(&gone), row_field(&gone, "task_news")),
+            (Some(9), None),
+            "the asker's edge, unmarked: {gone}"
+        );
+        let mut row = open(3);
+        assert!(row.merge(&gone, 10));
+        assert_eq!(
+            (row.state.as_str(), row.rev),
+            ("closed", 3),
+            "an edge no worker reported is not the board's rev"
+        );
+        assert!(
+            row.merge(
+                "@s-0a1 rev=3 state=working agent=- program_state=- attention=- result_bytes=0 \
+                 task_news=0",
+                20
+            ),
+            "the worker's own answer at its own rev reopens it"
+        );
+        assert_eq!(row.state, "working");
     }
 
     #[test]
@@ -1622,6 +2313,7 @@ mod tests {
                 })
                 .collect(),
             order: Vec::new(),
+            recorded: None,
         }]
     }
 
@@ -2126,14 +2818,15 @@ mod tests {
                 fact_since: None,
             },
         ];
-        let pinned = group(targets.clone(), true, "/tmp/pinned.sock", Some(dir)).unwrap();
+        let pinned = group(targets.clone(), true, "/tmp/pinned.sock", Some(dir));
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0].targets.len(), 2);
-        let err = group(targets, false, "/tmp/default.sock", Some(dir)).unwrap_err();
-        assert!(
-            err.to_string().contains("ERR no such session @s-abc"),
-            "{err}"
-        );
+        // A sid no live instance hosts goes to the caller's own, which may keep the end of a
+        // worker whose tab it closed, and otherwise refuses it.
+        let unhosted = group(targets, false, "/tmp/default.sock", Some(dir));
+        assert_eq!(unhosted.len(), 1);
+        assert_eq!(unhosted[0].sock, "/tmp/default.sock");
+        assert_eq!(unhosted[0].order, [0, 1]);
         let local = group(
             vec![Target {
                 selector: ".".into(),
@@ -2143,8 +2836,7 @@ mod tests {
             false,
             "/tmp/default.sock",
             Some(dir),
-        )
-        .unwrap();
+        );
         assert_eq!(local[0].sock, "/tmp/default.sock");
     }
 
@@ -2205,6 +2897,7 @@ mod tests {
                 reply: None,
             }),
             label: "lab-mini".to_owned(),
+            node: None,
         })
     }
 
@@ -2230,6 +2923,7 @@ mod tests {
         crate::DriveLink {
             stream: Box::new(Answers(io::Cursor::new(format!("{line}\n").into_bytes()))),
             label: "lab-mini".to_owned(),
+            node: None,
         }
     }
 
@@ -2407,6 +3101,7 @@ mod tests {
                         reply: None,
                     }),
                     label: "lab-mini".to_owned(),
+                    node: None,
                 })
             })
         }
@@ -2444,9 +3139,10 @@ mod tests {
             rows: Vec::new(),
             since: Instant::now(),
             why: io::Error::other(GONE),
+            served: true,
         };
         assert_eq!(
-            print_waited(unanswered, "lab-mini").unwrap(),
+            print_waited(unanswered, "lab-mini", crate::board::Writes::Nothing).unwrap(),
             ExitCode::from(redial::EXIT_REPLACED)
         );
     }
@@ -2499,10 +3195,12 @@ mod tests {
                     rows,
                     why,
                     lowered,
+                    served,
                 }) => {
                     assert_eq!(at, "lab-mini");
                     assert_eq!((rows, lowered), (vec![BUSY.to_owned()], was_lowered));
-                    let said = ungranted(&at, &why, lowered);
+                    assert!(served, "the baseline was served");
+                    let said = ungranted(&at, &why, lowered, served);
                     assert!(
                         said.starts_with(
                             "lab-mini served this wait's baseline and refuses this Mac's drive \
@@ -2530,9 +3228,10 @@ mod tests {
             rows: Vec::new(),
             why: io::Error::other(LOWERED),
             lowered: true,
+            served: true,
         };
         assert_eq!(
-            print_waited(refused, "lab-mini").unwrap(),
+            print_waited(refused, "lab-mini", crate::board::Writes::Nothing).unwrap(),
             ExitCode::FAILURE
         );
     }
@@ -2615,6 +3314,7 @@ mod tests {
             Ok(crate::DriveLink {
                 stream: Box::new(Frozen(Instant::now() + within)),
                 label: "lab-mini".to_owned(),
+                node: None,
             })
         }
         fn frozen(host: &str, within: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
@@ -2723,6 +3423,7 @@ mod tests {
                         },
                     ],
                     order: vec![0, 2],
+                    recorded: None,
                 },
                 Group {
                     sock: y.to_string(),
@@ -2732,6 +3433,7 @@ mod tests {
                         fact_since: None,
                     }],
                     order: vec![1],
+                    recorded: None,
                 },
             ]
         };
@@ -2810,5 +3512,288 @@ mod tests {
             Ok(_) => panic!("baseline refusal on another group must not be dropped"),
         };
         assert_eq!(err.to_string(), "ERR no such session @s-b");
+    }
+
+    fn board_group(key: &str, pos: usize, sid: &str, rev: u64) -> Group {
+        Group {
+            sock: key.to_owned(),
+            targets: vec![Target {
+                selector: sid.to_owned(),
+                since: Some(rev),
+                fact_since: None,
+            }],
+            order: vec![pos],
+            recorded: Some(vec![format!(
+                "@{sid} rev={rev} state=working agent=- program_state=- attention=- \
+                 result_bytes=0 read=board"
+            )]),
+        }
+    }
+
+    /// A worker asked by its sid is answered only by a row naming that sid, in every wait: the
+    /// regression a driven Mac answering for another worker was, whose state then landed on that
+    /// worker's board row.
+    #[test]
+    fn a_row_naming_another_sid_is_no_answer_for_the_one_asked() {
+        let legs = scripted(vec![(
+            "drive:e",
+            "await task @s-a1 any timeout=0\n",
+            answered(&[
+                "@s-b2 rev=9 state=closed agent=- attention=- result_bytes=0 \
+                        conclusion=finished",
+            ]),
+        )]);
+        match wait_task_groups(
+            one_group("drive:e", &["s-a1"]),
+            Combine::Any,
+            false,
+            None,
+            &redial::Redial::none(),
+            &legs,
+        ) {
+            Err(e) => assert!(e.to_string().contains("@s-b2"), "{e}"),
+            Ok(_) => panic!("a row of another sid read as the answer for s-a1"),
+        }
+    }
+
+    /// A Mac that refuses a board's wait before it answered at all says its rows are the
+    /// board's, never that it served a baseline it did not.
+    #[test]
+    fn a_board_wait_a_mac_refused_from_the_start_says_its_rows_are_the_boards() {
+        let legs = scripted(vec![(
+            "drive:m2",
+            "await task @s-b2:1 any timeout=0\n",
+            step(|| Leg::Ungranted {
+                why: io::Error::other(format!(
+                    "{}node ab12cd34 is not one the dialled Mac lets drive it",
+                    aterm_types::control_verbs::DRIVE_UNGRANTED
+                )),
+                lowered: false,
+            }),
+        )]);
+        let waited = wait_task_groups(
+            vec![board_group("drive:m2", 0, "s-b2", 1)],
+            Combine::Any,
+            false,
+            None,
+            &redial::Redial::none(),
+            &legs,
+        );
+        let (rows, why, lowered, served) = match waited {
+            Ok(Waited::Ungranted {
+                rows,
+                why,
+                lowered,
+                served,
+                ..
+            }) => (rows, why, lowered, served),
+            Ok(_) => panic!("a refusal before any answer read as another end"),
+            Err(e) => panic!("a refusal before any answer ended the board's wait: {e}"),
+        };
+        assert!(!served);
+        assert!(
+            rows.iter().all(|row| row.ends_with(" read=board")),
+            "{rows:?}"
+        );
+        let said = ungranted("m2", &why, lowered, served);
+        assert!(
+            said.contains("board's record") && !said.contains("baseline"),
+            "{said}"
+        );
+        let said = unanswered("m2", Instant::now(), &io::Error::other("x"), false);
+        assert!(
+            said.contains("board's record") && !said.contains("last it read"),
+            "{said}"
+        );
+    }
+
+    /// A board's wait keeps each Mac's failure to its own rows: one Mac answering news ends an
+    /// `any` wait with the rows the board knows of a Mac that refused, and under `all` the wait
+    /// ends with every row, the refusing Mac's said, never an error for the whole wait.
+    #[test]
+    fn a_board_wait_keeps_one_macs_failure_to_its_rows() {
+        let script = |m1: &'static str, m2: &'static str| {
+            scripted(vec![
+                (
+                    "drive:m1",
+                    m1,
+                    answered(
+                        &["@s-a1 rev=4 state=done agent=- attention=- result_bytes=0 \
+                               conclusion=finished"],
+                    ),
+                ),
+                (
+                    "drive:m2",
+                    m2,
+                    refused(
+                        "ERR busy: an aterm window is open on this Mac and took no fleet \
+                             connection (x); ask again",
+                    ),
+                ),
+            ])
+        };
+        let groups = || {
+            vec![
+                board_group("drive:m1", 0, "s-a1", 3),
+                board_group("drive:m2", 1, "s-b2", 1),
+            ]
+        };
+        let any = script(
+            "await task @s-a1:3 any timeout=0\n",
+            "await task @s-b2:1 any timeout=0\n",
+        );
+        let (rows, answered) = waited(groups(), Combine::Any, None, &any);
+        assert!(answered);
+        assert!(rows[0].contains("state=done"), "{rows:?}");
+        assert!(rows[1].ends_with("read=board"), "{rows:?}");
+
+        let all = wait_task_groups(
+            groups(),
+            Combine::All,
+            false,
+            None,
+            &redial::Redial::none(),
+            &script(
+                "await task @s-a1:3 all timeout=0\n",
+                "await task @s-b2:1 all timeout=0\n",
+            ),
+        )
+        .expect("no error for the whole wait");
+        let Waited::Unanswered { at, rows, .. } = all else {
+            panic!("the refusing Mac is said");
+        };
+        assert_eq!(at, "drive:m2");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            rows[0].contains("state=done"),
+            "the Mac that answered: {rows:?}"
+        );
+        assert!(
+            rows[1].ends_with("read=board"),
+            "the Mac that refused: {rows:?}"
+        );
+    }
+
+    /// A Mac with no window open hosts no worker: a board's rows on it close, and a row naming a
+    /// sid the leg did not ask for is no answer for the one it asked for.
+    #[test]
+    fn a_board_wait_closes_a_windowless_macs_workers_and_refuses_a_foreign_row() {
+        let legs = scripted(vec![(
+            "drive:m3",
+            "await task @s-c3:2 any timeout=0\n",
+            refused("ERR no window open on this Mac"),
+        )]);
+        let (rows, closed) = waited(
+            vec![board_group("drive:m3", 0, "s-c3", 2)],
+            Combine::Any,
+            None,
+            &legs,
+        );
+        assert!(closed, "a closed worker answers the wait");
+        assert!(
+            rows[0].starts_with("@s-c3 ") && rows[0].contains("state=closed"),
+            "{rows:?}"
+        );
+
+        let legs = scripted(vec![(
+            "drive:m4",
+            "await task @s-d4:1 any timeout=0\n",
+            answered(&[
+                "@s-0ther rev=9 state=done agent=- attention=- result_bytes=0 \
+                       conclusion=finished checked=0123456789ab@origin/main",
+            ]),
+        )]);
+        let ended = wait_task_groups(
+            vec![board_group("drive:m4", 0, "s-d4", 1)],
+            Combine::Any,
+            false,
+            None,
+            &redial::Redial::none(),
+            &legs,
+        )
+        .expect("no error for the whole wait");
+        let Waited::Unanswered { rows, why, .. } = ended else {
+            panic!("a foreign row is no answer");
+        };
+        assert!(why.to_string().contains("malformed"), "{why}");
+        assert_eq!(
+            rows,
+            [
+                "@s-d4 rev=1 state=working agent=- program_state=- attention=- result_bytes=0 \
+              read=board"
+            ],
+            "the board's own row, not the foreign one"
+        );
+    }
+
+    /// A board's row is waited on where its worker runs: this Mac's own (`node=-` on its own
+    /// board, or its own node) at its instance, never over a drive to itself; another Mac's
+    /// over a drive to its node; `node=-` on another Mac's board over a drive to that Mac.
+    #[test]
+    fn a_board_row_is_waited_on_where_its_worker_runs() {
+        let own = "0a".repeat(16);
+        let other = "0b".repeat(16);
+        let row = |node: Option<&str>| crate::board::Row {
+            node: node.map(str::to_owned),
+            ..crate::board::Row::started("s-0a1", 1)
+        };
+        let here = (Some("/here.sock"), Some(own.as_str()));
+        let sock = Reach::Socket("/here.sock".to_owned());
+        assert_eq!(reach_of(&row(None), BoardAt::Here, None, here), sock);
+        assert_eq!(reach_of(&row(Some(&own)), BoardAt::Here, None, here), sock);
+        assert_eq!(
+            reach_of(&row(Some(&own)), BoardAt::Host("m14"), None, here),
+            sock
+        );
+        assert_eq!(
+            reach_of(&row(Some(&other)), BoardAt::Here, None, here),
+            Reach::Drive(other.clone())
+        );
+        assert_eq!(
+            reach_of(&row(None), BoardAt::Host("m14"), None, here),
+            Reach::Drive("m14".to_owned())
+        );
+        assert!(matches!(
+            reach_of(
+                &row(Some(&own)),
+                BoardAt::Here,
+                None,
+                (None, Some(own.as_str()))
+            ),
+            Reach::Nowhere(_)
+        ));
+    }
+
+    /// With no `since=`, each worker's edge is its board row's revision; more than 64 workers on
+    /// one Mac go in several legs.
+    #[test]
+    fn a_board_wait_starts_each_worker_from_its_row_in_legs_of_64() {
+        let rows: Vec<crate::board::Row> = (0..70u64)
+            .map(|n| crate::board::Row {
+                node: Some("0b".repeat(16)),
+                rev: n,
+                ..crate::board::Row::started(&format!("s-{:x}", 0x100 + n), n)
+            })
+            .collect();
+        let (groups, reaches) = board_groups(&rows, BoardAt::Here, (None, None), (None, None));
+        assert_eq!(reaches.len(), 1);
+        assert_eq!(
+            groups.iter().map(|g| g.targets.len()).collect::<Vec<_>>(),
+            [64, 6]
+        );
+        assert_eq!(
+            groups[1].targets[5].since,
+            Some(69),
+            "the row's own revision"
+        );
+        assert_eq!(groups[1].order[5], 69);
+        let (groups, _) = board_groups(&rows, BoardAt::Here, (None, None), (Some(0), None));
+        assert!(
+            groups
+                .iter()
+                .flat_map(|g| &g.targets)
+                .all(|t| t.since == Some(0)),
+            "since= names every worker's edge"
+        );
     }
 }

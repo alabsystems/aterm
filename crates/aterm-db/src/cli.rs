@@ -22,6 +22,32 @@ mod network_place;
 
 /// Command help. Mutation request IDs are caller-held, so lost replies are safely retried.
 pub const USAGE: &str = "aterm db — encrypted embedded application databases (Unix)\n\
+  The owner's tables (registry views once any Mac's import filled the registry; until then, on a\n\
+  Mac holding a fleet_db replica, the fleet tables below):\n\
+  emails|computers|phones|ai-accounts [--show-addresses] | --digest | --edit\n\
+                    | set <row> <column> [<value> | --stdin]\n\
+  emails --show-passwords | phones --show-numbers\n\
+                                       plaintext only in a person's own tab, at a terminal\n\
+  Fleet relational tables (backed by astream + aterm-net at ~/.aterm/lab-db, no --dir needed):\n\
+  tables                               summary, row counts and foreign-key integrity\n\
+  computers [<label>]                  list all computers or get one by label/alias\n\
+  emails [<email>] [--show-passwords]  list all emails/mailboxes or get one by address\n\
+  phones [<phone>]                     list all phone numbers or get one by number\n\
+  ai-accounts [<id>]                   list all AI service accounts or get one by ID\n\
+  get <table> <key> [--show-passwords] get one row from computers|emails|phones|ai_accounts\n\
+  put <table> <key> <json>             replace one row by its primary key; an email row without a\n\
+                                       password keeps the stored one, and null clears it\n\
+  delete <table> <key>                 delete one row by its primary key\n\
+  dump [<file>] [--show-passwords]     export all 4 tables as JSON; only a dump to <file> can be\n\
+                                       loaded back, because stdout redacts passwords\n\
+  load <file>                          write the rows of a dump that differ from what is stored\n\
+  bootstrap [<secrets-dir>]            add rows from the legacy CSVs; a key already used is left alone\n\
+  rekey                                move this database's rows onto the current fleet key after a\n\
+                                       rotation or a new fleet, keeping the old folder beside it;\n\
+                                       run it again to finish a move cut short\n\
+  sync <peer[:port]>                   sync operations.astream with a fleet peer over TLS\n\
+  serve [--listen <ip:port>] [--peers <ip:port,...>]\n\
+                                       serve operations.astream to fleet peers (default LAN :7485)\n\
   Commons tables use enrolled secrets and default LAN repair (no --dir):\n\
   table <verb> ...                     typed ATT/1 tables: ls, schema, get, scan, history,\n\
                                        check, revert, export, apply, edit (table --help)\n\
@@ -34,6 +60,8 @@ pub const USAGE: &str = "aterm db — encrypted embedded application databases (
   commons-inventory --table <digest>    local retained operation counts and fingerprints\n\
                     [--records <1..256> [--after <digest>]]\n\
                                        page operation IDs and eligibility; no values or keys\n\
+                    --tables <digest,...>\n\
+                                       inspect up to 64 tables through one read context\n\
   commons-custody --table <digest>      inspect local recovery evidence without changing custody\n\
   commons-open --application <id> --role <id> [--version <n>]\n\
                                        open a deterministic offline application table\n\
@@ -146,9 +174,42 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     if words[0] == "accounts-request" {
         return crate::accounts::broker::command::main_entry(&words[1..]);
     }
+    // The owner's tables as registry views (one-mesh design §4.7, A7), once the registry serves
+    // them on this Mac; until then a Mac holding a fleet_db replica keeps fleet_db's views.
+    if let Some(code) = crate::alab::command::views::main_entry(&words) {
+        return code;
+    }
+    // fleet_db prints passwords on `--show-passwords`, and `dump <file>` writes every one in
+    // plaintext: the same session rule decides both (§4.8), so no spawned, driven or agent
+    // session reads them that way. Its phones' numbers are fleet_db's keys, printed by every
+    // verb that names a phone; they go with fleet_db (A13).
+    #[cfg(unix)]
+    if fleet_db_reveals(&words)
+        && let Err(error) =
+            crate::alab::command::session::decide(&crate::alab::command::session::facts())
+    {
+        let _ = writeln!(std::io::stderr(), "aterm db: {error}");
+        return ExitCode::from(1);
+    }
     match run(&words) {
-        Ok(value) => match aterm_json::to_string(&value) {
-            Ok(text) => aterm_uds::stdout::answer_exit("aterm db", &format!("{text}\n"), 0),
+        Ok(value) => match if words[0] == "commons-status" && words.len() == 1 {
+            Ok(commons_status_text(&value))
+        } else {
+            aterm_json::to_string(&value)
+        } {
+            Ok(text) => {
+                let code = if value
+                    .as_object()
+                    .and_then(|o| o.get("ok"))
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                {
+                    1
+                } else {
+                    0
+                };
+                aterm_uds::stdout::answer_exit("aterm db", &format!("{text}\n"), code)
+            }
             Err(_) => ExitCode::from(1),
         },
         Err(error) => {
@@ -159,6 +220,14 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
 }
 /// Run a command for embedding/testing. Every option is consumed exactly once.
 pub fn run(words: &[String]) -> Result<Value> {
+    let words = if words.len() == 2 && words[0] == "commons-status" && words[1] == "--json" {
+        &words[..1]
+    } else {
+        words
+    };
+    if let Some(value) = crate::fleet_db::try_run(words)? {
+        return Ok(value);
+    }
     let command = words
         .first()
         .map(String::as_str)
@@ -211,9 +280,8 @@ pub fn run(words: &[String]) -> Result<Value> {
             .ok_or_else(|| Error::new("network observation path unavailable"))?;
         let paths = aterm_secrets::client::Paths::live()
             .map_err(|_| Error::new("service observation path unavailable"))?;
-        let network = crate::runtime::read_live_publication(&paths, &config);
         return read_network_state_with(
-            network,
+            || crate::runtime::read_live_publication(&paths, &config),
             || {
                 Ok(crate::network_state::Publication::new(
                     crate::network_state::read_history(&config)?,
@@ -553,22 +621,9 @@ pub fn run(words: &[String]) -> Result<Value> {
         "sync" => {
             let peer = address(take(&mut options, "--peer")?)?;
             empty(&options)?;
-            let mut sent = 0;
-            let mut received = 0;
-            let mut caught_up = false;
-            let mut deferred = 0;
-            let mut repair = crate::network::Repair::default();
-            for _ in 0..80 {
-                let report = crate::network::sync_round_with(dir, peer, &mut repair)?;
-                sent += report.sent;
-                received += report.received;
-                deferred = report.deferred;
-                if report.sent == 0 && report.received == 0 {
-                    caught_up = deferred == 0;
-                    break;
-                }
-            }
-            json!({"sent":sent,"received":received,"deferred":deferred,"caught_up":caught_up})
+            crate::fleet_db::sync_peer_with(peer, |repair| {
+                crate::network::sync_round_with(dir, peer, repair)
+            })
         }
         "serve" => {
             let listen = address(take(&mut options, "--listen")?)?;
@@ -593,6 +648,43 @@ pub fn run(words: &[String]) -> Result<Value> {
     Ok(value)
 }
 
+fn commons_status_text(value: &Value) -> String {
+    let mut lines = vec![format!(
+        "Commons: {}{}",
+        value["state"].as_str().unwrap_or("unknown"),
+        value["role"]
+            .as_str()
+            .map(|role| format!(" ({role})"))
+            .unwrap_or_default()
+    )];
+    if let Some(peers) = value["repairs"]["peers"].as_array() {
+        for peer in peers {
+            let repair = &peer["last_repair"];
+            if repair.is_null() {
+                continue;
+            }
+            lines.push(format!(
+                "peer {}: {}{}",
+                peer["slot"],
+                if repair["needs_update"].as_bool() == Some(true) {
+                    "needs-update"
+                } else {
+                    repair["outcome"].as_str().unwrap_or("unknown")
+                },
+                repair["cause"]
+                    .as_str()
+                    .map(|cause| format!(" ({cause})"))
+                    .unwrap_or_else(|| if repair["outcome"].as_str() == Some("failed") {
+                        " (cause unavailable)".into()
+                    } else {
+                        String::new()
+                    })
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
 #[derive(Clone, Copy)]
 struct LiveObservationError {
     kind: std::io::ErrorKind,
@@ -600,13 +692,16 @@ struct LiveObservationError {
 }
 
 fn read_network_state_with(
-    network: std::io::Result<crate::network_state::Publication>,
+    read_network: impl FnOnce() -> std::io::Result<crate::network_state::Publication>,
     read_history: impl FnOnce() -> Result<crate::network_state::Publication>,
     read_services: impl FnOnce() -> crate::service_state::Publication,
     read_place: impl FnOnce() -> Option<aterm_netplace::Place>,
     clock: impl FnOnce() -> (std::time::Instant, Option<u64>),
 ) -> Result<Value> {
-    let (network, error) = match network {
+    // A service read can outlast the network's 15 s lease, so the network is read after it. A
+    // relayed publication keeps its owner's age, so reading it late renews nothing.
+    let services = read_services();
+    let (network, error) = match read_network() {
         Ok(network) => (network, None),
         Err(error) => (
             read_history()?,
@@ -617,24 +712,19 @@ fn read_network_state_with(
         ),
     };
     Ok(network_state_value_with(
-        network,
-        error,
-        read_services,
-        read_place,
-        clock,
+        network, error, services, read_place, clock,
     ))
 }
 
 fn network_state_value_with(
     network: crate::network_state::Publication,
     live_error: Option<LiveObservationError>,
-    read_services: impl FnOnce() -> crate::service_state::Publication,
+    services: crate::service_state::Publication,
     read_place: impl FnOnce() -> Option<aterm_netplace::Place>,
     clock: impl FnOnce() -> (std::time::Instant, Option<u64>),
 ) -> Value {
-    let services = read_services();
     let place = read_place();
-    // Both leases include service and place I/O and use the same final clock sample.
+    // Both leases include the place I/O and use the same final clock sample.
     let (now, wall) = clock();
     let network = network.current_at(now, wall);
     let services = services.current_at(now, wall);
@@ -717,9 +807,67 @@ fn status(db: &Database) -> Value {
     json!({"dataset":hex::encode_lower(&db.credentials.manifest.id),"root":hex::encode_lower(&db.credentials.manifest.root),"actor":hex::encode_lower(&db.credentials.capability.actor),"namespace":db.credentials.manifest.namespace,"retained":db.history.index.inventory().count(),"visible":view.causal.ordered.len(),"pending":view.causal.pending.len(),"quarantined":view.causal.quarantined.iter().map(|a|hex::encode_lower(a)).collect::<Vec<_>>(),"invalid":view.invalid.len(),"refused":db.history.refusals().map(|(id,reason)|json!({"operation":hex::encode_lower(id),"reason":reason})).collect::<Vec<_>>(),"authority_fault":view.authority_fault,"retired_writers":view.revocations.keys().map(|actor|hex::encode_lower(actor)).collect::<Vec<_>>(),"budgets":budgets})
 }
 
+/// Whether fleet_db's `words` show or write plaintext: `--show-passwords` (`--reveal`), or a
+/// `dump` to a file, its file read as fleet_db reads it (the word after `--dir` is its folder).
+#[cfg(unix)]
+fn fleet_db_reveals(words: &[String]) -> bool {
+    if words
+        .iter()
+        .any(|w| w == "--show-passwords" || w == "--reveal")
+    {
+        return true;
+    }
+    if words.first().map(String::as_str) != Some("dump") {
+        return false;
+    }
+    let mut rest = words[1..].iter();
+    while let Some(word) = rest.next() {
+        if word == "--dir" {
+            rest.next();
+        } else if !word.starts_with("--") {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(all(test, unix))]
+mod reveal_gate_tests {
+    use super::fleet_db_reveals;
+
+    /// NEGATIVE CONTROL: with `--dir`'s folder read as a dump file, `dump --dir <folder>` (which
+    /// shows only masked rows) is gated: `` dump --dir /r ``.
+    #[test]
+    fn fleet_db_s_plaintext_paths_are_its_show_flag_and_a_dump_to_a_file() {
+        let words = |line: &str| -> Vec<String> { line.split(' ').map(str::to_owned).collect() };
+        for gated in [
+            "emails --show-passwords",
+            "get emails a@b --reveal",
+            "dump out.json",
+            "dump --dir /r out.json",
+            "dump out.json --dir /r",
+        ] {
+            assert!(fleet_db_reveals(&words(gated)), "{gated}");
+        }
+        for open in ["dump", "dump --dir /r", "emails", "put emails a@b {}"] {
+            assert!(!fleet_db_reveals(&words(open)), "{open}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod network_state_tests {
     use super::*;
+    #[test]
+    fn commons_status_text_shows_the_same_cause_as_json() {
+        let value = json!({"state":"ready","repairs":{"peers":[
+            {"slot":1,"last_repair":{"outcome":"failed","cause":"legacy-past-crossing","needs_update":true}},
+            {"slot":2,"last_repair":{"outcome":"failed","cause":"not-ready","needs_update":false}}
+        ]}});
+        let text = commons_status_text(&value);
+        assert!(text.contains("needs-update (legacy-past-crossing)"));
+        assert!(text.contains("failed (not-ready)"));
+    }
     use aterm_types::network_state::{
         HistoryState, NetworkObservation, ServiceAvailability, ServiceState, ServiceStates,
         Visibility,
@@ -765,7 +913,7 @@ mod network_state_tests {
         let value = network_state_value_with(
             network(at, 100_000),
             None,
-            || services(at, 100_000),
+            services(at, 100_000),
             || None,
             || (at, Some(100_000)),
         );
@@ -779,7 +927,7 @@ mod network_state_tests {
         let value = network_state_value_with(
             network(at, 100_000),
             None,
-            || services(at, 100_000),
+            services(at, 100_000),
             || Some(aterm_netplace::sample::hotspot(100_000, 90_000)),
             || (at, Some(100_000)),
         );
@@ -821,7 +969,7 @@ mod network_state_tests {
                 at,
             ),
             None,
-            || crate::service_state::Publication::new(ServiceStates::default(), at),
+            crate::service_state::Publication::new(ServiceStates::default(), at),
             || Some(aterm_netplace::sample::home(100_000, 12)),
             || (at, Some(100_000)),
         );
@@ -841,7 +989,7 @@ mod network_state_tests {
         let value = network_state_value_with(
             network(at, 100_000),
             None,
-            || services(at, 100_000),
+            services(at, 100_000),
             || {
                 now.set((at + Duration::from_secs(61), Some(161_000)));
                 Some(aterm_netplace::sample::hotspot(100_000, 90_000))
@@ -881,7 +1029,7 @@ mod network_state_tests {
         let value = network_state_value_with(
             network(at, 100_000),
             None,
-            || crate::service_state::Publication::new(states, at),
+            crate::service_state::Publication::new(states, at),
             || None,
             || (at + Duration::from_secs(61), Some(161_000)),
         );
@@ -932,7 +1080,7 @@ mod network_state_tests {
         let value = network_state_value_with(
             network(at, 100_000),
             None,
-            || crate::service_state::Publication::new(states, at),
+            crate::service_state::Publication::new(states, at),
             || None,
             || (at + Duration::from_secs(61), Some(161_000)),
         );
@@ -957,14 +1105,16 @@ mod network_state_tests {
         );
     }
 
+    /// A relayed publication is as old as its owner's sample, so reading it after the services
+    /// renews nothing.
     #[test]
     fn delayed_service_metadata_cannot_keep_an_expired_network_current() {
         let at = Instant::now();
         let sampled = at + Duration::from_secs(14);
         let now = Cell::new((sampled, Some(114_000)));
-        let value = network_state_value_with(
-            network(at, 100_000),
-            None,
+        let value = read_network_state_with(
+            || Ok(network(at, 100_000)),
+            || panic!("a live read must not open retained history"),
             || {
                 let publication = services(sampled, 114_000);
                 now.set((at + Duration::from_secs(16), Some(116_000)));
@@ -972,7 +1122,8 @@ mod network_state_tests {
             },
             || None,
             || now.get(),
-        );
+        )
+        .unwrap();
         assert_eq!(value["live_network"], json!(false));
         assert_eq!(value["network"]["visibility"], json!("Unavailable"));
         assert_eq!(value["network"]["observed_at_ms"], json!(100_000));
@@ -983,6 +1134,41 @@ mod network_state_tests {
         );
     }
 
+    /// The network's short lease starts at its owner's latest periodic sample, whose age a relayed
+    /// read keeps, so a healthy owner stays healthy however long the services took to read before
+    /// the read of the network.
+    #[test]
+    fn a_slow_service_read_does_not_expire_a_healthy_network() {
+        let at = Instant::now();
+        let now = Cell::new((at, 100_000));
+        let value = read_network_state_with(
+            || {
+                let (at, wall) = now.get();
+                Ok(network(at, wall))
+            },
+            || panic!("a live read must not open retained history"),
+            || {
+                let publication = services(at, 100_000);
+                now.set((at + Duration::from_secs(70), 170_000));
+                publication
+            },
+            || None,
+            || {
+                let (at, wall) = now.get();
+                (at, Some(wall))
+            },
+        )
+        .unwrap();
+        assert_eq!(value["live_network"], json!(true));
+        assert_eq!(value["network"]["visibility"], json!("Active"));
+        assert_eq!(value["network"]["observed_at_ms"], json!(170_000));
+        // The services are as old as their read, and say so.
+        assert_eq!(
+            value["services"]["accounts"]["availability"],
+            json!("Unknown")
+        );
+    }
+
     #[test]
     fn current_network_and_retained_history_keep_their_distinct_evidence() {
         let at = Instant::now();
@@ -990,23 +1176,21 @@ mod network_state_tests {
         let current = network_state_value_with(
             network(at, 100_000),
             None,
-            || {
-                crate::service_state::Publication::new(
-                    ServiceStates {
-                        accounts: ServiceState {
-                            availability: ServiceAvailability::Cached,
-                            observed_at_ms: 50_000,
-                            ..ServiceState::default()
-                        },
-                        secrets: ServiceState {
-                            availability: ServiceAvailability::Cached,
-                            observed_at_ms: 114_000,
-                            ..ServiceState::default()
-                        },
+            crate::service_state::Publication::new(
+                ServiceStates {
+                    accounts: ServiceState {
+                        availability: ServiceAvailability::Cached,
+                        observed_at_ms: 50_000,
+                        ..ServiceState::default()
                     },
-                    now,
-                )
-            },
+                    secrets: ServiceState {
+                        availability: ServiceAvailability::Cached,
+                        observed_at_ms: 114_000,
+                        ..ServiceState::default()
+                    },
+                },
+                now,
+            ),
             || None,
             || (now, Some(114_000)),
         );
@@ -1032,7 +1216,7 @@ mod network_state_tests {
         let history = network_state_value_with(
             retained,
             None,
-            || services(now, 114_000),
+            services(now, 114_000),
             || None,
             || (now, Some(114_000)),
         );
@@ -1051,7 +1235,7 @@ mod network_state_tests {
             (std::io::ErrorKind::NotFound, "NotFound"),
         ] {
             let value = read_network_state_with(
-                Err(std::io::Error::new(kind, private)),
+                || Err(std::io::Error::new(kind, private)),
                 || {
                     Ok(crate::network_state::Publication::new(
                         NetworkObservation {
@@ -1082,7 +1266,7 @@ mod network_state_tests {
             assert!(!aterm_json::to_string(&value).unwrap().contains(private));
         }
         let live = read_network_state_with(
-            Ok(network(at, 100_000)),
+            || Ok(network(at, 100_000)),
             || panic!("a live read must not open retained history"),
             || services(at, 100_000),
             || None,
@@ -1103,7 +1287,7 @@ mod network_state_tests {
         assert!(error.to_string().contains(private));
         let at = Instant::now();
         let value = read_network_state_with(
-            Err(error),
+            || Err(error),
             || {
                 Ok(crate::network_state::Publication::new(
                     NetworkObservation {
@@ -1133,9 +1317,9 @@ mod network_state_tests {
     #[test]
     fn a_failed_live_read_cannot_hide_a_failed_history_read() {
         let result = read_network_state_with(
-            Err(std::io::ErrorKind::NotFound.into()),
+            || Err(std::io::ErrorKind::NotFound.into()),
             || Err(Error::new("history unavailable")),
-            || panic!("failed history must be returned before service reads"),
+            || services(Instant::now(), 100_000),
             || panic!("failed history must be returned before place reads"),
             || panic!("failed history supplies no publication"),
         );

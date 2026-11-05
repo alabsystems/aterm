@@ -19,7 +19,28 @@ use crate::image_payload_memo::{ImagePayload, image_payloads};
 use crate::platform::AppRt as _;
 use crate::{Wake, term_lock};
 
+/// How long a main-thread hop waits for its reply ([`recv_main`]).
 const MAIN_THREAD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The dev seam that sets, in milliseconds, [`main_thread_reply_within`] for a test of the binary.
+const MAIN_THREAD_REPLY_SEAM: &str = "ATERM_DEBUG_MAIN_REPLY_WITHIN_MS";
+
+/// How long [`recv_main`] waits, and the reason it answers once that runs out:
+/// [`MAIN_THREAD_REPLY_TIMEOUT`], or what [`MAIN_THREAD_REPLY_SEAM`] names, read once. A test
+/// world's instance runs on the test's own machine, whose main thread answers however loaded the
+/// machine is, so under the seam its hops wait the hang detector.
+fn main_thread_reply_within() -> (std::time::Duration, &'static str) {
+    static WITHIN: std::sync::OnceLock<(std::time::Duration, String)> = std::sync::OnceLock::new();
+    let (within, late) = WITHIN.get_or_init(|| {
+        let within =
+            crate::fleet_listen::seam_or(MAIN_THREAD_REPLY_SEAM, MAIN_THREAD_REPLY_TIMEOUT);
+        (
+            within,
+            format!("main-thread reply did not arrive within {within:?}"),
+        )
+    });
+    (*within, late)
+}
 
 /// Wire-ready error reason returned when a main-thread RPC hop fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,18 +244,18 @@ pub(crate) fn call_main<T>(
     recv_main(&rx)
 }
 
-/// Waits up to the default allowance (30 s) for a main-thread reply.
+/// Waits up to the default allowance ([`main_thread_reply_within`]: 30 s unless a test's dev seam
+/// names another) for a main-thread reply.
 ///
 /// # Errors
 ///
 /// The reply did not arrive within the allowance, or the main thread dropped its channel
 /// unanswered.
 pub(crate) fn recv_main<T>(rx: &std::sync::mpsc::Receiver<T>) -> Result<T, MainHopError> {
-    match rx.recv_timeout(MAIN_THREAD_REPLY_TIMEOUT) {
+    let (within, late) = main_thread_reply_within();
+    match rx.recv_timeout(within) {
         Ok(v) => Ok(v),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(MainHopError::Reason(
-            "main-thread reply did not arrive within 30s",
-        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(MainHopError::Reason(late)),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(MainHopError::Reason("main-thread reply dropped"))
         }
@@ -2368,6 +2389,9 @@ pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
                 "View \u{25b8} Stats Lens, \u{2318}I"
             }
             crate::menu::MenuAction::ToggleStatsLens => "View \u{25b8} Stats Lens",
+            crate::menu::MenuAction::RecordUnseenKeys => {
+                "View \u{25b8} Record Keys Not Echoed\u{2026}, then aterm's alert"
+            }
             _ => "Agents \u{25b8} Take Over This Tab / Hand Back This Tab",
         };
         format!("ERR denied: {name} is the person's own act at the window ({at})\n")
@@ -3143,8 +3167,41 @@ fn spawn_form(rest: &str) -> Result<SpawnForm, String> {
     spawn_cwd_refusal(&form).map_or(Ok(form), Err)
 }
 
-/// Handles `spawn ...`, creating a new terminal session or worker on the main thread.
-pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Option<u64>) -> String {
+/// `spawn rest`, answered, with its `kind=spawn` telemetry row: the worker's program (`shell` for
+/// a plain tab), its folder, and how long the verb took to answer.
+pub(crate) fn cmd_spawn_metered(
+    proxy: &EventLoopProxy<Wake>,
+    rest: &str,
+    session: Option<u64>,
+    by: crate::session_store::ExitActor,
+) -> String {
+    let began = std::time::Instant::now();
+    let reply = cmd_spawn(proxy, rest, session, by);
+    let (agent, cwd) = match parse_spawn_args(rest) {
+        Ok(SpawnForm::Plain { agent, cwd, .. }) => (
+            agent.map_or("shell", |AgentSpec::Worker { agent, .. }| agent.name()),
+            cwd,
+        ),
+        Ok(SpawnForm::Connected { cwd, .. }) => ("connected", cwd),
+        Err(_) => ("-", None),
+    };
+    crate::telemetry_host::spawned(
+        agent,
+        cwd.as_deref(),
+        u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+        &reply,
+    );
+    reply
+}
+
+/// Handles `spawn ...`, creating a new terminal session or worker on the main thread; `by` the
+/// caller its tab's open names (`crate::control::control_session::caller_actor_of`).
+pub(crate) fn cmd_spawn(
+    proxy: &EventLoopProxy<Wake>,
+    rest: &str,
+    session: Option<u64>,
+    by: crate::session_store::ExitActor,
+) -> String {
     let form = match spawn_form(rest) {
         Ok(form) => form,
         Err(refusal) => return refusal,
@@ -3192,6 +3249,7 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
                 theme,
                 task,
                 shell,
+                by,
                 reply: tx,
             })
         }
@@ -3207,6 +3265,7 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
             origin,
             cwd,
             theme,
+            by,
             reply: tx,
         }),
     };
@@ -3303,6 +3362,31 @@ impl WorkerStart {
 pub(crate) struct Spawned {
     sid: String,
     worker: Option<PendingWorker>,
+}
+
+#[cfg(test)]
+impl Spawned {
+    /// A plain session `sid` spawned with no worker.
+    pub(crate) const fn plain_for_test(sid: String) -> Self {
+        Self { sid, worker: None }
+    }
+}
+
+/// A fleet driver's plain shell `landed`: recorded as `node`'s and marked `ctl spawn`'s before
+/// its `OK <sid>` goes out, or refused when the person reached it first.
+pub(crate) fn fleet_shell_landed(
+    store: &crate::session_store::Store,
+    landed: Result<String, String>,
+    node: &str,
+) -> Result<String, String> {
+    landed.and_then(|sid| {
+        if crate::control::record_driven_shell(store, &sid, node) {
+            crate::control::mark_ctl_spawned(store, &sid);
+            Ok(sid)
+        } else {
+            Err("the plain shell was adopted before ownership could be recorded".to_owned())
+        }
+    })
 }
 
 /// Spawned worker session waiting for its launcher thread to start.
@@ -3436,14 +3520,7 @@ impl crate::App {
                 let ask = SpawnPlan::ask(theme, None);
                 let (ask, then) = if let Some(node) = shell {
                     let then = crate::tab_spawn::TabSpawnThen::Run(Box::new(move |app, landed| {
-                        let landed = landed.and_then(|sid| {
-                            if crate::control::record_driven_shell(&app.store, &sid, &node) {
-                                Ok(sid)
-                            } else {
-                                Err("the plain shell was adopted before ownership could be recorded".to_owned())
-                            }
-                        });
-                        let _ = reply.send(landed);
+                        let _ = reply.send(fleet_shell_landed(&app.store, landed, &node));
                     }));
                     (ask.for_fleet_shell(), then)
                 } else {
@@ -3584,6 +3661,7 @@ impl crate::App {
                 return;
             }
         };
+        crate::control::mark_ctl_spawned(&self.store, &sid);
         let taken = reply.send(Ok(sid.clone())).is_ok();
         match worker {
             Some(worker) if taken => {
@@ -3737,6 +3815,7 @@ impl crate::App {
             trusted_cwd: worker.order.trusted_cwd,
             caller,
             chrome: worker.order.chrome,
+            approve: self.harness_policy.get().policy.approve,
         })
     }
 
@@ -3750,7 +3829,11 @@ impl crate::App {
         if let Some(local) = local {
             let _closing = crate::session_store::CloseAttribution::enter(
                 crate::session_store::ExitReason::CtlClose,
-                crate::session_store::ExitActor::Ctl,
+                crate::session_store::ExitActor::Harness,
+            );
+            let _act = crate::tab_marks::ActScope::closing(
+                crate::session_store::ExitActor::Harness,
+                "unstarted",
             );
             let policy = std::mem::replace(
                 &mut self.close_confirm,
@@ -3777,7 +3860,7 @@ impl crate::App {
     ) {
         let wid = self.hosting_window(session);
         if matches!(action, crate::TabAction::New) {
-            return self.tab_new_answered(wid, reply);
+            return self.tab_new_answered(wid, by, reply);
         }
         let state = wid.and_then(|wid| {
             self.tab_cmd_bracketed(el, by, |app| app.apply_tab_cmd_in(wid, action))
@@ -3797,15 +3880,24 @@ impl crate::App {
             let front = self
                 .frontmost_window
                 .ok_or_else(|| crate::app_tabs::NO_FOCUSED_WINDOW.to_string());
-            return self.tab_new_answered(front, reply);
+            return self.tab_new_answered(front, by, reply);
         }
         let _ = reply.send(self.tab_cmd_bracketed(el, by, |app| app.apply_tab_cmd(action)));
     }
 
-    fn tab_new_answered(&mut self, window: Result<crate::WindowId, String>, reply: TabCmdReply) {
+    /// A control client's `tab new` in `window`, by `by` (the caller
+    /// `crate::control::control_session::caller_actor_of` names): its tab opens by that caller
+    /// (`why=new-tab`), whose act the spawn's booking keeps until it lands.
+    pub(crate) fn tab_new_answered(
+        &mut self,
+        window: Result<crate::WindowId, String>,
+        by: crate::session_store::ExitActor,
+        reply: TabCmdReply,
+    ) {
         match window {
             Ok(wid) => {
                 self.clear_tab_surface_move_license(None);
+                let _act = crate::tab_marks::ActScope::enter(by, "new-tab");
                 self.open_tab_off_loop(wid, None, crate::tab_spawn::TabSpawnThen::Counts(reply));
             }
             Err(why) => {
@@ -4334,10 +4426,13 @@ mod spawn_parse_tests {
     /// A SPAWN'S REFUSAL NAMES THE WORD IT REFUSES: the bare usage line left its caller, a fleet
     /// drive's lead above all, to guess which option was refused. The reply stays the usage line
     /// (clients read `ERR usage: spawn` as such) and names the word, one line of its first 32
-    /// characters; a line no one word breaks gets the usage line alone.
+    /// characters; a line no one word breaks gets the usage line alone. Every one names
+    /// `agent=`, so the client never reads it as an instance older than workers
+    /// (`aterm_ctl::usage_predates_workers`) and tells the person to update a current aterm.
     #[test]
     fn a_spawn_refusal_names_the_word_it_refuses() {
         let usage = super::spawn_usage();
+        assert!(!aterm_ctl::usage_predates_workers(&usage), "{usage:?}");
         let long = format!("identity={}", "y".repeat(400));
         for (rest, word) in [
             (
@@ -4357,7 +4452,8 @@ mod spawn_parse_tests {
             assert!(
                 reply.starts_with("ERR usage: spawn")
                     && reply.contains(&format!("`{word}`"))
-                    && reply.lines().count() == 1,
+                    && reply.lines().count() == 1
+                    && !aterm_ctl::usage_predates_workers(&reply),
                 "{rest}: {reply:?}"
             );
         }
@@ -5195,6 +5291,242 @@ mod worker_start_app_tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// A launcher holding a launch for a pool keeps no clock either: the deadline's stall ends the
+    /// hold, its session's mark goes with it, and nothing is tried again when the row opens, so a
+    /// dispatcher that placed the worker elsewhere never gets a second run days on.
+    #[test]
+    fn a_startup_stall_ends_a_launchers_hold_and_nothing_starts_later() {
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-hold-ends")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            app.push_stub_tab(WindowId(0), crate::stub_session(1));
+            let sid = sid_of(&app, 1);
+            let ctx = ctx_of(&app, 1);
+            let (seed, _path) = seeded(&sid);
+            let launch = app.ready_worker(&sid, worker(), seed).expect("a worker");
+            let launch = launch.launch;
+            let tries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tried = tries.clone();
+
+            let until = 4_000_000_000_i64;
+            let (said, heard) = std::sync::mpsc::channel();
+            let holding = std::thread::spawn(move || {
+                let got: Result<(), String> = crate::task_launch::pool_attempts(
+                    || {
+                        tried.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err("codex account pool has no usable account".to_string())
+                    },
+                    || Some(until),
+                    || Some(until - 3 * 86_400),
+                    crate::task_launch::pool_wait_for(
+                        &launch,
+                        "no account of its pool can take it now",
+                    ),
+                );
+                let _ = said.send(got);
+                launch
+            });
+            let hold = || ctx.timeline.lock().unwrap().worker_pool_hold().cloned();
+            let waited = std::time::Instant::now();
+            while hold().is_none() {
+                assert!(
+                    waited.elapsed() < std::time::Duration::from_secs(60),
+                    "the launcher never held"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(hold().map(|hold| hold.until), Some(until));
+
+            let mut stalled = crate::task_record::TaskMark::new(TaskState::Stalled);
+            stalled.why = Some("startup");
+            crate::task_record::mark_session_task(&ctx, 1, &stalled).expect("unfenced");
+            let refused = heard
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the stall ended its hold");
+            assert_eq!(
+                refused,
+                Err("codex account pool has no usable account".to_string()),
+                "nothing is started for a row that opens later"
+            );
+            let launch = holding.join().expect("the launcher's hold");
+            drop(launch);
+            assert_eq!(hold(), None, "the mark went with the hold");
+            assert_eq!(
+                tries.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "it never tried again"
+            );
+        });
+    }
+
+    /// A LAUNCHER THAT GIVES UP SAYS WHY: its refusal is `stalled why=startup` at once, with the cause
+    /// in `attention=`, where a dispatcher can read it. NEGATIVE CONTROL: before, it was `why=shell`,
+    /// which says a shell ended or a person used it, with the cause only in this Mac's log. A record
+    /// that moved on already says what became of the task, and raises nothing.
+    #[test]
+    fn a_launchers_refusal_names_its_cause_where_a_dispatcher_reads_it() {
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-refused")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            app.push_stub_tab(WindowId(0), crate::stub_session(1));
+            let ctx = ctx_of(&app, 1);
+            let attention = || {
+                ctx.meta
+                    .lock()
+                    .unwrap()
+                    .attention_owners
+                    .get(crate::harness_host::ATTENTION_OWNER)
+                    .map(str::to_owned)
+            };
+            let record = || {
+                let record = ctx.timeline.lock().unwrap().task().cloned();
+                record.map(|record| (record.state, record.why))
+            };
+            let why = "the default login names another account";
+            let codex = aterm_phase::Program::Codex;
+
+            crate::task_record::mark_session_task(
+                &ctx,
+                1,
+                &crate::task_record::TaskMark::new(TaskState::Done),
+            )
+            .expect("unfenced");
+            crate::task_launch::stall_refused_task(&ctx, 1, codex, why);
+            assert_eq!(
+                attention(),
+                None,
+                "CONTROL: a record that moved on raises nothing"
+            );
+
+            crate::task_record::mark_session_task(
+                &ctx,
+                1,
+                &crate::task_record::TaskMark::new(TaskState::Working),
+            )
+            .expect("unfenced");
+            crate::task_launch::stall_refused_task(&ctx, 1, codex, why);
+            assert_eq!(record(), Some((TaskState::Stalled, Some("startup"))));
+            let said = attention().expect("the cause");
+            assert!(said.contains(why), "{said}");
+            assert!(
+                said.starts_with(crate::harness_host::STARTUP_HEAD),
+                "{said}"
+            );
+        });
+    }
+
+    /// A SHELL THAT ENDS DURING A POOL'S HOLD ENDS THAT HOLD, and the pool is then no reason: the
+    /// record says its shell ended, not that an account could not take it, so no dispatcher waits
+    /// for a window to open. CONTROL: while it is alive the pool's words are the cause.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_gone_during_a_pool_hold_is_named_not_the_pool() {
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-shell-gone")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            app.push_stub_tab(WindowId(0), crate::stub_session(1));
+            app.push_stub_tab(WindowId(0), crate::stub_session(2));
+            let why = "no account of its pool can take it now";
+            for (local, gone, word) in [(1, false, "startup"), (2, true, "shell")] {
+                let sid = sid_of(&app, local);
+                let ctx = ctx_of(&app, local);
+                let (seed, _path) = seeded(&sid);
+                let launch = app
+                    .ready_worker(&sid, worker(), seed)
+                    .expect("a worker")
+                    .launch;
+                crate::task_record::mark_session_task(
+                    &ctx,
+                    local,
+                    &crate::task_record::TaskMark::new(TaskState::Working),
+                )
+                .expect("unfenced");
+                if gone {
+                    app.exit_session_logical(local);
+                }
+                crate::task_launch::stall_gave_up(&launch, why);
+                let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+                assert_eq!(
+                    (record.state, record.why),
+                    (TaskState::Stalled, Some(word)),
+                    "gone={gone}"
+                );
+                let said = ctx
+                    .meta
+                    .lock()
+                    .unwrap()
+                    .attention_owners
+                    .get(crate::harness_host::ATTENTION_OWNER)
+                    .map(str::to_owned);
+                assert_eq!(
+                    said.as_deref().is_some_and(|said| said.contains(why)),
+                    !gone,
+                    "gone={gone}: {said:?}"
+                );
+            }
+        });
+    }
+
+    /// A LINE THE SESSION WOULD NOT TAKE SAYS WHY TOO: no shell ended and no person came, so the
+    /// record says `why=startup`, not `why=shell`, with the cause in `attention=`.
+    #[cfg(unix)]
+    #[test]
+    fn a_line_nothing_took_names_why_where_a_dispatcher_reads_it() {
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-blocked")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            app.push_stub_tab(WindowId(0), crate::stub_session(1));
+            let sid = sid_of(&app, 1);
+            let ctx = ctx_of(&app, 1);
+            let (seed, _path) = seeded(&sid);
+            let launch = app
+                .ready_worker(&sid, worker(), seed)
+                .expect("a worker")
+                .launch;
+            crate::task_record::mark_session_task(
+                &ctx,
+                1,
+                &crate::task_record::TaskMark::new(TaskState::Working),
+            )
+            .expect("unfenced");
+            crate::feed_session_for_test(&app, 1, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            let seen = crate::task_launch::await_prompt(&launch, std::time::Duration::ZERO)
+                .expect("its first prompt");
+            let typed = crate::task_launch::type_at_prompt(&launch, seen, |_| {
+                Ok::<Result<&'static str, _>, std::convert::Infallible>(Err(
+                    crate::task_launch::Untyped::Blocked("its input sink is busy".to_string()),
+                ))
+            });
+            assert_eq!(typed, None);
+            let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+            assert_eq!(
+                (record.state, record.why),
+                (TaskState::Stalled, Some("startup"))
+            );
+            let said = ctx
+                .meta
+                .lock()
+                .unwrap()
+                .attention_owners
+                .get(crate::harness_host::ATTENTION_OWNER)
+                .map(str::to_owned)
+                .expect("the cause");
+            assert!(said.contains("its input sink is busy"), "{said}");
+        });
     }
 
     /// A launcher waiting for its worker's first prompt keeps no clock, so a mark on the task is

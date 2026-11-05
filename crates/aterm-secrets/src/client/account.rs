@@ -9,7 +9,7 @@ use crate::commons::{
     journal::Journal,
     roster::Role,
 };
-use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
+use ring::signature::Ed25519KeyPair;
 
 const SUCCESSION_DOMAIN: &[u8] = b"aterm/account-issuer-succession/1\0";
 
@@ -84,9 +84,11 @@ impl AccountIssuerSuccession {
         {
             return Err(Error::new("account issuer succession is no longer current"));
         }
-        UnparsedPublicKey::new(&ED25519, terms.issuer.writer())
-            .verify(&self.message(), &self.signature)
-            .map_err(|_| Error::new("account issuer succession signature differs"))
+        if crate::ed25519::verifies(terms.issuer.writer(), &self.message(), &self.signature) {
+            Ok(())
+        } else {
+            Err(Error::new("account issuer succession signature differs"))
+        }
     }
 }
 

@@ -401,10 +401,24 @@ fn a_refused_sandbox_never_says_the_session_started() {
     assert!(!out.contains("session started"), "{out:?}");
 }
 
+/// The development seam that lifts the collector's wait for this test's ack, its parent's, to
+/// [`cpu_policy_hang_ms`]: a loaded machine that slows the ack is not a parent gone.
+#[cfg(target_os = "macos")]
+const CPU_POLICY_HANG: &str = "ATERM_CPU_POLICY_HANG_MS";
+
+/// Half the hang detector: the collector's ack wait (30 s) and its role deadline (that, the
+/// collection and 5 s: 45 s) end, and say so by their exit codes, before [`DEADLINE`] ends the
+/// test with a bare panic.
+#[cfg(target_os = "macos")]
+fn cpu_policy_hang_ms() -> String {
+    (aterm_spec::wait::MUST_HAPPEN / 2).as_millis().to_string()
+}
+
 #[cfg(target_os = "macos")]
 fn cpu_policy_child(root: &Path) -> std::process::Child {
     isolated(&mut aterm_cmd(), root)
         .arg(aterm_sysprobe::cpu_policy::COLLECTOR_VERB)
+        .env(CPU_POLICY_HANG, cpu_policy_hang_ms())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -549,6 +563,7 @@ fn cpu_policy_native_parent_pipe_closure_ends_the_collector() {
     let (reader, mut writer) = std::io::pipe().unwrap();
     let mut child = isolated(&mut aterm_cmd(), root.path())
         .arg(aterm_sysprobe::cpu_policy::COLLECTOR_VERB)
+        .env(CPU_POLICY_HANG, cpu_policy_hang_ms())
         .stdin(Stdio::piped())
         .stdout(Stdio::from(writer.try_clone().unwrap()))
         .stderr(Stdio::piped())
@@ -612,7 +627,8 @@ fn cpu_policy_native_watchdog_exits_even_when_identity_stdout_is_blocked() {
         .spawn()
         .unwrap();
     // Keep both the full pipe's reader and the parent input alive: neither EOF
-    // nor a SIGPIPE can substitute for the collector's own deadline.
+    // nor a SIGPIPE can substitute for the collector's own deadline, which no
+    // `CPU_POLICY_HANG` lifts here.
     let status = cpu_policy_exit(&mut child);
     assert_eq!(
         status.code(),

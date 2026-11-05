@@ -14,6 +14,8 @@ mod common;
 mod api_writes;
 mod args;
 #[cfg(unix)]
+mod atomic_refs;
+#[cfg(unix)]
 mod auth_verbs;
 mod classification;
 mod cli_reads;

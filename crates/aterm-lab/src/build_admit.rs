@@ -29,7 +29,7 @@ fn release_on_hard_exit() {
     let _capture = capture::lock();
     if let Some(paths) = HARD_RELEASES.get() {
         for path in paths {
-            let _ = fs::write(path, "go\n");
+            let _ = crate::util::write_fresh(path, "go\n");
         }
     }
 }
@@ -120,14 +120,14 @@ impl Drop for Fixture {
         // Output can unwind before explicit cleanup. Direct writes release the scripts without
         // recreating scratch which successful cleanup already removed.
         for build in &self.builds {
-            let _ = fs::write(&build.release, "go\n");
+            let _ = crate::util::write_fresh(&build.release, "go\n");
         }
     }
 }
 
 fn write(path: &Path, text: &str) -> Result<(), String> {
     fs::create_dir_all(path.parent().ok_or("file has no parent")?)
-        .and_then(|()| fs::write(path, text))
+        .and_then(|()| crate::util::write_fresh(path, text))
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -231,8 +231,8 @@ impl Fixture {
         let mut cmd = command(helper);
         self.environment(&mut cmd);
         cmd.args([atpkg::build_admit::VERB, "--capabilities"])
-            .stdout(fs::File::create(&out).map_err(|e| e.to_string())?)
-            .stderr(fs::File::create(&log).map_err(|e| e.to_string())?);
+            .stdout(crate::util::create_stdio_file(&out).map_err(|e| e.to_string())?)
+            .stderr(crate::util::create_stdio_file(&log).map_err(|e| e.to_string())?);
         stop::check().map_err(|e| format!("interrupted: {}", e.0))?;
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
         let status = reap(&mut child, HANG, Reap::Child)?;
@@ -281,7 +281,7 @@ impl Fixture {
             .process_group(0)
             .setsid(true)
             .stdout(Stdio::null())
-            .stderr(fs::File::create(&log).map_err(|e| e.to_string())?);
+            .stderr(crate::util::create_stdio_file(&log).map_err(|e| e.to_string())?);
         stop::check().map_err(|e| format!("interrupted: {}", e.0))?;
         let child = cmd.spawn().map_err(|e| e.to_string())?;
         self.builds.push(Build {

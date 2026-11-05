@@ -116,6 +116,7 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
             label: "Tab 1".into(),
             program: "cargo".into(),
             tab_id: Some(7),
+            agent_leader: None,
         }],
         self_uid: Some(501),
         thermal: Some(Thermal {
@@ -2409,4 +2410,144 @@ fn the_gpu_view_names_the_device_and_core_count_once() {
         .text;
     assert_eq!(gpu.matches("Apple M5").count(), 1, "{gpu}");
     assert_eq!(gpu.matches("10 cores").count(), 1, "{gpu}");
+}
+
+/// An exact OS level prints the OS's own word everywhere `sys` names the thermal state (the
+/// global clause, the `thermal` line, `sys cores`, every JSON `thermal` key, an event, the strip
+/// label), and "throttled" is left to the counter heuristic, which counts throttle events. The
+/// `throttle` key is retired. Control: the code before A2 S3 printed "throttled: light" at Fair
+/// and kept the `throttle` key.
+#[test]
+fn sys_prints_the_os_thermal_word_and_reserves_throttled_for_counted_throttling() {
+    let fair = Thermal {
+        level: crate::model::Throttle::Light,
+        raw: 1,
+        low_power: Some(false),
+        exact: true,
+    };
+    let mut s = snapshot();
+    s.thermal = Some(fair);
+    let mut w = world();
+    w.events = vec![Event {
+        seq: 2,
+        at_ns: 11_000_000_000,
+        kind: EventKind::Thermal {
+            from: Thermal {
+                level: crate::model::Throttle::None,
+                raw: 0,
+                ..fair
+            },
+            to: fair,
+        },
+    }];
+    let c = ctx(&w, Some(&s), true, true);
+    let overview = all_text(&render_text(&query(View::Overview, false), &c));
+    assert!(overview.contains("; thermal fair; "), "{overview}");
+    assert!(
+        overview.contains(" kind=thermal from=nominal to=fair"),
+        "{overview}"
+    );
+    let global = render_text(&query(View::Global, false), &c);
+    let line = |r: &Reply, key: &str| {
+        r.lines
+            .iter()
+            .find(|l| l.text.starts_with(key))
+            .map(|l| l.text.clone())
+    };
+    assert_eq!(
+        line(&global, "thermal").as_deref(),
+        Some("thermal  fair (OS level 1) · Low Power Mode off")
+    );
+    let cores = render_text(&query(View::Cores, false), &c);
+    assert_eq!(
+        line(&cores, "thermal").as_deref(),
+        Some("thermal fair (OS level 1) · Low Power Mode off")
+    );
+    for r in [&global, &cores] {
+        assert!(
+            !all_text(r).contains("throttle"),
+            "Fair claims no throttling: {}",
+            all_text(r)
+        );
+    }
+    assert!(!overview.contains("throttle"), "{overview}");
+
+    let j = render_json(&query(View::Global, true), &c);
+    assert_eq!(j.get("throttle"), None);
+    assert_eq!(
+        j.get("thermal"),
+        Some(&Jv::obj([
+            ("word", Jv::s("fair")),
+            ("raw", Jv::u(1)),
+            ("exact", Jv::Bool(true)),
+            ("low_power", Jv::Bool(false)),
+        ]))
+    );
+    let g = j.get("global").expect("global");
+    assert_eq!(
+        (g.get("thermal"), g.get("throttle")),
+        (Some(&Jv::s("fair")), None)
+    );
+    let j = render_json(&query(View::Cores, true), &c);
+    assert_eq!(
+        (j.get("thermal"), j.get("throttle")),
+        (Some(&Jv::s("fair")), None)
+    );
+    let j = render_json(&query(View::Overview, true), &c);
+    let e = match j.get("events") {
+        Some(Jv::Arr(e)) => e[0].clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        (e.get("kind"), e.get("from"), e.get("to")),
+        (
+            Some(&Jv::s("thermal")),
+            Some(&Jv::s("nominal")),
+            Some(&Jv::s("fair"))
+        )
+    );
+
+    let counted = Thermal {
+        level: crate::model::Throttle::Light,
+        raw: 1,
+        low_power: None,
+        exact: false,
+    };
+    s.thermal = Some(counted);
+    let c = ctx(&w, Some(&s), true, true);
+    let overview = all_text(&render_text(&query(View::Overview, false), &c));
+    assert!(overview.contains("; throttled: light; "), "{overview}");
+    let global = render_text(&query(View::Global, false), &c);
+    assert!(
+        line(&global, "thermal")
+            .is_some_and(|l| l.starts_with("thermal  throttled: light (estimate: ")),
+        "{}",
+        all_text(&global)
+    );
+    let j = render_json(&query(View::Global, true), &c);
+    assert_eq!(
+        j.get("thermal"),
+        Some(&Jv::obj([
+            ("word", Jv::s("light")),
+            ("raw", Jv::u(1)),
+            ("exact", Jv::Bool(false)),
+            ("low_power", Jv::why("unsupported")),
+        ]))
+    );
+
+    let mut v = Vitals::new();
+    let _ = v.absorb(&sample(10, &[0, 0, 0, 0], 0));
+    let mut hot = sample(11, &[20, 30, 100, 90], 1);
+    hot.thermal = Some(Thermal {
+        level: crate::model::Throttle::Severe,
+        raw: 3,
+        ..fair
+    });
+    let labels: Vec<String> = v
+        .absorb(&hot)
+        .strip_events
+        .into_iter()
+        .map(|e| e.label)
+        .collect();
+    assert_eq!(labels, ["thermal critical"]);
 }

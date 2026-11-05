@@ -381,18 +381,30 @@ impl SignalPipe {
                 to_set.push((sig, old));
             }
         }
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `fds` is a two-int array, as `pipe(2)` requires.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        for fd in fds {
-            // SAFETY: both are descriptors `pipe` just returned.
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _};
+        let (rd_fd, wr_fd) = aterm_uds::kept_out(|| {
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: `fds` is a two-int array, as `pipe(2)` requires.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
             }
-        }
+            // SAFETY: both are fresh descriptors `pipe` just returned.
+            let (rd, wr) = unsafe {
+                (
+                    std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                    std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+                )
+            };
+            for fd in [rd.as_raw_fd(), wr.as_raw_fd()] {
+                // SAFETY: both are owned descriptors `pipe` just returned.
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                }
+            }
+            Ok((rd, wr))
+        })?;
+        let fds = [rd_fd.into_raw_fd(), wr_fd.into_raw_fd()];
         let prev_wr = SIGNAL_WR.swap(fds[1], Ordering::Relaxed);
         for (idx, &(sig, _)) in to_set.iter().enumerate() {
             // SAFETY: a zeroed `sigaction` is a valid starting value; the handler
@@ -752,9 +764,14 @@ pub fn tiocsti(fd: RawFd, byte: u8) -> io::Result<()> {
 
 /// Attempt an outbound IPv4 UDP `connect()` to `(ip, port)`.
 pub fn udp_connect(ip: [u8; 4], port: u16) -> io::Result<()> {
-    // SAFETY: a plain datagram socket; closed below on every path.
+    // SAFETY: a plain datagram socket; owned below on every path.
     let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if s < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _owned = own_fd(s);
+    // SAFETY: F_SETFD takes an integer flag on this live descriptor.
+    if unsafe { libc::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: a zeroed `sockaddr_in` is valid; the fields set below fill it.
@@ -767,13 +784,11 @@ pub fn udp_connect(ip: [u8; 4], port: u16) -> io::Result<()> {
     let len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_in>()).unwrap_or(16);
     // SAFETY: `sa` is a valid `sockaddr_in` of `len` bytes.
     let r = unsafe { libc::connect(s, (&raw const sa).cast(), len) };
-    let out = if r == 0 {
+    if r == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
-    };
-    close(s);
-    out
+    }
 }
 
 unsafe extern "C" {
@@ -852,6 +867,10 @@ const PRIO_DARWIN_ROLE: libc::c_int = 6;
 
 #[cfg(target_os = "macos")]
 type SpawnAttr = *mut libc::c_void;
+// Darwin's opaque file-actions pointer, matching the existing native spawn ABI in
+// aterm-uds::spawnfd. The first-party libc surface does not declare these bindings.
+#[cfg(target_os = "macos")]
+type SpawnActions = *mut libc::c_void;
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -860,10 +879,17 @@ unsafe extern "C" {
     fn posix_spawnattr_setflags(attr: *mut SpawnAttr, flags: libc::c_short) -> libc::c_int;
     fn posix_spawnattr_setprocesstype_np(attr: *mut SpawnAttr, kind: libc::c_int) -> libc::c_int;
     fn posix_spawnattr_set_darwin_role_np(attr: *mut SpawnAttr, role: u64) -> libc::c_int;
+    fn posix_spawn_file_actions_init(actions: *mut SpawnActions) -> libc::c_int;
+    fn posix_spawn_file_actions_destroy(actions: *mut SpawnActions) -> libc::c_int;
+    fn posix_spawn_file_actions_adddup2(
+        actions: *mut SpawnActions,
+        fd: libc::c_int,
+        target: libc::c_int,
+    ) -> libc::c_int;
     fn posix_spawn(
         pid: *mut libc::pid_t,
         path: *const libc::c_char,
-        actions: *const libc::c_void,
+        actions: *const SpawnActions,
         attr: *const SpawnAttr,
         argv: *const *const libc::c_char,
         envp: *const *const libc::c_char,
@@ -872,6 +898,8 @@ unsafe extern "C" {
 
 #[cfg(target_os = "macos")]
 const SPAWN_SETEXEC: libc::c_short = 0x40;
+#[cfg(target_os = "macos")]
+const SPAWN_CLOEXEC_DEFAULT: libc::c_short = 0x4000;
 #[cfg(target_os = "macos")]
 const PROC_TYPE_APP_DEFAULT: libc::c_int = 0x100;
 
@@ -883,6 +911,119 @@ pub fn exec_as_app(
     env: &[(String, String)],
     role: u64,
 ) -> io::Error {
+    exec_as_app_inner(program, argv, env, role, None)
+}
+
+/// Replace this process as an app, retaining only stdio and the explicitly held window guard.
+/// The guard's original descriptor and close-on-exec policy remain unchanged if exec fails.
+#[cfg(target_os = "macos")]
+pub fn exec_as_app_with_guards(
+    program: &str,
+    argv: &[String],
+    env: &[(String, String)],
+    role: u64,
+    guards: &[std::os::fd::BorrowedFd<'_>],
+) -> io::Error {
+    exec_as_app_inner(program, argv, env, role, Some(guards))
+}
+
+#[cfg(target_os = "macos")]
+fn exec_as_app_inner(
+    program: &str,
+    argv: &[String],
+    env: &[(String, String)],
+    role: u64,
+    guards: Option<&[std::os::fd::BorrowedFd<'_>]>,
+) -> io::Error {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    struct Actions {
+        actions: SpawnActions,
+        // SETEXEC cannot read a CLOEXEC source. Only this private temporary copy loses
+        // CLOEXEC, never the original guard offered to keeper in argv.
+        sources: Vec<OwnedFd>,
+    }
+    impl Drop for Actions {
+        fn drop(&mut self) {
+            // SAFETY: initialized native actions owned exclusively by this scope.
+            unsafe { posix_spawn_file_actions_destroy(&raw mut self.actions) };
+        }
+    }
+    let actions = guards
+        .map(|guards| -> io::Result<Actions> {
+            let targets: Vec<_> = guards.iter().map(|guard| guard.as_raw_fd()).collect();
+            if targets.is_empty()
+                || targets.len() > 2
+                || targets.iter().any(|fd| *fd <= 2)
+                || (targets.len() == 2 && targets[0] == targets[1])
+            {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            let floor = targets
+                .iter()
+                .copied()
+                .max()
+                .and_then(|fd| fd.checked_add(1))
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            let mut sources = Vec::with_capacity(guards.len());
+            for guard in guards {
+                let source = aterm_uds::kept_out(|| {
+                    // SAFETY: duplicate a live borrowed descriptor above stdio with CLOEXEC set.
+                    let raw =
+                        unsafe { libc::fcntl(guard.as_raw_fd(), libc::F_DUPFD_CLOEXEC, floor) };
+                    if raw < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // SAFETY: fcntl returned a new descriptor, owned only by this scope.
+                    Ok::<_, io::Error>(unsafe { OwnedFd::from_raw_fd(raw) })
+                })?;
+                // SAFETY: F_GETFD/SETFD affect only our new owned duplicate, kept out of other
+                // spawns. The handing guard below lifts its fork exclusion for this exec alone.
+                let flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) };
+                if flags < 0
+                    || unsafe {
+                        libc::fcntl(source.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC)
+                    } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                sources.push(source);
+            }
+            let mut native = std::ptr::null_mut();
+            // SAFETY: native is initialized by this call before use and always destroyed.
+            let rc = unsafe { posix_spawn_file_actions_init(&raw mut native) };
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc));
+            }
+            let mut actions = Actions {
+                actions: native,
+                sources,
+            };
+            let mut copies = vec![(0, 0), (1, 1), (2, 2)];
+            copies.extend(
+                actions
+                    .sources
+                    .iter()
+                    .map(|source| source.as_raw_fd())
+                    .zip(targets),
+            );
+            for (source, target) in copies {
+                // SAFETY: live descriptors retained across SETEXEC; explicit file actions also
+                // preserve stdio under CLOEXEC_DEFAULT. No original descriptor flags change.
+                let rc = unsafe {
+                    posix_spawn_file_actions_adddup2(&raw mut actions.actions, source, target)
+                };
+                if rc != 0 {
+                    return Err(io::Error::from_raw_os_error(rc));
+                }
+            }
+            Ok(actions)
+        })
+        .transpose();
+    let actions = match actions {
+        Ok(actions) => actions,
+        Err(error) => return error,
+    };
     let c = |s: &str| CString::new(s).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput));
     let made = (|| -> io::Result<(CString, Vec<CString>, Vec<CString>)> {
         let args = argv.iter().map(|a| c(a)).collect::<io::Result<Vec<_>>>()?;
@@ -904,6 +1045,19 @@ pub fn exec_as_app(
     };
     let (argp, envp) = (ptrs(&args), ptrs(&vars));
     let mut attr: SpawnAttr = std::ptr::null_mut();
+    let handed: Vec<_> = actions
+        .as_ref()
+        .map(|actions| {
+            actions
+                .sources
+                .iter()
+                .map(|source| source.as_raw_fd())
+                .collect()
+        })
+        .unwrap_or_default();
+    let _handing = actions
+        .as_ref()
+        .map(|_| aterm_uds::spawn_lock::handing(&handed));
     // SAFETY: `attr` is initialized before use and destroyed after; every
     // pointer passed (path, argv, envp: NULL-terminated arrays of C strings
     // that outlive the call) is valid; on success the call does not return.
@@ -913,7 +1067,15 @@ pub fn exec_as_app(
             return io::Error::from_raw_os_error(rc);
         }
         let set = [
-            posix_spawnattr_setflags(&raw mut attr, SPAWN_SETEXEC),
+            posix_spawnattr_setflags(
+                &raw mut attr,
+                SPAWN_SETEXEC
+                    | if actions.is_some() {
+                        SPAWN_CLOEXEC_DEFAULT
+                    } else {
+                        0
+                    },
+            ),
             posix_spawnattr_setprocesstype_np(&raw mut attr, PROC_TYPE_APP_DEFAULT),
             posix_spawnattr_set_darwin_role_np(&raw mut attr, role),
         ];
@@ -923,7 +1085,9 @@ pub fn exec_as_app(
             None => posix_spawn(
                 &raw mut pid,
                 prog.as_ptr(),
-                std::ptr::null(),
+                actions.as_ref().map_or(std::ptr::null(), |actions| {
+                    std::ptr::from_ref(&actions.actions)
+                }),
                 &raw const attr,
                 argp.as_ptr(),
                 envp.as_ptr(),
@@ -931,6 +1095,121 @@ pub fn exec_as_app(
         };
         posix_spawnattr_destroy(&raw mut attr);
         io::Error::from_raw_os_error(e)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod app_exec_guard_tests {
+    use super::*;
+    use aterm_toolchain::record_lock::RecordLock;
+    use std::os::fd::{AsRawFd as _, OwnedFd};
+
+    #[test]
+    fn failed_app_exec_preserves_original_guard_flags_and_closes_temporary_sources() {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let path = world.path().join("window.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let original = RecordLock::try_lock(file, 0).unwrap().into_close_only();
+        let guard: OwnedFd = original.try_clone_fd().unwrap();
+        let flags = |fd| {
+            // SAFETY: the test retains the owned descriptor across this query.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0);
+            flags
+        };
+        let before = flags(guard.as_raw_fd());
+        assert_ne!(before & libc::FD_CLOEXEC, 0);
+        let missing = world.path().join("missing-program");
+        let program = missing.to_str().unwrap();
+        let error = exec_as_app_with_guards(
+            program,
+            &[program.into()],
+            &[],
+            1,
+            &[std::os::fd::AsFd::as_fd(&guard)],
+        );
+        assert!(error.raw_os_error().is_some());
+        assert_eq!(flags(guard.as_raw_fd()), before);
+        let open = || std::fs::File::open(&path).unwrap();
+        assert!(matches!(
+            RecordLock::try_lock(open(), 0),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(original);
+        assert!(matches!(
+            RecordLock::try_lock(open(), 0),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(guard);
+        let _new = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "failed native exec closes its private temporary guard source",
+            || match RecordLock::try_lock(open(), 0) {
+                Ok(guard) => Some(guard),
+                Err(std::fs::TryLockError::WouldBlock) => None,
+                Err(std::fs::TryLockError::Error(error)) => panic!("cannot reacquire: {error}"),
+            },
+        );
+    }
+
+    #[test]
+    fn failed_two_role_exec_preserves_both_original_descriptions() {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let mut originals = Vec::new();
+        let mut descriptors = Vec::new();
+        let mut paths = Vec::new();
+        for name in ["lane", "memory"] {
+            let path = world.path().join(name);
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let original = RecordLock::try_lock(file, 0).unwrap().into_close_only();
+            descriptors.push(original.try_clone_fd().unwrap());
+            originals.push(original);
+            paths.push(path);
+        }
+        let flags = |fd| {
+            // SAFETY: both actual owned descriptors remain live through the query.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0);
+            flags
+        };
+        let before: Vec<_> = descriptors.iter().map(|fd| flags(fd.as_raw_fd())).collect();
+        let borrowed: Vec<_> = descriptors.iter().map(std::os::fd::AsFd::as_fd).collect();
+        let missing = world.path().join("missing");
+        let program = missing.to_str().unwrap();
+        let error = exec_as_app_with_guards(program, &[program.into()], &[], 1, &borrowed);
+        assert!(error.raw_os_error().is_some());
+        for (fd, before) in descriptors.iter().zip(before) {
+            assert_eq!(flags(fd.as_raw_fd()), before);
+        }
+        drop(originals);
+        for path in &paths {
+            assert!(matches!(
+                RecordLock::try_lock(std::fs::File::open(path).unwrap(), 0),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+        }
+        drop(descriptors);
+        for path in paths {
+            let _reacquired = aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "both temporary native guard sources to close",
+                || match RecordLock::try_lock(std::fs::File::open(&path).unwrap(), 0) {
+                    Ok(held) => Some(held),
+                    Err(std::fs::TryLockError::WouldBlock) => None,
+                    Err(why) => panic!("native guard reacquisition: {why}"),
+                },
+            );
+        }
     }
 }
 
@@ -1256,6 +1535,15 @@ fn fstat_of(fd: RawFd) -> io::Result<(libc::mode_t, u32, u64)> {
     Ok((st.st_mode & libc::S_IFMT, st.st_uid, u64::from(st.st_nlink)))
 }
 
+/// `e`, a scratch `O_NOFOLLOW_ANY` open's failure for `path`: where the kernel refused a link in
+/// the path (`ELOOP`), the path is told as one the lab refused ([`crate::link_notice::refused`]).
+fn told(e: io::Error, path: &std::path::Path) -> io::Error {
+    if e.raw_os_error() == Some(libc::ELOOP) {
+        crate::link_notice::refused(path);
+    }
+    e
+}
+
 /// Open this user's single-link regular file at `path` with `O_NOFOLLOW_ANY` and return its metadata.
 pub fn scratch_file_with_meta(
     path: &std::path::Path,
@@ -1270,7 +1558,7 @@ pub fn scratch_file_with_meta(
         )
     };
     if fd < 0 {
-        let e = io::Error::last_os_error();
+        let e = told(io::Error::last_os_error(), path);
         return if e.raw_os_error() == Some(libc::ENOENT) {
             Ok(None)
         } else {
@@ -1319,7 +1607,7 @@ pub fn scratch_dir(
         )
     };
     if fd < 0 {
-        let e = io::Error::last_os_error();
+        let e = told(io::Error::last_os_error(), path);
         return if e.raw_os_error() == Some(libc::ENOENT) {
             Ok(None)
         } else {
@@ -1371,6 +1659,10 @@ pub fn scratch_dir(
         let kind = match d_type {
             libc::DT_DIR => EntryKind::Dir,
             libc::DT_REG => EntryKind::File,
+            libc::DT_LNK => {
+                crate::link_notice::refused(&path.join(name));
+                continue;
+            }
             _ => continue,
         };
         out.push((name.to_os_string(), kind));
@@ -1490,6 +1782,7 @@ pub fn scratch_dirs(path: &std::path::Path) -> io::Result<()> {
 }
 
 /// Atomically stage and rename `src` to absolute `path` with `mode` without following symlinks.
+/// Parent traversal is refused before creating any directory.
 pub fn put(path: &std::path::Path, mode: u32, src: &PutSrc<'_>) -> io::Result<()> {
     put_with_nonce(path, mode, src, || {
         let mut r = [0u8; 4];
@@ -1509,6 +1802,15 @@ fn put_with_nonce(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("put: {} is not an absolute path", path.display()),
+        ));
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("put: {} climbs with ..", path.display()),
         ));
     }
     let name = path
@@ -1552,26 +1854,30 @@ fn put_with_nonce(
         nonce()
     )))?;
     let mut owned_stage = None;
-    let create = |d: RawFd,
-                  owned: &mut Option<std::os::fd::OwnedFd>|
-     -> io::Result<std::os::fd::OwnedFd> {
-        // SAFETY: `d` is an open directory, `tmp` a valid C string.
-        let fd = unsafe {
-            libc::openat(
-                d,
-                tmp.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600 as libc::c_uint,
-            )
+    let create =
+        |d: RawFd, owned: &mut Option<std::os::fd::OwnedFd>| -> io::Result<std::os::fd::OwnedFd> {
+            // SAFETY: `d` is an open directory, `tmp` a valid C string.
+            let fd = unsafe {
+                libc::openat(
+                    d,
+                    tmp.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK,
+                    0o600 as libc::c_uint,
+                )
+            };
+            if fd < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                let fd = own_fd(fd);
+                *owned = Some(fd.try_clone()?);
+                Ok(fd)
+            }
         };
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            let fd = own_fd(fd);
-            *owned = Some(fd.try_clone()?);
-            Ok(fd)
-        }
-    };
     let written: io::Result<std::os::fd::OwnedFd> = (|| match src {
         PutSrc::Bytes(b) => {
             let fd = create(d, &mut owned_stage)?;
@@ -1713,20 +2019,24 @@ impl NewOutputDir {
         if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: the parent is pinned; O_NOFOLLOW refuses a link replacing the new entry.
-        let fd = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let dir = aterm_uds::kept_out(|| {
+            // SAFETY: the parent is pinned; O_NOFOLLOW refuses a link replacing the new entry.
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(own_fd(fd))
+            }
+        })?;
         let output = Self {
             parent,
-            dir: own_fd(fd),
+            dir,
             name,
             path,
         };
@@ -1769,7 +2079,12 @@ impl NewOutputDir {
             libc::openat(
                 self.dir.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
                 0o600 as libc::c_uint,
             )
         };
@@ -1799,7 +2114,7 @@ pub fn scratch_remove(path: &std::path::Path) -> io::Result<()> {
         )
     };
     if fd < 0 {
-        let e = io::Error::last_os_error();
+        let e = told(io::Error::last_os_error(), path);
         return if e.raw_os_error() == Some(libc::ENOENT) {
             Ok(())
         } else {
@@ -1849,7 +2164,7 @@ fn open_parent(path: &std::path::Path) -> io::Result<Option<(std::os::fd::OwnedF
         )
     };
     if fd < 0 {
-        let e = io::Error::last_os_error();
+        let e = told(io::Error::last_os_error(), path);
         return if e.raw_os_error() == Some(libc::ENOENT) {
             Ok(None)
         } else {
@@ -2007,8 +2322,8 @@ struct WholeMap {
 impl WholeMap {
     fn of(path: &std::path::Path) -> io::Result<Option<WholeMap>> {
         use std::os::fd::AsRawFd as _;
-        let file = std::fs::File::open(path)?;
-        let len = usize::try_from(file.metadata()?.len())
+        let (file, meta) = aterm_uds::regular_file::open(path)?;
+        let len = usize::try_from(meta.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large to map"))?;
         if len == 0 {
             return Ok(None);
@@ -2858,6 +3173,17 @@ mod tests {
             .is_err()
         );
         assert!(put(Path::new("relative/x"), 0o600, &PutSrc::Bytes(b"")).is_err());
+        for prefix in ["a", "not-created"] {
+            let traversal = d.0.join(prefix).join("../outside");
+            assert_eq!(
+                put(&traversal, 0o600, &PutSrc::Bytes(b"no"))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert!(!d.0.join("not-created").exists());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
     }
 
     /// A folder made through no link: each missing part made, an existing one kept. NEGATIVE

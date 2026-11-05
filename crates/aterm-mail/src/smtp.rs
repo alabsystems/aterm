@@ -169,12 +169,30 @@ pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
             aterm_codec::base64::encode(part.as_bytes()).map_err(|e| e.to_string())?
         ));
     }
-    let normalized = draft
-        .text
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace('\n', "\r\n");
-    let body = aterm_codec::base64::encode(normalized.as_bytes()).map_err(|e| e.to_string())?;
+    let mut normalized = Vec::with_capacity(draft.text.len().saturating_add(draft.text.len() / 16));
+    let raw_text = draft.text.as_bytes();
+    let mut i = 0;
+    while i < raw_text.len() {
+        match raw_text[i] {
+            b'\r' => {
+                normalized.extend_from_slice(b"\r\n");
+                if raw_text.get(i + 1) == Some(&b'\n') {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            b'\n' => {
+                normalized.extend_from_slice(b"\r\n");
+                i += 1;
+            }
+            b => {
+                normalized.push(b);
+                i += 1;
+            }
+        }
+    }
+    let body = aterm_codec::base64::encode(&normalized).map_err(|e| e.to_string())?;
     let now = aterm_time::unix_secs().ok_or("System clock is unavailable")?;
     let date = mail_date(now)?;
     let mut identifier = [0u8; 16];

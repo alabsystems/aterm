@@ -501,9 +501,11 @@ impl std::fmt::Debug for Lookahead {
 /// Whether a person can be asked: this process has a terminal.
 fn at_terminal() -> bool {
     use std::io::IsTerminal as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/dev/tty")
         .is_ok_and(|tty| tty.is_terminal())
 }
@@ -3027,6 +3029,7 @@ pub(crate) mod tests {
         Status {
             config: Some(Config {
                 source: Source::Url(aterm_secrets::ALAB_DEFAULT_URL.into()),
+                mirrors: Vec::new(),
                 name: "alab".into(),
                 signer: Some([3; 32]),
                 followed: Vec::new(),
@@ -5442,6 +5445,7 @@ pub(crate) mod tests {
         let mut plain = configured(Membership::Plain);
         plain.config = Some(Config {
             source: Source::Path("/Volumes/Keys/team.vault".into()),
+            mirrors: Vec::new(),
             name: "team".into(),
             signer: None,
             followed: Vec::new(),
@@ -5725,6 +5729,7 @@ pub(crate) mod tests {
         let mut joined = configured(Membership::In { seq: 7, heard: 0 });
         joined.config = Some(Config {
             source: Source::Path(source.into()),
+            mirrors: Vec::new(),
             name: "team".into(),
             signer: None,
             followed: Vec::new(),
@@ -6247,6 +6252,9 @@ pub(crate) mod tests {
         let url = format!("http://{}/v1/team", running.addr);
         let created = aterm_secrets::client::create(&admin, &url, None, Some("admin")).unwrap();
         let live = LiveSecrets::new(&root.path().join("joiner"));
+        // This test's own server answers each check within CHECK_WAIT plus the one-minute hang
+        // detector (aterm_spec::wait::MUST_HAPPEN) in place of the fetch margin's 5 s.
+        let _answering = aterm_secrets::client::ServersAnswering::within(Duration::from_secs(60));
 
         let Ok(Checked::Unpinned { fingerprint, pin }) = live.check(&url) else {
             panic!("an unpinned vault is put to the person");
@@ -6400,7 +6408,14 @@ pub(crate) mod tests {
             matches!(outcome, JoinOutcome::Pending { .. }),
             "{outcome:?}"
         );
-        let refused = aterm_secrets::client::auto_approve(&admin).unwrap();
+        let refused = {
+            // This test's own server answers the approver's verdict post, which nothing
+            // retries, within the one-minute hang detector (aterm_spec::wait::MUST_HAPPEN), not
+            // the product's 10 s.
+            let _answering =
+                aterm_secrets::client::ServersAnswering::within(Duration::from_secs(60));
+            aterm_secrets::client::auto_approve(&admin).unwrap()
+        };
         assert_eq!(refused.refused.len(), 1, "{refused:?}");
         // A window far past the hang detector: only the verdict ends it within it.
         let (ended, waited) = std::sync::mpsc::channel();

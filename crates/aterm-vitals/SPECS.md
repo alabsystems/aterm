@@ -42,6 +42,36 @@ Result, recounted from §1's and §2's rows and the test files on 2026-11-01: **
 > (`LeftRow::foreground`, `end`'s `why=foreground`) and gives its exe word (`LeftRow::exe_word`,
 > which the view and the `proc.` records print), and the view keeps the live tabs it was judged
 > against (`LeftView::live`), which `end`'s re-proof judges the one pid against again.
+>
+> 2026-11-01: `left-entry` (held by its tests, not yet a row): `left::eligible(r, view, after)` iff
+> r's tier is `offer` or `auto`, `left::owner_gone_ms(r, view)` (`as_of_ms` less its closed tab's
+> `closed_ms`, or its dead run's `dead_ms`; `None` for a live tab's row or one nothing ties) is at
+> least `after`, and r is `launcher-dead` or `left::costs(r, view)` (CPU at least a second per hour
+> of its age, or its executable under one of `view.build_dirs`); `ENTRY_AFTER_MS` is an hour
+> (`src/left_tests.rs`: `a_dead_runs_leftover_an_hour_old_is_eligible_even_idle`,
+> `a_closed_tabs_idle_leftover_is_not_eligible`,
+> `a_closed_tabs_leftover_burning_a_second_an_hour_is_eligible`,
+> `an_executable_under_a_kept_build_dir_makes_a_closed_tabs_leftover_eligible`,
+> `an_orphan_of_a_live_tab_is_never_eligible`, `under_an_hour_nothing_is_eligible`). The view's
+> `link` rows print `target=gone|not-mounted`, and their checkout and path only with no caller
+> session; its JSON gives each `proc` its `owner_gone_ms` and `entry`
+> (`src/sys/left_tests.rs::a_dangling_links_row_names_its_target_and_paths_only_with_no_caller`).
+>
+> 2026-11-04: `left-agent-rows` (held by its tests, not yet a row): a judged row records
+> `LeftRow::after_agent`, W-session's tie's (false with none): born in one of its tab's agent
+> stretches (`LiveTab::agent_spans`, `AgentSpan`). `left::fold_agent` keeps them: a reading that
+> names an agent opens a stretch from the least unique id it read (or reopens and widens the last
+> one that id falls in or before, merging what it then overlaps), one that names none closes the
+> open stretch at its horizon, at most `AGENT_SPANS_KEPT`. `left::left_of(view, row)` is the session
+> whose count holds an `offer` row: W-session's live tab (`Proof::Env`, `Source::Tab`) for one born
+> in a stretch, or after its shell where the tab has none, and a dead run's record's `sid`; never a
+> `name`, `never` or `auto` row, a closed tab's or an untied one. `agents_left(view, sid)` is the rows
+> it gives `sid`; `agents_left_read` and `agents_left_count` read none of a partial view
+> (`complete` false or `bounded`). `holds_an_offer` holds such a row too. `sys::left::status_field`
+> is `left=-` with no view, no sid or a partial view, `left=0:-` with no row, else
+> `left=<n>:<oldest + age | ->`, and `sys left` prints `left_of=<sid>` on each such row
+> (`src/left_tests.rs::{a_row_records_whether_it_was_born_after_its_agent,the_agents_rows_are_its_offered_session_rows_and_its_dead_runs,a_partial_view_counts_no_agents_rows,a_tabs_agent_stretches_open_close_and_merge,a_view_offering_a_gone_owners_row_asks_for_its_next_reading}`,
+> `src/sys/left_tests.rs::each_agents_left_row_says_whose_count_it_is_in`).
 
 ## 0. Notation used in the statements
 

@@ -221,10 +221,7 @@ pub fn followed_mode(file: &std::path::Path) -> Mode {
 }
 
 fn write_subscription(home: &std::path::Path, now: i64) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(home.join(".claude.json"))?;
+    let mut file = crate::util::create_new_regular_file(&home.join(".claude.json"), 0o600)?;
     let reset = crate::util::utc_stamp(now + 7 * 24 * 60 * 60);
     let profile = aterm_json::json!({
         "oauthAccount": {
@@ -442,7 +439,6 @@ fn screen(
 
 fn write_env() -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     let home = std::env::var_os("HOME").ok_or(std::io::ErrorKind::NotFound)?;
     let dir = std::path::Path::new(&home).join(ENV_DIR);
     std::fs::create_dir_all(&dir)?;
@@ -453,13 +449,7 @@ fn write_env() -> std::io::Result<()> {
         body.extend_from_slice(v.as_bytes());
         body.push(0);
     }
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(dir.join(std::process::id().to_string()))?
-        .write_all(&body)
+    aterm_uds::atomic_file::write(&dir.join(std::process::id().to_string()), &body, 0o600)
 }
 
 fn write_session(
@@ -518,9 +508,9 @@ fn write_session(
             ),
         ));
     }
-    std::fs::write(project.join(format!("{session}.jsonl")), transcript)?;
-    std::fs::write(
-        dir.join("sessions").join(format!("{pid}.json")),
+    crate::util::write_fresh(&project.join(format!("{session}.jsonl")), transcript)?;
+    crate::util::write_fresh(
+        &dir.join("sessions").join(format!("{pid}.json")),
         format!(
             "{{\"pid\":{pid},\"sessionId\":\"{session}\",\"cwd\":\"{}\",\"startedAt\":{},\"version\":\"2.1.300\",\"kind\":\"interactive\"}}\n",
             escape(&cwd_text),

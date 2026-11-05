@@ -26,6 +26,11 @@ fn round(admit_ms: f64, restored_ms: f64) -> Round {
         seam_copies: 0,
         seam_plants: 0,
         seam_ms: 0.0,
+        fence_cohort: 2,
+        sync_sent_ms: admit_ms + 3.0,
+        sync_answer_max_ms: 0.5,
+        fence_ms: admit_ms + 4.0,
+        b_served_ms: admit_ms + 5.0,
         ready_ms: 40.0,
         served_ms: 45.0,
         served_window_ms: 2.5,
@@ -226,7 +231,8 @@ fn served_s_window_runs_from_the_last_refusal_or_ready_to_the_answer() {
 /// does not have left out of it), and a row per round of what came back.
 #[test]
 fn the_tables_carry_every_size_and_every_round() {
-    let spec = crate::spec::parse("out=/s sessions=1,2 rounds=2").expect("parses");
+    let spec =
+        crate::spec::parse("sessions=1,2 rounds=2", std::path::Path::new("/s")).expect("parses");
     let mut unsettled = round(3.0, 50.0);
     unsettled.settled_ms = None;
     let sizes = vec![
@@ -243,8 +249,12 @@ fn the_tables_carry_every_size_and_every_round() {
         "the nearest-rank median, the min and the max, the round with no import left out: {md}"
     );
     assert!(
-        md.contains("| 1 | 40.0 (40.0–40.0) | 45.0 (45.0–45.0) | 2.5 (2.5–2.5) |"),
-        "the bench's clock with served's window: {md}"
+        md.contains("| 1 | 4.0 (4.0–6.0) | 0.5 (0.5–0.5) | 5.0 (5.0–7.0) | 6.0 (6.0–8.0) | 2 |"),
+        "the fence on B's clocks: {md}"
+    );
+    assert!(
+        md.contains("| 1 | 40.0 (40.0–40.0) | 45.0 (45.0–45.0) | 2.5 (2.5–2.5) | 5.0 (5.0–5.0) |"),
+        "the bench's clock with served's window and ready → served: {md}"
     );
     assert_eq!(
         md.lines()
@@ -257,6 +267,8 @@ fn the_tables_carry_every_size_and_every_round() {
     );
     let json = size_json(2, &sizes[1].1);
     assert_eq!(json["summary"]["admit_ms"]["p50"], json!(2.0));
+    assert_eq!(json["summary"]["fence_ms"]["p50"], json!(6.0));
+    assert_eq!(json["rounds"][0]["ready_to_served_ms"], json!(5.0));
     assert_eq!(json["rounds"].as_array().map(Vec::len), Some(2));
     assert_eq!(
         json["rounds"][0]["experiment"],

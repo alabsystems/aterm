@@ -16,7 +16,6 @@
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -229,10 +228,9 @@ pub fn run_standin_auth(
             if !otp_ok {
                 return (1, String::new());
             }
-            if std::fs::create_dir_all(&target_dir).is_err() {
+            if crate::util::create_private_dir_all(&target_dir).is_err() {
                 return (1, String::new());
             }
-            let _ = std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o700));
             let expires_ms = (now_secs() + 86_400) * 1000;
             let creds = format!(
                 "{{\"claudeAiOauth\":{{\"accessToken\":\"tok-mbx-{}\",\"refreshToken\":\"ref-mbx-{}\",\
@@ -266,18 +264,14 @@ pub fn run_standin_auth(
             }
             if let Some(ctl) = ctl_dir {
                 let _ = std::fs::create_dir_all(&ctl);
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(ctl.join("auth-logins.tsv"))
-                {
+                if let Ok(mut f) = crate::util::append_regular_file(&ctl.join("auth-logins.tsv")) {
                     let _ = writeln!(f, "{email}\t{}", target_dir.display());
                 }
             }
             (0, format!("Logged in as {email}\n"))
         }
         "status" => {
-            let creds_ok = std::fs::metadata(target_dir.join(".credentials.json"))
+            let creds_ok = std::fs::symlink_metadata(target_dir.join(".credentials.json"))
                 .is_ok_and(|m| m.is_file() && m.len() > 2);
             let profile_raw = scratch_text(&target_dir.join(".claude.json"));
             let email = J::parse(&profile_raw)
@@ -346,9 +340,8 @@ pub fn write_hermetic_ai_mailbox_toml(
     email: &str,
 ) -> Result<PathBuf, String> {
     let secrets = home.join(".secrets");
-    std::fs::create_dir_all(&secrets).map_err(|e| format!("create {}: {e}", secrets.display()))?;
-    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("chmod {}: {e}", secrets.display()))?;
+    crate::util::create_private_dir_all(&secrets)
+        .map_err(|e| format!("create {}: {e}", secrets.display()))?;
     let path = secrets.join(SECRETS_MAILBOX_TOML_FILE);
     let body = format!(
         "dir = \"{}\"\n\n[passwords]\n\"{}\" = \"hermetic-mailbox-pass\"\n",
@@ -486,18 +479,14 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
     }
 
     let secrets_dir = world.home.join(".secrets");
-    std::fs::create_dir_all(&secrets_dir).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| e.to_string())?;
+    crate::util::create_private_dir_all(&secrets_dir).map_err(|e| e.to_string())?;
 
     let harness = world.state().join("harness/claude-harness");
     let store = Store::at(&harness);
     std::fs::create_dir_all(store.logins_dir()).map_err(|e| e.to_string())?;
 
     let claude_home = world.home.join(".claude");
-    std::fs::create_dir_all(&claude_home).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&claude_home, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| e.to_string())?;
+    crate::util::create_private_dir_all(&claude_home).map_err(|e| e.to_string())?;
     let base_expires_ms = (now_secs() + 86_400) * 1000;
     let base_creds = format!(
         "{{\"claudeAiOauth\":{{\"accessToken\":\"tok-swarm-base\",\"refreshToken\":\"ref-swarm-base\",\
@@ -688,9 +677,7 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
     // until the row is enrolled.
     if let Some(raw) = &live_mailbox_bytes {
         let secrets = world.home.join(".secrets");
-        std::fs::create_dir_all(&secrets).map_err(|e| e.to_string())?;
-        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| e.to_string())?;
+        crate::util::create_private_dir_all(&secrets).map_err(|e| e.to_string())?;
         sys::put(
             &secrets.join(SECRETS_MAILBOX_TOML_FILE),
             0o600,
@@ -755,9 +742,11 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
         if !crate::wait_until(HANG, || {
             inst.ctl(&[&sel, "status"]).stdout.contains("program=bash")
         }) {
-            inst.stop();
             world.keep();
-            return Err(Fail::die("tab did not enter interactive bash"));
+            return crate::instance::after_stop(
+                Err(Fail::die("tab did not enter interactive bash")),
+                inst.stop(),
+            );
         }
         ctl_ok(&inst, &[&sel, "meta", "set", "autopilot", "cruise"])?;
         ctl_ok(&inst, &[&sel, "task", "mark", "working"])?;
@@ -874,14 +863,20 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
         ..ev.clone()
     };
     if judge_mailbox_evidence(&withheld_only, &label).is_empty() {
-        inst.stop();
-        return Err(Fail::die(
-            "negative control broken: judge accepted withheld-only evidence",
-        ));
+        world.keep();
+        return crate::instance::after_stop(
+            Err(Fail::die(
+                "negative control broken: judge accepted withheld-only evidence",
+            )),
+            inst.stop(),
+        );
     }
 
     let failures = judge_mailbox_evidence(&ev, &label);
-    inst.stop();
+    let cleanup = inst.stop();
+    if cleanup.is_err() {
+        world.keep();
+    }
 
     let mode_word = if opts.live { "live" } else { "hermetic" };
     println!("swarm mailbox-signin ({mode_word}):");
@@ -900,6 +895,9 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
 
     if !saw_no_route || !enrolled_ok || !failures.is_empty() {
         world.keep();
+        if let Err(why) = &cleanup {
+            eprintln!("swarm mailbox-signin: instance cleanup failed: {why}");
+        }
         let host_log = scratch_text(&world.state().join("logs/aterm.log"));
         let tail: Vec<&str> = host_log
             .lines()
@@ -917,6 +915,7 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
         return Ok(1);
     }
 
+    cleanup.map_err(Fail::die)?;
     if opts.record {
         let report = write_measured_report(mode_word, &label, &ev)?;
         println!("  recorded: {}", report.display());

@@ -332,7 +332,8 @@ fn place(work: &Path, kk: &Path) -> Result<(), String> {
         if let Some(dir) = dst.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        std::fs::copy(&src, &dst).map_err(|e| format!("{}: {e}", src.display()))?;
+        crate::util::copy_regular_file(&src, &dst)
+            .map_err(|e| format!("{}: {e}", src.display()))?;
     }
     let shim = kk.join(SHIM);
     std::fs::create_dir_all(&shim).map_err(|e| format!("{}: {e}", shim.display()))?;

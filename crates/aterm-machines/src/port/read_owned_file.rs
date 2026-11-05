@@ -27,7 +27,7 @@ pub(super) fn read(path: &Path, uid: u32, max: usize, private: bool) -> io::Resu
         let bound = max.checked_add(1).ok_or(io::ErrorKind::InvalidInput)?;
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)?;
         let metadata = file.metadata()?;
         admit(

@@ -1014,6 +1014,7 @@ fn publication_case(
             roster_path: &path,
             own_dir: None,
             codex_program: None,
+            sign_in: crate::harness::sign_in_ladder::asked_fixture(cli, "account"),
         },
         env.now,
         "login",

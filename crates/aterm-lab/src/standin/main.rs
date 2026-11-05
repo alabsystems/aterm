@@ -114,10 +114,17 @@ fn word(bytes: &[u8]) -> String {
 
 /// Append `line` to `$ATERM_LAB_STANDIN_LOG`, if set; a failed write is dropped.
 fn log(line: &str) {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let Some(path) = std::env::var_os("ATERM_LAB_STANDIN_LOG") else {
         return;
     };
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        && f.metadata().is_ok_and(|m| m.is_file())
+    {
         let _ = f.write_all(format!("{} {line}\n", now_us()).as_bytes());
     }
 }
@@ -126,7 +133,7 @@ fn read_regular_text(path: &Path) -> Option<String> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
         .ok()?;
     let meta = file.metadata().ok()?;
@@ -158,7 +165,7 @@ fn store_version(exe: &Path) -> Option<String> {
 /// A fresh lowercase UUIDv4 from `/dev/urandom`.
 fn new_uuid() -> String {
     let mut b = [0u8; 16];
-    let read = File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+    let read = aterm_uds::rand::fill(&mut b);
     if read.is_err() {
         let t = now_us().to_le_bytes();
         let p = std::process::id().to_le_bytes();
@@ -221,8 +228,8 @@ fn session_dir(root: &Path, session: &str) -> PathBuf {
             .into_iter()
             .flatten()
             .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
             .map(|e| e.path())
-            .filter(|p| p.is_dir())
             .collect()
     };
     let found = dirs(root)
@@ -335,21 +342,26 @@ impl Session {
                 .unwrap_or_default()
                 .matches("\"payload_type\":\"session.started\"")
                 .count();
+            use std::os::unix::fs::OpenOptionsExt as _;
             lock = OpenOptions::new()
                 .create(true)
                 .truncate(true)
                 .write(true)
                 .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(dir.join(".session.lock"))
-                .ok();
+                .ok()
+                .filter(|f| f.metadata().is_ok_and(|m| m.is_file()));
             if let Some(f) = lock.as_mut() {
                 let _ = f.write_all(format!("pid={pid}\n").as_bytes());
             }
             log = OpenOptions::new()
                 .create(true)
                 .append(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(dir.join("session.jsonl"))
-                .ok();
+                .ok()
+                .filter(|f| f.metadata().is_ok_and(|m| m.is_file()));
         }
         let mut s = Session {
             dialect,

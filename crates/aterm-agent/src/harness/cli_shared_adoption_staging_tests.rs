@@ -176,10 +176,10 @@ fn observations(case: i64) -> Vec<aterm_spec::interp::State> {
     let mut result = vec![snapshot(0)];
     let run_missing = || {
         if case == 15 {
-            let lock = store.signin_now().unwrap().unwrap();
             let mut next = candidate(&approval);
             next.authority = Arc::new(RevokeAfterCheck(approval.clone()));
             next.provider = provider.clone();
+            let lock = adoption_sign_in(&store, &host.roster, &next);
             super::super::shared_adoption::adopt(&env, &host, &store, &lock, &host.roster, next)
         } else {
             run_with_provider(&env, &host, &approval, provider.clone())

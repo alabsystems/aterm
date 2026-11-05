@@ -399,18 +399,24 @@ pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -
     }
 }
 
-/// Verify that `line` uses only plain zsh grammar whose expansions behave as text or paths: no
-/// unquoted `^`, and no unquoted `#` but one opening a comment, as a startup may set
-/// `EXTENDED_GLOB` (`^x` any name but `x`, `x#` any run of `x`), which the secret check's globs do
-/// not read.
-pub(crate) fn plain_zsh_line(line: &str) -> Result<(), String> {
+/// Verify that `line` uses only plain zsh grammar whose expansions behave as text or paths; with
+/// `extended_glob` (the startup may set `EXTENDED_GLOB`,
+/// [`ShellStartup::may_extended_glob`](crate::supervise::policy::ShellStartup::may_extended_glob)),
+/// also no unquoted `^` and no unquoted `#` but one opening a comment: that option makes them
+/// glob operators (`^x` any name but `x`, `x#` any run of `x`), which the secret check's globs do
+/// not read. With it off both are text: MEASURED 2026-11-05 with zsh 5.9, `/bin/zsh -f -c
+/// 'setopt NO_EXTENDED_GLOB; print -r -- W'` printed each of `HEAD^`, `HEAD^^`, `^fn`, `x^y`,
+/// `a#b`, `~/.config/^x/hosts.yml` and `~/.s#h/config` as written (the last two under the home)
+/// in a home holding `.config/gh/hosts.yml` and `.ssh/config` and a directory holding `HEAD` and
+/// `fn` (`docs/measured/classifier-zsh-glob-2026-11-05.md`).
+pub(crate) fn plain_zsh_line(line: &str, extended_glob: bool) -> Result<(), String> {
     let chars: Vec<char> = line.chars().collect();
-    plain_zsh(&chars, 0)
+    plain_zsh(&chars, 0, extended_glob)
 }
 
 const PLAIN_NEST: u8 = 8;
 
-fn plain_zsh(chars: &[char], depth: u8) -> Result<(), String> {
+fn plain_zsh(chars: &[char], depth: u8, extended_glob: bool) -> Result<(), String> {
     #[derive(PartialEq)]
     enum Quote {
         None,
@@ -453,7 +459,7 @@ fn plain_zsh(chars: &[char], depth: u8) -> Result<(), String> {
             Quote::Double => match c {
                 '"' => quote = Quote::None,
                 '$' => {
-                    i = plain_dollar(chars, i, depth)?;
+                    i = plain_dollar(chars, i, depth, extended_glob)?;
                     continue;
                 }
                 '`' | '\\' => return Err(format!("`{c}` inside double quotes")),
@@ -474,12 +480,12 @@ fn plain_zsh(chars: &[char], depth: u8) -> Result<(), String> {
                     continue;
                 }
                 '$' => {
-                    i = plain_dollar(chars, i, depth)?;
+                    i = plain_dollar(chars, i, depth, extended_glob)?;
                     word.push('$');
                     continue;
                 }
                 '`' | '\\' | '(' | ')' | '{' | '}' => return Err(format!("`{c}`")),
-                '^' | '#' => {
+                '^' | '#' if extended_glob => {
                     return Err(format!(
                         "an unquoted `{c}` in a word, a glob operator under EXTENDED_GLOB"
                     ));
@@ -537,7 +543,12 @@ fn plain_zsh(chars: &[char], depth: u8) -> Result<(), String> {
     end_word(&mut word, &mut quoted, &mut target, true)
 }
 
-fn plain_dollar(chars: &[char], at: usize, depth: u8) -> Result<usize, String> {
+fn plain_dollar(
+    chars: &[char],
+    at: usize,
+    depth: u8,
+    extended_glob: bool,
+) -> Result<usize, String> {
     let name_from = |from: usize| -> Option<usize> {
         let first = chars.get(from)?;
         if !(first.is_ascii_alphabetic() || *first == '_') {
@@ -558,7 +569,7 @@ fn plain_dollar(chars: &[char], at: usize, depth: u8) -> Result<usize, String> {
                 return Err("command substitutions nested too deep".into());
             }
             let close = substitution_close(chars, at + 2, 0)?;
-            plain_zsh(&chars[at + 2..close], depth + 1)
+            plain_zsh(&chars[at + 2..close], depth + 1, extended_glob)
                 .map_err(|why| format!("inside `$(…)`: {why}"))?;
             close + 1
         }

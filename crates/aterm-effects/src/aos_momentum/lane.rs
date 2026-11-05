@@ -883,6 +883,7 @@ impl<'g, G: Glow + ?Sized> Lane<'g, G> {
         self.calls.push(MomentumEvent::Key {
             at: i128::from(t),
             tau_bits,
+            echo: super::KeyEcho::Seen,
         });
         self.counts.keys += 1;
         self.keyed = true;

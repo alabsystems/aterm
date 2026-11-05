@@ -298,6 +298,7 @@ mod tests {
                 focused_path: Vec::new(),
                 zoomed: false,
                 parked: false,
+                ephemeral: false,
             },
         }
     }

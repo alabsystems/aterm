@@ -50,6 +50,9 @@ pub enum Cap {
     Tok(Charset, usize),
     /// Free text whose percent-encoding is at most this many bytes.
     Text(usize),
+    /// A sample aterm took (an unsigned count), or [`crate::vocab::UNAVAILABLE`] where it could
+    /// not take one: never a `0` standing in for a sample it lacks.
+    Sample,
 }
 
 /// Declares [`Key`], its words and the [`FIELDS`] table from one list.
@@ -219,6 +222,14 @@ keys! {
     FactRule "fact_rule" Wire Cap::Word(FACT_RULE_WORDS),
     FactN "fact_n" Wire Cap::U,
     TurnBy "turn_by" Wire Cap::Word(TURN_BY_WORDS),
+    Window "window" Wire Cap::U,
+    Parked "parked" Wire Cap::U,
+    TaskEnd "task" Wire Cap::Tok(Charset::Rollup, 64),
+    WallS "wall_s" Wire Cap::Sample,
+    CpuS "cpu_s" Wire Cap::Sample,
+    PeakMb "peak_mb" Wire Cap::Sample,
+    Tokens "tokens" Wire Cap::Sample,
+    Account "account" Host Cap::Text(64),
 }
 
 impl Key {
@@ -385,7 +396,8 @@ impl Val {
             (Val::Word(w), Cap::Word(list)) => {
                 *w == crate::vocab::UNKNOWN || lookup(list, w).is_some()
             }
-            (Val::U(_), Cap::U) | (Val::I(_), Cap::I) | (Val::Id(_), Cap::Id) => true,
+            (Val::U(_), Cap::U | Cap::Sample) | (Val::I(_), Cap::I) | (Val::Id(_), Cap::Id) => true,
+            (Val::Word(w), Cap::Sample) => *w == crate::vocab::UNAVAILABLE,
             (Val::Tok(t), Cap::Tok(_, cap)) => encoded_len(t.as_str()) <= cap,
             (Val::Text(t), Cap::Text(cap)) => encoded_len(t.as_str()) <= cap,
             _ => false,
@@ -474,6 +486,21 @@ impl Fields {
     /// As [`Fields::set`].
     pub fn u(self, key: Key, n: u64) -> Result<Fields, FieldError> {
         self.with(key, Val::U(n))
+    }
+
+    /// Set a sample key ([`Cap::Sample`]) to what aterm read, or to
+    /// [`crate::vocab::UNAVAILABLE`] where `sample` is `None`.
+    ///
+    /// # Errors
+    /// [`FieldError::Shape`] when `key` is no sample key, [`FieldError::Full`] when the fields are full.
+    pub fn sample(self, key: Key, sample: Option<u64>) -> Result<Fields, FieldError> {
+        if key.cap() != Cap::Sample {
+            return Err(FieldError::Shape(key));
+        }
+        self.with(
+            key,
+            sample.map_or(Val::Word(crate::vocab::UNAVAILABLE), Val::U),
+        )
     }
 
     /// Set a signed key.

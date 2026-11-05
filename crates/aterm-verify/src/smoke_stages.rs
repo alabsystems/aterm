@@ -130,7 +130,7 @@ impl Sandbox {
         let cfgdir = tmp.join("cfg");
         std::fs::create_dir_all(cfgdir.join("aterm")).ok()?;
         chmod_700(&cfgdir)?;
-        std::fs::write(
+        crate::write_fresh(
             cfgdir.join("aterm/aterm.toml"),
             format!(
                 "{extra}agents_auto_prime = false\nbell_sound = false\n{}",
@@ -196,8 +196,7 @@ impl Sandbox {
 }
 
 fn chmod_700(path: &Path) -> Option<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).ok()
+    crate::set_dir_mode_nofollow(path, 0o700).ok()
 }
 
 enum Ready {
@@ -218,7 +217,7 @@ fn bring_up(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, bundle: &crate::Measure
         ));
         return Ready::Stopped;
     }
-    let log = match std::fs::File::create(&sb.gui_log) {
+    let log = match crate::create_stdio_file(&sb.gui_log) {
         Ok(f) => f,
         Err(e) => {
             r.cannot_run(format!("{tag}: cannot open child log ({e})"));
@@ -477,7 +476,7 @@ fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
             burst_target_ready(
                 || !child_exited(sb),
                 || crate::smoke::activate_macos_gui_pid(pid),
-                || check_burst_timing(timing),
+                || check_burst_timing(timing).map(drop),
             )?;
             let got = ctl(ctx, sb, ctl_bin, &["metrics", "reset"]);
             if !ok_reply(&got) {
@@ -509,24 +508,29 @@ fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
 struct BurstTiming {
     outer: Arc<aterm_capacity::Claim>,
     entry: aterm_capacity::Claim,
+    /// Why the burst runs without a qualified quiet admission: stated, never a finding.
+    unqualified: Vec<aterm_capacity::Unqualified>,
 }
 
+/// The burst's measured entry, under the stage's claim: on a machine that stayed busy through
+/// its patience it runs loaded and says so (owner ruling 2026-11-05).
 fn burst_timing_entry() -> Result<(BurstTiming, String), String> {
     let outer = crate::current_quiet_claim().ok_or("gui burst has no stage timing reservation")?;
-    outer
-        .timing_admission()
+    let mut unqualified = Vec::new();
+    lapsed_or(outer.timing_protection(), &mut unqualified)
         .map_err(|why| format!("outer timing hold: {why}"))?;
     let mut entry = crate::admit_live(
-        aterm_capacity::Need::timing("gui cursor-pacing burst entry"),
+        aterm_capacity::Need::timing("gui cursor-pacing burst entry").runs_loaded(),
         aterm_capacity::Admit::Wait,
     )
     .map_err(|why| format!("burst timing admission: {why}"))?;
-    let window = entry
-        .measurement_entry()
+    let stated = entry
+        .stated_entry()
         .map_err(|why| format!("burst measurement entry: {why}"))?;
-    outer
-        .timing_admission()
+    unqualified.extend(stated.unqualified);
+    lapsed_or(outer.timing_protection(), &mut unqualified)
         .map_err(|why| format!("outer timing hold after entry: {why}"))?;
+    let window = stated.window;
     let bounds = |claim: &aterm_capacity::Claim| {
         let admitted = claim.record().timing.admitted_ms;
         let expires = admitted
@@ -537,27 +541,60 @@ fn burst_timing_entry() -> Result<(BurstTiming, String), String> {
     let (admitted, expires) = bounds(&entry);
     let (outer_admitted, outer_expires) = bounds(&outer);
     let note = format!(
-        "timing phase=gui_burst_entry provider=sysprobe_core_ticks scope=sampled_global_cpu_window;not_continuous_quiet observed_ms={} interval_ns={} cores={} busy_ticks={} total_ticks={} entry_load1={:?} actual_admitted_ms={admitted:?} expires_ms={expires:?} outer_actual_admitted_ms={outer_admitted:?} outer_expires_ms={outer_expires:?}",
+        "timing phase=gui_burst_entry provider=sysprobe_core_ticks scope=sampled_global_cpu_window;not_continuous_quiet observed_ms={} interval_ns={} cores={} busy_ticks={} total_ticks={} entry_load1={:?} actual_admitted_ms={admitted:?} expires_ms={expires:?} outer_actual_admitted_ms={outer_admitted:?} outer_expires_ms={outer_expires:?} qualification={}",
         window.observed_ms,
         window.interval_ns,
         window.cores,
         window.busy_ticks,
         window.total_ticks,
         entry.record().timing.entry_load1,
+        stated_qualification(&unqualified),
     );
-    Ok((BurstTiming { outer, entry }, note))
+    Ok((
+        BurstTiming {
+            outer,
+            entry,
+            unqualified,
+        },
+        note,
+    ))
 }
 
-fn check_burst_timing(timing: &BurstTiming) -> Result<(), String> {
-    timing
-        .outer
-        .timing_admission()
+/// `qualified`, or why it ran unqualified.
+fn stated_qualification(unqualified: &[aterm_capacity::Unqualified]) -> String {
+    if unqualified.is_empty() {
+        return "qualified".to_owned();
+    }
+    let why: Vec<String> = unqualified.iter().map(ToString::to_string).collect();
+    format!("unqualified ({})", why.join("; "))
+}
+
+/// A timing hold that ended is stated ([`aterm_capacity::Unqualified::Lapsed`]); any other
+/// failure is not.
+fn lapsed_or(
+    protection: Result<aterm_capacity::Protection, aterm_capacity::TimingIssue>,
+    unqualified: &mut Vec<aterm_capacity::Unqualified>,
+) -> Result<(), aterm_capacity::TimingIssue> {
+    match protection {
+        Ok(_) => Ok(()),
+        Err(aterm_capacity::TimingIssue::Expired) => {
+            if !unqualified.contains(&aterm_capacity::Unqualified::Lapsed) {
+                unqualified.push(aterm_capacity::Unqualified::Lapsed);
+            }
+            Ok(())
+        }
+        Err(why) => Err(why),
+    }
+}
+
+/// Why the collected burst is unqualified, or why its protection failed.
+fn check_burst_timing(timing: &BurstTiming) -> Result<Vec<String>, String> {
+    let mut unqualified = timing.unqualified.clone();
+    lapsed_or(timing.outer.timing_protection(), &mut unqualified)
         .map_err(|why| format!("outer timing hold: {why}"))?;
-    timing
-        .entry
-        .timing_admission()
+    lapsed_or(timing.entry.timing_protection(), &mut unqualified)
         .map_err(|why| format!("burst timing hold: {why}"))?;
-    Ok(())
+    Ok(unqualified.iter().map(ToString::to_string).collect())
 }
 
 struct BurstReadings {
@@ -624,7 +661,7 @@ fn guarded_burst<G>(
     r: &mut Report,
     enter: impl FnOnce() -> Result<(G, String), String>,
     collect: impl FnOnce(&G) -> Result<BurstReadings, BurstError>,
-    protected: impl FnOnce(&G) -> Result<(), String>,
+    protected: impl FnOnce(&G) -> Result<Vec<String>, String>,
 ) {
     let (guard, note) = match enter() {
         Ok(entered) => entered,
@@ -652,16 +689,29 @@ fn guarded_burst<G>(
         }
     };
     let bounded = bounded_burst_readings(&readings);
-    if let Err(why) = protected(&guard) {
-        match bounded {
-            Ok(()) => retain_burst_readings(r, &readings),
-            Err(why) => r.raw(why),
+    let unqualified = match protected(&guard) {
+        Ok(unqualified) => unqualified,
+        Err(why) => {
+            match bounded {
+                Ok(()) => retain_burst_readings(r, &readings),
+                Err(why) => r.raw(why),
+            }
+            r.cannot_run(format!(
+                "gui smoke: timing protection unavailable after collection ({why}); result unqualified"
+            ));
+            return;
         }
-        r.cannot_run(format!(
-            "gui smoke: timing protection unavailable after collection ({why}); result unqualified"
-        ));
-        return;
-    }
+    };
+    // Stated beside each pass, never a finding: a busy machine never blocks a release (owner
+    // ruling 2026-11-05).
+    let stated = if unqualified.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; ran without a qualified quiet admission (stated, not a finding): {}",
+            unqualified.join("; ")
+        )
+    };
     if let Err(why) = bounded {
         r.fail(why);
         return;
@@ -673,7 +723,7 @@ fn guarded_burst<G>(
     }
     for verdict in [effects, hardware] {
         match verdict {
-            Ok(line) => r.pass(line),
+            Ok(line) => r.pass(format!("{line}{stated}")),
             Err(why) => r.fail(why),
         }
     }
@@ -1153,7 +1203,7 @@ pub(crate) mod tests {
             |_| {
                 assert_eq!(phase.replace(3), 2);
                 assert!(!dropped.get());
-                Ok(())
+                Ok(Vec::new())
             },
         );
         assert!(dropped.get());
@@ -1195,6 +1245,49 @@ pub(crate) mod tests {
         assert_eq!(r.entries.iter().filter(|e| matches!(e, crate::ladder::Entry::Raw(text) if text.starts_with("gui smoke metrics"))).count(), 2);
     }
 
+    /// A BURST THAT RAN WITHOUT A QUALIFIED QUIET ADMISSION PASSES AND SAYS WHY ON EACH PASS: a
+    /// busy machine never blocks a release (owner ruling 2026-11-05). NEGATIVE CONTROL: a
+    /// qualified burst's passes say nothing of it
+    /// ([`burst_retains_full_success_metrics_and_guard_until_postcheck`]).
+    #[test]
+    fn a_loaded_burst_passes_and_states_why() {
+        let mut r = Report::new("burst");
+        guarded_burst(
+            &mut r,
+            || Ok(((), String::new())),
+            |_| Ok(burst_readings()),
+            |_| {
+                Ok(vec![
+                    "admitted loaded at its patience bound: CPU 63.0% busy".to_owned(),
+                ])
+            },
+        );
+        let passes: Vec<&str> = r
+            .outcomes()
+            .filter(|(o, _)| *o == crate::ladder::Outcome::Ok)
+            .map(|(_, line)| line)
+            .collect();
+        assert_eq!(passes.len(), 2);
+        for line in passes {
+            assert!(
+                line.contains("ran without a qualified quiet admission (stated, not a finding): admitted loaded"),
+                "{line}"
+            );
+        }
+        let mut quiet = Report::new("burst");
+        guarded_burst(
+            &mut quiet,
+            || Ok(((), String::new())),
+            |_| Ok(burst_readings()),
+            |_| Ok(Vec::new()),
+        );
+        assert!(
+            !quiet
+                .outcomes()
+                .any(|(_, line)| line.contains("qualified quiet"))
+        );
+    }
+
     #[test]
     fn burst_oversized_receipt_cannot_pass_or_be_retained() {
         for percentiles in [false, true] {
@@ -1210,7 +1303,7 @@ pub(crate) mod tests {
                 &mut r,
                 || Ok(((), String::new())),
                 |_| Ok(readings),
-                |_| Ok(()),
+                |_| Ok(Vec::new()),
             );
             assert_eq!(
                 r.outcomes().map(|(o, _)| o).collect::<Vec<_>>(),

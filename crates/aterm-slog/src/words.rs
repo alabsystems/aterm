@@ -247,10 +247,46 @@ pub enum SessionOut {
     WindowClose,
     /// `app-quit`.
     AppQuit,
+    /// `reaper`: aterm closed a worker's tab once its task concluded.
+    Reaper,
     /// The process went away (a synthetic close).
     Gone,
     /// The close path did not say.
     Unknown,
+}
+
+/// What happened to a tab (`tab act=`, one of [`crate::vocab::ACT_WORDS`] after the input acts).
+/// A worker that lands behind the Workers home opens parked (`act=open parked=1`): no tab is
+/// parked after it opened, so no act says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TabAct {
+    /// `open`: a session took its place in a window, as a tab, a split pane or a window's first.
+    Open,
+    /// `close`: it left.
+    Close,
+    /// `keep`: a person kept a worker's tab as their own (Keep as Tab).
+    Keep,
+}
+
+impl TabAct {
+    /// Every tab act, in wire order.
+    pub const ALL: [TabAct; 3] = [TabAct::Open, TabAct::Close, TabAct::Keep];
+
+    /// The wire word.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            TabAct::Open => "open",
+            TabAct::Close => "close",
+            TabAct::Keep => "keep",
+        }
+    }
+
+    /// The act a wire word names, or `None`.
+    #[must_use]
+    pub fn from_word(w: &str) -> Option<TabAct> {
+        TabAct::ALL.into_iter().find(|a| a.word() == w)
+    }
 }
 
 /// An outcome at the level of the node it closes.
@@ -311,6 +347,7 @@ impl Out {
                 SessionOut::UiClose => "ui-close",
                 SessionOut::WindowClose => "window-close",
                 SessionOut::AppQuit => "app-quit",
+                SessionOut::Reaper => "reaper",
                 SessionOut::Gone => "gone",
                 SessionOut::Unknown => "unknown",
             },

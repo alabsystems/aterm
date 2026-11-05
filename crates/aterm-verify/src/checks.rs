@@ -21,7 +21,6 @@ pub enum Check {
     Libc,
     Spec,
     Checkers,
-    GpuOracle,
     Appkit,
     Export,
     Measure,
@@ -57,7 +56,7 @@ pub struct Spec {
 }
 
 /// Every check, in the order `list` shows them and a verdict names them.
-pub const CHECKS: [Spec; 19] = [
+pub const CHECKS: [Spec; 18] = [
     Spec {
         check: Check::Fmt,
         name: "fmt",
@@ -83,7 +82,9 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::Selection,
         needs: &["targo-tippy"],
         also: "",
-        runs: "targo-tippy <selection> --all-targets -- -D warnings (under release, the \
+        runs: "targo-tippy <selection> --all-targets -- -D warnings; a change cone has up to two \
+               passes, that one over what the change touched and default targets over the rest \
+               that link it, and leaves out what it holds only by a dev edge (under release, the \
                required-features targets and -p aterm --release)",
     },
     Spec {
@@ -132,8 +133,9 @@ pub const CHECKS: [Spec; 19] = [
         needs: &["rustup"],
         also: "stable's foreign stds and clippy",
         runs: "every forge cell but this machine's own (or each --cell), its whole graph linted for its \
-               own triple (-p: those crates alone); with a Windows cell and no -p ruling them out, both \
-               windows-sys oracles (aterm-win32-oracle's oracle and oracle-052) (STOCK EXCEPTION)",
+               own triple (-p: those crates alone); with a Windows cell and no -p or pulled selection \
+               ruling them out, both windows-sys oracles (aterm-win32-oracle's oracle and oracle-052) \
+               (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::WasmSmoke,
@@ -151,9 +153,9 @@ pub const CHECKS: [Spec; 19] = [
         name: "wasm-glue",
         stages: &[StageId::WasmGlue],
         reach: Reach::WholeTree,
-        needs: &["chrome-headless-shell", "rustup", "wasm-bindgen"],
+        needs: &["chrome-headless-shell", "rustup"],
         also: "stable's wasm32",
-        runs: "`verify glue` on aterm-wasm-abi's toy: goldens, its driver in headless Chromium, a planted bug; the wasm-bindgen oracle (STOCK EXCEPTION)",
+        runs: "`verify glue` on aterm-wasm-abi's toy: goldens, its driver in headless Chromium, a planted bug (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::Browser,
@@ -190,16 +192,7 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::Selection,
         needs: &["targo", "ty"],
         also: "",
-        runs: "targo test <selection plus shared aterm-spec runtime> --features aterm-spec/checkers --tests (own target dir; after test; binaries in parallel)",
-    },
-    Spec {
-        check: Check::GpuOracle,
-        name: "gpu-oracle",
-        stages: &[StageId::GpuOracle],
-        reach: Reach::WholeTree,
-        needs: &["targo", "gpu"],
-        also: "",
-        runs: "targo test -p aterm-gpu --lib frame_record_tests: this host's arm against aterm's CPU twins of its frames, decided on any adapter, with the record of wgpu's frames a same-adapter signal (on the test run's build, after it)",
+        runs: "targo test <selection plus shared aterm-spec runtime> --features aterm-spec/checkers --tests (own target dir; after test; binaries in parallel); on demand: under release, test carries the feature itself",
     },
     Spec {
         check: Check::Appkit,
@@ -266,7 +259,7 @@ pub const DEV: [Check; 5] = [
 ];
 
 /// What publication requires: the whole workspace, and a skip is not a pass.
-pub const RELEASE: [Check; 12] = [
+pub const RELEASE: [Check; 10] = [
     Check::Fmt,
     Check::Lint,
     Check::Test,
@@ -275,8 +268,6 @@ pub const RELEASE: [Check; 12] = [
     Check::Forge,
     Check::Libc,
     Check::Spec,
-    Check::Checkers,
-    Check::GpuOracle,
     Check::Appkit,
     Check::Measure,
 ];
@@ -350,8 +341,8 @@ pub fn stages_of(checks: &[Check]) -> Vec<StageId> {
 
 /// The package that holds each GPU arm's frames to their CPU twins, beside the
 /// record of wgpu's (docs/AUDIT-third-party-2026-10-15.md GW.6 and
-/// ORACLE-ADAPTER), and the test that compares them: the `gpu-oracle` check
-/// passes only when it ran.
+/// ORACLE-ADAPTER), and the test that compares them: a release's test run passes
+/// only when it ran ([`crate::stages::compared_no_frame`]).
 pub const GOLDEN: (&str, &str) = (
     "aterm-gpu",
     "frame_record_tests::armed_frames_hold_to_their_cpu_twins",
@@ -376,10 +367,11 @@ pub fn pulled(wanted: &[Check], holds: impl Fn(&str) -> bool) -> Vec<(Check, &'s
         .collect()
 }
 
-/// `wanted`, plus what it [`pulled`], in [`CHECKS`] order; a `release` run is `wanted` alone.
+/// `wanted`, plus what it [`pulled`], in [`CHECKS`] order; `alone` is `wanted` as it is
+/// ([`crate::cli::Args::wanted`]).
 #[must_use]
-pub fn with_pulled(wanted: &[Check], release: bool, holds: impl Fn(&str) -> bool) -> Vec<Check> {
-    if release {
+pub fn with_pulled(wanted: &[Check], alone: bool, holds: impl Fn(&str) -> bool) -> Vec<Check> {
+    if alone {
         return wanted.to_vec();
     }
     let pulled = pulled(wanted, holds);
@@ -396,8 +388,9 @@ pub fn with_pulled(wanted: &[Check], release: bool, holds: impl Fn(&str) -> bool
 /// a change this machine's lint and tests pass can still break those builds, as the cells
 /// fixes 78f54c26c7, 266437995c and 333be891e9 each repaired on main. The pulled run checks one
 /// cell per other OS, each only where its graph holds a selected crate, and of that graph `-p`'s
-/// crates, or the cone and its dependents there ([`crate::cells::pulled_cells`],
-/// [`crate::cells::narrows`]); `verify cells` checks every cell's whole graph.
+/// crates, or the cone and what the change reaches there ([`crate::cells::pulled_cells`],
+/// [`crate::cells::narrows`]); it is not red on a Windows cell's test-target warnings
+/// ([`crate::cells::leaves_test_warnings`]). `verify cells` checks every cell's whole graph.
 #[must_use]
 pub fn pulls_cells(wanted: &[Check], release: bool, compiles: bool) -> bool {
     !release && compiles && wanted.contains(&Check::Lint) && !wanted.contains(&Check::Cells)
@@ -452,6 +445,10 @@ pub fn needs_of(check: Check) -> String {
         .iter()
         .map(|name| aterm_uds::host::tool(name).needs_label())
         .collect();
+    if check == Check::Test {
+        let release = RELEASE_TEST_NEEDS.map(|name| aterm_uds::host::tool(name).needs_label());
+        words.push(format!("under release {}", release.join(", ")));
+    }
     if !spec.also.is_empty() {
         words.push(spec.also.to_string());
     }
@@ -462,11 +459,19 @@ pub fn needs_of(check: Check) -> String {
     }
 }
 
+/// What the `test` check needs only under `release`, whose run carries `aterm-spec/checkers`
+/// (`ty`) and has to reach the [`GOLDEN`] test (a GPU adapter); either missing is its COULD NOT RUN.
+pub const RELEASE_TEST_NEEDS: [&str; 2] = ["ty", "gpu"];
+
 /// `verify list`'s second table: every tool a check needs, once, in first-mention order.
 #[must_use]
 pub fn tools_table() -> String {
     let mut names: Vec<&str> = Vec::new();
-    for name in CHECKS.iter().flat_map(|s| s.needs) {
+    for name in CHECKS
+        .iter()
+        .flat_map(|s| s.needs)
+        .chain(&RELEASE_TEST_NEEDS)
+    {
         if !names.contains(name) {
             names.push(name);
         }
@@ -697,18 +702,19 @@ mod tests {
         );
         let manifests: Manifests = DEPENDENTS
             .iter()
-            .map(|(n, _)| (format!("crates/{n}"), Some(n.to_string())))
+            .map(|(n, _)| format!("crates/{n}"))
             .collect();
         let scope_after = |changed: &str| {
             let dependents = |name: &str| {
                 let (_, users) = DEPENDENTS.iter().find(|(dep, _)| *dep == name)?;
-                Some(
-                    users
+                Some(crate::changed::Reach {
+                    links: users
                         .split_whitespace()
                         .chain([name])
                         .map(String::from)
                         .collect(),
-                )
+                    dev_only: Vec::new(),
+                })
             };
             let sel = select(
                 &[format!("crates/{changed}/src/lib.rs")],

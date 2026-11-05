@@ -161,7 +161,7 @@ fn report_case(fault: i64, published: bool, edit: bool) -> (bool, bool, bool) {
     }
     let _held = (fault == 6).then(|| bed.store.acquire().unwrap());
     let before = bed.bytes();
-    let result = read_sync_report(&bed.store, NOW, bed.publication(published), None);
+    let result = read_sync_report(&bed.env, &bed.store, bed.publication(published), None);
     if fault != 1 {
         assert_eq!(bed.bytes(), before, "only admitted recovery can write");
     }
@@ -346,7 +346,7 @@ fn a_completed_concurrent_commit_is_observed_without_rewriting_sync_source_metri
     bed.seed();
     let publication = bed.publication(false);
     bed.renew("later").unwrap();
-    let report = read_sync_report(&bed.store, NOW, publication, None).unwrap();
+    let report = read_sync_report(&bed.env, &bed.store, publication, None).unwrap();
     assert!(
         !report.publication.changed,
         "the other completed writer is not this sync's change"
@@ -357,6 +357,56 @@ fn a_completed_concurrent_commit_is_observed_without_rewriting_sync_source_metri
     );
     assert_eq!(report.publication.fleet_accounts, 3);
     assert_eq!(report.into_init(false).enrolled, 1);
+}
+
+/// A row a page stopped is told what a person runs, as the report tells it. CONTROL: a row with no
+/// stop on record is told it waits, and nothing promises it a sign-in by itself: no session here
+/// runs on it.
+#[test]
+fn a_row_a_page_stopped_is_not_promised_a_sign_in_by_itself() {
+    let bed = Bed::new();
+    bed.seed();
+    let mut roster = Roster::load(&bed.path).unwrap();
+    roster.rows[0].dir = None;
+    fs::write(&bed.path, format_roster_toml(&roster).unwrap()).unwrap();
+    fs::rename(
+        bed.env.state.join("old/.credentials.json"),
+        bed.env.state.join("kept-credential"),
+    )
+    .unwrap();
+    let said = || {
+        let report = read_sync_report(&bed.env, &bed.store, bed.publication(false), None).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            write_sync_report(&report, NOW, false, &mut out, &mut err),
+            ExitCode::SUCCESS
+        );
+        let out = String::from_utf8(out).unwrap();
+        out.lines()
+            .find(|line| line.starts_with("not signed in yet: m1"))
+            .unwrap_or_else(|| panic!("no line for m1: {out}"))
+            .to_owned()
+    };
+    let waiting = said();
+    assert!(!waiting.contains("by itself"), "{waiting}");
+    assert!(waiting.contains("each waits for"), "CONTROL: {waiting}");
+    assert!(!waiting.contains("a page stopped"), "CONTROL: {waiting}");
+    bed.store
+        .transact_pool_logins_within(&[], &bed.path, NOW, &mut None, |_, _, logins| {
+            accounts::admit_workflow(logins, "m1")?;
+            Ok(accounts::note_sign_in_attempt(
+                logins,
+                "m1",
+                accounts::AttemptOutcome::Blocked,
+                "profile: it met a bot check",
+                NOW,
+            ))
+        })
+        .unwrap();
+    let stopped = said();
+    assert!(!stopped.contains("by itself"), "{stopped}");
+    assert!(stopped.contains("a page stopped"), "{stopped}");
+    assert!(stopped.contains("accounts renew m1"), "{stopped}");
 }
 
 #[test]
@@ -371,7 +421,7 @@ fn a_default_row_bound_to_a_missing_isolated_login_needs_renewal() {
         bed.env.state.join("kept-credential"),
     )
     .unwrap();
-    let report = read_sync_report(&bed.store, NOW, bed.publication(false), None).unwrap();
+    let report = read_sync_report(&bed.env, &bed.store, bed.publication(false), None).unwrap();
     let json = render(&report);
     assert_eq!(
         json["machine_accounts"][0]["default_login"].as_bool(),

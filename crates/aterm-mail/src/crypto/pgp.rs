@@ -145,16 +145,17 @@ pub(super) fn unlock_packet(bytes: &[u8], password: &[u8]) -> Result<Zeroizing<V
         }
         _ => return Err("Unsupported private-key derivation".into()),
     };
-    let mut key = Zeroizing::new(Vec::new());
+    let mut key = Zeroizing::new(Vec::with_capacity(64));
     let length = key_len(cipher)?;
-    let mut input = Zeroizing::new(salt.to_vec());
+    let mut input = Zeroizing::new(Vec::with_capacity(salt.len() + password.len()));
+    input.extend_from_slice(salt);
     input.extend_from_slice(password);
     for prefix in 0..4 {
         if key.len() >= length {
             break;
         }
         let mut digest = ring::digest::Context::new(algorithm);
-        digest.update(&vec![0; prefix]);
+        digest.update(&[0; 4][..prefix]);
         let mut left = count.max(input.len());
         if input.is_empty() {
             return Err("Empty key derivation input".into());
@@ -326,10 +327,12 @@ fn literal(bytes: &[u8], depth: usize) -> Result<Zeroizing<Vec<u8>>, String> {
     Err("Message contains no literal text".into())
 }
 
-fn owned_packet(input: &[u8]) -> Result<(u8, Vec<u8>, &[u8]), String> {
+type PacketSlice<'a> = (u8, std::borrow::Cow<'a, [u8]>, &'a [u8]);
+
+fn owned_packet(input: &[u8]) -> Result<PacketSlice<'_>, String> {
     if input.len() < 2 || input[0] & 0xc0 != 0xc0 || !(224..=254).contains(&input[1]) {
         let (tag, body, rest) = packet(input)?;
-        return Ok((tag, body.to_vec(), rest));
+        return Ok((tag, std::borrow::Cow::Borrowed(body), rest));
     }
     let tag = input[0] & 63;
     let mut at = 1usize;
@@ -370,7 +373,7 @@ fn owned_packet(input: &[u8]) -> Result<(u8, Vec<u8>, &[u8]), String> {
         body.extend_from_slice(input.get(at..end).ok_or("Truncated partial PGP body")?);
         at = end;
         if !partial {
-            return Ok((tag, body, &input[at..]));
+            return Ok((tag, std::borrow::Cow::Owned(body), &input[at..]));
         }
     }
 }

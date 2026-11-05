@@ -451,7 +451,22 @@ fn independent_metadata_does_not_replace_an_existing_decisions_account_context()
                     },
                 )
                 .unwrap();
-            assert_eq!(value, Some(retained.clone()), "context case {case}");
+            let mut value = value.unwrap();
+            let work = std::mem::take(&mut value.independent_work);
+            assert_eq!(value, retained, "primary context case {case}");
+            assert_eq!(
+                work,
+                if case == 1 {
+                    vec![ActiveSignIn {
+                        label: current.label.clone(),
+                        route: Some("mailbox".into()),
+                        observed_at: 90,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                "independent context case {case}"
+            );
             let kept = kept.lock().unwrap();
             let bound = if execution {
                 kept.account.execution_progress.as_ref().unwrap()

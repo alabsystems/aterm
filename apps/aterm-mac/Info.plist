@@ -92,6 +92,17 @@
 	     ATERM_HANDOFF_GRANT_CAPS. -->
 	<key>ATermHandoffGrantEmpty</key>
 	<string>empty1</string>
+	<!-- A DECLARED CAPABILITY, read like ATermHandoffGrantChunks: this build's
+	     successor side rebuilds a window that held only an empty Workers list
+	     from its row in the handoff layout (crates/aterm-gui restore.rs,
+	     is_lone_workers_list), with no shell of its own, so an outgoing build
+	     whose windows hold nothing else may still hand itself over to this one
+	     in the overlap lane. Without the key a parent leaves such a row out,
+	     because every build before this one refuses a layout of them whole and
+	     opens a new shell for one beside a tab. No offer goes with it: the row
+	     in the layout is the offer. -->
+	<key>ATermHandoffGrantDesk</key>
+	<string>desk1</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 	<key>NSHumanReadableCopyright</key>

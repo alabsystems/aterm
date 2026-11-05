@@ -683,6 +683,13 @@ impl SetByWords {
                 },
                 |place| format!("from {place}"),
             ),
+            Actor::Fleet(token) => format!(
+                "over the fleet from {}",
+                token
+                    .as_str()
+                    .strip_prefix(aterm_slog::FLEET_ACTOR_PREFIX)
+                    .unwrap_or(token.as_str())
+            ),
             Actor::Vendor | Actor::Nobody => "over aterm ctl (writer unknown)".to_string(),
         };
         Some(Self {

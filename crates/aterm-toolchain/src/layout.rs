@@ -60,12 +60,11 @@ pub fn aside_of(build_dir: &Path) -> Option<PathBuf> {
 /// is exactly its own `<name>.noindex`, relative ([`aside_of`]).
 #[must_use]
 pub fn is_linked_aside(build_dir: &Path) -> bool {
-    let Some(aside) = aside_of(build_dir) else {
+    let Some(name) = build_dir.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    std::fs::symlink_metadata(build_dir).is_ok_and(|m| m.file_type().is_symlink())
-        && std::fs::read_link(build_dir)
-            .is_ok_and(|target| Some(target.as_os_str()) == aside.file_name())
+    std::fs::read_link(build_dir)
+        .is_ok_and(|target| target == Path::new(&crate::build_cache::noindex(name)))
 }
 
 /// Whether the build tree at `tree` ships a Rust sysroot: `lib/` and `lib/rustlib` are real

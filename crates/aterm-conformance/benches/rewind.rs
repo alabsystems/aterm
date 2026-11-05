@@ -21,7 +21,7 @@ mod measuring {
     use aterm_conformance::measure::rewind_cost::{self, CostRow};
     use aterm_conformance::measure::starvation::Disposition;
 
-    /// A full chain: the recorder re-keyframes at a quarter of its 8 MiB budget, so 2 MiB of output is the longest a step folds through.
+    /// A full chain: the reader re-keyframes after a quarter of the 8 MiB budget of slices and witnesses, so 2 MiB of output is the longest a step folds through.
     const CHAIN: usize = 2_000_000;
 
     /// One row: a Rewind view's step or idle, or what recording costs.
@@ -95,7 +95,7 @@ mod measuring {
                      bundle that records by default is past the idle target.\n  {}",
                     report.line
                 )),
-                Disposition::Unproved => Outcome::CouldNotRun(format!(
+                Disposition::Unproved => Outcome::Undecided(format!(
                     "REWIND COST UNPROVED: the adjacent takes' off/on ratios spread past the bound \
                      the row judges, so their median's 95% interval holds it and the takes are no \
                      evidence either way; take it on an unloaded machine.\n  {}",
@@ -125,7 +125,7 @@ mod measuring {
                 "REWIND CONFORMANCE FAILED: a step took past its bound to be shown, or an idle \
                  view woke the app.\n  {report}"
             )),
-            Disposition::Unproved => Outcome::CouldNotRun(format!(
+            Disposition::Unproved => Outcome::Undecided(format!(
                 "REWIND UNPROVED: a step took past its bound to be shown while the driver was \
                  held off its core as long as the bound, so the take is not evidence about the \
                  step; take it on an unloaded machine.\n  {report}"

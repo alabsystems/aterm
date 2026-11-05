@@ -164,7 +164,23 @@ fn clear_default_record(root: &Path) -> Result<(), String> {
 /// steps before it): a hang bound, not a latency budget a busy machine's working fabric misses.
 const PROOF_DEADLINE: Duration = Duration::from_secs(60);
 
+/// How long `on` waits for the broker launchd or systemd started to answer ([`wait_for_broker`]).
 const BIND_DEADLINE: Duration = Duration::from_secs(5);
+
+/// [`BIND_DEADLINE`]'s seam, in milliseconds, in a seam-enabled build: the fabric_world harness
+/// sets it (its `BIND_WAIT`) for a broker a test's stand-in launchd or systemd starts on the
+/// test's loaded machine, where a debug `aterm link broker` can take past 5 s to bind.
+const BIND_DEADLINE_SEAM: &str = "ATERM_FABRIC_BIND_DEADLINE_MS";
+
+/// [`BIND_DEADLINE`], or the [`BIND_DEADLINE_SEAM`] a seam-enabled build was given, read once.
+fn bind_deadline() -> Duration {
+    static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        aterm_types::dev_seam!(BIND_DEADLINE_SEAM)
+            .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?))
+            .map_or(BIND_DEADLINE, Duration::from_millis)
+    })
+}
 
 const ARM_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -174,6 +190,13 @@ const IO_TIMEOUT: Duration = Duration::from_secs(8);
 /// loaded machine, not an instance gone silent: their sockets wait the hang detector.
 #[cfg(test)]
 const IO_TIMEOUT: Duration = aterm_spec::wait::MUST_HAPPEN;
+
+/// The bound on each read and write of an instance's control socket: [`IO_TIMEOUT`], or the
+/// `aterm fabric` sockets' seam a development build was given ([`fabric::io_seam`]), so a test's
+/// instance that the loaded machine keeps from answering for 8 s is waited for, not left unarmed.
+fn io_timeout() -> Duration {
+    fabric::io_seam().unwrap_or(IO_TIMEOUT)
+}
 
 const TRACE_ENV: &str = "ATERM_FABRIC_TRACE";
 
@@ -467,7 +490,11 @@ impl Paths {
         argv
     }
 
-    fn broker_argv(&self) -> Vec<String> {
+    /// The argv the broker's launchd job runs: `<aterm> link broker <root>/bus.sock
+    /// <root>/bus.log --secret-file <root>/mint.secret` (no `link` word for the `aterm-link`
+    /// shim), and `--durability <tier>` when this root names one.
+    #[must_use]
+    pub fn broker_argv(&self) -> Vec<String> {
         let mut argv = vec![self.program()];
         if !self.is_link_shim() {
             argv.push("link".to_string());
@@ -481,6 +508,14 @@ impl Paths {
         ]);
         argv.extend(crate::durability::argv_words(self.durability));
         argv
+    }
+
+    /// The log a broker `argv` serves (one [`Paths::broker_argv`] renders, on any tier), read as
+    /// `aterm link broker` reads its words; `None` for an argv that serves no log, a `--repair`
+    /// or `--retire-log` one among them.
+    #[must_use]
+    pub fn served_log<S: AsRef<std::ffi::OsStr>>(argv: &[S]) -> Option<PathBuf> {
+        crate::broker_args::BrokerArgs::from_invocation(argv)?.log_path()
     }
 
     /// Whether `text` already runs [`Paths::broker_argv`] under [`Paths::label`] with `KeepAlive`.
@@ -505,7 +540,12 @@ impl Paths {
             .join(" ")
     }
 
-    /// Render the launchd plist (`ProgramArguments` as XML-escaped words, no `/bin/sh -c`).
+    /// Render the launchd plist (`ProgramArguments` as XML-escaped words, no `/bin/sh -c`). Its
+    /// `ProcessType` is `Background` (darwin-bg, every thread at 4). One A B B A set against an
+    /// `Interactive` job's task type, at loads of 5 to 16 on 18 cores, did not meet the bar for a
+    /// change (`docs/measured/fabric/README.md`, F02). The writer's ack tail was faster
+    /// `Interactive` in both pairs, but the paced ping-pong's slowest round was slower in both
+    /// and the attach went one pair each way.
     #[must_use]
     pub fn plist_text(&self) -> String {
         let root = aterm_codec::xml::escape(&self.root.to_string_lossy());
@@ -894,7 +934,12 @@ pub(crate) fn read_bounded_string(path: &Path, max_bytes: u64) -> io::Result<Str
 }
 
 fn role_text(path: &Path) -> Result<Option<String>, String> {
-    match read_bounded_string(path, 1024 * 1024) {
+    role_read(path, read_bounded_string(path, 1024 * 1024))
+}
+
+/// What a read of `path` says of a role: no file is none, and a link to nothing is a fault.
+fn role_read(path: &Path, read: io::Result<String>) -> Result<Option<String>, String> {
+    match read {
         Ok(text) => Ok(Some(text)),
         Err(e)
             if e.kind() == io::ErrorKind::NotFound
@@ -913,7 +958,8 @@ fn configured_fleet(
 ) -> Result<Option<String>, String> {
     let configured = config
         .map(|path| {
-            role_text(path)?
+            aterm_types::dirs::read_aterm_config_text(path)
+                .map_err(|error| format!("{}: {error}", path.display()))?
                 .map(|text| {
                     fabric::command_in_toml(&text).map_err(|e| format!("{}: {e}", path.display()))
                 })
@@ -1032,14 +1078,7 @@ fn undo_command(program: &str, scope: &[(&str, Option<String>)]) -> String {
 }
 
 fn login_home() -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        aterm_uds::account::home_of(aterm_uds::peer::our_uid()).filter(|h| h.is_absolute())
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
+    aterm_uds::account::home_of(aterm_uds::peer::our_uid()).filter(|h| h.is_absolute())
 }
 
 /// `<control socket dir>/fabric.toml`.
@@ -1878,12 +1917,17 @@ fn ring_is_for(
 
 fn trace(word: &str) {
     if let Some(path) = aterm_types::dev_seam!(TRACE_ENV) {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(path)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.append(true).create(true);
+        #[cfg(unix)]
         {
-            let _ = writeln!(f, "{word}");
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
+        if let Ok(mut f) = opts.open(path) {
+            if f.metadata().is_ok_and(|m| m.is_file()) {
+                let _ = writeln!(f, "{word}");
+            }
         }
     }
 }
@@ -2612,12 +2656,18 @@ fn program_step(p: &Paths, out: &mut Out) -> bool {
         return true;
     }
     let made = (if make_bin {
-        std::fs::create_dir(bin)
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(bin)
     } else {
         Ok(())
     })
     .and_then(|()| {
-        std::fs::set_permissions(bin, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(bin)
+            .and_then(|f| f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700)))
     });
     if let Err(e) = made {
         out.fail("program", &format!("{}: {e}", bin.display()));
@@ -2700,6 +2750,7 @@ fn wait_for_broker(p: &Paths, node: &str) -> Result<fabric::BrokerView, Box<fabr
     poll_broker(
         || poll_reach(p, node),
         fabric::BrokerView::locate,
+        bind_deadline(),
         BIND_DEADLINE,
     )
 }
@@ -2711,11 +2762,14 @@ fn poll_reach(p: &Paths, node: &str) -> fabric::BrokerView {
 
 /// `reach` every 100 ms until a broker answers, then `name` its process once: the poll itself
 /// connects and names nothing, so no process table is scanned while nothing listens yet. Past
-/// `deadline`, the last poll's view.
+/// `deadline`, the last poll's view; past `refused_after` ([`BIND_DEADLINE`]) too once a broker
+/// answers, in this astream protocol or another, but its bus cannot be read, so a seam that
+/// waits longer for a broker to bind waits no longer on one that refuses.
 fn poll_broker(
     mut reach: impl FnMut() -> fabric::BrokerView,
     name: impl FnOnce(&mut fabric::BrokerView),
     deadline: Duration,
+    refused_after: Duration,
 ) -> Result<fabric::BrokerView, Box<fabric::BrokerView>> {
     let started = Instant::now();
     loop {
@@ -2724,7 +2778,9 @@ fn poll_broker(
             name(&mut view);
             return Ok(view);
         }
-        if started.elapsed() > deadline {
+        let waited = started.elapsed();
+        let answered = view.reachable || view.protocol.is_some();
+        if waited > deadline || (answered && waited > refused_after) {
             return Err(Box::new(view));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -2732,15 +2788,8 @@ fn poll_broker(
 }
 
 /// This process's effective uid, as `id -u` prints it.
-#[cfg(unix)]
 pub(crate) fn uid() -> String {
     aterm_uds::peer::our_uid().to_string()
-}
-
-/// No uid off Unix: the launchd steps that name one are macOS's alone.
-#[cfg(not(unix))]
-pub(crate) fn uid() -> String {
-    "501".to_string()
 }
 
 fn launchctl_program() -> std::ffi::OsString {
@@ -4153,8 +4202,8 @@ fn ask_instance(pid: u32, sock: String) -> Result<Instance, Option<String>> {
             )
         })
     })?;
-    let _ = ctl.get_ref().set_read_timeout(Some(IO_TIMEOUT));
-    let _ = ctl.get_ref().set_write_timeout(Some(IO_TIMEOUT));
+    let _ = ctl.get_ref().set_read_timeout(Some(io_timeout()));
+    let _ = ctl.get_ref().set_write_timeout(Some(io_timeout()));
     let reply = match ctl.request("fabric status") {
         Ok(r) if r.ok() => r,
         Ok(r) => {
@@ -4247,7 +4296,7 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
             out.fail("instance", &format!("{pid}: the control socket went away"));
             continue;
         };
-        let _ = ctl.get_ref().set_read_timeout(Some(IO_TIMEOUT));
+        let _ = ctl.get_ref().set_read_timeout(Some(io_timeout()));
         let line = format!("fabric attach {}", argv.join(" "));
         match ctl.request(&line) {
             Ok(r) if r.ok() => {}
@@ -4336,7 +4385,7 @@ fn proof_skipped(running: Option<usize>) -> &'static str {
 fn held_sessions() -> Vec<(u32, Option<String>, String, Option<String>)> {
     let mut held = Vec::new();
     for (pid, sock) in aterm_ctl::local_instances().unwrap_or_default() {
-        let Ok(Some(mut ctl)) = fabric::open_instance(pid, &sock, IO_TIMEOUT) else {
+        let Ok(Some(mut ctl)) = fabric::open_instance(pid, &sock, io_timeout()) else {
             continue;
         };
         for sid in session_sids(&mut ctl) {
@@ -4364,7 +4413,7 @@ fn sessions_of(inst: &Instance) -> Vec<String> {
     let Ok(mut ctl) = Ctl::open(&inst.sock) else {
         return Vec::new();
     };
-    let _ = ctl.get_ref().set_read_timeout(Some(IO_TIMEOUT));
+    let _ = ctl.get_ref().set_read_timeout(Some(io_timeout()));
     session_sids(&mut ctl)
 }
 
@@ -4434,8 +4483,8 @@ fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
     // The post and the await each block up to the proof's deadline before they answer.
     let _ = ctl
         .get_ref()
-        .set_read_timeout(Some(PROOF_DEADLINE + IO_TIMEOUT));
-    let _ = ctl.get_ref().set_write_timeout(Some(IO_TIMEOUT));
+        .set_read_timeout(Some(PROOF_DEADLINE + io_timeout()));
+    let _ = ctl.get_ref().set_write_timeout(Some(io_timeout()));
     let ask = |ctl: &mut Ctl, line: &str| -> Result<crate::ctl::Reply, String> {
         let r = ctl.request(line).map_err(|e| format!("`{line}`: {e}"))?;
         if r.ok() {
@@ -4948,7 +4997,8 @@ fn finish(
             let want = rendezvous.render();
             let private = {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o077 == 0)
+                std::fs::symlink_metadata(&path)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o077 == 0)
             };
             if private
                 && read_bounded_bytes(&path, 1024 * 1024).is_ok_and(|old| old == want.as_bytes())
@@ -4962,12 +5012,24 @@ fn finish(
                 );
                 if !dry_run {
                     if let Some(dir) = path.parent() {
-                        let _ = std::fs::create_dir_all(dir).and_then(|()| {
-                            std::fs::set_permissions(
-                                dir,
-                                std::os::unix::fs::PermissionsExt::from_mode(0o700),
-                            )
-                        });
+                        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+                        let _ = std::fs::DirBuilder::new()
+                            .recursive(true)
+                            .mode(0o700)
+                            .create(dir)
+                            .and_then(|()| {
+                                std::fs::OpenOptions::new()
+                                    .read(true)
+                                    .custom_flags(
+                                        libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                                    )
+                                    .open(dir)
+                            })
+                            .and_then(|f| {
+                                f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(
+                                    0o700,
+                                ))
+                            });
                     }
                     if let Err(e) = write_atomic(&path, want.as_bytes(), 0o600) {
                         out.fail("rendezvous", &format!("{}: {e}", path.display()));
@@ -7929,6 +7991,7 @@ mod tests {
                 view.pid = Some(71);
             },
             Duration::from_secs(60),
+            BIND_DEADLINE,
         )
         .expect("an answer on the third poll");
         assert_eq!(
@@ -7944,11 +8007,47 @@ mod tests {
             },
             |_: &mut fabric::BrokerView| panic!("a broker that never answered was named"),
             Duration::ZERO,
+            BIND_DEADLINE,
         );
         assert_eq!(
             silent.err().and_then(|view| view.error).as_deref(),
             Some("connect: refused")
         );
+    }
+
+    /// A broker that answers but whose bus cannot be read, in this astream protocol or another,
+    /// ends the wait at the refusal bound, not at a seam's longer wait for a broker to bind.
+    #[test]
+    fn a_broker_that_answers_but_cannot_be_read_ends_the_wait_at_the_refusal_bound() {
+        let unattached = fabric::BrokerView {
+            reachable: true,
+            ..fabric::BrokerView::default()
+        };
+        let skewed = fabric::BrokerView {
+            protocol: Some(astream_broker::ProtocolMismatch {
+                broker: astream_broker::proto::PROTO_VERSION + 1,
+                client: astream_broker::proto::PROTO_VERSION,
+            }),
+            ..fabric::BrokerView::default()
+        };
+        for (what, view) in [("unattached", unattached), ("skewed", skewed)] {
+            let polls = std::cell::Cell::new(0_u32);
+            let ended = poll_broker(
+                || {
+                    polls.set(polls.get() + 1);
+                    view.clone()
+                },
+                |_: &mut fabric::BrokerView| panic!("{what}: an unreadable broker was named"),
+                Duration::from_secs(60),
+                Duration::ZERO,
+            );
+            assert!(ended.is_err(), "{what}: an unreadable broker is no answer");
+            assert!(
+                polls.get() <= 2,
+                "{what}: the wait ended at the refusal bound, not after {} polls toward the seam's",
+                polls.get()
+            );
+        }
     }
 
     /// The wait's poll connects and names no process, though the listener scan finds this
@@ -8372,6 +8471,14 @@ mod tests {
         assert!(!relaxed.plist_is_current(&bare.plist_text()));
         assert!(!bare.plist_is_current(&strict.plist_text()));
         assert!(relaxed.plist_is_current(&relaxed.plist_text()));
+        for paths in [&bare, &relaxed, &strict] {
+            assert_eq!(
+                Paths::served_log(&paths.broker_argv()),
+                Some(paths.root.join(BUS_LOG)),
+                "the job's argv serves the root's log on every tier: {:?}",
+                paths.broker_argv()
+            );
+        }
         let sock = bare.sock();
         assert!(
             crate::broker_args::BrokerArgs::from_invocation(&argv).is_some_and(|args| args.serves(

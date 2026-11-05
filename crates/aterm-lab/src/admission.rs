@@ -10,15 +10,311 @@
 //! window. This is admission evidence, not continuous quiet or a postcompile performance
 //! qualification. The same flag is the run's for every claim it makes: the
 //! Linux and Windows lanes' boots take it for their disk claims ([`mode`]).
+//! Functional windows reserve memory without timing evidence. Both window kinds also share
+//! one account-level lane for this original lab process; a scratch World never chooses it.
+//! Native handoffs retain the original lane in keepers and guarded development GUIs, so a
+//! surviving window remains serialized after its controller dies. Other desktop apps do
+//! not participate. Keepers retain their existing lifeline teardown and never reacquire it.
 
-use std::sync::OnceLock;
+use std::cell::Cell;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use aterm_capacity::{Admit, Claim, Ledger, Machine, Need, Pace};
+use aterm_toolchain::{
+    named_lock::{self, Refused, Wait},
+    record_lock::CloseOnlyLock,
+};
 
 use crate::Fail;
 
 /// The run's `--admit` mode and its verb.
 static RUN: OnceLock<(Admit, String)> = OnceLock::new();
+static WINDOW_PROCESS: OnceLock<u32> = OnceLock::new();
+
+/// A positive headroom requirement keeps functional work out of the ledger's auto-ALONE
+/// policy: its requested peak must fit alongside this unreserved margin.
+const FUNCTIONAL_MARGIN: u64 = 128 * 1024 * 1024;
+const WINDOW_LANE: &str = aterm_types::lab_window_guard::LOCK_NAME;
+
+struct WindowLane {
+    path: PathBuf,
+    held: CloseOnlyLock,
+}
+
+/// One original lab run retains its lane even between windows. Never pass a path or an
+/// environment marker to a keeper as a substitute for this actual held description.
+static WINDOWS: Mutex<Option<WindowLane>> = Mutex::new(None);
+
+fn refused(what: &str, kind: &str, why: &dyn std::fmt::Display, signal: Option<i32>) -> Fail {
+    Fail {
+        stopped: signal
+            .inspect(|sig| crate::stop::note(*sig))
+            .or_else(|| crate::stop::check().err().map(|s| s.0)),
+        ..crate::linux::not_run(format!("{what}: its {kind} was {why}; it started nothing"))
+    }
+}
+
+/// Hold the shared native-window lane once for this original lab run. Every Timing and
+/// Functional window calls this before its resource claim; repeated calls do not relock.
+/// The account database selects the capacity directory, independently of HOME/XDG/LAB_STATE.
+/// # Errors
+/// NOT RUN for missing/unusable account storage, a changed lane identity, unchecked `now`
+/// admission, or interruption before or while waiting. This grants no timing evidence.
+pub fn window_lane() -> Result<(), Fail> {
+    let pid = std::process::id();
+    if *WINDOW_PROCESS.get_or_init(|| pid) != pid {
+        // Check before touching WINDOWS: an unexecuted fork could have copied that mutex
+        // while another thread held it. An inherited label or descriptor is no run handoff.
+        return Err(refused(
+            "native window",
+            "window lane",
+            &"unavailable: this is not the original lab process",
+            None,
+        ));
+    }
+    if mode() == Admit::Now {
+        return Err(refused(
+            "native window",
+            "window lane",
+            &"not asked for: windows require --admit wait",
+            None,
+        ));
+    }
+    let verb = RUN.get().map_or("lab", |(_, verb)| verb.as_str());
+    window_lane_in(
+        &WINDOWS,
+        Ledger::user().as_ref(),
+        verb,
+        Wait::Block,
+        &mut |line| eprintln!("{line}"),
+        &|| crate::stop::check().is_err(),
+    )
+}
+
+/// Duplicate the original run's actual window description for an explicit
+/// native handoff. This does not create admission, reacquire a lane or turn a
+/// descriptor number into authority.
+pub fn window_descriptor() -> Result<std::os::fd::OwnedFd, Fail> {
+    window_lane()?;
+    let run = WINDOWS.lock().map_err(|_| {
+        refused(
+            "native window",
+            "window lane",
+            &"original run state was poisoned",
+            None,
+        )
+    })?;
+    run.as_ref()
+        .ok_or_else(|| {
+            refused(
+                "native window",
+                "window lane",
+                &"original description is absent",
+                None,
+            )
+        })?
+        .held
+        .try_clone_fd()
+        .map_err(|why| refused("native window", "window lane", &why, None))
+}
+
+/// The canonical physical-account lane expected by a keeper receiving actual
+/// inherited custody. No scratch HOME, command-line path or PID selects it.
+pub fn window_path() -> Result<PathBuf, String> {
+    let ledger = Ledger::user().ok_or("no account capacity directory")?;
+    aterm_uds::private_file::check_private_dir(ledger.dir()).map_err(|why| why.to_string())?;
+    ledger
+        .dir()
+        .canonicalize()
+        .map(|dir| dir.join(WINDOW_LANE))
+        .map_err(|why| why.to_string())
+}
+
+fn window_lane_in(
+    run: &Mutex<Option<WindowLane>>,
+    ledger: Option<&Ledger>,
+    verb: &str,
+    wait: Wait,
+    say: &mut dyn FnMut(&str),
+    stopped: &dyn Fn() -> bool,
+) -> Result<(), Fail> {
+    let fail =
+        |why: &dyn std::fmt::Display, signal| refused("native window", "window lane", why, signal);
+    if stopped() {
+        return Err(fail(&"not asked for: the run was interrupted", None));
+    }
+    let ledger = ledger.ok_or_else(|| fail(&"unavailable: no account capacity ledger", None))?;
+    let path = ledger.dir().join(WINDOW_LANE);
+    let mut run = run
+        .lock()
+        .map_err(|_| fail(&"unavailable: original run state was poisoned", None))?;
+    if stopped() {
+        return Err(fail(&"not asked for: the run was interrupted", None));
+    }
+    let check = |held: &WindowLane| -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        aterm_uds::private_file::check_private_dir(ledger.dir())?;
+        let named = std::fs::symlink_metadata(&path)?;
+        let original = held.held.metadata()?;
+        if held.path != path
+            || !named.is_file()
+            || named.dev() != original.dev()
+            || named.ino() != original.ino()
+        {
+            return Err(std::io::Error::other(
+                "the original window lane was replaced",
+            ));
+        }
+        Ok(())
+    };
+    if let Some(held) = run.as_ref() {
+        return check(held).map_err(|why| fail(&why, None));
+    }
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(ledger.dir())
+            .and_then(|()| aterm_uds::private_file::check_private_dir(ledger.dir()))
+            .map_err(|why| fail(&why, None))?;
+    }
+    let checkout = std::env::current_dir().map_err(|why| fail(&why, None))?;
+    let me = named_lock::Holder::me(&format!("lab {verb}: native windows"), &checkout);
+    let held = named_lock::take(
+        &path,
+        &me,
+        wait,
+        &mut |holder, waited| {
+            let who = named_lock::name(holder, |_| 0, aterm_uds::process::pid_alive);
+            say(&format!(
+                "native window: waiting for {who}, which holds the account window lane ({} s)",
+                waited.as_secs()
+            ));
+        },
+        stopped,
+    )
+    .map_err(|why| match why {
+        Refused::Stopped { signal, .. } => fail(&"interrupted while waiting", signal),
+        Refused::Held(_) => fail(&"held by another lab run", None),
+        Refused::Io(error) => fail(&error, None),
+    })?;
+    let held = WindowLane {
+        path: path.clone(),
+        held: held.into_close_only(),
+    };
+    check(&held).map_err(|why| fail(&why, None))?;
+    if stopped() {
+        return Err(fail(&"not asked for: the run was interrupted", None));
+    }
+    *run = Some(held);
+    Ok(())
+}
+
+/// Reserve the declared peak for a functional native window without asking for a quiet
+/// machine or issuing Timing evidence. Unknown memory and unchecked admission start no work.
+/// # Errors
+/// NOT RUN for zero memory, `--admit now`, unavailable memory/ledger, capacity refusal or an
+/// interrupted wait. Known insufficient memory waits for room with positive spare headroom.
+pub fn functional(what: &str, memory_bytes: u64) -> Result<Claim, Fail> {
+    let (mode, verb) = RUN
+        .get()
+        .cloned()
+        .unwrap_or_else(|| (Admit::Wait, String::new()));
+    functional_in(
+        Ledger::user().as_ref(),
+        &aterm_capacity::Live,
+        Need::new(format!("lab {verb}: {what}"))
+            .mem(memory_bytes)
+            .margin(FUNCTIONAL_MARGIN),
+        what,
+        mode,
+        Pace::default(),
+        &mut |line| eprintln!("{line}"),
+    )
+}
+
+struct FunctionalMachine<'a> {
+    inner: &'a dyn Machine,
+    unknown: Cell<bool>,
+}
+
+impl Machine for FunctionalMachine<'_> {
+    fn read(&self, path: Option<&Path>) -> aterm_capacity::Reading {
+        let mut reading = self.inner.read(path);
+        if !matches!((reading.available, reading.physical), (Some(available), Some(physical)) if physical > 0 && available <= physical)
+        {
+            self.unknown.set(true);
+            // Keep this look blocked until the admission loop observes the unknown stop.
+            // A positive margin prevents the ordinary ledger's auto-ALONE rule here.
+            reading.available = Some(0);
+        }
+        reading
+    }
+    fn procs(&self) -> Option<aterm_capacity::Procs> {
+        self.inner.procs()
+    }
+    fn lineage(&self, pid: u32) -> Option<aterm_capacity::Procs> {
+        self.inner.lineage(pid)
+    }
+}
+
+fn functional_in(
+    ledger: Option<&Ledger>,
+    machine: &dyn Machine,
+    need: Need,
+    what: &str,
+    mode: Admit,
+    pace: Pace,
+    say: &mut dyn FnMut(&str),
+) -> Result<Claim, Fail> {
+    let fail =
+        |why: &dyn std::fmt::Display, signal| refused(what, "functional memory claim", why, signal);
+    if crate::stop::check().is_err() {
+        return Err(fail(&"not asked for: the run was interrupted", None));
+    }
+    if mode == Admit::Now {
+        return Err(fail(
+            &"not asked for: functional windows require --admit wait",
+            None,
+        ));
+    }
+    if need.mem == 0 || need.margin == 0 || need.quiet.is_some() || need.alone {
+        return Err(fail(
+            &"invalid: a positive peak and spare memory are required without quiet or ALONE",
+            None,
+        ));
+    }
+    let ledger = ledger.ok_or_else(|| {
+        fail(
+            &"unavailable: no home to keep the capacity ledger under",
+            None,
+        )
+    })?;
+    let machine = FunctionalMachine {
+        inner: machine,
+        unknown: Cell::new(false),
+    };
+    let _ = machine.read(None);
+    if machine.unknown.get() {
+        return Err(fail(&"unavailable: usable memory observation", None));
+    }
+    let result = aterm_capacity::admit_until(ledger, &machine, need, mode, pace, say, &|| {
+        machine.unknown.get() || crate::stop::check().is_err()
+    });
+    if machine.unknown.get() {
+        return Err(fail(
+            &"unavailable: memory observation changed to unknown",
+            None,
+        ));
+    }
+    match result {
+        Ok(claim) => Ok(claim),
+        Err(error @ aterm_capacity::Error::Stopped { signal, .. }) => Err(fail(&error, signal)),
+        Err(error) => Err(fail(&error, None)),
+    }
+}
 
 /// Take `--admit now|wait` (or `--admit=now|wait`) out of `args` (any place before a `--`) for
 /// the run of `verb`.
@@ -26,6 +322,9 @@ static RUN: OnceLock<(Admit, String)> = OnceLock::new();
 /// A value that is neither, or none.
 pub fn take(verb: &str, args: &mut Vec<String>) -> Result<(), Fail> {
     let mode = strip(args)?;
+    // The normal entry calls take before dispatch; capture the original process before
+    // any window or worker can start, even when the first window will be much later.
+    let _ = WINDOW_PROCESS.set(std::process::id());
     let _ = RUN.set((mode, verb.to_owned()));
     Ok(())
 }
@@ -138,6 +437,322 @@ mod tests {
 
     use aterm_capacity::{Fixed, Reading};
     use aterm_spec::wait::{MUST_HAPPEN, until_within};
+
+    fn functional_need() -> Need {
+        Need::new("functional fixture")
+            .mem_gib(2)
+            .margin(FUNCTIONAL_MARGIN)
+    }
+
+    #[test]
+    fn functional_claim_reserves_memory_without_timing_or_quiet_evidence() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let mut reading = Reading::of_gib(48, 40, 14);
+        reading.load1 = Some(200.0);
+        let fixed = Fixed::new(reading);
+        let mut claim = functional_in(
+            Some(&ledger),
+            &fixed,
+            functional_need(),
+            "functional fixture",
+            Admit::Wait,
+            Pace::default(),
+            &mut |line| panic!("unexpected wait: {line}"),
+        )
+        .unwrap();
+        let records = ledger.list().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].need.mem, 2 * aterm_capacity::floor::GIB);
+        assert_eq!(records[0].need.margin, FUNCTIONAL_MARGIN);
+        assert!(records[0].need.quiet.is_none());
+        assert!(!records[0].need.covers);
+        assert!(!records[0].held.unwrap().alone);
+        assert_eq!(
+            claim.timing_admission(),
+            Err(aterm_capacity::TimingIssue::UnknownAdmission)
+        );
+        assert_eq!(
+            claim.measurement_entry(),
+            Err(aterm_capacity::TimingIssue::UnknownAdmission)
+        );
+        assert!(fixed.cpu_point().is_none());
+        drop(claim);
+        assert!(ledger.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn functional_claim_refuses_now_zero_missing_and_unknown_before_work() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let healthy = Fixed::new(Reading::of_gib(48, 40, 14));
+        for (ledger, need, mode) in [
+            (Some(&ledger), functional_need(), Admit::Now),
+            (
+                Some(&ledger),
+                Need::new("zero").margin(FUNCTIONAL_MARGIN),
+                Admit::Wait,
+            ),
+            (None, functional_need(), Admit::Wait),
+        ] {
+            let error = functional_in(
+                ledger,
+                &healthy,
+                need,
+                "functional fixture",
+                mode,
+                Pace::default(),
+                &mut |line| panic!("unexpected wait: {line}"),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, 3);
+            assert!(error.msg.unwrap().contains("started nothing"));
+        }
+        for reading in [
+            Reading::default(),
+            Reading {
+                available: None,
+                ..Reading::of_gib(48, 40, 14)
+            },
+            Reading {
+                physical: None,
+                ..Reading::of_gib(48, 40, 14)
+            },
+        ] {
+            let error = functional_in(
+                Some(&ledger),
+                &Fixed::new(reading),
+                functional_need(),
+                "functional fixture",
+                Admit::Wait,
+                Pace::default(),
+                &mut |line| panic!("unknown memory must not wait or admit: {line}"),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, 3);
+            assert!(error.msg.unwrap().contains("memory observation"));
+        }
+        assert!(ledger.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn functional_shortage_waits_for_actual_room_and_never_uses_alone() {
+        struct RoomAfterLine {
+            ready: Cell<bool>,
+            start: Instant,
+        }
+        impl Machine for RoomAfterLine {
+            fn read(&self, _: Option<&Path>) -> Reading {
+                assert!(self.start.elapsed() < MUST_HAPPEN, "admission hung");
+                Reading::of_gib(48, if self.ready.get() { 40 } else { 0 }, 14)
+            }
+            fn procs(&self) -> Option<aterm_capacity::Procs> {
+                None
+            }
+        }
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let machine = RoomAfterLine {
+            ready: Cell::new(false),
+            start: Instant::now(),
+        };
+        let claim = functional_in(
+            Some(&ledger),
+            &machine,
+            functional_need(),
+            "functional fixture",
+            Admit::Wait,
+            Pace {
+                poll: std::time::Duration::ZERO,
+                ..Pace::default()
+            },
+            &mut |line| {
+                if machine.ready.get() {
+                    assert!(line.contains("admitted"), "{line}");
+                } else {
+                    assert!(line.contains("waits") && line.contains("memory"), "{line}");
+                    machine.ready.set(true);
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            machine.ready.get(),
+            "a zero-room ALONE admission would skip the actual wait"
+        );
+        assert!(!ledger.list().unwrap()[0].held.unwrap().alone);
+        drop(claim);
+        assert!(ledger.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn functional_memory_must_remain_known_during_admission() {
+        struct Lost {
+            reads: Cell<u32>,
+        }
+        impl Machine for Lost {
+            fn read(&self, _: Option<&Path>) -> Reading {
+                let reads = self.reads.get();
+                self.reads.set(reads + 1);
+                if reads == 0 {
+                    Reading::of_gib(48, 40, 14)
+                } else {
+                    Reading::default()
+                }
+            }
+            fn procs(&self) -> Option<aterm_capacity::Procs> {
+                None
+            }
+        }
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let machine = Lost {
+            reads: Cell::new(0),
+        };
+        let error = functional_in(
+            Some(&ledger),
+            &machine,
+            functional_need(),
+            "functional fixture",
+            Admit::Wait,
+            Pace {
+                poll: std::time::Duration::ZERO,
+                ..Pace::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.code, 3);
+        assert!(error.msg.unwrap().contains("changed to unknown"));
+        assert!(machine.reads.get() > 1);
+        assert!(ledger.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn window_lane_reuses_original_run_but_blocks_an_independent_run() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let original = Mutex::new(None);
+        let other = Mutex::new(None);
+        for _ in 0..2 {
+            window_lane_in(
+                &original,
+                Some(&ledger),
+                "functional fixture",
+                Wait::No,
+                &mut |line| panic!("same run must not wait: {line}"),
+                &|| false,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            window_lane_in(
+                &other,
+                Some(&ledger),
+                "timing fixture",
+                Wait::No,
+                &mut |_| {},
+                &|| false
+            )
+            .unwrap_err()
+            .code,
+            3
+        );
+        assert!(other.lock().unwrap().is_none());
+        assert!(
+            ledger.list().unwrap().is_empty(),
+            "lane is not a memory or Timing claim"
+        );
+        drop(original);
+        window_lane_in(
+            &other,
+            Some(&ledger),
+            "timing fixture",
+            Wait::No,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn window_lane_fails_closed_on_missing_storage_replacement_and_stopping() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let run = Mutex::new(None);
+        for (ledger, stopped) in [(None, false), (Some(&ledger), true)] {
+            assert_eq!(
+                window_lane_in(&run, ledger, "fixture", Wait::No, &mut |_| {}, &|| stopped)
+                    .unwrap_err()
+                    .code,
+                3
+            );
+            assert!(run.lock().unwrap().is_none());
+        }
+        window_lane_in(
+            &run,
+            Some(&ledger),
+            "fixture",
+            Wait::No,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        let path = ledger.dir().join(WINDOW_LANE);
+        std::fs::rename(&path, ledger.dir().join("original-window.lock")).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        assert_eq!(
+            window_lane_in(
+                &run,
+                Some(&ledger),
+                "fixture",
+                Wait::No,
+                &mut |_| {},
+                &|| false
+            )
+            .unwrap_err()
+            .code,
+            3
+        );
+    }
+
+    #[test]
+    fn occupied_window_lane_wait_can_be_interrupted_without_starting_work() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let holder = Mutex::new(None);
+        window_lane_in(
+            &holder,
+            Some(&ledger),
+            "holder",
+            Wait::No,
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+        let waiter = Mutex::new(None);
+        let stop = Cell::new(false);
+        let start = Instant::now();
+        let error = window_lane_in(
+            &waiter,
+            Some(&ledger),
+            "waiter",
+            Wait::Block,
+            &mut |line| {
+                assert!(line.contains("account window lane"));
+                stop.set(true);
+            },
+            &|| {
+                assert!(start.elapsed() < MUST_HAPPEN, "lane wait hung");
+                stop.get()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, 3);
+        assert!(stop.get());
+        assert!(waiter.lock().unwrap().is_none());
+        assert!(holder.lock().unwrap().is_some());
+    }
 
     /// Set, the test binary is [`standin_waits_for_the_quiet_machine`], its ledger under this
     /// directory.

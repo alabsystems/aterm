@@ -18,6 +18,7 @@ fn restored_lab(incoming_handoff_pending: bool) -> crate::App {
         focused_path: Vec::new(),
         zoomed: false,
         parked: false,
+        ephemeral: false,
     }];
     app.incoming_handoff_pending = incoming_handoff_pending;
     app.restore_into_window(crate::WindowId(0), layout);

@@ -275,6 +275,13 @@ fn the_registry_lists_each_slot_once_in_order_with_its_timeline_rows() {
         .words(),
         "detached why=secure_input"
     );
+    for (on, why, words) in [
+        (true, "person", "unseen=on why=person"),
+        (false, "person", "unseen=off why=person"),
+        (false, "program left", "unseen=off why=program_left"),
+    ] {
+        assert_eq!(Row::Unseen { on, why }.words(), words);
+    }
 }
 
 #[test]

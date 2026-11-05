@@ -252,12 +252,6 @@ fn the_refusal_names_its_provider() {
         lima.starts_with("no limactl here: `targo --unverified verify provision --linux` fetches"),
         "{lima}"
     );
-    let bindgen = tool("wasm-bindgen").refusal_on("linux-x86_64");
-    assert!(
-        bindgen
-            .contains("`targo --unverified verify provision --record` builds the pinned 0.2.108"),
-        "{bindgen}"
-    );
     let vim = tool("vim").refusal_on(mac);
     assert!(
         vim.contains("operating system, and no command adds it"),
@@ -334,9 +328,11 @@ fn every_workspace_row_names_the_run_that_provides_it() {
             refusal.contains(&format!("`{}`", when.command())),
             "{refusal}"
         );
-        for (flag, wanted) in [("--linux", When::Linux), ("--record", When::Record)] {
-            assert_eq!(refusal.contains(flag), when == wanted, "{refusal}");
-        }
+        assert_eq!(
+            refusal.contains("--linux"),
+            when == When::Linux,
+            "{refusal}"
+        );
         assert!(!refusal.contains("init --develop"), "{refusal}");
         assert_eq!(row.provided_by(), when.verb());
     }
@@ -366,8 +362,6 @@ fn a_host_the_tree_pins_nothing_for_is_told_so() {
             assert!(words.contains("the pinned"), "{mac}: {words}");
         }
     }
-    let bindgen = tool("wasm-bindgen").refusal_on("linux-aarch64");
-    assert!(bindgen.contains("builds the pinned 0.2.108"), "{bindgen}");
 }
 
 #[test]
@@ -433,13 +427,6 @@ fn a_pin_lives_under_its_package() {
     assert_eq!(
         tool("limactl").pinned_in(t),
         Some(PathBuf::from("/t/lima-2.2.1/bin/limactl"))
-    );
-    assert_eq!(
-        tool("wasm-bindgen").pinned_root(t),
-        Some(PathBuf::from(format!(
-            "/t/wasm-bindgen-{}",
-            pinned_version("wasm-bindgen")
-        )))
     );
     assert_eq!(
         tool("rustup").pinned_in(t),
@@ -540,18 +527,34 @@ fn a_rustup_the_row_cannot_find_is_absent_naming_verify_provision_once() {
             tooling.join("rustup-1.29.2").join("bin/rustup").display()
         )
     );
-    // The fix is this host's remedy: the pin covers macOS and Linux, and a
-    // Windows host is told the tree pins none for it.
+    // The fix is this host's remedy, which names the run that provides the pin once: a host
+    // the pin covers is promised its version, and one it does not cover is told which hosts
+    // it covers instead.
     assert_eq!(absent.fix, row.remedy());
-    assert_eq!(
-        row.remedy_on("macos-aarch64"),
-        "`targo --unverified verify provision` fetches the pinned 1.29.2 into this user's cache"
-    );
-    assert_eq!(
-        row.remedy_on("windows-aarch64"),
-        "aterm provides none for windows-aarch64: `targo --unverified verify provision` pins it \
-         for macos-aarch64 and macos-x86_64 and linux-x86_64 and linux-aarch64 only"
-    );
+    let pin = row.pin.expect("rustup is pinned");
+    for platform in [
+        "macos-aarch64",
+        "linux-x86_64",
+        "windows-aarch64",
+        "windows-x86_64",
+    ] {
+        let remedy = row.remedy_on(platform);
+        assert_eq!(
+            remedy.matches(&When::Always.command()).count(),
+            1,
+            "{platform}: {remedy}"
+        );
+        if pin.pinned_for(platform) {
+            assert!(remedy.contains(pin.version), "{platform}: {remedy}");
+        } else {
+            assert!(
+                !remedy.contains(pin.version)
+                    && remedy.contains(platform)
+                    && pin.hosts.iter().all(|host| remedy.contains(host)),
+                "{platform}: {remedy}"
+            );
+        }
+    }
     let said = absent.to_string();
     assert_eq!(said.matches("verify provision").count(), 1, "{said}");
     assert!(!said.contains("brew"), "{said}");
@@ -718,39 +721,137 @@ fn a_missing_tool_ends_could_not_run_naming_its_provider() {
     );
 }
 
-/// Windows ships none of the Unix OS rows: a missing one is refused as Windows' absence,
-/// naming the usual third-party copies its row looks for, and a row Windows ships is
-/// Windows' own.
+/// A ROW'S REMEDY ON WINDOWS SAYS WHETHER WINDOWS SHIPS IT. A program Windows ships (its own,
+/// or a Unix OS's program Windows ships too, as System32's curl) has Windows' own remedy there
+/// and, if a Unix OS ships it as well, the OS's off Windows; a Unix OS's program Windows does
+/// not ship has neither there, and names each Windows place its row looks at and no Unix one.
+/// NEGATIVE CONTROL: with the `OsAndWindows` arm folded into the `Os` ones, curl's remedy on
+/// Windows is Windows' absence.
 #[test]
-fn a_unix_os_row_on_windows_is_not_the_operating_systems() {
-    let on = "windows-aarch64";
-    assert_eq!(
-        tool("zsh").refusal_on(on),
-        "no zsh here: Windows ships none, and aterm looks for one at \
-         C:\\Program Files\\Git\\usr\\bin\\zsh.exe or C:\\msys64\\usr\\bin\\zsh.exe \
-         (or ATERM_TEST_ZSH=<path> names one)"
+fn a_rows_remedy_on_windows_says_whether_windows_ships_it() {
+    let (windows, mac) = ("windows-aarch64", "macos-aarch64");
+    let windows_own = tool("cmd").remedy_on(windows);
+    let os_own = tool("sh").remedy_on(mac);
+    assert_ne!(windows_own, os_own);
+    assert!(
+        tool("cmd").remedy_on(mac).contains(mac),
+        "Windows' own program off Windows names the host it is not on"
     );
+    let mut shipped_by_both = 0;
+    for row in TOOLS {
+        let there = row.remedy_on(windows);
+        match row.provider {
+            Provider::Windows => assert_eq!(there, windows_own, "{}", row.name),
+            Provider::OsAndWindows => {
+                assert_eq!(there, windows_own, "{}", row.name);
+                assert_eq!(row.remedy_on(mac), os_own, "{}", row.name);
+                assert_eq!(row.places_on("windows").count(), 0, "{}", row.name);
+                shipped_by_both += 1;
+            }
+            Provider::Os => {
+                assert!(
+                    there != windows_own && there != os_own,
+                    "{}: {there}",
+                    row.name
+                );
+                for place in row.places_on("windows") {
+                    assert!(there.contains(place), "{}: {there}", row.name);
+                }
+                for place in row.places_on("macos") {
+                    assert!(!there.contains(place), "{}: {there}", row.name);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(shipped_by_both > 0, "curl, tar, OpenSSH and hostname");
     assert_eq!(
-        tool("bash").remedy_on(on),
-        "Windows ships none, and aterm looks for one at C:\\Program Files\\Git\\bin\\bash.exe"
-    );
-    assert_eq!(
-        tool("codesign").remedy_on(on),
-        "Windows ships none, and aterm provides none"
-    );
-    assert_eq!(
-        tool("cmd").remedy_on(on),
-        "it comes with Windows, and no command adds it"
-    );
-    assert_eq!(
-        tool("cmd").remedy_on("macos-aarch64"),
-        "only Windows ships it, and this host is macos-aarch64"
-    );
-    assert_eq!(
-        tool("zsh").remedy_on("macos-x86_64"),
-        "it comes with the operating system, and no command adds it"
+        tool("curl").provider,
+        Provider::OsAndWindows,
+        "the control's row"
     );
     assert_eq!(tool("cmd").provided_by(), "Windows");
+}
+
+/// AN `os` ROW ONLY MACOS SHIPS THAT THE LINUX GUEST LAYS SENDS A LINUX HOST THERE, naming the
+/// place the guest lays it at, and is the operating system's on macOS. NEGATIVE CONTROL:
+/// without the `in_guest` arm, web2 on Linux "comes with the operating system".
+#[test]
+fn a_linux_host_without_web2_is_sent_to_the_guest_that_lays_it() {
+    let web2 = tool("web2");
+    assert!(web2.in_guest);
+    let laid = web2.places_on("linux").next().expect("a Unix place");
+    for linux in ["linux-aarch64", "linux-x86_64"] {
+        let remedy = web2.remedy_on(linux);
+        assert!(
+            remedy.contains(laid) && remedy.ends_with(GUEST_RUNS),
+            "{linux}: {remedy}"
+        );
+    }
+    assert_eq!(
+        web2.remedy_on("macos-aarch64"),
+        tool("sh").remedy_on("macos-aarch64"),
+        "macOS ships it"
+    );
+}
+
+/// A HOST LOOKS ONLY AT ITS OWN FAMILY'S PLACES: off Windows a row's `/`-rooted ones, on Windows
+/// the rest, each absolute there, so neither is read, resolved or named as a relative name on
+/// the other. NEGATIVE CONTROLS: with `places_on` unfiltered off Windows, bash's `looked_in`
+/// on a Mac names Git for Windows' `C:\Program Files\Git\bin\bash.exe`; unfiltered on
+/// Windows, `/bin/bash` is taken for a Windows place.
+#[test]
+fn a_host_looks_only_at_its_own_places() {
+    for row in TOOLS {
+        for place in row.places_on("windows") {
+            let bytes = place.as_bytes();
+            assert!(
+                bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && bytes[1..3] == *b":\\",
+                "{}: {place} is no Windows place",
+                row.name
+            );
+        }
+        let looked = row.looked_in(None);
+        let foreign = if cfg!(windows) { "macos" } else { "windows" };
+        for place in row.places_on(foreign) {
+            assert!(!looked.contains(place), "{}: {looked}", row.name);
+        }
+    }
+    assert!(
+        tool("bash").places_on("windows").count() > 0,
+        "the control's row"
+    );
+}
+
+/// A PROGRAM WINDOWS SHIPS IS `<name>.exe` IN A WINDOWS `PATH` DIRECTORY, and the resolver finds
+/// it there; a Unix OS's program is looked for by its own name everywhere (System32's
+/// `bash.exe` is WSL's, not the bash a row means). NEGATIVE CONTROL: with `path_file_on`
+/// answering the bare name, a Windows host's resolver misses the scratch `curl.exe`.
+#[test]
+fn a_program_windows_ships_is_its_exe_on_a_windows_path() {
+    for (name, there) in [
+        ("curl", "curl.exe"),
+        ("ssh-keygen", "ssh-keygen.exe"),
+        ("cmd", "cmd.exe"),
+        ("wsl.exe", "wsl.exe"),
+        ("bash", "bash"),
+        ("zsh", "zsh"),
+    ] {
+        assert_eq!(tool(name).path_file_on("windows"), there);
+        assert_eq!(tool(name).path_file_on("macos"), name);
+    }
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let curl = Tool {
+        at: &[],
+        ..*tool("curl")
+    };
+    let file = scratch.path().join(curl.path_file_on(std::env::consts::OS));
+    stand_in(&file);
+    let lookup = Lookup {
+        path: Some(scratch.path().as_os_str().to_owned()),
+        ..Lookup::default()
+    };
+    assert_eq!(curl.find_in(&lookup), Some(file));
 }
 
 #[test]
@@ -763,10 +864,6 @@ fn a_tools_variable_is_its_upper_snake_name() {
         "limactl (verify provision --linux)"
     );
     assert_eq!(tool("firefox").needs_label(), "firefox (verify provision)");
-    assert_eq!(
-        tool("wasm-bindgen").needs_label(),
-        "wasm-bindgen (verify provision --record)"
-    );
     assert_eq!(tool("zsh").needs_label(), "zsh (OS)");
 }
 

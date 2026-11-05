@@ -3,7 +3,7 @@
 
 //! Which sessions an open `edit` ticket holds, and the refusal that enforces it (amacs design §6.7; slices N1 and N4).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -27,18 +27,10 @@ struct Entry {
     expires: Option<Instant>,
 }
 
-#[derive(Debug)]
-struct Holds {
-    /// Each held session's holds, in the order their tickets first held it.
-    sessions: BTreeMap<u64, Vec<Entry>>,
-    /// The tickets of `edit … wait=0` requests being served ([`Unwaited`]).
-    unwaited: BTreeSet<Ticket>,
-}
+/// Each held session's holds, in the order their tickets first held it.
+type Holds = BTreeMap<u64, Vec<Entry>>;
 
-static EDIT_HOLD: Mutex<Holds> = Mutex::new(Holds {
-    sessions: BTreeMap::new(),
-    unwaited: BTreeSet::new(),
-});
+static EDIT_HOLD: Mutex<Holds> = Mutex::new(BTreeMap::new());
 
 /// The map's lock, a leaf: nothing else is acquired while it is held. Callers lock it themselves
 /// (`edit_hold().lock_or_recover()`), so every acquisition carries the name.
@@ -63,31 +55,10 @@ pub(crate) fn holds_verb(verb: &str) -> bool {
     )
 }
 
-/// An `edit … wait=0` request's ticket, marked for as long as its lane serves it.
-#[derive(Debug)]
-pub(crate) struct Unwaited(Ticket);
-
-impl Unwaited {
-    /// Mark `ticket` before its request is posted to the main thread, whose answer comes after its view has opened.
-    pub(crate) fn mark(ticket: Ticket) -> Self {
-        edit_hold().lock_or_recover().unwaited.insert(ticket);
-        Self(ticket)
-    }
-}
-
-impl Drop for Unwaited {
-    fn drop(&mut self) {
-        edit_hold().lock_or_recover().unwaited.remove(&self.0);
-    }
-}
-
 /// Ticket `hold.ticket` holds `session` until cleared.
 pub(crate) fn set(session: u64, hold: Hold) {
     let mut holds = edit_hold().lock_or_recover();
-    if holds.unwaited.contains(&hold.ticket) {
-        return;
-    }
-    let entries = holds.sessions.entry(session).or_default();
+    let entries = holds.entry(session).or_default();
     match entries
         .iter_mut()
         .find(|entry| entry.hold.ticket == hold.ticket)
@@ -106,10 +77,10 @@ pub(crate) fn set(session: u64, hold: Hold) {
 /// Ticket `ticket` no longer holds `session`.
 pub(crate) fn clear(session: u64, ticket: Ticket) {
     let mut holds = edit_hold().lock_or_recover();
-    if let Some(entries) = holds.sessions.get_mut(&session) {
+    if let Some(entries) = holds.get_mut(&session) {
         entries.retain(|entry| entry.hold.ticket != ticket);
         if entries.is_empty() {
-            holds.sessions.remove(&session);
+            holds.remove(&session);
         }
     }
 }
@@ -118,7 +89,6 @@ pub(crate) fn clear(session: u64, ticket: Ticket) {
 pub(crate) fn set_expiry(session: u64, ticket: Ticket, expires: Option<Instant>) {
     if let Some(entry) = edit_hold()
         .lock_or_recover()
-        .sessions
         .get_mut(&session)
         .and_then(|entries| entries.iter_mut().find(|entry| entry.hold.ticket == ticket))
     {
@@ -134,7 +104,7 @@ pub(crate) fn get(session: u64) -> Option<Hold> {
 /// `get` as of `now`.
 pub(crate) fn get_at(session: u64, now: Instant) -> Option<Hold> {
     let mut holds = edit_hold().lock_or_recover();
-    live(&mut holds.sessions, session, now)
+    live(&mut holds, session, now)
         .last()
         .map(|entry| entry.hold)
 }
@@ -147,17 +117,17 @@ pub(crate) fn count(session: u64) -> usize {
 /// `count` as of `now`.
 pub(crate) fn count_at(session: u64, now: Instant) -> usize {
     let mut holds = edit_hold().lock_or_recover();
-    live(&mut holds.sessions, session, now).len()
+    live(&mut holds, session, now).len()
 }
 
 /// The holds standing at `now` through one of `views`, as `(session, ticket)` pairs ascending.
 pub(crate) fn holds_through(views: &[u64], now: Instant) -> Vec<(u64, Ticket)> {
     let mut holds = edit_hold().lock_or_recover();
-    let sessions: Vec<u64> = holds.sessions.keys().copied().collect();
+    let sessions: Vec<u64> = holds.keys().copied().collect();
     let mut through: Vec<(u64, Ticket)> = Vec::new();
     for session in sessions {
         through.extend(
-            live(&mut holds.sessions, session, now)
+            live(&mut holds, session, now)
                 .iter()
                 .filter(|entry| views.contains(&entry.hold.view))
                 .map(|entry| (session, entry.hold.ticket)),
@@ -471,6 +441,7 @@ mod tests {
                     create: false,
                     for_word: None,
                     wait: true,
+                    read_only: false,
                 },
                 real_uri: crate::control_edit::real_file_uri(&uri),
                 reply,
@@ -524,6 +495,54 @@ mod tests {
                 .is_some(),
             "an orphan keeps its view"
         );
+    }
+
+    /// Admission retains `wait=0` without a transport lane; a waiter arriving later
+    /// turns the same ticket into a hold.
+    #[test]
+    fn an_unwaited_edit_holds_only_after_its_waiter_arrives() {
+        use amacs::protocol::edit::{AwaitKey, EditOk, EditRequest};
+
+        use crate::control_edit::{AwaitCall, EditCall, WaiterId};
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan.md");
+        std::fs::write(&path, b"plan\n").unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let mut app = crate::App::headless_for_test();
+        app.serve_edits_headless_for_test();
+        let sid = crate::control_edit::mint_ticket().0;
+        app.next_session_id = sid;
+        app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
+        let ticket = crate::control_edit::mint_ticket();
+        let (reply, answer) = std::sync::mpsc::channel();
+        // Admission owns the request's policy even without a transport lane on the stack.
+        app.begin_edit(EditCall {
+            ticket,
+            session: sid,
+            request: EditRequest::parse(&format!("{uri} wait=0")).unwrap(),
+            real_uri: crate::control_edit::real_file_uri(&uri),
+            reply,
+        });
+        let ok = EditOk::parse(&answer.try_recv().expect("admission answered")).unwrap();
+        assert_eq!(typed("send", sid), None, "opening alone holds no input");
+
+        let (reply, _done) = std::sync::mpsc::channel();
+        app.await_edit(AwaitCall {
+            waiter: WaiterId(ticket.0),
+            key: AwaitKey::Ticket(ticket),
+            real_uri: None,
+            reply,
+        });
+        assert_eq!(
+            typed("send", sid),
+            Some(format!(
+                "ERR busy editing ticket={ticket} view={}\n",
+                ok.view
+            )),
+            "a later waiter holds the admitted ticket"
+        );
+        clear(sid, ticket);
     }
 
     /// `edit … wait=0` (`amacs --no-wait`) opens its view holding nothing:

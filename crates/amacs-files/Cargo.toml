@@ -33,6 +33,9 @@ aterm-gui-consent = { workspace = true }
 aterm-digest = { workspace = true }
 # The content fingerprint (FNV-1a with a length mix).
 aterm-hash = { workspace = true }
+# The draft journal's records are astream step records (`io/journal_steps.rs`), and astream's
+# scan tells their torn tail from a fault. Not a new edge in the graph: aterm-hash links it.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 # The workspace's one epoch-clock read, which seeds a temporary's name.
 aterm-time = { workspace = true }
 # open(2) flags and errnos.
@@ -40,6 +43,12 @@ libc = { workspace = true }
 # The one read rule for `aterm.toml` the switch readers hold too
 # (`dirs::aterm_config_file_refusal`). Not a new edge in the graph: amacs links it already.
 aterm-types = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# A commit's folder (`host/folder.rs`): opened once with no link anywhere on its path, and
+# its save lock, temporary, reads, publication and sync all fd-relative `*at` calls through
+# that one descriptor, never the path again. libc only, which this crate links already.
+aterm-dirfd = { workspace = true }
 
 [dev-dependencies]
 # Exclusive scratch directories whose cleanup belongs to the fixture.

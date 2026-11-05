@@ -19,10 +19,20 @@ impl<W: Write + ?Sized> BitWriter<'_, W> {
     fn bits(&mut self, value: u64, n: u32) -> io::Result<()> {
         self.acc |= value << self.nbits;
         self.nbits += n;
-        while self.nbits >= 8 {
-            self.out.write_all(&[self.acc as u8])?;
-            self.acc >>= 8;
-            self.nbits -= 8;
+        if self.nbits >= 32 {
+            self.flush_whole()?;
+        }
+        Ok(())
+    }
+
+    fn flush_whole(&mut self) -> io::Result<()> {
+        let whole = (self.nbits / 8) as usize;
+        if whole > 0 {
+            let bytes = self.acc.to_le_bytes();
+            self.out.write_all(&bytes[..whole])?;
+            let shift = (whole as u32) * 8;
+            self.acc = self.acc.checked_shr(shift).unwrap_or(0);
+            self.nbits -= shift;
         }
         Ok(())
     }
@@ -30,7 +40,8 @@ impl<W: Write + ?Sized> BitWriter<'_, W> {
     /// Zero bits up to the next byte boundary.
     fn pad(&mut self) -> io::Result<()> {
         let n = (8 - self.nbits % 8) % 8;
-        self.bits(0, n)
+        self.nbits += n;
+        self.flush_whole()
     }
 }
 

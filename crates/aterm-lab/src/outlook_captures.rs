@@ -243,14 +243,14 @@ fn profile(plan: &Plan, now: i64) -> String {
 /// A file could not be written, or the store refused a reading.
 pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
     let io = |what: &str, e: std::io::Error| format!("outlook seed: {what}: {e}");
-    std::fs::write(world.home.join(".claude.json"), profile(plan, now))
+    crate::util::write_fresh(&world.home.join(".claude.json"), profile(plan, now))
         .map_err(|e| io("profile", e))?;
     let mut rows = Vec::new();
     for &(label, class) in &plan.rows {
         let dir = (label != "me").then(|| world.home.join("logins").join(label));
         if let Some(dir) = &dir {
             std::fs::create_dir_all(dir).map_err(|e| io(label, e))?;
-            std::fs::write(dir.join("a-login-file"), "{}").map_err(|e| io(label, e))?;
+            crate::util::write_fresh(&dir.join("a-login-file"), "{}").map_err(|e| io(label, e))?;
         }
         rows.push(accounts::Row {
             label: label.into(),
@@ -263,7 +263,7 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
         });
     }
     let roster = accounts::append_rows("", &rows)?;
-    std::fs::write(world.cfg.join("aterm").join("accounts.toml"), roster)
+    crate::util::write_fresh(&world.cfg.join("aterm").join("accounts.toml"), roster)
         .map_err(|e| io("roster", e))?;
     let state_dir = harness_state(world);
     std::fs::create_dir_all(&state_dir).map_err(|e| io("state", e))?;
@@ -433,7 +433,7 @@ pub fn cmd_outlook_captures(args: &[String]) -> Res {
         ));
     }
     let path = o.out.join(format!("manifest-{}.tsv", o.tag));
-    std::fs::write(&path, manifest)
+    crate::util::write_fresh(&path, manifest)
         .map_err(|e| Fail::die(format!("cannot write {}: {e}", path.display())))?;
     println!("outlook-captures: {} shots, {}", rows.len(), path.display());
     Ok(0)
@@ -531,7 +531,7 @@ fn shoot(o: &Opts, aterm: &Path, scene: char, look: Look, scale: u8) -> Result<V
             let png = name(what);
             let note = image(inst, &png)?;
             let rows_file = png.with_extension("controls.txt");
-            std::fs::write(&rows_file, &card)
+            crate::util::write_fresh(&rows_file, &card)
                 .map_err(|e| Fail::die(format!("cannot write {}: {e}", rows_file.display())))?;
             let _ = inst.ctl(&["key", "escape"]);
             rows.push(Row {
@@ -545,7 +545,7 @@ fn shoot(o: &Opts, aterm: &Path, scene: char, look: Look, scale: u8) -> Result<V
         }
     }
     let _ = std::fs::remove_file(&scratch);
-    lab.inst.stop();
+    lab.inst.stop().map_err(Fail::die)?;
     Ok(rows)
 }
 
@@ -669,7 +669,7 @@ fn image(inst: &Instance, png: &Path) -> Result<String, Fail> {
             shot.first()
         )));
     }
-    std::fs::copy(path, png)
+    crate::util::copy_regular_file(path, png)
         .map_err(|e| Fail::die(format!("cannot write {}: {e}", png.display())))?;
     Ok(shot.first())
 }
@@ -882,7 +882,7 @@ fn full_series(
             text.push('\n');
         }
         text.push_str(&crate::util::read_regular_text(&path).unwrap_or_default());
-        std::fs::write(&path, text)
+        crate::util::write_fresh(&path, text)
             .map_err(|e| Fail::die(format!("cannot write {}: {e}", path.display())))?;
     }
     Ok(())
@@ -995,7 +995,7 @@ pub fn cmd_outlook_perf(args: &[String]) -> Res {
         lines.push(l);
     };
     for pair in 1..=o.pairs {
-        let load = crate::aos_workers_bench::load_average()
+        let load = crate::bench_stats::load_average()
             .map_or_else(|e| format!("load=? ({e})"), |l| format!("load1={l:.2}"));
         let gate = std::sync::Barrier::new(2);
         let (main, mine) = std::thread::scope(|s| {
@@ -1027,7 +1027,7 @@ pub fn cmd_outlook_perf(args: &[String]) -> Res {
     let cost = resolver_cost(100)?;
     say(&mut lines, cost);
     let path = o.out.join("perf.txt");
-    std::fs::write(&path, format!("{}\n", lines.join("\n")))
+    crate::util::write_fresh(&path, format!("{}\n", lines.join("\n")))
         .map_err(|e| Fail::die(format!("cannot write {}: {e}", path.display())))?;
     println!("outlook-perf: {}", path.display());
     Ok(0)

@@ -70,6 +70,26 @@ pub enum FixtureStage {
     AfterGo,
 }
 
+fn local_environment(raw: &[(OsString, OsString)]) -> std::io::Result<Vec<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    raw.iter()
+        .map(|(name, value)| {
+            if name.is_empty() || !names.insert(name) {
+                return Err(std::io::Error::other(
+                    "cold environment has ambiguous names",
+                ));
+            }
+            let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
+                return Err(std::io::Error::other("cold environment is not Unicode"));
+            };
+            if name.contains(['=', '\0']) || value.contains('\0') {
+                return Err(std::io::Error::other("cold environment is malformed"));
+            }
+            Ok(format!("{name}={value}"))
+        })
+        .collect()
+}
+
 fn run(
     args: Args,
     #[cfg(debug_assertions)] hook: Option<&dyn Fn(FixtureStage, ImagePhase) -> std::io::Result<()>>,
@@ -87,37 +107,86 @@ fn run(
     if let Some(hook) = hook {
         hook(FixtureStage::BeforeAttach, args.phase)?;
     }
-    let Reply::Launch {
-        command,
-        deadline_us,
-    } = native_act::exchange(
+    let attached = native_act::exchange(
         &mut client,
         &args.session,
         &Request::Attach(args.binding.clone(), args.phase),
-    )?
-    else {
-        return Err(std::io::Error::other("native launcher was not admitted"));
+    )?;
+    let mut inherited = None;
+    let (command, deadline_us) = match attached {
+        Reply::Launch {
+            command,
+            deadline_us,
+        } => (command, deadline_us),
+        Reply::NeedEnvironment {
+            seed,
+            intent,
+            deadline_us,
+        } => {
+            if args.phase != ImagePhase::Forward {
+                return Err(std::io::Error::other("cold rollback refused"));
+            }
+            let raw = std::env::vars_os().collect::<Vec<_>>();
+            let cwd = std::env::current_dir()?;
+            let env = local_environment(&raw)?;
+            let facts =
+                native_act::ColdEnvironmentFacts::observe_for_command(&env, &intent, &seed, &cwd)
+                    .ok_or_else(|| std::io::Error::other("cold environment facts unavailable"))?;
+            let Reply::ResolvedLaunch {
+                command,
+                deadline_us: resolved_deadline,
+            } = native_act::exchange(
+                &mut client,
+                &args.session,
+                &Request::Resolve(args.binding.clone(), args.phase, facts),
+            )?
+            else {
+                return Err(std::io::Error::other("cold launch was not admitted"));
+            };
+            if resolved_deadline != deadline_us || !seed.cold_resolution_agrees(&command) {
+                return Err(std::io::Error::other("cold launch intent changed"));
+            }
+            inherited = Some(raw);
+            (command, deadline_us)
+        }
+        _ => return Err(std::io::Error::other("native launcher was not admitted")),
     };
     #[cfg(debug_assertions)]
     if let Some(hook) = hook {
         hook(FixtureStage::AfterAttach, args.phase)?;
     }
-    // All preparation happens before Execute. No shell text is parsed, no new argv/env is
-    // supplied by this child, and the host has already registered its exact birth/death watch.
+    // All preparation happens before Execute. The child supplies only interpreted account
+    // facts, never a command or argv. Its raw environment stays local; the host has already
+    // registered its exact birth/death watch and selects the permitted export delta.
     if Image::at(std::path::Path::new(&command.program)).as_ref() != Some(&command.image)
-        || command
-            .env
-            .iter()
-            .any(|(name, value)| std::env::var(name).ok().as_deref() != Some(value.as_str()))
-        || command
-            .unset
-            .as_ref()
-            .is_some_and(|names| names.iter().any(|name| std::env::var_os(name).is_some()))
+        || inherited.is_none()
+            && (command
+                .env
+                .iter()
+                .any(|(name, value)| std::env::var(name).ok().as_deref() != Some(value.as_str()))
+                || command
+                    .unset
+                    .as_ref()
+                    .is_some_and(|names| names.iter().any(|name| std::env::var_os(name).is_some())))
     {
         return Err(std::io::Error::other("native launch context changed"));
     }
     let mut exec = aterm_uds::spawnfd::transparent(&command.program);
     exec.args(&command.argv);
+    if let Some(mut raw) = inherited {
+        if let Some(names) = &command.unset {
+            raw.retain(|(name, _)| {
+                !names
+                    .iter()
+                    .any(|unset| name == std::ffi::OsStr::new(unset))
+            });
+        }
+        for (name, value) in &command.env {
+            raw.retain(|(key, _)| key != std::ffi::OsStr::new(name));
+            raw.push((OsString::from(name), OsString::from(value)));
+        }
+        exec.env_exactly(raw);
+    }
     let exec = exec.prepare_exec()?;
     let Reply::Execute {
         deadline_us: original,
@@ -178,4 +247,23 @@ pub fn fixture_entry(
         let _terminal = run(args, Some(hook));
     }
     Some(ExitCode::from(126))
+}
+
+#[cfg(test)]
+mod cold_environment_tests {
+    use super::*;
+    #[test]
+    fn owned_environment_rejects_duplicate_names_without_disclosing_values() {
+        assert_eq!(local_environment(&[]).unwrap(), Vec::<String>::new());
+        let raw = vec![(OsString::from("PROBE"), OsString::from("first"))];
+        assert_eq!(local_environment(&raw).unwrap(), ["PROBE=first"]);
+        let mut duplicate = raw;
+        duplicate.push((
+            OsString::from("PROBE"),
+            OsString::from("different-private-value"),
+        ));
+        let refusal = local_environment(&duplicate).unwrap_err().to_string();
+        assert!(!refusal.contains("different-private-value"));
+        assert!(local_environment(&[(OsString::from("bad=name"), OsString::new())]).is_err());
+    }
 }

@@ -345,7 +345,8 @@ pub(super) fn run(
         ),
         None => (
             materialized(&paths.home, &names)?,
-            aterm_secrets::client::swarm_roster(paths).ok().flatten(),
+            aterm_secrets::client::swarm_roster_until(paths, crate::admission::deadline())
+                .map_err(crate::table::failure)?,
         ),
     };
     let rendered = rendered(vendors, &lab, &places, &current)?;

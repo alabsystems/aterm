@@ -19,9 +19,7 @@
 //! cell no more for that.
 
 use super::*;
-use crate::supervise::policy::turn_end::{
-    MENU_DIVERTS, OWN_WORDS_STAND, PERSON_TYPING, SEARCH_DIVERTS,
-};
+use crate::supervise::policy::turn_end::{OWN_WORDS_STAND, PERSON_TYPING, SEARCH_DIVERTS};
 
 const SAID: &str = "Stage 1 is in.";
 const HINT: &str = "keep going, then merge when ready";
@@ -1641,15 +1639,16 @@ fn the_loop_and_the_upgrade_gate_read_one_screen_alike() {
     }
 }
 
-/// A PERSON'S DRAFT OVER A MENU ITS ENTER WOULD RUN HOLDS ITS GRACE AND IS ASKED ABOUT: a person's
-/// `/config` over Claude Code's slash menu with `/update-config` selected (its Enter would run the
-/// selection: `Composer::Diverted`), no key measured, standing for good, or redrawn the same at new
-/// seqs 20 s and 40 s on. Its grace is waited out at the wait's pace, the point is asked about
-/// (`MENU_DIVERTS`) once it is out, and nothing is ever sent.
-/// NEGATIVE CONTROL: the policy reading a draft over a menu as `Composer::Typed` (`over_menu`
-/// ignored), and the draft step sends it with its Enter on the selection.
+/// A PERSON'S SLASH DRAFT OVER A MENU ITS ENTER WOULD RUN HOLDS ITS GRACE AND STANDS AS THEIR
+/// COMMAND (v6 §14.17.5.8): a person's `/config` over Claude Code's slash menu with
+/// `/update-config` selected (its Enter would run the selection), no key measured, standing for
+/// good, or redrawn the same at new seqs 20 s and 40 s on. Its grace is waited out at the wait's
+/// pace, and past it the draft is the person's command whatever the menu selects: held quietly
+/// (`HOLD … why=command`, once), never asked about (no `MENU_DIVERTS`) and never sent.
+/// NEGATIVE CONTROL: the reading's command form ignored over a menu (`over_menu` alone, as before
+/// the slice): the point is asked about, `MENU_DIVERTS`.
 #[test]
-fn a_draft_over_a_menu_its_enter_would_run_holds_its_grace_and_is_asked_about() {
+fn a_slash_draft_over_a_menu_its_enter_would_run_holds_its_grace_and_stands_as_a_command() {
     use aterm_phase::prompt::fixtures::{
         SLASH_MENU_CONFIG_2_1_268, SLASH_MENU_CONFIG_DOWN_CELLS_2_1_268, cells, screen,
     };
@@ -1689,34 +1688,33 @@ fn a_draft_over_a_menu_its_enter_would_run_holds_its_grace_and_is_asked_about() 
         m.stall_sleep = Some(Duration::from_secs(3600));
         m.exit_when = Some(acted_or_asked);
         let tag = if redrawn {
-            "draft-held-diverted-redrawn"
+            "draft-held-command-redrawn"
         } else {
-            "draft-held-diverted"
+            "draft-held-command"
         };
         let t = held_run(tag, m);
         assert_eq!(t.person_waits(), 1, "{tag}: {}", t.evidence());
         let seen = t.first_read_of(1);
-        let told =
-            t.m.attention_at
-                .unwrap_or_else(|| panic!("{tag}: asked about: {}", t.evidence()));
         assert!(
-            told >= seen + Duration::from_secs(119),
-            "{tag}: asked {:?} after the draft was first read, inside its grace: {}",
-            told.saturating_duration_since(seen),
+            !t.m.requests
+                .iter()
+                .any(|r| r.starts_with("meta set attention")),
+            "{tag}: never asked about: {}",
             t.evidence()
         );
-        let reason = &MENU_DIVERTS[..60];
-        assert!(
-            t.m.requests
+        assert_eq!(
+            t.journal
                 .iter()
-                .any(|r| r.starts_with("meta set attention") && r.contains(reason)),
-            "{tag}: {}",
+                .filter(|l| l.starts_with("HOLD ") && l.contains(" why=command "))
+                .count(),
+            1,
+            "{tag}: held as the person's command: {}",
             t.evidence()
         );
         let reads =
             t.m.read_times
                 .iter()
-                .filter(|(_, at)| (seen..=told).contains(at))
+                .filter(|(_, at)| (seen..=seen + Duration::from_secs(120)).contains(at))
                 .count();
         assert!(
             reads <= 40,
@@ -1810,15 +1808,13 @@ fn history_searches() -> Vec<MeasuredSearch> {
 /// measured, standing for good. Nothing is ever typed or pressed, and the point is asked about with
 /// the search's own reason (`SEARCH_DIVERTS`) at once, never held as an unknown composer: the
 /// search's row is no person's draft, so no person's grace waits on it.
-/// NEGATIVE CONTROLS: `aterm_phase::phase::history_search` reading nothing, and the match is sent with
-/// the loop's Enter once its grace is out, the continuation is typed into the query over nothing, and
-/// the suggestion is held as an unknown composer, asked about by no one; it reading the footer's
-/// first row alone, and the match under the status line is sent; it reading the label only whole on
-/// one row, and the narrow matches are entered after a person's grace and the narrow nothings typed
-/// into; the policy not reading the search
-/// (`TurnEndReading::of_slept`), and all are held as unknown composers, asked about by no one;
-/// `Session::composer_typed` keeping the search's row as a draft seen, and each waits a person's
-/// grace from the loop's own read.
+/// NEGATIVE CONTROLS: `aterm_phase::phase::history_search` reading nothing, and each is held as an
+/// unknown composer, asked about by no one (the cursor under the composer still keeps every key out,
+/// `screen::cursor_under_composer`); the policy not reading the search (`TurnEndReading::of_slept`),
+/// and the same; `Session::composer_typed` keeping the search's row as a draft seen, and each waits a
+/// person's grace from the loop's own read. Without the cursor rule the search's rows are typed into
+/// and its match entered where its label is not read (`a_search_in_a_narrow_window_is_never_pressed_
+/// or_typed_into`).
 #[test]
 fn the_history_search_is_never_pressed_or_typed_into_and_is_asked_about() {
     let reason = &SEARCH_DIVERTS[..60];
@@ -1867,18 +1863,18 @@ fn the_history_search_is_never_pressed_or_typed_into_and_is_asked_about() {
     );
 }
 
-/// A PERSON WHO LEAVES THE SEARCH HAS THE COMPOSER JUDGED AS USUAL: the search open over its match
-/// (doc scene C) at a turn end, no key measured, standing 150 s, past a person's grace, then left
-/// (Esc): the footer back and the composer empty. Nothing is typed or pressed while the search
-/// stands; the continuation is typed once it has gone, with no Enter on the old prompt.
-/// NEGATIVE CONTROLS: `aterm_phase::phase::history_search` reading nothing, and the match is entered
-/// once its grace is out; `Session::draft_look` keeping a diverted hold whatever it reads, and
-/// nothing is typed after the search goes.
+/// A PERSON WHO LEAVES THE SEARCH HAS THE COMPOSER JUDGED AS USUAL: the search open at a turn end,
+/// its query matching nothing over an empty composer (`claude-2.1.318-history-search-no-match`), no
+/// key measured, standing 150 s, past a person's grace, then left with Esc, which keeps what stood
+/// before it (measured, scene E of docs/measured/history-search-narrow-2026-11-04.md): the footer
+/// back and the composer empty. Nothing is typed or pressed while the search stands; the
+/// continuation is typed once it has gone, with no Enter.
+/// NEGATIVE CONTROL: `Session::draft_look` keeping a diverted hold whatever it reads, and nothing is
+/// typed after the search goes.
 #[test]
 fn a_person_who_leaves_the_search_has_the_composer_judged_as_usual() {
-    use aterm_phase::prompt::fixtures::{HISTORY_SEARCH_NO_MATCH_2_1_318, screen};
-    let (_, open, (row, col), cells) = history_searches().swap_remove(0);
-    let mut left = screen(HISTORY_SEARCH_NO_MATCH_2_1_318);
+    let (_, open, (row, col), _) = history_searches().swap_remove(1);
+    let mut left = open.clone();
     let footer = left.len() - 1;
     left[footer] = "  ⏵⏵ auto mode on (shift+tab to cycle)".to_string();
     let caret = left
@@ -1890,7 +1886,6 @@ fn a_person_who_leaves_the_search_has_the_composer_judged_as_usual() {
     m.screen_cols.insert(1, col);
     m.screen_cursors.insert(2, caret);
     m.screen_cols.insert(2, 2);
-    m.cells = cells.into_iter().collect();
     m.timeline = Some((1, vec![Duration::ZERO, Duration::from_secs(150)]));
     m.stall_sleep = Some(Duration::from_secs(3600));
     m.exit_when = Some(acted);
@@ -1905,12 +1900,387 @@ fn a_person_who_leaves_the_search_has_the_composer_judged_as_usual() {
     assert_eq!((t.enters(), t.typed()), (0, 1), "{}", t.evidence());
 }
 
+/// Ends a run at its first write or Enter, or 600 s after its last screen was first read.
+fn acted_or_600s_on(m: &Mock) -> bool {
+    acted(m)
+        || m.read_times
+            .iter()
+            .find(|(i, _)| *i + 1 == m.screens.len())
+            .is_some_and(|(_, at)| run_since(m.waits.as_deref(), *at) >= Duration::from_secs(600))
+}
+
+/// AN OLD PROMPT THE SEARCH LEFT UNEDITED IS ASKED ABOUT AND NEVER ENTERED (finding 2 of the review
+/// of the draft-hold work): Esc accepts the search's match in Claude Code 2.1.318 and Muse Code
+/// 1.4.14 alike, so a person backing out of the search leaves the old prompt in the composer, in typed
+/// ink, the cursor home (measured, `claude-2.1.318-history-search-left`,
+/// `muse-1.4.14-R7309.1-history-search-left`, each with its cells; the search's frames before it are
+/// those screens under the search's measured row, the cursor after its query). Nobody typed it, so
+/// the point is asked about (`RECALL_STANDS`) and nothing is entered or typed for 600 s, in a
+/// 12-column window too, where the match's label stands two cells wide round a blank row
+/// (measured, `claude-2.1.318-history-search-12col`, `-left-12col`). A query that matched nothing
+/// over a person's draft leaves the draft (scene CD, measured), which is theirs: entered once its
+/// grace is out. And a person's edit of the old prompt makes it theirs: asked about while it stood
+/// unedited, it is entered a grace after the edit.
+/// NEGATIVE CONTROLS: `Session::see_draft` not keeping what the search showed, and the old prompt is
+/// entered once its grace is out (scenes CM and CR, measured on `0d3f571d04`); `Searched::seen`
+/// keeping the search's last text whatever the composer held before, and the person's own draft is
+/// asked about and never entered; `Session::left_composer` ignoring what the search left, and the old
+/// prompt is entered; `phase::history_search` ending its footer at the first blank row, and the
+/// 12-column match is entered (lab scene CM at 12 columns, measured on `cdef270607`).
+#[test]
+fn an_old_prompt_the_search_left_unedited_is_asked_about_and_never_entered() {
+    use crate::supervise::policy::turn_end::RECALL_STANDS;
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::{
+        HISTORY_SEARCH_12COL_2_1_318, HISTORY_SEARCH_LEFT_2_1_318,
+        HISTORY_SEARCH_LEFT_12COL_2_1_318, HISTORY_SEARCH_LEFT_12COL_CELLS_2_1_318,
+        HISTORY_SEARCH_LEFT_CELLS_2_1_318, cells, cursor, screen,
+    };
+    let measured = |text: &str| -> Vec<((usize, usize), String)> {
+        cells(text)
+            .into_iter()
+            .map(|(r, c, reply)| ((r, c), reply))
+            .collect()
+    };
+    // Claude Code: the left frame as measured; the search's frame is it with the search's row in
+    // place of the footer's first, the cursor after its query.
+    let left = screen(HISTORY_SEARCH_LEFT_2_1_318);
+    let (caret, home) = cursor(HISTORY_SEARCH_LEFT_2_1_318).expect("a measured cursor");
+    assert_eq!(home, 2);
+    let footer = caret + 2;
+    let mode = "  ⏵⏵ auto mode on (shift+tab to cycle)";
+    assert_eq!(left[footer], mode);
+    let searching = |label: &str, text: &str| {
+        let mut rows = left.clone();
+        rows[caret] = format!("❯ {text}").trim_end().to_string();
+        rows[footer] = format!("  {label}  {}", mode.trim_start());
+        rows
+    };
+    let at = |rows: &[String], text: &str| {
+        let mut rows = rows.to_vec();
+        rows[caret] = format!("❯ {text}").trim_end().to_string();
+        rows
+    };
+    let mut busy_draft = busy_screen();
+    let busy_caret = busy_draft
+        .iter()
+        .position(|r| r.starts_with('❯'))
+        .expect("the caret");
+    let own = "my own words here";
+    busy_draft[busy_caret] = format!("❯ {own}");
+    let old = "alpha old prompt one";
+    let edited = format!("{old} today");
+    // (tag, screens, cursors by screen, the screen whose first read a grace runs from, cells, entered)
+    type Arm = (
+        &'static str,
+        Vec<Vec<String>>,
+        Vec<(usize, usize)>,
+        Option<usize>,
+        Vec<((usize, usize), String)>,
+        bool,
+    );
+    let arms: Vec<Arm> = vec![
+        (
+            "match over nothing, Esc",
+            vec![
+                busy_screen(),
+                searching("search prompts: alpha", old),
+                left.clone(),
+            ],
+            vec![(0, 2), (footer, 23), (caret, 2)],
+            None,
+            measured(HISTORY_SEARCH_LEFT_CELLS_2_1_318),
+            false,
+        ),
+        (
+            "match over a draft, Esc",
+            vec![
+                busy_draft.clone(),
+                searching("search prompts: alpha", old),
+                left.clone(),
+            ],
+            vec![(busy_caret, 2 + own.len()), (footer, 23), (caret, 2)],
+            None,
+            measured(HISTORY_SEARCH_LEFT_CELLS_2_1_318),
+            false,
+        ),
+        (
+            "nothing over a draft, Esc",
+            vec![
+                busy_draft.clone(),
+                searching("no matching prompt: zzq", own),
+                at(&left, own),
+            ],
+            vec![
+                (busy_caret, 2 + own.len()),
+                (footer, 25),
+                (caret, 2 + own.len()),
+            ],
+            None,
+            Vec::new(),
+            true,
+        ),
+        (
+            "match over nothing, Esc, then edited",
+            vec![
+                busy_screen(),
+                searching("search prompts: alpha", old),
+                left.clone(),
+                at(&left, &edited),
+            ],
+            vec![(0, 2), (footer, 23), (caret, 2), (caret, 2 + edited.len())],
+            Some(3),
+            measured(HISTORY_SEARCH_LEFT_CELLS_2_1_318),
+            true,
+        ),
+    ];
+    let recall_asked = |t: &Held| {
+        t.m.requests
+            .iter()
+            .any(|r| r.starts_with("meta set attention") && r.contains(&RECALL_STANDS[..60]))
+    };
+    let mut outcomes = Vec::new();
+    for (tag, screens, cursors, timed, cells, entered) in arms {
+        let n = screens.len();
+        let mut m = fenced(screens);
+        for (i, (row, col)) in cursors.into_iter().enumerate() {
+            m.screen_cursors.insert(i, row);
+            m.screen_cols.insert(i, col);
+        }
+        m.cell_attrs = "none";
+        m.cells = cells.into_iter().collect();
+        let mut offsets = vec![Duration::ZERO, Duration::from_secs(150)];
+        if n == 4 {
+            offsets.push(Duration::from_secs(300));
+        }
+        m.timeline = Some((1, offsets));
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.exit_when = Some(acted_or_600s_on);
+        let t = held_run(&format!("history-search-recall-{tag}"), m);
+        let got = (t.enters(), t.typed(), recall_asked(&t));
+        // The recall edited later is asked about while it stands unedited, then sent a grace
+        // after the edit, the person's own draft.
+        let want = match (entered, timed) {
+            (false, _) => (0, 0, true),
+            (true, None) => (1, 0, false),
+            (true, Some(_)) => (1, 0, true),
+        };
+        if let Some(from) = timed.filter(|_| got == want) {
+            let enter = t.enter_at().expect("the Enter");
+            let from = t.first_read_of(from);
+            assert!(
+                enter >= from + Duration::from_secs(119),
+                "{tag}: entered {:?} after the edit: {}",
+                enter.saturating_duration_since(from),
+                t.evidence()
+            );
+        }
+        outcomes.push((tag, got, want, t.evidence()));
+    }
+    // A grey suggestion the old prompt repeats, the person at the keys while it stands: the search
+    // opened over it with no query (measured, `claude-2.1.318-history-search-over-suggestion`, its
+    // glyphs' cells `999999 … dim`) held no draft before it, so the match Esc leaves is the
+    // search's, though it reads the same words.
+    let grey: std::collections::BTreeMap<(usize, usize), String> = [(2, 'a'), (3, 'l')]
+        .into_iter()
+        .map(|(col, glyph)| ((caret, col), format!("OK {glyph} 999999 111318 dim")))
+        .collect();
+    let mut m = fenced(vec![
+        busy_screen(),
+        left.clone(),
+        searching("search prompts: ", old),
+        searching("search prompts: alpha", old),
+        left.clone(),
+    ]);
+    for (i, (row, col)) in [(0, 2), (caret, 2), (footer, 18), (footer, 23), (caret, 2)]
+        .into_iter()
+        .enumerate()
+    {
+        m.screen_cursors.insert(i, row);
+        m.screen_cols.insert(i, col);
+    }
+    m.cell_attrs = "none";
+    m.cells = measured(HISTORY_SEARCH_LEFT_CELLS_2_1_318)
+        .into_iter()
+        .collect();
+    m.cells_on = [(1, grey.clone()), (2, grey)].into_iter().collect();
+    // The person's keys: Ctrl-R over the suggestion, then the query.
+    m.human_on = [(1, "200"), (2, "200"), (3, "200")].into_iter().collect();
+    m.timeline = Some((
+        1,
+        vec![
+            Duration::ZERO,
+            Duration::from_millis(500),
+            Duration::from_secs(2),
+            Duration::from_secs(152),
+        ],
+    ));
+    m.stall_sleep = Some(Duration::from_secs(3600));
+    m.exit_when = Some(acted_or_600s_on);
+    let t = held_run("history-search-recall-over-suggestion", m);
+    outcomes.push((
+        "a suggestion the match repeats, Esc",
+        (t.enters(), t.typed(), recall_asked(&t)),
+        (0, 0, true),
+        t.evidence(),
+    ));
+    // Claude Code at 12 columns, its match's label two cells wide round a blank row (measured,
+    // `claude-2.1.318-history-search-12col`, then the frame Esc left, `-left-12col`, with its
+    // cells): lab scene CM pressed Enter on it where the label went unread.
+    {
+        let open = screen(HISTORY_SEARCH_12COL_2_1_318);
+        let left = screen(HISTORY_SEARCH_LEFT_12COL_2_1_318);
+        let mut m = fenced(vec![busy_screen(), open, left]);
+        for (i, text) in [
+            (1, HISTORY_SEARCH_12COL_2_1_318),
+            (2, HISTORY_SEARCH_LEFT_12COL_2_1_318),
+        ] {
+            let (row, col) = cursor(text).expect("a measured cursor");
+            m.screen_cursors.insert(i, row);
+            m.screen_cols.insert(i, col);
+        }
+        m.cell_attrs = "none";
+        m.cells = measured(HISTORY_SEARCH_LEFT_12COL_CELLS_2_1_318)
+            .into_iter()
+            .collect();
+        m.timeline = Some((1, vec![Duration::ZERO, Duration::from_secs(150)]));
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.exit_when = Some(acted_or_600s_on);
+        let t = held_run("history-search-recall-12col", m);
+        outcomes.push((
+            "12 columns: match over nothing, Esc",
+            (t.enters(), t.typed(), recall_asked(&t)),
+            (0, 0, true),
+            t.evidence(),
+        ));
+    }
+    // Muse Code: the same, its search's row between the bottom rule and the footer: scoped at 144
+    // columns, its scope dropped at 26 (measured, `muse-1.4.14-R7309.1-history-search-26col`; the
+    // frame Esc left, `-left-26col`, with its cells: the search's frame is it with that row over
+    // the footer, row for row the measured one).
+    let wide = screen(u::HISTORY_SEARCH_LEFT);
+    let (caret, _) = cursor(u::HISTORY_SEARCH_LEFT).expect("cursor");
+    let mut open = wide.clone();
+    open.remove(0);
+    open.insert(
+        caret + 1,
+        "  [everywhere] search prompts: alpha".to_string(),
+    );
+    let narrow = screen(u::HISTORY_SEARCH_LEFT_26COL);
+    let (narrow_caret, _) = cursor(u::HISTORY_SEARCH_LEFT_26COL).expect("cursor");
+    let mut narrow_open = narrow.clone();
+    narrow_open.insert(narrow_caret + 2, "  search prompts: alpha".to_string());
+    narrow_open.pop();
+    for (tag, screens, (row, col), left_at, left_cells) in [
+        (
+            "muse: match over nothing, Esc",
+            vec![screen(u::BUSY_1_4_10), open, wide],
+            (caret + 1, 36),
+            caret,
+            u::HISTORY_SEARCH_LEFT_CELLS,
+        ),
+        (
+            "muse at 26 columns: match over nothing, Esc",
+            vec![screen(u::BUSY_1_4_10), narrow_open, narrow],
+            (narrow_caret + 2, 23),
+            narrow_caret,
+            u::HISTORY_SEARCH_LEFT_26COL_CELLS,
+        ),
+    ] {
+        let mut m = muse_fenced(screens);
+        m.screen_cursors.insert(1, row);
+        m.screen_cols.insert(1, col);
+        m.screen_cursors.insert(2, left_at);
+        m.screen_cols.insert(2, 2);
+        m.cell_attrs = "none";
+        m.cells = measured(left_cells).into_iter().collect();
+        m.timeline = Some((1, vec![Duration::ZERO, Duration::from_secs(150)]));
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.exit_when = Some(acted_or_600s_on);
+        let t = held_run("history-search-recall-muse", m);
+        outcomes.push((
+            tag,
+            (t.enters(), t.typed(), recall_asked(&t)),
+            (0, 0, true),
+            t.evidence(),
+        ));
+    }
+    // A read inside Muse Code's unbracketed redraw: the person's draft whole, the cursor still on
+    // the footer (docs/measured/half-drawn-frame-2026-10-22.md), then placed. No search's row
+    // stands, so no search opened: the draft is theirs, entered a grace after the read that said it
+    // typed.
+    let (short, whole) = ("fix the bu", "fix the bug");
+    let drafted = muse_typed(whole);
+    let caret = aterm_phase::muse::composer(&drafted).expect("the composer");
+    let mut m = muse_fenced(vec![
+        screen(u::BUSY_1_4_10),
+        muse_typed(short),
+        drafted.clone(),
+        drafted.clone(),
+    ]);
+    for (i, (row, col)) in [
+        (caret, 2 + short.len()),
+        (muse_footer(&drafted), 40),
+        (caret, 2 + whole.len()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        m.screen_cursors.insert(i + 1, row);
+        m.screen_cols.insert(i + 1, col);
+    }
+    m.cell_attrs = "none";
+    m.timeline = Some((
+        1,
+        vec![
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ],
+    ));
+    m.stall_sleep = Some(Duration::from_secs(3600));
+    m.exit_when = Some(acted_or_600s_on);
+    let t = held_run("history-search-muse-half-drawn", m);
+    let got = (t.enters(), t.typed(), recall_asked(&t));
+    if got == (1, 0, false) {
+        let enter = t.enter_at().expect("the Enter");
+        let from = t.first_read_of(3);
+        assert!(
+            enter >= from + Duration::from_secs(119),
+            "muse half-drawn: entered {:?} after the read that said typed: {}",
+            enter.saturating_duration_since(from),
+            t.evidence()
+        );
+    }
+    outcomes.push((
+        "muse: a draft read inside the redraw, the cursor on the footer",
+        got,
+        (1, 0, false),
+        t.evidence(),
+    ));
+    let wrong: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, got, want, _)| got != want)
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "(enters, typed, asked) of each: {:#?}\n{:#?}",
+        outcomes
+            .iter()
+            .map(|(tag, got, want, _)| (tag, got, want))
+            .collect::<Vec<_>>(),
+        wrong
+            .iter()
+            .map(|(tag, _, _, evidence)| (tag, evidence))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// THE UPGRADE GATE NEVER READS THE SEARCH AS AN EMPTY COMPOSER (`upgrade::composer_is_empty`, which
 /// the Claude upgrade's typing and the window's own `/` commands go through): over every measured
 /// search of `history_searches`, each with its measured cursor and its first glyph's ink.
-/// NEGATIVE CONTROLS: `composer_is_empty` not asking `history_search`, and over nothing it reads
-/// empty; `history_search` reading the label only whole on one row, and over nothing in a narrow
-/// window it reads empty.
+/// NEGATIVE CONTROL: `screen::composer_holds_no_draft` without its cursor rule
+/// (`cursor_under_composer`), and over nothing it reads empty.
 #[test]
 fn the_upgrade_gate_never_reads_the_history_search_as_an_empty_composer() {
     for (tag, rows, at, cells) in history_searches() {
@@ -1928,10 +2298,10 @@ fn the_upgrade_gate_never_reads_the_history_search_as_an_empty_composer() {
 /// no key measured; then left (Esc), the composer empty and the cursor home. While the search stands
 /// the door's read at a write finds no composer it could type into; once it has gone nothing holds
 /// the break's lines as a draft.
-/// NEGATIVE CONTROLS: `Session::composer_draft` not asking `history_search`, and the door reads the
-/// search's empty row as an empty composer to type into; `Session::composer_typed` keeping the
-/// search's row as a draft seen, and the break's guards hold an empty draft after the search has
-/// gone.
+/// NEGATIVE CONTROLS: `Session::composer_draft` without the cursor rule (`Screen::cursor_under`), and
+/// the door reads the search's empty row as an empty composer to type into; `Session::composer_typed`
+/// keeping the search's row as a draft seen, and the break's guards hold an empty draft after the
+/// search has gone.
 #[test]
 fn a_search_left_at_a_break_leaves_no_draft_behind() {
     let (closed, caret) = at_break("");
@@ -1953,10 +2323,9 @@ fn a_search_left_at_a_break_leaves_no_draft_behind() {
     let searching = s.screen().expect("the search");
     s.host_steps_in_background(&searching, &mut since, Some(&opts.policy), &mut Alone)
         .expect("the break's step");
-    assert_eq!(
+    assert!(
         s.door_draft(&searching),
-        None,
-        "the door's read of the search"
+        "the door's read of the search: no empty composer"
     );
     let left = s.screen().expect("the search left");
     s.host_steps_in_background(&left, &mut since, Some(&opts.policy), &mut Alone)
@@ -1964,7 +2333,7 @@ fn a_search_left_at_a_break_leaves_no_draft_behind() {
     let guards = s.occupancy_guards(s.fx.mono(), &opts.policy, &left.rows);
     assert_eq!(
         (guards.draft, s.door_draft(&left)),
-        (false, Some(false)),
+        (false, false),
         "held after the search went: seen {:?}",
         s.draft_seen
     );
@@ -2753,7 +3122,7 @@ fn a_persons_draft_that_begins_the_loops_own_line_is_theirs() {
         m.cursor_col = Some(2 + seen.chars().count());
         let mut s = virtual_session(&mut m, None);
         s.set_clock(TEST_NOW, PDT);
-        s.own_line = Some(OwnLine::of(own, OwnBy::Line));
+        s.own_line = Some(OwnLine::of(own, OwnBy::Line, None));
         let _ = s.screen().expect("the read of the composer");
         assert!(s.draft_seen.is_some(), "{seen:?}: the read sees it");
         assert_eq!(
@@ -2774,4 +3143,204 @@ fn a_persons_draft_that_begins_the_loops_own_line_is_theirs() {
             "{seen:?} under the line held {own:?}"
         );
     }
+}
+
+/// THE DOOR READS A COMPOSER ONCE, ASKING A CELL ONLY WHERE THE ROWS CANNOT SAY (finding 4 of the
+/// review of the draft-hold work): `left_seen` read the composer by its rows (`draft_read`) and again
+/// by the door's read (`Session::door_draft`), and the door's guards read it that second way alone,
+/// which asked the glyph's cell over a line the rows already said was typed. One read now serves both,
+/// asking what the measured looks need (`docs/measured/composer-cells-2026-11-03.md`): a typed line,
+/// the cursor past it, no cell; the same line home under Claude Code's drawn caret, two (inverse, then
+/// plain: typed); a suggestion home, two (inverse, then dim: none); an empty composer, none; the
+/// prompt-history search, none (its cursor under the composer, `claude-2.1.318-history-search-no-
+/// match`). `left_seen` says what the door's read says and asks what it asks.
+/// NEGATIVE CONTROL: `door_draft` without its `draft_read` arm, and the typed line with the cursor past
+/// it asks its cell at each read.
+#[test]
+fn the_doors_read_asks_a_cell_only_where_the_rows_cannot_say() {
+    use crate::supervise::facts::LeftLook;
+    use aterm_phase::prompt::fixtures::{HISTORY_SEARCH_NO_MATCH_2_1_318, cursor, screen};
+    type Look<'a> = (
+        &'a str,
+        Vec<String>,
+        (usize, usize),
+        Vec<((usize, usize), &'a str)>,
+        bool,
+        usize,
+    );
+    let (empty, caret) = at_break("");
+    let typed = at_break("hello there").0;
+    let suggested = at_break("run the whole test suite again").0;
+    let looks: [Look<'_>; 5] = [
+        (
+            "typed, the cursor past it",
+            typed.clone(),
+            (caret, 13),
+            Vec::new(),
+            true,
+            0,
+        ),
+        (
+            "typed, home",
+            typed,
+            (caret, 2),
+            vec![
+                ((caret, 2), "OK h 111318 d0d0d0 inverse"),
+                ((caret, 3), "OK e d0d0d0 111318 none"),
+            ],
+            true,
+            2,
+        ),
+        (
+            "a suggestion, home",
+            suggested,
+            (caret, 2),
+            vec![
+                ((caret, 2), "OK r 111318 d0d0d0 inverse"),
+                ((caret, 3), "OK u 999999 111318 dim"),
+            ],
+            false,
+            2,
+        ),
+        ("empty", empty, (caret, 2), Vec::new(), false, 0),
+        (
+            "the search",
+            screen(HISTORY_SEARCH_NO_MATCH_2_1_318),
+            cursor(HISTORY_SEARCH_NO_MATCH_2_1_318).expect("a measured cursor"),
+            Vec::new(),
+            true,
+            0,
+        ),
+    ];
+    let mut outcomes = Vec::new();
+    for (look, rows, (row, col), cells, draft, asked) in looks {
+        let mut m = Mock::new(vec![rows]);
+        m.screen_cursors.insert(0, row);
+        m.screen_cols.insert(0, col);
+        m.cell_attrs = "none";
+        m.cells = cells
+            .into_iter()
+            .map(|(at, reply)| (at, reply.to_string()))
+            .collect();
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        let scr = s.screen().expect("the look");
+        let asked_now = |s: &Session<'_, Mock>| {
+            s.ctl
+                .requests
+                .iter()
+                .filter(|r| r.split_whitespace().find(|w| !w.starts_with('@')) == Some("cell"))
+                .count()
+        };
+        let before = asked_now(&s);
+        let door = s.door_draft(&scr);
+        let door_cells = asked_now(&s) - before;
+        let left = match s.left_seen(&scr, false) {
+            LeftLook::Read { draft, .. } => draft,
+            other => panic!("{look}: {other:?}"),
+        };
+        let left_cells = asked_now(&s) - before - door_cells;
+        outcomes.push((
+            look,
+            (door, left, door_cells, left_cells),
+            (draft, Some(draft), asked, asked),
+        ));
+    }
+    let wrong: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, got, want)| got != want)
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "(door, left_seen, the door's cells, left_seen's cells): {outcomes:#?}"
+    );
+}
+
+/// A SEARCH IN A NARROW WINDOW IS NEVER PRESSED OR TYPED INTO (finding 5 of the review of the
+/// draft-hold work, and finding 7's Claude Code under 22 columns): measured in the real-Claude lab on
+/// 2.1.318 at 22, 14 and 12 columns (`claude-2.1.318-history-search-22col`, `-14col`,
+/// `-no-match-14col`, `-no-match-12col`, each with its cursor), the search's label wraps down its own
+/// column, and the no-match frames at 14 and 12 columns have a blank row inside it, the space
+/// between two of its words, which `phase::history_search` reads across. Its
+/// cursor stands under the composer's bottom rule, as on every measured search and on no other measured
+/// screen (`screen::cursor_under_composer`), so the composer reads as neither an empty one to type into
+/// nor a person's draft to send: nothing is pressed or typed for 600 s, and the upgrade's gate reads no
+/// empty composer.
+/// NEGATIVE CONTROL: `Session::composer_draft` without the cursor rule, and the 12-column search's
+/// empty row reads as an empty composer: the loop's continuation is typed into the search.
+#[test]
+fn a_search_in_a_narrow_window_is_never_pressed_or_typed_into() {
+    use aterm_phase::prompt::fixtures::{
+        HISTORY_SEARCH_14COL_2_1_318, HISTORY_SEARCH_22COL_2_1_318,
+        HISTORY_SEARCH_NO_MATCH_12COL_2_1_318, HISTORY_SEARCH_NO_MATCH_14COL_2_1_318, cursor,
+        screen,
+    };
+    let mut outcomes = Vec::new();
+    for (tag, text) in [
+        ("22col", HISTORY_SEARCH_22COL_2_1_318),
+        ("14col", HISTORY_SEARCH_14COL_2_1_318),
+        ("no-match-14col", HISTORY_SEARCH_NO_MATCH_14COL_2_1_318),
+        ("no-match-12col", HISTORY_SEARCH_NO_MATCH_12COL_2_1_318),
+    ] {
+        let rows = screen(text);
+        let at = cursor(text).expect("a measured cursor");
+        let gate = crate::harness::upgrade::composer_is_empty(&rows, Some(at), false);
+        let mut m = fenced(vec![busy_screen(), rows]);
+        m.screen_cursors.insert(1, at.0);
+        m.screen_cols.insert(1, at.1);
+        m.cell_attrs = "none";
+        m.timeline = Some((1, vec![Duration::ZERO]));
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.exit_when = Some(acted_or_600s_on);
+        let t = held_run(&format!("narrow-search-{tag}"), m);
+        outcomes.push((tag, (t.enters(), t.typed(), gate), t.evidence()));
+    }
+    let wrong: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, got, _)| *got != (0, 0, false))
+        .collect();
+    assert!(wrong.is_empty(), "(enters, typed, the gate): {wrong:#?}");
+}
+
+/// MUSE CODE'S SEARCH IN A NARROW WINDOW IS NEVER PRESSED OR TYPED INTO (finding 7 of the review of
+/// the draft-hold work): measured on Muse Code 1.4.14 at 34, 26 and 22 columns
+/// (`muse-1.4.14-R7309.1-history-search-no-match-34col`, `-26col`, `-no-match-22col`, each with its
+/// cursor), the search's row drops its scope, or is cut from the left at 22. Muse's reader takes that
+/// lone row between the bottom rule and the footer for the search's (`muse::is_lone_search_row`), so
+/// the point asks the search's own question at once (`SEARCH_DIVERTS`) and nothing is pressed or
+/// typed for 600 s (the upgrade's gate on the same frames is
+/// `the_gate_reads_the_cursor_as_the_loop_does`'s).
+/// NEGATIVE CONTROL: `is_lone_search_row` taking the scoped row alone, and the frames read as none:
+/// held, asked about by no one.
+#[test]
+fn a_muse_search_in_a_narrow_window_is_never_pressed_or_typed_into() {
+    use crate::supervise::policy::turn_end::SEARCH_DIVERTS;
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::{cursor, screen};
+    let mut outcomes = Vec::new();
+    for (tag, text) in [
+        ("no-match-34col", u::HISTORY_SEARCH_NO_MATCH_34COL),
+        ("26col", u::HISTORY_SEARCH_26COL),
+        ("no-match-22col", u::HISTORY_SEARCH_NO_MATCH_22COL),
+    ] {
+        let rows = screen(text);
+        let at = cursor(text).expect("a measured cursor");
+        let mut m = muse_fenced(vec![screen(u::BUSY_1_4_10), rows]);
+        m.screen_cursors.insert(1, at.0);
+        m.screen_cols.insert(1, at.1);
+        m.cell_attrs = "none";
+        m.timeline = Some((1, vec![Duration::ZERO]));
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.exit_when = Some(acted_or_600s_on);
+        let t = held_run(&format!("narrow-muse-search-{tag}"), m);
+        let asked =
+            t.m.requests
+                .iter()
+                .any(|r| r.starts_with("meta set attention") && r.contains(&SEARCH_DIVERTS[..60]));
+        outcomes.push((tag, (t.enters(), t.typed(), asked), t.evidence()));
+    }
+    let wrong: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, got, _)| *got != (0, 0, true))
+        .collect();
+    assert!(wrong.is_empty(), "(enters, typed, asked): {wrong:#?}");
 }

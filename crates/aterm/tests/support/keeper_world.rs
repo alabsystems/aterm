@@ -410,9 +410,11 @@ pub fn ledger_dir(root: &Path) -> PathBuf {
 }
 
 /// What every request to a recovered instance answers while an old journal the keeper
-/// may still offer has no accepted successor (`keeper_link::RecoveryCountAdmission`):
-/// the instance serves nothing and closes the connection until the keeper confirms it
-/// read each adopted session's new journal (its SYNC answer behind the COMPANION).
+/// may still offer is not confirmed retired (`keeper_link::RecoveryCountAdmission`):
+/// the instance serves nothing and closes the connection until, for each journal its
+/// boot offers carried, the keeper answers the SYNC behind the frame that settled it:
+/// the adopting session's new journal (its COMPANION), its COMPANION_RELEASE when it has
+/// none, or the master's RELEASE when no session kept it or the session closed first.
 pub const FENCED: &str = "ERR recovery-count-custody unconfirmed";
 
 /// A connection to the instance at `sock` once its recovery-count fence has lifted

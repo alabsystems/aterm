@@ -77,8 +77,12 @@ pub const STORE_WINDOW: (u64, u64) = (LEGACY_PIN_CEILING, crate::vendor_direct::
 /// One `codex-package.json`'s entrypoint (relative to the root).
 #[must_use]
 pub fn package_entrypoint(text: &str) -> Option<PathBuf> {
-    use std::path::Component;
     let v: aterm_json::Value = aterm_json::from_str(text).ok()?;
+    package_entrypoint_value(&v)
+}
+
+fn package_entrypoint_value(v: &aterm_json::Value) -> Option<PathBuf> {
+    use std::path::Component;
     if v.get("layoutVersion").and_then(aterm_json::Value::as_u64) != Some(1) {
         return None;
     }
@@ -134,16 +138,25 @@ pub fn regular_entry_under(root: &Path, entry: &Path) -> bool {
     false
 }
 
-/// The package root `root`'s manifest text and entrypoint, read bounded and never through a
+/// The package root `root`'s parsed manifest and entrypoint, read bounded and never through a
 /// link.
-fn manifest_of(root: &Path) -> Option<(String, PathBuf)> {
+fn manifest_of(root: &Path) -> Option<(aterm_json::Value, PathBuf)> {
     let text = crate::metadata_io::read_bounded_regular_utf8(
         &root.join(PACKAGE_JSON),
         MAX_PACKAGE_JSON_BYTES,
     )
     .ok()?;
-    let entry = package_entrypoint(&text)?;
-    Some((text, entry))
+    let v: aterm_json::Value = aterm_json::from_str(&text).ok()?;
+    let entry = package_entrypoint_value(&v)?;
+    Some((v, entry))
+}
+
+fn validated_manifest_of(root: &Path) -> Option<(aterm_json::Value, PathBuf)> {
+    let (v, entry) = manifest_of(root)?;
+    (regular_entry_under(root, &entry)
+        && std::fs::symlink_metadata(root.join(ALAB_BUILD_JSON))
+            .is_ok_and(|m| m.file_type().is_file() && !crate::platform::is_reparse(&m)))
+    .then_some((v, entry))
 }
 
 /// The entrypoint package root `root`'s manifest names ([`package_entrypoint`]).
@@ -152,28 +165,29 @@ pub fn entrypoint_of(root: &Path) -> Option<PathBuf> {
     manifest_of(root).map(|(_, entry)| entry)
 }
 
+/// The entrypoint of `root` when `root` is a valid ALab package ([`is_alab_package`]).
+#[must_use]
+pub fn validated_entrypoint_of(root: &Path) -> Option<PathBuf> {
+    validated_manifest_of(root).map(|(_, entry)| entry)
+}
+
 /// Whether `root` is an ALAB PACKAGE.
 #[must_use]
 pub fn is_alab_package(root: &Path) -> bool {
-    let Some((_, entry)) = manifest_of(root) else {
-        return false;
-    };
-    regular_entry_under(root, &entry)
-        && std::fs::symlink_metadata(root.join(ALAB_BUILD_JSON))
-            .is_ok_and(|m| m.file_type().is_file() && !crate::platform::is_reparse(&m))
+    validated_manifest_of(root).is_some()
+}
+
+fn package_version_value(v: &aterm_json::Value) -> Option<String> {
+    let version = v.get("version")?.as_str()?;
+    (!version.is_empty() && version.len() <= 128 && version.bytes().all(|b| b.is_ascii_graphic()))
+        .then(|| version.to_string())
 }
 
 /// The version an ALab package says it is (`codex-package.json`'s `version`), verbatim.
 #[must_use]
 pub fn package_version(root: &Path) -> Option<String> {
-    if !is_alab_package(root) {
-        return None;
-    }
-    let (text, _) = manifest_of(root)?;
-    let v: aterm_json::Value = aterm_json::from_str(&text).ok()?;
-    let version = v.get("version")?.as_str()?;
-    (!version.is_empty() && version.len() <= 128 && version.bytes().all(|b| b.is_ascii_graphic()))
-        .then(|| version.to_string())
+    let (v, _) = validated_manifest_of(root)?;
+    package_version_value(&v)
 }
 
 /// A CODEX-ALAB VERSION, in one of the four shapes codex-alab's `alab/package.sh` mints
@@ -327,7 +341,8 @@ pub fn exe_is_alab(exe: &Path) -> bool {
 /// of the running image's compiled identity or supervisor authority.
 #[must_use]
 pub fn package_version_of_exe(exe: &Path) -> Option<String> {
-    package_version(&alab_root_of_exe(exe)?)
+    let (_, v) = alab_root_and_manifest_of_exe(exe)?;
+    package_version_value(&v)
 }
 
 /// The recorded ALab package version of the executable that `program`'s current development link
@@ -343,17 +358,16 @@ pub fn linked_package_version(layout: &Layout, program: &str) -> Option<String> 
 
 /// The ALab package root whose entrypoint IS `exe` ([`exe_is_alab`]'s reading), canonical.
 pub(crate) fn alab_root_of_exe(exe: &Path) -> Option<PathBuf> {
+    alab_root_and_manifest_of_exe(exe).map(|(root, _)| root)
+}
+
+fn alab_root_and_manifest_of_exe(exe: &Path) -> Option<(PathBuf, aterm_json::Value)> {
     let exe = std::fs::canonicalize(exe).ok()?;
-    exe.ancestors()
-        .skip(1)
-        .take(2)
-        .find(|root| {
-            is_alab_package(root)
-                && entrypoint_of(root)
-                    .and_then(|entry| std::fs::canonicalize(root.join(entry)).ok())
-                    .is_some_and(|entry| entry == exe)
-        })
-        .map(Path::to_path_buf)
+    exe.ancestors().skip(1).take(2).find_map(|root| {
+        let (v, entry) = validated_manifest_of(root)?;
+        let canon_entry = std::fs::canonicalize(root.join(entry)).ok()?;
+        (canon_entry == exe).then(|| (root.to_path_buf(), v))
+    })
 }
 
 /// The upstream Codex an ALab build is based on, as its [`ALAB_BUILD_JSON`] records it.
@@ -405,6 +419,12 @@ const UPSTREAM_SHORT_COMMIT: usize = 12;
 #[must_use]
 pub fn parse_upstream(text: &str) -> Option<Upstream> {
     let v: aterm_json::Value = aterm_json::from_str(text).ok()?;
+    parse_upstream_value(&v)
+}
+
+/// [`parse_upstream`] over an already-parsed `alab-build.json` [`aterm_json::Value`].
+#[must_use]
+pub fn parse_upstream_value(v: &aterm_json::Value) -> Option<Upstream> {
     let upstream = v.get("upstream")?;
     let release = upstream.get("release")?.as_str()?;
     let commit = upstream.get("commit")?.as_str()?;
@@ -560,7 +580,7 @@ pub fn active_alab_build(layout: &Layout, program: &str, triple: &str) -> Option
     if !agent(program)?.serves(triple) {
         return None;
     }
-    let by_shim = crate::ops::active_builds(layout).get(program).copied();
+    let by_shim = crate::ops::active_build_of(layout, program);
     by_shim
         .or_else(|| current_build(layout, program))
         .filter(|build| build_is_alab(layout, program, *build))
@@ -577,14 +597,9 @@ pub fn current_build(layout: &Layout, program: &str) -> Option<u64> {
 /// `program`'s retained ALab store builds below `below`, newest first.
 #[must_use]
 pub fn retained_alab_below(layout: &Layout, program: &str, below: u64) -> Vec<u64> {
-    let mut builds: Vec<u64> = crate::ops::list_installed(layout)
+    let mut builds: Vec<u64> = crate::ops::list_installed_for(layout, program)
         .into_iter()
-        .filter(|(p, b)| p == program && *b < below)
-        .map(|(_, b)| b)
-        .filter(|b| {
-            let dir = layout.build_dir(program, *b);
-            crate::store::build_is_complete(&dir) && build_is_alab(layout, program, *b)
-        })
+        .filter(|b| *b < below && build_is_alab(layout, program, *b))
         .collect();
     builds.sort_unstable_by(|a, b| b.cmp(a));
     builds

@@ -84,11 +84,22 @@ impl Transcript {
         match &self.sink {
             Sink::Stdout => println!("{line}"),
             Sink::File(path) => {
-                let ok = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .and_then(|mut f| writeln!(f, "{line}"));
+                let mut opts = std::fs::OpenOptions::new();
+                opts.create(true).append(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+                }
+                let ok = opts.open(path).and_then(|mut f| {
+                    if !f.metadata()?.is_file() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "not a regular file",
+                        ));
+                    }
+                    writeln!(f, "{line}")
+                });
                 if let Err(e) = ok {
                     eprintln!("{}: cannot append to {}: {e}", self.me, path.display());
                 }
@@ -132,10 +143,14 @@ fn trim_tail(bytes: &[u8], keep: usize) -> &[u8] {
 }
 
 fn write_staged_new(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    }
+    let mut file = opts.open(tmp)?;
     file.write_all(bytes)
 }
 
@@ -228,7 +243,8 @@ pub fn record_once(
     }
     let message: String = message.replace('\n', " ").chars().take(200).collect();
     let day = utc_day(now_unix);
-    let file = dir.join(format!("notified-{day}"));
+    let today_name = format!("notified-{day}");
+    let file = dir.join(&today_name);
     let seen = crate::identity::read_regular_text(&file, crate::identity::MAX_META_BYTES)
         .unwrap_or_default();
     if seen.lines().any(|l| l == message) {
@@ -239,7 +255,7 @@ pub fn record_once(
             let name = e.file_name();
             let name = name.to_string_lossy();
             if name.starts_with("notified-")
-                && *name != *format!("notified-{day}")
+                && *name != *today_name
                 && e.file_type().is_ok_and(|ft| ft.is_file())
             {
                 let _ = std::fs::remove_file(e.path());
@@ -247,11 +263,22 @@ pub fn record_once(
         }
     }
     let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&file)
-        .and_then(|mut f| writeln!(f, "{message}"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    }
+    let _ = opts.open(&file).and_then(|mut f| {
+        if !f.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        writeln!(f, "{message}")
+    });
     notifier.record(title, &message);
 }
 

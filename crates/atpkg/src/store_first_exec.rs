@@ -103,14 +103,12 @@ fn gate(program: &Path) -> io::Result<Removal> {
         use std::os::windows::fs::OpenOptionsExt as _;
         options.custom_flags(0x0020_0000);
     }
-    let file = options.open(&path)?;
+    let file = aterm_uds::kept_out(|| options.open(&path))?;
     if !file.metadata()?.is_file() || !std::fs::symlink_metadata(&path)?.file_type().is_file() {
         return Err(io::Error::other(
             "first exec gate is not a regular non-link file",
         ));
     }
-    #[cfg(any(unix, windows))]
-    aterm_uds::keep_out_of_children(&file)?;
     let held = crate::lock::Flock::try_lock(file).map_err(|error| match error {
         std::fs::TryLockError::WouldBlock => busy(),
         std::fs::TryLockError::Error(error) => error,

@@ -69,7 +69,6 @@ fn fail(error: impl std::fmt::Display) -> Fail {
 
 fn environment(world: &World, port: u16) -> Vec<(String, String)> {
     let mut env = world.env();
-    env.retain(|(key, _)| key != "ATERM_STATE_HOME" && key != "CI");
     env.push((aterm_net::loopback::SEAM.into(), "1".into()));
     env.push((
         aterm_db::runtime::LOOPBACK_PORT_ENV.into(),
@@ -292,7 +291,7 @@ pub(crate) fn image(window: &Instance, out: &Path, name: &str) -> Result<(), Fai
         .and_then(|body| body.splitn(3, ' ').nth(2));
     match (reply.code, image) {
         (0, Some(image)) => {
-            std::fs::copy(image, out.join(name)).map_err(fail)?;
+            crate::util::copy_regular_file(image, out.join(name)).map_err(fail)?;
             Ok(())
         }
         _ => Err(Fail::die(format!(
@@ -691,13 +690,13 @@ mod tests {
     }
 
     #[test]
-    fn an_ordinary_host_environment_keeps_private_roots_without_suppressing_startup() {
+    fn an_ordinary_host_environment_keeps_its_private_marker_and_guarded_attachment() {
         let mut world = World::new(CONFIG_OFF).unwrap();
         world.keep();
         let env = environment(&world, 49152);
         assert!(
-            !env.iter()
-                .any(|(key, _)| key == "ATERM_STATE_HOME" || key == "CI")
+            env.iter()
+                .any(|(key, value)| key == "ATERM_STATE_HOME" && Path::new(value) == world.state())
         );
         assert!(
             env.iter()

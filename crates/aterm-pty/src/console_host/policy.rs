@@ -412,11 +412,14 @@ pub(crate) fn copy_out(source: &Path, cache: &Path, package: &str) -> io::Result
                 format!("OpenConsole.exe.{pid}.{seq}.partial")
             };
             let candidate = dir.join(name);
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+            }
+            match opts.open(&candidate) {
                 Ok(file) => {
                     opened = Some((candidate, file));
                     break;

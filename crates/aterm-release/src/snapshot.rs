@@ -123,11 +123,7 @@ impl CacheRoot {
             _lock: lock,
         };
         let holder = self.root.join("holder");
-        let _ = fs::remove_file(&holder);
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&holder)
+        crate::durable::create_fresh(&holder)
             .and_then(|mut note| writeln!(note, "pid {}", std::process::id()))
             .map_err(|e| format!("write {}: {e}", holder.display()))?;
         Ok(hold)
@@ -962,16 +958,21 @@ impl Syncer {
     }
 
     fn exact(&mut self, rel: &Path) -> Result<Option<fs::Metadata>, String> {
+        let parent = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        let name = rel
+            .file_name()
+            .ok_or_else(|| format!("refusing the take path {}", rel.display()))?;
+        if let Some(names) = self.names.get(&parent)
+            && names.is_empty()
+        {
+            return Ok(None);
+        }
         let full = self.root.join(rel);
         let meta = match fs::symlink_metadata(&full) {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("inspect {}: {e}", full.display())),
         };
-        let parent = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-        let name = rel
-            .file_name()
-            .ok_or_else(|| format!("refusing the take path {}", rel.display()))?;
         if self.names_in(&parent)?.contains(name) {
             return Ok(Some(meta));
         }
@@ -1137,7 +1138,8 @@ fn set_mode(path: &Path, meta: &fs::Metadata, exec: bool) -> Result<(), String> 
     use std::os::unix::fs::PermissionsExt as _;
     let want = if exec { 0o755 } else { 0o644 };
     if meta.permissions().mode() & 0o7777 != want {
-        fs::set_permissions(path, fs::Permissions::from_mode(want))
+        crate::durable::open_regular_file(path)
+            .and_then(|f| f.set_permissions(fs::Permissions::from_mode(want)))
             .map_err(|e| format!("chmod {}: {e}", path.display()))?;
     }
     Ok(())
@@ -1163,7 +1165,8 @@ fn write_beside(full: &Path, data: &[u8], exec: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(want);
+        open.mode(want)
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
     }
     let mut file = open
         .open(&tmp)
@@ -1311,9 +1314,13 @@ pub fn check_crate_archives(locked: &[LockedCrate], cargo_home: &Path) -> Result
             krate.checksum
         ));
     }
+    let seen_set: BTreeSet<(&str, &str)> = found
+        .iter()
+        .map(|(seen, _, _)| (seen.name.as_str(), seen.version.as_str()))
+        .collect();
     if let Some(missing) = locked
         .iter()
-        .find(|krate| !found.iter().any(|(seen, _, _)| seen.stem() == krate.stem()))
+        .find(|krate| !seen_set.contains(&(krate.name.as_str(), krate.version.as_str())))
     {
         return Err(format!(
             "vendoring left no archive of {} in {}: its vendored bytes come from nothing the \
@@ -1488,18 +1495,19 @@ fn put_tree(sync: &mut Syncer, from: &Path, prefix: &Path) -> Result<(), String>
             let entry = entry.map_err(|e| format!("list {}: {e}", dir.display()))?;
             let path = entry.path();
             let here = rel.join(entry.file_name());
-            let meta = fs::symlink_metadata(&path)
+            let ft = entry
+                .file_type()
                 .map_err(|e| format!("inspect {}: {e}", path.display()))?;
-            if meta.is_dir() {
+            if ft.is_dir() {
                 dirs.push((path, here));
-            } else if meta.is_file() {
-                let data = crate::durable::read_file(&path)
+            } else if ft.is_file() {
+                let (data, meta) = crate::durable::read_file_with_meta(&path)
                     .map_err(|e| format!("read {}: {e}", path.display()))?;
                 sync.put(&here, &data, is_exec(&meta))?;
             } else {
                 return Err(format!(
                     "vendoring left {} at {}: a release builds from regular files only",
-                    if meta.file_type().is_symlink() {
+                    if ft.is_symlink() {
                         "a symbolic link"
                     } else {
                         "a special file"
@@ -1536,19 +1544,20 @@ fn listing(root: &Path) -> Result<Listing, String> {
                 here.push(b'/');
             }
             here.extend_from_slice(&path_bytes(Path::new(&entry.file_name())));
-            let meta = fs::symlink_metadata(&path)
+            let ft = entry
+                .file_type()
                 .map_err(|e| format!("inspect {}: {e}", path.display()))?;
-            let line = if meta.is_dir() {
+            let line = if ft.is_dir() {
                 dirs.push((path, here));
                 continue;
-            } else if meta.file_type().is_symlink() {
+            } else if ft.is_symlink() {
                 let target = fs::read_link(&path)
                     .map_err(|e| format!("read link {}: {e}", path.display()))?;
                 let mut line = b"link\0-\0".to_vec();
                 line.extend_from_slice(&path_bytes(&target));
                 line
-            } else if meta.is_file() {
-                let bytes = crate::durable::read_file(&path)
+            } else if ft.is_file() {
+                let (bytes, meta) = crate::durable::read_file_with_meta(&path)
                     .map_err(|e| format!("read {}: {e}", path.display()))?;
                 let sha = sha256_hex(&bytes);
                 format!("file\0{:o}\0{sha}", file_mode(&meta)).into_bytes()

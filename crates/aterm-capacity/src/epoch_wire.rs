@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Private v2 observations. Parsing data does not construct retirement authority.
+//! Private v4 observations. Parsing data does not construct retirement authority.
 
 use aterm_json::{Value, json};
 use std::{
@@ -11,6 +11,7 @@ use std::{
 
 pub(super) const FRAME: usize = 16 * 1024;
 pub(super) const BUFFER: usize = 64 * 1024;
+pub(super) const VERSION: u64 = 4;
 
 fn bad() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid private epoch frame")
@@ -59,10 +60,16 @@ pub(super) enum Event {
         code: Option<i32>,
         success: bool,
     },
+    Cancelled {
+        id: u32,
+        pid: u32,
+        stopped: bool,
+    },
     Closing,
     Retired {
         withdrawn: u32,
         fifo: PathBuf,
+        finalization: String,
     },
 }
 
@@ -77,7 +84,7 @@ pub(super) fn decode(bytes: &[u8], epoch: &str) -> io::Result<Event> {
     if aterm_json::to_vec(&value).map_err(|_| bad())? != bytes {
         return Err(bad());
     }
-    if value.get("v").and_then(Value::as_u64) != Some(2)
+    if value.get("v").and_then(Value::as_u64) != Some(VERSION)
         || value.get("epoch").and_then(Value::as_str) != Some(epoch)
     {
         return Err(bad());
@@ -144,6 +151,23 @@ pub(super) fn decode(bytes: &[u8], epoch: &str) -> io::Result<Event> {
                 success,
             })
         }
+        Some("cancelled") => {
+            fields(&value, &["v", "epoch", "event", "id", "pid", "state"])?;
+            let stopped = match value.get("state").and_then(Value::as_str) {
+                Some("stopped") => true,
+                Some("already-exited") => false,
+                _ => return Err(bad()),
+            };
+            let pid = number(&value, "pid")?;
+            if pid == 0 {
+                return Err(bad());
+            }
+            Ok(Event::Cancelled {
+                id: number(&value, "id")?,
+                pid,
+                stopped,
+            })
+        }
         Some("closing") => {
             fields(&value, &["v", "epoch", "event"])?;
             Ok(Event::Closing)
@@ -151,15 +175,35 @@ pub(super) fn decode(bytes: &[u8], epoch: &str) -> io::Result<Event> {
         Some("retired") => {
             fields(
                 &value,
-                &["v", "epoch", "event", "withdrawn", "fifo", "scope"],
+                &[
+                    "v",
+                    "epoch",
+                    "event",
+                    "withdrawn",
+                    "fifo",
+                    "scope",
+                    "finalization",
+                ],
             )?;
             if value.get("scope").and_then(Value::as_str) != Some("owned-roots-and-explicit-tokens")
+            {
+                return Err(bad());
+            }
+            let finalization = value
+                .get("finalization")
+                .and_then(Value::as_str)
+                .ok_or_else(bad)?;
+            if finalization.len() != 32
+                || !finalization
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             {
                 return Err(bad());
             }
             Ok(Event::Retired {
                 withdrawn: number(&value, "withdrawn")?,
                 fifo: path(&value, "fifo")?,
+                finalization: finalization.to_owned(),
             })
         }
         _ => Err(bad()),
@@ -184,9 +228,19 @@ pub(super) fn spawn(epoch: &str, id: u32, manifest: &Path, target: &Path) -> io:
         .to_str()
         .filter(|_| target.is_absolute())
         .ok_or_else(bad)?;
-    encode(json!({"v":2,"epoch":epoch,"op":"spawn","id":id,"manifest":manifest,"target":target}))
+    encode(
+        json!({"v":VERSION,"epoch":epoch,"op":"spawn","id":id,"manifest":manifest,"target":target}),
+    )
 }
 
 pub(super) fn close(epoch: &str) -> io::Result<Vec<u8>> {
-    encode(json!({"v":2,"epoch":epoch,"op":"close"}))
+    encode(json!({"v":VERSION,"epoch":epoch,"op":"close"}))
+}
+
+pub(super) fn finalize(epoch: &str, finalization: &str) -> io::Result<Vec<u8>> {
+    encode(json!({"v":VERSION,"epoch":epoch,"op":"finalize","finalization":finalization}))
+}
+
+pub(super) fn cancel(epoch: &str, id: u32) -> io::Result<Vec<u8>> {
+    encode(json!({"v":VERSION,"epoch":epoch,"op":"cancel","id":id}))
 }

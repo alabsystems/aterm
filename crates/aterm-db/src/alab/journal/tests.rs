@@ -545,6 +545,7 @@ fn window_at(paths: &Paths, now: u64) -> ([u8; 16], flush::Window) {
     let session = Session::from_admitted_journal(&bootstrap, journal).unwrap();
     let me = session
         .members()
+        .unwrap()
         .iter()
         .find(|binding| binding.actor() == session.actor())
         .map(|binding| *binding.machine())

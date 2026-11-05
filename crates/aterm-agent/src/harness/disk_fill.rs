@@ -296,9 +296,10 @@ pub mod fault {
     /// One planted defect.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Fault {
-        /// A gone owner's build cache keeps the day's quiet window under a projection, as before
-        /// revision 2: the night's 118.6 GiB of removed worktrees' caches stayed.
-        GoneQuietUnderProjection,
+        /// A gone owner's build cache keeps the day's quiet window, as before 2026-11-05: the
+        /// night's 118.6 GiB of removed worktrees' caches stayed, and on m20 52.8 GiB held a
+        /// verify's disk claim waiting five hours.
+        GoneWaitsTheDay,
         /// Tier 4 under a projection above the floor takes profiles unwritten for ten minutes, not
         /// an hour: a session paused between builds loses its incremental cache.
         TenMinutesOnProjection,

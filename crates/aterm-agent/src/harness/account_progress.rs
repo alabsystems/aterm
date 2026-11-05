@@ -85,6 +85,14 @@ pub struct OwnClaimFinding {
     pub pinned: bool,
 }
 
+/// Separately observed local work, without an account decision or retry promise.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ActiveSignIn {
+    pub label: String,
+    pub route: Option<String>,
+    pub observed_at: i64,
+}
+
 /// An observed session decision, not an instruction to activate credentials.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AccountProgress {
@@ -99,7 +107,11 @@ pub struct AccountProgress {
     pub wall: Option<String>,
     pub details: Vec<String>,
     /// Validated historical provider facts, separate from free-text route records.
+    /// Fresh scoped pool outcomes can accompany a captured decision without renewing it.
     pub login_diagnostics: Vec<super::accounts_sync::LoginDiagnostic>,
+    /// Current scoped sign-in work independent of the retained decision or execution gate.
+    /// An empty observation grants no authority and does not prove other work is absent.
+    pub independent_work: Vec<ActiveSignIn>,
     /// Earliest observed reevaluation or retry event, not a promise of account readiness.
     /// Independent holds on one unchanged account end at their latest deadline; alternatives
     /// and normal decision rechecks contribute their earliest event. A live execution gate
@@ -121,6 +133,7 @@ impl AccountProgress {
             wall: None,
             details: Vec::new(),
             login_diagnostics: Vec::new(),
+            independent_work: Vec::new(),
             next_at: None,
             own_claim: None,
         }

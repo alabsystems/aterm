@@ -6330,14 +6330,7 @@ pub(crate) fn best_named_face(
 }
 
 fn face_in_file(path: &std::path::Path, target: FaceTarget) -> u32 {
-    let collection = {
-        use std::io::Read as _;
-        let mut magic = [0u8; 4];
-        std::fs::File::open(path)
-            .and_then(|mut file| file.read_exact(&mut magic))
-            .is_ok_and(|()| &magic == b"ttcf")
-    };
-    if !collection {
+    if !font_file::is_ttc_font_file(path) {
         return 0;
     }
     font_file::read_font_file(path)

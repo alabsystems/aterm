@@ -3,7 +3,7 @@
 
 //! Durable private crash journals for native documents, keyed by [`JournalDocumentKey`] under [`load_or_mint_journal_secret`] with one-time [`LegacyJournal`] migration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -15,11 +15,13 @@ use crate::document_store::{DocumentId, DocumentSnapshot};
 use crate::durable::Flush;
 use crate::native_document_host::{replace_file, sync_directory};
 use crate::native_document_io::{
-    ContentFingerprint, DraftJournalReducer, DurableCheckpoint, DurableSource, JOURNAL_SECRET_LEN,
-    JournalAppendPlan, JournalAppendProof, JournalAppendResult, JournalDocumentKey, JournalEdit,
-    JournalError, JournalImageGeneration, JournalOwnerId, JournalRecord, JournalReduction,
-    JournalSecret, JournalStage, LegacyJournal, MAX_INSERT_BYTES, MAX_JOURNAL_BYTES,
-    StoredJournalRecovery, compact_journal, encode_journal, recover_journal_for,
+    ContentFingerprint, DraftJournalReducer, DurableCheckpoint, DurableSource, JOURNAL_FRAME_HEAD,
+    JOURNAL_SECRET_LEN, JournalAppendPlan, JournalAppendProof, JournalAppendResult,
+    JournalDocumentKey, JournalEdit, JournalError, JournalImageGeneration, JournalLanding,
+    JournalOwnerId, JournalRecord, JournalReduction, JournalSecret, JournalStage, JournalTail,
+    LegacyJournal, MAX_INSERT_BYTES, MAX_JOURNAL_BYTES, StoredJournalRecovery, compact_journal,
+    encode_journal_image, encode_journal_image_v1, frame_record, journal_is_format_1,
+    recover_journal_for, recover_journal_image_for,
 };
 
 #[cfg(any(unix, windows))]
@@ -53,6 +55,10 @@ mod owner {
         true
     }
 
+    pub(super) fn uniquely_linked(_file: &File) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
     pub(super) fn mark_publication(
         _temporary: &File,
         _temporary_path: &Path,
@@ -66,6 +72,14 @@ mod owner {
 
     pub(super) fn confirm_publication(_path: &Path, _mark: &[u8]) {}
 
+    pub(super) fn mark_append(
+        _path: &Path,
+        _file: &File,
+        _image: ContentFingerprint,
+        _owner: Option<JournalOwnerId>,
+    ) {
+    }
+
     pub(super) fn adopt(_path: &Path, _image: ContentFingerprint, _owner: Option<JournalOwnerId>) {}
 
     pub(super) fn released(_path: PathBuf, _key: JournalDocumentKey) -> Option<Candidate> {
@@ -77,8 +91,12 @@ mod owner {
     }
 }
 
-const COMPACT_RECORDS: usize = 128;
-const COMPACT_BYTES: usize = 16 * 1024 * 1024;
+/// An append that would leave an image of more records than this compacts it instead.
+const COMPACT_RECORDS: u64 = 128;
+/// An append that would leave more than this of deltas after the image's last snapshot
+/// ([`JournalTail::appended_since_snapshot`]) compacts it instead. The snapshots themselves
+/// do not count: a draft larger than this still appends in place.
+const COMPACT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryNotice {
@@ -111,6 +129,12 @@ pub(crate) struct JournalOpenDecision {
     expected_image: JournalImageGeneration,
     /// The keyed image the inspection read holds no draft ([`holds_no_draft`]).
     expected_clean: bool,
+    /// The keyed image the inspection read is format 1 ([`journal_is_format_1`]), so
+    /// [`DraftJournalHost::initialize`] republishes format 1: in an update from an aterm
+    /// before format 2, that outgoing aterm reads the image back after this open (its Commit
+    /// check of the carried draft, and on a rollback its re-seat), and it reads format 1
+    /// alone. The first write after the open publishes format 2.
+    keyed_format_1: bool,
     /// The legacy journal this open read in place of the keyed one.
     legacy: Option<LegacyJournal>,
 }
@@ -121,7 +145,8 @@ pub(crate) struct InitializedJournal {
     pub(crate) path: PathBuf,
     pub(crate) durable_seq: Seq,
     pub(crate) durable_text: Arc<str>,
-    pub(crate) image_fingerprint: ContentFingerprint,
+    /// The image it published, as an appender holds it.
+    pub(crate) tail: JournalTail,
     pub(crate) notice: Option<RecoveryNotice>,
     /// A legacy journal not yet retired.
     legacy: Option<LegacyJournal>,
@@ -140,6 +165,8 @@ pub(crate) struct JournalRewritePlan {
     pub(crate) target_text: Arc<str>,
     pub(crate) bytes: Arc<[u8]>,
     pub(crate) fingerprint: ContentFingerprint,
+    /// [`Self::bytes`]' tail, which appends after the rewrite extend.
+    pub(crate) tail: JournalTail,
     /// Retired before this rewrite publishes ([`LegacyJournal`]).
     pub(crate) retire_legacy: Option<LegacyJournal>,
     /// Named on the image it publishes ([`DraftJournalHost::owner_id`]).
@@ -198,7 +225,9 @@ struct JournalEntry {
     path: PathBuf,
     reducer: DraftJournalReducer,
     durable_text: Arc<str>,
-    durable_image: ContentFingerprint,
+    /// The image this store last published or appended to, held beside the journal: an append
+    /// proves the file is still it from its length and last frame ([`JournalTail`]).
+    image: JournalTail,
     desired: DocumentSnapshot,
     append_text: Option<Arc<str>>,
     next_rewrite_generation: u64,
@@ -265,7 +294,7 @@ pub(crate) enum JournalReseatResult {
     Unchanged,
     /// A fresh image recovering to the plan's target was published.
     Republished {
-        image: ContentFingerprint,
+        image: JournalTail,
         baseline: ContentFingerprint,
         baseline_seq: Seq,
         baseline_is_file: bool,
@@ -315,8 +344,17 @@ pub(crate) enum JournalCompletion {
 pub(crate) struct DocumentJournalStore {
     host: DraftJournalHost,
     entries: BTreeMap<DocumentId, JournalEntry>,
+    /// Open documents that keep no journal ([`Self::decline`]): every write to theirs is a no-op.
+    declined: BTreeSet<DocumentId>,
     /// See [`Self::set_reseat_fenced`].
     reseat_fenced: bool,
+}
+
+/// Whether `canonical_uri` names a private edit's document ([`aterm_types::private_edit`]): one
+/// amacs keeps no draft journal and no closed-buffer recovery of, and serves no `doc read` of.
+pub(crate) fn private_uri(canonical_uri: &str) -> bool {
+    crate::native_document_host::file_uri_path(canonical_uri)
+        .is_ok_and(|path| aterm_types::private_edit::is_private(&path))
 }
 
 impl DocumentJournalStore {
@@ -324,6 +362,7 @@ impl DocumentJournalStore {
         Ok(Self {
             host: DraftJournalHost::system_default()?,
             entries: BTreeMap::new(),
+            declined: BTreeSet::new(),
             reseat_fenced: false,
         })
     }
@@ -333,6 +372,7 @@ impl DocumentJournalStore {
         Ok(Self {
             host: DraftJournalHost::new(root)?,
             entries: BTreeMap::new(),
+            declined: BTreeSet::new(),
             reseat_fenced: false,
         })
     }
@@ -363,7 +403,7 @@ impl DocumentJournalStore {
                     initialized.durable_seq,
                 ),
                 durable_text: initialized.durable_text.clone(),
-                durable_image: initialized.image_fingerprint,
+                image: initialized.tail,
                 desired: current.clone(),
                 append_text: None,
                 next_rewrite_generation: 1,
@@ -458,7 +498,29 @@ impl DocumentJournalStore {
         })
     }
 
+    /// Keep no journal for `document` (a private edit's, [`private_uri`]): remove every journal an
+    /// earlier open of `canonical_uri` left, keyed or legacy, with its preserved copies, lock and
+    /// write temporaries, and from now on take its commits and checkpoints as no-ops and owe it
+    /// no effect. An error leaves the document declined, and names what could not be removed.
+    pub(crate) fn decline(
+        &mut self,
+        document: DocumentId,
+        canonical_uri: &str,
+    ) -> Result<(), String> {
+        self.entries.remove(&document);
+        self.declined.insert(document);
+        self.host.purge(canonical_uri)
+    }
+
+    /// Whether `document` keeps no journal ([`Self::decline`]).
+    pub(crate) fn declined(&self, document: DocumentId) -> bool {
+        self.declined.contains(&document)
+    }
+
     pub(crate) fn observe_commit(&mut self, snapshot: &DocumentSnapshot) -> Result<(), String> {
+        if self.declined(snapshot.id) {
+            return Ok(());
+        }
         let entry = self
             .entries
             .get_mut(&snapshot.id)
@@ -475,6 +537,9 @@ impl DocumentJournalStore {
         checkpoint: DurableCheckpoint,
         saved_text: Arc<str>,
     ) -> Result<(), String> {
+        if self.declined(checkpoint.document) {
+            return Ok(());
+        }
         if !matches!(
             checkpoint.source,
             DurableSource::AtomicFile | DurableSource::StableFileObservation
@@ -509,6 +574,9 @@ impl DocumentJournalStore {
         &mut self,
         document: DocumentId,
     ) -> Result<Option<JournalEffect>, String> {
+        if self.declined(document) {
+            return Ok(None);
+        }
         let reseat_fenced = self.reseat_fenced;
         let Some(entry) = self.entries.get_mut(&document) else {
             return Err("document journal was not initialized".to_string());
@@ -529,7 +597,7 @@ impl DocumentJournalStore {
                 generation,
                 document,
                 key: entry.key,
-                ours: entry.durable_image,
+                ours: entry.image.fingerprint(),
                 baseline: entry.baseline,
                 baseline_seq: entry.baseline_seq,
                 baseline_is_file: entry.baseline_is_file,
@@ -557,7 +625,7 @@ impl DocumentJournalStore {
                 entry.key,
                 generation,
                 entry.reducer.durable_seq(),
-                entry.durable_image,
+                entry.image.fingerprint(),
                 &disk,
                 &entry.desired,
             )
@@ -576,26 +644,21 @@ impl DocumentJournalStore {
         if entry.desired.seq <= entry.reducer.durable_seq() {
             return Ok(None);
         }
-        let mut plan = if entry.desired.seq.0 == entry.reducer.durable_seq().0.saturating_add(1) {
-            let edit = single_edit(&entry.durable_text, &entry.desired.text);
-            if edit.insert.len() <= MAX_INSERT_BYTES {
-                entry
-                    .reducer
-                    .plan_delta(entry.reducer.durable_seq(), entry.desired.seq, vec![edit])
-                    .map_err(|error| format!("could not plan journal delta: {error:?}"))?
-            } else {
-                entry
-                    .reducer
-                    .plan_snapshot(&entry.desired)
-                    .map_err(|error| format!("could not plan journal snapshot: {error:?}"))?
-            }
+        // One edit from the durable text to the head, however many commits coalesced behind the
+        // append in flight: an append writes about what changed, never the whole document.
+        let edit = single_edit(&entry.durable_text, &entry.desired.text);
+        let mut plan = if edit.insert.len() <= MAX_INSERT_BYTES {
+            entry
+                .reducer
+                .plan_delta(entry.reducer.durable_seq(), entry.desired.seq, vec![edit])
+                .map_err(|error| format!("could not plan journal delta: {error:?}"))?
         } else {
             entry
                 .reducer
                 .plan_snapshot(&entry.desired)
                 .map_err(|error| format!("could not plan journal snapshot: {error:?}"))?
         };
-        plan.expected_image = Some(entry.durable_image);
+        plan.expected_tail = Some(entry.image);
         plan.retire_legacy = entry.legacy.clone();
         plan.owner = self.host.owner_id();
         entry.append_text = Some(entry.desired.text.clone());
@@ -623,8 +686,8 @@ impl DocumentJournalStore {
         let Some(entry) = self.entries.get_mut(&document) else {
             return JournalCompletion::Stale;
         };
-        let published_image = match &result {
-            JournalAppendResult::Committed(proof) => Some(proof.published_image),
+        let published = match &result {
+            JournalAppendResult::Committed(proof) => Some(proof.published),
             _ => None,
         };
         match entry.reducer.complete(generation, result) {
@@ -632,8 +695,8 @@ impl DocumentJournalStore {
                 if let Some(text) = entry.append_text.take() {
                     entry.durable_text = text;
                 }
-                if let Some(fingerprint) = published_image {
-                    entry.durable_image = fingerprint;
+                if let Some(published) = published {
+                    entry.image = published;
                 }
                 entry.append_failed = false;
                 entry.legacy = None;
@@ -737,7 +800,7 @@ impl DocumentJournalStore {
                 entry.reducer =
                     DraftJournalReducer::new_with_key(document, entry.key, plan.target_seq);
                 entry.durable_text = plan.target_text;
-                entry.durable_image = plan.fingerprint;
+                entry.image = plan.tail;
                 entry.append_text = None;
                 entry.append_failed = false;
                 entry.legacy = None;
@@ -797,7 +860,7 @@ impl DocumentJournalStore {
                 entry.reducer =
                     DraftJournalReducer::new_with_key(document, entry.key, plan.target_seq);
                 entry.durable_text = plan.target_text;
-                entry.durable_image = image;
+                entry.image = image;
                 entry.baseline = baseline;
                 entry.baseline_seq = baseline_seq;
                 entry.baseline_is_file = baseline_is_file;
@@ -860,6 +923,7 @@ impl DocumentJournalStore {
             .iter()
             .filter_map(|document| {
                 debug_assert!(self.settled(*document));
+                self.declined.remove(document);
                 self.entries.remove(document)
             })
             .collect::<Vec<_>>();
@@ -902,7 +966,9 @@ impl DocumentJournalStore {
     /// The image this store last published for `document`.
     #[cfg(all(test, unix))]
     pub(crate) fn durable_image(&self, document: DocumentId) -> Option<ContentFingerprint> {
-        self.entries.get(&document).map(|entry| entry.durable_image)
+        self.entries
+            .get(&document)
+            .map(|entry| entry.image.fingerprint())
     }
 }
 
@@ -1104,13 +1170,21 @@ pub(crate) fn execute_journal_reseat(
         let found_baseline = existing
             .as_deref()
             .and_then(|bytes| journal_baseline_text(plan.key, bytes));
-        let recovered = existing
-            .as_deref()
-            .and_then(|bytes| recover_journal_for(plan.key, bytes).ok());
-        let holds_nothing_new = recovered.as_ref().is_some_and(|recovered| {
-            recovered.text == *plan.durable_text
-                || recovered.text == *plan.target_text
-                || holds_no_draft(recovered)
+        let recovered = existing.as_deref().and_then(|bytes| {
+            recover_journal_image_for(plan.key, bytes)
+                .ok()
+                .map(|(read, tail)| {
+                    (
+                        read,
+                        tail.is_none_or(|tail| tail.byte_len() == bytes.len() as u64),
+                    )
+                })
+        });
+        let holds_nothing_new = recovered.as_ref().is_some_and(|(recovered, complete)| {
+            *complete
+                && (recovered.text == *plan.durable_text
+                    || recovered.text == *plan.target_text
+                    || holds_no_draft(recovered))
         });
         let preserved = found.exists && !holds_nothing_new;
         if preserved {
@@ -1152,11 +1226,12 @@ pub(crate) fn execute_journal_reseat(
                 )
             }
         };
-        let bytes = encode_journal(&records).map_err(|error| format!("encode: {error:?}"))?;
+        let (bytes, image) =
+            encode_journal_image(&records).map_err(|error| format!("encode: {error:?}"))?;
         atomic_replace_locked(path, &bytes, found, plan.owner)
             .map_err(|error| error.to_string())?;
         Ok(Some(JournalReseatResult::Republished {
-            image: ContentFingerprint::of(&bytes),
+            image,
             baseline: baseline_fingerprint,
             baseline_seq,
             baseline_is_file,
@@ -1273,32 +1348,40 @@ impl DraftJournalHost {
             preserve_existing: false,
             expected_image: JournalImageGeneration::missing(),
             expected_clean: false,
+            keyed_format_1: false,
             legacy: None,
         };
         let keyed = read_journal_image(&path)
             .map_err(|error| format!("could not read recovery journal: {error}"))?;
+        decision.keyed_format_1 = keyed.as_deref().is_some_and(journal_is_format_1);
         let keyed_recovery = keyed.as_deref().map(|bytes| {
             decision.expected_image = JournalImageGeneration::of(bytes);
-            recover_journal_for(key, bytes)
+            recover_journal_image_for(key, bytes).map(|(recovered, tail)| {
+                decision.preserve_existing |=
+                    tail.is_some_and(|tail| tail.byte_len() < bytes.len() as u64);
+                recovered
+            })
         });
-        decision.expected_clean = keyed_recovery
-            .as_ref()
-            .is_some_and(|recovered| recovered.as_ref().is_ok_and(holds_no_draft));
+        decision.expected_clean = !decision.preserve_existing
+            && keyed_recovery
+                .as_ref()
+                .is_some_and(|recovered| recovered.as_ref().is_ok_and(holds_no_draft));
         let legacy_key = JournalDocumentKey::legacy_unkeyed(canonical_uri);
         let legacy_path = self.legacy_path_for(legacy_key);
         let legacy = read_journal_image(&legacy_path)
             .map_err(|error| format!("could not read legacy recovery journal: {error}"))?;
         if let Some(legacy_bytes) = legacy {
             let image = JournalImageGeneration::of(&legacy_bytes);
-            match recover_journal_for(legacy_key, &legacy_bytes) {
-                Ok(recovered) => {
+            match recover_journal_image_for(legacy_key, &legacy_bytes) {
+                Ok((recovered, tail)) => {
+                    let torn = tail.is_some_and(|tail| tail.byte_len() < legacy_bytes.len() as u64);
                     let reading = read_for_open(&recovered, disk_bytes);
                     if reading.made_against_disk || reading.keep_aside {
                         decision.legacy = Some(LegacyJournal {
                             path: legacy_path,
                             image,
                             carried: reading.made_against_disk,
-                            keep_aside: reading.keep_aside,
+                            keep_aside: reading.keep_aside || torn,
                         });
                         let set_aside = keyed_recovery
                             .as_ref()
@@ -1318,7 +1401,7 @@ impl DraftJournalHost {
                         path: legacy_path,
                         image,
                         carried: false,
-                        keep_aside: false,
+                        keep_aside: torn,
                     });
                 }
                 Err(error) => {
@@ -1343,7 +1426,7 @@ impl DraftJournalHost {
         match keyed_recovery {
             Ok(recovered) => {
                 let reading = read_for_open(&recovered, disk_bytes);
-                decision.preserve_existing = reading.keep_aside;
+                decision.preserve_existing |= reading.keep_aside;
                 reading.apply(&mut decision, recovered);
             }
             Err(error) => {
@@ -1369,8 +1452,16 @@ impl DraftJournalHost {
         if current.seq != disk.seq || current.text != disk.text {
             records.push(JournalRecord::snapshot_for(decision.key, current));
         }
-        let bytes = encode_journal(&records).map_err(|error| format!("{error:?}"))?;
-        let image_fingerprint = ContentFingerprint::of(&bytes);
+        // A format-1 image the inspection read (an aterm before format 2 wrote it) is
+        // republished in format 1 (`JournalOpenDecision::keyed_format_1`): its draft, read
+        // through the format-1 decoder, is in `current`, and the first write after this open
+        // compacts it into format 2. One that did not decode was set aside untouched first.
+        let encoded = if decision.keyed_format_1 {
+            encode_journal_image_v1(&records)
+        } else {
+            encode_journal_image(&records)
+        };
+        let (bytes, tail) = encoded.map_err(|error| format!("{error:?}"))?;
         with_journal_lock(&decision.path, JournalLockPatience::EventLoop, || {
             let current = observe_journal_image(&decision.path)?;
             let swept = decision.expected_clean && !current.exists;
@@ -1407,7 +1498,7 @@ impl DraftJournalHost {
             path: decision.path,
             durable_seq: current.seq,
             durable_text: current.text.clone(),
-            image_fingerprint,
+            tail,
             notice: decision.notice,
             legacy,
         })
@@ -1420,6 +1511,69 @@ impl DraftJournalHost {
 
     fn legacy_path_for(&self, legacy: JournalDocumentKey) -> PathBuf {
         self.root.join(format!("{:016x}.atdj", legacy.0))
+    }
+
+    /// Remove every file of `canonical_uri`'s journals from the root: the keyed and the legacy
+    /// journal, each one's preserved copies (`<stem>.preserved-<n>.atdj`), lock (`.<name>.lock`)
+    /// and write temporaries (`.<name>.<pid>-<nonce>.tmp`), then sync the root. A file already
+    /// gone is no error.
+    fn purge(&self, canonical_uri: &str) -> Result<(), String> {
+        let journals = [
+            self.path_for(self.key_for(canonical_uri)),
+            self.legacy_path_for(JournalDocumentKey::legacy_unkeyed(canonical_uri)),
+        ];
+        let mut doomed = Vec::new();
+        for journal in &journals {
+            let (Some(name), Some(stem)) = (
+                journal.file_name().and_then(|name| name.to_str()),
+                journal.file_stem().and_then(|stem| stem.to_str()),
+            ) else {
+                continue;
+            };
+            doomed.push(journal.clone());
+            doomed.push(self.root.join(format!(".{name}.lock")));
+            let preserved = format!("{stem}.preserved-");
+            let temporary = format!(".{name}.");
+            let listing = match fs::read_dir(&self.root) {
+                Ok(listing) => listing,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(format!("could not list the draft journals: {error}")),
+            };
+            for entry in listing.flatten() {
+                let file = entry.file_name();
+                let Some(file) = file.to_str() else {
+                    continue;
+                };
+                let copy = file
+                    .strip_prefix(&preserved)
+                    .and_then(|rest| rest.strip_suffix(".atdj"))
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+                let partial = file
+                    .strip_prefix(&temporary)
+                    .is_some_and(|rest| rest.ends_with(".tmp"));
+                if copy || partial {
+                    doomed.push(entry.path());
+                }
+            }
+        }
+        let mut removed = false;
+        for path in doomed {
+            match fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "could not remove the draft journal {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        if removed {
+            sync_directory(&self.root, Flush::Durable)
+                .map_err(|error| format!("could not sync the draft journals: {error}"))?;
+        }
+        Ok(())
     }
 
     fn preserve_locked(&self, path: &Path, expected: JournalImageGeneration) -> Result<(), String> {
@@ -1694,46 +1848,48 @@ pub(crate) fn execute_journal_append(
         };
     }
     let result = with_journal_lock(path, patience, || {
-        let existing = read_existing_journal(path, "preflight")?;
-        let expected_image = plan
-            .expected_image
+        let tail = plan
+            .expected_tail
             .ok_or_else(|| "preflight: journal plan has no bound disk image".to_string())?;
-        let actual = JournalImageGeneration::of(&existing);
-        if actual.fingerprint != expected_image {
-            return Err(format!(
-                "preflight: journal image changed (expected {:?}, found {:?})",
-                expected_image, actual.fingerprint
-            ));
+        // A format-1 image an open republished has no frame to follow: its first append
+        // compacts it into format 2.
+        if !tail.appends_in_place() {
+            return compact_appending(path, key, plan, tail);
         }
-        let recovered =
-            recover_journal_for(key, &existing).map_err(|error| format!("preflight: {error:?}"))?;
-        if recovered.durable_seq != plan.base_durable {
-            return Err(format!(
-                "preflight: journal sequence changed (expected {}, found {})",
-                plan.base_durable.0, recovered.durable_seq.0
-            ));
+        let (frames, after) =
+            frame_record(&tail, &plan.bytes).map_err(|error| format!("encode: {error:?}"))?;
+        if after.records() > COMPACT_RECORDS
+            || after.appended_since_snapshot() > COMPACT_BYTES
+            || after.byte_len() > MAX_JOURNAL_BYTES as u64
+        {
+            return compact_appending(path, key, plan, tail);
         }
-        let combined_len = existing
-            .len()
-            .checked_add(plan.bytes.len())
-            .ok_or_else(|| "append length overflow".to_string())?;
-        if combined_len > MAX_JOURNAL_BYTES {
-            return Err("journal reached its bounded size limit".to_string());
+        let file = open_journal_image(path).map_err(|error| format!("preflight: {error}"))?;
+        holds_tail(&file, &tail)?;
+        // Preservation can hard-link the current image before a replacement succeeds. An
+        // append must not change that saved copy; replace the named image instead. The lock
+        // serializes this check with cooperating preservation and publication writers.
+        if !owner::uniquely_linked(&file).map_err(|error| format!("preflight: {error}"))? {
+            return compact_appending(path, key, plan, tail);
         }
-        let mut combined = existing;
-        combined.extend_from_slice(&plan.bytes);
-        let image = compact_journal(key, &combined, COMPACT_RECORDS, COMPACT_BYTES)
-            .map_err(|error| format!("compact: {error:?}"))?;
-        let published_image = ContentFingerprint::of(&image);
-        atomic_replace_locked(path, &image, actual, plan.owner)
-            .map_err(|error| error.to_string())?;
+        // In place after the last whole record, then durable before acknowledging the new
+        // checkpoint. An ordering barrier alone would allow power loss to discard a record
+        // after its durable sequence had advanced. Interrupted appends retain a readable prefix.
+        let landed = write_at(&file, &frames, tail.byte_len())
+            .and_then(|()| crate::durable::finish(&file, Flush::Durable));
+        if let Err(error) = landed {
+            // Nobody was told of this record: take back what of it reached the file, so the
+            // next append still finds the image this store holds.
+            let _ = file.set_len(tail.byte_len());
+            return Err(format!("append: {error}"));
+        }
+        owner::mark_append(path, &file, after.fingerprint(), plan.owner);
         Ok(JournalAppendProof {
-            appended_len: plan.bytes.len(),
+            record_len: plan.bytes.len(),
             encoded_fingerprint: plan.encoded_fingerprint,
-            published_image,
+            published: after,
             file_synced: true,
-            renamed_over_journal: true,
-            directory_synced: true,
+            landing: JournalLanding::Appended,
         })
     });
     match result {
@@ -1743,6 +1899,80 @@ pub(crate) fn execute_journal_append(
             message,
         },
     }
+}
+
+/// Compare the expected append boundary under the journal lock: the length and last frame's
+/// head (its CRC, step and prefix fingerprint, [`JournalTail`]). Protocol-following writers
+/// change this boundary when appending or replacing an image. This does not rescan earlier
+/// payloads or detect arbitrary in-place corruption; the full decoder checks their frames.
+fn holds_tail(file: &File, tail: &JournalTail) -> Result<(), String> {
+    let len = file
+        .metadata()
+        .map_err(|error| format!("preflight: {error}"))?
+        .len();
+    if len != tail.byte_len() {
+        return Err(format!(
+            "preflight: journal image changed (expected {} bytes, found {len})",
+            tail.byte_len()
+        ));
+    }
+    let (at, head) = tail.last_frame();
+    let mut found = [0_u8; JOURNAL_FRAME_HEAD];
+    read_at(file, &mut found, at).map_err(|error| format!("preflight: {error}"))?;
+    if found != *head {
+        return Err(format!(
+            "preflight: journal image changed (its last frame, at byte {at}, is not the one \
+             this store wrote)"
+        ));
+    }
+    Ok(())
+}
+
+fn read_at(mut file: &File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+    use std::io::{Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(at))?;
+    file.read_exact(buf)
+}
+
+fn write_at(mut file: &File, bytes: &[u8], at: u64) -> std::io::Result<()> {
+    use std::io::{Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(at))?;
+    file.write_all(bytes)
+}
+
+/// An append that takes the image past a compaction bound ([`COMPACT_RECORDS`],
+/// [`COMPACT_BYTES`], [`MAX_JOURNAL_BYTES`]), or the first after an open republished a
+/// format-1 image ([`JournalTail::appends_in_place`]): the image read whole and proved to be
+/// `tail`'s, the plan's record after it, compacted ([`compact_journal`]) into format 2 and
+/// renamed over the journal with it and its folder durable, as a checkpoint is.
+fn compact_appending(
+    path: &Path,
+    key: JournalDocumentKey,
+    plan: &JournalAppendPlan,
+    tail: JournalTail,
+) -> Result<JournalAppendProof, String> {
+    let existing = read_existing_journal(path, "preflight")?;
+    let actual = JournalImageGeneration::of(&existing);
+    if actual.fingerprint != tail.fingerprint() {
+        return Err(format!(
+            "preflight: journal image changed (expected {:?}, found {:?})",
+            tail.fingerprint(),
+            actual.fingerprint
+        ));
+    }
+    let (image, published) = compact_journal(key, &existing, &plan.bytes)
+        .map_err(|error| format!("compact: {error:?}"))?;
+    atomic_replace_locked(path, &image, actual, plan.owner).map_err(|error| error.to_string())?;
+    Ok(JournalAppendProof {
+        record_len: plan.bytes.len(),
+        encoded_fingerprint: plan.encoded_fingerprint,
+        published,
+        file_synced: true,
+        landing: JournalLanding::Rewritten {
+            renamed_over_journal: true,
+            directory_synced: true,
+        },
+    })
 }
 
 /// `patience` carries the caller's thread, exactly as in [`execute_journal_append`].
@@ -1802,8 +2032,8 @@ pub(crate) fn checkpoint_plan(
     if current.seq != disk.seq || current.text != disk.text {
         records.push(JournalRecord::snapshot_for(key, current));
     }
-    let bytes = encode_journal(&records)?;
-    let fingerprint = ContentFingerprint::of(&bytes);
+    let (bytes, tail) = encode_journal_image(&records)?;
+    let fingerprint = tail.fingerprint();
     Ok(JournalRewritePlan {
         generation,
         key,
@@ -1813,6 +2043,7 @@ pub(crate) fn checkpoint_plan(
         target_text: current.text.clone(),
         bytes: Arc::from(bytes),
         fingerprint,
+        tail,
         retire_legacy: None,
         owner: None,
     })
@@ -1906,27 +2137,57 @@ fn journal_not_regular(kind: &str) -> std::io::Error {
     )
 }
 
-/// Open the sibling advisory lock without following or waiting on a hostile final component.
-#[cfg(unix)]
+/// Which of a journal's files [`open_journal_file`] opens.
+#[derive(Clone, Copy)]
+enum JournalFile {
+    /// The sibling advisory lock, made when it is missing.
+    Lock,
+    /// The image itself, for an append in place: never made.
+    Image,
+}
+
+impl JournalFile {
+    const fn creates(self) -> bool {
+        matches!(self, Self::Lock)
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Lock => "lock",
+            Self::Image => "image",
+        }
+    }
+}
+
 fn open_journal_lock(path: &Path) -> std::io::Result<File> {
+    open_journal_file(path, JournalFile::Lock)
+}
+
+fn open_journal_image(path: &Path) -> std::io::Result<File> {
+    open_journal_file(path, JournalFile::Image)
+}
+
+/// Open one of a journal's files without following or waiting on a hostile final component.
+#[cfg(unix)]
+fn open_journal_file(path: &Path, which: JournalFile) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
+        .create(which.creates())
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     if !file.metadata()?.file_type().is_file() {
-        return Err(journal_not_regular("lock"));
+        return Err(journal_not_regular(which.name()));
     }
     Ok(file)
 }
 
 #[cfg(windows)]
-fn open_journal_lock(path: &Path) -> std::io::Result<File> {
+fn open_journal_file(path: &Path, which: JournalFile) -> std::io::Result<File> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -1934,7 +2195,7 @@ fn open_journal_lock(path: &Path) -> std::io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
+        .create(which.creates())
         .truncate(false)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
@@ -1942,29 +2203,29 @@ fn open_journal_lock(path: &Path) -> std::io::Result<File> {
     if !metadata.file_type().is_file()
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     {
-        return Err(journal_not_regular("lock"));
+        return Err(journal_not_regular(which.name()));
     }
     Ok(file)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_journal_lock(path: &Path) -> std::io::Result<File> {
+fn open_journal_file(path: &Path, which: JournalFile) -> std::io::Result<File> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
-            return Err(journal_not_regular("lock"));
+            return Err(journal_not_regular(which.name()));
         }
         Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && which.creates() => {}
         Err(error) => return Err(error),
     }
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
+        .create(which.creates())
         .truncate(false)
         .open(path)?;
     if !file.metadata()?.file_type().is_file() {
-        return Err(journal_not_regular("lock"));
+        return Err(journal_not_regular(which.name()));
     }
     Ok(file)
 }
@@ -2138,6 +2399,13 @@ fn atomic_replace_locked(
         let candidate = parent.join(format!(".{name}.{}-{nonce}.tmp", std::process::id()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
         match options.open(&candidate) {
             Ok(file) => {
                 temporary = Some((candidate, file));
@@ -2214,17 +2482,18 @@ fn atomic_replace_locked(
 mod tests {
     use super::*;
     use crate::document_store::{DocumentStore, TextEdit};
+    use crate::native_document_io::{encode_journal, encode_journal_v1, journal_tail};
     #[cfg(unix)]
     use std::os::unix::fs::FileTypeExt as _;
 
-    fn test_root(name: &str) -> PathBuf {
+    pub(super) fn test_root(name: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("aterm-draft-journal-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         root
     }
 
-    fn snapshots(text: &str) -> (DocumentStore, DocumentId, DocumentSnapshot) {
+    pub(super) fn snapshots(text: &str) -> (DocumentStore, DocumentId, DocumentSnapshot) {
         let mut store = crate::test_document_store();
         let id = store.open("file:///tmp/draft.md".to_string(), text.to_string());
         let snapshot = store.snapshot(id).unwrap();
@@ -2480,12 +2749,12 @@ mod tests {
         let current = store.snapshot(id).unwrap();
         let mut reducer = DraftJournalReducer::new_with_key(id, initialized.key, disk.seq);
         let mut append = reducer.plan_snapshot(&current).unwrap();
-        append.expected_image = Some(initialized.image_fingerprint);
+        append.expected_tail = Some(initialized.tail);
         let rewrite = checkpoint_plan(
             initialized.key,
             JournalRewriteGeneration(1),
             disk.seq,
-            initialized.image_fingerprint,
+            initialized.tail.fingerprint(),
             &disk,
             &current,
         )
@@ -2748,12 +3017,11 @@ mod tests {
                 id,
                 crate::native_document_io::JournalGeneration(first.generation.0 + 7),
                 JournalAppendResult::Committed(JournalAppendProof {
-                    appended_len: first.bytes.len(),
+                    record_len: first.bytes.len(),
                     encoded_fingerprint: first.encoded_fingerprint,
-                    published_image: first.expected_image.unwrap(),
+                    published: first.expected_tail.unwrap(),
                     file_synced: true,
-                    renamed_over_journal: true,
-                    directory_synced: true,
+                    landing: JournalLanding::Appended,
                 }),
             ),
             JournalCompletion::Stale
@@ -3036,7 +3304,7 @@ mod tests {
             initialized.key,
             JournalRewriteGeneration(1),
             disk.seq,
-            initialized.image_fingerprint,
+            initialized.tail.fingerprint(),
             &disk,
             &disk,
         )
@@ -3053,7 +3321,7 @@ mod tests {
         let newer = store.snapshot(id).unwrap();
         let mut reducer = DraftJournalReducer::new_with_key(id, initialized.key, disk.seq);
         let mut append = reducer.plan_snapshot(&newer).unwrap();
-        append.expected_image = Some(initialized.image_fingerprint);
+        append.expected_tail = Some(initialized.tail);
         assert!(matches!(
             execute_journal_append(
                 &initialized.path,
@@ -3093,7 +3361,7 @@ mod tests {
         );
         let mut reducer = DraftJournalReducer::new_with_key(id, initialized.key, disk.seq);
         let mut plan = reducer.plan_snapshot(&store.snapshot(id).unwrap()).unwrap();
-        plan.expected_image = Some(initialized.image_fingerprint);
+        plan.expected_tail = Some(initialized.tail);
 
         let other = synthetic_snapshot(id, disk.seq, Arc::from("other"));
         let other_image =
@@ -3134,7 +3402,7 @@ mod tests {
             );
             let mut reducer = DraftJournalReducer::new_with_key(id, key, disk.seq);
             let mut plan = reducer.plan_snapshot(&store.snapshot(id).unwrap()).unwrap();
-            plan.expected_image = Some(ContentFingerprint::of(&fs::read(&path).unwrap()));
+            plan.expected_tail = Some(journal_tail(&fs::read(&path).unwrap()).unwrap());
             fs::write(root.join(format!("ready-{role}")), b"ready").unwrap();
             let go = root.join("go");
             let deadline = std::time::Instant::now() + HANG;
@@ -3297,7 +3565,7 @@ mod tests {
         }
     }
 
-    fn journaled_edit(
+    pub(super) fn journaled_edit(
         name: &str,
     ) -> (
         PathBuf,
@@ -3352,7 +3620,7 @@ mod tests {
         (result, completion)
     }
 
-    fn preserved_images(root: &Path) -> Vec<Vec<u8>> {
+    pub(super) fn preserved_images(root: &Path) -> Vec<Vec<u8>> {
         let mut preserved = fs::read_dir(root)
             .unwrap()
             .filter_map(Result::ok)
@@ -3783,11 +4051,11 @@ mod tests {
             (seq, text) = (after, next);
         }
         let path = root.join(format!("{:016x}.atdj", key.0));
-        fs::write(&path, encode_journal(&records).unwrap()).unwrap();
+        fs::write(&path, encode_journal_v1(&records).unwrap()).unwrap();
         path
     }
 
-    fn open_as_the_app_does(
+    pub(super) fn open_as_the_app_does(
         journals: &mut DocumentJournalStore,
         store: &mut DocumentStore,
         uri: &str,
@@ -3813,7 +4081,7 @@ mod tests {
         (decision, id, initialized)
     }
 
-    fn type_and_append(
+    pub(super) fn type_and_append(
         journals: &mut DocumentJournalStore,
         store: &mut DocumentStore,
         id: DocumentId,
@@ -4224,3 +4492,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 }
+
+#[cfg(test)]
+#[path = "native_document_journal_steps_tests.rs"]
+mod steps_tests;

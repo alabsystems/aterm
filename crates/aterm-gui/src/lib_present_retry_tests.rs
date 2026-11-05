@@ -193,6 +193,28 @@ fn project(
 }
 
 #[test]
+fn a_scheduling_mutant_keeps_the_saturating_budget_representation() {
+    let model = aterm_spec::interp::with_buggy(&aterm_models_core::present_retry_model(), 3);
+    let mut state = model.init_state();
+    let now = Instant::now();
+    for count in 1..=PRESENT_RETRY_CAP + 2 {
+        assert!(model.fire("DropPersistent", &mut state));
+        assert!(
+            !model.check_invariant("ParkedHasNoDeadline", &state),
+            "the illegal scheduling decision must still be caught"
+        );
+        assert!(model.fire("Wake", &mut state));
+        let observed = PresentRetry {
+            autonomous_retries: count,
+            deadline: None,
+            parked: false,
+            recovery_redraw_outstanding: true,
+        };
+        assert_matches(&state, &observed, now, true);
+    }
+}
+
+#[test]
 fn failed_present_device_loss_route_conforms_to_derived_model() {
     let model = aterm_models_core::gpu_loss_route_model();
     let mut state = model.init_state();

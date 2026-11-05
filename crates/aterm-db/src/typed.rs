@@ -27,6 +27,7 @@ pub mod grid;
 pub mod guard;
 pub mod keys;
 pub mod owned;
+pub mod secret;
 
 /// The format word a stored schema row carries.
 pub const FORMAT: &str = "att/1";
@@ -147,6 +148,8 @@ pub enum Ty {
     Url,
     /// `{vault, entry, item?}`: names of a vault entry, never its value.
     SecretRef,
+    /// An inner-sealed secret, revealed only through the local audited API.
+    Secret,
     /// A primary key of the named collection.
     Ref(&'static str),
     Set(&'static Ty),
@@ -200,6 +203,7 @@ impl Ty {
             Self::Email => json!("email"),
             Self::Url => json!("url"),
             Self::SecretRef => json!("secret_ref"),
+            Self::Secret => json!("secret"),
             Self::Ref(collection) => json!({"ref": collection}),
             Self::Set(inner) => json!({"set": inner.word()}),
             Self::List(inner, max) => json!({"list": inner.word(), "max": max}),
@@ -322,7 +326,7 @@ const fn secret_named(name: &str) -> bool {
         }
         w += 1;
     }
-    false
+    str_eq(name, "pin") || str_eq(name, "pin_code")
 }
 
 const fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -416,7 +420,7 @@ impl Collection {
     }
 
     /// Whether this compiled declaration is well formed: the grammars, no reused column
-    /// name, secret-named columns only as vault references, a lifecycle column on every
+    /// name, secret-named columns only as Secret, a lifecycle column on every
     /// cells collection, and writers that fit the kind. Called by [`att_collection!`] at
     /// compile time, so a bad schema never builds.
     ///
@@ -451,8 +455,8 @@ impl Collection {
             if !column_name(column.name) {
                 return Err("column name breaks the column grammar");
             }
-            if secret_named(column.name) && !matches!(column.ty, Ty::SecretRef) {
-                return Err("a secret-named column must be a vault reference");
+            if secret_named(column.name) && !matches!(column.ty, Ty::Secret) {
+                return Err("a secret-named column must be Secret");
             }
             if column.since == 0 || column.since > self.version {
                 return Err("a column's since lies outside the collection's versions");
@@ -587,13 +591,14 @@ pub fn request_id(application: &str, role: &str, changes: &[Change]) -> crate::R
         .collect();
     let bytes = aterm_json::to_vec(&canonical)
         .map_err(|_| crate::Error::new("typed changes could not be encoded"))?;
-    let mut input = REQUEST_DOMAIN.to_vec();
+    let mut sha = Sha256::new();
+    sha.update(REQUEST_DOMAIN);
     for part in [application.as_bytes(), role.as_bytes()] {
-        input.extend_from_slice(part);
-        input.push(0);
+        sha.update(part);
+        sha.update([0]);
     }
-    input.extend_from_slice(&bytes);
-    let digest = Sha256::digest(&input);
+    sha.update(&bytes);
+    let digest = sha.finalize();
     let mut request = [0; 16];
     request.copy_from_slice(&digest[..16]);
     Ok(request)

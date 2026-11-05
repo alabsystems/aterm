@@ -201,7 +201,8 @@ fn publish_marker(root: &aterm_dirfd::OwnedFd, receipt: &Receipt) -> Option<()> 
             | aterm_dirfd::OFlags::CREATE
             | aterm_dirfd::OFlags::EXCL
             | aterm_dirfd::OFlags::NOFOLLOW
-            | aterm_dirfd::OFlags::CLOEXEC,
+            | aterm_dirfd::OFlags::CLOEXEC
+            | aterm_dirfd::OFlags::NONBLOCK,
         aterm_dirfd::Mode::from_bits(0o600),
     )
     .ok()?;

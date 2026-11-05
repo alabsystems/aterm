@@ -113,6 +113,15 @@ impl Bed {
             dirs,
         };
         bed.renew_ended(0).unwrap();
+        // A session here ran on main within the week, so `--due` renews its ended login
+        // (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4).
+        bed.store
+            .transact(bed.env.now, &mut None, |state| {
+                let events = accounts::note_session(state, "s-1", "main", None, bed.env.now - 3600);
+                state.sessions.remove("s-1");
+                Ok(events)
+            })
+            .unwrap();
         bed
     }
 

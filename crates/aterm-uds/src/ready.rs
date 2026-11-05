@@ -92,7 +92,8 @@ fn pair(
     deadline: Option<std::time::Instant>,
 ) -> io::Result<Option<Ready>> {
     let mut fds = [read_pollfd(first), read_pollfd(second)];
-    Ok(poll_reads(&mut fds, deadline)?.then(|| Ready {
+    let wait = deadline.map_or(Wait::Forever, Wait::Until);
+    Ok(poll_set(&mut fds, wait)?.then(|| Ready {
         first: fds[0].revents != 0,
         second: fds[1].revents != 0,
     }))
@@ -111,14 +112,67 @@ pub fn any_until(fds: &[BorrowedFd<'_>], deadline: std::time::Instant) -> io::Re
         ));
     }
     let mut reads: Vec<_> = fds.iter().copied().map(read_pollfd).collect();
-    if !poll_reads(&mut reads, Some(deadline))? {
+    ready_indices(&mut reads, Wait::Until(deadline))
+}
+
+/// Wait for mixed read/write interests until an absolute deadline, without
+/// consuming bytes or notifications. Returns indices into the supplied set;
+/// hangup/error also wake, and an empty result means expiry. An already expired
+/// deadline asks nothing. The caller bounds the set and retains every descriptor.
+/// # Errors
+/// Empty or unrepresentable set, or poll error other than interruption.
+pub fn any_interests_until(
+    interests: &[Watch<'_>],
+    deadline: std::time::Instant,
+) -> io::Result<Vec<usize>> {
+    ready_indices(&mut interest_fds(interests)?, Wait::Until(deadline))
+}
+
+/// Ask native readiness once with zero timeout. Like [`any_interests_until`],
+/// this consumes no bytes or notifications. An interrupted poll is asked again.
+/// Use this for already buffered work that must not hide pending host control.
+/// # Errors
+/// Empty or unrepresentable set, or poll error other than interruption.
+pub fn any_interests_now(interests: &[Watch<'_>]) -> io::Result<Vec<usize>> {
+    ready_indices(&mut interest_fds(interests)?, Wait::Now)
+}
+
+fn interest_fds(interests: &[Watch<'_>]) -> io::Result<Vec<libc::pollfd>> {
+    if interests.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty readiness set",
+        ));
+    }
+    Ok(interests
+        .iter()
+        .map(|watch| libc::pollfd {
+            fd: watch.fd.as_raw_fd(),
+            events: match watch.interest {
+                Interest::Read => libc::POLLIN,
+                Interest::Write => libc::POLLOUT,
+            },
+            revents: 0,
+        })
+        .collect())
+}
+
+fn ready_indices(fds: &mut [libc::pollfd], wait: Wait) -> io::Result<Vec<usize>> {
+    if !poll_set(fds, wait)? {
         return Ok(Vec::new());
     }
-    Ok(reads
+    Ok(fds
         .iter()
         .enumerate()
         .filter_map(|(i, fd)| (fd.revents != 0).then_some(i))
         .collect())
+}
+
+#[derive(Clone, Copy)]
+enum Wait {
+    Forever,
+    Until(std::time::Instant),
+    Now,
 }
 
 fn read_pollfd(fd: BorrowedFd<'_>) -> libc::pollfd {
@@ -130,15 +184,16 @@ fn read_pollfd(fd: BorrowedFd<'_>) -> libc::pollfd {
 }
 
 #[cfg_attr(trust_verify, trust::skip)]
-fn poll_reads(fds: &mut [libc::pollfd], deadline: Option<std::time::Instant>) -> io::Result<bool> {
+fn poll_set(fds: &mut [libc::pollfd], wait: Wait) -> io::Result<bool> {
     let count = fds
         .len()
         .try_into()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "readiness set too large"))?;
     loop {
-        let timeout = match deadline {
-            None => -1,
-            Some(deadline) => {
+        let timeout = match wait {
+            Wait::Forever => -1,
+            Wait::Now => 0,
+            Wait::Until(deadline) => {
                 let Some(remaining) = deadline
                     .checked_duration_since(std::time::Instant::now())
                     .filter(|n| !n.is_zero())
@@ -166,6 +221,9 @@ fn poll_reads(fds: &mut [libc::pollfd], deadline: Option<std::time::Instant>) ->
         if fds.iter().any(|fd| fd.revents != 0) {
             return Ok(true);
         }
+        if matches!(wait, Wait::Now) {
+            return Ok(false);
+        }
     }
 }
 
@@ -183,6 +241,30 @@ pub fn one(fd: BorrowedFd<'_>) -> io::Result<()> {
 pub enum Interest {
     Read,
     Write,
+}
+
+/// Opaque borrowed readiness interest. A holder can wait for a descriptor but
+/// cannot extract it to read, write, close or duplicate the original endpoint.
+#[derive(Clone, Copy)]
+pub struct Watch<'a> {
+    fd: BorrowedFd<'a>,
+    interest: Interest,
+}
+
+impl std::fmt::Debug for Watch<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Watch")
+            .field("interest", &self.interest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> Watch<'a> {
+    /// Observe readiness for one operation on a descriptor retained by its owner.
+    #[must_use]
+    pub const fn new(fd: BorrowedFd<'a>, interest: Interest) -> Self {
+        Self { fd, interest }
+    }
 }
 
 /// Wait for `interest`, hangup or error without changing socket timeout options.
@@ -285,6 +367,113 @@ pub fn for_read(stream: &crate::CtlStream) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mixed_readiness_reports_writable_readable_and_hangup_without_consuming_bytes() {
+        use super::*;
+        use std::{
+            io::{Read as _, Write as _},
+            os::fd::AsFd as _,
+            time::Instant,
+        };
+        let (quiet, _keep) = std::io::pipe().unwrap();
+        let (mut sink, mut writable) = std::io::pipe().unwrap();
+        let (mut readable, mut source) = std::io::pipe().unwrap();
+        let (mut ended, close) = std::io::pipe().unwrap();
+        source.write_all(b"r").unwrap();
+        drop(close);
+        let interests = [
+            Watch::new(quiet.as_fd(), Interest::Read),
+            Watch::new(writable.as_fd(), Interest::Write),
+            Watch::new(readable.as_fd(), Interest::Read),
+            Watch::new(ended.as_fd(), Interest::Read),
+        ];
+        assert_eq!(any_interests_now(&interests).unwrap(), [1, 2, 3]);
+        assert_eq!(
+            any_interests_until(&interests, Instant::now() + HANG).unwrap(),
+            [1, 2, 3]
+        );
+        assert!(
+            any_interests_until(&interests, Instant::now())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            any_interests_until(&[], Instant::now() + HANG)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let mut byte = [0];
+        readable.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"r");
+        writable.write_all(b"w").unwrap();
+        sink.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"w");
+        assert_eq!(ended.read(&mut byte).unwrap(), 0);
+        assert!(
+            any_interests_now(&[Watch::new(quiet.as_fd(), Interest::Read)])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            any_interests_now(&[]).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn a_blocked_writer_is_not_reported_as_readiness_work() {
+        use super::*;
+        use std::{
+            io::{Read as _, Write as _},
+            os::fd::AsFd as _,
+            time::Instant,
+        };
+        let (mut drain, mut writer) = std::io::pipe().unwrap();
+        let flags = writer.try_clone().unwrap();
+        with_nonblocking(flags.as_fd(), || {
+            // Fill the actual pipe completely, including any partial final page.
+            let mut written = 0;
+            loop {
+                match writer.write(b"x") {
+                    Ok(1) => {
+                        written += 1;
+                        assert!(written <= 8 * 1024 * 1024);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    other => panic!("filling private pipe: {other:?}"),
+                }
+            }
+            let (mut hint, mut sender) = std::io::pipe().unwrap();
+            sender.write_all(b"h")?;
+            assert_eq!(
+                any_interests_until(
+                    &[
+                        Watch::new(hint.as_fd(), Interest::Read),
+                        Watch::new(writer.as_fd(), Interest::Write),
+                    ],
+                    Instant::now() + HANG
+                )?,
+                [0]
+            );
+            let mut byte = [0];
+            hint.read_exact(&mut byte)?;
+            assert_eq!(byte, *b"h");
+            let mut bytes = vec![0; written];
+            drain.read_exact(&mut bytes)?;
+            assert!(bytes.iter().all(|byte| *byte == b'x'));
+            assert_eq!(
+                any_interests_until(
+                    &[Watch::new(writer.as_fd(), Interest::Write)],
+                    Instant::now() + HANG
+                )?,
+                [0]
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn many_readiness_preserves_bytes_and_reports_all_ready_indices() {
         use super::*;

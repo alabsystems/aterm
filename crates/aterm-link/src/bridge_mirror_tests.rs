@@ -2369,16 +2369,19 @@ fn the_alias_key_survives_a_bridge_restart_and_a_cap_change() {
     assert_ne!(elsewhere.key(), key, "another node's is its own");
 }
 
-/// The round that reads a batch's acks parks for zero duration while the landing is owed; the
-/// take owed after the landing, which nothing would carry, is held for at most the grace
-/// (critic item E04).
+/// The round that reads a batch's acks parks for zero duration while the landing is owed. The
+/// take after a full batch's landing drains the backlog and goes the round it falls due; the
+/// take after the snapshot's landing, which left none and which nothing would carry, is held
+/// for at most the grace (critic item E04 and its review), on the bridge's clock, which the
+/// test holds ([`crate::fx::Fx::on_a_held_clock`]) and moves past the grace.
 #[test]
 fn the_round_that_reads_a_batchs_acks_parks_for_nothing_before_its_landing() {
     let mut w = World::new();
+    w.bridge.fx = crate::fx::Fx::os().on_a_held_clock();
     w.append();
     w.append();
     w.bridge.mirror = Some(MirrorRun::acked_for_tests(&w.bridge.state, 3));
-    w.bridge.roster_due = Instant::now() + ROSTER_REFRESH;
+    w.bridge.roster_due = w.bridge.fx.now() + ROSTER_REFRESH;
     assert!(
         w.bridge.deadlines.is_empty() && w.bridge.ghosts.is_empty(),
         "PRECONDITION: no other duty owed"
@@ -2413,29 +2416,6 @@ fn the_round_that_reads_a_batchs_acks_parks_for_nothing_before_its_landing() {
         Some(Duration::ZERO),
         "the next take is owed now"
     );
-    // Nothing would carry that take, so the round that finds it due holds it for the loop's
-    // next write, parking no longer than the grace (critic item E04); the hold is dated a grace
-    // ago here, so the round after it takes without waiting it out.
-    let takes = w.lane.mirror.lock().unwrap().takes;
-    assert!(w.bridge.mirror_then_round());
-    assert_eq!(
-        w.lane.mirror.lock().unwrap().takes,
-        takes,
-        "the round held the take"
-    );
-    assert!(
-        w.bridge.parked.is_some_and(|p| p <= IDLE_ACK_GRACE),
-        "and parked no longer than the grace: {:?}",
-        w.bridge.parked
-    );
-    let a_grace_ago = Instant::now()
-        .checked_sub(IDLE_ACK_GRACE)
-        .expect("a clock past its first grace");
-    w.bridge
-        .mirror
-        .as_deref_mut()
-        .unwrap()
-        .date_uncarried_for_tests(a_grace_ago);
     assert!(w.bridge.mirror_then_round());
     let (slots, outcomes) = w.bridge.mirror.as_deref().unwrap().batch();
     assert!(
@@ -2462,10 +2442,15 @@ fn the_round_that_reads_a_batchs_acks_parks_for_nothing_before_its_landing() {
         "PRECONDITION: the next take is held"
     );
     w.bridge
-        .mirror
-        .as_deref_mut()
-        .unwrap()
-        .date_uncarried_for_tests(a_grace_ago);
+        .fx
+        .advance(IDLE_ACK_GRACE - Duration::from_nanos(1));
+    w.bridge.mirror_step();
+    assert_eq!(
+        w.lane.mirror.lock().unwrap().takes,
+        takes,
+        "a pass inside the grace still holds it"
+    );
+    w.bridge.fx.advance(Duration::from_nanos(1));
     w.bridge.mirror_step();
     assert_eq!(
         w.lane.mirror.lock().unwrap().takes,
@@ -2476,7 +2461,7 @@ fn the_round_that_reads_a_batchs_acks_parks_for_nothing_before_its_landing() {
         w.bridge.mirror.as_deref().unwrap().batch().0.is_empty(),
         "PRECONDITION: the take is empty"
     );
-    let now = Instant::now();
+    let now = w.bridge.fx.now();
     w.bridge.roster_due = now + ROSTER_REFRESH;
     assert_eq!(w.bridge.mirror_due(now), None, "nothing is owed");
     assert_eq!(
@@ -2484,6 +2469,102 @@ fn the_round_that_reads_a_batchs_acks_parks_for_nothing_before_its_landing() {
         ROSTER_REFRESH,
         "nothing owed: the park is the roster's"
     );
+}
+
+/// A DRAIN TAKES THE BATCH AFTER EACH LANDING THE ROUND IT FALLS DUE (critic item E04's review):
+/// a take that says `more=1`, or comes back with every slot it asked, leaves a backlog at the
+/// endpoint ([`MirrorRun::drains`]), so the take after its landing goes at once though no inbox
+/// commit would ride it, as before E04. Here two slots a take drain the session's four records
+/// and its snapshot: the first take says `more=1`, the second is full with the snapshot left
+/// out, and only the take after the snapshot's landing, which left nothing behind, is held for
+/// a commit to carry ([`Bridge::mirror_rides_nothing`]): on the bridge's clock, which the test
+/// holds ([`crate::fx::Fx::on_a_held_clock`]), that round parks the whole grace.
+///
+/// NEGATIVE CONTROL: with a drain's take held like any other
+/// ([`crate::sim::world::Mutant::MirrorHoldsADrainingTake`], E04 as it first landed), the round
+/// after the first landing holds the take.
+#[test]
+fn a_drain_takes_the_batch_after_each_landing_the_round_it_falls_due() {
+    for drains in [true, false] {
+        let mut w = World::new();
+        w.bridge.fx = if drains {
+            crate::fx::Fx::os()
+        } else {
+            crate::fx::Fx::os_without(crate::sim::world::Mutant::MirrorHoldsADrainingTake)
+        }
+        .on_a_held_clock();
+        for _ in 0..3 {
+            w.append();
+        }
+        w.bridge.mirror = Some(MirrorRun::acked_for_tests(&w.bridge.state, 2));
+        w.bridge.roster_due = w.bridge.fx.now() + ROSTER_REFRESH;
+        let takes = |w: &World| w.lane.mirror.lock().unwrap().takes;
+        let landings = |w: &World| w.lane.mirror.lock().unwrap().landings.len();
+        assert!(w.bridge.mirror_then_round());
+        assert!(
+            w.bridge.state.logpin_fence_held(),
+            "PRECONDITION: the open's first pass made the pin's fence"
+        );
+        assert_eq!(
+            (
+                takes(&w),
+                w.bridge.mirror.as_deref().unwrap().batch().0.len()
+            ),
+            (1, 2),
+            "PRECONDITION: the first pass took a full batch"
+        );
+        for landed in 1..=2 {
+            assert!(w.bridge.mirror_then_round());
+            assert_eq!(landings(&w), landed, "PRECONDITION: the batch landed");
+            assert!(w.bridge.mirror_then_round());
+            if !drains {
+                assert_eq!(
+                    (
+                        takes(&w),
+                        w.bridge.mirror.as_deref().unwrap().uncarried().is_some()
+                    ),
+                    (landed, true),
+                    "NEGATIVE CONTROL (MirrorHoldsADrainingTake): the round held the take"
+                );
+                break;
+            }
+            assert_eq!(
+                takes(&w),
+                landed + 1,
+                "the take after landing {landed} went the round it fell due"
+            );
+            let (slots, _) = w.bridge.mirror.as_deref().unwrap().batch();
+            let snaps = slots
+                .iter()
+                .filter(|s| s.body.contains(" op=snap "))
+                .count();
+            assert_eq!(
+                (slots.len(), snaps),
+                if landed == 1 { (2, 0) } else { (1, 1) },
+                "PRECONDITION: take 2 is full with the snapshot left out, take 3 the snapshot \
+                 alone: {slots:?}"
+            );
+        }
+        if !drains {
+            continue;
+        }
+        assert!(w.bridge.mirror_then_round());
+        assert_eq!(landings(&w), 3, "PRECONDITION: the snapshot's batch landed");
+        assert!(w.bridge.mirror_then_round());
+        assert_eq!(
+            (
+                takes(&w),
+                w.bridge.mirror.as_deref().unwrap().uncarried().is_some()
+            ),
+            (3, true),
+            "the take after a batch that left nothing behind is held"
+        );
+        assert_eq!(
+            w.bridge.parked,
+            Some(IDLE_ACK_GRACE),
+            "and the round parked the grace out"
+        );
+    }
 }
 
 /// An empty take with `more=1` waits its retry backoff and never spins.
@@ -2529,16 +2610,17 @@ fn an_empty_take_that_says_more_waits_its_retry_and_never_spins() {
 /// An empty take whose endpoint held a moved mail count's snapshot back to its rate (`due=`, LOOP-2)
 /// owes a take at that instant, not at the roster's next wake; a record appended meanwhile is
 /// due at once, and once the instant passes the pass takes again (each take, which nothing would
-/// carry, held for the grace first: critic item E04). The owed instant and the loop's wait are
-/// read as of the moment before the take, so a slow take changes neither.
+/// carry, held for the grace first: critic item E04). The bridge's clock is the test's
+/// ([`crate::fx::Fx::on_a_held_clock`]), so a slow take moves neither the owed instant nor the
+/// loop's wait, and the test moves it past each grace.
 #[test]
 fn an_empty_take_that_holds_a_snapshot_back_takes_again_when_it_is_due() {
     let mut w = World::new();
+    w.bridge.fx = crate::fx::Fx::os().on_a_held_clock();
     w.lane.mirror.lock().unwrap().refuse_take = Some("OK 0 slots=0 due=400\n".to_string());
-    let before = Instant::now();
-    w.bridge.roster_due = before + aterm_spec::wait::MUST_HAPPEN;
+    let now = w.bridge.fx.now();
+    w.bridge.roster_due = now + aterm_spec::wait::MUST_HAPPEN;
     w.bridge.mirror_step();
-    let after = Instant::now();
     assert_eq!(
         w.lane.mirror.lock().unwrap().takes,
         1,
@@ -2553,23 +2635,20 @@ fn an_empty_take_that_holds_a_snapshot_back_takes_again_when_it_is_due() {
         "PRECONDITION: only the roster's round wakes the loop besides the take"
     );
     let wait = Duration::from_millis(400);
-    let due = w
-        .bridge
-        .mirror_due(before)
-        .expect("the held-back snapshot owes a take");
-    assert!(
-        due >= before + wait && due <= after + wait,
+    assert_eq!(
+        w.bridge.mirror_due(now),
+        Some(now + wait),
         "the take is owed when the snapshot is due"
     );
     assert_eq!(
-        w.bridge.park_wait(before),
-        due.duration_since(before),
+        w.bridge.park_wait(now),
+        wait,
         "the loop wakes for it, not at the roster's next round"
     );
     w.bridge.mirror_wake();
     assert_eq!(
-        w.bridge.mirror_due(after),
-        Some(after),
+        w.bridge.mirror_due(now),
+        Some(now),
         "an append meanwhile is due at once"
     );
     w.lane.mirror.lock().unwrap().refuse_take = Some("OK 0 slots=0 due=0\n".to_string());

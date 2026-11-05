@@ -226,6 +226,9 @@ impl ActionSink for TerminalHandler<'_> {
 
     fn esc_dispatch(&mut self, intermediates: &Provenance<[u8], Pty>, final_byte: u8) {
         self.note_sync_open_action();
+        // As the CSI and OSC dispatchers do: a RIS moves the marks, which must first catch up with
+        // the rows the batch's output already moved (a region scroll's pending splice).
+        self.sync_absolute_row_metadata();
         let cap = super::super::response_capability::ResponseCapability::mint_for_dispatch();
         self.esc_dispatch_core(&cap, intermediates.as_ref(), final_byte);
     }

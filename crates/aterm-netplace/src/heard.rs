@@ -66,18 +66,35 @@ fn opt<T: ToString>(value: Option<T>) -> String {
 }
 
 fn answer_line(answer: &Answer) -> String {
-    format!(
-        "a {} {} {} {} {} {} {} {} {}",
-        answer.lane.word(),
-        answer.member,
-        opt(answer.addr),
-        opt(answer.via),
-        opt(answer.iface.as_deref().filter(|iface| valid_iface(iface))),
-        opt(answer.network.as_ref().map(NetworkId::as_str)),
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(96);
+    let _ = write!(out, "a {} {} ", answer.lane.word(), answer.member);
+    match answer.addr {
+        Some(addr) => {
+            let _ = write!(out, "{addr} ");
+        }
+        None => out.push_str("- "),
+    }
+    match answer.via {
+        Some(via) => {
+            let _ = write!(out, "{via} ");
+        }
+        None => out.push_str("- "),
+    }
+    let _ = write!(
+        out,
+        "{} {} {} {} {}",
+        answer
+            .iface
+            .as_deref()
+            .filter(|iface| valid_iface(iface))
+            .unwrap_or("-"),
+        answer.network.as_ref().map_or("-", NetworkId::as_str),
         if answer.logged { LOGGED } else { "-" },
         answer.began_ms,
         answer.at_ms
-    )
+    );
+    out
 }
 
 /// An answer line's word for [`Answer::logged`] (`-` for not).
@@ -125,16 +142,19 @@ fn valid_endpoint(endpoint: &str) -> bool {
 }
 
 /// One endpoint word: a host name or address, no space or control character.
-fn endpoint_word(endpoint: &str) -> String {
+fn endpoint_word(endpoint: &str) -> std::borrow::Cow<'_, str> {
+    if valid_endpoint(endpoint) {
+        return std::borrow::Cow::Borrowed(endpoint);
+    }
     let word: String = endpoint
         .chars()
         .filter(|c| c.is_ascii_graphic())
         .take(MAX_ENDPOINT)
         .collect();
     if word.is_empty() {
-        "-".to_owned()
+        std::borrow::Cow::Borrowed("-")
     } else {
-        word
+        std::borrow::Cow::Owned(word)
     }
 }
 
@@ -188,8 +208,17 @@ pub fn parse_counted(text: &str) -> (Evidence, usize) {
 
 /// Adds the note `line` holds to `evidence`; a line this build cannot read adds none.
 fn parse_line(line: &str, evidence: &mut Evidence) {
-    let words: Vec<&str> = line.split(' ').collect();
-    match words.as_slice() {
+    let mut words = [""; 11];
+    let mut len = 0;
+    for w in line.split(' ') {
+        if len < words.len() {
+            words[len] = w;
+            len += 1;
+        } else {
+            return;
+        }
+    }
+    match &words[..len] {
         [
             "a",
             lane,
@@ -312,7 +341,9 @@ pub fn compact(mut evidence: Evidence) -> Evidence {
 /// The [`FILE`] text of `evidence`, oldest first.
 #[must_use]
 pub fn format(evidence: &Evidence) -> String {
-    let mut lines: Vec<(u64, String)> = Vec::new();
+    let mut lines: Vec<(u64, String)> = Vec::with_capacity(
+        evidence.answers.len() + evidence.rounds.len() + evidence.internet.len(),
+    );
     lines.extend(evidence.answers.iter().map(|a| (a.at_ms, answer_line(a))));
     lines.extend(evidence.rounds.iter().map(|r| (r.at_ms, round_line(r))));
     lines.extend(
@@ -322,7 +353,12 @@ pub fn format(evidence: &Evidence) -> String {
             .map(|i| (i.at_ms, internet_line(i))),
     );
     lines.sort();
-    lines.into_iter().map(|(_, line)| line + "\n").collect()
+    let mut out = String::with_capacity(lines.iter().map(|(_, l)| l.len() + 1).sum());
+    for (_, line) in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
 }
 
 /// The evidence in `dir`; empty where there is none or it is not private.
@@ -331,11 +367,26 @@ pub fn read(dir: &Path) -> Evidence {
     read_counted(dir).0
 }
 
+pub(crate) fn read_in(dir: &Path, judged: &aterm_uds::private_file::JudgedDir<'_>) -> Evidence {
+    read_counted_in(dir, judged).0
+}
+
 /// Presentation evidence includes direct scans, stored apart from admission evidence.
 /// A newer unlogged scan must neither replace nor postpone a heartbeat's proof.
 #[must_use]
 pub fn read_for_place(dir: &Path) -> Evidence {
     let mut evidence = read(dir);
+    evidence
+        .answers
+        .extend(read(&dir.join("observations")).answers);
+    compact(evidence)
+}
+
+pub(crate) fn read_for_place_in(
+    dir: &Path,
+    judged: &aterm_uds::private_file::JudgedDir<'_>,
+) -> Evidence {
+    let mut evidence = read_in(dir, judged);
     evidence
         .answers
         .extend(read(&dir.join("observations")).answers);
@@ -367,25 +418,37 @@ pub fn note_observations(dir: &Path, mut answers: Vec<Answer>) {
 /// The admission ledger alone, with how many lines it passed over ([`parse_counted`]).
 #[must_use]
 pub fn read_counted(dir: &Path) -> (Evidence, usize) {
-    match aterm_uds::private_file::read_private(dir, FILE, MAX_BYTES) {
+    let Ok(judged) = aterm_uds::private_file::JudgedDir::judge(dir) else {
+        return refused_read(dir);
+    };
+    read_counted_in(dir, &judged)
+}
+
+pub(crate) fn read_counted_in(
+    dir: &Path,
+    judged: &aterm_uds::private_file::JudgedDir<'_>,
+) -> (Evidence, usize) {
+    match judged.read(FILE, MAX_BYTES) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => parse_counted(&text),
             Err(_) => (Evidence::default(), 1),
         },
         Err(aterm_uds::private_file::PrivateFileError::Missing) => (Evidence::default(), 0),
-        Err(_) => {
-            let dir_is_symlink =
-                std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink());
-            let file_present = !matches!(
-                std::fs::symlink_metadata(dir.join(FILE)),
-                Err(e) if e.kind() == io::ErrorKind::NotFound
-            );
-            (
-                Evidence::default(),
-                usize::from(dir_is_symlink || file_present),
-            )
-        }
+        Err(_) => refused_read(dir),
     }
+}
+
+fn refused_read(dir: &Path) -> (Evidence, usize) {
+    let dir_is_symlink =
+        std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink());
+    let file_present = !matches!(
+        std::fs::symlink_metadata(dir.join(FILE)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound
+    );
+    (
+        Evidence::default(),
+        usize::from(dir_is_symlink || file_present),
+    )
 }
 
 /// Adds `notes` to the evidence in `dir` under [`LOCK`] ([the lock rule](self)), bounded by
@@ -434,8 +497,17 @@ pub fn parse_book(text: &str) -> Book {
         members: text
             .lines()
             .filter_map(|line| {
-                let words: Vec<&str> = line.split(' ').collect();
-                let ["m", member, addr, answered, network @ ..] = words.as_slice() else {
+                let mut words = [""; 6];
+                let mut len = 0;
+                for w in line.split(' ') {
+                    if len < words.len() {
+                        words[len] = w;
+                        len += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                let ["m", member, addr, answered, network @ ..] = &words[..len] else {
                     return None;
                 };
                 if !is_lower_hex16(member) {
@@ -461,7 +533,12 @@ pub fn parse_book(text: &str) -> Book {
 /// The fleet book snapshot in `dir`; `None` where the fleet lane wrote none.
 #[must_use]
 pub fn read_book(dir: &Path) -> Option<Book> {
-    let bytes = aterm_uds::private_file::read_private(dir, BOOK_FILE, MAX_BYTES).ok()?;
+    let judged = aterm_uds::private_file::JudgedDir::judge(dir).ok()?;
+    read_book_in(&judged)
+}
+
+pub(crate) fn read_book_in(judged: &aterm_uds::private_file::JudgedDir<'_>) -> Option<Book> {
+    let bytes = judged.read(BOOK_FILE, MAX_BYTES).ok()?;
     Some(parse_book(std::str::from_utf8(&bytes).ok()?))
 }
 
@@ -509,7 +586,7 @@ pub fn write_book(
 #[derive(Default)]
 struct Noted {
     /// Per directory and key (`lane member`, `internet ok`), the time last noted.
-    last: HashMap<(PathBuf, String), u64>,
+    last: HashMap<PathBuf, HashMap<String, u64>>,
     /// Notes a held lock kept back, per directory.
     pending: HashMap<PathBuf, Evidence>,
 }
@@ -526,7 +603,8 @@ fn stay_start(dir: &Path) -> Option<u64> {
 fn due(noted: &Noted, dir: &Path, key: &str, now: u64, stay: Option<u64>) -> bool {
     noted
         .last
-        .get(&(dir.to_path_buf(), key.to_owned()))
+        .get(dir)
+        .and_then(|by_key| by_key.get(key))
         .is_none_or(|last| {
             now.saturating_sub(*last) >= COALESCE_MS || stay.is_some_and(|start| *last < start)
         })
@@ -542,8 +620,11 @@ fn flush(dir: &Path, mut notes: Evidence, keys: Vec<String>, now: u64) {
         notes.rounds.extend(held.rounds);
         notes.internet.extend(held.internet);
     }
-    for key in keys {
-        noted.last.insert((dir.to_path_buf(), key), now);
+    if !keys.is_empty() {
+        let dir_last = noted.last.entry(dir.to_path_buf()).or_default();
+        for key in keys {
+            dir_last.insert(key, now);
+        }
     }
     drop(guard);
     if let Err(e) = add(dir, notes.clone()) {
@@ -679,22 +760,24 @@ pub fn note_round(
 /// `source` measured it at `at_ms`. Coalesced as [`note_answer`] is, per verdict: a change of
 /// verdict is always noted.
 pub fn note_internet(dir: &Path, ok: bool, source: InternetSource, endpoint: &str, at_ms: u64) {
-    let noted_key = format!("internet {}", if ok { "ok" } else { "down" });
-    let other = format!("internet {}", if ok { "down" } else { "ok" });
+    let (noted_key, other) = if ok {
+        ("internet ok", "internet down")
+    } else {
+        ("internet down", "internet ok")
+    };
     let stay = stay_start(dir);
     {
         let mut guard = NOTED.lock().unwrap_or_else(PoisonError::into_inner);
         let noted = guard.get_or_insert_with(Noted::default);
-        let changed = noted
-            .last
-            .get(&(dir.to_path_buf(), other.clone()))
+        let dir_last = noted.last.get(dir);
+        let changed = dir_last
+            .and_then(|by_key| by_key.get(other))
             .is_some_and(|other_at| {
-                noted
-                    .last
-                    .get(&(dir.to_path_buf(), noted_key.clone()))
+                dir_last
+                    .and_then(|by_key| by_key.get(noted_key))
                     .is_none_or(|this_at| other_at > this_at)
             });
-        if !changed && !due(noted, dir, &noted_key, at_ms, stay) {
+        if !changed && !due(noted, dir, noted_key, at_ms, stay) {
             return;
         }
     }
@@ -705,11 +788,11 @@ pub fn note_internet(dir: &Path, ok: bool, source: InternetSource, endpoint: &st
                 ok,
                 source,
                 at_ms,
-                endpoint: endpoint_word(endpoint),
+                endpoint: endpoint_word(endpoint).into_owned(),
             }],
             ..Evidence::default()
         },
-        vec![noted_key],
+        vec![noted_key.to_owned()],
         at_ms,
     );
 }

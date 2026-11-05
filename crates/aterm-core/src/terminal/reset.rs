@@ -43,17 +43,19 @@ impl ResetGroups<'_> {
         self.sixel.reset();
         self.dcs.reset();
         self.notifications.reset();
-        self.marks_state.marks.clear();
-        self.marks_state.annotations.clear();
         *self.taskbar_progress = None;
         self.program_state.reset();
     }
 }
 
-/// Reset terminal modes to power-on defaults while preserving host policy and capabilities.
+/// Reset terminal modes to power-on defaults while preserving host policy and capabilities, the
+/// BiDi mode and direction returning to the host's configured `bidi` (`disabled` is a host choice
+/// no program can make, so the power-on Implicit would override it).
 #[inline]
-fn reset_modes(prev: &TerminalModes) -> TerminalModes {
+fn reset_modes(prev: &TerminalModes, bidi: &crate::config::BiDiConfig) -> TerminalModes {
     TerminalModes {
+        bidi_mode: bidi.mode,
+        bidi_direction: bidi.direction,
         allow_osc52_query: prev.allow_osc52_query,
         allow_osc52_set: prev.allow_osc52_set,
         allow_window_ops: prev.allow_window_ops,
@@ -85,9 +87,10 @@ pub(super) fn reset_common_fields(
     color: &mut super::ColorState,
     secure_keyboard_entry: &mut bool,
     groups: &mut ResetGroups<'_>,
+    bidi: &crate::config::BiDiConfig,
 ) {
     let was_alternate_screen = modes.alternate_screen;
-    *modes = reset_modes(modes);
+    *modes = reset_modes(modes, bidi);
     style.reset();
     charset.reset();
     if was_alternate_screen {
@@ -103,12 +106,25 @@ pub(super) fn reset_common_fields(
     grid.erase_screen();
     grid.clear_line_attributes();
     grid.set_cursor(0, 0);
+    // The shell's marks, the named marks and the annotations outlive the reset as they outlive
+    // `clear` (ED 2 from home, then ED 3): what was drawn is gone from the screen and the history,
+    // those wholly in the history go with it, and a running command keeps its block.
+    super::handler::note_full_clear(grid.visible_to_absolute(0), true, groups.shell);
+    super::handler::forget_erased_history(
+        grid.oldest_absolute_row(),
+        groups.shell,
+        groups.marks_state,
+    );
     grid.reset_tab_stops();
     grid.invalidate_host_coordinates();
     *alt_grid = None;
     cursor_save.reset();
     transient.reset();
     color.reset();
+    // The DEC 2031 latch is the scheme the reset leaves, set quietly (the reset turned 2031 off):
+    // `Terminal::reset` is followed by no batch end to settle it, and a stale latch reads as a
+    // scheme change to the next host colour call.
+    modes.color_scheme = color.reported_scheme().0;
     *secure_keyboard_entry = false;
     groups.reset();
 }
@@ -141,6 +157,7 @@ impl Terminal {
             &mut self.color,
             &mut self.secure_keyboard_entry,
             &mut groups,
+            &self.bidi_state.config,
         );
         self.holder_fence.note_alt_exit();
         self.modes.cursor_style = self.default_cursor_style;
@@ -158,7 +175,11 @@ impl Terminal {
         self.content_scroll_state.invalidate();
         self.refresh_mode_mirror();
         self.alt_archive_after_host_reset();
-        let _ = self.reconcile_color_scheme();
+        // The program's frame is whole, as after a batch that ends with RIS (`note_batch_end`), so
+        // the next unfinished frame's hang clock starts at its own batch. Not in
+        // `TransientState::reset`: within a batch, a RIS then `?2026h` is a back-to-back frame,
+        // whose clock keeps running, or a program resetting on every burst would never hang.
+        self.transient.frame_unfinished_since = None;
         self.host_journal.push(super::HostOp::Reset);
     }
 }

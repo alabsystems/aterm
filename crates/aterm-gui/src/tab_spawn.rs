@@ -8,7 +8,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use aterm_window::event::WindowEvent;
+use aterm_window::event::{InputOrigin, WindowEvent};
 use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
 use aterm_window::keyboard::ModifiersState;
 use aterm_window::window::WindowId as WinitWindowId;
@@ -75,9 +75,12 @@ impl TabSpawnThen {
                 {
                     app.apprt.window_bring_to_front(&os_window);
                 }
-                let _ = reply.send(outcome);
+                answer_ctl_spawn(app, &reply, outcome);
             }
             Self::Counts(reply) => {
+                if let Ok(sid) = &outcome {
+                    crate::control::mark_ctl_spawned(&app.store, sid);
+                }
                 let counts = outcome.map(|_| {
                     app.windows.get(&window).map_or((0, 0), |ws| {
                         (ws.tab_set.active_index().unwrap_or(0), ws.tab_set.len())
@@ -88,6 +91,20 @@ impl TabSpawnThen {
             Self::Run(then) | Self::Before { then, .. } => then(app, outcome),
         }
     }
+}
+
+/// Answer a control client's spawn with `outcome`, first marking the session it started as
+/// `ctl spawn`'s ([`crate::SessionCtx::spawn_mark`]), so its `reveal` says `spawned` from the
+/// moment the client can name it. Whether the client took the answer.
+pub(crate) fn answer_ctl_spawn(
+    app: &App,
+    reply: &Sender<Result<String, String>>,
+    outcome: Result<String, String>,
+) -> bool {
+    if let Ok(sid) = &outcome {
+        crate::control::mark_ctl_spawned(&app.store, sid);
+    }
+    reply.send(outcome).is_ok()
 }
 
 /// Where a session spawned off the loop lands in its window.
@@ -189,7 +206,7 @@ pub(crate) struct AdoptSpare {
 
 /// Why the control verb's `split=` lands nowhere beside a worker on show.
 pub(crate) const WORKER_SPLIT_REFUSED: &str = "spawn split= does not land beside a worker under the \
-     Workers tab: choose Move to Tab on its row first, or split a person's tab";
+     Workers tab: choose Keep as Tab on its row first, or split a person's tab";
 
 /// Admission facts captured when a spawn is booked on the main thread.
 #[derive(Clone, Default)]
@@ -427,6 +444,8 @@ struct InFlight {
     completion: Arc<TabSpawnCompletion>,
     /// The newborn's own theme, as asked ([`SpawnAsk::theme`]).
     theme: Option<crate::session_theme::SessionTheme>,
+    /// The act it was booked under ([`crate::tab_marks::acting`]), which its tab's open names.
+    acting: Option<crate::tab_marks::Acting>,
 }
 
 type SpawnGrid = (u16, u16, Option<(u16, u16)>);
@@ -449,14 +468,14 @@ struct Held {
     menu: MenuMark,
     /// Whether a modifier change for a new window was already applied to `typed_into`.
     applied: bool,
-    /// Whether an `hwkey` burst posted it, decided as it arrived (`App::key_event_posted`): its
-    /// replay runs as a control client's gesture then, whatever event AppKit is dispatching.
-    posted: bool,
+    /// Where it came from, decided as it arrived (`App::input_origin`): its replay runs marked
+    /// as that then, whatever event AppKit is dispatching.
+    origin: InputOrigin,
 }
 
 /// A held input event released for replay ([`App::replay_window_event`]): the OS window it goes
-/// through, the event, and whether an `hwkey` burst posted it ([`Held::posted`]).
-pub(crate) type Released = (WinitWindowId, WindowEvent, bool);
+/// through, the event, and where it came from ([`Held::origin`]).
+pub(crate) type Released = (WinitWindowId, WindowEvent, InputOrigin);
 
 const fn is_pointer(event: &WindowEvent) -> bool {
     matches!(
@@ -534,7 +553,7 @@ fn sift_held(
             } else {
                 through.unwrap_or(h.typed_into)
             };
-            replay.push((via, h.event, h.posted));
+            replay.push((via, h.event, h.origin));
             continue;
         }
         let keep = match &h.event {
@@ -563,7 +582,7 @@ fn sift_held(
             }
         };
         if keep {
-            replay.push((h.typed_into, h.event, h.posted));
+            replay.push((h.typed_into, h.event, h.origin));
         }
     }
     (replay, dropped)
@@ -583,6 +602,10 @@ pub(crate) struct TabSpawns {
     pub(crate) menu: Arc<MenuMarks>,
     /// Active replay floor preventing replayed input from waiting on earlier bookings.
     floor: Option<ReplayFloor>,
+    /// A test's app with no event loop books each spawn as one with a loop would and sends no
+    /// job: the test lands it ([`App::install_spawned_tab`]).
+    #[cfg(test)]
+    pub(crate) unsent: bool,
 }
 
 /// Cutoff marks so replayed input waits only for spawns or menu posts triggered during the replay.
@@ -669,7 +692,7 @@ impl TabSpawns {
             && last.target == held.target
             && last.spawn == held.spawn
             && last.menu == held.menu
-            && last.posted == held.posted
+            && last.origin == held.origin
             && coalesce(&mut last.event, &held.event)
         {
             last.until = last.until.max(held.until);
@@ -780,8 +803,8 @@ pub(crate) struct MenuOrigin {
     content: Option<crate::front_content::FrontContent>,
     /// The marks of the gesture that chose the row: the command runs under them
     /// ([`App::dispatch_marked_menu_action`]), so a person-only act in a control client's
-    /// refuses the client, and an edit an accessibility client's makes is no person's
-    /// ([`crate::owner_keys_save`]).
+    /// refuses the client, and an edit an accessibility client's or another process's input
+    /// makes is no person's ([`crate::owner_keys_save`]).
     chooser: GestureMarks,
 }
 
@@ -796,6 +819,11 @@ impl MenuOrigin {
     /// Whether an accessibility client's request chose the row.
     pub(crate) const fn assistive(self) -> bool {
         self.chooser.assistive
+    }
+
+    /// Whether a key or click another process posted chose the row.
+    pub(crate) const fn relayed(self) -> bool {
+        self.chooser.relayed
     }
 }
 
@@ -839,8 +867,8 @@ fn post_menu_action_from(
     sent
 }
 
-/// Post `action` from a native menu or toolbar callback using [`NATIVE_MENU_MARKS`], marked as a
-/// control client's gesture when one chose it ([`native_post_by_controller`]).
+/// Post `action` from a native menu or toolbar callback using [`NATIVE_MENU_MARKS`], marked by
+/// where the key or click that chose it came from ([`native_post_origin`]).
 #[cfg(target_os = "macos")]
 pub(crate) fn post_native_menu_action(
     proxy: &EventLoopProxy<Wake>,
@@ -851,20 +879,17 @@ pub(crate) fn post_native_menu_action(
         NATIVE_MENU_MARKS.get().map(Arc::as_ref),
         action,
         None,
-        GestureMarks {
-            controller: native_post_by_controller(),
-            assistive: false,
-        },
+        GestureMarks::of(native_post_origin()),
     )
 }
 
-/// Whether the native menu or toolbar item AppKit runs now is a control client's gesture: the
-/// key that chose it by its key equivalent (⌘V is Edit ▸ Paste) is one an `hwkey` burst posted,
-/// which takes the person's own event path with no mark of its own
-/// ([`crate::hwkey::current_event_posted`]).
+/// Where the native menu or toolbar item AppKit runs now was chosen from: the key that chose it
+/// by its key equivalent (⌘V is Edit ▸ Paste) or the click that chose it, one an `hwkey` burst
+/// posted (a control client's gesture) or another process posted (relayed), which takes the
+/// person's own event path with no mark of its own ([`crate::hwkey::current_event_origin`]).
 #[cfg(any(target_os = "macos", all(test, unix)))]
-pub(crate) fn native_post_by_controller() -> bool {
-    crate::hwkey::current_event_posted()
+pub(crate) fn native_post_origin() -> InputOrigin {
+    crate::hwkey::current_event_origin()
 }
 
 struct Spawner {
@@ -1115,7 +1140,7 @@ fn hold_for_test(completion: &TabSpawnCompletion) {
     };
     let mut held = path.clone();
     held.push(".held");
-    let _ = std::fs::write(&held, b"");
+    let _ = aterm_uds::atomic_file::write(std::path::Path::new(&held), b"", 0o600);
     let path = std::path::PathBuf::from(path);
     let until = Instant::now() + Duration::from_secs(60);
     while !completion.cancelled() && !path.exists() && Instant::now() < until {
@@ -1179,7 +1204,7 @@ impl App {
             );
             return;
         }
-        let Some(proxy) = self.proxy.clone() else {
+        let Some(proxy) = self.spawn_proxy() else {
             then.answer(self, owner, Err("no event loop to spawn on".to_string()));
             return;
         };
@@ -1205,12 +1230,22 @@ impl App {
         then: TabSpawnThen,
     ) {
         let (window, place, grid) = self.reserve_window();
-        let Some(proxy) = self.proxy.clone() else {
+        let Some(proxy) = self.spawn_proxy() else {
             let why = place.failed(self, "no event loop to host the new window", false);
             then.answer(self, window, Err(why));
             return;
         };
         self.book_off_loop(window, place, grid, lineage_parent, ask, then, proxy);
+    }
+
+    /// Where a booking's job posts its landing: the event loop's proxy, or, in a test's app that
+    /// books unsent ([`TabSpawns::unsent`]), nowhere; `None` where no spawn can be booked.
+    fn spawn_proxy(&self) -> Option<Option<EventLoopProxy<Wake>>> {
+        #[cfg(test)]
+        if self.proxy.is_none() && self.tab_spawns.unsent {
+            return Some(None);
+        }
+        self.proxy.clone().map(Some)
     }
 
     fn reserve_window(&mut self) -> (WindowId, SpawnPlace, SpawnGrid) {
@@ -1238,7 +1273,7 @@ impl App {
         parent: Option<aterm_session::SessionId>,
         ask: SpawnAsk,
         then: TabSpawnThen,
-        proxy: EventLoopProxy<Wake>,
+        proxy: Option<EventLoopProxy<Wake>>,
     ) {
         let inherited = self.inherited_theme(window, place, ask.theme.as_ref());
         let tried = if inherited.is_some() {
@@ -1367,7 +1402,12 @@ impl App {
             unasked,
             completion: Arc::clone(&completion),
             theme,
+            acting: crate::tab_marks::acting(),
         });
+        // A test's unsent booking stands as booked; the test lands it.
+        let Some(proxy) = proxy else {
+            return;
+        };
         let job = TabSpawnJob {
             id,
             window,
@@ -1459,8 +1499,8 @@ impl App {
         repair: Option<WindowId>,
     ) {
         self.replaying(true, |app| {
-            for (winit_id, event, posted) in replay {
-                app.replay_window_event(el, winit_id, event, posted);
+            for (winit_id, event, origin) in replay {
+                app.replay_window_event(el, winit_id, event, origin);
             }
         });
         if let Some(ws) = repair.and_then(|at| self.windows.get_mut(&at)) {
@@ -1553,8 +1593,8 @@ impl App {
         if self.tab_spawns.menu.settle(mark) {
             let release = self.claim_menu_held_input(mark, booked);
             self.replaying(false, |app| {
-                for (winit_id, event, posted) in release {
-                    app.replay_window_event(el, winit_id, event, posted);
+                for (winit_id, event, origin) in release {
+                    app.replay_window_event(el, winit_id, event, origin);
                 }
             });
         }
@@ -1569,11 +1609,7 @@ impl App {
         gesture: GestureMarks,
         dispatch: impl FnOnce(&mut Self, crate::menu::MenuAction),
     ) {
-        let chooser = origin.map_or_else(GestureMarks::default, |origin| origin.chooser);
-        let marks = GestureMarks {
-            controller: gesture.controller || chooser.controller,
-            assistive: gesture.assistive || chooser.assistive,
-        };
+        let marks = origin.map_or(gesture, |origin| gesture.union(origin.chooser));
         if let Some(action) = self.menu_action_for_origin(action, origin) {
             self.with_gesture_marks(marks, |app| dispatch(app, action));
         }
@@ -1613,16 +1649,16 @@ impl App {
                 .rev()
                 .find(|(from, ..)| typed.is_some() && *from == typed);
             let Some(&(_, target, until, id)) = spawn else {
-                release.push((h.typed_into, h.event, h.posted));
+                release.push((h.typed_into, h.event, h.origin));
                 continue;
             };
             if Some(target) != typed {
                 if is_pointer(&h.event) {
-                    release.push((h.typed_into, h.event, h.posted));
+                    release.push((h.typed_into, h.event, h.origin));
                     continue;
                 }
                 if matches!(h.event, WindowEvent::ModifiersChanged(_)) {
-                    release.push((h.typed_into, h.event.clone(), h.posted));
+                    release.push((h.typed_into, h.event.clone(), h.origin));
                     h.applied = true;
                 }
             }
@@ -1683,6 +1719,7 @@ impl App {
             parks,
             refuses_worker_split,
             unasked,
+            acting,
         ) = match self
             .tab_spawns
             .in_flight
@@ -1703,6 +1740,7 @@ impl App {
                     t.parks,
                     t.refuses_worker_split,
                     t.unasked,
+                    t.acting,
                 )
             }
             None => (
@@ -1717,6 +1755,7 @@ impl App {
                 false,
                 false,
                 false,
+                None,
             ),
         };
         let new_window = matches!(place, SpawnPlace::Window { .. });
@@ -1762,6 +1801,7 @@ impl App {
                             self.catch_up_colors(&session, colors);
                         }
                         let sid = session.ctx.self_id.as_str().to_string();
+                        let acted = crate::tab_marks::ActScope::resume(acting);
                         let installed = match place {
                             SpawnPlace::Tab => {
                                 let kept = background
@@ -1790,6 +1830,7 @@ impl App {
                                 self.install_window_session(window, session, parent, grid, os)
                             }
                         };
+                        drop(acted);
                         if installed.is_ok() && theme.is_some() {
                             self.set_session_theme(id, theme);
                         }
@@ -1949,7 +1990,7 @@ impl App {
             until,
             menu,
             applied: now_too.is_some(),
-            posted: self.key_event_posted,
+            origin: self.input_origin,
         });
         now_too
     }
@@ -2145,8 +2186,18 @@ pub(crate) mod test_support {
             unasked: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
+            acting: None,
         });
         id
+    }
+
+    /// The act the newest booking was made under ([`crate::tab_marks::acting`] as it booked),
+    /// which its tab's open names once it lands.
+    pub(crate) fn booked_act(app: &App) -> Option<crate::tab_marks::Acting> {
+        app.tab_spawns
+            .in_flight
+            .last()
+            .and_then(|t| t.acting.clone())
     }
 
     /// Book an in-flight tab nobody asked for ([`SpawnAsk::unasked`]), as [`book`] does.
@@ -2205,6 +2256,7 @@ pub(crate) mod test_support {
             unasked: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
+            acting: None,
         });
         (id, window)
     }
@@ -2675,6 +2727,79 @@ pub(crate) mod tests {
         );
     }
 
+    /// A candidate's spawn that finishes before its Commit waits for that Commit and lands: its
+    /// completion alone clears the booking, and a booking refuses every later update. A held
+    /// wake past the bound is no reason to lose it.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawn_finishing_before_the_commit_lands_after_it() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let (shell, _shell_pty) = piped_session(app.next_session_id);
+        app.push_stub_tab(wid, shell);
+        app.incoming_handoff_pending = true;
+        app.handoff_committed_wakes = (0..crate::MAX_COMMITTED_DEFERRED_WAKES)
+            .map(|_| Wake::Snapshot)
+            .collect();
+
+        let (session, _pty) = piped_session(app.next_session_id);
+        let id = book(&mut app, wid, TabSpawnThen::Nothing);
+        let completion = Arc::clone(&app.tab_spawns.in_flight.last().unwrap().completion);
+        let mut queued = None;
+        publish_completion(
+            &completion,
+            TabSpawned {
+                id,
+                window: wid,
+                session: Ok(session),
+                reader_gate: None,
+            },
+            |wake| {
+                queued = Some(wake);
+                true
+            },
+        );
+        assert!(
+            app.admit_wake_before_commit(queued.expect("the worker queued its completion"))
+                .is_none(),
+            "not landed ahead of the Commit"
+        );
+        assert!(!app.tab_spawns.is_empty(), "still booked");
+        let Some(Wake::TabSpawned(held)) = app.handoff_committed_wakes.pop() else {
+            panic!("the completion was dropped, so its booking would refuse updates for good");
+        };
+
+        app.incoming_handoff_pending = false;
+        assert!(app.install_spawned_tab(held.take().expect("the session it finished with")));
+        assert!(
+            app.tab_spawns.is_empty(),
+            "nothing is left to refuse an update"
+        );
+    }
+
+    /// A menu press swallowed before the Commit holds no later key or click for its mark.
+    #[test]
+    fn a_menu_press_dropped_before_the_commit_holds_no_input() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let winit_id = WinitWindowId::from(0u64);
+        app.winit_to_window.insert(winit_id, wid);
+        app.incoming_handoff_pending = true;
+        let mark = app.tab_spawns.menu.mint(Instant::now());
+        assert!(app.drops_wake_before_commit(&Wake::MenuAction {
+            action: crate::menu::MenuAction::Copy,
+            mark,
+            origin: None,
+            gesture: GestureMarks::default(),
+        }));
+        app.incoming_handoff_pending = false;
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, typed("x"))
+                .is_some(),
+            "the swallowed press must not hold the key typed after the Commit"
+        );
+    }
+
     fn said_dropped(app: &App, what: &str) -> bool {
         app.messages.live_rows().any(|l| {
             l.msg.title == "Keystrokes dropped" && l.msg.detail.iter().any(|d| d.contains(what))
@@ -2686,9 +2811,9 @@ pub(crate) mod tests {
     }
 
     fn replay(app: &mut App, wid: WindowId, events: Vec<Released>) {
-        for (_, event, posted) in events {
+        for (_, event, origin) in events {
             if let WindowEvent::Ime(ime) = event {
-                app.dispatch_ime_event(wid, ime, posted);
+                app.dispatch_ime_event(wid, ime, origin);
             }
         }
     }
@@ -2907,6 +3032,7 @@ pub(crate) mod tests {
             unasked: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
+            acting: None,
         });
         let (session, _pty) = piped_session(id);
         let sid = session.ctx.self_id.clone();
@@ -4371,14 +4497,14 @@ pub(crate) mod tests {
     /// A HELD KEY REPLAYS AS THE KEY IT ARRIVED AS: whether a key is one an `hwkey` burst posted
     /// is read off the event AppKit is dispatching (`-[NSApp currentEvent]`), which by a held
     /// key's replay is another one (the person's mouse, or a burst's next key). So it is decided
-    /// as the key arrives (`crate::arriving_key_posted`, into `App::key_event_posted`) and the
+    /// as the key arrives (`crate::arriving_input_origin`, into `App::input_origin`) and the
     /// hold carries it: a posted ⌘V held under a pending menu mark (a burst's ⌘T, say) comes back
     /// posted, and its replay through the key arm (`App::replay_window_event` runs
     /// `App::dispatch_hw_key` with the carried word) pastes no clipboard while nothing posted is
     /// being dispatched; the person's ⌘V held beside it comes back the person's and pastes while a
     /// burst's key is being dispatched. A key typed before an incoming handoff's Commit carries
     /// the word the same way.
-    /// NEGATIVE CONTROL: with the hold keeping no word (`posted: false` in
+    /// NEGATIVE CONTROL: with the hold keeping no word (`origin: InputOrigin::Person` in
     /// `defer_tab_spawn_input`, which is what the branch's replay that read the current event
     /// found here: no posted key under dispatch), the burst's held ⌘V sent `s3cret-pass`.
     #[test]
@@ -4388,7 +4514,7 @@ pub(crate) mod tests {
             Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr,
         };
 
-        use crate::hwkey::{CURRENT_KEY_STUB, NS_EVENT_TYPE_KEY_DOWN, PostedKey, note_posted};
+        use crate::hwkey::{CURRENT_INPUT_STUB, NS_EVENT_TYPE_KEY_DOWN, NativeInput, note_posted};
         const SECRET: &str = "s3cret-pass";
         if !crate::app_input::HARDCODED_SUPER_CHORDS {
             return;
@@ -4429,51 +4555,60 @@ pub(crate) mod tests {
             is_synthetic: false,
         };
         let key = |stamp: f64, posted: bool| {
-            let key = PostedKey {
+            let key = NativeInput {
                 kind: NS_EVENT_TYPE_KEY_DOWN,
                 keycode: 9,
                 timestamp: stamp,
+                source_pid: crate::hwkey::HID_SYSTEM,
             };
             if posted {
                 note_posted(&[key]).expect("room");
             }
             key
         };
-        let dispatching = |current: Option<PostedKey>, f: &mut dyn FnMut()| {
-            CURRENT_KEY_STUB.with(|stub| stub.set(current));
+        let dispatching = |current: Option<NativeInput>, f: &mut dyn FnMut()| {
+            CURRENT_INPUT_STUB.with(|stub| stub.set(current));
             f();
-            CURRENT_KEY_STUB.with(|stub| stub.set(None));
+            CURRENT_INPUT_STUB.with(|stub| stub.set(None));
         };
         // The event as `App::on_window_event` takes it: decided as it arrives, then held.
-        let arrive = |app: &mut App, current: PostedKey| {
-            let mut posted = false;
+        let arrive = |app: &mut App, current: NativeInput| {
+            let mut origin = InputOrigin::Person;
             dispatching(Some(current), &mut || {
-                posted = crate::arriving_key_posted(&cmd_v())
+                origin = crate::arriving_input_origin(&cmd_v());
             });
-            app.key_event_posted = posted;
+            app.input_origin = origin;
             assert!(app.defer_tab_spawn_input(wid, winit_id, cmd_v()).is_none());
-            app.key_event_posted = false;
-            posted
+            app.input_origin = InputOrigin::Person;
+            origin
         };
         // The replay as `App::replay_window_event` runs it through the key arm.
-        let replay = |app: &mut App, released: Released, current: Option<PostedKey>| {
-            let (_, WindowEvent::KeyboardInput { event, .. }, posted) = released else {
+        let replay = |app: &mut App, released: Released, current: Option<NativeInput>| {
+            let (_, WindowEvent::KeyboardInput { event, .. }, origin) = released else {
                 panic!("a key");
             };
             app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SUPER;
             dispatching(current, &mut || {
-                app.dispatch_hw_key(wid, event.clone(), posted)
+                app.dispatch_hw_key(wid, event.clone(), origin);
             });
             app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
         };
 
         let marks = Arc::clone(&app.tab_spawns.menu);
         let mark = marks.mint(Instant::now());
-        assert!(arrive(&mut app, key(2_000.25, true)), "a burst's ⌘V");
-        assert!(!arrive(&mut app, key(2_000.5, false)), "the person's ⌘V");
+        assert_eq!(
+            arrive(&mut app, key(2_000.25, true)),
+            InputOrigin::Posted,
+            "a burst's ⌘V"
+        );
+        assert_eq!(
+            arrive(&mut app, key(2_000.5, false)),
+            InputOrigin::Person,
+            "the person's ⌘V"
+        );
         assert!(marks.settle(mark));
         let mut back = app.claim_menu_held_input(mark, app.tab_spawns.in_flight.len());
-        let words: Vec<bool> = back.iter().map(|(.., posted)| *posted).collect();
+        let words: Vec<InputOrigin> = back.iter().map(|(.., origin)| *origin).collect();
         let persons = back.pop().expect("the person's ⌘V");
         let bursts = back.pop().expect("the burst's ⌘V");
         replay(&mut app, bursts, None);
@@ -4488,19 +4623,32 @@ pub(crate) mod tests {
             person_sent.contains(SECRET),
             "the person's held ⌘V sent {person_sent:?}"
         );
-        assert_eq!(words, [true, false], "each came back as it arrived");
+        assert_eq!(
+            words,
+            [InputOrigin::Posted, InputOrigin::Person],
+            "each came back as it arrived"
+        );
 
         app.incoming_handoff_pending = true;
-        app.key_event_posted = true;
-        app.queue_pre_commit_input(winit_id, cmd_v());
-        app.key_event_posted = false;
-        app.queue_pre_commit_input(winit_id, cmd_v());
+        for origin in [
+            InputOrigin::Posted,
+            InputOrigin::Relayed,
+            InputOrigin::Person,
+        ] {
+            app.input_origin = origin;
+            app.queue_pre_commit_input(winit_id, cmd_v());
+        }
+        app.input_origin = InputOrigin::Person;
         assert_eq!(
             app.handoff_deferred_input
                 .iter()
-                .map(|(.., posted)| *posted)
+                .map(|(.., origin)| *origin)
                 .collect::<Vec<_>>(),
-            [true, false],
+            [
+                InputOrigin::Posted,
+                InputOrigin::Relayed,
+                InputOrigin::Person
+            ],
             "a key typed before Commit carries its word"
         );
         crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
@@ -4511,8 +4659,8 @@ pub(crate) mod tests {
     #[test]
     fn held_ime_replays_its_source_after_the_raw_ledger_forgets_it() {
         use crate::hwkey::{
-            CURRENT_KEY_STUB, NS_EVENT_TYPE_KEY_DOWN, NS_EVENT_TYPE_KEY_UP, PostedKey,
-            event_posted, note_posted, with_window_event_posted_for_test,
+            CURRENT_INPUT_STUB, NS_EVENT_TYPE_KEY_DOWN, NS_EVENT_TYPE_KEY_UP, NativeInput,
+            classify, note_posted, with_window_event_origin_for_test,
         };
 
         let mut app = App::headless_for_test();
@@ -4522,68 +4670,82 @@ pub(crate) mod tests {
         let (session, pty) = piped_session(app.next_session_id);
         let ctx = Arc::clone(&session.ctx);
         app.push_stub_tab(wid, session);
-        let a = PostedKey {
+        let a = NativeInput {
             kind: NS_EVENT_TYPE_KEY_DOWN,
             keycode: 0,
             timestamp: 6_100.0,
+            source_pid: crate::hwkey::HID_SYSTEM,
         };
-        let b = PostedKey {
+        let b = NativeInput {
             timestamp: 6_101.0,
             ..a
         };
-        let up = PostedKey {
+        let up = NativeInput {
             kind: NS_EVENT_TYPE_KEY_UP,
             ..b
         };
         note_posted(&[a, b, up]).expect("room");
-        let retained_a = event_posted(a);
-        assert!(retained_a, "A was classified at its native source");
-        assert!(event_posted(b));
-        assert!(event_posted(up));
-        assert!(
-            !event_posted(a),
+        let retained_a = classify(a);
+        assert_eq!(
+            retained_a,
+            InputOrigin::Posted,
+            "A was classified at its native source"
+        );
+        assert_eq!(classify(b), InputOrigin::Posted);
+        assert_eq!(classify(up), InputOrigin::Posted);
+        assert_eq!(
+            classify(a),
+            InputOrigin::Person,
             "PRECONDITION: later keys consumed A's raw ledger entry"
         );
 
         let marks = Arc::clone(&app.tab_spawns.menu);
         let mark = marks.mint(Instant::now());
-        let hold = |app: &mut App, posted: bool, text: &str| {
-            with_window_event_posted_for_test(posted, || {
+        let hold = |app: &mut App, origin: InputOrigin, text: &str| {
+            with_window_event_origin_for_test(origin, || {
                 for ime in [
                     Ime::Preedit(text.into(), Some((0, 0))),
                     Ime::Commit(text.into()),
                 ] {
                     let event = WindowEvent::Ime(ime);
-                    let arrived = crate::arriving_key_posted(&event);
-                    assert_eq!(arrived, posted);
+                    let arrived = crate::arriving_input_origin(&event);
+                    assert_eq!(arrived, origin);
                     app.note_window_input_arrival(&event, arrived);
-                    app.key_event_posted = arrived;
+                    app.input_origin = arrived;
                     assert!(app.defer_tab_spawn_input(wid, winit_id, event).is_none());
-                    app.key_event_posted = false;
+                    app.input_origin = InputOrigin::Person;
                 }
             });
         };
-        CURRENT_KEY_STUB.with(|current| current.set(None));
+        CURRENT_INPUT_STUB.with(|current| current.set(None));
         hold(&mut app, retained_a, "日本");
-        CURRENT_KEY_STUB.with(|current| current.set(Some(up)));
-        assert!(
-            crate::hwkey::current_event_posted(),
+        CURRENT_INPUT_STUB.with(|current| current.set(Some(up)));
+        assert_eq!(
+            crate::hwkey::current_event_origin(),
+            InputOrigin::Posted,
             "the opposite ambient posted key"
         );
-        hold(&mut app, false, "語");
-        CURRENT_KEY_STUB.with(|current| current.set(None));
+        hold(&mut app, InputOrigin::Person, "語");
+        CURRENT_INPUT_STUB.with(|current| current.set(None));
         assert!(marks.settle(mark));
         let mut released = app.claim_menu_held_input(mark, app.tab_spawns.in_flight.len());
         assert_eq!(
             released
                 .iter()
-                .map(|(.., posted)| *posted)
+                .map(|(.., origin)| *origin)
                 .collect::<Vec<_>>(),
-            [true, true, false, false]
+            [
+                InputOrigin::Posted,
+                InputOrigin::Posted,
+                InputOrigin::Person,
+                InputOrigin::Person
+            ]
         );
         let physical = released.split_off(2);
 
-        with_window_event_posted_for_test(false, || replay(&mut app, wid, released));
+        with_window_event_origin_for_test(InputOrigin::Person, || {
+            replay(&mut app, wid, released);
+        });
         crate::app_input::paste_order::await_drain_for_test(&ctx.sink);
         assert_eq!(drain(&pty), "日本".as_bytes());
         assert_eq!(
@@ -4595,9 +4757,11 @@ pub(crate) mod tests {
             None
         );
 
-        CURRENT_KEY_STUB.with(|current| current.set(Some(up)));
-        with_window_event_posted_for_test(true, || replay(&mut app, wid, physical));
-        CURRENT_KEY_STUB.with(|current| current.set(None));
+        CURRENT_INPUT_STUB.with(|current| current.set(Some(up)));
+        with_window_event_origin_for_test(InputOrigin::Posted, || {
+            replay(&mut app, wid, physical);
+        });
+        CURRENT_INPUT_STUB.with(|current| current.set(None));
         crate::app_input::paste_order::await_drain_for_test(&ctx.sink);
         assert_eq!(drain(&pty), "語".as_bytes());
         let counts = ctx.human_input.counts();
@@ -4610,17 +4774,17 @@ pub(crate) mod tests {
         assert!(!app.person_gesture_refused());
 
         app.incoming_handoff_pending = true;
-        for posted in [true, false] {
-            app.key_event_posted = posted;
+        for origin in [InputOrigin::Posted, InputOrigin::Person] {
+            app.input_origin = origin;
             app.queue_pre_commit_input(winit_id, WindowEvent::Ime(Ime::Commit("x".into())));
         }
-        app.key_event_posted = false;
+        app.input_origin = InputOrigin::Person;
         assert_eq!(
             app.handoff_deferred_input
                 .iter()
-                .map(|(.., posted)| *posted)
+                .map(|(.., origin)| *origin)
                 .collect::<Vec<_>>(),
-            [true, false],
+            [InputOrigin::Posted, InputOrigin::Person],
             "handoff Commit retains IME provenance too"
         );
     }
@@ -4708,7 +4872,7 @@ pub(crate) mod tests {
             .map(|h| {
                 (
                     h.target,
-                    named(&[(h.typed_into, h.event.clone(), h.posted)]).remove(0),
+                    named(&[(h.typed_into, h.event.clone(), h.origin)]).remove(0),
                 )
             })
             .collect();

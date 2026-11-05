@@ -8,8 +8,6 @@
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
-#[cfg(test)]
-aterm_secrets::memoized_x25519_in_tests!();
 
 pub mod agent;
 pub mod askpass;

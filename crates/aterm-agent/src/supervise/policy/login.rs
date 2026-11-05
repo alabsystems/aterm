@@ -58,6 +58,73 @@ fn why_persons(picker: &LoginPicker, method: Option<LoginMethod>) -> String {
     )
 }
 
+/// WHAT CLAUDE CODE'S SETTINGS MAKE OF `/login` IN THE SESSION (v6 §14.17 rule 1; the
+/// post-landing review, 2026-11-02), as the host read them before aterm types it
+/// (`IdleHost::login_pin`, `claude_settings::login_pin`). Claude Code 2.1.316 (the store build's
+/// own code, read for this rule) reads `forceLoginMethod` from its merged settings, and its
+/// `/login` then draws no method picker:
+/// `claudeai` or `console` starts the OAuth sign-in one tick after the Enter, and the system
+/// browser comes forward over the person's work; a gateway (`forceLoginGatewayUrl`, or
+/// `forceLoginMethod` `gateway` in managed settings) draws a form of its own, which aterm's login
+/// reader does not read. aterm types `/login` only over [`Self::Picker`]; over every other it tells
+/// the person, quietly, to type it themselves ([`Self::leaves_login`]), so the browser opens on
+/// their key, never aterm's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LoginPin {
+    /// Nothing the host read pins a sign-in method: `/login` draws its picker. Also the answer of
+    /// a host that reads no settings (a test's, a replay of a tape recorded before the door).
+    #[default]
+    Picker,
+    /// `forceLoginMethod` names a method (`claudeai`, `console`): `/login` opens the browser at once.
+    Method,
+    /// A gateway sign-in (`forceLoginGatewayUrl`, or `forceLoginMethod` `gateway`): `/login`
+    /// draws the gateway's form, which aterm does not read.
+    Gateway,
+    /// A settings source of the session's could not be read, or its environment could not: aterm
+    /// cannot tell whether `/login` opens the browser at once.
+    Unread,
+}
+
+impl LoginPin {
+    /// Every pin, for a tape's words.
+    pub const ALL: [Self; 4] = [Self::Picker, Self::Method, Self::Gateway, Self::Unread];
+
+    /// Whether `/login` is the person's to type, not aterm's: anything but [`Self::Picker`].
+    #[must_use]
+    pub const fn leaves_login(self) -> bool {
+        !matches!(self, Self::Picker)
+    }
+
+    /// The pin's word on a tape and in a journal line.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Picker => "picker",
+            Self::Method => "method",
+            Self::Gateway => "gateway",
+            Self::Unread => "unread",
+        }
+    }
+
+    /// The pin [`Self::word`] names.
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.word() == word)
+    }
+
+    /// Why aterm did not type `/login` over the pin (`notice::LOGIN_NOT_RUN`'s `{why}`), `None`
+    /// over [`Self::Picker`].
+    #[must_use]
+    pub const fn why(self) -> Option<&'static str> {
+        match self {
+            Self::Picker => None,
+            Self::Method => Some(super::notice::WHY_PINNED),
+            Self::Gateway => Some(super::notice::WHY_GATEWAY),
+            Self::Unread => Some(super::notice::WHY_PIN_UNREAD),
+        }
+    }
+}
+
 /// Returns the decision at the method picker of the loop's own `/login` ([`why_persons`]): the
 /// person's, escalated quietly with why, never a key pressed in it.
 #[must_use]

@@ -7,7 +7,6 @@
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -371,7 +370,7 @@ fn write_standin_records(
             escape(&cwd_text),
             escape(&cwd_text),
         );
-        std::fs::write(&transcript_path, seed)?;
+        crate::util::write_fresh(&transcript_path, seed)?;
     }
     if let Some((prompt, reply)) = append_turn {
         let stamp = utc_stamp(now_secs());
@@ -384,10 +383,7 @@ fn write_standin_records(
             escape(reply),
             escape(&cwd_text),
         );
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&transcript_path)?;
+        let mut f = crate::util::append_regular_file(&transcript_path)?;
         f.write_all(rows.as_bytes())?;
     }
     let session_json = format!(
@@ -513,11 +509,7 @@ pub fn claude_main(args: &[String]) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
 
     let _ = std::fs::create_dir_all(&ctl_dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(ctl_dir.join("launches.tsv"))
-    {
+    if let Ok(mut f) = crate::util::append_regular_file(&ctl_dir.join("launches.tsv")) {
         let _ = writeln!(f, "{pid}\t{login}\t{}", args.join(" "));
     }
 
@@ -650,11 +642,7 @@ pub fn claude_main(args: &[String]) -> i32 {
                     fire_status_tap(cmd, &session, five_pct, 10, api_ms, now_secs());
                 }
                 let turn_log = if on_a { "turns-a.log" } else { "turns-b.log" };
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(ctl_dir.join(turn_log))
-                {
+                if let Ok(mut f) = crate::util::append_regular_file(&ctl_dir.join(turn_log)) {
                     let _ = writeln!(f, "{pid}\t{prompt_shown}");
                 }
             }
@@ -663,9 +651,8 @@ pub fn claude_main(args: &[String]) -> i32 {
 }
 
 fn write_enrolled_login(dir: &Path, label: &str, now: i64) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("chmod {}: {e}", dir.display()))?;
+    crate::util::create_private_dir_all(dir)
+        .map_err(|e| format!("create {}: {e}", dir.display()))?;
     let expires_ms = (now + 86_400) * 1000;
     let creds = format!(
         "{{\"claudeAiOauth\":{{\"accessToken\":\"tok-{label}\",\"refreshToken\":\"ref-{label}\",\
@@ -754,9 +741,7 @@ pub fn cmd_swarm(args: &[String]) -> Res {
     write_enrolled_login(&login_b, LABEL_B, now)?;
 
     let claude_home = world.home.join(".claude");
-    std::fs::create_dir_all(&claude_home).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&claude_home, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| e.to_string())?;
+    crate::util::create_private_dir_all(&claude_home).map_err(|e| e.to_string())?;
     atomic_write(
         &world.home.join(".claude.json"),
         b"{\"hasCompletedOnboarding\":true}\n",
@@ -1003,7 +988,10 @@ pub fn cmd_swarm(args: &[String]) -> Res {
         ledger_proven_b: ledger_has_proven(&ledger_text, LABEL_B),
     };
     let failures = judge_evidence(&ev, &login_a_str, &login_b_str);
-    inst.stop();
+    let cleanup = inst.stop();
+    if cleanup.is_err() {
+        world.keep();
+    }
 
     println!("swarm rotate:");
     println!(
@@ -1018,6 +1006,9 @@ pub fn cmd_swarm(args: &[String]) -> Res {
 
     if !rotated_and_proven || !failures.is_empty() {
         world.keep();
+        if let Err(why) = &cleanup {
+            eprintln!("swarm rotate: instance cleanup failed: {why}");
+        }
         let host_log = scratch_text(&world.state().join("logs/aterm.log"));
         let tail: Vec<&str> = host_log
             .lines()
@@ -1035,6 +1026,7 @@ pub fn cmd_swarm(args: &[String]) -> Res {
         return Ok(1);
     }
 
+    cleanup.map_err(Fail::die)?;
     println!("swarm rotate: PASS");
     Ok(0)
 }

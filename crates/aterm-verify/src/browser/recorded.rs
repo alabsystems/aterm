@@ -27,10 +27,7 @@ pub(crate) struct Recording {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    aterm_digest::Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
 }
 
 fn png(frame: &Frame) -> Result<Vec<u8>, String> {
@@ -59,7 +56,7 @@ pub(crate) fn write(dir: &Path, rec: &Recording) -> Result<(), String> {
     let mut listed = Vec::new();
     for (name, frame) in &rec.frames {
         let path = dir.join(format!("{name}.png"));
-        std::fs::write(&path, png(frame)?)
+        crate::write_fresh(&path, png(frame)?)
             .map_err(|e| format!("could not write {}: {e}", path.display()))?;
         listed.push(json!({
             "name": name,
@@ -87,7 +84,7 @@ pub(crate) fn write(dir: &Path, rec: &Recording) -> Result<(), String> {
     text += &rows.join(",\n");
     text += "\n  ]\n}\n";
     let path = dir.join(MANIFEST);
-    std::fs::write(&path, text).map_err(|e| format!("could not write {}: {e}", path.display()))
+    crate::write_fresh(&path, text).map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
 /// Read the recording in `dir`: every frame's PNG decoded and held to the manifest's size and

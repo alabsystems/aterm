@@ -5711,6 +5711,39 @@ fn land_a_fails_a_wrong_window_read() {
     let (w, why) = l(&s, "claude", Scenario::L5);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("not \"\u{2026}; waits on you\""), "{why}");
+    // The landed chip's description said to carry on beside the need (the post-landing review,
+    // 2026-11-02): the page and the chip's title said it waits.
+    let described = |tail: &str| {
+        let mut s = seen_land_a("claude");
+        s.window.chip.push(j(
+            380_000,
+            &format!(
+                "window=2 program=claude face=landed drawn=\"\u{2713} landed\" spoken=\"x\" \
+                 description=\"Landed. Needs you: {NEED}. {tail}\" title=\"x\""
+            ),
+        ));
+        s
+    };
+    let (carrying, waits) = {
+        use aterm_agent::harness::hold_said::NeedTail;
+        (
+            NeedTail::CarryingOn.sentence(),
+            NeedTail::WaitsOnYou.sentence(),
+        )
+    };
+    let (w, why) = l(&described(&carrying), "claude", Scenario::L5);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("the landed chip's description says") && why.contains(&waits),
+        "{why}"
+    );
+    let (w, why) = l(&described(&waits), "claude", Scenario::L5);
+    assert_eq!(w, "PASS", "{why}");
+    assert!(!why.contains(super::surfaces::L5_UNSPOKEN), "{why}");
+    // No description spoke the need beside the landing: L5 says it did not judge one.
+    let (w, why) = l(&seen_land_a("claude"), "claude", Scenario::L5);
+    assert_eq!(w, "PASS", "{why}");
+    assert!(why.contains(super::surfaces::L5_UNSPOKEN), "{why}");
     let mut s = seen_land_a("claude");
     for (_, p) in &mut s.window.page {
         *p = "-".into();
@@ -5941,7 +5974,13 @@ fn stopped_read(product: Option<&str>, first: bool) -> String {
         },
         ask: Some(usize::from(!first)),
         report: Some(usize::from(first)),
-        tip: product.map(|p| aterm_agent::supervise::mode_words::report_words(p, false)),
+        tip: product.map(|p| {
+            aterm_agent::supervise::mode_words::report_words(
+                p,
+                aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+                false,
+            )
+        }),
         pressing: if first { "@s-ask" } else { "@s-cn" }.into(),
     };
     format!("{} cleared=yes", read.line("s-ask", "s-cn"))
@@ -7037,6 +7076,163 @@ fn the_residual_modes_pick_their_chains_and_script_them() {
     assert_eq!(reply(Ladder, &[CONTINUE_TEXT]).as_deref(), Some(WORK));
     assert_eq!(ladder_env(), "ATERM_DEV_LADDER_SCALE=0.125");
     assert!(crate::lab::instance_env(&ladder_env()).is_ok());
+}
+
+/// L20 and C5 (`--mode dialog`): Claude Code's chains only, the first turn's `AskUserQuestion`
+/// called once with the new work Recommended, then each chain's script as its Autopilot answers.
+#[test]
+fn the_dialog_mode_asks_its_question_once_on_claude_code() {
+    use Chain::*;
+    assert_eq!(
+        Chain::of_mode(Mode::Dialog),
+        [LandDialog, CruiseDialog, Off]
+    );
+    assert_eq!(
+        Chain::of_mode_on(Mode::Dialog, Harness::Claude),
+        Chain::of_mode(Mode::Dialog)
+    );
+    for h in [Harness::Agy, Harness::Muse] {
+        assert_eq!(Chain::of_mode_on(Mode::Dialog, h), [Off], "{h:?}");
+        assert!(dialog_out_of_reach(h).is_some(), "{h:?}");
+    }
+    assert!(LandDialog.lands() && LandDialog.autopilot() == "land");
+    assert!(!CruiseDialog.lands() && CruiseDialog.autopilot() == "cruise");
+    assert!(!LandDialog.same_reply() && !CruiseDialog.same_reply());
+    assert_eq!(LandDialog.scenarios(), [Scenario::L20]);
+    assert_eq!(CruiseDialog.scenarios(), [Scenario::C5]);
+    assert_eq!(Mode::Dialog.walled(), None);
+    let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    let a = parse_args(&v(&["--harness", "claude", "--mode", "dialog"]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.mode, Mode::Dialog);
+    let sp = spec(&Chain::DIALOG);
+    for c in [LandDialog, CruiseDialog] {
+        let first = crate::stub::with_reply(sp.clone(), &[c.prompt()]);
+        let (name, input) = crate::stub::scripted_call(&first, false).expect("the call");
+        assert_eq!(name, "AskUserQuestion", "{c:?}");
+        let questions = input
+            .get("questions")
+            .and_then(J::as_arr)
+            .expect("questions");
+        let labels: Vec<&str> = questions[0]
+            .get("options")
+            .and_then(J::as_arr)
+            .expect("options")
+            .iter()
+            .filter_map(|o| o.get("label").and_then(J::as_str))
+            .collect();
+        assert_eq!(labels, [DIALOG_NEW_WORK, DIALOG_LANDS], "{c:?}");
+        assert!(crate::stub::scripted_call(&first, true).is_none(), "{c:?}");
+        assert_eq!(reply(c, &[]).as_deref(), Some(WORK), "{c:?}");
+    }
+    assert_eq!(reply(LandDialog, &[LAND]).as_deref(), Some(CLEAN));
+    assert_eq!(
+        reply(CruiseDialog, &[CONTINUE_TEXT]).as_deref(),
+        Some(DONE_CLAIM)
+    );
+}
+
+/// L20 and C5's judge: the Autopilot's own rule approved, none of the other's, none handed over,
+/// in time, and what the dialog's tool result carried back; L20's landing comes through the land
+/// check ([`judge_clean_landing`]).
+#[test]
+fn a_dialog_is_judged_by_its_autopilots_rule_and_what_came_back() {
+    use aterm_agent::supervise::policy::question::LAND_TEXT;
+    use aterm_agent::supervise::policy::{RULE_ANSWER_LAND, RULE_ANSWER_RECOMMENDED};
+    let asked = Chain::LandDialog.first_reply_ms();
+    let said = |label: &str| {
+        format!("User has answered your questions: \"{DIALOG_QUESTION}\"=\"{label}\"")
+    };
+    let rec = said(DIALOG_NEW_WORK);
+    let cruise = |rule: &str, decision: &str, answer: &str| Seen {
+        ledger: vec![row(
+            asked + 2_000,
+            rule,
+            decision,
+            "enter",
+            "the recommended answer",
+        )],
+        cover: Cover {
+            dialog_answers: Some(vec![answer.to_string()]),
+            ..Cover::default()
+        },
+        end_ms: T0 + 120_000,
+        ..Seen::default()
+    };
+    let v = cover::judge_dialog(
+        &cruise(RULE_ANSWER_RECOMMENDED, "approved", &rec),
+        false,
+        T0,
+    );
+    assert_eq!(v.word(), "PASS", "{}", v.why());
+    let mut late = cruise(RULE_ANSWER_RECOMMENDED, "approved", &rec);
+    late.ledger[0].ts = T0 + asked + 61_000;
+    for (tag, s) in [
+        ("land's rule", cruise(RULE_ANSWER_LAND, "approved", &rec)),
+        (
+            "handed over",
+            cruise(RULE_ANSWER_RECOMMENDED, "escalated", &rec),
+        ),
+        (
+            "other label",
+            cruise(RULE_ANSWER_RECOMMENDED, "approved", &said(DIALOG_LANDS)),
+        ),
+        ("late", late),
+    ] {
+        assert_eq!(cover::judge_dialog(&s, false, T0).word(), "FAIL", "{tag}");
+    }
+    let unanswered = Seen {
+        end_ms: T0 + 120_000,
+        ..Seen::default()
+    };
+    assert_eq!(
+        cover::judge_dialog(&unanswered, false, T0).word(),
+        "UNOBSERVED"
+    );
+
+    // L20: land-a's landing with no need, the dialog answered under Land's rule before it.
+    let mut land = landed_a();
+    land.meta.retain(|(_, m)| !needs_up(m));
+    land.journal.retain(|(_, l)| !l.starts_with("NEEDS "));
+    land.ledger.insert(
+        0,
+        row(
+            asked + 2_000,
+            RULE_ANSWER_LAND,
+            "approved",
+            "text",
+            "typed the land policy text into the free-text row: the worker decides",
+        ),
+    );
+    land.cover.dialog_answers = Some(vec![said(LAND_TEXT)]);
+    let v = cover::judge_dialog(&land, true, T0);
+    assert_eq!(v.word(), "PASS", "{}", v.why());
+    assert!(
+        v.why().contains("answer-land@v1 row(s) approved"),
+        "{}",
+        v.why()
+    );
+    let mut unlanded = land.clone();
+    unlanded.journal.retain(|(_, l)| !l.starts_with("DONE "));
+    assert_eq!(
+        cover::judge_dialog(&unlanded, true, T0).word(),
+        "FAIL",
+        "a dialog answered under Land and never landed"
+    );
+    let mut pressed = land.clone();
+    pressed.ledger.retain(|r| r.rule != RULE_ANSWER_LAND);
+    pressed.ledger.push(row(
+        asked + 2_000,
+        RULE_ANSWER_RECOMMENDED,
+        "approved",
+        "enter",
+        "the recommended answer",
+    ));
+    assert_eq!(cover::judge_dialog(&pressed, true, T0).word(), "FAIL");
+    let mut unsaid = land.clone();
+    unsaid.cover.dialog_answers = Some(vec![rec]);
+    assert_eq!(cover::judge_dialog(&unsaid, true, T0).word(), "FAIL");
 }
 
 #[test]

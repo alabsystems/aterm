@@ -41,6 +41,7 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         turn_said: None,
         said_lines: None,
         turn_lines: None,
+        turn_breaks: Default::default(),
         opened_by: None,
         message_drawn: false,
         submits: None,
@@ -88,11 +89,13 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         record_turn: None,
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,
+        leftover: crate::harness::leftover::LeftRead::NotAsked,
         login_screen: None,
         login_interrupted: false,
         login_at_wall: None,
         login_method: None,
         login_shared: None,
+        login_pin: crate::supervise::policy::login::LoginPin::Picker,
         login_moved: false,
         roster: None,
     }
@@ -964,6 +967,37 @@ fn a_weekly_usage_limit_does_not_raise_a_nag_exception() {
     });
     assert_eq!(exception_for(&st, &drafted, &cfg(), t), None);
     assert!(draft_holds_limit_switch(&st, &drafted, &cfg()));
+    // A person's command holds the switch as a prompt draft does (v6 §14.17.5.8), its step
+    // `notice::LIMIT_DRAFT_COMMAND`'s: clear it, never "send the draft". Negative control by
+    // mutation: the roster step's command arm dropped: `LIMIT_DRAFT`, "Send the draft".
+    let command = TurnEndReading {
+        composer: Composer::Command(
+            aterm_phase::DraftCommand::Slash,
+            crate::supervise::policy::turn_end::CommandEnter::Runs,
+        ),
+        ..drafted.clone()
+    };
+    assert_eq!(exception_for(&st, &command, &cfg(), t), None);
+    assert!(draft_holds_limit_switch(&st, &command, &cfg()));
+    for (reading, want) in [
+        (&drafted, &notice::LIMIT_DRAFT),
+        (&command, &notice::LIMIT_DRAFT_COMMAND),
+    ] {
+        let step = limit_roster_step(
+            reading.roster.as_ref(),
+            limit_switch(reading, &cfg()),
+            cfg().resume_limits,
+            st.account_refusal(),
+            Some(&reading.composer),
+        );
+        assert_eq!(
+            step.flatten().map(|(text, ..)| (text.id, text.todo)),
+            Some((want.id, want.todo)),
+            "{:?}",
+            reading.composer
+        );
+    }
+    assert_eq!(notice::LIMIT_DRAFT_COMMAND.todo, notice::COMMAND_TODO);
 
     let mut in_browser = weekly.clone();
     in_browser.wall = None;
@@ -992,6 +1026,71 @@ fn a_weekly_usage_limit_does_not_raise_a_nag_exception() {
     };
     let e = exception_for(&st, &left_lost, &cfg(), t + MIN).expect("told");
     assert_eq!(e.notice.as_ref().map(|n| n.id), Some("login-left"), "{e:?}");
+}
+
+/// A SIGN-IN UNDER WAY OVER A MANAGED WORKER'S WEEKLY WALL ENDS THE CHAIN WITH NO EXCEPTION, as on
+/// any tab: the `/login` dialog's arm answers `Some(None)` for a managed worker too, so no later
+/// arm (a held, unread limit past `FUTILE_AFTER`, a limit an hour past its reset) is reached
+/// there, and a failed sign-in is told on a managed worker's tab as on a person's. NEGATIVE
+/// CONTROL: with no `/login` dialog the arm leaves the chain to the arms after it, managed or
+/// not.
+#[test]
+fn a_sign_in_over_a_managed_workers_weekly_wall_ends_the_chain_as_on_any_tab() {
+    let t = t0();
+    let mut weekly = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+    );
+    weekly.reset_at = Some(t + 30 * 60 * MIN);
+    weekly.autopilot = crate::supervise::Autopilot::Land;
+    let tab = |managed: bool| {
+        let mut st = TurnEndState::default();
+        st.set_managed(managed);
+        st.observe(&weekly, t);
+        st
+    };
+    let dialog = |screen: LoginScreen| TurnEndReading {
+        wall: None,
+        login_screen: Some(screen),
+        ..weekly.clone()
+    };
+    for managed in [false, true] {
+        let st = tab(managed);
+        for screen in [
+            LoginScreen::Browser,
+            LoginScreen::ConsoleMenu,
+            LoginScreen::Success {
+                row: "Login successful. Press Enter to continue…".to_string(),
+            },
+        ] {
+            let r = dialog(screen.clone());
+            assert_eq!(
+                claude_limit_login(&st, &r, &cfg(), t),
+                Some(None),
+                "managed={managed} {screen:?}: the chain ends here"
+            );
+        }
+        let browser = dialog(LoginScreen::Browser);
+        assert_eq!(
+            exception_for(&st, &browser, &cfg(), t),
+            None,
+            "managed={managed}"
+        );
+        let failed = dialog(LoginScreen::Failed);
+        let told = claude_limit_login(&st, &failed, &cfg(), t)
+            .flatten()
+            .expect("a failed sign-in is told");
+        assert_eq!(
+            told.notice.as_ref().map(|n| n.id),
+            Some(notice::LOGIN_STOPPED.id),
+            "managed={managed}"
+        );
+        assert_eq!(
+            claude_limit_login(&st, &weekly, &cfg(), t),
+            None,
+            "CONTROL managed={managed}: no dialog leaves the chain to the arms after it"
+        );
+    }
 }
 
 #[test]
@@ -1133,4 +1232,152 @@ fn a_refused_go_ahead_stands_at_a_break_of_background_work() {
             "{other:?}"
         );
     }
+}
+
+/// A LOST LOGIN UNDER THE PROMPT-HISTORY SEARCH ASKS THE SEARCH'S QUESTION FIRST (finding 3 of the
+/// review of the draft-hold work), measured in the real-Claude lab on 2.1.318
+/// (docs/measured/draft-hold-findings-2026-11-04.md): its turn ended on `⏺ Please run /login · API
+/// Error: 401 Invalid bearer token`, and the person opened the search inside their grace, its query
+/// matching nothing (scene E) or an old prompt (scene CM). On `0d3f571d04` the loop told
+/// `login-not-run-draft` there ("Clear the draft in the tab"), over no draft, and once the search
+/// went decided nothing again: `/login` was never typed. Here those frames, the measured searches
+/// with the turn's measured last row: the point asks the search's own question and no login notice
+/// is told; with the search gone over the empty composer `/login` is typed; the old prompt the
+/// search left is asked about as that, with no login notice; a person's own draft standing has the
+/// login's draft notice, true of it; and where `/login` is held back by what is no draft
+/// (`retry_api_errors` off, the hour's continues spent) the search is told as no draft, closed
+/// before `/login` is typed, and a draft under Claude Code's completion menu as the draft it is.
+/// NEGATIVE CONTROLS: the draft step's login arm ahead of the composer's question, and the search is
+/// escalated as the login's draft (`a draft stands in the composer`); `claude_login` without its arm
+/// for the composer's question, and `login-not-run-draft` is told over the search; its draft arm
+/// taking every drafted composer, as before, and the budget's and retry's notices are the draft's;
+/// it taking the typed, own and recalled composers alone, and the menu's draft is told as none;
+/// the search's notice told as over an empty composer, and its todo types `/login` into the query.
+#[test]
+fn a_lost_login_under_the_history_search_asks_the_searchs_question_first() {
+    use crate::supervise::policy::turn_end::{Diversion, RECALL_STANDS, SEARCH_DIVERTS};
+    use aterm_phase::prompt::fixtures::{
+        HISTORY_SEARCH_2_1_318, HISTORY_SEARCH_NO_MATCH_2_1_318, cursor,
+    };
+    let t = t0();
+    let lost = "⏺ Please run /login · API Error: 401 Invalid bearer token";
+    let read = |text: &str| {
+        let mut rows = screen(text);
+        let said = rows
+            .iter()
+            .rposition(|r| r.starts_with("⏺ "))
+            .expect("the turn's last row");
+        rows[said] = lost.to_string();
+        let col = cursor(text).map(|(_, col)| col);
+        let reading = aterm_phase::read(Some("claude"), &rows, col);
+        TurnEndReading {
+            restartable: true,
+            ..TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None)
+        }
+    };
+    for (scene, text) in [
+        ("E", HISTORY_SEARCH_NO_MATCH_2_1_318),
+        ("CM", HISTORY_SEARCH_2_1_318),
+    ] {
+        let open = read(text);
+        assert_eq!(
+            (open.wall, open.composer.clone()),
+            (Some(WallKind::Auth), Composer::Diverted(Diversion::Search)),
+            "{scene}"
+        );
+        let (a, e) = point(&mut TurnEndState::default(), &open, &cfg(), t);
+        assert_eq!(
+            a,
+            TurnEndAction::Escalate {
+                reason: SEARCH_DIVERTS.to_string()
+            },
+            "{scene}"
+        );
+        assert_eq!(notice_id(e.as_ref()), None, "{scene}: {e:?}");
+    }
+    let open = read(HISTORY_SEARCH_NO_MATCH_2_1_318);
+    let left = |composer: Composer| TurnEndReading {
+        composer,
+        ..open.clone()
+    };
+    let (a, e) = point(
+        &mut TurnEndState::default(),
+        &left(Composer::Empty),
+        &cfg(),
+        t,
+    );
+    assert_eq!(a.rule_id(), Some(RULE_LOGIN), "E, left: {a:?}");
+    assert_eq!(notice_id(e.as_ref()), None, "E, left: {e:?}");
+    let recalled = left(Composer::Diverted(Diversion::Recall));
+    let (a, e) = point(&mut TurnEndState::default(), &recalled, &cfg(), t);
+    assert_eq!(
+        a,
+        TurnEndAction::Escalate {
+            reason: RECALL_STANDS.to_string()
+        },
+        "CM, left"
+    );
+    assert_eq!(notice_id(e.as_ref()), None, "CM, left: {e:?}");
+    let (a, e) = point(
+        &mut TurnEndState::default(),
+        &left(Composer::Typed),
+        &cfg(),
+        t,
+    );
+    assert!(
+        matches!(&a, TurnEndAction::Escalate { reason } if reason.contains("a draft stands in the composer")),
+        "a draft: {a:?}"
+    );
+    assert_eq!(
+        notice_id(e.as_ref()),
+        Some(notice::LOGIN_NOT_RUN_DRAFT.id),
+        "a draft: {e:?}"
+    );
+    // `/login` held back by what is no draft (`retry_api_errors` off, the hour's continues
+    // spent): the search over an empty composer is told as that, never as a draft.
+    // A person's draft under Claude Code's completion menu is still their draft.
+    let menu = left(Composer::Diverted(Diversion::Menu));
+    let not_run = |st: &mut TurnEndState, cfg: &SupervisorConfig, why: &str| {
+        let (a, e) = point(st, &open, cfg, t + MIN);
+        assert!(matches!(a, TurnEndAction::Escalate { .. }), "{why}: {a:?}");
+        assert_eq!(
+            notice_id(e.as_ref()),
+            Some(notice::LOGIN_NOT_RUN.id),
+            "{why}: {e:?}"
+        );
+        let e = e.expect("told");
+        assert!(
+            e.action.contains("Close the prompt-history search"),
+            "{why}: {}",
+            e.action
+        );
+        assert!(e.notice.is_some_and(|n| n.did.contains(why)), "{why}");
+        let (_, e) = point(&mut st.clone(), &menu, cfg, t + MIN);
+        assert_eq!(
+            notice_id(e.as_ref()),
+            Some(notice::LOGIN_NOT_RUN_DRAFT.id),
+            "{why}, a menu over a draft: {e:?}"
+        );
+    };
+    let off = SupervisorConfig {
+        retry_api_errors: false,
+        ..cfg()
+    };
+    not_run(&mut TurnEndState::default(), &off, notice::WHY_RETRY_OFF);
+    let budget = SupervisorConfig {
+        continue_per_hour: 1,
+        ..cfg()
+    };
+    let mut st = TurnEndState::default();
+    let ended = TurnEndReading {
+        wall: None,
+        wall_message: String::new(),
+        composer: Composer::Empty,
+        ..open.clone()
+    };
+    let (a, _) = point(&mut st, &ended, &budget, t);
+    assert!(a.rule_id().is_some(), "a continuation: {a:?}");
+    st.acted(&a, &ended, t);
+    st.observe(&open, t + Duration::from_secs(5));
+    not_run(&mut st, &budget, notice::WHY_BUDGET);
 }

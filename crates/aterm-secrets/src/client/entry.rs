@@ -6,6 +6,116 @@
 
 use super::*;
 
+const PUBLIC_ROSTER_NAMES: [&str; 2] = [
+    "~/.aterm/release-ring/roster/aterm-machines.toml",
+    "~/.aterm/release-ring/roster/aterm-machines.toml.sig",
+];
+
+/// Public release-roster bytes observed together in the authenticated, locally applied vault.
+/// The caller must verify the release master signature and apply its roster authority policy.
+/// This observation does not establish ownership of any materialized file.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PublicRosterPair {
+    /// Opaque canonical roster bytes; release-master verification remains the caller's job.
+    pub roster: Vec<u8>,
+    /// The detached signature supplied by the same authenticated snapshot.
+    pub signature: Vec<u8>,
+}
+
+impl std::fmt::Debug for PublicRosterPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublicRosterPair").finish_non_exhaustive()
+    }
+}
+
+/// No configured source is distinct from a recipient snapshot lacking the canonical pair.
+#[derive(Debug)]
+pub enum PublicRosterRead {
+    /// This account has no configured vault source.
+    Unconfigured,
+    /// Neither canonical Everyone entry is available in this authenticated recipient snapshot.
+    Absent,
+    /// Both public entries are available, without release-authority admission.
+    Pair(PublicRosterPair),
+}
+
+/// How long a read of the public roster waits while the vault's own writer (a sync or an
+/// apply in the running aterm) holds the state lock, before it calls the source busy.
+const PUBLIC_ROSTER_WAIT: Duration = Duration::from_secs(30);
+
+/// Read only the two canonical Everyone public roster entries under one shared state guard.
+/// Materialized files and their ownership do not participate. Absence is returned only after
+/// authenticating the current applied recipient snapshot, not as a claim about plaintext
+/// available to other recipients. A partial pair is an error. This fetches no
+/// source, changes no state and grants no signing authority or lease across later effects.
+/// In particular, this does not filter out a newer expired or revoking release roster.
+/// A writer holding the vault state is waited for, up to 30 s.
+/// # Errors
+/// Configured state is busy past that wait, pending, denied, untrusted or unreadable; the pair
+/// has a host audience or only one entry. Existing vault-entry size bounds apply; the caller
+/// must refuse malformed roster or signature bytes through its existing release admission
+/// policy.
+pub fn current_public_roster(paths: &Paths) -> crate::Result<PublicRosterRead> {
+    current_public_roster_until(paths, Instant::now() + PUBLIC_ROSTER_WAIT)
+}
+
+/// [`current_public_roster`], waiting for a writer holding the vault state only until `deadline`.
+pub(crate) fn current_public_roster_until(
+    paths: &Paths,
+    deadline: Instant,
+) -> crate::Result<PublicRosterRead> {
+    let Some(expected) = config(paths)? else {
+        return Ok(PublicRosterRead::Unconfigured);
+    };
+    if expected.signer.is_none() {
+        return Err(Error::new(
+            "public roster source has no authenticated signer",
+        ));
+    }
+    let observation = StateLock::observe_until(paths, deadline)?
+        .ok_or_else(|| Error::new("public roster source is busy or unavailable"))?;
+    let mut versions = [None, None];
+    let mut values = Vec::with_capacity(2);
+    for (index, name) in PUBLIC_ROSTER_NAMES.into_iter().enumerate() {
+        values.push(
+            read_entry_with_version_held(
+                paths,
+                &expected,
+                name,
+                Reading::PublicRoster,
+                &mut versions[index],
+                &observation,
+            )?
+            .map(|(entry, _)| entry.value),
+        );
+    }
+    let [Some(a), Some(b)] = &versions else {
+        return Err(Error::new(
+            "public roster source is not currently applied and authenticated",
+        ));
+    };
+    if a.config != b.config
+        || a.recipient != b.recipient
+        || a.seq != b.seq
+        || a.envelope != b.envelope
+        || a.log_ids != b.log_ids
+        || a.mailbox_stamp != b.mailbox_stamp
+    {
+        return Err(Error::new(
+            "public roster halves belong to different source snapshots",
+        ));
+    }
+    let mut values = values.into_iter();
+    match (values.next().flatten(), values.next().flatten()) {
+        (None, None) => Ok(PublicRosterRead::Absent),
+        (Some(roster), Some(signature)) => Ok(PublicRosterRead::Pair(PublicRosterPair {
+            roster: roster.as_slice().to_vec(),
+            signature: signature.as_slice().to_vec(),
+        })),
+        _ => Err(Error::new("canonical public roster pair is incomplete")),
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     static MAILBOX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -484,6 +594,7 @@ enum Reading {
     PublicationMaterial,
     Reserved,
     ReservedAndAdmin,
+    PublicRoster,
 }
 
 fn holds_admin_locker(
@@ -528,7 +639,9 @@ fn read_entry_with_version(
         reading,
         Reading::Materialized | Reading::SigningMaterial | Reading::PublicationMaterial
     );
-    let valid = if matches!(reading, Reading::SigningMaterial) {
+    let valid = if matches!(reading, Reading::PublicRoster) {
+        PUBLIC_ROSTER_NAMES.contains(&name)
+    } else if matches!(reading, Reading::SigningMaterial) {
         text::valid_entry_name(name) && signing_material_name(name)
     } else if matches!(reading, Reading::PublicationMaterial) {
         matches!(name, "gh_access_token" | "gh_access_token_alabsystems")
@@ -555,6 +668,21 @@ fn read_entry_with_version(
     let Some(_observation) = StateLock::observe(paths)? else {
         return Ok(None);
     };
+    read_entry_with_version_held(paths, expected, name, reading, version, &_observation)
+}
+
+fn read_entry_with_version_held(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+    reading: Reading,
+    version: &mut Option<EntryVersion>,
+    _observation: &StateLock,
+) -> crate::Result<Option<(VerifiedEntry, bool)>> {
+    let materialized = matches!(
+        reading,
+        Reading::Materialized | Reading::SigningMaterial | Reading::PublicationMaterial
+    );
     let Some(config) = config(paths)? else {
         return Ok(None);
     };
@@ -658,7 +786,17 @@ fn read_entry_with_version(
         }
     }
     let entry = entries.iter().find(|entry| entry.name == name);
-    if !materialized && entry.is_some_and(|entry| entry.if_absent || entry.anchor.is_some()) {
+    if matches!(reading, Reading::PublicRoster)
+        && entry.is_some_and(|entry| entry.audience != Audience::Everyone)
+    {
+        return Err(Error::new(
+            "canonical public roster entry has a host-specific audience",
+        ));
+    }
+    if !materialized
+        && !matches!(reading, Reading::PublicRoster)
+        && entry.is_some_and(|entry| entry.if_absent || entry.anchor.is_some())
+    {
         return Ok(None);
     }
     let log_ids = trusted_log
@@ -818,7 +956,7 @@ fn read_single_private(path: &Path) -> crate::Result<Option<SecretBytes>> {
     if metadata.nlink() != 1 || metadata.len() > text::MAX_VALUE as u64 {
         return Err(Error::new("publication material has unsafe links or size"));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = crate::fsx::read_buffer(metadata.len(), text::MAX_VALUE);
     crate::secret::read_to_end_wiping_on_error(file.take(text::MAX_VALUE as u64 + 1), &mut bytes)?;
     let value = SecretBytes::new(bytes);
     if value.as_slice().len() > text::MAX_VALUE {

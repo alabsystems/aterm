@@ -711,6 +711,15 @@ pub fn messages_answered(body: &[u8]) -> bool {
         .any(is_tool_result)
 }
 
+/// The tool results a Messages API request carries back, oldest first, each as its text.
+#[must_use]
+pub fn message_results(body: &[u8]) -> Vec<String> {
+    let Ok(j) = J::parse_bytes(body) else {
+        return Vec::new();
+    };
+    tool_results(j.get("messages").and_then(J::as_arr).unwrap_or_default())
+}
+
 /// The user texts of a Messages API request, oldest first.
 #[must_use]
 pub fn message_users(body: &[u8]) -> Vec<String> {
@@ -1767,10 +1776,12 @@ const MAX_BODY_BYTES: usize = 64 << 20;
 /// # Errors
 /// A malformed request line or chunk, or the connection failing mid-request.
 pub fn read_request(r: &mut impl io::BufRead) -> io::Result<Option<Request>> {
+    use std::io::BufRead as _;
+    const MAX_LINE_BYTES: u64 = 64 * 1024;
     let mut line = String::new();
     loop {
         line.clear();
-        if r.read_line(&mut line)? == 0 {
+        if (&mut *r).take(MAX_LINE_BYTES).read_line(&mut line)? == 0 {
             return Ok(None);
         }
         if !line.trim().is_empty() {
@@ -1788,7 +1799,7 @@ pub fn read_request(r: &mut impl io::BufRead) -> io::Result<Option<Request>> {
     let mut headers = Vec::new();
     loop {
         let mut h = String::new();
-        if r.read_line(&mut h)? == 0 {
+        if (&mut *r).take(MAX_LINE_BYTES).read_line(&mut h)? == 0 {
             break;
         }
         let h = h.trim_end_matches(['\r', '\n']);
@@ -1833,7 +1844,7 @@ pub fn read_request(r: &mut impl io::BufRead) -> io::Result<Option<Request>> {
         {
             loop {
                 let mut size = String::new();
-                r.read_line(&mut size)?;
+                (&mut *r).take(MAX_LINE_BYTES).read_line(&mut size)?;
                 let size = size.trim();
                 if size.is_empty() {
                     break;
@@ -1847,7 +1858,7 @@ pub fn read_request(r: &mut impl io::BufRead) -> io::Result<Option<Request>> {
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
                 if n == 0 {
                     let mut end = String::new();
-                    r.read_line(&mut end)?;
+                    (&mut *r).take(MAX_LINE_BYTES).read_line(&mut end)?;
                     break;
                 }
                 if n > MAX_BODY_BYTES || req.body.len().saturating_add(n) > MAX_BODY_BYTES {
@@ -1860,7 +1871,7 @@ pub fn read_request(r: &mut impl io::BufRead) -> io::Result<Option<Request>> {
                 r.read_exact(&mut chunk)?;
                 req.body.extend_from_slice(&chunk);
                 let mut crlf = String::new();
-                r.read_line(&mut crlf)?;
+                (&mut *r).take(MAX_LINE_BYTES).read_line(&mut crlf)?;
             }
         }
     }
@@ -2085,11 +2096,7 @@ impl Stub {
         let _g = self.log_lock.lock().unwrap_or_else(|p| p.into_inner());
         match &self.args.log {
             Some(p) => {
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(p)
-                {
+                if let Ok(mut f) = crate::util::append_regular_file(p) {
                     let _ = f.write_all(out.as_bytes());
                 }
             }
@@ -2106,7 +2113,8 @@ impl Stub {
         let mut st = self.st();
         let mut from_file = None;
         if let Some(path) = &self.args.mode_file
-            && let Ok(meta) = std::fs::metadata(path)
+            && let Ok(meta) = std::fs::symlink_metadata(path)
+            && meta.is_file()
         {
             let mtime = meta.modified().ok();
             if st.mode_file_mtime != mtime {
@@ -2128,22 +2136,27 @@ impl Stub {
         mode
     }
 
-    /// Switch the mode (from the control path, or from the file).
-    pub fn set_mode(&self, m: &str, from_file: bool) {
+    /// Persist and switch the mode from the control path.
+    ///
+    /// # Errors
+    /// Returns a configured mode file's write error without changing the active mode.
+    pub fn set_mode(&self, m: &str) -> io::Result<()> {
         let m = clean_mode(m);
         {
             let mut st = self.st();
+            let mtime = if let Some(path) = &self.args.mode_file {
+                crate::util::write_out(path, format!("{m}\n").as_bytes())?;
+                std::fs::symlink_metadata(path)
+                    .and_then(|m| m.modified())
+                    .ok()
+            } else {
+                None
+            };
             st.switch_mode(&m);
-            if let (Some(path), false) = (&self.args.mode_file, from_file)
-                && std::fs::write(path, format!("{m}\n")).is_ok()
-            {
-                st.mode_file_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-            }
+            st.mode_file_mtime = mtime;
         }
-        self.log(&format!(
-            "MODE -> {m}{}",
-            if from_file { " (from file)" } else { "" }
-        ));
+        self.log(&format!("MODE -> {m}"));
+        Ok(())
     }
 
     /// Resolve a request once its protocol has classified it. The last allowed main request
@@ -2306,8 +2319,8 @@ impl Stub {
         let _ = std::fs::create_dir_all(dir);
         let idx = self.dumped.fetch_add(1, Ordering::Relaxed) + 1;
         let prefix = if is_side(kind) { SIDE_DUMP } else { TURN_DUMP };
-        let _ = std::fs::write(
-            dir.join(format!("{prefix}{idx:05}.json")),
+        let _ = crate::util::write_fresh(
+            &dir.join(format!("{prefix}{idx:05}.json")),
             &body[..body.len().min(4 << 20)],
         );
         if let Some(old) = idx.checked_sub(DUMPS_KEPT) {
@@ -2467,8 +2480,15 @@ impl Stub {
         let arg = |k: &str| q.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         match path {
             "/__mode" => {
-                if let Some(m) = arg("m") {
-                    self.set_mode(&m, false);
+                if let Some(m) = arg("m")
+                    && let Err(error) = self.set_mode(&m)
+                {
+                    out.json(
+                        500,
+                        &err_body("api_error", &format!("mode was not changed: {error}")),
+                        &[],
+                    )?;
+                    return Ok(true);
                 }
                 out.json(200, &J::obj([("mode", J::s(self.mode()))]), &[])?;
             }
@@ -3812,8 +3832,22 @@ impl Stub {
 
 fn write_port_file(path: &Path, port: u16) -> io::Result<()> {
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    std::fs::write(&tmp, format!("{port}\n"))?;
-    std::fs::rename(&tmp, path)
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let written = opts
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(format!("{port}\n").as_bytes()))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Bind and start serving (threads); the ports are written to their files.

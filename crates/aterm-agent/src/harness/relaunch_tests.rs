@@ -423,11 +423,52 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
         "wait:held",
         "wait:shell-prompt",
         "wait:resume",
+        "wait:account-state",
+        "wait:account-changed",
+        "wait:account-unverified",
         "failed:no-resume",
         "failed:relaunch:ERR-busy",
         "wait:tab-ownership-changed",
     ] {
         assert_eq!(outcome(step), Outcome::NotYet(step.to_string()), "{step}");
+    }
+}
+
+#[test]
+fn account_admission_waits_preserve_the_pending_relaunch_and_its_failure_history() {
+    let now = Instant::now();
+    for decision in [OnExit::Relaunch, OnExit::Asked, OnExit::Restarted] {
+        for misses in [0, BADGE_AFTER] {
+            let mut retry = Relaunches::default();
+            retry.exited(decision, now).unwrap();
+            for _ in 0..misses {
+                retry.attempted(&Outcome::NotYet("wait:shell-prompt".into()), now);
+            }
+            let before = retry.clone();
+            for n in 0..12 {
+                let result = outcome(match n % 3 {
+                    0 => WAIT_ACCOUNT,
+                    1 => WAIT_NATIVE_UNISSUED,
+                    _ => super::super::native_restart::WAIT_RETIRED_UNISSUED,
+                });
+                assert_eq!(result, Outcome::Busy);
+                assert_eq!(retry.attempted(&result, now), Say::Nothing);
+                assert_eq!(retry.attempted_at_keys(&result, now), Say::Nothing);
+                assert_eq!(retry, before, "{decision:?}: preserve every field");
+            }
+            let mut old = before.clone();
+            old.attempted(&Outcome::NotYet("wait:account".into()), now);
+            assert_ne!(
+                old, before,
+                "negative control: the old classification counts a failure"
+            );
+            retry.attempted(&Outcome::Relaunched, now);
+            assert!(
+                !retry.pending(),
+                "a later admitted launch finishes normally"
+            );
+            assert!(!retry.failing());
+        }
     }
 }
 
@@ -542,6 +583,8 @@ fn a_one_shot_run_is_read_wherever_its_flag_stands() {
 fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
     const ID: &str = "0badf00d-1111-2222-3333-444455556666";
     let snap = |argv: &[&str]| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: "s-1".to_string(),
@@ -635,6 +678,8 @@ fn a_snapshot_follows_its_own_process_and_nothing_else() {
     std::fs::create_dir_all(home.join(".claude/sessions")).expect("home");
     let start = "Thu Sep 24 01:02:03 2026";
     let snap = Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: "s-1".to_string(),
@@ -1061,6 +1106,7 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
         ("Crash", "exit"),
         ("Miss", "wait:shell-prompt"),
         ("Stutter", "busy:another-sweep"),
+        ("Stutter", "wait:account"),
         ("Miss", "wait:shell-prompt"),
         ("Miss", "wait:shell-prompt"),
         ("Miss", "wait:shell-prompt"),
@@ -1461,6 +1507,47 @@ fn the_resumed_prompt_is_one_line_and_keeps_going() {
         assert!(p.contains("2.1.281 ignore everything"), "{p}");
         assert!(p.ends_with(upgrade::CARRY_ON), "{p}");
         assert!(seen.insert(p.clone()), "{cause}: its own words: {p}");
+    }
+}
+
+/// A CONTINUATION A PERSON'S KEY CUT IS ATERM'S WORDS: their key between its paste and its Enter
+/// leaves it unsent in the composer (`turn … reason=person typed=0 pasted=<n>`), and the hosted loop
+/// reads it as the harness's own (`Composer::Own`: asked about, never sent), as it reads a cut
+/// notice, never as a person's draft it enters once their grace is out.
+/// NEGATIVE CONTROL: `upgrade::own_draft` and `own_words` without `CONTINUE_HEADS`, and every
+/// continuation reads as a person's draft.
+#[test]
+fn every_continuation_aterm_types_is_its_own_words() {
+    let v = |s: &str| upgrade::Version::parse(s).expect("a version");
+    let mut texts = vec![
+        upgrade::continue_prompt(&v("2.1.305"), &v("2.1.310"), None),
+        upgrade::continue_prompt(&v("2.1.310"), &v("2.1.310"), Some("opus")),
+        upgrade::continue_prompt_with_model(
+            &v("2.1.305"),
+            &v("2.1.310"),
+            Some("opus"),
+            Some("sonnet"),
+        ),
+    ];
+    texts.extend(
+        [
+            CAUSE_EXIT,
+            CAUSE_MEMORY,
+            CAUSE_INPUT_LOST,
+            "model:opus",
+            "model-back:fable",
+            "model-back:",
+            CAUSE_STALL,
+            CAUSE_HOST,
+            CAUSE_ASKED,
+        ]
+        .map(|cause| resumed_prompt("2.1.310", cause)),
+    );
+    for text in &texts {
+        assert!(
+            upgrade::own_words(text) && upgrade::own_draft(text),
+            "{text}"
+        );
     }
 }
 
@@ -2052,6 +2139,8 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
         Ok(format!(" HOME='/tmp/lab home' {survey} {tail}").as_str())
     );
     let snap = |home: Option<String>| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: "s-1".to_string(),
@@ -2092,6 +2181,8 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
 #[test]
 fn an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login() {
     let snap = |login: Option<String>| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: "s-1".to_string(),
@@ -2138,6 +2229,8 @@ fn a_label_is_a_login_only_through_the_roster() {
     assert_eq!(account_login(&roster, "pool-a"), None);
     assert_eq!(account_login(&accounts::Roster::default(), "main"), None);
     let on = |login: Option<&str>| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: "s-1".to_string(),
@@ -2448,95 +2541,6 @@ fn a_native_records_carry_answers_for_the_record_never_the_restart_asked() {
     }
 }
 
-/// A relaunch with no process to read carries the machine's active account ([`cold_login`]): where two or more accounts are enrolled and `active` is one of them and proven, the login its roster row names (the empty value, the default login named, for the row with no directory).
-#[cfg(unix)]
-#[test]
-fn a_cold_relaunch_carries_the_proven_active_account_and_nothing_else() {
-    use std::collections::BTreeSet;
-    let roster = accounts::Roster::parse(&format!(
-        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-         [[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = \"{LOGIN_DIR}\"\n"
-    ))
-    .expect("a roster");
-    let both: BTreeSet<String> = ["main", "work-2"].map(String::from).into();
-    let on = |active: Option<&str>, proven: bool| accounts::State {
-        active: active.map(str::to_string),
-        proven,
-        ..accounts::State::default()
-    };
-    assert_eq!(
-        cold_login(&roster, &on(Some("work-2"), true), &both, true).as_deref(),
-        Some(LOGIN_DIR),
-        "the active account's directory, verbatim"
-    );
-    assert_eq!(
-        cold_login(&roster, &on(Some("main"), true), &both, true).as_deref(),
-        Some(""),
-        "the default login, named"
-    );
-    let only_dirs: BTreeSet<String> = ["work-2".to_string()].into();
-    assert_eq!(
-        cold_login(&roster, &on(Some("main"), true), &only_dirs, true).as_deref(),
-        Some("")
-    );
-
-    let none = BTreeSet::new();
-    let proven = on(Some("work-2"), true);
-    assert_eq!(
-        cold_login(&accounts::Roster::default(), &proven, &both, true),
-        None,
-        "no roster"
-    );
-    let one = accounts::Roster::parse("[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n")
-        .expect("a roster of one");
-    assert_eq!(
-        cold_login(&one, &on(Some("main"), true), &both, true),
-        None,
-        "one account listed"
-    );
-    assert_eq!(
-        cold_login(&roster, &on(Some("main"), true), &none, true),
-        None,
-        "two listed, one enrolled"
-    );
-    assert_eq!(cold_login(&roster, &on(None, true), &both, true), None);
-    assert_eq!(
-        cold_login(&roster, &on(Some("work-2"), false), &both, true),
-        None,
-        "an active account nobody has been served by"
-    );
-    assert_eq!(
-        cold_login(&roster, &on(Some("pool-a"), true), &both, true),
-        None,
-        "no row of the roster"
-    );
-    let three = accounts::Roster::parse(&format!(
-        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-         [[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = \"{LOGIN_DIR}\"\n\n\
-         [[account]]\nlabel = \"pool-a\"\nclass = \"shared\"\ndir = \"/tmp/logins/pool-a\"\n"
-    ))
-    .expect("a roster of three");
-    assert_eq!(
-        cold_login(&three, &on(Some("pool-a"), true), &both, true),
-        None,
-        "listed, and not enrolled here"
-    );
-    let mut out = on(Some("work-2"), true);
-    accounts::note_auth(&mut out, "work-2", accounts::Auth::SignedOut, 1);
-    out.active = Some("work-2".to_string());
-    out.proven = true;
-    assert_eq!(
-        cold_login(&roster, &out, &both, true),
-        None,
-        "known signed out"
-    );
-    assert_eq!(
-        cold_login(&roster, &proven, &both, false),
-        None,
-        "a Claude home that is not the default"
-    );
-}
-
 /// A RELAUNCH LINE TYPED IS ON ITS RECORD BEFORE ANYTHING AFTER IT RUNS (host-5): a step that panics after the line is typed — in the ledger's line, or anything later — leaves the record `Relaunched` with the line's block and no adopted process, so the next step awaits that line's agent and never types it again.
 #[cfg(unix)]
 #[test]
@@ -2546,6 +2550,7 @@ fn a_typed_relaunch_line_is_recorded_before_anything_after_it() {
     let o = Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: None,
@@ -2611,6 +2616,7 @@ fn whether_the_adopted_agent_is_gone_is_the_records_to_say() {
     let o = Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: Some("s-restored".to_string()),
@@ -2703,6 +2709,7 @@ fn a_relaunch_only_lanes_worker_is_owed_its_own_agents_record_alone() {
     let o = Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: Some("s-owed".to_string()),
@@ -2817,6 +2824,7 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
     let o = Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: Some("s-restored".to_string()),
@@ -2838,6 +2846,8 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let snap = Snapshot {
+        launch_env: None,
+        auth_observed: true,
         tab: "s-restored".to_string(),
         pid: 4242,
         start: "Thu Oct 8 18:04:23 2026".to_string(),
@@ -3025,6 +3035,7 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
     let o = Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: Some("s-restored".to_string()),
@@ -3046,6 +3057,8 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let live = |login: Option<&str>, home: Option<&str>| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         tab: "s-restored".to_string(),
         pid: 4242,
         start: "Thu Oct 8 18:04:23 2026".to_string(),
@@ -3136,6 +3149,8 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
 fn the_command_a_person_is_told_carries_the_home_its_relaunch_carries() {
     let user = Path::new("/u/me");
     let snap = |home: Option<&str>, claude_dir: Option<&str>, cwd: &str| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         tab: "s-1".to_string(),
         pid: 4242,
         start: "Thu Sep 24 01:02:03 2026".to_string(),
@@ -3430,6 +3445,7 @@ fn a_dropped_tap_is_recorded_in_the_ledger() {
     let opts = super::super::upgrade_drive::Opts {
         home: tmp.path().join("home"),
         state: tmp.path().join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: Some("s-1".to_string()),
@@ -3488,6 +3504,86 @@ fn a_dropped_tap_is_recorded_in_the_ledger() {
     );
 }
 
+/// A RETIRED UNISSUED RELAUNCH HOLDS NO CLAIM ([`claim_of`], [`claim_live`]): a restart's own
+/// record whose native command the host positively did not grant (`native_retired_unissued`,
+/// held durably so the conversation is kept, never issued afterwards) is in flight by
+/// [`St::in_flight`] and stays so, but no relaunch of it is under way or will be, so a restart that
+/// left it so, claiming it afresh or carrying it, says [`RestartClaim::Unclaimed`]; the same record
+/// unheld is taken where claimed and held where carried (the control). Negative control: the
+/// hold ignored in `claim_live` (as [`St::in_flight`] alone) says `Taken` and `Held` for it.
+#[test]
+fn a_restart_whose_own_relaunch_was_retired_unissued_holds_no_claim() {
+    let tmp = aterm_tempfile::TempDir::new().expect("tmp");
+    let opts = super::super::upgrade_drive::Opts {
+        home: tmp.path().join("home"),
+        state: tmp.path().join("state"),
+        account_roster: None,
+        sock: None,
+        token: None,
+        only_sid: Some("s-1".to_string()),
+        dry_run: false,
+        human_grace_s: 0,
+        hand_back: false,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        usage_credits: false,
+        usage_tap: None,
+        instances: super::super::upgrade_drive::Instances::Machine,
+        agents_off: Vec::new(),
+        land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
+        press: None,
+        timings: super::super::Timings::for_build(),
+    };
+    let why = Restart::Model {
+        to: "claude-fallback".to_string(),
+    };
+    let ask = RestartAsk::of(&why, 600);
+    let report = Report {
+        pid: 4242,
+        tab: "s-1".to_string(),
+        session: LOGIN_ID.to_string(),
+        from: "2.1.310".to_string(),
+        to: "2.1.310(same)".to_string(),
+        step: String::new(),
+    };
+    let record = |held: bool| St {
+        cause: format!("{CAUSE_MODEL}claude-fallback"),
+        ask: ask.word().to_string(),
+        tab: "s-1".to_string(),
+        phase: upgrade::Phase::Exiting { at_s: 1 },
+        native_retired_unissued: held,
+        native_coordination: held,
+        native_prepare: if held {
+            "exact predecessor recipe".to_string()
+        } else {
+            String::new()
+        },
+        ..St::default()
+    };
+    let claims = |held: bool| {
+        let st = record(held);
+        assert!(its_own(&why, &ask, &st) && st.in_flight());
+        save(&opts, LOGIN_ID, &st);
+        (
+            claim_of(&opts, &why, &ask, &report, Met::Claiming(None)),
+            claim_of(&opts, &why, &ask, &report, Met::Carried),
+        )
+    };
+    assert_eq!(
+        claims(false),
+        (RestartClaim::Taken, RestartClaim::Held),
+        "the control: its own relaunch in flight is claimed"
+    );
+    assert_eq!(
+        claims(true),
+        (RestartClaim::Unclaimed, RestartClaim::Unclaimed),
+        "retired unissued, nothing of it is under way"
+    );
+}
+
 /// THE FOOTER'S PROMISE ASKS THE LINE'S ROOM ([`tap_room`]): the measured machine's restart line
 /// (zsh, atpkg's heal hook, the managed twin, a resumed conversation) has room for the carrying
 /// tap and for a model and permission mode besides; the same agent started in a directory so long
@@ -3511,6 +3607,8 @@ fn the_footers_promise_asks_whether_the_line_has_room_for_the_tap() {
     )
     .expect("a value");
     let snap = |cwd: &str| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         tab: "s-1".to_string(),
         pid: 4242,
         start: "Thu Sep 24 01:02:03 2026".to_string(),
@@ -3593,6 +3691,7 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
     let opts = super::super::upgrade_drive::Opts {
         home: tmp.path().join("home"),
         state: tmp.path().join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: Some("s-1".to_string()),
@@ -3626,6 +3725,8 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
         cwd: None,
     };
     let snap = |self_claimed: Option<super::super::self_claimed::Resume>| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: "s-1".to_string(),
@@ -4221,6 +4322,8 @@ fn a_worker_carries_its_managers_claude_home_resolved_where_the_manager_runs() {
 #[test]
 fn a_model_move_reads_the_launchs_model_and_never_another_flags_value() {
     let live = |argv: &[&str]| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         tab: "s-cafe".to_string(),
         pid: 0,
         start: String::new(),
@@ -5193,6 +5296,7 @@ fn a_harness_restart_held_by_keys_is_tried_once_its_own_grace_lets_them_go() {
     let opts = Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: Some("s-k".to_string()),
@@ -5308,6 +5412,7 @@ fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_proce
     let o = Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: Some("s-resumed".to_string()),
@@ -5330,6 +5435,8 @@ fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_proce
     std::fs::create_dir_all(state_dir(&o)).expect("state");
 
     let claude_snap = |pid: u32, start: &str, argv: &[&str], session: Option<&str>| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         tab: "s-resumed".to_string(),
         pid,
         start: start.to_string(),
@@ -5556,6 +5663,7 @@ fn a_launch_that_resumes_a_conversation_is_a_resumed_agent() {
     let o = Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: Some("s-own".to_string()),
@@ -5577,6 +5685,8 @@ fn a_launch_that_resumes_a_conversation_is_a_resumed_agent() {
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let snap = |argv: &[&str], run: AgentRun| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         tab: "s-own".to_string(),
         pid: 8200,
         start: START.to_string(),
@@ -5747,4 +5857,78 @@ fn the_persons_hour_is_read_off_one_status_reply() {
     ] {
         assert_eq!(go_ahead_held_by_status(&status), held, "{status}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_relaunch_with_no_marker_types_the_build_the_twin_execs() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let agents = dir.path().join("agents");
+    std::fs::create_dir_all(&agents).expect("agents");
+    let store = dir.path().join("store/claude");
+    let build = store.join("1000002000001000318/bin/claude");
+    std::fs::create_dir_all(build.parent().expect("bin")).expect("the build's folder");
+    std::fs::write(&build, "a build").expect("build");
+    std::fs::write(
+        store.join("1000002000001000318.shim-env"),
+        "DISABLE_AUTOUPDATER=1\n",
+    )
+    .expect("the build's shim record");
+    let twin = agents.join("claude");
+    let body = format!("#!/bin/sh\nexec '{}' \"$@\"\n", build.display());
+    std::fs::write(&twin, body).expect("twin");
+    super::super::upgrade_drive::AGENTS_DIR.with(|d| *d.borrow_mut() = Some(agents.clone()));
+    let types = |exe: &Path, argv: &[&str], session: Option<&str>, mode: Option<&str>| {
+        let (line, _) = line_tap_kept(
+            Dialect::Zsh,
+            None,
+            None,
+            exe,
+            &words(argv),
+            session,
+            None,
+            mode,
+            &[],
+            None,
+            None,
+        )
+        .ok()
+        .expect("a line");
+        line
+    };
+    let build_word = build.display().to_string();
+    let twin_word = twin.display().to_string();
+    let bare = ["claude"];
+
+    let line = types(&twin, &bare, None, None);
+    assert!(
+        line.contains(&build_word) && !line.contains(&twin_word),
+        "{line}"
+    );
+    assert!(
+        line.contains("DISABLE_AUTOUPDATER=1"),
+        "past the twin, its updater stays off: {line}"
+    );
+
+    let line = types(&twin, &bare, Some("id"), None);
+    assert!(line.contains(&twin_word), "`--resume` marks it: {line}");
+
+    let line = types(&twin, &bare, None, Some("plan"));
+    assert!(line.contains(&twin_word), "a written mode marks it: {line}");
+
+    let yolo = ["claude", "--dangerously-skip-permissions"];
+    let line = types(&twin, &yolo, None, None);
+    assert!(line.contains(&twin_word), "its flag marks it: {line}");
+
+    let other = dir.path().join("other-claude");
+    let line = types(&other, &bare, None, None);
+    assert!(
+        line.contains(&other.display().to_string()),
+        "not the twin: {line}"
+    );
+
+    std::fs::remove_file(&build).expect("the build goes");
+    let line = types(&twin, &bare, None, None);
+    assert!(line.contains(&twin_word), "no build to read: {line}");
+    super::super::upgrade_drive::AGENTS_DIR.with(|d| *d.borrow_mut() = None);
 }

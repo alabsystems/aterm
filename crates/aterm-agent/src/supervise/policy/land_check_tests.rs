@@ -96,7 +96,7 @@ fn a_need_in_the_answer_is_a_need() {
         CheckAnswer::Needs { rest_landed: false }
     );
     assert_eq!(
-        land_check_answer("LANDED", Some("NEEDS YOU: the signing key"), false),
+        land_check_answer("LANDED", Some("NEEDS YOU: the signing key".into()), false),
         CheckAnswer::Needs { rest_landed: true }
     );
     assert_eq!(
@@ -115,26 +115,26 @@ fn the_answers_last_word_on_needs_wins() {
     let interim = "./check.sh fails on main in tests/test_clock.sh. NEEDS YOU: decide whether to \
                    fix or delete tests/test_clock.sh.";
     assert_eq!(
-        land_check_answer("NEEDS YOU: nothing\nLANDED", Some(interim), false),
+        land_check_answer("NEEDS YOU: nothing\nLANDED", Some(interim.into()), false),
         CheckAnswer::Landed
     );
     assert_eq!(
         land_check_answer(
             "NEEDS YOU: nothing\nThe docs PR is still open.",
-            Some(interim),
+            Some(interim.into()),
             false
         ),
         CheckAnswer::Left("The docs PR is still open.".into())
     );
     assert_eq!(
-        land_check_answer("LANDED", Some(interim), false),
+        land_check_answer("LANDED", Some(interim.into()), false),
         CheckAnswer::Needs { rest_landed: true },
         "unretracted, the earlier need stands"
     );
     assert_eq!(
         land_check_answer(
             "NEEDS YOU: rotate the deploy key\nLANDED",
-            Some("NEEDS YOU: nothing"),
+            Some("NEEDS YOU: nothing".into()),
             false
         ),
         CheckAnswer::Needs { rest_landed: true },

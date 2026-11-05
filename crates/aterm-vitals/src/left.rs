@@ -283,8 +283,79 @@ pub struct LiveTab {
     pub shell_uniqueid: Option<u64>,
     /// Its foreground job's process group, where the jobs engine names one.
     pub fg_pgid: Option<u32>,
-    /// The lowest unique id among the agent calls seen in it: its agent had started by then.
-    pub agent_since: Option<u64>,
+    /// The stretches an agent ran in it, oldest first ([`AgentSpan`]); empty while none was seen.
+    pub agent_spans: Vec<AgentSpan>,
+}
+
+/// One stretch an agent ran in a tab, by unique ids: from its start (the lowest unique id among
+/// its own process and the agent calls seen in it) to the horizon of the first reading that named
+/// no agent there, inclusive; `until` is `None` while one is named. A process born in a stretch
+/// was born while that agent ran, and one born between two was the person's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentSpan {
+    /// Its agent had started by this unique id.
+    pub since: u64,
+    /// The horizon of the first reading that named no agent after it; `None` while one is named.
+    pub until: Option<u64>,
+}
+
+impl AgentSpan {
+    /// Whether a process of unique id `born` was born in this stretch.
+    #[must_use]
+    pub fn holds(&self, born: u64) -> bool {
+        born >= self.since && self.until.is_none_or(|until| born <= until)
+    }
+}
+
+/// The most stretches a tab keeps ([`fold_agent`]): past it the oldest two become one, which
+/// reads the person's processes between them as an agent's, never an agent's as the person's.
+pub const AGENT_SPANS_KEPT: usize = 32;
+
+/// Folds one reading's word on a tab's agent into its stretches `spans`. `named` says the reading
+/// named an agent there (its own process or a live agent call); `since` is the lowest unique id it
+/// read among them; `horizon` is the reading's ([`ClosedTab::horizon`]'s sense). A reading that
+/// names none closes the open stretch at `horizon` (one whose horizon is below the stretch's start
+/// read no table to close it at, and changes nothing); one that names an agent whose id it did not
+/// read changes nothing; one whose id falls in or before the last stretch extends that stretch
+/// back and keeps it open (the same agent named again after a reading that missed it), merging
+/// every earlier one it now overlaps; any other opens a new stretch. At most [`AGENT_SPANS_KEPT`]
+/// are kept.
+pub fn fold_agent(spans: &mut Vec<AgentSpan>, named: bool, since: Option<u64>, horizon: u64) {
+    if !named {
+        if let Some(open) = spans
+            .last_mut()
+            .filter(|s| s.until.is_none() && horizon >= s.since)
+        {
+            open.until = Some(horizon);
+        }
+        return;
+    }
+    let Some(since) = since else {
+        return;
+    };
+    match spans.last_mut() {
+        Some(last) if last.until.is_none_or(|until| since <= until) => {
+            last.since = last.since.min(since);
+            last.until = None;
+        }
+        _ => spans.push(AgentSpan { since, until: None }),
+    }
+    while let [.., before, last] = spans.as_slice() {
+        if before.until.is_some_and(|until| until < last.since) {
+            break;
+        }
+        let since = before.since.min(last.since);
+        spans.pop();
+        if let Some(merged) = spans.last_mut() {
+            *merged = AgentSpan { since, until: None };
+        }
+    }
+    while spans.len() > AGENT_SPANS_KEPT {
+        let first = spans.remove(0);
+        if let Some(next) = spans.first_mut() {
+            next.since = first.since;
+        }
+    }
 }
 
 /// A tab this instance saw close: its shell and the horizon its window closes at (§3.2). Kept in
@@ -306,8 +377,8 @@ pub struct ClosedTab {
     pub horizon: u64,
     /// When that reading was, unix ms.
     pub closed_ms: u64,
-    /// The lowest unique id among the agent calls seen in it while it lived.
-    pub agent_since: Option<u64>,
+    /// The stretches an agent ran in it while it lived ([`LiveTab::agent_spans`]).
+    pub agent_spans: Vec<AgentSpan>,
     /// The processes it left that the newest reading offers a token for (the rows `end` takes):
     /// a daemon, a held program and a NEVER row it left are listed, never counted.
     pub left: usize,
@@ -375,6 +446,9 @@ pub struct LeftRow {
     pub token: Option<String>,
     /// It is in a live session's foreground group: that is `signal`'s to end, never `end`'s.
     pub foreground: bool,
+    /// W-session ties it to a session where an agent ran when it was born ([`Tie::after_agent`]);
+    /// false where W-session ties it to none.
+    pub after_agent: bool,
 }
 
 impl LeftRow {
@@ -409,13 +483,40 @@ pub struct RunRow {
     pub next_verify: bool,
 }
 
+/// Where a dangling link points (§5.6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LinkTarget {
+    /// Nothing is at its target.
+    #[default]
+    Gone,
+    /// Its target is on a volume that is not mounted now.
+    NotMounted,
+}
+
+impl LinkTarget {
+    /// The `target=` word.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Gone => "gone",
+            Self::NotMounted => "not-mounted",
+        }
+    }
+}
+
 /// One recorded dangling link.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LinkRow {
-    /// The root it is under, 1-based.
+    /// The checkout it is under, 1-based among the checkouts the view's links name.
     pub root: usize,
+    /// That checkout's path.
+    pub checkout: String,
+    /// The link's own path.
+    pub path: String,
     /// What kind of link (`target`).
     pub kind: String,
+    /// Where it points.
+    pub target: LinkTarget,
     /// Who saw it (`disk`).
     pub seen: String,
 }
@@ -437,6 +538,63 @@ pub struct LeftView {
     pub complete: bool,
     /// The reading stopped at its bound of new candidates: some rows wait for a later one.
     pub bounded: bool,
+    /// When the reading was, unix ms.
+    pub as_of_ms: u64,
+    /// The build directories the disk watch's last pass named as the ones it must keep (the
+    /// `disk.low` hogs line's), as of the reading: a leftover running from one costs disk.
+    pub build_dirs: Vec<String>,
+}
+
+/// How long a leftover's owner must have been gone before the `leftovers` Entry names it, ms
+/// (§6.6).
+pub const ENTRY_AFTER_MS: u64 = 3_600_000;
+
+/// How long `row`'s owner has been gone as of `view`'s reading, ms: since its tab closed, or
+/// since a reader first found its verify run's launcher dead. `None` while its owner lives, and
+/// for a row nothing ties to a tab or a run.
+#[must_use]
+pub fn owner_gone_ms(row: &LeftRow, view: &LeftView) -> Option<u64> {
+    match &row.from {
+        Source::Closed(key) => view
+            .closed
+            .iter()
+            .rev()
+            .find(|t| t.key == *key)
+            .map(|t| view.as_of_ms.saturating_sub(t.closed_ms)),
+        Source::Run(id) => view
+            .runs
+            .iter()
+            .find(|r| r.id == *id && r.dead)
+            .and_then(|r| r.dead_ms),
+        Source::Tab(_) | Source::Unknown => None,
+    }
+}
+
+/// Whether `row` costs something while it runs (§6.6): at least one second of CPU for each hour
+/// of its age, or an executable under a build directory the disk watch must keep.
+#[must_use]
+pub fn costs(row: &LeftRow, view: &LeftView) -> bool {
+    let burns = row
+        .cpu_ms
+        .zip(row.started_ms)
+        .is_some_and(|(cpu, age)| cpu.saturating_mul(3_600) >= age);
+    let holds_a_build = row.exe_judged.as_deref().is_some_and(|exe| {
+        view.build_dirs
+            .iter()
+            .any(|dir| std::path::Path::new(exe).starts_with(dir))
+    });
+    burns || holds_a_build
+}
+
+/// Whether the `leftovers` Entry names `row` (§6.6): a row an end takes (`offer`, `auto`) whose
+/// owner has been gone at least `after_ms`, and either a dead verify run's (aterm's own leak,
+/// even when it costs nothing) or one that costs something. An orphan whose tab still lives is
+/// never named: its owner is not gone.
+#[must_use]
+pub fn eligible(row: &LeftRow, view: &LeftView, after_ms: u64) -> bool {
+    matches!(row.tier, Tier::Offer | Tier::Auto)
+        && owner_gone_ms(row, view).is_some_and(|ms| ms >= after_ms)
+        && (row.why == Why::LauncherDead || costs(row, view))
 }
 
 /// The session W-session ties a candidate to.
@@ -446,8 +604,8 @@ pub struct Tie {
     pub key: u64,
     /// Its tab closed: it is in this instance's closed-tab records.
     pub closed: bool,
-    /// The candidate was born at or after the first agent call seen in that tab, so after its
-    /// agent started.
+    /// The candidate was born while an agent ran in that tab: in one of its stretches
+    /// ([`LiveTab::agent_spans`]).
     pub after_agent: bool,
 }
 
@@ -470,7 +628,7 @@ pub fn session_of(f: &Facts, ctx: &Ctx<'_>) -> Option<Tie> {
             && horizon.is_none_or(|h| lin.uniqueid <= h)
             && orphaned(lin.parent, lin.launcher_version, ctx.launchd)
     };
-    let after = |since: Option<u64>| since.is_some_and(|agent| lin.uniqueid >= agent);
+    let after = |spans: &[AgentSpan]| spans.iter().any(|s| s.holds(lin.uniqueid));
     if let Some(t) = ctx.live.iter().find(|t| t.sid == named) {
         return t
             .shell_uniqueid
@@ -478,7 +636,7 @@ pub fn session_of(f: &Facts, ctx: &Ctx<'_>) -> Option<Tie> {
             .map(|_| Tie {
                 key: t.key,
                 closed: false,
-                after_agent: after(t.agent_since),
+                after_agent: after(&t.agent_spans),
             });
     }
     ctx.closed
@@ -488,7 +646,7 @@ pub fn session_of(f: &Facts, ctx: &Ctx<'_>) -> Option<Tie> {
         .map(|t| Tie {
             key: t.key,
             closed: true,
-            after_agent: after(t.agent_since),
+            after_agent: after(&t.agent_spans),
         })
 }
 
@@ -569,15 +727,79 @@ pub fn waiting_of(view: &JobsView) -> Vec<(u32, Waiting)> {
         .collect()
 }
 
-/// Whether `view` offers a row whose owner is gone (a closed tab's, a dead run's): such a view is
-/// read again within the jobs engine's slow cadence, so the row's next reading comes without an
-/// edge.
+/// Whether `view` offers a row whose owner is gone (a closed tab's, a dead run's) or one of an
+/// agent's left rows ([`left_of`]): such a view is read again within the jobs engine's slow
+/// cadence, so the row's next reading comes without an edge. A live session's edges do not bring
+/// it either: an agent's process its tool shell left runs outside the session's process tree, so
+/// its exit reaches no session's process watch.
 #[must_use]
 pub fn holds_an_offer(view: &LeftView) -> bool {
     view.rows.iter().any(|r| {
-        matches!(r.tier, Tier::Offer | Tier::Auto)
-            && matches!(r.from, Source::Closed(_) | Source::Run(_))
+        (matches!(r.tier, Tier::Offer | Tier::Auto)
+            && matches!(r.from, Source::Closed(_) | Source::Run(_)))
+            || left_of(view, r).is_some()
     })
+}
+
+/// THE SESSION WHOSE AGENT LEFT `row` of `view` (`docs/DESIGN-leftovers-by-default-2026-10-30.md`
+/// §2), by the one rule every agent surface tells: an `offer` row W-session ties to a live tab
+/// ([`Proof::Env`]) that was born while an agent ran there ([`LeftRow::after_agent`]), or after its
+/// shell where no agent was seen in the tab, is that tab's session's; an `offer` row of a dead
+/// verify run is the session its record says it rode in. Never a `name`, `never` or `auto` row
+/// (none an agent ends: no token, or the next verify run's to end), a closed tab's or an untied
+/// row, nor one a parent chain alone ties to the tab; `None` for those and an empty session id.
+#[must_use]
+pub fn left_of<'a>(view: &'a LeftView, row: &LeftRow) -> Option<&'a str> {
+    if row.tier != Tier::Offer {
+        return None;
+    }
+    let sid = match &row.from {
+        Source::Tab(key) => view
+            .live
+            .iter()
+            .find(|t| t.key == *key)
+            .filter(|t| {
+                row.proof.contains(&Proof::Env) && (row.after_agent || t.agent_spans.is_empty())
+            })
+            .map(|t| t.sid.as_str()),
+        Source::Run(id) => view
+            .runs
+            .iter()
+            .filter(|r| r.dead && r.id == *id)
+            .find_map(|r| r.sid.as_deref()),
+        Source::Closed(_) | Source::Unknown => None,
+    }?;
+    (!sid.is_empty()).then_some(sid)
+}
+
+/// THE AGENT'S LEFT ROWS of the live session `sid` in `view`: each row [`left_of`] gives `sid`;
+/// none for an empty `sid`.
+#[must_use]
+pub fn agents_left<'a>(view: &'a LeftView, sid: &str) -> Vec<&'a LeftRow> {
+    if sid.is_empty() {
+        return Vec::new();
+    }
+    view.rows
+        .iter()
+        .filter(|r| left_of(view, r) == Some(sid))
+        .collect()
+}
+
+/// [`agents_left`] where `view` can say how many are left: `None` for a partial view (its sweep
+/// stopped at its cap, or its reading at its bound of new candidates), which can say a row is
+/// left but never that none is, so every agent surface reads it unread.
+#[must_use]
+pub fn agents_left_read<'a>(view: &'a LeftView, sid: &str) -> Option<Vec<&'a LeftRow>> {
+    (view.complete && !view.bounded).then(|| agents_left(view, sid))
+}
+
+/// How many rows [`agents_left_read`] gives `sid` in `view`, and the oldest one's fork age at the
+/// view's reading, ms (`None` with no row, or none whose age was read); `None` for a partial view.
+#[must_use]
+pub fn agents_left_count(view: &LeftView, sid: &str) -> Option<(usize, Option<u64>)> {
+    let rows = agents_left_read(view, sid)?;
+    let oldest = rows.iter().filter_map(|r| r.started_ms).max();
+    Some((rows.len(), oldest))
 }
 
 /// Judges one candidate: `None` when it is no leftover (a live process under a live owner that
@@ -744,6 +966,7 @@ pub fn judge(f: &Facts, ctx: &Ctx<'_>) -> Option<LeftRow> {
             .then(|| f.token.clone())
             .flatten(),
         foreground,
+        after_agent: session.is_some_and(|t| t.after_agent),
     })
 }
 

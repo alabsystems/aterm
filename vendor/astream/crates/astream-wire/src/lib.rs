@@ -7,7 +7,8 @@
 //! [`CausalCut`] frontier lattice, the fabric receipts ([`V1Receipt`], [`FabricReceipt`]), a
 //! log's [`LogIdentity`] and [`Lineage`], and the
 //! [`steps`] record — astream's generic dense, versioned, CRC-framed opaque
-//! record — with its torn-tail-or-fault classifier.
+//! record — with its torn-tail-or-fault classifier, and the [`summary`] metric
+//! primitive: window summaries any replica merges exactly.
 //!
 //! Design rules:
 //!
@@ -41,6 +42,9 @@ pub mod partition;
 pub mod receipt;
 pub mod steps;
 pub mod subject;
+/// Mergeable per-window metric summaries (count, sum, extremes, a fixed log-linear
+/// histogram), with counters, gauges and the reader that merges each origin's latest rows.
+pub mod summary;
 /// Transport-independent causal replication of independently authored records.
 pub mod sync;
 /// Fabric wake priority algebra, sender-demotion rules, and per-recipient window-budget coalescing.

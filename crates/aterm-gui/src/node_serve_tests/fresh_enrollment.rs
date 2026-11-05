@@ -78,6 +78,8 @@ impl Node {
             stop: Arc::clone(&stop),
             launcher,
             lan_may_go: || true,
+            updates: None,
+            mesh: NodeMesh::off(),
         };
         Self {
             stop,

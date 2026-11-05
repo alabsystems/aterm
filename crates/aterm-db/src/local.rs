@@ -26,7 +26,8 @@ use std::{
 
 const CONFIG: &str = "database.json";
 const IDENTITY: &str = "identity";
-const MAX_JOURNAL: usize = 128 * 1024 * 1024;
+/// Most retained journal bytes in one database generation.
+pub(crate) const MAX_JOURNAL: usize = 128 * 1024 * 1024;
 
 /// Dataset keys and a local installation identity. Never formatted or printed.
 pub struct Credentials {
@@ -37,11 +38,17 @@ pub struct Credentials {
     pub(crate) seed: [u8; 32],
     pub(crate) key: [u8; 32],
     root_seed: Option<[u8; 32]>,
+    /// The fleet tables' dataset, whose root every holder of `fleet.key` can derive: it has no
+    /// authority stream, so a control record stays inert evidence and counts for nothing.
+    no_authority: bool,
 }
 impl Credentials {
     /// Load private bounded state and prove its signing identity matches its admission.
     pub fn load(dir: &Path) -> Result<Self> {
-        let bytes = private_file::read_private(dir, CONFIG, 4096)
+        let judged = private_file::JudgedDir::judge(dir)
+            .map_err(|_| Error::new("database configuration missing or not private"))?;
+        let bytes = judged
+            .read(CONFIG, 4096)
             .map_err(|_| Error::new("database configuration missing or not private"))?;
         let v: Value = aterm_json::from_slice(&bytes)
             .map_err(|_| Error::new("invalid database configuration"))?;
@@ -52,7 +59,7 @@ impl Credentials {
                 "installation capability cannot be an administrative control certificate",
             ));
         }
-        let (seed, actor) = identity(dir)?;
+        let (seed, actor) = identity_in(&judged)?;
         if actor != capability.actor {
             return Err(Error::new(
                 "database admission belongs to another installation",
@@ -62,6 +69,11 @@ impl Credentials {
         let root_seed = match v.get("root_seed") {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => Some(decode_hex(s)?),
+            Some(_) => return Err(Error::new("invalid database configuration")),
+        };
+        let no_authority = match v.get("no_authority") {
+            None => false,
+            Some(Value::Bool(set)) => *set,
             Some(_) => return Err(Error::new("invalid database configuration")),
         };
         if root_seed
@@ -78,10 +90,11 @@ impl Credentials {
             seed,
             key,
             root_seed,
+            no_authority,
         })
     }
     fn save(&self, dir: &Path) -> Result<()> {
-        let v = json!({"manifest":hex::encode_lower(self.manifest.bytes()),"capability":hex::encode_lower(self.capability.bytes()),"key":hex::encode_lower(&self.key),"root_seed":self.root_seed.as_ref().map(|s|hex::encode_lower(s))});
+        let v = json!({"manifest":hex::encode_lower(self.manifest.bytes()),"capability":hex::encode_lower(self.capability.bytes()),"key":hex::encode_lower(&self.key),"root_seed":self.root_seed.as_ref().map(|s|hex::encode_lower(s)),"no_authority":self.no_authority});
         private_file::write_private(
             dir,
             CONFIG,
@@ -133,22 +146,25 @@ fn lock(dir: &Path) -> Result<WriterLock> {
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(dir.join("writer.lock"))
     {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.into()),
     }
-    let (file, _) = private_file::open_private(dir, "writer.lock")
+    let (file, _) = aterm_uds::kept_out(|| private_file::open_private(dir, "writer.lock"))
         .map_err(|_| Error::new("database writer lock is not private"))?;
     #[expect(
         clippy::disallowed_methods,
         reason = "WriterLock releases by LOCK_UN before closing, including while another child inherited the descriptor"
     )]
-    file.try_lock().map_err(|_| {
-        Error::new("another local database writer is active; retry after it finishes")
-    })?;
-    Ok(WriterLock(file))
+    let locked = file.try_lock();
+    match locked {
+        Ok(()) => Ok(WriterLock(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::busy()),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 fn missing(dir: &Path, name: &str) -> Result<bool> {
     match private_file::read_private(dir, name, 4096) {
@@ -160,7 +176,13 @@ fn missing(dir: &Path, name: &str) -> Result<bool> {
     }
 }
 fn identity(dir: &Path) -> Result<([u8; 32], Actor)> {
-    let bytes = private_file::read_private(dir, IDENTITY, 48)
+    let judged = private_file::JudgedDir::judge(dir)
+        .map_err(|_| Error::new("local database identity missing or not private"))?;
+    identity_in(&judged)
+}
+fn identity_in(judged: &private_file::JudgedDir) -> Result<([u8; 32], Actor)> {
+    let bytes = judged
+        .read(IDENTITY, 48)
         .map_err(|_| Error::new("local database identity missing or not private"))?;
     if bytes.len() != 48 {
         return Err(Error::new("invalid local database identity"));
@@ -200,8 +222,111 @@ pub fn init(dir: &Path, namespace: &str) -> Result<()> {
         seed,
         key: crypto::random()?,
         root_seed: Some(root_seed),
+        no_authority: false,
     }
     .save(dir)
+}
+/// What the fleet secret decides about the fleet tables' dataset.
+struct FleetKeys {
+    root_seed: [u8; 32],
+    manifest: Manifest,
+    key: [u8; 32],
+}
+impl FleetKeys {
+    fn derive(fleet_secret: &[u8]) -> Result<Self> {
+        use zeroize::Zeroizing;
+        let prk = Zeroizing::new(aterm_digest::hkdf_extract(
+            b"aterm-db/fleet-tables/1",
+            fleet_secret,
+        ));
+        let root_seed = Zeroizing::new(aterm_digest::hkdf_expand_32(&prk, b"root-seed"));
+        let id = aterm_digest::hkdf_expand_32(&prk, b"dataset-id");
+        let incarnation = aterm_digest::hkdf_expand_32(&prk, b"control-incarnation");
+        let mut control_incarnation = [0u8; 16];
+        control_incarnation.copy_from_slice(&incarnation[..16]);
+        Ok(Self {
+            manifest: Manifest::deterministic(&root_seed, id, control_incarnation, "alab")?,
+            root_seed: *root_seed,
+            key: aterm_digest::hkdf_expand_32(&prk, b"encryption-key"),
+        })
+    }
+    fn hold(&self, credentials: &Credentials) -> bool {
+        credentials.manifest.bytes() == self.manifest.bytes() && credentials.key == self.key
+    }
+}
+impl Drop for FleetKeys {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.root_seed.zeroize();
+        self.key.zeroize();
+    }
+}
+/// Ensure the deterministic fleet-shared database is initialized at `dir`.
+/// Every machine in the fleet derives the same dataset descriptor and encryption key from
+/// `fleet_secret`, while signing causal operations with its own local `identity`. The root seed
+/// is never kept, and because every member can derive it anyway, the dataset takes no authority
+/// stream at all: a control record has no effect on a replica (`no_authority`).
+pub fn ensure_fleet(dir: &Path, fleet_secret: &[u8]) -> Result<()> {
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = private_file::create_private_dir(parent);
+    }
+    let keys = FleetKeys::derive(fleet_secret)?;
+    let _lock = lock(dir)?;
+    if !missing(dir, CONFIG)? {
+        let mut existing = Credentials::load(dir)?;
+        if !keys.hold(&existing) {
+            return Err(Error::new(
+                "this database belongs to another fleet key; `aterm db rekey` moves its rows onto the current one",
+            ));
+        }
+        if existing.root_seed.is_some() || !existing.no_authority {
+            existing.root_seed = None;
+            existing.no_authority = true;
+            existing.save(dir)?;
+        }
+        return Ok(());
+    }
+    let (seed, actor) = ensure_identity(dir)?;
+    Credentials {
+        capability: Capability::issue(&keys.manifest, &keys.root_seed, actor)?,
+        manifest: keys.manifest.clone(),
+        seed,
+        key: keys.key,
+        root_seed: None,
+        no_authority: true,
+    }
+    .save(dir)
+}
+/// Whether the database at `dir` already belongs to the dataset `fleet_secret` decides.
+pub(crate) fn belongs_to_fleet(dir: &Path, fleet_secret: &[u8]) -> Result<bool> {
+    let keys = FleetKeys::derive(fleet_secret)?;
+    let _lock = lock(dir)?;
+    Ok(keys.hold(&Credentials::load(dir)?))
+}
+/// Whether `dir` holds a dataset other than the one `fleet_secret` decides.
+pub(crate) fn holds_another_dataset(dir: &Path, fleet_secret: &[u8]) -> Result<bool> {
+    if missing(dir, CONFIG)? {
+        return Ok(false);
+    }
+    belongs_to_fleet(dir, fleet_secret).map(|belongs| !belongs)
+}
+/// A replica of the fleet tables as a member that used its fleet key to sign a control record:
+/// keeps the root seed and a history that admits the record, as no shipped build can.
+#[cfg(test)]
+pub(crate) fn test_forge_authority(dir: &Path, fleet_secret: &[u8]) -> Result<()> {
+    let keys = FleetKeys::derive(fleet_secret)?;
+    ensure_fleet(dir, fleet_secret)?;
+    let mut credentials = Credentials::load(dir)?;
+    credentials.root_seed = Some(keys.root_seed);
+    credentials.no_authority = false;
+    credentials.save(dir)
+}
+/// Undo the `no_authority` mark, as a replica a build before it left behind.
+#[cfg(test)]
+pub(crate) fn test_forget_no_authority(dir: &Path) -> Result<()> {
+    let mut credentials = Credentials::load(dir)?;
+    credentials.no_authority = false;
+    credentials.save(dir)
 }
 /// Join using an invitation for this machine and an independently trusted root key.
 pub fn join(dir: &Path, invitation: &[u8], trusted_root: [u8; 32]) -> Result<()> {
@@ -236,28 +361,28 @@ pub fn join(dir: &Path, invitation: &[u8], trusted_root: [u8; 32]) -> Result<()>
         seed,
         key: decode_hex(field(&v, "key")?)?,
         root_seed: None,
+        no_authority: false,
     }
     .save(dir)
 }
 fn unhex(s: &str, max: usize) -> Result<Vec<u8>> {
-    if s.len() > max * 2
-        || !s.len().is_multiple_of(2)
-        || !s
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if s.len() > max * 2 || !s.len().is_multiple_of(2) {
         return Err(Error::new("invalid encoded database bytes"));
     }
-    s.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let high = hex::nibble(pair[0]).ok_or_else(|| Error::new("invalid hex"))?;
-            let low = hex::nibble(pair[1]).ok_or_else(|| Error::new("invalid hex"))?;
-            Ok(high * 16 + low)
-        })
-        .collect()
+    let lower_nibble = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in s.as_bytes().as_chunks::<2>().0 {
+        let high =
+            lower_nibble(pair[0]).ok_or_else(|| Error::new("invalid encoded database bytes"))?;
+        let low =
+            lower_nibble(pair[1]).ok_or_else(|| Error::new("invalid encoded database bytes"))?;
+        out.push(high * 16 + low);
+    }
+    Ok(out)
 }
 
 /// One exclusive local writer. Open for an edit/exchange, not while waiting for peers.
@@ -275,13 +400,27 @@ pub struct Database {
 impl Database {
     /// Open the strict journal and replay every bounded authenticated record.
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_as(dir, false)
+    }
+    /// Open a fleet dataset to move its rows, ignoring a control record as every current replica
+    /// does: [`ensure_fleet`] only marks a database of the current key, so one that a rotation
+    /// left behind may never have been marked.
+    pub(crate) fn open_for_rekey(dir: &Path) -> Result<Self> {
+        Self::open_as(dir, true)
+    }
+    fn open_as(dir: &Path, no_authority: bool) -> Result<Self> {
         let lock = lock(dir)?;
-        let credentials = Credentials::load(dir)?;
+        let mut credentials = Credentials::load(dir)?;
+        credentials.no_authority |= no_authority;
         let log = BrokerLog::open_with(dir.join("operations.astream"), Durability::Strict)?;
         if log.stats().retained_bytes > MAX_JOURNAL {
             return Err(Error::new("database journal exceeds generation capacity"));
         }
-        let mut history = History::new(credentials.manifest.root);
+        let mut history = if credentials.no_authority {
+            History::without_authority(credentials.manifest.root)
+        } else {
+            History::new(credentials.manifest.root)
+        };
         let mut receipts = BTreeMap::new();
         let mut offset = Offset::ZERO;
         loop {
@@ -306,7 +445,7 @@ impl Database {
                 receipts
                     .entry(opened.header.id)
                     .or_insert((received_at, record.seq.0));
-                history.insert(opened)?;
+                history.replay(opened)?;
                 offset = Offset(
                     record
                         .seq
@@ -332,6 +471,10 @@ impl Database {
     /// Pure local snapshot; consumers must surface pending history and conflicts.
     pub fn view(&self) -> View {
         self.history.view()
+    }
+    /// Retained bytes of the journal, which [`MAX_JOURNAL`] bounds.
+    pub(crate) fn journal_bytes(&self) -> usize {
+        self.log.stats().retained_bytes
     }
     /// Signed operation metadata together with this replica's first durable receipt.
     /// The received time and append position are local observations, not global order.
@@ -409,6 +552,11 @@ impl Database {
                 "an earlier append had an uncertain outcome; reopen before retrying the same request identity",
             ));
         }
+        if self.credentials.no_authority && command.stops() {
+            return Err(Error::new(
+                "this dataset has no authority stream, so no member can stop a key for good; delete the row instead",
+            ));
+        }
         loop {
             let control = command.is_control();
             let control_capability = if control {
@@ -479,11 +627,10 @@ impl Database {
             } else {
                 view.causal
             };
-            if projection
-                .quarantined
-                .iter()
-                .any(|a| a == &actor || a[..32] == self.credentials.manifest.root)
-            {
+            if projection.quarantined.iter().any(|a| {
+                a == &actor
+                    || (!self.credentials.no_authority && a[..32] == self.credentials.manifest.root)
+            }) {
                 return Err(Error::new(
                     "local writer or admission authority equivocated; recovery required",
                 ));
@@ -813,5 +960,54 @@ impl Database {
             actor,
             through,
         })
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    const SECRET: &[u8] = b"1111111111111111111111111111111111111111";
+
+    /// A build before the `no_authority` mark counted a control record against no quota, and the
+    /// journal it left has to open still, or its rows are out of reach, its rekey included.
+    /// NEGATIVE CONTROL: with replay going through `History::insert`, the open fails:
+    /// `` writer's retained history quota is exhausted ``.
+    #[test]
+    fn control_records_an_earlier_build_kept_past_a_quota_do_not_close_the_folder() {
+        let root = crate::tests::tmp();
+        let victim = root.path().join("victim");
+        ensure_fleet(&victim, SECRET).unwrap();
+        test_forget_no_authority(&victim).unwrap();
+        let keys = FleetKeys::derive(SECRET).unwrap();
+        let cap = Capability::control(&keys.manifest, &keys.root_seed).unwrap();
+        let plain = format!(
+            "{{\"v\":1,\"pad\":\"{}\"}}",
+            "x".repeat(crypto::MAX_BODY - 32)
+        );
+        let mut unmarked = Database::open(&victim).unwrap();
+        let mut previous: Option<Digest> = None;
+        for n in 0..(crate::database::MAX_WRITER_BYTES / crypto::MAX_BODY + 2) as u64 {
+            let parents: Vec<Digest> = previous.into_iter().collect();
+            let wire = crypto::seal(
+                &keys.manifest,
+                &keys.key,
+                &keys.root_seed,
+                &cap,
+                crypto::Causal {
+                    sequence: n + 1,
+                    previous,
+                    parents: &parents,
+                },
+                plain.as_bytes(),
+            )
+            .unwrap();
+            previous = Some(aterm_digest::Sha256::digest(&wire));
+            unmarked.ingest(&wire).unwrap();
+        }
+        drop(unmarked);
+
+        ensure_fleet(&victim, SECRET).unwrap();
+        assert!(Database::open(&victim).is_ok());
     }
 }

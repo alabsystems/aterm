@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Repository verbs: `repo view`, `repo list` and `repo clone`.
+//! Repository views, cloning and private main snapshots.
 
 use std::path::PathBuf;
 
@@ -78,8 +78,13 @@ const DEPTH_MAX: u32 = 1_000_000;
 /// # Errors
 ///
 /// Usage for `--anonymous` or `--as`, the repository, a `DIR` that is not empty, or a
-/// `--depth` outside 1 to 1,000,000; the runner's refusals and git's failure.
+/// `--depth` outside 1 to 1,000,000 or combined with `--mirror`;
+/// the runner's refusals and git's failure.
 pub(crate) fn repo_clone(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    let mirror = inv.has("--mirror");
+    if mirror && inv.flag("--depth").is_some() {
+        return Err(inv.usage("--mirror needs complete history: drop --depth"));
+    }
     if inv.global.anonymous || inv.global.as_profile.is_some() {
         return Err(inv.usage(
             "repo clone speaks as agh.toml routes it (the read chain, or a release-tier owner's \
@@ -96,10 +101,16 @@ pub(crate) fn repo_clone(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
                 .ok_or_else(|| inv.usage("--depth wants 1 to 1000000"))?,
         ),
     };
-    let dir = inv
-        .rest()
-        .first()
-        .map_or_else(|| PathBuf::from(slug.repo()), PathBuf::from);
+    let dir = inv.rest().first().map_or_else(
+        || {
+            PathBuf::from(if mirror {
+                format!("{}.git", slug.repo())
+            } else {
+                slug.repo().to_string()
+            })
+        },
+        PathBuf::from,
+    );
     let dir = std::path::absolute(&dir).map_err(|e| inv.usage(format!("DIR: {e}")))?;
     let empty = match std::fs::read_dir(&dir) {
         Ok(mut entries) => entries.next().is_none(),
@@ -111,7 +122,12 @@ pub(crate) fn repo_clone(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             dir.display()
         )));
     }
-    let mut run = GitRun::new_clone(&slug, &dir).with_named(named);
+    let mut run = if mirror {
+        GitRun::new_mirror(&slug, &dir)
+    } else {
+        GitRun::new_clone(&slug, &dir)
+    }
+    .with_named(named);
     if let Some(depth) = depth {
         run = run.with_depth(depth);
     }
@@ -124,6 +140,41 @@ pub(crate) fn repo_clone(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         "as".to_string(),
         out.as_.unwrap_or_else(|| "anonymous".to_string()),
     ));
+    Ok(Outcome {
+        answer: Answer::Nothing,
+        receipt,
+    })
+}
+
+/// `agh repo fetch-main REPO DIR`: refresh agh's private main snapshot, with a reflog.
+/// Branches, tags, remote-tracking refs, stash and working files are not moved.
+///
+/// # Errors
+/// Usage for an identity override or absent directory; repository and runner refusals.
+pub(crate) fn repo_fetch_main(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    const INTO: &str = "refs/agh/fetched-main";
+    if inv.global.anonymous || inv.global.as_profile.is_some() {
+        return Err(
+            inv.usage("repo fetch-main speaks as agh.toml routes it: drop --anonymous and --as")
+        );
+    }
+    let dir = inv
+        .rest()
+        .first()
+        .ok_or_else(|| inv.usage("DIR is required"))?;
+    let dir = std::path::absolute(dir).map_err(|e| inv.usage(format!("DIR: {e}")))?;
+    if !dir.is_dir() {
+        return Err(inv.usage("DIR must be an existing Git repository directory"));
+    }
+    let gh = ctx.github()?;
+    let (slug, named) = inv.repo(gh.router())?;
+    let out = gh.run_git(&GitRun::fetch_main(&slug, &dir, INTO).with_named(named))?;
+    let mut receipt = Receipt::for_repo(inv, &gh, &slug);
+    receipt.as_ = None;
+    receipt
+        .notes
+        .push(("as".into(), out.as_.unwrap_or_else(|| "anonymous".into())));
+    receipt.notes.push(("ref".into(), INTO.into()));
     Ok(Outcome {
         answer: Answer::Nothing,
         receipt,

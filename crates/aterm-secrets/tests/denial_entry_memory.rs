@@ -58,6 +58,12 @@ static ALLOCATOR: Counting = Counting;
 
 struct Measuring;
 
+// The public reads share bounded process-wide caches, while this allocator counts only
+// the current thread. Another fixture can evict a warmed snapshot during measurement,
+// moving its replacement's ownership into that cache and its eventual drop to a different
+// thread. Isolate whole scenarios so the count measures plaintext resolution, as intended.
+static SCENARIO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Drop for Measuring {
     fn drop(&mut self) {
         ACTIVE.with(|active| active.set(false));
@@ -185,6 +191,7 @@ fn fixture(paths: &client::Paths, vault: &std::path::Path, denied: &str) -> Log 
 
 #[test]
 fn public_denial_read_bounds_unrelated_plaintext_retention() {
+    let _scenario = SCENARIO.lock().unwrap();
     let home = aterm_tempfile::tempdir().unwrap();
     let paths = client::Paths::for_home(&home.path().join("member"));
     let expected = vec!["f".repeat(32)];
@@ -225,6 +232,7 @@ fn public_denial_read_bounds_unrelated_plaintext_retention() {
 
 #[test]
 fn public_local_roster_read_bounds_unrelated_plaintext_retention() {
+    let _scenario = SCENARIO.lock().unwrap();
     let home = aterm_tempfile::tempdir().unwrap();
     let paths = client::Paths::for_home(&home.path().join("member"));
     let denied = "f".repeat(32);

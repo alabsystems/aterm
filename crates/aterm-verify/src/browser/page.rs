@@ -47,7 +47,7 @@ impl Chrome {
         scratch: &Path,
     ) -> Result<Self, Refused> {
         let unavailable = |what: String| Refused::Unavailable(what);
-        std::fs::write(root.join(PAGE), PAGE_HTML).map_err(|e| {
+        crate::write_fresh(root.join(PAGE), PAGE_HTML).map_err(|e| {
             unavailable(format!(
                 "could not write {}: {e}",
                 root.join(PAGE).display()

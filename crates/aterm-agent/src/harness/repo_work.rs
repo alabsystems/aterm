@@ -1461,6 +1461,22 @@ fn submodules_unpushed(
     Some(beyond)
 }
 
+fn open_git_stdin_feed(path: &Path, body: &[u8]) -> Option<std::fs::File> {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = opts.open(path).ok()?;
+    file.write_all(body).ok()?;
+    file.seek(SeekFrom::Start(0)).ok()?;
+    Some(file)
+}
+
 /// Whether the index's gitlink `record` is a commit this submodule has fetched. Only Git's
 /// structured `missing` answer makes it optional; an error, diagnostic or other object type
 /// leaves the count unread. The private input file feeds one bounded object name and is removed
@@ -1468,8 +1484,7 @@ fn submodules_unpushed(
 fn record_available(dir: &Path, record: &str, reads: &Reads<'_>) -> Option<bool> {
     let input = aterm_tempfile::tempdir().ok()?;
     let path = input.path().join("record");
-    std::fs::write(&path, format!("{record}\n")).ok()?;
-    let feed = std::fs::File::open(&path).ok()?;
+    let feed = open_git_stdin_feed(&path, format!("{record}\n").as_bytes())?;
     let reply = run_git(
         dir,
         &["cat-file", "--batch-check=%(objecttype)"],
@@ -1686,8 +1701,7 @@ fn commits_available(dir: &Path, shas: &[String], reads: &Reads<'_>) -> Option<V
         query.push_str(sha);
         query.push_str("^{commit}\n");
     }
-    std::fs::write(&path, query).ok()?;
-    let feed = std::fs::File::open(&path).ok()?;
+    let feed = open_git_stdin_feed(&path, query.as_bytes())?;
     let reply = run_git(
         dir,
         &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
@@ -1759,9 +1773,13 @@ fn used_branches(
     if let Some(since) = used.since {
         let at = git_offline(root, &["rev-parse", "--git-path", "logs/HEAD"], reads, None)?;
         // No reflog file (none kept, or a `reftable` repository): no move is recorded.
-        if let Some(mut file) = reflog_tail(&root.join(at.trim_end_matches(['\n', '\r']))) {
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut file, &mut bytes).ok()?;
+        if let Some((file, rem)) =
+            reflog_tail_with_rem(&root.join(at.trim_end_matches(['\n', '\r'])))
+        {
+            let cap = usize::try_from(rem.min(LAG_REFLOG).saturating_add(1)).unwrap_or(0);
+            let mut bytes = Vec::with_capacity(cap);
+            std::io::Read::read_to_end(&mut std::io::Read::take(file, LAG_REFLOG), &mut bytes)
+                .ok()?;
             let text = String::from_utf8_lossy(&bytes);
             for line in text.lines().rev() {
                 // `<old> <new> <who> <when> <zone>\t<why>`
@@ -2116,25 +2134,29 @@ fn bounded_dir_bytes(
                 break;
             }
             *budget -= 1;
-            let Ok(meta) = entry.metadata() else {
+            let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            if meta.is_symlink() {
+            if kind.is_symlink() {
                 continue;
             }
-            if meta.is_dir() {
-                let path = entry.path();
+            if kind.is_dir() {
                 let child_temp = in_temp
                     || (split_temp
-                        && path
+                        && entry
                             .file_name()
-                            .and_then(|n| n.to_str())
+                            .to_str()
                             .is_some_and(is_temp_or_build_dir_name));
-                stack.push((path, child_temp));
-            } else if in_temp {
-                *temp_out = temp_out.saturating_add(meta.len());
+                stack.push((entry.path(), child_temp));
             } else {
-                total = total.saturating_add(meta.len());
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if in_temp {
+                    *temp_out = temp_out.saturating_add(meta.len());
+                } else {
+                    total = total.saturating_add(meta.len());
+                }
             }
         }
     }
@@ -2287,20 +2309,25 @@ fn without_lagging_submodules(
 /// The reflog file at `path`, read-only, at the first whole line of its last [`LAG_REFLOG`]
 /// bytes; `None` where it is no file or cannot be read.
 fn reflog_tail(path: &Path) -> Option<std::fs::File> {
+    reflog_tail_with_rem(path).map(|(file, _)| file)
+}
+
+/// [`reflog_tail`] together with the remaining byte count from the seek offset.
+fn reflog_tail_with_rem(path: &Path) -> Option<(std::fs::File, u64)> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let (mut file, meta) = open_git_file(path)?;
     let len = meta.len();
-    let from = len.saturating_sub(LAG_REFLOG);
-    if from > 0 {
-        // From the byte before `from`: a line that starts at `from` is whole.
-        file.seek(SeekFrom::Start(from - 1)).ok()?;
+    let mut start = len.saturating_sub(LAG_REFLOG);
+    if start > 0 {
+        // From the byte before `start`: a line that starts at `start` is whole.
+        file.seek(SeekFrom::Start(start - 1)).ok()?;
         let mut head = [0_u8; 4096];
         let read = file.read(&mut head).ok()?;
         let newline = head.get(..read)?.iter().position(|&b| b == b'\n')?;
-        file.seek(SeekFrom::Start(from + u64::try_from(newline).ok()?))
-            .ok()?;
+        start += u64::try_from(newline).ok()?;
+        file.seek(SeekFrom::Start(start)).ok()?;
     }
-    Some(file)
+    Some((file, len.saturating_sub(start)))
 }
 
 /// The `(path, commit)` records `history` (`git diff-tree --raw -z --no-abbrev`) names: a
@@ -2845,6 +2872,13 @@ pub(crate) mod read_stall {
         SPENT.with(|s| s.set(0));
     }
 
+    /// Whether the read [`set_after`] named is still to come: a probe that returned with it pending
+    /// never reached it, so a probe told to starve any later read is this same uncut one.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn pending() -> bool {
+        NEXT.with(Cell::get) != 0
+    }
+
     /// Starve every read this thread starts `ms`, clearing the time already spent.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn every(ms: u64) {
@@ -2882,6 +2916,9 @@ pub(crate) mod read_stall {
 #[path = "repo_work_record.rs"]
 mod record;
 pub use record::read_work;
+
+#[path = "repo_home.rs"]
+pub mod home;
 
 #[cfg(test)]
 #[path = "repo_work_tests.rs"]

@@ -13,7 +13,7 @@
 //! asb drain  <endpoint> <group> <filter> [--max N] [--idle MS] [--peek]
 //! asb ack    <endpoint> <group> <offset> <subject> handled|refused|deferred
 //! asb commit <endpoint> <group> <upto>                      durably commit a consumer group
-//! asb federate <src> <dst> (--rules-file P | --group G --filter F) [--once | --interval-ms N]
+//! asb federate <src> <dst> (--rules-file P | --group G --filter F) [--once]
 //!                                                           mirror subtrees across brokers exactly once
 //! asb mint   <grant> --secret-env NAME | --secret-file PATH mint a capability line
 //! asb repair <log>                                          truncate at the first corrupt record
@@ -283,7 +283,7 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
        asb commit <endpoint> <group> <upto> <transport> <cap>
        asb federate <src-endpoint> <dst-endpoint>
                   (--rules-file PATH | --group G --filter F [--rewrite SPEC] [--exclude P]...)
-                  [--id N] [--max N] [--once | --interval-ms N] [--cut-file PATH]
+                  [--id N] [--max N] [--once] [--cut-file PATH]
                   <transport> [--dst-tcp] [--dst-handshake]
                   [--dst-key-env NAME | --dst-key-file PATH]
                   <cap> [--dst-cap-file PATH]...
@@ -1110,7 +1110,6 @@ const VALUE_FLAGS: &[&str] = &[
     "--filter",
     "--rewrite",
     "--rules-file",
-    "--interval-ms",
     "--cut-file",
     "--key-env",
     "--key-file",
@@ -2129,7 +2128,8 @@ fn sync_parent_dir_by(
 #[cfg(feature = "cap")]
 fn unbound_god_cap_filter(grant: &str) -> Option<String> {
     let g = astream_cap::Grant::parse(grant).ok()?;
-    (g.mode == astream_cap::Mode::ReadWrite && g.principal.is_none()).then_some(g.filter)
+    (g.mode == astream_cap::Mode::ReadWrite && g.principal.is_none() && !g.relay)
+        .then_some(g.filter)
 }
 
 /// Without the `cap` feature there is no vetted parser here to ask — and no MAC
@@ -2808,7 +2808,7 @@ fn cmd_mint(cli: &Cli) -> Result<(), AsbErr> {
         }
         (None, true) => {
             return Err(AsbErr::Exit(usage_error(
-                "--legacy-unbound applies only to the READ-WRITE, UNBOUND grant (a bare filter, or `rw:` with no `,p=<principal>`); this grant is already read-only or bound to a principal",
+                "--legacy-unbound applies only to the READ-WRITE, UNBOUND grant (a bare filter, or `rw:` with no `,p=<principal>`); this grant is already read-only, a relay, or bound to a principal",
             )));
         }
         _ => {}
@@ -3998,7 +3998,6 @@ fn cmd_federate(cli: &Cli) -> Result<(), AsbErr> {
             "--id",
             "--max",
             "--once",
-            "--interval-ms",
             "--cut-file",
             "--dst-tcp",
             "--dst-handshake",
@@ -4009,18 +4008,6 @@ fn cmd_federate(cli: &Cli) -> Result<(), AsbErr> {
     )?;
 
     let once = cli.has("--once");
-    let interval_opt = cli.num("--interval-ms")?;
-    if once && interval_opt.is_some() {
-        return Err(AsbErr::Exit(usage_error(
-            "--once and --interval-ms are mutually exclusive",
-        )));
-    }
-    let interval_ms = interval_opt.unwrap_or(250);
-    if !once && interval_ms == 0 {
-        return Err(AsbErr::Exit(usage_error(
-            "--interval-ms expects a positive number of milliseconds",
-        )));
-    }
 
     let rules = match cli.kv.get("--rules-file") {
         Some(path) => {
@@ -4187,45 +4174,46 @@ fn cmd_federate(cli: &Cli) -> Result<(), AsbErr> {
         return Ok(());
     }
 
-    let sleep_dur = Duration::from_millis(interval_ms);
-    loop {
-        match runner.sync_all_once() {
-            Ok(reports) => {
-                let mut any_fetched = false;
-                for (_group, rep) in &reports {
-                    if rep.fetched > 0 {
-                        any_fetched = true;
-                    }
-                }
-                if any_fetched {
-                    if let Some((ref path, ref mut cut)) = cut_state {
-                        runner.record_into_cut(&reports, cut);
-                        write_cut_file_atomic(path, cut)?;
-                    }
-                    for (group, rep) in &reports {
-                        if rep.fetched > 0 {
-                            let line = format_federation_report_line(group, rep);
-                            say_durable(
-                                &line,
-                                "the federated records and source consumer-group commit ARE on the logs",
-                            )?;
-                        }
-                    }
-                } else {
-                    std::thread::sleep(sleep_dur);
-                }
+    // Live: by push, with no timer. A lost connection ends the command with exit 1, and the
+    // durable groups and the destination's dedup let whatever restarts it resume exactly.
+    let cut_state = std::sync::Mutex::new(cut_state);
+    let src_log = runner.source_identity();
+    let wrote: std::sync::Mutex<Option<AsbErr>> = std::sync::Mutex::new(None);
+    let closer = runner.closer();
+    let outcome = runner.run(&|group, rep| {
+        let said = || -> Result<(), AsbErr> {
+            if let Some((path, cut)) = cut_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                astream_broker::FederationRunner::record_report(src_log, rep, cut);
+                write_cut_file_atomic(path, cut)?;
             }
-            Err(astream_broker::FederationError::Io(_)) => {
-                std::thread::sleep(sleep_dur);
-                if let Err(e) = runner.reconnect_all() {
-                    warn(&format!("asb: {e}"));
-                    return Err(AsbErr::Exit(1));
-                }
-            }
-            Err(e) => {
-                warn(&format!("asb: {e}"));
-                return Err(AsbErr::Exit(1));
-            }
+            say_durable(
+                &format_federation_report_line(group, rep),
+                "the federated records and source consumer-group commit ARE on the logs",
+            )?;
+            Ok(())
+        };
+        if let Err(e) = said() {
+            *wrote
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+            closer.close();
+        }
+    });
+    if let Some(e) = wrote
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return Err(e);
+    }
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            warn(&format!("asb: {e}"));
+            Err(AsbErr::Exit(1))
         }
     }
 }

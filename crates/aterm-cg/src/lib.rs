@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CoreGraphics display and image FFI bindings for macOS.
+//! CoreGraphics display, image and event FFI bindings for macOS.
 
 #![cfg(target_os = "macos")]
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
 use std::ptr;
 
-use aterm_objc::CGRect;
+use aterm_objc::{CGRect, Id, Sel};
 
-aterm_objc::opaque! { CGDisplayMode, CGImage, CGColorSpace, CGDataProvider }
+aterm_objc::opaque! { CGDisplayMode, CGImage, CGColorSpace, CGDataProvider, __CGEvent }
 
 pub type CGError = i32;
 pub type CGDirectDisplayID = u32;
@@ -20,11 +20,15 @@ pub type CGColorSpaceRef = *mut CGColorSpace;
 pub type CGDataProviderRef = *mut CGDataProvider;
 pub type CGBitmapInfo = u32;
 pub type CGColorSpaceModel = i32;
+pub type CGEventRef = *mut __CGEvent;
+pub type CGEventField = u32;
 /// Re-export of [`aterm_objc::cf::CFDataRef`] returned by [`CGDataProviderCopyData`].
 pub type CFDataRef = aterm_objc::cf::CFDataRef;
 
 pub const kCGErrorSuccess: CGError = 0;
 pub const kCGColorSpaceModelRGB: CGColorSpaceModel = 1;
+/// The event field that holds the Unix process ID of the event's source (`CGEventTypes.h`).
+pub const kCGEventSourceUnixProcessID: CGEventField = 41;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -56,6 +60,32 @@ unsafe extern "C" {
     pub fn CGImageRelease(image: CGImageRef);
     pub fn CGColorSpaceGetModel(space: CGColorSpaceRef) -> CGColorSpaceModel;
     pub fn CGDataProviderCopyData(provider: CGDataProviderRef) -> CFDataRef;
+
+    pub fn CGEventGetIntegerValueField(event: CGEventRef, field: CGEventField) -> i64;
+}
+
+/// The Unix process ID of the process `event` came from: its CoreGraphics event's
+/// [`kCGEventSourceUnixProcessID`]. A key another process posted (`CGEventPost`, System Events'
+/// `keystroke`) names that process; a key the HID system delivered from a keyboard reads 0
+/// (INFERRED from the field's documented meaning: the header names it only "the event source
+/// Unix process ID"). An event with no CoreGraphics event, which only this process can build,
+/// reads 0 too: `CGEventGetIntegerValueField` takes a NULL event.
+///
+/// # Safety
+/// `event` is a live `NSEvent`.
+#[must_use]
+pub unsafe fn event_source_pid(event: Id) -> i64 {
+    aterm_objc::autoreleasepool(|_| {
+        // SAFETY: `-[NSEvent CGEvent]` is `^{__CGEvent=}16@0:8` on the live event the caller
+        // pins, +0 and autoreleased (NULL where the event has none), used before this pool pops;
+        // `CGEventGetIntegerValueField` reads one scalar field and accepts NULL.
+        unsafe {
+            let cg_event: unsafe extern "C-unwind" fn(Id, Sel) -> *mut std::ffi::c_void =
+                aterm_objc::checked_msg();
+            let cg = cg_event(event, aterm_objc::sel!(CGEvent));
+            CGEventGetIntegerValueField(cg.cast(), kCGEventSourceUnixProcessID)
+        }
+    })
 }
 
 #[inline]

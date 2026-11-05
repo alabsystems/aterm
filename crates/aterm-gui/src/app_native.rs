@@ -1738,6 +1738,8 @@ impl App {
             } else {
                 crate::control::FrontControlSurface::NativeSettings
             }
+        } else if self.view_is_private(view) {
+            crate::control::FrontControlSurface::PrivateDocument
         } else {
             crate::control::FrontControlSurface::OtherNative
         }
@@ -3941,7 +3943,7 @@ impl App {
                 })
             }
             InputEvent::ScrollView(intent) => Some(AppEvent::ScrollLines(match intent {
-                ScrollIntent::By(lines) => -*lines,
+                ScrollIntent::By(lines) => lines.saturating_neg(),
                 ScrollIntent::Up | ScrollIntent::PrevPrompt => -8,
                 ScrollIntent::Down | ScrollIntent::NextPrompt => 8,
                 ScrollIntent::Top => -10_000,
@@ -6142,6 +6144,7 @@ impl App {
                             false,
                             aterm_messages::Waiter::Person,
                             &post,
+                            &|_| {},
                         );
                         let (failure, ran_pass) = match &ran {
                             Ok((run, status)) => (
@@ -7491,6 +7494,7 @@ impl App {
                 });
                 let grant_chunks = passed.as_ref().is_ok_and(|facts| facts.grant_chunks);
                 let grant_empty = passed.as_ref().is_ok_and(|facts| facts.grant_empty);
+                let grant_desk = passed.as_ref().is_ok_and(|facts| facts.grant_desk);
                 *slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -7504,6 +7508,7 @@ impl App {
                         policy,
                         grant_chunks,
                         grant_empty,
+                        grant_desk,
                     });
             });
         match spawned {

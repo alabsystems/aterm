@@ -781,15 +781,21 @@ pub fn reduce(
         package: package.to_string(),
         ..Record::default()
     };
+    const MAX_REPORT_LINE_BYTES: usize = 16 * 1024 * 1024;
     loop {
+        use std::io::Read as _;
         buf.clear();
-        let got = reader
+        let got = (&mut reader)
+            .take((MAX_REPORT_LINE_BYTES + 1) as u64)
             .read_until(b'\n', &mut buf)
             .map_err(|e| format!("{}: {e}", report.display()))?;
         if got == 0 {
             break;
         }
         n += 1;
+        if buf.len() > MAX_REPORT_LINE_BYTES {
+            return Err(format!("line {n} exceeds {MAX_REPORT_LINE_BYTES} bytes"));
+        }
         while matches!(buf.last(), Some(b'\n' | b'\r')) {
             buf.pop();
         }
@@ -1012,7 +1018,10 @@ pub fn write_record(args: &ReduceArgs) -> std::result::Result<Record, String> {
                 .prefix(".oblig-")
                 .tempdir_in(dir)?;
             let staged = stage.path().join("record.tsv");
-            fs::write(&staged, rec.to_text())?;
+            crate::durable::open_create_new(&staged).and_then(|mut f| {
+                use std::io::Write as _;
+                f.write_all(rec.to_text().as_bytes())
+            })?;
             fs::rename(&staged, &args.out)
         };
         write()

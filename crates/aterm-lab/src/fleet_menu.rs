@@ -6,7 +6,7 @@
 
 use crate::instance::{BOOT, CONFIG_OFF, Instance, Launch, World};
 use crate::{Fail, Res};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -75,9 +75,10 @@ pub fn cmd(args: &[String]) -> Res {
     let aterm = std::fs::canonicalize(crate::paths::from_caller(aterm))
         .map_err(|e| Fail::die(e.to_string()))?;
     let out = crate::paths::from_caller(out);
-    std::fs::create_dir(&out).map_err(|e| Fail::die(format!("{out}: {e}")))?;
-    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| Fail::die(e.to_string()))?;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&out)
+        .map_err(|e| Fail::die(format!("{out}: {e}")))?;
     let out = std::fs::canonicalize(out).map_err(|e| Fail::die(e.to_string()))?;
 
     let mut peer = World::new(CONFIG_OFF).map_err(Fail::die)?;
@@ -136,7 +137,8 @@ pub fn cmd(args: &[String]) -> Res {
     }) {
         return Err(Fail::die("fleet-menu peer did not report two instances"));
     }
-    std::fs::write(out.join("peer-survey.json"), &survey).map_err(|e| Fail::die(e.to_string()))?;
+    crate::util::atomic_write(&out.join("peer-survey.json"), survey.as_bytes())
+        .map_err(|e| Fail::die(e.to_string()))?;
     let window = start(&reader, &aterm, false)?;
     let until = Instant::now() + HANG;
     let (chrome, complete) = loop {
@@ -153,14 +155,16 @@ pub fn cmd(args: &[String]) -> Res {
         }
         crate::stop::sleep(Duration::from_millis(50))?;
     };
-    std::fs::write(out.join("menu.txt"), &chrome).map_err(|e| Fail::die(e.to_string()))?;
+    crate::util::atomic_write(&out.join("menu.txt"), chrome.as_bytes())
+        .map_err(|e| Fail::die(e.to_string()))?;
     let image = control(&reader, &aterm, &window.sock, &["image", "frame.png"])?;
     let image = image
         .split_whitespace()
         .nth(3)
         .filter(|path| !path.is_empty())
         .ok_or_else(|| Fail::die("fleet-menu image reply has no path"))?;
-    std::fs::copy(image, out.join("frame.png")).map_err(|e| Fail::die(e.to_string()))?;
+    crate::util::copy_regular_file(image, out.join("frame.png"))
+        .map_err(|e| Fail::die(e.to_string()))?;
     println!(
         "fleet-menu peer={} sibling={} reader_keeper={} output={}\n{}",
         primary.pid,

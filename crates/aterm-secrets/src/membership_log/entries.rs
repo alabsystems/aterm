@@ -2376,7 +2376,8 @@ mod selective_tests;
 mod tests {
     use super::*;
     use crate::commons::binding::Request;
-    use crate::membership_log::tests::signed::generated;
+    use crate::membership_log::epochs;
+    use crate::membership_log::tests::signed::{Mac, generated, three_macs};
     use crate::membership_log::{Entrant, Evidence, Inserted};
 
     const NETWORK: [u8; 16] = [0x31; 16];
@@ -3460,7 +3461,7 @@ mod tests {
         m2_writes_under_e(&t, &mut split);
         let mut healed = split.side_1.clone();
         healed.merge(&split.side_2).unwrap();
-        let audiences = [EpochAudience::Everyone];
+        let audiences = [crate::membership_log::SeatAudience::Everyone];
         for (who, id) in [("m1", &t.id1), ("m2", &t.id2)] {
             let opened = healed.open_audience_entries(id).unwrap().unwrap();
             let handed: Vec<RecordId> = Log::admission_epochs(&opened, &audiences)
@@ -4575,25 +4576,92 @@ mod tests {
         assert_eq!(opened_conc.entries[0].value.as_slice(), expected);
     }
 
-    /// On 200 signed logs where Macs remove each other while the removed reseal on their own
-    /// copies and others write under those epochs, and reseals attest and cover the keyed epochs
-    /// ([`generated`]), every keyed-epoch reading of every opening is what the replaced reading
-    /// gives: the generated logs read keyed epochs, covered ones among them.
+    /// On 200 signed logs ([`generated`]: three Macs write, delete, reseal, mint Commons and
+    /// `[mac-1 mac-2]` epochs that leave a Mac out a quarter of the time, remove each other, let
+    /// each other back in and write under the epochs of the removed, on diverging copies), each of
+    /// the three readings every opening and probe takes, of each copy after each step and of the
+    /// merge, is what the one it replaced gives: every epoch verdict ([`epochs::oracle::check`]),
+    /// every keyed-epoch reading ([`keyed::oracle::check`]), which finds keyed epochs, covered ones
+    /// among them, and every register ([`register::oracle`]). Each oracle fails the generation on
+    /// a disagreement, so a failure names its reading in its own panic and not in this test's name.
+    /// NEGATIVE CONTROLS: with what a writer held keeping every carry, the openings disagree; a
+    /// verdict that reads no seat entry, no prior wrap, lets a newest epoch the seat entry follows
+    /// learn from a prior wrap, or counts a prior wrap the entry of a Mac that came back follows,
+    /// disagrees, each by the first log that takes its branch.
     #[test]
-    fn two_hundred_signed_logs_read_keyed_epochs_as_the_replaced_reading_did() {
+    fn two_hundred_signed_logs_read_as_the_replaced_readings_did() {
+        epochs::oracle::CHECKED.set((0, 0));
         keyed::oracle::CHECKED.set((0, 0));
         keyed::oracle::FOUND.set((0, 0));
-        for seed in 1..=200 {
-            let _ = generated(seed);
-        }
+        register::oracle::CHECKED.set((0, 0));
+        let logs: Vec<Log> = (1..=200).map(generated).collect();
+
+        let (checked, wrong) = epochs::oracle::CHECKED.get();
+        assert!(checked > 30_000, "the probes checked verdicts: {checked}");
+        assert_eq!(wrong, 0, "of {checked} epoch verdicts");
         let (checked, wrong) = keyed::oracle::CHECKED.get();
         let (found, covered) = keyed::oracle::FOUND.get();
-        assert_eq!(wrong, 0, "of {checked} readings");
+        assert_eq!(wrong, 0, "of {checked} keyed-epoch readings");
         assert!(found > 0, "no reading of {checked} found a keyed epoch");
         assert!(
             covered > 0,
             "no reading of {found} found a covered keyed epoch"
         );
+        let (checked, wrong) = register::oracle::CHECKED.get();
+        assert!(checked > 5_000, "the openings checked registers: {checked}");
+        assert_eq!(wrong, 0, "of {checked} registers");
+
+        let (macs, _) = three_macs();
+        let left_out = logs
+            .iter()
+            .filter(|log| {
+                macs.iter().any(|mac| {
+                    log.audience_left_out_recipient(
+                        &EpochAudience::Everyone,
+                        &mac.identity.recipient(),
+                    )
+                })
+            })
+            .count();
+        assert!(left_out > 50, "merges leave a Mac out: {left_out}");
+
+        register::oracle::COUNT_ONLY.set(true);
+        register::oracle::CHECKED.set((0, 0));
+        register::MUTANT.set(Some(register::Mutant::KeepEveryCarry));
+        let (founder, _) = Mac::new(1);
+        for log in &logs {
+            let _ = log.open_entry_set(&founder.identity).unwrap();
+        }
+        register::MUTANT.set(None);
+        register::oracle::COUNT_ONLY.set(false);
+        let (checked, wrong) = register::oracle::CHECKED.get();
+        assert!(
+            checked > 0 && wrong > 0,
+            "keeping every carry goes unnoticed"
+        );
+
+        for mutant in [
+            epochs::Mutant::IgnoreSeat,
+            epochs::Mutant::IgnorePriorWraps,
+            epochs::Mutant::IgnoreEntryAfter,
+            epochs::Mutant::IgnoreReturn,
+        ] {
+            epochs::oracle::CHECKED.set((0, 0));
+            epochs::oracle::COUNT_ONLY.set(true);
+            epochs::MUTANT.set(Some(mutant));
+            // The verdict is `wrong > 0`, which the first disagreement settles.
+            for seed in 1..=200 {
+                let _ = generated(seed);
+                if epochs::oracle::CHECKED.get().1 > 0 {
+                    break;
+                }
+            }
+            epochs::MUTANT.set(None);
+            epochs::oracle::COUNT_ONLY.set(false);
+            let (checked, wrong) = epochs::oracle::CHECKED.get();
+            assert!(checked > 0 && wrong > 0, "{mutant:?} goes unnoticed");
+        }
+        epochs::oracle::CHECKED.set((0, 0));
     }
 
     /// Every keyed-epoch reading the tests take checks itself against the one it replaced

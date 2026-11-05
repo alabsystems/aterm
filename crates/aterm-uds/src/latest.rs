@@ -94,7 +94,12 @@ pub fn publish(link: &Path, sock_path: &str) {
     let _ = std::fs::remove_file(&tmp);
     let mut contents = target.to_string_lossy().into_owned();
     contents.push('\n');
-    if std::fs::write(&tmp, contents).is_err() {
+    let open = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, contents.as_bytes()));
+    if open.is_err() {
         return;
     }
     if std::fs::rename(&tmp, link).is_err() {

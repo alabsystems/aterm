@@ -34,11 +34,252 @@ use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 use std::collections::BTreeMap;
 
 pub(crate) use edit::edit as edit_grid;
-pub use edit::{Edited, Opener, amacs};
+pub(crate) use edit::show as show_grid;
+pub use edit::{Edited, GridSecrets, Opener, amacs, in_editor_tab, open_secrets};
 
 /// How a table keys the row a new grid row becomes, from the typed values of its cells and the
 /// table's cells as they are (an account's key needs its login's address).
 pub type Birth = fn(&Collection, &BTreeMap<String, Value>, &Cells) -> Result<String>;
+
+/// A keyed comparison of a collection. The epoch is part of the output: digests
+/// from different epochs cannot be called a table mismatch.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SecretDigest {
+    pub epoch: String,
+    pub rows: usize,
+    pub with_secret: usize,
+    pub digest: String,
+}
+
+/// A key rotation is distinct from a differing table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DigestComparison {
+    Equal,
+    Different,
+    DifferentEpoch,
+}
+
+impl SecretDigest {
+    /// Compare only under the same named digest epoch.
+    pub fn compare(&self, other: &Self) -> DigestComparison {
+        if self.epoch != other.epoch {
+            DigestComparison::DifferentEpoch
+        } else if self == other {
+            DigestComparison::Equal
+        } else {
+            DigestComparison::Different
+        }
+    }
+}
+
+impl std::fmt::Display for SecretDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "epoch={} rows={} with_secret={} digest={}",
+            self.epoch, self.rows, self.with_secret, self.digest
+        )
+    }
+}
+
+/// Compare the logical values, not randomized ciphertext, in one collection. `key`
+/// is the current everyone epoch key; `resolve` supplies the table audience key for
+/// each stored cell's epoch, including historical epochs after rotation. Conflicting
+/// secrets are compared as a sorted set of values, independent of operation IDs.
+///
+/// # Errors
+/// A cell's historical key is unavailable, its seal fails, or values cannot encode.
+pub fn secret_digest(
+    table: &str,
+    collection: &Collection,
+    cells: &Cells,
+    epoch: &Digest,
+    key: &[u8; 32],
+    resolve: impl Fn(&Digest) -> Result<zeroize::Zeroizing<[u8; 32]>>,
+) -> Result<SecretDigest> {
+    use crate::typed::{Ty, secret};
+    use ring::hmac;
+    use zeroize::Zeroizing;
+    let prk = Zeroizing::new(aterm_digest::hkdf_extract(
+        b"aterm/att/secret-digest/1\0",
+        key,
+    ));
+    let derived = Zeroizing::new(aterm_digest::hkdf_expand_32(
+        &prk,
+        b"aterm/att/secret-digest/1\0",
+    ));
+    let mut mac = hmac::Context::with_key(&hmac::Key::new(hmac::HMAC_SHA256, &*derived));
+    let mut part = |bytes: &[u8]| {
+        mac.update(&(bytes.len() as u64).to_le_bytes());
+        mac.update(bytes);
+    };
+    part(table.as_bytes());
+    part(collection.name.as_bytes());
+    let projection = cell::project(collection, cells);
+    part(&(projection.rows.len() as u64).to_le_bytes());
+    let mut with_secret = 0;
+    for (pk, row) in &projection.rows {
+        part(pk.as_bytes());
+        part(&(row.fields.len() as u64).to_le_bytes());
+        let mut populated = false;
+        for (name, field) in &row.fields {
+            part(name.as_bytes());
+            if collection
+                .column(name)
+                .is_some_and(|c| matches!(c.ty, Ty::Secret))
+            {
+                part(b"secret");
+                let candidates: Vec<&Value> = match field {
+                    cell::Field::Value(c) => vec![&c.value.x],
+                    cell::Field::Conflict { candidates, .. } => {
+                        candidates.iter().map(|c| &c.value.x).collect()
+                    }
+                    cell::Field::Set(_) => return Err(Error::new("a secret is not a set")),
+                };
+                let mut values: Vec<Zeroizing<Vec<u8>>> = Vec::new();
+                for value in candidates {
+                    if value.is_null() {
+                        values.push(Zeroizing::new(vec![0]));
+                        continue;
+                    }
+                    let token = value
+                        .as_str()
+                        .ok_or_else(|| Error::new("invalid secret cell"))?;
+                    let old_key = resolve(&secret::epoch(token)?)?;
+                    let plain = secret::open(
+                        token,
+                        &old_key,
+                        secret::Cell {
+                            table,
+                            collection: collection.name,
+                            row: pk,
+                            column: name,
+                        },
+                    )?;
+                    let text = plain.plaintext().as_bytes();
+                    let mut bytes = Zeroizing::new(Vec::with_capacity(1 + text.len()));
+                    bytes.push(1);
+                    bytes.extend_from_slice(text);
+                    values.push(bytes);
+                    populated = true;
+                }
+                values.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+                values.dedup_by(|a, b| a.as_slice() == b.as_slice());
+                part(&(values.len() as u64).to_le_bytes());
+                for value in values.iter() {
+                    part(value);
+                }
+            } else {
+                part(b"value");
+                let values: Vec<Value> = match field {
+                    cell::Field::Value(c) => vec![c.value.x.clone()],
+                    cell::Field::Conflict { candidates, .. } => {
+                        candidates.iter().map(|c| c.value.x.clone()).collect()
+                    }
+                    cell::Field::Set(_) => vec![aterm_json::json!(
+                        field.members().into_iter().collect::<Vec<_>>()
+                    )],
+                };
+                let mut encoded: Vec<Vec<u8>> = values
+                    .iter()
+                    .map(aterm_json::to_vec)
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|_| Error::new("cannot encode digest field"))?;
+                encoded.sort();
+                encoded.dedup();
+                part(&(encoded.len() as u64).to_le_bytes());
+                for value in encoded {
+                    part(&value);
+                }
+            }
+        }
+        with_secret += usize::from(populated);
+    }
+    Ok(SecretDigest {
+        epoch: aterm_codec::hex::encode_lower(epoch),
+        rows: projection.rows.len(),
+        with_secret,
+        digest: aterm_codec::hex::encode_lower(mac.sign().as_ref()),
+    })
+}
+
+#[cfg(test)]
+mod secret_digest_tests {
+    use super::*;
+    use crate::database::{Candidate, Cell as Stored};
+    use crate::typed::{
+        Column, Derive, Kind, Ty, Writers,
+        secret::{Cell, Secret},
+    };
+
+    const COLLECTION: Collection = Collection {
+        name: "mailbox",
+        version: 1,
+        kind: Kind::Cells,
+        writers: Writers::Owner,
+        prefix: "mb",
+        derive: Derive::Random,
+        columns: &[
+            Column::new("row", Ty::Enum(&["live", "ended"])),
+            Column::new("password", Ty::Secret).null(),
+        ],
+        unique: &[],
+        max_row: 1024,
+    };
+
+    fn cells(password: &str, epoch: Digest, key: [u8; 32]) -> Cells {
+        let token = Secret::new(password.into())
+            .seal(
+                &key,
+                &epoch,
+                Cell {
+                    table: "alab/registry",
+                    collection: "mailbox",
+                    row: "mb-test",
+                    column: "password",
+                },
+            )
+            .unwrap();
+        BTreeMap::from([(
+            ("mailbox".into(), "mb-test.password".into()),
+            Stored {
+                stopped: false,
+                candidates: vec![Candidate {
+                    operation: [1; 32],
+                    value: cell::CellValue::owner(1, Value::String(token)).encode(),
+                }],
+            },
+        )])
+    }
+
+    #[test]
+    fn digest_compares_logical_values_and_names_its_epoch() {
+        let epoch = [2; 32];
+        let key = [3; 32];
+        let digest = |cells: &Cells, epoch: &Digest, key: &[u8; 32]| {
+            secret_digest("alab/registry", &COLLECTION, cells, epoch, key, |_| {
+                Ok(zeroize::Zeroizing::new([3; 32]))
+            })
+            .unwrap()
+        };
+        let first = cells("fixture-one", epoch, key);
+        let resealed = cells("fixture-one", epoch, key);
+        assert_ne!(first, resealed);
+        let one = digest(&first, &epoch, &key);
+        assert_eq!(one, digest(&resealed, &epoch, &key));
+        assert_ne!(
+            one.digest,
+            digest(&cells("fixture-two", epoch, key), &epoch, &key).digest
+        );
+        let rotated = digest(&first, &[4; 32], &[5; 32]);
+        assert_ne!(one.digest, rotated.digest);
+        assert_ne!(one.epoch, rotated.epoch);
+        assert_eq!(one.compare(&rotated), DigestComparison::DifferentEpoch);
+        assert_eq!((one.rows, one.with_secret), (1, 1));
+        assert!(one.to_string().starts_with(&format!("epoch={}", one.epoch)));
+        assert!(!one.to_string().contains("fixture-one"));
+    }
+}
 
 /// A typed catalog table this build compiles.
 #[derive(Clone, Copy, Debug)]
@@ -92,6 +333,12 @@ impl Compiled {
     /// `<application>/<role>`.
     pub fn name(&self) -> String {
         format!("{}/{}", self.table.application, self.table.role)
+    }
+
+    pub(crate) fn matches_name(&self, name: &str) -> bool {
+        name.strip_prefix(self.table.application)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|role| role == self.table.role)
     }
 
     /// The cells or owned collection named `name`.
@@ -168,10 +415,16 @@ pub fn current(paths: &Paths, first: &'static Compiled) -> &'static Compiled {
 
 /// The compiled table of `table`'s family at `generation`.
 fn generation_of(table: &Table, generation: u64) -> Option<&'static Compiled> {
-    let family = |role: &str| role.split('.').next().unwrap_or(role).to_owned();
+    let target_family = table.role.split('.').next().unwrap_or(table.role);
     TABLES.iter().find(|compiled| {
         compiled.table.application == table.application
-            && family(compiled.table.role) == family(table.role)
+            && compiled
+                .table
+                .role
+                .split('.')
+                .next()
+                .unwrap_or(compiled.table.role)
+                == target_family
             && u64::from(compiled.generation) == generation
     })
 }
@@ -183,7 +436,7 @@ fn generation_of(table: &Table, generation: u64) -> Option<&'static Compiled> {
 pub fn find(name: &str) -> Result<&'static Compiled> {
     TABLES
         .iter()
-        .find(|compiled| compiled.name() == name)
+        .find(|compiled| compiled.matches_name(name))
         .ok_or_else(|| {
             Error::new("no typed table of that name in this build (see `aterm db table ls`)")
         })
@@ -412,7 +665,14 @@ pub(crate) fn pack(rows: Vec<Vec<Change>>) -> Result<Vec<Vec<Change>>> {
             return Err(Error::new("one typed row passes a record's limits"));
         }
         match records.last_mut() {
-            Some(last) if fits(&[last.as_slice(), row.as_slice()].concat()) => last.extend(row),
+            Some(last) if last.len() + row.len() <= MAX_WRITES => {
+                let prev_len = last.len();
+                last.extend(row);
+                if !fits(last) {
+                    let row = last.split_off(prev_len);
+                    records.push(row);
+                }
+            }
             _ => records.push(row),
         }
     }
@@ -516,6 +776,26 @@ pub struct Entry {
     pub changes: Vec<Change>,
 }
 
+/// The Secret-cell sealer of table `name` in `session`: the current audience epoch seals, and a
+/// stored token opens under the epoch it names, through the session's retained handoffs.
+///
+/// # Errors
+/// The current audience key is unavailable.
+pub(crate) fn sealer<'s>(
+    name: &'s str,
+    session: &'s Session<'_>,
+    scope: crate::table::Scope,
+) -> Result<impl typed::secret::Sealer + 's> {
+    let epoch = session.secret_basis();
+    let key = session.secret_key(scope, &epoch)?;
+    Ok(typed::secret::Keyed {
+        table: name,
+        epoch,
+        key,
+        resolve: move |basis: &Digest| session.secret_key(scope, basis),
+    })
+}
+
 /// A typed table on this Mac's Commons.
 pub struct Handle {
     paths: Paths,
@@ -533,6 +813,96 @@ impl Handle {
     /// The table this handle reaches.
     pub const fn compiled(&self) -> &'static Compiled {
         self.compiled
+    }
+
+    /// Digest a collection under an explicitly named everyone epoch. Historical
+    /// cell keys stay inside the pinned table session.
+    ///
+    /// # Errors
+    /// The table, collection, historical cell key or authenticated value is unavailable.
+    pub fn secret_digest(
+        &self,
+        collection: &str,
+        epoch: &Digest,
+        everyone_key: &[u8; 32],
+    ) -> Result<SecretDigest> {
+        let collection = self.compiled.collection(collection)?;
+        application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
+            let view = View::read(
+                self.compiled.table,
+                session,
+                &Log::read_with(session, store, scope, decode)?,
+            );
+            secret_digest(
+                &self.compiled.name(),
+                collection,
+                &view.cells,
+                epoch,
+                everyone_key,
+                |basis| session.secret_key(scope, basis),
+            )
+        })
+    }
+
+    /// Seal an authored Secret for this table without exposing its audience key.
+    ///
+    /// # Errors
+    /// The table cannot be observed, the column is not Secret, or sealing fails.
+    pub fn seal_secret(
+        &self,
+        collection: &str,
+        row: &str,
+        column: &str,
+        value: &typed::secret::Secret,
+    ) -> Result<Value> {
+        let schema = self.compiled.collection(collection)?;
+        if !schema
+            .column(column)
+            .is_some_and(|c| matches!(c.ty, typed::Ty::Secret))
+            || !typed::pk_grammar(row)
+        {
+            return Err(Error::new("invalid Secret cell destination"));
+        }
+        application::observe_store(&self.paths, self.descriptor(), |session, _, scope| {
+            let basis = session.secret_basis();
+            let key = session.secret_key(scope, &basis)?;
+            value
+                .seal(
+                    &key,
+                    &basis,
+                    typed::secret::Cell {
+                        table: &self.compiled.name(),
+                        collection,
+                        row,
+                        column,
+                    },
+                )
+                .map(Value::String)
+        })
+    }
+
+    /// Reveal a stored Secret through the single audited plaintext exit.
+    ///
+    /// # Errors
+    /// The table or historical audience key is unavailable, the token does not
+    /// authenticate, or the local reveal journal cannot be committed.
+    pub fn reveal_secret<T>(
+        &self,
+        cell: typed::secret::Cell<'_>,
+        token: &str,
+        journal: &crate::alab::secret::Journal,
+        surface: crate::alab::secret::Surface,
+        when_ms: u64,
+        consume: impl FnOnce(&str) -> T,
+    ) -> Result<T> {
+        if !self.compiled.matches_name(cell.table) {
+            return Err(Error::new("secret cell belongs to another table"));
+        }
+        application::observe_store(&self.paths, self.descriptor(), |session, _, scope| {
+            let basis = typed::secret::epoch(token)?;
+            let key = session.secret_key(scope, &basis)?;
+            crate::alab::secret::reveal(journal, token, &key, cell, surface, when_ms, consume)
+        })
     }
 
     fn descriptor(&self) -> impl FnOnce(&Bootstrap) -> Result<Descriptor> + use<> {
@@ -638,6 +1008,23 @@ impl Handle {
                         "this table's history here is incomplete; a grid save waits for a complete scan",
                     ));
                 }
+                // A revealed `Secret` cell's edit is sealed here, in the writing session, under
+                // its current epoch; nothing else is held plaintext past this point.
+                let sealed;
+                let plan = if plan.rows.iter().flat_map(|(_, e)| e).any(|e| e.secret) {
+                    let mut owned = plan.clone();
+                    let name = self.compiled.name();
+                    grid::seal(
+                        collection,
+                        &mut owned,
+                        &sealer(&name, session, scope)?,
+                        &view.cells,
+                    )?;
+                    sealed = owned;
+                    &sealed
+                } else {
+                    plan
+                };
                 let settled = grid::settle(collection, plan, &view.cells);
                 let mut applied = Applied {
                     unchanged: settled.unchanged,
@@ -680,7 +1067,47 @@ impl Handle {
         declare: bool,
         derive: impl FnOnce(&View) -> Result<(T, Vec<Vec<Change>>)>,
     ) -> Result<(T, Applied)> {
-        self.commit_planned(declare, false, derive)
+        self.commit_planned(declare, false, crate::admission::deadline(), |view, _| {
+            derive(view)
+        })
+    }
+
+    /// [`Self::commit_derived`] held to `deadline`, for a command a person runs and waits on (a
+    /// product open's budget is no measure of a pass that has to happen), whose plan also seals
+    /// and compares the table's Secret cells (`typed::secret::Sealer`): the importer's
+    /// `password` and `number` cells. The audience key stays inside the session that writes the
+    /// plan.
+    ///
+    /// # Errors
+    /// As [`Self::commit_derived`], a Secret's key is unavailable, or `deadline` passes first.
+    pub(crate) fn commit_sealed_until<T>(
+        &self,
+        declare: bool,
+        deadline: std::time::Instant,
+        derive: impl FnOnce(&View, &dyn typed::secret::Sealer) -> Result<(T, Vec<Vec<Change>>)>,
+    ) -> Result<(T, Applied)> {
+        self.commit_planned(declare, false, deadline, derive)
+    }
+
+    /// Read the table with its Secret cells' sealer, as [`Self::commit_sealed_until`] plans, writing
+    /// nothing: the importer's dry run and comparisons, `check`'s duplicate numbers.
+    ///
+    /// # Errors
+    /// As [`Self::view`], or a Secret's key is unavailable.
+    pub(crate) fn view_sealed<T>(
+        &self,
+        read: impl FnOnce(&View, &dyn typed::secret::Sealer) -> Result<T>,
+    ) -> Result<T> {
+        let compiled = self.compiled;
+        application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
+            let view = View::read(
+                compiled.table,
+                session,
+                &Log::read_with(session, store, scope, decode)?,
+            );
+            let name = compiled.name();
+            read(&view, &sealer(&name, session, scope)?)
+        })
     }
 
     /// [`Self::commit_derived`] for the owner's own word (`aterm db alab add|retire|relabel`): each
@@ -695,20 +1122,82 @@ impl Handle {
         &self,
         derive: impl FnOnce(&View) -> Result<(T, Vec<Vec<Change>>)>,
     ) -> Result<(T, Applied)> {
-        self.commit_planned(false, true, derive)
+        self.commit_planned(false, true, crate::admission::deadline(), |view, _| {
+            derive(view)
+        })
+    }
+
+    /// [`Self::commit_owner`] with the table's sealer: the owner's own word that writes a `Secret`
+    /// cell (`aterm db emails set <row> password --stdin`, the grid's revealed column), sealed
+    /// inside the writing session under its current epoch. Each record's request id is random.
+    ///
+    /// # Errors
+    /// As [`Self::commit_owner`], or a Secret's key is unavailable.
+    pub(crate) fn commit_owner_sealed<T>(
+        &self,
+        derive: impl FnOnce(&View, &dyn typed::secret::Sealer) -> Result<(T, Vec<Vec<Change>>)>,
+    ) -> Result<(T, Applied)> {
+        self.commit_planned(false, true, crate::admission::deadline(), derive)
+    }
+
+    /// Reveal each of `cells` (`(collection, row, column, token)`) through the one audited
+    /// plaintext exit, in one store session: each is journaled ([`crate::alab::secret::reveal`])
+    /// before its value is kept, and comes back as a [`typed::secret::Secret`], which prints
+    /// masked and is zeroized on drop. A cell whose epoch this Mac holds no key of, or whose token
+    /// does not open at its coordinates, comes back `None` and is never journaled, so one such
+    /// cell masks itself and no other.
+    ///
+    /// # Errors
+    /// The store cannot be read, or a reveal could not be journaled: nothing is returned then.
+    pub fn reveal_cells(
+        &self,
+        cells: &[(&str, &str, &str, &str)],
+        journal: &crate::alab::secret::Journal,
+        surface: crate::alab::secret::Surface,
+        when_ms: u64,
+    ) -> Result<Vec<Option<typed::secret::Secret>>> {
+        let table = self.compiled.name();
+        application::observe_store(&self.paths, self.descriptor(), |session, _, scope| {
+            cells
+                .iter()
+                .map(|&(collection, row, column, token)| {
+                    let cell = typed::secret::Cell {
+                        table: &table,
+                        collection,
+                        row,
+                        column,
+                    };
+                    let Ok(key) = typed::secret::epoch(token)
+                        .and_then(|epoch| session.secret_key(scope, &epoch))
+                    else {
+                        return Ok(None);
+                    };
+                    if typed::secret::open(token, &key, cell).is_err() {
+                        return Ok(None);
+                    }
+                    crate::alab::secret::reveal(journal, token, &key, cell, surface, when_ms, |s| {
+                        typed::secret::Secret::new(s.to_owned())
+                    })
+                    .map(Some)
+                })
+                .collect()
+        })
     }
 
     fn commit_planned<T>(
         &self,
         declare: bool,
         random: bool,
-        derive: impl FnOnce(&View) -> Result<(T, Vec<Vec<Change>>)>,
+        deadline: std::time::Instant,
+        derive: impl FnOnce(&View, &dyn typed::secret::Sealer) -> Result<(T, Vec<Vec<Change>>)>,
     ) -> Result<(T, Applied)> {
         let table = self.compiled.table;
-        application::with_store(
+        let name = self.compiled.name();
+        application::with_store_until(
             &self.paths,
             declare,
             self.descriptor(),
+            deadline,
             |session, store, scope| {
                 session.writer()?;
                 let mut log = Log::read_with(session, store, scope, decode)?;
@@ -719,7 +1208,7 @@ impl Handle {
                         "this table's history here is incomplete; an import waits for a complete scan",
                     ));
                 }
-                let (planned, rows) = derive(&view)?;
+                let (planned, rows) = derive(&view, &sealer(&name, session, scope)?)?;
                 let mut applied = Applied::default();
                 for changes in pack(rows)? {
                     let count = changes.len();

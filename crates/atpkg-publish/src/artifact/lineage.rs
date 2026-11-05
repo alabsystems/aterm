@@ -4,12 +4,11 @@
 //! The producer's half of LINEAGE: the payload scan over a staged tree ([`scan_tree`]) and the
 //! `LINEAGE` stamp a signed bundle carries ([`stamp_with`]).
 
-use std::io::Read as _;
 use std::path::Path;
 
 use atpkg::lineage::{
     Finding, LINEAGE_FILE, LINEAGE_SCHEMA, LineagePolicy, LineageProof, SEED_MINT_FILE,
-    admit_content_with, check_compiler_with, receipt_sha256, scan_object,
+    admit_content_with, check_compiler_with, receipt_sha256, scan_if_compiled_object,
 };
 
 /// What [`scan_tree`] read.
@@ -21,37 +20,6 @@ pub struct ScanReport {
     pub findings: Vec<Finding>,
 }
 
-/// Whether `path` is compiled output the scan reads: by head (Mach-O, ELF, PE, wasm, an
-/// ar archive, crate metadata) or by name (`.rlib`/`.rmeta`/`.a`/`.o`/`.so`/`.dylib`/
-/// `.dll`/`.wasm`).
-fn is_compiled_output(path: &Path) -> bool {
-    let named = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        matches!(
-            e,
-            "rlib" | "rmeta" | "a" | "o" | "so" | "dylib" | "dll" | "wasm"
-        )
-    }) || path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.contains(".so."));
-    if named {
-        return true;
-    }
-    let mut head = Vec::with_capacity(9);
-    if crate::identity::open_regular_nonblock(path)
-        .and_then(|(f, _)| f.take(8).read_to_end(&mut head))
-        .is_err()
-    {
-        return false;
-    }
-    atpkg::macho::is_macho_header(&head)
-        || head.starts_with(b"\x7fELF")
-        || head.starts_with(b"MZ")
-        || head.starts_with(b"\0asm")
-        || head.starts_with(b"!<arch>\n")
-        || head.starts_with(b"rust\0\0\0")
-}
-
 /// Scan every compiled object under `root` (regular files only, no symlink followed) for evidence
 /// of any compiler but the one whose commit-hash is `admitted`.
 /// # Errors
@@ -60,11 +28,12 @@ pub fn scan_tree(root: &Path, admitted: &str) -> Result<ScanReport, String> {
     let mut report = ScanReport::default();
     for rel in super::relocate::walk_files(root)? {
         let path = root.join(&rel);
-        if !is_compiled_output(&path) {
+        let Some(hits) = scan_if_compiled_object(&path, admitted)
+            .map_err(|e| format!("{}: {e}", rel.display()))?
+        else {
             continue;
-        }
+        };
         report.objects += 1;
-        let hits = scan_object(&path, admitted).map_err(|e| format!("{}: {e}", rel.display()))?;
         for (evidence, count) in hits {
             report.findings.push(Finding {
                 file: rel.to_string_lossy().into_owned(),

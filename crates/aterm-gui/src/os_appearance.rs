@@ -322,12 +322,58 @@ mod desktop {
         read_portal(READ_BOUND)
     }
 
+    const MAX_WATCH_LINE_BYTES: usize = 64 << 10;
+
+    pub(super) struct BoundedLines(std::io::BufReader<std::process::ChildStdout>);
+
+    impl Iterator for BoundedLines {
+        type Item = std::io::Result<String>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            use std::io::{BufRead as _, Read as _};
+            let mut buf = Vec::new();
+            match (&mut self.0)
+                .take((MAX_WATCH_LINE_BYTES as u64) + 1)
+                .read_until(b'\n', &mut buf)
+            {
+                Ok(0) => None,
+                Ok(_) => {
+                    if !buf.ends_with(b"\n") && buf.len() > MAX_WATCH_LINE_BYTES {
+                        while let Ok(chunk) = self.0.fill_buf() {
+                            if chunk.is_empty() {
+                                break;
+                            }
+                            let nl = chunk.iter().position(|&b| b == b'\n');
+                            let len = chunk.len();
+                            if let Some(nl) = nl {
+                                self.0.consume(nl + 1);
+                                break;
+                            }
+                            self.0.consume(len);
+                        }
+                    }
+                    if buf.ends_with(b"\n") {
+                        buf.pop();
+                        if buf.ends_with(b"\r") {
+                            buf.pop();
+                        }
+                    }
+                    Some(
+                        String::from_utf8(buf)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                    )
+                }
+                Err(e) => Some(Err(e)),
+            }
+        }
+    }
+
     /// A long-running watcher (`gdbus monitor`, `gsettings monitor`) tethered to this process.
     pub(super) struct Tethered {
         child: aterm_uds::spawnfd::Child,
         /// The tether: dropping it ends the watcher.
         tether: Option<std::process::ChildStdin>,
-        pub(super) lines: std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+        pub(super) lines: BoundedLines,
     }
 
     impl Tethered {
@@ -341,7 +387,6 @@ mod desktop {
         r#""$@" & pid=$!; exec >/dev/null; read -r _line || :; kill "$pid" 2>/dev/null; wait"#;
 
     pub(super) fn tethered(program: &str, args: &[&str]) -> Option<Tethered> {
-        use std::io::BufRead as _;
         let mut child = aterm_uds::spawnfd::command("/bin/sh")
             .arg("-c")
             .arg(TETHER_SCRIPT)
@@ -358,7 +403,7 @@ mod desktop {
         Some(Tethered {
             child,
             tether,
-            lines: std::io::BufReader::new(stdout).lines(),
+            lines: BoundedLines(std::io::BufReader::new(stdout)),
         })
     }
 

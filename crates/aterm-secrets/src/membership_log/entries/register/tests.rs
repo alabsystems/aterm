@@ -2,19 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! The register resolver gives what the one it replaced gave ([`oracle`]) on 200 seeded
-//! histories with concurrent registers and on 200 signed logs of three Macs that write, delete
-//! and reseal on diverging copies; and what it costs is pinned by count on one Mac's
-//! 12,288-op register, where the scan it replaced runs past the pin, on a register of 12,288
-//! records whose ops read growing frontiers of carries, its bound, and on a frontier of reseals
-//! and edits, where each op's row is read over one word.
+//! histories with concurrent registers (on 200 signed logs, `entries`'s
+//! `two_hundred_signed_logs_read_as_the_replaced_readings_did`); and what it costs is pinned by
+//! count on one Mac's 12,288-op register, where the scan it replaced runs past the pin, on a
+//! register of 12,288 records whose ops read growing frontiers of carries, its bound, and on a
+//! frontier of reseals and edits, where each op's row is read over one word.
 
 use super::super::super::reach::tests::{Rng, fanned, indexed, random_parents, walked};
 use super::super::super::reach::{self, WORK, Work};
-use super::super::super::tests::signed::{Mac, generated};
 use super::super::{CandidateOp, DecodedOp, EntryMeta};
 use super::oracle::{self, Exhausted};
 use super::{MUTANT, Mutant, Register};
-use crate::membership_log::{Log, RecordId};
+use crate::membership_log::RecordId;
 
 /// An op at record `index`: a `Delete`, or a `Put` of one of `values` values, with an id from
 /// `rng`.
@@ -487,31 +486,4 @@ fn a_frontier_of_reseals_and_edits_reads_one_word_per_op() {
             Some(_) => assert!(work.words > bound, "whole rows go unnoticed: {work:?}"),
         }
     }
-}
-
-/// On 200 signed logs of three Macs writing, deleting and resealing on diverging copies
-/// ([`generated`]), every register every opening resolves (each copy after each step, and the
-/// merge) is what the replaced resolver gives: [`oracle::check`] runs in every resolution.
-/// NEGATIVE CONTROL: with what a writer held keeping every carry, the openings disagree.
-#[test]
-fn two_hundred_signed_logs_resolve_as_the_replaced_resolver_did() {
-    oracle::CHECKED.set((0, 0));
-    let logs: Vec<Log> = (1..=200).map(generated).collect();
-    let (checked, wrong) = oracle::CHECKED.get();
-    assert!(checked > 5_000, "the openings checked registers: {checked}");
-    assert_eq!(wrong, 0);
-    oracle::COUNT_ONLY.set(true);
-    oracle::CHECKED.set((0, 0));
-    let (founder, _) = Mac::new(1);
-    with_mutants(Some(Mutant::KeepEveryCarry), None, || {
-        for log in &logs {
-            let _ = log.open_entry_set(&founder.identity).unwrap();
-        }
-    });
-    oracle::COUNT_ONLY.set(false);
-    let (checked, wrong) = oracle::CHECKED.get();
-    assert!(
-        checked > 0 && wrong > 0,
-        "keeping every carry goes unnoticed"
-    );
 }

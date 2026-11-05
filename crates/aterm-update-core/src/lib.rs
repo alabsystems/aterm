@@ -16,8 +16,9 @@
 //! `/usr/bin/codesign` check ([`codesign`]).
 //!
 //! `aterm-update` layers the macOS `.app` pieces (DMG mount, spctl, the `RENAME_SWAP` bundle
-//! exchange and re-exec, the staging layout) on top. Roster verification uses `ring`, shared
-//! with the owner-side minting tool so producer and client cannot drift on a valid chain.
+//! exchange and re-exec, the staging layout) on top. Roster verification is astream's strict
+//! Ed25519 check (`astream_aead::signature::verify`), shared with the owner-side minting tool so
+//! producer and client cannot drift on a valid chain.
 
 // Under the Trust verifier, register the `trust` tool namespace so the crate's
 // `#[cfg_attr(trust_verify, trust::skip)]` opt-outs resolve; inert under plain rustc.

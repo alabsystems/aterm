@@ -1602,6 +1602,7 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
         week_reset: None,
         walled_until: None,
         last_used: None,
+        read_at: None,
     };
     let store = crate::session_store::new_store();
     let claude = crate::session_store::test_handle(5);
@@ -1620,16 +1621,19 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
     let facts = SwarmSurveyFacts {
         node: None,
         label: None,
+        roster_unread: false,
         version: "0.146.0".to_owned(),
         window: true,
         window_last: None,
         sessions: 2,
         ssh_host_key: None,
+        moves: None,
         accounts: vec![
             SurveyAccountFact {
                 usage_5h_pct: Some(10),
                 usage_7d_pct: Some(42),
                 last_used: Some(1_793_130_000),
+                read_at: None,
                 ..row("claude", "main", "usable")
             },
             SurveyAccountFact {
@@ -1645,6 +1649,9 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
             "codex-1".to_owned(),
         )]),
         server_heard: Vec::new(),
+        home: None,
+        home_free_mb: None,
+        repos: None,
     };
     let listing = Here {
         facts: Some(facts),
@@ -1805,6 +1812,7 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
     let facts = SwarmSurveyFacts {
         node: Some("0123456789abcdef0123456789abcdef".to_owned()),
         label: Some("m22".to_owned()),
+        roster_unread: false,
         version: "0.146.0".to_owned(),
         window: true,
         window_last: Some(1_793_160_000),
@@ -1820,14 +1828,19 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
             week_reset: Some(1_793_500_000),
             walled_until: None,
             last_used: Some(1_793_159_000),
+            read_at: None,
         }],
         accounts_unread: Vec::new(),
         session_accounts: std::collections::BTreeMap::new(),
+        moves: None,
         server_heard: vec![ServerHeardFact {
             vault: "alab".to_owned(),
             subject: "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p".to_owned(),
             at: 1_793_159_999,
         }],
+        home: None,
+        home_free_mb: None,
+        repos: None,
     };
     let non_drive = Here {
         host: Some("m22.local".to_owned()),
@@ -1854,6 +1867,86 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
     assert!(drive_reply.lines().nth(1).unwrap().contains(" drive=1"));
     let again = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &non_drive);
     assert!(!again.lines().nth(1).unwrap().contains(" drive=1"));
+}
+
+/// WHERE A MAC KEEPS ITS WORK IS CONTENT: a content reply carries its home, free space and
+/// checkouts, which round-trip; the same facts at the facts level carry none of them (a reader
+/// granted facts alone reads an aterm that says nothing of its home), and the account rows stay.
+#[test]
+fn a_survey_says_the_home_and_its_checkouts_at_content_alone() {
+    use aterm_agent::harness::repo_work::home::{HomeRepo, HomeRepos};
+    use aterm_agent::survey_facts::SwarmSurveyFacts;
+
+    let store = crate::session_store::new_store();
+    let facts = SwarmSurveyFacts {
+        version: "0.147.0".to_owned(),
+        home: Some("/Users//a".to_owned()),
+        home_free_mb: Some(812_345),
+        repos: Some(HomeRepos {
+            read_ms: 1_793_159_000_000,
+            repos: vec![HomeRepo {
+                name: "trust".to_owned(),
+                path: "/Users//a/trust".into(),
+                head: Some("e23254f84a67131e6cad7724c7f749073b190dd2".to_owned()),
+                branch: Some("main".to_owned()),
+                main_ref: Some("origin/main".to_owned()),
+                behind: Some(2),
+                fetched_ms: Some(1_793_150_000_000),
+                dirty: Some(false),
+            }],
+            cut: 0,
+        }),
+        node: None,
+        label: None,
+        roster_unread: false,
+        window: false,
+        window_last: None,
+        sessions: 0,
+        ssh_host_key: None,
+        accounts: Vec::new(),
+        accounts_unread: Vec::new(),
+        session_accounts: std::collections::BTreeMap::new(),
+        moves: None,
+        server_heard: Vec::new(),
+    };
+    let here = Here {
+        host: Some("m22.local".to_owned()),
+        instances: 1,
+        drive: true,
+        facts: Some(facts.clone()),
+    };
+    let content = survey_rows(&store, SurveyLevel::Content, usize::MAX, &here);
+    assert!(content.contains("\nrepo name=trust "), "{content}");
+    let parsed = SwarmSurveyFacts::from_survey_reply(&content).expect("a content reply");
+    assert_eq!(
+        (&parsed.home, parsed.home_free_mb, &parsed.repos),
+        (&facts.home, facts.home_free_mb, &facts.repos)
+    );
+    let at_facts = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &here);
+    assert!(
+        !at_facts.contains(" home=")
+            && !at_facts.contains("repo ")
+            && !at_facts.contains("/Users//a"),
+        "{at_facts}"
+    );
+    let parsed = SwarmSurveyFacts::from_survey_reply(&at_facts).expect("a facts reply");
+    assert_eq!(
+        (parsed.home, parsed.home_free_mb, parsed.repos),
+        (None, None, None)
+    );
+}
+
+/// A test binary's survey reads no checkout of the person's home: its `$HOME` is theirs, so
+/// [`Here::now`] starts no git there (`aterm node serve`'s explicit home, a test's scratch one,
+/// still reads).
+#[test]
+fn a_test_binary_reads_no_checkout_of_the_persons_home() {
+    let exe = std::env::current_exe().expect("this program");
+    assert!(
+        aterm_uds::test_binary::is_test_binary(&exe),
+        "a test binary"
+    );
+    assert_eq!(crate::survey::home_to_read(), None);
 }
 
 /// A record of where a worker works, for the work rows' tests: branch `feat/x` in `/repo`, three

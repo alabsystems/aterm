@@ -13,7 +13,8 @@ use crate::harness::accounts_step::Step;
 use std::cell::Cell;
 use std::collections::BTreeSet;
 
-/// [`LawHost`], at a terminal, whose sign-in is a stand-in that counts what reached it.
+/// [`LawHost`], at a terminal, whose sign-in and browser window are stand-ins that count what
+/// reached them.
 struct StepHost {
     host: LawHost,
     reached: Cell<usize>,
@@ -62,6 +63,18 @@ impl AccountsHost for StepHost {
             ),
             host: None,
         }
+    }
+    fn window_browser(&self) -> Option<PathBuf> {
+        Some(PathBuf::from("/nonexistent/stand-in-browser"))
+    }
+    fn open_window(
+        &self,
+        _: &Path,
+        _: &Path,
+        _: &str,
+    ) -> Result<crate::harness::browser_window::WindowEnd, String> {
+        self.reached.set(self.reached.get() + 1);
+        Err("this stand-in opens no window".to_string())
     }
 }
 
@@ -228,7 +241,7 @@ fn surfaces(pool: &Pool, host: &StepHost, lay: &dyn Fn()) -> Vec<Said> {
         .read_account_records(pool.env.accounts_roster_for(cli).as_deref(), pool.env.now)
         .expect("the records");
     if cli == Cli::Codex {
-        let mut fact = pool.law_fact(&host.host);
+        let mut fact = fact_on(pool, &host.host);
         if let Some(row) = fact.login_pool() {
             if let Some(why) = &row.launch_refused {
                 said.push(("the doctor's refusal".to_owned(), why.clone()));
@@ -286,6 +299,12 @@ fn surfaces(pool: &Pool, host: &StepHost, lay: &dyn Fn()) -> Vec<Said> {
 }
 
 /// A step's command line for the real parser: a label and an address a person chooses filled in.
+/// What the facts say of `pool` under the launcher `host`'s build names.
+fn fact_on(pool: &Pool, host: &LawHost) -> crate::ai::facts::Facts {
+    pool.lay_launcher(host);
+    pool.law_fact()
+}
+
 fn command_line(step: &Step) -> String {
     step.to_string()
         .replace("<label>", "fresh")
@@ -335,7 +354,7 @@ fn take(pool: &Pool, build: LawBuild, host: &StepHost, step: &Step) -> Result<()
         if id != pool.cli.id() {
             return Err(format!("{id} is not the CLI of this pool"));
         }
-        let fact = pool.law_fact(&host.host);
+        let fact = fact_on(pool, &host.host);
         let row = fact.login_pool().ok_or("`aterm ai login` sees no pool")?;
         if crate::ai::login::default_home_sign_in(row) {
             // Its own sign-in in the default home, which is the vendor's program.
@@ -366,7 +385,7 @@ fn ai_login_takes_the_step_a_moved_default_logins_refusal_names() {
     let pool = Pool::of(Cli::Codex, "ai-login-moved");
     let host = LawBuild::CodexNew.program(&pool);
     pool.lay_moved(MovedWorld::PinOnMainToRow);
-    let fact = pool.law_fact(&host);
+    let fact = fact_on(&pool, &host);
     let row = fact.login_pool().expect("a pool");
     let why = crate::ai::login::pool_target(Cli::Codex, row).expect_err("no sign-in ends it");
     let sync = Step::Sync(Cli::Codex).to_string();
@@ -384,7 +403,7 @@ fn ai_login_takes_the_step_a_moved_default_logins_refusal_names() {
         ..accounts::Row::default()
     });
     pool.rows(&rows);
-    let fact = pool.law_fact(&host);
+    let fact = fact_on(&pool, &host);
     let row = fact.login_pool().expect("a pool");
     assert_eq!(row.next.as_deref(), Some("third"), "CONTROL");
     assert!(
@@ -409,7 +428,7 @@ fn ai_login_takes_the_step_a_moved_default_logins_refusal_names() {
             Ok(Vec::new())
         })
         .expect("the pin");
-    let fact = pool.law_fact(&host);
+    let fact = fact_on(&pool, &host);
     let row = fact.login_pool().expect("a pool");
     assert_eq!(
         row.default_moved,
@@ -427,7 +446,7 @@ fn ai_login_takes_the_step_a_moved_default_logins_refusal_names() {
     let work = rows.iter_mut().find(|row| row.label == "work");
     work.expect("a row").email = Some("work@example.com".into());
     pool.rows(&rows);
-    let fact = pool.law_fact(&host);
+    let fact = fact_on(&pool, &host);
     let row = fact.login_pool().expect("a pool");
     assert_eq!(row.default_moved, None, "CONTROL");
     let target = crate::ai::login::pool_target(Cli::Codex, row).expect("CONTROL");
@@ -679,6 +698,15 @@ fn law_of_world(
 /// exits with the refusal it was named from, or changes nothing, fails it. A pool's install and
 /// update, and a vendor's own login, are judged by what is on this Mac, since aterm cannot run
 /// them here. FLOOR: the steps it took cannot silently shrink.
+///
+/// THE GAP, from [`law_worlds`]'s cuts. A build that is not there takes only that function's few
+/// worlds, so what a surface asks there of any other world is not taken: Codex's `use --auto`,
+/// which a refusal asks first only with both rows walled (the launch law holds its exit on such a
+/// build, from the pin `use` leaves), and `accounts --cli <id>`, from `ai login`'s refusal and the
+/// doctor's mend on Codex and from a launch's refusal with both rows walled on Grok and Kimi. Grok
+/// and Kimi cross a claim only where both rows can serve, so `accounts --cli <id>`, which
+/// `use <row>` names with both rows walled and one claimed, is not taken on either. A defect in one
+/// of those steps that shows only in such a world passes here.
 #[test]
 fn every_step_a_surface_names_can_be_taken() {
     let builds = [

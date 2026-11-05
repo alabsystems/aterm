@@ -298,6 +298,7 @@ fn parked_record(attempt_id: u64) -> crate::PendingUpdateHandoff {
         target_build: 0,
         target_commit: String::new(),
         layout: crate::restore::RestoreManifest::new(Vec::new()),
+        carry_lone_lists: false,
         layout_digest: [0; 32],
         screen_digest: [0; 32],
         activity_epoch: 0,
@@ -535,9 +536,15 @@ fn a_journal_that_does_not_verify_holds_the_update_with_a_reason() {
         .unwrap();
     let good = std::fs::read(&path).unwrap();
 
+    // A byte of the record before the last: damage with a whole record after it, which the
+    // read refuses (damage to the last record alone reads as a torn append, which holds an
+    // older text than the editor's and is refused for that).
     let mut flipped = good.clone();
-    let last = flipped.len() - 12;
-    flipped[last] ^= 0x20;
+    let (last_frame, _) = crate::native_document_io::journal_tail(&good)
+        .unwrap()
+        .last_frame();
+    let damaged = usize::try_from(last_frame).unwrap() - 12;
+    flipped[damaged] ^= 0x20;
     std::fs::write(&path, &flipped).unwrap();
     let DraftCarry::Refused(why) = rig.parent.draft_carry(rig.document) else {
         panic!("a corrupt journal is never carried");

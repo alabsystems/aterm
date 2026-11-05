@@ -352,13 +352,30 @@ fn sibling_controls(sources: &BTreeMap<&'static str, String>, report: &mut Contr
     }
 }
 
+fn copy_regular(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
+    let (mut reader, meta) = aterm_uds::regular_file::open(from.as_ref())?;
+    let to = to.as_ref();
+    let _ = std::fs::remove_file(to);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    }
+    let mut writer = opts.open(to)?;
+    let copied = std::io::copy(&mut reader, &mut writer)?;
+    writer.set_permissions(meta.permissions())?;
+    Ok(copied)
+}
+
 fn copy_oracle(root: &Path, dest: &Path) -> io::Result<()> {
     let oracle = root.join("libc-oracle");
     let into = dest.join("libc-oracle");
     std::fs::create_dir_all(into.join(".cargo"))?;
     std::fs::create_dir_all(dest.join(".cargo"))?;
     for file in ["Cargo.toml", "Cargo.lock"] {
-        std::fs::copy(oracle.join(file), into.join(file))?;
+        copy_regular(oracle.join(file), into.join(file))?;
     }
     for (config, to) in [
         (
@@ -371,7 +388,7 @@ fn copy_oracle(root: &Path, dest: &Path) -> io::Result<()> {
         ),
     ] {
         if config.is_file() {
-            std::fs::copy(config, to)?;
+            copy_regular(config, to)?;
         }
     }
     copy_dir(&oracle.join("conformance"), &into.join("conformance"))?;
@@ -390,7 +407,7 @@ fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
         if kind.is_dir() {
             copy_dir(&entry.path(), &to.join(entry.file_name()))?;
         } else if kind.is_file() {
-            std::fs::copy(entry.path(), to.join(entry.file_name()))?;
+            copy_regular(entry.path(), to.join(entry.file_name()))?;
         }
     }
     Ok(())
@@ -415,9 +432,9 @@ impl Scratch<'_> {
             Ok(mutated) => mutated,
             Err(failure) => return Ok(Err(failure)),
         };
-        std::fs::write(&path, mutated).map_err(io_failure("planting a defect in the copy"))?;
+        crate::write_fresh(&path, mutated).map_err(io_failure("planting a defect in the copy"))?;
         let result = then(&self.ws);
-        std::fs::write(&path, original).map_err(io_failure("restoring the copy"))?;
+        crate::write_fresh(&path, original).map_err(io_failure("restoring the copy"))?;
         result
             .map(Ok)
             .map_err(io_failure("running targo on the copy"))

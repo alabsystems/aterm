@@ -7,6 +7,18 @@ use std::path::{Path, PathBuf};
 
 use aterm_uds::CtlStream;
 
+/// No hold here: a Windows file lock is mandatory, so one on the token would refuse a client's
+/// read of it, and [`aterm_uds::ownerlock::probe`] has no wiring on this platform either.
+#[derive(Debug)]
+pub(crate) struct SocketOwner;
+
+impl SocketOwner {
+    /// The Unix twin takes the token file's lock; here there is nothing to take.
+    pub(crate) const fn hold(_token_path: &Path) -> Option<Self> {
+        Some(Self)
+    }
+}
+
 /// Create `dir` (and parents) if absent.
 pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     if aterm_uds::elevation::is_elevated()

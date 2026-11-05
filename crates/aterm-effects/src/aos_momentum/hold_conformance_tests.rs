@@ -14,10 +14,17 @@
 //! glow took a key no recording logged. `unproven` is not the host's to judge (it never sees a
 //! character): aterm-gui's binding drives that claim through the echo proof.
 //!
+//! The person's grant (`optin`) and a mask (`masked`) are the harness's bookkeeping, as `Echo` is:
+//! the host holds no grant and never sees a mask, so `exposed` is 0 here and the grant's own laws
+//! (`MaskedKeyNeverLogged`, `OptInEndsWithItsAttach`) are bound in aterm-gui. `unseen` is the real
+//! code's: the live state's count of keys logged unseen ([`MomentumState::unseen`]) grew across a
+//! step the harness took with no grant.
+//!
 //! The steps are the GUI's calls: `Private` and `Refute` are `private_key`'s stop (the retired
 //! segments taken, the recording dropped, the glow tainted), the held keys then handed to the glow
 //! unrecorded, and for `Private` the key itself; `Detach` is `aos detach`, which hands the held
-//! keys over the same way. `Echo` is the program's and calls nothing.
+//! keys over the same way. `Echo` is the program's and calls nothing; `OptIn`, `Lapse` and `Mask`
+//! call nothing either. `Unproven` is [`MomentumHost::aos_release_unseen`] over every held key.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -65,9 +72,14 @@ struct Real {
     attaches: u64,
     /// Whether the harness handed the glow a key no recording logged since the last attach.
     unlogged: bool,
+    /// The person's grant for the live attach, as the GUI would hold it.
+    optin: i64,
+    /// A mask shows where an unechoed held key should.
+    masked: i64,
     leak: i64,
     gap: i64,
     dirty: i64,
+    unseen: i64,
 }
 
 impl Real {
@@ -79,10 +91,20 @@ impl Real {
             echoed: 0,
             attaches: 0,
             unlogged: false,
+            optin: 0,
+            masked: 0,
             leak: 0,
             gap: 0,
             dirty: 0,
+            unseen: 0,
         }
+    }
+
+    /// The live recording's count of keys logged unseen, attached.
+    fn unseen_logged(&self) -> Option<u32> {
+        self.host
+            .aos_attached()
+            .then(|| hosted(&self.host).state().unseen())
     }
 
     /// The events the recording has logged since its ancestor checkpoint.
@@ -109,6 +131,10 @@ impl Real {
             ("unproven", 0),
             ("gap", self.gap),
             ("dirty", self.dirty),
+            ("optin", self.optin),
+            ("masked", self.masked),
+            ("unseen", self.unseen),
+            ("exposed", 0),
         ] {
             s.insert(name, v);
         }
@@ -133,6 +159,7 @@ impl Real {
         }
         self.held = 0;
         self.echoed = 0;
+        self.masked = 0;
     }
 
     /// Makes the GUI's calls for `action`.
@@ -140,6 +167,7 @@ impl Real {
         self.now += STEP;
         let now = self.now;
         let before = (self.held > 0).then(|| self.log_len()).flatten();
+        let (granted, unseen_before) = (self.optin == 1, self.unseen_logged());
         match action {
             "Attach" => {
                 self.attaches += 1;
@@ -156,16 +184,19 @@ impl Real {
                     self.dirty = 1;
                 }
                 self.unlogged = false;
+                self.optin = 0;
             }
             "Detach" => {
                 self.host.aos_detach();
                 self.hand_over_held();
+                self.optin = 0;
             }
             "Key" => self.host.on_key(now, TAU),
             "Private" => {
                 self.stop_for_privacy();
                 self.unlogged = true;
                 self.host.on_key(now, TAU);
+                self.optin = 0;
             }
             "Hold" => {
                 if self.held == 0 {
@@ -185,8 +216,27 @@ impl Real {
                 self.held -= 1;
                 self.echoed -= 1;
             }
-            "Refute" => self.stop_for_privacy(),
+            "Refute" => {
+                self.stop_for_privacy();
+                self.optin = 0;
+            }
+            "OptIn" => self.optin = 1,
+            "Lapse" => self.optin = 0,
+            "Mask" => self.masked = 1,
+            "Unproven" => {
+                let held = u32::try_from(self.held).expect("small");
+                self.host.aos_release_unseen(now, held, TAU);
+                self.held = 0;
+                self.echoed = 0;
+                self.masked = 0;
+            }
             _ => panic!("no real call for the model action `{action}`"),
+        }
+        if !granted
+            && let (Some(was), Some(now)) = (unseen_before, self.unseen_logged())
+            && now > was
+        {
+            self.unseen = 1;
         }
         if let Some(n) = before
             && matches!(action, "Hold" | "Echo" | "Tick")
@@ -422,6 +472,68 @@ fn negative_control_an_attach_that_keeps_an_unlogged_key() {
         s.action == "Attach" && s.prev["glow"] == 1
     });
     assert!(caught > 0, "the space has an attach over a tainted glow");
+}
+
+/// Dial 6 changes `Unproven`'s guard, not its update: the harness makes the real call with no
+/// grant, the projection sees the count grow, and only the mutant admits that step.
+#[test]
+fn negative_control_an_unseen_release_without_a_grant() {
+    let model = aos_key_hold_model();
+    let mutant = interp::with_buggy(&model, 6);
+    let mut w = Walker::new(&mutant, "an unseen release without a grant".into());
+    w.take("Attach");
+    w.take("Hold");
+    let prev = w.real.project();
+    w.real.act("Unproven");
+    let got = w.real.project();
+    assert_eq!(
+        got["unseen"], 1,
+        "the log gained an unseen key with no grant"
+    );
+    assert_eq!(
+        interp::admits(&model, &prev, &got),
+        None,
+        "the healthy model refuses it"
+    );
+    assert!(
+        mutant.successors("Unproven", &prev).contains(&got),
+        "the mutant's step"
+    );
+    assert!(!mutant.check_invariant("UnseenOnlyWithOptIn", &got));
+
+    let mut w = Walker::new(&model, "negative control: under the grant".into());
+    for a in ["Attach", "OptIn", "Hold", "Unproven"] {
+        w.take(a);
+    }
+    assert_eq!(w.real.project()["unseen"], 0);
+}
+
+#[test]
+fn an_unproven_release_logs_every_held_key_unseen_at_one_instant() {
+    let model = aos_key_hold_model();
+    let mut w = Walker::new(&model, "an unproven release".into());
+    for a in ["Attach", "OptIn", "Hold", "Hold"] {
+        w.take(a);
+    }
+    let n = w.real.log_len().expect("attached");
+    w.take("Unproven");
+    assert_eq!(w.real.log_len(), Some(n + 2), "both keys, and nothing else");
+    let log = hosted(&w.real.host).boundary.log().expect("a log");
+    let keys: Vec<_> = log.inputs()[n..]
+        .iter()
+        .map(|e| match *e {
+            super::MomentumEvent::Key { at, echo, .. } => (at, echo),
+            ref other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(keys[0], keys[1], "one instant, never their presses");
+    assert_eq!(keys[0].1, super::KeyEcho::Unseen);
+    assert_eq!(w.real.unseen_logged(), Some(2));
+    assert!(w.real.host.aos_attached(), "the recording goes on");
+    assert!(
+        w.real.host.aos_tainted(),
+        "and its glow starts the next one from rest"
+    );
 }
 
 #[test]

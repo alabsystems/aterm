@@ -39,8 +39,9 @@ impl Identity {
         &self.email
     }
 
-    /// A secrets-registry name, not a password. Even a home-path-shaped name must
-    /// be resolved through that registry, never opened directly as a path.
+    /// A credential source reference, never a password. Vault names resolve through the
+    /// vault; `registry_mailbox` has a disjoint internal prefix bound to its exact row.
+    /// Even a home-path-shaped vault name is never opened directly as a path.
     #[must_use]
     pub fn credential_ref(&self) -> Option<&str> {
         self.credential_ref.as_deref()
@@ -211,7 +212,13 @@ impl Registry {
         for row in rows(&root, "identities")? {
             keys(
                 row,
-                &["id", "email", "credential_ref", "verification_email"],
+                &[
+                    "id",
+                    "email",
+                    "credential_ref",
+                    "registry_mailbox",
+                    "verification_email",
+                ],
             )?;
             let id = text(row, "id")?;
             if !word(&id) {
@@ -232,6 +239,25 @@ impl Registry {
             {
                 return Err("Google identity registry contains an invalid secret reference");
             }
+            let credential_ref = if let Some(mailbox) = row.get("registry_mailbox") {
+                if credential_ref.is_some() {
+                    return Err("Google identity has competing credential sources");
+                }
+                let mailbox = mailbox
+                    .as_str()
+                    .filter(|v| {
+                        v.strip_prefix("mb-").is_some_and(|key| {
+                            key.len() == 16
+                                && key
+                                    .bytes()
+                                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                        })
+                    })
+                    .ok_or("Google identity has an invalid registry mailbox key")?;
+                Some(format!("registry-mailbox:{mailbox}"))
+            } else {
+                credential_ref
+            };
             if !emails.insert(email.clone()) || registry.identities.contains_key(&id) {
                 return Err("Google identity registry repeats an identity or Google email");
             }

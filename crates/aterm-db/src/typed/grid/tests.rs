@@ -621,19 +621,109 @@ fn a_new_row_is_born_under_its_derived_key_in_one_record() {
             .any(|p| p.column == column(&missing, "domain")),
         "{problems:?}"
     );
-    // A mailbox's key is random, never derived from what it guards.
+    // A mailbox's key derives from its login's address key, a member-readable row's.
+    let login = keys::address_pk("box@example.invalid").unwrap();
     let mailboxes = export(&REGISTRY, &MAILBOX, &cells, &[], false).unwrap();
     let mut text = add_row(&mailboxes.text, 0);
     for (name, value) in [
         ("label", "proton-1"),
         ("service", "proton"),
         ("code_path", "proton-api"),
-        ("vault_ref", r#"{"vault":"admins","entry":"mailbox-1"}"#),
+        ("login", login.as_str()),
     ] {
         text = type_in(&text, 1, name, value);
     }
     let plan = super::plan(&REGISTRY, &MAILBOX, &mailboxes.base, &text, &birth).unwrap();
-    assert!(keys::is_digest_pk(&plan.born[0], "mb"), "{:?}", plan.born);
+    assert_eq!(plan.born, [keys::mailbox_pk(&login).unwrap()]);
+}
+
+/// A revealed grid: a new row's password is plaintext, sealed as typed (never read as JSON), and
+/// a save that protects a row and types its password together seals nothing; a stored-protected
+/// row's password is read-only, so a save that unprotects the row and types it is refused.
+/// NEGATIVE CONTROLS: with the new-row path reading a `Secret` cell through `read`, the plan
+/// refuses the password as JSON: `` called `Result::unwrap()` on an `Err` value ``; with `seal`
+/// reading protection from the stored row alone, the protecting save seals:
+/// `` called `Result::unwrap_err()` on an `Ok` value ``.
+#[test]
+fn a_revealed_grid_seals_a_new_rows_password_and_none_into_a_row_it_protects() {
+    use crate::typed::secret::{Fixed, Sealer as _};
+    let mut book = Book::new();
+    let ann = keys::address_pk("ann.lee@example.invalid").unwrap();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(&ADDRESS, &ann, "addr", json!("ann.lee@example.invalid")),
+            put(&ADDRESS, &ann, "domain", json!("example.invalid")),
+            put(&ADDRESS, &ann, "origin", json!("owner")),
+            put(&ADDRESS, &ann, "row", json!("live")),
+        ],
+    );
+    let cells = book.cells();
+    let birth = registry_birth(&cells);
+    let sealer = Fixed("alab/registry");
+    let opened = Opened::new();
+    let exported = export_opened(&REGISTRY, &ADDRESS, &cells, &[], false, Some(&opened)).unwrap();
+    let mut text = add_row(&exported.text, 1);
+    for (name, value) in [
+        ("addr", "bob.ray@example.invalid"),
+        ("domain", "example.invalid"),
+        ("origin", "owner"),
+        ("password", "pw-for-bob-01"),
+    ] {
+        text = type_in(&text, 2, name, value);
+    }
+    let mut plan = super::plan(&REGISTRY, &ADDRESS, &exported.base, &text, &birth).unwrap();
+    super::seal(&ADDRESS, &mut plan, &sealer, &cells).unwrap();
+    let born = keys::address_pk("bob.ray@example.invalid").unwrap();
+    let (_, edits) = plan.rows.iter().find(|(pk, _)| *pk == born).unwrap();
+    let password = edits.iter().find(|e| e.column == "password").unwrap();
+    let token = password.x.as_str().unwrap();
+    assert!(
+        crate::typed::secret::is_sealed(token),
+        "sealed, not plaintext"
+    );
+    let typed = crate::typed::secret::Secret::new("pw-for-bob-01".to_owned());
+    assert!(sealer.holds("address", &born, "password", token, &typed));
+
+    let both = type_in(
+        &type_in(&exported.text, 1, "protected", "true"),
+        1,
+        "password",
+        "pw-for-ann-01",
+    );
+    let mut plan = super::plan(&REGISTRY, &ADDRESS, &exported.base, &both, &birth).unwrap();
+    let refused = super::seal(&ADDRESS, &mut plan, &sealer, &cells).unwrap_err();
+    assert!(refused.to_string().contains("protected"), "{refused}");
+
+    let mut stored = Book::new();
+    let cat = keys::address_pk("cat.ng@example.invalid").unwrap();
+    stored.write(
+        1,
+        &[],
+        vec![
+            put(&ADDRESS, &cat, "addr", json!("cat.ng@example.invalid")),
+            put(&ADDRESS, &cat, "domain", json!("example.invalid")),
+            put(&ADDRESS, &cat, "origin", json!("owner")),
+            put(&ADDRESS, &cat, "row", json!("live")),
+            put(&ADDRESS, &cat, "protected", json!(true)),
+        ],
+    );
+    let cells = stored.cells();
+    let birth = registry_birth(&cells);
+    let exported = export_opened(&REGISTRY, &ADDRESS, &cells, &[], false, Some(&opened)).unwrap();
+    let unprotect = type_in(&exported.text, 1, "protected", "false");
+    // The control: unprotecting alone saves.
+    let mut plan = super::plan(&REGISTRY, &ADDRESS, &exported.base, &unprotect, &birth).unwrap();
+    super::seal(&ADDRESS, &mut plan, &sealer, &cells).unwrap();
+    let typed = type_in(&unprotect, 1, "password", "pw-for-cat-01");
+    let refused = super::plan(&REGISTRY, &ADDRESS, &exported.base, &typed, &birth).unwrap_err();
+    assert!(
+        refused
+            .iter()
+            .any(|problem| problem.rule.contains("protected")),
+        "{refused:?}"
+    );
 }
 
 /// A born row is all or nothing: when a peer made the row under the same key after the plan

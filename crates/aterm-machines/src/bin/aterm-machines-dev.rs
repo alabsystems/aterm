@@ -154,7 +154,7 @@ fn seal(words: &[String]) -> ExitCode {
 fn relay(words: &[String]) -> ExitCode {
     use aterm_machines::controller::screen;
     use aterm_machines::controller::ssh::{self, Target};
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     let mut get = std::collections::BTreeMap::new();
     let mut it = words.iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
@@ -222,7 +222,7 @@ fn relay(words: &[String]) -> ExitCode {
     };
     println!("relay 127.0.0.1:{}", relay.port());
     let _ = std::io::stdout().flush();
-    let _ = std::io::stdin().read_to_end(&mut Vec::new());
+    let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
     match relay.close() {
         Ok(()) => {
             println!("closed");

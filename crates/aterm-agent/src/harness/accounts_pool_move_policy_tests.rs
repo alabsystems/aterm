@@ -28,9 +28,10 @@ fn session_move_refuses_policy_already_stale_before_preparation() {
                     })
                     .unwrap();
             }
-            std::fs::write(
-                world.cfg.join("aterm.toml"),
-                format!("[harness]\naccounts = '{}'\n", configured.as_str()),
+            aterm_uds::atomic_file::write(
+                &(world.cfg.join("aterm.toml")),
+                (format!("[harness]\naccounts = '{}'\n", configured.as_str())).as_ref(),
+                0o600,
             )
             .unwrap();
             let before = world.load(cli);
@@ -206,9 +207,10 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
     let s = session(cli, Supervisor::Aterm, Mode::Early, &world.exe);
     if matches!(case, 23 | 24) {
         let mode = if case == 23 { "off" } else { "wall" };
-        std::fs::write(
-            world.cfg.join("aterm.toml"),
-            format!("[harness]\naccounts = '{mode}'\n"),
+        aterm_uds::atomic_file::write(
+            &(world.cfg.join("aterm.toml")),
+            (format!("[harness]\naccounts = '{mode}'\n")).as_ref(),
+            0o600,
         )
         .unwrap();
     }
@@ -318,9 +320,10 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
             }
             16 => std::fs::rename(store.logins_file(), world.root.join("kept-bindings")).unwrap(),
             17 => held = Some(store.acquire().unwrap()),
-            19 => std::fs::write(
-                world.cfg.join("aterm.toml"),
-                "[harness]\naccounts = 'off'\n",
+            19 => aterm_uds::atomic_file::write(
+                &(world.cfg.join("aterm.toml")),
+                ("[harness]\naccounts = 'off'\n").as_ref(),
+                0o600,
             )
             .unwrap(),
             20 => {

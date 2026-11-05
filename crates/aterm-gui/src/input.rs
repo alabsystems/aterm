@@ -4,6 +4,7 @@
 //! Engine-neutral [`InputEvent`] vocabulary and [`Source`] audit tag for the input convergence seam.
 
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU32;
 
 use aterm_core::selection::SelectionSide;
 use aterm_core::terminal::{ModeMirror, Terminal};
@@ -11,6 +12,7 @@ use aterm_session::sink::{AcceptedOrder, BulkMeter, SinkWriter, WriteReceipt, Wr
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey, encode_key_with_event};
 use aterm_types::mouse::MouseButton;
 
+use crate::metrics::TermWaitSite;
 use crate::term_lock;
 
 /// One logical input event, engine-neutral.
@@ -708,6 +710,7 @@ pub(crate) fn seam_egress(
         &mut accepted,
         None,
         WheelPlatform::Host,
+        None,
     )
 }
 
@@ -731,6 +734,31 @@ pub(crate) fn seam_egress_receipt_metered(
     mode: EgressMode,
     meter: Option<&BulkMeter>,
 ) -> EgressReceipt {
+    seam_egress_receipt_as(term, modes, sink, ev, mode, meter, None)
+}
+
+/// [`seam_egress_receipt`] for a pointer report on the UI thread: its terminal wait registers in
+/// `ui_waiting`, so the PTY reader hands the lock over, and books under [`TermWaitSite::Mouse`].
+pub(crate) fn seam_egress_receipt_ui(
+    term: &Mutex<Terminal>,
+    modes: &ModeMirror,
+    sink: &SinkWriter,
+    ev: &InputEvent,
+    mode: EgressMode,
+    ui_waiting: &AtomicU32,
+) -> EgressReceipt {
+    seam_egress_receipt_as(term, modes, sink, ev, mode, None, Some(ui_waiting))
+}
+
+fn seam_egress_receipt_as(
+    term: &Mutex<Terminal>,
+    modes: &ModeMirror,
+    sink: &SinkWriter,
+    ev: &InputEvent,
+    mode: EgressMode,
+    meter: Option<&BulkMeter>,
+    ui_waiting: Option<&AtomicU32>,
+) -> EgressReceipt {
     debug_assert_ne!(
         mode,
         EgressMode::Encode,
@@ -746,6 +774,7 @@ pub(crate) fn seam_egress_receipt_metered(
         &mut accepted,
         meter,
         WheelPlatform::Host,
+        ui_waiting,
     );
     EgressReceipt {
         egress,
@@ -766,6 +795,17 @@ pub(crate) fn seam_encode(
     seam_encode_on(WheelPlatform::Host, term, modes, sink, ev)
 }
 
+/// [`seam_encode`] for a pointer report on the UI thread ([`seam_egress_receipt_ui`]).
+pub(crate) fn seam_encode_ui(
+    term: &Mutex<Terminal>,
+    modes: &ModeMirror,
+    sink: &SinkWriter,
+    ev: &InputEvent,
+    ui_waiting: &AtomicU32,
+) -> (Egress, Vec<u8>) {
+    seam_encode_as(WheelPlatform::Host, term, modes, sink, ev, Some(ui_waiting))
+}
+
 /// [`seam_encode`] on the wheel rule `platform` ([`WheelPlatform`]).
 pub(crate) fn seam_encode_on(
     platform: WheelPlatform,
@@ -773,6 +813,17 @@ pub(crate) fn seam_encode_on(
     modes: &ModeMirror,
     sink: &SinkWriter,
     ev: &InputEvent,
+) -> (Egress, Vec<u8>) {
+    seam_encode_as(platform, term, modes, sink, ev, None)
+}
+
+fn seam_encode_as(
+    platform: WheelPlatform,
+    term: &Mutex<Terminal>,
+    modes: &ModeMirror,
+    sink: &SinkWriter,
+    ev: &InputEvent,
+    ui_waiting: Option<&AtomicU32>,
 ) -> (Egress, Vec<u8>) {
     let mut accepted = Accepted::default();
     let egress = seam_egress_inner(
@@ -784,14 +835,15 @@ pub(crate) fn seam_encode_on(
         &mut accepted,
         None,
         platform,
+        ui_waiting,
     );
     (egress, accepted.encoded)
 }
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the seam's six handles, the paste's meter and the injected wheel rule; \
-              bundling them would add a per-event struct on the keystroke path"
+    reason = "the seam's six handles, the paste's meter, the injected wheel rule and the UI \
+              thread's wait count; bundling them would add a per-event struct on the keystroke path"
 )]
 fn seam_egress_inner(
     term: &Mutex<Terminal>,
@@ -802,6 +854,7 @@ fn seam_egress_inner(
     accepted_order: &mut Accepted,
     meter: Option<&BulkMeter>,
     platform: WheelPlatform,
+    ui_waiting: Option<&AtomicU32>,
 ) -> Egress {
     #[cfg(debug_assertions)]
     if let Ok(t) = term.try_lock() {
@@ -861,7 +914,10 @@ fn seam_egress_inner(
             ..
         } => {
             let report = {
-                let mut t = term_lock(term);
+                let mut t = match ui_waiting {
+                    Some(waiting) => crate::term_lock_ui(term, waiting, TermWaitSite::Mouse),
+                    None => term_lock(term),
+                };
                 if t.mouse_tracking_enabled() {
                     let (rx, ry) = report_coords(&t, *col, *row, *px_off);
                     let bytes = if *pressed {
@@ -901,7 +957,10 @@ fn seam_egress_inner(
             ..
         } => {
             let report = {
-                let mut t = term_lock(term);
+                let mut t = match ui_waiting {
+                    Some(waiting) => crate::term_lock_ui(term, waiting, TermWaitSite::Mouse),
+                    None => term_lock(term),
+                };
                 if t.mouse_tracking_enabled() {
                     let (rx, ry) = report_coords(&t, *col, *row, *px_off);
                     if t.mouse_motion_repeats_last_report(rx, ry) {
@@ -948,7 +1007,10 @@ fn seam_egress_inner(
                 Fallback(WheelViewport),
             }
             let plan = {
-                let mut t = term_lock(term);
+                let mut t = match ui_waiting {
+                    Some(waiting) => crate::term_lock_ui(term, waiting, TermWaitSite::Mouse),
+                    None => term_lock(term),
+                };
                 let route = wheel_route_for(&t, *mods);
                 if route == WheelRoute::Report {
                     let (rx, ry) = report_coords(&t, *col, *row, *px_off);
@@ -1590,6 +1652,75 @@ mod tests {
         assert_eq!(a, Egress::Reported(Delivery::Full));
         assert_eq!(b, Egress::Reported(Delivery::Full));
         assert_eq!(cap.drain(), b"\x1b[13;2u\xc3\xa9".to_vec());
+    }
+
+    /// A pointer report the UI thread makes waits as the UI thread: registered, so the PTY reader
+    /// hands the lock over during a flood, and booked. Each arm of the seam, by both of its routes.
+    #[test]
+    fn a_pointer_report_on_the_ui_thread_registers_its_wait_and_books_it() {
+        use std::sync::atomic::Ordering;
+        let site = TermWaitSite::Mouse;
+        let booked = || {
+            crate::metrics::METRICS.window.redraw.term_wait[site.index()]
+                .copy_out()
+                .n()
+        };
+        let before = booked();
+        let pointer = [
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true,
+                row: 0,
+                col: 0,
+                mods: 0,
+                px_off: PixelOffset::default(),
+                click_count: 1,
+                side: SelectionSide::Left,
+                block: false,
+                suppress_copy_on_select: false,
+            },
+            InputEvent::MouseMove {
+                buttons: 3,
+                row: 0,
+                col: 0,
+                mods: 0,
+                px_off: PixelOffset::default(),
+                side: SelectionSide::Left,
+            },
+            wheel(WheelDir::Up, 1),
+        ];
+        let mut waits = 0;
+        for ev in pointer {
+            for encode in [false, true] {
+                let term = term_with(&[b"\x1b[?1003h\x1b[?1006h"]);
+                let modes = crate::mode_mirror_of(&term);
+                let waiting = Arc::new(AtomicU32::new(0));
+                let held = term_lock(&term);
+                let reporter = {
+                    let (term, waiting, ev) = (term.clone(), waiting.clone(), ev.clone());
+                    std::thread::spawn(move || {
+                        let sink = SinkWriter::new(-1);
+                        if encode {
+                            let _ = seam_encode_ui(&term, &modes, &sink, &ev, &waiting);
+                        } else {
+                            let mode = EgressMode::Interactive;
+                            let _ =
+                                seam_egress_receipt_ui(&term, &modes, &sink, &ev, mode, &waiting);
+                        }
+                    })
+                };
+                aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "the report's wait for the held terminal registers",
+                    || (waiting.load(Ordering::Acquire) == 1).then_some(()),
+                );
+                drop(held);
+                reporter.join().expect("the report finishes");
+                assert_eq!(waiting.load(Ordering::Acquire), 0, "{ev:?} let go");
+                waits += 1;
+            }
+        }
+        assert!(booked() >= before + waits, "each wait books a mouse wait");
     }
 
     fn wheel(dir: WheelDir, lines: i32) -> InputEvent {

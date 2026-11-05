@@ -359,6 +359,16 @@ pub fn retry_delay(config: &Config, failures: u32) -> Duration {
     )
 }
 
+/// Whether selection was conclusively refused before publication, or its write may
+/// already have changed current. Checked readback can reconcile only the latter.
+#[derive(Debug)]
+pub enum SelectionError {
+    /// No selection was attempted; matching readback cannot override this refusal.
+    Rejected(Error),
+    /// Selection was attempted and may have renamed current before returning an error.
+    Uncertain(Error),
+}
+
 /// Effects required by the one-pass state machine. The real producer runs entirely within
 /// an owned worker group; the guardian retires that group before another pass or final ACK.
 /// Interrupted operations keep their immutable partials.
@@ -384,13 +394,16 @@ pub trait Driver {
         plan: &Self::Plan,
         artifact: &Path,
     ) -> Result<Self::Candidate>;
-    /// Select by current CAS under a short store lock.
+    /// Recheck the staged candidate against its original plan and source, then select
+    /// by current CAS under a short store lock. A known preselection refusal must be
+    /// distinguished from an uncertain write acknowledgement.
     fn select(
         &mut self,
         config: &Config,
+        plan: &Self::Plan,
         candidate: &Self::Candidate,
         expected: ExpectedCurrent,
-    ) -> Result<()>;
+    ) -> std::result::Result<(), SelectionError>;
 }
 
 /// Run one immediate pass; the caller owns its exact lifetime lock and status persistence.
@@ -426,18 +439,17 @@ pub fn pass<D: Driver>(
             && status.compiled == status.selected
         {
             status.pending = None;
-            status.reason = "previous selection confirmed by checked current readback; live adoption is not implemented".into();
-            status.failures = 0;
-            status.retry_seconds = config.poll_seconds;
-            return save(status);
+            status.reason = "previous selection confirmed by checked current readback; rechecking current source before accepting this pass".into();
+            save(status)?;
+        } else {
+            status.reason = format!(
+                "preserved interrupted {pending:?}; guardian retirement and partial reconciliation remain required"
+            );
+            status.failures = status.failures.saturating_add(1);
+            status.retry_seconds = retry_delay(config, status.failures).as_secs();
+            save(status)?;
+            return Err(Error::refused(status.reason.clone()));
         }
-        status.reason = format!(
-            "preserved interrupted {pending:?}; guardian retirement and partial reconciliation remain required"
-        );
-        status.failures = status.failures.saturating_add(1);
-        status.retry_seconds = retry_delay(config, status.failures).as_secs();
-        save(status)?;
-        return Err(Error::refused(status.reason.clone()));
     }
     let result = (|| {
         status.pending = Some(Operation::Fetch);
@@ -494,7 +506,26 @@ pub fn pass<D: Driver>(
         status.pending = Some(Operation::Select);
         status.reason = "selecting current by compare-and-swap".into();
         save(status)?;
-        let ack = driver.select(config, &candidate, observed.expected());
+        let ack = match driver.select(config, &plan, &candidate, observed.expected()) {
+            Err(SelectionError::Rejected(error)) => {
+                // The source/lease check conclusively preceded any selection write.
+                // Even a matching current cannot turn its refusal into acceptance.
+                status.pending = None;
+                status.selected = match driver.current(config) {
+                    Ok(CurrentLocal::Selected(identity)) => Some(identity.into()),
+                    Ok(CurrentLocal::Absent) => None,
+                    Err(readback) => {
+                        status.selected = None;
+                        return Err(Error::cannot_run(format!(
+                            "{error}; current is unknown: {readback}"
+                        )));
+                    }
+                };
+                return Err(error);
+            }
+            Err(SelectionError::Uncertain(error)) => Err(error),
+            Ok(()) => Ok(()),
+        };
         // Every ACK, including success, is followed by descriptor-based current readback.
         let now = driver.current(config)?;
         status.selected = match now {

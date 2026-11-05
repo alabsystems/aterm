@@ -106,12 +106,23 @@ fn systemctl(args: &[&str]) -> Result<(bool, String), String> {
 const MAX_PROC_OR_ETC_BYTES: usize = 4 * 1024 * 1024;
 
 fn read_regular_utf8(path: &str) -> io::Result<String> {
-    let f = crate::open_regular_nonblock(Path::new(path))?;
-    let cap = u64::try_from(MAX_PROC_OR_ETC_BYTES)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let mut text = String::new();
-    let read = f.take(cap).read_to_string(&mut text)?;
+    let (f, meta) = crate::open_regular_nonblock_with_meta(Path::new(path))?;
+    let max_u64 = u64::try_from(MAX_PROC_OR_ETC_BYTES).unwrap_or(u64::MAX);
+    if meta.len() > max_u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {MAX_PROC_OR_ETC_BYTES}-byte limit"),
+        ));
+    }
+    let init = if meta.len() > 0 {
+        usize::try_from(meta.len().min(max_u64).saturating_add(1)).unwrap_or(0)
+    } else {
+        0
+    };
+    let mut text = String::with_capacity(init);
+    let read = f
+        .take(max_u64.saturating_add(1))
+        .read_to_string(&mut text)?;
     if read > MAX_PROC_OR_ETC_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -253,12 +264,14 @@ impl System for Guest {
 /// # Errors
 /// The registration was refused.
 pub fn register_rosetta() -> io::Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     if Path::new(boot::ROSETTA_ENTRY).exists() {
         return Ok(false);
     }
     let line = boot::rosetta_registration(&format!("{}/rosetta", boot::ROSETTA_SHARE));
     std::fs::OpenOptions::new()
         .write(true)
+        .custom_flags(sys::O_NOFOLLOW | sys::O_NONBLOCK | sys::O_CLOEXEC)
         .open(boot::BINFMT_REGISTER)?
         .write_all(line.as_bytes())?;
     Ok(true)

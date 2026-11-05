@@ -568,7 +568,7 @@ mod live {
         }
         let opened = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path);
         let mut f = match opened {
             Ok(f) => f,

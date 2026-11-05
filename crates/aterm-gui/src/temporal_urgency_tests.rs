@@ -245,12 +245,19 @@ fn byte_pressure_and_refund_follow_payloads_not_only_message_count() {
         super::RewindPool::new(usize::MAX),
         demands.clone(),
     );
+    assert!(tx.send(raw(3)));
+    assert!(!demands.is_urgent(), "below half the bytes nothing presses");
+    assert!(rx.try_recv().is_some());
     assert!(tx.send(raw(4)));
-    assert!(!demands.is_urgent());
-    assert!(tx.send(raw(2)));
-    assert_eq!(demands.snapshot().counts, [0, 0, 1]);
+    assert_eq!(
+        demands.snapshot().counts,
+        [0, 0, 1],
+        "half the bytes, where has_room stops a keyframe, presses"
+    );
     assert!(tx.send(raw(2)));
     assert_eq!(demands.snapshot().counts, [0, 0, 2]);
+    assert!(tx.send(raw(2)));
+    assert_eq!(demands.snapshot().counts, [0, 0, 3]);
     assert!(!tx.send(raw(1)), "the byte admission cap is unchanged");
     assert_eq!(tx.state.bytes.load(Ordering::Acquire), 8);
     drop(rx);
@@ -277,10 +284,24 @@ fn shared_pool_pressure_is_visible_to_the_other_queue() {
         pool.clone(),
         demands.clone(),
     );
+    assert!(first.send(raw(super::MIN_QUEUE_BYTES / 2 - 1)));
+    assert!(
+        !demands.is_urgent(),
+        "below half the pool's share nothing presses"
+    );
+    assert!(first_rx.try_recv().is_some());
     assert!(first.send(raw(super::MIN_QUEUE_BYTES / 2)));
-    assert!(!demands.is_urgent());
+    assert_eq!(
+        demands.snapshot().counts,
+        [0, 0, 1],
+        "half the pool's share, where has_room stops a keyframe, presses"
+    );
     assert!(second.send(raw(super::MIN_QUEUE_BYTES / 4)));
-    assert_eq!(demands.snapshot().counts, [0, 0, 1]);
+    assert_eq!(
+        demands.snapshot().counts,
+        [0, 0, 2],
+        "the pool presses a queue that holds little itself"
+    );
     let mut writer = WriterRole::new(demands.clone());
     writer.poll_with(true, |role| {
         assert_eq!(role, Role::Responsive);
@@ -294,6 +315,162 @@ fn shared_pool_pressure_is_visible_to_the_other_queue() {
     assert!(second_rx.try_recv().is_some());
     assert_eq!(pool.queued(), 0);
     assert!(!demands.is_urgent());
+}
+
+/// One queue of a sweep, and the weights its sends take in turn.
+struct Lane {
+    tx: super::TemporalTx,
+    rx: super::TemporalRx,
+    weights: Vec<usize>,
+    sent: usize,
+}
+
+impl Lane {
+    fn open(
+        cap: usize,
+        byte_cap: usize,
+        pool: &Arc<super::RewindPool>,
+        demands: &Arc<Demands>,
+        weights: Vec<usize>,
+    ) -> Self {
+        let (tx, rx) = super::queue_in_with_demands(
+            Arc::default(),
+            cap,
+            byte_cap,
+            pool.clone(),
+            demands.clone(),
+        );
+        Self {
+            tx,
+            rx,
+            weights,
+            sent: 0,
+        }
+    }
+
+    fn send(&mut self) -> bool {
+        let weight = self.weights[self.sent % self.weights.len()];
+        self.sent += 1;
+        self.tx.send(raw(weight))
+    }
+}
+
+/// Fill `lanes` in turn until every one refuses or twelve rounds pass, write one message from each and queue another in its place, then write them all, and at every state between, wherever a live queue has no room, find a Pressure demand standing.
+fn sweep(lanes: &mut [Lane], demands: &Demands, scenario: &str) {
+    let check = |lanes: &[Lane], step: &str| {
+        for (index, lane) in lanes.iter().enumerate() {
+            let state = &lane.tx.state;
+            let live = !state.writer_gone() && !state.closed.load(Ordering::Acquire);
+            if live && !lane.tx.has_room() {
+                assert!(
+                    demands.snapshot().counts[2] > 0,
+                    "{scenario}, {step}: queue {index} has no room for a keyframe with {} messages and {} bytes unwritten and {} on the pool, yet no Pressure demand stands",
+                    state.in_flight.load(Ordering::Acquire),
+                    state.bytes.load(Ordering::Acquire),
+                    state.pool.queued(),
+                );
+            }
+        }
+    };
+    for _ in 0..12 {
+        let mut any = false;
+        for index in 0..lanes.len() {
+            any |= lanes[index].send();
+            check(lanes, "filling");
+        }
+        if !any {
+            break;
+        }
+    }
+    for _ in 0..4 {
+        for index in 0..lanes.len() {
+            drop(lanes[index].rx.try_recv());
+            check(lanes, "writing one");
+            lanes[index].send();
+            check(lanes, "queueing one in its place");
+        }
+    }
+    for index in 0..lanes.len() {
+        while lanes[index].rx.try_recv().is_some() {
+            check(lanes, "draining");
+        }
+    }
+    assert!(
+        !demands.is_urgent(),
+        "{scenario}: every written message let go of its demand"
+    );
+}
+
+/// A keyframe refused for room waits only behind a writer that a Pressure demand keeps Responsive: wherever `has_room` fails on a live queue, for want of a place, of the queue's bytes or of the pool's, the newest message queued holds that demand.
+#[test]
+fn a_refusal_for_room_always_has_a_pressure_demand() {
+    let mib = super::MIN_QUEUE_BYTES;
+    for cap in 1..=5 {
+        let demands = Demands::new();
+        let pool = super::RewindPool::new(usize::MAX);
+        let mut lanes = [Lane::open(cap, usize::MAX, &pool, &demands, vec![0])];
+        sweep(&mut lanes, &demands, &format!("message cap {cap}"));
+    }
+    for byte_cap in [5, 8, mib] {
+        let weights: Vec<usize> = if byte_cap < 64 {
+            (1..=byte_cap).collect()
+        } else {
+            vec![
+                1,
+                byte_cap / 4,
+                byte_cap / 2 - 1,
+                byte_cap / 2,
+                byte_cap / 2 + 1,
+                byte_cap - byte_cap / 4,
+                byte_cap - 1,
+                byte_cap,
+            ]
+        };
+        for &first in &weights {
+            for &then in &weights {
+                let demands = Demands::new();
+                let pool = super::RewindPool::new(usize::MAX);
+                let mut lanes = [Lane::open(
+                    usize::MAX,
+                    byte_cap,
+                    &pool,
+                    &demands,
+                    vec![first, then],
+                )];
+                sweep(
+                    &mut lanes,
+                    &demands,
+                    &format!("byte cap {byte_cap}, weights {first} then {then}"),
+                );
+            }
+        }
+    }
+    for share in [mib, mib + 1] {
+        let weights = [
+            1,
+            share / 4,
+            share / 2 - 1,
+            share / 2,
+            share / 2 + 1,
+            share - 1,
+        ];
+        for &one in &weights {
+            for &other in &weights {
+                let demands = Demands::new();
+                let pool = super::RewindPool::new(share * super::POOL_QUEUE_SHARE);
+                let mut lanes = [
+                    Lane::open(usize::MAX, usize::MAX, &pool, &demands, vec![one]),
+                    Lane::open(usize::MAX, usize::MAX, &pool, &demands, vec![other]),
+                ];
+                assert_eq!(lanes[0].tx.pool_share(), share);
+                sweep(
+                    &mut lanes,
+                    &demands,
+                    &format!("pool share {share}, weights {one} and {other}"),
+                );
+            }
+        }
+    }
 }
 
 #[test]

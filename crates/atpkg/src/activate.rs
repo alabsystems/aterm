@@ -213,24 +213,25 @@ pub fn reconcile_agents(layout: &Layout) {
             continue;
         };
         let primary = layout.shim(&tool);
-        let Some((target, primary_is)) = platform::resolve_shim(&primary)
+        let primary_read = platform::read_shim(&primary);
+        let Some((target, primary_is)) = primary_read
+            .target
             .and_then(|t| agent_primary(layout, name, &t).map(|is| (t, is)))
         else {
             // not installed here (a pending stub, a tombstone): the sweep answers it
             continue;
         };
         let dev_link = primary_is == AgentPrimary::DevLink;
-        let env = platform::shim_env_of(&primary);
+        let env = primary_read.env;
         #[cfg(all(test, unix))]
         agents_checkpoint::at(layout, agents_checkpoint::Event::Read(name));
         let twin = layout.agent_shim(&tool);
+        let twin_read = platform::read_shim(&twin);
         let exec = twin_exec(layout, name, &target, primary_is);
-        let named = |shim: &Path| {
-            crate::metadata_io::read_bounded_regular_utf8(shim, 64 * 1024)
-                .ok()
-                .and_then(|body| crate::stub::sh_named_atpkg(&body, "__atpkg"))
-        };
-        let standing = named(&twin).or_else(|| named(&primary));
+        let named =
+            |body: Option<&str>| body.and_then(|b| crate::stub::sh_named_atpkg(b, "__atpkg"));
+        let standing =
+            named(twin_read.body.as_deref()).or_else(|| named(primary_read.body.as_deref()));
         let atpkg = crate::stub::Embedder::this_process().embed(standing.as_deref());
         let prelude = if dev_link {
             String::new()
@@ -249,11 +250,10 @@ pub fn reconcile_agents(layout: &Layout) {
             && let Err(e) =
                 primary_executable(&primary, &target, exec.managed.as_deref(), &env, &prelude)
                     .and_then(|file| {
-                        if crate::metadata_io::read_bounded_regular(
-                            &primary,
-                            platform::MAX_SHIM_BYTES,
-                        )
-                        .is_ok_and(|have| have == file.body)
+                        if primary_read
+                            .body
+                            .as_deref()
+                            .is_some_and(|have| have.as_bytes() == file.body)
                         {
                             Ok(())
                         } else {
@@ -273,12 +273,12 @@ pub fn reconcile_agents(layout: &Layout) {
                 platform::twin_executable_to_env(&twin, &exec.path, &env, &prelude)
             }
         };
-        if platform::resolve_shim(&twin).is_some_and(|t| t == exec.path)
-            && platform::shim_env_of(&twin) == env
-            && twin_file().is_ok_and(|want| {
-                crate::metadata_io::read_bounded_regular(&twin, platform::MAX_SHIM_BYTES)
-                    .is_ok_and(|have| have == want.body)
-            })
+        if twin_read.target.as_deref() == Some(exec.path.as_path())
+            && twin_read.env == env
+            && twin_read
+                .body
+                .as_deref()
+                .is_some_and(|have| twin_file().is_ok_and(|want| have.as_bytes() == want.body))
         {
             continue;
         }
@@ -477,10 +477,8 @@ pub(crate) mod agents_checkpoint {
     }
 }
 
+#[cfg(all(test, unix))]
 fn shim_is_rendered(shim: &Path, target: &Path, env: &crate::shim_env::ShimEnv) -> bool {
-    if cfg!(not(unix)) {
-        return true;
-    }
     platform::shim_executable_to_env(shim, target, env).is_ok_and(|want| {
         crate::metadata_io::read_bounded_regular(shim, platform::MAX_SHIM_BYTES)
             .is_ok_and(|have| have == want.body)
@@ -503,29 +501,32 @@ fn sweep_agents(layout: &Layout) {
     let Ok(entries) = std::fs::read_dir(layout.agents_dir()) else {
         return;
     };
-    let installed = crate::ops::active_builds(layout);
+    let mut installed = None;
     for entry in entries.flatten() {
         let name = entry.file_name();
         if crate::lay::in_flight_here(&name) {
             continue;
         }
+        let path = entry.path();
         let keep = name
             .to_str()
             .and_then(ToolName::from_shim_file)
             .is_some_and(|tool| {
                 crate::stub::is_agent_program(tool.as_str())
-                    && (platform::resolve_shim(&entry.path())
+                    && (platform::resolve_shim(&path)
                         .map(|t| unstable_spelling(layout, tool.as_str(), t))
                         .is_some_and(|t| {
                             agent_primary(layout, tool.as_str(), &t).is_some()
                                 && platform::resolve_shim(&layout.shim(&tool))
                                     .is_some_and(|b| b == t)
                         })
-                        || (crate::stub::is_pending_stub(&entry.path())
-                            && !installed.contains_key(tool.as_str())))
+                        || (crate::stub::is_pending_stub(&path)
+                            && !installed
+                                .get_or_insert_with(|| crate::ops::active_builds(layout))
+                                .contains_key(tool.as_str())))
             });
         if !keep {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -540,7 +541,9 @@ pub(crate) fn reconcile_aliases(
     if aliases == Aliases::Alab {
         for tool in tools {
             let Some(alias) = tool.alias() else { continue };
-            let Some(wanted) = platform::resolve_shim(&layout.shim(tool))
+            let primary_read = platform::read_shim(&layout.shim(tool));
+            let Some(wanted) = primary_read
+                .target
                 .filter(|t| t.starts_with(build_dir) && t.file_name().is_some())
             else {
                 continue;
@@ -548,21 +551,25 @@ pub(crate) fn reconcile_aliases(
             let Some(target_bin) = wanted.parent().map(Path::to_path_buf) else {
                 continue;
             };
-            let env = platform::shim_env_of(&layout.shim(tool));
+            let env = primary_read.env;
             let shim = layout.shim(&alias);
-            if platform::resolve_shim(&shim).is_some_and(|t| t == wanted)
-                && platform::shim_env_of(&shim) == env
-                && shim_is_rendered(&shim, &wanted, &env)
+            let alias_read = platform::read_shim(&shim);
+            if alias_read.target.as_deref() == Some(wanted.as_path())
+                && alias_read.env == env
+                && (cfg!(not(unix))
+                    || alias_read.body.as_deref().is_some_and(|have| {
+                        platform::shim_executable_to_env(&shim, &wanted, &env)
+                            .is_ok_and(|want| have.as_bytes() == want.body)
+                    }))
             {
                 continue;
             }
-            match std::fs::symlink_metadata(&shim) {
-                Err(_) => {}
-                Ok(_)
-                    if platform::resolve_shim(&shim).is_some_and(|t| {
-                        crate::ops::store_build_of(&layout.prefix, &t).is_some()
-                    }) => {}
-                Ok(_) => continue,
+            if !alias_read
+                .target
+                .is_some_and(|t| crate::ops::store_build_of(&layout.prefix, &t).is_some())
+                && (alias_read.body.is_some() || std::fs::symlink_metadata(&shim).is_ok())
+            {
+                continue;
             }
             layout.ensure_dir(&layout.bin_dir())?;
             platform::install_shim_env(&target_bin, tool, &shim, &env)?;
@@ -595,8 +602,9 @@ pub(crate) fn shim_env_drift(
         .iter()
         .map(|tool| layout.shim(tool))
         .filter_map(|shim| {
-            let target = platform::resolve_shim(&shim).filter(|t| t.starts_with(build_dir))?;
-            (platform::shim_env_of(&shim) != declared).then_some((shim, target))
+            let read = platform::read_shim(&shim);
+            let target = read.target.filter(|t| t.starts_with(build_dir))?;
+            (read.env != declared).then_some((shim, target))
         })
         .collect();
     (!shims.is_empty()).then_some(EnvDrift { declared, shims })
@@ -717,55 +725,67 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
     let Ok(entries) = crate::ops::read_bin_dir(layout) else {
         return;
     };
-    let recorded = crate::store::recorded_exposes(build_dir).unwrap_or_default();
-    let runs_this_build = |shim: &Path| {
-        crate::platform::resolve_shim(shim).is_some_and(|t| {
-            crate::ops::store_build_of(&layout.prefix, &t)
-                .is_some_and(|(p, b)| p == program && b == build)
-        })
-    };
+    let mut recorded = None;
     for entry in entries.flatten() {
         let name = entry.file_name();
         if crate::lay::in_flight_here(&name) {
             continue;
         }
+        let path = entry.path();
         let Some(name) = name.to_str() else { continue };
         let Some(tool) = crate::store::ToolName::from_shim_file(name) else {
-            if refused_name_shim(layout, name, &entry.path()).is_some_and(|(p, _)| p == program) {
-                let _ = std::fs::remove_file(entry.path());
+            if refused_name_shim(layout, name, &path).is_some_and(|(p, _)| p == program) {
+                let _ = std::fs::remove_file(path);
             }
             continue;
         };
         if installed.contains(&tool) {
             continue;
         }
+        if aliases == Aliases::Alab
+            && tool
+                .alias_base()
+                .is_some_and(|base| installed.contains(&base))
+        {
+            continue;
+        }
+        let Some(target) = crate::platform::resolve_shim(&path) else {
+            // not a shim we can resolve (tombstone, real file)
+            continue;
+        };
+        let Some((p, b)) = crate::ops::store_build_of(&layout.prefix, &target) else {
+            continue;
+        };
+        if p != program {
+            continue;
+        }
         let alias_wanted = aliases == Aliases::Alab
             && tool.alias_base().is_some_and(|base| {
-                installed.contains(&base)
-                    || runs_this_build(&layout.shim(&base))
+                let base_shim = layout.shim(&base);
+                let base_owner = crate::platform::resolve_shim(&base_shim)
+                    .and_then(|t| crate::ops::store_build_of(&layout.prefix, &t));
+                base_owner
+                    .as_ref()
+                    .is_some_and(|(bp, bb)| bp == &program && *bb == build)
                     // The base's shim is a file outside this program's store (the user's, another
                     // program's) while the alias still runs this build: the alias is the one way
                     // left to run its tool. This program's own shim at another build is not one:
                     // this loop removes it, so keeping the alias for it would turn on the order
                     // `bin/` lists in.
-                    || (recorded.contains(&base)
-                        && std::fs::symlink_metadata(layout.shim(&base)).is_ok()
-                        && !crate::platform::resolve_shim(&layout.shim(&base))
-                            .and_then(|t| crate::ops::store_build_of(&layout.prefix, &t))
-                            .is_some_and(|(p, _)| p == program)
-                        && runs_this_build(&entry.path()))
+                    || (b == build
+                        && !base_owner.as_ref().is_some_and(|(bp, _)| bp == &program)
+                        && recorded
+                            .get_or_insert_with(|| {
+                                crate::store::recorded_exposes(build_dir).unwrap_or_default()
+                            })
+                            .contains(&base)
+                        && (base_owner.is_some() || std::fs::symlink_metadata(&base_shim).is_ok()))
             });
         if alias_wanted {
             continue;
         }
-        let Some(target) = crate::platform::resolve_shim(&entry.path()) else {
-            // not a shim we can resolve (tombstone, real file)
-            continue;
-        };
-        if crate::ops::store_build_of(&layout.prefix, &target)
-            .is_some_and(|(p, b)| p == program && (b != build || tool.is_alias()))
-        {
-            let _ = std::fs::remove_file(entry.path());
+        if b != build || tool.is_alias() {
+            let _ = std::fs::remove_file(path);
         }
     }
 }

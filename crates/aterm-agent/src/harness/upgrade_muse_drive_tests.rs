@@ -449,6 +449,7 @@ impl Rig {
         let opts = Opts {
             home: base.join("home"),
             state: base.join("state"),
+            account_roster: None,
             sock: Some(sock),
             token: None,
             only_sid: None,
@@ -494,6 +495,8 @@ impl Rig {
     /// Snapshot of the running Muse process.
     fn snap(&self, session: Option<&str>) -> Snapshot {
         Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: TAB.to_string(),
@@ -1608,6 +1611,7 @@ fn the_gate_reads_the_composer_past_a_drawn_caret_as_the_loop_does() {
         generation: None,
         human: crate::supervise::screen::HumanInput::Never,
         title: None,
+        human_seq: None,
     };
     let caret_cell = "OK a 111318 d0d0d0 inverse";
     for (cells, empty) in [
@@ -1664,6 +1668,7 @@ fn the_gate_reads_the_cursor_as_the_loop_does() {
         generation: None,
         human: crate::supervise::screen::HumanInput::Never,
         title: None,
+        human_seq: None,
     };
     for (rows, cursor, empty) in [
         (&lone, Some((caret, 2)), true),
@@ -1697,12 +1702,17 @@ fn the_gate_reads_the_cursor_as_the_loop_does() {
         server.join().expect("server");
     }
     // The prompt-history search (measured on 1.4.14), over an old prompt and over an empty
-    // composer, its cursor on its query: no composer the upgrade's line could go into, no cell asked.
-    // NEGATIVE CONTROL: `composer_empty` not asking `muse::history_search`, and the empty one reads
-    // empty.
+    // composer, its cursor on its query under the composer's bottom rule, and in windows of 34, 26
+    // and 22 columns, where its row wraps and drops its scope: no composer the upgrade's line could
+    // go into, no cell asked.
+    // NEGATIVE CONTROL: `screen::composer_holds_no_draft` without its cursor rule
+    // (`cursor_under_composer`), and the empty one reads empty.
     for text in [
         aterm_phase::muse::fixtures::HISTORY_SEARCH,
         aterm_phase::muse::fixtures::HISTORY_SEARCH_EMPTY,
+        aterm_phase::muse::fixtures::HISTORY_SEARCH_NO_MATCH_34COL,
+        aterm_phase::muse::fixtures::HISTORY_SEARCH_26COL,
+        aterm_phase::muse::fixtures::HISTORY_SEARCH_NO_MATCH_22COL,
     ] {
         let rows = fixture_rows(text);
         let scr = screen_of(&rows, aterm_phase::prompt::fixtures::cursor(text));

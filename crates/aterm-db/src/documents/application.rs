@@ -161,12 +161,36 @@ fn observe_store_if_declared_until<T>(
     pass_current(deadline)?;
     let paths = crate::generation::observed_paths_until(paths, deadline)?;
     let paths = &paths;
-    let (bootstrap, _) = Bootstrap::established_with_journal_until(paths, deadline)
+    let (bootstrap, journal) = Bootstrap::established_with_journal_until(paths, deadline)
         .map_err(crate::table::failure)?;
-    let session = Session::observe_until(&bootstrap, deadline)?;
-    let descriptor = descriptor(&bootstrap)?;
-    let directory = Directory::new(paths, bootstrap.trust());
-    let snapshot = directory.snapshot_existing(&session)?;
+    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline))?;
+    observe_declared_in_session(&session, descriptor(&bootstrap)?, deadline, action)
+}
+
+/// Observe another declared table through a bounded current application session.
+/// Historical sessions remain usable elsewhere; this read refuses generation changes.
+pub(crate) fn observe_store_in_session<T>(
+    session: &Session<'_>,
+    descriptor: Descriptor,
+    deadline: std::time::Instant,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> Result<T> {
+    session.require_current_application_generation(deadline)?;
+    let result = observe_declared_in_session(session, descriptor, deadline, action)?
+        .ok_or_else(|| Error::new("application table is not initialized"))?;
+    session.require_current_application_generation(deadline)?;
+    Ok(result)
+}
+
+fn observe_declared_in_session<T>(
+    session: &Session<'_>,
+    descriptor: Descriptor,
+    deadline: std::time::Instant,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> Result<Option<T>> {
+    pass_current(deadline)?;
+    let directory = Directory::new(session.paths(), session.trust());
+    let snapshot = directory.snapshot_existing(session)?;
     pass_current(deadline)?;
     let Some(entry) = snapshot.entries.get(&descriptor.scope.digest()) else {
         return Ok(None);
@@ -181,9 +205,9 @@ fn observe_store_if_declared_until<T>(
             "application table has an incompatible or unavailable descriptor",
         ));
     }
-    let store = directory.observe_table(&session, descriptor.scope)?;
+    let store = directory.observe_table(session, descriptor.scope)?;
     pass_current(deadline)?;
-    action(&session, &store, descriptor.scope).map(Some)
+    action(session, &store, descriptor.scope).map(Some)
 }
 
 /// [`observe_store_if_declared`] on a Mac that may hold no Commons: `None` there too, as
@@ -228,14 +252,51 @@ pub(crate) fn peek_catalog(
     {
         return Ok(None);
     }
-    let (bootstrap, _) = Bootstrap::established_with_journal_until(&paths, deadline)
+    let (bootstrap, journal) = Bootstrap::established_with_journal_until(&paths, deadline)
         .map_err(crate::table::failure)?;
-    let session = Session::observe_until(&bootstrap, deadline)?;
+    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline))?;
     let directory = Directory::new(&paths, bootstrap.trust());
     Ok(Some((
         bootstrap.trust(),
         directory.snapshot_if_exists(&session)?,
     )))
+}
+
+/// What this Mac's catalog says of `descriptor`'s table, read as an observer that creates
+/// nothing: the catalog's own table id, and whether a Mac other than this one declared that table
+/// in it. `None` where there is no Commons here.
+///
+/// # Errors
+/// Custody, membership or the catalog's storage cannot be read.
+pub(crate) fn peek_declared_elsewhere(
+    paths: &Paths,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+) -> Result<Option<(astream_wire::sync::Digest, bool)>> {
+    let deadline = admission_deadline();
+    let paths = crate::generation::observed_paths_until(paths, deadline)?;
+    if Bootstrap::cached(&paths)
+        .map_err(crate::table::failure)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let (bootstrap, journal) = Bootstrap::established_with_journal_until(&paths, deadline)
+        .map_err(crate::table::failure)?;
+    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline))?;
+    let directory = Directory::new(&paths, bootstrap.trust());
+    let table = descriptor(&bootstrap)?.scope.digest();
+    let me = session.actor();
+    let elsewhere = directory
+        .snapshot_if_exists(&session)?
+        .entries
+        .get(&table)
+        .is_some_and(|entry| {
+            entry
+                .declarations
+                .iter()
+                .any(|declaration| declaration.actor != me)
+        });
+    Ok(Some((directory.catalog_scope().digest(), elsewhere)))
 }
 
 fn pass_current(deadline: std::time::Instant) -> Result<()> {

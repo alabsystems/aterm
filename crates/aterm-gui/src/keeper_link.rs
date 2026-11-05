@@ -292,7 +292,7 @@ pub(crate) struct Claim {
     restore: Option<crate::crash_restore::RestoreReport>,
     armed: bool,
     #[cfg(unix)]
-    recovery_count: Option<std::sync::Arc<AtomicBool>>,
+    recovery_count: Option<std::sync::Arc<aterm_keeper::client::ReadObserver>>,
 }
 
 impl Claim {
@@ -348,7 +348,9 @@ impl Claim {
 
     /// This old authority stays in the boot cohort even if the claim is dropped.
     #[cfg(unix)]
-    pub(crate) fn recovery_count(&self) -> Option<std::sync::Arc<AtomicBool>> {
+    pub(crate) fn recovery_count(
+        &self,
+    ) -> Option<std::sync::Arc<aterm_keeper::client::ReadObserver>> {
         self.recovery_count.as_ref().map(std::sync::Arc::clone)
     }
 
@@ -360,6 +362,9 @@ impl Claim {
 impl Drop for Claim {
     fn drop(&mut self) {
         if self.armed {
+            #[cfg(unix)]
+            release_unclaimed(self.rdev, self.recovery_count.take());
+            #[cfg(not(unix))]
             release_unclaimed(self.rdev);
         }
     }
@@ -379,25 +384,71 @@ pub(crate) fn released_unclaimed(rdev: u64) -> bool {
         .contains(&rdev)
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    /// A test's link state, standing in for the process's on this thread in what an
+    /// undischarged [`Claim`]'s drop releases ([`claims_release_to`]).
+    static CLAIMS_RELEASE_TO: std::cell::RefCell<Option<Arc<Mutex<State>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Send what an undischarged [`Claim`] dropped on this thread releases over `st` (a test's link
+/// state, over a keeper the test steps) in place of the process's, until it is set to `None`: the
+/// drop's own path, from the claim's fields to the op the link writes.
+#[cfg(all(test, unix))]
+fn claims_release_to(st: Option<Arc<Mutex<State>>>) {
+    CLAIMS_RELEASE_TO.with(|to| *to.borrow_mut() = st);
+}
+
+/// Release `rdev`, an offered master that became no session; when its offer carried a journal of
+/// the boot cohort, that journal's `observer` hears once the keeper confirms the RELEASE
+/// ([`LinkOp::Retire`]).
+#[cfg(unix)]
+fn release_unclaimed(rdev: u64, observer: Option<Arc<aterm_keeper::client::ReadObserver>>) {
+    #[cfg(test)]
+    {
+        UNCLAIMED_RELEASES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(rdev);
+        if let Some(st) = CLAIMS_RELEASE_TO.with(|to| to.borrow().clone()) {
+            let mut st = st.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            release_unclaimed_in(&mut st, rdev, observer);
+            return;
+        }
+    }
+    if !on() {
+        return;
+    }
+    release_unclaimed_in(&mut keeper_state(), rdev, observer);
+}
+
+#[cfg(not(unix))]
 fn release_unclaimed(rdev: u64) {
     #[cfg(test)]
     UNCLAIMED_RELEASES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(rdev);
-    if !on() {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        let mut st = keeper_state();
-        if matches!(st.phase, Phase::Live(_)) {
-            aterm_log::info!("keeper: an offered master became no session; released");
-            send_in(&mut st, None, LinkOp::Release { rdev });
-        }
-    }
-    #[cfg(not(unix))]
+    #[cfg(not(test))]
     let _ = rdev;
+}
+
+/// [`release_unclaimed`] over `st`. Only a live link carries it: no other could confirm it.
+#[cfg(unix)]
+fn release_unclaimed_in(
+    st: &mut State,
+    rdev: u64,
+    observer: Option<Arc<aterm_keeper::client::ReadObserver>>,
+) {
+    if matches!(st.phase, Phase::Live(_)) {
+        aterm_log::info!("keeper: an offered master became no session; released");
+        let op = match observer {
+            Some(observer) => LinkOp::Retire { rdev, observer },
+            None => LinkOp::Release { rdev },
+        };
+        send_in(st, None, op);
+    }
 }
 
 /// Match recovered shells to the panes they filled by putting every id in one namespace keyed
@@ -477,16 +528,29 @@ pub(crate) fn place_by_owner(
     }
 }
 
-/// Fixed boot cohort of old journal authorities the keeper may still offer.
+/// Fixed boot cohort of old journal authorities the keeper may still offer: it is ready once the
+/// keeper confirmed, for every one, that it can no longer offer that journal (each a
+/// [`ReadObserver`]): it read the new journal of the session that adopted the master, or that
+/// session's COMPANION_RELEASE when it has no journal (`journal_op`) or its journal stopped, or
+/// the master's RELEASE when no session kept it (a refused offer, `release_refused_offer`; an
+/// adoption never placed, `release_unclaimed`) or the session closed before the keeper's read of
+/// its journal frame was confirmed (the link hands the observer on, aterm-keeper
+/// link-worker-delivery). No write confirms anything but a RELEASE's to a keeper without SYNC;
+/// a COMPANION or COMPANION_RELEASE written to one leaves its observer, and the fence, waiting.
+///
+/// [`ReadObserver`]: aterm_keeper::client::ReadObserver
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryCountAdmission {
-    retained: Vec<std::sync::Arc<AtomicBool>>,
+    #[cfg(unix)]
+    retained: Vec<std::sync::Arc<aterm_keeper::client::ReadObserver>>,
     ready: AtomicBool,
 }
 
 impl RecoveryCountAdmission {
     #[cfg(unix)]
-    pub(crate) const fn from_retained(retained: Vec<std::sync::Arc<AtomicBool>>) -> Self {
+    pub(crate) const fn from_retained(
+        retained: Vec<std::sync::Arc<aterm_keeper::client::ReadObserver>>,
+    ) -> Self {
         Self {
             retained,
             ready: AtomicBool::new(false),
@@ -497,16 +561,14 @@ impl RecoveryCountAdmission {
         if self.ready.load(Ordering::Acquire) {
             return true;
         }
-        if self
-            .retained
-            .iter()
-            .all(|accepted| accepted.load(Ordering::Acquire))
-        {
+        #[cfg(unix)]
+        let all = self.retained.iter().all(|accepted| accepted.confirmed());
+        #[cfg(not(unix))]
+        let all = true;
+        if all {
             self.ready.store(true, Ordering::Release);
-            true
-        } else {
-            false
         }
+        all
     }
 }
 
@@ -803,56 +865,15 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
                 crate::metrics::mark_keeper_hello();
                 let seam_at_hello = crate::metrics::keeper_seam();
                 KEEPER_JOURNALS.store(client.keeper_journals(), Ordering::Relaxed);
-                let mut used_cells = 0u64;
                 let offered = offers.len();
-                let mut slowest = Duration::ZERO;
-                for offer in offers {
-                    let recovery_count = offer.companion.as_ref().map(|_| {
-                        let accepted = Arc::new(AtomicBool::new(false));
-                        retained_counts.push(Arc::clone(&accepted));
-                        accepted
-                    });
-                    let rdev = offer.header.rdev;
-                    let local_id = offer.header.local_id;
-                    if let Some(owner) = Tag::decode(&offer.tag).and_then(|t| t.owner)
-                        && !recovery.owners.contains(&owner)
-                    {
-                        recovery.owners.push(owner);
-                    }
-                    // The restore lane's seam's own work is off this clock: a really damaged
-                    // region never pays it (`metrics::keeper_seam`).
-                    let seam_before = crate::metrics::keeper_seam();
-                    let started = std::time::Instant::now();
-                    let admitted = admit_recovered_master(offer, &mut used_cells, cfg);
-                    let seam = crate::metrics::keeper_seam().since(seam_before);
-                    slowest = slowest.max(started.elapsed().saturating_sub(seam.spent()));
-                    match admitted {
-                        Ok(mut adopted) => {
-                            if let Some(claim) = adopted.keeper.as_mut() {
-                                claim.recovery_count = recovery_count;
-                            }
-                            if let Some(report) =
-                                adopted.keeper.as_ref().and_then(|c| c.restore.as_ref())
-                            {
-                                recovery.restores.note(report);
-                            }
-                            recovery.shells.push(adopted.pid);
-                            recovery.adopted.push(adopted);
-                        }
-                        Err(why) => {
-                            aterm_log::warn!(
-                                "keeper: refused the offer of session {local_id}: {why}; released"
-                            );
-                            let _ = client.send(&Frame::Release { rdev }, None);
-                            recovery.refused.push((local_id, why));
-                        }
-                    }
-                }
+                let (cohort, slowest) = admit_offers(&client, offers, &mut recovery, cfg);
                 crate::metrics::record_keeper_admitted(
                     offered,
                     slowest,
                     crate::metrics::keeper_seam().since(seam_at_hello),
                 );
+                crate::metrics::record_keeper_cohort(cohort.clone());
+                retained_counts = cohort;
                 Some(client)
             }
             Err(e) => {
@@ -906,6 +927,89 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
         }
     }
     recovery
+}
+
+/// Admit the boot HELLO's `offers`, made on `client`, into `recovery`, releasing each refused one
+/// on `client` ([`release_refused_offer`]): the fence's boot cohort (one read observer per offer
+/// that carried a journal), and the slowest admission, its restore seam's own work off the clock.
+#[cfg(unix)]
+fn admit_offers(
+    client: &KeeperClient,
+    offers: Vec<Offered>,
+    recovery: &mut Recovery,
+    cfg: Option<&aterm_core::config::TerminalConfig>,
+) -> (Vec<Arc<aterm_keeper::client::ReadObserver>>, Duration) {
+    let mut cohort = Vec::new();
+    let mut used_cells = 0u64;
+    let mut slowest = Duration::ZERO;
+    for offer in offers {
+        let recovery_count = offer.companion.as_ref().map(|_| {
+            let accepted = Arc::new(aterm_keeper::client::ReadObserver::default());
+            cohort.push(Arc::clone(&accepted));
+            accepted
+        });
+        let rdev = offer.header.rdev;
+        let local_id = offer.header.local_id;
+        if let Some(owner) = Tag::decode(&offer.tag).and_then(|t| t.owner)
+            && !recovery.owners.contains(&owner)
+        {
+            recovery.owners.push(owner);
+        }
+        // The restore lane's seam's own work is off this clock: a really damaged region never
+        // pays it (`metrics::keeper_seam`).
+        let seam_before = crate::metrics::keeper_seam();
+        let started = std::time::Instant::now();
+        let admitted = admit_recovered_master(offer, &mut used_cells, cfg);
+        let seam = crate::metrics::keeper_seam().since(seam_before);
+        slowest = slowest.max(started.elapsed().saturating_sub(seam.spent()));
+        match admitted {
+            Ok(mut adopted) => {
+                if let Some(claim) = adopted.keeper.as_mut() {
+                    claim.recovery_count = recovery_count;
+                }
+                if let Some(report) = adopted.keeper.as_ref().and_then(|c| c.restore.as_ref()) {
+                    recovery.restores.note(report);
+                }
+                recovery.shells.push(adopted.pid);
+                recovery.adopted.push(adopted);
+            }
+            Err(why) => {
+                aterm_log::warn!(
+                    "keeper: refused the offer of session {local_id}: {why}; released"
+                );
+                release_refused_offer(client, rdev, recovery_count);
+                recovery.refused.push((local_id, why));
+            }
+        }
+    }
+    (cohort, slowest)
+}
+
+/// RELEASE `rdev`, an offer the window refused, on `client`, the boot connection it came on. When
+/// the offer carried a journal of the boot cohort, `observer` hears once the keeper confirms the
+/// RELEASE ([`KeeperClient::retire`]): the link started on `client` sees that through, and tells
+/// it to the next connection if this one ends first.
+#[cfg(unix)]
+fn release_refused_offer(
+    client: &KeeperClient,
+    rdev: u64,
+    observer: Option<Arc<aterm_keeper::client::ReadObserver>>,
+) {
+    let retiring = observer.is_some();
+    let released = match observer {
+        Some(observer) => client.retire(rdev, observer),
+        None => client.send(&Frame::Release { rdev }, None),
+    };
+    if let Err(e) = released {
+        if retiring {
+            aterm_log::warn!(
+                "keeper: the RELEASE of a refused offer was not written ({e}); the link tells it \
+                 to its next connection"
+            );
+        } else {
+            aterm_log::warn!("keeper: the RELEASE of a refused offer was not written ({e})");
+        }
+    }
 }
 
 /// Commit (an update's successor, beside `crash_signal::adopt_app_identity`).
@@ -1232,6 +1336,7 @@ pub(crate) fn register(session: &crate::Session, claim: Option<Claim>) {
     let tracked = register_unix(
         session,
         claim.is_some() || session.handoff_local_id.is_some(),
+        claim.as_ref().and_then(Claim::recovery_count),
     );
     #[cfg(not(unix))]
     let tracked = {
@@ -1243,9 +1348,14 @@ pub(crate) fn register(session: &crate::Session, claim: Option<Claim>) {
     }
 }
 
-/// Whether the session is now tracked (and so released at its drop).
+/// Whether the session is now tracked (and so released at its drop). `retires` is the read
+/// observer of the old journal the adopted master's offer carried, when it is in the boot cohort.
 #[cfg(unix)]
-fn register_unix(session: &crate::Session, prior_claim: bool) -> bool {
+fn register_unix(
+    session: &crate::Session,
+    prior_claim: bool,
+    retires: Option<Arc<aterm_keeper::client::ReadObserver>>,
+) -> bool {
     use std::os::fd::{BorrowedFd, OwnedFd};
     use std::os::unix::fs::MetadataExt as _;
     if session.master < 3 || session.pid <= 1 {
@@ -1281,18 +1391,11 @@ fn register_unix(session: &crate::Session, prior_claim: bool) -> bool {
         tag: tag.encode(),
     };
     let mut st = keeper_state();
-    let journal = match session.ctx.crash_journal.get().and_then(|j| {
+    let custody = session.ctx.crash_journal.get().and_then(|j| {
         j.note_custody_registered();
         j.take_custody_with_receipt()
-    }) {
-        Some(held) => LinkOp::Companion {
-            rdev,
-            region: held.region,
-            len: held.len,
-            receipt: held.receipt,
-        },
-        None => LinkOp::CompanionRelease { rdev },
-    };
+    });
+    let journal = journal_op(rdev, custody, retires);
     register_in(
         &mut st,
         session.id,
@@ -1307,6 +1410,35 @@ fn register_unix(session: &crate::Session, prior_claim: bool) -> bool {
         journal,
     );
     true
+}
+
+/// The op that settles a registration's journal claim on `rdev`: its region's `custody`, with the
+/// receipt the journal made (which reports to the boot cohort's observer when the journal was
+/// bound to one, `SessionJournal::bind_recovery_count`), or, with none (no journal: its creation
+/// failed or was refused, or it is broken), COMPANION_RELEASE. That one tells the keeper to drop
+/// the region an adopted master's offer carried, so it reports the keeper's read to that old
+/// journal's observer, `retires`: folding the count locally would leave the keeper free to offer
+/// the old journal again.
+#[cfg(unix)]
+fn journal_op(
+    rdev: u64,
+    custody: Option<crate::crash_restore::JournalCustody>,
+    retires: Option<Arc<aterm_keeper::client::ReadObserver>>,
+) -> LinkOp {
+    match custody {
+        Some(held) => LinkOp::Companion {
+            rdev,
+            region: held.region,
+            len: held.len,
+            receipt: held.receipt,
+        },
+        None => LinkOp::CompanionRelease {
+            rdev,
+            receipt: retires.map(|observer| {
+                Arc::new(aterm_keeper::client::CompanionReceipt::reporting_confirmation(observer))
+            }),
+        },
+    }
 }
 
 /// [`register`] over `st` (the process's link state, or a test's): track session
@@ -1343,7 +1475,14 @@ fn release_companion_in(st: &mut State, session_id: u64) {
     let Some(rdev) = st.tracked.get(&session_id).map(|t| t.rdev) else {
         return;
     };
-    send_in(st, Some(session_id), LinkOp::CompanionRelease { rdev });
+    send_in(
+        st,
+        Some(session_id),
+        LinkOp::CompanionRelease {
+            rdev,
+            receipt: None,
+        },
+    );
 }
 
 /// What became of a fresh region's custody offered to the keeper link ([`replace_companion`]).
@@ -3229,11 +3368,12 @@ mod tests {
             .filter_map(|op| match op {
                 LinkOp::Release { rdev } if rdev == FILLER_RDEV => None,
                 LinkOp::Release { rdev } => Some(("RELEASE", rdev, 0)),
+                LinkOp::Retire { rdev, .. } => Some(("RETIRE", rdev, 0)),
                 LinkOp::Register { master, header, .. } => {
                     Some(("REGISTER", header.rdev, inode(&master)))
                 }
                 LinkOp::Companion { rdev, region, .. } => Some(("COMPANION", rdev, inode(&region))),
-                LinkOp::CompanionRelease { rdev } => Some(("COMPANION_RELEASE", rdev, 0)),
+                LinkOp::CompanionRelease { rdev, .. } => Some(("COMPANION_RELEASE", rdev, 0)),
                 LinkOp::Meta { rdev, .. } => Some(("META", rdev, 0)),
                 LinkOp::Pending { pid } => Some(("PENDING", u64::from(pid), 0)),
                 LinkOp::Bye => Some(("BYE", 0, 0)),
@@ -3249,7 +3389,15 @@ mod tests {
         let link = TestLink::bare();
         link.fill();
         let (master, master_ino) = files.fd();
-        link.register(7, 70, master, LinkOp::CompanionRelease { rdev: 70 });
+        link.register(
+            7,
+            70,
+            master,
+            LinkOp::CompanionRelease {
+                rdev: 70,
+                receipt: None,
+            },
+        );
         assert_eq!(
             link.owed(),
             2,
@@ -3308,7 +3456,10 @@ mod tests {
                 id,
                 id + 1_000,
                 master,
-                LinkOp::CompanionRelease { rdev: id + 1_000 },
+                LinkOp::CompanionRelease {
+                    rdev: id + 1_000,
+                    receipt: None,
+                },
             );
             assert_eq!(churn.owed(), 2);
             assert!(
@@ -3327,7 +3478,15 @@ mod tests {
         let admitted = TestLink::bare();
         admitted.fill_but(1);
         let (master, ino) = files.fd();
-        admitted.register(200, 2_000, master, LinkOp::CompanionRelease { rdev: 2_000 });
+        admitted.register(
+            200,
+            2_000,
+            master,
+            LinkOp::CompanionRelease {
+                rdev: 2_000,
+                receipt: None,
+            },
+        );
         admitted.release(200);
         assert_eq!(admitted.owed(), 2);
         assert_eq!(seen(admitted.drain()), [("REGISTER", 2_000, ino)]);
@@ -3344,7 +3503,15 @@ mod tests {
         let prior = TestLink::bare();
         prior.fill();
         let (master, ino) = files.fd();
-        prior.register(250, 2_500, master, LinkOp::CompanionRelease { rdev: 2_500 });
+        prior.register(
+            250,
+            2_500,
+            master,
+            LinkOp::CompanionRelease {
+                rdev: 2_500,
+                receipt: None,
+            },
+        );
         prior
             .state
             .lock()
@@ -3378,7 +3545,10 @@ mod tests {
             u64::MAX,
             9_001,
             master,
-            LinkOp::CompanionRelease { rdev: 9_001 },
+            LinkOp::CompanionRelease {
+                rdev: 9_001,
+                receipt: None,
+            },
         );
         unclaimed.release(u64::MAX);
         assert_eq!(unclaimed.owed(), 1);
@@ -3389,7 +3559,15 @@ mod tests {
         let quitting = TestLink::bare();
         quitting.fill();
         let (master, _) = files.fd();
-        quitting.register(300, 3_000, master, LinkOp::CompanionRelease { rdev: 3_000 });
+        quitting.register(
+            300,
+            3_000,
+            master,
+            LinkOp::CompanionRelease {
+                rdev: 3_000,
+                receipt: None,
+            },
+        );
         let live = quit_link_in(&mut quitting.state.lock().expect("state"));
         assert!(live.is_some());
         assert_eq!(quitting.owed(), 0);
@@ -3508,7 +3686,10 @@ mod tests {
 
         let link = TestLink::stalled(8, 80);
         link.fill();
-        link.enqueue_dropping(LinkOp::CompanionRelease { rdev: 80 });
+        link.enqueue_dropping(LinkOp::CompanionRelease {
+            rdev: 80,
+            receipt: None,
+        });
         let first = seen(link.drain());
         link.tick();
         let later = seen(link.drain());
@@ -3529,7 +3710,15 @@ mod tests {
             let link = TestLink::bare();
             link.fill();
             let (master, master_ino) = files.fd();
-            link.register(7, 70, master, LinkOp::CompanionRelease { rdev: 70 });
+            link.register(
+                7,
+                70,
+                master,
+                LinkOp::CompanionRelease {
+                    rdev: 70,
+                    receipt: None,
+                },
+            );
             assert_eq!(
                 link.owed(),
                 2,
@@ -3567,5 +3756,448 @@ mod tests {
             [("REGISTER", 70, master_ino)],
             "control: the full queue's ordinary admission takes no BYE"
         );
+    }
+
+    /// A keeper in this process, stepped by the test: what a crash restore's boot connection,
+    /// link and old journal speak to.
+    #[cfg(unix)]
+    struct Keeper {
+        _dir: aterm_tempfile::TempDir,
+        sock: std::path::PathBuf,
+        server: aterm_keeper::server::Server,
+    }
+
+    #[cfg(unix)]
+    impl Keeper {
+        fn new(for_what: &str) -> Self {
+            let dir = crate::test_scratch::short_dir(for_what);
+            let sock = dir.path().join("k.sock");
+            let server = aterm_keeper::server::Server::bind(aterm_keeper::server::ServeConfig {
+                socket: sock.clone(),
+                identity: aterm_keeper::identity::Identity::same_uid(),
+                relaunch: aterm_keeper::server::Relauncher::Unavailable,
+                version: "test".into(),
+                test_drop_custody: false,
+            })
+            .expect("a keeper");
+            Self {
+                _dir: dir,
+                sock,
+                server,
+            }
+        }
+
+        /// Step the keeper until `done`, under the one-minute hang detector.
+        #[track_caller]
+        fn step_until(&mut self, what: &str, done: impl Fn(&aterm_keeper::server::Server) -> bool) {
+            let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            while !done(&self.server) {
+                assert!(std::time::Instant::now() < deadline, "never: {what}");
+                self.server.step(20).expect("a keeper turn");
+            }
+        }
+
+        /// A link to this keeper on `booted` (or dialled), idle for good: only an op or the
+        /// keeper's own frame wakes it, so nothing but the keeper's answer confirms a read.
+        fn link(&self, booted: Option<KeeperClient>) -> KeeperLink {
+            KeeperLink::start_idling(
+                self.sock.clone(),
+                aterm_keeper::identity::Identity::same_uid(),
+                "t".into(),
+                None,
+                booted,
+                true,
+                Duration::from_secs(3_600),
+            )
+            .expect("a link")
+        }
+
+        /// The dead window's custody of `sh`'s master, as the keeper keeps it: a claim of an
+        /// older connection of this process, with its journal region beside it (the old journal
+        /// an offer of it carries). The link that holds that claim, and the master's rdev.
+        fn old_claim(&mut self, sh: &aterm_pty::SpawnedShell, birth: u64) -> (KeeperLink, u64) {
+            use std::os::unix::fs::MetadataExt as _;
+            let older = self.link(None);
+            let master = owned_dup(sh.master);
+            let rdev = std::fs::File::from(master.try_clone().expect("dup"))
+                .metadata()
+                .expect("stat the master")
+                .rdev();
+            assert!(older.enqueue(LinkOp::Register {
+                master,
+                header: MasterHeader {
+                    rdev,
+                    ..header_for(sh.pid, birth)
+                },
+                tag: tag(),
+            }));
+            let (_region, custody) = journal_region();
+            assert!(older.enqueue(LinkOp::Companion {
+                rdev,
+                region: custody,
+                len: aterm_uds::shm::PAGE as u64,
+                receipt: None,
+            }));
+            self.step_until("the keeper holds the old journal", |s| {
+                s.holds(rdev) && old_journal(s, rdev).is_some()
+            });
+            (older, rdev)
+        }
+
+        /// A window's boot connection, its HELLO answered (the test hands it the offer).
+        fn boot(&mut self) -> KeeperClient {
+            let sock = self.sock.clone();
+            let hello = std::thread::spawn(move || {
+                let c = KeeperClient::connect(
+                    &sock,
+                    &aterm_keeper::identity::Identity::same_uid(),
+                    aterm_spec::wait::MUST_HAPPEN,
+                )
+                .expect("dial");
+                let offers = c.hello_app_marked("t", None, true).expect("the WELCOME");
+                assert!(offers.is_empty(), "premise: the claim is not orphaned");
+                c
+            });
+            self.step_until("the boot HELLO is answered", |_| hello.is_finished());
+            hello.join().expect("the boot HELLO")
+        }
+    }
+
+    /// A journal region a window would make: read-only custody of a fresh shared-memory object.
+    #[cfg(unix)]
+    fn journal_region() -> (aterm_uds::shm::Region, std::os::fd::OwnedFd) {
+        // SAFETY: nothing modifies, resizes or invalidates the object: the returned `Region` stays
+        // inert (no test writes through it), the keeper only holds the custody descriptor, and
+        // the window's restore at most maps it read-only (`map_readonly`) to read a blank page.
+        unsafe { aterm_uds::shm::Region::create(aterm_uds::shm::PAGE) }.expect("a region")
+    }
+
+    /// The region an offer of `rdev` would carry now.
+    #[cfg(unix)]
+    fn old_journal(server: &aterm_keeper::server::Server, rdev: u64) -> Option<u64> {
+        server.core().companion_view(rdev).and_then(|v| v.offered)
+    }
+
+    /// A duplicate of `fd`, a live descriptor the test holds.
+    #[cfg(unix)]
+    fn owned_dup(fd: i32) -> std::os::fd::OwnedFd {
+        // SAFETY: `fd` is a live descriptor the test holds for this call.
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .expect("dup")
+    }
+
+    /// The boot HELLO's offer of `sh`'s master at `rdev`, its shell born at `birth`, with the old
+    /// journal beside it.
+    #[cfg(unix)]
+    fn offer_of(sh: &aterm_pty::SpawnedShell, rdev: u64, birth: u64) -> Offered {
+        let (_region, custody) = journal_region();
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b[?2004h");
+        Offered {
+            master: owned_dup(sh.master),
+            header: MasterHeader {
+                rdev,
+                ..header_for(sh.pid, birth)
+            },
+            tag: tag(),
+            meta: crate::seamless::keeper_meta(&t).expect("meta"),
+            companion: Some(aterm_keeper::client::OfferedCompanion {
+                region: custody,
+                kind: aterm_keeper::wire::COMPANION_JOURNAL,
+                len: aterm_uds::shm::PAGE as u64,
+            }),
+            attempts: 0,
+        }
+    }
+
+    /// A RELEASE written behind every op queued before it: what the keeper has unread when the
+    /// test asserts the fence still holds.
+    #[cfg(unix)]
+    fn written_behind(link: &KeeperLink) {
+        assert!(
+            link.send_and_wait(
+                LinkOp::Release { rdev: u64::MAX - 1 },
+                aterm_spec::wait::MUST_HAPPEN
+            ),
+            "control: the ops queued before are written"
+        );
+    }
+
+    /// F01, a refused offer: the window refuses the old journal's offer (its shell's pid now
+    /// names another process) and releases it on the boot connection, and its fence, which no
+    /// session's journal will ever lift, lifts once the keeper answers the SYNC behind that
+    /// RELEASE, not while the keeper holds the connection unread.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_offer_lifts_the_fence_once_the_keeper_reads_its_release() {
+        let mut keeper = Keeper::new("refused offer");
+        let (sh, birth) = live_pty();
+        let (older, rdev) = keeper.old_claim(&sh, birth);
+        let boot = keeper.boot();
+        let mut recovery = Recovery::default();
+        let (cohort, _) = admit_offers(
+            &boot,
+            vec![offer_of(&sh, rdev, birth + 1)],
+            &mut recovery,
+            None,
+        );
+        assert_eq!(
+            recovery.refused,
+            [(3, "its shell's pid now names another process")]
+        );
+        let admission = RecoveryCountAdmission::from_retained(cohort);
+        let link = keeper.link(Some(boot));
+        written_behind(&link);
+        assert!(
+            keeper.server.holds(rdev),
+            "premise: the keeper read nothing"
+        );
+        assert!(!admission.ready(), "a written RELEASE lifts no fence");
+        keeper.step_until("the keeper's answer lifts the fence", |_| admission.ready());
+        assert!(
+            !keeper.server.holds(rdev),
+            "the keeper closed the old master and its journal"
+        );
+        link.shutdown();
+        older.shutdown();
+        end(&sh);
+    }
+
+    /// F01, an adoption never placed: the window admits the offer, but its session never comes
+    /// to be, so the adoption is dropped, and its armed claim's drop retires the old journal
+    /// through the link; the fence lifts once the keeper answers the SYNC behind that RELEASE.
+    #[cfg(unix)]
+    #[test]
+    fn an_adoption_never_placed_lifts_the_fence_once_the_keeper_reads_its_release() {
+        let mut keeper = Keeper::new("unplaced adoption");
+        let (sh, birth) = live_pty();
+        let (older, rdev) = keeper.old_claim(&sh, birth);
+        let boot = keeper.boot();
+        let mut recovery = Recovery::default();
+        let (cohort, _) =
+            admit_offers(&boot, vec![offer_of(&sh, rdev, birth)], &mut recovery, None);
+        let adopted = recovery.adopted.pop().expect("the offer is admitted");
+        assert!(
+            adopted
+                .keeper
+                .as_ref()
+                .is_some_and(|claim| claim.recovery_count().is_some()),
+            "premise: its claim holds the old journal's observer"
+        );
+        let admission = RecoveryCountAdmission::from_retained(cohort);
+        let state = Arc::new(Mutex::new(State {
+            phase: Phase::Live(Arc::new(keeper.link(Some(boot)))),
+            buffered: Vec::new(),
+            owed: VecDeque::new(),
+            tracked: BTreeMap::new(),
+            pump: false,
+        }));
+        // The claim's own drop, over this test's link in place of the process's.
+        claims_release_to(Some(Arc::clone(&state)));
+        drop(adopted);
+        claims_release_to(None);
+        assert!(
+            released_unclaimed(rdev),
+            "control: the claim's drop released the master"
+        );
+        let Phase::Live(link) =
+            std::mem::replace(&mut state.lock().expect("state").phase, Phase::Off)
+        else {
+            unreachable!("the test's link is live")
+        };
+        written_behind(&link);
+        assert!(
+            keeper.server.holds(rdev),
+            "premise: the keeper read nothing"
+        );
+        assert!(!admission.ready(), "a written RELEASE lifts no fence");
+        keeper.step_until("the keeper's answer lifts the fence", |_| admission.ready());
+        assert!(
+            !keeper.server.holds(rdev),
+            "the keeper closed the old master and its journal"
+        );
+        Arc::into_inner(link).expect("the one link").shutdown();
+        older.shutdown();
+        end(&sh);
+    }
+
+    /// F01, an adopted session with no journal (`SessionJournal::create` failed, so the
+    /// registration has no region's custody to send): its COMPANION_RELEASE tells the keeper to
+    /// drop the old journal, and the fence lifts once the keeper answers the SYNC behind it.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_with_no_journal_lifts_the_fence_once_the_keeper_drops_the_old_one() {
+        let mut keeper = Keeper::new("journal-less adoption");
+        let (sh, birth) = live_pty();
+        let (older, rdev) = keeper.old_claim(&sh, birth);
+        let boot = keeper.boot();
+        let mut recovery = Recovery::default();
+        let (cohort, _) =
+            admit_offers(&boot, vec![offer_of(&sh, rdev, birth)], &mut recovery, None);
+        let mut adopted = recovery.adopted.pop().expect("the offer is admitted");
+        let claim = adopted.keeper.take().expect("its release obligation");
+        let admission = RecoveryCountAdmission::from_retained(cohort);
+        let link = keeper.link(Some(boot));
+        let mut state = State {
+            phase: Phase::Live(Arc::new(link)),
+            buffered: Vec::new(),
+            owed: VecDeque::new(),
+            tracked: BTreeMap::new(),
+            pump: false,
+        };
+        // What `register` sends for the placed session ([`register_unix`]), its journal off.
+        register_in(
+            &mut state,
+            adopted.local_id,
+            Tracked {
+                rdev,
+                prior_claim: true,
+                term: Weak::new(),
+                fabric: Weak::new(),
+                last: None,
+            },
+            LinkOp::Register {
+                master: owned_dup(sh.master),
+                header: MasterHeader {
+                    rdev,
+                    ..header_for(sh.pid, birth)
+                },
+                tag: tag(),
+            },
+            journal_op(rdev, None, claim.recovery_count()),
+        );
+        claim.discharge();
+        let Phase::Live(link) = std::mem::replace(&mut state.phase, Phase::Off) else {
+            unreachable!("the test's link is live")
+        };
+        written_behind(&link);
+        assert!(
+            old_journal(&keeper.server, rdev).is_some(),
+            "premise: the keeper read nothing, and offers the old journal still"
+        );
+        assert!(
+            !admission.ready(),
+            "a written COMPANION_RELEASE lifts no fence"
+        );
+        keeper.step_until("the keeper's answer lifts the fence", |_| admission.ready());
+        assert_eq!(
+            old_journal(&keeper.server, rdev),
+            None,
+            "the keeper holds the master with no journal an offer of it could carry"
+        );
+        assert!(
+            keeper.server.holds(rdev),
+            "the session's master stays in custody"
+        );
+        drop(adopted);
+        Arc::into_inner(link).expect("the one link").shutdown();
+        older.shutdown();
+        end(&sh);
+    }
+
+    /// F01, an adopted session closed (`release_in`), or whose journal stopped
+    /// (`release_companion_in`, `SessionJournal::stop`), before the link read the keeper's answer
+    /// to the SYNC behind the frame that settles its journal claim: that frame's observer goes on
+    /// to the frame that superseded it (the RELEASE, or the receipt-less COMPANION_RELEASE), and
+    /// the fence lifts once the keeper answers the SYNC behind that one. Every op is written
+    /// before the keeper reads any, as when the keeper is slow or the link is between
+    /// connections.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_gone_before_the_keeper_read_its_journal_frame_still_lifts_the_fence() {
+        for (case, journaled) in [
+            ("a journal-less session closed", false),
+            ("a session's journal stopped", true),
+        ] {
+            let mut keeper = Keeper::new(case);
+            let (sh, birth) = live_pty();
+            let (older, rdev) = keeper.old_claim(&sh, birth);
+            let boot = keeper.boot();
+            let mut recovery = Recovery::default();
+            let (cohort, _) =
+                admit_offers(&boot, vec![offer_of(&sh, rdev, birth)], &mut recovery, None);
+            let mut adopted = recovery.adopted.pop().expect("the offer is admitted");
+            let claim = adopted.keeper.take().expect("its release obligation");
+            let admission = RecoveryCountAdmission::from_retained(cohort);
+            let mut state = State {
+                phase: Phase::Live(Arc::new(keeper.link(Some(boot)))),
+                buffered: Vec::new(),
+                owed: VecDeque::new(),
+                tracked: BTreeMap::new(),
+                pump: false,
+            };
+            let (_region, custody) = journal_region();
+            // What `register_unix` sends: the journal's first region with the receipt it binds to
+            // the old journal's observer (`SessionJournal::bind_recovery_count`), or none.
+            let journal = if journaled {
+                let observer = claim.recovery_count().expect("the old journal's observer");
+                journal_op(
+                    rdev,
+                    Some(crate::crash_restore::JournalCustody {
+                        region: custody,
+                        len: aterm_uds::shm::PAGE as u64,
+                        receipt: Some(Arc::new(
+                            aterm_keeper::client::CompanionReceipt::reporting_confirmation(
+                                observer,
+                            ),
+                        )),
+                    }),
+                    None,
+                )
+            } else {
+                journal_op(rdev, None, claim.recovery_count())
+            };
+            register_in(
+                &mut state,
+                adopted.local_id,
+                Tracked {
+                    rdev,
+                    prior_claim: true,
+                    term: Weak::new(),
+                    fabric: Weak::new(),
+                    last: None,
+                },
+                LinkOp::Register {
+                    master: owned_dup(sh.master),
+                    header: MasterHeader {
+                        rdev,
+                        ..header_for(sh.pid, birth)
+                    },
+                    tag: tag(),
+                },
+                journal,
+            );
+            claim.discharge();
+            if journaled {
+                release_companion_in(&mut state, adopted.local_id);
+            } else {
+                release_in(&mut state, adopted.local_id);
+            }
+            let Phase::Live(link) = std::mem::replace(&mut state.phase, Phase::Off) else {
+                unreachable!("the test's link is live")
+            };
+            written_behind(&link);
+            assert!(
+                old_journal(&keeper.server, rdev).is_some(),
+                "{case}: premise: the keeper read nothing, and offers the old journal still"
+            );
+            assert!(!admission.ready(), "{case}: a written frame lifts no fence");
+            keeper.step_until(case, |_| admission.ready());
+            assert_eq!(
+                old_journal(&keeper.server, rdev),
+                None,
+                "{case}: the keeper holds no journal an offer of the master could carry"
+            );
+            assert_eq!(
+                keeper.server.holds(rdev),
+                journaled,
+                "{case}: the master stays in custody only while its session lives"
+            );
+            drop(adopted);
+            Arc::into_inner(link).expect("the one link").shutdown();
+            older.shutdown();
+            end(&sh);
+        }
     }
 }

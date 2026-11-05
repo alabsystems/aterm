@@ -145,20 +145,19 @@ pub(crate) fn check(spec: &ChildSpec) -> Result<()> {
 /// `Instant`, not a `Duration`, so the deadline is computed here, inside `fx/`, the one place
 /// census's agh-fx clause lets agh read a clock. `output_until` itself makes stdin
 /// `/dev/null`, pipes both streams, keeps the last `deadline::OUTPUT_KEEP` bytes of each, and
-/// puts the child at the head of a new process group (`process_group(0)`), which the bound
-/// kills.
+/// puts the child at the head of a new process group (`process_group(0)`), which its
+/// termination path targets.
 ///
 /// # Errors
 ///
 /// could_not_run, `Sub::Local`. Before anything is spawned: why `{program} is not an absolute
-/// path`, or `{program}'s budget {budget} is past what the clock holds`. After: `{program}
-/// could not start: {e}` (it never ran, or its stream readers could not start and it was
-/// killed at once), `{program} could not be waited for: {e}`, or `{program} did not finish in
-/// {budget}`. The last two come from a child that started, was killed and was reaped, and it
-/// may have acted first: a git push may have reached its remote, so they carry
-/// `SideEffect::Unknown` and never read as not sent. Every earlier one carries
-/// `SideEffect::None`. A caller that only reads (ls-remote, clone, `gh auth token`) may lower
-/// the side effect to none.
+/// path`, `{program}'s budget {budget} is past what the clock holds`, or `{program} could not
+/// start: {e}`. These pre-dispatch refusals carry `SideEffect::None`.
+/// A capture failure after successful dispatch, wait failure or timeout carries
+/// `SideEffect::Unknown`: a git push may already have reached its remote. Neither the
+/// collector failure nor its termination attempt proves that nothing happened; its cleanup
+/// contract is separate from dispatch classification. A caller that only reads remotely
+/// (ls-remote, clone, `gh auth token`) may lower the side effect to none.
 pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
     check(spec)?;
     let program = spec.program.display();
@@ -181,28 +180,73 @@ pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
             stdout: output.stdout,
             stderr: output.stderr,
         }),
-        Err(RunError::Spawn(e)) => Err(Error::local(format!("{program} could not start: {e}"))),
-        Err(RunError::Wait(e)) => Err(Error::local(format!(
-            "{program} could not be waited for: {e}"
+        Err(error) => Err(classify_failure(spec, error)),
+    }
+}
+
+/// Dispatch classification is independent of the collector's cleanup contract.
+fn classify_failure(spec: &ChildSpec, error: RunError) -> Error {
+    let program = spec.program.display();
+    match error {
+        RunError::Spawn(e) => Error::local(format!("{program} could not start: {e}")),
+        RunError::Capture(e) => Error::local(format!(
+            "{program} was dispatched but output capture failed: {e}"
         ))
-        .with_side_effect(SideEffect::Unknown)),
-        Err(RunError::TimedOut) => Err(Error::local(format!(
-            "{program} did not finish in {:?}",
-            spec.budget
-        ))
-        .with_side_effect(SideEffect::Unknown)),
+        .with_side_effect(SideEffect::Unknown),
+        RunError::Wait(e) => Error::local(format!("{program} could not be waited for: {e}"))
+            .with_side_effect(SideEffect::Unknown),
+        RunError::TimedOut => {
+            Error::local(format!("{program} did not finish in {:?}", spec.budget))
+                .with_side_effect(SideEffect::Unknown)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    #[cfg(unix)]
     use std::time::Duration;
 
-    use super::{ChildOut, ChildSpec, ScriptedChild, run};
+    use super::{ChildOut, ChildSpec, RunError, ScriptedChild, classify_failure, run};
     use crate::error::{Kind, SideEffect, Sub};
     use crate::fx::Fx;
+
+    /// Successful dispatch permits effects even if the output reader never starts. The
+    /// other collector failures keep their previous classifications and diagnostic stages.
+    #[test]
+    fn collector_failures_preserve_dispatch_and_side_effect_classification() {
+        let spec = ChildSpec::new(Path::new("/fixture/git")).budget(Duration::from_secs(73));
+        let cause = || std::io::Error::other("collector-classification-marker");
+        for (error, effect, why) in [
+            (
+                RunError::Spawn(cause()),
+                SideEffect::None,
+                "/fixture/git could not start: collector-classification-marker",
+            ),
+            (
+                RunError::Capture(cause()),
+                SideEffect::Unknown,
+                "/fixture/git was dispatched but output capture failed: collector-classification-marker",
+            ),
+            (
+                RunError::Wait(cause()),
+                SideEffect::Unknown,
+                "/fixture/git could not be waited for: collector-classification-marker",
+            ),
+            (
+                RunError::TimedOut,
+                SideEffect::Unknown,
+                "/fixture/git did not finish in 73s",
+            ),
+        ] {
+            let data = classify_failure(&spec, error).into_data();
+            assert_eq!(
+                (data.kind, data.sub, data.side_effect),
+                (Kind::CouldNotRun, Sub::Local, effect)
+            );
+            assert_eq!(data.why, why);
+        }
+    }
 
     /// `Instant + Duration::MAX` panics; the run answers could_not_run instead, before anything
     /// is spawned, so nothing was written. The child is one that runs and exits 0 under a

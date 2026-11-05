@@ -621,3 +621,40 @@ fn missing_report_paths_and_provider_homes_have_json_refusals() {
         assert!(doc["rows"].as_array().unwrap().is_empty());
     }
 }
+
+/// The limits hint promises no sign-in of another Mac's account (`ATERM-KI-1105-9`).
+/// `CONTROL`: it does of the same row while the sheet names this Mac.
+#[test]
+fn the_limits_hint_promises_no_sign_in_of_another_macs_account() {
+    let f = Fixture::new(Cli::Claude, true);
+    let home = f.env.home.as_deref().unwrap();
+    let config = f.env.config.as_deref().unwrap();
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(config, "[fleet]\nmachine = \"m16\"\n").unwrap();
+    std::fs::write(
+        &f.roster,
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
+             label = \"other\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"other@example.test\"\n",
+            home.join(".aterm/logins/other").display()
+        ),
+    )
+    .unwrap();
+    let secrets = home.join(".secrets");
+    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
+    let line_with_sheet_naming = |machine: &str| {
+        std::fs::write(
+            secrets.join(crate::harness::accounts_sync::ACCOUNTS_CSV_FILE),
+            format!("email,computer,claude,notes\nother@example.test,{machine},1,\n"),
+        )
+        .unwrap();
+        limits_accounts_line(&f.env, "@s-test").unwrap()
+    };
+    let line = line_with_sheet_naming("m16");
+    assert!(line.contains("no login made yet"), "CONTROL: {line}");
+    assert!(!line.contains("gives it to"), "CONTROL: {line}");
+    let line = line_with_sheet_naming("m22");
+    assert!(!line.contains("no login made yet"), "{line}");
+    assert!(line.contains("gives it to m22"), "{line}");
+}

@@ -390,19 +390,8 @@ fn manifest_text(path: &Path) -> Option<String> {
     use std::io::Read as _;
     const LIMIT: u64 = 16 * 1024 * 1024;
 
-    if !std::fs::symlink_metadata(path).ok()?.is_file() {
-        return None;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options.open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > LIMIT {
+    let (file, metadata) = aterm_uds::regular_file::open(path).ok()?;
+    if metadata.len() > LIMIT {
         return None;
     }
     let mut text = String::with_capacity(

@@ -2599,6 +2599,41 @@ fn accounts_reply(remote: bool, head: &str, rows: Vec<String>) -> HostReply {
     }
 }
 
+/// Figures on an `unseen` row are old ones: the line says how old, so none reads as what the row
+/// uses now. CONTROL: a row read lately prints its figures alone, and one with no read time says
+/// `unseen`.
+#[test]
+fn an_unseen_rows_old_figures_say_how_old_they_are() {
+    let said = |fields: &[(&str, &str)]| {
+        let mut row = vec![
+            ("pool", "codex"),
+            ("id", "main"),
+            ("enrolled", "1"),
+            ("pct5", "-"),
+        ];
+        row.extend_from_slice(fields);
+        let reply = accounts_reply(false, " accounts=1", vec![account_row(&row)]);
+        let survey = reply.answer.expect("it parses");
+        accounts_line(&survey, false).expect("a line")
+    };
+    let week = [("pct7", "1"), ("week_reset", "1793916839")];
+    let with = |more: &[(&'static str, &'static str)]| {
+        let mut row = week.to_vec();
+        row.extend_from_slice(more);
+        said(&row)
+    };
+    // 1793130000 is the reply's own clock.
+    let old = with(&[("condition", "unseen"), ("read_at", "1793100000")]);
+    assert!(old.contains("main 7d 1% read 8h ago"), "{old}");
+    let unknown = with(&[("condition", "unseen")]);
+    assert!(unknown.contains("main 7d 1% unseen"), "{unknown}");
+    let fresh = with(&[("condition", "usable"), ("read_at", "1793129900")]);
+    assert!(
+        fresh.contains("main 7d 1%") && !fresh.contains("read "),
+        "{fresh}"
+    );
+}
+
 /// An instance's account rows parse when its header counts them, print as one line under its
 /// header, each pool it could not read named last, and go whole into `--json`; an older aterm's
 /// say nothing, which is no row.
@@ -2692,6 +2727,116 @@ fn an_instances_account_rows_parse_and_print_on_one_line() {
     assert!(render_json(std::slice::from_ref(&unknown)).contains("\"accounts\":null"));
     assert!(!render_full(&[unknown], None).contains("accounts:"));
     assert!(!render_full(&[none], None).contains("accounts:"));
+}
+
+/// An instance that says where its home is prints it with its free space and when it read its
+/// checkouts, then each checkout on a line of its own; `--json` carries every row. Rows that did
+/// not all come, a read not made yet and an older aterm say nothing of its checkouts: `null`,
+/// never `[]`.
+#[test]
+fn an_instances_home_and_checkouts_print_under_its_header() {
+    let repo_row = |fields: &[(&str, &str)]| wire_row(fields).replacen("session", "repo", 1);
+    let trust = repo_row(&[
+        ("name", "trust"),
+        ("path", "/Users//a/trust"),
+        ("head", "0123456789abcdef0123456789abcdef01234567"),
+        ("branch", "main"),
+        ("main", "origin/main"),
+        ("behind", "3"),
+        ("fetched_at", "1793122800000"),
+        ("dirty", "1"),
+    ]);
+    let aterm = repo_row(&[
+        ("name", "aterm"),
+        ("path", "/Users//a/aterm"),
+        ("head", "-"),
+        ("branch", "-"),
+        ("main", "-"),
+        ("behind", "-"),
+        ("fetched_at", "-"),
+        ("dirty", "-"),
+    ]);
+    let head = " home=/Users//a home_free_mb=831488 repos=2 repos_at=1793129820000 repos_cut=1";
+    let reply = accounts_reply(true, head, vec![trust.clone(), aterm]);
+    let survey = reply.answer.as_ref().expect("a survey");
+    assert_eq!(survey.repos.as_ref().map(Vec::len), Some(2));
+    let text = render_full(std::slice::from_ref(&reply), None);
+    assert!(
+        text.contains(
+            "\n  home /Users//a, 812 GiB free \u{b7} checkouts read 3m ago\n    trust \
+             main@0123456789ab 3 behind origin/main, fetched 2h ago, dirty\n    aterm, no HEAD \
+             read, no origin main, never fetched, status unread\n    +1 past the most a read \
+             lists, not read\n"
+        ),
+        "{text}"
+    );
+    assert_line_caps(&text);
+    let json = render_json(std::slice::from_ref(&reply));
+    assert!(
+        json.contains(
+            "\"repos\":[{\"name\":\"trust\",\"path\":\"/Users//a/trust\",\"head\":\
+             \"0123456789abcdef0123456789abcdef01234567\""
+        ),
+        "{json}"
+    );
+    assert!(json.contains("\"home_free_mb\":"), "{json}");
+
+    let none = accounts_reply(
+        true,
+        " home=/Users//a repos=0 repos_at=1793043600000 repos_cut=0",
+        Vec::new(),
+    );
+    assert!(render_json(std::slice::from_ref(&none)).contains("\"repos\":[]"));
+    assert!(
+        render_full(&[none], None)
+            .contains("\n  home /Users//a \u{b7} checkouts read 1d ago: none\n")
+    );
+    for (head, rows, said) in [
+        (
+            " home=/Users//a repos=- repos_at=- repos_cut=-",
+            Vec::new(),
+            "not read yet",
+        ),
+        (
+            " home=/Users//a repos=2 repos_at=1 repos_cut=0",
+            vec![trust.clone()],
+            "cut from this reply (--json has none either)",
+        ),
+        (
+            " home=/Users//a repos=0 repos_at=1 repos_cut=0",
+            vec![trust.clone()],
+            "cut from this reply (--json has none either)",
+        ),
+    ] {
+        let unknown = accounts_reply(true, head, rows);
+        assert_eq!(unknown.answer.as_ref().unwrap().repos, None, "{head}");
+        assert!(render_json(std::slice::from_ref(&unknown)).contains("\"repos\":null"));
+        let text = render_full(&[unknown], None);
+        assert!(
+            text.contains(&format!("\n  home /Users//a \u{b7} checkouts {said}\n")),
+            "{head}: {text}"
+        );
+    }
+    let older = accounts_reply(true, "", vec![trust]);
+    assert_eq!(older.answer.as_ref().unwrap().repos, None);
+    assert!(render_json(std::slice::from_ref(&older)).contains("\"repos\":null"));
+    assert!(!render_full(&[older], None).contains("  home "));
+
+    // Past the most a block lists, the rest are counted.
+    let many: Vec<String> = (0..CHECKOUTS_SHOWN + 2)
+        .map(|n| repo_row(&[("name", format!("r{n:02}").as_str()), ("head", "-")]))
+        .collect();
+    let crowded = accounts_reply(
+        true,
+        &format!(" home=/Users//a repos={} repos_at=1 repos_cut=0", many.len()),
+        many,
+    );
+    let text = render_full(&[crowded], None);
+    assert!(
+        text.contains("\n    +2 more (--json lists each)\n"),
+        "{text}"
+    );
+    assert!(!text.contains(&format!("r{CHECKOUTS_SHOWN:02}")), "{text}");
 }
 
 /// A peer's label that is an email is masked, and any other that is no plain word shows as `?`.

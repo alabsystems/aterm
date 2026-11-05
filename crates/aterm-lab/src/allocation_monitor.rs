@@ -6,8 +6,10 @@
 
 use aterm_capacity::{
     Admit, Ledger, Pace,
+    build_cpu::{Owner as CpuOwner, RetainedPool, RetainedSlotState},
     cohort_namespace::Namespace,
-    host_protocol::{Attempt, Phase as NativePhase, Snapshot},
+    epoch_controller::Config as EpochConfig,
+    host_protocol::{Attempt, Epoch, Phase as NativePhase, Snapshot},
     leadership::Fence,
 };
 use aterm_uds::spawnfd::{self, Stdio};
@@ -15,7 +17,7 @@ use atpkg::build_admit::{
     self, Admission, JobControl, Seat,
     host::Completion,
     service::{
-        Owner,
+        EpochId, Owner,
         monitor::{EventKind, Exchange, Progress, RecordSummary},
     },
 };
@@ -23,6 +25,7 @@ use atpkg::build_cache::Tool;
 use std::{
     collections::BTreeMap,
     fs, io,
+    num::NonZeroU32,
     os::fd::OwnedFd,
     path::{Path, PathBuf},
     sync::{
@@ -41,11 +44,23 @@ use crate::{
     trail_gallery::{self, ReplyShape, image_bytes, relay_reply},
 };
 
+#[cfg(debug_assertions)]
+#[path = "allocation_monitor_cache_work.rs"]
+mod cache_work;
+
+#[cfg(debug_assertions)]
+#[path = "allocation_monitor_paint.rs"]
+mod paint;
+
 const HANG: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(25);
+/// Conservative GUI/keeper reservation, independently of the actual builds'
+/// resource claims. The run records their kernel lifetime peaks separately;
+/// this configured budget is not presented as a measured peak.
+const WINDOW_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const SCRIPT: &str = r#"
 fn main() {
-    let world = std::path::PathBuf::from(std::env::var_os("ALLOCATION_MONITOR_BUILD").unwrap());
+    let world = std::path::PathBuf::from(BARRIER_PATH);
     std::fs::write(world.join("ready"), b"actual compiled build script running").unwrap();
     let began = std::time::Instant::now();
     while !world.join("release").exists() {
@@ -56,16 +71,22 @@ fn main() {
 }
 "#;
 
-pub const HELP: &str = "allocation-monitor --aterm PATH --targo PATH --out DIR [--look dark|light] [--keep]\n\
+pub const HELP: &str = "allocation-monitor --aterm PATH --targo PATH --sdk-bin ABS --out DIR [--look dark|light] [--keep]\n\
 Open one private real window, build two actual Targo projects behind readiness barriers,\n\
-attach the read-only monitor once through authenticated local control, preserve two-build\n\
-and one-build PNG/layout observations with the same attachment and exact completed outcome,\n\
-close Allocation while the\n\
-peer remains owned, then finish it and run both emitted programs. Functional evidence only.\n";
+attach the read-only monitor once through authenticated local control, and preserve two-build\n\
+and one-build PNG/layout observations with the exact completed outcome. Then observe a real\n\
+private N=2/R=1 epoch live and fully settled beside the still-held peer through that same\n\
+attachment. Close Allocation before releasing the peer, then run all three emitted programs\n\
+and verify ledger drain. Reopen through the same attachment for actual prepared cold and warm\n\
+harness costs, with unchanged script counters and dependency bytes. Requires a debug lab and\n\
+an immutable capable SDK whose targo is --targo. Functional window admission reserves\n\
+2 GiB and coordinates with other updated lab runs; it supplies no timing evidence and\n\
+refuses --admit now. No global CPU-pool activation.\n";
 
 struct Args {
     aterm: Option<String>,
     targo: PathBuf,
+    sdk_bin: PathBuf,
     out: PathBuf,
     light: bool,
     keep: bool,
@@ -75,6 +96,7 @@ fn parse(args: &[String]) -> Result<Args, Fail> {
     let mut args = args.to_vec();
     let aterm = instance::take_value(&mut args, "--aterm")?;
     let targo = instance::take_value(&mut args, "--targo")?.ok_or_else(|| Fail::usage(HELP))?;
+    let sdk_bin = instance::take_value(&mut args, "--sdk-bin")?.ok_or_else(|| Fail::usage(HELP))?;
     let out = instance::take_value(&mut args, "--out")?.ok_or_else(|| Fail::usage(HELP))?;
     let look = instance::take_value(&mut args, "--look")?.unwrap_or_else(|| "dark".into());
     let keep = instance::take_flag(&mut args, "--keep");
@@ -88,12 +110,25 @@ fn parse(args: &[String]) -> Result<Args, Fail> {
             "--targo must name the actual Trust targo image",
         ));
     }
+    if !Path::new(&sdk_bin).is_absolute() {
+        return Err(Fail::usage(
+            "--sdk-bin must be an absolute immutable SDK bin directory",
+        ));
+    }
+    let sdk_bin =
+        fs::canonicalize(&sdk_bin).map_err(|e| Fail::die(format!("resolve SDK bin: {e}")))?;
+    if !sdk_bin.is_dir() || fs::canonicalize(sdk_bin.join("targo")).ok().as_ref() != Some(&targo) {
+        return Err(Fail::usage(
+            "--targo must be the selected --sdk-bin/targo image",
+        ));
+    }
     let out =
         trail_gallery::resolve_out(&from_caller(&out), &trail_gallery::checkouts(&paths().repo))
             .map_err(Fail::die)?;
     Ok(Args {
         aterm,
         targo,
+        sdk_bin,
         out,
         light: look == "light",
         keep,
@@ -104,7 +139,7 @@ struct Release(Vec<PathBuf>);
 impl Drop for Release {
     fn drop(&mut self) {
         for path in &self.0 {
-            let _ = fs::write(path.join("release"), b"parent cleanup");
+            let _ = crate::util::write_fresh(&path.join("release"), b"parent cleanup");
         }
     }
 }
@@ -187,27 +222,36 @@ impl Drop for IoWorker {
     }
 }
 
-fn prepare_project(path: &Path) -> io::Result<()> {
-    fs::create_dir(path)?;
-    fs::create_dir(path.join("src"))?;
-    fs::write(
-        path.join("Cargo.toml"),
-        "[package]\nname='allocation_probe'\nversion='0.0.0'\nedition='2024'\n[workspace]\n",
-    )?;
-    fs::write(
-        path.join("src/main.rs"),
-        "fn main() { assert_eq!((0..10).sum::<u64>(), 45); println!(\"allocation-probe-ok\"); }\n",
-    )?;
-    fs::write(path.join("build.rs"), SCRIPT)
+fn build_script(barrier: Option<&Path>) -> io::Result<String> {
+    let expression = match barrier {
+        Some(path) => format!(
+            "{:?}",
+            path.to_str()
+                .ok_or_else(|| io::Error::other("build barrier path is not UTF-8"))?
+        ),
+        None => "std::env::var_os(\"ALLOCATION_MONITOR_BUILD\").unwrap()".into(),
+    };
+    Ok(SCRIPT.replace("BARRIER_PATH", &expression))
 }
 
-fn submit_projects(
-    world: &World,
-    targo: &Path,
-    namespace: &Namespace,
-    engine: &mut Engine,
-    release: &mut Release,
-) -> Result<Vec<Attempt>, String> {
+fn prepare_project(path: &Path, embedded_barrier: bool) -> io::Result<()> {
+    fs::create_dir(path)?;
+    fs::create_dir(path.join("src"))?;
+    crate::util::write_fresh(
+        &path.join("Cargo.toml"),
+        "[package]\nname='allocation_probe'\nversion='0.0.0'\nedition='2024'\n[workspace]\n",
+    )?;
+    crate::util::write_fresh(
+        &path.join("src/main.rs"),
+        "fn main() { assert_eq!((0..10).sum::<u64>(), 45); println!(\"allocation-probe-ok\"); }\n",
+    )?;
+    crate::util::write_fresh(
+        &path.join("build.rs"),
+        build_script(embedded_barrier.then_some(path))?,
+    )
+}
+
+fn admit_project(path: &Path, namespace: &Namespace) -> Result<build_admit::Held, String> {
     let machine = aterm_capacity::Live;
     let seat = Seat {
         ledger: Some(Ledger::at(namespace.fence())),
@@ -221,17 +265,25 @@ fn submit_projects(
     };
     let build = build_admit::classify(&["--unverified".into(), "build".into()], Tool::Targo)
         .ok_or("Targo build classifier refused")?;
+    match build_admit::admit_cohort_job(&build, path, &seat, &mut |line| eprintln!("{line}")) {
+        Admission::Claimed(held) => Ok(*held),
+        other => Err(format!("private native admission refused: {other:?}")),
+    }
+}
+
+fn submit_projects(
+    world: &World,
+    targo: &Path,
+    namespace: &Namespace,
+    engine: &mut Engine,
+    release: &mut Release,
+) -> Result<Vec<Attempt>, String> {
     let mut attempts = Vec::new();
     for index in 0..2 {
         let path = world.dir.join(format!("build-{index}.noindex"));
-        prepare_project(&path).map_err(|e| format!("prepare project: {e}"))?;
+        prepare_project(&path, false).map_err(|e| format!("prepare project: {e}"))?;
         release.0.push(path.clone());
-        let held = match build_admit::admit_cohort_job(&build, &path, &seat, &mut |line| {
-            eprintln!("{line}")
-        }) {
-            Admission::Claimed(held) => *held,
-            other => return Err(format!("private native admission refused: {other:?}")),
-        };
+        let held = admit_project(&path, namespace)?;
         let mut command = spawnfd::transparent(targo).into_command();
         command
             .args(["--unverified", "build", "--offline", "--target-dir"])
@@ -245,7 +297,8 @@ fn submit_projects(
             .current_dir(&path)
             .stdout(Stdio::null())
             .stderr(Stdio::from(
-                fs::File::create(path.join("compiler.log")).map_err(|e| e.to_string())?,
+                crate::util::create_stdio_file(&path.join("compiler.log"))
+                    .map_err(|e| e.to_string())?,
             ));
         let attempt = engine
             .owner
@@ -263,6 +316,236 @@ fn submit_projects(
             return Err("actual Targo build scripts did not reach both barriers".into());
         }
         stop::sleep(POLL).map_err(|e| format!("interrupted: {e:?}"))?;
+    }
+}
+
+struct EpochBuild {
+    id: EpochId,
+    pool: RetainedPool,
+    project: PathBuf,
+    transport: PathBuf,
+    admitted_bytes: u64,
+}
+
+impl EpochBuild {
+    fn start(
+        world: &World,
+        targo: &Path,
+        namespace: &Namespace,
+        engine: &mut Engine,
+        release: &mut Release,
+    ) -> Result<Self, String> {
+        let project = world.dir.join("epoch-build.noindex");
+        // Epoch roots have no per-command environment extension. The original
+        // compiled fixture embeds its private barrier instead of relying on one.
+        prepare_project(&project, true).map_err(|e| format!("prepare epoch project: {e}"))?;
+        release.0.push(project.clone());
+        let held = admit_project(&project, namespace)?;
+        let admitted_bytes = held.claim().record().need.mem;
+        let pool = RetainedPool::create_private(
+            &world.dir.join("epoch-cpu.noindex"),
+            NonZeroU32::new(2).expect("two original CPU units"),
+        )
+        .map_err(|e| format!("private epoch CPU pool: {e}"))?;
+        let mut cpu = Vec::new();
+        for _ in 0..2 {
+            cpu.push(
+                pool.try_acquire(CpuOwner::current(None))
+                    .map_err(|e| e.to_string())?
+                    .ok_or("fresh private CPU backing unavailable")?,
+            );
+        }
+        let transport = world.dir.join("epoch-transport.noindex");
+        let accepted = engine
+            .owner
+            .submit_epoch(
+                held,
+                cpu,
+                EpochConfig {
+                    helper: targo.to_owned(),
+                    directory: transport.clone(),
+                    epoch: aterm_uds::rand::hex_token::<16>().map_err(|e| e.to_string())?,
+                    roots: 1,
+                },
+            )
+            .map_err(|e| format!("submit original epoch custody: {e}"))?;
+        accepted
+            .result
+            .map_err(|e| format!("accepted epoch {} launch: {e}", accepted.id.sequence()))?;
+        let until = Instant::now() + HANG;
+        loop {
+            engine.live(1)?;
+            if engine
+                .owner
+                .epoch_status(&accepted.id)
+                .map_err(|e| e.to_string())?
+                .opened
+            {
+                break;
+            }
+            if Instant::now() >= until {
+                return Err("actual Targo epoch helper did not open".into());
+            }
+            engine.owner.wait(until).map_err(|e| e.to_string())?;
+        }
+        engine
+            .owner
+            .epoch_spawn_root(
+                &accepted.id,
+                0,
+                &project.join("Cargo.toml"),
+                &project.join("target.noindex"),
+            )
+            .map_err(|e| format!("spawn original epoch root: {e}"))?;
+        engine
+            .owner
+            .epoch_close(&accepted.id)
+            .map_err(|e| format!("close original epoch: {e}"))?;
+        let until = Instant::now() + HANG;
+        loop {
+            engine.live(1)?;
+            if project.join("ready").is_file() {
+                break;
+            }
+            if Instant::now() >= until {
+                return Err("actual epoch build script did not reach its barrier".into());
+            }
+            // A held build script creates this file without a native exit or
+            // pipe frame. Keep driving queued commands while checking its barrier.
+            stop::sleep(POLL).map_err(|e| format!("interrupted: {e:?}"))?;
+        }
+        Ok(Self {
+            id: accepted.id,
+            pool,
+            project,
+            transport,
+            admitted_bytes,
+        })
+    }
+
+    fn snapshot(&self, engine: &Engine, peer: Attempt, settled: bool) -> Result<Snapshot, String> {
+        let snapshot = (*engine
+            .owner
+            .observer()
+            .read(None)
+            .map_err(|e| format!("epoch snapshot: {e:?}"))?
+            .snapshot)
+            .clone();
+        let expected = Epoch {
+            sequence: self.id.sequence(),
+            backing: 2,
+            roots: 1,
+            reserved_bytes: self.admitted_bytes,
+            opened: true,
+            retired: settled,
+            helper_exited: settled,
+            control_eof: settled,
+            endpoint_cleaned: settled,
+            settled_units: if settled { 2 } else { 0 },
+            uncertain_units: 0,
+            remaining_units: if settled { 0 } else { 2 },
+            completed_roots: u32::from(settled),
+            failed_roots: 0,
+            faulted: false,
+            unbound: false,
+            not_spawned: false,
+            cancellation_started: false,
+            failure: None,
+            cache_work: Vec::new(),
+        };
+        if snapshot.generation != peer.generation
+            || snapshot.closed
+            || snapshot.jobs.len() != 1
+            || snapshot.jobs[0].attempt != peer.sequence
+            || snapshot.epochs != [expected]
+        {
+            return Err(format!(
+                "actual epoch/held-peer snapshot mismatch: {snapshot:?}"
+            ));
+        }
+        let states = self.pool.snapshot().map_err(|e| e.to_string())?;
+        if states.len() != 2
+            || !states.iter().all(|state| {
+                if settled {
+                    matches!(state, RetainedSlotState::Available { .. })
+                } else {
+                    matches!(state, RetainedSlotState::Held { .. })
+                }
+            })
+        {
+            return Err(format!("private epoch CPU inventory mismatch: {states:?}"));
+        }
+        Ok(snapshot)
+    }
+
+    fn finish(&self, engine: &mut Engine) -> Result<(), String> {
+        crate::util::write_fresh(
+            &self.project.join("release"),
+            b"observe original epoch settlement",
+        )
+        .map_err(|e| e.to_string())?;
+        let until = Instant::now() + HANG;
+        loop {
+            engine.live(1)?;
+            let status = engine
+                .owner
+                .epoch_status(&self.id)
+                .map_err(|e| e.to_string())?;
+            if status.settled_units == 2 {
+                break;
+            }
+            if status.faulted || status.uncertain_units != 0 || Instant::now() >= until {
+                return Err(format!("original epoch failed to settle: {status:?}"));
+            }
+            engine.owner.wait(until).map_err(|e| e.to_string())?;
+        }
+        let outcome = engine
+            .owner
+            .epoch_root_outcome(&self.id, 0)
+            .map_err(|e| e.to_string())?
+            .ok_or("settled epoch lost its actual root outcome")?;
+        let history_only = engine
+            .owner
+            .epoch_close(&self.id)
+            .is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists);
+        if !outcome.success || outcome.code != Some(0) || !history_only {
+            return Err(format!(
+                "settled epoch did not retain successful read-only history: {outcome:?}"
+            ));
+        }
+        match fs::symlink_metadata(self.transport.join("credits.fifo")) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            other => return Err(format!("settled original FIFO was not removed: {other:?}")),
+        }
+        let mut restored = Vec::new();
+        for _ in 0..2 {
+            restored.push(
+                self.pool
+                    .try_acquire(CpuOwner::current(None))
+                    .map_err(|e| e.to_string())?
+                    .ok_or("original epoch did not restore both CPU units")?,
+            );
+        }
+        if restored[0].slot() == restored[1].slot()
+            || self
+                .pool
+                .try_acquire(CpuOwner::current(None))
+                .map_err(|e| e.to_string())?
+                .is_some()
+        {
+            return Err("restored private pool did not conserve exactly N=2".into());
+        }
+        // These newly acquired capabilities backed no work. Only the original
+        // controller settled the epoch's original capabilities after closure.
+        for cap in restored {
+            cap.settle().map_err(|e| e.to_string())?;
+        }
+        crate::util::copy_regular_file(
+            self.transport.join("root-0.stderr"),
+            self.project.join("compiler.log"),
+        )
+        .map_err(|e| format!("preserve epoch compiler log: {e}"))?;
+        Ok(())
     }
 }
 
@@ -319,6 +602,118 @@ fn monitor_projection(text: &str, prefix: &str, field: &str) -> Option<BTreeMap<
     Some(rows)
 }
 
+fn epoch_projection(epoch: &Epoch) -> Option<BTreeMap<String, String>> {
+    use aterm_capacity::cache_work::{Availability, UnavailableReason};
+    let yes = |flag| if flag { "yes" } else { "no" };
+    let launch = if epoch.cancellation_started {
+        " · launch cancellation started"
+    } else if epoch.not_spawned {
+        " · no child spawned; cancellation pending"
+    } else if epoch.unbound {
+        " · child held; durable binding pending"
+    } else {
+        ""
+    };
+    let fault = if epoch.faulted {
+        " · protocol fault"
+    } else {
+        ""
+    };
+    let failure = epoch.failure.map_or_else(String::new, |failure| {
+        format!(" · owner error {:?}", failure.kind)
+    });
+    let cleanup = match (epoch.cancellation_started, epoch.endpoint_cleaned) {
+        (true, true) => "unlaunched cleanup confirmed",
+        (true, false) => "unlaunched cleanup pending",
+        (false, true) => "group drain + endpoint cleanup confirmed",
+        (false, false) => "group drain + endpoint cleanup pending",
+    };
+    let mut rows: BTreeMap<_, _> = [
+        ("budget", format!("Epoch {} · CPU backing N={} · root slots R={} · original admitted memory peak {} bytes ({:.1} GiB)", epoch.sequence, epoch.backing, epoch.roots, epoch.reserved_bytes, epoch.reserved_bytes as f64 / (1024.0 * 1024.0 * 1024.0))),
+        ("roots", format!("Roots: {} completed of {} slots · {} failed{launch}{fault}{failure}", epoch.completed_roots, epoch.roots, epoch.failed_roots)),
+        ("transport", format!("Transport: opened {} · Retired {} · helper exited {} · output ended {}", yes(epoch.opened), yes(epoch.retired), yes(epoch.helper_exited), yes(epoch.control_eof))),
+        ("backing", format!("CPU backing: {} returned · {} remaining · {} uncertain · {cleanup}", epoch.settled_units, epoch.remaining_units, epoch.uncertain_units)),
+    ].into_iter().map(|(part, label)| (format!("allocation/monitor/epoch/{}/{part}", epoch.sequence), label)).collect();
+    for record in &epoch.cache_work {
+        let key = |part| {
+            format!(
+                "allocation/monitor/epoch/{}/root/{}/cache/{part}",
+                epoch.sequence, record.root
+            )
+        };
+        let prefix = format!("Root {} · Historical cache validation", record.root);
+        let mut put = |part, value| rows.insert(key(part), value).is_none().then_some(());
+        match (&record.summary, record.unavailable) {
+            (None, Some(reason)) => {
+                let reason = match reason {
+                    UnavailableReason::NotRecorded => "not recorded",
+                    UnavailableReason::UnsupportedDriver => "unsupported driver",
+                    UnavailableReason::MissingSession => "session marker missing",
+                    UnavailableReason::AmbiguousSession => "session marker ambiguous",
+                    UnavailableReason::QueryFailed => "report query failed",
+                    UnavailableReason::InvalidReport => "invalid report",
+                    UnavailableReason::PersistenceFailed => "report persistence failed",
+                };
+                put("availability", format!("{prefix}: unavailable · {reason}"))?;
+            }
+            (Some(summary), None) => {
+                summary.validate().ok()?;
+                let availability = match summary.availability {
+                    Availability::Complete => "complete",
+                    Availability::UnavailableLegacyLog => "legacy log unavailable",
+                };
+                put(
+                    "availability",
+                    format!(
+                        "{prefix} · run {} · scope {} · {availability}",
+                        summary.run_id,
+                        summary.scope()
+                    ),
+                )?;
+                if let Some(work) = summary.totals {
+                    let d = summary.denominators;
+                    put(
+                        "coverage",
+                        format!(
+                            "Build-script input work: {} observed of {} script units · {} registered units · {} capture attempts · {} uncacheable",
+                            d.observed_units,
+                            d.run_script_units,
+                            d.registered_units,
+                            d.attempts_finished,
+                            d.uncacheable_attempts
+                        ),
+                    )?;
+                    put(
+                        "work",
+                        format!(
+                            "Inputs: {} bytes hashed · {} metadata reads · {} revalidations",
+                            work.bytes_hashed, work.metadata_reads, work.revalidations
+                        ),
+                    )?;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let not_recorded = epoch
+        .completed_roots
+        .checked_sub(u32::try_from(epoch.cache_work.len()).ok()?)?;
+    if not_recorded != 0 || epoch.cache_work.is_empty() {
+        rows.insert(
+            format!(
+                "allocation/monitor/epoch/{}/cache/not-recorded",
+                epoch.sequence
+            ),
+            if not_recorded == 0 {
+                "Cache validation: no completed-root report recorded".into()
+            } else {
+                format!("Cache validation: not recorded for {not_recorded} completed roots")
+            },
+        );
+    }
+    Some(rows)
+}
+
 fn matches_snapshot(text: &str, expected: &Snapshot, attachment: u64) -> bool {
     let audit = text.lines().any(|line| line.starts_with("paint-node "));
     let Some(rows) = monitor_projection(text, if audit { "paint-node " } else { "text " }, "label")
@@ -329,6 +724,17 @@ fn matches_snapshot(text: &str, expected: &Snapshot, attachment: u64) -> bool {
     // are two witnesses of the same rows, never twice as many owned attempts.
     if audit && monitor_projection(text, "paint-text ", "painted").as_ref() != Some(&rows) {
         return false;
+    }
+    let mut epochs = BTreeMap::new();
+    for epoch in &expected.epochs {
+        let Some(projected) = epoch_projection(epoch) else {
+            return false;
+        };
+        for (key, label) in projected {
+            if epochs.insert(key, label).is_some() {
+                return false;
+            }
+        }
     }
     let generation: String = expected
         .generation
@@ -367,6 +773,14 @@ fn matches_snapshot(text: &str, expected: &Snapshot, attachment: u64) -> bool {
                     ))
                 })
         })
+        && rows
+            .keys()
+            .filter(|key| key.starts_with("allocation/monitor/epoch/"))
+            .count()
+            == epochs.len()
+        && epochs
+            .iter()
+            .all(|(key, label)| rows.get(key) == Some(label))
 }
 
 struct Scene<'a> {
@@ -475,7 +889,10 @@ fn capture(
         )?;
         last_audit.clone_from(&audit);
         let shape = crate::system_state_gallery::layout_shape(&audit);
-        if !shape.is_empty() && previous.as_ref() == Some(&shape) {
+        if !shape.is_empty()
+            && previous.as_ref() == Some(&shape)
+            && matches_scene(&audit, expected, attachment)
+        {
             let shot = require(
                 relay_reply(
                     &mut wire,
@@ -494,10 +911,15 @@ fn capture(
             if crate::system_state_gallery::layout_shape(&after) == shape
                 && matches_scene(&after, expected, attachment)
             {
-                fs::write(out.join("allocation.png"), png).map_err(|e| e.to_string())?;
-                fs::write(out.join("allocation.layout.txt"), after).map_err(|e| e.to_string())?;
-                fs::write(out.join("allocation.image-meta.txt"), format!("{meta}\n"))
+                crate::util::write_fresh(&out.join("allocation.png"), png)
                     .map_err(|e| e.to_string())?;
+                crate::util::write_fresh(&out.join("allocation.layout.txt"), after)
+                    .map_err(|e| e.to_string())?;
+                crate::util::write_fresh(
+                    &out.join("allocation.image-meta.txt"),
+                    format!("{meta}\n"),
+                )
+                .map_err(|e| e.to_string())?;
                 return Ok(());
             }
         }
@@ -512,6 +934,14 @@ fn capture(
 }
 
 fn run(args: Args) -> Result<(), String> {
+    if !cfg!(debug_assertions) {
+        return Err(
+            "allocation-monitor requires a debug lab for its real prepared-harness fixture".into(),
+        );
+    }
+    if fs::canonicalize(args.sdk_bin.join("targo")).ok().as_ref() != Some(&args.targo) {
+        return Err("selected SDK driver changed after argument validation".into());
+    }
     fs::create_dir_all(&args.out).map_err(|e| e.to_string())?;
     if fs::read_dir(&args.out)
         .map_err(|e| e.to_string())?
@@ -540,13 +970,13 @@ fn run(args: Args) -> Result<(), String> {
     // Preserve failed inputs/logs. Successful runs release the world only after
     // all children have ended, unless the caller requested --keep.
     world.keep();
-    fs::write(
-        args.out.join("world.txt"),
+    crate::util::write_fresh(
+        &args.out.join("world.txt"),
         format!("{}\n", world.dir.display()),
     )
     .map_err(|e| e.to_string())?;
     let aterm = instance::resolve_aterm(args.aterm)?;
-    let mut inst = Instance::start(
+    let mut inst = Instance::start_functional(
         &world,
         Launch {
             aterm,
@@ -562,9 +992,15 @@ fn run(args: Args) -> Result<(), String> {
             sandbox: None,
             reroute: false,
         },
+        WINDOW_MEMORY_BYTES,
     )?;
     inst.await_socket(instance::BOOT)
         .map_err(|e| format!("GUI startup: {e:?}"))?;
+    let gui_pid = inst.aterm_pid().ok_or("private GUI has no live process")?;
+    let gui_start = crate::sys::rusage(gui_pid)
+        .filter(|usage| usage.ri_proc_start_abstime != 0)
+        .ok_or("private GUI has no kernel usage observation")?
+        .ri_proc_start_abstime;
     require(
         inst.ctl(&["appearance", if args.light { "light" } else { "dark" }]),
         "appearance",
@@ -596,8 +1032,8 @@ fn run(args: Args) -> Result<(), String> {
     }
     let two_out = args.out.join("two-builds");
     fs::create_dir(&two_out).map_err(|e| e.to_string())?;
-    fs::write(
-        two_out.join("owner.snapshot.json"),
+    crate::util::write_fresh(
+        &two_out.join("owner.snapshot.json"),
         expected.encode().map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
@@ -619,13 +1055,14 @@ fn run(args: Args) -> Result<(), String> {
         recent: &[],
     };
     let (view, index, text) = observe(&inst, &two_scene, &mut engine, 0, queued)?;
-    fs::write(two_out.join("allocation.text.txt"), text).map_err(|e| e.to_string())?;
+    crate::util::write_fresh(&two_out.join("allocation.text.txt"), text)
+        .map_err(|e| e.to_string())?;
     capture(&inst, view, &two_out, &mut engine, &two_scene, 0, queued)?;
 
     // The existing delegated connection must carry the transition. There is no
     // second attachment or probe: only the first real build is released.
-    fs::write(
-        release.0[0].join("release"),
+    crate::util::write_fresh(
+        &release.0[0].join("release"),
         b"observe first build completion",
     )
     .map_err(|e| e.to_string())?;
@@ -689,13 +1126,13 @@ fn run(args: Args) -> Result<(), String> {
     }
     let one_out = args.out.join("one-build");
     fs::create_dir(&one_out).map_err(|e| e.to_string())?;
-    fs::write(
-        one_out.join("owner.snapshot.json"),
+    crate::util::write_fresh(
+        &one_out.join("owner.snapshot.json"),
         remaining.encode().map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    fs::write(
-        one_out.join("owner.completions.txt"),
+    crate::util::write_fresh(
+        &one_out.join("owner.completions.txt"),
         format!("{recent:#?}\n"),
     )
     .map_err(|e| e.to_string())?;
@@ -707,8 +1144,93 @@ fn run(args: Args) -> Result<(), String> {
     if next_view != view || next_index != index {
         return Err("continuous observation replaced the Allocation view".into());
     }
-    fs::write(one_out.join("allocation.text.txt"), text).map_err(|e| e.to_string())?;
+    crate::util::write_fresh(&one_out.join("allocation.text.txt"), text)
+        .map_err(|e| e.to_string())?;
     capture(&inst, view, &one_out, &mut engine, &one_scene, 1, queued)?;
+
+    // The same original owner and monitor connection carry real retained epoch
+    // work beside the still-held ordinary peer. No second monitor is attached.
+    let epoch = EpochBuild::start(&world, &args.targo, &namespace, &mut engine, &mut release)?;
+    let epoch_live = epoch.snapshot(&engine, attempts[1], false)?;
+    if epoch_live.revision <= remaining.revision
+        || epoch
+            .pool
+            .try_acquire(CpuOwner::current(None))
+            .map_err(|e| e.to_string())?
+            .is_some()
+        || release.0[1].join("release").exists()
+    {
+        return Err("live epoch did not retain original CPU backing beside the held peer".into());
+    }
+    let epoch_out = args.out.join("live-epoch");
+    fs::create_dir(&epoch_out).map_err(|e| e.to_string())?;
+    crate::util::write_fresh(
+        &epoch_out.join("owner.snapshot.json"),
+        epoch_live.encode().map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let epoch_scene = Scene {
+        snapshot: &epoch_live,
+        recent: &recent,
+    };
+    let (next_view, next_index, text) = observe(&inst, &epoch_scene, &mut engine, 1, queued)?;
+    if next_view != view || next_index != index {
+        return Err("live epoch observation replaced the Allocation view".into());
+    }
+    crate::util::write_fresh(&epoch_out.join("allocation.text.txt"), text)
+        .map_err(|e| e.to_string())?;
+    capture(
+        &inst,
+        view,
+        &epoch_out,
+        &mut engine,
+        &epoch_scene,
+        1,
+        queued,
+    )?;
+
+    epoch.finish(&mut engine)?;
+    let epoch_settled = epoch.snapshot(&engine, attempts[1], true)?;
+    if epoch_settled.revision <= epoch_live.revision || release.0[1].join("release").exists() {
+        return Err("original epoch settlement did not precede ordinary peer release".into());
+    }
+    let settled_out = args.out.join("settled-epoch");
+    fs::create_dir(&settled_out).map_err(|e| e.to_string())?;
+    crate::util::write_fresh(
+        &settled_out.join("owner.snapshot.json"),
+        epoch_settled.encode().map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    crate::util::write_fresh(
+        &settled_out.join("owner.root-outcome.txt"),
+        format!(
+            "{:?}\n",
+            engine
+                .owner
+                .epoch_root_outcome(&epoch.id, 0)
+                .map_err(|e| e.to_string())?
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    let settled_scene = Scene {
+        snapshot: &epoch_settled,
+        recent: &recent,
+    };
+    let (next_view, next_index, text) = observe(&inst, &settled_scene, &mut engine, 1, queued)?;
+    if next_view != view || next_index != index {
+        return Err("settled epoch observation replaced the Allocation view".into());
+    }
+    crate::util::write_fresh(&settled_out.join("allocation.text.txt"), text)
+        .map_err(|e| e.to_string())?;
+    capture(
+        &inst,
+        view,
+        &settled_out,
+        &mut engine,
+        &settled_scene,
+        1,
+        queued,
+    )?;
     require(
         inst.ctl(&["tab", "close", &index.to_string()]),
         "close Allocation",
@@ -731,7 +1253,7 @@ fn run(args: Args) -> Result<(), String> {
     if !inst.running() {
         return Err("closing Allocation unexpectedly stopped the private GUI".into());
     }
-    fs::write(release.0[1].join("release"), b"panel closed; finish peer")
+    crate::util::write_fresh(&release.0[1].join("release"), b"panel closed; finish peer")
         .map_err(|e| e.to_string())?;
     let until = Instant::now() + HANG;
     while !engine.owner.is_empty() {
@@ -761,7 +1283,7 @@ fn run(args: Args) -> Result<(), String> {
         if !output.status.success() || output.stdout != b"allocation-probe-ok\n" {
             return Err("emitted program failed".into());
         }
-        fs::copy(
+        crate::util::copy_regular_file(
             path.join("compiler.log"),
             args.out.join(format!(
                 "{}.compiler.log",
@@ -777,10 +1299,49 @@ fn run(args: Args) -> Result<(), String> {
     {
         return Err("private cohort ledger did not conclusively drain".into());
     }
+    // Keep the peer's original sixty-second barrier bounded to the original
+    // scenes. Reopening reuses the original Source, Exchange and attachment.
+    #[cfg(debug_assertions)]
+    cache_work::run(
+        &cache_work::Original {
+            world: &world,
+            out: &args.out,
+            targo: &args.targo,
+            sdk_bin: &args.sdk_bin,
+            namespace: &namespace,
+            inst: &inst,
+            attachment: queued,
+            generation: expected.generation,
+        },
+        &mut engine,
+    )?;
     io.finish()?;
-    inst.stop();
-    fs::copy(&inst.log, args.out.join("gui.log")).map_err(|e| e.to_string())?;
-    fs::write(args.out.join("result.txt"), format!("PASS\nattachment={queued}\nattachments=1\nobserved_generation={}\ninitial_revision={}\nremaining_revision={}\nobserved_transition=2->1\ncompleted_attempt={}\ncompletion_revision={}\ncompletion_visible_before_peer_release=true\nactual_builds=2\nemitted_programs=2\npanel_closed_before_peer_release=true\nledger_drained=true\nlook={}\n", expected.generation.0.iter().map(|b| format!("{b:02x}")).collect::<String>(), expected.revision, remaining.revision, attempts[0].sequence, recent[0].revision, if args.light { "light" } else { "dark" })).map_err(|e| e.to_string())?;
+    let gui_usage = crate::sys::rusage(gui_pid)
+        .filter(|usage| usage.ri_proc_start_abstime == gui_start)
+        .ok_or("private GUI lost its original kernel usage identity")?;
+    let keeper_usage =
+        crate::sys::rusage(inst.pid).ok_or("private keeper has no kernel usage observation")?;
+    let gui_peak = gui_usage.ri_lifetime_max_phys_footprint;
+    let keeper_peak = keeper_usage.ri_lifetime_max_phys_footprint;
+    if gui_peak == 0
+        || keeper_peak == 0
+        || gui_peak.saturating_add(keeper_peak) > WINDOW_MEMORY_BYTES
+    {
+        return Err(format!(
+            "native memory observation unavailable or exceeds reservation: GUI {gui_peak}, keeper {keeper_peak}, reserved {WINDOW_MEMORY_BYTES}"
+        ));
+    }
+    crate::util::write_fresh(
+        &args.out.join("window-memory.txt"),
+        format!(
+            "admission=functional\ntiming_qualified=false\nconfigured_reserved_bytes={WINDOW_MEMORY_BYTES}\ngui_pid={gui_pid}\ngui_start_abstime={gui_start}\ngui_lifetime_peak_physical_bytes={gui_peak}\nkeeper_lifetime_peak_physical_bytes={keeper_peak}\npeak_scope=native_gui_and_keeper_before_stop\nbuild_memory=separate_original_claims\n"
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    inst.stop()?;
+    crate::util::copy_regular_file(&inst.log, args.out.join("gui.log"))
+        .map_err(|e| e.to_string())?;
+    crate::util::write_fresh(&args.out.join("result.txt"), format!("PASS\nattachment={queued}\nattachments=1\nobserved_generation={}\ninitial_revision={}\nremaining_revision={}\nobserved_transition=2->1\ncompleted_attempt={}\ncompletion_revision={}\ncompletion_visible_before_peer_release=true\nepoch_sequence={}\nepoch_live_revision={}\nepoch_settled_revision={}\nepoch_backing_n=2\nepoch_roots_r=1\nepoch_original_admitted_bytes={}\nepoch_successful_roots=1\nepoch_settled_units=2\nepoch_uncertain_units=0\nepoch_original_endpoint_absent=true\nepoch_exact_cpu_reacquisition=2\nepoch_settled_before_peer_release=true\nactual_builds=5\nemitted_programs=4\nharness_cold_warm_costs=true\nharness_script_counts=1,1,1\nharness_dependency_unchanged=true\nharness_cold_warm_same_attachment=true\npanel_closed_before_peer_release=true\nledger_drained=true\nlook={}\n", expected.generation.0.iter().map(|b| format!("{b:02x}")).collect::<String>(), expected.revision, remaining.revision, attempts[0].sequence, recent[0].revision, epoch.id.sequence(), epoch_live.revision, epoch_settled.revision, epoch.admitted_bytes, if args.light { "light" } else { "dark" })).map_err(|e| e.to_string())?;
     if !args.keep {
         world.release();
     }
@@ -798,7 +1359,7 @@ pub fn cmd(args: &[String]) -> Res {
     let args = parse(args)?;
     run(args).map_err(|e| Fail::die(format!("allocation-monitor: {e}")))?;
     println!(
-        "allocation-monitor: PASS; one attachment painted actual completion beside live peer, panel closed before peer release, both programs succeeded and ledger drained"
+        "allocation-monitor: PASS; one attachment painted actual completion, live/settled epoch and real cold/warm harness costs; five builds, unchanged dependency, four programs and drained ledger"
     );
     Ok(0)
 }
@@ -809,12 +1370,318 @@ mod tests {
     use aterm_capacity::host_protocol::{Generation, Job, Phase};
 
     #[test]
+    fn epoch_witness_requires_exact_live_and_settled_backing_beside_the_same_peer() {
+        let mut snapshot = Snapshot {
+            generation: Generation([7; 16]),
+            revision: 8,
+            closed: false,
+            jobs: vec![Job {
+                attempt: 9,
+                phase: Phase::Waiting,
+                reserved_bytes: 123456,
+                failure: None,
+            }],
+            epochs: vec![Epoch {
+                sequence: 1,
+                backing: 2,
+                roots: 1,
+                reserved_bytes: 234567,
+                opened: true,
+                retired: false,
+                helper_exited: false,
+                control_eof: false,
+                endpoint_cleaned: false,
+                settled_units: 0,
+                uncertain_units: 0,
+                remaining_units: 2,
+                completed_roots: 0,
+                failed_roots: 0,
+                faulted: false,
+                unbound: false,
+                not_spawned: false,
+                cancellation_started: false,
+                failure: None,
+                cache_work: Vec::new(),
+            }],
+        };
+        let base = concat!(
+            "text key=\"allocation/monitor/scope\" label=\"Delegated native session · read-only observation\"\n",
+            "text key=\"allocation/monitor/attachment\" label=\"Monitor attachment 4: Observed\"\n",
+            "text key=\"allocation/monitor/source\" label=\"Source generation: 07070707070707070707070707070707 · snapshot revision 8 · attachment 4\"\n",
+            "text key=\"allocation/monitor/attempt/9\" label=\"Session attempt 9 · Waiting for next child observation · admitted peak 123456 bytes (0.0 GiB)\"\n",
+        );
+        let live = concat!(
+            "text key=\"allocation/monitor/epoch/1/budget\" label=\"Epoch 1 · CPU backing N=2 · root slots R=1 · original admitted memory peak 234567 bytes (0.0 GiB)\"\n",
+            "text key=\"allocation/monitor/epoch/1/roots\" label=\"Roots: 0 completed of 1 slots · 0 failed\"\n",
+            "text key=\"allocation/monitor/epoch/1/transport\" label=\"Transport: opened yes · Retired no · helper exited no · output ended no\"\n",
+            "text key=\"allocation/monitor/epoch/1/backing\" label=\"CPU backing: 0 returned · 2 remaining · 0 uncertain · group drain + endpoint cleanup pending\"\n",
+            "text key=\"allocation/monitor/epoch/1/cache/not-recorded\" label=\"Cache validation: no completed-root report recorded\"\n",
+        );
+        let text = format!("{base}{live}");
+        assert!(matches_snapshot(&text, &snapshot, 4));
+        assert!(!matches_snapshot(base, &snapshot, 4), "missing epoch rows");
+        for (before, after) in [
+            ("epoch/1/", "epoch/2/"),
+            ("Epoch 1 ·", "Epoch 2 ·"),
+            ("N=2", "N=3"),
+            ("R=1", "R=2"),
+            ("234567", "234568"),
+            ("0 completed", "1 completed"),
+            ("of 1 slots", "of 2 slots"),
+            ("0 failed", "1 failed"),
+            ("opened yes", "opened no"),
+            ("Retired no", "Retired yes"),
+            ("helper exited no", "helper exited yes"),
+            ("output ended no", "output ended yes"),
+            ("0 returned", "2 returned"),
+            ("2 remaining", "0 remaining"),
+            ("0 uncertain", "1 uncertain"),
+            ("cleanup pending", "cleanup confirmed"),
+            ("Session attempt 9", "Session attempt 10"),
+            ("snapshot revision 8", "snapshot revision 9"),
+            ("no completed-root report recorded", "0 bytes hashed"),
+        ] {
+            assert!(
+                !matches_snapshot(&text.replace(before, after), &snapshot, 4),
+                "reject {after}"
+            );
+        }
+        assert!(
+            !matches_snapshot(&format!("{text}{live}"), &snapshot, 4),
+            "duplicate epoch rows"
+        );
+        assert!(
+            !matches_snapshot(
+                &format!("{text}{}", live.replace("epoch/1/", "epoch/2/")),
+                &snapshot,
+                4
+            ),
+            "extra epoch rows"
+        );
+        let audit = format!(
+            "{}{}",
+            text.replace("text key=", "paint-node visible=true clipped=false key="),
+            text.replace(
+                "text key=",
+                "paint-text overflow=false clip-truncated=false key="
+            )
+            .replace("label=", "painted=")
+        );
+        assert!(matches_snapshot(&audit, &snapshot, 4));
+        assert!(
+            !matches_snapshot(
+                &audit.replace(
+                    "painted=\"CPU backing: 0 returned",
+                    "painted=\"CPU backing: 2 returned"
+                ),
+                &snapshot,
+                4
+            ),
+            "painted custody must match semantic custody"
+        );
+        assert!(
+            !matches_snapshot(
+                &audit.replace("clipped=false", "clipped=true"),
+                &snapshot,
+                4
+            ),
+            "clipped epochs never qualify"
+        );
+        let epoch = &mut snapshot.epochs[0];
+        epoch.retired = true;
+        epoch.helper_exited = true;
+        epoch.control_eof = true;
+        epoch.endpoint_cleaned = true;
+        epoch.completed_roots = 1;
+        epoch.settled_units = 2;
+        epoch.remaining_units = 0;
+        let settled = text
+            .replace("Roots: 0 completed", "Roots: 1 completed")
+            .replace("Retired no", "Retired yes")
+            .replace("helper exited no", "helper exited yes")
+            .replace("output ended no", "output ended yes")
+            .replace("0 returned", "2 returned")
+            .replace("2 remaining", "0 remaining")
+            .replace("cleanup pending", "cleanup confirmed")
+            .replace(
+                "no completed-root report recorded",
+                "not recorded for 1 completed roots",
+            );
+        assert!(matches_snapshot(&settled, &snapshot, 4));
+        assert!(
+            !matches_snapshot(&text, &snapshot, 4),
+            "live work is not settled history"
+        );
+        snapshot.epochs[0].settled_units = 1;
+        snapshot.epochs[0].uncertain_units = 1;
+        assert!(
+            !matches_snapshot(&settled, &snapshot, 4),
+            "uncertain repayment is never all-N success"
+        );
+        assert!(matches_snapshot(
+            &settled
+                .replace("2 returned", "1 returned")
+                .replace("0 uncertain", "1 uncertain"),
+            &snapshot,
+            4
+        ));
+    }
+
+    #[test]
+    fn synthetic_cache_witness_requires_exact_run_costs_and_all_availability_rows() {
+        use aterm_capacity::{
+            cache_work::{Availability, Denominators, Summary, UnavailableReason, Work},
+            host_protocol::RootCacheWork,
+        };
+        let complete = Summary {
+            run_id: "20261105T103732783Z-1ab3ba0487a929a0".into(),
+            availability: Availability::Complete,
+            denominators: Denominators {
+                registered_units: 7,
+                run_script_units: 2,
+                observed_units: 1,
+                units_without_attempts: 6,
+                attempts_started: 2,
+                attempts_finished: 2,
+                captured_attempts: 1,
+                uncacheable_attempts: 1,
+            },
+            totals: Some(Work {
+                entries: 3,
+                input_bytes: 41,
+                bytes_hashed: 17,
+                metadata_reads: 12,
+                resolution_steps: 11,
+                link_reads: 0,
+                observations: 15,
+                revalidations: 7,
+            }),
+        };
+        let legacy = Summary {
+            run_id: "20261105T103732784Z-1ab3ba0487a929a0".into(),
+            availability: Availability::UnavailableLegacyLog,
+            denominators: Denominators {
+                registered_units: 7,
+                run_script_units: 2,
+                units_without_attempts: 7,
+                ..Denominators::default()
+            },
+            totals: None,
+        };
+        // This is an independent semantic law fixture. The real-window scene
+        // currently has no analysis report and must show honest NotRecorded.
+        let snapshot = Snapshot {
+            generation: Generation([7; 16]),
+            revision: 8,
+            closed: false,
+            jobs: vec![],
+            epochs: vec![Epoch {
+                sequence: 1,
+                backing: 4,
+                roots: 4,
+                reserved_bytes: 42,
+                opened: true,
+                retired: true,
+                helper_exited: true,
+                control_eof: true,
+                endpoint_cleaned: true,
+                settled_units: 4,
+                uncertain_units: 0,
+                remaining_units: 0,
+                completed_roots: 4,
+                failed_roots: 0,
+                faulted: false,
+                unbound: false,
+                not_spawned: false,
+                cancellation_started: false,
+                failure: None,
+                cache_work: vec![
+                    RootCacheWork {
+                        root: 0,
+                        summary: Some(complete),
+                        unavailable: None,
+                    },
+                    RootCacheWork {
+                        root: 1,
+                        summary: Some(legacy),
+                        unavailable: None,
+                    },
+                    RootCacheWork {
+                        root: 2,
+                        summary: None,
+                        unavailable: Some(UnavailableReason::QueryFailed),
+                    },
+                ],
+            }],
+        };
+        snapshot.encode().unwrap();
+        let text = concat!(
+            "text key=\"allocation/monitor/scope\" label=\"Delegated native session · read-only observation\"\n",
+            "text key=\"allocation/monitor/attachment\" label=\"Monitor attachment 4: Observed\"\n",
+            "text key=\"allocation/monitor/source\" label=\"Source generation: 07070707070707070707070707070707 · snapshot revision 8 · attachment 4\"\n",
+            "text key=\"allocation/monitor/epoch/1/budget\" label=\"Epoch 1 · CPU backing N=4 · root slots R=4 · original admitted memory peak 42 bytes (0.0 GiB)\"\n",
+            "text key=\"allocation/monitor/epoch/1/roots\" label=\"Roots: 4 completed of 4 slots · 0 failed\"\n",
+            "text key=\"allocation/monitor/epoch/1/transport\" label=\"Transport: opened yes · Retired yes · helper exited yes · output ended yes\"\n",
+            "text key=\"allocation/monitor/epoch/1/backing\" label=\"CPU backing: 4 returned · 0 remaining · 0 uncertain · group drain + endpoint cleanup confirmed\"\n",
+            "text key=\"allocation/monitor/epoch/1/root/0/cache/availability\" label=\"Root 0 · Historical cache validation · run 20261105T103732783Z-1ab3ba0487a929a0 · scope build-script-inputs-v1 · complete\"\n",
+            "text key=\"allocation/monitor/epoch/1/root/0/cache/coverage\" label=\"Build-script input work: 1 observed of 2 script units · 7 registered units · 2 capture attempts · 1 uncacheable\"\n",
+            "text key=\"allocation/monitor/epoch/1/root/0/cache/work\" label=\"Inputs: 17 bytes hashed · 12 metadata reads · 7 revalidations\"\n",
+            "text key=\"allocation/monitor/epoch/1/root/1/cache/availability\" label=\"Root 1 · Historical cache validation · run 20261105T103732784Z-1ab3ba0487a929a0 · scope build-script-inputs-v1 · legacy log unavailable\"\n",
+            "text key=\"allocation/monitor/epoch/1/root/2/cache/availability\" label=\"Root 2 · Historical cache validation: unavailable · report query failed\"\n",
+            "text key=\"allocation/monitor/epoch/1/cache/not-recorded\" label=\"Cache validation: not recorded for 1 completed roots\"\n",
+        );
+        assert!(matches_snapshot(text, &snapshot, 4));
+        for (before, after) in [
+            ("20261105T103732783Z", "20261105T103732782Z"),
+            ("1ab3ba0487a929a0", "2ab3ba0487a929a0"),
+            ("root/0/cache/", "root/9/cache/"),
+            ("17 bytes hashed", "18 bytes hashed"),
+            ("1 observed of 2", "2 observed of 2"),
+            ("12 metadata reads", "13 metadata reads"),
+            ("legacy log unavailable", "complete"),
+            ("report query failed", "not recorded"),
+            ("not recorded for 1", "not recorded for 0"),
+        ] {
+            assert!(
+                !matches_snapshot(&text.replace(before, after), &snapshot, 4),
+                "reject {after}"
+            );
+        }
+        let missing = text
+            .lines()
+            .filter(|line| !line.contains("root/0/cache/work"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!matches_snapshot(&missing, &snapshot, 4));
+        let extra = format!(
+            "{text}text key=\"allocation/monitor/epoch/1/root/1/cache/work\" label=\"Inputs: 0 bytes hashed · 0 metadata reads · 0 revalidations\"\n"
+        );
+        assert!(!matches_snapshot(&extra, &snapshot, 4));
+        let audit = format!(
+            "{}{}",
+            text.replace("text key=", "paint-node visible=true clipped=false key="),
+            text.replace(
+                "text key=",
+                "paint-text overflow=false clip-truncated=false key="
+            )
+            .replace("label=", "painted=")
+        );
+        assert!(matches_snapshot(&audit, &snapshot, 4));
+        assert!(!matches_snapshot(
+            &audit.replace("painted=\"Inputs: 17", "painted=\"Inputs: 18"),
+            &snapshot,
+            4
+        ));
+    }
+
+    #[test]
     fn scene_requires_exact_owner_completion_beside_current_snapshot() {
         let snapshot = Snapshot {
             generation: Generation([7; 16]),
             revision: 7,
             closed: false,
             jobs: vec![],
+            epochs: vec![],
         };
         let recent = [RecordSummary {
             revision: 6,
@@ -910,6 +1777,7 @@ mod tests {
                 reserved_bytes: 123456,
                 failure: None,
             }],
+            epochs: vec![],
         };
         let text = concat!(
             "text key=\"allocation/monitor/scope\" label=\"Delegated native session · read-only observation\"\n",

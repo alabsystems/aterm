@@ -1134,6 +1134,7 @@ impl App {
         let Some((ask, then)) = self.begin_pressed_install(own_aterm) else {
             return false;
         };
+        let _act = crate::tab_marks::ActScope::gesture("install");
         self.open_off_loop(window, crate::tab_spawn::SpawnPlace::Tab, ask, then);
         true
     }
@@ -1810,7 +1811,7 @@ impl App {
             let stopped = status.finished && status.run.is_some_and(|run| !run.allowed);
             return self.workstation_setup.setup_unheld() && !stopped;
         }
-        self.person_permission_admission_stands()
+        self.permission_steps_admitted()
             && self.workstation_setup.setup_unheld()
             && !status.changing
             && status
@@ -1893,13 +1894,32 @@ impl App {
         if self.headless {
             return;
         }
-        let Some((window, ask, then)) = self.begin_developer_tools_install(own_aterm) else {
+        self.open_developer_tools_install(own_aterm);
+    }
+
+    /// [`Self::tick_developer_tools_install`]'s opening, `aterm` naming this program's `aterm`:
+    /// a queued press's tab is the person's (`by=human`, the press that asked for it), the
+    /// automatic one aterm's own (`by=harness`).
+    pub(crate) fn open_developer_tools_install(
+        &mut self,
+        aterm: impl FnOnce() -> Option<std::path::PathBuf>,
+    ) {
+        let by = if matches!(
+            self.workstation_setup.developer_tools,
+            Install::PressedQueued { .. }
+        ) {
+            crate::session_store::ExitActor::Human
+        } else {
+            crate::session_store::ExitActor::Harness
+        };
+        let Some((window, ask, then)) = self.begin_developer_tools_install(aterm) else {
             return;
         };
         aterm_log::info!(
             "System State: starting the Command Line Tools install tab (`aterm {}`)",
             ARGS.join(" ")
         );
+        let _act = crate::tab_marks::ActScope::enter(by, "install");
         self.open_off_loop(window, crate::tab_spawn::SpawnPlace::Tab, ask, then);
     }
 
@@ -2011,7 +2031,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unattended_setup_cannot_open_a_password_install_tab() {
+    fn unattended_setup_starts_the_selected_tools_install_without_another_press() {
         let mut app = App::headless_for_test();
         let permissions = Some(crate::InitialSetupPermissionPolicy {
             revision: 4,
@@ -2028,14 +2048,14 @@ mod tests {
             ..crate::SetupStatus::default()
         });
         app.want_developer_tools_install(4, true);
-        assert!(!app.developer_tools_install_due(false));
+        assert!(app.developer_tools_install_due(false));
         app.note_system_state_touch();
         app.note_system_state_apply(crate::system_state::Admission::Person);
         app.accepted_initial_setup_apply();
         app.observe_initial_setup_permissions(permissions);
         assert!(
             app.developer_tools_install_due(false),
-            "explicit admission is the negative control"
+            "an additional press does not change the automatic admission"
         );
     }
 
@@ -2376,8 +2396,7 @@ mod tests {
 
     /// A launch's want asks nobody first: no run, no person's admission, no page, as a new Mac's
     /// one password comes first. A hold and a Stop kept in the run's records still stand.
-    /// NEGATIVE CONTROL: a pass's own want, on the same unadmitted app, stays held
-    /// (`unattended_setup_cannot_open_a_password_install_tab`).
+    /// NEGATIVE CONTROL: durable and local Stop records hold both launch and pass requests.
     #[test]
     fn a_launchs_want_opens_with_no_run_and_no_person() {
         let mut app = App::headless_for_test();

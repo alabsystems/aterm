@@ -130,7 +130,8 @@ pub fn write(state: &Path, tab: &str, stamp: &Stamp) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let written = open
         .open(&tmp)

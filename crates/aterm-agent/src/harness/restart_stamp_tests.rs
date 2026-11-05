@@ -298,6 +298,7 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
     let opts = super::super::upgrade_drive::Opts {
         home: tmp.path().join("home"),
         state: tmp.path().join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: Some("s-1".to_string()),
@@ -318,6 +319,8 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
         timings: crate::harness::Timings::FAST,
     };
     let snap = Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: "s-1".to_string(),

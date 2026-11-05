@@ -6,15 +6,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::tap::Window;
-use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::limit::{ResetSpec, place_reset, within_a_session_window};
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::login::{OVER_LIMIT_UNUSED, RULE_LOGIN_OVER_LIMIT};
 use aterm_agent::supervise::policy::turn_end::{
-    Cleared, Clearing, FIRED_EARLY, RULE_CONTINUE, RULE_LIMIT_RESUME, TurnEndAction,
-    TurnEndReading, TurnEndState, TurnEndTiming, cleared_text, decide_turn_end,
+    Cleared, Clearing, FIRED_EARLY, GaveUp, LAND, LAND_NUDGE, MANAGED_WALL_HORIZON, RULE_CONTINUE,
+    RULE_LAND, RULE_LAND_NUDGE, RULE_LIMIT_RESUME, TurnEndAction, TurnEndReading, TurnEndState,
+    TurnEndTiming, cleared_text, decide_turn_end,
 };
 use aterm_agent::supervise::tap_clock::{TapClock, TapWindow, UsageWindow, timed};
+use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_models_harness::supervisor_usage_wall_model;
 use aterm_phase::prompt::fixtures::screen;
 use aterm_spec::derive::Model;
@@ -41,6 +42,26 @@ fn walled_model() -> Model {
 /// [`walled_model`] with a person's own `/login` opened over the shown wall (`Dialog = 1`).
 fn dialog_model() -> Model {
     aterm_spec::interp::with_consts(&walled_model(), &[("Dialog", 1)])
+}
+
+/// [`dialog_model`] for a MANAGED WORKER (`Managed = 1`: a session a manager waits on, under
+/// Land) whose wall resets two minutes past [`MANAGED_WALL_HORIZON`] (`Horizon`, one tick a
+/// minute): it concludes at the wall as it appears, and a person's `/login` held open over it
+/// (`Dialog = 1`) lets the clock reach the horizon, where the wall is waited out as on any tab.
+fn managed_model() -> Model {
+    let horizon = i64::try_from(MANAGED_WALL_HORIZON.as_secs() / 60).expect("minutes");
+    let reset = horizon + 2;
+    let m = dialog_model();
+    let cap = reset + cnst(&m, "Skew") + 2;
+    aterm_spec::interp::with_consts(
+        &m,
+        &[
+            ("Managed", 1),
+            ("Horizon", horizon),
+            ("ResetAt", reset),
+            ("Cap", cap),
+        ],
+    )
 }
 
 /// [`walled_model`] with the usage tap timing a wall whose notice is cut
@@ -223,6 +244,9 @@ impl Screen {
             1 if st["cut"] == 1 => Self::CutWalled,
             1 if st["bg"] == 1 => Self::WalledShell,
             1 => Self::Walled,
+            // A managed worker's concluded wall still shows.
+            7 if st["bg"] == 1 => Self::WalledShell,
+            7 => Self::Walled,
             6 if st["other"] == 1 => Self::Resumed,
             6 if st["other"] == 2 => Self::ResumedContinued,
             6 if st["unread"] == 1 => Self::Cancelled,
@@ -511,6 +535,9 @@ fn reading_of(
         t.reset_at = None;
         t.reset_clock = None;
     }
+    if run.managed {
+        t.autopilot = Autopilot::Land;
+    }
     t
 }
 
@@ -537,6 +564,11 @@ struct Run {
     /// login arm decided before `login-over-limit@v1` (`dialog_act`'s `Nothing` at the hand-off),
     /// so the dialog over the wall is never waited out or closed.
     dialog_left_open: bool,
+    /// A managed worker ([`managed_model`]): its real state is managed and read under Land.
+    managed: bool,
+    /// THE 2026-11-04 DECIDER ([`decide`]): a managed worker's wall decided as a person's tab's,
+    /// so a reset a day off is waited for and nothing concludes the work.
+    waits_out: bool,
 }
 
 #[derive(Clone)]
@@ -573,6 +605,9 @@ enum Verdict {
     Close,
     /// A wait on a person's own `/login` still in use, past the wall's due.
     Held,
+    /// A managed worker's work concluded at its wall (`ManagedConcludes`): nothing typed, the
+    /// task `failed why=usage-limit`.
+    Concluded,
 }
 
 fn expected(m: &Model, st: &State) -> Verdict {
@@ -602,6 +637,9 @@ fn expected(m: &Model, st: &State) -> Verdict {
     if st["cut"] == 1 && st["tap"] == 0 {
         return Verdict::Wait(minutes(m, "Rung2"));
     }
+    if m.action_enabled("ManagedConcludes", st) {
+        return Verdict::Concluded;
+    }
     if m.action_enabled("Act", st) {
         return Verdict::Act;
     }
@@ -617,13 +655,25 @@ fn expected(m: &Model, st: &State) -> Verdict {
     Verdict::Wait(MIN * u32::try_from(due).unwrap())
 }
 
-fn verdict(a: &TurnEndAction, now: Instant) -> Verdict {
+/// The model's word for `a`. The resume is the one cleared line, or under Land (`land`) the
+/// instruction still owed, the one prompt then (`SupervisorConditionResume`); where the turn past
+/// the wall was a resumed conversation's, Land's own prompt (its instruction, then its nudge) is
+/// the resume.
+fn verdict(a: &TurnEndAction, now: Instant, land: bool) -> Verdict {
     match a {
+        TurnEndAction::Type { text, rule_id }
+            if land
+                && ((*rule_id == RULE_LAND && text == LAND)
+                    || (*rule_id == RULE_LAND_NUDGE && text == LAND_NUDGE)) =>
+        {
+            Verdict::Act
+        }
         TurnEndAction::Type { text, rule_id } if *rule_id == RULE_LIMIT_RESUME => {
             assert!(
                 [Clearing::Measured, Clearing::Blind]
                     .iter()
-                    .any(|&how| *text == cleared_text(Cleared::UsageLimit, how)),
+                    .any(|&how| *text == cleared_text(Cleared::UsageLimit, how))
+                    || (land && text == LAND),
                 "the resume is the one cleared line: {text}"
             );
             Verdict::Act
@@ -644,7 +694,8 @@ fn verdict(a: &TurnEndAction, now: Instant) -> Verdict {
 }
 
 /// The decider under test: the real [`decide_turn_end`], or under `Run::dialog_left_open` the
-/// 2026-10-31 one, whose login arm returned `Nothing` at a person's own `/login` dialog.
+/// 2026-10-31 one, whose login arm returned `Nothing` at a person's own `/login` dialog, or under
+/// `Run::waits_out` the 2026-11-04 one, which decided a managed worker's wall as a person's.
 fn decide(
     st: &TurnEndState,
     r: &TurnEndReading,
@@ -655,7 +706,35 @@ fn decide(
     if run.dialog_left_open && r.login_screen.is_some() && st.login_typed_at().is_none() {
         return TurnEndAction::Nothing;
     }
+    if run.waits_out {
+        let mut person = st.clone();
+        person.set_managed(false);
+        return decide_turn_end(&person, r, cfg, now);
+    }
     decide_turn_end(st, r, cfg, now)
+}
+
+/// [`decide`] and what the loop concludes after it ([`TurnEndState::conclude_at_wall`]), on
+/// `st` itself: the verdict, a managed worker's conclusion made here [`Verdict::Concluded`].
+fn decide_and_conclude(
+    st: &mut TurnEndState,
+    r: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+    run: Run,
+) -> (TurnEndAction, Verdict) {
+    let a = decide(st, r, cfg, now, run);
+    let open = st.gave_up().is_none();
+    if !run.waits_out {
+        st.conclude_at_wall(r, cfg, &a);
+    }
+    let v = if open && st.gave_up() == Some(GaveUp::UsageLimit) {
+        assert!(a == TurnEndAction::Nothing && st.task_done(), "{a:?}");
+        Verdict::Concluded
+    } else {
+        verdict(&a, now, r.autopilot == Autopilot::Land)
+    };
+    (a, v)
 }
 
 fn mirror(
@@ -862,7 +941,7 @@ fn mirror(
             let r = reading(before, None, real.reset, run, real);
             real.st.observe(&r, now);
             let a = decide(&real.st, &r, cfg, now, run);
-            if verdict(&a, now) != Verdict::Close {
+            if verdict(&a, now, r.autopilot == Autopilot::Land) != Verdict::Close {
                 return false;
             }
             real.st.acted(&a, &r, now);
@@ -875,7 +954,16 @@ fn mirror(
             let r = reading(after, None, real.reset, run, real);
             real.st.observe(&r, now);
         }
+        "ManagedConcludes" => {
+            let r = reading(before, None, real.reset, run, real);
+            real.st.observe(&r, now);
+            let (_, v) = decide_and_conclude(&mut real.st, &r, cfg, now, run);
+            if v != Verdict::Concluded {
+                return false;
+            }
+        }
         "WallMasked"
+        | "ManagedWaitsOut"
         | "LoginLeftOpen"
         | "GivesUp"
         | "MetKeepsTheGuess"
@@ -928,8 +1016,10 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
 fn walk_until(m: &Model, strict: bool, run: Run, first_off: bool) -> Walked {
     let cfg = SupervisorConfig::default();
     let base = Instant::now() + Duration::from_secs(24 * 3600);
+    let mut st = TurnEndState::new(timing(m));
+    st.set_managed(run.managed);
     let init = Real {
-        st: TurnEndState::new(timing(m)),
+        st,
         now: base,
         unix: PRINT,
         appeared: base,
@@ -959,7 +1049,7 @@ fn walk_until(m: &Model, strict: bool, run: Run, first_off: bool) -> Walked {
         let mut at = real.st.clone();
         let here = reading(&st, None, real.reset, run, &real);
         at.observe(&here, real.now);
-        let got = verdict(&decide(&at, &here, &cfg, real.now, run), real.now);
+        let got = decide_and_conclude(&mut at, &here, &cfg, real.now, run).1;
         let want = expected(m, &st);
         if got != want {
             assert!(
@@ -1081,6 +1171,80 @@ fn the_loop_that_leaves_a_persons_login_open_over_the_wall_disagrees() {
         !walked.fired.contains_key("LoginClosed"),
         "the decider that never closes it closed it: {:?}",
         walked.fired
+    );
+}
+
+/// A MANAGED WORKER'S WALL PAST THE HORIZON ENDS ITS WORK (owner, 2026-11-04): every reachable
+/// state of [`managed_model`] agrees with the real reader and decider under Land with the session
+/// managed, the loop's conclusion included. Its wall, shown or left, concludes exactly where
+/// `ManagedConcludes` is enabled (nothing typed, `failed why=usage-limit`), and a wall the clock
+/// brought inside the horizon under a person's `/login` is waited out and acted on as any tab's.
+#[test]
+fn tier1_a_managed_workers_wall_past_the_horizon_concludes_exactly_where_the_model_does() {
+    let m = managed_model();
+    let run = Run {
+        managed: true,
+        ..Run::default()
+    };
+    let walked = walk(&m, true, run);
+    let states = &walked.states;
+    let concluding = states
+        .iter()
+        .filter(|st| m.action_enabled("ManagedConcludes", st))
+        .collect::<Vec<_>>();
+    assert!(
+        concluding.iter().any(|st| st["wall"] == 1) && concluding.iter().any(|st| st["wall"] == 6),
+        "{concluding:?}"
+    );
+    let reset = cnst(&m, "ResetAt");
+    let near = states
+        .iter()
+        .filter(|st| {
+            st["wall"] == 1
+                && st["dialog"] == 0
+                && st["clock"] + cnst(&m, "Horizon") >= reset
+                && st["clock"] < reset
+        })
+        .count();
+    let concluded = states.iter().filter(|st| st["wall"] == 7).count();
+    assert!(near > 2 && concluded > 2, "{near} {concluded}");
+    for a in ["ManagedConcludes", "PersonClosesLogin", "Act", "Taken"] {
+        assert!(walked.fired.contains_key(a), "{a}: {:?}", walked.fired);
+    }
+}
+
+/// THE 2026-11-04 DECIDER DISAGREES WITH THE REAL CODE: one that decides a managed worker's wall
+/// as a person's tab's (`Run::waits_out`) waits for the reset a day off where the real code
+/// concludes, and disagrees nowhere else: inside the horizon both wait the same wait.
+#[test]
+fn the_loop_that_waits_out_a_managed_workers_far_wall_disagrees() {
+    let m = managed_model();
+    let run = Run {
+        managed: true,
+        waits_out: true,
+        ..Run::default()
+    };
+    let walked = walk(&m, false, run);
+    let off = &walked.off;
+    assert!(!off.is_empty(), "the decider that waits agreed everywhere");
+    assert!(
+        off.iter()
+            .all(|st| m.action_enabled("ManagedConcludes", st)),
+        "{off:?}"
+    );
+    assert!(
+        !walked.fired.contains_key("ManagedConcludes"),
+        "the decider that waits concluded: {:?}",
+        walked.fired
+    );
+    let buggy = aterm_spec::interp::with_buggy(&m, 1);
+    let mut st = buggy.init_state();
+    for a in ["WallAppears", "ManagedWaitsOut"] {
+        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
+    }
+    assert!(
+        !buggy.check_invariant("NoManagedWaitPastHorizon", &st),
+        "{st:?}"
     );
 }
 

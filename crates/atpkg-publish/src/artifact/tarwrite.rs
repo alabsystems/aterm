@@ -85,10 +85,12 @@ enum Member {
         rel: Vec<u8>,
         path: PathBuf,
         size: u64,
+        mode: u32,
     },
     Link {
         rel: Vec<u8>,
         target: Vec<u8>,
+        size: u64,
     },
 }
 
@@ -242,14 +244,11 @@ pub fn write_with(root: &Path, asset: &Path, compressor: &dyn Compressor) -> Res
             root.display()
         )));
     }
-    let content_bytes = content(root)?;
-    let stream_bytes = encode(&members, asset, compressor)
+    let content_bytes = content(&members);
+    let (stream_bytes, size) = encode(&members, asset, compressor)
         .map_err(|e| Error::io(format!("write {}", asset.display()), &e))?;
     let sha256 = atpkg::sha256_file(asset)
         .map_err(|e| Error::io(format!("hash {}", asset.display()), &e))?;
-    let size = std::fs::metadata(asset)
-        .map_err(|e| Error::io(format!("stat {}", asset.display()), &e))?
-        .len();
     let tree_root = atpkg::tree_root(root)
         .map_err(|e| Error::io(format!("tree_root {}", root.display()), &e))?;
     Ok(Packed {
@@ -279,7 +278,7 @@ fn rel_bytes(rel: &Path) -> Vec<u8> {
 /// Walk `root`, normalize every mode, and lay the members out sorted by path bytes, the
 /// first name of a hard-link group its file and every later name an `h` member.
 fn plan(root: &Path) -> Result<Vec<Member>> {
-    let mut found: Vec<(Vec<u8>, PathBuf, std::fs::Metadata)> = Vec::new();
+    let mut found: Vec<(Vec<u8>, PathBuf, std::fs::Metadata, u32)> = Vec::new();
     let mut stack = vec![PathBuf::new()];
     while let Some(rel) = stack.pop() {
         let dir = root.join(&rel);
@@ -305,26 +304,28 @@ fn plan(root: &Path) -> Result<Vec<Member>> {
                     child.display()
                 )));
             }
-            normalize_mode(&path, &meta)?;
+            let mode = normalize_mode(&path, &meta)?;
             if ft.is_dir() {
                 stack.push(child.clone());
             }
-            found.push((rel_bytes(&child), path, meta));
+            found.push((rel_bytes(&child), path, meta, mode));
         }
     }
     found.sort_by(|a, b| a.0.cmp(&b.0));
     let mut first_of: BTreeMap<(u64, u64), Vec<u8>> = BTreeMap::new();
     let mut members = Vec::with_capacity(found.len());
-    for (rel, path, meta) in found {
+    for (rel, path, meta, mode) in found {
         if meta.is_dir() {
             members.push(Member::Dir(rel));
             continue;
         }
+        let size = meta.len();
         if let Some(key) = link_key(&meta) {
             if let Some(target) = first_of.get(&key) {
                 members.push(Member::Link {
                     rel,
                     target: target.clone(),
+                    size,
                 });
                 continue;
             }
@@ -333,7 +334,8 @@ fn plan(root: &Path) -> Result<Vec<Member>> {
         members.push(Member::File {
             rel,
             path,
-            size: meta.len(),
+            size,
+            mode,
         });
     }
     Ok(members)
@@ -353,47 +355,36 @@ fn link_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     }
 }
 
-fn normalize_mode(path: &Path, meta: &std::fs::Metadata) -> Result<()> {
+fn normalize_mode(path: &Path, meta: &std::fs::Metadata) -> Result<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = meta.permissions().mode() & 0o7777;
         let want = atpkg::extract::safe_mode(mode, meta.is_dir());
         if mode != want {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(want))
-                .map_err(|e| Error::io(format!("chmod {}", path.display()), &e))?;
+            if meta.is_file() {
+                crate::identity::set_regular_mode(path, want)
+                    .map_err(|e| Error::io(format!("chmod {}", path.display()), &e))?;
+            } else {
+                atpkg::platform::set_mode(path, want)
+                    .map_err(|e| Error::io(format!("chmod {}", path.display()), &e))?;
+            }
         }
-    }
-    #[cfg(not(unix))]
-    let _ = (path, meta);
-    Ok(())
-}
-
-fn mode_of(path: &Path) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(path).map_or(0o644, |m| m.permissions().mode() & 0o7777)
+        Ok(want)
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        0o644
+        let _ = (path, meta);
+        Ok(0o644)
     }
 }
 
 /// Every regular file's size, each name of a hard-link group counted.
-fn content(root: &Path) -> Result<u64> {
-    let files = crate::artifact::relocate::walk_files(root).map_err(Error::cannot_run)?;
-    let mut sum = 0u64;
-    for rel in files {
-        let p = root.join(rel);
-        let len = std::fs::metadata(&p)
-            .map_err(|e| Error::io(format!("stat {}", p.display()), &e))?
-            .len();
-        sum = sum.saturating_add(len);
-    }
-    Ok(sum)
+fn content(members: &[Member]) -> u64 {
+    members.iter().fold(0u64, |sum, member| match member {
+        Member::Dir(_) => sum,
+        Member::File { size, .. } | Member::Link { size, .. } => sum.saturating_add(*size),
+    })
 }
 
 /// Counts and hashes the bytes written through it: the decompressed stream's length and
@@ -416,14 +407,27 @@ impl<W: Write> Write for Counting<W> {
     }
 }
 
-/// Writes the archive through `compressor` into `asset`; returns the tar stream's length.
+/// Writes the archive through `compressor` into `asset`; returns `(stream_bytes, asset_size)`.
 ///
 /// The stream is sized before it is written ([`stream_len`]), from the plan alone: the
 /// compressor learns its length before the first byte with no second copy of it, in memory
 /// or on disk, so the producer's memory stays the encoder's own whatever the pack's size.
-fn encode(members: &[Member], asset: &Path, compressor: &dyn Compressor) -> io::Result<u64> {
+fn encode(members: &[Member], asset: &Path, compressor: &dyn Compressor) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let len = stream_len(members)?;
-    let file = std::fs::File::create(asset)?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(asset)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    file.set_len(0)?;
     let (mut n, mut sum) = (0u64, 0u64);
     compressor.compress(&file, len, &mut |input| {
         let mut out = Counting {
@@ -436,15 +440,15 @@ fn encode(members: &[Member], asset: &Path, compressor: &dyn Compressor) -> io::
         streamed
     })?;
     aterm_durable::durable(&file)?;
-    decodes_back(asset, n, sum)?;
-    Ok(n)
+    let size = decodes_back(asset, n, sum)?;
+    Ok((n, size))
 }
 
 /// Reads `asset` back through the decoder every client installs it with: one or more
 /// checksummed frames that decode to exactly the `n`-byte stream written, whose XXH64
-/// is `sum`.
-fn decodes_back(asset: &Path, n: u64, sum: u64) -> io::Result<()> {
-    let (file, _) = crate::identity::open_regular_nonblock(asset)?;
+/// is `sum`; returns the compressed asset's byte length from its opened descriptor.
+fn decodes_back(asset: &Path, n: u64, sum: u64) -> io::Result<u64> {
+    let (file, meta) = crate::identity::open_regular_nonblock(asset)?;
     let mut decoder = aterm_zstd::Decoder::new(file).require_checksum();
     let mut hash = Xxh64::new(0);
     let mut got = 0u64;
@@ -464,7 +468,7 @@ fn decodes_back(asset: &Path, n: u64, sum: u64) -> io::Result<()> {
             hash.digest()
         )));
     }
-    Ok(())
+    Ok(meta.len())
 }
 
 /// The tar stream: every member, then the two zero records that end the archive. Each
@@ -521,9 +525,14 @@ fn layout<W: Write>(
                 name.push(b'/');
                 entry(out, &name, b'5', 0o755, 0, None)?;
             }
-            Member::Link { rel, target } => entry(out, rel, b'1', 0o644, 0, Some(target))?,
-            Member::File { rel, path, size } => {
-                entry(out, rel, b'0', mode_of(path), *size, None)?;
+            Member::Link { rel, target, .. } => entry(out, rel, b'1', 0o644, 0, Some(target))?,
+            Member::File {
+                rel,
+                path,
+                size,
+                mode,
+            } => {
+                entry(out, rel, b'0', *mode, *size, None)?;
                 body(out, path, *size)?;
                 pad(out, *size)?;
             }
@@ -535,7 +544,7 @@ fn layout<W: Write>(
 fn pad(out: &mut impl Write, size: u64) -> io::Result<()> {
     let rem = (size % 512) as usize;
     if rem != 0 {
-        out.write_all(&vec![0u8; 512 - rem])?;
+        out.write_all(&[0u8; 512][..512 - rem])?;
     }
     Ok(())
 }

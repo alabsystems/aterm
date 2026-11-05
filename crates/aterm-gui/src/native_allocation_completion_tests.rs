@@ -9,7 +9,7 @@ use crate::native_app::ViewMotionCx;
 use crate::native_ui::{CompiledUi, LogicalRect, UiKey};
 use aterm_capacity::{
     cohort_namespace::Namespace,
-    host_protocol::{Generation, Job, Phase as JobPhase},
+    host_protocol::{Epoch, Generation, Job, Phase as JobPhase},
     leadership::Fence,
 };
 use atpkg::build_admit::service::{
@@ -75,6 +75,246 @@ fn compiled(app: &AllocationApp) -> CompiledUi {
     app.view(&AllocationViewState::default(), &cx)
         .compile(cx.viewport)
         .unwrap()
+}
+
+fn epoch(sequence: u64) -> Epoch {
+    Epoch {
+        sequence,
+        backing: 4,
+        roots: 2,
+        reserved_bytes: 3 * 1024 * 1024 * 1024,
+        opened: true,
+        retired: false,
+        helper_exited: false,
+        control_eof: false,
+        endpoint_cleaned: false,
+        settled_units: 0,
+        uncertain_units: 0,
+        remaining_units: 4,
+        completed_roots: 0,
+        failed_roots: 0,
+        faulted: false,
+        unbound: false,
+        not_spawned: false,
+        cancellation_started: false,
+        failure: None,
+        cache_work: Vec::new(),
+    }
+}
+
+#[test]
+fn cache_work_keeps_exact_run_unavailability_and_original_attachment_in_the_pane() {
+    use aterm_capacity::{
+        cache_work::{Availability, Denominators, Summary, UnavailableReason, Work},
+        host_protocol::RootCacheWork,
+    };
+    let mut observation = observation();
+    let mut historical = epoch(1);
+    historical.roots = 3;
+    historical.completed_roots = 3;
+    historical.retired = true;
+    historical.helper_exited = true;
+    historical.control_eof = true;
+    historical.endpoint_cleaned = true;
+    historical.settled_units = 4;
+    historical.remaining_units = 0;
+    let run = "20261105T103732783Z-1ab3ba0487a929a0";
+    let measured = Summary {
+        run_id: run.into(),
+        availability: Availability::Complete,
+        denominators: Denominators {
+            registered_units: 7,
+            run_script_units: 2,
+            observed_units: 1,
+            units_without_attempts: 6,
+            attempts_started: 2,
+            attempts_finished: 2,
+            captured_attempts: 1,
+            uncacheable_attempts: 1,
+        },
+        totals: Some(Work {
+            entries: 3,
+            input_bytes: 41,
+            bytes_hashed: 17,
+            metadata_reads: 12,
+            resolution_steps: 11,
+            link_reads: 0,
+            observations: 15,
+            revalidations: 7,
+        }),
+    };
+    let legacy = Summary {
+        run_id: "20261105T103732784Z-1ab3ba0487a929a0".into(),
+        availability: Availability::UnavailableLegacyLog,
+        denominators: Denominators {
+            registered_units: 7,
+            run_script_units: 2,
+            units_without_attempts: 7,
+            ..Denominators::default()
+        },
+        totals: None,
+    };
+    historical.cache_work = vec![
+        RootCacheWork {
+            root: 0,
+            summary: Some(measured),
+            unavailable: None,
+        },
+        RootCacheWork {
+            root: 1,
+            summary: Some(legacy),
+            unavailable: None,
+        },
+        RootCacheWork {
+            root: 2,
+            summary: None,
+            unavailable: Some(UnavailableReason::QueryFailed),
+        },
+    ];
+    observation.snapshot.epochs = vec![historical];
+    observation.snapshot.encode().unwrap();
+    let mut app = app(observation, Vec::new());
+    let ui = compiled(&app);
+    let label = |key: &str| {
+        &ui.semantic(&UiKey::new(format!("allocation/monitor/epoch/1/{key}")))
+            .unwrap()
+            .label
+    };
+    assert!(label("root/0/cache/availability").contains(run));
+    assert!(label("root/0/cache/availability").contains("build-script-inputs-v1 · complete"));
+    assert_eq!(
+        label("root/0/cache/work"),
+        "Inputs: 17 bytes hashed · 12 metadata reads · 7 revalidations"
+    );
+    assert!(label("root/0/cache/coverage").contains("1 observed of 2 script units"));
+    assert!(label("root/1/cache/availability").contains("legacy log unavailable"));
+    assert!(label("root/2/cache/availability").contains("report query failed"));
+    for root in [1, 2] {
+        assert!(
+            ui.semantic(&UiKey::new(format!(
+                "allocation/monitor/epoch/1/root/{root}/cache/work"
+            )))
+            .is_none()
+        );
+    }
+    let mut pending = (**app.monitor.as_ref().unwrap()).clone();
+    pending.requested = 2;
+    pending.desired_generation = Some(Generation([9; 16]));
+    pending.phase = Phase::Queued;
+    app.monitor = Some(Arc::new(pending));
+    let rows = app.rows(Instant::now());
+    assert!(
+        rows.iter()
+            .any(|(key, label)| key == "monitor/retained" && label.contains("attachment 1"))
+    );
+    assert!(rows.iter().any(
+        |(key, label)| key == "monitor/epoch/1/root/0/cache/availability" && label.contains(run)
+    ));
+    let absent = cache_work_rows(&epoch(2));
+    assert_eq!(absent.len(), 1);
+    assert!(absent[0].1.contains("no completed-root report recorded"));
+    assert!(!absent[0].1.contains("0 bytes"));
+}
+
+#[test]
+fn epochs_preserve_failed_builds_and_uncertain_backing_after_transport_retirement() {
+    let mut observation = observation();
+    let mut retired = epoch(2);
+    retired.retired = true;
+    retired.helper_exited = true;
+    retired.control_eof = true;
+    retired.endpoint_cleaned = true;
+    retired.settled_units = 1;
+    retired.uncertain_units = 1;
+    retired.remaining_units = 2;
+    retired.completed_roots = 2;
+    retired.failed_roots = 1;
+    let mut retiring = epoch(1);
+    retiring.retired = true;
+    observation.snapshot.epochs = vec![retired, retiring];
+    // Exercise the public projection's invariants before rendering synthetic
+    // states; resource cleanup never upgrades the original build outcome.
+    observation.snapshot.encode().unwrap();
+    let app = app(observation, Vec::new());
+    let rows = app.rows(Instant::now());
+    let index = |key: &str| rows.iter().position(|(found, _)| found == key).unwrap();
+    assert!(index("monitor/epoch/1/budget") < index("monitor/epoch/2/budget"));
+    assert!(index("monitor/epoch/2/backing") < index("monitor/completions"));
+    let ui = compiled(&app);
+    let label = |key: &str| {
+        &ui.semantic(&UiKey::new(format!("allocation/monitor/{key}")))
+            .unwrap()
+            .label
+    };
+    assert_eq!(
+        label("epoch/2/budget"),
+        "Epoch 2 · CPU backing N=4 · root slots R=2 · original admitted memory peak 3221225472 bytes (3.0 GiB)"
+    );
+    assert_eq!(
+        label("epoch/2/roots"),
+        "Roots: 2 completed of 2 slots · 1 failed"
+    );
+    assert_eq!(
+        label("epoch/1/transport"),
+        "Transport: opened yes · Retired yes · helper exited no · output ended no"
+    );
+    assert_eq!(
+        label("epoch/1/backing"),
+        "CPU backing: 0 returned · 4 remaining · 0 uncertain · group drain + endpoint cleanup pending"
+    );
+    assert_eq!(
+        label("epoch/2/backing"),
+        "CPU backing: 1 returned · 2 remaining · 1 uncertain · group drain + endpoint cleanup confirmed"
+    );
+    assert_eq!(
+        ui.semantic(&UiKey::new("allocation/monitor/epochs"))
+            .unwrap()
+            .role,
+        SemanticRole::Heading
+    );
+}
+
+#[test]
+fn unlaunched_cancellation_returns_resources_without_inventing_build_success() {
+    let mut observation = observation();
+    let mut cancelled = epoch(1);
+    cancelled.opened = false;
+    cancelled.cancellation_started = true;
+    cancelled.endpoint_cleaned = true;
+    cancelled.settled_units = 4;
+    cancelled.remaining_units = 0;
+    let mut not_spawned = epoch(2);
+    not_spawned.opened = false;
+    not_spawned.not_spawned = true;
+    observation.snapshot.epochs = vec![cancelled, not_spawned];
+    observation.snapshot.encode().unwrap();
+    let ui = compiled(&app(observation, Vec::new()));
+    let label = |key: &str| {
+        &ui.semantic(&UiKey::new(format!("allocation/monitor/{key}")))
+            .unwrap()
+            .label
+    };
+    assert_eq!(
+        label("epoch/1/roots"),
+        "Roots: 0 completed of 2 slots · 0 failed · launch cancellation started"
+    );
+    assert_eq!(
+        label("epoch/1/backing"),
+        "CPU backing: 4 returned · 0 remaining · 0 uncertain · unlaunched cleanup confirmed"
+    );
+    assert_eq!(
+        label("epoch/2/roots"),
+        "Roots: 0 completed of 2 slots · 0 failed · no child spawned; cancellation pending"
+    );
+    assert_eq!(
+        label("epoch/1/transport"),
+        "Transport: opened no · Retired no · helper exited no · output ended no"
+    );
+    assert!(
+        ui.semantic(&UiKey::new("allocation/monitor/completions-empty"))
+            .is_some(),
+        "CPU repayment supplies no delivered build completion"
+    );
 }
 
 #[test]
@@ -178,6 +418,7 @@ fn retained_outcomes_keep_original_identity_and_distinguish_local_eviction_from_
         reserved_bytes: 1024,
         failure: None,
     });
+    observation.snapshot.epochs.push(epoch(3));
     let mut app = app(
         observation,
         vec![RecordSummary {
@@ -220,6 +461,7 @@ fn retained_outcomes_keep_original_identity_and_distinguish_local_eviction_from_
     );
     let index = |key: &str| rows.iter().position(|(found, _)| found == key).unwrap();
     assert!(index("monitor/attempt/2") < index("monitor/completions"));
+    assert!(index("monitor/epoch/3/budget") < index("monitor/completions"));
     assert!(index("monitor/completions") < index("monitor/completion/20"));
     assert_eq!(
         rows.len(),
@@ -234,6 +476,7 @@ fn retained_outcomes_keep_original_identity_and_distinguish_local_eviction_from_
         "monitor/source",
         "monitor/history-gap",
         "monitor/completions-omitted",
+        "monitor/epoch/3/budget",
         "monitor/completion/20",
     ] {
         assert_eq!(

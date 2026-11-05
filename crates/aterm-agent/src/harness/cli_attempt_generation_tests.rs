@@ -511,7 +511,10 @@ fn queued_vendor_renewal_rechecks_its_original_parent_before_running_authenticat
                 &host,
                 &store,
                 (&row, &roster_path, &captured),
-                Some(path),
+                (
+                    Some(path),
+                    crate::harness::sign_in_ladder::asked_fixture(cli, &row.label)
+                ),
                 &mut Vec::new(),
                 &mut Vec::new()
             ),
@@ -598,7 +601,10 @@ fn a_vendor_sign_in_a_person_waited_for_goes_by_what_the_wait_left() {
                 &host,
                 &store,
                 (&row, &roster_path, &captured),
-                Some(path),
+                (
+                    Some(path),
+                    crate::harness::sign_in_ladder::asked_fixture(cli, &row.label),
+                ),
                 &mut Vec::new(),
                 &mut Vec::new(),
             );

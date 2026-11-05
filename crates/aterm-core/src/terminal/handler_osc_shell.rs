@@ -1360,6 +1360,92 @@ mod reported_cwd_tests {
         assert_eq!(s.current_working_directory(), Some("/srv"));
     }
 
+    /// A reset while the shell sits at its prompt (the GUI's manual reset is a RIS) keeps the cwd
+    /// the shell reported there for its next `A`, as it keeps the phase that report waits in.
+    /// NEGATIVE CONTROL: with `ShellIntegrationState::reset` dropping `held_cwd`, `` the next A
+    /// applies it `` fails.
+    #[test]
+    fn a_reset_at_the_prompt_keeps_the_shells_held_cwd() {
+        for host in [false, true] {
+            let mut t = at_prompt();
+            t.process(&osc7("/held"));
+            assert_eq!(
+                t.current_working_directory(),
+                Some("/home/me"),
+                "PRECONDITION: held"
+            );
+            if host {
+                t.reset();
+            } else {
+                t.process(b"\x1bc");
+            }
+            t.process(&signed("A"));
+            assert_eq!(
+                t.current_working_directory(),
+                Some("/held"),
+                "host reset {host}: the next A applies it"
+            );
+        }
+    }
+
+    /// The host's word that a program runs since the prompt outlives a reset: replayed from the
+    /// journal (no live probe), `probe_job_active` is the only record of it, and a job's report at
+    /// the prompt lands. NEGATIVE CONTROL: with `ShellIntegrationState::reset` clearing
+    /// `probe_job_active`, `` the job's report lands `` fails.
+    #[test]
+    fn a_reset_keeps_the_hosts_probe_verdict() {
+        for host in [false, true] {
+            let mut t = at_prompt();
+            t.apply_host_op(crate::terminal::HostOp::ForegroundJob {
+                active: false,
+                probed: true,
+                restore_cwd: false,
+            });
+            if host {
+                t.reset();
+            } else {
+                t.process(b"\x1bc");
+            }
+            t.process(&osc7("/srv/app"));
+            assert_eq!(
+                t.current_working_directory(),
+                Some("/srv/app"),
+                "host reset {host}: the job's report lands"
+            );
+        }
+    }
+
+    /// A probe edge the batch recorded before its RIS still reaches the host journal at the
+    /// batch's end, so a replay sees the verdict the reset kept. NEGATIVE CONTROL: with
+    /// `ShellIntegrationState::reset` clearing `probe_transitioned`, `` RIS true: the edge is
+    /// journaled `` fails.
+    #[test]
+    fn a_ris_keeps_the_batchs_probe_edge_for_the_journal() {
+        for ris in [false, true] {
+            let mut t = at_prompt();
+            t.set_program_probe(Some(Box::new(|_: u64| true)));
+            let from = t.host_ordinal();
+            let tail: &[u8] = if ris { b"\x1bc" } else { b"" };
+            t.process(&[osc7("/srv/app").as_slice(), tail].concat());
+            let edges = t
+                .host_journal_since(from)
+                .0
+                .into_iter()
+                .filter(|r| {
+                    matches!(
+                        r.op,
+                        crate::terminal::HostOp::ForegroundJob {
+                            active: false,
+                            probed: true,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(edges, 1, "RIS {ris}: the edge is journaled");
+        }
+    }
+
     #[test]
     fn an_in_place_restore_drops_the_previous_prompts_held_cwd() {
         let mut ordinary = at_prompt();

@@ -675,7 +675,9 @@ fn join_tried(
     err: &mut dyn Write,
 ) -> Tried {
     let membership = client::status(&me.paths).map(|status| status.membership);
-    if matches!(membership, Ok(client::Membership::In { .. })) {
+    // A seatless recipient (its locker opened, no seat binds it) is no member: it asks for a
+    // seat as a new Mac asks, with the keys it holds (one-mesh S1).
+    if matches!(membership, Ok(client::Membership::In { .. })) && !client::seat_asks(&me.paths) {
         let _ = writeln!(out, "This Mac is already in ALab as {}.", me.name);
         return Tried::Ended(0);
     }
@@ -686,6 +688,17 @@ fn join_tried(
     if matches!(membership, Ok(client::Membership::Pending)) && client::holds_allowed(&me.paths) {
         let _ = writeln!(out, "{}", allowed_words(&(reach.follow)(&me.paths.home)));
         return Tried::Ended(0);
+    }
+    // A lab identity (one a test, a debug build, a lab lane or a VM made) never asks the live
+    // ALab, whose members a browse of `_alab._tcp` finds: with no `--at` it refuses before it
+    // looks for a member or dials one, and before the vault half joins ALab's vault. A lab's own
+    // members service (`ATERM_LAB_MEMBER_SERVICE`) or the members a person names with `--at`
+    // are asked as before, and a member on the live genesis refuses the marked ask itself.
+    if args.at.is_empty()
+        && let Err(error) = client::refuse_lab_member_browse(&me.paths)
+    {
+        let _ = writeln!(err, "aterm members join: {error}");
+        return Tried::Ended(1);
     }
     let joining = match me.joining() {
         Ok(joining) => joining,
@@ -852,6 +865,9 @@ fn join_alab_vault(paths: &Paths) -> aterm_secrets::Result<()> {
 fn wait_at_vault(paths: &Paths, reach: &Reach<'_>) -> Result<Follows, String> {
     let unset = || !matches!(client::config(paths), Ok(Some(_)));
     if unset() {
+        // A lab identity (one `--at` sends to a lab's members) leaves no intent to join the live
+        // ALab's vault: its subscriber would retry a join refused every time (A12).
+        client::refuse_lab_identity(paths).map_err(|error| error.to_string())?;
         client::prepare_alab_join_retry(paths).map_err(|error| error.to_string())?;
         if unset()
             && let Err(error) = (reach.join_vault)(paths)
@@ -1025,9 +1041,12 @@ pub fn ask_members(home: &Path) -> Result<usize, String> {
     let me = Me::at(Paths::for_home(home))?;
     if client::status(&me.paths)
         .is_ok_and(|status| matches!(status.membership, client::Membership::In { .. }))
+        && !client::seat_asks(&me.paths)
     {
         return Err(format!("this Mac is already in ALab as {}", me.name));
     }
+    // A lab identity's subscriber asks no live ALab member ([`join_tried`]).
+    client::refuse_lab_member_browse(&me.paths).map_err(|error| error.to_string())?;
     let ats = aterm_secrets::discover::browse_members(BROWSE_WITHIN)
         .map_err(|error| error.to_string())?;
     ask_after_proof(proved_back(&me, &ats, None), || {
@@ -1245,6 +1264,10 @@ fn status_said(
 pub enum Standing {
     /// A member, under this machine name.
     Member(String),
+    /// The vault's locker opened here, but no seat of the membership log binds this Mac: it is
+    /// no member, and its vault subscriber asks ALab's members for a seat with the same keys
+    /// (one-mesh S1, [`client::Seat::Seatless`]).
+    Seatless,
     /// A member let it in and `~/.secrets` is written; the vault records it once this Mac's
     /// vault subscriber follows the vault.
     Allowed {
@@ -1270,6 +1293,7 @@ impl Standing {
         place: &dyn Fn() -> join::JoinPlace,
     ) -> Self {
         match client::status(paths).map(|status| status.membership) {
+            Ok(client::Membership::In { .. }) if client::seat_asks(paths) => Self::Seatless,
             Ok(client::Membership::In { .. }) => Self::Member(
                 client::config(paths)
                     .ok()
@@ -1304,6 +1328,7 @@ impl Standing {
     pub fn line(&self) -> String {
         match self {
             Self::Member(name) => format!("member as {name}"),
+            Self::Seatless => client::Seat::SEATLESS.to_owned(),
             Self::Allowed { fix, .. } => allowed_line(fix.as_deref()),
             Self::Asking(place) => format!("asking: {}", join::let_in(*place)),
             Self::NotIn => "not in ALab: run `aterm members join` here".to_owned(),
@@ -1332,10 +1357,12 @@ mod tests {
         genesis: [3; 32],
     };
 
-    /// A Mac with a synthetic machine key and Commons device under `root/name`.
+    /// A Mac with a synthetic machine key and Commons device under `root/name`. Its identity is
+    /// unmarked, as a release build makes one on a Mac: these joins ask members a browse finds,
+    /// which a lab identity never does ([`a_lab_identity_asks_no_member_a_browse_finds`]).
     fn mac(root: &Path, name: &str) -> (Paths, Device) {
         let paths = Paths::for_home(&root.join(name));
-        client::machine_identity(&paths).expect("identity");
+        client::machine_identity_as(&paths, aterm_secrets::Making::default()).expect("identity");
         let device = Device::open(&paths).expect("device").expect("an identity");
         (paths, device)
     }
@@ -1642,6 +1669,127 @@ mod tests {
         );
     }
 
+    /// A12: a lab identity (one this test binary makes, as a debug build, a lab lane or a VM
+    /// makes one) that runs `aterm members join` with no `--at`, or the window's phrase join,
+    /// looks for no member, dials none and proves itself to none: a loopback member records no
+    /// connection. The same join from an identity a release build made browses and dials it: the
+    /// pair shows the refusal bites.
+    ///
+    /// NEGATIVE CONTROL: drop the `refuse_lab_member_browse` return in `join_tried`: the lab
+    /// identity browses, and the loopback member hears it.
+    #[test]
+    fn a_lab_identity_asks_no_member_a_browse_finds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback member");
+        let at = listener.local_addr().expect("its address").to_string();
+        let (rang, rings) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+                if rang.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        let (browsed, proved, vaulted) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let dial = |at: &str| -> aterm_secrets::Result<Box<dyn Stream>> {
+            let stream = std::net::TcpStream::connect(at)?;
+            stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
+            Ok(Box::new(stream))
+        };
+        let reach = Reach {
+            browse: &|| {
+                browsed.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![at.clone()])
+            },
+            dial: &dial,
+            prove: &|_, _, _| {
+                proved.fetch_add(1, Ordering::SeqCst);
+                Proved::No
+            },
+            join_vault: &|paths| {
+                vaulted.fetch_add(1, Ordering::SeqCst);
+                no_vault(paths)
+            },
+            follow: &|_| Follows::Runs,
+        };
+        // The identity this Mac's process makes, which `me` keeps.
+        client::machine_identity(&Paths::for_home(&root.path().join("lab"))).expect("identity");
+        let lab = me(root.path(), "lab");
+        assert_eq!(
+            client::lab_mark(&lab.paths).expect("its mark"),
+            Some(aterm_secrets::LabMark::TestBinary)
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let tried = join_tried(&lab, &JoinArgs::default(), &reach, &mut out, &mut err);
+        let said = String::from_utf8_lossy(&err).into_owned();
+        assert_eq!(tried, Tried::Ended(1), "{said}");
+        assert!(said.contains(client::LAB_IDENTITY_REFUSAL), "{said}");
+        let phrase = SecretBytes::from(Phrase::generate().expect("a phrase").words().join(" "));
+        assert!(
+            matches!(
+                phrase_join_as(&lab, &phrase, &reach),
+                PhraseTry::Refused(ref why) if why.contains(client::LAB_IDENTITY_REFUSAL)
+            ),
+            "the window's phrase join refuses too"
+        );
+        assert_eq!(
+            browsed.load(Ordering::SeqCst),
+            0,
+            "no member was looked for"
+        );
+        assert_eq!(proved.load(Ordering::SeqCst), 0, "no member was proved to");
+        assert_eq!(
+            vaulted.load(Ordering::SeqCst),
+            0,
+            "ALab's vault was not joined"
+        );
+        assert!(rings.try_recv().is_err(), "no member was dialed");
+
+        // The members a person names with `--at` are asked; the live ALab's vault is neither
+        // joined nor left for the subscriber to retry.
+        let named = JoinArgs {
+            at: vec![at.clone()],
+            ..JoinArgs::default()
+        };
+        join_tried(&lab, &named, &reach, &mut out, &mut err);
+        rings
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the member named is dialed");
+        assert_eq!(browsed.load(Ordering::SeqCst), 0, "none was looked for");
+        assert_eq!(
+            vaulted.load(Ordering::SeqCst),
+            0,
+            "ALab's vault was not joined"
+        );
+        assert!(
+            !lab.paths.dir.join("alab-join-pending").exists(),
+            "no intent to join ALab's vault"
+        );
+
+        let release = me(root.path(), "release");
+        assert_eq!(client::lab_mark(&release.paths).expect("its mark"), None);
+        let mut err = Vec::new();
+        // The member hangs up on the ask, and the join waits at the vault, as any does.
+        join_tried(&release, &JoinArgs::default(), &reach, &mut out, &mut err);
+        let said = String::from_utf8_lossy(&err).into_owned();
+        assert!(!said.contains(client::LAB_IDENTITY_REFUSAL), "{said}");
+        assert_eq!(
+            browsed.load(Ordering::SeqCst),
+            1,
+            "a release identity browses"
+        );
+        assert_eq!(vaulted.load(Ordering::SeqCst), 1, "and joins ALab's vault");
+        rings
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("and dials the member it found");
+    }
+
     /// A Mac a member let in that runs `aterm members join` again (one still waiting on a lane
     /// with no window, or install.sh's `--no-wait` on its next lane) says it was allowed and
     /// makes sure its subscriber runs. It asks no member and does not say to press Allow: the
@@ -1722,6 +1870,8 @@ mod tests {
     fn a_first_vault_fetch_failure_keeps_headless_bootstrap_running() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let paths = Paths::for_home(root.path());
+        // A Mac a release build set up: a lab identity sets up no join of ALab's vault.
+        client::machine_identity_as(&paths, aterm_secrets::Making::default()).expect("identity");
         let followed = std::sync::atomic::AtomicBool::new(false);
         let follow = |_: &Path| {
             followed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1830,7 +1980,11 @@ mod tests {
             join_vault: &|_| panic!("sharing off: no fetch"),
             follow: &|_| panic!("sharing off: no follower"),
         };
-        assert!(wait_at_vault(&paths, &reach).is_err());
+        // A Mac a release build set up, so sharing alone stops it (a lab identity would be
+        // refused first).
+        client::machine_identity_as(&paths, aterm_secrets::Making::default()).expect("identity");
+        let refused = wait_at_vault(&paths, &reach).expect_err("sharing off");
+        assert!(refused.contains("sharing is off"), "{refused}");
         assert!(client::config(&paths).unwrap().is_none());
     }
 

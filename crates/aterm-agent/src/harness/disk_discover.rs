@@ -526,6 +526,7 @@ pub(crate) fn census_of_running(
 }
 
 fn read_process(pid: u32, home: Option<&Path>, scratch: Option<&Scratch>) -> Option<Process> {
+    aterm_uds::progress::tick();
     let read = || {
         let exec = atpkg::caller_shell::process_args(pid).and_then(Exec::of);
         (exec, aterm_uds::holders::exe_of(pid))
@@ -677,6 +678,145 @@ pub struct Discovered {
     pub found: Vec<Found>,
     pub notes: Vec<String>,
     pub cut: Option<String>,
+    /// The checkouts' `target*` links whose target is not there ([`Dangling`]).
+    pub dangling: Vec<Dangling>,
+}
+
+/// The most dangling links one walk records.
+pub const MAX_DANGLING: usize = 64;
+
+/// A checkout's `target*` link the walk met whose target is not there
+/// (`docs/DESIGN-leftover-processes-2026-10-16.md` §5.6): a removed `target.noindex`, or a cache
+/// on a volume that is not mounted. Recorded only in a checkout the walk visits anyway, and
+/// never followed further, deleted, retargeted or repaired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dangling {
+    /// The link.
+    pub link: PathBuf,
+    /// Its target, as the link says it (relative to the link's folder when it is relative).
+    pub target: PathBuf,
+    /// The checkout it is in.
+    pub checkout: PathBuf,
+    /// Whether its target is gone or on a volume that is not mounted.
+    pub state: aterm_vitals::left::LinkTarget,
+}
+
+/// The folders an operating system mounts removable and network volumes in, each with whether
+/// it keeps a folder per user first (`/run/media/<user>/<volume>`): a target under one whose
+/// volume folder is missing is on a volume that is not mounted, not gone.
+const VOLUME_FOLDERS: &[(&str, bool)] = if cfg!(target_os = "macos") {
+    &[("/Volumes", false)]
+} else if cfg!(windows) {
+    &[]
+} else {
+    &[("/media", true), ("/run/media", true), ("/mnt", false)]
+};
+
+/// Whether `target` (absolute) is on a volume that is not mounted: its drive is missing
+/// (Windows), or the nearest folder of it that is there is one of [`VOLUME_FOLDERS`] (or the
+/// user's folder in one that keeps them), or a folder in one that no volume is mounted on (an
+/// empty mount point, as `/mnt/<volume>` stays while its volume is not mounted).
+fn on_missing_volume(target: &Path) -> bool {
+    on_missing_volume_in(target, VOLUME_FOLDERS)
+}
+
+/// [`on_missing_volume`] with `folders` as the folders volumes are mounted in.
+fn on_missing_volume_in(target: &Path, folders: &[(&str, bool)]) -> bool {
+    let holds_volumes = |p: &Path| {
+        folders.iter().any(|&(folder, per_user)| {
+            let folder = Path::new(folder);
+            p == folder || (per_user && p.parent() == Some(folder))
+        })
+    };
+    let mut at = target;
+    while let Some(up) = at.parent() {
+        if let Ok(meta) = std::fs::symlink_metadata(up) {
+            return holds_volumes(up)
+                || (meta.is_dir()
+                    && up.parent().is_some_and(holds_volumes)
+                    && !mounted_on(up, &meta));
+        }
+        at = up;
+    }
+    cfg!(windows)
+}
+
+/// Whether a volume is mounted on the folder `dir` (its `lstat`, `meta`): it is on another
+/// device than its parent.
+fn mounted_on(dir: &Path, meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        dir.parent()
+            .and_then(|up| std::fs::symlink_metadata(up).ok())
+            .is_none_or(|up| up.dev() != meta.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, meta);
+        true
+    }
+}
+
+/// Where a link in `dir` whose target reads `to` leads, its `.` and `..` parts taken as the
+/// path's own words, so a target that climbs out of the checkout is the folder it names (the
+/// walk descends real folders, so `dir` names no link of its own).
+fn link_target(dir: &Path, to: &Path) -> PathBuf {
+    let mut at = PathBuf::new();
+    for part in dir.join(to).components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                at.pop();
+            }
+            part => at.push(part),
+        }
+    }
+    at
+}
+
+impl Dangling {
+    /// This record as a look reads it again: `None` once the link is gone or names another
+    /// target, or its target is there now; else whether its target is gone or on a volume that
+    /// is not mounted, read anew. Only the link and the path its target names are read, never
+    /// past them.
+    #[must_use]
+    pub fn again(self) -> Option<Self> {
+        if std::fs::read_link(&self.link).ok()? != self.target {
+            return None;
+        }
+        let abs = link_target(self.link.parent()?, &self.target);
+        match std::fs::symlink_metadata(&abs) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Self {
+                state: if on_missing_volume(&abs) {
+                    aterm_vitals::left::LinkTarget::NotMounted
+                } else {
+                    aterm_vitals::left::LinkTarget::Gone
+                },
+                ..self
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// What a look keeps of the dangling links: each of `kept` (what earlier searches recorded) and
+/// then of `found` (what this look's search recorded, if it searched) that still dangles
+/// ([`Dangling::again`]), each link once, at most [`MAX_DANGLING`]. A search that walked some
+/// checkouts and not others drops no link that still dangles, and a look with no search drops
+/// the ones fixed since.
+#[must_use]
+pub fn still_dangling(kept: Vec<Dangling>, found: Vec<Dangling>) -> Vec<Dangling> {
+    let mut out: Vec<Dangling> = Vec::new();
+    for d in kept.into_iter().chain(found) {
+        if out.len() < MAX_DANGLING
+            && !out.iter().any(|o| o.link == d.link)
+            && let Some(d) = d.again()
+        {
+            out.push(d);
+        }
+    }
+    out
 }
 
 /// An automatic watch's place among physical build directories. This is a selection hint,
@@ -858,6 +998,7 @@ fn discover_on(
                     found: Vec::new(),
                     notes: vec![format!("cargo-targets: {why}")],
                     cut: Some(why),
+                    dangling: Vec::new(),
                 },
                 None,
                 None,
@@ -980,7 +1121,17 @@ fn discover_on(
         notes.push(format!("cargo-targets: {why}"));
         cut.get_or_insert(why);
     }
-    (Discovered { found, notes, cut }, next, pending)
+    let dangling = w.dangling;
+    (
+        Discovered {
+            found,
+            notes,
+            cut,
+            dangling,
+        },
+        next,
+        pending,
+    )
 }
 
 fn marked(dir: &Path) -> bool {
@@ -1249,6 +1400,7 @@ struct Walk {
     mounts: BTreeSet<PathBuf>,
     foreign: Vec<PathBuf>,
     notes: Vec<String>,
+    dangling: Vec<Dangling>,
     _exposed: Exposed,
 }
 
@@ -1289,6 +1441,7 @@ impl Walk {
                 .cloned()
                 .collect(),
             notes: Vec::new(),
+            dangling: Vec::new(),
             _exposed: exposed,
         })
     }
@@ -1351,7 +1504,9 @@ impl Walk {
         let Ok(to) = std::fs::read_link(link) else {
             return true;
         };
-        let abs = link.parent().map_or_else(|| to.clone(), |p| p.join(&to));
+        let abs = link
+            .parent()
+            .map_or_else(|| to.clone(), |p| link_target(p, &to));
         if cfg!(windows) {
             use aterm_sysprobe::paths::{key_under, windows_key};
             let Some(key) = windows_key(&abs) else {
@@ -1430,7 +1585,7 @@ impl Walk {
             }
         }
         self.entries = self.entries.saturating_add(out.len());
-        super::beat::tick(out.len());
+        aterm_uds::progress::tick();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
@@ -1540,16 +1695,24 @@ impl Walk {
             if ty.is_symlink() {
                 // The ONE link followed: a checkout's `target -> target.noindex`
                 // — its marker never read where it leads into a sync root or
-                // another app's container.
-                if n.starts_with("target")
-                    && !self.leads_into_mount(&path)
-                    && let Ok(real) = std::fs::canonicalize(&path)
-                    && !self.fenced(&real)
-                    && std::fs::metadata(&real).is_ok_and(|m| m.is_dir())
-                    && self.outside_sync_root(&real)
-                    && marked(&real)
-                {
-                    self.add_via(&real, origin, &path);
+                // another app's container. One whose target is not there is
+                // recorded and left as it is.
+                if n.starts_with("target") && !self.leads_into_mount(&path) {
+                    match std::fs::canonicalize(&path) {
+                        Ok(real) => {
+                            if !self.fenced(&real)
+                                && std::fs::metadata(&real).is_ok_and(|m| m.is_dir())
+                                && self.outside_sync_root(&real)
+                                && marked(&real)
+                            {
+                                self.add_via(&real, origin, &path);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            self.dangle(&path, origin);
+                        }
+                        Err(_) => {}
+                    }
                 }
                 continue;
             }
@@ -1562,6 +1725,34 @@ impl Walk {
                 self.marked_walk(&path, depth - 1, dev, origin);
             }
         }
+    }
+
+    /// Records `link`, a `target*` link of a checkout whose target is not there ([`Dangling`]);
+    /// a link met under another origin is not recorded.
+    fn dangle(&mut self, link: &Path, origin: &Origin) {
+        let Origin::Checkout { root } = origin else {
+            return;
+        };
+        let Ok(target) = std::fs::read_link(link) else {
+            return;
+        };
+        if self.dangling.len() >= MAX_DANGLING || self.dangling.iter().any(|d| d.link == link) {
+            return;
+        }
+        let abs = link
+            .parent()
+            .map_or_else(|| target.clone(), |dir| link_target(dir, &target));
+        let state = if on_missing_volume(&abs) {
+            aterm_vitals::left::LinkTarget::NotMounted
+        } else {
+            aterm_vitals::left::LinkTarget::Gone
+        };
+        self.dangling.push(Dangling {
+            link: link.to_path_buf(),
+            target,
+            checkout: root.clone(),
+            state,
+        });
     }
 
     fn bootstrap(&mut self, repo: &Path) {
@@ -1729,14 +1920,14 @@ impl Owner {
         }
     }
 
-    /// Returns the required quiet duration in seconds before a gone owner's build directory can be removed.
+    /// Returns the required quiet duration in seconds before a gone owner's directory can be
+    /// removed: a gone workspace's build cache waits only the ten minutes no pass takes a profile
+    /// a compile wrote into ([`super::PRESSURE_MIN_IDLE_S`]), short or not, since nobody builds
+    /// into a removed workspace again; a Claude session waits `quiet_s`.
     #[must_use]
-    pub fn quiet_s(&self, quiet_s: i64, short: bool) -> i64 {
+    pub fn quiet_s(&self, quiet_s: i64) -> i64 {
         match self {
-            Owner::BuildCache { .. } if short => super::PRESSURE_MIN_IDLE_S,
-            Owner::BuildCache { .. } => {
-                i64::try_from(atpkg::build_cache::RECLAIM_GONE.as_secs()).unwrap_or(i64::MAX)
-            }
+            Owner::BuildCache { .. } => super::PRESSURE_MIN_IDLE_S,
             Owner::ClaudeSession { .. } => quiet_s,
         }
     }
@@ -2312,7 +2503,7 @@ pub fn newest_write(dir: &Path, max: usize) -> Result<Option<i64>, String> {
             .any(|e| CARGO_LOCKS.iter().any(|l| e.file_name() == *l));
         for e in entries {
             seen += 1;
-            super::beat::tick(1);
+            aterm_uds::progress::tick();
             if seen > max {
                 return Err(format!(
                     "{} holds more than {max} entries, too many to date",

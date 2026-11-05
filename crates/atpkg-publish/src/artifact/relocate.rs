@@ -327,7 +327,20 @@ fn write_vendored_record(vendored: &Path, report: &Report) -> Result<(), String>
         text.push_str(&format!("{} {} {}\n", v.sha256, v.name, v.donor_rel));
     }
     let dest = vendored.join(VENDORED_RECORD);
-    std::fs::write(&dest, text).map_err(|e| format!("write {}: {e}", dest.display()))
+    let _ = std::fs::remove_file(&dest);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    opts.open(&dest)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(text.as_bytes())
+        })
+        .map_err(|e| format!("write {}: {e}", dest.display()))
 }
 
 struct VendorTo<'a> {
@@ -385,7 +398,8 @@ fn vendor_file(
     };
     std::fs::create_dir_all(to.dir).map_err(|e| format!("create vendored dir: {e}"))?;
     let dest = to.dir.join(base);
-    std::fs::copy(&canonical, &dest).map_err(|e| format!("vendor {}: {e}", src.display()))?;
+    crate::identity::copy_regular_file(&canonical, &dest)
+        .map_err(|e| format!("vendor {}: {e}", src.display()))?;
     let donor_sha = atpkg::tree::sha256_file(&canonical)
         .map_err(|e| format!("hash {}: {e}", canonical.display()))?;
     let copy_sha =
@@ -429,8 +443,9 @@ fn hard_link_key(_path: &Path) -> Option<(u64, u64)> {
 }
 
 fn relink_aliases(stage: &Path, obj: &Path, aliases: &[PathBuf]) -> Result<(), String> {
+    let obj_key = hard_link_key(obj);
     for alias in aliases {
-        if hard_link_key(obj).is_some() && hard_link_key(obj) == hard_link_key(alias) {
+        if obj_key.is_some() && obj_key == hard_link_key(alias) {
             continue;
         }
         super::relink::replace(obj, alias).map_err(|e| {

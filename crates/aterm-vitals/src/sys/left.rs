@@ -9,14 +9,36 @@ use super::json::Jv;
 use super::query::{ScopeArg, SysQuery};
 use super::view::{Line, scope_keys};
 use super::{Ctx, clock_ms, pct};
-use crate::left::{LeftRow, LeftView, RunRow, Source, State};
+use crate::left::{ENTRY_AFTER_MS, LeftRow, LeftView, LinkRow, RunRow, Source, State};
 use crate::model::Snapshot;
+
+/// `status`'s `left=` field for the session `sid` from `view`, `age_ms` being the view's age: how
+/// many of its agent's left rows the view names ([`crate::left::agents_left_count`]) and the
+/// oldest's age to now, ms (`-` where no row's age was read); `left=0:-` with none, `left=-` with
+/// no view, no session id or a partial view, which can say a row is left but never that none is.
+#[must_use]
+pub fn status_field(view: Option<&LeftView>, sid: Option<&str>, age_ms: u64) -> String {
+    let counted = view
+        .zip(sid)
+        .and_then(|(view, sid)| crate::left::agents_left_count(view, sid));
+    match counted {
+        None => "left=-".to_owned(),
+        Some((0, _)) => "left=0:-".to_owned(),
+        Some((n, oldest)) => format!(
+            "left={n}:{}",
+            oldest.map_or_else(
+                || "-".to_owned(),
+                |ms| ms.saturating_add(age_ms).to_string()
+            )
+        ),
+    }
+}
 
 /// The rows and runs a reply shows, by its scope.
 struct Shown<'a> {
     rows: Vec<&'a LeftRow>,
     runs: Vec<&'a RunRow>,
-    links: &'a [crate::left::LinkRow],
+    links: &'a [LinkRow],
 }
 
 /// The sessions' ids of `keys`, as the host names them.
@@ -145,6 +167,9 @@ fn proc_text(ctx: &Ctx<'_>, view: &LeftView, row: &LeftRow) -> String {
     if let Some(sid) = &row.teller {
         t.push_str(&format!(" teller={}", pct(sid)));
     }
+    if let Some(sid) = crate::left::left_of(view, row) {
+        t.push_str(&format!(" left_of={}", pct(sid)));
+    }
     t.push_str(&format!(" end={}", row.token.as_deref().unwrap_or("-")));
     t
 }
@@ -231,16 +256,31 @@ pub(super) fn left_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut V
         });
     }
     for (i, link) in shown.links.iter().enumerate() {
+        let mut text = format!(
+            "link state=dangling root={} kind={} target={} seen={}",
+            link_root(ctx, link),
+            pct(&link.kind),
+            link.target.word(),
+            pct(&link.seen)
+        );
+        if ctx.caller_panes.is_none() {
+            text.push_str(&format!(" path={}", pct(&link.path)));
+        }
         lines.push(Line {
             key: format!("link:{i}"),
-            text: format!(
-                "link state=dangling root={} kind={} seen={}",
-                link.root,
-                pct(&link.kind),
-                pct(&link.seen)
-            ),
+            text,
             value: true,
         });
+    }
+}
+
+/// `root=`'s word for a link: its checkout's path with no caller session (no session owns a
+/// link), else its number among the checkouts the view's links name.
+fn link_root(ctx: &Ctx<'_>, link: &LinkRow) -> String {
+    if ctx.caller_panes.is_none() {
+        pct(&link.checkout)
+    } else {
+        link.root.to_string()
     }
 }
 
@@ -276,9 +316,19 @@ fn proc_json(ctx: &Ctx<'_>, view: &LeftView, row: &LeftRow) -> Jv {
     if let Some(sid) = &row.teller {
         o.set("teller", Jv::s(pct(sid)));
     }
+    if let Some(sid) = crate::left::left_of(view, row) {
+        o.set("left_of", Jv::s(pct(sid)));
+    }
     o.set(
         "end",
         row.token.as_deref().map_or_else(|| Jv::s("-"), Jv::s),
+    );
+    if let Some(ms) = crate::left::owner_gone_ms(row, view) {
+        o.set("owner_gone_ms", Jv::u(ms));
+    }
+    o.set(
+        "entry",
+        Jv::Bool(crate::left::eligible(row, view, ENTRY_AFTER_MS)),
     );
     o
 }
@@ -352,12 +402,18 @@ pub(super) fn left_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, o: &mut Jv) {
                 .links
                 .iter()
                 .map(|l| {
-                    Jv::obj([
+                    let mut o = Jv::obj([
                         ("state", Jv::s("dangling")),
                         ("root", Jv::u(l.root as u64)),
                         ("kind", Jv::s(pct(&l.kind))),
+                        ("target", Jv::s(l.target.word())),
                         ("seen", Jv::s(pct(&l.seen))),
-                    ])
+                    ]);
+                    if ctx.caller_panes.is_none() {
+                        o.set("checkout", Jv::s(pct(&l.checkout)));
+                        o.set("path", Jv::s(pct(&l.path)));
+                    }
+                    o
                 })
                 .collect(),
         ),

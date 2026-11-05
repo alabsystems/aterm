@@ -18,6 +18,7 @@ use super::*;
 
 const LONG: QuestionPriority = QuestionPriority::LongTerm;
 const SHORT: QuestionPriority = QuestionPriority::ShortTerm;
+const LAND: QuestionPriority = QuestionPriority::Land;
 const COLS: u16 = 120;
 
 fn text_of(p: QuestionPriority) -> &'static str {
@@ -26,7 +27,7 @@ fn text_of(p: QuestionPriority) -> &'static str {
 
 fn decided(rows: &[String], p: QuestionPriority, own: Option<QuestionPriority>) -> Decision {
     let prompt = parse_prompt_v2(rows).unwrap_or_else(|| panic!("no box: {rows:#?}"));
-    answer_question(&prompt, rows, p, own, false, Pane::of(rows))
+    answer_question(&prompt, rows, p, own, (false, false), Pane::of(rows))
 }
 
 /// What an answer does: writes a priority's text, or presses Enter on a
@@ -135,7 +136,7 @@ fn the_policy_texts_keep_their_rules() {
         why
     };
     assert!(!broken(f::MEASURED_LONG_TERM_2_1_283).is_empty());
-    for p in [LONG, SHORT] {
+    for p in [LONG, SHORT, LAND] {
         let text = text_of(p);
         assert_eq!(broken(text), Vec::<&str>::new(), "{p:?}");
         for width in 40..=220usize {
@@ -164,6 +165,15 @@ fn the_policy_texts_keep_their_rules() {
         assert_eq!(QuestionPriority::parse(p.word()), Some(p));
         assert!(is_question_rule(p.rule_id()), "{p:?}");
     }
+    for p in QuestionPriority::EVERY {
+        assert_eq!(QuestionPriority::of_fact(p.word()), Some(p));
+    }
+    assert_eq!(
+        QuestionPriority::parse("land"),
+        None,
+        "no person sets Land's priority"
+    );
+    assert!(is_question_rule(LAND.rule_id()));
     assert_eq!(QuestionPriority::Recommended.text(), None);
     for rule in [
         RULE_ALLOW_ONCE,
@@ -340,7 +350,21 @@ fn a_single_select_is_typed_then_entered_and_anything_else_is_the_persons() {
         assert_eq!(what, Did::Type(-1, p));
         assert!(!unproven.contains("moved off"), "{unproven}");
 
-        assert!(reason(&decided(&pristine, p, Some(p))).contains("gone"));
+        let (what, rule, _, _) = did(&decided(&pristine, p, Some(p)));
+        assert_eq!(what, Did::Enter(-2, AnswerTarget::Option(1)));
+        assert_eq!(rule, p.rule_id());
+        let prompt = parse_prompt_v2(&pristine).unwrap();
+        assert!(matches!(
+            answer_question(
+                &prompt,
+                &pristine,
+                p,
+                Some(p),
+                (false, true),
+                Pane::of(&pristine)
+            ),
+            Decision::Escalate { .. }
+        ));
 
         let own = rewrap_free_text(f::QUESTION_283_TYPED_LONG_TERM, text, 120);
         let (what, rule, _, _) = did(&decided(&own, p, Some(p)));
@@ -418,13 +442,17 @@ fn a_multi_select_is_typed_then_submitted_by_its_button_never_in_the_field() {
         assert_eq!(free_text_of(&unticked).text, text);
         assert!(reason(&decided(&unticked, p, Some(p))).contains("unticked"));
         let checked = edited(&pristine, "1. [ ] Cheese", "1. [✔] Cheese");
-        assert!(reason(&decided(&checked, p, None)).contains("option 1 is checked"));
+        let (what, rule, _, _) = did(&decided(&checked, p, None));
+        assert_eq!(what, Did::Enter(1, AnswerTarget::Button));
+        assert_eq!(rule, p.rule_id());
         let checked_own = edited(&typed, "1. [ ] Cheese", "1. [✔] Cheese");
         assert!(reason(&decided(&checked_own, p, Some(p))).contains("option 1 is checked"));
         let person = screen(f::QUESTION_283_MULTISELECT_TYPED_PERSON);
         assert!(reason(&decided(&person, p, Some(p))).contains("did not write"));
         assert!(reason(&decided(&typed, p, None)).contains("did not write"));
-        assert!(reason(&decided(&pristine, p, Some(p))).contains("gone"));
+        let (what, rule, _, _) = did(&decided(&pristine, p, Some(p)));
+        assert_eq!(what, Did::Enter(-3, AnswerTarget::Option(1)));
+        assert_eq!(rule, p.rule_id());
         let ticked_empty = edited(&pristine, "4. [ ] Type something", "4. [✔] Type something");
         assert!(
             matches!(decided(&ticked_empty, p, None), Decision::Escalate { .. }),
@@ -457,7 +485,7 @@ fn a_multi_select_text_its_dialog_would_draw_over_is_never_typed() {
             cols: u16::try_from(cols).expect("cols"),
             rows: 50,
         };
-        answer_question(&prompt, &rows, LONG, None, false, pane)
+        answer_question(&prompt, &rows, LONG, None, (false, false), pane)
     };
     for cols in [80, 40] {
         let (what, rule, subject, _) = did(&decide_at(cols));
@@ -714,7 +742,14 @@ fn a_multi_select_text_is_typed_at_every_measured_width_it_keeps_its_rows() {
         assert_eq!(label_col(&field), 9, "{cols}");
         let prompt = parse_prompt_v2(&rows).expect("a box");
         let pane = Pane { cols, rows: 60 };
-        let (what, _, subject, _) = did(&answer_question(&prompt, &rows, LONG, None, false, pane));
+        let (what, _, subject, _) = did(&answer_question(
+            &prompt,
+            &rows,
+            LONG,
+            None,
+            (false, false),
+            pane,
+        ));
         if cols == 80 {
             assert_eq!(what, Did::Enter(0, AnswerTarget::Option(1)), "{subject}");
         } else {
@@ -822,6 +857,21 @@ fn a_tab_the_text_cannot_go_to_is_answered_with_its_recommended_option_and_says_
     let (what, rule, _, _) = did(&decided(&single, p, None));
     assert_eq!(what, Did::Enter(-2, AnswerTarget::Option(1)));
     assert_eq!(rule, RULE_ANSWER_LONG_TERM);
+    let no_recommendation: Vec<String> = screen(f::QUESTION_MODEL_SWITCH_PREFERENCE)
+        .iter()
+        .map(|row| row.replace("flagged this message", "flagged this delete"))
+        .collect();
+    assert!(
+        matches!(
+            decided(&no_recommendation, p, None),
+            Decision::Escalate { .. }
+        ),
+        "an unmarked destructive question has no authorized stand-in"
+    );
+    assert!(
+        matches!(decided(&single, p, Some(SHORT)), Decision::Escalate { .. }),
+        "a changed priority latch never adopts the stand-in"
+    );
     let multi = tight(f::QUESTION_283_MULTISELECT_FREE_TEXT_FOCUSED);
     assert_eq!(
         did(&decided(&multi, p, None)).0,
@@ -859,7 +909,9 @@ fn a_tab_the_text_cannot_go_to_is_answered_with_its_recommended_option_and_says_
         assert_eq!(rule, RULE_ANSWER_LONG_TERM);
     }
     let skipped = screen(f::QUESTION_REVIEW_UNANSWERED);
-    reason(&decided(&skipped, p, None));
+    let (what, rule, _, _) = did(&decided(&skipped, p, None));
+    assert_eq!(what, Did::Enter(0, AnswerTarget::ReviewSubmit));
+    assert_eq!(rule, p.rule_id());
 
     let rows = screen(f::QUESTION_DO_YOU_WANT_LIVE);
     assert!(matches!(decided(&rows, p, None), Decision::Approve { .. }));
@@ -1112,7 +1164,7 @@ fn the_recommended_decisions_ignore_memory_and_pane_width() {
                 rows,
                 QuestionPriority::Recommended,
                 own,
-                false,
+                (false, false),
                 Pane {
                     cols,
                     rows: rows.len(),
@@ -1520,7 +1572,7 @@ fn tier1_text_mode_decider_chooses_only_what_the_model_enables() {
         let real = move |d: &Drawing| {
             let prompt =
                 parse_prompt_v2(&d.rows).unwrap_or_else(|| panic!("no box: {:#?}", d.rows));
-            answer_question(&prompt, &d.rows, p, d.own, d.fell_back, d.pane)
+            answer_question(&prompt, &d.rows, p, d.own, (d.fell_back, false), d.pane)
         };
         for multi in [false, true] {
             let verdicts = bind(of(multi), p, &real).unwrap_or_else(|wrong| {
@@ -1647,10 +1699,7 @@ fn a_multi_select_text_drawn_against_its_checkbox_is_submitted_by_its_button() {
         "a person's word"
     );
     let unticked = edited(&rows, "[✔]Decide", "[ ]Decide");
-    assert_eq!(
-        reason(&decided(&unticked, LONG, Some(LONG))),
-        "the long-term policy text's row reads unticked: its answer would be none"
-    );
+    assert!(reason(&decided(&unticked, LONG, Some(LONG))).contains("unticked"));
     let (_, over) = REFLOW_2_1_300[0];
     assert!(
         reason(&decided(&screen(over), LONG, Some(LONG)))
@@ -1695,7 +1744,7 @@ fn muses_question_takes_the_text_as_a_note_and_its_review_is_sent() {
     };
     let (prompt, rows) = read(u::QUESTION);
     for p in [LONG, SHORT] {
-        match answer_question(&prompt, &rows, p, None, false, Pane::of(&rows)) {
+        match answer_question(&prompt, &rows, p, None, (false, false), Pane::of(&rows)) {
             Decision::Approve {
                 rule_id,
                 choice,
@@ -1764,7 +1813,7 @@ fn muses_question_takes_the_text_as_a_note_and_its_review_is_sent() {
         let (p, rows) = read(text);
         assert!(aterm_phase::muse::is_review(&p), "PRECONDITION: {text}");
         (
-            answer_question(&p, &rows, priority, own, false, Pane::of(&rows)),
+            answer_question(&p, &rows, priority, own, (false, false), Pane::of(&rows)),
             rows,
         )
     };
@@ -1845,7 +1894,7 @@ fn muses_question_takes_the_text_as_a_note_and_its_review_is_sent() {
             .prompt
             .expect("the review");
         assert!(aterm_phase::muse::is_review(&p), "PRECONDITION: {what}");
-        let d = answer_question(&p, &rows, priority, own, false, Pane::of(&rows));
+        let d = answer_question(&p, &rows, priority, own, (false, false), Pane::of(&rows));
         assert!(
             matches!(&d, Decision::Escalate { reason } if reason.contains(says)),
             "{what}: {d:?}"
@@ -1853,7 +1902,196 @@ fn muses_question_takes_the_text_as_a_note_and_its_review_is_sent() {
     }
     for text in [u::QUESTION_MULTI, u::QUESTION_MULTISELECT] {
         let (p, rows) = read(text);
-        let d = answer_question(&p, &rows, LONG, None, false, Pane::of(&rows));
+        let d = answer_question(&p, &rows, LONG, None, (false, false), Pane::of(&rows));
         assert!(matches!(d, Decision::Escalate { .. }), "{text}: {d:?}");
     }
+}
+
+/// LAND'S DIALOG TEXT (`answer-land@v1`): a pristine single- or multi-select under Land is
+/// answered by writing [`LAND_TEXT`] into its free-text row; a preview, which has none, takes its
+/// recommended option under Land's rule and says why. NEGATIVE CONTROL: the same captures under
+/// `recommended` press Enter on the (Recommended) row. MUTANT: Land's `text()` as `None`.
+#[test]
+fn a_dialog_under_land_writes_the_land_text() {
+    for capture in [
+        f::QUESTION_283_FREE_TEXT_FOCUSED,
+        f::QUESTION_283_MULTISELECT_FREE_TEXT_FOCUSED,
+    ] {
+        let rows = screen(capture);
+        let (what, rule, subject, unproven) = did(&decided(&rows, LAND, None));
+        assert_eq!(what, Did::Type(0, LAND), "{capture:.60}");
+        assert_eq!(rule, "answer-land@v1");
+        assert!(subject.ends_with("→ the land policy text"), "{subject}");
+        assert!(
+            unproven.starts_with("policy land: the worker decides"),
+            "{unproven}"
+        );
+        let (what, rule, _, _) = did(&decided(&rows, QuestionPriority::Recommended, None));
+        assert!(
+            matches!(what, Did::Enter(_, AnswerTarget::Option(_))),
+            "the control: {what:?}"
+        );
+        assert_eq!(rule, RULE_ANSWER_RECOMMENDED);
+    }
+    let preview = screen(f::QUESTION_283_PREVIEW);
+    let (what, rule, _, unproven) = did(&decided(&preview, LAND, None));
+    assert_eq!(what, Did::Enter(0, AnswerTarget::Option(1)));
+    assert_eq!(rule, "answer-land@v1");
+    assert!(
+        unproven.starts_with("policy land: a preview question has no free-text row"),
+        "{unproven}"
+    );
+}
+
+/// The question captures the holdouts read, each as its own program reads it, one per file of
+/// `aterm-phase`'s fixtures named for a question: (name, rows, prompt).
+fn question_captures() -> Vec<(String, Vec<String>, aterm_phase::PromptV2)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the phase fixtures")
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.contains("question") && n.ends_with(".txt"))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let program = ["claude", "muse", "agy"]
+                .into_iter()
+                .find(|p| name.starts_with(&format!("{p}-")))?;
+            let text = std::fs::read_to_string(dir.join(&name)).expect("a fixture");
+            let rows = screen(&text);
+            let prompt = aterm_phase::read(Some(program), &rows, None)
+                .prompt
+                .filter(|p| p.kind == aterm_phase::PromptKind::Question)?;
+            Some((name, rows, prompt))
+        })
+        .collect()
+}
+
+/// M1, THE FIT HOLDOUT: on every committed question capture with a free-text row, at 80, 120 and
+/// 200 columns, Land's text fits (and keeps a multi-select's rows) in every cell the long-term
+/// text does. Land's is the shorter text, so it fits in more (153 of 192 cells, the long-term
+/// text 135, as this test printed on 2026-11-05). MUTANT: a 400-character Land text.
+#[test]
+fn the_land_text_fits_wherever_the_long_term_text_does() {
+    let (mut long, mut land, mut cells) = (0, 0, 0);
+    for (name, rows, prompt) in question_captures() {
+        let Some(dialog) = prompt.question_dialog.as_ref() else {
+            continue;
+        };
+        let (free_text, multi) = match &dialog.form {
+            QuestionForm::Single { free_text, .. } => (free_text, false),
+            QuestionForm::Multi { free_text, .. } => (free_text, true),
+            _ => continue,
+        };
+        let col = label_col(free_text);
+        for cols in [80u16, 120, 200] {
+            let pane = Pane {
+                cols,
+                rows: rows.len(),
+            };
+            let fits = |text: &str| {
+                text_fits(&prompt, &rows, pane, col, text)
+                    && (!multi || text_keeps_its_rows(text, cols, col))
+            };
+            cells += 1;
+            let (l, t) = (fits(LONG_TERM_TEXT), fits(LAND_TEXT));
+            assert!(
+                !l || t,
+                "{name} at {cols}: the long-term text fits, Land's does not"
+            );
+            long += usize::from(l);
+            land += usize::from(t);
+        }
+    }
+    assert!(
+        long > 0 && long < cells,
+        "{long} of {cells}: the holdout tells fit from none"
+    );
+    assert!(
+        land >= long,
+        "Land fits in {land} of {cells} cells, long-term in {long}"
+    );
+    println!("M1: Land fits in {land} of {cells} cells, long-term in {long}");
+}
+
+/// EVERY TEXT PRIORITY TAKES A DIALOG THE RECOMMENDED ANSWER WOULD TAKE: over every committed question
+/// capture (Claude Code's single, multi, preview and review; Muse Code's; agy's), at 80, 120 and
+/// 200 columns, with no text of the loop's in it and with its text remembered there, each text
+/// priority escalates in no cell where the recommended decision approves. Negative controls:
+/// a person's input and a changed priority latch keep the text path's refusal. MUTANT: the
+/// text refusal escalates instead of using the recommendation (`text_instead` returns `why`).
+#[test]
+fn a_text_priority_escalates_nowhere_the_recommended_answer_is_taken() {
+    let decide = |prompt: &aterm_phase::PromptV2,
+                  rows: &[String],
+                  p: QuestionPriority,
+                  own: Option<QuestionPriority>,
+                  person: bool,
+                  cols: u16| {
+        answer_question(
+            prompt,
+            rows,
+            p,
+            own,
+            (false, person),
+            Pane {
+                cols,
+                rows: rows.len(),
+            },
+        )
+    };
+    let approves = |d: &Decision| matches!(d, Decision::Approve { .. });
+    let (mut cells, mut answered, mut person_held, mut latch_held) = (0, 0, 0, 0);
+    for (name, rows, prompt) in question_captures() {
+        for cols in [80u16, 120, 200] {
+            let recommended = decide(
+                &prompt,
+                &rows,
+                QuestionPriority::Recommended,
+                None,
+                false,
+                cols,
+            );
+            if !approves(&recommended) {
+                continue;
+            }
+            for (p, own) in [LONG, SHORT, LAND]
+                .into_iter()
+                .flat_map(|p| [(p, None), (p, Some(p))])
+            {
+                cells += 1;
+                let d = decide(&prompt, &rows, p, own, false, cols);
+                assert!(
+                    approves(&d),
+                    "{name} at {cols} with {p:?}/{own:?}: text policy hands over what the recommended answer \
+                     takes: {d:?}"
+                );
+                if let Decision::Approve { rule_id, .. } = d {
+                    assert_eq!(rule_id, p.rule_id(), "{name}");
+                }
+                answered += 1;
+                if own.is_some() && !approves(&decide(&prompt, &rows, p, own, true, cols)) {
+                    person_held += 1;
+                }
+                if own.is_some() {
+                    let other = if p == LONG { SHORT } else { LONG };
+                    if !approves(&decide(&prompt, &rows, p, Some(other), false, cols)) {
+                        latch_held += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(cells > 0 && answered == cells, "{answered} of {cells}");
+    assert!(latch_held > 0, "a changed latch changes none of {cells}");
+    assert!(
+        person_held > 0,
+        "the second control: a person's input changes none of {cells}"
+    );
+    println!(
+        "T10: text priorities answer {answered} of {cells} cells; changed latches hold {latch_held}; a \
+         person's input keeps {person_held}"
+    );
 }

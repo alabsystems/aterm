@@ -574,35 +574,40 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
     };
     let dir = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(if dir.as_os_str().is_empty() {
             Path::new(".")
         } else {
             dir
         })?;
     let name = std::ffi::CString::new(name.as_bytes())?;
-    // SAFETY: `dir` is open for the call and `name` is NUL-terminated; the mode
-    // is the variadic argument `O_CREAT` reads.
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            libc::c_uint::from(0o600_u16),
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `openat` just returned `fd`, which nothing else owns.
-    let file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let file = aterm_uds::kept_out(|| {
+        // SAFETY: `dir` is open for the call and `name` is NUL-terminated; the mode
+        // is the variadic argument `O_CREAT` reads.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK,
+                libc::c_uint::from(0o600_u16),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `openat` just returned `fd`, which nothing else owns.
+        Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    })?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} is not a regular file", path.display()),
         ));
     }
-    aterm_uds::keep_out_of_children(&file)?;
     Ok(file)
 }
 

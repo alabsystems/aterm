@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# THE ACTION TELEMETRY ROW AND ITS LOCAL LOG (Continuum TM-0, trust
+# docs/design/2026-11-02-continuum.md §6.10 and §11 Wave 0): one versioned row
+# per action aterm watches or admits (a tab's command, an agent's tool call, a
+# worker spawn), appended to a bounded, rotated log under the state directory,
+# and the reader `aterm ctl telemetry` summarizes by kind.
+
+[package]
+name = "aterm-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "aterm's versioned per-action telemetry row (schema 1: key, kind, host, wall, CPU, peak memory, admission wait, cache tier, outcome, stop cause, host-facts digest), its bounded append-only local log with rotation and torn-line recovery, a non-blocking writer, and the per-kind reader"
+
+[dependencies]
+# The row's key, folder and host-facts digests, and each line's checksum:
+# SHA-256 truncated. First-party (astream-digest re-exported), no third-party code.
+aterm-digest = { workspace = true }
+# The reader's `--json` form. First-party.
+aterm-json = { workspace = true }
+# The workspace's one epoch-clock read.
+aterm-time = { workspace = true }
+# `dirs::state_dir` places the log; `version::build_id` names this build in the
+# host facts. Workspace crate.
+aterm-types = { workspace = true }
+# The machine facts the host-facts digest covers (model, CPU, memory, OS),
+# read once per writer. Workspace crate; the window already links it.
+aterm-sysprobe = { workspace = true }
+# `file_lock::lock_exclusive_until`: appends and rotation from every writer on
+# this account go one at a time; `process::lan_host_name` names the host as the
+# survey does. Workspace crate.
+aterm-uds = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+aterm-tempfile = { workspace = true }

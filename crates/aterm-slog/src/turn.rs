@@ -1276,12 +1276,16 @@ impl TurnTracker {
             .any(|&(n, opened)| n == t && opened > at.wall_ms)
     }
 
-    /// The oldest untaken turn opened within [`ATTRIBUTION_MS`] before `at` (or after it), taken;
-    /// the older ones are dropped.
+    /// Take the oldest untaken turn opened within [`ATTRIBUTION_MS`] of `at`.
+    /// Drop older turns, retaining later ones for their own beginning.
     fn take_untaken(&mut self, at: Stamp) -> Option<Node> {
         self.untaken
             .retain(|&(_, opened)| untaken_fresh(opened, at));
-        (!self.untaken.is_empty()).then(|| self.untaken.remove(0).0)
+        let index = self
+            .untaken
+            .iter()
+            .position(|&(_, opened)| opened <= at.wall_ms.saturating_add(ATTRIBUTION_MS))?;
+        Some(self.untaken.remove(index).0)
     }
 
     /// THE TRANSCRIPT'S READER STOPPED (its tap dropped, or reading no file now): the join keeps

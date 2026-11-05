@@ -123,7 +123,7 @@ use sync_commit::usage_target;
 
 #[path = "accounts_directory.rs"]
 mod directory;
-#[cfg(unix)]
+pub(super) use directory::canonical_directory;
 pub(super) use directory::retained_directory_owner_at;
 pub(super) use directory::{
     lists_directory, naming_row, retained_directory_owner, shared_staging_retained,
@@ -1625,6 +1625,98 @@ pub fn profile_configured(configs: &Path) -> bool {
     }
 }
 
+/// What a Claude relaunch's account checks (a cold admission, an external route's recheck) read
+/// of the environment the relaunch inherits, recorded from a Claude Code process's own kernel
+/// exec environment while it ran: the environment its shell passed it, which a relaunch typed
+/// into that shell inherits too. A shell's own kernel record holds only what the shell was
+/// started with, and macOS omits even that for an Apple binary such as `/bin/zsh` or
+/// `/bin/bash` (measured on macOS 26.7.2 and 27.0.1).
+///
+/// Only the entries those checks read are kept ([`Self::reads`]), and only for a process that
+/// runs on its stored login ([`Self::admitted`]): such an environment sets no credential,
+/// profile or route variable ([`ProcessLogin::of_env`]), so a record holds directories and
+/// selectors, never a secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LaunchEnv(Vec<String>);
+
+impl LaunchEnv {
+    /// The record of `env`, a process's kernel exec environment (`KEY=value` entries): `None`
+    /// for an empty one (an unread environment) or one [`Self::admitted`] refuses.
+    #[must_use]
+    pub fn of_exec_env(env: &[String]) -> Option<Self> {
+        if env.is_empty() {
+            return None;
+        }
+        Self::kept(env).admitted()
+    }
+
+    /// A record read back from where it was kept (`KEY=value` words): only the entries
+    /// [`Self::reads`] names, and `None` where [`Self::admitted`] refuses them, so a damaged or
+    /// edited record never stands in for one.
+    #[must_use]
+    pub fn of_record(words: &[String]) -> Option<Self> {
+        Self::kept(words).admitted()
+    }
+
+    /// The record where it runs on its stored login ([`ProcessLogin::of_env`]) and sets no
+    /// credential, profile or route variable empty. An empty one may be what the agent's own
+    /// command line set (`ANTHROPIC_API_KEY= claude`) over its shell's value, which a relaunch
+    /// line, carrying no credential, would leave to the shell: such a record is no evidence of
+    /// what the relaunch inherits.
+    fn admitted(self) -> Option<Self> {
+        let blanked = self
+            .pairs()
+            .any(|(name, value)| value.is_empty() && Self::routes(name));
+        (!blanked && ProcessLogin::of_env(self.pairs()).stored_login).then_some(self)
+    }
+
+    /// Its `KEY=value` entries, in the process's order.
+    #[must_use]
+    pub fn entries(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Whether admission reads variable `name`: the login and home selectors, the directories
+    /// the home check and [`profile_configs_dir`] read, and every variable
+    /// [`ProcessLogin::of_env`] judges a login by.
+    #[must_use]
+    pub fn reads(name: &str) -> bool {
+        [LOGIN_ENV, HOME_ENV, HOMEDIR_ENV, "XDG_CONFIG_HOME", "HOME"].contains(&name)
+            || Self::routes(name)
+    }
+
+    /// Whether `name` is a credential, profile or route variable ([`names_another_login`]).
+    fn routes(name: &str) -> bool {
+        use super::netwatch::{ROUTE_KEYS, ROUTE_PREFIXES};
+        CREDENTIAL_KEYS.contains(&name)
+            || PROFILE_KEYS.contains(&name)
+            || ROUTE_KEYS.contains(&name)
+            || ROUTE_PREFIXES.iter().any(|p| name.starts_with(p))
+    }
+
+    fn kept(env: &[String]) -> Self {
+        Self(
+            env.iter()
+                .filter(|entry| entry.split_once('=').is_some_and(|(k, _)| Self::reads(k)))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().filter_map(|entry| entry.split_once('='))
+    }
+}
+
+/// Names only, so no value reaches a log line.
+impl std::fmt::Debug for LaunchEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.pairs().map(|(name, _)| name))
+            .finish()
+    }
+}
+
 fn login_file_dir<'a>(value: &'a str, file: &str) -> Option<&'a Path> {
     if value
         .chars()
@@ -2087,7 +2179,7 @@ pub(super) fn write_google_renewal_checkpoint(
         ));
     }
     let path = grant.path().map_err(io::Error::other)?;
-    if path != Path::new(staging).join(".gemini/antigravity-cli/antigravity-oauth-token") {
+    if path != super::upgrade_agy::profile_grant(Path::new(staging)) {
         return Err(io::Error::other(
             "Google proof does not describe this staging home",
         ));
@@ -2566,6 +2658,10 @@ pub struct SignInAttempt {
     pub routes: String,
     /// When this outcome over these routes was first recorded (Unix seconds).
     pub since: i64,
+    /// When a pass last met this page (Unix seconds), for [`AttemptOutcome::Blocked`], whose wait
+    /// counts from it: an unchanged attempt keeps `since` and writes no ledger line. Any other
+    /// outcome repeats with no write at all, so here this stays `since`.
+    pub tried_at: i64,
 }
 
 /// The human step a vendor renewal could not finish, without its page or error text.
@@ -2929,6 +3025,7 @@ impl Logins {
                     tried.insert("outcome".into(), Value::from(attempt.outcome.as_str()));
                     tried.insert("routes".into(), Value::from(attempt.routes.clone()));
                     tried.insert("since".into(), Value::from(attempt.since));
+                    tried.insert("tried_at".into(), Value::from(attempt.tried_at));
                     m.insert("sign_in_attempt".into(), Value::Object(tried));
                 }
                 (label.clone(), Value::Object(m))
@@ -3045,13 +3142,15 @@ impl Logins {
             // An attempt this build cannot read is dropped, not refused: it is a record of the
             // ladder's last pass, which the next pass writes again.
             let sign_in_attempt = v.get("sign_in_attempt").and_then(|tried| {
+                let since = stamp(tried.get("since"), now)?;
                 Some(SignInAttempt {
                     outcome: tried
                         .get("outcome")
                         .and_then(Value::as_str)
                         .and_then(AttemptOutcome::parse)?,
                     routes: one_line(tried.get("routes")?.as_str()?, ROUTES_MAX),
-                    since: stamp(tried.get("since"), now)?,
+                    since,
+                    tried_at: stamp(tried.get("tried_at"), now).unwrap_or(since),
                 })
             });
             let binding = Binding {
@@ -3523,7 +3622,58 @@ pub fn login_state(row: &Row, logins: &Logins, state: &State, now: i64) -> Login
     }
 }
 
-/// Returns the labels of accounts with an `email` whose login is expired or due for renewal.
+/// How long a login keeps being renewed on this Mac after a session here last ran on it
+/// ([`Account::ran_at`], [`used_here`]): a week (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15
+/// rule 4).
+pub const USED_WITHIN_S: i64 = WEEK_WINDOW_S;
+
+/// Whether this Mac uses `label`'s login, so its upkeep may renew it (§4.15 rule 4): a session
+/// here ran on it within [`USED_WITHIN_S`] ([`Account::ran_at`], which only a session noted on
+/// this Mac sets), and this Mac holds the account's senior live claim or no Mac claims it
+/// ([`State::leases`], as the claims ring settles it).
+#[must_use]
+pub fn used_here(state: &State, label: &str, now: i64) -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if USE_CONDITION_OFF.with(std::cell::Cell::get) {
+        return true;
+    }
+    let ran = state
+        .accounts
+        .get(label)
+        .and_then(|account| account.ran_at)
+        .is_some_and(|at| recent(at, now, USED_WITHIN_S));
+    let claim_ours_or_none = state
+        .leases
+        .get(label)
+        .filter(|lease| lease.until > now)
+        .is_none_or(|lease| state.owns_swarm_label(&lease.holder));
+    ran && claim_ours_or_none
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static USE_CONDITION_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// NEGATIVE CONTROL seam: runs `body` with [`used_here`] true for every login on this thread, as
+/// the upkeep was before it renewed only logins this Mac uses, so a test can show its own
+/// assertion fails without the use condition, or observe a login's lifetime apart from it.
+#[cfg(any(test, debug_assertions))]
+pub fn without_use_condition<R>(body: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            USE_CONDITION_OFF.with(|off| off.set(self.0));
+        }
+    }
+    let _restore = Restore(USE_CONDITION_OFF.with(|off| off.replace(true)));
+    body()
+}
+
+/// Returns the labels of accounts with an `email` whose login is expired or due for renewal and
+/// that this Mac uses ([`used_here`]): a login made here that no session here has run on for a
+/// week, or that another Mac holds the senior claim of, is not renewed here by itself. It stays
+/// as it is until a person signs it in, or a session here runs on it and loses its login.
 #[must_use]
 pub fn renew_due(
     roster: &Roster,
@@ -3536,6 +3686,7 @@ pub fn renew_due(
         .rows
         .iter()
         .filter(|row| row.held_by.is_none() && row.email.is_some() && is_enrolled(row, enrolled))
+        .filter(|row| used_here(state, &row.label, now))
         .filter(|row| {
             matches!(
                 login_state(row, logins, state, now),
@@ -3646,11 +3797,13 @@ pub fn note_sign_in_attempt(
         return Vec::new();
     };
     if current
-        && binding
-            .sign_in_attempt
-            .as_ref()
-            .is_some_and(|last| last.outcome == outcome && last.routes == routes)
+        && let Some(last) = binding.sign_in_attempt.as_mut()
+        && last.outcome == outcome
+        && last.routes == routes
     {
+        if outcome == AttemptOutcome::Blocked {
+            last.tried_at = at;
+        }
         return Vec::new();
     }
     let mut event = Event::new(at, Kind::SignIn, label);
@@ -3662,13 +3815,14 @@ pub fn note_sign_in_attempt(
         outcome,
         routes,
         since: at,
+        tried_at: at,
     });
     vec![event]
 }
 
 /// Whether `row` still needs a sign-in on this machine: it has no login it can be run on here
-/// (not enrolled, or signed out), or it has an email and its login is due for renewal (as
-/// [`renew_due`] lists it). A failed automatic sign-in of such a row is still news
+/// (not enrolled, or signed out), or it has an email and its login is due for renewal
+/// ([`login_state`]). A failed automatic sign-in of such a row is still news
 /// ([`failing_sign_ins`]); one of a row whose login works and is not due is not.
 #[must_use]
 pub fn needs_sign_in(row: &Row, state: &State, logins: &Logins, enrolled: bool, now: i64) -> bool {
@@ -4010,7 +4164,7 @@ fn native_google_digest(staging: &Path) -> Option<[u8; 32]> {
 
 #[cfg(unix)]
 fn native_google_digest_checked(staging: &Path) -> io::Result<Option<[u8; 32]>> {
-    let path = staging.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    let path = super::upgrade_agy::profile_grant(staging);
     let Some(bytes) = aterm_secrets::fsx::read_private(&path, 64 * 1024)
         .map_err(|_| io::Error::other("native grant could not be read"))?
     else {
@@ -4085,7 +4239,9 @@ pub fn note_wrong_account(logins: &mut Logins, label: &str, at: i64) -> Vec<Even
 /// out, a pin on it ends ([`Kind::Unpin`]), its binding's `served_at` (turns served under a login
 /// it no longer holds) is cleared, `active` where it named `label` names `now_default`
 /// ([`repoint_active`]), and one [`Kind::Displaced`] event says so. A later auth word already on
-/// record is kept.
+/// record is kept. The word is of the row's final login, so an earlier retired word does not hide
+/// it, and neither does this transaction's edit ([`auth_scope::finish`]): a row that read `usable`
+/// here could be rotated onto with no login.
 pub fn note_displaced(
     state: &mut State,
     logins: &mut Logins,
@@ -4103,6 +4259,7 @@ pub fn note_displaced(
         record.clear_auth_context();
         record.auth = Auth::SignedOut;
         record.auth_at = Some(at);
+        record.auth_scope.reinstate();
         // Metadata loss is not a provider observation on the replacement. Preserve the
         // entry witness, including any actual result already captured in this transaction.
     }
@@ -4468,6 +4625,7 @@ pub(crate) fn fill_observations(into: &mut Account, from: Account) {
     fill(&mut into.before, from.before);
     fill(&mut into.offer, from.offer);
     fill(&mut into.cleared_at, from.cleared_at);
+    fill(&mut into.room_at, from.room_at);
     fill(&mut into.ran_at, from.ran_at);
     fill(&mut into.credits, from.credits);
     fill(&mut into.credits_day, from.credits_day);
@@ -4902,6 +5060,9 @@ pub struct Account {
     pub auth_projection: AuthProjection,
     /// Machine-local: the latest account-wide clearing ([`pin`], [`note_reading`]).
     pub cleared_at: Option<i64>,
+    /// Machine-local: the newest read naming a window with none of them full ([`note_sample`]),
+    /// kept past a later read that finds one full ([`Account::room_since`]).
+    pub room_at: Option<i64>,
     /// Machine-local: when a session was last read running on it ([`note_session`],
     /// [`reset_allowed`]).
     pub ran_at: Option<i64>,
@@ -4943,6 +5104,7 @@ impl PartialEq for Account {
             && self.renewal_metadata == other.renewal_metadata
             && self.served_metadata == other.served_metadata
             && self.cleared_at == other.cleared_at
+            && self.room_at == other.room_at
             && self.ran_at == other.ran_at
             && self.credits == other.credits
             && self.credits_day == other.credits_day
@@ -5067,6 +5229,16 @@ impl Account {
     #[must_use]
     pub fn of_another(&self, key: Option<super::profile::AccountKey>) -> bool {
         matches!((self.key, key), (Some(held), Some(key)) if held != key)
+    }
+
+    /// When this row last had room on someone's word: the owner's clearing ([`pin`]), or the newest
+    /// read that named a window and found none full ([`note_sample`]). Nothing rewrites a rollout,
+    /// and a session stopped at a wall writes no later reading, so a full reading older than this
+    /// no longer speaks for the row ([`crate::ai::codex_limits::login_sample`]). A later read that
+    /// finds one full leaves this where it was: it speaks for itself, and only from then on.
+    #[must_use]
+    pub fn room_since(&self) -> Option<i64> {
+        self.cleared_at.max(self.room_at)
     }
 
     /// Returns the latest timestamp until which a standing wall blocks this account at `now`.
@@ -5226,6 +5398,153 @@ pub struct SessionRow {
     pub held: Option<String>,
 }
 
+/// One stretch of a Claude Code conversation under a login of a row's own directory
+/// ([`LoginDirSpans`]), in Unix seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirSpan {
+    /// From when: a move or a relaunch onto such a login began, or such a process of it started.
+    pub since: i64,
+    /// Until when, exclusive: the second after the one a process of it on the default login
+    /// started in (`off_dir_from`), whose rows may be the process before's, or its record's lapse
+    /// ([`LoginDirSpans::lapse`]) where an open stretch lapsed before a later note (`spans_at`).
+    /// `None` while a host sees it run under such a login, to its record's lapse.
+    pub until: Option<i64>,
+}
+
+/// How long an open stretch of a conversation under a login of a row's own directory runs on
+/// past its last sighting ([`LoginDirSpans::lapse`]): its process seen there by a host (at its
+/// account points, at a move's landing) or found still running by an accounts sync, which saves
+/// that before its transcript scan reads the record ([`LoginDirSpans::seen_running`]). One whose
+/// process is gone unseen (aterm quit, a crash, a resume in another terminal) is no longer taken
+/// to run there an hour on.
+pub const LOGIN_DIR_NOTED_S: i64 = 3600;
+
+/// The longest [`NotedProcess::start`] a record keeps.
+const NOTED_START_MAX: usize = 64;
+
+/// The process a host saw run a conversation under a login of a row's own directory, as its
+/// relaunch snapshot names it (`relaunch::Snapshot`'s `pid` and `start`, the kernel's start in
+/// `ps -o lstart=` spelling), so a check that it still runs is not fooled by a reused pid
+/// (`restart_stamp::alive_as`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotedProcess {
+    pub pid: u32,
+    pub start: String,
+}
+
+/// Machine-local record of the stretches a Claude Code conversation ran under a login of a row's
+/// own directory ([`State::login_dir_spans`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginDirSpans {
+    /// Its stretches, oldest first, each ending before the next begins.
+    pub spans: Vec<DirSpan>,
+    /// When it was last seen: noted by a host, or its process found running by a sync.
+    pub at: i64,
+    /// The process a host last saw run its open stretch; `None` where it has none, or where a
+    /// launch onto such a login is still to start one.
+    pub process: Option<NotedProcess>,
+}
+
+impl LoginDirSpans {
+    /// Its process found still running at `now` (`alive`), as an accounts sync looks, and saves,
+    /// as its transcript scan reads the record ([`LOGIN_DIR_NOTED_S`]): a sighting, so the open stretch
+    /// of a turn that runs on for hours with no account point does not lapse under it.
+    pub fn seen_running(&mut self, now: i64, alive: impl FnOnce(&NotedProcess) -> bool) {
+        if self.spans.iter().any(|span| span.until.is_none())
+            && self.process.as_ref().is_some_and(alive)
+        {
+            self.at = self.at.max(now);
+        }
+    }
+
+    /// Whether a transcript row written at `at` (Unix seconds) falls in one of its stretches.
+    #[must_use]
+    pub fn covers(&self, at: i64) -> bool {
+        let lapse = self.lapse();
+        self.spans
+            .iter()
+            .any(|span| span.since <= at && at < span.until.unwrap_or(lapse))
+    }
+
+    /// Where its open stretch ends unless a host notes it again ([`LOGIN_DIR_NOTED_S`]).
+    #[must_use]
+    pub fn lapse(&self) -> i64 {
+        self.at.saturating_add(LOGIN_DIR_NOTED_S)
+    }
+
+    /// Its stretches as they stand at `t`: an open one that lapsed before then ended at its
+    /// lapse, so a note at `t` neither joins it nor stretches its end over the hours no host saw.
+    fn spans_at(&self, t: i64) -> Vec<DirSpan> {
+        let lapse = self.lapse();
+        self.spans
+            .iter()
+            .map(|span| DirSpan {
+                since: span.since,
+                until: span.until.or((lapse < t).then_some(lapse)),
+            })
+            .filter(|span| span.until.is_none_or(|until| span.since < until))
+            .collect()
+    }
+
+    /// What of it still matters at `now`: a wall written in a stretch stands a week at most
+    /// ([`WEEK_WINDOW_S`]), so a stretch that ended that long ago cuts no standing wall, and a
+    /// record no host noted in that long is of no process that runs. `None` where nothing is left.
+    fn kept_at(&self, now: i64) -> Option<Self> {
+        if self.at.saturating_add(WEEK_WINDOW_S) <= now {
+            return None;
+        }
+        let spans: Vec<DirSpan> = self
+            .spans
+            .iter()
+            .filter(|span| {
+                span.until
+                    .is_none_or(|until| until.saturating_add(WEEK_WINDOW_S) > now)
+            })
+            .copied()
+            .collect();
+        let open = spans.iter().any(|span| span.until.is_none());
+        (!spans.is_empty()).then(|| Self {
+            spans,
+            at: self.at,
+            process: self.process.clone().filter(|_| open),
+        })
+    }
+}
+
+/// `spans` with the stretch from `since` on added: every stretch that has not ended before
+/// `since` joins it, and it runs on (`until: None`).
+fn spans_opened(spans: &[DirSpan], since: i64) -> Vec<DirSpan> {
+    let (mut kept, joined): (Vec<DirSpan>, Vec<DirSpan>) = spans
+        .iter()
+        .partition(|span| span.until.is_some_and(|until| until < since));
+    let since = joined.iter().map(|span| span.since).fold(since, i64::min);
+    kept.push(DirSpan { since, until: None });
+    kept
+}
+
+/// `state`'s conversation records with what no longer matters at `now` gone
+/// ([`LoginDirSpans::kept_at`]).
+fn login_dir_spans_kept(state: &mut State, now: i64) {
+    let spans = std::mem::take(&mut state.login_dir_spans);
+    state.login_dir_spans = spans
+        .into_iter()
+        .filter_map(|(conversation, noted)| Some((conversation, noted.kept_at(now)?)))
+        .collect();
+}
+
+/// `spans` with nothing from `from` on: a stretch that began by then ends there at the latest,
+/// one that began later is dropped.
+fn spans_cut(spans: &[DirSpan], from: i64) -> Vec<DirSpan> {
+    spans
+        .iter()
+        .filter(|span| span.since < from)
+        .map(|span| DirSpan {
+            since: span.since,
+            until: Some(span.until.map_or(from, |until| until.min(from))),
+        })
+        .collect()
+}
+
 /// Machine-local claim for an in-flight or recently completed `/usage` probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeClaim {
@@ -5377,6 +5696,11 @@ pub struct State {
     /// Operation-local failed preparations; not authority, history or persisted policy.
     #[doc(hidden)]
     pub excluded_accounts: BTreeSet<String>,
+    /// Runtime local read: the rows whose own credential file here shows their login lapsed
+    /// ([`Store::hydrate_auth_contexts`], [`crate::ai::connector::stored_login_lapsed`]), which
+    /// [`condition`] reads as [`Condition::SignedOut`]; not an observation, history or policy.
+    #[doc(hidden)]
+    pub lapsed_logins: BTreeSet<String>,
     /// Machine-local: the one account this home runs on.
     pub active: Option<String>,
     /// Machine-local: the account `active` was before the last rotation or pin ([`strike`]).
@@ -5396,6 +5720,14 @@ pub struct State {
     pub pending_pin: Option<PinRequest>,
     /// Machine-local: the supervised sessions, by session id.
     pub sessions: BTreeMap<String, SessionRow>,
+    /// Machine-local: when each Claude Code conversation ran under a login of a row's own
+    /// directory, by conversation id ([`note_on_login_dir`], [`note_off_login_dir`]). Such a
+    /// process keeps the default profile, so the `session_context` of its transcript names the
+    /// default login's address whatever login served its turns (measured on Claude Code
+    /// 2.1.317, 2026-11-03: a conversation moved onto `lab-c`'s login by `--resume` went on
+    /// naming `lab-a`'s): the transcript scan books none of its rows written in those stretches
+    /// (`accounts_sync::find_transcript_walls_by_email`).
+    pub login_dir_spans: BTreeMap<String, LoginDirSpans>,
     /// Machine-local: when `active` was rotated, the last hour's.
     pub rotations: Vec<i64>,
     /// Machine-local: the probe's claim.
@@ -5434,33 +5766,68 @@ pub struct State {
 
 impl Eq for State {}
 
+/// Every field but the runtime scope (`contextual_auth`, `excluded_accounts`, `lapsed_logins`):
+/// a transaction saves its state only when this says it changed. The pattern names each field,
+/// so a new one is compared or skipped by a decision here, never left out of a save unseen.
 impl PartialEq for State {
     fn eq(&self, other: &Self) -> bool {
-        self.schema == other.schema
-            && self.machine == other.machine
-            && self.accounts == other.accounts
-            && self.pending_auth == other.pending_auth
-            && self.active == other.active
-            && self.previous == other.previous
-            && self.previous_proven == other.previous_proven
-            && self.proven == other.proven
-            && self.canary == other.canary
-            && self.undo == other.undo
-            && self.pinned == other.pinned
-            && self.pending_pin == other.pending_pin
-            && self.sessions == other.sessions
-            && self.rotations == other.rotations
-            && self.probe == other.probe
-            && self.reset == other.reset
-            && self.leases == other.leases
-            && self.home_accounts == other.home_accounts
-            && self.prepared_accounts == other.prepared_accounts
-            && self.swarm_label == other.swarm_label
-            && self.swarm_aliases == other.swarm_aliases
-            && self.unrecorded == other.unrecorded
-            && self.claimed_at == other.claimed_at
-            && self.clock == other.clock
-            && self.forgotten == other.forgotten
+        let Self {
+            schema,
+            machine,
+            accounts,
+            pending_auth,
+            contextual_auth: _,
+            excluded_accounts: _,
+            lapsed_logins: _,
+            active,
+            previous,
+            previous_proven,
+            proven,
+            canary,
+            undo,
+            pinned,
+            pending_pin,
+            sessions,
+            login_dir_spans,
+            rotations,
+            probe,
+            reset,
+            leases,
+            home_accounts,
+            prepared_accounts,
+            swarm_label,
+            swarm_aliases,
+            unrecorded,
+            claimed_at,
+            clock,
+            forgotten,
+        } = self;
+        *schema == other.schema
+            && *machine == other.machine
+            && *accounts == other.accounts
+            && *pending_auth == other.pending_auth
+            && *active == other.active
+            && *previous == other.previous
+            && *previous_proven == other.previous_proven
+            && *proven == other.proven
+            && *canary == other.canary
+            && *undo == other.undo
+            && *pinned == other.pinned
+            && *pending_pin == other.pending_pin
+            && *sessions == other.sessions
+            && *login_dir_spans == other.login_dir_spans
+            && *rotations == other.rotations
+            && *probe == other.probe
+            && *reset == other.reset
+            && *leases == other.leases
+            && *home_accounts == other.home_accounts
+            && *prepared_accounts == other.prepared_accounts
+            && *swarm_label == other.swarm_label
+            && *swarm_aliases == other.swarm_aliases
+            && *unrecorded == other.unrecorded
+            && *claimed_at == other.claimed_at
+            && *clock == other.clock
+            && *forgotten == other.forgotten
     }
 }
 
@@ -5473,6 +5840,7 @@ impl Default for State {
             pending_auth: Vec::new(),
             contextual_auth: false,
             excluded_accounts: BTreeSet::new(),
+            lapsed_logins: BTreeSet::new(),
             active: None,
             previous: None,
             previous_proven: false,
@@ -5482,6 +5850,7 @@ impl Default for State {
             pinned: false,
             pending_pin: None,
             sessions: BTreeMap::new(),
+            login_dir_spans: BTreeMap::new(),
             rotations: Vec::new(),
             probe: None,
             reset: None,
@@ -5704,6 +6073,7 @@ fn account_json(a: &Account) -> Value {
         o.insert("served_metadata".to_owned(), Value::from(a.served_metadata));
     }
     o.insert("cleared_at".to_owned(), Value::from(a.cleared_at));
+    o.insert("room_at".to_owned(), Value::from(a.room_at));
     o.insert("ran_at".to_owned(), Value::from(a.ran_at));
     o.insert(
         "credits".to_owned(),
@@ -5888,6 +6258,7 @@ fn account_of(v: &Value, now: i64) -> Account {
         served_metadata,
         auth_projection: AuthProjection::Legacy,
         cleared_at: stamp(v.get("cleared_at"), now),
+        room_at: stamp(v.get("room_at"), now),
         ran_at: stamp(v.get("ran_at"), now),
         credits: v.get("credits").and_then(|c| credits_of(c, cap)),
         credits_day: int(v.get("credits_day")),
@@ -5958,6 +6329,41 @@ impl State {
                     .collect(),
             ),
         );
+        if !self.login_dir_spans.is_empty() {
+            o.insert(
+                "login_dir_spans".to_owned(),
+                Value::Object(
+                    self.login_dir_spans
+                        .iter()
+                        .map(|(conversation, noted)| {
+                            let spans = noted
+                                .spans
+                                .iter()
+                                .map(|span| {
+                                    let mut row = Map::new();
+                                    row.insert("since".to_owned(), Value::from(span.since));
+                                    row.insert(
+                                        "until".to_owned(),
+                                        span.until.map_or(Value::Null, Value::from),
+                                    );
+                                    Value::Object(row)
+                                })
+                                .collect();
+                            let mut row = Map::new();
+                            row.insert("spans".to_owned(), Value::Array(spans));
+                            row.insert("at".to_owned(), Value::from(noted.at));
+                            if let Some(process) = &noted.process {
+                                let mut seen = Map::new();
+                                seen.insert("pid".to_owned(), Value::from(process.pid));
+                                seen.insert("start".to_owned(), Value::from(process.start.clone()));
+                                row.insert("process".to_owned(), Value::Object(seen));
+                            }
+                            (conversation.clone(), Value::Object(row))
+                        })
+                        .collect(),
+                ),
+            );
+        }
         o.insert(
             "rotations".to_owned(),
             Value::Array(self.rotations.iter().map(|t| Value::from(*t)).collect()),
@@ -6136,6 +6542,42 @@ impl State {
                 ))
             })
             .collect();
+        let login_dir_spans: Vec<(String, LoginDirSpans)> = doc
+            .get("login_dir_spans")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(conversation, _)| super::upgrade::is_session_id(conversation))
+            .filter_map(|(conversation, v)| {
+                let mut spans = Vec::new();
+                for span in v.get("spans")?.as_array()? {
+                    spans = spans_opened(&spans, int(span.get("since"))?);
+                    if let Some(until) = span.get("until").filter(|until| !until.is_null()) {
+                        spans = spans_cut(&spans, int(Some(until))?);
+                    }
+                }
+                let process = v.get("process").and_then(|seen| {
+                    Some(NotedProcess {
+                        pid: u32::try_from(int(seen.get("pid"))?).ok()?,
+                        start: seen
+                            .get("start")?
+                            .as_str()
+                            .filter(|start| {
+                                !start.is_empty()
+                                    && start.len() <= NOTED_START_MAX
+                                    && !start.chars().any(char::is_control)
+                            })?
+                            .to_owned(),
+                    })
+                });
+                let noted = LoginDirSpans {
+                    spans,
+                    at: int(v.get("at"))?,
+                    process,
+                };
+                Some((conversation.clone(), noted.kept_at(now)?))
+            })
+            .collect();
         let mut rotations: Vec<i64> = doc
             .get("rotations")
             .and_then(Value::as_array)
@@ -6295,6 +6737,7 @@ impl State {
             pending_auth: Vec::new(),
             contextual_auth: false,
             excluded_accounts: BTreeSet::new(),
+            lapsed_logins: BTreeSet::new(),
             active: label(doc.get("active")),
             previous: label(doc.get("previous")),
             previous_proven: doc
@@ -6312,6 +6755,7 @@ impl State {
                 )
             }),
             sessions: sessions.into_iter().collect(),
+            login_dir_spans: login_dir_spans.into_iter().collect(),
             rotations,
             probe,
             reset,
@@ -6511,7 +6955,8 @@ pub fn mint_machine() -> io::Result<String> {
 pub enum Condition {
     /// No login was made for it on this machine ([`login_made`]).
     NotEnrolled,
-    /// Its login's last word on record is [`Auth::SignedOut`] ([`strike`]).
+    /// Its login's last word on record is [`Auth::SignedOut`] ([`strike`]), or its own credential
+    /// file here shows it lapsed ([`State::lapsed_logins`]).
     SignedOut,
     /// A wall stands, until this instant.
     Limited {
@@ -6553,11 +6998,16 @@ impl Condition {
     }
 }
 
-/// Computes the [`Condition`] of `row` at `now` given `state` and whether its login is `enrolled`.
+/// Computes the [`Condition`] of `row` at `now` given `state` and whether its login is `enrolled`:
+/// an enrolled row whose credential file shows its login lapsed ([`State::lapsed_logins`]) is
+/// [`Condition::SignedOut`] whatever its records say, so no launch picks it.
 #[must_use]
 pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Condition {
     if !enrolled {
         return Condition::NotEnrolled;
+    }
+    if state.lapsed_logins.contains(&row.label) {
+        return Condition::SignedOut;
     }
     let Some(account) = state.accounts.get(&row.label) else {
         return Condition::Unseen;
@@ -8101,6 +8551,38 @@ pub fn note_wall(
     out
 }
 
+/// Lifts the walls a read of `account` shows gone: `sample`, read after each of them and naming no
+/// wall of its own, has a figure for the wall's window below full. A wall written after the read
+/// stands, and so does one of a window it has no figure for (a month, a window its plan does not
+/// show). The caller holds a read that named a wall back, since a server can refuse use with no
+/// window full. As a reset's clearing does ([`reset_outcome`]), the mark keeps an older observer
+/// from raising it again.
+pub fn note_room(state: &mut State, account: &str, sample: &Sample, now: i64) -> Vec<Event> {
+    let by = state.machine.clone();
+    let Some(record) = account_mut(state, account) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (window, wall) in &mut record.walls {
+        let pct = match window.as_str() {
+            SESSION_LIMIT => sample.session_pct,
+            WEEK_LIMIT => sample.week_pct,
+            _ => None,
+        };
+        if !wall.cleared && wall.at < sample.at && pct.is_some_and(|pct| pct < 100) {
+            wall.cleared = true;
+            wall.at = now;
+            wall.by = by.clone();
+            wall.attempts = 0;
+            out.push(
+                Event::new(now, Kind::Wall, account)
+                    .because(&format!("{window} lifted: a read shows room")),
+            );
+        }
+    }
+    out
+}
+
 /// Records a settled `/usage` panel [`Sample`] for `account` at `now`.
 pub fn note_sample(state: &mut State, account: &str, sample: Sample, now: i64) -> Vec<Event> {
     let by = state.machine.clone();
@@ -8127,6 +8609,13 @@ pub fn note_sample(state: &mut State, account: &str, sample: Sample, now: i64) -
         .is_some_and(|held| sample.at < held.at.min(now) || sample.at == held.at)
     {
         return Vec::new();
+    }
+    if [sample.session_pct, sample.week_pct]
+        .iter()
+        .flatten()
+        .all(|pct| *pct < 100)
+    {
+        record.room_at = record.room_at.max(Some(sample.at.min(now)));
     }
     // A row the panel lacked leads with `–` and says so, never a bare `?`: a narrow pane may cut
     // a row, so it is not Claude Code reporting no window ([`tap_shown`]).
@@ -8287,6 +8776,7 @@ pub fn note_reading_held(
             served_metadata,
             auth_projection,
             cleared_at: _,
+            room_at: _,
             ran_at,
             credits: _,
             credits_day,
@@ -8628,6 +9118,102 @@ pub fn note_session(
         },
     );
     out
+}
+
+/// Notes that Claude Code conversation `conversation` runs under a login of a row's own
+/// directory from `since` on ([`State::login_dir_spans`]), by a launch onto such a login whose
+/// process is still to start (a move, a cold relaunch): a stretch that has not ended by then (nor
+/// lapsed, [`LoginDirSpans::lapse`]) joins it, the process it was last seen in is forgotten, and
+/// `now` is when it was noted. What no record holds any more at `now` goes
+/// ([`LoginDirSpans::kept_at`]). Returns whether the record changed; a word that is not a
+/// conversation id ([`super::upgrade::is_session_id`]) changes nothing.
+pub fn note_on_login_dir(state: &mut State, conversation: &str, since: i64, now: i64) -> bool {
+    note_on(state, conversation, since, None, now)
+}
+
+/// [`note_on_login_dir`] for `process`, seen running `conversation` under such a login since
+/// `since`, its start: the process its open stretch runs in ([`LoginDirSpans::seen_running`]).
+pub fn note_seen_on_login_dir(
+    state: &mut State,
+    conversation: &str,
+    process: &NotedProcess,
+    since: i64,
+    now: i64,
+) -> bool {
+    note_on(state, conversation, since, Some(process), now)
+}
+
+fn note_on(
+    state: &mut State,
+    conversation: &str,
+    since: i64,
+    process: Option<&NotedProcess>,
+    now: i64,
+) -> bool {
+    if !super::upgrade::is_session_id(conversation) {
+        return false;
+    }
+    let before = state.login_dir_spans.clone();
+    let was = state.login_dir_spans.get(conversation);
+    let noted = LoginDirSpans {
+        spans: spans_opened(&was.map_or_else(Vec::new, |was| was.spans_at(since)), since),
+        at: was.map_or(now, |was| was.at.max(now)),
+        process: process
+            .filter(|process| process.start.len() <= NOTED_START_MAX)
+            .cloned(),
+    };
+    state.login_dir_spans.insert(conversation.to_owned(), noted);
+    login_dir_spans_kept(state, now);
+    state.login_dir_spans != before
+}
+
+/// Notes that conversation `conversation` runs on the default login from `from` on: a stretch
+/// of it under a row's own directory ends there at the latest (at its lapse, where that came
+/// first), and one that began later never ran (a move onto such a login that was not made), so
+/// it goes; a record left with none goes, as does what no record holds any more at `now`.
+/// `from` is a process's start in whole seconds (`lstart`), as the transcript's row times are,
+/// so its own second stays the stretch's ([`off_dir_from`]). Returns whether the record changed.
+pub fn note_off_login_dir(state: &mut State, conversation: &str, from: i64, now: i64) -> bool {
+    let before = state.login_dir_spans.clone();
+    let from = off_dir_from(from);
+    if let Some(was) = state.login_dir_spans.get(conversation) {
+        let spans = spans_cut(&was.spans_at(from), from);
+        if spans != was.spans {
+            let at = was.at.max(now);
+            let process = None;
+            state.login_dir_spans.insert(
+                conversation.to_owned(),
+                LoginDirSpans { spans, at, process },
+            );
+        }
+    }
+    login_dir_spans_kept(state, now);
+    state.login_dir_spans != before
+}
+
+/// Whether noting `conversation` as running under a row's own directory (`on_dir`) or on the
+/// default login from `from` on ([`note_on_login_dir`], [`note_off_login_dir`]) would leave its
+/// stretches as they are.
+#[must_use]
+pub fn login_dir_spans_hold(state: &State, conversation: &str, on_dir: bool, from: i64) -> bool {
+    let Some(noted) = state.login_dir_spans.get(conversation) else {
+        return !on_dir;
+    };
+    if on_dir {
+        spans_opened(&noted.spans_at(from), from) == noted.spans
+    } else {
+        let from = off_dir_from(from);
+        spans_cut(&noted.spans_at(from), from) == noted.spans
+    }
+}
+
+/// Where a stretch under a row's own login ends for a process seen on the default login since
+/// `started`, a whole second: after that second. A row the transcript times in it (whole seconds
+/// too) may be the process before's, still on the row's login: its wall, met in the second the
+/// relaunch onto the default login started, belongs to the row it ran on, and a new process
+/// meets no wall in its first second.
+fn off_dir_from(started: i64) -> i64 {
+    started.saturating_add(1)
 }
 
 /// Removes `sid` from the session table and clears its canary hold if it was the canary.
@@ -9403,7 +9989,7 @@ pub(crate) fn read_bounded(path: &Path, max: u64) -> io::Result<Option<String>> 
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = match options.open(path) {
         Ok(f) => f,
@@ -9646,7 +10232,7 @@ fn open_retained_file(path: &Path, kind: &str) -> io::Result<std::fs::File> {
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         open.mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     #[cfg(windows)]
     {
@@ -9654,7 +10240,7 @@ fn open_retained_file(path: &Path, kind: &str) -> io::Result<std::fs::File> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         open.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = open.open(path)?;
+    let file = aterm_uds::kept_out(|| open.open(path))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(not_regular());
@@ -9667,8 +10253,6 @@ fn open_retained_file(path: &Path, kind: &str) -> io::Result<std::fs::File> {
             return Err(not_regular());
         }
     }
-    #[cfg(any(unix, windows))]
-    aterm_uds::keep_out_of_children(&file)?;
     Ok(file)
 }
 
@@ -9759,11 +10343,75 @@ impl Store {
         Some(AuthContext::new(row, credential))
     }
 
-    /// Hydrates only runtime applicability; it creates neither observations nor writes.
+    /// Records `row`'s login signed out under its current credential context, as a read that met
+    /// the login's wall does (`accounts_pool`'s `Reading::SignedOut`): how a lab world lays out a
+    /// login that lapsed here (one-mesh E4, `aterm-lab local-signins`).
+    /// # Errors
+    /// The row's credential context cannot be read, or the store cannot be written.
+    #[cfg(any(test, debug_assertions))]
+    pub fn record_lapse_for_lab(&self, row: &Row, now: i64) -> Result<(), String> {
+        let context = self
+            .capture_auth_context(row)
+            .ok_or("the row's credential context cannot be read")?;
+        let mut note = None;
+        self.transact_logins(now, &mut note, |state, logins| {
+            stage_auth(state, row, logins, context, Auth::SignedOut, now);
+            Ok(Vec::new())
+        })
+        .map(|_| ())
+    }
+
+    /// [`Store::load`] with `roster`'s runtime applicability hydrated
+    /// ([`Store::hydrate_auth_contexts`]): the state a pick judges rows by, so a row whose own
+    /// credential file shows its login lapsed is signed out to it as it is to the report.
+    /// # Errors
+    /// [`Store::load`]'s.
+    pub fn load_judged(
+        &self,
+        now: i64,
+        roster: &Roster,
+    ) -> Result<(State, Option<String>), String> {
+        let (mut state, note) = self.load(now)?;
+        self.hydrate_auth_contexts(&mut state, roster);
+        Ok((state, note))
+    }
+
+    /// Hydrates only runtime applicability; it creates neither observations nor writes. Every
+    /// CLI's [`State::lapsed_logins`] is the rows of `roster` whose own credential file shows its
+    /// login lapsed ([`crate::ai::connector::stored_login_lapsed`]): a row's own directory, or
+    /// for the default login the CLI's default home ([`Store::default_home`]; Claude Code's store
+    /// knows none, so its default row is read by its records alone).
     pub(crate) fn hydrate_auth_contexts(&self, state: &mut State, roster: &Roster) {
+        self.hydrate_lapsed(state, roster);
         if self.cli != Cli::Codex {
             return;
         }
+        self.hydrate_codex_contexts(state, roster);
+    }
+
+    /// [`State::lapsed_logins`] alone ([`Store::hydrate_auth_contexts`]): the runtime set a
+    /// transaction's edit judges rows by, so an edit that picks a row (a restart's advice) skips
+    /// a lapsed one as the report and the launch do.
+    pub(crate) fn hydrate_lapsed(&self, state: &mut State, roster: &Roster) {
+        let default = self.default_home();
+        state.lapsed_logins = roster
+            .rows
+            .iter()
+            .filter(|row| {
+                let home = match row.dir.as_deref().filter(|dir| !dir.is_empty()) {
+                    Some(dir) => Path::new(dir),
+                    None => match default.as_deref() {
+                        Some(home) => home,
+                        None => return false,
+                    },
+                };
+                crate::ai::connector::stored_login_lapsed(self.cli.connector(), home)
+            })
+            .map(|row| row.label.clone())
+            .collect();
+    }
+
+    fn hydrate_codex_contexts(&self, state: &mut State, roster: &Roster) {
         state.contextual_auth = true;
         for account in state.accounts.values_mut() {
             account.auth_projection = AuthProjection::Unknown;
@@ -10684,7 +11332,8 @@ impl Store {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600);
+            open.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         let mut file = open.open(tmp)?;
         let written = (|| {
@@ -10785,7 +11434,7 @@ impl Store {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600);
+            open.mode(0o600).custom_flags(libc::O_CLOEXEC);
         }
         let mut file = open.open(&path)?;
         file.write_all(text.as_bytes())?;

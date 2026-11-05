@@ -2306,3 +2306,34 @@ fn two_grok_auth_walls_give_one_need() {
         Some("signing Claude back in".to_string())
     );
 }
+
+/// A NEED'S ID READS ITS WORDS, NOT THE FRAME (§14.18): case, runs of white space, surrounding
+/// emphasis and a trailing stop give one id; two needs stay two, however much they share; and
+/// where the entry's count moves its key ([`ask_key`]), its first need's id does not.
+#[test]
+fn need_id_reads_the_words_not_the_frame() {
+    let id = need_id("grant Accessibility to aterm");
+    for same in [
+        "Grant accessibility to ATERM",
+        "  grant   Accessibility\tto aterm  ",
+        "**grant Accessibility to aterm**",
+        "`grant Accessibility to aterm`.",
+        "_grant Accessibility to aterm_!",
+        "grant Accessibility to aterm:",
+    ] {
+        assert_eq!(need_id(same), id, "{same:?}");
+    }
+    assert_ne!(need_id("grant Screen Recording to aterm"), id);
+    assert_ne!(need_id("grant Accessibility to aterm and Terminal"), id);
+    assert_ne!(need_id(""), 0, "never 0");
+    let one = "claude needs you: grant Accessibility to aterm \u{2014} carrying on";
+    let two = "claude needs you: grant Accessibility to aterm (+1 more) \u{2014} carrying on";
+    assert_ne!(
+        ask_key(one),
+        ask_key(two),
+        "control: the entry's key moves with its count"
+    );
+    let first = |text: &str| need_words(text).map(|w| need_id(w.first));
+    assert_eq!(first(one), first(two));
+    assert_eq!(first(one), Some(id));
+}

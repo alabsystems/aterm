@@ -268,7 +268,7 @@ pub(super) fn physical(name: &str) -> io::Result<bool> {
     let mut kind = Vec::new();
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path.join("type"))?;
     if !file.metadata()?.is_file() {
         return Ok(false);

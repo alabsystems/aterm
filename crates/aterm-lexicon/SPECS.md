@@ -374,7 +374,7 @@ Numbered as §1 and §2 cite them.
    - `try_spaced_token` now evaluates the `allow_bare_cat` (`|C(k)| <= 3`) and short-`Emphasis` (`|C(k)| <= 3`, `k in user_surfaces`) guards against the matched `spaced` key (`folded` for exact hits, `candidate_folded` for possessive/clitic hits), keeping `scan` consistent with `has_scannable_class_surface` while keeping `opts.ignore` and `form_hash` keyed on `Fold(full token)`.
    - `bare_cat_is_opt_in`, `user_short_emphasis_surface_matches`, and `non_user_short_emphasis_surface_stays_suppressed` pin possessives and apostrophes across both guards.
 4. **The dictionary tests depend on the host's word list.**
-   - These read the host's Webster's Second, the list their allowlists are curated against, at the first place aterm_uds's `web2` row names that reads (`/usr/share/dict/web2`, which macOS's `/usr/share/dict/words` names, then `C:\usr\share\dict\web2`); a word list, not a program, so it is read where it lies, not resolved as a runnable tool:
+   - These read the host's Webster's Second, the list their allowlists are curated against, at the first of this host's places aterm_uds's `web2` row names that reads (`/usr/share/dict/web2`, which macOS's `/usr/share/dict/words` names, on macOS and Linux; `C:\usr\share\dict\web2` on Windows); a word list, not a program, so it is read where it lies, not resolved as a runnable tool:
      - `english_fold_collisions::no_unambiguous_surface_is_an_ordinary_english_word`;
      - `english_fold_collisions::no_english_word_transits_an_unambiguous_profanity_prefix`;
      - `tricks::no_ungated_non_english_surface_is_an_english_dictionary_word`.

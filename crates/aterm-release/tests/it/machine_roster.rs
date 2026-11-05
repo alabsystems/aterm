@@ -92,8 +92,13 @@ fn armed<'a>(master: &'a [&'a str], document: &'a machines::RosterDocument) -> R
 }
 
 /// Signing anchors for `masters` and `identity`.
-fn anchors<'a>(masters: &'a [&'a str], identity: Option<&'a Path>) -> publish::SigningAnchors<'a> {
+fn anchors<'a>(
+    home: &'a Path,
+    masters: &'a [&'a str],
+    identity: Option<&'a Path>,
+) -> publish::SigningAnchors<'a> {
     publish::SigningAnchors {
+        home: Some(home),
         master_pubkeys: masters,
         identity_path: identity,
         now_unix: NOW,
@@ -619,8 +624,8 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
     let creds = sign::ReleaseCredentials::load(&profile, None).expect("loads");
     let master = pk(&MASTER);
     let masters = [master.as_str()];
-    let verdict =
-        publish::signing_verdict(Some(&creds), &anchors(&masters, None)).expect("an armed cut");
+    let verdict = publish::signing_verdict(Some(&creds), &anchors(&dir, &masters, None))
+        .expect("an armed cut");
     assert!(verdict.policy.required);
     assert_eq!(verdict.policy.pubkey.as_deref(), Some(pubkey.as_str()));
     let who = verdict.attribution.expect("armed means attributed");
@@ -635,10 +640,10 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
 
     let identity = dir.join("machine.toml");
     std::fs::write(&identity, "id = \"m11\"\npubkey = \"unused\"\n").unwrap();
-    publish::signing_verdict(Some(&creds), &anchors(&masters, Some(&identity)))
+    publish::signing_verdict(Some(&creds), &anchors(&dir, &masters, Some(&identity)))
         .expect_err("a mint record naming another machine must refuse");
     std::fs::write(&identity, "id = \"m3\"\npubkey = \"unused\"\n").unwrap();
-    publish::signing_verdict(Some(&creds), &anchors(&masters, Some(&identity)))
+    publish::signing_verdict(Some(&creds), &anchors(&dir, &masters, Some(&identity)))
         .expect("a truthful mint record is not an obstacle");
 
     let orphan = write_profile2(
@@ -650,8 +655,70 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
         ),
     );
     let creds = sign::ReleaseCredentials::load(&orphan, None).expect("loads");
-    publish::signing_verdict(Some(&creds), &anchors(&masters, None))
+    publish::signing_verdict(Some(&creds), &anchors(&dir, &masters, None))
         .expect_err("a named-but-missing roster must refuse");
+    clean(&dir);
+}
+
+#[test]
+fn current_signing_observes_the_floor_while_finish_preserves_completed_receipts() {
+    let dir = tempdir("current-floor");
+    let (pkcs8, pubkey) = fresh_keypair();
+    let document = roster_naming(&[("m3", &pubkey)], &[], &MASTER);
+    let roster_path = dir.join("aterm-machines.toml");
+    std::fs::write(&roster_path, &document.bytes).unwrap();
+    std::fs::write(
+        machines::RosterDocument::signature_path(&roster_path),
+        &document.signature,
+    )
+    .unwrap();
+    let profile = write_profile(
+        &dir,
+        &format!(
+            "signing_key = \"{pkcs8}\"\nmachine_roster = \"{}\"\n",
+            roster_path.display()
+        ),
+    );
+    let creds = sign::ReleaseCredentials::load(&profile, None).unwrap();
+    let master = pk(&MASTER);
+    let masters = [master.as_str()];
+    let mut context = anchors(&dir, &masters, None);
+    publish::signing_verdict(Some(&creds), &context).expect("no retained floor admits m3");
+    // The floor as the vault writes it (0600 in a 0700 directory), so each verdict below
+    // turns on the floor's generation, never on a file mode its reader refuses.
+    let paths = aterm_secrets::client::Paths::for_home(&dir);
+    aterm_uds::private_file::ensure_private_dir(&paths.dir).unwrap();
+    let retain = |floor: &[u8]| {
+        aterm_uds::private_file::write_private(&paths.dir, "release-ring-roster-floor", floor)
+            .unwrap();
+    };
+    retain(b"4\n");
+    publish::signing_verdict(Some(&creds), &context)
+        .expect("a floor at the roster's own generation 4 admits it");
+    retain(b"5\n");
+    let below = publish::signing_verdict(Some(&creds), &context)
+        .expect_err("a floor above generation 4 refuses the cut");
+    assert!(
+        below
+            .0
+            .contains(machines::current_roster::BELOW_RETAINED_FLOOR),
+        "{below}"
+    );
+    context.home = None;
+    let homeless = publish::signing_verdict(Some(&creds), &context)
+        .expect_err("an armed cut with no home refuses before reading any floor");
+    assert!(homeless.0.contains(publish::NO_HOME_CONTEXT), "{homeless}");
+    // Finishing a cut whose roster has since lapsed reads no roster and no floor: it keeps
+    // its completed receipts with the above-grant floor in reach and with no home at all.
+    context.duty = publish::RosterDuty::Finish;
+    context.now_unix = LONG_AFTER;
+    for home in [Some(dir.as_path()), None] {
+        context.home = home;
+        let completed = publish::signing_verdict(Some(&creds), &context).unwrap();
+        assert!(completed.policy.required, "{home:?}");
+        assert!(completed.attribution.is_none(), "{home:?}");
+        assert!(completed.roster.is_none(), "{home:?}");
+    }
     clean(&dir);
 }
 

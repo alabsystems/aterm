@@ -2842,6 +2842,141 @@ fn no_still_wait_runs_past_the_deny_it_races() {
     );
 }
 
+/// The measured 2.1.316 rm box (`f::BOX_RM_AUTO_BLOCK_2_1_316`), whose countdown says `block this
+/// request in`, carrying the incident's call ([`incident`]) and `left` on its countdown: the
+/// countdown row whole, or (`wrapped`) cut through its words as a narrower pane wraps it.
+fn blocked(left: &str, wrapped: bool) -> Vec<String> {
+    let measured = f::screen(f::BOX_RM_AUTO_BLOCK_2_1_316);
+    let countdown = if wrapped {
+        vec![
+            " ⚠ Claude Code will automatically block this".to_string(),
+            format!(" request in {left}, to avoid holding up an"),
+            " unattended session".to_string(),
+        ]
+    } else {
+        vec![format!(
+            " ⚠ Claude Code will automatically block this request in {left}, to avoid holding up \
+             an unattended session"
+        )]
+    };
+    let countdown: Vec<&str> = countdown.iter().map(String::as_str).collect();
+    swapped(
+        &measured,
+        &[
+            (
+                "⏺ Bash(S=/private/tmp/at-nonexistent-lab; for p in a b; do set -- $p; rm -rf \
+                 $S/$1; done; touch /private/tmp/at.UxZb/proj/ran.txt)",
+                &["⏺ Bash(rm -f \"$O\"/*)"],
+            ),
+            (
+                " Delete temporary directories",
+                &[" Remove the old output files"],
+            ),
+            (
+                " │ S=/private/tmp/at-nonexistent-lab; for p in a b; do set -- $p; rm -rf $S/$1; \
+                 done; touch /private/tmp/at.UxZb/proj/ran.txt",
+                &[" │ rm -f \"$O\"/*"],
+            ),
+            (
+                " │ Dangerous rm operation on possibly-empty variable path: $S/$1 in `rm -rf \
+                 $S/$1` (bind $1 and rewrite its $S as \"${S:?}\" or use a literal",
+                &[
+                    " │ Dangerous rm operation on possibly-empty variable path: \"$O\"/* in `rm \
+                     -f \"$O\"/*` (rewrite it as \"${O:?}\"/* or use a literal path)",
+                ],
+            ),
+            (" │ path)", &[]),
+            (
+                " ⚠ Claude Code will automatically block this request in 1:59, to avoid holding \
+                 up an unattended session",
+                &countdown,
+            ),
+        ],
+    )
+}
+
+/// A box whose countdown says `block this request in` (2.1.316), whole or wrapped through its
+/// words, is held as one whose countdown says `deny`: one box through every tick, its first hold
+/// a look to see it tick and the next naming the vendor's deny, the bound of a box nobody touched
+/// ending that hold before the deny's margin, and at the margin the hold ends and the policy's
+/// answer goes before the vendor denies the box.
+#[test]
+fn a_box_whose_countdown_says_block_is_held_against_its_deny() {
+    let past = |stamp: &str| {
+        aterm_types::rfc3339::parse_utc_fractional(stamp).expect("a stamp") - TEST_NOW
+    };
+    for wrapped in [false, true] {
+        let at = |left: &str| blocked(left, wrapped);
+        let p = aterm_phase::parse_prompt_v2(&at("1:44")).expect("the box");
+        assert_eq!(
+            p.auto_deny_left(),
+            Some(Duration::from_secs(104)),
+            "wrapped {wrapped}: {p:?}"
+        );
+        assert!(p.rm_breaker().is_some(), "wrapped {wrapped}: {p:?}");
+        let one = approval_loop::box_identity(&at("1:44"));
+        assert!(one.is_some(), "wrapped {wrapped}");
+        assert_eq!(
+            one,
+            approval_loop::box_identity(&at("1:43")),
+            "wrapped {wrapped}: one box through the tick"
+        );
+
+        let (m, journal) = held_watch(
+            watched(ticking(104, 2, at)),
+            Some(TYPED_BEFORE_MS),
+            Build::Shipped,
+            |_, _| {},
+        );
+        assert_eq!(ones(&m), 0, "wrapped {wrapped}: {:#?}", m.requests);
+        let held = held_lines(&journal);
+        assert_eq!(held.len(), 2, "wrapped {wrapped}: {journal:#?}");
+        assert!(
+            held[0].ends_with("(the box's answer; a countdown on it is read again to see it tick)"),
+            "wrapped {wrapped}: {}",
+            held[0]
+        );
+        assert!(
+            held[1].contains("a person is typing: hands off until ")
+                && held[1].contains("(the box's answer; the vendor denies it at "),
+            "wrapped {wrapped}: {}",
+            held[1]
+        );
+        let (until, deny) = held_times(held[1]);
+        let (until, deny) = (past(&until), past(deny.as_deref().expect("the deny named")));
+        assert!(
+            (45..=103).contains(&deny) && until <= 10,
+            "wrapped {wrapped}: {until}, {deny}: {}",
+            held[1]
+        );
+        assert!(!ended(&journal), "wrapped {wrapped}: {journal:#?}");
+
+        let (m, journal) = held_watch(
+            watched(ticking(15, 2, at)),
+            Some(TYPED_BEFORE_MS),
+            Build::Shipped,
+            |_, _| {},
+        );
+        assert_eq!(ones(&m), 1, "wrapped {wrapped}: {:#?}", m.requests);
+        let end = journal
+            .iter()
+            .position(|l| l.starts_with("HOLD-ENDED "))
+            .unwrap_or_else(|| panic!("wrapped {wrapped}: the hold's end said: {journal:#?}"));
+        assert!(
+            journal[end].contains(
+                "a person is typing, but nobody has touched the box and the vendor denies it at "
+            ),
+            "wrapped {wrapped}: {}",
+            journal[end]
+        );
+        let approved = journal
+            .iter()
+            .position(|l| l.starts_with("APPROVED "))
+            .expect("approved");
+        assert!(end < approved, "wrapped {wrapped}: {journal:#?}");
+    }
+}
+
 /// [`super::super::observe_table`]'s row of a decline: down, tab, the decline's text and Enter
 /// ([`a_decline_goes_before_the_countdown_runs_out`]).
 pub(crate) fn observe_row_decline() -> &'static [&'static str] {

@@ -13,7 +13,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 10, "0.10");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 11, "0.11");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -50,6 +50,21 @@ fn is_search_row(row: &str) -> bool {
             })
 }
 
+/// Whether `row`, standing alone between the composer's bottom rule and its footer, is the
+/// prompt-history search's row: scoped ([`is_search_row`]), or as a narrow window draws it, its
+/// scope dropped (`  search prompts: alpha` at 26 columns, `  no matching prompt: zzq` at 34) or cut
+/// from the left, its query whole (` matching prompt: zzq` at 22; `muse-1.4.14-R7309.1-history-search-
+/// 26col`, `-no-match-34col`, `-no-match-22col`). Cut anywhere in its words or its query, it is told
+/// by its place: no other measured state of Muse Code draws one row of text there, and a branch
+/// panel's rows are the panel's.
+fn is_lone_search_row(row: &str) -> bool {
+    is_search_row(row)
+        || !(blank(row)
+            || plain_rule_width(row).is_some()
+            || is_panel_row(row)
+            || is_panel_head(row))
+}
+
 fn bottom_and_footer(rows: &[String]) -> Option<(usize, usize)> {
     let footer = rows.iter().rposition(|r| !blank(r))?;
     if leading_spaces(&rows[footer]) != 2 {
@@ -57,7 +72,7 @@ fn bottom_and_footer(rows: &[String]) -> Option<(usize, usize)> {
     }
     let mut k = footer.checked_sub(1)?;
     // The history search draws its row between the bottom rule and the footer.
-    if is_search_row(&rows[k]) && plain_rule_width(&rows[k.checked_sub(1)?]).is_some() {
+    if is_lone_search_row(&rows[k]) && plain_rule_width(&rows[k.checked_sub(1)?]).is_some() {
         return Some((k - 1, footer));
     }
     if plain_rule_width(&rows[k]).is_some() {
@@ -170,7 +185,7 @@ pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
     Some((f.caret, lines))
 }
 
-/// WHETHER MUSE CODE'S PROMPT-HISTORY SEARCH (Ctrl-R) IS OPEN: its row ([`is_search_row`]) stands
+/// WHETHER MUSE CODE'S PROMPT-HISTORY SEARCH (Ctrl-R) IS OPEN: its row ([`is_lone_search_row`]) stands
 /// between the composer's bottom rule and the footer. Measured on 1.4.14-R7309.1
 /// (`muse-1.4.14-R7309.1-history-search*`): the composer's row shows the old prompt the search
 /// matched, in the ink of typed text, or nothing, the cursor stands after the query on the search's
@@ -178,7 +193,8 @@ pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
 /// is drawn between the rules, and the transcript above them.
 #[must_use]
 pub fn history_search(rows: &[String]) -> bool {
-    open_frame(rows).is_some_and(|f| f.bottom + 1 < f.footer && is_search_row(&rows[f.bottom + 1]))
+    open_frame(rows)
+        .is_some_and(|f| f.bottom + 1 < f.footer && is_lone_search_row(&rows[f.bottom + 1]))
 }
 
 const STATUS_GLYPHS: [char; 3] = ['◇', '◈', '◆'];
@@ -883,18 +899,34 @@ pub fn said_whole(rows: &[String]) -> bool {
         && open_frame(rows).is_some_and(|f| matches!(turn(rows, f.top), Turn::Ended(..)))
 }
 
-/// Extracts earlier `◆` replies belonging to the same turn as [`said_tail`].
+/// Extracts earlier `◆` replies belonging to the same turn as [`said_tail`], joined
+/// ([`crate::reader::join_messages`]).
 #[must_use]
 pub fn turn_said_before(rows: &[String]) -> Option<String> {
+    turn_messages_before(rows).map(|m| crate::reader::join_messages(&m))
+}
+
+/// [`turn_said_before`] reply by reply, oldest first.
+#[must_use]
+pub fn turn_messages_before(rows: &[String]) -> Option<Vec<String>> {
     let (_, said) = turn_before(rows, crate::wrap::said_rows)?;
-    (!said.is_empty()).then(|| said.join("\n\n"))
+    (!said.is_empty()).then_some(said)
 }
 
 /// [`turn_said_before`], its lines read as [`said_lines`] reads them.
 #[must_use]
 pub fn turn_lines_before(rows: &[String], apart: crate::reader::Apart) -> Option<String> {
+    turn_message_lines_before(rows, apart).map(|m| crate::reader::join_messages(&m))
+}
+
+/// [`turn_lines_before`] reply by reply, oldest first.
+#[must_use]
+pub fn turn_message_lines_before(
+    rows: &[String],
+    apart: crate::reader::Apart,
+) -> Option<Vec<String>> {
     let (_, said) = turn_before(rows, |said| crate::wrap::said_lines(rows, said, 0, apart))?;
-    (!said.is_empty()).then(|| said.join("\n\n"))
+    (!said.is_empty()).then_some(said)
 }
 
 /// Returns whether the entire last turn (from the user's `❯` message through [`said_tail`])
@@ -2407,6 +2439,31 @@ pub mod fixtures {
         include_str!("fixtures/muse-1.4.14-R7309.1-history-search.txt");
     pub const HISTORY_SEARCH_EMPTY: &str =
         include_str!("fixtures/muse-1.4.14-R7309.1-history-search-empty.txt");
+    /// Muse Code 1.4.14's shell mode with `ls -la` typed after `!` (v6 §14.17.5.8): the caret row
+    /// `! ls -la`, the footer ending `Shell mode`, no `❯` composer.
+    pub const SHELL_MODE_DRAFT: &str =
+        include_str!("fixtures/muse-1.4.14-lab-shell-mode-draft.txt");
+    /// Muse Code 1.4.14 with `!echo pasted-probe` pasted: shell mode again, `! echo pasted-probe`.
+    pub const PASTED_BANG_DRAFT: &str =
+        include_str!("fixtures/muse-1.4.14-lab-pasted-bang-draft.txt");
+    /// The same search in narrow windows: its row drops its scope at 34 columns (its query matching
+    /// nothing) and 26 (its match), and is cut from the left at 22, read by its place alone
+    /// (`is_lone_search_row`); and the match the search left in the composer when Esc closed it, in
+    /// typed ink, with its cells, at 144 columns and at 26.
+    pub const HISTORY_SEARCH_NO_MATCH_34COL: &str =
+        include_str!("fixtures/muse-1.4.14-R7309.1-history-search-no-match-34col.txt");
+    pub const HISTORY_SEARCH_26COL: &str =
+        include_str!("fixtures/muse-1.4.14-R7309.1-history-search-26col.txt");
+    pub const HISTORY_SEARCH_NO_MATCH_22COL: &str =
+        include_str!("fixtures/muse-1.4.14-R7309.1-history-search-no-match-22col.txt");
+    pub const HISTORY_SEARCH_LEFT: &str =
+        include_str!("fixtures/muse-1.4.14-R7309.1-history-search-left.txt");
+    pub const HISTORY_SEARCH_LEFT_CELLS: &str =
+        include_str!("fixtures/muse-1.4.14-R7309.1-history-search-left-cells.txt");
+    pub const HISTORY_SEARCH_LEFT_26COL: &str =
+        include_str!("fixtures/muse-1.4.14-R7309.1-history-search-left-26col.txt");
+    pub const HISTORY_SEARCH_LEFT_26COL_CELLS: &str =
+        include_str!("fixtures/muse-1.4.14-R7309.1-history-search-left-26col-cells.txt");
     pub const BUSY: &str = include_str!("fixtures/muse-1.4.9-R6297.1-busy-thinking.txt");
     pub const BUSY_ALT_GLYPH: &str =
         include_str!("fixtures/muse-1.4.9-R6297.1-busy-thinking-alt-glyph.txt");

@@ -536,12 +536,28 @@ fn recovery_next_line(at: Option<i64>) -> String {
     )
 }
 
+fn pool_work_observed_line(at: i64) -> String {
+    if at > 0 {
+        format!(
+            "Pool work observed {}",
+            aterm_agent::harness::usage::rfc3339_utc(at)
+        )
+    } else {
+        "Pool work observation time unknown".into()
+    }
+}
+
 /// Full observed recovery evidence, without the menu's display-width limit.
 fn recovery_report(progress: &aterm_agent::harness::account_progress::AccountProgress) -> String {
     let count = |value: Option<usize>| value.map_or_else(|| "unknown".into(), |n| n.to_string());
     let mut lines = vec![
         format!(
-            "Recovery: {}",
+            "{}: {}",
+            if progress.independent_work.is_empty() {
+                "Recovery"
+            } else {
+                "Recorded decision"
+            },
             aterm_agent::harness::footer::account_progress_phase(progress)
         ),
         format!(
@@ -558,6 +574,10 @@ fn recovery_report(progress: &aterm_agent::harness::account_progress::AccountPro
             progress.wall.as_deref().unwrap_or("not observed")
         ),
     ];
+    for work in &progress.independent_work {
+        lines.push(aterm_agent::harness::footer::account_pool_work_text(work));
+        lines.push(pool_work_observed_line(work.observed_at));
+    }
     lines.extend(progress.details.iter().cloned());
     for diagnostic in &progress.login_diagnostics {
         lines.push(format!(
@@ -575,31 +595,43 @@ fn recovery_report(progress: &aterm_agent::harness::account_progress::AccountPro
     lines.join("\n")
 }
 
-fn login_diagnostic_rows(
-    out: &mut Vec<MenuRow>,
-    diagnostic: &aterm_agent::harness::accounts_sync::LoginDiagnostic,
-    room: usize,
-) {
-    out.push(MenuRow::note(format!(
-        "Last local sign-in: {}",
-        diagnostic.label()
-    )));
+fn wrapped_note_rows(out: &mut Vec<MenuRow>, words: &str, room: usize) {
+    wrapped_note_rows_marked(out, words, room, "-");
+}
+
+fn wrapped_note_rows_marked(out: &mut Vec<MenuRow>, words: &str, room: usize, mark: &str) {
     let width = if room == 0 {
         autopilot_menu::MAX_CONTENT
     } else {
         room.min(autopilot_menu::MAX_CONTENT)
     };
-    let words = diagnostic.words();
-    let wrapped = crate::native_settings::wrap_to_box(&words, width as f32, &|text| {
-        crate::tab_menu::display_cells(text) as f32
-    });
-    let mut spoken = Some(words.as_str());
+    let wrapped = crate::native_settings::wrap_to_box_marked(
+        words,
+        width as f32,
+        &|text| crate::tab_menu::display_cells(text) as f32,
+        mark,
+    );
+    let mut spoken = Some(words);
     for line in wrapped {
         out.push(MenuRow::note_spoken(
             line,
             spoken.take().unwrap_or_default(),
         ));
     }
+}
+
+fn login_diagnostic_rows(
+    out: &mut Vec<MenuRow>,
+    diagnostic: &aterm_agent::harness::accounts_sync::LoginDiagnostic,
+    room: usize,
+) {
+    wrapped_note_rows_marked(
+        out,
+        &format!("Last local sign-in: {}", diagnostic.label()),
+        room,
+        "",
+    );
+    wrapped_note_rows(out, &diagnostic.words(), room);
     out.push(MenuRow::note(format!(
         "Finished {}",
         aterm_agent::harness::usage::rfc3339_utc(diagnostic.completed_at),
@@ -703,10 +735,14 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
             if let Some(progress) = &facts.account_progress {
                 let mut summary = progress.clone();
                 summary.details.clear();
+                summary.independent_work.clear();
                 summary.next_at = summary.next_at.filter(|at| *at > 0);
-                out.push(MenuRow::note(
-                    aterm_agent::harness::footer::account_progress_text(&summary, false),
-                ));
+                let summary = aterm_agent::harness::footer::account_progress_text(&summary, false);
+                out.push(MenuRow::note(if progress.independent_work.is_empty() {
+                    summary
+                } else {
+                    format!("Recorded decision: {summary}")
+                }));
                 out.push(item(
                     fact,
                     "\u{29c9}",
@@ -730,6 +766,14 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 // Keep timing visible before a long list of retained route details.
                 out.push(MenuRow::note(recovery_observed_line(progress.observed_at)));
                 out.push(MenuRow::note(recovery_next_line(progress.next_at)));
+                for work in &progress.independent_work {
+                    wrapped_note_rows(
+                        &mut out,
+                        &aterm_agent::harness::footer::account_pool_work_text(work),
+                        facts.room,
+                    );
+                    out.push(MenuRow::note(pool_work_observed_line(work.observed_at)));
+                }
                 let mut diagnostics: Vec<_> = progress.login_diagnostics.iter().collect();
                 diagnostics.sort_by_key(|diagnostic| std::cmp::Reverse(diagnostic.completed_at));
                 for diagnostic in diagnostics {
@@ -1138,7 +1182,7 @@ pub(crate) fn pool_menu_rows(
     let roster = accounts::Roster::load_for(cli, &path)?;
     let store = accounts::Store::at_for(state_dir, cli, home);
     let roster = store.bound(&roster, now)?;
-    let (state, _) = store.load(now)?;
+    let (state, _) = store.load_judged(now, &roster)?;
     let enrolled = accounts::enrolled_in(cli, &roster, home);
     Ok(account_menu_rows_from(
         &roster,
@@ -1209,8 +1253,9 @@ pub(crate) struct SessionWeek {
 }
 
 /// The Account menu's rows of `roster`, each with its condition and quota and whether it can be
-/// chosen. `auto_login` is whether aterm signs a row with an email in by itself (Claude Code's,
-/// and another CLI's whose renewal approves its page headlessly, `Cli::renews_headlessly`): such
+/// chosen. `auto_login` is whether choosing a row with an email starts its sign-in with nobody at
+/// the page (Claude Code's, and another CLI's whose renewal approves its page headlessly,
+/// `Cli::renews_headlessly`): such
 /// a row that is signed out or not enrolled says `(auto-login)` and can be chosen. Where it is
 /// false (Grok Build's, whose background renewal never starts) that row is as one with no email:
 /// it names its condition and cannot be chosen, since a choice would start no sign-in.
@@ -2010,3 +2055,7 @@ impl App {
 #[cfg(test)]
 #[path = "fact_menu_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "independent_work_consumer_tests.rs"]
+mod independent_work_tests;

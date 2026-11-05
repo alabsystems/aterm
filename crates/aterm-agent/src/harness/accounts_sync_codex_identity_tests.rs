@@ -32,7 +32,7 @@ impl World {
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::create_dir_all(home.join(".secrets")).unwrap();
         fs::create_dir_all(home.join(".codex")).unwrap();
-        fs::write(&config, "[fleet]\nmachine='m16'\n").unwrap();
+        aterm_uds::atomic_file::write(&config, b"[fleet]\nmachine='m16'\n", 0o600).unwrap();
         fs::write(
             home.join(".codex/config.toml"),
             "cli_auth_credentials_store='file'\n",

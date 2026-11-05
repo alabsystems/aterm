@@ -46,7 +46,9 @@ pub fn run(args: &[OsString]) -> ExitCode {
         // Copy stdin to stdout until its EOF.
         "echo" => {
             let mut all = Vec::new();
-            let _ = std::io::stdin().read_to_end(&mut all);
+            let _ = std::io::stdin()
+                .take(64 * 1024 * 1024)
+                .read_to_end(&mut all);
             let _ = out.write_all(&all);
             ExitCode::SUCCESS
         }
@@ -107,7 +109,7 @@ pub fn run(args: &[OsString]) -> ExitCode {
         // The kernel's view of its credentials (Linux): `Uid:`, `Gid:` and `Groups:`.
         "ids" => {
             use std::io::Read as _;
-            let status = std::fs::File::open("/proc/self/status")
+            let status = crate::open_regular_nonblock(std::path::Path::new("/proc/self/status"))
                 .ok()
                 .and_then(|f| {
                     let mut buf = String::with_capacity(4096);

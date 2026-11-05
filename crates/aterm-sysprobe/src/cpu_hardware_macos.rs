@@ -8,9 +8,9 @@
 use std::ffi::{CStr, CString, c_void};
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use super::{Channel, Controls, PowerLimits, Reading, State, interpret};
+use super::{Chain, Channel, Controls, Link, Pair, PowerLimits, Reading, State, interpret, nanos};
 use crate::iokit::{self, CFDictionaryRef, CFMutableDictionaryRef, CFStringRef, CFTypeRef};
 use crate::macos::{Cf, cf_bytes, cf_text, cf_u64};
 
@@ -44,17 +44,11 @@ fn api() -> Reading<&'static Api> {
     .map_err(Clone::clone)
 }
 
-struct Previous {
-    sample: Cf,
-    after: Instant,
-    call_ns: u64,
-}
-
 pub(super) struct Reader {
     api: &'static Api,
     subscription: Cf,
     channels: Cf,
-    previous: Option<Previous>,
+    chain: Chain<Cf>,
     e_frequencies: Option<Vec<f64>>,
     p_frequencies: Option<Vec<f64>>,
 }
@@ -88,13 +82,15 @@ impl Reader {
             api,
             subscription,
             channels,
-            previous: None,
+            chain: Chain::default(),
             e_frequencies,
             p_frequencies,
         })
     }
 
-    pub(super) fn sample(&mut self) -> (u64, u64, Reading<Vec<Channel>>) {
+    /// One snapshot, and its delta against the previous one within `gap` (the gap rule,
+    /// [`Chain`]): the window between their returns, the two calls' summed span, and the rows.
+    pub(super) fn sample(&mut self, gap: Duration) -> (u64, u64, Reading<Vec<Channel>>) {
         let before = Instant::now();
         // SAFETY: subscription and its actual subscribed dictionary remain live.
         let sample = Cf::adopt(
@@ -109,33 +105,37 @@ impl Reader {
         );
         let after = Instant::now();
         let Some(sample) = sample else {
-            self.previous = None;
+            self.chain.clear();
             return (0, 0, Err("refused:ioreport_sample".into()));
         };
-        let current = Previous {
-            sample,
+        let call_ns = nanos(after.duration_since(before));
+        let current = Link {
+            snapshot: sample,
             after,
-            call_ns: nanos(after.duration_since(before)),
+            call_ns,
         };
-        let Some(previous) = self.previous.replace(current) else {
-            return (
-                0,
-                nanos(after.duration_since(before)),
-                Err("warming".into()),
-            );
+        let Some(Pair {
+            previous,
+            current,
+            window_ns,
+            span_ns,
+        }) = self.chain.push(current, gap)
+        else {
+            return (0, call_ns, Err("warming".into()));
         };
-        let current = self.previous.as_ref().expect("replaced above");
-        let window = nanos(current.after.duration_since(previous.after));
-        let span = previous.call_ns.saturating_add(current.call_ns);
         // SAFETY: both snapshots were returned under the same live subscription.
         let delta = Cf::adopt(
-            unsafe { (self.api.delta)(previous.sample.0.cast(), current.sample.0.cast(), null()) }
-                .cast(),
+            unsafe { (self.api.delta)(previous.0.cast(), current.0.cast(), null()) }.cast(),
         );
         let rows = delta
             .ok_or_else(|| "refused:ioreport_delta".to_owned())
             .and_then(|delta| self.decode(&delta));
-        (window, span, rows)
+        (window_ns, span_ns, rows)
+    }
+
+    /// Whether a snapshot taken now would pair within `gap`.
+    pub(super) fn warm(&self, gap: Duration) -> bool {
+        self.chain.warm(Instant::now(), gap)
     }
 
     fn decode(&self, delta: &Cf) -> Reading<Vec<Channel>> {
@@ -239,10 +239,6 @@ impl Reader {
             Ok(rows)
         }
     }
-}
-
-fn nanos(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn service(class: &CStr) -> Option<u32> {

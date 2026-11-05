@@ -151,11 +151,19 @@ pub fn stage_local(options: &LocalStageOptions) -> Result<String, String> {
     aterm_update_core::ensure_private_dir(&checked.root).map_err(|e| e.to_string())?;
     // Preserve the actual local floor for the ordinary scratch publisher's late checks.
     if live.floor().exists() {
-        std::fs::write(
-            checked.floor(),
-            read_asset(&live.root, "floor.toml", crate::MAX_LEDGER_BYTES)?,
-        )
-        .map_err(|e| e.to_string())?;
+        use std::io::Write as _;
+        let floor_bytes = read_asset(&live.root, "floor.toml", crate::MAX_LEDGER_BYTES)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        opts.open(checked.floor())
+            .and_then(|mut f| f.write_all(&floor_bytes))
+            .map_err(|e| e.to_string())?;
     }
     let refresh = || crate::manifest::Floor::read(&live.floor()).roster_seq;
     let policy = RosterPolicy {
@@ -191,7 +199,14 @@ pub fn stage_local(options: &LocalStageOptions) -> Result<String, String> {
     }
     let copied = scratch.path().join(&artifact.name);
     let (mut input, _) = regular(&options.assets.join(&artifact.name))?;
-    let mut output = std::fs::File::create(&copied).map_err(|e| e.to_string())?;
+    let mut output_opts = std::fs::OpenOptions::new();
+    output_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        output_opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut output = output_opts.open(&copied).map_err(|e| e.to_string())?;
     let cap = aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND;
     let size = std::io::copy(
         &mut Read::by_ref(&mut input).take(cap.saturating_add(1)),

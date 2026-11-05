@@ -51,12 +51,14 @@ impl std::fmt::Display for EditError {
 impl std::error::Error for EditError {}
 
 /// The `edit` request's usage line.
-pub const EDIT_USAGE: &str = "edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]";
+pub const EDIT_USAGE: &str =
+    "edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0] [ro=1]";
 
 /// The `await edit` request's usage line.
 pub const AWAIT_EDIT_USAGE: &str = "await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]";
 
-/// Parsed `edit` request (`edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]`).
+/// Parsed `edit` request (`edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]
+/// [ro=1]`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditRequest {
     /// The file, as a `file://` URI ([`super::uri::path_to_file_uri`]).
@@ -69,6 +71,10 @@ pub struct EditRequest {
     pub for_word: Option<String>,
     /// Whether the asker will wait on the ticket (`await edit`).
     pub wait: bool,
+    /// `ro=1`: the document opens read-only. Nothing typed, pasted or cut changes it and no save
+    /// writes it; the person reads it and closes the tab (a revealed secret's grid, one-mesh
+    /// design §4.8).
+    pub read_only: bool,
 }
 
 impl EditRequest {
@@ -85,6 +91,7 @@ impl EditRequest {
             create: false,
             for_word: None,
             wait: true,
+            read_only: false,
         };
         let mut seen = Vec::new();
         for word in words {
@@ -117,6 +124,13 @@ impl EditRequest {
                         _ => return Err(EditError::BadField("wait", value.to_string())),
                     };
                 }
+                "ro" => {
+                    request.read_only = match value {
+                        "1" => true,
+                        "0" => false,
+                        _ => return Err(EditError::BadField("ro", value.to_string())),
+                    };
+                }
                 _ => return Err(EditError::UnknownOption(word.to_string())),
             }
         }
@@ -134,8 +148,15 @@ impl EditRequest {
             if line == 0 || col == Some(0) {
                 return Err(EditError::BadLine(format_line(line, col)));
             }
-            args.push_str(" line=");
-            args.push_str(&format_line(line, col));
+            use std::fmt::Write as _;
+            match col {
+                Some(col) => {
+                    let _ = write!(args, " line={line}:{col}");
+                }
+                None => {
+                    let _ = write!(args, " line={line}");
+                }
+            }
         }
         if self.create {
             args.push_str(" create=1");
@@ -150,6 +171,9 @@ impl EditRequest {
         }
         if !self.wait {
             args.push_str(" wait=0");
+        }
+        if self.read_only {
+            args.push_str(" ro=1");
         }
         Ok(args)
     }
@@ -183,9 +207,9 @@ impl EditOk {
 
     /// Read a reply line (a trailing newline is allowed).
     pub fn parse(line: &str) -> Result<Self, EditError> {
-        let fields = reply_fields(line, &["OK", "edit"], "OK edit ticket= view= doc= uri=")?;
-        let [ticket, view, doc, uri] = keyed(
-            &fields,
+        let [ticket, view, doc, uri] = reply_keyed(
+            line,
+            &["OK", "edit"],
             ["ticket", "view", "doc", "uri"],
             "OK edit ticket= view= doc= uri=",
         )?;
@@ -257,8 +281,12 @@ impl EditOutcome {
     /// Read a reply line (a trailing newline is allowed).
     pub fn parse(line: &str) -> Result<Self, EditError> {
         const FORM: &str = "OK edit done result= saved= seq=";
-        let fields = reply_fields(line, &["OK", "edit", "done"], FORM)?;
-        let [result, saved, seq] = keyed(&fields, ["result", "saved", "seq"], FORM)?;
+        let [result, saved, seq] = reply_keyed(
+            line,
+            &["OK", "edit", "done"],
+            ["result", "saved", "seq"],
+            FORM,
+        )?;
         Ok(Self {
             result: EditResult::from_word(result)
                 .ok_or_else(|| EditError::BadField("result", result.to_string()))?,
@@ -335,7 +363,8 @@ impl AwaitEdit {
             }
         };
         if let Some(ms) = self.timeout_ms {
-            args.push_str(&format!(" timeout={ms}"));
+            use std::fmt::Write as _;
+            let _ = write!(args, " timeout={ms}");
         }
         Ok(args)
     }
@@ -422,30 +451,21 @@ fn number(text: &str, field: &'static str) -> Result<u64, EditError> {
         .map_err(|_| EditError::BadField(field, text.to_string()))
 }
 
-fn reply_fields<'a>(
+fn reply_keyed<'a, const N: usize>(
     line: &'a str,
     leading: &[&str],
+    keys: [&'static str; N],
     form: &'static str,
-) -> Result<Vec<&'a str>, EditError> {
+) -> Result<[&'a str; N], EditError> {
     let mut words = line.split_whitespace();
     for want in leading {
         if words.next() != Some(*want) {
             return Err(EditError::Usage(form));
         }
     }
-    Ok(words.collect())
-}
-
-fn keyed<'a, const N: usize>(
-    fields: &[&'a str],
-    keys: [&'static str; N],
-    form: &'static str,
-) -> Result<[&'a str; N], EditError> {
-    if fields.len() != N {
-        return Err(EditError::Usage(form));
-    }
     let mut values = [""; N];
-    for (slot, (field, key)) in values.iter_mut().zip(fields.iter().zip(keys)) {
+    for (slot, key) in values.iter_mut().zip(keys) {
+        let field = words.next().ok_or(EditError::Usage(form))?;
         let value = field
             .strip_prefix(key)
             .and_then(|rest| rest.strip_prefix('='))
@@ -454,6 +474,9 @@ fn keyed<'a, const N: usize>(
             return Err(EditError::BadField(key, String::new()));
         }
         *slot = value;
+    }
+    if words.next().is_some() {
+        return Err(EditError::Usage(form));
     }
     Ok(values)
 }
@@ -481,6 +504,7 @@ mod tests {
                 create: false,
                 for_word: None,
                 wait: true,
+                read_only: false,
             },
             EditRequest {
                 uri: URI.to_string(),
@@ -488,6 +512,7 @@ mod tests {
                 create: false,
                 for_word: Some("git".to_string()),
                 wait: true,
+                read_only: false,
             },
             EditRequest {
                 uri: URI.to_string(),
@@ -495,6 +520,7 @@ mod tests {
                 create: true,
                 for_word: Some("claude-code_2.1".to_string()),
                 wait: true,
+                read_only: false,
             },
             EditRequest {
                 uri: URI.to_string(),
@@ -502,6 +528,15 @@ mod tests {
                 create: false,
                 for_word: Some("git".to_string()),
                 wait: false,
+                read_only: false,
+            },
+            EditRequest {
+                uri: URI.to_string(),
+                line: Some((1, None)),
+                create: false,
+                for_word: Some("aterm".to_string()),
+                wait: true,
+                read_only: true,
             },
         ] {
             let args = request.format().unwrap();
@@ -511,7 +546,18 @@ mod tests {
                 !request.wait,
                 "only `wait=0` is written: {args}"
             );
+            assert_eq!(
+                args.contains("ro="),
+                request.read_only,
+                "only `ro=1` is written: {args}"
+            );
         }
+        assert!(
+            !EditRequest::parse(&format!("{URI} ro=0"))
+                .unwrap()
+                .read_only,
+            "`ro=0` is the default spelled out"
+        );
         assert!(
             EditRequest::parse(&format!("{URI} wait=1")).unwrap().wait,
             "`wait=1` is the default spelled out"
@@ -524,6 +570,7 @@ mod tests {
                 create: false,
                 for_word: Some("git".to_string()),
                 wait: true,
+                read_only: false,
             },
             "options in any order, any spacing"
         );
@@ -555,6 +602,7 @@ mod tests {
             create: false,
             for_word: None,
             wait: true,
+            read_only: false,
         };
         assert!(matches!(zero.format(), Err(EditError::BadLine(_))));
     }
@@ -572,6 +620,8 @@ mod tests {
             "create=yes",
             "wait=no",
             "wait=0 wait=0",
+            "ro=yes",
+            "ro=1 ro=1",
             "for=a/b",
             "bare",
         ] {
@@ -592,6 +642,7 @@ mod tests {
             create: false,
             for_word: None,
             wait: true,
+            read_only: false,
         };
         assert_eq!(spaced.format(), Err(EditError::Whitespace("uri")));
         let word = EditRequest {
@@ -600,6 +651,7 @@ mod tests {
             create: false,
             for_word: Some("git commit".to_string()),
             wait: true,
+            read_only: false,
         };
         assert_eq!(word.format(), Err(EditError::Whitespace("for")));
         let ok = EditOk {

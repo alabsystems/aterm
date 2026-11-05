@@ -238,7 +238,7 @@ impl Epoch {
                 return Err(bad("epoch inventory is unknown or exceeds its window"));
             }
             let (file, _, stamp) = held_immutable(&self.directory, entry)?;
-            if file.metadata()?.mode() & 0o111 != 0 {
+            if stamp.mode() & 0o111 != 0 {
                 return Err(bad("epoch inventory contains an executable"));
             }
             members.push(Member {

@@ -549,8 +549,13 @@ fn route_sockaddr(block: &[u8], addrs: i32, want: i32) -> Option<&[u8]> {
 
 /// How long [`route_source_ipv4`] waits for the kernel's answer to its `RTM_GET`, which the
 /// kernel queues before the write returns: a bound, never a pace.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 const ROUTE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// A unit test's is the one-minute hang detector (`aterm_spec::wait::MUST_HAPPEN`, which this
+/// crate sits below): the answer always comes, but a loaded machine can keep the test's thread
+/// from reading it within 1 s.
+#[cfg(all(target_os = "macos", test))]
+const ROUTE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The local IPv4 address this Mac's kernel sends from toward `to`: the address of the route
 /// `to` takes, as `route -n get` reads it (a `PF_ROUTE` `RTM_GET` that asks for the route's
@@ -576,7 +581,13 @@ pub fn route_source_ipv4(to: Ipv4Addr) -> Option<Ipv4Addr> {
             return Err(std::io::Error::last_os_error());
         }
         // SAFETY: `raw` is the fresh descriptor socket(2) returned, owned by nothing else.
-        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        // Before the mark, as F_SETFD replaces every descriptor flag.
+        // SAFETY: F_SETFD takes an integer flag on this live descriptor.
+        if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(fd)
     })
     .ok()?;
     let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);

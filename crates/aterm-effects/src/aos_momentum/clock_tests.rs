@@ -211,6 +211,7 @@ fn a_decoded_log_whose_times_go_back_replays_as_time_went_back() {
     let key = |at: i128| MomentumEvent::Key {
         at,
         tau_bits: TAU.to_bits(),
+        echo: super::KeyEcho::Seen,
     };
     let (five, two, one, six) = (nanos(ms(5)), nanos(ms(2)), nanos(ms(1)), nanos(ms(6)));
     let (schema, identity, header, start) = {

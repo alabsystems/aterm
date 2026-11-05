@@ -242,6 +242,21 @@ fn a_stale_crate_folder_and_an_old_compilers_unit_go_with_their_entries() {
     );
 }
 
+/// A SURVEY SAYS IT IS STILL GOING: it stats each unit of a profile and reads each fingerprint
+/// folder's JSON, and a profile holds thousands of each.
+#[test]
+fn a_survey_ticks_for_each_stamp_and_fingerprint_it_reads() {
+    let fs = world(now() - DAY, 4 * DAY);
+    let ticks = aterm_uds::progress::ticks_here;
+    let before = ticks();
+    stamp(&fs, Path::new(LEAF));
+    assert_eq!(ticks() - before, 1, "a stamp");
+    let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
+    let before = ticks();
+    assert!(compiler(&fs, Path::new(&folder)).is_some());
+    assert_eq!(ticks() - before, 1, "a fingerprint folder");
+}
+
 /// THE WINDOW IS THE PASS'S: parts written four hours ago stay for a pass with room and go for
 /// a pass below the floor, the unit by the same window as the folder. Parts written 59 minutes
 /// ago stay for both, as does the folder written just now.

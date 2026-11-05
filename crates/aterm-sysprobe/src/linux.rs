@@ -103,6 +103,9 @@ pub const MAX_CPUS: usize = 4096;
 /// The most bytes of `/proc/stat` one [`StatReader::sample`] takes: room for the per-core lines of about 800 cores.
 pub const STAT_CAP: usize = 64 * 1024;
 
+/// The bytes of a process's name `comm` keeps: 15 (`TASK_COMM_LEN` less its NUL).
+const COMM_CUT: usize = 15;
+
 /// Every core's ticks from `/proc/stat`'s `cpuN` lines, indexed by `N` (a core missing between two others, which the kernel leaves out while it is offline, reads all zero).
 #[must_use]
 pub fn proc_stat_cores(text: &str, cut: bool) -> Option<Vec<CoreTicks>> {
@@ -1865,7 +1868,11 @@ impl Root {
                 resident,
                 disk_read: None,
                 disk_written: None,
-                name: stat.name,
+                name: crate::procs::whole_name(
+                    stat.name.as_bytes(),
+                    COMM_CUT,
+                    self.longer_names(pid),
+                ),
                 pgid: stat.pgrp,
                 uid: owner(&entry),
                 state: RunState::from_linux(stat.state),
@@ -1884,6 +1891,32 @@ impl Root {
             });
         }
         Some(Sweep { procs, truncated })
+    }
+
+    /// `pid`'s longer names for [`crate::procs::whole_name`], each read only once pulled, neither
+    /// cut: its `exe` link's file name (only its own user, or root, may read the link), less the
+    /// ` (deleted)` the kernel adds for an unlinked image; then its `argv[0]`'s, where that ends
+    /// in its NUL and holds no space (a program that rewrote its arguments into a title, which
+    /// may name other files, is not read).
+    fn longer_names(
+        &self,
+        pid: u32,
+    ) -> impl Iterator<Item = Option<(Vec<u8>, Option<usize>)>> + '_ {
+        let exe = std::iter::once_with(move || {
+            let link = std::fs::read_link(self.at(&format!("proc/{pid}/exe"))).ok()?;
+            let name = link.file_name()?.to_str()?;
+            let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+            Some((name.as_bytes().to_vec(), None))
+        });
+        let argv0 = std::iter::once_with(move || {
+            self.read(&format!("proc/{pid}/cmdline"), |t| {
+                let (argv0, _) = t.split_once('\0')?;
+                let name = argv0.rsplit('/').next()?;
+                (!argv0.contains(' ')).then(|| (name.as_bytes().to_vec(), None))
+            })
+            .flatten()
+        });
+        exe.chain(argv0)
     }
 
     /// What this tree's readers can say ([`Caps`]): each row from a probe of the file it reads.

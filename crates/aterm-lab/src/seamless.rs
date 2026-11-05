@@ -380,7 +380,8 @@ impl Desk {
         ] {
             let Some(pipe) = pipe else { continue };
             std::thread::spawn(move || {
-                for line in std::io::BufReader::new(pipe).lines() {
+                use std::io::Read as _;
+                for line in std::io::BufReader::new(pipe.take(16 * 1024 * 1024)).lines() {
                     let Ok(line) = line else { break };
                     if let Ok(mut g) = into.lock() {
                         g.push(line);
@@ -451,7 +452,8 @@ fn until<T>(within: Duration, mut f: impl FnMut() -> Option<T>) -> Result<Option
 }
 
 fn set_mode(file: &Path, mode: crate::fleet_fixture::Mode) -> Result<(), String> {
-    std::fs::write(file, mode.word()).map_err(|e| format!("{}: {e}", file.display()))
+    crate::util::atomic_write(file, mode.word().as_bytes())
+        .map_err(|e| format!("{}: {e}", file.display()))
 }
 
 fn measure(desk: &Desk, a: &str, b: &str, mode: &Path) -> Result<Figures, Fail> {
@@ -589,13 +591,11 @@ fn across_update(aterm: &Path, keep: bool) -> Result<Vec<(&'static str, Verdict)
     let updroot = world.dir.join("updroot");
     let keep_root = world.dir.join("keep");
     let laid = (|| -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
         for d in [&bin, &updroot, &keep_root] {
-            std::fs::create_dir_all(d)?;
-            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
+            crate::util::create_private_dir_all(d)?;
         }
         std::os::unix::fs::symlink(&crate::paths::paths().exe, bin.join("claude"))?;
-        std::fs::write(&mode, "idle")
+        crate::util::atomic_write(&mode, b"idle")
     })();
     laid.map_err(|e| {
         Fail::die(format!(
@@ -655,7 +655,7 @@ fn across_update(aterm: &Path, keep: bool) -> Result<Vec<(&'static str, Verdict)
         })
         .collect();
     let keeper = inst.pid;
-    inst.stop();
+    let cleanup = inst.stop();
     ended.push(format!(
         "keeper {keeper}:{}",
         if crate::sys::alive(keeper) {
@@ -671,7 +671,7 @@ fn across_update(aterm: &Path, keep: bool) -> Result<Vec<(&'static str, Verdict)
         world.dir.display(),
         if keep { " (kept)" } else { " (removed)" }
     );
-    ran
+    crate::instance::after_stop(ran, cleanup)
 }
 
 fn two_tabs(desk: &Desk, mode: &Path, bin: &Path) -> Result<(String, String), Fail> {
@@ -741,11 +741,9 @@ fn present_once(aterm: &Path, keep: bool) -> Result<Figures, Fail> {
     let bin = world.dir.join("bin");
     let mode = world.dir.join("standin.mode");
     let laid = (|| -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::create_dir_all(&bin)?;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700))?;
+        crate::util::create_private_dir_all(&bin)?;
         std::os::unix::fs::symlink(&crate::paths::paths().exe, bin.join("claude"))?;
-        std::fs::write(&mode, "idle")
+        crate::util::atomic_write(&mode, b"idle")
     })();
     laid.map_err(|e| {
         Fail::die(format!(
@@ -776,20 +774,25 @@ fn present_once(aterm: &Path, keep: bool) -> Result<Figures, Fail> {
     let server = server_pid(&desk.sock);
     let measured = two_tabs(&desk, &mode, &bin).and_then(|(a, b)| measure(&desk, &a, &b, &mode));
     let keeper = inst.pid;
-    inst.stop();
+    let cleanup = inst.stop();
     let gone = server.is_none_or(end_pid) && !crate::sys::alive(keeper);
     println!(
         "seamless: present instance {} (keeper {keeper}) {}",
         server.map_or_else(|| "-".to_string(), |p| p.to_string()),
         if gone { "gone" } else { "STILL ALIVE" }
     );
-    if !gone {
-        return Err(Fail::die(format!(
-            "seamless: the present instance of {} outlived its stop",
-            aterm.display()
-        )));
-    }
-    measured
+    let measured = if !gone {
+        crate::instance::after_stop(
+            measured,
+            Err(format!(
+                "seamless: the present instance of {} outlived its stop",
+                aterm.display()
+            )),
+        )
+    } else {
+        measured
+    };
+    crate::instance::after_stop(measured, cleanup)
 }
 
 fn bridge_pid(state: &Path) -> Option<i32> {
@@ -1044,8 +1047,8 @@ fn plant(desk: &Desk, dir: &Path) -> Result<Result<Planted, String>, Fail> {
     let at_p = format!("@{p}");
     let marked = dir.join("marked.sh");
     let title = dir.join("title.sh");
-    let written = std::fs::write(&marked, marked_script("QZP6SECRET1"))
-        .and_then(|()| std::fs::write(&title, "printf '\\033]0;QZP6SECRET2\\007'\n"));
+    let written = crate::util::write_fresh(&marked, marked_script("QZP6SECRET1"))
+        .and_then(|()| crate::util::write_fresh(&title, "printf '\\033]0;QZP6SECRET2\\007'\n"));
     if let Err(e) = written {
         return Ok(Err(format!("the plants' scripts: {e}")));
     }

@@ -1244,7 +1244,7 @@ fn apply_swarm_revoke_cascade(
         revoked_labels.insert(canon);
     }
     let mut loaded_roster = if swarm_enabled {
-        let log_lbls = roster::log_labels(paths);
+        let log_lbls = roster::log_labels(paths)?;
         Some(roster::load_or_seed_swarm_roster_with_log(
             admin, doc, &log_lbls,
         )?)

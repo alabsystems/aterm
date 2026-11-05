@@ -17,6 +17,7 @@ fn rec(seq: u64, subject: &str, text: &str, commit: Option<(&str, u64)>) -> Rec 
         text: text.to_string(),
         head: String::new(),
         commit: commit.map(|(g, u)| (g.to_string(), u)),
+        bytes: subject.len() + text.len(),
     }
 }
 
@@ -80,9 +81,28 @@ fn a_window_counts_every_record_and_names_the_commits() {
             .and_then(aterm_json::Value::as_f64),
         Some(1.0)
     );
+    let bytes: usize = recs[..5].iter().map(|r| r.bytes).sum();
+    let note = "/f/f1/in/n-1/s-b/n-1/note".len() + "lat-0".len();
+    assert_eq!((c.bytes, c.largest), (bytes, note), "every record's bytes");
+    assert_eq!(
+        c.bytes_by_class.get("/f/f1/in/<node>/<sid>/<node>/note"),
+        Some(&(2 * note))
+    );
+    assert_eq!(
+        j.get("bytes").and_then(aterm_json::Value::as_u64),
+        u64::try_from(bytes).ok()
+    );
     let table = rows(&c, 2);
     assert!(
-        table.iter().any(|r| r == "| **all records** | 5 | 2.500 |"),
+        table
+            .iter()
+            .any(|r| *r == format!("| **all records** | 5 | 2.500 | {bytes} |")),
+        "{table:?}"
+    );
+    assert!(
+        table
+            .iter()
+            .any(|r| *r == format!("The largest record: {note} bytes.")),
         "{table:?}"
     );
 }

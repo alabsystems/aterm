@@ -5,6 +5,8 @@ use super::*;
 
 fn source() -> Snapshot {
     Snapshot {
+        launch_env: None,
+        auth_observed: true,
         tab: "s-selected-source".into(),
         pid: 4242,
         start: "source-birth".into(),
@@ -186,6 +188,7 @@ fn account_admission_refuses_before_any_filesystem_work() {
     let opts = Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: Some(source().tab),
@@ -225,7 +228,12 @@ fn account_admission_refuses_before_any_filesystem_work() {
             (case != 0).then_some(&selected),
             &Live,
         );
-        assert_eq!(report.step, "wait:account-changed", "case {case}");
+        assert_eq!(report.report.step, "wait:account-changed", "case {case}");
+        assert_eq!(
+            report.claim,
+            crate::supervise::policy::turn_end::RestartClaim::Unread,
+            "case {case}: an account move refused before the lock reads no record"
+        );
         assert!(!opts.state.exists());
         assert!(!opts.home.exists());
     }

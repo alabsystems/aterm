@@ -87,8 +87,17 @@ pub(crate) fn corpus_file(corpus: Corpus, mb: u64) -> Result<PathBuf, String> {
     if !path.is_file() {
         eprintln!("generating the {mb} MB {} corpus", corpus.name());
         let part = path.with_extension("part");
+        let _ = std::fs::remove_file(&part);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
         let mut f = std::io::BufWriter::new(
-            std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?,
+            opts.open(&part)
+                .map_err(|e| format!("{}: {e}", part.display()))?,
         );
         generate(corpus.unit().as_bytes(), mb, &mut f)
             .map_err(|e| format!("{}: {e}", part.display()))?;
@@ -144,7 +153,7 @@ pub(crate) fn private_root(root: &Path) -> Result<Vec<(&'static str, PathBuf)>, 
         std::fs::create_dir_all(d).map_err(|e| format!("could not create {}: {e}", d.display()))?;
         private(d)?;
     }
-    std::fs::write(config.join("aterm.toml"), super::start::config())
+    crate::write_fresh(config.join("aterm.toml"), super::start::config())
         .map_err(|e| format!("could not write the config: {e}"))?;
     Ok(env)
 }

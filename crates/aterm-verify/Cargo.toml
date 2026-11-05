@@ -59,6 +59,9 @@ aterm-uds = { workspace = true }
 # tells it what a run's passes end unasked. Workspace crate, std-only, with no
 # third-party dependency.
 aterm-ctl = { path = "../aterm-ctl" }
+# `perf cli-start`'s `prelude` stop: the verb aterm's front door refuses past its hook installs
+# (`aterm_containment::consent::OPEN_PROBE_VERB`). std, aterm-log, aterm-uds and aterm-tempfile.
+aterm-containment = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 # `glue` and `wasm-glue` read the descriptor aterm-wasm-abi's `#[export]`
 # writes, with that crate's own decoder and lowering table.

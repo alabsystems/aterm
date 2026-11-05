@@ -140,31 +140,43 @@ fn below(root: &Path, relative: &str) -> R<PathBuf> {
 }
 
 fn digest(p: &Path) -> R<String> {
-    regular(p)?;
-    atpkg::sha256_file(p).map_err(|e| io(p, &e))
+    match atpkg::sha256_file(p) {
+        Ok(d) => Ok(d),
+        Err(e) => {
+            regular(p)?;
+            Err(io(p, &e))
+        }
+    }
 }
 
 fn files(root: &Path) -> R<Vec<PathBuf>> {
     directory(root)?;
     let mut out = Vec::new();
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(root)
-        .map_err(|e| io(root, &e))?
-        .map(|e| e.map(|e| e.path()).map_err(|e| io(root, &e)))
+    files_inner(root, &mut out)?;
+    Ok(out)
+}
+
+fn files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> R<()> {
+    let mut entries: Vec<(PathBuf, std::fs::FileType)> = std::fs::read_dir(dir)
+        .map_err(|e| io(dir, &e))?
+        .map(|e| {
+            let e = e.map_err(|err| io(dir, &err))?;
+            let p = e.path();
+            let ft = e.file_type().map_err(|err| io(&p, &err))?;
+            Ok((p, ft))
+        })
         .collect::<R<_>>()?;
-    entries.sort();
-    for p in entries {
-        let ft = std::fs::symlink_metadata(&p)
-            .map_err(|e| io(&p, &e))?
-            .file_type();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (p, ft) in entries {
         if ft.is_dir() {
-            out.extend(files(&p)?);
+            files_inner(&p, out)?;
         } else if ft.is_file() {
             out.push(p);
         } else {
             return Err(Refusal::LinkInClosure(p));
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn fields(path: &Path) -> R<BTreeMap<String, String>> {
@@ -224,9 +236,9 @@ fn compiler_identity(
 fn any_named(dir: &Path, prefix: &str, suffix: &str) -> bool {
     std::fs::read_dir(dir).is_ok_and(|rd| {
         rd.flatten().any(|e| {
-            let n = e.file_name();
-            let n = n.to_string_lossy();
-            n.starts_with(prefix) && n.ends_with(suffix)
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(suffix))
         })
     })
 }
@@ -250,6 +262,7 @@ fn require_surface(target: &Path, driver: &Path) -> R<()> {
 }
 
 fn merge_closure(source: &Path, target: &Path) -> R<()> {
+    let mut verified_dirs = std::collections::BTreeSet::new();
     for entry in files(source)? {
         let rel = entry
             .strip_prefix(source)
@@ -258,10 +271,13 @@ fn merge_closure(source: &Path, target: &Path) -> R<()> {
         if let Some(dirs) = rel.parent() {
             for part in dirs.components() {
                 parent.push(part);
-                if std::fs::symlink_metadata(&parent).is_err() {
-                    std::fs::create_dir(&parent).map_err(|e| io(&parent, &e))?;
+                if !verified_dirs.contains(&parent) {
+                    if std::fs::symlink_metadata(&parent).is_err() {
+                        std::fs::create_dir(&parent).map_err(|e| io(&parent, &e))?;
+                    }
+                    directory(&parent)?;
+                    verified_dirs.insert(parent.clone());
                 }
-                directory(&parent)?;
             }
         }
         let dest = target.join(rel);
@@ -270,7 +286,7 @@ fn merge_closure(source: &Path, target: &Path) -> R<()> {
                 return Err(Refusal::Conflict(rel.to_path_buf()));
             }
         } else {
-            std::fs::copy(&entry, &dest).map_err(|e| io(&dest, &e))?;
+            crate::identity::copy_regular_file(&entry, &dest).map_err(|e| io(&dest, &e))?;
         }
     }
     Ok(())
@@ -375,12 +391,12 @@ pub fn prepare(
     let mut drivers: Vec<PathBuf> = std::fs::read_dir(&library)
         .map_err(|e| io(&library, &e))?
         .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        .filter(|e| {
+            e.file_name().to_str().is_some_and(|n| {
                 n.starts_with("librustc_driver-") && (n.ends_with(".so") || n.ends_with(".dylib"))
             })
         })
+        .map(|e| e.path())
         .collect();
     drivers.sort();
     let [driver] = drivers.as_slice() else {
@@ -442,7 +458,17 @@ pub fn prepare(
         merge_closure(&private_target, &target)?;
         merge_closure(&below(&private, "host")?, &target)?;
         require_surface(&target, driver)?;
-        std::fs::write(&marker, format!("{commit}\n")).map_err(|e| io(&marker, &e))?;
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&marker)
+                .and_then(|mut f| f.write_all(format!("{commit}\n").as_bytes()))
+                .map_err(|e| io(&marker, &e))?;
+        }
     }
     let target_driver = target.join(&driver_name);
     if !same_file(&target_driver, driver) {

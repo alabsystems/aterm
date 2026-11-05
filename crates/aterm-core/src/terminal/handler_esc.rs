@@ -300,6 +300,14 @@ impl TerminalHandler<'_> {
         )
     )]
     fn reset_terminal_state(&mut self) {
+        // A scheme change this read made while 2031 was set is pushed before the reset turns
+        // 2031 off, as a read that ended at the RIS would push it.
+        super::super::state_accessors::settle_color_scheme_after_output(
+            self.modes,
+            self.color,
+            self.policy,
+            self.transient,
+        );
         let mut groups = super::super::ResetGroups {
             kitty_keyboard: self.kitty_keyboard,
             xterm_keyboard: self.xterm_keyboard,
@@ -324,6 +332,7 @@ impl TerminalHandler<'_> {
             self.color,
             self.secure_keyboard_entry,
             &mut groups,
+            self.host_bidi,
         );
         self.holder_fence.note_alt_exit();
         self.invalidate_bidi_all();

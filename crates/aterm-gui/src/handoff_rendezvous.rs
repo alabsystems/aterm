@@ -109,7 +109,12 @@ const CODE_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 const ACCEPT_POLL_SLICE: Duration = Duration::from_millis(10);
 
+/// How long an accepted dialer has to present its claim frame, from its accept. A unit test's
+/// dialers are its own threads and children, which write theirs, so they wait the hang detector.
+#[cfg(not(test))]
 const CLAIM_FRAME_BUDGET: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const CLAIM_FRAME_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 const MAX_REFUSED_DIALS: usize = 32;
 
@@ -339,7 +344,7 @@ fn prove_bound_socket_is_ours(dir: &Path, path: &Path) -> Result<(), String> {
     let uid = unsafe { libc::getuid() };
     let dir_handle = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(dir)
         .map_err(|e| format!("rendezvous directory is not a real directory of ours: {e}"))?;
     let dmeta = dir_handle
@@ -4076,10 +4081,84 @@ mod tests {
         *state = successors[0].clone();
     }
 
-    fn grant_disagreement(
-        decide: &dyn Fn(bool, bool, usize) -> Result<GrantShape, RendezvousError>,
-        read: &dyn Fn(&str, &str, bool) -> Result<GrantBody, RendezvousError>,
-    ) -> Option<String> {
+    /// The code [`grant_disagreement`] reads against the model.
+    #[derive(Clone, Copy)]
+    struct GrantCode<'a> {
+        decide: &'a dyn Fn(bool, bool, usize) -> Result<GrantShape, RendezvousError>,
+        read: &'a dyn Fn(&str, &str, bool) -> Result<GrantBody, RendezvousError>,
+        /// What a park captures of a desk with a tab or none, with a lone Workers list or none,
+        /// for a target whose read declared `desk1` or did not.
+        capture: &'a dyn Fn(bool, bool, bool) -> crate::restore::RestoreManifest,
+        /// The parent has no layout to send (`outgoing_layout_wire`).
+        nothing: &'a dyn Fn(&crate::restore::RestoreManifest) -> bool,
+        /// A successor with `desk1`'s code, or a build before it, places what it was handed.
+        take: &'a dyn Fn(&crate::restore::RestoreManifest, bool) -> bool,
+    }
+
+    /// A window for the sweep: one with a tab, or one whose list stands alone.
+    fn swept_window(tab: bool) -> crate::restore::WindowLayout {
+        let mut window = crate::restore::WindowLayout::lone_workers_list(24, 80);
+        if tab {
+            window.workers_in_front = false;
+            window.restored_tabs = vec![crate::restore::RestoredTab {
+                root: crate::restore::RestoredSplitTree::leaf(
+                    crate::restore::RestoredView::Native(
+                        crate::restore::NativeLeafRestore::settings("/".to_string()),
+                    ),
+                ),
+                focused_path: Vec::new(),
+                zoomed: false,
+                parked: false,
+                ephemeral: false,
+            }];
+        }
+        window
+    }
+
+    fn swept_desk(tab: bool, lone_list: bool) -> Vec<crate::restore::WindowLayout> {
+        [
+            tab.then(|| swept_window(true)),
+            lone_list.then(|| swept_window(false)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    fn captured(tab: bool, lone_list: bool, read: bool) -> crate::restore::RestoreManifest {
+        let mut windows = swept_desk(tab, lone_list);
+        windows.retain(|window| window.kept_in_layout(read));
+        crate::restore::RestoreManifest::new(windows)
+    }
+
+    /// A build with `desk1`'s code places a lone list. One before it reads only tabs, which is
+    /// why a parent never sends it one.
+    fn placed(layout: &crate::restore::RestoreManifest, desk_capable: bool) -> bool {
+        if desk_capable {
+            !layout.is_empty()
+        } else {
+            layout.windows.iter().any(|window| !window.holds_no_tab())
+        }
+    }
+
+    fn shipped_code() -> GrantCode<'static> {
+        GrantCode {
+            decide: &grant_shape,
+            read: &parse_grant_body,
+            capture: &captured,
+            nothing: &crate::restore::RestoreManifest::is_empty,
+            take: &placed,
+        }
+    }
+
+    fn grant_disagreement(code: GrantCode<'_>) -> Option<String> {
+        let GrantCode {
+            decide,
+            read,
+            capture,
+            nothing,
+            take,
+        } = code;
         let model = aterm_models_update::native_update_rendezvous_grant_model();
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let bools = [false, true];
@@ -4107,87 +4186,130 @@ mod tests {
                 {
                     continue;
                 }
-                let mut state = model.init_state();
-                for (taken, action) in [
-                    (capable, "Upgrade"),
-                    (declared, "Declare"),
-                    (empty_capable, "UpgradeEmpty"),
-                    (empty_declared, "DeclareEmpty"),
-                    (large, "Grow"),
-                    (sessionless, "Empty"),
-                    (offered, "Offer"),
-                    (empty_offered, "OfferEmpty"),
-                    (true, "Launch"),
-                ] {
-                    if taken {
-                        step_grant(&model, &mut state, action);
-                    }
-                }
-                let caps = grant_caps(offered, empty_offered).map(std::ffi::OsString::from);
-                let claims_chunks = capable && offers_chunked_grant(caps.as_deref());
-                if model.action_enabled("ClaimChunks", &state) != claims_chunks
-                    || model.action_enabled("ClaimOne", &state) == claims_chunks
+                for (desk_capable, desk_declared, desk_read, workers_window, workers_only) in
+                    bools.into_iter().flat_map(|a| {
+                        bools.into_iter().flat_map(move |b| {
+                            bools.into_iter().flat_map(move |c| {
+                                bools.into_iter().flat_map(move |d| {
+                                    bools.into_iter().map(move |e| (a, b, c, d, e))
+                                })
+                            })
+                        })
+                    })
                 {
-                    return Some(format!("the claim of capable={capable} offered={offered}"));
-                }
-                let secret = "d".repeat(CLAIM_HEX_LEN);
-                let claimed = claim_frame_kind(&claim_frame_with(&secret, claims_chunks), &secret)
-                    .expect("the claim carries the secret");
-                step_grant(
-                    &model,
-                    &mut state,
-                    if claimed { "ClaimChunks" } else { "ClaimOne" },
-                );
-                let pools: &[usize] = if sessionless {
-                    &[0]
-                } else if large {
-                    &[MAX_RENDEZVOUS_SESSIONS + 1, 100, MAX_CHUNKED_SESSIONS]
-                } else {
-                    &[1, 3, MAX_RENDEZVOUS_SESSIONS]
-                };
-                for &sessions in pools {
-                    let decided = decide(claimed, empty_offered, sessions);
-                    let expected = (
-                        matches!(decided, Ok(GrantShape::OneMessage)),
-                        matches!(decided, Ok(GrantShape::Chunked)),
-                        matches!(decided, Err(RendezvousError::TooManySessions { .. })),
-                    );
-                    let modelled = (
-                        model.action_enabled("GrantOne", &state),
-                        model.action_enabled("GrantChunks", &state),
-                        model.action_enabled("RefuseTooMany", &state)
-                            || model.action_enabled("RefuseEmpty", &state),
-                    );
-                    if expected != modelled {
-                        return Some(format!(
-                            "{sessions} sessions for claim chunks={claimed} empty \
-                             offered={empty_offered}: the parent decides {decided:?}, the \
-                             model enables {modelled:?}"
-                        ));
-                    }
-                }
-                if sessionless {
-                    // Where the sound parent refuses, the Buggy model's parent sends the empty
-                    // grant it never offered, so the successor's refusal of that grant is read
-                    // against the model's Refuse as its adoption of an offered one is against
-                    // Adopt.
-                    let parent = if model.action_enabled("GrantOne", &state) {
-                        &model
-                    } else {
-                        &buggy
-                    };
-                    for action in ["GrantOne", "Send", "Take"] {
-                        step_grant(parent, &mut state, action);
-                    }
-                    let reads = empty_capable && offers_empty_grant(caps.as_deref());
-                    let adopted = read(&format!("{TEST_NONCE}\n\n"), TEST_NONCE, reads).is_ok();
-                    if parent.action_enabled("Adopt", &state) != adopted
-                        || parent.action_enabled("Refuse", &state) == adopted
+                    if (desk_declared && !desk_capable)
+                        || (desk_read && !desk_declared)
+                        || (workers_only && !(sessionless && workers_window))
                     {
+                        continue;
+                    }
+                    let mut state = model.init_state();
+                    for (taken, action) in [
+                        (capable, "Upgrade"),
+                        (declared, "Declare"),
+                        (empty_capable, "UpgradeEmpty"),
+                        (empty_declared, "DeclareEmpty"),
+                        (desk_capable, "UpgradeDesk"),
+                        (desk_declared, "DeclareDesk"),
+                        (large, "Grow"),
+                        (sessionless, "Empty"),
+                        (workers_window, "WorkersWindow"),
+                        (workers_only, "WorkersOnly"),
+                        (offered, "Offer"),
+                        (empty_offered, "OfferEmpty"),
+                        (desk_read, "ReadDesk"),
+                        (true, "Launch"),
+                    ] {
+                        if taken {
+                            step_grant(&model, &mut state, action);
+                        }
+                    }
+                    let layout = capture(!workers_only, workers_window, desk_read);
+                    if state["carried"] != i64::from(layout.carries_lone_workers_list()) {
                         return Some(format!(
-                            "a sessionless grant to empty capable={empty_capable} \
-                             offered={empty_offered}: the successor adopts={adopted}"
+                            "a lone list with desk read={desk_read}: the capture carries {}",
+                            layout.carries_lone_workers_list()
                         ));
+                    }
+                    let nothing_to_send = nothing(&layout);
+                    let caps = grant_caps(offered, empty_offered).map(std::ffi::OsString::from);
+                    let claims_chunks = capable && offers_chunked_grant(caps.as_deref());
+                    if model.action_enabled("ClaimChunks", &state) != claims_chunks
+                        || model.action_enabled("ClaimOne", &state) == claims_chunks
+                    {
+                        return Some(format!("the claim of capable={capable} offered={offered}"));
+                    }
+                    let secret = "d".repeat(CLAIM_HEX_LEN);
+                    let claimed =
+                        claim_frame_kind(&claim_frame_with(&secret, claims_chunks), &secret)
+                            .expect("the claim carries the secret");
+                    step_grant(
+                        &model,
+                        &mut state,
+                        if claimed { "ClaimChunks" } else { "ClaimOne" },
+                    );
+                    let pools: &[usize] = if sessionless {
+                        &[0]
+                    } else if large {
+                        &[MAX_RENDEZVOUS_SESSIONS + 1, 100, MAX_CHUNKED_SESSIONS]
+                    } else {
+                        &[1, 3, MAX_RENDEZVOUS_SESSIONS]
+                    };
+                    for &sessions in pools {
+                        let decided = decide(claimed, empty_offered, sessions);
+                        let expected = (
+                            matches!(decided, Ok(GrantShape::OneMessage)) && !nothing_to_send,
+                            matches!(decided, Ok(GrantShape::Chunked)) && !nothing_to_send,
+                            matches!(decided, Err(RendezvousError::TooManySessions { .. }))
+                                || nothing_to_send,
+                        );
+                        let modelled = (
+                            model.action_enabled("GrantOne", &state),
+                            model.action_enabled("GrantChunks", &state),
+                            model.action_enabled("RefuseTooMany", &state)
+                                || model.action_enabled("RefuseEmpty", &state)
+                                || model.action_enabled("RefuseDesk", &state),
+                        );
+                        if expected != modelled {
+                            return Some(format!(
+                                "{sessions} sessions for claim chunks={claimed} empty \
+                                 offered={empty_offered} desk read={desk_read} alone \
+                                 list={workers_only}: the parent decides {decided:?} with \
+                                 nothing={nothing_to_send}, the model enables {modelled:?}"
+                            ));
+                        }
+                    }
+                    if sessionless {
+                        // Where the sound parent refuses, the Buggy model's parent sends the
+                        // empty grant it never offered and the lone list it never read a
+                        // declaration of, so the successor's refusal of that grant is read
+                        // against the model's Refuse as its adoption of an offered one is against
+                        // Adopt.
+                        let parent = if model.action_enabled("GrantOne", &state) {
+                            &model
+                        } else {
+                            &buggy
+                        };
+                        for action in ["GrantOne", "Send", "Take"] {
+                            step_grant(parent, &mut state, action);
+                        }
+                        let reads = empty_capable && offers_empty_grant(caps.as_deref());
+                        let sent = capture(
+                            !workers_only,
+                            workers_window,
+                            desk_read || std::ptr::eq(parent, &buggy),
+                        );
+                        let adopted = read(&format!("{TEST_NONCE}\n\n"), TEST_NONCE, reads).is_ok()
+                            && take(&sent, desk_capable);
+                        if parent.action_enabled("Adopt", &state) != adopted
+                            || parent.action_enabled("Refuse", &state) == adopted
+                        {
+                            return Some(format!(
+                                "a sessionless grant to empty capable={empty_capable} \
+                                 offered={empty_offered} and desk capable={desk_capable} alone \
+                                 list={workers_only}: the successor adopts={adopted}"
+                            ));
+                        }
                     }
                 }
             }
@@ -4197,30 +4319,73 @@ mod tests {
 
     #[test]
     fn rendezvous_grant_conformance() {
-        assert_eq!(grant_disagreement(&grant_shape, &parse_grant_body), None);
+        let shipped = shipped_code();
+        assert_eq!(grant_disagreement(shipped), None);
         assert!(
-            grant_disagreement(
-                &|_, empty, sessions| grant_shape(true, empty, sessions),
-                &parse_grant_body
-            )
+            grant_disagreement(GrantCode {
+                decide: &|_, empty, sessions| grant_shape(true, empty, sessions),
+                ..shipped
+            })
             .is_some(),
             "a parent that ignores the claim must disagree with the model"
         );
         assert!(
-            grant_disagreement(
-                &|chunks, _, sessions| grant_shape(chunks, true, sessions),
-                &parse_grant_body
-            )
+            grant_disagreement(GrantCode {
+                decide: &|chunks, _, sessions| grant_shape(chunks, true, sessions),
+                ..shipped
+            })
             .is_some(),
             "a parent that sends an empty grant it never offered must disagree with the model"
         );
         assert!(
-            grant_disagreement(&grant_shape, &|body, nonce, _| parse_grant_body(
-                body, nonce, true
-            ))
+            grant_disagreement(GrantCode {
+                read: &|body, nonce, _| parse_grant_body(body, nonce, true),
+                ..shipped
+            })
             .is_some(),
             "a successor that adopts an empty grant it was never offered must disagree with the \
              model"
+        );
+        assert!(
+            grant_disagreement(GrantCode {
+                capture: &|tab, lone_list, _| captured(tab, lone_list, true),
+                ..shipped
+            })
+            .is_some(),
+            "a capture that carries a lone list to a target with no `desk1` must disagree with \
+             the model"
+        );
+        assert!(
+            grant_disagreement(GrantCode {
+                capture: &|tab, lone_list, _| captured(tab, lone_list, false),
+                ..shipped
+            })
+            .is_some(),
+            "a capture that never carries a lone list must disagree with the model"
+        );
+        assert!(
+            grant_disagreement(GrantCode {
+                nothing: &|layout| layout.windows.iter().all(|w| w.holds_no_tab()),
+                ..shipped
+            })
+            .is_some(),
+            "a parent that reads a lone list as nothing to send must disagree with the model"
+        );
+        assert!(
+            grant_disagreement(GrantCode {
+                take: &|layout, _| placed(layout, true),
+                ..shipped
+            })
+            .is_some(),
+            "a build before `desk1` that places a lone list must disagree with the model"
+        );
+        assert!(
+            grant_disagreement(GrantCode {
+                take: &|layout, _| placed(layout, false),
+                ..shipped
+            })
+            .is_some(),
+            "a successor that refuses the lone list it declared must disagree with the model"
         );
     }
 }

@@ -146,10 +146,15 @@ fn read_capped_with_len(
         .min(64 * 1024)
         .saturating_add(1);
     let mut bytes = Vec::with_capacity(init);
-    file.take((max as u64).saturating_add(1))
+    if let Err(e) = file
+        .take((max as u64).saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(PrivateFileError::Io)?;
+    {
+        crate::secret::scrub(&mut bytes);
+        return Err(PrivateFileError::Io(e));
+    }
     if bytes.len() > max {
+        crate::secret::scrub(&mut bytes);
         return Err(PrivateFileError::Malformed(
             "longer than such a file can be",
         ));
@@ -236,6 +241,19 @@ impl<'a> JudgedDir<'a> {
         })
     }
 
+    /// Whether `dir` was an existing owner-private `0700` directory with no ACL grants when
+    /// [`Self::judge`] took its verdict.
+    #[must_use]
+    pub fn is_private(&self) -> bool {
+        matches!(self.judged, DirIs::Private)
+    }
+
+    /// Whether `dir` did not exist when [`Self::judge`] took its verdict.
+    #[must_use]
+    pub fn is_missing(&self) -> bool {
+        matches!(self.judged, DirIs::Missing)
+    }
+
     /// [`open_private`] of `name` under this verdict.
     /// # Errors
     /// As [`open_private`].
@@ -250,8 +268,20 @@ impl<'a> JudgedDir<'a> {
     /// # Errors
     /// As [`read_private`].
     pub fn read(&self, name: &str, max: usize) -> Result<Vec<u8>, PrivateFileError> {
+        self.read_with_metadata(name, max)
+            .map(|(bytes, _meta)| bytes)
+    }
+
+    /// [`read_private_with_metadata`] of `name` under this verdict.
+    /// # Errors
+    /// As [`read_private_with_metadata`].
+    pub fn read_with_metadata(
+        &self,
+        name: &str,
+        max: usize,
+    ) -> Result<(Vec<u8>, std::fs::Metadata), PrivateFileError> {
         let (file, meta) = self.open(name)?;
-        read_capped_with_len(file, meta.len(), max)
+        read_capped_with_len(file, meta.len(), max).map(|bytes| (bytes, meta))
     }
 }
 
@@ -303,40 +333,39 @@ fn open_in(
         }
         _ => {}
     }
-    match std::fs::symlink_metadata(dir.join(name)) {
-        // A missing file is created by a read-write opening, judged like any other.
-        Err(e) if e.kind() == io::ErrorKind::NotFound && how != Opening::ReadWrite => {
-            return Err(PrivateFileError::Missing);
-        }
-        Err(e)
-            if e.kind() != io::ErrorKind::PermissionDenied
-                && e.kind() != io::ErrorKind::NotFound =>
-        {
-            return Err(PrivateFileError::Io(e));
-        }
-        _ => {}
-    }
+    let path = dir.join(name);
     let dir_loose = match judged {
-        DirIs::Others => {
-            return Err(PrivateFileError::NotPrivate(
-                "the directory is another user's",
-            ));
-        }
-        DirIs::Acl => return Err(PrivateFileError::NotPrivate(ACL_OPEN)),
-        DirIs::Open(mode) => match owned_mode(how, mode) {
-            Some(loose) => loose,
-            None if how == Opening::Owned => {
-                return Err(PrivateFileError::NotPrivate(DIR_WRITABLE));
+        DirIs::Private => false,
+        DirIs::Open(mode) if let Some(loose) = owned_mode(how, mode) => loose,
+        _ => {
+            match std::fs::symlink_metadata(&path) {
+                // A missing file is created by a read-write opening, judged like any other.
+                Err(e) if e.kind() == io::ErrorKind::NotFound && how != Opening::ReadWrite => {
+                    return Err(PrivateFileError::Missing);
+                }
+                Err(e)
+                    if e.kind() != io::ErrorKind::PermissionDenied
+                        && e.kind() != io::ErrorKind::NotFound =>
+                {
+                    return Err(PrivateFileError::Io(e));
+                }
+                _ => {}
             }
-            None => return Err(PrivateFileError::NotPrivate(DIR_OPEN)),
-        },
-        _ => false,
+            return Err(match judged {
+                DirIs::Others => PrivateFileError::NotPrivate("the directory is another user's"),
+                DirIs::Acl => PrivateFileError::NotPrivate(ACL_OPEN),
+                DirIs::Open(_) if how == Opening::Owned => {
+                    PrivateFileError::NotPrivate(DIR_WRITABLE)
+                }
+                _ => PrivateFileError::NotPrivate(DIR_OPEN),
+            });
+        }
     };
     let opened = match how {
         Opening::Read | Opening::Owned => {
-            astream_sys::open_nonblocking(&dir.join(name), astream_sys::Links::Refuse)
+            astream_sys::open_nonblocking(&path, astream_sys::Links::Refuse)
         }
-        Opening::ReadWrite => open_rw_created_0600(&dir.join(name), libc::O_NOFOLLOW),
+        Opening::ReadWrite => open_rw_created_0600(&path, libc::O_NOFOLLOW | libc::O_CLOEXEC),
     };
     let file = match opened {
         Ok(file) => file,
@@ -431,12 +460,20 @@ pub fn read_private_into(
 ) -> Result<PrivateRead, PrivateFileError> {
     use std::os::unix::fs::MetadataExt as _;
     let (mut file, meta) = open_private(dir, name)?;
-    let len = read_capped_into(&mut file, max, buf)?;
+    let len = read_capped_into(&mut file, meta.len(), max, buf)?;
     Ok(PrivateRead {
         len,
         dev: meta.dev(),
         ino: meta.ino(),
     })
+}
+
+/// Reads `name` in `dir` up to `max` bytes under [`read_owned_into`]'s rules.
+/// # Errors
+/// As [`read_owned_into`].
+pub fn read_owned(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, PrivateFileError> {
+    let (file, meta, _loose) = open_judged(dir, name, Opening::Owned)?;
+    read_capped_with_len(file, meta.len(), max)
 }
 
 /// What [`read_owned_into`] read: the length, the file's identity, and whether the file or
@@ -476,7 +513,7 @@ pub fn read_owned_into(
 ) -> Result<OwnedRead, PrivateFileError> {
     use std::os::unix::fs::MetadataExt as _;
     let (mut file, meta, loose) = open_judged(dir, name, Opening::Owned)?;
-    let len = read_capped_into(&mut file, max, buf)?;
+    let len = read_capped_into(&mut file, meta.len(), max, buf)?;
     Ok(OwnedRead {
         len,
         dev: meta.dev(),
@@ -490,10 +527,17 @@ pub fn read_owned_into(
 /// file left in `buf`.
 fn read_capped_into(
     file: &mut std::fs::File,
+    file_len: u64,
     max: usize,
     buf: &mut [u8],
 ) -> Result<usize, PrivateFileError> {
     let cap = max.min(buf.len());
+    if file_len > cap as u64 {
+        crate::secret::scrub(&mut buf[..cap]);
+        return Err(PrivateFileError::Malformed(
+            "longer than such a file can be",
+        ));
+    }
     let len = match read_full(file, &mut buf[..cap]) {
         Ok(len) => len,
         Err(e) => {
@@ -593,8 +637,38 @@ fn make_0700(dir: &Path) -> io::Result<()> {
 }
 
 fn narrow_0700(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    set_dir_mode_nofollow(dir, 0o700)
+}
+
+/// Change a real directory's mode through an open descriptor, recovering an
+/// unreadable directory with kernel-enforced nofollow chmod on permission denial.
+///
+/// # Errors
+/// Refuses non-directories and symlinks; returns open or chmod errors. There is
+/// no path-based chmod fallback when the platform cannot honor nofollow.
+pub fn set_dir_mode_nofollow(dir: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+    {
+        Ok(f) => {
+            if f.metadata()
+                .is_ok_and(|m| m.permissions().mode() & 0o7777 == mode)
+            {
+                return Ok(());
+            }
+            f.set_permissions(std::fs::Permissions::from_mode(mode))
+        }
+        Err(e)
+            if e.kind() == io::ErrorKind::PermissionDenied
+                && std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) =>
+        {
+            crate::atomic_file::set_mode_nofollow(dir, mode)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// [`ensure_private_dir`], with `make` making `dir` and `narrow` making it 0700.
@@ -660,13 +734,17 @@ fn ensure_private_dir_by(
 /// # Errors
 /// Returns an error if `dir` is missing, loose, symlinked, not owned, or has ACL grants.
 pub fn check_private_dir(dir: &Path) -> io::Result<()> {
+    check_dir_verdict(dir, dir_is(dir)?)
+}
+
+fn check_dir_verdict(dir: &Path, verdict: DirIs) -> io::Result<()> {
     let refused = |why: &dyn fmt::Display| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("the directory {}: {why}", dir.display()),
         )
     };
-    match dir_is(dir)? {
+    match verdict {
         DirIs::Private => Ok(()),
         DirIs::Missing => Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -801,19 +879,17 @@ pub fn remove_private(dir: &Path, name: &str) -> io::Result<bool> {
 /// # Errors
 /// Returns an error if creation or [`check_private_dir`] fails.
 pub fn create_private_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-    match std::fs::symlink_metadata(dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-                Ok(()) => {
-                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e),
+    use std::os::unix::fs::DirBuilderExt as _;
+    match dir_is(dir)? {
+        DirIs::Private => return Ok(()),
+        DirIs::Missing => match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {
+                narrow_0700(dir)?;
             }
-        }
-        Err(e) => return Err(e),
-        Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        },
+        other => return check_dir_verdict(dir, other),
     }
     check_private_dir(dir)
 }
@@ -870,7 +946,9 @@ impl PrivateLock {
         one_component_io(name)?;
         check_private_dir(dir)?;
         let path = dir.join(name);
-        let file = open_rw_created_0600(&path, libc::O_NOFOLLOW | libc::O_NONBLOCK)?;
+        let file = crate::kept_out(|| {
+            open_rw_created_0600(&path, libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        })?;
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

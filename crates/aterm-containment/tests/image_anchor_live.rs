@@ -42,8 +42,11 @@ impl Probe {
         let (tx, readings) = channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(anchor) = line.trim().strip_prefix(TAG)
-                    && tx.send(anchor.to_string()).is_err()
+                // Under one test thread (RUST_TEST_THREADS=1, which the child inherits) libtest
+                // prints `test <name> ... ` before the test runs, so the first reading shares
+                // that line: the tag is found anywhere in it.
+                if let Some((_, anchor)) = line.split_once(TAG)
+                    && tx.send(anchor.trim().to_string()).is_err()
                 {
                     return;
                 }

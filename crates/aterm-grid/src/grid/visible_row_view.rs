@@ -295,7 +295,6 @@ impl Grid {
     /// abs=<n>`), which pairs with the live frame's reads of the screen.
     #[must_use]
     pub fn history_row_view(&self, rev_idx: usize) -> VisibleRowView<'_> {
-        crate::history_reads::note();
         match self.materialized_history_row(rev_idx, self.cols()) {
             Some(mat) => VisibleRowView::History { mat },
             None => VisibleRowView::Empty,
@@ -316,7 +315,6 @@ impl Grid {
     /// The materialized history row at `rev_idx`, from the memo when it provably describes
     /// this history, else materialized and memoized; `None` only when the row does not exist.
     fn materialized_history_row(&self, rev_idx: usize, cols: u16) -> Option<Arc<MaterializedRow>> {
-        crate::history_reads::note();
         let Some(abs_row) = self.history_absolute_row(rev_idx) else {
             #[cfg(any(test, debug_assertions))]
             super::count_viewport_row_materialize();

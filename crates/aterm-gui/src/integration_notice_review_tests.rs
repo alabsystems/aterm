@@ -82,7 +82,7 @@ fn every_word(app: &App) -> String {
 }
 
 fn harness(cfg: Option<aterm_agent::supervise::SupervisorConfig>) -> HostHandle {
-    let host = HostHandle::for_restored_test(Arc::new(|_, _, _, _| "refused:inert".to_string()));
+    let host = HostHandle::for_restored_test(Arc::new(|_, _, _, _, _| "refused:inert".to_string()));
     if let Some(cfg) = cfg {
         host.set_config(cfg);
     }

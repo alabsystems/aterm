@@ -325,6 +325,7 @@ fn retained_peer_repairs_survive_expiry_and_remain_readable_at_both_widths() {
             let mut lab = fixture();
             Arc::make_mut(&mut lab.network).network.peers[0].last_repair =
                 Some(RepairObservation {
+                    cause: None,
                     completed_at_ms: 90_000,
                     outbound: true,
                     stage: Some(RepairStage::Application),

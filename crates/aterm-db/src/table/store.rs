@@ -59,6 +59,23 @@ pub(crate) fn with_replay_observer<T>(
     read()
 }
 
+/// [`with_replay_observer`], with `observe` run at each replay `read` does, not only the first. A
+/// replay `observe` itself does sees no observer.
+#[cfg(test)]
+pub(crate) fn with_each_replay_observed<T>(
+    observe: impl Fn() + 'static,
+    read: impl FnOnce() -> T,
+) -> T {
+    fn armed(observe: std::rc::Rc<dyn Fn()>) -> Box<dyn FnOnce()> {
+        Box::new(move || {
+            observe();
+            let next = armed(observe);
+            REPLAY_OBSERVER.with(|slot| *slot.borrow_mut() = Some(next));
+        })
+    }
+    with_replay_observer(armed(std::rc::Rc::new(observe)), read)
+}
+
 pub(crate) const MAX_RECORDS: usize = 8192;
 pub(crate) const MAX_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CONFLICTS: usize = aterm_secrets::commons::constraints::MAX_BINDINGS;
@@ -413,41 +430,36 @@ impl Store {
         region.validate_directory(session, dir, scope)?;
         let claim_dir = region.claims(session)?;
         let claim_name = claim_name(scope);
-        match private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN) {
-            Ok(claim) if pending_claim_region(&claim, scope, &session.actor(), region) => Ok(None),
-            Err(PrivateFileError::Missing) => {
-                match private_file::judge_private_dir(dir)? {
-                    private_file::PrivateDir::Missing => return Ok(None),
-                    private_file::PrivateDir::Private
-                        if std::fs::read_dir(dir)?.next().transpose()?.is_none() =>
-                    {
-                        // subscriptions() reserves a slot before Store::join creates
-                        // its independent enrollment claim and journal.
-                        return Ok(None);
-                    }
-                    _ => {}
+        if matches!(
+            private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN),
+            Err(PrivateFileError::Missing)
+        ) {
+            match private_file::judge_private_dir(dir)? {
+                private_file::PrivateDir::Missing => return Ok(None),
+                private_file::PrivateDir::Private
+                    if std::fs::read_dir(dir)?.next().transpose()?.is_none() =>
+                {
+                    // subscriptions() reserves a slot before Store::join creates
+                    // its independent enrollment claim and journal.
+                    return Ok(None);
                 }
-                Self::open_region(
-                    session,
-                    dir,
-                    scope,
-                    false,
-                    Capacity::default(),
-                    true,
-                    region,
-                )
-                .map(Some)
+                _ => {}
             }
-            _ => Self::open_region(
-                session,
-                dir,
-                scope,
-                false,
-                Capacity::default(),
-                true,
-                region,
-            )
-            .map(Some),
+        }
+        // Enrollment may start after the absence check. Classify its freshly
+        // validated claim inside the open, rather than trusting an earlier read.
+        match Self::open_region(
+            session,
+            dir,
+            scope,
+            false,
+            Capacity::default(),
+            true,
+            region,
+        ) {
+            Ok(store) => Ok(Some(store)),
+            Err(error) if error.is_enrollment_pending() => Ok(None),
+            Err(error) => Err(error),
         }
     }
     #[cfg_attr(
@@ -618,7 +630,7 @@ impl Store {
             directory::check(dir, &claim_dir, &claim_name, &claim)?;
         }
         if pending && !initialize {
-            return Err(Error::new("table enrollment is not yet complete"));
+            return Err(Error::enrollment_pending());
         }
         // The stable token binds the data directory even while the claim changes
         // from pending to ready. No record can be authored in the pending state.
@@ -826,8 +838,9 @@ impl Store {
         if self.records.len().saturating_add(records) > self.capacity.operations
             || self.operation_bytes.saturating_add(bytes) > self.capacity.bytes
         {
-            return Err(Error::new(
+            return Err(Error::repair(
                 "table operation capacity exhausted; conflict space is reserved",
+                aterm_types::network_state::RepairCause::Quota,
             ));
         }
         let mut count = records;
@@ -842,7 +855,10 @@ impl Store {
             WRITER_RECORDS
         };
         if count > writer_limit || size > WRITER_BYTES {
-            return Err(Error::new("table writer evidence quota exhausted"));
+            return Err(Error::repair(
+                "table writer evidence quota exhausted",
+                aterm_types::network_state::RepairCause::Quota,
+            ));
         }
         Ok(())
     }
@@ -1018,28 +1034,29 @@ impl Store {
             }
             return Ok(());
         }
-        let sources: Vec<_> = self
+        let mut sources_len = 0usize;
+        let mut sources_bytes = 0usize;
+        let mut own_len = 0usize;
+        let mut own_bytes = 0usize;
+        let actor = proof.actor();
+        for stored in self
             .conflicts
             .values()
             .filter(|stored| stored.conflict.discarded().is_some())
-            .collect();
-        let own: Vec<_> = sources
-            .iter()
-            .filter(|stored| stored.conflict.actor() == proof.actor())
-            .collect();
-        if sources.len() >= self.capacity.operations
-            || sources
-                .iter()
-                .map(|stored| stored.conflict.wire().len())
-                .sum::<usize>()
-                .saturating_add(proof.wire().len())
+        {
+            let wire_len = stored.conflict.wire().len();
+            sources_len += 1;
+            sources_bytes = sources_bytes.saturating_add(wire_len);
+            if stored.conflict.actor() == actor {
+                own_len += 1;
+                own_bytes = own_bytes.saturating_add(wire_len);
+            }
+        }
+        if sources_len >= self.capacity.operations
+            || sources_bytes.saturating_add(proof.wire().len())
                 > self.capacity.bytes + self.capacity.operations * DISCARDED_OVERHEAD
-            || own.len() >= WRITER_RECORDS
-            || own
-                .iter()
-                .map(|stored| stored.conflict.wire().len())
-                .sum::<usize>()
-                .saturating_add(proof.wire().len())
+            || own_len >= WRITER_RECORDS
+            || own_bytes.saturating_add(proof.wire().len())
                 > WRITER_BYTES + WRITER_RECORDS * DISCARDED_OVERHEAD
         {
             return Err(Error::new(
@@ -2097,17 +2114,6 @@ fn validate_claim_region(
         ));
     }
     Ok(pending)
-}
-
-/// Whether `claim` is `writer`'s well-formed pending enrollment claim for `scope`, exactly as
-/// `Store::join` writes one before the table's journal exists.
-fn pending_claim_region(claim: &[u8], scope: Scope, writer: &[u8], region: Region) -> bool {
-    claim.len() == CLAIM_LEN
-        && &claim[..4] == region.magic()
-        && claim[4] == b'0'
-        && claim[5..5 + super::SCOPE_LEN] == scope.bytes()
-        && claim[5 + super::SCOPE_LEN..5 + super::SCOPE_LEN + 48] == *writer
-        && claim[ANCHOR_LEN..].iter().all(|byte| *byte == 0)
 }
 
 /// The file name of `scope`'s enrollment claim inside [`claim_dir`].

@@ -92,9 +92,10 @@ fn native_commit_rechecks_policy_and_target_generation() {
                 })
                 .unwrap();
         } else {
-            std::fs::write(
-                world.cfg.join("aterm.toml"),
-                "[harness]\naccounts = 'off'\n",
+            aterm_uds::atomic_file::write(
+                &(world.cfg.join("aterm.toml")),
+                ("[harness]\naccounts = 'off'\n").as_ref(),
+                0o600,
             )
             .unwrap();
         }

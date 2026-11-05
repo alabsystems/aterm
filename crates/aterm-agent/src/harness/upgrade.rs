@@ -4121,29 +4121,29 @@ pub fn hold_since(prior: (u64, u64), f: &Facts, now_s: u64) -> (u64, u64) {
 /// Returns whether the composer prompt is present and holds no user-typed text: nothing in it, or a
 /// grey first glyph (`dim_at_caret`) with the cursor home ([`crate::supervise::screen::cursor_home`]),
 /// which is how the loop tells a suggestion too (`Session::composer_draft`). Grey with the cursor
-/// anywhere else says neither there, so it holds here, and so does the prompt-history search open
-/// over the composer ([`aterm_phase::phase::history_search`]), whose query keys would type into.
+/// anywhere else says neither there, so it holds here, and so does the cursor under the composer
+/// ([`crate::supervise::screen::cursor_under_composer`]), where the prompt-history search leaves
+/// it, whose query keys would type into, and an old prompt box or a read inside a redraw shows
+/// it, over a composer whose rows say nothing of a draft.
 #[must_use]
 pub fn composer_is_empty(
     rows: &[String],
     cursor: Option<(usize, usize)>,
     dim_at_caret: bool,
 ) -> bool {
-    if aterm_phase::phase::history_search(rows) {
-        return false;
-    }
     let Some((caret, lines)) = aterm_phase::phase::composer_draft(rows) else {
         return false;
     };
-    crate::supervise::screen::composer_holds_no_draft(cursor, caret, &lines, || dim_at_caret)
+    crate::supervise::screen::composer_holds_no_draft(rows, cursor, caret, &lines, || dim_at_caret)
 }
 
-/// Returns the screen row whose cell style distinguishes a dim placeholder from typed text: none with
-/// the cursor anywhere but home, where [`composer_is_empty`] asks no cell.
+/// Returns the screen row whose cell style distinguishes a dim placeholder from typed text: none where
+/// [`composer_is_empty`] decides by the rows alone (a blank first line, or the cursor anywhere but
+/// home, [`crate::supervise::screen::grey_decides`]), so a gate asks no cell it would not read.
 #[must_use]
 pub fn composer_dim_row(rows: &[String], cursor: Option<(usize, usize)>) -> Option<usize> {
     let (caret, lines) = aterm_phase::phase::composer_draft(rows)?;
-    crate::supervise::screen::cursor_home(cursor, caret, &lines).then_some(caret)
+    crate::supervise::screen::grey_decides(cursor, caret, &lines).then_some(caret)
 }
 
 /// Persisted per-session state machine phase for an upgrade.
@@ -4585,6 +4585,29 @@ pub const RELEASE_HEAD: &str = "[aterm harness] Upgrade off: ";
 
 pub const TELL_HEAD: &str = "[aterm harness] Upgrade waiting: ";
 
+/// The heads of aterm's continuation after a restart it made: the upgrade's
+/// ([`continue_prompt_with_model`]) and a relaunch's (`relaunch::resumed_prompt_as`). A continuation
+/// a person's key cut stands unsent in the composer; these say it is aterm's.
+pub const CONTINUE_HEADS: [&str; 3] = [
+    concat!(harness_mark!(), " Upgraded: "),
+    concat!(harness_mark!(), " Restarted: "),
+    concat!(harness_mark!(), " Relaunched"),
+];
+
+/// Every head [`own_draft`] and [`own_words`] read as aterm's own: the harness's lines it types
+/// through a fenced `turn`, which a person's gesture can leave unsent in the composer (`turn …
+/// reason=person typed=0 pasted=<n>`).
+const OWN_HEADS: [&str; 8] = [
+    ANNOUNCE_HEAD,
+    RELEASE_HEAD,
+    TELL_HEAD,
+    CONTINUE_HEADS[0],
+    CONTINUE_HEADS[1],
+    CONTINUE_HEADS[2],
+    super::disk::RESUME_HEAD,
+    super::disk::ask::LINE_HEAD,
+];
+
 /// `text` with no whitespace and no leading caret, as [`own_draft`] and [`own_words`] compare it.
 fn upgrade_compact(text: &str) -> String {
     let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
@@ -4593,24 +4616,25 @@ fn upgrade_compact(text: &str) -> String {
         .to_string()
 }
 
-/// Returns whether `draft` is a prefix of aterm's own upgrade notice or release line.
+/// Returns whether `draft` is a prefix of aterm's own upgrade notice, release line or continuation
+/// after a restart ([`CONTINUE_HEADS`]).
 #[must_use]
 pub fn own_draft(draft: &str) -> bool {
     let draft = upgrade_compact(draft);
     draft.chars().nth(1).is_some()
-        && [ANNOUNCE_HEAD, RELEASE_HEAD, TELL_HEAD]
+        && OWN_HEADS
             .iter()
             .map(|head| upgrade_compact(head))
             .any(|head| draft.starts_with(&head) || head.starts_with(&draft))
 }
 
-/// Returns whether `draft` opens with the whole head of aterm's own upgrade notice or release line:
-/// aterm's words, as no part of a head can say of a person's few glyphs, which [`own_draft`] takes in
-/// too.
+/// Returns whether `draft` opens with the whole head of aterm's own upgrade notice, release line or
+/// continuation: aterm's words, as no part of a head can say of a person's few glyphs, which
+/// [`own_draft`] takes in too.
 #[must_use]
 pub fn own_words(draft: &str) -> bool {
     let draft = upgrade_compact(draft);
-    [ANNOUNCE_HEAD, RELEASE_HEAD, TELL_HEAD]
+    OWN_HEADS
         .iter()
         .any(|head| draft.starts_with(&upgrade_compact(head)))
 }

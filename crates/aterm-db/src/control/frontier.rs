@@ -224,22 +224,27 @@ fn trade(stream: &mut (impl Read + Write), side: Side, own: &[u8], max: usize) -
 
 /// What this endpoint holds of the membership log for one `atdb/5` session, read once: the
 /// frontier and ancestry checkpoints it states before any evidence ([`View::have`]), and the
-/// records a peer's evidence push is judged in a copy of ([`overlay`]). Custody that does not
-/// read, or whose log is another root's, states nothing, and a push to it is judged from its
-/// genesis alone, as a log witness was. An `atdb/4` session reads none ([`View::NONE`]).
+/// records a peer's evidence push is judged in a copy of ([`overlay`]). Custody whose log is
+/// another root's states nothing, and a push to it is judged from its genesis alone, as a log
+/// witness was; so does a journal endpoint's custody that does not read
+/// ([`super::Custody::Journal`]). An `atdb/4` session reads none ([`View::NONE`]).
 pub(super) struct View(Option<Records>);
 
 impl View {
     /// Nothing held: what an `atdb/4` session, which states nothing, judges in.
     pub(super) const NONE: Self = Self(None);
 
-    pub(super) fn of(endpoint: &Endpoint) -> Self {
-        let Some(store) = endpoint
-            .paths
-            .as_ref()
-            .and_then(|paths| client::load_records(paths).ok())
-        else {
-            return Self(None);
+    /// # Errors
+    /// The records of an endpoint built from its membership log ([`super::Custody::Log`]) do
+    /// not read: a push judged from its own genesis would pass a Mac those records remove.
+    pub(super) fn of(endpoint: &Endpoint) -> Result<Self> {
+        let custody = endpoint.custody();
+        let (super::Custody::Log(paths) | super::Custody::Journal(paths)) = custody else {
+            return Ok(Self(None));
+        };
+        let store = match super::held_records(paths) {
+            Ok(store) => store,
+            Err(error) => return custody.unread(error).map(|()| Self(None)),
         };
         let ours = store.log().is_some_and(|log| {
             matches!(
@@ -252,7 +257,7 @@ impl View {
                 .as_ref()
                 .is_none_or(|own| own.network() == log.network())
         });
-        Self(ours.then_some(store))
+        Ok(Self(ours.then_some(store)))
     }
 
     pub(super) fn have(&self) -> Vec<Digest> {
@@ -632,7 +637,7 @@ fn overlay(endpoint: &Endpoint, view: &View, pushed: Vec<Record>) -> Result<(Log
 
 fn verify_evidence(endpoint: &Endpoint, peer: &Metadata, evidence: &Received) -> Result<()> {
     verify_peer_against_local_log(
-        endpoint.paths.as_ref(),
+        endpoint.custody(),
         endpoint.trust,
         &peer.request,
         evidence.judged(),
@@ -669,7 +674,7 @@ pub(super) fn connected(
     let (view, have) = match wire {
         Wire::Whole => (View::NONE, Vec::new()),
         Wire::Delta => {
-            let view = View::of(endpoint);
+            let view = View::of(endpoint)?;
             let have = trade_haves(endpoint, stream, side, repair, &mut peer, &view)?;
             (view, have)
         }

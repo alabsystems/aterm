@@ -9,6 +9,36 @@ use std::fs;
 
 use super::*;
 
+#[test]
+fn retained_reader_caps_keep_store_and_tests_log_identity_checks() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let store = root.path().join("store.txt");
+    assert_eq!(store_id(root.path()), None);
+    fs::write(&store, b"store bytes").unwrap();
+    assert_eq!(
+        store_id(root.path()),
+        Some(Digest::of(STORE_DOMAIN, &[b"store bytes"]))
+    );
+    fs::write(&store, vec![b'x'; MAX_STORE_TEXT as usize + 1]).unwrap();
+    assert_eq!(store_id(root.path()), None);
+    let log = root.path().join("tests.log");
+    let commit = "0123456789ab";
+    assert!(tests_log_digest(&log, commit).is_err());
+    let bytes = format!("checked {commit}\n");
+    fs::write(&log, bytes.as_bytes()).unwrap();
+    assert_eq!(
+        tests_log_digest(&log, commit).unwrap(),
+        Digest::of(TESTS_LOG_DOMAIN, &[bytes.as_bytes()])
+    );
+    assert!(tests_log_digest(&log, "another commit").is_err());
+    assert!(tests_log_digest(root.path(), commit).is_err());
+    fs::File::create(&log)
+        .unwrap()
+        .set_len(MAX_TESTS_LOG + 1)
+        .unwrap();
+    assert_eq!(tests_log_digest(&log, commit).unwrap_err().code, 2);
+}
+
 const BUILD: &str = "aterm-lab 0.1.0+g0123456789ab";
 
 fn summary(child: &str, store: u8) -> Summary {

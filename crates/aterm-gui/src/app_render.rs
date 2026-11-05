@@ -11355,7 +11355,13 @@ impl App {
             .as_ref()
             .is_some_and(|recording| recording.window == id)
         {
-            self.commit_recording_presented_meta(id, visible_route, presented_plan);
+            if self.plan_shows_private(presented_plan) {
+                // A private document's values never reach a recording: the take ends and its
+                // folder goes, as `image` and `window` refuse the frame.
+                self.video_abort_private_view(id);
+            } else {
+                self.commit_recording_presented_meta(id, visible_route, presented_plan);
+            }
         }
 
         let _recovered = self.recover_latched_gpu_loss(id, None, frame_started);
@@ -18558,9 +18564,7 @@ impl App {
                 .as_ref()
                 .filter(|p| p.wid == wid)
                 .map_or(0, crate::paste_banner::PendingPaste::serial),
-            self.close_banner
-                .as_ref()
-                .filter(|p| p.wid == wid)
+            self.close_band(wid)
                 .map_or(0, crate::close_confirm::PendingClose::serial),
         )
     }
@@ -18576,11 +18580,7 @@ impl App {
             .as_ref()
             .filter(|p| p.wid == wid)
             .map_or(0, |p| p.wanted_rows(cols));
-        let close_rows = self
-            .close_banner
-            .as_ref()
-            .filter(|p| p.wid == wid)
-            .map_or(0, |p| p.wanted_rows(cols));
+        let close_rows = self.close_band(wid).map_or(0, |p| p.wanted_rows(cols));
         let rows = paste_rows
             .max(close_rows)
             .min(window.input_scratch.cells.len());
@@ -18864,7 +18864,7 @@ impl App {
 
     fn splice_close_banner(&mut self, wid: WindowId) {
         let (panel_rows, cols) = {
-            let Some(pending) = self.close_banner.as_ref().filter(|p| p.wid == wid) else {
+            let Some(pending) = self.close_band(wid) else {
                 // Distinct branch.
                 return; // no confirmation here -> byte-identical frame
             };
@@ -18880,7 +18880,7 @@ impl App {
         let cell_h = self.win_cell_size(wid).1;
         let palette = self.chrome_palette(ChromeSurface::OverGrid(wid));
         let built = {
-            let Some(pending) = self.close_banner.as_ref().filter(|p| p.wid == wid) else {
+            let Some(pending) = self.close_band(wid) else {
                 return;
             };
             crate::close_confirm::banner_rows(&pending.prompt, cols, panel_rows, palette)

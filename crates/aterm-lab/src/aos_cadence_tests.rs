@@ -45,26 +45,62 @@ fn every_take_types_the_same_keys_at_the_same_person_s_cadence() {
 }
 
 #[test]
-fn a_take_line_names_its_build_its_recording_and_each_figure() {
+fn a_take_line_names_its_build_its_program_its_recording_and_each_figure() {
     let t = Take {
         attached: true,
         logged: Some(154),
         figures: FIGURES.iter().map(|_| "1.5".to_owned()).collect(),
+        held: Some((4.0, 180.0, 230.5)),
     };
-    let line = measured(2, 'B', true, 158, &t);
+    let line = measured(2, 'B', (true, false), 158, &t);
     assert!(line.starts_with(
-        "MEASURED take=2 build=B attach=true typed=158 attached=true logged=154 n_present=1.5 "
+        "MEASURED take=2 build=B program=echo attach=true typed=158 attached=true logged=154 n_present=1.5 "
     ));
-    assert!(line.ends_with(" input_p99_ms=1.5"), "{line}");
-    assert!(take_ok(true, &t));
+    assert!(
+        line.ends_with(" input_p99_ms=1.5 held_p50_ms=4.0 held_p95_ms=180.0 held_p99_ms=230.5"),
+        "{line}"
+    );
+    assert!(take_ok((true, false), &t));
+    assert!(
+        !take_ok((true, true), &t),
+        "a recording that ran through a program that echoes nothing fails its take"
+    );
     let stopped = Take {
         attached: false,
         ..Take::default()
     };
     assert!(
-        !take_ok(true, &stopped),
+        !take_ok((true, false), &stopped),
         "a recording that stopped fails its take"
     );
-    assert!(take_ok(false, &stopped), "the control attaches nothing");
-    assert!(measured(1, 'A', false, 158, &stopped).ends_with(" attached=false logged=-"));
+    assert!(take_ok((true, true), &stopped), "unless nothing was echoed");
+    assert!(
+        take_ok((false, false), &stopped),
+        "the control attaches nothing"
+    );
+    assert!(
+        measured(1, 'A', (false, true), 158, &stopped)
+            .contains(" program=silent attach=false typed=158 attached=false logged=- ")
+    );
+    assert!(measured(1, 'A', (false, false), 158, &stopped).ends_with(" held_p99_ms=-"));
+}
+
+#[test]
+fn a_logged_key_is_matched_to_its_press_from_the_newest() {
+    let ms = |n: u64| Duration::from_millis(n);
+    let ns = |n: u64| i128::from(n) * 1_000_000;
+    let keys = ['a', 'b', '\n', 'c'];
+    let sent = [ms(10), ms(200), ms(400), ms(600)];
+    assert_eq!(
+        held_ns(&[ns(205), ns(205), ns(603)], &keys, &sent),
+        [195_000_000, 5_000_000, 3_000_000],
+        "'a' waited for 'b', 'b' and 'c' for their own echo; the Enter is never logged"
+    );
+    assert_eq!(
+        held_ns(&[ns(603)], &keys, &sent),
+        [3_000_000],
+        "a log that holds only the newest key"
+    );
+    assert_eq!(held_ns(&[ns(5)], &['a'], &[ms(10)]), [0], "never negative");
+    assert!(held_ns(&[], &keys, &sent).is_empty());
 }

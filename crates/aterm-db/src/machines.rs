@@ -6,9 +6,6 @@
 use crate::{Error, Result, crypto::name};
 use aterm_json::Value;
 
-/// The most digits a machine number has (`m999999`), as the swarm roster's labels allow.
-const MAX_DIGITS: usize = 6;
-
 /// A positive decimal number of at most `max` digits with no leading zero.
 fn positive(digits: &str, max: usize) -> Option<u32> {
     (!digits.is_empty()
@@ -21,7 +18,11 @@ fn positive(digits: &str, max: usize) -> Option<u32> {
 
 /// The number of `m<N>` or `M<N>`.
 fn machine_number(text: &str) -> Option<u32> {
-    positive(text.strip_prefix(['m', 'M'])?, MAX_DIGITS)
+    let spelled = text.starts_with(['m', 'M']) && text.trim_ascii() == text;
+    spelled
+        .then(|| aterm_types::machine_name::Number::parse(text).ok())
+        .flatten()
+        .map(aterm_types::machine_name::Number::get)
 }
 
 /// Canonical machine name, including legacy high numbers such as m100.
@@ -95,7 +96,7 @@ impl Label {
     /// It is not a stored machine label.
     pub fn parse_stored(text: &str) -> Result<Self> {
         let label = Self::parse(text)?;
-        if label.canonical() == text {
+        if text.trim_ascii().len() == text.len() && !text.bytes().any(|b| b.is_ascii_uppercase()) {
             Ok(label)
         } else {
             Err(Error::new(
@@ -264,7 +265,7 @@ impl Slot {
     }
     /// Canonical account slot.
     pub fn canonical(&self) -> String {
-        format!("{}.{}", self.machine.canonical(), self.number)
+        format!("m{}.{}", self.machine.0, self.number)
     }
 }
 /// Validate a stable-id keyed assignment; ingestion separately enforces authority.

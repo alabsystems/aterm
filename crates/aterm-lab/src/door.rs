@@ -53,7 +53,8 @@ impl<'a> Door<'a> {
     /// Which rule the socket broke.
     pub fn check_socket(&self) -> Result<(), String> {
         let (sock, dir) = (&self.run.sock, &self.run.sockdir);
-        let owned = std::fs::metadata(dir).is_ok_and(|m| m.uid() == crate::sys::getuid());
+        let owned = std::fs::symlink_metadata(dir)
+            .is_ok_and(|m| m.is_dir() && m.uid() == crate::sys::getuid());
         if dir.is_empty() || *sock != format!("{dir}/a.sock") || !owned {
             return Err(format!(
                 "refusing to talk to '{sock}': not this lab's socket"
@@ -68,7 +69,7 @@ impl<'a> Door<'a> {
         if !lab_socket_shape(sock) {
             return Err(format!("refusing to talk to '{sock}': not a lab socket"));
         }
-        let is_sock = std::fs::metadata(sock).is_ok_and(|m| {
+        let is_sock = std::fs::symlink_metadata(sock).is_ok_and(|m| {
             use std::os::unix::fs::FileTypeExt as _;
             m.file_type().is_socket()
         });

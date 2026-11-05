@@ -639,12 +639,12 @@ fn open_native_monitor_tab_in_aterm() -> Option<String> {
     {
         let mut socks: Vec<PathBuf> = entries
             .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
                     .is_some_and(|n| n.starts_with("aterm-") && n.ends_with(".sock"))
             })
+            .map(|e| e.path())
             .collect();
         socks.sort();
         socks.reverse();
@@ -3792,10 +3792,13 @@ fn here_report(
         Ok(t) => t,
         Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
     };
-    let baseline = match crate::baseline::parse(&text) {
+    let mut baseline = match crate::baseline::parse(&text) {
         Ok(b) => b,
         Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
     };
+    if plain && let Some(developer) = baseline.developer.as_mut() {
+        developer.retained_root_run = true;
+    }
     if baseline
         .keyboard
         .as_ref()
@@ -6174,18 +6177,20 @@ mod tests {
              keeping a Mac\n# awake and editing a file, aterm has its own `aterm acaffeine` and \
              `aterm edit`.\n\n";
         assert!(templates::DEFAULT_BASELINE.contains(pointer));
-        // What every build from the vault server's starter (b88705c068) to the aCaffeine rename
-        // (388f2736e4) wrote, and so what their controllers hold: the rename changed only this word.
         let before_rename =
             templates::DEFAULT_BASELINE.replace("`aterm acaffeine`", "`aterm acaffiene`");
-        assert_ne!(before_rename, templates::DEFAULT_BASELINE);
         assert!(
-            templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&before_rename).as_str()),
-            "the digest is of the starter before the aCaffeine rename"
+            templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&before_rename).as_str())
         );
-        let previous = templates::DEFAULT_BASELINE
-            .replace("vault_server = true\n", "")
-            .replace(pointer, HOMEBREW_AND_APPS);
+        let before_vault_daemon = before_rename.replace("vault_server = true\n", "");
+        assert!(
+            templates::EARLIER_DEFAULT_BASELINES
+                .contains(&text_sha256(&before_vault_daemon).as_str())
+        );
+        let previous = before_vault_daemon.replace(
+            &pointer.replace("acaffeine", "acaffiene"),
+            HOMEBREW_AND_APPS,
+        );
         assert!(
             templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&previous).as_str()),
             "the digest is of the starter as a6c1342e82 wrote it"
@@ -6217,6 +6222,18 @@ mod tests {
             (
                 before_rename.clone(),
                 templates::DEFAULT_BASELINE.to_owned(),
+            ),
+            (
+                before_vault_daemon.clone(),
+                templates::DEFAULT_BASELINE.to_owned(),
+            ),
+            (
+                format!("{before_rename}# mine\n"),
+                format!("{before_rename}# mine\n"),
+            ),
+            (
+                format!("{before_vault_daemon}# mine\n"),
+                format!("{before_vault_daemon}# mine\n"),
             ),
             (previous.clone(), templates::DEFAULT_BASELINE.to_owned()),
             (earlier.clone(), templates::DEFAULT_BASELINE.to_owned()),
@@ -6505,6 +6522,7 @@ mod tests {
         let baseline = "/b/command-line-tools.toml";
         let mac = || {
             let sys = Fake::root();
+            sys.born(std::process::id(), 123).running(&[]);
             sys.stat_of(
                 "/dev/console",
                 crate::port::Stat {
@@ -6547,19 +6565,30 @@ mod tests {
         );
         assert!(matches!(plain(&done), Ok(None)));
 
-        // Apple's catalog out of reach.
+        // Apple's catalog out of reach waits in the same process until an explicit Stop.
         let unreached = mac();
         unreached
             .on("/usr/bin/xcode-select -p", none_selected())
             .on(catalog, Ran::exit(1, "catalog network unavailable"));
-        assert!(plain(&unreached).err() == class(Unfinished::Catalog));
+        unreached.on_sleep(|sys, _| {
+            sys.stop_now();
+        });
+        assert!(plain(&unreached).err() == class(Unfinished::Stopped));
 
-        // Another install holds the placeholder.
+        // Another install holds the placeholder; the same authorized run waits until Stop.
         let busy = mac();
         busy.on("/usr/bin/xcode-select -p", none_selected())
             .running(&["/usr/sbin/softwareupdate"])
             .file(crate::items::developer::PLACEHOLDER, b"");
-        assert!(plain(&busy).err() == class(Unfinished::Busy));
+        busy.on_sleep(|sys, _| {
+            sys.stop_now();
+        });
+        assert!(plain(&busy).err() == class(Unfinished::Stopped));
+        assert_eq!(
+            busy.written(crate::items::developer::PLACEHOLDER),
+            Some(Vec::new()),
+            "Stop preserves the other installer's marker"
+        );
 
         // A baseline file the person's account wrote is never what the root half applies: one
         // that asks for nothing still installs the tools.
@@ -6568,7 +6597,10 @@ mod tests {
             .file(baseline, b"schema = 1\n")
             .on("/usr/bin/xcode-select -p", none_selected())
             .on(catalog, Ran::exit(1, "catalog network unavailable"));
-        assert!(plain(&planted).err() == class(Unfinished::Catalog));
+        planted.on_sleep(|sys, _| {
+            sys.stop_now();
+        });
+        assert!(plain(&planted).err() == class(Unfinished::Stopped));
 
         // What the root half cannot even start is said as the other class, never in its words.
         let mut user = Fake::default();
@@ -6714,8 +6746,9 @@ mod tests {
         assert!(matches!(plain(&unnamed, None), Ok(None)));
         assert_eq!(sets(&unnamed), Vec::<String>::new());
 
-        // NEGATIVE CONTROL: the tools out of reach still say so beside a name in place.
+        // An unavailable catalog retains custody beside the completed naming steps.
         let unreached = Fake::root();
+        unreached.born(std::process::id(), 123).running(&[]);
         unreached
             .stat_of("/dev/console", console)
             .on(
@@ -6731,9 +6764,12 @@ mod tests {
             )
             .on("/usr/sbin/scutil --get ComputerName", Ran::ok("m42\n"))
             .on("/usr/sbin/scutil --get LocalHostName", Ran::ok("m42\n"));
+        unreached.on_sleep(|sys, _| {
+            sys.stop_now();
+        });
         assert!(
             plain(&unreached, Some("m42")).err()
-                == Some(ExitCode::from(Unfinished::Catalog.code().unwrap()))
+                == Some(ExitCode::from(Unfinished::Stopped.code().unwrap()))
         );
     }
 

@@ -52,6 +52,19 @@ const CHECK_BUDGET: Duration = Duration::from_millis(250);
 #[cfg(all(unix, test))]
 const CHECK_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
 
+/// The dev seam that sets, in milliseconds, [`check_budget`] for a test of the binary: the folders
+/// a live test's instance checks are local scratch too, whose check must answer.
+#[cfg(unix)]
+const CHECK_BUDGET_SEAM: &str = "ATERM_DEBUG_FOLDER_CHECK_WITHIN_MS";
+
+/// How long a spawn waits for the folder check: [`CHECK_BUDGET`], or what [`CHECK_BUDGET_SEAM`]
+/// names, read once.
+#[cfg(unix)]
+fn check_budget() -> Duration {
+    static BUDGET: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| crate::fleet_listen::seam_or(CHECK_BUDGET_SEAM, CHECK_BUDGET))
+}
+
 /// The most checks left waiting on a hung volume at once: past this, a spawn
 /// does not start another and judges its folder as one that did not answer
 /// ([`start_fault`]), so a mount that stopped answering costs a bounded number
@@ -78,7 +91,7 @@ pub(crate) fn folder_fault(dir: &str) -> Option<Fault> {
     {
         folder_fault_in(
             &CHECKS_IN_FLIGHT,
-            CHECK_BUDGET,
+            check_budget(),
             dir,
             fault_now,
             remote_mount_here(),
@@ -114,7 +127,7 @@ pub(crate) fn start_fault(dir: &str) -> Option<Fault> {
     {
         start_fault_in(
             &CHECKS_IN_FLIGHT,
-            CHECK_BUDGET,
+            check_budget(),
             dir,
             fault_now,
             remote_mount_here(),
@@ -151,7 +164,7 @@ pub(crate) fn volume_answers(dir: &Path) -> bool {
         dir.to_str().is_none_or(|dir| {
             answers_in(
                 &CHECKS_IN_FLIGHT,
-                CHECK_BUDGET,
+                check_budget(),
                 dir,
                 look_now,
                 remote_mount_here(),
@@ -226,7 +239,7 @@ pub(crate) fn canonical_folder(dir: &str) -> Option<String> {
     {
         canonical_in(
             &CHECKS_IN_FLIGHT,
-            CHECK_BUDGET,
+            check_budget(),
             dir,
             canonical_now,
             remote_mount_here(),
@@ -727,7 +740,7 @@ pub(crate) fn retarget_folder(dir: &str) -> Option<String> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         retarget_folder_in(dir, remote_volume, |dir| {
-            within(&CHECKS_IN_FLIGHT, CHECK_BUDGET, dir, retarget_now).flatten()
+            within(&CHECKS_IN_FLIGHT, check_budget(), dir, retarget_now).flatten()
         })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

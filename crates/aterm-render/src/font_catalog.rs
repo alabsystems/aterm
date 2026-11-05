@@ -370,7 +370,10 @@ impl Catalog {
                 }
                 self.stats.work += 1;
                 let Ok(raw) = font_file::read_bounded_font_file(&path, read_cap) else {
-                    let len = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+                    let len = std::fs::symlink_metadata(&path)
+                        .ok()
+                        .filter(std::fs::Metadata::is_file)
+                        .map_or(0, |meta| meta.len());
                     if len > read_cap as u64 && len <= super::NAME_SCAN_MAX_BYTES {
                         if len > name_remaining as u64 {
                             self.stats.exhausted.insert("name bytes");

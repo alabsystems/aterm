@@ -43,7 +43,7 @@ fn open_unix(path: &Path) -> io::Result<(File, Metadata)> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "not a regular file");
     let mut options = OpenOptions::new();
     options.read(true);
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     let file = match options.open(path) {
         Ok(file) => file,
         Err(err) => {

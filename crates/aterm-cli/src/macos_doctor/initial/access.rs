@@ -526,7 +526,9 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
         accessibility,
         no_sign_out_owed,
         opted_out: [None; 5],
-        acquiring: super::state_root().is_ok_and(|root| super::person_access_admits(&root)),
+        acquiring: super::state_root().is_ok_and(|root| {
+            super::permission_steps_at(&root) == Ok(super::PermissionSteps::Allowed)
+        }),
     };
     grants.opted_out = opted_out(
         Access::ALL.map(opt_out::get),

@@ -524,7 +524,7 @@ fn an_older_builds_trust_sidecar_goes_with_its_worker() {
     for sidecar in [&path, &other] {
         std::fs::write(sidecar, "{}").unwrap();
     }
-    retire_task_file_in(&dir, &gone);
+    retire_files_in(&dir, std::slice::from_ref(&gone), Retire::All);
     assert!(!task.exists() && !path.exists(), "removed with its worker");
     assert!(
         other_task.exists() && other.exists(),
@@ -635,7 +635,7 @@ fn a_closed_workers_task_files_are_removed_and_no_other() {
     .iter()
     .map(|n| touch(&dir, n))
     .collect();
-    retire_task_file_in(&dir, &gone);
+    retire_files_in(&dir, std::slice::from_ref(&gone), Retire::All);
     assert!(!path.exists(), "removed");
     for r in &results {
         assert!(!r.exists(), "{} removed", r.display());
@@ -644,9 +644,44 @@ fn a_closed_workers_task_files_are_removed_and_no_other() {
     for o in &others {
         assert!(o.exists(), "{} stays", o.display());
     }
-    retire_task_file_in(&dir, &gone);
-    retire_task_file_in(&scratch.path().join("absent"), &gone);
+    retire_files_in(&dir, std::slice::from_ref(&gone), Retire::All);
+    retire_files_in(
+        &scratch.path().join("absent"),
+        std::slice::from_ref(&gone),
+        Retire::All,
+    );
     assert!(other.exists());
+}
+
+/// A WORKER aterm CLOSED KEEPS ITS RESULTS WHILE ITS RETIRED ROW STANDS: its close removes its task
+/// file alone, and its row's end removes the results, and only its own. CONTROL: a person's close
+/// takes both at once (`a_closed_workers_task_files_are_removed_and_no_other`).
+#[cfg(unix)]
+#[test]
+fn a_reaped_workers_results_outlive_its_task_file_until_its_row_goes() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-reaped")
+        .tempdir()
+        .expect("scratch dir");
+    let dir = scratch.path().join("tasks");
+    let gone = SessionId::new("s-0c");
+    let path = TaskSeed::new(b"one".to_vec())
+        .write_in(&dir, &gone)
+        .expect("written");
+    let results = [
+        touch(&dir, "s-0c-3.result.md"),
+        touch(&dir, "s-0c-3.result.src"),
+    ];
+    let other = touch(&dir, "s-0f-3.result.md");
+    retire_files_in(&dir, std::slice::from_ref(&gone), Retire::TaskFile);
+    assert!(!path.exists(), "its task file goes with its tab");
+    assert!(results.iter().all(|r| r.exists()), "its results stay");
+    retire_files_in(&dir, std::slice::from_ref(&gone), Retire::Results);
+    assert!(
+        results.iter().all(|r| !r.exists()),
+        "its row went: so do they"
+    );
+    assert!(other.exists(), "another session's stays");
 }
 
 /// A QUIT removes the task file of every worker it still holds
@@ -1224,7 +1259,8 @@ fn a_prompt_is_taken_once_one_screen_generation_has_held_for_the_settle() {
 /// A WORKER'S LINE IS TRIED AGAIN ONLY WHERE NOTHING WAS WRITTEN ([`launch_line_typed`]): the
 /// fence's refusals, which it makes before a byte is written, are [`Untyped::Unsettled`]; a line
 /// written whole or in part is typed and never tried again, and a person's use or a write the
-/// sink did not take (a short write among them) stalls the task.
+/// sink did not take (a short write among them) stalls the task: the first says a person came, the
+/// second names a cause no shell or person made ([`Untyped::Blocked`]).
 #[test]
 fn only_a_press_that_wrote_nothing_is_tried_again() {
     use crate::control::GuardedInput;
@@ -1242,20 +1278,26 @@ fn only_a_press_that_wrote_nothing_is_tried_again() {
             "{written:?} is typed, never typed again"
         );
     }
-    for refused in [
-        GuardedInput::Person,
+    assert!(
+        matches!(
+            launch_line_typed(GuardedInput::Person),
+            Err(Untyped::Refused(_))
+        ),
+        "CONTROL: a person's use stalls the task"
+    );
+    for blocked in [
         GuardedInput::Pressed(Delivery::BusyZero),
         GuardedInput::Pressed(Delivery::Failed),
     ] {
         assert!(
-            matches!(launch_line_typed(refused), Err(Untyped::Refused(_))),
-            "CONTROL: {refused:?} stalls the task"
+            matches!(launch_line_typed(blocked), Err(Untyped::Blocked(_))),
+            "CONTROL: {blocked:?} stalls the task, naming why"
         );
     }
 }
 
 /// A LAUNCHER'S INSTALLING MARK LIVES ON ITS SESSION'S TIMELINE WHILE IT STANDS, AND GOES WHEN
-/// IT DROPS: the startup deadline reads it to leave an install unjudged.
+/// IT DROPS: the startup deadline reads it to judge an install by its work, not by its own 120 s.
 #[test]
 fn an_installing_mark_stands_on_the_timeline_while_it_lives() {
     let h = crate::stub_session(1);
@@ -1266,6 +1308,67 @@ fn an_installing_mark_stands_on_the_timeline_while_it_lives() {
         assert!(installing());
     }
     assert!(!installing(), "dropped with its install");
+}
+
+/// A LAUNCHER'S INSTALL NAMES ITS CHILD ON THE TIMELINE: the process whose pass the startup
+/// deadline reads as this worker's work, which is the pid a stand-in atpkg sees as its own under
+/// the very spawn and QoS wrapper an install runs, since the file's `pid` is atpkg's own. It goes
+/// with the mark. CONTROL: a mark names no child before its install spawns one.
+#[cfg(unix)]
+#[test]
+fn a_launchers_install_names_its_child_on_the_timeline() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-gui-install-child-")
+        .tempdir()
+        .unwrap();
+    let said = dir.path().join("pid");
+    let stub = dir.path().join("atpkg-fake");
+    std::fs::write(
+        &stub,
+        format!("#!/bin/sh\necho $$ > '{}'\n", said.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    aterm_uds::deadline::output_until(
+        &mut crate::qos::atpkg_command(&stub),
+        Instant::now() + aterm_spec::wait::FIRST_EXEC,
+    )
+    .unwrap_or_else(|e| panic!("the stub's first exec within its hang detector: {e}"));
+    let layout = atpkg::store::Layout {
+        prefix: dir.path().to_path_buf(),
+    };
+    let h = crate::stub_session(1);
+    let child = || h.ctx.timeline.lock().unwrap().worker_install_child();
+    {
+        let _mark = InstallingMark::of(&h.ctx);
+        assert_eq!(child(), None, "CONTROL: nothing spawned yet");
+        install_with(&stub, &layout, "codex", &h.ctx).expect("the stub exits clean");
+        let pid = std::fs::read_to_string(&said).expect("the stub ran");
+        assert_eq!(child(), Some(pid.trim().parse().expect("a pid")));
+    }
+    assert_eq!(child(), None, "gone with its mark");
+}
+
+#[test]
+fn a_pool_hold_mark_stands_on_the_timeline_while_it_lives_and_is_no_install() {
+    let h = crate::stub_session(1);
+    let hold = || h.ctx.timeline.lock().unwrap().worker_pool_hold().cloned();
+    let ended = || h.ctx.timeline.lock().unwrap().worker_pool_hold_ended();
+    assert_eq!((hold(), ended()), (None, None), "PRECONDITION: no hold");
+    {
+        let mark = PoolHoldMark::of(&h.ctx);
+        assert_eq!(hold(), None, "nothing is held until it says what for");
+        mark.until(1_794_170_393, "no account of its pool can take it now");
+        assert_eq!(hold().map(|hold| hold.until), Some(1_794_170_393));
+        assert!(
+            !h.ctx.timeline.lock().unwrap().worker_installing(),
+            "the deadline waits out an install, and judges a hold"
+        );
+        assert_eq!(ended(), None, "it stands");
+    }
+    assert_eq!(hold(), None, "dropped with its hold");
+    assert!(ended().is_some(), "when it ended is kept");
 }
 
 /// A CLAUDE CODE WORKER SPAWNED FROM A WALLED TAB starts on the row a wall would move it to: the
@@ -1382,6 +1485,92 @@ fn a_claude_worker_of_a_walled_tab_starts_on_the_row_a_wall_moves_to() {
         super::claude_starter_in(plain.clone(), &seat, 4),
         plain,
         "`[harness] accounts = \"off\"` keeps it"
+    );
+}
+
+/// A CLAIM WORKER'S WALL IS THE ROW IT WOULD START ON ([`super::claude_worker_wall`]): the
+/// default login (`main`) at a usage limit with no row to move to reads its `until`, and so
+/// does a roster whose other row the accounts are told not to move to (`accounts = "off"`).
+/// NEGATIVE CONTROLS: a fresh `main` reads no wall, and a wall the launch moves the worker past
+/// (to `work`) reads none either, as [`super::claude_starter_in`] would start it there.
+#[test]
+fn a_claim_workers_wall_is_the_wall_of_the_row_it_would_start_on() {
+    use aterm_agent::harness::accounts::{self, Cli};
+    use aterm_agent::harness::accounts_pool::Seat;
+    use aterm_agent::harness::worker::Starter;
+
+    const NOW: i64 = 1_792_700_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().canonicalize().expect("canonical");
+    let (cfg, state, home) = (root.join("cfg"), root.join("state"), root.join("home"));
+    for dir in [&cfg, &state, &home] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    std::fs::write(
+        cfg.join(accounts::ACCOUNTS_FILE),
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
+    )
+    .expect("roster");
+    let seat = Seat {
+        config_dir: &cfg,
+        state: &state,
+        home: &home,
+        now: NOW,
+    };
+    let plain = Starter {
+        exe: PathBuf::from("/opt/claude"),
+        env: Vec::new(),
+        args: Ok(Vec::new()),
+        unset: Vec::new(),
+    };
+    assert_eq!(
+        super::claude_worker_wall(&plain, &seat),
+        None,
+        "CONTROL: a fresh login runs"
+    );
+
+    let until = NOW + 3600;
+    let mut note = None;
+    seat.store(Cli::Claude)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
+            Ok(accounts::note_wall(
+                s,
+                "main",
+                "five_hour",
+                Some(until),
+                NOW,
+                NOW,
+            ))
+        })
+        .expect("wall main");
+    assert_eq!(
+        super::claude_worker_wall(&plain, &seat),
+        Some(until + accounts::RESET_GRACE_S),
+        "the one login is walled, to its reset and the grace after it"
+    );
+
+    let work = root.join("logins/claude/work");
+    std::fs::create_dir_all(&work).expect("login dir");
+    std::fs::write(work.join(".claude.json"), "{}").expect("login");
+    std::fs::write(
+        cfg.join(accounts::ACCOUNTS_FILE),
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+            work.display()
+        ),
+    )
+    .expect("roster with work");
+    assert_eq!(
+        super::claude_worker_wall(&plain, &seat),
+        None,
+        "CONTROL: the launch moves the worker to `work`, which runs"
+    );
+    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("cfg");
+    assert_eq!(
+        super::claude_worker_wall(&plain, &seat),
+        Some(until + accounts::RESET_GRACE_S),
+        "a launch that moves no worker starts it on the wall"
     );
 }
 
@@ -2082,7 +2271,24 @@ fn a_signed_out_default_on_a_program_that_ignores_codex_auth_path_names_its_sign
         user_home: &'a Path,
     }
     impl UsageReader for Rejected<'_> {
-        fn read(&self, _: Cli, at: &Path, _: Option<&str>, _: i64) -> Reading {
+        fn read(
+            &self,
+            _: Cli,
+            at: &Path,
+            _: Option<&str>,
+            now: i64,
+            use_token: aterm_agent::harness::provider_read::Use,
+        ) -> Reading {
+            if use_token
+                .begin_home(
+                    aterm_agent::harness::provider_read::Read::CodexEndpoint,
+                    at,
+                    now,
+                )
+                .is_err()
+            {
+                return Reading::Unread;
+            }
             if at == self.default {
                 Reading::SignedOut
             } else {
@@ -2095,9 +2301,14 @@ fn a_signed_out_default_on_a_program_that_ignores_codex_auth_path_names_its_sign
             at: &Path,
             expected: Option<&str>,
             now: i64,
+            use_token: aterm_agent::harness::provider_read::Use,
         ) -> UsageObservation {
-            UsageObservation::from_fixture(self.read(cli, at, expected, now), at, self.user_home)
-                .expect("owned fixture credentials")
+            UsageObservation::from_fixture(
+                self.read(cli, at, expected, now, use_token),
+                at,
+                self.user_home,
+            )
+            .expect("owned fixture credentials")
         }
     }
     let reader = Rejected {
@@ -2475,7 +2686,7 @@ fn an_agy_worker_launch_is_held_while_every_model_pool_is_spent_and_starts_on_re
     }
 
     impl Source for AgyClockSource<'_> {
-        fn read(&self) -> Result<String, String> {
+        fn read(&self, _: &aterm_agent::harness::provider_read::Permit) -> Result<String, String> {
             self.reads.set(self.reads.get() + 1);
             let third_5h = if self.clock.get() >= self.until {
                 1.0
@@ -2487,7 +2698,10 @@ fn an_agy_worker_launch_is_held_while_every_model_pool_is_spent_and_starts_on_re
             ))
         }
 
-        fn default_model(&self) -> Result<String, String> {
+        fn default_model(
+            &self,
+            _: &aterm_agent::harness::provider_read::Permit,
+        ) -> Result<String, String> {
             Ok("gemini-4-argon-high".to_owned())
         }
     }

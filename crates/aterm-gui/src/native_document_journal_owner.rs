@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use super::{
     ContentFingerprint, JournalDocumentKey, JournalImageGeneration, JournalLockPatience,
-    JournalOwnerId, MAX_JOURNAL_BYTES, holds_no_draft, journal_lock_path, recover_journal_for,
-    with_journal_lock,
+    JournalOwnerId, MAX_JOURNAL_BYTES, holds_no_draft, journal_lock_path,
+    recover_journal_image_for, with_journal_lock,
 };
 use crate::native_document_io::parse_hex16;
 
@@ -86,6 +86,11 @@ pub(super) fn names_file(path: &Path, file: &File) -> bool {
         (Ok(named), Ok(open)) => named.same_file(&open),
         _ => false,
     }
+}
+
+/// Whether an in-place write can change only this image, with no preserved hard-link alias.
+pub(super) fn uniquely_linked(file: &File) -> std::io::Result<bool> {
+    sys::stamp(file).map(|stamp| stamp.uniquely_linked())
 }
 
 fn owners_dir_of(image: &Path) -> Option<PathBuf> {
@@ -256,6 +261,22 @@ pub(super) fn confirm_publication(path: &Path, mark: &[u8]) {
     let _ = (path, mark);
 }
 
+/// `owner` just appended to `file`, the image at `path`, in place and under the journal lock, so that its bytes are now `image`: name `owner` alone on them. No other holder holds these bytes: one that held the image before them proves its own tail against the file before it appends, and no longer finds it there. A failed write leaves a mark of other bytes, which names nobody, so the image is never taken.
+pub(super) fn mark_append(
+    path: &Path,
+    file: &File,
+    image: ContentFingerprint,
+    owner: Option<JournalOwnerId>,
+) {
+    let mark = owner
+        .filter(|_| owners_dir_of(path).is_some())
+        .and_then(|owner| format_mark(image, &BTreeSet::from([owner])))
+        .unwrap_or_else(|| UNKNOWN_HOLDERS.to_vec());
+    if let Err(error) = sys::write_mark(path, file, &mark) {
+        aterm_log::debug!("draft journal appended without an owner mark: {error}");
+    }
+}
+
 /// A re-seat found the image it last published (bytes `image`) still in place: join its owner set, so the image names this process even when another wrote these same bytes since.
 pub(super) fn adopt(path: &Path, image: ContentFingerprint, owner: Option<JournalOwnerId>) {
     let (Some(owner), Some(owners_dir)) = (owner, owners_dir_of(path)) else {
@@ -309,7 +330,9 @@ impl Candidate {
             .take(MAX_JOURNAL_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .ok()?;
-        let clean = recover_journal_for(self.key, &bytes).is_ok_and(|read| holds_no_draft(&read));
+        let clean = recover_journal_image_for(self.key, &bytes).is_ok_and(|(read, tail)| {
+            holds_no_draft(&read) && tail.is_none_or(|tail| tail.byte_len() == bytes.len() as u64)
+        });
         Some((ContentFingerprint::of(&bytes), clean))
     }
 
@@ -398,7 +421,7 @@ pub(crate) struct JournalSweep {
     pub(crate) dead_owners: usize,
 }
 
-/// Start [`sweep_unheld_journals`] over `root` on a background thread: no window or open waits on it, and each journal it takes is one no live process holds.
+/// Start [`sweep_unheld_journals`] over `root`, then the sweep of dead makers' grid scratch folders ([`aterm_types::private_edit::sweep_dead`]), on a background thread: no window or open waits on it, and each journal or folder it takes is one no live process holds.
 #[cfg(not(test))]
 pub(crate) fn spawn_launch_sweep(root: PathBuf) {
     let spawned = crate::qos::spawn_lane_thread(
@@ -408,6 +431,15 @@ pub(crate) fn spawn_launch_sweep(root: PathBuf) {
             let sweep = sweep_unheld_journals(&root);
             if sweep != JournalSweep::default() {
                 aterm_log::info!("draft journal sweep: {sweep:?}");
+            }
+            // A grid scratch folder whose maker was killed mid-edit still holds what it
+            // revealed: it goes at launch (`aterm_types::private_edit`).
+            let scratch = aterm_types::private_edit::sweep_dead(
+                &aterm_types::private_edit::scratch_root(),
+                None,
+            );
+            if scratch > 0 {
+                aterm_log::info!("private edit sweep: {scratch} scratch folder(s) removed");
             }
         },
     );
@@ -584,6 +616,7 @@ mod sys {
         dev: u64,
         ino: u64,
         len: u64,
+        links: u64,
         mtime: (i64, i64),
     }
 
@@ -593,12 +626,17 @@ mod sys {
                 dev: metadata.dev(),
                 ino: metadata.ino(),
                 len: metadata.len(),
+                links: metadata.nlink(),
                 mtime: (metadata.mtime(), metadata.mtime_nsec()),
             }
         }
 
         pub(super) const fn len(&self) -> u64 {
             self.len
+        }
+
+        pub(super) const fn uniquely_linked(&self) -> bool {
+            self.links == 1
         }
 
         pub(super) const fn same_file(&self, other: &Self) -> bool {
@@ -765,10 +803,15 @@ mod sys {
         volume: u32,
         index: u64,
         len: u64,
+        links: u32,
         last_write: u64,
     }
 
     impl Stamp {
+        pub(super) const fn uniquely_linked(&self) -> bool {
+            self.links == 1
+        }
+
         pub(super) fn len(&self) -> u64 {
             self.len
         }
@@ -794,6 +837,7 @@ mod sys {
             volume: information.volume_serial_number,
             index: pair(information.file_index_high, information.file_index_low),
             len: pair(information.file_size_high, information.file_size_low),
+            links: information.number_of_links,
             last_write: pair(
                 information.last_write_time[1],
                 information.last_write_time[0],

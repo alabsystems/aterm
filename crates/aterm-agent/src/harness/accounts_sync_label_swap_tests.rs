@@ -115,6 +115,7 @@ fn m3() -> Desk {
                             outcome: accounts::AttemptOutcome::NoRoute,
                             routes: format!("profile(none) for {label}"),
                             since: NOW - 10,
+                            tried_at: NOW - 10,
                         }),
                         ..accounts::Binding::default()
                     },

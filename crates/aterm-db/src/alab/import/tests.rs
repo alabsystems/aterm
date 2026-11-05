@@ -11,8 +11,14 @@
 use super::*;
 use crate::{
     alab::registry::{ACCOUNT, ADDRESS, MACHINE, PREFERENCE},
-    typed::grid::tests::{Book, elem, put},
+    typed::{
+        grid::tests::{Book, elem, put},
+        secret::Fixed,
+    },
 };
+
+/// A synthetic `[everyone]` key the harness files' sources are keyed under.
+const KEY: [u8; 32] = [0x3c; 32];
 
 /// A stand-in close to the harness's reading: `1` is a member, Kimi Code's bare `1` is held and
 /// its region words name a region, Codex's and Grok Build's flow words name a flow, and a note
@@ -102,12 +108,15 @@ pub(crate) fn logins(rows: &[&str]) -> Sheet {
     Sheet::parse(SheetKind::Logins, "ai-account-logins.csv", text.as_bytes()).unwrap()
 }
 
-fn input<'a>(sheets: &'a [Sheet], macs: &'a [KnownMac], keys: MailboxKeys) -> Input<'a> {
+/// The registry's sealer in these plans: a fixed key, the registry's table name.
+pub(crate) const SEALER: Fixed = Fixed("alab/registry");
+
+fn input<'a>(sheets: &'a [Sheet], macs: &'a [KnownMac]) -> Input<'a> {
     Input {
         sheets,
         macs,
         vendors: &Stand,
-        keys,
+        sealer: &SEALER,
         now_ms: 1_800_000_000_000,
         births: true,
         unread: &[],
@@ -119,6 +128,17 @@ fn values(plan: &Plan) -> Vec<String> {
     plan.rows
         .iter()
         .flatten()
+        .map(|c| aterm_json::to_string(c.value.as_ref().unwrap()).unwrap())
+        .collect()
+}
+
+/// Every changed value but an address row's `addr`, the one cell an address's text is in (a
+/// mailbox's login is an address row like any other), as stored JSON text.
+fn values_but_addr(plan: &Plan) -> Vec<String> {
+    plan.rows
+        .iter()
+        .flatten()
+        .filter(|c| !(c.collection == ADDRESS.name && c.key.ends_with(".addr")))
         .map(|c| aterm_json::to_string(c.value.as_ref().unwrap()).unwrap())
         .collect()
 }
@@ -169,7 +189,7 @@ fn the_vault_sheet_reads_the_harness_way_and_keys_accounts_by_the_claims_key() {
         ",bob@example.invalid,m4.2,,1,,,1,global,,kimi banned,,",
         ",cy@example.invalid,m5,,pro,device,,,cn,device,,,",
     ]);
-    let plan = plan(&input(&[sheet], &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    let plan = plan(&input(&[sheet], &[]), &Cells::new()).unwrap();
     let key = |realm, address| keys::account_pk(realm, address).unwrap();
     let ann_claude = key("claude", "ann@example.invalid");
     assert_eq!(
@@ -306,12 +326,8 @@ fn notes_cross_behind_the_guard_and_nothing_else_does() {
     let other = logins(&[
         "m7,dee@example.invalid,claude,box@proton.example,the lead guessed from the domain,",
     ]);
-    let plan = plan(
-        &input(&[sheet, other], &[], MailboxKeys::default()),
-        &Cells::new(),
-    )
-    .unwrap();
-    let all = values(&plan).join("\n");
+    let plan = plan(&input(&[sheet, other], &[]), &Cells::new()).unwrap();
+    let all = values_but_addr(&plan).join("\n");
     for secret in [
         "PRIVATE-CELL",
         "lead guessed",
@@ -382,13 +398,9 @@ fn a_notes_import_is_three_way() {
         ",bob@example.invalid,m4,,1,,,,,,first note,,",
     ]);
     let mut book = Book::new();
-    let one = plan(
-        &input(std::slice::from_ref(&first), &[], MailboxKeys::default()),
-        &Cells::new(),
-    )
-    .unwrap();
+    let one = plan(&input(std::slice::from_ref(&first), &[]), &Cells::new()).unwrap();
     let cells = apply(&mut book, &one);
-    let again = plan(&input(&[first], &[], MailboxKeys::default()), &cells).unwrap();
+    let again = plan(&input(&[first], &[]), &cells).unwrap();
     assert!(again.rows.is_empty(), "{:?}", again.rows);
     let ann = keys::address_pk("ann@example.invalid").unwrap();
     let bob = keys::address_pk("bob@example.invalid").unwrap();
@@ -399,7 +411,7 @@ fn a_notes_import_is_three_way() {
         ",ann@example.invalid,m3,,1,,,,,,second note,,",
         ",bob@example.invalid,m4,,1,,,,,,,,",
     ]);
-    let next = plan(&input(&[edited], &[], MailboxKeys::default()), &cells).unwrap();
+    let next = plan(&input(&[edited], &[]), &cells).unwrap();
     let after = apply(&mut book, &next);
     let rows = cell::project(&ADDRESS, &after);
     assert_eq!(rows.rows[&ann].get("note"), Some(&json!("mine")));
@@ -425,11 +437,7 @@ fn a_re_import_retracts_what_the_sheet_no_longer_says() {
         "m6,bob@example.invalid,chatgpt/codex,,lead's reasoning,",
     ]);
     let mut book = Book::new();
-    let one = plan(
-        &input(std::slice::from_ref(&first), &[], MailboxKeys::default()),
-        &Cells::new(),
-    )
-    .unwrap();
+    let one = plan(&input(std::slice::from_ref(&first), &[]), &Cells::new()).unwrap();
     apply(&mut book, &one);
     // The owner states Bob's ChatGPT service themself.
     let bob_codex = keys::account_pk("codex", "bob@example.invalid").unwrap();
@@ -446,7 +454,7 @@ fn a_re_import_retracts_what_the_sheet_no_longer_says() {
         "m6,bob@example.invalid,codex,,lead's reasoning,",
     ]);
     let other = vault(&[",cy@example.invalid,m9,,1,,,,,,,,"]);
-    let untouched = plan(&input(&[other], &[], MailboxKeys::default()), &cells).unwrap();
+    let untouched = plan(&input(&[other], &[]), &cells).unwrap();
     assert!(
         untouched
             .planned
@@ -461,7 +469,7 @@ fn a_re_import_retracts_what_the_sheet_no_longer_says() {
             .all(|f| f.kind != Kind::NoLongerListed),
         "nor reports the rows only the other sheet lists"
     );
-    let next = plan(&input(&[edited], &[], MailboxKeys::default()), &cells).unwrap();
+    let next = plan(&input(&[edited], &[]), &cells).unwrap();
     let after = apply(&mut book, &next);
     let ann_codex_pk = keys::account_pk("codex", "ann@example.invalid").unwrap();
     let old = keys::preference_pk(&keys::machine_pk("m5"), &ann_codex_pk).unwrap();
@@ -508,13 +516,9 @@ fn a_re_import_never_overwrites_the_owner_and_writes_nothing_when_unchanged() {
         ",cy@example.invalid,m5,,1,,,,,,,,",
     ]);
     let mut book = Book::new();
-    let one = plan(
-        &input(std::slice::from_ref(&first), &[], MailboxKeys::default()),
-        &Cells::new(),
-    )
-    .unwrap();
+    let one = plan(&input(std::slice::from_ref(&first), &[]), &Cells::new()).unwrap();
     let cells = apply(&mut book, &one);
-    let again = plan(&input(&[first], &[], MailboxKeys::default()), &cells).unwrap();
+    let again = plan(&input(&[first], &[]), &cells).unwrap();
     assert!(again.rows.is_empty(), "{:?}", again.rows);
     // The owner marks Ann's Claude account active, a peer writes Bob's concurrently with
     // another value, and the owner retires Cy's address.
@@ -541,7 +545,7 @@ fn a_re_import_never_overwrites_the_owner_and_writes_nothing_when_unchanged() {
         ",bob@example.invalid,m4,,1,,,,,,claude banned,,",
         ",cy@example.invalid,m5,,1,,,,,,claude banned,,",
     ]);
-    let next = plan(&input(&[edited], &[], MailboxKeys::default()), &cells).unwrap();
+    let next = plan(&input(&[edited], &[]), &cells).unwrap();
     let after = apply(&mut book, &next);
     let accounts = cell::project(&ACCOUNT, &after);
     assert_eq!(accounts.rows[&ann].get("status"), Some(&json!("active")));
@@ -569,7 +573,6 @@ fn a_re_import_never_overwrites_the_owner_and_writes_nothing_when_unchanged() {
                 ",cy@example.invalid,m5,,1,,,,,,claude banned,,",
             ])],
             &[],
-            MailboxKeys::default(),
         ),
         &after,
     )
@@ -630,7 +633,7 @@ fn labels_resolve_through_live_rows_and_known_macs_before_a_placeholder() {
         ",cy@example.invalid,M109,,1,,,,,,,,",
         ",dee@example.invalid,m27-2,,1,,,,,,,,",
     ]);
-    let plan = plan(&input(&[sheet], &macs, MailboxKeys::default()), &cells).unwrap();
+    let plan = plan(&input(&[sheet], &macs), &cells).unwrap();
     let machine_of = |address: &str| {
         let pk = keys::account_pk("claude", address).unwrap();
         plan.planned
@@ -700,7 +703,7 @@ fn a_retired_machines_label_births_a_row_of_its_own() {
     );
     let cells = book.cells();
     let sheets = [vault(&[",ann@example.test,m40,,1,,,,,,,,"])];
-    let first = plan(&input(&sheets, &[], MailboxKeys::default()), &cells).unwrap();
+    let first = plan(&input(&sheets, &[]), &cells).unwrap();
     let fresh = keys::machine_pk("m40/2");
     let ann = keys::account_pk("claude", "ann@example.test").unwrap();
     let on = |plan: &Plan| {
@@ -720,7 +723,7 @@ fn a_retired_machines_label_births_a_row_of_its_own() {
         "nothing is written onto the retired row"
     );
     let cells = apply(&mut book, &first);
-    let again = plan(&input(&sheets, &[], MailboxKeys::default()), &cells).unwrap();
+    let again = plan(&input(&sheets, &[]), &cells).unwrap();
     assert!(
         again.rows.is_empty(),
         "a re-import over the result writes nothing"
@@ -755,7 +758,7 @@ fn a_retired_node_born_row_leaves_the_mac_a_row_of_its_own() {
         node: Some(node.to_owned()),
         hosts: Vec::new(),
     }];
-    let first = plan(&input(&[], &macs, MailboxKeys::default()), &cells).unwrap();
+    let first = plan(&input(&[], &macs), &cells).unwrap();
     let fresh = keys::machine_pk(&format!("n-{node}/2"));
     assert_eq!(
         planned(&first, "machine", &fresh, "label"),
@@ -770,67 +773,61 @@ fn a_retired_node_born_row_leaves_the_mac_a_row_of_its_own() {
         "nothing is written onto the retired row"
     );
     let cells = apply(&mut book, &first);
-    let again = plan(&input(&[], &macs, MailboxKeys::default()), &cells).unwrap();
+    let again = plan(&input(&[], &macs), &cells).unwrap();
     assert!(
         again.rows.is_empty(),
         "a re-import over the result writes nothing"
     );
 }
 
-/// An address never links to the mailbox it is itself: that link, beside the address row's own
-/// `addr`, would name the mailbox's login. A hub that receives for another row and is listed as
-/// a login too is a finding, and the other row's link (which names no login) is written.
-/// NEGATIVE CONTROL: with the self arm removed from `logins` (every mailbox address linked),
-/// the hub's own row links to its mailbox: `` left: Some(String("mb-…")) right: None ``.
+/// The mailbox-login rule follows the owner's sheet (docs/DESIGN-alab-one-mesh-2026-11-05.md
+/// §4.7): a hub that receives for another row and is listed as a login links to its own mailbox
+/// like any other, the mailbox names it as its `login`, and no finding stands in the way.
+/// NEGATIVE CONTROL: with `mailbox` wanting no `login`, the hub's mailbox names none: `` left:
+/// None right: Some(String("ad-…")) ``.
 #[test]
-fn an_address_never_links_to_the_mailbox_it_is() {
+fn a_login_links_to_its_own_mailbox() {
     let sheet = logins(&[
         "m3,hub@proton.example,claude,hub@proton.example,lead's reasoning,",
         "m4,ann@example.invalid,claude,hub@proton.example,lead's reasoning,",
     ]);
-    let plan = plan(
-        &input(std::slice::from_ref(&sheet), &[], MailboxKeys::default()),
-        &Cells::new(),
-    )
-    .unwrap();
+    let plan = plan(&input(std::slice::from_ref(&sheet), &[]), &Cells::new()).unwrap();
     let hub = keys::address_pk("hub@proton.example").unwrap();
     let ann = keys::address_pk("ann@example.invalid").unwrap();
-    assert_eq!(planned(&plan, "address", &hub, "mailbox_hint"), None);
-    assert!(
-        planned(&plan, "address", &ann, "mailbox_hint")
-            .and_then(Value::as_str)
-            .is_some_and(|pk| keys::is_digest_pk(pk, "mb"))
+    let mailbox = keys::mailbox_pk(&hub).unwrap();
+    assert_eq!(
+        planned(&plan, "address", &hub, "mailbox_hint"),
+        Some(&json!(mailbox))
+    );
+    assert_eq!(
+        planned(&plan, "address", &ann, "mailbox_hint"),
+        Some(&json!(mailbox))
+    );
+    assert_eq!(
+        planned(&plan, "mailbox", &mailbox, "login"),
+        Some(&json!(hub))
     );
     let found = kinds(&plan);
-    assert!(found.contains(&"self-mailbox"), "{found:?}");
-    assert!(found.contains(&"mailbox-is-login"), "{found:?}");
+    assert!(!found.contains(&"self-mailbox"), "{found:?}");
+    assert!(!found.contains(&"mailbox-is-login"), "{found:?}");
 }
 
-/// A receiving mailbox crosses as a random key, a plain label, a service, a code path and a
-/// vault entry name: its address is in no key and no value, its key is no digest of it, and
-/// this Mac's mailbox keys give the same key and label on the next import. The lead's guess is
-/// a hint and the owner's correction is the mailbox.
-/// NEGATIVE CONTROL: with `mailbox` keying a new mailbox by its address's digest
-/// (`format!("mb-{}", &keys::address_pk(address).unwrap_or_default()[3..])` in place of
-/// `keys::random_pk(..)`), the key carries the login's digest and the assertion that no key
-/// does fails with the synthetic login as its message: `` box@proton.example ``.
+/// A receiving mailbox crosses as the key its login's address key derives, a plain label, a
+/// service, a code path and its `login` reference: its address is in no key and no value, and
+/// a fresh plan on any Mac names the same key, so no key file is kept. The lead's guess is a
+/// hint and the owner's correction is the mailbox.
+/// NEGATIVE CONTROL: with `mailbox` keying a new mailbox by `keys::random_pk`, the fresh plan's
+/// hint differs: `` left: Some(String("mb-…")) right: Some(String("mb-…")) ``.
 #[test]
-fn mailbox_logins_never_cross_and_keys_are_random_and_kept_locally() {
+fn mailbox_keys_derive_from_their_login() {
     let sheet = logins(&[
         "m3,ann@example.invalid,claude,box@proton.example,lead's reasoning,",
         "m4,bob@example.invalid,chatgpt/codex + google/gemini,box@proton.example,lead's reasoning,other@proton.example",
     ]);
-    let first = plan(
-        &input(std::slice::from_ref(&sheet), &[], MailboxKeys::default()),
-        &Cells::new(),
-    )
-    .unwrap();
-    let all = values(&first).join("\n");
-    let keys_text: String = first.rows.iter().flatten().map(|c| c.key.clone()).collect();
+    let first = plan(&input(std::slice::from_ref(&sheet), &[]), &Cells::new()).unwrap();
+    let all = values_but_addr(&first).join("\n");
     for login in ["box@proton.example", "other@proton.example"] {
         assert!(!all.contains(login), "{login}");
-        let digest = keys::address_pk(login).unwrap();
-        assert!(!keys_text.contains(&digest[3..]), "{login}");
     }
     let mailboxes: Vec<&Planned> = first
         .planned
@@ -840,15 +837,11 @@ fn mailbox_logins_never_cross_and_keys_are_random_and_kept_locally() {
     assert_eq!(mailboxes.len(), 2);
     let ann = keys::address_pk("ann@example.invalid").unwrap();
     let bob = keys::address_pk("bob@example.invalid").unwrap();
-    let hint = planned(&first, "address", &ann, "mailbox_hint")
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert!(keys::is_digest_pk(&hint, "mb"));
-    assert_ne!(
-        &hint[3..],
-        &keys::address_pk("box@proton.example").unwrap()[3..]
+    let boxed = keys::address_pk("box@proton.example").unwrap();
+    let hint = keys::mailbox_pk(&boxed).unwrap();
+    assert_eq!(
+        planned(&first, "address", &ann, "mailbox_hint"),
+        Some(&json!(hint))
     );
     assert_eq!(
         planned(&first, "address", &bob, "mailbox_hint"),
@@ -859,7 +852,10 @@ fn mailbox_logins_never_cross_and_keys_are_random_and_kept_locally() {
         .as_str()
         .unwrap()
         .to_owned();
-    assert_ne!(owner, hint);
+    assert_eq!(
+        owner,
+        keys::mailbox_pk(&keys::address_pk("other@proton.example").unwrap()).unwrap()
+    );
     let columns: BTreeSet<&str> = first
         .planned
         .iter()
@@ -868,32 +864,19 @@ fn mailbox_logins_never_cross_and_keys_are_random_and_kept_locally() {
         .collect();
     assert_eq!(
         columns,
-        BTreeSet::from(["code_path", "label", "row", "service", "vault_ref"])
+        BTreeSet::from(["code_path", "label", "login", "row", "service"])
     );
     assert_eq!(
-        planned(&first, "mailbox", &hint, "vault_ref"),
-        Some(
-            &json!({"vault": "alab", "entry": "ai-mailbox.toml", "item": format!("mailbox-{hint}")})
-        )
+        planned(&first, "mailbox", &hint, "login"),
+        Some(&json!(boxed))
     );
-    // A fresh plan with no keys mints another random key; the kept keys find the same one.
-    let fresh = plan(
-        &input(std::slice::from_ref(&sheet), &[], MailboxKeys::default()),
-        &Cells::new(),
-    )
-    .unwrap();
-    assert_ne!(
+    let fresh = plan(&input(std::slice::from_ref(&sheet), &[]), &Cells::new()).unwrap();
+    assert_eq!(
         planned(&fresh, "address", &ann, "mailbox_hint"),
         Some(&json!(hint))
     );
-    let kept = MailboxKeys::from_json(&first.keys.to_json()).unwrap();
-    let again = plan(&input(&[sheet], &[], kept), &Cells::new()).unwrap();
     assert_eq!(
-        planned(&again, "address", &ann, "mailbox_hint"),
-        Some(&json!(hint))
-    );
-    assert_eq!(
-        planned(&again, "mailbox", &hint, "label"),
+        planned(&fresh, "mailbox", &hint, "label"),
         planned(&first, "mailbox", &hint, "label")
     );
     // Bob's services: a ChatGPT/Codex account with both services, and a Google one.
@@ -935,7 +918,7 @@ fn every_account_of_a_row_gets_its_mappings_and_a_number_is_only_a_rank() {
         ",m9.5@example.invalid,m3,,1,,,,,,,,",
         ",eve@example.invalid,m5,,,,,,,,,,",
     ]);
-    let plan = plan(&input(&[sheet], &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    let plan = plan(&input(&[sheet], &[]), &Cells::new()).unwrap();
     let rank =
         |label: &str, address: &str| planned(&plan, "preference", &pref(label, address), "rank");
     let row = |label: &str, address: &str| {
@@ -1008,11 +991,7 @@ fn ending_a_preference_is_three_way() {
         ",dee@example.invalid,m6,,1,,,,,,,,",
     ]);
     let mut book = Book::new();
-    let one = plan(
-        &input(std::slice::from_ref(&first), &[], MailboxKeys::default()),
-        &Cells::new(),
-    )
-    .unwrap();
+    let one = plan(&input(std::slice::from_ref(&first), &[]), &Cells::new()).unwrap();
     apply(&mut book, &one);
     let ann = pref("m3", "ann@example.invalid");
     let bob = pref("m4", "bob@example.invalid");
@@ -1035,7 +1014,7 @@ fn ending_a_preference_is_three_way() {
         ",cy@example.invalid,,,1,,,,,,,,",
         ",dee@example.invalid,m6,,1,,,,,,,,",
     ]);
-    let next = plan(&input(&[dropped], &[], MailboxKeys::default()), &cells).unwrap();
+    let next = plan(&input(&[dropped], &[]), &cells).unwrap();
     let after = apply(&mut book, &next);
     let rows = cell::project(&PREFERENCE, &after).rows;
     assert_eq!(rows[&ann].lifecycle(), Some("live"));
@@ -1059,7 +1038,7 @@ fn ending_a_preference_is_three_way() {
         Some(&json!("pending"))
     );
     let restated = vault(&[",cy@example.invalid,m5,,1,,,,,,,,"]);
-    let back = plan(&input(&[restated], &[], MailboxKeys::default()), &after).unwrap();
+    let back = plan(&input(&[restated], &[]), &after).unwrap();
     let after = apply(&mut book, &back);
     let rows = cell::project(&PREFERENCE, &after).rows;
     assert!(rows[&cy].live());
@@ -1083,7 +1062,7 @@ fn an_alias_links_to_the_listed_login_it_is_received_at() {
         "m8,hub+three@example.invalid,claude,,x,ann@example.invalid",
         "m9,lone+tag@example.invalid,claude,,x,",
     ]);
-    let plan = plan(&input(&[sheet], &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    let plan = plan(&input(&[sheet], &[]), &Cells::new()).unwrap();
     let link = |address: &str| {
         planned(
             &plan,
@@ -1106,7 +1085,7 @@ fn an_alias_links_to_the_listed_login_it_is_received_at() {
         planned(&plan, "address", &ann, "kind"),
         Some(&json!("alias"))
     );
-    assert!(!values(&plan).join("\n").contains("box@"));
+    assert!(!values_but_addr(&plan).join("\n").contains("box@"));
 }
 
 /// A harness file adds what the sheets did not state, below them: its machines are a set, so a
@@ -1121,7 +1100,7 @@ fn an_alias_links_to_the_listed_login_it_is_received_at() {
 fn a_harness_file_adds_below_the_sheets() {
     let stated = |kind, name: &str, text: &str| {
         let rows = Stand.stated(kind, name, text).unwrap();
-        Sheet::stated(kind, name, text.as_bytes(), &rows).unwrap()
+        Sheet::stated(kind, name, text.as_bytes(), &rows, &KEY).unwrap()
     };
     let sheet = vault(&[",ann@example.invalid,m3.2,,1,,,,,,,,"]);
     let fleet = stated(
@@ -1135,7 +1114,7 @@ fn a_harness_file_adds_below_the_sheets() {
         "claude,ann@example.invalid,,m3 m9\ncodex,ann@example.invalid,,m9",
     );
     let sheets = [pool, sheet, fleet];
-    let first = plan(&input(&sheets, &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    let first = plan(&input(&sheets, &[]), &Cells::new()).unwrap();
     let rank =
         |label: &str, address: &str| planned(&first, "preference", &pref(label, address), "rank");
     assert_eq!(rank("m3", "ann@example.invalid"), Some(&json!(2)));
@@ -1187,22 +1166,18 @@ fn a_harness_file_adds_below_the_sheets() {
     // that reads a pool file no longer naming m9 ends that row alone.
     let mut book = Book::new();
     let cells = apply(&mut book, &first);
-    let again = plan(&input(&sheets, &[], MailboxKeys::default()), &cells).unwrap();
+    let again = plan(&input(&sheets, &[]), &cells).unwrap();
     assert!(again.rows.is_empty(), "{:?}", again.rows);
     let [_, sheet, fleet] = sheets;
     let without = [sheet.clone(), fleet.clone()];
-    let skipped = plan(&input(&without, &[], MailboxKeys::default()), &cells).unwrap();
+    let skipped = plan(&input(&without, &[]), &cells).unwrap();
     assert!(skipped.planned.iter().all(|p| p.x != json!("ended")));
     let shorter = stated(
         SheetKind::AiPool,
         "ai-pool.toml",
         "claude,ann@example.invalid,,m3",
     );
-    let next = plan(
-        &input(&[sheet, fleet, shorter], &[], MailboxKeys::default()),
-        &cells,
-    )
-    .unwrap();
+    let next = plan(&input(&[sheet, fleet, shorter], &[]), &cells).unwrap();
     let ended: Vec<&str> = next
         .planned
         .iter()
@@ -1245,7 +1220,7 @@ fn two_rows_naming_one_fleet_node_adopt_neither() {
         sheets: &[],
         macs: &macs,
         vendors: &Stand,
-        keys: MailboxKeys::default(),
+        sealer: &SEALER,
         now_ms: 0,
         births: false,
         unread: &[],
@@ -1307,7 +1282,7 @@ fn adopt_binds_known_macs_by_node_and_births_none() {
         sheets: &[],
         macs: &macs,
         vendors: &Stand,
-        keys: MailboxKeys::default(),
+        sealer: &SEALER,
         now_ms: 0,
         births: false,
         unread: &[],
@@ -1351,11 +1326,7 @@ fn adopt_binds_known_macs_by_node_and_births_none() {
 fn an_address_both_sheets_list_alike_is_no_disagreement() {
     let sheet = vault(&[",ann@example.invalid,m3,,1,,,,,,,,"]);
     let other = logins(&["m3,ann@example.invalid,claude,box@proton.example,x,"]);
-    let plan = plan(
-        &input(&[sheet, other], &[], MailboxKeys::default()),
-        &Cells::new(),
-    )
-    .unwrap();
+    let plan = plan(&input(&[sheet, other], &[]), &Cells::new()).unwrap();
     let ann = keys::address_pk("ann@example.invalid").unwrap();
     assert_eq!(
         planned(&plan, "address", &ann, "origin"),
@@ -1368,74 +1339,22 @@ fn an_address_both_sheets_list_alike_is_no_disagreement() {
     assert_eq!(disagreements, Vec::<&str>::new());
 }
 
-/// A stored mailbox key file reads back as written, refuses anything else, and never holds an
-/// address: each mailbox is filed under its address's digest.
-/// NEGATIVE CONTROL: with `MailboxKeys::digest` returning the address itself, the stored form
-/// holds it: `` assertion failed: !text.contains('@') ``.
+/// A stated file is named by its file name alone, and a name that names no file is refused.
 #[test]
-fn mailbox_keys_round_trip() {
-    let sheet = logins(&["m3,ann@example.invalid,claude,box@proton.example,x,"]);
-    let plan = plan(&input(&[sheet], &[], MailboxKeys::default()), &Cells::new()).unwrap();
-    assert_eq!(plan.keys.len(), 1);
-    assert_eq!(
-        MailboxKeys::from_json(&plan.keys.to_json()).unwrap(),
-        plan.keys
-    );
-    assert!(MailboxKeys::from_json(&json!({"format": "other"})).is_err());
-    let text = aterm_json::to_string(&plan.keys.to_json()).unwrap();
-    assert!(!text.contains('@'));
-    assert!(
-        MailboxKeys::from_json(&json!({
-            "format": "alab-mailbox-keys/1",
-            "mailboxes": {"d": {"pk": "mb-0000000000000001", "label": ""}}
-        }))
-        .is_err()
-    );
-    let digest_a = "a".repeat(64);
-    let digest_b = "b".repeat(64);
-    for bad in [
-        json!({
-            "format": "alab-mailbox-keys/1",
-            "mailboxes": {"box@proton.example": {"pk": "mb-0000000000000001", "label": "proton-1"}}
-        }),
-        json!({
-            "format": "alab-mailbox-keys/1",
-            "mailboxes": {(digest_a.as_str()): {"pk": "mb-0000000000000001", "label": "box@proton.example"}}
-        }),
-        json!({
-            "format": "alab-mailbox-keys/1",
-            "mailboxes": {
-                (digest_a.as_str()): {"pk": "mb-0000000000000001", "label": "proton-1"},
-                (digest_b.as_str()): {"pk": "mb-0000000000000001", "label": "proton-2"},
-            }
-        }),
-        json!({
-            "format": "alab-mailbox-keys/1",
-            "mailboxes": {
-                (digest_a.as_str()): {"pk": "mb-0000000000000001", "label": "proton-1"},
-                (digest_b.as_str()): {"pk": "mb-0000000000000002", "label": "proton-1"},
-            }
-        }),
-        json!({
-            "format": "alab-mailbox-keys/1",
-            "extra": true,
-            "mailboxes": {}
-        }),
-    ] {
-        assert!(MailboxKeys::from_json(&bad).is_err(), "{bad}");
-    }
+fn a_stated_file_is_named_by_its_file_name() {
     let win = Sheet::stated(
         SheetKind::FleetAccounts,
         r"C:\Users\owner\.secrets\fleet-accounts.toml",
         b"",
         &[],
+        &KEY,
     )
     .unwrap();
     assert_eq!(win.name, "fleet-accounts.toml");
-    assert!(Sheet::stated(SheetKind::FleetAccounts, "   ", b"", &[]).is_err());
-    assert!(Sheet::stated(SheetKind::AiPool, "", b"x", &[]).is_err());
-    assert!(Sheet::stated(SheetKind::AiPool, "dir/", b"x", &[]).is_err());
-    let stated = Sheet::stated(SheetKind::AiPool, "ai-pool.toml", b"x", &[]).unwrap();
+    assert!(Sheet::stated(SheetKind::FleetAccounts, "   ", b"", &[], &KEY).is_err());
+    assert!(Sheet::stated(SheetKind::AiPool, "", b"x", &[], &KEY).is_err());
+    assert!(Sheet::stated(SheetKind::AiPool, "dir/", b"x", &[], &KEY).is_err());
+    let stated = Sheet::stated(SheetKind::AiPool, "ai-pool.toml", b"x", &[], &KEY).unwrap();
     assert_eq!(
         stated.text(&Coord {
             sheet: 0,
@@ -1462,16 +1381,7 @@ fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_en
     let logins_one =
         logins(&["m3,ann@example.invalid,google/agy,box@proton.example,lead,real@proton.example"]);
     let mut book = Book::new();
-    let combined = plan(
-        &input(
-            &[vault_one.clone(), logins_one],
-            &[],
-            MailboxKeys::default(),
-        ),
-        &Cells::new(),
-    )
-    .unwrap();
-    let keys = combined.keys.clone();
+    let combined = plan(&input(&[vault_one.clone(), logins_one], &[]), &Cells::new()).unwrap();
     let cells = apply(&mut book, &combined);
 
     let ann = keys::address_pk("ann@example.invalid").unwrap();
@@ -1489,7 +1399,7 @@ fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_en
 
     // Re-importing only an edited vault sheet must NOT wipe mailbox_hint, mailbox, or services.agy.
     let vault_two = vault(&[",ann@example.invalid,m4,,,,1,,,,,,"]);
-    let vault_only = plan(&input(&[vault_two], &[], keys.clone()), &cells).unwrap();
+    let vault_only = plan(&input(&[vault_two], &[]), &cells).unwrap();
     let after_vault = apply(&mut book, &vault_only);
     let addresses = cell::project(&ADDRESS, &after_vault);
     assert_eq!(addresses.rows[&ann].get("mailbox_hint"), Some(&hint));
@@ -1502,7 +1412,7 @@ fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_en
 
     // Next, re-importing only an edited logins sheet that drops `agy` and `mailbox_hint` retracts them.
     let logins_two = logins(&["m4,ann@example.invalid,google,,,real@proton.example"]);
-    let logins_only = plan(&input(&[logins_two], &[], keys.clone()), &after_vault).unwrap();
+    let logins_only = plan(&input(&[logins_two], &[]), &after_vault).unwrap();
     let after_logins = apply(&mut book, &logins_only);
     assert_eq!(
         cell::project(&ADDRESS, &after_logins).rows[&ann].get("mailbox_hint"),
@@ -1526,7 +1436,7 @@ fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_en
     .unwrap();
     assert_eq!(empty_vault.name, "ai-accounts.csv");
     let ending = plan(
-        &input(std::slice::from_ref(&empty_vault), &[], keys),
+        &input(std::slice::from_ref(&empty_vault), &[]),
         &after_logins,
     )
     .unwrap();
@@ -1571,11 +1481,7 @@ fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_en
             ],
         },
     ];
-    let roster_plan = plan(
-        &input(&[], &noisy_macs, MailboxKeys::default()),
-        &Cells::new(),
-    )
-    .unwrap();
+    let roster_plan = plan(&input(&[], &noisy_macs), &Cells::new()).unwrap();
     let m77 = keys::machine_pk("n-0123456789abcdef0123456789abcdef");
     assert_eq!(
         planned(&roster_plan, "machine", &m77, "fleet_node"),
@@ -1597,7 +1503,7 @@ fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_en
 fn a_lower_source_leaves_what_the_vault_sheet_said() {
     let first = vault(&[",ann@example.invalid,m3,,1,,,,,,claude banned,,"]);
     let mut book = Book::new();
-    let one = plan(&input(&[first], &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    let one = plan(&input(&[first], &[]), &Cells::new()).unwrap();
     apply(&mut book, &one);
     let account = keys::account_pk("claude", "ann@example.invalid").unwrap();
     let ann = keys::address_pk("ann@example.invalid").unwrap();
@@ -1617,11 +1523,12 @@ fn a_lower_source_leaves_what_the_vault_sheet_said() {
         "fleet-accounts.toml",
         text.as_bytes(),
         &rows,
+        &KEY,
     )
     .unwrap();
     let other = logins(&["m3,ann@example.invalid,claude,,x,"]);
     for sheet in [fleet, other] {
-        let next = plan(&input(&[sheet], &[], MailboxKeys::default()), &cells).unwrap();
+        let next = plan(&input(&[sheet], &[]), &cells).unwrap();
         assert_eq!(planned(&next, "account", &account, "status"), None);
         assert_eq!(planned(&next, "address", &ann, "origin"), None);
         assert_eq!(planned(&next, "account", &account, "label"), None);
@@ -1639,7 +1546,7 @@ fn a_lower_source_leaves_what_the_vault_sheet_said() {
 /// The stated rows of one harness file.
 fn harness_file(kind: SheetKind, name: &str, text: &str) -> Sheet {
     let rows = Stand.stated(kind, name, text).unwrap();
-    Sheet::stated(kind, name, text.as_bytes(), &rows).unwrap()
+    Sheet::stated(kind, name, text.as_bytes(), &rows, &KEY).unwrap()
 }
 
 /// A note with no secret word from the old list still never crosses, on the address or on a
@@ -1652,7 +1559,7 @@ fn a_note_that_reads_as_a_password_never_crosses() {
         ",ann@example.invalid,m3,,1,,,,,,pass: Hunter2!,,",
         ",bob@example.invalid,m3,,1,,,,,,claude banned,pw Hunter2!,",
     ]);
-    let plan = plan(&input(&[sheet], &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    let plan = plan(&input(&[sheet], &[]), &Cells::new()).unwrap();
     assert!(
         !values(&plan).join("\n").contains("Hunter2"),
         "the password crossed"
@@ -1689,15 +1596,12 @@ fn a_retraction_names_the_file_that_wrote_the_cell() {
     ];
     let cells = apply(
         &mut book,
-        &plan(&input(&first, &[], MailboxKeys::default()), &Cells::new()).unwrap(),
+        &plan(&input(&first, &[]), &Cells::new()).unwrap(),
     );
     let edited = claude("claude,ann@example.invalid,,m3");
     let source = edited.source.clone();
     let second = [codex, edited];
-    let after = apply(
-        &mut book,
-        &plan(&input(&second, &[], MailboxKeys::default()), &cells).unwrap(),
-    );
+    let after = apply(&mut book, &plan(&input(&second, &[]), &cells).unwrap());
     let preferences = cell::project(&PREFERENCE, &after);
     let bob = &preferences.rows[&pref("m3", "bob@example.invalid")];
     assert_eq!(bob.get(crate::typed::LIFECYCLE), Some(&json!("ended")));
@@ -1725,10 +1629,7 @@ fn a_fleet_file_retracts_only_what_it_stated() {
         codex,
     ];
     let mut book = Book::new();
-    let cells = apply(
-        &mut book,
-        &plan(&input(&both, &[], MailboxKeys::default()), &Cells::new()).unwrap(),
-    );
+    let cells = apply(&mut book, &plan(&input(&both, &[]), &Cells::new()).unwrap());
     let ended = |plan: &Plan| {
         plan.planned
             .iter()
@@ -1740,7 +1641,7 @@ fn a_fleet_file_retracts_only_what_it_stated() {
     let shorter = [claude(
         "claude,ann@example.invalid,,m3\ncodex,cod@example.invalid,,m5",
     )];
-    let only_named = plan(&input(&shorter, &[], MailboxKeys::default()), &cells).unwrap();
+    let only_named = plan(&input(&shorter, &[]), &cells).unwrap();
     assert_eq!(
         only_named
             .planned
@@ -1759,7 +1660,7 @@ fn a_fleet_file_retracts_only_what_it_stated() {
     // The same run with a fleet file that failed to parse ends nothing.
     let failed = Input {
         unread: &[SheetKind::FleetAccounts],
-        ..input(&shorter, &[], MailboxKeys::default())
+        ..input(&shorter, &[])
     };
     assert_eq!(ended(&plan(&failed, &cells).unwrap()), 0);
 }
@@ -1777,11 +1678,7 @@ fn a_correction_stops_the_tag_guess() {
         "m6,ann+words@example.invalid,claude,,x,forwarded by hand",
         "m7,ann+plain@example.invalid,claude,,x,",
     ]);
-    let first = plan(
-        &input(std::slice::from_ref(&sheet), &[], MailboxKeys::default()),
-        &Cells::new(),
-    )
-    .unwrap();
+    let first = plan(&input(std::slice::from_ref(&sheet), &[]), &Cells::new()).unwrap();
     let link = |plan: &Plan, address: &str, column: &str| {
         planned(plan, "address", &keys::address_pk(address).unwrap(), column).cloned()
     };
@@ -1808,11 +1705,8 @@ fn a_correction_stops_the_tag_guess() {
     ]);
     let both = [listing.clone(), sheet];
     let mut book = Book::new();
-    let cells = apply(
-        &mut book,
-        &plan(&input(&both, &[], MailboxKeys::default()), &Cells::new()).unwrap(),
-    );
-    let alone = plan(&input(&[listing], &[], MailboxKeys::default()), &cells).unwrap();
+    let cells = apply(&mut book, &plan(&input(&both, &[]), &Cells::new()).unwrap());
+    let alone = plan(&input(&[listing], &[]), &cells).unwrap();
     assert_eq!(link(&alone, "ann+plain@example.invalid", "alias_of"), None);
     assert_eq!(link(&alone, "ann+plain@example.invalid", "kind"), None);
     assert_eq!(link(&alone, "ann+new@example.invalid", "alias_of"), None);
@@ -1830,7 +1724,7 @@ fn an_unread_file_holds_every_ending() {
     ]);
     let cells = apply(
         &mut book,
-        &plan(&input(&[start], &[], MailboxKeys::default()), &Cells::new()).unwrap(),
+        &plan(&input(&[start], &[]), &Cells::new()).unwrap(),
     );
     let dropped = [vault(&[",ann@example.invalid,m3,,1,,,,,,,,"])];
     let ended = |plan: &Plan| {
@@ -1841,10 +1735,10 @@ fn an_unread_file_holds_every_ending() {
     };
     let held = Input {
         unread: &[SheetKind::FleetAccounts],
-        ..input(&dropped, &[], MailboxKeys::default())
+        ..input(&dropped, &[])
     };
     assert_eq!(ended(&plan(&held, &cells).unwrap()), 0);
-    let whole = input(&dropped, &[], MailboxKeys::default());
+    let whole = input(&dropped, &[]);
     assert_eq!(ended(&plan(&whole, &cells).unwrap()), 1);
 }
 
@@ -1858,11 +1752,7 @@ fn a_lower_source_never_moves_the_vault_sheets_rank() {
     let cells = apply(
         &mut book,
         &plan(
-            &input(
-                &[vault(&[",ann@example.invalid,m8.3,,1,,,,,,,,"])],
-                &[],
-                MailboxKeys::default(),
-            ),
+            &input(&[vault(&[",ann@example.invalid,m8.3,,1,,,,,,,,"])], &[]),
             &Cells::new(),
         )
         .unwrap(),
@@ -1876,7 +1766,7 @@ fn a_lower_source_never_moves_the_vault_sheets_rank() {
         ),
         logins(&["m8.2,ann@example.invalid,claude,,x,"]),
     ] {
-        let next = plan(&input(&[sheet], &[], MailboxKeys::default()), &cells).unwrap();
+        let next = plan(&input(&[sheet], &[]), &cells).unwrap();
         assert_eq!(planned(&next, "preference", &on_m8, "rank"), None);
         assert!(
             next.findings
@@ -1896,17 +1786,9 @@ fn a_lower_source_never_moves_the_vault_sheets_rank() {
     let mut book = Book::new();
     let cells = apply(
         &mut book,
-        &plan(
-            &input(&[fleet("m9-2")], &[], MailboxKeys::default()),
-            &Cells::new(),
-        )
-        .unwrap(),
+        &plan(&input(&[fleet("m9-2")], &[]), &Cells::new()).unwrap(),
     );
-    let moved = plan(
-        &input(&[fleet("m9-3")], &[], MailboxKeys::default()),
-        &cells,
-    )
-    .unwrap();
+    let moved = plan(&input(&[fleet("m9-3")], &[]), &cells).unwrap();
     assert_eq!(
         planned(
             &moved,
@@ -1928,7 +1810,7 @@ fn a_two_mac_label_in_a_harness_file_maps_both_macs() {
         "ai-pool.toml",
         "claude,ann@example.invalid,m106-m38,m106\nclaude,bob@example.invalid,m7-m9,",
     );
-    let plan = plan(&input(&[sheet], &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    let plan = plan(&input(&[sheet], &[]), &Cells::new()).unwrap();
     for (machine, address) in [
         ("m106", "ann@example.invalid"),
         ("m38", "ann@example.invalid"),
@@ -1958,10 +1840,10 @@ fn a_cell_this_run_could_not_read_ends_nothing() {
     let mut book = Book::new();
     let cells = apply(
         &mut book,
-        &plan(&input(&[start], &[], MailboxKeys::default()), &Cells::new()).unwrap(),
+        &plan(&input(&[start], &[]), &Cells::new()).unwrap(),
     );
     let ended = |rows: &[&str]| {
-        plan(&input(&[vault(rows)], &[], MailboxKeys::default()), &cells)
+        plan(&input(&[vault(rows)], &[]), &cells)
             .unwrap()
             .planned
             .iter()
@@ -1996,4 +1878,98 @@ fn a_cell_this_run_could_not_read_ends_nothing() {
         ended(&[ann, bob, ",cy@example.invalid,m3,,,,,,,,,,", kay]),
         [pref("m3", "cy@example.invalid")]
     );
+}
+
+#[test]
+fn computers_emails_and_phones_sheets_import_and_protect_private_addresses() {
+    let phones = Sheet::parse(
+        SheetKind::Phones,
+        "alab-phones.csv",
+        b"Phone Number,Carrier / Provider,Line Type,Associated Device / Person,Notes\n\
+          415-555-0199,Tello Mobile,eSIM,Desk Phone,Primary test line\n",
+    )
+    .unwrap();
+    let computers = Sheet::parse(
+        SheetKind::Computers,
+        "alab-computers.csv",
+        b"ID,Make,Arch,OS,Processor,RAM,HD,Aliases,Nickname,Nickname Aliases,Location,Notes\n\
+          m2,Apple,arm64,macOS,M3 Max,64,2000,\"m2.2, m2.3\",fb,redballoon,SF,Desk Mac\n",
+    )
+    .unwrap();
+    let emails = Sheet::parse(
+        SheetKind::Emails,
+        "alab-emails.csv",
+        b"Email Address,Root Account,Password,Status,Provider,Activation Phone Number,Protection Flag,Notes\n\
+          private@example.invalid,,secret-ignored,Active,gmail,415-555-0199,Protected (Real Email),Personal real email\n\
+          root@proton.example,,secret-ignored,Active,proton,,,Root proton mailbox\n\
+          alias1@proton.example,root@proton.example,,Active,proton,415-555-0199,,First alias\n",
+    )
+    .unwrap();
+    let mut book = Book::new();
+    let plan1 = plan(&input(&[phones, computers, emails], &[]), &Cells::new()).unwrap();
+    assert!(!kinds(&plan1).contains(&"credential-shaped"));
+    let cells = apply(&mut book, &plan1);
+    let (lab_findings, generic_findings) = crate::alab::checks::lab(&cells);
+    assert!(lab_findings.is_empty(), "{lab_findings:?}");
+    assert!(generic_findings.is_empty(), "{generic_findings:?}");
+
+    let m2_pk = keys::machine_pk("m2");
+    assert_eq!(
+        planned(&plan1, "machine", &m2_pk, "nickname"),
+        Some(&json!("fb"))
+    );
+    assert_eq!(
+        planned(&plan1, "machine", &m2_pk, "ram_gb"),
+        Some(&json!(64))
+    );
+    let priv_pk = keys::address_pk("private@example.invalid").unwrap();
+    assert_eq!(
+        planned(&plan1, "address", &priv_pk, "protected"),
+        Some(&json!(true))
+    );
+    assert_eq!(planned(&plan1, "address", &priv_pk, "mailbox"), None);
+
+    let alias_pk = keys::address_pk("alias1@proton.example").unwrap();
+    let root_pk = keys::address_pk("root@proton.example").unwrap();
+    assert_eq!(
+        planned(&plan1, "address", &alias_pk, "alias_of"),
+        Some(&json!(root_pk))
+    );
+    assert!(planned(&plan1, "address", &alias_pk, "mailbox").is_some());
+    assert!(planned(&plan1, "address", &alias_pk, "phone").is_some());
+}
+
+/// A `~/.secrets` harness file's source is keyed under the `[everyone]` key, tokens or not: no
+/// plain digest of its bytes (nor its first 8 bytes, the source key) reaches the shared `source`
+/// row, while a one-byte change is still a new source and another epoch's key names it anew.
+/// NEGATIVE CONTROL: with `keyed_source` a plain `Sha256::digest(bytes)` (the key ignored), the
+/// plain-digest assertion fails: `` assertion `left != right` failed ``.
+#[test]
+fn a_secrets_file_source_is_a_keyed_digest() {
+    let text = "claude,ann@example.invalid,,m3 m9\n";
+    let read = |text: &str, key: &[u8; 32]| {
+        let rows = Stand
+            .stated(SheetKind::AiPool, "ai-pool.toml", text)
+            .unwrap();
+        Sheet::stated(
+            SheetKind::AiPool,
+            "ai-pool.toml",
+            text.as_bytes(),
+            &rows,
+            key,
+        )
+        .unwrap()
+    };
+    let one = read(text, &KEY);
+    assert_ne!(
+        one.sha256,
+        hex::encode_lower(&Sha256::digest(text.as_bytes()))
+    );
+    assert_ne!(one.source, keys::source_pk(text.as_bytes()));
+    assert_eq!(one.sha256.len(), 64);
+    assert!(one.source.starts_with("sr-") && one.sha256.starts_with(&one.source[3..]));
+    let changed = read(&text.replace("m9", "m8"), &KEY);
+    assert_ne!(changed.source, one.source);
+    assert_ne!(read(text, &[0xc3; 32]).sha256, one.sha256);
+    assert_eq!(read(text, &KEY).source, one.source);
 }

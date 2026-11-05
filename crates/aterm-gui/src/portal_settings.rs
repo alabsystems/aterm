@@ -167,7 +167,7 @@ mod tests {
         addresses: &[aterm_dbus::address::Address],
         how: Portal,
     ) -> std::thread::JoinHandle<Vec<String>> {
-        let mut server = Connection::open(addresses).unwrap();
+        let mut server = Connection::open_within(addresses, HANG).unwrap();
         let asked = Instant::now();
         loop {
             let owned = server

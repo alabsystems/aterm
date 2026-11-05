@@ -26,6 +26,10 @@ const READ_PAGE: usize = 64;
 #[path = "build_admit_monitor.rs"]
 pub mod monitor;
 
+#[path = "build_admit_epochs.rs"]
+mod epochs;
+pub use epochs::{EpochAccepted, EpochId, EpochRefused};
+
 /// Incarnation-bound event cursor, not a control credential.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cursor {
@@ -235,6 +239,7 @@ impl Controller {
 /// session does not install a new daemon or claim computer-wide leadership.
 pub struct Owner {
     jobs: Jobs,
+    epochs: epochs::Table,
     tickets: BTreeMap<u64, Ticket>,
     process: u32,
     generation: Generation,
@@ -242,7 +247,7 @@ pub struct Owner {
     keep_control: Controller,
     observer: Observer,
     monitor_connections: Arc<AtomicUsize>,
-    // Declared last: native Jobs cleanup completes before leadership is released.
+    // Declared last: actual job/epoch custody drops before leadership is released.
     fence: Option<aterm_capacity::leadership::Fence>,
 }
 
@@ -302,6 +307,7 @@ impl Owner {
                     revision: 0,
                     closed: false,
                     jobs: Vec::new(),
+                    epochs: Vec::new(),
                 }),
                 at: Instant::now(),
                 events: VecDeque::with_capacity(history),
@@ -312,6 +318,7 @@ impl Owner {
         );
         Ok(Self {
             jobs,
+            epochs: epochs::Table::new(max_jobs, history),
             tickets: BTreeMap::new(),
             process,
             generation,
@@ -376,6 +383,12 @@ impl Owner {
         grace: std::time::Duration,
     ) -> io::Result<Attempt> {
         self.check_owner()?;
+        if self.jobs.len() + self.epochs.active_len() >= aterm_capacity::host_protocol::MAX_JOBS {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "host observation capacity is full",
+            ));
+        }
         if let Some(fence) = &self.fence
             && let Err(error) = fence.check_claim(held.claim())
         {
@@ -481,7 +494,13 @@ impl Owner {
                 )
             },
             say,
-        )?;
+        );
+        // One failing subsystem cannot prevent another original owner from
+        // advancing its real pipes, child reap or safe settlement.
+        if let Some(fence) = &self.fence {
+            self.epochs.tick(fence, say);
+        }
+        let completed = completed?;
         for completion in &completed {
             let event = match &completion.result {
                 Ok(outcome) => Event::Finished {
@@ -500,6 +519,9 @@ impl Owner {
 
     fn publish(&self, mut events: Vec<(Option<u64>, Event)>) -> io::Result<()> {
         let jobs = self.jobs.protocol_rows()?;
+        let epochs = self
+            .epochs
+            .rows(aterm_capacity::host_protocol::MAX_JOBS - jobs.len());
         let mut state = self
             .observer
             .0
@@ -508,7 +530,7 @@ impl Owner {
         if state.exhausted {
             return Ok(());
         }
-        if events.is_empty() && jobs == state.snapshot.jobs {
+        if events.is_empty() && jobs == state.snapshot.jobs && epochs == state.snapshot.epochs {
             return Ok(());
         }
         if events.is_empty() {
@@ -535,6 +557,7 @@ impl Owner {
             revision,
             closed: false,
             jobs,
+            epochs,
         });
         state.at = Instant::now();
         drop(state);
@@ -546,12 +569,16 @@ impl Owner {
     /// # Errors
     /// Native job table/readiness errors. Run on the execution owner, not a UI thread.
     pub fn wait(&self, until: Instant) -> io::Result<super::host::Wake> {
-        self.jobs.wait(self.receiver.as_fd(), until)
+        self.check_owner()?;
+        let (extra, immediate, until) = self.epochs.wait_plan(until);
+        self.jobs
+            .wait_with(self.receiver.as_fd(), &extra, immediate, until)
     }
-    /// Active owned roots; an empty table does not certify retained cohort drain.
+    /// No owned root or unresolved epoch remains. Bounded settled history is
+    /// observation only; an uncertain or faulted epoch keeps this false.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.jobs.is_empty()
+        self.jobs.is_empty() && self.epochs.active_len() == 0
     }
 }
 
@@ -599,6 +626,7 @@ mod tests {
                     revision,
                     closed: false,
                     jobs: Vec::new(),
+                    epochs: Vec::new(),
                 }),
                 at: Instant::now(),
                 events: (0..count)
@@ -691,6 +719,7 @@ mod tests {
             revision: u64::MAX,
             closed: false,
             jobs: Vec::new(),
+            epochs: Vec::new(),
         });
         owner.publish(vec![(None, Event::StateChanged)]).unwrap();
         assert_eq!(observer.read(None).unwrap_err(), ReadError::Exhausted);

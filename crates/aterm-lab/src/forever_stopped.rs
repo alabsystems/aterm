@@ -229,7 +229,11 @@ pub fn first(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
             other.unwrap_or("?")
         )),
     }
-    let want_tip = report_words(product, false);
+    let want_tip = report_words(
+        product,
+        aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+        false,
+    );
     let tip = quoted(l, "tip");
     if tip.as_deref() != Some(want_tip.as_str()) {
         bad.push(format!(

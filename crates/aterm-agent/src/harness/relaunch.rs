@@ -26,6 +26,7 @@ use super::upgrade_drive::{
 };
 use crate::supervise::approvals;
 use crate::supervise::limit::one_line;
+use crate::supervise::policy::turn_end::RestartClaim;
 use crate::supervise::policy::turn_end::TurnEndReading;
 pub use crate::supervise::policy::turn_end::{Restart, RestartAsk};
 use crate::supervise::screen::HumanInput;
@@ -49,6 +50,7 @@ pub(super) struct Plan {
     pub(super) line_dir: Option<String>,
     /// The exact flags/environment selected while rendering `line`, before native admission.
     pub(super) command: Option<PlannedCommand>,
+    pub(super) cold: Option<super::native_act::ColdIntent>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +62,7 @@ pub(super) struct PlannedCommand {
     pub(super) argv: Vec<String>,
     pub(super) env: Vec<(String, String)>,
     pub(super) unset: Option<Vec<String>>,
+    pub(super) account_intent: Option<super::accounts_pool::ExecutionIntent>,
 }
 
 impl PlannedCommand {
@@ -76,6 +79,7 @@ impl PlannedCommand {
                 Some(path) => Some(path.to_str()?.to_string()),
             },
             dialect: self.dialect,
+            account_intent: self.account_intent.clone().map(Box::new),
         })
     }
 }
@@ -119,7 +123,8 @@ pub(super) struct Launch<'a> {
     pub(super) agent: u32,
     /// Its argv, `argv[0]` first.
     pub(super) argv: &'a [String],
-    /// What the line executes.
+    /// What the line executes, but for the managed twin on a line it would make yolo, where the
+    /// line executes the twin's build ([`past_unmarked_twin`]).
     pub(super) exe: &'a Path,
     /// The model the relaunch asks for ([`with_model`]).
     pub(super) model: Option<&'a str>,
@@ -133,6 +138,11 @@ pub(super) struct Launch<'a> {
     pub(super) login: Option<&'a str>,
     /// Whether the process it replaces authenticated by its stored login ([`Snapshot::stored_login`]).
     pub(super) stored_login: bool,
+    /// The authentication route was positively observed, rather than omitted by a legacy record.
+    pub(super) auth_observed: bool,
+    /// What the replaced agent's own exec environment recorded of its shell's, where it was
+    /// recorded ([`Snapshot::launch_env`]).
+    pub(super) launch_env: Option<&'a accounts::LaunchEnv>,
     /// Whether the line moves the model: without usage credits, a move needs a named model and a
     /// captured Standard billing context equal to the target's.
     pub(super) billing: ModelBilling<'a>,
@@ -161,6 +171,73 @@ fn billing_allows_launch(
                 })
         }
     }
+}
+
+/// Reuse the original model-billing rule for a deferred login selection.
+#[must_use]
+pub fn cold_profile_allows(
+    intent: &super::native_act::ColdIntent,
+    seed: &super::native_act::RestartCommand,
+    resolved: &super::native_act::RestartCommand,
+    user_home: &Path,
+    cwd: &str,
+) -> bool {
+    if !seed.cold_resolution_agrees(resolved) {
+        return false;
+    }
+    if intent.billing != super::native_act::ColdBilling::PreserveProfile {
+        return true;
+    }
+    let required = resolved
+        .env
+        .iter()
+        .filter_map(|(key, value)| {
+            let key = match key.as_str() {
+                accounts::LOGIN_ENV => accounts::LOGIN_ENV,
+                accounts::HOME_ENV => accounts::HOME_ENV,
+                accounts::HOMEDIR_ENV => accounts::HOMEDIR_ENV,
+                _ => return None,
+            };
+            Some((key, value.as_str()))
+        })
+        .collect::<Vec<_>>();
+    let target = intent
+        .profile
+        .as_ref()
+        .and_then(|from| from.for_launch(user_home, cwd, &required));
+    cold_profile_allows_context(
+        intent,
+        seed,
+        resolved,
+        target.as_ref().map(|env| &env.context),
+    )
+}
+
+/// Apply the existing billing law to the actual helper's resolved profile context.
+#[must_use]
+pub fn cold_profile_allows_context(
+    intent: &super::native_act::ColdIntent,
+    seed: &super::native_act::RestartCommand,
+    resolved: &super::native_act::RestartCommand,
+    target: Option<&super::profile::Context>,
+) -> bool {
+    if !seed.cold_resolution_agrees(resolved) {
+        return false;
+    }
+    if intent.billing != super::native_act::ColdBilling::PreserveProfile {
+        return true;
+    }
+    let model = seed
+        .argv
+        .windows(2)
+        .find(|words| words[0] == "--model")
+        .map(|words| words[1].as_str());
+    billing_allows_launch(
+        false,
+        ModelBilling::Move(intent.profile.as_ref()),
+        model,
+        target,
+    )
 }
 
 /// The required environment of a relaunch line for `login` ([`Launch::login`]).
@@ -197,6 +274,16 @@ pub(super) fn plan(
     launch: &Launch<'_>,
     shell: u32,
     t: &[super::upgrade_drive::ProcRow],
+) -> Result<Plan, NoPlan> {
+    plan_with_cold(opts, launch, shell, t, None)
+}
+
+fn plan_with_cold(
+    opts: &Opts,
+    launch: &Launch<'_>,
+    shell: u32,
+    t: &[super::upgrade_drive::ProcRow],
+    cold: Option<super::native_act::ColdIntent>,
 ) -> Result<Plan, NoPlan> {
     if shell == NO_SHELL {
         return Err(NoPlan::Refused {
@@ -262,7 +349,39 @@ pub(super) fn plan(
         exact.as_ref().map(|env| env.unset.as_slice()),
         tap.as_deref(),
     )?;
+    // Profile reconstruction can supply a login absent from the original argv.
+    // Bind the environment actually retained by this command, after selection.
+    let selected_value = |name: &str| {
+        selected
+            .env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    let selected_launch = Launch {
+        home: selected_value(accounts::HOME_ENV).or(launch.home),
+        homedir: selected_value(accounts::HOMEDIR_ENV).or(launch.homedir),
+        login: selected_value(accounts::LOGIN_ENV).or(launch.login),
+        ..*launch
+    };
+    let unset = exact.map(|env| {
+        env.unset
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    });
+    let account_intent = if cold.is_some() {
+        // This is only the immutable recipe. The exact owned helper supplies the
+        // observed route before Resolve selects and captures its account intent.
+        None
+    } else {
+        let mut intent =
+            command_account(opts, &selected_launch).map_err(|_| NoPlan::Wait("account"))?;
+        intent.bind_external_environment(&selected.env, unset.as_deref(), launch.launch_env);
+        Some(intent)
+    };
     Ok(Plan {
+        cold,
         shell,
         dialect,
         line: selected.line,
@@ -275,9 +394,184 @@ pub(super) fn plan(
             target: launch.exe.to_path_buf(),
             argv: selected.argv,
             env: selected.env,
-            unset: exact.map(|env| env.unset.iter().map(|name| (*name).to_string()).collect()),
+            unset,
+            account_intent,
         }),
     })
+}
+
+fn account_seat(opts: &Opts) -> Result<super::accounts_pool::Seat<'_>, &'static str> {
+    let roster = opts
+        .account_roster
+        .as_deref()
+        .ok_or("account namespace unavailable")?;
+    let config_dir = roster
+        .parent()
+        .filter(|_| {
+            roster
+                .file_name()
+                .is_some_and(|name| name == accounts::Cli::Claude.accounts().roster_file)
+        })
+        .ok_or("account namespace invalid")?;
+    Ok(super::accounts_pool::Seat {
+        config_dir,
+        state: &opts.state,
+        home: &opts.home,
+        now: i64::try_from(now_s()).map_err(|_| "account clock unavailable")?,
+    })
+}
+
+fn command_account(
+    opts: &Opts,
+    launch: &Launch<'_>,
+) -> Result<super::accounts_pool::ExecutionIntent, String> {
+    if !launch.auth_observed {
+        return Err("command authentication attribution is unknown".into());
+    }
+    if launch.home.is_some_and(|home| !home.is_empty())
+        || launch
+            .homedir
+            .is_some_and(|home| !same_dir(Some(home), &opts.home.to_string_lossy()))
+        || launch.auth_observed && !launch.stored_login
+    {
+        if launch.stored_login {
+            let mut directories = Vec::new();
+            if let Some(home) = launch.home.filter(|home| !home.is_empty()) {
+                directories.push(PathBuf::from(home));
+            } else if let Some(home) = launch.homedir {
+                directories
+                    .push(Path::new(home).join(accounts::Cli::Claude.accounts().default_home));
+            }
+            if let Some(login) = launch.login.filter(|login| !login.is_empty()) {
+                directories.push(PathBuf::from(login));
+            }
+            for directory in &mut directories {
+                if directory.is_relative() {
+                    *directory = Path::new(launch.cwd).join(&*directory);
+                }
+            }
+            super::accounts_pool::admit_external_execution(
+                &account_seat(opts)?,
+                accounts::Cli::Claude,
+                &directories,
+            )?;
+        }
+        return Ok(super::accounts_pool::ExecutionIntent::external());
+    }
+    super::accounts_pool::capture_execution(
+        &account_seat(opts)?,
+        accounts::Cli::Claude,
+        &accounts::ProcessLogin {
+            login: launch
+                .login
+                .filter(|login| !login.is_empty())
+                .map(str::to_owned),
+            default_home: true,
+            stored_login: true,
+        },
+    )
+}
+
+fn account_execution(
+    opts: &Opts,
+    intent: Option<&super::accounts_pool::ExecutionIntent>,
+) -> Result<Option<super::accounts_pool::ExecutionGuard>, String> {
+    let intent = intent.ok_or("saved command authentication attribution is unknown")?;
+    if matches!(
+        intent,
+        super::accounts_pool::ExecutionIntent::External { .. }
+    ) {
+        return Ok(None);
+    }
+    super::accounts_pool::admit_execution(&account_seat(opts)?, accounts::Cli::Claude, intent)
+        .map(Some)
+}
+
+fn external_at_shell(
+    opts: &Opts,
+    intent: Option<&super::accounts_pool::ExecutionIntent>,
+    shell: u32,
+) -> Result<Option<super::accounts_pool::ExecutionGuard>, String> {
+    let Some(intent) = intent else {
+        return Ok(None);
+    };
+    if !matches!(
+        intent,
+        super::accounts_pool::ExecutionIntent::External { .. }
+    ) {
+        return Ok(None);
+    }
+    let inherited = match atpkg::caller_shell::process_args(shell) {
+        Some(args) => args.env,
+        // An unread environment reads as an empty one only where the agent recorded its
+        // launch environment, the base the intent then reads instead.
+        None if matches!(
+            intent,
+            super::accounts_pool::ExecutionIntent::External {
+                launch: Some(_),
+                ..
+            }
+        ) =>
+        {
+            Vec::new()
+        }
+        None => return Err("shell authentication environment is unavailable".into()),
+    };
+    external_from_env(opts, intent, &inherited, cwd_of(shell).as_deref())
+}
+
+fn external_from_env(
+    opts: &Opts,
+    intent: &super::accounts_pool::ExecutionIntent,
+    inherited: &[String],
+    cwd: Option<&str>,
+) -> Result<Option<super::accounts_pool::ExecutionGuard>, String> {
+    let env = intent
+        .external_environment(inherited)
+        .ok_or("external authentication context is unavailable")?;
+    let who = accounts::ProcessLogin::of_exec_env(&env)
+        .ok_or("shell authentication attribution is unavailable")?;
+    let value = |name: &str| {
+        env.iter()
+            .filter_map(|entry| entry.split_once('='))
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value)
+    };
+    let home = value(accounts::HOMEDIR_ENV).ok_or("shell home is unavailable")?;
+    let same_home = same_dir(Some(home), &opts.home.to_string_lossy());
+    if !intent.matches_process(&who, same_home) {
+        return Err("external authentication route is no longer present".into());
+    }
+    if !who.stored_login {
+        return Ok(None);
+    }
+    let mut directories = Vec::new();
+    if let Some(custom) = value(accounts::HOME_ENV).filter(|path| !path.is_empty()) {
+        directories.push(PathBuf::from(custom));
+    } else if !same_home {
+        directories.push(Path::new(home).join(accounts::Cli::Claude.accounts().default_home));
+    }
+    if let Some(login) = who.login {
+        directories.push(PathBuf::from(login));
+    }
+    for directory in &mut directories {
+        if directory.is_relative() {
+            *directory = Path::new(cwd.ok_or("shell directory is unavailable")?).join(&*directory);
+        }
+    }
+    super::accounts_pool::admit_external_execution(
+        &account_seat(opts)?,
+        accounts::Cli::Claude,
+        &directories,
+    )
+    .map(Some)
+}
+
+fn checks_account_execution(agent: &upgrade::Agent) -> bool {
+    match agent {
+        upgrade::Agent::Claude => true,
+        upgrade::Agent::Codex | upgrade::Agent::Agy | upgrade::Agent::Muse => false,
+    }
 }
 
 /// Whether the shell's directory `shell` (the kernel's spelling) is `want` (the agent's, often a
@@ -411,6 +705,23 @@ pub(super) fn line_tap_kept(
     .map(|selected| (selected.line, selected.tap_dropped))
 }
 
+/// The build to type in place of `exe`, where `exe` is Claude Code's managed twin and `flags` hold
+/// nothing it reads as typed: it would add yolo, and a relaunch never enters bypass
+/// ([`with_permission_mode`]). A line with `--resume` or a mode written on it stays the twin's, as
+/// does one the build cannot be read for. [`Plan::command`] still names `exe`, so the native
+/// restart, off for Claude Code (`SessionPolicy::constructor_enabled`), would refuse such a line
+/// with `native-command-changed` rather than run the twin.
+fn past_unmarked_twin(exe: &Path, flags: &[String]) -> Option<PathBuf> {
+    let atpkg::yolo::Launch::Default(_) = atpkg::yolo::decide("claude", flags) else {
+        return None;
+    };
+    let twin = super::upgrade_drive::managed_agent_twin("claude")?;
+    if twin != exe {
+        return None;
+    }
+    super::upgrade_drive::twin_build(exe, "claude")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn line_tap_selected(
     dialect: Dialect,
@@ -435,6 +746,8 @@ fn line_tap_selected(
         flags.truncate(flags.len().saturating_sub(2));
     }
     let flags = with_permission_mode(with_model(flags, model), mode);
+    let build = past_unmarked_twin(exe, &flags);
+    let exe = build.as_deref().unwrap_or(exe);
     let both: Vec<(&str, &str)> = required.iter().copied().chain(CLAUDE_LAUNCH_ENV).collect();
     let tapped = tap.map(|value| with_tap(flags.clone(), value));
     let line = |env: &[(&str, &str)], flags: &[String]| {
@@ -772,6 +1085,9 @@ pub(super) fn stale_exit_line(st: &St, who: &str, now: u64) -> String {
 
 /// Why a relaunch in flight whose agent is gone must stop instead of acting on the tab, `(word, ledger detail)`, or `None` while it may still act.
 pub(super) fn expired(st: &St, now: u64) -> Option<(&'static str, String)> {
+    if st.native_retired_unissued {
+        return None;
+    }
     use upgrade::Phase;
     match st.phase {
         Phase::Exiting { at_s }
@@ -785,11 +1101,20 @@ pub(super) fn expired(st: &St, now: u64) -> Option<(&'static str, String)> {
         )),
         Phase::Relaunched { at_s } if now.saturating_sub(at_s) > STALE_S => Some((
             "no-resume",
-            "the relaunched agent never registered the conversation".to_string(),
+            if st.found_gone {
+                REGISTERED_AND_ENDED
+            } else {
+                "the relaunched agent never registered the conversation"
+            }
+            .to_string(),
         )),
         _ => None,
     }
 }
+
+/// What the ledger says of a relaunch found on the conversation and gone before it came up.
+const REGISTERED_AND_ENDED: &str =
+    "the relaunched agent registered the conversation and ended before it came up";
 
 /// The word a Claude restart in flight stops with once another conversation holds its tab
 /// ([`overtaken`]).
@@ -902,6 +1227,17 @@ fn close_if_taken(
     c: &mut Client,
     tab: &str,
 ) -> Option<Report> {
+    let retired = match super::native_restart::refresh_retirement_hold(c, tab, st) {
+        Ok(retired) => retired,
+        Err(why) => return Some(said(r.clone(), format!("wait:{why}"))),
+    };
+    if retired {
+        save(opts, session, st);
+        return Some(said(
+            r.clone(),
+            super::native_restart::WAIT_RETIRED_UNISSUED,
+        ));
+    }
     if !overtakable(st, alive) {
         return None;
     }
@@ -909,12 +1245,46 @@ fn close_if_taken(
     let tabs = host_roster(c);
     let front = tab_front(tabs.as_deref(), tab, st.shell);
     let sf = overtaken_by(st, session, &files, front)?;
+    if let Some(wait) = native_retirement_wait(opts, r, st, session, c) {
+        return Some(wait);
+    }
     let line = overtaken_line(sf.pid, &sf.session_id);
     st.close_overtaken(TAB_TAKEN, now_s());
     let r = said(r.clone(), format!("failed:{TAB_TAKEN}"));
     ledger(opts, &r, &line);
     save(opts, session, st);
     Some(r)
+}
+
+pub(super) fn native_retirement_wait(
+    opts: &Opts,
+    r: &Report,
+    st: &mut St,
+    session: &str,
+    c: &mut Client,
+) -> Option<Report> {
+    if st.native_retired_unissued {
+        return Some(said(
+            r.clone(),
+            super::native_restart::WAIT_RETIRED_UNISSUED,
+        ));
+    }
+    if st.native.is_none() && st.native_prepare.is_empty() {
+        return None;
+    }
+    let tab = st.tab.clone();
+    let retired = super::native_restart::retire(opts, session, c, &tab, st);
+    save(opts, session, st);
+    (!retired).then(|| {
+        said(
+            r.clone(),
+            if st.native_retired_unissued {
+                super::native_restart::WAIT_RETIRED_UNISSUED
+            } else {
+                "wait:native-retirement"
+            },
+        )
+    })
 }
 
 /// What a new process holding the conversation of a relaunch in flight is to that relaunch.
@@ -1035,9 +1405,12 @@ pub(super) fn relaunch(
     session: &str,
     k: &dyn Kernel,
 ) -> Report {
+    if st.native_retired_unissued {
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = relaunch_held(opts, r, st, c, &mut hand, session, k);
-    if !matches!(st.phase, upgrade::Phase::Exiting { .. }) {
+    if st.native_retired_unissued || !matches!(st.phase, upgrade::Phase::Exiting { .. }) {
         hand.give_back(c);
     }
     r
@@ -1052,6 +1425,9 @@ fn relaunch_held(
     session: &str,
     k: &dyn Kernel,
 ) -> Report {
+    if st.native_retired_unissued {
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     let has_private_constructor = match st.agent {
         upgrade::Agent::Claude => true,
         upgrade::Agent::Codex | upgrade::Agent::Agy | upgrade::Agent::Muse => false,
@@ -1070,6 +1446,9 @@ fn relaunch_held(
             Ok(super::native_restart::Recovery::Retired) => {
                 return said(r, "failed:native-cohort-retired");
             }
+            Ok(super::native_restart::Recovery::Held) => {
+                return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+            }
             Ok(super::native_restart::Recovery::Legacy) => {}
             Ok(super::native_restart::Recovery::Cancelled) => {
                 return said(r, "wait:native-crash-observation");
@@ -1080,7 +1459,7 @@ fn relaunch_held(
     let old = st.pid;
     if !st.native_prepare.is_empty() {
         let tab = st.tab.clone();
-        match super::native_restart::recover(c, &tab, st) {
+        match super::native_restart::recover(opts, session, c, &tab, st) {
             Ok(super::native_restart::Recovery::Completed) => {
                 save(opts, session, st);
                 return await_held(opts, r, st, c, hand, session, k);
@@ -1094,6 +1473,10 @@ fn relaunch_held(
                 save(opts, session, st);
                 return said(r, "failed:native-cohort-retired");
             }
+            Ok(super::native_restart::Recovery::Held) => {
+                save(opts, session, st);
+                return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+            }
             Ok(
                 super::native_restart::Recovery::Admitted | super::native_restart::Recovery::Legacy,
             ) => {}
@@ -1101,7 +1484,12 @@ fn relaunch_held(
         }
         save(opts, session, st);
     }
-    if st.native.is_some() && super::native_restart::resume_observed(c, &st.tab, st) {
+    let tab = st.tab.clone();
+    let resumed = match super::native_restart::resume_observed(c, &tab, st) {
+        Ok(resumed) => resumed,
+        Err(why) => return said(r, format!("wait:{why}")),
+    };
+    if resumed {
         // The client may have ended after the server submitted the fixed line but before its
         // local typed record landed. Kernel proof of that same operation resumes observation;
         // the old line is never sent again while waiting for the shell to return.
@@ -1109,15 +1497,23 @@ fn relaunch_held(
         save(opts, session, st);
         return await_held(opts, r, st, c, hand, session, k);
     }
+    if st.native_retired_unissued {
+        save(opts, session, st);
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     if !st.native_prepare.is_empty() && alive(old) {
         let tab = st.tab.clone();
         // A prepare/signal reply may have been lost before mutation. Prove an explicit
         // pre-mutation abort before returning to a fresh at-rest constructor; never signal
         // later from this recovery/observation lane using an old screen observation.
-        if super::native_restart::abort(c, &tab, st) {
+        if super::native_restart::abort(opts, session, c, &tab, st) {
             st.stop("native-aborted-before-signal", now_s());
             save(opts, session, st);
             return said(r, "wait:native-aborted-before-signal");
+        }
+        if st.native_retired_unissued {
+            save(opts, session, st);
+            return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
         }
     }
     if !super::upgrade_wake::wait_exit(old, opts.timings.exited) {
@@ -1144,8 +1540,6 @@ fn relaunch_held(
         }
         Err(no) => return unplanned(opts, r, st, no),
     };
-    let asked = record_asked(opts, session, &st.model_list);
-    let block = line_block(c, &tab);
     if st.native.is_some() && line != st.line {
         return said(r, "wait:native-continuation-changed");
     }
@@ -1154,6 +1548,40 @@ fn relaunch_held(
         return said(r, "wait:native-recovery");
     }
     let native_phase = super::native_restart::phase(st);
+    let deferred_cold = native.is_some()
+        && matches!(super::native_act::Request::parse(&st.native_prepare),
+            Some(super::native_act::Request::Prepare(prepare))
+                if matches!(prepare.plan, super::native_act::NativePlan::Restart { cold: Some(_), .. }));
+    // Observe already dispatched work above before consulting current policy. This
+    // admission grants only the saved command; it never chooses a replacement login.
+    // A deferred native recipe has no selected account until the exact helper resolves it.
+    // Its Execute takes canonical account admission after that point; legacy recipes cannot
+    // enter this branch and keep their existing dispatch guard below.
+    let account_guard = if checks_account_execution(&st.agent) && !deferred_cold {
+        match account_execution(opts, st.account_intent.as_ref()) {
+            Ok(guard) => guard,
+            Err(_) => return said(r, WAIT_ACCOUNT),
+        }
+    } else {
+        None
+    };
+    // The native helper takes the same writer at Execute. Keeping the client lock
+    // over Resume would deadlock it; the raw legacy write retains it through dispatch.
+    let legacy_account_guard = if native.is_some() {
+        drop(account_guard);
+        None
+    } else {
+        if checks_account_execution(&st.agent) {
+            match external_at_shell(opts, st.account_intent.as_ref(), shell) {
+                Ok(guard) => guard.or(account_guard),
+                Err(_) => return said(r, WAIT_ACCOUNT),
+            }
+        } else {
+            account_guard
+        }
+    };
+    let asked = record_asked(opts, session, &st.model_list);
+    let block = line_block(c, &tab);
     let typed = type_relaunch_line_admitted(
         opts,
         &st.agent_records(&opts.home),
@@ -1167,6 +1595,7 @@ fn relaunch_held(
         |c, pid, tab| process_in_tab(c, pid, tab, None, None),
         native.as_ref().map(|binding| (binding, native_phase)),
     );
+    drop(legacy_account_guard);
     if typed
         .as_ref()
         .is_err_and(|e| *e != RelaunchLineError::Unanswered)
@@ -1223,7 +1652,7 @@ pub(super) fn line_unanswered(
     said(r, "wait:unanswered")
 }
 
-fn typed_recorded(
+pub(super) fn typed_recorded(
     opts: &Opts,
     st: &mut St,
     session: &str,
@@ -1233,6 +1662,7 @@ fn typed_recorded(
     st.relaunched(now_s());
     st.line_block = block;
     st.relaunched_pid = 0;
+    st.found_gone = false;
     save(opts, session, st);
     after(st);
 }
@@ -1525,31 +1955,35 @@ fn type_at_prompt(
             if !tab_probe(c, shell, tab) {
                 return Err(RelaunchLineError::Wait("tab-ownership-changed"));
             }
-            let Some(generation) = scr.and_then(|s| s.generation) else {
+            let Some((generation, human)) = scr.and_then(|s| Some((s.generation?, s.human_seq)))
+            else {
                 break;
             };
-            match turn_fenced(c, tab, line, Some(&generation)) {
+            match turn_fenced(c, tab, line, Some(&generation), human) {
                 Ok(()) => return Ok(()),
                 Err(Typed::Changed) => pause(fence_every),
                 Err(Typed::Yielded) => return Err(RelaunchLineError::Wait("yield")),
+                Err(Typed::Person) => return Err(RelaunchLineError::Wait("held")),
                 Err(Typed::Cut(_)) => return Err(RelaunchLineError::Wait("cut")),
                 Err(Typed::Refused(e)) => return Err(refused_line(e)),
                 Err(Typed::Unanswered) => return Err(RelaunchLineError::Unanswered),
             }
         }
     }
-    at_mark(mark, screen(c, tab).as_ref())?;
+    let last = screen(c, tab);
+    at_mark(mark, last.as_ref())?;
     if !tab_probe(c, shell, tab) {
         return Err(RelaunchLineError::Wait("tab-ownership-changed"));
     }
     let typed = if bash {
         type_line(c, tab, line)
     } else {
-        turn_fenced(c, tab, line, None)
+        turn_fenced(c, tab, line, None, last.and_then(|s| s.human_seq))
     };
     match typed {
         Ok(()) => Ok(()),
         Err(Typed::Yielded | Typed::Changed) => Err(RelaunchLineError::Wait("yield")),
+        Err(Typed::Person) => Err(RelaunchLineError::Wait("held")),
         Err(Typed::Cut(_)) => Err(RelaunchLineError::Wait("cut")),
         Err(Typed::Refused(e)) => Err(refused_line(e)),
         Err(Typed::Unanswered) => Err(RelaunchLineError::Unanswered),
@@ -1779,6 +2213,9 @@ pub(super) fn await_new(
     session: &str,
     k: &dyn Kernel,
 ) -> Report {
+    if st.native_retired_unissued {
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = await_held(opts, r, st, c, &mut hand, session, k);
     hand.give_back(c);
@@ -1794,21 +2231,62 @@ fn await_held(
     session: &str,
     k: &dyn Kernel,
 ) -> Report {
+    if st.native_retired_unissued {
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
+    let tab = st.tab.clone();
+    let unissued = if checks_account_execution(&st.agent) {
+        match super::native_restart::launch_unissued(c, &tab, st) {
+            Ok(unissued) => unissued,
+            Err(why) => return said(r, format!("wait:{why}")),
+        }
+    } else {
+        false
+    };
+    if unissued {
+        retain_unissued(st);
+        save(opts, session, st);
+        return said(r, WAIT_NATIVE_UNISSUED);
+    }
+    if st.native_retired_unissued {
+        save(opts, session, st);
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     let records = st.agent_records(&opts.home);
     let (old, shell) = (st.pid, st.shell);
     let fresh = starts_afresh(&st.cause);
     let mut new: Option<SessionFile> = None;
     let mut roster = SessionRosterCache::default();
     let mut back = ShellBack::after(st.line_block, &opts.timings);
-    let mut ended = false;
+    let mut found_gone = std::mem::take(&mut st.found_gone);
+    let mut ended = found_gone;
+    let mut unread = false;
     let look_back = ends_at_once(&st.cause);
     let tab = st.tab.clone();
     let limit = held_wait(&opts.timings, &st.cause);
     wait_every(limit, poll_gap(limit).min(opts.timings.shell_look), || {
         hand.keep(c);
-        if st.native.is_some() && super::native_restart::resume_observed(c, &tab, st) {
+        let resumed = match super::native_restart::resume_observed(c, &tab, st) {
+            Ok(resumed) => resumed,
+            Err(_) => {
+                unread = true;
+                return true;
+            }
+        };
+        if resumed {
             let _completed = super::native_restart::complete(opts, session, c, &tab, st);
+            if st.native_retired_unissued {
+                st.found_gone = found_gone;
+            }
             save(opts, session, st);
+            if st.native_retired_unissued {
+                return true;
+            }
+        }
+        if st.native_retired_unissued {
+            st.found_gone = found_gone;
+            save(opts, session, st);
+            return true;
         }
         new = roster.files(&records, wait_now()).and_then(|files| {
             files
@@ -1823,12 +2301,22 @@ fn await_held(
                 .cloned()
         });
         let now = wait_now();
-        if look_back && new.is_none() && back.due(now) {
+        if !ended && look_back && new.is_none() && back.due(now) {
             let over = back.block.and_then(|block| line_over(c, &tab, block));
             ended = back.saw(k.shell_holds_tab(shell), over, now);
         }
         new.is_some() || ended
     });
+    if unread {
+        st.found_gone = found_gone;
+        save(opts, session, st);
+        return said(r, "wait:native-recovery");
+    }
+    if st.native_retired_unissued {
+        st.found_gone = found_gone;
+        save(opts, session, st);
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     if let Some(sf) = &new {
         first_idle(c, hand, &st.tab, opts.timings.first_idle, || {
             records
@@ -1836,9 +2324,63 @@ fn await_held(
                 .is_some_and(|sf| sf.status == "idle")
         });
     }
-    if new.is_some() && !super::native_restart::complete(opts, session, c, &st.tab.clone(), st) {
+    // A process found on the conversation and gone by the end of this wait is read as one that
+    // never came up, unless an earlier step adopted it, whose end is its own. After a restart that
+    // ended its own agent, adopting it would let the carry of the old agent's exit close the move
+    // as one that landed, with nothing said. The on-exit lanes and the restored lane retry an
+    // adopted process that is gone. One limit: a process up but not adopted yet, its step having
+    // answered a wait, and quit during this wait reads the same.
+    if new.as_ref().is_some_and(|sf| {
+        ends_its_agent(&st.cause) && st.relaunched_pid != sf.pid && !alive(sf.pid)
+    }) {
+        new = None;
+        ended = true;
+        found_gone = true;
+    }
+    let how_ended = if found_gone {
+        REGISTERED_AND_ENDED
+    } else {
+        "the relaunched agent ended without registering the conversation: its shell has the tab \
+         back"
+    };
+    // The helper can be refused and exit during the observation wait, not just
+    // before it. Preserve that positively unissued attempt before ordinary
+    // no-resume retirement or rollback can consume the owed conversation.
+    let unissued = if new.is_none() && checks_account_execution(&st.agent) {
+        match super::native_restart::launch_unissued(c, &tab, st) {
+            Ok(unissued) => unissued,
+            Err(why) => {
+                st.found_gone = found_gone;
+                save(opts, session, st);
+                return said(r, format!("wait:{why}"));
+            }
+        }
+    } else {
+        false
+    };
+    if unissued {
+        retain_unissued(st);
         save(opts, session, st);
-        return said(r, "wait:native-outcome");
+        return said(r, WAIT_NATIVE_UNISSUED);
+    }
+    if st.native_retired_unissued {
+        st.found_gone = found_gone;
+        save(opts, session, st);
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
+    if new.is_some() && !super::native_restart::complete(opts, session, c, &st.tab.clone(), st) {
+        if st.native_retired_unissued {
+            st.found_gone = found_gone;
+        }
+        save(opts, session, st);
+        return said(
+            r,
+            if st.native_retired_unissued {
+                super::native_restart::WAIT_RETIRED_UNISSUED
+            } else {
+                "wait:native-outcome"
+            },
+        );
     }
     match new {
         Some(sf) if fresh => {
@@ -1887,8 +2429,7 @@ fn await_held(
                 opts,
                 &failed,
                 &format!(
-                    "the relaunched agent ended without registering the conversation: its shell \
-                     has the tab back; resumed on {}, the build it ran",
+                    "{how_ended}; resumed on {}, the build it ran",
                     one_line(&st.to)
                 ),
             );
@@ -1900,24 +2441,27 @@ fn await_held(
             relaunch_held(opts, r, st, c, hand, session, k)
         }
         None if ended => {
-            if st.native.is_some() && !super::native_restart::retire(c, &tab, st) {
+            if st.native.is_some() && !super::native_restart::retire(opts, session, c, &tab, st) {
+                st.found_gone = found_gone;
                 save(opts, session, st);
+                if st.native_retired_unissued {
+                    return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+                }
                 return said(r, "wait:native-retirement");
             }
             st.stop("no-resume", now_s());
             let r = said(r, "failed:no-resume");
-            ledger(
-                opts,
-                &r,
-                "the relaunched agent ended without registering the conversation: its shell \
-                 has the tab back",
-            );
+            ledger(opts, &r, how_ended);
             r
         }
         None => {
             if let upgrade::Phase::Relaunched { at_s } = st.phase
                 && now_s().saturating_sub(at_s) > STALE_S
             {
+                st.found_gone = found_gone;
+                if let Some(wait) = native_retirement_wait(opts, &r, st, session, c) {
+                    return wait;
+                }
                 st.stop("no-resume", now_s());
                 let r = said(r, "failed:no-resume");
                 ledger(
@@ -1930,6 +2474,19 @@ fn await_held(
             said(r, "wait:resume")
         }
     }
+}
+
+fn retain_unissued(st: &mut St) {
+    let at_s = if st.exited_at != 0 {
+        st.exited_at
+    } else {
+        match &st.phase {
+            upgrade::Phase::Relaunched { at_s } | upgrade::Phase::Exiting { at_s } => *at_s,
+            _ => now_s(),
+        }
+    };
+    st.exited_at = at_s;
+    st.phase = upgrade::Phase::Exiting { at_s };
 }
 
 /// What an `adopted` row promises of the relaunch's last step, which the tab's loop takes at its
@@ -2626,6 +3183,9 @@ fn done_quietly(
     version: &str,
     pid: u32,
 ) -> Report {
+    if st.native_retired_unissued {
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     st.phase = upgrade::Phase::Done;
     r.from.clone_from(&st.from);
     r.to = format!("{version}({})", st.source);
@@ -2699,6 +3259,9 @@ fn done_with_nothing(
     version: &str,
     pid: u32,
 ) -> Report {
+    if st.native_retired_unissued {
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     st.phase = upgrade::Phase::Done;
     r.from.clone_from(&st.from);
     r.to = format!("{version}({})", st.source);
@@ -2752,8 +3315,8 @@ pub(super) enum Continued {
 
 fn type_continuation(c: &mut Client, tab: &str, text: &str, fence_every: Duration) -> Continued {
     for _ in 0..CONTINUE_FENCE_TRIES {
-        let generation = match typing_fence(c, tab) {
-            Ok(generation) => generation,
+        let (generation, human) = match typing_fence(c, tab) {
+            Ok(fenced) => fenced,
             Err("changed") => {
                 pause(fence_every);
                 continue;
@@ -2762,18 +3325,22 @@ fn type_continuation(c: &mut Client, tab: &str, text: &str, fence_every: Duratio
             Err("box") => return Continued::Stands("wait:box"),
             Err(_) => return Continued::Not,
         };
-        match turn_fenced(c, tab, text, generation.as_deref()) {
+        match turn_fenced(c, tab, text, generation.as_deref(), human) {
             Ok(()) => return Continued::Typed,
             Err(Typed::Changed | Typed::Yielded) => pause(fence_every),
+            // The person's gesture since the read: their grace is the carry's next step's to wait
+            // out, never a retry's a moment on.
+            Err(Typed::Person) => return Continued::Stands("wait:held"),
             Err(Typed::Cut(_) | Typed::Refused(_)) => return Continued::Not,
             Err(Typed::Unanswered) => return Continued::Unanswered,
         }
     }
-    if !composer_clear(c, tab) {
+    let Some(clear) = composer_clear(c, tab) else {
         return Continued::Stands("wait:draft");
-    }
-    match turn_fenced(c, tab, text, None) {
+    };
+    match turn_fenced(c, tab, text, None, clear.human_seq) {
         Ok(()) => Continued::Typed,
+        Err(Typed::Person) => Continued::Stands("wait:held"),
         Err(Typed::Unanswered) => Continued::Unanswered,
         Err(_) => Continued::Not,
     }
@@ -2799,6 +3366,7 @@ pub(super) fn type_carry(
         match type_text(c, generation.as_deref()) {
             Ok(()) => return Continued::Typed,
             Err(Typed::Changed | Typed::Yielded) => pause(fence_every),
+            Err(Typed::Person) => return Continued::Stands("wait:held"),
             Err(Typed::Cut(_) | Typed::Refused(_)) => return Continued::Not,
             Err(Typed::Unanswered) => return Continued::Unanswered,
         }
@@ -3144,6 +3712,11 @@ pub const IN_FLIGHT_OTHER: &str = "wait:restart-in-flight";
 /// ([`native_carried`]).
 pub const NATIVE_CARRIED: &str = "wait:native-carried";
 
+/// What a restart in place answers where the conversation's record is the asked restart's own,
+/// its relaunch already carried on in the very process asking ([`already_made`]): the restart was
+/// made, and nothing is signalled again.
+pub const ALREADY_MADE: &str = "done:made";
+
 /// What a restart in place answers where it was asked of another process than the tab's agent
 /// now ([`asked_of`]): the process it was asked of no longer holds the tab, and no other process
 /// is restarted in its place.
@@ -3196,8 +3769,59 @@ pub(super) fn supersedes(
     !matches!(why, Restart::Account { .. })
         && !its_own(why, ask, st)
         && matches!(st.phase, upgrade::Phase::Relaunched { .. })
-        && (st.relaunched_pid == sf.pid
-            || relaunch_of(k, sf, session, st.pid, st.shell) == Relaunch::Ours)
+        && landed_in(st, sf, session, k)
+}
+
+/// Whether the relaunch the record `st` holds landed in the agent `sf` names: adopted there
+/// (`relaunched_pid`), or the process its line started, by its parent (`k`'s read,
+/// [`relaunch_of`]).
+fn landed_in(st: &St, sf: &SessionFile, session: &str, k: &dyn Kernel) -> bool {
+    st.relaunched_pid == sf.pid || relaunch_of(k, sf, session, st.pid, st.shell) == Relaunch::Ours
+}
+
+/// WHETHER THE RESTART `why`, ASKED AGAIN AS `ask` BY THE AGENT `sf` NAMES IN TAB `tab`, IS ALREADY
+/// MADE ([`ALREADY_MADE`]): the conversation's record `st` is its own ([`its_own`]: an ask of that
+/// restart claimed it, of its cause), its relaunch carried on (`Done`) in that tab and landed in
+/// the asker ([`carried_on_in`]). A restart whose relaunch answered a wait once its signal had gone
+/// (`wait:resume`, `wait:exiting`, `wait:shell-prompt`) is asked again under the same ask, and the
+/// sweep may carry its relaunch on first: made again over that record, it would end the process
+/// its own relaunch started, a second relaunch for one restart (a model's way back, put off to a
+/// quiet moment, the loop asks until it books it made). A record another ask claimed is another
+/// restart's, and one landed in another process says nothing of the asker: either is restarted
+/// over as any record that is not in flight.
+pub(super) fn already_made(
+    why: &Restart,
+    ask: &RestartAsk,
+    st: &St,
+    tab: &str,
+    (sf, session): (&SessionFile, &str),
+    k: &dyn Kernel,
+) -> bool {
+    matches!(st.phase, upgrade::Phase::Done)
+        && st.tab == tab
+        && its_own(why, ask, st)
+        && carried_on_in(st, sf, session, k)
+}
+
+/// How long after a relaunched agent's start its record may be carried on (`St::done_at`) and
+/// still be read as that relaunch's ([`carried_on_in`]): the whole seconds both clocks round to.
+const CARRIED_ON_SLACK_S: u64 = 5;
+
+/// Whether the relaunch the carried-on record `st` holds landed in the agent `sf` names: adopted
+/// there (`relaunched_pid`), or the process its line started by its parent (`k`'s read,
+/// [`relaunch_of`]) where that process was up by the time the record was carried on (`done_at`,
+/// within [`CARRIED_ON_SLACK_S`]; a start or carry-on unread is no evidence against it). The
+/// relaunch's own process was up before its record was carried on; one started after that in the
+/// record's shell on the same conversation (`claude -c` typed once the relaunch ended) is another
+/// launch, whatever model it runs, which a re-ask restarts over.
+fn carried_on_in(st: &St, sf: &SessionFile, session: &str, k: &dyn Kernel) -> bool {
+    let up_by_carry_on = || {
+        st.done_at == 0
+            || super::upgrade_models::parse_lstart(&squash(&sf.proc_start))
+                .is_none_or(|began| began <= st.done_at.saturating_add(CARRIED_ON_SLACK_S))
+    };
+    st.relaunched_pid == sf.pid
+        || (relaunch_of(k, sf, session, st.pid, st.shell) == Relaunch::Ours && up_by_carry_on())
 }
 
 /// The word [`restart_as`] answers after carrying a record the restart asked supersedes but for
@@ -3221,7 +3845,8 @@ pub(super) fn native_carried(step: String) -> String {
 /// ([`model_restart`]: a memory restart's, a model's move onto the same model, its way back, a lost
 /// line's). Asked again after a deferral, a restart meets its own record wherever the relaunch of
 /// the ask that claimed it landed, its first ask's or a later one's: carried, it adopts the process
-/// that relaunch started, which superseding would end, a second relaunch for one restart. Any other
+/// that relaunch started, which superseding would end, a second relaunch for one restart; carried
+/// on already (`Done`), it is made ([`already_made`]). Any other
 /// record of its cause is another restart's, made before this one was asked and landed in the
 /// process now asking (an earlier memory restart's, a model's earlier move, an earlier line's), and
 /// so is one met where this restart's first ask was deferred before it claimed anything
@@ -3434,9 +4059,10 @@ pub fn resumed_prompt_as(agent: &str, version: &str, cause: &str) -> String {
     )
 }
 
-/// The restart in place `why`, asked as `ask` ([`RestartAsk`]).
+/// The restart in place `why`, asked as `ask` ([`RestartAsk`]): its report and its claim
+/// ([`Restarted`]).
 #[must_use]
-pub fn restart_here(opts: &Opts, why: &Restart, ask: &RestartAsk) -> Report {
+pub fn restart_here(opts: &Opts, why: &Restart, ask: &RestartAsk) -> Restarted {
     restart_from(opts, why, ask, snapshot(opts))
 }
 
@@ -3448,7 +4074,7 @@ pub fn restart_under(
     ask: &RestartAsk,
     roster: &accounts::Roster,
     selected: &AccountRestart,
-) -> Report {
+) -> Restarted {
     restart_as(
         opts,
         why,
@@ -3545,29 +4171,6 @@ pub fn runs_under(snap: &Snapshot, roster: &accounts::Roster, label: &str) -> bo
     roster
         .row_for_login(snap.login.as_deref())
         .is_some_and(|row| row.label == label)
-}
-
-/// The login a relaunch with no process to read (a cold restore) carries.
-#[must_use]
-pub fn cold_login(
-    roster: &accounts::Roster,
-    state: &accounts::State,
-    enrolled: &std::collections::BTreeSet<String>,
-    default_home: bool,
-) -> Option<String> {
-    if !default_home {
-        return None;
-    }
-    let here = |row: &accounts::Row| row.dir.is_none() || enrolled.contains(&row.label);
-    if roster.rows.iter().filter(|row| here(row)).count() < 2 {
-        return None;
-    }
-    let active = state.active.as_deref().filter(|_| state.proven)?;
-    let row = roster.row(active).filter(|row| here(row))?;
-    if state.account(active).current_auth(row) == accounts::Auth::SignedOut {
-        return None;
-    }
-    Some(accounts::login_env(row).1)
 }
 
 /// How a session of a pooled CLI other than Claude Code is relaunched ([`pool_line`]).
@@ -3871,7 +4474,7 @@ pub(super) fn restart_from(
     why: &Restart,
     ask: &RestartAsk,
     snap: Result<Snapshot, &'static str>,
-) -> Report {
+) -> Restarted {
     restart_with(opts, why, ask, snap, &Live)
 }
 
@@ -3882,7 +4485,7 @@ pub(super) fn restart_with(
     ask: &RestartAsk,
     snap: Result<Snapshot, &'static str>,
     k: &dyn Kernel,
-) -> Report {
+) -> Restarted {
     restart_as(opts, why, ask, &accounts::Roster::default(), snap, None, k)
 }
 
@@ -3891,12 +4494,107 @@ pub(super) fn account_login(roster: &accounts::Roster, label: &str) -> Option<St
     roster.row(label).map(|row| accounts::login_env(row).1)
 }
 
+/// WHAT A RESTART IN PLACE ANSWERED ([`restart_as`]): its report, and what it read of the
+/// conversation's record once it answered ([`RestartClaim`], the loop's
+/// [`crate::supervise::policy::turn_end::RestartAnswer::claim`]), read back from the record as the
+/// restart left it, under the sweep's lock it held ([`claim_of`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Restarted {
+    /// The restart's report: its step, and the agent's pid it names.
+    pub report: Report,
+    /// What the restart read of the conversation's record once it answered.
+    pub claim: RestartClaim,
+}
+
+impl Restarted {
+    /// `report`, where the restart read no record ([`RestartClaim::Unread`]).
+    fn unread(report: Report) -> Self {
+        Self {
+            report,
+            claim: RestartClaim::Unread,
+        }
+    }
+}
+
+/// HOW FAR A RESTART IN PLACE WENT WITH THE CONVERSATION'S RECORD ([`restart_locked`]), by which
+/// [`restart_as`] reads its claim back ([`claim_of`]).
+#[derive(Debug)]
+enum Met {
+    /// No record read: no session record of the asker named.
+    Unread,
+    /// The record read and left as it stood: another tab's in flight, or an account move's
+    /// deferred over one.
+    Stood,
+    /// The record in flight carried.
+    Carried,
+    /// The asked restart's own record found carried on in the asker ([`already_made`]).
+    Made,
+    /// A claim of the restart's own asked for, over the record that stood before (`None`: none),
+    /// boxed so the other variants stay small.
+    Claiming(Option<Box<St>>),
+}
+
+/// THE CLAIM [`restart_as`] SAYS ([`RestartClaim`]), read back from the conversation's record as
+/// the restart left it (`report` names its session) by how far it went (`met`). The record holds
+/// the asked restart's claim live where it is that restart's own ([`its_own`]) and its relaunch
+/// is in flight or carried on ([`claim_live`]): held where the restart carried that record (in
+/// the asker's tab, as only such a record is carried) or found it made, taken where the restart
+/// asked a claim of its own and the record is no longer the one that stood before (a record this
+/// restart writes is the asker's tab's). Anything else read holds no live claim of the restart's:
+/// another's record, another tab's in flight (left as it stood), its own stopped or failed unmade,
+/// its own retired unissued (as the restart found it or left it), its own claim unwritten or
+/// restored, its own carried on in another process than the asker (left as it stood).
+fn claim_of(
+    opts: &Opts,
+    why: &Restart,
+    ask: &RestartAsk,
+    report: &Report,
+    met: Met,
+) -> RestartClaim {
+    let live = || load(opts, &report.session).filter(|st| its_own(why, ask, st) && claim_live(st));
+    match met {
+        Met::Unread => RestartClaim::Unread,
+        Met::Stood => RestartClaim::Unclaimed,
+        Met::Made => RestartClaim::Held,
+        Met::Carried if live().is_some() => RestartClaim::Held,
+        Met::Claiming(prior) if live().is_some_and(|st| prior.as_deref() != Some(&st)) => {
+            RestartClaim::Taken
+        }
+        Met::Carried | Met::Claiming(_) => RestartClaim::Unclaimed,
+    }
+}
+
+/// Whether the claim the record `st` holds is live: its relaunch in flight ([`St::in_flight`]),
+/// which a re-ask under its ask carries, or carried on (`Done`), which a re-ask answers made where
+/// it landed in the asker ([`already_made`]). A relaunch stopped or failed (`Failed`) made nothing:
+/// a re-ask over its record restarts afresh. One retired unissued (`native_retired_unissued`: its
+/// native command positively not granted, the record held durably so the conversation is kept)
+/// is in flight by [`St::in_flight`] for good, yet nothing of it is under way or ever will be:
+/// every re-ask over it waits ([`native_restart::WAIT_RETIRED_UNISSUED`]), so it holds no live
+/// claim.
+///
+/// [`native_restart::WAIT_RETIRED_UNISSUED`]: super::native_restart::WAIT_RETIRED_UNISSUED
+fn claim_live(st: &St) -> bool {
+    !st.native_retired_unissued && (st.in_flight() || st.phase == upgrade::Phase::Done)
+}
+
 /// [`restart_with`] under `roster` ([`restart_under`]). A restart asked of another process than
 /// the tab's agent makes none ([`asked_of`]); the conversation's record in flight answers the
 /// restart asked by being carried ([`carried_word`]) unless the restart supersedes it
 /// ([`supersedes`]), and one it supersedes that still holds a native restart's operation is
-/// carried first and answered by [`native_carried`], superseded at the restart's re-ask; the
-/// record it claims keeps its `ask` ([`St::ask`]).
+/// carried first and answered by [`native_carried`], superseded at the restart's re-ask; its own
+/// record already carried on in the asker answers [`ALREADY_MADE`] ([`already_made`]); the record
+/// it claims keeps its `ask` ([`St::ask`]). THE CLAIM IS SAID HERE, ONCE ([`Restarted::claim`],
+/// [`claim_of`]): with the sweep's lock still held, the conversation's record as the restart left
+/// it is read back. An answer given before any record is read (an account move not listed or not
+/// admitted, another sweep's lock, a snapshot of another tab or none, one of a process the
+/// restart was not asked of or with no shell job, one that names no session record) is
+/// [`RestartClaim::Unread`], whoever's the record is. Past that, the claim is
+/// [`RestartClaim::Taken`] where this answer wrote the record as the asked restart's own and its
+/// claim is live (a relaunch landed or in flight, its signal gone; a native move's record saved),
+/// [`RestartClaim::Held`] where this answer carried the restart's own record in flight and it is
+/// live still, or found it made, and [`RestartClaim::Unclaimed`] otherwise. No account move's
+/// record is its own, so no account move's answer holds or takes a claim.
 pub(super) fn restart_as(
     opts: &Opts,
     why: &Restart,
@@ -3905,11 +4603,11 @@ pub(super) fn restart_as(
     snap: Result<Snapshot, &'static str>,
     selected: Option<&AccountRestart>,
     k: &dyn Kernel,
-) -> Report {
+) -> Restarted {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
-    let mut r = Report {
+    let r = Report {
         pid: 0,
-        tab: tab.clone(),
+        tab,
         session: "-".to_string(),
         from: "-".to_string(),
         to: "-".to_string(),
@@ -3918,17 +4616,39 @@ pub(super) fn restart_as(
     let target = match why {
         Restart::Account { to, .. } => match account_login(roster, to) {
             Some(login) => Some(login),
-            None => return said(r, "refused:account-not-listed"),
+            None => return Restarted::unread(said(r, "refused:account-not-listed")),
         },
         _ => None,
     };
     if !restart_admitted(why, roster, &snap, selected) {
-        return said(r, "wait:account-changed");
+        return Restarted::unread(said(r, "wait:account-changed"));
     }
     let _held = match sweep_lock(opts) {
         Ok(lock) => lock,
-        Err(why) => return said(r, format!("busy:{why}")),
+        Err(why) => return Restarted::unread(said(r, format!("busy:{why}"))),
     };
+    let mut met = Met::Unread;
+    let report = restart_locked(opts, why, ask, snap, selected, k, r, target, &mut met);
+    let claim = claim_of(opts, why, ask, &report, met);
+    Restarted { report, claim }
+}
+
+/// [`restart_as`] past its admission, under the sweep's lock: `r` the report so far, `target` the
+/// login an account move's line carries, `met` set to how far it went with the conversation's
+/// record ([`Met`]).
+#[allow(clippy::too_many_arguments)]
+fn restart_locked(
+    opts: &Opts,
+    why: &Restart,
+    ask: &RestartAsk,
+    snap: Result<Snapshot, &'static str>,
+    selected: Option<&AccountRestart>,
+    k: &dyn Kernel,
+    mut r: Report,
+    target: Option<String>,
+    met: &mut Met,
+) -> Report {
+    let tab = r.tab.clone();
     let snap = match snap {
         Ok(snap) if snap.tab == tab => snap,
         Ok(_) => return said(r, "wait:tab-identity-conflict"),
@@ -3954,7 +4674,11 @@ pub(super) fn restart_as(
     r.from.clone_from(&sf.version);
     r.to = format!("{}(same)", sf.version);
     let prior = load(opts, &session);
+    *met = Met::Stood;
     if let Some(st) = prior.clone().filter(St::in_flight) {
+        if st.native_retired_unissued {
+            return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+        }
         if st.tab != tab {
             return said(r, "wait:conversation-in-other-tab");
         }
@@ -3965,6 +4689,7 @@ pub(super) fn restart_as(
         let native = st.native.is_some() || !st.native_prepare.is_empty();
         if !supersedes || native {
             let cause = st.cause.clone();
+            *met = Met::Carried;
             let carried = carry_in_flight(opts, r, st, &session, &tab);
             let step = if supersedes {
                 native_carried(carried.step.clone())
@@ -3974,6 +4699,14 @@ pub(super) fn restart_as(
             return said(carried, step);
         }
     }
+    if prior
+        .as_ref()
+        .is_some_and(|st| already_made(why, ask, st, &tab, (&sf, &session), k))
+    {
+        *met = Met::Made;
+        return said(r, ALREADY_MADE);
+    }
+    *met = Met::Claiming(prior.clone().map(Box::new));
     if upgrade::one_shot(&snap.argv) {
         return said(r, "refused:one-shot");
     }
@@ -4025,6 +4758,8 @@ pub(super) fn restart_as(
         homedir: None,
         login: login.as_deref(),
         stored_login: snap.stored_login,
+        auth_observed: snap.auth_observed,
+        launch_env: snap.launch_env.as_ref(),
         billing: if riding_move || matches!(why, Restart::Model { .. } | Restart::ModelBack { .. })
         {
             ModelBilling::Move(snap.profile.as_ref())
@@ -4097,7 +4832,7 @@ pub(super) fn restart_as(
                 .as_ref()
                 .is_some_and(|(p, name)| owned_by_aterm((*p, name.as_str())))
             && screen(&mut c, &tab).is_some_and(|scr| at_rest_for(why, &mut c, &tab, &scr))
-            && live_background(snap.pid).is_empty()
+            && !background_holds(snap.pid)
             && !held(&mut c, &tab, opts.human_grace_s);
         if !still {
             break 'signal Some(said(r.clone(), "wait:changed"));
@@ -4119,6 +4854,9 @@ pub(super) fn restart_as(
         st.shell = shell;
         st.tab.clone_from(&tab);
         st.line = line;
+        st.account_intent = command
+            .as_ref()
+            .and_then(|command| command.account_intent.clone());
         st.line_dir = line_dir.unwrap_or_default();
         st.line_grace_s = Some(opts.human_grace_s);
         st.phase = upgrade::Phase::Exiting { at_s: now_s() };
@@ -4142,11 +4880,25 @@ pub(super) fn restart_as(
         if matches!(admission, Ok(super::native_restart::Recovery::Retired)) {
             break 'signal Some(said(r.clone(), "failed:native-cohort-retired"));
         }
+        if matches!(admission, Ok(super::native_restart::Recovery::Held)) {
+            break 'signal Some(said(
+                r.clone(),
+                super::native_restart::WAIT_RETIRED_UNISSUED,
+            ));
+        }
         if let Err(why) = admission {
-            if st.native_prepare.is_empty() || super::native_restart::abort(&mut c, &tab, &mut st) {
+            if st.native_prepare.is_empty()
+                || super::native_restart::abort(opts, &session, &mut c, &tab, &mut st)
+            {
                 restore(opts, &session, prior.as_ref());
             } else {
                 save(opts, &session, &st);
+            }
+            if st.native_retired_unissued {
+                break 'signal Some(said(
+                    r.clone(),
+                    super::native_restart::WAIT_RETIRED_UNISSUED,
+                ));
             }
             break 'signal Some(said(r.clone(), format!("wait:{why}")));
         }
@@ -4154,14 +4906,20 @@ pub(super) fn restart_as(
             && (selected.is_some_and(|s| !s.is_current())
                 || foreground_shell(k.job(snap.pid)) != Ok(shell)
                 || !screen(&mut c, &tab).is_some_and(|scr| at_rest_for(why, &mut c, &tab, &scr))
-                || !live_background(snap.pid).is_empty()
+                || background_holds(snap.pid)
                 || held(&mut c, &tab, opts.human_grace_s)
                 || records.unique_owner(&sf).is_err())
         {
-            if super::native_restart::abort(&mut c, &tab, &mut st) {
+            if super::native_restart::abort(opts, &session, &mut c, &tab, &mut st) {
                 restore(opts, &session, prior.as_ref());
             } else {
                 save(opts, &session, &st);
+            }
+            if st.native_retired_unissued {
+                break 'signal Some(said(
+                    r.clone(),
+                    super::native_restart::WAIT_RETIRED_UNISSUED,
+                ));
             }
             break 'signal Some(said(r.clone(), "wait:changed-after-native-admission"));
         }
@@ -4207,8 +4965,9 @@ pub(super) fn restart_as(
 /// ([`over_own_work`]); and the composer empty, or, for an account move, a sign-in menu drawn in
 /// the composer's place ([`TurnEndReading::sign_in_menu_drawn`]), where nothing typed stands to
 /// lose and the login the move leaves is the menu's own. The processes under the agent (a shell,
-/// a monitor) are the process table's to say ([`live_background`]); this reads the work Claude
-/// Code runs in its own process, which no process row names.
+/// a monitor) are the process table's to say too ([`live_background`]); this reads the work the
+/// screen names, among it the work no process row names ([`aterm_phase::phase::unlisted_work`]:
+/// the work Claude Code runs in its own process, any other work its footer's pill counts).
 fn at_rest_for(why: &Restart, c: &mut Client, tab: &str, scr: &Screen) -> bool {
     (over_own_work(why) || aterm_phase::phase::work_running(&scr.rows).is_none())
         && (composer_empty(c, tab, scr)
@@ -4273,8 +5032,15 @@ pub struct Snapshot {
     pub claude_dir: Option<PathBuf>,
     /// Whether it authenticates by its stored login, by its own exec environment ([`accounts::ProcessLogin::of_exec_env`]'s `stored_login`).
     pub stored_login: bool,
+    /// Whether Claude's authentication attribution was captured, rather than omitted by a legacy restore.
+    /// Other providers carry their authentication provenance in their own run fields.
+    pub auth_observed: bool,
     /// The exact profile paths and filename selector captured from this process's own exec environment and resolved records.
     pub profile: Option<super::profile::Context>,
+    /// What its cold account admission reads of the environment its shell passed it, read from
+    /// its own exec environment with the rest of this snapshot ([`accounts::LaunchEnv`]): the
+    /// base that admission reads where the shell's own environment cannot be read.
+    pub launch_env: Option<accounts::LaunchEnv>,
 }
 
 impl Snapshot {
@@ -4312,12 +5078,16 @@ impl Snapshot {
             home,
             claude_dir,
             stored_login,
+            auth_observed,
             profile,
             cwd: _,
             session: _,
             version: _,
             shell: _,
             dialect: _,
+            // Read from the same exec environment as `login`, `home` and `stored_login`, which
+            // are compared: a record carried from an older layout without it is the same context.
+            launch_env: _,
         } = self;
         (
             tab,
@@ -4343,7 +5113,7 @@ impl Snapshot {
             &other.claude_dir,
             &other.stored_login,
             &other.profile,
-        )
+        ) && (!matches!(run, AgentRun::Claude) || auth_observed == &other.auth_observed)
     }
 
     /// The agent it is of, by its run ([`Snapshot::run`]).
@@ -4726,9 +5496,14 @@ pub fn snapshot_with_claim(
     opts: &Opts,
     claim: Option<&super::self_claimed::Copy>,
 ) -> Result<Snapshot, &'static str> {
-    let snap = snapshot_with_claimed(opts, &Live, claim)?;
-    super::native_restart::observe_live(opts, &snap);
-    Ok(snap)
+    snapshot_with_claimed(opts, &Live, claim)
+}
+
+/// Retain passive native crash evidence only after the host published this snapshot.
+/// The caller must release its publication locks before this control exchange; the observer
+/// still verifies that the exact vendor and shell are live before registering either one.
+pub fn observe_published(opts: &Opts, snap: &Snapshot) {
+    super::native_restart::observe_live(opts, snap);
 }
 
 /// The lane that reads a tab's foreground agent ([`snapshot_with`]).
@@ -4859,7 +5634,9 @@ pub fn snapshot_of_copy(
         home: None,
         claude_dir: None,
         stored_login: false,
+        auth_observed: false,
         profile: None,
+        launch_env: None,
     }
 }
 
@@ -4970,7 +5747,9 @@ fn snapshot_with_claimed(
         claude_dir: records.dir().map(Path::to_path_buf),
         stored_login: accounts::ProcessLogin::of_exec_env(&args.env)
             .is_some_and(|who| who.stored_login),
+        auth_observed: !args.env.is_empty(),
         profile: records.billing_context(&opts.home, &args),
+        launch_env: accounts::LaunchEnv::of_exec_env(&args.env),
     })
 }
 
@@ -5226,7 +6005,46 @@ pub fn after_exit(
         Some(super::restart_stamp::Cause::Asked) => ExitCause::Asked,
         None => ExitCause::Exit,
     };
-    after_exit_as(opts, snap, left, upgrade, cause, None)
+    after_exit_as(opts, snap, left, upgrade, cause, None, None)
+}
+
+/// Admission for a newly planned execution, after ended exits and existing durable plans are resolved.
+pub enum ColdAdmission {
+    Immediate(Option<Box<Snapshot>>),
+    Deferred(super::native_act::ColdIntent),
+}
+
+impl ColdAdmission {
+    /// Retain a resolved snapshot without enlarging every deferred admission.
+    pub fn immediate(snapshot: Option<Snapshot>) -> Self {
+        Self::Immediate(snapshot.map(Box::new))
+    }
+}
+
+pub type Admission<'a> = dyn Fn(&Snapshot) -> Result<ColdAdmission, String> + 'a;
+
+/// [`after_exit`] with account admission only where a new command will be planned.
+/// Existing in-flight commands retain their already-recorded execution context.
+#[must_use]
+pub fn after_exit_admitting(
+    opts: &Opts,
+    snap: &Snapshot,
+    left: &ExitRecord,
+    upgrade: bool,
+    asked: Option<super::restart_stamp::Cause>,
+    carried: bool,
+    admit: &Admission<'_>,
+) -> Report {
+    let cause = if carried {
+        ExitCause::Carried
+    } else {
+        match asked {
+            Some(super::restart_stamp::Cause::Stall) => ExitCause::Stall,
+            Some(super::restart_stamp::Cause::Asked) => ExitCause::Asked,
+            None => ExitCause::Exit,
+        }
+    };
+    after_exit_as(opts, snap, left, upgrade, cause, None, Some(admit))
 }
 
 /// [`after_exit`] of an exit an Autopilot carries ([`Carried::Yes`]): relaunched on its
@@ -5239,7 +6057,7 @@ pub fn after_carried_exit(
     left: &ExitRecord,
     upgrade: bool,
 ) -> Report {
-    after_exit_as(opts, snap, left, upgrade, ExitCause::Carried, None)
+    after_exit_as(opts, snap, left, upgrade, ExitCause::Carried, None, None)
 }
 
 /// Whose an exit [`on_exit`] found nobody owns is, under the session's Autopilot ([`carried`]).
@@ -5357,6 +6175,27 @@ pub fn after_host_ended_from(
         upgrade,
         ExitCause::HostEnded,
         was,
+        None,
+    )
+}
+
+/// Host-ended relaunch with explicit account admission for a new plan.
+#[must_use]
+pub fn after_host_ended_admitting(
+    opts: &Opts,
+    snap: &Snapshot,
+    upgrade: bool,
+    was: Option<&str>,
+    admit: &Admission<'_>,
+) -> Report {
+    after_exit_as(
+        opts,
+        snap,
+        &ExitRecord::Unread,
+        upgrade,
+        ExitCause::HostEnded,
+        was,
+        Some(admit),
     )
 }
 
@@ -5387,6 +6226,7 @@ fn after_exit_as(
     upgrade: bool,
     cause: ExitCause,
     was: Option<&str>,
+    admit: Option<&Admission<'_>>,
 ) -> Report {
     match &snap.run {
         AgentRun::Codex(_) => {
@@ -5469,6 +6309,9 @@ fn after_exit_as(
     }
     let mut relaunched_before = false;
     if let Some(mut st) = load(opts, &session).filter(St::in_flight) {
+        if st.native_retired_unissued {
+            return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+        }
         r.to = format!("{}({})", st.to, st.source);
         if st.tab != snap.tab && cause != ExitCause::HostEnded {
             return said(r, "wait:conversation-in-other-tab");
@@ -5525,6 +6368,18 @@ fn after_exit_as(
     if !alive(snap.shell) {
         return said(r, "refused:shell-gone");
     }
+    let (admitted, mut cold) = match admit {
+        Some(admit) => match admit(snap) {
+            Ok(ColdAdmission::Immediate(chosen)) => (chosen, None),
+            Ok(ColdAdmission::Deferred(intent)) => (None, Some(intent)),
+            Err(why) => {
+                aterm_log::info!("harness @{}: live account admission waits: {why}", snap.tab);
+                return said(r, "wait:account");
+            }
+        },
+        None => (None, None),
+    };
+    let snap = admitted.as_deref().unwrap_or(snap);
     let running = version.as_deref().and_then(Version::parse);
     let candidates = if upgrade {
         let native = native_root(&opts.home);
@@ -5578,6 +6433,8 @@ fn after_exit_as(
         homedir: None,
         login: snap.login.as_deref(),
         stored_login: snap.stored_login,
+        auth_observed: snap.auth_observed,
+        launch_env: snap.launch_env.as_ref(),
         billing: if riding.is_some() {
             ModelBilling::Move(snap.profile.as_ref())
         } else {
@@ -5637,13 +6494,22 @@ fn after_exit_as(
             .map(|p| tail_to_end(&p, TAIL_BYTES));
         (st.model_before, st.mark) = model_and_mark(recent.as_ref());
     }
+    if let Some(intent) = &mut cold {
+        intent.billing = match launch.billing {
+            ModelBilling::Keep => super::native_act::ColdBilling::Keep,
+            ModelBilling::Move(_) if opts.usage_credits => {
+                super::native_act::ColdBilling::UsageCredits
+            }
+            ModelBilling::Move(_) => super::native_act::ColdBilling::PreserveProfile,
+        };
+    }
     let planned =
         home_carried(&opts.home, snap.home.as_deref(), &cwd, &records).and_then(|homedir| {
             let launch = Launch {
                 homedir: homedir.as_deref(),
                 ..launch
             };
-            plan(opts, &launch, snap.shell, &table())
+            plan_with_cold(opts, &launch, snap.shell, &table(), cold)
         });
     let plan = match planned {
         Ok(p) => p,
@@ -5686,6 +6552,7 @@ fn launch_after_exit(
         tap_dropped,
         line_dir,
         command,
+        cold,
         ..
     } = plan;
     let session = r.session.clone();
@@ -5693,6 +6560,9 @@ fn launch_after_exit(
     st.shell = shell;
     st.tab.clone_from(&snap.tab);
     st.line = line;
+    st.account_intent = command
+        .as_ref()
+        .and_then(|command| command.account_intent.clone());
     st.line_dir = line_dir.unwrap_or_default();
     st.phase = upgrade::Phase::Exiting { at_s: now_s() };
     if opts.token.is_some() || super::native_restart::coordinated(&st) {
@@ -5703,11 +6573,15 @@ fn launch_after_exit(
             &session,
             snap,
             command.as_ref(),
+            cold.as_ref(),
         ) {
             Ok(super::native_restart::Recovery::Admitted) => {}
             Ok(super::native_restart::Recovery::Completed) => return said(r, "wait:relaunched"),
             Ok(super::native_restart::Recovery::Retired) => {
                 return said(r, "failed:native-cohort-retired");
+            }
+            Ok(super::native_restart::Recovery::Held) => {
+                return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
             }
             Ok(super::native_restart::Recovery::Legacy) => {}
             Ok(super::native_restart::Recovery::Cancelled) => {
@@ -5737,6 +6611,9 @@ pub(super) fn exit_fallback(
 }
 
 fn carry_in_flight(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) -> Report {
+    if st.native_retired_unissued {
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     if opts.dry_run {
         return said(r, format!("would-resume:{}", st.phase.word()));
     }
@@ -5860,6 +6737,15 @@ pub fn carry_line_grace(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) ->
     })
 }
 
+/// Whether the agent `pid`'s own background work holds its restart in place: a shell of its job
+/// still runs, or the process table reads empty, so none can be ruled out. [`restart_as`]'s
+/// signal refuses the restart then (`wait:changed`), and an account move asks this first, so it
+/// takes no row from another session for a relaunch this would refuse.
+#[must_use]
+pub fn background_holds(pid: u32) -> bool {
+    !live_background(pid).is_empty()
+}
+
 /// The label of the account move whose restart signalled the Claude Code `pid` of tab `opts.only_sid`.
 #[must_use]
 pub fn account_restart(opts: &Opts, pid: u32) -> Option<String> {
@@ -5942,6 +6828,9 @@ fn told_by_its_row(opts: &Opts, r: Report, session: &str) -> Report {
 }
 
 fn carry_own_step(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) -> Report {
+    if st.native_retired_unissued {
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     let refused = |r: Report, why: &str| {
         said(
             r,
@@ -6150,6 +7039,7 @@ pub fn carry_owed_of(opts: &Opts, only: Option<upgrade::Agent>) -> bool {
     };
     record_where(opts, |st| {
         st.tab == tab
+            && !st.native_retired_unissued
             && matches!(st.phase, upgrade::Phase::Relaunched { .. })
             && !resumes_quietly(st)
             && only.is_none_or(|agent| st.agent == agent)
@@ -6175,6 +7065,9 @@ fn owed_record(opts: &Opts, only: Option<upgrade::Agent>) -> Option<(String, St)
         }
         let session = path.file_stem()?.to_string_lossy().into_owned();
         let st = load(opts, &session)?;
+        if st.native_retired_unissued {
+            return None;
+        }
         // A look is its resumed agent's: once that agent is gone, whatever runs next in the tab
         // is owed nothing of it, and a sweep's confirmations close it ([`restore_look`]).
         let due = matches!(st.phase, upgrade::Phase::Relaunched { .. })
@@ -6494,6 +7387,9 @@ fn carried_done(opts: &Opts, r: Report, session: &str, (word, why): (&str, &str)
     else {
         return r;
     };
+    if st.native_retired_unissued {
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     st.phase = upgrade::Phase::Done;
     st.done_at = now_s();
     st.outcome = nothing_typed(st.agent, &st.to, why);
@@ -6590,6 +7486,12 @@ pub(super) fn settle_look(
     key: &str,
     now: u64,
 ) -> Option<Report> {
+    if st.native_retired_unissued {
+        return Some(said(
+            r.clone(),
+            super::native_restart::WAIT_RETIRED_UNISSUED,
+        ));
+    }
     let records = st.agent_records(&opts.home);
     if alive(st.resumed_pid) && look_warned(&records, key, st) {
         return Some(match told_nothing(opts, &records, key, st) {
@@ -6620,7 +7522,7 @@ pub enum Outcome {
     Left(String),
     /// Not now, and why (a busy tab, a shell not back yet, a relaunch that did not register).
     NotYet(String),
-    /// Another aterm actor holds the upgrade state.
+    /// Account admission, a hand or another aterm actor holds the attempt before launch.
     Busy,
     /// Never, and why: an interactive conversation that cannot come back (an uncarryable launch, a gone shell).
     Cannot(String),
@@ -6649,7 +7551,15 @@ pub fn outcome(step: &str) -> Outcome {
         .or_else(|| step.strip_prefix("told:"))
     {
         Outcome::Cannot(why.to_string())
-    } else if matches!(step, "busy:another-sweep" | WAIT_ACT_ENDS | WAIT_HAND_LIFTS) {
+    } else if matches!(
+        step,
+        "busy:another-sweep"
+            | WAIT_ACT_ENDS
+            | WAIT_HAND_LIFTS
+            | WAIT_ACCOUNT
+            | WAIT_NATIVE_UNISSUED
+            | super::native_restart::WAIT_RETIRED_UNISSUED
+    ) {
         Outcome::Busy
     } else if let Some(why) = step.strip_prefix("busy:") {
         // State directory cannot hold the lock.
@@ -6658,6 +7568,15 @@ pub fn outcome(step: &str) -> Outcome {
         Outcome::NotYet(step.to_string())
     }
 }
+
+/// Account admission held an attempt before planning or executing its launch.
+/// This wait neither spends a restart attempt nor erases an earlier failure.
+/// Other account waits may follow a dispatched restart and keep their own outcome.
+pub const WAIT_ACCOUNT: &str = "wait:account";
+
+/// Positive proof that the last native helper received no exec grant; the same
+/// owed command remains eligible without consuming launch-failure history.
+pub const WAIT_NATIVE_UNISSUED: &str = "wait:native-launch-unissued";
 
 /// What the host does when a supervised agent has left its tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6867,7 +7786,8 @@ pub const BACKOFF: [Duration; 4] = [
     Duration::from_secs(600),
 ];
 
-/// The look again after an [`Outcome::Busy`] step ([`WAIT_ACT_ENDS`], [`WAIT_HAND_LIFTS`], or another actor on the upgrade state).
+/// The look again after an [`Outcome::Busy`] step: account admission, a hand or
+/// another actor on the upgrade state ([`WAIT_ACCOUNT`], [`WAIT_ACT_ENDS`], [`WAIT_HAND_LIFTS`]).
 pub const BUSY: Duration = Duration::from_secs(10);
 
 /// An agent that ran this long since its last relaunch of a crash starts the back-off over.

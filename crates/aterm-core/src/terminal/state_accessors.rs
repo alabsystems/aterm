@@ -231,39 +231,19 @@ impl Terminal {
         self.color.reported_scheme().1
     }
 
-    /// [`Self::reconcile_color_scheme`] at the end of a process batch, where the change came from the program's own output (OSC 10/11/110/111, OSC 21, a colour-stack pop, RIS, DECSTR).
+    /// [`settle_color_scheme_after_output`] at the end of a process batch.
     pub(super) fn reconcile_color_scheme_after_output(&mut self) {
-        const PUSH_LEN: usize = b"\x1b[?997;1n".len();
-        if self.modes.color_scheme == self.color.reported_scheme().0 {
-            return;
-        }
-        if self.modes.report_color_scheme
-            && !super::handler::program_response_admitted(
-                &mut self.policy,
-                &mut self.transient,
-                PUSH_LEN,
-            )
-        {
-            return;
-        }
-        let _ = self.reconcile_color_scheme();
+        settle_color_scheme_after_output(
+            &mut self.modes,
+            &self.color,
+            &mut self.policy,
+            &mut self.transient,
+        );
     }
 
-    /// Bring the announced latch (`TerminalModes::color_scheme`) to the derived scheme, queueing the `CSI ? 997 ; Ps n` push when it moved and DEC 2031 is set.
+    /// [`reconcile_color_scheme_latch`] for a change the host made.
     pub(super) fn reconcile_color_scheme(&mut self) -> bool {
-        const PUSH_MAX_LEN: usize = 16;
-        let now = self.color.reported_scheme().0;
-        if self.modes.color_scheme == now {
-            return false;
-        }
-        self.modes.color_scheme = now;
-        if self.modes.report_color_scheme {
-            use std::fmt::Write as _;
-            let mut response = super::stack_response::StackResponse::<PUSH_MAX_LEN>::new();
-            let _ = write!(response, "\x1b[?997;{}n", now.dsr_code());
-            let _ = self.transient.push_report(response.as_bytes());
-        }
-        true
+        reconcile_color_scheme_latch(&mut self.modes, &self.color, &mut self.transient)
     }
 
     /// Whether an OSC 52 query the program sends now reaches the host's clipboard callback: one is installed and the query gate opens (authorized, or allowed by the installed policy). aterm-gui's `host_io_prefetch` reads the pasteboard, before it takes the terminal lock, only when this says yes.
@@ -336,20 +316,6 @@ impl Terminal {
             }
         } else {
             self.grid.seed_replay_carried_history(max_history);
-        }
-    }
-
-    /// Trim only the primary history between replayed input slices. A slice is
-    /// processed in full before this call, so it may still use every row it
-    /// created; the next recorded slice was admitted against this same suffix.
-    #[must_use]
-    pub fn trim_replay_history(&mut self, max_history: usize) -> bool {
-        if self.modes.alternate_screen {
-            self.alt_grid
-                .as_mut()
-                .is_none_or(|main| main.trim_replay_history(max_history))
-        } else {
-            self.grid.trim_replay_history(max_history)
         }
     }
 
@@ -756,6 +722,54 @@ impl Terminal {
 }
 
 use super::TerminalModes;
+
+/// Bring the announced latch (`TerminalModes::color_scheme`) to the derived scheme, queueing the `CSI ? 997 ; Ps n` push when it moved and DEC 2031 is set.
+pub(super) fn reconcile_color_scheme_latch(
+    modes: &mut TerminalModes,
+    color: &super::ColorState,
+    transient: &mut super::TransientState,
+) -> bool {
+    const PUSH_MAX_LEN: usize = 16;
+    let now = color.reported_scheme().0;
+    if modes.color_scheme == now {
+        return false;
+    }
+    modes.color_scheme = now;
+    if modes.report_color_scheme {
+        use std::fmt::Write as _;
+        let mut response = super::stack_response::StackResponse::<PUSH_MAX_LEN>::new();
+        let _ = write!(response, "\x1b[?997;{}n", now.dsr_code());
+        let _ = transient.push_report(response.as_bytes());
+    }
+    true
+}
+
+/// Settle the scheme the program's own output moved (OSC 10/11/110/111, OSC 21, a colour-stack
+/// pop) on the latch: at the end of a process batch, where the program moves DEC 2031 (a
+/// `?2031h`/`?2031l`, a RIS) and before it asks for the scheme (DSR 996), so that a read ending
+/// there would have settled it the same. Changes within one stretch coalesce into one push; one
+/// made while 2031 is set is pushed when the reply gates admit it (else the latch waits for a
+/// later settle), one made while it is reset moves the latch quietly. What 2031 owes a program
+/// that is gone is dropped instead: the prompt that proves an alternate-screen app dead clears
+/// the reports (`release_dead_app_reports`), and a handback's `?2031l` is preceded by a quiet
+/// latch (`foreground_handback`).
+pub(super) fn settle_color_scheme_after_output(
+    modes: &mut TerminalModes,
+    color: &super::ColorState,
+    policy: &mut super::policy_gates::PolicyState,
+    transient: &mut super::TransientState,
+) {
+    const PUSH_LEN: usize = b"\x1b[?997;1n".len();
+    if modes.color_scheme == color.reported_scheme().0 {
+        return;
+    }
+    if modes.report_color_scheme
+        && !super::handler::program_response_admitted(policy, transient, PUSH_LEN)
+    {
+        return;
+    }
+    let _ = reconcile_color_scheme_latch(modes, color, transient);
+}
 
 impl Terminal {
     /// Get a mutable reference to the terminal modes.

@@ -353,8 +353,25 @@ impl Frame {
         }
     }
 
-    fn payload(&self) -> Result<Vec<u8>, WireError> {
-        let mut p = Put(Vec::new());
+    /// The whole frame, header first.
+    ///
+    /// # Errors
+    /// Its payload is over [`MAX_FRAME`] bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
+        let cap = match self {
+            Self::Stdin(b) | Self::Out(b) | Self::Err(b) => {
+                if b.len() > MAX_FRAME {
+                    return Err(WireError::TooLarge(b.len() as u64));
+                }
+                HEADER + b.len()
+            }
+            Self::Poweroff | Self::StdinEof => HEADER,
+            Self::Kill(_) => HEADER + 4,
+            Self::Beat { .. } | Self::Clock { .. } => HEADER + 8,
+            _ => 64,
+        };
+        let mut p = Put(Vec::with_capacity(cap));
+        p.0.extend_from_slice(&[self.kind(), 0, 0, 0, 0]);
         match self {
             Self::Exec(e) => {
                 p.list(&e.argv, |p, a| p.bytes(a))?;
@@ -414,23 +431,12 @@ impl Frame {
             Self::Beat { uptime_ms } => p.u64(*uptime_ms),
             Self::Clock { unix_ns } => p.u64(*unix_ns),
         }
-        Ok(p.0)
-    }
-
-    /// The whole frame, header first.
-    ///
-    /// # Errors
-    /// Its payload is over [`MAX_FRAME`] bytes.
-    pub fn encode(&self) -> Result<Vec<u8>, WireError> {
-        let payload = self.payload()?;
-        if payload.len() > MAX_FRAME {
-            return Err(WireError::TooLarge(payload.len() as u64));
+        let payload_len = p.0.len() - HEADER;
+        if payload_len > MAX_FRAME {
+            return Err(WireError::TooLarge(payload_len as u64));
         }
-        let mut out = Vec::with_capacity(HEADER + payload.len());
-        out.push(self.kind());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&payload);
-        Ok(out)
+        p.0[1..HEADER].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        Ok(p.0)
     }
 
     /// The frame of `kind` whose payload is `payload`.
@@ -551,7 +557,12 @@ pub fn read_frame(r: &mut impl Read) -> Result<Option<Frame>, WireError> {
     if !payload.is_empty() && !fill(r, &mut payload)? {
         return Err(WireError::Truncated);
     }
-    Frame::decode(header[0], &payload).map(Some)
+    match header[0] {
+        STDIN => Ok(Some(Frame::Stdin(payload))),
+        OUT => Ok(Some(Frame::Out(payload))),
+        ERR => Ok(Some(Frame::Err(payload))),
+        kind => Frame::decode(kind, &payload).map(Some),
+    }
 }
 
 /// Write `frame` with one `write_all`, so frames from two threads behind one lock never

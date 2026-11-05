@@ -130,9 +130,10 @@ fn default_drift_leaves_an_independent_serving_login_attributed() {
 fn facts_choose_the_valid_alternative_a_managed_launch_uses() {
     use crate::harness::accounts::Cli;
     let pool = DoctorPool::new(true, Some(Mode::Early));
-    std::fs::write(
-        pool.config.join("aterm.toml"),
-        "[harness]\naccounts='early'\n",
+    aterm_uds::atomic_file::write(
+        &pool.config.join("aterm.toml"),
+        b"[harness]\naccounts='early'\n",
+        0o600,
     )
     .unwrap();
     pool.state(|state| {

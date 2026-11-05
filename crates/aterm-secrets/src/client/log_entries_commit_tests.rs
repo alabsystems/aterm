@@ -68,28 +68,40 @@ fn concurrent_ingress_at_a_full_held_store() {
     }
     super::super::save_records(&paths, &encode_records(base.records())).unwrap();
 
-    let mut attempts = 0;
+    let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
     let mut authored_ids = Vec::new();
-    let mut peer_ids = Vec::new();
+    let peer_ids = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    // Peer ingress does not take the local author lock. It cannot land mid-draft, since the
+    // draft's observation keeps every writer out, so it advances the actual store between each
+    // draft and its commit, including the last allowed re-draft. Both authored records fit the
+    // snapshot; only one fits that final store.
+    let ingress = {
+        let (paths, attempts, peer_ids) = (paths.clone(), attempts.clone(), peer_ids.clone());
+        super::author_batch_tests::install_hook(move || {
+            let mut incoming = super::super::load_records(&paths)
+                .unwrap()
+                .log()
+                .unwrap()
+                .clone();
+            let incoming: Vec<_> = (0..if attempts.get() < 4 { 2 } else { 1 })
+                .map(|_| append_name(&mut incoming, &peer, &peer_writer, peer_incarnation))
+                .collect();
+            peer_ids
+                .borrow_mut()
+                .extend(incoming.iter().map(|record| *record.id()));
+            super::super::save_records(&paths, &encode_records(&incoming)).unwrap();
+        })
+    };
     let result = author_and_commit_records(&paths, |snapshot| {
-        attempts += 1;
+        attempts.set(attempts.get() + 1);
         let mut draft = snapshot.log().unwrap().clone();
         let first = append_name(&mut draft, &actor, &writer, incarnation);
         let second = append_name(&mut draft, &actor, &writer, incarnation);
         authored_ids = vec![*first.id(), *second.id()];
-
-        // Peer ingress does not take the local author lock. Advance the actual
-        // store after each draft, including the last allowed re-draft. Both
-        // authored records fit the snapshot; only one fits that final store.
-        let mut incoming = snapshot.log().unwrap().clone();
-        let incoming: Vec<_> = (0..if attempts < 4 { 2 } else { 1 })
-            .map(|_| append_name(&mut incoming, &peer, &peer_writer, peer_incarnation))
-            .collect();
-        peer_ids.extend(incoming.iter().map(|record| *record.id()));
-        super::super::save_records(&paths, &encode_records(&incoming)).unwrap();
         Ok((vec![first, second], ()))
     });
-    assert_eq!(attempts, 4);
+    drop(ingress);
+    assert_eq!(attempts.get(), 4);
     let after = super::super::load_records(&paths).unwrap();
     let retained = authored_ids.iter().filter(|id| after.contains(id)).count();
     assert!(
@@ -102,7 +114,7 @@ fn concurrent_ingress_at_a_full_held_store() {
     );
     assert_eq!(after.len(), LEGACY.held - 1);
     assert!(
-        peer_ids.iter().all(|id| after.contains(id)),
+        peer_ids.borrow().iter().all(|id| after.contains(id)),
         "peer ingress remains durable"
     );
 
@@ -132,6 +144,42 @@ fn concurrent_ingress_at_a_full_held_store() {
     let (again, _, ()) = author_and_commit_records(&paths, |_| Ok((records.clone(), ()))).unwrap();
     assert_eq!(again.len(), 1);
     assert_eq!(std::fs::read(paths.records_file()).unwrap(), before);
+}
+
+/// A draft that takes its own Mac's state lock exclusively, under the observation its author
+/// holds across it, panics at once in a build with debug assertions rather than wait on that
+/// observation for good, which flock(2) would.
+///
+/// NEGATIVE CONTROL: without `StateLock::not_under_own_draft` in `take_at`, the take waits on
+/// the author's own observation and the hang detector fails "the take refuses at once".
+#[test]
+fn a_draft_that_takes_its_own_state_lock_panics_rather_than_wait_on_itself() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(root.path());
+    drop(StateLock::take(&paths).unwrap());
+    let (done, finished) = std::sync::mpsc::channel();
+    let drafting = paths.clone();
+    std::thread::spawn(move || {
+        let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = author_and_commit_records(&drafting, |_| {
+                let _held = StateLock::take(&drafting)?;
+                Ok((Vec::new(), ()))
+            });
+        }));
+        let _ = done.send(
+            taken
+                .err()
+                .and_then(|panic| panic.downcast_ref::<String>().cloned()),
+        );
+    });
+    let message = finished
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the take refuses at once rather than wait on its own observation")
+        .expect("the take panics");
+    assert!(
+        message.contains("under this thread's own draft observation"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -196,7 +244,7 @@ fn admin_publication_at_a_full_held_store() {
                 assert!(store.insert(record).unwrap());
             }
         });
-        fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600).unwrap();
+        super::super::write_records(&paths, &store).unwrap();
         let admin = super::super::admin_cached(&paths).unwrap();
         assert_eq!(admin.log_base, expected_base);
         let mut wanted = admin.published_doc.clone();

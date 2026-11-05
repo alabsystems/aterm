@@ -55,8 +55,13 @@ pub const PASSWD_FILE_SEAM: &str = "ATERM_PASSWD_FILE";
 fn passwd_home_dir(uid: u32) -> Option<PathBuf> {
     use std::io::Read as _;
     const MAX_PASSWD_BYTES: u64 = 16 * 1024 * 1024;
-    let (file, _) = crate::fs_restricted::open_regular_nonblock_with_meta(&passwd_file()).ok()?;
-    let mut contents = Vec::new();
+    let (file, meta) =
+        crate::fs_restricted::open_regular_nonblock_with_meta(&passwd_file()).ok()?;
+    if meta.len() > MAX_PASSWD_BYTES {
+        return None;
+    }
+    let mut contents =
+        Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(MAX_PASSWD_BYTES + 1)
         .read_to_end(&mut contents)
         .ok()?;
@@ -147,6 +152,97 @@ pub fn aterm_config_refusal(owner: u32, mode: u32, me: u32) -> Option<String> {
 pub fn aterm_config_file_refusal(meta: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt as _;
     aterm_config_refusal(meta.uid(), meta.mode(), aterm_uds::peer::our_uid())
+}
+
+/// The most of `aterm.toml` [`read_aterm_config`] reads.
+#[cfg(not(target_family = "wasm"))]
+pub const ATERM_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// A present config could not be admitted or read; neither case means defaults were selected.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+pub enum AtermConfigReadError {
+    /// The opened file failed the existing config ownership policy.
+    Refused(String),
+    /// The file, its metadata, bounded contents or text could not be read.
+    Unavailable(std::io::Error),
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl std::fmt::Display for AtermConfigReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(reason) => write!(f, "config refused: {reason}"),
+            Self::Unavailable(error) => error.fmt(f),
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl std::error::Error for AtermConfigReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Refused(_) => None,
+            Self::Unavailable(error) => Some(error),
+        }
+    }
+}
+
+/// The admitted bytes of `aterm.toml`, or `None` only when the path is absent.
+/// A symlink (a dotfiles checkout, home-manager) is followed. Its opened target must be a
+/// regular file of at most [`ATERM_CONFIG_MAX_BYTES`], and on Unix must pass
+/// [`aterm_config_refusal`] using the opened handle's metadata. No Windows ownership policy
+/// is inferred from Unix modes. On Unix the open does not block on a FIFO.
+///
+/// # Errors
+/// Returns [`AtermConfigReadError::Refused`] for a failed ownership policy, or
+/// [`AtermConfigReadError::Unavailable`] for I/O, invalid file type or oversized contents.
+/// A dangling link is unavailable, because the settings entry exists but cannot be read.
+#[cfg(not(target_family = "wasm"))]
+pub fn read_aterm_config(path: &std::path::Path) -> Result<Option<Vec<u8>>, AtermConfigReadError> {
+    match aterm_uds::atomic_file::read_regular(path, ATERM_CONFIG_MAX_BYTES) {
+        Ok((bytes, meta)) => {
+            #[cfg(unix)]
+            if let Some(reason) = aterm_config_file_refusal(&meta) {
+                return Err(AtermConfigReadError::Refused(reason));
+            }
+            #[cfg(not(unix))]
+            let _ = meta;
+            Ok(Some(bytes))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(AtermConfigReadError::Unavailable(error)),
+                Ok(_) => Err(AtermConfigReadError::Unavailable(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "an existing config entry could not be opened",
+                ))),
+            }
+        }
+        Err(error) => Err(AtermConfigReadError::Unavailable(error)),
+    }
+}
+
+/// [`read_aterm_config`] as text.
+///
+/// # Errors
+/// As [`read_aterm_config`], or unavailable with [`std::io::ErrorKind::InvalidData`] where
+/// the admitted bytes are not UTF-8.
+#[cfg(not(target_family = "wasm"))]
+pub fn read_aterm_config_text(
+    path: &std::path::Path,
+) -> Result<Option<String>, AtermConfigReadError> {
+    read_aterm_config(path)?
+        .map(|bytes| {
+            String::from_utf8(bytes).map_err(|error| {
+                AtermConfigReadError::Unavailable(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error,
+                ))
+            })
+        })
+        .transpose()
 }
 
 /// The aterm config directory.
@@ -516,6 +612,74 @@ pub fn resolve_logs_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn aterm_toml_reader_holds_the_opened_targets_ownership_rule() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed.toml");
+        let link = dir.path().join("aterm.toml");
+        let text = "[harness]\nenabled = false\n";
+        assert!(read_aterm_config(&path).unwrap().is_none());
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&path, &link).unwrap();
+        for name in [&path, &link] {
+            assert_eq!(read_aterm_config_text(name).unwrap().as_deref(), Some(text));
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(aterm_config_file_refusal(&std::fs::metadata(&path).unwrap()).is_some());
+        for name in [&path, &link] {
+            assert!(
+                matches!(
+                    read_aterm_config(name),
+                    Err(AtermConfigReadError::Refused(_))
+                ),
+                "a writable target must be refused through {name:?}"
+            );
+        }
+    }
+
+    /// A symlink there is followed; an oversized file is refused; and only no entry at all reads
+    /// as absent, since a link to nothing stands for settings that could not be read.
+    #[cfg(unix)]
+    #[test]
+    fn aterm_toml_is_read_through_a_link_and_a_dangling_one_is_no_absence() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles-aterm.toml");
+        std::fs::write(&real, "shell = \"fish\"\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("aterm.toml");
+        symlink(&real, &link).unwrap();
+        assert_eq!(
+            read_aterm_config_text(&link).unwrap().as_deref(),
+            Some("shell = \"fish\"\n")
+        );
+
+        std::fs::write(&real, vec![b'#'; 1024 * 1024 + 1]).unwrap();
+        assert!(read_aterm_config(&link).is_err());
+
+        std::fs::remove_file(&real).unwrap();
+        assert!(matches!(read_aterm_config(&link),
+            Err(AtermConfigReadError::Unavailable(error))
+                if error.kind() == std::io::ErrorKind::InvalidData));
+        assert!(
+            read_aterm_config(&dir.path().join("gone.toml"))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(&real, [0xff]).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(read_aterm_config_text(&link),
+            Err(AtermConfigReadError::Unavailable(error))
+                if error.kind() == std::io::ErrorKind::InvalidData));
+        assert!(matches!(
+            read_aterm_config(dir.path()),
+            Err(AtermConfigReadError::Unavailable(_))
+        ));
+    }
 
     /// `aterm.toml` passes for this user's file or root's, with no group or other write and no
     /// set-id bit; another user's, or one others may write, is refused, saying why.

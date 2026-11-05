@@ -75,6 +75,16 @@ impl TimingMachine {
     }
 }
 
+impl TimingMachine {
+    /// The same reads with `load1` for the 1-minute load.
+    pub(crate) fn with_load(self, load1: Option<f64>) -> Self {
+        let mut reading = Reading::of_gib(48, 40, 14);
+        reading.load1 = load1;
+        self.base.set(reading);
+        self
+    }
+}
+
 impl crate::Machine for TimingMachine {
     fn read(&self, path: Option<&Path>) -> Reading {
         crate::Machine::read(&self.base, path)
@@ -214,27 +224,310 @@ fn unknown_cpu_and_now_refuse_timing_without_affecting_explicit_load_admission()
     let _load = admitted(enter(&s, &m, Need::new("explicit load").quiet(100.0)), &m);
 }
 
+/// Patience that reaches its bound at its first look.
+const AT_ONCE: Patience = Patience {
+    reserve: Duration::ZERO,
+    start: Duration::ZERO,
+    hold: crate::QUIET_PATIENCE.hold,
+};
+
+/// Busy then quiet counter pairs, one tick per read step.
+const BUSY: [(u64, u64); 2] = [(0, 0), (100, 0)];
+const QUIET: [(u64, u64); 2] = [(0, 0), (1, 99)];
+
+/// What `need` comes to on `m` after a first look that warms.
+fn second_look(s: &Scratch, m: &TimingMachine, need: Need) -> Polled {
+    match Waiter::enter(&s.ledger, m, need).unwrap().poll(m) {
+        Polled::Waiting(waiting, _) => waiting.poll(m),
+        _ => panic!("the first counter point only warms"),
+    }
+}
+
+/// A STRICT MEASURED NEED AT ITS BOUND ON A BUSY MACHINE IS REFUSED, HOLDING NOTHING: a perf
+/// baseline or a quoted lab latency must not run loaded. NEGATIVE CONTROL: the same need on a
+/// quiet window is admitted and qualifies.
 #[test]
-fn a_forced_patience_bound_never_qualifies_timing_work() {
-    let s = scratch("timing-bound");
-    let m = TimingMachine::new(&[(0, 0), (100, 0)]);
-    let need = Need::timing("forced bound").patience(Patience {
-        reserve: Duration::ZERO,
-        start: Duration::ZERO,
-        hold: crate::QUIET_PATIENCE.hold,
-    });
-    let first = Waiter::enter(&s.ledger, &m, need).unwrap();
-    let waiting = match first.poll(&m) {
-        Polled::Waiting(waiting, _) => waiting,
-        _ => panic!("first sample warms"),
-    };
+fn a_strict_timing_need_is_refused_loaded_at_its_bound() {
+    let s = scratch("timing-strict");
+    let m = TimingMachine::new(&BUSY);
     assert!(matches!(
-        waiting.poll(&m),
-        Polled::Unqualified(crate::TimingIssue::Bound)
+        second_look(&s, &m, Need::timing("strict").patience(AT_ONCE)),
+        Polled::Unqualified(crate::TimingIssue::Loaded)
     ));
     assert!(
         s.ledger.list().unwrap().is_empty(),
-        "forced, unqualified claim was released"
+        "the refused need holds nothing"
+    );
+    let m = TimingMachine::new(&QUIET);
+    let Polled::Admitted(claim) = second_look(&s, &m, Need::timing("strict").patience(AT_ONCE))
+    else {
+        panic!("a quiet window at the bound admits");
+    };
+    assert!(claim.timing_admission().is_ok());
+}
+
+/// A MEASURED NEED THAT RUNS LOADED STARTS AT ITS BOUND ON A BUSY MACHINE AND SAYS SO (owner
+/// ruling 2026-11-05: a busy machine never blocks a release): its cause is Loaded, its protection
+/// names the window and load it ran on, and it never qualifies a measurement. NEGATIVE CONTROL:
+/// on a quiet window the same need is an ordinary qualified admission.
+#[test]
+fn a_timing_need_that_runs_loaded_is_admitted_loaded_and_states_it() {
+    let s = scratch("timing-loaded");
+    let m = TimingMachine::new(&BUSY);
+    let need = Need::timing("loaded").patience(AT_ONCE).runs_loaded();
+    let Polled::Admitted(claim) = second_look(&s, &m, need.clone()) else {
+        panic!("a need that runs loaded is admitted at its bound");
+    };
+    assert_eq!(claim.record().timing.cause, crate::TimingCause::Loaded);
+    assert_eq!(
+        claim.timing_admission(),
+        Err(crate::TimingIssue::Loaded),
+        "a loaded admission never qualifies"
+    );
+    let Ok(crate::Protection::Loaded(observed)) = claim.timing_protection() else {
+        panic!("its protection states the load it ran on");
+    };
+    assert_eq!((observed.window.busy_ticks, observed.load1), (100, 1.0));
+    assert!(
+        !claim.quiet().is_some_and(|q| q.at_bound),
+        "a load within its bound is never said to be over it"
+    );
+    let line = crate::Unqualified::Admission(observed).to_string();
+    names(&line, &["admitted loaded", "100.0% busy", "load 1.0"]);
+    drop(claim);
+    let m = TimingMachine::new(&QUIET);
+    let Polled::Admitted(claim) = second_look(&s, &m, need) else {
+        panic!("a quiet window admits");
+    };
+    assert_eq!(claim.record().timing.cause, crate::TimingCause::Wait);
+    assert!(matches!(
+        claim.timing_protection(),
+        Ok(crate::Protection::Qualified(_))
+    ));
+}
+
+/// NO CPU WINDOW, OR NO LOAD, AT THE BOUND ADMITS NOTHING, STRICT OR LOADED: counters that went
+/// backwards or froze, a lost read, or an unreadable load say nothing about the machine's load,
+/// so they never pass as a busy machine. NEGATIVE CONTROL: the busy window of
+/// [`a_timing_need_that_runs_loaded_is_admitted_loaded_and_states_it`] is admitted.
+#[test]
+fn no_cpu_window_or_load_at_the_bound_admits_nothing() {
+    let s = scratch("timing-blind");
+    for need in [
+        Need::timing("blind").patience(AT_ONCE),
+        Need::timing("blind").patience(AT_ONCE).runs_loaded(),
+    ] {
+        for (counters, why) in [
+            (&[(5, 5), (1, 1)][..], crate::TimingIssue::Blind),
+            (&[(0, 0), (0, 0)][..], crate::TimingIssue::Blind),
+            (&[(0, 0)][..], crate::TimingIssue::Unavailable),
+        ] {
+            let m = TimingMachine::new(counters);
+            let got = second_look(&s, &m, need.clone());
+            assert!(
+                matches!(got, Polled::Unqualified(issue) if issue == why),
+                "{counters:?} at the bound must be {why}"
+            );
+        }
+        let m = TimingMachine::new(&BUSY).with_load(None);
+        assert!(matches!(
+            Waiter::enter(&s.ledger, &m, need.clone()).unwrap().poll(&m),
+            Polled::Unqualified(crate::TimingIssue::LoadUnknown)
+        ));
+        assert!(s.ledger.list().unwrap().is_empty());
+    }
+}
+
+/// COUNTERS THAT CHANGE BEFORE THE BOUND ARE WAITED OUT, NOT REFUSED: a fresh pair after a reset
+/// decides. NEGATIVE CONTROL: the same reset at the bound is blind
+/// ([`no_cpu_window_or_load_at_the_bound_admits_nothing`]).
+#[test]
+fn counter_changes_are_waited_out_before_the_bound() {
+    let s = scratch("timing-reset");
+    let m = TimingMachine::new(&[(5, 5), (1, 1), (2, 200)]);
+    let waiting = match second_look(&s, &m, Need::timing("reset").runs_loaded()) {
+        Polled::Waiting(waiting, short) => {
+            assert!(
+                short
+                    .shorts
+                    .iter()
+                    .any(|s| matches!(s, Short::Timing(crate::TimingIssue::CounterChanged)))
+            );
+            waiting
+        }
+        _ => panic!("a reset before the bound waits"),
+    };
+    let Polled::Admitted(claim) = waiting.poll(&m) else {
+        panic!("a fresh quiet pair after the reset admits");
+    };
+    assert!(claim.timing_admission().is_ok());
+}
+
+/// A LOADED CLAIM SPENDS THE PATIENCE OF THE WORK UNDER IT: a need that runs loaded under its own
+/// process's loaded claim decides on its first window rather than wait out the same busy machine
+/// again. NEGATIVE CONTROLS: a strict need under it still waits, and so does one that runs loaded
+/// under a quiet claim.
+#[test]
+fn a_loaded_claim_spends_the_patience_of_work_under_it() {
+    let s = scratch("timing-inherit");
+    let m = TimingMachine::new(&BUSY);
+    let Polled::Admitted(outer) = second_look(
+        &s,
+        &m,
+        Need::timing("outer").patience(AT_ONCE).runs_loaded(),
+    ) else {
+        panic!("the outer claim runs loaded");
+    };
+    let m = TimingMachine::new(&BUSY);
+    let Polled::Admitted(inner) = second_look(&s, &m, Need::timing("inner").runs_loaded()) else {
+        panic!("work under a loaded claim decides on its first window");
+    };
+    assert_eq!(inner.record().timing.cause, crate::TimingCause::Loaded);
+    drop(inner);
+    let m = TimingMachine::new(&BUSY);
+    assert!(matches!(
+        second_look(&s, &m, Need::timing("strict inner")),
+        Polled::Waiting(_, short) if short.shorts.iter().any(|s| matches!(s, Short::Timing(crate::TimingIssue::Busy)))
+    ));
+    drop(outer);
+    let m = TimingMachine::new(&QUIET);
+    let Polled::Admitted(quiet_outer) =
+        second_look(&s, &m, Need::timing("quiet outer").patience(AT_ONCE))
+    else {
+        panic!("a quiet outer claim");
+    };
+    let m = TimingMachine::new(&BUSY);
+    assert!(matches!(
+        second_look(&s, &m, Need::timing("inner").runs_loaded()),
+        Polled::Waiting(..)
+    ));
+    drop(quiet_outer);
+}
+
+/// WORK A LOADED CLAIM SPARED ITS WAIT ENTERS ON ITS FIRST WINDOW TOO, even when its own
+/// admission window read quiet. NEGATIVE CONTROL: the same admission with no loaded claim above
+/// it keeps waiting through busy entry windows until the scripted reads run out.
+#[test]
+fn work_under_a_loaded_claim_enters_on_its_first_window() {
+    let s = scratch("entry-spent");
+    let lull = [(0, 0), (1, 99), (100, 100), (200, 100)];
+    let enter_under = |outer: bool| {
+        let held = outer.then(|| {
+            let m = TimingMachine::new(&BUSY);
+            match second_look(
+                &s,
+                &m,
+                Need::timing("outer").patience(AT_ONCE).runs_loaded(),
+            ) {
+                Polled::Admitted(claim) => claim,
+                _ => panic!("the outer claim runs loaded"),
+            }
+        });
+        let m = TimingMachine::new(&lull);
+        let Polled::Admitted(mut claim) = second_look(&s, &m, Need::timing("inner").runs_loaded())
+        else {
+            panic!("a quiet first window admits");
+        };
+        assert_eq!(claim.record().timing.cause, crate::TimingCause::Wait);
+        let entered = claim.stated_entry_on(&m, Pace::default(), &mut |_| false);
+        drop(held);
+        entered
+    };
+    let entry = enter_under(true).unwrap();
+    assert!(matches!(
+        entry.unqualified[..],
+        [crate::Unqualified::Entry(_)]
+    ));
+    assert_eq!(
+        enter_under(false),
+        Err(crate::TimingIssue::Unavailable),
+        "without a loaded claim above it the entry waits its own patience"
+    );
+}
+
+/// A LOADED ADMISSION ENTERS ITS MEASUREMENT ON ONE FRESH WINDOW AND STATES BOTH: no second
+/// patience. NEGATIVE CONTROL: the strict entry refuses the same claim, appending no entry.
+#[test]
+fn a_loaded_admission_enters_on_one_fresh_window() {
+    let s = scratch("entry-loaded");
+    let m = TimingMachine::new(&[(0, 0), (100, 0), (200, 0), (300, 0)]);
+    let Polled::Admitted(mut claim) = second_look(
+        &s,
+        &m,
+        Need::timing("loaded entry").patience(AT_ONCE).runs_loaded(),
+    ) else {
+        panic!("admitted loaded");
+    };
+    assert_eq!(
+        claim.measurement_entry_on(&m, Pace::default(), &mut |_| false),
+        Err(crate::TimingIssue::Loaded)
+    );
+    let mut sleeps = 0;
+    let entry = claim
+        .stated_entry_on(&m, Pace::default(), &mut |_| {
+            sleeps += 1;
+            false
+        })
+        .unwrap();
+    assert_eq!((sleeps, m.reads.get()), (1, 4));
+    assert!(matches!(
+        entry.unqualified[..],
+        [
+            crate::Unqualified::Admission(_),
+            crate::Unqualified::Entry(_)
+        ]
+    ));
+    assert_eq!(claim.record().timing.entry, Some(entry.window));
+}
+
+/// A QUIET ADMISSION WHOSE ENTRY STAYS BUSY THROUGH ITS ENTRY'S PATIENCE ENTERS THEN AND SAYS SO;
+/// the strict entry refuses it. NEGATIVE CONTROLS: frozen entry counters are blind both ways, and
+/// a quiet entry is unqualified by nothing.
+#[test]
+fn a_busy_entry_after_a_quiet_admission_is_stated_or_refused() {
+    let s = scratch("entry-busy");
+    let need = Need::timing("busy entry").patience(AT_ONCE).runs_loaded();
+    let claim_on = |m: &TimingMachine| match second_look(&s, m, need.clone()) {
+        Polled::Admitted(claim) => claim,
+        _ => panic!("a quiet admission"),
+    };
+    let entry = |m: &TimingMachine, stated: bool| {
+        let mut claim = claim_on(m);
+        if stated {
+            claim.stated_entry_on(m, Pace::default(), &mut |_| false)
+        } else {
+            claim
+                .measurement_entry_on(m, Pace::default(), &mut |_| false)
+                .map(|window| crate::StatedEntry {
+                    window,
+                    load1: 1.0,
+                    unqualified: Vec::new(),
+                })
+        }
+    };
+    let busy = [(0, 0), (1, 99), (100, 100), (200, 100)];
+    let stated = entry(&TimingMachine::new(&busy), true).unwrap();
+    assert!(matches!(
+        stated.unqualified[..],
+        [crate::Unqualified::Entry(_)]
+    ));
+    assert_eq!(
+        entry(&TimingMachine::new(&busy), false),
+        Err(crate::TimingIssue::Loaded)
+    );
+    let frozen = [(0, 0), (1, 99), (100, 100), (100, 100)];
+    for stated in [true, false] {
+        assert_eq!(
+            entry(&TimingMachine::new(&frozen), stated),
+            Err(crate::TimingIssue::Blind)
+        );
+    }
+    let quiet = [(0, 0), (1, 99), (100, 100), (101, 199)];
+    assert!(
+        entry(&TimingMachine::new(&quiet), true)
+            .unwrap()
+            .unqualified
+            .is_empty()
     );
 }
 
@@ -1974,6 +2267,91 @@ fn an_overtaken_unservable_waiter_is_relieved_again_once_it_fits_the_room() {
     let got = joined(waiting, "its admission once the second relief freed room");
     assert_eq!(got.expect("admitted").as_str(), "verify");
     drop(around);
+}
+
+/// A waiter is relieved again once its relief says what it may take grew ([`crate::Relief::renewed`]):
+/// a workspace removed while it waits leaves a build directory nobody builds into again (m20,
+/// 2026-11-05: a verify waited five hours beside 52.8 GiB of removed worktrees' caches, its one
+/// relief having run before they were removed). A 27 GiB run on a volume 16 GiB above its floor
+/// is relieved once (nothing freed) and waits. NEGATIVE CONTROL, in the same wait: while
+/// `renewed` says no, the looks ask it again and again and the relief is not called a second
+/// time; once it says yes, the relief runs at that look, frees room, and the run is admitted.
+#[test]
+fn a_waiter_is_relieved_again_once_its_relief_is_renewed() {
+    struct Renewing {
+        machine: Arc<Fixed>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        asked: std::sync::mpsc::Sender<()>,
+        grown: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl crate::Relief for Renewing {
+        fn relieve(
+            &mut self,
+            _short: &crate::Shortfall,
+            _say: &mut dyn FnMut(&str),
+            _stopped: &dyn Fn() -> bool,
+        ) {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.machine.set(with_vol(vol(100, 36, 4)));
+            }
+        }
+        fn holders(
+            &mut self,
+            _short: &crate::Shortfall,
+            _stopped: &dyn Fn() -> bool,
+        ) -> Option<String> {
+            None
+        }
+        fn renewed(&mut self, _stopped: &dyn Fn() -> bool) -> bool {
+            let _ = self.asked.send(());
+            self.grown.swap(false, Ordering::SeqCst)
+        }
+    }
+    let s = scratch("relief-renewed");
+    let m = Arc::new(on(vol(100, 20, 4)));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let grown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (asked, asks) = std::sync::mpsc::channel::<()>();
+    let (ledger, theirs) = (s.ledger.clone(), Arc::clone(&m));
+    let (their_calls, their_grown) = (Arc::clone(&calls), Arc::clone(&grown));
+    let waiting = std::thread::spawn(move || {
+        let mut relief = Renewing {
+            machine: Arc::clone(&theirs),
+            calls: their_calls,
+            asked,
+            grown: their_grown,
+        };
+        crate::admit_relieved(
+            &ledger,
+            &*theirs,
+            Need::new("verify").disk(27 * GIB, "/vol"),
+            Admit::Wait,
+            Pace {
+                poll: Duration::from_millis(5),
+                line_every: Duration::from_secs(60),
+            },
+            &mut relief,
+            &mut |_| {},
+        )
+        .map(|c| c.record().need.what.clone())
+    });
+    for _ in 0..3 {
+        asks.recv_timeout(MUST_HAPPEN)
+            .expect("each waiting look asks");
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "nothing grew: relieved once, at its first look"
+    );
+    grown.store(true, Ordering::SeqCst);
+    let got = joined(waiting, "its admission once the renewed relief freed room");
+    assert_eq!(got.expect("admitted").as_str(), "verify");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "relieved again once renewed"
+    );
 }
 
 /// An unservable waiter whose first relief itself brings its need within the room, while the

@@ -96,6 +96,30 @@ pub(crate) fn declares_grant_empty(app_root: &Path) -> Result<bool, String> {
     )
 }
 
+/// The `Info.plist` key by which a bundle declares it rebuilds a window that held only an empty
+/// Workers list from its row in a handoff layout.
+pub const HANDOFF_GRANT_DESK_KEY: &str = "<key>ATermHandoffGrantDesk</key>";
+
+/// The value [`HANDOFF_GRANT_DESK_KEY`] carries in a bundle that rebuilds such a window.
+pub const HANDOFF_GRANT_DESK_TOKEN: &str = "desk1";
+
+/// Whether an `Info.plist`'s text declares the desk grant.
+#[must_use]
+pub fn plist_declares_grant_desk(text: &str) -> bool {
+    crate::manifest::xml_plist_string(text, HANDOFF_GRANT_DESK_KEY)
+        .is_some_and(|value| value == HANDOFF_GRANT_DESK_TOKEN)
+}
+
+/// Read the desk-grant declaration off a bundle whose signature was just verified.
+pub(crate) fn declares_grant_desk(app_root: &Path) -> Result<bool, String> {
+    let path = app_root.join("Contents/Info.plist");
+    grant_judged(
+        &path,
+        crate::read_ledger_text_checked(&path),
+        plist_declares_grant_desk,
+    )
+}
+
 /// Resolve the installed bundle the updater may replace, or `None` when it must not act:
 ///
 /// * not the `…/<name>.app/Contents/MacOS/<exe>` layout (a `target/` binary): nothing to
@@ -441,5 +465,39 @@ mod tests {
     fn the_shipped_info_plist_declares_the_sessionless_grant() {
         let template = include_str!("../../../apps/aterm-mac/Info.plist");
         assert!(plist_declares_grant_empty(template));
+    }
+
+    #[test]
+    fn the_desk_grant_is_declared_only_by_its_exact_token() {
+        let plist = |body: &str| {
+            format!(
+                "<plist><dict><key>CFBundleVersion</key><string>7</string>{body}</dict></plist>"
+            )
+        };
+        assert!(plist_declares_grant_desk(&plist(
+            "<key>ATermHandoffGrantDesk</key>\n\t<string>desk1</string>"
+        )));
+        for undeclared in [
+            "",
+            "<key>ATermHandoffGrantDesk</key><string></string>",
+            "<key>ATermHandoffGrantDesk</key><string>desk2</string>",
+            "<key>ATermHandoffGrantDesk</key><string>true</string>",
+            "<key>ATermHandoffGrantDesk</key><key>Other</key><string>desk1</string>",
+            "<key>ATermHandoffGrantEmpty</key><string>empty1</string>",
+            "<key>ATermHandoffGrantEmpty</key><string>desk1</string>",
+        ] {
+            assert!(
+                !plist_declares_grant_desk(&plist(undeclared)),
+                "{undeclared:?} declares nothing"
+            );
+        }
+        assert!(!plist_declares_grant_desk("\u{0}bplist00 binary garbage"));
+    }
+
+    /// This build rebuilds a lone Workers list, so the bundle it ships in declares it.
+    #[test]
+    fn the_shipped_info_plist_declares_the_desk_grant() {
+        let template = include_str!("../../../apps/aterm-mac/Info.plist");
+        assert!(plist_declares_grant_desk(template));
     }
 }

@@ -1596,6 +1596,7 @@ mod sys {
         fn empty(&mut self, listing: &mut Dir, state: &mut (bool, bool), depth: usize) -> Emptied {
             let (mut went_any, mut all) = (false, true);
             loop {
+                aterm_uds::progress::tick();
                 if !self.permit.allows() {
                     return Emptied::Below;
                 }
@@ -2564,6 +2565,7 @@ mod sys {
     }
 
     pub(super) fn tree(top: &Path) -> Left {
+        aterm_uds::progress::tick();
         let meta = match std::fs::symlink_metadata(top) {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Left::default(),

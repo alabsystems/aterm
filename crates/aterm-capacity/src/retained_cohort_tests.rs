@@ -113,19 +113,19 @@ fn assert_cpu_denied(pool: &RetainedPool) {
     );
 }
 
-fn assert_kernel_free_but_debt_retained(pool: &RetainedPool) {
-    let path = pool
-        .path()
-        .join(RETAINED_DIRECTORY_NAME)
-        .join("slot-00000000");
+fn wait_for_kernel_release(pool: &RetainedPool) {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&path)
+        .open(
+            pool.path()
+                .join(RETAINED_DIRECTORY_NAME)
+                .join("slot-00000000"),
+        )
         .unwrap();
-    // A concurrent fork can transiently copy a descriptor until exec. Observe
-    // the actual final kernel release rather than interpreting elapsed time as
-    // closure, and close this probe before asking the API for capacity.
+    // A concurrent fork can retain a closed CLOEXEC descriptor until exec.
+    // Observe actual kernel release without treating it as durable settlement;
+    // callers separately check either the retained debt or the Free record.
     aterm_uds::file_lock::lock_exclusive_until(
         &file,
         Instant::now() + MUST_HAPPEN,
@@ -134,6 +134,21 @@ fn assert_kernel_free_but_debt_retained(pool: &RetainedPool) {
     .unwrap();
     file.unlock().unwrap();
     drop(file);
+}
+
+fn assert_settled_cpu_available(pool: &RetainedPool) -> crate::build_cpu::RetainedLease {
+    wait_for_kernel_release(pool);
+    assert_eq!(
+        pool.snapshot().unwrap(),
+        [RetainedSlotState::Available { slot: 0 }]
+    );
+    pool.try_acquire(owner())
+        .unwrap()
+        .expect("the settled slot must have an explicit free record")
+}
+
+fn assert_kernel_free_but_debt_retained(pool: &RetainedPool) {
+    wait_for_kernel_release(pool);
     let fresh = RetainedPool::open_existing(pool.path()).unwrap().unwrap();
     assert_cpu_denied(&fresh);
     assert_eq!(
@@ -178,7 +193,7 @@ fn leader_exit_keeps_cpu_until_the_actual_final_member_drains() {
     member.end();
     assert_eq!(cohort.lifetime(), Lifetime::Drained);
     retained.try_finish(&fence).unwrap();
-    let replacement = pool.try_acquire(owner()).unwrap().unwrap();
+    let replacement = assert_settled_cpu_available(&pool);
     assert_eq!(replacement.slot(), original);
     assert_cpu_denied(&pool);
     replacement.settle().unwrap();
@@ -229,7 +244,7 @@ fn durable_finish_failure_keeps_cpu_until_original_pending_event_is_retried() {
     // The actual Claim owns its pending write/origin. A preflight check of its
     // old committed bytes must not strand this legitimate retry forever.
     retained.try_finish(&fence).unwrap();
-    let replacement = pool.try_acquire(owner()).unwrap().unwrap();
+    let replacement = assert_settled_cpu_available(&pool);
     assert_eq!(replacement.slot(), 0);
     assert_cpu_denied(&pool);
     replacement.settle().unwrap();
@@ -264,11 +279,7 @@ fn genuine_not_spawned_receipt_must_cancel_arm_before_cpu_can_be_freed() {
     );
     assert_cpu_denied(&pool);
     retained.try_finish(&fence).unwrap();
-    pool.try_acquire(owner())
-        .unwrap()
-        .unwrap()
-        .settle()
-        .unwrap();
+    assert_settled_cpu_available(&pool).settle().unwrap();
 }
 
 #[test]
@@ -322,11 +333,7 @@ fn cancelled_launch_preserves_its_actual_receipt_or_pending_event_until_settleme
         assert_cpu_denied(&pool);
         retained.try_finish(&fence).unwrap();
         assert!(retained.is_settled());
-        pool.try_acquire(owner())
-            .unwrap()
-            .unwrap()
-            .settle()
-            .unwrap();
+        assert_settled_cpu_available(&pool).settle().unwrap();
     }
 }
 
@@ -363,11 +370,7 @@ fn actual_unbound_child_remains_owned_and_denies_cpu_until_bind_retry_and_drain(
     running.end();
     assert_eq!(cohort.lifetime(), Lifetime::Drained);
     retained.try_finish(&fence).unwrap();
-    pool.try_acquire(owner())
-        .unwrap()
-        .unwrap()
-        .settle()
-        .unwrap();
+    assert_settled_cpu_available(&pool).settle().unwrap();
 }
 
 #[test]
@@ -388,11 +391,7 @@ fn foreign_leadership_cannot_settle_original_custody_even_after_actual_drain() {
     assert!(retained.try_finish(&foreign).is_err());
     assert_cpu_denied(&pool);
     retained.try_finish(&fence).unwrap();
-    pool.try_acquire(owner())
-        .unwrap()
-        .unwrap()
-        .settle()
-        .unwrap();
+    assert_settled_cpu_available(&pool).settle().unwrap();
 }
 
 #[test]
@@ -497,7 +496,7 @@ fn unused_admission_settles_once_and_cannot_release_a_later_unit_generation() {
     )
     .unwrap();
     retained.try_finish(&fence).unwrap();
-    let replacement = pool.try_acquire(owner()).unwrap().unwrap();
+    let replacement = assert_settled_cpu_available(&pool);
     let path = pool
         .path()
         .join(RETAINED_DIRECTORY_NAME)

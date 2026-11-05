@@ -61,9 +61,10 @@ use crate::proto::{
     append_frame, compute_delivery_crc, decode_request_with_bt, decode_response,
     encode_protocol_refusal, encode_replicate_stamped, encode_response, read_frame, write_frame,
     AttachedProducerStats, FaceStats, Request, Response, WireStats, CAP_EXPIRED_PREFIX,
-    ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_RATE_LIMITED, ERR_RECORD_REFUSED, ERR_REFUSED,
-    ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND, ERR_TOO_MANY_CONNS, ERR_UNAUTHORIZED,
-    LOG_POISONED_PREFIX, PROTO_VERSION, RATE_LIMITED_PREFIX, RETAINED_FROM_PREFIX,
+    ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_ORIGIN_REFUSED, ERR_RATE_LIMITED, ERR_RECORD_REFUSED,
+    ERR_REFUSED, ERR_RELAY_NOT_READY, ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND, ERR_TOO_MANY_CONNS,
+    ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION, RATE_LIMITED_PREFIX,
+    RETAINED_FROM_PREFIX,
 };
 use crate::store::{
     is_hidden_subject, replicated_reserved_msg, reserved_msg, Begun, BrokerLog, Durability,
@@ -96,6 +97,13 @@ enum Sock {
     #[cfg(unix)]
     Unix(UnixStream),
     Tcp(TcpStream),
+    /// An adopted stream ([`Broker::serve_stream`]), and the key its owner proved. Unlike a
+    /// socket, it is ended as soon as that key is revoked ([`end_revoked_streams`]).
+    #[cfg(feature = "stream")]
+    Stream {
+        link: Arc<dyn crate::stream_link::StreamLink>,
+        peer: [u8; 32],
+    },
 }
 
 impl Sock {
@@ -104,6 +112,8 @@ impl Sock {
             #[cfg(unix)]
             Sock::Unix(s) => s.shutdown(Shutdown::Both),
             Sock::Tcp(s) => s.shutdown(Shutdown::Both),
+            #[cfg(feature = "stream")]
+            Sock::Stream { link, .. } => link.shutdown(Shutdown::Both),
         };
     }
 }
@@ -411,6 +421,13 @@ fn refusal(code: u8, msg: impl Into<String>) -> Refusal {
 
 enum WriteKind {
     Publish {
+        producer_id: u64,
+        producer_seq: u64,
+        subject: String,
+        body: Vec<u8>,
+    },
+    /// A [`Request::Relay`]: a publish of a record that originated elsewhere.
+    Relay {
         producer_id: u64,
         producer_seq: u64,
         subject: String,
@@ -846,7 +863,37 @@ fn apply_revocation_file(shared: &Shared, path: &Path) -> io::Result<usize> {
     shared.has_revocation_file.store(true, Ordering::Release);
     shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
     notify_all_tails(shared);
+    #[cfg(feature = "stream")]
+    end_revoked_streams(shared);
     Ok(count)
+}
+
+/// End every adopted stream whose key or `n-` principal is now revoked. An identity TCP
+/// connection learns of its revocation at its next request or delivery; an adopted stream is one
+/// channel of its owner's live connection, and may sit idle for as long as that connection lasts,
+/// so it is shut here and now. Runs after the revocation is in force, and a stream checks for it
+/// after it registers ([`serve_conn`]), so one registering meanwhile is ended by one or the other.
+#[cfg(feature = "stream")]
+fn end_revoked_streams(shared: &Shared) {
+    let identities = shared
+        .revoked_identities
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let principals = shared
+        .revoked_principals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let conns = shared
+        .conns
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for sock in conns.values() {
+        if let Sock::Stream { peer, .. } = sock {
+            if identities.contains(peer) || principals.contains(&identity_principal(peer)) {
+                sock.shutdown_both();
+            }
+        }
+    }
 }
 
 fn maybe_reload_revocation_file(shared: &Shared) {
@@ -878,21 +925,30 @@ fn maybe_reload_revocation_file(shared: &Shared) {
     }
 }
 
-/// Whether `peer_id` is in `shared.revoked_identities` without triggering file I/O
-/// (safe to call while holding `shared.log`).
+/// Whether `peer_id` stands revoked, by its key or by the `n-` principal that key derives, without
+/// triggering file I/O (safe to call while holding `shared.log`).
 fn is_peer_revoked_raw(shared: &Shared, peer_id: Option<[u8; 32]>) -> bool {
-    match peer_id {
-        Some(ref pk) => shared
-            .revoked_identities
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(pk),
-        None => false,
+    let Some(ref pk) = peer_id else {
+        return false;
+    };
+    if shared
+        .revoked_identities
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(pk)
+    {
+        return true;
     }
+    let principals = shared
+        .revoked_principals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    !principals.is_empty() && principals.contains(&identity_principal(pk))
 }
 
-/// Whether `peer_id` (an Ed25519 identity key from `serve_tcp_identity`) has been
-/// revoked via [`Broker::revoke_identity`] or a `SIGHUP` revocation-file reload.
+/// Whether `peer_id` (an Ed25519 identity key from `serve_tcp_identity` or `serve_stream`) has
+/// been revoked via [`Broker::revoke_identity`], [`Broker::revoke_principal`] on the principal it
+/// derives, or a `SIGHUP` revocation-file reload.
 fn is_peer_revoked(shared: &Shared, peer_id: Option<[u8; 32]>) -> bool {
     maybe_reload_revocation_file(shared);
     is_peer_revoked_raw(shared, peer_id)
@@ -1203,6 +1259,9 @@ enum Conn {
     Tcp(TcpStream),
     #[cfg(feature = "aead")]
     Sealed(astream_aead::SealedStream<TcpStream>),
+    /// A stream its owner authenticated ([`Broker::serve_stream`]), with the key it proved.
+    #[cfg(feature = "stream")]
+    Stream(crate::stream_link::LinkEnd, [u8; 32]),
 }
 
 impl Conn {
@@ -1213,6 +1272,8 @@ impl Conn {
             Conn::Tcp(s) => s.set_read_timeout(d),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.get_ref().set_read_timeout(d),
+            #[cfg(feature = "stream")]
+            Conn::Stream(s, _) => s.0.set_read_timeout(d),
         }
     }
 
@@ -1223,6 +1284,8 @@ impl Conn {
             Conn::Tcp(s) => s.set_write_timeout(d),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.get_ref().set_write_timeout(d),
+            #[cfg(feature = "stream")]
+            Conn::Stream(s, _) => s.0.set_write_timeout(d),
         }
     }
 
@@ -1236,6 +1299,8 @@ impl Conn {
             Conn::Tcp(s) => s.set_nonblocking(on),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.get_ref().set_nonblocking(on),
+            #[cfg(feature = "stream")]
+            Conn::Stream(s, _) => s.0.set_nonblocking(on),
         }
     }
 
@@ -1264,6 +1329,8 @@ impl Conn {
                 kept_from_children(clone.get_ref())?;
                 Conn::Sealed(clone)
             }
+            #[cfg(feature = "stream")]
+            Conn::Stream(s, peer) => Conn::Stream(s.clone(), *peer),
         })
     }
 
@@ -1288,6 +1355,11 @@ impl Conn {
                 kept_from_children(&clone)?;
                 Sock::Tcp(clone)
             }
+            #[cfg(feature = "stream")]
+            Conn::Stream(s, peer) => Sock::Stream {
+                link: Arc::clone(&s.0),
+                peer: *peer,
+            },
         })
     }
 
@@ -1299,6 +1371,8 @@ impl Conn {
             Conn::Tcp(s) => s.shutdown(Shutdown::Write),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.get_ref().shutdown(Shutdown::Write),
+            #[cfg(feature = "stream")]
+            Conn::Stream(s, _) => s.0.shutdown(Shutdown::Write),
         };
     }
 }
@@ -1311,6 +1385,8 @@ impl Read for Conn {
             Conn::Tcp(s) => s.read(buf),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.read(buf),
+            #[cfg(feature = "stream")]
+            Conn::Stream(s, _) => s.read(buf),
         }
     }
 }
@@ -1323,6 +1399,8 @@ impl Write for Conn {
             Conn::Tcp(s) => s.write(buf),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.write(buf),
+            #[cfg(feature = "stream")]
+            Conn::Stream(s, _) => s.write(buf),
         }
     }
 
@@ -1333,6 +1411,8 @@ impl Write for Conn {
             Conn::Tcp(s) => s.flush(),
             #[cfg(feature = "aead")]
             Conn::Sealed(s) => s.flush(),
+            #[cfg(feature = "stream")]
+            Conn::Stream(s, _) => s.flush(),
         }
     }
 }
@@ -1910,7 +1990,9 @@ impl HelloCopy {
                         | crate::proto::REQUEST_GAP_NOTICES
                         | crate::proto::REQUEST_TOLD_FETCH
                         | crate::proto::REQUEST_BROKER_TIMES
-                        | crate::proto::REQUEST_STATS,
+                        | crate::proto::REQUEST_STATS
+                        | crate::proto::REQUEST_BURST_MARKS
+                        | crate::proto::REQUEST_RELAY,
                 ),
                 // Never copied: the answer reads it fresh from the vitals
                 // (`hello_health`), since it moves with every batch's flush.
@@ -2074,6 +2156,11 @@ struct Shared {
     /// Revoked capability principals (`p=<principal>`, including `n-<16 hex>` node
     /// principals derived from revoked Ed25519 keys via [`identity_principal`]).
     revoked_principals: Mutex<RevocationSet<String>>,
+    /// Whose relayed records this broker takes: `identity_principal(key) -> key`.
+    #[cfg(feature = "relay")]
+    origin_keys: Mutex<std::collections::BTreeMap<String, [u8; 32]>>,
+    /// Relayed records refused for what they are ([`ERR_ORIGIN_REFUSED`]).
+    origin_refused: AtomicU64,
     /// Revocation file tracked for automatic Apple `SIGHUP` reload (`REQUIREMENTS` R6).
     revocation_file: Mutex<Option<RevocationFileState>>,
     /// Fast atomic flag set once [`Broker::load_revocation_file`] has been called.
@@ -2486,6 +2573,8 @@ struct TailAsks {
     idle_marks: bool,
     gaps: bool,
     broker_times: bool,
+    burst_marks: bool,
+    origin_stamps: bool,
 }
 
 /// The broker side of a [`Broker::pause_last_scan_round`] rendezvous.
@@ -3546,6 +3635,8 @@ impl Drop for ConnGuard<'_> {
 /// Operational snapshot of a running [`Broker`] (`REQUIREMENTS` R5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerStats {
+    /// Relayed records refused for what they are: a bad signature, or a revoked or unknown origin.
+    pub origin_refused: u64,
     /// Snapshot of the underlying durable [`BrokerLog`].
     pub log: LogStats,
     /// Subscriber-visible head offset (the durable head in Strict/Relaxed, or the
@@ -4280,6 +4371,19 @@ impl Broker {
             .cold_reads()
     }
 
+    /// What this broker's log's residency tier did since the open
+    /// ([`BrokerLog::tier_tally`]): read around a piece of work, how much of the tier's code
+    /// it ran. A test or debug build only.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn tier_tally(&self) -> crate::TierTally {
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tier_tally()
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn reset_cold_reads(&self) {
         self.shared
@@ -4576,14 +4680,44 @@ impl Broker {
         now_unix_ms()
     }
 
+    /// Say whose relayed records this broker takes: exactly these Ed25519 keys, replacing the set
+    /// the last call gave. An embedder calls it whenever its membership changes. A relayed record
+    /// must name `identity_principal(key)` as its subject's owner, carry that principal's derived
+    /// producer id and be signed by the key ([`origin`](crate::origin)), so a neighbour can
+    /// neither forge another node's record nor race one in ahead of the real one. A broker that
+    /// was given no keys takes no relayed record. A key also stands refused while it is revoked
+    /// ([`revoke_identity`](Self::revoke_identity), [`revoke_principal`](Self::revoke_principal)).
+    #[cfg(feature = "relay")]
+    pub fn set_origin_keys(&self, keys: impl IntoIterator<Item = [u8; 32]>) {
+        let keys: std::collections::BTreeMap<String, [u8; 32]> = keys
+            .into_iter()
+            .map(|key| (identity_principal(&key), key))
+            .collect();
+        let ids: Vec<u64> = keys
+            .keys()
+            .map(|principal| astream_cap::producer_id_of(principal))
+            .collect();
+        *self
+            .shared
+            .origin_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = keys;
+        self.shared
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add_relay_origin_ids(ids);
+    }
+
     /// Revoke an Ed25519 peer identity public key (`REQUIREMENTS` R6).
     ///
     /// Any future connection attempt presenting `pubkey` on `Self::serve_tcp_identity`
     /// is refused during the handshake, any capability bound to `identity_principal(&pubkey)`
     /// (`n-<16 hex>`) is revoked, and any already-open connection authenticated under
     /// `pubkey` is terminated with an `unauthorized` error on its next request or
-    /// subscription delivery (with any pending last will suppressed). Returns `true`
-    /// if `pubkey` was newly added to the revocation set.
+    /// subscription delivery (with any pending last will suppressed), and any stream adopted
+    /// under `pubkey` (`Self::serve_stream`, the `stream` feature's) is shut at once. Returns
+    /// `true` if `pubkey` was newly added to the revocation set.
     pub fn revoke_identity(&self, pubkey: [u8; 32]) -> bool {
         let (added, changed) = insert_identity_revocation(
             &mut self
@@ -4601,6 +4735,8 @@ impl Broker {
         if changed {
             self.shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
             notify_all_tails(&self.shared);
+            #[cfg(feature = "stream")]
+            end_revoked_streams(&self.shared);
         }
         added
     }
@@ -4657,6 +4793,8 @@ impl Broker {
         if added {
             self.shared.revocation_epoch.fetch_add(1, Ordering::AcqRel);
             notify_all_tails(&self.shared);
+            #[cfg(feature = "stream")]
+            end_revoked_streams(&self.shared);
         }
         added
     }
@@ -4781,6 +4919,9 @@ impl Broker {
             acceptors_abandoned: AtomicU64::new(0),
             revoked_identities: Mutex::new(RevocationSet::new()),
             revoked_principals: Mutex::new(RevocationSet::new()),
+            #[cfg(feature = "relay")]
+            origin_keys: Mutex::new(std::collections::BTreeMap::new()),
+            origin_refused: AtomicU64::new(0),
             revocation_file: Mutex::new(None),
             has_revocation_file: AtomicBool::new(false),
             sighup_seen: AtomicU64::new(0),
@@ -5150,7 +5291,8 @@ impl Broker {
             return Err(empty_secret());
         }
         match astream_cap::Grant::parse(follower_cap.filter.as_str()) {
-            Ok(g) if g.mode == astream_cap::Mode::ReadWrite && g.principal.is_none() => {}
+            Ok(g)
+                if g.mode == astream_cap::Mode::ReadWrite && g.principal.is_none() && !g.relay => {}
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -6102,6 +6244,40 @@ impl Broker {
         Ok((listener, node, wake))
     }
 
+    /// Serve one connection over `link`, a stream the embedder ALREADY authenticated as the
+    /// holder of `peer_pubkey`: no listener, no handshake and no second identity. The peer is
+    /// `identity_principal(&peer_pubkey)`, exactly as on [`serve_tcp_identity`](Self::serve_tcp_identity):
+    /// a grant naming any other `n-` principal is refused at `Attach`, and a revoked key is
+    /// refused here, ends this connection at once ([`revoke_identity`](Self::revoke_identity)),
+    /// and drops its last will.
+    ///
+    /// The connection runs on a thread of its own, which the returned handle joins; it counts
+    /// against the connection cap and shuts `link` as it ends. Dropping the handle detaches it.
+    ///
+    /// # Errors
+    /// `PermissionDenied` for a revoked key or principal (`link` is shut); the thread's spawn.
+    #[cfg(feature = "stream")]
+    pub fn serve_stream(
+        &self,
+        link: Arc<dyn crate::stream_link::StreamLink>,
+        peer_pubkey: [u8; 32],
+    ) -> io::Result<JoinHandle<io::Result<()>>> {
+        if is_peer_revoked(&self.shared, Some(peer_pubkey)) {
+            let _ = link.shutdown(Shutdown::Both);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unauthorized: peer identity key has been revoked",
+            ));
+        }
+        let shared = self.shared.clone();
+        thread::Builder::new().spawn(move || {
+            let conn = Conn::Stream(crate::stream_link::LinkEnd(Arc::clone(&link)), peer_pubkey);
+            let res = handle_conn_with_peer(&shared, conn, Wire::Tcp, "stream", Some(peer_pubkey));
+            let _ = link.shutdown(Shutdown::Both);
+            res
+        })
+    }
+
     /// Like [`serve`](Self::serve) but over TCP — multi-machine, PLAINTEXT and
     /// unauthenticated, so for a TRUSTED network only (the sealed transport is
     /// `serve_tcp_sealed`, with the `aead` feature). Binds `addr` (use `127.0.0.1:0`
@@ -6412,6 +6588,7 @@ fn stats_of(shared: &Shared) -> BrokerStats {
     #[cfg(not(feature = "retention"))]
     let (retention_ticks, retention_skips) = (0, 0);
     BrokerStats {
+        origin_refused: shared.origin_refused.load(Ordering::Relaxed),
         log,
         visible_head,
         active_conns,
@@ -6490,6 +6667,7 @@ fn health_of(shared: &Shared) -> crate::health::BrokerHealth {
         parked_tails: count64(stats.parked_tails),
         flushes,
         process_flushes: Some(astream_sys::flush_tally()),
+        process_flush_times: Some(astream_sys::flush_times()),
         resident: Some(crate::health::Residency {
             records: count64(stats.log.resident_records),
             bytes: count64(stats.log.resident_bytes),
@@ -6649,6 +6827,13 @@ impl Drop for Broker {
         // never called (`active_listeners == 0`), this `Broker` IS the lifecycle: stop
         // the writer and release the log's file lock.
         if self.shared.active_listeners.load(Ordering::Acquire) == 0 {
+            // A broker that only ever adopted streams has no handle to end them.
+            #[cfg(feature = "stream")]
+            {
+                self.shared.running.store(false, Ordering::Relaxed);
+                notify_all_tails(&self.shared);
+                BrokerHandle::force_close_conns(&self.shared);
+            }
             stop_writer(&self.shared);
         }
     }
@@ -7341,6 +7526,16 @@ fn serve_conn(
     if !shared.running.load(Ordering::Relaxed) {
         return Ok(());
     }
+    // A revocation that ran before this connection registered found nothing to end.
+    #[cfg(feature = "stream")]
+    if let Conn::Stream(_, peer) = &stream {
+        if is_peer_revoked(shared, Some(*peer)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unauthorized: peer identity key has been revoked",
+            ));
+        }
+    }
     // Nothing is known about the peer until its first frame — on a guarded broker,
     // until it has a capability accepted: bound that wait (see FIRST_FRAME_TIMEOUT).
     // `preauth` is that phase; `preauth_deadline` the instant a guarded connection
@@ -7602,6 +7797,19 @@ fn serve_conn(
                             let why = ungranted(secret, &keyring, &req, now);
                             let err = refusal(ERR_UNAUTHORIZED, why);
                             let keep_open = match &req {
+                                Request::Relay {
+                                    producer_id,
+                                    producer_seq,
+                                    ..
+                                } => emit_producer_refusal(
+                                    shared,
+                                    &mut stream,
+                                    &mut pipe,
+                                    fences_gaps.then_some(conn_id),
+                                    *producer_id,
+                                    *producer_seq,
+                                    err,
+                                )?,
                                 Request::Publish {
                                     producer_id,
                                     producer_seq,
@@ -7928,7 +8136,7 @@ fn dispatch_request(
             Ok(false)
         }
         Request::Last { filter, after, max } => {
-            serve_last(shared, stream, pipe, asks.broker_times, filter, after, max)
+            serve_last(shared, stream, pipe, *asks, filter, after, max)
         }
         Request::Will {
             producer_id,
@@ -7985,6 +8193,65 @@ fn dispatch_request(
             asks.broker_times = true;
             write_frame(stream, &encode_response(&mark_at_head(shared)))?;
             Ok(true)
+        }
+        Request::BurstMarks => {
+            finish_pipe(pipe)?;
+            asks.burst_marks = true;
+            write_frame(stream, &encode_response(&mark_at_head(shared)))?;
+            Ok(true)
+        }
+        Request::OriginStamps => {
+            finish_pipe(pipe)?;
+            asks.origin_stamps = true;
+            write_frame(stream, &encode_response(&mark_at_head(shared)))?;
+            Ok(true)
+        }
+        Request::Relay {
+            producer_id,
+            producer_seq,
+            subject,
+            body,
+        } => {
+            if let Some(err) = publish_subject_error(&subject) {
+                return emit_producer_refusal(
+                    shared,
+                    stream,
+                    pipe,
+                    fence,
+                    producer_id,
+                    producer_seq,
+                    err,
+                );
+            }
+            if let Some(err) = origin_refusal(shared, producer_id, producer_seq, &subject, &body) {
+                if err.0 == ERR_ORIGIN_REFUSED {
+                    shared.origin_refused.fetch_add(1, Ordering::Relaxed);
+                }
+                return emit_producer_refusal(
+                    shared,
+                    stream,
+                    pipe,
+                    fence,
+                    producer_id,
+                    producer_seq,
+                    err,
+                );
+            }
+            // No rate limit: the bucket is the origin's, and a carrier replaying one genuine
+            // record would spend it under the origin's id. The origin's own broker charged the
+            // record when it was published.
+            emit_conn_op(
+                shared,
+                stream,
+                pipe,
+                fence,
+                WriteKind::Relay {
+                    producer_id,
+                    producer_seq,
+                    subject,
+                    body,
+                },
+            )
         }
         Request::FenceGaps => {
             // Answered in the request loop after the pending acks, so every write this
@@ -8057,16 +8324,7 @@ fn dispatch_request(
             from_offset,
             filter,
             max,
-        } => serve_fetch(
-            shared,
-            stream,
-            pipe,
-            asks.gaps,
-            asks.broker_times,
-            from_offset,
-            filter,
-            max,
-        ),
+        } => serve_fetch(shared, stream, pipe, *asks, from_offset, filter, max),
         Request::Retire {
             producer_id,
             subject,
@@ -8436,7 +8694,7 @@ fn serve_last(
     shared: &Arc<Shared>,
     stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
-    broker_times: bool,
+    asks: TailAsks,
     filter: String,
     after: String,
     max: u32,
@@ -8453,7 +8711,8 @@ fn serve_last(
         }
     };
     let want = max.min(LAST_PAGE_MAX) as usize;
-    let (page, bts, resume, head) = match last_page(shared, &filt, &after, want, broker_times) {
+    let (page, bts, resume, head) = match last_page(shared, &filt, &after, want, asks.broker_times)
+    {
         Ok(v) => v,
         Err(msg) => {
             return emit(stream, pipe, Err(refusal(ERR_REFUSED, msg)));
@@ -8462,7 +8721,7 @@ fn serve_last(
     let mut out = Vec::new();
     for (i, rec) in page.iter().enumerate() {
         let bt_ms = bts.get(i).copied().flatten();
-        queue_delivery_maybe_stamped(shared, stream, &mut out, rec, broker_times, bt_ms)?;
+        queue_delivery_maybe_stamped(shared, stream, &mut out, rec, asks, bt_ms)?;
     }
     let resume_str = match resume {
         Some(r) => r,
@@ -8680,13 +8939,11 @@ fn serve_will(
 /// that asked for gap notices (`gaps`; R4's addendum A9) is read from `from_offset` while
 /// retention still holds records of its filter below the oldest, the notice ahead of the
 /// page ([`BrokerLog::fetch_told`]); every other is refused `retained-from=<oldest>`.
-#[allow(clippy::too_many_arguments)]
 fn serve_fetch(
     shared: &Arc<Shared>,
     stream: &mut Conn,
     pipe: &mut Option<Pipeline>,
-    gaps: bool,
-    broker_times: bool,
+    asks: TailAsks,
     from_offset: u64,
     filter: String,
     max: u32,
@@ -8710,14 +8967,14 @@ fn serve_fetch(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let head = shared.head.load(Ordering::Relaxed);
-        let read = if gaps {
+        let read = if asks.gaps {
             log.fetch_told(from_offset, &filt, max as usize, FETCH_SCAN_MAX, head)
         } else {
             log.fetch_checked(from_offset, &filt, max as usize, FETCH_SCAN_MAX, head)
                 .map(|(page, next)| (page, next, None))
         };
         let mut bts = Vec::new();
-        if broker_times {
+        if asks.broker_times {
             if let Ok((ref page, _, _)) = read {
                 bts.reserve(page.len());
                 for rec in page {
@@ -8753,7 +9010,7 @@ fn serve_fetch(
     }
     for (i, rec) in page.iter().enumerate() {
         let bt_ms = bts.get(i).copied().flatten();
-        queue_delivery_maybe_stamped(shared, stream, &mut out, rec, broker_times, bt_ms)?;
+        queue_delivery_maybe_stamped(shared, stream, &mut out, rec, asks, bt_ms)?;
     }
     let mut closing = mark(next, head, durable, String::new());
     if let Response::Mark { oldest: o, .. } = &mut closing {
@@ -8779,6 +9036,72 @@ fn retained_from_msg(filter: &str, floor: u64) -> String {
 /// broker-internal commit subject (a record there would bypass exactly-once dedup
 /// and never be delivered — consumer-group commits go through `Commit` /
 /// `ProcessAndProduce`). Either is permanent.
+/// Why a relayed record may not be appended, if it may not: it is checked before the dedup index,
+/// so a forged record cannot take a real one's key, and off the writer, so a neighbour's burst of
+/// signatures holds up no other connection. On every broker, guarded or not: this is the record's
+/// own proof, where a grant only says who may carry it.
+#[cfg(feature = "relay")]
+fn origin_refusal(
+    shared: &Shared,
+    producer_id: u64,
+    producer_seq: u64,
+    subject: &str,
+    body: &[u8],
+) -> Option<Refusal> {
+    let refused = |why: String| Some(refusal(ERR_ORIGIN_REFUSED, why));
+    if producer_seq >= crate::ACK_SEQ_BASE {
+        return refused(format!(
+            "relay: sequence {producer_seq} is in the reserved ack half"
+        ));
+    }
+    let Some(owner) = astream_cap::relay_owner(subject) else {
+        return refused(format!("relay: {subject:?} names no owner"));
+    };
+    if astream_cap::producer_id_of(owner) != producer_id {
+        return refused(format!(
+            "relay: {subject:?} is not producer {producer_id}'s"
+        ));
+    }
+    let key = {
+        let keys = shared
+            .origin_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if keys.is_empty() {
+            return Some(refusal(
+                ERR_RELAY_NOT_READY,
+                "relay: this broker has been given no origin keys",
+            ));
+        }
+        keys.get(owner).copied()
+    };
+    let Some(key) = key else {
+        return refused(format!("relay: {owner} is not a known origin"));
+    };
+    if is_peer_revoked(shared, Some(key)) {
+        return refused(format!("relay: origin {owner} is revoked"));
+    }
+    if !crate::origin::verify(&key, subject, producer_seq, body) {
+        return refused(format!("relay: bad signature from {owner} on {subject:?}"));
+    }
+    None
+}
+
+/// A build with no signature check takes no relayed record.
+#[cfg(not(feature = "relay"))]
+fn origin_refusal(
+    _shared: &Shared,
+    _producer_id: u64,
+    _producer_seq: u64,
+    _subject: &str,
+    _body: &[u8],
+) -> Option<Refusal> {
+    Some(refusal(
+        ERR_RELAY_NOT_READY,
+        "this broker was built without astream-broker's `relay` feature",
+    ))
+}
+
 fn publish_subject_error(subject: &str) -> Option<Refusal> {
     if Subject::new(subject).is_err() {
         Some(refusal(ERR_BAD_SUBJECT, format!("bad subject {subject:?}")))
@@ -8945,11 +9268,15 @@ fn attach_grant(
         // the fleet root keeps. It is legal and it is a footgun, so say so once, on
         // stderr, where an operator can see which grant it was.
         (astream_cap::Mode::ReadWrite, None) => {
-            eprintln!(
+            if parsed.relay {
+                // Writes under an origin's id only where a subject names that origin.
+            } else {
+                eprintln!(
                 "astream-broker: warn: attached an UNBOUND read-write grant {grant:?} — it may \
                  publish under ANY producer id (no principal binding); mint it as \
                  \"rw,p=<principal>:<filter>\" unless it is deliberately the fleet root"
             );
+            }
         }
         // A read-only grant publishes nothing, so it binds nothing: binding it would
         // let a read-only holder append a /a/bind record.
@@ -9060,6 +9387,9 @@ fn cap_authorized_until(
         // UNBOUND, because the record carries a producer id this connection's principal
         // does not derive and never could.
         Replicate(&'a str),
+        // A RELAYED write: a relay (or unbound) grant over the subject, under the id of the
+        // subject's owner.
+        Relay(&'a str, u64),
         // Any genuine, unexpired grant on the connection.
         AnyValid,
         // A genuine, unexpired read-write grant that publishes as `producer_id`.
@@ -9126,6 +9456,11 @@ fn cap_authorized_until(
             producer_id,
             ..
         } => (CapPred::Publish(subject, *producer_id), None),
+        Request::Relay {
+            subject,
+            producer_id,
+            ..
+        } => (CapPred::Relay(subject, *producer_id), None),
         // The commit HALF of a read-process-write also advances a consumer group,
         // so authorize BOTH the output subject AND the group (as a subject the ring
         // grants) — not the output subject alone.
@@ -9188,6 +9523,8 @@ fn cap_authorized_until(
         | Request::IdleMarks
         | Request::GapNotices
         | Request::BrokerTimes
+        | Request::BurstMarks
+        | Request::OriginStamps
         | Request::FenceGaps
         | Request::ClearGapFences => (CapPred::AnyValid, None),
         // A producer's budget is answered to whoever could spend it: a genuine,
@@ -9208,6 +9545,9 @@ fn cap_authorized_until(
             let matched = match pred {
                 CapPred::Publish(subject, producer_id) => {
                     astream_cap::grants_publish(secret, c, subject, producer_id, now_ms)
+                }
+                CapPred::Relay(subject, producer_id) => {
+                    astream_cap::grants_relay(secret, c, subject, producer_id, now_ms)
                 }
                 CapPred::Commit(group) => astream_cap::grants_commit(secret, c, group, now_ms),
                 CapPred::Read(filter) => astream_cap::grants_filter(secret, c, filter, now_ms),
@@ -9264,6 +9604,7 @@ fn oversized_name(req: &Request) -> Option<String> {
     const NONE: (&str, &str) = ("", "");
     let names: [(&str, &str); 2] = match req {
         Request::Publish { subject, .. }
+        | Request::Relay { subject, .. }
         | Request::Will { subject, .. }
         | Request::Retire { subject, .. } => [("subject", subject), NONE],
         Request::Subscribe { filter, .. }
@@ -9295,6 +9636,8 @@ fn oversized_name(req: &Request) -> Option<String> {
         | Request::IdleMarks
         | Request::GapNotices
         | Request::BrokerTimes
+        | Request::BurstMarks
+        | Request::OriginStamps
         | Request::FenceGaps
         | Request::ClearGapFences
         | Request::Budget { .. } => [NONE, NONE],
@@ -9536,6 +9879,17 @@ fn emit_producer_refusal(
             },
         )
     } else {
+        // Through the pipeline even when this is the connection's first write: an inline ack
+        // stops the read half, and a client still writing its burst reads no acks until that
+        // write returns. A run of refusals fills both ways' buffers and stalls them against
+        // each other.
+        if pipe.is_none() {
+            *pipe = Some(Pipeline::start(
+                stream,
+                Duration::from_millis(shared.write_timeout_ms.load(Ordering::Relaxed)),
+                shared.writes.clone(),
+            )?);
+        }
         emit(stream, pipe, Err(err))
     }
 }
@@ -10228,6 +10582,11 @@ fn stage_batch_ops(
                     producer_seq,
                     ..
                 }
+                | WriteKind::Relay {
+                    producer_id,
+                    producer_seq,
+                    ..
+                }
                 | WriteKind::ProcessAndProduce {
                     producer_id,
                     producer_seq,
@@ -10303,6 +10662,12 @@ fn stage_batch_ops(
                 subject,
                 body,
             } => guard.stage_publish(producer_id, producer_seq, subject, body),
+            WriteKind::Relay {
+                producer_id,
+                producer_seq,
+                subject,
+                body,
+            } => guard.stage_relay(producer_id, producer_seq, subject, body),
             WriteKind::Commit { group, upto } => match guard.stage_commit(group, upto) {
                 Ok(off) => Ok((off, false)),
                 Err(e) => Err(e),
@@ -11669,7 +12034,7 @@ fn tail_deliver_batch(
     batch_bts: &[Option<u64>],
     cursor: &mut u64,
     filter: &Filter,
-    broker_times: bool,
+    asks: TailAsks,
     peer_id: Option<[u8; 32]>,
     cap_check: &mut StreamCapCheck,
     until: &mut u64,
@@ -11700,7 +12065,7 @@ fn tail_deliver_batch(
         }
         if filter.matches_str(&rec.subject) {
             let bt_ms = batch_bts.get(i).copied().flatten();
-            queue_delivery_maybe_stamped(shared, stream, out, &rec, broker_times, bt_ms)?;
+            queue_delivery_maybe_stamped(shared, stream, out, &rec, asks, bt_ms)?;
             wrote = true;
         }
     }
@@ -11770,6 +12135,8 @@ fn tail_loop(
     let mut wrote_at = Instant::now();
     let mut said_caught_up = false;
     let mut marked_durable: u64 = 0;
+    // A `Request::BurstMarks` reader is owed a `Mark` at each catch-up after a delivery.
+    let mut owes_burst_mark = asks.burst_marks;
     loop {
         let mut gap = None;
         let mut batch_bts = Vec::new();
@@ -11846,17 +12213,19 @@ fn tail_loop(
             if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
                 return end_stream_failure(stream, &mut out, failure);
             }
-            if idle_marks
-                && (!said_caught_up
-                    || wrote_at.elapsed() >= idle_mark
-                    || (shared.durable_marks
-                        && marked_durable < cursor
-                        && shared.durable.load(Ordering::Relaxed) > marked_durable))
+            if owes_burst_mark
+                || idle_marks
+                    && (!said_caught_up
+                        || wrote_at.elapsed() >= idle_mark
+                        || (shared.durable_marks
+                            && marked_durable < cursor
+                            && shared.durable.load(Ordering::Relaxed) > marked_durable))
             {
                 let head = shared.head.load(Ordering::Relaxed);
                 marked_durable = durable_for(shared, head);
                 write_mark(stream, cursor, head, marked_durable)?;
                 said_caught_up = true;
+                owes_burst_mark = false;
                 wrote_at = Instant::now();
             }
             #[cfg(test)]
@@ -11930,7 +12299,7 @@ fn tail_loop(
             &batch_bts,
             &mut cursor,
             &filter,
-            asks.broker_times,
+            asks,
             peer_id,
             &mut cap_check,
             &mut until,
@@ -11942,6 +12311,7 @@ fn tail_loop(
         tail_pause_at(&mut pause, PauseAt::FirstChunk, cursor);
         if wrote {
             wrote_at = Instant::now();
+            owes_burst_mark = asks.burst_marks;
         } else if idle_marks && wrote_at.elapsed() >= idle_mark {
             if let Some(failure) = stream_failure(shared, peer_id, &mut cap_check, &mut until) {
                 return end_stream_failure(stream, &mut out, failure);
@@ -12020,11 +12390,14 @@ fn queue_delivery_maybe_stamped<S: Write>(
     stream: &mut S,
     out: &mut Vec<u8>,
     rec: &BrokerRecord,
-    broker_times: bool,
+    asks: TailAsks,
     bt_ms: Option<u64>,
 ) -> io::Result<()> {
-    if broker_times {
-        append_delivery_frame_stamped(out, rec.seq.0, &rec.subject, &rec.body, bt_ms)?;
+    if asks.broker_times || asks.origin_stamps {
+        let origin = asks
+            .origin_stamps
+            .then_some((rec.producer_id, rec.producer_seq));
+        append_delivery_frame_stamped(out, rec.seq.0, &rec.subject, &rec.body, bt_ms, origin)?;
         if out.len() >= EGRESS_CHUNK {
             flush_egress(stream, out)?;
         }

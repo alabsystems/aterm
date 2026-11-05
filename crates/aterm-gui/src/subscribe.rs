@@ -60,7 +60,7 @@ impl TargetStreams {
 /// What the client asked for at instance scope, before any authority check.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) struct RequestedInstance {
-    /// The instance lifecycle stream: `EVENT * session-created <sid>` when any session spawns and `EVENT * session-exited <sid> reason=<shell-exit|ctl-close|ui-close|window-close|unknown>` when one closes, so a supervisor learns of siblings without polling.
+    /// The instance lifecycle stream: `EVENT * session-created <sid>` when any session spawns and `EVENT * session-exited <sid> reason=<shell-exit|ctl-close|ui-close|window-close|reaper|unknown>` when one closes, so a supervisor learns of siblings without polling.
     pub sessions: bool,
 }
 
@@ -282,6 +282,10 @@ struct Watch {
     last_block_id: Option<u64>,
     last_turn_id: Option<u64>,
     last_timeline_id: Option<u64>,
+    /// An `events` watch's `role= attention= user_title=`, as `meta` prints them, read in the
+    /// same meta hold as `last_timeline_id` ([`watch_start`]): its ack says them
+    /// ([`ack_tail`]), and every later change is an `EVENT <local> meta` past the watermark.
+    acked_meta: Option<String>,
     last_resize_id: u64,
     last_title: Option<String>,
     last_bell: u64,
@@ -843,20 +847,31 @@ fn drain_mail_events(watch: &mut Watch, sid: &str, out: &mut String) {
     watch.last_direct_mail_id = watch.last_direct_mail_id.max(high);
 }
 
-fn log_anchor(watch: &Watch) -> String {
-    watch.log.as_ref().map_or_else(String::new, |lw| {
+/// What a target's `sub <local> <sid>` ack says after its sid: a `log` watch's anchor
+/// (` log_seq= log_ep= log_base=`), then an `events` watch's meta ([`Watch::acked_meta`]: ` role=
+/// attention= user_title=`), each empty when the watch has none.
+fn ack_tail(watch: &Watch) -> String {
+    let mut tail = watch.log.as_ref().map_or_else(String::new, |lw| {
         format!(
             " log_seq={} log_ep={} log_base={}",
             lw.cursor.seq, lw.cursor.ep, lw.base
         )
-    })
+    });
+    if let Some(meta) = &watch.acked_meta {
+        tail.push(' ');
+        tail.push_str(meta);
+    }
+    tail
 }
 
-fn with_log_anchors<'h>(handshake: &'h str, watches: &[Watch]) -> std::borrow::Cow<'h, str> {
-    if watches.iter().all(|w| w.log.is_none()) {
+fn with_ack_tails<'h>(handshake: &'h str, watches: &[Watch]) -> std::borrow::Cow<'h, str> {
+    if watches
+        .iter()
+        .all(|w| w.log.is_none() && w.acked_meta.is_none())
+    {
         return std::borrow::Cow::Borrowed(handshake);
     }
-    let mut out = String::with_capacity(handshake.len() + 32 * watches.len());
+    let mut out = String::with_capacity(handshake.len() + 64 * watches.len());
     for line in handshake.split_inclusive('\n') {
         let watch = line
             .strip_prefix("sub ")
@@ -864,10 +879,10 @@ fn with_log_anchors<'h>(handshake: &'h str, watches: &[Watch]) -> std::borrow::C
             .filter(|local| local.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|local| local.parse::<u64>().ok())
             .and_then(|local| watches.iter().find(|w| w.local_id == local));
-        match (watch.map(log_anchor), line.strip_suffix('\n')) {
-            (Some(anchor), Some(body)) if !anchor.is_empty() => {
+        match (watch.map(ack_tail), line.strip_suffix('\n')) {
+            (Some(tail), Some(body)) if !tail.is_empty() => {
                 out.push_str(body);
-                out.push_str(&anchor);
+                out.push_str(&tail);
                 out.push('\n');
             }
             _ => out.push_str(line),
@@ -1130,11 +1145,12 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
     frames
 }
 
-/// What a watch reads from its session besides the engine: the byte fan-out (the `bytes` stream), the turn ledger and the event timeline (the `events` digest), the inbox (`mail`), and the published frame (`screen`, `cells`); and the watcher list its subscription registers on, which the writes to all of these ring.
+/// What a watch reads from its session besides the engine: the byte fan-out (the `bytes` stream), the turn ledger, the meta its ack seeds and the event timeline (the `events` digest), the inbox (`mail`), and the published frame (`screen`, `cells`); and the watcher list its subscription registers on, which the writes to all of these ring.
 #[derive(Clone)]
 pub(crate) struct WatchSource {
     byte_fanout: Arc<ByteFanout>,
     turns: Arc<Mutex<TurnLedger>>,
+    meta: Arc<Mutex<crate::session_timeline::SessionMeta>>,
     timeline: Arc<Mutex<crate::session_timeline::SessionTimeline>>,
     fabric: Arc<crate::fabric::SessionFabric>,
     frame: Arc<FrameSlot>,
@@ -1147,6 +1163,7 @@ impl WatchSource {
         WatchSource {
             byte_fanout: ctx.byte_fanout.clone(),
             turns: ctx.turns.clone(),
+            meta: ctx.meta.clone(),
             timeline: ctx.timeline.clone(),
             fabric: ctx.fabric.clone(),
             frame: ctx.frame.clone(),
@@ -1224,7 +1241,7 @@ fn new_watch_at(
     } = target;
     let records_read = src.watchers.records_rung();
     let engine = engine_seed(term, &src.frame, streams);
-    let (last_timeline_id, last_resize_id) = initial_timeline_watermarks(&src.timeline, streams);
+    let (last_timeline_id, last_resize_id, acked_meta) = watch_start(src, streams);
     Watch {
         local_id: *local_id,
         term: term.clone(),
@@ -1263,6 +1280,7 @@ fn new_watch_at(
             .filter(|anchor| *anchor <= crate::control::turn_ids_minted())
             .or_else(|| initial_turn_watermark(&src.turns, streams)),
         last_timeline_id,
+        acked_meta,
         last_resize_id,
         last_title: engine.title,
         last_bell: engine.bell,
@@ -1534,7 +1552,7 @@ pub(crate) fn push_loop_with_peer_probe<W: Write, L: PeerLiveness>(
         let _ = sub.watch(peer);
     }
 
-    let handshake = with_log_anchors(handshake, &watches);
+    let handshake = with_ack_tails(handshake, &watches);
     if !handshake.is_empty()
         && (writer.write_all(handshake.as_bytes()).is_err() || writer.flush().is_err())
     {
@@ -1756,6 +1774,38 @@ fn initial_turn_watermark(turns: &Arc<Mutex<TurnLedger>>, streams: TargetStreams
     turns.lock().unwrap_or_else(|p| p.into_inner()).high_id()
 }
 
+/// An `events` watch's timeline and resize watermarks ([`initial_timeline_watermarks`]) and the
+/// meta its ack says (critic item E05), all read in ONE meta hold. Every meta write records its
+/// `meta-change` row inside the session's meta hold (meta → timeline,
+/// [`crate::session_timeline::SessionTimeline::record_meta_change`]), so each change is either
+/// already in the fields the ack says or a row past the watermark, an `EVENT <local> meta` this
+/// watch pushes: none falls between the two.
+fn watch_start(src: &WatchSource, streams: TargetStreams) -> (Option<u64>, u64, Option<String>) {
+    watch_start_with(src, streams, initial_timeline_watermarks)
+}
+
+/// [`watch_start`] with its watermark read passed in, so a test can ask what is held while the
+/// watermark is read.
+fn watch_start_with(
+    src: &WatchSource,
+    streams: TargetStreams,
+    watermarks: impl FnOnce(
+        &Arc<Mutex<crate::session_timeline::SessionTimeline>>,
+        TargetStreams,
+    ) -> (Option<u64>, u64),
+) -> (Option<u64>, u64, Option<String>) {
+    if !streams.events {
+        return (None, 0, None);
+    }
+    let meta = src.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let (head, resizes) = watermarks(&src.timeline, streams);
+    (
+        head,
+        resizes,
+        Some(crate::control::presence_meta_tokens(&meta)),
+    )
+}
+
 fn initial_timeline_watermarks(
     timeline: &Arc<Mutex<crate::session_timeline::SessionTimeline>>,
     streams: TargetStreams,
@@ -1873,12 +1923,12 @@ fn drain_membership(
     for (target, sid, fresh) in picked {
         let mut watch = new_watch_at(&target, streams, opts, fresh);
         watch.dirty = watch_session(sub, &target.src.watchers, streams);
-        let anchor = log_anchor(&watch);
+        let tail = ack_tail(&watch);
         watches.push(watch);
         out.push(Frame::text(
             Tag::Instance,
             t_us,
-            format!("sub {} {sid}{anchor}\n", target.local_id),
+            format!("sub {} {sid}{tail}\n", target.local_id),
         ));
     }
     if !roster.is_empty() {
@@ -2184,7 +2234,7 @@ mod tests {
 
         assert_eq!(
             adopt(&mut watches, &mut sub, &mut cursors),
-            format!("sub 5 {sid}\n"),
+            format!("sub 5 {sid}{UNSET_META}\n"),
             "the adopted channel is acked exactly like a handshake channel"
         );
         assert_eq!(watches.len(), 1, "and it joined the watch set");
@@ -2203,6 +2253,145 @@ mod tests {
         assert!(
             frames_for_watch(&mut watches[0], streams, true).is_empty(),
             "an adopted watch is seeded at the LIVE highs, so it replays no backlog"
+        );
+    }
+
+    /// AN EVENTS ACK SAYS THE MEANING FIELDS ITS WATCH STARTS FROM, AND ITS EVENTS SAY EVERY
+    /// CHANGE AFTER (critic item E05): a handshake channel's ack and an adopted one's both carry
+    /// `role= attention= user_title=` as `meta` prints them, read in one meta hold with the
+    /// watch's timeline watermark, so a change made before the watch is in the ack and replays no
+    /// event, and one made after is an `EVENT <local> meta` and not in the ack: no change is in
+    /// neither. A watch without `events` says none in its ack.
+    #[test]
+    fn an_events_ack_says_the_meta_its_watch_starts_from_and_its_events_every_change_after() {
+        use crate::session_timeline::{MetaEdit, MetaField};
+        let set = |h: &crate::session_store::SessionHandle, field, value| {
+            crate::session_timeline::write_session_meta(
+                &h.ctx,
+                field,
+                MetaEdit::Set(value),
+                aterm_slog::Actor::Ctl,
+            )
+            .expect("the meta write");
+        };
+        let events = TargetStreams {
+            events: true,
+            ..Default::default()
+        };
+        let meta_events = |w: &mut Watch| -> Vec<String> {
+            text(&frames_for_watch(w, events, true))
+                .lines()
+                .filter(|line| line.contains(" meta "))
+                .map(str::to_string)
+                .collect()
+        };
+
+        let h = crate::session_store::test_handle(7);
+        set(&h, MetaField::Role, "worker");
+        set(&h, MetaField::Title, "build agent");
+        let mut w = new_watch(&target_of(&h), events, &PushOptions::default());
+        set(&h, MetaField::Role, "lead");
+        let ack = with_ack_tails("sub 7 s-x\n", std::slice::from_ref(&w));
+        assert_eq!(
+            ack, "sub 7 s-x role=worker attention=- user_title=build%20agent\n",
+            "the handshake's ack says the fields the watch starts from"
+        );
+        assert_eq!(
+            meta_events(&mut w),
+            ["EVENT 7 meta field=role value=lead"],
+            "the change after the watch's start is its event, and the ones before are not"
+        );
+
+        let store = crate::session_store::new_store();
+        let adopted = crate::session_store::test_handle(8);
+        let sid = adopted.sid.as_str().to_string();
+        set(&adopted, MetaField::Attention, "-");
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(adopted.clone());
+        let (mut watches, mut sub) = (Vec::new(), Subscription::new());
+        let mut cursors = PushCursors {
+            roster: None,
+            adopt_seq: 0,
+            pruned_at: None,
+            instance_dirty: None,
+            reader: None,
+        };
+        let acks = text(&drain_membership(
+            &store,
+            &mut watches,
+            &mut sub,
+            events,
+            &PushOptions::default(),
+            AdoptScope::authorize(true, Scope::Owner),
+            &mut cursors,
+        ));
+        assert_eq!(
+            acks,
+            format!("sub 8 {sid} role=- attention=%2D user_title=-\n"),
+            "an adopted channel's ack says them too"
+        );
+        assert!(meta_events(&mut watches[0]).is_empty(), "and replays none");
+
+        let screen = TargetStreams {
+            screen: true,
+            ..Default::default()
+        };
+        let quiet = new_watch(&target_of(&h), screen, &PushOptions::default());
+        assert_eq!(
+            with_ack_tails("sub 7 s-x\n", std::slice::from_ref(&quiet)),
+            "sub 7 s-x\n",
+            "a watch without events says no meta in its ack"
+        );
+    }
+
+    /// AN EVENTS WATCH READS ITS ACK'S META AND ITS TIMELINE WATERMARK IN ONE META HOLD (critic
+    /// item E05's review): [`watch_start`] holds the session's meta while it reads the watermark,
+    /// so no `meta set` lands between the fields its ack says and the point its events start
+    /// (each meta write records its `meta-change` row inside that hold), and the ack's fields
+    /// are read off that same guard. The watermark read here is [`initial_timeline_watermarks`]
+    /// behind a probe that asks whether the meta is free. CONTROL: a start that reads the fields
+    /// in a hold of their own and the watermark after it, which would lose a change landing
+    /// between the two (in neither the ack nor an event), finds the meta free there.
+    #[test]
+    fn an_events_watch_reads_its_acks_meta_and_its_watermark_in_one_meta_hold() {
+        let h = crate::session_store::test_handle(7);
+        let src = WatchSource::of(&h.ctx);
+        let events = TargetStreams {
+            events: true,
+            ..Default::default()
+        };
+        let meta_free = std::cell::Cell::new(None);
+        let probe = |timeline: &Arc<Mutex<crate::session_timeline::SessionTimeline>>, streams| {
+            meta_free.set(Some(!matches!(
+                src.meta.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            )));
+            initial_timeline_watermarks(timeline, streams)
+        };
+
+        let (_, _, acked) = watch_start_with(&src, events, probe);
+        assert_eq!(
+            meta_free.take(),
+            Some(false),
+            "the watermark is read inside the meta hold"
+        );
+        assert_eq!(acked.as_deref(), Some(UNSET_META.trim_start()));
+
+        let split = || {
+            let acked = {
+                let meta = src.meta.lock().unwrap_or_else(|p| p.into_inner());
+                crate::control::presence_meta_tokens(&meta)
+            };
+            let (head, resizes) = probe(&src.timeline, events);
+            (head, resizes, Some(acked))
+        };
+        let _ = split();
+        assert_eq!(
+            meta_free.take(),
+            Some(true),
+            "CONTROL: a split start reads its watermark with the meta free"
         );
     }
 
@@ -2297,6 +2486,7 @@ mod tests {
             _cells_hold: None,
             last_block_id: None,
             last_timeline_id: None,
+            acked_meta: None,
             last_resize_id: 0,
             last_turn_id: None,
             last_title: None,
@@ -5334,7 +5524,7 @@ mod tests {
         };
         let mut landed = false;
         let mut sink = Scripted::new(|line: &str| {
-            if line == "sub 5 s-flood" {
+            if line == format!("sub 5 s-flood{UNSET_META}") {
                 let _ = seeded.send(());
             }
             landed |= line == "EVENT 5 title done";
@@ -5389,7 +5579,7 @@ mod tests {
         let mut written = 0;
         let mut sink = Scripted::new(|line: &str| {
             let read = line == format!("EVENT 5 meta n={}", written.max(1) - 1);
-            if line == "sub 5 s-trickle" || (read && written < N) {
+            if line == format!("sub 5 s-trickle{UNSET_META}") || (read && written < N) {
                 record(written);
                 written += 1;
                 return true;
@@ -5463,7 +5653,7 @@ mod tests {
         });
         let (mut pushed, mut landed) = (0, false);
         let mut sink = Scripted::new(|line: &str| {
-            if line == "sub 5 s-mixed" {
+            if line == format!("sub 5 s-mixed{UNSET_META}") {
                 let _ = seeded.send(());
             }
             pushed += usize::from(line.starts_with("EVENT 5 meta n="));
@@ -6257,6 +6447,10 @@ mod tests {
         }
     }
 
+    /// What an `events` ack says after its sid for a session whose meta is unset (critic item
+    /// E05, [`ack_tail`]).
+    const UNSET_META: &str = " role=- attention=- user_title=-";
+
     fn hang_detector(what: &'static str) -> impl FnMut() -> bool {
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         move || {
@@ -6313,7 +6507,7 @@ mod tests {
         }
 
         fn ack_line(&self) -> String {
-            format!("sub {} {}", self.local, self.sid)
+            format!("sub {} {}{UNSET_META}", self.local, self.sid)
         }
 
         fn created_line(&self) -> String {
@@ -6527,7 +6721,10 @@ mod tests {
         acks.sort_unstable();
         assert_eq!(
             acks,
-            [format!("sub 3 {c}"), format!("sub 5 {e}")],
+            [
+                format!("sub 3 {c}{UNSET_META}"),
+                format!("sub 5 {e}{UNSET_META}")
+            ],
             "the ones still waiting are acked by the pass that adopts them, and \
              not announced again"
         );
@@ -6622,7 +6819,7 @@ mod tests {
         );
         assert_eq!(
             membership(&mut watches, &mut sub, &mut cursors),
-            format!("sub {CAP} {s_sid}\n"),
+            format!("sub {CAP} {s_sid}{UNSET_META}\n"),
             "the membership pass after the prune adopts S"
         );
     }
@@ -6634,7 +6831,7 @@ mod tests {
         let (local, sid, ctx) = (s.local_id, s.sid.as_str().to_string(), s.ctx.clone());
         store.write().unwrap_or_else(|p| p.into_inner()).register(s);
         let active: crate::control::ActiveHandle = Arc::new(Mutex::new(None));
-        let ack = format!("sub {local} {sid}");
+        let ack = format!("sub {local} {sid}{UNSET_META}");
         let pushed = format!("EVENT {local} topic add {PROBE_TOPIC} ");
         let mut added = false;
         let mut sink = Scripted::new(|line: &str| {
@@ -6712,7 +6909,7 @@ mod tests {
         store.write().unwrap_or_else(|p| p.into_inner()).register(h);
         let active: crate::control::ActiveHandle = Arc::new(Mutex::new(None));
         let (ack, exited) = (
-            format!("sub {local} {sid}"),
+            format!("sub {local} {sid}{UNSET_META}"),
             format!("EVENT {local} exited"),
         );
         let mut seen: Option<(usize, bool)> = None;
@@ -6844,7 +7041,10 @@ mod tests {
         assert_eq!(acked.len(), CAP, "every handshake target is acked");
         let left_over = left_over.expect("REACH: one session was left over at the cap");
         assert!(
-            wire.contains(&format!("sub {left_over} {}\n", sids[&left_over])),
+            wire.contains(&format!(
+                "sub {left_over} {}{UNSET_META}\n",
+                sids[&left_over]
+            )),
             "the session the cap left over is acked once a slot frees"
         );
     }
@@ -7134,7 +7334,7 @@ mod tests {
         }
 
         fn decided(&mut self, frames: &str) -> (i64, i64) {
-            let picked = frames.contains(&format!("sub {} {}\n", Self::S, self.sid));
+            let picked = frames.contains(&format!("sub {} {}{UNSET_META}\n", Self::S, self.sid));
             self.ack_written |= picked;
             let created = format!("EVENT * session-created {}", self.sid);
             let line = if frames.contains(&format!("{created} watch=deferred\n")) {
@@ -7182,7 +7382,7 @@ mod tests {
             let mut frames = String::new();
             for (target, sid) in picked {
                 self.sub.watch(&target.src.watchers);
-                frames.push_str(&format!("sub {} {sid}\n", target.local_id));
+                frames.push_str(&format!("sub {} {sid}{UNSET_META}\n", target.local_id));
                 self.watches.push(new_watch(
                     &target,
                     TargetStreams {
@@ -7218,6 +7418,7 @@ mod log_stream_tests {
             src: WatchSource {
                 byte_fanout: Arc::new(ByteFanout::new()),
                 turns: Arc::new(Mutex::new(TurnLedger::default())),
+                meta: Arc::default(),
                 timeline: timeline.clone(),
                 fabric: Arc::default(),
                 frame: Arc::default(),
@@ -7275,7 +7476,7 @@ mod log_stream_tests {
         let (live, _) = log_watch(&tl, None, LogFilter::default());
         let ack = "OK subscribe 1\nsub 1 s-aaaa\n";
         assert_eq!(
-            with_log_anchors(ack, std::slice::from_ref(&live)),
+            with_ack_tails(ack, std::slice::from_ref(&live)),
             "OK subscribe 1\nsub 1 s-aaaa log_seq=2 log_ep=1 log_base=1\n"
         );
         let (resumed, _) = log_watch(
@@ -7284,12 +7485,12 @@ mod log_stream_tests {
             LogFilter::default(),
         );
         assert_eq!(
-            with_log_anchors(ack, std::slice::from_ref(&resumed)),
+            with_ack_tails(ack, std::slice::from_ref(&resumed)),
             "OK subscribe 1\nsub 1 s-aaaa log_seq=1 log_ep=1 log_base=1\n"
         );
         let mut quiet = live;
         quiet.log = None;
-        assert_eq!(with_log_anchors(ack, std::slice::from_ref(&quiet)), ack);
+        assert_eq!(with_ack_tails(ack, std::slice::from_ref(&quiet)), ack);
     }
 
     /// C13 (ROBUST-3): a resumed watch whose cursor names another log (`log-base=`) reads this
@@ -7322,7 +7523,7 @@ mod log_stream_tests {
             LogFilter::default(),
         );
         assert_eq!(
-            with_log_anchors(ack, std::slice::from_ref(&foreign)),
+            with_ack_tails(ack, std::slice::from_ref(&foreign)),
             format!("OK subscribe 1\nsub 1 s-aaaa log_seq=1 log_ep={ep} log_base={other}\n"),
             "the ack names the log the watch was asked to start in"
         );

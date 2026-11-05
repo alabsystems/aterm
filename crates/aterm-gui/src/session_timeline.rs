@@ -130,6 +130,38 @@ pub(crate) fn carried_attention(value: &str) -> Option<String> {
 
 const MAX_PAYLOAD: usize = 256;
 
+/// A finite continuity generation with an explicit, absorbing exhausted state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RelaunchEpoch(Option<u64>);
+
+impl Default for RelaunchEpoch {
+    fn default() -> Self {
+        Self(Some(0))
+    }
+}
+
+impl RelaunchEpoch {
+    fn advance(&mut self) {
+        self.0 = self.0.and_then(|epoch| epoch.checked_add(1));
+    }
+
+    fn same(self, other: Self) -> bool {
+        self.0.is_some() && self == other
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn for_test(epoch: u64) -> Self {
+        Self(Some(epoch))
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn test_value(self) -> Option<u64> {
+        self.0
+    }
+}
+
 /// The user-settable per-session metadata (`meta set`/`meta unset`).
 #[derive(Default, Clone, Debug)]
 pub(crate) struct SessionMeta {
@@ -141,6 +173,10 @@ pub(crate) struct SessionMeta {
     pub(crate) attention_owners: AttentionOwners,
     pub(crate) supervisor: Option<SupervisorClaim>,
     pub(crate) supervisor_revision: u64,
+    /// Exhaustion is permanent for this session; an absent epoch cannot prove continuity.
+    pub(crate) builtin_relaunch_epoch: RelaunchEpoch,
+    /// Authored only by the authenticated claim setter; never inferred from holder text.
+    pub(crate) supervisor_builtin: bool,
     /// The connections proven claims were bound to, with each claim's proof
     /// ([`SupervisorClaim::identity`]), kept past the claim's end until the connection closes
     /// ([`Self::close_connection`]): a `kind=wait` written on one is its claimant's own.
@@ -195,6 +231,8 @@ impl PartialEq for SessionMeta {
             attention_owners: _,
             supervisor: _,
             supervisor_revision: _,
+            builtin_relaunch_epoch: _,
+            supervisor_builtin: _,
             claimant_conn: _,
             scoped_input_connections: _,
             scoped_input_actors: _,
@@ -324,6 +362,8 @@ impl SessionMeta {
             attention_owners: AttentionOwners::default(),
             supervisor: None,
             supervisor_revision: 0,
+            builtin_relaunch_epoch: RelaunchEpoch::default(),
+            supervisor_builtin: false,
             claimant_conn: Vec::new(),
             scoped_input_connections: Vec::new(),
             scoped_input_actors: Vec::new(),
@@ -449,6 +489,22 @@ impl SessionMeta {
     /// Capture the live claim and its revision together. This snapshot describes duty ownership;
     /// it grants no input or act admission and must be checked again before either is admitted.
     #[must_use]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "Capture",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "NativeObservationContinuity",
+            action = "ForeignExpiry",
+            reason = "The fixture advances the external clock past the foreign lease; this reader observes expiry without resetting the retained revocation epoch."
+        )
+    )]
     pub(crate) fn supervisor_authority(&self, now_us: u64) -> SupervisorAuthority {
         let claim = self.live_claim(now_us);
         SupervisorAuthority {
@@ -464,6 +520,11 @@ impl SessionMeta {
             conn: claim.and_then(|c| c.conn),
             scopes: claim.and_then(|c| c.scoped.as_ref().map(|s| s.claim.scopes.clone())),
             revision: self.supervisor_revision,
+            builtin_relaunch_epoch: self.builtin_relaunch_epoch,
+            builtin_relaunch_kept: claim.is_none_or(|claim| {
+                self.supervisor_builtin
+                    || !claim.takes(aterm_agent::harness::contract::Scope::Relaunch)
+            }),
         }
     }
 
@@ -536,11 +597,111 @@ impl SessionMeta {
     /// during the lapse never comes back); a proven claim bound to a connection is recorded in
     /// [`Self::claimant_conn`] until that connection closes, and an unproven claim bound to a
     /// connection clears any earlier proof recorded for that connection.
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "OwnClaim",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "OwnRenew",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "OwnRelease",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "OwnRetake",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "ForeignRelaunch",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "ForeignReturn",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "ForeignUpgradeOnly",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "OverflowForeign",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "OverflowReturn",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "NativeObservationContinuity",
+            action = "NearExhaustion",
+            reason = "The fixture sets the epoch beside its last values, a state no run reaches by counting; no production step takes it there."
+        )
+    )]
     fn set_supervisor(
         &mut self,
         claim: Option<SupervisorClaim>,
         now_us: u64,
     ) -> (u64, AttentionMove) {
+        let builtin = crate::control::serving_principal() == crate::control::Principal::Harness
+            && crate::control::serving_peer_pid() == Some(std::process::id())
+            && crate::control::serving_connection().is_some()
+            && claim.as_ref().is_some_and(|claim| {
+                claim.holder == crate::harness_host::holder()
+                    && match claim.conn {
+                        Some(conn) => Some(conn) == crate::control::serving_connection(),
+                        None => claim.expires_us.is_some(),
+                    }
+            });
+        let old_kept = self.supervisor.as_ref().is_none_or(|claim| {
+            self.supervisor_builtin || !claim.takes(aterm_agent::harness::contract::Scope::Relaunch)
+        });
+        let new_kept = claim.as_ref().is_none_or(|claim| {
+            builtin || !claim.takes(aterm_agent::harness::contract::Scope::Relaunch)
+        });
+        if old_kept != new_kept {
+            self.builtin_relaunch_epoch.advance();
+        }
+        self.supervisor_builtin = builtin;
         if let Some(scoped) = claim.as_ref().and_then(|claim| claim.scoped.as_ref()) {
             if !self.scoped_input_actors.contains(&scoped.proven) {
                 self.scoped_input_actors.push(scoped.proven.clone());
@@ -1206,9 +1367,67 @@ pub(crate) struct SupervisorAuthority {
     conn: Option<u64>,
     scopes: Option<aterm_agent::harness::contract::Scopes>,
     revision: u64,
+    builtin_relaunch_epoch: RelaunchEpoch,
+    builtin_relaunch_kept: bool,
 }
 
 impl SupervisorAuthority {
+    /// Passive evidence survives only uninterrupted built-in Relaunch ownership.
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "ProveOwnContinuity",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "ProveAfterForeignReturn",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "ProveAfterForeignExpiry",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "ProveUnrelatedDuty",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "ProveAfterOverflow",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "NativeObservationContinuity",
+            action = "CaptureAfterOverflow",
+            project = "control::control_native_observe_tests::continuity_transition"
+        )
+    )]
+    pub(crate) fn same_builtin_relaunch_continuity(&self, other: &Self) -> bool {
+        self.builtin_relaunch_kept
+            && other.builtin_relaunch_kept
+            && self
+                .builtin_relaunch_epoch
+                .same(other.builtin_relaunch_epoch)
+    }
     /// The live holder, or none once its lease has lapsed.
     #[must_use]
     pub(crate) fn holder(&self) -> Option<&str> {
@@ -2530,7 +2749,7 @@ impl FencedWrites {
             revision,
             active,
             id: id.to_string(),
-            _boundary: boundary,
+            boundary: Arc::new(boundary),
         })
     }
 
@@ -2562,10 +2781,16 @@ pub(crate) struct NativeCustody {
     revision: u64,
     active: ActiveInput,
     id: String,
-    _boundary: aterm_types::update_boundary::Held<'static>,
+    boundary: Arc<aterm_types::update_boundary::Held<'static>>,
 }
 
 impl NativeCustody {
+    /// Keep the app handoff fenced after input custody drains, while a terminal
+    /// receipt becomes durable. This retains the existing hold without racing
+    /// a new admission against a pending handoff.
+    pub(crate) fn handoff_guard(&self) -> Arc<aterm_types::update_boundary::Held<'static>> {
+        Arc::clone(&self.boundary)
+    }
     pub(crate) fn drain(&self) -> NativeDrain {
         NativeDrain {
             state: Arc::clone(&self.state),
@@ -3327,6 +3552,16 @@ impl UpgradeOwner {
 /// How long the outputs after a holder's first look for Claude's effort hint keep reading the
 /// live screen for it ([`SessionTimeline::effort_hint_looks`]).
 pub(crate) const EFFORT_HINT_LOOK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What a worker's launcher holds its launch for ([`SessionTimeline::worker_pool_hold`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerPoolHold {
+    /// When the first of the pool's rows opens, Unix seconds.
+    pub(crate) until: i64,
+    /// Why nothing can take the launch now, in this crate's own words.
+    pub(crate) because: &'static str,
+}
+
 /// A session's lifecycle state under one lock: its session log, whose rows are the timeline
 /// ([`crate::session_timeline_view`]), and what the session publishes beside it.
 #[derive(Default)]
@@ -3378,9 +3613,15 @@ pub(crate) struct SessionTimeline {
     handoff_ceiling: Option<u64>,
     task: Option<crate::task_record::TaskRecord>,
     worker_launch: Option<(std::time::Instant, String)>,
-    /// The worker's launcher is installing its program, or holding its launch for a pool row,
-    /// now (`task_launch::InstallingMark`).
+    /// The worker's launcher is installing its program or preparing its Google sign-in now
+    /// (`task_launch::InstallingMark`).
     worker_installing: bool,
+    /// The atpkg child that install runs, once the launcher has spawned it, while the mark stands.
+    worker_install_child: Option<u32>,
+    /// The worker's launcher is holding its launch for a pool now (`task_launch::PoolHoldMark`).
+    worker_pool_hold: Option<WorkerPoolHold>,
+    /// When its last hold ended, so a line typed then has a whole startup deadline to start in.
+    worker_pool_hold_ended: Option<std::time::Instant>,
     claude_excerpts: Option<(i32, crate::survey::ClaudeExcerpts)>,
     codex_survey: Option<(i32, crate::survey::CodexSurvey)>,
     /// The background terminals codex-alab's own record counts for the codex process in group `.0`
@@ -4097,6 +4338,12 @@ impl SessionTimeline {
         self.resizes.note_tried(id);
     }
 
+    /// The repaint nudge's attempt for epoch `id` gave up, unanswered
+    /// ([`crate::resize_epoch::EpochBook::note_unrepaired`]).
+    pub(crate) fn note_resize_unrepaired(&mut self, id: u64) {
+        self.resizes.note_unrepaired(id);
+    }
+
     /// The repaint nudge's attempt for epoch `id` was superseded by a real resize.
     pub(crate) fn note_resize_superseded(&mut self, id: u64) {
         self.resizes.note_superseded(id);
@@ -4361,17 +4608,52 @@ impl SessionTimeline {
         self.worker_launch.as_ref()
     }
 
-    /// Note whether the worker's launcher is installing its program, or holding its launch for
-    /// a pool row, now (`task_launch::InstallingMark`).
+    /// Note whether the worker's launcher is installing its program or preparing its Google sign-in
+    /// now (`task_launch::InstallingMark`).
     pub(crate) fn set_worker_installing(&mut self, installing: bool) {
         self.worker_installing = installing;
+        self.worker_install_child = None;
     }
 
-    /// Whether the worker's launcher is installing its program, or holding its launch for a pool
-    /// row, now. The startup deadline does not judge the worker while it is
-    /// (`harness_host::look_at_startups`).
+    /// Note the atpkg child the launcher's install just spawned (`task_launch::install_with`).
+    pub(crate) fn set_worker_install_child(&mut self, pid: u32) {
+        self.worker_install_child = Some(pid);
+    }
+
+    /// The atpkg child the worker's launcher is installing its program by, whose pass on atpkg's
+    /// `progress.json` is that install's work (`harness_host::InstallWork`). `None` before the
+    /// spawn returns, under a launcher's Google preparation, which runs no such child, and once the
+    /// mark is gone.
+    pub(crate) const fn worker_install_child(&self) -> Option<u32> {
+        self.worker_install_child
+    }
+
+    /// Whether the worker's launcher is installing its program or preparing its Google sign-in now.
+    /// While it is, the startup deadline judges the worker by whether that work moves, not by the
+    /// deadline's own 120 s (`harness_host::look_at_startups`, `harness_host::INSTALL_QUIET_LIMIT`).
     pub(crate) const fn worker_installing(&self) -> bool {
         self.worker_installing
+    }
+
+    /// Note the hold the worker's launcher has its launch under now, or that it ended
+    /// (`task_launch::PoolHoldMark`).
+    pub(crate) fn set_worker_pool_hold(&mut self, hold: Option<WorkerPoolHold>) {
+        if hold.is_none() && self.worker_pool_hold.is_some() {
+            self.worker_pool_hold_ended = Some(std::time::Instant::now());
+        }
+        self.worker_pool_hold = hold;
+    }
+
+    /// What the worker's launcher is holding its launch for now. The startup deadline judges a
+    /// worker through this (`harness_host::StartupHold::LaunchHeld`): what holds it may stand for
+    /// days, and whoever started the worker is owed that news.
+    pub(crate) const fn worker_pool_hold(&self) -> Option<&WorkerPoolHold> {
+        self.worker_pool_hold.as_ref()
+    }
+
+    /// When the worker's launcher last stopped holding its launch for a pool.
+    pub(crate) const fn worker_pool_hold_ended(&self) -> Option<std::time::Instant> {
+        self.worker_pool_hold_ended
     }
 
     /// Publish the session's need verdict ([`Self::need`]).
@@ -5126,6 +5408,13 @@ impl SessionTimeline {
             && let Some((owner, card)) = self.carried_card(facts)
         {
             self.claude_card = Some((*np, *ns, owner, card));
+        }
+        if let Some((pgid, started, facts)) = &next {
+            self.slog.note_agent_usage(
+                agent_run(*pgid, *started, facts),
+                whole_tokens(facts),
+                facts.account.clone(),
+            );
         }
         self.claude_footer = next;
         self.claude_footer_image = self
@@ -6083,6 +6372,61 @@ mod tests {
         assert!(meta.transfer_native_exec_claim(&moved, 13, 100).is_none());
     }
 
+    #[test]
+    fn passive_relaunch_continuity_rejects_spoofed_holder_and_expired_foreign_aba() {
+        let mut meta = SessionMeta::default();
+        let original = meta.supervisor_authority(100);
+        meta.set_supervisor(None, 100);
+        let benign = meta.supervisor_authority(100);
+        assert_ne!(original.revision(), benign.revision());
+        assert!(original.same_builtin_relaunch_continuity(&benign));
+        // Identical attribution text is not authenticated built-in custody.
+        meta.set_supervisor(
+            Some(SupervisorClaim {
+                holder: crate::harness_host::holder(),
+                conn: Some(71),
+                expires_us: Some(101),
+                proven: None,
+                scoped: None,
+            }),
+            100,
+        );
+        assert!(!original.same_builtin_relaunch_continuity(&meta.supervisor_authority(100)));
+        // Expiry cannot hide the intervening foreign acquisition, even when the
+        // next writer observes an already absent live claim.
+        meta.set_supervisor(None, 102);
+        assert!(!original.same_builtin_relaunch_continuity(&meta.supervisor_authority(102)));
+        assert_eq!(meta.builtin_relaunch_epoch.test_value(), Some(2));
+    }
+
+    #[test]
+    fn passive_relaunch_continuity_exhaustion_never_reuses_a_generation() {
+        let mut meta = SessionMeta::default();
+        let original = meta.supervisor_authority(100);
+        assert!(original.same_builtin_relaunch_continuity(&original));
+        meta.builtin_relaunch_epoch = RelaunchEpoch::for_test(u64::MAX - 1);
+        meta.set_supervisor(
+            Some(SupervisorClaim {
+                holder: "foreign".into(),
+                conn: Some(71),
+                expires_us: None,
+                proven: None,
+                scoped: None,
+            }),
+            100,
+        );
+        assert_eq!(meta.builtin_relaunch_epoch.test_value(), Some(u64::MAX));
+        meta.set_supervisor(None, 100);
+        assert_eq!(meta.builtin_relaunch_epoch.test_value(), None);
+        let exhausted = meta.supervisor_authority(100);
+        assert!(!original.same_builtin_relaunch_continuity(&exhausted));
+        assert!(!exhausted.same_builtin_relaunch_continuity(&exhausted));
+        // A benign claim revision cannot reopen the exhausted generation space.
+        meta.set_supervisor(None, 101);
+        assert_eq!(meta.builtin_relaunch_epoch.test_value(), None);
+        assert!(!exhausted.same_builtin_relaunch_continuity(&meta.supervisor_authority(101)));
+    }
+
     /// One capture preserves a claim's identity, binding and revision, and assigns every duty
     /// exactly once. Legacy foreign claims and v2 retain full ownership; v3 takes its subset.
     /// An expired claim is absent, and reading either snapshot changes no revision.
@@ -6555,6 +6899,8 @@ mod questions_field_tests {
             "ask\u{202e}",
             "rec\u{200b}ommended",
             "whatever claude thinks",
+            "land",
+            "Land",
         ] {
             assert_eq!(normalize_questions_value(bad), None, "{bad:?}");
         }
@@ -7750,6 +8096,34 @@ mod screen_move_tests {
         assert!(!shell.note_screen_move(t0), "no agent");
         assert_eq!(shell.agent().screen_moves, 0);
     }
+}
+
+/// The agent run footer facts speak for, as a tab's spend keys it
+/// (`crate::session_log::SessionLog::note_agent_usage`): its conversation where the registry
+/// names one (a process that takes up a conversation goes on its run), else its process.
+fn agent_run(
+    pgid: i32,
+    started: Option<u64>,
+    facts: &aterm_agent::harness::footer::FooterFacts,
+) -> String {
+    facts.owner.as_ref().map_or_else(
+        || {
+            format!(
+                "p:{pgid}:{}",
+                started.map_or_else(|| "-".to_string(), |s| s.to_string())
+            )
+        },
+        |owner| format!("c:{}", owner.session_id),
+    )
+}
+
+/// The input and output tokens `facts` count, from a usage read that saw the whole run alone.
+fn whole_tokens(facts: &aterm_agent::harness::footer::FooterFacts) -> Option<u64> {
+    facts
+        .usage
+        .as_ref()
+        .filter(|u| u.complete)
+        .map(|u| u.input_total().saturating_add(u.output_total()))
 }
 
 #[cfg(test)]

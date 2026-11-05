@@ -135,8 +135,20 @@ pub fn place(
         std::fs::create_dir(&partial).map_err(|e| io("make", &partial, e))?;
         let copy = partial.join(EXE);
         let ents = partial.join(ENTITLEMENTS_FILE);
-        std::fs::write(&ents, ENTITLEMENTS).map_err(|e| io("write", &ents, e))?;
-        let mut file = std::fs::File::create(&copy).map_err(|e| io("write", &copy, e))?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&ents)
+            .and_then(|mut f| f.write_all(ENTITLEMENTS.as_bytes()))
+            .map_err(|e| io("write", &ents, e))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&copy)
+            .map_err(|e| io("write", &copy, e))?;
         file.write_all(&bytes).map_err(|e| io("write", &copy, e))?;
         file.set_permissions(std::fs::Permissions::from_mode(0o755))
             .map_err(|e| io("chmod", &copy, e))?;
@@ -262,18 +274,19 @@ impl Drop for InUse {
 /// helper outside a content-addressed directory, or a marker that could not be written.
 pub fn mark_ran(exe: &Path) -> Option<InUse> {
     let (dir, _) = content_dir(exe)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(dir.join(RAN))
-        .ok()?;
+    let file = aterm_uds::kept_out(|| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(dir.join(RAN))
+    })
+    .ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;
     }
-    aterm_uds::keep_out_of_children(&file).ok()?;
     #[expect(
         clippy::disallowed_methods,
         reason = "the guard's own take: its Drop releases by LOCK_UN"
@@ -324,35 +337,39 @@ pub fn reclaim(host: &Path, keep: &str, record: Option<&Record>) -> Vec<PathBuf>
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        let path = entry.path();
-        let Some(name) = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-        else {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
             continue;
         };
         // While a copy is removed, its marker is held exclusively, so no helper takes it.
         let mut held = None;
-        let removable = if let Some(rest) = name.strip_prefix(".partial-") {
+        let path = if let Some(rest) = name.strip_prefix(".partial-") {
             // `.partial-<sha256>-<pid>`: a placing whose process is gone; nothing ran from it.
-            rest.rsplit_once('-')
+            let dead = rest
+                .rsplit_once('-')
                 .map(|(_, pid)| pid)
                 .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|pid| pid.parse::<u32>().ok())
-                .is_some_and(|pid| !aterm_uds::process::pid_alive(pid))
-        } else if crate::is_hex(&name, 64) {
-            let named = record.is_some_and(|r| r.helper_sha256 == name);
-            if name != keep && !named {
-                held = removal_guard(&path);
-                held.is_some()
-            } else {
-                false
+                .is_some_and(|pid| !aterm_uds::process::pid_alive(pid));
+            if !dead {
+                continue;
             }
+            entry.path()
+        } else if crate::is_hex(name, 64) {
+            let named = record.is_some_and(|r| r.helper_sha256 == name);
+            if name == keep || named {
+                continue;
+            }
+            let path = entry.path();
+            held = removal_guard(&path);
+            if held.is_none() {
+                continue;
+            }
+            path
         } else {
-            false
+            continue;
         };
-        if removable && std::fs::remove_dir_all(&path).is_ok() {
+        if std::fs::remove_dir_all(&path).is_ok() {
             removed.push(path);
         }
         drop(held);

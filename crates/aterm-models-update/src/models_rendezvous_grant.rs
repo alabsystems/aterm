@@ -29,6 +29,12 @@ pub fn native_update_rendezvous_grant_model() -> Model {
             var empty_declared = 0;
             var empty_offered = 0;
             var sessionless = 0;
+            var desk_capable = 0;
+            var desk_declared = 0;
+            var desk_read = 0;
+            var workers_window = 0;
+            var workers_only = 0;
+            var carried = 0;
 
             action Upgrade when (phase == 0 && capable == 0) {
                 capable = 1;
@@ -57,11 +63,36 @@ pub fn native_update_rendezvous_grant_model() -> Model {
             ) {
                 empty_offered = 1;
             }
+            // A window that holds only an empty Workers list is its own declared capability
+            // (`desk1`). The parent learns it from the read of the target's bundle and no offer
+            // goes on the wire, since the window's row in the layout is the offer.
+            action UpgradeDesk when (phase == 0 && desk_capable == 0) {
+                desk_capable = 1;
+            }
+            action DeclareDesk when (
+                phase == 0 && desk_capable == 1 && desk_declared == 0
+            ) {
+                desk_declared = 1;
+            }
+            action ReadDesk when (
+                phase == 0 && desk_read == 0 && (desk_declared == 1 || Buggy == 1)
+            ) {
+                desk_read = 1;
+            }
+            action WorkersWindow when (phase == 0 && workers_window == 0) {
+                workers_window = 1;
+            }
+            action WorkersOnly when (
+                phase == 0 && sessionless == 1 && workers_window == 1 && workers_only == 0
+            ) {
+                workers_only = 1;
+            }
             action Offer when (phase == 0 && offered == 0 && (declared == 1 || Buggy == 1)) {
                 offered = 1;
             }
             action Launch when (phase == 0) {
                 phase = 1;
+                carried = if desk_read == 1 || Buggy == 1 { workers_window } else { 0 };
             }
             action ClaimOne when (phase == 1 && (offered == 0 || capable == 0)) {
                 claimed = 1;
@@ -73,7 +104,8 @@ pub fn native_update_rendezvous_grant_model() -> Model {
             }
             action GrantOne when (
                 phase == 2 && large == 0 &&
-                (sessionless == 0 || empty_offered == 1 || Buggy == 1)
+                (sessionless == 0 || empty_offered == 1 || Buggy == 1) &&
+                (workers_only == 0 || desk_read == 1 || Buggy == 1)
             ) {
                 grant = 1;
                 need = 1;
@@ -94,6 +126,10 @@ pub fn native_update_rendezvous_grant_model() -> Model {
                 grant = 3;
                 phase = 4;
             }
+            action RefuseDesk when (phase == 2 && workers_only == 1 && desk_read == 0) {
+                grant = 3;
+                phase = 4;
+            }
             action Send when (phase == 3 && sent <= need - 1) {
                 sent = sent + 1;
             }
@@ -108,7 +144,8 @@ pub fn native_update_rendezvous_grant_model() -> Model {
             action Adopt when (
                 adopted == 0 && closed == 0 && (grant == 1 || claimed == 2) &&
                 held > 0 && (held == need || Buggy == 1) &&
-                (sessionless == 0 || (empty_offered == 1 && empty_capable == 1))
+                (sessionless == 0 || (empty_offered == 1 && empty_capable == 1)) &&
+                (workers_only == 0 || desk_capable == 1)
             ) {
                 adopted = 1;
             }
@@ -116,7 +153,8 @@ pub fn native_update_rendezvous_grant_model() -> Model {
                 adopted == 0 && closed == 0 && held == sent && held > 0 &&
                 ((phase == 4 && held <= need - 1) || (grant == 2 && claimed == 1) ||
                     (grant == 1 && sessionless == 1 &&
-                        (empty_offered == 0 || empty_capable == 0)))
+                        (empty_offered == 0 || empty_capable == 0)) ||
+                    (grant == 1 && workers_only == 1 && desk_capable == 0))
             ) {
                 closed = 1;
                 held = if Buggy == 1 { held } else { 0 };
@@ -135,6 +173,14 @@ pub fn native_update_rendezvous_grant_model() -> Model {
                 } else {
                     empty_offered <= 1
                 };
+            invariant DeskReadOnlyWhenDeclared: desk_read <= desk_declared;
+            invariant DeskGrantOnlyWhenRead:
+                if grant == 1 && workers_only == 1 {
+                    desk_read == 1
+                } else {
+                    desk_read <= 1
+                };
+            invariant DescriptorOnlyWhenRead: carried <= desk_read;
         }
     }
 }

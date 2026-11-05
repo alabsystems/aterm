@@ -1,0 +1,51 @@
+# claude-code 2.1.318 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (14x50, aterm 0.154.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Claude Code's prompt-history search (ctrl+r) open in a 14-column window, query please look, its match SCENE-C please look wrapping the composer onto three rows; the long query leaves the label's column two cells wide (`se p… ⏵⏵`), then `ar`, `ch`, a blank row for the space between its words, then `pr`, `om`, `pt`, `s:` · cursor=41,13
+           Opu
+           s
+           5.5
+ ▐▛███▛█   API
+▝▜██████▀  Us
+ ▝▝   ▝▝   age
+           Bi
+           lli
+           ng
+           /…/
+           tmp
+           /at
+           .y1
+           wT/
+           pro
+           j
+
+
+❯ SCENE-C
+  please look
+
+  Read 1 file
+  (ctrl+o to
+  expand)
+
+⏺ Implemented
+  the parser
+  module and
+  its unit
+  tests in
+  this turn.
+
+✻ Cooked for
+  9s · done
+  3:33 PM
+
+──────────────
+❯ SCENE-C
+  please
+  look
+──────────────
+  se p… ⏵⏵
+  ar
+  ch
+
+  pr
+  om
+  pt
+  s:
+

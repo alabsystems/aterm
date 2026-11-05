@@ -1278,7 +1278,7 @@ fn replace_text_placeholders(
     #[cfg(unix)]
     let mut seen: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
     for path in files {
-        let Ok(meta) = std::fs::metadata(&path) else {
+        let Ok((file, meta)) = crate::metadata_io::open_regular_with_meta(&path) else {
             continue;
         };
         #[cfg(unix)]
@@ -1288,7 +1288,9 @@ fn replace_text_placeholders(
                 continue;
             }
         }
-        let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 128 * 1024 * 1024) else {
+        let Ok(bytes) =
+            crate::metadata_io::read_bounded_regular_file(file, &meta, 128 * 1024 * 1024)
+        else {
             continue;
         };
         if bytes.contains(&0) || !bytes.windows(10).any(|w| w == b"@@HOMEBREW") {
@@ -1297,23 +1299,47 @@ fn replace_text_placeholders(
         let mut text = bytes;
         let mut changed = false;
         for (old, new) in &pairs {
-            let replaced = replace_bytes(&text, old.as_bytes(), new.as_bytes());
-            if replaced != text {
-                changed = true;
-                text = replaced;
+            let old = old.as_bytes();
+            if text.windows(old.len()).any(|w| w == old) {
+                let replaced = replace_bytes(&text, old, new.as_bytes());
+                if replaced != text {
+                    changed = true;
+                    text = replaced;
+                }
             }
         }
         if changed {
-            let mode = meta.permissions();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
-            }
-            std::fs::write(&path, &text).map_err(|e| format!("abrew: {e}"))?;
-            let _ = std::fs::set_permissions(&path, mode);
+            rewrite_staged_regular(&path, &meta, &text)?;
         }
     }
+    Ok(())
+}
+
+fn rewrite_staged_regular(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    bytes: &[u8],
+) -> Result<(), String> {
+    use std::io::Write as _;
+    let mode = meta.permissions();
+    #[cfg(unix)]
+    {
+        let _ = crate::metadata_io::set_regular_mode(path, 0o644);
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut f = opts.open(path).map_err(|e| format!("abrew: {e}"))?;
+    if !f.metadata().map_err(|e| format!("abrew: {e}"))?.is_file() {
+        return Err(format!("abrew: {} is not a regular file", path.display()));
+    }
+    f.set_len(0).map_err(|e| format!("abrew: {e}"))?;
+    f.write_all(bytes).map_err(|e| format!("abrew: {e}"))?;
+    let _ = f.set_permissions(mode);
     Ok(())
 }
 
@@ -1368,13 +1394,15 @@ fn relocate_staged(
     }
     collect(staged, &mut files);
     for path in files {
-        let Ok(meta) = std::fs::metadata(&path) else {
+        let Ok((file, meta)) = crate::metadata_io::open_regular_with_meta(&path) else {
             continue;
         };
         if !seen.insert((meta.dev(), meta.ino())) {
             continue;
         }
-        let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 128 * 1024 * 1024) else {
+        let Ok(bytes) =
+            crate::metadata_io::read_bounded_regular_file(file, &meta, 128 * 1024 * 1024)
+        else {
             continue;
         };
         if !bytes.windows(10).any(|w| w == b"@@HOMEBREW") {
@@ -1396,10 +1424,7 @@ fn relocate_staged(
             };
             let install_name_tool = install_name_tool.to_string_lossy();
             let mode = meta.permissions();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
-            }
+            let _ = crate::metadata_io::set_regular_mode(&path, 0o755);
             args.push(shown.clone());
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let out = fetch::run_capture(&install_name_tool, &refs)
@@ -1427,25 +1452,24 @@ fn relocate_staged(
                     String::from_utf8_lossy(&out.stderr).trim()
                 )));
             }
-            let _ = std::fs::set_permissions(&path, mode);
+            if let Ok(file) = crate::metadata_io::open_regular(&path) {
+                let _ = file.set_permissions(mode);
+            }
         } else if !bytes.contains(&0) {
             let mut text = bytes;
             let mut changed = false;
             for (old, new) in &pairs {
-                let replaced = replace_bytes(&text, old.as_bytes(), new.as_bytes());
-                if replaced != text {
-                    changed = true;
-                    text = replaced;
+                let old = old.as_bytes();
+                if text.windows(old.len()).any(|w| w == old) {
+                    let replaced = replace_bytes(&text, old, new.as_bytes());
+                    if replaced != text {
+                        changed = true;
+                        text = replaced;
+                    }
                 }
             }
             if changed {
-                let mode = meta.permissions();
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
-                }
-                std::fs::write(&path, &text).map_err(|e| format!("abrew: {e}"))?;
-                let _ = std::fs::set_permissions(&path, mode);
+                rewrite_staged_regular(&path, &meta, &text)?;
             }
         }
     }
@@ -1457,16 +1481,13 @@ fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> 
         return haystack.to_vec();
     }
     let mut out = Vec::with_capacity(haystack.len());
-    let mut i = 0;
-    while i < haystack.len() {
-        if haystack[i..].starts_with(needle) {
-            out.extend_from_slice(replacement);
-            i += needle.len();
-        } else {
-            out.push(haystack[i]);
-            i += 1;
-        }
+    let mut rest = haystack;
+    while let Some(pos) = rest.windows(needle.len()).position(|w| w == needle) {
+        out.extend_from_slice(&rest[..pos]);
+        out.extend_from_slice(replacement);
+        rest = &rest[pos + needle.len()..];
     }
+    out.extend_from_slice(rest);
     out
 }
 
@@ -1842,7 +1863,7 @@ fn publish_payload_with(
     .map_err(|e| format!("abrew: {e}"))?;
     let prepared_receipt = stash.path().join(receipt_name);
     std::fs::rename(receipt, &prepared_receipt).map_err(|e| format!("abrew: {e}"))?;
-    let identity = std::fs::metadata(staged).map_err(|e| format!("abrew: {e}"))?;
+    let identity = std::fs::symlink_metadata(staged).map_err(|e| format!("abrew: {e}"))?;
     ensure_directory(parent)?;
     super::prefix::publish_directory(staged, live, false)
         .map_err(|e| format!("abrew: cannot publish payload: {e}"))?;
@@ -2415,20 +2436,29 @@ fn owned_keg_links(prefix: &Prefix, name: &str, include_opt: bool) -> Result<Vec
     }
     check_directory(&prefix.cellar().join(name), &prefix.root).map_err(|e| e.message())?;
     let cellar = prefix.cellar().join(name);
+    let versions: Vec<PathBuf> = prefix
+        .installed_one(Kind::Formula, name)
+        .map(|inst| inst.versions.into_iter().map(|v| cellar.join(v)).collect())
+        .unwrap_or_default();
     let mut links = Vec::new();
     for sub in ["bin", "sbin", "lib", "include", "share", "etc"] {
-        owned_links(&prefix.root.join(sub), &cellar, &mut links)?;
+        owned_links(&prefix.root.join(sub), &cellar, &versions, &mut links)?;
     }
     if include_opt {
         let opt = prefix.opt(name);
-        if prefix_owned_target(&opt, &cellar) {
+        if prefix_owned_target_with(&opt, &cellar, &versions) {
             links.push(opt);
         }
     }
     Ok(links)
 }
 
-fn owned_links(dir: &Path, cellar: &Path, links: &mut Vec<PathBuf>) -> Result<(), String> {
+fn owned_links(
+    dir: &Path,
+    cellar: &Path,
+    versions: &[PathBuf],
+    links: &mut Vec<PathBuf>,
+) -> Result<(), String> {
     // Do not traverse a foreign directory symlink, including the top-level root.
     if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir()) {
         return Ok(());
@@ -2438,17 +2468,30 @@ fn owned_links(dir: &Path, cellar: &Path, links: &mut Vec<PathBuf>) -> Result<()
         let entry = entry.map_err(|e| format!("abrew: {e}"))?;
         let p = entry.path();
         let kind = entry.file_type().map_err(|e| format!("abrew: {e}"))?;
-        if kind.is_symlink() && prefix_owned_target(&p, cellar) {
+        if kind.is_symlink() && prefix_owned_target_with(&p, cellar, versions) {
             links.push(p);
         } else if kind.is_dir() {
-            owned_links(&p, cellar, links)?;
+            owned_links(&p, cellar, versions, links)?;
         }
     }
     Ok(())
 }
 
+fn prefix_owned_target_with(link: &Path, package: &Path, versions: &[PathBuf]) -> bool {
+    let Ok(target) = std::fs::read_link(link) else {
+        return false;
+    };
+    link_target_points_into(link, &target, package)
+        && versions
+            .iter()
+            .any(|version| link_target_points_into(link, &target, version))
+}
+
 fn prefix_owned_target(link: &Path, package: &Path) -> bool {
-    if !link_points_into(link, package) {
+    let Ok(target) = std::fs::read_link(link) else {
+        return false;
+    };
+    if !link_target_points_into(link, &target, package) {
         return false;
     }
     let Some(name) = package.file_name().and_then(|n| n.to_str()) else {
@@ -2462,7 +2505,7 @@ fn prefix_owned_target(link: &Path, package: &Path) -> bool {
         .is_some_and(|inst| {
             inst.versions
                 .iter()
-                .any(|version| link_points_into(link, &package.join(version)))
+                .any(|version| link_target_points_into(link, &target, &package.join(version)))
         })
 }
 

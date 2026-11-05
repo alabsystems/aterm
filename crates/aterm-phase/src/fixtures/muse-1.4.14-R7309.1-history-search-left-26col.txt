@@ -1,0 +1,51 @@
+# muse 1.4.14-R7309.1 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (26x50, aterm 0.154.0) running the real Muse Code, launched by path with the lab fake key and `--base-url` the local stub of the API (crates/aterm-lab) · Muse Code's prompt-history search (ctrl+r) in a 26-column window, its query alpha matching alpha old prompt one over an empty composer, left with Esc: the match stays in the composer in typed ink, the search's row gone, the cursor home · cursor=46,2
+
+❯ SCENE-MC please look
+
+◆ Used tool… — unavailable
+├ unknown tool `Read`. Ses
+│ sion tool ids: muse.add_
+│ memory, muse.bash, muse.
+│ bash_input, muse.create_
+│ goal, muse.cron_create,
+│ muse.cron_delete, muse.c
+│ ron_list, muse.edit_file
+│ , muse.edit_memory, muse
+│ .get_goal, muse.list_pee
+│ r_sessions, muse.monitor
+│ , muse.read_file, muse.r
+│ ead_memory, muse.read_sk
+│ ill, muse.report_progres
+│ s, muse.request_user_inp
+│ ut, muse.search, muse.se
+│ nd_session_message, muse
+│ .snooze_reminder, muse.s
+│ ubagent_cancel, muse.sub
+│ agent_read_result, muse.
+│ subagent_send_message, m
+│ use.subagent_spawn, muse
+│ .subagent_status, muse.s
+│ ubagent_wait, muse.updat
+│ e_goal, muse.web_fetch,
+│ muse.web_search, muse.wo
+│ rk_list, muse.work_statu
+│ s, muse.work_stop, muse.
+│ workflow, muse.write_fil
+│ e, muse.write_todos
+└ (ctrl+o to expand)
+
+◆ Implemented the parser
+  module and its unit
+  tests in this turn.
+
+❯ alpha old prompt one
+
+◆ Implemented the parser
+  module and its unit
+  tests in this turn.
+
+── Voice input (⌥ + v to…
+❯ alpha old prompt one
+──────────────────────────
+  lab-stub · high · …/proj
+

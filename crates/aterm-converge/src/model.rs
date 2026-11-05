@@ -242,7 +242,7 @@ pub enum StoodAside {
     Lock(String),
     /// A network the change needs is down (atpkg's exit 69).
     Offline(String),
-    /// The change waits on another person's action (such as admin approval).
+    /// Another actor must finish a prerequisite, such as an admin approval or background pass.
     Waiting(String),
     /// The account has not granted permission the change needs (exit 77).
     Permission(String),

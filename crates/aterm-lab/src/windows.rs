@@ -628,9 +628,7 @@ pub fn iso_name(link: &str) -> Option<String> {
 
 fn uuid4() -> Result<String, String> {
     let mut b = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut b))
-        .map_err(|e| format!("/dev/urandom: {e}"))?;
+    aterm_uds::rand::fill(&mut b).map_err(|e| format!("entropy: {e}"))?;
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h = aterm_codec::hex::encode_lower(&b);
@@ -714,7 +712,7 @@ fn fetch_windows_iso(l: &Layout) -> Result<(PathBuf, String), String> {
             "{name} has SHA-256 {have}, not the {want} Microsoft publishes: removed"
         ));
     }
-    std::fs::write(iso_record(l), format!("{name}\n{want}\n"))
+    crate::util::atomic_write(&iso_record(l), format!("{name}\n{want}\n").as_bytes())
         .map_err(|e| format!("{}: {e}", iso_record(l).display()))?;
     println!("windows: {name} matches Microsoft's published SHA-256 {want}");
     Ok((dest, want))
@@ -1070,7 +1068,7 @@ fn start(l: &Layout, t: &Tools, boot: &Boot) -> Result<(), String> {
         stop_swtpm(l)?;
         return Err(format!("QEMU did not start: {}", out.tail(8)));
     }
-    std::fs::write(l.port(), format!("{}\n", boot.port))
+    crate::util::atomic_write(&l.port(), format!("{}\n", boot.port).as_bytes())
         .map_err(|e| format!("{}: {e}", l.port().display()))
 }
 
@@ -1099,7 +1097,8 @@ pub fn qmp(l: &Layout, commands: &[String]) -> Result<Vec<aterm_json::Value>, St
         .map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(sock.try_clone().map_err(|e| e.to_string())?);
     let mut line = String::new();
-    reader
+    (&mut reader)
+        .take(1024 * 1024)
         .read_line(&mut line)
         .map_err(|e| format!("QMP greeting: {e}"))?;
     let mut answers = Vec::new();
@@ -1110,7 +1109,8 @@ pub fn qmp(l: &Layout, commands: &[String]) -> Result<Vec<aterm_json::Value>, St
             .map_err(|e| format!("QMP: {e}"))?;
         loop {
             line.clear();
-            if reader
+            if (&mut reader)
+                .take(1024 * 1024)
                 .read_line(&mut line)
                 .map_err(|e| format!("QMP: {e}"))?
                 == 0
@@ -1271,17 +1271,17 @@ impl Ssh {
                 };
             }
         };
-        let err_reader = child.stderr.take().map(|mut e| {
+        let err_reader = child.stderr.take().map(|e| {
             std::thread::spawn(move || {
                 let mut s = String::new();
-                let _ = e.read_to_string(&mut s);
+                let _ = e.take(16 * 1024 * 1024).read_to_string(&mut s);
                 s
             })
         });
         let mut text = String::new();
         if let Some(out) = child.stdout.take() {
             let stdout = std::io::stdout();
-            for line in BufReader::new(out).split(b'\n') {
+            for line in BufReader::new(out.take(16 * 1024 * 1024)).split(b'\n') {
                 let Ok(line) = line else { break };
                 let line = String::from_utf8_lossy(&line);
                 let line = line.trim_end_matches('\r');
@@ -1415,7 +1415,7 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     for entry in std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
         if entry.file_type().map_err(|e| e.to_string())?.is_file() {
-            std::fs::copy(entry.path(), to.join(entry.file_name()))
+            crate::util::copy_regular_file(entry.path(), to.join(entry.file_name()))
                 .map_err(|e| format!("{}: {e}", entry.path().display()))?;
         }
     }
@@ -1437,9 +1437,11 @@ fn snapshot(l: &Layout, t: &Tools, fingerprint: &str) -> Result<(), String> {
     if !out.ok() {
         return Err(format!("qemu-img snapshot -c failed: {}", out.tail(5)));
     }
-    std::fs::copy(l.vars(), l.vars_saved()).map_err(|e| format!("{}: {e}", l.vars().display()))?;
+    crate::util::copy_regular_file(l.vars(), l.vars_saved())
+        .map_err(|e| format!("{}: {e}", l.vars().display()))?;
     copy_dir(&l.tpm(), &l.tpm_saved())?;
-    std::fs::write(l.provisioned(), format!("{fingerprint}\n")).map_err(|e| e.to_string())
+    crate::util::atomic_write(&l.provisioned(), format!("{fingerprint}\n").as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 fn revert(l: &Layout, t: &Tools) -> Result<(), String> {
@@ -1451,7 +1453,7 @@ fn revert(l: &Layout, t: &Tools) -> Result<(), String> {
     if !out.ok() {
         return Err(format!("qemu-img snapshot -a failed: {}", out.tail(5)));
     }
-    std::fs::copy(l.vars_saved(), l.vars())
+    crate::util::copy_regular_file(l.vars_saved(), l.vars())
         .map_err(|e| format!("{}: {e}", l.vars_saved().display()))?;
     copy_dir(&l.tpm_saved(), &l.tpm())
 }
@@ -1464,8 +1466,27 @@ fn snapshot_plan(l: &Layout) -> Option<String> {
 }
 
 fn secret_file(path: &Path, text: &str) -> Result<(), String> {
-    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !f
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .is_file()
+    {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    f.set_len(0)
+        .and_then(|()| f.write_all(text.as_bytes()))
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -1501,9 +1522,7 @@ fn lane_password(l: &Layout) -> Result<String, String> {
         return Ok(p.trim().to_string());
     }
     let mut b = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut b))
-        .map_err(|e| format!("/dev/urandom: {e}"))?;
+    aterm_uds::rand::fill(&mut b).map_err(|e| format!("entropy: {e}"))?;
     let p = aterm_codec::hex::encode_lower(&b);
     secret_file(&l.password(), &p)?;
     Ok(p)
@@ -1517,13 +1536,16 @@ fn write_media(l: &Layout, virtio: &Path, public_key: &str, password: &str) -> R
         &dir.join("autounattend.xml"),
         &guest::autounattend(password),
     )?;
-    std::fs::write(
-        dir.join(guest::FIRST_LOGON_FILE),
-        guest::first_logon_script(),
+    crate::util::atomic_write(
+        &dir.join(guest::FIRST_LOGON_FILE),
+        guest::first_logon_script().as_bytes(),
     )
     .map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("administrators_authorized_keys"), public_key)
-        .map_err(|e| e.to_string())?;
+    crate::util::atomic_write(
+        &dir.join("administrators_authorized_keys"),
+        public_key.as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
     let drivers = dir.join(NETKVM_DIR);
     std::fs::create_dir_all(&drivers).map_err(|e| format!("{}: {e}", drivers.display()))?;
     let inf = iso_member(virtio, &format!("{NETKVM_DIR}/{NETKVM_INF}"))?;
@@ -1533,10 +1555,10 @@ fn write_media(l: &Layout, virtio: &Path, public_key: &str, password: &str) -> R
             "{NETKVM_DIR}/{NETKVM_INF} names no netkvm.sys in [SourceDisksFiles]"
         ));
     }
-    std::fs::write(drivers.join(NETKVM_INF), &inf).map_err(|e| e.to_string())?;
+    crate::util::atomic_write(&drivers.join(NETKVM_INF), &inf).map_err(|e| e.to_string())?;
     for file in sources.iter().map(String::as_str).chain([NETKVM_CAT]) {
         let bytes = iso_member(virtio, &format!("{NETKVM_DIR}/{file}"))?;
-        std::fs::write(drivers.join(file), bytes).map_err(|e| e.to_string())?;
+        crate::util::atomic_write(&drivers.join(file), &bytes).map_err(|e| e.to_string())?;
     }
     let _ = std::fs::remove_file(l.media());
     let out = run(
@@ -1558,7 +1580,8 @@ fn write_media(l: &Layout, virtio: &Path, public_key: &str, password: &str) -> R
         return Err(format!("hdiutil makehybrid failed: {}", out.tail(3)));
     }
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::set_permissions(l.media(), std::fs::Permissions::from_mode(0o600))
+    aterm_uds::regular_file::open(&l.media())
+        .and_then(|(f, _)| f.set_permissions(std::fs::Permissions::from_mode(0o600)))
         .map_err(|e| e.to_string())
 }
 
@@ -1657,8 +1680,10 @@ fn new_machine(l: &Layout, t: &Tools) -> Result<(), String> {
     if !out.ok() {
         return Err(format!("qemu-img create failed: {}", out.tail(3)));
     }
-    std::fs::copy(&t.vars, l.vars()).map_err(|e| format!("{}: {e}", t.vars.display()))?;
-    std::fs::set_permissions(l.vars(), std::fs::Permissions::from_mode(0o600))
+    crate::util::copy_regular_file(&t.vars, l.vars())
+        .map_err(|e| format!("{}: {e}", t.vars.display()))?;
+    aterm_uds::regular_file::open(&l.vars())
+        .and_then(|(f, _)| f.set_permissions(std::fs::Permissions::from_mode(0o600)))
         .map_err(|e| e.to_string())
 }
 
@@ -1711,7 +1736,7 @@ fn install(l: &Layout, t: &Tools, timings: &mut Vec<(String, f64)>) -> Result<Ss
             log.tail(20)
         )));
     }
-    std::fs::write(l.installed(), "ok\n").map_err(|e| Fail::die(e.to_string()))?;
+    crate::util::atomic_write(&l.installed(), b"ok\n").map_err(|e| Fail::die(e.to_string()))?;
     Ok(ssh)
 }
 
@@ -1766,7 +1791,8 @@ fn stage_display_driver(l: &Layout, ssh: &Ssh) -> Result<(), String> {
     for (file, want) in guest::VIOGPUDO_FILES {
         let bytes = iso_member(&iso, &format!("{}/{file}", guest::VIOGPUDO_DIR))?;
         let local = l.run().join(file);
-        std::fs::write(&local, &bytes).map_err(|e| format!("{}: {e}", local.display()))?;
+        crate::util::atomic_write(&local, &bytes)
+            .map_err(|e| format!("{}: {e}", local.display()))?;
         let have = sha256_file(&local);
         if have.as_deref() != Ok(want) {
             let _ = std::fs::remove_file(&local);
@@ -1787,18 +1813,20 @@ fn stage_display_driver(l: &Layout, ssh: &Ssh) -> Result<(), String> {
     Ok(())
 }
 
-/// This Mac's `web2` to the guest's [`guest::WEB2`], whose digest the plan's `web2` step checks.
+/// This Mac's `web2` to the guest's [`guest::web2_path`], whose digest the plan's `web2` step
+/// checks.
 fn stage_web2(ssh: &Ssh) -> Result<(), String> {
-    let (dir, _) = guest::WEB2
+    let web2 = guest::web2_path();
+    let (dir, _) = web2
         .rsplit_once('\\')
-        .unwrap_or_else(|| unreachable!("{} names a folder", guest::WEB2));
+        .unwrap_or_else(|| unreachable!("{web2} names a folder"));
     let made = ssh.run(&format!("if not exist {dir} mkdir {dir}"));
     if !made.ok() {
         return Err(format!("mkdir {dir}: {}", made.tail(3)));
     }
     let put = ssh.put(
         Path::new(crate::linux_guest::WEB2),
-        &guest::WEB2.replace('\\', "/"),
+        &web2.replace('\\', "/"),
     );
     if put.ok() { Ok(()) } else { Err(put.tail(3)) }
 }
@@ -2600,9 +2628,8 @@ pub fn boot_lane(l: &Layout) -> Result<LaneLock, Fail> {
 /// `--no-wait` and another run holds it (NOT RUN, naming it), an interrupt while waiting, or the
 /// lock file cannot be made.
 pub fn lane_lock(l: &Layout) -> Result<LaneLock, Fail> {
-    std::fs::create_dir_all(&l.home)
+    crate::util::create_private_dir_all(&l.home)
         .map_err(|e| Fail::die(format!("{}: {e}", l.home.display())))?;
-    let _ = std::fs::set_permissions(&l.home, std::fs::Permissions::from_mode(0o700));
     LaneLock::at(&l.lock(), "windows")
 }
 
@@ -2768,7 +2795,7 @@ pub fn copy_tree(l: &Layout, ssh: &Ssh, repo: &Path) -> Result<(usize, usize), S
     if !send.is_empty() {
         let list = run_dir.join("copy.list");
         let tar = run_dir.join("copy.tar");
-        std::fs::write(&list, send.join("\0")).map_err(|e| e.to_string())?;
+        crate::util::write_fresh(&list, send.join("\0")).map_err(|e| e.to_string())?;
         let out = aterm_uds::spawnfd::command("/usr/bin/tar")
             .args([
                 "-c",
@@ -2816,7 +2843,7 @@ pub fn copy_tree(l: &Layout, ssh: &Ssh, repo: &Path) -> Result<(usize, usize), S
         let mut lines = remove.clone();
         lines.extend(emptied_dirs(&here, &remove).into_iter().map(|d| d + "/"));
         let gone = run_dir.join("copy.remove");
-        std::fs::write(&gone, lines.join("\n")).map_err(|e| e.to_string())?;
+        crate::util::write_fresh(&gone, lines.join("\n")).map_err(|e| e.to_string())?;
         let put = ssh.put(&gone, "C:/lane/copy.remove");
         let out = ssh.ps(&format!(
             "Get-Content -LiteralPath 'C:\\lane\\copy.remove' | ForEach-Object {{\n\
@@ -2832,7 +2859,7 @@ pub fn copy_tree(l: &Layout, ssh: &Ssh, repo: &Path) -> Result<(usize, usize), S
         }
     }
     let m = run_dir.join("manifest");
-    std::fs::write(&m, manifest(&here)).map_err(|e| e.to_string())?;
+    crate::util::write_fresh(&m, manifest(&here)).map_err(|e| e.to_string())?;
     let put = ssh.put(&m, "C:/lane/manifest");
     if !put.ok() {
         return Err(format!("the manifest did not copy: {}", put.tail(3)));
@@ -3108,7 +3135,7 @@ pub fn run_on_desktop(up: &Up, name: &str, line: &str, how: guest::Desktop, stre
         ("ps1", guest::desktop_runner(name, how)),
     ] {
         let local = run_dir.join(format!("{name}.{ext}"));
-        if let Err(e) = std::fs::write(&local, text) {
+        if let Err(e) = crate::util::write_fresh(&local, text) {
             return failed(format!("{}: {e}", local.display()));
         }
         let put = up.admin.put(&local, &format!("{tasks}/{name}.{ext}"));

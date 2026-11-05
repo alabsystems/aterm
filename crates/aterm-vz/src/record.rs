@@ -93,16 +93,18 @@ impl Paths {
                 run.display()
             ));
         }
-        dir.set_permissions(std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| why("set opened directory mode", e))?;
-        let narrowed = dir
-            .metadata()
-            .map_err(|e| why("read narrowed directory mode", e))?;
-        if narrowed.mode() & 0o7777 != 0o700 {
-            return Err(format!(
-                "{}: the run directory did not become 0700",
-                run.display()
-            ));
+        if metadata.mode() & 0o7777 != 0o700 {
+            dir.set_permissions(std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| why("set opened directory mode", e))?;
+            let narrowed = dir
+                .metadata()
+                .map_err(|e| why("read narrowed directory mode", e))?;
+            if narrowed.mode() & 0o7777 != 0o700 {
+                return Err(format!(
+                    "{}: the run directory did not become 0700",
+                    run.display()
+                ));
+            }
         }
         Ok(run)
     }
@@ -615,14 +617,22 @@ impl DiskLock {
     /// The lock file could not be opened, or the lock failed otherwise.
     pub fn try_take(path: &Path) -> std::io::Result<Option<Self>> {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
+        let file: std::fs::File = aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+                .open(path)
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
         #[expect(
             clippy::disallowed_methods,
             reason = "the guard's own take: its Drop releases by LOCK_UN"
@@ -640,10 +650,20 @@ impl DiskLock {
     /// stop at a held `flock` ([`crate::fault::Fault::NoFlock`]).
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn unheld(path: &Path) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file: std::fs::File = aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+                .open(path)
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
         Ok(Self { file })
     }
 }

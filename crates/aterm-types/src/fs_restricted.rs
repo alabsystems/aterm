@@ -139,17 +139,22 @@ pub const fn dir_safe_for_private_write(uid: u32, owner_uid: u32, mode: u32) -> 
         target_arch = "arm",
     ),
 ))]
-const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800;
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800 | 0x0008_0000;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004 | 0x0100_0000;
 
 #[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "dragonfly",
 ))]
 const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004;
+
+/// Flags passed to `OpenOptionsExt::custom_flags` for exclusive file creation (`O_NONBLOCK | O_CLOEXEC`).
+#[cfg(unix)]
+pub(crate) const CREATE_NEW_OPEN_FLAG: i32 = NONBLOCK_OPEN_FLAG;
 
 /// Open `path` without blocking on FIFOs and verify the opened descriptor is a regular file.
 pub(crate) fn open_regular_nonblock_with_meta(

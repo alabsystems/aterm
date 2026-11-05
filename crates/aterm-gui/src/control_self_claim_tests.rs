@@ -2598,7 +2598,7 @@ fn only_a_proven_claims_holder_tells_its_own_land_hold() {
     let usage = Some((
         "ERR usage: meta set harness_land since=<ms> nudges=<n> [read=1 legs=\u{2026} \
          open=\u{2026} changed=\u{2026} untracked=\u{2026} stashes=\u{2026} unpushed=\u{2026} \
-         unlanded=\u{2026}] | meta unset harness_land\n"
+         unlanded=\u{2026} left=\u{2026}] | meta unset harness_land\n"
             .to_string(),
         false,
     ));
@@ -2640,6 +2640,8 @@ fn only_a_proven_claims_holder_tells_its_own_land_hold() {
         line("read=1 legs=repo legs=open"),
         line("read=1 read=1 legs=repo"),
         line("read=1 legs=repo unpushed=1 unpushed=2"),
+        line("left=1"),
+        line("read=1 legs=left left=x"),
         // An unset that says more.
         format!("unset harness_land since={SINCE_MS}"),
     ]
@@ -2775,8 +2777,8 @@ fn only_a_proven_claims_holder_tells_its_own_land_hold() {
             &no_proof,
             &format!(
                 "set harness_land unlanded=5 read=1 since={SINCE_MS} \
-                 legs=cut,defense,open,repo-unread,repo,needs nudges=3 changed=3 untracked=1 \
-                 stashes=2 unpushed=4 open=follow-up,not%20pushed"
+                 legs=cut,defense,open,left,repo-unread,repo,needs nudges=3 changed=3 untracked=1 \
+                 stashes=2 unpushed=4 open=follow-up,not%20pushed left=2"
             )
         ),
         ok(true)
@@ -2799,6 +2801,7 @@ fn only_a_proven_claims_holder_tells_its_own_land_hold() {
         unlanded: 5,
         sub_unpushed: 0,
         parked: 0,
+        left: 2,
     };
     assert!(
         ["follow-up", "not pushed", "skipped", "untested", "todo"]

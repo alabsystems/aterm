@@ -82,11 +82,12 @@ fn rebuilt(root: &Path) -> u64 {
         .into_iter()
         .flatten()
         .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
+        .filter(|entry| {
+            std::path::Path::new(&entry.file_name())
+                .extension()
                 .is_some_and(|extension| extension == "json")
         })
+        .map(|entry| entry.path())
         .filter_map(|path| crate::macos_doctor::read_record_bytes(&path).ok())
         .filter_map(|bytes| aterm_json::from_slice::<Value>(&bytes).ok())
         .map(|value| named(&value));

@@ -3,7 +3,7 @@
 
 //! Per-session temporal recorder.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
@@ -61,6 +61,7 @@ pub(crate) struct ReplayKeyframe {
     pub(crate) carry: Arc<ReplayCarry>,
     pub(crate) recorded_config: Option<Option<Arc<TerminalConfig>>>,
     charge: usize,
+    shared_images: usize,
 }
 
 impl ReplayKeyframe {
@@ -71,15 +72,25 @@ impl ReplayKeyframe {
             .saturating_add(ARC_HEADER)
             .saturating_add(carry.memory_used())
             .saturating_add(carry.retained_image_bytes());
+        let mut shared_images = 0usize;
+        carry.for_each_retained_image(|img| {
+            shared_images = shared_images.saturating_add(img.payload_bytes());
+        });
         Self {
             checkpoint,
             carry,
             recorded_config: None,
             charge,
+            shared_images,
         }
     }
 
-    /// The bytes retaining this keyframe holds against the recording's budget: its slot, its checkpoint and its carry whole, and every image payload the carry keeps alive (a payload several keyframes share is charged to each); the replay config it shares with the recorder is not charged.
+    /// What queuing it holds beyond the engine it was taken of: [`Self::charge`] less the image payloads its carry shares with that engine ([`ReplayCarry::for_each_retained_image`]), which the queue keeps alive but does not copy ([`TemporalMsg::weight`]).
+    pub(crate) const fn queue_weight(&self) -> usize {
+        self.charge.saturating_sub(self.shared_images)
+    }
+
+    /// The bytes retaining this keyframe holds: its slot, its checkpoint and its carry whole, and every image payload the carry keeps alive; the replay config it shares with the recorder is not charged. A queued keyframe weighs it less the image payloads it shares with the engine it was taken of ([`Self::queue_weight`]); a recording charges each image payload its kept keyframes share once ([`SharedImages`]).
     pub(crate) const fn charge(&self) -> usize {
         self.charge
     }
@@ -122,6 +133,8 @@ pub(crate) enum TemporalMsg {
     Keyframe(ReplayKeyframe),
     /// A live keyframe a diverged witness asked for ([`SpineWatermark::keyframe_wanted`]), with the marks of the slice it stands in for; it closes no break.
     LiveKeyframe(ReplayKeyframe, SliceMarks),
+    /// A keyframe of the live engine right after the slice queued before it, which a reader sends once a rekey is due ([`SpineMark::rekey`]): it follows that slice, so it is no instant, no export writes it and it cuts no chain.
+    Rekeyframe(ReplayKeyframe),
     /// The live screen right after the slice queued before it, for a replay to match ([`Fidelity`]).
     Witness(Arc<TerminalCheckpoint>),
 }
@@ -133,9 +146,6 @@ pub(crate) struct InputSlice {
     range: Range<usize>,
     clock: ClockReading,
     marks: SliceMarks,
-    /// The parser state observed with these bytes under the live terminal's lock.
-    /// Unknown callers retain the recorder's normal replay attempt.
-    parser_ground: Option<bool>,
     reply: Option<Arc<[u8]>>,
 }
 
@@ -159,7 +169,6 @@ impl InputSlice {
             range,
             clock,
             marks: SliceMarks::default(),
-            parser_ground: None,
             reply: None,
         }
     }
@@ -209,8 +218,15 @@ pub(crate) fn reply_of(response: Option<&[u8]>, reports: Option<&[u8]>) -> Optio
 /// A replay keyframe of `term` with each grid's history bounded to `max_history` lines, carrying the shell-integration nonce and revision so a replay verifies shell marks as the live engine does, plus the in-process [`ReplayCarry`] no checkpoint holds (it stays in memory).
 #[must_use]
 pub(crate) fn keyframe_of(term: &Terminal, max_history: usize) -> Option<ReplayKeyframe> {
-    let mut checkpoint = term.checkpoint_continuing_bounded(max_history)?;
+    let keyframe = capture_keyframe(term, max_history)?;
     term.note_bounded_replay_keyframe(max_history);
+    Some(keyframe)
+}
+
+/// [`keyframe_of`] without seeding the live grid's carried replay history from it ([`Terminal::note_bounded_replay_keyframe`]), for a reader that may not queue it: once it is queued, the reader seeds it, under the same terminal lock.
+#[must_use]
+fn capture_keyframe(term: &Terminal, max_history: usize) -> Option<ReplayKeyframe> {
+    let mut checkpoint = term.checkpoint_continuing_bounded(max_history)?;
     if checkpoint.grid.capacity() > checkpoint.grid.len() + 4096 {
         checkpoint.grid.shrink_to_fit();
     }
@@ -295,15 +311,18 @@ pub(crate) const QUEUE_CAP: usize = 1024;
 /// The fewest bytes a queue may hold unwritten, whatever its recorder's budget.
 const MIN_QUEUE_BYTES: usize = 1024 * 1024;
 
+/// The room a rekey's keyframe leaves on its queue for the reader's next slice ([`TemporalTx::fits`]): a whole read, which a reader takes 64 KiB at most of, and a reply to it of up to 16 KiB. A slice whose reply is larger (the engine owes up to 1 MiB) may still find no room.
+const SLICE_ROOM: usize = 80 * 1024;
+
 /// The share of its pool's limit every queue together may hold unwritten (a quarter).
 const POOL_QUEUE_SHARE: usize = 4;
 
 impl TemporalMsg {
-    /// The bytes this message holds while queued: a slice and its reply, a keyframe's or a witness's charge.
+    /// The bytes this message holds while queued: a slice and its reply, a witness's charge, or a keyframe's charge less the image payloads it shares with the live engine ([`ReplayKeyframe::queue_weight`]).
     fn weight(&self) -> usize {
         match self {
             Self::RawIn(input) => input.charge(),
-            Self::Keyframe(k) | Self::LiveKeyframe(k, _) => k.charge(),
+            Self::Keyframe(k) | Self::LiveKeyframe(k, _) | Self::Rekeyframe(k) => k.queue_weight(),
             Self::Witness(c) => charge_of(c),
             Self::Reply
             | Self::Resize { .. }
@@ -314,7 +333,10 @@ impl TemporalMsg {
     }
 
     const fn is_keyframe(&self) -> bool {
-        matches!(self, Self::Keyframe(_) | Self::LiveKeyframe(..))
+        matches!(
+            self,
+            Self::Keyframe(_) | Self::LiveKeyframe(..) | Self::Rekeyframe(_)
+        )
     }
 }
 
@@ -385,13 +407,17 @@ fn writer() -> Result<&'static Sender<Queued>, String> {
                     let _gone = WriterGone;
                     let demands = urgency::global().clone();
                     demands.adopt_writer(std::thread::current());
-                    let mut role = urgency::WriterRole::new(demands.clone());
-                    role.poll();
+                    let role = std::rc::Rc::new(std::cell::RefCell::new(urgency::WriterRole::new(
+                        demands.clone(),
+                    )));
+                    role.borrow_mut().poll();
+                    let mut channel = WriterChannel::new(rx, pool().clone(), demands.clone());
+                    channel.role = Some(role.clone());
                     serve(
-                        &mut WriterChannel(rx),
+                        &mut channel,
                         || demands.is_urgent(),
                         |queued| {
-                            role.poll();
+                            role.borrow_mut().poll();
                             let Queued {
                                 mut completion,
                                 generation,
@@ -401,11 +427,10 @@ fn writer() -> Result<&'static Sender<Queued>, String> {
                                 completion.begin_processing();
                             }
                             if let Some(to) = &completion.route.to {
-                                write_queued_with_poll(
+                                write_queued(
                                     to,
                                     generation,
                                     msg,
-                                    &mut || role.poll(),
                                     #[cfg(any(debug_assertions, feature = "dev-seams"))]
                                     completion.route.costs.as_deref(),
                                 );
@@ -413,7 +438,7 @@ fn writer() -> Result<&'static Sender<Queued>, String> {
                             completion.written();
                             completion.route.state.pool.relieve();
                             drop(completion);
-                            role.poll();
+                            role.borrow_mut().poll();
                         },
                     );
                 },
@@ -465,26 +490,110 @@ fn serve<Q>(inbox: &mut impl Inbox<Q>, urgent: impl Fn() -> bool, mut write: imp
     }
 }
 
-/// The shared writer's channel, whose wait first gives an idle writer the allocator relief it owes
-/// once it has freed enough ([`RewindPool::relieve_allocator_if_due`]).
-struct WriterChannel(Receiver<Queued>);
+/// How long a writer that owes work to its quiet periods waits on its channel before it does that work ([`WriterChannel`]).
+const QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(20);
 
-impl Inbox<Queued> for WriterChannel {
-    fn wait(&mut self) -> Option<Queued> {
-        if pool().relief_due() {
-            match self.0.recv_timeout(std::time::Duration::from_millis(20)) {
+/// The receiving end of the shared writer's channel ([`WriterChannel`]).
+trait Mailbox {
+    type Msg;
+    /// The next message, waiting as long as it takes; `None` once every sender is gone.
+    fn recv(&mut self) -> Option<Self::Msg>;
+    /// The next message, waiting at most `timeout`.
+    fn recv_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Self::Msg, std::sync::mpsc::RecvTimeoutError>;
+    /// A message already queued, without waiting.
+    fn try_recv(&mut self) -> Option<Self::Msg>;
+}
+
+impl<Q> Mailbox for Receiver<Q> {
+    type Msg = Q;
+
+    fn recv(&mut self) -> Option<Q> {
+        Receiver::recv(self).ok()
+    }
+
+    fn recv_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Q, std::sync::mpsc::RecvTimeoutError> {
+        Receiver::recv_timeout(self, timeout)
+    }
+
+    fn try_recv(&mut self) -> Option<Q> {
+        Receiver::try_recv(self).ok()
+    }
+}
+
+/// The shared writer's channel, whose wait spends the writer's quiet periods on `pool`: a wait that owes the allocator relief once enough was freed ([`RewindPool::relieve_allocator_if_due`]), or owes a judge of closed chains ([`RewindPool::judge_due`]) while no demand stands, first waits [`QUIET_WINDOW`] for a message, and only when none came does that work ([`IdleJudge`]), stopping it for the next message or demand.
+struct WriterChannel<R: Mailbox = Receiver<Queued>> {
+    rx: R,
+    /// The message the idle judge stopped for, the next one written.
+    held: Option<R::Msg>,
+    judge: IdleJudge,
+    demands: Arc<urgency::Demands>,
+    pool: Arc<RewindPool>,
+    /// The writer thread's role, which it shares with the code that writes each message: polled before the judge runs, so the judge runs in the role no demand raises ([`urgency::WriterRole::poll`]). A test's channel has none.
+    role: Option<std::rc::Rc<std::cell::RefCell<urgency::WriterRole>>>,
+}
+
+impl<R: Mailbox> WriterChannel<R> {
+    fn new(rx: R, pool: Arc<RewindPool>, demands: Arc<urgency::Demands>) -> Self {
+        Self {
+            rx,
+            held: None,
+            judge: IdleJudge::default(),
+            demands,
+            pool,
+            role: None,
+        }
+    }
+}
+
+impl<R: Mailbox> Inbox<R::Msg> for WriterChannel<R> {
+    /// A held message first. Otherwise, while relief is due, or a judge is due and no demand stands, one wait of at most [`QUIET_WINDOW`]; on its timeout the relief, then the judge until a message or a demand comes. Then a wait as long as it takes, so a wait times out at most once, and with nothing left due waits with no timeout at all.
+    fn wait(&mut self) -> Option<R::Msg> {
+        if let Some(held) = self.held.take() {
+            return Some(held);
+        }
+        let judging = self.pool.judge_due() && !self.demands.is_urgent();
+        if self.pool.relief_due() || judging {
+            match self.rx.recv_timeout(QUIET_WINDOW) {
                 Ok(more) => return Some(more),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    pool().relieve_allocator_if_due();
+                    self.pool.relieve_allocator_if_due();
+                    if judging {
+                        if let Some(role) = &self.role {
+                            role.borrow_mut().poll();
+                        }
+                        let Self {
+                            rx,
+                            held,
+                            judge,
+                            demands,
+                            pool,
+                            ..
+                        } = self;
+                        judge.run(pool, || {
+                            if held.is_none() {
+                                *held = rx.try_recv();
+                            }
+                            held.is_some() || demands.is_urgent()
+                        });
+                        if let Some(held) = self.held.take() {
+                            return Some(held);
+                        }
+                    }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
             }
         }
-        self.0.recv().ok()
+        self.rx.recv()
     }
 
-    fn take(&mut self) -> Option<Queued> {
-        self.0.try_recv().ok()
+    fn take(&mut self) -> Option<R::Msg> {
+        self.held.take().or_else(|| self.rx.try_recv())
     }
 
     fn nap(&mut self) {
@@ -547,6 +656,8 @@ fn queue_in_with_demands(
 struct QueueState {
     in_flight: AtomicUsize,
     bytes: AtomicUsize,
+    /// The bytes ever counted on this queue, wrapping: what a reader queued within one terminal-lock hold is the difference across it ([`TemporalTx::sent`]).
+    sent: AtomicUsize,
     closed: AtomicBool,
     abandoned: AtomicBool,
     pool: Arc<RewindPool>,
@@ -580,6 +691,7 @@ impl QueueState {
         Self {
             in_flight: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
+            sent: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             pool,
@@ -595,6 +707,7 @@ impl QueueState {
     }
 
     fn queue(&self, weight: usize) -> QueuedCounts {
+        self.sent.fetch_add(weight, Ordering::AcqRel);
         QueuedCounts {
             messages: self.in_flight.fetch_add(1, Ordering::AcqRel) + 1,
             bytes: self.bytes.fetch_add(weight, Ordering::AcqRel) + weight,
@@ -686,16 +799,19 @@ pub(crate) struct TemporalTx {
 
 impl TemporalTx {
     /// Queue `msg`, unless the queue holds `cap` messages, or a message other than a keyframe would take it past its bytes or every queue past the pool's share.
+    ///
+    /// A message that brings the queue to three quarters of `cap` messages, or the queue or the pool to half its bytes, each rounded up, holds a Pressure demand until it is written; [`Self::has_room`] stops a keyframe only past half. Every message still unwritten was counted when the newest one was, so while a live queue has no room under an unchanged pool limit, the newest message on it or on its pool holds that demand.
     fn send(&self, msg: TemporalMsg) -> bool {
         let weight = msg.weight();
         if !self.admits(weight, msg.is_keyframe()) {
             return false;
         }
         let counts = self.state.queue(weight);
-        let near = |used: usize, cap: usize| used >= cap.saturating_sub(cap / 4);
-        let pressure = (near(counts.messages, self.cap)
-            || near(counts.bytes, self.byte_cap)
-            || near(counts.pool_bytes, self.pool_share()))
+        let share = self.pool_share();
+        let reaches = |used: usize, cap: usize, spare: usize| used >= cap.saturating_sub(spare);
+        let pressure = (reaches(counts.messages, self.cap, self.cap / 4)
+            || reaches(counts.bytes, self.byte_cap, self.byte_cap / 2)
+            || reaches(counts.pool_bytes, share, share / 2))
         .then(|| self.state.demands.acquire(urgency::Reason::Pressure));
         let queued = Queued {
             completion: Completion {
@@ -732,11 +848,25 @@ impl TemporalTx {
         (self.state.pool.limit() / POOL_QUEUE_SHARE).max(MIN_QUEUE_BYTES)
     }
 
-    /// Whether a keyframe may be queued now: a free place, and this queue and every queue at most half their bytes, so a recording that broke for want of room keys again only once its writer has caught up.
+    /// Whether a keyframe may be queued now: a free place, and this queue and every queue at most half their bytes, so a recording that broke for want of room keys again only once its writer has caught up. Each line it stops at lies at or past one of [`Self::send`]'s Pressure lines, so while a live queue has no room a Pressure demand stands.
     fn has_room(&self) -> bool {
         self.admits(0, true)
             && self.state.bytes.load(Ordering::Acquire) <= self.byte_cap / 2
             && self.state.pool.queued() <= self.pool_share() / 2
+    }
+
+    /// Whether a keyframe weighing `weight` may be queued now: queued, it would still leave this queue and its pool room for [`SLICE_ROOM`] more, so the slice a reader sends after it is not refused for it; or it could not even with nothing queued but `own`, what the asking reader queued in its current terminal-lock hold, so waiting for the writer would not make room for both and the keyframe goes ahead of the slice. A keyframe passes the byte caps ([`Self::admits`]), so a rekey asks this, after [`Self::has_room`], before it queues one ([`SpineMark::rekey`]).
+    fn fits(&self, weight: usize, own: usize) -> bool {
+        let after = |used: usize| used.saturating_add(weight).saturating_add(SLICE_ROOM);
+        let (bytes, pool) = (self.byte_cap, self.pool_share());
+        after(own) > bytes.min(pool)
+            || (after(self.state.bytes.load(Ordering::Acquire)) <= bytes
+                && after(self.state.pool.queued()) <= pool)
+    }
+
+    /// The bytes ever counted on this queue, wrapping: across a terminal-lock hold, what the holder queued ([`SpineMark::sent_from`]).
+    fn sent(&self) -> usize {
+        self.state.sent.load(Ordering::Acquire)
     }
 
     /// The recording's spine watermark, where a reader that starts on this queue attaches ([`SpineMark::attach`]).
@@ -941,19 +1071,106 @@ pub(crate) struct SpineWatermark {
     dropped_input: AtomicU64,
     closed: AtomicU64,
     dropped_replies: AtomicU64,
+    /// Keyframes a reader has counted to send that the writer has not applied. The reader counts one before its send, so the writer never applies a keyframe ahead of its count, and uncounts it if the send is refused; the writer uncounts each one it applies. A forget stores its generation, then zeroes the count, and the writer drops a keyframe sent before it without uncounting it.
     keyframes_queued: AtomicU64,
     keyframe_wanted: AtomicBool,
     generation: AtomicU64,
     replay_config: Mutex<Option<Arc<TerminalConfig>>>,
+    /// The output a chain runs before the readers key it afresh ([`SpineMark::rekey`]): a quarter of the recorder's budget, at least [`MIN_REKEY_BYTES`]. Zero on a watermark no recorder made, which keys only when the writer asks ([`Self::rekey_wanted`]).
+    rekey_interval: AtomicUsize,
+    /// The recorder's budget, which the pressure trigger keys under ([`Self::rekey_due`]).
+    budget: AtomicUsize,
+    /// The slice bytes and witness charges the readers sent since the last keyframe they sent or the recorder seeded: what the writer charges the newest chain, counted as it is sent. Written only under the terminal's lock.
+    rekey_bytes: AtomicUsize,
+    /// What that keyframe charges ([`ReplayKeyframe::charge`]). Written only under the terminal's lock, and by [`TemporalRecorder::seed_spine`].
+    base_charge: AtomicUsize,
+    /// The queue weight the next keyframe a rekey takes is expected to bring ([`ReplayKeyframe::queue_weight`]): the last one's, sent or refused, zero before the first ([`SpineMark::rekey`]). Only a prediction: [`TemporalTx::fits`] passes any weight once the queue holds no more than the asking hold queued, so a stale one never stops a rekey once the writer catches up. Written only under the terminal's lock.
+    keyframe_weight: AtomicUsize,
+    /// Whether a reader sent a step that changed the screen since the last witness or keyframe it sent, so no witness covers the chain's tail yet. Written only under the terminal's lock.
+    tail_unwitnessed: AtomicBool,
+    /// Whether the writer asks for a rekey: the newest chain ran [`REKEY_EVENTS`] events, lost its first slice or host step, or no keyframe is kept while the spine holds events ([`TemporalRecorder::after_op`]). The writer sets it only while no keyframe is in flight; a reader's keyframe clears it.
+    rekey_wanted: AtomicBool,
+    /// A rekey trigger a test switches off, the negative control of the trigger it tests.
+    #[cfg(test)]
+    disabled_trigger: Mutex<Option<RekeyTrigger>>,
 }
 
 impl SpineWatermark {
-    /// Start the watermark at `pre`.
-    pub(crate) fn seed(&self, pre: SpinePre) {
+    /// The watermark of a recorder whose budget is `budget`, keying its chains every quarter of it ([`Self::rekey_interval`]).
+    fn keyed(budget: usize) -> Self {
+        let watermark = Self::default();
+        watermark
+            .rekey_interval
+            .store((budget / 4).max(MIN_REKEY_BYTES), Ordering::Relaxed);
+        watermark.budget.store(budget, Ordering::Relaxed);
+        watermark
+    }
+
+    /// Start the watermark at `pre`, with no output counted toward a rekey and none asked for.
+    fn seed(&self, pre: SpinePre) {
         self.store_host((pre.lifetime, pre.host_ordinal));
         self.store((pre.lifetime, pre.ordinal));
         self.store_cell_px(pre.cell_px);
         self.store_deep_pullback(pre.deep_pullback);
+        self.keyed_afresh(0);
+        self.rekey_wanted.store(false, Ordering::SeqCst);
+    }
+
+    /// Count a sent step that changed the screen, carrying `bytes` of output toward a rekey, and leave the chain's tail uncovered until the next witness.
+    fn note_step(&self, bytes: usize) {
+        if bytes > 0 {
+            self.rekey_bytes.fetch_add(bytes, Ordering::AcqRel);
+        }
+        self.tail_unwitnessed.store(true, Ordering::Release);
+    }
+
+    /// Count a sent witness of `charge` bytes toward a rekey, as the writer charges it to the chain; the chain's tail is covered.
+    fn note_witness(&self, charge: usize) {
+        self.rekey_bytes.fetch_add(charge, Ordering::AcqRel);
+        self.tail_unwitnessed.store(false, Ordering::Release);
+    }
+
+    /// A keyframe charging `charge` was sent: a fresh chain, with nothing counted toward a rekey and its tail covered.
+    fn keyed_afresh(&self, charge: usize) {
+        self.rekey_bytes.store(0, Ordering::Release);
+        self.base_charge.store(charge, Ordering::Release);
+        self.tail_unwitnessed.store(false, Ordering::Release);
+        self.rekey_wanted.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the newest chain is due a rekey: the writer asked for one, or the output and witnesses sent since its keyframe reach the interval, or, under pressure, half the room its keyframe leaves it under the budget, at least [`MIN_REKEY_BYTES`], so it is keyed well before the budget takes its first slice. Pressure keys sooner the heavier the keyframe, and never once a keyframe leaves less than [`MIN_REKEY_BYTES`], which a fresh keyframe of the same charge could not keep a chain behind either.
+    fn rekey_due(&self) -> bool {
+        #[cfg(test)]
+        let disabled = *self
+            .disabled_trigger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let wanted = self.rekey_wanted.load(Ordering::Acquire);
+        #[cfg(test)]
+        let wanted = wanted && disabled != Some(RekeyTrigger::Events);
+        let interval = self.rekey_interval.load(Ordering::Relaxed);
+        if wanted || interval == 0 {
+            return wanted;
+        }
+        let chain = self.rekey_bytes.load(Ordering::Acquire);
+        let by_bytes = chain >= interval;
+        let room = self
+            .budget
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.base_charge.load(Ordering::Acquire));
+        let by_pressure = room >= MIN_REKEY_BYTES && chain >= (room / 2).max(MIN_REKEY_BYTES);
+        #[cfg(test)]
+        let by_pressure = by_pressure && disabled != Some(RekeyTrigger::Pressure);
+        by_bytes || by_pressure
+    }
+
+    /// Switch `trigger` off, the negative control of a test of it.
+    #[cfg(test)]
+    fn disable_trigger(&self, trigger: RekeyTrigger) {
+        *self
+            .disabled_trigger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(trigger);
     }
 
     fn load_deep_pullback(&self) -> u64 {
@@ -962,6 +1179,15 @@ impl SpineWatermark {
 
     fn store_deep_pullback(&self, ordinal: u64) {
         self.deep_pullback.store(ordinal, Ordering::Release);
+    }
+
+    /// Uncount one queued keyframe, never below zero: a forget may have zeroed the count already.
+    fn unqueue_keyframe(&self) {
+        let _ = self
+            .keyframes_queued
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_sub(1))
+            });
     }
 
     fn load(&self) -> Option<(u64, u64)> {
@@ -1065,6 +1291,8 @@ pub(crate) struct SpineMark {
     since_witness: usize,
     witnessed_at: Option<aterm_time::Instant>,
     generation: u64,
+    /// The queue's [`TemporalTx::sent`] as the current terminal-lock hold began ([`Self::record`], [`Self::flush_host`]), so what the hold queued is the difference.
+    sent_from: usize,
 }
 
 /// What one reader hold read before processing its bytes: the engine's resize lifetime, ordinal and geometry, and its count of started commands.
@@ -1118,18 +1346,30 @@ pub(crate) trait SpineSink {
     fn bytes(&mut self, bytes: &[u8]) -> bool;
 }
 
-struct TemporalSink<'a>(&'a TemporalTx);
+/// A reader's queue as a [`SpineSink`], noting whether it sent a resize, which the chain's next witness must cover ([`SpineWatermark::note_step`]).
+struct TemporalSink<'a> {
+    tx: &'a TemporalTx,
+    resized: bool,
+}
+
+impl<'a> TemporalSink<'a> {
+    const fn new(tx: &'a TemporalTx) -> Self {
+        Self { tx, resized: false }
+    }
+}
 
 impl SpineSink for TemporalSink<'_> {
     fn resize(&mut self, resize: SpineResize) -> bool {
-        self.0.send(TemporalMsg::Resize {
+        let sent = self.tx.send(TemporalMsg::Resize {
             rows: resize.to.0,
             cols: resize.to.1,
-        })
+        });
+        self.resized |= sent;
+        sent
     }
 
     fn resizes_lost(&mut self, n: u64) -> bool {
-        self.0.send(TemporalMsg::ResizesLost(n))
+        self.tx.send(TemporalMsg::ResizesLost(n))
     }
 
     /// Refused: the writer queue takes bytes only with the clock they were parsed at ([`SpineMark::record`]).
@@ -1157,7 +1397,21 @@ impl SpineMark {
             shared,
             since_witness: 0,
             witnessed_at: None,
+            sent_from: 0,
         }
+    }
+
+    /// Whether the queue has room for the keyframe a rekey expects ([`SpineWatermark::keyframe_weight`]), asked before it captures one, so while the writer stays behind a refused rekey does not capture again each slice.
+    fn room_expected(&self, tx: &TemporalTx) -> bool {
+        tx.fits(
+            self.shared.keyframe_weight.load(Ordering::Acquire),
+            self.queued_in_hold(tx),
+        )
+    }
+
+    /// What this hold queued on `tx` since it began ([`Self::sent_from`]).
+    fn queued_in_hold(&self, tx: &TemporalTx) -> usize {
+        tx.sent().wrapping_sub(self.sent_from)
     }
 
     /// Put the watermark at `pre`.
@@ -1205,8 +1459,19 @@ impl SpineMark {
         if !tx.send(TemporalMsg::CellPx { width, height }) {
             return false;
         }
+        self.shared.note_step(0);
         self.advance_cell_px(cell_px);
         true
+    }
+
+    /// [`Self::catch_up`] onto `tx`, noting a resize it sent as a step the chain's next witness must cover.
+    fn catch_up_queue(&mut self, tx: &TemporalTx, pre: SpinePre, term: &Terminal) -> bool {
+        let mut sink = TemporalSink::new(tx);
+        let caught_up = self.catch_up(&mut sink, pre, term);
+        if sink.resized {
+            self.shared.note_step(0);
+        }
+        caught_up
     }
 
     fn catch_up_host(&mut self, tx: &TemporalTx, term: &Terminal) -> CatchUpHost {
@@ -1234,14 +1499,16 @@ impl SpineMark {
             if !tx.send(TemporalMsg::Host(report.op, report.clock)) {
                 return CatchUpHost::QueueFull;
             }
+            self.shared.note_step(0);
             self.advance_host((lifetime, report.ordinal));
         }
         CatchUpHost::Ok
     }
 
-    /// Flush any host-side mutations recorded on `term` (such as a retired drawer mark) onto `tx` when no output slice accompanies them.
+    /// Flush any host-side mutations recorded on `term` (such as a retired drawer mark) onto `tx` when no output slice accompanies them, then a rekey when one is due ([`Self::rekey`]).
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn flush_host(&mut self, tx: &TemporalTx, term: &Terminal) {
+        self.sent_from = tx.sent();
         let generation = self.shared.generation();
         if generation != self.generation {
             self.generation = generation;
@@ -1272,9 +1539,7 @@ impl SpineMark {
             }
             return;
         }
-        if self.shared.load().is_some()
-            && !self.catch_up(&mut TemporalSink(tx), SpinePre::take(term), term)
-        {
+        if self.shared.load().is_some() && !self.catch_up_queue(tx, SpinePre::take(term), term) {
             self.broken = true;
             self.shared.dropped_input.fetch_add(1, Ordering::Release);
             return;
@@ -1283,6 +1548,7 @@ impl SpineMark {
             CatchUpHost::Ok => {
                 if self.shared.load().is_some() {
                     term.note_bounded_replay_step(REKEY_SCROLLBACK_LINES);
+                    self.rekey(tx, term);
                 }
             }
             CatchUpHost::Overrun => {
@@ -1305,7 +1571,7 @@ impl SpineMark {
         !self.broken || tx.has_room()
     }
 
-    /// Record one slice on the spine with what the live screen showed after it ([`SliceMarks`]), then a live witness when one is due ([`WITNESS_BYTES`], [`WITNESS_INTERVAL`]).
+    /// Record one slice on the spine with what the live screen showed after it ([`SliceMarks`]), then a live witness when one is due ([`WITNESS_BYTES`], [`WITNESS_INTERVAL`]), then a rekey when one is due ([`Self::rekey`]).
     pub(crate) fn record(
         &mut self,
         tx: &TemporalTx,
@@ -1322,7 +1588,7 @@ impl SpineMark {
             sync_open: term.modes().synchronized_output(),
             command: term.started_command_seq() != pre.started,
         };
-        input.parser_ground = Some(term.parser_is_ground());
+        self.sent_from = tx.sent();
         let generation = self.shared.generation();
         if generation != self.generation {
             // A forget cleared the spine: take up where it put the watermark.
@@ -1349,9 +1615,7 @@ impl SpineMark {
             return;
         }
         let (len, at) = (input.len(), input.clock.monotonic);
-        if !self.catch_up(&mut TemporalSink(tx), pre, term)
-            || !self.catch_up_cell_px(tx, pre.cell_px)
-        {
+        if !self.catch_up_queue(tx, pre, term) || !self.catch_up_cell_px(tx, pre.cell_px) {
             self.broken = true;
             self.shared.dropped_input.fetch_add(1, Ordering::Release);
             return;
@@ -1385,7 +1649,9 @@ impl SpineMark {
             self.advance_host((term.resize_lifetime(), term.host_ordinal()));
             self.advance_deep_pullback(term.deep_history_pullback_ordinal());
             term.note_bounded_replay_step(REKEY_SCROLLBACK_LINES);
+            self.shared.note_step(len);
             self.witness(tx, term, len, at);
+            self.rekey(tx, term);
         } else {
             self.broken = true;
             self.shared.dropped_input.fetch_add(1, Ordering::Release);
@@ -1400,19 +1666,76 @@ impl SpineMark {
         if !due || !term.parser_is_ground() {
             return;
         }
-        #[cfg(any(debug_assertions, feature = "dev-seams"))]
-        let _cost =
-            crate::recording_cost::begin(tx.spine.costs.get().map(|cost| &cost.witness), Some(1));
-        let Some(live) = term.checkpoint_visible() else {
-            return;
-        };
-        if tx.send(TemporalMsg::Witness(Arc::new(live))) {
-            self.since_witness = 0;
+        if self.send_witness(tx, term) {
             self.witnessed_at = Some(at);
         }
     }
 
-    /// Queue a keyframe of the live screen in place of the slice just parsed: one that closes a break (`live: None`), or a live one carrying that slice's marks.
+    /// Queue a witness of the live screen, counting its charge toward a rekey as the writer charges it to the chain: whether it was queued.
+    fn send_witness(&mut self, tx: &TemporalTx, term: &Terminal) -> bool {
+        #[cfg(any(debug_assertions, feature = "dev-seams"))]
+        let _cost =
+            crate::recording_cost::begin(tx.spine.costs.get().map(|cost| &cost.witness), Some(1));
+        let Some(live) = term.checkpoint_visible() else {
+            return false;
+        };
+        let charge = charge_of(&live);
+        if !tx.send(TemporalMsg::Witness(Arc::new(live))) {
+            return false;
+        }
+        self.shared.note_witness(charge);
+        self.since_witness = 0;
+        true
+    }
+
+    /// Key the recording afresh from the live screen, under the terminal's lock the caller holds, once a rekey is due ([`SpineWatermark::rekey_due`]): first a witness of the screen when a step since the last one left the chain's tail uncovered, so every chain a rekey closes ends at a witness, then a [`TemporalMsg::Rekeyframe`], which follows the steps already queued. Without room on the queue ([`TemporalTx::has_room`], or [`TemporalTx::fits`] for the keyframe and the slice after it, asked first of the weight [`SpineWatermark::keyframe_weight`] expects ([`Self::room_expected`]), then of the keyframe taken), inside a sequence a keyframe would swallow or cut, or with history detached, it sends nothing more and the rekey stays due; a refusal opens no break. The live grid's carried replay history is seeded from the keyframe only once it is queued.
+    fn rekey(&mut self, tx: &TemporalTx, term: &Terminal) {
+        if !self.shared.rekey_due()
+            || !tx.has_room()
+            || !self.room_expected(tx)
+            || term.partial_sequence_swallowed().is_some()
+            || term.has_detached_scrollback()
+            || !term.parser_is_ground()
+        {
+            return;
+        }
+        if self.shared.tail_unwitnessed.load(Ordering::Acquire) {
+            if !self.send_witness(tx, term) {
+                return;
+            }
+            self.witnessed_at = None;
+        }
+        let keyframe = {
+            #[cfg(any(debug_assertions, feature = "dev-seams"))]
+            let _cost =
+                crate::recording_cost::begin(tx.spine.costs.get().map(|cost| &cost.rekey), Some(1));
+            capture_keyframe(term, REKEY_SCROLLBACK_LINES)
+        };
+        let Some(mut keyframe) = keyframe else {
+            return;
+        };
+        #[cfg(test)]
+        capture_probe::captured();
+        let weight = keyframe.queue_weight();
+        let fits = tx.fits(weight, self.queued_in_hold(tx));
+        self.shared.keyframe_weight.store(weight, Ordering::Release);
+        if !fits {
+            return;
+        }
+        let charge = keyframe.charge();
+        keyframe.recorded_config = Some(self.shared.replay_config());
+        self.shared.keyframes_queued.fetch_add(1, Ordering::SeqCst);
+        if !tx.send(TemporalMsg::Rekeyframe(keyframe)) {
+            self.shared.unqueue_keyframe();
+            return;
+        }
+        term.note_bounded_replay_keyframe(REKEY_SCROLLBACK_LINES);
+        self.shared.keyed_afresh(charge);
+        self.since_witness = 0;
+        self.witnessed_at = None;
+    }
+
+    /// Queue a keyframe of the live screen in place of the slice just parsed: one that closes a break (`live: None`), or a live one carrying that slice's marks. It sends whenever the queue has room for it ([`TemporalTx::has_room`]), since the recording needs it: unlike a rekey's, its keyframe may leave the next slice no room, which then breaks the recording for the next resync to close. It seeds the live grid's carried replay history from the keyframe once it is queued.
     fn resync(&mut self, tx: &TemporalTx, term: &Terminal, live: Option<SliceMarks>) -> bool {
         if !tx.has_room()
             || term.partial_sequence_swallowed().is_some()
@@ -1420,21 +1743,25 @@ impl SpineMark {
         {
             return false;
         }
-        let Some(mut keyframe) = keyframe_of(term, REKEY_SCROLLBACK_LINES) else {
+        let Some(mut keyframe) = capture_keyframe(term, REKEY_SCROLLBACK_LINES) else {
             return false;
         };
         keyframe.recorded_config = Some(self.shared.replay_config());
         #[cfg(test)]
         resync_probe::projected();
+        let charge = keyframe.charge();
         let msg = match live {
             None => TemporalMsg::Keyframe(keyframe),
             Some(marks) => TemporalMsg::LiveKeyframe(keyframe, marks),
         };
+        self.shared.keyframes_queued.fetch_add(1, Ordering::SeqCst);
         if !tx.send(msg) {
+            self.shared.unqueue_keyframe();
             return false;
         }
+        term.note_bounded_replay_keyframe(REKEY_SCROLLBACK_LINES);
         self.broken = false;
-        self.shared.keyframes_queued.fetch_add(1, Ordering::Release);
+        self.shared.keyed_afresh(charge);
         self.shared.keyframe_wanted.store(false, Ordering::Release);
         self.since_witness = 0;
         self.witnessed_at = None;
@@ -1536,6 +1863,8 @@ pub(crate) struct TemporalRecorder {
     blobs: VecDeque<Option<InputSlice>>,
     host_ops: VecDeque<(HostOp, Option<ClockReading>)>,
     keyframes: VecDeque<RetainedKeyframe>,
+    /// The image payloads the kept keyframes hold, each charged to `used` once.
+    images: SharedImages,
     next_blob: u64,
     next_host_op: u64,
     next_keyframe: u64,
@@ -1543,10 +1872,6 @@ pub(crate) struct TemporalRecorder {
     budget: usize,
     lost_resizes: u64,
     spine: Arc<SpineWatermark>,
-    bytes_since_keyframe: usize,
-    ends_mid_sequence: bool,
-    #[cfg(test)]
-    disabled_trigger: Option<RekeyTrigger>,
     #[cfg(test)]
     frozen_now: Option<Ticks>,
     /// A sleep the test adds to the clock, as a machine asleep would.
@@ -1563,6 +1888,12 @@ pub(crate) struct TemporalRecorder {
     next_witness: u64,
     witnessed: u64,
     diverged: u64,
+    /// Kept witnesses no fold has judged yet ([`Self::pending`]).
+    pending: u64,
+    /// Witnesses an eviction dropped before any fold judged them ([`Self::unjudged_evicted`]).
+    unjudged_evicted: u64,
+    /// Whether the writer asked for a rekey because the newest chain no longer replays and no keyframe recorded since was kept with its chain whole ([`Self::after_op`]): a keyframe the budget evicts as it lands asks for no next one.
+    lost_asked: bool,
     chain_diverged: bool,
     generation: u64,
     share: Option<Share>,
@@ -1644,22 +1975,20 @@ impl TemporalRecorder {
     /// A recorder with an explicit retained-byte budget (>= 1).
     #[must_use]
     pub(crate) fn with_budget(budget: usize) -> Self {
+        let budget = budget.max(1);
         Self {
             log: EventLog::default(),
             blobs: VecDeque::new(),
             host_ops: VecDeque::new(),
             keyframes: VecDeque::new(),
+            images: SharedImages::default(),
             next_blob: 0,
             next_host_op: 0,
             next_keyframe: 0,
             used: 0,
-            budget: budget.max(1),
+            budget,
             lost_resizes: 0,
-            spine: Arc::default(),
-            bytes_since_keyframe: 0,
-            ends_mid_sequence: false,
-            #[cfg(test)]
-            disabled_trigger: None,
+            spine: Arc::new(SpineWatermark::keyed(budget)),
             #[cfg(test)]
             frozen_now: None,
             #[cfg(test)]
@@ -1674,6 +2003,9 @@ impl TemporalRecorder {
             next_witness: 0,
             witnessed: 0,
             diverged: 0,
+            pending: 0,
+            unjudged_evicted: 0,
+            lost_asked: false,
             chain_diverged: false,
             generation: 0,
             share: None,
@@ -1681,9 +2013,10 @@ impl TemporalRecorder {
         }
     }
 
-    /// What this recorder charges its pool: its retained bytes and the slots its log and slices hold.
+    /// What this recorder charges its pool: its retained bytes, the slots its log and slices hold, and its image ledger's table.
     fn charge(&self) -> usize {
         self.used
+            + self.images.table_bytes()
             + self.blobs.len() * std::mem::size_of::<Option<InputSlice>>()
             + self.host_ops.len() * std::mem::size_of::<(HostOp, Option<ClockReading>)>()
             + self.live_events() * std::mem::size_of::<aterm_buffer::Event>()
@@ -1704,8 +2037,11 @@ impl TemporalRecorder {
     }
 
     fn compact_storage(&mut self) {
+        const fn wasteful(capacity: usize, len: usize) -> bool {
+            capacity > 64 && capacity / 4 > len
+        }
         fn shrink<T>(q: &mut VecDeque<T>) {
-            if q.capacity() > 64 && q.capacity() / 4 > q.len() {
+            if wasteful(q.capacity(), q.len()) {
                 q.shrink_to_fit();
             }
         }
@@ -1713,6 +2049,10 @@ impl TemporalRecorder {
         shrink(&mut self.host_ops);
         shrink(&mut self.keyframes);
         shrink(&mut self.witnesses);
+        let images = &mut self.images.0;
+        if wasteful(images.capacity(), images.len()) {
+            images.shrink_to_fit();
+        }
     }
 
     /// Drop every kept event, slice, keyframe and witness, so no replay reaches an instant before now; a message queued before it is dropped as it arrives.
@@ -1726,10 +2066,11 @@ impl TemporalRecorder {
         self.blobs = VecDeque::new();
         self.host_ops = VecDeque::new();
         self.keyframes = VecDeque::new();
+        self.images = SharedImages::default();
         self.witnesses = VecDeque::new();
+        self.pending = 0;
+        self.lost_asked = false;
         self.used = 0;
-        self.bytes_since_keyframe = 0;
-        self.ends_mid_sequence = false;
         self.chain_diverged = false;
         self.settle();
     }
@@ -1748,9 +2089,16 @@ impl TemporalRecorder {
             return false;
         };
         self.record_keyframe(seed);
-        self.spine.seed(SpinePre::take(term));
+        self.seed_spine(SpinePre::take(term));
         self.spine.keyframe_wanted.store(false, Ordering::Release);
         true
+    }
+
+    /// Start the spine's watermark at `at` ([`SpineWatermark::seed`]) behind the newest keyframe, which the caller just recorded of the engine `at` was taken of, its charge the base the readers' pressure trigger counts from ([`SpineWatermark::rekey_due`]). The caller holds that engine's lock, or no reader runs on it yet.
+    pub(crate) fn seed_spine(&self, at: SpinePre) {
+        self.spine.seed(at);
+        let charge = self.keyframes.back().map_or(0, RetainedKeyframe::charge);
+        self.spine.base_charge.store(charge, Ordering::Release);
     }
 
     /// Ask the reader for a live keyframe on its next slice at parser ground.
@@ -1758,8 +2106,9 @@ impl TemporalRecorder {
         self.spine.keyframe_wanted.store(true, Ordering::Release);
     }
 
-    /// The pool's [`Self::forget`]: the reader keys the recording afresh on its next slice.
+    /// The pool's [`Self::forget`], which counts the witnesses it drops unjudged ([`Self::unjudged_evicted`]): the reader keys the recording afresh on its next slice.
     fn forget_for_pool(&mut self) {
+        self.unjudged_evicted += self.pending;
         self.forget();
         self.want_keyframe();
     }
@@ -1795,6 +2144,7 @@ impl TemporalRecorder {
             self.settle();
         }
         self.compact_storage();
+        self.settle();
     }
 
     /// Mark this spine as one that starts at a seamless update ([`crate::session_timeline::HandoffGap`]).
@@ -1936,23 +2286,58 @@ impl TemporalRecorder {
         seq
     }
 
-    fn record(&mut self, op: Op) -> Option<Rekey> {
+    fn record(&mut self, op: Op) {
         let ts = self.stamp();
         self.append(op, ts);
-        self.due()
+        self.after_op();
     }
 
-    fn due(&mut self) -> Option<Rekey> {
-        let due = self.rekey_due();
-        if due.is_none() {
-            self.enforce_budget();
+    /// After each op the writer appends: hold the budget, then ask the readers for a rekey ([`SpineWatermark::rekey_wanted`]) while no keyframe is in flight and the newest chain ran [`REKEY_EVENTS`] events, or, once until a keyframe is kept with its chain whole ([`Self::lost_asked`]), lost its first slice or host step, or no keyframe is kept while the spine holds events. A keyframe the budget cannot keep is evicted as it lands, so asking again for each would key every slice.
+    fn after_op(&mut self) {
+        self.enforce_budget();
+        let in_flight = || self.spine.keyframes_queued.load(Ordering::SeqCst) != 0;
+        if in_flight() {
+            return;
         }
-        due
+        let lost = match self.wants_rekey() {
+            None => return,
+            Some(true) if self.lost_asked => return,
+            Some(lost) => lost,
+        };
+        self.spine.rekey_wanted.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        if ask_probe::races() {
+            self.spine.keyframes_queued.fetch_add(1, Ordering::SeqCst);
+        }
+        // A reader that counted a keyframe since keys the chain afresh, and may already have cleared the request: take it back, so it never outlives a keyframe already sent. A loss is asked for again after the next op should that keyframe not be sent after all.
+        if in_flight() {
+            self.spine.rekey_wanted.store(false, Ordering::SeqCst);
+            return;
+        }
+        self.lost_asked |= lost;
     }
 
-    fn witness(&mut self, live: Arc<TerminalCheckpoint>) -> Option<Rekey> {
+    /// Whether the newest chain needs a reader's keyframe the readers do not count toward, and whether for a loss: `Some(true)` when it lost its first slice or host step, so it no longer replays, or no keyframe is kept while the spine holds events; `Some(false)` when it ran [`REKEY_EVENTS`] events, which the spine's ring would evict it after.
+    fn wants_rekey(&self) -> Option<bool> {
+        match self.keyframes.back() {
+            Some(_) if !self.newest_replays() => Some(true),
+            Some(newest) => {
+                (self.log.head().0.saturating_sub(newest.seq.0) >= REKEY_EVENTS).then_some(false)
+            }
+            None => self.log.newest_live().is_some().then_some(true),
+        }
+    }
+
+    /// Whether the newest keyframe is kept with its chain's first slice and host step.
+    fn newest_replays(&self) -> bool {
+        self.keyframes.back().is_some_and(|newest| {
+            newest.first_blob >= self.blob_base() && newest.first_host_op >= self.host_op_base()
+        })
+    }
+
+    fn witness(&mut self, live: Arc<TerminalCheckpoint>) {
         if self.keyframes.is_empty() || self.chain_diverged {
-            return None;
+            return;
         }
         let ts = self.stamp();
         let id = WitnessId(self.next_witness);
@@ -1960,7 +2345,6 @@ impl TemporalRecorder {
         let seq = self.append(Op::Witness(id), ts);
         let charge = charge_of(&live);
         self.used += charge;
-        self.bytes_since_keyframe += charge;
         self.witnesses.push_back(Witnessed {
             id,
             seq,
@@ -1969,12 +2353,18 @@ impl TemporalRecorder {
             state: WitnessState::Pending(live),
             snapshot_charge: charge,
         });
-        self.due()
+        self.pending += 1;
+        self.after_op();
     }
 
+    /// Evict the witnesses at or before `gone`, counting each one no fold judged ([`Self::unjudged_evicted`]).
     fn drop_witnesses_through(&mut self, gone: Seq) {
         while let Some(w) = self.witnesses.front().filter(|w| w.seq <= gone) {
             self.used = self.used.saturating_sub(w.charge());
+            if matches!(w.state, WitnessState::Pending(_)) {
+                self.pending = self.pending.saturating_sub(1);
+                self.unjudged_evicted += 1;
+            }
             self.witnesses.pop_front();
         }
     }
@@ -1991,7 +2381,7 @@ impl TemporalRecorder {
         self.witnesses.get(idx).filter(|w| w.id == id)
     }
 
-    /// Record the verdicts a fold reached ([`ReplayPlan::fold`]), refunding each judged snapshot to the budget and, in the newest keyframe's chain only, to its rekey count; a mismatch there asks the reader for a live keyframe and keeps the chain from minting one.
+    /// Record the verdicts a fold reached ([`ReplayPlan::fold`]) on witnesses still pending, taking each out of [`Self::pending`] and refunding its snapshot to the budget; a mismatch in the newest keyframe's chain asks the reader for a live keyframe and keeps that chain from taking another witness.
     pub(crate) fn judge(&mut self, judged: Judged) {
         let newest = self.keyframes.back().map(|kf| kf.seq);
         for (id, matched) in judged.0 {
@@ -2008,10 +2398,8 @@ impl TemporalRecorder {
                 WitnessState::Diverged
             };
             let in_newest_chain = newest.is_some_and(|kf| w.seq > kf);
+            self.pending = self.pending.saturating_sub(1);
             self.used = self.used.saturating_sub(charge);
-            if in_newest_chain {
-                self.bytes_since_keyframe = self.bytes_since_keyframe.saturating_sub(charge);
-            }
             self.witnessed += 1;
             if !matched {
                 self.diverged += 1;
@@ -2143,19 +2531,33 @@ impl TemporalRecorder {
         self.diverged
     }
 
+    /// Kept witnesses no fold has judged yet (`temporal status` `pending=`): each is charged to the budget until a fold judges it or an eviction drops it.
+    #[must_use]
+    pub(crate) const fn pending(&self) -> u64 {
+        self.pending
+    }
+
+    /// Witnesses the spine's ring, the budget, the pool's shedding or the pool's forget dropped before any fold judged them (`temporal status` `unjudged_evicted=`); a forget the person asked for drops its witnesses uncounted.
+    #[must_use]
+    pub(crate) const fn unjudged_evicted(&self) -> u64 {
+        self.unjudged_evicted
+    }
+
     /// Record a keyframe (a serialized [`TerminalCheckpoint`]), the seed for replays to instants at or after it.
     pub(crate) fn record_keyframe(&mut self, keyframe: impl Into<ReplayKeyframe>) {
-        self.record_keyframe_inner(keyframe.into(), false, false);
+        self.record_keyframe_inner(keyframe.into(), false, false, false);
         self.settle();
     }
 
     fn record_keyframe_with_marks(&mut self, keyframe: ReplayKeyframe, command: bool) {
-        self.record_keyframe_inner(keyframe, command, true);
+        self.record_keyframe_inner(keyframe, false, command, true);
     }
 
+    /// [`Self::record_keyframe_as`] under the config the reader projected `keyframe` under, or the recorder's when it names none; a config that has moved since asks the reader for a live keyframe under the new one.
     fn record_keyframe_inner(
         &mut self,
         mut keyframe: ReplayKeyframe,
+        follows: bool,
         command: bool,
         coalesceable: bool,
     ) {
@@ -2164,7 +2566,7 @@ impl TemporalRecorder {
             .take()
             .unwrap_or_else(|| self.replay_config.clone());
         let stale_config = config.as_deref() != self.replay_config.as_deref();
-        self.record_keyframe_as(keyframe, false, command, coalesceable, config);
+        self.record_keyframe_as(keyframe, follows, command, coalesceable, config);
         if stale_config {
             self.spine.keyframe_wanted.store(true, Ordering::Release);
         }
@@ -2179,21 +2581,25 @@ impl TemporalRecorder {
         })
     }
 
-    /// [`Self::record_keyframe`], marked as minted by a replay (a rekey) or taken from the live engine, as standing in for a slice that started a command, and its chain replaying under `config`.
+    /// [`Self::record_keyframe`], marked as following the slice before it (a reader's rekey, [`TemporalMsg::Rekeyframe`]) or standing in for it, as standing in for a slice that started a command, and its chain replaying under `config`. When it closes a chain that still holds a pending witness, it tells the pool the recorder is charged to that a judge is due ([`RewindPool::judge_due`]).
     fn record_keyframe_as(
         &mut self,
         keyframe: ReplayKeyframe,
-        replayed: bool,
+        follows: bool,
         command: bool,
         coalesceable: bool,
         config: Option<Arc<TerminalConfig>>,
     ) {
+        let closes_pending = self
+            .keyframes
+            .back()
+            .is_some_and(|prev| self.holds_pending(prev.seq));
         let ts = self.stamp();
         let id = KeyframeId(self.next_keyframe);
         self.next_keyframe += 1;
         let seq = self.append(Op::Keyframe(id), ts);
         let mut command = command;
-        let mut freed_keyframe = 0usize;
+        let mut coalesced = None;
         if coalesceable
             && self.keyframes.len() >= 2
             && self.keyframes.back().is_some_and(|prev| {
@@ -2206,12 +2612,12 @@ impl TemporalRecorder {
             })
             && let Some(prev) = self.keyframes.pop_back()
         {
-            let prev_charge = prev.charge();
-            self.used = self.used.saturating_sub(prev_charge);
-            freed_keyframe = prev_charge;
+            self.used = self.used.saturating_sub(prev.own_charge());
             command |= prev.command;
+            coalesced = Some(prev);
         }
         let retained_bytes = keyframe.charge;
+        let (image_bytes, charged_images) = self.images.hold(&keyframe.carry);
         let keyframe = RetainedKeyframe {
             #[cfg(test)]
             id,
@@ -2220,21 +2626,30 @@ impl TemporalRecorder {
             first_blob: self.next_blob,
             first_host_op: self.next_host_op,
             cut: None,
-            replayed,
+            follows,
             coalesceable,
             command,
             packed: false,
             retained_bytes,
+            image_bytes,
             checkpoint: keyframe.checkpoint,
             carry: keyframe.carry,
             config,
         };
-        self.used += keyframe.charge();
+        self.used += keyframe.own_charge() + charged_images;
         self.keyframes.push_back(keyframe);
-        self.bytes_since_keyframe = 0;
-        self.ends_mid_sequence = false;
+        // The keyframe it replaces lets go of its images only after this one holds them, so an image both hold is neither refunded and charged again nor counted as freed.
+        let freed_keyframe = coalesced.map_or(0, |prev| {
+            let refunded = self.images.release(&prev.carry);
+            self.used = self.used.saturating_sub(refunded);
+            prev.own_charge() + refunded
+        });
         self.chain_diverged = false;
+        if closes_pending && let Some(share) = &self.share {
+            share.pool.judge_due.store(true, Ordering::Release);
+        }
         self.enforce_budget();
+        self.lost_asked &= !self.newest_replays();
         self.pack_older_chains();
         if freed_keyframe > 0 {
             self.note_freed(freed_keyframe);
@@ -2368,57 +2783,8 @@ impl TemporalRecorder {
         if let Some(newest) = self.keyframes.back_mut() {
             newest.cut = Some(end);
         }
-        self.ends_mid_sequence = false;
         self.record_keyframe(keyframe);
         self.spine.closed.fetch_add(1, Ordering::Release);
-    }
-
-    fn rekey_due(&self) -> Option<Rekey> {
-        if self.ends_mid_sequence || self.chain_diverged {
-            return None;
-        }
-        let newest = self.keyframes.back().filter(|kf| {
-            kf.first_blob >= self.blob_base() && kf.first_host_op >= self.host_op_base()
-        })?;
-        let chain = self.bytes_since_keyframe;
-        let interval = (self.budget / 4).max(MIN_REKEY_BYTES);
-        let by_bytes = chain >= interval;
-        let by_events = self.log.head().0.saturating_sub(newest.seq.0) >= REKEY_EVENTS;
-        let by_pressure = chain >= MIN_REKEY_BYTES
-            && newest.charge() + chain > self.budget.saturating_sub(interval);
-        #[cfg(test)]
-        let (by_events, by_pressure) = (
-            by_events && self.disabled_trigger != Some(RekeyTrigger::Events),
-            by_pressure && self.disabled_trigger != Some(RekeyTrigger::Pressure),
-        );
-        if !(by_bytes || by_events || by_pressure) {
-            return None;
-        }
-        Some(Rekey {
-            plan: self.plan(self.latest_tick())?,
-            head: self.log.head(),
-            generation: self.generation,
-        })
-    }
-
-    /// Record the verdicts and the keyframe a due re-keyframe minted ([`Rekey::mint_with_poll`]), unless a witness in its chain diverged, then hold the budget.
-    pub(crate) fn rekeyed(&mut self, minted: Minted) {
-        self.note_freed(BLOB_SLAB_BYTES);
-        if minted.generation != self.generation {
-            return;
-        }
-        self.judge(minted.judged);
-        match minted.keyframe {
-            Some(keyframe) if self.log.head() == minted.head && !self.chain_diverged => {
-                self.record_keyframe_as(keyframe, true, false, false, minted.config);
-            }
-            Some(_) => self.enforce_budget(),
-            None => {
-                self.ends_mid_sequence = true;
-                self.enforce_budget();
-            }
-        }
-        self.settle();
     }
 
     fn store_blob(&mut self, input: Option<InputSlice>) -> BlobId {
@@ -2467,7 +2833,8 @@ impl TemporalRecorder {
         let Some(keyframe) = self.keyframes.pop_front() else {
             return false;
         };
-        self.used = self.used.saturating_sub(keyframe.charge());
+        let refunded = self.images.release(&keyframe.carry);
+        self.used = self.used.saturating_sub(keyframe.own_charge() + refunded);
         let first_host = self
             .keyframes
             .front()
@@ -2559,85 +2926,58 @@ impl TemporalRecorder {
     }
 
     /// Fold one message from the reader into the spine, in FIFO order: the writer thread's whole job ([`write_queued`]).
-    #[must_use]
-    pub(crate) fn apply(&mut self, msg: TemporalMsg) -> Option<Rekey> {
-        let due = self.apply_op(msg);
+    pub(crate) fn apply(&mut self, msg: TemporalMsg) {
+        self.apply_op(msg);
         self.settle();
-        due
     }
 
     /// [`Self::apply`] for a message sent in recording generation `generation`: one sent before a forget is dropped, a break it closes still counted.
-    #[must_use]
-    fn apply_in(&mut self, generation: u64, msg: TemporalMsg) -> Option<Rekey> {
+    fn apply_in(&mut self, generation: u64, msg: TemporalMsg) {
         if generation == self.generation {
-            return self.apply(msg);
-        }
-        if let TemporalMsg::Keyframe(_) = msg {
+            self.apply(msg);
+        } else if let TemporalMsg::Keyframe(_) = msg {
             self.spine.closed.fetch_add(1, Ordering::Release);
         }
-        None
     }
 
-    fn apply_op(&mut self, msg: TemporalMsg) -> Option<Rekey> {
+    fn apply_op(&mut self, msg: TemporalMsg) {
         let op = match msg {
-            TemporalMsg::RawIn(input) => {
-                self.bytes_since_keyframe += input.len();
-                // Only avoid repeating a failed fold while this exact slice is
-                // known to leave the live parser inside a sequence. A
-                // first attempt, Ground, or an unknown caller still replays.
-                self.ends_mid_sequence &= input.parser_ground == Some(false);
-                Op::RawIn(self.store_blob(Some(input)))
-            }
+            TemporalMsg::RawIn(input) => Op::RawIn(self.store_blob(Some(input))),
             TemporalMsg::Reply => Op::Reply(self.store_blob(None)),
             TemporalMsg::Resize { rows, cols } => Op::Resize { rows, cols },
             TemporalMsg::CellPx { width, height } => Op::CellPx { width, height },
-            TemporalMsg::Host(op, clock) => {
-                if matches!(op, HostOp::Reset) {
-                    self.ends_mid_sequence = false;
-                }
-                Op::Host(self.store_host_op(op, clock))
-            }
+            TemporalMsg::Host(op, clock) => Op::Host(self.store_host_op(op, clock)),
             TemporalMsg::ResizesLost(n) => {
                 self.lost_resizes = self.lost_resizes.saturating_add(n);
-                return None;
+                return;
             }
             TemporalMsg::Keyframe(checkpoint) => {
-                let _ = self.spine.keyframes_queued.try_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |n| Some(n.saturating_sub(1)),
-                );
+                self.spine.unqueue_keyframe();
                 self.close_break(checkpoint);
-                return None;
+                return;
             }
             TemporalMsg::LiveKeyframe(keyframe, marks) => {
-                let _ = self.spine.keyframes_queued.try_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |n| Some(n.saturating_sub(1)),
-                );
-                self.ends_mid_sequence = false;
+                self.spine.unqueue_keyframe();
                 self.record_keyframe_with_marks(keyframe, marks.command);
-                return None;
+                return;
             }
-            TemporalMsg::Witness(live) => return self.witness(live),
+            TemporalMsg::Rekeyframe(keyframe) => {
+                self.spine.unqueue_keyframe();
+                self.record_keyframe_inner(keyframe, true, false, false);
+                return;
+            }
+            TemporalMsg::Witness(live) => {
+                self.witness(live);
+                return;
+            }
         };
-        self.record(op)
-    }
-
-    /// [`Self::apply`], minting a due re-keyframe in place.
-    #[cfg(test)]
-    pub(crate) fn apply_inline(&mut self, msg: TemporalMsg) {
-        if let Some(due) = self.apply(msg) {
-            let minted = due.mint();
-            self.rekeyed(minted);
-        }
+        self.record(op);
     }
 
     /// Record a raw PTY-input burst (one copy into a shared allocation).
     #[cfg(test)]
     pub(crate) fn record_raw_in(&mut self, bytes: &[u8]) {
-        self.apply_inline(TemporalMsg::RawIn(InputSlice::at(
+        self.apply(TemporalMsg::RawIn(InputSlice::at(
             bytes,
             ClockReading::now(),
         )));
@@ -2647,7 +2987,7 @@ impl TemporalRecorder {
     #[cfg(test)]
     pub(crate) fn record_raw_in_shared(&mut self, bytes: Arc<[u8]>) {
         let range = 0..bytes.len();
-        self.apply_inline(TemporalMsg::RawIn(InputSlice::new(
+        self.apply(TemporalMsg::RawIn(InputSlice::new(
             bytes,
             range,
             ClockReading::now(),
@@ -2657,13 +2997,13 @@ impl TemporalRecorder {
     /// Record a reply's instant.
     #[cfg(test)]
     pub(crate) fn record_reply(&mut self) {
-        self.apply_inline(TemporalMsg::Reply);
+        self.apply(TemporalMsg::Reply);
     }
 
     /// Record a geometry change.
     #[cfg(test)]
     pub(crate) fn record_resize(&mut self, rows: u16, cols: u16) {
-        self.apply_inline(TemporalMsg::Resize { rows, cols });
+        self.apply(TemporalMsg::Resize { rows, cols });
     }
 
     /// Input slices the session's readers could not queue (`temporal status` `dropped_input=`).
@@ -2785,12 +3125,12 @@ impl TemporalRecorder {
             steps,
             policy: self.resize_policy,
             host_resyncs: self.host_resyncs_alt_screen,
-            live_base: !base.replayed,
+            stands_in: !base.follows,
             config: base.config.clone(),
         })
     }
 
-    /// The replay of each replayable chain to `at`'s, oldest first, the last folding only to `at` ([`App::rewind_changed`](crate::App)).
+    /// The replay of each replayable chain to `at`'s, oldest first, the last folding to `at`, or on to the witness that covers `at` ([`Self::covering_witness`]) where one does, so a search that reads instants only to `at` still passes the witness its replay is judged by ([`App::rewind_changed`](crate::App)).
     #[must_use]
     pub(crate) fn chain_plans(&self, at: Ticks) -> Vec<ReplayPlan> {
         let Some(oldest) = self.oldest_replayable().map(|kf| kf.seq) else {
@@ -2799,10 +3139,11 @@ impl TemporalRecorder {
         let Some(last) = self.base_keyframe(at).map(|kf| kf.seq) else {
             return Vec::new();
         };
+        let to = self.covering_witness(at).map_or(at, |w| w.max(at));
         self.keyframes
             .iter()
             .filter(|kf| kf.seq >= oldest && kf.seq <= last)
-            .filter_map(|kf| self.plan_from(kf, if kf.seq == last { at } else { Ticks(u64::MAX) }))
+            .filter_map(|kf| self.plan_from(kf, if kf.seq == last { to } else { Ticks(u64::MAX) }))
             .collect()
     }
 
@@ -2826,6 +3167,35 @@ impl TemporalRecorder {
             .get(self.keyframe_after(last).checked_sub(2)?)
             .filter(|kf| kf.seq >= oldest)?;
         self.plan_from(before, Ticks(u64::MAX))
+    }
+
+    /// The whole replay of every kept chain that holds a pending witness, newest first, the newest chain included: what [`judge_all`] folds.
+    #[must_use]
+    pub(crate) fn judge_plans(&self) -> Vec<ReplayPlan> {
+        self.keyframes
+            .iter()
+            .rev()
+            .filter(|kf| self.holds_pending(kf.seq))
+            .filter_map(|kf| self.plan_from(kf, Ticks(u64::MAX)))
+            .collect()
+    }
+
+    /// The whole replay of the newest closed chain (one a later keyframe ends) that holds a pending witness: what the shared writer judges next when idle ([`IdleJudge`]). The newest chain still grows, so only a fold on demand judges it ([`Self::judge_plans`]).
+    #[must_use]
+    pub(crate) fn judge_plan(&self) -> Option<ReplayPlan> {
+        let closed = self.keyframes.len().checked_sub(1)?;
+        self.keyframes
+            .iter()
+            .take(closed)
+            .rev()
+            .filter(|kf| self.holds_pending(kf.seq))
+            .find_map(|kf| self.plan_from(kf, Ticks(u64::MAX)))
+    }
+
+    /// Whether keyframe `base`'s chain holds a witness no fold has judged.
+    fn holds_pending(&self, base: Seq) -> bool {
+        self.chain_witnesses(base)
+            .any(|w| matches!(w.state, WitnessState::Pending(_)))
     }
 
     /// The whole replays a view at `at` keeps forks along: the replayable chain before `at`'s, then `at`'s ([`crate::rewind_worker::Show::around`]).
@@ -2958,7 +3328,7 @@ impl TemporalRecorder {
                         sync_open: kf.checkpoint.modes.synchronized_output(),
                         command: kf.command,
                     });
-                    (marks, !kf.replayed)
+                    (marks, !kf.follows)
                 }
                 _ => continue,
             };
@@ -3059,7 +3429,7 @@ impl TemporalRecorder {
                 }
                 Op::Resize { rows, cols } => events.push((t, Exported::Resize { rows, cols })),
                 Op::Keyframe(_) => {
-                    if let Some(kf) = self.keyframe_at(ev.seq).filter(|kf| !kf.replayed) {
+                    if let Some(kf) = self.keyframe_at(ev.seq).filter(|kf| !kf.follows) {
                         events.push((t, Exported::Screen(kf.checkpoint.clone())));
                     }
                 }
@@ -3252,16 +3622,18 @@ struct RetainedKeyframe {
     first_blob: u64,
     first_host_op: u64,
     cut: Option<Ticks>,
-    /// Whether a replay minted it (a rekey), so the slices before it are all on the spine.
-    replayed: bool,
+    /// Whether it is the live engine just after the slice before it (a reader's rekey, [`TemporalMsg::Rekeyframe`]) rather than standing in for that slice: every slice before it is on the spine, so it is no instant, no export writes it and it cuts no chain.
+    follows: bool,
     /// Whether this keyframe came from a live in-band resync ([`TemporalMsg::LiveKeyframe`]) and may coalesce with an immediately following one when no chain steps fell between them.
     coalesceable: bool,
     /// Whether the slice a live keyframe stands in for started a command ([`SliceMarks::command`]).
     command: bool,
     /// Whether unshared small slices in this completed chain were packed into slabs.
     packed: bool,
-    /// What the keyframe was charged when retained ([`ReplayKeyframe::charge`]), refunded when it goes.
+    /// What the keyframe pins whole ([`ReplayKeyframe::charge`]), its image payloads included.
     retained_bytes: usize,
+    /// The payload bytes of the distinct images its carry keeps alive, which the recording charges through [`SharedImages`], once however many keyframes hold one.
+    image_bytes: usize,
     checkpoint: Arc<TerminalCheckpoint>,
     /// The in-process transient state no checkpoint carries ([`ReplayCarry`]).
     carry: Arc<ReplayCarry>,
@@ -3270,8 +3642,62 @@ struct RetainedKeyframe {
 }
 
 impl RetainedKeyframe {
+    /// What it pins whole, its images included: what its chain holds once every older chain is gone, the base the readers' pressure trigger counts from ([`TemporalRecorder::seed_spine`]).
     const fn charge(&self) -> usize {
         self.retained_bytes
+    }
+
+    /// What `used` charges it alone: [`Self::charge`] less its images, refunded when it goes.
+    const fn own_charge(&self) -> usize {
+        self.retained_bytes.saturating_sub(self.image_bytes)
+    }
+}
+
+/// The image payloads the kept keyframes hold, each charged to the recording once however many of them share it: how many kept keyframes hold each, by the address of its `Arc` ([`ReplayCarry::for_each_retained_image`]). An address names one image while its entry lives, because an entry lives only while a kept keyframe holds that `Arc`, so its allocation cannot be reused.
+#[derive(Default)]
+struct SharedImages(HashMap<usize, usize>);
+
+impl SharedImages {
+    /// Count one more holder of each image `carry` keeps alive. Returns their payload bytes, and of those the bytes of the images no kept keyframe held before, which the recording charges now.
+    fn hold(&mut self, carry: &ReplayCarry) -> (usize, usize) {
+        let (mut held, mut charged) = (0usize, 0usize);
+        carry.for_each_retained_image(|img| {
+            let bytes = img.payload_bytes();
+            held = held.saturating_add(bytes);
+            let holders = self.0.entry(Arc::as_ptr(img).addr()).or_insert(0);
+            if *holders == 0 {
+                charged = charged.saturating_add(bytes);
+            }
+            *holders += 1;
+        });
+        (held, charged)
+    }
+
+    /// Count one holder fewer of each image `carry` keeps alive, as a keyframe [`Self::hold`] counted goes. Returns the payload bytes of the images no kept keyframe holds now, which the recording refunds.
+    fn release(&mut self, carry: &ReplayCarry) -> usize {
+        let mut refunded = 0usize;
+        carry.for_each_retained_image(|img| {
+            let key = Arc::as_ptr(img).addr();
+            let holders = self.0.get_mut(&key);
+            debug_assert!(
+                holders.is_some(),
+                "a keyframe let go of an image the ledger never counted it holding"
+            );
+            let Some(holders) = holders else {
+                return;
+            };
+            *holders -= 1;
+            if *holders == 0 {
+                self.0.remove(&key);
+                refunded = refunded.saturating_add(img.payload_bytes());
+            }
+        });
+        refunded
+    }
+
+    /// The bytes its table allocates, which the recorder charges its pool apart from `used` ([`TemporalRecorder::charge`]).
+    fn table_bytes(&self) -> usize {
+        aterm_alloc::heap::table_bytes::<(usize, usize)>(self.0.capacity())
     }
 }
 
@@ -3281,51 +3707,21 @@ impl Default for TemporalRecorder {
     }
 }
 
-/// The writer thread's step for one message a reader sent in recording generation `generation`.
-#[cfg(test)]
-fn write_queued(recorder: &Mutex<TemporalRecorder>, generation: u64, msg: TemporalMsg) {
-    write_queued_with_poll(
-        recorder,
-        generation,
-        msg,
-        &mut || {},
-        #[cfg(any(debug_assertions, feature = "dev-seams"))]
-        None,
-    );
-}
-
-fn write_queued_with_poll(
+/// The writer thread's step for one message a reader sent in recording generation `generation`: apply it under the recorder's lock ([`TemporalRecorder::apply_in`]).
+fn write_queued(
     recorder: &Mutex<TemporalRecorder>,
     generation: u64,
     msg: TemporalMsg,
-    poll: &mut impl FnMut(),
     #[cfg(any(debug_assertions, feature = "dev-seams"))] costs: Option<
         &crate::recording_cost::Costs,
     >,
 ) {
-    poll();
-    let lock = || recorder.lock().unwrap_or_else(PoisonError::into_inner);
-    let due = {
-        #[cfg(any(debug_assertions, feature = "dev-seams"))]
-        let _cost = crate::recording_cost::begin(costs.map(|cost| &cost.apply), Some(1));
-        lock().apply_in(generation, msg)
-    };
-    if let Some(due) = due {
-        let minted = {
-            #[cfg(any(debug_assertions, feature = "dev-seams"))]
-            let _cost = crate::recording_cost::begin(
-                costs.map(|cost| &cost.mint),
-                u64::try_from(due.plan.steps.len()).ok(),
-            );
-            due.mint_with_poll(poll)
-        };
-        {
-            #[cfg(any(debug_assertions, feature = "dev-seams"))]
-            let _cost = crate::recording_cost::begin(costs.map(|cost| &cost.commit), Some(1));
-            lock().rekeyed(minted);
-        }
-    }
-    poll();
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    let _cost = crate::recording_cost::begin(costs.map(|cost| &cost.apply), Some(1));
+    recorder
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .apply_in(generation, msg);
 }
 
 impl Drop for TemporalRecorder {
@@ -3348,6 +3744,8 @@ pub(crate) struct RewindPool {
     focus: AtomicU64,
     front: AtomicU64,
     members: Mutex<Vec<Member>>,
+    /// Set when a member records a keyframe that closes a chain still holding a pending witness ([`TemporalRecorder::record_keyframe_as`]); cleared by the shared writer's [`IdleJudge`] once no member has a closed chain left to judge.
+    judge_due: AtomicBool,
 }
 
 /// One recording in a pool, and when its pane was last focused.
@@ -3399,7 +3797,13 @@ impl RewindPool {
             focus: AtomicU64::new(0),
             front: AtomicU64::new(NO_FRONT),
             members: Mutex::new(Vec::new()),
+            judge_due: AtomicBool::new(false),
         })
+    }
+
+    /// Whether a member's closed chain may hold a pending witness the shared writer has yet to judge ([`IdleJudge`]).
+    fn judge_due(&self) -> bool {
+        self.judge_due.load(Ordering::Acquire)
     }
 
     fn note_freed(&self, bytes: usize) {
@@ -3537,8 +3941,8 @@ pub(crate) struct ReplayPlan {
     steps: Vec<Placed>,
     policy: ResizePolicy,
     host_resyncs: bool,
-    /// Whether the base keyframe was taken from the live engine, so past the oldest chain it stands in for a slice the spine keeps no bytes of.
-    live_base: bool,
+    /// Whether the base keyframe stands in for the slice before it, so past the oldest chain the spine keeps no bytes of that slice.
+    stands_in: bool,
     config: Option<Arc<TerminalConfig>>,
 }
 
@@ -3570,17 +3974,11 @@ impl ReplayPlan {
     /// Fold the plan from its base keyframe through a fresh [`ReplayEngine`] configured with [`TemporalRecorder::set_resize_policy`], [`TemporalRecorder::set_host_resyncs_alt_screen`] and the base's [`TemporalRecorder::set_replay_config`], each slice at its recorded clock, judging each pending witness it passes by full equality with the replay's `checkpoint_visible()`.
     #[must_use]
     pub(crate) fn fold(self) -> Fold {
-        self.fold_with_poll(&mut || {})
-    }
-
-    fn fold_with_poll(self, poll: &mut impl FnMut()) -> Fold {
-        poll();
         #[cfg(test)]
         replay_hook::before_replay();
         let mut replay = self.configured(ReplayEngine::from_checkpoint(&self.base, self.policy));
         let mut judged = Vec::new();
         for Placed { step, .. } in self.steps {
-            poll();
             match step {
                 #[cfg(test)]
                 Step::RawIn(input) if replay_clock::live() => replay.process(input.bytes()),
@@ -3594,75 +3992,6 @@ impl ReplayPlan {
                 }
             }
         }
-        poll();
-        Fold {
-            term: replay.into_terminal(),
-            judged: Judged(judged),
-        }
-    }
-
-    /// A rekey keeps only the history the producer carries into its next input
-    /// slice. Keep an entire slice's history until it ends: the slice may write
-    /// and unscroll more than the carried suffix before the producer clamps it.
-    /// Unknown input callers, explicit history operations, and slices that
-    /// reveal or rewrap history retain the ordinary full-history fold.
-    #[cfg(test)]
-    fn fold_for_rekey(self) -> Fold {
-        self.fold_for_rekey_with_poll(&mut || {})
-    }
-
-    fn fold_for_rekey_with_poll(self, poll: &mut impl FnMut()) -> Fold {
-        poll();
-        if self.steps.iter().any(|placed| match &placed.step {
-            Step::RawIn(input) => input.parser_ground.is_none(),
-            Step::Resize { .. } | Step::Host(..) => true,
-            Step::CellPx { .. } | Step::Witness(..) => false,
-        }) {
-            return self.fold_with_poll(poll);
-        }
-        #[cfg(test)]
-        replay_hook::before_replay();
-        let mut replay = self.configured(ReplayEngine::from_checkpoint(&self.base, self.policy));
-        if replay.terminal().has_image_state() {
-            return self.fold_with_poll(poll);
-        }
-        let mut judged = Vec::new();
-        for placed in &self.steps {
-            poll();
-            match &placed.step {
-                Step::RawIn(input) => {
-                    let history = replay.terminal().main_grid().history_fence();
-                    let alternate = replay.terminal().modes().alternate_screen;
-                    let kitty_commands = replay.terminal().kitty_graphics_commands();
-                    let (_, history_effect) = aterm_core::grid::observe_history_effects(|| {
-                        #[cfg(test)]
-                        if replay_clock::live() {
-                            replay.process(input.bytes());
-                        } else {
-                            replay.process_at(input.bytes(), input.clock);
-                        }
-                        #[cfg(not(test))]
-                        replay.process_at(input.bytes(), input.clock);
-                    });
-                    if history_effect
-                        || kitty_commands != replay.terminal().kitty_graphics_commands()
-                        || alternate != replay.terminal().modes().alternate_screen
-                        || !history.holds_at(&replay.terminal().main_grid().history_fence())
-                        || !replay.trim_replay_history(REKEY_SCROLLBACK_LINES)
-                    {
-                        return self.fold_with_poll(poll);
-                    }
-                }
-                Step::Resize { rows, cols } => replay.resize(*rows, *cols),
-                Step::CellPx { width, height } => replay.set_cell_pixel_size(*width, *height),
-                Step::Host(op, clock) => replay.apply_host_op(*op, *clock),
-                Step::Witness(id, live) => {
-                    let replayed = replay.terminal().checkpoint_visible();
-                    judged.push((*id, replayed.as_ref() == Some(&**live)));
-                }
-            }
-        }
-        poll();
         Fold {
             term: replay.into_terminal(),
             judged: Judged(judged),
@@ -3768,11 +4097,12 @@ impl ReplayPlan {
         (differs, last)
     }
 
-    /// Fold every step onto `replay` (the base restored), calling `before` ahead of each slice or resize with the engine as the steps before it left it, while it says to go on; whether every step was folded.
+    /// Fold every step onto `replay` (the base restored), calling `before` ahead of each slice or resize with the engine as the steps before it left it, while it says to go on, and `witness` at each pending witness with its tick and whether it differs from the replay in more than a bounded history renumbers ([`unnumbered`], as [`Self::fold_onto`] reads it); whether every step was folded.
     pub(crate) fn fold_before(
         &self,
         replay: &mut ReplayEngine,
         mut before: impl FnMut(Passed<'_>, &ReplayEngine) -> bool,
+        mut witness: impl FnMut(Ticks, bool),
     ) -> bool {
         for placed in &self.steps {
             let (bytes, resize) = match &placed.step {
@@ -3787,7 +4117,14 @@ impl ReplayPlan {
                     continue;
                 }
                 Step::Host(..) => (None, None),
-                Step::Witness(..) => continue,
+                Step::Witness(_, live) => {
+                    let differs = replay
+                        .terminal()
+                        .checkpoint_visible()
+                        .is_none_or(|seen| unnumbered(seen) != unnumbered((**live).clone()));
+                    witness(placed.ts, differs);
+                    continue;
+                }
             };
             let go_on = before(
                 Passed {
@@ -3816,45 +4153,57 @@ impl ReplayPlan {
         self.configured(ReplayEngine::from_checkpoint(&self.base, self.policy))
     }
 
-    /// Fold the steps after `after` onto `replay` (from [`Self::restore`], or as an earlier call left it) until `budget` bytes of slices are applied, judging each pending witness it passes as [`Self::fold`] does, up to the next slice: the verdicts, the seq of the last step applied, and whether steps are left.
+    /// Fold the steps after `after` onto `replay` (from [`Self::restore`], or as an earlier call left it) until `budget` bytes of work are done, judging each pending witness it passes as [`Self::fold`] does, up to the next step that is not a witness: the verdicts, the seq of the last step applied, the bytes of slices applied, and whether steps are left. A slice works its bytes, a resize, which reflows the whole history, [`RESIZE_WORK`], and any other step [`STEP_WORK`], so a chain of resizes or host steps yields as a chain of slices does.
     pub(crate) fn judge_onto(
         &self,
         replay: &mut ReplayEngine,
         after: Seq,
         budget: usize,
-    ) -> (Judged, Seq, bool) {
+    ) -> (Judged, Seq, usize, bool) {
         let mut judged = Vec::new();
-        let (mut last, mut folded) = (after, 0usize);
+        let (mut last, mut folded, mut work) = (after, 0usize, 0usize);
         for placed in self.steps.iter().filter(|p| p.seq > after) {
-            if folded >= budget && matches!(placed.step, Step::RawIn(_)) {
-                return (Judged(judged), last, true);
+            if work >= budget && !matches!(placed.step, Step::Witness(..)) {
+                return (Judged(judged), last, folded, true);
             }
             match &placed.step {
                 #[cfg(test)]
                 Step::RawIn(input) if replay_clock::live() => {
                     replay.process(input.bytes());
                     folded += input.len();
+                    work += input.len();
                 }
                 Step::RawIn(input) => {
                     replay.process_at(input.bytes(), input.clock);
                     folded += input.len();
+                    work += input.len();
                 }
-                Step::Resize { rows, cols } => replay.resize(*rows, *cols),
-                Step::CellPx { width, height } => replay.set_cell_pixel_size(*width, *height),
-                Step::Host(op, clock) => replay.apply_host_op(*op, *clock),
+                Step::Resize { rows, cols } => {
+                    replay.resize(*rows, *cols);
+                    work += RESIZE_WORK;
+                }
+                Step::CellPx { width, height } => {
+                    replay.set_cell_pixel_size(*width, *height);
+                    work += STEP_WORK;
+                }
+                Step::Host(op, clock) => {
+                    replay.apply_host_op(*op, *clock);
+                    work += STEP_WORK;
+                }
                 Step::Witness(id, live) => {
                     let replayed = replay.terminal().checkpoint_visible();
                     judged.push((*id, replayed.as_ref() == Some(&**live)));
+                    work += STEP_WORK;
                 }
             }
             last = placed.seq;
         }
-        (Judged(judged), last, false)
+        (Judged(judged), last, folded, false)
     }
 
-    /// Whether the base keyframe was taken from the live engine, so past the oldest chain it stands in for a slice the spine keeps no bytes of.
-    pub(crate) const fn live_base(&self) -> bool {
-        self.live_base
+    /// Whether the base keyframe stands in for the slice before it, so past the oldest chain the spine keeps no bytes of that slice.
+    pub(crate) const fn stands_in(&self) -> bool {
+        self.stands_in
     }
 
     /// The seqs after which the plan's slices from its base first reach each multiple of `every` bytes: where a cache of its forks keeps them.
@@ -3893,52 +4242,225 @@ fn unnumbered(mut c: TerminalCheckpoint) -> TerminalCheckpoint {
     c
 }
 
-/// A due re-keyframe ([`TemporalRecorder::apply`]).
-#[must_use = "the budget holds once the re-keyframe is recorded (`TemporalRecorder::rekeyed`)"]
-pub(crate) struct Rekey {
+/// Output folded between the forks a view's cache keeps, and the most a judging pass folds before its caller looks for other work.
+pub(crate) const FORK_EVERY: usize = 64 * 1024;
+
+/// The work a judging fold books for a resize ([`ReplayPlan::judge_onto`]): a pass's whole budget, since a resize reflows the whole history the judging engine keeps.
+const RESIZE_WORK: usize = FORK_EVERY;
+
+/// The work a judging fold books for a step that is neither a slice nor a resize ([`ReplayPlan::judge_onto`]).
+const STEP_WORK: usize = 1024;
+
+/// A judging fold of one chain on an engine that keeps its whole history, as [`ReplayPlan::fold`] restores it, so its verdicts count: [`FORK_EVERY`] bytes of slices a pass ([`ReplayPlan::judge_onto`]). It holds the plan, not the recorder, so each pass runs with the recorder unlocked.
+pub(crate) struct ChainJudge {
     plan: ReplayPlan,
-    head: Seq,
-    generation: u64,
+    engine: ReplayEngine,
+    /// The seq of the last step a pass applied, or the base's before the first.
+    at: Seq,
 }
 
-impl Rekey {
-    /// Replay to the spine's end, judging the witnesses on the way, and checkpoint the result, with the recorder unlocked.
-    #[cfg(test)]
-    pub(crate) fn mint(self) -> Minted {
-        self.mint_with_poll(&mut || {})
-    }
-
-    fn mint_with_poll(self, poll: &mut impl FnMut()) -> Minted {
-        let config = self.plan.config.clone();
-        let Fold { term, judged } = self.plan.fold_for_rekey_with_poll(poll);
-        poll();
-        let keyframe = if term.parser_is_ground() {
-            keyframe_of(&term, REKEY_SCROLLBACK_LINES)
-        } else {
-            None
-        };
-        poll();
-        Minted {
-            head: self.head,
-            generation: self.generation,
-            keyframe,
-            config,
-            judged,
+impl ChainJudge {
+    /// A judge of `plan`, its base restored ([`ReplayPlan::restore`]).
+    pub(crate) fn new(plan: ReplayPlan) -> Self {
+        #[cfg(test)]
+        replay_hook::before_replay();
+        Self {
+            engine: plan.restore(),
+            at: plan.base_seq(),
+            plan,
         }
     }
+
+    /// Judge `plan` too: on `judge`'s chain, carry its fold on to the further witness; on another, or with none, start over. Whether it started over.
+    pub(crate) fn extend(judge: &mut Option<Self>, plan: ReplayPlan) -> bool {
+        match judge.as_mut() {
+            Some(j) if j.plan.base_seq() == plan.base_seq() => {
+                if plan.end_seq() > j.plan.end_seq() {
+                    j.plan = plan;
+                }
+                false
+            }
+            _ => {
+                *judge = Some(Self::new(plan));
+                true
+            }
+        }
+    }
+
+    /// One pass: the verdicts it reached, the bytes of slices it folded and whether steps are left.
+    pub(crate) fn step(&mut self) -> (Judged, usize, bool) {
+        let (judged, last, folded, more) =
+            self.plan.judge_onto(&mut self.engine, self.at, FORK_EVERY);
+        self.at = last;
+        (judged, folded, more)
+    }
+
+    /// The memory its engine holds ([`engine_bytes`]), which no pool is charged.
+    pub(crate) fn engine_bytes(&self) -> usize {
+        engine_bytes(&self.engine)
+    }
 }
 
-/// What [`Rekey::mint_with_poll`] produced, for [`TemporalRecorder::rekeyed`].
-pub(crate) struct Minted {
-    head: Seq,
-    generation: u64,
-    keyframe: Option<ReplayKeyframe>,
-    /// The config the replay ran under, which the keyframe's chain keeps.
-    config: Option<Arc<TerminalConfig>>,
-    judged: Judged,
+/// The memory `engine` holds: both grids and their stores.
+/// Unbooked Kitty store and visible-cell image payloads are added on top.
+pub(crate) fn engine_bytes(engine: &ReplayEngine) -> usize {
+    let term = engine.terminal();
+    term.grid()
+        .memory_used()
+        .saturating_add(
+            term.inactive_grid()
+                .map_or(0, aterm_core::grid::Grid::memory_used),
+        )
+        .saturating_add(term.unbooked_image_bytes())
 }
 
-/// Test-only hook [`ReplayPlan::fold`] calls first, so a test can probe the recorder lock from inside the fold.
+/// What [`judge_all`] did: the witnesses it judged and how many of them diverged, then the recorder's [`TemporalRecorder::pending`] and [`TemporalRecorder::unjudged_evicted`] after it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct JudgeCounts {
+    pub(crate) judged: u64,
+    pub(crate) diverged: u64,
+    pub(crate) pending: u64,
+    pub(crate) unjudged_evicted: u64,
+}
+
+/// Judge every kept chain that holds a pending witness, newest first ([`TemporalRecorder::judge_plans`], taken under one brief lock): each chain is folded to its end by a [`ChainJudge`] with the recorder unlocked, and its verdicts are handed to [`TemporalRecorder::judge`] under the lock. A witness evicted or forgotten meanwhile takes no verdict.
+pub(crate) fn judge_all(recorder: &Mutex<TemporalRecorder>) -> JudgeCounts {
+    let lock = || recorder.lock().unwrap_or_else(PoisonError::into_inner);
+    let plans = lock().judge_plans();
+    let mut counts = JudgeCounts::default();
+    for plan in plans {
+        let mut judge = ChainJudge::new(plan);
+        let mut verdicts = Judged::default();
+        loop {
+            let (judged, _, more) = judge.step();
+            verdicts.0.extend(judged.0);
+            if !more {
+                break;
+            }
+        }
+        drop(judge);
+        let mut rec = lock();
+        let (witnessed, diverged) = (rec.witnessed(), rec.diverged());
+        rec.judge(verdicts);
+        counts.judged += rec.witnessed() - witnessed;
+        counts.diverged += rec.diverged() - diverged;
+    }
+    let rec = lock();
+    counts.pending = rec.pending();
+    counts.unjudged_evicted = rec.unjudged_evicted();
+    counts
+}
+
+/// The shared writer's judge of closed chains in its quiet periods ([`WriterChannel`]): at most one [`ChainJudge`] in the process, parked between them.
+#[derive(Default)]
+struct IdleJudge {
+    job: Option<IdleJob>,
+}
+
+/// One closed chain the idle writer is judging, and the recording it was planned on.
+struct IdleJob {
+    recorder: Weak<Mutex<TemporalRecorder>>,
+    /// The seq of the chain's base keyframe, which must stay kept for a verdict to post. A forget ([`TemporalRecorder::forget`]) drops every keyframe and no seq recurs, so a job planned before one finds its base gone.
+    base: Seq,
+    judge: ChainJudge,
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    costs: Option<Arc<crate::recording_cost::Costs>>,
+}
+
+impl IdleJudge {
+    /// Judge `pool`'s closed chains that hold pending witnesses: the parked job first, then each member's newest such chain ([`TemporalRecorder::judge_plan`]), the pane focused last first. Before each [`FORK_EVERY`] pass it asks `stop`, and once that holds it returns with the job parked; each pass runs with the recorder unlocked and posts its verdicts under the lock before the next. A job is dropped when its chain is folded, when its recorder is gone, or, unposted, when the recording was forgotten or the chain's base evicted since it was planned. With no member's closed chain left to judge, it clears [`RewindPool::judge_due`].
+    fn run(&mut self, pool: &RewindPool, mut stop: impl FnMut() -> bool) {
+        loop {
+            if stop() {
+                return;
+            }
+            if self.job.is_none() {
+                // Cleared before the members are read, so a chain a member closes meanwhile keeps it set.
+                pool.judge_due.store(false, Ordering::Release);
+                let Some(job) = IdleJob::pick(pool) else {
+                    return;
+                };
+                pool.judge_due.store(true, Ordering::Release);
+                self.job = Some(job);
+            }
+            if !self.job.as_mut().is_some_and(IdleJob::pass) {
+                self.drop_job(pool);
+            }
+        }
+    }
+
+    /// Drop the job, reporting its engine freed to `pool` ([`RewindPool::note_freed`]), and relieve `pool`.
+    fn drop_job(&mut self, pool: &RewindPool) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        let freed = job.judge.engine_bytes();
+        drop(job);
+        pool.note_freed(freed);
+        pool.relieve();
+    }
+}
+
+impl IdleJob {
+    /// A judge of the newest closed chain holding a pending witness in the first of `pool`'s members, the pane focused last first, that has one; each recorder locked only to take its plan, the base restored with none locked.
+    fn pick(pool: &RewindPool) -> Option<Self> {
+        let mut members: Vec<(u64, Weak<Mutex<TemporalRecorder>>)> = pool
+            .members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|m| (m.focused, m.recorder.clone()))
+            .collect();
+        members.sort_by_key(|&(focused, _)| std::cmp::Reverse(focused));
+        members.into_iter().find_map(|(_, recorder)| {
+            let strong = recorder.upgrade()?;
+            let rec = strong.lock().unwrap_or_else(PoisonError::into_inner);
+            let plan = rec.judge_plan()?;
+            #[cfg(any(debug_assertions, feature = "dev-seams"))]
+            let costs = rec.spine.costs.handle();
+            drop(rec);
+            drop(strong);
+            Some(Self {
+                base: plan.base_seq(),
+                judge: ChainJudge::new(plan),
+                recorder,
+                #[cfg(any(debug_assertions, feature = "dev-seams"))]
+                costs,
+            })
+        })
+    }
+
+    /// One pass, booked under the recorder's `judge` cost, its verdicts then posted: whether the job goes on, which it does while steps are left and its chain's base is still kept (neither forgotten nor evicted). A job whose recorder is gone runs no pass.
+    fn pass(&mut self) -> bool {
+        if self.recorder.strong_count() == 0 {
+            return false;
+        }
+        let (judged, more) = {
+            #[cfg(any(debug_assertions, feature = "dev-seams"))]
+            let mut cost =
+                crate::recording_cost::begin(self.costs.as_deref().map(|c| &c.judge), None);
+            let (judged, folded, more) = self.judge.step();
+            #[cfg(any(debug_assertions, feature = "dev-seams"))]
+            if let Some(cost) = cost.as_mut() {
+                cost.set_work(u64::try_from(folded).ok());
+            }
+            #[cfg(not(any(debug_assertions, feature = "dev-seams")))]
+            let _ = folded;
+            (judged, more)
+        };
+        let Some(recorder) = self.recorder.upgrade() else {
+            return false;
+        };
+        let mut rec = recorder.lock().unwrap_or_else(PoisonError::into_inner);
+        if rec.keyframe_at(self.base).is_none() {
+            return false;
+        }
+        rec.judge(judged);
+        more
+    }
+}
+
+/// Test-only hook a replay calls first ([`ReplayPlan::fold`], and [`ChainJudge::new`] before it restores its base), so a test can probe the recorder lock from inside the fold.
 #[cfg(test)]
 pub(crate) mod replay_hook {
     use std::cell::RefCell;
@@ -4031,6 +4553,45 @@ pub(crate) mod lookup_scan {
     }
 }
 
+/// The keyframes rekeys on this thread captured ([`SpineMark::rekey`]), sent or refused.
+#[cfg(test)]
+mod capture_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CAPTURED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn captured() {
+        CAPTURED.with(|n| n.set(n.get() + 1));
+    }
+
+    /// Keyframes captured on this thread so far.
+    pub(super) fn count() -> usize {
+        CAPTURED.with(Cell::get)
+    }
+}
+
+/// A reader that counts a keyframe between a writer's ask and its recheck ([`TemporalRecorder::after_op`]), which no test thread can time.
+#[cfg(test)]
+mod ask_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static RACE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Have the next ask a writer on this thread stores race a reader that counts a keyframe right after it.
+    pub(super) fn race_next() {
+        RACE.with(|r| r.set(true));
+    }
+
+    /// Whether this ask races one; once per [`race_next`].
+    pub(super) fn races() -> bool {
+        RACE.with(|r| r.replace(false))
+    }
+}
+
 #[cfg(test)]
 mod resync_probe {
     use std::cell::Cell;
@@ -4049,10 +4610,13 @@ mod resync_probe {
     }
 }
 
+/// Events since the newest keyframe after which the recorder asks the readers for a rekey ([`SpineWatermark::rekey_wanted`]), well inside the event ring so that keyframe stays replayable.
 const REKEY_EVENTS: u64 = (aterm_buffer::MAX_LOG_EVENTS / 4) as u64;
 
+/// The least rekey interval, and the least output since the newest keyframe for the pressure trigger to rekey ([`SpineWatermark::rekey_due`]).
 const MIN_REKEY_BYTES: usize = 64 * 1024;
 
+/// A trigger a test turns off on a recording's readers ([`SpineWatermark::disable_trigger`]): `Events` ignores the recorder's ask ([`SpineWatermark::rekey_wanted`]), `Pressure` the budget-pressure arm of [`SpineWatermark::rekey_due`].
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RekeyTrigger {
@@ -4060,6 +4624,7 @@ enum RekeyTrigger {
     Pressure,
 }
 
+/// The history, in lines, a reader's keyframes carry ([`keyframe_of`]) and its primary grid's carried replay-history suffix is clamped to after each recorded step ([`aterm_core::Terminal::note_bounded_replay_step`]).
 const REKEY_SCROLLBACK_LINES: usize = 2048;
 
 /// Output since the last witness that makes the next slice at parser ground take one.
@@ -4135,7 +4700,7 @@ mod tests {
         }
         assert!(
             r.keyframe_count() > 1,
-            "REACH: the fixture must mint several keyframes"
+            "REACH: the fixture must record several keyframes"
         );
 
         let ticks: Vec<u64> = r.log.live().map(|e| e.ts.0).collect();
@@ -4407,21 +4972,30 @@ mod tests {
         assert!(r.blob_bytes(BlobId(3)).is_none(), "unissued handle => None");
     }
 
+    /// The readers' rekeys keep the latest instant reachable through four budgets of output: each a follows keyframe of the live screen, every kept one replays, and the latest replay is the live screen.
     #[test]
     fn rekeyframing_keeps_the_latest_reachable_past_the_budget() {
-        let mut r = TemporalRecorder::with_budget(1024 * 1024);
-        let blank = aterm_core::terminal::Terminal::new(6, 24);
-        r.record_keyframe(blank.checkpoint());
+        let mut rig = ReaderRig::new(Terminal::new(6, 24), 1024 * 1024);
         for i in 0..4096u32 {
-            r.record_raw_in(format!("row {i:06}\r\n").as_bytes());
-            r.record_raw_in(&[b'.'; 1000]);
-            r.record_raw_in(b"\r\n");
+            rig.slice(format!("row {i:06}\r\n").as_bytes(), 0);
+            rig.slice(&[b'.'; 1000], 0);
+            rig.slice(b"\r\n", 0);
         }
-        r.record_raw_in(b"FINAL-SENTINEL-LINE\r\n");
+        rig.slice(b"FINAL-SENTINEL-LINE\r\n", 0);
 
+        let r = &rig.r;
         let term = r
             .replay_at(None)
             .expect("re-keyframing keeps the latest instant reachable past the budget");
+        assert_eq!(
+            term.checkpoint_visible(),
+            rig.live.checkpoint_visible(),
+            "the latest replay is the live screen"
+        );
+        assert!(
+            r.keyframes.iter().all(|kf| kf.follows),
+            "every kept keyframe is a reader's rekey: the seed went with the budget"
+        );
         let mut found = false;
         for row in 0..i32::from(term.rows()) {
             if term
@@ -4441,7 +5015,7 @@ mod tests {
         let interval = (r.budget / 4).max(MIN_REKEY_BYTES);
         assert!(
             (2..=r.budget / interval + 1).contains(&r.keyframe_count()),
-            "re-keyframing minted fresh keyframes, at most {} kept: {}",
+            "the readers keyed fresh chains, at most {} kept: {}",
             r.budget / interval + 1,
             r.keyframe_count()
         );
@@ -4486,30 +5060,33 @@ mod tests {
             );
         }
         for events_trigger in [true, false] {
-            let mut live = Terminal::new(6, 20);
-            let mut r = TemporalRecorder::new();
+            let mut rig = ReaderRig::new(Terminal::new(6, 20), DEFAULT_BUDGET_BYTES);
             if !events_trigger {
-                r.disabled_trigger = Some(RekeyTrigger::Events);
+                rig.r
+                    .spine_watermark()
+                    .disable_trigger(RekeyTrigger::Events);
             }
-            r.record_keyframe(live.checkpoint());
             let mut lost_at = None;
             for i in 0..3 * RING {
-                let line = format!("{i:06}\r\n");
-                live.process(line.as_bytes());
-                r.record_raw_in(line.as_bytes());
+                rig.slice(format!("{i:06}\r\n").as_bytes(), 0);
                 if i % PROBE == PROBE / 2 {
-                    let Some(replayed) = r.replay_at(None) else {
+                    let Some(replayed) = rig.r.replay_at(None) else {
                         lost_at = Some(i);
                         break;
                     };
-                    assert_eq!(screen_of(&replayed), screen_of(&live), "after {i}");
+                    assert_eq!(screen_of(&replayed), screen_of(&rig.live), "after {i}");
                 }
             }
-            assert_retention_holds(&r);
+            let r = &rig.r;
+            assert_retention_holds(r);
             assert!(r.dropped_events() > 0, "REACH: the ring wrapped");
             if events_trigger {
                 assert_eq!(lost_at, None, "replay lost");
                 assert!(r.reachable_from().is_some());
+                assert!(
+                    rig.rekeys > 0,
+                    "REACH: the writer asked the reader for rekeys"
+                );
             } else {
                 assert!(
                     lost_at.is_some_and(|i| (RING - 1..RING - 1 + PROBE).contains(&i)),
@@ -4524,24 +5101,24 @@ mod tests {
     #[test]
     fn replay_survives_more_than_twice_the_ring_under_a_small_budget() {
         const RING: usize = aterm_buffer::MAX_LOG_EVENTS;
-        let mut live = Terminal::new(6, 40);
-        let mut r = TemporalRecorder::with_budget(1024 * 1024);
-        r.record_keyframe(live.checkpoint());
+        let mut rig = ReaderRig::new(Terminal::new(6, 40), 1024 * 1024);
         let pad = "x".repeat(31);
         for i in 0..2 * RING + 8192 {
             let line = format!("{i:06} {pad}\r\n");
             assert_eq!(line.len(), 40);
-            live.process(line.as_bytes());
-            r.record_raw_in(line.as_bytes());
+            rig.slice(line.as_bytes(), 0);
             if i % 16_384 == 8191 {
-                let replayed = r
+                let replayed = rig
+                    .r
                     .replay_at(None)
                     .unwrap_or_else(|| panic!("replay lost after event {i}"));
-                assert_eq!(screen_of(&replayed), screen_of(&live), "after {i}");
-                assert_retention_holds(&r);
+                assert_eq!(screen_of(&replayed), screen_of(&rig.live), "after {i}");
+                assert_retention_holds(&rig.r);
             }
         }
-        assert_retention_holds(&r);
+        assert!(rig.rekeys > 0, "REACH: the readers keyed the recording");
+        let r = &rig.r;
+        assert_retention_holds(r);
         assert!(r.dropped_events() > 0, "REACH: the ring wrapped");
         assert!(
             r.blobs.len() < r.live_events(),
@@ -4575,28 +5152,34 @@ mod tests {
             "REACH: under pressure the chain still fits (charge {charge})"
         );
         for pressure in [true, false] {
-            let mut live = seeded();
             let mut r = TemporalRecorder::with_budget(budget);
-            if !pressure {
-                r.disabled_trigger = Some(RekeyTrigger::Pressure);
-            }
             r.record_keyframe(keyframe.clone());
+            let mut rig = ReaderRig::with(seeded(), r);
+            assert_eq!(
+                rig.r.spine.base_charge.load(Ordering::Acquire),
+                charge,
+                "the pressure trigger counts from the seed's charge"
+            );
+            if !pressure {
+                rig.r
+                    .spine_watermark()
+                    .disable_trigger(RekeyTrigger::Pressure);
+            }
             let mut lost_at = None;
             for i in 0..3 * budget / line(0).len() {
-                let bytes = line(REKEY_SCROLLBACK_LINES + 24 + i);
-                live.process(bytes.as_bytes());
-                r.record_raw_in(bytes.as_bytes());
-                if r.reachable_from().is_none() {
+                rig.slice(line(REKEY_SCROLLBACK_LINES + 24 + i).as_bytes(), 0);
+                if rig.r.reachable_from().is_none() {
                     lost_at = Some(i);
                     break;
                 }
             }
+            let r = &rig.r;
             assert!(r.used <= r.budget);
             if pressure {
                 assert_eq!(lost_at, None, "the newest chain was evicted");
-                assert!(r.next_keyframe > 4, "REACH: pressure re-keyframed");
+                assert!(rig.rekeys > 3, "REACH: pressure re-keyframed");
                 let replayed = r.replay_at(None).expect("replay");
-                assert_eq!(screen_of(&replayed), screen_of(&live));
+                assert_eq!(screen_of(&replayed), screen_of(&rig.live));
             } else {
                 assert!(lost_at.is_some(), "the chain survived without pressure");
                 assert!(r.replay_at(None).is_none());
@@ -4641,12 +5224,11 @@ mod tests {
     /// Review fix #50 (R1): once the oldest keyframe is evicted, the track is Lost from the oldest tick the log still names up to the keyframe a view now replays from.
     #[test]
     fn the_track_is_lost_up_to_the_oldest_replayable_keyframe_once_the_first_is_evicted() {
-        let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
-        r.record_keyframe(Terminal::new(6, 20).checkpoint());
+        let mut rig = ReaderRig::new(Terminal::new(6, 20), 4 * MIN_REKEY_BYTES);
         let line = vec![b'x'; MIN_REKEY_BYTES / 8];
         let lost = (0..10_000).find_map(|_| {
-            r.record_raw_in(&line);
-            let track = r.rewind_track();
+            rig.slice(&line, 0);
+            let track = rig.r.rewind_track();
             track
                 .spans
                 .first()
@@ -4655,6 +5237,8 @@ mod tests {
                 .map(|span| (track, span))
         });
         let (track, (from, to, _)) = lost.expect("the first keyframe is evicted");
+        assert!(rig.rekeys > 0, "REACH: the readers keyed the recording");
+        let r = &rig.r;
         assert_eq!(from, track.from);
         assert_eq!(Some(to), r.oldest_replayable().map(|kf| kf.ts));
         assert!(to > from, "a stretch, not a point");
@@ -4664,137 +5248,86 @@ mod tests {
         );
     }
 
+    /// A due rekey waits for the reader's slice that ends at parser ground: a slice that leaves a CSI or a tmux passthrough wrapper open sends no witness and no keyframe, nor does any slice or resize inside it, and the slice that closes it keys the chain, which then replays faithfully. The rekey is due by bytes, or because the writer asked for it.
     #[test]
-    fn a_rekeyframe_due_mid_sequence_waits_for_the_input_that_ends_it() {
-        let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
-        r.record_keyframe(Terminal::new(6, 20).checkpoint());
-        let mut burst = vec![b'x'; MIN_REKEY_BYTES];
-        burst.extend_from_slice(b"\x1b[1;3");
-        r.record_raw_in(&burst);
-        assert_eq!(r.keyframe_count(), 1, "deferred inside the CSI");
-        r.record_reply();
-        r.record_resize(6, 21);
-        assert_eq!(r.keyframe_count(), 1, "still inside it");
-        r.record_raw_in(b"1m");
-        assert_eq!(r.keyframe_count(), 2, "minted once the CSI ended");
-        assert_eq!(r.bytes_since_keyframe, 0);
-    }
-
-    fn partial_rekey_folds(open: &[u8], fragments: &[&[u8]], close: &[u8], observed: bool) {
-        let mut live = Terminal::new(6, 40);
-        let mut recorder = TemporalRecorder::with_budget(DEFAULT_BUDGET_BYTES);
-        recorder.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
-        recorder.spine_watermark().seed(SpinePre::take(&live));
-        let (tx, rx) = queue(64);
-        let mut mark = SpineMark::attach(recorder.spine_watermark());
-        let folds = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&folds);
-        let hook = replay_hook::install(move || {
-            count.fetch_add(1, Ordering::Relaxed);
-        });
-        let step = |live: &mut Terminal, mark: &mut SpineMark, bytes: &[u8], ms: u64| {
-            let at = clock(ms);
-            let pre = SpinePre::take(live);
-            live.process_at(bytes, at);
-            let reply = live.take_response().map(Arc::<[u8]>::from);
-            let input = InputSlice::at(bytes, at).replying(reply);
-            if observed {
-                mark.record(&tx, pre, live, input);
+    fn a_due_rekey_waits_for_the_reader_at_parser_ground() {
+        /// What opens the sequence, the slices inside it, and what closes it.
+        type Case<'a> = (&'a [u8], &'a [&'a [u8]], &'a [u8]);
+        let cases: [Case<'_>; 2] = [
+            (b"\x1b[1;3", &[b"2", b";"], b"1m"),
+            (b"\x1bPtmux;", &[b"abc", b"def"], b"\x1b\\"),
+        ];
+        for ((open, inside, close), by_bytes) in cases
+            .into_iter()
+            .flat_map(|case| [(case, true), (case, false)])
+        {
+            let label = format!("{} by_bytes={by_bytes}", String::from_utf8_lossy(open));
+            let mut rig = ReaderRig::new(Terminal::new(6, 40), 4 * MIN_REKEY_BYTES);
+            let mut first = if by_bytes {
+                format!("{}\r\n", "x".repeat(30))
+                    .repeat(MIN_REKEY_BYTES / 32 + 1)
+                    .into_bytes()
             } else {
-                assert!(tx.send(TemporalMsg::RawIn(input)));
+                rig.want_rekey();
+                b"prompt$ ".to_vec()
+            };
+            first.extend_from_slice(open);
+            assert_eq!(rig.slice(&first, 0), ["in"], "{label}: deferred inside it");
+            assert!(!rig.live.parser_is_ground());
+            assert!(rig.r.spine.rekey_due(), "{label}: the rekey stays due");
+            if !by_bytes {
+                rig.live.resize(6, 41);
             }
-        };
-        let mut first = vec![b'x'; DEFAULT_BUDGET_BYTES / 4];
-        first.extend_from_slice(open);
-        step(&mut live, &mut mark, &first, 100);
-        drain(&rx, &mut recorder);
-        assert!(!live.parser_is_ground());
-        assert_eq!(recorder.keyframe_count(), 1);
-        assert_eq!(folds.load(Ordering::Relaxed), 1);
-        for (index, fragment) in fragments.iter().enumerate() {
-            step(&mut live, &mut mark, fragment, 200 + index as u64);
-            drain(&rx, &mut recorder);
-            assert!(!live.parser_is_ground());
-            assert_eq!(recorder.keyframe_count(), 1);
-        }
-        let partial_folds = folds.load(Ordering::Relaxed);
-        step(&mut live, &mut mark, close, 2000);
-        drain(&rx, &mut recorder);
-        let completed_folds = folds.load(Ordering::Relaxed);
-        assert!(live.parser_is_ground());
-        assert_eq!(recorder.keyframe_count(), 2);
-        drop(hook);
-        for plan in recorder.chain_plans(recorder.latest_tick()) {
-            recorder.judge(plan.fold().judged);
-        }
-        assert_eq!(recorder.diverged(), 0);
-        assert_eq!(
-            screen_of(&recorder.replay_at(None).unwrap()),
-            screen_of(&live)
-        );
-        for chain in recorder.pane_chains().expect("chains") {
+            for bytes in inside {
+                let names = rig.slice(bytes, 0);
+                assert_eq!(
+                    names.last().map(String::as_str),
+                    Some("in"),
+                    "{label}: {names:?}"
+                );
+                assert!(!rig.live.parser_is_ground(), "{label}: still inside it");
+            }
             assert_eq!(
-                chain
-                    .check(aterm_aos_pane::PaneCode::ThisBuild, "test")
-                    .verdict,
-                aterm_aos::contract::Verdict::Pass
+                rig.slice(close, 0),
+                ["in", "witness", "rekeyframe"],
+                "{label}: keyed once it ended"
             );
-        }
-        if observed {
-            assert!(recorder.witnessed() > 0);
-            assert_eq!((partial_folds, completed_folds), (1, 2));
-        } else {
-            assert_eq!(partial_folds, 1 + fragments.len());
-            assert_eq!(completed_folds, partial_folds + 1);
+            assert!(rig.live.parser_is_ground());
+            assert_eq!(rig.follows(), 1, "{label}");
+            rig.assert_faithful(&label);
         }
     }
 
-    #[test]
-    fn nonground_rekey_csi_does_not_refold_the_unchanged_prefix() {
-        partial_rekey_folds(b"\x1b[1;", &[b"2", b";", b"3"], b"m", true);
-    }
-
-    #[test]
-    fn nonground_rekey_dcs_does_not_refold_the_unchanged_prefix() {
-        partial_rekey_folds(b"\x1bP$q", &[b"m", b"\x1b"], b"\\", true);
-    }
-
-    #[test]
-    fn nonground_rekey_tmux_wrapper_waits_for_its_terminator() {
-        partial_rekey_folds(b"\x1bPtmux;", &[b"abc", b"def"], b"\x1b\\", true);
-    }
-
-    #[test]
-    fn nonground_rekey_unknown_slices_retain_each_replay_attempt() {
-        partial_rekey_folds(b"\x1b[1;", &[b"2", b";", b"3"], b"m", false);
-    }
-
+    /// A split UTF-8 character reads as parser ground, so the reader keys the chain at it: the keyframe's parser carry holds the partial character, and the replay that completes it from there is the live screen.
     #[test]
     fn nonground_rekey_partial_utf8_still_keys_and_preserves_its_carry() {
-        let mut live = Terminal::new(6, 40);
-        let mut recorder = TemporalRecorder::with_budget(DEFAULT_BUDGET_BYTES);
-        recorder.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
-        recorder.spine_watermark().seed(SpinePre::take(&live));
-        let (tx, rx) = queue(64);
-        let mut mark = SpineMark::attach(recorder.spine_watermark());
-        let mut first = vec![b'x'; DEFAULT_BUDGET_BYTES / 4];
+        let mut rig = ReaderRig::new(Terminal::new(6, 40), 4 * MIN_REKEY_BYTES);
+        let mut first = vec![b'x'; MIN_REKEY_BYTES];
         first.push(0xf0);
-        slice_at(&mut live, &mut mark, &tx, &first, clock(100));
-        drain(&rx, &mut recorder);
-        assert!(live.parser_is_ground());
-        assert_eq!(recorder.keyframe_count(), 2);
-        for (index, bytes) in [b"\x9f".as_slice(), b"\x98", b"\x80"].iter().enumerate() {
-            slice_at(&mut live, &mut mark, &tx, bytes, clock(200 + index as u64));
-            drain(&rx, &mut recorder);
-            assert!(live.parser_is_ground());
-            assert!(!recorder.ends_mid_sequence);
-        }
-        assert_eq!(recorder.keyframe_count(), 2);
         assert_eq!(
-            screen_of(&recorder.replay_at(None).unwrap()),
-            screen_of(&live)
+            rig.slice(&first, 0),
+            ["in", "witness", "rekeyframe"],
+            "keyed at the split character"
         );
-        for chain in recorder.pane_chains().expect("chains") {
+        assert!(rig.live.parser_is_ground());
+        let keyed = rig.r.keyframes.back().expect("the rekey");
+        assert!(keyed.follows);
+        assert_eq!(
+            keyed
+                .checkpoint
+                .parser
+                .as_ref()
+                .map(|p| p.utf8_tail.clone()),
+            Some(vec![0xf0]),
+            "the keyframe's parser carry holds the partial character"
+        );
+        for bytes in [b"\x9f".as_slice(), b"\x98", b"\x80"] {
+            assert_eq!(rig.slice(bytes, 0), ["in"]);
+            assert!(rig.live.parser_is_ground());
+        }
+        assert_eq!(rig.follows(), 1);
+        rig.assert_faithful("the completed character");
+        for chain in rig.r.pane_chains().expect("chains") {
             assert_eq!(
                 chain
                     .check(aterm_aos_pane::PaneCode::ThisBuild, "test")
@@ -4802,75 +5335,6 @@ mod tests {
                 aterm_aos::contract::Verdict::Pass
             );
         }
-    }
-
-    #[test]
-    fn nonground_rekey_host_reset_retries_without_another_slice() {
-        let mut live = Terminal::new(6, 40);
-        let mut recorder = TemporalRecorder::with_budget(DEFAULT_BUDGET_BYTES);
-        recorder.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
-        recorder.spine_watermark().seed(SpinePre::take(&live));
-        let (tx, rx) = queue(64);
-        let mut mark = SpineMark::attach(recorder.spine_watermark());
-        let mut first = vec![b'x'; DEFAULT_BUDGET_BYTES / 4];
-        first.extend_from_slice(b"\x1b[1;");
-        slice_at(&mut live, &mut mark, &tx, &first, clock(100));
-        drain(&rx, &mut recorder);
-        assert!(recorder.ends_mid_sequence);
-        assert_eq!(recorder.keyframe_count(), 1);
-        live.reset();
-        mark.flush_host(&tx, &live);
-        drain(&rx, &mut recorder);
-        assert!(!recorder.ends_mid_sequence);
-        assert_eq!(recorder.keyframe_count(), 2);
-        assert_eq!(
-            screen_of(&recorder.replay_at(None).unwrap()),
-            screen_of(&live)
-        );
-    }
-
-    #[test]
-    fn nonground_rekey_new_keyframes_and_forget_reject_stale_wait_state() {
-        let mut live = Terminal::new(6, 40);
-        let mut recorder = TemporalRecorder::with_budget(DEFAULT_BUDGET_BYTES);
-        recorder.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
-        recorder.spine_watermark().seed(SpinePre::take(&live));
-        let (tx, rx) = queue_on(recorder.spine_watermark(), 64);
-        let mut mark = SpineMark::attach(recorder.spine_watermark());
-        let mut first = vec![b'x'; DEFAULT_BUDGET_BYTES / 4];
-        first.extend_from_slice(b"\x1b[1;");
-        slice_at(&mut live, &mut mark, &tx, &first, clock(100));
-        let (generation, input) = rx.try_recv_stamped().expect("first slice");
-        let minted = recorder
-            .apply_in(generation, input)
-            .expect("first fold")
-            .mint();
-        assert!(minted.keyframe.is_none());
-        recorder.rekeyed(minted);
-        assert!(recorder.ends_mid_sequence);
-        slice_at(&mut live, &mut mark, &tx, b"m", clock(200));
-        recorder.record_keyframe(keyframe_of(&live, usize::MAX).expect("new chain"));
-        assert!(!recorder.ends_mid_sequence);
-        slice_at(&mut live, &mut mark, &tx, b"\x1b[", clock(250));
-        assert!(!live.parser_is_ground());
-        // Both queued slices predate this forget. Neither their hints nor an old
-        // failed mint may restore waiting state in the replacement recording.
-        let stale = recorder
-            .apply(TemporalMsg::RawIn(InputSlice::at(&first, clock(300))))
-            .expect("stale fold")
-            .mint();
-        assert!(stale.keyframe.is_none());
-        live.reset();
-        assert!(recorder.forget_onto(&live));
-        recorder.rekeyed(stale);
-        drain_stamped(&rx, &mut recorder);
-        assert!(!recorder.ends_mid_sequence);
-        assert_eq!(recorder.keyframe_count(), 1);
-        assert_eq!(recorder.diverged(), 0);
-        assert_eq!(
-            screen_of(&recorder.replay_at(None).unwrap()),
-            screen_of(&live)
-        );
     }
 
     fn boundary_rekey_bulk(start: usize, count: usize) -> Vec<u8> {
@@ -4884,51 +5348,31 @@ mod tests {
         bytes
     }
 
-    fn boundary_rekey_matches_full(recorder: &TemporalRecorder, live: &Terminal) {
-        let expected = recorder.plan(recorder.latest_tick()).unwrap().fold();
-        let actual = recorder
-            .plan(recorder.latest_tick())
-            .unwrap()
-            .fold_for_rekey();
-        assert_eq!(actual.judged.0, expected.judged.0);
-        assert!(actual.judged.0.iter().all(|(_, same)| *same));
-        assert_eq!(actual.term.checkpoint_visible(), live.checkpoint_visible());
-        assert_eq!(
-            actual.term.checkpoint_visible(),
-            expected.term.checkpoint_visible()
-        );
-        let actual_key = keyframe_of(&actual.term, REKEY_SCROLLBACK_LINES).unwrap();
-        let expected_key = keyframe_of(&expected.term, REKEY_SCROLLBACK_LINES).unwrap();
-        assert!(
-            actual_key.checkpoint == expected_key.checkpoint,
-            "bounded replay changed the retained checkpoint"
-        );
-        let resumed = |key: &ReplayKeyframe| {
-            let mut replay = ReplayEngine::from_checkpoint(&key.checkpoint, recorder.resize_policy);
-            if let Some(config) = &recorder.replay_config {
-                replay = replay.with_config(config.clone());
+    /// History the seed kept whole, a resize and alternate-screen switches survive the readers' rekeys: after each the replay to the spine's end is the live screen and every witness judges faithful, and so on through unscrolls, screen switches and resizes past the last.
+    #[test]
+    fn boundary_rekey_preserves_initial_history_and_observed_resize_alt_transitions() {
+        let mut live = Terminal::new(20, 80);
+        live.set_scrollback_line_limit(None);
+        live.process_at(&boundary_rekey_bulk(0, 4000), clock(0));
+        let mut rig = ReaderRig::new(live, 64 * 1024 * 1024);
+        rig.slice_keyed(&b"\x1b[20+T".repeat(150), 1000);
+        rig.assert_faithful("after unscrolling the seed's history");
+        for chunk in 0..40 {
+            let bulk = boundary_rekey_bulk(4000 + chunk * 100, 100);
+            let ms = 2000 + chunk as u64 * 100;
+            if chunk == 39 {
+                rig.slice_keyed(&bulk, ms);
+            } else {
+                rig.slice(&bulk, ms);
             }
-            replay.with_replay_carry(&key.carry)
-        };
-        let mut actual_next = resumed(&actual_key);
-        let mut expected_next = resumed(&expected_key);
-        assert_eq!(
-            actual_next
-                .terminal()
-                .main_grid()
-                .capture_image_carry(REKEY_SCROLLBACK_LINES),
-            expected_next
-                .terminal()
-                .main_grid()
-                .capture_image_carry(REKEY_SCROLLBACK_LINES)
-        );
-        assert_eq!(
-            actual_next.terminal().main_grid().capture_handback_carry(),
-            expected_next
-                .terminal()
-                .main_grid()
-                .capture_handback_carry()
-        );
+        }
+        rig.assert_faithful("after more history");
+        rig.live.resize(20, 53);
+        rig.slice(b"resized\r\n", 7000);
+        rig.slice_keyed(b"\x1b[?1049halt-screen", 7500);
+        rig.assert_faithful("on the alternate screen after a resize");
+        rig.slice_keyed(b"\x1b[?1049lmain-again\r\n", 8000);
+        rig.assert_faithful("back on the main screen");
         for (i, bytes) in [
             b"\x1b[20+".as_slice(),
             b"T",
@@ -4938,170 +5382,16 @@ mod tests {
         .iter()
         .enumerate()
         {
-            actual_next.process_at(bytes, clock(20_000 + i as u64));
-            expected_next.process_at(bytes, clock(20_000 + i as u64));
-            assert_eq!(
-                actual_next.terminal().checkpoint_visible(),
-                expected_next.terminal().checkpoint_visible()
-            );
-            assert_eq!(
-                actual_next
-                    .terminal()
-                    .main_grid()
-                    .capture_image_carry(REKEY_SCROLLBACK_LINES),
-                expected_next
-                    .terminal()
-                    .main_grid()
-                    .capture_image_carry(REKEY_SCROLLBACK_LINES)
-            );
+            rig.slice(bytes, 9000 + i as u64 * 1000);
         }
         for (rows, cols) in [(30, 53), (10, 80), (20, 80)] {
-            actual_next.resize(rows, cols);
-            expected_next.resize(rows, cols);
-            assert_eq!(
-                actual_next.terminal().checkpoint_visible(),
-                expected_next.terminal().checkpoint_visible()
-            );
+            rig.live.resize(rows, cols);
+            rig.slice(b"~", 14_000);
         }
+        rig.assert_faithful("past the last rekey");
     }
 
-    #[test]
-    fn boundary_rekey_preserves_one_slices_new_history_before_trimming() {
-        let mut live = Terminal::new(20, 80);
-        live.set_scrollback_line_limit(None);
-        let mut recorder = TemporalRecorder::with_budget(64 * 1024 * 1024);
-        recorder.record_keyframe(keyframe_of(&live, usize::MAX).unwrap());
-        recorder.spine_watermark().seed(SpinePre::take(&live));
-        let (tx, rx) = queue(64);
-        let mut mark = SpineMark::attach(recorder.spine_watermark());
-        let mut bytes = boundary_rekey_bulk(0, 4000);
-        bytes.extend_from_slice(&b"\x1b[20+T".repeat(150));
-        slice_at(&mut live, &mut mark, &tx, &bytes, clock(1000));
-        drain(&rx, &mut recorder);
-        assert_eq!(recorder.keyframe_count(), 1);
-        boundary_rekey_matches_full(&recorder, &live);
-
-        // An always-on store limit discards rows that this same input later
-        // pulls back. This is the negative control for trimming only at its end.
-        let plan = recorder.plan(recorder.latest_tick()).unwrap();
-        let mut fixed = plan.restore_bounded(REKEY_SCROLLBACK_LINES.saturating_sub(1000));
-        let _ = plan.judge_onto(&mut fixed, plan.base_seq(), usize::MAX);
-        assert_ne!(
-            fixed.terminal().checkpoint_visible(),
-            live.checkpoint_visible()
-        );
-    }
-
-    #[test]
-    fn boundary_rekey_preserves_initial_history_and_observed_resize_alt_transitions() {
-        let mut live = Terminal::new(20, 80);
-        live.set_scrollback_line_limit(None);
-        live.process_at(&boundary_rekey_bulk(0, 4000), clock(0));
-        let mut recorder = TemporalRecorder::with_budget(64 * 1024 * 1024);
-        recorder.record_keyframe(keyframe_of(&live, usize::MAX).unwrap());
-        recorder.spine_watermark().seed(SpinePre::take(&live));
-        let (tx, rx) = queue(64);
-        let mut mark = SpineMark::attach(recorder.spine_watermark());
-        slice_at(
-            &mut live,
-            &mut mark,
-            &tx,
-            &b"\x1b[20+T".repeat(150),
-            clock(1000),
-        );
-        drain(&rx, &mut recorder);
-        boundary_rekey_matches_full(&recorder, &live);
-        for chunk in 0..40 {
-            slice_at(
-                &mut live,
-                &mut mark,
-                &tx,
-                &boundary_rekey_bulk(4000 + chunk * 100, 100),
-                clock(2000 + chunk as u64 * 100),
-            );
-            drain(&rx, &mut recorder);
-        }
-        boundary_rekey_matches_full(&recorder, &live);
-        live.resize(20, 53);
-        slice_at(
-            &mut live,
-            &mut mark,
-            &tx,
-            b"resized\r\n\x1b[?1049halt-screen",
-            clock(7000),
-        );
-        drain(&rx, &mut recorder);
-        boundary_rekey_matches_full(&recorder, &live);
-        slice_at(
-            &mut live,
-            &mut mark,
-            &tx,
-            b"\x1b[?1049lmain-again\r\n",
-            clock(8000),
-        );
-        drain(&rx, &mut recorder);
-        boundary_rekey_matches_full(&recorder, &live);
-    }
-
-    #[test]
-    fn boundary_rekey_unknown_input_keeps_full_history() {
-        let mut recorder = TemporalRecorder::with_budget(64 * 1024 * 1024);
-        recorder.record_keyframe(keyframe_of(&Terminal::new(20, 80), usize::MAX).unwrap());
-        recorder.record_raw_in(&boundary_rekey_bulk(0, 4000));
-        let expected = recorder.plan(recorder.latest_tick()).unwrap().fold();
-        let actual = recorder
-            .plan(recorder.latest_tick())
-            .unwrap()
-            .fold_for_rekey();
-        assert!(actual.term.grid().scrollback_lines() > REKEY_SCROLLBACK_LINES);
-        assert_eq!(actual.term.checkpoint(), expected.term.checkpoint());
-    }
-
-    #[test]
-    fn boundary_rekey_append_only_output_really_trims_between_slices() {
-        let mut live = Terminal::new(20, 80);
-        live.set_scrollback_line_limit(None);
-        let mut recorder = TemporalRecorder::with_budget(64 * 1024 * 1024);
-        recorder.record_keyframe(keyframe_of(&live, usize::MAX).unwrap());
-        recorder.spine_watermark().seed(SpinePre::take(&live));
-        let (tx, rx) = queue(64);
-        let mut mark = SpineMark::attach(recorder.spine_watermark());
-        for chunk in 0..40 {
-            slice_at(
-                &mut live,
-                &mut mark,
-                &tx,
-                &boundary_rekey_bulk(chunk * 100, 100),
-                clock(1000 + chunk as u64 * 100),
-            );
-            drain(&rx, &mut recorder);
-        }
-        let full = recorder.plan(recorder.latest_tick()).unwrap().fold();
-        let bounded = recorder
-            .plan(recorder.latest_tick())
-            .unwrap()
-            .fold_for_rekey();
-        assert!(full.term.grid().scrollback_lines() > REKEY_SCROLLBACK_LINES);
-        assert_eq!(
-            bounded.term.grid().scrollback_lines(),
-            REKEY_SCROLLBACK_LINES
-        );
-        boundary_rekey_matches_full(&recorder, &live);
-
-        // A later reveal must restart from the original plan, not continue with
-        // the already trimmed speculative engine.
-        slice_at(&mut live, &mut mark, &tx, b"\x1b[20+T", clock(6000));
-        drain(&rx, &mut recorder);
-        let full = recorder.plan(recorder.latest_tick()).unwrap().fold();
-        let fallback = recorder
-            .plan(recorder.latest_tick())
-            .unwrap()
-            .fold_for_rekey();
-        assert!(fallback.term.grid().scrollback_lines() > REKEY_SCROLLBACK_LINES);
-        assert_eq!(fallback.term.checkpoint(), full.term.checkpoint());
-        boundary_rekey_matches_full(&recorder, &live);
-    }
-
+    /// A CSI split across slices defers the reader's rekey to the slice that ends it, the keyed chain replays under the source's scrollback limit, and a witness of another screen judges diverged and asks for a live keyframe.
     #[test]
     fn boundary_rekey_keeps_split_parser_state_and_source_limits_and_rejects_bad_witness() {
         for limit in [None, Some(80)] {
@@ -5111,127 +5401,39 @@ mod tests {
             });
             let mut live = Terminal::new(20, 80);
             let _ = live.apply_config(&config);
-            let mut recorder = TemporalRecorder::with_budget(64 * 1024 * 1024);
-            recorder.set_replay_config(Some(config));
-            recorder.record_keyframe(keyframe_of(&live, usize::MAX).unwrap());
-            recorder.spine_watermark().seed(SpinePre::take(&live));
-            let (tx, rx) = queue(64);
-            let mut mark = SpineMark::attach(recorder.spine_watermark());
+            let mut r = TemporalRecorder::with_budget(64 * 1024 * 1024);
+            r.set_replay_config(Some(config));
+            r.record_keyframe(keyframe_of(&live, usize::MAX).unwrap());
+            let mut rig = ReaderRig::with(live, r);
             let mut first = boundary_rekey_bulk(0, 4000);
             first.extend_from_slice(b"\x1b[20+");
-            slice_at(&mut live, &mut mark, &tx, &first, clock(1000));
-            drain(&rx, &mut recorder);
-            assert!(!live.parser_is_ground());
-            slice_at(&mut live, &mut mark, &tx, b"T", clock(2000));
-            drain(&rx, &mut recorder);
-            boundary_rekey_matches_full(&recorder, &live);
-            let actual = recorder
-                .plan(recorder.latest_tick())
-                .unwrap()
-                .fold_for_rekey();
-            assert_eq!(actual.term.scrollback_line_limit(), limit);
+            rig.want_rekey();
+            assert_eq!(rig.slice(&first, 1000), ["in"], "{limit:?}: inside the CSI");
+            assert!(!rig.live.parser_is_ground());
+            assert_eq!(
+                rig.slice(b"T", 2000),
+                ["in", "witness", "rekeyframe"],
+                "{limit:?}: keyed once the CSI ended"
+            );
+            let replayed = rig.r.replay_at(None).expect("replay");
+            assert_eq!(replayed.scrollback_line_limit(), limit);
+            rig.assert_faithful(&format!("{limit:?}"));
             let stranger = Terminal::new(20, 80).checkpoint_visible().unwrap();
-            recorder.apply_inline(TemporalMsg::Witness(Arc::new(stranger)));
-            let full = recorder.plan(recorder.latest_tick()).unwrap().fold();
-            let bounded = recorder
-                .plan(recorder.latest_tick())
-                .unwrap()
-                .fold_for_rekey();
-            assert_eq!(bounded.judged.0, full.judged.0);
-            assert_eq!(bounded.judged.0.last().map(|(_, same)| *same), Some(false));
+            rig.r.apply(TemporalMsg::Witness(Arc::new(stranger)));
+            let counts = rig.judge_all();
+            assert_eq!(
+                (counts.judged, counts.diverged, counts.pending),
+                (1, 1, 0),
+                "{limit:?}: a witness of another screen diverges"
+            );
+            assert!(
+                rig.r.spine.keyframe_wanted(),
+                "{limit:?}: and asks the reader for a live keyframe"
+            );
         }
     }
 
-    #[test]
-    fn boundary_rekey_tight_byte_budgets_preserve_varied_append_only_history() {
-        for with_images in [false, true] {
-            for budget in [1024, 4 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024] {
-                let config = Arc::new(TerminalConfig {
-                    scrollback_limit: None,
-                    memory_budget: budget,
-                    ..TerminalConfig::default()
-                });
-                let mut live = aterm_core::terminal::TerminalBuilder::new()
-                    .size(20, 80)
-                    .tiered_scrollback_defaults()
-                    .build();
-                let _ = live.apply_config(&config);
-                assert_eq!(live.grid().scrollback_memory_budget(), Some(budget));
-                let mut recorder = TemporalRecorder::with_budget(64 * 1024 * 1024);
-                recorder.set_replay_config(Some(config));
-                recorder.record_keyframe(keyframe_of(&live, usize::MAX).unwrap());
-                recorder.spine_watermark().seed(SpinePre::take(&live));
-                let (tx, rx) = queue(64);
-                let mut mark = SpineMark::attach(recorder.spine_watermark());
-                let mut random = 0x8ebc_6af1u32;
-                let mut saw_image = false;
-                for chunk in 0..72usize {
-                    let mut bytes = Vec::new();
-                    for offset in 0..64usize {
-                        let row = chunk * 64 + offset;
-                        if with_images && row % 257 == 0 {
-                            bytes.extend_from_slice(b"\x1bP0;0;0q\"1;1;10;20#1;2;100;0;0~\x1b\\");
-                        }
-                        if row % 13 == 0 {
-                            bytes.extend_from_slice(
-                                format!("\x1b]8;;https://example.com/replay/{row}\x1b\\")
-                                    .as_bytes(),
-                            );
-                        }
-                        bytes.extend_from_slice(
-                            format!("\x1b[1;38;5;{}mr{row:05} ", row % 256).as_bytes(),
-                        );
-                        for _ in 0..[24, 79, 137][row % 3] {
-                            random ^= random << 13;
-                            random ^= random >> 17;
-                            random ^= random << 5;
-                            let byte = if chunk % 3 == 0 {
-                                b'x'
-                            } else {
-                                32 + (random % 95) as u8
-                            };
-                            bytes.push(byte);
-                        }
-                        if row % 17 == 0 {
-                            bytes.extend_from_slice("é界".as_bytes());
-                        }
-                        bytes.extend_from_slice(b"\x1b]8;;\x1b\\\x1b[m\r\n");
-                    }
-                    slice_at(
-                        &mut live,
-                        &mut mark,
-                        &tx,
-                        &bytes,
-                        clock(1000 + chunk as u64 * 100),
-                    );
-                    drain(&rx, &mut recorder);
-                    saw_image |= !live
-                        .grid()
-                        .capture_image_carry(REKEY_SCROLLBACK_LINES)
-                        .is_empty();
-                    if chunk % 8 == 7 {
-                        eprintln!(
-                            "boundary budget case: {budget} bytes, images={with_images}, after {} chunks, {} pressure-evicted rows",
-                            chunk + 1,
-                            live.scrollback_truncated_lines()
-                        );
-                        boundary_rekey_matches_full(&recorder, &live);
-                    }
-                }
-                assert_eq!(
-                    saw_image, with_images,
-                    "the image fixture must be exercised"
-                );
-                if budget <= 4 * 1024 {
-                    assert!(
-                        live.scrollback_truncated_lines() > 0,
-                        "the small budget must exercise pressure eviction"
-                    );
-                }
-            }
-        }
-    }
-
+    /// A sixel on either grid survives a rekey of a chain whose seed kept more history than a rekey keeps: the keyed chain replays the live screen, before and after a screen switch.
     #[test]
     fn boundary_rekey_keeps_image_bearing_bases_on_either_grid() {
         for alternate in [false, true] {
@@ -5244,65 +5446,22 @@ mod tests {
                 live.process_at(b"\x1b[?1049h", clock(300));
             }
             assert!(live.has_image_state());
-            let mut recorder = TemporalRecorder::with_budget(64 * 1024 * 1024);
-            recorder.record_keyframe(keyframe_of(&live, usize::MAX).unwrap());
-            recorder.spine_watermark().seed(SpinePre::take(&live));
-            let (tx, rx) = queue(64);
-            let mut mark = SpineMark::attach(recorder.spine_watermark());
-            slice_at(
-                &mut live,
-                &mut mark,
-                &tx,
-                &boundary_rekey_bulk(2750, 4000),
-                clock(1000),
-            );
-            drain(&rx, &mut recorder);
-            let full = recorder.plan(recorder.latest_tick()).unwrap().fold();
-            let actual = recorder
-                .plan(recorder.latest_tick())
-                .unwrap()
-                .fold_for_rekey();
-            assert!(full.term.main_grid().scrollback_lines() > REKEY_SCROLLBACK_LINES);
-            assert_eq!(actual.term.checkpoint(), full.term.checkpoint());
-            boundary_rekey_matches_full(&recorder, &live);
+            let mut rig = ReaderRig::new(live, 64 * 1024 * 1024);
+            rig.slice_keyed(&boundary_rekey_bulk(2750, 4000), 1000);
+            assert!(rig.live.main_grid().scrollback_lines() > REKEY_SCROLLBACK_LINES);
+            assert!(rig.live.has_image_state());
+            rig.assert_faithful(&format!("alternate={alternate}"));
+            let switch: &[u8] = if alternate {
+                b"\x1b[?1049lmain\r\n"
+            } else {
+                b"\x1b[?1049halt\r\n"
+            };
+            rig.slice(switch, 2000);
+            rig.assert_faithful(&format!("alternate={alternate}, switched"));
         }
     }
 
-    #[test]
-    fn boundary_rekey_observes_image_creation_erased_within_one_slice() {
-        let mut live = Terminal::new(20, 80);
-        live.set_scrollback_line_limit(None);
-        live.set_cell_pixel_size(10, 20);
-        let mut recorder = TemporalRecorder::with_budget(64 * 1024 * 1024);
-        recorder.record_keyframe(keyframe_of(&live, usize::MAX).unwrap());
-        recorder.spine_watermark().seed(SpinePre::take(&live));
-        let (tx, rx) = queue(64);
-        let mut mark = SpineMark::attach(recorder.spine_watermark());
-        let mut bytes = b"\x1bP0;0;0q\"1;1;10;20#1;2;100;0;0~\x1b\\\x1b[2J".to_vec();
-        bytes.extend_from_slice(&boundary_rekey_bulk(0, 4000));
-        let history = live.main_grid().history_fence();
-        let alternate = live.modes().alternate_screen;
-        let kitty_commands = live.kitty_graphics_commands();
-        assert!(!live.has_image_state());
-        slice_at(&mut live, &mut mark, &tx, &bytes, clock(1000));
-        drain(&rx, &mut recorder);
-        assert!(history.holds_at(&live.main_grid().history_fence()));
-        assert_eq!(alternate, live.modes().alternate_screen);
-        assert_eq!(kitty_commands, live.kitty_graphics_commands());
-        assert!(
-            !live.has_image_state(),
-            "the slice must erase its transient image"
-        );
-        let full = recorder.plan(recorder.latest_tick()).unwrap().fold();
-        let actual = recorder
-            .plan(recorder.latest_tick())
-            .unwrap()
-            .fold_for_rekey();
-        assert!(full.term.grid().scrollback_lines() > REKEY_SCROLLBACK_LINES);
-        assert_eq!(actual.term.checkpoint(), full.term.checkpoint());
-        boundary_rekey_matches_full(&recorder, &live);
-    }
-
+    /// A kitty image a reader's rekey carries in its history stays referenced in the keyed chain's replay once more output scrolls it past the history a rekey keeps: deleted from the screen and placed again by its id, the replay shows it where the live screen does.
     #[test]
     fn boundary_rekey_keeps_kitty_history_references_for_later_delete_and_place() {
         let mut live = aterm_core::terminal::TerminalBuilder::new()
@@ -5311,60 +5470,50 @@ mod tests {
             .build();
         live.set_scrollback_line_limit(None);
         live.set_cell_pixel_size(10, 20);
-        let mut recorder = TemporalRecorder::with_budget(64 * 1024 * 1024);
-        recorder.record_keyframe(keyframe_of(&live, usize::MAX).unwrap());
-        recorder.spine_watermark().seed(SpinePre::take(&live));
-        let (tx, rx) = queue(64);
-        let mut mark = SpineMark::attach(recorder.spine_watermark());
-        let step = |live: &mut Terminal, mark: &mut SpineMark, bytes: &[u8], ms: u64| {
-            let at = clock(ms);
-            let pre = SpinePre::take(live);
-            live.process_at(bytes, at);
-            let reply = live.take_response().map(Arc::<[u8]>::from);
-            mark.record(&tx, pre, live, InputSlice::at(bytes, at).replying(reply));
-        };
-        let mut first = Vec::new();
-        for row in 0..2750 {
-            if row == 500 {
-                first.extend_from_slice(
-                    b"\x1b_Ga=T,f=32,s=1,v=1,i=7,c=1,r=1,q=2;/wAA/w==\x1b\\\r\n",
-                );
+        let mut rig = ReaderRig::new(live, 64 * 1024 * 1024);
+        let rows = |range: std::ops::Range<usize>| {
+            let mut bytes = Vec::new();
+            for row in range {
+                if row == 500 {
+                    bytes.extend_from_slice(
+                        b"\x1b_Ga=T,f=32,s=1,v=1,i=7,c=1,r=1,q=2;/wAA/w==\x1b\\\r\n",
+                    );
+                }
+                bytes.extend_from_slice(format!("row-{row:04}\r\n").as_bytes());
             }
-            first.extend_from_slice(format!("row-{row:04}\r\n").as_bytes());
-        }
-        step(&mut live, &mut mark, &first, 1000);
-        drain(&rx, &mut recorder);
+            bytes
+        };
+        rig.slice_keyed(&rows(0..1000), 1000);
+        rig.slice(&rows(1000..2750), 1500);
         let placed = |term: &Terminal| {
             term.grid()
                 .history_any_image(&|span| span.kitty.is_some_and(|tag| tag.image_id == 7))
         };
-        assert!(placed(&live));
+        assert!(placed(&rig.live));
         assert!(
-            live.grid()
+            rig.live
+                .grid()
                 .capture_image_carry(usize::MAX)
                 .history_rev
                 .iter()
                 .any(|(rev, spans)| {
-                    *rev >= 2048
+                    usize::try_from(*rev).is_ok_and(|rev| rev >= REKEY_SCROLLBACK_LINES)
                         && spans
                             .iter()
                             .any(|span| span.kitty.is_some_and(|tag| tag.image_id == 7))
                 }),
-            "image 7 must be placed outside the speculative retained suffix"
+            "image 7 is placed older than the history a rekey keeps"
         );
-        let full = recorder.plan(recorder.latest_tick()).unwrap().fold();
-        assert!(placed(&full.term));
-        step(&mut live, &mut mark, b"\x1b_Ga=d,d=A,q=2\x1b\\", 2000);
-        drain(&rx, &mut recorder);
-        step(
-            &mut live,
-            &mut mark,
-            b"\x1b_Ga=p,i=7,c=1,r=1,q=2\x1b\\",
-            3000,
+        rig.slice(b"\x1b_Ga=d,d=A,q=2\x1b\\", 2000);
+        rig.slice(b"\x1b_Ga=p,i=7,c=1,r=1,q=2\x1b\\", 3000);
+        assert!(!rig.live.grid().capture_image_carry(0).visible.is_empty());
+        let replayed = rig.r.replay_at(None).expect("replay");
+        assert_eq!(
+            replayed.grid().capture_image_carry(0).visible,
+            rig.live.grid().capture_image_carry(0).visible,
+            "the image is placed again in the replay"
         );
-        drain(&rx, &mut recorder);
-        assert!(!live.grid().capture_image_carry(0).visible.is_empty());
-        boundary_rekey_matches_full(&recorder, &live);
+        rig.assert_faithful("placed again after the rekey");
     }
 
     fn alt_frame(rows: u16, cols: u16) -> Vec<u8> {
@@ -5386,7 +5535,7 @@ mod tests {
                 TemporalMsg::RawIn(_) => "in".to_string(),
                 other => shape(other),
             });
-            r.apply_inline(msg);
+            r.apply(msg);
         }
         out
     }
@@ -5401,6 +5550,7 @@ mod tests {
             TemporalMsg::ResizesLost(n) => format!("lost:{n}"),
             TemporalMsg::Keyframe(_) => "keyframe".to_string(),
             TemporalMsg::LiveKeyframe(..) => "live-keyframe".to_string(),
+            TemporalMsg::Rekeyframe(_) => "rekeyframe".to_string(),
             TemporalMsg::Witness(_) => "witness".to_string(),
         }
     }
@@ -5466,7 +5616,7 @@ mod tests {
             } else {
                 live.checkpoint_visible()
             };
-            r.apply_inline(TemporalMsg::Witness(Arc::new(seen.expect("visible"))));
+            r.apply(TemporalMsg::Witness(Arc::new(seen.expect("visible"))));
             let plan = r.replay_plan(None).expect("plan");
             let mut bounded = plan.restore_bounded(crate::rewind_worker::STORE_LINES);
             let (differs, _) = plan.fold_onto(&mut bounded, plan.base_seq(), |_, _| true);
@@ -5483,17 +5633,830 @@ mod tests {
     fn seeded(live: &Terminal) -> TemporalRecorder {
         let mut r = TemporalRecorder::new();
         r.record_keyframe(keyframe_of(live, usize::MAX).expect("seedable"));
-        r.spine_watermark().seed(SpinePre::take(live));
+        r.seed_spine(SpinePre::take(live));
         r
     }
 
     fn drain(rx: &TemporalRx, r: &mut TemporalRecorder) -> usize {
         let mut n = 0;
         while let Some(msg) = rx.try_recv() {
-            r.apply_inline(msg);
+            r.apply(msg);
             n += 1;
         }
         n
+    }
+
+    /// One pane's reader and the writer of its recording: the live engine, the reader's mark and queue, and the recorder the queue's messages are applied to in the writer's way ([`TemporalRecorder::apply_in`]).
+    struct ReaderRig {
+        live: Terminal,
+        r: TemporalRecorder,
+        mark: SpineMark,
+        tx: TemporalTx,
+        rx: TemporalRx,
+        /// The readers' rekeys the writer took off the queue ([`TemporalMsg::Rekeyframe`]), a stale one included.
+        rekeys: usize,
+    }
+
+    impl ReaderRig {
+        /// A rig on `live` whose recorder of `budget` is seeded with a keyframe of it.
+        fn new(live: Terminal, budget: usize) -> Self {
+            let mut r = TemporalRecorder::with_budget(budget);
+            r.record_keyframe(keyframe_of(&live, usize::MAX).expect("seedable"));
+            Self::with(live, r)
+        }
+
+        /// A rig on `live` and `r`, whose newest keyframe the caller recorded of `live`.
+        fn with(live: Terminal, r: TemporalRecorder) -> Self {
+            r.seed_spine(SpinePre::take(&live));
+            let (tx, rx) = queue_on(r.spine_watermark(), 256);
+            let mark = SpineMark::attach(r.spine_watermark());
+            Self {
+                live,
+                r,
+                mark,
+                tx,
+                rx,
+                rekeys: 0,
+            }
+        }
+
+        /// Parse `bytes` live `ms` past the tests' epoch ([`clock`]) and queue the slice and its reply as the reader records them ([`SpineMark::record`]), applying nothing.
+        fn queue(&mut self, bytes: &[u8], ms: u64) {
+            let at = clock(ms);
+            let pre = SpinePre::take(&self.live);
+            self.live.process_at(bytes, at);
+            let reply = self.live.take_response().map(Arc::<[u8]>::from);
+            self.mark.record(
+                &self.tx,
+                pre,
+                &self.live,
+                InputSlice::at(bytes, at).replying(reply),
+            );
+        }
+
+        /// [`Self::queue`], then [`Self::drain`].
+        fn slice(&mut self, bytes: &[u8], ms: u64) -> Vec<String> {
+            self.queue(bytes, ms);
+            self.drain()
+        }
+
+        /// Apply the next queued message, named as [`shape`] names it (`in` for a slice).
+        fn apply_next(&mut self) -> Option<String> {
+            let (generation, msg) = self.rx.try_recv_stamped()?;
+            let name = match &msg {
+                TemporalMsg::RawIn(_) => "in".to_string(),
+                TemporalMsg::Rekeyframe(_) => {
+                    self.rekeys += 1;
+                    shape(&msg)
+                }
+                other => shape(other),
+            };
+            self.r.apply_in(generation, msg);
+            Some(name)
+        }
+
+        /// Apply every queued message, in order, naming each ([`Self::apply_next`]).
+        fn drain(&mut self) -> Vec<String> {
+            std::iter::from_fn(|| self.apply_next()).collect()
+        }
+
+        /// [`judge_all`] on the recorder.
+        fn judge_all(&mut self) -> JudgeCounts {
+            let shared = Mutex::new(std::mem::take(&mut self.r));
+            let counts = judge_all(&shared);
+            self.r = shared.into_inner().unwrap_or_else(PoisonError::into_inner);
+            counts
+        }
+
+        /// Ask the readers for a rekey as the writer does ([`TemporalRecorder::after_op`]).
+        fn want_rekey(&self) {
+            self.r.spine.rekey_wanted.store(true, Ordering::SeqCst);
+        }
+
+        /// [`Self::slice`] with a rekey asked for first, which the reader sends right after the slice.
+        fn slice_keyed(&mut self, bytes: &[u8], ms: u64) {
+            self.want_rekey();
+            let names = self.slice(bytes, ms);
+            assert_eq!(
+                names.last().map(String::as_str),
+                Some("rekeyframe"),
+                "the reader keys the chain after the slice: {names:?}"
+            );
+        }
+
+        /// The kept keyframes a reader's rekey recorded ([`RetainedKeyframe::follows`]).
+        fn follows(&self) -> usize {
+            self.r.keyframes.iter().filter(|kf| kf.follows).count()
+        }
+
+        /// The replay to the spine's end is the live screen, and every kept witness judges faithful.
+        fn assert_faithful(&mut self, label: &str) {
+            let replayed = self.r.replay_at(None).expect("the spine's end replays");
+            assert_eq!(
+                replayed.checkpoint_visible(),
+                self.live.checkpoint_visible(),
+                "{label}: the replay is the live screen"
+            );
+            let counts = self.judge_all();
+            assert_eq!(
+                (counts.diverged, counts.pending),
+                (0, 0),
+                "{label}: every witness judged faithful"
+            );
+        }
+    }
+
+    /// The reader's rekey follows the slice it keyed after, in the same hold: the slice, the witness that closes the chain, then the keyframe, which stands in for no slice. It adds no Rewind instant and no exported screen, cuts no chain, and the replay to the spine's end is the live screen.
+    #[test]
+    fn a_reader_rekey_follows_the_slice_and_cuts_nothing() {
+        let mut rig = ReaderRig::new(Terminal::new(6, 30), 256 * 1024);
+        assert_eq!(rig.slice(b"before\r\n", 0), ["in"]);
+        let instants = rig.r.rewind_instants().len();
+        let exported = rig.r.export().expect("export").events.len();
+        rig.queue(&vec![b'.'; MIN_REKEY_BYTES], 0);
+        let names = rig.drain();
+        let keyed = rig.r.keyframes.back().expect("the rekey");
+        let (at, follows, cut) = (keyed.ts, keyed.follows, keyed.cut);
+        let now = rig.r.rewind_instants();
+        assert_eq!(
+            now.len(),
+            instants + 1,
+            "the slice is the one new instant: {now:?}"
+        );
+        assert!(now.iter().all(|i| i.at != at), "no instant at the rekey");
+        let export = rig.r.export().expect("export");
+        assert_eq!(
+            export.events.len(),
+            exported + 1,
+            "the export writes the slice and no screen for the rekey"
+        );
+        assert!(
+            export
+                .events
+                .iter()
+                .all(|(_, e)| !matches!(e, Exported::Screen(_)))
+        );
+        assert_eq!(
+            names,
+            ["in", "witness", "rekeyframe"],
+            "one hold queued the slice, the closing witness and the rekey"
+        );
+        assert!(follows, "the rekey follows its slice");
+        assert_eq!(cut, None);
+        let chains = rig.r.pane_chains().expect("chains");
+        assert_eq!(chains.len(), 2);
+        for chain in &chains {
+            assert_eq!(
+                chain
+                    .check(aterm_aos_pane::PaneCode::ThisBuild, "test")
+                    .verdict,
+                aterm_aos::contract::Verdict::Pass
+            );
+        }
+        rig.assert_faithful("across the rekey");
+    }
+
+    /// A due rekey the queue has no room for is refused without a trace: no witness and no keyframe are sent, no break opens, no keyframe stays counted in flight, and the rekey stays due, so the reader sends it once the writer has caught up: on its next slice, or on the next host flush when the queue took the closing witness but not the keyframe.
+    #[test]
+    fn a_refused_rekey_stays_due_and_opens_no_break() {
+        let fresh = |cap: usize, byte_cap: usize| {
+            let mut rig = ReaderRig::new(Terminal::new(6, 30), 256 * 1024);
+            let (tx, rx) = queue_in(
+                rig.r.spine_watermark(),
+                cap,
+                byte_cap,
+                RewindPool::new(usize::MAX),
+            );
+            (rig.tx, rig.rx) = (tx, rx);
+            rig
+        };
+        let refused = |rig: &ReaderRig, label: &str| {
+            let spine = &rig.r.spine;
+            assert!(!spine.break_open(), "{label}: no break opened");
+            assert_eq!(spine.dropped_input(), 0, "{label}");
+            assert_eq!(
+                spine.keyframes_queued.load(Ordering::SeqCst),
+                0,
+                "{label}: no keyframe counted in flight"
+            );
+            assert!(spine.rekey_due(), "{label}: the rekey stays due");
+        };
+
+        // The writer holds two 40 KiB slices of a 128 KiB queue: past half its bytes, no room to key.
+        // Carriage returns leave the screen as it is, so once the writer catches up the keyframe and
+        // a whole read fit the queue ([`TemporalTx::fits`]).
+        let mut rig = fresh(64, 128 * 1024);
+        let slice = vec![b'\r'; 40 * 1024];
+        rig.queue(&slice, 0);
+        rig.queue(&slice, 0);
+        refused(&rig, "no room");
+        assert_eq!(rig.drain(), ["in", "in"], "no witness and no keyframe");
+        assert_eq!(rig.slice(b"x", 0), ["in", "witness", "rekeyframe"]);
+        assert!(rig.r.reachable_from().is_some());
+        rig.assert_faithful("no room");
+
+        // Two places: the slice and the closing witness take them, and the keyframe is refused.
+        let mut rig = fresh(2, usize::MAX);
+        rig.queue(&vec![b'.'; MIN_REKEY_BYTES], 0);
+        refused(&rig, "no place");
+        assert_eq!(rig.drain(), ["in", "witness"]);
+        rig.mark.flush_host(&rig.tx, &rig.live);
+        assert_eq!(
+            rig.drain(),
+            ["rekeyframe"],
+            "the flush keys the chain its witness closed"
+        );
+        assert!(rig.r.reachable_from().is_some());
+        rig.assert_faithful("no place");
+    }
+
+    /// The pressure trigger keys a chain at half the room its keyframe leaves it under the budget, at least [`MIN_REKEY_BYTES`], so it keys sooner the heavier the keyframe; and never for a keyframe that leaves less than [`MIN_REKEY_BYTES`], which a fresh keyframe of the same charge could not keep a chain behind either.
+    #[test]
+    fn pressure_keys_halfway_to_eviction_and_never_for_a_keyframe_no_chain_fits_behind() {
+        const MIB: usize = 1024 * 1024;
+        let spine = SpineWatermark::keyed(8 * MIB);
+        let due = |base: usize, chain: usize| {
+            spine.base_charge.store(base, Ordering::Release);
+            spine.rekey_bytes.store(chain, Ordering::Release);
+            spine.rekey_due()
+        };
+        assert!(
+            !due(MIB, MIB) && due(MIB, 2 * MIB),
+            "the interval keys a light chain"
+        );
+        assert!(
+            !due(5 * MIB, 3 * MIB / 2 - 1) && due(5 * MIB, 3 * MIB / 2),
+            "3 MiB of room: at half of it"
+        );
+        assert!(
+            !due(7 * MIB, MIB / 2 - 1) && due(7 * MIB, MIB / 2),
+            "1 MiB of room: at half of it, not at MIN_REKEY_BYTES"
+        );
+        assert!(
+            !due(8 * MIB - 3 * MIN_REKEY_BYTES / 2, MIN_REKEY_BYTES - 1)
+                && due(8 * MIB - 3 * MIN_REKEY_BYTES / 2, MIN_REKEY_BYTES),
+            "less room than two minimums: at the minimum"
+        );
+        assert!(
+            !due(8 * MIB - MIN_REKEY_BYTES / 2, 2 * MIB - 1),
+            "a keyframe no chain fits behind keys only at the interval"
+        );
+        assert!(due(8 * MIB - MIN_REKEY_BYTES / 2, 2 * MIB));
+    }
+
+    /// A keyframe the budget cannot keep is evicted as it lands. The writer asks for a rekey once for that loss, and a keyframe evicted as it lands asks for no other, so the readers key at their own cadence rather than after every slice.
+    #[test]
+    fn a_keyframe_the_budget_cannot_keep_is_asked_for_once() {
+        let mut rig = ReaderRig::new(Terminal::new(24, 80), 2048);
+        assert_eq!(
+            rig.r.keyframe_count(),
+            0,
+            "fixture: the seed keyframe alone charges past the budget"
+        );
+        for n in 0..32 {
+            let _ = rig.slice(format!("line {n}\r\n").as_bytes(), 0);
+        }
+        assert_eq!(
+            rig.rekeys, 1,
+            "one rekey for the loss, none for each keyframe evicted as it lands"
+        );
+        assert!(
+            !rig.r.spine.rekey_wanted.load(Ordering::SeqCst),
+            "no rekey is asked for"
+        );
+        assert_eq!(rig.r.spine.dropped_input(), 0);
+    }
+
+    /// A rekey's keyframe passes the queue's byte caps, so a rekey sends only while the queue keeps room for the keyframe it took and for the reader's next whole read ([`TemporalTx::fits`]). With the writer behind by half the queue, the keyframe is refused, the rekey stays due and the next whole read is queued; once the writer catches up, the next slice keys the chain.
+    #[test]
+    fn a_rekey_leaves_the_queue_room_for_the_next_slice() {
+        let mut rig = ReaderRig::new(Terminal::new(6, 30), 8 * 1024 * 1024);
+        let weight = capture_keyframe(&rig.live, REKEY_SCROLLBACK_LINES)
+            .expect("keyable")
+            .queue_weight();
+        let seen = charge_of(&rig.live.checkpoint_visible().expect("visible"));
+        assert!(
+            seen < weight,
+            "fixture: a witness weighs less than a keyframe"
+        );
+        let half = weight + SLICE_ROOM - 1;
+        let (tx, rx) = queue_in(
+            rig.r.spine_watermark(),
+            1024,
+            2 * half,
+            RewindPool::new(usize::MAX),
+        );
+        (rig.tx, rig.rx) = (tx, rx);
+        // Carriage returns leave the screen, and so the keyframe a rekey takes, as it is.
+        let mut left = half;
+        while left > 0 {
+            let n = left.min(16 * 1024);
+            if left == n {
+                rig.r.spine.rekey_wanted.store(true, Ordering::SeqCst);
+            }
+            rig.queue(&vec![b'\r'; n], 0);
+            left -= n;
+        }
+        assert!(rig.r.spine.rekey_due(), "the rekey stays due");
+        rig.queue(&vec![b'\r'; SLICE_ROOM], 0);
+        assert_eq!(
+            rig.r.spine.dropped_input(),
+            0,
+            "the whole read after the refused rekey is queued"
+        );
+        assert!(!rig.r.spine.break_open(), "no break opened");
+        let applied = rig.drain();
+        assert!(
+            !applied.iter().any(|m| m == "rekeyframe"),
+            "no keyframe went ahead of the read: {applied:?}"
+        );
+        assert_eq!(rig.slice(b"x", 0), ["in", "witness", "rekeyframe"]);
+        rig.assert_faithful("caught up");
+    }
+
+    /// A keyframe the queue has no room for beside the next read, with the writer behind, is refused, and the readers capture no other while the queue still has no room for one as heavy ([`SpineMark::room_expected`]); once the writer catches up, the next slice keys the screen.
+    #[test]
+    fn a_refused_rekey_captures_again_only_once_the_queue_has_room() {
+        let mut live = Terminal::new(6, 30);
+        for n in 0..3000 {
+            live.process(format!("{n:029}\r\n").as_bytes());
+        }
+        let weight = capture_keyframe(&live, REKEY_SCROLLBACK_LINES)
+            .expect("keyable")
+            .queue_weight();
+        let mut rig = ReaderRig::new(live, 8 * 1024 * 1024);
+        // A queue that fits the keyframe beside a whole read, with 16 KiB to spare.
+        let (tx, rx) = queue_in(
+            rig.r.spine_watermark(),
+            1024,
+            weight + 2 * SLICE_ROOM + 16 * 1024,
+            RewindPool::new(usize::MAX),
+        );
+        (rig.tx, rig.rx) = (tx, rx);
+        // Past the read's room beside the keyframe, within has_room's half.
+        for _ in 0..(SLICE_ROOM / (8 * 1024) + 3) {
+            rig.queue(&[b'\r'; 8 * 1024], 0);
+        }
+        let before = capture_probe::count();
+        rig.r.spine.rekey_wanted.store(true, Ordering::SeqCst);
+        rig.queue(b"y", 0);
+        assert_eq!(capture_probe::count() - before, 1, "one capture");
+        assert_eq!(
+            rig.r.spine.keyframes_queued.load(Ordering::SeqCst),
+            0,
+            "the keyframe was refused"
+        );
+        for _ in 0..4 {
+            rig.queue(&[b'\r'; 1024], 0);
+        }
+        assert_eq!(
+            capture_probe::count() - before,
+            1,
+            "no capture while the writer is still behind"
+        );
+        let _ = rig.drain();
+        assert_eq!(rig.slice(b"z", 0), ["in", "witness", "rekeyframe"]);
+        assert_eq!(capture_probe::count() - before, 2);
+        assert_eq!(rig.r.spine.dropped_input(), 0);
+        rig.assert_faithful("caught up");
+    }
+
+    /// A queue that fits a refused keyframe beside a read with only 8 KiB to spare: the weight the next rekey expects is the keyframe's own, so while the writer stays behind it captures nothing, and once the writer catches up it keys. An expected weight an eighth heavier would read as one no queue could fit and capture every slice.
+    #[test]
+    fn a_refused_rekey_near_the_queue_cap_neither_stalls_nor_captures_each_slice() {
+        let mut live = Terminal::new(6, 30);
+        for n in 0..3000 {
+            live.process(format!("{n:029}\r\n").as_bytes());
+        }
+        let weight = capture_keyframe(&live, REKEY_SCROLLBACK_LINES)
+            .expect("keyable")
+            .queue_weight();
+        assert!(
+            weight / 8 > 8 * 1024,
+            "fixture: an eighth is more than the spare room"
+        );
+        let mut rig = ReaderRig::new(live, 8 * 1024 * 1024);
+        let (tx, rx) = queue_in(
+            rig.r.spine_watermark(),
+            1024,
+            weight + SLICE_ROOM + 8 * 1024,
+            RewindPool::new(usize::MAX),
+        );
+        (rig.tx, rig.rx) = (tx, rx);
+        rig.queue(&[b'\r'; 16 * 1024], 0);
+        let before = capture_probe::count();
+        rig.r.spine.rekey_wanted.store(true, Ordering::SeqCst);
+        rig.queue(b"y", 0);
+        assert_eq!(capture_probe::count() - before, 1, "one capture");
+        assert_eq!(
+            rig.r.spine.keyframes_queued.load(Ordering::SeqCst),
+            0,
+            "the keyframe was refused"
+        );
+        for _ in 0..4 {
+            rig.queue(&[b'\r'; 1024], 0);
+        }
+        assert_eq!(
+            capture_probe::count() - before,
+            1,
+            "no capture while the writer is still behind"
+        );
+        let _ = rig.drain();
+        assert_eq!(rig.slice(b"z", 0), ["in", "witness", "rekeyframe"]);
+        assert_eq!(rig.r.spine.dropped_input(), 0);
+        rig.assert_faithful("caught up");
+    }
+
+    /// The weight a rekey expects is only a prediction: one too heavy for any queue, left by a screen since cleared, does not stop a rekey, which captures the screen as it is, keys it, and expects that weight next.
+    #[test]
+    fn a_stale_heavy_prediction_does_not_stop_a_rekey() {
+        let mut rig = ReaderRig::new(Terminal::new(6, 30), 8 * 1024 * 1024);
+        let (tx, rx) = queue_in(
+            rig.r.spine_watermark(),
+            1024,
+            MIN_QUEUE_BYTES,
+            RewindPool::new(usize::MAX),
+        );
+        (rig.tx, rig.rx) = (tx, rx);
+        rig.r
+            .spine
+            .keyframe_weight
+            .store(1 << 40, Ordering::Release);
+        rig.r.spine.rekey_wanted.store(true, Ordering::SeqCst);
+        assert_eq!(rig.slice(b"y", 0), ["in", "witness", "rekeyframe"]);
+        let light = capture_keyframe(&rig.live, REKEY_SCROLLBACK_LINES)
+            .expect("keyable")
+            .queue_weight();
+        assert!(
+            rig.r.spine.keyframe_weight.load(Ordering::Acquire) <= light,
+            "the next rekey expects the light screen's weight"
+        );
+        rig.assert_faithful("keyed");
+    }
+
+    /// A keyframe that could not leave the next read room even were the writer caught up to the reader's own hold is sent whenever the queue has room: waiting would never make room for both, and keying the chain comes before the read.
+    #[test]
+    fn a_keyframe_no_queue_fits_beside_a_read_goes_when_the_queue_has_room() {
+        let mut live = Terminal::new(6, 30);
+        for n in 0..3000 {
+            live.process(format!("{n:029}\r\n").as_bytes());
+        }
+        let weight = capture_keyframe(&live, REKEY_SCROLLBACK_LINES)
+            .expect("keyable")
+            .queue_weight();
+        let mut rig = ReaderRig::new(live, 8 * 1024 * 1024);
+        // No room for a read beside the keyframe even with nothing else queued.
+        let (tx, rx) = queue_in(
+            rig.r.spine_watermark(),
+            1024,
+            weight + SLICE_ROOM,
+            RewindPool::new(usize::MAX),
+        );
+        (rig.tx, rig.rx) = (tx, rx);
+        // The writer behind, within has_room's half.
+        for _ in 0..4 {
+            rig.queue(&[b'\r'; 8 * 1024], 0);
+        }
+        rig.r.spine.rekey_wanted.store(true, Ordering::SeqCst);
+        rig.queue(b"y", 0);
+        assert_eq!(
+            rig.r.spine.keyframes_queued.load(Ordering::SeqCst),
+            1,
+            "the rekey's keyframe is queued"
+        );
+        assert!(rig.drain().iter().any(|m| m == "rekeyframe"));
+        assert_eq!(rig.r.spine.dropped_input(), 0);
+        rig.assert_faithful("keyed");
+    }
+
+    /// A keyframe's image payloads are the live engine's, shared rather than copied, so they weigh nothing on the queue ([`ReplayKeyframe::queue_weight`]): with the writer behind, a rekey of a screen whose image would not fit beside the next read is still queued.
+    #[test]
+    fn a_rekey_weighs_its_shared_images_at_nothing_on_the_queue() {
+        let mut live = Terminal::new(6, 30);
+        // A 256x128 RGBA image of zeros, 128 KiB, in 4096-character chunks.
+        let payload = format!("{}AAA=", "AAAA".repeat(43_690));
+        let chunks: Vec<&[u8]> = payload.as_bytes().chunks(4096).collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let head = if i == 0 {
+                "a=T,f=32,s=256,v=128,i=9,q=2,"
+            } else {
+                ""
+            };
+            let more = u8::from(i + 1 < chunks.len());
+            live.process(format!("\x1b_G{head}m={more};").as_bytes());
+            live.process(chunk);
+            live.process(b"\x1b\\");
+        }
+        let keyframe = capture_keyframe(&live, REKEY_SCROLLBACK_LINES).expect("keyable");
+        let (charge, weight) = (keyframe.charge(), keyframe.queue_weight());
+        assert!(
+            charge >= weight + 128 * 1024,
+            "fixture: the image is in the keyframe's charge: {charge} {weight}"
+        );
+        let mut rig = ReaderRig::new(live, 8 * 1024 * 1024);
+        let (tx, rx) = queue_in(
+            rig.r.spine_watermark(),
+            1024,
+            charge + 2 * SLICE_ROOM + 16 * 1024,
+            RewindPool::new(usize::MAX),
+        );
+        (rig.tx, rig.rx) = (tx, rx);
+        for _ in 0..(SLICE_ROOM / (8 * 1024) + 3) {
+            rig.queue(&[b'\r'; 8 * 1024], 0);
+        }
+        rig.r.spine.rekey_wanted.store(true, Ordering::SeqCst);
+        rig.queue(b"y", 0);
+        assert_eq!(
+            rig.r.spine.keyframes_queued.load(Ordering::SeqCst),
+            1,
+            "the rekey's keyframe is queued"
+        );
+        assert!(rig.drain().iter().any(|m| m == "rekeyframe"));
+        assert_eq!(rig.r.spine.dropped_input(), 0);
+        rig.assert_faithful("imaged");
+    }
+
+    /// The writer takes back a rekey it asked for while a reader's keyframe is in flight. Should that keyframe not be sent after all, the writer asks for the loss again after its next op: it marks a loss asked for only once the ask stands.
+    #[test]
+    fn a_loss_is_asked_for_again_when_the_keyframe_in_flight_is_not_sent() {
+        let mut rig = ReaderRig::new(Terminal::new(24, 80), 2048);
+        assert_eq!(
+            rig.r.keyframe_count(),
+            0,
+            "fixture: the seed keyframe alone charges past the budget"
+        );
+        let slice = || TemporalMsg::RawIn(InputSlice::at(b"x", ClockReading::now()));
+        ask_probe::race_next();
+        rig.r.apply(slice());
+        assert_eq!(
+            rig.r.spine.keyframes_queued.load(Ordering::SeqCst),
+            1,
+            "a reader counted a keyframe as the ask was stored"
+        );
+        assert!(
+            !rig.r.spine.rekey_wanted.load(Ordering::SeqCst),
+            "taken back while a keyframe is in flight"
+        );
+        rig.r.spine.unqueue_keyframe();
+        rig.r.apply(slice());
+        assert!(
+            rig.r.spine.rekey_wanted.load(Ordering::SeqCst),
+            "asked for again once none is"
+        );
+    }
+
+    /// The replay a cell search reads the shown instant's chain on folds on to the witness that covers that instant, so the search passes that witness while it is still pending and finds the replay it differs from untrusted; with no covering witness it folds to the instant.
+    #[test]
+    fn a_searchs_last_chain_folds_on_to_its_covering_witness() {
+        let mut live = Terminal::new(6, 30);
+        let mut r = TemporalRecorder::new();
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("keyable"));
+        let put = |r: &mut TemporalRecorder, live: &mut Terminal, bytes: &[u8]| {
+            let at = ClockReading::now();
+            live.process_at(bytes, at);
+            r.apply(TemporalMsg::RawIn(InputSlice::at(bytes, at)));
+            r.latest_tick()
+        };
+        let shown = put(&mut r, &mut live, b"\x1b[3;1Hone");
+        live.process(b"\x1b[5;1Hunrecorded");
+        while r.now() <= shown {}
+        r.apply(TemporalMsg::Witness(Arc::new(
+            live.checkpoint_visible().expect("visible"),
+        )));
+        let _ = put(&mut r, &mut live, b"\x1b[6;1Htwo");
+        let differs = |plans: Vec<ReplayPlan>| {
+            let last = plans.last().expect("the shown chain");
+            let mut replay = last.restore_bounded(crate::rewind_worker::STORE_LINES);
+            let mut seen = Vec::new();
+            assert!(last.fold_before(&mut replay, |_, _| true, |_, d| seen.push(d)));
+            seen
+        };
+        assert_eq!(
+            differs(r.chain_plans(shown)),
+            [true],
+            "the fold passes the pending witness that covers the shown instant, which the replay differs from"
+        );
+        assert_eq!(r.pending(), 1, "and posts no verdict");
+        assert_eq!(
+            differs(r.chain_plans(r.latest_tick())),
+            [true],
+            "past the witness, the fold to the instant passes it too"
+        );
+    }
+
+    /// The writer asks the readers for a rekey ([`SpineWatermark::rekey_wanted`]) once the newest chain ran [`REKEY_EVENTS`] events, lost its first slice, or no keyframe is kept, and never while a reader's keyframe is in flight: a slice the reader takes between a rekeyed slice's apply and its keyframe's sends no second keyframe.
+    #[test]
+    fn the_writer_asks_for_a_rekey_only_with_no_keyframe_in_flight() {
+        let wanted = |r: &TemporalRecorder| r.spine.rekey_wanted.load(Ordering::SeqCst);
+
+        // REKEY_EVENTS events past the newest keyframe, none in flight.
+        let mut r = TemporalRecorder::new();
+        r.record_keyframe(Terminal::new(4, 10).checkpoint());
+        for n in 1..=REKEY_EVENTS {
+            r.apply(TemporalMsg::Reply);
+            assert_eq!(wanted(&r), n >= REKEY_EVENTS, "after {n} events");
+        }
+
+        // A rekey in flight as the chain reaches them.
+        let mut rig = ReaderRig::new(Terminal::new(6, 30), 256 * 1024);
+        for _ in 1..REKEY_EVENTS {
+            rig.r.apply(TemporalMsg::Reply);
+        }
+        assert!(!wanted(&rig.r), "precondition: one event short");
+        rig.queue(&vec![b'.'; MIN_REKEY_BYTES], 0);
+        assert_eq!(rig.apply_next().as_deref(), Some("in"));
+        assert_eq!(
+            rig.r.spine.keyframes_queued.load(Ordering::SeqCst),
+            1,
+            "the rekey is in flight"
+        );
+        rig.queue(b"x", 0);
+        let names = rig.drain();
+        assert_eq!(
+            rig.follows(),
+            1,
+            "the slice taken with the rekey in flight sent no second one"
+        );
+        assert_eq!(names, ["witness", "rekeyframe", "in"]);
+        assert!(!wanted(&rig.r), "the applied rekey leaves nothing wanted");
+
+        // The newest chain's first slice evicted.
+        let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
+        r.record_keyframe(Terminal::new(4, 10).checkpoint());
+        let third = vec![b'.'; 4 * MIN_REKEY_BYTES / 3];
+        for _ in 0..3 {
+            r.apply(TemporalMsg::RawIn(InputSlice::at(&third, clock(0))));
+        }
+        assert_eq!(r.keyframe_count(), 1, "precondition: the keyframe is kept");
+        assert!(
+            r.keyframes[0].first_blob < r.blob_base(),
+            "precondition: its first slice went"
+        );
+        assert!(
+            wanted(&r),
+            "a chain that lost its first slice is keyed afresh"
+        );
+
+        // No keyframe kept.
+        let mut r = TemporalRecorder::new();
+        r.record_keyframe(Terminal::new(4, 10).checkpoint());
+        r.forget();
+        assert!(!wanted(&r));
+        r.apply(TemporalMsg::Reply);
+        assert!(wanted(&r), "events with no keyframe kept");
+    }
+
+    /// The readers key a chain after the slice its rule names, counted from what the writer applies: the bytes of the slices since the chain's keyframe and the charges of the witnesses sent before deciding, against a quarter of the budget, or, under pressure, against half the room the keyframe's own charge leaves under the budget, at least [`MIN_REKEY_BYTES`]. Host steps count nothing. A 2,000,000-byte chain of 80-column lines at the default budget, its witnesses included, is never keyed: the Rewind step row's one chain.
+    #[test]
+    fn reader_rekey_accounting_keys_after_the_slice_its_rule_names() {
+        const COLS: usize = 120;
+        let text = |len: usize, n: usize| {
+            let line = format!("{n:06} {}\r\n", "y".repeat(COLS - 9));
+            line.repeat(len / line.len() + 1).into_bytes()[..len].to_vec()
+        };
+        let sizes = [3_000, 17_000, 40_000, 9_000, 1_000, 25_000, 60_000];
+        let (mut by_bytes, mut by_pressure) = (0, 0);
+        // Budgets from half again the seed's charge, which leaves a chain room for MIN_REKEY_BYTES and the largest slice, to ten times it.
+        for scale in [6, 8, 16, 40] {
+            let mut live = Terminal::new(24, COLS as u16);
+            live.set_scrollback_line_limit(Some(REKEY_SCROLLBACK_LINES));
+            live.process(&text(COLS * (REKEY_SCROLLBACK_LINES + 24), 0));
+            let charge = keyframe_of(&live, usize::MAX).expect("keyable").charge();
+            let budget = charge * scale / 4;
+            let interval = (budget / 4).max(MIN_REKEY_BYTES);
+            let mut rig = ReaderRig::new(live, budget);
+            let mut base = rig.r.keyframes.back().expect("seed").charge();
+            let mut chain = 0;
+            let mut first_of_chain = true;
+            for step in 0..140 {
+                let ms = 1_100 * (step as u64 + 1);
+                if step % 9 == 8 {
+                    rig.live.clear_scrollback();
+                    rig.mark.flush_host(&rig.tx, &rig.live);
+                    let names = rig.drain();
+                    assert!(
+                        !names.iter().any(|n| n.contains("keyframe")),
+                        "scale {scale}, step {step}: a host step counts nothing: {names:?}"
+                    );
+                    continue;
+                }
+                let len = sizes[step % sizes.len()];
+                rig.queue(&text(len, step), ms);
+                let (mut names, mut witness_charges) = (Vec::new(), Vec::new());
+                while let Some(name) = rig.apply_next() {
+                    if name == "witness" {
+                        let w = rig.r.witnesses.back().expect("the witness just applied");
+                        witness_charges.push(w.snapshot_charge);
+                    }
+                    names.push(name);
+                }
+                chain += len;
+                // Every slice but a chain's first comes a second past the last witness, so the reader witnessed it before deciding.
+                let witnessed = !first_of_chain;
+                if witnessed {
+                    assert_eq!(
+                        names.get(1).map(String::as_str),
+                        Some("witness"),
+                        "scale {scale}, step {step}: {names:?}"
+                    );
+                    // With the chain's tail covered, the reader sends no witness of its own before a rekey: the first is the slice's.
+                    chain += witness_charges[0];
+                }
+                let bytes_due = chain >= interval;
+                let room = budget.saturating_sub(base);
+                let pressure_due =
+                    room >= MIN_REKEY_BYTES && chain >= (room / 2).max(MIN_REKEY_BYTES);
+                let keyed = names.last().map(String::as_str) == Some("rekeyframe");
+                assert_eq!(
+                    keyed,
+                    bytes_due || pressure_due,
+                    "scale {scale}, step {step}: chain {chain} base {base} interval {interval} budget {budget}: {names:?}"
+                );
+                if keyed {
+                    if bytes_due {
+                        by_bytes += 1;
+                    } else {
+                        by_pressure += 1;
+                    }
+                    chain = 0;
+                    base = rig.r.keyframes.back().expect("the rekey").charge();
+                }
+                first_of_chain = keyed;
+            }
+            assert!(rig.r.used <= rig.r.budget);
+        }
+        assert!(by_bytes > 0, "REACH: the byte interval keyed a chain");
+        assert!(by_pressure > 0, "REACH: the pressure trigger keyed a chain");
+
+        // The Rewind step row's chain: 80-column lines at the default budget, in reads of up to 64 KiB.
+        let mut rig = ReaderRig::new(Terminal::new(24, 80), DEFAULT_BUDGET_BYTES);
+        // The step row's chain file (`chain_text`): whole numbered lines just under 2,000,000 bytes, each newline reaching the reader as CRLF through the PTY.
+        let (mut chain, mut file_len) = (String::with_capacity(2_100_000), 0);
+        for n in 0.. {
+            let digits = format!("{n:07} ");
+            let line = format!(
+                "\x1b[{}m{digits}\x1b[m{}\n",
+                31 + n % 6,
+                char::from(b'a' + (n % 26) as u8)
+                    .to_string()
+                    .repeat(80 - 1 - digits.len())
+            );
+            if file_len + line.len() > 2_000_000 {
+                break;
+            }
+            file_len += line.len();
+            chain.push_str(&line.replace('\n', "\r\n"));
+        }
+        let mut names = Vec::new();
+        for (i, read) in chain.as_bytes().chunks(64 * 1024).enumerate() {
+            names.extend(rig.slice(read, 20 * i as u64));
+        }
+        assert!(
+            names.iter().filter(|n| *n == "witness").count() >= 7,
+            "REACH: the chain was witnessed every 256 KiB: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("keyframe")),
+            "the step row's chain stays one chain"
+        );
+        assert_eq!(rig.r.keyframe_count(), 1);
+    }
+
+    /// The reader closes every chain it keys with a witness of the screen right before the keyframe, so an instant late in the chain, past its last cadence witness, is judged: faithful once judged.
+    #[test]
+    fn every_closed_chain_end_is_covered_by_a_witness() {
+        let mut rig = ReaderRig::new(Terminal::new(6, 30), 256 * 1024);
+        assert_eq!(rig.slice(b"a\r\n", 0), ["in"]);
+        assert_eq!(rig.slice(b"b\r\n", 1_100), ["in", "witness"]);
+        let names = rig.slice(&vec![b'c'; MIN_REKEY_BYTES], 1_200);
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("rekeyframe"),
+            "precondition: due by bytes, a tenth of a second and less than WITNESS_BYTES past the last witness: {names:?}"
+        );
+        let at_c = rig
+            .r
+            .log
+            .live()
+            .filter(|e| matches!(e.op, Op::RawIn(_)))
+            .last()
+            .map(|e| e.ts)
+            .expect("the last slice");
+        let counts = rig.judge_all();
+        assert_eq!((counts.diverged, counts.pending), (0, 0));
+        assert_eq!(
+            rig.r.fidelity_at(at_c),
+            Fidelity::Faithful,
+            "the chain's last slice is judged"
+        );
+        let keyed = rig.r.keyframes.back().expect("the rekey").seq;
+        let closing = rig.r.witnesses.back().expect("the closing witness");
+        assert_eq!(
+            Seq(closing.seq.0 + 1),
+            keyed,
+            "the closed chain's last witness is right before its rekey"
+        );
+        assert!(closing.ts > at_c);
     }
 
     #[test]
@@ -5592,7 +6555,7 @@ mod tests {
                 }
                 other => shape(other),
             });
-            r.apply_inline(msg);
+            r.apply(msg);
         }
         assert_eq!(
             order,
@@ -5662,13 +6625,13 @@ mod tests {
         slice(&mut live, &mut mark, &tx, b"2");
         while let Some(msg) = rx.try_recv() {
             seen.push(shape(&msg));
-            r.apply_inline(msg);
+            r.apply(msg);
         }
         assert_eq!(r.dropped_input(), 1, "slice 2's input");
         slice(&mut live, &mut mark, &tx, b"3");
         while let Some(msg) = rx.try_recv() {
             seen.push(shape(&msg));
-            r.apply_inline(msg);
+            r.apply(msg);
         }
         assert_eq!(
             seen,
@@ -5903,7 +6866,7 @@ mod tests {
             }],
             policy: ResizePolicy::Native,
             host_resyncs: false,
-            live_base: true,
+            stands_in: true,
             config: None,
         };
 
@@ -5975,7 +6938,7 @@ mod tests {
         r.record_keyframe(live.checkpoint());
         for (ms, bytes) in fixture {
             live.process_at(bytes, clock(ms));
-            r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(ms))));
+            r.apply(TemporalMsg::RawIn(InputSlice::at(bytes, clock(ms))));
         }
         assert!(
             !live.modes().synchronized_output,
@@ -6007,53 +6970,49 @@ mod tests {
         assert_ne!(plain.checkpoint_visible(), live.checkpoint_visible());
     }
 
-    /// Two live witnesses of a recorded session match its replay, and the rekey that judged them mints its keyframe; replayed on the live clock both diverge, the rekey mints none, and the next slice queues a live keyframe the replay then matches.
+    /// Two live witnesses of a recorded session match its replay once judged ([`judge_all`]); replayed on the live clock both diverge, which asks the reader for a live keyframe it queues on the next slice. A burst due a rekey ends its chain at the witness the reader sends before its keyframe, which covers the burst once judged, and the replay is the live screen.
     #[test]
     fn live_witnesses_judge_the_replay_and_a_mismatch_takes_a_live_keyframe() {
         for live_clock in [false, true] {
-            let mut live = Terminal::new(6, 30);
-            let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
-            r.record_keyframe(live.checkpoint());
-            r.spine_watermark().seed(SpinePre::take(&live));
-            let (tx, rx) = queue(64);
-            let mut mark = SpineMark::attach(r.spine_watermark());
+            let mut rig = ReaderRig::new(Terminal::new(6, 30), 4 * MIN_REKEY_BYTES);
             let _clock = live_clock.then(replay_clock::on_live_clock);
-            let burst = vec![b'.'; MIN_REKEY_BYTES];
-            let mut feed = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8], ms| {
-                tick_past(r, r.latest_tick());
-                slice_at(live, &mut mark, &tx, bytes, clock(ms));
-                drain_named(&rx, r)
+            let feed = |rig: &mut ReaderRig, bytes: &[u8], ms| {
+                tick_past(&rig.r, rig.r.latest_tick());
+                rig.slice(bytes, ms)
             };
-            assert_eq!(feed(&mut live, &mut r, b"\x1b[?2026hframe", 0), ["in"]);
-            assert_eq!(feed(&mut live, &mut r, b"\r\none", 1500), ["in", "witness"]);
-            assert!(!live.modes().synchronized_output, "precondition");
-            assert_eq!(feed(&mut live, &mut r, b"\r\ntwo", 3000), ["in", "witness"]);
-            assert_eq!(r.witnessed(), 0, "no fold has judged them yet");
+            assert_eq!(feed(&mut rig, b"\x1b[?2026hframe", 0), ["in"]);
+            assert_eq!(feed(&mut rig, b"\r\none", 1500), ["in", "witness"]);
+            assert!(!rig.live.modes().synchronized_output, "precondition");
+            assert_eq!(feed(&mut rig, b"\r\ntwo", 3000), ["in", "witness"]);
+            assert_eq!(rig.r.witnessed(), 0, "no fold has judged them yet");
+            let counts = rig.judge_all();
             assert_eq!(
-                feed(&mut live, &mut r, &burst, 3100),
-                ["in"],
-                "the burst is due a rekey"
+                (counts.judged, counts.diverged, counts.pending),
+                (2, if live_clock { 2 } else { 0 }, 0)
             );
+            assert_eq!(rig.r.spine_watermark().keyframe_wanted(), live_clock);
+            let at_witness = rig.r.witnesses[0].ts;
             assert_eq!(
-                (r.witnessed(), r.diverged()),
-                (2, if live_clock { 2 } else { 0 })
-            );
-            assert_eq!(
-                r.keyframe_count(),
-                if live_clock { 1 } else { 2 },
-                "a chain that diverged mints no keyframe"
-            );
-            assert_eq!(r.spine_watermark().keyframe_wanted(), live_clock);
-            let at_witness = r.witnesses[0].ts;
-            assert_eq!(
-                r.fidelity_at(at_witness),
+                rig.r.fidelity_at(at_witness),
                 if live_clock {
                     Fidelity::Diverged
                 } else {
                     Fidelity::Faithful
                 }
             );
-            let at_burst = r
+            assert_eq!(
+                feed(&mut rig, b"\r\nthree", 3200),
+                [if live_clock { "live-keyframe" } else { "in" }]
+            );
+            assert!(!rig.r.spine_watermark().keyframe_wanted());
+            assert_eq!(rig.r.keyframe_count(), if live_clock { 2 } else { 1 });
+            assert_eq!(
+                feed(&mut rig, &[b'.'; MIN_REKEY_BYTES], 3300),
+                ["in", "witness", "rekeyframe"],
+                "the burst is due a rekey"
+            );
+            let at_burst = rig
+                .r
                 .log
                 .live()
                 .filter(|e| matches!(e.op, Op::RawIn(_)))
@@ -6061,22 +7020,16 @@ mod tests {
                 .map(|e| e.ts)
                 .expect("the burst");
             assert_eq!(
-                r.fidelity_at(at_burst),
-                if live_clock {
-                    Fidelity::Diverged
-                } else {
-                    Fidelity::Unwitnessed
-                },
-                "no witness covers the burst after the last one"
+                rig.r.fidelity_at(at_burst),
+                Fidelity::Unwitnessed,
+                "the witness that closed the chain is pending"
             );
+            rig.assert_faithful(&format!("live_clock={live_clock}"));
             assert_eq!(
-                feed(&mut live, &mut r, b"\r\nthree", 3200),
-                [if live_clock { "live-keyframe" } else { "in" }]
+                rig.r.fidelity_at(at_burst),
+                Fidelity::Faithful,
+                "the witness that closed the chain covers the burst"
             );
-            assert!(!r.spine_watermark().keyframe_wanted());
-            assert_eq!(r.keyframe_count(), 2);
-            let replayed = r.replay_at(None).expect("replay");
-            assert_eq!(screen_of(&replayed), screen_of(&live));
         }
     }
 
@@ -6158,6 +7111,152 @@ mod tests {
         assert!(r.spine_watermark().keyframe_wanted());
     }
 
+    /// A witness no fold has judged reads unchecked at every instant it covers, never faithful, in every chain the recording keyed past it; [`judge_all`] then judges each by full equality, so a witness that differs from the replay only where a bounded history renumbers (its row counter) reads diverged, and the track draws a differing stretch only once it is judged.
+    #[test]
+    fn an_unjudged_witness_reads_unchecked_never_faithful() {
+        use crate::rewind::Faith;
+        let mut live = Terminal::new(6, 30);
+        let recorder = Mutex::new(seeded(&live));
+        let put = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8]| {
+            tick_past(r, r.latest_tick());
+            live.process_at(bytes, clock(0));
+            r.apply(TemporalMsg::RawIn(InputSlice::at(bytes, clock(0))));
+            r.latest_tick()
+        };
+        let see = |live: &Terminal, r: &mut TemporalRecorder, renumbered: bool| {
+            tick_past(r, r.latest_tick());
+            let mut seen = live.checkpoint_visible().expect("visible");
+            if renumbered {
+                seen.absolute_row_counter += 7;
+            }
+            r.apply(TemporalMsg::Witness(Arc::new(seen)));
+        };
+        let (covered, tampered) = {
+            let mut r = recorder.lock().unwrap();
+            let mut covered = Vec::new();
+            for chain in 0..3 {
+                if chain > 0 {
+                    tick_past(&r, r.latest_tick());
+                    r.record_keyframe(keyframe_of(&live, usize::MAX).expect("keyable"));
+                }
+                for n in 0..2 {
+                    let line = format!("chain {chain} line {n}\r\n");
+                    covered.push(put(&mut live, &mut r, line.as_bytes()));
+                    see(&live, &mut r, false);
+                }
+            }
+            let tampered = put(&mut live, &mut r, b"renumbered\r\n");
+            see(&live, &mut r, true);
+            assert_eq!(
+                (r.keyframe_count(), r.pending(), r.witnessed()),
+                (3, 7, 0),
+                "fixture: three chains, every witness pending"
+            );
+            for &at in covered.iter().chain([&tampered]) {
+                assert_eq!(r.fidelity_at(at), Fidelity::Unwitnessed, "at {at:?}");
+                assert_eq!(Faith::of(r.fidelity_at(at)).band(), "unchecked");
+            }
+            assert!(
+                r.rewind_track()
+                    .spans
+                    .iter()
+                    .all(|&(.., span)| span != Span::Differs),
+                "nothing differs before a judge"
+            );
+            (covered, tampered)
+        };
+        assert_eq!(
+            judge_all(&recorder),
+            JudgeCounts {
+                judged: 7,
+                diverged: 1,
+                pending: 0,
+                unjudged_evicted: 0,
+            },
+            "full equality catches the renumbered witness"
+        );
+        let r = recorder.lock().unwrap();
+        for &at in &covered {
+            assert_eq!(r.fidelity_at(at), Fidelity::Faithful, "at {at:?}");
+            assert_eq!(Faith::of(r.fidelity_at(at)).band(), "faithful");
+        }
+        assert_eq!(r.fidelity_at(tampered), Fidelity::Diverged);
+        assert!(
+            r.rewind_track()
+                .spans
+                .iter()
+                .any(|&(.., span)| span == Span::Differs),
+            "the judged mismatch differs"
+        );
+    }
+
+    /// Every witness no fold judged that an eviction drops is counted, and only those: the budget's eviction of the oldest chains and the pool's forget add each, a judged witness evicted adds none, and a forget the person asked for adds none and leaves nothing pending.
+    #[test]
+    fn an_evicted_unjudged_witness_is_counted() {
+        let mut live = Terminal::new(4, 20);
+        let chain = keyframe_of(&live, usize::MAX).expect("keyable").charge
+            + 3 * (charge_of(&live.checkpoint_visible().expect("visible")) + 256);
+        let mut r = TemporalRecorder::with_budget(3 * chain);
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("keyable"));
+        let mut judged = Vec::new();
+        for n in 0..8 {
+            if n > 0 {
+                r.record_keyframe(keyframe_of(&live, usize::MAX).expect("keyable"));
+            }
+            for line in 0..3 {
+                let bytes = format!("chain {n} line {line}\r\n");
+                live.process_at(bytes.as_bytes(), clock(0));
+                r.apply(TemporalMsg::RawIn(InputSlice::at(
+                    bytes.as_bytes(),
+                    clock(0),
+                )));
+                let seen = live.checkpoint_visible().expect("visible");
+                r.apply(TemporalMsg::Witness(Arc::new(seen)));
+            }
+            if n == 0 {
+                judged.extend(r.witnesses.iter().map(|w| w.id));
+                let fold = r.replay_plan(None).expect("replay").fold();
+                r.judge(fold.judged);
+            }
+        }
+        let kept: Vec<WitnessId> = r.witnesses.iter().map(|w| w.id).collect();
+        let evicted = (0..r.next_witness)
+            .map(WitnessId)
+            .filter(|id| !kept.contains(id) && !judged.contains(id))
+            .count();
+        assert_eq!(r.next_witness, 24, "fixture: every witness was taken");
+        assert_eq!(r.witnessed(), 3, "fixture: only the first chain was judged");
+        assert!(
+            r.keyframe_count() < 8
+                && !kept.is_empty()
+                && judged.iter().all(|id| !kept.contains(id)),
+            "fixture: the budget evicted the oldest chains, the judged one among them, and kept the newest"
+        );
+        assert_eq!(r.unjudged_evicted(), evicted as u64);
+        assert_eq!(r.pending(), kept.len() as u64);
+
+        let before = r.unjudged_evicted();
+        let pending = r.pending();
+        r.forget_for_pool();
+        assert_eq!(
+            (r.unjudged_evicted(), r.pending()),
+            (before + pending, 0),
+            "the pool's forget counts what it drops"
+        );
+
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("keyable"));
+        let seen = live.checkpoint_visible().expect("visible");
+        r.apply(TemporalMsg::Witness(Arc::new(seen)));
+        assert_eq!(r.pending(), 1, "fixture: a pending witness");
+        let before = r.unjudged_evicted();
+        r.forget();
+        assert_eq!(
+            (r.unjudged_evicted(), r.pending()),
+            (before, 0),
+            "a forget the person asked for counts nothing"
+        );
+    }
+
     /// Slices recorded while the clock reads no later than the newest event, as a writer recording
     /// a batch within one microsecond sees it, each take the tick past the one before and stay
     /// their own Rewind state.
@@ -6167,7 +7266,7 @@ mod tests {
         let mut r = seeded(&live);
         let put = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8]| {
             live.process_at(bytes, clock(0));
-            r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(0))));
+            r.apply(TemporalMsg::RawIn(InputSlice::at(bytes, clock(0))));
         };
         let ahead = Ticks(r.now().0 + 60_000_000);
         r.freeze_now_for_test(Some(ahead));
@@ -6201,7 +7300,7 @@ mod tests {
             let mut r = seeded(&live);
             let put = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8], ms| {
                 live.process_at(bytes, clock(ms));
-                r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(ms))));
+                r.apply(TemporalMsg::RawIn(InputSlice::at(bytes, clock(ms))));
             };
             tick_past(&r, r.latest_tick());
             put(&mut live, &mut r, b"one", 0);
@@ -6210,7 +7309,7 @@ mod tests {
             let tie = r.now();
             r.frozen_now = Some(tie);
             let seen = live.checkpoint_visible().expect("at ground");
-            r.apply_inline(TemporalMsg::Witness(Arc::new(seen)));
+            r.apply(TemporalMsg::Witness(Arc::new(seen)));
             put(&mut live, &mut r, b"\r\ntwo", 10);
             r.frozen_now = None;
             assert_eq!(
@@ -6239,7 +7338,7 @@ mod tests {
             if poisoned {
                 seen.cols += 1;
             }
-            r.apply_inline(TemporalMsg::Witness(Arc::new(seen)));
+            r.apply(TemporalMsg::Witness(Arc::new(seen)));
             assert_eq!(
                 r.fidelity_at(tie),
                 Fidelity::Unwitnessed,
@@ -6274,7 +7373,7 @@ mod tests {
             let mut r = seeded(&live);
             tick_past(&r, r.latest_tick());
             live.process_at(b"one", clock(0));
-            r.apply_inline(TemporalMsg::RawIn(InputSlice::at(b"one", clock(0))));
+            r.apply(TemporalMsg::RawIn(InputSlice::at(b"one", clock(0))));
             let at = r.latest_tick();
             tick_past(&r, at);
             let tie = r.now();
@@ -6283,9 +7382,9 @@ mod tests {
             if poisoned {
                 seen.cols += 1;
             }
-            r.apply_inline(TemporalMsg::Witness(Arc::new(seen)));
+            r.apply(TemporalMsg::Witness(Arc::new(seen)));
             let next = keyframe_of(&live, usize::MAX).expect("at ground");
-            r.apply_inline(TemporalMsg::LiveKeyframe(next, SliceMarks::default()));
+            r.apply(TemporalMsg::LiveKeyframe(next, SliceMarks::default()));
             r.frozen_now = None;
             assert_eq!(
                 (r.witnesses[0].ts, r.keyframes[1].ts),
@@ -6338,7 +7437,7 @@ mod tests {
                 r.set_replay_config(Some(config.clone()));
             }
             r.record_keyframe(live.checkpoint());
-            r.spine_watermark().seed(SpinePre::take(&live));
+            r.seed_spine(SpinePre::take(&live));
             let (tx, rx) = queue(64);
             let mut mark = SpineMark::attach(r.spine_watermark());
             slice_at(&mut live, &mut mark, &tx, b"\x1b[2 qa", clock(0));
@@ -6443,46 +7542,6 @@ mod tests {
         }
     }
 
-    /// A fold that judges a witness of an older chain refunds its grids from the budget only: the newest chain's byte count, which a rekey is due by, never held them.
-    #[test]
-    fn judging_an_older_chains_witness_leaves_the_newest_chains_bytes() {
-        for live_keyframe in [false, true] {
-            let mut live = Terminal::new(6, 30);
-            let mut r = seeded(&live);
-            let put = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8]| {
-                live.process_at(bytes, clock(0));
-                r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(0))));
-            };
-            put(&mut live, &mut r, b"old chain\r\n");
-            let seen = live.checkpoint_visible().expect("at ground");
-            let charge = charge_of(&seen);
-            r.apply_inline(TemporalMsg::Witness(Arc::new(seen)));
-            let at = r.witnesses[0].ts;
-            tick_past(&r, at);
-            let next = keyframe_of(&live, usize::MAX).expect("at ground");
-            r.apply_inline(if live_keyframe {
-                TemporalMsg::LiveKeyframe(next, SliceMarks::default())
-            } else {
-                TemporalMsg::Keyframe(next)
-            });
-            let tail = vec![b'.'; 4 * charge];
-            put(&mut live, &mut r, &tail);
-            assert_eq!(r.keyframe_count(), 2, "precondition: no rekey");
-            assert_eq!(r.bytes_since_keyframe, tail.len());
-            let used = r.used;
-
-            let fold = r.replay_plan(Some(at)).expect("replay").fold();
-            r.judge(fold.judged);
-            assert_eq!((r.witnessed(), r.diverged()), (1, 0));
-            assert_eq!(r.used, used - charge, "the witness's grids are refunded");
-            assert_eq!(
-                r.bytes_since_keyframe,
-                tail.len(),
-                "live keyframe: {live_keyframe}"
-            );
-        }
-    }
-
     /// The first slice at parser ground that brings the output since the last witness to 256 KiB takes one, inside the second; a slice off ground leaves it due.
     #[test]
     fn a_witness_is_due_after_256_kib_of_output() {
@@ -6508,33 +7567,30 @@ mod tests {
         assert_eq!(feed(&mut live, &mut r, b"\x07", 40), ["in", "witness"]);
     }
 
-    /// A rekey mints its keyframe with the session's shell nonce, so the signed marks after it replay and the next witness matches.
+    /// The reader's rekey keys the chain with the session's shell nonce, so the signed marks after it replay and the witnesses judge faithful.
     #[test]
-    fn a_rekeyed_keyframe_carries_the_shell_nonce() {
+    fn a_reader_rekey_carries_the_shell_nonce() {
         let nonce = [0x5Au8; 32];
         let mut live = Terminal::new(6, 40);
         live.authorize_shell_integration(nonce);
         live.set_require_shell_integration_nonce(true);
-        let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
-        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("at ground"));
-        let put = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8]| {
-            live.process_at(bytes, clock(0));
-            r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(0))));
-        };
-        put(&mut live, &mut r, &vec![b'.'; MIN_REKEY_BYTES]);
-        assert_eq!(r.keyframe_count(), 2, "precondition: the burst rekeyed");
-        assert!(
-            r.keyframes
-                .back()
-                .is_some_and(|kf| kf.checkpoint.shell_integration_nonce.is_some())
+        let mut rig = ReaderRig::new(live, 4 * MIN_REKEY_BYTES);
+        assert_eq!(
+            rig.slice(&vec![b'.'; MIN_REKEY_BYTES], 0),
+            ["in", "witness", "rekeyframe"],
+            "precondition: the burst keyed the chain"
         );
-        put(&mut live, &mut r, signed_marks(nonce).as_bytes());
-        assert_eq!(live.command_marks().len(), 1, "precondition");
-        let seen = live.checkpoint_visible().expect("at ground");
-        r.apply_inline(TemporalMsg::Witness(Arc::new(seen)));
-        let fold = r.replay_plan(None).expect("replay").fold();
-        r.judge(fold.judged);
-        assert_eq!((r.witnessed(), r.diverged()), (1, 0));
+        assert!(
+            rig.r
+                .keyframes
+                .back()
+                .is_some_and(|kf| kf.follows && kf.checkpoint.shell_integration_nonce.is_some())
+        );
+        assert_eq!(rig.slice(signed_marks(nonce).as_bytes(), 10), ["in"]);
+        assert_eq!(rig.live.command_marks().len(), 1, "precondition");
+        assert_eq!(rig.slice(b"more", 1200), ["in", "witness"]);
+        let counts = rig.judge_all();
+        assert_eq!((counts.judged, counts.diverged), (2, 0));
     }
 
     /// The live keyframe a divergence asks for carries the shell nonce, so the signed marks after it replay and the next witness matches.
@@ -6546,7 +7602,7 @@ mod tests {
         live.set_require_shell_integration_nonce(true);
         let mut r = TemporalRecorder::new();
         r.record_keyframe(keyframe_of(&live, usize::MAX).expect("at ground"));
-        r.spine_watermark().seed(SpinePre::take(&live));
+        r.seed_spine(SpinePre::take(&live));
         let (tx, rx) = queue(64);
         let mut mark = SpineMark::attach(r.spine_watermark());
         r.spine.keyframe_wanted.store(true, Ordering::Release);
@@ -6593,7 +7649,7 @@ mod tests {
         for (keyframe, accepted) in [(carried, true), (bare.into(), false)] {
             let mut r = TemporalRecorder::new();
             r.record_keyframe(keyframe);
-            r.apply_inline(TemporalMsg::RawIn(InputSlice::at(
+            r.apply(TemporalMsg::RawIn(InputSlice::at(
                 signed.as_bytes(),
                 clock(0),
             )));
@@ -6610,36 +7666,77 @@ mod tests {
         }
     }
 
+    /// A chain is judged with its recorder unlocked, by the idle writer ([`IdleJudge::run`]) and by [`judge_all`] alike: each [`ChainJudge`] restores its base with the lock free, which the replay hook finds, and the idle judge finds it free before every pass; a fold run under the lock finds it held.
     #[test]
     fn temporal_replay_runs_with_the_recorder_unlocked() {
-        use std::cell::Cell;
+        use std::cell::RefCell;
         use std::rc::Rc;
-        let burst = || TemporalMsg::RawIn(InputSlice::at(&[b'x'; MIN_REKEY_BYTES][..], clock(0)));
-        let recorder = Arc::new(Mutex::new(TemporalRecorder::with_budget(
-            4 * MIN_REKEY_BYTES,
-        )));
-        recorder
-            .lock()
-            .unwrap()
-            .record_keyframe(Terminal::new(6, 20).checkpoint());
-        let held = Rc::new(Cell::new(None));
+        let pool = RewindPool::new(usize::MAX);
+        let mut live = Terminal::new(6, 20);
+        let recorder = Arc::new(Mutex::new(TemporalRecorder::new()));
+        pool.join(1, &recorder);
+        {
+            let mut rec = recorder.lock().unwrap();
+            for chain in 0..3 {
+                rec.record_keyframe(keyframe_of(&live, usize::MAX).expect("keyable"));
+                for n in 0..2 {
+                    let line = format!("chain {chain} line {n}\r\n");
+                    live.process_at(line.as_bytes(), clock(0));
+                    rec.apply(TemporalMsg::RawIn(InputSlice::at(
+                        line.as_bytes(),
+                        clock(0),
+                    )));
+                    let seen = live.checkpoint_visible().expect("visible");
+                    rec.apply(TemporalMsg::Witness(Arc::new(seen)));
+                }
+            }
+            assert_eq!(
+                (rec.keyframe_count(), rec.pending()),
+                (3, 6),
+                "fixture: two closed chains and the open one, every witness pending"
+            );
+        }
+        let held = Rc::new(RefCell::new(Vec::new()));
         let _hook = replay_hook::install({
             let (recorder, held) = (recorder.clone(), held.clone());
-            move || held.set(Some(recorder.try_lock().is_err()))
+            move || held.borrow_mut().push(recorder.try_lock().is_err())
         });
-        write_queued(&recorder, 0, burst());
-        assert_eq!(held.take(), Some(false), "folded with the recorder held");
-        let mut rec = recorder.lock().unwrap();
-        assert_eq!(rec.keyframe_count(), 2, "the re-keyframe was recorded");
-
+        let mut before_pass = Vec::new();
+        IdleJudge::default().run(&pool, || {
+            before_pass.push(recorder.try_lock().is_err());
+            false
+        });
+        assert_eq!(
+            held.take(),
+            [false, false],
+            "the idle writer restores each closed chain unlocked"
+        );
+        assert!(
+            before_pass.len() >= 3 && before_pass.iter().all(|&locked| !locked),
+            "and finds the recorder unlocked before every pass: {before_pass:?}"
+        );
+        assert_eq!(
+            recorder.lock().unwrap().pending(),
+            2,
+            "the open chain's witnesses wait for a judge on demand"
+        );
+        assert_eq!(
+            judge_all(&recorder),
+            JudgeCounts {
+                judged: 2,
+                diverged: 0,
+                pending: 0,
+                unjudged_evicted: 0,
+            }
+        );
+        assert_eq!(
+            held.take(),
+            [false],
+            "judge_all restores the open chain unlocked"
+        );
+        let rec = recorder.lock().unwrap();
         let _ = rec.replay_plan(None).map(ReplayPlan::run);
-        assert_eq!(held.take(), Some(true), "the probe sees a held recorder");
-
-        let due = rec.apply(burst()).expect("due by bytes");
-        let minted = due.mint();
-        let _ = rec.apply(TemporalMsg::Reply);
-        rec.rekeyed(minted);
-        assert_eq!(rec.keyframe_count(), 2, "the spine moved: discarded");
+        assert_eq!(held.take(), [true], "the probe sees a held recorder");
     }
 
     /// A replay keyframe carries the live engine's open mode-2026 frame start, drained response rate-limit buckets, alternate-screen leave notes, Kitty ids, host alternate-scroll default and pending restore lineage across initial keyframes, live resyncs and rekeys; a bare checkpoint without the carry diverges on each.
@@ -6653,17 +7750,23 @@ mod tests {
             let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
             r.record_keyframe(keyframe);
             if rekey_before {
+                r.seed_spine(SpinePre::take(live));
+                let (tx, rx) = queue_on(r.spine_watermark(), 64);
+                let mut mark = SpineMark::attach(r.spine_watermark());
                 let burst = vec![b'.'; MIN_REKEY_BYTES];
-                live.process_at(&burst, clock(0));
-                r.apply_inline(TemporalMsg::RawIn(InputSlice::at(&burst, clock(0))));
-                assert_eq!(r.keyframe_count(), 2, "precondition: burst rekeyed");
+                slice_at(live, &mut mark, &tx, &burst, clock(0));
+                assert_eq!(
+                    drain_named(&rx, &mut r),
+                    ["in", "witness", "rekeyframe"],
+                    "precondition: the reader keyed the burst"
+                );
             }
             for &(bytes, ms) in steps {
                 live.process_at(bytes, clock(ms));
-                r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(ms))));
+                r.apply(TemporalMsg::RawIn(InputSlice::at(bytes, clock(ms))));
             }
             let seen = live.checkpoint_visible().expect("at ground");
-            r.apply_inline(TemporalMsg::Witness(Arc::new(seen)));
+            r.apply(TemporalMsg::Witness(Arc::new(seen)));
             let fold = r.replay_plan(None).expect("replay").fold();
             r.judge(fold.judged);
             (r.witnessed(), r.diverged())
@@ -6690,7 +7793,7 @@ mod tests {
             let mut live = Terminal::new(6, 30);
             let mut r = TemporalRecorder::new();
             r.record_keyframe(keyframe_of(&live, usize::MAX).expect("at ground"));
-            r.spine_watermark().seed(SpinePre::take(&live));
+            r.seed_spine(SpinePre::take(&live));
             let (tx, rx) = queue(64);
             let mut mark = SpineMark::attach(r.spine_watermark());
             live.process_at(b"\x1b[?2026hopen", clock(3_600_000));
@@ -6700,7 +7803,7 @@ mod tests {
             slice_at(&mut live, &mut mark, &tx, b"still", clock(3_600_500));
             assert_eq!(drain_named(&rx, &mut r), ["in"]);
             assert!(live.modes().synchronized_output(), "still open at +500 ms");
-            r.apply_inline(TemporalMsg::Witness(Arc::new(
+            r.apply(TemporalMsg::Witness(Arc::new(
                 live.checkpoint_visible().expect("at ground"),
             )));
             slice_at(&mut live, &mut mark, &tx, b"expired", clock(3_601_050));
@@ -6709,7 +7812,7 @@ mod tests {
                 !live.modes().synchronized_output(),
                 "expired 1050 ms past open (950 ms past live-keyframe)"
             );
-            r.apply_inline(TemporalMsg::Witness(Arc::new(
+            r.apply(TemporalMsg::Witness(Arc::new(
                 live.checkpoint_visible().expect("at ground"),
             )));
             let fold = r.replay_plan(None).expect("replay").fold();
@@ -6721,7 +7824,7 @@ mod tests {
             );
         }
 
-        // 2. Drained response rate-limit bucket (both PolicyEngine standard profile and fallback limiter), including across a Rekey.
+        // 2. Drained response rate-limit bucket (both PolicyEngine standard profile and fallback limiter), including across a reader's rekey.
         for (with_policy, rekey, carried) in [
             (true, false, true),
             (true, false, false),
@@ -6807,10 +7910,7 @@ mod tests {
 
     fn drain_stamped(rx: &TemporalRx, r: &mut TemporalRecorder) {
         while let Some((generation, msg)) = rx.try_recv_stamped() {
-            if let Some(due) = r.apply_in(generation, msg) {
-                let minted = due.mint();
-                r.rekeyed(minted);
-            }
+            r.apply_in(generation, msg);
         }
     }
 
@@ -6872,26 +7972,60 @@ mod tests {
         assert_eq!(r.total_events(), total + 1);
     }
 
+    /// A rekey a reader queued before a forget is dropped when the writer reaches it: it closes no break, leaves no keyframe counted in flight and records no keyframe that follows. A recording forgotten onto the live screen keeps only the forget's keyframe, starts its readers' rekey count afresh from that keyframe, and replays the live screen.
     #[test]
-    fn a_rekey_minted_before_a_forget_is_discarded() {
-        let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
-        let live = Terminal::new(6, 20);
-        r.record_keyframe(live.checkpoint());
-        let burst = || TemporalMsg::RawIn(InputSlice::at(&[b'x'; MIN_REKEY_BYTES][..], clock(0)));
-        let minted = r.apply(burst()).expect("due by bytes").mint();
-        r.forget();
-        r.rekeyed(minted);
-        assert_eq!(
-            r.keyframe_count(),
-            0,
-            "the pool's forget appends nothing, so only the generation refuses it"
-        );
-        assert!(r.replay_at(None).is_none());
-        r.record_keyframe(live.checkpoint());
-        let minted = r.apply(burst()).expect("due by bytes").mint();
-        assert!(r.forget_onto(&live));
-        r.rekeyed(minted);
-        assert_eq!(r.keyframe_count(), 1, "only the forget's keyframe");
+    fn a_rekeyframe_queued_before_a_forget_is_discarded() {
+        let burst = vec![b'x'; MIN_REKEY_BYTES];
+        for onto in [false, true] {
+            let mut rig = ReaderRig::new(Terminal::new(6, 20), 4 * MIN_REKEY_BYTES);
+            rig.queue(&burst, 0);
+            let spine = rig.r.spine_watermark();
+            assert_eq!(
+                spine.keyframes_queued.load(Ordering::SeqCst),
+                1,
+                "onto={onto}: the rekey is in flight"
+            );
+            let closed = spine.closed.load(Ordering::Acquire);
+            if onto {
+                assert!(rig.r.forget_onto(&rig.live));
+            } else {
+                rig.r.forget();
+            }
+            assert_eq!(rig.drain(), ["in", "witness", "rekeyframe"]);
+            assert_eq!(
+                spine.closed.load(Ordering::Acquire),
+                closed,
+                "onto={onto}: a rekey closes no break"
+            );
+            assert_eq!(
+                spine.keyframes_queued.load(Ordering::SeqCst),
+                0,
+                "onto={onto}"
+            );
+            assert_eq!(rig.follows(), 0, "onto={onto}: the stale rekey was dropped");
+            if !onto {
+                assert_eq!(
+                    (rig.r.keyframe_count(), rig.r.live_events()),
+                    (0, 0),
+                    "the pool's forget appends nothing, so only the generation refuses the rekey"
+                );
+                assert!(rig.r.replay_at(None).is_none());
+                continue;
+            }
+            assert_eq!(rig.r.keyframe_count(), 1, "only the forget's keyframe");
+            assert_eq!(
+                (
+                    spine.rekey_bytes.load(Ordering::Acquire),
+                    spine.rekey_wanted.load(Ordering::Acquire),
+                    spine.tail_unwitnessed.load(Ordering::Acquire),
+                    spine.base_charge.load(Ordering::Acquire),
+                ),
+                (0, false, false, rig.r.keyframes[0].charge()),
+                "the forget's seed starts the readers' rekey count at its keyframe"
+            );
+            assert_eq!(rig.slice(b"after\r\n", 0), ["in"]);
+            rig.assert_faithful("after the forget");
+        }
     }
 
     /// A recorder of `chains` chains, each a keyframe and `bytes` of output.
@@ -7311,6 +8445,49 @@ mod tests {
                 check.verdict
             );
         }
+
+        // A reader's rekey projected under c1 and still in flight when the config moves keeps c1, and landing stale asks again for a keyframe under c2.
+        let mut live = Terminal::new(6, 30);
+        let _ = live.apply_config(&c1);
+        let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
+        r.set_replay_config(Some(c1.clone()));
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("keyable"));
+        let mut rig = ReaderRig::with(live, r);
+        rig.queue(&vec![b'.'; MIN_REKEY_BYTES], 0);
+        assert_eq!(
+            rig.r.spine.keyframes_queued.load(Ordering::SeqCst),
+            1,
+            "the rekey is in flight"
+        );
+        let _ = rig.live.apply_config(&c2);
+        rig.r.set_replay_config(Some(c2.clone()));
+        assert!(
+            rig.r.spine.keyframe_wanted(),
+            "a config move while a rekey is in flight asks the reader for a c2 keyframe"
+        );
+        rig.queue(b"resync-c2", 100);
+        assert!(!rig.r.spine.keyframe_wanted());
+        assert_eq!(
+            rig.drain(),
+            ["in", "witness", "rekeyframe", "live-keyframe"]
+        );
+        let configs: Vec<_> = rig
+            .r
+            .keyframes
+            .iter()
+            .map(|kf| (kf.follows, kf.config.as_deref() == Some(&*c1)))
+            .collect();
+        assert_eq!(
+            configs,
+            [(false, true), (true, true), (false, false)],
+            "the rekey keeps c1, the live keyframe c2"
+        );
+        assert_eq!(rig.r.keyframes[2].config.as_deref(), Some(&*c2));
+        assert!(
+            rig.r.spine.keyframe_wanted(),
+            "the rekey landing under the config that moved asks again"
+        );
+        rig.assert_faithful("across the config move");
     }
 
     #[test]
@@ -7628,7 +8805,7 @@ mod tests {
         let mut live = Terminal::new(6, 40);
         let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
         r.record_keyframe(keyframe_of(&live, usize::MAX).expect("at ground"));
-        r.spine_watermark().seed(SpinePre::take(&live));
+        r.seed_spine(SpinePre::take(&live));
         let (tx, rx) = queue(64);
         let mut mark = SpineMark::attach(r.spine_watermark());
         let step = |live: &mut Terminal, mark: &mut SpineMark, bytes: &[u8], ms: u64| {
@@ -7639,7 +8816,7 @@ mod tests {
             mark.record(&tx, pre, live, InputSlice::at(bytes, at).replying(reply));
         };
 
-        // Push up to the rekey byte threshold and leave the slice mid-DECRQSS (`ends_mid_sequence`).
+        // Push past the rekey byte interval and leave the slice inside a DECRQSS body, which a keyframe would swallow (`partial_sequence_swallowed`), so the reader's gate defers the rekey.
         let mut near_rekey = vec![b'a'; MIN_REKEY_BYTES];
         near_rekey.extend_from_slice(b"\x1b[32m\x1bP$q");
         step(&mut live, &mut mark, &near_rekey, 100);
@@ -7647,7 +8824,7 @@ mod tests {
         assert_eq!(
             r.keyframe_count(),
             1,
-            "mid-DECRQSS slice defers rekey until Ground"
+            "a slice inside the DECRQSS body defers the rekey"
         );
 
         // Advance to ST-pending (`ESC`), still mid-query.
@@ -7655,10 +8832,14 @@ mod tests {
         drain(&rx, &mut r);
         assert_eq!(r.keyframe_count(), 1);
 
-        // Complete DECRQSS (`\`), landing at Ground so the deferred rekey mints, then split XTGETTCAP.
+        // Complete DECRQSS (`\`), landing at Ground so the reader sends the deferred rekey, then split XTGETTCAP.
         step(&mut live, &mut mark, b"\\ok\r\n", 1300);
         drain(&rx, &mut r);
-        assert_eq!(r.keyframe_count(), 2, "rekey minted once Ground returned");
+        assert_eq!(
+            r.keyframe_count(),
+            2,
+            "the reader keyed once Ground returned"
+        );
 
         step(&mut live, &mut mark, b"\x1bP+q54", 1400);
         step(&mut live, &mut mark, b"4E\x1b", 1500);
@@ -7754,7 +8935,7 @@ mod tests {
         live.set_cell_pixel_size(10, 20);
         let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
         r.record_keyframe(keyframe_of(&live, usize::MAX).expect("at ground"));
-        r.spine_watermark().seed(SpinePre::take(&live));
+        r.seed_spine(SpinePre::take(&live));
         let (tx, rx) = queue(64);
         let mut mark = SpineMark::attach(r.spine_watermark());
         let step = |live: &mut Terminal, mark: &mut SpineMark, bytes: &[u8], ms: u64| {
@@ -7766,7 +8947,7 @@ mod tests {
         };
 
         // Chain 0: store RGBA image 1 (via number 42) + frame 2, virtual placement U=1 + placeholder,
-        // open m=1 chunked transfer for image 8, and cross MIN_REKEY_BYTES so a rekey mints.
+        // open m=1 chunked transfer for image 8, and cross MIN_REKEY_BYTES so the reader keys the chain.
         let mut pre_rekey = b"\x1b_Ga=t,f=32,s=3,v=1,I=42;////AAAA////AAAA\x1b\\\
                               \x1b_Ga=f,f=32,s=3,v=1,i=1,z=50;AAAA////AAAA////\x1b\\\
                               \x1b_Ga=p,U=1,i=1,p=3,c=2,r=1\x1b\\"
@@ -7779,13 +8960,14 @@ mod tests {
         pre_rekey.extend_from_slice(b"\r\n");
         step(&mut live, &mut mark, &pre_rekey, 100);
         drain(&rx, &mut r);
-        if let Some(rekey) = r.rekey_due() {
-            r.rekeyed(rekey.mint());
-        }
-        assert_eq!(r.keyframe_count(), 2, "rekey minted carrying Kitty store");
+        assert_eq!(
+            r.keyframe_count(),
+            2,
+            "the reader's rekey carries the Kitty store"
+        );
         assert!(
             r.keyframes[1].carry.retained_image_bytes() >= 24,
-            "minted keyframe retains Kitty image and chunk bytes"
+            "the rekey retains the Kitty image and chunk bytes"
         );
         // Chain 1 (after the rekey): complete m=0 chunk, place by I=42 and i=8, animate, delete.
         step(
@@ -7873,7 +9055,7 @@ mod tests {
         live.set_kitty_file_resolver(|_, _| None);
         let mut r = TemporalRecorder::with_budget(4 * MIN_REKEY_BYTES);
         r.record_keyframe(keyframe_of(&live, usize::MAX).expect("at ground"));
-        r.spine_watermark().seed(SpinePre::take(&live));
+        r.seed_spine(SpinePre::take(&live));
         let (tx, rx) = queue(64);
         let mut mark = SpineMark::attach(r.spine_watermark());
         let step = |live: &mut Terminal, mark: &mut SpineMark, bytes: &[u8], ms: u64| {
@@ -7884,19 +9066,16 @@ mod tests {
             mark.record(&tx, pre, live, InputSlice::at(bytes, at).replying(reply));
         };
 
-        // Chain 0: query `t=f` (`OK`), cross `MIN_REKEY_BYTES`, and mint a second keyframe.
+        // Chain 0: query `t=f` (`OK`) and cross `MIN_REKEY_BYTES`, so the reader keys a second chain.
         let mut pre_rekey = b"\x1b_Gi=31,a=q,t=f\x1b\\".to_vec();
         pre_rekey.extend(std::iter::repeat_n(b'x', MIN_REKEY_BYTES));
         pre_rekey.extend_from_slice(b"\r\n");
         step(&mut live, &mut mark, &pre_rekey, 100);
         drain(&rx, &mut r);
-        if let Some(rekey) = r.rekey_due() {
-            r.rekeyed(rekey.mint());
-        }
         assert_eq!(r.keyframe_count(), 2);
         assert!(
             r.keyframes[1].carry.kitty_media_admitted(),
-            "minted keyframe preserves kitty_media_admitted across rekeys"
+            "the reader's rekey preserves kitty_media_admitted"
         );
 
         // Chain 1 (after the rekey): query `t=t`/`t=s` (`OK`) and refuse a missing `t=f` (`EINVAL`).
@@ -7910,9 +9089,10 @@ mod tests {
         );
         drain(&rx, &mut r);
 
-        for plan in r.chain_plans(r.latest_tick()) {
-            r.judge(plan.fold().judged);
-        }
+        let r = Mutex::new(r);
+        let counts = judge_all(&r);
+        assert_eq!((counts.diverged, counts.pending), (0, 0));
+        let r = r.into_inner().unwrap();
         assert_eq!(r.diverged(), 0);
 
         let chains = r.pane_chains().expect("chains");
@@ -7947,7 +9127,7 @@ mod tests {
 
         let mut r = TemporalRecorder::with_budget(8 * MIN_REKEY_BYTES);
         r.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
-        r.spine_watermark().seed(SpinePre::take(&live));
+        r.seed_spine(SpinePre::take(&live));
         let (tx, rx) = queue(64);
         let mut mark = SpineMark::attach(r.spine_watermark());
         let step = |live: &mut Terminal, mark: &mut SpineMark, bytes: &[u8], ms: u64| {
@@ -8008,7 +9188,7 @@ mod tests {
         let mut bare_seed = Terminal::new(6, 40);
         bare_seed.set_kitty_file_resolver(|_, _| None);
         unresynced.record_keyframe(keyframe_of(&bare_seed, usize::MAX).expect("seed"));
-        unresynced.apply_inline(TemporalMsg::RawIn(
+        unresynced.apply(TemporalMsg::RawIn(
             InputSlice::at(load.as_bytes(), clock(200))
                 .replying(Some(Arc::from(&b"\x1b_Gi=7;OK\x1b\\"[..]))),
         ));
@@ -8035,7 +9215,7 @@ mod tests {
         let mut r = TemporalRecorder::with_budget(16 * MIN_REKEY_BYTES);
         r.freeze_now_for_test(Some(Ticks(10)));
         r.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
-        r.spine_watermark().seed(SpinePre::take(&live));
+        r.seed_spine(SpinePre::take(&live));
         let (tx, rx) = queue(128);
         let mut mark = SpineMark::attach(r.spine_watermark());
         let mut step = |bytes: &[u8], ms: u64| {
@@ -8077,6 +9257,15 @@ mod tests {
         assert_eq!(
             (r.keyframe_count(), r.reachable_from()),
             (2, Some(Ticks(10)))
+        );
+        let (scratch, per_keyframe, once) = used_from_scratch(&r);
+        assert_eq!(
+            r.used, scratch,
+            "each coalesced keyframe handed its images on"
+        );
+        assert!(
+            once == per_keyframe && once >= 10 * 4,
+            "REACH: the one live keyframe holds the ten thumbnails ({once} B)"
         );
         for plan in r.chain_plans(r.latest_tick()) {
             r.judge(plan.fold().judged);
@@ -8131,26 +9320,100 @@ mod tests {
         }
     }
 
-    /// The recording [`five_non_adjacent_live_read_stretches_keep_every_chain_the_budget_holds`] makes under `budget`: a seed and its chain, then five live host reads each followed by output and a witness, so no two live keyframes coalesce and every chain takes a witness. Returns the recorder, the live engine, and the recorder's `used` before any fold judged a witness.
+    /// Back-to-back Kitty file loads that each store a new image 1 coalesce into one live keyframe holding only the newest payload: each keyframe the next one replaced lets go of a payload no kept keyframe holds, so the recording refunds it and charges only the image still kept.
+    #[test]
+    fn coalesced_kitty_loads_that_replace_one_image_refund_each_replaced_payload() {
+        const FRAME_BYTES: usize = 8 * 8 * 4;
+        let mut live = Terminal::new(8, 40);
+        live.set_kitty_file_resolver(|_, path| {
+            path.strip_prefix("/host/frame-")
+                .and_then(|n| n.strip_suffix(".raw"))
+                .and_then(|n| n.parse::<u8>().ok())
+                .map(|k| vec![k; FRAME_BYTES])
+        });
+        let mut r = TemporalRecorder::with_budget(16 * MIN_REKEY_BYTES);
+        r.freeze_now_for_test(Some(Ticks(10)));
+        r.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
+        r.seed_spine(SpinePre::take(&live));
+        let (tx, rx) = queue(128);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        let mut step = |bytes: &[u8], ms: u64| {
+            let pre = SpinePre::take(&live);
+            live.process_at(bytes, clock(ms));
+            let reply = live.take_response().map(Arc::<[u8]>::from);
+            let replied = reply.is_some();
+            mark.record(
+                &tx,
+                pre,
+                &live,
+                InputSlice::at(bytes, clock(ms)).replying(reply),
+            );
+            if replied {
+                mark.reply(&tx);
+            }
+            r.freeze_now_for_test(Some(Ticks(ms)));
+            drain(&rx, &mut r);
+        };
+
+        step(b"ready\r\n", 100);
+        for idx in 1u8..=5 {
+            let path = aterm_codec::base64::encode(format!("/host/frame-{idx}.raw").as_bytes())
+                .expect("b64");
+            let load = format!("\x1b_Gi=1,a=t,t=f,f=32,s=8,v=8;{path}\x1b\\");
+            step(load.as_bytes(), 1_000 + u64::from(idx) * 50);
+        }
+        step(b"done\r\n", 2_000);
+
+        assert_eq!(
+            r.keyframe_count(),
+            2,
+            "REACH: the seed and the one live keyframe the five loads coalesced into"
+        );
+        let kept = r.keyframes.back().map(images_of).unwrap_or_default();
+        assert!(
+            kept.len() == 1 && kept[0].1 == FRAME_BYTES,
+            "REACH: the live keyframe holds image 1's newest payload alone: {kept:?}"
+        );
+        let (scratch, per_keyframe, once) = used_from_scratch(&r);
+        assert_eq!(r.used, scratch, "each replaced payload was refunded");
+        assert_eq!((per_keyframe, once), (FRAME_BYTES, FRAME_BYTES));
+    }
+
+    /// A 256x512 RGBA raster's bytes (512 KiB): what the host file `/host/screen.raw` holds in [`five_live_read_stretches`].
+    const SCREEN_IMAGE_BYTES: usize = 256 * 512 * 4;
+
+    /// A Kitty file load of `/host/screen.raw` as image 1 under `action`: `T` places it in a 4x2-cell box, `t` only stores it (replacing any image 1).
+    fn screen_image_load(action: char) -> String {
+        let path = aterm_codec::base64::encode(b"/host/screen.raw").expect("b64");
+        let place = if action == 'T' { ",c=4,r=2" } else { "" };
+        format!("\x1b_Gi=1,a={action},t=f,f=32,s=256,v=512{place};{path}\x1b\\")
+    }
+
+    /// The recording [`five_non_adjacent_live_read_stretches_keep_every_chain_the_budget_holds`] makes under `budget`: `prelude` on the live engine before the seed, a seed and its chain, then each of `reads` (live host reads) followed by output and a witness, so no two live keyframes coalesce and every chain takes a witness, then `coda` as one more slice when it is not empty. Returns the recorder, the live engine, and the recorder's `used` before any fold judged a witness.
     fn five_live_read_stretches(
         budget: usize,
+        prelude: &[u8],
         reads: &[String],
+        coda: &[u8],
     ) -> (TemporalRecorder, Terminal, usize) {
         use aterm_core::terminal::{ClipboardAccess, ClipboardOperation};
 
         let mut live = Terminal::new(8, 40);
-        live.set_kitty_file_resolver(|_, path| {
-            (path == "/secret/host/photo.raw").then(|| vec![0x11, 0x22, 0x33, 0xff])
+        live.set_kitty_file_resolver(|_, path| match path {
+            "/secret/host/photo.raw" => Some(vec![0x11, 0x22, 0x33, 0xff]),
+            "/host/screen.raw" => Some(vec![0x5a; SCREEN_IMAGE_BYTES]),
+            _ => None,
         });
         live.authorize_clipboard_access(ClipboardAccess::Query);
         live.set_clipboard_callback(|op| match op {
             ClipboardOperation::Query { .. } => Some("secret-clipboard-token".to_string()),
             _ => None,
         });
+        live.process(prelude);
         let mut r = TemporalRecorder::with_budget(budget);
         r.freeze_now_for_test(Some(Ticks(10)));
         r.record_keyframe(keyframe_of(&live, usize::MAX).expect("seed"));
-        r.spine_watermark().seed(SpinePre::take(&live));
+        r.seed_spine(SpinePre::take(&live));
         let (tx, rx) = queue(128);
         let mut mark = SpineMark::attach(r.spine_watermark());
         let mut step = |live: &mut Terminal, r: &mut TemporalRecorder, bytes: &[u8], ms: u64| {
@@ -8188,6 +9451,10 @@ mod tests {
                 at + 1_200,
             );
         }
+        if !coda.is_empty() {
+            let at = 2_000 * (reads.len() as u64 + 1);
+            step(&mut live, &mut r, coda, at);
+        }
         let used = r.used;
         (r, live, used)
     }
@@ -8210,7 +9477,7 @@ mod tests {
             "\x1b]52;c;?\x07".to_string(),
         ];
 
-        let (mut r, live, used) = five_live_read_stretches(DEFAULT_BUDGET_BYTES, &reads);
+        let (mut r, live, used) = five_live_read_stretches(DEFAULT_BUDGET_BYTES, b"", &reads, b"");
         assert_eq!(
             live.host_io_ordinal(),
             5,
@@ -8270,7 +9537,7 @@ mod tests {
         assert!(r.used <= r.budget);
 
         // Negative control: half the bytes keep only the newest chains, oldest gone first.
-        let (r, live, _) = five_live_read_stretches(used / 2, &reads);
+        let (r, live, _) = five_live_read_stretches(used / 2, b"", &reads, b"");
         let kept: Vec<Ticks> = r.keyframes.iter().map(|kf| kf.ts).collect();
         assert!(
             (1..ticks.len()).contains(&kept.len()),
@@ -8285,6 +9552,151 @@ mod tests {
         let latest = r.plan(r.latest_tick()).expect("latest").fold().term;
         assert_eq!(latest.checkpoint_visible(), live.checkpoint_visible());
         assert!(r.used <= r.budget, "used={} past {}", r.used, r.budget);
+    }
+
+    /// The distinct images `kf` keeps alive, each by the address of its `Arc` and its payload bytes, in address order.
+    fn images_of(kf: &RetainedKeyframe) -> Vec<(usize, usize)> {
+        let mut images = Vec::new();
+        kf.carry.for_each_retained_image(|img| {
+            images.push((Arc::as_ptr(img).addr(), img.payload_bytes()))
+        });
+        images.sort_unstable();
+        images
+    }
+
+    /// `used` recomputed from what `r` keeps: each slice and its reply, each pending witness, each keyframe's charge less its images, and each distinct image any kept keyframe holds, once. Also returns the image bytes the keyframes hold summed over them (what charging each keyframe its images whole would count) and the distinct images' bytes. Asserts the ledger counts, for each image, exactly the kept keyframes that hold it, so a keyframe that went without letting go of its images fails here even while another kept keyframe still holds each of them.
+    fn used_from_scratch(r: &TemporalRecorder) -> (usize, usize, usize) {
+        let mut distinct: Vec<(usize, usize)> = Vec::new();
+        let mut holders: HashMap<usize, usize> = HashMap::new();
+        let (mut own, mut per_keyframe) = (0usize, 0usize);
+        for kf in &r.keyframes {
+            let images = images_of(kf);
+            let held: usize = images.iter().map(|&(_, bytes)| bytes).sum();
+            own += kf.charge() - held;
+            per_keyframe += held;
+            for &(addr, _) in &images {
+                *holders.entry(addr).or_insert(0) += 1;
+            }
+            distinct.extend(images);
+        }
+        assert_eq!(
+            r.images.0, holders,
+            "the ledger counts each image's kept holders"
+        );
+        distinct.sort_unstable();
+        distinct.dedup();
+        let once: usize = distinct.iter().map(|&(_, bytes)| bytes).sum();
+        let blobs: usize = r.blobs.iter().flatten().map(InputSlice::charge).sum();
+        let witnesses: usize = r.witnesses.iter().map(Witnessed::charge).sum();
+        (blobs + witnesses + own + once, per_keyframe, once)
+    }
+
+    /// One 512 KiB Kitty image on screen while five non-adjacent live clipboard reads and a rekey make seven keyframes that all hold it: the recording charges it once, so a 2 MiB budget keeps every chain (charged to each keyframe, it kept the newest two). A distinct image per read is still charged each, and the budget drops the oldest chains for them.
+    #[test]
+    fn a_kitty_image_five_keyframes_share_is_charged_once() {
+        const BUDGET: usize = 2 * 1024 * 1024;
+        let clipboard_reads = vec!["\x1b]52;c;?\x07".to_string(); 5];
+        let mut flood = vec![b'z'; BUDGET / 4];
+        flood.extend_from_slice(b"\r\n");
+        let (mut r, live, used) = five_live_read_stretches(
+            BUDGET,
+            screen_image_load('T').as_bytes(),
+            &clipboard_reads,
+            &flood,
+        );
+        assert_eq!(
+            live.host_io_ordinal(),
+            6,
+            "REACH: the image load and five clipboard reads went to the host"
+        );
+        let screen = r.keyframes.front().map(images_of).unwrap_or_default();
+        assert!(
+            screen.iter().any(|&(_, bytes)| bytes >= SCREEN_IMAGE_BYTES),
+            "REACH: the oldest keyframe holds the image: {screen:?}"
+        );
+        assert_eq!(
+            r.keyframe_count(),
+            7,
+            "the seed, five live keyframes and a rekey"
+        );
+        assert!(
+            r.keyframes.back().is_some_and(|kf| kf.follows),
+            "REACH: the flood rekeyed"
+        );
+        assert_eq!(
+            r.reachable_from(),
+            Some(Ticks(10)),
+            "Rewind reaches the seed"
+        );
+        assert!(used <= r.budget, "used={used} past {}", r.budget);
+        let image = screen
+            .iter()
+            .find(|&&(_, bytes)| bytes >= SCREEN_IMAGE_BYTES)
+            .copied()
+            .expect("the image");
+        assert!(
+            r.keyframes.iter().all(|kf| images_of(kf).contains(&image)),
+            "every keyframe, the rekey's included, holds the one image"
+        );
+        let (scratch, per_keyframe, once) = used_from_scratch(&r);
+        eprintln!(
+            "shared: {} keyframes, used {} B of {} B, images held {per_keyframe} B, charged {once} B",
+            r.keyframe_count(),
+            r.used,
+            r.budget
+        );
+        assert_eq!(r.used, scratch, "used is the ledger's sum");
+        assert!(
+            per_keyframe - once >= 6 * SCREEN_IMAGE_BYTES,
+            "the image is charged once, not once per keyframe ({per_keyframe} B held, {once} B charged)"
+        );
+        let before = r.plan(Ticks(100)).expect("the seed's chain").fold().term;
+        assert!(
+            (0..8).any(|row| before.row_text(row).as_deref().map(str::trim)
+                == Some("before every stretch")),
+            "the seed's chain replays its first slice beside the image: {:?}",
+            (0..8).map(|row| before.row_text(row)).collect::<Vec<_>>()
+        );
+        let latest = r.plan(r.latest_tick()).expect("latest").fold().term;
+        assert_eq!(latest.checkpoint_visible(), live.checkpoint_visible());
+        for plan in r.chain_plans(r.latest_tick()) {
+            r.judge(plan.fold().judged);
+        }
+        assert_eq!(r.diverged(), 0, "every chain's witness matched its replay");
+        assert_eq!(
+            r.used,
+            used_from_scratch(&r).0,
+            "judging refunds the witnesses"
+        );
+
+        // Negative control: each read stores a new image 1, so every keyframe holds an image of its own, charged each.
+        let loads = vec![screen_image_load('t'); 5];
+        let (r, live, _) = five_live_read_stretches(BUDGET, b"", &loads, b"");
+        assert_eq!(live.host_io_ordinal(), 5, "REACH: five image loads");
+        let kept: Vec<Ticks> = r.keyframes.iter().map(|kf| kf.ts).collect();
+        let all = [10, 2_000, 4_000, 6_000, 8_000, 10_000].map(Ticks);
+        assert!(
+            (1..all.len()).contains(&kept.len()),
+            "distinct images kept {} of {} keyframes",
+            kept.len(),
+            all.len()
+        );
+        assert!(all.ends_with(&kept), "kept {kept:?}, oldest first gone");
+        let (scratch, per_keyframe, once) = used_from_scratch(&r);
+        eprintln!(
+            "distinct: kept {kept:?}, used {} B of {} B, images charged {once} B",
+            r.used, r.budget
+        );
+        assert_eq!(r.used, scratch, "used is the ledger's sum");
+        assert_eq!(per_keyframe, once, "no keyframe shares an image");
+        assert_eq!(
+            once,
+            kept.len() * SCREEN_IMAGE_BYTES,
+            "REACH: each kept live keyframe holds one image"
+        );
+        assert!(r.used <= r.budget, "used={} past {}", r.used, r.budget);
+        let latest = r.plan(r.latest_tick()).expect("latest").fold().term;
+        assert_eq!(latest.checkpoint_visible(), live.checkpoint_visible());
     }
 
     /// A keyframe is charged what dropping it frees, within a quarter and a kilobyte over, for a fresh shell, a full history, one dense with shell marks, a styled alternate-screen TUI, a production terminal's policy, a stored Kitty image (whose shared payload the live store keeps) and an in-flight transfer; a witness's snapshot the same. The rule before (a checkpoint's grid bytes) charged less than either frees.
@@ -8459,7 +9871,7 @@ mod tests {
         let put = |r: &mut TemporalRecorder, live: &mut Terminal, ms: u64, bytes: &[u8]| {
             r.freeze_now_for_test(Some(Ticks(ms)));
             live.process_at(bytes, clock(ms));
-            r.apply_inline(TemporalMsg::RawIn(InputSlice::at(bytes, clock(ms))));
+            r.apply(TemporalMsg::RawIn(InputSlice::at(bytes, clock(ms))));
         };
         for chain in 0..CHAINS {
             ms += 10;
@@ -8471,7 +9883,7 @@ mod tests {
             } else {
                 live.checkpoint_visible()
             };
-            r.apply_inline(TemporalMsg::Witness(Arc::new(seen.expect("visible"))));
+            r.apply(TemporalMsg::Witness(Arc::new(seen.expect("visible"))));
             if chain % 3 != 0 {
                 ms += 10;
             }
@@ -8621,7 +10033,7 @@ mod tests {
         live.set_cell_pixel_size(10, 20);
         let mut r = TemporalRecorder::with_budget(80 * MIN_REKEY_BYTES);
         r.record_keyframe(keyframe_of(&live, REKEY_SCROLLBACK_LINES).expect("seed"));
-        r.spine_watermark().seed(SpinePre::take(&live));
+        r.seed_spine(SpinePre::take(&live));
         let (tx, rx) = queue(256);
         let mut mark = SpineMark::attach(r.spine_watermark());
         let step = |live: &mut Terminal, mark: &mut SpineMark, bytes: &[u8], ms: u64| {
@@ -8645,8 +10057,8 @@ mod tests {
         drain(&rx, &mut r);
         assert_eq!(r.keyframe_count(), 2);
         assert!(
-            r.keyframes[1].replayed,
-            "bulk crossed the byte interval so apply_inline minted a trimmed rekey"
+            r.keyframes[1].follows,
+            "the bulk crossed the byte interval, so the reader keyed the chain with history bounded to REKEY_SCROLLBACK_LINES"
         );
 
         // 102 slices * 20 lines = 2,040 lines (<= 2,048 carried): zero extra keyframes, and the
@@ -8712,8 +10124,8 @@ mod tests {
         unresynced.record_keyframe(keyframe_of(&bare_live, REKEY_SCROLLBACK_LINES).expect("seed"));
         let deep = b"\x1b[20+T".repeat(103);
         bare_live.process_at(&deep, clock(5_000));
-        unresynced.apply_inline(TemporalMsg::RawIn(InputSlice::at(&deep, clock(5_000))));
-        unresynced.apply_inline(TemporalMsg::Witness(Arc::new(
+        unresynced.apply(TemporalMsg::RawIn(InputSlice::at(&deep, clock(5_000))));
+        unresynced.apply(TemporalMsg::Witness(Arc::new(
             bare_live.checkpoint_visible().expect("witness"),
         )));
         let folded = unresynced

@@ -21,7 +21,7 @@ use crate::headless_boot::{self, Instance};
 /// loopback, kills the process that asked, at once. The resolver's rule comes
 /// first: after the loopback allowance it also kills an established loopback
 /// connection (macOS 27).
-const NETWORK_JAIL: &str = concat!(
+pub(crate) const NETWORK_JAIL: &str = concat!(
     "(version 1)(allow default)",
     "(deny network-outbound (literal \"/private/var/run/mDNSResponder\") ",
     "(with send-signal SIGKILL))",
@@ -166,7 +166,7 @@ fn upkeep_word(inst: &mut Instance) -> String {
 
 /// The instance still runs: the jail killed it for no connection or lookup.
 #[track_caller]
-fn alive(inst: &mut Instance) {
+pub(crate) fn alive(inst: &mut Instance) {
     let status = inst.child.try_wait().expect("the instance's status");
     assert!(
         status.is_none(),
@@ -176,8 +176,8 @@ fn alive(inst: &mut Instance) {
     );
 }
 
-/// Boot a jailed instance whose aterm.toml gets `extra` appended, with the
-/// live upkeep let in by its development seam where `live` says so (under the
+/// Boot a jailed instance with its harness master enabled and `extra` appended to aterm.toml,
+/// with live upkeep let in by its development seam where `live` says so (under the
 /// private state root the seam's admission asks for).
 #[track_caller]
 fn boot(prefix: &str, extra: String, live: bool) -> Instance {
@@ -187,7 +187,11 @@ fn boot(prefix: &str, extra: String, live: bool) -> Instance {
         move |tmp: &Path, cmd| {
             let toml = tmp.join("cfg/aterm/aterm.toml");
             let base = std::fs::read_to_string(&toml).expect("aterm.toml");
-            std::fs::write(&toml, format!("{base}{extra}")).expect("aterm.toml");
+            let base = base
+                .strip_suffix(crate::launch_isolation::HARNESS_OFF)
+                .expect("the isolated config ends with the harness disabled");
+            std::fs::write(&toml, format!("{base}[harness]\nenabled = true\n{extra}"))
+                .expect("aterm.toml");
             cmd.env("ATERM_LOG", "info");
             if live {
                 cmd.env("ATERM_STATE_HOME", tmp.join(PRIVATE_STATE))

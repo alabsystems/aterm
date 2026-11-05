@@ -1,13 +1,143 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pure injected-`Read` tests for strict stdout draining.
+//! Strict stdout draining with injected reads and actual owned native pipes.
 
 use super::*;
 use std::io::Cursor;
 use std::time::Duration;
 
 const HANG: Duration = Duration::from_secs(60);
+
+#[cfg(unix)]
+#[test]
+fn retained_reader_unwind_keeps_cleanup_ownership_until_its_actual_child_reaps() {
+    struct SignalReaped(std::sync::mpsc::Sender<()>);
+    impl Drop for SignalReaped {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut command = crate::spawnfd::command(crate::deadline::stand_in(std::path::Path::new(
+        "/bin/sleep",
+    )));
+    command.arg("30");
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = capture_retained(
+            &mut command,
+            Instant::now() + HANG,
+            Duration::ZERO,
+            SignalReaped(tx),
+            |_, _| panic!("injected retained reader-start unwind"),
+        );
+    }));
+    assert!(panic.is_err());
+    rx.recv_timeout(HANG)
+        .expect("retained guards eventually drop after the actual child reaps");
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct RetainedGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(unix)]
+impl Drop for RetainedGuard {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_complete_capture_returns_guards_after_full_output_and_owning_reap() {
+    use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut command =
+        crate::spawnfd::command(crate::deadline::stand_in(std::path::Path::new("/bin/echo")));
+    command.arg("complete retained answer");
+    let (output, guard) = output_until_complete_stdout_retained(
+        &mut command,
+        Instant::now() + HANG,
+        Duration::ZERO,
+        RetainedGuard(Arc::clone(&drops)),
+    )
+    .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"complete retained answer\n");
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(guard);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_complete_spawn_refusal_preserves_no_child_and_original_guards() {
+    use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
+    let drops = Arc::new(AtomicUsize::new(0));
+    let world = aterm_tempfile::tempdir().unwrap();
+    let mut command = crate::spawnfd::command(world.path().join("no-executable"));
+    let (error, mut custody) = output_until_complete_stdout_retained(
+        &mut command,
+        Instant::now() + HANG,
+        Duration::ZERO,
+        RetainedGuard(Arc::clone(&drops)),
+    )
+    .unwrap_err()
+    .into_parts();
+    assert!(matches!(
+        error,
+        CompleteOutputError::Run(RunError::Spawn(_))
+    ));
+    assert_eq!(
+        custody.completion(),
+        super::super::ChildCompletion::NotStarted
+    );
+    assert_eq!(custody.observe_until(Instant::now()).unwrap(), None);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(custody.try_into_retained().unwrap());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_complete_timeout_preserves_cause_and_guards_until_positive_reap() {
+    use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut command = crate::spawnfd::command(crate::deadline::stand_in(std::path::Path::new(
+        "/bin/sleep",
+    )));
+    command.arg("30");
+    let (error, mut custody) = output_until_complete_stdout_retained(
+        &mut command,
+        Instant::now(),
+        Duration::ZERO,
+        RetainedGuard(Arc::clone(&drops)),
+    )
+    .unwrap_err()
+    .into_parts();
+    assert!(matches!(
+        error,
+        CompleteOutputError::Run(RunError::TimedOut)
+    ));
+    assert_ne!(
+        custody.completion(),
+        super::super::ChildCompletion::NotStarted
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    let status = custody
+        .observe_until(Instant::now() + HANG)
+        .unwrap()
+        .unwrap();
+    assert!(!status.success());
+    assert_eq!(
+        custody.completion(),
+        super::super::ChildCompletion::Reaped(status)
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(custody.try_into_retained().unwrap());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
 
 #[cfg(unix)]
 #[test]
@@ -51,7 +181,9 @@ fn dispatch_witness_distinguishes_spawn_from_post_spawn_reader_failure() {
     .expect_err("post-spawn reader failure is reported");
     assert!(matches!(
         error,
-        CompleteOutputError::Run(RunError::Spawn(_))
+        CompleteOutputError::Run(RunError::Capture(error))
+            if error.kind() == io::ErrorKind::Other
+                && error.to_string() == "injected reader-thread spawn failure"
     ));
     assert!(
         started.get(),
@@ -155,6 +287,80 @@ fn complete_stdout_refuses_every_discarded_byte_after_eof() {
     assert!(matches!(error, CompleteOutputError::StdoutTooLarge { limit } if limit == OUTPUT_KEEP));
 }
 
+#[cfg(unix)]
+#[test]
+fn explicit_stdout_limit_accepts_the_native_boundary_without_changing_the_default() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let path = world.path().join("complete-output");
+    let limit = OUTPUT_KEEP + 1;
+    let mut expected = vec![b'x'; limit];
+    expected[limit - 1] = b'!';
+    std::fs::write(&path, &expected).unwrap();
+    let cat = crate::deadline::stand_in(std::path::Path::new("/bin/cat"));
+    let command = || {
+        let mut command = crate::spawnfd::command(&cat);
+        command.arg(&path);
+        command
+    };
+    assert!(matches!(
+        output_until_complete_stdout(&mut command(), Instant::now() + HANG),
+        Err(CompleteOutputError::StdoutTooLarge { limit }) if limit == OUTPUT_KEEP
+    ));
+    let output =
+        output_until_complete_stdout_with_limit(&mut command(), Instant::now() + HANG, limit)
+            .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout, expected,
+        "the final byte came through actual child EOF"
+    );
+    assert!(matches!(
+        output_until_complete_stdout_with_limit(
+            &mut command(), Instant::now() + HANG, limit - 1,
+        ),
+        Err(CompleteOutputError::StdoutTooLarge { limit }) if limit == OUTPUT_KEEP
+    ));
+}
+
+#[test]
+fn explicit_stdout_limit_has_a_hard_maximum_and_supports_empty_output() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let mut missing = crate::spawnfd::command(world.path().join("absent"));
+    assert!(
+        matches!(
+            output_until_complete_stdout_with_limit(
+                &mut missing, Instant::now() + HANG, MAX_COMPLETE_STDOUT_BYTES + 1,
+            ),
+            Err(CompleteOutputError::Run(RunError::Spawn(error)))
+                if error.kind() == io::ErrorKind::InvalidInput
+        ),
+        "the hard-limit refusal precedes even an absent program's spawn error"
+    );
+    assert!(
+        read_stdout(Cursor::new(Vec::<u8>::new()), 0)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        read_stdout(Cursor::new(b"x"), 0),
+        Err(CompleteOutputError::StdoutTooLarge { limit: 0 })
+    ));
+    assert_eq!(
+        read_stdout(
+            Cursor::new(vec![b'x'; MAX_COMPLETE_STDOUT_BYTES]),
+            MAX_COMPLETE_STDOUT_BYTES
+        )
+        .unwrap()
+        .len(),
+        MAX_COMPLETE_STDOUT_BYTES
+    );
+    assert!(
+        matches!(read_stdout(Cursor::new(vec![b'x'; MAX_COMPLETE_STDOUT_BYTES+1]),
+        MAX_COMPLETE_STDOUT_BYTES), Err(CompleteOutputError::StdoutTooLarge { limit })
+        if limit == MAX_COMPLETE_STDOUT_BYTES)
+    );
+}
+
 /// The test knows the reader is waiting for release before EOF.
 struct GatedEof {
     prefix: Cursor<Vec<u8>>,
@@ -207,34 +413,36 @@ fn gated() -> (
 
 #[test]
 fn complete_stdout_refuses_a_still_open_stream_and_accepts_proven_completion() {
-    let (input, entered, release, dropped) = gated();
-    let reader = drain_stdout(None, input).unwrap();
-    entered
-        .recv_timeout(HANG)
-        .expect("the reader reached the EOF gate");
-    let incomplete = reader.collect(&Grace::at(Instant::now()));
-    release.send(()).expect("release this owned reader");
-    dropped
-        .recv_timeout(HANG)
-        .expect("the incomplete reader released its input");
-    assert!(matches!(
-        incomplete,
-        Err(CompleteOutputError::StdoutIncomplete)
-    ));
+    for limit in [OUTPUT_KEEP, MAX_COMPLETE_STDOUT_BYTES] {
+        let (input, entered, release, dropped) = gated();
+        let reader = drain_stdout_with_limit(None, input, limit).unwrap();
+        entered
+            .recv_timeout(HANG)
+            .expect("the reader reached the EOF gate");
+        let incomplete = reader.collect(&Grace::at(Instant::now()));
+        release.send(()).expect("release this owned reader");
+        dropped
+            .recv_timeout(HANG)
+            .expect("the incomplete reader released its input");
+        assert!(matches!(
+            incomplete,
+            Err(CompleteOutputError::StdoutIncomplete)
+        ));
 
-    let (input, entered, release, dropped) = gated();
-    let reader = drain_stdout(None, input).unwrap();
-    entered
-        .recv_timeout(HANG)
-        .expect("the second reader reached the gate");
-    release.send(()).expect("permit actual EOF");
-    assert_eq!(
-        reader.collect(&Grace::at(Instant::now() + HANG)).unwrap(),
-        b"owned prefix"
-    );
-    dropped
-        .recv_timeout(HANG)
-        .expect("the completed reader released its input");
+        let (input, entered, release, dropped) = gated();
+        let reader = drain_stdout_with_limit(None, input, limit).unwrap();
+        entered
+            .recv_timeout(HANG)
+            .expect("the second reader reached the gate");
+        release.send(()).expect("permit actual EOF");
+        assert_eq!(
+            reader.collect(&Grace::at(Instant::now() + HANG)).unwrap(),
+            b"owned prefix"
+        );
+        dropped
+            .recv_timeout(HANG)
+            .expect("the completed reader released its input");
+    }
 }
 
 #[cfg(unix)]

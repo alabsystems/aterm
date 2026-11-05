@@ -9,6 +9,8 @@ const BORN: u64 = 100;
 
 pub(super) fn snapshot() -> Snapshot {
     Snapshot {
+        launch_env: None,
+        auth_observed: true,
         tab: SID.into(),
         pid: 4242,
         start: "process-a".into(),
@@ -835,6 +837,7 @@ fn account_progress_distinguishes_refused_and_in_flight_restarts() {
             canary: None,
             session: None,
             held: None,
+            spans: None,
         }),
     });
     let refused = read(&host).unwrap();

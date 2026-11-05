@@ -37,7 +37,6 @@ fn listing(seen: &Seen) -> Listing {
             .iter()
             .map(|address| Listed {
                 addr: address.email.clone(),
-                own: address.own,
                 receives: address.receives,
             })
             .collect(),
@@ -72,12 +71,17 @@ impl Rests {
     }
 
     fn key(login: &str, target: Option<&str>) -> [u8; 32] {
-        let fold = |text: &str| text.trim().to_ascii_lowercase();
-        aterm_digest::Sha256::digest(format!(
-            "{}\0{}",
-            fold(login),
-            target.map(fold).unwrap_or_default()
-        ))
+        let mut hasher = aterm_digest::Sha256::new();
+        for b in login.trim().bytes() {
+            hasher.update([b.to_ascii_lowercase()]);
+        }
+        hasher.update([0]);
+        if let Some(target) = target {
+            for b in target.trim().bytes() {
+                hasher.update([b.to_ascii_lowercase()]);
+            }
+        }
+        hasher.finalize()
     }
 
     /// Whether a pass for `login` and `target` may start now, marking it running if so: not while
@@ -330,7 +334,7 @@ mod tests {
         assert_eq!(read.target, seen.target);
         assert!(read.complete);
         assert_eq!(read.listed.len(), 1);
-        assert!(read.listed[0].receives && !read.listed[0].own);
+        assert!(read.listed[0].receives);
     }
 
     /// The hook's take-up ends each pair by its own pass: one that did not settle is due again at

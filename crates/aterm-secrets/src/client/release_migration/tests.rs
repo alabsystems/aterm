@@ -471,6 +471,7 @@ fn unprotected_or_incomplete_legacy_bundles_are_not_copied() {
 fn alab_config() -> Config {
     Config {
         source: Source::Url("http://fixture.invalid/vault/alab".into()),
+        mirrors: Vec::new(),
         name: crate::ALAB_VAULT.into(),
         signer: decode_key32(crate::ALAB_SIGNER),
         followed: Vec::new(),

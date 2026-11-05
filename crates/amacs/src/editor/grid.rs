@@ -1446,6 +1446,11 @@ impl EditorWorkspace {
         view: &mut EditorBufferView,
         initial: Option<String>,
     ) -> Result<Vec<EditorEffect>, EditorError> {
+        if store.read_only(view.document) {
+            return Ok(vec![EditorEffect::Status(
+                super::workspace::read_only_words(store, view.document),
+            )]);
+        }
         let snapshot = snapshot_for_view(store, view)?;
         let Ok(table) = self.grid_table(&snapshot, grid_delimiter(view)) else {
             return Ok(Vec::new());
@@ -1621,6 +1626,11 @@ impl EditorWorkspace {
         store: &mut DocumentStore,
         view: &mut EditorBufferView,
     ) -> Result<Vec<EditorEffect>, EditorError> {
+        if store.read_only(view.document) {
+            return Ok(vec![EditorEffect::Status(
+                super::workspace::read_only_words(store, view.document),
+            )]);
+        }
         let snapshot = snapshot_for_view(store, view)?;
         let table = match self.grid_table(&snapshot, grid_delimiter(view)) {
             Ok(table) => table,
@@ -1709,6 +1719,11 @@ impl EditorWorkspace {
         view: &mut EditorBufferView,
         value: &str,
     ) -> Result<Vec<EditorEffect>, EditorError> {
+        if store.read_only(view.document) {
+            return Ok(vec![EditorEffect::Status(
+                super::workspace::read_only_words(store, view.document),
+            )]);
+        }
         let snapshot = snapshot_for_view(store, view)?;
         let table = match self.grid_table(&snapshot, grid_delimiter(view)) {
             Ok(table) => table,
@@ -1946,7 +1961,7 @@ fn draft_drop(view: &mut EditorBufferView) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::{CloseWhy, Invocation, Keymap, Platform};
+    use crate::editor::{CloseWhy, Invocation, Keymap, Platform, READ_ONLY_DOCUMENT};
     use crate::store::{DocumentId, DocumentViewId};
 
     /// Whether `effects` asks the host to close the view for `why`.
@@ -2041,6 +2056,79 @@ mod tests {
             }],
         );
         assert_eq!(cell_of(store, workspace, view), (record, column));
+    }
+
+    /// A read-only document's grid (a revealed secret's, opened `edit … ro=1`) moves between
+    /// cells and copies one, but every key, paste, cut, row command, undo and save that would
+    /// change it says so and changes nothing: no cell opens and the text stays as it was.
+    /// NEGATIVE CONTROL: with `open_draft` skipping its read-only check, typing opens a cell:
+    /// `` x: a cell opened ``.
+    #[test]
+    fn a_read_only_grid_moves_and_copies_but_changes_nothing() {
+        let (mut store, mut workspace, mut view, document) = grid_editor(MAIN);
+        store.set_read_only(document).unwrap();
+        goto(&mut store, &mut workspace, &mut view, 1, 1);
+        let refused = |effects: &[EditorEffect]| {
+            effects == [EditorEffect::Status(READ_ONLY_DOCUMENT.to_string())]
+        };
+        let changes: [(&str, Vec<EditorInput>); 12] = [
+            ("x", vec![ch('x', Modifiers::empty())]),
+            ("space", vec![named(NamedKey::Space)]),
+            ("enter", vec![named(NamedKey::Enter)]),
+            ("f2", vec![named(NamedKey::F2)]),
+            ("paste", vec![EditorInput::Paste("pasted".into())]),
+            ("backspace", vec![named(NamedKey::Backspace)]),
+            ("delete", vec![named(NamedKey::Delete)]),
+            ("C-k", vec![ch('k', Modifiers::CTRL)]),
+            ("C-o", vec![ch('o', Modifiers::CTRL)]),
+            ("cmd-z", vec![ch('z', Modifiers::SUPER)]),
+            ("cmd-s", vec![ch('s', Modifiers::SUPER)]),
+            (
+                "double-click",
+                vec![EditorInput::GridPointer {
+                    record: 1,
+                    column: 1,
+                    open: true,
+                }],
+            ),
+        ];
+        for (name, inputs) in &changes {
+            let effects = press(&mut store, &mut workspace, &mut view, inputs);
+            assert!(view.grid_draft().is_none(), "{name}: a cell opened");
+            assert!(refused(&effects), "{name}: {effects:?}");
+            assert_eq!(text_of(&store, document), MAIN, "{name}");
+        }
+        for command in [EditorCommand::GridInsertRow, EditorCommand::GridDeleteRow] {
+            let effects = workspace.execute(&mut store, &mut view, command).unwrap();
+            assert!(refused(&effects), "{command:?}: {effects:?}");
+        }
+        assert_eq!(text_of(&store, document), MAIN);
+        // Moving and copying are reading.
+        press(
+            &mut store,
+            &mut workspace,
+            &mut view,
+            &[named(NamedKey::ArrowRight)],
+        );
+        assert_eq!(cell_of(&store, &mut workspace, &view), (1, 2));
+        let copied = press(
+            &mut store,
+            &mut workspace,
+            &mut view,
+            &[ch('c', Modifiers::SUPER)],
+        );
+        assert!(!refused(&copied), "{copied:?}");
+
+        // The same keys change a writable grid.
+        let (mut store, mut workspace, mut view, document) = grid_editor(MAIN);
+        goto(&mut store, &mut workspace, &mut view, 1, 1);
+        press(
+            &mut store,
+            &mut workspace,
+            &mut view,
+            &[ch('x', Modifiers::empty()), named(NamedKey::Enter)],
+        );
+        assert_ne!(text_of(&store, document), MAIN);
     }
 
     #[test]

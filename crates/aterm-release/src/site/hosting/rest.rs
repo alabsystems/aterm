@@ -315,13 +315,25 @@ impl Client {
         }
         let mut args: Vec<String> = vec!["-X".into(), method.into()];
         let file = |name: &str, bytes: &[u8]| -> Result<String, Unanswered> {
+            use std::io::Write as _;
             let path = self.scratch.join(name);
-            std::fs::write(&path, bytes).map_err(|e| {
-                Unanswered::Unsent(format!(
-                    "cannot write the request body {}: {e}",
-                    path.display()
-                ))
-            })?;
+            let _ = std::fs::remove_file(&path);
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600)
+                    .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+            }
+            opts.open(&path)
+                .and_then(|mut f| f.write_all(bytes))
+                .map_err(|e| {
+                    Unanswered::Unsent(format!(
+                        "cannot write the request body {}: {e}",
+                        path.display()
+                    ))
+                })?;
             path.to_str()
                 .map(|p| format!("@{p}"))
                 .ok_or_else(|| Unanswered::Unsent(format!("{} is not UTF-8", path.display())))

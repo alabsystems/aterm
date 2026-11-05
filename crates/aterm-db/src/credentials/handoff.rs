@@ -74,7 +74,7 @@ impl Round<'_> {
             |session, store, scope| {
                 session.may_write()?;
                 session.peer_writer(self.peer)?;
-                let context = context(&facts, session, scope, now);
+                let context = context(&facts, session, scope, now)?;
                 let log = Log::read_with(session, store, scope, decode)?;
                 let book = Book::read(&log, &context);
                 let thread = book
@@ -134,7 +134,7 @@ impl Round<'_> {
             |session, store, scope| {
                 session.may_write()?;
                 session.peer_writer(self.peer)?;
-                let context = context(&facts, session, scope, now);
+                let context = context(&facts, session, scope, now)?;
                 let log = Log::read_with(session, store, scope, decode)?;
                 let book = Book::read(&log, &context);
                 let mut offers = Vec::new();
@@ -408,7 +408,7 @@ fn publish(
         if let Some(contributor) = contributor {
             session.peer_writer(contributor)?;
         }
-        let context = context(&facts, session, scope, now_ms());
+        let context = context(&facts, session, scope, now_ms())?;
         if !context.policy.allows(&thread.want) {
             return Err(Error::new("credential policy refuses publication"));
         }

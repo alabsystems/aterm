@@ -124,7 +124,7 @@ impl Drop for Group {
 
 /// A fresh private directory `<base>/<prefix><pid>.<n>`, registered for removal on interrupt.
 pub(crate) fn make_dir(base: &Path, prefix: &str) -> Result<PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::DirBuilderExt as _;
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let mut live = live();
     loop {
@@ -133,9 +133,9 @@ pub(crate) fn make_dir(base: &Path, prefix: &str) -> Result<PathBuf, String> {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        match std::fs::create_dir(&dir) {
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                crate::set_dir_mode_nofollow(&dir, 0o700)
                     .map_err(|e| format!("could not chmod {}: {e}", dir.display()))?;
                 live.dirs.insert(dir.clone());
                 return Ok(dir);

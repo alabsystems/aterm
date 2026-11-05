@@ -5,10 +5,13 @@
 //! `idle_rest_secs` (ATERM-KI-1027-4, `docs/DESIGN-stats-deck-live-2026-10-24.md` §13).
 //!
 //! A resting window stops its classic caret blink on the visible phase, and its stats deck draws
-//! as an unfocused window's deck does: no live-edge motion, a reading every
-//! [`crate::vitals_host::BACKGROUND_PERIOD`]. The GPU then gets several quiet seconds at a time,
-//! and the Apple driver frees the ~179 MB block it keeps for render passes a second or two after
-//! the last one (`docs/measured/idle-memory-window-2026-10-27.md`).
+//! as an unfocused window's deck does: no live-edge motion. aterm takes one stream of readings
+//! for every reader, and the rest slows it to a reading every
+//! [`crate::vitals_host::BACKGROUND_PERIOD`] only while no page reads it: a Tab Control or
+//! Allocation page on screen keeps a focused window's cadence, and an open stats lens its own
+//! (`App::vitals_audience`, `Audience::cadence`). Otherwise the GPU gets several quiet
+//! seconds at a time, and the Apple driver frees the ~179 MB block it keeps for render passes a
+//! second or two after the last one (`docs/measured/idle-memory-window-2026-10-27.md`).
 //!
 //! The first person's event in the window ([`stirs`]) or the first output its active tab shows
 //! wakes it at once. Its deck moves again from the first reading that lands after the wake

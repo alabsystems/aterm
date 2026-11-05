@@ -515,6 +515,7 @@ impl Rig {
         let opts = Opts {
             home: base.join("user"),
             state: base.join("state"),
+            account_roster: None,
             sock: Some(sock),
             token: None,
             only_sid: None,
@@ -590,6 +591,8 @@ impl Rig {
 
     fn snap(&self, conversation: Option<&str>) -> Snapshot {
         Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: TAB.to_string(),

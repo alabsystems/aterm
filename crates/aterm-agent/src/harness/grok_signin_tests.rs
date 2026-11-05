@@ -101,6 +101,10 @@ struct Bed {
     tmp: aterm_tempfile::TempDir,
     exe: PathBuf,
     lead: Vec<OsString>,
+    /// How many sign-ins the gate began ([`Gate::begin`]).
+    begun: AtomicUsize,
+    /// Where set, the door's refusal: the gate's begin returns it.
+    refuse: Mutex<Option<String>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -113,6 +117,8 @@ impl Bed {
             tmp,
             exe: std::env::current_exe().expect("test exe"),
             lead: lead(),
+            begun: AtomicUsize::new(0),
+            refuse: Mutex::new(None),
         }
     }
 
@@ -426,6 +432,10 @@ fn gate_run_as(
     let var = vars(env);
     let home = bed.home();
     let state = bed.state();
+    let begin = |_: i64| -> Result<(), String> {
+        bed.begun.fetch_add(1, Ordering::SeqCst);
+        bed.refuse.lock().unwrap().clone().map_or(Ok(()), Err)
+    };
     let gate = Gate {
         state: &state,
         home: Some(&home),
@@ -437,6 +447,7 @@ fn gate_run_as(
         ack,
         stopped,
         now: &clock,
+        begin: &begin,
     };
     let mut ledger = Vec::new();
     let ended = run(&gate, auto, owner, &mut |line| ledger.push(line.to_owned()));
@@ -770,6 +781,43 @@ fn a_sign_in_that_ends_unsigned_ends_its_waiters_and_is_never_looped() {
         "a person's launch starts one more: {person:?}"
     );
     assert_eq!(bed.runs(), 2);
+}
+
+/// THE SIGN-IN DOOR (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15): the gate begins its sign-in
+/// ([`Gate::begin`]) once, only where it decided to run one and before grok runs; a refused
+/// begin (another sign-in holds the machine's lock) runs nothing, writes no ledger line and no
+/// record, so it leaves no backoff. Signed in, nothing is begun. CONTROL: once the door admits
+/// it, the same background caller signs in.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sign_in_starts_only_through_its_door_and_a_refusal_runs_nothing() {
+    let bed = Bed::new("sign");
+    let seen = Seen::default();
+    let sandbox = Some(Path::new(login_drive::SANDBOX_EXEC));
+    *bed.refuse.lock().unwrap() = Some("held".to_owned());
+    let mut owner = Counted::new(&seen, Some(bed.root().join("approve")));
+    let (ended, ledger) = gate_run(&bed, sandbox, (true, false), vec![], &mut owner);
+    assert_eq!(ended, Ended::NotRun("held".to_owned()));
+    assert_eq!((bed.runs(), bed.begun.load(Ordering::SeqCst)), (0, 1));
+    assert!(ledger.is_empty(), "{ledger:?}");
+    assert!(
+        !bed.state().join(RECORD_FILE).exists(),
+        "no record, so no backoff"
+    );
+    *bed.refuse.lock().unwrap() = None;
+    let (ended, _) = gate_run(&bed, sandbox, (true, false), vec![], &mut owner);
+    assert!(
+        matches!(ended, Ended::SignedIn { .. }),
+        "CONTROL: {ended:?}"
+    );
+    assert_eq!((bed.runs(), bed.begun.load(Ordering::SeqCst)), (1, 2));
+    let (ended, _) = gate_run(&bed, sandbox, (true, false), vec![], &mut owner);
+    assert!(matches!(ended, Ended::Already(_)), "{ended:?}");
+    assert_eq!(
+        bed.begun.load(Ordering::SeqCst),
+        2,
+        "signed in, nothing is begun"
+    );
 }
 
 /// A caller that does not wait ends [`Ended::Busy`] while another holds the lock, and runs
@@ -1252,6 +1300,7 @@ fn a_waiter_is_told_of_a_sign_in_only_while_one_runs() {
                 ack: true,
                 stopped: &polled,
                 now: &clock,
+                begin: &|_| Ok(()),
             };
             let mut owner = Counted::new(&seen, Some(bed.root().join("approve")));
             run(&gate, &mut Rung::bare(), &mut owner, &mut |_| {})

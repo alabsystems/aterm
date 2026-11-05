@@ -9,7 +9,8 @@
 //! [`TurnEndState::left_to_person`], [`TurnEndState::followed`]) with result snapshots
 //! ([`crate::harness::result::snapshot`], [`DoneBy`], [`crate::harness::result::snapshot_screen`],
 //! [`crate::harness::result::with_report`], [`result::prune_results`]) and seeds loops from
-//! existing records ([`Session::task_seed`], [`TurnEndState::set_managed`],
+//! existing records, read ahead of the first fold ([`Session::task_ahead`],
+//! [`Session::task_seed`], [`TurnEndState::set_managed`],
 //! [`TurnEndState::seed_task_done`], [`TurnEndState::record_landing_holds`], and the occupancy
 //! task door's standing fact word, `Session::door_task_seed`), or at a break's write before the
 //! first fold ([`Session::managed_at_write`]).
@@ -173,6 +174,11 @@ pub const COULD_NOT_FINISH_WHY: &str = GaveUp::CouldNotFinish.word();
 /// The `why=` when the harness marks a task `failed` because Land stopped typing to a reply that
 /// came back the same with no work.
 pub const REPEATED_WHY: &str = GaveUp::Repeated.word();
+
+/// The `why=` when the harness marks a managed worker's task `failed` at its own usage limit,
+/// which resets too far off to wait for, where no move off it (another account, a fallback model)
+/// was made.
+pub const USAGE_LIMIT_WHY: &str = GaveUp::UsageLimit.word();
 
 /// Whether the record `t` is a landing this harness published: `done
 /// why=landed` ([`LANDED_WHY`]).
@@ -367,6 +373,11 @@ impl<C: Ctl> Session<'_, C> {
         if let Some(word) = &checked {
             args.push(format!("checked={word}"));
         }
+        // WHAT THE LANDING'S YIELD READ OF THE AGENT'S LEFT ROWS (`left=0|kept:<n>|<n>|unchecked`),
+        // only where the host was asked: a tape recorded without the door marks as it was recorded.
+        if let Some(left) = self.turn_end.landed_left().filter(|_| ending.is_none()) {
+            args.push(format!("left={}", left.word()));
+        }
         let result = match &snap {
             Ok(s) => {
                 args.push(format!("result_bytes={}", s.bytes));
@@ -401,20 +412,34 @@ impl<C: Ctl> Session<'_, C> {
         Ok(true)
     }
 
-    /// The task record at this loop's first fold, read once per loop.
-    pub(super) fn task_seed(&mut self, opts: &SuperviseOpts) -> Result<(), Fail> {
+    /// THE TASK RECORD AHEAD OF THIS LOOP'S FIRST FOLD, read once per loop, right before that
+    /// fold: whether a manager waits on the session is known to the point the fold judges
+    /// ([`TurnEndState::set_managed`]), so a managed worker's opening exchange is its task's,
+    /// never left to a person, and its `Could not finish:` concludes at that point. A lost read
+    /// leaves the session unmanaged, as a session with no record is, and is tried again at the
+    /// next point. The rest the record seeds waits for the fold ([`Self::task_seed`]).
+    pub(super) fn task_ahead(&mut self, opts: &SuperviseOpts) -> Result<Option<TaskRead>, Fail> {
         if self.task_seeded || opts.tasks.is_none() || self.claim.watching_behind().is_some() {
-            return Ok(());
+            return Ok(None);
         }
         let r = self.call(&["task"])?;
         if r.lost() {
-            return Ok(());
+            return Ok(None);
         }
         self.task_seeded = true;
-        let Some(record) = task_read(&r) else {
-            return Ok(());
+        let record = task_read(&r);
+        if let Some(record) = &record {
+            self.turn_end.set_managed(record.state != "exited");
+        }
+        Ok(record)
+    }
+
+    /// The task record [`Self::task_ahead`] read before this loop's first fold, seeded once that
+    /// fold has judged its point.
+    pub(super) fn task_seed(&mut self, record: Option<TaskRead>, opts: &SuperviseOpts) {
+        let Some(record) = record else {
+            return;
         };
-        self.turn_end.set_managed(record.state != "exited");
         self.door_task_seed(record.fact, &opts.policy);
         if record.state == "failed" {
             // A CONCLUSION THE LOOP BEFORE THIS ONE MADE ends this loop's typing too, unless a
@@ -441,11 +466,10 @@ impl<C: Ctl> Session<'_, C> {
                 self.task_done_said = true;
             }
         }
-        Ok(())
     }
 
     /// THE MANAGED GUARD'S RECORD AT A LINE'S WRITE (`Session::write_guards`, past an owner's
-    /// grant): before this loop's first fold has read the record ([`Self::task_seed`]), a break's
+    /// grant): before this loop's first fold has read the record ([`Self::task_ahead`]), a break's
     /// line would be judged on a worker no one has read as managed — a managed worker's first
     /// turn, or a loop that carried an open hold. So the write reads it once here and sets the
     /// managed guard as the seed does. `Some(Guard::Managed)` holds the line where the read is

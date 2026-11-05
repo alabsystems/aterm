@@ -105,7 +105,8 @@ pub(crate) struct Inert {
     fails: Arc<Mutex<Vec<&'static str>>>,
     /// How many times the store lock had been let go when a sync kind was first read.
     released_at_first_read: Mutex<Option<u32>>,
-    backgrounds: AtomicU32,
+    /// The trigger of each time a runner lowered its scheduling.
+    backgrounds: Mutex<Vec<Trigger>>,
     build: Mutex<String>,
     routes: Mutex<Vec<String>>,
     now: AtomicU64,
@@ -184,7 +185,7 @@ impl Inert {
             contended: AtomicBool::new(false),
             fails: Arc::new(Mutex::new(Vec::new())),
             released_at_first_read: Mutex::new(None),
-            backgrounds: AtomicU32::new(0),
+            backgrounds: Mutex::new(Vec::new()),
             refreshed_subscribers: AtomicU32::new(0),
             held: Mutex::new(None),
             held_reads: AtomicU32::new(0),
@@ -271,9 +272,9 @@ impl Inert {
         self.applies.lock().unwrap().clone()
     }
 
-    /// How many times a runner lowered its scheduling.
-    pub(crate) fn backgrounds(&self) -> u32 {
-        self.backgrounds.load(Ordering::SeqCst)
+    /// The trigger of each time a runner lowered its scheduling.
+    pub(crate) fn backgrounds(&self) -> Vec<Trigger> {
+        self.backgrounds.lock().unwrap().clone()
     }
 
     pub(crate) fn base_applied(&self) -> Vec<String> {
@@ -291,8 +292,8 @@ impl Inert {
 }
 
 impl Ports for Inert {
-    fn background(&self) {
-        self.backgrounds.fetch_add(1, Ordering::SeqCst);
+    fn background(&self, trigger: Trigger) {
+        self.backgrounds.lock().unwrap().push(trigger);
     }
     fn own_account(&self) -> bool {
         self.own
@@ -2169,7 +2170,7 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
             }
 
             impl Ports for SimSubscriber {
-                fn background(&self) {}
+                fn background(&self, _trigger: Trigger) {}
                 fn own_account(&self) -> bool {
                     true
                 }
@@ -2569,8 +2570,8 @@ pub(crate) mod owed_clone {
     }
 
     impl Ports for Hooked<'_> {
-        fn background(&self) {
-            self.inner.background();
+        fn background(&self, trigger: Trigger) {
+            self.inner.background(trigger);
         }
         fn own_account(&self) -> bool {
             self.inner.own_account()

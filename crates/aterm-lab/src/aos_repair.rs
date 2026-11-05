@@ -1389,11 +1389,11 @@ impl Drive<'_> {
     }
 
     fn keep(&self, suffix: &str, text: &str) {
-        let _ = std::fs::write(self.out.join(format!("{}.{suffix}", self.stem)), text);
+        let _ = crate::util::write_fresh(&self.out.join(format!("{}.{suffix}", self.stem)), text);
     }
 
     fn keep_bytes(&self, suffix: &str, bytes: &[u8]) {
-        let _ = std::fs::write(self.out.join(format!("{}.{suffix}", self.stem)), bytes);
+        let _ = crate::util::write_fresh(&self.out.join(format!("{}.{suffix}", self.stem)), bytes);
     }
 
     /// One request whose reply ends with a `hex=` run (`aos bundle`, `aos trace hex`), transcribed with the run's length in place of its digits.
@@ -1429,7 +1429,7 @@ impl Drive<'_> {
                 format!("{}{}", r.stdout, r.stderr).trim_end()
             )
         })?;
-        std::fs::copy(&shot.path, dest)
+        crate::util::copy_regular_file(&shot.path, dest)
             .map_err(|e| format!("cannot copy {} to {}: {e}", shot.path, dest.display()))?;
         Ok(shot)
     }
@@ -2280,8 +2280,8 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
             measured = std::mem::take(&mut d.measured);
         }
     }
-    inst.stop();
-    let _ = std::fs::copy(&inst.log, out.join(format!("{stem}.gui.log")));
+    let cleanup = inst.stop();
+    let _ = crate::util::copy_regular_file(&inst.log, out.join(format!("{stem}.gui.log")));
     let survivors: Vec<i32> = pids
         .iter()
         .copied()
@@ -2296,13 +2296,20 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
     }
     gates.push(gate(
         "instance-ended",
-        !pids.is_empty() && survivors.is_empty(),
-        format!("aterm pids {pids:?}, survivors {survivors:?}"),
+        cleanup.is_ok() && !pids.is_empty() && survivors.is_empty(),
+        format!("aterm pids {pids:?}, survivors {survivors:?}, cleanup {cleanup:?}"),
     ));
     drop(inst);
     if let Some(sig) = stopped {
-        println!("aos-repair: interrupted (signal {sig}); the instance is stopped");
-        return Err(Fail::from(Stopped(sig)));
+        println!(
+            "aos-repair: interrupted (signal {sig}); instance cleanup {}",
+            if cleanup.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            }
+        );
+        return crate::instance::after_stop(Err(Fail::from(Stopped(sig))), cleanup);
     }
     let mut report = String::new();
     for g in &gates {
@@ -2320,13 +2327,13 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
     println!("{result}");
     transcript.push(report);
     transcript.push(result);
-    let _ = std::fs::write(
-        out.join(format!("{stem}.transcript.txt")),
+    let _ = crate::util::write_fresh(
+        &out.join(format!("{stem}.transcript.txt")),
         transcript.join("\n") + "\n",
     );
     if !measured.is_empty() {
-        let _ = std::fs::write(
-            out.join(format!("{stem}.measured.txt")),
+        let _ = crate::util::write_fresh(
+            &out.join(format!("{stem}.measured.txt")),
             measured.join("\n") + "\n",
         );
     }

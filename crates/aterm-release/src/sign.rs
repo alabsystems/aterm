@@ -343,13 +343,22 @@ pub fn check_credentials_perms(
 
 fn read_credentials_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
-    let pre = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("read {}: {error}", path.display()))?;
-    if !pre.file_type().is_file() {
-        return Err(format!("REFUSING {} — not a regular file", path.display()));
+    #[cfg(not(unix))]
+    {
+        let pre = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        if !pre.file_type().is_file() {
+            return Err(format!("REFUSING {} — not a regular file", path.display()));
+        }
     }
-    let file = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse)
-        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let file = match astream_sys::open_nonblocking(path, astream_sys::Links::Refuse) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(_) if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) => {
+            return Err(format!("REFUSING {} — not a regular file", path.display()));
+        }
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
     let meta = file
         .metadata()
         .map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -367,7 +376,7 @@ fn read_credentials_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
             path.display()
         ));
     }
-    let cap = usize::try_from(meta.len().min(64 * 1024)).unwrap_or(0);
+    let cap = usize::try_from(meta.len().min(64 * 1024).saturating_add(1)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(cap);
     file.take(max.saturating_add(1))
         .read_to_end(&mut bytes)

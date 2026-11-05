@@ -203,7 +203,9 @@ fn open_or_make(path: &std::path::Path) -> io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        making.mode(0o600);
+        making
+            .mode(0o600)
+            .custom_flags(crate::atomic_file::LOCK_OPEN_FLAGS);
     }
     match making.open(path) {
         Ok(file) => {
@@ -225,7 +227,7 @@ fn open_existing(path: &std::path::Path) -> io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     #[cfg(windows)]
     {

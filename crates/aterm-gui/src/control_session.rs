@@ -1072,6 +1072,7 @@ fn await_agent(
 }
 
 /// One target of an `await task` ([`await_task`]): the session, and the task rev it waits past — its own `@<sel>:<rev>` or the request's `since=`, else (`None`) its rev when the wait is armed — and, with `facts=1` (`facts`), the fact revision it waits past likewise (`@<sel>:<rev>:<fact_rev>` or `fact_since=`, else its `fact_rev` when the wait is armed).
+#[derive(Clone, Copy)]
 pub(crate) struct TaskTarget<'a> {
     pub(crate) local_id: u64,
     pub(crate) ctx: &'a SessionCtx,
@@ -1080,10 +1081,29 @@ pub(crate) struct TaskTarget<'a> {
     pub(crate) fact_since: Option<u64>,
 }
 
-/// `await task`: park until the task records of `targets` have news — a target whose record's rev is past its `since` with a state to read (`done`, `exited`, `stalled`) or an ask raised under a task owner, never a `kind=wait` entry ([`crate::task_record::TaskRecord::has_news`]), a `facts=1` target whose fact word was noted past its fact edge (a clear is none), or whose session closed — at the first such target (`any`) or once every target is one (`all`). A fact edit never moves `rev`, so a wait without `facts=1` never wakes on one.
+/// One target of an `await task` ([`await_tasks`]): a live session's task ([`TaskTarget`]), or the
+/// row of a worker whose tab aterm closed once its task concluded ([`crate::retired_workers`]),
+/// which has its news at once: its end, `state=closed`, as a wait armed before the close reads it.
+pub(crate) enum Awaited<'a> {
+    Live(TaskTarget<'a>),
+    Retired(String),
+}
+
+/// `await task` on live sessions alone ([`await_tasks`]).
 pub(crate) fn await_task(
     store: &Store,
     targets: &[TaskTarget<'_>],
+    combine: crate::task_record::Combine,
+    timeout_ms: u64,
+) -> String {
+    let awaited: Vec<Awaited<'_>> = targets.iter().copied().map(Awaited::Live).collect();
+    await_tasks(store, &awaited, combine, timeout_ms)
+}
+
+/// `await task`: park until the task records of `awaited` have news — a target whose record's rev is past its `since` with a state to read (`done`, `exited`, `stalled`) or an ask raised under a task owner, never a `kind=wait` entry ([`crate::task_record::TaskRecord::has_news`]), a `facts=1` target whose fact word was noted past its fact edge (a clear is none), whose session closed, or a retired worker's row ([`Awaited::Retired`]), news from the start — at the first such target (`any`) or once every target is one (`all`). A fact edit never moves `rev`, so a wait without `facts=1` never wakes on one. Rows answer in `awaited`'s order.
+pub(crate) fn await_tasks(
+    store: &Store,
+    awaited: &[Awaited<'_>],
     combine: crate::task_record::Combine,
     timeout_ms: u64,
 ) -> String {
@@ -1092,8 +1112,16 @@ pub(crate) fn await_task(
     use crate::task_record::Combine;
 
     let overall = Instant::now() + Duration::from_millis(timeout_ms);
+    let targets: Vec<TaskTarget<'_>> = awaited
+        .iter()
+        .filter_map(|target| match target {
+            Awaited::Live(target) => Some(*target),
+            Awaited::Retired(_) => None,
+        })
+        .collect();
+    let retired = awaited.len() - targets.len();
     let mut sub = crate::session_watch::Subscription::new();
-    for target in targets {
+    for target in &targets {
         let _ = sub.watch(&target.ctx.watchers);
     }
     let edges: Vec<(u64, Option<u64>)> = targets
@@ -1118,11 +1146,11 @@ pub(crate) fn await_task(
     let in_the_look = || false;
     let park = Park::new(&sub, &in_the_look, OnHangup::Abort, Stretch::None);
     let look = |_: Instant, _: bool, _: bool| {
-        latch_task_news(store, targets, &edges, &exits, &mut latched);
-        let with_news = latched.iter().filter(|latch| latch.is_some()).count();
+        latch_task_news(store, &targets, &edges, &exits, &mut latched);
+        let with_news = retired + latched.iter().filter(|latch| latch.is_some()).count();
         let answered = match combine {
             Combine::Any => with_news > 0,
-            Combine::All => with_news == targets.len(),
+            Combine::All => with_news == awaited.len(),
         };
         (answered.then_some(()), None)
     };
@@ -1131,16 +1159,27 @@ pub(crate) fn await_task(
         Parked::Deadline | Parked::Exited => " status=timeout",
         Parked::HungUp => return crate::control::HUNG_UP_REPLY.to_string(),
     };
-    let mut out = format!("OK {}{tail}\n", targets.len());
-    for ((target, exited), latch) in targets.iter().zip(&exits).zip(latched) {
-        let row = latch.unwrap_or_else(|| {
-            task_wait_row(
-                target,
-                task_record_of(target.ctx).as_ref(),
-                exited(store),
-                false,
-            )
+    let mut live = targets
+        .iter()
+        .zip(&exits)
+        .zip(latched)
+        .map(|((target, exited), latch)| {
+            latch.unwrap_or_else(|| {
+                task_wait_row(
+                    target,
+                    task_record_of(target.ctx).as_ref(),
+                    exited(store),
+                    false,
+                )
+            })
         });
+    let mut out = format!("OK {}{tail}\n", awaited.len());
+    for target in awaited {
+        // `live` holds one row per `Awaited::Live`, in order.
+        let row = match target {
+            Awaited::Live(_) => live.next().unwrap_or_default(),
+            Awaited::Retired(row) => row.clone(),
+        };
         out.push_str(&row);
         out.push('\n');
     }
@@ -1953,8 +1992,9 @@ impl ShellSubmit {
         }
     }
 
-    /// One accepted start and the same retained block prove the association.
-    /// Reset/eviction or multiple starts retain submit evidence, but no block claim.
+    /// One accepted start and the same retained block prove the association; a reset keeps the
+    /// block (the shell's marks outlive it), so the claim stands through one.
+    /// Eviction or multiple starts retain submit evidence, but no block claim.
     fn block(self, t: &Terminal) -> Option<u64> {
         if self.started.checked_add(1) != Some(t.started_command_seq()) {
             return None;
@@ -2014,12 +2054,20 @@ mod shell_submit_tests {
     }
 
     #[test]
-    fn reset_and_eviction_cannot_reassociate_an_old_prompt() {
+    fn a_reset_keeps_the_started_block_and_neither_it_nor_eviction_reassociates_a_prompt() {
         let mut t = entering();
         let armed = ShellSubmit::capture(&t);
         t.process(START);
         t.reset();
-        assert_eq!(armed.block(&t), None);
+        assert!(
+            armed.block.is_some(),
+            "PRECONDITION: the press armed a block"
+        );
+        assert_eq!(
+            armed.block(&t),
+            armed.block,
+            "the reset kept the block the press started"
+        );
         t.process(PROMPT);
         assert_ne!(ShellSubmit::capture(&t).block, armed.block);
 
@@ -2310,6 +2358,9 @@ pub(crate) fn cmd_await_momentum(
 enum GuardedSubmit {
     Pressed,
     Missed,
+    /// The person made a gesture since the caller's read (`if-human=`), judged under the lock at
+    /// every try: nothing of this press was written.
+    Person,
     /// The sink took none of the Enter until the submit window ended: nothing of this press was written.
     Busy,
     Failed(String),
@@ -2319,6 +2370,7 @@ fn guarded_submit(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
     guard: &dyn aterm_core::terminal::RowMatch,
+    human: Option<u64>,
     window: std::time::Instant,
     mark: Option<&crate::control_input_ack::InputMark>,
 ) -> GuardedSubmit {
@@ -2332,6 +2384,7 @@ fn guarded_submit(
         let fence = super::control_input::InputFence {
             guard: Some(guard),
             guard_at_cursor: true,
+            human,
             ..super::control_input::InputFence::default()
         };
         match super::control_input::input_if_fenced_observed(
@@ -2345,9 +2398,8 @@ fn guarded_submit(
             GuardedInput::Pressed(Delivery::Full) => {
                 return GuardedSubmit::Pressed;
             }
-            GuardedInput::Skipped | GuardedInput::Changed | GuardedInput::Person => {
-                return GuardedSubmit::Missed;
-            }
+            GuardedInput::Skipped | GuardedInput::Changed => return GuardedSubmit::Missed,
+            GuardedInput::Person => return GuardedSubmit::Person,
             GuardedInput::Pressed(Delivery::BusyZero) if std::time::Instant::now() < window => {
                 std::thread::sleep(BUSY_RETRY);
             }
@@ -2360,7 +2412,7 @@ fn guarded_submit(
 }
 
 /// `turn`'s usage line.
-pub(crate) const TURN_USAGE: &str = "ERR usage: turn [id=<epoch>:<producer>:<seq>] [if-supervisor=<holder>] [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>] <text>\n";
+pub(crate) const TURN_USAGE: &str = "ERR usage: turn [id=<epoch>:<producer>:<seq>] [if-supervisor=<holder>] [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] [if-rows=<first>-<last>:<hex16>] [if-human=<n>] [cause=@<off>|<seq>] <text>\n";
 
 /// `turn`'s answer when a key it pressed (a typed grapheme, the submit key) did not deliver.
 const KEY_DELIVERY_FAILED: &str = "ERR key delivery failed\n";
@@ -2386,6 +2438,11 @@ pub(crate) struct TurnOptions<'a> {
     yield_floor: Option<f32>,
     if_gen: Option<crate::control::ScreenGen>,
     if_rows: Option<aterm_types::control_verbs::RowsFence>,
+    /// The person's input count (`status human_seq=`) the caller read the screen at: any gesture
+    /// since, a key that moves no fenced row among them (Shift+Tab's mode, an undrawn Ctrl-R),
+    /// skips the turn (`reason=person`), judged under the fence's lock and again before its paste
+    /// and its first press.
+    if_human: Option<u64>,
     pub(crate) cause: Option<crate::session_log::CauseRef>,
     text: &'a str,
 }
@@ -2409,6 +2466,7 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
     let mut yield_floor: Option<f32> = None;
     let mut if_gen: Option<crate::control::ScreenGen> = None;
     let mut if_rows: Option<aterm_types::control_verbs::RowsFence> = None;
+    let mut if_human: Option<u64> = None;
     let mut cause_opt: Option<crate::session_log::CauseRef> = None;
     let is_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let (options, text) = aterm_types::control_verbs::turn_option_words(rest);
@@ -2495,6 +2553,10 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
                 Some(fence) => if_rows = Some(fence),
                 None => return Err(USAGE.to_string()),
             },
+            "if-human" => match is_digits(v).then(|| v.parse::<u64>().ok()).flatten() {
+                Some(n) => if_human = Some(n),
+                None => return Err(USAGE.to_string()),
+            },
             "cause" => match crate::session_log::CauseRef::parse(v) {
                 Some(c) if cause_opt.is_none() => cause_opt = Some(c),
                 _ => return Err(crate::session_log::CAUSE_USAGE.to_string()),
@@ -2529,6 +2591,7 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
         yield_floor,
         if_gen,
         if_rows,
+        if_human,
         cause: cause_opt,
         text,
     })
@@ -2626,9 +2689,12 @@ fn turn_attempt(
         yield_floor,
         if_gen,
         if_rows,
+        if_human,
         text,
         ..
     } = o;
+    // A gesture the person made since the caller's read, by the window's count of them.
+    let person_moved = || if_human.is_some_and(|seen| ctx.human_input.seq() != seen);
 
     let (turn_id, handed_back) = {
         let mut lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
@@ -2760,7 +2826,7 @@ fn turn_attempt(
     }
 
     let mut hold: Option<TypingHold> = None;
-    if if_gen.is_some() || if_rows.is_some() {
+    if if_gen.is_some() || if_rows.is_some() || if_human.is_some() {
         let mut look = ctx.frame.look_frame();
         let typing = typed && !text.is_empty();
         let held_open = std::cell::Cell::new(false);
@@ -2770,6 +2836,10 @@ fn turn_attempt(
         };
         let terminal = crate::term_lock_whole_when(term, crate::park::Lane::SERVED, waits);
         let unvouched = if_rows.filter(|_| held_open.get());
+        if person_moved() {
+            let seq = terminal.content_seq();
+            return format!("OK 0 turn skipped reason=person submitted=0 seq={seq} id={turn_id}\n");
+        }
         let held = typing.then(|| TypingHold::of(&terminal, ctx, if_rows, unvouched));
         let moved = if_gen
             .is_some_and(|generation| crate::control::screen_gen(&terminal) != generation)
@@ -2902,6 +2972,9 @@ fn turn_attempt(
             if let Some(refusal) = halted(None) {
                 return refusal;
             }
+            if person_moved() {
+                return typed_cut(term, "person", 0, 0, turn_id);
+            }
             note_ctl_input();
             let first = !wrote.replace(true);
             if !(io.paste)(text) {
@@ -3020,6 +3093,22 @@ fn turn_attempt(
                 }
                 return cut;
             }
+            // A gesture since the caller's read stops the turn before its Enter: the text stands
+            // where it was put, the person's to send. A re-press follows an Enter that went.
+            // What a person's cut leaves standing: the keys typed, or the text pasted whole.
+            let pasted = || {
+                if typed {
+                    pasted_graphemes
+                } else {
+                    aterm_grapheme::GraphemeClusters::graphemes(text).count()
+                }
+            };
+            if person_moved() {
+                if press_no > 0 {
+                    break;
+                }
+                return typed_cut(term, "person", typed_keys, pasted(), turn_id);
+            }
             let window = deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
             let (base_started, typed_row, base_turns, mut id) = {
                 let mut t = term_lock(term);
@@ -3035,8 +3124,15 @@ fn turn_attempt(
             note_ctl_input();
             let first = !wrote.replace(true);
             if let Some(guard) = submit_matcher.as_deref() {
-                match guarded_submit(term, ctx, guard, window, io.mark) {
+                match guarded_submit(term, ctx, guard, if_human, window, io.mark) {
                     GuardedSubmit::Pressed => {}
+                    GuardedSubmit::Person => {
+                        term_lock(term).watch_disarm(id);
+                        if press_no > 0 {
+                            break;
+                        }
+                        return typed_cut(term, "person", typed_keys, pasted(), turn_id);
+                    }
                     GuardedSubmit::Missed => {
                         term_lock(term).watch_disarm(id);
                         if press_no == 0 {
@@ -4343,10 +4439,10 @@ pub(crate) fn self_claim_write<T>(
 
 const HARNESS_LAND_USAGE: &str = "ERR usage: meta set harness_land since=<ms> nudges=<n> \
      [read=1 legs=\u{2026} open=\u{2026} changed=\u{2026} untracked=\u{2026} stashes=\u{2026} \
-     unpushed=\u{2026} unlanded=\u{2026}] | meta unset harness_land\n";
+     unpushed=\u{2026} unlanded=\u{2026} left=\u{2026}] | meta unset harness_land\n";
 
 /// The keys of a `meta set harness_land` line, each at most once: the two every line carries, then `read`'s group.
-const HARNESS_LAND_KEYS: [&str; 10] = [
+const HARNESS_LAND_KEYS: [&str; 11] = [
     "since",
     "nudges",
     "read",
@@ -4357,6 +4453,7 @@ const HARNESS_LAND_KEYS: [&str; 10] = [
     "stashes",
     "unpushed",
     "unlanded",
+    "left",
 ];
 
 /// The Land hold a `meta set harness_land …` tells (`Some`), or a `meta unset harness_land`'s lift (`None`); `None` outright for every other `meta` line, and the usage for a malformed one ([`land_held_of`]; an unset with any token after it).
@@ -4375,7 +4472,7 @@ fn harness_land_request(
     Some(held.ok_or(HARNESS_LAND_USAGE))
 }
 
-/// THE HOLD A `meta set harness_land` LINE'S TOKENS TELL, read strictly: each `key=value` of [`HARNESS_LAND_KEYS`] at most once, in any order; `since=` (unix ms, ASCII digits) and `nudges=` on every line; `read=1` with `legs=` (each [`aterm_agent::harness::acts::HoldLeg::word`], comma-separated) and neither without the other; `open=` and the five repository counts only beside `read=1`. A count is ASCII digits, held at its field's largest value past it. `open=`'s words are percent-encoded and comma-separated, and only the first four [`aterm_agent::harness::acts::OpenWord::of`] knows are kept, the rest dropped, as the strict reading keeps them. `None` for an unknown token, a token twice, a leg word no leg has, a count or a `since` that is no number, a `read=` other than `1`, a missing `since=` or `nudges=`, `read=1` without `legs=` or `legs=` without it, and `open=` or a count with no `read=1`.
+/// THE HOLD A `meta set harness_land` LINE'S TOKENS TELL, read strictly: each `key=value` of [`HARNESS_LAND_KEYS`] at most once, in any order; `since=` (unix ms, ASCII digits) and `nudges=` on every line; `read=1` with `legs=` (each [`aterm_agent::harness::acts::HoldLeg::word`], comma-separated) and neither without the other; `open=`, the five repository counts and `left=` (the processes its agent left running, unkept: [`aterm_agent::harness::acts::HoldLeg::Left`]) only beside `read=1`. A count is ASCII digits, held at its field's largest value past it. `open=`'s words are percent-encoded and comma-separated, and only the first four [`aterm_agent::harness::acts::OpenWord::of`] knows are kept, the rest dropped, as the strict reading keeps them. `None` for an unknown token, a token twice, a leg word no leg has, a count or a `since` that is no number, a `read=` other than `1`, a missing `since=` or `nudges=`, `read=1` without `legs=` or `legs=` without it, and `open=` or a count with no `read=1`.
 fn land_held_of<'a>(
     toks: impl Iterator<Item = &'a str>,
 ) -> Option<aterm_agent::harness::acts::LandHeld> {
@@ -4413,6 +4510,7 @@ fn land_held_of<'a>(
             "untracked" => held.untracked = short(value)?,
             "stashes" => held.stashes = short(value)?,
             "unpushed" => held.unpushed = short(value)?,
+            "left" => held.left = short(value)?,
             _ => held.unlanded = short(value)?,
         }
     }
@@ -4420,7 +4518,7 @@ fn land_held_of<'a>(
     (since && nudges && read == legs && (read || !rest.contains(&true))).then_some(held)
 }
 
-/// `meta set harness_land since=<ms> nudges=<n> [read=1 legs=… [open=…] [changed=… untracked=… stashes=… unpushed=… unlanded=…]]` / `meta unset harness_land` — an agent that supervises itself tells WHY ITS OWN LAND STILL HOLDS, as aterm's loop tells its own ([`aterm_agent::harness::acts::LandHeld`], read by [`land_held_of`]), or that no landing holds, so `status land_held= land_nudges= land_since=`, the menu bar's `landing` and every hold line say its hold as they say aterm's own. THE HOLD IS ITS CLAIM'S, as `meta set harness_held`'s stop is ([`self_claim_write`], else `ERR denied`): kept with that claim's proof ([`crate::session_timeline::SessionMeta::self_land`]), NEVER on aterm's own glass (which stays cleared beside a proven self-claim), and gone wherever that stop goes; shown while the claim stands ([`crate::App::shown_hold`]). `OK` whether or not it moved; only a move is a change, which wakes the window.
+/// `meta set harness_land since=<ms> nudges=<n> [read=1 legs=… [open=…] [changed=… untracked=… stashes=… unpushed=… unlanded=…] [left=…]]` / `meta unset harness_land` — an agent that supervises itself tells WHY ITS OWN LAND STILL HOLDS, as aterm's loop tells its own ([`aterm_agent::harness::acts::LandHeld`], read by [`land_held_of`]), or that no landing holds, so `status land_held= land_nudges= land_since=`, the menu bar's `landing` and every hold line say its hold as they say aterm's own. THE HOLD IS ITS CLAIM'S, as `meta set harness_held`'s stop is ([`self_claim_write`], else `ERR denied`): kept with that claim's proof ([`crate::session_timeline::SessionMeta::self_land`]), NEVER on aterm's own glass (which stays cleared beside a proven self-claim), and gone wherever that stop goes; shown while the claim stands ([`crate::App::shown_hold`]). `OK` whether or not it moved; only a move is a change, which wakes the window.
 pub(crate) fn cmd_meta_harness_land(
     ctx: &SessionCtx,
     conn: Option<u64>,
@@ -4587,11 +4685,6 @@ fn meta_status(
             .and_then(aterm_sysprobe::process_cwd)
             .map(|p| p.to_string_lossy().into_owned())
     };
-    let opt = |v: Option<&str>| match v {
-        None => "-".to_string(),
-        Some("-") => "%2D".to_string(),
-        Some(v) => pct_encode(v),
-    };
     let (autopilot_by, autopilot_since) = autopilot_by_fields(&meta);
     format!(
         "OK title={} user_title={} description={} icon={} role={} attention={} cwd={} state={state} \
@@ -4599,25 +4692,48 @@ fn meta_status(
          questions={} agent_cwd={} trusted_cwd={} worker={} autopilot={} land_at={} \
          autopilot_by={} autopilot_since={}\n",
         pct_encode(&title),
-        opt(meta.user_title.as_deref()),
-        opt(meta.description.as_deref()),
-        opt(meta.icon.as_deref()),
-        opt(meta.role.as_deref()),
-        opt(meta.attention.as_deref()),
-        opt(cwd.as_deref()),
-        opt(attention_owner(&meta)),
+        meta_value(meta.user_title.as_deref()),
+        meta_value(meta.description.as_deref()),
+        meta_value(meta.icon.as_deref()),
+        meta_value(meta.role.as_deref()),
+        meta_value(meta.attention.as_deref()),
+        meta_value(cwd.as_deref()),
+        meta_value(attention_owner(&meta)),
         attention_owners(&meta),
         attention_kinds(&meta),
-        opt(meta.live_supervisor(crate::metrics::now_us())),
+        meta_value(meta.live_supervisor(crate::metrics::now_us())),
         u8::from(meta.claim_proven(crate::metrics::now_us())),
-        opt(meta.questions.as_deref()),
-        opt(agent_cwd.as_deref()),
-        opt(trusted_cwd.as_deref()),
+        meta_value(meta.questions.as_deref()),
+        meta_value(agent_cwd.as_deref()),
+        meta_value(trusted_cwd.as_deref()),
         worker.map_or("-", aterm_phase::Program::name),
-        opt(meta.autopilot.as_deref()),
+        meta_value(meta.autopilot.as_deref()),
         crate::autopilot::land_at_field(meta.land_at),
         autopilot_by,
         autopilot_since,
+    )
+}
+
+/// A `meta` field's value as `meta` prints it: `-` for none, `%2D` for a stored `-` (so it never
+/// reads as none), anything else percent-encoded.
+pub(crate) fn meta_value(v: Option<&str>) -> String {
+    match v {
+        None => "-".to_string(),
+        Some("-") => "%2D".to_string(),
+        Some(v) => pct_encode(v),
+    }
+}
+
+/// THE PRESENCE ROW'S MEANING FIELDS, as `meta` prints them (critic item E05):
+/// `role=<pct|-> attention=<pct|-> user_title=<pct|->`, the three the Fabric bridge folds into a
+/// session's presence ([`meta_value`] each). Every `sessions status` row carries them, and so does
+/// an `events` subscription's `sub` ack, so the bridge's attach asks no `@<sid> meta`.
+pub(crate) fn presence_meta_tokens(meta: &crate::session_timeline::SessionMeta) -> String {
+    format!(
+        "role={} attention={} user_title={}",
+        meta_value(meta.role.as_deref()),
+        meta_value(meta.attention.as_deref()),
+        meta_value(meta.user_title.as_deref()),
     )
 }
 
@@ -4897,7 +5013,12 @@ const CAST_DRIFT_CUT_ATTEMPTS: usize = 3;
 
 const CAST_DRIFT_CONCURRENCY: usize = 2;
 
+/// How long a `cast drift` waits for a free slot before it answers busy. A unit test's holders
+/// are its sibling tests, which finish, so its callers wait the hang detector.
+#[cfg(not(test))]
 const CAST_DRIFT_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const CAST_DRIFT_SLOT_WAIT: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
 static CAST_DRIFT_SLOTS: DriftSlots = DriftSlots {
     busy: Mutex::new(0),
@@ -5007,10 +5128,11 @@ fn cast_drift_with(
     report.render(ms, None)
 }
 
-/// `temporal [tick] [trim]` -> `OK <nbytes>[ trimmed=<k>]\n` then the session's screen RECONSTRUCTED at logical `tick` (default: the latest recorded instant) — with `trim`, minus its trailing all-blank rows (the `text trim` rule; the byte count on the header is the trimmed body's) — the read half of the hydratable temporal spine (`docs/design/HIERARCHICAL_SESSIONS.md` Addendum B), the endpoint the `TemporalRecorder` producer feeds.
+/// `temporal [tick] [trim]` -> `OK <nbytes>[ trimmed=<k>]\n` then the session's screen RECONSTRUCTED at logical `tick` (default: the latest recorded instant) — with `trim`, minus its trailing all-blank rows (the `text trim` rule; the byte count on the header is the trimmed body's) — the read half of the hydratable temporal spine (`docs/design/HIERARCHICAL_SESSIONS.md` Addendum B), the endpoint the `TemporalRecorder` producer feeds; the fold posts its verdicts on the pending witnesses it passes ([`crate::temporal::TemporalRecorder::judge`]). `temporal judge` -> `OK judged=<n> diverged=<n> pending=<n> unjudged_evicted=<n>\n`: every kept chain's pending witnesses judged ([`crate::temporal::judge_all`]), the first two counted in this call, the last two read after it.
 pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str) -> String {
-    const USAGE: &str = "ERR usage: temporal [status | <tick>] [trim]  (tick = µs since \
-                         session start; `temporal status` reports the reachable range)\n";
+    const USAGE: &str = "ERR usage: temporal [status | judge | <tick>] [trim]  (tick = µs since \
+                         session start; `temporal status` reports the reachable range; \
+                         `temporal judge` judges every pending witness)\n";
     let (rest, trim) = super::control_query::split_trim_tail(rest);
     let pending = || {
         let spine = ctx
@@ -5033,8 +5155,8 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
         return format!(
             "OK enabled={enabled} latest_tick={} reachable_from={reachable_from} keyframes={} \
              live_events={} dropped_events={} lost_resizes={} dropped_input={} \
-             dropped_replies={} pending_resizes={} witnessed={} diverged={} pool_used={} \
-             pool_limit={}{}{}\n",
+             dropped_replies={} pending_resizes={} witnessed={} diverged={} pending={} \
+             unjudged_evicted={} pool_used={} pool_limit={}{}{}\n",
             rec.latest_tick().0,
             rec.keyframe_count(),
             rec.live_events(),
@@ -5045,10 +5167,23 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
             if enabled { pending } else { 0 },
             rec.witnessed(),
             rec.diverged(),
+            rec.pending(),
+            rec.unjudged_evicted(),
             crate::temporal::pool().used(),
             crate::temporal::pool().limit(),
             rec.status_tail(),
             rec.writer_status(),
+        );
+    }
+    if rest == "judge" {
+        if trim {
+            return USAGE.to_string();
+        }
+        let _consumer = crate::temporal::consumer_demand();
+        let counts = crate::temporal::judge_all(&ctx.temporal);
+        return format!(
+            "OK judged={} diverged={} pending={} unjudged_evicted={}\n",
+            counts.judged, counts.diverged, counts.pending, counts.unjudged_evicted
         );
     }
     let at = match rest {
@@ -5428,8 +5563,12 @@ pub(crate) fn cmd_raise(
     }
 }
 
-/// `exits [<n>] [since=<id>]` -> the instance's exit ledger, oldest-first, framed `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n> reason=<…> exit_code=<n|-> by=<sid|human|ctl|bridge|harness|->` line per session that left the registry — the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps rows with id strictly greater) over the closed-session index, whose slots are linked in the write that records the roster's `Exited` row, in its seq order (the row id); bounded by the index's last 512 closes.
-pub(crate) fn cmd_exits(store: &Store, rest: &str) -> String {
+/// `exits [<n>] [since=<id>]` -> the instance's exit ledger, oldest-first, framed `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n> reason=<…> exit_code=<n|-> by=<sid|human|ctl|bridge|harness|-> left=<n|->` line per session that left the registry — the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps rows with id strictly greater) over the closed-session index, whose slots are linked in the write that records the roster's `Exited` row, in its seq order (the row id); bounded by the index's last 512 closes. `left=` is what the leftover view's record of that close (`closed`, [`exits_closed`]) says the tab left running that `end` takes, and `-` where the view keeps no record of it.
+pub(crate) fn cmd_exits(
+    store: &Store,
+    rest: &str,
+    closed: &[aterm_vitals::left::ClosedTab],
+) -> String {
     let page = match RingPage::parse(rest, "exits") {
         Ok(page) => page,
         Err(usage) => return usage,
@@ -5438,10 +5577,23 @@ pub(crate) fn cmd_exits(store: &Store, rest: &str) -> String {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         page.copy(g.closed_logs().exits_since(page.since.unwrap_or(0)))
     };
-    exits_reply(&rows)
+    exits_reply(&rows, closed)
 }
 
-fn exits_reply(rows: &[crate::session_log::ClosedExit]) -> String {
+/// The closed tabs the newest held leftover view keeps a record of (in memory, no read):
+/// `exits`' `left=`.
+pub(crate) fn exits_closed() -> Vec<aterm_vitals::left::ClosedTab> {
+    crate::sys_host::SYS
+        .held_now()
+        .and_then(|held| held.snap.left.clone())
+        .map(|view| view.closed.clone())
+        .unwrap_or_default()
+}
+
+fn exits_reply(
+    rows: &[crate::session_log::ClosedExit],
+    closed: &[aterm_vitals::left::ClosedTab],
+) -> String {
     use std::fmt::Write as _;
     #[cfg(test)]
     crate::session_log::encode_probe();
@@ -5452,9 +5604,14 @@ fn exits_reply(rows: &[crate::session_log::ClosedExit]) -> String {
         let exit_code = r
             .exit_code
             .map_or_else(|| "-".to_string(), |c| c.to_string());
+        let left = closed
+            .iter()
+            .rev()
+            .find(|t| t.sid == r.sid.as_str())
+            .map_or_else(|| "-".to_string(), |t| t.left.to_string());
         let _ = writeln!(
             out,
-            "exit {} t={} sid={} local={} reason={} exit_code={exit_code} by={}",
+            "exit {} t={} sid={} local={} reason={} exit_code={exit_code} by={} left={left}",
             r.seq,
             r.t_ms,
             r.sid.as_str(),
@@ -5466,15 +5623,46 @@ fn exits_reply(rows: &[crate::session_log::ClosedExit]) -> String {
     out
 }
 
-/// The exit ledger's `by=` for a control-socket `close`: the caller's own sid when the connection carries one.
-pub(crate) fn caller_actor(scope: Scope, target: &SessionCtx) -> ExitActor {
-    caller_actor_of(scope, Some(target))
+/// The exit ledger's `by=` for a control-socket `close`: [`caller_actor_of`] with its session.
+pub(crate) fn caller_actor(scope: Scope, target: &SessionCtx, store: &Store) -> ExitActor {
+    caller_actor_of(scope, Some(target), store)
 }
 
-/// [`caller_actor`] for a request that may have no resolved session (the App lane's `tab` and `invoke`).
-pub(crate) fn caller_actor_of(scope: Scope, target: Option<&SessionCtx>) -> ExitActor {
+/// WHO ASKS on this connection, as the exit ledger and the tab marks name an act's actor (a
+/// close's, a spawn's, a `tab` or `invoke` gesture's): a drive from another Mac its host
+/// (`fleet:<host>`); aterm's own harness token `harness`; an owner-token client run from a tab
+/// that tab's session, found by the connection's peer process and its ancestors
+/// ([`owner_tab_sid`]), which is how a manager running `aterm ctl` in its own tab is named; the
+/// fabric bridge `bridge`; an edge-scoped caller its own sid by `target`'s grant table; `ctl`
+/// for an owner-token client in no tab, and unknown otherwise.
+pub(crate) fn caller_actor_of(
+    scope: Scope,
+    target: Option<&SessionCtx>,
+    store: &Store,
+) -> ExitActor {
+    caller_actor_as(scope, target, store, || {
+        crate::typed_by::Who::client(crate::control::serving_peer_pid())
+    })
+}
+
+/// [`caller_actor_of`], `client` naming the owner-token connection's process (read only for
+/// such a connection): the connection's peer, or a test's process and lineage.
+pub(crate) fn caller_actor_as(
+    scope: Scope,
+    target: Option<&SessionCtx>,
+    store: &Store,
+    client: impl FnOnce() -> crate::typed_by::Who,
+) -> ExitActor {
+    if let Some(driver) = crate::fabric::serving_driver() {
+        return ExitActor::fleet(&driver.host);
+    }
     match scope {
-        Scope::Owner => ExitActor::Ctl,
+        Scope::Owner => match crate::control::serving_principal() {
+            crate::control::Principal::Harness => ExitActor::Harness,
+            crate::control::Principal::Instance => {
+                owner_tab_sid(&client(), store).map_or(ExitActor::Ctl, ExitActor::Sid)
+            }
+        },
         #[cfg(any(unix, test))]
         Scope::Bridge => ExitActor::Bridge,
         Scope::Edge(presented) => target
@@ -5492,7 +5680,27 @@ pub(crate) fn caller_actor_of(scope: Scope, target: Option<&SessionCtx>) -> Exit
     }
 }
 
-/// The turn ledger's `by=` for a `turn` from this connection ([`TurnIo::by`]), from the scope and the driver the dispatch already resolved from it (an edge's source in the target's table, `crate::control::turn_driver`): the caller the exits ledger would name ([`caller_actor`]), so the two ledgers attribute a connection in the same words — `ctl` for an owner-token client, `bridge` for the fabric bridge, an edge-scoped caller's own sid, `-` for an edge whose grant is not in the target's table.
+/// The sid of the live session whose shell is `who`'s process or an ancestor of it
+/// (`crate::typed_by::tab_session_of`), over the sessions `store` registers now.
+pub(crate) fn owner_tab_sid(who: &crate::typed_by::Who, store: &Store) -> Option<String> {
+    let shells: Vec<(u64, i32, String)> = store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .live_handles()
+        .map(|h| (h.local_id, h.shell_identity.pid, h.sid.as_str().to_string()))
+        .collect();
+    let pids: Vec<(u64, i32)> = shells
+        .iter()
+        .map(|(local, pid, _)| (*local, *pid))
+        .collect();
+    let local = crate::typed_by::tab_session_of(who, &pids)?;
+    shells
+        .into_iter()
+        .find(|(of, ..)| *of == local)
+        .map(|(.., sid)| sid)
+}
+
+/// The turn ledger's `by=` for a `turn` from this connection ([`TurnIo::by`]), from the scope and the driver the dispatch already resolved from it (an edge's source in the target's table, `crate::control::turn_driver`): `ctl` for an owner-token client, `bridge` for the fabric bridge, an edge-scoped caller's own sid, `-` for an edge whose grant is not in the target's table. The exits ledger ([`caller_actor`]) names an edge, the bridge and an owner client in no tab in these same words; it names further what this ledger leaves `ctl` (an owner client run from a tab, as that tab's session; aterm's harness token; a fleet drive), which the turn ledger's readers ([`typed_by`]) name their own way.
 pub(crate) fn turn_by(scope: Scope, driver: Option<&SessionId>) -> TurnBy {
     match scope {
         Scope::Owner => TurnBy::Ctl,
@@ -5821,7 +6029,7 @@ mod tests {
         let replies = [
             cmd_history(&h.ctx, ""),
             cmd_timeline(&h.ctx, ""),
-            cmd_exits(&store, ""),
+            cmd_exits(&store, "", &[]),
         ];
         let probes = std::mem::take(&mut *held.lock().unwrap());
         for reply in &replies {
@@ -5848,7 +6056,7 @@ mod tests {
             },
             {
                 let g = store.read().unwrap();
-                exits_reply(&all.copy(g.closed_logs().exits_since(0)))
+                exits_reply(&all.copy(g.closed_logs().exits_since(0)), &[])
             },
         ];
         let probes = std::mem::take(&mut *held.lock().unwrap());
@@ -6034,7 +6242,7 @@ mod tests {
             )),
             byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
             turns: observed.turns,
-            meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+            meta: Arc::default(),
             timeline: observed.timeline,
             fabric: std::sync::Arc::default(),
             idem: Default::default(),
@@ -6056,6 +6264,7 @@ mod tests {
             witness: Default::default(),
             fenced_writes: Default::default(),
             native_policy: Default::default(),
+            spawn_mark: Default::default(),
         });
         SessionHandle {
             sid,
@@ -7724,7 +7933,7 @@ mod tests {
             )),
             byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
             turns: observed.turns,
-            meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+            meta: Arc::default(),
             timeline: observed.timeline,
             fabric: std::sync::Arc::default(),
             idem: Default::default(),
@@ -7746,6 +7955,7 @@ mod tests {
             witness: Default::default(),
             fenced_writes: Default::default(),
             native_policy: Default::default(),
+            spawn_mark: Default::default(),
         }
     }
 
@@ -7764,7 +7974,7 @@ mod tests {
         {
             let mut rec = ctx.temporal.lock().unwrap();
             rec.record_keyframe(base);
-            rec.spine_watermark().seed(at);
+            rec.seed_spine(at);
             rec.record_raw_in(input);
         }
 
@@ -7850,7 +8060,7 @@ mod tests {
         assert_eq!(held.take(), Some(true), "the probe sees a held recorder");
     }
 
-    /// `temporal status` counts the live witnesses a `temporal` fold judged: a recorded session's all match; replayed on the live clock one diverges and the next slice records a live keyframe.
+    /// `temporal status` counts the live witnesses a `temporal` fold or `temporal judge` judged and those still pending: a recorded session's all match; replayed on the live clock one diverges and the next slice records a live keyframe.
     #[test]
     fn temporal_status_counts_the_witnesses_a_replay_judged() {
         use crate::temporal::{InputSlice, SpineMark, SpinePre};
@@ -7861,14 +8071,14 @@ mod tests {
                 .find_map(|kv| kv.strip_prefix(key))
                 .map(str::to_owned)
         };
-        for live_clock in [false, true] {
+        for (live_clock, judge) in [(false, false), (true, false), (false, true), (true, true)] {
             let ctx = temporal_ctx();
             let live = Mutex::new(aterm_core::terminal::Terminal::new(6, 30));
             let watermark = {
                 let t = term_lock(&live);
                 let mut rec = ctx.temporal.lock().unwrap();
                 rec.record_keyframe(t.checkpoint());
-                rec.spine_watermark().seed(SpinePre::take(&t));
+                rec.seed_spine(SpinePre::take(&t));
                 rec.spine_watermark()
             };
             let (tx, rx) = crate::temporal::queue(64);
@@ -7887,20 +8097,37 @@ mod tests {
                 }
                 let mut rec = ctx.temporal.lock().unwrap();
                 while let Some(msg) = rx.try_recv() {
-                    rec.apply_inline(msg);
+                    rec.apply(msg);
                 }
             };
             hold(b"\x1b[?2026hframe", 0);
             hold(b"\r\none", 1500);
             let status = cmd_temporal(&ctx, &live, "status");
             assert_eq!(key(&status, "witnessed=").as_deref(), Some("0"), "{status}");
+            assert_eq!(key(&status, "pending=").as_deref(), Some("1"), "{status}");
             let _clock = live_clock.then(crate::temporal::replay_clock::on_live_clock);
-            assert!(cmd_temporal(&ctx, &live, "").starts_with("OK "));
+            if judge {
+                assert_eq!(
+                    cmd_temporal(&ctx, &live, "judge"),
+                    format!(
+                        "OK judged=1 diverged={} pending=0 unjudged_evicted=0\n",
+                        u8::from(live_clock)
+                    )
+                );
+            } else {
+                assert!(cmd_temporal(&ctx, &live, "").starts_with("OK "));
+            }
             let status = cmd_temporal(&ctx, &live, "status");
             assert_eq!(key(&status, "witnessed=").as_deref(), Some("1"), "{status}");
             assert_eq!(
                 key(&status, "diverged=").as_deref(),
                 Some(if live_clock { "1" } else { "0" }),
+                "{status}"
+            );
+            assert_eq!(key(&status, "pending=").as_deref(), Some("0"), "{status}");
+            assert_eq!(
+                key(&status, "unjudged_evicted=").as_deref(),
+                Some("0"),
                 "{status}"
             );
             hold(b"\r\ntwo", 1600);
@@ -7911,6 +8138,69 @@ mod tests {
                 "a mismatch takes a live keyframe: {status}"
             );
         }
+    }
+
+    /// `temporal judge` judges the pending witnesses of every kept chain, the closed ones and the newest alike, and `temporal status` agrees; with nothing left pending it judges none, and `trim` is no form of it.
+    #[test]
+    fn temporal_judge_verb_judges_every_kept_chain() {
+        use crate::temporal::{InputSlice, TemporalMsg, keyframe_of};
+        use aterm_core::terminal::ClockReading;
+        let key = |status: &str, key: &str| {
+            status
+                .split_whitespace()
+                .find_map(|kv| kv.strip_prefix(key))
+                .map(str::to_owned)
+        };
+        let ctx = temporal_ctx();
+        let live = Mutex::new(aterm_core::terminal::Terminal::new(6, 30));
+        {
+            let mut t = term_lock(&live);
+            let mut rec = ctx.temporal.lock().unwrap();
+            rec.record_keyframe(t.checkpoint());
+            for chain in 0..3 {
+                if chain > 0 {
+                    rec.record_keyframe(keyframe_of(&t, usize::MAX).expect("keyable"));
+                }
+                for n in 0..2 {
+                    let bytes = format!("chain {chain} line {n}\r\n");
+                    let clock = ClockReading::now();
+                    t.process_at(bytes.as_bytes(), clock);
+                    rec.apply(TemporalMsg::RawIn(InputSlice::at(bytes.as_bytes(), clock)));
+                    let seen = t.checkpoint_visible().expect("visible");
+                    rec.apply(TemporalMsg::Witness(Arc::new(seen)));
+                }
+            }
+        }
+        let status = cmd_temporal(&ctx, &live, "status");
+        for (field, want) in [("keyframes=", "3"), ("witnessed=", "0"), ("pending=", "6")] {
+            assert_eq!(
+                key(&status, field).as_deref(),
+                Some(want),
+                "fixture: {status}"
+            );
+        }
+        assert_eq!(
+            cmd_temporal(&ctx, &live, "judge"),
+            "OK judged=6 diverged=0 pending=0 unjudged_evicted=0\n"
+        );
+        let status = cmd_temporal(&ctx, &live, "status");
+        for (field, want) in [
+            ("witnessed=", "6"),
+            ("diverged=", "0"),
+            ("pending=", "0"),
+            ("unjudged_evicted=", "0"),
+        ] {
+            assert_eq!(key(&status, field).as_deref(), Some(want), "{status}");
+        }
+        assert_eq!(
+            cmd_temporal(&ctx, &live, "judge"),
+            "OK judged=0 diverged=0 pending=0 unjudged_evicted=0\n",
+            "nothing is left to judge"
+        );
+        assert!(
+            cmd_temporal(&ctx, &live, "judge trim").starts_with("ERR usage: temporal"),
+            "judge takes no trim"
+        );
     }
 
     #[test]
@@ -7940,14 +8230,14 @@ mod tests {
         let watermark = {
             let mut rec = ctx.temporal.lock().unwrap();
             rec.record_keyframe(base);
-            rec.spine_watermark().seed(at);
+            rec.seed_spine(at);
             rec.spine_watermark()
         };
         let (tx, rx) = crate::temporal::queue(1);
         let drain = || {
             let mut rec = ctx.temporal.lock().unwrap();
             while let Some(msg) = rx.try_recv() {
-                rec.apply_inline(msg);
+                rec.apply(msg);
             }
         };
         let mut mark = SpineMark::attach(watermark);
@@ -8008,7 +8298,7 @@ mod tests {
         let watermark = {
             let mut rec = ctx.temporal.lock().unwrap();
             rec.record_keyframe(base);
-            rec.spine_watermark().seed(at);
+            rec.seed_spine(at);
             rec.spine_watermark()
         };
         let (tx, rx) = crate::temporal::queue(64);
@@ -8023,7 +8313,7 @@ mod tests {
             }
             let mut rec = ctx.temporal.lock().unwrap();
             while let Some(msg) = rx.try_recv() {
-                rec.apply_inline(msg);
+                rec.apply(msg);
             }
         };
         let mut frame = String::from("\x1b[?1049h\x1b[2J");
@@ -8370,12 +8660,16 @@ mod exits_tests {
     #[test]
     fn no_exits_is_ok_zero() {
         let store = new_store();
-        assert_eq!(cmd_exits(&store, ""), "OK 0\n");
+        assert_eq!(cmd_exits(&store, "", &[]), "OK 0\n");
         store
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .register(test_handle(1));
-        assert_eq!(cmd_exits(&store, ""), "OK 0\n", "a birth is not an exit");
+        assert_eq!(
+            cmd_exits(&store, "", &[]),
+            "OK 0\n",
+            "a birth is not an exit"
+        );
     }
 
     #[test]
@@ -8400,7 +8694,7 @@ mod exits_tests {
                 g.deregister_local_as(local, *reason, actor);
             }
         }
-        let reply = cmd_exits(&store, "");
+        let reply = cmd_exits(&store, "", &[]);
         let lines: Vec<&str> = reply.lines().collect();
         assert_eq!(lines[0], format!("OK {}", ExitReason::ALL.len()));
         let ledger: Vec<(u64, u64)> = {
@@ -8425,7 +8719,7 @@ mod exits_tests {
             assert_eq!(
                 lines[i + 1],
                 format!(
-                    "exit {seq} t={t} sid={} local={} reason={} exit_code={code} by={by}",
+                    "exit {seq} t={t} sid={} local={} reason={} exit_code={code} by={by} left=-",
                     sids[i],
                     i + 10,
                     reason.as_str()
@@ -8460,7 +8754,7 @@ mod exits_tests {
                         .exit_code
                         .map_or_else(|| "-".to_string(), |c| c.to_string());
                     format!(
-                        "exit {} t={} sid={} local={} reason={} exit_code={exit_code} by={}",
+                        "exit {} t={} sid={} local={} reason={} exit_code={exit_code} by={} left=-",
                         r.seq,
                         r.t_ms,
                         r.sid.as_str(),
@@ -8482,12 +8776,12 @@ mod exits_tests {
         };
         let exited = 4;
         take_ring_rows_formatted();
-        assert_eq!(cmd_exits(&store, ""), oracle(0, 0));
+        assert_eq!(cmd_exits(&store, "", &[]), oracle(0, 0));
         assert_eq!(take_ring_rows_formatted(), exited, "negative control");
         for n in [1, 2, exited - 1, exited, exited + 1] {
             for since in [0, 3, 6, 12, u64::MAX] {
                 let args = format!("{n} since={since}");
-                let reply = cmd_exits(&store, &args);
+                let reply = cmd_exits(&store, &args, &[]);
                 assert_eq!(reply, oracle(since, n), "{args}");
                 assert_eq!(
                     take_ring_rows_formatted(),
@@ -8508,34 +8802,95 @@ mod exits_tests {
                 g.deregister_local_as(local, ExitReason::UiClose, ExitActor::Human);
             }
         }
-        let all = cmd_exits(&store, "");
+        let all = cmd_exits(&store, "", &[]);
         let ids: Vec<u64> = all
             .lines()
             .skip(1)
             .map(|l| l.split(' ').nth(1).unwrap().parse().unwrap())
             .collect();
         assert_eq!(ids.len(), 3);
-        let last = cmd_exits(&store, "1");
+        let last = cmd_exits(&store, "1", &[]);
         assert!(last.starts_with("OK 1\n"), "{last:?}");
         assert!(last.contains(&format!("exit {} ", ids[2])), "{last:?}");
-        let newer = cmd_exits(&store, &format!("since={}", ids[1]));
+        let newer = cmd_exits(&store, &format!("since={}", ids[1]), &[]);
         assert!(newer.starts_with("OK 1\n"), "{newer:?}");
         assert!(newer.contains(&format!("exit {} ", ids[2])), "{newer:?}");
-        assert_eq!(cmd_exits(&store, &format!("since={}", ids[2])), "OK 0\n");
-        let both = cmd_exits(&store, &format!("5 since={}", ids[0]));
-        assert!(both.starts_with("OK 2\n"), "{both:?}");
-        assert_eq!(cmd_exits(&store, "3 1"), last);
         assert_eq!(
-            cmd_exits(&store, &format!("since=0 since={}", ids[1])),
+            cmd_exits(&store, &format!("since={}", ids[2]), &[]),
+            "OK 0\n"
+        );
+        let both = cmd_exits(&store, &format!("5 since={}", ids[0]), &[]);
+        assert!(both.starts_with("OK 2\n"), "{both:?}");
+        assert_eq!(cmd_exits(&store, "3 1", &[]), last);
+        assert_eq!(
+            cmd_exits(&store, &format!("since=0 since={}", ids[1]), &[]),
             newer
         );
         for bad in ["bogus", "since=x", "since=", "1 extra", "-1"] {
             assert_eq!(
-                cmd_exits(&store, bad),
+                cmd_exits(&store, bad, &[]),
                 "ERR usage: exits [<n>] [since=<id>]\n",
                 "{bad:?}"
             );
         }
+    }
+
+    /// The leftover view's record of a tab's close, as its last reading counted what that tab
+    /// left running that `end` takes.
+    fn closed(sid: &str, left: usize) -> aterm_vitals::left::ClosedTab {
+        aterm_vitals::left::ClosedTab {
+            key: 1,
+            sid: sid.to_owned(),
+            shell_uniqueid: 1_000,
+            horizon: 2_000,
+            left,
+            ..aterm_vitals::left::ClosedTab::default()
+        }
+    }
+
+    /// AN EXIT THAT LEFT TWO PROCESSES READS `left=2`: the row joins its session to the view's
+    /// record of that close, the newest when the view holds two (a sid is never reused, so two
+    /// are one close's), and reads no table.
+    #[test]
+    fn an_exit_that_left_two_processes_reads_left_2() {
+        let store = new_store();
+        let sid = {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            let h = test_handle(1);
+            let sid = h.sid.as_str().to_string();
+            g.register(h);
+            g.deregister_local_as(1, ExitReason::UiClose, ExitActor::Human);
+            sid
+        };
+        let reply = cmd_exits(&store, "", &[closed(&sid, 5), closed(&sid, 2)]);
+        let row = reply.lines().nth(1).expect("one exit row");
+        assert!(row.ends_with(" by=human left=2"), "{row}");
+    }
+
+    /// AN EXIT WITH NO RECORD READS `left=-`: a tab closed before its shell was read, or one the
+    /// view has dropped, is not a tab that left nothing. NEGATIVE CONTROL: default a missing
+    /// record to 0, and this row reads `left=0`.
+    #[test]
+    fn an_exit_with_no_record_reads_left_dash() {
+        let store = new_store();
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            for local in 1..=2 {
+                g.register(test_handle(local));
+                g.deregister_local_as(local, ExitReason::UiClose, ExitActor::Human);
+            }
+        }
+        let reply = cmd_exits(&store, "", &[closed("s-another", 3)]);
+        let rows: Vec<&str> = reply.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2, "{reply}");
+        for row in rows {
+            assert!(row.ends_with(" left=-"), "{row}");
+        }
+        let empty = closed("s-another", 0);
+        assert_eq!(
+            super::exits_reply(&[], std::slice::from_ref(&empty)),
+            "OK 0\n"
+        );
     }
 
     #[test]
@@ -8558,7 +8913,7 @@ mod exits_tests {
                 Op::WriteInput,
                 target.ctx.nonce,
             );
-        let by = caller_actor(Scope::Edge(tok), &target.ctx);
+        let by = caller_actor(Scope::Edge(tok), &target.ctx, &store);
         assert_eq!(by, ExitActor::Sid(caller_sid.clone()));
         assert_ne!(
             by.as_wire(),
@@ -8566,28 +8921,34 @@ mod exits_tests {
             "the closer is the token's source session, not the session being closed"
         );
         assert_eq!(
-            caller_actor(Scope::Owner, &target.ctx),
+            caller_actor(Scope::Owner, &target.ctx, &store),
             ExitActor::Ctl,
             "an owner-token connection carries no session identity, so the row \
              names the kind of client"
         );
         assert_eq!(ExitActor::Ctl.as_wire(), "ctl");
         assert_eq!(
-            caller_actor(Scope::Bridge, &target.ctx),
+            caller_actor(Scope::Bridge, &target.ctx, &store),
             ExitActor::Bridge,
             "the bridge is a connection with no sid, named apart from a local client"
         );
         assert_eq!(ExitActor::Bridge.as_wire(), "bridge");
         assert_eq!(
-            caller_actor(Scope::Edge(EdgeToken::generate()), &target.ctx),
+            caller_actor(Scope::Edge(EdgeToken::generate()), &target.ctx, &store),
             ExitActor::Unknown,
             "a token the target's table never issued names nobody"
         );
-        assert_eq!(caller_actor_of(Scope::Owner, None), ExitActor::Ctl);
-        assert_eq!(caller_actor_of(Scope::Bridge, None), ExitActor::Bridge);
-        assert_eq!(caller_actor_of(Scope::Edge(tok), None), ExitActor::Unknown);
+        assert_eq!(caller_actor_of(Scope::Owner, None, &store), ExitActor::Ctl);
         assert_eq!(
-            caller_actor_of(Scope::Edge(tok), Some(&target.ctx)),
+            caller_actor_of(Scope::Bridge, None, &store),
+            ExitActor::Bridge
+        );
+        assert_eq!(
+            caller_actor_of(Scope::Edge(tok), None, &store),
+            ExitActor::Unknown
+        );
+        assert_eq!(
+            caller_actor_of(Scope::Edge(tok), Some(&target.ctx), &store),
             ExitActor::Sid(caller_sid.clone())
         );
         {
@@ -8596,19 +8957,27 @@ mod exits_tests {
             g.register(target);
             g.deregister_local_as(2, ExitReason::CtlClose, by);
         }
-        let reply = cmd_exits(&store, "");
+        let reply = cmd_exits(&store, "", &[]);
         let row = reply.lines().nth(1).expect("one exit row");
         assert!(row.contains(&format!(" sid={target_sid} ")), "{row}");
         assert!(
-            row.ends_with(&format!(" reason=ctl-close exit_code=- by={caller_sid}")),
+            row.ends_with(&format!(
+                " reason=ctl-close exit_code=- by={caller_sid} left=-"
+            )),
             "{row}"
         );
     }
 
+    /// THE TURN LEDGER NAMES A CALLER AS THE EXITS DO, but for an owner client run from a tab:
+    /// the exits name that tab's session, the turns `ctl` (their readers name the process their
+    /// own way, `typed_by`), and only the harness's hand makes a turn the harness's.
     #[test]
     fn a_turns_by_is_the_callers_and_only_the_harness_hand_makes_it_harness() {
+        let store = new_store();
         let caller = test_handle(1);
-        let target = test_handle(2);
+        let mut target = test_handle(2);
+        target.shell_identity.pid = 6999;
+        let target_sid = target.sid.as_str().to_string();
         let caller_sid = caller.sid.as_str().to_string();
         let tok = target
             .ctx
@@ -8624,12 +8993,12 @@ mod exits_tests {
         let by = |scope: Scope| {
             let driver = crate::control::turn_driver(scope, &target.ctx);
             let by = turn_by(scope, driver.as_ref());
-            let named = match caller_actor(scope, &target.ctx) {
+            let named = match caller_actor_of(scope, Some(&target.ctx), &store) {
                 ExitActor::Sid(sid) => TurnBy::Sid(sid),
                 ExitActor::Ctl => TurnBy::Ctl,
                 ExitActor::Bridge => TurnBy::Bridge,
                 ExitActor::Harness => TurnBy::Harness,
-                ExitActor::Human | ExitActor::Unknown => TurnBy::Unknown,
+                ExitActor::Human | ExitActor::Fleet(_) | ExitActor::Unknown => TurnBy::Unknown,
             };
             assert_eq!(by, named, "{scope:?}");
             by
@@ -8641,6 +9010,43 @@ mod exits_tests {
             by(Scope::Edge(EdgeToken::generate())),
             TurnBy::Unknown,
             "a token the target's table never issued names nobody"
+        );
+        let ctx = std::sync::Arc::clone(&target.ctx);
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(target);
+        let in_tab = || {
+            crate::typed_by::Who::client_with(
+                Some(7001),
+                1,
+                &|pid| match pid {
+                    7001 => Some(6999),
+                    _ => None,
+                },
+                &|_| None,
+                &|_| Some("aterm".to_string()),
+            )
+        };
+        assert_eq!(
+            super::caller_actor_as(Scope::Owner, Some(&ctx), &store, in_tab),
+            ExitActor::Sid(target_sid),
+            "the exits name an owner client run from a tab by that tab's session"
+        );
+        assert_eq!(
+            turn_by(
+                Scope::Owner,
+                crate::control::turn_driver(Scope::Owner, &ctx).as_ref()
+            ),
+            TurnBy::Ctl,
+            "the turns name it the owner token's client"
+        );
+        let elsewhere =
+            || crate::typed_by::Who::client_with(Some(8001), 1, &|_| None, &|_| None, &|_| None);
+        assert_eq!(
+            super::caller_actor_as(Scope::Owner, Some(&ctx), &store, elsewhere),
+            ExitActor::Ctl,
+            "CONTROL: a client in no tab is `ctl` in both"
         );
 
         let drive = |holder: &str| crate::Lease::Drive {
@@ -8796,7 +9202,7 @@ mod update_anchor_tests {
             .write()
             .unwrap()
             .deregister_local_as(1, ExitReason::ShellExit, ExitActor::Human);
-        let page = cmd_exits(&successor, "since=4");
+        let page = cmd_exits(&successor, "since=4", &[]);
         assert!(page.starts_with("OK 1\n"), "{page}");
         assert!(page.contains("reason=shell-exit"), "{page}");
         let old = SessionHandoff::from_toml(

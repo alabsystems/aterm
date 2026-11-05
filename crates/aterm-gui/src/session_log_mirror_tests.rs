@@ -1615,3 +1615,99 @@ fn a_mail_count_the_rate_holds_back_says_when_it_is_due() {
         assert_eq!(snap.f.get_u(Key::MailIn), Some(2), "{reply}");
     });
 }
+
+/// The sessions a take's header names as held back (`held=`), in its order.
+fn held_of(reply: &str) -> Vec<String> {
+    let (header, _) = reply.split_once('\n').expect("a header line");
+    header
+        .split(' ')
+        .find_map(|t| t.strip_prefix("held="))
+        .map(|sids| sids.split(',').map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// **THE RATE HOLD IS EACH SESSION'S OWN, AND THE TAKE NAMES WHOSE IT IS** (critic item E04c's
+/// review): with one session's mail count held back to its rate, a mail delivered to another
+/// session, whose count last crossed more than a second ago (here never), is in the next take
+/// as its snapshot at once. The header still says the first session's `due=`, and its `held=`
+/// names that session alone, so the bridge can tell a wake the hold covers from one it does not.
+#[test]
+fn the_rate_hold_is_each_sessions_own_and_the_take_names_it() {
+    crate::fabric::with_link_reset(|| {
+        let generation = mirroring();
+        let store = crate::session_store::new_store();
+        let a = session(&store, 1);
+        let b = session(&store, 2);
+        a.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .slog_mut()
+            .set_clock(crate::session_log::Clock::reading(|| {
+                aterm_slog::Stamp::new(1_760_000_001_000, 1_000)
+            }));
+        let take = |what: &str| {
+            let reply = cmd_log_take(&store, "", Some(generation));
+            let (taken, more) = slots(&reply);
+            assert!(!more, "{what}: {reply}");
+            (taken, reply)
+        };
+        let deliver = |to: &crate::session_store::SessionHandle, off: u64| {
+            let line = format!(
+                "{} off={off} from=s-peer@n-lab kind=note trust=agent text=QZP6WORD",
+                to.sid.as_str()
+            );
+            assert!(crate::fabric::cmd_deliver(&store, &line).starts_with("OK "));
+        };
+        let (first, reply) = take("the first take");
+        assert!(held_of(&reply).is_empty(), "{reply}");
+        assert_eq!(
+            cmd_log_landed(&store, &landings(&first), Some(generation)),
+            "OK ok ok\n",
+            "PRECONDITION: both sessions' first takes landed"
+        );
+        deliver(&a, 7);
+        let (snap, reply) = take("a's first mail");
+        assert_eq!(snap.len(), 1, "PRECONDITION: a's snapshot: {reply}");
+        assert!(held_of(&reply).is_empty(), "{reply}");
+        let _ = cmd_log_landed(&store, &landings(&snap), Some(generation));
+        deliver(&a, 8);
+        let (none, reply) = take("a's second mail inside the second");
+        assert!(
+            none.is_empty(),
+            "PRECONDITION: a's count held back: {reply}"
+        );
+        assert_eq!(
+            (due_of(&reply), held_of(&reply)),
+            (
+                Some(aterm_slog::MAIL_SNAP_GAP_MS),
+                vec![a.sid.as_str().to_string()]
+            ),
+            "the hold's end, and whose it is: {reply}"
+        );
+        deliver(&b, 9);
+        let (taken, reply) = take("b's mail inside a's hold");
+        assert_eq!(
+            taken
+                .iter()
+                .map(|(sid, ..)| sid.as_str())
+                .collect::<Vec<_>>(),
+            [b.sid.as_str()],
+            "b's snapshot at once, a's still held: {reply}"
+        );
+        let snap = decode_bus(&taken[0].2).expect("decodes").rec;
+        assert_eq!(
+            (snap.op, snap.f.get_u(Key::MailIn)),
+            (aterm_slog::Op::Snap, Some(1)),
+            "{reply}"
+        );
+        assert_eq!(
+            (due_of(&reply), held_of(&reply)),
+            (
+                Some(aterm_slog::MAIL_SNAP_GAP_MS),
+                vec![a.sid.as_str().to_string()]
+            ),
+            "the hold names a alone: {reply}"
+        );
+    });
+}

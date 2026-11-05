@@ -196,6 +196,8 @@ pub(crate) struct SessionRow {
     pub need_alone: bool,
     /// Where its tab is (`in tab 3`, `in tab 3, left pane`; `App::session_place`), filled by the glance's first pass only where another row shares its label: every row that names the session says it after the label ([`Self::named`]).
     pub place: Option<String>,
+    /// The number of the person's last plain Enter in the tab (`HumanInputStamp::last_plain_enter`), `0` for none: the owner's turn, which lets a need he was told of be told again ([`Escalation::owner_turn`]). The menu never shows it, so a keypress moves no row.
+    pub owner_turn: u64,
 }
 
 impl SessionRow {
@@ -392,6 +394,60 @@ pub(crate) struct Escalation {
     /// The engine's sequence of the program's own `blocked` report a program-claim need stands
     /// on ([`crate::needs::Need::report`]): the box [`crate::box_banner`] keeps to one banner.
     pub report: Option<u64>,
+    /// Each need an ask stands for, by its own words ([`need_ids`]); empty for every other kind and for a fleet need, which keep one notice per transition.
+    pub needs: Vec<NeedId>,
+    /// The owner's turn in the tab as the row read it ([`SessionRow::owner_turn`]); `0` for a fleet need.
+    pub owner_turn: u64,
+}
+
+/// One need an escalation stands for ([`Escalation::needs`]): its id ([`crate::needs::need_id`] of its words, or an ask's key where the window has no words for it), how the window read it, and the banner that names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NeedId {
+    /// The need's identity: the same words are the same need, whatever frame, count or order they come in.
+    pub id: u64,
+    /// How the window read the need ([`NeedRead`]): what else names it in the told memory.
+    pub read: NeedRead,
+    /// The notification body that names it: `<tab title>: <its words> (+N more)`.
+    pub body: String,
+}
+
+/// HOW THE WINDOW READ A NEED (design §14.18.1): the needs entry carries a harness's first need cut to the entry's cells (`… needs you: <first, cut> (+N more)`), its told set carries every need whole, and a row reads the set where it has one and the entry alone where it has none (a seamless successor before its loop tells the set again, a self-claim that tells none). So a first need read whole and read cut from the same entry is one need, while two needs that share only the cut stay two when read whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NeedRead {
+    /// Read whole, where the entry carries it in the same words or never names it: its id alone names it.
+    Whole,
+    /// Read whole from a told set while the entry beside it carries it cut: the [`crate::needs::need_id`] of the entry's words, which a read of that entry alone names it by.
+    Cut(u64),
+    /// Read from the entry alone, whose words may be a cut: a need read whole beside an entry that cut it to these words is this need too.
+    Entry,
+}
+
+/// What telling a need read whole marks for the entry's cut of it ([`NeedRead::Cut`]): apart from every need id, so a read of the entry alone matches it ([`NeedRead::Entry`]) and another need read whole with the same cut does not.
+fn cut_mark(entry: u64) -> u64 {
+    let mut bytes = b"need-cut:".to_vec();
+    bytes.extend_from_slice(&entry.to_le_bytes());
+    aterm_hash::fnv1a_64(&bytes).max(1)
+}
+
+impl NeedId {
+    /// What telling this need marks ([`Told::mark`]): its id, and [`cut_mark`] of the entry's words where it was read whole beside an entry that cuts it.
+    fn marks(&self) -> impl Iterator<Item = u64> + use<> {
+        let cut = match self.read {
+            NeedRead::Cut(entry) => Some(cut_mark(entry)),
+            NeedRead::Whole | NeedRead::Entry => None,
+        };
+        std::iter::once(self.id).chain(cut)
+    }
+
+    /// Whether the marks `has` holds name this need: its id; read whole beside a cut, the cut's id a read of the entry alone marked; read from the entry alone, the [`cut_mark`] a whole read cut to these words left.
+    fn named_in(&self, has: impl Fn(u64) -> bool) -> bool {
+        has(self.id)
+            || match self.read {
+                NeedRead::Whole => false,
+                NeedRead::Cut(entry) => has(entry),
+                NeedRead::Entry => has(cut_mark(self.id)),
+            }
+    }
 }
 
 const ROW_TITLE_MAX: usize = 32;
@@ -420,6 +476,7 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
     let need = row.need.as_ref()?;
     let body = tab_body(&row.title, &body_words(need));
     let label = need_label(&row.title, None, &need.what);
+    let needs = need_ids(&row.title, need, &body);
     Some(Escalation {
         session: row.id,
         kind: EscalationKind::of(need.word),
@@ -429,7 +486,51 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
         body,
         headline: headline(need.word),
         report: need.report,
+        needs,
+        owner_turn: row.owner_turn,
     })
+}
+
+/// THE NEEDS AN ASK STANDS FOR, EACH BY ITS OWN WORDS (design §14.18): a harness's ask one per need it carries (its first, then its others, in the worker's order), each named by a body that leads with it, and its key besides where its entry counts needs no told set carries (`(+N more)` past the others: an entry read alone, or a self-claim past its told set's cap); any other ask its key alone, whose body is the escalation's. The first need is read from the entry alone where no told set came with it, else whole, beside the entry's cut of it where the entry's words differ ([`NeedRead`]); the others and the key are read whole. Every other word stands for none: its key is already one episode, and it keeps one notice per transition.
+fn need_ids(title: &str, need: &crate::needs::Need, body: &str) -> Vec<NeedId> {
+    if need.word != NeedWord::Ask {
+        return Vec::new();
+    }
+    let Some(ask) = &need.harness else {
+        return vec![NeedId {
+            id: need.key,
+            read: NeedRead::Whole,
+            body: body.to_string(),
+        }];
+    };
+    let more = ask.more_words();
+    let first_read = ask.entry_first.as_deref().map_or(NeedRead::Entry, |cut| {
+        let cut = crate::needs::need_id(cut);
+        if cut == crate::needs::need_id(&ask.first) {
+            NeedRead::Whole
+        } else {
+            NeedRead::Cut(cut)
+        }
+    });
+    let mut ids: Vec<NeedId> = std::iter::once((&ask.first, first_read))
+        .chain(ask.others.iter().map(|words| (words, NeedRead::Whole)))
+        .map(|(words, read)| NeedId {
+            id: crate::needs::need_id(words),
+            read,
+            body: tab_body(
+                title,
+                &format!("{}{more}", fold_clip(words, crate::needs::NEED_WHAT_MAX)),
+            ),
+        })
+        .collect();
+    if usize::from(ask.more) > ask.others.len() {
+        ids.push(NeedId {
+            id: need.key,
+            read: NeedRead::Whole,
+            body: body.to_string(),
+        });
+    }
+    ids
 }
 
 /// The shortest spacing between two notifications for one session: a flapping verdict costs one notification per floor, never one per flap.
@@ -462,11 +563,11 @@ pub(crate) struct HeraldOutcome {
     pub row_moved: bool,
     /// Post exactly this notification.
     pub notice: Option<HeraldNotice>,
-    /// This note met a new `(kind, key)`: not a re-read of the one shown, and not the timer re-heralding an owed notice ([`Herald::due`]).
+    /// This note met a new `(kind, key)`, or an ask under the same key carrying a need neither told nor noted last ([`Told`]): not a re-read of the one shown, and not the timer re-heralding an owed notice ([`Herald::due`]).
     pub transition: bool,
     /// The transitions awaiting a notice when this note decided, its own included: what a post pays (`aterm.log`'s `(+n-1 more)`), what [`HeraldQuiet::Limited`] still owes (`1` on the FIRST hold), what [`HeraldQuiet::Looking`] or [`HeraldQuiet::Disabled`] spent.
     pub owed: u32,
-    /// This quiet decision — [`HeraldQuiet::Looking`], [`HeraldQuiet::Disabled`], or [`HeraldQuiet::Limited`]'s FIRST hold (a transition leaving one notice owed) — is its session's first since the later of its last post and a [`NOTIFY_SESSION_FLOOR`] ago: the one `aterm.log` records at `info` ([`herald_log_line`]).
+    /// This quiet decision — [`HeraldQuiet::Looking`], [`HeraldQuiet::Disabled`], [`HeraldQuiet::ToldOnce`], or [`HeraldQuiet::Limited`]'s FIRST hold (a transition leaving one notice owed) — is its session's first since the later of its last post and a [`NOTIFY_SESSION_FLOOR`] ago: the one `aterm.log` records at `info` ([`herald_log_line`]).
     pub first_quiet: bool,
 }
 
@@ -493,6 +594,8 @@ pub(crate) enum HeraldQuiet {
     Disabled,
     /// [`NOTIFY_SESSION_FLOOR`] or [`NOTIFY_BURST`] held it back, or the notifier's queue refused this session's notice less than [`NOTIFY_RETRY`] ago (another session's refusal holds nothing here): it is owed, and posted (coalesced) when the limit allows ([`Herald::due`]).
     Limited,
+    /// Every need the transition stands for was told already ([`Told`]): the same need back, re-counted or re-ordered, or a set that lost a need. Decided before the look, the program's own notification and the setting, so it is the same with alerts off.
+    ToldOnce,
 }
 
 #[derive(Debug, Default)]
@@ -505,6 +608,72 @@ struct HeraldSlot {
     owed: u32,
     quiet_logged_at: Option<std::time::Instant>,
     notice_owner: Option<std::sync::Arc<()>>,
+    told: Told,
+}
+
+/// The most need ids one session's told memory keeps ([`Told`]); the oldest goes first, and its need can be told again.
+pub(crate) const TOLD_MAX: usize = 32;
+
+/// ONE SESSION'S TOLD-ONCE MEMORY (design §14.18): the ids ([`NeedId`]) of the asks its owner was told of — a notice queued, or spent on his look, the program's own notification or alerts off — since his last turn in the tab ([`Escalation::owner_turn`]) and the agent's last take-down (the escalation gone), with each told escalation's key. Process-local: an update carries only whether the standing need was told ([`StatusCarry::told`]), which marks that escalation's ids told in the successor, and the needs it counts without naming them once a read under its key names them ([`Herald::note_spent`]).
+#[derive(Debug, Default)]
+struct Told {
+    /// The owner's turn the memory is kept under.
+    turn: u64,
+    /// The ids told, oldest first, at most [`TOLD_MAX`].
+    ids: std::collections::VecDeque<u64>,
+    /// The marks ([`NeedId::marks`]) of the escalation noted last, told or not: a re-read under the same key brings news only with a need neither these nor the memory name ([`NeedId::named_in`]).
+    noted: Vec<u64>,
+    /// The ids the last notice marked new, which [`Herald::refused`] takes back.
+    posted: Vec<u64>,
+    /// The key of an adopted told escalation that counts needs it does not name (an entry read alone, [`Herald::note_spent`]): the outgoing process told the set standing under it, so the first read under that key that names every need it counts marks them told.
+    adopted: Option<u64>,
+}
+
+impl Told {
+    fn has(&self, id: u64) -> bool {
+        self.ids.contains(&id)
+    }
+
+    /// Whether this memory names `need` ([`NeedId::named_in`]).
+    fn names(&self, need: &NeedId) -> bool {
+        need.named_in(|id| self.has(id))
+    }
+
+    /// Mark `ids` told, returning those that were not.
+    fn mark(&mut self, ids: impl IntoIterator<Item = u64>) -> Vec<u64> {
+        let mut new = Vec::new();
+        for id in ids {
+            if self.has(id) {
+                continue;
+            }
+            if self.ids.len() == TOLD_MAX {
+                self.ids.pop_front();
+            }
+            self.ids.push_back(id);
+            new.push(id);
+        }
+        new
+    }
+
+    /// Forget every id told and an adoption's set still to name, keeping what was noted last: a re-read of it is still no transition.
+    fn forget(&mut self) {
+        self.ids.clear();
+        self.posted.clear();
+        self.adopted = None;
+    }
+}
+
+/// What a told escalation marks ([`Told::mark`]): each need it stands for ([`NeedId::marks`]), and its key.
+fn told_ids(esc: &Escalation) -> impl Iterator<Item = u64> + '_ {
+    esc.needs
+        .iter()
+        .flat_map(NeedId::marks)
+        .chain(std::iter::once(esc.key))
+}
+
+/// Whether `esc` counts needs it does not name: its key stands among its needs ([`need_ids`]).
+fn counts_unnamed(esc: &Escalation) -> bool {
+    esc.needs.iter().any(|need| need.id == esc.key)
 }
 
 impl HeraldSlot {
@@ -533,6 +702,9 @@ pub(crate) struct Herald {
     last_quiet: Option<HeraldQuiet>,
     since: std::collections::HashMap<u64, Since>,
     adopted: std::collections::HashMap<u64, Adopted>,
+    /// Test seam: the herald before told once, one notice per transition (the negative controls).
+    #[cfg(test)]
+    told_off: bool,
 }
 
 /// How long a seamless successor takes what its outgoing process had told the owner as already told ([`Herald::adopt`], and `App::herald_fleet`'s first fresh read): room for every standing need to be published again — the stall watch's re-detection (`input_backlog::STALL_AFTER`, stretched under load, then `input_stall::RECHECK`) and an issuer's first fleet read (`fleet_glance::POLL_EVERY` and its timeout).
@@ -699,7 +871,7 @@ impl Herald {
         moved
     }
 
-    /// A seamless update adopted `session` with what its outgoing process knew of it (`carry`, `SessionRecord::status_seen`), at `now_unix` / `now`: for [`ADOPT_SETTLE`], its first need published here takes the carried age when it is the carried word ([`Self::observe`]), and is no transition when it is the need the herald had told ([`Self::note_spent`]) — an update is no new need, and the owner was told once.
+    /// A seamless update adopted `session` with what its outgoing process knew of it (`carry`, `SessionRecord::status_seen`), at `now_unix` / `now`: for [`ADOPT_SETTLE`], its first need published here takes the carried age when it is the carried word ([`Self::observe`]), and is no transition when it is the need the herald had told ([`Self::note_spent`]), each need of it marked told (§14.18) — an update is no new need, and the owner was told once.
     pub(crate) fn adopt(
         &mut self,
         session: u64,
@@ -805,6 +977,62 @@ impl Herald {
             project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "HeraldToldOnce",
+            action = "ShowA",
+            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "HeraldToldOnce",
+            action = "ShowB",
+            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "HeraldToldOnce",
+            action = "ShowBoth",
+            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "HeraldToldOnce",
+            action = "Swap",
+            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "HeraldToldOnce",
+            action = "Displace",
+            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "HeraldToldOnce",
+            action = "Clear",
+            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "HeraldToldOnce",
+            action = "OwnerTurn",
+            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
+        )
+    )]
     pub(crate) fn note_spent(
         &mut self,
         session: u64,
@@ -830,6 +1058,8 @@ impl Herald {
         let Some(esc) = current else {
             slot.shown = None;
             slot.owed = 0;
+            // No need stands: the agent took it down, so one raised again is news (§14.18).
+            slot.told = Told::default();
             return HeraldOutcome {
                 row_moved,
                 ..HeraldOutcome::default()
@@ -843,10 +1073,64 @@ impl Herald {
             && told == esc.word
         {
             slot.shown = ident;
+            // The outgoing process told these needs: told here too (§14.18). Where this read
+            // counts needs it does not name, the set it told names them.
+            slot.told.turn = esc.owner_turn;
+            slot.told.mark(told_ids(esc));
+            slot.told.adopted = counts_unnamed(esc).then_some(esc.key);
         }
-        let transition = slot.shown != ident;
+        let mut transition = slot.shown != ident;
+        // TOLD ONCE (§14.18): an ask's needs are judged by their words. The owner's own turn
+        // forgets what he was told; a re-read under the same key that carries a need neither
+        // told nor noted last is a transition; a transition whose every need was told is none
+        // owed.
+        if slot.told.turn != esc.owner_turn {
+            slot.told.turn = esc.owner_turn;
+            slot.told.forget();
+        }
+        #[cfg(test)]
+        let telling = !esc.needs.is_empty() && !self.told_off;
+        #[cfg(not(test))]
+        let telling = !esc.needs.is_empty();
+        if let Some(key) = slot.told.adopted {
+            if key != esc.key {
+                slot.told.adopted = None;
+            } else if telling && !counts_unnamed(esc) {
+                // The adopted entry's set, named: what the outgoing process told.
+                slot.told.mark(told_ids(esc));
+                slot.told.adopted = None;
+            }
+        }
+        let mut news = None;
+        if telling {
+            let fresh = |need: &&NeedId| {
+                !slot.told.names(need) && !need.named_in(|id| slot.told.noted.contains(&id))
+            };
+            // The news a notice names: a need new to the slot first, then any not told.
+            news = esc
+                .needs
+                .iter()
+                .find(fresh)
+                .or_else(|| esc.needs.iter().find(|need| !slot.told.names(need)));
+            transition |= esc.needs.iter().any(|need| fresh(&need));
+        }
+        slot.told.noted = esc.needs.iter().flat_map(NeedId::marks).collect();
         if transition {
             slot.shown = ident;
+            if telling && news.is_none() {
+                slot.owed = 0;
+                slot.retry_at = None;
+                slot.told.mark(told_ids(esc));
+                let first_quiet = slot.first_quiet(now);
+                self.last_quiet = Some(HeraldQuiet::ToldOnce);
+                return HeraldOutcome {
+                    row_moved,
+                    notice: None,
+                    transition,
+                    owed: 0,
+                    first_quiet,
+                };
+            }
             slot.owed += 1;
         }
         let owed = slot.owed;
@@ -866,6 +1150,9 @@ impl Herald {
         if owed == 0 {
             // The same box re-read, and nothing owed for it.
             return quiet(self, HeraldQuiet::Same, false);
+        }
+        if telling && (spent.is_some() || !desktop_alerts) {
+            slot.told.mark(told_ids(esc));
         }
         if let Some(spent) = spent {
             slot.owed = 0;
@@ -901,6 +1188,11 @@ impl Herald {
         slot.notified_at = Some(now);
         slot.retry_at = None;
         slot.quiet_logged_at = None;
+        slot.told.posted = if telling {
+            slot.told.mark(told_ids(esc))
+        } else {
+            Vec::new()
+        };
         self.recent.push_back(now);
         let validity = crate::notify::NoticeValidity::new(
             slot.notice_owner
@@ -911,7 +1203,7 @@ impl Herald {
             notice: Some(HeraldNotice {
                 session,
                 title: esc.headline,
-                body: esc.body.clone(),
+                body: news.map_or_else(|| esc.body.clone(), |need| need.body.clone()),
                 validity,
                 decided: (),
             }),
@@ -928,6 +1220,9 @@ impl Herald {
         };
         slot.notice_owner = None;
         slot.retry_at = Some(now + NOTIFY_RETRY);
+        // What the refused notice marked told was never told: its retry names it again (§14.18).
+        let untold = std::mem::take(&mut slot.told.posted);
+        slot.told.ids.retain(|id| !untold.contains(id));
         let Some(posted) = slot.notified_at else {
             return;
         };
@@ -936,6 +1231,13 @@ impl Herald {
         }
         slot.notified_at = slot.notified_before.take();
         slot.owed += owed;
+    }
+
+    /// Desktop alerts just turned on: what the herald marked told while they were off was never posted, so every session's told memory goes (§14.18), keeping what each noted last, so nothing standing is replayed.
+    pub(crate) fn forget_told(&mut self) {
+        for slot in self.slots.values_mut() {
+            slot.told.forget();
+        }
     }
 
     /// Turning desktop alerts off cancels pending rate-limit and refusal retries, keeping the labels and transition keys the menu uses.
@@ -1066,6 +1368,7 @@ pub(crate) fn herald_log_line(
                 first,
                 "not queued: suppressed by desktop_alerts = false".to_string(),
             ),
+            HeraldQuiet::ToldOnce => (first, "not queued: told once".to_string()),
             HeraldQuiet::Limited if outcome.first_quiet => {
                 (Level::Info, "not queued: limited".to_string())
             }
@@ -1469,6 +1772,7 @@ fn report_tip(need: &NeedRow) -> Option<String> {
     let ask = need.harness.as_ref()?;
     Some(aterm_agent::supervise::mode_words::report_words(
         ask.program.product(),
+        ask.tail,
         need.alone,
     ))
 }
@@ -3942,6 +4246,14 @@ mod macos {
 #[cfg(test)]
 #[path = "desktop_alert_debt_conformance.rs"]
 mod desktop_alert_debt_conformance;
+
+#[cfg(test)]
+#[path = "herald_told_once_conformance.rs"]
+mod herald_told_once_conformance;
+
+#[cfg(test)]
+#[path = "status_item_told_tests.rs"]
+mod told_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6987,7 +7299,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("{program:?}: the report's row: {menu:?}"));
             assert_eq!(
                 tip.as_deref(),
-                Some(report_words(program.product(), false).as_str()),
+                Some(
+                    report_words(
+                        program.product(),
+                        aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+                        false
+                    )
+                    .as_str()
+                ),
                 "{program:?}"
             );
             let tip = tip.unwrap_or_default();
@@ -7009,7 +7328,11 @@ mod tests {
                 lines.iter().any(|l| l.contains("proj-api")
                     && l.contains(&format!(
                         " tip={:?}",
-                        report_words(program.product(), false)
+                        report_words(
+                            program.product(),
+                            aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+                            false
+                        )
                     ))),
                 "chrome's statusmenu carries the tip: {lines:#?}"
             );
@@ -7036,7 +7359,11 @@ mod tests {
         };
         assert_eq!(
             tip_of(alone),
-            Some(report_words(aterm_phase::Program::Claude.product(), true))
+            Some(report_words(
+                aterm_phase::Program::Claude.product(),
+                aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+                true
+            ))
         );
         assert_eq!(
             tip_of(SessionRow {
@@ -7044,13 +7371,87 @@ mod tests {
                 need_alone: false,
                 ..report.clone()
             }),
-            Some(report_words(aterm_phase::Program::Claude.product(), false)),
+            Some(report_words(
+                aterm_phase::Program::Claude.product(),
+                aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+                false
+            )),
             "CONTROL: a hold with another leg too carries on meanwhile"
         );
         assert_eq!(
             tip_of(report),
-            Some(report_words(aterm_phase::Program::Claude.product(), false))
+            Some(report_words(
+                aterm_phase::Program::Claude.product(),
+                aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+                false
+            ))
         );
+    }
+
+    /// A REPORT WHOSE ENTRY SAYS THE WORK WAITS ON THE PERSON SAYS SO ON EVERY SURFACE (the
+    /// post-landing review, 2026-11-02): beside the stop for replies that repeat, or a landed task,
+    /// the entry ends ` — waits on you`, and the menu row's tip and the tab's hover say
+    /// `<product> waits on you` as the entry and the chip say it, never that it carries on;
+    /// for Claude Code, agy and Muse Code alike. CONTROL: an entry that carries on says so on
+    /// both. Negative control: `report_words` reading the alone flag only (`origin/main`)
+    /// says `carries on meanwhile` beside `waits on you`.
+    #[test]
+    fn a_report_that_waits_on_the_person_says_so_on_the_tip_and_the_hover() {
+        use aterm_agent::harness::hold_said::NeedTail;
+        use aterm_agent::supervise::mode_words::CARRIES_ON;
+        let now = 100_000_i64;
+        for program in [
+            aterm_phase::Program::Claude,
+            aterm_phase::Program::Agy,
+            aterm_phase::Program::Muse,
+        ] {
+            for tail in NeedTail::ALL {
+                let facts = NeedFacts {
+                    attention: vec![crate::needs::AttentionFact {
+                        owner: crate::harness_host::NEEDS_ATTENTION_OWNER.to_string(),
+                        text: format!(
+                            "{} needs you: sign 0.48.0 \u{2014} {}",
+                            program.name(),
+                            tail.words()
+                        ),
+                        kind: Some(aterm_types::needs::AttentionKind::Ask),
+                    }],
+                    ..NeedFacts::default()
+                };
+                let row = SessionRow {
+                    need_since: Some(now - 60),
+                    ..row_of(3, "proj-api", &facts)
+                };
+                let ask = row
+                    .need
+                    .as_ref()
+                    .and_then(|n| n.harness.clone())
+                    .expect("the report's ask");
+                assert_eq!(ask.tail, tail, "{program:?}");
+                let menu = compose_status_menu(&local_glance(&[row], &[], now, None), now);
+                let (_, tip) = menu_row(&menu, "\u{25c7} proj-api \u{2014} sign 0.48.0")
+                    .unwrap_or_else(|| panic!("{program:?}: the report's row: {menu:?}"));
+                let hover = crate::app_presence::harness_need_hover(&ask);
+                let want = match tail {
+                    NeedTail::WaitsOnYou => {
+                        format!("{} {}", program.product(), NeedTail::WaitsOnYou.words())
+                    }
+                    NeedTail::CarryingOn => format!("{} {CARRIES_ON}", program.product()),
+                };
+                assert_eq!(tip.as_deref(), Some(want.as_str()), "{program:?} {tail:?}");
+                assert_eq!(
+                    hover.last(),
+                    Some(&want),
+                    "{program:?} {tail:?}: {hover:#?}"
+                );
+                if tail == NeedTail::WaitsOnYou {
+                    assert!(
+                        !hover.iter().any(|l| l.contains(CARRIES_ON)),
+                        "{program:?}: {hover:#?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -7486,6 +7887,7 @@ mod tests {
         let whose = Some("Claude Code in alpha needs this too");
         let carries_on = aterm_agent::supervise::mode_words::report_words(
             aterm_phase::Program::Claude.product(),
+            aterm_agent::harness::hold_said::NeedTail::CarryingOn,
             false,
         );
         assert_eq!(

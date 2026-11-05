@@ -854,14 +854,6 @@ pub(crate) fn ensure_rc_sources_hooks(
             outcomes.push((rc, RcOutcome::ConsentFenced));
             continue;
         }
-        let Ok(meta) = fs::metadata(&real) else {
-            outcomes.push((rc, RcOutcome::Unreadable));
-            continue;
-        };
-        if !meta.is_file() {
-            outcomes.push((rc, RcOutcome::Unreadable));
-            continue;
-        }
         let Ok(existing) = crate::metadata_io::read_bounded_regular_utf8(&real, 1024 * 1024) else {
             outcomes.push((rc, RcOutcome::Unreadable));
             continue;
@@ -876,6 +868,10 @@ pub(crate) fn ensure_rc_sources_hooks(
             outcomes.push((rc, RcOutcome::OptOutKept));
             continue;
         }
+        let Ok(meta) = fs::symlink_metadata(&real) else {
+            outcomes.push((rc, RcOutcome::Unreadable));
+            continue;
+        };
         let mut next = existing;
         if !next.is_empty() && !next.ends_with('\n') {
             next.push('\n');
@@ -893,8 +889,10 @@ pub(crate) fn ensure_rc_sources_hooks(
         ));
         let _ = fs::remove_file(&tmp);
         let written = crate::platform::create_private_new(&tmp)
-            .and_then(|mut f| io::Write::write_all(&mut f, next.as_bytes()))
-            .and_then(|()| fs::set_permissions(&tmp, meta.permissions()))
+            .and_then(|mut f| {
+                io::Write::write_all(&mut f, next.as_bytes())?;
+                f.set_permissions(meta.permissions())
+            })
             .and_then(|()| fs::rename(&tmp, &real));
         if written.is_err() {
             let _ = fs::remove_file(&tmp);
@@ -1055,7 +1053,6 @@ enum RcRead {
 
 #[cfg(unix)]
 fn read_rc_for_report(canonical_home: &Path, rc_path: &Path) -> Option<RcRead> {
-    fs::symlink_metadata(rc_path).ok()?;
     let real = fs::canonicalize(rc_path).ok()?;
     if crate::protected::under_protected_root(canonical_home, &real) {
         return Some(RcRead::Fenced);
@@ -1536,9 +1533,10 @@ fn stage_hook(dest: &Path, content: &str) -> io::Result<std::path::PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hook path has no parent"))?;
     let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
-    let staged = crate::platform::create_private_new(&tmp)
-        .and_then(|mut f| io::Write::write_all(&mut f, content.as_bytes()))
-        .and_then(|()| crate::platform::harden_file(&tmp));
+    let staged = crate::platform::create_private_new(&tmp).and_then(|mut f| {
+        io::Write::write_all(&mut f, content.as_bytes())?;
+        crate::platform::set_mode_on(&f, 0o600)
+    });
     match staged {
         Ok(()) => Ok(tmp),
         Err(e) => {

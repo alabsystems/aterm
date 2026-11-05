@@ -80,6 +80,22 @@ pub fn hv_support() -> Option<bool> {
     }
 }
 
+/// Whether this macOS runs as a virtual machine's guest (`kern.hv_vmm_present` is 1), read by
+/// `sysctlbyname`: an identity aterm's vault makes there is a lab identity
+/// (`aterm_secrets::LabMark::VirtualMachine`, `docs/DESIGN-alab-one-mesh-2026-11-05.md` A12).
+/// `None` off macOS, or where the kernel has no such name.
+#[must_use]
+pub fn hv_vmm_present() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::sysctl_int(c"kern.hv_vmm_present").map(|v| v == 1)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// A path buffer (`PROC_PIDPATHINFO_MAXSIZE`).
 pub const PATH_CAP: usize = 4096;
 /// Every file read (`/proc`) stops here: 4 KiB.
@@ -429,6 +445,20 @@ pub fn hid_idle() -> Option<std::time::Duration> {
     #[cfg(target_os = "macos")]
     {
         macos::hid_idle()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// The machine's model identifier (macOS `hw.model`: `Mac16,6`), `None` where unread, and off
+/// macOS.
+#[must_use]
+pub fn machine_model() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::machine_model()
     }
     #[cfg(not(target_os = "macos"))]
     {

@@ -243,8 +243,10 @@ fn token(v: Option<&str>) -> String {
     v.map_or_else(|| "none".to_string(), |s| s.replace(' ', "_"))
 }
 
-/// Formats the `status` answer as a single `k=v` line with signed-nanosecond epoch offsets.
-pub(crate) fn status_line(window: u64, s: &MomentumAosStatus) -> String {
+/// Formats the `status` answer as a single `k=v` line with signed-nanosecond epoch offsets; an
+/// attached line says whether the person's grant to keep keys aterm cannot see echoed is live
+/// (`unseen=on`).
+pub(crate) fn status_line(window: u64, s: &MomentumAosStatus, unseen: bool) -> String {
     let mut line = format!(
         "window={window} attached={} code={} hot={} active={} settling={}",
         s.attached, s.code, s.hot, s.is_active, s.settling
@@ -252,6 +254,7 @@ pub(crate) fn status_line(window: u64, s: &MomentumAosStatus) -> String {
     if !s.attached {
         return line;
     }
+    line.push_str(if unseen { " unseen=on" } else { " unseen=off" });
     let st = &s.stats;
     line.push_str(&format!(
         " build={} code_digest={} rev={} branch={} paused={} queued={}/{} log={} log_epoch={} \
@@ -448,8 +451,8 @@ pub(crate) fn trace_line(t: &TraceSummary) -> String {
     }
     let c = &t.counts;
     line.push_str(&format!(
-        " sealed=true keys={} resets={} ticks={} queries={}",
-        c.keys, c.resets, c.ticks, c.queries
+        " sealed=true keys={} resets={} ticks={} queries={} unseen={}",
+        c.keys, c.resets, c.ticks, c.queries, t.unseen
     ));
     line
 }
@@ -468,12 +471,14 @@ pub(crate) fn trace_file_line(t: &TraceSummary, file: &[u8]) -> String {
 /// The `export` answer's words before the file's path, which ends the line since the state dir may hold a space.
 pub(crate) fn export_line(e: &Exported, file: &str) -> String {
     format!(
-        "window={} exported kept={} log_epoch={} identity={} bytes={} mode=0600 file={file}",
+        "window={} exported kept={} log_epoch={} identity={} bytes={} unseen={} mode=0600 \
+         file={file}",
         e.window.0,
         e.kept.map_or_else(|| "live".to_string(), |k| k.to_string()),
         e.log_epoch,
         e.identity.short(),
-        e.bytes.len()
+        e.bytes.len(),
+        e.unseen
     )
 }
 
@@ -627,12 +632,13 @@ pub(crate) fn pane_check_line(file: &str, bytes: usize, c: &PaneCheck) -> String
     )
 }
 
-/// Formats the `check` answer from the replay and the contract's verdict on it.
+/// Formats the `check` answer from the replay and the contract's verdict on it; `unseen=` is the
+/// replayed head's count of keys logged unseen, the checkpoint's included.
 pub(crate) fn check_line(file: &str, bytes: usize, c: &TraceCheck) -> String {
     let r = &c.replay;
     let n = &r.counts;
     format!(
-        "checked code={} log_epoch={} first={} keys={} resets={} ticks={} queries={} \
+        "checked code={} log_epoch={} first={} keys={} resets={} ticks={} queries={} unseen={} \
          checkpoint={} state={} chain={} verdict={} bytes={bytes} file={file}",
         r.code.name(),
         r.log_epoch,
@@ -641,6 +647,7 @@ pub(crate) fn check_line(file: &str, bytes: usize, c: &TraceCheck) -> String {
         n.resets,
         n.ticks,
         n.queries,
+        r.unseen,
         r.checkpoint.short(),
         r.state_digest.short(),
         r.observation_chain.short(),
@@ -884,11 +891,13 @@ mod tests {
             log_epoch: 2,
             identity: aterm_aos::Digest([0xcd; 32]),
             bytes: vec![0; 10],
+            unseen: 3,
         };
         assert_eq!(
             export_line(&e, "f.trace"),
             format!(
-                "window=4 exported kept=live log_epoch=2 identity={} bytes=10 mode=0600 file=f.trace",
+                "window=4 exported kept=live log_epoch=2 identity={} bytes=10 unseen=3 mode=0600 \
+                 file=f.trace",
                 aterm_aos::Digest([0xcd; 32]).short()
             )
         );
@@ -1006,7 +1015,7 @@ mod tests {
             ..MomentumAosStatus::default()
         };
         assert_eq!(
-            status_line(3, &s),
+            status_line(3, &s, true),
             "window=3 attached=false code=shipped hot=false active=false settling=false"
         );
         assert_eq!(token(Some("log full")), "log_full");
@@ -1032,7 +1041,11 @@ mod tests {
             guard_firings: Some(3),
             ..MomentumAosStatus::default()
         };
-        let line = status_line(1, &plan);
+        let line = status_line(1, &plan, false);
+        assert!(
+            line.contains(" settling=false unseen=off build="),
+            "an attached line says whether the grant is live: {line}"
+        );
         assert!(
             line.contains(" deadline=none guard=moved:true,firings:3 replays=0 "),
             "{line}"
@@ -1042,7 +1055,8 @@ mod tests {
             code: MomentumCode::Shipped.name(),
             ..MomentumAosStatus::default()
         };
-        let line = status_line(1, &shipped);
+        let line = status_line(1, &shipped, true);
+        assert!(line.contains(" unseen=on "), "{line}");
         assert!(
             line.contains(" deadline=none replays=0 ") && !line.contains(" guard="),
             "{line}"
@@ -1066,10 +1080,12 @@ mod tests {
             log_bytes: 900,
             counts: aterm_effects::aos_momentum::EventCounts {
                 keys: 4,
+                unseen: 1,
                 resets: 1,
                 ticks: 3,
                 queries: 2,
             },
+            unseen: 2,
         };
         let ab = "ab".repeat(32);
         let one = "01".repeat(32);
@@ -1077,7 +1093,8 @@ mod tests {
             trace_line(&t),
             format!(
                 "window=2 log=10 log_epoch=3 first=40 end=50 trace={ab} checkpoint={one} \
-                 identity={} broken=false bytes=120+900 sealed=true keys=4 resets=1 ticks=3 queries=2",
+                 identity={} broken=false bytes=120+900 sealed=true keys=4 resets=1 ticks=3 queries=2 \
+                 unseen=2",
                 d(0xcd).short()
             )
         );
@@ -1088,7 +1105,7 @@ mod tests {
             format!(
                 "window=2 log=10 log_epoch=3 first=40 end=50 trace=none checkpoint={one} \
                  identity={} broken=true bytes=120+900 broken_why=log_full sealed=true keys=4 \
-                 resets=1 ticks=3 queries=2",
+                 resets=1 ticks=3 queries=2 unseen=2",
                 d(0xcd).short()
             )
         );

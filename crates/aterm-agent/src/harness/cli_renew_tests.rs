@@ -152,9 +152,10 @@ fn cached_profile_only(env: &Env) {
         Some("main"),
     );
     std::fs::create_dir_all(profile).unwrap();
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_deref().unwrap(),
-        "[harness]\nusage_tap = false\n",
+        ("[harness]\nusage_tap = false\n").as_ref(),
+        0o600,
     )
     .unwrap();
 }
@@ -814,9 +815,10 @@ fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
         ("logins = \"off\"", Some("logins")),
     ] {
         let (_tmp, env) = renew_env(&format!("renew-said-{}", off.unwrap_or("on")));
-        std::fs::write(
+        aterm_uds::atomic_file::write(
             env.config.as_deref().expect("a config"),
-            format!("[harness]\n{switch}\n"),
+            (format!("[harness]\n{switch}\n")).as_ref(),
+            0o600,
         )
         .expect("write");
         let host = RenewHost::new();
@@ -1200,8 +1202,8 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
     assert!(!env.accounts_store().dir.join("bin").exists());
 }
 
-/// `--due` runs what a session needs now, never a row the upkeep signs in by itself before any
-/// session needs it: a row with an email and no login, and nothing walled or due, is not due.
+/// `--due` runs what a session here needs now, never a row nobody here runs on: a row with an email
+/// and no login, and nothing walled or due, is not due.
 #[test]
 fn due_leaves_a_row_no_session_needs_to_the_upkeep() {
     let (_tmp, env) = renew_env("renew-due-unneeded");
@@ -1239,6 +1241,20 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
             Ok(Vec::new())
         })
         .expect("recorded");
+    let (code, out, _) = acc(renew(&[], true, None), &env, &host);
+    assert_eq!(code, exit(0));
+    assert_eq!(
+        out, "nothing is due on this machine\n",
+        "a due login no session here ran on this week is not renewed (DESIGN-alab-one-mesh-2026-11-05.md §4.15 rule 4)"
+    );
+    assert!(host.flows.borrow().is_empty());
+    env.accounts_store()
+        .transact(env.now, &mut note, |state| {
+            let events = accounts::note_session(state, "s-2", "work-2", None, env.now - 3600);
+            state.sessions.remove("s-2");
+            Ok(events)
+        })
+        .expect("a session here ran on work-2");
     let (code, out, err) = acc(renew(&[], true, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let renewed: Vec<_> = host
@@ -1295,18 +1311,11 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     let wall_host = RenewHost::new();
     let (code, out, err) = acc(renew(&[], true, None), &env, &wall_host);
     assert_eq!(code, exit(0), "{out}{err}");
-    let wall_renewed: Vec<_> = wall_host
-        .flows
-        .borrow()
-        .iter()
-        .map(|(_, e, _)| e.clone())
-        .collect();
-    assert_eq!(
-        wall_renewed,
-        ["w3@example.test"],
-        "--due selects the un-enrolled successor when all enrolled rows are at a wall"
+    assert!(
+        wall_host.flows.borrow().is_empty(),
+        "--due signs in no successor nobody here runs on when the enrolled rows are at a wall: {out}"
     );
-    assert!(out.contains("work-3: renewed"), "{out}");
+    assert_eq!(out, "nothing is due on this machine\n");
     no_address(&env, &[&out, &err]);
 }
 
@@ -1382,9 +1391,10 @@ fn other_machines_are_renewed_through_native_fleet_in_one_sitting() {
     );
     assert_eq!(out.matches("remote due pass completed").count(), 2);
     assert_eq!(err.matches("remote observation").count(), 2);
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_ref().expect("a config"),
-        "[harness]\nhosts = [\"m5\"]\n",
+        ("[harness]\nhosts = [\"m5\"]\n").as_ref(),
+        0o600,
     )
     .expect("write");
     let host = RenewHost::new();
@@ -1406,7 +1416,8 @@ fn other_machines_are_renewed_through_native_fleet_in_one_sitting() {
     let (code, _, err) = acc(renew(&[], true, None), &env, &failing);
     assert_eq!(code, exit(1));
     assert!(err.contains("on m5: exited 1"), "{err}");
-    std::fs::write(env.config.as_ref().expect("a config"), "").expect("write");
+    aterm_uds::atomic_file::write(env.config.as_ref().expect("a config"), ("").as_ref(), 0o600)
+        .expect("write");
     let host = RenewHost::new();
     let (code, ..) = acc(renew(&[], true, None), &env, &host);
     assert_eq!(code, exit(0));
@@ -1438,9 +1449,12 @@ fn local_interactive_rows_do_not_prevent_a_native_remote_pass() {
     let (_tmp, env) = renew_env("renew-remote-without-tty");
     let mut note = None;
     env.accounts_store()
-        .transact_logins(env.now, &mut note, |_, logins| {
+        .transact_logins(env.now, &mut note, |state, logins| {
             accounts::note_login_notice(logins, "work-2", 2, env.now);
-            Ok(Vec::new())
+            // A session here ran on work-2 within the week: a due login this Mac uses.
+            let events = accounts::note_session(state, "s-2", "work-2", None, env.now - 3600);
+            state.sessions.remove("s-2");
+            Ok(events)
         })
         .expect("make the local interactive account due");
     for (labels, wanted_code) in [(&[][..], exit(0)), (&["main"][..], exit(1))] {
@@ -2193,7 +2207,11 @@ fn an_unattended_nonzero_exit_reports_its_browser_cause_without_changing_retries
         let row = roster.row("work-2").unwrap();
         let logins = logins_of(&env);
         let before = logins.get("work-2").cloned();
-        let signin = store.signin_now().unwrap().unwrap();
+        let signin = crate::harness::sign_in_ladder::begun_fixture(
+            store.signin_now().unwrap().unwrap(),
+            Cli::Claude,
+            "work-2",
+        );
         let mut out = Vec::new();
         let mut err = Vec::new();
         let result = renew_one(

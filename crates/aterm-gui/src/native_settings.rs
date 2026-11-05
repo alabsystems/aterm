@@ -5455,6 +5455,31 @@ impl SettingsApp {
             return EventResult::Handled;
         }
 
+        if action == "settings/reset-cursor-tuning" {
+            let edits = trail_tuning_reset_edits(view);
+            if edits.is_empty() {
+                view.feedback = Some("Cursor trail tuning is already at its defaults".to_string());
+                cx.repaint(crate::native_app::DamageRegion::All);
+                return EventResult::Handled;
+            }
+            for edit in &edits {
+                view.field_inputs.remove(&edit.key);
+                view.field_errors.remove(&edit.key);
+                if view.editing_field.as_deref() == Some(edit.key.as_str()) {
+                    view.editing_field = None;
+                }
+            }
+            let patch = ConfigPatch {
+                base_revision: self.config_revision,
+                edits,
+            };
+            if Self::submit_config(view, cx, patch).is_some() {
+                view.feedback = Some("Resetting cursor trail tuning…".to_string());
+            }
+            cx.repaint(crate::native_app::DamageRegion::All);
+            return EventResult::Handled;
+        }
+
         if let Some(key) = action.strip_prefix("settings/reset/") {
             if view.field_index_of(key).is_some() {
                 if key == prefs::EDIT_CURSOR_TRAIL_STYLE {
@@ -21179,6 +21204,20 @@ fn trail_style_reset_edits(state: &SettingsViewState) -> Vec<ConfigEdit> {
     }]
 }
 
+fn trail_tuning_reset_edits(state: &SettingsViewState) -> Vec<ConfigEdit> {
+    let resolved = candidate_trail_resolution(state, None);
+    prefs::CURSOR_STYLE_TUNING_KEYS
+        .iter()
+        .copied()
+        .filter(|key| state.is_explicit(key) && trail_style_uses(&resolved, key, true))
+        .map(|key| ConfigEdit {
+            key: key.to_string(),
+            expected: ExpectedConfigValue::Exact(state.raw_value(key)),
+            value: None,
+        })
+        .collect()
+}
+
 fn top_effect_apply_feedback(escaped_serious_mode: bool) -> String {
     if escaped_serious_mode {
         "Applying… Serious Mode will turn off; other effects stay off.".to_string()
@@ -23155,19 +23194,14 @@ fn cursor_styles_page(
     let live = cursor_style_status(state, cx.motion);
     let retired = match &live {
         Some((status, retired)) => {
-            state
+            let was = state
                 .cursor_style_note
                 .replace(retired.map(|now| (status.clone(), now)));
-            None
+            was.filter(|(was, _)| was != status)
         }
         None => state.cursor_style_note.borrow().clone(),
     };
-    let status: Vec<(UiNode, f32)> = if let Some((status, _)) = live {
-        cursor_style_note_rungs(&status)
-            .into_iter()
-            .map(|text| note(&text))
-            .collect()
-    } else if let Some((was, now)) = retired {
+    let status: Vec<(UiNode, f32)> = if let Some((was, now)) = retired {
         cursor_style_note_rungs(&was)
             .into_iter()
             .map(|was| {
@@ -23177,6 +23211,11 @@ fn cursor_styles_page(
                 node.layout.height = Length::Fixed(height);
                 (node, height)
             })
+            .collect()
+    } else if let Some((status, _)) = live {
+        cursor_style_note_rungs(&status)
+            .into_iter()
+            .map(|text| note(&text))
             .collect()
     } else {
         Vec::new()
@@ -23368,10 +23407,12 @@ fn cursor_styles_page(
     out
 }
 
-const SERIOUS_STYLE_NOTE: &str = "Serious Mode is on, so your cursor has no trail. Choosing a style turns Serious Mode off; other effects stay off.";
-
-const SERIOUS_STYLE_NOTE_SHORT: &str =
-    "Serious Mode is on, so no trail. Choosing a style turns it off; other effects stay off.";
+const SERIOUS_STYLE_NOTE: &str =
+    "Hidden by Serious Mode. Choosing a style turns it off; other effects stay off.";
+const SERIOUS_STYLE_NOTE_SHORT: &str = "Hidden by Serious Mode. Choosing a style turns it off.";
+const REDUCED_STYLE_NOTE: &str = "Hidden by Reduce Motion. Motion settings can override it.";
+const BUSY_STYLE_NOTE: &str = "Paused while aterm is busy. It will return on its own.";
+const DIM_STYLE_NOTE: &str = "Too dim to see at this brightness. Reset it under Advanced tuning.";
 
 fn cursor_style_note_rungs(note: &str) -> Vec<String> {
     let mut rungs = vec![note.to_string()];
@@ -23392,14 +23433,29 @@ fn cursor_style_status(
         ));
     }
     let raw = top_authored_trail_value(state);
-    if !crate::app_config::resolve_trail_style(&raw).unknown {
-        return None;
+    let resolved = crate::app_config::resolve_trail_style(&raw);
+    resolved.style?;
+    if resolved.unknown {
+        return Some((
+            format!(
+                "aterm.toml names a style aterm does not know, so it draws {}.",
+                cursor_style_name(prefs::DEFAULT_CURSOR_TRAIL_STYLE)
+            ),
+            None,
+        ));
     }
-    let note = format!(
-        "aterm.toml names a style aterm does not know, so it draws {}.",
-        cursor_style_name(prefs::DEFAULT_CURSOR_TRAIL_STYLE)
-    );
-    Some((note, None))
+    if crate::motion::MotionPolicy::resolve(motion.mode, motion.system_reduced, true)
+        == crate::motion::MotionPolicy::Reduced
+    {
+        return Some((REDUCED_STYLE_NOTE.to_string(), None));
+    }
+    if candidate_trail_intensity(state, None) <= 0.0 {
+        return Some((DIM_STYLE_NOTE.to_string(), None));
+    }
+    if motion.shed {
+        return Some((BUSY_STYLE_NOTE.to_string(), None));
+    }
+    None
 }
 
 fn cursor_styles_card(
@@ -23572,6 +23628,29 @@ fn cursor_style_row(
     vec![button, (block, description_height)]
 }
 
+fn cursor_style_tuning_reset_row(text_width: f32) -> (UiNode, f32) {
+    let height = scaled_control_height();
+    let label = "Reset to style defaults";
+    let spec = ButtonSpec::new("Reset to style defaults for cursor trail tuning").visual_label(
+        crate::native_ui::fit_native_button_label(label, text_width.max(0.0)),
+    );
+    (
+        UiNode::new(
+            "settings/reset-cursor-tuning",
+            UiContent::Button(
+                Control::new(spec, ActionId::new("settings/reset-cursor-tuning"))
+                    .style(StyleRef::Secondary),
+            ),
+        )
+        .layout(
+            Layout::default()
+                .width(Length::Fill)
+                .height(Length::Fixed(height)),
+        ),
+        height,
+    )
+}
+
 fn cursor_style_tuning_bound(
     state: &SettingsViewState,
     styles: &[ListedCursorStyle],
@@ -23583,7 +23662,7 @@ fn cursor_style_tuning_bound(
         .map(|style| crate::app_config::resolve_trail_style(&style.value))
         .filter(|resolved| resolved.style.is_some())
         .collect();
-    let rows: Vec<(UiNode, f32)> = prefs::CURSOR_STYLE_TUNING_KEYS
+    let mut rows: Vec<(UiNode, f32)> = prefs::CURSOR_STYLE_TUNING_KEYS
         .iter()
         .filter(|key| tuning_row_shown(state, key))
         .filter(|key| {
@@ -23609,13 +23688,21 @@ fn cursor_style_tuning_bound(
             Some((whole, height))
         })
         .collect();
+    if prefs::CURSOR_STYLE_TUNING_KEYS.iter().any(|key| {
+        state.is_explicit(key)
+            && resolved
+                .iter()
+                .any(|style| trail_style_uses(style, key, true))
+    }) {
+        rows.push(cursor_style_tuning_reset_row(text_width));
+    }
     let card: Vec<ListItem> = if rows.is_empty() {
         Vec::new()
     } else {
         vec![ListItem::Split(cursor_styles_card(
             "tuning",
-            Some("Adjust"),
-            "Adjust",
+            Some("Advanced tuning"),
+            "Advanced tuning",
             rows,
             text_width,
         ))]
@@ -23638,9 +23725,9 @@ fn cursor_style_tuning_card(
 ) -> Option<SplitCard> {
     let resolved = crate::app_config::resolve_trail_style(saved);
     resolved.style?;
-    let caption = format!("Adjust {}", cursor_style_name(saved));
+    let caption = "Advanced tuning";
     let chrome = {
-        let empty = cursor_styles_card("tuning", Some(&caption), &caption, Vec::new(), text_width);
+        let empty = cursor_styles_card("tuning", Some(caption), caption, Vec::new(), text_width);
         empty.height() + empty.gap
     };
     let room = (room - chrome).max(0.0);
@@ -23662,7 +23749,7 @@ fn cursor_style_tuning_card(
     let mut finished = page_finished_rows(state, &keys, width, text_width, None);
     place_box_facts(&mut finished);
     agree_box_default_marks(&mut finished);
-    let rows = finished
+    let mut rows = finished
         .iter()
         .flat_map(|finished| {
             let mut stops = finished_row_stops(finished, Some(room));
@@ -23680,13 +23767,20 @@ fn cursor_style_tuning_card(
             stops
         })
         .collect::<Vec<_>>();
+    if prefs::CURSOR_STYLE_TUNING_KEYS.iter().any(|key| {
+        state.is_explicit(key)
+            && tuning_row_shown(state, key)
+            && trail_style_uses(&resolved, key, true)
+    }) {
+        rows.push(cursor_style_tuning_reset_row(text_width));
+    }
     if rows.is_empty() {
         return None;
     }
     Some(cursor_styles_card(
         "tuning",
-        Some(&caption),
-        &caption,
+        Some(caption),
+        caption,
         rows,
         text_width,
     ))
@@ -29584,6 +29678,15 @@ impl ConsentGestures {
         }
     }
 
+    /// The inert arms with an owner who says no.
+    #[cfg(test)]
+    pub(crate) const fn declining() -> Self {
+        Self {
+            confirm: ConfirmArm::StandIn(test_confirm_no),
+            ..Self::inert()
+        }
+    }
+
     /// Start the owner's debugger-access change through this instance's arm.
     pub(crate) fn run_devtools(
         &self,
@@ -29732,6 +29835,11 @@ const fn gesture_no() -> bool {
 #[cfg(test)]
 const fn test_confirm_yes(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
     Some(true)
+}
+
+#[cfg(test)]
+const fn test_confirm_no(_title: &str, _body: &str, _proceed: &str) -> Option<bool> {
+    Some(false)
 }
 
 const fn inert_open_settings(_pane: crate::menu::PrivacyPane) -> crate::menu::SettingsOpen {
@@ -30966,7 +31074,7 @@ impl OwnerAnswer {
         matches!(self, Self::Yes(_))
     }
 
-    const fn refusal(&self, declined: &'static str) -> &'static str {
+    pub(crate) const fn refusal(&self, declined: &'static str) -> &'static str {
         match self {
             Self::Yes(_) | Self::No => declined,
             Self::Quiet => {
@@ -36668,7 +36776,8 @@ pub(crate) fn wrap_to_box(text: &str, width: f32, measure: &dyn Fn(&str) -> f32)
     wrap_to_box_marked(text, width, measure, "-")
 }
 
-fn wrap_to_box_marked(
+/// Wrap with `mark` at discretionary splits; an empty mark disables inserted break marks.
+pub(crate) fn wrap_to_box_marked(
     text: &str,
     width: f32,
     measure: &dyn Fn(&str) -> f32,

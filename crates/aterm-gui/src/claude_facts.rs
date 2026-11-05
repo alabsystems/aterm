@@ -178,7 +178,9 @@ pub(crate) fn fact_title(facts: &FooterFacts, cwd: Option<&Path>, fact: Fact) ->
             // A watch adds inventory beside the account's own readings. Limits and
             // active or unconfirmed recovery keep the existing recovery-only disclosure.
             if let Some(progress) = progress.as_deref()
-                && (progress.phase != ProgressPhase::Watching || progress.wall.is_some())
+                && (progress.phase != ProgressPhase::Watching
+                    || progress.wall.is_some()
+                    || !progress.independent_work.is_empty())
             {
                 return (
                     format!(
@@ -388,7 +390,9 @@ pub(crate) fn fact_spoken_of(
         Fact::Account => {
             let progress = facts.account_progress_view();
             if let Some(progress) = progress.as_deref()
-                && (progress.phase != ProgressPhase::Watching || progress.wall.is_some())
+                && (progress.phase != ProgressPhase::Watching
+                    || progress.wall.is_some()
+                    || !progress.independent_work.is_empty())
             {
                 return (
                     format!(

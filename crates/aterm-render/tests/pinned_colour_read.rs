@@ -85,6 +85,18 @@ fn typed_pinned(
     std::mem::take(&mut r.kept)
 }
 
+/// [`typed_pinned`] of `style`, one of [`PINNED_STYLES`], in the pink pin on the dark page with no
+/// control applied. Two tests read these frames, and a full run replays each style once.
+fn pink_on_dark(style: &str) -> &'static [Kept] {
+    static KEPT: [std::sync::OnceLock<Vec<Kept>>; PINNED_STYLES.len()] =
+        [const { std::sync::OnceLock::new() }; PINNED_STYLES.len()];
+    let at = PINNED_STYLES
+        .iter()
+        .position(|pinned| *pinned == style)
+        .expect("a pinned style");
+    KEPT[at].get_or_init(|| typed_pinned(style, DARK, PINK_PIN, |_| {}))
+}
+
 /// Every pixel of `k` the effects changed, outside the caret's cell: `(x, y, frame px)`.
 fn changed(k: &Kept) -> impl Iterator<Item = (usize, usize, u32)> + '_ {
     let (cw, ch) = cell(k);
@@ -419,8 +431,8 @@ fn a_chosen_colour_lays_its_light_in_its_own_hue_and_chroma_on_dark() {
         );
     });
     aterm_spec::check::each(&PINNED_STYLES, |&style| {
-        for k in typed_pinned(style, DARK, PINK_PIN, |_| {}) {
-            let (share, n) = share_in_hue(&k, PINK_PIN);
+        for k in pink_on_dark(style) {
+            let (share, n) = share_in_hue(k, PINK_PIN);
             assert!(
                 n < 8 || share >= 0.9,
                 "{style} pinned to {PINK_PIN:06x} at {} ms: {share:.2} of its {n} coloured \
@@ -454,8 +466,7 @@ fn a_chosen_colour_lays_its_light_in_its_own_hue_and_chroma_on_dark() {
 /// alone): some style reads under nine tenths.
 #[test]
 fn a_vivid_pin_s_trail_is_no_duller_for_the_hold() {
-    let read = |style: &str, controls: &dyn Fn(&mut EffectsPipeline)| -> (u32, u32, u64) {
-        let kept = typed_pinned(style, DARK, PINK_PIN, controls);
+    let judge = |kept: &[Kept]| -> (u32, u32, u64) {
         let all = kept
             .iter()
             .flat_map(|k| changed(k).map(|(_, _, px)| chroma(px)).collect::<Vec<_>>())
@@ -467,9 +478,16 @@ fn a_vivid_pin_s_trail_is_no_duller_for_the_hold() {
             .unwrap_or((0, 0));
         (p95(all), worst, at)
     };
+    let read = |style: &str, controls: &dyn Fn(&mut EffectsPipeline)| {
+        judge(&typed_pinned(style, DARK, PINK_PIN, controls))
+    };
     let styles: Vec<&str> = PINNED_STYLES.into_iter().chain(["classic"]).collect();
     let duller: Vec<&str> = aterm_spec::check::each(&styles, |&style| {
-        let (held, worst, at) = read(style, &|_| {});
+        let (held, worst, at) = if style == "classic" {
+            read(style, &|_| {})
+        } else {
+            judge(pink_on_dark(style))
+        };
         assert!(
             worst <= chroma(PINK_PIN) + 6,
             "{style} pinned to {PINK_PIN:06x}: a frame's 95th-percentile chroma reads {worst} at \

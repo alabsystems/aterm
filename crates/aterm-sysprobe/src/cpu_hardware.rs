@@ -4,8 +4,16 @@
 //! Read-only CPU hardware evidence. Kernel CPU accounting and hardware residency
 //! are independent observations; neither is substituted for the other.
 
+use std::time::Duration;
+#[cfg(any(target_os = "macos", test))]
+use std::time::Instant;
+
 /// A bounded native reading, including a reason when the source did not answer.
 pub type Reading<T> = Result<T, String>;
+
+/// Whether this platform has a CPU Stats source. Where it has none, [`Probe::sample`] reads
+/// nothing and answers `unsupported` at once, so a sample costs nothing.
+pub const SOURCE: bool = cfg!(target_os = "macos");
 
 /// One IOReport state, with the source's cumulative-counter delta left intact.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,15 +110,17 @@ pub struct Probe {
 }
 
 impl Probe {
-    /// Read one interval without sleeping, starting a child, or changing policy.
-    pub fn sample(&mut self) -> Sample {
+    /// Read one interval without sleeping, starting a child, or changing policy. `gap` is the
+    /// asking demand's gap (A2 §6.4): a snapshot more than `gap` after the previous one reads
+    /// `warming` and starts the next interval, so no reading averages over a gap.
+    pub fn sample(&mut self, gap: Duration) -> Sample {
         #[cfg(target_os = "macos")]
         {
-            let began = std::time::Instant::now();
+            let began = Instant::now();
             let controls = native::controls();
             let reader = self.native.get_or_insert_with(native::Reader::new);
             let (window_ns, observation_span_ns, channels) = match reader {
-                Ok(reader) => reader.sample(),
+                Ok(reader) => reader.sample(gap),
                 Err(why) => (0, 0, Err(why.clone())),
             };
             Sample {
@@ -118,7 +128,7 @@ impl Probe {
                     .duration_since(std::time::UNIX_EPOCH)
                     .ok()
                     .and_then(|d| i64::try_from(d.as_millis()).ok()),
-                collection_span_ns: u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                collection_span_ns: nanos(began.elapsed()),
                 window_ns,
                 observation_span_ns,
                 channels,
@@ -127,9 +137,102 @@ impl Probe {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = gap;
             Sample::unavailable("unsupported")
         }
     }
+
+    /// Whether a sample taken now would read `warming` under `gap`: the source answers, but
+    /// holds no snapshot within `gap`. A source that never subscribed is cold; one whose
+    /// subscription failed is not, since a second sample would read the same failure.
+    #[must_use]
+    pub fn cold(&self, gap: Duration) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            match &self.native {
+                None => true,
+                Some(Ok(reader)) => !reader.warm(gap),
+                Some(Err(_)) => false,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = gap;
+            false
+        }
+    }
+}
+
+/// The previous native snapshot of a cumulative-counter source, which the next one deltas
+/// against, under the gap rule (A2 §6.4): a snapshot pairs with the previous one only within
+/// its demand's gap. Past the gap, or with none held, it is kept only as the next one's
+/// previous and its reading says `warming`, never an average over the gap.
+#[cfg(any(target_os = "macos", test))]
+struct Chain<T> {
+    previous: Option<Link<T>>,
+}
+
+/// One native snapshot: when its call returned and how long the call took.
+#[cfg(any(target_os = "macos", test))]
+struct Link<T> {
+    snapshot: T,
+    after: Instant,
+    call_ns: u64,
+}
+
+/// A snapshot paired with the previous one within its gap: what one delta reads.
+#[cfg(any(target_os = "macos", test))]
+struct Pair<'a, T> {
+    /// The previous snapshot, no longer kept.
+    previous: T,
+    /// The snapshot just kept, the next one's previous.
+    current: &'a T,
+    /// The window between the two calls' returns, ns.
+    window_ns: u64,
+    /// The two calls' summed span, ns, which bounds the observation's skew.
+    span_ns: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl<T> Default for Chain<T> {
+    fn default() -> Self {
+        Self { previous: None }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl<T> Chain<T> {
+    /// Keeps `current` as the next snapshot's previous, and returns it paired with the previous
+    /// one when the window between their returns is within `gap`.
+    fn push(&mut self, current: Link<T>, gap: Duration) -> Option<Pair<'_, T>> {
+        let previous = self.previous.take();
+        let current = &*self.previous.insert(current);
+        let previous = previous?;
+        let window = current.after.saturating_duration_since(previous.after);
+        (window <= gap).then(|| Pair {
+            span_ns: previous.call_ns.saturating_add(current.call_ns),
+            previous: previous.snapshot,
+            current: &current.snapshot,
+            window_ns: nanos(window),
+        })
+    }
+
+    /// Forgets the previous snapshot, as a refused sample does.
+    fn clear(&mut self) {
+        self.previous = None;
+    }
+
+    /// Whether a snapshot taken at `now` would pair within `gap`.
+    fn warm(&self, now: Instant, gap: Duration) -> bool {
+        self.previous
+            .as_ref()
+            .is_some_and(|p| now.saturating_duration_since(p.after) <= gap)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl Sample {
@@ -261,5 +364,57 @@ mod tests {
         assert!(interpret(&s, None).1.is_err());
         let out_of_order = states(&[("IDLE", 2), ("P1", 3), ("P0", 5)]);
         assert!(interpret(&out_of_order, Some(&[1000.0, 2000.0])).1.is_err());
+    }
+
+    /// A snapshot more than its demand's gap after the previous one reads `warming` and starts
+    /// the next interval from itself: it never pairs with the snapshot before the gap, whose
+    /// delta would be the gap's average. CONTROL: today's reader paired every snapshot with the
+    /// previous one whatever the gap (an unbounded gap here), so after the same 9 s gap it read
+    /// the 9 s average.
+    #[test]
+    fn a_cpu_stats_sample_after_a_gap_reads_warming_not_the_gaps_average() {
+        let t0 = Instant::now();
+        let at = |s: u64| Link {
+            snapshot: s,
+            after: t0 + Duration::from_secs(s),
+            call_ns: s + 1,
+        };
+        let pair =
+            |p: Option<Pair<'_, u64>>| p.map(|p| (p.previous, *p.current, p.window_ns, p.span_ns));
+        let gap = Duration::from_millis(2_500);
+        let mut chain = Chain::default();
+        assert_eq!(pair(chain.push(at(0), gap)), None, "the first sample warms");
+        assert_eq!(
+            pair(chain.push(at(1), gap)),
+            Some((0, 1, 1_000_000_000, 3)),
+            "the window between returns, and both calls' span"
+        );
+        assert!(chain.warm(t0 + Duration::from_millis(3_500), gap));
+        assert!(!chain.warm(t0 + Duration::from_millis(3_501), gap));
+        assert_eq!(
+            pair(chain.push(at(10), gap)),
+            None,
+            "after a 9 s gap: warming"
+        );
+        assert_eq!(
+            pair(chain.push(at(11), gap)),
+            Some((10, 11, 1_000_000_000, 23)),
+            "the sample after the gap starts the next interval"
+        );
+        chain.clear();
+        assert!(
+            !chain.warm(t0 + Duration::from_secs(11), gap),
+            "cleared: cold"
+        );
+
+        let mut today = Chain::default();
+        let unbounded = Duration::MAX;
+        let _ = today.push(at(0), unbounded);
+        let _ = today.push(at(1), unbounded);
+        assert_eq!(
+            pair(today.push(at(10), unbounded)),
+            Some((1, 10, 9_000_000_000, 13)),
+            "control: with no gap rule the sample after the gap is its average"
+        );
     }
 }

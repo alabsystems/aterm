@@ -29,6 +29,21 @@ fn a_stopped_search_is_never_a_verdict() {
     )));
 }
 
+#[test]
+fn only_a_named_law_is_a_refutation() {
+    assert_eq!(
+        super::ty_violated_law("--- ty stdout ---\nError: Invariant Fits is violated.\n"),
+        Some("Fits")
+    );
+    for failure in [
+        "Error: Successor state is not completely specified\nStates found: 1\n",
+        "Parse error: unexpected token\n",
+        "No errors found (exhaustive).\n",
+    ] {
+        assert_eq!(super::ty_violated_law(failure), None, "{failure}");
+    }
+}
+
 /// Isolated `bmc` per invariant at `Buggy = 1` as an oracle for [`super::uncaught_invariants`].
 fn uncaught_invariants_one_walk_per_invariant(m: &super::Model) -> Vec<&'static str> {
     let buggy = super::interp::with_buggy(m, 1);
@@ -999,4 +1014,18 @@ fn a_ty_verdict_over_another_space_is_not_a_proof() {
             .unwrap_or_default();
         assert!(message.contains(refusal), "{case}: {message}");
     }
+}
+
+/// A machine with no checker is the machine's refusal, whatever the checker would have said: the
+/// run's row reads COULD NOT RUN and names what installs it (`aterm_verify`'s
+/// `libtest::environment_refusals` reads the sentinel). A release's test run goes through here.
+#[test]
+fn a_missing_checker_ends_the_test_could_not_run() {
+    let refused = std::panic::catch_unwind(|| super::missing_checker("ty")).unwrap_err();
+    let said = refused
+        .downcast_ref::<String>()
+        .expect("could_not_run formats its message");
+    assert!(said.contains(crate::host::COULD_NOT_RUN), "{said}");
+    assert!(said.contains("VERIFICATION GATE"), "{said}");
+    assert!(said.contains("Trust `ty`"), "{said}");
 }

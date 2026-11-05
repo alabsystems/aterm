@@ -50,10 +50,15 @@ pub struct Now {
 #[must_use]
 pub fn read_with(state: &Path, here: Here, now: u64) -> Now {
     let dir = crate::record::dir(state);
-    let record = crate::record::read(&dir)
-        .map(|written| written.record)
-        .unwrap_or_default();
-    let (evidence, passed) = crate::heard::read_counted(&dir);
+    let (record, (evidence, passed)) = match aterm_uds::private_file::JudgedDir::judge(&dir) {
+        Ok(judged) => (
+            crate::record::read_in(&judged)
+                .map(|written| written.record)
+                .unwrap_or_default(),
+            crate::heard::read_counted_in(&dir, &judged),
+        ),
+        Err(_) => (Default::default(), crate::heard::read_counted(&dir)),
+    };
     let (record, _) = step(&record, &here.facts, &evidence, None, now, None);
     let stay = record.current();
     Now {

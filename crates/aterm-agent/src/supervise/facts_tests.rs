@@ -101,6 +101,7 @@ fn reading(as_of_ms: i64, calls: Vec<BackgroundCall>) -> FactsReading {
         as_of_ms,
         no_progress: calls,
         held: None,
+        left: None,
     }
 }
 
@@ -213,6 +214,7 @@ fn held(as_of_ms: i64, pids: &[(u32, u64)]) -> FactsReading {
             as_of_ms,
             programs: held_calls(pids),
         }),
+        left: None,
     }
 }
 
@@ -349,6 +351,7 @@ fn a_held_part_older_than_the_gate_tells_nothing() {
                 as_of_ms: T0 - age,
                 programs: held_calls(&[(72955, 600_000)]),
             }),
+            left: None,
         };
         let mut s = FactsState::default();
         assert_eq!(
@@ -644,4 +647,377 @@ fn a_fact_left_in_the_composer_is_not_the_fact_to_tell() {
     s.told(key, T0 + 2);
     assert!(s.is_spoken_for(key), "told: spoken for");
     assert_eq!(s.pending(Some(&r), T0), None, "told: never again");
+}
+
+/// A reading of the agent's left rows alone, as of `as_of_ms`: `count` rows, the oldest 20
+/// minutes old.
+fn leftover(as_of_ms: i64, count: u32) -> FactsReading {
+    FactsReading {
+        as_of_ms,
+        no_progress: Vec::new(),
+        held: None,
+        left: Some(LeftoverReading {
+            as_of_ms,
+            count,
+            oldest_ms: Some(20 * 60_000),
+        }),
+    }
+}
+
+/// Asks at each of `readings` (with its time), telling what each gives: the episodes told.
+fn tells(s: &mut FactsState, readings: &[(Option<FactsReading>, i64)]) -> Vec<EpisodeKey> {
+    let mut told = Vec::new();
+    for (r, now) in readings {
+        if let Some(fact) = ask(s, r.as_ref(), *now) {
+            s.told(fact.key, *now);
+            told.push(fact.key);
+        }
+    }
+    told
+}
+
+/// A LEFTOVER EPISODE IS TOLD ONCE: the first fresh reading naming a row opens it and tells it;
+/// an absent reading, one whose left part was not read, and one naming none past the forgetting
+/// bound neither close nor reopen it, so a fresh reading naming two rows after them tells nothing;
+/// a fresh one naming none closes it, and the next row is a new episode, told again. NEGATIVE
+/// CONTROL: let a stale reading close the episode, and it is told twice.
+#[test]
+fn a_leftover_episode_is_told_once() {
+    let mut s = FactsState::default();
+    let stale = T0 + NO_PROGRESS_FRESH_MS + 1;
+    let unread = FactsReading {
+        left: None,
+        ..leftover(T0 + 1_000, 0)
+    };
+    let first = tells(
+        &mut s,
+        &[
+            (Some(leftover(T0, 1)), T0),
+            (None, T0 + 1_000),
+            (Some(unread), T0 + 1_000),
+            (Some(leftover(T0, 0)), stale),
+            (Some(leftover(stale + 1_000, 2)), stale + 1_000),
+        ],
+    );
+    assert_eq!(first.len(), 1, "told once: {first:?}");
+    assert_eq!(first[0].kind, FactKind::Leftover);
+    let clear = stale + 3_000;
+    let again = tells(
+        &mut s,
+        &[
+            (Some(leftover(clear, 0)), clear),
+            (Some(leftover(clear + 2_000, 1)), clear + 2_000),
+        ],
+    );
+    assert_eq!(again.len(), 1, "a fresh reading naming none closed it");
+    assert_ne!(again[0], first[0], "the next row is a new episode");
+}
+
+/// A LEFTOVER IS TOLD ONLY ON A PROMPT TYPED ANYWAY: the turn end's pick gives it, a break's
+/// stuck line never does, and still gives the held program beside it. NEGATIVE CONTROL: let the
+/// leftover ride a break, and the break's line tells it.
+#[test]
+fn a_leftover_is_never_a_breaks_line() {
+    let mut s = FactsState::default();
+    let r = leftover(T0, 1);
+    s.observe(Some(&r), T0);
+    assert_eq!(
+        s.pending(Some(&r), T0).map(|f| f.key.kind),
+        Some(FactKind::Leftover)
+    );
+    assert_eq!(s.pending_at_break(Some(&r), T0), None);
+    let both = FactsReading {
+        held: held(T0, &[(72955, 600_000)]).held,
+        ..r
+    };
+    s.observe(Some(&both), T0);
+    assert_eq!(
+        s.pending_at_break(Some(&both), T0).map(|f| f.key.kind),
+        Some(FactKind::ProgramCheck)
+    );
+}
+
+/// THE LEFTOVER SENTENCE NAMES COUNTS AND AGE ONLY: the closed template for one row, for three,
+/// and for rows whose age was not read; none says nothing; the longest (a ten-digit count and
+/// `9999999 h 59 m`) fits [`FACT_CAP`]. No sentence carries a path or any word outside the
+/// template's own. NEGATIVE CONTROL: put an executable word in the sentence, and the vocabulary
+/// check fails.
+#[test]
+fn the_leftover_fact_names_counts_and_age_only() {
+    let words = |count, oldest_ms| {
+        LeftoverReading {
+            as_of_ms: T0,
+            count,
+            oldest_ms,
+        }
+        .told()
+    };
+    let one = words(1, Some(20 * 60_000 + 59_999));
+    let three = words(3, Some(13 * 24 * 3_600_000));
+    let unaged = words(2, None);
+    let worst = words(u32::MAX, Some((9_999_999 * 3600 + 59 * 60) * 1000));
+    let template = [
+        "process",
+        "processes",
+        "this",
+        "session",
+        "started",
+        "still",
+        "run",
+        "runs",
+        "for",
+        "the",
+        "oldest",
+        "aterm",
+        "ctl",
+        "@self",
+        "sys",
+        "left",
+        "lists",
+        "it",
+        "them",
+        "s",
+        "m",
+        "h",
+    ];
+    for sentence in [&one, &three, &unaged, &worst] {
+        assert!(!sentence.contains('/'), "{sentence}");
+        for word in sentence.split(|c: char| c.is_whitespace() || ",;`".contains(c)) {
+            assert!(
+                word.is_empty()
+                    || word.chars().all(|c| c.is_ascii_digit())
+                    || template.contains(&word),
+                "{word:?} is outside the template: {sentence}"
+            );
+        }
+    }
+    assert_eq!(
+        one,
+        "1 process this session started still runs, for 20 m; `aterm ctl @self sys left` lists it"
+    );
+    assert_eq!(
+        three,
+        "3 processes this session started still run, the oldest for 312 h 00 m; `aterm ctl @self \
+         sys left` lists them"
+    );
+    assert_eq!(
+        unaged,
+        "2 processes this session started still run; `aterm ctl @self sys left` lists them"
+    );
+    assert_eq!(words(0, Some(1_000)), "");
+    assert!(worst.chars().count() <= FACT_CAP, "{worst}");
+}
+
+/// [`leftover`] whose left part is as of `left_ms`, in a reading taken at `as_of_ms`.
+fn left_at(as_of_ms: i64, left_ms: i64, count: u32) -> FactsReading {
+    let mut r = leftover(as_of_ms, count);
+    if let Some(left) = r.left.as_mut() {
+        left.as_of_ms = left_ms;
+    }
+    r
+}
+
+/// THE LEFTOVER PART IS JUDGED BY ITS OWN TIME, NOT THE READING'S: a fresh reading whose left part
+/// is past the tell gate opens the episode and tells nothing; a reading past every gate whose
+/// left part is fresh tells it, as of the part's time; once told, a fresh reading whose left part,
+/// naming none, is past the forgetting bound closes nothing, and the episode stays told.
+/// NEGATIVE CONTROL: judge the part by the reading's time in `pending`, and the first reading's
+/// part is told; in `observe`, and the stale part naming none closes the episode.
+#[test]
+fn a_leftover_part_is_judged_by_its_own_time() {
+    let mut s = FactsState::default();
+    let past_tell = T0 - FACT_FRESH_MS - 1;
+    assert_eq!(
+        ask(&mut s, Some(&left_at(T0, past_tell, 1)), T0),
+        None,
+        "a fresh reading of a left part past the tell gate"
+    );
+    let stale = T0 - NO_PROGRESS_FRESH_MS - 1;
+    let fact = ask(&mut s, Some(&left_at(stale, T0, 1)), T0).expect("a fresh left part");
+    assert_eq!(
+        (fact.key.kind, fact.key.id, fact.as_of_ms),
+        (FactKind::Leftover, past_tell.unsigned_abs(), T0),
+        "the episode the first reading opened, told as of the part's time"
+    );
+    s.told(fact.key, T0);
+    let later = T0 + 1_000;
+    s.observe(Some(&left_at(later, stale, 0)), later);
+    assert!(
+        s.is_told(fact.key),
+        "a stale left part naming none closes nothing"
+    );
+    assert_eq!(ask(&mut s, Some(&leftover(later, 1)), later), None);
+}
+
+/// A RESTART HOLDS A TOLD LEFTOVER EPISODE UNTIL IT CLEARS: a successor seeded from a typed
+/// `fact-leftover@v1` row ten minutes old opens its own episode (another id) and still holds it
+/// told; a fresh reading naming none releases the kind, and the next row is told. NEGATIVE
+/// CONTROL: seed the leftover kind by its key alone (`seeds_whole` false), and the successor tells
+/// the same leftovers again.
+#[test]
+fn a_restart_holds_a_told_leftover_episode_until_it_clears() {
+    let told = EpisodeKey {
+        kind: FactKind::Leftover,
+        id: (T0 - 600_000).unsigned_abs(),
+    };
+    let mut s = FactsState::default();
+    s.seed(
+        &[
+            (told, T0 - 600_000, SeedOutcome::Intent),
+            (told, T0 - 600_000, SeedOutcome::Typed),
+        ],
+        T0,
+    );
+    assert_eq!(
+        ask(&mut s, Some(&leftover(T0, 2)), T0),
+        None,
+        "the successor's episode is another id, held told"
+    );
+    let clear = T0 + 2_000;
+    assert_eq!(ask(&mut s, Some(&leftover(clear, 0)), clear), None);
+    let again = clear + 2_000;
+    assert_eq!(
+        ask(&mut s, Some(&leftover(again, 1)), again).map(|f| f.key.kind),
+        Some(FactKind::Leftover),
+        "seen clear: the next row is told"
+    );
+}
+
+use crate::supervise::overlap::OVERLAP_FRESH_MS;
+
+/// Two minted sids, as `aterm_session::SessionId::generate` makes them, and a third.
+const PEER_A: &str = "s-0a1b2c3d4e5f60718293";
+const PEER_B: &str = "s-ffeeddccbbaa99887766";
+const PEER_C: &str = "s-00000000000000000c0c";
+
+/// An overlap reading as of `as_of_ms`: `files` files shared with `peers`.
+fn shared(as_of_ms: i64, files: u32, peers: &[&str]) -> OverlapReading {
+    OverlapReading::new(as_of_ms, files, peers).expect("minted sids")
+}
+
+/// Observes the overlap `r` at `now`, then the overlap it tells.
+fn ask_overlap(s: &mut FactsState, r: Option<&OverlapReading>, now: i64) -> Option<Fact> {
+    s.observe_overlap(r, now);
+    s.pending_overlap(r, now)
+}
+
+/// AN OVERLAP EPISODE IS TOLD ONCE, AND A NEW PEER IS A NEW ONE: the first reading naming a peer
+/// tells it (`fact-overlap@v1`, its sentence, the reading's time); the same peer with more files is
+/// the same episode, not told again; an absent reading, or one older than [`OVERLAP_FRESH_MS`],
+/// forgets nothing, and an old one tells nothing. NEGATIVE CONTROLS: a third session joining is a
+/// new episode, told; a present reading with no overlap forgets it, and the next overlap with those
+/// peers is told again.
+#[test]
+fn an_overlap_episode_is_told_once_and_a_new_peer_is_a_new_one() {
+    assert_eq!(FactKind::Overlap.rule(), "fact-overlap@v1");
+    assert_eq!(FactKind::of_word("overlap"), Some(FactKind::Overlap));
+    assert_eq!(FactKind::ALL.last(), Some(&FactKind::Overlap));
+    let mut s = FactsState::default();
+    let first = ask_overlap(&mut s, Some(&shared(T0, 1, &[PEER_A])), T0).expect("told");
+    assert_eq!(first.key.kind, FactKind::Overlap);
+    assert_eq!(first.as_of_ms, T0);
+    assert_eq!(
+        first.text,
+        format!("1 file this branch changes is also changed by {PEER_A}")
+    );
+    s.told(first.key, T0);
+    let more = T0 + 60_000;
+    assert_eq!(
+        ask_overlap(&mut s, Some(&shared(more, 4, &[PEER_A])), more),
+        None,
+        "the same peer with more files: not told again"
+    );
+    let old = shared(more, 0, &[]);
+    for (seen, now) in [(None, more), (Some(&old), more + OVERLAP_FRESH_MS + 1)] {
+        s.observe_overlap(seen, now);
+        assert!(s.is_told(first.key), "{seen:?} at {now} forgets nothing");
+    }
+    assert_eq!(
+        s.pending_overlap(
+            Some(&shared(more, 1, &[PEER_B])),
+            more + OVERLAP_FRESH_MS + 1
+        ),
+        None,
+        "an old reading tells nothing"
+    );
+    let joined = ask_overlap(&mut s, Some(&shared(more, 4, &[PEER_A, PEER_C])), more)
+        .expect("CONTROL: a third session joining is told");
+    assert_ne!(joined.key, first.key);
+    s.told(joined.key, more);
+    assert!(!s.is_told(first.key), "the set it was is over");
+    let clear = more + 1_000;
+    assert_eq!(
+        ask_overlap(&mut s, Some(&shared(clear, 0, &[])), clear),
+        None
+    );
+    assert!(
+        !s.is_told(joined.key),
+        "CONTROL: a present reading with no overlap forgets"
+    );
+    assert_eq!(
+        ask_overlap(&mut s, Some(&shared(clear, 2, &[PEER_C, PEER_A])), clear).map(|f| f.key),
+        Some(joined.key),
+        "CONTROL: overlapping again, told again"
+    );
+}
+
+/// AN OVERLAP TELLS FROM RECORDS AS OLD AS A TURN: its reading is as old as the oldest work record
+/// it rests on, which its session read at its last turn end, so a reading two minutes old tells,
+/// with that time, and one [`OVERLAP_FRESH_MS`] old still does. NEGATIVE CONTROL: a millisecond
+/// older, a reading tells nothing and closes nothing.
+#[test]
+fn an_overlap_tells_from_records_as_old_as_a_turn() {
+    let mut s = FactsState::default();
+    let first = ask_overlap(&mut s, Some(&shared(T0, 1, &[PEER_A])), T0 + 120_000)
+        .expect("two minutes old: told");
+    assert_eq!(first.as_of_ms, T0);
+    s.told(first.key, T0 + 120_000);
+    let past = T0 + OVERLAP_FRESH_MS + 1;
+    assert_eq!(
+        ask_overlap(&mut s, Some(&shared(T0, 1, &[PEER_B])), past),
+        None,
+        "CONTROL: past the bound, nothing told"
+    );
+    assert!(
+        s.is_told(first.key),
+        "CONTROL: past the bound, nothing closed"
+    );
+    assert!(
+        ask_overlap(
+            &mut s,
+            Some(&shared(T0, 1, &[PEER_B])),
+            T0 + OVERLAP_FRESH_MS
+        )
+        .is_some(),
+        "at the bound: told"
+    );
+}
+
+/// A SEED HOLDS A TOLD OVERLAP BY ITS OWN KEY ALONE: the overlap's key is its peers' sids, which a
+/// successor names again exactly, so a typed row holds that episode told and no other. NEGATIVE
+/// CONTROL: an intent with no outcome after it leaves the episode untold.
+#[test]
+fn a_seed_holds_a_told_overlap_by_its_own_key_alone() {
+    let told = shared(T0, 1, &[PEER_A]).episode().expect("an episode");
+    let meant = shared(T0, 1, &[PEER_B]).episode().expect("an episode");
+    let mut s = FactsState::default();
+    s.seed(
+        &[
+            (told, T0, SeedOutcome::Intent),
+            (told, T0, SeedOutcome::Typed),
+            (meant, T0, SeedOutcome::Intent),
+        ],
+        T0 + 60_000,
+    );
+    assert_eq!(
+        s.pending_overlap(Some(&shared(T0, 2, &[PEER_A])), T0),
+        None,
+        "told before the restart"
+    );
+    assert_eq!(
+        s.pending_overlap(Some(&shared(T0, 1, &[PEER_B])), T0)
+            .map(|f| f.key),
+        Some(meant),
+        "CONTROL: an intent alone was never told"
+    );
 }

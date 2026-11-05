@@ -1380,14 +1380,17 @@ impl App {
         true
     }
 
-    /// Posts a `harness`-tagged log record from `aterm ctl appnotice harness`.
+    /// Posts a `harness`-tagged log record from `aterm ctl appnotice harness`
+    /// ([`crate::message_reporters::harness_note`]), unless its whole text is the last one
+    /// recorded's: two notes that differ only past the title's cut are two records, and a note
+    /// identical to an earlier one but not the last is written again.
     pub(crate) fn record_harness_note(&mut self, text: &str) -> bool {
-        let msg = crate::message_reporters::harness_note(text);
-        if self.harness_note_recorded.as_deref() == Some(msg.title.as_str()) {
+        let whole = crate::message_reporters::harness_note_text(text);
+        if self.harness_note_recorded.as_deref() == Some(whole.as_str()) {
             return false;
         }
-        self.harness_note_recorded = Some(msg.title.clone());
-        self.record_message(msg);
+        self.record_message(crate::message_reporters::harness_note(text));
+        self.harness_note_recorded = Some(whole);
         true
     }
 

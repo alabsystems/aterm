@@ -49,6 +49,9 @@ pub(crate) struct Asker {
     then: String,
     /// The membership log removed it (F16): the removal's own words.
     removed: Option<String>,
+    /// A live seat holds its node key under another vault key, and the Allow moves that seat to
+    /// it (one-mesh A15): when the old key last signed, and that it reads no newer secret.
+    moves: Option<String>,
 }
 
 /// The askers of a member desk's rows still asking, from whatever network: Allow where this Mac
@@ -86,6 +89,10 @@ pub(crate) fn desk_askers(rows: &[Row], can_allow: bool) -> Vec<Asker> {
                     .removed
                     .as_ref()
                     .map(aterm_secrets::client::RemovedNote::title),
+                moves: row
+                    .moves
+                    .as_ref()
+                    .map(aterm_secrets::client::KeptSeat::title),
             }
         })
         .collect()
@@ -105,6 +112,7 @@ pub(crate) fn approver_askers(asking: &[Asking]) -> Vec<Asker> {
                     recipient: asking.recipient.clone(),
                 }),
                 removed: None,
+                moves: None,
             }
         })
         .collect()
@@ -161,6 +169,9 @@ pub(crate) fn entries(askers: Vec<Asker>) -> Vec<Entry> {
         .map(|asker| {
             let namesakes = askers.iter().filter(|a| a.name == asker.name).count();
             let what = match (namesakes, &asker.removed) {
+                (1, None) if asker.moves.is_some() => {
+                    format!("Rebuilt Mac calling itself {}", asker.name)
+                }
                 (1, None) => format!("New Mac calling itself {}", asker.name),
                 (1, Some(_)) => format!("Removed Mac calling itself {}", asker.name),
                 (n, _) => format!("{n} Macs calling themselves {}", asker.name),
@@ -180,8 +191,8 @@ pub(crate) fn entries(askers: Vec<Asker>) -> Vec<Entry> {
                 "members: a Mac calling itself {} asks to join ALab (code {})",
                 asker.name, asker.code
             ));
-            if let Some(removed) = &asker.removed {
-                entry = entry.more(removed);
+            if let Some(words) = asker.removed.as_ref().or(asker.moves.as_ref()) {
+                entry = entry.more(words);
             }
             match &asker.nav {
                 Some(nav) => entry.show(nav.clone()),

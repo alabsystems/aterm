@@ -78,10 +78,8 @@ pub const MASTER_FLAGS: &[&str] = &[
 /// Value following `--<name>`, or `None` (two-token `--name value` form; [`vet_args`] runs first).
 #[must_use]
 pub fn flag<'a>(argv: &'a Argv, name: &str) -> Option<&'a str> {
-    let mut want = String::from("--");
-    want.push_str(name);
     for i in 0..MAX_ARGS {
-        if argv[i].as_deref() == Some(want.as_str()) && i + 1 < MAX_ARGS {
+        if argv[i].as_deref().and_then(|a| a.strip_prefix("--")) == Some(name) && i + 1 < MAX_ARGS {
             return argv[i + 1].as_deref();
         }
     }
@@ -218,8 +216,23 @@ pub fn verify_signed(
     use aterm_update_core::roster::{Roster, verify_roster};
     let verified = verify_roster(master_pubkeys, roster, roster_sig)?;
     let parsed = Roster::parse(&verified)?;
-    parsed.admit(0, now_unix)?;
-    let who = parsed.authorize_appcast(file, sig, now_unix)?;
+    verify_signed_by_roster(&parsed, file, sig, now_unix)
+}
+
+/// Verify a detached Ed25519 signature over `file`'s exact bytes against an already
+/// master-verified [`aterm_update_core::roster::Roster`].
+///
+/// # Errors
+///
+/// The [`aterm_update_core::roster::RosterReject`] of the first step that refused.
+pub fn verify_signed_by_roster(
+    roster: &aterm_update_core::roster::Roster,
+    file: &[u8],
+    sig: &[u8],
+    now_unix: i64,
+) -> Result<Signed, aterm_update_core::roster::RosterReject> {
+    roster.admit(0, now_unix)?;
+    let who = roster.authorize_appcast(file, sig, now_unix)?;
     Ok(Signed {
         machine_id: who.machine_id,
         roster_seq: who.roster_seq,

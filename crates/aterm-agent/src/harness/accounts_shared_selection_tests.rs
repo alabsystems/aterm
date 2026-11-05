@@ -278,6 +278,20 @@ fn stale_shared_dispatch_preserves_a_newer_request_and_unreadable_state() {
 /// that starts is handed none ([`RUNS_HANDED`]).
 fn progress(bed: &Bed) -> (bool, usize) {
     let store = &bed.store;
+    // The other account is one a session here runs on that lost its login, the door an
+    // upkeep signs in by (`upkeep_sign_in`).
+    store
+        .transact(NOW, &mut None, |state| {
+            let mut events = accounts::note_session(state, "s-1", "other", None, NOW - 60);
+            events.extend(accounts::note_auth(
+                state,
+                "other",
+                accounts::Auth::SignedOut,
+                NOW - 60,
+            ));
+            Ok(events)
+        })
+        .unwrap();
     let opener = bed.home.join(".local/bin/aterm-open-url");
     fs::create_dir_all(opener.parent().unwrap()).unwrap();
     #[cfg(unix)]

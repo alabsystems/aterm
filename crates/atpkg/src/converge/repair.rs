@@ -1130,7 +1130,7 @@ impl Repair {
     fn probe_exec_roots(&self) -> Probe {
         use crate::compat::RootState;
         let layout = self.layout();
-        let Some(&build) = crate::ops::active_builds(layout).get(crate::seam::SEAM_PROGRAM) else {
+        let Some(build) = crate::ops::active_build_of(layout, crate::seam::SEAM_PROGRAM) else {
             return ok("no active trust build, so no exec root");
         };
         match self.ground.reads.inspect(layout, build) {
@@ -1455,16 +1455,19 @@ pub(crate) fn exposes(layout: &Layout, program: &str, build_dir: &Path) -> Optio
 /// tombstone (which the plan reports revoked) — never another program's or a file of the user's.
 fn free_for(layout: &Layout, program: &str, tool: &crate::store::ToolName) -> bool {
     let shim = layout.shim(tool);
-    match std::fs::symlink_metadata(&shim) {
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-        Ok(_) => crate::platform::resolve_shim(&shim).map_or_else(
-            || crate::cli::is_tombstone_shim(layout, tool.as_str()),
-            |target| {
-                crate::ops::store_build_of(&layout.prefix, &target)
-                    .is_some_and(|(owner, _)| owner == program)
-            },
-        ),
+    let read = crate::platform::read_shim(&shim);
+    if let Some(target) = read.target {
+        return crate::ops::store_build_of(&layout.prefix, &target)
+            .is_some_and(|(owner, _)| owner == program);
     }
+    if read
+        .body
+        .as_deref()
+        .is_some_and(crate::cli::is_tombstone_shim_body)
+    {
+        return true;
+    }
+    std::fs::symlink_metadata(&shim).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
 #[cfg(all(test, unix))]

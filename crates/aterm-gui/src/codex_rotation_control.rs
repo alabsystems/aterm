@@ -105,6 +105,7 @@ impl pool::UsageReader for FixtureUsage<'_> {
         expected_email: Option<&str>,
         now: i64,
         wait: Duration,
+        use_token: aterm_agent::harness::provider_read::Use,
     ) -> Option<aterm_agent::harness::codex_app_login::IdentifiedUsage> {
         aterm_agent::harness::codex_app_login::read_identified_login_with_fixture_roots(
             home,
@@ -114,6 +115,7 @@ impl pool::UsageReader for FixtureUsage<'_> {
             now,
             expected_email,
             self.roots.clone(),
+            use_token,
         )
     }
 }

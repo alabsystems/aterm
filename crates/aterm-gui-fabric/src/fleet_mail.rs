@@ -27,6 +27,21 @@ use serde::{Deserialize, Serialize};
 const ROWS: usize = 64;
 const PER_NODE: usize = 16;
 const TEXT: usize = 4096;
+
+/// Capture the release policy once when the session is created.
+#[cfg(unix)]
+pub(super) struct MeshPolicy {
+    enabled: bool,
+}
+
+#[cfg(unix)]
+impl Default for MeshPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: aterm_types::mesh_switch::MESH,
+        }
+    }
+}
 #[cfg(unix)]
 const BUSY: &str = "another direct-mail operation holds this mailbox";
 /// The largest mailbox, as the TOML that is sealed.
@@ -162,7 +177,7 @@ impl Stamp {
 /// unsafe path, or a failed metadata read is refused.
 #[cfg(unix)]
 pub fn stamp(path: &std::path::Path) -> std::io::Result<Stamp> {
-    use aterm_uds::private_file::{PrivateFileError, check_private_dir, open_private};
+    use aterm_uds::private_file::{JudgedDir, PrivateFileError, check_private_dir};
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other("the mailbox has no directory"))?;
@@ -171,9 +186,14 @@ pub fn stamp(path: &std::path::Path) -> std::io::Result<Stamp> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| std::io::Error::other("the mailbox has no file name"))?;
     let none = || std::io::Error::new(std::io::ErrorKind::NotFound, "no mailbox");
-    let (_file, metadata) = open_private(dir, name).map_err(|error| match error {
-        // `open_private` answers a missing file before it judges an existing directory's
+    let judged = JudgedDir::judge(dir).map_err(|error| match error {
+        PrivateFileError::Io(error) => error,
+        error => std::io::Error::other(error.to_string()),
+    })?;
+    let (_file, metadata) = judged.open(name).map_err(|error| match error {
+        // `JudgedDir::open` answers a missing file before it judges an existing directory's
         // owner, mode and access list, so absence is judged against those rules here.
+        PrivateFileError::Missing if judged.is_private() || judged.is_missing() => none(),
         PrivateFileError::Missing => match check_private_dir(dir) {
             Ok(()) => none(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => none(),
@@ -277,7 +297,8 @@ fn id(word: &str) -> Option<u64> {
 }
 
 fn valid_node(node: &str) -> bool {
-    node.len() == 32
+    let (node, len) = node.strip_prefix("n-").map_or((node, 32), |id| (id, 16));
+    node.len() == len
         && node
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
@@ -592,12 +613,21 @@ fn transaction_waiting<T>(
     if !validated(&boxed) {
         return Err("direct fleet mailbox is malformed".into());
     }
+    let migrated = if ctx.fabric().mesh.enabled {
+        let aliases = mesh_aliases()?;
+        rewrite_nodes(&mut boxed, &aliases)
+    } else {
+        0
+    };
     // A file this writes is a new one, published by rename; a stamp it cannot read caches none,
     // so the next reader takes a transaction.
-    if plaintext {
+    if plaintext || migrated > 0 {
         // Sealed before the edit, which may refuse, so this transaction seals it either way.
         write_mailbox(dir, name, &boxed, &mut key)?;
         stamp = self::stamp(&path).ok();
+        if migrated > 0 {
+            aterm_log::info!("mesh mail rewrite: rows={migrated}");
+        }
     }
     let (result, changed) = edit(&mut boxed)?;
     if changed {
@@ -610,6 +640,45 @@ fn transaction_waiting<T>(
         self::changed(ctx);
     }
     Ok((result, changed))
+}
+
+#[cfg(unix)]
+fn mesh_aliases() -> Result<Vec<(String, String)>, String> {
+    use aterm_uds::private_file::{PrivateFileError, read_private};
+    let Some(dir) = aterm_types::dirs::state_dir() else {
+        return Ok(Vec::new());
+    };
+    match read_private(&dir, "mesh-node-aliases", 1024 * 1024) {
+        Ok(bytes) => {
+            let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+            text.lines()
+                .map(|line| {
+                    let (old, new) = line.split_once(' ').ok_or("malformed mesh node alias")?;
+                    if !valid_node(old) || !new.starts_with("n-") || !valid_node(new) {
+                        return Err("malformed mesh node alias".to_owned());
+                    }
+                    Ok((old.to_owned(), new.to_owned()))
+                })
+                .collect()
+        }
+        Err(PrivateFileError::Missing) => Ok(Vec::new()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn rewrite_nodes(boxed: &mut Mailbox, aliases: &[(String, String)]) -> usize {
+    let mut changed = 0;
+    for row in &mut boxed.rows {
+        if let Some((_, new)) = aliases
+            .iter()
+            .find(|(old, new)| old == &row.node && old != new)
+        {
+            row.node.clone_from(new);
+            changed += 1;
+        }
+    }
+    changed
 }
 
 #[cfg(not(unix))]
@@ -1079,6 +1148,37 @@ mod tests {
     use super::*;
     use crate::{Driver, DrivingAs, FabricFact, SessionFabric};
     use aterm_session::SessionId;
+
+    #[test]
+    fn mesh_mail_rewrite_retains_unknown_nodes_and_is_idempotent() {
+        let old = "a".repeat(32);
+        let unknown = "b".repeat(32);
+        let mut boxed = Mailbox {
+            next: 2,
+            rows: [old.clone(), unknown.clone()]
+                .into_iter()
+                .enumerate()
+                .map(|(i, node)| Row {
+                    id: i as u64 + 1,
+                    node,
+                    key: "unique".into(),
+                    kind: "ask".into(),
+                    text: "retained".into(),
+                    listed: false,
+                    reply: None,
+                    reply_seen: false,
+                })
+                .collect(),
+        };
+        let aliases = vec![(old, "n-0123456789abcdef".into())];
+        assert_eq!(rewrite_nodes(&mut boxed, &aliases), 1);
+        assert_eq!(boxed.rows[0].node, aliases[0].1);
+        assert_eq!(boxed.rows[1].node, unknown);
+        assert_eq!(boxed.rows[0].text, "retained");
+        assert!(validated(&boxed));
+        assert_eq!(rewrite_nodes(&mut boxed, &aliases), 0);
+        assert!(!valid_node("0123456789abcdef"));
+    }
 
     struct Session {
         sid: SessionId,

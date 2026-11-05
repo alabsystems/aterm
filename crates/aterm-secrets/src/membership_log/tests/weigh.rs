@@ -899,6 +899,18 @@ fn cutoffs_of(log: &Log, who: Mac) -> Vec<RecordId> {
         .collect()
 }
 
+/// The [`GENERATED`] logs of [`generated_log`], named by seed, built once a run: every signature
+/// is paid by the first reader. A clone shares each log's caches, so a reader that counts a log's
+/// work counts it on a log it builds from these records, and no mutant runs on these logs.
+pub(super) fn generated_logs() -> &'static [(String, Log)] {
+    static LOGS: OnceLock<Vec<(String, Log)>> = OnceLock::new();
+    LOGS.get_or_init(|| {
+        (1..=GENERATED)
+            .map(|seed| (format!("generated {seed}"), generated_log(seed)))
+            .collect()
+    })
+}
+
 /// A random log from `seed`: 3 to 5 founders, 15 to 50 steps on up to three branches (clones,
 /// healed by merging), each an admission (a fresh Mac 60% of the time), a removal at a cutoff
 /// the branch holds, a quorum (2 to 4 seated signers removing one Mac at one cutoff), a name, a
@@ -1067,21 +1079,6 @@ pub(super) fn corpus() -> Vec<(String, Log)> {
     logs
 }
 
-pub(in crate::membership_log) fn relation_baseline_corpus() -> Vec<(String, Log)> {
-    let mut logs = corpus();
-    logs.extend([
-        ("distinct K=64".into(), distinct_flood(64)),
-        (
-            "redundant m=100 K=50".into(),
-            redundant_removal_flood(100, 50, Restore::Never),
-        ),
-        ("restore chain K=40".into(), restore_chain_flood(40)),
-        ("many cuts m=48 c=40".into(), many_cuts_flood(48, 40)),
-        ("section4.2 N=256".into(), section_4_2_flood(256)),
-    ]);
-    logs
-}
-
 /// The admit-chain log: P lets Q in, W removes P from the genesis after signing n1, a quorum
 /// removes C at C's record, and another removes W at n1. With W's removal of P void, Q's
 /// membership changes only through P's `Admit` of it being effective again.
@@ -1116,10 +1113,9 @@ pub(super) const GENERATED: u64 = 200;
 /// every standing `Remove` pins; a final `Remove` pins its target out.
 #[test]
 fn the_weighing_walk_agrees_with_weighing_each_pair() {
-    let generated = (1..=GENERATED).map(|seed| (format!("generated {seed}"), generated_log(seed)));
     let mut weighed_pairs = 0;
-    for (name, log) in corpus().into_iter().chain(generated) {
-        let records = held(&log);
+    for (name, log) in corpus().iter().chain(generated_logs()) {
+        let records = held(log);
         let by_pairs = eval::weigh_relations(&records, true);
         let walk = eval::weigh_relations(&records, false);
         assert_eq!(walk, by_pairs, "{name}");
@@ -1157,9 +1153,8 @@ fn weighing_never_costs_more_evaluations_than_weighing_each_pair() {
         let (walk, pairs) = costs(log);
         assert!(walk.work() <= pairs.work(), "{name}: {walk:?} {pairs:?}");
     }
-    let generated = (1..=GENERATED).map(|seed| (format!("generated {seed}"), generated_log(seed)));
-    for (name, log) in corpus().into_iter().chain(generated) {
-        let (walk, pairs) = costs(&log);
+    for (name, log) in corpus().iter().chain(generated_logs()) {
+        let (walk, pairs) = costs(log);
         assert!(
             walk.evaluations <= pairs.evaluations,
             "{name}: {walk:?} {pairs:?}"

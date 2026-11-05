@@ -967,11 +967,13 @@ impl App {
     }
 
     /// Keep activity pacing for every key or input-method callback, but known controller input
-    /// establishes no person's presence. `posted` is the provenance captured at the native source.
+    /// establishes no person's presence. `origin` is the provenance captured at the native source:
+    /// a key another process posted is a person's presence here, as their on-screen keyboard's or
+    /// Screen Sharing's is.
     pub(crate) fn note_window_input_arrival(
         &mut self,
         event: &aterm_window::event::WindowEvent,
-        posted: bool,
+        origin: aterm_window::event::InputOrigin,
     ) {
         use aterm_window::event::WindowEvent;
         if matches!(
@@ -982,41 +984,44 @@ impl App {
             self.last_keystroke_at = Some(now);
             crate::note_key_rest(None, true, now);
         }
-        if crate::is_person_input(event)
-            && !(posted
-                && matches!(
-                    event,
-                    WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
-                ))
-        {
+        if crate::is_person_input(event) && origin != aterm_window::event::InputOrigin::Posted {
             self.last_person_input_at = Some(Instant::now());
         }
     }
 
-    /// One key from the winit `KeyboardInput` arm. A key an `hwkey` burst posted (`posted`, as
-    /// it arrived: `App::key_event_posted`) takes this, the person's own key path, with no mark
-    /// of its own, but it is a control client's gesture: its dispatch carries the controller
-    /// mark, so the person-only leaves it reaches (⌘V, ⌘C, a Copy or Paste binding, the stats
-    /// lens's copies, an Editor's kill ring and macro) refuse it as they refuse `key`.
+    /// One key from the winit `KeyboardInput` arm, from `origin` (as it arrived:
+    /// `App::input_origin`). A key an `hwkey` burst posted takes this, the person's own key path,
+    /// with no mark of its own, but it is a control client's gesture: its dispatch carries the
+    /// controller mark, so the person-only leaves it reaches (⌘V, ⌘C, a Copy or Paste binding, the
+    /// stats lens's copies, an Editor's kill ring and macro) refuse it as they refuse `key`. A key
+    /// another process posted carries the relayed mark, so its edit of the aterm.toml in force is
+    /// no person's ([`crate::owner_keys_save::Unvouched::Relayed`]).
     pub(crate) fn dispatch_hw_key(
         &mut self,
         wid: WindowId,
         event: aterm_window::event::KeyEvent,
-        posted: bool,
+        origin: aterm_window::event::InputOrigin,
     ) {
-        self.with_controller_mark(posted, |app| app.dispatch_key_event(wid, event));
+        self.with_origin_mark(origin, |app| app.dispatch_key_event(wid, event));
     }
 
-    /// An input method's callback through the same controller mark as its causal native key.
-    /// Composed text still follows the existing recipient and delivery paths.
+    /// An input method's callback through the same mark as its causal native key. Composed text
+    /// still follows the existing recipient and delivery paths. A commit also carries the mark of
+    /// the keys that composed it ([`Self::ime_composed_from`]), so text a posted key composed
+    /// stays that key's when the person's key commits it.
     pub(crate) fn dispatch_ime_event(
         &mut self,
         wid: WindowId,
         ime: aterm_window::event::Ime,
-        posted: bool,
+        origin: aterm_window::event::InputOrigin,
     ) {
-        use aterm_window::event::Ime;
-        self.with_controller_mark(posted, |app| match ime {
+        use aterm_window::event::{Ime, InputOrigin};
+        let composed = if matches!(ime, Ime::Commit(_)) {
+            self.ime_composed_from(wid)
+        } else {
+            InputOrigin::Person
+        };
+        self.with_origin_mark(origin.max(composed), |app| match ime {
             Ime::Preedit(text, cursor) => app.on_ime_preedit(wid, text, cursor),
             Ime::Commit(text) => app.on_ime_commit(wid, text),
             Ime::Enabled | Ime::Disabled => app.on_ime_enablement_changed(wid),
@@ -2097,6 +2102,7 @@ pub(crate) fn harness_need_hover(ask: &crate::needs::HarnessAsk) -> Vec<String> 
     }
     lines.push(aterm_agent::supervise::mode_words::report_words(
         ask.program.product(),
+        ask.tail,
         false,
     ));
     lines
@@ -2403,6 +2409,8 @@ fn grok_signin_now(
 
 #[cfg(test)]
 mod tests {
+
+    use aterm_window::event::InputOrigin;
 
     use super::*;
     use crate::presence::{ChipLevel, Rim};
@@ -3085,7 +3093,7 @@ mod tests {
             is_synthetic: false,
         };
         assert!(app.last_person_input_at.is_none());
-        app.note_window_input_arrival(&event, true);
+        app.note_window_input_arrival(&event, InputOrigin::Posted);
         assert!(
             app.last_keystroke_at.is_some(),
             "automation still counts as input activity"
@@ -3093,17 +3101,23 @@ mod tests {
         assert!(app.last_person_input_at.is_none());
         assert!(!app.person_present_within(Duration::from_secs(60), Instant::now()));
         app.last_keystroke_at = None;
-        app.note_window_input_arrival(&event, false);
+        app.note_window_input_arrival(&event, InputOrigin::Person);
         assert!(app.last_keystroke_at.is_some());
         let person = app
             .last_person_input_at
             .expect("a physical key establishes presence");
         assert!(app.person_present_within(Duration::from_secs(60), Instant::now()));
-        app.note_window_input_arrival(&event, true);
+        app.note_window_input_arrival(&event, InputOrigin::Posted);
         assert_eq!(
             app.last_person_input_at,
             Some(person),
             "a later posted key preserves the actual person's stamp"
+        );
+        app.last_person_input_at = None;
+        app.note_window_input_arrival(&event, InputOrigin::Relayed);
+        assert!(
+            app.last_person_input_at.is_some(),
+            "a key another process posted (Screen Sharing, an on-screen keyboard) is presence"
         );
     }
 
@@ -3131,7 +3145,7 @@ mod tests {
                 false,
             )
         };
-        app.dispatch_hw_key(wid, key(), true);
+        app.dispatch_hw_key(wid, key(), InputOrigin::Posted);
         assert_eq!(
             app.presence_session_level(sid),
             presence::Level::Story,
@@ -3146,7 +3160,7 @@ mod tests {
             presence::Level::Story,
             "a pointer click"
         );
-        app.dispatch_hw_key(wid, key(), false);
+        app.dispatch_hw_key(wid, key(), InputOrigin::Person);
         assert_eq!(
             app.presence_session_level(sid),
             presence::Level::Quiet,

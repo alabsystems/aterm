@@ -389,20 +389,8 @@ fn load_database(conn: &aterm_x11::Connection) -> Result<Database, X11Error> {
         .reply()?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let file = |path: PathBuf| {
-        use std::io::Read as _;
         const MAX_XRESOURCES_BYTES: u64 = 16 * 1024 * 1024;
-        let f = std::fs::File::open(&path).ok()?;
-        let meta = f.metadata().ok()?;
-        if !meta.is_file() || meta.len() > MAX_XRESOURCES_BYTES {
-            return None;
-        }
-        let cap =
-            usize::try_from(meta.len().min(MAX_XRESOURCES_BYTES)).unwrap_or(0).saturating_add(1);
-        let mut data = Vec::with_capacity(cap);
-        f.take(MAX_XRESOURCES_BYTES + 1).read_to_end(&mut data).ok()?;
-        if data.len() as u64 > MAX_XRESOURCES_BYTES {
-            return None;
-        }
+        let data = xrm::read_regular_file(&path, MAX_XRESOURCES_BYTES)?;
         Some(Database::parse_file(&data, &xrm::include_dir(&path)))
     };
     let mut database = if reply.format == 8 && !reply.value.is_empty() {

@@ -101,6 +101,7 @@ impl ToolError {
         let (class, not_started) = match error {
             E::Run(RunError::Spawn(_)) if !started => ("spawn", true),
             E::Run(RunError::Spawn(_)) => ("reader-spawn", false),
+            E::Run(RunError::Capture(_)) => ("capture", false),
             E::Run(RunError::Wait(_)) => ("wait", false),
             E::Run(RunError::TimedOut) => ("deadline", false),
             E::StdoutRead(_) => ("stdout-read", false),

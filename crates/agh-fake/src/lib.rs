@@ -823,7 +823,7 @@ impl FakeGithub {
         releases
     }
 
-    /// `slug`'s refs: `refs/heads/…` and `refs/tags/…` with their shas, sorted.
+    /// `slug`'s fully qualified refs with their OIDs, sorted.
     #[must_use]
     pub fn git_refs(&self, slug: &str) -> Vec<(String, String)> {
         let state = self.state();

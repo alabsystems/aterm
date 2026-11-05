@@ -257,6 +257,7 @@ pub(super) fn blocked_rejection() -> (Arc<Accts>, WorkerIdle, Arc<Mutex<Option<a
 fn a_rejected_restart_keeps_its_rollback_until_recorded() {
     let (a, idle, held) = blocked_rejection();
     assert_eq!(a.state().active.as_deref(), Some("work-2"));
+    assert!(a.state().login_dir_spans[ACCT_TALK_A].covers(a.clock()));
     drop(held.lock().unwrap().take());
     assert!(matches!(
         account_land(&idle.sid, &idle.kept, &idle.hooks, Landing::Asked),
@@ -265,6 +266,7 @@ fn a_rejected_restart_keeps_its_rollback_until_recorded() {
     assert!(idle.kept.lock().unwrap().account.flying.is_none());
     assert!(idle.kept.lock().unwrap().account.moved.is_none());
     assert_eq!(a.state().active, None);
+    assert!(a.state().login_dir_spans.is_empty());
     assert!(a.state().rotations.is_empty());
     assert_eq!(a.ledger(), ["wall", "rotate", "struck"]);
     account_land(&idle.sid, &idle.kept, &idle.hooks, Landing::Asked);
@@ -274,7 +276,7 @@ fn a_rejected_restart_keeps_its_rollback_until_recorded() {
 
 #[test]
 fn a_pending_rejection_preserves_new_session_and_canary_state() {
-    for change in ["session", "canary", "gone"] {
+    for change in ["session", "canary", "gone", "session+spans"] {
         let (a, idle, held) = blocked_rejection();
         drop(held.lock().unwrap().take());
         a.store()
@@ -291,6 +293,15 @@ fn a_pending_rejection_preserves_new_session_and_canary_state() {
                         accounts::forget_session(state, &idle.sid);
                         Vec::new()
                     }
+                    "session+spans" => {
+                        assert!(accounts::note_on_login_dir(
+                            state,
+                            ACCT_TALK_A,
+                            a.clock() - 100,
+                            a.clock()
+                        ));
+                        accounts::note_session(state, &idle.sid, "pool-a", None, a.clock())
+                    }
                     _ => unreachable!(),
                 };
                 Ok(events)
@@ -302,7 +313,14 @@ fn a_pending_rejection_preserves_new_session_and_canary_state() {
             account_land(&idle.sid, &idle.kept, &idle.hooks, Landing::Asked),
             Applied::No
         ));
-        assert_eq!(a.state(), before, "{change}");
+        // The move's own stretch under work-2's login goes: no process of it ran there. A
+        // record another writer has put since is theirs.
+        let mut kept = before.clone();
+        assert!(kept.login_dir_spans.contains_key(ACCT_TALK_A), "{change}");
+        if change != "session+spans" {
+            kept.login_dir_spans.remove(ACCT_TALK_A);
+        }
+        assert_eq!(a.state(), kept, "{change}");
         assert_eq!(a.ledger(), ledger, "{change}");
         assert!(idle.kept.lock().unwrap().account.flying.is_none());
         assert!(idle.kept.lock().unwrap().account.moved.is_none());

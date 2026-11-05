@@ -174,6 +174,53 @@ pub fn decode_strict(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
     decode_strict_with_table(input, &STANDARD_DECODE)
 }
 
+/// RFC 4648 §5's URL-safe alphabet: `-` and `_` where the standard one has `+` and `/`.
+const URL_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+const URL_DECODE: [u8; 256] = build_decode_table(URL_ALPHABET);
+
+/// [`encode_into`] in the URL-safe alphabet with no padding: a value that sits in a
+/// space-separated `key=value` word with no `+`, `/` or `=` of its own.
+/// # Errors
+/// Returns [`EncodeError::InputTooLarge`], with `out` untouched, if `input` is longer than
+/// [`crate::MAX_INPUT_LEN`].
+pub fn encode_url_into(out: &mut String, input: &[u8]) -> Result<(), EncodeError> {
+    let mut standard = String::new();
+    encode_into(&mut standard, input)?;
+    out.extend(standard.chars().filter(|c| *c != '=').map(|c| match c {
+        '+' => '-',
+        '/' => '_',
+        c => c,
+    }));
+    Ok(())
+}
+
+/// Decode what [`encode_url_into`] writes, and only that: URL-safe symbols, no padding, and the
+/// canonical last symbol, so one byte string has one spelling.
+/// # Errors
+/// Returns [`DecodeError`] if the input is over [`crate::MAX_INPUT_LEN`], contains a byte outside
+/// the URL-safe alphabet (`=` included), has a length of one modulo four, or is a non-canonical
+/// spelling of its output.
+pub fn decode_url(input: &str) -> Result<Vec<u8>, DecodeError> {
+    let bytes = input.as_bytes();
+    if bytes.len() > crate::MAX_INPUT_LEN {
+        return Err(DecodeError::InputTooLarge(bytes.len()));
+    }
+    if let Some(pos) = bytes.iter().position(|b| *b == b'=') {
+        return Err(DecodeError::InvalidByte(pos, b'='));
+    }
+    let pad = match bytes.len() % 4 {
+        0 => 0,
+        2 => 2,
+        3 => 1,
+        _ => return Err(DecodeError::InvalidLength(bytes.len())),
+    };
+    let mut padded = Vec::with_capacity(bytes.len().saturating_add(pad));
+    padded.extend_from_slice(bytes);
+    padded.resize(bytes.len().saturating_add(pad), b'=');
+    decode_strict_with_table(&padded, &URL_DECODE)
+}
+
 #[inline]
 const fn sextets(n: u32) -> [u8; 4] {
     let alphabet = STANDARD_ALPHABET;

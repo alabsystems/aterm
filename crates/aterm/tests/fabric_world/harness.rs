@@ -40,6 +40,8 @@ pub fn sealed_opts(mut opts: OpenOptions) -> OpenOptions {
     opts
 }
 
+/// A broker as `aterm link broker` opens one: retained by aterm's default rules and limited by
+/// its default rate limit.
 #[must_use]
 pub fn open_broker(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
     let broker = open_broker_unretained(log, opts);
@@ -47,9 +49,14 @@ pub fn open_broker(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
     broker
 }
 
+/// A broker as `aterm link broker` serves one whose retention rules could not be set: retaining
+/// nothing, and limited by aterm's default rate limit all the same.
 #[must_use]
 pub fn open_broker_unretained(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
-    Broker::open_opts(log, opts.clone(), || Ok(Prepared::Nothing)).expect("guarded broker")
+    let broker =
+        Broker::open_opts(log, opts.clone(), || Ok(Prepared::Nothing)).expect("guarded broker");
+    aterm_link::broker_rules::limit(&broker).expect("the default rate limit");
+    broker
 }
 
 /// The fleet every test runs in.
@@ -63,9 +70,11 @@ pub const DEADLINE: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// [`scratch_spawnfd`], so every instance a test starts through them carries it to the bridge
 /// it runs (a world's first boot, a relaunch, a successor, a sibling, a [`Fleet`]'s nodes),
 /// and so does a bridge a test starts through them itself; `owner_ask`'s instances, which
-/// build their own environment, set it beside [`STALE_HORIZON`]. A test's broker runs on the
-/// test's machine, beside every other test, so an answer that comes late is that machine, not
-/// a broker gone silent. Under the product's 5 s, an answer the loaded machine held past it
+/// build their own environment, set it beside [`STALE_HORIZON`]. `aterm link notify` waits each
+/// broker answer by the same seam, which the runs of it that build their own commands
+/// (`notify`'s, `owner_ask`'s) set themselves. A test's broker runs on the test's machine,
+/// beside every other test, so an answer that comes late is that machine, not a broker gone
+/// silent. Under the product's 5 s, an answer the loaded machine held past it
 /// took the link down (`stalled reason=no-ack`, then `connected` on the same bridge's redial)
 /// under tests whose property is no latency. The test of that verdict names its own deadline
 /// (`link_state::a_broker_that_accepts_but_never_acks_is_stalled_no_ack`).
@@ -73,14 +82,29 @@ pub const ACK_WAIT: (&str, Duration) = ("ATERM_LINK_ACK_DEADLINE_MS", DEADLINE);
 
 /// The bound `aterm fabric` puts on each socket its report and one-shot commands open, the
 /// doctor's read of each local instance among them (`ATERM_FABRIC_IO_TIMEOUT_MS`, the
-/// product's 3 s), for a command whose property is not latency. A world's instance answers on
-/// the test's loaded machine, where `fabric status` can wait past 3 s, and the doctor then
-/// refuses (`1 local instance(s) did not answer`). Half of [`DEADLINE`], so a doctor that does
-/// find an instance mute says which one before the harness's bound on the command
-/// ([`output_within`]) ends the test. Set by [`prepare_gui_environment`] and
-/// [`scratch_spawnfd`]; a test of the refusal removes it, so its doctor has the product's bound.
+/// product's 3 s), on `on`'s and `off`'s reads of each instance (the product's 8 s), and on the
+/// listener scan that names the broker's process (the product's 10 s), for a command whose
+/// property is not latency. A world's instance answers on the test's loaded machine, where
+/// `fabric status` can wait past 3 s, and the doctor then refuses (`1 local instance(s) did not
+/// answer`); an `on` whose `fabric attach` waits past 8 s fails its instance step; a scan held
+/// past 10 s names no broker pid. Half of
+/// [`DEADLINE`], so a doctor that does find an instance mute says which one before the
+/// harness's bound on the command ([`output_within`]) ends the test. Set by
+/// [`prepare_gui_environment`] and [`scratch_spawnfd`]; a test of the refusal removes it, so its
+/// doctor has the product's bound.
 pub const FABRIC_IO_WAIT: (&str, Duration) = (
     "ATERM_FABRIC_IO_TIMEOUT_MS",
+    Duration::from_secs(DEADLINE.as_secs() / 2),
+);
+
+/// How long `aterm fabric on` waits for the broker a test's stand-in launchd or systemd started
+/// to answer (`ATERM_FABRIC_BIND_DEADLINE_MS`, the product's 5 s), for a command whose property
+/// is not latency: the stand-in starts a debug `aterm link broker` on the test's loaded machine,
+/// which can take past 5 s to bind. Half of [`DEADLINE`], so an `on` whose broker never binds
+/// says so before the harness's bound on the command ([`output_within`]) ends the test. Set by
+/// [`prepare_gui_environment`] and [`scratch_spawnfd`].
+pub const BIND_WAIT: (&str, Duration) = (
+    "ATERM_FABRIC_BIND_DEADLINE_MS",
     Duration::from_secs(DEADLINE.as_secs() / 2),
 );
 
@@ -386,7 +410,13 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
 
 /// The bounds every child of a test has in place of the product's ([`prepare_gui_environment`],
 /// [`scratch_spawnfd`]).
-const TEST_WAITS: [(&str, Duration); 4] = [STALE_HORIZON, ACK_WAIT, LIVE_WAIT, FABRIC_IO_WAIT];
+const TEST_WAITS: [(&str, Duration); 5] = [
+    STALE_HORIZON,
+    ACK_WAIT,
+    LIVE_WAIT,
+    FABRIC_IO_WAIT,
+    BIND_WAIT,
+];
 
 /// The sleep every instance a test starts reads in its hosted harness loops
 /// ([`aterm_types::domain::ENV_DEBUG_HOST_SLEEP`]), set where [`TEST_WAITS`] are: none, a host
@@ -562,12 +592,14 @@ pub const FIXTURE_GUI_CONFIG: &str = "agents_auto_prime = false\n\n[update]\nena
 /// Seed a private config once; an intentional fixture edit survives relaunch.
 pub fn prepare_fixture_config(tmp: &Path) {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let dir = tmp.join("cfg/aterm");
     std::fs::create_dir_all(&dir).expect("scratch config dir");
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(dir.join("aterm.toml"))
     {
         Ok(mut file) => file
@@ -1435,6 +1467,53 @@ impl World {
     /// This session's `inbox` rows (`--peek`, so the watermarks do not move).
     pub fn inbox(&self, sid: &str) -> Vec<String> {
         inbox_rows(&self.verb(&format!("@{sid} inbox --peek")))
+    }
+
+    /// `person`'s cap file on this world's fleet, in its scratch.
+    pub fn person_cap(&self, person: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = self.tmp.join(format!("{person}.cap"));
+        let caps: String = astream_cap::GrantCeiling::aterm_person_ring(FLEET, person)
+            .expect("a person ring")
+            .rules()
+            .iter()
+            .map(|g| cap_line(g))
+            .collect();
+        std::fs::write(&path, caps).expect("write the person's cap");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+        path
+    }
+
+    /// Runs `aterm fabric <args>` as a person on this world's fleet, to a successful exit:
+    /// `(stdout, stderr)`.
+    pub fn fabric_as_person(&self, args: &[&str]) -> (String, String) {
+        let cmd_line =
+            std::fs::read_to_string(self.tmp.join("fabric.cmd")).expect("the fabric command");
+        #[expect(
+            clippy::disallowed_types,
+            reason = "the harness's bounded reader (`output_within`) takes a std Command; the \
+                      child is `aterm fabric`, run to its exit, so an inherited descriptor lives \
+                      no longer"
+        )]
+        let mut cmd = Command::new(aterm_to_launch());
+        prepare_gui_environment(&mut cmd);
+        cmd.arg("fabric")
+            .args(args)
+            .env("ATERM_FABRIC_COMMAND", cmd_line.trim())
+            .env("HOME", self.tmp.join("home"))
+            .env("XDG_CONFIG_HOME", self.tmp.join("cfg"))
+            .env("XDG_RUNTIME_DIR", self.tmp.join("run"));
+        let out = output_within(&mut cmd, "aterm fabric");
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        );
+        assert!(
+            out.status.success(),
+            "aterm fabric {args:?}: {:?}\n{stdout}\n{stderr}",
+            out.status
+        );
+        (stdout, stderr)
     }
 
     /// Posts from `from` to `to` with `--wait=60000` and returns `(header, offset)`.

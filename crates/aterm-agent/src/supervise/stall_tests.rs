@@ -198,7 +198,7 @@ fn a_press_refused_or_warned_input_unread_reads_status_before_it_presses_again()
             &["status"]
         } else {
             &[
-                "mark - act word=approve rule=read-only.classify-v11",
+                "mark - act word=approve rule=read-only.classify-v12",
                 "status",
             ]
         };

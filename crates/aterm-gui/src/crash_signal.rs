@@ -406,7 +406,7 @@ pub(crate) mod markers {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&pending)
             .ok()?;
         let fd = file.into_raw_fd();
@@ -459,7 +459,7 @@ pub(crate) mod markers {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
             .ok()?;
         Some(Armed {

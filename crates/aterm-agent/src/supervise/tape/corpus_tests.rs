@@ -89,6 +89,30 @@ fn a_word_is_taken_only_where_no_letter_stands_beside_it() {
 }
 
 #[test]
+fn a_host_under_a_words_floor_is_taken_only_joined_to_a_name() {
+    let mut s = Scrub::new();
+    s.word("alice", token::USER)
+        .expect("user")
+        .host("m8", "alice")
+        .expect("a short host");
+    let cases = [
+        ("alice@m8 ~ % ls", "lab-user@lab-host ~ % ls"),
+        ("ssh m8.local", "ssh lab-host.local"),
+        ("m8 m80 Bm8 am8.localx", "m8 m80 Bm8 am8.localx"),
+        ("alice and m8", "lab-user and m8"),
+    ];
+    for (input, want) in cases {
+        assert_eq!(s.text(input), want, "{input}");
+    }
+    let mut long = Scrub::new();
+    long.host("alices-mbp", "alice").expect("a long host");
+    assert_eq!(long.text("on alices-mbp"), "on lab-host");
+    for (host, user) in [("", "alice"), ("a b", "alice"), ("m8", "a/b")] {
+        assert!(Scrub::new().host(host, user).is_err(), "{host:?} {user:?}");
+    }
+}
+
+#[test]
 fn a_name_is_taken_in_a_press_guards_spelling_too() {
     let mut s = Scrub::new();
     s.path(Path::new("/Users/_a.b/my lab"), token::STATE)

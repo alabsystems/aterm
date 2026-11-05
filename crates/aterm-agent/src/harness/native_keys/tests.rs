@@ -27,7 +27,7 @@ fn native_launch_refuses_unknown_local_policy_before_credential_selection() {
                 )
             };
             assert!(run().unwrap().is_some());
-            std::fs::write(&config, "").unwrap();
+            aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
             assert!(run().unwrap().is_some());
             assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
             let mut refused = Vec::new();

@@ -703,7 +703,7 @@ impl Cycle<'_> {
             return Err(Fail::die(format!("peer-cycle image: {}", image.first())));
         }
         let (png, metadata) = crate::trail_gallery::image_bytes(&image.stdout).map_err(fail)?;
-        std::fs::write(self.out.join(format!("{name}.png")), png).map_err(fail)?;
+        crate::util::write_fresh(&self.out.join(format!("{name}.png")), png).map_err(fail)?;
         let after = match self.inspect_gui(pid) {
             Ok(after) => after,
             Err(error) => {

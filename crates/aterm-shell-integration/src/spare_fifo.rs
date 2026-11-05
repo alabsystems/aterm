@@ -280,7 +280,7 @@ fn release(
     let wake = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .ok()?;
     if !wake.metadata().is_ok_and(|m| m.file_type().is_fifo()) {

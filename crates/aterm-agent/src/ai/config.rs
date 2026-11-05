@@ -432,7 +432,7 @@ fn read_private(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.custom_flags(libc::O_NONBLOCK);
+        open.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = match open.open(path) {
         Ok(f) => f,

@@ -228,14 +228,16 @@ impl JobDecision {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
         crate::fsx::ensure_private_dir(&secrets_dir(home))?;
         let path = decision_lock_path(home, job);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)?;
+        let file: std::fs::File = aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&path)
+        })?;
         let meta = file.metadata()?;
         if !meta.is_file() || meta.uid() != aterm_uds::peer::our_uid() || meta.nlink() != 1 {
             return Err(Error::new(format!(
@@ -246,7 +248,6 @@ impl JobDecision {
         if meta.mode() & 0o7777 != 0o600 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        aterm_uds::keep_out_of_children(&file)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the take of JobDecision, whose Drop releases the local service decision lock"
@@ -530,7 +531,7 @@ fn read_regular_bounded(path: &Path, max: usize) -> Option<Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .ok()?;
     let meta = file.metadata().ok()?;
@@ -897,6 +898,15 @@ pub fn in_build_dir(path: &Path, exists: &dyn Fn(&Path) -> bool) -> bool {
         }
         if text.ends_with(".noindex")
             && (text.contains("target") || after(1).is_some_and(|n| n == "target"))
+        {
+            return true;
+        }
+        // Cargo's own layout, wherever its build directory is (`build.build-dir`, as atpkg's
+        // targo shim sets it): a profile's `deps` (the old layout) or `build` (the new one,
+        // `build/<package>/<hash>/out/`) holds the test binaries and the units, never an
+        // installed program.
+        if (text == "debug" || text == "release")
+            && after(1).is_some_and(|n| n == "deps" || n == "build")
         {
             return true;
         }
@@ -1534,7 +1544,7 @@ fn recoverable_subscriber_unit(home: &Path, program: &Path) -> crate::Result<Opt
     let path = unit_file(home, Job::Subscriber);
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(&path)
     {
         Ok(file) => file,
@@ -2346,20 +2356,7 @@ pub fn bundle_id_of(program: &Path) -> Option<String> {
     if !in_bundle {
         return None;
     }
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(contents.join("Info.plist"))
-            .ok()?
-    };
-    if !file.metadata().ok()?.file_type().is_file() {
-        return None;
-    }
-    let mut text = Vec::new();
-    std::io::Read::read_to_end(&mut std::io::Read::take(file, INFO_PLIST_MOST), &mut text).ok()?;
-    let text = std::str::from_utf8(&text).ok()?;
+    let text = read_regular_string(&contents.join("Info.plist"), INFO_PLIST_MOST)?;
     let tag = "<key>CFBundleIdentifier</key>";
     let rest = text[text.find(tag)? + tag.len()..]
         .trim_start()
@@ -2374,7 +2371,7 @@ pub fn bundle_id_of(program: &Path) -> Option<String> {
 
 /// The largest `Info.plist` [`bundle_id_of`] reads.
 #[cfg(unix)]
-const INFO_PLIST_MOST: u64 = 256 * 1024;
+const INFO_PLIST_MOST: usize = 256 * 1024;
 
 /// Stop and remove `job`, for this login's own `home` ([`own_home`]).
 pub fn uninstall(home: &Path, job: Job) -> crate::Result<bool> {
@@ -2735,9 +2732,9 @@ fn repair_hash_file(program: &Path, mapped_image: bool) -> crate::Result<String>
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(if mapped_image {
-            libc::O_NONBLOCK
+            libc::O_NONBLOCK | libc::O_CLOEXEC
         } else {
-            libc::O_NOFOLLOW | libc::O_NONBLOCK
+            libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC
         })
         .open(program)?;
     let before = file.metadata()?;
@@ -5614,6 +5611,31 @@ mod tests {
         assert!(!in_build_dir(Path::new("/scratch/other/aterm"), &tag));
         let own = |p: &Path| p == Path::new("/scratch/aterm/CACHEDIR.TAG");
         assert!(!in_build_dir(Path::new("/scratch/aterm"), &own));
+    }
+
+    /// A build directory apart from the target directory (`build.build-dir`, atpkg's targo shim)
+    /// carries no tag and no `target` name: its `<profile>/deps` alone says it is cargo's.
+    #[test]
+    fn a_units_build_directory_is_a_build_whatever_holds_it() {
+        let none = |_: &Path| false;
+        assert!(in_build_dir(
+            Path::new(
+                "/Users//x/Library/Caches/aterm/.ubd/cargo-build.noindex/Users//x/aterm/\
+                 .cargo-build/debug/deps/aterm_secrets-0123"
+            ),
+            &none
+        ));
+        assert!(in_build_dir(
+            Path::new("/b/.cargo-build/release/deps/aterm-0123"),
+            &none
+        ));
+        assert!(in_build_dir(
+            Path::new("/b/.cargo-build/debug/build/aterm-secrets/0123/out/aterm_secrets-0123"),
+            &none
+        ));
+        assert!(!in_build_dir(Path::new("/Users//x/debug/aterm"), &none));
+        assert!(!in_build_dir(Path::new("/Users//x/build/aterm"), &none));
+        assert!(!in_build_dir(Path::new("/Users//x/deps/aterm"), &none));
     }
 
     #[test]

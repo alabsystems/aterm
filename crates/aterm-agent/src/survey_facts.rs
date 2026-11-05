@@ -11,7 +11,8 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::ai::connector::Cli;
 use crate::harness::accounts;
-use crate::harness::cli::{Env, SurveyPool};
+use crate::harness::cli::{Env, PoolMoves, SurveyPool};
+use crate::harness::repo_work::home::{self as repo_home, HomeRepo, HomeRepos};
 
 const WINDOW_LAST_FILE: &str = "window-last";
 const WINDOW_LAST_FLUSH_SECS: u64 = 60;
@@ -38,6 +39,9 @@ pub struct SurveyAccountFact {
     pub walled_until: Option<i64>,
     /// Unix timestamp (seconds) when a session here last ran on this account.
     pub last_used: Option<i64>,
+    /// Unix timestamp (seconds) when its usage figures were last read, when known. A row whose
+    /// reading is old says `unseen`, not `usable` ([`crate::harness::cli::survey_accounts`]).
+    pub read_at: Option<i64>,
 }
 
 /// One subscriber last-heard record from a vault server running on this machine (§7.2, C16).
@@ -59,6 +63,8 @@ pub struct SwarmSurveyFacts {
     pub node: Option<String>,
     /// Canonical machine label (`m<N>` or configured `[ai]`/`[fleet] machine` / vault host).
     pub label: Option<String>,
+    /// The roster was unread this pass; a missing label is unknown rather than absent.
+    pub roster_unread: bool,
     /// Running `aterm` version string.
     pub version: String,
     /// Whether a GUI window instance is live right now (`1` in a window host, `0` headless).
@@ -78,8 +84,50 @@ pub struct SwarmSurveyFacts {
     /// The row each supervised session was last read running on, by pool and session id. Not on
     /// the wire: this instance's own session rows name it.
     pub session_accounts: BTreeMap<(String, String), String>,
+    /// What this Mac's ledgers say of rotations (`moves_7d=`, `last_move=`). `None` from an aterm
+    /// whose facts predate them or with a pool it could not read, which a reader takes as unknown,
+    /// never as none.
+    pub moves: Option<MoveFacts>,
     /// Subscriber last-heard records when this machine serves vaults (`~/.config/aterm/secrets/served`).
     pub server_heard: Vec<ServerHeardFact>,
+    /// The home this aterm runs under, absolute (`home=`): where a fleet spawn's `cwd=~/…`
+    /// resolves. `None` from an aterm that says nothing of it, which a reader takes as unknown.
+    pub home: Option<String>,
+    /// Free space on the home's volume, in MiB (`home_free_mb=`), read with these facts.
+    pub home_free_mb: Option<u64>,
+    /// The checkouts aterm's setup clones into the home, as its last read found them
+    /// ([`repo_home::read_home`]: `repos=`, `repos_at=`, `repos_cut=` and one `repo` line
+    /// each); `None` before a read finished, which a reader takes as unknown, never as none.
+    pub repos: Option<HomeRepos>,
+}
+
+/// What a Mac's ledgers keep of rotations, across its pools: whether rotation has ever happened
+/// here is the one thing a roster and a condition cannot say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MoveFacts {
+    /// Rotations onto another row a session then proved, in the last seven days: it worked.
+    pub proven_7d: usize,
+    /// Rotations onto another row, in the last seven days, proved or not: each was an attempt.
+    pub tried_7d: usize,
+    /// The newest proved rotation its ledgers keep, Unix seconds.
+    pub last: Option<i64>,
+}
+
+impl MoveFacts {
+    fn of(moves: &PoolMoves, now: i64) -> Self {
+        const WEEK_S: i64 = 7 * 24 * 60 * 60;
+        let in_week = |times: &[i64]| {
+            times
+                .iter()
+                .filter(|t| now.saturating_sub(**t) < WEEK_S)
+                .count()
+        };
+        Self {
+            proven_7d: in_week(&moves.proven),
+            tried_7d: in_week(&moves.tried),
+            last: moves.proven.iter().copied().max(),
+        }
+    }
 }
 
 fn word_token(text: Option<&str>) -> String {
@@ -111,6 +159,7 @@ impl SwarmSurveyFacts {
             Err(_) => Self {
                 node,
                 label: None,
+                roster_unread: false,
                 version: aterm_types::version::app_version().to_owned(),
                 window,
                 window_last: window.then(|| u64::try_from(now.max(0)).unwrap_or(0)),
@@ -119,7 +168,11 @@ impl SwarmSurveyFacts {
                 accounts: Vec::new(),
                 accounts_unread: Cli::ALL.iter().map(|cli| cli.id().to_owned()).collect(),
                 session_accounts: BTreeMap::new(),
+                moves: None,
                 server_heard: Vec::new(),
+                home: None,
+                home_free_mb: None,
+                repos: None,
             },
         }
     }
@@ -176,12 +229,16 @@ impl SwarmSurveyFacts {
     ) -> Self {
         let now_u64 = u64::try_from(env.now.max(0)).unwrap_or(0);
         let window_last = touch_or_read_window_last(&env.state, window, now_u64);
-        let label = resolve_machine_label(env);
-        let (accounts, accounts_unread, session_accounts) = collect_account_facts(env);
+        let resolved_label = resolve_machine_label_checked(env);
+        let roster_unread = resolved_label.is_err();
+        let label = resolved_label.ok().flatten();
+        let (accounts, accounts_unread, session_accounts, moved) = collect_account_facts(env);
         let server_heard = collect_server_heard(env);
+        let home = env.home.as_deref().filter(|home| home.is_absolute());
         Self {
             node,
             label,
+            roster_unread,
             version: aterm_types::version::app_version().to_owned(),
             window,
             window_last,
@@ -190,27 +247,52 @@ impl SwarmSurveyFacts {
             accounts,
             accounts_unread,
             session_accounts,
+            moves: moved.map(|moves| MoveFacts::of(&moves, env.now)),
             server_heard,
+            home: home.and_then(Path::to_str).map(str::to_owned),
+            home_free_mb: home.and_then(free_mb),
+            repos: home.and_then(repo_home::latest),
         }
     }
 
     /// Space-prefixed `key=value` tokens appended onto `survey`'s `instance …` header line: with
     /// `accounts=` counting the `account` lines that follow, and `accounts_unread=` naming the
     /// pools none of whose rows they list because their records could not be read (`-` for none).
+    /// A reply at `content` adds the home, its volume's free space and its checkouts' count and
+    /// read (`home=`, `home_free_mb=`, `repos=`, `repos_at=`, `repos_cut=`): where a Mac keeps its
+    /// work is content, as a session's folder is, so a reader granted facts alone, or a facts
+    /// heartbeat, reads them as an aterm that says nothing of them.
     #[must_use]
-    pub fn header_tokens(&self) -> String {
+    pub fn header_tokens(&self, content: bool) -> String {
         let headroom = live_cpu_headroom_pct()
             .map(|pct| format!(" cpu_headroom={pct}"))
             .unwrap_or_default();
+        let home = if content {
+            let repos = self.repos.as_ref();
+            format!(
+                " home={} home_free_mb={} repos={} repos_at={} repos_cut={}",
+                word_token(self.home.as_deref()),
+                opt_u64_token(self.home_free_mb),
+                repos.map_or_else(|| "-".to_owned(), |read| read.repos.len().to_string()),
+                opt_u64_token(repos.map(|read| read.read_ms)),
+                opt_u64_token(repos.and_then(|read| u64::try_from(read.cut).ok())),
+            )
+        } else {
+            String::new()
+        };
         format!(
-            " label={} window={} window_last={} ssh_host_key={}{headroom} accounts={} \
-             accounts_unread={}",
+            " label={} window={} window_last={} ssh_host_key={}{headroom}{home} accounts={} \
+             accounts_unread={} moves_7d={} move_tries_7d={} last_move={} roster_unread={}",
             word_token(self.label.as_deref()),
             u8::from(self.window),
             opt_u64_token(self.window_last),
             word_token(self.ssh_host_key.as_deref()),
             self.accounts.len(),
             word_token(Some(&self.accounts_unread.join(","))),
+            opt_u64_token(self.moves.and_then(|m| u64::try_from(m.proven_7d).ok())),
+            opt_u64_token(self.moves.and_then(|m| u64::try_from(m.tried_7d).ok())),
+            opt_i64_token(self.moves.and_then(|m| m.last)),
+            u8::from(self.roster_unread),
         )
     }
 
@@ -229,16 +311,29 @@ impl SwarmSurveyFacts {
         None
     }
 
-    /// Additional `account …` and `server_heard …` lines emitted in a `survey` reply, each
-    /// account's `id=` masked where it is an email ([`aterm_ctl::masked_label`]), so none crosses
-    /// the fleet.
+    /// Take the home's checkouts as its latest read found them ([`repo_home::latest`]), so facts a
+    /// listener keeps a while still say a read that ended since they were collected.
+    pub fn take_latest_repos(&mut self) {
+        if let Some(home) = self.home.as_deref() {
+            self.repos = repo_home::latest(Path::new(home));
+        }
+    }
+
+    /// Additional `account …`, `repo …` and `server_heard …` lines emitted in a `survey` reply,
+    /// each account's `id=` masked where it is an email ([`aterm_ctl::masked_label`]), so none
+    /// crosses the fleet; the `repo` lines only at `content` ([`Self::header_tokens`]).
     #[must_use]
-    pub fn extra_lines(&self) -> Vec<String> {
-        let mut lines = Vec::with_capacity(self.accounts.len() + self.server_heard.len());
+    pub fn extra_lines(&self, content: bool) -> Vec<String> {
+        let repos = match &self.repos {
+            Some(read) if content => &read.repos[..],
+            _ => &[][..],
+        };
+        let mut lines =
+            Vec::with_capacity(self.accounts.len() + repos.len() + self.server_heard.len());
         for acc in &self.accounts {
             lines.push(format!(
                 "account pool={} id={} condition={} enrolled={} pct5={} pct7={} \
-                 week_reset={} walled_until={} last_used={}",
+                 week_reset={} walled_until={} last_used={} read_at={}",
                 aterm_codec::pct::encode(&acc.pool),
                 aterm_codec::pct::encode(&aterm_ctl::masked_label(&acc.id)),
                 aterm_codec::pct::encode(&acc.condition),
@@ -248,6 +343,21 @@ impl SwarmSurveyFacts {
                 opt_i64_token(acc.week_reset),
                 opt_i64_token(acc.walled_until),
                 opt_i64_token(acc.last_used),
+                opt_i64_token(acc.read_at),
+            ));
+        }
+        for repo in repos {
+            lines.push(format!(
+                "repo name={} path={} head={} branch={} main={} behind={} fetched_at={} dirty={}",
+                aterm_codec::pct::encode(&repo.name),
+                word_token(repo.path.to_str()),
+                word_token(repo.head.as_deref()),
+                word_token(repo.branch.as_deref()),
+                word_token(repo.main_ref.as_deref()),
+                opt_u32_token(repo.behind),
+                opt_u64_token(repo.fetched_ms),
+                repo.dirty
+                    .map_or("-", |dirty| if dirty { "1" } else { "0" }),
             ));
         }
         for heard in &self.server_heard {
@@ -262,7 +372,8 @@ impl SwarmSurveyFacts {
     }
 
     /// Render a standalone `OK <n>\ninstance …\n` survey-facts wire payload (used by node-job
-    /// heartbeats when no window socket is needed and by round-trip tests).
+    /// heartbeats when no window socket is needed and by round-trip tests), at `facts`: it
+    /// carries nothing of the home ([`Self::header_tokens`]).
     #[must_use]
     pub fn to_survey_reply(
         &self,
@@ -272,7 +383,22 @@ impl SwarmSurveyFacts {
         instances: usize,
         drive: bool,
     ) -> String {
-        let extra = self.extra_lines();
+        self.to_survey_reply_at(false, pid, host, at_ms, instances, drive)
+    }
+
+    /// [`Self::to_survey_reply`] at `content` where it is true (`level=content`), with the home's
+    /// facts and checkouts.
+    #[must_use]
+    pub fn to_survey_reply_at(
+        &self,
+        content: bool,
+        pid: u32,
+        host: Option<&str>,
+        at_ms: u64,
+        instances: usize,
+        drive: bool,
+    ) -> String {
+        let extra = self.extra_lines(content);
         let count = 1 + extra.len();
         let host = word_token(host);
         let version = aterm_codec::pct::encode(&self.version);
@@ -280,9 +406,10 @@ impl SwarmSurveyFacts {
         let drive_tok = if drive { " drive=1" } else { "" };
         let mut out = format!(
             "OK {count}\ninstance pid={pid} host={host} version={version} sessions={} \
-             level=facts cut=0 at_ms={at_ms} node={node} instances={instances}{}{drive_tok}\n",
+             level={} cut=0 at_ms={at_ms} node={node} instances={instances}{}{drive_tok}\n",
             self.sessions,
-            self.header_tokens(),
+            if content { "content" } else { "facts" },
+            self.header_tokens(content),
         );
         for line in extra {
             out.push_str(&line);
@@ -299,6 +426,7 @@ impl SwarmSurveyFacts {
     pub fn from_survey_reply(reply: &str) -> Result<Self, String> {
         let mut instance: Option<Vec<(String, String)>> = None;
         let mut accounts = Vec::new();
+        let mut repos = Vec::new();
         let mut server_heard = Vec::new();
 
         for raw in reply.lines() {
@@ -310,6 +438,8 @@ impl SwarmSurveyFacts {
                 instance = Some(parse_fields(line));
             } else if line.starts_with("account ") {
                 accounts.push(parse_account_line(&parse_fields(line))?);
+            } else if line.starts_with("repo ") {
+                repos.push(parse_repo_line(&parse_fields(line))?);
             } else if line.starts_with("server_heard ") {
                 server_heard.push(parse_server_heard_line(&parse_fields(line))?);
             }
@@ -327,6 +457,7 @@ impl SwarmSurveyFacts {
                 ));
             }
         }
+        let repos = parse_repos(&header, repos)?;
         let version = required_nonempty(&header, "version")?;
         let sessions = crate::parse_uint::<usize>(required_raw(&header, "sessions")?)
             .ok_or_else(|| "invalid sessions field in instance header".to_owned())?;
@@ -347,10 +478,30 @@ impl SwarmSurveyFacts {
                     .collect()
             });
 
+        // Optional: an aterm whose C16 facts predate them says nothing of its moves.
+        let moves = field_raw(&header, "moves_7d")
+            .and_then(optional_word)
+            .map(|week| {
+                Ok::<_, String>(MoveFacts {
+                    proven_7d: crate::parse_uint::<usize>(&week)
+                        .ok_or_else(|| "invalid moves_7d field in instance header".to_owned())?,
+                    tried_7d: field_raw(&header, "move_tries_7d")
+                        .and_then(crate::parse_uint::<usize>)
+                        .ok_or_else(|| {
+                            "invalid move_tries_7d field in instance header".to_owned()
+                        })?,
+                    last: field_raw(&header, "last_move")
+                        .map_or(Ok(None), |raw| parse_opt_i64(raw, "last_move"))?,
+                })
+            })
+            .transpose()?;
+
         Ok(Self {
             node,
             label,
             version,
+            roster_unread: field_raw(&header, "roster_unread")
+                .map_or(Ok(false), |raw| parse_bool01(raw, "roster_unread"))?,
             window,
             window_last,
             sessions,
@@ -358,9 +509,71 @@ impl SwarmSurveyFacts {
             accounts,
             accounts_unread,
             session_accounts: BTreeMap::new(),
+            moves,
             server_heard,
+            home: field_raw(&header, "home").and_then(optional_word),
+            home_free_mb: field_raw(&header, "home_free_mb")
+                .map_or(Ok(None), |raw| parse_opt_u64(raw, "home_free_mb"))?,
+            repos,
         })
     }
+}
+
+/// The home's checkouts an `instance` header (`header`) and its `repo` lines (`rows`) say: `None`
+/// where it says nothing of them (an aterm whose facts predate them) or none was read yet
+/// (`repos=-`, with no line).
+fn parse_repos(
+    header: &[(String, String)],
+    rows: Vec<HomeRepo>,
+) -> Result<Option<HomeRepos>, String> {
+    let Some(count) = field_raw(header, "repos").and_then(optional_word) else {
+        return if rows.is_empty() {
+            Ok(None)
+        } else {
+            Err("survey reply has repo lines and no repos count".to_owned())
+        };
+    };
+    let expected = crate::parse_uint::<usize>(&count)
+        .ok_or_else(|| "invalid repos field in instance header".to_owned())?;
+    if expected != rows.len() {
+        return Err(format!(
+            "survey reply repo count mismatch: header says {expected}, body has {}",
+            rows.len()
+        ));
+    }
+    let read_ms = parse_opt_u64(required_raw(header, "repos_at")?, "repos_at")?
+        .ok_or_else(|| "empty `repos_at` field".to_owned())?;
+    let cut = parse_opt_u64(required_raw(header, "repos_cut")?, "repos_cut")?
+        .and_then(|cut| usize::try_from(cut).ok())
+        .ok_or_else(|| "invalid `repos_cut` field".to_owned())?;
+    Ok(Some(HomeRepos {
+        read_ms,
+        repos: rows,
+        cut,
+    }))
+}
+
+fn parse_repo_line(fields: &[(String, String)]) -> Result<HomeRepo, String> {
+    Ok(HomeRepo {
+        name: required_nonempty(fields, "name")?,
+        path: required_nonempty(fields, "path")?.into(),
+        head: optional_word(required_raw(fields, "head")?),
+        branch: optional_word(required_raw(fields, "branch")?),
+        main_ref: optional_word(required_raw(fields, "main")?),
+        behind: parse_opt_u32(required_raw(fields, "behind")?, "behind")?,
+        fetched_ms: parse_opt_u64(required_raw(fields, "fetched_at")?, "fetched_at")?,
+        dirty: match required_raw(fields, "dirty")? {
+            "-" => None,
+            raw => Some(parse_bool01(raw, "dirty")?),
+        },
+    })
+}
+
+/// The free space on `home`'s volume, in MiB.
+fn free_mb(home: &Path) -> Option<u64> {
+    aterm_sysprobe::volumes::read_path(home, &aterm_sysprobe::volumes::table())
+        .ok()
+        .map(|reading| reading.free >> 20)
 }
 
 fn parse_fields(line: &str) -> Vec<(String, String)> {
@@ -440,6 +653,10 @@ fn parse_account_line(fields: &[(String, String)]) -> Result<SurveyAccountFact, 
         week_reset: parse_opt_i64(required_raw(fields, "week_reset")?, "week_reset")?,
         walled_until: parse_opt_i64(required_raw(fields, "walled_until")?, "walled_until")?,
         last_used: parse_opt_i64(required_raw(fields, "last_used")?, "last_used")?,
+        // A member older than the field sends none.
+        read_at: required_raw(fields, "read_at")
+            .ok()
+            .map_or(Ok(None), |raw| parse_opt_i64(raw, "read_at"))?,
     })
 }
 
@@ -487,27 +704,60 @@ fn touch_or_read_window_last(state_dir: &Path, window: bool, now: u64) -> Option
 }
 
 #[cfg(unix)]
-fn local_roster_denial(home: Option<&Path>) -> (Vec<String>, bool) {
+fn local_roster_denial(home: Option<&Path>) -> Result<(Vec<String>, bool, Option<String>), String> {
     let Some(home) = home else {
-        return (Vec::new(), false);
+        return Ok((Vec::new(), false, None));
     };
     let paths = aterm_secrets::client::Paths::for_home(home);
+    let roster = aterm_secrets::client::swarm_roster_until(
+        &paths,
+        std::time::Instant::now() + std::time::Duration::from_millis(250),
+    )
+    .map_err(|why| why.to_string())?;
     let recipient_denied = aterm_secrets::client::local_recipient_denied_in_roster(&paths);
-    let Ok(Some(roster)) = aterm_secrets::client::swarm_roster(&paths) else {
-        return (Vec::new(), recipient_denied);
+    let label = if let Some(roster) = &roster {
+        aterm_secrets::client::read_machine_identity(&paths)
+            .map_err(|why| why.to_string())?
+            .and_then(|identity| {
+                roster
+                    .member_by_recipient(&identity.recipient().to_bech32())
+                    .filter(|member| !roster.is_member_denied(member))
+                    .map(|member| member.label.clone())
+            })
+    } else {
+        aterm_secrets::client::status(&paths)
+            .ok()
+            .and_then(|status| status.config.map(|config| config.host))
+            .filter(|host| !host.trim().is_empty())
     };
-    (roster.deny_labels, recipient_denied)
+    Ok((
+        roster.map_or_else(Vec::new, |r| r.deny_labels),
+        recipient_denied,
+        label,
+    ))
 }
 
 #[cfg(not(unix))]
-fn local_roster_denial(_home: Option<&Path>) -> (Vec<String>, bool) {
-    (Vec::new(), false)
+fn local_roster_denial(
+    _home: Option<&Path>,
+) -> Result<(Vec<String>, bool, Option<String>), String> {
+    Ok((Vec::new(), false, None))
+}
+
+/// This machine's canonical label as its survey facts name it, where it has one it may publish.
+#[must_use]
+pub fn machine_label() -> Option<String> {
+    resolve_machine_label(&Env::from_process().ok()?)
 }
 
 fn resolve_machine_label(env: &Env) -> Option<String> {
-    let (deny_labels, recipient_denied) = local_roster_denial(env.home.as_deref());
+    resolve_machine_label_checked(env).ok().flatten()
+}
+
+fn resolve_machine_label_checked(env: &Env) -> Result<Option<String>, String> {
+    let (deny_labels, recipient_denied, vault_label) = local_roster_denial(env.home.as_deref())?;
     if recipient_denied {
-        return None;
+        return Ok(None);
     }
     let is_denied_label = |candidate: &str| {
         #[cfg(unix)]
@@ -536,41 +786,16 @@ fn resolve_machine_label(env: &Env) -> Option<String> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty() && !is_denied_label(s))
             {
-                return Some(machine.to_owned());
+                return Ok(Some(machine.to_owned()));
             }
         }
     }
-    resolve_vault_host_label(env).filter(|h| !is_denied_label(h))
+    Ok(vault_label.filter(|h| !is_denied_label(h)))
 }
 
-#[cfg(unix)]
-fn resolve_vault_host_label(env: &Env) -> Option<String> {
-    let home = env.home.as_deref()?;
-    let paths = aterm_secrets::client::Paths::for_home(home);
-    if let Ok(Some(label)) = aterm_secrets::client::resolve_local_swarm_label(&paths, &[]) {
-        return Some(label);
-    }
-    if aterm_secrets::client::swarm_roster(&paths)
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return None;
-    }
-    let status = aterm_secrets::client::status(&paths).ok()?;
-    status
-        .config
-        .map(|cfg| cfg.host)
-        .filter(|h| !h.trim().is_empty())
-}
-
-#[cfg(not(unix))]
-fn resolve_vault_host_label(_env: &Env) -> Option<String> {
-    None
-}
-
-/// Each pooled CLI's rows, the pools that could not be read, and the row each session runs on,
-/// as `aterm harness accounts --json` reads them beside `env`'s `aterm.toml`.
+/// Each pooled CLI's rows, the pools that could not be read, the row each session runs on, as
+/// `aterm harness accounts --json` reads them beside `env`'s `aterm.toml`, and when its ledgers
+/// say it rotated.
 fn collect_account_facts(env: &Env) -> AccountFacts {
     account_facts_of(Cli::ALL.into_iter().map(|cli| {
         let read = env
@@ -588,11 +813,13 @@ fn collect_account_facts(env: &Env) -> AccountFacts {
     }))
 }
 
-/// What [`collect_account_facts`] reads: the rows, the unread pools, and each session's row.
+/// What [`collect_account_facts`] reads: the rows, the unread pools, each session's row, and its
+/// rotations, `None` where a pool or its ledger could not be read.
 type AccountFacts = (
     Vec<SurveyAccountFact>,
     Vec<String>,
     BTreeMap<(String, String), String>,
+    Option<PoolMoves>,
 );
 
 /// The account facts each pool's read makes: its rows, or its id among the unread where it could
@@ -603,12 +830,19 @@ fn account_facts_of(
     let mut rows = Vec::new();
     let mut unread = Vec::new();
     let mut sessions = BTreeMap::new();
+    let mut moved = Some(PoolMoves::default());
     for (cli, read) in reads {
         let pool = cli.id().to_owned();
         let Ok(read) = read else {
             unread.push(pool);
+            moved = None;
             continue;
         };
+        moved = moved.zip(read.moves).map(|(mut all, more)| {
+            all.tried.extend(more.tried);
+            all.proven.extend(more.proven);
+            all
+        });
         rows.extend(read.rows.into_iter().map(|row| SurveyAccountFact {
             pool: pool.clone(),
             walled_until: match row.condition {
@@ -622,6 +856,7 @@ fn account_facts_of(
             usage_7d_pct: row.seven_day_pct,
             week_reset: row.week_reset,
             last_used: row.used_at,
+            read_at: row.read_at,
         }));
         sessions.extend(
             read.sessions
@@ -629,7 +864,7 @@ fn account_facts_of(
                 .map(|(sid, label)| ((pool.clone(), sid), label)),
         );
     }
-    (rows, unread, sessions)
+    (rows, unread, sessions, moved)
 }
 
 #[cfg(unix)]
@@ -745,11 +980,17 @@ mod tests {
         SwarmSurveyFacts {
             node: Some("f1e2d3c4".to_owned()),
             label: Some("m22".to_owned()),
+            roster_unread: false,
             version: "0.146.0".to_owned(),
             window: true,
             window_last: Some(1_793_160_000),
             sessions: 4,
             ssh_host_key: Some("SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU".to_owned()),
+            moves: Some(MoveFacts {
+                proven_7d: 2,
+                tried_7d: 3,
+                last: Some(1_793_159_000),
+            }),
             accounts: vec![
                 SurveyAccountFact {
                     pool: "claude".to_owned(),
@@ -761,6 +1002,7 @@ mod tests {
                     week_reset: Some(1_793_500_000),
                     walled_until: None,
                     last_used: Some(1_793_159_900),
+                    read_at: None,
                 },
                 SurveyAccountFact {
                     pool: "codex".to_owned(),
@@ -772,6 +1014,7 @@ mod tests {
                     week_reset: Some(1_793_600_000),
                     walled_until: Some(1_793_170_000),
                     last_used: Some(1_793_158_000),
+                    read_at: None,
                 },
                 SurveyAccountFact {
                     pool: "claude".to_owned(),
@@ -783,6 +1026,7 @@ mod tests {
                     week_reset: None,
                     walled_until: None,
                     last_used: None,
+                    read_at: None,
                 },
             ],
             accounts_unread: vec!["grok".to_owned(), "kimi".to_owned()],
@@ -793,15 +1037,187 @@ mod tests {
                     .to_owned(),
                 at: 1_793_159_995,
             }],
+            home: Some("/Users//a yates".to_owned()),
+            home_free_mb: Some(812_345),
+            repos: Some(HomeRepos {
+                read_ms: 1_793_159_000_000,
+                repos: vec![
+                    HomeRepo {
+                        name: "aterm".to_owned(),
+                        path: "/Users//a yates/aterm".into(),
+                        head: None,
+                        branch: None,
+                        main_ref: None,
+                        behind: None,
+                        fetched_ms: None,
+                        dirty: None,
+                    },
+                    HomeRepo {
+                        name: "trust".to_owned(),
+                        path: "/Users//a yates/trust".into(),
+                        head: Some("0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c".to_owned()),
+                        branch: Some("main".to_owned()),
+                        main_ref: Some("origin/main".to_owned()),
+                        behind: Some(3),
+                        fetched_ms: Some(1_793_150_000_000),
+                        dirty: Some(true),
+                    },
+                ],
+                cut: 0,
+            }),
+        }
+    }
+
+    /// THE HOME'S CHECKOUTS CROSS THE WIRE AT CONTENT AND ARE READ BACK: `home=`,
+    /// `home_free_mb=`, the `repos=` count with its read's time and cut, and one `repo` line each.
+    /// A reply at facts (a reader granted no more, a heartbeat) carries none of them. An aterm
+    /// that says nothing of them, and one that read none yet (`repos=-`), read as unknown
+    /// (`None`), never as a home with no checkout; a body whose `repo` lines disagree with the
+    /// count is refused.
+    #[test]
+    fn the_homes_checkouts_cross_the_wire_and_are_unknown_where_unsaid() {
+        let facts = sample_facts();
+        let wire =
+            facts.to_survey_reply_at(true, 1, Some("m22.local"), 1_793_160_000_000, 1, false);
+        assert!(wire.contains(" level=content "), "{wire}");
+        let at_facts = facts.to_survey_reply(1, Some("m22.local"), 1_793_160_000_000, 1, false);
+        assert!(
+            !at_facts.contains(" home=")
+                && !at_facts.contains(" repos=")
+                && !at_facts.contains("\nrepo ")
+                && !at_facts.contains("yates"),
+            "{at_facts}"
+        );
+        let parsed = SwarmSurveyFacts::from_survey_reply(&at_facts).expect("valid");
+        assert_eq!(
+            (parsed.home, parsed.home_free_mb, parsed.repos),
+            (None, None, None)
+        );
+        let head = wire.lines().nth(1).expect("the instance line");
+        for token in [
+            " home=/Users//a%20yates ",
+            " home_free_mb=812345 ",
+            " repos=2 ",
+            " repos_at=1793159000000 ",
+            " repos_cut=0 ",
+        ] {
+            assert!(head.contains(token), "{token}: {head}");
+        }
+        assert!(wire.contains(
+            "\nrepo name=trust path=/Users//a%20yates/trust \
+             head=0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c branch=main main=origin/main behind=3 \
+             fetched_at=1793150000000 dirty=1\n"
+        ));
+        assert!(wire.contains(
+            "\nrepo name=aterm path=/Users//a%20yates/aterm head=- branch=- main=- behind=- \
+             fetched_at=- dirty=-\n"
+        ));
+        let parsed = SwarmSurveyFacts::from_survey_reply(&wire).expect("valid");
+        assert_eq!(parsed.repos, facts.repos);
+
+        let unread = SwarmSurveyFacts {
+            repos: None,
+            ..facts.clone()
+        };
+        let wire_unread = unread.to_survey_reply_at(true, 1, None, 0, 1, false);
+        assert!(wire_unread.contains(" repos=- repos_at=- repos_cut=- "));
+        let parsed = SwarmSurveyFacts::from_survey_reply(&wire_unread).expect("valid");
+        assert_eq!(
+            (parsed.repos, parsed.home.as_deref()),
+            (None, Some("/Users//a yates"))
+        );
+
+        let mut older = wire.clone();
+        for token in [
+            " home=/Users//a%20yates",
+            " home_free_mb=812345",
+            " repos=2",
+            " repos_at=1793159000000",
+            " repos_cut=0",
+        ] {
+            older = older.replacen(token, "", 1);
+        }
+        let older: String = older
+            .lines()
+            .filter(|line| !line.starts_with("repo "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let parsed = SwarmSurveyFacts::from_survey_reply(&older).expect("an older aterm's");
+        assert_eq!(
+            (parsed.home, parsed.home_free_mb, parsed.repos),
+            (None, None, None)
+        );
+        assert_eq!(
+            SwarmSurveyFacts::from_survey_reply(&wire)
+                .expect("valid")
+                .moves,
+            Some(MoveFacts {
+                proven_7d: 2,
+                tried_7d: 3,
+                last: Some(1_793_159_000),
+            }),
+            "CONTROL: what it says goes both ways"
+        );
+        let predates = wire
+            .replacen(" moves_7d=2", "", 1)
+            .replacen(" move_tries_7d=3", "", 1)
+            .replacen(" last_move=1793159000", "", 1);
+        assert_eq!(
+            SwarmSurveyFacts::from_survey_reply(&predates)
+                .expect("an older aterm's")
+                .moves,
+            None,
+            "unknown, never none"
+        );
+        let cannot_say = wire.replacen(" moves_7d=2", " moves_7d=-", 1).replacen(
+            " last_move=1793159000",
+            " last_move=-",
+            1,
+        );
+        assert_eq!(
+            SwarmSurveyFacts::from_survey_reply(&cannot_say)
+                .expect("valid")
+                .moves,
+            None
+        );
+
+        let dropped: String = wire
+            .lines()
+            .filter(|line| !line.starts_with("repo name=trust "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(SwarmSurveyFacts::from_survey_reply(&dropped).is_err());
+        for broken in [
+            wire.replacen(" repos_at=1793159000000", "", 1),
+            wire.replacen(" dirty=1", " dirty=2", 1),
+            wire.replacen(" repos=2 ", " ", 1),
+        ] {
+            assert!(
+                SwarmSurveyFacts::from_survey_reply(&broken).is_err(),
+                "{broken}"
+            );
         }
     }
 
     #[test]
     fn facts_round_trip_and_missing_field_negative_controls() {
         let expected = sample_facts();
+        let content =
+            expected.to_survey_reply_at(true, 4242, Some("m22.local"), 1_793_160_000_000, 1, false);
+        let parsed = SwarmSurveyFacts::from_survey_reply(&content).expect("valid C16 wire reply");
+        assert_eq!(parsed, expected);
         let wire = expected.to_survey_reply(4242, Some("m22.local"), 1_793_160_000_000, 1, false);
         let parsed = SwarmSurveyFacts::from_survey_reply(&wire).expect("valid C16 wire reply");
-        assert_eq!(parsed, expected);
+        assert_eq!(
+            parsed,
+            SwarmSurveyFacts {
+                home: None,
+                home_free_mb: None,
+                repos: None,
+                ..expected.clone()
+            },
+            "a facts reply carries nothing of the home"
+        );
 
         // Negative controls: omitting any required C16 field on `instance`, `account`, or
         // `server_heard` fails validation instead of silently inventing defaults.
@@ -837,6 +1253,48 @@ mod tests {
         assert!(SwarmSurveyFacts::from_survey_reply(&signed_accounts).is_err());
     }
 
+    /// A Mac's moves of the last seven days, proved and tried, and the newest proved however old.
+    #[test]
+    fn moves_count_the_last_seven_days_and_keep_the_newest_proved() {
+        const DAY: i64 = 24 * 60 * 60;
+        let now = 1_800_000_000;
+        let moves = PoolMoves {
+            tried: vec![
+                now - 8 * DAY,
+                now - 7 * DAY,
+                now - 7 * DAY + 1,
+                now - 20,
+                now - 5,
+            ],
+            proven: vec![now - 8 * DAY, now - 7 * DAY + 2, now - 10],
+        };
+        assert_eq!(
+            MoveFacts::of(&moves, now),
+            MoveFacts {
+                proven_7d: 2,
+                tried_7d: 3,
+                last: Some(now - 10),
+            }
+        );
+        let old = PoolMoves {
+            tried: vec![now - 30 * DAY, now - 3],
+            proven: vec![now - 30 * DAY],
+        };
+        assert_eq!(
+            MoveFacts::of(&old, now),
+            MoveFacts {
+                proven_7d: 0,
+                tried_7d: 1,
+                last: Some(now - 30 * DAY),
+            },
+            "an attempt is no last move"
+        );
+        assert_eq!(
+            MoveFacts::of(&PoolMoves::default(), now),
+            MoveFacts::default()
+        );
+    }
+
     /// The header counts the account lines and names the pools that could not be read, which an
     /// aterm whose facts predate the field leaves out; no email crosses the wire.
     #[test]
@@ -856,7 +1314,7 @@ mod tests {
             ..facts.clone()
         };
         let wire = none.to_survey_reply(4242, None, 0, 1, false);
-        assert!(wire.contains(" accounts_unread=-\n"), "{wire}");
+        assert!(wire.contains(" accounts_unread=- "), "{wire}");
         assert!(unread(&wire).is_empty());
         assert!(unread(&wire.replacen(" accounts_unread=-", "", 1)).is_empty());
 
@@ -888,8 +1346,13 @@ mod tests {
             seven_day_pct: Some(42),
             week_reset: Some(1_793_500_000),
             used_at: Some(1_793_130_000),
+            read_at: Some(1_793_130_000),
         };
         let claude = SurveyPool {
+            moves: Some(PoolMoves {
+                tried: vec![1_793_000_000],
+                proven: vec![1_793_000_050],
+            }),
             rows: vec![
                 row("main", Condition::Usable),
                 row(
@@ -901,12 +1364,45 @@ mod tests {
             ],
             sessions: BTreeMap::from([("s-a1".to_owned(), "work-2".to_owned())]),
         };
-        let (rows, unread, sessions) = account_facts_of([
+        let (_, _, _, moved) = account_facts_of([
+            (Cli::Claude, Ok(claude.clone())),
+            (
+                Cli::Kimi,
+                Ok(SurveyPool {
+                    moves: Some(PoolMoves {
+                        tried: vec![1_793_000_100],
+                        proven: Vec::new(),
+                    }),
+                    ..SurveyPool::default()
+                }),
+            ),
+        ]);
+        assert_eq!(
+            moved,
+            Some(PoolMoves {
+                tried: vec![1_793_000_000, 1_793_000_100],
+                proven: vec![1_793_000_050],
+            }),
+            "a Mac's moves across its pools"
+        );
+        let (_, _, _, moved) = account_facts_of([
+            (Cli::Claude, Ok(claude.clone())),
+            (Cli::Kimi, Ok(SurveyPool::default())),
+        ]);
+        assert_eq!(moved, None, "a ledger it could not read is unknown");
+        let (rows, unread, sessions, moved) = account_facts_of([
             (Cli::Claude, Ok(claude)),
             (Cli::Codex, Err("its roster could not be read".to_owned())),
-            (Cli::Grok, Ok(SurveyPool::default())),
+            (
+                Cli::Grok,
+                Ok(SurveyPool {
+                    moves: Some(PoolMoves::default()),
+                    ..SurveyPool::default()
+                }),
+            ),
         ]);
         assert_eq!(unread, ["codex"]);
+        assert_eq!(moved, None, "a pool it could not read is unknown");
         assert_eq!(
             rows.iter()
                 .map(|row| (row.pool.as_str(), row.id.as_str()))
@@ -976,6 +1472,36 @@ mod tests {
             touch_or_read_window_last(&state, false, 1_793_160_300),
             Some(1_793_160_000)
         );
+    }
+
+    /// When a row's figures were read crosses the wire, and an older member, which sends no such
+    /// field, still parses.
+    #[test]
+    fn an_account_rows_read_time_crosses_the_wire_and_an_older_member_sends_none() {
+        let line = |read_at: &str| {
+            let mut fields: Vec<(String, String)> = [
+                ("pool", "codex"),
+                ("id", "main"),
+                ("condition", "unseen"),
+                ("enrolled", "1"),
+                ("pct5", "-"),
+                ("pct7", "1"),
+                ("week_reset", "1793916839"),
+                ("walled_until", "-"),
+                ("last_used", "-"),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+            if !read_at.is_empty() {
+                fields.push(("read_at".to_owned(), read_at.to_owned()));
+            }
+            parse_account_line(&fields)
+        };
+        assert_eq!(line("1793000000").unwrap().read_at, Some(1_793_000_000));
+        assert_eq!(line("-").unwrap().read_at, None);
+        assert_eq!(line("").unwrap().read_at, None, "an older member");
+        assert!(line("soon").is_err(), "CONTROL: a bad figure is no figure");
     }
 
     #[cfg(unix)]
@@ -1114,6 +1640,21 @@ mod tests {
         let facts_ok =
             SwarmSurveyFacts::collect_at(&state, Some(&home), None, 0, false, None, 1_793_160_000);
         assert_eq!(facts_ok.label.as_deref(), Some("m100"));
+        let writer = aterm_secrets::client::test_hold_state_lock(&paths).unwrap();
+        let busy =
+            SwarmSurveyFacts::collect_at(&state, Some(&home), None, 0, false, None, 1_793_160_000);
+        assert!(
+            busy.roster_unread,
+            "a writer is visible as an unread roster"
+        );
+        assert_eq!(busy.label, None);
+        let wire = busy.to_survey_reply(1, None, 0, 1, false);
+        assert!(
+            SwarmSurveyFacts::from_survey_reply(&wire)
+                .unwrap()
+                .roster_unread
+        );
+        drop(writer);
         assert_eq!(
             SwarmSurveyFacts::parse_cpu_headroom_pct("instance cpu_headroom=+50\n"),
             None

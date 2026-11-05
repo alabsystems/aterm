@@ -234,3 +234,323 @@ fn a_tag_never_takes_up_its_base_s_guess() {
         Some(("mb-route".to_owned(), How::Routed, Vec::new()))
     );
 }
+
+#[test]
+fn a_protected_address_never_resolves_a_mailbox() {
+    let (priv_addr, alias, tag) = (pk("private"), pk("alias"), pk("private+ai"));
+    let addresses = rows(vec![
+        put(&ADDRESS, &priv_addr, "addr", json!("private@example.test")),
+        put(&ADDRESS, &priv_addr, "protected", json!(true)),
+        put(&ADDRESS, &priv_addr, "mailbox", json!("mb-own")),
+        put(&ADDRESS, &priv_addr, "mailbox_hint", json!("mb-hint")),
+        put(&ADDRESS, &alias, "addr", json!("alias@example.test")),
+        put(&ADDRESS, &alias, "alias_of", json!(priv_addr)),
+        put(&ADDRESS, &tag, "addr", json!("private+ai@example.test")),
+    ]);
+    let seen = Observed::from([(priv_addr.clone(), BTreeSet::from(["mb-obs".to_owned()]))]);
+    let route_priv = priv_addr.clone();
+    let routes = move |pk: &str| (pk == route_priv).then(|| "mb-route".to_owned());
+    assert_eq!(effective(&addresses, &seen, &routes, &priv_addr), None);
+    assert_eq!(effective(&addresses, &seen, &none, &alias), None);
+    assert_eq!(effective(&addresses, &seen, &none, &tag), None);
+}
+
+/// A sign-in's mailbox from registry rows alone (step A9): the MAILBOX row names its login by
+/// the address row, and its patterns, webmail and held credentials, never a value.
+mod sign_in {
+    use super::*;
+    use crate::{
+        alab::{registry::MAILBOX, secret::Journal},
+        typed::{
+            grid::tests::elem,
+            secret::{Fixed, Sealer, Secret},
+        },
+    };
+
+    const TABLE: &str = "alab/registry";
+
+    fn sealed(collection: &str, row: &str, column: &str, value: &str) -> Value {
+        json!(
+            Fixed(TABLE)
+                .seal(collection, row, column, &Secret::new(value.to_owned()))
+                .unwrap()
+        )
+    }
+
+    struct Fixture {
+        book: Book,
+        login: String,
+        mailbox: String,
+        member: String,
+    }
+
+    /// Every value is synthetic: an `example.test` login and fixture credentials.
+    fn fixture() -> Fixture {
+        let login = pk("owner");
+        let member = pk("ai1");
+        let mailbox = keys::mailbox_pk(&login).unwrap();
+        let mut book = Book::new();
+        book.write(
+            1,
+            &[],
+            vec![
+                put(&ADDRESS, &login, "addr", json!("owner@example.test")),
+                put(
+                    &ADDRESS,
+                    &login,
+                    "password",
+                    sealed("address", &login, "password", "fixture-login-pass"),
+                ),
+                put(&ADDRESS, &member, "addr", json!("ai1@example.test")),
+                put(&MAILBOX, &mailbox, "label", json!("proton-1")),
+                put(&MAILBOX, &mailbox, "service", json!("proton")),
+                put(&MAILBOX, &mailbox, "code_path", json!("webmail")),
+                put(
+                    &MAILBOX,
+                    &mailbox,
+                    "webmail",
+                    json!("https://mail.example.test/inbox"),
+                ),
+                put(&MAILBOX, &mailbox, "login", json!(login)),
+                put(
+                    &MAILBOX,
+                    &mailbox,
+                    "mailbox_password",
+                    sealed(
+                        "mailbox",
+                        &mailbox,
+                        "mailbox_password",
+                        "fixture-second-pass",
+                    ),
+                ),
+                put(
+                    &MAILBOX,
+                    &mailbox,
+                    "totp",
+                    sealed(
+                        "mailbox",
+                        &mailbox,
+                        "totp",
+                        "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+                    ),
+                ),
+                elem(&MAILBOX, &mailbox, "receives", &member),
+                put(
+                    &MAILBOX,
+                    &mailbox,
+                    "receives_domains",
+                    json!(["pm.example.test", "*"]),
+                ),
+            ],
+        );
+        Fixture {
+            book,
+            login,
+            mailbox,
+            member,
+        }
+    }
+
+    fn projections(book: &Book) -> (Projection, Projection) {
+        let cells = book.cells();
+        (
+            cell::project(&ADDRESS, &cells),
+            cell::project(&MAILBOX, &cells),
+        )
+    }
+
+    fn reveal_all(
+        addresses: &Projection,
+        mailboxes: &Projection,
+        journal: &Journal,
+        mailbox: &str,
+    ) -> Vec<std::result::Result<String, Withheld>> {
+        Credential::ALL
+            .into_iter()
+            .map(|which| {
+                let ask = Ask {
+                    mailbox,
+                    which,
+                    when_ms: 1_000,
+                };
+                reveal_in(
+                    addresses,
+                    mailboxes,
+                    &Fixed(TABLE),
+                    journal,
+                    ask,
+                    str::to_owned,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// The mailbox reads its login, webmail, patterns and held credentials from its rows, and
+    /// each credential reveals through the sealer, journalled once, with no value in the journal.
+    /// NEGATIVE CONTROL: with [`mailboxes`] reading the login from the MAILBOX row's own `label`
+    /// instead of its `login` address row, the login reads `proton-1` and the assertion on
+    /// `owner@example.test` fails.
+    #[test]
+    fn a_sign_in_reads_the_login_and_its_credentials_from_registry_rows() {
+        let Fixture {
+            book,
+            login,
+            mailbox,
+            member,
+        } = fixture();
+        let (addresses, mailboxes_rows) = projections(&book);
+        let found = mailboxes(&addresses, &mailboxes_rows);
+        assert_eq!(found.len(), 1);
+        let only = &found[0];
+        assert_eq!(only.pk, mailbox);
+        assert_eq!(only.login, "owner@example.test");
+        assert_eq!(only.login_pk, login);
+        assert_eq!(only.label, "proton-1");
+        assert_eq!(
+            only.webmail.as_deref(),
+            Some("https://mail.example.test/inbox")
+        );
+        assert_eq!(
+            only.receives,
+            ["ai1@example.test", "*@pm.example.test", "*"],
+            "exact, then domain, then any"
+        );
+        assert_eq!(only.held, Credential::ALL);
+        let _ = member;
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let journal = Journal::at(dir.path());
+        assert_eq!(
+            reveal_all(&addresses, &mailboxes_rows, &journal, &mailbox),
+            [
+                Ok("fixture-login-pass".to_owned()),
+                Ok("fixture-second-pass".to_owned()),
+                Ok("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_owned()),
+            ]
+        );
+        let log = std::fs::read_to_string(dir.path().join("reveals.jsonl")).unwrap();
+        assert_eq!(log.lines().count(), 3, "one record per reveal");
+        assert!(log.lines().all(|line| line.contains("SignIn")));
+        for value in ["fixture-login-pass", "fixture-second-pass", "GEZDGNBVGY3TQ"] {
+            assert!(
+                !log.contains(value),
+                "the journal holds coordinates, never a value"
+            );
+        }
+        assert!(log.contains(&login) && log.contains(&mailbox));
+    }
+
+    /// Two writes of one password under fresh nonces are one value; two different values are
+    /// withheld until the owner picks one, an empty cell says so, and a mailbox whose login row
+    /// is retired is no sign-in's. Nothing withheld reaches the journal.
+    /// NEGATIVE CONTROL: with the candidate comparison in [`reveal_in`] removed (the first token
+    /// always revealed), the two-values assertion reads `Ok("fixture-other")`.
+    #[test]
+    fn two_values_are_withheld_and_a_retired_login_is_no_mailbox() {
+        let Fixture {
+            mut book,
+            login,
+            mailbox,
+            ..
+        } = fixture();
+        // Two other Macs write, each unaware of the first's write: concurrent candidates. One
+        // writes the same login password under a fresh nonce, the other a different second one.
+        book.write(
+            2,
+            &[],
+            vec![put(
+                &ADDRESS,
+                &login,
+                "password",
+                sealed("address", &login, "password", "fixture-login-pass"),
+            )],
+        );
+        book.write(
+            3,
+            &[],
+            vec![put(
+                &MAILBOX,
+                &mailbox,
+                "mailbox_password",
+                sealed("mailbox", &mailbox, "mailbox_password", "fixture-other"),
+            )],
+        );
+        let (addresses, mailboxes_rows) = projections(&book);
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let journal = Journal::at(dir.path());
+        let got = reveal_all(&addresses, &mailboxes_rows, &journal, &mailbox);
+        assert_eq!(
+            got[0],
+            Ok("fixture-login-pass".to_owned()),
+            "equal values are one"
+        );
+        assert_eq!(got[1], Err(Withheld::TwoValues));
+        assert_eq!(got[2], Ok("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_owned()));
+        let log = std::fs::read_to_string(dir.path().join("reveals.jsonl")).unwrap();
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "a withheld value is never journalled"
+        );
+
+        let mut empty = Book::new();
+        empty.write(
+            1,
+            &[],
+            vec![
+                put(&ADDRESS, &login, "addr", json!("owner@example.test")),
+                put(&MAILBOX, &mailbox, "label", json!("proton-1")),
+                put(&MAILBOX, &mailbox, "service", json!("proton")),
+                put(&MAILBOX, &mailbox, "code_path", json!("webmail")),
+                put(&MAILBOX, &mailbox, "login", json!(login)),
+            ],
+        );
+        let (addresses, mailboxes_rows) = projections(&empty);
+        assert!(mailboxes(&addresses, &mailboxes_rows)[0].held.is_empty());
+        assert_eq!(
+            reveal_all(&addresses, &mailboxes_rows, &journal, &mailbox)[0],
+            Err(Withheld::NotSet)
+        );
+        empty.write(1, &[], vec![put(&ADDRESS, &login, "row", json!("retired"))]);
+        let (addresses, mailboxes_rows) = projections(&empty);
+        assert!(mailboxes(&addresses, &mailboxes_rows).is_empty());
+        assert_eq!(
+            reveal_all(&addresses, &mailboxes_rows, &journal, &mailbox)[0],
+            Err(Withheld::NoMailbox)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("reveals.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    /// A token another table's sealer wrote does not open here: withheld as `Unopened`.
+    #[test]
+    fn a_cell_that_does_not_open_here_is_withheld() {
+        let Fixture { book, mailbox, .. } = fixture();
+        let (addresses, mailboxes_rows) = projections(&book);
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let journal = Journal::at(dir.path());
+        let ask = Ask {
+            mailbox: &mailbox,
+            which: Credential::Totp,
+            when_ms: 1,
+        };
+        assert_eq!(
+            reveal_in(
+                &addresses,
+                &mailboxes_rows,
+                &Fixed("alab/other"),
+                &journal,
+                ask,
+                str::to_owned
+            )
+            .unwrap(),
+            Err(Withheld::Unopened)
+        );
+    }
+}

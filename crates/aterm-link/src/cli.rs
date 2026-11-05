@@ -611,14 +611,20 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
             "unretained".to_string()
         }
     };
+    if let Err(e) = crate::broker_rules::limit(&broker) {
+        eprintln!(
+            "aterm link broker: {log}: its rate limit could not be set ({e}); it serves with no \
+             limit on any producer"
+        );
+    }
+    // The limit the broker serves under, read back from it: the start line says what it does.
+    let limited = crate::broker_rules::rate_word(broker.rate_limit());
     let handle = match broker.serve(&endpoint) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("aterm link broker: serve {endpoint}: {e}");
             if log_created_here
-                && std::fs::metadata(&log)
-                    .map(|m| m.len() == 0)
-                    .unwrap_or(false)
+                && std::fs::symlink_metadata(&log).is_ok_and(|m| m.is_file() && m.len() == 0)
             {
                 drop(broker);
                 let _ = std::fs::remove_file(&log);
@@ -646,7 +652,7 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
         let _ = writeln!(
             std::io::stderr(),
             "aterm link broker: unix socket on {endpoint}{guard_note}, durability {}: {}; \
-             {retained}; {}; at-rest={}; log {}",
+             {retained}; {limited}; {}; at-rest={}; log {}",
             durability.name(),
             crate::durability::describe_served(
                 durability,
@@ -851,25 +857,16 @@ impl StopSignal {
 }
 
 const fn signal_name(sig: i32) -> &'static str {
-    #[cfg(unix)]
-    {
-        match sig {
-            libc::SIGTERM => "SIGTERM",
-            libc::SIGINT => "SIGINT",
-            libc::SIGHUP => "SIGHUP",
-            _ => "a signal",
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = sig;
-        "a signal"
+    match sig {
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGINT => "SIGINT",
+        libc::SIGHUP => "SIGHUP",
+        _ => "a signal",
     }
 }
 
 /// Block `SIGTERM`, `SIGINT` and `SIGHUP` on the main thread (before worker threads spawn)
 /// and unpark `main` when one arrives so astream flushes and marks the log `Closed`.
-#[cfg(unix)]
 fn take_stop_signals(main: std::thread::Thread) -> Option<StopSignal> {
     let taken = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
     let flag = std::sync::Arc::clone(&taken);
@@ -878,11 +875,6 @@ fn take_stop_signals(main: std::thread::Thread) -> Option<StopSignal> {
         main.unpark();
     })
     .then_some(StopSignal(taken))
-}
-
-#[cfg(not(unix))]
-fn take_stop_signals(_main: std::thread::Thread) -> Option<StopSignal> {
-    None
 }
 
 /// Remedy prefix printed when astream refuses to open a corrupt broker log.
@@ -912,7 +904,7 @@ fn repair_log(log: &str) -> ExitCode {
     if let Some(refused) = crate::at_rest::unfinished_retire(std::path::Path::new(log)) {
         return refuse_repair(&refused);
     }
-    match std::fs::metadata(log) {
+    match std::fs::symlink_metadata(log) {
         Ok(m) if m.is_file() => {}
         Ok(_) => {
             eprintln!("aterm link broker --repair: {log} is not a file");

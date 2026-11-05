@@ -225,7 +225,7 @@ pub(crate) fn replay(
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| failed("replay.mjs answered no answers to record".to_string()))?;
-        std::fs::write(&answers, text)
+        crate::write_fresh(&answers, text)
             .map_err(|e| failed(format!("could not write {}: {e}", answers.display())))?;
         let _ = writeln!(log, "  wasm-replay: recorded {}", answers.display());
     }
@@ -235,7 +235,7 @@ pub(crate) fn replay(
         .ok_or_else(|| failed(format!("{}: no frame hash to plant", answers.display())))?;
     for (name, contents) in [("answers.json", &text), ("answers.planted.json", &planted)] {
         let path = site.join(name);
-        std::fs::write(&path, contents)
+        crate::write_fresh(&path, contents)
             .map_err(|e| failed(format!("could not write {}: {e}", path.display())))?;
     }
     let differ = |ran: &wasm_page::Ran| ran.value.get("failures").and_then(Value::as_u64);
@@ -393,7 +393,7 @@ fn build_and_bench(
         ("wasm_gpu_module_bytes", "gpu/aterm_gpu_web_bg.wasm"),
     ] {
         let path = site.join(module);
-        let bytes = std::fs::metadata(&path)
+        let bytes = std::fs::symlink_metadata(&path)
             .map_err(|e| failed(format!("could not read {}: {e}", path.display())))?
             .len();
         fields.insert(key.to_string(), json!(bytes));

@@ -3,9 +3,7 @@
 
 //! End-to-end ordered durability and selective escalation tests for the fabric broker.
 
-use crate::harness::{self, FLEET, World, until};
-
-use std::path::PathBuf;
+use crate::harness::{self, World, until};
 
 /// Creates an ordered-durability broker world with no horizon, or `None` if strict.
 fn ordered_world(tag: &str) -> Option<World> {
@@ -26,50 +24,6 @@ fn ordered_world(tag: &str) -> Option<World> {
         return None;
     }
     Some(w)
-}
-
-/// `person`'s cap file.
-fn person_cap(w: &World, person: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = w.tmp.join(format!("{person}.cap"));
-    let caps: String = astream_cap::GrantCeiling::aterm_person_ring(FLEET, person)
-        .expect("a person ring")
-        .rules()
-        .iter()
-        .map(|g| harness::cap_line(g))
-        .collect();
-    std::fs::write(&path, caps).expect("write the person's cap");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
-    path
-}
-
-/// Run `aterm fabric <args>` as a person on this world's fleet.
-fn fabric(w: &World, args: &[&str]) -> (String, String) {
-    let cmd_line = std::fs::read_to_string(w.tmp.join("fabric.cmd")).expect("the fabric command");
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the harness's bounded reader (`output_within`) takes a std Command; the child \
-                  is `aterm fabric`, run to its exit, so an inherited descriptor lives no longer"
-    )]
-    let mut cmd = std::process::Command::new(harness::aterm_to_launch());
-    harness::prepare_gui_environment(&mut cmd);
-    cmd.arg("fabric")
-        .args(args)
-        .env("ATERM_FABRIC_COMMAND", cmd_line.trim())
-        .env("HOME", w.tmp.join("home"))
-        .env("XDG_CONFIG_HOME", w.tmp.join("cfg"))
-        .env("XDG_RUNTIME_DIR", w.tmp.join("run"));
-    let out = harness::output_within(&mut cmd, "aterm fabric");
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    );
-    assert!(
-        out.status.success(),
-        "aterm fabric {args:?}: {:?}\n{stdout}\n{stderr}",
-        out.status
-    );
-    (stdout, stderr)
 }
 
 /// The offset `@<off>` that `text` names after `marker`.
@@ -121,9 +75,9 @@ fn an_ordered_broker_flushes_a_persons_records_before_it_shows_them() {
     );
     assert_eq!(full(), 0, "no full flush was spent on machine records");
 
-    let cap = person_cap(&w, "h-x");
+    let cap = w.person_cap("h-x");
     let cap = cap.to_string_lossy();
-    let (out, _) = fabric(&w, &["halt", "--cap-file", &cap, "stop", "now"]);
+    let (out, _) = w.fabric_as_person(&["halt", "--cap-file", &cap, "stop", "now"]);
     let halt = at_off(&out, "halt is ON at ");
     assert!(
         broker.durable_head() > halt,
@@ -135,7 +89,7 @@ fn an_ordered_broker_flushes_a_persons_records_before_it_shows_them() {
         "the whole file"
     );
     assert_eq!(full(), 1, "one full flush, the halt's");
-    let (out, _) = fabric(&w, &["halt", "--cap-file", &cap, "off"]);
+    let (out, _) = w.fabric_as_person(&["halt", "--cap-file", &cap, "off"]);
     let lift = at_off(&out, "halt is OFF at ");
     assert!(broker.durable_head() > lift, "a lift is escalated too");
     let after_lift = full();
@@ -154,7 +108,7 @@ fn an_ordered_broker_flushes_a_persons_records_before_it_shows_them() {
     assert_eq!(mailed, after_lift + 1, "one full flush, the ask's");
     let note = agent_note(&w, &a, &b, "unread");
     assert!(broker.durable_head() <= note);
-    let (out, err) = fabric(&w, &["inbox", "--cap-file", &cap]);
+    let (out, err) = w.fabric_as_person(&["inbox", "--cap-file", &cap]);
     assert!(
         out.contains(&format!("@{ask} ")),
         "the ask is in the inbox:\n{out}"

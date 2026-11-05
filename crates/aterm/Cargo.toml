@@ -31,6 +31,13 @@ path = "src/main.rs"
 name = "aterm-windowed"
 path = "src/windowed.rs"
 
+# Dev-only native image for the owned host regression.
+[[bin]]
+name = "aterm-claude-fixture"
+path = "tests/support/claude_fixture_main.rs"
+test = false
+bench = false
+
 [dependencies]
 # The four faces of the one command, all libraries:
 aterm-cli = { path = "../aterm-cli" }     # the SESSION (PTY passthrough) + parser/diag/manual
@@ -93,6 +100,10 @@ aterm-uds = { workspace = true }
 # `std::os::unix` imports. Off unix the `link` verb stays on the roster and refuses by name
 # (src/main.rs `link_unavailable`).
 [target.'cfg(unix)'.dependencies]
+# Development native-window handoff retains an actual original account-lane description.
+# Both libraries are already in the composed executable's dependency graph.
+aterm-capacity = { workspace = true }
+aterm-toolchain = { path = "../aterm-toolchain" }
 aterm-link = { path = "../aterm-link" }
 # `aterm secrets` — one credentials file for every machine
 # (docs/DESIGN-secrets-2026-10-20.md): the vault's client, its keyless
@@ -170,9 +181,7 @@ aterm-slog = { workspace = true }
 # `fabric status --json` is asserted as JSON, not as substrings: aterm-json is a
 # [dependencies] row (the doctor's `--json`), which the tests reach too.
 # The spare suite asks which system files the host's zsh reads before aterm's
-# parked hold (`pre_hold_files`), and a scratch world's teardown releases the spares
-# its killed instances left (`spare_fifo::sweep_dead`). Already in the graph through
-# aterm-gui.
+# parked hold (`pre_hold_files`). Already in the graph through aterm-gui.
 aterm-shell-integration = { workspace = true }
 # The Rewind R3 suite decodes a pane trace another process exported. Already in the graph
 # through aterm-gui.

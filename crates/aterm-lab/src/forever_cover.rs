@@ -2061,6 +2061,105 @@ pub(super) fn judge_same_words(seen: &Seen, t0: i64) -> Verdict {
     }
 }
 
+/// How long after the stub's question reaches the screen its answer may take where no person
+/// types: a one-minute hang detector, never a latency budget.
+const DIALOG_ANSWER_MS: i64 = 60_000;
+
+/// L20 (`land`) and C5: the first turn's question dialog ([`dialog_call`]). Its answer rows are
+/// the Autopilot's (`answer-land@v1` under Land, `answer-recommended@v1` under Cruise), approved,
+/// none of the other's and none handed over, the first within [`DIALOG_ANSWER_MS`] of the
+/// question's reply; the tool result the agent sent back carries the land policy text under Land
+/// and the Recommended option under Cruise, and no need is raised. Under Land the chain then lands
+/// through the land check ([`judge_clean_landing`]).
+pub(super) fn judge_dialog(seen: &Seen, land: bool, t0: i64) -> Verdict {
+    use aterm_agent::supervise::policy::question::LAND_TEXT;
+    use aterm_agent::supervise::policy::{RULE_ANSWER_LAND, RULE_ANSWER_RECOMMENDED};
+    let (rule, other, carried) = if land {
+        (RULE_ANSWER_LAND, RULE_ANSWER_RECOMMENDED, LAND_TEXT)
+    } else {
+        (
+            RULE_ANSWER_RECOMMENDED,
+            RULE_ANSWER_LAND,
+            DIALOG_NEW_WORK.trim_end_matches(" (Recommended)"),
+        )
+    };
+    let rows: Vec<&Row> = seen
+        .ledger
+        .iter()
+        .filter(|r| r.ts >= t0 && r.rule.starts_with("answer-"))
+        .collect();
+    if let Some(r) = rows
+        .iter()
+        .find(|r| matches!(r.decision.as_str(), "escalated" | "deferred"))
+    {
+        return Verdict::Fail(format!(
+            "the dialog was handed over at +{} ({} {}): {}",
+            at(t0, r.ts),
+            r.rule,
+            r.decision,
+            crate::util::one_line(&r.reason, 200)
+        ));
+    }
+    if let Some(r) = rows.iter().find(|r| r.rule == other) {
+        return Verdict::Fail(format!(
+            "the dialog was answered under {other} at +{}, not {rule}",
+            at(t0, r.ts)
+        ));
+    }
+    let Some(first) = rows
+        .iter()
+        .find(|r| r.rule == rule && r.decision == "approved")
+    else {
+        return Verdict::Unobserved(format!(
+            "no {rule} row approved within {}",
+            at(t0, seen.end_ms)
+        ));
+    };
+    let asked = t0 + Chain::LandDialog.first_reply_ms();
+    if first.ts - asked > DIALOG_ANSWER_MS {
+        return Verdict::Fail(format!(
+            "{rule} first approved at +{}, more than {} s after the question's reply (+{})",
+            at(t0, first.ts),
+            DIALOG_ANSWER_MS / 1000,
+            at(t0, asked)
+        ));
+    }
+    let Some(answers) = seen.cover.dialog_answers.as_ref() else {
+        return Verdict::Unobserved("the stub's dumps were not read".into());
+    };
+    let head: String = carried.chars().take(60).collect();
+    if !answers.iter().any(|a| a.contains(head.as_str())) {
+        return Verdict::Fail(format!(
+            "no tool result carried {head:?} back: {}",
+            answers
+                .iter()
+                .map(|a| crate::util::one_line(a, 160))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+    if let Some((t, m)) = seen.meta.iter().find(|(t, m)| *t >= t0 && needs_up(m)) {
+        return Verdict::Fail(format!(
+            "a need was raised at +{}: {}",
+            at(t0, *t),
+            crate::util::one_line(m, 160)
+        ));
+    }
+    let said = format!(
+        "{} {rule} row(s) approved from +{}, the tool result carrying {head:?}",
+        rows.iter().filter(|r| r.decision == "approved").count(),
+        at(t0, first.ts)
+    );
+    if !land {
+        return Verdict::Pass(said);
+    }
+    let land_act = seen.acts(turn_end::RULE_LAND).first().copied();
+    compose(
+        &said,
+        &[("landed", judge_clean_landing(seen, land_act, t0))],
+    )
+}
+
 /// Judges F3 live: a first reply ending on a read-only tool box.
 pub(super) fn judge_tool_end(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
     let results = seen.cover.tool_results.unwrap_or(0);

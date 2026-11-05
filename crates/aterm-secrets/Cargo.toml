@@ -7,12 +7,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's credentials vault (`aterm secrets`, docs/DESIGN-secrets-2026-10-20.md): one text file of secrets, encrypted per audience to every machine's age X25519 key, signed by the vault's Ed25519 key, served from a URL (or read from a path) by a keyless long-poll server, and kept in sync into ~/.secrets on every machine. The age v1 codec and a first-party X25519 (TweetNaCl's verified ladder) compile everywhere; the files, the server, the subscriber and the services are Unix."
+description = "aterm's credentials vault (`aterm secrets`, docs/DESIGN-secrets-2026-10-20.md): one text file of secrets, encrypted per audience to every machine's age X25519 key, signed by the vault's Ed25519 key, served from a URL (or read from a path) by a keyless long-poll server, and kept in sync into ~/.secrets on every machine. The age v1 codec and a first-party X25519 (RFC 7748's ladder over fiat-crypto's radix-2^51 field) compile everywhere; the files, the server, the subscriber and the services are Unix."
 
 [dependencies]
-# ChaCha20-Poly1305, HKDF-SHA256, HMAC-SHA256 and Ed25519 sign/verify. No features:
+# ChaCha20-Poly1305, HKDF-SHA256, HMAC-SHA256 and Ed25519 signing. No features:
 # none of these is behind `alloc`, and randomness is aterm_uds::rand, not ring's RNG.
 ring = { workspace = true }
+# Every Ed25519 verification (`ed25519::verifies` and direct calls): astream's strict
+# check, which refuses the small-order keys and commitments ring alone takes. Its
+# `signature` feature is ring, zeroize and getrandom, all already in this graph.
+astream-aead = { path = "../../vendor/astream/crates/astream-aead", default-features = false, features = ["signature"] }
 # Wipes every key, file key and plaintext buffer the crate holds on drop (not the key
 # schedules ring derives from them, which ring never wipes). Already in the KEEP closure
 # through rustls, so no new package.
@@ -27,6 +31,8 @@ aterm-digest = { workspace = true }
 aterm-uds = { workspace = true }
 # `dirs::home_dir`, `fs_restricted` (0700 directories).
 aterm-types = { workspace = true }
+# `hv_vmm_present`: an identity made in a virtual machine is a lab identity (`LabMark`).
+aterm-sysprobe = { workspace = true }
 # Shared release-ring authority is verified with the updater's pinned master-roster chain.
 aterm-update-core = { workspace = true }
 # The workspace clock.

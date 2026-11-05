@@ -1487,7 +1487,15 @@ fn load_with_pins(store: &Path, now: u64, pins: &[(String, [u8; 32])]) -> crate:
     let entries =
         std::fs::read_dir(store).map_err(|e| Error::new(format!("{}: {e}", store.display())))?;
     let mut names: Vec<String> = entries
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter_map(|entry| {
+            let file = entry.ok()?.file_name().into_string().ok()?;
+            let stem = file
+                .strip_suffix(".vault")
+                .or_else(|| file.strip_suffix(".records"))
+                .or_else(|| file.strip_suffix(".joins"))
+                .or_else(|| file.strip_suffix(".heard"))?;
+            envelope::valid_name(stem).then_some(file)
+        })
         .collect();
     // Vaults first: a record store follows the key of the envelope held beside it.
     names.sort_by(|a, b| (!a.ends_with(".vault"), a).cmp(&(!b.ends_with(".vault"), b)));
@@ -1576,15 +1584,17 @@ pub fn read_last_heard(store: &Path) -> Vec<(String, String, u64)> {
         return Vec::new();
     };
     let mut names: Vec<String> = entries
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter_map(|entry| {
+            let file = entry.ok()?.file_name().into_string().ok()?;
+            file.strip_suffix(".heard")
+                .is_some_and(envelope::valid_name)
+                .then_some(file)
+        })
         .collect();
     names.sort();
     let mut out = Vec::new();
     for file in names {
-        let Some(name) = file
-            .strip_suffix(".heard")
-            .filter(|n| envelope::valid_name(n))
-        else {
+        let Some(name) = file.strip_suffix(".heard") else {
             continue;
         };
         let Ok(Some(bytes)) = fsx::read_owned(&store.join(&file), MAX_HEARD_FILE) else {
@@ -4786,11 +4796,7 @@ fn parse_positive_seq(text: &str) -> Option<u64> {
 }
 
 fn hex32_encode(bytes: &[u8; 32]) -> String {
-    let mut out = String::with_capacity(64);
-    for &byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    aterm_codec::hex::encode_lower(bytes)
 }
 
 fn hex32_decode(text: &str) -> Option<[u8; 32]> {
@@ -5097,7 +5103,13 @@ fn end(child: &mut aterm_uds::spawnfd::Child) {
 /// Budget for resolving `_alab-vault._tcp` instances heard on the standing browse.
 const PEER_RESOLVE_BUDGET: Duration = Duration::from_millis(750);
 /// Budget for an immediate `?after=<seq>` pull from a `>= 0.146` peer (`X-Aterm-No-Wait: 1`).
+#[cfg(not(test))]
 const PEER_PULL_BUDGET: Duration = Duration::from_secs(2);
+/// A unit test's is its one-minute hang detector: the peers its servers pull from are its own
+/// loopback stand-ins, whose answer is waited for rather than taken for a peer gone from the LAN
+/// (`tests/` lifts it through [`start_with_peer_pull`]).
+#[cfg(test)]
+const PEER_PULL_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// Budget for a pull from a `0.145` peer (`txt == None`), which ignores `X-Aterm-No-Wait` and
 /// parks when it holds nothing newer.
 const LEGACY_PEER_PULL_BUDGET: Duration = Duration::from_millis(750);

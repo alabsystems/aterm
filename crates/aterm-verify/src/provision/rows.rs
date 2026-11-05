@@ -113,8 +113,6 @@ pub enum Install {
         /// Upstream source tarball, held to its size and SHA-256.
         source: Archive,
     },
-    /// Crate CLI built by `targo --unverified install --locked` at its lockfile pin.
-    Cargo,
     /// Browser engine pinned by the browser lane.
     Browser(Engine),
     /// rustup-init at its tool row's pin, copied into the cache as `bin/rustup` (rustup-init
@@ -230,7 +228,7 @@ const BASH_PATCHES: [Archive; aterm_uds::host::bash::PATCHES.len()] = {
 pub const MICROSOFT_TEAM: &str = "UBF8T346G9";
 
 /// Every row, in the order a run provides them.
-pub const ROWS: [Row; 15] = [
+pub const ROWS: [Row; 14] = [
     Row {
         name: "openssl-signing",
         tool: Some("openssl-signing"),
@@ -473,11 +471,6 @@ pub const ROWS: [Row; 15] = [
                 ubuntu(aterm_vz::pins::INITRD),
             ],
         },
-    },
-    Row {
-        name: "wasm-bindgen",
-        tool: Some("wasm-bindgen"),
-        install: Install::Cargo,
     },
 ];
 

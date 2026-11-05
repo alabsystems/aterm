@@ -578,7 +578,15 @@ fn keyed_baseline_path(lane: &FloorLane) -> PathBuf {
 }
 
 fn write_baseline(path: &Path, text: &str) -> LaneRun {
-    match std::fs::write(path, text) {
+    write_baseline_using(path, text, super::publication::publish)
+}
+
+fn write_baseline_using(
+    path: &Path,
+    text: &str,
+    publish: super::publication::Publisher,
+) -> LaneRun {
+    match publish(path, text) {
         Ok(()) => {
             eprintln!("  RECORDED baseline -> {}", path.display());
             LaneRun {
@@ -1330,6 +1338,21 @@ mod tests {
         }
         let none = compare_keyed_against_baseline(&SEARCH_LANE, &dir.path().join("x"), &values);
         assert_eq!(none.status, Status::NotJudged("no baseline".into()));
+    }
+
+    #[test]
+    fn interrupted_baseline_publication_preserves_history() {
+        let dir = scratch();
+        let path = dir.path().join("baseline.json");
+        let old = "{\"median_mbps\":42}";
+        assert_eq!(
+            write_baseline(&path, old).status,
+            Status::Recorded(path.clone())
+        );
+        assert!(
+            write_baseline_using(&path, "new", super::super::publication::interrupted).failed()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
     }
 
     #[test]

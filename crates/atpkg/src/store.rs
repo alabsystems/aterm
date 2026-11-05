@@ -284,9 +284,6 @@ impl Layout {
     pub fn retired_date(&self, program: &str) -> Option<String> {
         ToolName::new(program)?;
         let path = self.retired_marker(program);
-        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
-            return None;
-        }
         let text = crate::metadata_io::read_bounded_regular_utf8(&path, 4096).ok()?;
         let first = text.lines().next()?.trim();
         let shaped = first.len() == 10
@@ -541,6 +538,16 @@ pub fn build_is_complete(build_dir: &Path) -> bool {
     }
 }
 
+/// Whether `build_dir`'s ready record names a `bin/` tool that is provably gone, which makes
+/// [`build_is_complete`] answer no. No record, or one this process cannot read, says nothing.
+pub(crate) fn lost_a_recorded_tool(build_dir: &Path) -> bool {
+    ready_marker_path(build_dir)
+        .and_then(|marker| {
+            crate::metadata_io::read_bounded_regular_utf8(&marker, 4 * 1024 * 1024).ok()
+        })
+        .is_some_and(|text| !ready_contents_accept(&text, build_dir))
+}
+
 /// Whether `build_dir` records the other slice of the universal binary.
 /// # Errors
 /// Its present marker cannot be admitted or its leading complete/platform evidence cannot
@@ -666,16 +673,16 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) -> std::io::Result<()> {
         // Numeric build dirs only, by the same test every other store scan uses: `current`
         // is a symlink, and `<n>.ready` / `<n>.provenance` / `<n>.shim-env` are files. A
         // build laid aside is its `<n>` link.
-        if !entry.file_type()?.is_dir() && !aterm_toolchain::layout::is_linked_aside(&entry.path())
-        {
-            continue;
-        }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if parse_build_name(name).is_none() {
             continue;
         }
-        clear_build_ready(&entry.path())?;
+        let path = entry.path();
+        if !entry.file_type()?.is_dir() && !aterm_toolchain::layout::is_linked_aside(&path) {
+            continue;
+        }
+        clear_build_ready(&path)?;
         unmarked = true;
     }
     if unmarked {
@@ -1375,6 +1382,43 @@ pub(crate) fn tree_absent(build_dir: &Path) -> bool {
     }
 }
 
+/// `lstat` of `path` as an answer: `Ok(true)` for a real directory, `Ok(false)` for
+/// provably none (absent, `ENOTDIR` above it, or a non-directory such as a symlink at the
+/// name), and `Err` when the question went unanswered (a component that cannot be
+/// searched).
+#[cfg(unix)]
+pub(crate) fn real_dir(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => Ok(m.is_dir()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(libc::ENOTDIR) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!("cannot lstat {} ({e})", path.display()),
+        )),
+    }
+}
+
+/// [`real_dir`] for the store build `build`, which also stands as its `<n>` link to a real
+/// `<n>.noindex` once laid aside ([`aterm_toolchain::layout`]).
+#[cfg(unix)]
+pub(crate) fn build_stands(build: &Path) -> std::io::Result<bool> {
+    match aterm_toolchain::layout::aside_of(build) {
+        Some(aside) if aterm_toolchain::layout::is_linked_aside(build) => real_dir(&aside),
+        _ => real_dir(build),
+    }
+}
+
+/// Elsewhere no build is laid aside ([`lays_aside`]).
+#[cfg(not(unix))]
+pub(crate) fn build_stands(build: &Path) -> std::io::Result<bool> {
+    Ok(std::fs::symlink_metadata(build).is_ok_and(|m| m.is_dir()))
+}
+
 /// Point `build_dir` at its aside: the link `<build>` -> `<build>.noindex`, relative.
 #[cfg(unix)]
 pub(crate) fn link_aside(build_dir: &Path) -> std::io::Result<()> {
@@ -1559,8 +1603,9 @@ pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for child in std::fs::read_dir(&dir)? {
-            let path = child?.path();
-            let ft = std::fs::symlink_metadata(&path)?.file_type();
+            let child = child?;
+            let path = child.path();
+            let ft = child.file_type()?;
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() {
@@ -1574,7 +1619,7 @@ pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
                 }
             }
         }
-        if let Ok(handle) = std::fs::File::open(&dir) {
+        if let Ok(handle) = crate::platform::open_for_sync(&dir) {
             sync_contents_or_accept_refusal(&handle)?;
             counts.dirs = counts.dirs.saturating_add(1);
         }
@@ -1824,9 +1869,9 @@ pub(crate) mod system_shape {
 
 fn system_chain_trusted(p: &Path) -> bool {
     p.ancestors().all(|anc| {
-        std::fs::symlink_metadata(anc).is_ok_and(|m| {
+        std::fs::symlink_metadata(anc).map_or(true, |m| {
             !crate::platform::is_reparse(&m) && crate::platform::dir_meta_is_system(&m)
-        }) || std::fs::symlink_metadata(anc).is_err()
+        })
     })
 }
 

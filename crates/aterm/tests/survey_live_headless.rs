@@ -77,7 +77,11 @@ fn the_survey_reads_every_session_of_an_instance() {
         "{text}"
     );
     let lines: Vec<&str> = rest.lines().collect();
-    assert_eq!(lines.len(), 3, "a header and two sessions: {text}");
+    assert_eq!(
+        lines.len(),
+        4,
+        "a header, its home and two sessions: {text}"
+    );
     assert!(lines[0].starts_with("== "), "{text}");
     assert!(lines[0].contains(" · 2 sessions"), "{text}");
     assert!(lines[0].ends_with(" trust=screen"), "{text}");
@@ -85,13 +89,17 @@ fn the_survey_reads_every_session_of_an_instance() {
     for line in &lines[1..] {
         assert!(line.chars().count() <= 110, "{line}");
     }
+    // The instance's home (a content survey's), whose checkouts its scratch home has none of
+    // once read.
+    assert!(lines[1].starts_with("  home "), "{text}");
+    assert!(lines[1].contains(" \u{b7} checkouts "), "{text}");
     assert!(
-        lines[1].starts_with(&format!("{b} running sleep")),
+        lines[2].starts_with(&format!("{b} running sleep")),
         "{text}"
     );
-    assert!(lines[2].starts_with(&format!("{a} ")), "{text}");
-    assert!(lines[2].contains(" idle typed by "), "{text}");
-    assert!(lines[2].contains(" ago | build "), "{text}");
+    assert!(lines[3].starts_with(&format!("{a} ")), "{text}");
+    assert!(lines[3].contains(" idle typed by "), "{text}");
+    assert!(lines[3].contains(" ago | build "), "{text}");
     assert!(
         !text.contains('\u{202e}'),
         "the override reached the reader: {text:?}"

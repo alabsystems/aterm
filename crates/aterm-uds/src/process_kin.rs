@@ -563,10 +563,15 @@ fn read_host_id() -> Option<String> {
         .open("/etc/machine-id")
         .ok()?;
     let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || metadata.len() > 64
+    {
         return None;
     }
-    let mut text = String::new();
+    let mut text =
+        String::with_capacity(usize::try_from(metadata.len().saturating_add(1)).unwrap_or(0));
     file.take(65).read_to_string(&mut text).ok()?;
     let text = text.trim();
     (text.len() == 32

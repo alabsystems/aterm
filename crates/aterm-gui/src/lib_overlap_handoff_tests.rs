@@ -1,7 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::{App, WindowId, stub_session};
+use super::{App, WindowId, bootstrap_paints_first, stub_session};
+
+/// A successor whose first window the pass leaves with no terminal paints none of its fresh shell:
+/// the shell would reach the glass, and stand as the paint proof, before the list or page did.
+#[test]
+fn a_successor_paints_no_shell_the_pass_retires_at_once() {
+    for (handoff_ready, pass_runs_now, first_holds_no_terminal, paints) in [
+        (false, false, false, false),
+        (false, false, true, false),
+        (true, true, false, true),
+        (true, true, true, false),
+        (true, false, false, true),
+        (true, false, true, true),
+    ] {
+        assert_eq!(
+            bootstrap_paints_first(handoff_ready, pass_runs_now, first_holds_no_terminal),
+            paints,
+            "ready={handoff_ready} pass={pass_runs_now} no terminal={first_holds_no_terminal}"
+        );
+    }
+}
 
 fn overlap_model_step(
     model: &aterm_spec::derive::Model,
@@ -134,6 +154,7 @@ pub(crate) fn arm_outgoing_handoff(app: &mut App) -> std::sync::mpsc::Receiver<(
         target_build: crate::build_info::build_number().parse().unwrap_or(0),
         target_commit: crate::build_info::git_commit().to_string(),
         layout,
+        carry_lone_lists: false,
         layout_digest,
         screen_digest: [9; 32],
         activity_epoch: app.update_handoff_activity_epoch,
@@ -1341,7 +1362,7 @@ fn a_focus_loss_after_input_was_queued_for_the_window_marks_it_incoherent() {
     app.handoff_deferred_input.push((
         this,
         WindowEvent::ModifiersChanged(Default::default()),
-        false,
+        aterm_window::event::InputOrigin::Person,
     ));
     app.on_focus(WindowId(0), false);
     assert!(

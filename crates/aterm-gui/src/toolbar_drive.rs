@@ -908,6 +908,7 @@ mod macos {
         );
         let want = aterm_agent::supervise::mode_words::report_words(
             aterm_phase::Program::Claude.product(),
+            aterm_agent::harness::hold_said::NeedTail::CarryingOn,
             false,
         );
         let tip = report.and_then(|r| needs[r].tip.clone());

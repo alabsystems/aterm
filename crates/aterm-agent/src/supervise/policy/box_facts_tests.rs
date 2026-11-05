@@ -32,7 +32,9 @@ fn every_fact() -> BoxFacts {
         shell_cwds: vec![PathBuf::from("/Users//owner/src/app/sub")],
         shell: Some(Ok(ShellStartup::of_parts(
             vec![("alias".to_string(), "ls".to_string(), true)],
+            true,
             false,
+            true,
         ))),
         owner_asks: Some(Ok(vec![OwnerAsk {
             kind: AskKind::Rule {
@@ -49,6 +51,7 @@ fn every_fact() -> BoxFacts {
             priority: QuestionPriority::LongTerm,
             own: Some(QuestionPriority::ShortTerm),
             fell_back: true,
+            person: true,
         }),
         box_call: Some("Bash".to_string()),
         login_carry: true,
@@ -81,6 +84,7 @@ fn facts_read_back_as_written() {
     assert_eq!(back.cwd, facts.cwd);
     assert_eq!(back.trusted_cwd, facts.trusted_cwd);
     assert_eq!(back.shell_cwds, facts.shell_cwds);
+    assert_eq!(back.shell, facts.shell);
     assert_eq!(back.worker_agent, Some(aterm_phase::Program::Agy));
     assert!(text.contains("\"worker_agent\":\"agy\""), "{text}");
     let old = text.replacen(
@@ -294,4 +298,31 @@ fn a_trusted_disk_worker_folder_makes_a_disk_worker() {
         .trusted_cwd
         .as_deref()
         .and_then(Path::to_str)));
+}
+
+/// A BOX UNDER LAND READS BACK AS WRITTEN: its facts carry the priority `land` (and a person's
+/// input since the loop's text) and decode as written; facts from before the person fact read
+/// it as none. NEGATIVE CONTROL: a priority no build writes is refused. MUTANT: the decode
+/// reading only the three words a person sets (`QuestionPriority::parse`).
+#[test]
+fn facts_under_land_read_back_as_written() {
+    let mut facts = every_fact();
+    facts.question = Some(QuestionFacts {
+        answer: true,
+        priority: QuestionPriority::Land,
+        own: Some(QuestionPriority::Land),
+        fell_back: false,
+        person: true,
+    });
+    let text = written(&facts);
+    assert!(text.contains("\"priority\":\"land\""), "{text}");
+    let (back, _) = read(&text);
+    assert_eq!(back.question, facts.question);
+    let older = text.replacen(",\"person\":true", "", 1);
+    assert_ne!(older, text, "the fact was taken out");
+    let (old, _) = read(&older);
+    assert_eq!(old.question.map(|q| q.person), Some(false));
+    let roots = roots();
+    let bad = text.replacen("\"priority\":\"land\"", "\"priority\":\"landing\"", 1);
+    assert!(BoxFacts::from_json(&bad, &|raw| roots.decode(raw)).is_err());
 }

@@ -4,7 +4,9 @@
 //! Where an agent session works ([`WorkRecord`]): its repository, worktree and branch, the
 //! branch's base on origin's default branch and how far behind that it is, and the names of the
 //! files the branch changes. The host reads it with git under the repository probe's own rules
-//! ([`crate::harness::repo_work::read_work`]) and shows it in `survey`'s content rows.
+//! ([`crate::harness::repo_work::read_work`]) and shows it in `survey`'s content rows; where
+//! another session's record names one of its files ([`overlap`]), the harness tells the agent
+//! the count and that session's sid ([`crate::supervise::overlap`]).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -73,6 +75,47 @@ impl WorkRecord {
             host: self.host.clone(),
             common_dir: self.common_dir.clone(),
         }
+    }
+}
+
+/// What a session's record shares with other sessions' records ([`overlap`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Overlap<'a> {
+    /// How many of this record's names any of [`Self::peers`] also names.
+    pub files: u32,
+    /// The peers it shares a file with, as their words were given, in the order given.
+    pub peers: Vec<&'a str>,
+}
+
+/// THE OVERLAP of this session's record `mine` with `peers` (each another session's word and
+/// record): the peers in the same repository ([`WorkRecord::key`]: one host's common dir) whose
+/// names share at least one of `mine`'s, and how many of `mine`'s names any of them names. Names
+/// are compared as the records hold them, so a record past [`WORK_PATHS`] files gives a lower
+/// bound.
+#[must_use]
+pub fn overlap<'a>(
+    mine: &WorkRecord,
+    peers: impl IntoIterator<Item = (&'a str, &'a WorkRecord)>,
+) -> Overlap<'a> {
+    let key = mine.key();
+    let mut shared = std::collections::BTreeSet::new();
+    let mut found = Vec::new();
+    for (word, peer) in peers {
+        if peer.key() != key {
+            continue;
+        }
+        let mut any = false;
+        for name in mine.paths.iter().filter(|name| peer.paths.contains(name)) {
+            shared.insert(name.as_str());
+            any = true;
+        }
+        if any {
+            found.push(word);
+        }
+    }
+    Overlap {
+        files: u32::try_from(shared.len()).unwrap_or(u32::MAX),
+        peers: found,
     }
 }
 

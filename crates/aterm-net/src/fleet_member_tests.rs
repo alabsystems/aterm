@@ -4,7 +4,7 @@
 //! Tests for fleet membership join codes, peer book persistence, and loopback join/reach flows.
 
 use super::*;
-use crate::fleet::{FleetEvent, Listening, read_key_file, serve, serve_with_handshake};
+use crate::fleet::{FleetEvent, Listening, read_key_file, serve_with_handshake};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
@@ -12,6 +12,90 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const HANG: Duration = Duration::from_secs(60);
+
+#[test]
+fn mesh_identity_and_book_migration_are_key_derived_and_idempotent() {
+    let scratch = State::new("mesh-identity");
+    let dir = scratch.dir().to_owned();
+    let old = node_identity_with_mesh(&dir, false).unwrap();
+    let peer = NodeIdentity::from_seed("0123456789abcdef0123456789abcdef", &[7; 32]).unwrap();
+    let entry = Peer::own(&peer, ("peer.local", 7100, "0.154.0"), 1);
+    write_private(&dir, PEERS_FILE, book_text(&[entry]).as_bytes()).unwrap();
+    let mesh = node_identity_with_mesh(&dir, true).unwrap();
+    assert_eq!(mesh.node(), node_principal(old.key()));
+    assert_eq!(mesh.key(), old.key());
+    assert_eq!(
+        node_identity_with_mesh(&dir, true).unwrap().node(),
+        mesh.node()
+    );
+    assert_eq!(
+        node_identity_with_mesh(&dir, false).unwrap().node(),
+        old.node()
+    );
+    let peers = read_peers(&dir).unwrap();
+    assert_eq!(
+        peers[0].node.as_deref(),
+        Some(node_principal(peer.key()).as_str())
+    );
+    assert_eq!(peers[0].key, Some(peer.key()));
+    assert!(
+        peers[0].signed.is_none(),
+        "only the peer can re-sign its new id"
+    );
+    let aliases = std::fs::read(dir.join("mesh-node-aliases")).unwrap();
+    let before = std::fs::read(dir.join(PEERS_FILE)).unwrap();
+    assert_eq!(rewrite_mesh_book(&dir).unwrap(), 0);
+    assert_eq!(std::fs::read(dir.join(PEERS_FILE)).unwrap(), before);
+    assert_eq!(
+        std::fs::read(dir.join("mesh-node-aliases")).unwrap(),
+        aliases
+    );
+    let rotated = NodeIdentity::from_seed(old.node(), &[8; 32]).unwrap();
+    assert_ne!(node_principal(rotated.key()), mesh.node());
+    write_private(
+        &dir,
+        NODE_KEY_FILE,
+        format!("{}\n", "08".repeat(32)).as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        node_identity_with_mesh(&dir, true).unwrap().node(),
+        node_principal(rotated.key())
+    );
+    assert!(names_node(
+        mesh.node(),
+        &format!("node-{}", &mesh.node()[2..10])
+    ));
+    assert!(is_node_word(&format!("node-{}", mesh.node())));
+    assert_eq!(
+        node_principal(crate::fleet::NodeKey::from_hex(&"ab".repeat(32)).unwrap()),
+        "n-abababababababab"
+    );
+}
+
+#[test]
+fn mesh_grants_cross_versions_only_for_the_verified_key() {
+    use crate::fleet::{DriveGrant, NodeKey};
+    let old = "0123456789abcdef0123456789abcdef";
+    let key = NodeKey::from_hex(&"07".repeat(32)).unwrap();
+    let new = node_principal(key);
+    for (written, proved) in [(old, new.as_str()), (new.as_str(), old)] {
+        let word = format!("{written}:{}", key.hex());
+        let grant = DriveGrant::from_word(&word).unwrap();
+        assert_eq!(grant.word(), word);
+        assert!(grant.admits(proved, key));
+        assert!(!grant.admits(proved, NodeKey::from_hex(&"08".repeat(32)).unwrap()));
+        // Negative control: comparing ids refuses the mixed-version proof.
+        assert_ne!(grant.node, proved);
+    }
+    assert!(
+        !aterm_codec::hex::is_lower(&new, 32),
+        "the old parser refuses the principal"
+    );
+    assert!(NodeIdentity::from_seed(&new, &[7; 32]).is_some());
+    assert!(!is_node_id("n-abcdef"));
+    assert!(!is_node_id("n-ABABABABABABABAB"));
+}
 
 #[path = "fleet_member_tests/self_entry.rs"]
 mod self_entry;
@@ -626,10 +710,9 @@ fn a_node_key_is_minted_once_and_read_back_as_itself() {
     assert!(aterm_codec::hex::is_lower(digits, 64));
     {
         let _claim = BookLock::take(state.dir(), Duration::ZERO).unwrap();
-        assert_eq!(
-            refused_at_once(state.dir()).kind(),
-            io::ErrorKind::WouldBlock
-        );
+        let read = waiting(Duration::ZERO, None, || node_identity(state.dir()))
+            .expect("a minted node reads while another holds the book's lock, never waiting");
+        assert_eq!((read.node(), read.key()), (me.node(), me.key()));
         let kept = read_node_identity(state.dir()).unwrap().unwrap();
         assert_eq!((kept.node(), kept.key()), (me.node(), me.key()));
         assert!(std::fs::read(&file).unwrap() == text.as_bytes());
@@ -1615,7 +1698,8 @@ fn an_all_member_grant_still_requires_an_issuer_binding() {
     );
     assert_eq!(
         DriveGrant::admitting(&both, &node_of(0xa3), member.key()),
-        Some(&grants[0])
+        Some(&named),
+        "the verified key keeps its named grant across an id change"
     );
     let rekeyed = identity(&node_of(0xa2), 4).key();
     assert_eq!(
@@ -2186,6 +2270,29 @@ fn a_registration_tells_an_issuers_refusal_from_no_answer() {
 }
 
 #[test]
+fn the_longest_join_answer_with_its_seed_fits_one_record() {
+    let root = NodeIdentity::from_seed(&"11".repeat(16), &[0x11; 32]).unwrap();
+    let seed = fleet_seed::FleetSeed::mint(&root, secret(5).mark(), u64::MAX).unwrap();
+    let longest = Issuer {
+        node: "11".repeat(16),
+        host: "h".repeat(253),
+        port: u16::MAX,
+        version: "+".repeat(64),
+    };
+    let answer = join_answer(&longest, PEERS_MAX, Some(&seed));
+    assert!(answer.len() < RECORD_MAX, "{}", answer.len());
+    let joined = joined_of(&answer).expect("an older reader's fields are all there");
+    assert_eq!((joined.issuer, joined.seed), (longest, Some(seed)));
+    assert_eq!(
+        joined_of(&join_answer(&issuer(0x11), 1, None))
+            .unwrap()
+            .seed,
+        None,
+        "a member holding none"
+    );
+}
+
+#[test]
 fn a_join_registers_the_member_with_the_issuer() {
     let state = State::new("join");
     let issuing = Issuing::start(secret(5), state.dir(), issuer(0x11));
@@ -2208,7 +2315,8 @@ fn a_join_registers_the_member_with_the_issuer() {
         joined,
         Joined {
             issuer: issuer(0x11),
-            peers: 1
+            peers: 1,
+            seed: None,
         }
     );
     let book = read_peers(state.dir()).unwrap();
@@ -2238,6 +2346,24 @@ fn a_join_registers_the_member_with_the_issuer() {
         1
     );
     assert_eq!(read_peers(state.dir()).unwrap()[0].port, 7102);
+
+    // A member holding the fleet seed answers with it, for the joiner to verify (machine names
+    // §3.3).
+    let root = NodeIdentity::from_seed(&"11".repeat(16), &[0x11; 32]).unwrap();
+    let seed = fleet_seed::FleetSeed::mint(&root, secret(5).mark(), 1_793_000_000_000).unwrap();
+    write_private(
+        state.dir(),
+        fleet_seed::FILE,
+        format!("{}\n", seed.words()).as_bytes(),
+    )
+    .unwrap();
+    let seeded = join_over(issuing.port, &secret(5), &again).unwrap();
+    assert_eq!(seeded.seed, Some(seed));
+    assert!(
+        seeded
+            .seed
+            .is_some_and(|seed| seed.verifies(&root.key(), secret(5).mark()))
+    );
 
     let itself = Registration {
         node: issuer(0x11).node,
@@ -3240,6 +3366,183 @@ fn every_member_serves_its_book_with_or_without_a_code() {
 }
 
 #[test]
+fn a_book_reply_carries_the_held_seed_in_a_trailer_an_older_reader_never_reads() {
+    let state = State::new("book-seed");
+    let first_hand = [
+        joined(0x22, "m2.local", [10, 0, 0, 2], 7100),
+        manual("lab-mini", 7101),
+    ];
+    write_book(state.dir(), &first_hand);
+    let issuing = Issuing::start(secret(5), state.dir(), issuer(0x11));
+    let target = target_of(&issuer_entry(0x11, issuing.port));
+    let deadline = || (Instant::now() + HANG, HANG);
+    let unseeded = fetch_book(&target, (&secret(5), None), deadline()).expect("a book");
+    assert_eq!((unseeded.peers.len(), unseeded.seed), (2, None));
+    let mut wire = Vec::new();
+    let node = issuer(0x11).node;
+    serve_book(&mut wire, state.dir(), || Ok(node.clone()))
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8(wire).unwrap();
+    assert!(!text.contains("more="), "no trailer, no count: {text}");
+
+    let root = NodeIdentity::from_seed(&"11".repeat(16), &[0x11; 32]).unwrap();
+    let seed = fleet_seed::FleetSeed::mint(&root, secret(5).mark(), 1_793_000_000_000).unwrap();
+    write_private(
+        state.dir(),
+        fleet_seed::FILE,
+        format!("{}\n", seed.words()).as_bytes(),
+    )
+    .unwrap();
+    let seeded = fetch_book(&target, (&secret(5), None), deadline()).expect("a book");
+    assert_eq!(seeded.seed, Some(seed));
+    assert_eq!(seeded.peers, unseeded.peers, "the trailer is no peer");
+
+    let mut wire = Vec::new();
+    assert_eq!(
+        serve_book(&mut wire, state.dir(), || Ok(node.clone())).unwrap(),
+        Ok(2),
+        "the peer lines it sent"
+    );
+    let text = String::from_utf8(wire).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], format!("OK 2 node={node} more=1"));
+    assert_eq!(book_head(lines[0]), Ok(3));
+    // A reader before the trailer takes the head's first count and returns after that many
+    // lines, so the seed's line is never read as an entry.
+    let older_n: usize = lines[0].split(' ').nth(1).unwrap().parse().unwrap();
+    assert_eq!(older_n, 2);
+    assert!(
+        lines[1..=older_n]
+            .iter()
+            .all(|line| Peer::parse(line).is_some())
+    );
+    assert_eq!(lines[older_n + 1..], [seed.words().as_str()]);
+    assert_eq!(Peer::parse(lines[older_n + 1]), None);
+
+    let twice: &'static str =
+        Box::leak(format!("OK 0 node={node} more=2\n{0}\n{0}\n", seed.words()).into_boxed_str());
+    let doubled = Issuing::hooked(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        secret(5),
+        state.dir(),
+        issuer(0x11),
+        EVERY_OP,
+        Arc::new(move |op| (op == FleetOp::Book).then_some(twice)),
+    );
+    let book = fetch_book(
+        &target_of(&issuer_entry(0x11, doubled.port)),
+        (&secret(5), None),
+        deadline(),
+    )
+    .expect("a book");
+    assert_eq!(book.seed, None, "a trailer with two seeds carries none");
+
+    let later: &'static str = Box::leak(
+        format!(
+            "OK 0 node={node} more={}\n{}{}\n",
+            TRAILER_LINES_MAX + 2,
+            "tombstone x\n".repeat(TRAILER_LINES_MAX + 1),
+            seed.words()
+        )
+        .into_boxed_str(),
+    );
+    let longer = Issuing::hooked(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        secret(5),
+        state.dir(),
+        issuer(0x11),
+        EVERY_OP,
+        Arc::new(move |op| (op == FleetOp::Book).then_some(later)),
+    );
+    let book = fetch_book(
+        &target_of(&issuer_entry(0x11, longer.port)),
+        (&secret(5), None),
+        deadline(),
+    )
+    .expect("a later aterm's book");
+    assert_eq!(
+        book.seed,
+        Some(seed),
+        "its trailer's lines this aterm does not know are passed over"
+    );
+}
+
+#[test]
+fn a_book_of_long_lines_sends_fewer_peers_and_keeps_room_for_its_trailer() {
+    let line = "x".repeat(RECORD_MAX - 1);
+    let trailer = vec!["t".repeat(TRAILER_MAX / TRAILER_LINES_MAX - 1); TRAILER_LINES_MAX + 2];
+    let named = format!("node={}", node_of(0x11));
+    let (reply, served) = book_reply(
+        &named,
+        std::iter::repeat_n(line.clone(), PEERS_MAX),
+        &trailer,
+    );
+    assert!(served < PEERS_MAX, "{served}");
+    assert!(reply.len() <= REPLY_MAX, "{}", reply.len());
+    assert!(
+        BOOK_HEAD_MAX + (served + 1) * (line.len() + 1) + TRAILER_MAX > REPLY_MAX,
+        "one more peer line would eat into the trailer's room"
+    );
+    let lines: Vec<&str> = reply.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!("OK {served} {named} more={TRAILER_LINES_MAX}")
+    );
+    assert_eq!(book_head(lines[0]), Ok(served + TRAILER_LINES_MAX));
+    assert_eq!(
+        lines.len(),
+        1 + served + TRAILER_LINES_MAX,
+        "the trailer's first lines"
+    );
+    let widest = format!(
+        "OK {PEERS_MAX} node={} more={TRAILER_LINES_MAX}\n",
+        "f".repeat(64)
+    );
+    assert!(widest.len() <= BOOK_HEAD_MAX, "{}", widest.len());
+
+    let halves = vec!["h".repeat(TRAILER_MAX / 2); 2];
+    let (reply, _) = book_reply(&named, std::iter::empty(), &halves);
+    assert_eq!(
+        reply,
+        format!("OK 0 {named} more=1\n{}\n", halves[0]),
+        "the trailer's lines while they fit its room"
+    );
+    let short = vec!["s".to_owned(); TRAILER_LINES_MAX + 5];
+    let (reply, _) = book_reply(&named, std::iter::empty(), &short);
+    assert_eq!(
+        reply.lines().next(),
+        Some(format!("OK 0 {named} more={TRAILER_LINES_MAX}").as_str()),
+        "short lines stop at the line count, not the bytes"
+    );
+    let (reply, served) = book_reply(&named, std::iter::repeat_n("p".to_owned(), 3), &[]);
+    assert_eq!((reply, served), (format!("OK 3 {named}\np\np\np\n"), 3));
+}
+
+#[test]
+fn a_book_head_counts_its_trailer_once_and_within_bounds() {
+    assert_eq!(book_head("OK 3 node=ab more=1"), Ok(4));
+    assert_eq!(book_head("OK 3 more=0"), Ok(3));
+    assert_eq!(book_counts("OK 3 node=ab more=2"), Ok((3, 2)));
+    assert_eq!(
+        book_head(&format!("OK 0 more={TRAILER_READ_MAX}")),
+        Ok(TRAILER_READ_MAX),
+        "a later aterm's longer trailer is read"
+    );
+    for refused in [
+        "OK 3 more=+1".to_owned(),
+        "OK 3 more=".to_owned(),
+        "OK 3 more=1 more=1".to_owned(),
+        format!("OK 3 more={}", TRAILER_READ_MAX + 1),
+        format!("OK {} more=1", PEERS_MAX + 1),
+        "OK more=1".to_owned(),
+    ] {
+        assert!(book_head(&refused).is_err(), "{refused}");
+    }
+    assert_eq!(book_head("ERR not-now more=9"), Ok(0));
+}
+
+#[test]
 fn an_older_issuer_leaves_its_member_reading_what_it_knows() {
     let state = State::new("older");
     issue(state.dir());
@@ -3476,6 +3779,7 @@ fn a_merge_replaces_the_copy_whole_dedupes_and_is_bounded() {
     let fetched = Book {
         node: node_of(0x11),
         proven: true,
+        seed: None,
         at: issuer_at,
         peers: vec![
             joined(0xaa, "me", [10, 0, 0, 10], 7100),
@@ -3720,6 +4024,7 @@ fn a_member_that_names_anothers_place_takes_neither_its_copy_nor_its_key() {
         let fetched = Book {
             node: i.node().to_owned(),
             proven: true,
+            seed: None,
             at: IpAddr::from([10, 0, 0, 7]),
             peers,
         };
@@ -3961,6 +4266,7 @@ fn a_book_that_rebinds_a_member_replaces_its_copy_and_key() {
         peers: vec![member(key)],
         at: IpAddr::from([10, 0, 0, 1]),
         proven: true,
+        seed: None,
     };
 
     let mut queued = queue();
@@ -7186,8 +7492,14 @@ fn host_resolution_order_ranks_tiers_resolves_m22_and_lists_ties() {
 
     // Tier 3 resolves leading `m\d+` (case-insensitively), without prefix or middle-token leaks.
     assert_eq!(
-        leading_machine_label("m22-Macbook-M5-Max-128GB-8TB.local"),
-        Some("m22")
+        leading_machine_label("m22-Macbook-M5-Max-128GB-8TB.local").map(|n| n.to_string()),
+        Some("m22".to_owned())
+    );
+    assert_eq!(leading_machine_label("m022-studio.local"), None, "zero-led");
+    assert_eq!(
+        leading_machine_label("m1234567.local"),
+        None,
+        "seven digits"
     );
     assert_eq!(leading_machine_label("Mac-mini-M4.local"), None);
     assert_eq!(leading_machine_label("m3a.local"), None);
@@ -7399,6 +7711,34 @@ fn c19_dormant_at_14_days_and_expiry_at_90_days() {
     assert_eq!(book, vec![fresh, manual_peer]);
 }
 
+/// The handshake's gate under a log read refuses the keys it took out; under a log this Mac
+/// cannot read now it refuses every proved dialer, as with no deny list read.
+#[test]
+fn an_unread_log_refuses_every_proved_dialer_at_the_handshake() {
+    let proof = |seed: u8| crate::fleet::NodeProof {
+        node: node_of(seed),
+        key: identity(&node_of(seed), seed).key(),
+    };
+    let (member, out) = (proof(0x51), proof(0x52));
+    let read: MemberKeys = [(out.key, Standing::Out("removed".to_owned()))]
+        .into_iter()
+        .collect();
+    let gate = crate::fleet::Denied::under(Some(&[]), Some(&read));
+    assert!(!gate.unread && !gate.refuses(Some(&member)) && gate.refuses(Some(&out)));
+    assert!(crate::fleet::Denied::under(Some(&[]), None).is_empty());
+    let unread = MemberKeys::unreadable("this Mac's membership log cannot be read now");
+    assert!(
+        unread.holds_out(&member.key) && !unread.admits(&member.key) && unread.out().is_empty()
+    );
+    for gate in [
+        crate::fleet::Denied::under(Some(&[]), Some(&unread)),
+        crate::fleet::Denied::under(None, Some(&read)),
+        crate::fleet::Denied::under(None, None),
+    ] {
+        assert!(gate.unread && gate.refuses(Some(&member)), "{gate:?}");
+    }
+}
+
 /// A listener that has not read its deny list yet refuses every dialer that proved the fleet
 /// secret, a node proof or none, naming [`FleetError::DenyListUnread`] in its own refusal and
 /// answering `NO capacity` on the wire: the dialer reads it as busy, to dial again later, which
@@ -7410,13 +7750,20 @@ fn c19_dormant_at_14_days_and_expiry_at_90_days() {
 /// answering `NO unread` on the wire, which a dialer from this build reads but an older one takes
 /// as a refused proof, the dial fails with that (`expected a busy listener to dial again, got:
 /// Handshake(127.0.0.1:<port>, DenyListUnread)`).
+///
+/// The listener answers the dialer before it reports the refusal, so the test waits for each
+/// report (a hang detector) instead of reading whatever has been reported when the dial returns.
+/// NEGATIVE CONTROL (2026-11-05): with the event callback sleeping 300 ms before it records a
+/// refusal, a read of the reports when the dials return finds none (`the listener names why it
+/// refused: []`, every run), and this test passes; with the unread listener refusing as
+/// [`FleetError::AddressBusy`], it fails (`the listener names why it refused (report 1 of 2)`).
 #[test]
 fn a_listener_that_has_not_read_its_deny_list_refuses_every_proven_peer_until_it_has() {
     let secret = FleetSecret::new(&[0x43; 32]).unwrap();
     let listener_id = identity(&node_of(0x11), 0x11);
     let peer_id = identity(&node_of(0x31), 0x31);
     let read = Arc::new(AtomicBool::new(false));
-    let refusals = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (refused, refusals) = std::sync::mpsc::channel();
     let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = tcp_listener.local_addr().unwrap();
     let running = Arc::new(AtomicBool::new(true));
@@ -7432,7 +7779,6 @@ fn a_listener_that_has_not_read_its_deny_list_refuses_every_proven_peer_until_it
     let server = std::thread::spawn({
         let running = Arc::clone(&running);
         let read = Arc::clone(&read);
-        let refusals = Arc::clone(&refusals);
         move || {
             crate::fleet::serve_offering_with_ask_within(
                 &tcp_listener,
@@ -7453,7 +7799,7 @@ fn a_listener_that_has_not_read_its_deny_list_refuses_every_proven_peer_until_it
                 |served, _| served.answer(|s| s.write_all(b"OK 0\n")),
                 move |event| {
                     if let FleetEvent::Refused { reason, .. } = event {
-                        refusals.lock().unwrap().push(reason);
+                        let _ = refused.send(reason);
                     }
                 },
             );
@@ -7480,16 +7826,25 @@ fn a_listener_that_has_not_read_its_deny_list_refuses_every_proven_peer_until_it
         );
     }
     let unread = FleetError::DenyListUnread.to_string();
-    let heard = refusals.lock().unwrap().clone();
-    assert!(
-        heard.len() == 2 && heard.iter().all(|reason| *reason == unread),
-        "the listener names why it refused: {heard:?}"
-    );
+    // Each dial is refused on its own thread, so the two reports may arrive in either order.
+    for n in 1..=2 {
+        let reason = refusals
+            .recv_timeout(HANG)
+            .unwrap_or_else(|e| panic!("the listener reports refusal {n} of 2: {e}"));
+        assert_eq!(
+            reason, unread,
+            "the listener names why it refused (report {n} of 2)"
+        );
+    }
 
     read.store(true, Ordering::Release);
     if let Err(err) = dial_as(Some(&peer_id)) {
         panic!("once its deny list is read, the peer must be admitted: {err:?}");
     }
+    assert!(
+        refusals.try_recv().is_err(),
+        "the listener refused only the two dials before its deny list was read"
+    );
 
     running.store(false, Ordering::Release);
     let _ = TcpStream::connect(addr);
@@ -7506,7 +7861,7 @@ fn c19_denied_node_and_unproved_peer_refused_with_valid_fleet_secret() {
     let deny = Arc::new(crate::fleet::Denied {
         nodes: vec![revoked_id.node().to_owned()],
         keys: vec![removed_id.key()],
-        unread: false,
+        ..crate::fleet::Denied::default()
     });
 
     let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -7770,6 +8125,31 @@ fn heartbeats_go_to_the_members_that_answer_with_the_issuer_dark() {
         key: None,
         signed: None,
     };
+
+    // A log this Mac cannot read now admits no member to dial and judges no entry of its book.
+    let book_before = read_peers(b_state.dir()).unwrap();
+    let unread = MemberKeys::unreadable("this Mac's membership log cannot be read now");
+    assert!(
+        heartbeat_members(
+            b_state.dir(),
+            (&secret, &b),
+            &reg,
+            HANG,
+            (Some(&unread), &Vec::new),
+        )
+        .expect("the book reads")
+        .is_empty(),
+        "an unread log dials no member"
+    );
+    assert_eq!(
+        read_peers(b_state.dir()).unwrap(),
+        book_before,
+        "an unread log takes no entry out of the book"
+    );
+    assert!(
+        read_peers(a_state.dir()).unwrap().is_empty() && read_answered(b_state.dir()).is_empty(),
+        "no member heard a heartbeat"
+    );
 
     let answered = heartbeat_members(
         b_state.dir(),
@@ -9022,6 +9402,250 @@ fn with_no_log_a_heartbeat_binds_the_members_its_issuer_recorded() {
     );
 }
 
+fn seed_words(state: &Path) -> Option<String> {
+    fleet_seed::read(state).unwrap().map(|seed| seed.words())
+}
+
+#[test]
+fn a_relayed_seed_is_adopted_only_under_the_key_this_book_binds_to_its_minter() {
+    use fleet_seed::{CONFLICT_FILE, FleetSeed};
+    const T: u64 = 1_793_000_000_000;
+    let state = State::new("relayed-seed");
+    write_key(state.dir(), &[0x56; SECRET_LEN]).unwrap();
+    let mark = FleetSecret::new(&[0x56; SECRET_LEN]).unwrap().mark();
+    let me = identity(&node_of(0x12), 0x12);
+    let (c, d) = (
+        identity(&node_of(0x13), 0x13),
+        identity(&node_of(0x14), 0x14),
+    );
+    write_book(state.dir(), &[keyed(0x13, c.key(), [10, 0, 0, 3], 7100)]);
+    let adopt = |offered: &[FleetSeed], mark, now| {
+        hold_book(state.dir())
+            .unwrap()
+            .adopt_relayed_seed(&me, mark, offered.iter().copied(), now)
+            .unwrap()
+    };
+    let by_c = FleetSeed::mint(&c, mark, T).unwrap();
+    let by_d = FleetSeed::mint(&d, mark, T - 1_000).unwrap();
+    let other_fleet = FleetSeed::mint(&c, secret(9).mark(), T).unwrap();
+    assert_eq!(adopt(&[by_d, other_fleet], mark, T), None);
+    assert_eq!(
+        seed_words(state.dir()),
+        None,
+        "an unbound minter's seed waits, and another fleet's verifies under no key here"
+    );
+    let later_c = FleetSeed::mint(&c, mark, T + 1).unwrap();
+    assert_eq!(
+        adopt(&[by_d, by_c, later_c], mark, T),
+        Some(by_c),
+        "the first on trust, which a later mint of its minter does not replace"
+    );
+    assert_eq!(seed_words(state.dir()), Some(by_c.words()));
+    assert_eq!(adopt(&[by_c], mark, T), None, "held already");
+
+    write_book(
+        state.dir(),
+        &[
+            keyed(0x13, c.key(), [10, 0, 0, 3], 7100),
+            keyed(0x14, d.key(), [10, 0, 0, 4], 7100),
+        ],
+    );
+    assert_eq!(
+        adopt(&[by_d], mark, T + 5),
+        None,
+        "another minter's, earlier or not"
+    );
+    assert_eq!(seed_words(state.dir()), Some(by_c.words()));
+    let recorded = || String::from_utf8(read_private(state.dir(), CONFLICT_FILE, 512).unwrap());
+    assert_eq!(recorded().unwrap(), fleet_seed::conflict_line(&by_d, T + 5));
+    assert!(
+        !recorded()
+            .unwrap()
+            .contains(&aterm_codec::hex::encode_lower(by_d.seed()))
+    );
+    adopt(&[by_d], mark, T + 9);
+    assert_eq!(
+        recorded().unwrap(),
+        fleet_seed::conflict_line(&by_d, T + 5),
+        "recorded once"
+    );
+
+    let earlier = FleetSeed::mint(&c, mark, T - 1).unwrap();
+    assert_eq!(
+        adopt(&[earlier], mark, T),
+        Some(earlier),
+        "its own minter's earlier"
+    );
+    let rotated = secret(7).mark();
+    let resigned = earlier.resign(&c, rotated).unwrap();
+    assert_eq!(adopt(&[resigned], mark, T), None, "not under the mark held");
+    assert_eq!(
+        adopt(&[resigned], rotated, T),
+        Some(resigned),
+        "signed again"
+    );
+
+    hold_book(state.dir()).unwrap().keep_seed(None).unwrap();
+    assert_eq!(seed_words(state.dir()), None);
+    assert!(
+        read_private(state.dir(), CONFLICT_FILE, 512).is_err(),
+        "the record goes with the seed"
+    );
+    write_private(state.dir(), fleet_seed::FILE, b"no seed\n").unwrap();
+    assert_eq!(
+        adopt(&[by_c], mark, T),
+        Some(by_c),
+        "a file of no seed is replaced"
+    );
+
+    hold_book(state.dir()).unwrap().keep_seed(None).unwrap();
+    assert_eq!(
+        adopt(&[by_c, by_d], mark, T + 20),
+        Some(by_c),
+        "each judged against the one taken before it in the same round"
+    );
+    assert_eq!(
+        recorded().unwrap(),
+        fleet_seed::conflict_line(&by_d, T + 20)
+    );
+}
+
+#[test]
+fn a_root_adopts_only_a_seed_it_minted() {
+    use fleet_seed::FleetSeed;
+    let state = State::new("root-seed");
+    issue(state.dir());
+    let root = identity(&node_of(0x11), 0x11);
+    let c = identity(&node_of(0x13), 0x13);
+    write_book(state.dir(), &[keyed(0x13, c.key(), [10, 0, 0, 3], 7100)]);
+    let adopt = |offered: FleetSeed| {
+        hold_book(state.dir())
+            .unwrap()
+            .adopt_relayed_seed(&root, secret(5).mark(), [offered], 1)
+            .unwrap()
+    };
+    let by_c = FleetSeed::mint(&c, secret(5).mark(), 1_000).unwrap();
+    assert_eq!(adopt(by_c), None, "a member's, bound here");
+    assert_eq!(seed_words(state.dir()), None);
+    assert_eq!(
+        String::from_utf8(read_private(state.dir(), fleet_seed::CONFLICT_FILE, 512).unwrap())
+            .unwrap(),
+        fleet_seed::conflict_line(&by_c, 1),
+        "recorded: a second minter in a founded fleet"
+    );
+    let own = FleetSeed::mint(&root, secret(5).mark(), 2_000).unwrap();
+    assert_eq!(adopt(own), Some(own), "the one it minted and lost");
+
+    let member = State::new("root-seed-member");
+    issue(member.dir());
+    write_book(
+        member.dir(),
+        &[Peer {
+            via: Via::Issuer,
+            ..keyed(0x13, c.key(), [10, 0, 0, 3], 7100)
+        }],
+    );
+    assert_eq!(
+        hold_book(member.dir())
+            .unwrap()
+            .adopt_relayed_seed(&root, secret(5).mark(), [by_c], 1)
+            .unwrap(),
+        Some(by_c),
+        "control: a code holder whose book names an issuer is a member"
+    );
+}
+
+#[test]
+fn a_heartbeat_adopts_the_seed_a_members_book_relays_once_it_binds_the_minter() {
+    let secret_bytes = [0x57; SECRET_LEN];
+    let secret = FleetSecret::new(&secret_bytes).unwrap();
+    let (a_state, b_state) = (State::new("relay-a"), State::new("relay-b"));
+    for state in [&a_state, &b_state] {
+        write_key(state.dir(), &secret_bytes).unwrap();
+    }
+    let a = identity(&node_of(0x11), 0x11);
+    let b = identity(&node_of(0x12), 0x12);
+    let c = identity(&node_of(0x13), 0x13);
+    let x = identity(&node_of(0x14), 0x14);
+    keep_identity(b_state.dir(), &b, 0x12);
+    write_book(a_state.dir(), &[]);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let a_port = listener.local_addr().unwrap().port();
+    let named = Issuer {
+        node: a.node().to_owned(),
+        host: "127.0.0.1".to_owned(),
+        port: a_port,
+        version: "0.146.0".to_owned(),
+    };
+    let _a_at = Issuing::gated(
+        listener,
+        (secret.clone(), Some(a.clone())),
+        a_state.dir(),
+        named,
+        None,
+    );
+    let now = unix_ms_now().unwrap();
+    write_book(
+        b_state.dir(),
+        &[Peer {
+            node: Some(a.node().to_owned()),
+            host: "127.0.0.1".to_owned(),
+            via: Via::Issuer,
+            seen_ms: Some(now),
+            ..keyed(0, a.key(), [127, 0, 0, 1], a_port)
+        }],
+    );
+    let reg = Registration {
+        node: b.node().to_owned(),
+        host: "127.0.0.1".to_owned(),
+        port: 7314,
+        version: "0.146.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let relay = |seed: &fleet_seed::FleetSeed| {
+        write_private(
+            a_state.dir(),
+            fleet_seed::FILE,
+            format!("{}\n", seed.words()).as_bytes(),
+        )
+        .unwrap();
+        heartbeat_members(b_state.dir(), (&secret, &b), &reg, HANG, (None, &Vec::new))
+            .expect("the book reads")
+    };
+
+    let unbound = fleet_seed::FleetSeed::mint(&x, secret.mark(), 1_000).unwrap();
+    assert_eq!(relay(&unbound).len(), 1, "A answered");
+    assert_eq!(
+        seed_words(b_state.dir()),
+        None,
+        "no book here binds its minter"
+    );
+    // C's entry reaches A's book with C's seed, so B binds C only in the round that relays
+    // it: the seed is judged under the keys of that round's merge.
+    write_book(
+        a_state.dir(),
+        &[Peer::own(
+            &c,
+            ("127.0.0.1", 7311, "0.146.0"),
+            1_760_000_000_001,
+        )],
+    );
+    assert_eq!(Keyring::read(b_state.dir()).bound(c.node()), None);
+    let by_c = fleet_seed::FleetSeed::mint(&c, secret.mark(), 2_000).unwrap();
+    relay(&by_c);
+    assert_eq!(
+        Keyring::read(b_state.dir()).bound(c.node()),
+        Some(c.key()),
+        "C's entry, merged from A's book"
+    );
+    assert_eq!(
+        seed_words(b_state.dir()),
+        Some(by_c.words()),
+        "C's seed, relayed by A"
+    );
+}
+
 /// With no membership log yet, a Mac that joined at a member, not at the Mac that minted the
 /// code, reaches every book member to member (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.1, no
 /// leaders): B, whose issuer A is away, takes in D, who joined at C, from C's book, and E, who
@@ -9908,10 +10532,11 @@ fn facts_mail_code_and_census_enforce_framing_bounds_and_clamp_max_deadlines() {
         let running = Arc::clone(&running);
         let next_reply = Arc::clone(&next_reply);
         move || {
-            serve(
+            serve_with_handshake(
                 &listener,
                 &listening,
                 &running,
+                HANG,
                 move |served, op| {
                     let bytes = next_reply.lock().unwrap().clone();
                     served.answer(|stream| {
@@ -10346,6 +10971,70 @@ fn pushed_facts_admission_refuses_denied_bindings_when_pruning_is_busy() {
         assert_eq!(admitted[0].node, other);
         assert_eq!(admitted[0].payload, "allowed\n");
     }
+}
+
+/// A log this Mac cannot read now admits no stored survey and removes none: the facts it cannot
+/// judge wait, unread, for a log that reads.
+#[test]
+fn pushed_facts_under_an_unread_log_are_neither_admitted_nor_pruned() {
+    let state = State::new("facts-unread-log");
+    let node = "33".repeat(16);
+    let key = NodeIdentity::from_seed(&node, &[0x11; 32]).unwrap().key();
+    store_pushed_facts_with_key(state.dir(), &node, Some(key), "kept\n").unwrap();
+    let unread = MemberKeys::unreadable("this Mac's membership log cannot be read now");
+    prune_pushed_facts(state.dir(), &[], &[], Some(&unread));
+    assert_eq!(
+        read_pushed_facts(state.dir()),
+        [(node.clone(), "kept\n".to_owned())]
+    );
+    assert!(read_admitted_pushed_facts(state.dir(), &[], &[], Some(&unread)).is_empty());
+    let admitted = read_admitted_pushed_facts(state.dir(), &[], &[], None);
+    assert_eq!(
+        admitted.iter().map(|r| r.node.as_str()).collect::<Vec<_>>(),
+        [node.as_str()],
+        "with no log the stored survey is admitted"
+    );
+}
+
+/// A log this Mac cannot read now admits no Mac to take its survey facts: the push names why and
+/// dials no one, the Mac its book names as issuer included.
+#[test]
+fn an_unread_log_pushes_survey_facts_to_no_one() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let me = identity(&node_of(0x61), 0x61);
+    let issuer = identity(&node_of(0x62), 0x62);
+    let peer = Peer {
+        node: Some(issuer.node().to_owned()),
+        key: Some(issuer.key()),
+        key_from: None,
+        host: "127.0.0.1".to_owned(),
+        addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        port: listener.local_addr().unwrap().port(),
+        version: None,
+        seen_ms: None,
+        via: Via::Issuer,
+        fleet: None,
+        signed: None,
+    };
+    let why = "this Mac's membership log cannot be read now";
+    let unread = MemberKeys::unreadable(why);
+    assert_eq!(
+        push_facts_to_bound_peer(
+            &peer,
+            (&secret(9), Some(&me)),
+            (&[], Some(&unread)),
+            "OK 0\n",
+            HANG
+        ),
+        Err(why.to_owned())
+    );
+    assert!(
+        listener
+            .accept()
+            .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
+        "an unread log dialed the issuer"
+    );
 }
 
 #[test]

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The swarm deny list and roster for a reader that asks per connection or per round: a fleet
+//! The swarm deny list for a reader that asks per connection or per round: a fleet
 //! listener, which checks each proved dialer against the deny list, its node job's watch, which
 //! checks every live connection each tick, and the node's Commons peer checks and census.
-//! [`swarm_denied_nodes`](super::swarm_denied_nodes) and [`swarm_roster`](super::swarm_roster)
-//! decrypt the vault's roster entry and evaluate the membership log at every call, tens of
-//! milliseconds of CPU on a busy Mac, so this keeps each one's last settled answer and reads
+//! [`swarm_denied_nodes`](super::swarm_denied_nodes) decrypts the vault's roster entry and
+//! evaluates the membership log at every call, tens of milliseconds of CPU on a busy Mac,
+//! so this keeps its last settled answer and reads
 //! again when an input file or the vault directory's identity or access metadata changes.
 
 use super::{Paths, StateLock, StateObservation};
+#[cfg(test)]
 use crate::swarm_roster::SwarmRoster;
 use std::{os::unix::fs::MetadataExt as _, path::PathBuf, sync::Mutex};
 
@@ -40,26 +41,17 @@ pub fn swarm_denied_nodes_now(paths: &Paths) -> crate::Result<Option<Vec<String>
     MEMO.read(paths, super::swarm_denied_nodes)
 }
 
-/// [`swarm_roster`](super::swarm_roster), kept and read again exactly as
-/// [`swarm_denied_nodes_now`] keeps and reads the deny list: a removal the log takes in is in the
-/// next call's answer.
-///
-/// # Errors
-/// As [`swarm_roster`](super::swarm_roster).
-pub fn swarm_roster_now(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
-    static MEMO: Memo<SwarmRoster> = Memo::new();
-    MEMO.read(paths, super::swarm_roster)
-}
-
 /// The files [`swarm_denied_nodes`](super::swarm_denied_nodes) and
-/// [`swarm_roster`](super::swarm_roster) take their answer from: the configured source
+/// [`swarm_roster_until`](super::swarm_roster_until) take their answer from: the configured source
 /// (`source.toml`), the state lock the deny list observes (`.lock`, whose presence and mode decide
-/// that read), the applied state (`state.toml`), this Mac's identity, the held envelope (`vault`)
-/// and the membership records entry and selected data. The vault folder holds others that
+/// that read), the applied state (`state.toml`), this Mac's identity, the held envelope (`vault`),
+/// the membership records entry and selected data, and the membership history this Mac
+/// acknowledged ([`Paths::acknowledged_history_files`]). The vault folder holds others that
 /// change every few seconds and that these reads never open (the vault server's `served/`,
 /// `commons/`, the jobs' logs, the
 /// needs and answers queues), so a change to them reads nothing again.
-fn inputs(paths: &Paths) -> Option<[PathBuf; 7]> {
+fn inputs(paths: &Paths) -> Option<[PathBuf; 11]> {
+    let [claim, anchor, receipts, checkpoint] = paths.acknowledged_history_files();
     Some([
         paths.source_file(),
         paths.lock_file(),
@@ -68,6 +60,10 @@ fn inputs(paths: &Paths) -> Option<[PathBuf; 7]> {
         paths.cache_file(),
         paths.records_file(),
         paths.records_data_file().ok()?,
+        claim,
+        anchor,
+        receipts,
+        checkpoint,
     ])
 }
 
@@ -85,7 +81,7 @@ struct Stamp {
 
 /// The directory's identity and access metadata, without the content timestamps that an
 /// unrelated job or server write moves. A symlink here is refused by [`StateLock`], even when
-/// all seven input paths still resolve to the files from an earlier read.
+/// every input path still resolves to the files from an earlier read.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DirectoryStamp {
     dev: u64,
@@ -407,7 +403,11 @@ mod tests {
         .unwrap();
         crate::client::admin_publish(&paths, &admin, &doc).unwrap();
         crate::client::sync(&paths, None).unwrap();
-        let expected = crate::client::swarm_roster(&paths).unwrap();
+        let expected = crate::client::swarm_roster_until(
+            &paths,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap();
         assert_eq!(expected.as_ref().unwrap().deny_nodes, ["m99"]);
 
         let before = stamp_inputs(&paths).unwrap();
@@ -416,15 +416,31 @@ mod tests {
         // The read fault lasts until explicitly cleared; no implementation read count
         // decides when the actual signed roster becomes available again.
         fsx::fail_reads(&failure.0, usize::MAX);
-        let failed = memo.read(&paths, crate::client::swarm_roster);
+        let failed = memo.read(&paths, |paths| {
+            crate::client::swarm_roster_until(
+                paths,
+                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            )
+        });
         drop(failure);
         assert!(
             stamp_inputs(&paths).unwrap() == before,
             "clearing a read fault must not change the memo's input metadata"
         );
-        assert_eq!(crate::client::swarm_roster(&paths).unwrap(), expected);
         assert_eq!(
-            memo.read(&paths, crate::client::swarm_roster).unwrap(),
+            crate::client::swarm_roster_until(
+                &paths,
+                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            memo.read(&paths, |paths| crate::client::swarm_roster_until(
+                paths,
+                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+            ))
+            .unwrap(),
             expected,
             "a transient read failure must not remain cached after the roster recovers"
         );

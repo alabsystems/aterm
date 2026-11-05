@@ -29,7 +29,7 @@ use super::m6_policy::{
 use super::plan::{DEMO_PLAN, PlanRefusal, SHIPPED_PLAN, SchedulePlan, Split, Wake};
 use super::policy::{GRID_V1, ITEMS_V1, MAX_PROPOSAL_BYTES, MAX_ROUNDS, Totals};
 use super::search::{
-    GridProposer, Mode, ON_DEMAND, Proposer, ProposerId, SearchStats, TrainFeedback,
+    FileProposer, GridProposer, Mode, ON_DEMAND, Proposer, ProposerId, SearchStats, TrainFeedback,
 };
 use super::test_fixtures::{BUILD, refused_off_the_pinned_target};
 use super::{
@@ -350,11 +350,11 @@ fn a_memoizing_evaluator_judges_each_pair_once_as_a_fresh_one_does() {
     if refused_off_the_pinned_target() {
         return;
     }
-    let ev = evaluator().anew().memoizing();
-    let fresh = evaluator().anew();
+    let ev = evaluator().anew_cold().memoizing();
+    let fresh = evaluator().anew_cold();
     let reads = |e: &Evaluator| {
         let n = |r: &AtomicU64| r.load(Ordering::Relaxed);
-        (n(&e.reads().train), n(&e.reads().held_out))
+        (n(&e.afresh().train), n(&e.afresh().held_out))
     };
     let (golden, t1, h1) = (
         index_of("golden"),
@@ -988,6 +988,104 @@ fn a_selection_states_training_facts() {
     assert_eq!(s.proposer(), &ProposerId::new("spy", 1, &[]));
     assert_eq!((s.round(), s.index()), (0, 0));
     assert_eq!(s.stats().admitted, 1);
+}
+
+/// Only the even jobs, on the caller's thread: the caller must run the rest in place. Counts the
+/// jobs it skipped.
+#[derive(Default)]
+struct Evens {
+    skipped: AtomicU64,
+}
+
+impl Spread for Evens {
+    fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
+        (0..n).step_by(2).for_each(job);
+        self.skipped.fetch_add((n / 2) as u64, Ordering::Relaxed);
+    }
+}
+
+/// A plans file of the six-line plans the lab's process test runs (three admitted, three refused),
+/// with an undecodable line, an oversized one and a duplicate.
+fn six_plans_text() -> String {
+    let hex =
+        |p: SchedulePlan| -> String { p.encode().iter().map(|b| format!("{b:02x}")).collect() };
+    let six = [
+        gap0(),
+        SHIPPED_PLAN,
+        plan(Split::Shipped, Wake::Never),
+        plan(Split::Shipped, Wake::ColdOnly),
+        plan(Split::Shipped, Wake::Poll { period_us: 1_000 }),
+        plan(Split::Shipped, Wake::Cadence),
+    ];
+    let mut text: String = six.iter().map(|&p| format!("{}\n", hex(p))).collect();
+    text.push_str("ffff0000\n");
+    text.push_str(&"ab".repeat(80));
+    text.push('\n');
+    text.push_str(&format!("{}  # again\n", hex(gap0())));
+    text
+}
+
+/// `select_spread`, on threads or on a spread that skips jobs, selects as `select` does: the grid
+/// on threads; the plans file of [`six_plans_text`] on the spread that skips (which runs the jobs
+/// it skips in place, on one thread). The grid's serial selection reads the rows the shared search
+/// judged on threads, so its fold waits on no serial judgment. Every selection here reads the
+/// shared evaluator's judgments ([`Evaluator::memoizing`]), so this is the fold's and the spread's
+/// law; that a judgment made on a thread is the one a fresh evaluator makes serially is
+/// `a_memoizing_evaluator_judges_each_pair_once_as_a_fresh_one_does`'s and
+/// `m6_tests::the_chain_names_no_build`'s.
+#[test]
+fn select_spread_equals_select() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
+    let same = |a: &super::m4::Selection, b: &super::m4::Selection| {
+        assert_eq!(
+            (
+                a.plan(),
+                a.round(),
+                a.index(),
+                a.stats(),
+                a.train(),
+                a.proposer()
+            ),
+            (
+                b.plan(),
+                b.round(),
+                b.index(),
+                b.stats(),
+                b.train(),
+                b.proposer()
+            )
+        );
+    };
+    let ev = evaluator();
+    let _ = searched();
+    let serial = ev.select(&mut GridProposer::new()).expect("a winner");
+    let threaded = ev
+        .select_spread(&mut GridProposer::new(), &Threads)
+        .expect("a winner");
+    same(&threaded, &serial);
+    let text = six_plans_text();
+    let local = ev
+        .select(&mut FileProposer::from_text(&text))
+        .expect("a winner");
+    assert_eq!(
+        (
+            local.stats().admitted,
+            local.stats().oversized,
+            local.stats().duplicates
+        ),
+        (3, 1, 1)
+    );
+    let evens = Evens::default();
+    let skipping = ev
+        .select_spread(&mut FileProposer::from_text(&text), &evens)
+        .expect("a winner");
+    assert!(
+        evens.skipped.load(Ordering::Relaxed) > 0,
+        "the spread skips a job"
+    );
+    same(&skipping, &local);
 }
 
 // ---- M6 labels and outcomes (design §13.3, stage B) ----

@@ -189,14 +189,17 @@ fn vendor_dirs(root: &Path) -> Vec<String> {
         return out;
     };
     for entry in entries.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;
         }
-        out.push(name);
+        let is_dir = entry
+            .file_type()
+            .map(|ft| ft.is_dir() || (ft.is_symlink() && entry.path().is_dir()))
+            .unwrap_or(false);
+        if is_dir {
+            out.push(name);
+        }
     }
     out.sort();
     out
@@ -504,6 +507,11 @@ fn workspace_requirements(root: &Path, name: &str) -> Vec<(String, String)> {
     if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
         let mut members: Vec<PathBuf> = entries
             .flatten()
+            .filter(|e| {
+                e.file_type()
+                    .map(|ft| ft.is_dir() || ft.is_symlink())
+                    .unwrap_or(true)
+            })
             .map(|e| e.path().join("Cargo.toml"))
             .filter(|p| p.is_file())
             .collect();
@@ -691,6 +699,13 @@ fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
 
 /// The gitlinks (mode 160000 entries) the index records under `vendor/`, repo-relative.
 fn vendor_gitlinks(root: &Path) -> Option<BTreeSet<String>> {
+    vendor_index_paths(root).map(|(_, submodules)| submodules)
+}
+
+/// Tracked vendor inputs and their ancestor directories, plus the gitlink boundaries.
+/// Generated, ignored build outputs are not redistributed inputs. Gitlinks are recorded
+/// as leaves: another repository's index and working tree do not belong to this one.
+fn vendor_index_paths(root: &Path) -> Option<(Vec<String>, BTreeSet<String>)> {
     let output = command(aterm_uds::os_path!("git"))
         .current_dir(root)
         .args(["ls-files", "-s", "-z", "--", "vendor"])
@@ -699,32 +714,25 @@ fn vendor_gitlinks(root: &Path) -> Option<BTreeSet<String>> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Some(
-        text.split('\0')
-            .filter_map(|entry| {
-                let (meta, path) = entry.split_once('\t')?;
-                meta.starts_with("160000 ").then(|| path.to_string())
-            })
-            .collect(),
-    )
-}
-
-/// Every repo-relative path under `vendor/` (files and dirs), except under a submodule in `skip`.
-fn vendor_paths(root: &Path, dir: &Path, skip: &BTreeSet<String>, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    paths.sort();
-    for path in paths {
-        let rel = rel_display(root, &path);
-        let descend = path.is_dir() && !path.is_symlink() && !skip.contains(&rel);
-        out.push(rel);
-        if descend {
-            vendor_paths(root, &path, skip, out);
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut paths = BTreeSet::new();
+    let mut submodules = BTreeSet::new();
+    for entry in text.split('\0').filter(|entry| !entry.is_empty()) {
+        let (meta, path) = entry.split_once('\t')?;
+        let (mode, _) = meta.split_once(' ')?;
+        if mode == "160000" {
+            submodules.insert(path.to_string());
+        }
+        let mut ancestor = Some(path);
+        while let Some(path) = ancestor {
+            if !path.starts_with("vendor/") {
+                break;
+            }
+            paths.insert(path.to_string());
+            ancestor = path.rsplit_once('/').map(|(parent, _)| parent);
         }
     }
+    Some((paths.into_iter().collect(), submodules))
 }
 
 /// Run every obligation ([`Attestation`]).
@@ -1098,7 +1106,7 @@ fn ob1_patch_vendor_agreement(
                  rule here — the submodule check above holds it to its pinned commit instead."
             } else {
                 "[OB-10] DOES: unlike a patch target under crates/, this directory is under \
-                 vendor/, and the ignore sweep walks every path there — a rule that swallows \
+                 vendor/, and the ignore sweep checks every tracked path there — a rule that swallows \
                  first-party source loses it just as silently."
             };
             let _ = writeln!(
@@ -1891,17 +1899,29 @@ fn ob9_spdx_allowlist(root: &Path, forks: &[VendoredFork], log: &mut String) -> 
     fails
 }
 
-/// `[OB-10]` Nothing under `vendor/` is swallowed by `.gitignore`.
+/// `[OB-10]` No tracked input or present required metadata under `vendor/` is swallowed by
+/// `.gitignore`.
 fn ob10_gitignore(root: &Path, forks: &[VendoredFork], log: &mut String) -> usize {
-    let submodules = vendor_gitlinks(root).unwrap_or_default();
-    let mut existing = Vec::new();
-    vendor_paths(root, &root.join("vendor"), &submodules, &mut existing);
+    let Some((mut existing, submodules)) = vendor_index_paths(root) else {
+        let _ = writeln!(
+            log,
+            "  • NOTE [OB-10] the tracked vendor inventory could not be read, so the ignore \
+             analysis was SKIPPED rather than scored as a pass."
+        );
+        return 0;
+    };
     let mut probes = Vec::new();
     for fork in forks {
         for leaf in [".cargo_vcs_info.json", "Cargo.toml.orig"] {
             let candidate = format!("{}/{leaf}", fork.rel);
             if !existing.contains(&candidate) {
-                probes.push(candidate);
+                // Required redistribution metadata is source even before it is staged.
+                // Only absent paths get the future-addition note; OB-4 judges their absence.
+                if std::fs::symlink_metadata(root.join(&candidate)).is_ok() {
+                    existing.push(candidate);
+                } else {
+                    probes.push(candidate);
+                }
             }
         }
     }
@@ -1933,12 +1953,9 @@ fn ob10_gitignore(root: &Path, forks: &[VendoredFork], log: &mut String) -> usiz
         if !present.is_empty() {
             let _ = writeln!(
                 log,
-                "  ✗ FAIL [OB-10] ignore rule `{rule}` matches {} path(s) that are IN vendor/ \
-                 today: {}. They are in the tree only because they entered the index before \
-                 the rule did (or were force-added) — a plain `git add` of the same path in a \
-                 re-vendor does NOTHING and the file is lost silently. FIX: add a \
-                 `!vendor/**/<name>` re-include beside the rule, the way `!vendor/**/debug/` \
-                 is kept for any vendored crate shipping a real `debug` source module.",
+                "  ✗ FAIL [OB-10] ignore rule `{rule}` matches {} vendor source input(s): {}. \
+                 Tracked source and required vendoring metadata must survive a normal \
+                 re-vendor. FIX: add a matching `!vendor/...` re-include beside that rule.",
                 present.len(),
                 present.join(", ")
             );
@@ -2548,7 +2565,42 @@ mod tests {
         std::fs::create_dir_all(root.join("vendor/goodfork/target")).unwrap();
         std::fs::write(root.join("vendor/goodfork/target/out"), "").unwrap();
         let mut log = String::new();
+        assert_eq!(ob10_gitignore(root, &[], &mut log), 0, "{log}");
+        // An ignored generated cache is not source. Force-adding the same path changes
+        // that fact: the guard must still reject tracked source swallowed on re-vendor.
+        git(root, &["add", "-f", "vendor/goodfork/target/out"]);
+        let mut log = String::new();
         assert_eq!(ob10_gitignore(root, &[], &mut log), 1, "{log}");
+        std::fs::write(
+            root.join(".gitignore"),
+            "target\n!vendor/goodfork/target/\n",
+        )
+        .unwrap();
+        let mut log = String::new();
+        assert_eq!(ob10_gitignore(root, &[], &mut log), 0, "{log}");
+    }
+
+    #[test]
+    fn required_metadata_is_checked_before_it_enters_the_index() {
+        let fixture = good_fixture("ob10-required-metadata");
+        let root = fixture.0.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            "Cargo.toml.orig\n.cargo_vcs_info.json\n",
+        )
+        .unwrap();
+        let forks = survey_forks(root, &patch_paths(root).unwrap());
+        assert_eq!(forks.len(), 1);
+        let mut log = String::new();
+        assert_eq!(ob10_gitignore(root, &forks, &mut log), 2, "{log}");
+        for name in ["Cargo.toml.orig", ".cargo_vcs_info.json"] {
+            std::fs::remove_file(root.join("vendor/goodfork").join(name)).unwrap();
+        }
+        let mut log = String::new();
+        assert_eq!(ob10_gitignore(root, &forks, &mut log), 0, "{log}");
+        assert!(log.contains("Cargo.toml.orig") && log.contains(".cargo_vcs_info.json"));
+        assert!(ob4_provenance_files(&forks, &mut log) > 0, "{log}");
     }
 
     #[test]

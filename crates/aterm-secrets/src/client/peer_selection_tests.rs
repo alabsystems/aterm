@@ -41,6 +41,7 @@ impl Fixture {
         let seed = [19; 32];
         let config = Config {
             source: Source::Url("http://127.0.0.1:1/v1/team".to_owned()),
+            mirrors: Vec::new(),
             name: "team".to_owned(),
             signer: Some(envelope::signer_public(&seed).unwrap()),
             followed: Vec::new(),
@@ -921,7 +922,9 @@ fn a_replacement_waiting_for_records_preserves_the_previous_state() {
     let next = std::fs::read(replacement.m22.cache_file()).unwrap();
     let next_key = configured(&replacement.m22).unwrap().signer.unwrap();
     std::fs::remove_file(old.m7.records_file()).unwrap();
-    save_records(&old.m7, &prefix).unwrap();
+    // A foreign snapshot may be found on disk, but intake under the old root pin refuses it.
+    assert!(save_records(&old.m7, &prefix).is_err());
+    fsx::write_atomic(&old.m7.records_file(), &prefix, 0o600).unwrap();
     let previous = envelope::TEST_RETIRED.with(|cell| {
         cell.replace(Some(Retired {
             keys: vec![config.signer.unwrap()],
@@ -933,7 +936,7 @@ fn a_replacement_waiting_for_records_preserves_the_previous_state() {
         &old.m7,
         config.clone(),
         before.clone(),
-        Fetched::Body(next),
+        Fetched::Body(next.clone()),
         None,
         None,
     )
@@ -946,6 +949,27 @@ fn a_replacement_waiting_for_records_preserves_the_previous_state() {
     );
     assert_eq!(configured(&old.m7).unwrap(), config);
     assert_eq!(std::fs::read(old.m7.cache_file()).unwrap(), cache);
+    // A complete prospective log is inspected under the verified replacement pin and
+    // retained before the new configuration or values become current.
+    fsx::write_atomic(
+        &old.m7.records_data_file().unwrap(),
+        &load_records(&replacement.m22).unwrap().encode(),
+        0o600,
+    )
+    .unwrap();
+    let outcome =
+        apply_fetched_until(&old.m7, config, before, Fetched::Body(next), None, None).unwrap();
+    assert!(matches!(outcome, SyncOutcome::Applied { .. }));
+    assert_eq!(configured(&old.m7).unwrap().signer, Some(next_key));
+    assert_eq!(
+        std::fs::read(old.m7.home.join(".secrets/shared")).unwrap(),
+        b"replacement"
+    );
+    assert!(
+        log_entries::trusted_configured_log(&old.m7, &configured(&old.m7).unwrap())
+            .unwrap()
+            .is_some()
+    );
     old.server.stop();
     replacement.server.stop();
 }
@@ -1457,6 +1481,7 @@ pub(crate) fn replacement_transition(
             // Deliberately bypass the earlier network filter: the selector must
             // independently reject a key the compiled policy did not replace.
             let candidate = SyncPeerHead {
+                url: "http://peer.local:7484/v1/test".to_owned(),
                 seq: e.seq,
                 digest: e.digest(),
                 parents: e.parents,
@@ -1672,7 +1697,57 @@ fn a_recovered_exact_body_restores_the_handoff_floor_before_peer_selection() {
     }
 }
 
+/// The two homes every `Select` of a walk reads, each built once: a fresh home per state costs a
+/// machine identity, seven seals and a sync, and [`peer_selection::select`] writes nothing there
+/// (it leaves publishing and caching to the normal apply path). [`SelectionHomes::files`] holds
+/// the walk to that.
+pub(crate) struct SelectionHomes {
+    /// The model's `cached = 1`.
+    whole: Fixture,
+    /// The model's `cached = 0`.
+    damaged: Fixture,
+}
+
+impl SelectionHomes {
+    fn new() -> Self {
+        let damaged = Fixture::new();
+        std::fs::write(damaged.paths.cache_file(), b"damaged cache").unwrap();
+        Self {
+            whole: Fixture::new(),
+            damaged,
+        }
+    }
+
+    fn at(&self, state: &aterm_spec::interp::State) -> &Fixture {
+        if state["cached"] == 0 {
+            &self.damaged
+        } else {
+            &self.whole
+        }
+    }
+
+    /// Every file both homes hold, cache and records among them, byte for byte.
+    fn files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn read(dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    read(&path, files);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap();
+                    files.insert(path, bytes);
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        read(&self.whole.paths.home, &mut files);
+        read(&self.damaged.paths.home, &mut files);
+        files
+    }
+}
+
 pub(crate) fn selection_transition(
+    homes: &SelectionHomes,
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
@@ -1703,10 +1778,7 @@ pub(crate) fn selection_transition(
             next.insert("cached", 0);
         }
         "Select" => {
-            let f = Fixture::new();
-            if state["cached"] == 0 {
-                std::fs::write(f.paths.cache_file(), b"damaged cache").unwrap();
-            }
+            let f = homes.at(state);
             let good = if state["revoke"] == 1 {
                 &f.revoked
             } else {
@@ -1765,16 +1837,22 @@ pub(crate) fn selection_transition(
     next
 }
 
+/// Every `Select` the model reaches takes what the real [`peer_selection::select`] takes, over
+/// the two homes of [`SelectionHomes`] and leaving both as they were. THE GAP: the keys are drawn
+/// once per run rather than once per state, so a defect that shows only under some drawn key
+/// bytes is sampled twice here, not once per `Select`.
 #[test]
 fn peer_selection_model_conforms_and_rejects_an_unfiltered_choice() {
     let model = aterm_models_swarm::peer_selection_model();
     aterm_spec::interp::prove_and_catch(&model);
     let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
     assert!(faults.is_empty(), "{faults:?}");
+    let homes = SelectionHomes::new();
+    let held = homes.files();
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
-                let actual = selection_transition(&state, action.name);
+                let actual = selection_transition(&homes, &state, action.name);
                 assert!(
                     model.successors(action.name, &state).contains(&actual),
                     "{}: {state:?} -> {actual:?}",
@@ -1786,10 +1864,11 @@ fn peer_selection_model_conforms_and_rejects_an_unfiltered_choice() {
     let mut state = model.init_state();
     state.insert("good", 1);
     state.insert("fork", 1);
-    let mut bad = selection_transition(&state, "Select");
+    let mut bad = selection_transition(&homes, &state, "Select");
     bad.insert("pick", 3);
     assert!(!model.successors("Select", &state).contains(&bad));
     assert!(!model.check_invariant("AdmittedOnly", &bad));
+    assert!(homes.files() == held, "a selection wrote to its home");
 }
 
 #[test]
@@ -1965,6 +2044,7 @@ fn a_bodyless_response_applies_log_admission_from_a_pending_cache() {
 
 fn head(bytes: Vec<u8>, config: &Config) -> SyncPeerHead {
     sync_peer_head(
+        "http://peer.local:7484/v1/test",
         Fetched::Body(bytes),
         None,
         config,

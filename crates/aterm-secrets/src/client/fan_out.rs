@@ -232,16 +232,16 @@ pub(super) fn reads_within<A, T: Send>(
 }
 
 /// [`reads_within`] of the envelope each of `urls` serves, and what `keep` makes of each one read
-/// whole: in `urls`' order, `None` for a server that answered nothing in time, failed, or served
+/// whole, given the URL that served it: in `urls`' order, `None` for a server that answered nothing in time, failed, or served
 /// nothing `keep` kept.
 pub(super) fn envelopes_within<K: Send>(
     urls: &[String],
     within: Duration,
     read: impl Fn(&str, Duration, usize) -> crate::Result<Pulled> + Sync,
-    keep: impl Fn(Fetched) -> Option<K> + Sync,
+    keep: impl Fn(&str, Fetched) -> Option<K> + Sync,
 ) -> Vec<Option<K>> {
-    reads_within(ENVELOPES, urls, within, read, |_, read| match read {
-        Ok(Pulled::Fetched(fetched)) => keep(fetched),
+    reads_within(ENVELOPES, urls, within, read, |url, read| match read {
+        Ok(Pulled::Fetched(fetched)) => keep(url, fetched),
         Ok(Pulled::Larger) | Err(_) => None,
     })
     .into_iter()
@@ -262,7 +262,7 @@ pub(super) fn bodies_within<K: Send>(
         urls,
         within,
         |url, left, limit| transport::get_within_as(url, left, None, reader, limit),
-        |fetched| match fetched {
+        |_, fetched| match fetched {
             Fetched::Body(bytes) => keep(bytes),
             Fetched::Missing | Fetched::NoNewer(_) => None,
         },

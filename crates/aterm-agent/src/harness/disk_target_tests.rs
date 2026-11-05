@@ -68,6 +68,7 @@ fn supported_retention_revokes_ordinary_paths_and_keeps_unretained_siblings_elig
         let tmp = Tmp::new("supported-cache-retention");
         let home = tmp.path().canonicalize().unwrap();
         let target = synthetic_target(&tmp, "target").canonicalize().unwrap();
+        aterm_uds::private_file::ensure_private_dir(&target).unwrap();
         let sibling = synthetic_target(&tmp, "sibling").canonicalize().unwrap();
         let now = now_after_write(STALE + 1);
         let debug = target.join("debug");
@@ -738,6 +739,35 @@ fn furnished(tmp: &Tmp, name: &str) -> PathBuf {
     std::fs::create_dir_all(t.join("doc").join("lay")).expect("doc");
     std::fs::write(t.join("doc").join("lay").join("index.html"), b"<html>").expect("doc page");
     t
+}
+
+/// TIER 3 SAYS IT IS STILL GOING WHILE IT JUDGES: before it removes anything it compares a copied
+/// artifact with its twin byte by byte, and matches each entry of the profile against every name in
+/// `deps/`, either of which can run for minutes on a swapping machine.
+#[test]
+fn tier_3_ticks_while_it_compares_artifacts_and_judges_entries() {
+    const KEPT: usize = 400;
+    const BLOCKS: usize = 512;
+    let tmp = Tmp::new("tier-3-ticks");
+    let t = synthetic_target(&tmp, "target");
+    let debug = t.join("debug");
+    let bytes = vec![7u8; BLOCKS * 8192];
+    std::fs::write(debug.join("deps").join("lay-2bcb77ac5af7c69c"), &bytes).expect("twin");
+    std::fs::write(debug.join("lay"), &bytes).expect("a copy, so its bytes are compared");
+    for i in 0..KEPT {
+        std::fs::write(debug.join(format!("kept-{i}")), b"x").expect("kept");
+    }
+    let now = now_after_write(STALE + 1);
+    let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+    let before = aterm_uds::progress::ticks_here();
+    reclaim_profiles(&t, &judge(now), seen, DAY, &mut || Ok(()), &mut || Ok(())).expect("emptied");
+    let ticks = aterm_uds::progress::ticks_here() - before;
+    assert!(
+        std::fs::symlink_metadata(debug.join("lay")).is_err(),
+        "the copy was its twin's bytes, so it went"
+    );
+    assert!(debug.join("kept-0").exists(), "no output of cargo's stays");
+    assert!(ticks >= KEPT + BLOCKS, "{ticks} ticks");
 }
 
 /// Snapshot every entry under `root` except paths matching `skip`.

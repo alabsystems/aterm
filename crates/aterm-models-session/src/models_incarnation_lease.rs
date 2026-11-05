@@ -1,11 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Incarnation lease model across kills, power losses, and write-backs.
+//! Incarnation lease model across kills, power losses, write-backs and, off the boot volume, a
+//! disk that vanishes within one boot.
 
 use aterm_spec::derive::Model;
 
-/// Build the incarnation lease model across kills, power losses, and write-backs.
+/// Build the incarnation lease model across kills, power losses, write-backs and, off the boot
+/// volume, a disk that vanishes within one boot.
+///
+/// `c_*` is what the page cache holds and `m_*` what the media holds: `inc` (`c_inc`), the lease's
+/// `used`, its `top` and the boot it names (`c_lb`), and `seq`. `boot` is the kernel's boot. A
+/// plan (`tr`, `pn`, `sp`) trusts a lease by the trusted boot, which is `boot` on the boot volume
+/// and none off it (`OffVolume`, `StateDir::trusted_boot`), and never by the boot the lease names,
+/// which a take writes on every volume (`StateDir::kernel_boot`). Where no boot is trusted, every
+/// take flushes `inc` and leases that one incarnation (`sp = 1`). `Vanish` is a disk off the boot
+/// volume lost and found again within one boot: the cache goes, the boot stays.
+///
+/// Dials, each a defect of `StateDir::take_incarnation`: 1 trusts a lease that names any boot, 2
+/// one whose top is not `inc`'s, 3 writes the lease before `inc` is flushed, 4 leaves `inc`
+/// unflushed, and 5 trusts by the named boot off the boot volume too, which a vanish turns into
+/// an incarnation presented twice (`Fence`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn incarnation_lease_model() -> Model {
@@ -15,6 +30,8 @@ pub fn incarnation_lease_model() -> Model {
             const Span = 2;
             const MaxTop = 5;
             const MaxBoot = 3;
+            const OffVolume = 0;
+            scenario OffVolume = 1;
             var boot = 1;
             var c_inc = 0;
             var m_inc = 0;
@@ -29,18 +46,22 @@ pub fn incarnation_lease_model() -> Model {
             var pc = 0;
             var tr = 0;
             var pn = 0;
+            var sp = 0;
             var hi = 0;
             var dup = 0;
 
             action Plan when (pc == 0) {
                 tr = if (c_lb == boot || (Buggy == 1 && c_lb > 0))
-                    && (c_top == c_inc || Buggy == 2) { 1 } else { 0 };
+                    && (c_top == c_inc || Buggy == 2)
+                    && (OffVolume == 0 || Buggy == 5) { 1 } else { 0 };
                 pn = (if (c_lb == boot || (Buggy == 1 && c_lb > 0))
-                    && (c_top == c_inc || Buggy == 2) {
+                    && (c_top == c_inc || Buggy == 2)
+                    && (OffVolume == 0 || Buggy == 5) {
                     if c_seq <= c_used { c_used } else { c_seq }
                 } else {
                     if c_seq <= c_inc { c_inc } else { c_seq }
                 }) + 1;
+                sp = if OffVolume == 0 || Buggy == 5 { Span } else { 1 };
                 pc = 1;
             }
             action Take when (pc == 1 && tr == 1 && pn <= c_inc) {
@@ -50,28 +71,28 @@ pub fn incarnation_lease_model() -> Model {
                 pc = 2;
             }
             action TakeFlushed when (pc == 1 && (tr == 0 || pn > c_inc)
-                && pn + Span - 1 <= MaxTop) {
-                c_inc = pn + Span - 1;
-                m_inc = if Buggy == 4 { m_inc } else { pn + Span - 1 };
+                && pn + sp - 1 <= MaxTop) {
+                c_inc = pn + sp - 1;
+                m_inc = if Buggy == 4 { m_inc } else { pn + sp - 1 };
                 c_used = pn;
-                c_top = pn + Span - 1;
+                c_top = pn + sp - 1;
                 c_lb = boot;
                 pc = 2;
             }
             action KillRenamed when (pc == 1 && (tr == 0 || pn > c_inc)
-                && pn + Span - 1 <= MaxTop) {
-                c_inc = pn + Span - 1;
+                && pn + sp - 1 <= MaxTop) {
+                c_inc = pn + sp - 1;
                 c_used = if Buggy == 3 { pn } else { c_used };
-                c_top = if Buggy == 3 { pn + Span - 1 } else { c_top };
+                c_top = if Buggy == 3 { pn + sp - 1 } else { c_top };
                 c_lb = if Buggy == 3 { boot } else { c_lb };
                 pc = 0;
             }
             action KillFlushed when (pc == 1 && (tr == 0 || pn > c_inc)
-                && pn + Span - 1 <= MaxTop) {
-                c_inc = pn + Span - 1;
-                m_inc = pn + Span - 1;
+                && pn + sp - 1 <= MaxTop) {
+                c_inc = pn + sp - 1;
+                m_inc = pn + sp - 1;
                 c_used = if Buggy == 3 { pn } else { c_used };
-                c_top = if Buggy == 3 { pn + Span - 1 } else { c_top };
+                c_top = if Buggy == 3 { pn + sp - 1 } else { c_top };
                 c_lb = if Buggy == 3 { boot } else { c_lb };
                 pc = 0;
             }
@@ -98,6 +119,14 @@ pub fn incarnation_lease_model() -> Model {
             }
             action PowerLoss when (boot + 1 <= MaxBoot) {
                 boot = boot + 1;
+                c_inc = m_inc;
+                c_used = m_used;
+                c_top = m_top;
+                c_lb = m_lb;
+                c_seq = m_seq;
+                pc = 0;
+            }
+            action Vanish when (OffVolume == 1) {
                 c_inc = m_inc;
                 c_used = m_used;
                 c_top = m_top;

@@ -766,7 +766,7 @@ impl Run<'_> {
             .to_string();
         if reply.starts_with("OK") && !path.is_empty() {
             let dest = self.out.join(format!("frame-{}.png", self.tag));
-            let _ = std::fs::copy(&path, &dest);
+            let _ = crate::util::copy_regular_file(&path, &dest);
             println!(
                 "      image mid-line: {} -> {}",
                 reply.trim(),
@@ -999,10 +999,11 @@ fn print_verdict(v: &Verdict) {
 }
 
 fn copy_out(out: &Path, tag: &str, log: &Path, takes: &Path) {
-    let _ = std::fs::copy(log, out.join(format!("aterm-{tag}.log")));
+    let _ = crate::util::copy_regular_file(log, out.join(format!("aterm-{tag}.log")));
     if let Ok(dir) = std::fs::read_dir(takes) {
         for (i, e) in dir.filter_map(Result::ok).enumerate() {
-            let _ = std::fs::copy(e.path(), out.join(format!("take-{tag}-{i}.take")));
+            let _ =
+                crate::util::copy_regular_file(e.path(), out.join(format!("take-{tag}-{i}.take")));
         }
     }
 }
@@ -1032,7 +1033,7 @@ fn run_one(
         std::fs::create_dir_all(&bin)?;
         std::fs::create_dir_all(&takes)?;
         let shell = bin.join(&cfg.shell);
-        std::fs::copy(&crate::paths::paths().exe, &shell)?;
+        crate::util::copy_regular_file(&crate::paths::paths().exe, &shell)?;
         let config = instance::config_with(&[
             format!(
                 "predictive_echo = \"{}\"",
@@ -1040,12 +1041,12 @@ fn run_one(
             ),
             format!("shell = \"{}\"", shell.display()),
         ]);
-        std::fs::write(
-            world.cfg.join("aterm/aterm.toml"),
+        crate::util::write_fresh(
+            &world.cfg.join("aterm/aterm.toml"),
             instance::bell_off(&config),
         )?;
-        std::fs::write(world.home.join(".zshrc"), "PROMPT='$ '\nRPROMPT=''\n")?;
-        std::fs::write(world.home.join(".bashrc"), "PS1='$ '\n")?;
+        crate::util::write_fresh(&world.home.join(".zshrc"), "PROMPT='$ '\nRPROMPT=''\n")?;
+        crate::util::write_fresh(&world.home.join(".bashrc"), "PS1='$ '\n")?;
         Ok((shell, takes))
     })();
     let (_, takes) = match laid {
@@ -1171,8 +1172,7 @@ fn run_one(
         i += 1;
     }
     copy_out(out, &tag, &log, &run.takes);
-    run.inst.stop();
-    Ok(Ok(held))
+    Ok(run.inst.stop().map(|()| held))
 }
 
 /// `predict-live` (module docs).

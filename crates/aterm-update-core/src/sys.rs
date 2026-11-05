@@ -30,21 +30,22 @@ impl FileLock {
     #[cfg_attr(trust_verify, trust::skip)]
     fn open_lock_file(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
+        let file = aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+        })?;
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{} is not a regular file", path.display()),
             ));
         }
-        aterm_uds::keep_out_of_children(&file)?;
         Ok(file)
     }
 

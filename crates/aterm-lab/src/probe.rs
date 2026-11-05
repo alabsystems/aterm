@@ -1254,7 +1254,7 @@ fn build_replica(w: &World) -> std::io::Result<()> {
         w.home
     ))) {
         fs::create_dir_all(Path::new(&path).parent().unwrap())?;
-        fs::write(path, "owned replica\n")?;
+        crate::util::write_fresh(Path::new(&path), "owned replica\n")?;
     }
     for (kind, path) in protected_paths(&w.home, &w.cc) {
         let names = match kind {
@@ -1269,32 +1269,30 @@ fn build_replica(w: &World) -> std::io::Result<()> {
             if let Some(d) = Path::new(&n).parent() {
                 fs::create_dir_all(d)?;
             }
-            fs::write(&n, "replica\n")?;
+            crate::util::write_fresh(Path::new(&n), "replica\n")?;
         }
     }
-    use std::os::unix::fs::PermissionsExt as _;
     for b in [w.claude.clone(), w.codex.clone(), sibling_build(w)] {
         if let Some(d) = Path::new(&b).parent() {
             fs::create_dir_all(d)?;
         }
-        fs::write(&b, "#!/bin/sh\necho replica\n")?;
-        fs::set_permissions(&b, fs::Permissions::from_mode(0o755))?;
+        crate::util::write_fresh_mode(Path::new(&b), "#!/bin/sh\necho replica\n", 0o755)?;
     }
     if let Some(build) = Path::new(&w.codex).parent().and_then(Path::parent) {
-        fs::write(
-            build.join("codex-package.json"),
+        crate::util::write_fresh(
+            &build.join("codex-package.json"),
             "{\"version\": \"replica\"}\n",
         )?;
     }
-    fs::write(format!("{}/env.sh", w.run), "# replica\n")?;
-    fs::write(format!("{}/xcrun_db", w.usertmp), "replica\n")?;
+    crate::util::write_fresh(Path::new(&format!("{}/env.sh", w.run)), "# replica\n")?;
+    crate::util::write_fresh(Path::new(&format!("{}/xcrun_db", w.usertmp)), "replica\n")?;
     fs::create_dir_all(format!("{}/scratch", w.run))?;
     for n in SCRATCH_DIRS {
         fs::create_dir_all(format!("{}/scratch/{n}", w.run))?;
     }
     fs::create_dir_all(format!("{}/proj", w.sockdir))?;
     for n in ["a.sock", "a.sock.token"] {
-        fs::write(format!("{}/{n}", w.sockdir), "replica\n")?;
+        crate::util::write_fresh(Path::new(&format!("{}/{n}", w.sockdir)), "replica\n")?;
     }
     Ok(())
 }
@@ -1334,7 +1332,7 @@ fn run_inside(w: &World, checks: &[Check], spec_dir: &Path) -> Result<Vec<String
         .iter()
         .map(|c| format!("{}\n", c.op.encode()))
         .collect();
-    fs::write(&spec, body).map_err(|e| e.to_string())?;
+    crate::util::write_fresh(&spec, body).map_err(|e| e.to_string())?;
     let out = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec")
         .arg("-f")
         .arg(&w.jail)
@@ -1406,7 +1404,7 @@ fn judge_worlds(worlds: &[World], base: &Path, o: &mut dyn std::io::Write) -> i3
         let mut made = Vec::new();
         for n in ["a.sock", "a.sock.token"] {
             let path = format!("{}/{n}", w.sockdir);
-            if !w.replica && fs::symlink_metadata(&path).is_err() && fs::write(&path, "").is_ok() {
+            if !w.replica && crate::util::write_fresh(Path::new(&path), "").is_ok() {
                 made.push(path);
             }
         }
@@ -1639,7 +1637,7 @@ fn probe_in(
                 fs::create_dir_all(run.join("scratch").join(n))
                     .map_err(|e| Fail::die(e.to_string()))?;
             }
-            let _ = fs::write(run.join("env.sh"), "");
+            let _ = crate::util::write_fresh(&run.join("env.sh"), "");
             let mut spec = crate::jail::Spec::for_lab(
                 &run.to_string_lossy(),
                 &claude,
@@ -1648,7 +1646,7 @@ fn probe_in(
                 "",
             );
             spec.home.clone_from(&p.real_home);
-            fs::write(run.join("jail.sb"), crate::jail::render(&spec)?)
+            crate::util::write_fresh(&run.join("jail.sb"), crate::jail::render(&spec)?)
                 .map_err(|e| Fail::die(e.to_string()))?;
             World {
                 name: "this lab's jail.sb, against this machine".into(),
@@ -1698,7 +1696,7 @@ fn probe_in(
     rspec.ccsocks = rs("cc");
     rspec.state = st(&pst.join("lab/state"));
     rspec.user_tmp = st(&pst.join("T"));
-    fs::write(rrun.join("jail.sb"), crate::jail::render(&rspec)?)
+    crate::util::write_fresh(&rrun.join("jail.sb"), crate::jail::render(&rspec)?)
         .map_err(|e| Fail::die(e.to_string()))?;
     worlds.push(World {
         name: "the same rules on a replica home (every protected path, a socket for each, the store, the scratch)"

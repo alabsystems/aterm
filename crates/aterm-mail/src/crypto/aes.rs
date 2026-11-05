@@ -83,24 +83,26 @@ pub(super) fn wrap(key: &[u8], input: &[u8]) -> Result<Vec<u8>, String> {
     let key = Key::new(key)?;
     let n = input.len() / 8;
     let mut a = [0xa6u8; 8];
-    let mut result = input.to_vec();
+    let mut output = Vec::with_capacity(8 + input.len());
+    output.extend_from_slice(&a);
+    output.extend_from_slice(input);
     for j in 0..6 {
         for i in 1..=n {
             let mut block = [0u8; 16];
             block[..8].copy_from_slice(&a);
-            block[8..].copy_from_slice(&result[(i - 1) * 8..i * 8]);
+            block[8..].copy_from_slice(&output[8 * i..8 * (i + 1)]);
             let mut encoded = key.block(block, false);
+            block.zeroize();
             let t = ((n * j + i) as u64).to_be_bytes();
             for k in 0..8 {
                 a[k] = encoded[k] ^ t[k];
             }
-            result[(i - 1) * 8..i * 8].copy_from_slice(&encoded[8..]);
+            output[8 * i..8 * (i + 1)].copy_from_slice(&encoded[8..]);
             encoded.zeroize();
         }
     }
-    let mut output = a.to_vec();
-    output.extend_from_slice(&result);
-    result.zeroize();
+    output[..8].copy_from_slice(&a);
+    a.zeroize();
     Ok(output)
 }
 
@@ -121,12 +123,15 @@ pub(super) fn unwrap(key: &[u8], input: &[u8]) -> Result<Zeroizing<Vec<u8>>, Str
             }
             block[8..].copy_from_slice(&output[8 * (i - 1)..8 * i]);
             let mut plain = key.block(block, true);
+            block.zeroize();
             a.copy_from_slice(&plain[..8]);
             output[8 * (i - 1)..8 * i].copy_from_slice(&plain[8..]);
             plain.zeroize();
         }
     }
-    if !aterm_digest::ct_eq(&a, &[0xa6; 8]) {
+    let ok = aterm_digest::ct_eq(&a, &[0xa6; 8]);
+    a.zeroize();
+    if !ok {
         return Err("Wrapped key integrity check failed".into());
     }
     Ok(output)

@@ -20,7 +20,7 @@
 use crate::supervise::facts::{EpisodeKey, Fact, Left, LeftLook, Settled};
 use crate::supervise::occupancy::door::{FactDoor, LeftRow, LeftSaid, left_reason};
 use crate::supervise::occupancy::fault::{Fault, armed};
-use crate::supervise::policy::turn_end::{Composer, TurnEndReading};
+use crate::supervise::policy::turn_end::{Composer, Diversion, TurnEndReading};
 
 use super::*;
 
@@ -95,10 +95,9 @@ impl<C: Ctl> Session<'_, C> {
     /// The look a read of `screen` is (`live`: a turn runs on it): whether its composer holds a
     /// draft (unread under a prompt, or where none is drawn, or while a line this loop gave up on
     /// undrawn is held: an empty composer then says nothing of a line that may still come, so no
-    /// line it left is released while its copy may arrive) and its submit count. Unless the rows
-    /// and the cursor alone say typed ([`draft_read`]), the glyph's cell is asked, as at the door's own
-    /// write ([`Self::door_draft`]): a line left stands, whole or edited, while that says typed or
-    /// cannot say, and a suggestion at home is no line left, on any number of rows.
+    /// line it left is released while its copy may arrive) and its submit count, read as the door's
+    /// own write reads it ([`Self::door_draft`]): a line left stands, whole or edited, while that
+    /// says typed or cannot say, and a suggestion at home is no line left.
     pub(in crate::supervise::run) fn left_seen(&mut self, screen: &Screen, live: bool) -> LeftLook {
         let reader = self.reader(&screen.rows);
         let draft = if (reader.prompt(&screen.rows).is_some() && !armed(Fault::BoxedComposerRead))
@@ -106,10 +105,10 @@ impl<C: Ctl> Session<'_, C> {
         {
             None
         } else {
-            reader.composer(&screen.rows).map(|c| {
-                draft_read(Some(&c), reader.placeholder(), screen) == Some(true)
-                    || self.door_draft(screen) != Some(false)
-            })
+            reader
+                .composer(&screen.rows)
+                .is_some()
+                .then(|| self.door_draft(screen))
         };
         LeftLook::Read {
             draft,
@@ -297,12 +296,31 @@ impl<C: Ctl> Session<'_, C> {
     /// and left with a person's words joined to it (`OwnLine::joined_in`: their keys landed before
     /// its Enter): neither the loop's act nor the person's own draft, so the policy's draft step
     /// sends neither as the other. The person sends or clears it, and the next look settles it.
+    /// A command standing (`Composer::Command`, v6 §14.17.5.8) is a person's hold, but for the
+    /// line this loop wrote and left, whole, with no person's typing since (`Session::own_unkeyed`:
+    /// a scroll or a click is none): that one is the loop's, read as a line of its own is under
+    /// the menu over it (`CommandEnter::own`: sent where Enter runs it as written, as the probe's
+    /// own `/usage` is, never where it runs another entry or the selection is unread); a person's
+    /// command equal to it, typed over it or after their typing, never is.
+    /// An old prompt the prompt-history search left in the composer unedited ([`Self::searched`])
+    /// is no person's draft either (`Diversion::Recall`): asked about, never sent; their edit makes
+    /// it theirs.
     pub(in crate::supervise::run) fn left_composer(
         &self,
         r: &mut TurnEndReading,
         cfg: &SupervisorConfig,
         screen: &Screen,
     ) {
+        if let Composer::Command(_, enter) = r.composer
+            && let Some(own) = self.own_line.as_ref()
+            && self.own_unkeyed(own, screen)
+            && self
+                .reader(&screen.rows)
+                .composer(&screen.rows)
+                .is_some_and(|(_, lines)| own.is(&lines.join(" ")))
+        {
+            r.composer = enter.own();
+        }
         let prompt = cfg.occupancy.grant().is_some();
         let stuck = cfg.stuck_break_grant().is_some();
         if r.composer == Composer::Typed && !self.facts.state.draft_may_go(prompt, stuck) {
@@ -316,6 +334,15 @@ impl<C: Ctl> Session<'_, C> {
                 .is_some_and(|(_, lines)| own.joined_in(&lines.join(" ")))
         {
             r.composer = Composer::Own;
+        }
+        if r.composer == Composer::Typed
+            && let Some(turn_end_loop::Searched::Left(found)) = self.searched.as_ref()
+            && self
+                .reader(&screen.rows)
+                .composer(&screen.rows)
+                .is_some_and(|(_, lines)| lines.join("\n") == *found)
+        {
+            r.composer = Composer::Diverted(Diversion::Recall);
         }
     }
 }

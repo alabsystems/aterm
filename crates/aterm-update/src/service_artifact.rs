@@ -61,9 +61,7 @@ fn digest(bytes: &[u8]) -> String {
     hex(&aterm_digest::Sha256::digest(bytes))
 }
 fn valid_hash(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    aterm_codec::hex::is_lower(s, 64)
 }
 fn relative(path: &Path) -> bool {
     valid_executable_path(path)
@@ -145,11 +143,7 @@ fn authenticate(
     let Extension { service } = aterm_toml::from_str(&signed.manifest).map_err(error)?;
     let revision = manifest
         .commit
-        .filter(|s| {
-            s.len() == 40
-                && s.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
+        .filter(|s| aterm_codec::hex::is_lower(s, 40))
         .ok_or("service release requires full source revision")?;
     if service.schema != 1
         || service.platform.trim().is_empty()
@@ -288,6 +282,15 @@ impl Store {
             ".materialize-{}",
             aterm_uds::rand::hex_token::<16>().map_err(error)?
         ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&scratch)
+                .map_err(error)?;
+        }
+        #[cfg(not(unix))]
         std::fs::create_dir(&scratch).map_err(error)?;
         let result = (|| {
             ensure_private_dir(&scratch).map_err(error)?;
@@ -300,10 +303,6 @@ impl Store {
             let bytes = aterm_json::to_vec(&record).map_err(error)?;
             aterm_uds::private_file::write_private(&scratch, "receipt.json", &bytes)
                 .map_err(error)?;
-            let record_path = scratch.join("receipt.json");
-            aterm_durable::durable(&std::fs::File::open(&record_path).map_err(error)?)
-                .map_err(error)?;
-            aterm_durable::Flush::Durable.dir(&scratch).map_err(error)?;
             std::fs::rename(&scratch, &final_dir).map_err(error)?;
             aterm_durable::Flush::Durable
                 .dir(&self.root)
@@ -467,14 +466,27 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn flush_tree(path: &Path) -> Result<(), String> {
+    fn flush_dir(path: &Path) -> Result<(), String> {
+        for entry in std::fs::read_dir(path).map_err(error)? {
+            let entry = entry.map_err(error)?;
+            let ft = entry.file_type().map_err(error)?;
+            if ft.is_dir() {
+                flush_dir(&entry.path())?;
+            } else if ft.is_file() {
+                let (file, _) = aterm_uds::regular_file::open(&entry.path()).map_err(error)?;
+                aterm_durable::durable(&file).map_err(error)?;
+            } else if !ft.is_symlink() {
+                return Err("special file in service image".into());
+            }
+        }
+        aterm_durable::Flush::Durable.dir(path).map_err(error)
+    }
     let meta = std::fs::symlink_metadata(path).map_err(error)?;
     if meta.is_dir() {
-        for entry in std::fs::read_dir(path).map_err(error)? {
-            flush_tree(&entry.map_err(error)?.path())?;
-        }
-        aterm_durable::Flush::Durable.dir(path).map_err(error)?;
+        flush_dir(path)?;
     } else if meta.is_file() {
-        aterm_durable::durable(&std::fs::File::open(path).map_err(error)?).map_err(error)?;
+        let (file, _) = aterm_uds::regular_file::open(path).map_err(error)?;
+        aterm_durable::durable(&file).map_err(error)?;
     } else if !meta.file_type().is_symlink() {
         return Err("special file in service image".into());
     }
@@ -484,19 +496,55 @@ fn flush_tree(path: &Path) -> Result<(), String> {
 #[cfg(not(target_os = "macos"))]
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(from).map_err(error)?;
-    if meta.file_type().is_symlink() {
+    copy_tree_kind(from, to, meta.file_type(), Some(&meta))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_tree_kind(
+    from: &Path,
+    to: &Path,
+    kind: std::fs::FileType,
+    dir_meta: Option<&std::fs::Metadata>,
+) -> Result<(), String> {
+    if kind.is_symlink() {
         std::os::unix::fs::symlink(std::fs::read_link(from).map_err(error)?, to).map_err(error)?;
-    } else if meta.is_dir() {
+    } else if kind.is_dir() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let owned_meta;
+        let meta = match dir_meta {
+            Some(meta) => meta,
+            None => {
+                owned_meta = std::fs::symlink_metadata(from).map_err(error)?;
+                &owned_meta
+            }
+        };
         std::fs::create_dir(to).map_err(error)?;
         for entry in std::fs::read_dir(from).map_err(error)? {
             let entry = entry.map_err(error)?;
-            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+            let ft = entry.file_type().map_err(error)?;
+            copy_tree_kind(&entry.path(), &to.join(entry.file_name()), ft, None)?;
         }
-        std::fs::set_permissions(to, meta.permissions()).map_err(error)?;
-        aterm_durable::Flush::Durable.dir(to).map_err(error)?;
-    } else if meta.is_file() {
-        std::fs::copy(from, to).map_err(error)?;
-        aterm_durable::durable(&std::fs::File::open(to).map_err(error)?).map_err(error)?;
+        let dir_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(to)
+            .map_err(error)?;
+        dir_fd.set_permissions(meta.permissions()).map_err(error)?;
+        aterm_durable::durable(&dir_fd).map_err(error)?;
+    } else if kind.is_file() {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let (mut source, src_meta) = aterm_uds::regular_file::open(from).map_err(error)?;
+        let mut sink = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(src_meta.permissions().mode())
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+            .open(to)
+            .map_err(error)?;
+        std::io::copy(&mut source, &mut sink).map_err(error)?;
+        sink.set_permissions(src_meta.permissions())
+            .map_err(error)?;
+        aterm_durable::durable(&sink).map_err(error)?;
     } else {
         return Err("special file in service image".into());
     }

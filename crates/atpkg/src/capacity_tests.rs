@@ -314,3 +314,98 @@ fn a_reservation_is_the_need_less_what_is_written() {
         "{shown:#?}"
     );
 }
+
+/// A detached record's numeric PID and credit list cannot attribute a reused process tree.
+/// Whole cohort accounting has the same credit restriction but a different closure policy;
+/// ordinary holder accounting continues to report and subtract the actual observed trees.
+#[test]
+fn claim_accounting_reports_lifetime_without_attributing_reused_pids() {
+    use aterm_capacity::Accounting;
+
+    let (r, _) = data();
+    let mut original = claim(52_000, 4, 0, DATA, true);
+    original.need = Need::new("original window reservation").mem(16 * GIB);
+    original.credit = vec![52_100];
+    let trees = HashMap::from([
+        (
+            original.pid,
+            TreeUse {
+                footprint: 2 * GIB,
+                written: 0,
+            },
+        ),
+        (
+            original.credit[0],
+            TreeUse {
+                footprint: 6 * GIB,
+                written: 0,
+            },
+        ),
+    ]);
+    for (accounting, mode, lifetime, pid_role, left) in [
+        (
+            Accounting::Holder,
+            "holder",
+            "claim-protocol",
+            "holder",
+            8 * GIB,
+        ),
+        (
+            Accounting::Whole,
+            "whole",
+            "cohort-closure",
+            "original-record",
+            16 * GIB,
+        ),
+        (
+            Accounting::Detached,
+            "detached",
+            "final-guard-close",
+            "original-record",
+            16 * GIB,
+        ),
+    ] {
+        let mut record = original.clone();
+        record.accounting = accounting;
+        let claims = [record];
+        let report = json_report(&r, &[], &claims, Some(&trees));
+        for (key, expected) in [
+            ("pid", Value::from(original.pid)),
+            ("pid_role", Value::from(pid_role)),
+            ("accounting", Value::from(mode)),
+            ("lifetime", Value::from(lifetime)),
+            ("mem", Value::from(16 * GIB)),
+            ("reserved_mem", Value::from(left)),
+        ] {
+            assert_eq!(json_claims(&report, key), [expected], "{mode}: {key}");
+        }
+        let shown = super::claim_line(
+            &claims[0],
+            reserved(&claims, Some(&trees), r.volume.as_slice())[0],
+            Some(&trees),
+            1_000,
+        );
+        assert!(shown.contains(&format!("accounting {mode}, lifetime {lifetime}")));
+        assert!(shown.contains(&format!("reserves {}", gib(left))));
+        if accounting == Accounting::Holder {
+            assert_eq!(json_claims(&report, "tree_held"), [Value::from(2 * GIB)]);
+            assert_eq!(
+                json_claims(&report, "credited_held"),
+                [Value::from(6 * GIB)]
+            );
+            assert!(shown.contains("its holder's tree holds"));
+            assert!(!shown.contains("original pid"));
+        } else {
+            assert_eq!(json_claims(&report, "tree_held"), [Value::Null]);
+            assert_eq!(json_claims(&report, "credited_held"), [Value::Null]);
+            assert!(shown.contains(&format!("original pid {}", original.pid)));
+            assert!(!shown.contains("tree holds"));
+            assert!(!shown.contains("processes credited"));
+            assert_eq!(
+                json_claims(&json_report(&r, &[], &claims, None), "reserved_mem"),
+                [Value::from(left)],
+                "non-holder reservations do not depend on a PID sweep"
+            );
+        }
+    }
+}

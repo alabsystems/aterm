@@ -452,13 +452,22 @@ pub(super) fn prepare_shared_with_clock(
             continue;
         }
         let key = shared_key(grant.source);
+        let label = adoption_label(&candidate, &records.raw_roster);
+        let sign_in = approved_sign_in(&grant, cli, &label);
         let Ok(Some(signin)) = store.signin_now() else {
             return false;
         };
+        // Another account's sign-in started here within the spacing: no candidate starts now.
+        if !matches!(sign_in.spaced(&store, now), Ok(None)) {
+            return false;
+        }
         let Some(permit) =
             AutoRenewPermit::claim_preparation(fx.renew_guard, &key, clock(), &grant)
         else {
             continue;
+        };
+        let Ok(signin) = sign_in.begin(cli, &label, signin, &store, now) else {
+            return false;
         };
         let home = home.to_owned();
         let state_dir = state_dir.to_owned();
@@ -489,6 +498,58 @@ pub(super) fn prepare_shared_with_clock(
         return true;
     }
     false
+}
+
+/// THE ADOPTION'S SIGN-IN DOOR: a root approved this one account for this Mac's first custody
+/// (`grant`, re-read from the root's current decision), so its sign-in names that account and keeps
+/// the upkeep's spacing ([`super::super::sign_in_ladder::SPACING_S`]). The census guard
+/// `usage-read-on-timer` does not walk into it.
+fn approved_sign_in(grant: &Grant, cli: Cli, label: &str) -> SignIn {
+    SignIn::granted_sign_in(grant, cli, label)
+}
+
+/// THE CUSTODY SIGN-IN DOOR: `row` is in this Mac's shared custody (`records`' logins require a
+/// root's source for it), and the root's current decision for it, read now through `factory`, is
+/// one no login here answers yet: no attempt at it, or the last one not published. The root's
+/// decision is a person's, made for this Mac and this account; once its login is published, the
+/// row is renewed only as any login this Mac uses is ([`super::upkeep_sign_in`]). The census
+/// guard `usage-read-on-timer` does not walk into it.
+pub(super) fn custody_sign_in(
+    home: &Path,
+    roster_path: &Path,
+    records: &accounts::AccountRecords,
+    row: &Row,
+    factory: Option<&Factory>,
+) -> Option<SignIn> {
+    let source = records.logins.shared.required(row).ok()??;
+    let authority = automatic(
+        factory?(home, source, row).ok()?,
+        config_beside(roster_path),
+    );
+    let grant = authority.prepare(row).ok()?;
+    let answered = records.logins.shared.latest(source).is_some_and(|attempt| {
+        attempt.intent.decision == grant.decision
+            && attempt.intent.generation >= grant.generation
+            && matches!(attempt.outcome, accounts::shared::Outcome::Published { .. })
+    });
+    (grant.source == source && !answered).then(|| approved_sign_in(&grant, Cli::Claude, &row.label))
+}
+
+/// The local row an adoption of `candidate` signs in: the one row here that already carries its
+/// identity, else the candidate's own label (what [`super::super::cli::shared_adoption::adopt`]
+/// signs in).
+pub(in crate::harness) fn adoption_label(candidate: &Candidate, raw: &Roster) -> String {
+    raw.rows
+        .iter()
+        .find(|row| {
+            candidate
+                .row
+                .email
+                .iter()
+                .chain(candidate.row.identity_email.iter())
+                .any(|email| row.matches_email(email))
+        })
+        .map_or_else(|| candidate.row.label.clone(), |row| row.label.clone())
 }
 
 pub(super) fn shared_key(source: accounts::shared::Source) -> String {

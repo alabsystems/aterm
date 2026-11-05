@@ -127,8 +127,8 @@ pub(super) struct TransientState {
     pub(super) pending_parser_reset: bool,
     /// The main grid's `absolute_row_counter` when this batch parked it (smcup).
     pub(super) alt_park_main_row_counter: Option<u64>,
-    /// A reading position flattened off a grid swapped back in mid-batch (rmcup): `(the display_offset it was parked with, its absolute_row_counter at the swap)`.
-    pub(super) alt_restore_pin: Option<(usize, u64)>,
+    /// A reading position flattened off a grid swapped back in mid-batch (rmcup): `(the display_offset it was parked with, its absolute_row_counter at the swap, its scrollback_clear_gen at the swap)`; an erase of its history since voids it.
+    pub(super) alt_restore_pin: Option<(usize, u64, u64)>,
     /// Whether this batch left the alt screen at any point.
     pub(super) alt_screen_left_in_batch: bool,
     /// The host asked for the primary screen (`Terminal::leave_alternate_screen`, the `mainscreen` verb) after an app died on the alternate screen.
@@ -179,9 +179,9 @@ pub(super) struct TransientState {
     pub(super) kitty_pending: Option<crate::terminal::kitty_graphics::KittyCommand>,
     /// Per screen (`[main, alternate]`, indexed by `modes.alternate_screen`), an upper bound on the payload bytes of the inline images that screen shows, held under `MAX_LIVE_IMAGE_BYTES` by `TerminalHandler::admit_live_image` (which explains the bound).
     pub(super) live_image_charge: [usize; 2],
-    /// Edge-triggered BEL flag set by `handle_bell()` (after rate limiting) and drained by `Terminal::drain_bell()`, for polling hosts.
+    /// Edge-triggered BEL flag set by `handle_bell()` (after rate limiting) and drained by `Terminal::drain_bell()`, for polling hosts. A reset keeps it: the bell rang before it.
     pub(super) bell_pending: bool,
-    /// App-event queue of OSC payloads `(code, payload)` the host polls via `Terminal::take_osc_event`: OSC 52 decoded clipboard, OSC 7 cwd, OSC 133 marks.
+    /// App-event queue of OSC payloads `(code, payload)` the host polls via `Terminal::take_osc_event`: OSC 52 decoded clipboard, OSC 7 cwd, OSC 133 marks. A reset keeps every event, as `clear` does: they happened before it, and a reset renumbers no row (an A, B or C's `row=` names the row its mark was made on, as after ED 2 and ED 3).
     pub(super) osc_events: OscEventQueue,
     /// Where the most recent PTY print run ended: the active-grid cursor `(row, col)` after each print action.
     pub(super) print_anchor: Option<(u16, u16)>,
@@ -339,8 +339,6 @@ impl TransientState {
         self.bracketed_paste_from_prompt = false;
         self.xtsave_modes.clear();
         self.last_osc_bel_terminated = false;
-        self.bell_pending = false;
-        self.osc_events.clear();
         self.print_anchor = None;
         self.kitty_images.clear();
         self.kitty_frames.clear();
@@ -400,12 +398,6 @@ impl OscEventQueue {
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
         self.events.is_empty()
-    }
-
-    #[inline]
-    pub(super) fn clear(&mut self) {
-        self.events.clear();
-        self.bytes = 0;
     }
 
     /// Keep only the events `keep` accepts.

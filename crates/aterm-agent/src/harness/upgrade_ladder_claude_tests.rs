@@ -78,6 +78,7 @@ fn read(rows: Vec<String>, seq: u64, human: HumanInput) -> Screen {
         generation: None,
         human,
         title: None,
+        human_seq: None,
     }
 }
 
@@ -121,6 +122,7 @@ fn opts() -> Opts {
     Opts {
         home: none.join("home"),
         state: none.join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: None,
@@ -406,6 +408,7 @@ fn rest_look(rows: &[String], behind: u64) -> Facts {
         generation: None,
         human: HumanInput::Ago(600_000),
         title: None,
+        human_seq: None,
     };
     let mut st = St {
         pending_since: NOW - behind,
@@ -534,16 +537,17 @@ fn the_agents_own_work_holds_the_restart_under_any_footer_rule() {
         &[],
         &[RUNNING],
     );
-    // The same done row as 2.1.310 and later draw it beside their side panel: padded out to the
-    // panel's rule (`claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt`).
-    let beside = own_work_screen(
-        &format!(
-            "{:<81}│",
-            "✻ Brewed for 6m 7s · done 10:07 AM · 2 agents still running"
-        ),
+    // The same done row as 2.1.310 and later draw it beside their side panel: it and every row
+    // above the composer padded out to the panel's rule
+    // (`claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt`).
+    let mut beside = own_work_screen(
+        "✻ Brewed for 6m 7s · done 10:07 AM · 2 agents still running",
         &[],
         &[RUNNING],
     );
+    for row in &mut beside[..4] {
+        *row = format!("{row:<81}│");
+    }
     for (name, rows, work) in [
         ("carried", &carried, "screen:background-work-still-running"),
         (
@@ -645,6 +649,72 @@ fn the_work_a_done_row_names_above_an_idle_compaction_holds_the_restart() {
     }
     let signal = read(agents, 7, HumanInput::Ago(600_000));
     assert!(!turn_over_shown(&signal, false), "the signal waits");
+}
+
+/// WORK ONLY THE FOOTER'S PILL COUNTS HOLDS THE RESTART: Claude Code counts what still runs in its
+/// footer's pill, one label for each kind (2.1.286, read from its source: `1 MCP task`, `2
+/// background tasks`, `◇ 1 cloud session`, `1 Artifact comment monitor`; no capture draws one),
+/// and where its done row names none of that work, the pill is the one place the screen names it.
+/// No process row names it either ([`background`] reads the processes under the agent that
+/// [`BACKGROUND`] names), so the restart waits for it at every rung, LAND's too, and its signal
+/// does not go ([`turn_over_shown`]). The screens are the measured 2.1.312 capture with its done
+/// row's ` · 1 shell still running` dropped and its pill's `1 shell` replaced by each label
+/// (CONSTRUCTED).
+/// NEGATIVE CONTROL: the same screen with its pill counting no work (`10 files changed`) restarts
+/// at LAND, its signal going.
+#[test]
+fn work_only_the_footers_pill_counts_holds_the_restart() {
+    use aterm_phase::prompt::fixtures::{IDLE_COMPACTED_OVER_A_SHELL_2_1_312, screen};
+    let captured = screen(IDLE_COMPACTED_OVER_A_SHELL_2_1_312);
+    let done = captured
+        .iter()
+        .position(|r| r.starts_with("✻ Worked for 23s"))
+        .expect("the done row");
+    let pill = captured.len() - 1;
+    assert!(captured[pill].ends_with("· 1 shell"), "{captured:#?}");
+    let counting = |count: &str| -> Vec<String> {
+        let mut rows = captured.clone();
+        rows[done] = "✻ Worked for 23s · done 4:57 PM".to_string();
+        rows[pill] = captured[pill].replace("· 1 shell", &format!("· {count}"));
+        rows
+    };
+    for label in [
+        "1 MCP task",
+        "2 background tasks",
+        "◇ 1 cloud session",
+        "1 Artifact comment monitor",
+    ] {
+        let rows = counting(label);
+        for behind in [60, upgrade::RUNG_LAND_S] {
+            let f = rest_look(&rows, behind);
+            assert_eq!(
+                upgrade::next_step(&Phase::Pending, &f, false, NOW),
+                upgrade::Step::Wait("background"),
+                "{label}, behind {behind}s: {f:?}"
+            );
+            assert_eq!(
+                f.background,
+                ["screen:background-work-running"],
+                "{label}, behind {behind}s"
+            );
+        }
+        let signal = read(rows, 7, HumanInput::Ago(600_000));
+        assert!(
+            !turn_over_shown(&signal, false),
+            "{label}: the signal waits"
+        );
+    }
+    // CONTROL: the pill counts no work.
+    let files = counting("10 files changed");
+    let f = rest_look(&files, upgrade::RUNG_LAND_S);
+    assert!(f.background.is_empty(), "{f:?}");
+    assert_eq!(
+        upgrade::next_step(&Phase::Pending, &f, false, NOW),
+        upgrade::Step::Terminate,
+        "{f:?}"
+    );
+    let signal = read(files, 7, HumanInput::Ago(600_000));
+    assert!(turn_over_shown(&signal, false), "the signal goes");
 }
 
 /// A Claude Code screen under a command status line (aterm's usage tap is one), CONSTRUCTED in the

@@ -734,3 +734,60 @@ fn a_left_lines_rows_read_back_whole_and_its_settle_as_its_doors() {
         }
     }
 }
+
+/// A LEFTOVER'S OR AN OVERLAP'S LEFT LINE READS BACK AT THE TURN END ALONE: neither kind rides a
+/// break ([`FactKind::rides_breaks`]), so its `door=turn-end` left row comes back from
+/// [`left_rows_in`] and a `door=break` one, which no door of it writes, reads as nothing, while a
+/// call at no progress reads back at either door. NEGATIVE CONTROL: read a leftover's left row at
+/// either door, and its `door=break` row comes back.
+#[test]
+fn a_leftover_or_overlap_left_line_reads_back_at_the_turn_end_alone() {
+    let hung = EpisodeKey::no_progress(27098, 7);
+    for kind in FactKind::ALL {
+        let key = if kind == FactKind::NoProgress {
+            hung
+        } else {
+            EpisodeKey { kind, id: 0x5e }
+        };
+        let row_of = |door| {
+            let left_row = LeftRow::Fact { door };
+            let reason = left_reason(left_row, key, LeftSaid::Left { submits: Some(2) });
+            Row {
+                rule_id: kind.rule(),
+                outcome: Outcome::Waiting,
+                command: "the line",
+                reason: &reason,
+                box_seq: 1,
+            }
+            .to_json(1, Some(SID))
+        };
+        let read = |door| {
+            left_rows_in(&row_of(door), Some(SID))
+                .into_iter()
+                .map(|(read, left)| (read, left.row))
+                .collect::<Vec<_>>()
+        };
+        match kind {
+            FactKind::Hold | FactKind::Wake => {}
+            FactKind::NoProgress | FactKind::ProgramCheck => {
+                for door in [FactDoor::Break, FactDoor::TurnEnd] {
+                    assert_eq!(read(door), [(key, LeftRow::Fact { door })], "{kind:?}");
+                }
+            }
+            FactKind::Leftover | FactKind::Overlap => {
+                assert!(!kind.rides_breaks(), "{kind:?}");
+                assert_eq!(
+                    read(FactDoor::TurnEnd),
+                    [(
+                        key,
+                        LeftRow::Fact {
+                            door: FactDoor::TurnEnd
+                        }
+                    )],
+                    "{kind:?}"
+                );
+                assert!(read(FactDoor::Break).is_empty(), "{kind:?} at a break");
+            }
+        }
+    }
+}

@@ -285,7 +285,9 @@ impl Fixture {
             ("ok", i64::from(status == LoginState::Ok)),
             (
                 "renew",
-                i64::from(
+                // The lifetime law alone: whether this Mac uses the login ([`used_here`]) is
+                // the upkeep's separate condition, which this model does not hold.
+                i64::from(without_use_condition(|| {
                     renew_due(
                         &records.roster,
                         &records.logins,
@@ -293,8 +295,8 @@ impl Fixture {
                         &enrolled,
                         NOW,
                     )
-                    .contains(&self.label),
-                ),
+                    .contains(&self.label)
+                })),
             ),
             (
                 "closing",

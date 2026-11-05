@@ -11,7 +11,7 @@
 //! is held to the watchdog's grace.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aterm_capacity::{Admit, Claim, Error, Fixed, Ledger, Need, Pace, Reading, admit_with};
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
@@ -30,6 +30,17 @@ const CHILD: &str = "ATERM_VERIFY_INTERRUPT_REPORT_CHILD";
 /// Set, the stand-in run never reaches its end once it has reported: it naps where it would
 /// die of the signal.
 const HANGS: &str = "ATERM_VERIFY_INTERRUPT_REPORT_HANGS";
+
+/// The watchdog's grace in the stand-in run: the hang detector for one that reports, since its
+/// report must happen however loaded the host, and [`crate::exec::group::REPORT_GRACE`] for one
+/// that [`HANGS`], whose grace must fire.
+fn report_grace(hangs: bool) -> Duration {
+    if hangs {
+        crate::exec::group::REPORT_GRACE
+    } else {
+        MUST_HAPPEN
+    }
+}
 
 /// The stand-in's directory.
 fn standin_dir() -> PathBuf {
@@ -95,18 +106,20 @@ fn standin_disk(dir: &Path) -> atpkg::admit_disk::Run {
         cold: 1 << 30,
         on: dir.to_path_buf(),
         stuck_ends: None,
+        machine: None,
     }
 }
 
 /// Run by the tests below in a process of its own: a verify run of `fmt` and `lint`, its
-/// interrupt handling verify's own, its log a file and its disk claimed ([`standin_disk`]), that
-/// ends as verify's does ([`crate::let_disk_go`], [`crate::end_run`]) unless [`HANGS`] says it
-/// never gets there.
+/// interrupt handling verify's own, held to [`report_grace`], its log a file and its disk claimed
+/// ([`standin_disk`]), that ends as verify's does ([`crate::let_disk_go`], [`crate::end_run`])
+/// unless [`HANGS`] says it never gets there.
 #[test]
 fn standin_run_reports_once_interrupted() {
     let Some(dir) = std::env::var_os(STANDIN).map(PathBuf::from) else {
         return;
     };
+    crate::exec::group::set_report_grace_for_test(report_grace(std::env::var_os(HANGS).is_some()));
     crate::exec::group::kill_on_interrupt();
     let scratch = dir.join("scratch");
     std::fs::create_dir_all(&scratch).expect("the run's scratch");
@@ -151,7 +164,7 @@ fn standin_run_reports_once_interrupted() {
         std::thread::sleep(MUST_HAPPEN * 2);
     }
     let scratch = ctx.scratch.clone();
-    crate::let_disk_go(Some(disk), Some(&mut log));
+    crate::let_disk_go(Some(disk), code == crate::exit::PASS, Some(&mut log));
     crate::end_run(&ctx, &scratch);
     std::process::exit(code);
 }
@@ -208,14 +221,15 @@ fn interrupted(dir: &Path, hangs: bool) -> (std::process::ExitStatus, std::time:
         0,
         "signalled the run"
     );
-    let status = until_within(MUST_HAPPEN, "the run's end", || {
+    let status = until_within(report_grace(hangs) + MUST_HAPPEN, "the run's end", || {
         child.0.try_wait().ok().flatten()
     });
     (status, sent.elapsed(), stage_child)
 }
 
-/// One SIGINT while the tippy stage's child runs: the run still dies of SIGINT, well inside the
-/// one-minute hang detector (the time is reported), and its log holds the quick stage's report,
+/// One SIGINT while the tippy stage's child runs: the run still dies of SIGINT once it has
+/// reported, its report held to the hang detector rather than the watchdog's shipped grace (the
+/// time is reported), and its log holds the quick stage's report,
 /// the tippy stage's (the child ended by the run's end, which decided nothing), the verdict,
 /// COULD NOT RUN, and its disk claim's end, which keeps nothing: the record of what runs of its
 /// scope wrote is as it was, so the next run claims no less for what this one never wrote. Its
@@ -273,8 +287,8 @@ fn an_interrupted_run_writes_its_log_before_it_dies() {
 }
 
 /// A run that reports but never reaches its end still dies of the SIGINT, by its watchdog,
-/// [`crate::exec::group::REPORT_GRACE`] after the groups were ended and inside the one-minute
-/// hang detector. Negative control: with no watchdog the run naps on past the detector.
+/// [`crate::exec::group::REPORT_GRACE`] after the groups were ended and inside the hang detector
+/// past that grace. Negative control: with no watchdog the run naps on past the detector.
 #[test]
 fn an_interrupted_run_that_never_ends_dies_at_the_watchdogs_grace() {
     use std::os::unix::process::ExitStatusExt as _;

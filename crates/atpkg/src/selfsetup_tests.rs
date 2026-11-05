@@ -284,6 +284,45 @@ fn a_scoped_uninstall_leaves_what_another_aterm_uses() {
     );
 }
 
+/// A damaged aterm (its `Info.plist` lost, which an install repairs) still runs on the account's
+/// store. Nothing proves it is something else, so a decline a sweep recorded stays with it and a
+/// scoped sweep keeps what it uses; a readable identifier naming another app does prove that.
+#[test]
+fn an_uninstall_keeps_what_a_damaged_aterm_may_use() {
+    let mut a = Account::new("damaged");
+    let home = a.home().to_path_buf();
+    let support = home.join("Library/Application Support/aterm");
+    let swept = a.dir.join("swept.log");
+    let atpkg = sweeping_atpkg(&support, &swept);
+    let damaged = home.join("Applications/aterm.app");
+    exe(&damaged.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 0\n");
+    let decline = support.join("pkg/declined");
+    write(&decline, format!("{SWEPT_DECLINE_TAG}\n"));
+    let (_, out, _) = a.sweep(None, false);
+    assert!(damaged.exists(), "only a proven aterm is deleted: {out}");
+    assert!(decline.is_file(), "the decline stays with it: {out}");
+    std::fs::remove_file(&decline).expect("rm");
+
+    bundle(&home.join("aterm.app"), Some(&atpkg));
+    aterm_spec::wait::first_exec(&home.join("aterm.app/Contents/MacOS/atpkg"), &["--version"]);
+    a.places.install_dir = Some(home.clone());
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    assert!(!swept.exists(), "the store it runs on stays: {out}");
+    assert!(!home.join("aterm.app").exists(), "{out}");
+    assert!(damaged.exists(), "{out}");
+
+    write(
+        &damaged.join("Contents/Info.plist"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n\
+         <key>CFBundleIdentifier</key><string>com.example.other</string></dict></plist>\n",
+    );
+    bundle(&home.join("aterm.app"), Some(&atpkg));
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    assert!(swept.exists(), "another app's bundle keeps nothing: {out}");
+}
+
 #[test]
 fn shell_setup_selects_the_cli_before_an_inherited_bundle_and_preserves_the_profile() {
     let fish = aterm_spec::host::need_tool("fish");

@@ -18,8 +18,6 @@
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
-#[cfg(all(test, target_os = "macos"))]
-aterm_secrets::memoized_x25519_in_tests!();
 
 use aterm_containment::consent::{
     DEBUGGER_ACCESS_REVERT, DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel,
@@ -37,6 +35,7 @@ mod driver;
 /// `aterm doctor`'s own rows as converge items; `crates/aterm` composes them with the packages'
 /// repair items and `aterm pkg doctor`.
 pub mod doctor;
+mod doctor_leftovers;
 mod manual;
 mod spotlight;
 
@@ -1028,7 +1027,8 @@ fn read_log_tail(path: &std::path::Path, tail: u64) -> Option<String> {
     if cut {
         file.seek(SeekFrom::Start(len - tail)).ok()?;
     }
-    let mut bytes = Vec::new();
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(len.min(tail).saturating_add(1)).unwrap_or(0));
     file.take(tail).read_to_end(&mut bytes).ok()?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
     Some(if cut {
@@ -1586,6 +1586,8 @@ struct FactReads<'a> {
     /// The `end=` token the leftover view offers a pid ([`offered_token_live`]), asked only of an
     /// unsupervised broker ([`aterm_ctl::census::supervise`]).
     offered: &'a (dyn Fn(u32) -> Option<String> + Sync),
+    /// The `leftovers:` row's facts ([`doctor_leftovers::fact`]).
+    leftovers: &'a (dyn Fn() -> doctor_leftovers::LeftoversFact + Sync),
     /// [`person_here`]: a hand-over may follow the report.
     person_here: &'a (dyn Fn() -> bool + Sync),
 }
@@ -1607,6 +1609,7 @@ impl FactReads<'static> {
         fabric: &fabric_fact,
         awake: &awake_fact,
         offered: &offered_token_live,
+        leftovers: &doctor_leftovers::fact,
         person_here: &person_here,
     };
 }
@@ -1675,11 +1678,17 @@ struct FactsRead {
 
 /// [`doctor_facts_rows`] over `ports`.
 fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_>) -> FactsRead {
-    let program_check = ["syspolicyd:", "devtools:", "instances:", "fabric:"]
-        .into_iter()
-        .any(reads)
-        .then(ports.program_check)
-        .flatten();
+    let program_check = [
+        "syspolicyd:",
+        "devtools:",
+        "instances:",
+        "fabric:",
+        "leftovers:",
+    ]
+    .into_iter()
+    .any(reads)
+    .then(ports.program_check)
+    .flatten();
     let withheld = args_read_withheld(program_check.as_ref());
     let withheld = withheld.as_deref();
     fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
@@ -1705,6 +1714,12 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
             })
         });
         let fabric = reads("fabric:").then(|| scope.spawn(move || (ports.fabric)(withheld)));
+        let leftovers = reads("leftovers:").then(|| {
+            scope.spawn(move || match withheld {
+                Some(why) => Err(why.to_owned()),
+                None => (ports.leftovers)(),
+            })
+        });
         let awake = reads("awake:").then(|| scope.spawn(ports.awake));
         let recovery = if reads("recovery:") {
             recovery_facts()
@@ -1725,6 +1740,7 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
             shim_cache: reads("services:").then(shim_cache_fact).flatten(),
             network: reads("network:").then(network_fact).flatten(),
             program_check,
+            leftovers: leftovers.map(join),
             ..MachineFacts::absent()
         };
         let privacy = privacy.map_or_else(
@@ -1841,6 +1857,9 @@ struct MachineFacts {
     network: Option<(bool, String)>,
     /// macOS: whether aCaffeine keeps this Mac awake now ([`awake_fact`]).
     awake: Option<aterm_acaffeine::held::Held>,
+    /// What closed tabs and dead verify runs left running ([`doctor_leftovers::fact`]); `None`
+    /// where the row was not read.
+    leftovers: Option<doctor_leftovers::LeftoversFact>,
 }
 
 impl MachineFacts {
@@ -1855,6 +1874,7 @@ impl MachineFacts {
             services: None,
             shim_cache: None,
             network: None,
+            leftovers: None,
         }
     }
 }
@@ -1994,7 +2014,7 @@ fn offered_token_live(pid: u32) -> Option<String> {
             aterm_uds::control_socket_dir().is_some_and(|dir| aterm_ctl::graph_writer(&dir, pid))
         },
     };
-    let facts = aterm_uds::left::read_one(&kernel, pid, &known)?;
+    let facts = aterm_uds::left::read_one(&kernel, pid, &known).ok()??;
     offered_token(&facts, kernel.launchd_version(), me)
 }
 
@@ -2238,6 +2258,23 @@ const fn fabric_mark(level: aterm_link::fabric::SummaryLevel) -> Mark {
         SummaryLevel::Note => Mark::Note,
         SummaryLevel::Warn => Mark::Warn,
     }
+}
+
+fn leftovers_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
+    facts
+        .leftovers
+        .as_ref()
+        .map(|fact| {
+            let (mark, words) = doctor_leftovers::row(fact);
+            DoctorRow {
+                label: "leftovers:",
+                mark,
+                fact: words,
+                unmeasured: fact.is_err(),
+            }
+        })
+        .into_iter()
+        .collect()
 }
 
 fn fabric_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
@@ -3420,6 +3457,7 @@ fn doctor_rows(
         fact: instances_fact,
         unmeasured: instances.is_err(),
     });
+    checks.extend(leftovers_rows(machine));
     checks.extend(fabric_rows(machine));
     checks.extend([
         DoctorRow {
@@ -3975,7 +4013,12 @@ fn ensure_agents_dir(prefix: &std::path::Path, dir: &std::path::Path) -> Result<
     match builder.create(dir) {
         Ok(()) => {
             if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == mode) {
-                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+                use std::os::unix::fs::OpenOptionsExt as _;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(dir)
+                    .and_then(|f| f.set_permissions(std::fs::Permissions::from_mode(mode)))
                     .map_err(|error| format!("{}: {error}", dir.display()))?;
             }
             Ok(())
@@ -5804,21 +5847,10 @@ mod tests {
         let both = config_path_paragraph_with(Some(file), Some((&split, home)));
         assert!(both.starts_with(alone.trim_end_matches('\n')), "{both}");
         let flat = both.split_whitespace().collect::<Vec<_>>().join(" ");
-        let here_rel = format!(
-            "Not the app's: this aterm reads ~/{}",
-            std::path::Path::new("dots/aterm")
-                .join("aterm.toml")
-                .display()
-        );
-        let app_rel = format!(
-            "reads ~/{} (launchd gives apps no XDG_CONFIG_HOME)",
-            std::path::Path::new(".config/aterm")
-                .join("aterm.toml")
-                .display()
-        );
+        // A path under the home reads `~/…` joined by `/` on every platform (`Split::shown`).
         for said in [
-            here_rel.as_str(),
-            app_rel.as_str(),
+            "Not the app's: this aterm reads ~/dots/aterm/aterm.toml",
+            "reads ~/.config/aterm/aterm.toml (launchd gives apps no XDG_CONFIG_HOME)",
             "they differ in update.enabled",
             "ln -s /h/dots/aterm /h/.config/aterm (undo: rm /h/.config/aterm)",
         ] {
@@ -6640,6 +6672,60 @@ mod tests {
         }
     }
 
+    /// THE LEFTOVERS ROW IS WITHHELD WHILE THE CHECK IS FULL: its reads take each candidate's
+    /// marker variables, an environment read, which would wait on a program the full pool holds
+    /// mid-start, so the row says why and its probe is never asked. NEGATIVE CONTROL: read it
+    /// anyway, and the probe is asked.
+    #[cfg(unix)]
+    #[test]
+    fn leftovers_row_is_withheld_while_the_check_is_full() {
+        use aterm_uds::program_check::{Daemon, Look, Reading};
+        let full = || {
+            Some(Look::Read(Reading {
+                daemon: Daemon {
+                    pid: 690,
+                    start_s: 1,
+                    start_us: 0,
+                },
+                workers: 95,
+                at_limit: true,
+                limit: Some(90),
+            }))
+        };
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let leftovers = || {
+            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(super::doctor_leftovers::Leftovers::default())
+        };
+        let ports = super::FactReads {
+            program_check: &full,
+            devtools: &|_, _| (DevtoolsFacts::absent(), None),
+            spotlight: &|| None,
+            services: &|| None,
+            privacy: &unmeasured,
+            debugger: &no_debugger,
+            instances: &no_census,
+            fabric: &|_| None,
+            awake: &|| None,
+            offered: &|_| None,
+            leftovers: &leftovers,
+            person_here: &|| false,
+        };
+        let rows = super::facts_rows_over(false, &|label| label == "leftovers:", &ports).rows;
+        let row = rows
+            .iter()
+            .find(|r| r.label == "leftovers:")
+            .expect("the row is said, withheld");
+        assert!(
+            row.fact
+                .starts_with("not measured (macOS's program check (syspolicyd) is at the kernel's"),
+            "{}",
+            row.fact
+        );
+        assert!(row.unmeasured);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     /// While the program check's pool is at the kernel's limit, doctor lists no
     /// program's command line, and the reason the census and the fabric rows give carries
     /// the reading itself.
@@ -6726,6 +6812,7 @@ mod tests {
             shim_cache: None,
             network: None,
             awake: None,
+            leftovers: None,
         };
         let report = |d: &DevtoolsFacts| {
             doctor_checks_with_origin(
@@ -6972,6 +7059,10 @@ mod tests {
                     self.read("offered");
                     None
                 },
+                leftovers: &|| {
+                    self.read("leftovers");
+                    Err("not read".to_owned())
+                },
                 person_here: &|| false,
             };
             let rows = super::facts_rows_over(false, reads, &ports).rows;
@@ -7056,6 +7147,7 @@ mod tests {
                 "devtools",
                 "fabric",
                 "instances",
+                "leftovers",
                 "privacy",
                 "services",
                 "spotlight"
@@ -7076,13 +7168,13 @@ mod tests {
     fn doctors_own_probes_read_at_once() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let all = CountedReads::new(Some(std::sync::Barrier::new(8)));
+            let all = CountedReads::new(Some(std::sync::Barrier::new(9)));
             let _ = tx.send(all.rows(&|label| super::doctor::reads(&[], label)).1);
         });
         let read = rx
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the probes never met: one waited for another to finish");
-        assert_eq!(read.len(), 8, "{read:?}");
+        assert_eq!(read.len(), 9, "{read:?}");
     }
 
     fn devtools_facts_with(list: aterm_containment::DevToolList) -> atpkg::devtools::Facts {
@@ -7540,6 +7632,7 @@ mod tests {
                 fabric: &|_| None,
                 awake: &|| None,
                 offered: &|_| None,
+                leftovers: &|| Err("not read".to_owned()),
                 person_here: &person,
             };
             super::facts_rows_over(fix, &|label| label == "privacy:", &ports)

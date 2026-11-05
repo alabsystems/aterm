@@ -17,6 +17,7 @@
 //! so a refill's hold of the log lock shows as the writer's stall.
 
 use std::collections::HashMap;
+use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -24,7 +25,7 @@ use aterm_link::ctl::Ctl;
 
 use super::{await_note, list_since, newest_id, post, request};
 use crate::clock::{Clock, ms};
-use crate::harness::{FLEET, World, until};
+use crate::harness::{DEADLINE, FLEET, World, until};
 
 /// The filler's producer id: one per population, `+ size index`.
 pub const FILL_PRODUCER: u64 = 0x0fab_0b09_0000_0000;
@@ -108,18 +109,91 @@ pub fn seed_seen(
 /// pipelined: how long the fill took, in ms.
 pub fn fill(w: &World, producer: u64, n: usize) -> f64 {
     let subject = fill_subject(&w.node);
-    let bodies: Vec<&[u8]> = vec![&FILL_BODY[..]; n];
     let mut god = w.god();
     let t0 = Instant::now();
-    let acks = god
-        .publish_pipelined(producer, &subject, &bodies, FILL_WINDOW)
+    fill_records(&mut god, producer, &subject, n)
         .unwrap_or_else(|e| panic!("fill {n} records on {subject}: {e}"));
-    assert_eq!(acks.len(), n, "every filler record acked");
-    assert!(
-        acks.iter().all(|(_, deduped)| !deduped),
-        "a filler record was deduped: producer {producer:#x} was used before"
-    );
     t0.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Fill in bounded coalesced windows. Drain every response before backoff and
+/// retry only refused sequences: later successes in the same window stay paid.
+/// A minute without a new acknowledgement is the hang detector, not a total
+/// fill budget; a large backlog may legitimately take longer under a quota.
+fn fill_records<S: Read + Write>(
+    client: &mut astream_broker::Client<S>,
+    producer: u64,
+    subject: &str,
+    n: usize,
+) -> io::Result<()> {
+    use astream_broker::{Pipelined, broker_refusal};
+
+    if client.owed_acks() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fill owes earlier acknowledgements",
+        ));
+    }
+    let window = FILL_WINDOW.min(astream_broker::Client::<S>::MAX_PIPELINE_WINDOW);
+    let mut progress = Instant::now();
+    for start in (0..n).step_by(window) {
+        let mut pending: Vec<u64> = (start..n.min(start.saturating_add(window)))
+            .map(|index| index as u64 + 1)
+            .collect();
+        while !pending.is_empty() {
+            if progress.elapsed() >= DEADLINE {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "backlog fill made no progress",
+                ));
+            }
+            let burst: Vec<_> = pending
+                .iter()
+                .map(|&producer_seq| Pipelined::Publish {
+                    producer_id: producer,
+                    producer_seq,
+                    subject,
+                    body: &FILL_BODY,
+                })
+                .collect();
+            client.send_pipelined(&burst)?;
+            let mut retry = Vec::new();
+            let mut wait = Duration::ZERO;
+            let mut failure = None;
+            for seq in pending {
+                match client.recv_publish_ack() {
+                    Ok((_, false)) => progress = Instant::now(),
+                    Ok((_, true)) => {
+                        failure.get_or_insert_with(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "a filler record was deduped: its producer was used before",
+                            )
+                        });
+                    }
+                    Err(error) => {
+                        let Some(refusal) = broker_refusal(&error) else {
+                            return Err(error);
+                        };
+                        if let Some(ms) = refusal.retry_after_ms().filter(|&ms| ms > 0) {
+                            wait = wait.max(Duration::from_millis(ms));
+                            retry.push(seq);
+                        } else {
+                            failure.get_or_insert(error);
+                        }
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            if !retry.is_empty() {
+                std::thread::sleep(wait.min(DEADLINE.saturating_sub(progress.elapsed())));
+            }
+            pending = retry;
+        }
+    }
+    Ok(())
 }
 
 /// One paced publish: when it was sent, and when its ack came, on the run's clock.
@@ -223,6 +297,77 @@ pub fn held(broker: &astream_broker::Broker) -> Held {
     }
 }
 
+/// The broker's residency tier's tally since its open (astream's `TierTally`, D10f): its
+/// pushes, its one-record reads by index (a cold read two), its walks over a range of summaries
+/// and the rows they read (a filtered read's scan, `Tier::scan`, is a walk and its records are
+/// rows), its subject walks and the pages they read, and the values it read from its wide
+/// maps. Read around a restart as its cold reads are, so an attach's cost is put down to the
+/// pages' code, or not, by a count. A build with debug assertions counts it (the `opt`
+/// profile's); a build without them (`--profile shipped`) counts nothing and reads `None`.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn tier_tally(broker: &astream_broker::Broker) -> Option<astream_broker::TierTally> {
+    Some(broker.tier_tally())
+}
+
+/// The broker's residency tier's tally: `None`, since a build without debug assertions counts
+/// nothing.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub fn tier_tally(_broker: &astream_broker::Broker) -> Option<astream_broker::TierTally> {
+    None
+}
+
+/// One count of a tally as the report carries it: its key in the JSON, its column in the
+/// markdown table, and the count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierCount {
+    pub key: &'static str,
+    pub column: &'static str,
+    pub n: u64,
+}
+
+/// Every count of `t`, in the order the report's table prints them. The pattern names each of
+/// astream's fields, so a count astream adds fails to compile here until the report carries
+/// it; the table's heading and the JSON's keys are read from the same list.
+#[must_use]
+pub fn tier_counts(t: astream_broker::TierTally) -> [TierCount; 7] {
+    let astream_broker::TierTally {
+        pushes,
+        lookups,
+        walks,
+        rows,
+        namings,
+        named_pages,
+        wide,
+    } = t;
+    let c = |key, column, n| TierCount { key, column, n };
+    [
+        c("pushes", "pushes", pushes),
+        c("lookups", "lookups", lookups),
+        c("walks", "walks", walks),
+        c("rows", "rows walked", rows),
+        c("namings", "subject walks", namings),
+        c("named_pages", "pages named", named_pages),
+        c("wide", "wide", wide),
+    ]
+}
+
+/// `t` as the report's JSON carries it: an object of [`tier_counts`] by their keys.
+#[must_use]
+pub fn tier_json(t: astream_broker::TierTally) -> aterm_json::Value {
+    aterm_json::Value::Object(
+        tier_counts(t)
+            .into_iter()
+            .map(|c| (c.key.to_string(), aterm_json::Value::from(c.n)))
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+#[path = "backlog_fill_tests.rs"]
+mod fill_tests;
+
 #[cfg(test)]
 mod tests {
     /// The spec's bound on the backlog is astream's and aterm's own arithmetic: a filler
@@ -281,5 +426,38 @@ mod tests {
         assert_eq!((inside, outside), (vec![1.0], vec![0.2]));
         let (inside, outside) = split(&beats, &[]);
         assert_eq!((inside.len(), outside.len()), (0, 2));
+    }
+
+    /// Each of a tally's counts reaches the report once, under a JSON key and a table column of
+    /// its own: a tally whose counts all differ comes back as each of them once, and the JSON
+    /// holds each under its key.
+    #[test]
+    fn every_count_of_a_tally_reaches_the_report_once() {
+        use super::*;
+
+        let t = astream_broker::TierTally {
+            pushes: 1,
+            lookups: 2,
+            wide: 3,
+            walks: 4,
+            rows: 5,
+            namings: 6,
+            named_pages: 7,
+        };
+        let counts = tier_counts(t);
+        let mut ns: Vec<u64> = counts.iter().map(|c| c.n).collect();
+        ns.sort_unstable();
+        assert_eq!(ns, (1..=7).collect::<Vec<u64>>());
+        let keys: std::collections::BTreeSet<_> = counts.iter().map(|c| c.key).collect();
+        let columns: std::collections::BTreeSet<_> = counts.iter().map(|c| c.column).collect();
+        assert_eq!((keys.len(), columns.len()), (counts.len(), counts.len()));
+        let json = tier_json(t);
+        for c in counts {
+            assert_eq!(
+                json.get(c.key).and_then(aterm_json::Value::as_u64),
+                Some(c.n),
+                "{c:?}"
+            );
+        }
     }
 }

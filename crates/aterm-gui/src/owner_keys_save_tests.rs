@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+use aterm_window::event::InputOrigin;
+
 use super::JournalSlot;
 use crate::document_store::DocumentId;
 use crate::native_app::{AppEvent, AppKind, TextInputEvent};
@@ -285,19 +287,27 @@ fn a_recovered_drafts_owner_keys_are_saved_by_no_persons_save() {
 /// A SAVE QUEUED BEHIND ONE IN FLIGHT IS REPLAYED FOR WHOEVER ASKED: a control client's Save of
 /// the person's note, asked while the person's theme edit is being written, is replayed as the
 /// control client's when that write lands, so the `occupancy = "prompt"` the person typed in
-/// between waits for the person's own Save; so is an accessibility client's Save; a person's
-/// Save merged into the queue makes the replay the person's.
+/// between waits for the person's own Save, and so is an accessibility client's Save and a Save
+/// another process's key or click chose ([`Unvouched::Relayed`]); a person's Save merged into
+/// the queue makes the replay the person's.
 /// NEGATIVE CONTROL: with the queue forgetting who asked (`QueueDropsSource`), the control
-/// client's replay writes it.
+/// client's replay writes it; with the queue asking only whether a control client asked
+/// (`App::person_gesture_refused`), the relayed Save's replay wrote it.
 #[test]
 fn a_queued_save_is_replayed_for_whoever_asked() {
     const THEME: &str = "window_theme = \"dark\"\n";
     const NOTE: &str = "# the person's note\n";
-    for (asker, person_too, planted) in [
-        (Unvouched::Controller, false, false),
-        (Unvouched::Controller, true, false),
-        (Unvouched::Controller, false, true),
-        (Unvouched::Assistive, false, false),
+    use crate::app_take_over::GestureMarks;
+    let assistive = GestureMarks {
+        assistive: true,
+        ..GestureMarks::default()
+    };
+    for (by, person_too, planted) in [
+        (GestureMarks::of(InputOrigin::Posted), false, false),
+        (GestureMarks::of(InputOrigin::Posted), true, false),
+        (GestureMarks::of(InputOrigin::Posted), false, true),
+        (assistive, false, false),
+        (GestureMarks::of(InputOrigin::Relayed), false, false),
     ] {
         let dir = aterm_tempfile::tempdir().unwrap();
         let (mut app, path, document) = manual(dir.path());
@@ -307,10 +317,9 @@ fn a_queued_save_is_replayed_for_whoever_asked() {
         // An edit past the save in flight, so the queued save has something to replay.
         append(&mut app, false, NOTE);
         let queue = |app: &mut App| {
-            match asker {
-                Unvouched::Assistive => app.with_assistive_source(|app| save(app, false)),
-                _ => save(app, true),
-            }
+            app.with_gesture_marks(by, |app| {
+                app.dispatch_native_event(WID, AppEvent::EditorCommand(EditorCommand::Save))
+            })
             .expect("queued behind the save in flight");
         };
         if planted {
@@ -323,7 +332,7 @@ fn a_queued_save_is_replayed_for_whoever_asked() {
             save(&mut app, false).expect("the person's Save, queued too");
         }
         let landed = app.land_held_document_save_for_test(document, view, held);
-        let case = format!("asker={asker:?} person_too={person_too} planted={planted}");
+        let case = format!("{by:?} person_too={person_too} planted={planted}");
         if person_too || planted {
             landed.expect(&case);
             assert_eq!(
@@ -399,6 +408,7 @@ fn the_fence_decides_from_the_saves_provenance_and_both_texts() {
         Provenance::new(true, None),
         Provenance::new(false, Some(Unvouched::Controller)),
         Provenance::new(false, Some(Unvouched::Assistive)),
+        Provenance::new(false, Some(Unvouched::Relayed)),
         Provenance::new(false, Some(Unvouched::Recovered)),
     ] {
         assert!(provenance.fenced(), "{provenance:?}");
@@ -747,32 +757,45 @@ fn an_accessibility_clients_save_keeps_the_owners_keys() {
     }
 }
 
-/// A PALETTE PASTE AN ACCESSIBILITY CLIENT CHOSE IS NO PERSON'S EDIT: the palette posts its Edit
-/// rows to the event loop, so the origin it posts carries the marks of the gesture that chose
-/// the row and the row runs under them at the wake ([`App::run_posted_menu_action`]). The
-/// clipboard's `occupancy = "prompt"` pasted by a row a palette Click through the window's
-/// accessibility tree chose (taken under the mark [`App::on_accessibility_action`] sets) is
-/// refused by the person's Save, the file unchanged.
-/// NEGATIVE CONTROL: the same row the person chose pastes, and the person's Save writes it.
+/// A PALETTE PASTE NO PERSON CHOSE IS NO PERSON'S EDIT: the palette posts its Edit rows to the
+/// event loop, so the origin it posts carries the marks of the gesture that chose the row and the
+/// row runs under them at the wake ([`App::run_posted_menu_action`]). The clipboard's `occupancy
+/// = "prompt"` pasted by a row a palette Click through the window's accessibility tree chose
+/// (taken under the mark [`App::on_accessibility_action`] sets), or a key another process posted
+/// chose (taken under the relayed mark [`App::with_origin_mark`] sets), is refused by the
+/// person's Save, the file unchanged.
+/// NEGATIVE CONTROL: the same row the person chose pastes, and the person's Save writes it. With
+/// the relayed mark left out of the marks a post carries ([`App::gesture_marks`]), the relayed
+/// row's origin carried none; left out of the marks the row runs under
+/// (`GestureMarks::union` of the post's and its chooser's), its paste left the buffer unmarked.
 #[test]
-fn a_palette_paste_an_accessibility_client_chose_is_no_persons_edit() {
+fn a_palette_paste_no_person_chose_is_no_persons_edit() {
+    use aterm_window::event::InputOrigin;
+
     use crate::app_take_over::GestureMarks;
     use crate::menu::MenuAction;
-    for assistive in [true, false] {
+    for chooser in [Some(Unvouched::Assistive), Some(Unvouched::Relayed), None] {
         let dir = aterm_tempfile::tempdir().unwrap();
         let (mut app, path, document) = manual(dir.path());
         app.dispatch_native_event(WID, AppEvent::EditorCommand(EditorCommand::EndOfBuffer))
             .unwrap();
-        let origin = if assistive {
-            app.with_assistive_source(|app| app.palette_menu_origin(WID))
-        } else {
-            app.palette_menu_origin(WID)
+        let origin = match chooser {
+            Some(Unvouched::Assistive) => {
+                app.with_assistive_source(|app| app.palette_menu_origin(WID))
+            }
+            Some(_) => {
+                app.with_origin_mark(InputOrigin::Relayed, |app| app.palette_menu_origin(WID))
+            }
+            None => app.palette_menu_origin(WID),
         }
         .expect("a palette origin");
-        let case = format!("assistive={assistive}");
+        let case = format!("chooser={chooser:?}");
         assert_eq!(
-            origin.assistive(),
-            assistive,
+            (origin.assistive(), origin.relayed()),
+            (
+                chooser == Some(Unvouched::Assistive),
+                chooser == Some(Unvouched::Relayed)
+            ),
             "{case}: the chooser's mark rides the post"
         );
         crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = Some(PROMPT.to_string()));
@@ -793,15 +816,16 @@ fn a_palette_paste_an_accessibility_client_chose_is_no_persons_edit() {
             format!("{DISK}{PROMPT}"),
             "{case}: the paste reached the buffer"
         );
+        assert_eq!(
+            app.native_documents.unvouched.get(&document).copied(),
+            chooser,
+            "{case}"
+        );
         let saved = save(&mut app, false);
-        if assistive {
+        if let Some(mark) = chooser {
             assert_eq!(
                 saved,
-                Err(fenced(
-                    Provenance::new(false, Some(Unvouched::Assistive)),
-                    &app,
-                    document
-                )),
+                Err(fenced(Provenance::new(false, Some(mark)), &app, document)),
                 "{case}"
             );
             assert_eq!(
@@ -813,5 +837,421 @@ fn a_palette_paste_an_accessibility_client_chose_is_no_persons_edit() {
             saved.expect(&case);
             assert_eq!(on_disk(&path), format!("{DISK}{PROMPT}"), "{case}");
         }
+    }
+}
+
+/// A process other than this one: System Events, or a program in a tab.
+fn elsewhere() -> i64 {
+    i64::from(std::process::id()) + 1
+}
+
+/// A stamp no other native event in this thread has.
+fn stamp() -> f64 {
+    thread_local! {
+        static STAMPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    STAMPS.with(|stamps| {
+        stamps.set(stamps.get() + 1);
+        8_000.0 + f64::from(stamps.get())
+    })
+}
+
+/// A native key-down from the process `source_pid` names.
+fn native_key(keycode: u16, source_pid: i64) -> crate::hwkey::NativeInput {
+    crate::hwkey::NativeInput {
+        kind: crate::hwkey::NS_EVENT_TYPE_KEY_DOWN,
+        keycode,
+        timestamp: stamp(),
+        source_pid,
+    }
+}
+
+/// A native left-button mouse-up from the process `source_pid` names: the click that chooses a
+/// menu or toolbar item.
+#[cfg(unix)]
+fn native_click(source_pid: i64) -> crate::hwkey::NativeInput {
+    crate::hwkey::NativeInput {
+        kind: crate::hwkey::NS_EVENT_TYPE_LEFT_MOUSE_UP,
+        keycode: 0,
+        timestamp: stamp(),
+        source_pid,
+    }
+}
+
+/// Where a native menu or toolbar item chosen by `chooser` (the event AppKit is dispatching as
+/// the item's callback runs, the test build's stand-in) is posted from
+/// ([`crate::tab_spawn::native_post_origin`]).
+#[cfg(unix)]
+fn chosen_by(chooser: crate::hwkey::NativeInput) -> InputOrigin {
+    crate::hwkey::CURRENT_INPUT_STUB.with(|current| current.set(Some(chooser)));
+    let by = crate::tab_spawn::native_post_origin();
+    crate::hwkey::CURRENT_INPUT_STUB.with(|current| current.set(None));
+    by
+}
+
+/// One press of `ch` with `mods` held through the winit key arm's dispatch
+/// ([`App::dispatch_hw_key`]), its native key from `source_pid`: the event AppKit dispatches,
+/// told apart as it arrives (`crate::arriving_input_origin`).
+fn press(app: &mut App, ch: char, mods: aterm_window::keyboard::ModifiersState, source_pid: i64) {
+    use aterm_window::event::{DeviceId, ElementState, KeyEvent, WindowEvent};
+    use aterm_window::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr};
+    let (code, keycode) = match ch {
+        's' => (KeyCode::KeyS, 1),
+        'x' => (KeyCode::KeyX, 7),
+        '#' => (KeyCode::Digit3, 20),
+        other => panic!("no key code for {other:?}"),
+    };
+    let text = SmolStr::new(ch.to_string());
+    let event = KeyEvent::synthetic_for_test(
+        PhysicalKey::Code(code),
+        Key::Character(text.clone()),
+        Some(text),
+        KeyLocation::Standard,
+        ElementState::Pressed,
+        false,
+    );
+    let arrived = WindowEvent::KeyboardInput {
+        device_id: DeviceId::dummy(),
+        event: event.clone(),
+        is_synthetic: false,
+    };
+    app.windows.get_mut(&WID).unwrap().mods = mods;
+    crate::hwkey::CURRENT_INPUT_STUB
+        .with(|current| current.set(Some(native_key(keycode, source_pid))));
+    let origin = crate::arriving_input_origin(&arrived);
+    app.dispatch_hw_key(WID, event, origin);
+    crate::hwkey::CURRENT_INPUT_STUB.with(|current| current.set(None));
+    app.windows.get_mut(&WID).unwrap().mods = ModifiersState::empty();
+}
+
+/// C-x C-s, both keys from `source_pid`.
+fn chord_save(app: &mut App, source_pid: i64) {
+    use aterm_window::keyboard::ModifiersState;
+    press(app, 'x', ModifiersState::CONTROL, source_pid);
+    press(app, 's', ModifiersState::CONTROL, source_pid);
+}
+
+/// A KEY ANOTHER PROCESS POSTED IS NO PERSON'S FOR THE OWNER'S KEYS: System Events' `keystroke`,
+/// or `CGEventPost` from a program in a tab (which inherits aterm's Accessibility grant), reaches
+/// the window as a native key whose source is that process (`hwkey::NativeInput::source_pid`).
+/// One such key typed into the aterm.toml in force marks the buffer ([`Unvouched::Relayed`]), so
+/// the person's own Save of their `occupancy = "prompt"` is refused, and C-x C-s from it of the
+/// person's own edit is refused too, while the same chord saves a key that is not the owner's;
+/// the person's Save then writes the owner key.
+/// NEGATIVE CONTROL: the same keys from a keyboard ([`crate::hwkey::HID_SYSTEM`]) are the
+/// person's: the typed key leaves no mark and C-x C-s writes the owner key. With the source
+/// unread (`hwkey::NativeInput::relayed` answering false, as the classifier was), the other
+/// process's keys left no mark and their C-x C-s wrote the owner key.
+#[test]
+fn a_key_another_process_posted_is_no_persons_for_the_owner_keys() {
+    use aterm_window::keyboard::ModifiersState;
+    for source in [elsewhere(), crate::hwkey::HID_SYSTEM] {
+        let relayed = source != crate::hwkey::HID_SYSTEM;
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (mut app, path, document) = manual(dir.path());
+        append(&mut app, false, PROMPT);
+        press(&mut app, '#', ModifiersState::empty(), source);
+        assert_eq!(
+            app.native_documents.unvouched.get(&document).copied(),
+            relayed.then_some(Unvouched::Relayed),
+            "source {source}"
+        );
+        let saved = save(&mut app, false);
+        if relayed {
+            assert_eq!(
+                saved.unwrap_err(),
+                fenced(
+                    Provenance::new(false, Some(Unvouched::Relayed)),
+                    &app,
+                    document
+                )
+            );
+            assert_eq!(on_disk(&path), DISK, "the refused save wrote nothing");
+        } else {
+            saved.expect("the person's key and Save");
+            assert_eq!(on_disk(&path), format!("{DISK}{PROMPT}#"));
+        }
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (mut app, path, document) = manual(dir.path());
+        append(&mut app, false, PROMPT);
+        chord_save(&mut app, source);
+        if relayed {
+            assert_eq!(
+                on_disk(&path),
+                DISK,
+                "another process's C-x C-s wrote nothing"
+            );
+            assert_eq!(app.document_store.dirty(document), Some(true));
+            save(&mut app, false).expect("the person's own Save");
+        }
+        assert_eq!(on_disk(&path), format!("{DISK}{PROMPT}"), "source {source}");
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (mut app, path, _) = manual(dir.path());
+        let edit = "window_theme = \"dark\"\n";
+        append(&mut app, false, edit);
+        chord_save(&mut app, source);
+        assert_eq!(
+            on_disk(&path),
+            format!("{DISK}{edit}"),
+            "no owner key changed"
+        );
+    }
+}
+
+/// A MENU ITEM ANOTHER PROCESS'S KEY OR CLICK CHOSE IS NO PERSON'S FOR THE OWNER'S KEYS: the
+/// item's callback reads the native source of the key equivalent (⌘S) or of the click (a
+/// `CGEventPost` mouse-up on Edit ▸ Paste) that chose it as it runs
+/// ([`crate::tab_spawn::native_post_origin`]), and the item runs marked by it
+/// ([`App::run_posted_menu_action`]). So Edit ▸ Paste of the person's clipboard holding
+/// `occupancy = "prompt"` marks the buffer and the person's Save is refused, and File ▸ Save of
+/// the person's own owner key is refused, whether a key or a click chose it; the person's Save
+/// then writes it.
+/// NEGATIVE CONTROL: the same key or click from the HID system pastes and saves. With the source
+/// unread, another process's ⌘S wrote the owner key; with a click's source unread (`classify`
+/// relaying keys alone, as the branch read only keys at `a2f973cd8f`), another process's click on
+/// Save, and on Paste then Save, wrote the owner key.
+#[cfg(unix)]
+#[test]
+fn a_menu_item_another_processs_key_or_click_chose_is_no_persons_for_the_owner_keys() {
+    use crate::menu::MenuAction;
+    for source in [elsewhere(), crate::hwkey::HID_SYSTEM] {
+        let relayed = source != crate::hwkey::HID_SYSTEM;
+        let want = if relayed {
+            InputOrigin::Relayed
+        } else {
+            InputOrigin::Person
+        };
+        for chooser in [native_key(1, source), native_click(source)] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let (mut app, path, document) = manual(dir.path());
+            append(&mut app, false, PROMPT);
+            let by = chosen_by(chooser);
+            assert_eq!(by, want, "source {source}, chooser {chooser:?}");
+            app.pending_action_refusal = None;
+            app.run_posted_menu_action(
+                MenuAction::Save,
+                None,
+                crate::app_take_over::GestureMarks::of(by),
+                App::dispatch_document_menu_action,
+            );
+            if relayed {
+                assert_eq!(
+                    app.pending_action_refusal.take(),
+                    Some(fenced(Provenance::new(true, None), &app, document)),
+                    "chooser {chooser:?}"
+                );
+                assert_eq!(on_disk(&path), DISK);
+                save(&mut app, false).expect("the person's own Save");
+            } else {
+                assert_eq!(app.pending_action_refusal, None, "the person's {chooser:?}");
+            }
+            assert_eq!(on_disk(&path), format!("{DISK}{PROMPT}"));
+        }
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (mut app, path, document) = manual(dir.path());
+        app.dispatch_native_event(WID, AppEvent::EditorCommand(EditorCommand::EndOfBuffer))
+            .unwrap();
+        crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = Some(PROMPT.into()));
+        let by = chosen_by(native_click(source));
+        app.run_posted_menu_action(
+            MenuAction::Paste,
+            None,
+            crate::app_take_over::GestureMarks::of(by),
+            |app, action| {
+                app.fence_menu_action(action);
+                app.paste_into_front_field();
+            },
+        );
+        crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            format!("{DISK}{PROMPT}"),
+            "PRECONDITION: the paste reached the buffer (source {source})"
+        );
+        assert_eq!(
+            app.native_documents.unvouched.get(&document).copied(),
+            relayed.then_some(Unvouched::Relayed),
+            "source {source}"
+        );
+        let saved = save(&mut app, false);
+        if relayed {
+            assert_eq!(
+                saved.unwrap_err(),
+                fenced(
+                    Provenance::new(false, Some(Unvouched::Relayed)),
+                    &app,
+                    document
+                )
+            );
+            assert_eq!(on_disk(&path), DISK);
+        } else {
+            saved.expect("the person's Paste and Save");
+            assert_eq!(on_disk(&path), format!("{DISK}{PROMPT}"));
+        }
+    }
+}
+
+/// A CLICK OR SCROLL ANOTHER PROCESS POSTED INTO THE WINDOW ARRIVES AS IT WAS CLASSIFIED: the
+/// window's `MouseInput` and `MouseWheel` callbacks carry the verdict their native event got
+/// before AppKit dispatched it, as a key's do, so the winit arms dispatch them under the relayed
+/// mark; a cursor move, which edits nothing, carries none.
+/// NEGATIVE CONTROL: with `arriving_input_origin` reading keys and input methods only (as the
+/// branch had it at `a2f973cd8f`), another process's click arrived as the person's.
+#[test]
+fn a_click_another_process_posted_arrives_relayed() {
+    use aterm_window::event::{
+        DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
+    };
+    let click = WindowEvent::MouseInput {
+        device_id: DeviceId::dummy(),
+        state: ElementState::Released,
+        button: MouseButton::Left,
+    };
+    let scroll = WindowEvent::MouseWheel {
+        device_id: DeviceId::dummy(),
+        delta: MouseScrollDelta::LineDelta(0.0, 1.0),
+        phase: TouchPhase::Moved,
+    };
+    let moved = WindowEvent::CursorMoved {
+        device_id: DeviceId::dummy(),
+        position: aterm_window::dpi::PhysicalPosition::new(1.0, 1.0),
+    };
+    for origin in [InputOrigin::Relayed, InputOrigin::Person] {
+        crate::hwkey::with_window_event_origin_for_test(origin, || {
+            assert_eq!(crate::arriving_input_origin(&click), origin);
+            assert_eq!(crate::arriving_input_origin(&scroll), origin);
+            assert_eq!(crate::arriving_input_origin(&moved), InputOrigin::Person);
+        });
+    }
+}
+
+/// The classifier the window installs before a native key or click can generate a callback
+/// reads the event's source: another process's key or click is relayed, a keyboard's or a
+/// mouse's is the person's.
+/// NEGATIVE CONTROL: with `platform::window_input_origin` passing [`crate::hwkey::HID_SYSTEM`]
+/// for every event's source, another process's key was the person's.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_window_classifier_reads_an_events_source() {
+    let native =
+        |event: crate::hwkey::NativeInput| aterm_window::platform::macos::NativeInputEvent {
+            kind: event.kind,
+            keycode: event.keycode,
+            timestamp: event.timestamp,
+            source_pid: event.source_pid,
+        };
+    for (event, want) in [
+        (native_key(1, elsewhere()), InputOrigin::Relayed),
+        (native_click(elsewhere()), InputOrigin::Relayed),
+        (native_key(1, crate::hwkey::HID_SYSTEM), InputOrigin::Person),
+        (native_click(crate::hwkey::HID_SYSTEM), InputOrigin::Person),
+    ] {
+        assert_eq!(
+            crate::platform::window_input_origin(native(event)),
+            want,
+            "{event:?}"
+        );
+    }
+}
+
+/// A COMPOSITION A POSTED KEY REACHED STAYS THAT KEY'S: an input method's preedit whose native
+/// key a burst or another process posted, committed by the person's own key (the empty preedit
+/// and the commit are the person's callbacks), marks the buffer, as a control client's when a
+/// burst posted the key and as relayed when another process did, so the person's Save is
+/// refused; so does a posted key's preedit in a composition the person began, and a posted
+/// key's own commit.
+/// NEGATIVE CONTROL: the composition all the person's writes the owner key. With the commit's mark
+/// the committing key's alone (`App::ime_composed_from` answering the person's), the posted
+/// key's composition was saved.
+#[test]
+fn an_input_methods_composition_a_posted_key_reached_stays_that_keys() {
+    use aterm_window::event::{Ime, WindowEvent};
+    for origin in [InputOrigin::Posted, InputOrigin::Relayed] {
+        for posted_at in [Some(0), Some(1), Some(3), None] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let (mut app, path, document) = manual(dir.path());
+            app.dispatch_native_event(WID, AppEvent::EditorCommand(EditorCommand::EndOfBuffer))
+                .unwrap();
+            let steps = [
+                Ime::Preedit("[harness]".to_string(), None),
+                Ime::Preedit(PROMPT.to_string(), None),
+                Ime::Preedit(String::new(), None),
+                Ime::Commit(PROMPT.to_string()),
+            ];
+            for (at, ime) in steps.into_iter().enumerate() {
+                let arrives = if posted_at == Some(at) {
+                    origin
+                } else {
+                    InputOrigin::Person
+                };
+                crate::hwkey::with_window_event_origin_for_test(arrives, || {
+                    let event = WindowEvent::Ime(ime.clone());
+                    let arrived = crate::arriving_input_origin(&event);
+                    app.dispatch_ime_event(WID, ime, arrived);
+                });
+            }
+            assert_eq!(
+                app.gesture_origin(),
+                InputOrigin::Person,
+                "the dispatch mark is restored"
+            );
+            let mark = posted_at.map(|_| match origin {
+                InputOrigin::Posted => Unvouched::Controller,
+                _ => Unvouched::Relayed,
+            });
+            assert_eq!(
+                app.native_documents.unvouched.get(&document).copied(),
+                mark,
+                "{origin:?} at {posted_at:?}"
+            );
+            let saved = save(&mut app, false);
+            if let Some(mark) = mark {
+                assert_eq!(
+                    saved.unwrap_err(),
+                    fenced(Provenance::new(false, Some(mark)), &app, document)
+                );
+                assert_eq!(on_disk(&path), DISK, "{origin:?} at {posted_at:?}");
+            } else {
+                saved.expect("the person's composition and Save");
+                assert_eq!(on_disk(&path), format!("{DISK}{PROMPT}"));
+            }
+        }
+    }
+}
+
+/// A composition a posted key began that the input method cancelled leaves the person's next
+/// composition the person's: its commit leaves no mark and the person's Save writes it.
+/// NEGATIVE CONTROL: with a new composition keeping the cancelled one's mark, the person's
+/// composition was refused.
+#[test]
+fn a_cancelled_posted_composition_leaves_the_persons_next_one_unmarked() {
+    use aterm_window::event::{Ime, WindowEvent};
+    for origin in [InputOrigin::Posted, InputOrigin::Relayed] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (mut app, path, document) = manual(dir.path());
+        app.dispatch_native_event(WID, AppEvent::EditorCommand(EditorCommand::EndOfBuffer))
+            .unwrap();
+        let person = InputOrigin::Person;
+        let steps = [
+            (Ime::Preedit("[harness]".to_string(), None), origin),
+            (Ime::Preedit(String::new(), None), person),
+            (Ime::Preedit(PROMPT.to_string(), None), person),
+            (Ime::Preedit(String::new(), None), person),
+            (Ime::Commit(PROMPT.to_string()), person),
+        ];
+        for (ime, arrives) in steps {
+            crate::hwkey::with_window_event_origin_for_test(arrives, || {
+                let event = WindowEvent::Ime(ime.clone());
+                let arrived = crate::arriving_input_origin(&event);
+                app.dispatch_ime_event(WID, ime, arrived);
+            });
+        }
+        assert_eq!(app.native_documents.unvouched.get(&document), None);
+        save(&mut app, false).expect("the person's composition and Save");
+        assert_eq!(on_disk(&path), format!("{DISK}{PROMPT}"));
     }
 }

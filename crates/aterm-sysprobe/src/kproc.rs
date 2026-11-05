@@ -53,6 +53,13 @@ pub fn records() -> Option<Vec<Record>> {
     imp::records()
 }
 
+/// The signals `pid` ignores now (`p_sigignore`, bit `n - 1` for signal `n`); `None` when it is
+/// gone, its record cannot be read, or this platform has no such record.
+#[must_use]
+pub fn ignored_signals(pid: u32) -> Option<u32> {
+    imp::ignored_signals(pid)
+}
+
 /// `pid`'s argument words (`argv`, `argv[0]` first, never its environment), as `ps` reads them.
 #[must_use]
 pub fn argv(pid: u32) -> Option<Vec<Vec<u8>>> {
@@ -167,8 +174,8 @@ mod imp {
 
     use crate::jobs::darwin::{
         KERN_PROC, KERN_PROC_PID, KINFO_COMM_AT, KINFO_FLAG_AT, KINFO_PGID_AT, KINFO_PID_AT,
-        KINFO_PPID_AT, KINFO_SIZE, KINFO_START_SEC_AT, KINFO_START_USEC_AT, KINFO_STAT_AT,
-        KINFO_TDEV_AT, KINFO_TPGID_AT, NODEV, P_NOCLDWAIT,
+        KINFO_PPID_AT, KINFO_SIGIGNORE_AT, KINFO_SIZE, KINFO_START_SEC_AT, KINFO_START_USEC_AT,
+        KINFO_STAT_AT, KINFO_TDEV_AT, KINFO_TPGID_AT, NODEV, P_NOCLDWAIT,
     };
 
     use super::{Locale, Record};
@@ -341,7 +348,8 @@ mod imp {
         (rc == 0).then_some(len)
     }
 
-    pub(super) fn record_read(pid: u32) -> std::io::Result<Option<Record>> {
+    /// `pid`'s whole `kinfo_proc`, about that pid; `None` when no process has it.
+    fn kinfo(pid: u32) -> std::io::Result<Option<[u8; KINFO_SIZE]>> {
         let native_pid = c_int::try_from(pid).map_err(|_| std::io::ErrorKind::InvalidInput)?;
         let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_PID, native_pid];
         let mut buf = [0u8; KINFO_SIZE];
@@ -352,12 +360,19 @@ mod imp {
         };
         match n {
             0 => Ok(None),
-            KINFO_SIZE => parse(&buf)
-                .filter(|record| record.pid == pid)
-                .map(Some)
-                .ok_or_else(|| std::io::ErrorKind::InvalidData.into()),
+            KINFO_SIZE if u32_at(&buf, KINFO_PID_AT) == Some(pid) => Ok(Some(buf)),
             _ => Err(std::io::ErrorKind::InvalidData.into()),
         }
+    }
+
+    pub(super) fn record_read(pid: u32) -> std::io::Result<Option<Record>> {
+        kinfo(pid)?
+            .map(|buf| parse(&buf).ok_or_else(|| std::io::ErrorKind::InvalidData.into()))
+            .transpose()
+    }
+
+    pub(super) fn ignored_signals(pid: u32) -> Option<u32> {
+        u32_at(&kinfo(pid).ok()??, KINFO_SIGIGNORE_AT)
     }
 
     pub(super) fn records() -> Option<Vec<Record>> {
@@ -454,6 +469,10 @@ mod imp {
     }
 
     pub(super) fn records() -> Option<Vec<Record>> {
+        None
+    }
+
+    pub(super) fn ignored_signals(_pid: u32) -> Option<u32> {
         None
     }
 

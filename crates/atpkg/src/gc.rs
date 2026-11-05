@@ -455,7 +455,7 @@ fn pursued_assets(layout: &Layout, program: &str) -> Vec<String> {
     else {
         return Vec::new();
     };
-    let active = crate::ops::active_builds(layout).get(program).copied();
+    let active = crate::ops::active_build_of(layout, program);
     if active < Some(head.build_id()) {
         crate::vendor_direct::resolve::staging_assets(spec, head, crate::cli::current_triple())
     } else {

@@ -35,28 +35,6 @@ pub mod token_line;
 pub mod transport;
 pub mod x25519;
 
-/// Memoize X25519 in this test binary ([`x25519::seam`]): a test that reads one vault at every
-/// lock it takes computes each scalar and point once. A load-time hook, so before any test
-/// thread; test and debug builds on Apple targets and Linux.
-#[macro_export]
-macro_rules! memoized_x25519_in_tests {
-    () => {
-        #[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
-        const _: () = {
-            extern "C" fn memoize_x25519() {
-                $crate::x25519::seam::memoize();
-            }
-            #[used]
-            #[cfg_attr(
-                target_vendor = "apple",
-                unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")
-            )]
-            #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
-            static MEMOIZE_X25519: extern "C" fn() = memoize_x25519;
-        };
-    };
-}
-
 pub mod cli;
 #[cfg(unix)]
 pub mod client;
@@ -103,6 +81,7 @@ pub mod sync_diagnostic;
 #[cfg(unix)]
 pub mod wake;
 
+mod ed25519;
 mod secret;
 pub use secret::SecretBytes;
 
@@ -161,6 +140,90 @@ pub fn reserved_name(name: &str) -> bool {
         || commons::reserved_name(name)
 }
 
+/// Why a vault identity is a lab identity: one that founds its own lab and never joins the live
+/// ALab (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.2 M2, A12). The mark is written into the
+/// identity file when the identity is made (`client::machine_identity`) and read from it ever
+/// after, so an identity a release build made stays unmarked whatever build uses it later, and a
+/// lab identity stays one whatever build reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabMark {
+    /// A test binary made it (`aterm_uds::test_binary::is_test_binary`).
+    TestBinary,
+    /// A build with debug assertions on made it: a lab instance, a dev build, an example.
+    DebugBuild,
+    /// A process a lab lane marked made it (`ATERM_LAB_MEMBER_SERVICE`, which `lab mac nux
+    /// --scenario vault-phrase` sets on its joiner).
+    LabLane,
+    /// A build running inside a virtual machine made it (macOS's `kern.hv_vmm_present` reads
+    /// 1): the other `lab mac nux` guests run a release app, so only this catches them.
+    VirtualMachine,
+    /// A build after this one marked it for a reason this one does not name: marked all the same.
+    Unnamed,
+}
+
+impl LabMark {
+    /// The mark's word in the identity file.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::TestBinary => "test-binary",
+            Self::DebugBuild => "debug-build",
+            Self::LabLane => "lab-lane",
+            Self::VirtualMachine => "virtual-machine",
+            Self::Unnamed => "unnamed",
+        }
+    }
+
+    /// The mark a word names; a word this build does not know is [`LabMark::Unnamed`].
+    #[must_use]
+    pub fn of_word(word: &str) -> Self {
+        [
+            Self::TestBinary,
+            Self::DebugBuild,
+            Self::LabLane,
+            Self::VirtualMachine,
+        ]
+        .into_iter()
+        .find(|mark| mark.word() == word)
+        .unwrap_or(Self::Unnamed)
+    }
+}
+
+/// What a process making a vault identity knows of itself ([`lab_identity`]): the live reading is
+/// `Making::now` (Unix), whose virtual-machine probe is inert in every test binary; a test states
+/// each fact instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Making {
+    /// It is a test binary.
+    pub test_binary: bool,
+    /// It was built with debug assertions on.
+    pub debug_build: bool,
+    /// A lab lane marked it (`ATERM_LAB_MEMBER_SERVICE` is set).
+    pub lab_lane: bool,
+    /// It runs inside a virtual machine.
+    pub virtual_machine: bool,
+}
+
+/// The lab mark an identity made by a process that is `making` carries, or `None` for a release
+/// build on a Mac's own hardware, the one kind of process whose new identity may join the live
+/// ALab. The first fact that holds names the mark. A process this says `None` for that finds a
+/// lab-marked identity in this Mac's vault folder sets that folder aside and starts as a new Mac
+/// (A16, `client::Paths::for_home`).
+#[must_use]
+pub const fn lab_identity(making: Making) -> Option<LabMark> {
+    if making.test_binary {
+        Some(LabMark::TestBinary)
+    } else if making.debug_build {
+        Some(LabMark::DebugBuild)
+    } else if making.lab_lane {
+        Some(LabMark::LabLane)
+    } else if making.virtual_machine {
+        Some(LabMark::VirtualMachine)
+    } else {
+        None
+    }
+}
+
 /// The port `aterm secrets serve` listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 7484;
 
@@ -198,6 +261,9 @@ pub enum ErrorKind {
     /// A membership record or batch cannot fit the existing count or byte bounds.
     /// No local operation may treat a partial draft as the complete operation.
     MembershipCapacity,
+    /// A locally retained causal frontier is not yet covered by complete raw records.
+    /// Credential authority is unavailable; record intake may repair the missing history.
+    MembershipHistoryUnavailable,
     /// A connect to a private or link-local address (a vault on this LAN) found no route:
     /// what macOS answers while aterm may not yet reach the local network (its Local Network
     /// question is open, or was answered Don't Allow), and also what a LAN host that is down
@@ -227,6 +293,10 @@ pub enum ErrorKind {
     /// A member's desk answered that a vault pass on it holds its state: its join run touched no
     /// phrase, so the same words go to it again once the pass ends.
     MemberBusy,
+    /// This Mac's vault identity is a lab identity ([`LabMark`]), or the one this process would
+    /// make is, and the join would ask the live ALab: refused before anything was dialed. A lab
+    /// identity founds its own lab, or joins one by its URL; asked again, it is refused again.
+    LabIdentity,
 }
 
 impl Error {
@@ -304,6 +374,42 @@ mod tests {
     fn the_compiled_alab_genesis_is_a_digest_when_there_is_one() {
         let compiled = crate::membership_log::genesis::digest_compiled().expect("64 hex digits");
         assert_eq!(compiled.is_some(), super::ALAB_GENESIS.is_some());
+    }
+
+    /// A12's predicate: each fact alone marks an identity, the first that holds names it, and
+    /// only a release build on a Mac's own hardware makes an unmarked one.
+    #[test]
+    fn each_lab_fact_marks_an_identity_and_a_release_build_on_hardware_none() {
+        use super::{LabMark, Making, lab_identity};
+        assert_eq!(lab_identity(Making::default()), None);
+        let one = |fact: fn(&mut Making)| {
+            let mut making = Making::default();
+            fact(&mut making);
+            lab_identity(making)
+        };
+        assert_eq!(one(|m| m.test_binary = true), Some(LabMark::TestBinary));
+        assert_eq!(one(|m| m.debug_build = true), Some(LabMark::DebugBuild));
+        assert_eq!(one(|m| m.lab_lane = true), Some(LabMark::LabLane));
+        assert_eq!(
+            one(|m| m.virtual_machine = true),
+            Some(LabMark::VirtualMachine)
+        );
+        let all = Making {
+            test_binary: true,
+            debug_build: true,
+            lab_lane: true,
+            virtual_machine: true,
+        };
+        assert_eq!(lab_identity(all), Some(LabMark::TestBinary));
+        for mark in [
+            LabMark::TestBinary,
+            LabMark::DebugBuild,
+            LabMark::LabLane,
+            LabMark::VirtualMachine,
+        ] {
+            assert_eq!(LabMark::of_word(mark.word()), mark);
+        }
+        assert_eq!(LabMark::of_word("a-later-reason"), LabMark::Unnamed);
     }
 
     #[test]

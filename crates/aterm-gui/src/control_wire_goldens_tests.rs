@@ -283,7 +283,7 @@ fn exits_text(plant: bool) -> String {
     let mut out = String::new();
     for rest in ["", "2", "since=4", "since=x"] {
         out.push_str(&format!("> exits {rest}\n"));
-        out.push_str(&cmd_exits(&store, rest));
+        out.push_str(&cmd_exits(&store, rest, &[]));
     }
     let mut producer = SessionStore::default();
     for local in 1..=3 {
@@ -309,43 +309,45 @@ fn exits_text(plant: bool) -> String {
     }
     for rest in ["", "since=4", "1"] {
         out.push_str(&format!("> successor exits {rest}\n"));
-        out.push_str(&cmd_exits(&successor, rest));
+        out.push_str(&cmd_exits(&successor, rest, &[]));
     }
     mask_sids(&mask_t(&out), &sids)
 }
 
 const EXITS_GOLDEN: &str = concat!(
     "> exits \n",
-    "OK 6\n",
-    "exit 2 t=* sid=<sid0> local=10 reason=shell-exit exit_code=0 by=s-driver0\n",
-    "exit 4 t=* sid=<sid1> local=11 reason=ctl-close exit_code=- by=human\n",
-    "exit 6 t=* sid=<sid2> local=12 reason=ui-close exit_code=2 by=ctl\n",
-    "exit 8 t=* sid=<sid3> local=13 reason=window-close exit_code=- by=bridge\n",
-    "exit 10 t=* sid=<sid4> local=14 reason=app-quit exit_code=4 by=-\n",
-    "exit 12 t=* sid=<sid5> local=15 reason=unknown exit_code=- by=s-driver5\n",
+    "OK 7\n",
+    "exit 2 t=* sid=<sid0> local=10 reason=shell-exit exit_code=0 by=s-driver0 left=-\n",
+    "exit 4 t=* sid=<sid1> local=11 reason=ctl-close exit_code=- by=human left=-\n",
+    "exit 6 t=* sid=<sid2> local=12 reason=ui-close exit_code=2 by=ctl left=-\n",
+    "exit 8 t=* sid=<sid3> local=13 reason=window-close exit_code=- by=bridge left=-\n",
+    "exit 10 t=* sid=<sid4> local=14 reason=app-quit exit_code=4 by=- left=-\n",
+    "exit 12 t=* sid=<sid5> local=15 reason=reaper exit_code=- by=s-driver5 left=-\n",
+    "exit 14 t=* sid=<sid6> local=16 reason=unknown exit_code=6 by=human left=-\n",
     "> exits 2\n",
     "OK 2\n",
-    "exit 10 t=* sid=<sid4> local=14 reason=app-quit exit_code=4 by=-\n",
-    "exit 12 t=* sid=<sid5> local=15 reason=unknown exit_code=- by=s-driver5\n",
+    "exit 12 t=* sid=<sid5> local=15 reason=reaper exit_code=- by=s-driver5 left=-\n",
+    "exit 14 t=* sid=<sid6> local=16 reason=unknown exit_code=6 by=human left=-\n",
     "> exits since=4\n",
-    "OK 4\n",
-    "exit 6 t=* sid=<sid2> local=12 reason=ui-close exit_code=2 by=ctl\n",
-    "exit 8 t=* sid=<sid3> local=13 reason=window-close exit_code=- by=bridge\n",
-    "exit 10 t=* sid=<sid4> local=14 reason=app-quit exit_code=4 by=-\n",
-    "exit 12 t=* sid=<sid5> local=15 reason=unknown exit_code=- by=s-driver5\n",
+    "OK 5\n",
+    "exit 6 t=* sid=<sid2> local=12 reason=ui-close exit_code=2 by=ctl left=-\n",
+    "exit 8 t=* sid=<sid3> local=13 reason=window-close exit_code=- by=bridge left=-\n",
+    "exit 10 t=* sid=<sid4> local=14 reason=app-quit exit_code=4 by=- left=-\n",
+    "exit 12 t=* sid=<sid5> local=15 reason=reaper exit_code=- by=s-driver5 left=-\n",
+    "exit 14 t=* sid=<sid6> local=16 reason=unknown exit_code=6 by=human left=-\n",
     "> exits since=x\n",
     "ERR usage: exits [<n>] [since=<id>]\n",
     "> successor exits \n",
     "OK 2\n",
-    "exit 7 t=* sid=<sid9> local=1 reason=ui-close exit_code=- by=human\n",
-    "exit 8 t=* sid=<sid10> local=2 reason=window-close exit_code=- by=ctl\n",
+    "exit 7 t=* sid=<sid10> local=1 reason=ui-close exit_code=- by=human left=-\n",
+    "exit 8 t=* sid=<sid11> local=2 reason=window-close exit_code=- by=ctl left=-\n",
     "> successor exits since=4\n",
     "OK 2\n",
-    "exit 7 t=* sid=<sid9> local=1 reason=ui-close exit_code=- by=human\n",
-    "exit 8 t=* sid=<sid10> local=2 reason=window-close exit_code=- by=ctl\n",
+    "exit 7 t=* sid=<sid10> local=1 reason=ui-close exit_code=- by=human left=-\n",
+    "exit 8 t=* sid=<sid11> local=2 reason=window-close exit_code=- by=ctl left=-\n",
     "> successor exits 1\n",
     "OK 1\n",
-    "exit 8 t=* sid=<sid10> local=2 reason=window-close exit_code=- by=ctl\n",
+    "exit 8 t=* sid=<sid11> local=2 reason=window-close exit_code=- by=ctl left=-\n",
 );
 
 #[test]

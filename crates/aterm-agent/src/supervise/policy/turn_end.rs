@@ -290,24 +290,30 @@ pub enum GaveUp {
     /// The same reply came back with no work and Land's stop for that took the point
     /// ([`TurnEndState::conclude_repeated`]).
     Repeated,
+    /// Its account met a usage limit that resets past [`MANAGED_WALL_HORIZON`] and no move off it
+    /// (another account, a fallback model) was made ([`TurnEndState::conclude_at_wall`]).
+    UsageLimit,
 }
 
 impl GaveUp {
+    /// Every ending, in the order [`Self::of_word`] and [`Self::of_journal_line`] try them: the
+    /// `why=` words a task record's `failed` mark must take ([`Self::word`]).
+    pub const ALL: [Self; 3] = [Self::CouldNotFinish, Self::Repeated, Self::UsageLimit];
+
     /// The task record's `why=` for it.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
             Self::CouldNotFinish => "could-not-finish",
             Self::Repeated => "repeated",
+            Self::UsageLimit => "usage-limit",
         }
     }
 
     /// The ending a record's `why=` names; `None` for any other word.
     #[must_use]
     pub fn of_word(word: &str) -> Option<Self> {
-        [Self::CouldNotFinish, Self::Repeated]
-            .into_iter()
-            .find(|ending| ending.word() == word)
+        Self::ALL.into_iter().find(|ending| ending.word() == word)
     }
 
     /// What the loop's journal says of it.
@@ -316,17 +322,30 @@ impl GaveUp {
         match self {
             Self::CouldNotFinish => "the worker said it could not finish",
             Self::Repeated => "the worker repeated the same reply with no work",
+            Self::UsageLimit => {
+                "the worker's account is at a usage limit that resets too far off to wait for, \
+                 and no move off it is made"
+            }
         }
     }
 
     /// The ending a journal's `FAILED` line names, by its [`Self::words`].
     #[must_use]
     pub fn of_journal_line(line: &str) -> Option<Self> {
-        [Self::CouldNotFinish, Self::Repeated]
+        Self::ALL
             .into_iter()
             .find(|ending| line.contains(ending.words()))
     }
 }
+
+/// HOW FAR OFF A MANAGED WORKER'S USAGE WALL MAY RESET AND STILL BE WAITED OUT
+/// ([`managed_wall_ends`]). A worker a manager waits on is a task-sized, ephemeral session, not a
+/// person's long-lived tab: a quarter of an hour (a five-hour window's last minutes, a reset the
+/// notice puts minutes away) costs its manager less than a relaunch, while anything longer is a
+/// tab that sits blocked for hours or days (the claim workers of 2026-11-04 waited on a weekly
+/// reset 30 h out). Past it the work ends `failed why=usage-limit` ([`GaveUp::UsageLimit`]), which
+/// is its manager's report and lets the manager run it again once quota returns.
+pub const MANAGED_WALL_HORIZON: Duration = Duration::from_secs(15 * 60);
 
 /// The decider's check that holds an act at the same reply ([`TurnEndState::repeats`]).
 pub const SAME_REPLY: &str = "same-reply";
@@ -518,10 +537,14 @@ fn words_end_with(tail: Option<&str>, mark: Option<u64>, len: usize) -> bool {
 /// ([`TurnEndState::go_ahead_at_break`]) read it alike. A need of the earlier messages that the
 /// turn's last word retracted parks nothing ([`needs::retracted_cut`]): the agent did that work,
 /// or no longer needs it, so a go-ahead for it would be a prompt it cannot act on.
-fn turn_go_ahead(turn_said: Option<&str>, tail: &str, act: Option<&str>) -> Option<go_ahead::Park> {
+fn turn_go_ahead(
+    turn_said: Option<needs::Before<'_>>,
+    tail: &str,
+    act: Option<&str>,
+) -> Option<go_ahead::Park> {
     match turn_said {
         Some(before) => go_ahead::parked(
-            &needs::retracted_cut(without_act_rows(before, act), tail),
+            &needs::retracted_cut(before.past(without_act_rows(before.text(), act)), tail),
             tail,
         ),
         None => go_ahead::parked("", without_act_rows(tail, act)),
@@ -9041,11 +9064,13 @@ pub fn land_open_found(tail: Option<&str>) -> Vec<Found> {
 /// owed by it no longer. The word
 /// reader never sets the Open leg: it only describes the agent's list there
 /// ([`LandHeld::open`]). Beside it, the hold's own words (§14.17 item 1, slice 4b): the agent's
-/// list, quoted, and the files the repository's probe named ([`HoldSaid::of`]).
+/// list, quoted, and the files the repository's probe named ([`HoldSaid::of`]). `left` is how many
+/// of the agent's left rows hold it ([`HoldLeg::Left`], [`TurnEndState::left_at_yield`]).
 fn hold_at_yield(
     reading: &TurnEndReading,
     answer: Option<&land_check::CheckAnswer>,
     stands: Option<&str>,
+    left: u16,
 ) -> (LandHeld, HoldSaid) {
     let tail = reading.said_tail.as_deref();
     let said_need = reading.names_need();
@@ -9072,6 +9097,7 @@ fn hold_at_yield(
         (HoldLeg::Needs, said_need),
         (HoldLeg::Repo, repo.is_some()),
         (HoldLeg::Unread, reading.repo.is_unread()),
+        (HoldLeg::Left, left > 0),
         (HoldLeg::Open, listed.is_some()),
         (
             HoldLeg::Defense,
@@ -9102,6 +9128,7 @@ fn hold_at_yield(
         unlanded: count(|r| r.unlanded),
         sub_unpushed: count(|r| r.sub_unpushed),
         parked: count(|r| r.parked),
+        left,
     };
     (held, said)
 }
@@ -9821,23 +9848,76 @@ impl Unmade {
 }
 
 impl Restart {
+    /// A lost line's restart's [`Self::word`] ([`Restart::InputLost`]).
+    pub const INPUT_LOST: &'static str = "input-lost";
+    /// A model's way back's [`Self::word`] ([`Restart::ModelBack`]).
+    pub const MODEL_BACK: &'static str = "model-back";
+    /// An account move ahead's [`Self::word`] ([`Restart::Account`] at [`AccountAt::Ahead`]).
+    pub const ACCOUNT_AHEAD: &'static str = "account-ahead";
+
+    /// A model's move onto its fallback's [`Self::word`] ([`Restart::Model`]).
+    pub const MODEL: &'static str = "model";
+    /// An account move at a wall's [`Self::word`] ([`Restart::Account`] at [`AccountAt::Wall`]).
+    pub const ACCOUNT: &'static str = "account";
+
+    /// THE KINDS ([`Self::word`]) OF THE MOVES PUT OFF TO A QUIET MOMENT: a model's way back and an
+    /// account move ahead, which the turn-end state owes until the move is made or refused, never
+    /// a screen. Where its host answers a wait (`wait:…`, `busy:another-sweep`), the point goes on
+    /// with the act it would have taken (`DEFERRED`) and the move is asked again at a later turn
+    /// end, under the same ask ([`RestartAsk`]) while its run holds a live claim of the
+    /// conversation's record ([`RestartClaim`], [`Self::moves`]).
+    pub const PUT_OFF: [&'static str; 2] = [Self::MODEL_BACK, Self::ACCOUNT_AHEAD];
+
+    /// Whether a restart of the kind `word` ([`Self::word`]) is a move put off to a quiet moment
+    /// ([`Self::PUT_OFF`]).
+    #[must_use]
+    pub fn put_off(word: &str) -> bool {
+        Self::PUT_OFF.contains(&word)
+    }
+
+    /// THE KINDS ([`Self::word`]) OF THE MOVES: a model's move onto its fallback and its way back,
+    /// and an account move at a wall or ahead of one. A move is the session's, not its process's:
+    /// asked again after the loop's other acts it is the same move, so while its run holds a live
+    /// claim of the conversation's record ([`RestartClaim`]) the loop keeps that ask until the move
+    /// is made, refused or another restart's run takes its place, and the re-ask meets the record
+    /// it claimed (carried while its relaunch is in flight, made once that is carried on). A memory
+    /// restart's need and a lost line's are the process's: neither is a move.
+    pub const MOVES: [&'static str; 4] = [
+        Self::MODEL,
+        Self::MODEL_BACK,
+        Self::ACCOUNT,
+        Self::ACCOUNT_AHEAD,
+    ];
+
+    /// Whether a restart of the kind `word` ([`Self::word`]) is a move ([`Self::MOVES`]).
+    #[must_use]
+    pub fn moves(word: &str) -> bool {
+        Self::MOVES.contains(&word)
+    }
+
     /// The one word the journal names it by (`restart:<word>`).
     #[must_use]
     pub const fn word(&self) -> &'static str {
         match self {
             Restart::Memory => "memory",
-            Restart::InputLost { .. } => "input-lost",
-            Restart::Model { .. } => "model",
-            Restart::ModelBack { .. } => "model-back",
+            Restart::InputLost { .. } => Self::INPUT_LOST,
+            Restart::Model { .. } => Self::MODEL,
+            Restart::ModelBack { .. } => Self::MODEL_BACK,
             Restart::Account {
                 at: AccountAt::Wall,
                 ..
-            } => "account",
+            } => Self::ACCOUNT,
             Restart::Account {
                 at: AccountAt::Ahead,
                 ..
-            } => "account-ahead",
+            } => Self::ACCOUNT_AHEAD,
         }
+    }
+
+    /// Whether `word` is [`Self::word`] of a move onto another account.
+    #[must_use]
+    pub fn moves_account(word: &str) -> bool {
+        matches!(word, "account" | "account-ahead")
     }
 }
 
@@ -9849,13 +9929,22 @@ impl Restart {
 /// it, or one past the last run's where that run's was this second or later
 /// (`Session::restart_floor`), so no two runs of one loop share one; a loop's first run is past
 /// the newest run's second its journal's restart notes name (each names its run's ask). It is
-/// kept while the loop asks that kind again, on its back-off or, for a move put off to a quiet
-/// moment (a model's way back, an account move ahead), at a later turn end, until the restart is
-/// made or refused or the loop decides another act; and it is restored by a later loop for a
-/// model's move its ledger or journal shows still waiting, so a re-ask there is the same. The
+/// kept while the loop asks that kind again on its back-off, until the restart is made or refused
+/// or the loop decides another act; a lost line's restart's run outlives that act while its line
+/// stands held, and a move's ([`Restart::moves`]) while the run holds a live claim of the
+/// conversation's record ([`RestartClaim`]: from the answer that took it until one that read the
+/// record finds none), until the move is made or refused or another restart's run takes its place:
+/// its next ask, at a later turn end or on its back-off, meets the record its ask claimed. A move
+/// whose run holds no claim ends its run at the act, so a later ask that claims the record is
+/// another run's; either way the move is dated by the second its claim was taken
+/// (`approvals::model_switch_reason`), never by an ask that claimed nothing or a claim that
+/// lapsed. A later loop restores the run of a move its journal's last restart note shows deferred
+/// with its claim held, which outlives the acts there too. The
 /// relaunch's record keeps the ask that claimed it (`St::ask`), and a restart asked again meets
-/// its own record by it alone, never by its cause, so a restart asked of the process an earlier
-/// restart of its cause started is made of it (`relaunch::its_own`).
+/// its own record by that ask, never by its cause alone, so a restart asked of the process an
+/// earlier restart of its cause started is made of it (`relaunch::its_own`); no account move's
+/// record is its own, whatever its ask (`relaunch::carried_word` answers one in flight), so no
+/// account move's answer holds or takes a claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestartAsk(String);
 
@@ -9876,6 +9965,88 @@ impl RestartAsk {
     #[must_use]
     pub fn word(&self) -> &str {
         &self.0
+    }
+}
+
+/// THE HOST'S ANSWER TO AN ASK OF A RESTART IN PLACE (`IdleHost::restart`): `step`, its word for
+/// what it did (`adopted`, `relaunched`, `continued…` or `done:…` that the restart is made;
+/// `wait:…` or `busy:another-sweep` that it defers it; any other `busy:…`, `refused:…` or
+/// `failed:…` that it made none), and `claim`, what it read of the conversation's record once it
+/// answered ([`RestartClaim`]). The window host makes the claim in one place, from the record as
+/// its restart left it (`relaunch::restart_as`). A deferral may come before the claim (a person's
+/// hand on the tab, another sweep's lock, the record unwritable) or after it, its signal gone and
+/// its relaunch landed (`wait:resume`, `wait:exiting`, `wait:shell-prompt`), and the words do not
+/// tell the two apart (`wait:held` is said at either), so the loop reads the claim from this field
+/// alone (`Session::restart_agent`): a run holds a claim from the answer that took it until an
+/// answer that read the record finds it no live claim of the run's or the run ends, which keeps a
+/// move's ask past its other acts (`Session::run_outlives_act`); the move is dated by the second
+/// the claim was taken; and the run's claim is journaled (`HOST … restart:<kind> ask=<ask>
+/// claimed=<second|no> step=<step>`), which a later loop reads back
+/// (`turn_end_loop::journaled_open_moves`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartAnswer {
+    /// The host's word for what it did.
+    pub step: String,
+    /// What the host read of the conversation's record once it answered.
+    pub claim: RestartClaim,
+}
+
+impl RestartAnswer {
+    /// `step`, where the answer read no record ([`RestartClaim::Unread`]).
+    #[must_use]
+    pub fn unread(step: impl Into<String>) -> Self {
+        Self {
+            step: step.into(),
+            claim: RestartClaim::Unread,
+        }
+    }
+}
+
+/// WHAT A RESTART'S ANSWER READ OF THE CONVERSATION'S RECORD ([`RestartAnswer::claim`]), read back
+/// under the sweep's lock as the restart left it (`relaunch::restart_as`). The asked restart's own
+/// record is the one an ask of that restart claimed ([`RestartAsk`] against `St::ask`), of its
+/// cause (`relaunch::its_own`), in the asker's tab; its claim is LIVE while its relaunch is in
+/// flight, which a re-ask under the same ask carries, or once it is carried on, which a re-ask
+/// answers made where it landed in the asker (`relaunch::already_made`). A record whose relaunch
+/// stopped or failed unmade holds no live claim: a re-ask over it restarts afresh, a new claim. No
+/// account move's record is its own, so no account move's answer holds or takes a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartClaim {
+    /// The answer read no record (an account move not listed or not admitted, another sweep's
+    /// lock, a snapshot of another tab or none, a process the restart was not asked of or with no
+    /// shell job, no session record of the asker): it says nothing of the run's claim.
+    Unread,
+    /// The record read holds no live claim of the asked restart's: it is none, another restart's
+    /// or another tab's, its own relaunch stopped or failed unmade, its own carried on in another
+    /// process than the asker, or its own claim went unwritten or was restored.
+    Unclaimed,
+    /// The record is the asked restart's own, its claim live, as an earlier answer took it: this
+    /// answer carried it in flight, or found it made in the asker.
+    Held,
+    /// This answer took the claim: it wrote the record as the asked restart's own, and its claim
+    /// is live once it answered.
+    Taken,
+}
+
+impl RestartClaim {
+    /// Every claim, in the order [`Self::word`] names them.
+    pub const ALL: [Self; 4] = [Self::Unread, Self::Unclaimed, Self::Held, Self::Taken];
+
+    /// The one word a tape names it by.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Unread => "unread",
+            Self::Unclaimed => "unclaimed",
+            Self::Held => "held",
+            Self::Taken => "taken",
+        }
+    }
+
+    /// The claim [`Self::word`] names `word` (`None`: no claim this build knows).
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|claim| claim.word() == word)
     }
 }
 
@@ -10972,6 +11143,49 @@ pub enum Composer {
     Typed,
     Own,
     Diverted(Diversion),
+    /// A draft its program would run as a command on Enter, not take as a prompt
+    /// ([`aterm_phase::draft_command`], or Claude Code's slash menu whose Enter runs an entry):
+    /// a person's, it stands as their hold, never sent by aterm (v6 §14.17.5.8,
+    /// [`COMMAND_STANDS`]), whatever a menu over it does. The loop's own line equal to it, left
+    /// with no person's typing since, reads as the menu over it says ([`CommandEnter::own`]).
+    Command(aterm_phase::DraftCommand, CommandEnter),
+}
+
+/// WHAT ENTER DOES WITH A COMMAND STANDING ([`Composer::Command`]) UNDER THE COMPLETION MENU DRAWN
+/// OVER IT: nothing to a person's command, which stands whatever it says, and the composer a line
+/// of the loop's own reads as ([`Self::own`]), so no Enter runs an entry the loop never wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandEnter {
+    /// Enter runs the line as typed: no menu is drawn, or its Enter runs this command.
+    Runs,
+    /// The menu's Enter runs or completes another entry ([`Diversion::Menu`]).
+    Diverted,
+    /// The menu's selection could not be read: its Enter may run the line or another entry.
+    Unread,
+}
+
+impl CommandEnter {
+    /// What a menu read `menu` (`None` where Enter sends the draft as typed; else
+    /// [`Composer::Diverted`] or [`Composer::Unknown`]) says of a command's Enter.
+    #[must_use]
+    pub const fn of(menu: Option<&Composer>) -> Self {
+        match menu {
+            None => Self::Runs,
+            Some(Composer::Diverted(_)) => Self::Diverted,
+            Some(_) => Self::Unread,
+        }
+    }
+
+    /// The composer the loop's own line reads as under it: a line its Enter runs as typed
+    /// ([`Composer::Typed`]), else what stands over it, as for any draft.
+    #[must_use]
+    pub const fn own(self) -> Composer {
+        match self {
+            Self::Runs => Composer::Typed,
+            Self::Diverted => Composer::Diverted(Diversion::Menu),
+            Self::Unread => Composer::Unknown,
+        }
+    }
 }
 
 impl Composer {
@@ -10982,14 +11196,32 @@ impl Composer {
     pub const fn drafted(&self) -> bool {
         matches!(
             self,
-            Composer::Typed | Composer::Own | Composer::Diverted(_)
+            Composer::Typed | Composer::Own | Composer::Diverted(_) | Composer::Command(..)
         )
+    }
+
+    /// The question a point standing on this composer asks before any act of its, whatever the
+    /// act: aterm's own words standing ([`OWN_WORDS_STAND`]), or what diverts the composer's Enter
+    /// ([`Diversion::reason`]). `None` for a composer a person's draft (their command included)
+    /// or nothing stands in.
+    #[must_use]
+    pub const fn asks(&self) -> Option<&'static str> {
+        match self {
+            Composer::Own => Some(OWN_WORDS_STAND),
+            Composer::Diverted(by) => Some(by.reason()),
+            Composer::Absent
+            | Composer::Unknown
+            | Composer::Empty
+            | Composer::Placeholder(_)
+            | Composer::Typed
+            | Composer::Command(..) => None,
+        }
     }
 }
 
-/// WHAT STANDS OVER THE COMPOSER so that its Enter sends no draft it shows ([`Composer::Diverted`]):
-/// the point is asked about ([`Self::reason`]) once a person's grace is out, and decided again when
-/// it goes.
+/// WHAT KEEPS THE COMPOSER'S ENTER FROM SENDING A PERSON'S DRAFT ([`Composer::Diverted`]): something
+/// standing over it, or an old prompt a search left in it. The point is asked about
+/// ([`Self::reason`]) once a person's grace is out, and decided again when it goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Diversion {
     /// Claude Code's completion menu, open under a draft: Enter may run or complete its entry.
@@ -10998,6 +11230,12 @@ pub enum Diversion {
     /// (`aterm_phase::ScreenReader::history_search`): keys type into its query and Enter sends the
     /// old prompt it matched, whatever the composer's row shows.
     Search,
+    /// The old prompt the search matched, left in the composer unedited as the search went: Esc
+    /// accepts the match in Claude Code 2.1.318 and Muse Code 1.4.14 alike (measured,
+    /// `claude-2.1.318-history-search-left`, `muse-1.4.14-R7309.1-history-search-left`), so a
+    /// person backing out of the search leaves it there, drawn as typed text. It is no draft of
+    /// theirs to send: their edit makes it one.
+    Recall,
 }
 
 impl Diversion {
@@ -11007,6 +11245,7 @@ impl Diversion {
         match self {
             Self::Menu => MENU_DIVERTS,
             Self::Search => SEARCH_DIVERTS,
+            Self::Recall => RECALL_STANDS,
         }
     }
 
@@ -11015,10 +11254,16 @@ impl Diversion {
     pub const fn todo(self) -> &'static str {
         match self {
             Self::Menu => "Close the completion menu, then send the draft in the tab.",
-            Self::Search => "Leave the prompt-history search in the tab with Esc.",
+            Self::Search => "Close the prompt-history search in the tab.",
+            Self::Recall => "Send, edit or clear the old prompt the search left in the tab.",
         }
     }
 }
+
+/// WHY A PERSON'S COMMAND HOLDS THE POINT ([`Composer::Command`], v6 §14.17.5.8): the one journal
+/// line its hold writes, no alert and no badge (`DESIGN-continuous-forward-2026-11-01.md`).
+pub const COMMAND_STANDS: &str = "stands unsent in the prompt: aterm's Enter sends no command it \
+     did not write, so it is their hold until they send or clear it";
 
 /// Escalation reason while aterm's own words stand unsent in the prompt ([`Composer::Own`]).
 pub const OWN_WORDS_STAND: &str =
@@ -11031,8 +11276,14 @@ pub const MENU_DIVERTS: &str = "a draft stands with Claude Code's completion men
 
 /// Escalation reason while the prompt-history search stands over the composer ([`Diversion::Search`]).
 pub const SEARCH_DIVERTS: &str = "the prompt-history search (ctrl+r) is open over the composer: \
-     Enter would send the old prompt it found and typing would go into its query; leave the \
-     search and the session goes on";
+     Enter would send the old prompt it found and typing would go into its query, and leaving it \
+     with Esc keeps that prompt in the composer; send, edit or clear what it leaves, or leave a \
+     search that found nothing, and the session goes on";
+
+/// Escalation reason while an old prompt the search left stands unedited ([`Diversion::Recall`]).
+pub const RECALL_STANDS: &str = "an old prompt the prompt-history search (ctrl+r) found stands \
+     unedited in the composer, where leaving the search with Esc keeps it: aterm sends no prompt \
+     it did not see typed; send, edit or clear it and the session goes on";
 
 /// Suffix of an escalated question's reason when `answer_questions` holds it (`<why>; answer_questions is off`).
 pub const ANSWERS_OFF: &str = "answer_questions is off";
@@ -11231,6 +11482,10 @@ pub struct TurnEndReading {
     pub said_lines: Option<String>,
     /// [`Self::turn_said`], read as [`Self::said_lines`] is.
     pub turn_lines: Option<String>,
+    /// Where each of [`Self::turn_said`]'s messages after the first opens, in it and in
+    /// [`Self::turn_lines`] ([`needs::Breaks`]): the readers of the turn's needs read a none in
+    /// an earlier message for that message alone ([`needs::standing_before`]).
+    pub turn_breaks: needs::Breaks,
     pub opened_by: Option<u64>,
     pub message_drawn: bool,
     pub submits: Option<u64>,
@@ -11306,6 +11561,10 @@ pub struct TurnEndReading {
     pub login_at_wall: Option<aterm_phase::LoginAtWall>,
     pub login_method: Option<aterm_phase::LoginMethod>,
     pub login_shared: Option<super::login::LoginShared>,
+    /// WHAT CLAUDE CODE'S SETTINGS MAKE OF `/login` here (`IdleHost::login_pin`, read at a lost
+    /// login before aterm types it): a pinned sign-in method opens the browser at once, so
+    /// `/login` is then the person's to type ([`super::login::LoginPin::leaves_login`]).
+    pub login_pin: super::login::LoginPin,
     /// THE LOGIN MOVED OFF THE LIMIT'S ACCOUNT: the session's Claude Code
     /// profile names another account than the one its standing limit was
     /// read under (`IdleHost::login_account`), on the one reading that
@@ -11316,6 +11575,13 @@ pub struct TurnEndReading {
     pub record_turn: Option<RecordTurn>,
     pub credits: Option<CreditsCarry>,
     pub repo: crate::harness::repo_work::RepoRead,
+    /// THE PROCESSES THE SESSION'S AGENT STARTED THAT STILL RUN, as the host read and re-proved
+    /// them at this yield (`IdleHost::leftover`): read by the loop only where it reads
+    /// [`Self::repo`] (a done claim, a finished record, an awaited land check, a Land go-ahead's
+    /// park), fresh at each, and not asked anywhere else, nor by a tape recorded without the door.
+    /// Under Land an unkept row holds the landing ([`HoldLeg::Left`]); a view that cannot say holds
+    /// nothing.
+    pub leftover: crate::harness::leftover::LeftRead,
 }
 
 /// THE TURN A SCREEN'S LAST WORDS CLOSE ([`TurnEndReading::answered`]).
@@ -11461,24 +11727,40 @@ impl TurnEndReading {
     }
 
     /// THE TURN'S EARLIER MESSAGES AS ITS LAST WORD LEAVES THEM for needs
-    /// ([`needs::standing_before`]): [`Self::turn_said`] from the last paragraph that says no need
-    /// stands, or none where the reply ([`Self::said_tail`]) says it. Every reader of the needs a
-    /// turn named reads them here, beside the reply's own, but the go-ahead reader, which reads
-    /// the same rule's cut ([`needs::retracted_cut`]) for its prose (the post-landing review,
+    /// ([`needs::standing_before`]): [`Self::turn_said`] without the needs each message's own later
+    /// none retracted, or none where the reply ([`Self::said_tail`]) says it. Every reader of the
+    /// needs a turn named reads them here, beside the reply's own, but the go-ahead reader, which
+    /// reads the same rule's cut ([`needs::retracted_cut`]) for its prose (the post-landing review,
     /// 2026-11-01).
     #[must_use]
-    pub fn needs_before(&self) -> Option<&str> {
-        needs::standing_before(
-            self.turn_said.as_deref(),
-            self.said_tail.as_deref().unwrap_or_default(),
-        )
+    pub fn needs_before(&self) -> Option<std::borrow::Cow<'_, str>> {
+        needs::standing_before(self.before(), self.said_tail.as_deref().unwrap_or_default())
     }
 
     /// Whether [`Self::needs_before`] names a need.
     #[must_use]
     pub fn need_before(&self) -> bool {
         self.needs_before()
-            .is_some_and(|t| !needs::needs_you(t).is_empty())
+            .is_some_and(|t| !needs::needs_you(&t).is_empty())
+    }
+
+    /// [`Self::turn_said`], its messages told apart ([`Self::turn_breaks`]).
+    #[must_use]
+    pub fn before(&self) -> Option<needs::Before<'_>> {
+        self.turn_said
+            .as_deref()
+            .map(|t| needs::Before::new(t, &self.turn_breaks.said))
+    }
+
+    /// The turn's earlier messages as the needs fold reads them: [`Self::turn_lines`] where it
+    /// holds the same words as [`Self::turn_said`] ([`lines_of`]), else [`Self::before`].
+    fn lines_before(&self) -> Option<needs::Before<'_>> {
+        match (self.turn_said.as_deref(), self.turn_lines.as_deref()) {
+            (said, Some(lines)) if lines_of(said, Some(lines)) == Some(lines) => {
+                Some(needs::Before::new(lines, &self.turn_breaks.lines))
+            }
+            _ => self.before(),
+        }
     }
 
     /// WHETHER A NEED THE TURN NAMED STANDS: the reply's own, or one its earlier messages named
@@ -11507,7 +11789,7 @@ impl TurnEndReading {
             return None;
         }
         turn_go_ahead(
-            self.turn_said.as_deref(),
+            self.before(),
             self.said_tail.as_deref().unwrap_or_default(),
             act,
         )
@@ -11583,6 +11865,22 @@ impl TurnEndReading {
                 Some(Composer::Unknown)
             }
         });
+        // A DRAFT ITS PROGRAM RUNS AS A COMMAND (v6 §14.17.5.8): by its own forms
+        // ([`aterm_phase::draft_command`]), or under Claude Code's slash menu, whose Enter runs an
+        // entry ([`aterm_phase::phase::MenuEnter::Run`]) whatever the draft says.
+        let command = reading.composer.as_ref().and_then(|(_, lines)| {
+            aterm_phase::draft_command(reading.program, lines).or_else(|| {
+                claude
+                    .then(|| aterm_phase::phase::completion_menu(rows))
+                    .flatten()
+                    .filter(|menu| {
+                        menu.runs(read.menu_fg.as_deref())
+                            .iter()
+                            .any(|enter| matches!(enter, aterm_phase::phase::MenuEnter::Run(_)))
+                    })
+                    .map(|_| aterm_phase::DraftCommand::Slash)
+            })
+        });
         // A HISTORY SEARCH OVER THE COMPOSER: what its row shows (a match drawn as typed, nothing, a
         // suggestion) is no draft Enter would send, whatever its cell says.
         let searching = reading.program.reader().history_search(rows);
@@ -11591,7 +11889,10 @@ impl TurnEndReading {
             (Some(_), _) if searching => Composer::Diverted(Diversion::Search),
             (Some(_), None) => Composer::Unknown,
             (Some(_), Some(true)) if own => Composer::Own,
-            (Some(_), Some(true)) => over_menu.unwrap_or(Composer::Typed),
+            (Some(_), Some(true)) => match command {
+                Some(form) => Composer::Command(form, CommandEnter::of(over_menu.as_ref())),
+                None => over_menu.unwrap_or(Composer::Typed),
+            },
             (Some(_), Some(false)) => match &reading.suggestion {
                 Some(s) => Composer::Placeholder(s.clone()),
                 None => Composer::Empty,
@@ -11620,6 +11921,14 @@ impl TurnEndReading {
             .flatten()
             .unwrap_or_default();
         let less = |w: Duration, asleep: Duration| w.max(done.saturating_sub(asleep));
+        let (turn_said, said_breaks) =
+            needs::joined(reading.program.reader().turn_messages_before(rows));
+        let (turn_lines, lines_breaks) = needs::joined(
+            reading
+                .program
+                .reader()
+                .turn_message_lines_before(rows, needs::apart),
+        );
         Self {
             phase: reading.phase.clone(),
             authoritative: reading.phase_authoritative,
@@ -11641,12 +11950,13 @@ impl TurnEndReading {
             opens_cut: reading.said_tail.is_some()
                 && !reading.program.reader().bounds_messages()
                 && !reading.program.reader().turn_whole(rows),
-            turn_said: reading.program.reader().turn_said_before(rows),
+            turn_said,
             said_lines: reading.program.reader().said_lines(rows, needs::apart),
-            turn_lines: reading
-                .program
-                .reader()
-                .turn_lines_before(rows, needs::apart),
+            turn_lines,
+            turn_breaks: needs::Breaks {
+                said: said_breaks,
+                lines: lines_breaks,
+            },
             opened_by: reading
                 .program
                 .reader()
@@ -11703,6 +12013,7 @@ impl TurnEndReading {
             login_at_wall: claude.then(|| aterm_phase::login_at_wall(rows)).flatten(),
             login_method: None,
             login_shared: None,
+            login_pin: super::login::LoginPin::Picker,
             login_moved: false,
             roster: None,
             answered: claude.then(|| ScreenAnswer::of(rows)).flatten(),
@@ -11712,6 +12023,7 @@ impl TurnEndReading {
                 ..CreditsCarry::default()
             }),
             repo: crate::harness::repo_work::RepoRead::Clean,
+            leftover: crate::harness::leftover::LeftRead::NotAsked,
         }
     }
 
@@ -12404,7 +12716,35 @@ struct LandEpisode {
     rest: bool,
     /// The rest was journaled ([`TurnEndState::rest_untold`]).
     rest_told: bool,
+    /// THE TOKENS THE EPISODE'S DEFENSES KEPT RUNNING (each `keep <token>` line under a `Nothing
+    /// left:`, [`needs::kept_tokens`]) that still run ([`Self::keep`]): the rows they name hold no
+    /// landing for the rest of the episode, at the check's `LANDED`, which has no defense to read,
+    /// as at the defense itself.
+    kept: [Option<aterm_uds::process::Identity>; KEPT_TOKENS],
+    /// A DEFENSE KEPT MORE RUNNING ROWS THAN [`Self::kept`] HOLDS: the episode no longer knows
+    /// which rows its defenses kept, so the left leg holds nothing for the rest of it and a
+    /// landing over a row it reads unkept says `left=unchecked`.
+    kept_over: bool,
+    /// HOW MANY YIELDS THE LEFT LEG HELD IN THIS EPISODE ([`HoldLeg::Left`]): from
+    /// [`LEFT_HOLDS`] on it holds no more, so a program that starts again whatever the agent ends
+    /// cannot keep Land typing.
+    left_holds: u8,
+    /// THE REPLY WHOSE YIELD THE LEFT LEG COUNTED AND NOTHING SETTLED YET ([`Self::left_holds`],
+    /// its [`reply_mark`]): an act typed, or a turn run since the yield, settles it
+    /// ([`TurnEndState::settle_left`]). Until then the same yield read again before its act takes
+    /// its hold back first ([`TurnEndState::uncount_left`]), and the books a loop that follows
+    /// seeds leave it out ([`TurnEndState::land_books`]): that loop counts it again where it judges
+    /// the yield again and still holds, and never where it reads a turn run since, so each yield
+    /// counts once, and only as it was last judged.
+    left_counted: Option<u64>,
 }
+
+/// The most running rows a land episode keeps at once ([`LandEpisode::kept`]).
+pub const KEPT_TOKENS: usize = 16;
+
+/// HOW MANY TIMES THE LEFT LEG HOLDS A LAND EPISODE ([`LandEpisode::left_holds`]), as many as
+/// the same reply is let hold: past them a landing says the rows it left (`left=<n>`).
+pub const LEFT_HOLDS: u8 = 3;
 
 /// THE LAND CHECK'S BOOKS A LOOP THAT FOLLOWS KEEPS (v6 §14.17.13, the post-landing review,
 /// 2026-11-01): the defenses the check audited since the last real work ([`LandEpisode::audited`])
@@ -12415,6 +12755,13 @@ struct LandEpisode {
 pub struct LandBooks {
     pub audited: [Option<u64>; 3],
     pub sent: Option<u64>,
+    /// The tokens the episode's defenses kept ([`LandEpisode::kept`]).
+    pub kept: [Option<aterm_uds::process::Identity>; KEPT_TOKENS],
+    /// A defense kept more than they hold ([`LandEpisode::kept_over`]).
+    pub kept_over: bool,
+    /// The yields the left leg held, the one nothing settled yet left out
+    /// ([`LandEpisode::left_holds`], [`LandEpisode::left_counted`]).
+    pub left_holds: u8,
 }
 
 /// THE WALL'S PASS A LOOP THAT FOLLOWS KEEPS (v6 §14.17.5.7): whether a cut act went uncounted
@@ -12470,6 +12817,49 @@ impl LandEpisode {
         if !self.audited.contains(&Some(mark)) {
             self.audited.rotate_left(1);
             self.audited[self.audited.len() - 1] = Some(mark);
+        }
+    }
+
+    /// Keeps `tokens` running for the rest of the episode ([`Self::kept`]), newest last: first the
+    /// kept tokens the yield's rows (`running`) no longer list are let go, since a token names one
+    /// process and a gone one keeps nothing again, then each new token joins them. Past
+    /// [`KEPT_TOKENS`] the new tokens no row read names go first, oldest first, so only kept rows
+    /// that run fill the books (a new one no row names, a process gone or one this yield read as no
+    /// row of the agent's, stays while there is room); past it still, the oldest are dropped and
+    /// [`Self::kept_over`] is set. With no rows read (`running` is `None`) none is let go.
+    fn keep(
+        &mut self,
+        tokens: &[aterm_uds::process::Identity],
+        running: Option<&[aterm_uds::process::Identity]>,
+    ) {
+        let runs =
+            |token: &aterm_uds::process::Identity| running.is_none_or(|rows| rows.contains(token));
+        let mut kept: Vec<aterm_uds::process::Identity> = self
+            .kept
+            .iter()
+            .flatten()
+            .filter(|token| runs(token))
+            .copied()
+            .collect();
+        for token in tokens {
+            if !kept.contains(token) {
+                kept.push(*token);
+            }
+        }
+        let mut spare = kept.len().saturating_sub(KEPT_TOKENS);
+        kept.retain(|token| {
+            let drop = spare > 0 && !runs(token);
+            spare -= usize::from(drop);
+            !drop
+        });
+        if kept.len() > KEPT_TOKENS {
+            self.kept_over = true;
+            kept.drain(..kept.len() - KEPT_TOKENS);
+        }
+        self.kept = [None; KEPT_TOKENS];
+        let from = KEPT_TOKENS - kept.len();
+        for (slot, token) in self.kept[from..].iter_mut().zip(kept) {
+            *slot = Some(token);
         }
     }
 
@@ -12544,6 +12934,23 @@ impl Needs {
         if self.named {
             self.answered.retain(|line| parks.contains(line));
         }
+    }
+
+    /// The standing needs a word of the agent's took back ([`needs::retracted_in`]) are no
+    /// longer standing.
+    fn retract(&mut self, lines: &[String]) {
+        if lines.is_empty() || !self.standing.iter().any(|n| lines.contains(n)) {
+            return;
+        }
+        self.standing.retain(|n| !lines.contains(n));
+        self.answered.retain(|n| !lines.contains(n));
+        self.answering.retain(|n| !lines.contains(n));
+        if self.standing.is_empty() {
+            *self = Self::default();
+            return;
+        }
+        self.key = needs::needs_key(&self.standing);
+        self.reshow();
     }
 
     /// The lines being answered, and `past`, are answered: off the menu bar for good, until a
@@ -12732,6 +13139,14 @@ pub struct TurnEndState {
     land_point_seed: bool,
     open: Vec<&'static str>,
     repo: crate::harness::repo_work::RepoRead,
+    /// HOW MANY PROCESSES THE ACT'S LEFT SUFFIX NAMES ([`Suffix::Left`]): under Land the unkept
+    /// rows of a yield whose left leg held ([`HoldLeg::Left`]), under Cruise those of its done
+    /// claim; none elsewhere.
+    left_said: u16,
+    /// THE DONE LINE'S `left=` WORD of the landing this loop made ([`crate::harness::leftover::LeftWord`]):
+    /// what its yield read of the agent's left rows; `None` where nothing was asked or no landing
+    /// was made here.
+    landed_left: Option<crate::harness::leftover::LeftWord>,
     needs: Needs,
     autopilot: Option<Autopilot>,
     /// The word the replies were last read under, for the person's switch to Land
@@ -12771,7 +13186,7 @@ pub struct TurnEndState {
     /// nothing is typed, until a turn runs.
     gave_up: Option<GaveUp>,
     /// The point judged last read `Could not finish:` under every gate but the manager's, which a
-    /// loop's first point has not read yet ([`Self::set_managed`]).
+    /// point judged with no record read back has not read yet ([`Self::set_managed`]).
     could_not_finish_read: bool,
     /// THE FAILED CONCLUSION A LOOP BEFORE THIS ONE JOURNALED, and the mark of the reply it ended on
     /// ([`Self::seed_failed`]), until this loop's first point takes it up or drops it.
@@ -12989,6 +13404,8 @@ impl TurnEndState {
             land_point_seed: false,
             open: Vec::new(),
             repo: crate::harness::repo_work::RepoRead::Clean,
+            left_said: 0,
+            landed_left: None,
             needs: Needs::default(),
             autopilot: None,
             word_seen: None,
@@ -13243,6 +13660,24 @@ impl TurnEndState {
             .and_then(|t| Some((t.kind?, t.attempts, t.ups, t.since, t.down)))
     }
 
+    /// Whether the retry track's outage resumed on a witness that met the wall again
+    /// ([`WallTrack::witnessed`]), for the loop that follows ([`Self::seed_retry_witnessed`]).
+    #[must_use]
+    pub fn retry_witnessed(&self) -> bool {
+        self.wall
+            .as_ref()
+            .is_some_and(|t| t.class == WallClass::Retry && t.witnessed)
+    }
+
+    /// A loop before this one resumed the seeded retry track's outage on a witness
+    /// ([`Self::retry_witnessed`], its row's ` witnessed=yes`): the ladder tries it until the agent
+    /// works again, as that loop's would have (the post-landing review, 2026-11-02).
+    pub fn seed_retry_witnessed(&mut self) {
+        if let Some(t) = self.wall.as_mut().filter(|t| t.class == WallClass::Retry) {
+            t.witnessed = true;
+        }
+    }
+
     /// THE WITNESS AN OUTAGE WAIT'S RESUME AT `reading` IS TYPED ON (v6 §14.17.5.4, slice 12c):
     /// when another session's turn on the route finished, where it clears the standing API wall's
     /// track ([`witness_clears`]); `None` otherwise. The loop journals it with the resume.
@@ -13253,15 +13688,17 @@ impl TurnEndState {
     }
 
     /// THE WITNESS `action` RESUMED THE OUTAGE ON (v6 §14.17.5.4): [`Self::witness_clearing`] at
-    /// the point's `reading`, where the act typed the outage's measured line; `None` for a blind
-    /// try, whatever witness landed while it was typed, and for every other act.
+    /// the point's `reading` as decided (`Check::AsDecided`, its witness the decision's), for an
+    /// outage's resume of any text but the blind try's line: the measured line, Land's instruction
+    /// or the person's draft sent on the witness (the post-landing review, 2026-11-02); `None` for
+    /// the blind line, whatever witness landed while it was typed, and for every other act.
     #[must_use]
     pub fn witness_resumed(
         &self,
         action: &TurnEndAction,
         reading: &TurnEndReading,
     ) -> Option<Instant> {
-        if action.rule_id() != Some(RULE_OUTAGE_RESUME) || !types_measured_outage_line(action) {
+        if action.rule_id() != Some(RULE_OUTAGE_RESUME) || types_blind_outage_line(action) {
             return None;
         }
         self.witness_clearing(reading)
@@ -13756,12 +14193,19 @@ impl TurnEndState {
         self.cut_uncounted = pass.owed;
     }
 
-    /// THE LAND CHECK'S BOOKS this state keeps ([`LandBooks`]), for the ledger's rows.
+    /// THE LAND CHECK'S BOOKS this state keeps ([`LandBooks`]), for the ledger's rows: the left
+    /// hold of a yield nothing settled yet left out ([`LandEpisode::left_counted`]), since the
+    /// yield may yet be judged again before its act, and a loop that follows judges it again or
+    /// reads a turn run since.
     #[must_use]
-    pub const fn land_books(&self) -> LandBooks {
+    pub fn land_books(&self) -> LandBooks {
+        let unsettled = u8::from(self.land.left_counted.is_some());
         LandBooks {
             audited: self.land.audited,
             sent: self.land.sent,
+            kept: self.land.kept,
+            kept_over: self.land.kept_over,
+            left_holds: self.land.left_holds.saturating_sub(unsettled),
         }
     }
 
@@ -13771,6 +14215,9 @@ impl TurnEndState {
         if self.land.typed {
             self.land.audited = books.audited;
             self.land.sent = books.sent;
+            self.land.kept = books.kept;
+            self.land.kept_over = books.kept_over;
+            self.land.left_holds = books.left_holds;
         }
     }
 
@@ -14836,6 +15283,7 @@ impl TurnEndState {
             unlanded: legs.unlanded,
             sub_unpushed: legs.sub_unpushed,
             parked: legs.parked,
+            left: legs.left,
             ..base
         }))
     }
@@ -14879,14 +15327,99 @@ impl TurnEndState {
     }
 
     /// The legs and words of the land act's yield read now ([`hold_at_yield`]); none once landed.
+    /// A yield the left leg holds counts toward [`LEFT_HOLDS`] ([`LandEpisode::left_counted`]),
+    /// and its rows are what the act's left suffix names ([`Self::left_said`]).
     fn set_legs(&mut self, reading: &TurnEndReading, answer: Option<&land_check::CheckAnswer>) {
         if self.landed() {
             self.land.legs = None;
         } else {
-            let (held, said) = hold_at_yield(reading, answer, self.land_listed.as_deref());
+            let left = self.left_at_yield(reading, answer.is_some());
+            let (held, said) = hold_at_yield(reading, answer, self.land_listed.as_deref(), left);
+            let counted = held.holds(HoldLeg::Left);
+            if counted {
+                self.land.left_holds = self.land.left_holds.saturating_add(1);
+            }
+            self.land.left_counted = counted.then(|| reply_mark(reading));
+            if reading.autopilot == Autopilot::Land {
+                self.left_said = held.left;
+            }
             self.land.legs = Some(held);
             self.land_said = said;
         }
+    }
+
+    /// A YIELD READ AGAIN BEFORE ITS ACT is judged as it was the first time: the hold the left leg
+    /// counted for it and nothing settled yet ([`LandEpisode::left_counted`]) is taken back, and
+    /// [`Self::set_legs`] counts it again where it still holds.
+    fn uncount_left(&mut self, reading: &TurnEndReading) {
+        if self.land.left_counted == Some(reply_mark(reading)) {
+            self.land.left_holds = self.land.left_holds.saturating_sub(1);
+            self.land.left_counted = None;
+        }
+    }
+
+    /// THE LEFT HOLD NOTHING SETTLED YET IS SETTLED ([`LandEpisode::left_counted`]): an act typed,
+    /// or a turn run since its yield, leaves that yield nothing to judge again, so its hold stands
+    /// counted, in the books a loop that follows seeds too.
+    const fn settle_left(&mut self) {
+        self.land.left_counted = None;
+    }
+
+    /// WHAT KEEPS A ROW RUNNING AT `reading`: a `keep <token>` line under one of the episode's
+    /// defenses ([`LandEpisode::kept`]) or under the reply's own ([`needs::kept_tokens`]).
+    fn left_kept(
+        &self,
+        reading: &TurnEndReading,
+    ) -> impl Fn(&aterm_uds::process::Identity) -> bool {
+        let said = reading
+            .said_tail
+            .as_deref()
+            .filter(|_| !reading.leftover.rows().is_empty())
+            .map(needs::kept_tokens)
+            .unwrap_or_default();
+        let episode = self.land.kept;
+        move |row| episode.contains(&Some(*row)) || said.contains(row)
+    }
+
+    /// The agent's left rows at `reading` nothing keeps running ([`Self::left_kept`]).
+    fn left_unkept(&self, reading: &TurnEndReading) -> u16 {
+        let n = reading.leftover.unkept(self.left_kept(reading)).count();
+        u16::try_from(n).unwrap_or(u16::MAX)
+    }
+
+    /// WHETHER THE LEFT LEG HOLDS LAND AT `reading` ([`HoldLeg::Left`]): under Land, a row of the
+    /// agent's nothing keeps, while the episode's left holds are fewer than [`LEFT_HOLDS`]. A view
+    /// that could not say, none asked, or an episode that lost what its defenses kept
+    /// ([`LandEpisode::kept_over`]) holds nothing.
+    fn left_holds(&self, reading: &TurnEndReading) -> bool {
+        reading.autopilot == Autopilot::Land
+            && !self.land.kept_over
+            && self.land.left_holds < LEFT_HOLDS
+            && self.left_unkept(reading) > 0
+    }
+
+    /// HOW MANY OF THE AGENT'S LEFT ROWS HOLD THE LAND ACT'S YIELD AT `reading`: where the leg holds
+    /// ([`Self::left_holds`]) at a `Nothing left:` defense, where it would owe the check, or at the
+    /// check's answer (`answered`), where its `LANDED` lands nothing over them; none at any other
+    /// reply, whose own legs hold it.
+    fn left_at_yield(&self, reading: &TurnEndReading, answered: bool) -> u16 {
+        let defends = reading
+            .said_tail
+            .as_deref()
+            .and_then(needs::defense_line)
+            .is_some();
+        if (answered || defends) && self.left_holds(reading) {
+            self.left_unkept(reading)
+        } else {
+            0
+        }
+    }
+
+    /// THE DONE LINE'S `left=` WORD of the landing this loop made: what its yield read of the
+    /// agent's left rows, the episode's kept tokens kept; `None` where nothing was asked there.
+    #[must_use]
+    pub const fn landed_left(&self) -> Option<crate::harness::leftover::LeftWord> {
+        self.landed_left
     }
 
     /// THE SESSION'S WORD AS A POINT READ IT (v6 §14.17 item 3), the word a wake reported riding
@@ -15058,12 +15591,24 @@ impl TurnEndState {
     }
 
     /// A DEFENSE AT A LAND ACT'S YIELD owes the land check, once per defense, over a clean
-    /// repository read; a dirty or unread one gets the repository's facts instead.
+    /// repository read and no row of the agent's left running unkept ([`Self::left_holds`]); a
+    /// dirty or unread repository gets the repository's facts instead, and a left row the left
+    /// suffix. The tokens its keep lines name stay kept for the rest of the episode while they run
+    /// ([`LandEpisode::keep`]).
     fn land_defended(&mut self, reading: &TurnEndReading) {
         let tail = reading.said_tail.as_deref();
         let mark = reply_mark(reading);
+        let running = match &reading.leftover {
+            crate::harness::leftover::LeftRead::Rows(rows) => Some(rows.as_slice()),
+            crate::harness::leftover::LeftRead::NotAsked
+            | crate::harness::leftover::LeftRead::Unchecked => None,
+        };
+        self.land
+            .keep(&tail.map(needs::kept_tokens).unwrap_or_default(), running);
+        let left = self.left_holds(reading);
         let owed = !self.landed()
             && reading.repo.is_clean()
+            && !left
             && tail.and_then(needs::defense_line).is_some()
             && !self.land.audited(mark);
         self.land.check_owed = owed;
@@ -15327,11 +15872,14 @@ impl TurnEndState {
 
     /// Whether `autopilot` leaves a person's own exchange to them. CRUISE NEVER PARKS (owner ruling
     /// 2026-10-26); under Land only the exchange that opens the session is theirs
-    /// (2026-10-27, [`Self::exchange_opens`]); Off leaves every one.
+    /// (2026-10-27, [`Self::exchange_opens`]), and never a managed worker's
+    /// ([`Self::set_managed`]): its opening message is the task aterm or its manager typed, so a
+    /// person's gesture in its first turn (a box they answered, a click, a scroll) makes the work
+    /// no exchange of theirs, and Land goes on to conclude it (2026-11-04); Off leaves every one.
     const fn mode_leaves_exchange(&self, autopilot: Autopilot) -> bool {
         match autopilot {
             Autopilot::Cruise => false,
-            Autopilot::Land => self.exchange_opens,
+            Autopilot::Land => self.exchange_opens && !self.managed,
             Autopilot::Off => true,
         }
     }
@@ -15369,8 +15917,9 @@ impl TurnEndState {
         self.done_at
     }
 
-    /// A MANAGER WAITS ON THIS SESSION (`managed`). A loop's first point is judged before the
-    /// record is read, so its `Could not finish:` word waits here for this.
+    /// A MANAGER WAITS ON THIS SESSION (`managed`). The loop reads the record before its first
+    /// point is judged; a point judged while no read had come back (a lost one) keeps its
+    /// `Could not finish:` word here for this.
     pub fn set_managed(&mut self, managed: bool) {
         self.managed = managed;
         if managed && std::mem::take(&mut self.could_not_finish_read) {
@@ -15429,6 +15978,35 @@ impl TurnEndState {
         self.conclude(GaveUp::Repeated);
     }
 
+    /// A MANAGED WORKER'S USAGE WALL ENDS ITS WORK ([`GaveUp::UsageLimit`]): at a Land point whose
+    /// decision (`decided`) typed nothing at the worker's own usage wall ([`managed_wall_ends`]),
+    /// shown or left on the screen and remembered (the wall the decider read, [`still_shown`]),
+    /// because its reset lies past [`MANAGED_WALL_HORIZON`], or no act lifts it, and no move off it
+    /// (another account, a fallback model) was made ([`managed_wall_act`]), the rest it would take
+    /// has no end its manager could wait for, so it is a conclusion: the record is marked `failed
+    /// why=usage-limit`, which is the manager's report and lets it run the work again once quota
+    /// returns. A decision that waits, moves or types concludes nothing, and a person's tab waits
+    /// for its reset as before.
+    pub fn conclude_at_wall(
+        &mut self,
+        reading: &TurnEndReading,
+        cfg: &SupervisorConfig,
+        decided: &TurnEndAction,
+    ) {
+        if *decided != TurnEndAction::Nothing {
+            return;
+        }
+        let left = self
+            .wall
+            .as_ref()
+            .filter(|t| reading.wall.is_none() && named_class(t.class))
+            .and_then(|t| still_shown(t, reading));
+        let at_wall = left.as_ref().map_or(reading, |(_, shown)| shown);
+        if managed_wall_ends(self, at_wall, cfg) {
+            self.conclude(GaveUp::UsageLimit);
+        }
+    }
+
     /// THE FAILED CONCLUSION A LOOP BEFORE THIS ONE JOURNALED: the rest a journal's landing seeds
     /// ([`Self::seed_landed`]), since a relaunch restores the session's Land and no task record. It
     /// takes this loop's first point where that point holds the same reply (`words`, where the
@@ -15448,15 +16026,19 @@ impl TurnEndState {
 
     /// THE RECORD SAYS THE WORK ENDED UNFINISHED: whether that stands here, as
     /// [`Self::seed_task_done`] asks of a landing. A turn that ran at the first point, an act in
-    /// flight or a wall means it no longer does, and the record is opened again.
+    /// flight or a wall means it no longer does, and the record is opened again; a usage or model
+    /// limit's wall is where a [`GaveUp::UsageLimit`] was concluded, so that one stands at it.
     pub fn seed_gave_up(&mut self, ending: GaveUp) -> bool {
         if self.gave_up.is_some() {
             return true;
         }
+        let its_wall = |t: &WallTrack| {
+            ending == GaveUp::UsageLimit && matches!(t.class, WallClass::Usage | WallClass::Model)
+        };
         if self.autopilot == Some(Autopilot::Cruise)
             || !self.point_turnless
             || self.task_done()
-            || self.wall.is_some()
+            || self.wall.as_ref().is_some_and(|t| !its_wall(t))
             || self.awaiting.is_some()
             || self.after.is_some()
         {
@@ -15721,7 +16303,7 @@ impl TurnEndState {
     #[must_use]
     pub fn go_ahead_at_break(
         &self,
-        turn_said: Option<&str>,
+        turn_said: Option<needs::Before<'_>>,
         tail: &str,
         opens_cut: bool,
     ) -> Option<go_ahead::Park> {
@@ -15921,6 +16503,7 @@ impl TurnEndState {
             &[
                 Suffix::Open(&self.open),
                 Suffix::Repo(&self.repo, RepoAsk::Own),
+                Suffix::Left(self.left_said, RepoAsk::Own),
                 Suffix::Fixed(reversible_clause(
                     irreversible || (ack && self.needs_destroy()),
                 )),
@@ -16567,6 +17150,26 @@ impl TurnEndState {
             },
             true,
             false,
+        )
+    }
+
+    /// THE LOST LOGIN LEFT TO THE PERSON OVER A PIN WHOSE NOTICE LEFT THE SCREEN: `reading` as the
+    /// point read it (its notice, from the track, as [`still_shown`] puts it back), where the
+    /// login's track stands with no `/login` typed and the agent's settings leave `/login` to the
+    /// person ([`super::login::LoginPin::leaves_login`]), so the person is told of it as at the
+    /// notice on screen, until the login is back (the review of fix/landed-review-2, 2026-11-02).
+    #[must_use]
+    pub(super) fn pinned_login_left(&self, reading: &TurnEndReading) -> Option<TurnEndReading> {
+        let t = self
+            .wall
+            .as_ref()
+            .filter(|t| t.class == WallClass::Auth && t.attempts == 0)?;
+        (reading.wall.is_none() && reading.login_pin.leaves_login() && !reading.login_back).then(
+            || TurnEndReading {
+                wall: Some(WallKind::Auth),
+                wall_message: t.said.clone(),
+                ..reading.clone()
+            },
         )
     }
 
@@ -17341,13 +17944,19 @@ impl TurnEndState {
         let answer_stopped = check_yield && reading.interrupted;
         let answer_read = land_check::land_check_answer(
             reading.said_tail.as_deref().unwrap_or_default(),
-            reading.turn_said.as_deref(),
+            reading.before(),
             reading.said_cut,
         );
         let landed_answer = answer_read == land_check::CheckAnswer::Landed;
         let check_answer = check_yield.then(|| answer_read.clone());
-        let clean =
-            check_answer == Some(land_check::CheckAnswer::Landed) && reading.repo.is_clean();
+        // A ROW OF THE AGENT'S LEFT RUNNING UNKEPT holds the landing the check's `LANDED` would make
+        // ([`Self::left_holds`]). A landing made stands over it: a seeded one, one its words or its
+        // wake hold, and one a finished record keeps (`by_record`, which keeps only a landing this
+        // loop or its journal made, whose `LANDED` the leg already let land).
+        let left_held = self.left_holds(reading);
+        let clean = check_answer == Some(land_check::CheckAnswer::Landed)
+            && reading.repo.is_clean()
+            && !left_held;
         // A LANDING ITS JOURNAL OR ITS PARK HOLDS stands on the reply that landed it: the check's
         // `LANDED`, or an older build's clean defense.
         let seed_clean = (clean_words || landed_answer) && reading.repo.is_clean();
@@ -17551,7 +18160,8 @@ impl TurnEndState {
             (None, Some(d)) => {
                 self.exchange_work = d;
                 // CRUISE NEVER PARKS: a person's own exchange is left to them under Land and Off
-                // alone, and under Land only where it opens the session (owner ruling 2026-10-27):
+                // alone, and under Land only where it opens the session (owner ruling 2026-10-27)
+                // of no managed worker ([`Self::mode_leaves_exchange`]):
                 // a person's message once the session has worked (a point this loop judged, or a
                 // loop before it: [`Self::seed_point`], [`Self::seed_worked`]) interrupts that
                 // work, which Land carries on after the reply. A program started fresh in the
@@ -17900,11 +18510,13 @@ impl TurnEndState {
         // row again: theirs again, but under Cruise, which never parks
         // ([`Self::mode_takes_exchange`]), and under Land once the session worked, where only its
         // opening message is the person's: a record of one left after work is an older build's,
-        // under the superseded rule, or Off's, and the work goes on.
+        // under the superseded rule, or Off's, and the work goes on. Nor is a managed worker's
+        // under Land ([`Self::mode_leaves_exchange`]): a record of its opening message left is an
+        // older build's too.
         let left_record = reading.left_record
             && match reading.autopilot {
                 Autopilot::Cruise => false,
-                Autopilot::Land => !self.left_after_work,
+                Autopilot::Land => !self.left_after_work && !self.managed,
                 Autopilot::Off => true,
             };
         if left_record {
@@ -17943,6 +18555,13 @@ impl TurnEndState {
             } else {
                 crate::harness::repo_work::RepoRead::Clean
             };
+            // Cruise's done check names the rows its claim left, and holds nothing on them; Land's
+            // act names those of a yield its left leg held ([`Self::set_legs`]).
+            self.left_said = if claim && reading.autopilot == Autopilot::Cruise {
+                self.left_unkept(reading)
+            } else {
+                0
+            };
             if reading.wall.is_none() && !reading.pending_input {
                 // Someone else's turn on someone's prompt (`prompted`): the
                 // person answered what stood. A turn nobody asked — Claude
@@ -17953,7 +18572,7 @@ impl TurnEndState {
                 }
                 let act = self.act_words.clone().filter(|_| reading.opens_cut);
                 self.fold_turn_needs(
-                    lines_of(reading.turn_said.as_deref(), reading.turn_lines.as_deref()),
+                    reading.lines_before(),
                     lines_of(tail, reading.said_lines.as_deref()),
                     act.as_deref(),
                 );
@@ -18009,6 +18628,7 @@ impl TurnEndState {
         }
         if awaited.is_some() || reading.worked.is_some() {
             self.land.check_owed = false;
+            self.settle_left();
         }
         // THE LAND ACT'S ANSWER A LOOP BEFORE THIS ONE JUDGED, READ AGAIN ([`Self::seed_land_point`]):
         // the check that loop owed its defense is owed here too, as that loop typed it.
@@ -18018,11 +18638,18 @@ impl TurnEndState {
             && ok_to_leave
             && check_answer.is_none()
             && reading.autopilot == Autopilot::Land;
+        // A `LANDED` A LEFT ROW HELD checks no defense: said again once the row is ended, the
+        // defense is owed the check again.
+        let audits = |answer: &land_check::CheckAnswer| {
+            !(left_held && *answer == land_check::CheckAnswer::Landed)
+        };
         if land_judged {
             self.land.check_pending = false;
             match &check_answer {
                 Some(answer) => {
-                    if let Some(mark) = self.land.sent.take() {
+                    if let Some(mark) = self.land.sent.take()
+                        && audits(answer)
+                    {
                         self.land.audit(mark);
                     }
                     self.land_answered(answer, reading);
@@ -18038,17 +18665,34 @@ impl TurnEndState {
             // [`Self::seed_land_checked`]; the post-landing review, 2026-11-01): read again as the
             // loop before this one read it, so a rest on a need stays a rest, typing nothing, a
             // list stays answered and quoted, and the defense it audits is audited. A stopped
-            // turn gave no answer, there as here.
+            // turn gave no answer, there as here. Its left hold, which the books that loop handed
+            // on leave out ([`Self::land_books`]), is counted where it still holds, and a `LANDED`
+            // no left row holds now, over a repository read clean, lands, as the check's answer
+            // lands where it is first read so ([`Self::left_holds`]).
+            let left_held = self.left_holds(reading);
             let answer = (std::mem::take(&mut self.land.check_pending) && !reading.interrupted)
                 .then_some(answer_read);
             match &answer {
                 Some(answer) => {
-                    if let Some(mark) = self.land.sent.take() {
+                    if let Some(mark) = self.land.sent.take()
+                        && !(left_held && *answer == land_check::CheckAnswer::Landed)
+                    {
                         self.land.audit(mark);
                     }
                     self.land_answered(answer, reading);
                 }
                 None => self.land_defended(reading),
+            }
+            if answer == Some(land_check::CheckAnswer::Landed)
+                && reading.repo.is_clean()
+                && !left_held
+                && !self.exchange
+                && !self.landed()
+            {
+                self.done = 2;
+                self.done_at = Some(now);
+                self.landed = true;
+                self.by_check = true;
             }
             self.set_legs(reading, answer.as_ref());
         } else if check_yield && !(self.cut_land || reading.pending_input) {
@@ -18056,6 +18700,26 @@ impl TurnEndState {
             // checked, so said again it is owed the check.
             self.land.check_pending = false;
             self.land.sent = None;
+        } else if awaited.is_none()
+            && reading.worked.is_none()
+            && ok_to_leave
+            && reading.autopilot == Autopilot::Land
+            && self.land.legs.is_some_and(|legs| legs.holds(HoldLeg::Left))
+            && reading.leftover != crate::harness::leftover::LeftRead::NotAsked
+            && reading
+                .said_tail
+                .as_deref()
+                .and_then(needs::defense_line)
+                .is_some()
+            && self.left_unkept(reading) != self.left_said
+        {
+            // A DEFENSE THE LEFT LEG HELD, READ AGAIN OVER OTHER ROWS before its act (a row that
+            // ended by itself in the back-off), or over a view that can no longer say: judged
+            // again as the first time ([`Self::uncount_left`]), so the act names the rows that run
+            // now and, with none proved, the check is owed.
+            self.uncount_left(reading);
+            self.land_defended(reading);
+            self.set_legs(reading, None);
         }
         // THE WORKER'S OWN `Could not finish: <why>` (a managed worker's, under Land alone: Cruise
         // never rests, and a person's own session has no one waiting on such a word). A turn the
@@ -18084,6 +18748,16 @@ impl TurnEndState {
         }
         if self.landed() && !landed_before {
             self.landed_mark = seed_mark.or(tail_mark);
+            // An episode that lost what its defenses kept cannot say a row it reads unkept was left.
+            self.landed_left = match crate::harness::leftover::LeftWord::of(
+                &reading.leftover,
+                self.left_kept(reading),
+            ) {
+                Some(crate::harness::leftover::LeftWord::Left(_)) if self.land.kept_over => {
+                    Some(crate::harness::leftover::LeftWord::Unchecked)
+                }
+                word => word,
+            };
             self.hold_landed();
         }
         self.point_mark = tail_mark;
@@ -18520,34 +19194,49 @@ impl TurnEndState {
     /// there reaches no point ([`Self::observe`] folds needs at points), so its `NEEDS YOU:` lines
     /// are folded here from the turn's words as a point folds them: its earlier messages `before`
     /// (the act's own rows cut from their opening where it `opens_cut`), then its report `tail`.
-    pub fn fold_break_needs(&mut self, before: Option<&str>, tail: Option<&str>, opens_cut: bool) {
+    pub fn fold_break_needs(
+        &mut self,
+        before: Option<needs::Before<'_>>,
+        tail: Option<&str>,
+        opens_cut: bool,
+    ) {
         let act = self.act_words.clone().filter(|_| opens_cut);
         self.fold_turn_needs(before, tail, act.as_deref());
     }
 
     /// Fold the needs a turn's words name: its earlier messages `before`, the typed `act`'s own
     /// rows cut from their opening ([`without_act_rows`]), then its last `tail`.
-    fn fold_turn_needs(&mut self, before: Option<&str>, tail: Option<&str>, act: Option<&str>) {
+    fn fold_turn_needs(
+        &mut self,
+        before: Option<needs::Before<'_>>,
+        tail: Option<&str>,
+        act: Option<&str>,
+    ) {
         let opening = |t: &str| without_act_rows(t, act).to_string();
-        // The turn's last word on needs wins: a later word that says none stands retracts the
-        // needs its earlier messages named before it, and is folded itself, so a need an earlier
-        // point raised comes down too ([`needs::standing_before`]).
-        match tail.map_or(before, |t| needs::standing_before(before, t)) {
-            Some(before) => self.fold_needs(Some(&format!(
-                "{}\n\n{}",
-                opening(before),
-                tail.unwrap_or_default()
-            ))),
-            None => self.fold_needs(tail.map(opening).as_deref()),
+        // THE AGENT'S WORD ON NEEDS ([`needs::standing_before`]): its last message's own none
+        // retracts every need the turn named and every need an earlier point raised; an earlier
+        // message's own none retracts only the needs named before it in that message, here as
+        // in the turn's words ([`needs::retracted_in`]); a none anywhere else, quoted, fenced or
+        // in a message of its own, takes no need down.
+        let last = tail.unwrap_or_default();
+        let retracted = tail.is_some_and(needs::retracts);
+        if let Some(before) = before.filter(|_| !retracted) {
+            self.needs.retract(&needs::retracted_in(before));
+        }
+        match needs::standing_before(before, last) {
+            Some(before) => {
+                self.fold_needs(Some(&format!("{}\n\n{last}", opening(&before))), retracted)
+            }
+            None => self.fold_needs(tail.map(opening).as_deref(), retracted),
         }
     }
 
-    fn fold_needs(&mut self, tail: Option<&str>) {
+    fn fold_needs(&mut self, tail: Option<&str>, retracted: bool) {
         let Some(t) = tail else {
             return;
         };
         let named = needs::needs_you(t);
-        if named.is_empty() && needs::defense_line(t).is_none() && !needs::says_no_needs(t) {
+        if named.is_empty() && needs::defense_line(t).is_none() && !retracted {
             // A reply that goes on without the lines a go-ahead decided but did not type yet
             // answers them as its submission would (DESIGN-harness-autopilot §15.6).
             self.needs.answer(&[]);
@@ -18777,6 +19466,7 @@ impl TurnEndState {
         };
         let kept = self.kept_words(action, reading);
         self.point_last = false;
+        self.settle_left();
         self.fallback_unasked = false;
         self.account_asked |= self.account.is_some();
         self.account_startup = false;
@@ -19010,11 +19700,14 @@ impl TurnEndState {
         if (is_wall_act(rule) || in_limits_place)
             && let Some(t) = &mut self.wall
         {
-            // The resume typed on a witness latches it: the act typed the measured line (a blind
-            // try's line on a witness that landed while it was typed is no resume on it) and the
-            // point's witness clears the track ([`witness_clears`]).
+            // The resume decided on a witness latches it, whatever it typed (the post-landing
+            // review, 2026-11-02): the outage's measured line, Land's instruction not given yet,
+            // or the person's draft sent, but never the blind try's line. `reading` is the point
+            // as decided (`Check::AsDecided`), its witness the decision's, and a blind line on a
+            // witness that landed while it was typed latches nothing whatever the reading says
+            // ([`types_blind_outage_line`], [`witness_clears`]).
             if rule == RULE_OUTAGE_RESUME
-                && types_measured_outage_line(action)
+                && !types_blind_outage_line(action)
                 && t.kind
                     .is_some_and(|k| witness_clears(Some(&*t), reading, k).is_some())
             {
@@ -20039,6 +20732,68 @@ enum Suffix<'a> {
     Repo(&'a crate::harness::repo_work::RepoRead, RepoAsk),
     /// The agent's own list of what is left, quoted ([`land_check::listed_suffix`]).
     Listed(Option<&'a str>),
+    /// How many processes the session's agent left running ([`left_suffix`],
+    /// [`own_left_suffix`]), in the room the repository's ask leaves: whole, else short
+    /// ([`left_suffix_short`]), else not at all. None for `0`.
+    Left(u16, RepoAsk),
+}
+
+/// THE LEFT SUFFIX'S HEAD: how many processes the session's agent started still run.
+fn left_head(n: u16) -> String {
+    match n {
+        1 => "1 process this session started still runs".to_owned(),
+        n => format!("{n} processes this session started still run"),
+    }
+}
+
+/// THE CHECKS LAND MAKES BEFORE A LANDING, as `harness policy` names them (`land_checks=`), so a
+/// harness that supervises itself makes the same: `git`, the session repository read for work no
+/// remote main has; `left`, the processes the session's agent started that still run
+/// (`aterm ctl @self sys left`), each ended or kept by a `keep <token>` line under `Nothing left:`.
+pub const LAND_CHECKS: &str = "git,left";
+
+/// Where the agent reads the rows the left suffix counts.
+const LEFT_SYS: &str = "`aterm ctl @self sys left`";
+
+/// What the left suffix asks, and its close: no process is a person's question.
+const LEFT_NEVER_ASK: &str = "Do not ask about a process: it is never a NEEDS YOU line.";
+
+/// LAND'S LEFT SUFFIX ([`HoldLeg::Left`]): `n` processes the session's agent started still run,
+/// where to see them, how to keep one it was asked to run (a `keep <token>` line under `Nothing
+/// left:`, which the landing then takes as kept) and how to end what it started for its own
+/// checks. Numbers and fixed words only: no executable, path or argument.
+#[must_use]
+pub fn left_suffix(n: u16) -> String {
+    format!(
+        "{} ({LEFT_SYS}). Keep anything you were asked to run, or are unsure of, with a line \
+         `keep <token>` under `Nothing left:`; end what you started for your own checks with \
+         `aterm ctl end <token>`. {LEFT_NEVER_ASK}",
+        left_head(n)
+    )
+}
+
+/// CRUISE'S LEFT SUFFIX, its done check's: [`left_suffix`]'s count in its own-work words, as
+/// [`own_repo_work_suffix`] asks for the repository: end what the agent started for its own
+/// checks, leave running what it was asked to run. It holds nothing.
+#[must_use]
+pub fn own_left_suffix(n: u16) -> String {
+    format!(
+        "{} ({LEFT_SYS}): end what you started for your own checks with `aterm ctl end \
+         <token>`, and leave running what you were asked to run. {LEFT_NEVER_ASK}",
+        left_head(n)
+    )
+}
+
+/// THE LEFT SUFFIX WHERE THE WHOLE ONE DOES NOT FIT: the count and where to see the rows.
+#[must_use]
+pub fn left_suffix_short(n: u16) -> String {
+    format!("{}: {LEFT_SYS}.", left_head(n))
+}
+
+/// Whether `text` carries a left suffix of `n` rows, whole or short ([`Suffix::Left`]).
+#[must_use]
+pub fn carries_left_suffix(text: &str, n: u16) -> bool {
+    n > 0 && text.contains(&left_head(n))
 }
 
 fn units(s: &str) -> usize {
@@ -20161,12 +20916,36 @@ fn fit_act(base: &str, parts: &[Suffix<'_>], rules: Option<&str>) -> (String, bo
     }
     let (open, repo_s) = chosen;
     let repo_left = (repo.is_some() || unread) && repo_s.is_none();
+    // THE LEFT SUFFIX TAKES THE ROOM THE REPOSITORY'S ASK LEFT, whole, else short, else none: it
+    // never pushes that ask out.
+    let spent = [&open, &repo_s]
+        .into_iter()
+        .flatten()
+        .map(|said| 1 + units(said))
+        .sum::<usize>();
+    let left_s = parts
+        .iter()
+        .find_map(|p| match p {
+            Suffix::Left(n, ask) if *n > 0 => Some((*n, *ask)),
+            _ => None,
+        })
+        .and_then(|(n, ask)| {
+            let whole = match ask {
+                RepoAsk::All => left_suffix(n),
+                RepoAsk::Own => own_left_suffix(n),
+            };
+            let room = room.saturating_sub(spent);
+            [whole, left_suffix_short(n)]
+                .into_iter()
+                .find(|said| units(said) < room)
+        });
     let mut text = base.to_string();
     for p in parts {
         let said = match p {
             Suffix::Fixed(f) => Some(*f),
             Suffix::Open(_) | Suffix::Listed(_) => open.as_deref(),
             Suffix::Repo(..) => repo_s.as_deref(),
+            Suffix::Left(..) => left_s.as_deref(),
         };
         if let Some(a) = said.filter(|a| !a.is_empty()) {
             text.push(' ');
@@ -20198,11 +20977,25 @@ pub fn land_contradicted(
     after: &[&str],
     rules: Option<&str>,
 ) -> Option<String> {
+    land_contradicted_left(repo, listed, 0, after, rules)
+}
+
+/// [`land_contradicted`] with the left suffix of `left` rows after the repository's ask
+/// ([`Suffix::Left`]): the processes the agent left running contradict no defense of their own,
+/// so they ride a contradiction git or the list makes and make none.
+fn land_contradicted_left(
+    repo: &crate::harness::repo_work::RepoRead,
+    listed: Option<&str>,
+    left: u16,
+    after: &[&str],
+    rules: Option<&str>,
+) -> Option<String> {
     let listed = listed.filter(|l| !land_check::listed_words(l).is_empty());
     let fixed: Vec<Suffix<'_>> = after.iter().map(|a| Suffix::Fixed(a)).collect();
     if let Some(found) = repo.found() {
         let base = contradicted_git(&repo_finding(found));
-        let parts: Vec<Suffix<'_>> = std::iter::once(Suffix::Listed(listed))
+        let parts: Vec<Suffix<'_>> = [Suffix::Listed(listed), Suffix::Left(left, RepoAsk::All)]
+            .into_iter()
             .chain(fixed)
             .collect();
         return Some(fitted_act(&base, &parts, rules));
@@ -20219,9 +21012,13 @@ pub fn land_contradicted(
         "{LAND_CONTRADICTED_HEAD} {CONTRADICTED_LISTED}{quote}{close} {CONTRADICTED_LISTED_ASK} \
          {LAND_CLOSE}"
     );
-    let parts: Vec<Suffix<'_>> = std::iter::once(Suffix::Repo(repo, RepoAsk::All))
-        .chain(fixed)
-        .collect();
+    let parts: Vec<Suffix<'_>> = [
+        Suffix::Repo(repo, RepoAsk::All),
+        Suffix::Left(left, RepoAsk::All),
+    ]
+    .into_iter()
+    .chain(fixed)
+    .collect();
     Some(fitted_act(&base, &parts, rules))
 }
 
@@ -20520,6 +21317,19 @@ fn fact_rides(
     let TurnEndAction::Type { text, rule_id } = action else {
         return action;
     };
+    // THE ACT THAT NAMES THE AGENT'S LEFT PROCESSES carries no fact that names them again.
+    if fact.key.kind == crate::supervise::facts::FactKind::Leftover
+        && carries_left_suffix(&text, state.left_said)
+    {
+        note(trace, "fact", Some(rule_id), || {
+            Outcome::Unproven(format!(
+                "{} {:016x}: the act names the processes left: typed without it",
+                fact.key.kind.word(),
+                fact.key.id
+            ))
+        });
+        return TurnEndAction::Type { text, rule_id };
+    }
     let said = format!("{text}{}", fact_suffix(fact));
     if !fact_fits(fact, &said) {
         note(trace, "fact", Some(rule_id), || {
@@ -20777,26 +21587,39 @@ fn decide_unridden(
         return ended_at(trace, "person-draft", TurnEndAction::Nothing);
     }
 
-    let drafted = match act.rule_id() {
-        Some(RULE_LOGIN) if reading.composer.drafted() => TurnEndAction::Escalate {
-            reason: login_gone(
-                reading.program,
-                state.wall_words(reading),
-                Some("a draft stands in the composer"),
-                &sign_in_how(reading.program, state.wall_words(reading)),
-            ),
+    // What stands in or over the composer asks first, whatever the act (a lost login's `/login`
+    // too): its question is decided again the moment the composer reads otherwise
+    // (`turn_end_loop::draft_holds`), where the login's would hold the point for good.
+    let drafted = match (act.rule_id(), reading.composer.asks()) {
+        (None, _) => return act,
+        (Some(_), Some(why)) => TurnEndAction::Escalate {
+            reason: why.to_string(),
         },
-        Some(rule_id) if reading.composer == Composer::Typed => TurnEndAction::Submit { rule_id },
-        Some(_) if reading.composer == Composer::Own => TurnEndAction::Escalate {
-            reason: OWN_WORDS_STAND.to_string(),
-        },
-        Some(_) => match &reading.composer {
-            Composer::Diverted(by) => TurnEndAction::Escalate {
-                reason: by.reason().to_string(),
-            },
-            _ => return act,
-        },
-        None => return act,
+        (Some(RULE_LOGIN), None)
+            if matches!(reading.composer, Composer::Typed | Composer::Command(..)) =>
+        {
+            TurnEndAction::Escalate {
+                reason: login_gone(
+                    reading.program,
+                    state.wall_words(reading),
+                    Some(if reading.composer == Composer::Typed {
+                        "a draft stands in the composer"
+                    } else {
+                        "a command stands unsent in the composer"
+                    }),
+                    &sign_in_how(reading.program, state.wall_words(reading)),
+                ),
+            }
+        }
+        (Some(rule_id), None) if reading.composer == Composer::Typed => {
+            TurnEndAction::Submit { rule_id }
+        }
+        // A PERSON'S COMMAND STANDS (v6 §14.17.5.8): nothing typed over it, nothing cleared, no
+        // Enter; the loop journals the hold once and decides again when the draft changes or goes.
+        (Some(_), None) if matches!(reading.composer, Composer::Command(..)) => {
+            TurnEndAction::Nothing
+        }
+        (Some(_), None) => return act,
     };
     ended_at(trace, "draft", drafted)
 }
@@ -21661,6 +22484,10 @@ fn words_act(
         done,
         held,
     } = words;
+    debug_assert!(
+        cfg.question_priority != QuestionPriority::Land,
+        "Land's priority answers a dialog only; prose under Land is land_policy's"
+    );
     if reading.autopilot == Autopilot::Land {
         return Some(land_policy(state, reading, asked, done, budgeted));
     }
@@ -21741,6 +22568,7 @@ fn land_words(state: &TurnEndState, reading: &TurnEndReading, ack: bool) -> (Str
                 &[
                     Suffix::Listed(state.land_listed.as_deref()),
                     Suffix::Repo(&state.repo, RepoAsk::All),
+                    Suffix::Left(state.left_said, RepoAsk::All),
                     Suffix::Fixed(rev),
                     Suffix::Fixed(ack_s),
                 ],
@@ -21769,7 +22597,7 @@ fn contradicted(
         .land_listed
         .as_deref()
         .filter(|_| state.repo.found().is_some() || !state.land.answered);
-    land_contradicted(&state.repo, listed, after, rules)
+    land_contradicted_left(&state.repo, listed, state.left_said, after, rules)
 }
 
 /// Whether `text` opens with one of Land's acts as this build types them, the switch's why before
@@ -22185,7 +23013,15 @@ fn renewed_draft_reason(composer: &Composer) -> String {
              or clear the draft"
         }
         Composer::Diverted(Diversion::Search) => {
-            "the prompt-history search is open over the composer: leave it with Esc"
+            "the prompt-history search is open over the composer: close it"
+        }
+        Composer::Diverted(Diversion::Recall) => {
+            "an old prompt the prompt-history search found stands in the composer: send, edit or \
+             clear it"
+        }
+        Composer::Command(..) => {
+            "a command stands unsent in the composer, which aterm never sends for you: send or \
+             clear it"
         }
         _ => "a draft stands in the composer: send or clear it",
     };
@@ -22298,6 +23134,105 @@ fn account_first(
         }
         (AccountAdvice::Probe { .. }, today) => today,
     }
+}
+
+/// A MANAGED WORKER'S OWN USAGE WALL, WHICH IT WAITS OUT NO FURTHER THAN [`MANAGED_WALL_HORIZON`]
+/// ([`managed_wall_act`], [`TurnEndState::conclude_at_wall`]): under Land, a session a manager
+/// waits on ([`TurnEndState::managed`]) whose work has not concluded, at a point whose reading
+/// shows its own usage wall (on the screen, or left there and remembered, [`still_shown`]), a
+/// session or weekly limit or a model's bucket (not one a moved login or a switched model left
+/// behind, and no `/login` dialog standing over it), with no resume owed past an account or login
+/// move or a reset claim. A person's tab, and a managed worker under Cruise (which never rests),
+/// waits for the reset as before.
+pub(super) fn managed_wall_ends(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+) -> bool {
+    reading.autopilot == Autopilot::Land
+        && state.managed
+        && !state.task_done()
+        && !reading.taskless
+        && reading.at_point(state.stale_input)
+        && reading.login_screen.is_none()
+        && matches!(
+            reading.wall,
+            Some(WallKind::UsageSession | WallKind::UsageWeekly | WallKind::ModelBucket { .. })
+        )
+        && !state.login_left(reading)
+        && !state.bucket_left(reading)
+        && !(cfg.resume_limits
+            && (state.account_resume || state.login_resume || state.reset_resume.is_some()))
+}
+
+/// What a managed worker's own usage wall ([`managed_wall_ends`]) does with `act`, what the wall's
+/// arm decided for any session. An act made now stands (a model's consent, the resume once the
+/// reset passed), and so does a move the roster advises onto another account or a fallback model:
+/// rotation comes first and wins, and where the move is not made its fallback waits at most the
+/// horizon before the point is decided again ([`managed_fallback`]); so does the roster's wait for
+/// another account that ends inside the horizon ([`within_managed_horizon`]). A wait that ends
+/// past [`MANAGED_WALL_HORIZON`] for a reset past it too (or one no reading names), or no act at
+/// all (an escalation, `resume_limits` off), types nothing: the loop concludes the work there
+/// ([`TurnEndState::conclude_at_wall`], `failed why=usage-limit`), its manager's report, and
+/// raises no limit notice for a person (`Session::limit_after`).
+fn managed_wall_act(act: TurnEndAction, reading: &TurnEndReading, now: Instant) -> TurnEndAction {
+    match act {
+        TurnEndAction::WaitUntil { until, .. } if !within_managed_horizon(until, reading, now) => {
+            TurnEndAction::Nothing
+        }
+        TurnEndAction::Nothing | TurnEndAction::Escalate { .. } => TurnEndAction::Nothing,
+        TurnEndAction::Restart {
+            why,
+            rule_id,
+            otherwise,
+        } => TurnEndAction::Restart {
+            why,
+            rule_id,
+            otherwise: Box::new(managed_fallback(*otherwise, reading, now)),
+        },
+        act => act,
+    }
+}
+
+/// THE FALLBACK OF A MOVE A MANAGED WORKER'S WALL MAKES FIRST ([`managed_wall_act`]): where the
+/// move is not made, a wait within the horizon stands, and anything that would wait longer or
+/// type nothing waits [`MANAGED_WALL_HORIZON`] instead, so the point is decided again and its
+/// wall concludes the work then.
+fn managed_fallback(act: TurnEndAction, reading: &TurnEndReading, now: Instant) -> TurnEndAction {
+    match act {
+        TurnEndAction::WaitUntil { until, .. } if within_managed_horizon(until, reading, now) => {
+            act
+        }
+        TurnEndAction::WaitUntil { .. }
+        | TurnEndAction::Nothing
+        | TurnEndAction::Escalate { .. } => TurnEndAction::WaitUntil {
+            until: later(now, MANAGED_WALL_HORIZON),
+            why: MANAGED_WALL_AGAIN.to_string(),
+            wait: WaitKind::Other,
+        },
+        TurnEndAction::Restart {
+            why,
+            rule_id,
+            otherwise,
+        } => TurnEndAction::Restart {
+            why,
+            rule_id,
+            otherwise: Box::new(managed_fallback(*otherwise, reading, now)),
+        },
+        act => act,
+    }
+}
+
+/// Why a managed worker's fallback waits ([`managed_fallback`]).
+pub const MANAGED_WALL_AGAIN: &str = "a managed worker's usage limit: the move off it was not made; decided again within the horizon";
+
+/// Whether a wait to `until` at a managed worker's wall stays within [`MANAGED_WALL_HORIZON`]: the
+/// wait itself ends within it (a move the roster advises once another account frees up, or once
+/// the hour's moves allow one, [`account_first`], whatever the wall's own reset), or the reset
+/// the reading names lies within it (the grace the resume waits past it rides along).
+fn within_managed_horizon(until: Instant, reading: &TurnEndReading, now: Instant) -> bool {
+    let horizon = later(now, MANAGED_WALL_HORIZON);
+    until <= horizon || reading.reset_at.is_some_and(|reset| reset <= horizon)
 }
 
 pub(super) fn login_wall_moves<'a>(
@@ -22548,7 +23483,12 @@ fn wall_action(
                 return act;
             }
             let attempts = state.wall_attempts(kind).unwrap_or(0);
-            account_first(state, reading, cfg, now, attempts, today, continue_as)
+            let act = account_first(state, reading, cfg, now, attempts, today, continue_as);
+            if managed_wall_ends(state, reading, cfg) {
+                managed_wall_act(act, reading, now)
+            } else {
+                act
+            }
         }
         WallKind::Auth if state.login_left(reading) => resume_limit(continue_as),
         WallKind::Auth => {
@@ -22845,6 +23785,12 @@ fn wall_own_act(
             let Some(login) = login_command(reading.program) else {
                 return esc(login_gone(reading.program, msg, None, &how));
             };
+            // A `/login` that draws no picker (a sign-in method its settings pin) opens the
+            // browser one tick after its Enter, over the person's work (v6 §14.17 rule 1; the
+            // post-landing review, 2026-11-02): it is theirs to type, told quietly.
+            if let Some(why) = reading.login_pin.why() {
+                return esc(login_gone(reading.program, msg, Some(why), &how));
+            }
             budgeted(TurnEndAction::TypeCommand {
                 command: login.to_string(),
                 rule_id: RULE_LOGIN,
@@ -23020,13 +23966,14 @@ pub fn outage_gap(t: &TurnEndTiming, n: u32, after: Option<Duration>) -> Duratio
     }
 }
 
-/// Whether `action` types an outage's measured line (*has cleared*, [`cleared_text`]), alone or
-/// with what rides with it.
-fn types_measured_outage_line(action: &TurnEndAction) -> bool {
+/// Whether `action` types an outage's blind try (*may have cleared*, [`Clearing::Blind`]): the one
+/// resume text no witness decided, so it says no witness and latches none, whatever the reading
+/// beside it ([`TurnEndState::witness_resumed`]).
+fn types_blind_outage_line(action: &TurnEndAction) -> bool {
     matches!(action, TurnEndAction::Type { text, .. } if
         [Outage::Overload, Outage::ApiError, Outage::Connection]
             .into_iter()
-            .any(|o| text.contains(cleared_text(Cleared::Outage(o), Clearing::Measured))))
+            .any(|o| text.contains(cleared_text(Cleared::Outage(o), Clearing::Blind))))
 }
 
 /// THE WITNESS THAT CLEARS AN OUTAGE (v6 §14.17.5.4, slice 12c): another session of this aterm on

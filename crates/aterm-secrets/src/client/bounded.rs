@@ -65,11 +65,13 @@ pub(super) fn sync_reader_with_candidates_until(
         None,
         Some(deadline),
         true,
-    )?;
+    );
     match local {
-        SyncOutcome::Unchanged { .. } => {}
-        SyncOutcome::Applied { ref report, .. } if apply_failed(report) => {}
-        complete => return Ok(complete),
+        Err(error) if error.kind() == crate::ErrorKind::MembershipHistoryUnavailable => {}
+        Err(error) => return Err(error),
+        Ok(SyncOutcome::Unchanged { .. }) => {}
+        Ok(SyncOutcome::Applied { ref report, .. }) if apply_failed(report) => {}
+        Ok(complete) => return Ok(complete),
     }
     let config = configured(paths)?;
     let before = load_state(paths)?;
@@ -138,7 +140,16 @@ pub(super) fn sync_reader_with_candidates_until(
             let peers_within = budget(Some(deadline), servers_within(PROBE_DEADLINE));
             let found: Vec<SyncPeerHead> = match peers_within {
                 Ok(left) => {
-                    probe_peers_for_sync(paths, &peers, &config, pin, left, subscriber.as_deref())
+                    let read_only = super::mirrors::ReadOnly::of(paths, &config, candidates);
+                    probe_peers_for_sync(
+                        paths,
+                        &peers,
+                        &config,
+                        pin,
+                        left,
+                        subscriber.as_deref(),
+                        &read_only,
+                    )
                 }
                 Err(_) => Vec::new(),
             };
@@ -210,6 +221,11 @@ pub fn join_if_unchanged_until(
     }
     budget(Some(deadline), Duration::MAX)?;
     let typed = options.source.trim();
+    // No URL, or the default one, asks the live ALab: a lab identity is refused before the look
+    // and the fetch, as `join` refuses it (A12).
+    if typed.is_empty() || crate::is_alab_default_url(typed) {
+        super::refuse_lab_identity(paths)?;
+    }
     let probed = if options.fetched.is_none()
         && alab_signer_built_in()
         && (typed.is_empty() || crate::is_alab_default_url(typed))

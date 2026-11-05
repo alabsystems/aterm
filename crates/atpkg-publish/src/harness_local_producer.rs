@@ -6,10 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
+use aterm_uds::process::{self, Identity};
 use atpkg::local_harness::{self, CurrentLocal, ExpectedCurrent, LocalAuthority, StagedLocal};
 use atpkg::store::Layout;
 
-use super::{Config, Driver, LocalProfile, Version};
+use super::{Config, Driver, LocalProfile, SelectionError, Version};
 use crate::artifact::build_local::{self, Plan};
 use crate::artifact::tools::{Run, Tools};
 use crate::ctx::Ctx;
@@ -111,6 +112,33 @@ fn fetch_source(tools: &dyn Tools, config: &Config, origin: &str, token: &Path) 
 /// exact locks and capacity claim until the whole worker group retires.
 pub struct QualifiedGuardian {
     package: PackageScope,
+    source: SourceScope,
+}
+
+pub(super) struct SourceScope {
+    pub(super) home: PathBuf,
+    pub(super) config: Config,
+    pub(super) lease: super::fs::LeaseProof,
+    pub(super) guardian: Identity,
+}
+
+impl SourceScope {
+    fn check(&self, home: &Path, config: &Config) -> Result<()> {
+        if self.home != home || self.config != *config {
+            return Err(Error::refused(
+                "local selection differs from its original guardian source scope",
+            ));
+        }
+        super::fs::verify_lease(home, config, &self.lease)?;
+        if process::process_presence(self.guardian.pid) != process::ProcessPresence::Present
+            || process::read_identity(self.guardian.pid).as_ref() != Some(&self.guardian)
+        {
+            return Err(Error::refused(
+                "local selection's original guardian is no longer live; current and candidate are preserved",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct PackageScope {
@@ -134,6 +162,7 @@ impl QualifiedGuardian {
     pub(super) fn in_worker(permit: &super::guardian::WorkerPermit) -> Self {
         Self {
             package: permit.package_scope(),
+            source: permit.source_scope(),
         }
     }
 }
@@ -346,14 +375,20 @@ impl Driver for Producer<'_> {
                 "source or native compiler changed during local planning",
             ));
         }
-        let profile = match config.profile {
-            LocalProfile::Release => "release",
-            LocalProfile::Dev => "dev",
-        };
-        let target = self._guardian.package.cache.join(format!(
-            "{}-{}-{profile}.noindex",
-            plan.source, plan.compiler
-        ));
+        let request = self.request(config);
+        let target = self
+            ._guardian
+            .package
+            .cache
+            .join(build_local::harness_cache_key(
+                &config.checkout,
+                &plan.source,
+                &plan.compiler,
+                plan.triple,
+                request.profile,
+                request.policy,
+                plan.cache_freshness,
+            )?);
         plan.command
             .env
             .push(("CARGO_TARGET_DIR".into(), target.into()));
@@ -440,14 +475,38 @@ impl Driver for Producer<'_> {
     fn select(
         &mut self,
         config: &Config,
+        plan: &Plan,
         candidate: &StagedLocal,
         expected: ExpectedCurrent,
-    ) -> Result<()> {
-        let lock = Self::store(config)?;
+    ) -> std::result::Result<(), SelectionError> {
+        let lock = Self::store(config).map_err(SelectionError::Rejected)?;
+        let check = || -> Result<()> {
+            config.validate(&self.ctx.home)?;
+            self._guardian.source.check(&self.ctx.home, config)?;
+            if Version::from(candidate.identity()) != self.identity(config, plan)? {
+                return Err(Error::refused(
+                    "local selection candidate differs from the checked plan; current and candidate are preserved",
+                ));
+            }
+            self.clean_main(config)?;
+            // Staging (including admission of a recovered artifact) establishes
+            // the candidate's bytes, not which source is current at selection.
+            // Reuse the checked plan's source/count/pristine validator here.
+            plan.harness
+                .as_ref()
+                .ok_or_else(|| Error::refused("local selection has no checked harness source"))?
+                .recheck(&config.checkout)?;
+            self._guardian.source.check(&self.ctx.home, config)
+        };
+        check().map_err(SelectionError::Rejected)?;
         local_harness::select_current(&lock, candidate, expected)
-            .map_err(|e| Error::io("select local current", &e))
+            .map_err(|e| SelectionError::Uncertain(Error::io("select local current", &e)))
     }
 }
+
+#[cfg(test)]
+#[path = "harness_local_producer_tests.rs"]
+mod selection_tests;
 
 #[cfg(test)]
 mod auth_tests {

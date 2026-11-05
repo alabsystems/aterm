@@ -12,9 +12,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--cpu-hardware") {
         let mut hardware = aterm_sysprobe::cpu_hardware::Probe::default();
-        println!("hardware_initial {:?}", hardware.sample());
+        let gap = Duration::from_millis(2_500);
+        println!("hardware_initial {:?}", hardware.sample(gap));
         std::thread::sleep(Duration::from_secs(1));
-        println!("hardware_interval {:?}", hardware.sample());
+        println!("hardware_interval {:?}", hardware.sample(gap));
         return;
     }
     if let Some(i) = args.iter().position(|a| a == "--start") {

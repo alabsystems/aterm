@@ -160,6 +160,13 @@ fn bundle_is_ours(app: &Path) -> bool {
     bundle_identifier(app).as_deref() == Some(BUNDLE_ID)
 }
 
+/// Whether `app` may be an aterm: only a readable identifier naming another bundle proves it is
+/// not. The test for what an uninstall keeps, where [`bundle_is_ours`] is the test for what it
+/// deletes: an aterm whose `Info.plist` is lost or garbled still runs on the account's store.
+fn bundle_may_be_aterm(app: &Path) -> bool {
+    bundle_identifier(app).is_none_or(|id| id == BUNDLE_ID)
+}
+
 fn link_target(path: &Path) -> Option<String> {
     std::fs::read_link(path)
         .ok()
@@ -455,10 +462,10 @@ fn bundle_programs(app: &Path) -> Result<Vec<PathBuf>, String> {
     };
     let mut programs = Vec::new();
     for entry in entries {
-        let path = entry
-            .map_err(|e| format!("cannot read an entry in {}: {e}", dir.display()))?
-            .path();
-        let metadata = std::fs::symlink_metadata(&path)
+        let entry = entry.map_err(|e| format!("cannot read an entry in {}: {e}", dir.display()))?;
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
             programs.push(path);
@@ -712,7 +719,7 @@ fn open_checked_with_meta(
 ) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = opts
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
         .open(path)?;
     let opened = file.metadata()?;
     let owner = if root {
@@ -881,7 +888,7 @@ fn outside_scope(p: &Places, bundle: &Path) -> bool {
 }
 
 fn other_aterm(p: &Places, bundle: &Path) -> bool {
-    bundle.is_dir() && outside_scope(p, bundle) && bundle_is_ours(bundle)
+    bundle.is_dir() && outside_scope(p, bundle) && bundle_may_be_aterm(bundle)
 }
 
 fn scope_outsider(p: &Places) -> Option<PathBuf> {
@@ -1099,7 +1106,7 @@ fn cleanup_lock_free(lock: &Path, account: Option<(u32, u32)>) -> bool {
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(lock)
     else {
         return false;
@@ -1575,7 +1582,7 @@ fn acaffeine_cleanup_hold(
         .write(true)
         .create(account.is_none() && aterm_uds::peer::our_uid() != 0)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .ok()?;
     let opened = file.metadata().ok()?;
@@ -1774,7 +1781,16 @@ fn self_uninstall_with_acaffeine(
                     });
                 let stderr = said
                     .as_ref()
-                    .and_then(|(_, file)| std::fs::File::create(file).ok())
+                    .and_then(|(_, file)| {
+                        let mut opts = std::fs::OpenOptions::new();
+                        opts.write(true).create_new(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt as _;
+                            opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                        }
+                        opts.open(file).ok()
+                    })
                     .map_or_else(
                         aterm_uds::spawnfd::Stdio::null,
                         aterm_uds::spawnfd::Stdio::from,
@@ -1883,11 +1899,15 @@ fn self_uninstall_with_acaffeine(
                     None => s.rm(&app, "app bundle"),
                 }
             } else {
-                let id = bundle_identifier(&app).unwrap_or_else(|| "unreadable".to_string());
-                s.skip(
-                    &app.display().to_string(),
-                    &format!("not an aterm bundle (CFBundleIdentifier={id})"),
+                let why = bundle_identifier(&app).map_or_else(
+                    || {
+                        "not proven an aterm bundle (no readable CFBundleIdentifier): if it is \
+                         a damaged aterm, remove it by hand"
+                            .to_string()
+                    },
+                    |id| format!("not an aterm bundle (CFBundleIdentifier={id})"),
                 );
+                s.skip(&app.display().to_string(), &why);
             }
         }
     }
@@ -1895,7 +1915,7 @@ fn self_uninstall_with_acaffeine(
     if (swept || decline_tagged) && !dry && !decline_before && decline.is_file() {
         let app_left = app_dirs.iter().any(|d| {
             let app = d.join("aterm.app");
-            app.is_dir() && bundle_is_ours(&app)
+            app.is_dir() && bundle_may_be_aterm(&app)
         });
         if !app_left {
             let _ = s.unlink(&decline, true);
@@ -1993,25 +2013,24 @@ fn self_uninstall_with_acaffeine(
 
     let desktop = p.xdg_data.join("applications/aterm.desktop");
     let mut desktop_owned = false;
-    let desktop_is_link =
-        std::fs::symlink_metadata(&desktop).is_ok_and(|m| m.file_type().is_symlink());
-    if desktop.is_file() || desktop_is_link {
-        let owned = crate::metadata_io::read_bounded_regular_utf8(&desktop, 64 * 1024)
-            .is_ok_and(|text| text.lines().any(|l| l == DESKTOP_MARKER));
-        if owned {
-            desktop_owned = true;
-            s.rm(&desktop, "desktop entry");
-            if !dry {
-                refresh_desktop_database(&ShellEnv::of_process(), &p.xdg_data, |update| {
-                    runs_as(aterm_uds::peer::our_uid(), &p.home, update)
-                });
-            }
-        } else {
-            s.skip(
-                &desktop.display().to_string(),
-                "not a desktop entry this installer wrote (missing its marker line)",
-            );
+    if crate::metadata_io::read_bounded_regular_utf8(&desktop, 64 * 1024)
+        .is_ok_and(|text| text.lines().any(|l| l == DESKTOP_MARKER))
+    {
+        desktop_owned = true;
+        s.rm(&desktop, "desktop entry");
+        if !dry {
+            refresh_desktop_database(&ShellEnv::of_process(), &p.xdg_data, |update| {
+                runs_as(aterm_uds::peer::our_uid(), &p.home, update)
+            });
         }
+    } else if std::fs::symlink_metadata(&desktop)
+        .is_ok_and(|m| m.is_file() || m.file_type().is_symlink())
+        || desktop.is_file()
+    {
+        s.skip(
+            &desktop.display().to_string(),
+            "not a desktop entry this installer wrote (missing its marker line)",
+        );
     }
     for size in ICON_SIZES {
         let icon = p
@@ -2629,9 +2648,6 @@ fn checkout_pages(src: &Path) -> Vec<Page> {
                 .filter(|e| matches!(e.as_bytes(), [b'1'..=b'9']))?
                 .to_string();
             let name = page.file_name()?.to_os_string();
-            if !page.is_file() {
-                return None;
-            }
             let bytes = crate::metadata_io::read_bounded_regular(&page, 1024 * 1024).ok()?;
             Some((section, name, Cow::Owned(bytes)))
         })
@@ -2873,9 +2889,6 @@ fn checkout_icons(dir: &Path) -> Vec<Icon> {
         .filter_map(|size| {
             let png = size.join("apps/aterm.png");
             let name = size.file_name()?.to_str()?.to_string();
-            if !png.is_file() {
-                return None;
-            }
             let bytes = crate::metadata_io::read_bounded_regular(&png, 1024 * 1024).ok()?;
             Some((name, Cow::Owned(bytes)))
         })

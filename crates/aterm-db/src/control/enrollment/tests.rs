@@ -224,18 +224,7 @@ fn frontier_large_log_enrollment_reopens_selected_witness() {
             Ok::<(), aterm_secrets::Error>(())
         })
         .unwrap();
-    aterm_secrets::fsx::write_atomic(
-        &lab.paths[0].records_file().with_extension("crossed"),
-        b"crossed\n",
-        0o600,
-    )
-    .unwrap();
-    aterm_secrets::fsx::write_atomic(
-        &lab.paths[0].records_file(),
-        &encode_records(log.records()),
-        0o600,
-    )
-    .unwrap();
+    client::save_records(&lab.paths[0], &encode_records(log.records())).unwrap();
     let pending = lab.pending();
     let owner = Endpoint::from_bootstrap(&lab.bootstrap(0))
         .unwrap()

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::Rig;
 use super::instance::{
-    Budget, CouldNotRun, Instance, Scratch, World, could_not_run, field, unanswered,
+    Band, Budget, CouldNotRun, Instance, Scratch, World, could_not_run, field, unanswered,
 };
 use super::starvation::{Disposition, ShapeVerdict};
 
@@ -367,6 +367,9 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
                 for (arm, record) in [false, true, true, false].into_iter().enumerate() {
                     let take = Take::launch(rig, record, budget)?;
                     let out = take.home.join("drain.us");
+                    // Observe both endpoints without changing scheduling or timing the probes.
+                    let subject_role_before = Band::observed_role(take.inst.pid());
+                    let driver_role_before = Band::observed_role(0);
                     let before = cpu_ns(take.inst.pid());
                     let started = std::time::Instant::now();
                     take.start_drain(rig, None, bytes, &out)?;
@@ -379,12 +382,27 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
                     // The verdict still uses only the producer's original drain measurement.
                     let status = take.inst.ctl.ok(&["temporal", "status"])?;
                     let completed = take.completed_status(record)?;
+                    let subject_role_after = Band::observed_role(take.inst.pid());
+                    let driver_role_after = Band::observed_role(0);
                     eprintln!(
                         "measure-sample: {}",
                         aterm_json::json!({
                             "schema": 1, "measurement": "recording-throughput", "pair": pair,
                             "arm": arm, "recording": record, "drain_us": us,
                             "sample_wall_us": sample_wall_us, "sample_cpu_ns": used,
+                            "role_observation": "read_only_endpoints;not_continuous",
+                            "subject_role_before": {
+                                "darwin_role": subject_role_before.0, "errno": subject_role_before.1,
+                            },
+                            "driver_role_before": {
+                                "darwin_role": driver_role_before.0, "errno": driver_role_before.1,
+                            },
+                            "subject_role_after": {
+                                "darwin_role": subject_role_after.0, "errno": subject_role_after.1,
+                            },
+                            "driver_role_after": {
+                                "darwin_role": driver_role_after.0, "errno": driver_role_after.1,
+                            },
                             "dropped_input": field(&completed, "dropped_input"),
                             "dropped_input_at_receipt": field(&status, "dropped_input"),
                             "completion_writer_in_flight": field(&completed, "writer_in_flight"),

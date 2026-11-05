@@ -1025,6 +1025,25 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.153.0", "stalled-sequence"),
     ("v0.153.0", "twelve-panes"),
     ("v0.153.0", "variants"),
+    ("v0.154.0", "carried-state"),
+    ("v0.154.0", "claude-code-1049"),
+    ("v0.154.0", "colour-and-shell"),
+    ("v0.154.0", "engine-state"),
+    ("v0.154.0", "fold"),
+    ("v0.154.0", "held-failed"),
+    ("v0.154.0", "held-pane"),
+    ("v0.154.0", "held-withheld"),
+    ("v0.154.0", "history"),
+    ("v0.154.0", "history-carry"),
+    ("v0.154.0", "incident-55x149"),
+    ("v0.154.0", "link-dense"),
+    ("v0.154.0", "link-dense-history"),
+    ("v0.154.0", "policy-repaint"),
+    ("v0.154.0", "policy-visible"),
+    ("v0.154.0", "shell-integration"),
+    ("v0.154.0", "stalled-sequence"),
+    ("v0.154.0", "twelve-panes"),
+    ("v0.154.0", "variants"),
 ];
 
 const REQUIRED_DESKS: &[(&str, &str)] = &[
@@ -1149,6 +1168,9 @@ struct ParentRecord {
     ready_wire: String,
     commit_wire: String,
     files: Vec<String>,
+    /// Empty on a desk with no terminal session (`lone-workers-list`, from v0.155.0), which the
+    /// writer gives no `[[session]]` table.
+    #[serde(default)]
     session: Vec<SessionExpectation>,
     /// The panes kept open after their command exited (`--hold`) whose final screens the producer
     /// carried, from v0.100.0; an older producer carries none, and the successor shows each such
@@ -1836,7 +1858,7 @@ fn assert_history_imports(desk: &Desk, sessions: Vec<Adopted>) {
         );
         assert_eq!(
             restored.len(),
-            checkpoint.history_lines as usize,
+            crate::seamless::carried_lines(&checkpoint) as usize,
             "{label}: session {id} restores the history its checkpoint carries"
         );
         let report = crate::handoff_history::run_imports(vec![crate::handoff_history::ImportJob {

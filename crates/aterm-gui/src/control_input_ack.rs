@@ -94,12 +94,17 @@ impl InputMark {
         self
     }
 
-    /// The already admitted connection's caller, carried with this exact event.
+    /// The already admitted connection's caller, carried with this exact event. A caller other
+    /// than aterm's own counts as the session's driver from here, before the event is written
+    /// ([`crate::typed_by::TypedStamp::admit`]).
     pub(crate) fn typed_by(
         mut self,
         ctx: &SessionCtx,
         caller: Option<Arc<crate::typed_by::Caller>>,
     ) -> Self {
+        if let Some(by) = &caller {
+            ctx.typed.admit(by);
+        }
         self.typist = caller.map(|by| (ctx.typed.clone(), ctx.self_id.clone(), by));
         self
     }

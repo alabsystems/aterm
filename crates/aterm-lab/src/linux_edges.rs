@@ -536,8 +536,9 @@ impl Run<'_> {
 
     fn keep(&self, what: &str) -> String {
         let text = self.wire();
-        let _ = std::fs::write(
-            self.cell
+        let _ = crate::util::write_fresh(
+            &self
+                .cell
                 .results
                 .join(format!("{}-{what}.txt", self.gui.name)),
             &text,

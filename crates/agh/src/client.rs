@@ -126,6 +126,9 @@ pub struct Call {
     pub(crate) rate_book: bool,
     /// The most its retry sleeps may take (`How::sleep_budget`; default `None`: no cap).
     pub(crate) sleep_budget: Option<Duration>,
+    /// The exact-body capability of the typed atomic-ref resource; never set
+    /// by a generic call or raw API request.
+    pub(crate) atomic_refs: Option<crate::github::refs::AtomicRefWrite>,
 }
 
 impl Call {
@@ -151,6 +154,7 @@ impl Call {
             body: CallBody::Empty,
             rate_book: true,
             sleep_budget: None,
+            atomic_refs: None,
         }
     }
 
@@ -1422,6 +1426,7 @@ const COVERS: &str = "covers";
 const PACE: Duration = Duration::from_secs(1);
 
 struct Prepared {
+    atomic_refs: Option<crate::github::refs::AtomicRefWrite>,
     method: Method,
     url: String,
     headers: Vec<(String, String)>,
@@ -1449,6 +1454,7 @@ impl Prepared {
             permit: None,
             body_digest: None,
             as_profile: self.as_profile.as_deref(),
+            atomic_refs: self.atomic_refs.as_ref(),
         }
     }
 
@@ -2182,6 +2188,7 @@ impl Github {
             IdentityRef::Anonymous => None,
         };
         Prepared {
+            atomic_refs: call.atomic_refs.clone(),
             method: call.method,
             url: endpoints.url(call.origin, &call.path_and_query()),
             headers,

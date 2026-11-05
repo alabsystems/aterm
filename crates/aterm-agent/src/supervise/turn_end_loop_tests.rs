@@ -50,11 +50,17 @@ mod draft_hold_loop;
 #[path = "probe_own_line_tests.rs"]
 mod probe_own_line;
 
+#[path = "command_draft_loop_tests.rs"]
+mod command_draft_loop;
+
 #[path = "point_key_loop_tests.rs"]
 mod point_key_loop;
 
 #[path = "custody_loop_tests.rs"]
 mod custody_loop;
+
+#[path = "restart_claim_loop_tests.rs"]
+mod restart_claim_loop;
 
 fn hosted(max_s: u64) -> SuperviseOpts {
     SuperviseOpts {
@@ -558,8 +564,14 @@ fn a_suggestion_under_claude_codes_drawn_caret_is_typed_over() {
     }
 }
 
+/// A PERSON'S SLASH DRAFT OVER CLAUDE CODE'S MENU IS THEIR COMMAND, WHICHEVER ENTRY IS SELECTED
+/// (v6 §14.17.5.8): `/config` with its own entry selected, with `/update-config` selected, and with
+/// the colour-only menu's cells unanswered, past a grace of 0: the entries' cells are still read,
+/// and no Enter is pressed, nothing typed and nothing badged (before the slice the first was sent
+/// onto its own entry and the second badged `MENU_DIVERTS`). Negative control by mutation: the
+/// draft step's command arm dropped: the first draft's Enter.
 #[test]
-fn a_draft_over_a_selection_drawn_in_colour_only_is_sent_only_onto_its_own_entry() {
+fn a_slash_draft_over_its_menu_is_the_persons_command_whichever_entry_is_selected() {
     use aterm_phase::prompt::fixtures::{
         SLASH_MENU_CONFIG_2_1_268, SLASH_MENU_CONFIG_CELLS_2_1_268,
         SLASH_MENU_CONFIG_DOWN_CELLS_2_1_268, cells, screen,
@@ -572,23 +584,16 @@ fn a_draft_over_a_selection_drawn_in_colour_only_is_sent_only_onto_its_own_entry
         .iter()
         .position(|r| r.starts_with('❯') && r.trim_end().ends_with("/config"))
         .expect("the caret row");
-    for (what, measured, sent, unanswered) in [
-        (
-            "`/config` selected",
-            SLASH_MENU_CONFIG_CELLS_2_1_268,
-            true,
-            false,
-        ),
+    for (what, measured, unanswered) in [
+        ("`/config` selected", SLASH_MENU_CONFIG_CELLS_2_1_268, false),
         (
             "`/update-config` selected",
             SLASH_MENU_CONFIG_DOWN_CELLS_2_1_268,
-            false,
             false,
         ),
         (
             "the cells unanswered",
             SLASH_MENU_CONFIG_CELLS_2_1_268,
-            false,
             true,
         ),
     ] {
@@ -618,18 +623,13 @@ fn a_draft_over_a_selection_drawn_in_colour_only_is_sent_only_onto_its_own_entry
             .count();
         assert_eq!(
             (enters, count(&m, "turn") + count(&m, "send")),
-            (usize::from(sent), 0),
+            (0, 0),
             "{what}: {lines:#?}\n{:#?}",
             m.requests
         );
-        let reason = &crate::supervise::policy::turn_end::MENU_DIVERTS[..60];
-        let escalated = m
-            .requests
-            .iter()
-            .any(|r| r.starts_with("meta set attention") && r.contains(reason));
         assert_eq!(
-            escalated,
-            !sent && !unanswered,
+            count(&m, "meta set attention"),
+            0,
             "{what}: {lines:#?}\n{:#?}",
             m.requests
         );
@@ -7240,8 +7240,8 @@ impl IdleHost for ReachHost {
             .or_else(|| self.script.lock().unwrap().front().copied())
             .unwrap_or_else(|| *self.last.lock().unwrap())
     }
-    fn restart(&self, _: &Restart, _: &RestartAsk) -> Option<String> {
-        self.restarts.lock().unwrap().map(str::to_string)
+    fn restart(&self, _: &Restart, _: &RestartAsk) -> Option<RestartAnswer> {
+        self.restarts.lock().unwrap().map(RestartAnswer::unread)
     }
     fn answered(&self, ago_ms: u64) {
         self.answered.fetch_add(1, Ordering::SeqCst);
@@ -10478,6 +10478,120 @@ fn a_lost_login_left_inside_the_own_acts_window_types_login() {
     );
 }
 
+/// A host whose session's Claude Code settings make `/login` what `pin` says; `raised` keeps each
+/// exception it was told.
+#[derive(Debug)]
+struct PinnedHost {
+    pin: crate::supervise::policy::login::LoginPin,
+    raised: std::sync::Mutex<Vec<crate::supervise::policy::exception::Exception>>,
+}
+
+impl IdleHost for PinnedHost {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn login_pin(&self) -> crate::supervise::policy::login::LoginPin {
+        self.pin
+    }
+    fn exception(&self, standing: Option<&crate::supervise::policy::exception::Exception>) {
+        self.raised.lock().unwrap().extend(standing.cloned());
+    }
+}
+
+/// The lines of a loop over `screens` (an ended turn, then the lost login) whose host answers
+/// `pin`, with its own act's take window short enough that the wall can leave inside it, and the
+/// exceptions its host was told.
+fn pinned_login_lines(
+    screens: Vec<Vec<String>>,
+    pin: crate::supervise::policy::login::LoginPin,
+    tag: &str,
+) -> (
+    Vec<String>,
+    Vec<crate::supervise::policy::exception::Exception>,
+) {
+    let (dir, journal) = journal_file(tag);
+    let host = Arc::new(PinnedHost {
+        pin,
+        raised: std::sync::Mutex::default(),
+    });
+    let mut m = Mock::new(screens);
+    m.turn_gates = vec![1];
+    m.vanish_after = Some(40);
+    m.stall_sleep = Some(Duration::from_millis(100));
+    m.end_when_parked = true;
+    let opts = SuperviseOpts {
+        journal: Some(journal),
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            take_within: Duration::from_secs(1),
+            short_backoff: Duration::from_millis(100),
+            ..TurnEndTiming::default()
+        });
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let raised = host.raised.lock().unwrap().clone();
+    (lines, raised)
+}
+
+/// A lost login whose settings pin the sign-in method is the person's to sign in on BOTH of the
+/// loop's paths to the login's act: the notice on screen at its point, and the notice that left
+/// the screen inside aterm's own act's take window, decided off the track (`still_shown`). Its
+/// `/login` would open the browser one tick after its Enter, over the person's work (v6 §14.17
+/// rule 1, the review of fix/landed-review-2, 2026-11-02): the loop asks the host's settings at
+/// each, and the host is told the quiet `login-not-run` need with why at each. CONTROL: with no
+/// pin, `/login` once on each path. Negative controls: the pin read only where the notice is on
+/// screen (the loop's gate `unnamed` alone) types `/login` on the path it left; the told reading
+/// the screen alone (`claude_login` without `pinned_login_left`) tells nobody there.
+#[test]
+fn a_lost_login_whose_settings_pin_its_sign_in_types_no_login_on_either_path() {
+    use crate::supervise::policy::login::LoginPin;
+    let turn = || ended("Fixed the parser; the suite is green.");
+    let logins = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|l| l.contains("rule=auth-login@v1"))
+            .count()
+    };
+    use crate::supervise::policy::notice::{LOGIN_NOT_RUN, WHY_PINNED};
+    for (left, path, tag) in [
+        (false, "on screen at its point", "te-pin-shown"),
+        (true, "left before its point", "te-pin-left"),
+    ] {
+        let screens = || {
+            let then = if left { login_left() } else { login_expired() };
+            vec![busy_screen(), turn(), login_expired(), then]
+        };
+        let (control, _) = pinned_login_lines(screens(), LoginPin::Picker, &format!("{tag}-c"));
+        assert_eq!(
+            logins(&control),
+            1,
+            "CONTROL {path}: no pin, /login once: {control:#?}"
+        );
+        let (lines, raised) = pinned_login_lines(screens(), LoginPin::Method, tag);
+        assert_eq!(
+            logins(&lines),
+            0,
+            "the lost login {path}: /login typed over the pin: {lines:#?}"
+        );
+        assert!(
+            raised.iter().any(|e| e
+                .notice
+                .as_ref()
+                .is_some_and(|n| n.id == LOGIN_NOT_RUN.id && n.did.contains(WHY_PINNED))),
+            "the lost login {path}: the pin's quiet need: {lines:#?}\n{raised:#?}"
+        );
+    }
+}
+
 #[test]
 fn a_reprinted_wall_is_not_sent_to_tomorrow_at_once() {
     let at = |h: i64, m: i64| TEST_NOW + (h - 8) * 3600 + (m - 55) * 60;
@@ -12929,6 +13043,235 @@ fn a_call_named_after_an_unnamed_rung_is_told_at_once_not_a_pace_later() {
     }
 }
 
+/// What a canary's looks came to: the rung after each, what the host heard, each note's first
+/// word, and the reads the looks took.
+struct CanaryLooks {
+    rungs: Vec<super::super::wall_memory::StuckRung>,
+    told: Vec<String>,
+    said: Vec<String>,
+    titles: usize,
+    statuses: usize,
+}
+
+/// The hour between two looks, past every rung's wait and the pace.
+const CANARY_LOOK_GAP: Duration = Duration::from_secs(3600);
+
+/// One canary's climb over a tab `world` shaped, on a virtual clock, its screen standing: each of
+/// `gaps` is the time before one look. The stall canary reads background work alone, the dialog
+/// one a screen no reader names, its first sight starting the clock. Both rest on the title.
+fn canary_looks(dialog: bool, gaps: &[Duration], world: impl FnOnce(&mut Mock)) -> CanaryLooks {
+    use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
+    let host = Arc::new(LadderHost::default());
+    let mut m = Mock::new(vec![busy_screen()]);
+    m.title = Some("✳ Claude Code".to_string());
+    world(&mut m);
+    let mut s = session(&mut m, None);
+    s.set_fx(Fx::over(ClockSource::Virtual(Arc::new(VirtualClock::new(
+        Instant::now(),
+        0,
+    )))));
+    s.setup.stuck_after = Duration::from_secs(180);
+    s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+    let background = read_screen(memory_scrolled());
+    let unread = read_screen(crate::supervise::prompt::fixtures::screen(
+        crate::supervise::prompt::fixtures::AUTO_CLASSIFIER_BILLING_NOTICE_MEASURED,
+    ));
+    let since = s.fx.mono();
+    let mut heard = Heard::default();
+    if dialog {
+        s.dialog_note(&unread, &mut heard);
+    }
+    let rungs = gaps
+        .iter()
+        .map(|gap| {
+            s.fx.sleep(*gap);
+            if dialog {
+                s.dialog_note(&unread, &mut heard);
+            } else {
+                s.stuck_busy_note(&background, Some(since), &mut heard);
+            }
+            s.stuck_rung
+        })
+        .collect();
+    drop(s);
+    let told = host.told.lock().unwrap().clone();
+    let said = heard
+        .noted
+        .iter()
+        .filter_map(|line| line.split(' ').next())
+        .map(str::to_string)
+        .collect();
+    CanaryLooks {
+        rungs,
+        told,
+        said,
+        titles: count(&m, "title"),
+        statuses: count(&m, "status"),
+    }
+}
+
+/// `exception:<kind>`, as a host hears the third rung of this canary.
+fn canary_raised(dialog: bool) -> &'static str {
+    if dialog {
+        "exception:dialog"
+    } else {
+        "exception:stalled"
+    }
+}
+
+/// THE CANARY READS THE AGENT'S OWN TITLE: the one its OSC stream set, as `title` answers it.
+/// `status`'s `subject=` answers a person's rename first (`subject_source=pin`), which read as a
+/// title that moves and so kept both canaries off the ladder for good, the dialog's clock
+/// restarting at each look. The stall canary's look is one read; only the dialog's needs `status`,
+/// for the tab's program. CONTROL: a title that moves ends the ladder, whatever the pin says.
+#[test]
+fn the_canary_climbs_on_the_agents_own_title_under_a_renamed_tab() {
+    use super::super::wall_memory::StuckRung::{Quiet, Raised, Said, Told};
+    let hourly = [CANARY_LOOK_GAP; 4];
+    for dialog in [false, true] {
+        let raised = canary_raised(dialog);
+        for (name, pin) in [("no rename", None), ("a rename", Some("build agent"))] {
+            let looks = canary_looks(dialog, &hourly, |m| m.pinned = pin.map(str::to_string));
+            let why = format!("dialog={dialog}, {name}");
+            assert_eq!(looks.rungs, [Said, Told, Raised, Raised], "{why}");
+            assert_eq!(looks.told, ["unread:some", raised], "{why}");
+            assert_eq!(looks.said, ["STUCK", "STALLED", "EXCEPTION"], "{why}");
+        }
+        let reads = canary_looks(dialog, &hourly, |_| {});
+        assert_eq!(
+            (reads.titles, reads.statuses),
+            (3, if dialog { 3 } else { 0 }),
+            "dialog={dialog}: a look at each rung it climbed, `status` only for the dialog's program"
+        );
+        let moved = canary_looks(dialog, &hourly, |m| {
+            m.pinned = Some("✳ build agent".to_string());
+            m.titles = VecDeque::from([
+                Some("✳ Claude Code".to_string()),
+                Some("✳ Claude Code".to_string()),
+                Some("◐ Claude Code".to_string()),
+            ]);
+        });
+        let why = format!("dialog={dialog}: a title that moves ends the ladder");
+        assert_eq!(moved.rungs, [Said, Told, Quiet, Quiet], "{why}");
+        assert_eq!(moved.told, ["unread:some", "unread:none"], "{why}");
+        assert_eq!(moved.said, ["STUCK", "STALLED"], "{why}");
+    }
+}
+
+/// A BUSY TERMINAL IS NO TITLE THAT MOVES: `status` answers `subject=- subject_source=unavailable`
+/// while the terminal is held. Read as work, that withdrew the host's record at `STALLED` and said
+/// `STUCK` and `STALLED` again, delaying the exception. Now the title comes from `title`, which
+/// waits for the terminal, and the dialog's `status` is read only for `program=`, which needs no
+/// terminal, so a busy read at any rung climbs as a quiet one does.
+#[test]
+fn a_busy_terminal_at_a_canarys_rung_does_not_knock_it_down() {
+    use super::super::wall_memory::StuckRung::{Raised, Said, Told};
+    let status = |subject: &str, source: &str| {
+        ok(&format!(
+            "OK schema=1 phase=running program=claude agent=claude subject={subject} \
+             subject_source={source}\n"
+        ))
+    };
+    let rests = status("%E2%9C%B3%20Claude%20Code", "osc");
+    let busy = status("-", "unavailable");
+    for dialog in [false, true] {
+        let looks = canary_looks(dialog, &[CANARY_LOOK_GAP; 4], |m| {
+            m.verb_replies.insert(
+                "status",
+                VecDeque::from([rests.clone(), rests.clone(), busy.clone()]),
+            );
+        });
+        let why = format!("dialog={dialog}");
+        assert_eq!(looks.rungs, [Said, Told, Raised, Raised], "{why}");
+        assert_eq!(
+            looks.told,
+            ["unread:some", canary_raised(dialog)],
+            "{why}: the record stands"
+        );
+        assert_eq!(
+            looks.said,
+            ["STUCK", "STALLED", "EXCEPTION"],
+            "{why}: each rung once"
+        );
+    }
+}
+
+/// A LOOK THE CANARY COULD NOT MAKE LEAVES ITS RUNG: a read with no answer is no evidence either
+/// way, on either of the look's reads. An ERR `status` has no `program=`, which would read as a tab
+/// running no Claude. The pace stands too: the next look comes one period later, not at the next
+/// read of the screen.
+#[test]
+fn a_look_the_canary_could_not_make_leaves_its_rung() {
+    use super::super::wall_memory::StuckRung::{Quiet, Raised, Said, Told};
+    let hourly = [CANARY_LOOK_GAP; 4];
+    let title = ok("OK ✳ Claude Code\n");
+    let cut = canary_looks(true, &hourly, |m| {
+        m.verb_replies.insert(
+            "status",
+            VecDeque::from([
+                ok("OK schema=1 program=claude agent=claude subject=%E2%9C%B3 subject_source=osc\n"),
+                ok("OK schema=1 program=claude agent=claude subject=%E2%9C%B3 subject_source=osc\n"),
+                err("the session is going away"),
+            ]),
+        );
+    });
+    assert_eq!(
+        cut.rungs,
+        [Said, Told, Told, Raised],
+        "an ERR `status` at the dialog's STALLED"
+    );
+    assert_eq!(
+        cut.told,
+        ["unread:some", "exception:dialog"],
+        "the record stands"
+    );
+    assert_eq!(
+        cut.said,
+        ["STUCK", "STALLED", "EXCEPTION"],
+        "each rung once"
+    );
+    for dialog in [false, true] {
+        let raised = canary_raised(dialog);
+        let refused = canary_looks(dialog, &hourly, |m| m.title_refused = true);
+        let why = format!("dialog={dialog}");
+        assert_eq!(refused.rungs, [Quiet; 4], "{why}: a host without `title`");
+        assert!(
+            refused.told.is_empty() && refused.said.is_empty(),
+            "{why}: {:?} {:?}",
+            refused.told,
+            refused.said
+        );
+        let cut = canary_looks(dialog, &hourly, |m| {
+            m.verb_replies.insert(
+                "title",
+                VecDeque::from([title.clone(), title.clone(), closed()]),
+            );
+        });
+        assert_eq!(
+            cut.rungs,
+            [Said, Told, Told, Raised],
+            "{why}: a cut `title` at STALLED"
+        );
+        assert_eq!(
+            cut.told,
+            ["unread:some", raised],
+            "{why}: the record stands"
+        );
+        assert_eq!(
+            cut.said,
+            ["STUCK", "STALLED", "EXCEPTION"],
+            "{why}: each rung once"
+        );
+        let paced = canary_looks(dialog, &[CANARY_LOOK_GAP, Duration::ZERO], |m| {
+            m.title_refused = true;
+        });
+        assert_eq!(
+            paced.titles, 1,
+            "{why}: a look with no answer keeps the pace"
+        );
+    }
+}
+
 #[test]
 fn agy_or_muse_background_work_that_never_ends_climbs_the_canary() {
     use aterm_phase::agy::fixtures::lab as a;
@@ -15199,7 +15542,9 @@ fn a_persons_exchange_stays_theirs_under_an_idle_compaction() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-use crate::supervise::policy::turn_end::{AccountAt, RULE_ACCOUNT, Restart, RestartAsk, Unmade};
+use crate::supervise::policy::turn_end::{
+    AccountAt, RULE_ACCOUNT, Restart, RestartAnswer, RestartAsk, RestartClaim, Unmade,
+};
 
 /// A roster host as a test drives it: its advice ([`IdleHost::account`]) and relaunch answers
 /// ([`IdleHost::restart`]) are scripted (each ask the next entry, the last for ever), and all
@@ -15216,6 +15561,12 @@ struct AccountHost {
     advised_on_restart: std::sync::Mutex<Option<Option<AccountAdvice>>>,
     answers: std::sync::Mutex<VecDeque<&'static str>>,
     answered: std::sync::Mutex<Option<&'static str>>,
+    /// What each relaunch answer read of the conversation's record ([`RestartAnswer::claim`]),
+    /// scripted beside [`Self::answers`] (each answer the next entry, the last for ever; none:
+    /// [`RestartClaim::Unclaimed`], as no account move's record is its own, `relaunch::its_own`),
+    /// and the last one given.
+    claims: std::sync::Mutex<VecDeque<RestartClaim>>,
+    claimed: std::sync::Mutex<Option<RestartClaim>>,
     said: std::sync::Mutex<Vec<String>>,
     /// Each restart the loop asked for ([`IdleHost::restart`]), in order.
     asked: std::sync::Mutex<Vec<Restart>>,
@@ -15226,6 +15577,9 @@ struct AccountHost {
     /// The stamp moves by itself right after the first ask for advice: news that lands while
     /// the session waits on that advice.
     news_after_first_ask: std::sync::atomic::AtomicBool,
+    /// The stamp moves at each restart it answers: the window's host strikes the row a move it
+    /// could not make took, and the strike is news of the accounts (`Kind::Struck` wakes).
+    news_on_restart: std::sync::atomic::AtomicBool,
     /// A relaunched agent's last step is owed: the host asks for the next
     /// idle point and takes it there ([`IdleHost::at_idle`]), once.
     carry: std::sync::atomic::AtomicBool,
@@ -15345,6 +15699,18 @@ impl AccountHost {
         })
     }
 
+    /// [`Self::scripted`], each relaunch answer's claim the next of `claims`
+    /// ([`Self::claims`]).
+    fn claiming(
+        advice: &[Option<AccountAdvice>],
+        answers: &[&'static str],
+        claims: &[RestartClaim],
+    ) -> Arc<Self> {
+        let host = Self::scripted(advice, answers);
+        *host.claims.lock().unwrap() = claims.iter().copied().collect();
+        host
+    }
+
     fn moving(to: &str, answer: &'static str) -> Arc<Self> {
         Self::scripted(
             &[Some(AccountAdvice::Move {
@@ -15441,7 +15807,7 @@ impl IdleHost for AccountHost {
         self.relaunch_off_asked.fetch_add(1, Ordering::SeqCst);
         self.relaunch_off.load(Ordering::SeqCst)
     }
-    fn restart(&self, why: &Restart, ask: &RestartAsk) -> Option<String> {
+    fn restart(&self, why: &Restart, ask: &RestartAsk) -> Option<RestartAnswer> {
         let what = match why {
             Restart::Account { to, .. } => format!("restart:{}:{to}", why.word()),
             other => format!("restart:{}", other.word()),
@@ -15459,8 +15825,15 @@ impl IdleHost for AccountHost {
         if let Some(next) = self.answers.lock().unwrap().pop_front() {
             *last = Some(next);
         }
+        let mut claimed = self.claimed.lock().unwrap();
+        if let Some(next) = self.claims.lock().unwrap().pop_front() {
+            *claimed = Some(next);
+        }
         if *last == Some("adopted") && self.parks.load(Ordering::SeqCst) {
             self.carry.store(true, Ordering::SeqCst);
+        }
+        if self.news_on_restart.load(Ordering::SeqCst) {
+            self.stamp.fetch_add(1, Ordering::SeqCst);
         }
         let mut pids = self.pids_on_restart.lock().unwrap();
         let moved = if pids.len() > 1 {
@@ -15477,7 +15850,10 @@ impl IdleHost for AccountHost {
         } else {
             lefts.front().copied()
         };
-        last.map(str::to_string)
+        last.map(|step| RestartAnswer {
+            step: step.to_string(),
+            claim: claimed.unwrap_or(RestartClaim::Unclaimed),
+        })
     }
     fn restart_left(&self) -> Option<crate::supervise::custody::Process> {
         self.left.lock().unwrap().map(|pid| (Some(pid), None))
@@ -16568,6 +16944,290 @@ fn news_of_the_accounts_ends_a_sessions_wait_at_its_limit() {
     assert_eq!(host.said("account").len(), 1, "{:?}", host.all());
     assert!(host.said("restart").is_empty(), "{lines:#?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R6 of `claude-rotation-proof` (rp1103a, 2026-11-03): at a wall the host put the move off for
+/// the tab's own background job (`wait:changed`) and struck the row the move had taken, and the
+/// strike's news woke the loop to ask the move again at once: 371 asks in 288 s, its back-off
+/// (10 s, 1 min, 5 min, 10 min) never reached. The wait under a move its host's word puts off
+/// ends at that word's due, as an F19 yield's ends at its instant: the move's own strike is no
+/// news that ends it, so a run whose host strikes at each put-off asks the move once, at the wall.
+///
+/// NEGATIVE CONTROLS: the wall's wait with no move to make ends on the same news, which can open
+/// a row, and so does a wait the loop stands after the put-off's (the wall's reset, once the
+/// advice changed), though the restart's run counters stand on: a line in custody keeps them
+/// through every act but a restart (`turn_end_execute`).
+#[test]
+fn a_move_its_host_puts_off_is_not_asked_again_by_its_own_strike() {
+    let at_wall = |host: &Arc<AccountHost>, next: bool| {
+        let opts = account_opts(host);
+        let mut m = Mock::new(vec![limited_screen()]);
+        let (mut s, wall) = account_session(&mut m);
+        host.stamp.store(7, Ordering::SeqCst);
+        let action = s
+            .turn_end_at_point(&wall, Some(Duration::from_secs(180)), &opts)
+            .expect("a decision");
+        s.turn_end_execute(&wall, action, &opts, &[], &mut Alone)
+            .expect("the wall is waited at");
+        assert!(s.turn_end_due.is_some(), "{:?}", host.all());
+        if next {
+            assert!(s.restart_waits > 0, "{:?}", host.all());
+            let reset = s.fx.mono() + Duration::from_secs(3600);
+            s.set_due(reset, "the wall's reset");
+        }
+        // The strike's news, as the window's listener tells it once the move is put off.
+        host.stamp.store(8, Ordering::SeqCst);
+        (s.account_edge(&opts), host.all())
+    };
+    let host = AccountHost::moving("work-2", "wait:changed");
+    let (edge, said) = at_wall(&host, false);
+    assert_eq!(host.said("restart"), ["restart:account:work-2"], "{said:?}");
+    assert!(!edge, "the move's own strike ends no wait: {said:?}");
+    let host = AccountHost::moving("work-2", "wait:changed");
+    let (edge, said) = at_wall(&host, true);
+    assert!(edge, "news ends the wait after the put-off's: {said:?}");
+    let host = AccountHost::scripted(&[None], &[]);
+    let (edge, said) = at_wall(&host, false);
+    assert!(
+        !said.iter().any(|s| s.starts_with("restart")),
+        "nothing to move to: {said:?}"
+    );
+    assert!(edge, "news ends a wall's wait with no move: {said:?}");
+
+    let (dir, ledger) = ledger_at("account-strike-news");
+    let host = AccountHost::moving("work-2", "wait:changed");
+    host.news_on_restart.store(true, Ordering::SeqCst);
+    let wall = vec![busy_screen(), limited_screen()];
+    let (_, _, journal) = account_run("te-account-strike-news", wall, &host, &ledger);
+    assert_eq!(
+        host.said("restart"),
+        ["restart:account:work-2"],
+        "{journal:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A move ahead its host puts off past its rotation (`wait:conversation-in-other-tab`) strikes the
+/// row its ask took, as R6's move at a wall did. Where the act its point goes on with is a wait (a
+/// usage-credits hold, `held_by_credits`), that strike's news would end the wait and ask the move
+/// again at once. The wait is the move's (`Due::put_off`) and ends at the move's back-off step at
+/// the latest, so the move is asked again on its back-off, never on its own strike.
+///
+/// NEGATIVE CONTROL: the same wait, stood with no move asked, ends on the same news.
+#[test]
+fn a_move_ahead_its_host_puts_off_is_asked_again_on_its_back_off_not_on_its_own_strike() {
+    let ahead = |host: &Arc<AccountHost>, asked: bool| {
+        let opts = account_opts(host);
+        let mut m = Mock::new(vec![ended("Stage 3 done; the suite is green.")]);
+        let (mut s, _) = account_session(&mut m);
+        let end = account_point_of(ended("Stage 3 done; the suite is green."), Phase::Idle);
+        host.stamp.store(7, Ordering::SeqCst);
+        let action = s
+            .turn_end_at_point(&end, Some(Duration::from_secs(300)), &opts)
+            .expect("a decision");
+        let TurnEndAction::Restart { why, rule_id, .. } = action else {
+            panic!("a move ahead: {action:?}");
+        };
+        assert!(
+            matches!(&why, Restart::Account { at: AccountAt::Ahead, to } if to == "work-2"),
+            "{why:?}"
+        );
+        let held = TurnEndAction::WaitUntil {
+            until: s.fx.mono() + Duration::from_secs(3600),
+            why: "the usage credits lift".to_string(),
+            wait: WaitKind::Other,
+        };
+        let action = if asked {
+            TurnEndAction::Restart {
+                why,
+                rule_id,
+                otherwise: Box::new(held),
+            }
+        } else {
+            held
+        };
+        s.turn_end_execute(&end, action, &opts, &[], &mut Alone)
+            .expect("the point goes on");
+        let due = s.turn_end_due.clone().expect("the point waits");
+        let now = s.fx.mono();
+        // The strike's news, as the window's listener tells it once the move is put off.
+        host.stamp.store(8, Ordering::SeqCst);
+        (s.account_edge(&opts), due, now, host.all())
+    };
+    let host = AccountHost::moving("work-2", "wait:conversation-in-other-tab");
+    let (edge, due, now, said) = ahead(&host, true);
+    assert_eq!(
+        host.said("restart"),
+        ["restart:account-ahead:work-2"],
+        "{said:?}"
+    );
+    assert!(!edge, "the move's own strike ends no wait: {said:?}");
+    assert_eq!(due.put_off, Some("account-ahead"), "{due:?}");
+    assert!(
+        due.at <= now + Duration::from_secs(10),
+        "asked again on its back-off: {due:?}"
+    );
+    let host = AccountHost::moving("work-2", "wait:conversation-in-other-tab");
+    let (edge, due, _, said) = ahead(&host, false);
+    assert!(host.said("restart").is_empty(), "{said:?}");
+    assert!(edge, "news ends the same wait under no move: {said:?}");
+    assert_eq!(due.put_off, None, "{due:?}");
+}
+
+/// A move ahead its host puts off, at a point that goes on with a restart the host puts off too (a
+/// model's move onto its fallback; `wait:conversation-in-other-tab` to both): each acts on its own
+/// run (`Session::restart_aside`), so at the next point each is the same ask a step further on its
+/// back-off, and the point's wait with them. The point's restart minting a run of its own at every
+/// point would hold that wait, and the move's asks, at the ladder's first step. The run set aside
+/// is that restart's wherever it is asked next: on its own (the move no longer advised), as the
+/// fallback of a move whose run is new, or after the move is refused.
+///
+/// NEGATIVE CONTROL: an act that is no restart between two points (a wait, or an escalation after
+/// the move is refused) ends the model's run, which outlives no act, and not the move's, which is
+/// put off: the model's next ask is another ask, its wait back on the ladder's first step. Another
+/// restart asked on its own ends both runs.
+#[test]
+fn a_move_ahead_put_off_and_the_restart_its_point_goes_on_with_back_off_each_on_its_own_run() {
+    use crate::supervise::policy::turn_end::RULE_MODEL_FALLBACK;
+    let host = AccountHost::moving("work-2", "wait:conversation-in-other-tab");
+    let opts = account_opts(&host);
+    let mut m = Mock::new(vec![ended("Stage 3 done; the suite is green.")]);
+    let (mut s, _) = account_session(&mut m);
+    let end = account_point_of(ended("Stage 3 done; the suite is green."), Phase::Idle);
+    let action = s
+        .turn_end_at_point(&end, Some(Duration::from_secs(300)), &opts)
+        .expect("a decision");
+    let TurnEndAction::Restart { why, rule_id, .. } = action else {
+        panic!("a move ahead: {action:?}");
+    };
+    assert!(
+        matches!(&why, Restart::Account { at: AccountAt::Ahead, to } if to == "work-2"),
+        "{why:?}"
+    );
+    let held = |s: &Session<'_, Mock>| TurnEndAction::WaitUntil {
+        until: s.fx.mono() + Duration::from_secs(3600),
+        why: "the usage credits lift".to_string(),
+        wait: WaitKind::Other,
+    };
+    let fallback = |s: &Session<'_, Mock>| TurnEndAction::Restart {
+        why: Restart::Model {
+            to: "sonnet".to_string(),
+        },
+        rule_id: RULE_MODEL_FALLBACK,
+        otherwise: Box::new(held(s)),
+    };
+    let act = |s: &mut Session<'_, Mock>, action| {
+        s.turn_end_execute(&end, action, &opts, &[], &mut Alone)
+            .expect("the point goes on");
+        let due = s.turn_end_due.clone().expect("the point waits");
+        due.at.saturating_duration_since(s.fx.mono())
+    };
+    let point = |s: &mut Session<'_, Mock>| {
+        let action = TurnEndAction::Restart {
+            why: why.clone(),
+            rule_id,
+            otherwise: Box::new(fallback(s)),
+        };
+        act(s, action)
+    };
+    let asks = || host.asks.lock().unwrap().clone();
+    let said = || host.said("restart");
+    let (ahead, model) = ("restart:account-ahead:work-2", "restart:model");
+    let first = point(&mut s);
+    let second = point(&mut s);
+    assert_eq!(said(), [ahead, model, ahead, model], "{:?}", host.all());
+    assert!(first <= Duration::from_secs(10), "{first:?}");
+    assert!(
+        second > Duration::from_secs(10) && second <= Duration::from_secs(60),
+        "the next point waits a step further on: {second:?}"
+    );
+    let asked = asks();
+    assert_eq!(asked[2], asked[0], "the move asked again is its own ask");
+    assert_eq!(asked[3], asked[1], "so is the point's restart");
+
+    // The point's restart asked on its own, the move no longer advised: its run, on its own step.
+    let alone = fallback(&s);
+    let third = act(&mut s, alone);
+    assert_eq!(said()[4], model);
+    assert_eq!(asks()[4], asked[1], "the restart set aside takes the slot");
+    assert!(
+        third > Duration::from_secs(60) && third <= Duration::from_secs(300),
+        "its third step: {third:?}"
+    );
+    // The move asked again on a run of its own sets that run aside, for its point's restart.
+    let fourth = point(&mut s);
+    let asked = asks();
+    assert_eq!(said()[5..], [ahead, model]);
+    assert_ne!(
+        asked[5], asked[0],
+        "the move's run ended at another restart's"
+    );
+    assert_eq!(asked[6], asked[1], "the point's restart keeps its own");
+    assert!(
+        fourth <= Duration::from_secs(10),
+        "the move's first step: {fourth:?}"
+    );
+
+    let wait = held(&s);
+    s.turn_end_execute(&end, wait, &opts, &[], &mut Alone)
+        .expect("the point waits");
+    let fifth = point(&mut s);
+    let asked = asks();
+    assert_eq!(asked[7], asked[5], "the move put off outlives the act");
+    assert_ne!(asked[8], asked[1], "the model's run ends at it");
+    assert!(
+        fifth <= Duration::from_secs(10),
+        "back on the first step: {fifth:?}"
+    );
+
+    // Another restart asked on its own takes the place of the move's run, and of the run set
+    // aside with it: the next point's asks are both new.
+    let memory = TurnEndAction::Restart {
+        why: Restart::Memory,
+        rule_id: "memory-restart@v1",
+        otherwise: Box::new(held(&s)),
+    };
+    s.turn_end_execute(&end, memory, &opts, &[], &mut Alone)
+        .expect("the restart waits");
+    let _ = point(&mut s);
+    let asked = asks();
+    assert_eq!(said()[9], "restart:memory", "{:?}", host.all());
+    assert_ne!(asked[10], asked[7], "the move's run ended");
+    assert_ne!(asked[11], asked[8], "and the one set aside");
+
+    // The move refused: the restart its point goes on with takes back its own run.
+    host.answers
+        .lock()
+        .unwrap()
+        .extend(["refused:no-room", "wait:conversation-in-other-tab"]);
+    let _ = point(&mut s);
+    let asked = asks();
+    assert_eq!(said()[12..], [ahead, model], "{:?}", host.all());
+    assert_eq!(asked[12], asked[10], "the move's own ask, refused");
+    assert_eq!(asked[13], asked[11], "the point's restart, on its own run");
+
+    // The move refused at a point that goes on to escalate, an act that is no restart: the run
+    // its new ask set aside ends there, and the next point's restart is another ask.
+    host.answers
+        .lock()
+        .unwrap()
+        .extend(["refused:no-room", "wait:conversation-in-other-tab"]);
+    let escalate = TurnEndAction::Restart {
+        why: why.clone(),
+        rule_id,
+        otherwise: Box::new(TurnEndAction::Escalate {
+            reason: "nothing to go on with".to_string(),
+        }),
+    };
+    s.turn_end_execute(&end, escalate, &opts, &[], &mut Alone)
+        .expect("the point escalates");
+    let _ = point(&mut s);
+    let asked = asks();
+    assert_eq!(said()[14..], [ahead, ahead, model], "{:?}", host.all());
+    assert_ne!(
+        asked[16], asked[13],
+        "the escalation ended the run set aside"
+    );
 }
 
 #[test]
@@ -26524,24 +27184,24 @@ fn usage_left_typed_is_sent_as_the_probes_own_and_its_panel_is_closed() {
         probe_policy(0),
         |_| {},
     );
-    assert_eq!(m.writes(), ["enter"], "{lines:#?}");
+    // A person's `/usage` is their command (v6 §14.17.5.8): it stands as their hold, never sent
+    // by the draft rule (origin/main's `CONTINUED … rule=continue@v1 /usage`) and never closed.
+    assert_eq!(m.writes(), Vec::<String>::new(), "{lines:#?}");
     assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("CONTINUED ") && l.ends_with(" rule=continue@v1 /usage")),
-        "the draft rule's act, as before: {lines:#?}"
+        !lines.iter().any(|l| l.starts_with("CONTINUED ")),
+        "nothing sent: {lines:#?}"
     );
     assert_eq!(
         world(&mut m).at,
-        PanelAt::Open,
-        "not the harness's to close"
+        PanelAt::Typed("/usage".to_string()),
+        "their line, standing"
     );
     assert_eq!(probe_writes(&m), Vec::<&str>::new());
     assert!(host.said("probe").is_empty() && host.said("inform").is_empty());
     assert!(probe_rows(&ledger).is_empty());
     assert_eq!(
         crate::supervise::approvals::typed_at(&ledger, None).len(),
-        1
+        0
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -26740,11 +27400,22 @@ fn the_probe_is_not_typed_again_over_its_own_text_left_typed() {
     let (probes, said, writes, journal) = second_turn_end("probe-left-again", false);
     assert_eq!(probes, ["/usage"], "the first loop's alone");
     assert_eq!(said, ["turn-ran"], "asked for no advice and no claim");
-    assert_eq!(writes, ["text:/usage", "enter"], "nothing written over it");
-    // The probe the ledger seeds owes the panel and claims no draft (slice pl1): the `/usage` it
-    // finds standing is no line this process wrote, so it holds for a person's grace.
+    assert_eq!(
+        writes,
+        ["text:/usage", "enter", "enter"],
+        "nothing written over it: the probe's own Enter alone"
+    );
+    // The probe the ledger seeds proves the `/usage` it finds standing is the first loop's write
+    // (v6 §14.17.5.8: no person's typing since its row, nor a gesture where the window stamps
+    // none): its own line,
+    // sent by its own Enter with no person's grace held on it.
     assert!(
-        journal.iter().any(|l| l.starts_with("WAITING ")
+        journal.iter().any(|l| l.starts_with("NOTE ")
+            && l.contains(super::super::turn_end_loop::PROBE_SEED_PROVEN)),
+        "{journal:#?}"
+    );
+    assert!(
+        !journal.iter().any(|l| l.starts_with("WAITING ")
             && l.contains(crate::supervise::policy::turn_end::PERSON_TYPING)),
         "{journal:#?}"
     );
@@ -28083,6 +28754,11 @@ fn the_landing_points_showing_places_the_turn_snapshotted() {
     assert_eq!(marks, [done_mark("landed", report.len(), &path)]);
 }
 
+/// A PERSON'S OWN EXCHANGE MARKS NO TASK: a quick opening turn their gesture is in, in a session
+/// whose record no manager waits on (`exited`), is left to them (`LEFT`), and the loop reads the
+/// record once and marks nothing. A MANAGED WORKER'S OPENING MESSAGE IS ITS TASK (2026-11-04): the
+/// same turn in a session whose record is `working` leaves nothing to the person, and Land types
+/// its instruction. CONTROL: with no gesture, the worker's landing marks its record once.
 #[test]
 fn a_persons_own_exchange_marks_no_task() {
     let root = crate::supervise::ScratchDir::new("task", "left");
@@ -28098,8 +28774,11 @@ fn a_persons_own_exchange_marks_no_task() {
         task_row("assistant", "a-hi", "msg_1", &said),
     ]);
     let landed = transcript_of(&landing_rows(&landed_reply()));
-    let run = |person: bool| {
-        let journal = root.join(format!("journal-{person}.jsonl"));
+    let run = |person: bool, task: Option<(u64, String)>| {
+        let managed = task
+            .as_ref()
+            .is_some_and(|(_, t)| t.contains("state=working"));
+        let journal = root.join(format!("journal-{person}-{managed}.jsonl"));
         let (screens, text) = if person {
             (vec![busy_screen(), quick(&said)], &greeting)
         } else {
@@ -28122,7 +28801,7 @@ fn a_persons_own_exchange_marks_no_task() {
         if person {
             m.human = vec!["2000"];
         }
-        m.task = working_task();
+        m.task = task;
         let mut out: Vec<u8> = Vec::new();
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
@@ -28149,10 +28828,28 @@ fn a_persons_own_exchange_marks_no_task() {
             .count();
         (m, left)
     };
-    let (m, left) = run(true);
+    let exited = Some((
+        2,
+        "state=exited from=s-0a1b since_ms=0 result_bytes=0 why=exit".to_string(),
+    ));
+    let (m, left) = run(true, exited);
     assert_eq!(left, 1, "the person's exchange");
     assert_eq!(m.task_requests, ["task"], "the loop's first read, no mark");
-    let (m, left) = run(false);
+    let (m, left) = run(true, working_task());
+    assert_eq!(left, 0, "a managed worker's opening message is its task");
+    assert!(
+        m.requests
+            .iter()
+            .any(|r| r.contains("turn submit=") && r.contains(LAND)),
+        "Land's instruction: {:#?}",
+        m.requests
+    );
+    assert!(
+        task_marks(&m).is_empty(),
+        "nothing landed: {:?}",
+        m.task_requests
+    );
+    let (m, left) = run(false, working_task());
     assert_eq!(left, 0);
     assert_eq!(task_marks(&m).len(), 1, "{:?}", m.task_requests);
 }
@@ -30353,9 +31050,19 @@ fn a_restart_of_another_kind_begins_a_run_of_its_own() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A FALLBACK'S RELAUNCH IN FLIGHT WHEN ITS LOOP ENDS IS MADE AT ITS FIRST ASK: the loop's move
+/// onto the fallback answered a wait once its ask had claimed the conversation's record
+/// (`wait:resume`, claimed), and the loop ended there. The journal's restart note says the claim
+/// (`claimed=<second>`, [`super::super::turn_end_loop::journaled_open_moves`]), so the next loop
+/// restores the run (`Session::seed_open_move_in`) and asks the move as the first loop asked
+/// it: the relaunch is booked made at that first ask, and once booked, no run is left open. With a
+/// person's prompt answered on the fallback, the wall it moved off waits for its reset; with the
+/// redraw alone (CONTROL), the turn end is continued before it.
 #[test]
 fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() {
-    use crate::supervise::approvals::{Ledger, open_model_switch, open_wall, relaunch_waiting};
+    use super::super::turn_end_loop::journaled_open_moves;
+    use crate::supervise::approvals::{Ledger, open_model_switch, open_wall};
+    use crate::supervise::journal::JournalRecord;
     use crate::supervise::policy::turn_end::{RULE_CONTINUE, Restart, decide_turn_end};
     use aterm_phase::prompt::fixtures as fx;
     const RESET: i64 = 1_792_279_200;
@@ -30422,8 +31129,17 @@ fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() 
             + "\n"
     };
     let before = tail("carry on with the task", now - 600);
-    let hosted = |transcript: &str, answers: &[&'static str]| {
-        let host = AccountHost::scripted(&[None], answers);
+    let journaled = |heard: &Heard| -> String {
+        heard
+            .noted
+            .iter()
+            .map(|line| {
+                JournalRecord::of_line(now * 1000 + 400, Some("@s-1"), line, None).to_json() + "\n"
+            })
+            .collect()
+    };
+    let hosted = |transcript: &str, answers: &[&'static str], claim: RestartClaim| {
+        let host = AccountHost::claiming(&[None], answers, &[claim]);
         *host.tail.lock().unwrap() = Some(transcript.to_string());
         let opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
@@ -30435,7 +31151,7 @@ fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() 
     let mut wrong = Vec::new();
     for (n, answered) in [true, false].into_iter().enumerate() {
         let (dir, ledger) = ledger_at(&format!("relaunch-in-flight-{n}"));
-        let (host, opts) = hosted(&before, &["wait:resume"]);
+        let (host, opts) = hosted(&before, &["wait:resume"], RestartClaim::Taken);
         let mut m = Mock::new(vec![armed.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_zone_lookup(test_zones);
@@ -30457,11 +31173,15 @@ fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() 
             ),
             "{a:?}"
         );
-        s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
+        let mut heard = Heard::default();
+        s.turn_end_execute(&p, a, &opts, &[], &mut heard)
             .expect("waits");
         assert_eq!(host.said("restart"), ["restart:model"]);
         drop(s);
-        let run = relaunch_waiting(&ledger, Some("@s-1"));
+        let journal = journaled(&heard);
+        let run = journaled_open_moves(&journal, Some("@s-1"))
+            .0
+            .and_then(|run| run.claimed.map(|claimed| (run.kind, run.at, claimed)));
         let (screen, transcript) = if answered {
             (
                 met.clone(),
@@ -30470,7 +31190,7 @@ fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() 
         } else {
             (redrawn.clone(), before.clone())
         };
-        let (_host2, opts2) = hosted(&transcript, &["relaunched"]);
+        let (_host2, opts2) = hosted(&transcript, &["relaunched"], RestartClaim::Held);
         let mut m2 = Mock::new(vec![screen.clone()]);
         let mut s2 = session(&mut m2, Some("@s-1".to_string()));
         s2.set_clock(now + 61, PDT);
@@ -30481,6 +31201,7 @@ fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() 
             ..TurnEndTiming::default()
         });
         s2.seed_model_switch(&ledger);
+        s2.seed_open_move_in(&journal);
         s2.seed_wall_memory(open_wall(&ledger, Some("@s-1")));
         let p = point_at(&s2, screen.clone(), 101);
         let a = s2
@@ -30494,10 +31215,12 @@ fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() 
             }
         );
         s2.pass_wake_settle();
-        s2.turn_end_execute(&p, a, &opts2, &[], &mut Alone)
+        let mut heard2 = Heard::default();
+        s2.turn_end_execute(&p, a, &opts2, &[], &mut heard2)
             .expect("relaunched");
         let made = open_model_switch(&ledger, Some("@s-1")).map(|o| o.made_unix - now);
-        let ended = relaunch_waiting(&ledger, Some("@s-1")).is_none();
+        let ended = journaled_open_moves(&(journal.clone() + &journaled(&heard2)), Some("@s-1"))
+            == (None, None);
         s2.set_clock(now + 70, PDT);
         s2.pass_wake_settle();
         let point = point_at(&s2, screen, 102);
@@ -30516,7 +31239,7 @@ fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() 
         };
         drop(s2);
         let _ = std::fs::remove_dir_all(&dir);
-        let ok = run == Some(now)
+        let ok = run == Some((Restart::MODEL, now, now))
             && asked
             && made == Some(0)
             && ended
@@ -30527,14 +31250,14 @@ fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() 
             };
         if !ok {
             wrong.push(format!(
-                "{}: the run's row {:?}, the successor asked the relaunch {asked}, made=now{:+?} \
+                "{}: the journal's claimed run {:?}, the successor asked the relaunch {asked}, made=now{:+?} \
                  (the run ended {ended}), then {:?} at now{:+}s",
                 if answered {
                     "a person's prompt answered"
                 } else {
                     "control: the redraw"
                 },
-                run.map(|r| r - now),
+                run.map(|(kind, at, claimed)| (kind, at - now, claimed - now)),
                 made,
                 decided.1,
                 decided.0 - now
@@ -33022,6 +33745,50 @@ fn two_restart_runs_of_one_cause_asked_in_one_second_are_two_asks() {
     );
 }
 
+/// A RESTART NOTE AN OLDER BUILD WROTE RESTORES NO CLAIMED RUN (ATERM-KI-1101-3): a build before
+/// the host said its claim wrote its notes with no `claimed=` word, and no answer of that build
+/// said a claim was taken, so a move's deferral it journaled last is read as holding none: the
+/// next loop restores no run for it (`turn_end_loop::journaled_open_moves`), and its ask is a
+/// run of its own, past the second that note's ask names (`turn_end_loop::journaled_restart_floor`
+/// reads that alike). A note this build wrote with its claim's second restores the run, holding
+/// that claim. NEGATIVE CONTROL by mutation: a note with no `claimed=` read as holding a claim
+/// restores the older build's deferral.
+#[test]
+fn a_restart_note_an_older_build_wrote_restores_no_claimed_run() {
+    use super::super::turn_end_loop::{RestartRun, journaled_open_moves, journaled_restart_floor};
+    use crate::supervise::journal::JournalRecord;
+    let note = |line: &str| {
+        JournalRecord::of_line(TEST_NOW * 1000 + 400, Some("@s-1"), line, None).to_json() + "\n"
+    };
+    let older = note(&format!(
+        "HOST seq=2 restart:model-back ask=model-back@{TEST_NOW} step=wait:resume"
+    ));
+    assert_eq!(journaled_open_moves(&older, Some("@s-1")), (None, None));
+    assert_eq!(
+        journaled_restart_floor(&older, Some("@s-1")),
+        Some(TEST_NOW)
+    );
+    let claimed = note(&format!(
+        "HOST seq=2 restart:model-back ask=model-back@{TEST_NOW} claimed={} step=wait:resume",
+        TEST_NOW + 3
+    ));
+    assert_eq!(
+        journaled_open_moves(&claimed, Some("@s-1")),
+        (
+            Some(RestartRun {
+                kind: Restart::MODEL_BACK,
+                at: TEST_NOW,
+                claimed: Some(TEST_NOW + 3),
+            }),
+            None
+        )
+    );
+    let unclaimed = note(&format!(
+        "HOST seq=2 restart:model-back ask=model-back@{TEST_NOW} claimed=no step=wait:resume"
+    ));
+    assert_eq!(journaled_open_moves(&unclaimed, Some("@s-1")), (None, None));
+}
+
 /// A LOOP'S FIRST RESTART RUN IS PAST EVERY RUN ITS JOURNAL SHOWS ASKED: a loop that starts in the
 /// second an earlier loop's run of the same cause was asked in mints a new run past it
 /// (`journaled_restart_floor`), so it never takes the earlier run's record for its own. The
@@ -33046,7 +33813,9 @@ fn a_loops_first_restart_run_is_past_every_run_its_journal_shows_asked() {
             ),
         ) + &note(
             TEST_NOW,
-            &format!("HOST seq=9 restart:memory ask=memory@{TEST_NOW} step=adopted"),
+            &format!(
+                "HOST seq=9 restart:memory ask=memory@{TEST_NOW} claimed={TEST_NOW} step=adopted"
+            ),
         ) + &note(TEST_NOW, "NOTE seq=9 nothing restarted here");
         std::fs::write(
             crate::supervise::approvals::journal_beside(&ledger),
@@ -33097,20 +33866,171 @@ fn a_loops_first_restart_run_is_past_every_run_its_journal_shows_asked() {
     );
 }
 
-/// A MOVE BACK PUT OFF TO A QUIET MOMENT KEEPS ITS ASK: a model-back answered a wait after its
-/// ask claimed the conversation's record (`wait:resume`: the process its relaunch started not yet
-/// registered) is deferred, and the point goes on with the act it would have taken
-/// (`DEFERRED`). That act ended the run, so the next turn end asked the move as another restart,
-/// `model-back@<a later second>`; the relaunch read the record the first ask claimed, landed in
-/// the process asking, as another restart's and superseded it (`relaunch::supersedes`): one move
-/// back, two relaunches. The act a deferral goes on with keeps the deferred restart's run. A
-/// restart made ends it, and CONTROL: any later act that is no restart still does.
+/// A MOVE WHOSE ASK CLAIMED THE RECORD IS ASKED AS ITSELF WHATEVER ACTS COME BEFORE ITS NEXT ASK
+/// (ATERM-KI-1101-3): a model's way back answered a wait after its ask claimed the conversation's
+/// record (`wait:resume`, [`RestartAnswer::claim`]) is deferred, and the point goes on. While
+/// the relaunch that ask landed is owed its carry-on, the window host owns the turn ends that come
+/// and the policy decides nothing at them (`upgrading`): acts that are no restart, each of which
+/// ended the move's run, so its next ask, once the sweep had carried the relaunch on, was another
+/// run's, missed the record its first ask claimed (`relaunch::its_own`), and the relaunch
+/// restarted the process that ask had landed: two relaunches for one move. The run of a move
+/// whose ask claimed now keeps its ask, whatever acts the loop decides, until the move is made or
+/// refused, and the relaunch's word for its own record carried on (`relaunch::ALREADY_MADE`) books
+/// it, which closes the model switch; one `RESTARTED`. An account move ahead, whose record is never
+/// its own (`relaunch::its_own`) and whose answers so claim nothing, keeps its run past the acts by
+/// its kind, so its back-off stays apart from the restart its point goes on with
+/// (`Session::restart_aside`), and the word of its record carried in flight (`adopted`,
+/// `relaunch::carried_word`, whatever its ask) books it once. CONTROLS: a move refused, and a move
+/// made, ends its run, so the ask after it is another; a way back whose answers claimed nothing
+/// ends its run at the act as any restart does, so each of its asks is another run's.
 #[test]
-fn a_model_back_asked_again_after_its_deferral_is_its_first_ask() {
-    let host = AccountHost::scripted(
-        &[None],
-        &["wait:resume", "adopted", "wait:resume", "wait:resume"],
-    );
+fn a_move_put_off_after_its_claim_is_asked_as_itself_whatever_acts_come_between() {
+    use crate::harness::relaunch::ALREADY_MADE;
+    use crate::supervise::policy::turn_end::{ModelSwitch, RULE_ACCOUNT, RULE_MODEL_RESTORE};
+    let back = Restart::ModelBack { to: None };
+    let ahead = Restart::Account {
+        to: "work".to_string(),
+        at: AccountAt::Ahead,
+    };
+    for (why, rule, made, claims, keeps) in [
+        (
+            &back,
+            RULE_MODEL_RESTORE,
+            ALREADY_MADE,
+            &[
+                RestartClaim::Taken,
+                RestartClaim::Unclaimed,
+                RestartClaim::Taken,
+                RestartClaim::Held,
+                RestartClaim::Taken,
+            ][..],
+            true,
+        ),
+        (
+            &ahead,
+            RULE_ACCOUNT,
+            "adopted",
+            &[RestartClaim::Unclaimed][..],
+            true,
+        ),
+        (
+            &back,
+            RULE_MODEL_RESTORE,
+            ALREADY_MADE,
+            &[RestartClaim::Unclaimed][..],
+            false,
+        ),
+    ] {
+        let host = AccountHost::claiming(
+            &[None],
+            &[
+                "wait:resume",
+                "refused:no-room",
+                "wait:resume",
+                made,
+                "wait:resume",
+            ],
+            claims,
+        );
+        let mut m = Mock::new(vec![idle_screen(); 16]);
+        m.cursor_on_caret = true;
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        let _ = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+            .expect("the decision");
+        let now = s.fx.mono();
+        s.turn_end.seed_model(ModelSwitch {
+            from: Some("claude-opus-5-5".to_string()),
+            to: "claude-sonnet-5-5".to_string(),
+            back_at: Some(now),
+        });
+        let mut heard = Heard::default();
+        for acts in [2, 1, 2, 1, 0] {
+            s.restart_agent(
+                &point,
+                why,
+                rule,
+                TurnEndAction::Nothing,
+                &opts,
+                &[],
+                &mut heard,
+            )
+            .expect("the restart");
+            for _ in 0..acts {
+                s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut heard)
+                    .expect("an act that is no restart");
+            }
+        }
+        let asks: Vec<String> = host
+            .asks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| a.word().to_string())
+            .collect();
+        assert_eq!(asks.len(), 5, "{asks:?}");
+        let case = format!("{} keeps={keeps}", why.word());
+        if keeps {
+            assert_eq!(
+                asks[0], asks[1],
+                "{case}: asked again past the acts after its deferral: {asks:?}"
+            );
+            assert_ne!(
+                asks[1], asks[2],
+                "{case}: CONTROL: a move refused ends its run: {asks:?}"
+            );
+            assert_eq!(
+                asks[2], asks[3],
+                "{case}: the next run's deferral keeps its ask: {asks:?}"
+            );
+            assert_ne!(
+                asks[3], asks[4],
+                "{case}: CONTROL: a move made ends its run: {asks:?}"
+            );
+        } else {
+            let mut distinct = asks.clone();
+            distinct.dedup();
+            assert_eq!(
+                distinct, asks,
+                "{case}: CONTROL: a move that claimed nothing ends its run at the act: {asks:?}"
+            );
+        }
+        if matches!(why, Restart::ModelBack { .. }) {
+            assert!(
+                s.turn_end.model_switch().is_none(),
+                "{case}: the way back booked made closes the switch"
+            );
+        }
+        let restarted: Vec<&String> = heard
+            .said
+            .iter()
+            .filter(|l| l.starts_with("RESTARTED ") && l.contains(&format!("rule={rule}")))
+            .collect();
+        assert_eq!(restarted.len(), 1, "{case}: {:#?}", heard.said);
+    }
+}
+
+/// A HELD LINE KEEPS ONLY ITS OWN RESTART'S RUN PAST ANOTHER ACT (ATERM-KI-1101-3): an act the
+/// loop decides that is no restart ends a restart's run (`RestartAsk`), but while a line stood
+/// held in custody every run outlived it, so a memory restart the host deferred (`wait:changed`)
+/// and asked again after the loop's other acts was asked under its first ask, which meets the
+/// record any ask of that run claimed (`relaunch::its_own`: carried, `adopted`, nothing signalled,
+/// a memory restart booked that no signal made). Only the held line's own restart keeps its run,
+/// and with it its back-off, past another act now, as the write the custody holds may turn into
+/// that restart (`Session::custody_lost`). CONTROL: the line's restart, deferred and asked again
+/// across another act, steps on to its back-off's second wait; NEGATIVE CONTROL by mutation: with
+/// no run kept past the act, its second wait is the first's again.
+#[test]
+fn a_held_line_keeps_only_its_own_restarts_run_past_another_act() {
+    use crate::supervise::run::turn_end_loop::Custody;
+    let host = AccountHost::scripted(&[None], &["wait:changed"]);
     let mut m = Mock::new(vec![idle_screen(); 12]);
     m.cursor_on_caret = true;
     let opts = SuperviseOpts {
@@ -33124,32 +34044,31 @@ fn a_model_back_asked_again_after_its_deferral_is_its_first_ask() {
     let _ = s
         .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
         .expect("the decision");
-    let back = Restart::ModelBack { to: None };
+    s.custody = Some(Custody::of("keep going", s.fx.mono()));
+    let line = Restart::InputLost {
+        of: (None, None),
+        line: crate::supervise::custody::LineAsk { at_ms: 0, nth: 0 },
+    };
     let mut heard = Heard::default();
-    for at in 0..4 {
-        if at == 3 {
-            s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut Alone)
-                .expect("another act");
+    for why in [&Restart::Memory, &line] {
+        for again in [false, true] {
+            if again {
+                s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut heard)
+                    .expect("another act");
+            }
+            s.restart_agent(
+                &point,
+                why,
+                "restart@v1",
+                TurnEndAction::Nothing,
+                &opts,
+                &[],
+                &mut heard,
+            )
+            .expect("the restart");
         }
-        s.restart_agent(
-            &point,
-            &back,
-            crate::supervise::policy::turn_end::RULE_MODEL_RESTORE,
-            TurnEndAction::Nothing,
-            &opts,
-            &[],
-            &mut heard,
-        )
-        .expect("the restart");
     }
-    assert!(
-        heard
-            .noted
-            .iter()
-            .any(|n| n.starts_with("DEFERRED ") && n.contains("restart:model-back")),
-        "{:?}",
-        heard.noted
-    );
+    assert!(s.custody.is_some(), "the line stands held throughout");
     let asks: Vec<String> = host
         .asks
         .lock()
@@ -33158,19 +34077,39 @@ fn a_model_back_asked_again_after_its_deferral_is_its_first_ask() {
         .map(|a| a.word().to_string())
         .collect();
     assert_eq!(asks.len(), 4, "{asks:?}");
-    assert_eq!(asks[0], asks[1], "asked again after its deferral: {asks:?}");
-    assert_ne!(asks[1], asks[2], "a restart made ends its run: {asks:?}");
-    assert_ne!(asks[2], asks[3], "CONTROL: another act ends it: {asks:?}");
+    assert_ne!(
+        asks[0], asks[1],
+        "another act ends the memory restart's run, a line held or not: {asks:?}"
+    );
+    assert_eq!(asks[2], asks[3], "the line's ask is its line's: {asks:?}");
+    let waits: Vec<i64> = heard
+        .noted
+        .iter()
+        .filter(|n| n.starts_with("WAITING ") && n.contains("restart:input-lost waits:"))
+        .filter_map(|n| {
+            n.split_whitespace()
+                .find_map(|w| w.strip_prefix("until="))
+                .and_then(aterm_types::rfc3339::parse_utc)
+        })
+        .map(|at| at - TEST_NOW)
+        .collect();
+    assert_eq!(
+        waits,
+        [10, 60],
+        "CONTROL: the held line's restart keeps its back-off past the act: {:#?}",
+        heard.noted
+    );
 }
 
 /// A RUN A LATER LOOP READS FROM THE JOURNAL IS READ AT ITS OWN SECOND: a run minted past the
 /// wall clock (`Session::restart_floor`: a second run in one second) was journaled at the second
 /// the host answered it, and a later loop read that second back as the run's. The fallback's move
-/// it restored waiting was asked `model@<the note's second>` where the record its run's ask
-/// claimed keeps `model@<the run's>` (`St::ask`), so `relaunch::its_own` missed it and the
-/// landed relaunch was superseded; and the later loop's floor fell short of the run minted
-/// ahead, so its next run of that cause shared that run's ask. The note now carries the ask
-/// (`HOST … restart:<kind> ask=<ask> step=…`), and both readers take the run's second from it.
+/// it restored, its ask's claim deferred, was asked `model@<the note's second>` where the record
+/// its run's ask claimed keeps `model@<the run's>` (`St::ask`), so `relaunch::its_own` missed it
+/// and the landed relaunch was superseded; and the later loop's floor fell short of the run minted
+/// ahead, so its next run of that cause shared that run's ask. The note carries the ask
+/// (`HOST … restart:<kind> ask=<ask> claimed=<second|no> step=…`), and both readers take the run's
+/// second from it.
 #[test]
 fn a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second() {
     use crate::supervise::journal::JournalRecord;
@@ -33185,7 +34124,15 @@ fn a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second() {
             .map(|a| a.word().to_string())
             .collect::<Vec<_>>()
     };
-    let first = AccountHost::scripted(&[None], &["adopted", "wait:changed", "busy:another-sweep"]);
+    let first = AccountHost::claiming(
+        &[None],
+        &["adopted", "wait:changed", "wait:resume"],
+        &[
+            RestartClaim::Taken,
+            RestartClaim::Unclaimed,
+            RestartClaim::Taken,
+        ],
+    );
     let mut heard = Heard::default();
     {
         let mut m = Mock::new(vec![idle_screen(); 8]);
@@ -33272,12 +34219,262 @@ fn a_run_a_later_loop_reads_from_the_journal_is_read_at_its_own_second() {
     let asked = ask_words(&later);
     assert_eq!(
         asked[0], earlier[2],
-        "the move restored waiting is the earlier run's ask: {asked:?} after {earlier:?}"
+        "the claimed move restored is the earlier run's ask: {asked:?} after {earlier:?}"
     );
     assert!(
         !earlier.contains(&asked[1]),
         "a new run is past every run the journal shows: {asked:?} after {earlier:?}"
     );
+}
+
+/// A MOVE PUT OFF WHEN ITS LOOP ENDS IS ASKED BY THE NEXT LOOP AS ITS FIRST ASK
+/// (ATERM-KI-1101-3): a loop's way back answered a wait after its ask claimed the conversation's
+/// record (`wait:resume`, [`RestartAnswer::claim`]) is deferred, and the loop ends before the
+/// move is booked (the harness loop restarts, or aterm does). The next loop restores the model
+/// switch from the ledger and asks the way back again; had it minted a new run past the journal's
+/// floor, its ask would miss the record the first ask claimed, and the relaunch would restart the
+/// process that ask had landed (superseded in flight, or restarted over once carried on), two
+/// relaunches for one move. The next loop restores the run of a move its journal shows deferred
+/// last in a run that outlives the loop's acts (`turn_end_loop::journaled_open_moves`): the way
+/// back's, its record claimed, and an account move ahead's, whose answers claim nothing (its
+/// record is never its own, `relaunch::its_own`) and whose run outlives the acts by its kind. Its
+/// ask, past the act its first turn end decides (the carry hold's nothing), is the first ask.
+/// CONTROLS: a move the journal shows refused or made after its deferral, or followed by another
+/// restart's ask (whose run took its place), leaves no run to restore, and the next loop's ask is
+/// a new run's.
+#[test]
+fn a_move_put_off_when_its_loop_ends_is_asked_by_the_next_as_its_first_ask() {
+    use crate::harness::relaunch::ALREADY_MADE;
+    use crate::supervise::journal::JournalRecord;
+    use crate::supervise::policy::turn_end::{RULE_ACCOUNT, RULE_MODEL_RESTORE};
+    let back = Restart::ModelBack { to: None };
+    let ahead = Restart::Account {
+        to: "work".to_string(),
+        at: AccountAt::Ahead,
+    };
+    let mut wrong = Vec::new();
+    for (why, rule) in [(&back, RULE_MODEL_RESTORE), (&ahead, RULE_ACCOUNT)] {
+        let claims = matches!(why, Restart::ModelBack { .. });
+        let (taken, held) = if claims {
+            (RestartClaim::Taken, RestartClaim::Held)
+        } else {
+            (RestartClaim::Unclaimed, RestartClaim::Unclaimed)
+        };
+        for (case, answers, then, claimed, restored) in [
+            ("deferred", &["wait:resume"][..], None, &[taken][..], true),
+            (
+                "refused",
+                &["wait:resume", "refused:no-room"][..],
+                Some(why),
+                &[taken, RestartClaim::Unclaimed][..],
+                false,
+            ),
+            (
+                "made",
+                &["wait:resume", ALREADY_MADE][..],
+                Some(why),
+                &[taken, held][..],
+                false,
+            ),
+            (
+                "replaced",
+                &["wait:resume", "wait:changed"][..],
+                Some(&Restart::Memory),
+                &[taken, RestartClaim::Unclaimed][..],
+                false,
+            ),
+        ] {
+            let first = AccountHost::claiming(&[None], answers, claimed);
+            let mut heard = Heard::default();
+            {
+                let mut m = Mock::new(vec![idle_screen(); 8]);
+                m.cursor_on_caret = true;
+                let opts = SuperviseOpts {
+                    idle_host: Some(Arc::clone(&first) as Arc<dyn IdleHost>),
+                    ..hosted(30)
+                };
+                let mut s = session(&mut m, Some("@s-1".to_string()));
+                s.set_clock(TEST_NOW, PDT);
+                let screen = s.screen().expect("the point");
+                let point = s.turn_of(screen);
+                let _ = s
+                    .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+                    .expect("the decision");
+                for asked in std::iter::once(why).chain(then) {
+                    s.restart_agent(
+                        &point,
+                        asked,
+                        rule,
+                        TurnEndAction::Nothing,
+                        &opts,
+                        &[],
+                        &mut heard,
+                    )
+                    .expect("the restart");
+                    s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut heard)
+                        .expect("an act that is no restart");
+                }
+            }
+            let (dir, ledger) = ledger_at(&format!("put-off-{}-{case}", why.word()));
+            std::fs::write(&ledger, "").expect("the ledger");
+            let journal: String = heard
+                .noted
+                .iter()
+                .map(|line| {
+                    JournalRecord::of_line(TEST_NOW * 1000 + 400, Some("@s-1"), line, None)
+                        .to_json()
+                        + "\n"
+                })
+                .collect();
+            std::fs::write(
+                crate::supervise::approvals::journal_beside(&ledger),
+                journal,
+            )
+            .expect("the journal");
+            let next = AccountHost::scripted(&[None], &["wait:resume"]);
+            {
+                let mut m = Mock::new(vec![idle_screen(); 6]);
+                m.cursor_on_caret = true;
+                let opts = SuperviseOpts {
+                    idle_host: Some(Arc::clone(&next) as Arc<dyn IdleHost>),
+                    ..hosted(30)
+                };
+                let mut s = session(&mut m, Some("@s-1".to_string()));
+                s.set_clock(TEST_NOW + 30, PDT);
+                let _ = s.seed_from_ledger(&ledger, (TEST_NOW + 30) * 1000, false);
+                let screen = s.screen().expect("the point");
+                let point = s.turn_of(screen);
+                let _ = s
+                    .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+                    .expect("the decision");
+                s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut Alone)
+                    .expect("the carry hold's nothing");
+                s.restart_agent(
+                    &point,
+                    why,
+                    rule,
+                    TurnEndAction::Nothing,
+                    &opts,
+                    &[],
+                    &mut Alone,
+                )
+                .expect("the move asked again");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            let words = |host: &AccountHost| {
+                host.asks
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|a| a.word().to_string())
+                    .collect::<Vec<_>>()
+            };
+            let (earlier, later) = (words(&first), words(&next));
+            if (later.first() == earlier.first()) != restored {
+                wrong.push(format!(
+                    "{} {case}: the next loop asked {later:?} after {earlier:?}",
+                    why.word()
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a move put off is asked by the next loop as its first ask, and only it: {wrong:#?}"
+    );
+}
+
+/// A LATER LOOP RESTORES AN ACCOUNT MOVE PUT OFF WITH THE RUN SET ASIDE BESIDE IT
+/// (`Session::seed_open_move_in`, `turn_end_loop::journaled_open_moves`): its journal reads its
+/// runs back as the earlier loop moved them. An account move ahead the host put off took the slot
+/// and set aside the model's move standing there, which held a live claim of the conversation's
+/// record (`claimed=<second>`), as that move's ask would (`Session::aside_for`): the later loop
+/// restores both, the model's run holding its claim, so the model's move asked there is asked as
+/// the earlier loop asked it, meets the record it claimed and backs off on its own run. An account
+/// move ahead holds no claim, and is restored by its kind. A restart noted after it, the one its
+/// point went on with or one asked on its own, takes the place of both, restored only where its
+/// run holds a claim; a model's move set aside with no claim is not restored, nor either once the
+/// account move is made. CONTROL: a model's way back restored, claimed, takes the slot with
+/// nothing set aside, as any restart but an account move's does.
+#[test]
+fn a_later_loop_restoring_an_account_move_sets_aside_the_run_its_ledger_restored() {
+    use super::super::turn_end_loop::RestartRun;
+    use crate::supervise::journal::JournalRecord;
+    let note = |seq: u32, kind: &str, at: i64, claimed: Option<i64>, step: &str| {
+        let claimed = claimed.map_or_else(|| "no".to_string(), |c| c.to_string());
+        let line =
+            format!("HOST seq={seq} restart:{kind} ask={kind}@{at} claimed={claimed} step={step}");
+        JournalRecord::of_line(TEST_NOW * 1000 + 5000, Some("@s-1"), &line, None).to_json() + "\n"
+    };
+    let run = |kind: &'static str, at: i64, claimed: Option<i64>| RestartRun { kind, at, claimed };
+    let fallback = note(6, "model", TEST_NOW, Some(TEST_NOW + 1), "wait:resume");
+    let ahead = |seq| {
+        note(
+            seq,
+            "account-ahead",
+            TEST_NOW + 5,
+            None,
+            "wait:conversation-in-other-tab",
+        )
+    };
+    let model = run(Restart::MODEL, TEST_NOW, Some(TEST_NOW + 1));
+    let account = run(Restart::ACCOUNT_AHEAD, TEST_NOW + 5, None);
+    let cases: [(&str, String, Option<RestartRun>, Option<RestartRun>); 6] = [
+        (
+            "an account move ahead over a claimed model's move",
+            fallback.clone() + &ahead(7),
+            Some(account),
+            Some(model),
+        ),
+        (
+            "the model's move noted after it, still claimed",
+            fallback.clone()
+                + &ahead(7)
+                + &note(7, "model", TEST_NOW, Some(TEST_NOW + 1), "wait:held"),
+            Some(model),
+            None,
+        ),
+        (
+            "the model's move noted after it, its claim lapsed",
+            fallback.clone() + &ahead(7) + &note(9, "model", TEST_NOW, None, "wait:changed"),
+            None,
+            None,
+        ),
+        (
+            "the account move made",
+            fallback.clone()
+                + &ahead(7)
+                + &note(8, "account-ahead", TEST_NOW + 5, None, "done:made"),
+            None,
+            None,
+        ),
+        (
+            "an account move ahead over an unclaimed model's move",
+            note(6, "model", TEST_NOW, None, "wait:changed") + &ahead(7),
+            Some(account),
+            None,
+        ),
+        (
+            "CONTROL: a model's way back, claimed",
+            fallback.clone()
+                + &note(
+                    7,
+                    "model-back",
+                    TEST_NOW + 5,
+                    Some(TEST_NOW + 6),
+                    "wait:conversation-in-other-tab",
+                ),
+            Some(run(Restart::MODEL_BACK, TEST_NOW + 5, Some(TEST_NOW + 6))),
+            None,
+        ),
+    ];
+    for (case, journal, slot, aside) in cases {
+        let mut m = Mock::new(vec![idle_screen()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.seed_open_move_in(&journal);
+        assert_eq!(s.restart_run, slot, "{case}");
+        assert_eq!(s.restart_aside, aside.map(|set| (set, 0)), "{case}");
+    }
 }
 
 #[test]

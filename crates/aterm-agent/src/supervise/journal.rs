@@ -112,6 +112,236 @@ pub const LINE_LOST_AGAIN: &str =
 /// was back, begins (`supervise::run::woken_turn`).
 pub const UNSTUCK: &str = "UNSTUCK";
 
+/// How the line of the rows of a screen the loop keeps begins ([`Capture`]).
+pub const CAPTURED: &str = "CAPTURED";
+
+/// The rows of a screen the loop kept, as its journal line says them: `CAPTURED seq=<n> <what>
+/// program=<name> version=<v|-> grid=<cols>x<rows>|- first=<n> masked=<n> rows=<JSON array>`,
+/// each row as the read gave it ([`Self::of_screen`]: every e-mail address masked), its trailing
+/// blanks cut; `first` is the grid row of the first, so the rows above it (the transcript over a
+/// box) are none of the record's. A record, never a badge or an ask; the `rows=` array, top to
+/// bottom, is a phase fixture's rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capture {
+    /// The read's `seq=`.
+    pub seq: u64,
+    /// What the screen shows (`reset-dialog`, `reset-answer`, …), one word.
+    pub what: String,
+    /// The program whose screen it is (`status program=`).
+    pub program: String,
+    /// The program's own version, where it says one (Claude Code's transcript rows).
+    pub version: Option<String>,
+    /// The pane's columns and rows, where the read said them.
+    pub grid: Option<(u16, usize)>,
+    /// The grid row of the first row kept (`0` for a whole screen).
+    pub first: usize,
+    /// How many e-mail addresses [`Self::of_screen`] masked in `rows`.
+    pub masked: usize,
+    /// The rows, top to bottom.
+    pub rows: Vec<String>,
+}
+
+/// `rows` with the ASCII letters and digits of each e-mail address in them masked
+/// (`name@host.com` reads `xxxx@xxxx.xxx`), their other characters and so their widths kept, and
+/// how many addresses it masked. An address is an `@` with a run of address characters on each
+/// side (letters, digits and `._%+-` before it, letters, digits, `.` and `-` after it), a letter or
+/// digit in the run before it, and a `.` with a letter or digit on each side in the run after it.
+/// A row that ends in an address character is read on into the next row's first word where that
+/// starts with one (an address the screen wrapped is masked whole). A word that opens with `@` (a
+/// session's `@s-1`) is none.
+#[must_use]
+pub fn mask_addresses(rows: &[String]) -> (Vec<String>, usize) {
+    let name_char = |c: char| host_char(c) || matches!(c, '_' | '%' | '+');
+    let joins = |c: char| name_char(c) || c == '@';
+    let mut rows: Vec<Vec<char>> = rows.iter().map(|row| row.chars().collect()).collect();
+    // The rows as one text, each character's (row, column) beside it, a blank between two rows
+    // unless the first ends in an address character and the second's first word starts with one.
+    let mut text: Vec<(char, Option<(usize, usize)>)> = Vec::new();
+    let mut runs_on = false;
+    for (i, row) in rows.iter().enumerate() {
+        let lead = row.iter().take_while(|c| c.is_whitespace()).count();
+        let from = if runs_on && row.get(lead).copied().is_some_and(joins) {
+            lead
+        } else {
+            text.push((' ', None));
+            0
+        };
+        let end = row
+            .iter()
+            .rposition(|c| !c.is_whitespace())
+            .map_or(0, |e| e + 1);
+        text.extend((from..end.max(from)).map(|j| (row[j], Some((i, j)))));
+        runs_on = end > 0 && joins(row[end - 1]);
+    }
+    let chars: Vec<char> = text.iter().map(|&(c, _)| c).collect();
+    let spans = address_spans(&chars, name_char);
+    for &(start, stop) in &spans {
+        for &(_, at) in &text[start..stop] {
+            if let Some((i, j)) = at
+                && rows[i][j].is_ascii_alphanumeric()
+            {
+                rows[i][j] = 'x';
+            }
+        }
+    }
+    (
+        rows.into_iter().map(String::from_iter).collect(),
+        spans.len(),
+    )
+}
+
+/// A character an address's host may hold.
+fn host_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '.' || c == '-'
+}
+
+/// The `[start, stop)` spans of the e-mail addresses in `text` ([`mask_addresses`]).
+fn address_spans(text: &[char], name_char: impl Fn(char) -> bool) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for (at, _) in text.iter().enumerate().filter(|(_, c)| **c == '@') {
+        let start = text[..at]
+            .iter()
+            .rposition(|&c| !name_char(c))
+            .map_or(0, |b| b + 1);
+        let stop = at + 1 + text[at + 1..].iter().take_while(|&&c| host_char(c)).count();
+        let (name, host) = (&text[start..at], &text[at + 1..stop]);
+        let dotted = host
+            .windows(3)
+            .any(|w| w[0].is_ascii_alphanumeric() && w[1] == '.' && w[2].is_ascii_alphanumeric());
+        if name.iter().any(char::is_ascii_alphanumeric) && dotted {
+            spans.push((start, stop));
+        }
+    }
+    spans
+}
+
+impl Capture {
+    /// A capture of `rows`, the grid's from row `first`, with every e-mail address masked
+    /// ([`mask_addresses`]).
+    #[must_use]
+    pub fn of_screen(
+        seq: u64,
+        what: String,
+        program: String,
+        version: Option<String>,
+        grid: Option<(u16, usize)>,
+        first: usize,
+        rows: &[String],
+    ) -> Self {
+        let (rows, masked) = mask_addresses(rows);
+        Self {
+            seq,
+            what,
+            program,
+            version,
+            grid,
+            first,
+            masked,
+            rows,
+        }
+    }
+
+    /// The journal line.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let rows = self
+            .rows
+            .iter()
+            .map(|row| json_str(row.trim_end()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{CAPTURED} seq={} {} program={} version={} grid={} first={} masked={} rows=[{rows}]",
+            self.seq,
+            self.what,
+            self.program,
+            self.version.as_deref().unwrap_or("-"),
+            self.grid
+                .map_or_else(|| "-".to_string(), |(c, r)| format!("{c}x{r}")),
+            self.first,
+            self.masked,
+        )
+    }
+
+    /// A [`Self::line`] read back; `None` for any other line.
+    #[cfg(test)]
+    #[must_use]
+    pub fn of_line(line: &str) -> Option<Self> {
+        fn field<'l>(words: &mut impl Iterator<Item = &'l str>, key: &str) -> Option<&'l str> {
+            words.next()?.strip_prefix(key)?.strip_prefix('=')
+        }
+        let rest = line.strip_prefix(CAPTURED)?.strip_prefix(' ')?;
+        let (head, rows) = rest.split_once(" rows=")?;
+        let mut words = head.split(' ');
+        let seq = field(&mut words, "seq")?.parse().ok()?;
+        let what = words
+            .next()
+            .filter(|w| !w.is_empty() && !w.contains('='))?
+            .to_string();
+        let program = field(&mut words, "program")?.to_string();
+        let version = Some(field(&mut words, "version")?)
+            .filter(|v| *v != "-")
+            .map(str::to_string);
+        let grid = match field(&mut words, "grid")? {
+            "-" => None,
+            g => {
+                let (c, r) = g.split_once('x')?;
+                Some((c.parse().ok()?, r.parse().ok()?))
+            }
+        };
+        let first = field(&mut words, "first")?.parse().ok()?;
+        let masked = field(&mut words, "masked")?.parse().ok()?;
+        if words.next().is_some() {
+            return None;
+        }
+        let Json::Array(rows) = Json::parse(rows).ok()? else {
+            return None;
+        };
+        let rows = rows
+            .iter()
+            .map(|row| row.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            seq,
+            what,
+            program,
+            version,
+            grid,
+            first,
+            masked,
+            rows,
+        })
+    }
+
+    /// The phase fixture of the capture: its head line (the program and version, `CAPTURED` on
+    /// `date` by the harness, the grid, the addresses masked, then `what`), then its rows.
+    #[cfg(test)]
+    #[must_use]
+    pub fn fixture(&self, date: &str) -> String {
+        let mut out = format!(
+            "# {} {} · CAPTURED {date} by the harness's journal (seq={}, grid {}, first row {}, \
+             {} e-mail addresses masked) · {}\n",
+            if self.program == "claude" {
+                "claude-code"
+            } else {
+                self.program.as_str()
+            },
+            self.version.as_deref().unwrap_or("unknown-version"),
+            self.seq,
+            self.grid
+                .map_or_else(|| "-".to_string(), |(c, r)| format!("{c}x{r}")),
+            self.first,
+            self.masked,
+            self.what,
+        );
+        for row in &self.rows {
+            out.push_str(row);
+            out.push('\n');
+        }
+        out
+    }
+}
+
 /// How an `ESCALATED seq=<n> attention=<reply>` line's tail begins where no badge went.
 pub const ATTENTION_SKIPPED: &str = "attention=skipped: ";
 /// Why [`ATTENTION_SKIPPED`] behind another supervisor's claim.
@@ -301,11 +531,12 @@ pub enum Noted {
     RepoUnread,
     Unstuck,
     Receipt,
+    Captured,
 }
 
 impl Noted {
     /// Every word, in declaration order.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::Done,
         Self::Left,
         Self::Failed,
@@ -342,6 +573,7 @@ impl Noted {
         Self::RepoUnread,
         Self::Unstuck,
         Self::Receipt,
+        Self::Captured,
     ];
 
     /// How a line of this word begins (`NOT ESCALATED` is two words).
@@ -384,6 +616,7 @@ impl Noted {
             Self::RepoUnread => "REPO UNREAD",
             Self::Unstuck => UNSTUCK,
             Self::Receipt => crate::harness::land_receipt::RECEIPT,
+            Self::Captured => CAPTURED,
         }
     }
 
@@ -427,6 +660,7 @@ impl Noted {
             Self::RepoUnread => "repo-unread",
             Self::Unstuck => "unstuck",
             Self::Receipt => "receipt",
+            Self::Captured => "captured",
         }
     }
 
@@ -768,9 +1002,19 @@ impl Journal {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            o.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
-        match o.open(path) {
+        match o.open(path).and_then(|f| {
+            if f.metadata()?.is_file() {
+                Ok(f)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ))
+            }
+        }) {
             Ok(f) => j.file = Some(f),
             Err(e) => j.failed(&e, "cannot open it", warn),
         }

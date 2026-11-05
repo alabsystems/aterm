@@ -74,6 +74,107 @@ fn move_admitted_to(lab: &mut Lab, member: usize, next: Paths) -> Paths {
 }
 
 #[test]
+fn a_displaced_application_triggers_succession_with_a_healthy_catalog() {
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let (scope, id) = data(&lab);
+    let original = lab.paths[0].clone();
+    {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::observe(&bootstrap).unwrap();
+        assert!(!recovery_required(&session, false).unwrap());
+    }
+    let claim = original.dir.join("commons/table-claims").join(format!(
+        "{}.claim",
+        aterm_codec::hex::encode_lower(&scope.digest())
+    ));
+    let mut bytes = std::fs::read(&claim).unwrap();
+    let at = 5 + 104 + 48 + 16;
+    let old = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    bytes[at..at + 8].copy_from_slice(&(old + 1).to_le_bytes());
+    fsx::write_atomic(&claim, &bytes, 0o600).unwrap();
+    let before_claims = files(&original.dir.join("commons/table-claims"));
+    let before_tables = files(&original.dir.join("commons/tables"));
+
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    let directory = Directory::new(&original, bootstrap.trust());
+    let catalog = custody::inspect(&session, directory.catalog_scope().digest()).unwrap();
+    assert!(catalog.directory.unwrap().binding_error.is_none());
+    directory.snapshot_existing(&session).unwrap();
+    let application = custody::inspect(&session, scope.digest()).unwrap();
+    assert!(application.directory.unwrap().binding_error.is_some());
+    assert!(application.prefix.unwrap().is_ok());
+    assert!(
+        recovery_required(&session, false).unwrap(),
+        "a healthy catalog must not hide lost application custody"
+    );
+    assert_eq!(
+        files(&original.dir.join("commons/table-claims")),
+        before_claims
+    );
+    assert_eq!(files(&original.dir.join("commons/tables")), before_tables);
+    drop(session);
+
+    let mut selection = reserved(&lab);
+    let next = move_admitted_candidate(&mut lab);
+    import(&mut selection).unwrap();
+    assert_eq!(selected(&original).unwrap(), next);
+    let fresh = lab.bootstrap(1);
+    let session = Session::observe(&fresh).unwrap();
+    let directory = Directory::new(&next, fresh.trust());
+    let store = Store::observe(&session, &directory.path(scope).unwrap(), scope).unwrap();
+    assert_eq!(
+        store
+            .inventory(&session)
+            .unwrap()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![id]
+    );
+    assert_eq!(
+        store.catalog(&session).unwrap()[0].payload(),
+        b"retained before device-number change"
+    );
+    assert_eq!(
+        files(&original.dir.join("commons/table-claims")),
+        before_claims
+    );
+    assert_eq!(files(&original.dir.join("commons/tables")), before_tables);
+}
+
+#[test]
+fn a_displaced_application_with_a_refused_prefix_cannot_start_succession() {
+    let lab = Lab::new(&[Role::Writer]);
+    let (scope, _) = data(&lab);
+    let original = &lab.paths[0];
+    let claim = original.dir.join("commons/table-claims").join(format!(
+        "{}.claim",
+        aterm_codec::hex::encode_lower(&scope.digest())
+    ));
+    let mut bytes = std::fs::read(&claim).unwrap();
+    let at = 5 + 104 + 48 + 16;
+    let old = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    bytes[at..at + 8].copy_from_slice(&(old + 1).to_le_bytes());
+    *bytes.last_mut().unwrap() ^= 1;
+    fsx::write_atomic(&claim, &bytes, 0o600).unwrap();
+    let before = files(&original.dir);
+
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    assert!(custody::directory_binding_lost(&session, scope.digest()).unwrap());
+    assert!(
+        custody::inspect(&session, scope.digest())
+            .unwrap()
+            .prefix
+            .unwrap()
+            .is_err()
+    );
+    assert!(recovery_required(&session, false).is_err());
+    assert!(!root(original).exists());
+    assert_eq!(files(&original.dir), before);
+}
+
+#[test]
 fn completed_successor_keeps_transport_until_its_preserved_source_changes() {
     let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
     data(&lab);
@@ -392,16 +493,14 @@ fn account_service_observation_never_repairs_a_selected_generations_ancestor() {
         move_admitted_candidate(&mut lab);
         import(&mut selection).unwrap();
         assert_eq!(
-            crate::service_state::observe(&original, &selection.config, 1000)
-                .accounts
-                .availability,
+            crate::service_state::accounts(&original, &selection.config, 1000).availability,
             ServiceAvailability::Cached
         );
         let path = original.dir.join(name);
         std::fs::rename(&path, path.with_extension("preserved")).unwrap();
         let before = files(lab._home.path());
 
-        let observed = crate::service_state::observe(&original, &selection.config, 2000).accounts;
+        let observed = crate::service_state::accounts(&original, &selection.config, 2000);
         assert!(
             files(lab._home.path()) == before,
             "account observation repaired ancestor {name}"
@@ -410,6 +509,78 @@ fn account_service_observation_never_repairs_a_selected_generations_ancestor() {
         assert!(observed.refresh_failed);
         assert_eq!(observed.last_success_ms, None);
     }
+}
+
+/// A holder of a predecessor's custody stops a read when the wait for a holder ends, however long
+/// the read has left to read, at both points the read takes that custody. The wait is spent here,
+/// so a read that does wait reaches the lock-wait observer, which lets the holder go: that read
+/// then finds the lock free and reads Cached, rather than sitting out the hang detector.
+#[test]
+fn a_held_predecessor_is_busy_when_the_wait_ends_not_when_the_read_does() {
+    use crate::service_state::{accounts_until, control_busy, tests::after_custody};
+    use aterm_types::network_state::ServiceAvailability;
+    use aterm_uds::private_file::PrivateLock;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    crate::accounts::proposals::Proposals::at(original.clone())
+        .initialize()
+        .unwrap();
+    let mut selection = reserved(&lab);
+    move_admitted_candidate(&mut lab);
+    import(&mut selection).unwrap();
+    let hang_detector = || Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    for lock in ["commons.lock", "commons-device.lock"] {
+        for at_session in [false, true] {
+            let case = format!("{lock}, at_session={at_session}");
+            let holder = Rc::new(RefCell::new(None));
+            let hold = {
+                let (holder, dir) = (holder.clone(), original.dir.clone());
+                move || {
+                    let held = PrivateLock::take(&dir, lock, Duration::ZERO, "held").unwrap();
+                    *holder.borrow_mut() = Some(held);
+                }
+            };
+            if at_session {
+                after_custody(hold);
+            } else {
+                hold();
+            }
+            let waited = Rc::new(Cell::new(false));
+            let observer = {
+                let (holder, waited) = (holder.clone(), waited.clone());
+                move |_: &std::fs::File| {
+                    waited.set(true);
+                    drop(holder.borrow_mut().take());
+                }
+            };
+            let read = aterm_uds::file_lock::with_lock_wait_observer(observer, || {
+                accounts_until(
+                    &original,
+                    &selection.config,
+                    1000,
+                    &Instant::now,
+                    hang_detector(),
+                )
+            });
+            assert!(!waited.get(), "{case}: waited past a spent wait");
+            assert_eq!(read, control_busy(1000), "{case}");
+            assert!(holder.borrow_mut().take().is_some(), "{case}: never held");
+        }
+    }
+    // With nothing held, the same spent wait reads: only a holder uses it up, on any load.
+    let read = accounts_until(
+        &original,
+        &selection.config,
+        2000,
+        &Instant::now,
+        hang_detector(),
+    );
+    assert_eq!(read.availability, ServiceAvailability::Cached, "{read:?}");
 }
 
 #[test]
@@ -1543,4 +1714,177 @@ fn held_original_or_candidate_device_custody_obeys_one_deadline_and_can_resume()
         assert_eq!(selected(&lab.paths[0]).unwrap(), next);
     }
     assert_eq!(files(&lab.paths[0].dir.join("commons/tables")), retained);
+}
+
+/// An unchanged imported activation head cannot make an old proposal observation current.
+#[test]
+fn a_shared_application_read_refuses_a_completed_successor_with_the_same_decision() {
+    use crate::{
+        accounts::{activations::Activations, proposals::Proposals},
+        database::Change,
+    };
+    use aterm_json::json;
+    for after_read in [false, true] {
+        let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+        let original = lab.paths[0].clone();
+        let value = json!({"provider":"anthropic","method":"oauth","label":"before"});
+        Proposals::at(original.clone())
+            .write(
+                [81; 16],
+                vec![Change {
+                    collection: "accounts".into(),
+                    key: "one".into(),
+                    value: Some(value),
+                }],
+            )
+            .unwrap();
+        let admin = client::admin_open(&original).unwrap();
+        let db = Activations::at(original.clone());
+        let bootstrap = lab.bootstrap(0);
+        let request = db
+            .configuration(
+                &admin,
+                [82; 32],
+                "one",
+                bootstrap.request().unwrap().binding().actor(),
+                vec![],
+            )
+            .unwrap();
+        let decision = db.issue(&admin, [83; 16], request).unwrap().0;
+        assert_eq!(
+            db.current_configuration([82; 32]).unwrap().0.id(),
+            decision.id()
+        );
+        let session = Session::observe(&bootstrap).unwrap();
+        let descriptor =
+            Descriptor::application(session.trust(), "accounts", "proposals", 1).unwrap();
+        let directory = Directory::new(&original, bootstrap.trust());
+        let scope = descriptor.scope;
+        let mut advance = || {
+            // A healthy predecessor remains readable: no claim or table is damaged.
+            let mut selection = reserved(&lab);
+            let next = move_admitted_candidate(&mut lab);
+            import(&mut selection).unwrap();
+            assert_eq!(selected(&original).unwrap(), next);
+            Proposals::at(next.clone())
+                .write(
+                    [84; 16],
+                    vec![Change {
+                        collection: "accounts".into(),
+                        key: "one".into(),
+                        value: Some(json!({"provider":"openai","method":"oauth","label":"after"})),
+                    }],
+                )
+                .unwrap();
+            next
+        };
+        let mut next = None;
+        if !after_read {
+            next = Some(advance());
+        }
+        let result = crate::documents::application::observe_store_in_session(
+            &session,
+            descriptor,
+            admission_deadline(),
+            |session, store, _| {
+                let snapshot = Proposals::snapshot_from_store(session, store)?;
+                if after_read {
+                    next = Some(advance());
+                }
+                Ok(snapshot)
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a completed successor must invalidate the old shared read"
+        );
+        let next = next.unwrap();
+        let current = Activations::at(next.clone());
+        assert_eq!(
+            current.state([82; 32]).unwrap(),
+            crate::accounts::activations::State::Ready(decision.id())
+        );
+        assert!(
+            current.current_configuration([82; 32]).is_err(),
+            "the imported decision cannot approve changed proposals"
+        );
+        let fresh = Proposals::at(next).snapshot().unwrap();
+        assert_eq!(
+            fresh.cells[&("accounts".into(), "one".into())].candidates[0].value["label"].as_str(),
+            Some("after")
+        );
+        // The ordinary historical read is intentionally still allowed.
+        let historical = directory.observe_table(&session, scope).unwrap();
+        let old = Proposals::snapshot_from_store(&session, &historical).unwrap();
+        assert_eq!(
+            old.cells[&("accounts".into(), "one".into())].candidates[0].value["label"].as_str(),
+            Some("before")
+        );
+    }
+}
+
+#[test]
+fn shared_application_observation_keeps_deadline_custody_and_catalog_refusals_read_only() {
+    for refusal in 0..7 {
+        let lab = Lab::new(&[Role::Writer, Role::Writer]);
+        let (scope, _) = data(&lab);
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::observe(&bootstrap).unwrap();
+        let mut descriptor =
+            Descriptor::application(session.trust(), "recovery-test", "records", 1).unwrap();
+        let read = |session: &Session<'_>, store: &Store, _| Ok(store.catalog(session)?.len());
+        assert_eq!(
+            crate::documents::application::observe_store_in_session(
+                &session,
+                descriptor.clone(),
+                admission_deadline(),
+                read
+            )
+            .unwrap(),
+            1
+        );
+        let deadline = match refusal {
+            0 => {
+                descriptor =
+                    Descriptor::application(session.trust(), "absent", "records", 1).unwrap();
+                admission_deadline()
+            }
+            1 => {
+                descriptor.version = 2;
+                admission_deadline()
+            }
+            2 => Instant::now(),
+            3 => {
+                std::fs::remove_file(lab.paths[0].dir.join("commons.claim")).unwrap();
+                admission_deadline()
+            }
+            4 => {
+                lab.rotate(&[Role::Writer, Role::Writer]);
+                admission_deadline()
+            }
+            5 => {
+                let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+                std::fs::remove_dir_all(directory.path(scope).unwrap()).unwrap();
+                admission_deadline()
+            }
+            6 => {
+                reserved(&lab);
+                admission_deadline()
+            }
+            _ => unreachable!(),
+        };
+        let before = files(lab._home.path());
+        assert!(
+            crate::documents::application::observe_store_in_session(
+                &session, descriptor, deadline, read
+            )
+            .is_err(),
+            "refusal {refusal}"
+        );
+        assert_eq!(
+            files(lab._home.path()),
+            before,
+            "refusal {refusal} must not enroll or repair"
+        );
+    }
 }

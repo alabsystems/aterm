@@ -128,7 +128,7 @@ pub struct Stamp {
 
 /// What `stat` says about the file at `path` now, if it can be read.
 pub(crate) fn stamp_of(path: &Path) -> Option<Stamp> {
-    std::fs::metadata(path).ok().map(|m| Stamp::of(&m))
+    std::fs::symlink_metadata(path).ok().map(|m| Stamp::of(&m))
 }
 
 impl Stamp {
@@ -293,7 +293,8 @@ impl TranscriptCursor {
         budget: u64,
         mut tap: Option<&mut StepFold>,
     ) -> io::Result<Advance> {
-        if let Ok(meta) = std::fs::metadata(&self.path)
+        if let Ok(meta) = std::fs::symlink_metadata(&self.path)
+            && meta.is_file()
             && self.unchanged(&meta)
         {
             return Ok(Advance {
@@ -1053,21 +1054,21 @@ fn list_subagents(dir: &Path, max_entries: usize) -> Listing {
                     cut: true,
                 };
             }
-            let Ok(meta) = entry.metadata() else {
+            let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            let path = entry.path();
-            if meta.is_dir() {
+            if kind.is_dir() {
                 if depth + 1 < MAX_SUBAGENT_DEPTH {
-                    stack.push((path, depth + 1));
+                    stack.push((entry.path(), depth + 1));
                 }
-            } else if meta.is_file()
+            } else if kind.is_file()
                 && entry
                     .file_name()
                     .to_str()
                     .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".jsonl"))
+                && let Ok(meta) = entry.metadata()
             {
-                files.push((path, meta));
+                files.push((entry.path(), meta));
             }
         }
         dirs.push(DirSeen::at(here, stamp, held, walked));

@@ -6,7 +6,7 @@
 
 use std::ffi::c_void;
 use std::fs::File;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle, RawHandle};
 use std::process::{ExitStatus, Output};
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ const PIPE_REJECT_REMOTE_CLIENTS: u32 = 8;
 const FIRST_INSTANCE: u32 = 0x0008_0000;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+const ERROR_BROKEN_PIPE: i32 = 109;
 const ERROR_NO_DATA: i32 = 232;
 const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
 const ERROR_PIPE_CONNECTED: i32 = 535;
@@ -305,19 +306,42 @@ impl Drop for Scope {
     }
 }
 
+/// One read of a nonblocking server end, by `ReadFile` itself: std's `File::read` reads
+/// `ERROR_NO_DATA` (an empty nonblocking pipe) as `BrokenPipe` and returns it as `Ok(0)`,
+/// the end of file, so through it an empty pipe and a closed writer read the same.
+fn read_now(pipe: &File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut read = 0_u32;
+    let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    // SAFETY: `pipe` owns a live synchronous handle, `buf` is writable for `len` bytes, `read`
+    // is a writable count, and no OVERLAPPED is passed.
+    if unsafe {
+        ReadFile(
+            pipe.as_raw_handle(),
+            buf.as_mut_ptr().cast(),
+            len,
+            &raw mut read,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(read as usize)
+}
+
+/// Read what `pipe` holds now into `bytes`, at most `max` in all. Returns whether it moved:
+/// bytes read, or the writer's end (`ERROR_BROKEN_PIPE`), which drops `pipe`. An empty pipe
+/// (`ERROR_NO_DATA`, or a read of no bytes) is not its end: the writer may still write.
 fn drain(pipe: &mut Option<File>, bytes: &mut Vec<u8>, max: usize) -> io::Result<bool> {
-    let Some(reader) = pipe.as_mut() else {
+    let Some(reader) = pipe.as_ref() else {
         return Ok(false);
     };
     let mut progressed = false;
     let mut chunk = [0_u8; 8192];
     // Bound each visit so continuous output cannot starve input or the deadline check.
     for _ in 0..16 {
-        match reader.read(&mut chunk) {
-            Ok(0) => {
-                *pipe = None;
-                return Ok(true);
-            }
+        match read_now(reader, &mut chunk) {
+            Ok(0) => break,
             Ok(n) => {
                 if n > max.saturating_sub(bytes.len()) {
                     return Err(io::Error::new(
@@ -331,8 +355,10 @@ fn drain(pipe: &mut Option<File>, bytes: &mut Vec<u8>, max: usize) -> io::Result
             Err(error) if error.raw_os_error() == Some(ERROR_NO_DATA) => break,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error)
-                if error.kind() == io::ErrorKind::BrokenPipe
-                    || error.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED) =>
+                if matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED)
+                ) =>
             {
                 *pipe = None;
                 return Ok(true);
@@ -528,6 +554,13 @@ unsafe extern "system" {
         template: RawHandle,
     ) -> RawHandle;
     fn ConnectNamedPipe(pipe: RawHandle, overlapped: *mut c_void) -> i32;
+    fn ReadFile(
+        file: RawHandle,
+        buffer: *mut c_void,
+        len: u32,
+        read: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
     fn GetNamedPipeClientProcessId(pipe: RawHandle, process: *mut u32) -> i32;
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
     fn CreateJobObjectW(security: *const c_void, name: *const u16) -> RawHandle;
@@ -676,22 +709,32 @@ mod tests {
         command
     }
 
+    /// The drain tells an empty pipe from a closed writer. Negative control: read through
+    /// std's `File::read`, which returns `Ok(0)` for both, the closed writer is taken for an
+    /// empty pipe, so the stream never ends and the closed-writer assertion fails.
     #[test]
     fn the_parent_pipe_does_not_wait_for_input_or_capacity() {
-        let (mut reader, client) = pipe(false).expect("read pipe");
-        let mut byte = [0_u8; 1];
-        let error = reader
-            .read(&mut byte)
-            .expect_err("an empty nonblocking pipe");
-        assert_eq!(error.raw_os_error(), Some(ERROR_NO_DATA));
+        let (reader, mut client) = pipe(false).expect("read pipe");
+        let mut reader = Some(reader);
+        let mut bytes = Vec::new();
+        let moved = drain(&mut reader, &mut bytes, 16).expect("an empty nonblocking pipe");
+        assert!(
+            !moved && reader.is_some(),
+            "an empty pipe is not the writer's end"
+        );
+        client.write_all(b"x").expect("the writer writes");
+        let moved = drain(&mut reader, &mut bytes, 16).expect("a byte in the pipe");
+        assert!(
+            moved && reader.is_some(),
+            "a byte read is progress, not the end"
+        );
+        assert_eq!(bytes, b"x");
         drop(client);
-        match reader.read(&mut byte) {
-            Ok(0) => {}
-            Err(error)
-                if error.kind() == io::ErrorKind::BrokenPipe
-                    || error.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED) => {}
-            other => panic!("a closed writer must give EOF: {other:?}"),
-        }
+        let moved = drain(&mut reader, &mut bytes, 16).expect("a closed writer");
+        assert!(
+            moved && reader.is_none(),
+            "a closed writer is the end of its stream"
+        );
 
         let (mut writer, _client) = pipe(true).expect("write pipe");
         let block = [1_u8; 8192];

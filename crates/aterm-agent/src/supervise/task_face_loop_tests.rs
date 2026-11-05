@@ -1539,6 +1539,76 @@ fn the_needs_entry_says_the_work_waits_on_you_where_nothing_carries_on() {
     );
 }
 
+/// THE NEEDS ENTRY SAYS THE WORK WAITS ON YOU WHERE THE LOOP STOPPED TYPING (the post-landing
+/// review, 2026-11-02): under Land, the agent gives the same blocked reply twice (its `NEEDS
+/// YOU:` line kept although it worked), so the stop for replies that repeat holds the loop's
+/// typing (`replies_stop`) and Land types nothing at the repeat; the entry is told again ending
+/// ` — waits on you`, where it said ` — carrying on` while Land still typed. Under Cruise the
+/// same repeat gets another turn past its back-off (`repeat_gets_a_turn`), so the entry keeps
+/// ` — carrying on`.
+/// Negative control: `need_tail` reading only Land's rest and landing (`origin/main`
+/// `21b1e42025`) leaves the held entry ` — carrying on`.
+#[test]
+fn the_needs_entry_says_the_work_waits_on_you_where_the_loop_stopped_typing() {
+    use crate::harness::hold_said::NeedTail;
+    let blocked = "Blocked on the key.\nNEEDS YOU: add the deploy key in the dashboard";
+    let ends = |tail: NeedTail| format!(" \u{2014} {}", tail.words());
+    let told = |word: &'static str, gates: Vec<usize>, tag: &str| {
+        let (dir, path) = files(tag, &[], &[]);
+        let screens = vec![
+            busy_screen(),
+            ended(PROGRESS),
+            busy_screen(),
+            ended(blocked),
+            busy_screen(),
+            ended(blocked),
+        ];
+        let (lines, turns, m) = run_kept(
+            screens,
+            word,
+            gates,
+            &Arc::new(Faces::default()),
+            Some(&path),
+            None,
+            |_| {},
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let entries: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("meta set attention owner=needs "))
+            .cloned()
+            .collect();
+        (lines, turns, entries)
+    };
+    let (lines, turns, entries) = told("land", vec![1, 3], "needs-tail-held");
+    assert_eq!(
+        turns, 2,
+        "the instruction, then one act, none at the repeat: {lines:#?}"
+    );
+    assert!(
+        entries
+            .first()
+            .is_some_and(|e| e.ends_with(&ends(NeedTail::CarryingOn))),
+        "while Land still typed: {entries:#?}"
+    );
+    assert!(
+        entries
+            .last()
+            .is_some_and(|e| e.contains("needs you: add the deploy key")
+                && e.ends_with(&ends(NeedTail::WaitsOnYou))),
+        "the held repeat: {entries:#?}\n{lines:#?}"
+    );
+    let (lines, _, entries) = told("cruise", vec![1, 3, 5], "needs-tail-cruise");
+    assert!(
+        !entries.is_empty()
+            && entries
+                .iter()
+                .all(|e| e.ends_with(&ends(NeedTail::CarryingOn))),
+        "Cruise carries on: {entries:#?}\n{lines:#?}"
+    );
+}
+
 /// A `NEEDS YOU:` BESIDE A FAILED CONCLUSION WAITS ON THE PERSON: nothing carries the work on, so its
 /// entry never says the harness does. NEGATIVE CONTROL: the same need beside a reply of work carries
 /// on.
@@ -1904,12 +1974,21 @@ fn a_done_turn_no_loop_watched_after_a_landing_is_no_landing() {
     }
 }
 
-/// A landing ridden through a seamless update's cut still reads landed after its restart.
+/// A landing ridden through a seamless update's cut still reads landed after its restart. Every
+/// request index a cut can fall on runs for one reply, each under the watcher's own checks (a
+/// hang, a tape that does not replay). THE GAP: the other reply stops at the first cut that hands
+/// the landing's point again, trying `SHORT_FIRST_CUT` first, so a cut at another index that
+/// panics, hangs or breaks a tape's replay only under that reply is not seen.
 #[test]
 fn a_landing_ridden_through_an_update_cut_reads_landed_after_its_restart() {
     const SHORT_DEFENSE: &str =
         "Verified, committed and pushed the parser.\nNothing left: it is all on remote main.";
-    for reply in [SHORT_DEFENSE, LANDING_REPLY] {
+    /// The first cut that hands the short defense's landing again.
+    const SHORT_FIRST_CUT: usize = 30;
+    for (reply, first_cut) in [
+        (SHORT_DEFENSE, Some(SHORT_FIRST_CUT)),
+        (LANDING_REPLY, None),
+    ] {
         let cut = |i: usize| {
             let (dir, ledger) = files("update-cut", &[], &[]);
             let host = Arc::new(Faces::default());
@@ -1957,20 +2036,24 @@ fn a_landing_ridden_through_an_update_cut_reads_landed_after_its_restart() {
             }
         };
         let cut = &cut;
-        let mut handed: Vec<_> = std::thread::scope(|scope| {
-            let tries: Vec<_> = (4..56usize).map(|i| scope.spawn(move || cut(i))).collect();
-            tries
-                .into_iter()
-                .filter_map(|t| t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-                .collect()
-        });
-        for (later, _, _) in handed.iter().skip(1) {
-            let _ = std::fs::remove_dir_all(later);
-        }
-        handed.truncate(1);
-        let (dir, ledger, first) = handed
-            .pop()
-            .unwrap_or_else(|| panic!("{reply:?}: no cut handed the landing's point again"));
+        let handed = if let Some(k) = first_cut {
+            (k..56).chain(4..k).find_map(cut)
+        } else {
+            let mut handed: Vec<_> = std::thread::scope(|scope| {
+                let tries: Vec<_> = (4..56usize).map(|i| scope.spawn(move || cut(i))).collect();
+                tries
+                    .into_iter()
+                    .filter_map(|t| t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                    .collect()
+            });
+            for (later, _, _) in handed.iter().skip(1) {
+                let _ = std::fs::remove_dir_all(later);
+            }
+            handed.truncate(1);
+            handed.pop()
+        };
+        let (dir, ledger, first) =
+            handed.unwrap_or_else(|| panic!("{reply:?}: no cut handed the landing's point again"));
         let (told, turns, added, lines) = after_off(&ledger, "land", LANDED);
         let log = format!("{first:#?}\n{added:#?}\n{lines:#?}");
         assert_eq!(turns, 0, "{reply:?}: nothing typed into landed work: {log}");
@@ -2764,13 +2847,15 @@ impl IdleHost for Restarter {
         &self,
         why: &crate::supervise::policy::turn_end::Restart,
         _: &crate::supervise::policy::turn_end::RestartAsk,
-    ) -> Option<String> {
+    ) -> Option<crate::supervise::policy::turn_end::RestartAnswer> {
         self.restarts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(why.word().to_string());
         self.carry.store(true, Ordering::SeqCst);
-        Some("adopted".to_string())
+        Some(crate::supervise::policy::turn_end::RestartAnswer::unread(
+            "adopted",
+        ))
     }
 }
 

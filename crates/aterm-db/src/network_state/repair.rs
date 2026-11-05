@@ -4,7 +4,7 @@
 //! Historical repair metadata. None of these observations refresh peer presence.
 
 use super::*;
-use aterm_types::network_state::{RepairObservation, RepairOutcome, RepairStage};
+use aterm_types::network_state::{RepairCause, RepairObservation, RepairOutcome, RepairStage};
 
 pub(super) fn value(observation: &RepairObservation) -> Value {
     json!({
@@ -12,6 +12,8 @@ pub(super) fn value(observation: &RepairObservation) -> Value {
         "outbound": observation.outbound,
         "stage": observation.stage.map(stage),
         "outcome": outcome(observation.outcome),
+        "cause": observation.cause.map(RepairCause::word),
+        "needs_update": observation.cause.map(|cause| matches!(cause, RepairCause::LegacyPastCrossing | RepairCause::NeedsUpdate)),
         "table": observation.table.map(|id| aterm_codec::hex::encode_lower(&id)),
         "sent": observation.sent,
         "received": observation.received,
@@ -57,6 +59,18 @@ pub(super) fn read(row: &Value) -> Result<Option<RepairObservation>> {
         return Err(bad());
     }
     Ok(Some(RepairObservation {
+        cause: match value.get("cause").and_then(Value::as_str) {
+            Some("legacy-past-crossing") => Some(RepairCause::LegacyPastCrossing),
+            Some("table-undeclared") => Some(RepairCause::TableUndeclared),
+            Some("quota") => Some(RepairCause::Quota),
+            Some("io") => Some(RepairCause::Io),
+            Some("decode") => Some(RepairCause::Decode),
+            Some("not-ready") => Some(RepairCause::NotReady),
+            Some("needs-update") => Some(RepairCause::NeedsUpdate),
+            Some("other") => Some(RepairCause::Other),
+            None if value.get("cause").is_none_or(Value::is_null) => None,
+            _ => return Err(bad()),
+        },
         completed_at_ms,
         outbound: value
             .get("outbound")
@@ -140,6 +154,31 @@ impl Observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cause_json_round_trips_without_diagnostic_text() {
+        for cause in [
+            RepairCause::LegacyPastCrossing,
+            RepairCause::TableUndeclared,
+            RepairCause::Quota,
+            RepairCause::Io,
+            RepairCause::Decode,
+            RepairCause::NotReady,
+            RepairCause::NeedsUpdate,
+        ] {
+            let mut observation = failed(1000);
+            observation.cause = Some(cause);
+            let encoded = value(&observation);
+            assert_eq!(encoded["cause"].as_str(), Some(cause.word()));
+            assert_eq!(
+                read(&json!({"last_repair":encoded})).unwrap(),
+                Some(observation)
+            );
+        }
+        assert!(
+            read(&json!({"last_repair": {"completed_at_ms":1000,"cause":"private payload"}}))
+                .is_err()
+        );
+    }
 
     fn identity(n: u8) -> MachineIdentity {
         MachineIdentity {
@@ -151,6 +190,7 @@ mod tests {
 
     fn failed(at: u64) -> RepairObservation {
         RepairObservation {
+            cause: None,
             completed_at_ms: at,
             outbound: true,
             stage: Some(RepairStage::Application),

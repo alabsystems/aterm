@@ -99,6 +99,9 @@ struct TurnWords {
     /// Its last message and its earlier messages as drawn (`said_tail`, `turn_said_before`): what
     /// the go-ahead reads, as a turn end's reading holds them.
     said: (Option<String>, Option<String>),
+    /// Where each earlier message after the first opens in `lines.1` and `said.1`
+    /// ([`needs::Breaks`]).
+    breaks: needs::Breaks,
     /// It opens cut: the act's own rows may head it.
     opens_cut: bool,
 }
@@ -572,8 +575,12 @@ impl<C: Ctl> Session<'_, C> {
         let turn = self.break_turn(screen);
         let (tail, said) = &turn.lines;
         let before = self.turn_end.shown_key();
-        self.turn_end
-            .fold_break_needs(said.as_deref(), tail.as_deref(), turn.opens_cut);
+        self.turn_end.fold_break_needs(
+            said.as_deref()
+                .map(|t| needs::Before::new(t, &turn.breaks.lines)),
+            tail.as_deref(),
+            turn.opens_cut,
+        );
         self.break_go_ahead(&turn, (screen.seq, at + waited), cfg, review);
         Some(before)
     }
@@ -607,8 +614,13 @@ impl<C: Ctl> Session<'_, C> {
         // as the needs fold read it ([`Self::break_turn`]).
         let (tail, before) = &turn.said;
         let at_break = tail.as_deref().and_then(|t| {
-            self.turn_end
-                .go_ahead_at_break(before.as_deref(), t, turn.opens_cut)
+            self.turn_end.go_ahead_at_break(
+                before
+                    .as_deref()
+                    .map(|b| needs::Before::new(b, &turn.breaks.said)),
+                t,
+                turn.opens_cut,
+            )
         });
         let parks = at_break.is_some();
         // The go-ahead goes at a break where it would at a turn end: the turn read whole (its
@@ -653,15 +665,19 @@ impl<C: Ctl> Session<'_, C> {
     fn break_turn(&mut self, screen: &Screen) -> TurnWords {
         let reader = self.reader(&screen.rows);
         let words = |rows: &[String]| {
-            let lines = (
-                reader.said_lines(rows, needs::apart),
-                reader.turn_lines_before(rows, needs::apart),
-            );
+            let (turn_lines, lines_breaks) =
+                needs::joined(reader.turn_message_lines_before(rows, needs::apart));
+            let (turn_said, said_breaks) = needs::joined(reader.turn_messages_before(rows));
+            let lines = (reader.said_lines(rows, needs::apart), turn_lines);
             let opens_cut =
                 lines.0.is_some() && !reader.bounds_messages() && !reader.turn_whole(rows);
             TurnWords {
                 lines,
-                said: (reader.said_tail(rows), reader.turn_said_before(rows)),
+                said: (reader.said_tail(rows), turn_said),
+                breaks: needs::Breaks {
+                    said: said_breaks,
+                    lines: lines_breaks,
+                },
                 opens_cut,
             }
         };

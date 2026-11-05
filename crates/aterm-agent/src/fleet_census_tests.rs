@@ -11,6 +11,74 @@ use crate::harness::claims;
 use crate::survey_facts::{ServerHeardFact, SurveyAccountFact, SwarmSurveyFacts};
 use aterm_secrets::swarm_roster::{SwarmMember, SwarmRoster};
 
+#[cfg(unix)]
+#[test]
+fn census_pass_waits_for_the_roster_writer_instead_of_losing_members() {
+    use aterm_secrets::client;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let state = root.path().join("state");
+    aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+    let paths = client::Paths::for_home(&home);
+    client::create(
+        &paths,
+        root.path().join("test.vault").to_str().unwrap(),
+        None,
+        Some("m1"),
+    )
+    .unwrap();
+    client::admin_seed_swarm_roster(&paths, &[]).unwrap();
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(Some(
+        client::test_hold_state_lock(&paths).unwrap(),
+    )));
+    let pass = || {
+        super::collect_local_census_inputs_until(
+            &state,
+            Some(&home),
+            Vec::new(),
+            1_793_000_000,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+    };
+    let busy = super::collect_local_census_inputs_until(
+        &state,
+        Some(&home),
+        Vec::new(),
+        1_793_000_000,
+        std::time::Instant::now(),
+    )
+    .expect_err("an exhausted pass defers instead of publishing an empty census");
+    assert!(busy.contains("roster is busy"), "{busy}");
+    assert!(
+        client::test_without_roster_wait(pass)
+            .unwrap()
+            .roster
+            .members
+            .is_empty(),
+        "negative control loses the roster in a background pass"
+    );
+    let release = writer.clone();
+    let inputs =
+        client::test_with_denied_nodes_busy(move || drop(release.borrow_mut().take()), pass)
+            .unwrap();
+    assert!(!inputs.roster.members.is_empty());
+    assert!(
+        writer.borrow().is_none(),
+        "the pass observed the writer before release"
+    );
+}
+
+#[cfg(unix)]
+fn collect_local_census_inputs(
+    state_dir: &Path,
+    home_dir: Option<&Path>,
+    bonjour_hosts: Vec<BonjourHostInput>,
+    now_s: u64,
+) -> CensusInputs {
+    super::collect_local_census_inputs(state_dir, home_dir, bonjour_hosts, now_s)
+        .expect("fixture roster reads")
+}
+
 fn sample_member(
     label: &str,
     aliases: &[&str],
@@ -44,6 +112,7 @@ fn sample_facts(
     SwarmSurveyFacts {
         node: Some(node.to_owned()),
         label: Some(label.to_owned()),
+        roster_unread: false,
         version: version.to_owned(),
         window,
         window_last,
@@ -52,7 +121,11 @@ fn sample_facts(
         accounts,
         accounts_unread: Vec::new(),
         session_accounts: BTreeMap::new(),
+        moves: None,
         server_heard: Vec::new(),
+        home: None,
+        home_free_mb: None,
+        repos: None,
     }
 }
 
@@ -172,6 +245,7 @@ fn census_joins_five_sources_identically_across_stewards_and_classifies_straggle
                         week_reset: Some(now_i64 + 86_400),
                         walled_until: Some(now_i64 + 1_800),
                         last_used: Some(now_i64 - 20),
+                        read_at: None,
                     }],
                 ),
                 received_at: Some(now_s - 20),
@@ -215,7 +289,6 @@ fn census_joins_five_sources_identically_across_stewards_and_classifies_straggle
                 seen_at: now_s - 35,
             },
         ],
-        journal_shortfall_hours: 3,
     };
 
     // Permute every input order on Steward B (`same steward label` for P2 JSON equality check).
@@ -283,13 +356,15 @@ fn census_joins_five_sources_identically_across_stewards_and_classifies_straggle
     assert_eq!(census_a.summary.fleet_members, 2);
     assert_eq!(census_a.summary.commons_members, 2);
 
-    // P3: 2 active-session Macs vs 0 unwalled accounts -> "short by 2 accounts" and 3h lost.
-    assert_eq!(census_a.summary.shortfall_accounts, 2);
-    assert_eq!(census_a.summary.shortfall_hours, 3);
+    // P3: one Mac with sessions, its one signed-in account at a wall.
+    assert_eq!(census_a.summary.shortfall, ["m100 claude"]);
+    assert_eq!(census_a.summary.shortfall_accounts, 1);
     let human = census_a.render_human();
     assert!(
-        human.contains("short by 2 accounts (3h lost to shortfall)"),
-        "P3 human output must print 'short by N accounts' with hours lost: {human}"
+        human.contains(
+            "short by 1 account (every signed-in account of the CLI at a wall: m100 claude)"
+        ),
+        "P3 human output must print 'short by N accounts' and who: {human}"
     );
 
     // P2: every straggler classified into {revoked, Linux, no aterm}.
@@ -512,6 +587,7 @@ fn census_clock_future_sources_do_not_outrank_a_known_contact() {
                     week_reset: None,
                     walled_until: None,
                     last_used: None,
+                    read_at: None,
                 }],
             ),
             received_at: Some(now + 30),
@@ -631,6 +707,147 @@ fn healthy_pool_inputs(now: u64) -> CensusInputs {
     inputs
 }
 
+/// One account row as a survey reports it, on no clock but its wall's.
+fn reported(pool: &str, id: &str, condition: &str, walled_until: Option<i64>) -> SurveyAccountFact {
+    SurveyAccountFact {
+        pool: pool.to_owned(),
+        id: id.to_owned(),
+        condition: condition.to_owned(),
+        enrolled: condition != "not-enrolled",
+        usage_5h_pct: None,
+        usage_7d_pct: None,
+        week_reset: None,
+        walled_until,
+        last_used: None,
+        read_at: None,
+    }
+}
+
+/// THE CENSUS SAYS WHETHER ROTATION CAN AND DOES HAPPEN, from what the Macs report, so it needs no
+/// pool file: with none, it used to print "short by 0 accounts" and "0h lost" of a fleet at its
+/// walls. A wall with nothing to move to is short by one; a wall with a second signed-in account,
+/// an account nobody signed in to, a Mac with no sessions and one not heard for a day are not.
+#[test]
+fn the_census_reads_rotation_from_what_macs_report_with_no_pool_file() {
+    let now: u64 = 1_800_000_000;
+    let wall = Some(now as i64 + 3600);
+    let mac = |label: &str, sessions, heard: u64, rows| HeartbeatInput {
+        node: format!("{label:0>32}"),
+        facts: sample_facts(label, label, "known", true, Some(now - 5), sessions, rows),
+        received_at: Some(now - heard),
+        converge_failures: 0,
+    };
+    let mut inputs = clock_inputs(now);
+    assert!(inputs.pool.is_none(), "no pool file");
+    let mut moved = mac(
+        "m3",
+        1,
+        60,
+        vec![
+            reported("claude", "a", "limited", wall),
+            reported("claude", "b", "usable", None),
+        ],
+    );
+    moved.facts.moves = Some(crate::survey_facts::MoveFacts {
+        proven_7d: 1,
+        tried_7d: 1,
+        last: Some(now as i64 - 100),
+    });
+    let mut idle = mac("m4", 1, 60, vec![reported("codex", "c", "usable", None)]);
+    idle.facts.moves = Some(crate::survey_facts::MoveFacts::default());
+    let mut failed = mac("m7", 1, 60, vec![reported("kimi", "k", "usable", None)]);
+    failed.facts.moves = Some(crate::survey_facts::MoveFacts {
+        proven_7d: 0,
+        tried_7d: 2,
+        last: None,
+    });
+    let mut unread = mac("m8", 1, 60, vec![reported("kimi", "l", "usable", None)]);
+    unread.facts.accounts_unread = vec!["claude".to_owned()];
+    inputs.heartbeats = vec![
+        mac(
+            "m2",
+            2,
+            60,
+            vec![
+                reported("claude", "w", "limited", wall),
+                reported("claude", "unsigned", "not-enrolled", None),
+                reported("claude", "out", "signed-out", None),
+            ],
+        ),
+        moved,
+        idle,
+        failed,
+        unread,
+        mac("m5", 0, 60, vec![reported("claude", "x", "limited", wall)]),
+        mac(
+            "m6",
+            1,
+            2 * HEARD_24H_S,
+            vec![reported("claude", "y", "limited", wall)],
+        ),
+    ];
+
+    let census = SwarmCensus::compute(&inputs);
+    let summary = &census.summary;
+    assert_eq!(summary.shortfall, ["m2 claude"], "{summary:?}");
+    assert_eq!(summary.shortfall_accounts, 1);
+    let rotation = summary.rotation.as_ref().expect("a rotation summary");
+    assert_eq!((rotation.macs, rotation.unread), (5, 1));
+    assert_eq!(rotation.two_logins, ["m3"]);
+    assert_eq!(
+        (rotation.reporting, rotation.moved_7d, rotation.unproven_7d),
+        (3, 1, 1),
+        "an attempt with no proof is no move"
+    );
+    assert_eq!(rotation.last_move, Some(now as i64 - 100));
+    let human = census.render_human();
+    assert!(
+        human.contains(
+            "short by 1 account (every signed-in account of the CLI at a wall: m2 claude)"
+        ),
+        "{human}"
+    );
+    assert!(
+        human.contains(
+            "rotation: 1 of 5 Macs with sessions hold two signed-in accounts of one CLI (m3), 1 of \
+             them could not read a pool; 1 of the 3 that report moves moved in 7 days (1 tried with \
+             no proof it worked), last 2027-01-15T07:58:20Z"
+        ),
+        "{human}"
+    );
+    assert_eq!(SwarmCensus::from_json(&census.to_json()).unwrap(), census);
+
+    // CONTROL: where nobody reports moves, and none has moved, it says which of those it knows.
+    for hb in &mut inputs.heartbeats {
+        hb.facts.moves = None;
+    }
+    let human = SwarmCensus::compute(&inputs).render_human();
+    assert!(human.contains("none of them reports it"), "{human}");
+    inputs.heartbeats[1].facts.moves = Some(crate::survey_facts::MoveFacts::default());
+    let human = SwarmCensus::compute(&inputs).render_human();
+    assert!(
+        human.contains("0 of the 1 that report moves moved in 7 days, last never"),
+        "{human}"
+    );
+}
+
+/// A census an older aterm wrote says nothing of rotation, and reads back so.
+#[test]
+fn a_census_from_before_rotation_was_reported_prints_no_rotation_line() {
+    let census = SwarmCensus::compute(&clock_inputs(1_800_000_000));
+    let mut json: aterm_json::Value = aterm_json::from_str(&census.to_json()).unwrap();
+    let summary = json
+        .as_object_mut()
+        .and_then(|root| root.get_mut("summary"))
+        .and_then(aterm_json::Value::as_object_mut)
+        .unwrap();
+    summary.remove("rotation");
+    summary.remove("shortfall");
+    let old = SwarmCensus::from_json(&aterm_json::to_string(&json).unwrap()).unwrap();
+    assert_eq!(old.summary.rotation, None);
+    assert!(!old.render_human().contains("rotation:"));
+}
+
 #[test]
 fn census_facts_receipt_stays_old_when_presence_is_fresh() {
     let now = 1_800_000_000;
@@ -736,6 +953,7 @@ fn wall_report(node: &str, label: &str, received_at: u64) -> HeartbeatInput {
                 week_reset: None,
                 walled_until: None,
                 last_used: None,
+                read_at: None,
             }],
         ),
         received_at: Some(received_at),
@@ -1168,6 +1386,7 @@ fn census_excludes_denied_and_log_held_out_members_from_book_facts_and_walled_ac
             week_reset: Some(now_i64 + 86_400),
             walled_until: Some(now_i64 + 3_600),
             last_used: Some(now_i64 - 5),
+            read_at: None,
         }],
     );
     let payload = denied_facts.to_survey_reply(1, Some("m9.local"), now_s * 1_000, 1, false);
@@ -1316,6 +1535,7 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
             week_reset: Some(now_i64 + 86_400),
             walled_until: Some(now_i64 + 3_600),
             last_used: Some(now_i64 - 5),
+            read_at: None,
         }],
     );
     let payload = denied_facts.to_survey_reply(1, Some("m8.local"), now_s * 1_000, 1, false);
@@ -1703,6 +1923,7 @@ fn census_walled_accounts_follow_limited_condition_wall_expiry_and_enrollment() 
                         week_reset: None,
                         walled_until: None,
                         last_used: Some(now_i64 - 10),
+                        read_at: None,
                     }],
                 ),
                 received_at: Some(now_s - 5),
@@ -1728,6 +1949,7 @@ fn census_walled_accounts_follow_limited_condition_wall_expiry_and_enrollment() 
                             week_reset: None,
                             walled_until: None,
                             last_used: Some(now_i64 - 10),
+                            read_at: None,
                         },
                         SurveyAccountFact {
                             pool: "claude".to_owned(),
@@ -1739,6 +1961,7 @@ fn census_walled_accounts_follow_limited_condition_wall_expiry_and_enrollment() 
                             week_reset: None,
                             walled_until: Some(now_i64 + 3_600),
                             last_used: None,
+                            read_at: None,
                         },
                     ],
                 ),

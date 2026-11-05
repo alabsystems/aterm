@@ -62,8 +62,16 @@ fn keep_once(
     now: u64,
     started_ms: u64,
 ) -> (Written, Place) {
-    let evidence = crate::heard::read_for_place(dir);
-    let book = crate::heard::read_book(dir);
+    let (evidence, book) = match aterm_uds::private_file::JudgedDir::judge(dir) {
+        Ok(judged) => (
+            crate::heard::read_for_place_in(dir, &judged),
+            crate::heard::read_book_in(&judged),
+        ),
+        Err(_) => (
+            crate::heard::read_for_place(dir),
+            crate::heard::read_book(dir),
+        ),
+    };
     let (record, place) = step(
         &held.record,
         facts,
@@ -246,10 +254,15 @@ fn keeper_alive(written: &Written) -> bool {
 #[must_use]
 pub fn read_with(state: &Path, facts: Facts, now: u64) -> Place {
     let dir = record::dir(state);
-    let written = record::read(&dir).unwrap_or_default();
+    let judged = aterm_uds::private_file::JudgedDir::judge(&dir).ok();
+    let written = judged
+        .as_ref()
+        .and_then(record::read_in)
+        .unwrap_or_default();
+    let alive = keeper_alive(&written);
     let mut facts = facts;
     if facts.path.is_none()
-        && keeper_alive(&written)
+        && alive
         && written
             .record
             .current()
@@ -257,16 +270,23 @@ pub fn read_with(state: &Path, facts: Facts, now: u64) -> Place {
     {
         facts.path = written.record.path;
     }
-    let evidence = crate::heard::read_for_place(&dir);
-    let book = crate::heard::read_book(&dir);
+    let (evidence, book) = match judged.as_ref() {
+        Some(judged) => (
+            crate::heard::read_for_place_in(&dir, judged),
+            crate::heard::read_book_in(judged),
+        ),
+        None => (
+            crate::heard::read_for_place(&dir),
+            crate::heard::read_book(&dir),
+        ),
+    };
     let (_, mut place) = step(&written.record, &facts, &evidence, book.as_ref(), now, None);
     let held_stay = written.record.current().map(|stay| stay.start_ms);
-    place.computed_by =
-        if keeper_alive(&written) && held_stay.is_some() && held_stay == place.since_ms {
-            ComputedBy::Keeper
-        } else {
-            ComputedBy::Reader
-        };
+    place.computed_by = if alive && held_stay.is_some() && held_stay == place.since_ms {
+        ComputedBy::Keeper
+    } else {
+        ComputedBy::Reader
+    };
     place
 }
 

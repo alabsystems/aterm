@@ -5,10 +5,9 @@
 // wasm-glue`): every boundary type aterm-wasm-abi carries, through the glue
 // `verify glue` wrote, held to the JS value wasm-bindgen gives the same Rust
 // type, compared type-exactly (BigInt, undefined, typed arrays, -0, thrown
-// strings vs Errors). Run on the glue wasm-bindgen 0.2.108 writes for a
-// #[wasm_bindgen] twin of the toy (the check's oracle row,
-// crates/aterm-verify/src/wasm_glue/oracle.rs), every check holds but the
-// two marked STRICTER (`another class`, and the misuse throws).
+// strings vs Errors). Run on the glue wasm-bindgen 0.2.108 wrote for a
+// #[wasm_bindgen] twin of the toy, every check held but the two marked
+// STRICTER (`another class`, and the misuse throws): tests/toy/README.md.
 //
 //   run({ glue })   the ES module glue's URL (relative to this module); its
 //                   `_bg.wasm` is beside it

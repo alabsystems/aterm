@@ -2330,3 +2330,14 @@ fn group_and_machine_memory_wire_roundtrip_and_saturating_total() {
     assert_eq!(saturated.total_estimated_mib(), u64::MAX);
     assert_eq!(MachineMemory::decode_le(saturated.encode_le()), saturated);
 }
+
+/// macOS names `kern.hv_vmm_present` on every Mac aterm runs on, so the read answers there: 0 on
+/// a Mac's own hardware, 1 in a guest. Off macOS there is no such name.
+#[test]
+fn the_guest_flag_reads_on_macos_and_nowhere_else() {
+    assert_eq!(
+        crate::hv_vmm_present().is_some(),
+        cfg!(target_os = "macos"),
+        "kern.hv_vmm_present"
+    );
+}

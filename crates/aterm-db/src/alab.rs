@@ -43,6 +43,7 @@ pub mod register;
 pub mod registry;
 #[cfg(unix)]
 pub mod roll;
+pub mod secret;
 pub mod seeds;
 #[cfg(unix)]
 pub(super) mod store;

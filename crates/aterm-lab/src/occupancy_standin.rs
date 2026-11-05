@@ -65,7 +65,7 @@ pub fn lay(run: &Path, bin: &Path) -> std::io::Result<PathBuf> {
     let claude = dir.join("claude");
     let _ = std::fs::remove_file(&claude);
     std::os::unix::fs::symlink(bin, &claude)?;
-    std::fs::write(dir.join(MARK), "")?;
+    crate::util::write_fresh(&dir.join(MARK), "")?;
     Ok(claude)
 }
 
@@ -271,11 +271,7 @@ impl Agent {
 
     /// Append `line` to [`LOG`].
     fn log(&self, line: &str) {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.scratch().join(LOG))
-        {
+        if let Ok(mut file) = crate::util::append_regular_file(&self.scratch().join(LOG)) {
             let _ = writeln!(file, "{line}");
         }
     }

@@ -194,7 +194,7 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
     let caps = cmd.cap_files.join(" ");
     let done = match &cmd.act {
         Act::Halt(reason) => halt(cfg, cmd, &person, reason.as_deref()),
-        Act::Inbox { peek } => inbox(cfg, cmd, &person, *peek, &mut io::stdout(), LIVE),
+        Act::Inbox { peek } => inbox(cfg, cmd, &person, *peek, &mut io::stdout(), live()),
         Act::Post {
             sid,
             node,
@@ -305,7 +305,7 @@ pub fn person_of(cap_files: &[String], fleet: &str) -> Result<String, String> {
 }
 
 fn connect(cfg: &Config, cmd: &PersonCmd) -> io::Result<(Conn, Closer)> {
-    connect_within(cfg, cmd, IO_TIMEOUT)
+    connect_within(cfg, cmd, crate::fabric::io_timeout())
 }
 
 fn connect_within(cfg: &Config, cmd: &PersonCmd, request: Duration) -> io::Result<(Conn, Closer)> {
@@ -322,11 +322,23 @@ struct Bounds {
     subscription: Duration,
 }
 
-const LIVE: Bounds = Bounds {
-    request: IO_TIMEOUT,
-    subscription: astream_broker::IDLE_MARK_DEADLINE,
-};
-const _: () = assert!(LIVE.subscription.as_millis() > LIVE.request.as_millis());
+/// The bounds a person's inbox runs under: each request [`crate::fabric::io_timeout`], and its
+/// subscription astream's [`astream_broker::IDLE_MARK_DEADLINE`] or one idle mark past the
+/// request's bound, whichever is later, so the subscription always outlasts a request.
+fn live() -> Bounds {
+    let request = crate::fabric::io_timeout();
+    Bounds {
+        request,
+        subscription: astream_broker::IDLE_MARK_DEADLINE
+            .max(request.saturating_add(astream_broker::IDLE_MARK)),
+    }
+}
+
+// A shipped build's subscription keeps astream's deadline.
+const _: () = assert!(
+    astream_broker::IDLE_MARK_DEADLINE.as_millis()
+        > IO_TIMEOUT.as_millis() + astream_broker::IDLE_MARK.as_millis()
+);
 
 fn publish(
     cfg: &Config,
@@ -340,7 +352,14 @@ fn publish(
         .filter(|&ns| ns > 0 && ns < astream_broker::ACK_SEQ_BASE)
         .ok_or_else(|| io::Error::other("the wall clock reads before 1970: no fresh sequence"))?;
     let (mut conn, _closer) = connect(cfg, cmd)?;
-    let (off, deduped) = conn.publish(astream_cap::producer_id_of(person), seq, subject, body)?;
+    // The person's own producer, whose bucket the broker's rate limit keeps: a refusal is waited
+    // out and sent again at the same sequence ([`crate::rate_hold::waiting_out`]).
+    let producer = astream_cap::producer_id_of(person);
+    let (off, deduped) = crate::rate_hold::waiting_out(
+        || conn.publish(producer, seq, subject, body),
+        IO_TIMEOUT,
+        std::thread::sleep,
+    )?;
     if deduped {
         return Err(io::Error::other(format!(
             "the broker deduped it at @{off} and appended nothing: sequence {seq} was already \
@@ -901,7 +920,7 @@ fn read_existing_cap(
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
     {
         Ok(file) => file,

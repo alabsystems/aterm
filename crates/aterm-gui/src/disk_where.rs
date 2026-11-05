@@ -144,68 +144,66 @@ fn start_with(
 }
 
 fn survey(ask: &Ask) -> Found {
-    aterm_agent::harness::disk::beat::quietly(|| {
-        let deadline = Instant::now() + BUDGET;
-        let table = aterm_sysprobe::volumes::table();
-        let home = ask
-            .home
-            .as_deref()
-            .filter(|h| placed(h, h, &table))
-            .and_then(|h| std::fs::canonicalize(h).ok())
-            .filter(|h| placed(h, h, &table));
-        let (hogs, cut) = match home {
-            Some(home) => {
-                let Some(device) = discover::device_of(&home) else {
-                    return Found {
-                        cut: true,
-                        ..Found::default()
-                    };
-                };
-                let cwds: Vec<PathBuf> = ask
-                    .shells
-                    .iter()
-                    .chain(&ask.agents)
-                    .filter_map(|&pid| aterm_sysprobe::process_cwd(pid))
-                    .collect();
-                let targets: Vec<PathBuf> = ask
-                    .agents
-                    .iter()
-                    .filter_map(|&pid| atpkg::caller_shell::process_args(pid))
-                    .filter_map(|args| args.env_var("CARGO_TARGET_DIR").map(PathBuf::from))
-                    .collect();
-                let Some(roots) = roots(&home, cwds, targets, &table, device) else {
-                    return Found {
-                        cut: true,
-                        ..Found::default()
-                    };
-                };
-                let found = discover::discover(
-                    &roots,
-                    Budget {
-                        wall: FIND_BUDGET,
-                        ..Budget::SHIPPED
-                    },
-                );
-                found_rows(
-                    &found,
-                    &home,
-                    || Instant::now() >= deadline,
-                    |dir| aterm_agent::harness::disk::target::total_bytes_until(dir, deadline),
-                )
-            }
-            None => {
+    let deadline = Instant::now() + BUDGET;
+    let table = aterm_sysprobe::volumes::table();
+    let home = ask
+        .home
+        .as_deref()
+        .filter(|h| placed(h, h, &table))
+        .and_then(|h| std::fs::canonicalize(h).ok())
+        .filter(|h| placed(h, h, &table));
+    let (hogs, cut) = match home {
+        Some(home) => {
+            let Some(device) = discover::device_of(&home) else {
                 return Found {
                     cut: true,
                     ..Found::default()
                 };
-            }
-        };
-        Found {
-            hogs,
-            at_unix_ms: aterm_time::unix_millis().and_then(|ms| i64::try_from(ms).ok()),
-            cut,
+            };
+            let cwds: Vec<PathBuf> = ask
+                .shells
+                .iter()
+                .chain(&ask.agents)
+                .filter_map(|&pid| aterm_sysprobe::process_cwd(pid))
+                .collect();
+            let targets: Vec<PathBuf> = ask
+                .agents
+                .iter()
+                .filter_map(|&pid| atpkg::caller_shell::process_args(pid))
+                .filter_map(|args| args.env_var("CARGO_TARGET_DIR").map(PathBuf::from))
+                .collect();
+            let Some(roots) = roots(&home, cwds, targets, &table, device) else {
+                return Found {
+                    cut: true,
+                    ..Found::default()
+                };
+            };
+            let found = discover::discover(
+                &roots,
+                Budget {
+                    wall: FIND_BUDGET,
+                    ..Budget::SHIPPED
+                },
+            );
+            found_rows(
+                &found,
+                &home,
+                || Instant::now() >= deadline,
+                |dir| aterm_agent::harness::disk::target::total_bytes_until(dir, deadline),
+            )
         }
-    })
+        None => {
+            return Found {
+                cut: true,
+                ..Found::default()
+            };
+        }
+    };
+    Found {
+        hogs,
+        at_unix_ms: aterm_time::unix_millis().and_then(|ms| i64::try_from(ms).ok()),
+        cut,
+    }
 }
 
 fn roots(
@@ -631,6 +629,7 @@ mod tests {
             found: vec![found(&home.join("p0/target"))],
             notes: Vec::new(),
             cut: why.map(str::to_owned),
+            dangling: Vec::new(),
         };
         let (hogs, cut_short) =
             found_rows(&cut(Some("wall budget")), home, || false, |_| (100, false));

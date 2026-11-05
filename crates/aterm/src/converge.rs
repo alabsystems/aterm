@@ -701,20 +701,31 @@ fn unrecorded_label(machines: &[Option<String>; 2], ours: &dyn Fn(&str) -> bool)
     }
 }
 
-/// Whether the vault's swarm roster at `paths` gives `pair` to this Mac, whose label it gives
-/// now is `label`: its row's label or one of its earlier ones ([`unrecorded_label`]).
-fn roster_gives(paths: &aterm_secrets::client::Paths, label: Option<&str>, pair: &str) -> bool {
+/// One bounded roster snapshot for a name-follow pass.
+fn read_name_roster(
+    paths: &aterm_secrets::client::Paths,
+) -> Result<Option<aterm_secrets::swarm_roster::SwarmRoster>, String> {
+    aterm_secrets::client::swarm_roster_until(
+        paths,
+        std::time::Instant::now() + std::time::Duration::from_millis(250),
+    )
+    .map_err(|why| format!("swarm roster unread: {why}"))
+}
+
+/// Whether this snapshot gives `pair` to this Mac under its current `label`.
+fn roster_gives(
+    roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
+    label: Option<&str>,
+    pair: &str,
+) -> bool {
     let Some(label) = label else {
         return false;
     };
-    aterm_secrets::client::swarm_roster(paths)
-        .ok()
-        .flatten()
-        .is_some_and(|roster| {
-            roster
-                .member_by_label_or_alias(pair)
-                .is_some_and(|member| member.label == label)
-        })
+    roster.is_some_and(|roster| {
+        roster
+            .member_by_label_or_alias(pair)
+            .is_some_and(|member| member.label == label)
+    })
 }
 
 /// What `sync.identity` owes `aterm.toml`: how the row reads, and, where it is due, the name it
@@ -731,18 +742,37 @@ fn identity_target(
     config_path: &Path,
     paths: &aterm_secrets::client::Paths,
     hostnames: &[String],
+    roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
 ) -> Result<Option<(String, Option<String>)>, String> {
     if swarm_disabled_at(config_path)? {
         return Ok(None);
     }
     let choice = read_identity_config(config_path)?.name;
-    let label = aterm_secrets::client::resolve_local_swarm_label(paths, hostnames)
-        .map_err(|why| why.to_string())?;
+    let label = name_label(paths, roster, hostnames)?;
     Ok(match (choice, label) {
         (NameChoice::Off, _) | (_, None) => None,
         (NameChoice::Yours(name), label) => Some((name, label)),
         (NameChoice::Roster, Some(label)) => Some((label.clone(), Some(label))),
     })
+}
+
+fn name_label(
+    paths: &aterm_secrets::client::Paths,
+    roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
+    hostnames: &[String],
+) -> Result<Option<String>, String> {
+    if let Some(roster) = roster {
+        let identity =
+            aterm_secrets::client::read_machine_identity(paths).map_err(|why| why.to_string())?;
+        return Ok(identity.and_then(|identity| {
+            roster
+                .member_by_recipient(&identity.recipient().to_bech32())
+                .filter(|member| !roster.is_member_denied(member))
+                .map(|member| member.label.clone())
+        }));
+    }
+    aterm_secrets::client::resolve_local_swarm_label(paths, hostnames)
+        .map_err(|why| why.to_string())
 }
 
 /// The swarm label the root half of the one password names the Mac by
@@ -753,7 +783,8 @@ fn identity_target(
 pub(crate) fn mac_name_label() -> Option<String> {
     let config = aterm_types::dirs::aterm_config_path()?;
     let paths = vault_paths().ok()?;
-    match identity_target(&config, &paths, &[]) {
+    let roster = read_name_roster(&paths).ok()?;
+    match identity_target(&config, &paths, &[], roster.as_ref()) {
         Ok(Some((target, Some(label)))) if target == label => Some(label),
         _ => None,
     }
@@ -790,13 +821,15 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
         return Ok(MacName::Off("[identity] name = false".to_owned()));
     }
     let paths = vault_paths()?;
+    let roster = read_name_roster(&paths)?;
     let own = own_names();
     let hostnames = local_hostnames(&own);
-    let Some((target, label)) = identity_target(&config, &paths, &hostnames)? else {
+    let Some((target, label)) = identity_target(&config, &paths, &hostnames, roster.as_ref())?
+    else {
         return Ok(MacName::Unlabelled);
     };
     let fleet = aterm_agent::fleet_name_for(&target, &|word| {
-        roster_gives(&paths, label.as_deref(), word)
+        roster_gives(roster.as_ref(), label.as_deref(), word)
     })?;
     let pending =
         own_name_pending(&target, label.as_deref(), &own).filter(|_| cfg!(target_os = "macos"));
@@ -902,6 +935,7 @@ fn with_fleet_name(
 
 /// `sync.identity`'s read at `config_path` given `paths` and fallback `hostnames`, with what aterm
 /// last wrote at `record`.
+#[cfg(test)]
 fn identity_at(
     config_path: &Path,
     record: &Path,
@@ -912,11 +946,23 @@ fn identity_at(
 }
 
 /// [`identity_at`], with what an apply writes.
+#[cfg(test)]
 fn identity_owed_at(
     config_path: &Path,
     record: &Path,
     paths: &aterm_secrets::client::Paths,
     hostnames: &[String],
+) -> Result<IdentityOwed, String> {
+    let roster = read_name_roster(paths)?;
+    identity_owed_from(config_path, record, paths, hostnames, roster.as_ref())
+}
+
+fn identity_owed_from(
+    config_path: &Path,
+    record: &Path,
+    paths: &aterm_secrets::client::Paths,
+    hostnames: &[String],
+    roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
 ) -> Result<IdentityOwed, String> {
     let off = |why: &str| IdentityOwed {
         read: IdentityRead::NotApplicable(why.to_owned()),
@@ -928,12 +974,11 @@ fn identity_owed_at(
     if read_identity_config(config_path)?.name == NameChoice::Off {
         return Ok(off("off: [identity] name = false"));
     }
-    let label = aterm_secrets::client::resolve_local_swarm_label(paths, hostnames)
-        .map_err(|why| why.to_string())?;
+    let label = name_label(paths, roster, hostnames)?;
     let config =
         aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
     identity_owed_in(&config, record, label.as_deref(), &|pair| {
-        roster_gives(paths, label.as_deref(), pair)
+        roster_gives(roster, label.as_deref(), pair)
     })
 }
 
@@ -1161,11 +1206,11 @@ fn window_in(dir: &Path, alive: &dyn Fn(u32) -> bool) -> bool {
     let own = std::process::id();
     std::fs::read_dir(dir).is_ok_and(|entries| {
         entries.flatten().any(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.ends_with(".sock")
-                && aterm_types::control_socket::instance_pid(&name)
-                    .is_some_and(|pid| pid != own && alive(pid))
+            entry.file_name().to_str().is_some_and(|name| {
+                name.ends_with(".sock")
+                    && aterm_types::control_socket::instance_pid(name)
+                        .is_some_and(|pid| pid != own && alive(pid))
+            })
         })
     })
 }
@@ -1191,10 +1236,15 @@ fn release_elsewhere(own: Option<&Path>, apps_dirs: &[PathBuf]) -> Option<PathBu
 /// The installed app's run of a held copy's subscriber pass: `program args` on the held copy's
 /// own stdio (null under the subscriber's runner; a person's terminal gets the rows), as its own
 /// responsible process (the one place the converge pass disclaims responsibility, so macOS asks
-/// about its Local Network use as aterm.app's, not the held copy's that started it).
+/// about its Local Network use as aterm.app's, not the held copy's that started it), and out of
+/// the background band the held copy starts its other children in ([`Ports::background`]), as
+/// the pass it runs takes the fleet book's lock.
 fn hand_off_command(program: &Path, args: &[String]) -> aterm_uds::spawnfd::Command {
     let mut command = aterm_uds::spawnfd::command(program);
-    command.args(args).disclaim_responsibility(true);
+    command
+        .args(args)
+        .disclaim_responsibility(true)
+        .leave_background_band(true);
     command
 }
 
@@ -1246,8 +1296,21 @@ impl Live {
 }
 
 impl Ports for Live {
-    fn background(&self) {
-        aterm_machines::sync::background_self();
+    /// Every thread of the pass held as it starts where its starter ran the pass, so the fleet
+    /// book's lock lifts its holder to the default class while the rest of the pass yields: the
+    /// vault subscriber's, its runner having left the subscriber's band
+    /// ([`aterm_secrets::converge::runner`]), at the background class with every child it starts
+    /// in the background band, where its `Background` launchd job ran them
+    /// ([`aterm_gui::hold_process_as_housekeeping`],
+    /// [`aterm_uds::spawnfd::start_children_in_background_band`]); a window's, the first
+    /// launch's and a person's at utility ([`aterm_gui::hold_process_as_background_work`]).
+    fn background(&self, trigger: aterm_machines::sync::Trigger) {
+        if trigger == aterm_machines::sync::Trigger::Subscriber {
+            aterm_gui::hold_process_as_housekeeping();
+            aterm_uds::spawnfd::start_children_in_background_band();
+        } else {
+            aterm_gui::hold_process_as_background_work();
+        }
     }
 
     fn own_account(&self) -> bool {
@@ -1371,14 +1434,23 @@ impl Ports for Live {
         let config = aterm_types::dirs::aterm_config_path()
             .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
         let paths = vault_paths()?;
+        let roster = read_name_roster(&paths)?;
         let names = own_names();
         let hostnames = local_hostnames(&names);
-        let read = identity_at(&config, &identity_record()?, &paths, &hostnames)?;
-        let Some((target, label)) = identity_target(&config, &paths, &hostnames)? else {
+        let read = identity_owed_from(
+            &config,
+            &identity_record()?,
+            &paths,
+            &hostnames,
+            roster.as_ref(),
+        )?
+        .read;
+        let Some((target, label)) = identity_target(&config, &paths, &hostnames, roster.as_ref())?
+        else {
             return Ok(read);
         };
         let fleet = aterm_agent::fleet_name_for(&target, &|word| {
-            roster_gives(&paths, label.as_deref(), word)
+            roster_gives(roster.as_ref(), label.as_deref(), word)
         })?;
         // Only a Mac's own names are aterm's to align (the root half is macOS's): elsewhere
         // the record names none.
@@ -1406,24 +1478,25 @@ impl Ports for Live {
             return Ok("left as it is: [identity] name = false".to_owned());
         }
         let paths = vault_paths()?;
+        let roster = read_name_roster(&paths)?;
         let names = own_names();
         let hostnames = local_hostnames(&names);
-        let label = aterm_secrets::client::resolve_local_swarm_label(&paths, &hostnames)
-            .map_err(|why| why.to_string())?;
+        let label = name_label(&paths, roster.as_ref(), &hostnames)?;
         let keys = write_identity_after_read(
             &config,
             &identity_record()?,
             label.as_deref(),
-            &|pair| roster_gives(&paths, label.as_deref(), pair),
+            &|pair| roster_gives(roster.as_ref(), label.as_deref(), pair),
             || {},
         )?;
         // The fleet name follows the same name: the vault's roster, the fleet and (under the
         // one password) the Mac's own names say one name (DESIGN-alab-swarm §3.2).
-        let Some((target, label)) = identity_target(&config, &paths, &hostnames)? else {
+        let Some((target, label)) = identity_target(&config, &paths, &hostnames, roster.as_ref())?
+        else {
             return Ok(keys);
         };
         let fleet = aterm_agent::follow_fleet_name(&target, &|word| {
-            roster_gives(&paths, label.as_deref(), word)
+            roster_gives(roster.as_ref(), label.as_deref(), word)
         })?;
         #[cfg(target_os = "macos")]
         if let Some(label) =
@@ -2053,7 +2126,7 @@ mod tests {
         let (home, state) = (scratch.path().join("home"), scratch.path().join("state"));
         let config = scratch.path().join("aterm.toml");
         let roster = scratch.path().join("accounts.toml");
-        std::fs::write(&config, "[harness]\naccounts = \"off\"\n").unwrap();
+        aterm_uds::atomic_file::write(&config, b"[harness]\naccounts = \"off\"\n", 0o600).unwrap();
         assert_eq!(
             accounts_at(Some(&config), &home, &state, &roster, 1_800_000_000),
             AccountsRead::Off
@@ -2085,7 +2158,7 @@ mod tests {
         let config = config_dir.join("aterm.toml");
         let roster = config_dir.join("accounts.toml");
         let configured = "[fleet]\nmachine = \"m16\"\n";
-        std::fs::write(&config, configured).unwrap();
+        aterm_uds::atomic_file::write(&config, configured.as_bytes(), 0o600).unwrap();
         std::fs::write(&roster, "").unwrap();
         let kimi = accounts::roster_beside_for(&config, accounts::Cli::Kimi).unwrap();
         let source = secrets.join(accounts_sync::cli_fleet_file(accounts::Cli::Kimi));
@@ -2173,7 +2246,12 @@ mod tests {
         let fleet =
             "[[account]]\nlabel='codex-1'\nemail='codex-one@example.test'\nmachines=['m16']\n";
         std::fs::write(&source, fleet).unwrap();
-        std::fs::write(&config, format!("{configured}[harness]\naccounts='off'\n")).unwrap();
+        aterm_uds::atomic_file::write(
+            &config,
+            format!("{configured}[harness]\naccounts='off'\n").as_bytes(),
+            0o600,
+        )
+        .unwrap();
         let now = 1_800_000_000;
         assert_eq!(
             accounts_at(Some(&config), &home, &state, &roster, now),
@@ -2359,8 +2437,11 @@ mod tests {
     }
 
     /// The hand-off runs the installed app with the held copy's words, as its own responsible
-    /// process (so macOS asks about its Local Network use as aterm.app's).
-    /// NEGATIVE CONTROL: a hand-off that keeps the held copy responsible fails here.
+    /// process (so macOS asks about its Local Network use as aterm.app's), out of the background
+    /// band the held copy starts its other children in (so the pass it runs lifts the fleet
+    /// book's lock holder).
+    /// NEGATIVE CONTROLS: a hand-off that keeps the held copy responsible, or that stays in the
+    /// band, fails here.
     #[test]
     fn the_hand_off_runs_the_app_as_its_own_responsible_process() {
         let args = ["init", "--converge", "--trigger", "subscriber"].map(str::to_owned);
@@ -2372,6 +2453,10 @@ mod tests {
             args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
         );
         assert!(command.get_disclaim_responsibility());
+        assert!(
+            command.leaves_background_band(),
+            "the pass handed off lifts its book lock's holder"
+        );
     }
 
     /// The installed app's publications use its Local Network answer, including a subscriber
@@ -2474,7 +2559,7 @@ mod tests {
         let paths = aterm_secrets::client::Paths::for_home(&home);
         let config = scratch.path().join("aterm.toml");
         let record = scratch.path().join("state/converge/identity-written.toml");
-        std::fs::write(&config, "[harness]\naccounts = \"wall\"\n").unwrap();
+        aterm_uds::atomic_file::write(&config, b"[harness]\naccounts = \"wall\"\n", 0o600).unwrap();
 
         // No vault / personal vault without roster -> NotApplicable, despite ~/.aterm/machine.toml.
         assert!(matches!(
@@ -2501,7 +2586,7 @@ mod tests {
         assert_eq!(parsed["harness"]["accounts"].as_str(), Some("wall"));
 
         // [swarm] enabled = false stands aside as NotApplicable.
-        std::fs::write(&config, "[swarm]\nenabled = false\n").unwrap();
+        aterm_uds::atomic_file::write(&config, b"[swarm]\nenabled = false\n", 0o600).unwrap();
         assert_eq!(
             identity_at(&config, &record, &paths, &["m15.local".to_owned()]).unwrap(),
             IdentityRead::NotApplicable("off: [swarm] enabled = false".to_owned())
@@ -2522,7 +2607,7 @@ mod tests {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let config = scratch.path().join("aterm.toml");
         let record = scratch.path().join("state/converge/identity-written.toml");
-        std::fs::write(&config, "[ai]\nmachine = \"studio\"\n").unwrap();
+        aterm_uds::atomic_file::write(&config, b"[ai]\nmachine = \"studio\"\n", 0o600).unwrap();
         assert_eq!(
             identity_owed(&config, &record, Some("m112")).unwrap().read,
             IdentityRead::Due {
@@ -2596,7 +2681,7 @@ mod tests {
             let record = dir.join("identity-written.toml");
             let backup = dir.join("aterm.toml.bak");
             if present {
-                std::fs::write(&config, "# the observed config\n").unwrap();
+                aterm_uds::atomic_file::write(&config, b"# the observed config\n", 0o600).unwrap();
             }
             if owned {
                 write_identity_at(&config, &record, Some("m111")).unwrap();
@@ -2663,7 +2748,7 @@ mod tests {
         let paths = aterm_secrets::client::Paths::for_home(&home);
         let config = scratch.path().join("aterm.toml");
         let record = scratch.path().join("state/converge/identity-written.toml");
-        std::fs::write(&config, "[identity]\nname = false\n").unwrap();
+        aterm_uds::atomic_file::write(&config, b"[identity]\nname = false\n", 0o600).unwrap();
         let off = IdentityRead::NotApplicable("off: [identity] name = false".to_owned());
         assert_eq!(
             identity_at(&config, &record, &paths, &["m15.local".to_owned()]).unwrap(),
@@ -2686,7 +2771,12 @@ mod tests {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let config = scratch.path().join("aterm.toml");
         let record = scratch.path().join("state/converge/identity-written.toml");
-        std::fs::write(&config, "[identity]\nname = \"studio\"\ngit = false\n").unwrap();
+        aterm_uds::atomic_file::write(
+            &config,
+            b"[identity]\nname = \"studio\"\ngit = false\n",
+            0o600,
+        )
+        .unwrap();
         let due = identity_owed(&config, &record, Some("m112")).unwrap().read;
         assert!(
             matches!(&due, IdentityRead::Due { to, .. }

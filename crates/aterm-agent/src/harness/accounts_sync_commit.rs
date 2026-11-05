@@ -885,6 +885,9 @@ impl Store {
                 )
             })
             .transpose()?;
+        if let Some(raw) = raw_before.as_ref() {
+            self.hydrate_lapsed(&mut state, &bound(raw, &logins));
+        }
         workflow_scope::begin(raw_before.as_ref(), &mut logins);
         let managed_before = raw_before.as_ref().filter(|_| !state.contextual_auth);
         auth_scope::begin(&mut state, managed_before, &mut logins);

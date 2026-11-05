@@ -53,3 +53,7 @@ handshake = ["stream", "dep:x25519-dalek", "dep:astream-digest"]
 # the handshake's ephemeral X25519 + HKDF for the session key; adds Ed25519
 # identity signatures. Off by default, so the base crate stays signature-free.
 identity = ["handshake", "dep:ed25519-dalek"]
+# Ed25519 sign and verify alone, with no handshake or transport: what astream-broker's
+# `relay` checks a record's origin with. It is ring's, so it adds no crate to a build that
+# already has this one.
+signature = []

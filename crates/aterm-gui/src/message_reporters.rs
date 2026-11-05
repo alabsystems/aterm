@@ -2496,13 +2496,38 @@ pub(crate) fn debugger_access_record(record: crate::debugger_access::DebuggerRec
     msg.record().key(KEY_DEBUGGER_ACCESS)
 }
 
-/// Builds the log record for an external `aterm ctl appnotice harness` note.
+/// An `aterm ctl appnotice harness` note's whole text, control characters stripped: what its
+/// record keeps ([`harness_note`]) and what a repeat is judged by
+/// (`App::record_harness_note`).
+pub(crate) fn harness_note_text(text: &str) -> String {
+    atpkg::progress::sanitize_for_tty(text, usize::MAX)
+}
+
+/// Builds the log record for an external `aterm ctl appnotice harness` note: the note cut to
+/// [`aterm_messages::TITLE_CAP`] characters with an ellipsis (its first 119 and `…`) as the title
+/// and, where the title cut it, its whole text as the detail, split on character boundaries into lines of at most
+/// [`aterm_messages::DETAIL_LINE_CAP`] characters with nothing dropped, so the lines joined
+/// back together are the text. A codex-alab act record keeps its fact, its why and its turn at
+/// its end, within the verb's 512 bytes, and those now reach the Messages log. The detail holds
+/// at most [`aterm_messages::DETAIL_LINES_CAP`] lines (5,760 characters) and drops the rest, which
+/// a note within the verb's 512 bytes (at most 512 characters, three lines) never reaches. A
+/// note the title holds whole gets no detail.
 pub(crate) fn harness_note(text: &str) -> Message {
+    let whole: Vec<char> = harness_note_text(text).chars().collect();
+    let detail = if whole.len() > aterm_messages::TITLE_CAP {
+        whole
+            .chunks(aterm_messages::DETAIL_LINE_CAP)
+            .map(|line| line.iter().collect::<String>())
+            .collect()
+    } else {
+        Vec::new()
+    };
     Message::new(
         tags::HARNESS,
         Severity::Info,
-        atpkg::progress::sanitize_for_tty(text, 120),
+        atpkg::progress::sanitize_for_tty(text, aterm_messages::TITLE_CAP),
     )
+    .lines(detail)
     .record()
 }
 
@@ -3549,6 +3574,28 @@ pub(crate) fn credit_claim_worker_record(
         ))
         .record()
         .key(&host_record_key("claim-worker", sid))
+}
+
+/// The key of [`credit_claim_not_ready_record`]: one wait at a time, whichever look found it.
+pub(crate) const CREDIT_CLAIM_NOT_READY_KEY: &str = "harness.host.claim-not-ready";
+
+/// The record in Messages of a free Claude credit the claim act holds until what it needs is in
+/// place (`why`: what aterm put in place and what is left, a line each,
+/// [`crate::harness_host::credit_claim::Stepped::NotReady`]): no try was spent and no tab opened,
+/// and the next look checks again. A record, never an alert: nothing waits on the person but the
+/// credit, and the words say what would let it be claimed.
+pub(crate) fn credit_claim_not_ready_record(why: &str) -> Message {
+    Message::new(
+        tags::HARNESS,
+        Severity::Info,
+        "A free Claude credit waits for Chrome",
+    )
+    .lines(
+        why.lines()
+            .map(|line| atpkg::progress::sanitize_for_tty(line, aterm_messages::DETAIL_LINE_CAP)),
+    )
+    .record()
+    .key(CREDIT_CLAIM_NOT_READY_KEY)
 }
 
 /// How a disk worker ended, as the record in Messages says it ([`disk_worker_over_record`]).
@@ -4995,6 +5042,204 @@ pub(crate) fn auto_end_record(text: &str) -> Message {
     .key(PROC_AUTO_END_KEY)
 }
 
+/// The key of each record of a dangling `target*` link the disk watch first saw.
+pub(crate) const PROC_LINK_KEY: &str = "proc.link";
+
+/// The key of each record of a link the lab refused in what a run left in its scratch, posted by
+/// that lab through `appnotice proc` (`aterm-lab`'s `link_notice`).
+pub(crate) const PROC_LAB_LINK_KEY: &str = "proc.lab-link";
+
+/// Builds the record an `appnotice proc <text>` line makes, by who speaks (the text's first
+/// word): the lab's refusal of a link (`lab …`) under [`PROC_LAB_LINK_KEY`], else what a verify
+/// run ended unasked ([`auto_end_record`]). A fact for later, never an Entry or a Now.
+pub(crate) fn proc_lane_record(text: &str) -> Message {
+    if text.split_whitespace().next() == Some("lab") {
+        Message::new(tags::SYSTEM, Severity::Info, "The lab refused a link")
+            .line(atpkg::progress::sanitize_for_tty(
+                text,
+                aterm_messages::DETAIL_LINE_CAP,
+            ))
+            .record()
+            .key(PROC_LAB_LINK_KEY)
+    } else {
+        auto_end_record(text)
+    }
+}
+
+/// The dev-build seam that shortens how long a leftover's owner must have been gone before the
+/// `leftovers` Entry names it, ms ([`left_entry_after_ms`]).
+pub(crate) const LEFT_ENTRY_AFTER_SEAM: &str = "ATERM_DEBUG_LEFT_ENTRY_AFTER_MS";
+
+/// How long a leftover's owner must have been gone before the `leftovers` Entry names it:
+/// [`aterm_vitals::left::ENTRY_AFTER_MS`], or in a development build what
+/// [`LEFT_ENTRY_AFTER_SEAM`] says, read once.
+pub(crate) fn left_entry_after_ms() -> u64 {
+    static AFTER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| {
+        aterm_types::dev_seam!(LEFT_ENTRY_AFTER_SEAM)
+            .and_then(|v| v.to_str().and_then(|v| v.trim().parse().ok()))
+            .unwrap_or(aterm_vitals::left::ENTRY_AFTER_MS)
+    })
+}
+
+/// How long an owner has been gone, as an Entry's detail says it: minutes under an hour, then
+/// whole hours.
+fn gone_words(ms: u64) -> String {
+    if ms < 3_600_000 {
+        aterm_uds::process::held_age(ms)
+    } else {
+        format!("{} h", ms / 3_600_000)
+    }
+}
+
+/// THE `leftovers` ENTRIES of `view` (leftover §6.6): one for each session whose closed tab, or a
+/// dead verify run that rode in it, left processes the Entry names
+/// ([`aterm_vitals::left::eligible`] with `after_ms`), keyed `vitals.proc.<sid>.leftovers` (a run
+/// whose session is unknown, `vitals.proc.leftovers`). Each says what outlived what in up to three
+/// detail lines by source and executable ("ugrep ×2 from Tab 2, 3 h"), and the one step: end the
+/// ones not wanted by their tokens. No button: one press that ends several processes would need
+/// an intent of its own. None when no row is eligible, which ends every entry the family holds.
+pub(crate) fn leftovers_entries(view: &aterm_vitals::left::LeftView, after_ms: u64) -> Vec<Entry> {
+    use aterm_vitals::left::Source;
+    /// The rows of one subject that came from one source and run one executable.
+    struct Group {
+        subject: String,
+        source: String,
+        word: String,
+        count: usize,
+        longest_gone_ms: u64,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for row in view
+        .rows
+        .iter()
+        .filter(|r| aterm_vitals::left::eligible(r, view, after_ms))
+    {
+        let (subject, source) = match &row.from {
+            Source::Closed(key) => {
+                let Some(tab) = view.closed.iter().rev().find(|t| t.key == *key) else {
+                    continue;
+                };
+                (tab.sid.clone(), tab_words(tab))
+            }
+            Source::Run(id) => (
+                view.runs
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .and_then(|r| r.sid.clone())
+                    .unwrap_or_default(),
+                format!("verify run {}", aterm_vitals::sys::pct(id)),
+            ),
+            Source::Tab(_) | Source::Unknown => continue,
+        };
+        let word = match row.exe_word() {
+            "-" => "a process".to_owned(),
+            word => word.to_owned(),
+        };
+        let gone = aterm_vitals::left::owner_gone_ms(row, view).unwrap_or(0);
+        match groups
+            .iter_mut()
+            .find(|g| g.subject == subject && g.source == source && g.word == word)
+        {
+            Some(g) => {
+                g.count += 1;
+                g.longest_gone_ms = g.longest_gone_ms.max(gone);
+            }
+            None => groups.push(Group {
+                subject,
+                source,
+                word,
+                count: 1,
+                longest_gone_ms: gone,
+            }),
+        }
+    }
+    let mut subjects: Vec<&str> = groups.iter().map(|g| g.subject.as_str()).collect();
+    subjects.sort_unstable();
+    subjects.dedup();
+    subjects
+        .into_iter()
+        .map(|subject| {
+            let mine: Vec<&Group> = groups.iter().filter(|g| g.subject == subject).collect();
+            let total: usize = mine.iter().map(|g| g.count).sum();
+            let mut entry = Entry::new(
+                Family::Vitals,
+                subject,
+                "leftovers",
+                "Processes outlived their tab or run",
+                Why::OnlyYou(Reason::new("only you know which of them you still want")),
+                Then::step(
+                    "End the ones you do not want with aterm ctl end, naming each token from \
+                     aterm ctl sys left",
+                ),
+            )
+            .resurface(Resurface::WAIT)
+            .log_line(format!(
+                "leftovers: {total} process{} outlived {}; aterm ctl sys left scope=aterm lists \
+                 each with its token",
+                if total == 1 { "" } else { "es" },
+                if subject.is_empty() {
+                    "a verify run".to_owned()
+                } else {
+                    format!("session {subject}")
+                }
+            ));
+            for g in mine {
+                let times = if g.count == 1 {
+                    String::new()
+                } else {
+                    format!(" ×{}", g.count)
+                };
+                entry = entry.more(format!(
+                    "{}{times} from {}, {}",
+                    g.word,
+                    g.source,
+                    gone_words(g.longest_gone_ms)
+                ));
+            }
+            entry
+        })
+        .collect()
+}
+
+/// The dangling links `view` holds that `told` (the links already told, by path) does not,
+/// which takes them: each is told once while this instance runs, at the first view that holds
+/// it. `told` keeps at most 512 links, the oldest dropped first.
+pub(crate) fn newly_dangling<'a>(
+    told: &mut std::collections::VecDeque<String>,
+    view: &'a aterm_vitals::left::LeftView,
+) -> Vec<&'a aterm_vitals::left::LinkRow> {
+    let mut new = Vec::new();
+    for link in &view.links {
+        if !told.contains(&link.path) {
+            told.push_back(link.path.clone());
+            new.push(link);
+        }
+    }
+    while told.len() > 512 {
+        told.pop_front();
+    }
+    new
+}
+
+/// Builds the record of a dangling `target*` link the disk watch saw in a checkout (leftover
+/// §5.6): where it is and where it points. A fact for later, never an Entry or a Now: nothing
+/// deletes, retargets or repairs it.
+pub(crate) fn link_record(link: &aterm_vitals::left::LinkRow) -> Message {
+    let target = match link.target {
+        aterm_vitals::left::LinkTarget::Gone => "its target is gone",
+        aterm_vitals::left::LinkTarget::NotMounted => "its target's volume is not mounted",
+    };
+    Message::new(tags::SYSTEM, Severity::Info, "A build link points nowhere")
+        .line(atpkg::progress::sanitize_for_tty(
+            &format!("{}: {target}", link.path),
+            aterm_messages::DETAIL_LINE_CAP,
+        ))
+        .line("aterm leaves it as it is; aterm ctl sys left scope=aterm lists it")
+        .record()
+        .key(PROC_LINK_KEY)
+}
+
 /// Builds the exceptions digest entry when the live upgrade host cannot lock its state directory.
 pub(crate) fn upgrade_cannot_run_entry(step: &str, dir: Option<&std::path::Path>) -> Entry {
     let need = aterm_agent::harness::upgrade_drive::Need::upgrade_cannot_run(step);
@@ -5079,8 +5324,9 @@ const ACCOUNTS_LABELS_FILL: usize = 200;
 /// THE RECORDED ERROR OF THE SIGNED-OUT CLAUDE CODE ROWS THAT NAME NO EMAIL
 /// (`accounts::signed_out`), a fact for later: aterm's sign-in ladder signs a row in by its email,
 /// so no route exists for these, and it asks no one to sign them in. A signed-out row with an
-/// email is never on it: the ladder signs that row in by itself, and where no route can, the
-/// no-sign-in fact names each one tried ([`accounts_no_sign_in_entry`]).
+/// email is never on it: a report names its sign-in, the ladder makes it where a session here runs
+/// on the row or a person asks, and where no route can, the no-sign-in fact names each one tried
+/// ([`accounts_no_sign_in_entry`]).
 pub(crate) fn accounts_signed_out_entry(labels: &[String]) -> Option<Entry> {
     let first = labels.first()?;
     let what = match labels.len() {
@@ -5094,7 +5340,7 @@ pub(crate) fn accounts_signed_out_entry(labels: &[String]) -> Option<Entry> {
         "signed-out",
         &what,
         Why::Spent {
-            tried: Reason::new("signs in by itself every row that names an email"),
+            tried: Reason::new("signs a row in only by the email it names"),
             reason: Reason::new(if labels.len() == 1 {
                 "this row names none, so no sign-in route exists for it"
             } else {
@@ -5174,8 +5420,9 @@ pub(crate) const ACCOUNTS_NO_SIGN_IN_KEY: &str = "harness.accounts.no-sign-in";
 /// The exceptions digest entry, a fact for later, for the Claude Code rows whose automatic
 /// sign-in found no route (or ran one that failed) and that still need one (no login to run on,
 /// or one due for renewal: `accounts::needs_sign_in`): each row with the routes it tried. It asks
-/// no one to sign in: aterm tries each row again by itself, as soon as anything a route reads
-/// changes and at the latest when its backoff ends.
+/// no one to sign in: aterm tries a row a session here runs on, or a due login used here, again by
+/// itself, as soon as anything a route reads changes and at the latest when its backoff ends;
+/// any other row waits for a person.
 pub(crate) fn accounts_no_sign_in_entry(rows: &[(String, String)]) -> Option<Entry> {
     rows.first()?;
     let mut entry = Entry::new(

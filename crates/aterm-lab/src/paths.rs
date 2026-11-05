@@ -471,7 +471,7 @@ pub fn checkout_key(repo: &Path) -> String {
 /// It cannot be made, or it is a link, not a directory, another user's, or its mode cannot be
 /// narrowed.
 pub fn private_dir(dir: &Path, uid: u32) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -493,7 +493,7 @@ pub fn private_dir(dir: &Path, uid: u32) -> Result<(), String> {
         ));
     }
     if meta.mode() & 0o077 != 0 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        crate::util::set_dir_mode_nofollow(dir, 0o700).map_err(|e| {
             format!(
                 "{}: its mode cannot be narrowed to 0700 ({e})",
                 dir.display()

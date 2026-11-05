@@ -232,7 +232,8 @@ fn keys_while_paused_queue_and_are_delivered_once_after_the_commit() {
         keys.iter()
             .map(|k| MomentumEvent::Key {
                 at: at(*k),
-                tau_bits: TAU.to_bits()
+                tau_bits: TAU.to_bits(),
+                echo: super::KeyEcho::Seen,
             })
             .collect::<Vec<_>>()
     );

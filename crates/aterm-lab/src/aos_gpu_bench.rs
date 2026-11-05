@@ -13,7 +13,7 @@ use std::time::Duration;
 use aterm_sysprobe::{GpuDriver, GpuReading};
 use aterm_uds::spawnfd::Stdio;
 
-use crate::aos_workers_bench::{load_average, median, required_valid, span_ratio, williams};
+use crate::bench_stats::{load_average, median, required_valid, span_ratio, williams};
 use crate::instance::take_value;
 use crate::paths::{from_caller, paths};
 use crate::stop::{self, Stopped};
@@ -2504,7 +2504,7 @@ impl Bench {
     fn write(&self, state: State) -> (String, i32) {
         let (text, code) = render(&self.header, &self.runs, state);
         let path = self.out.join("record.md");
-        if let Err(e) = std::fs::write(&path, &text) {
+        if let Err(e) = crate::util::write_fresh(&path, &text) {
             eprintln!("aos-gpu-bench: cannot write {}: {e}", path.display());
         }
         (text, code)
@@ -2518,8 +2518,8 @@ impl Bench {
         let summary_path = runs_dir.join(format!("{id}.summary"));
         let m = measure(&self.harness, arm, &id, &summary_path)?;
         cond.gpu_after = aterm_sysprobe::gpu();
-        let _ = std::fs::write(runs_dir.join(format!("{id}.stdout")), &m.stdout);
-        let _ = std::fs::write(runs_dir.join(format!("{id}.stderr")), &m.stderr);
+        let _ = crate::util::write_fresh(&runs_dir.join(format!("{id}.stdout")), &m.stdout);
+        let _ = crate::util::write_fresh(&runs_dir.join(format!("{id}.stderr")), &m.stderr);
         let summary = crate::util::read_regular_text(&summary_path)
             .map_err(|e| format!("cannot read {}: {e}", summary_path.display()))
             .and_then(|t| parse_summary(&t));
@@ -2535,7 +2535,8 @@ impl Bench {
         };
         run.verdict = judge(&run);
         let sidecar = runs_dir.join(format!("{}.runner", run.id));
-        if let Err(e) = std::fs::write(&sidecar, runner_text(&run, self.header.timebase)) {
+        if let Err(e) = crate::util::write_fresh(&sidecar, runner_text(&run, self.header.timebase))
+        {
             eprintln!("aos-gpu-bench: cannot write {}: {e}", sidecar.display());
         }
         eprintln!(

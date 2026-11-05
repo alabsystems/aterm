@@ -221,7 +221,7 @@ pub fn mark_ran(exe: &Path) {
     }) else {
         return;
     };
-    if let Err(e) = std::fs::write(snapshot.join(aterm_uds::deadline::RAN), b"") {
+    if let Err(e) = aterm_uds::deadline::try_mark_ran(snapshot) {
         eprintln!(
             "atpkg-publish: cannot mark {} as run from: {e}",
             snapshot.display()

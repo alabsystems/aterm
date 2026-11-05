@@ -83,50 +83,69 @@ impl Tools {
         now: i64,
         masters: &[&str],
     ) -> Result<(PathBuf, crate::machines::MachineIdentity), String> {
-        use atpkg_keys::provision::{MACHINE_KEY_REL, MACHINE_PUB_REL, RELEASE_ROSTER_REL};
-
-        let key = home.join(MACHINE_KEY_REL);
-        let record = home.join(MACHINE_PUB_REL);
-        let roster = home.join(RELEASE_ROSTER_REL);
-        let metadata = std::fs::symlink_metadata(&key)
-            .map_err(|e| format!("source signing needs {}: {e}", key.display()))?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(format!(
-                "source signing key {} is not a regular file",
-                key.display()
-            ));
+        #[cfg(not(unix))]
+        {
+            let _ = (home, now, masters);
+            Err("current source-signing authority is unavailable on this platform".into())
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt as _;
-            crate::sign::check_credentials_perms(
-                metadata.uid(),
-                metadata.mode(),
-                crate::sign::current_uid()?,
-                &key,
+            use atpkg_keys::provision::{MACHINE_KEY_REL, MACHINE_PUB_REL, RELEASE_ROSTER_REL};
+
+            let key = home.join(MACHINE_KEY_REL);
+            let record = home.join(MACHINE_PUB_REL);
+            let roster = home.join(RELEASE_ROSTER_REL);
+            let metadata = std::fs::symlink_metadata(&key)
+                .map_err(|e| format!("source signing needs {}: {e}", key.display()))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "source signing key {} is not a regular file",
+                    key.display()
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                crate::sign::check_credentials_perms(
+                    metadata.uid(),
+                    metadata.mode(),
+                    crate::sign::current_uid()?,
+                    &key,
+                )?;
+            }
+            atpkg_keys::provision::refuse_pending_roster_transaction(
+                roster.to_str().ok_or("release roster path is not UTF-8")?,
             )?;
-        }
-        atpkg_keys::provision::refuse_pending_roster_transaction(
-            roster.to_str().ok_or("release roster path is not UTF-8")?,
-        )?;
-        let identity = crate::machines::MachineIdentity::read(&record)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("source signing needs {}", record.display()))?;
-        let raw = crate::durable::read_regular_bytes(&roster, 64 * 1024)
-            .map_err(|e| format!("source signing needs a readable {}: {e}", roster.display()))?;
-        let sig_path = roster.with_extension("toml.sig");
-        let sig = crate::durable::read_regular_bytes(&sig_path, 64).map_err(|e| {
-            format!(
-                "source signing needs a readable {}: {e}",
-                sig_path.display()
+            let identity = crate::machines::MachineIdentity::read(&record)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("source signing needs {}", record.display()))?;
+            let current = crate::machines::current_roster::resolve(
+                home,
+                &[&roster],
+                masters,
+                Ok(None),
+                aterm_secrets::client::current_public_roster,
             )
-        })?;
-        let who = crate::machines::authorize_cut(masters, raw, &sig, &identity.pubkey, now)
-            .map_err(|e| e.to_string())?;
-        if who.machine_id != identity.id {
-            return Err("source signing ring identity disagrees with its signed roster".into());
+            .map_err(|error| error.to_string())?;
+            let who = crate::machines::authorize_cut(
+                masters,
+                current.selected.bytes.clone(),
+                &current.selected.sig,
+                &identity.pubkey,
+                now,
+            )
+            .map_err(|error| error.to_string())?;
+            current
+                .require_canonical(home, masters)
+                .map_err(|error| error.to_string())?;
+            current
+                .recheck(home, masters)
+                .map_err(|error| error.to_string())?;
+            if who.machine_id != identity.id {
+                return Err("source signing ring identity disagrees with its signed roster".into());
+            }
+            Ok((key, identity))
         }
-        Ok((key, identity))
     }
 
     fn check_ring(
@@ -145,7 +164,7 @@ impl Tools {
         let message = scratch.path().join("message");
         let signature = scratch.path().join("signature");
         let public = scratch.path().join("public.pem");
-        std::fs::write(&message, b"aterm source signing preflight v1\n")
+        crate::durable::write_fresh(&message, b"aterm source signing preflight v1\n")
             .map_err(|e| e.to_string())?;
         let mut der = vec![
             0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
@@ -155,7 +174,7 @@ impl Tools {
                 .map_err(|_| "source signing public key is not base64")?,
         );
         let pem = aterm_codec::base64::encode(&der).map_err(|_| "public key encoding failed")?;
-        std::fs::write(
+        crate::durable::write_fresh(
             &public,
             format!("-----BEGIN PUBLIC KEY-----\n{pem}\n-----END PUBLIC KEY-----\n"),
         )
@@ -514,10 +533,10 @@ mod tests {
             }
             .to_toml()
             .unwrap();
-            std::fs::write(&roster_path, &roster).unwrap();
-            std::fs::write(
-                roster_path.with_extension("toml.sig"),
-                atpkg_keys::sign(&master_key, roster.as_bytes()).unwrap(),
+            crate::provision::publish_proven_pair(
+                &roster_path,
+                roster.as_bytes(),
+                &atpkg_keys::sign(&master_key, roster.as_bytes()).unwrap(),
             )
             .unwrap();
             Self {
@@ -573,11 +592,12 @@ mod tests {
                     assert_eq!(&der[12..], public);
                     let message = std::fs::read(&args[7]).unwrap();
                     let signature = std::fs::read(&args[9]).unwrap();
-                    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public)
-                        .verify(&message, &signature)
-                        .map_err(|_| {
-                            "independent verification rejected the signature".to_string()
-                        })?;
+                    let public: [u8; 32] = public.try_into().unwrap();
+                    if !<&[u8; 64]>::try_from(signature.as_slice()).is_ok_and(|signature| {
+                        astream_aead::signature::verify(&public, &message, signature)
+                    }) {
+                        return Err("independent verification rejected the signature".to_string());
+                    }
                     Ok(vec![])
                 }
                 other => panic!("unexpected invocation: {other}"),
@@ -655,6 +675,30 @@ mod tests {
         )
         .unwrap();
         assert!(Tools::ring_authority(f.home.path(), 100, &[&f.master]).is_ok());
+    }
+
+    /// The fixture's grant is roster generation 1: a retained floor at 1 admits it and one at
+    /// 2 refuses it. Each floor is written as the vault writes it (0600 in a 0700 directory),
+    /// so the verdict turns on its generation, never on a file mode its reader refuses.
+    #[test]
+    fn current_source_signing_refuses_a_grant_below_the_retained_floor() {
+        let fixture = Fixture::new();
+        let authority = || Tools::ring_authority(fixture.home.path(), 100, &[&fixture.master]);
+        authority().expect("no retained floor admits the grant");
+        let paths = aterm_secrets::client::Paths::for_home(fixture.home.path());
+        aterm_uds::private_file::ensure_private_dir(&paths.dir).unwrap();
+        let retain = |floor: &[u8]| {
+            aterm_uds::private_file::write_private(&paths.dir, "release-ring-roster-floor", floor)
+                .unwrap();
+        };
+        retain(b"1\n");
+        authority().expect("a floor at the grant's own generation admits it");
+        retain(b"2\n");
+        let refused = authority().expect_err("a floor above the grant refuses it");
+        assert!(
+            refused.contains(crate::machines::current_roster::BELOW_RETAINED_FLOOR),
+            "{refused}"
+        );
     }
 
     #[test]

@@ -201,6 +201,7 @@ pub(super) fn fixture(etag: Option<&str>, with_recipient: bool) -> Fixture {
     let (url, server) = stub(response.into_bytes());
     let config = Config {
         source: Source::Url(url.clone()),
+        mirrors: Vec::new(),
         name: "team".into(),
         signer: None,
         followed: Vec::new(),

@@ -1241,16 +1241,19 @@ fn walk(projects: &Path, since: i64, limits: &Limits) -> Walk {
                 out.unread += 1;
                 continue;
             };
-            let path = entry.path();
             if kind.is_dir() {
                 if depth + 1 < MAX_DEPTH {
-                    stack.push((path, depth + 1));
+                    stack.push((entry.path(), depth + 1));
                 } else {
                     out.cut = true;
                 }
                 continue;
             }
-            if !kind.is_file() || path.extension().is_none_or(|e| e != "jsonl") {
+            if !kind.is_file()
+                || Path::new(&entry.file_name())
+                    .extension()
+                    .is_none_or(|e| e != "jsonl")
+            {
                 continue;
             }
             let Ok(meta) = entry.metadata() else {
@@ -1260,10 +1263,11 @@ fn walk(projects: &Path, since: i64, limits: &Limits) -> Walk {
             if mtime_ns(&meta) / 1_000_000_000 < since {
                 continue;
             }
+            let path = entry.path();
             match path.strip_prefix(projects).ok().and_then(Path::to_str) {
                 Some(rel) => out.files.push(Found {
                     rel: rel.to_owned(),
-                    path: path.clone(),
+                    path,
                     meta,
                 }),
                 None => out.unread += 1,

@@ -66,8 +66,9 @@ pub(crate) struct AgentMenu {
     pub stoppable: bool,
     /// The workers whose tasks THIS session started: `(sid, its row's words)`, in session order — the `Workers (n)` rows.
     pub workers: Vec<(SessionId, String)>,
-    /// The session's tab is parked under the window's Workers tab: Move to Tab is offered.
-    pub parked: bool,
+    /// The session's tab is a worker's ([`crate::tab_model::Tab::ephemeral`]): Keep as Tab is
+    /// offered.
+    pub worker: bool,
 }
 
 /// The session log's clause as the chrome shows it ([`SessionChromeInput::clause`]).
@@ -235,6 +236,10 @@ pub(crate) enum TabMenuEntry {
     },
 }
 
+/// The words of the one way a worker's tab becomes a person's: the tab menu's row and the Workers
+/// page's button.
+pub(crate) const KEEP_AS_TAB: &str = "Keep as Tab";
+
 /// The closed verb vocabulary of a [`TabMenuEntry::ConnectionAction`] row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnVerb {
@@ -242,8 +247,9 @@ pub(crate) enum ConnVerb {
     Show,
     /// Stop Worker…: after the person confirms the sheet (or, with no sheet to ask on, the Overview's inline confirm), SIGTERM to the session's agent, in process (`App::stop_worker`).
     StopWorker,
-    /// Move to Tab: a parked worker's tab joins the strip (`App::unpark_session`).
-    MoveToTab,
+    /// Keep as Tab: a worker's tab becomes the person's, on the strip and never closed for its
+    /// task's end (`App::keep_as_tab`).
+    KeepAsTab,
 }
 
 /// The per-tab tooltip and context-menu model the app pushes to the native strip.
@@ -734,13 +740,13 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
             enabled: true,
         });
     }
-    if agent.parked
+    if agent.worker
         && let Some(sid) = input.sid.clone()
     {
         entries.push(TabMenuEntry::ConnectionAction {
-            label: "Move to Tab".to_string(),
+            label: KEEP_AS_TAB.to_string(),
             peer_sid: sid,
-            verb: ConnVerb::MoveToTab,
+            verb: ConnVerb::KeepAsTab,
             enabled: true,
         });
     }

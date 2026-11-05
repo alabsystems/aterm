@@ -75,6 +75,12 @@ pub(crate) struct Startup {
     keeper_placed: OnceLock<Instant>,
     /// Their history imports settled ([`mark_keeper_imported`]).
     keeper_imported: OnceLock<Instant>,
+    /// The recovery-count fence's boot cohort: one read observer per old journal authority the
+    /// admission retained ([`record_keeper_cohort`], `keeper_link::RecoveryCountAdmission`).
+    #[cfg(unix)]
+    keeper_cohort: OnceLock<Vec<std::sync::Arc<aterm_keeper::client::ReadObserver>>>,
+    /// The first control request past that fence ([`mark_keeper_served`]).
+    keeper_served: OnceLock<Instant>,
     /// What the restore lane's look-alike seam did so far (`record_keeper_seam`).
     keeper_seam: SeamCounters,
 }
@@ -107,6 +113,9 @@ impl Startup {
             keeper_admitted: OnceLock::new(),
             keeper_placed: OnceLock::new(),
             keeper_imported: OnceLock::new(),
+            #[cfg(unix)]
+            keeper_cohort: OnceLock::new(),
+            keeper_served: OnceLock::new(),
             keeper_seam: SeamCounters::new(),
         }
     }
@@ -188,12 +197,22 @@ impl Startup {
     /// `main` to the answered HELLO), `startup_keeper_admit_ms=` (that HELLO to every offer
     /// admitted or refused, one after another), `startup_keeper_admit_max_ms=` (the slowest one
     /// offer), `startup_keeper_placed_ms=` (that HELLO to every recovered session placed) and
-    /// `startup_keeper_imported_ms=` (that HELLO to their history imports settled); every one
-    /// `none` on a launch whose HELLO no keeper answered, and each until its moment. A build that
-    /// compiles the crash-restore seams adds `startup_keeper_seam_copies=`,
-    /// `startup_keeper_seam_plants=` and `startup_keeper_seam_ms=`: what the restore lane's
-    /// look-alike seam did in that admission, whose time each reading above leaves out
-    /// ([`keeper_recovery`]).
+    /// `startup_keeper_imported_ms=` (that HELLO to their history imports settled), then the
+    /// recovery-count fence (`keeper_link::RecoveryCountAdmission`): `startup_keeper_fence_cohort=`
+    /// (the old journal authorities it waits on), `startup_keeper_sync_sent_ms=` (that HELLO to
+    /// the last moment the keeper was asked to confirm one, of the confirmations that lifted the
+    /// fence: the SYNC written behind the frame that settled its journal, a new journal's
+    /// COMPANION, a COMPANION_RELEASE or the master's RELEASE, or, for one no SYNC answered, the
+    /// confirmation itself, `aterm_keeper::client::ConfirmedRead`),
+    /// `startup_keeper_sync_answer_max_ms=` (the slowest one from asked to confirmed),
+    /// `startup_keeper_fence_ms=` (that HELLO to the last confirmation, where the fence
+    /// lifts) and `startup_keeper_served_ms=` (that HELLO to the first control request past the
+    /// fence); every one `none` on a launch whose HELLO no keeper answered, and each until its
+    /// moment (the SYNC readings and the fence's until every authority is confirmed, so never
+    /// with a cohort of none). A build that compiles the crash-restore seams adds
+    /// `startup_keeper_seam_copies=`, `startup_keeper_seam_plants=` and
+    /// `startup_keeper_seam_ms=`: what the restore lane's look-alike seam did in that admission,
+    /// whose time each reading above leaves out ([`keeper_recovery`]).
     fn emit_keeper_recovery(&self, s: &mut dyn FieldSink) {
         let sample = keeper_recovery(KeeperStamps {
             main: self.main_start(),
@@ -201,20 +220,33 @@ impl Startup {
             admitted: self.keeper_admitted.get().copied(),
             placed: self.keeper_placed.get().copied(),
             imported: self.keeper_imported.get().copied(),
+            fence: self.keeper_fence(),
+            served: self.keeper_served.get().copied(),
         });
         s.opt_count("startup_keeper_offers", sample.map(|k| k.offers), "none");
+        let read = |field: fn(&KeeperRecovery) -> Option<u64>| sample.as_ref().and_then(field);
         for (key, ns) in [
-            ("startup_keeper_hello_ms", sample.and_then(|k| k.hello_ns)),
-            ("startup_keeper_admit_ms", sample.and_then(|k| k.admit_ns)),
+            ("startup_keeper_hello_ms", read(|k| k.hello_ns)),
+            ("startup_keeper_admit_ms", read(|k| k.admit_ns)),
+            ("startup_keeper_admit_max_ms", read(|k| k.slowest_ns)),
+            ("startup_keeper_placed_ms", read(|k| k.placed_ns)),
+            ("startup_keeper_imported_ms", read(|k| k.imported_ns)),
+        ] {
+            s.opt_decimal(key, ns.map(wire::ms), "none");
+        }
+        s.opt_count(
+            "startup_keeper_fence_cohort",
+            read(|k| k.fence_cohort),
+            "none",
+        );
+        for (key, ns) in [
+            ("startup_keeper_sync_sent_ms", read(|k| k.sync_sent_ns)),
             (
-                "startup_keeper_admit_max_ms",
-                sample.and_then(|k| k.slowest_ns),
+                "startup_keeper_sync_answer_max_ms",
+                read(|k| k.sync_answer_max_ns),
             ),
-            ("startup_keeper_placed_ms", sample.and_then(|k| k.placed_ns)),
-            (
-                "startup_keeper_imported_ms",
-                sample.and_then(|k| k.imported_ns),
-            ),
+            ("startup_keeper_fence_ms", read(|k| k.fence_ns)),
+            ("startup_keeper_served_ms", read(|k| k.served_ns)),
         ] {
             s.opt_decimal(key, ns.map(wire::ms), "none");
         }
@@ -229,6 +261,84 @@ impl Startup {
                 "none",
             );
         }
+    }
+
+    /// The fence's cohort as its observers read now (`None` before [`record_keeper_cohort`]).
+    fn keeper_fence(&self) -> Option<KeeperFence> {
+        #[cfg(unix)]
+        {
+            self.keeper_cohort.get().map(|cohort| {
+                keeper_fence(
+                    cohort
+                        .iter()
+                        .map(|o| o.confirmation().map(|r| (r.sync_sent, r.answer_read))),
+                )
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+}
+
+/// The recovery-count fence's cohort as the ledger reads it ([`keeper_fence`]).
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeeperFence {
+    /// The old journal authorities the fence waits on.
+    cohort: u64,
+    /// `None` until the keeper confirmed, for every one of them, that it can no longer offer
+    /// that journal.
+    lifted: Option<FenceLift>,
+}
+
+/// When the fence lifted, and what decided it.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FenceLift {
+    /// The last moment the keeper was asked to confirm one, of the confirmations that lifted
+    /// it: the SYNC written behind the frame that settled the journal (a COMPANION, a
+    /// COMPANION_RELEASE or a RELEASE), or the confirmation itself where no SYNC answered it
+    /// (`aterm_keeper::client::ConfirmedRead::sync_sent`).
+    last_sent: Instant,
+    /// The last of those confirmations: the fence lifts there.
+    last_read: Instant,
+    /// The slowest one from asked to confirmed.
+    slowest_answer_ns: u64,
+}
+
+/// The fence over `reads`, each authority's confirmation as (when it was asked, when it was
+/// confirmed; `aterm_keeper::client::ConfirmedRead`), `None` before it: lifted once every one
+/// is confirmed, never with an empty cohort (whose fence never closed).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn keeper_fence(reads: impl IntoIterator<Item = Option<(Instant, Instant)>>) -> KeeperFence {
+    let mut cohort = 0u64;
+    let mut unconfirmed = false;
+    let mut lift: Option<FenceLift> = None;
+    for read in reads {
+        cohort = cohort.saturating_add(1);
+        let Some((sent, answered)) = read else {
+            unconfirmed = true;
+            continue;
+        };
+        let answer_ns = duration_ns(sent, answered).unwrap_or(0);
+        lift = Some(match lift {
+            None => FenceLift {
+                last_sent: sent,
+                last_read: answered,
+                slowest_answer_ns: answer_ns,
+            },
+            Some(so_far) => FenceLift {
+                last_sent: so_far.last_sent.max(sent),
+                last_read: so_far.last_read.max(answered),
+                slowest_answer_ns: so_far.slowest_answer_ns.max(answer_ns),
+            },
+        });
+    }
+    KeeperFence {
+        cohort,
+        lifted: lift.filter(|_| !unconfirmed),
     }
 }
 
@@ -309,6 +419,8 @@ struct KeeperStamps {
     admitted: Option<KeeperAdmitted>,
     placed: Option<Instant>,
     imported: Option<Instant>,
+    fence: Option<KeeperFence>,
+    served: Option<Instant>,
 }
 
 /// The keeper's boot recovery as `metrics` reports it ([`keeper_recovery`]).
@@ -326,13 +438,26 @@ struct KeeperRecovery {
     placed_ns: Option<u64>,
     /// The answered HELLO to their history imports settled, less the seam; `None` before then.
     imported_ns: Option<u64>,
+    /// The old journal authorities the recovery-count fence waits on; `None` before the
+    /// admission retained them.
+    fence_cohort: Option<u64>,
+    /// The answered HELLO to the last confirming SYNC written, less the seam; `None` until the
+    /// fence lifts.
+    sync_sent_ns: Option<u64>,
+    /// The slowest one confirming SYNC from written to its answer read; `None` until the fence
+    /// lifts.
+    sync_answer_max_ns: Option<u64>,
+    /// The answered HELLO to the fence lifting (the last answer read), less the seam.
+    fence_ns: Option<u64>,
+    /// The answered HELLO to the first control request past the fence, less the seam.
+    served_ns: Option<u64>,
     admit: Option<KeeperAdmitted>,
 }
 
 /// The keeper's boot recovery from its stamps: `None` until a keeper answered the HELLO. The
 /// seam's work all falls inside the admission, so every reading from the HELLO to a moment at or
-/// after the admission's end leaves it out, and placement and the imports read only once the
-/// admission's end is stamped.
+/// after the admission's end leaves it out, and placement, the imports and the fence's moments
+/// read only once the admission's end is stamped.
 fn keeper_recovery(stamps: KeeperStamps) -> Option<KeeperRecovery> {
     let hello = stamps.hello?;
     let admitted = stamps.admitted;
@@ -343,6 +468,7 @@ fn keeper_recovery(stamps: KeeperStamps) -> Option<KeeperRecovery> {
             .flatten()
             .map(|ns| ns.saturating_sub(a.seam.ns))
     };
+    let lift = stamps.fence.and_then(|f| f.lifted);
     Some(KeeperRecovery {
         offers: admitted.map_or(0, |a| a.offers),
         hello_ns: stamps.main.and_then(|main| duration_ns(main, hello)),
@@ -350,6 +476,11 @@ fn keeper_recovery(stamps: KeeperStamps) -> Option<KeeperRecovery> {
         slowest_ns: admitted.map(|a| a.slowest_ns),
         placed_ns: stamps.placed.and_then(less_seam),
         imported_ns: stamps.imported.and_then(less_seam),
+        fence_cohort: stamps.fence.map(|f| f.cohort),
+        sync_sent_ns: lift.and_then(|l| less_seam(l.last_sent)),
+        sync_answer_max_ns: lift.map(|l| l.slowest_answer_ns),
+        fence_ns: lift.and_then(|l| less_seam(l.last_read)),
+        served_ns: stamps.served.and_then(less_seam),
         admit: admitted,
     })
 }
@@ -386,6 +517,23 @@ pub(crate) fn mark_keeper_placed() {
 pub(crate) fn mark_keeper_imported() {
     if STARTUP.keeper_placed.get().is_some() {
         let _ = STARTUP.keeper_imported.set(Instant::now());
+    }
+}
+
+/// Record the recovery-count fence's boot cohort: the read observer of every old journal
+/// authority the admission retained (`keeper_link::RecoveryCountAdmission`), which the ledger
+/// reads for when the keeper confirmed it can no longer offer each one.
+#[cfg(unix)]
+pub(crate) fn record_keeper_cohort(
+    cohort: Vec<std::sync::Arc<aterm_keeper::client::ReadObserver>>,
+) {
+    let _ = STARTUP.keeper_cohort.set(cohort);
+}
+
+/// Mark a control request past the recovery-count fence: the first one stays.
+pub(crate) fn mark_keeper_served() {
+    if STARTUP.keeper_served.get().is_none() {
+        let _ = STARTUP.keeper_served.set(Instant::now());
     }
 }
 
@@ -2324,18 +2472,21 @@ mod keeper_recovery_tests {
     }
 
     /// The boot recovery's readings come from its stamps: `main` to the answered HELLO, and
-    /// from that HELLO to the admission's end, to every session placed and to their imports
-    /// settled, each less the seam's work (which all falls inside the admission); the slowest
-    /// one offer as recorded. Negative controls: no HELLO answered is no reading at all,
-    /// whatever else was stamped; a HELLO whose admission has not ended reads no admission,
-    /// placement or import; no `main` stamp leaves only the HELLO's own reading out; no seam
-    /// work leaves every reading whole.
+    /// from that HELLO to the admission's end, to every session placed, to their imports
+    /// settled, to the fence's last confirming SYNC written, to its lifting and to the first
+    /// control request past it, each less the seam's work (which all falls inside the
+    /// admission); the slowest one offer and the slowest one SYNC's answer as recorded.
+    /// Negative controls: no HELLO answered is no reading at all, whatever else was stamped; a
+    /// HELLO whose admission has not ended reads no admission, placement, import or fence
+    /// moment; no `main` stamp leaves only the HELLO's own reading out; no seam work leaves
+    /// every reading whole.
     #[test]
     fn the_keeper_recovery_reads_from_the_hello_less_the_seam_s_own_work() {
         let main = Instant::now();
         let hello = main + Duration::from_millis(7);
+        let at = |ms| hello + Duration::from_millis(ms);
         let admitted = KeeperAdmitted {
-            at: hello + Duration::from_millis(18),
+            at: at(18),
             offers: 32,
             slowest_ns: 2_000_000,
             seam: spent(32, 32, 12),
@@ -2344,8 +2495,13 @@ mod keeper_recovery_tests {
             main: Some(main),
             hello: Some(hello),
             admitted: Some(admitted),
-            placed: Some(hello + Duration::from_millis(20)),
-            imported: Some(hello + Duration::from_millis(31)),
+            placed: Some(at(20)),
+            imported: Some(at(31)),
+            fence: Some(keeper_fence([
+                Some((at(19), at(23))),
+                Some((at(21), at(22))),
+            ])),
+            served: Some(at(25)),
         };
         let k = keeper_recovery(stamps).expect("answered");
         assert_eq!(
@@ -2357,6 +2513,23 @@ mod keeper_recovery_tests {
             (k.placed_ns, k.imported_ns),
             (Some(8_000_000), Some(19_000_000)),
             "placement and the imports less the seam's 12 ms"
+        );
+        assert_eq!(
+            (
+                k.fence_cohort,
+                k.sync_sent_ns,
+                k.sync_answer_max_ns,
+                k.fence_ns,
+                k.served_ns
+            ),
+            (
+                Some(2),
+                Some(9_000_000),
+                Some(4_000_000),
+                Some(11_000_000),
+                Some(13_000_000)
+            ),
+            "the fence's moments less the seam's 12 ms, its slowest answer whole"
         );
         let unseamed = KeeperStamps {
             admitted: Some(KeeperAdmitted {
@@ -2396,6 +2569,11 @@ mod keeper_recovery_tests {
             "an admission not ended reads nothing after the HELLO"
         );
         assert_eq!(
+            (pending.sync_sent_ns, pending.fence_ns, pending.served_ns),
+            (None, None, None),
+            "nor any fence moment"
+        );
+        assert_eq!(
             keeper_recovery(KeeperStamps {
                 main: None,
                 ..stamps
@@ -2403,6 +2581,75 @@ mod keeper_recovery_tests {
             .map(|k| (k.hello_ns, k.admit_ns)),
             Some((None, Some(6_000_000))),
             "no main stamp"
+        );
+    }
+
+    /// The fence lifts at the last answer read once the keeper confirmed every authority's new
+    /// journal: the last confirming SYNC written and the slowest one answer come with it.
+    /// Negative controls: one authority unconfirmed keeps it shut whatever the others read, and
+    /// an empty cohort, whose fence never closed, has no lifting to read.
+    #[test]
+    fn the_fence_lifts_at_the_last_answer_once_every_authority_is_confirmed() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        assert_eq!(
+            keeper_fence([Some((at(1), at(5))), Some((at(3), at(4)))]),
+            KeeperFence {
+                cohort: 2,
+                lifted: Some(FenceLift {
+                    last_sent: at(3),
+                    last_read: at(5),
+                    slowest_answer_ns: 4_000_000,
+                }),
+            }
+        );
+        assert_eq!(
+            keeper_fence([Some((at(1), at(5))), None, Some((at(3), at(4)))]),
+            KeeperFence {
+                cohort: 3,
+                lifted: None
+            },
+            "one authority unconfirmed"
+        );
+        assert_eq!(
+            keeper_fence(std::iter::empty()),
+            KeeperFence {
+                cohort: 0,
+                lifted: None
+            },
+            "no cohort"
+        );
+    }
+
+    /// The ledger reads the fence off its cohort's own observers: shut while the keeper has
+    /// confirmed none, lifted at the confirmed read's answer once a receipt reporting to the
+    /// observer is confirmed.
+    #[cfg(unix)]
+    #[test]
+    fn the_ledger_reads_the_fence_off_its_cohort_s_observers() {
+        use aterm_keeper::client::{CompanionReceipt, ReadObserver};
+        use std::sync::Arc;
+        let startup = Startup::new();
+        assert_eq!(startup.keeper_fence(), None, "no cohort recorded");
+        let observer = Arc::new(ReadObserver::default());
+        let _ = startup.keeper_cohort.set(vec![Arc::clone(&observer)]);
+        assert_eq!(
+            startup.keeper_fence(),
+            Some(KeeperFence {
+                cohort: 1,
+                lifted: None
+            }),
+            "unconfirmed"
+        );
+        CompanionReceipt::reporting_confirmation(Arc::clone(&observer)).confirm_captured();
+        let read = observer.confirmation().expect("confirmed");
+        assert_eq!(
+            startup.keeper_fence().and_then(|f| f.lifted),
+            Some(FenceLift {
+                last_sent: read.sync_sent,
+                last_read: read.answer_read,
+                slowest_answer_ns: duration_ns(read.sync_sent, read.answer_read).expect("ordered"),
+            })
         );
     }
 
@@ -2415,8 +2662,9 @@ mod keeper_recovery_tests {
     }
 
     /// `metrics` spells the fields on every summary: `none` on a launch no keeper answered
-    /// (the negative control), the readings once the stamps are set, and in this build (which
-    /// compiles the seams) what the seam did.
+    /// (the negative control), the readings once the stamps are set (the fence's cohort on a
+    /// platform with a keeper, its SYNC and lift readings `none` while one authority is
+    /// unconfirmed), and in this build (which compiles the seams) what the seam did.
     #[test]
     fn metrics_spells_the_keeper_recovery_or_none() {
         let fields = |startup: &Startup| wire::render_text(|s| startup.emit_keeper_recovery(s));
@@ -2427,8 +2675,10 @@ mod keeper_recovery_tests {
             " startup_keeper_offers=none startup_keeper_hello_ms=none \
              startup_keeper_admit_ms=none startup_keeper_admit_max_ms=none \
              startup_keeper_placed_ms=none startup_keeper_imported_ms=none \
-             startup_keeper_seam_copies=none startup_keeper_seam_plants=none \
-             startup_keeper_seam_ms=none"
+             startup_keeper_fence_cohort=none startup_keeper_sync_sent_ms=none \
+             startup_keeper_sync_answer_max_ms=none startup_keeper_fence_ms=none \
+             startup_keeper_served_ms=none startup_keeper_seam_copies=none \
+             startup_keeper_seam_plants=none startup_keeper_seam_ms=none"
         );
         let answered = Startup::new();
         let main = Instant::now();
@@ -2441,12 +2691,23 @@ mod keeper_recovery_tests {
             seam: spent(2, 1, 1),
         });
         let _ = answered.keeper_placed.set(main + Duration::from_millis(12));
+        let _ = answered.keeper_served.set(main + Duration::from_millis(14));
+        #[cfg(unix)]
+        let _ = answered
+            .keeper_cohort
+            .set(vec![std::sync::Arc::default(), std::sync::Arc::default()]);
+        let cohort = if cfg!(unix) { "2" } else { "none" };
         assert_eq!(
             fields(&answered),
-            " startup_keeper_offers=2 startup_keeper_hello_ms=3.00 startup_keeper_admit_ms=5.00 \
-             startup_keeper_admit_max_ms=4.00 startup_keeper_placed_ms=8.00 \
-             startup_keeper_imported_ms=none startup_keeper_seam_copies=2 \
-             startup_keeper_seam_plants=1 startup_keeper_seam_ms=1.00"
+            format!(
+                " startup_keeper_offers=2 startup_keeper_hello_ms=3.00 \
+                 startup_keeper_admit_ms=5.00 startup_keeper_admit_max_ms=4.00 \
+                 startup_keeper_placed_ms=8.00 startup_keeper_imported_ms=none \
+                 startup_keeper_fence_cohort={cohort} startup_keeper_sync_sent_ms=none \
+                 startup_keeper_sync_answer_max_ms=none startup_keeper_fence_ms=none \
+                 startup_keeper_served_ms=10.00 startup_keeper_seam_copies=2 \
+                 startup_keeper_seam_plants=1 startup_keeper_seam_ms=1.00"
+            )
         );
     }
 }

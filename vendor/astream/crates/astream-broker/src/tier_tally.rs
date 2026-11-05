@@ -1,0 +1,131 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! WHAT A TIER'S READERS AND WRITERS DID, counted: the pushes, the one-record reads by index,
+//! the walks and the rows they read, the subject walks and the pages they read, and the values
+//! read from the wide maps. A measurement says by it how much of the pages' code a piece of
+//! work ran (aterm's attach bench reads it around each restart, its item D10f), so a cost is
+//! put down to the tier, or not, by a count rather than a guess. Only a test or debug build
+//! counts (`Counters` and the broker's readers of them): a shipped broker keeps no counters.
+//! `TierTally` is compiled in every build, so a reader such as aterm's bench names astream's
+//! counts rather than keeping a copy of them.
+
+#[cfg(any(test, debug_assertions))]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A tier's counts since its log was opened ([`BrokerLog::tier_tally`](crate::BrokerLog),
+/// [`Broker::tier_tally`](crate::Broker)). A replica's rebuild of the tier carries them on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TierTally {
+    /// Records pushed: each promoted record (a publish's, a batch's, a replica's) once. An
+    /// open's build of the tier from the records it recovered is not counted.
+    pub pushes: u64,
+    /// One-record reads by index (`summary`, `at`, `bt`), each finding its record's page: a
+    /// cold read is two (its frame's start and the next one's).
+    pub lookups: u64,
+    /// The values read from the wide maps (a frame start or broker time no column holds), by a
+    /// lookup or a walk's row; 0 in a log whose frames are contiguous and whose broker times
+    /// rise within a page.
+    pub wide: u64,
+    /// The walks begun over a range of summaries: a `Stats` reading, a filtered read's scan
+    /// (`Tier::scan`, whose records are rows here, not lookups) or a wake plan's, compaction's,
+    /// the retention planning's (each of its passes one).
+    pub walks: u64,
+    /// The rows those walks read.
+    pub rows: u64,
+    /// The subject walks begun (the pending wills' reading, `Tier::naming`).
+    pub namings: u64,
+    /// The pages those walks read: the pages whose ids name the subject.
+    pub named_pages: u64,
+}
+
+impl TierTally {
+    /// What `self` counted since `before` (each count less `before`'s, saturating at 0).
+    #[must_use]
+    pub fn since(self, before: TierTally) -> TierTally {
+        TierTally {
+            pushes: self.pushes.saturating_sub(before.pushes),
+            lookups: self.lookups.saturating_sub(before.lookups),
+            wide: self.wide.saturating_sub(before.wide),
+            walks: self.walks.saturating_sub(before.walks),
+            rows: self.rows.saturating_sub(before.rows),
+            namings: self.namings.saturating_sub(before.namings),
+            named_pages: self.named_pages.saturating_sub(before.named_pages),
+        }
+    }
+}
+
+/// The counts a tier keeps, as atomics because its readers hold it shared (under the log's
+/// lock, so they never contend).
+#[cfg(any(test, debug_assertions))]
+#[derive(Debug, Default)]
+pub(crate) struct Counters {
+    pushes: AtomicU64,
+    lookups: AtomicU64,
+    wide: AtomicU64,
+    walks: AtomicU64,
+    rows: AtomicU64,
+    namings: AtomicU64,
+    named_pages: AtomicU64,
+}
+
+/// One kind of count.
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Count {
+    Push,
+    Lookup,
+    Wide,
+    Walk,
+    Rows,
+    Naming,
+    NamedPage,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Counters {
+    fn cell(&self, c: Count) -> &AtomicU64 {
+        match c {
+            Count::Push => &self.pushes,
+            Count::Lookup => &self.lookups,
+            Count::Wide => &self.wide,
+            Count::Walk => &self.walks,
+            Count::Rows => &self.rows,
+            Count::Naming => &self.namings,
+            Count::NamedPage => &self.named_pages,
+        }
+    }
+
+    /// Count `n` more of `c`.
+    pub(crate) fn add(&self, c: Count, n: u64) {
+        self.cell(c).fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The counts now.
+    pub(crate) fn read(&self) -> TierTally {
+        let r = |c| self.cell(c).load(Ordering::Relaxed);
+        TierTally {
+            pushes: r(Count::Push),
+            lookups: r(Count::Lookup),
+            wide: r(Count::Wide),
+            walks: r(Count::Walk),
+            rows: r(Count::Rows),
+            namings: r(Count::Naming),
+            named_pages: r(Count::NamedPage),
+        }
+    }
+
+    /// Fresh counters holding `self`'s counts (a rebuilt tier's).
+    pub(crate) fn carried(&self) -> Counters {
+        let t = self.read();
+        Counters {
+            pushes: AtomicU64::new(t.pushes),
+            lookups: AtomicU64::new(t.lookups),
+            wide: AtomicU64::new(t.wide),
+            walks: AtomicU64::new(t.walks),
+            rows: AtomicU64::new(t.rows),
+            namings: AtomicU64::new(t.namings),
+            named_pages: AtomicU64::new(t.named_pages),
+        }
+    }
+}

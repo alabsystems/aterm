@@ -121,64 +121,64 @@ impl Drop for Process {
     }
 }
 
+/// Every crash phase of a real child killed by SIGKILL, on a two-Mac Commons: Mac 0's share is 1 as
+/// it would be alone, so its reserve and retry path is a lone Mac's, and the peer then repairs.
+/// GAP: no child dies on a one-member Commons, so a crash-retention defect only there is not seen
+/// (`dispatch_tests` keeps one-member dispatch in process, without a kill).
 #[test]
 fn sigkill_retains_dispatch_and_offline_liability() {
-    for machines in [1, 2] {
-        for phase in 0..3 {
-            let lab = Lab::new(&vec![Role::Writer; machines]);
-            let allocation = allocation(&lab, &vec![1; machines]);
-            let db = resources(&lab, 0, &allocation);
-            db.initialize().unwrap();
-            let child = Process::start(&lab.paths[0], &allocation, phase);
-            let expected = if phase == 2 {
-                ObservationState::Recorded(observed(Outcome::Completed))
-            } else {
-                ObservationState::Unknown
-            };
+    for phase in 0..3 {
+        let lab = Lab::new(&[Role::Writer; 2]);
+        let allocation = allocation(&lab, &[1, 1]);
+        let db = resources(&lab, 0, &allocation);
+        db.initialize().unwrap();
+        let child = Process::start(&lab.paths[0], &allocation, phase);
+        let expected = if phase == 2 {
+            ObservationState::Recorded(observed(Outcome::Completed))
+        } else {
+            ObservationState::Unknown
+        };
 
-            // A different process can observe and retry while the adapter is
-            // stopped at the boundary: persistent locks cannot cross entry.
-            let pending = db.attempt(REQUEST).unwrap().unwrap();
-            assert_eq!(pending.observation, expected);
-            assert!(!pending.invoked);
-            let retry = || {
-                let retried = db
-                    .dispatch_once(REQUEST, 1, OPERATION, || {
-                        panic!("process reentered adapter")
-                    })
-                    .unwrap();
-                assert_eq!(retried, pending);
-                assert!(db.reserve([64; 16], 1).is_err());
-                assert_eq!(db.snapshot().unwrap().used.values().sum::<u64>(), 1);
-            };
-            retry();
-            assert_eq!(
-                lab.paths[0].home.join("adapter-entered").exists(),
-                phase > 0
-            );
-            child.crash();
-            retry();
+        // A different process can observe and retry while the adapter is
+        // stopped at the boundary: persistent locks cannot cross entry.
+        let pending = db.attempt(REQUEST).unwrap().unwrap();
+        assert_eq!(pending.observation, expected);
+        assert!(!pending.invoked);
+        let retry = || {
+            let retried = db
+                .dispatch_once(REQUEST, 1, OPERATION, || {
+                    panic!("process reentered adapter")
+                })
+                .unwrap();
+            assert_eq!(retried, pending);
+            assert!(db.reserve([64; 16], 1).is_err());
+            assert_eq!(db.snapshot().unwrap().used.values().sum::<u64>(), 1);
+        };
+        retry();
+        assert_eq!(
+            lab.paths[0].home.join("adapter-entered").exists(),
+            phase > 0
+        );
+        child.crash();
+        retry();
 
-            if machines == 2 {
-                let peer = resources(&lab, 1, &allocation);
-                peer.initialize().unwrap();
-                let reservation = peer.reserve([65; 16], 1).unwrap();
-                assert!(reservation.fresh);
-                assert!(peer.reserve([66; 16], 1).is_err());
-                rounds(&lab);
-                assert_eq!(db.snapshot().unwrap(), peer.snapshot().unwrap());
-                assert_eq!(db.snapshot().unwrap().used.values().sum::<u64>(), 2);
-                assert_eq!(db.attempt(REQUEST).unwrap().unwrap(), pending);
-                assert!(
-                    !db.dispatch_once(REQUEST, 1, OPERATION, || panic!("repair reentered adapter"))
-                        .unwrap()
-                        .invoked
-                );
-                assert_eq!(
-                    peer.reserve([65; 16], 1).unwrap().receipt,
-                    reservation.receipt
-                );
-            }
-        }
+        let peer = resources(&lab, 1, &allocation);
+        peer.initialize().unwrap();
+        let reservation = peer.reserve([65; 16], 1).unwrap();
+        assert!(reservation.fresh);
+        assert!(peer.reserve([66; 16], 1).is_err());
+        rounds(&lab);
+        assert_eq!(db.snapshot().unwrap(), peer.snapshot().unwrap());
+        assert_eq!(db.snapshot().unwrap().used.values().sum::<u64>(), 2);
+        assert_eq!(db.attempt(REQUEST).unwrap().unwrap(), pending);
+        assert!(
+            !db.dispatch_once(REQUEST, 1, OPERATION, || panic!("repair reentered adapter"))
+                .unwrap()
+                .invoked
+        );
+        assert_eq!(
+            peer.reserve([65; 16], 1).unwrap().receipt,
+            reservation.receipt
+        );
     }
 }

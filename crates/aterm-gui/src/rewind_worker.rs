@@ -12,7 +12,9 @@ use aterm_control::replay::ReplayEngine;
 use aterm_core::config::TerminalConfig;
 use aterm_core::terminal::{RenderCell, Terminal};
 
-use crate::temporal::{Judged, Passed, ReplayPlan, RewindInstant};
+use crate::temporal::{
+    ChainJudge, FORK_EVERY, Judged, Passed, ReplayPlan, RewindInstant, engine_bytes,
+};
 
 /// Lines past its 1000-line ring a view engine's history keeps (keyframes keep 2048), so a fork copies in bounded time.
 pub(crate) const STORE_LINES: usize = 2048;
@@ -22,9 +24,6 @@ pub(crate) const MAX_FORKS: usize = 32;
 
 /// At most this many bytes of forks are cached.
 pub(crate) const MAX_FORK_BYTES: usize = 32 * 1024 * 1024;
-
-/// Output folded between the forks the cache keeps, and the most an idle pass folds before it looks for an ask.
-pub(crate) const FORK_EVERY: usize = 64 * 1024;
 
 /// Which fold of which view a fold is; view ids are unique in the process, so a closed view's late fold names no later view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,7 +214,9 @@ impl Drop for RewindWorker {
 
 fn run(rx: &Receiver<Job>, post: &impl Fn(Done) -> bool, cancelled: &AtomicU64, busy: &AtomicBool) {
     let mut cache = Cache::default();
-    let mut judging: Option<Judging> = None;
+    let mut judging: Option<ChainJudge> = None;
+    // The session the judge's verdicts go to.
+    let mut judging_session = 0;
     let mut warm: Option<Warm> = None;
     loop {
         let job = match rx.try_recv() {
@@ -223,8 +224,8 @@ fn run(rx: &Receiver<Job>, post: &impl Fn(Done) -> bool, cancelled: &AtomicU64, 
             Err(TryRecvError::Disconnected) => return,
             Err(TryRecvError::Empty) => {
                 if let Some(j) = judging.as_mut() {
-                    let (judged, more) = j.step();
-                    let session = j.session;
+                    let (judged, _, more) = j.step();
+                    let session = judging_session;
                     if !more {
                         judging = None;
                     }
@@ -252,8 +253,10 @@ fn run(rx: &Receiver<Job>, post: &impl Fn(Done) -> bool, cancelled: &AtomicU64, 
             Job::Show(show) => {
                 let session = show.session;
                 let (folded, judge, around, near) = cache.show(show);
-                if let Some(plan) = judge {
-                    Judging::extend(&mut judging, session, plan);
+                if let Some(plan) = judge
+                    && ChainJudge::extend(&mut judging, plan)
+                {
+                    judging_session = session;
                 }
                 warm = Some(Warm::new(around, near));
                 Done::Shown(Box::new(folded))
@@ -270,42 +273,6 @@ fn run(rx: &Receiver<Job>, post: &impl Fn(Done) -> bool, cancelled: &AtomicU64, 
         if !post(done) {
             return;
         }
-    }
-}
-
-/// A judging fold toward the witness that covers a shown instant, on an engine that keeps its whole history, [`FORK_EVERY`] bytes a pass.
-struct Judging {
-    session: u64,
-    plan: ReplayPlan,
-    engine: ReplayEngine,
-    at: Seq,
-}
-
-impl Judging {
-    /// Judge `plan` too: on `judging`'s chain, carry its fold on to the further witness; on another, start over.
-    fn extend(judging: &mut Option<Self>, session: u64, plan: ReplayPlan) {
-        match judging.as_mut() {
-            Some(j) if j.plan.base_seq() == plan.base_seq() => {
-                if plan.end_seq() > j.plan.end_seq() {
-                    j.plan = plan;
-                }
-            }
-            _ => {
-                *judging = Some(Self {
-                    session,
-                    engine: plan.restore(),
-                    at: plan.base_seq(),
-                    plan,
-                });
-            }
-        }
-    }
-
-    /// One pass: the verdicts it reached and whether steps are left.
-    fn step(&mut self) -> (Judged, bool) {
-        let (judged, last, more) = self.plan.judge_onto(&mut self.engine, self.at, FORK_EVERY);
-        self.at = last;
-        (judged, more)
     }
 }
 
@@ -644,7 +611,7 @@ impl Cache {
     }
 }
 
-/// Fold the chains in `changed` newest first, reading the cell at each steppable instant, back to the instant that changed it: the start of the run of instants that show it as the asked one does, or of the run before when the asked instant starts its own and the last search found it. The walk stops at an instant a live witness contradicts, and gives up with `None` once `go_on` says no.
+/// Fold the chains in `changed` newest first, reading the cell at each steppable instant, back to the instant that changed it: the start of the run of instants that show it as the asked one does, or of the run before when the asked instant starts its own and the last search found it. The walk stops at an instant a live witness contradicts, the asked one included, and gives up with `None` once `go_on` says no.
 fn search(changed: Changed, go_on: &dyn Fn() -> bool) -> Option<Found> {
     let Changed {
         session,
@@ -686,6 +653,12 @@ fn search(changed: Changed, go_on: &dyn Fn() -> bool) -> Option<Found> {
         }
         for reading in readings.into_iter().rev() {
             let Some((value, oldest)) = run.as_mut() else {
+                // The shown instant itself: a judged witness refuses it before the search starts, but a pending one only its chain's fold finds.
+                if reading.contradicted {
+                    found.at = Some(reading.at);
+                    found.change = Change::Unknown;
+                    return Some(found);
+                }
                 run = Some((reading.cell.clone(), reading));
                 continue;
             };
@@ -733,7 +706,7 @@ struct Tail {
     resize: Option<(u16, u16)>,
 }
 
-/// Fold `plan`'s chain from its base, reading `cell` at each of `instants` in `[plan.base_ts(), until)`, and what it folds after the last of them; `None` once `go_on` says no.
+/// Fold `plan`'s chain from its base, reading `cell` at each of `instants` in `[plan.base_ts(), until)`, and what it folds after the last of them; `None` once `go_on` says no. A pending witness the fold passes that differs from the replay ([`ReplayPlan::fold_before`]) contradicts every reading from the pending witness before it, or the chain's base, to the chain's end; the fold is bounded, so it posts no verdict.
 fn read_chain(
     plan: &ReplayPlan,
     instants: &[(RewindInstant, bool)],
@@ -750,7 +723,7 @@ fn read_chain(
         bytes: Vec::new(),
         resize: None,
     };
-    let base = (plan.base_ts(), plan.live_base());
+    let base = (plan.base_ts(), plan.stands_in());
     let mut read = |before: Ticks, engine: &ReplayEngine, tail: &mut Tail| {
         while let Some((instant, contradicted)) = ahead.next_if(|(i, _)| i.at < before) {
             readings.push(Reading {
@@ -763,24 +736,41 @@ fn read_chain(
             });
         }
     };
+    // The tick the replay is untrusted from, once a pending witness it passed differs from it.
+    let mut untrusted: Option<Ticks> = None;
+    let mut last_witness = plan.base_ts();
     let mut replay = plan.restore_bounded(STORE_LINES);
-    let whole = plan.fold_before(&mut replay, |passed: Passed<'_>, engine| {
-        if !go_on() {
-            return false;
-        }
-        read(passed.ts, engine, &mut tail);
-        if let Some(b) = passed.bytes {
-            tail.bytes.extend_from_slice(b);
-        }
-        if passed.resize.is_some() {
-            tail.resize = passed.resize;
-        }
-        true
-    });
+    let whole = plan.fold_before(
+        &mut replay,
+        |passed: Passed<'_>, engine| {
+            if !go_on() {
+                return false;
+            }
+            read(passed.ts, engine, &mut tail);
+            if let Some(b) = passed.bytes {
+                tail.bytes.extend_from_slice(b);
+            }
+            if passed.resize.is_some() {
+                tail.resize = passed.resize;
+            }
+            true
+        },
+        |at, differs| {
+            if differs {
+                untrusted.get_or_insert(last_witness);
+            }
+            last_witness = at;
+        },
+    );
     if !whole {
         return None;
     }
     read(until, &replay, &mut tail);
+    if let Some(from) = untrusted {
+        for reading in readings.iter_mut().filter(|r| r.at >= from) {
+            reading.contradicted = true;
+        }
+    }
     Some((readings, tail))
 }
 
@@ -814,15 +804,8 @@ fn cell_words(term: &Terminal, (row, col): (u16, u16)) -> Option<CellWords> {
     Some(CellWords { look, text, lead })
 }
 
-/// The memory `engine` holds: both grids and their stores.
-/// Unbooked Kitty store and visible-cell image payloads are added on top.
-fn engine_bytes(engine: &ReplayEngine) -> usize {
-    let term = engine.terminal();
-    term.grid()
-        .memory_used()
-        .saturating_add(
-            term.inactive_grid()
-                .map_or(0, aterm_core::grid::Grid::memory_used),
-        )
-        .saturating_add(term.unbooked_image_bytes())
+/// [`search`] to its end, as the worker runs it for a view's cell search.
+#[cfg(test)]
+pub(crate) fn search_to_end(changed: Changed) -> Option<Found> {
+    search(changed, &|| true)
 }

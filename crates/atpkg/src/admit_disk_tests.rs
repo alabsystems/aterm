@@ -43,6 +43,7 @@ fn verify_run(dir: &Path) -> Run {
         cold: 27 * GIB,
         on: PathBuf::from("/Volumes/scratch"),
         stuck_ends: None,
+        machine: None,
     }
 }
 
@@ -688,12 +689,10 @@ fn the_runs_own_pass_keeps_its_directories_and_frees_the_rest() {
 
 /// A CLAIM THAT DOES NOT FIT IS NOT A VOLUME BELOW ITS FLOOR: a relief asks for the hour's wait on
 /// a live worktree's stale parts only where nothing stands above the floor. Above it, the wait
-/// stays three days, while a gone workspace's build directory goes as it does below.
+/// stays three days (a gone workspace's build directory has no wait at either).
 #[test]
 fn a_claims_relief_waits_the_hour_only_below_the_floor() {
-    use crate::build_cache::{
-        RECLAIM_GONE_UNDER_PRESSURE, RECLAIM_STALE, RECLAIM_STALE_UNDER_PRESSURE,
-    };
+    use crate::build_cache::{RECLAIM_STALE, RECLAIM_STALE_UNDER_PRESSURE};
     let relieved = |above_floor: u64| {
         let seen = std::sync::Arc::new(Mutex::new(None));
         let theirs = std::sync::Arc::clone(&seen);
@@ -721,12 +720,88 @@ fn a_claims_relief_waits_the_hour_only_below_the_floor() {
     };
 
     let after = relieved(12 * GIB);
-    assert_eq!(after.gone, RECLAIM_GONE_UNDER_PRESSURE);
     assert_eq!(after.stale, RECLAIM_STALE);
 
     let after = relieved(0);
-    assert_eq!(after.gone, RECLAIM_GONE_UNDER_PRESSURE);
     assert_eq!(after.stale, RECLAIM_STALE_UNDER_PRESSURE);
+}
+
+/// A RELIEF IS RENEWED BY A WORKSPACE REMOVED WHILE ITS RUN WAITS: a build directory the gone
+/// listing did not hold as its pass began renews it ([`aterm_capacity::Relief::renewed`]), one
+/// removed while that pass ran included; one it did hold (a build kept it) does not, and the next
+/// pass's listing is the new mark. NEGATIVE CONTROLS: a relief that watches no listing, or whose
+/// last call was short of no disk (memory alone), is never renewed, so no look relieves again.
+#[test]
+fn a_workspace_removed_while_a_run_waits_renews_its_relief() {
+    use aterm_capacity::Relief as _;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    type Shared<T> = Rc<RefCell<T>>;
+    let reclaim = |during: Shared<Option<PathBuf>>, listed: Shared<Vec<PathBuf>>| {
+        Reclaim::of(
+            Box::new(move |_room: super::Room<'_>, _stopped| {
+                if let Some(leaf) = during.borrow_mut().take() {
+                    listed.borrow_mut().push(leaf);
+                }
+                (0, Vec::new(), Vec::new())
+            }),
+            Box::new(|_, _, _| None),
+            Box::new(|_, _| Vec::new()),
+        )
+    };
+    let listed: Shared<Vec<PathBuf>> =
+        Rc::new(RefCell::new(vec![PathBuf::from("/c/held/.cargo-build")]));
+    let removing: Shared<Option<PathBuf>> = Rc::default();
+    let theirs = Rc::clone(&listed);
+    let mut relief = reclaim(Rc::clone(&removing), Rc::clone(&listed))
+        .watching(Box::new(move || theirs.borrow().iter().cloned().collect()));
+    let short = aterm_capacity::Shortfall {
+        shorts: vec![aterm_capacity::Short::Disk {
+            need: 20 * GIB,
+            mount: PathBuf::from("/Volumes/scratch"),
+            above_floor: 12 * GIB,
+            floor: 10 * GIB,
+            reserved: 0,
+        }],
+        holders: Vec::new(),
+    };
+    relief.relieve(&short, &mut |_| {}, &|| false);
+    assert!(!relief.renewed(&|| false), "what its pass left is no news");
+    listed
+        .borrow_mut()
+        .push(PathBuf::from("/c/removed/.cargo-build"));
+    assert!(
+        relief.renewed(&|| false),
+        "a workspace removed since renews it"
+    );
+    assert!(!relief.renewed(&|| true), "nor once its wait is stopped");
+    relief.relieve(&short, &mut |_| {}, &|| false);
+    assert!(!relief.renewed(&|| false), "the new pass is the new mark");
+    *removing.borrow_mut() = Some(PathBuf::from("/c/mid-pass/.cargo-build"));
+    relief.relieve(&short, &mut |_| {}, &|| false);
+    assert!(
+        relief.renewed(&|| false),
+        "a workspace removed while the pass ran renews the next look"
+    );
+
+    let memory = aterm_capacity::Shortfall {
+        shorts: vec![aterm_capacity::Short::Memory {
+            need: 8 * GIB,
+            margin: 0,
+            available: GIB,
+            reserved: 0,
+        }],
+        holders: Vec::new(),
+    };
+    relief.relieve(&memory, &mut |_| {}, &|| false);
+    assert!(
+        !relief.renewed(&|| false),
+        "short of memory alone: never renewed"
+    );
+
+    let mut blind = reclaim(Rc::default(), Rc::default());
+    blind.relieve(&short, &mut |_| {}, &|| false);
+    assert!(!blind.renewed(&|| false), "watching nothing, never renewed");
 }
 
 /// Set, the test binary is [`standin_claims_disk_until_interrupted`], its ledger and run under
@@ -1344,4 +1419,228 @@ fn a_run_that_asks_to_give_up_behind_a_stuck_holder_does() {
     drop(held);
     let admitted = joined(waiting, "the admission once the holder lets go").expect("admitted");
     let _ = admitted.finish();
+}
+
+/// The machine's record, under `dir`, of [`verify_run`]'s kind, and what such a run builds.
+fn machinewide(dir: &Path) -> super::Machinewide {
+    super::Machinewide {
+        record: dir.join("state/verify/disk-footprint.json"),
+        selection: super::Selection {
+            work: "lint".to_owned(),
+            crates: Some(vec!["aterm-capacity".to_owned()]),
+        },
+    }
+}
+
+/// A [`verify_run`] in the checkout `name` under `dir`, keeping its runs in the machine's record
+/// ([`machinewide`]) where `machine` says so, its build directory holding the verify tool's own
+/// build (`tool` bytes), as a fresh worktree's does once `targo verify` has built the tool.
+fn checkout_run(dir: &Path, name: &str, machine: bool, tool: usize) -> Run {
+    let run = Run {
+        machine: machine.then(|| machinewide(dir)),
+        ..verify_run(&dir.join(name))
+    };
+    std::fs::create_dir_all(&run.dirs[0]).expect("the build directory");
+    std::fs::write(run.dirs[0].join("tool.rlib"), vec![3u8; tool]).expect("the tool's build");
+    run
+}
+
+/// `run` admitted on a volume with room, with a relief that must not be asked.
+fn admit_with_room(run: Run, ledger: &Ledger) -> super::Admitted {
+    let mut never = Reclaim::of(
+        Box::new(|_, _| panic!("reclaimed for a run with room")),
+        Box::new(|_, _, _| panic!("asked for a run with room")),
+        Box::new(|_, _| panic!("named holders for a run with room")),
+    );
+    admit_on(
+        run,
+        ledger,
+        &Fixed::new(image(40, 36)),
+        Admit::Wait,
+        Pace::default(),
+        &mut never,
+        &mut |_| {},
+    )
+    .expect("room")
+}
+
+/// A FRESH WORKTREE WHOSE SCOPE RAN IN ANOTHER CHECKOUT HERE CLAIMS WHAT THAT RUN WROTE, not the
+/// cold budget (V1, DA-MACHINE-FOOTPRINT). The first worktree's run, its build directory holding
+/// only the verify tool's 2 MiB build, claims the cold budget less that, grows its directories by
+/// 3 MiB and passes; the second worktree, holding the same tool build, claims those 3 MiB, read
+/// from that one run in the machine's record, and says so. NEGATIVE CONTROL: a third fresh
+/// worktree whose kind keeps no machine record claims the cold budget less what it holds, as
+/// every fresh worktree did before; and with the machine's lookup dropped from the claim
+/// (`need_of` reading `kept.need` alone) the second worktree claims the same cold figure and
+/// this test fails.
+#[test]
+fn a_fresh_worktree_claims_what_its_scope_wrote_in_another_checkout_here() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("admit-disk-machine-")
+        .tempdir()
+        .expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let tool = 2 << 20;
+    let one = checkout_run(dir.path(), "one", true, tool);
+    let build_one = one.dirs[0].clone();
+    let holds = aterm_capacity::allocated(&one.dirs);
+    let first = admit_with_room(one, &ledger);
+    let e = first.estimate;
+    assert_eq!(
+        (e.bytes, e.runs, e.machine),
+        (27 * GIB - holds, 0, None),
+        "{e}"
+    );
+    std::fs::write(build_one.join("scope.rlib"), vec![4u8; 3 << 20]).expect("the scope's units");
+    let done = first.finish_whole();
+    assert!(
+        done.here.is_ok() && matches!(done.machine, Some(Ok(()))),
+        "both records took it: {done:?}"
+    );
+    let took = done.run;
+    assert_eq!((took.peak, took.grew), (holds + (3 << 20), 3 << 20));
+
+    let two = checkout_run(dir.path(), "two", true, tool);
+    assert_eq!(
+        aterm_capacity::allocated(&two.dirs),
+        holds,
+        "as fresh as the first"
+    );
+    let second = admit_with_room(two, &ledger);
+    let e = second.estimate;
+    assert_eq!(e.bytes, took.grew, "the first run's growth: {e}");
+    assert_eq!(e.runs, 0, "no run of it on its own directories: {e}");
+    let cover = e.machine.expect("read from the machine's record");
+    assert_eq!((cover.runs, cover.selections, cover.exact), (1, 1, true));
+    names(
+        &e.to_string(),
+        &[
+            "3 MiB, the most a run of it in this machine's checkouts wrote",
+            "no run of it measured on these directories",
+        ],
+    );
+    let _ = second.finish_whole();
+
+    let three = checkout_run(dir.path(), "three", false, tool);
+    let holds = aterm_capacity::allocated(&three.dirs);
+    let third = admit_with_room(three, &ledger);
+    let e = third.estimate;
+    assert_eq!((e.bytes, e.machine), (27 * GIB - holds, None), "{e}");
+    assert!(
+        third.finish_whole().machine.is_none(),
+        "its kind keeps no machine record"
+    );
+
+    // A machine record that cannot be written says so, and the run is kept beside its
+    // directories all the same.
+    let mut four = checkout_run(dir.path(), "four", true, tool);
+    let blocked = dir.path().join("blocked");
+    std::fs::write(&blocked, b"a file where the record's folder goes").expect("written");
+    if let Some(m) = four.machine.as_mut() {
+        m.record = blocked.join("disk-footprint.json");
+    }
+    let done = admit_with_room(four, &ledger).finish_whole();
+    assert!(
+        done.here.is_ok() && matches!(done.machine, Some(Err(_))),
+        "{done:?}"
+    );
+}
+
+/// A SCOPE NO RUN HERE COVERS STILL CLAIMS THE COLD BUDGET less what its directories hold: a
+/// fresh worktree's run of other crates than any run kept, or of other checks, reads nothing from
+/// the machine's record. NEGATIVE CONTROL: the same worktree running the kept selection claims
+/// what it wrote.
+#[test]
+fn a_scope_no_run_here_covers_still_claims_the_cold_budget() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("admit-disk-machine-cold-")
+        .tempdir()
+        .expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let m = machinewide(dir.path());
+    aterm_capacity::MachineFootprints::keep(
+        &m.record,
+        m.selection.clone(),
+        super::Footprint {
+            peak: 5 << 20,
+            grew: 3 << 20,
+            at_ms: 1,
+            dirs: Some(1),
+            scope: None,
+        },
+    )
+    .expect("kept");
+    let fresh = |selection: super::Selection| {
+        let mut run = checkout_run(dir.path(), "fresh", true, 2 << 20);
+        run.machine = Some(super::Machinewide {
+            selection,
+            ..machinewide(dir.path())
+        });
+        let holds = aterm_capacity::allocated(&run.dirs);
+        let admitted = admit_with_room(run, &ledger);
+        let e = admitted.estimate;
+        drop(admitted);
+        (e, holds)
+    };
+    let (e, holds) = fresh(super::Selection {
+        work: "lint".to_owned(),
+        crates: Some(vec!["aterm-time".to_owned()]),
+    });
+    assert_eq!(
+        (e.bytes, e.machine),
+        (27 * GIB - holds, None),
+        "other crates: {e}"
+    );
+    let (e, holds) = fresh(super::Selection {
+        work: "lint test".to_owned(),
+        crates: m.selection.crates.clone(),
+    });
+    assert_eq!(
+        (e.bytes, e.machine),
+        (27 * GIB - holds, None),
+        "other checks: {e}"
+    );
+    let (e, _) = fresh(m.selection.clone());
+    assert_eq!(e.bytes, 3 << 20, "the kept selection: {e}");
+}
+
+/// A RUN THAT DID NOT DO ALL ITS WORK IS KEPT FOR ITS OWN DIRECTORIES ALONE: one that failed may
+/// have stopped short of what its scope writes, so the next fresh worktree claims the cold budget
+/// as it would with no run kept, while the run's own checkout claims what it grew. NEGATIVE
+/// CONTROL: the same run finished whole is what the next fresh worktree claims.
+#[test]
+fn a_run_that_did_not_pass_is_kept_for_its_own_directories_alone() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("admit-disk-machine-failed-")
+        .tempdir()
+        .expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let one = checkout_run(dir.path(), "one", true, 2 << 20);
+    let build_one = one.dirs[0].clone();
+    let first = admit_with_room(one.clone(), &ledger);
+    std::fs::write(build_one.join("scope.rlib"), vec![4u8; 1 << 20]).expect("written");
+    let _ = first.finish();
+    assert!(
+        aterm_capacity::MachineFootprints::load(&machinewide(dir.path()).record)
+            .rows()
+            .is_empty(),
+        "nothing kept for the machine"
+    );
+    let e = admit_with_room(one.clone(), &ledger).estimate;
+    assert_eq!((e.bytes, e.runs), (1 << 20, 1), "its own directories: {e}");
+    let two = checkout_run(dir.path(), "two", true, 2 << 20);
+    let holds = aterm_capacity::allocated(&two.dirs);
+    let e = admit_with_room(two.clone(), &ledger).estimate;
+    assert_eq!(e.bytes, 27 * GIB - holds, "a fresh worktree: {e}");
+
+    // Its checkout held the tool, the failed run's 1 MiB and its record when it ran whole, so a
+    // fresh one, holding the tool alone, writes what it takes to bring its directories to that
+    // run's peak: those 1 MiB, its 2 MiB and the record's block.
+    let again = admit_with_room(one, &ledger);
+    std::fs::write(build_one.join("more.rlib"), vec![5u8; 2 << 20]).expect("written");
+    let took = again.finish_whole().run;
+    assert_eq!(took.grew, 2 << 20);
+    let e = admit_with_room(two, &ledger).estimate;
+    assert_eq!(e.bytes, took.peak - holds, "the run finished whole: {e}");
+    assert!((3 << 20..(3 << 20) + (64 << 10)).contains(&e.bytes), "{e}");
 }

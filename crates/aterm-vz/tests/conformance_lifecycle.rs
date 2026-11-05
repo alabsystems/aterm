@@ -23,10 +23,10 @@
 //!   action ([`StepEvidence`], [`xref::check_closure`]).
 //! - Negative controls: each planted defect ([`aterm_vz::fault`]), and each defective caller
 //!   the harness plays, is the walk's first disagreement (or, where a case the walk meets
-//!   later matters, the step after a path the model admits: [`control_at`]), which no step of
-//!   the model admits and which is exactly its mutant's step, breaking that mutant's law. A
-//!   helper that waits forever on its hard stop is no mutant's step: the walk sees it at
-//!   `HardTimeout`.
+//!   later matters or the walk there is costly, the step after a path the model admits:
+//!   [`control_at`]), which no step of the model admits and which is exactly its mutant's step,
+//!   breaking that mutant's law. A helper that waits forever on its hard stop is no mutant's
+//!   step: the walk sees it at `HardTimeout`.
 //!
 //! Every wait for something that must happen is a one-minute hang detector; only the lab's
 //! "answers nothing" span is short, since nothing must happen within it.
@@ -2181,7 +2181,7 @@ fn control(
 /// The real system after `path`, which agrees with the model step for step, then `last`
 /// (with `fault` armed for it, or a defective caller the harness plays): no step of the
 /// healthy model admits what it did, and `mutant`'s step does, breaking `law`. For a defect
-/// the walk's first disagreement meets elsewhere first.
+/// the walk's first disagreement meets elsewhere first, or that a walk is costly to reach.
 fn control_at(
     path: &[&'static str],
     last: &'static str,
@@ -2228,6 +2228,8 @@ fn tier1_a_command_connection_on_a_booting_vm_is_rejected() {
     );
 }
 
+/// The one control of this fault. Its site reads no phase, so this stands for a VM still ready too;
+/// a defect that dropped an exit only while ready goes unseen.
 #[test]
 fn tier1_an_exit_dropped_on_a_stopping_vm_is_rejected() {
     control_at(
@@ -2344,25 +2346,21 @@ fn tier1_a_live_disk_cloned_from_a_partial_bake_is_rejected() {
     );
 }
 
+/// On the path the walk first meets this defect by, a sealed bake and then a new start, rather than
+/// walking there. That the walk still reaches a sealed bake goes unasserted here;
+/// [`tier1_a_second_helper_past_the_flock_boots_a_second_vm_on_the_live_disk`] stays on the walk as
+/// its check that it still reaches this deep.
 #[test]
 fn tier1_a_sealed_disk_handed_out_writable_is_rejected() {
-    control(
-        Some(Fault::AttachBaked),
-        None,
+    control_at(
+        &[
+            "UpLocks", "Start", "Attach", "Prepare", "Boot", "Hello", "Ready", "Stopped", "Seal",
+            "Start", "Attach",
+        ],
         "Prepare",
+        Some(Fault::AttachBaked),
         "AttachBaked",
         "SealedNeverAttached",
-    );
-}
-
-#[test]
-fn tier1_a_command_whose_exit_is_dropped_is_rejected() {
-    control(
-        Some(Fault::DropExit),
-        None,
-        "ExecExit",
-        "DropExit",
-        "EveryExecEndsOnce",
     );
 }
 

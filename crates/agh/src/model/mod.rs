@@ -433,7 +433,7 @@ pub struct KeyObject {
 /// A git ref (`GET /repos/{o}/{r}/git/ref/{name}`, `POST …/git/refs`).
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct RefObject {
-    /// `refs/heads/…` or `refs/tags/…`.
+    /// A fully qualified Git ref.
     #[serde(rename = "ref")]
     pub reference: String,
     /// The API URL of the ref.

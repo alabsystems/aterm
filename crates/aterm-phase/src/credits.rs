@@ -66,7 +66,8 @@ pub struct Warning {
 #[must_use]
 pub fn in_use(rows: &[String]) -> Option<Credits> {
     let mut found: Option<Credits> = None;
-    for segment in segments(rows) {
+    let transcript = crate::phase::Transcript::of(rows);
+    for segment in segments(rows, &transcript) {
         for head in [
             crate::anchor!("credits.started"),
             crate::anchor!("credits.allocation_started"),
@@ -162,7 +163,8 @@ fn started(rest: &str) -> Started {
 #[must_use]
 pub fn usage_warning(rows: &[String]) -> Option<Warning> {
     let lead = const { crate::anchor!("usage.warning") };
-    segments(rows).find_map(|segment| {
+    let transcript = crate::phase::Transcript::of(rows);
+    segments(rows, &transcript).find_map(|segment| {
         let rest = segment.strip_prefix(lead)?.strip_prefix(' ')?;
         let (pct, rest) = rest.split_once("% of your ")?;
         let pct: u8 = pct
@@ -180,31 +182,39 @@ pub fn usage_warning(rows: &[String]) -> Option<Warning> {
     })
 }
 
-/// The right segments of the rows a notification is drawn on, the footer's first.
-fn segments(rows: &[String]) -> impl Iterator<Item = &str> {
+/// The right segments of the rows a notification is drawn on, the footer's first: a footer row
+/// whole and against the composer's width, a row over the composer read on its `transcript`, up
+/// to the side panel's rule and against its room ([`crate::phase::Transcript`]), the right edge a
+/// notice stands against beside the panel.
+fn segments<'a>(
+    rows: &'a [String],
+    transcript: &'a crate::phase::Transcript<'_>,
+) -> impl Iterator<Item = &'a str> {
     use crate::phase::{composer_frame, footer_end, status_block};
     use crate::wall::{in_queued_message, right_segment};
     let frame = composer_frame(rows);
     let width = frame.map_or(0, |f| {
         crate::text::trim_end(&rows[f.bottom]).chars().count()
     });
-    let reaches = move |row: &str| row.chars().count() + 3 >= width;
+    let room = transcript.room(width);
+    let said: &'a [String] = &transcript.rows;
+    let reaches = |row: &str, width: usize| row.chars().count() + 3 >= width;
     let footer = frame
         .map(|f| f.bottom + 1..footer_end(rows, f.bottom + 1))
         .into_iter()
         .flatten()
         .filter_map(move |i| {
             let row = crate::text::trim_end(&rows[i]);
-            reaches(row).then(|| right_segment(row).1)
+            reaches(row, width).then(|| right_segment(row).1)
         });
     let zone = frame
         .map(|f| {
             let block = status_block(rows, f.top);
             let under = block.status.map_or(f.top, |s| s + 1);
             (under..f.top).filter_map(move |i| {
-                let row = crate::text::trim_end(&rows[i]);
-                let queued = block.status.is_some_and(|s| in_queued_message(rows, s, i));
-                (reaches(row) && !queued).then(|| right_segment(row).1)
+                let row = crate::text::trim_end(&said[i]);
+                let queued = block.status.is_some_and(|s| in_queued_message(said, s, i));
+                (reaches(row, room) && !queued).then(|| right_segment(row).1)
             })
         })
         .into_iter()

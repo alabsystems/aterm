@@ -444,6 +444,7 @@ fn fresh_log(log: &std::path::Path) -> std::io::Result<()> {
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(log)
         .map(drop)
 }

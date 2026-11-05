@@ -13,6 +13,16 @@ use super::codex_renewal::{self as renewal, Identity, Receipt, ReceiptWriter, Su
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub(super) struct LaunchUse(());
+
+pub(super) struct WallUse(super::provider_read::Account);
+
+impl super::provider_read::WallDoor for WallUse {
+    fn account(self) -> super::provider_read::Account {
+        self.0
+    }
+}
+
 pub trait UsageReader {
     fn read(
         &self,
@@ -20,6 +30,7 @@ pub trait UsageReader {
         expected_email: Option<&str>,
         now: i64,
         wait: Duration,
+        use_token: super::provider_read::Use,
     ) -> Option<IdentifiedUsage>;
 }
 
@@ -54,6 +65,7 @@ impl UsageReader for LiveUsage<'_> {
         expected_email: Option<&str>,
         now: i64,
         wait: Duration,
+        use_token: super::provider_read::Use,
     ) -> Option<IdentifiedUsage> {
         codex_app_login::read_identified_login_with_config(
             home,
@@ -62,6 +74,7 @@ impl UsageReader for LiveUsage<'_> {
             wait,
             now,
             expected_email,
+            use_token,
         )
     }
 }
@@ -457,7 +470,7 @@ pub fn prepare(
     reader: &dyn UsageReader,
     wait: Duration,
 ) -> Result<Option<Proposal>, &'static str> {
-    prepare_with(
+    prepare_quota_wall(
         seat,
         session,
         expected_source,
@@ -481,7 +494,7 @@ pub fn prepare_exec<R: Clone>(
     wait: Duration,
     mut command: impl FnMut(&Row) -> Option<super::codex_exec_handoff::ExecCommand>,
 ) -> Result<Option<Proposal<super::codex_exec_handoff::ExecCommand>>, &'static str> {
-    prepare_with(
+    prepare_quota_wall(
         seat,
         session,
         expected_source,
@@ -499,7 +512,7 @@ pub fn prepare_exec<R: Clone>(
     )
 }
 
-fn prepare_with<T, R: Clone>(
+fn prepare_quota_wall<T, R: Clone>(
     seat: &Seat<'_>,
     session: &Session<'_, R>,
     expected_source: &Identity,
@@ -551,8 +564,19 @@ fn prepare_with<T, R: Clone>(
     if left.is_zero() {
         return Ok(None);
     }
-    let Some(observed) = reader.read(&old_auth, source.expected_identity_email(), seat.now, left)
-    else {
+    let use_token =
+        super::provider_read::Use::wall_read_use(WallUse(super::provider_read::Account::in_home(
+            super::provider_read::Read::CodexEndpoint,
+            &old_auth,
+            Some(&source.label),
+        )));
+    let Some(observed) = reader.read(
+        &old_auth,
+        source.expected_identity_email(),
+        seat.now,
+        left,
+        use_token,
+    ) else {
         return Ok(None);
     };
     if observed.identity != *expected_source {
@@ -571,6 +595,7 @@ fn prepare_with<T, R: Clone>(
         at: Some(seat.now),
     };
     let mut selected = None;
+    let mut launch = super::provider_read::Launch::launch_use(LaunchUse(()));
     let mut reads = Vec::new();
     let mut admit = |row: &Row| {
         let left = remaining();
@@ -579,8 +604,23 @@ fn prepare_with<T, R: Clone>(
         }
         let new_auth = row_auth(seat, row);
         let context = seat.store(Cli::Codex).capture_auth_context(row);
-        let Some(usage) = reader.read(&new_auth, row.expected_identity_email(), seat.now, left)
-        else {
+        let Some(use_token) = super::provider_read::Use::launch_read_use(
+            &mut launch,
+            super::provider_read::Account::in_home(
+                super::provider_read::Read::CodexEndpoint,
+                &new_auth,
+                Some(&row.label),
+            ),
+        ) else {
+            return false;
+        };
+        let Some(usage) = reader.read(
+            &new_auth,
+            row.expected_identity_email(),
+            seat.now,
+            left,
+            use_token,
+        ) else {
             return false;
         };
         reads.push(accounts_pool::FreshRead {

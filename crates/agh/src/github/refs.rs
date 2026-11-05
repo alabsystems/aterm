@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Git refs (design §9.4): read one, create one (OneShot, journaled), and delete one only
+//! Git refs (design §9.4): read one, create one (OneShot, journaled), update a
+//! repository-bound batch atomically, and delete one only
 //! if it still points where the caller expects, through `git push --force-with-lease`
 //! (`DELETE git/refs` takes no expected sha).
 
@@ -20,6 +21,11 @@ use crate::retry::Idempotency;
 use crate::slug::Slug;
 use crate::wire::Method;
 use crate::write::{Deleted, Effect, Ensured, Outcome, WriteOp};
+
+mod atomic;
+pub(crate) use atomic::ATOMIC_KEY;
+pub(crate) use atomic::AtomicRefWrite;
+pub use atomic::{AtomicRefBatch, RefUpdate};
 
 /// GitHub's 422 message for a ref that exists (design §9.4).
 const ALREADY_EXISTS: &str = "Reference already exists";
@@ -276,9 +282,14 @@ impl<'a> Refs<'a> {
     /// The repository read's error; Forbidden `NoPush` when the answer says push is not
     /// granted, Forbidden `other` when it carries no permissions block.
     pub(crate) fn push_check(&self) -> Result<()> {
+        self.push_repo().map(|_| ())
+    }
+
+    /// The repository whose writer permission the guard read established.
+    fn push_repo(&self) -> Result<crate::model::RepoObject> {
         let repo = self.gh.repos().how(self.how.clone()).get(&self.slug)?;
-        let (sub, why) = match repo.permissions {
-            Some(permissions) if permissions.push => return Ok(()),
+        let (sub, why) = match &repo.permissions {
+            Some(permissions) if permissions.push => return Ok(repo),
             Some(_) => (crate::error::Forbid::NoPush, "push is not granted"),
             None => (
                 crate::error::Forbid::Other,

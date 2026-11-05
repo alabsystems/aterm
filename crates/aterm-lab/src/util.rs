@@ -379,12 +379,165 @@ pub fn output_claimed(
     Ok(out)
 }
 
-/// Atomically replaces `path` with `bytes` via [`crate::sys::put`].
+/// Atomically replaces `path` with `bytes` via [`atomic_write_mode`], through no link: the
+/// writer for the lab's own scratch. A file in a folder the person named is [`write_out`].
 ///
 /// # Errors
-/// A link on the way, or the write or the rename failing.
+/// As [`atomic_write_mode`].
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    crate::sys::put(path, 0o644, &crate::sys::PutSrc::Bytes(bytes))
+    atomic_write_mode(path, bytes, 0o644)
+}
+
+/// Atomically replaces `path` with `bytes` and `mode` via [`crate::sys::put`], which walks
+/// `path` from `/` through no link: a link a program under test planted in the lab's own
+/// scratch (its HOME, a world's folders) never redirects the write into another file.
+///
+/// # Errors
+/// A relative `path`, a link on the way, or the write or the rename failing.
+pub fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    crate::sys::put(path, mode, &crate::sys::PutSrc::Bytes(bytes))
+}
+
+/// Atomically replaces `path` with `bytes` in a folder the person named (a gallery's or a
+/// report's output, the checkout) via [`aterm_uds::atomic_file::write`]: the folders on the way
+/// are theirs and may be links, as `/tmp` is; a link at `path` itself is refused. The lab's own
+/// scratch is written with [`atomic_write`].
+///
+/// # Errors
+/// A link at `path`, or the write or the rename failing.
+pub fn write_out(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    aterm_uds::atomic_file::write(path, bytes, 0o644)
+}
+
+/// Creates or truncates a regular file at `path` for writing with
+/// `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`.
+///
+/// # Errors
+/// Returns an error if `path` cannot be opened, is a symlink, or is not a regular file.
+pub fn create_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    f.set_len(0)?;
+    Ok(f)
+}
+
+/// Opens or creates a regular file at `path` for appending with
+/// `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`.
+///
+/// # Errors
+/// Returns an error if `path` cannot be opened, is a symlink, or is not a regular file.
+pub fn append_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(f)
+}
+
+/// Exclusively creates a regular file at `path` for writing with `mode` and
+/// `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`.
+///
+/// # Errors
+/// Returns an error if `path` already exists or cannot be created.
+pub fn create_new_regular_file(path: &Path, mode: u32) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// Copies a regular file at `from` (`O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`) to a fresh or
+/// truncated regular file at `to` (`O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`), preserving permissions.
+///
+/// # Errors
+/// Returns an error if `from` or `to` is a symlink or non-regular file, or if reading/writing fails.
+pub fn copy_regular_file(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
+    let (mut reader, meta) = aterm_uds::regular_file::open(from.as_ref())?;
+    let mut writer = create_regular_file(to.as_ref())?;
+    let copied = std::io::copy(&mut reader, &mut writer)?;
+    writer.set_permissions(meta.permissions())?;
+    Ok(copied)
+}
+
+/// Unlinks any existing entry at `path` and opens a fresh regular file with `O_CREAT | O_EXCL`
+/// and `O_NOFOLLOW | O_CLOEXEC` (without `O_NONBLOCK`, so it is safe to pass as child stdio).
+///
+/// # Errors
+/// Returns an error if `path` cannot be created exclusively.
+pub fn create_stdio_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let _ = std::fs::remove_file(path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// Unlinks any existing entry at `path` and writes `bytes` into a fresh regular file.
+///
+/// # Errors
+/// Returns an error if `path` cannot be created or written.
+pub fn write_fresh(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
+    use std::io::Write as _;
+    create_stdio_file(path)?.write_all(bytes.as_ref())
+}
+
+/// Unlinks any existing entry at `path`, writes `bytes` into a fresh regular file, and sets `mode`
+/// on the open file descriptor.
+///
+/// # Errors
+/// Returns an error if `path` cannot be created, written, or have its mode set.
+pub fn write_fresh_mode(path: &Path, bytes: impl AsRef<[u8]>, mode: u32) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut file = create_stdio_file(path)?;
+    file.write_all(bytes.as_ref())?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+}
+
+/// Sets `mode` on directory `dir` via an `O_DIRECTORY | O_NOFOLLOW` descriptor, refusing symlinks.
+///
+/// # Errors
+/// Returns an error if `dir` is not a directory or its permissions cannot be set.
+pub fn set_dir_mode_nofollow(dir: &Path, mode: u32) -> io::Result<()> {
+    aterm_uds::private_file::set_dir_mode_nofollow(dir, mode)
+}
+
+/// Creates `dir` and any missing ancestors with mode `0700` and narrows `dir` to `0700` without
+/// following symlinks.
+///
+/// # Errors
+/// Returns an error if `dir` cannot be created or narrowed to `0700`.
+pub fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    set_dir_mode_nofollow(dir, 0o700)
 }
 
 /// Reads a scratch file via [`crate::sys::scratch_read`], or returns empty.

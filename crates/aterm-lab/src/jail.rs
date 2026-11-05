@@ -164,9 +164,13 @@ fn codex_package_root(exe: &str, homes: &[&str]) -> Option<String> {
     {
         return None;
     }
-    let manifest = crate::sys::scratch_file(&root.join(PACKAGE_JSON)).ok()??;
+    let (manifest, meta) = crate::sys::scratch_file_with_meta(&root.join(PACKAGE_JSON)).ok()??;
     const LIMIT: u64 = 1024 * 1024;
-    let mut text = String::new();
+    if meta.len() > LIMIT {
+        return None;
+    }
+    let mut text =
+        String::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     manifest.take(LIMIT + 1).read_to_string(&mut text).ok()?;
     if text.len() as u64 > LIMIT {
         return None;

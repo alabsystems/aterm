@@ -138,6 +138,7 @@ pub(super) fn launched_job(
         verify_staged_candidate,
         grant_chunks: false,
         grant_empty: false,
+        grant_desk: false,
         sessionless: false,
         installed_activation,
         bundle: None,

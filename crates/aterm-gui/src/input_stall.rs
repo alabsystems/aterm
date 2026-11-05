@@ -402,12 +402,16 @@ pub(crate) fn pid_task_info(pid: libc::pid_t) -> Option<libc::proc_taskinfo> {
 
 #[cfg(target_os = "linux")]
 fn linux_proc_stat_after_comm(pid: libc::pid_t) -> Option<String> {
-    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
     if pid <= 1 {
         return None;
     }
     let path = format!("/proc/{pid}/stat");
-    let file = std::fs::File::open(&path).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&path)
+        .ok()?;
     let meta = file.metadata().ok()?;
     // SAFETY: `geteuid` is a side-effect-free libc getter.
     let ours = unsafe { libc::geteuid() };
@@ -2695,6 +2699,8 @@ pub(crate) mod tests {
 
     fn hosted_claude(sid: &str) -> aterm_agent::harness::relaunch::Snapshot {
         let snap = aterm_agent::harness::relaunch::Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: sid.to_string(),

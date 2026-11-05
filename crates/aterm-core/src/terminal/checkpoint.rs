@@ -399,21 +399,30 @@ impl ReplayCarry {
             .map_or(0, |cmd| cmd.payload.capacity())
     }
 
-    /// Distinct Kitty image and in-flight chunk payload bytes retained by this carry.
+    /// Distinct Kitty image and in-flight chunk payload bytes retained by this carry: [`Self::pending_transfer_bytes`] and the payload of each image [`Self::for_each_retained_image`] visits.
     #[must_use]
     pub fn retained_image_bytes(&self) -> usize {
+        let mut total = self.pending_transfer_bytes();
+        self.for_each_retained_image(|img| total = total.saturating_add(img.payload_bytes()));
+        total
+    }
+
+    /// Visit once each distinct image this carry keeps alive (one `Arc` several of its tables share is one image): the Kitty store's images, animation frames, variants and their sources, virtual and floating placements, and the inline and Kitty spans on both grids' visible rows and carried history. Each `Arc` is shared with the engine the carry was taken from, and with every other carry taken while that engine held it.
+    pub fn for_each_retained_image(
+        &self,
+        mut f: impl FnMut(&std::sync::Arc<aterm_types::ImageData>),
+    ) {
         use aterm_types::ImageData;
         use std::sync::Arc;
         let Some(c) = self.0.as_ref() else {
-            return 0;
+            return;
         };
         let mut seen: Vec<usize> = Vec::new();
-        let mut total = self.pending_transfer_bytes();
         let mut visit = |img: &Arc<ImageData>| {
             let ptr = Arc::as_ptr(img) as usize;
             if let Err(pos) = seen.binary_search(&ptr) {
                 seen.insert(pos, ptr);
-                total = total.saturating_add(img.payload_bytes());
+                f(img);
             }
         };
         for img in c.kitty_images.values() {
@@ -460,7 +469,6 @@ impl ReplayCarry {
                 }
             }
         }
-        total
     }
 
     /// Host alternate-scroll baseline captured with this keyframe, if non-empty.
@@ -2065,11 +2073,13 @@ impl Terminal {
         self.checkpoint_carry(0)
     }
 
-    /// The seamless-handoff projection.
+    /// The seamless-handoff projection, carrying up to `max_history` lines of the history of the
+    /// grid that holds it ([`Self::history_budgets`]).
     #[must_use]
     pub fn checkpoint_carry(&self, max_history: usize) -> Option<TerminalCheckpoint> {
         self.partial_sequence_uncarried().is_none().then(|| {
-            let mut c = self.project_bounded(max_history, 0, true);
+            let (active, inactive) = self.history_budgets(max_history);
+            let mut c = self.project_bounded(active, inactive, true);
             c.shell_integration_nonce = self.carried_shell_integration_nonce();
             c.shell_integration_rev = self.shell_integration_rev().map(str::to_owned);
             c
@@ -2083,13 +2093,20 @@ impl Terminal {
             && self.partial_sequence_swallowed().is_none()
             && !self.partial_sequence_is_shell_mark())
         .then(|| {
-            let (active, inactive) = if self.modes.alternate_screen {
-                (0, bridge)
-            } else {
-                (bridge, 0)
-            };
+            let (active, inactive) = self.history_budgets(bridge);
             self.project_bounded(active, inactive, self.parser_is_ground())
         })
+    }
+
+    /// `lines` of history as (active, inactive) budgets: all of them to the grid that holds the
+    /// history, the active grid on the main screen and the saved primary (the inactive grid)
+    /// while the alternate screen is up, which keeps none.
+    const fn history_budgets(&self, lines: usize) -> (usize, usize) {
+        if self.modes.alternate_screen {
+            (0, lines)
+        } else {
+            (lines, 0)
+        }
     }
 
     /// [`Self::checkpoint_journal`] whose completed shell marks and blocks reach `marks` history lines above the screen, whether or not the bridge carries those lines.
@@ -2103,11 +2120,7 @@ impl Terminal {
             && self.partial_sequence_swallowed().is_none()
             && !self.partial_sequence_is_shell_mark())
         .then(|| {
-            let (active, inactive) = if self.modes.alternate_screen {
-                (0, bridge)
-            } else {
-                (bridge, 0)
-            };
+            let (active, inactive) = self.history_budgets(bridge);
             self.project(
                 active,
                 inactive,
@@ -2128,7 +2141,8 @@ impl Terminal {
             !crate::fault::triggered("checkpoint.carry_projection"),
             "fault injected: the carry projection failed"
         );
-        let mut carry = self.project_bounded(max_history, 0, true);
+        let (active, inactive) = self.history_budgets(max_history);
+        let mut carry = self.project_bounded(active, inactive, true);
         carry.shell_integration_nonce = self.carried_shell_integration_nonce();
         carry.shell_integration_rev = self.shell_integration_rev().map(str::to_owned);
         (carry, self.partial_sequence_uncarried())

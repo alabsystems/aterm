@@ -242,6 +242,11 @@ impl HumanInputStamp {
         self.count.load(Ordering::Acquire)
     }
 
+    /// The number of the person's last plain Enter ([`Gesture::PlainEnter`]), `0` for none: the owner's turn the herald's told-once memory is kept under (`status_item::SessionRow::owner_turn`).
+    pub(crate) fn last_plain_enter(&self) -> u64 {
+        self.last_plain_enter.load(Ordering::Acquire)
+    }
+
     /// [`Self::seq`] and whether its last gesture was a plain Enter: the count first, then the marker, both acquires.
     pub(crate) fn probe(&self) -> PersonProbe {
         let seq = self.count.load(Ordering::Acquire);
@@ -460,7 +465,7 @@ impl crate::App {
         use crate::seamless::PersonStamp;
         let now_us = crate::metrics::now_us();
         let now = std::time::Instant::now();
-        let job_seen = &self.claim_job_seen;
+        let job_seen = &self.worker_job_seen;
         let stamps: Vec<(u64, PersonStamp)> = ids
             .iter()
             .filter_map(|&id| Some((id, &self.pool.get(id)?.ctx.human_input)))
@@ -508,8 +513,8 @@ impl crate::App {
     /// ([`HumanInputStamp::carry`]) or how long it was served unkeyed
     /// ([`HumanInputStamp::serve_from`]). Each modern writer says whether typing is recorded;
     /// without that provenance, a legacy keyed age conservatively counts as a possible key. The
-    /// claim look's last sight of a program in an ended claim worker's tab crosses too
-    /// (`App::claim_job_seen`), so the tab's reading time after that program is not cut short.
+    /// reaper's last sight of someone else's program in a concluded worker's tab crosses too
+    /// (`App::worker_job_seen`), so the tab's reading time after that program is not cut short.
     pub(crate) fn take_carried_person_stamps(&mut self) {
         let now_us = crate::metrics::now_us();
         for session in self.pool.iter() {
@@ -579,7 +584,7 @@ impl crate::App {
                 let seen = now
                     .checked_sub(std::time::Duration::from_millis(age_ms))
                     .unwrap_or(now);
-                self.claim_job_seen.insert(adopted, seen);
+                self.worker_job_seen.insert(adopted, seen);
             }
         }
         if carried > 0 {
@@ -818,8 +823,8 @@ mod tests {
     /// the outgoing process writes, for the sessions it hands over, the age
     /// of each one's last person's gesture — a stamp it carried itself from
     /// an earlier update included — and for a session nobody keyed, how long
-    /// it served it so (`-<age>`, the review's KR-2), and how long ago the claim
-    /// look last saw a program in an ended claim worker's tab (`j<id>`, the
+    /// it served it so (`-<age>`, the review's KR-2), and how long ago the
+    /// reaper's look last saw a program in a concluded worker's tab (`j<id>`, the
     /// 2026-11-02 review); the successor's Commit carries each onto the shell
     /// adopted under the id it names and consumes the sidecar.
     #[cfg(unix)]
@@ -874,7 +879,7 @@ mod tests {
         let program_seen = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(50))
             .expect("up 50 s");
-        outgoing.claim_job_seen.insert(untouched, program_seen);
+        outgoing.worker_job_seen.insert(untouched, program_seen);
         let written = outgoing
             .write_person_stamps_of(&[keyed, untouched], path.clone())
             .expect("written");
@@ -926,7 +931,7 @@ mod tests {
                         stamp.typed_ms_since(now),
                         stamp.typed_awake_ms(now),
                         successor
-                            .claim_job_seen
+                            .worker_job_seen
                             .get(&id)
                             .map(|seen| seen.elapsed().as_millis()),
                     )

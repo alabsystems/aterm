@@ -304,6 +304,7 @@ impl crate::App {
             return refuse("this copy of aterm has no path a shell can run");
         };
         aterm_log::info!("services: a tab opens to run `aterm {}`", args.join(" "));
+        let _act = crate::tab_marks::ActScope::gesture("install");
         self.open_off_loop(
             window,
             crate::tab_spawn::SpawnPlace::Tab,

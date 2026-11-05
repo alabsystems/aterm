@@ -8,10 +8,12 @@
 //! or `PUBLIC BOUNDARY`, and no lint names that rule. Three shapes are stock by construction:
 //!
 //! - a cargo-fuzz target (cargo-fuzz and its sanitizer runtime are stock nightly's);
-//! - shipped code that selects a stock channel by a literal: rustup's `"+nightly"` override as
-//!   one argument; `"RUSTUP_TOOLCHAIN"`, rustup's `"--toolchain"` or its `"run"` followed by a
-//!   channel (`"stable"`); or a channel handed straight to a call whose path names a toolchain
-//!   or rustup (`rustup::Toolchain::resolve(rustup, "stable")`);
+//! - shipped code that selects a stock channel by a literal: rustup's `"+nightly"` override,
+//!   `"--toolchain=stable"` or `"RUSTUP_TOOLCHAIN=stable"` as one argument; `"RUSTUP_TOOLCHAIN"`,
+//!   rustup's `"--toolchain"` or its `"run"` followed by a channel (`"stable"`), in a list or
+//!   in the next `.arg(..)` of a chain; a channel handed straight to a call whose path names a
+//!   toolchain or rustup (`rustup::Toolchain::resolve(rustup, "stable")`); or a channel bound
+//!   as the default of a name that names one (`let mut stock = "stable".to_string();`);
 //! - a Cargo target that has no work on Trust's host. Trust ships its host's std alone
 //!   ([`TRUST_HOST`]), so wherever Linux or Windows code is compiled, stock Rust compiles it:
 //!   the Linux and Windows lanes' guests (`aterm-lab`'s `linux_guest.rs`, `windows_guest.rs`)
@@ -29,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use super::rules::{PRODUCT, test_path};
+use super::rules::{PRODUCT, TestCode};
 use super::{Finding, Rule, SourceFile, Tree, is_word, joined};
 
 pub(super) const STOCK_LABEL: Rule = Rule {
@@ -42,13 +44,18 @@ pub(super) const STOCK_LABEL: Rule = Rule {
 };
 
 /// What the one target Trust ships a std for (aarch64-apple-darwin, the host its releases
-/// carry) answers to the `cfg` names that fix a target. A predicate these make false holds
-/// only on a target Trust has no std for; `unix` and `windows` are `target_family`'s.
+/// carry) answers to the `cfg` names that fix a target (`trustc --print cfg` there). A
+/// predicate these make false holds only on a target Trust has no std for; `unix` and
+/// `windows` are `target_family`'s.
 const TRUST_HOST: &[(&str, &str)] = &[
     ("target_os", "macos"),
     ("target_family", "unix"),
     ("target_arch", "aarch64"),
     ("target_vendor", "apple"),
+    ("target_env", ""),
+    ("target_abi", ""),
+    ("target_pointer_width", "64"),
+    ("target_endian", "little"),
 ];
 
 /// The labels AGENTS.md names.
@@ -61,9 +68,67 @@ const CHANNELS: &[&str] = &["stable", "beta", "nightly"];
 /// flag and its `run` subcommand.
 const TOOLCHAIN_KEYS: &[&str] = &["\"RUSTUP_TOOLCHAIN\"", "\"--toolchain\"", "\"run\""];
 
+/// What opens a literal that names the toolchain whole, a channel after it: rustup's `+`
+/// override, and its flag and environment variable joined to their value by `=`.
+const OVERRIDES: &[&str] = &["+", "--toolchain=", "RUSTUP_TOOLCHAIN="];
+
 /// The calls that do no work: conversions and `exit`. A name that opens with a capital, a
 /// tuple struct's or a variant's constructor, does none either.
 const INERT_CALLS: &[&str] = &["into", "from", "to_string", "to_owned", "exit"];
+
+/// The macros that do no work, each named by its last segment (`tracing::warn!` is `warn`):
+/// these of std's, each of which reports, stops, or builds a value (not `include!`, which
+/// splices code in, or `thread_local!`, which declares an item), and the five level reporters
+/// (`error!` to `trace!`) that `log` and `tracing` define, and aterm's `aterm-log` and
+/// `aterm-tracing` after them. A call in a macro's arguments is read in its turn ([`works`]),
+/// so `assert!(serve())` does work.
+const INERT_MACROS: &[&str] = &[
+    "eprintln",
+    "println",
+    "eprint",
+    "print",
+    "write",
+    "writeln",
+    "format",
+    "format_args",
+    "dbg",
+    "panic",
+    "unreachable",
+    "todo",
+    "unimplemented",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "compile_error",
+    "ready",
+    "vec",
+    "concat",
+    "stringify",
+    "include_str",
+    "include_bytes",
+    "env",
+    "option_env",
+    "cfg",
+    "matches",
+    "is_x86_feature_detected",
+    "is_aarch64_feature_detected",
+    "addr_of",
+    "addr_of_mut",
+    "offset_of",
+    "pin",
+    "file",
+    "line",
+    "column",
+    "module_path",
+    "error",
+    "warn",
+    "info",
+    "debug",
+    "trace",
+];
 
 /// The keywords a `(` can follow, which call nothing.
 const KEYWORDS: &[&str] = &[
@@ -76,6 +141,7 @@ type Kind = &'static str;
 
 fn stock_label(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let roots = target_roots(tree, out);
+    let test_code = TestCode::read_named(tree.corpus, PRODUCT, named_for_tests);
     for file in tree.corpus.under(PRODUCT) {
         let found = if file.rel.contains("/fuzz/fuzz_targets/") {
             Some((0, "a cargo-fuzz target runs on stock nightly".to_string()))
@@ -84,7 +150,7 @@ fn stock_label(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             .and_then(|kinds| foreign_target(file, kinds))
         {
             Some(gate)
-        } else if test_path(&file.rel) || !file.mentions(CHANNELS) {
+        } else if test_code.holds(&file.rel) || !file.mentions(CHANNELS) {
             None
         } else {
             selector(file).map(|(no, seen)| (no, format!("selects a stock toolchain: `{seen}`")))
@@ -99,22 +165,30 @@ fn stock_label(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// The root file of every Cargo target of a package under [`PRODUCT`], with the kinds of
-/// target it roots: each one its manifest's target tables name (by `path`, else where Cargo
-/// looks for that `name`), and each one Cargo discovers beside the manifest (`src/lib.rs`,
-/// `src/main.rs`, `src/bin/`, `tests/`, `benches/`, `examples/`) unless the manifest turns that
-/// kind's discovery off. So a member of a test suite under `autotests = false` (declared by the
-/// suite's `mod x;`) is no root, and neither is a file of a `tests/` directory inside `src/`. A
-/// manifest this cannot read is a finding: the targets it declares would go unread.
+/// Does `rel`'s path name test code: a file in a `tests` directory (a test target's, or a
+/// `tests` module's), a `tests.rs` or a `<name>_tests.rs`? Such a file, and one its parent
+/// declares test-only, is test code unless a shipped line loads it ([`TestCode::holds`]), so no
+/// channel it names selects anything shipped. A name that only opens with `test` says nothing:
+/// `testrun.rs` and `test_binary.rs` can ship.
+fn named_for_tests(rel: &str) -> bool {
+    let (dirs, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    dirs.split('/').any(|dir| dir == "tests") || name == "tests.rs" || name.ends_with("_tests.rs")
+}
+
+/// The root file of every Cargo target of a package the corpus holds a manifest for (each
+/// under [`PRODUCT`]), with the kinds of target it roots: each one its manifest's target
+/// tables name (by `path`, else where Cargo looks for that `name`), and each one Cargo
+/// discovers beside the manifest (`src/lib.rs`, `src/main.rs`, `src/bin/`, `tests/`,
+/// `benches/`, `examples/`) unless the manifest turns that kind's discovery off. So a member of
+/// a test suite under `autotests = false` (declared by the suite's `mod x;`) is no root, and
+/// neither is a file of a `tests/` directory inside `src/`. A manifest this cannot read is a
+/// finding: the targets it declares would go unread.
 fn target_roots(tree: &Tree<'_>, out: &mut Vec<Finding>) -> BTreeMap<String, BTreeSet<Kind>> {
     let mut roots: BTreeMap<String, BTreeSet<Kind>> = BTreeMap::new();
     let mut add = |rel: String, kind: Kind| {
         roots.entry(rel).or_default().insert(kind);
     };
     for (rel, text) in &tree.corpus.manifests {
-        if !PRODUCT.iter().any(|p| rel.starts_with(p)) {
-            continue;
-        }
         let targets = match crate::scan_set::manifest_targets(text, rel) {
             Ok(targets) if targets.package => targets,
             Ok(_) => continue,
@@ -189,32 +263,43 @@ fn selector(file: &SourceFile) -> Option<(usize, String)> {
     // A literal opens at `at`: its quote is code, not a literal's blanked contents.
     let opens = |at: usize| code.as_bytes().get(at) == Some(&b'"');
     let mut seen: Vec<(usize, String)> = Vec::new();
-    for (at, _) in text.match_indices("\"+") {
-        if opens(at)
-            && let Some(lit) = channel_literal(&text, at, true)
-        {
-            seen.push((at, lit.to_string()));
+    for prefix in OVERRIDES {
+        for (at, _) in text.match_indices(&format!("\"{prefix}")) {
+            if opens(at)
+                && let Some(lit) = channel_literal(&text, at, prefix)
+            {
+                seen.push((at, lit.to_string()));
+            }
         }
     }
     for key in TOOLCHAIN_KEYS {
         for (at, _) in text.match_indices(key) {
             let rest = text[at + key.len()..].trim_start();
-            let value = rest
-                .strip_prefix(',')
+            let listed = rest.strip_prefix(',');
+            let chained = rest
+                .strip_prefix(')')
+                .and_then(|r| r.trim_start().strip_prefix(".arg("));
+            let value = listed
+                .or(chained)
                 .map(|v| text.len() - v.trim_start().len());
             if opens(at)
-                && let Some(lit) = value.and_then(|v| channel_literal(&text, v, false))
+                && let Some(lit) = value.and_then(|v| channel_literal(&text, v, ""))
             {
-                seen.push((at, format!("{key}, {lit}")));
+                seen.push(match listed {
+                    Some(_) => (at, format!("{key}, {lit}")),
+                    None => (at, format!(".arg({key}).arg({lit})")),
+                });
             }
         }
     }
     for (at, _) in text.match_indices('"') {
-        if opens(at)
-            && let Some(lit) = channel_literal(&text, at, false)
-            && let Some(path) = enclosing_call(&code, at).filter(|path| names_toolchain(path))
-        {
+        let Some(lit) = channel_literal(&text, at, "").filter(|_| opens(at)) else {
+            continue;
+        };
+        if let Some(path) = enclosing_call(&code, at).filter(|path| names_toolchain(path)) {
             seen.push((at, format!("{path}(.., {lit})")));
+        } else if let Some(name) = default_of(&code, at..at + lit.len()) {
+            seen.push((at, format!("{name} {lit}")));
         }
     }
     let (at, what) = seen.into_iter().min_by_key(|(at, _)| *at)?;
@@ -222,17 +307,80 @@ fn selector(file: &SourceFile) -> Option<(usize, String)> {
 }
 
 /// The literal whose quote is at `at` in this TEXT view when it is a stock channel whole
-/// (`"stable"`, `"nightly-2026-01-01"`; not `"stablex"` or `"runs stable"`), after a `+` when
-/// `plus` (rustup's `"+nightly"`).
-fn channel_literal(text: &str, at: usize, plus: bool) -> Option<&str> {
-    let name = text[at..].strip_prefix('"')?;
-    let name = if plus { name.strip_prefix('+')? } else { name };
+/// (`"stable"`, `"nightly-2026-01-01"`; not `"stablex"` or `"runs stable"`), after `prefix`
+/// (rustup's `"+nightly"` for `+`).
+fn channel_literal<'a>(text: &'a str, at: usize, prefix: &str) -> Option<&'a str> {
+    let name = text[at..].strip_prefix('"')?.strip_prefix(prefix)?;
     let channel = CHANNELS.iter().find(|channel| {
         name.strip_prefix(**channel)
             .is_some_and(|rest| rest.starts_with(['"', '-']))
     })?;
     let close = text.len() - name.len() + channel.len() + name[channel.len()..].find('"')?;
     Some(&text[at..=close])
+}
+
+/// The name a channel literal (at `lit` in this CODE) is bound to as its default, with the
+/// binding's sign (`stock =`, `stock:`), when that name names a toolchain ([`names_stock`]):
+/// the literal is the whole value of a `let`, of an assignment that opens a statement, or of a
+/// struct literal's field, read past a conversion (`"stable".to_string()`, `.into()`,
+/// `.to_owned()`, `String::from(..)`), or the fallback of an `Option` (`.unwrap_or("stable")`,
+/// `.unwrap_or_else(|| "stable".into())`); the value ends at a `;`, a `,` or a `}`. A `name =`
+/// after a comma opens no statement: it is a macro's named argument
+/// (`println!("{stock}", stock = "stable")`), which binds nothing.
+fn default_of(code: &str, lit: Range<usize>) -> Option<String> {
+    let b = code.as_bytes();
+    let mut depth = 0usize;
+    // Where the binding opens, and whether a comma stands before it.
+    let (mut start, mut listed) = (0, false);
+    for i in (0..lit.start).rev() {
+        match b[i] {
+            b'}' | b';' | b',' | b'{' if depth == 0 => {
+                (start, listed) = (i + 1, b[i] == b',');
+                break;
+            }
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' if depth > 0 => depth -= 1,
+            _ => {}
+        }
+    }
+    let head = code[start..lit.start].trim_start();
+    let (is_let, head) = match head.strip_prefix("let ") {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, head),
+    };
+    let head = head.strip_prefix("mut ").map_or(head, str::trim_start);
+    let name = &head[..head.bytes().take_while(|&c| is_word(c)).count()];
+    let rest = head[name.len()..].trim_start();
+    let (sign, value) = match rest.strip_prefix(':').filter(|r| !r.starts_with(':')) {
+        Some(typed) if is_let => (" =", typed.split_once('=')?.1),
+        Some(field) => (":", field),
+        None if !listed => (" =", rest.strip_prefix('=')?),
+        None => return None,
+    };
+    let value: String = value.split_whitespace().collect();
+    let close = match value.as_str() {
+        "" => "",
+        "String::from(" => ")",
+        v if v.ends_with(".unwrap_or(") || v.ends_with(".unwrap_or_else(||") => ")",
+        _ => return None,
+    };
+    let after = code[lit.end..].trim_start();
+    let after = [".to_string()", ".to_owned()", ".into()"]
+        .iter()
+        .find_map(|conversion| after.strip_prefix(conversion))
+        .unwrap_or(after);
+    let ends = after
+        .trim_start()
+        .strip_prefix(close)
+        .is_some_and(|r| r.trim_start().starts_with([';', ',', '}']));
+    (ends && names_stock(name)).then(|| format!("{name}{sign}"))
+}
+
+/// Does this name (a binding's, a field's) name a toolchain (`stock`, `toolchain`,
+/// `rustup_channel`)?
+fn names_stock(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("stock") || names_toolchain(&name)
 }
 
 /// The path of the call whose argument list holds byte `at` directly
@@ -260,11 +408,12 @@ fn enclosing_call(code: &str, at: usize) -> Option<&str> {
     None
 }
 
-/// Does a segment of this call path name a toolchain (`Toolchain`, `rust_toolchain`) or rustup?
+/// Does a segment of this call path name a toolchain or rustup (`Toolchain`, `rust_toolchain`,
+/// `rustup`, `rustup_run`)?
 fn names_toolchain(path: &str) -> bool {
     path.split([':', '.']).any(|segment| {
         let segment = segment.to_ascii_lowercase();
-        segment.contains("toolchain") || segment == "rustup"
+        segment.contains("toolchain") || segment.contains("rustup")
     })
 }
 
@@ -370,19 +519,33 @@ fn reports_only<'a>(code: &str, attrs: &'a [Attr]) -> Option<(&'a Attr, &'a str)
 }
 
 /// Does this CODE (a `fn main`'s body, its gated code at `gates` left out) call anything that
-/// does work? A macro (`eprintln!`), a constructor, a conversion and `exit` do none. A call
-/// handed a closure that holds gated code (a harness running a bench's rows) is judged by the
-/// closure, whose calls are read in their turn; one whose closures hold none (a server handed
-/// its handler) is work.
+/// does work? A macro that reports, stops or builds a value ([`INERT_MACROS`]), a constructor,
+/// a conversion and `exit` do none; any other macro (`serve_main!()`) is work, and so is a call
+/// through a tuple field (`handlers.0()`). A call handed a closure that holds gated code (a
+/// harness running a bench's rows) is judged by the closure, whose calls are read in their
+/// turn; one whose closures hold none (a server handed its handler) is work.
 fn works(code: &str, gates: &[Range<usize>]) -> bool {
-    code.match_indices('(').any(|(at, _)| {
-        let name = callee(&code[..at]);
-        !(name.is_empty()
-            || name.starts_with(|c: char| c.is_ascii_uppercase() || c.is_ascii_digit())
+    code.match_indices(['(', '[', '{']).any(|(at, open)| {
+        let head = code[..at].trim_end();
+        if let Some(name) = macro_name(head) {
+            return !INERT_MACROS.contains(&name);
+        }
+        let name = callee(head);
+        !(open != "("
+            || name.is_empty()
+            || name.starts_with(|c: char| c.is_ascii_uppercase())
             || INERT_CALLS.contains(&name)
             || KEYWORDS.contains(&name)
             || runs_gated_closure(code, at, gates))
     })
+}
+
+/// The name of the macro whose arguments a bracket opens, from the CODE before it, trimmed
+/// (`serve_main` for `aterm_p::serve_main!`); `None` when no macro's `!` ends it (`if !`, `!=`).
+fn macro_name(head: &str) -> Option<&str> {
+    let head = head.strip_suffix('!')?;
+    let start = head.bytes().rposition(|b| !is_word(b)).map_or(0, |p| p + 1);
+    Some(&head[start..]).filter(|name| !name.is_empty())
 }
 
 /// The name a `(` calls, from the CODE before it: the identifier that ends it, read past a
@@ -653,15 +816,33 @@ fn mains(code: &str, attrs: &[Attr]) -> Vec<Main> {
 }
 
 /// Does this CODE line open a top-level `fn main` (`fn main(`, `pub fn main(`, `pub(crate) fn
-/// main(`)?
+/// main(`), the qualifiers a `fn` may carry read past (`async fn main(`, `pub unsafe extern "C"
+/// fn main(`)?
 fn opens_main(code: &str) -> bool {
-    let rest = match code.strip_prefix("pub") {
-        Some(vis) if vis.starts_with('(') => vis.split_once(')').map_or("", |(_, r)| r),
-        Some(vis) if vis.starts_with(' ') => vis,
+    let mut rest = match code.strip_prefix("pub") {
+        Some(vis) if vis.starts_with('(') => {
+            vis.split_once(')').map_or("", |(_, r)| r).trim_start()
+        }
+        Some(vis) if vis.starts_with(' ') => vis.trim_start(),
         Some(_) => return false,
-        None => return code.starts_with("fn main("),
+        // At column 0: an indented `fn main` is no top-level one.
+        None => code,
     };
-    rest.trim_start().starts_with("fn main(")
+    loop {
+        let word = &rest[..rest.bytes().take_while(|&c| is_word(c)).count()];
+        rest = match word {
+            "const" | "async" | "unsafe" => rest[word.len()..].trim_start(),
+            // The ABI is a literal, its contents blank in this CODE: `extern " "`.
+            "extern" => {
+                let abi = rest[word.len()..].trim_start();
+                abi.strip_prefix('"').map_or(abi, |r| {
+                    r.split_once('"').map_or("", |(_, r)| r).trim_start()
+                })
+            }
+            _ => break,
+        };
+    }
+    rest.starts_with("fn main(")
 }
 
 /// `pred` (a `cfg` predicate) on Trust's host: `Some(false)` when no build there compiles what

@@ -12,6 +12,57 @@ use crate::native_app::{
 use crate::native_ui::{ActionId, CompiledUi, LogicalRect, SemanticValue, UiContent};
 use aterm_types::macos_setup::{PutBack, RestoreOutcome};
 
+#[test]
+fn completed_workstation_setup_keeps_unfinished_account_provisioning_visible() {
+    let mut status = status_of("set-up");
+    status.finished = true;
+    let account = Subject::Sync(SyncKind::Accounts);
+    status.observed.push(Observation {
+        subject: account,
+        standing: Standing::Waiting,
+        now: Some("Not provisioned".to_owned()),
+        after_login: None,
+        wanted: "Provisioned".to_owned(),
+        note: Some("No active Claude account is assigned to this machine".to_owned()),
+        detail: None,
+    });
+    let app = page_reading(&status);
+    let visible = app.reviewed_rows();
+    let row = visible
+        .iter()
+        .find(|row| row.subject == account)
+        .expect("account provisioning is visible");
+    assert!(row.managed);
+    assert!(
+        row.note
+            .as_deref()
+            .unwrap()
+            .contains("No active Claude account")
+    );
+    let hero = hero_of(&app);
+    assert_ne!(hero.headline, lines::READY);
+    assert!(hero.done < hero.total);
+    let cards = lines::card_items(&app, &visible);
+    assert!(cards.iter().any(|card| {
+        card.subject == Some(account)
+            && card.mark == Mark::Waiting
+            && card
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("No active Claude account"))
+    }));
+    assert_eq!(line_in(&app, Setting::Secrets).mark, Mark::Waiting);
+    let reading = status
+        .observed
+        .iter_mut()
+        .find(|reading| reading.subject == account)
+        .unwrap();
+    reading.standing = Standing::InPlace;
+    reading.now = Some("2 accounts provisioned".to_owned());
+    reading.note = None;
+    assert_eq!(hero_of(&page_reading(&status)).headline, lines::READY);
+}
+
 fn runtime_with_app(
     app: SystemStateApp,
 ) -> (NativeRuntime, crate::native_app::AppInstanceId, ViewId) {
@@ -1550,7 +1601,7 @@ fn a_vault_nothing_answered_for_is_set_up_and_a_typed_join_waits_for_it() {
             &compile(&app, &SystemStateViewState::default(), 999.0, 1400.0),
             HEADLINE
         ),
-        "Your Mac is ready"
+        "Selected setup complete"
     );
 
     // The whole profile, its vault read as on the base plan: the vault waits on nothing there
@@ -2011,7 +2062,14 @@ fn a_failed_check_again_is_a_page_note_only() {
         );
         // The page: ready, as last read.
         let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
-        assert_eq!(label(&compiled, HEADLINE), "Your Mac is ready");
+        assert_eq!(
+            label(&compiled, HEADLINE),
+            if plan.selection == Selection::all() {
+                "Your Mac is ready"
+            } else {
+                "Selected setup complete"
+            }
+        );
         assert!(
             label(&compiled, "system-state/sub").ends_with(AS_LAST_READ),
             "{words}"
@@ -4381,7 +4439,9 @@ fn every_state_keeps_its_words_whole_and_apart_from_320_to_800() {
     let scenarios = page_states();
     // Each state at each text size, with the vault open and shut, is one item, whose cuts are
     // keyed by all three, so the items run side by side; a worker prepares its own fonts and
-    // text size, a thread's own in tests.
+    // text size, a thread's own in tests. Shut, the page holds the open view's words but the
+    // vault's fields, with the disclosure's row the open view leads with, so the shut view runs
+    // at every 32pt: a word cut in that shut row, in a band narrower than that, goes unseen.
     let pages: Vec<(f32, usize, bool)> = [1.0_f32, 1.5, 2.0]
         .into_iter()
         .flat_map(|scale| {
@@ -4400,6 +4460,10 @@ fn every_state_keeps_its_words_whole_and_apart_from_320_to_800() {
         let mut cut = std::collections::BTreeMap::<String, Vec<String>>::new();
         let mut width = 320.0_f32;
         while width <= 800.0 {
+            if !vault_open && (width - 320.0) % 32.0 != 0.0 {
+                width += 8.0;
+                continue;
+            }
             let mut app = SystemStateApp::new(Plan::default());
             app.publish(status.clone());
             app.vault_open = Some(vault_open);
@@ -7197,7 +7261,20 @@ fn a_line_says_what_is_true_now_and_now_to_wanted() {
     assert_eq!(mac.mark, Mark::Done);
     assert!(mac.phrase.starts_with("Caps Lock is "), "{}", mac.phrase);
     let secrets = line_in(&app, Setting::Secrets);
-    assert_eq!(secrets.phrase, "Joined · in sync");
+    assert_eq!(secrets.mark, Mark::Done);
+    assert_eq!(
+        secrets.phrase,
+        format!("Joined · {}", Setting::Secrets.wanted().to_lowercase())
+    );
+    let mut unread = status_of("set-up");
+    unread
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == Subject::Setting(Setting::Secrets))
+        .unwrap()
+        .now = None;
+    let without_value = line_in(&page_reading(&unread), Setting::Secrets);
+    assert_ne!(without_value.phrase, secrets.phrase);
     let permissions = line_in(&app, Setting::Permissions);
     assert_eq!(permissions.phrase, "Granted");
     // A grant on offer is not granted: its line says Offered (nux round 9, item 12), and the
@@ -7213,8 +7290,11 @@ fn a_line_says_what_is_true_now_and_now_to_wanted() {
     reading.now = Some("Off".to_owned());
     reading.note = Some(aterm_types::macos_setup::ACCESS_OFFERED.to_owned());
     let permissions = line_in(&page_reading(&offered), Setting::Permissions);
-    assert_eq!(permissions.mark, Mark::Done);
-    assert_eq!(permissions.phrase, "Offered");
+    assert_eq!(permissions.mark, Mark::Waiting);
+    assert!(permissions.phrase.contains("macOS grants pending"));
+    let hero = hero_of(&page_reading(&offered));
+    assert_eq!(hero.headline, "Setup incomplete");
+    assert!(hero.done < hero.total);
     let app = page_reading(&status_of("mixed"));
     let (lines, _) = lines_of(&app);
     assert!(

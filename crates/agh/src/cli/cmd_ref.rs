@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The ref verbs (design §9.4): `ref create` over the API, and `ref delete` as a leased
-//! push through the git runner.
+//! The ref verbs (design §9.4): create and atomic update over the API, and
+//! `ref delete` as a leased push through the git runner.
 
 use super::args::Invocation;
 use super::cmd_release_write::{
@@ -15,6 +15,55 @@ use super::{Ctx, Outcome};
 use crate::error::Result;
 use crate::model::RefObject;
 use crate::write::WriteOp;
+
+/// `ref update-atomic REPO --input FILE`: validate a typed batch before routing,
+/// then run the repository-bound guards and one journaled mutation.
+///
+/// # Errors
+/// Local for an unreadable input; Usage for an invalid batch; the write
+/// pipeline's routing, guard, journal and unknown-outcome errors.
+pub(crate) fn ref_update_atomic(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    use crate::github::refs::{ATOMIC_KEY, AtomicRefBatch, RefUpdate};
+    let file = inv
+        .flag("--input")
+        .ok_or_else(|| inv.usage("--input FILE is required"))?;
+    let updates: Vec<RefUpdate> = super::cmd_api::read_input(file)?;
+    let batch = AtomicRefBatch::new(updates)?;
+    for update in batch.updates() {
+        journaled(inv, WriteOp::RefUpdateAtomic, "ref", &update.reference)?;
+    }
+    let w = Write::begin(ctx, inv)?;
+    journaled(inv, WriteOp::RefUpdateAtomic, "repo", &w.slug.key())?;
+    let report = w.report(WriteOp::RefUpdateAtomic, ATOMIC_KEY);
+    w.finish(report, |report| {
+        let permit = w.permit()?;
+        if w.dry {
+            return dry_run::ref_update_atomic(&w, &permit, &batch, report);
+        }
+        let journal = w.gh.journal(&w.slug)?;
+        let before = latest_intent(&journal, WriteOp::RefUpdateAtomic, ATOMIC_KEY);
+        let outcome =
+            w.gh.refs(&w.slug)
+                .how(w.how.clone())
+                .update_atomic(&permit, &batch, &journal)
+                .map_err(|e| {
+                    naming_intent(
+                        report,
+                        &journal,
+                        WriteOp::RefUpdateAtomic,
+                        before.as_ref(),
+                        e,
+                    )
+                })?;
+        Ok(one_shot_answer(
+            report,
+            WriteOp::RefUpdateAtomic,
+            &journal,
+            outcome,
+            |_| (None, None),
+        ))
+    })
+}
 
 /// REF, under the reference rule (`refs/heads/…` or `refs/tags/…`, by a name git accepts).
 fn reference(inv: &Invocation) -> Result<&str> {

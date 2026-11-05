@@ -59,7 +59,7 @@ const FACTS_PUSH_WITHIN: Duration = Duration::from_secs(5);
 const FACTS_PUSH_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// The milliseconds the dev seam `seam` names, else `default`.
-fn seam_or(seam: &str, default: Duration) -> Duration {
+pub(crate) fn seam_or(seam: &str, default: Duration) -> Duration {
     aterm_types::dev_seam!(seam)
         .and_then(|v| {
             let s = v.to_str()?.trim();
@@ -213,6 +213,38 @@ const SERVES_DRIVE: &[FleetOp] = &[
     FleetOp::VaultJoin,
 ];
 
+/// [`SERVES`] and the ops only the mesh carries that a node service serves as a connection's
+/// own op: its neighbour links, toolset units and the desk (§4.4).
+#[cfg(unix)]
+const SERVES_MESH: &[FleetOp] = &[
+    FleetOp::Survey,
+    FleetOp::Book,
+    FleetOp::Join,
+    FleetOp::Facts,
+    FleetOp::MailCode,
+    FleetOp::Census,
+    FleetOp::VaultJoin,
+    FleetOp::Neighbour,
+    FleetOp::Units,
+    FleetOp::Desk,
+];
+
+/// [`SERVES_MESH`] with [`FleetOp::Drive`].
+#[cfg(unix)]
+const SERVES_DRIVE_MESH: &[FleetOp] = &[
+    FleetOp::Survey,
+    FleetOp::Book,
+    FleetOp::Join,
+    FleetOp::Drive,
+    FleetOp::Facts,
+    FleetOp::MailCode,
+    FleetOp::Census,
+    FleetOp::VaultJoin,
+    FleetOp::Neighbour,
+    FleetOp::Units,
+    FleetOp::Desk,
+];
+
 /// C16 3-minute heartbeat interval for pushing `survey facts` to the fleet issuer.
 #[cfg(unix)]
 const FACTS_HEARTBEAT_EVERY: Duration = Duration::from_secs(180);
@@ -321,6 +353,16 @@ impl Serving {
             SERVES
         } else {
             SERVES_DRIVE
+        }
+    }
+
+    /// The ops a node service serves, the mesh's own too where `mesh` is on ([`SERVES_MESH`]).
+    #[cfg(unix)]
+    fn ops_meshed(&self, mesh: bool) -> &'static [FleetOp] {
+        match (mesh, self.grants.is_empty()) {
+            (false, _) => self.ops(),
+            (true, true) => SERVES_MESH,
+            (true, false) => SERVES_DRIVE_MESH,
         }
     }
 
@@ -519,7 +561,9 @@ fn still_drives(
 /// The membership log's admission in this window's process (`docs/DESIGN-fluid-swarm-2026-10-28.md`
 /// §4.1, F17: [`aterm_agent::fleet_log::LocalLog`] of the live secrets directory): none in a
 /// test, in an isolated run (`ATERM_STATE_HOME`, `CI`, as the node job) or while this Mac holds
-/// no log.
+/// no log. While the store cannot be read it is the verdict last read under the vault configured
+/// now (the same vault, its configuration rewritten or not), and with none, one that admits no
+/// key.
 #[cfg(unix)]
 pub(crate) fn window_log() -> Option<Arc<aterm_net::fleet_member::MemberKeys>> {
     static LOG: std::sync::OnceLock<Option<aterm_agent::fleet_log::LocalLog>> =
@@ -601,24 +645,27 @@ pub(crate) fn holds_in(
     }
 }
 
-/// What the listener's handshake refuses now: the swarm roster's deny-listed nodes
-/// (`denied_nodes`), and each node key the membership log `log` holds out; every dialer while no
-/// deny list was read yet (`None`, [`aterm_net::fleet::Denied::unread`]).
+/// What the listener's handshake refuses now ([`aterm_net::fleet::Denied::under`]): the swarm
+/// roster's deny-listed nodes (`denied_nodes`), and each node key the membership log `log` holds
+/// out; every dialer while no deny list was read yet (`None`) or the log exists but gave no verdict
+/// yet ([`aterm_net::fleet_member::MemberKeys::unreadable`]).
 #[cfg(unix)]
 pub(crate) fn denied_under(
     denied_nodes: Option<&[String]>,
     log: Option<&aterm_net::fleet_member::MemberKeys>,
 ) -> Arc<aterm_net::fleet::Denied> {
-    let Some(denied_nodes) = denied_nodes else {
-        return Arc::new(aterm_net::fleet::Denied::not_yet_read());
-    };
-    Arc::new(aterm_net::fleet::Denied {
-        nodes: denied_nodes.to_vec(),
-        keys: log
-            .map(aterm_net::fleet_member::MemberKeys::out)
-            .unwrap_or_default(),
-        unread: false,
-    })
+    Arc::new(aterm_net::fleet::Denied::under(denied_nodes, log))
+}
+
+/// Hand this process's fleet dialers the verdict this Mac's listener judges each dialer by
+/// ([`denied_under`] of the swarm's deny list and [`window_log`], read for each dial), so with the
+/// mesh switch on both ends of this Mac judge a peer's key by one standing
+/// (`aterm_net::fleet_member::judge_mesh_by`). Inert with the switch off.
+#[cfg(unix)]
+pub fn judge_mesh_dials() {
+    aterm_net::fleet_member::judge_mesh_by(Arc::new(|| {
+        denied_under(denied_nodes_now().as_deref(), window_log().as_deref())
+    }));
 }
 
 /// The key this Mac holds a node to now ([`bound_or_admitted_in`] of its keyring, [`window_log`]
@@ -804,6 +851,9 @@ struct FleetDesk {
     said: String,
     /// The serving generation's flag: cleared to stop it.
     stop: Option<Arc<AtomicBool>>,
+    /// The mesh is on (`aterm_types::mesh_switch::MESH`, read once as the listener starts): the
+    /// node service is the one listener per Mac, and a window serves no port of its own.
+    mesh: bool,
 }
 
 static FLEET_DESK: Mutex<FleetDesk> = Mutex::new(FleetDesk {
@@ -816,6 +866,7 @@ static FLEET_DESK: Mutex<FleetDesk> = Mutex::new(FleetDesk {
     standing: Standing::Off,
     said: String::new(),
     stop: None,
+    mesh: false,
 });
 
 static FLEET_CHANGED: Condvar = Condvar::new();
@@ -859,6 +910,7 @@ pub(crate) fn start_fleet_listener(fleet: Option<&FleetConfig>) {
         return;
     }
     desk.started = true;
+    desk.mesh = aterm_types::mesh_switch::MESH;
     if !desk.configured {
         desk.wanted = fleet_wanted(fleet);
         desk.generation = desk.generation.wrapping_add(1);
@@ -1196,6 +1248,20 @@ fn node_job_running_now() -> bool {
         .is_some_and(|state| aterm_agent::node_service::node_port_holds_lock(&state))
 }
 
+/// Why a window leaves the fleet port to the node service, if it does: always with the mesh on
+/// (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4, one listener per Mac), and otherwise while
+/// the node job holds the port ([`node_job_running_now`]). With the mesh off, a window with no
+/// node job listens itself, as before.
+fn window_yields_port(mesh: bool, node_job: impl FnOnce() -> bool) -> Option<&'static str> {
+    if mesh {
+        Some("fleet served by systems.alab.aterm-node, the one listener on this Mac")
+    } else if node_job() {
+        Some("fleet served by systems.alab.aterm-node")
+    } else {
+        None
+    }
+}
+
 /// The fleet port's `ask` handler: the members desk, the one path a caller without the fleet
 /// secret reaches (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10).
 #[cfg(unix)]
@@ -1207,20 +1273,19 @@ fn members_ask() -> Option<aterm_net::fleet::AskHandler> {
 /// and grants it is accepted under ([`served_now`]).
 #[cfg(unix)]
 fn serve_fleet_port(generation: u64, addr: SocketAddr) {
-    let mut revision = FLEET_DESK.lock_or_recover().revision;
+    let (mut revision, mesh) = {
+        let desk = FLEET_DESK.lock_or_recover();
+        (desk.revision, desk.mesh)
+    };
     loop {
-        if node_job_running_now() {
+        if let Some(line) = window_yields_port(mesh, node_job_running_now) {
             let serving = served_now();
             lift_undriving_holds(
                 &serving.grants,
                 &keyring_now(),
                 denied_nodes_now().as_deref().unwrap_or_default(),
             );
-            stand_fleet(
-                generation,
-                Standing::Listening,
-                "fleet served by systems.alab.aterm-node",
-            );
+            stand_fleet(generation, Standing::Listening, line);
             if wait_fleet_tick(generation, &mut revision) {
                 continue;
             }
@@ -1316,6 +1381,14 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
             per_source: aterm_net::fleet::per_source(fleet_slots()),
             lifetime: lifetime(),
         };
+        // One bound for a connection's TLS and both proofs and for each read and write of an op
+        // this listener answers itself (join, book, facts, mail code, census, vault join; a drive
+        // or a relayed op is bounded by its relay), so the seam lifts both: a test world's peers
+        // are aterms on this machine, which finish both however loaded it is.
+        let within = seam_or(
+            aterm_net::fleet::HANDSHAKE_SEAM,
+            aterm_net::fleet::HANDSHAKE_WITHIN,
+        );
         aterm_net::fleet::serve_offering_with_ask_within(
             &listener,
             (
@@ -1328,44 +1401,41 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
             ),
             members_ask(),
             &running,
-            seam_or(
-                aterm_net::fleet::HANDSHAKE_SEAM,
-                aterm_net::fleet::HANDSHAKE_WITHIN,
-            ),
+            within,
             move |served, op| {
                 let peer = served.peer_addr();
                 if op == FleetOp::Join {
                     let proof = served.peer_node().cloned();
                     return served.answer(|stream| {
-                        stream.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                        stream.set_read_timeout(Some(within))?;
                         register_member(stream, (peer, proof.as_ref()), (addr, &join_secret))
                     });
                 }
                 if op == FleetOp::Book {
                     return served.answer(|stream| {
-                        stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                        stream.set_write_timeout(Some(within))?;
                         share_book(stream, peer, (addr, &serving_generation))
                     });
                 }
                 if op == FleetOp::Facts {
                     let proof = served.peer_node().cloned();
                     return served.answer(|stream| {
-                        stream.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
-                        stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                        stream.set_read_timeout(Some(within))?;
+                        stream.set_write_timeout(Some(within))?;
                         receive_pushed_facts(stream, proof.as_ref(), peer)
                     });
                 }
                 if op == FleetOp::MailCode {
                     let proof = served.peer_node().cloned();
                     return served.answer(|stream| {
-                        stream.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
-                        stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                        stream.set_read_timeout(Some(within))?;
+                        stream.set_write_timeout(Some(within))?;
                         serve_mail_code_request(stream, proof.as_ref(), peer)
                     });
                 }
                 if op == FleetOp::Census {
                     return served.answer(|stream| {
-                        stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                        stream.set_write_timeout(Some(within))?;
                         serve_census_request(stream, peer)
                     });
                 }
@@ -1387,8 +1457,8 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                             )
                         });
                     return served.answer(|stream| {
-                        stream.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
-                        stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                        stream.set_read_timeout(Some(within))?;
+                        stream.set_write_timeout(Some(within))?;
                         crate::members_desk::serve_vault_join(stream, peer, judged);
                         Ok(())
                     });
@@ -1471,7 +1541,8 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
 /// `running` is cleared; `aterm pkg serve-units --off` stops it. It opens only once the fleet
 /// listener listens in this process, so macOS's firewall has already ruled on this app's
 /// incoming connections and asks nothing new. `None` where atpkg is inert, no store resolves,
-/// or the debug loopback guard refuses the address.
+/// or the fleet's guard refuses the address ([`aterm_net::loopback::check`]: an isolated debug
+/// drive's loopback, and every address of a private aterm's, since the port is the person's).
 #[cfg(unix)]
 fn share_units(
     listen: SocketAddr,
@@ -1564,9 +1635,36 @@ fn admit_driver_at(
     denied: &[String],
     log: Option<&aterm_net::fleet_member::MemberKeys>,
 ) -> Result<(crate::fabric::Driver, aterm_net::fleet::DriveGrant), (String, bool)> {
-    use aterm_net::fleet_member::{peer_of, proven_driver};
+    let node = aterm_net::fleet_member::proven_driver(served, state, grants, log);
+    admit_proven_driver_at(served.peer_node(), node, state, grants, denied)
+}
+
+/// [`admit_driver_at`] for a node `proof` a mesh link proved, its stream's peer
+/// ([`aterm_net::fleet::link::Incoming::peer`]): the same grants, bindings and revocations, judged
+/// now ([`aterm_net::fleet_member::recheck_driver`]).
+#[cfg(unix)]
+fn admit_linked_driver_at(
+    proof: &aterm_net::fleet::NodeProof,
+    state: &std::path::Path,
+    grants: &[aterm_net::fleet::DriveGrant],
+    denied: &[String],
+    log: Option<&aterm_net::fleet_member::MemberKeys>,
+) -> Result<(crate::fabric::Driver, aterm_net::fleet::DriveGrant), (String, bool)> {
+    let node = aterm_net::fleet_member::recheck_driver(proof, state, grants, log);
+    admit_proven_driver_at(Some(proof), node, state, grants, denied)
+}
+
+#[cfg(unix)]
+fn admit_proven_driver_at(
+    proof: Option<&aterm_net::fleet::NodeProof>,
+    node: Result<String, aterm_net::fleet_member::Undriven>,
+    state: &std::path::Path,
+    grants: &[aterm_net::fleet::DriveGrant],
+    denied: &[String],
+) -> Result<(crate::fabric::Driver, aterm_net::fleet::DriveGrant), (String, bool)> {
+    use aterm_net::fleet_member::peer_of;
     let refused = |why: &str, ungranted| (why.to_owned(), ungranted);
-    if served.peer_node().is_some_and(|proof| {
+    if proof.is_some_and(|proof| {
         aterm_net::fleet::is_denied_node(&proof.node, denied)
             || aterm_net::fleet::is_denied_key(&proof.key, denied)
     }) {
@@ -1577,10 +1675,8 @@ fn admit_driver_at(
     }
     // Each node named by a head no other node this Mac knows shares.
     let knows = aterm_net::fleet_member::known_nodes(state);
-    let node = proven_driver(served, state, grants, log)
-        .map_err(|why| (why.said(&knows), why.ungranted()))?;
-    let key = served
-        .peer_node()
+    let node = node.map_err(|why| (why.said(&knows), why.ungranted()))?;
+    let key = proof
         .filter(|proof| proof.node == node)
         .map(|proof| proof.key)
         .ok_or_else(|| refused("it proved no node", false))?;
@@ -1663,6 +1759,20 @@ fn lists_driver_at(
         aterm_net::fleet::is_denied_node(&proof.node, denied)
             || aterm_net::fleet::is_denied_key(&proof.key, denied)
     }) && aterm_net::fleet_member::proven_driver(served, state, grants, log).is_ok()
+}
+
+/// [`lists_driver_at`] for a node `proof` a mesh link proved.
+#[cfg(unix)]
+fn lists_linked_driver_at(
+    proof: &aterm_net::fleet::NodeProof,
+    state: &std::path::Path,
+    grants: &[aterm_net::fleet::DriveGrant],
+    denied: &[String],
+    log: Option<&aterm_net::fleet_member::MemberKeys>,
+) -> bool {
+    !(aterm_net::fleet::is_denied_node(&proof.node, denied)
+        || aterm_net::fleet::is_denied_key(&proof.key, denied))
+        && aterm_net::fleet_member::recheck_driver(proof, state, grants, log).is_ok()
 }
 
 /// A connection the listener handed to the control server, which [`cut_unserved`] hangs up once
@@ -1792,15 +1902,9 @@ fn driver_name(node: &str, host: Option<&str>, knows: &[String]) -> String {
     }
 }
 
-/// A drive this Mac refuses ([`admit_driver`]), under
-/// [`aterm_types::control_verbs::DRIVE_UNGRANTED`] where no grant admits its node (`ungranted`).
+/// Record a refused drive from `peer` among the fleet gate's denials, as each refusal is.
 #[cfg(unix)]
-fn refuse_driver(
-    served: aterm_net::fleet::Served,
-    peer: Option<SocketAddr>,
-    why: &str,
-    ungranted: bool,
-) -> std::io::Result<()> {
+fn note_refused_driver(peer: Option<SocketAddr>, why: &str) {
     let at = peer.map_or_else(|| "a fleet peer".to_owned(), |peer| peer.to_string());
     let line = format!(
         "{at} was refused a drive: {}",
@@ -1811,6 +1915,18 @@ fn refuse_driver(
     {
         aterm_log::warn!("fleet: {line}");
     }
+}
+
+/// A drive this Mac refuses ([`admit_driver`]), under
+/// [`aterm_types::control_verbs::DRIVE_UNGRANTED`] where no grant admits its node (`ungranted`).
+#[cfg(unix)]
+fn refuse_driver(
+    served: aterm_net::fleet::Served,
+    peer: Option<SocketAddr>,
+    why: &str,
+    ungranted: bool,
+) -> std::io::Result<()> {
+    note_refused_driver(peer, why);
     served.answer(|stream| {
         stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
         let head = if ungranted {
@@ -2755,6 +2871,24 @@ fn note_fleet(line: &str, refusal: bool) {
 mod tests {
     use super::*;
 
+    /// With MESH off a window still listens, leaving the port only to a node job that holds it;
+    /// with MESH on it leaves the port to the node service, the one listener on this Mac.
+    #[test]
+    fn with_the_mesh_off_a_window_still_listens_and_with_it_on_leaves_the_port_to_the_node() {
+        // MESH off, no node job: the window binds the port itself.
+        assert_eq!(window_yields_port(false, || false), None);
+        // MESH off, a node job holds the port: the window leaves it, as before the mesh.
+        assert_eq!(
+            window_yields_port(false, || true),
+            Some("fleet served by systems.alab.aterm-node")
+        );
+        // MESH on: the node service is the one listener, held or not; the job is not even asked.
+        assert!(
+            window_yields_port(true, || unreachable!("no port lock is read"))
+                .is_some_and(|line| line.contains("the one listener"))
+        );
+    }
+
     /// A detached book response that passed its early generation check must not publish its
     /// old listener endpoint after waiting on the descriptor lock and then being canceled.
     #[cfg(unix)]
@@ -3160,6 +3294,7 @@ mod tests {
             standing: Standing::Off,
             said: String::new(),
             stop: None,
+            mesh: false,
         };
         let at = |place: &str, level: &str| format!("fleet listening on {place} (serving {level})");
         assert!(noted_move(
@@ -3674,6 +3809,7 @@ mod tests {
         let holder_facts = SwarmSurveyFacts {
             node: Some(holder_id.node().to_owned()),
             label: Some("fixture-holder".to_owned()),
+            roster_unread: false,
             version: "0.146.0".to_owned(),
             window: true,
             window_last: Some(1_793_160_000),
@@ -3682,7 +3818,11 @@ mod tests {
             accounts: Vec::new(),
             accounts_unread: Vec::new(),
             session_accounts: std::collections::BTreeMap::new(),
+            moves: None,
             server_heard: Vec::new(),
+            home: None,
+            home_free_mb: None,
+            repos: None,
         };
         let holder_payload = holder_facts.to_survey_reply(
             100,
@@ -3766,6 +3906,7 @@ mod tests {
         let member_facts = SwarmSurveyFacts {
             node: Some(member_id.node().to_owned()),
             label: Some("m7".to_owned()),
+            roster_unread: false,
             version: "0.146.0".to_owned(),
             window: false,
             window_last: Some(1_793_150_000),
@@ -3774,7 +3915,11 @@ mod tests {
             accounts: Vec::new(),
             accounts_unread: Vec::new(),
             session_accounts: std::collections::BTreeMap::new(),
+            moves: None,
             server_heard: Vec::new(),
+            home: None,
+            home_free_mb: None,
+            repos: None,
         };
         let member_payload =
             member_facts.to_survey_reply(200, Some("m7.local"), 1_793_160_000_000, 0, false);

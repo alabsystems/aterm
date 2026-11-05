@@ -166,13 +166,55 @@ impl Lab {
     }
 }
 
+/// A credential a mailbox sign-in types, held in a registry `Secret` cell (one-mesh design §4.8):
+/// the login address's `password`, the mailbox's `mailbox_password` or its `totp` seed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Part {
+    Password,
+    MailboxPassword,
+    Totp,
+}
+
+/// A mailbox the registry describes (`aterm_db::alab::mail::Mailbox`), as a sign-in reads it:
+/// its login, webmail and `receives` patterns, and which credentials its cells hold. Never a
+/// value: [`reveal`] hands one over when a sign-in types it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LabMailbox {
+    /// Its registry key (`mb-…`), what [`reveal`] names it by.
+    pub pk: String,
+    /// Its login address, lower-case.
+    pub login: String,
+    /// The registry's declared service; it is never inferred from an address.
+    pub service: Option<String>,
+    /// Its webmail inbox URL.
+    pub webmail: Option<String>,
+    /// The normalized patterns of what it receives: exact addresses, `*@<domain>`, `*`.
+    pub receives: Vec<String>,
+    /// The parts whose cells hold a value.
+    pub held: Vec<Part>,
+}
+
+impl std::fmt::Debug for LabMailbox {
+    /// Its key, its masked login and what it holds; never an address or a value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LabMailbox")
+            .field("pk", &self.pk)
+            .field("login", &super::mailbox_routes::mask_login(&self.login))
+            .field("webmail", &self.webmail.is_some())
+            .field("receives", &self.receives.len())
+            .field("held", &self.held)
+            .finish()
+    }
+}
+
 /// What gives the harness its [`Lab`]: the `aterm` executable's cache.
 pub trait Source: Send + Sync {
     /// The lab as last projected, at once; `None` while nothing is projected, or where the
-    /// registry is not held here or the roster source is turned off.
+    /// registry is not held here, current local policy is unavailable, or the source is off.
     fn lab(&self) -> Option<Arc<Lab>>;
 
-    /// Whether no projection is held because reading the registry failed, where a projection
+    /// Whether current local policy is unavailable, or no projection is held because reading
+    /// the registry failed, where a projection
     /// named this Mac before: the lab may still name it, so nothing reads the sheet or labels a row after a machine until
     /// a read succeeds ([`pending`]).
     fn pending(&self) -> bool {
@@ -184,6 +226,39 @@ pub trait Source: Send + Sync {
     fn turned_off(&self) -> bool {
         false
     }
+
+    /// The registry's live mailboxes with a live login, as last projected; empty where no lab
+    /// is held.
+    fn mail(&self) -> Vec<LabMailbox> {
+        Vec::new()
+    }
+
+    /// Hand `part` of mailbox `mailbox` to `consume`, journalled on this Mac as a sign-in's
+    /// reveal; value-free words where it cannot.
+    ///
+    /// # Errors
+    /// No registry is held here, the cell is empty or holds two values, or it does not open.
+    /// Reveal only while the current registry view still has this exact mailbox binding.
+    /// Implementations must check binding and secret under the same retained view.
+    fn reveal_bound(
+        &self,
+        expected: &LabMailbox,
+        parts: &[Part],
+        consume: &mut dyn FnMut(Part, &str),
+    ) -> Result<(), &'static str> {
+        let _ = (expected, parts, consume);
+        Err("bound registry reveal is unavailable")
+    }
+
+    fn reveal(
+        &self,
+        mailbox: &str,
+        part: Part,
+        consume: &mut dyn FnMut(&str),
+    ) -> Result<(), &'static str> {
+        let _ = (mailbox, part, consume);
+        Err("no lab registry is held here")
+    }
 }
 
 static INSTALLED: OnceLock<Box<dyn Source>> = OnceLock::new();
@@ -194,7 +269,13 @@ pub fn install(source: Box<dyn Source>) -> bool {
 }
 
 #[cfg(test)]
+type Secrets = std::collections::BTreeMap<(String, Part), String>;
+
+#[cfg(test)]
 thread_local! {
+    static MAIL: std::cell::RefCell<Option<(Vec<LabMailbox>, Secrets)>> =
+        const { std::cell::RefCell::new(None) };
+    static REVEALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static OVERRIDE: std::cell::RefCell<Option<Arc<Lab>>> = const { std::cell::RefCell::new(None) };
     static PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TURNED_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -263,6 +344,132 @@ pub(crate) fn with_lab<T>(lab: Lab, f: impl FnOnce() -> T) -> T {
     let out = f();
     OVERRIDE.with(|cell| *cell.borrow_mut() = None);
     out
+}
+
+/// The registry's mailboxes this process holds ([`Source::mail`]): what a mailbox sign-in
+/// resolves a login, its webmail and its patterns from before any `ai-mailbox.toml` entry
+/// (`headless_oauth::discover_mailbox_config`). Empty where none is held.
+#[must_use]
+pub fn mail() -> Vec<LabMailbox> {
+    #[cfg(test)]
+    if let Some(mail) = MAIL.with(|cell| cell.borrow().as_ref().map(|(mail, _)| mail.clone())) {
+        return mail;
+    }
+    if turned_off() {
+        return Vec::new();
+    }
+    INSTALLED
+        .get()
+        .map(|source| source.mail())
+        .unwrap_or_default()
+}
+
+/// `part` of registry mailbox `mailbox`, revealed for a sign-in that types it now
+/// ([`Source::reveal`]); each call is one journalled reveal, so a caller reveals once per
+/// sign-in (`headless_oauth::MailboxConfig`'s memo).
+///
+/// # Errors
+/// As [`Source::reveal`], in value-free words.
+pub fn reveal(mailbox: &str, part: Part) -> Result<zeroize::Zeroizing<String>, &'static str> {
+    #[cfg(test)]
+    if let Some(found) = MAIL.with(|cell| {
+        cell.borrow().as_ref().map(|(_, secrets)| {
+            REVEALS.with(|n| n.set(n.get() + 1));
+            secrets
+                .get(&(mailbox.to_owned(), part))
+                .cloned()
+                .ok_or("not set in the registry")
+        })
+    }) {
+        return found.map(zeroize::Zeroizing::new);
+    }
+    if turned_off() {
+        return Err("the lab roster is turned off here");
+    }
+    let source = INSTALLED.get().ok_or("no lab registry is held here")?;
+    let mut out = zeroize::Zeroizing::new(String::new());
+    source.reveal(mailbox, part, &mut |value| out.push_str(value))?;
+    Ok(out)
+}
+
+/// Reveal a credential only under the exact mailbox metadata the consumer admitted.
+///
+/// # Errors
+/// Binding changed, no registry is held, or its secret cannot be revealed and journalled.
+pub fn reveal_bound(
+    expected: &LabMailbox,
+    parts: &[Part],
+) -> Result<Vec<zeroize::Zeroizing<String>>, &'static str> {
+    #[cfg(test)]
+    if let Some(result) = MAIL.with(|cell| {
+        cell.borrow().as_ref().map(|(mail, secrets)| {
+            if mail
+                .iter()
+                .filter(|m| m.pk == expected.pk)
+                .collect::<Vec<_>>()
+                .as_slice()
+                != [expected]
+            {
+                return Err("registry mailbox binding changed");
+            }
+            let values: Result<Vec<_>, _> = parts
+                .iter()
+                .map(|part| {
+                    secrets
+                        .get(&(expected.pk.clone(), *part))
+                        .cloned()
+                        .map(zeroize::Zeroizing::new)
+                        .ok_or("not set in the registry")
+                })
+                .collect();
+            REVEALS.with(|n| n.set(n.get() + parts.len()));
+            values
+        })
+    }) {
+        return result;
+    }
+    if turned_off() {
+        return Err("the lab roster is turned off here");
+    }
+    let source = INSTALLED.get().ok_or("no lab registry is held here")?;
+    let mut out = Vec::new();
+    source.reveal_bound(expected, parts, &mut |part, value| {
+        out.push((part, zeroize::Zeroizing::new(value.to_owned())))
+    })?;
+    if out.len() != parts.len()
+        || out
+            .iter()
+            .zip(parts)
+            .any(|((part, _), wanted)| part != wanted)
+    {
+        return Err("registry credential bundle is incomplete");
+    }
+    Ok(out.into_iter().map(|(_, value)| value).collect())
+}
+
+/// Run `f` with `mail` as this thread's registry mailboxes and `secrets` as what [`reveal`]
+/// hands over, each `(mailbox key, part)` to its value.
+#[cfg(test)]
+pub(crate) fn with_mail<T>(
+    mail: Vec<LabMailbox>,
+    secrets: Vec<((&str, Part), &str)>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let secrets = secrets
+        .into_iter()
+        .map(|((pk, part), value)| ((pk.to_owned(), part), value.to_owned()))
+        .collect();
+    MAIL.with(|cell| *cell.borrow_mut() = Some((mail, secrets)));
+    REVEALS.with(|n| n.set(0));
+    let out = f();
+    MAIL.with(|cell| *cell.borrow_mut() = None);
+    out
+}
+
+/// How many reveals this thread asked for since its [`with_mail`] began.
+#[cfg(test)]
+pub(crate) fn reveals() -> usize {
+    REVEALS.with(std::cell::Cell::get)
 }
 
 /// The `alab` fleet of `cli` for this Mac ([`SOURCE`]): every account it prefers that may join,
@@ -407,7 +614,7 @@ pub(super) fn chosen(
     let fleet = current().and_then(|lab| fleet_for(&lab, cli, existing.as_ref()));
     if fleet.is_none() && pending() {
         return Err(
-            "the lab registry is held here but could not be read yet, so this Mac may be one it \
+            "the lab source or its local policy could not be read, so this Mac may be one it \
              names: nothing was synced (no sheet is read meanwhile); a later sync reads it again"
                 .to_owned(),
         );
@@ -560,6 +767,33 @@ pub fn fleet_digest(cli: Cli) -> Option<[u8; 32]> {
         }
     }
     Some(hash.finalize())
+}
+
+/// A digest of the registry mailboxes this process holds ([`mail`]): each key, login, webmail,
+/// pattern and held part, never a value. The sign-in ladder's retry inputs, so a mailbox the
+/// registry adds, or a password it gains, releases a row held after a failed sign-in, as a new
+/// `ai-mailbox.toml` does.
+#[must_use]
+pub fn mail_digest() -> [u8; 32] {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm-alab-mail-v1");
+    let mut field = |value: &str| {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    };
+    for mailbox in mail() {
+        field(&mailbox.pk);
+        field(&mailbox.login);
+        field(mailbox.webmail.as_deref().unwrap_or(""));
+        for pattern in &mailbox.receives {
+            field(pattern);
+        }
+        for part in &mailbox.held {
+            field(&format!("{part:?}"));
+        }
+        field("");
+    }
+    hash.finalize()
 }
 
 /// `roster`, a sync's rebuild from the `alab` fleet, with every row of `existing` it lost put

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The epoch verdicts give what the scans they replaced gave ([`oracle`]) on 200 signed logs of
-//! three Macs that reseal and leave each other out on diverging copies; a log keeps its cache
+//! The epoch verdicts give what the scans they replaced gave ([`oracle`]; on 200 signed logs,
+//! `entries`'s `two_hundred_signed_logs_read_as_the_replaced_readings_did`); a log keeps its cache
 //! across records that change nothing it read and lets it go on the rest; a verdict once taken
 //! reads nothing again; and what a 12,288-epoch audience costs is pinned by count, where the
 //! pair test it replaced runs past the pin.
@@ -156,46 +156,6 @@ fn a_12288_epoch_audience_costs_a_few_rows_per_epoch() {
             Err(Exhausted),
             "{name}: the replaced pair test stays within the pin"
         );
-    }
-}
-
-/// On 200 signed logs of three Macs writing, resealing and minting Commons and `[mac-1 mac-2]`
-/// epochs that leave a Mac out a quarter of the time, removing each other and letting each other
-/// back in, on diverging copies ([`generated`]), every verdict asked of every Mac and audience,
-/// of each copy after each step and of the merge, is what the replaced scans give:
-/// [`oracle::check`] runs in every verdict.
-/// NEGATIVE CONTROLS: a verdict that reads no seat entry, no prior wrap, lets a newest epoch the
-/// seat entry follows learn from a prior wrap, or counts a prior wrap the entry of a Mac that came
-/// back follows, disagrees: the generated logs take each branch.
-#[test]
-fn two_hundred_signed_logs_leave_out_as_the_replaced_scans_did() {
-    oracle::CHECKED.set((0, 0));
-    let logs: Vec<Log> = (1..=200).map(generated).collect();
-    let (checked, wrong) = oracle::CHECKED.get();
-    assert!(checked > 30_000, "the probes checked verdicts: {checked}");
-    assert_eq!(wrong, 0);
-    let (macs, _) = three_macs();
-    let left_out = logs
-        .iter()
-        .filter(|log| {
-            macs.iter().any(|mac| {
-                log.audience_left_out_recipient(&EpochAudience::Everyone, &mac.identity.recipient())
-            })
-        })
-        .count();
-    assert!(left_out > 50, "merges leave a Mac out: {left_out}");
-    for mutant in [
-        Mutant::IgnoreSeat,
-        Mutant::IgnorePriorWraps,
-        Mutant::IgnoreEntryAfter,
-        Mutant::IgnoreReturn,
-    ] {
-        let (checked, wrong) = disagreeing(mutant, || {
-            for seed in 1..=200 {
-                let _ = generated(seed);
-            }
-        });
-        assert!(checked > 0 && wrong > 0, "{mutant:?} goes unnoticed");
     }
 }
 

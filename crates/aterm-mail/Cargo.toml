@@ -21,6 +21,9 @@ aterm-uds = { workspace = true }
 aterm-time = { workspace = true }
 aterm-types = { workspace = true }
 ring = { workspace = true }
+# The Ed25519 checks of the pinned modulus key and the address-token keys: astream's
+# strict verify, which refuses the small-order keys and commitments ring alone takes.
+astream-aead = { path = "../../vendor/astream/crates/astream-aead", default-features = false, features = ["signature"] }
 aterm-mail-bigint = { workspace = true }
 aterm-secrets = { workspace = true }
 aterm-digest = { workspace = true }

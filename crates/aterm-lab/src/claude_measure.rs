@@ -982,7 +982,7 @@ fn call(
 
 /// Write `text` to `path` in a run's world.
 fn save(path: &Path, text: &str) -> Result<(), Fail> {
-    std::fs::write(path, text).map_err(|e| not_run(format!("{}: {e}", path.display())))
+    crate::util::write_fresh(path, text).map_err(|e| not_run(format!("{}: {e}", path.display())))
 }
 
 /// STEPS 3 AND 8: one session of `build` in a lab of the verb's own (`up`, the folder trusted,
@@ -1041,7 +1041,8 @@ fn session(n: u8, build: &str, expect: Expect) -> Result<(Run, Vec<Check>), Fail
     std::fs::create_dir_all(&into).map_err(|e| not_run(format!("{}: {e}", into.display())))?;
     for (i, p) in found.iter().enumerate() {
         let to = into.join(format!("{}.jsonl", i + 1));
-        std::fs::copy(p, &to).map_err(|e| not_run(format!("{}: {e}", p.display())))?;
+        crate::util::copy_regular_file(p, &to)
+            .map_err(|e| not_run(format!("{}: {e}", p.display())))?;
     }
     let mut checks = Vec::new();
     if c.fails.is_empty() {

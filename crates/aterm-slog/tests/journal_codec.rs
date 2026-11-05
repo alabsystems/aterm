@@ -199,6 +199,7 @@ fn the_decoder_refuses_what_is_not_a_line() {
         Kind::Shown,
         Kind::Row,
         Kind::MailGap,
+        Kind::Tab,
     ] {
         let line = future.replace("zzz-kind-of-phase-9", k.word());
         match decode_line(line.as_bytes()) {

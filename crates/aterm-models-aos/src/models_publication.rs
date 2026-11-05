@@ -50,7 +50,7 @@ pub fn aos_boundary_publication_model() -> Model {
                 rb = rev;
                 ib = cur;
             }
-            action Hold when (paused == 1 && arrived + 1 <= MaxIn && queued + 1 <= Cap) {
+            action Hold when (paused == 1 && arrived + 1 <= MaxIn && (queued + 1 <= Cap || Buggy == 5)) {
                 arrived = arrived + 1;
                 queued = queued + 1;
             }
@@ -108,8 +108,9 @@ pub fn aos_boundary_publication_model() -> Model {
             invariant EachInputOnce: delivered + queued == arrived;
             invariant StaleNeverCommitted: stale == 0;
             invariant DeliveredToTheLivePair: cur == delivered;
+            invariant QueueBounded: queued <= Cap;
             bound ArrivalsBounded: arrived <= MaxIn;
-            bound QueueBounded: queued <= Cap;
+            bound QueueRange: queued <= MaxIn;
             bound RevisionsBounded: rev <= MaxRev;
         }
     }

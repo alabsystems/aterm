@@ -199,9 +199,14 @@ impl Face {
         self.taken = 0;
     }
 
+    /// Whether a gap notice is due now: every record pushed before it was taken.
+    fn gap_due(&self) -> bool {
+        self.gaps.front().is_some_and(|(at, ..)| *at <= self.taken)
+    }
+
     /// The gap notice due now: every record pushed before it was taken.
     fn take_gap(&mut self) -> Option<astream_broker::Gap> {
-        if self.gaps.front().is_some_and(|(at, ..)| *at <= self.taken) {
+        if self.gap_due() {
             return self.gaps.pop_front().map(|(_, g, _)| g);
         }
         None
@@ -470,6 +475,27 @@ impl Queues {
             }
         }
         Some(item)
+    }
+
+    /// Onto `run`, the inbox records [`Queues::take`] would hand over next, one after the other,
+    /// while nothing it puts ahead of them has come: at most `max` in all, each counted against
+    /// the turn as its own take is. It ends where `take` would hand over anything else: a
+    /// closure, the fleet face's record or due gap notice, a resume, an event while the inbox
+    /// is not due, or the inbox's own due gap notice.
+    fn take_inbox_run(&mut self, now: Instant, max: usize, run: &mut Vec<Record>) {
+        while run.len() < max
+            && self.closed.is_empty()
+            && self.fleet.records.is_empty()
+            && !self.fleet.gap_due()
+            && self.resume.is_empty()
+            && !self.inbox.gap_due()
+            && (self.events.is_empty() || self.inbox_due(now))
+        {
+            match self.take_inbox(now) {
+                Some(Item::Inbox(r)) => run.push(r),
+                _ => return,
+            }
+        }
     }
 
     fn take_record(&mut self, s: Source) -> Option<Record> {
@@ -748,6 +774,14 @@ impl Mailbox {
         self.lock().take_urgent()
     }
 
+    /// Up to `max` inbox records more for the run in hand ([`Queues::take_inbox_run`]), never
+    /// waiting: nothing queued is an empty run.
+    pub(crate) fn take_inbox_run(&self, now: Instant, max: usize) -> Vec<Record> {
+        let mut run = Vec::new();
+        self.lock().take_inbox_run(now, max, &mut run);
+        run
+    }
+
     /// Block until an item is ready to take or `timeout` elapses, judging the inbox face's wait
     /// at `now` (the caller's clock, `Fx::now`'s world). A take that parked judges at `now` as
     /// well, which can only under-count an age: a park begins with nothing queued, so whatever
@@ -883,6 +917,58 @@ mod tests {
             });
         }
         assert_eq!(seen, ["closed", "fleet", "resume", "event", "inbox", "say"]);
+    }
+
+    /// AN INBOX RUN IS WHAT `take` WOULD HAND OVER NEXT, AND NOTHING PAST IT (C08): records 1
+    /// and 2 come as one run, which stops at the gap notice due after them; record 9 comes after
+    /// the notice; a run holds at most `max`; and an event queued while the inbox is not due, or
+    /// a fleet record, goes ahead of the rest.
+    #[test]
+    fn an_inbox_run_is_what_take_would_hand_over_next_and_nothing_past_it() {
+        use astream_broker::Gap;
+        let mb = Mailbox::default();
+        let offs = |run: Vec<Record>| run.into_iter().map(|(off, ..)| off).collect::<Vec<_>>();
+        for off in [1, 2] {
+            assert_eq!(mb.push(Source::Inbox, rec(off), 0, t0()), Pushed::Queued);
+        }
+        let gap = Gap {
+            from: 3,
+            to: 9,
+            records: None,
+        };
+        assert!(mb.push_gap(Source::Inbox, gap, 0, t0()));
+        assert_eq!(mb.push(Source::Inbox, rec(9), 0, t0()), Pushed::Queued);
+        assert_eq!(offs(mb.take_inbox_run(t0(), 8)), [1, 2], "up to the notice");
+        assert!(matches!(
+            mb.take(Duration::ZERO, t0()),
+            Some(Item::Gap(Source::Inbox, _))
+        ));
+        assert_eq!(offs(mb.take_inbox_run(t0(), 8)), [9]);
+        assert!(mb.take_inbox_run(t0(), 8).is_empty(), "nothing queued");
+
+        for off in 10..14 {
+            assert_eq!(mb.push(Source::Inbox, rec(off), 0, t0()), Pushed::Queued);
+        }
+        assert_eq!(offs(mb.take_inbox_run(t0(), 2)), [10, 11], "at most `max`");
+        mb.push_event("EVENT 1 post 1".into());
+        assert!(
+            mb.take_inbox_run(t0(), 8).is_empty(),
+            "an event the inbox is not due ahead of goes first"
+        );
+        assert!(matches!(
+            mb.take(Duration::ZERO, t0()),
+            Some(Item::Event(_))
+        ));
+        assert_eq!(mb.push(Source::Fleet, rec(20), 0, t0()), Pushed::Queued);
+        assert!(
+            mb.take_inbox_run(t0(), 8).is_empty(),
+            "a fleet record goes first"
+        );
+        assert!(matches!(
+            mb.take(Duration::ZERO, t0()),
+            Some(Item::Fleet(_))
+        ));
+        assert_eq!(offs(mb.take_inbox_run(t0(), 8)), [12, 13]);
     }
 
     /// A GAP NOTICE IS TAKEN IN ITS PLACE among its source's records (astream's tail writes it

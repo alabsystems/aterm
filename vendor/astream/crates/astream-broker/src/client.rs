@@ -18,12 +18,13 @@
 
 use crate::logid::{Lineage, LogIdentity};
 use crate::proto::{
-    append_commit_frame, append_frame, append_publish_frame, append_retire_frame,
-    decode_response_with_bt, encode_request, foreign_protocol, read_frame, Request, Response,
-    WireStats, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_PROTOCOL, ERR_RATE_LIMITED,
-    ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED,
-    LOG_POISONED_PREFIX, PROTO_VERSION, RATE_LIMITED_PREFIX, RETAINED_FROM_PREFIX,
-    RETIRE_CHARGED_PREFIX, RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
+    append_commit_frame, append_frame, append_publish_frame, append_relay_frame,
+    append_retire_frame, decode_delivery_origin, decode_response_with_bt, encode_request,
+    foreign_protocol, read_frame, Request, Response, WireStats, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER,
+    ERR_BAD_SUBJECT, ERR_PROTOCOL, ERR_RATE_LIMITED, ERR_RECORD_REFUSED, ERR_REFUSED,
+    ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION,
+    RATE_LIMITED_PREFIX, RETAINED_FROM_PREFIX, RETIRE_CHARGED_PREFIX, RETIRE_CUT_PREFIX,
+    RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
 };
 use crate::proto::{Gap, NonceExt, ServedInfo};
 use astream_wire::frame::decode_frame_header_bytes;
@@ -1272,6 +1273,12 @@ impl<S: Read + Write> Client<S> {
                     subject,
                     body,
                 } => append_publish_frame(&mut out, producer_id, producer_seq, subject, body)?,
+                Pipelined::Relay {
+                    producer_id,
+                    producer_seq,
+                    subject,
+                    body,
+                } => append_relay_frame(&mut out, producer_id, producer_seq, subject, body)?,
                 Pipelined::Commit { group, upto } => append_commit_frame(&mut out, group, upto)?,
             }
         }
@@ -1436,6 +1443,11 @@ impl<S: Read + Write> Client<S> {
             }
         }
         if let Err(e) = self.set_nowait(true) {
+            // A link with no non-blocking mode has lost nothing: the client stays framed, and the
+            // blocking `recv_publish_ack` still reads the ack.
+            if e.kind() == io::ErrorKind::Unsupported {
+                return Err(e);
+            }
             return Err(self.lose(e));
         }
         // Read through `rx`, which keeps the bytes of a frame the stream stopped
@@ -1825,6 +1837,50 @@ impl<S: Read + Write> Client<S> {
         };
         self.broker_times = Some(took);
         Ok(took)
+    }
+
+    /// Ask that this connection's deliveries carry each record's own `(producer_id, producer_seq)`
+    /// ([`Request::OriginStamps`], read back with [`Subscription::last_origin`]). `Ok(false)` from
+    /// a broker that predates the verb, with the stream still framed.
+    pub fn origin_stamps(&mut self) -> io::Result<bool> {
+        self.send(&Request::OriginStamps)?;
+        match self.read_mark() {
+            Ok(_) => Ok(true),
+            Err(e) if is_refused_error(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Append a record that originated elsewhere, under its origin's `(producer_id, producer_seq)`
+    /// ([`Request::Relay`]), returning `(offset, deduped)`. Refused with [`AcksOwed`], sending
+    /// nothing, while pipelined acks are owed.
+    pub fn relay(
+        &mut self,
+        producer_id: u64,
+        producer_seq: u64,
+        subject: &str,
+        body: &[u8],
+    ) -> io::Result<(u64, bool)> {
+        self.owes_nothing()?;
+        self.send_pipelined(&[Pipelined::Relay {
+            producer_id,
+            producer_seq,
+            subject,
+            body,
+        }])?;
+        self.recv_publish_ack()
+    }
+
+    /// Ask for a `Mark` each time this connection's tail catches up after delivering, and once as
+    /// it first catches up ([`Request::BurstMarks`]): [`Event::Mark`] ends a burst. `Ok(false)`
+    /// from a broker that predates the verb, with the stream still framed.
+    pub fn burst_marks(&mut self) -> io::Result<bool> {
+        self.send(&Request::BurstMarks)?;
+        match self.read_mark() {
+            Ok(_) => Ok(true),
+            Err(e) if is_refused_error(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// LIFT THIS CONNECTION'S GAP FENCES ([`Request::ClearGapFences`]): the broker answers
@@ -2692,6 +2748,7 @@ impl<S: Read + Write> Client<S> {
             durable: self.durable,
             gap: None,
             last_bt: None,
+            last_origin: None,
         })
     }
 }
@@ -2845,6 +2902,17 @@ pub enum Pipelined<'a> {
         /// Its sequence within that producer.
         producer_seq: u64,
         /// Where it is published.
+        subject: &'a str,
+        /// What it carries.
+        body: &'a [u8],
+    },
+    /// What [`Client::relay`] writes: a record that originated elsewhere, under its origin's key.
+    Relay {
+        /// The origin's producer id.
+        producer_id: u64,
+        /// The origin's sequence.
+        producer_seq: u64,
+        /// Where it was published.
         subject: &'a str,
         /// What it carries.
         body: &'a [u8],
@@ -3295,6 +3363,9 @@ pub struct Subscription<S = UnixStream> {
     /// Monotone broker-stamped wall time (`bt=`, unix ms; `REQUIREMENTS` R3) carried by
     /// the most recent `Delivery` read on this stream.
     last_bt: Option<u64>,
+    /// The `(producer_id, producer_seq)` the most recent `Delivery` carried, on a stream that
+    /// asked ([`Client::origin_stamps`]).
+    last_origin: Option<(u64, u64)>,
 }
 
 /// A live delivery stream from the broker (Windows twin: TCP default, as above).
@@ -3313,6 +3384,9 @@ pub struct Subscription<S = TcpStream> {
     /// Monotone broker-stamped wall time (`bt=`, unix ms; `REQUIREMENTS` R3) carried by
     /// the most recent `Delivery` read on this stream.
     last_bt: Option<u64>,
+    /// The `(producer_id, producer_seq)` the most recent `Delivery` carried, on a stream that
+    /// asked ([`Client::origin_stamps`]).
+    last_origin: Option<(u64, u64)>,
 }
 
 #[cfg(unix)]
@@ -3643,6 +3717,12 @@ impl<S: Read + Write> Subscription<S> {
         self.last_bt
     }
 
+    /// The `(producer_id, producer_seq)` the most recent delivery carried (`None` before the
+    /// first delivery, or when the connection did not ask with [`Client::origin_stamps`]).
+    pub const fn last_origin(&self) -> Option<(u64, u64)> {
+        self.last_origin
+    }
+
     /// Block until the next matching delivery; `Ok(None)` if the broker closes.
     /// A `Mark` and a gap notice are SKIPPED (this method's signature is unchanged) —
     /// read [`recv_event`](Self::recv_event) to see them, or
@@ -3699,6 +3779,7 @@ impl<S: Read + Write> Subscription<S> {
                 body,
             } => {
                 self.last_bt = bt_ms;
+                self.last_origin = decode_delivery_origin(&p);
                 Ok(Some(Event::Delivery {
                     offset,
                     subject,
@@ -3940,7 +4021,7 @@ impl std::fmt::Debug for Transport {
 /// The [`AnyClient`] that [`connect`] hands back beside it shares that duplicate (it is
 /// how the client's [`try_recv_publish_ack`](Client::try_recv_publish_ack) reaches the
 /// socket under its erased stream), so the duplicate is closed when both are gone.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Closer {
     socket: Arc<Socket>,
 }
@@ -3951,6 +4032,8 @@ enum Socket {
     #[cfg(unix)]
     Unix(UnixStream),
     Tcp(TcpStream),
+    #[cfg(feature = "stream")]
+    Stream(Arc<dyn crate::stream_link::StreamLink>),
 }
 
 impl Socket {
@@ -3962,6 +4045,8 @@ impl Socket {
             #[cfg(unix)]
             Socket::Unix(s) => s.set_nonblocking(on),
             Socket::Tcp(s) => s.set_nonblocking(on),
+            #[cfg(feature = "stream")]
+            Socket::Stream(s) => s.set_nonblocking(on),
         }
     }
 }
@@ -3996,6 +4081,8 @@ impl Closer {
             #[cfg(unix)]
             Socket::Unix(s) => s.shutdown(std::net::Shutdown::Both),
             Socket::Tcp(s) => s.shutdown(std::net::Shutdown::Both),
+            #[cfg(feature = "stream")]
+            Socket::Stream(s) => s.shutdown(std::net::Shutdown::Both),
         };
     }
 
@@ -4029,6 +4116,8 @@ impl Closer {
             #[cfg(unix)]
             Socket::Unix(s) => unless_hung_up(s.set_read_timeout(d), s),
             Socket::Tcp(s) => unless_hung_up(s.set_read_timeout(d), s),
+            #[cfg(feature = "stream")]
+            Socket::Stream(s) => s.set_read_timeout(d),
         }
     }
 
@@ -4050,6 +4139,8 @@ impl Closer {
             #[cfg(unix)]
             Socket::Unix(s) => unless_hung_up(s.set_write_timeout(d), s),
             Socket::Tcp(s) => unless_hung_up(s.set_write_timeout(d), s),
+            #[cfg(feature = "stream")]
+            Socket::Stream(s) => s.set_write_timeout(d),
         }
     }
 }
@@ -4062,7 +4153,10 @@ impl Closer {
 /// poll. It takes the socket, never a closure that polls it, so the verified lane
 /// resolves the probe at every caller.
 #[cfg(target_vendor = "apple")]
-fn unless_hung_up(set: io::Result<()>, socket: &impl std::os::fd::AsFd) -> io::Result<()> {
+pub(crate) fn unless_hung_up(
+    set: io::Result<()>,
+    socket: &impl std::os::fd::AsFd,
+) -> io::Result<()> {
     if matches!(&set, Err(e) if e.raw_os_error() == Some(XNU_EINVAL)) && socket_hung_up(socket) {
         return Ok(());
     }
@@ -4071,7 +4165,7 @@ fn unless_hung_up(set: io::Result<()>, socket: &impl std::os::fd::AsFd) -> io::R
 
 /// Off Apple a refusal is always the error (see the Apple twin).
 #[cfg(not(target_vendor = "apple"))]
-fn unless_hung_up<S>(set: io::Result<()>, _socket: &S) -> io::Result<()> {
+pub(crate) fn unless_hung_up<S>(set: io::Result<()>, _socket: &S) -> io::Result<()> {
     set
 }
 
@@ -4147,6 +4241,19 @@ pub fn connect(
         Transport::Sealed(key) => connect_sealed(endpoint, key.as_ref(), connect_timeout),
         Transport::Handshake(key) => connect_handshake(endpoint, key.as_ref(), connect_timeout),
     }
+}
+
+/// A client over a stream the embedder already authenticated, and the [`Closer`] that ends it
+/// and bounds its I/O through the stream itself: no descriptor is duplicated. The stream comes
+/// back as it was handed over. The broker's side is
+/// [`Broker::serve_stream`](crate::Broker::serve_stream).
+#[cfg(feature = "stream")]
+#[must_use]
+pub fn connect_stream(link: Arc<dyn crate::stream_link::StreamLink>) -> (AnyClient, Closer) {
+    let closer = Closer {
+        socket: Arc::new(Socket::Stream(Arc::clone(&link))),
+    };
+    erase(crate::stream_link::LinkEnd(link), closer)
 }
 
 /// Box a connected stream behind [`AnyStream`], beside its closer. The box hides the

@@ -363,7 +363,7 @@ pub(in crate::harness) fn adopt(
     env: &Env,
     host: &dyn AccountsHost,
     store: &accounts::Store,
-    _signin: &accounts::Lock,
+    signin: &super::Begun,
     roster_path: &Path,
     candidate: Candidate,
 ) -> Result<bool, String> {
@@ -431,6 +431,9 @@ pub(in crate::harness) fn adopt(
         }
     } else if raw.row(&row.label).is_some() {
         return Err("approved account label is already used by another local identity".into());
+    }
+    if !signin.names(cli, &row.label) {
+        return Err("the sign-in started here names another account".into());
     }
     if row.browser.is_some() {
         return Err(super::super::account_catalog::NAMED_BROWSER_UNSUPPORTED.into());

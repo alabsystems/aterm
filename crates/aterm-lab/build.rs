@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The lab's commit stamp `ATERM_LAB_GIT_COMMIT` (12 hex digits, `-dirty` when the tree has changes outside the measured ledger `docs/measured` (`crates/aterm/stamp_paths.rs`), `unknown` without git), from which `aos-search` names its evaluator's build; and the toolchain line `ATERM_LAB_TOOLCHAIN` (the first line of `$RUSTC -vV`) and build profile `ATERM_LAB_PROFILE` (cargo's `PROFILE` and `OPT_LEVEL`) its workers' execution identity carries.
+// The lab's commit stamp `ATERM_LAB_GIT_COMMIT` (12 hex digits, `-dirty` when the tree has changes outside the measured ledger `docs/measured` (`crates/aterm/stamp_paths.rs`), `unknown` without git), from which `aos-search` names its evaluator's build; and the build profile `ATERM_LAB_PROFILE` (cargo's `PROFILE` and `OPT_LEVEL`) the GPU and learn benches record.
 
 #![allow(
     clippy::disallowed_types,
@@ -41,11 +41,6 @@ fn main() {
         }
     };
     println!("cargo:rustc-env=ATERM_LAB_GIT_COMMIT={commit}");
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let toolchain = run(&rustc, &["-vV"])
-        .and_then(|v| v.lines().next().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=ATERM_LAB_TOOLCHAIN={toolchain}");
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
     let opt = std::env::var("OPT_LEVEL").unwrap_or_else(|_| "unknown".into());
     println!("cargo:rustc-env=ATERM_LAB_PROFILE={profile} opt-level={opt}");

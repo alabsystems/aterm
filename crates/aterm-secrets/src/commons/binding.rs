@@ -10,7 +10,7 @@
 use crate::{Error, Result, SecretBytes, age};
 use aterm_digest::Sha256;
 use aterm_time::Instant;
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::time::Duration;
 use zeroize::Zeroize;
 
@@ -155,12 +155,13 @@ impl Request {
         }
         let end = REQUEST_LEN - 64;
         let binding = Binding::decode(&wire[4..end])?;
-        UnparsedPublicKey::new(&ED25519, binding.writer)
-            .verify(
-                message(REQUEST_DOMAIN, &wire[..end]).as_slice(),
-                &wire[end..],
-            )
-            .map_err(|_| Error::new("Commons device request signature failed"))?;
+        if !crate::ed25519::verifies(
+            &binding.writer,
+            message(REQUEST_DOMAIN, &wire[..end]).as_slice(),
+            &wire[end..],
+        ) {
+            return Err(Error::new("Commons device request signature failed"));
+        }
         Ok(Self {
             binding,
             wire: wire.to_vec(),
@@ -324,12 +325,11 @@ impl Pending {
         if response.len() != RESPONSE_LEN
             || &response[..4] != b"ACP1"
             || response[4..36] != self.id
-            || UnparsedPublicKey::new(&ED25519, self.binding.writer)
-                .verify(
-                    response_message(&self.id, plain.as_slice()).as_slice(),
-                    &response[36..],
-                )
-                .is_err()
+            || !crate::ed25519::verifies(
+                &self.binding.writer,
+                response_message(&self.id, plain.as_slice()).as_slice(),
+                &response[36..],
+            )
         {
             return Err(Error::new("invalid Commons possession response"));
         }

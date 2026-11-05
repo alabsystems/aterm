@@ -188,7 +188,13 @@ pub fn read_log(
             .filter(|c| c.collection == collection.name)
         {
             let parsed = change.key.split_once('.').and_then(|(uuid, text)| {
-                let n = text.parse::<u64>().ok().filter(|n| n.to_string() == text)?;
+                if text.is_empty()
+                    || (text.len() > 1 && text.starts_with('0'))
+                    || !text.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return None;
+                }
+                let n = text.parse::<u64>().ok()?;
                 Some((keys::parse_uuid32(uuid)?, n))
             });
             let signer = resolve(&op.roster, &op.actor);

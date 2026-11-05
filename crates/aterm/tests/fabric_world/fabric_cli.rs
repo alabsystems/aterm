@@ -108,7 +108,12 @@ impl Scratch {
     }
 
     fn write_config(&self, body: &str) {
-        std::fs::write(self.dir.path().join("cfg/aterm/aterm.toml"), body).expect("config");
+        aterm_uds::atomic_file::write(
+            &self.dir.path().join("cfg/aterm/aterm.toml"),
+            body.as_bytes(),
+            0o600,
+        )
+        .expect("config");
     }
 
     fn config_path(&self) -> String {
@@ -534,6 +539,31 @@ fn the_report_and_its_doctor_say_what_the_broker_says_of_its_log() {
                 .as_u64()
                 .is_some(),
             "{kind} in {out}"
+        );
+    }
+    // How long the broker process's flushes took, on astream-sys's clock, with its ring (E09):
+    // each kind's total, the slow count and the calls running are numbers, and every slow flush
+    // it keeps ends no earlier than it starts and carries its index, below the slow count (E09c).
+    let times = &health["snapshot"]["process_flush_times"];
+    assert_eq!(
+        times["clock"].as_str(),
+        Some(aterm_link::wait_tally::FLUSH_CLOCK.word()),
+        "{out}"
+    );
+    for key in ["full_ns", "barrier_ns", "plain_ns", "slow_count", "running"] {
+        assert!(times[key].as_u64().is_some(), "{key} in {out}");
+    }
+    for f in arr(times, "slow") {
+        assert!(
+            f["start_ns"].as_u64() <= f["end_ns"].as_u64(),
+            "a slow flush that ends before it starts: {out}"
+        );
+        assert!(
+            f["index"]
+                .as_u64()
+                .zip(times["slow_count"].as_u64())
+                .is_some_and(|(i, count)| i < count),
+            "a slow flush with no index below its count: {out}"
         );
     }
     // What of its log the broker keeps decoded, as the holds row's `resident=` quotes it (D10):

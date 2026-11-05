@@ -170,6 +170,8 @@ pub enum WriteOp {
     RefCreate,
     /// Delete a ref through `git push --force-with-lease`.
     RefDelete,
+    /// Atomically compare and update a repository's refs. One-shot.
+    RefUpdateAtomic,
     /// POST an SSH key to `/user/keys`.
     KeyAdd,
     /// DELETE an SSH key.
@@ -179,7 +181,7 @@ pub enum WriteOp {
 }
 
 /// Every op, in declaration order: `parse` reads its slugs from here.
-const WRITE_OPS: [WriteOp; 12] = [
+const WRITE_OPS: [WriteOp; 13] = [
     WriteOp::ReleaseCreate,
     WriteOp::ReleaseUpdate,
     WriteOp::ReleasePublish,
@@ -189,6 +191,7 @@ const WRITE_OPS: [WriteOp; 12] = [
     WriteOp::AssetRename,
     WriteOp::RefCreate,
     WriteOp::RefDelete,
+    WriteOp::RefUpdateAtomic,
     WriteOp::KeyAdd,
     WriteOp::KeyDelete,
     WriteOp::Api,
@@ -196,7 +199,7 @@ const WRITE_OPS: [WriteOp; 12] = [
 
 impl WriteOp {
     /// `release.create`, `release.update`, `release.publish`, `release.delete`,
-    /// `asset.upload`, `asset.delete`, `asset.rename`, `ref.create`, `ref.delete`,
+    /// `asset.upload`, `asset.delete`, `asset.rename`, `ref.create`, `ref.delete`, `ref.update-atomic`,
     /// `key.add`, `key.delete`, `api`.
     #[must_use]
     pub const fn slug(self) -> &'static str {
@@ -210,6 +213,7 @@ impl WriteOp {
             WriteOp::AssetRename => "asset.rename",
             WriteOp::RefCreate => "ref.create",
             WriteOp::RefDelete => "ref.delete",
+            WriteOp::RefUpdateAtomic => "ref.update-atomic",
             WriteOp::KeyAdd => "key.add",
             WriteOp::KeyDelete => "key.delete",
             WriteOp::Api => "api",

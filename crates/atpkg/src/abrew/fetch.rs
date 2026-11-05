@@ -284,22 +284,9 @@ pub fn head_size(url: &str, headers: &[&str]) -> Option<u64> {
 
 /// SHA-256 of a file, lowercase hex (ring, streamed).
 pub fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut f = crate::metadata_io::open_regular(path)
+    let f = crate::metadata_io::open_regular(path)
         .map_err(|e| format!("abrew: cannot read {}: {e}", path.display()))?;
-    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| format!("abrew: cannot read {}: {e}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        if let Some(chunk) = buf.get(..n) {
-            ctx.update(chunk);
-        }
-    }
-    Ok(hex(ctx.finish().as_ref()))
+    crate::tree::sha256_opened(f).map_err(|e| format!("abrew: cannot read {}: {e}", path.display()))
 }
 
 /// SHA-256 of bytes, lowercase hex.
@@ -309,28 +296,25 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    aterm_codec::hex::encode_lower(bytes)
 }
 
 /// Verify a regular, non-symlink cache entry.
 pub fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
-    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()) {
-        return Err(format!(
+    let f = crate::metadata_io::open_regular(path).map_err(|_| {
+        format!(
             "abrew: cache entry is not a regular file: {}",
             path.display()
-        ));
-    }
+        )
+    })?;
     if expected == "no_check" {
         return Ok(());
     }
     if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("abrew: missing or malformed SHA-256".to_string());
     }
-    let got = sha256_file(path)?;
+    let got = crate::tree::sha256_opened(f)
+        .map_err(|e| format!("abrew: cannot read {}: {e}", path.display()))?;
     if got.eq_ignore_ascii_case(expected) {
         Ok(())
     } else {
@@ -397,17 +381,13 @@ fn copy_mounted_tree(src_root: &Path, dir: &Path) -> Result<(), String> {
                     super::prefix::symlink_file(&target, &dst)?;
                 }
             } else if kind.is_file() {
-                let meta = entry.metadata().map_err(|e| format!("abrew: {e}"))?;
+                let (source, meta) = crate::metadata_io::open_regular_with_meta(&entry.path())
+                    .map_err(|e| format!("abrew: cannot read payload: {e}"))?;
                 let remaining = UNSIGNED_SIZE_CAP.saturating_sub(bytes);
                 if meta.len() > remaining {
                     return Err("abrew: dmg size limit exceeded".to_string());
                 }
-                let source = crate::metadata_io::open_regular(&entry.path())
-                    .map_err(|e| format!("abrew: cannot read payload: {e}"))?;
-                let mut dest = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&dst)
+                let mut dest = crate::platform::open_create_new_write(&dst, 0o644)
                     .map_err(|e| format!("abrew: cannot stage payload: {e}"))?;
                 let copied =
                     std::io::copy(&mut source.take(remaining.saturating_add(1)), &mut dest)
@@ -460,8 +440,11 @@ impl std::fmt::Display for DmgError {
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
 const DMG_ATTACH_LIMIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg(all(target_os = "macos", not(test)))]
 const DMG_DETACH_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Unit tests: the hang detector, since every detach these tests run must finish.
+#[cfg(all(test, unix))]
+const DMG_DETACH_LIMIT: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 #[cfg(target_os = "macos")]
 const DMG_REAP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -685,8 +668,9 @@ pub(super) fn copy_regular(src: &Path, dst: &Path) -> Result<(), String> {
     if !meta.file_type().is_file() {
         return Err("abrew: naked payload is not a regular file".to_string());
     }
-    std::fs::copy(src, dst).map_err(|e| format!("abrew: cannot stage payload: {e}"))?;
-    Ok(())
+    crate::metadata_io::copy_regular_file(src, dst)
+        .map(|_| ())
+        .map_err(|e| format!("abrew: cannot stage payload: {e}"))
 }
 
 pub fn untar(archive: &Path, dir: &Path) -> Result<(), String> {

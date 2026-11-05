@@ -606,6 +606,8 @@ pub fn quiet_environment() {}
 pub struct Opts {
     pub home: PathBuf,
     pub state: PathBuf,
+    /// The trusted local account namespace used when constructing or executing Claude commands.
+    pub account_roster: Option<PathBuf>,
     pub sock: Option<String>,
     /// The window harness's own token, presented on [`Self::sock`] alone ([`harness_client`]):
     /// a window's sweep passes it, so what the drive types reads `by=harness`; the CLI's is
@@ -1300,12 +1302,15 @@ pub(super) fn background(pid: u32, t: &[ProcRow]) -> Vec<String> {
 }
 
 /// The agent's own work a restart would end: the shells under it ([`background`]), and the work
-/// Claude Code's own words say runs in its own process, which no process row names: its status
-/// row's `Waiting for …`, the wait it carries above its own wake, a done row's `… still running`
-/// ([`aterm_phase::phase::in_process_work`], read whatever rule the reader reads first).
+/// Claude Code's screen names that no process row names ([`aterm_phase::phase::unlisted_work`],
+/// read whatever rule the reader reads first): the work it runs in its own process (its status
+/// row's `Waiting for …`, the wait it carries above its own wake, a done row's `… still running`),
+/// and any work its footer's pill counts that is no shell or monitor counted alone (`1 MCP task`,
+/// `2 background tasks`, `◇ 1 cloud session`). The shells and monitors the screen names are the
+/// process table's to name, read here, not off the screen.
 pub(super) fn own_work(pid: u32, t: &[ProcRow], rows: &[String]) -> Vec<String> {
     let mut work = background(pid, t);
-    if let Some(rule) = aterm_phase::phase::in_process_work(rows) {
+    if let Some(rule) = aterm_phase::phase::unlisted_work(rows) {
         work.push(format!("screen:{}", rule.replace(' ', "-")));
     }
     work
@@ -1689,15 +1694,20 @@ pub(super) fn names_program(exe: &Path, program: &str) -> bool {
         .is_some_and(|tool| exe.file_name() == Some(std::ffi::OsStr::new(&tool.exe_file())))
 }
 
-/// `twin` when it is a managed twin that execs `program`'s own build ([`catalog::twin_binary`]:
-/// a `sh` twin's body, or on Windows a `.cmd` twin's) by its executable's name
-/// ([`names_program`]), and that executable is a file.
-pub(super) fn twin_naming(twin: &Path, program: &str) -> Option<PathBuf> {
+/// The build a managed twin `twin` of `program` execs ([`catalog::twin_binary`]: a `sh` twin's
+/// body, or on Windows a `.cmd` twin's), named by its executable's name ([`names_program`]) and a
+/// file.
+pub(super) fn twin_build(twin: &Path, program: &str) -> Option<PathBuf> {
     let text = crate::harness::accounts::read_bounded(twin, 64 * 1024)
         .ok()
         .flatten()?;
     let exe = catalog::twin_binary(&text)?;
-    (names_program(&exe, program) && exe.is_file()).then(|| twin.to_path_buf())
+    (names_program(&exe, program) && exe.is_file()).then_some(exe)
+}
+
+/// `twin` when it execs `program`'s own build ([`twin_build`]).
+pub(super) fn twin_naming(twin: &Path, program: &str) -> Option<PathBuf> {
+    twin_build(twin, program).map(|_| twin.to_path_buf())
 }
 
 /// `program`'s managed twin ([`twin_naming`]) in the `agents/` directory `agents`, where atpkg
@@ -2368,6 +2378,10 @@ pub(super) struct Screen {
         )
     )]
     pub(super) title: Option<String>,
+    /// The person's input count the host took with `rows` (`"human_seq"`), which a turn fences on
+    /// (`turn if-human=`): a key since that moves no fenced row stops it. `None` where the host sent
+    /// none.
+    pub(super) human_seq: Option<u64>,
 }
 
 pub(super) fn screen(c: &mut Client, sid: &str) -> Option<Screen> {
@@ -2428,6 +2442,7 @@ fn parse_screen(json: &str) -> Option<Screen> {
         generation,
         human,
         title: v.get("title").and_then(Value::as_str).map(str::to_owned),
+        human_seq: v.get("human_seq").and_then(Value::as_u64),
     })
 }
 
@@ -2767,6 +2782,9 @@ pub(super) struct NoSocket;
 pub(super) enum Typed {
     Changed,
     Yielded,
+    /// The person made a gesture since the read it was fenced on (`if-human=`), and nothing of it
+    /// was put: the person's grace is the caller's to wait out before it types again.
+    Person,
     Cut(String),
     Refused(String),
     /// Its reply did not come within its wait ([`crate::unanswered`]): the server may still type
@@ -2779,6 +2797,7 @@ impl Typed {
         match self {
             Typed::Changed => "changed".to_string(),
             Typed::Yielded => "yield".to_string(),
+            Typed::Person => "person".to_string(),
             Typed::Cut(why) => format!("cut-{why}"),
             Typed::Refused(e) => first_word(e),
             Typed::Unanswered => "unanswered".to_string(),
@@ -2864,13 +2883,23 @@ fn turn_takes_rows(c: &mut Client) -> bool {
         .is_ok_and(|(head, body)| crate::is_ok_reply(&head) && (head + &body).contains("if-rows="))
 }
 
+/// Whether the host's `turn` fences on the person (`if-human=`): an older one reads the word as the
+/// turn's text, so it is sent only where `help turn` names it.
+fn turn_takes_human(c: &mut Client) -> bool {
+    c.help_counted("turn")
+        .is_ok_and(|(head, body)| crate::is_ok_reply(&head) && (head + &body).contains("if-human="))
+}
+
+/// One turn of `text`, fenced on `generation` (the screen's, or the composer's rows) and on `human`,
+/// the person's input count of the same read: a key since, drawn or not, stops it.
 pub(super) fn turn_fenced(
     c: &mut Client,
     sid: &str,
     text: &str,
     generation: Option<&str>,
+    human: Option<u64>,
 ) -> Result<(), Typed> {
-    checked_turn(c, sid, text, generation, Put::Paste)
+    checked_turn(c, sid, text, generation, human, Put::Paste)
 }
 
 #[cfg(all(test, unix))]
@@ -2880,7 +2909,7 @@ pub(super) fn notice_fenced(
     text: &str,
     generation: Option<&str>,
 ) -> Result<(), Typed> {
-    checked_turn(c, sid, text, generation, Put::Pressed)
+    checked_turn(c, sid, text, generation, None, Put::Pressed)
 }
 
 fn checked_turn(
@@ -2888,9 +2917,10 @@ fn checked_turn(
     sid: &str,
     text: &str,
     generation: Option<&str>,
+    human: Option<u64>,
     put: Put,
 ) -> Result<(), Typed> {
-    checked_turn_for_duty(c, sid, text, generation, put, None)
+    checked_turn_for_duty(c, sid, text, generation, human, put, None)
 }
 
 fn checked_turn_for_duty(
@@ -2898,6 +2928,7 @@ fn checked_turn_for_duty(
     sid: &str,
     text: &str,
     generation: Option<&str>,
+    human: Option<u64>,
     put: Put,
     authority: Option<(super::contract::Scope, u64)>,
 ) -> Result<(), Typed> {
@@ -2911,6 +2942,10 @@ fn checked_turn_for_duty(
         Some(g) if is_generation(g) && turn_takes_gen(c) => format!("if-gen={g} "),
         _ => String::new(),
     };
+    let person = human
+        .filter(|_| turn_takes_human(c))
+        .map(|n| format!("if-human={n} "))
+        .unwrap_or_default();
     let keys = if put == Put::Pressed && turn_takes_cap(c) {
         NOTICE_KEYS
     } else {
@@ -2942,7 +2977,7 @@ fn checked_turn_for_duty(
     };
     let (head, _) = c
         .request_counted(&format!(
-            "@{sid} turn {authority_words}{fence}{keys}{submit}yield=0.2 {wait} {text}"
+            "@{sid} turn {authority_words}{fence}{person}{keys}{submit}yield=0.2 {wait} {text}"
         ))
         .map_err(|e| Typed::of_io(&e))?;
     turn_verdict(&head)
@@ -2959,14 +2994,18 @@ fn turn_verdict(head: &str) -> Result<(), Typed> {
     if words.contains(&"skipped") {
         let field = |key: &str| words.iter().find_map(|w| w.strip_prefix(key));
         let reason = field("reason=").unwrap_or_default();
-        let typed = field("typed=").and_then(crate::parse_uint::<u64>);
+        // Keys typed or a paste put: the text stands where the turn left it.
+        let typed = field("typed=")
+            .and_then(crate::parse_uint::<u64>)
+            .max(field("pasted=").and_then(crate::parse_uint::<u64>));
         return Err(match (reason, typed) {
             (why, Some(1..)) => {
                 Typed::Cut(if why.is_empty() { "unknown" } else { why }.to_string())
             }
             ("guard", _) => Typed::Cut("guard".to_string()),
             ("changed", _) => Typed::Changed,
-            ("person" | "deadline", _) => Typed::Yielded,
+            ("person", _) => Typed::Person,
+            ("deadline", _) => Typed::Yielded,
             _ => Typed::Refused(head.to_string()),
         });
     }
@@ -3264,6 +3303,17 @@ pub fn tap_settings_under(
     argv: &[String],
     cwd: &str,
 ) -> Vec<(String, super::netwatch::Source)> {
+    tap_settings_for_directory(home, None, argv, cwd)
+}
+
+/// Read the same settings chain in an observed HOME/CLAUDE_CONFIG_DIR namespace.
+#[must_use]
+pub fn tap_settings_for_directory(
+    home: &Path,
+    config: Option<&str>,
+    argv: &[String],
+    cwd: &str,
+) -> Vec<(String, super::netwatch::Source)> {
     use crate::supervise::policy::claude_settings;
     use crate::supervise::policy::git_config::WorkerEnv;
     let Ok(mut flags) = upgrade::rewrite_argv(argv, "-") else {
@@ -3283,6 +3333,7 @@ pub fn tap_settings_under(
             home.display()
         )]
         .into_iter()
+        .chain(config.map(|config| format!("{}={config}", super::accounts::HOME_ENV)))
         .chain(account.clone())
         .chain(cowork.then(|| "CLAUDE_CODE_USE_COWORK_PLUGINS=1".to_string()))
         .collect();
@@ -3922,6 +3973,8 @@ pub(super) struct St {
     pub(super) native_prepare: String,
     /// Persisted before any native dispatch; terminal receipts never restore raw fallback.
     pub(super) native_coordination: bool,
+    /// A positive NotGranted retirement preserves the owed recipe, never a launch grant.
+    pub(super) native_retired_unissued: bool,
     /// Completed data is never an active grant; later crash entry mints a new operation.
     pub(super) native_completed_prepare: Option<Box<super::native_act::Prepare>>,
     pub(super) native_observation: Option<super::native_observe::SavedObservation>,
@@ -3952,6 +4005,10 @@ pub(super) struct St {
     pub(super) model_list: String,
     pub(super) fallback_from: Option<String>,
     pub(super) login: Option<String>,
+    /// Exact forward account attribution. Missing legacy attribution never grants execution.
+    pub(super) account_intent: Option<super::accounts_pool::ExecutionIntent>,
+    /// Independent account attribution of the retained rollback command.
+    pub(super) back_account_intent: Option<super::accounts_pool::ExecutionIntent>,
     pub(super) home: Option<String>,
     pub(super) home_profile: Option<String>,
     pub(super) failed_start_kept: Option<FailedStart>,
@@ -4038,6 +4095,10 @@ pub(super) struct St {
     pub(super) limit_spend: bool,
     pub(super) quiet: bool,
     pub(super) restart_look: bool,
+    /// The relaunch's process was found on the conversation and gone before it came up, and its
+    /// stop waits on its native operation's retirement: no look finds that process again, so the
+    /// next step ([`super::relaunch::await_new`]) reads that end here.
+    pub(super) found_gone: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4347,10 +4408,21 @@ impl St {
         self.stop_streak = kept.stop_streak;
     }
 
-    /// Turns a restart whose relaunched build ended without registering the conversation back
-    /// to the build it ran ([`Self::back_line`]), at `now`. No gate let that end go, so a
+    /// Turns a restart whose relaunched build ended, unregistered or found gone before it came
+    /// up, back to the build it ran ([`Self::back_line`]), at `now`. No gate let that end go, so a
     /// person's keys hold the line back for the whole `grace_s` ([`Self::line_grace_s`]).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeRetirementDebt",
+            action = "Rollback",
+            project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+        )
+    )]
     pub(super) fn roll_back(&mut self, now: u64, grace_s: u32) -> bool {
+        if self.native_retired_unissued {
+            return false;
+        }
         let claude = match self.agent {
             upgrade::Agent::Claude => true,
             upgrade::Agent::Codex | upgrade::Agent::Agy | upgrade::Agent::Muse => false,
@@ -4363,6 +4435,7 @@ impl St {
         SAME_PROGRAM.clone_into(&mut self.source);
         self.to.clone_from(&self.from);
         self.line = std::mem::take(&mut self.back_line);
+        self.account_intent = self.back_account_intent.take();
         self.native_rollback = self.native.is_some() || !self.native_prepare.is_empty();
         self.line_grace_s = Some(grace_s);
         self.model_list.clear();
@@ -4422,10 +4495,9 @@ impl St {
         who: Proc<'_>,
         now: u64,
     ) -> (St, Retarget) {
-        if let Some(old) = prior
-            .as_ref()
-            .filter(|old| old.native.is_some() || !old.native_prepare.is_empty())
-        {
+        if let Some(old) = prior.as_ref().filter(|old| {
+            old.native_retired_unissued || old.native.is_some() || !old.native_prepare.is_empty()
+        }) {
             let mut kept = old.clone();
             kept.native_coordination = true;
             return (kept, Retarget::Kept);
@@ -4767,8 +4839,17 @@ impl St {
         }
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeRetirementDebt",
+            action = "Retarget",
+            project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+        )
+    )]
     fn preserve_unresolved_native(&self, st: &mut St) -> bool {
-        if self.native.is_none() && self.native_prepare.is_empty() {
+        if !self.native_retired_unissued && self.native.is_none() && self.native_prepare.is_empty()
+        {
             return false;
         }
         // A new target/record cannot replace the only retained id/capability/recipe/budget.
@@ -4779,6 +4860,8 @@ impl St {
     }
 
     fn new_round(&mut self, now: u64) {
+        self.account_intent = None;
+        self.back_account_intent = None;
         if self.pending_since == 0 {
             self.pending_since = self.salt;
         }
@@ -4956,7 +5039,7 @@ impl St {
         }
     }
 
-    fn to_json(&self) -> String {
+    pub(super) fn to_json(&self) -> String {
         let (name, at, asks, why) = match &self.phase {
             Phase::Pending => ("pending", 0, 0, ""),
             Phase::Announced { at_s, asks } => ("announced", *at_s, *asks, ""),
@@ -5029,8 +5112,11 @@ impl St {
         if self.native_rollback {
             o.insert("native_rollback".into(), Value::Bool(true));
         }
-        if self.native_coordination {
+        if self.native_coordination || self.native_retired_unissued {
             o.insert("native_coordination".into(), Value::Bool(true));
+        }
+        if self.native_retired_unissued {
+            o.insert("native_retired_unissued".into(), Value::Bool(true));
         }
         if let Some(encoded) = self
             .native_completed_prepare
@@ -5048,6 +5134,12 @@ impl St {
         }
         if let Some(login) = &self.login {
             o.insert("login".into(), Value::from(login.as_str()));
+        }
+        if let Some(intent) = &self.account_intent {
+            o.insert("account_intent".into(), intent.to_value());
+        }
+        if let Some(intent) = &self.back_account_intent {
+            o.insert("back_account_intent".into(), intent.to_value());
         }
         if let Some(binding) = &self.native {
             o.insert("native_id".into(), Value::from(binding.id.as_str()));
@@ -5155,6 +5247,7 @@ impl St {
             ("quiet", u64::from(self.quiet)),
             ("limit_spend", u64::from(self.limit_spend)),
             ("restart_look", u64::from(self.restart_look)),
+            ("found_gone", u64::from(self.found_gone)),
         ] {
             o.insert(k.into(), Value::from(v));
         }
@@ -5203,7 +5296,15 @@ impl St {
         aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
     }
 
-    fn from_json(text: &str) -> Option<St> {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeRetirementDebt",
+            action = "Reload",
+            project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+        )
+    )]
+    pub(super) fn from_json(text: &str) -> Option<St> {
         let v: Value = aterm_json::from_str(text).ok()?;
         let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
@@ -5267,7 +5368,11 @@ impl St {
                 || !s("native_prepare").is_empty()
                 || v.get("native_id").is_some()
                 || v.get("native_completed_prepare").is_some()
-                || v.get("native_observation").is_some(),
+                || v.get("native_observation").is_some()
+                || v.get("native_retired_unissued").and_then(Value::as_bool) == Some(true),
+            native_retired_unissued: v
+                .get("native_retired_unissued")
+                .map_or(Some(false), Value::as_bool)?,
             native_completed_prepare: match v.get("native_completed_prepare") {
                 None => None,
                 Some(value) => {
@@ -5310,6 +5415,12 @@ impl St {
                 m => Some(m),
             },
             login: v.get("login").and_then(Value::as_str).map(str::to_owned),
+            account_intent: v
+                .get("account_intent")
+                .and_then(super::accounts_pool::ExecutionIntent::from_value),
+            back_account_intent: v
+                .get("back_account_intent")
+                .and_then(super::accounts_pool::ExecutionIntent::from_value),
             home: v.get("home").and_then(Value::as_str).map(str::to_owned),
             home_profile: v
                 .get("home_profile")
@@ -5452,6 +5563,7 @@ impl St {
             quiet: n("quiet") != 0,
             limit_spend: n("limit_spend") != 0,
             restart_look: n("restart_look") != 0,
+            found_gone: n("found_gone") != 0,
         };
         if v.get("progress_key").is_none() {
             st.progress_key = st.progress_key();
@@ -5464,7 +5576,8 @@ impl St {
     }
 
     pub(super) const fn in_flight(&self) -> bool {
-        matches!(self.phase, Phase::Exiting { .. } | Phase::Relaunched { .. })
+        self.native_retired_unissued
+            || matches!(self.phase, Phase::Exiting { .. } | Phase::Relaunched { .. })
     }
 
     pub(super) fn relaunched_gone(&self, alive: impl Fn(u32) -> bool) -> bool {
@@ -5472,6 +5585,9 @@ impl St {
     }
 
     pub(super) fn close_overtaken(&mut self, why: &str, now: u64) {
+        if self.native_retired_unissued {
+            return;
+        }
         self.exited_at = 0;
         self.stop(why, now);
     }
@@ -5515,6 +5631,9 @@ impl St {
     }
 
     pub(super) fn stuck(&self, now: u64) -> Option<&'static str> {
+        if self.native_retired_unissued {
+            return None;
+        }
         upgrade_status::stuck_on(&self.phase, self.exited_at, now)
     }
 
@@ -5523,7 +5642,8 @@ impl St {
     }
 
     pub(super) fn seen_gone(&mut self, now: u64) -> bool {
-        if self.exited_at != 0
+        if self.native_retired_unissued
+            || self.exited_at != 0
             || self.pid == 0
             || !super::upgrade_wake::wait_exit(self.pid, Duration::ZERO)
         {
@@ -5534,6 +5654,9 @@ impl St {
     }
 
     pub(super) fn carried_through_hand(&mut self, now: u64) -> bool {
+        if self.native_retired_unissued {
+            return false;
+        }
         let ends = match self.agent {
             upgrade::Agent::Claude | upgrade::Agent::Muse | upgrade::Agent::Agy => true,
             upgrade::Agent::Codex => false,
@@ -5550,7 +5673,7 @@ impl St {
     }
 
     pub(super) fn confirming(&self) -> bool {
-        self.phase == Phase::Done && self.confirm_by != 0
+        !self.native_retired_unissued && self.phase == Phase::Done && self.confirm_by != 0
     }
 
     fn notice_belongs_to(&self, sf: &SessionFile, tab: &str) -> bool {
@@ -5592,13 +5715,28 @@ impl St {
         }
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeRetirementDebt",
+            action = "Expire",
+            project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+        )
+    )]
     pub(super) fn stop(&mut self, why: &str, now: u64) {
+        if self.native_retired_unissued {
+            return;
+        }
         self.owe_release(why);
         self.forget_markers();
+        self.found_gone = false;
         self.fail(why, now);
     }
 
     pub(super) fn fail(&mut self, why: &str, now: u64) {
+        if self.native_retired_unissued {
+            return;
+        }
         if self.streak_why == why {
             self.stop_streak = self.stop_streak.saturating_add(1);
         } else {
@@ -5672,22 +5810,28 @@ impl St {
         self.shell = shell;
         tab.clone_into(&mut self.tab);
         self.line = line;
+        // A new command never inherits account authority from the prior round.
+        // Its constructor attaches the freshly captured intent after this reset.
+        self.account_intent = None;
         self.native_rollback = false;
         self.line_dir.clear();
         self.line_grace_s = None;
         self.back_line.clear();
+        self.back_account_intent = None;
         self.exited_at = 0;
         self.hand_seen_s = 0;
         back
     }
 
     pub(super) fn unsent(&mut self, back: Unsent) {
+        self.account_intent = None;
         self.phase = back.phase;
         self.release = back.release;
         self.marker = back.marker;
         self.markers = back.markers;
         self.fallback_from = back.fallback_from;
         self.back_line.clear();
+        self.back_account_intent = None;
     }
 
     pub(super) fn signal_failed(&mut self, back: Unsent, now: u64) {
@@ -5937,7 +6081,8 @@ pub(super) fn read_upgrade_dir(state: &Path) -> std::io::Result<std::fs::ReadDir
     }
 }
 
-/// Ensures `<state>` (creating missing parents first), `<state>/upgrade`, and optional child `sub` exist as owned plain directories.
+/// Ensures `<state>` (creating missing parents first) and optional child `sub` are owned plain
+/// directories. On Unix, the producer-owned `<state>/upgrade` is private for durable native records.
 pub(super) fn ensure_upgrade_tree(state: &Path, sub: Option<&str>) -> std::io::Result<PathBuf> {
     if !check_owned_plain_dir_existing(state)? {
         if let Some(parent) = state.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -5946,6 +6091,9 @@ pub(super) fn ensure_upgrade_tree(state: &Path, sub: Option<&str>) -> std::io::R
         create_owned_plain_dir(state)?;
     }
     let upgrade = state.join("upgrade");
+    #[cfg(unix)]
+    aterm_uds::private_file::ensure_private_dir(&upgrade)?;
+    #[cfg(not(unix))]
     create_owned_plain_dir(&upgrade)?;
     let Some(sub) = sub else {
         return Ok(upgrade);
@@ -5971,7 +6119,9 @@ fn forget_settled_pending(
     let now = now_s();
     let word_in_force = |st: &St| matches!(st.request, Request::DeferUntil(t) if t > now);
     let st = prior
-        .filter(|st| st.phase == Phase::Pending && st.release.is_empty())
+        .filter(|st| {
+            !st.native_retired_unissued && st.phase == Phase::Pending && st.release.is_empty()
+        })
         .filter(|st| !word_in_force(st))
         .filter(|st| model_only(st) || reached(st))?;
     if opts.dry_run {
@@ -5984,6 +6134,9 @@ fn forget_settled_pending(
 pub(super) const STATE_KEEP_S: u64 = 7 * 24 * 60 * 60;
 
 pub(super) fn settled(st: &St) -> bool {
+    if st.native_retired_unissued {
+        return false;
+    }
     match st.phase {
         Phase::Done | Phase::Failed(_) => true,
         Phase::Pending => st.request == Request::None,
@@ -6164,6 +6317,9 @@ pub(super) fn save(opts: &Opts, session: &str, st: &St) {
     save_at(opts, session, st, now_s());
 }
 
+/// Persist a transition before its caller dispatches native work. On Unix,
+/// the directory must be private and success includes its durability barrier.
+/// An error may follow rename, so retain the transition and retry it.
 pub(super) fn save_checked(opts: &Opts, session: &str, st: &St) -> std::io::Result<()> {
     record::save_at_checked(opts, session, st, now_s())
 }
@@ -6353,16 +6509,16 @@ mod record {
             return Ok(());
         }
         let dir = super::ensure_upgrade_tree(&opts.state, None)?;
-        let path = dir.join(format!("{session}.json"));
+        let name = format!("{session}.json");
         #[cfg(unix)]
         {
-            aterm_uds::atomic_file::write(&path, st.to_json().as_bytes(), 0o600)
+            aterm_journal::write_private_durable(&dir, &name, st.to_json().as_bytes())
         }
         #[cfg(not(unix))]
         {
             // Keep the existing portable replacement route, returning its
             // failure to the checked caller instead of hiding it.
-            crate::harness::upgrade_models::write_atomic(&path, &st.to_json())
+            crate::harness::upgrade_models::write_atomic(&dir.join(name), &st.to_json())
         }
     }
 
@@ -6424,7 +6580,8 @@ pub(super) fn ledger(opts: &Opts, r: &Report, detail: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     if let Ok(mut f) = open.open(&path) {
         let _ = writeln!(
@@ -6741,7 +6898,10 @@ pub(super) fn transcript_exists(home: &Path, session: &str) -> Option<bool> {
 pub(super) fn transcript_exists_in(claude_dir: &Path, session: &str) -> Option<bool> {
     let name = format!("{session}.jsonl");
     match std::fs::read_dir(claude_dir.join("projects")) {
-        Ok(dirs) => Some(dirs.flatten().any(|e| e.path().join(&name).is_file())),
+        Ok(dirs) => Some(
+            dirs.flatten()
+                .any(|e| e.file_type().is_ok_and(|t| t.is_dir()) && e.path().join(&name).is_file()),
+        ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && claude_dir.is_dir() => Some(false),
         Err(_) => None,
     }
@@ -7907,12 +8067,16 @@ pub(super) fn transcript(home: &Path, session: &str) -> Option<PathBuf> {
 }
 
 pub(super) fn transcript_in(claude_dir: &Path, session: &str) -> Option<PathBuf> {
+    let name = format!("{session}.jsonl");
     let mut found = None;
     for e in std::fs::read_dir(claude_dir.join("projects"))
         .ok()?
         .flatten()
     {
-        let p = e.path().join(format!("{session}.jsonl"));
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let p = e.path().join(&name);
         if p.is_file() {
             if found.is_some() {
                 return None;
@@ -8627,8 +8791,12 @@ fn due_among(
     let mctx = std::cell::OnceCell::new();
     let unanswered = std::cell::Cell::new(false);
     let wants = |sf: &SessionFile| {
+        let prior = load(opts, &sf.session_id);
+        if prior.as_ref().is_some_and(|st| st.native_retired_unissued) {
+            return false;
+        }
         let tg = targets.get_or_init(&read_targets);
-        let wanted = needs_upgrade_inspection(sf, tg, load(opts, &sf.session_id).as_ref())
+        let wanted = needs_upgrade_inspection(sf, tg, prior.as_ref())
             || model_wants_a_look(opts, sf, mctx.get_or_init(|| ModelCtx::read(opts, tg)));
         unanswered.set(!wanted && tg.unanswered);
         wanted
@@ -9639,16 +9807,15 @@ pub(super) fn sweep_lock(opts: &Opts) -> Result<Option<SweepLock>, &'static str>
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         open.mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
         open.custom_flags(0x0020_0000);
     }
-    let lock: std::fs::File = open
-        .open(dir.join("sweep.lock"))
-        .map_err(|_| "lock-unopenable")?;
+    let lock: std::fs::File =
+        aterm_uds::kept_out(|| open.open(dir.join("sweep.lock"))).map_err(|_| "lock-unopenable")?;
     let metadata = lock.metadata().map_err(|_| "lock-unopenable")?;
     if !metadata.is_file() {
         return Err("lock-unopenable");
@@ -9660,8 +9827,6 @@ pub(super) fn sweep_lock(opts: &Opts) -> Result<Option<SweepLock>, &'static str>
             return Err("lock-unopenable");
         }
     }
-    #[cfg(any(unix, windows))]
-    aterm_uds::keep_out_of_children(&lock).map_err(|_| "lock-unopenable")?;
     #[expect(
         clippy::disallowed_methods,
         reason = "the take lands in a SweepLock, whose Drop releases by LOCK_UN"
@@ -9743,7 +9908,8 @@ pub fn in_flight(opts: &Opts) -> Vec<String> {
                 return None;
             }
             let session = path.file_stem()?.to_string_lossy().into_owned();
-            let st = load(opts, &session).filter(St::in_flight)?;
+            let st =
+                load(opts, &session).filter(|st| st.in_flight() && !st.native_retired_unissued)?;
             let ours =
                 opts.only_sid.as_ref().is_none_or(|s| *s == st.tab) && lane_on(opts, st.agent);
             ours.then_some(session)
@@ -9935,6 +10101,9 @@ fn visit_models(
         return said(r, format!("wait:{why}"));
     }
     let mut prior = load(opts, &sf.session_id);
+    if prior.as_ref().is_some_and(|st| st.native_retired_unissued) {
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     if opts.press.is_some()
         && !prior
             .as_ref()
@@ -10277,10 +10446,12 @@ fn visit_models(
         let homedir = home_carried(&opts.home, home, &sf.cwd, &records)?;
         let mode = resume_mode(&records, &sf.session_id, shown_mode.clone());
         let model = model_to.clone().or_else(hand_model);
+        let launch_record = super::accounts::LaunchEnv::of_exec_env(&args.env);
         plan(
             opts,
             &Launch {
                 homedir: homedir.as_deref(),
+                launch_env: launch_record.as_ref(),
                 billing: if model_to.is_some() {
                     super::relaunch::ModelBilling::Move(profile.as_ref())
                 } else {
@@ -10296,6 +10467,7 @@ fn visit_models(
                     home,
                     args.env_var(super::accounts::LOGIN_ENV),
                     stored_login_of(&args.env),
+                    !args.env.is_empty(),
                 )
             },
             shell,
@@ -10508,6 +10680,7 @@ fn visit_models(
             }
             st.launch_model = launch_kept(opts, &sf.session_id, &args.argv).unwrap_or_default();
             let hand = st.model_list.is_empty().then(hand_model).flatten();
+            let launch_record = super::accounts::LaunchEnv::of_exec_env(&args.env);
             let restarting = Restarting {
                 argv: &args.argv,
                 target: &target,
@@ -10532,7 +10705,9 @@ fn visit_models(
                 login: args.env_var(super::accounts::LOGIN_ENV),
                 home: args.env_var(super::accounts::HOME_ENV),
                 stored_login: stored_login_of(&args.env),
+                auth_observed: !args.env.is_empty(),
                 profile: profile.as_ref(),
+                launch_env: launch_record.as_ref(),
             };
             restart(opts, r, &mut st, &mut c, &tab, sf, t, k, &restarting)
         }
@@ -11130,7 +11305,7 @@ fn tell(
             said(r, format!("wait:cut-{why}"))
         }
         Err(e) => {
-            if matches!(e, Typed::Changed | Typed::Yielded) {
+            if matches!(e, Typed::Changed | Typed::Yielded | Typed::Person) {
                 (st.tells, st.told_at, st.told_to) = spent;
             }
             said(r, format!("wait:{}", e.word()))
@@ -11346,6 +11521,32 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
             to: format!("{}({})", st.to, st.source),
             step: String::new(),
         };
+        let mut native_client = None;
+        if !st.native_retired_unissued
+            && (st.native.is_some() || !st.native_prepare.is_empty())
+            && !opts.dry_run
+        {
+            let tab = st.tab.clone();
+            let Ok(mut client) = connect(opts, &tab) else {
+                out.push(said(r, "wait:native-recovery"));
+                continue;
+            };
+            match super::native_restart::refresh_retirement_hold(&mut client, &tab, &mut st) {
+                Ok(true) => save(opts, &session, &st),
+                Ok(false) => {}
+                Err(why) => {
+                    out.push(said(r, format!("wait:{why}")));
+                    continue;
+                }
+            }
+            native_client = Some(client);
+        }
+        if st.native_retired_unissued {
+            if opts.press.is_none() {
+                out.push(said(r, super::native_restart::WAIT_RETIRED_UNISSUED));
+            }
+            continue;
+        }
         if alive(st.pid) {
             note_stuck(opts, &r, &mut st, &session, now_s());
             continue;
@@ -11356,6 +11557,13 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
                 if opts.press.is_none() {
                     out.push(said(r, format!("would-fail:{TAB_TAKEN}")));
                 }
+                continue;
+            }
+            if let Some(client) = native_client.as_mut()
+                && let Some(wait) =
+                    super::relaunch::native_retirement_wait(opts, &r, &mut st, &session, client)
+            {
+                out.push(wait);
                 continue;
             }
             let line = overtaken_line(sf.pid, &sf.session_id);
@@ -11385,6 +11593,13 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
         if let Some((why, detail)) = stale {
             if opts.dry_run {
                 out.push(said(r, format!("would-fail:{why}")));
+                continue;
+            }
+            if let Some(client) = native_client.as_mut()
+                && let Some(wait) =
+                    super::relaunch::native_retirement_wait(opts, &r, &mut st, &session, client)
+            {
+                out.push(wait);
                 continue;
             }
             st.stop(why, now_s());
@@ -11696,6 +11911,7 @@ fn launch_of<'a>(
     home: Option<&'a str>,
     login: Option<&'a str>,
     stored_login: bool,
+    auth_observed: bool,
 ) -> Launch<'a> {
     Launch {
         session: &sf.session_id,
@@ -11710,6 +11926,8 @@ fn launch_of<'a>(
         homedir: None,
         login,
         stored_login,
+        auth_observed,
+        launch_env: None,
         billing: crate::harness::relaunch::ModelBilling::Keep,
     }
 }
@@ -11775,8 +11993,13 @@ pub(super) fn home_carried(
     })
 }
 
-pub(super) fn typing_fence(c: &mut Client, tab: &str) -> Result<Option<String>, &'static str> {
-    typing_fence_read(c, tab).map(|(generation, _)| generation)
+/// The last look before typing into Claude Code's composer: the screen's generation, and the
+/// person's input count of the same read (`turn if-human=`).
+pub(super) fn typing_fence(
+    c: &mut Client,
+    tab: &str,
+) -> Result<(Option<String>, Option<u64>), &'static str> {
+    typing_fence_read(c, tab).map(|(generation, read)| (generation, read.human_seq))
 }
 
 fn typing_fence_read(c: &mut Client, tab: &str) -> Result<(Option<String>, Screen), &'static str> {
@@ -11893,12 +12116,13 @@ fn reads_idle(read: &Screen) -> bool {
         && reading.prompt.is_none()
 }
 
-/// Whether `read` shows the turn over for an automatic restart's signal: no work Claude Code runs
-/// in its own process pending on it ([`aterm_phase::phase::in_process_work`]; the process table
-/// the signal re-reads names none of it), and, where the status lags, an idle reading with no
-/// busy footer.
+/// Whether `read` shows the turn over for an automatic restart's signal: none of the agent's own
+/// work that no process row names pending on it ([`aterm_phase::phase::unlisted_work`]: the work
+/// Claude Code runs in its own process, any other work its footer's pill counts; the process
+/// table the signal re-reads names none of it), and, where the status lags, an idle reading with
+/// no busy footer.
 fn turn_over_shown(read: &Screen, lagging: bool) -> bool {
-    aterm_phase::phase::in_process_work(&read.rows).is_none()
+    aterm_phase::phase::unlisted_work(&read.rows).is_none()
         && (!lagging || (!busy_footer(&read.rows) && reads_idle(read)))
 }
 
@@ -11907,9 +12131,10 @@ fn press_lets_signal(read: &Screen) -> bool {
     !busy_footer(&read.rows) && aterm_phase::prompt::prompt_box_span(&read.rows).is_none()
 }
 
-pub(super) fn composer_clear(c: &mut Client, tab: &str) -> bool {
-    screen(c, tab).is_some_and(|scr| {
-        aterm_phase::prompt::prompt_box_span(&scr.rows).is_none() && composer_empty(c, tab, &scr)
+/// The screen read when it shows no box and an empty composer, else `None`.
+pub(super) fn composer_clear(c: &mut Client, tab: &str) -> Option<Screen> {
+    screen(c, tab).filter(|scr| {
+        aterm_phase::prompt::prompt_box_span(&scr.rows).is_none() && composer_empty(c, tab, scr)
     })
 }
 
@@ -12032,7 +12257,15 @@ fn type_fenced_then_for_duty(
                 return Err(Typed::Refused("survey".to_string()));
             }
             before_keys()?;
-            let typed = checked_turn_for_duty(c, tab, text, generation.as_deref(), put, authority);
+            let typed = checked_turn_for_duty(
+                c,
+                tab,
+                text,
+                generation.as_deref(),
+                read.human_seq,
+                put,
+                authority,
+            );
             match typed {
                 Ok(()) => return Ok(()),
                 Err(Typed::Changed) if again => std::thread::sleep(fence_every),
@@ -12060,7 +12293,11 @@ struct Restarting<'a> {
     login: Option<&'a str>,
     home: Option<&'a str>,
     stored_login: bool,
+    auth_observed: bool,
     profile: Option<&'a super::profile::Context>,
+    /// What the agent's own exec environment records of its shell's
+    /// ([`super::accounts::LaunchEnv`]).
+    launch_env: Option<&'a super::accounts::LaunchEnv>,
 }
 
 fn status_lets_signal(a: &SessionFile, looked: &SessionFile, lagging: bool) -> bool {
@@ -12082,6 +12319,9 @@ fn restart(
     k: &dyn Kernel,
     how: &Restarting<'_>,
 ) -> Report {
+    if st.native_retired_unissued {
+        return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
     let Restarting {
         argv,
         target,
@@ -12096,7 +12336,9 @@ fn restart(
         login,
         home,
         stored_login,
+        auth_observed,
         profile,
+        launch_env,
     } = *how;
     let records = Records::of_file(&opts.home, sf);
     let fresh = fresh || records.transcript_exists(&sf.session_id) == Some(false);
@@ -12152,6 +12394,7 @@ fn restart(
     let model = recorded(&st.model_list).or(hand_model);
     let mode = resume_mode(&records, &sf.session_id, shown_mode.map(str::to_owned));
     let launch = Launch {
+        launch_env,
         billing: if !st.model_list.is_empty() {
             super::relaunch::ModelBilling::Move(profile)
         } else {
@@ -12167,6 +12410,7 @@ fn restart(
             home,
             login,
             stored_login,
+            auth_observed,
         )
     };
     let planned = home_carried(&opts.home, home, &sf.cwd, &records).and_then(|homedir| {
@@ -12239,6 +12483,12 @@ fn restart(
         };
         let back = st.signalled(sf.pid, shell, tab, line, now_s());
         st.back_line.clone_from(&back_line);
+        st.account_intent = command
+            .as_ref()
+            .and_then(|command| command.account_intent.clone());
+        st.back_account_intent = back_command
+            .as_ref()
+            .and_then(|command| command.account_intent.clone());
         st.line_dir = line_dir.unwrap_or_default();
         st.line_grace_s = Some(grace);
         st.login = login.map(str::to_owned);
@@ -12290,13 +12540,27 @@ fn restart(
         if matches!(admission, Ok(super::native_restart::Recovery::Retired)) {
             break 'signal Some(said(r.clone(), "failed:native-cohort-retired"));
         }
+        if matches!(admission, Ok(super::native_restart::Recovery::Held)) {
+            break 'signal Some(said(
+                r.clone(),
+                super::native_restart::WAIT_RETIRED_UNISSUED,
+            ));
+        }
         if let Err(why) = admission {
             // The exact plan/id was saved before dispatch. Preserve it on an unknown ACK;
             // only a proved pre-mutation abort permits a later fresh constructor.
-            if st.native_prepare.is_empty() || super::native_restart::abort(c, tab, st) {
+            if st.native_prepare.is_empty()
+                || super::native_restart::abort(opts, &sf.session_id, c, tab, st)
+            {
                 st.unsent(back);
             }
             save(opts, &sf.session_id, st);
+            if st.native_retired_unissued {
+                break 'signal Some(said(
+                    r.clone(),
+                    super::native_restart::WAIT_RETIRED_UNISSUED,
+                ));
+            }
             break 'signal Some(said(r.clone(), format!("wait:{why}")));
         }
         if st.native.is_some()
@@ -12306,10 +12570,16 @@ fn restart(
                 || host_claim.is_some_and(|claim| !claim_still_live(c, sf.pid, claim))
                 || require_unique_owner(&opts.home, sf).is_err())
         {
-            if super::native_restart::abort(c, tab, st) {
+            if super::native_restart::abort(opts, &sf.session_id, c, tab, st) {
                 st.unsent(back);
             }
             save(opts, &sf.session_id, st);
+            if st.native_retired_unissued {
+                break 'signal Some(said(
+                    r.clone(),
+                    super::native_restart::WAIT_RETIRED_UNISSUED,
+                ));
+            }
             break 'signal Some(said(r.clone(), "wait:changed-after-native-admission"));
         }
         let signal = if let Some(binding) = st.native.as_ref() {

@@ -146,7 +146,7 @@ fn plan(
             rows,
             QuestionPriority::Recommended,
             None,
-            false,
+            (false, false),
             Pane::of(rows),
         );
         return match decision {
@@ -276,7 +276,7 @@ fn plan_by_role(
             rows,
             QuestionPriority::Recommended,
             None,
-            false,
+            (false, false),
             Pane::of(rows),
         );
         return match decision {

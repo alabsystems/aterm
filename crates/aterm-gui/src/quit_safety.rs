@@ -8,16 +8,20 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use aterm_uds::process::child_pids;
 
-/// The copy for a destructive close/quit confirmation, shown in the window.
+/// The copy for a destructive close/quit confirmation: a native sheet on a Mac window, the
+/// in-window band elsewhere ([`crate::close_confirm`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConfirmPrompt {
-    /// The primary message.
+    /// The question.
     pub title: &'static str,
-    /// The secondary explanatory line.
+    /// One short line saying what the answer ends.
     pub body: &'static str,
     /// The affirmative (destructive) button label; a "Cancel" button is always added alongside it.
     pub proceed: &'static str,
 }
+
+/// The question a quit asks.
+pub(crate) const QUIT_TITLE: &str = "Quit aterm?";
 
 /// Whether a close/quit gesture needs a confirmation dialog, and with what copy.
 pub(crate) const fn confirm_prompt(
@@ -27,27 +31,21 @@ pub(crate) const fn confirm_prompt(
 ) -> Option<ConfirmPrompt> {
     if exits_app {
         Some(ConfirmPrompt {
-            title: "Are you sure you want to quit aterm?",
+            title: QUIT_TITLE,
             body: match (busy, reopens) {
                 (true, true) => {
-                    "A running process ends and every shell's scrollback is lost; windows and \
-                     tabs come back when aterm starts."
+                    "A process is still running and will end. Windows and tabs reopen next time."
                 }
-                (false, true) => {
-                    "Every shell ends and its scrollback is lost; windows and tabs come back \
-                     when aterm starts."
-                }
-                (true, false) => {
-                    "A process is still running. Quitting will end it and close every window."
-                }
-                (false, false) => "This will close every window and end your terminal sessions.",
+                (false, true) => "Terminal sessions will end. Windows and tabs reopen next time.",
+                (true, false) => "A process is still running and will end with every session.",
+                (false, false) => "All terminal sessions will end.",
             },
             proceed: "Quit",
         })
     } else if busy {
         Some(ConfirmPrompt {
-            title: "A process is still running in this window.",
-            body: "Closing it now will end that process.",
+            title: "Close this window?",
+            body: "A process is still running in it and will end.",
             proceed: "Close",
         })
     } else {
@@ -64,11 +62,11 @@ pub(crate) const CLOSE_PANE: &str = "Close Pane";
 pub(crate) const fn busy_view_close_prompt(pane: bool) -> ConfirmPrompt {
     ConfirmPrompt {
         title: if pane {
-            "A process is still running in this pane."
+            "Close this pane?"
         } else {
-            "A process is still running in this tab."
+            "Close this tab?"
         },
-        body: "Closing it now will end that process.",
+        body: "A process is still running in it and will end.",
         proceed: if pane { CLOSE_PANE } else { CLOSE_TAB },
     }
 }
@@ -86,7 +84,7 @@ pub(crate) fn confirm_prompt_windows(
     }
     confirm_prompt(exits_app, busy, reopens).or(Some(ConfirmPrompt {
         title: "Close all tabs?",
-        body: "This window has several tabs open. Closing it will end all of their sessions.",
+        body: "Every tab's session in this window will end.",
         proceed: "Close",
     }))
 }
@@ -357,18 +355,10 @@ fn process_facts(pid: u32) -> Option<ProcessFacts> {
     }
 }
 
-/// The PTY master's foreground process group, or `-1` when unknown.
+/// The PTY master's foreground process group, or `-1` when unknown
+/// ([`aterm_pty::foreground_group`]: the read failed or named no group, and always on Windows).
 pub(crate) fn foreground_pgrp(master: i32) -> i32 {
-    #[cfg(unix)]
-    {
-        // SAFETY: `tcgetpgrp` on a PTY master fd; a <= 0 error return is treated as idle by the callers.
-        unsafe { libc::tcgetpgrp(master) }
-    }
-    #[cfg(windows)]
-    {
-        let _ = master;
-        -1
-    }
+    aterm_pty::foreground_group(master).unwrap_or(-1)
 }
 
 /// The most children [`session_root`] reports on Linux, as macOS's listing

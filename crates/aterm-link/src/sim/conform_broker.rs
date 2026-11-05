@@ -178,6 +178,11 @@ pub(crate) enum Step {
     Tick(u64),
     /// A cut at this offset, carrying state (`retain_before_carrying_state`); a [`Step::Tick`] comes first.
     Cut(u64),
+    /// The broker's rate limit set now, until the next open (astream's `Broker::set_rate_limit`,
+    /// critic item E06): every open sets aterm's own ([`crate::broker_rules::rate_limit`]).
+    RateLimit(Option<astream_broker::RateLimit>),
+    /// The publishes each arm's rate limit refused so far (`BrokerStats::rate_limited`), compared.
+    RateLimited,
 }
 
 /// THE RUN'S CLOCK for its retention ticks: an hour past the wall clock when the run began,
@@ -426,6 +431,8 @@ impl Real {
                 std::thread::yield_now();
             }
         }
+        // And its rate limit, as `aterm link broker` sets it at every open (critic item E06).
+        crate::broker_rules::limit(&broker).expect("aterm's rate limit is set");
         let handle = broker.serve(self.sock()).expect("the real broker serves");
         self.up = Some((broker, handle));
         self.queued = self.will_producers.len() as u64;
@@ -761,10 +768,11 @@ fn subscribes(req: &Request) -> bool {
 /// The refusal class astream defines a prefix for, or none.
 fn class(msg: &str) -> &'static str {
     use astream_broker::proto::{
-        LOG_POISONED_PREFIX, RETAINED_FROM_PREFIX, RETIRE_CHARGED_PREFIX, RETIRE_CUT_PREFIX,
-        RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
+        LOG_POISONED_PREFIX, RATE_LIMITED_PREFIX, RETAINED_FROM_PREFIX, RETIRE_CHARGED_PREFIX,
+        RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
     };
     [
+        RATE_LIMITED_PREFIX,
         RETIRE_CHARGED_PREFIX,
         RETIRE_WILL_PREFIX,
         RETIRE_LOG_PREFIX,
@@ -789,7 +797,20 @@ fn project(tier: Tier, resp: &Response) -> (String, Option<(Option<u64>, u64)>) 
             subject,
             body,
         } => (format!("delivery @{offset} {subject} {body:?}"), None),
-        Response::Error { code, msg } => (format!("error {code} {:?}", class(msg)), None),
+        // A rate-limited refusal by the bucket that refused it too (`(byte rate exceeded)`): its
+        // wait is each arm's clock's, and only the model's stands still.
+        Response::Error { code, msg } => (
+            format!(
+                "error {code} {:?}{}",
+                class(msg),
+                if *code == astream_broker::proto::ERR_RATE_LIMITED {
+                    msg.rfind(" (").map_or("", |i| &msg[i..])
+                } else {
+                    ""
+                }
+            ),
+            None,
+        ),
         Response::Mark {
             next,
             head,
@@ -970,6 +991,24 @@ fn run_keeping(
                         "the cut left the real base {r}, the model's {m}"
                     )));
                 }
+            }
+            Step::RateLimit(limit) => {
+                real.broker()
+                    .set_rate_limit(*limit)
+                    .expect("the real broker takes the limit");
+                model.core.broker.set_rate_limit(*limit);
+            }
+            Step::RateLimited => {
+                let (r, m) = (
+                    real.broker().stats().rate_limited,
+                    model.core.broker.rate_limited(),
+                );
+                if r != m {
+                    return Err(at(&format!(
+                        "the real broker refused {r} publishes for the rate, the model {m}"
+                    )));
+                }
+                answers += 1;
             }
         }
     }
@@ -1311,6 +1350,71 @@ pub(crate) mod scripts {
             Step::Send(2, publish(P, seq(1, 8), LANE, "fenced")),
             Step::Send(2, Request::ClearGapFences),
             Step::Send(2, publish(P, seq(1, 8), LANE, "lifted")),
+        ];
+        s.extend(look(2));
+        s
+    }
+
+    /// THE RATE LIMIT (critic item E06): a producer's bucket spent, another producer's whole, a
+    /// record past the byte burst, and the fence a refusal latches on a connection that asked,
+    /// what a refusal behind it counts, and the retry at its own sequence after the lift. A byte
+    /// bucket refilled at a byte a second, so neither arm's clock moves an answer: the first
+    /// publish leaves 63 of its 150 bytes, and the next needs 87.
+    pub(crate) fn rate_limited() -> Vec<Step> {
+        const R: u64 = 9;
+        let row = |c: char| c.to_string().repeat(60);
+        let limit = astream_broker::RateLimit::records(1_000, 1_000)
+            .and_then(|l| l.with_bytes(1, 150))
+            .expect("a byte bucket astream takes");
+        let mut s = vec![
+            Step::Dial(1),
+            Step::Send(1, Request::Hello),
+            Step::Send(1, Request::FenceGaps),
+            Step::RateLimit(Some(limit)),
+            // Landed, refused for the rate (the fence latched at its sequence), and gap-fenced:
+            // the last one counted refused for the rate too, ahead of the fence.
+            Step::Pipeline(
+                1,
+                vec![
+                    publish(P, seq(1, 1), LANE, &row('a')),
+                    publish(P, seq(1, 2), LANE, &row('b')),
+                    publish(P, seq(1, 3), LANE, &row('c')),
+                ],
+            ),
+            Step::RateLimited,
+            // Another producer's bucket is its own.
+            Step::Send(1, publish(Q, seq(1, 1), LANE_B, &row('q'))),
+            // A record past the byte burst, refused at every try; a retire, never limited; a
+            // malformed subject, refused for itself and never counted.
+            Step::Send(1, publish(R, seq(1, 1), LANE, &"x".repeat(200))),
+            Step::Send(1, publish(R, seq(1, 1), LANE, &"x".repeat(200))),
+            Step::Send(1, retire(P, LANE)),
+            Step::Send(1, publish(Q, seq(1, 2), "no-slash", "x")),
+            Step::RateLimited,
+            // The lift alone lands nothing: the refused post again, still past the bucket,
+            // latches the fence again.
+            Step::Send(1, Request::ClearGapFences),
+            Step::Send(1, publish(P, seq(1, 2), LANE, &row('b'))),
+            Step::Send(1, publish(P, seq(1, 3), LANE, &row('c'))),
+            // Unlimited, and no lift: the refused post at its own sequence lands and takes its
+            // fence down (an attach's replay holds the fences, and retries it so), then the next,
+            // then a resend the dedup answers; another producer's fence still stands until the lift.
+            Step::RateLimit(None),
+            Step::Send(1, publish(P, seq(1, 2), LANE, &row('b'))),
+            Step::Send(1, publish(P, seq(1, 3), LANE, &row('c'))),
+            Step::Send(1, publish(P, seq(1, 2), LANE, &row('b'))),
+            Step::Send(1, publish(R, seq(1, 2), LANE, "behind its fence")),
+            Step::Send(1, Request::ClearGapFences),
+            Step::Send(1, publish(R, seq(1, 1), LANE, &"x".repeat(200))),
+            Step::RateLimited,
+            // An open sets aterm's own limit again, which none of this reaches.
+            Step::Stop(super::Stop::Clean),
+            Step::Start,
+            Step::Dial(2),
+            Step::Send(2, Request::Hello),
+            Step::Send(2, publish(P, seq(2, 1), LANE, &row('d'))),
+            Step::Send(2, publish(P, seq(2, 2), LANE, &row('e'))),
+            Step::RateLimited,
         ];
         s.extend(look(2));
         s
@@ -1899,7 +2003,14 @@ pub(crate) mod long {
         let n = FETCH_SCAN_MAX as u64 + 5;
         let lane = super::scripts::LANE;
         let pres = super::scripts::PRES_A;
-        let mut s = vec![Step::Dial(1), Step::Send(1, Request::Hello)];
+        // A log past the scan bound is more records than any producer's burst (aterm's
+        // `broker_rules::RATE_BURST_RECORDS`), published faster than the model's clock, which
+        // stands still, refills it: unlimited.
+        let mut s = vec![
+            Step::Dial(1),
+            Step::Send(1, Request::Hello),
+            Step::RateLimit(None),
+        ];
         s.extend(pipelined(1, 1, n, |k| publish(P, seq(1, k), lane, "m")));
         s.extend([
             Step::Send(1, publish(P, seq(1, n + 1), pres, "live")),
@@ -1988,9 +2099,10 @@ fn the_model_answers_every_script_as_astreams_broker_does() {
 }
 
 /// Each verb the bridge sends and each edge astream defines for it.
-fn every_script() -> [(&'static str, Vec<Step>); 9] {
+fn every_script() -> [(&'static str, Vec<Step>); 10] {
     [
         ("publishing", scripts::publishing()),
+        ("the rate limit", scripts::rate_limited()),
         ("binary payload", scripts::binary_payload()),
         ("retiring", scripts::retiring()),
         ("retiring conditionally", scripts::conditional()),
@@ -2347,6 +2459,21 @@ fn drift() -> Vec<(ArmMutant, Vec<Step>, &'static str)> {
             ArmMutant::FenceUnasked,
             scripts::publishing(),
             "a publish fenced on a connection that never asked",
+        ),
+        (
+            ArmMutant::NoRateLimit,
+            scripts::rate_limited(),
+            "a publish past its producer's bucket",
+        ),
+        (
+            ArmMutant::RateSkipsTheFenced,
+            scripts::rate_limited(),
+            "a publish behind a fence the rate limit never counted",
+        ),
+        (
+            ArmMutant::RateLatchesNoFence,
+            scripts::rate_limited(),
+            "a refusal for the rate that fenced nothing",
         ),
     ]
 }

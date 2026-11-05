@@ -7,14 +7,10 @@ use std::path::{Path, PathBuf};
 
 mod js;
 mod model;
-pub(crate) mod oracle;
 mod templates;
 pub(crate) mod toy;
 mod wasm;
 mod webgl;
-
-/// What `verify provision --record` lays for the `wasm-glue` check's oracle row.
-pub use oracle::{BINDGEN, BINDGEN_INSTALL, bindgen_root, reports_pin, tooling};
 
 /// The pass the shipping pipeline applies to a bound `<stem>_bg.wasm`, never before binding.
 pub const WASM_OPT_FLAGS: [&str; 7] = [
@@ -66,7 +62,7 @@ pub(crate) fn bind(input: &Path, out_dir: &Path) -> Result<Vec<PathBuf>, String>
     let mut written = Vec::new();
     for (name, contents) in files {
         let path = out_dir.join(name);
-        std::fs::write(&path, contents)
+        crate::write_fresh(&path, contents)
             .map_err(|e| format!("could not write {}: {e}", path.display()))?;
         written.push(path);
     }

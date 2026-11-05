@@ -502,6 +502,7 @@ impl LiveRig {
         let opts = Opts {
             home: base.join("home"),
             state,
+            account_roster: None,
             sock: Some(sock),
             token: None,
             only_sid: Some(TAB.to_string()),

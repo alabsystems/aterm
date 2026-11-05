@@ -38,13 +38,33 @@ pub enum Finding {
         pk: String,
         column: String,
     },
+    /// A row whose `protected` cell is true holds a `Secret` cell ([`protected`]): a concurrent
+    /// write or an older build put it there; readers never reveal it and the owner clears it.
+    Protected {
+        collection: String,
+        pk: String,
+        column: String,
+    },
 }
 
-fn refs(ty: &Ty, value: &aterm_json::Value, out: &mut Vec<(String, String)>) {
+/// Whether a row is protected (design §4.7, "protection is data, not source"): any candidate
+/// of its `protected` cell says `true`, so a concurrent unprotect never uncovers a secret.
+pub fn protected(row: &super::cell::Row) -> bool {
+    use super::cell::Field;
+    match row.fields.get("protected") {
+        Some(Field::Value(candidate)) => candidate.value.x == aterm_json::Value::Bool(true),
+        Some(Field::Conflict { candidates, .. }) => candidates
+            .iter()
+            .any(|c| c.value.x == aterm_json::Value::Bool(true)),
+        _ => false,
+    }
+}
+
+fn refs<'a>(ty: &Ty, value: &'a aterm_json::Value, out: &mut Vec<(&'static str, &'a str)>) {
     match ty {
         Ty::Ref(target) => {
             if let Some(pk) = value.as_str() {
-                out.push(((*target).to_owned(), pk.to_owned()));
+                out.push((*target, pk));
             }
         }
         Ty::List(inner, _) => {
@@ -72,6 +92,24 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
             continue;
         };
         for (pk, row) in &projection.rows {
+            if protected(row) {
+                for column in schema.columns.iter().filter(|c| matches!(c.ty, Ty::Secret)) {
+                    if row
+                        .fields
+                        .get(column.name)
+                        .is_some_and(|field| match field {
+                            super::cell::Field::Value(c) => !c.value.x.is_null(),
+                            _ => true,
+                        })
+                    {
+                        found.push(Finding::Protected {
+                            collection: schema.name.to_owned(),
+                            pk: pk.clone(),
+                            column: column.name.to_owned(),
+                        });
+                    }
+                }
+            }
             for column in &row.raw {
                 found.push(Finding::Raw {
                     collection: schema.name.to_owned(),
@@ -98,7 +136,7 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
                 match (column.ty, field) {
                     (Ty::Set(Ty::Ref(target)), _) => {
                         for elem in field.members() {
-                            targets.push(((*target).to_owned(), elem.to_owned()));
+                            targets.push((*target, elem));
                         }
                     }
                     (ty, super::cell::Field::Conflict { candidates, .. }) => {
@@ -113,21 +151,21 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
                     }
                 }
                 for (target, key) in targets {
-                    if let Some(other) = tables.get(target.as_str())
-                        && !other.rows.contains_key(&key)
+                    if let Some(other) = tables.get(target)
+                        && !other.rows.contains_key(key)
                     {
                         found.push(Finding::Dangling {
                             collection: schema.name.to_owned(),
                             pk: pk.clone(),
                             column: name.clone(),
-                            target,
+                            target: target.to_owned(),
                         });
                     }
                 }
             }
         }
         for unique in schema.unique {
-            let mut groups = BTreeMap::<Vec<String>, Vec<String>>::new();
+            let mut groups = BTreeMap::<Vec<String>, Vec<&str>>::new();
             for (pk, row) in projection.rows.iter().filter(|(_, row)| row.live()) {
                 let values: Option<Vec<String>> = unique
                     .iter()
@@ -141,14 +179,14 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
                     })
                     .collect();
                 if let Some(values) = values {
-                    groups.entry(values).or_default().push(pk.clone());
+                    groups.entry(values).or_default().push(pk.as_str());
                 }
             }
             for pks in groups.into_values().filter(|pks| pks.len() > 1) {
                 found.push(Finding::Unique {
                     collection: schema.name.to_owned(),
                     columns: unique.iter().map(|c| (*c).to_owned()).collect(),
-                    pks,
+                    pks: pks.into_iter().map(str::to_owned).collect(),
                 });
             }
         }

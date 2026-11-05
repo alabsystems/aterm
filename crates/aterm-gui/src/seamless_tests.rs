@@ -713,6 +713,7 @@ fn bare_manifest(sessions: Vec<SessionRecord>) -> SessionHandoff {
         mirror_dropped: Vec::new(),
         mirror_served: false,
         machine_names: Vec::new(),
+        retired_workers: Vec::new(),
     }
 }
 
@@ -817,6 +818,7 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
                 focused_path: Vec::new(),
                 zoomed: false,
                 parked: false,
+                ephemeral: false,
             })
             .collect(),
     }])
@@ -1308,6 +1310,46 @@ pub(super) fn v0_91_consumer_decodes(checkpoint: &TerminalCheckpoint) -> bool {
 }
 
 #[test]
+fn only_a_successor_as_new_as_this_build_is_given_the_saved_primarys_history() {
+    use aterm_core::terminal::Terminal;
+
+    let running = RELAXED_CONSUMER_FROM_BUILD + 1_000;
+    let mut t = Terminal::new(24, 80);
+    for i in 0..300 {
+        t.process(format!("shell line {i}\r\n").as_bytes());
+    }
+    t.process(b"\x1b[?1049hvim");
+    for (target, reads_it) in [
+        (running, true),
+        (running + 1, true),
+        (running - 1, false),
+        (RELAXED_CONSUMER_FROM_BUILD - 1, false),
+    ] {
+        let caps = WireCaps::for_hop(running, target);
+        assert_eq!(caps.carries_inactive_history(), reads_it, "target {target}");
+        let (carry, rung, cause) = carry_for_wire(&t, 0, MAX_HANDOFF_HISTORY_LINES, &mut 0, caps);
+        assert!(!rung.needs_repaint(), "target {target}: {cause:?}");
+        let alt = carry.alt_grid.as_deref().expect("the saved primary");
+        if reads_it {
+            assert_eq!(
+                checkpoint_inactive_history(&carry),
+                MAX_HANDOFF_HISTORY_LINES,
+                "target {target}: the saved primary's newest history"
+            );
+        } else {
+            assert!(
+                checkpoint_grid_is_canonical(alt, carry.rows, carry.cols, 0),
+                "target {target}: exactly its rows, as an older consumer reads the inactive blob"
+            );
+        }
+        assert!(
+            grid_refusal(0, &carry, caps).is_none(),
+            "target {target}: the wire admits it"
+        );
+    }
+}
+
+#[test]
 fn a_rollback_never_sends_a_row_the_older_line_decoder_refuses() {
     use aterm_core::terminal::Terminal;
 
@@ -1384,6 +1426,41 @@ fn an_exact_carry_is_priced_as_the_consumer_prices_it() {
         "a smaller blank screen"
     );
     assert_eq!(charged - spent, wire_cells(&blank));
+
+    let mut saved_primary = Terminal::new(10, 40);
+    for line in 0..300 {
+        saved_primary.process(format!("shell line {line}\r\n").as_bytes());
+    }
+    saved_primary.process(b"\x1b[?1049hvim");
+    let mut charged = spent - 20_000;
+    let (carry, rung, cause) = carry_for_wire(
+        &saved_primary,
+        0,
+        MAX_HANDOFF_HISTORY_LINES,
+        &mut charged,
+        WireCaps::current(),
+    );
+    assert_eq!(rung, CarryRung::Full, "{cause:?}");
+    assert_eq!(
+        checkpoint_inactive_history(&carry),
+        MAX_HANDOFF_HISTORY_LINES,
+        "PRECONDITION: the saved primary's history is carried"
+    );
+    assert_eq!(
+        charged - (spent - 20_000),
+        wire_cells(&carry),
+        "the saved primary's history is charged"
+    );
+    let mut consumer = spent - 20_000;
+    admit_checkpoint_dimensions(
+        &mut consumer,
+        carry.rows,
+        carry.cols,
+        carried_lines(&carry),
+        true,
+    )
+    .expect("the consumer admits it");
+    assert_eq!(consumer, charged, "as the consumer charges it");
 }
 
 fn meta_pool(terminals: Vec<aterm_core::terminal::Terminal>) -> Vec<WireCarry> {
@@ -3255,7 +3332,7 @@ pub(super) fn child_proof() -> Option<ReadyChild> {
 pub(super) fn child_proof_from(
     mut incoming: IncomingHandoff,
 ) -> Option<(ReadyChild, Vec<Adopted>)> {
-    if incoming.adopted.is_empty() {
+    if incoming.adopted.is_empty() && (incoming.refusal.is_some() || incoming.layout.is_none()) {
         return None;
     }
     let target = take_target_identity()?;
@@ -3930,6 +4007,7 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
                 focused_path: vec![crate::restore::RestoreBranch::Second],
                 zoomed: false,
                 parked: false,
+                ephemeral: false,
             }];
         }),
         vec![untitled(0), titled(1, records[1])],
@@ -4203,6 +4281,7 @@ fn a_layout_naming_an_exited_pane_is_still_placed() {
             focused_path: Vec::new(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         });
         layout.to_toml().expect("the desk serializes")
     };
@@ -4261,6 +4340,7 @@ fn an_unplaced_layout_hands_over_the_drafts_it_carried() {
             focused_path: Vec::new(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         });
         layout.to_toml().expect("the desk serializes")
     };
@@ -4323,8 +4403,11 @@ fn a_held_screen_past_the_link_strip_bound_is_not_written() {
     let len = u64::try_from(dense.grid.len()).expect("a length");
     assert!(
         len > MAX_LINK_STRIP_BYTES
-            && checkpoint_grid_cap(&CheckpointMeta::from_checkpoint(&dense))
-                .is_some_and(|cap| len <= cap),
+            && checkpoint_grid_cap(
+                &CheckpointMeta::from_checkpoint(&dense),
+                dense.history_lines
+            )
+            .is_some_and(|cap| len <= cap),
         "PRECONDITION: over the strip bound, under the grid cap ({len} bytes)"
     );
     let small = {
@@ -4413,6 +4496,93 @@ fn a_sessionless_handoff_with_no_layout_to_place_is_the_producers_refusal() {
     staged.teardown();
 }
 
+/// A window row with no tab that parses is nothing to place either: the shape check passes it, and
+/// the emptiness read refuses it whole.
+#[test]
+#[cfg(unix)]
+fn a_sessionless_handoff_of_a_bare_window_is_the_producers_refusal() {
+    let Some(_env) = env_alone() else { return };
+    let _restore = restore_env();
+    let bare_desk = |_: &str| {
+        let bare = crate::restore::WindowLayout {
+            workers_in_front: false,
+            ..crate::restore::WindowLayout::lone_workers_list(24, 80)
+        };
+        let wire = crate::restore::RestoreManifest::new(vec![bare])
+            .to_toml()
+            .expect("the desk serializes");
+        assert!(
+            crate::restore::RestoreManifest::from_toml(&wire).is_some(),
+            "PRECONDITION: it parses, so the refusal is the emptiness read's"
+        );
+        wire
+    };
+    let staged = stage_outgoing_handoff("barewindow", 0, Some(&bare_desk));
+    let (ready_read, ready_write) = pipe_pair("ready");
+    let (commit_read, commit_write) = pipe_pair("commit");
+    staged.publish_env(ready_write, commit_read, None);
+    let incoming = take_incoming_as(ReceiverShape::Current);
+    assert!(incoming.adopted.is_empty() && incoming.layout.is_none());
+    assert_eq!(incoming.refusal, Some(WholeRefusal::Producer));
+    for fd in [ready_read, ready_write, commit_read, commit_write] {
+        aterm_pty::close_fd(fd);
+    }
+    staged.teardown();
+}
+
+/// A window whose list stood alone is a layout to place: this build rebuilds it, and judges by what
+/// it was handed (a parent sends it only to a target that declares `desk1`).
+#[test]
+#[cfg(unix)]
+fn a_sessionless_handoff_with_a_lone_workers_list_is_taken_over() {
+    let Some(_env) = env_alone() else { return };
+    let _restore = restore_env();
+    let lone_desk = |_: &str| {
+        crate::restore::RestoreManifest::new(vec![crate::restore::WindowLayout::lone_workers_list(
+            24, 80,
+        )])
+        .to_toml()
+        .expect("the desk serializes")
+    };
+    let left = vec!["what a worker the reaper closed left".to_owned()];
+    let stamp_left = |manifest: &mut SessionHandoff, _: &std::path::Path, _: &str| {
+        manifest.retired_workers.clone_from(&left);
+    };
+    let staged = stage_outgoing_handoff_full(
+        "lonelist",
+        0,
+        Some(&lone_desk),
+        None,
+        None,
+        &[],
+        Some(&stamp_left),
+    );
+    assert!(
+        staged.fds_wire.is_empty(),
+        "PRECONDITION: no session is handed"
+    );
+    let (ready_read, ready_write) = pipe_pair("ready");
+    let (commit_read, commit_write) = pipe_pair("commit");
+    staged.publish_env(ready_write, commit_read, None);
+    let incoming = take_incoming_as(ReceiverShape::Current);
+    assert_eq!(incoming.refusal, None, "the list alone is a handoff");
+    assert!(incoming.adopted.is_empty(), "no session is adopted");
+    assert_eq!(
+        incoming.retired_workers, left,
+        "a list's Finished rows keep answering here"
+    );
+    let layout = incoming
+        .layout
+        .as_ref()
+        .expect("the handed layout is placed");
+    assert!(layout.windows[0].is_lone_workers_list());
+    drop(incoming);
+    for fd in [ready_read, ready_write, commit_read, commit_write] {
+        aterm_pty::close_fd(fd);
+    }
+    staged.teardown();
+}
+
 /// A successor admitted with no session is a handoff's successor all the same: it restores the
 /// handed layout and holds its freeze until the Commit, never the quit layout a parent still
 /// owns.
@@ -4471,6 +4641,7 @@ fn a_sessionless_handoff_with_a_native_tab_is_taken_over() {
             focused_path: Vec::new(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         }];
         layout.to_toml().expect("the desk serializes")
     };

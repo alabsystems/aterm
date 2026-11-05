@@ -305,7 +305,8 @@ impl Sentinel {
             opts.open(&tmp)?
         };
         let wrote = (|| -> io::Result<()> {
-            if !f.metadata()?.is_file() {
+            let meta = f.metadata()?;
+            if !meta.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "boot sentinel temp path is not a regular file",
@@ -314,7 +315,9 @@ impl Sentinel {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                if meta.permissions().mode() & 0o7777 != 0o600 {
+                    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                }
             }
             write!(f, "{build} {attempts}")?;
             for name in &names[names.len().saturating_sub(MAX_NAMED_LAUNCHES)..] {

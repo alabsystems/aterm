@@ -158,6 +158,12 @@ impl Fixture {
             .env_remove("ATERM_STATE_HOME")
             .env_remove(atpkg::cli::SPAWNER_PID_ENV)
             .env_remove("ZDOTDIR")
+            // The fake and the login shell always answer, however late on a loaded machine:
+            // the warm waits the hang detector for each, never its 30 s kill or 5 s budget.
+            .env(
+                atpkg::warm::WAITS_AT_LEAST_ENV,
+                MUST_HAPPEN.as_millis().to_string(),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

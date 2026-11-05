@@ -40,7 +40,7 @@ fn create_with(
         .write(true)
         .create_new(true)
         .mode(mode)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(&prepared)?;
     file.write_all(bytes)?;
     file.set_permissions(Permissions::from_mode(mode))?;

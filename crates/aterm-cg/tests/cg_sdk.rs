@@ -27,7 +27,7 @@ fn the_parser_saw_every_declaration() {
         &Floor {
             fns: 19,
             structs: 0,
-            opaque: 4,
+            opaque: 5,
         },
     );
 }

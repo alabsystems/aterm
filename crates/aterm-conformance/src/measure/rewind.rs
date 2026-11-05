@@ -228,7 +228,7 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
     }
     let world = World::prepare(scratch.path(), "temporal_recording = true")
         .map_err(|e| CouldNotRun::Refused(format!("cannot lay out the scratch world: {e}")))?;
-    std::fs::write(world.home.join("chain.txt"), chain_text(row.chain_bytes))
+    super::write_fresh(world.home.join("chain.txt"), chain_text(row.chain_bytes))
         .map_err(|e| CouldNotRun::Refused(format!("cannot write the chain file: {e}")))?;
     let inst = Instance::launch(&rig.aterm, &world, budget)?;
     let ctl = &inst.ctl;

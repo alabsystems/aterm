@@ -156,7 +156,25 @@ impl Shim {
 
 /// Whether `dir` is laid and marked wanted.
 fn is_wanted(dir: &std::path::Path) -> bool {
-    dir.is_dir() && aterm_types::clt_shim::wanted_mark(dir).is_file()
+    dir.is_dir()
+        && std::fs::symlink_metadata(aterm_types::clt_shim::wanted_mark(dir))
+            .is_ok_and(|m| m.is_file())
+}
+
+#[cfg(unix)]
+fn write_mark(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        && file.metadata().is_ok_and(|m| m.is_file())
+    {
+        let _ = file.set_len(0);
+    }
 }
 
 /// Lay `dir` and mark it wanted while the tools are `missing`, with the installing mark as
@@ -174,7 +192,7 @@ fn refresh(dir: &Path, missing: bool, installing: bool, exe: Option<&Path>) {
         return;
     }
     if installing {
-        let _ = std::fs::write(&on_its_way, b"");
+        write_mark(&on_its_way);
     } else {
         let _ = std::fs::remove_file(&on_its_way);
     }
@@ -182,7 +200,7 @@ fn refresh(dir: &Path, missing: bool, installing: bool, exe: Option<&Path>) {
         return;
     }
     if relay(dir, exe).is_ok() {
-        let _ = std::fs::write(&wanted, b"");
+        write_mark(&wanted);
     }
 }
 

@@ -11,7 +11,7 @@ use crate::{
 use aterm_secrets::{commons::roster::Role, text::Audience};
 use std::{cell::Cell, collections::BTreeMap, time::Duration};
 
-struct Fixture {
+pub(crate) struct Fixture {
     lab: Lab,
     serial: Cell<u8>,
 }

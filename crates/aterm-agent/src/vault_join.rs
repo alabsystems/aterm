@@ -319,10 +319,13 @@ pub(crate) fn dial_until<'a>(
 /// The joining Mac's side: prove this Mac to the fleet's members (its book's peers, `peers`, each
 /// `(host, addr, port)`), over [`FleetOp::VaultJoin`] with the fleet `secret` and node `me`, one
 /// after another ([`join::prove_first`]): the first that lets it in hands the log bundle, which
-/// this Mac writes. No member is dialed once `until` has passed ([`dial_until`]).
+/// this Mac writes. No member is dialed once `until` has passed ([`dial_until`]), and none at all
+/// from a lab identity, unless this Mac follows a lab's vault: the fleet's members are the live
+/// ALab's ([`client::refuse_lab_identity_for_fleet`]).
 ///
 /// # Errors
-/// No member let it in ([`join::Missed`]).
+/// No member let it in ([`join::Missed`]), or this Mac's is a lab identity that follows no lab:
+/// its one refusal, with nothing signed.
 pub fn prove_over_fleet(
     paths: &Paths,
     joining: &Joining<'_>,
@@ -330,6 +333,12 @@ pub fn prove_over_fleet(
     peers: &[(String, Option<IpAddr>, u16)],
     until: Option<std::time::Instant>,
 ) -> Result<join::Joined, join::Missed> {
+    if let Err(error) = client::refuse_lab_identity_for_fleet(paths) {
+        return Err(join::Missed {
+            refused: vec![("this Mac".to_owned(), error.to_string())],
+            signed_maybe: false,
+        });
+    }
     let ats: Vec<String> = peers
         .iter()
         .map(|(host, _, port)| aterm_net::fleet_member::host_port(host, *port))

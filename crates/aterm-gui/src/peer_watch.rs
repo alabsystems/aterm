@@ -118,7 +118,7 @@ pub(crate) struct PeerWatch {
 impl PeerWatch {
     /// Start a peer watch's thread; `None` when it cannot start.
     pub(crate) fn start() -> Option<Arc<PeerWatch>> {
-        let (bell, listen) = match UnixStream::pair() {
+        let (bell, listen) = match aterm_uds::kept_out(UnixStream::pair) {
             Ok(pair) => pair,
             Err(error) => {
                 aterm_log::warn!("peer watch has no bell: {error}");

@@ -27,13 +27,24 @@ enum PasteOutcome {
     Timeout,
 }
 
+/// How long a paste waits on an owner whose answer stopped moving ([`X11Clipboard::get`]). A unit
+/// test's owner is its own thread or its own clipboard, which answers, so there it is the hang
+/// detector; the test of a silent owner passes its own bound ([`X11Clipboard::get_within`]).
+#[cfg(not(test))]
 const PASTE_STALL: Duration = Duration::from_millis(1000);
+#[cfg(test)]
+const PASTE_STALL: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
 
 const INCR_CHUNK: usize = 256 * 1024;
 
+/// How long an INCR transfer waits for its requestor to take the next chunk. A unit test's
+/// requestor is its own clipboard, which takes each one, so there it is the hang detector.
+#[cfg(not(test))]
 const SERVE_STALL: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SERVE_STALL: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 struct Atoms {
     clipboard: Atom,
@@ -570,12 +581,17 @@ impl X11Clipboard {
 
     /// Read the current contents of `sel` as text, or `None` if empty / unavailable.
     pub(crate) fn get(&self, sel: Sel) -> Option<String> {
+        self.get_within(sel, PASTE_STALL)
+    }
+
+    /// [`get`](Self::get), giving up on an owner once the read has not moved for `stall`.
+    fn get_within(&self, sel: Sel, stall: Duration) -> Option<String> {
         let atom = self.sel_atom(sel);
         if let Some(t) = self.get_owned(sel) {
             return Some(t);
         }
         for target in [self.inner.atoms.utf8, self.inner.atoms.text, atom::STRING] {
-            match self.convert_once(atom, target) {
+            match self.convert_once(atom, target, stall) {
                 PasteOutcome::Text(t) => return Some(t),
                 PasteOutcome::Unsupported => continue,
                 PasteOutcome::Timeout => return None,
@@ -592,7 +608,7 @@ impl X11Clipboard {
             .and_then(|slot| slot.lock().unwrap().clone())
     }
 
-    fn convert_once(&self, selection: Atom, target: Atom) -> PasteOutcome {
+    fn convert_once(&self, selection: Atom, target: Atom, stall: Duration) -> PasteOutcome {
         let inner = &*self.inner;
         let (tx, rx) = channel();
         let win = {
@@ -637,7 +653,7 @@ impl X11Clipboard {
                     let reads = inner.reads.lock().unwrap();
                     match reads.active.get(&win) {
                         None => return rx.try_recv().unwrap_or(PasteOutcome::Timeout),
-                        Some(read) if read.moved.elapsed() >= PASTE_STALL => {
+                        Some(read) if read.moved.elapsed() >= stall => {
                             return PasteOutcome::Timeout;
                         }
                         Some(_) => {}
@@ -1338,7 +1354,7 @@ mod tests {
                 owner.finish();
                 true
             });
-            let first = reader.get(Sel::Clipboard);
+            let first = reader.get_within(Sel::Clipboard, Duration::from_millis(1000));
             let second = reader.get(Sel::Clipboard);
             assert!(owner_thread.join().expect("the owner answered both rounds"));
             (first, second)

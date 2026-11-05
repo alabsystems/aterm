@@ -638,7 +638,8 @@ impl App {
         stop_worker_in(master, &ctx, by)
     }
 
-    /// Read result: open a done worker's result file as a Markdown document tab on `wid`.
+    /// Read result: open a done worker's result file as a Markdown document tab on `wid`, a live
+    /// worker's or one whose tab aterm closed ([`crate::retired_workers`]).
     pub(crate) fn read_result(&mut self, wid: WindowId, session: u64) -> Result<(), String> {
         let path = self
             .pool
@@ -651,6 +652,12 @@ impl App {
                     .task()
                     .filter(|t| crate::native_workers::result_to_read(t))
                     .and_then(|t| t.result_path.clone())
+            })
+            .or_else(|| {
+                self.finished_row(session)
+                    .map(|row| row.record)
+                    .filter(crate::native_workers::result_to_read)
+                    .and_then(|record| record.result_path)
             })
             .ok_or_else(|| "no result to read".to_string())?;
         self.overview_exit(wid);

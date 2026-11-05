@@ -13,8 +13,7 @@
 //!   any admitted plan runs it. Debugger access is no step of its own: setup's one early
 //!   elevation turns developer mode on (`aterm_machines::root_steps`).
 //! * A step puts something on screen only at [`App::access_step_moment`], one gesture at a
-//!   time, and never while a first permission walk may still start and waits only for the person
-//!   ([`App::walk_waits_for_the_person`]); while one is up the window holds a [`MacosDialog`], so
+//!   time; while one is up the window holds a [`MacosDialog`], so
 //!   the setup worker's own prompts wait too. The Local Network trigger goes first, at a moment of
 //!   its own that waits for no walk still to come, and that walk waits for it and its alert's hold
 //!   ([`App::local_network_step_to_come`]) until the step alone has held a ready walk for
@@ -1083,6 +1082,13 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
     let ended = status.finished || status.cancelled;
     let mut pending: Vec<&str> = Vec::new();
     let mut needs: Vec<&str> = Vec::new();
+    for access in crate::system_state::offered_access(status) {
+        let word = setup_word(Subject::Access(access));
+        if !pending.contains(&word) {
+            pending.push(word);
+            needs.push(word);
+        }
+    }
     for observation in
         status.observations_for(status.plan.as_ref().map(|plan| plan.vault_url.as_str()))
     {
@@ -1422,11 +1428,6 @@ impl App {
             .is_some_and(|(word, _)| atpkg::devtools::same_step(&word, &key))
     }
 
-    /// Whether System State is the visible view of a focused window ([`StepsReach::frontmost`]).
-    pub(crate) fn system_state_in_front(&self) -> bool {
-        (self.access_steps.reach.frontmost)(self)
-    }
-
     /// Whether System State's row for `access` offers its button: the setup run reads it as
     /// needing the person.
     pub(crate) fn system_state_offers(&self, access: Access) -> bool {
@@ -1582,7 +1583,6 @@ impl App {
     pub(crate) fn local_network_moment_but_settings(&self, now: Instant) -> bool {
         self.access_revision().is_some()
             && self.access_steps_allowed()
-            && (self.access_steps.reach.frontmost)(self)
             && self.no_gesture_up(now)
             && (self.access_steps.reach.quiet)(self, now)
     }
@@ -1617,10 +1617,7 @@ impl App {
     /// in aterm.log's words: each unmet condition once, in the moment's order, and empty when
     /// none is. A lasting hold (no approved revision, a `[privacy]` switch off) is said alone, so
     /// the words change only when it does. System State not frontmost is said alone too, as the
-    /// part of it that fails ([`Self::system_state_front_gap`], read only when the step's own arm
-    /// says it fails), so keys typed, windows or apps switched to and the window's gestures and
-    /// dialogs coming and going while the person is elsewhere change nothing said. With System
-    /// State in front come the window's gestures and dialogs, the quiet moment's parts
+    /// part of it that fails. The window's gestures and dialogs, and the quiet moment's parts
     /// ([`Self::step_quiet_gaps`], read only when the step's own arm says it fails; a part both
     /// name is said once), and System Settings asking (read last, as the moment reads it, only
     /// when nothing else holds the step: it may read the window list).
@@ -1655,13 +1652,6 @@ impl App {
                 holds.push(words.to_owned());
             }
         };
-        if !(self.access_steps.reach.frontmost)(self) {
-            return vec![
-                self.system_state_front_gap()
-                    .unwrap_or("System State is not the visible view of a focused window")
-                    .to_owned(),
-            ];
-        }
         if let Some(panel) = self.devtools_helper.panel() {
             hold(if panel.origin() == devtools_helper::Origin::Walk {
                 "the permission walk's helper panel is up"
@@ -1843,14 +1833,11 @@ impl App {
     /// The step moment: an access step after Local Network may put its page, panel or folder
     /// dialog on screen now ([`Self::local_network_moment`], with Local Network done, and System
     /// Settings asking nothing, nor a question seen asking lapsed off screen:
-    /// [`Self::system_settings_may_ask`], since a step's page opened under it is lost), and no
-    /// first walk that may still start by itself waits for the
-    /// person to come back ([`Self::walk_waits_for_the_person`]), so no step takes its first page.
+    /// [`Self::system_settings_may_ask`], since a step's page opened under it is lost).
     pub(crate) fn access_step_moment(&self, now: Instant) -> bool {
         !self.local_network_pending()
             && self.local_network_moment_but_settings(now)
             && !self.system_settings_may_ask()
-            && !self.walk_waits_for_the_person(now)
     }
 
     /// Drain a completed 1 s × 30 s LAN grant re-probe: on an answer heard (a LAN server
@@ -2460,10 +2447,8 @@ impl App {
                     .load(std::sync::atomic::Ordering::Acquire)
                     .then(|| now + devtools_helper::RECHECK_EVERY),
             });
-        // Focus is read only when something waits for the moment.
-        let focused = (waits || retry.is_some())
-            && self.access_steps_allowed()
-            && self.any_os_window_focused();
+        // Automatic steps keep their retry timer even when aterm is in the background.
+        let focused = (waits || retry.is_some()) && self.access_steps_allowed();
         let look = (focused && waits).then(|| now + devtools_helper::RECHECK_EVERY);
         let retry = retry.filter(|_| focused);
         let saves = self
@@ -3255,6 +3240,10 @@ fn live_connect_local_network(target: Ipv4Addr) -> bool {
 /// the bundle declares, for [`LOCAL_NETWORK_BROWSE_FOR`], hearing nothing it keeps.
 #[cfg(target_os = "macos")]
 fn live_browse_local_network() -> bool {
+    if aterm_agent::node_service::DiscoveryPolicy::process_discovery().mesh {
+        // The node job owns the only browse and asks macOS when this step permits it.
+        return true;
+    }
     let Ok(service) = std::ffi::CString::new(aterm_agent::node_service::ALAB_TCP_SERVICE) else {
         return false;
     };

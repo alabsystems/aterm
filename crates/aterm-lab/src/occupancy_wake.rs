@@ -512,14 +512,14 @@ pub fn clear_flag(dir: &Path) -> std::io::Result<()> {
     crate::sys::scratch_remove(&dir.join(FLAG))
 }
 
-/// The flag touched in `dir`: a new empty file renamed into place ([`crate::util::atomic_write`]),
+/// The flag touched in `dir`: a new empty file renamed into place ([`crate::sys::put`]),
 /// so a link the agent left at its name is replaced, never written through, and one on the way
 /// refuses it ([`clear_flag`]'s reason).
 ///
 /// # Errors
-/// A part of `dir` is a link, or the file could not be written or renamed.
+/// A relative path, parent traversal, a link in `dir`, or the write or rename failing.
 pub fn touch_flag(dir: &Path) -> std::io::Result<()> {
-    crate::util::atomic_write(&dir.join(FLAG), b"")
+    crate::sys::put(&dir.join(FLAG), 0o644, &crate::sys::PutSrc::Bytes(b""))
 }
 
 /// THE RUN.

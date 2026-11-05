@@ -41,6 +41,7 @@ pub(crate) use control_query::{
     ScreenGen, StyledFrameSnapshot, gather_styled_frame, line_size_name, row_line_size, screen_gen,
     screen_text, serialize_styled_frame, trimmed_len, visible_row,
 };
+pub(crate) use control_query::{SpawnMark, mark_ctl_spawned};
 #[cfg(test)]
 pub(crate) use control_query::{cmd_screen_styled_json, cmd_text_json_looked, text_args};
 pub(crate) use control_query::{
@@ -48,7 +49,7 @@ pub(crate) use control_query::{
 };
 
 #[path = "control_end.rs"]
-mod control_end;
+pub(crate) mod control_end;
 
 #[path = "control_input.rs"]
 pub(crate) mod control_input;
@@ -127,6 +128,7 @@ pub(crate) use control_session::harness_act_face;
 pub(crate) use control_session::mint_turn_id_for_test;
 #[cfg(test)]
 pub(crate) use control_session::own_turn_ids;
+pub(crate) use control_session::presence_meta_tokens;
 pub(crate) use control_session::self_claim_write;
 #[cfg(any(unix, test))]
 pub(crate) use control_session::turn_ids_for_handoff;
@@ -135,6 +137,8 @@ pub(crate) use control_session::turn_ids_past_handoff_ceiling;
 pub(crate) use control_session::{TURN_ID_RESERVE, raise_turn_ids, turn_ids_minted};
 #[cfg(test)]
 pub(crate) use control_session::{TurnIo, cmd_turn};
+#[cfg(test)]
+pub(crate) use control_session::{caller_actor_of, cmd_exits, owner_tab_sid};
 #[cfg(test)]
 pub(crate) use control_session::{cmd_brief, cmd_log, cmd_log_json};
 #[cfg(test)]
@@ -241,6 +245,20 @@ fn node_log_reply(rest: &str, selector: Option<&Selector>, scope: Scope) -> Stri
         return refusal;
     }
     crate::session_log_node::cmd_node_log(crate::session_log_node::node_log(), rest)
+}
+
+/// `board`: this Mac's fleet task board ([`aterm_ctl::board`]), read from its state folder. The
+/// server reads it whole; `aterm ctl` formats `--json` and writes `board accept` itself.
+fn board_reply(rest: &str) -> String {
+    if !rest.trim().is_empty() {
+        return "ERR usage: board takes no words (`aterm ctl board --json` formats it, and `aterm \
+                ctl board accept` writes this Mac's board itself)\n"
+            .to_owned();
+    }
+    aterm_types::dirs::state_dir().map_or_else(
+        || "ERR this Mac's state folder cannot be resolved: it keeps no board\n".to_owned(),
+        |state| aterm_ctl::board::serve(&state),
+    )
 }
 
 fn fleet_survey(verb: &str, rest: &str, scope: Scope, store: &Store) -> Option<String> {
@@ -365,6 +383,28 @@ fn sessionless_front_key_event(
             NativeControlDecision::ResolveSession
             | NativeControlDecision::NoActiveTerminal
             | NativeControlDecision::NoSuchSession => Err("ERR invalid control target\n"),
+        },
+    )
+}
+
+pub(crate) fn sessionless_front_scroll_event(
+    rest: &str,
+    selector: Option<&Selector>,
+    front_has_terminal: bool,
+    principal: NativeControlPrincipal,
+) -> Option<Result<InputEvent, String>> {
+    if front_has_terminal || !matches!(selector, None | Some(Selector::SelfTok)) {
+        return None;
+    }
+    Some(
+        match native_control_decision(false, true, principal, NativeControlTarget::App) {
+            NativeControlDecision::WithoutSession => {
+                parse_scroll_intent(rest).map(InputEvent::ScrollView)
+            }
+            NativeControlDecision::Denied => Err("ERR denied\n".into()),
+            NativeControlDecision::ResolveSession
+            | NativeControlDecision::NoActiveTerminal
+            | NativeControlDecision::NoSuchSession => Err("ERR invalid control target\n".into()),
         },
     )
 }
@@ -660,6 +700,9 @@ pub(crate) enum FrontControlSurface {
     Overlay(crate::overlay::OverlayKind),
     NativeSettings,
     HarnessSettings,
+    /// A private document's view ([`crate::App::view_is_private`]) is the front tab's focused
+    /// content: no controller reads or drives it, whatever its authority.
+    PrivateDocument,
     OtherNative,
 }
 
@@ -723,7 +766,7 @@ fn help_short_catalog() -> String {
     let mut body = format!(
         "# Framing: one \"OK …\"/\"ERR …\" status line, or \"OK <count>\" + <count> content lines \
          (\"OK <nbytes>\" + raw bytes for cast, temporal, doc read, inbox get, but not cast \
-         frames|drift or temporal status); empty content = no data, never an error\n\
+         frames|drift or temporal status|judge); empty content = no data, never an error\n\
          # --json on {json_verbs} = structured output · \"@<sid> <verb>\" = aim it at that session \
          (an app-level verb: its instance's front window; an @ that names nothing, as \"@$W\" with \
          $W empty, is refused; `aterm ctl` also takes a read's \"<verb> @<sid>\")\n\
@@ -766,7 +809,8 @@ fn help_full_catalog() -> String {
     let header = &format!(
         r#"# Framing: every reply is one STATUS line ("OK …" / "ERR …"), or "OK <count>" then <count>
 # CONTENT lines, or, for the bytes verbs (cast, temporal, doc read, inbox get; not
-# `cast frames|drift` or `temporal status`), "OK <nbytes>" then exactly that many raw bytes.
+# `cast frames|drift` or `temporal status|judge`), "OK <nbytes>" then exactly that many raw
+# bytes.
 # `aterm ctl` prints the content without its OK line, so EMPTY output means NO DATA, never
 # an error (errors are always "ERR …").
 # "--json" (or a bare "json") on {json_verbs} gives structured output; any other verb
@@ -2930,20 +2974,28 @@ mod bound_control {
         listener: CtlListener,
         token: Arc<String>,
         sock_path: String,
+        owner: Option<control_auth::SocketOwner>,
     }
 
     impl BoundControl {
-        /// `listener` must be the socket just bound at `sock_path`.
+        /// `listener` must be the socket just bound at `sock_path`, `owner` the hold on its token.
         pub(super) const fn bound(
             listener: CtlListener,
             token: Arc<String>,
             sock_path: String,
+            owner: Option<control_auth::SocketOwner>,
         ) -> Self {
             Self {
                 listener,
                 token,
                 sock_path,
+                owner,
             }
+        }
+
+        /// The hold on the socket, for whoever serves it: it must outlive publishing.
+        pub(super) const fn take_owner(&mut self) -> Option<control_auth::SocketOwner> {
+            self.owner.take()
         }
 
         pub(super) const fn listener(&self) -> &CtlListener {
@@ -3121,11 +3173,11 @@ fn bind_control_listener_within(
     };
     if control_auth::decide_bind(is_live) == control_auth::BindAction::RefuseLiveSocket {
         aterm_log::warn!(
-            "control socket {sock_path} already has a live listener; running without \
+            "control socket {sock_path} belongs to a live instance; running without \
              a control socket rather than hijacking it"
         );
         crate::logging::stderr_line!(
-            "aterm-gui: control socket {sock_path} already has a live listener; \
+            "aterm-gui: control socket {sock_path} belongs to a live instance; \
              running without a control socket rather than hijacking it"
         );
         return None;
@@ -3155,7 +3207,8 @@ fn bind_control_listener_within(
         |path| aterm_uds::kept_out(|| CtlListener::bind(path)),
         std::thread::sleep,
     )?;
-    Some(BoundControl::bound(listener, token, sock_path))
+    let owner = control_auth::SocketOwner::hold(&plan.token_path);
+    Some(BoundControl::bound(listener, token, sock_path, owner))
 }
 
 fn sweep_dead_instance_files(sock_dir: &std::path::Path) {
@@ -3347,9 +3400,10 @@ pub(crate) fn spawn(
                 Some(handoff) => handoff.bind(&plan),
                 None => ordinary_binding,
             };
-            let Some(socket) = binding else {
+            let Some(mut socket) = binding else {
                 return;
             };
+            let _owner = socket.take_owner();
             let token = socket.token().clone();
             let worker_context = Arc::new(ControlWorkerContext {
                 active: active.clone(),
@@ -3422,6 +3476,9 @@ pub(crate) fn spawn(
             crate::fabric_launch::spawn_supervisor(&startup_config);
             crate::fleet_listen::start_fleet_listener(startup_config.effective_fleet());
             crate::net_place::start();
+            if let Some(state) = aterm_types::dirs::state_dir() {
+                crate::board_keeper::start(state);
+            }
             let admit = move |stream: CtlStream| {
                 // Peer credential gate: refuse other uids before spending a lane (Unix:
                 // unverifiable also refuses; Windows: the peer pid's token user where
@@ -3725,6 +3782,7 @@ fn dispatch_meta_verb(
         "update" => cmd_update(rest, scope, proxy),
         "help" | "verbs" => cmd_help(rest),
         "privacy" => privacy(false, rest),
+        "setup" => control_query::cmd_setup(proxy, rest),
         _ => no_handler(verb),
     }
 }
@@ -3742,6 +3800,7 @@ fn dispatch_app_verb(
         scope,
         proxy,
         sock_dir,
+        store,
         ..
     } = *cx;
     match json_ask(form, verb, rest) {
@@ -3750,6 +3809,7 @@ fn dispatch_app_verb(
         JsonAsk::Emit(body) => {
             return match verb {
                 "metrics" => control_query::cmd_metrics_json(active_term, &body),
+                "telemetry" => crate::telemetry_host::cmd(&body, true),
                 _ => no_handler(verb),
             }
             .into();
@@ -3779,7 +3839,7 @@ fn dispatch_app_verb(
         "invoke" => control_media::cmd_invoke(
             proxy,
             rest,
-            control_session::caller_actor_of(scope, None),
+            control_session::caller_actor_of(scope, None, store),
             typist,
         ),
         "confirm" => control_media::cmd_confirm(proxy, rest),
@@ -3790,10 +3850,16 @@ fn dispatch_app_verb(
         "tone" => control_media::cmd_tone(proxy, rest),
         "trail" => control_media::cmd_trail(proxy, rest),
         "kitty" => control_media::cmd_kitty(proxy, rest),
-        "spawn" => control_media::cmd_spawn(proxy, rest, aim.session()),
+        "spawn" => control_media::cmd_spawn_metered(
+            proxy,
+            rest,
+            aim.session(),
+            control_session::caller_actor_of(scope, None, store),
+        ),
+        "telemetry" => crate::telemetry_host::cmd(rest, false),
         "settings" => control_media::cmd_settings_overlay(proxy, rest),
         "tab" => {
-            let by = control_session::caller_actor_of(scope, None);
+            let by = control_session::caller_actor_of(scope, None, store);
             match aim.session() {
                 Some(session) => control_media::cmd_tab_aimed(proxy, rest, session, by),
                 None => control_input::cmd_tab(proxy, rest, by),
@@ -4594,8 +4660,12 @@ fn dispatch_await_task(
         Ok(args) => args,
         Err(usage) => return usage,
     };
-    /// A target resolved: its local id, its session, its `rev` edge and its fact edge.
-    type Held = (u64, Arc<SessionCtx>, Option<u64>, Option<u64>);
+    /// A target resolved: a live session's local id, session, `rev` edge and fact edge, or a
+    /// retired worker's row ([`crate::retired_workers`]), its end read at once.
+    enum Held {
+        Live(u64, Arc<SessionCtx>, Option<u64>, Option<u64>),
+        Retired(String),
+    }
     let mut held: Vec<Held> = Vec::new();
     for target in &args.targets {
         // A list element that names nothing is refused like a bare `@`
@@ -4611,11 +4681,19 @@ fn dispatch_await_task(
             Resolution::Ambiguous(refusal) => return refusal,
         };
         let Some((_, _, local_id, ctx)) = resolved else {
-            return if sel.is_self() {
-                NO_ACTIVE_TERMINAL.to_string()
-            } else {
-                format!("ERR no such session @{}\n", target.selector)
-            };
+            if sel.is_self() {
+                return NO_ACTIVE_TERMINAL.to_string();
+            }
+            // A worker the reaper closed once its task concluded answers with its end, as a
+            // wait armed before its close read it: `state=closed`, its conclusion, news.
+            if let Some((sid, record)) = retired_record(store, &sel, scope) {
+                let mut row =
+                    crate::task_record::await_row(sid.as_str(), Some(&record), "-", "-", "-", true);
+                row.push_str(" task_news=1");
+                held.push(Held::Retired(row));
+                continue;
+            }
+            return format!("ERR no such session @{}\n", target.selector);
         };
         if !scope.is_owner_class() && !cross_session_authorized(scope, "await", &ctx) {
             log_denial(
@@ -4626,28 +4704,31 @@ fn dispatch_await_task(
             );
             return "ERR denied\n".to_string();
         }
-        held.push((
+        held.push(Held::Live(
             local_id,
             ctx,
             target.since.or(args.since),
             target.fact_since.or(args.fact_since),
         ));
     }
-    let targets: Vec<control_session::TaskTarget<'_>> = held
+    let awaited: Vec<control_session::Awaited<'_>> = held
         .iter()
-        .map(
-            |(local_id, ctx, since, fact_since)| control_session::TaskTarget {
-                local_id: *local_id,
-                ctx,
-                since: *since,
-                facts: args.facts,
-                fact_since: *fact_since,
-            },
-        )
+        .map(|target| match target {
+            Held::Live(local_id, ctx, since, fact_since) => {
+                control_session::Awaited::Live(control_session::TaskTarget {
+                    local_id: *local_id,
+                    ctx,
+                    since: *since,
+                    facts: args.facts,
+                    fact_since: *fact_since,
+                })
+            }
+            Held::Retired(row) => control_session::Awaited::Retired(row.clone()),
+        })
         .collect();
-    control_session::await_task(
+    control_session::await_tasks(
         store,
-        &targets,
+        &awaited,
         args.combine,
         args.timeout_ms
             .unwrap_or(aterm_control::wire::WAIT_DEFAULT_MS),
@@ -4831,8 +4912,10 @@ fn dispatch_owner(
             usize::MAX,
             &crate::survey::Here::now(),
         ),
+        "board" => board_reply(rest),
         "who" => refuse_stray_args(verb, rest).unwrap_or_else(|| control_session::cmd_who(store)),
-        "exits" => control_session::cmd_exits(store, rest),
+        "reveal" => control_query::cmd_reveal(store, scope.is_bridge(), rest),
+        "exits" => control_session::cmd_exits(store, rest, &control_session::exits_closed()),
         "grant" => on_own_session(own_ctx, verb, |ctx| {
             poke_connections_on_ok(proxy, control_session::cmd_grant(ctx, scope, rest))
         }),
@@ -5006,6 +5089,21 @@ fn dispatch_session(head: &Head<'_>, form: &Resolved, cx: &DispatchCx<'_>) -> Co
     ControlReply::with_tail(body, tail)
 }
 
+/// `ERR refused private view: …`: what a read or a drive of a private document's front view
+/// answers, as `doc read` refuses the document itself.
+fn private_view_refusal() -> String {
+    format!("ERR {}\n", crate::app_control::PRIVATE_VIEW_REFUSED)
+}
+
+/// Whether the front tab's focused content is a private document's view, asked of the main
+/// thread; a hop that fails answers `false`, and delivery still refuses input to such a view.
+fn front_is_private(proxy: &EventLoopProxy<Wake>) -> bool {
+    matches!(
+        control_media::call_main(proxy, |reply| Wake::FrontControlSurface { reply }),
+        Ok(FrontControlSurface::PrivateDocument)
+    )
+}
+
 fn sessionless_front(head: &Head<'_>, cx: &DispatchCx<'_>) -> Option<ControlReply> {
     let Head {
         selector,
@@ -5014,6 +5112,12 @@ fn sessionless_front(head: &Head<'_>, cx: &DispatchCx<'_>) -> Option<ControlRepl
     } = *head;
     let selector = selector.as_ref();
     let principal = cx.scope.principal();
+    // With no terminal in front, a bare read (`text`, `screen`, `image`, …) or drive (`key`,
+    // `paste`) of a private document's view is refused by name; `end` and a window `resize`
+    // touch none of its text.
+    if !matches!(verb, "end" | "resize") && front_is_private(cx.proxy) {
+        return Some(private_view_refusal().into());
+    }
     if let Some(caller) = sessionless_front_end(verb, selector, false, principal) {
         return Some(
             match caller {
@@ -5036,6 +5140,7 @@ fn sessionless_front(head: &Head<'_>, cx: &DispatchCx<'_>) -> Option<ControlRepl
         .map(|route| route.map_err(String::from)),
         "key" => sessionless_front_key_event(rest, selector, false, principal)
             .map(|route| route.map_err(String::from)),
+        "scroll" => sessionless_front_scroll_event(rest, selector, false, principal),
         "resize" => sessionless_front_window_resize(verb, rest, selector, false, principal),
         "image" if cx.scope.is_owner_class() && rest.split_whitespace().next() != Some("read") => {
             return Some(control_media::cmd_image(cx.proxy, rest, cx.sock_dir, None));
@@ -5153,6 +5258,10 @@ fn closed_session_reply_with(
     scope: Scope,
 ) -> String {
     const NO_SUCH: &str = "ERR no such session\n";
+    if matches!(verb, "result" | "task") {
+        return retired_reply(selector, verb, rest, store, scope)
+            .unwrap_or_else(|| NO_SUCH.to_string());
+    }
     if !matches!(verb, "log" | "brief") {
         return NO_SUCH.to_string();
     }
@@ -5194,6 +5303,54 @@ fn closed_session_reply_with(
         "log" => control_session::cmd_log_closed(&log, rest),
         _ => control_session::cmd_brief_closed(&log, &sid, store, rest),
     }
+}
+
+/// The final task record of a worker whose tab aterm closed once its task concluded
+/// ([`crate::retired_workers`]), named by its sid or the local id it had, with its sid, for a
+/// `scope` that may read it: an owner-class caller (a fleet drive's line is served as Owner), or
+/// an edge the closed session's log grants `ReadScreen`, the op of `result`, `task` and `await`
+/// on a live session. `None` where no row names it or `scope` may not read it.
+fn retired_record(
+    store: &Store,
+    selector: &Selector,
+    scope: Scope,
+) -> Option<(SessionId, crate::task_record::TaskRecord)> {
+    let guard = store.read().unwrap_or_else(|p| p.into_inner());
+    let retired = guard.retired_workers();
+    let row = match selector {
+        Selector::Sid(sid) => retired.by_sid(&SessionId::new(sid.as_str())),
+        Selector::Local(id) => retired.by_local(*id),
+        Selector::SelfTok | Selector::Invalid(_) => None,
+    }?;
+    let may = match scope {
+        Scope::Edge(presented) => guard
+            .closed_logs()
+            .by_sid(&row.sid)
+            .is_some_and(|log| log.read().edge_may_read(&presented)),
+        _ => scope.is_owner_class(),
+    };
+    may.then(|| (row.sid.clone(), row.record.clone()))
+}
+
+/// `result` and the read form of `task` for a worker whose tab aterm closed once its task
+/// concluded ([`retired_record`]): its manager reads what it left after the reaper took its tab.
+/// `None` where no row names it for `scope`, or for any other form.
+fn retired_reply(
+    selector: Option<&Selector>,
+    verb: &str,
+    rest: &str,
+    store: &Store,
+    scope: Scope,
+) -> Option<String> {
+    if !(verb == "result" || verb == "task" && rest.trim().is_empty()) {
+        return None;
+    }
+    let (_, record) = retired_record(store, selector?, scope)?;
+    Some(if verb == "result" {
+        crate::task_record::retired_result(&record, rest)
+    } else {
+        crate::task_record::retired_task_reply(&record)
+    })
 }
 
 fn journal_session_reply_with(
@@ -6418,7 +6575,15 @@ fn drive_admission(
         };
         let spawned = |sid: &SessionId| drive_may_close(store, sid, &driver.node);
         let shell = |sid: &SessionId| drive_owns_shell(store, sid, &driver.node);
-        return match drive_gate(request.line(), &hosts, &spawned, &shell) {
+        let retired = |sid: &SessionId| {
+            store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .retired_workers()
+                .by_sid(sid)
+                .is_some()
+        };
+        return match drive_gate(request.line(), &hosts, &spawned, &shell, &retired) {
             Ok(DriveLine::Fleet) => Ok((request, scope, None)),
             Ok(DriveLine::Answer(reply)) => Err(reply),
             Ok(DriveLine::Act { line, mut write }) => {
@@ -6478,9 +6643,12 @@ fn drive_gate(
     hosts: &dyn Fn(&SessionId) -> bool,
     spawned: &dyn Fn(&SessionId) -> bool,
     shell: &dyn Fn(&SessionId) -> bool,
+    retired: &dyn Fn(&SessionId) -> bool,
 ) -> Result<DriveLine, String> {
     const SID: &str = "a drive names a session the driven Mac hosts by its sid (`survey --host` \
                        lists them)";
+    const RETIRED: &str = "a worker whose tab the driven Mac closed once its task concluded \
+                           answers only @<sid> result and await task";
     const HOLD_SID: &str = "a drive's hold names a session the driven Mac hosts by its bare sid, \
                             with no @: hold s-… on|off [reason=<pct>]";
     const HOLD_SELECTOR: &str = "a drive's hold names its session as its argument, never a \
@@ -6504,6 +6672,12 @@ fn drive_gate(
         let sid = SessionId::new(sid);
         (sid.as_str().starts_with("s-") && hosts(&sid)).then_some(sid)
     };
+    // A worker the reaper closed keeps a row ([`crate::retired_workers`]) its manager's reads
+    // answer from, a manager on another Mac's too.
+    let kept = |sid: &str| {
+        let sid = SessionId::new(sid);
+        sid.as_str().starts_with("s-") && retired(&sid)
+    };
     let act = |verb: &'static str, sid: Option<SessionId>| DriveLine::Act {
         line: line.to_owned(),
         write: Some(DriveAct {
@@ -6519,7 +6693,13 @@ fn drive_gate(
     };
     match selector {
         None => match verb {
-            "survey" | "version" => Ok(DriveLine::Fleet),
+            "survey" | "version" | "setup" => Ok(DriveLine::Fleet),
+            // A board names working folders and accounts: a drive grant reads it, as Owner.
+            "board" if rest.trim().is_empty() => Ok(read()),
+            "board" => Err(drive_refused(
+                "a drive reads a board whole: `board` (`board accept` is its own Mac's)",
+                rest.trim(),
+            )),
             "service-repair" => {
                 let request = aterm_agent::service_repair_rpc::Request::parse(rest)?;
                 if matches!(request.operation.as_str(), "inspect" | "prepare") {
@@ -6572,16 +6752,23 @@ fn drive_gate(
                     }),
                 })
             }
-            "spawn" => drive_spawn(line, rest, &hosts).map(|line| DriveLine::Act {
-                write: Some(DriveAct {
-                    shell: !control_media::split_quoted_tokens(rest)
+            // The act is judged by the line the gate passes (a `cwd=~/…` resolved in it), the
+            // line the spawn handler reads.
+            "spawn" => drive_spawn(line, rest, &hosts, aterm_types::dirs::home_dir().as_deref())
+                .map(|line| DriveLine::Act {
+                    write: Some(DriveAct {
+                        shell: !control_media::split_quoted_tokens(
+                            line.trim_end_matches('\r')
+                                .strip_prefix("spawn ")
+                                .unwrap_or(rest),
+                        )
                         .is_some_and(|tokens| tokens.iter().any(|t| t.starts_with("agent="))),
-                    verb: "spawn",
-                    sid: None,
-                    hold: None,
+                        verb: "spawn",
+                        sid: None,
+                        hold: None,
+                    }),
+                    line,
                 }),
-                line,
-            }),
             "await" => {
                 let Some(words) = await_task_list(rest) else {
                     return Err(drive_refused(
@@ -6592,7 +6779,7 @@ fn drive_gate(
                 let args = crate::task_record::parse_await_task(&words, true)
                     .map_err(|usage| usage.trim_end().trim_start_matches("ERR ").to_owned())?;
                 for target in &args.targets {
-                    if hosted(&target.selector).is_some() {
+                    if hosted(&target.selector).is_some() || kept(&target.selector) {
                         continue;
                     }
                     if !matches!(Selector::parse(&target.selector), Selector::Sid(_)) {
@@ -6610,13 +6797,19 @@ fn drive_gate(
                 verb,
             )),
             _ => Err(drive_refused(
-                "a drive serves survey, version, vault status|approve, hold, spawn \
+                "a drive serves survey, version, board, vault status|approve, hold, spawn \
                  cwd=<absolute>|agent=<word> and await task, and @<sid> \
                  status|text|screen|result|inbox|post|turn|key|send|close",
                 verb,
             )),
         },
         Some(_) if verb == "hold" => Err(drive_refused(HOLD_SELECTOR, selected)),
+        Some(Selector::Sid(sid)) if hosted(sid.as_str()).is_none() && kept(sid.as_str()) => {
+            match verb {
+                "result" => Ok(read()),
+                _ => Err(drive_refused(RETIRED, verb)),
+            }
+        }
         Some(Selector::Sid(sid)) => {
             let Some(sid) = hosted(sid.as_str()) else {
                 return Err(drive_refused(SID, selected));
@@ -6664,18 +6857,171 @@ fn drive_turn(rest: &str) -> Result<(), String> {
     }
 }
 
+/// A drive's `cwd=~/…` (`value`) as the folder of this Mac's `home` it names, with every link
+/// resolved (`Ok(None)` where `value` names no folder in a home,
+/// [`aterm_types::control_verbs::home_cwd`]). Refused where this Mac names no home, the path could
+/// leave it (another account's `~user`, a `..`, or a link that resolves outside the home), it or a
+/// link on the way lies in a folder macOS guards (never looked into: a look there could ask the
+/// person, so each link is followed by hand, its target judged before any look, never by
+/// `canonicalize`), or no folder is there. An absolute `cwd=` keeps the drive's own rules: this
+/// resolves only the home-relative form.
+#[cfg(any(unix, test))]
+fn drive_home_cwd(
+    value: &str,
+    home: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(under) = aterm_types::control_verbs::home_cwd(value) else {
+        return Ok(None);
+    };
+    let token = format!("cwd={value}");
+    let refuse = |why: &str| drive_refused(&format!("a drive's cwd=~/\u{2026} {why}"), &token);
+    let under = under.map_err(refuse)?;
+    let Some(home) = home.filter(|home| home.is_absolute()) else {
+        return Err(refuse(
+            "names a folder in this Mac's home, which it cannot name",
+        ));
+    };
+    if atpkg::protected::under_protected_root(home, &home.join(under)) {
+        return Err(refuse("names a folder macOS guards"));
+    }
+    let gone = || format!("no such folder {}", aterm_codec::tty::one_line(value, 120));
+    let real_home = std::fs::canonicalize(home).map_err(|_| gone())?;
+    match walk_home_path(&real_home, std::path::Path::new(under)) {
+        Ok(real) if real.starts_with(&real_home) => Ok(Some(real)),
+        Ok(_) => Err(refuse("leaves this Mac's home")),
+        Err(HomeWalk::Guarded) => Err(refuse("leaves this Mac's home for a folder macOS guards")),
+        Err(HomeWalk::Gone) => Err(gone()),
+    }
+}
+
+/// Why [`walk_home_path`] found no folder.
+#[cfg(any(unix, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum HomeWalk {
+    /// A step, or a link's target, lies in a folder macOS guards: it was never looked at.
+    Guarded,
+    /// A step is not there, a link could not be read, the links went round more than 40 times,
+    /// or the end is no folder.
+    Gone,
+}
+
+/// The folder `under` names from `real_home` (a path with no link in it), each link on the way
+/// followed by hand: a step's path is judged against the folders macOS guards
+/// ([`atpkg::protected::under_protected_root`]) before it is looked at, so no link leads a look
+/// into one. The folder it ends at has no link in it.
+#[cfg(any(unix, test))]
+fn walk_home_path(
+    real_home: &std::path::Path,
+    under: &std::path::Path,
+) -> Result<std::path::PathBuf, HomeWalk> {
+    use std::path::{Component, PathBuf};
+    fn steps(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+        path.components()
+            .filter_map(|part| match part {
+                Component::ParentDir => Some("..".into()),
+                Component::Normal(name) => Some(name.to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+    let mut at = real_home.to_path_buf();
+    let mut left: std::collections::VecDeque<std::ffi::OsString> = steps(under).into();
+    let mut links = 0_u32;
+    while let Some(step) = left.pop_front() {
+        if step == ".." {
+            // `at` holds no link, so its parent is the folder `..` names.
+            at.pop();
+            continue;
+        }
+        let next = at.join(&step);
+        if atpkg::protected::under_protected_root(real_home, &next) {
+            return Err(HomeWalk::Guarded);
+        }
+        let meta = std::fs::symlink_metadata(&next).map_err(|_| HomeWalk::Gone)?;
+        if !meta.file_type().is_symlink() {
+            at = next;
+            continue;
+        }
+        links += 1;
+        if links > 40 {
+            return Err(HomeWalk::Gone);
+        }
+        let target = std::fs::read_link(&next).map_err(|_| HomeWalk::Gone)?;
+        if target.is_absolute() {
+            at = PathBuf::from("/");
+        }
+        for step in steps(&target).into_iter().rev() {
+            left.push_front(step);
+        }
+    }
+    if !std::fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir()) {
+        return Err(HomeWalk::Gone);
+    }
+    Ok(at)
+}
+
+/// The spawn line `tokens` make with the one `cwd=~/…` token's folder replaced by `real`, the
+/// folder it resolved to, and the words that line splits into, which are `tokens` with that one
+/// replaced and no other change: a value with a space goes in quotes. Refused where a word holds
+/// a quote, or a space outside a `key=` value, or the line would split otherwise: the line the
+/// gate passes splits into exactly the words it judged.
+#[cfg(any(unix, test))]
+fn drive_spawn_line(
+    tokens: &[String],
+    real: &std::path::Path,
+) -> Result<(String, Vec<String>), String> {
+    let mut words = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let word = if token.starts_with("cwd=~") {
+            let real = real
+                .to_str()
+                .ok_or_else(|| drive_refused("a drive's cwd= names no UTF-8 folder", token))?;
+            format!("cwd={real}")
+        } else {
+            token.clone()
+        };
+        let key = word.split_once('=').map_or(word.as_str(), |(key, _)| key);
+        if word.contains('"') || key.is_empty() || key.contains(char::is_whitespace) {
+            return Err(drive_refused(
+                "a drive's spawn word holds a quote, or a space outside its value",
+                token,
+            ));
+        }
+        words.push(word);
+    }
+    let mut line = "spawn".to_owned();
+    for word in &words {
+        line.push(' ');
+        match word.split_once('=') {
+            Some((key, value)) if value.contains(char::is_whitespace) => {
+                line.push_str(&format!("{key}=\"{value}\""));
+            }
+            _ => line.push_str(word),
+        }
+    }
+    let split = control_media::split_quoted_tokens(line.strip_prefix("spawn ").unwrap_or_default());
+    if split.as_deref() != Some(words.as_slice()) {
+        return Err(drive_refused(
+            "a drive's spawn would not split as its words",
+            "cwd=",
+        ));
+    }
+    Ok((line, words))
+}
+
 #[cfg(any(unix, test))]
 fn drive_spawn(
     line: &str,
     rest: &str,
     hosts: &dyn Fn(&SessionId) -> bool,
+    home: Option<&std::path::Path>,
 ) -> Result<String, String> {
-    const SHELL: &str = "a plain fleet shell is spawn cwd=/absolute [raise=false]; no task, \
-                         command or other options";
+    const SHELL: &str = "a plain fleet shell is spawn cwd=/absolute|~/<path> [raise=false]; no \
+                         task, command or other options";
     let usage = || {
         format!(
             "a drive's worker form is spawn agent=<{}> [model=<m>] [autopilot=<land|cruise>] \
-             [cwd=<absolute>] [from=<sid>] [raise=false] - < task",
+             [cwd=<absolute>|~/<path>] [from=<sid>] [raise=false] - < task",
             aterm_agent::harness::worker::started_words()
         )
     };
@@ -6683,6 +7029,32 @@ fn drive_spawn(
         // A quote left open is the last one the line holds: it opened the word it refuses.
         let open = rest.rfind('"').map_or(rest, |at| &rest[at..]);
         return Err(drive_refused(&usage(), open));
+    };
+    // A `cwd=~/…` names a folder of this Mac's home: resolved here, the spawn runs with that
+    // folder as an absolute `cwd=` would name it, so the handler below and the audit line see it.
+    let mut resolved = None;
+    let cwds = tokens
+        .iter()
+        .filter(|token| token.starts_with("cwd="))
+        .count();
+    for token in &tokens {
+        if let Some(value) = token.strip_prefix("cwd=")
+            && let Some(real) = drive_home_cwd(value, home)?
+        {
+            if cwds > 1 {
+                return Err(drive_refused("a drive's spawn names one cwd=", token));
+            }
+            resolved = Some(real);
+        }
+    }
+    let (line, tokens) = match &resolved {
+        Some(real) => drive_spawn_line(&tokens, real)?,
+        None => (line.to_owned(), tokens),
+    };
+    let line = line.as_str();
+    let rest = match &resolved {
+        Some(_) => line.strip_prefix("spawn ").unwrap_or(rest),
+        None => rest,
     };
     if !tokens.iter().any(|token| token.starts_with("agent=")) {
         let mut cwd = None;
@@ -6699,7 +7071,7 @@ fn drive_spawn(
             }
         }
         if cwd.is_none() {
-            return Err("a plain fleet shell requires cwd=/absolute".to_owned());
+            return Err("a plain fleet shell requires cwd=/absolute or 'cwd=~/<path>'".to_owned());
         }
         return Ok(if raise {
             line.to_owned()
@@ -6732,7 +7104,7 @@ fn drive_spawn(
             "cwd" if std::path::Path::new(value).is_absolute() => {}
             "cwd" => {
                 return Err(drive_refused(
-                    "a drive's spawn names an absolute cwd=",
+                    "a drive's spawn names an absolute cwd= or ~/<path> in this Mac's home",
                     token,
                 ));
             }
@@ -6955,7 +7327,8 @@ fn record_drive_worker(store: &Store, sid: &SessionId, node: &str) {
             }
         }
     }
-    let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&file, node));
+    let _ = std::fs::create_dir_all(dir)
+        .and_then(|()| aterm_uds::atomic_file::write(&file, node.as_bytes(), 0o600));
 }
 
 #[cfg(any(unix, test))]
@@ -7095,7 +7468,12 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
 fn recovery_count_refusal(
     admission: &crate::keeper_link::RecoveryCountAdmission,
 ) -> Option<&'static str> {
-    (!admission.ready()).then_some("ERR recovery-count-custody unconfirmed\n")
+    if admission.ready() {
+        crate::metrics::mark_keeper_served();
+        None
+    } else {
+        Some("ERR recovery-count-custody unconfirmed\n")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7898,6 +8276,8 @@ fn wait_authenticated_readable(_stream: &CtlStream) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Only a newline terminates a request. EOF discards a partial command, which
+/// may be the prefix left by a writer that died before completing its frame.
 fn read_request_line_with_policy(
     reader: &mut impl BufRead,
     refusal: &mut impl Write,
@@ -7908,13 +8288,7 @@ fn read_request_line_with_policy(
     loop {
         before_read().ok()?;
         match reader.fill_buf() {
-            Ok([]) => {
-                return if buf.is_empty() {
-                    None
-                } else {
-                    Some(decode_request_line(buf))
-                };
-            }
+            Ok([]) => return None,
             Ok(available) => {
                 let newline = available.iter().position(|byte| *byte == b'\n');
                 let chunk_len = newline.unwrap_or(available.len());
@@ -7952,7 +8326,13 @@ fn read_request_line_with_policy(
 
 const MAX_REQUEST_LINE: usize = aterm_types::control_verbs::MAX_REQUEST_LINE;
 
+/// How long a connection has to make its handshake line whole. A unit test's clients are its
+/// own, which send theirs, so they wait the hang detector; a test of the expiry sets its own
+/// short bound.
+#[cfg(not(test))]
 const AUTH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const AUTH_READ_TIMEOUT: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
 const AUTHENTICATED_READ_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -8970,6 +9350,9 @@ fn front_drive_escalation(
             Some(Need::OwnerOnly)
         }
         FrontControlSurface::NativeSettings => Some(Need::Op(Op::ConfigWrite)),
+        // Delivery refuses it for every authority (`App::controller_input_refusal`); a scoped
+        // caller is turned away here first.
+        FrontControlSurface::PrivateDocument => Some(Need::OwnerOnly),
         FrontControlSurface::None | FrontControlSurface::OtherNative => None,
     }
 }
@@ -8994,6 +9377,7 @@ fn front_drive_denial(surface: FrontControlSurface) -> String {
         FrontControlSurface::HarnessSettings => {
             "ERR native settings harness open (owner-only while open)\n".to_string()
         }
+        FrontControlSurface::PrivateDocument => private_view_refusal(),
         FrontControlSurface::None | FrontControlSurface::OtherNative => "ERR denied\n".to_string(),
     }
 }
@@ -10219,7 +10603,7 @@ fn serve_session_verb(
                 proxy,
                 session,
                 ctx.self_id.as_str(),
-                control_session::caller_actor(scope, ctx),
+                control_session::caller_actor(scope, ctx, store),
             ),
             Err(usage) => usage,
         },
@@ -10502,6 +10886,10 @@ fn typing_momentum_reading(
 #[cfg(test)]
 #[path = "control_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "control_native_observe_tests.rs"]
+mod control_native_observe_tests;
 
 #[cfg(all(test, unix))]
 #[path = "control_handoff_tests.rs"]

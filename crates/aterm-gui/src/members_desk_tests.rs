@@ -655,3 +655,93 @@ fn the_undo_row_offers_undo_until_this_mac_signed() {
         assert!(app.messages.live(posted).is_some(), "the undo row shows");
     }
 }
+
+/// A member the current Commons epochs leave out of control keeps its desk: the lane's read is
+/// [`Local::of`]'s, which its membership log seat alone makes (owner, 2026-11-02), so `aterm ctl
+/// members requests` answers, and an asking Mac is greeted by a member that can allow rather than
+/// told this Mac is no member. `left` reads it as a member still, so a read that found no desk
+/// for a moment (a vault pass that held its state past the read's deadline) never drops its desk.
+/// Without its pinned Commons anchor it is no member by its log while its Commons observation
+/// still reads control-excluded, so `left` reads it gone there and the lane drops the desk, which
+/// comes back with the pin; once its log removes it, `left` reads it gone and the lane drops the
+/// desk again.
+///
+/// NEGATIVE CONTROLS: the seated arm of `Local::of` answering `Ok(None)` (the old rule, where
+/// exclusion meant no desk) fails the `desk().is_some()` assert. `left` counting `control-excluded`
+/// as gone without asking `client::member_by_log` (as before) fails "a seated member has not
+/// left". `left` never counting `control-excluded` or `control-not-visible` as gone fails "a
+/// member with no pinned anchor has left".
+#[test]
+fn a_member_commons_control_leaves_out_keeps_its_desk() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let fixture = client::test_commons_excluded(root.path()).expect("the excluded member");
+    let mut app = App::headless_for_test();
+    app.members.slot = Box::leak(Box::new(Mutex::new(None)));
+    assert!(
+        matches!(
+            aterm_secrets::commons::observe(&fixture.member),
+            Ok(aterm_secrets::commons::Observation::Unavailable(
+                aterm_secrets::commons::Unavailable::ControlExcluded
+            ))
+        ),
+        "the member's Commons observation is control-excluded"
+    );
+    assert!(!left(&fixture.member), "a seated member has not left");
+    follow_local(app.members.slot, &fixture.member);
+    assert!(
+        app.members.desk().is_some(),
+        "the excluded member has a desk"
+    );
+    assert_eq!(app.take_members(&Asked::Requests), "OK 0\n");
+
+    let mut answered = std::io::Cursor::new(Vec::new());
+    serve_ask(
+        app.members.desk().as_ref(),
+        &mut answered,
+        SocketAddr::from(([10, 0, 0, 9], 7)),
+    );
+    let greeting =
+        members::joiner::greeting(&mut answered.get_ref().as_slice()).expect("a member's greeting");
+    assert!(greeting.can_allow, "its log seat lets it allow");
+
+    // Without its pinned anchor the member is no member by its log, while Commons still reads it
+    // as control-excluded: `left` asks the log, not the vault's revocation.
+    let pin = fixture.member.dir.join("commons/default.pin");
+    let kept = fixture.member.dir.join("commons/default.pin.kept");
+    std::fs::rename(&pin, &kept).expect("the pin set aside");
+    assert!(
+        matches!(
+            aterm_secrets::commons::observe(&fixture.member),
+            Ok(aterm_secrets::commons::Observation::Unavailable(
+                aterm_secrets::commons::Unavailable::ControlExcluded
+            ))
+        ),
+        "without its pin the member still reads control-excluded"
+    );
+    assert!(
+        matches!(client::member_by_log(&fixture.member), Ok(false)),
+        "without its pin the member is no member by its log"
+    );
+    assert!(
+        left(&fixture.member),
+        "a member with no pinned anchor has left"
+    );
+    follow_local(app.members.slot, &fixture.member);
+    assert!(
+        app.members.desk().is_none(),
+        "the desk of a member with no pinned anchor is dropped"
+    );
+    std::fs::rename(&kept, &pin).expect("the pin put back");
+    follow_local(app.members.slot, &fixture.member);
+    assert!(
+        app.members.desk().is_some(),
+        "its desk is back with its pin"
+    );
+
+    client::remove_member(&fixture.admin, "member", false).expect("the admin removes the member");
+    client::sync(&fixture.member, None).expect("the member syncs its removal");
+    assert!(left(&fixture.member), "a member its log removed has left");
+    follow_local(app.members.slot, &fixture.member);
+    assert!(app.members.desk().is_none(), "its desk is dropped");
+    fixture.server.stop();
+}

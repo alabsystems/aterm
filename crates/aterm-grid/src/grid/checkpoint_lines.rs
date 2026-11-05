@@ -205,7 +205,6 @@ impl Grid {
     /// Captures inline-image spans across visible rows and at most `max_history` newest scrollback rows (`0` = newest).
     #[must_use]
     pub fn capture_image_carry(&self, max_history: usize) -> GridImageCarry {
-        crate::history_reads::note();
         let has_visible = self.extras().any_image();
         let has_history = max_history > 0 && self.history_any_image(&|_| true);
         if !has_visible && !has_history {
@@ -279,7 +278,6 @@ impl Grid {
 
     /// Installs inline-image spans captured by [`Self::capture_image_carry`] onto visible and uncompressed history rows.
     pub fn apply_image_carry(&mut self, carry: &GridImageCarry) {
-        crate::history_reads::note();
         if self.extras().any_image() {
             let rows = self.rows();
             let cols = self.cols();

@@ -2249,7 +2249,12 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
     for d in [&home, &config, &state] {
         std::fs::create_dir_all(d).unwrap();
     }
-    std::fs::write(config.join("aterm.toml"), "[fleet]\nmachine = \"m16\"\n").unwrap();
+    aterm_uds::atomic_file::write(
+        &config.join("aterm.toml"),
+        b"[fleet]\nmachine = \"m16\"\n",
+        0o600,
+    )
+    .unwrap();
     std::fs::write(
         config.join("accounts.toml"),
         "[[account]]\nlabel = \"m16\"\nclass = \"dedicated\"\nemail = \"claude-one@example.com\"\n",

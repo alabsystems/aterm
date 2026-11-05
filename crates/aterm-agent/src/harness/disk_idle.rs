@@ -501,23 +501,29 @@ pub fn tree_quiet(
         for entry in rd {
             let entry = entry.map_err(|e| format!("{} could not be read: {e}", dir.display()))?;
             seen += 1;
-            super::beat::tick(1);
+            aterm_uds::progress::tick();
             if seen > MAX_WALK_ENTRIES {
                 return Err(format!(
                     "its working tree holds more than {MAX_WALK_ENTRIES} entries"
                 ));
             }
-            let path = entry.path();
-            let meta = std::fs::symlink_metadata(&path)
-                .map_err(|e| format!("{} could not be read: {e}", path.display()))?;
-            if meta.file_type().is_symlink() {
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("{} could not be read: {e}", dir.display()))?;
+            if ft.is_symlink() {
                 continue;
             }
+            let name = entry.file_name();
+            if (ft.is_dir() && name == ".git")
+                || (ft.is_file() && CARGO_LOCKS.iter().any(|l| name == *l))
+            {
+                continue;
+            }
+            let path = entry.path();
+            let meta = entry
+                .metadata()
+                .map_err(|e| format!("{} could not be read: {e}", path.display()))?;
             if meta.is_dir() {
-                let name = entry.file_name();
-                if name == ".git" {
-                    continue;
-                }
                 match device(&path, &meta) {
                     Some(d) if d == dev => {}
                     Some(_) => continue,
@@ -531,9 +537,6 @@ pub fn tree_quiet(
                 fresh(&path, &meta)?;
                 stack.push(path);
             } else if meta.is_file() {
-                if CARGO_LOCKS.iter().any(|l| entry.file_name() == *l) {
-                    continue;
-                }
                 fresh(&path, &meta)?;
             }
         }

@@ -464,6 +464,26 @@ fn workflow_retry_and_completion_consumers_conform_across_restarts_and_replaceme
     }
 }
 
+/// A promise rests on a ledger that can say what the row met.
+#[test]
+fn a_page_row_is_promised_a_sign_in_only_on_a_ledger_that_can_be_read() {
+    let fixture = Fixture::new(Cli::Codex, 3);
+    let records = fixture.records();
+    let promised =
+        |cli| page_row_signs_in_unattended(cli, &fixture.store, &fixture.raw, &records.logins);
+    assert!(
+        promised(Cli::Codex),
+        "CONTROL: nothing on record against it"
+    );
+    let ledger = fixture.store.ledger_path();
+    let _ = std::fs::remove_file(&ledger);
+    std::fs::create_dir(&ledger).unwrap();
+    assert!(
+        !promised(Cli::Codex),
+        "a ledger that cannot be read says nothing"
+    );
+}
+
 #[test]
 fn unadmitted_prose_cannot_complete_or_block_an_admitted_task() {
     let fixture = Fixture::new(Cli::Kimi, 3);

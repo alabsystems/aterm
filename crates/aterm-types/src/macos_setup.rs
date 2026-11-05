@@ -139,7 +139,7 @@ impl Setting {
             Self::Messages | Self::FaceTime => "Signed out",
             Self::Spotlight => "Kept out",
             Self::Permissions => "On",
-            Self::Secrets => "In sync",
+            Self::Secrets => VAULT_LOCAL_READY,
             Self::Repositories => "All",
         }
     }
@@ -320,9 +320,9 @@ pub enum Subject {
     Setting(Setting),
     /// One grant in the Access group.
     Access(Access),
-    /// One kind of credential synced across the person's Macs. A stub that rides
-    /// [`Setting::Secrets`] and reads as not-applicable until SYNC-1 fills its behaviour; it is
-    /// not enumerated by [`Subject::all`], so no Sync row is built in shipped code yet.
+    /// One kind of credential synced across the person's Macs, riding [`Setting::Secrets`].
+    /// Live readers supply evidenced rows; unimplemented categories are not enumerated by
+    /// [`Subject::all`] and never acquire a guessed successful state.
     Sync(SyncKind),
 }
 
@@ -507,6 +507,12 @@ pub const CHANGED_BY_YOU: &str = "Changed by you";
 /// also what the row wants then (design §4: an explicit opt-out is the row's wanted state), so
 /// its quiet Turn On Sync turns it back on.
 pub const SYNC_OFF: &str = "Sync off";
+
+/// The Secrets row's value for intact local vault materialization with a running subscriber.
+pub const VAULT_LOCAL_READY: &str = "Local cache ready";
+
+/// Scope of the local setup check; shared-state observations have their own evidence.
+pub const VAULT_LOCAL_READY_NOTE: &str = "Vault sync is running on this Mac. Network State shows shared-state access and observed versions.";
 
 /// The Secrets vault row's value while `[swarm] enabled = false` turns sharing with the person's
 /// other Macs off: their choice, so also what the row wants (design §4), whatever this Mac's
@@ -971,16 +977,17 @@ impl Selection {
 
 /// The base plan every Mac sets up where nobody chose one
 /// (`docs/DESIGN-init-on-by-default-2026-10-25.md` §8.1): aterm's own Permissions, the Secrets
-/// vault lane (discovery and the Sync rows ride it) and Rust in Spotlight, which changes this
+/// vault lane (discovery and the Sync rows ride it), GitHub repositories and Rust in Spotlight, which changes this
 /// login's own rustup (its profile set to minimal, each toolchain's `rust-docs` set aside and
 /// removed) and keeps aterm's build caches out of Spotlight. The rest is the ALab profile (the
-/// workstation preferences, Dock, Repositories and the Messages and FaceTime sign-outs), which
+/// workstation preferences, Dock and the Messages and FaceTime sign-outs), which
 /// aterm admits by itself only on an ALab Mac.
 pub const BASE_PLAN: Selection = {
     let mut selection = Selection::none();
     selection.set(Setting::Permissions, true);
     selection.set(Setting::Secrets, true);
     selection.set(Setting::Spotlight, true);
+    selection.set(Setting::Repositories, true);
     selection
 };
 
@@ -3084,7 +3091,9 @@ pub mod access_record {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
+                options
+                    .mode(0o600)
+                    .custom_flags(crate::fs_restricted::CREATE_NEW_OPEN_FLAG);
             }
             let mut file = options.open(&staged)?;
             for line in &lines[start..] {

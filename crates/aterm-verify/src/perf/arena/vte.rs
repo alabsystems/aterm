@@ -52,7 +52,8 @@ pub(crate) fn trimmed_benchmarks(stock: &Path, copy: &Path) -> Result<usize, Str
             let (out, changed) =
                 trim_tty(&text).map_err(|e| format!("{}: {e}", script.display()))?;
             if changed {
-                std::fs::write(&script, out).map_err(|e| format!("{}: {e}", script.display()))?;
+                aterm_uds::atomic_file::write(&script, out.as_bytes(), 0o755)
+                    .map_err(|e| format!("{}: {e}", script.display()))?;
                 trimmed += 1;
             }
         }

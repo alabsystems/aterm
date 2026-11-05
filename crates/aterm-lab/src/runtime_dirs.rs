@@ -330,10 +330,7 @@ pub fn witness(run_dir: &Path, members: &[i32], seen: &mut BTreeSet<Held>) {
             }
         }
         if !lines.is_empty()
-            && let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(run_dir.join(RECORD))
+            && let Ok(mut f) = crate::util::append_regular_file(&run_dir.join(RECORD))
         {
             let _ = f.write_all(lines.as_bytes());
         }

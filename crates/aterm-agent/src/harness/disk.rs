@@ -57,9 +57,6 @@ pub mod room;
 #[path = "disk_idle.rs"]
 pub mod idle;
 
-#[path = "disk_beat.rs"]
-pub mod beat;
-
 #[path = "disk_versions.rs"]
 pub mod versions;
 
@@ -1509,10 +1506,15 @@ fn whole_verdict(
             newest = newest.max(m);
         }
         let age_s = survey.now.saturating_sub(newest);
+        let quiet_s = owner.quiet_s(config.quiet_s());
         #[cfg(any(test, debug_assertions))]
-        let short =
-            short && !(fill::fault::armed(fill::fault::Fault::GoneQuietUnderProjection) && !below);
-        let quiet_s = owner.quiet_s(config.quiet_s(), short);
+        let quiet_s = if fill::fault::armed(fill::fault::Fault::GoneWaitsTheDay)
+            && matches!(owner, discover::Owner::BuildCache { .. })
+        {
+            24 * 60 * 60
+        } else {
+            quiet_s
+        };
         if age_s < quiet_s {
             return Err(format!(
                 "a profile was written into {} ago, inside the {} quiet window",
@@ -2589,11 +2591,9 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
     let span = sweep_span;
     match why {
         Unused::Requested => "an explicit request retired this registered ordinary cache after identity, Cargo lock and process-use checks".to_owned(),
-        Unused::Gone { idle, after } => format!(
-            "its workspace is gone, and nothing wrote it for {} (the sweep takes one unwritten \
-             {}); no build held its locks",
-            span(idle),
-            span(after)
+        Unused::Gone { idle } => format!(
+            "its workspace is gone (nothing wrote it for {}); no build held its locks",
+            span(idle)
         ),
         Unused::Idle { idle } => format!(
             "nothing wrote it for {}, a month or more, whatever its workspace's state; no build \
@@ -2629,7 +2629,7 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
         Unused::Tooling { idle, after } => format!(
             "a pinned tool of the tooling cache nothing ran for {} (the sweep takes \
              one unused {}); `targo --unverified verify provision` lays it again (`--linux` \
-             for the Linux lane's rows, `--record` for wasm-bindgen)",
+             for the Linux lane's rows)",
             span(idle),
             span(after)
         ),
@@ -2928,6 +2928,9 @@ pub struct Applied {
     pub stops: Vec<Stop>,
     /// The pass did not reach every row it may have: why (the search for build directories stopped short).
     pub unfinished: Option<String>,
+    /// The checkouts' `target*` links whose target the pass's search found not there
+    /// ([`discover::Dangling`]).
+    pub dangling: Vec<discover::Dangling>,
 }
 
 impl Applied {
@@ -3352,6 +3355,10 @@ pub(crate) fn remover_among(
 /// The ledger's name for the resume typed into a session whose screen said the disk was full ([`resume_text`]), once space is back.
 pub const RULE_DISK_RESUME: &str = "disk-resume@v1";
 
+/// The head of [`resume_text`]: aterm's own words where a person's gesture leaves it unsent in the
+/// composer (`upgrade::own_draft`).
+pub const RESUME_HEAD: &str = concat!(harness_mark!(), " The disk ran out of space (");
+
 /// What is typed into a session whose Claude Code said `ENOSPC` (or `EDQUOT`) while the volume measured full, once a look measures it back.
 #[must_use]
 pub fn resume_text(code: &str, freed: u64, top: &[String]) -> String {
@@ -3366,9 +3373,8 @@ pub fn resume_text(code: &str, freed: u64, top: &[String]) -> String {
         }
     };
     format!(
-        "{} The disk ran out of space ({code}) and {what}. Writes work again: retry what failed \
-         with {code} and carry on.",
-        super::upgrade::HARNESS_MARK
+        "{RESUME_HEAD}{code}) and {what}. Writes work again: retry what failed with {code} and \
+         carry on."
     )
 }
 
@@ -3539,7 +3545,7 @@ pub fn scan_with(
                     .flatten()
             });
             s.targets.push(td);
-            beat::beat();
+            aterm_uds::progress::tick();
         }
     }
     if roots.idle_whole {
@@ -3595,7 +3601,7 @@ fn observe_registered_holders(survey: &mut Survey) {
             serves,
             built_s_ago: None,
         });
-        beat::beat();
+        aterm_uds::progress::tick();
     }
 }
 
@@ -3802,7 +3808,7 @@ fn walk_bytes_until(
         };
         for entry in rd.flatten() {
             seen += 1;
-            beat::tick(1);
+            aterm_uds::progress::tick();
             if seen > MAX_WALK_ENTRIES || deadline.is_some_and(|at| std::time::Instant::now() >= at)
             {
                 return (total, true);

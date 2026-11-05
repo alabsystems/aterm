@@ -61,11 +61,8 @@ impl VerifiedLogin {
 fn snapshot(home: &Path) -> Result<Secret, String> {
     #[cfg(unix)]
     {
-        let mut bytes = vec![0; AUTH_FILE_MAX];
-        let read =
-            aterm_uds::private_file::read_private_into(home, AUTH_FILE, AUTH_FILE_MAX, &mut bytes)
-                .map_err(|_| "staged Codex credential is not private, owned, or intact")?;
-        bytes.truncate(read.len);
+        let bytes = aterm_uds::private_file::read_private(home, AUTH_FILE, AUTH_FILE_MAX)
+            .map_err(|_| "staged Codex credential is not private, owned, or intact")?;
         Ok(Secret::from_vec(bytes))
     }
     #[cfg(not(unix))]

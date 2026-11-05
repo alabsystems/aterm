@@ -135,6 +135,14 @@ fn a_compiled_zsh_set_is_sourced_from_its_wordcode() {
             .arg(path)
             .output()
             .unwrap_or_else(|error| panic!("spawn zsh to source the body: {error}"));
+        assert!(
+            out.status.success(),
+            "zsh sourcing {} exited {}: stderr={:?}, stdout={:?}",
+            path.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        );
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
     let old_text = |path: &std::path::Path| {

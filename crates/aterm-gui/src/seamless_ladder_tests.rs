@@ -283,7 +283,7 @@ fn every_reachable_engine_state_is_admitted_by_the_wire() {
         }
         if rung == CarryRung::StrippedLinks {
             let exact = t
-                .checkpoint_carry_abandoning_partial(checkpoint.history_lines as usize)
+                .checkpoint_carry_abandoning_partial(carried_lines(&checkpoint) as usize)
                 .0;
             let lines = assert_only_over_cap_links_dropped(&at, &exact, &checkpoint);
             assert!(lines > 0, "{at}: the rung names a line that lost its links");
@@ -430,7 +430,7 @@ fn producer_is_total_over_hostile_and_large_desks() {
             }
             StrippedLinks => {
                 let exact = terminal
-                    .checkpoint_carry(checkpoint.history_lines as usize)
+                    .checkpoint_carry(carried_lines(&checkpoint) as usize)
                     .expect("Ground");
                 assert_eq!(
                     assert_only_over_cap_links_dropped(&at, &exact, &checkpoint),
@@ -578,11 +578,14 @@ fn a_link_dense_line_costs_its_links_not_the_screen_or_the_scrollback() {
         ("in the scrollback", &in_scrollback),
         ("on the saved primary", &saved_primary),
     ] {
-        let exact = terminal
-            .checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize)
-            .expect("Ground");
         assert!(
-            checkpoint_shape_refusal(0, &exact).is_some(),
+            checkpoint_shape_refusal(
+                0,
+                &terminal
+                    .checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize)
+                    .expect("Ground")
+            )
+            .is_some(),
             "PRECONDITION {what}: the exact carry is refused"
         );
         for (caps, legacy) in [(WireCaps::current(), false), (WireCaps::legacy(), true)] {
@@ -590,6 +593,18 @@ fn a_link_dense_line_costs_its_links_not_the_screen_or_the_scrollback() {
             let mut cells = 0;
             let (checkpoint, rung, cause) =
                 carry_for_wire(terminal, 5, MAX_HANDOFF_HISTORY_LINES, &mut cells, caps);
+            // The saved primary's history goes only to a successor that reads it there.
+            let budget = if what == "on the saved primary" && legacy {
+                0
+            } else {
+                MAX_HANDOFF_HISTORY_LINES as usize
+            };
+            let exact = terminal.checkpoint_carry(budget).expect("Ground");
+            assert_eq!(
+                carried_lines(&checkpoint) > 0,
+                budget > 0,
+                "{at}: the scrollback crosses exactly where the successor reads it"
+            );
             assert_eq!(rung, CarryRung::StrippedLinks, "{at}: {cause:?}");
             assert!(!rung.needs_repaint() && rung.keeps_differ_state(), "{at}");
             let cause = cause.expect("a rung below Full names its cause");
@@ -599,12 +614,9 @@ fn a_link_dense_line_costs_its_links_not_the_screen_or_the_scrollback() {
                 )),
                 "{at}: the cause counts the lines: {cause}"
             );
-            assert!(
-                exact.history_lines > 0 || what == "on the saved primary",
-                "PRECONDITION {at}: there is scrollback to keep"
-            );
             assert_eq!(
-                checkpoint.history_lines, exact.history_lines,
+                carried_lines(&checkpoint),
+                carried_lines(&exact),
                 "{at}: the whole scrollback crossed"
             );
             assert_eq!(
@@ -632,7 +644,7 @@ fn a_link_dense_line_costs_its_links_not_the_screen_or_the_scrollback() {
                         &mut 0,
                         checkpoint.rows,
                         checkpoint.cols,
-                        checkpoint.history_lines,
+                        carried_lines(&checkpoint),
                         checkpoint.alt_grid.is_some()
                     )
                     .is_ok(),
@@ -934,42 +946,45 @@ fn a_pool_over_the_aggregate_lowers_its_largest_session() {
 /// Dropping carried scrollback produces a carry identical to the engine's visible-only carry.
 #[test]
 fn dropping_carried_history_equals_the_engines_visible_only_carry() {
-    let mut t = Terminal::new(10, 40);
-    for line in 0..60 {
-        t.process(format!("\x1b[3{}mline {line}\x1b[0m\r\n", line % 8).as_bytes());
+    let shell = || {
+        let mut t = Terminal::new(10, 40);
+        for line in 0..60 {
+            t.process(format!("\x1b[3{}mline {line}\x1b[0m\r\n", line % 8).as_bytes());
+        }
+        t.process(b"\x1b]8;;https://example.test\x1b\\link\x1b]8;;\x1b\\");
+        t
+    };
+    let main = shell();
+    let mut saved_primary = shell();
+    saved_primary.process(b"\x1b[?1049h\x1b[Hvim");
+    for (what, t) in [("main", &main), ("saved primary", &saved_primary)] {
+        let (checkpoint, rung, _) =
+            carry_for_wire(t, 4, MAX_HANDOFF_HISTORY_LINES, &mut 0, WireCaps::current());
+        assert_eq!(rung, CarryRung::Full, "{what}");
+        assert!(
+            carried_lines(&checkpoint) > 0,
+            "PRECONDITION {what}: history carried"
+        );
+        let mut pool = vec![WireCarry {
+            local_id: 4,
+            checkpoint,
+            rung,
+        }];
+        lower_wire_carry(&mut pool, 0, false, WireCaps::current(), "the test");
+        assert_eq!(pool[0].rung, CarryRung::VisibleOnly, "{what}");
+        assert_eq!(
+            Some(&pool[0].checkpoint),
+            t.checkpoint_carry(0).as_ref(),
+            "{what}: the lowered carry is the engine's own visible-only carry"
+        );
+        lower_wire_carry(&mut pool, 0, false, WireCaps::current(), "the test");
+        assert_eq!(
+            pool[0].rung,
+            CarryRung::Repaint,
+            "{what}: with no history left, the next step is the screen"
+        );
+        assert_wire_admits(&format!("{what} lowered twice"), &pool[0].checkpoint);
     }
-    t.process(b"\x1b]8;;https://example.test\x1b\\link\x1b]8;;\x1b\\");
-    let (checkpoint, rung, _) = carry_for_wire(
-        &t,
-        4,
-        MAX_HANDOFF_HISTORY_LINES,
-        &mut 0,
-        WireCaps::current(),
-    );
-    assert_eq!(rung, CarryRung::Full);
-    assert!(
-        checkpoint.history_lines > 0,
-        "PRECONDITION: history carried"
-    );
-    let mut pool = vec![WireCarry {
-        local_id: 4,
-        checkpoint,
-        rung,
-    }];
-    lower_wire_carry(&mut pool, 0, false, WireCaps::current(), "the test");
-    assert_eq!(pool[0].rung, CarryRung::VisibleOnly);
-    assert_eq!(
-        Some(&pool[0].checkpoint),
-        t.checkpoint_carry(0).as_ref(),
-        "the lowered carry is the engine's own visible-only carry"
-    );
-    lower_wire_carry(&mut pool, 0, false, WireCaps::current(), "the test");
-    assert_eq!(
-        pool[0].rung,
-        CarryRung::Repaint,
-        "with no history left, the next step is the screen"
-    );
-    assert_wire_admits("lowered twice", &pool[0].checkpoint);
 }
 
 /// A producer `Repaint` carry marks `ScreenCarry::repaint` and preserves the adoption proof.
@@ -1117,6 +1132,111 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
         proof, staged.expected,
         "THE HANDOFF COMPLETES: the child's proof equals the parent's expectation"
     );
+    drop(ready);
+    for fd in [ready_read, commit_read, commit_write] {
+        aterm_pty::close_fd(fd);
+    }
+    staged.teardown();
+}
+
+/// A two-row vim over a shell whose every history line links each cell to its own long URL, carried
+/// at the Full rung: the saved primary's 256 carried lines, far past what its two visible rows
+/// may take.
+fn link_heavy_saved_primary_carry() -> TerminalCheckpoint {
+    let mut t = Terminal::new(2, 20);
+    for line in 0..300 {
+        let mut row = String::new();
+        for cell in 0..20 {
+            row.push_str(&format!(
+                "\x1b]8;;https://example.test/{line}/{cell}/{}\x1b\\x\x1b]8;;\x1b\\",
+                "p".repeat(400)
+            ));
+        }
+        t.process(format!("{row}\r\n").as_bytes());
+    }
+    t.process(b"\x1b[?1049hvim");
+    let (checkpoint, rung, cause) = carry_for_wire(
+        &t,
+        0,
+        MAX_HANDOFF_HISTORY_LINES,
+        &mut 0,
+        WireCaps::current(),
+    );
+    assert_eq!(rung, CarryRung::Full, "{cause:?}");
+    assert_eq!(
+        checkpoint_inactive_history(&checkpoint),
+        MAX_HANDOFF_HISTORY_LINES
+    );
+    let alt = checkpoint.alt_grid.as_ref().expect("the saved primary");
+    let screens_cap = dimension_grid_cap(2, 20, 0).expect("a bounded geometry");
+    assert!(
+        alt.len() as u64 > screens_cap,
+        "PRECONDITION: the blob ({} bytes) is past its screens' cap ({screens_cap})",
+        alt.len()
+    );
+    checkpoint
+}
+
+/// The producer's self-check holds the saved primary's blob to the cap of every line it carries,
+/// as the consumer does: it commits the carry at its rung, unlowered.
+#[test]
+fn the_self_check_commits_a_saved_primarys_history_past_its_screens_byte_cap() {
+    let checkpoint = link_heavy_saved_primary_carry();
+    let mut pool = vec![WireCarry {
+        local_id: 0,
+        checkpoint: checkpoint.clone(),
+        rung: CarryRung::Full,
+    }];
+    let digest = settle_wire_carries(&mut pool, WireCaps::current()).expect("the pool commits");
+    assert_eq!(pool[0].rung, CarryRung::Full, "unlowered");
+    assert_eq!(pool[0].checkpoint, checkpoint, "committed as carried");
+    assert_eq!(screen_digest(&[(0, checkpoint)]), Ok(digest));
+}
+
+/// The successor reads the saved primary's blob before its record count can be read, under the
+/// cap of every line it may carry, not its screens' alone: a carry whose carried history is far
+/// past what its visible rows may take is adopted exactly.
+#[test]
+#[cfg(unix)]
+fn the_saved_primarys_carried_history_is_read_past_its_screens_byte_cap() {
+    use super::tests::{
+        StageCarry, child_proof_from, env_alone, pipe_pair, restore_env, stage_ladder_handoff,
+    };
+
+    let Some(_env) = env_alone() else { return };
+    let _restore = restore_env();
+    let checkpoint = link_heavy_saved_primary_carry();
+    let stage = StageCarry {
+        screens: vec![checkpoint.clone()],
+        controls: Vec::new(),
+        next_turn_id: None,
+        fg_holders: Vec::new(),
+        render_debts: Vec::new(),
+    };
+    let staged = stage_ladder_handoff("saved-primary", &stage, &[]);
+    let (ready_read, ready_write) = pipe_pair("ready");
+    let (commit_read, commit_write) = pipe_pair("commit");
+    staged.publish_env(
+        ready_write,
+        commit_read,
+        Some(encode_target_identity(
+            crate::build_info::build_number()
+                .parse::<u64>()
+                .unwrap_or(0),
+            crate::build_info::git_commit(),
+        )),
+    );
+    let incoming = take_incoming_as(ReceiverShape::Current);
+    assert_eq!(incoming.adopted.len(), 1, "the session adopts");
+    let adopted = &incoming.adopted[0];
+    assert!(!adopted.repaint, "an exact adoption");
+    assert_eq!(
+        adopted.checkpoint.as_ref(),
+        Some(&checkpoint),
+        "adopted exactly as carried, the saved primary's history with it"
+    );
+    let ((proof, ready, _), _) = child_proof_from(incoming).expect("the child adopts and proves");
+    assert_eq!(proof, staged.expected, "the handoff completes");
     drop(ready);
     for fd in [ready_read, commit_read, commit_write] {
         aterm_pty::close_fd(fd);

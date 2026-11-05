@@ -216,8 +216,6 @@ pub struct Options {
     pub rows: Vec<String>,
     /// `--linux`: add the Linux lane's rows.
     pub linux: bool,
-    /// `--record`: add the rows that re-record goldens.
-    pub record: bool,
     /// `--release`: add a release host's tools (source signing, the publication engine's
     /// Python).
     pub release: bool,
@@ -232,11 +230,11 @@ pub struct Options {
 pub fn usage() -> String {
     let names: Vec<&str> = ROWS.iter().map(|r| r.name).collect();
     format!(
-        "targo --unverified verify provision [ROW...] [--linux] [--record] [--release] [--check]
+        "targo --unverified verify provision [ROW...] [--linux] [--release] [--check]
 
 Fetch or build the tools this checkout pins into this user's cache, each placed whole
 or not at all beside a stamp.json; each download is held to a pinned sha256 (pwsh's
-also to Microsoft's Developer ID), and wasm-bindgen builds from crates.io. The rustup
+also to Microsoft's Developer ID). The rustup
 row copies the pinned rustup-init in as `rustup` (its self-install never runs, and
 nothing is written to CARGO_HOME), then has that copy add stable with clippy, its cross
 targets and the wasm32 pin to rustup's own home where they are missing (auto-install
@@ -245,7 +243,6 @@ off first in a home it never ran in). It reads the network.
   (no ROW)    the rows every checkout needs
   --linux     and the Linux lane's VM: lima, Ubuntu's pinned image for its own VM, and
               stable's aarch64-unknown-linux-musl std, which its guest agent is built against
-  --record    and wasm-bindgen, to re-record the wasm-glue goldens
   --release   and a release host's tools: OpenSSL 3 for source signing, and the
               standalone CPython the publication engine runs on
   --check     say what is missing; fetch and change nothing
@@ -268,7 +265,6 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     for arg in args {
         match arg.as_str() {
             "--linux" => opts.linux = true,
-            "--record" => opts.record = true,
             "--release" => opts.release = true,
             "--check" => opts.check = true,
             "-h" | "--help" => opts.help = true,
@@ -301,7 +297,6 @@ pub fn select(opts: &Options) -> Vec<&'static Row> {
                 match r.when() {
                     When::Always => true,
                     When::Linux => opts.linux,
-                    When::Record => opts.record,
                     When::Release => opts.release,
                 }
             } else {
@@ -345,7 +340,6 @@ fn target(row: &Row, machine: &Machine) -> Option<Target> {
         | Install::Build { .. }
         | Install::Configure { .. }
         | Install::OpenSsl { .. }
-        | Install::Cargo
         | Install::Files { .. }
         | Install::Rustup { .. } => {
             let tool = row.tool_row()?;
@@ -354,7 +348,6 @@ fn target(row: &Row, machine: &Machine) -> Option<Target> {
                 return None;
             }
             let sha256 = match row.install {
-                Install::Cargo => None,
                 Install::Files { .. } => {
                     let files = row.files_for(&machine.platform);
                     (!files.is_empty()).then(|| files_digest(&files, pin.version))
@@ -485,21 +478,21 @@ pub fn check_for(row: &Row, opts: &Options, machine: &Machine, host: &dyn Host) 
 
 /// Why `t`, which is not [`complete`], is not in place.
 fn not_complete(name: &str, t: &Target) -> String {
-    if let Some(file) = short(t).filter(|_| t.dir.join(&t.exe).is_file()) {
+    if !t.dir.join(&t.exe).is_file() {
+        format!("{name} {}: not in {}", t.version, t.dir.display())
+    } else if let Some(file) = short(t) {
         format!(
             "{name} {}: {} lacks {file} at its pinned size, which a run fetches again",
             t.version,
             t.dir.display()
         )
-    } else if t.dir.join(&t.exe).is_file() {
+    } else {
         format!(
             "{name} {}: {} holds a copy without this pin's stamp for {}, which a run replaces",
             t.version,
             t.dir.display(),
             t.platform
         )
-    } else {
-        format!("{name} {}: not in {}", t.version, t.dir.display())
     }
 }
 
@@ -551,11 +544,6 @@ pub fn provide_for(
     if matches!(row.install, Install::Rustup { .. }) {
         return rustup_row(row, &t, opts.linux, machine, host, say);
     }
-    if matches!(row.install, Install::Cargo)
-        && let Err(why) = bindgen_dependencies(machine, host)
-    {
-        return State::Failed(format!("{} oracle dependencies: {why}", row.name));
-    }
     let exe = t.dir.join(&t.exe);
     if complete(&t) {
         place::touch_stamp(&t.dir);
@@ -588,7 +576,6 @@ pub fn provide_for(
         Install::OpenSsl { source } => {
             openssl::build(&source, &t, machine, host, say).map_err(Refused::from)
         }
-        Install::Cargo => return cargo_row(row, &t, machine, host, say),
         Install::Browser(engine) => return browser_row(engine, &t, machine, host, say),
         Install::Rustup { .. } => unreachable!("rustup_row places it"),
     };
@@ -658,13 +645,8 @@ fn place_rustup(
         .parent()
         .ok_or_else(|| format!("{} has no directory", t.exe))?;
     std::fs::create_dir_all(bin).map_err(|e| format!("could not create {}: {e}", bin.display()))?;
-    std::fs::copy(&init, &rustup)
+    crate::copy_regular_fresh_mode(&init, &rustup, 0o755)
         .map_err(|e| format!("could not copy rustup-init to {}: {e}", rustup.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod {}: {e}", rustup.display()))?;
-    }
     for proxy in RUSTUP_PROXIES {
         std::fs::hard_link(&rustup, bin.join(proxy))
             .map_err(|e| format!("could not link {proxy} to {}: {e}", rustup.display()))?;
@@ -812,7 +794,7 @@ fn files_digest(files: &[Archive], version: &str) -> String {
             .as_bytes(),
         );
     }
-    sums.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    aterm_codec::hex::encode_lower(&sums.finalize())
 }
 
 /// A files row: fetch each file into a download directory of its own and hold it to its
@@ -844,102 +826,6 @@ fn files_row(
     place::write_stamp(&tree, &t.stamp(row.name, url, "sha256", None))?;
     place::place(&scratch, &tree, &t.dir, &|| complete(t))?;
     Ok(t.dir.join(&t.exe))
-}
-
-/// Fetch the library side of the oracle too: installing the CLI does not cache
-/// `wasm-bindgen`, and the oracle deliberately builds offline.
-fn bindgen_dependencies(machine: &Machine, host: &dyn Host) -> Result<(), String> {
-    let scratch = place::Scratch::new(&machine.tooling, "wasm-bindgen-dependencies")?;
-    let manifest = scratch.path().join("Cargo.toml");
-    std::fs::write(
-        &manifest,
-        format!(
-            "[package]\nname = \"aterm-bindgen-dependencies\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
-             [workspace]\n[lib]\npath = \"lib.rs\"\n\
-             [dependencies]\nwasm-bindgen = \"={}\"\n",
-            crate::wasm_glue::BINDGEN
-        ),
-    )
-    .map_err(|e| format!("could not write oracle dependency manifest: {e}"))?;
-    std::fs::write(scratch.path().join("lib.rs"), "")
-        .map_err(|e| format!("could not write oracle dependency library: {e}"))?;
-    let mut fetch = Spawn {
-        program: host.targo()?,
-        args: vec![
-            "fetch".into(),
-            "--manifest-path".into(),
-            manifest.into_os_string(),
-            "--offline".into(),
-        ],
-        cwd: scratch.path().to_path_buf(),
-        set: Vec::new(),
-        remove: fish::removed(),
-    };
-    if host.run(&fetch).is_err() {
-        fetch.args.pop();
-        host.run(&fetch)?;
-    }
-    Ok(())
-}
-
-fn cargo_row(
-    row: &Row,
-    t: &Target,
-    machine: &Machine,
-    host: &dyn Host,
-    say: &mut dyn FnMut(&str),
-) -> State {
-    let exe = t.dir.join(&t.exe);
-    let built = (|| -> Result<(), String> {
-        let scratch = place::Scratch::new(&machine.tooling, row.name)?;
-        let root = scratch.path().join("tree");
-        let targo = host.targo()?;
-        let mut args: Vec<OsString> = vec!["--unverified".into()];
-        args.extend(crate::wasm_glue::BINDGEN_INSTALL.iter().map(OsString::from));
-        args.extend([
-            "--root".into(),
-            root.clone().into_os_string(),
-            "--target-dir".into(),
-            scratch.path().join("target.noindex").into_os_string(),
-        ]);
-        say(&format!(
-            "building wasm-bindgen-cli {}: targo --unverified install --locked",
-            t.version
-        ));
-        let install = Spawn {
-            program: targo,
-            args,
-            cwd: scratch.path().to_path_buf(),
-            set: Vec::new(),
-            remove: fish::removed(),
-        };
-        let scratch = scratch.run_build(host, &install)?;
-        let built = root.join(&t.exe);
-        let probe = Spawn {
-            program: built.clone(),
-            args: vec!["--version".into()],
-            cwd: scratch.path().to_path_buf(),
-            set: Vec::new(),
-            remove: Vec::new(),
-        };
-        let (scratch, out) = scratch
-            .run_copied(host, &probe)
-            .map_err(|e| format!("{} did not answer --version: {e}", built.display()))?;
-        if !crate::wasm_glue::reports_pin(&out) {
-            return Err(format!("{} does not answer {}", built.display(), t.version));
-        }
-        let reports = out.trim().to_string();
-        let url = format!("https://crates.io/crates/wasm-bindgen-cli/{}", t.version);
-        place::write_stamp(
-            &root,
-            &t.stamp(row.name, Some(url), "crates.io", Some(reports)),
-        )?;
-        place::place(&scratch, &root, &t.dir, &|| complete(t))
-    })();
-    match built {
-        Ok(()) => State::Placed(exe),
-        Err(why) => State::Failed(format!("{} {}: {why}", row.name, t.version)),
-    }
 }
 
 fn browser_row(

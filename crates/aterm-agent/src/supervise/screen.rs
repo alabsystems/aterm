@@ -148,6 +148,12 @@ impl Screen {
             .checked_sub(self.first)
             .filter(|&i| i < self.rows.len())
     }
+
+    /// [`cursor_under_composer`] of this read's cursor, the composer's caret on row `caret`.
+    #[must_use]
+    pub fn cursor_under(&self, caret: usize) -> bool {
+        cursor_under_composer(&self.rows, self.cursor_index(), caret)
+    }
 }
 
 /// Parse the JSON payload of a `text --json` reply (with or without an `OK 1` header line).
@@ -481,22 +487,55 @@ pub fn cursor_home(cursor: Option<(usize, usize)>, caret: usize, lines: &[String
     })
 }
 
-/// WHETHER A COMPOSER OF `lines` FROM ROW `caret` HOLDS NO DRAFT, as Claude Code's and Muse Code's
-/// upgrade gates read it (the loop's `composer_draft` by the same rule): nothing in it, or a first
-/// line that `grey` says is drawn grey with the cursor home ([`cursor_home`]). A blank first line over
-/// text on a later row is text, whatever a blank's cell is drawn in, so `grey` is asked of nothing but
-/// a first glyph with the cursor home on it.
+/// WHETHER THE CURSOR STANDS UNDER THE COMPOSER whose caret is on row `caret` of `rows`: a rule
+/// between that row and the cursor's, so past the composer's bottom rule (on the rule itself it is a
+/// displaced grid's, [`cursor_home`]). Of a live composer's states measured only a program's
+/// prompt-history search (Ctrl-R) leaves it there, on the search's own row: Claude Code 2.1.318's
+/// at every width from 144 columns down to 12 (`claude-2.1.318-history-search*`), and Muse Code
+/// 1.4.14's; its other states (the `/`, `@`, `?`, `!` and `#` modes, Ctrl-C, Esc Esc, Shift+Tab,
+/// Ctrl-T, Ctrl-O) leave it on the composer (docs/measured/draft-hold-findings-2026-11-04.md). It
+/// also stands there under the old prompt box a relaunch left drawn above its new launch line
+/// (`claude-2.1.283-inline-relaunch-before-repl`), and in a read taken inside a redraw before the
+/// program placed its cursor (`half-drawn-frame-2026-10-22.md`). Keys go where the cursor stands,
+/// so the composer's rows say nothing of a draft: no empty composer to type into, no draft an
+/// Enter sends.
+#[must_use]
+pub fn cursor_under_composer(rows: &[String], cursor_row: Option<usize>, caret: usize) -> bool {
+    cursor_row.is_some_and(|row| {
+        rows.get(caret + 1..row)
+            .is_some_and(|between| between.iter().any(|r| aterm_phase::phase::is_rule(r)))
+    })
+}
+
+/// WHETHER THE FIRST GLYPH'S CELL DECIDES [`composer_holds_no_draft`] for a composer of `lines` from
+/// row `caret`: text on its first line, the cursor home on it ([`cursor_home`]). Anywhere else the
+/// rows decide alone, so a gate that reads the cell before it judges asks it only here.
+#[must_use]
+pub fn grey_decides(cursor: Option<(usize, usize)>, caret: usize, lines: &[String]) -> bool {
+    lines.first().is_some_and(|l| !l.is_empty()) && cursor_home(cursor, caret, lines)
+}
+
+/// WHETHER A COMPOSER OF `lines` FROM ROW `caret` OF `rows` HOLDS NO DRAFT, as Claude Code's and Muse
+/// Code's upgrade gates read it (the loop's `composer_draft` by the same rule): the cursor on or above
+/// its bottom rule ([`cursor_under_composer`]: under it, a search's keys go elsewhere), and nothing
+/// in it, or a first line that `grey` says is drawn grey with the cursor home. A blank first line
+/// over text on a later row is text, whatever a blank's cell is drawn in, so `grey` is asked only
+/// where it decides ([`grey_decides`]).
 #[must_use]
 pub fn composer_holds_no_draft(
+    rows: &[String],
     cursor: Option<(usize, usize)>,
     caret: usize,
     lines: &[String],
     grey: impl FnOnce() -> bool,
 ) -> bool {
-    if lines.first().is_none_or(String::is_empty) {
-        return lines.iter().all(String::is_empty);
+    if cursor_under_composer(rows, cursor.map(|(row, _)| row), caret) {
+        false
+    } else if grey_decides(cursor, caret, lines) {
+        grey()
+    } else {
+        lines.iter().all(String::is_empty)
     }
-    cursor_home(cursor, caret, lines) && grey()
 }
 
 /// THE COMPOSER'S FIRST GLYPH, READ WHERE ITS CELL SAYS WHAT THE TEXT IS: `read(col)` is the
@@ -548,6 +587,86 @@ pub fn status_field<'s>(stdout: &'s str, field: &str) -> Option<&'s str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OF A LIVE COMPOSER'S STATES ONLY THE PROMPT-HISTORY SEARCH LEAVES THE CURSOR UNDER IT, over
+    /// every screen in `aterm-phase`'s fixtures that records its cursor (`· cursor=<row>,<col>`) and
+    /// whose program's reader reads a composer: Claude Code 2.1.318's search at every width
+    /// measured and Muse Code 1.4.14's, each read by its program's reader (`history_search`), which
+    /// reads it on no other of these screens; and, no live composer, the old prompt box a relaunch
+    /// left drawn above its new launch line (`claude-2.1.283-inline-relaunch-before-repl`), where a
+    /// draft typed is lost. Nowhere a gate reads such a composer empty, and it asks no cell there.
+    /// NEGATIVE CONTROLS: the rule taking the bottom rule's own row for under it, and the half-drawn
+    /// launch frames read under; it reading no rule between, and every search over nothing reads
+    /// empty to a gate; `phase::history_search` ending its footer at the first blank row, and the
+    /// 12-column match reads no search.
+    #[test]
+    fn of_a_live_composer_only_the_history_search_leaves_the_cursor_under_it() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+        let mut under = Vec::new();
+        let mut read = 0;
+        for entry in std::fs::read_dir(&dir).expect("the phase fixtures") {
+            let path = entry.expect("a fixture").path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let Some((row, col)) = aterm_phase::prompt::fixtures::cursor(&text) else {
+                continue;
+            };
+            if text.contains("\n## ") {
+                continue;
+            }
+            let Some(program) = ["claude", "muse", "agy", "grok", "codex", "kimi"]
+                .into_iter()
+                .find(|p| name.starts_with(&format!("{p}-")))
+            else {
+                continue;
+            };
+            let rows = aterm_phase::prompt::fixtures::screen(&text);
+            let Some((caret, lines)) = aterm_phase::read(Some(program), &rows, Some(col)).composer
+            else {
+                continue;
+            };
+            read += 1;
+            let search = name.contains("-history-search") && !name.contains("-left");
+            let reader = match program {
+                "claude" => Some(aterm_phase::phase::history_search as fn(&[String]) -> bool),
+                "muse" => Some(aterm_phase::muse::history_search as fn(&[String]) -> bool),
+                _ => None,
+            };
+            if let Some(history_search) = reader {
+                assert_eq!(history_search(&rows), search, "{name}: the search read");
+            }
+            if cursor_under_composer(&rows, Some(row), caret) {
+                assert!(
+                    !composer_holds_no_draft(&rows, Some((row, col)), caret, &lines, || {
+                        panic!("{name}: a cell asked under the composer")
+                    }),
+                    "{name}"
+                );
+                under.push(name);
+            }
+        }
+        under.sort();
+        assert!(read >= 40, "the corpus must exercise the rule: {read}");
+        let searches: Vec<&String> = under
+            .iter()
+            .filter(|n| n.contains("-history-search") && !n.contains("-left"))
+            .collect();
+        assert_eq!(
+            under.len(),
+            searches.len() + 1,
+            "under the composer: {under:#?}"
+        );
+        assert!(
+            under.contains(&"claude-2.1.283-inline-relaunch-before-repl.txt".to_string()),
+            "{under:#?}"
+        );
+        assert!(searches.len() >= 16, "{under:#?}");
+    }
 
     /// [`Screen::take_cursor_of`]: a later read of the same content gives its cursor whole (row,
     /// column and slice start); NEGATIVE CONTROLS: a read whose seq moved, or whose rows moved

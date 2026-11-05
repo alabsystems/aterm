@@ -125,6 +125,10 @@ pub(super) fn save(opts: &Opts, tab: &str, observed: &Observed) -> std::io::Resu
     }
 }
 
+fn observation_kind_enabled(enabled: &[Constructor]) -> bool {
+    enabled.contains(&Constructor::PrivateRestart) || enabled.contains(&Constructor::ColdRestart)
+}
+
 /// Called by the real snapshot worker while the vendor is live. The first snapshot may
 /// precede host publication; refusal simply leaves crash entry without proof until captured.
 pub(crate) fn observe_live(opts: &Opts, snap: &super::super::relaunch::Snapshot) {
@@ -146,7 +150,15 @@ pub(crate) fn observe_live(opts: &Opts, snap: &super::super::relaunch::Snapshot)
     let Ok(mut client) = upgrade_drive::connect(opts, &snap.tab) else {
         return;
     };
-    if !constructor_enabled(&mut client, &snap.tab) {
+    let Ok(Reply::Constructors(enabled)) =
+        native_act::exchange(&mut client, &snap.tab, &Request::Constructors)
+    else {
+        return;
+    };
+    // A passive death witness grants no account or execution authority. Stored,
+    // provider and custom-directory routes all need the same live identity proof;
+    // their current credential context is admitted separately before Execute.
+    if !observation_kind_enabled(&enabled) {
         return;
     }
     let Ok(Reply::Info { epoch, .. }) =
@@ -235,4 +247,20 @@ pub(super) fn captured(
         && process.parent == snap.shell
         && Image::at(&snap.program).as_ref() == Some(&process.image))
     .then_some((observed.registration, binding))
+}
+
+#[cfg(test)]
+mod constructor_tests {
+    use super::*;
+    #[test]
+    fn passive_cold_witness_requires_an_advertised_restart_constructor() {
+        assert!(observation_kind_enabled(&[Constructor::PrivateRestart]));
+        assert!(observation_kind_enabled(&[Constructor::ColdRestart]));
+        assert!(observation_kind_enabled(&[
+            Constructor::OwnImage,
+            Constructor::ColdRestart
+        ]));
+        assert!(!observation_kind_enabled(&[Constructor::OwnImage]));
+        assert!(!observation_kind_enabled(&[]));
+    }
 }

@@ -149,7 +149,7 @@ fn verdict_lines(verdicts: &[(String, bool)], width: usize) -> Vec<Vec<usize>> {
 /// No tiles, or the PNG could not be encoded or written.
 pub fn write(path: &Path, title: &str, note: &str, tiles: &[Tile]) -> Result<(), String> {
     let png = sheet_png(title, note, tiles, false)?;
-    std::fs::write(path, png).map_err(|e| format!("{}: {e}", path.display()))
+    crate::util::write_out(path, &png).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Native-pixel tiles, encoded for a caller that retains its own output directory.

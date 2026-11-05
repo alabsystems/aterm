@@ -6,7 +6,9 @@
 
 use std::io;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
+#[cfg(all(test, unix))]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 #[cfg(all(test, unix))]
@@ -37,7 +39,7 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         ));
     }
     aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o700)?;
-    let meta = std::fs::symlink_metadata(dir)?;
+    let mut meta = std::fs::symlink_metadata(dir)?;
     if !meta.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -52,16 +54,16 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         #[cfg(all(test, unix))]
         CHMOD_CALLS.with(|c| c.set(c.get() + 1));
         set_dir_mode_nofollow(dir, 0o700)?;
-    }
-    let meta = std::fs::symlink_metadata(dir)?;
-    if !meta.file_type().is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{}: update path is not a real directory; refusing",
-                dir.display()
-            ),
-        ));
+        meta = std::fs::symlink_metadata(dir)?;
+        if !meta.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{}: update path is not a real directory; refusing",
+                    dir.display()
+                ),
+            ));
+        }
     }
     if aterm_types::fs_restricted::dir_safe_for_private_write(uid, meta.uid(), meta.mode()) {
         Ok(())
@@ -79,22 +81,7 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 fn set_dir_mode_nofollow(dir: &Path, mode: u32) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let perms = std::fs::Permissions::from_mode(mode);
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(dir)
-    {
-        Ok(f) => f.set_permissions(perms),
-        Err(_)
-            if std::fs::symlink_metadata(dir)
-                .is_ok_and(|m| m.file_type().is_dir() && m.uid() == our_uid()) =>
-        {
-            std::fs::set_permissions(dir, perms)
-        }
-        Err(e) => Err(e),
-    }
+    aterm_uds::private_file::set_dir_mode_nofollow(dir, mode)
 }
 
 /// Windows variant: create `dir` and refuse a final component that is a symlink or junction.

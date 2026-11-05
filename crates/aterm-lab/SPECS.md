@@ -12,6 +12,15 @@
 >
 > 2026-10-16: `codex-captures` and its one spec (`codex-slash-login-verdict`) went with aterm's Codex
 > screen reader, which the captures fed; the counts below are the recovery's.
+>
+> 2026-11-01: `link_notice` (held by `link_notice.rs::a_refused_link_is_told_once`,
+> `the_scratch_reads_tell_each_link_they_refuse_once` and `a_lab_a_test_started_tells_nothing`,
+> not yet a row): `sys::scratch_file`, `scratch_dir`, `scratch_remove` and `open_parent` hand a
+> path `O_NOFOLLOW_ANY` refused with `ELOOP` to `link_notice::refused`, and `scratch_dir` each link
+> its listing leaves out; armed by the lab's own verbs in an aterm session that no Cargo test
+> binary started (the lab's executable or an ancestor's), it tells the instance hosting it one
+> `appnotice proc lab refused <path>: …` line per path, within 2 s; unarmed (every test, and a lab
+> a test started), nothing.
 
 Source: `crates/aterm-lab` (read only). I read every `#[test]` (codex.rs 5, codex_proof.rs 1,
 door.rs 2, footers.rs 4, jail.rs 4, lab.rs 3, nudge.rs 6, paths.rs 3, probe.rs 3, procs.rs 3,
@@ -325,9 +334,9 @@ in a lab self-test on a real host.
 12. **Resolved — `configured_nudge` scopes `repaint_nudge` to `[render]`.** `nudge.rs::configured_nudge`
     now tracks TOML table headers and reads `repaint_nudge` only inside `[render]`.
 13. **Resolved — lagging spec rows reconciled with current code.** `launcher-argv`, `lab-parse-launch`,
-    `agy-parse-launch`, `run-env-sh-roundtrip`, `screen-composer`, `screen-composer-agy`, and
-    `aos-search-distributed-verify` (`aos_search::verify_bundle`) now match the shipped signatures
-    and agent branches, and the remaining `screen.rs` composer tests are mapped in §2 and §7.
+    `agy-parse-launch`, `run-env-sh-roundtrip`, `screen-composer` and `screen-composer-agy` now match
+    the shipped signatures and agent branches, and the remaining `screen.rs` composer tests are mapped
+    in §2 and §7.
 
 ## 6. Proof order
 
@@ -551,90 +560,36 @@ src/sys.rs	a_listing_that_fails_is_an_error_and_never_an_empty_jail	jail-members
 src/selftest.rs	a_member_table_that_was_not_read_says_why	jail-members-table	
 ```
 
-## 14. The distributed search's workers (aos M5b)
+## 14. The threaded search, and what the benches share
 
-`aos-search --threads N` and `--workers N` (`src/aos_search.rs`), the worker verb and its pool
-(`src/aos_workers.rs`) and the measurement's runner `aos-workers-bench`
-(`src/aos_workers_bench.rs`) drive aterm-effects' pure `aos-dist-*` core (its SPECS §7); the design
-is `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §11. The tests in `tests/aos_workers.rs`
-spawn the built `aterm-lab`, so their spec is an effect (gap 8).
+`aos-search --threads N` (`src/aos_search.rs`) judges a search's candidates on threads
+(`src/spread.rs`). The tests in `tests/aos_search.rs` spawn the built `aterm-lab`, so their spec is
+an effect (gap 8). `src/bench_stats.rs` holds what `aos-gpu-bench`, `outlook_captures` and the swarm
+partition share. The distributed search (`aos-search --workers`, the worker verb and the runner
+`aos-workers-bench`; `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §11) was removed on 2026-11-04:
+it gains no speed on one Mac that threads do not gain better (measured: 26.25 s on eight workers, 18.52 s on eight threads, 46.80 s serial, `docs/measured/aos-m5b-workers-2026-10-23.md`), and git history is the way back.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-aos-workers-process	contract	aos_workers::{worker_main,Pool::{spawn,admit,run,void,shutdown},binary}; aos_search::{run_in,search,distributed,summary_of}	For F the six-line plans file and N ≥ 1 workers: `aos-search --grid --plans F --workers N` prints the serial run's result and winners and writes the serial run's bundles, mode and timings aside, and `--threads N` and `--check all` do too. Each fault that only costs work (kill, hang, slow, late, dup, each at one lease) fires once and leaves that result unchanged. Each lie (late-lie, dup-lie, close-lie, lie-refusal, lie-best, inflate, garbage, flood) fires once and exits 1 with `result=void`, its refusal named, every bundle the command wrote removed, and no later search run; a void while other leases are live drains their holders by their acks, never by DrainTimeout. A foreign worker is refused alone (NoWorkers when it is the only one). SIGTERM exits 143 with refusal Cancelled; SIGKILL to the coordinator ends every worker through its stdin. On every exit path every spawned worker is reaped. Under `--frames` a run without `--workers` says on stderr `aos-workers step=0.evaluator` once its evaluator is built, then for each search G one `G.trained.N` per candidate trained (N from 0, in order on one thread); a pool run says `G.check` once G's claims are accepted, and no evaluator or trained step. Either says `G.held-out` only once G picked a winner and `G.verify` only once the held-out read admitted it, so a search with no winner says neither.	tests/aos_workers.rs::{honest_workers_give_the_local_result,check_all_judges_every_claim_and_records_search,threads_give_the_local_result,a_search_with_no_winner_says_no_held_out_or_verify,a_killed_worker_costs_a_retry_only,a_hung_worker_expires_and_is_retried,a_slow_worker_is_stale_and_its_late_progress_dropped,a_late_equal_result_is_stale,an_equal_resend_is_a_duplicate,a_late_lie_voids,a_differing_resend_voids_and_drains_by_acks,a_refusal_claimed_for_an_admitted_plan_voids,a_forged_best_voids,an_inflated_winner_is_found_by_the_dominance_check,garbage_voids_and_drains_by_acks,a_flood_voids,a_foreign_worker_is_refused_alone,a_void_in_a_later_search_removes_the_earlier_bundle,a_void_in_an_earlier_search_runs_no_later_one,a_lie_the_shutdown_drain_reads_removes_the_bundle,every_held_lie_is_sent_at_the_close_in_order,sigterm_voids_and_reaps,sigkill_to_the_coordinator_ends_every_worker_by_the_lifeline}	processes, pipes, signals, threads, files	0,1,8,13
-aos-workers-shell	contract	aos_workers::{read_frame,frame_bytes,read_worker,Fault::{parse,on},Timed::{run,calls},Stepped::run,percentiles,Tail::take,PoolArgs::limits}; spread::Threads::run	read_frame(frame_bytes(p)) = Ok(Some(p)) for |p| ≤ MAX_FRAME, a clean end between frames is Ok(None), a header over MAX_FRAME is Oversize before any payload byte is read, and a cut header or payload, a bad magic or a bad CRC is Corrupt. Fault::parse accepts exactly `KIND@G.S.A` (`:K` for kill, hang and slow only; G, A ≥ 1) and `foreign@W`, and `on(t)` fires only for t's search, slot and attempt. Threads(w).run(n, f) calls f once per index below n; Stepped over s with serial G runs f once per index below n through s and says `aos-workers step=G.trained.K` once per job finished, K counting from 0 across its calls, and nothing for n = 0; percentiles is nearest rank in ms; the stderr tail keeps the last STDERR_TAIL bytes and counts each `fault=… fired` line across chunks; limits() is LIMITS_V1 but the hello, the window, the grace and max_workers. Readers into a channel of capacity 2 × workers block when it is full and lose and reorder nothing.	src/aos_workers_tests.rs::{frames_round_trip_and_each_damage_is_refused_by_name,fault_specs_parse_by_lease_and_refuse_by_reason,threads_run_every_index_once,stepped_spreads_say_one_step_per_job_and_run_every_index_once,percentiles_are_nearest_rank,the_stderr_tail_is_bounded_and_counts_fired_faults,pool_limits_are_v1_but_the_hello_the_window_the_grace_and_the_size,a_full_channel_blocks_its_readers_and_loses_nothing}	Vec, slices, Result, string parsing, threads, atomics	0,1,3,5,7,13
-aos-workers-bench-record	contract	aos_workers_bench::{williams,parse_summary,lab_debug,gates,c0,criteria,record}	The runner of design §11.8's pre-registered session: round r runs row (r−1) mod 6 of a Williams square of the six arms (each arm once in every position and after every other once; 12 rounds are the six orders twice); a summary parses only with its header and result line and no stray line; gate 0 needs one clean commit and a debug lab byte-identical to the runner and unchanged at the end; gate 1 is A reproducing the M4 record's figures, each mismatch named; gate 2 (a void, an unreaped worker, a failing exit, a C0 mismatch, a run never compared) is a defect that stops the session; gate 3 leaves out a clean P round with any lost, expired, stale, duplicate, late progress, foreign, dropped, retry or cancel; gates 4–6 as registered; C0 sets aside exactly the timings, the toolchain line and the mode; C1–C3 are shown only when they hold in every valid round; each fault of the fault session must fire once and move its counter; a smoke run (rounds < 12) makes no claim; the statistics are the median and the range.	src/aos_workers_bench_tests.rs::{the_williams_square_puts_each_arm_once_in_every_position,the_williams_square_puts_each_arm_after_every_other_exactly_once,twelve_rounds_are_the_six_orders_twice_over,aos_workers_bench_parses_its_flags_and_defaults_to_the_registered_twelve_rounds,a_run_adds_its_arms_flags_then_its_fault,a_real_workers_summary_parses_field_by_field,a_real_serial_summary_and_a_real_fault_summary_parse,a_summary_without_its_header_or_result_or_with_a_stray_line_does_not_parse,the_load_average_is_the_first_of_sysctls_three,gate0_holds_for_one_clean_commit_on_a_debug_lab_and_fails_otherwise,the_lab_is_the_runners_profile_only_where_it_is_the_runner,gate1_passes_the_m4_records_figures_and_names_each_mismatch,an_a_run_that_does_not_reproduce_the_record_voids_the_session,gate2_a_void_an_unreaped_worker_a_failing_exit_or_a_c0_mismatch_is_a_defect_that_stops,gate2_a_run_waits_for_its_reference_and_a_run_never_compared_voids,gate3_a_clean_p_run_that_counts_a_lost_worker_leaves_its_round_out,gate4_a_wall_times_spanning_more_than_1_3x_void_the_session,gate5_the_deadline_and_the_memory_budget_each_leave_a_run_out,gate6_ten_of_twelve_valid_rounds_hold_and_nine_do_not,c0_sets_aside_the_timings_the_toolchain_line_and_the_mode_and_nothing_else,settle_takes_the_first_reproducing_a_run_as_the_reference_and_judges_the_waiting_runs,c1_c2_c3_are_shown_when_they_hold_in_every_valid_round,a_criterion_failing_in_one_valid_round_is_not_shown,a_left_out_round_is_not_paired,each_fault_must_fire_once_and_move_its_counter,the_fault_session_shows_every_fault_and_discloses_its_109_builds,a_fault_that_did_not_show_in_one_run_is_not_shown,a_fault_runs_c0_mismatch_stops_the_fault_session,a_smoke_records_stable_lines_say_smoke_and_make_no_claim,a_registered_valid_session_makes_its_claims_and_a_void_one_exits_1,a_session_with_faults_exits_0_only_when_every_fault_shows,the_statistics_are_the_median_and_the_range}	Vec, string parsing, f64, enum match	0,1,3,5,7
-aos-search-parallel-flags	contract	aos_search::parse_args	--threads and --workers are exclusive; --check, --lease-ms, --hello-ms, --grace-ms and --fault need --workers, and --frames parses in debug builds with or without it; --check is dominance (the default) or all; --workers takes 1 to min(available, 16) and --threads 1 to 256; --lease-ms, --hello-ms, --grace-ms, --fault and --frames parse only in debug builds, a fault spec by Fault::parse and a window, a hello or a grace in positive milliseconds; each refusal is a usage line naming its rule.	src/aos_search.rs::the_parallel_flags_are_exclusive_and_bounded	string matching, Option, Result	0,1,3
-aos-search-distributed-verify	contract	aos_search::{passed,verify_bundle}; aterm_effects m4 check_proposer, check_selection	A bundle of Mode::Distributed naming the grid is checked for what the grid fixes (its plan is plans()[index], round 0, the grid's counts), and its winner and admitted count are reported as provenance=declared, never as established. A forged count (duplicates = 1) is a Selection refusal after the rows have run; an index past the grid or a later round is a Proposer refusal, with no panic.	src/aos_search.rs::a_distributed_grid_bundle_is_declared_and_what_the_grid_fixes_is_checked	enum match, slices	0,1,3,12
+aos-search-threads-process	contract	aos_search::{run_in,search,summary_of}; spread::{say,say_built,Stepped::new}	For F the six-line plans file: `aos-search --plans F --threads 3 --frames` exits 0 and writes the bundle the same command without `--threads` writes, timings aside, in mode search; each run says its evaluator built, each candidate trained, the winner's held-out read and its verify, one step each. A run past the one-minute hang detector on its next new step or its end fails, or is COULD NOT RUN when its process waited for a core at least half the stretch and longer than it ran, from 10 s into the stretch and over its last 10 s.	tests/aos_search.rs::{threads_give_the_local_result,a_step_counts_once_and_only_when_the_run_names_it,a_stretch_is_judged_on_the_runs_wait_for_a_core,a_stretch_past_the_detector_is_could_not_run_only_when_starved_through}	processes, pipes, threads, files	0,1,8,13
+aos-spread	contract	spread::{Threads::run,Stepped::run}	Threads(w) runs each of n jobs exactly once at any width; Stepped runs every index once through the spread it wraps and says one step per job finished, numbered across its calls; a call with no jobs says nothing.	src/spread.rs::{threads_run_every_index_once,stepped_spreads_say_one_step_per_job_and_run_every_index_once}	threads, atomics	0,1,3,5,7,13
+aos-search-parallel-flags	contract	aos_search::parse_args	--threads takes 1 to 256, or exit 2; --frames parses in debug builds, with or without it.	src/aos_search.rs::threads_are_bounded_and_frames_parses_with_or_without_threads	string matching, Option, Result	0,1,3
+bench-stats	contract	bench_stats::{williams,median,span_ratio,required_valid,parse_loadavg}	williams(n) for even n is n orders of 0..n, each value once in every position and after every other value exactly once, None for odd n or 0; median is the middle value or the mean of the two; span_ratio is max / min, None when empty or the least is not positive; required_valid(n) = n − ⌊n/6⌋; parse_loadavg takes the first figure of `{ 1m 5m 15m }`.	src/bench_stats.rs::{the_williams_square_puts_each_arm_once_in_every_position,the_williams_square_puts_each_arm_after_every_other_exactly_once,the_load_average_is_the_first_of_sysctls_three,the_median_the_span_and_the_valid_rounds}	Vec, string parsing, f64	0,1,3,5,7
 ```
 
 ```tsv
 file	test	primary	also
-tests/aos_workers.rs	honest_workers_give_the_local_result	aos-workers-process	
-tests/aos_workers.rs	check_all_judges_every_claim_and_records_search	aos-workers-process	
-tests/aos_workers.rs	threads_give_the_local_result	aos-workers-process	
-tests/aos_workers.rs	a_search_with_no_winner_says_no_held_out_or_verify	aos-workers-process	
-tests/aos_workers.rs	a_killed_worker_costs_a_retry_only	aos-workers-process	
-tests/aos_workers.rs	a_hung_worker_expires_and_is_retried	aos-workers-process	
-tests/aos_workers.rs	a_slow_worker_is_stale_and_its_late_progress_dropped	aos-workers-process	
-tests/aos_workers.rs	a_late_equal_result_is_stale	aos-workers-process	
-tests/aos_workers.rs	an_equal_resend_is_a_duplicate	aos-workers-process	
-tests/aos_workers.rs	a_late_lie_voids	aos-workers-process	
-tests/aos_workers.rs	a_differing_resend_voids_and_drains_by_acks	aos-workers-process	
-tests/aos_workers.rs	a_refusal_claimed_for_an_admitted_plan_voids	aos-workers-process	
-tests/aos_workers.rs	a_forged_best_voids	aos-workers-process	
-tests/aos_workers.rs	an_inflated_winner_is_found_by_the_dominance_check	aos-workers-process	
-tests/aos_workers.rs	garbage_voids_and_drains_by_acks	aos-workers-process	
-tests/aos_workers.rs	a_flood_voids	aos-workers-process	
-tests/aos_workers.rs	a_foreign_worker_is_refused_alone	aos-workers-process	
-tests/aos_workers.rs	a_void_in_a_later_search_removes_the_earlier_bundle	aos-workers-process	
-tests/aos_workers.rs	a_void_in_an_earlier_search_runs_no_later_one	aos-workers-process	
-tests/aos_workers.rs	a_lie_the_shutdown_drain_reads_removes_the_bundle	aos-workers-process	
-tests/aos_workers.rs	every_held_lie_is_sent_at_the_close_in_order	aos-workers-process	
-tests/aos_workers.rs	sigterm_voids_and_reaps	aos-workers-process	
-tests/aos_workers.rs	sigkill_to_the_coordinator_ends_every_worker_by_the_lifeline	aos-workers-process	
-src/aos_workers_tests.rs	frames_round_trip_and_each_damage_is_refused_by_name	aos-workers-shell	
-src/aos_workers_tests.rs	fault_specs_parse_by_lease_and_refuse_by_reason	aos-workers-shell	
-src/aos_workers_tests.rs	threads_run_every_index_once	aos-workers-shell	
-src/aos_workers_tests.rs	stepped_spreads_say_one_step_per_job_and_run_every_index_once	aos-workers-shell	
-src/aos_workers_tests.rs	percentiles_are_nearest_rank	aos-workers-shell	
-src/aos_workers_tests.rs	the_stderr_tail_is_bounded_and_counts_fired_faults	aos-workers-shell	
-src/aos_workers_tests.rs	pool_limits_are_v1_but_the_hello_the_window_the_grace_and_the_size	aos-workers-shell	
-src/aos_workers_tests.rs	a_full_channel_blocks_its_readers_and_loses_nothing	aos-workers-shell	
-src/aos_workers_bench_tests.rs	the_williams_square_puts_each_arm_once_in_every_position	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	the_williams_square_puts_each_arm_after_every_other_exactly_once	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	twelve_rounds_are_the_six_orders_twice_over	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	aos_workers_bench_parses_its_flags_and_defaults_to_the_registered_twelve_rounds	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	a_run_adds_its_arms_flags_then_its_fault	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	a_real_workers_summary_parses_field_by_field	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	a_real_serial_summary_and_a_real_fault_summary_parse	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	a_summary_without_its_header_or_result_or_with_a_stray_line_does_not_parse	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	the_load_average_is_the_first_of_sysctls_three	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	gate0_holds_for_one_clean_commit_on_a_debug_lab_and_fails_otherwise	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	the_lab_is_the_runners_profile_only_where_it_is_the_runner	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	gate1_passes_the_m4_records_figures_and_names_each_mismatch	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	an_a_run_that_does_not_reproduce_the_record_voids_the_session	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	gate2_a_void_an_unreaped_worker_a_failing_exit_or_a_c0_mismatch_is_a_defect_that_stops	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	gate2_a_run_waits_for_its_reference_and_a_run_never_compared_voids	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	gate3_a_clean_p_run_that_counts_a_lost_worker_leaves_its_round_out	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	gate4_a_wall_times_spanning_more_than_1_3x_void_the_session	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	gate5_the_deadline_and_the_memory_budget_each_leave_a_run_out	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	gate6_ten_of_twelve_valid_rounds_hold_and_nine_do_not	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	c0_sets_aside_the_timings_the_toolchain_line_and_the_mode_and_nothing_else	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	settle_takes_the_first_reproducing_a_run_as_the_reference_and_judges_the_waiting_runs	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	c1_c2_c3_are_shown_when_they_hold_in_every_valid_round	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	a_criterion_failing_in_one_valid_round_is_not_shown	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	a_left_out_round_is_not_paired	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	each_fault_must_fire_once_and_move_its_counter	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	the_fault_session_shows_every_fault_and_discloses_its_109_builds	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	a_fault_that_did_not_show_in_one_run_is_not_shown	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	a_fault_runs_c0_mismatch_stops_the_fault_session	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	a_smoke_records_stable_lines_say_smoke_and_make_no_claim	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	a_registered_valid_session_makes_its_claims_and_a_void_one_exits_1	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	a_session_with_faults_exits_0_only_when_every_fault_shows	aos-workers-bench-record	
-src/aos_workers_bench_tests.rs	the_statistics_are_the_median_and_the_range	aos-workers-bench-record	
-src/aos_search.rs	the_parallel_flags_are_exclusive_and_bounded	aos-search-parallel-flags	
-src/aos_search.rs	a_distributed_grid_bundle_is_declared_and_what_the_grid_fixes_is_checked	aos-search-distributed-verify	
+tests/aos_search.rs	threads_give_the_local_result	aos-search-threads-process	
+tests/aos_search.rs	a_step_counts_once_and_only_when_the_run_names_it	aos-search-threads-process	
+tests/aos_search.rs	a_stretch_is_judged_on_the_runs_wait_for_a_core	aos-search-threads-process	
+tests/aos_search.rs	a_stretch_past_the_detector_is_could_not_run_only_when_starved_through	aos-search-threads-process	
+src/spread.rs	threads_run_every_index_once	aos-spread	
+src/spread.rs	stepped_spreads_say_one_step_per_job_and_run_every_index_once	aos-spread	
+src/aos_search.rs	threads_are_bounded_and_frames_parses_with_or_without_threads	aos-search-parallel-flags	
+src/bench_stats.rs	the_williams_square_puts_each_arm_once_in_every_position	bench-stats	
+src/bench_stats.rs	the_williams_square_puts_each_arm_after_every_other_exactly_once	bench-stats	
+src/bench_stats.rs	the_load_average_is_the_first_of_sysctls_three	bench-stats	
+src/bench_stats.rs	the_median_the_span_and_the_valid_rounds	bench-stats	
 ```
 
 ## 15. Added 2026-10-24: the shared-buffer inference measurement's runner (aos M5a)
@@ -1146,4 +1101,60 @@ util-read-regular	contract	util::{open_regular_file,read_regular_file,read_regul
 ```tsv
 file	test	primary	also
 src/util.rs	read_regular_file_and_text_refuse_non_regular_entries	util-read-regular	
+```
+
+## 29. Added 2026-11-04: the facts leg's pure readers (gap 23)
+
+`codex-alab-proof --facts-only` judges aterm's no-progress fact riding a real codex-alab's
+continuation by what it reads passively: codex-alab's journal of each read and ride, the model's
+requests, one `sys jobs` read after the measurement, the session ledger and the Messages log
+(`codex_alab_facts_proof.rs`). The model's `facts` arms ask for the leg's two calls and tag a
+request that carries the rider (`codex_alab_model.rs`). Read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+facts-journal-lines	contract	codex_alab_proof::facts_proof::{fact_line,fact_lines,story,is_episode,is_rule}	fact_lines(j) = in order, (at, fact_line(rest)) of each line of j split at its first `codex_alab_autopilot: ` where fact_line(rest) is Some, at = workers::iso_ms of the line's first word (its UTC stamp as unix ms, None where that does not parse). fact_line(rest) = Read{why,rule} iff rest = `fact: <why> (<rule>)` with why non-empty and rule = <name>@v<digits>; Told{e} iff rest = `fact <kind> <e> told` with e 16 lowercase hex digits; Rides{e,rule} iff rest = `<key>: fact <kind> <e> rides <rule>`; Other(rest) for any other rest that starts `fact: ` or `fact ` or holds `: fact: ` or `: fact `; None otherwise. story(ls) puts each Read's (why, at) in before while no Rides came yet and its why in after once one did, each Rides in rides, each Told in told and each Other in other.	-	1	-
+facts-check-1-in-time	contract	codex_alab_proof::facts_proof::{reads_before_hold,reads_at}	reads_before_hold(b, t) iff b is non-empty, every (why, at) in b has at = Some(a) with why = `stale`, or why = `none` and a − t < NONE_UNTIL_MS (PHI8_QUIET_MS + FACT_FRESH_MS + 3000), and some (_, Some(a)) in b has a − t < PHI8_QUIET_MS (184208, φ 8 over the 10 s floor μ). The leg's t is written_ms of FACTS_TICKS (the file's modified time as unix ms, the rhythm's last tick), util::now_ms where that cannot be read. reads_at(b, t) = for each (why, at): `<why> at <secs(a − t)>`, or `<why> at -` where at is None.	-	1	-
+facts-rider	contract	codex_alab_proof::facts_proof::{rider_of,told_call,expected_rider}	rider_of(u) = u[i..] for the last i at which turn_end::FACT_OPEN starts, None where it never does. told_call(r) = Some((p, n)) iff r holds `(pid <p>)` followed by `has made no progress for <n> min` with p: u32 and n: u64 parsing. expected_rider(p, n) = turn_end::fact_suffix of a Fact whose text is BackgroundCall{pid: p, task: None, wait: None, quiet_ms: 60000·n}.told() = ` (aterm: a background call (pid p) has made no progress for n min)`.	-	1	-
+facts-board-ledger-messages	contract	codex_alab_proof::facts_proof::{no_progress_leaders,ledger_facts,message_texts}	no_progress_leaders(r) = in order, the u32 after `id=a` of each line of r that starts `job ` and holds the word `no_progress=1`. ledger_facts(rows) = for each row whose rule_id is `fact-no-progress@v1`: its sid without a leading `@`, decision, command, reason and holder (each `` where absent). message_texts(r) = for each line of r that starts `message `: pct_decode(title) + ` ` + the lines of pct_decode(detail) joined with nothing between them.	-	1	-
+facts-model-arms	contract	codex_alab_model::{answer,facts_call,facts_holder_call,facts_waiter_call,facts_step}	For a request of leg `facts`: at Step::Person with 0 tool outputs, tag `facts:holder` and one exec_command (login false, yield_time_ms 1000, no tty) whose perl takes LOCK_EX on FACTS_LOCK, writes its pid to FACTS_HOLDER_PID and stops itself; with 1, tag `facts:waiter` and one exec_command whose perl is the call's leader, writes its pid to FACTS_WAITER_PID, prints FACTS_TICK_COUNT ticks FACTS_TICK_MS apart into FACTS_TICKS (its stdout and stderr) and then takes LOCK_EX on FACTS_LOCK; otherwise slow(FACTS_STARTED, SLOW_TURN) tagged `facts:person`. At Step::Continue, slow(facts_step(c), SLOW_TURN) tagged `facts:continue`, c the request's count of continuation texts, with FACT_TAG appended iff the request's user text holds turn_end::FACT_OPEN. facts_step(n) for n in 1..=10 are ten texts no two of which share codex-alab's reply mark (each word's letters, a word with a digit one `#`), and none says done.	-	1	-
+```
+
+```tsv
+file	test	primary	also
+src/codex_alab_facts_proof.rs	codex_alab_s_fact_lines_tell_the_reads_the_ride_and_its_ack	facts-journal-lines	
+src/codex_alab_facts_proof.rs	check_1_holds_l3_s_reads_and_refuses_a_late_ride	facts-check-1-in-time	facts-journal-lines
+src/codex_alab_facts_proof.rs	the_expected_rider_is_aterms_fact_suffix_for_the_call	facts-rider	
+src/codex_alab_facts_proof.rs	sys_jobs_names_the_no_progress_calls_by_their_leader	facts-board-ledger-messages	
+src/codex_alab_facts_proof.rs	the_ledger_s_fact_rows_carry_their_holder	facts-board-ledger-messages	
+src/codex_alab_facts_proof.rs	messages_rows_are_read_by_their_decoded_words	facts-board-ledger-messages	
+src/codex_alab_model.rs	the_facts_leg_runs_its_two_calls_then_its_steps_and_tags_a_fact	facts-model-arms	
+```
+
+## 30. Added 2026-11-01: `work-overlap`, the overlap fact live
+
+`work-overlap [tag] [--keep]` brings up a headless lab of its own against the stub alone and lays a
+scratch world in the project folder's `.ubd/work-overlap.noindex`: a bare `origin.git` whose main
+holds `src/lib.rs`, its clone `repo`, and the clone's worktrees `wa` and `wb` off main. The manager
+Claude Code spawns two workers, `spawn agent=claude cwd=<worktree>`; each changes `shared()` in
+`src/lib.rs` with one Bash call that then holds on a gate file the lab writes. The lab opens the
+first's gate once its first record is a floor old, waits for its next aterm-typed prompt and its
+`work=` row naming the file, opens the second's the same way, and wants the second's ledger row
+`fact-overlap@v1` typed and its next prompt to carry ` (aterm: 1 file this branch changes is also
+changed by <first sid>)` naming no place, and both rows to name the file; then it opens the
+first's second gate, whose Bash commits and pushes to origin's main before `Nothing left:` (and
+`LANDED` at Land's check), and
+wants the first's task `done why=landed` and its `work=` row gone while the second's stays. Each
+wait is a one-minute hang detector. Read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+work-overlap-plan	contract	work_overlap::{Plan::{new,script,spawn_command,change_command,land_command,hold,gate},told,typed_after,overlaps_typed,names_no_place,session_of,work_of}	Plan::new(n, w) keys the manager, the first and the second by tokens holding n, in w/wa and w/wb, their gates under w/gates; script() = the manager's two spawns (`aterm ctl @self spawn agent=claude cwd=<tree> - <<'EOF'`, the task, `EOF`) and its words; each worker's change (printf of shared() returning 1 or 2 into src/lib.rs, then hold(gate 1)) and report; the first's land_command (hold(gate 2), TMPDIR in the world, add, commit, `git push -q origin HEAD:main`, status), its `Nothing left:` defense and its `LANDED`; the second's reply, which is no defense. hold(g) waits for g in 0.2 s steps at most GATE_STEPS times and fails where g never came. told(s) = `1 file this branch changes is also changed by s`. typed_after(R, t) = the first user row after the assistant row whose text is t with words and no tool result. overlaps_typed(L) = the commands of L's fact-overlap@v1 rows decided typed. names_no_place(f) ⇔ no `/`, no `lib.rs`, and no word src, wa, wb, main, origin or repo. session_of(j, s) = the record of sid s among j's hosts' sessions; work_of(r) = (work=, work_paths= names src/lib.rs, work_ms= as a number).	-	1	-
+```
+
+```tsv
+file	test	primary	also
+src/work_overlap_tests.rs	the_script_keys_each_conversation_by_its_token	work-overlap-plan	
+src/work_overlap_tests.rs	the_seconds_prompt_and_ledger_rows_are_read_where_aterm_typed_them	work-overlap-plan	
+src/work_overlap_tests.rs	a_survey_records_work_fields_are_read_by_sid	work-overlap-plan	
 ```

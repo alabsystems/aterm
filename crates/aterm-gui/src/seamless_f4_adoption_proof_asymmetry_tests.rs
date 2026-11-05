@@ -103,6 +103,7 @@ fn realistic_layout() -> RestoreManifest {
             focused_path: vec![crate::restore::RestoreBranch::Second],
             zoomed: false,
             parked: false,
+            ephemeral: false,
         }],
     }])
 }
@@ -162,7 +163,7 @@ fn live_checkpoint() -> aterm_core::terminal::TerminalCheckpoint {
 }
 
 #[test]
-fn lowering_the_carry_to_zero_cures_a_shape_refusal() {
+fn a_scrollback_bearing_inactive_blob_is_the_saved_primarys_alone() {
     let mut t = aterm_core::terminal::Terminal::new(49, 131);
     for i in 0..400 {
         t.process(format!("primary line {i}\r\n").as_bytes());
@@ -175,27 +176,31 @@ fn lowering_the_carry_to_zero_cures_a_shape_refusal() {
 
     t.process(b"\x1b[?1049h");
     t.process(b"a full-screen app draws here");
+    let carried = t.checkpoint_carry(256).expect("parser is Ground");
+    assert_eq!(
+        checkpoint_inactive_history(&carried),
+        256,
+        "the carry spends its history on the saved primary"
+    );
+    assert!(
+        checkpoint_shape_refusal(0, &carried).is_none(),
+        "the saved primary's history is canonical in the inactive blob"
+    );
+    screen_digest(&[(0, carried)]).expect("and the digest commits it");
 
-    let mut carried = t.checkpoint_carry(256).expect("parser is Ground");
-    carried.alt_grid = Some(parked_primary);
-
+    t.process(b"\x1b[?1049l\x1b[?1047hthe parked buffer\x1b[?1047l");
+    let mut parked = t.checkpoint_carry(256).expect("parser is Ground");
+    parked.alt_grid = Some(parked_primary);
     assert!(
         matches!(
-            checkpoint_shape_refusal(0, &carried),
+            checkpoint_shape_refusal(0, &parked),
             Some(ScreenDigestRefusal::GridNotCanonical {
                 which: GridSlot::Inactive,
                 ..
             })
         ),
-        "the premise: a scrollback-bearing inactive blob is refused"
+        "on the main screen the inactive blob is the parked alternate screen, which keeps none"
     );
-
-    let visible_only = t.checkpoint_carry(0).expect("parser is Ground");
-    assert!(
-        checkpoint_shape_refusal(0, &visible_only).is_none(),
-        "the cure: at carry 0 the inactive blob is exactly `rows` records"
-    );
-    screen_digest(&[(0, visible_only)]).expect("and the digest commits it");
 }
 
 #[test]

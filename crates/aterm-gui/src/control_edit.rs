@@ -112,7 +112,6 @@ pub(crate) fn serve_edit(
         return format!("ERR refused bad-uri ({error})\n");
     }
     let ticket = mint_ticket();
-    let _unwaited = (!request.wait).then(|| hold::Unwaited::mark(ticket));
     let real_uri = real_file_uri(&request.uri);
     let (answer, _hop) = match post.ask(|reply| {
         Wake::EditRequest(Box::new(EditCall {

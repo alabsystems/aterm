@@ -4,6 +4,7 @@
 //! Lifecycle management (`up`, `down`, `ps`) for isolated lab instances.
 
 use std::fs;
+#[cfg(test)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -913,7 +914,7 @@ fn launch_window(
 fn progress_of(pid: i32, out: &Path) -> u64 {
     crate::sys::cpu_used(pid)
         .unwrap_or(0)
-        .saturating_add(fs::metadata(out).map_or(0, |m| m.len()))
+        .saturating_add(fs::symlink_metadata(out).map_or(0, |m| m.len()))
 }
 
 /// A starting child's readiness, waited for as a hang detector on its `progress`.
@@ -1025,10 +1026,18 @@ pub(crate) fn launch_ready(
 
 /// `path` opened for appending, twice.
 fn append_to_std(path: &Path) -> std::io::Result<(std::process::Stdio, std::process::Stdio)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let f = fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
     let g = f.try_clone()?;
     Ok((std::process::Stdio::from(f), std::process::Stdio::from(g)))
 }
@@ -1217,7 +1226,6 @@ fn bus_vars(run: &Run, user: &str) -> Vec<(String, String)> {
 /// A file could not be made, a grant could not be minted, or the broker could not start or never
 /// listened ([`crate::bus::await_listening`], naming what it said).
 fn stand_bus(run: &mut Run, armed: bool) -> Result<String, String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
     let vars = bus_vars(run, &paths().user);
     let live = bus_live(run);
     let laid = {
@@ -1245,15 +1253,10 @@ fn stand_bus(run: &mut Run, armed: bool) -> Result<String, String> {
     // `aterm_uds::control_socket_dir` under XDG_RUNTIME_DIR=<sockdir>: `<sockdir>/aterm`.
     let dir = Path::new(&run.sockdir).join("aterm");
     let file = dir.join(aterm_link::enable::RENDEZVOUS_FILE);
-    fs::create_dir_all(&dir)
-        .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)))
+    crate::util::create_private_dir_all(&dir)
         .and_then(|()| {
             use std::io::Write as _;
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&file)?
+            crate::util::create_new_regular_file(&file, 0o600)?
                 .write_all(laid.rendezvous().render().as_bytes())
         })
         .map_err(|e| format!("the rendezvous file {}: {e}", file.display()))?;
@@ -1562,7 +1565,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         let file = home_image_file(&run.run);
         let image = crate::disk_lane::Image::attach_at(&file, &home, size, "atermlabhome")
             .map_err(|e| abort(&run, &[], &format!("the home image: {e}")))?;
-        fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
+        crate::util::set_dir_mode_nofollow(&home, 0o700)
             .map_err(|e| abort(&run, &[], &format!("the home image's root: {e}")))?;
         image.leave();
         run.home_image = file.to_string_lossy().into_owned();
@@ -1591,15 +1594,15 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         crate::clock::lay(&mut run, &p.repo)
             .map_err(|e| abort(&run, &[], &format!("the sleep clock: {e}")))?;
     }
-    let _ = fs::write(
-        w.join("home/.codex/LAB-DECOY"),
+    let _ = crate::util::write_fresh(
+        &w.join("home/.codex/LAB-DECOY"),
         format!(
             "lab decoy: Codex runs with CODEX_HOME={}; nothing may be written here\n",
             w.join("codex-home").display()
         ),
     );
-    let _ = fs::write(
-        w.join(crate::agy_proof::DECOY),
+    let _ = crate::util::write_fresh(
+        &w.join(crate::agy_proof::DECOY),
         "lab decoy: agy runs with HOME=agy-home; nothing may be written here\n",
     );
     run.sockdir = crate::sys::make_temp_dir("/tmp/at.XXXX")
@@ -1609,7 +1612,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     let _ = fs::create_dir_all(&run.proj);
     let bin = run.run.join(BIN);
     let made = fs::create_dir_all(run.run.join("bin"))
-        .and_then(|()| fs::copy(&p.exe, &bin).map(|_| ()))
+        .and_then(|()| crate::util::copy_regular_file(&p.exe, &bin).map(|_| ()))
         .and_then(|()| fs::create_dir_all(run.run.join("shim")))
         .and_then(|()| std::os::unix::fs::symlink(&bin, run.run.join("shim/security")))
         .and_then(|()| std::os::unix::fs::symlink(&bin, run.run.join("shim/open")))
@@ -1644,7 +1647,8 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     spec.grok.clone_from(&run.grok_bin);
     spec.kimi.clone_from(&run.kimi_bin);
     let jail = crate::jail::render(&spec).map_err(|e| abort(&run, &[], &e))?;
-    fs::write(run.run.join("jail.sb"), jail).map_err(|e| abort(&run, &[], &e.to_string()))?;
+    crate::util::write_fresh(&run.run.join("jail.sb"), jail)
+        .map_err(|e| abort(&run, &[], &e.to_string()))?;
     if let Err(e) = crate::jail::check(&run.run.join("jail.sb")) {
         eprintln!("aterm-lab: {e}");
         return Err(abort(
@@ -1692,9 +1696,9 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     if o.tab_strip {
         run.tab_strip = "1".into();
     }
-    let _ = fs::write(w.join("mode"), "ok\n");
-    let _ = fs::write(w.join("reply.txt"), "");
-    let _ = fs::write(w.join("security.log"), "");
+    let _ = crate::util::write_fresh(&w.join("mode"), "ok\n");
+    let _ = crate::util::write_fresh(&w.join("reply.txt"), "");
+    let _ = crate::util::write_fresh(&w.join("security.log"), "");
 
     let ws = |f: &str| w.join(f).to_string_lossy().into_owned();
     let stub_prog: Vec<String> = [
@@ -1750,7 +1754,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     run.stub_pid = pid;
     run.save();
     if launched.is_ok() {
-        let _ = fs::write(run.run.join(BIN_RAN), "");
+        let _ = crate::util::atomic_write(&run.run.join(BIN_RAN), b"");
     }
     let started = [run.sampler_pid, run.stub_pid];
     if let Err(e) = launched {
@@ -1759,7 +1763,8 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         }
         eprintln!("aterm-lab: the stub: {e}");
     }
-    let filled = |f: &str| fs::metadata(w.join(f)).is_ok_and(|m| m.len() > 0);
+    let filled =
+        |f: &str| fs::symlink_metadata(w.join(f)).is_ok_and(|m| m.is_file() && m.len() > 0);
     if !(filled("stub.port") && filled("proxy.port")) {
         eprint!(
             "{}",
@@ -1782,14 +1787,13 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         "#!/bin/sh\n# the lab's fake API key (the stub accepts anything); nothing real\nprintf \"%s\\n\" \"{}\"\n",
         api_key()
     );
-    let _ = fs::write(&helper, script)
-        .and_then(|()| fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)));
+    let _ = crate::util::atomic_write_mode(&helper, script.as_bytes(), 0o755);
     let witness = run.run.join(crate::settings_witness::SCRIPT);
-    let _ = fs::write(
+    let _ = crate::util::atomic_write_mode(
         &witness,
-        crate::settings_witness::script(&w.join(crate::settings_witness::LOG)),
-    )
-    .and_then(|()| fs::set_permissions(&witness, fs::Permissions::from_mode(0o755)));
+        crate::settings_witness::script(&w.join(crate::settings_witness::LOG)).as_bytes(),
+        0o755,
+    );
     run.proxy = if o.proxy_dead {
         "http://127.0.0.1:9".into()
     } else {
@@ -1877,7 +1881,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     }
     run.claude_ver = jailed_version(&run, &run.claude_bin, |l| l.split_whitespace().next());
     if run.claude_ver != "?" && clone {
-        let _ = fs::write(run.run.join(CLOCK_RAN), "");
+        let _ = crate::util::atomic_write(&run.run.join(CLOCK_RAN), b"");
     }
     if !run.codex_bin.is_empty() {
         run.codex_ver = codex_version(&run, &run.codex_bin);
@@ -2213,7 +2217,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
         crate::occupancy_standin::LOG,
     ] {
         if let Ok(Some(b)) = crate::sys::scratch_read(&r.w.join(f)) {
-            let _ = fs::write(keep.join(f), b);
+            let _ = crate::util::write_fresh(&keep.join(f), b);
         }
     }
     for (f, to) in [
@@ -2269,7 +2273,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
             .lines()
             .map(|l| format!("{}\n", mask_account(l)))
             .collect();
-        let _ = fs::write(keep.join("security.log"), masked);
+        let _ = crate::util::write_fresh(&keep.join("security.log"), masked);
     }
     keep_tree(&r.state().join("drive"), &keep.join("drive"));
     keep_tree(&r.run.join(LAUNCHES), &keep.join(LAUNCHES));
@@ -2283,7 +2287,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
             ("b.log", "fabric-b.log"),
         ] {
             if let Ok(Some(b)) = crate::sys::scratch_read(&live.join(f)) {
-                let _ = fs::write(keep.join(to), b);
+                let _ = crate::util::write_fresh(&keep.join(to), b);
             }
         }
     }
@@ -2942,13 +2946,13 @@ fn relay_shown_running(run: &Run) -> bool {
 fn lay_relay(run: &Run) -> Result<(), Fail> {
     let dir = run.run.join("relay");
     if relay_shown_running(run) && dir.join("node").is_file() {
-        let _ = fs::write(run.run.join(RELAY_RAN), "");
+        let _ = crate::util::atomic_write(&run.run.join(RELAY_RAN), b"");
     }
     let node = dir.join("node");
     if !node.is_file() {
         let new = dir.join("node.new");
         fs::create_dir_all(&dir)
-            .and_then(|()| fs::copy(run.run.join(BIN), &new).map(|_| ()))
+            .and_then(|()| crate::util::copy_regular_file(run.run.join(BIN), &new).map(|_| ()))
             .and_then(|()| fs::rename(&new, &node))
             .map_err(|e| {
                 Fail::die(format!(
@@ -2986,9 +2990,8 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     }
     let script = run.run.join("claude.sh");
     let text = launcher(run, l);
-    atomic_write(&script, text.as_bytes())
+    crate::util::atomic_write_mode(&script, text.as_bytes(), 0o755)
         .map_err(|e| Fail::die(format!("cannot write {}: {e}", script.display())))?;
-    let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o755));
     let door = Door::new(run)?;
     let sid = crate::verbs::active_sid(&door);
     if !sid.is_empty() {

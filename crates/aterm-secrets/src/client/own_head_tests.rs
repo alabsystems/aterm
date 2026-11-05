@@ -450,9 +450,13 @@ fn an_admins_own_publish_after_the_heal_keeps_the_head_that_still_carries() {
 /// `st2`'s saw a version that kept it. `mx` holds no seat in the log (an approval by code signs no
 /// `Admit`), so the revoke writes no `Remove` there: the served version's `code-only` line is all
 /// that says it went. `st2`'s own version still lists `mx` with `st2`'s approval, but `st2` carries
-/// nothing back and forgets its own version.
+/// nothing back and forgets its own version. The let-go's re-key wraps current seats only
+/// (one-mesh M1, M4: the fixture's seatless `m9` drops), so `st2`'s later pass mirrors that change
+/// and keeps the version it sealed then: the forget is judged on the let-go itself, before a pass.
 ///
 /// NEGATIVE CONTROL: `lost_to` ignoring `code-only` lines: fails with "st2 carried mx back".
+/// NEGATIVE CONTROL: `settled` ignoring `code-only` lines: fails with "st2 still keeps an own
+/// version whose every approval a newer version decided".
 #[test]
 fn a_mac_another_admin_let_go_after_the_approval_is_not_carried_back() {
     let _answering = ServersAnswering::set();
@@ -496,6 +500,29 @@ fn a_mac_another_admin_let_go_after_the_approval_is_not_carried_back() {
         lab.st2.published_file().exists(),
         "CONTROL: st2 keeps its own version"
     );
+    let _ = sync_records_with_candidates(&lab.st2, None, &urls);
+    let st2_config = config(&lab.st2).unwrap().unwrap();
+    let st2_identity = read_identity(&lab.st2).unwrap().unwrap();
+    let own = super::own_head::own_head(&lab.st2, &st2_config, &st2_identity)
+        .expect("CONTROL: st2's own version verifies");
+    let heads = read_server_heads(&lab.st2, &urls).unwrap();
+    let let_go_seq = heads[0].envelope.seq;
+    let (log, _) =
+        super::log_entries::trusted_seeded_log(&lab.st2, &st2_config, &heads[0].envelope)
+            .unwrap()
+            .expect("st2's log");
+    let lost = super::own_head::judge(
+        &lab.st2,
+        &own,
+        &heads,
+        Some(&log),
+        &st2_identity.recipient(),
+    );
+    assert!(lost.is_empty(), "st2 carried mx back");
+    assert!(
+        !lab.st2.published_file().exists(),
+        "st2 still keeps an own version whose every approval a newer version decided"
+    );
 
     for _ in 0..2 {
         let _ = sync_with_candidates(&lab.st2, None, &urls);
@@ -504,9 +531,11 @@ fn a_mac_another_admin_let_go_after_the_approval_is_not_carried_back() {
     for url in &urls {
         assert!(!addressed(url, &mx_id), "{url} seals a locker to mx again");
     }
+    let kept = super::own_head::own_head(&lab.st2, &st2_config, &st2_identity);
     assert!(
-        !lab.st2.published_file().exists(),
-        "st2 still keeps an own version whose every approval a newer version decided"
+        kept.is_none_or(|own| own.envelope.seq > let_go_seq
+            && !own.doc.machines().iter().any(|m| m.recipient == mx_rec)),
+        "st2 keeps its approving version again"
     );
 
     lab.s1.stop();

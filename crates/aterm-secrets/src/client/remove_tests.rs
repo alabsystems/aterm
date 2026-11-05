@@ -11,6 +11,9 @@ use crate::membership_log::encode_records;
 #[path = "convergence_tests.rs"]
 mod convergence;
 
+#[path = "gap_heal_conformance_tests.rs"]
+mod gap_heal;
+
 /// Every clock in the log-derived envelope survives persistence, including maximum
 /// timestamps: every held record an epoch (a due, a seen and a wait clock each), and half of
 /// them `Remove`s instead (a removal clock each). The former 64 KiB reader refuses either file
@@ -501,6 +504,7 @@ fn a_removed_mac_asking_again_shows_as_removed_not_new() {
         allowed,
         reader: crate::members::bundle::Reader::LegacyLog,
         restore,
+        node_proven: false,
         held: None,
     };
     let error = hand_over(m7, &handing(&request, &allowed, false))
@@ -550,6 +554,7 @@ fn an_older_restore_cannot_undo_the_current_rosters_later_removal() {
             allowed: &allowed,
             reader: crate::members::bundle::Reader::LegacyLog,
             restore: true,
+            node_proven: false,
             held: None,
         },
     )
@@ -571,7 +576,12 @@ fn an_older_restore_cannot_undo_the_current_rosters_later_removal() {
     );
 
     remove_member(paths, &label, false).unwrap();
-    let current = swarm_roster(paths).unwrap().unwrap();
+    let current = swarm_roster_until(
+        paths,
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    .unwrap();
     assert!(current.is_label_denied(&label));
     assert!(
         current
@@ -818,9 +828,14 @@ fn an_undo_names_the_incarnation_with_removals_to_undo() {
 /// Mac the envelope lists). `aterm secrets revoke` sends each to the admin's revoke, which takes it
 /// out of both, instead of the member path whose refusal pointed back at `revoke`; a member stays
 /// on the member path, and the member path's refusal says where the admin's revoke runs.
+/// The admin's revoke re-keys `[everyone]` and Commons over the current seats (one-mesh M1, M4):
+/// m9 is out, the seat m22 holds the new keys, and the unproved m7, which no seat binds, drops
+/// from the log's carry (it takes a seat through the desk to read the log again).
 ///
 /// NEGATIVE CONTROL: make `revoke_by_log` return `removes_by_log(paths)` alone (the routing
-/// before): the `"revoke sends an unproved founder to the admin"` assert fails.
+/// before): the `"revoke sends an unproved founder to the admin"` assert fails. Restore the old
+/// carry (keep a seatless recipient every newest head wraps) and the `"seatless m7 drops"`
+/// assert fails.
 #[test]
 fn revoke_sends_a_mac_the_log_does_not_seat_to_the_admins_revoke() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -837,6 +852,7 @@ fn revoke_sends_a_mac_the_log_does_not_seat_to_the_admins_revoke() {
     );
     let m7_rec = machine_identity(&m7).expect("m7").recipient();
     let m9_rec = machine_identity(&m9).expect("m9").recipient();
+    let m22_rec = machine_identity(&m22).expect("m22").recipient();
     {
         let admin = admin_open(&m22).expect("admin");
         let mut doc = admin.doc.clone();
@@ -888,11 +904,15 @@ fn revoke_sends_a_mac_the_log_does_not_seat_to_the_admins_revoke() {
     for audience in [EpochAudience::Everyone, EpochAudience::Commons] {
         assert!(
             !log.wraps_maximal_audience_to(&audience, &m9_rec),
-            "{audience:?}"
+            "{audience:?}: the revoked m9 is out"
         );
         assert!(
-            log.wraps_maximal_audience_to(&audience, &m7_rec),
-            "{audience:?}"
+            log.wraps_maximal_audience_to(&audience, &m22_rec),
+            "{audience:?}: the seat m22 holds the re-keyed epoch"
+        );
+        assert!(
+            !log.wraps_maximal_audience_to(&audience, &m7_rec),
+            "{audience:?}: seatless m7 drops"
         );
     }
 }
@@ -974,6 +994,7 @@ fn a_mac_allowed_again_after_the_stewards_deny_rows_is_back_in_the_roster() {
             allowed: &allowed40,
             reader: crate::members::bundle::Reader::LegacyLog,
             restore: true,
+            node_proven: false,
             held: None,
         },
     )
@@ -986,9 +1007,12 @@ fn a_mac_allowed_again_after_the_stewards_deny_rows_is_back_in_the_roster() {
     );
     sync(m22, None).expect("m22 syncs");
     for paths in [m22, m7] {
-        let roster = crate::client::swarm_roster(paths)
-            .expect("roster")
-            .expect("a roster");
+        let roster = crate::client::swarm_roster_until(
+            paths,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .expect("roster")
+        .expect("a roster");
         assert!(
             !roster.is_label_denied(&label),
             "m40 is denied nothing: {:?}",
@@ -1032,6 +1056,7 @@ fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_deni
             allowed: &allowed40,
             reader: crate::members::bundle::Reader::LegacyLog,
             restore: false,
+            node_proven: false,
             held: None,
         },
     )
@@ -1122,6 +1147,7 @@ fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_deni
             allowed: &allowed40_v2,
             reader: crate::members::bundle::Reader::LegacyLog,
             restore: true,
+            node_proven: false,
             held: None,
         },
     )
@@ -1173,9 +1199,12 @@ fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_deni
 
     sync(m22, None).expect("m22 syncs");
     for paths in [m22, m7] {
-        let roster = crate::client::swarm_roster(paths)
-            .expect("roster")
-            .expect("a roster");
+        let roster = crate::client::swarm_roster_until(
+            paths,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .expect("roster")
+        .expect("a roster");
         assert!(!roster.is_label_denied(&label), "{:?}", roster.deny_labels);
         assert!(!roster.is_node_denied(&node_hex), "{:?}", roster.deny_nodes);
         assert!(roster.members.iter().any(|m| m.label == label));
@@ -1549,6 +1578,7 @@ fn a_removed_mac_asking_again_with_fresh_secrets_key_and_same_node_key_is_restor
             allowed: &allowed40,
             reader: crate::members::bundle::Reader::LegacyLog,
             restore: false,
+            node_proven: false,
             held: None,
         },
     )
@@ -1627,6 +1657,7 @@ fn a_removed_mac_asking_again_with_fresh_secrets_key_and_same_node_key_is_restor
             allowed: &allowed_fresh,
             reader: crate::members::bundle::Reader::LegacyLog,
             restore: true,
+            node_proven: false,
             held: None,
         },
     )
@@ -2909,9 +2940,28 @@ impl<'a> KeyedEpochsHarness<'a> {
             edited: false,
         };
         for action in path {
-            let _ = keyed_epochs_transition(&mut h, action);
+            h.apply(action);
         }
         h
+    }
+
+    /// A copy at `run_dir` of the Macs as `self` leaves them: a run that goes on from where this
+    /// one stands, without this one seeing it.
+    fn fork(&self, run_dir: &Path) -> Self {
+        for (home, paths) in KeyedEpochsFixture::HOMES.into_iter().zip(self.all()) {
+            copy_private_tree(&paths.home, &run_dir.join(home));
+        }
+        Self {
+            fixture: self.fixture,
+            m22: Paths::for_home(&run_dir.join("m22")),
+            m7: Paths::for_home(&run_dir.join("m7")),
+            m40: Paths::for_home(&run_dir.join("m40")),
+            m41: Paths::for_home(&run_dir.join("m41")),
+            m43: Paths::for_home(&run_dir.join("m43")),
+            healed: self.healed,
+            partial: self.partial,
+            edited: self.edited,
+        }
     }
 
     fn all(&self) -> [&Paths; 5] {
@@ -3016,7 +3066,7 @@ impl<'a> KeyedEpochsHarness<'a> {
                 .open_audience_entries(&id43)
                 .unwrap()
                 .unwrap();
-            Log::admission_epochs(&opened22, &[EpochAudience::Everyone])
+            Log::admission_epochs(&opened22, &[crate::membership_log::SeatAudience::Everyone])
                 .iter()
                 .any(|(_, epoch)| !opened43.unwrapped_keys.contains_key(epoch))
         };
@@ -3054,14 +3104,16 @@ fn keyed_epochs_transition(
 /// Negative control in the test: after PartialMint, the state a coverage rule without its head
 /// clause gives (X stops hiding, `hx = 0`) is no successor and breaks `ReadersAgree`.
 ///
-/// NEGATIVE CONTROLS (each restored with cp from a backup plus touch, and confirmed with cmp):
-/// - no reseal (`reseal_ready` answers `false`, as before rule 5): fails `Reseal after ["Heal",
-///   "CloseGap"] gave {"covered": 0, "edited": 0, "gap": 0, "healed": 1, "hx": 1, "partial": 0,
-///   "sx": 1, "t": 0, "win": 2}`.
-/// - rule 4's full reseal reduced to any counting epoch (`full` returns `true`): the partial mint
-///   covers E, and the test fails `Reseal after ["Heal", "PartialMint", "CloseGap"] gave
-///   {"covered": 1, "edited": 0, "gap": 0, "healed": 1, "hx": 0, "partial": 1, "sx": 1, "t": 0,
-///   "win": 2}`.
+/// Each state's run goes on from a copy of the run that found it, so a path runs once however many
+/// actions leave its states. THE GAP: an action that goes wrong only on some rerun of a path, with
+/// its fresh random bytes or a later clock, had a sample per edge and has one.
+///
+/// NEGATIVE CONTROLS (run by hand, each alone):
+/// - no reseal (`reseal_ready` answers `false`, as before rule 5): fails `state mismatch after
+///   ["Heal", "Reseal"]`, the run leaving `"covered": 0, "gap": 1, "hx": 1, "sx": 1` where the model
+///   has `"covered": 1, "gap": 0, "hx": 0, "sx": 2`.
+/// - rule 4's full reseal reduced to any counting epoch (`full` returns `true`): the replaced
+///   reading's oracle fails first, `the keyed epochs disagree with the replaced reading`.
 #[test]
 fn keyed_epochs_model_conforms_and_catches_mutants() {
     let model = aterm_models_swarm::keyed_epochs_model();
@@ -3102,24 +3154,33 @@ fn keyed_epochs_model_conforms_and_catches_mutants() {
     let fixture = KeyedEpochsFixture::build();
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let start = model.init_state();
-    let observed = KeyedEpochsHarness::replay(&fixture, &root.path().join("s0"), &[]).observe();
-    assert_eq!(observed, start, "state mismatch after []");
+    let first = KeyedEpochsHarness::replay(&fixture, &root.path().join("s0"), &[]);
+    assert_eq!(first.observe(), start, "state mismatch after []");
     let mut judged = BTreeSet::from([&start]);
     let mut run_id = 0usize;
-    for (state, path) in &paths {
+    // Shortest path first, so a state's own run stands kept before any action leaves it: its path
+    // is its finder's and one action, and each action runs on a copy of it.
+    let mut by_length: Vec<_> = paths.iter().collect();
+    by_length.sort_by_key(|(_, path)| path.len());
+    let mut kept: std::collections::BTreeMap<&[&str], KeyedEpochsHarness<'_>> =
+        std::collections::BTreeMap::from([(&[][..], first)]);
+    for (state, path) in by_length {
+        let parent = kept
+            .remove(path.as_slice())
+            .expect("the state's finder kept its run");
         for action in &model.actions {
             if !model.action_enabled(action.name, state) {
                 continue;
             }
             run_id += 1;
-            let mut h =
-                KeyedEpochsHarness::replay(&fixture, &root.path().join(format!("t{run_id}")), path);
+            let mut h = parent.fork(&root.path().join(format!("t{run_id}")));
             let next_obs = keyed_epochs_transition(&mut h, action.name);
             let next_path = [path.as_slice(), &[action.name]].concat();
-            match found_by.get(next_path.as_slice()) {
-                Some(&next) => {
+            match found_by.get_key_value(next_path.as_slice()) {
+                Some((&found, &next)) => {
                     assert_eq!(&next_obs, next, "state mismatch after {next_path:?}");
                     judged.insert(next);
+                    kept.insert(found, h);
                 }
                 None => assert!(
                     model.successors(action.name, state).contains(&next_obs),
@@ -3161,4 +3222,1101 @@ fn keyed_epochs_model_conforms_and_catches_mutants() {
     );
 
     fixture.split.macs.server.stop();
+}
+
+// One-mesh §8 and M4 (A3): the 8,500 stop holds only an automatic batch no writer waits on, a
+// removal reserves the room of the re-keys it makes due, and a writer that holds a `Remove`
+// keeps its `[everyone]` writes unsigned until the new key arrives.
+
+/// Record budgets whose keyed one is `keyed`, the weighed one as in production.
+fn keyed_budget(keyed: usize) -> crate::membership_log::RecordBudgets {
+    crate::membership_log::RecordBudgets {
+        weighed: crate::membership_log::MAX_WEIGHED_RECORDS,
+        keyed,
+        held: crate::membership_log::MAX_WEIGHED_RECORDS + keyed,
+    }
+}
+
+/// The record budgets in which `keyed` held records fill the log as `of` would fill
+/// [`crate::membership_log::MAX_KEYED_RECORDS`]: one of one-mesh §8's fills, scaled to a lab's
+/// log.
+fn scaled_budget(keyed: usize, of: usize) -> crate::membership_log::RecordBudgets {
+    keyed_budget(keyed * crate::membership_log::MAX_KEYED_RECORDS / of)
+}
+
+/// Each Mac of `all` runs its vault pass ([`vault_pass_at`]) at each of `steps`
+/// [`log_entries::GAP_STEP_MS`] steps from `t0`, what one signs carried to every other Mac of
+/// `all` at once. Returns what the passes signed.
+fn passes(all: &[Paths], t0: u64, steps: u64) -> Vec<Record> {
+    let mut signed = Vec::new();
+    for k in 0..steps {
+        for i in 0..all.len() {
+            let mine = vault_pass_at(&all[i], t0 + k * log_entries::GAP_STEP_MS).unwrap();
+            if !mine.is_empty() {
+                convergence::carry(all, i);
+                signed.extend(mine);
+            }
+        }
+    }
+    signed
+}
+
+/// The stop's lab, before any pass: of six Macs, m7 lets m44 in, which every Mac but m22 hears
+/// of; then m22 re-keys `[everyone]` to the six seats it knows ([`convergence::rekey`]), and m7,
+/// concurrently, to all seven and S, a key no seat binds ([`convergence::rekey_to`]); every Mac,
+/// m44 too, takes both batches. The log holds no `Remove`: the two heads differ (S), so
+/// `[everyone]` is due a coalesce no writer waits on, and the heal owes m44 one `Wrap` of m22's
+/// head (m44's `Admit` is not in its past), after which S still sets the heads apart. Returns
+/// the lab, its seven Macs (m44 last), m44's recipient, the log's keyed records and the tender's
+/// bound on what the coalesce signs ([`log_entries::rekey_keyed_bound`]), the same before the
+/// heal and after.
+fn stop_lab() -> (convergence::Six, Vec<Paths>, Recipient, usize, usize) {
+    let lab = convergence::six();
+    let (m44, _, rec44) = let_in_by(&lab.macs, &lab.macs.m7, "m44", "m44");
+    let wire = load_records(&lab.all[1]).unwrap().encode();
+    for paths in &lab.all[2..] {
+        save_records(paths, &wire).unwrap();
+    }
+    convergence::rekey(&lab.all[0], &EpochAudience::Everyone, |_| true);
+    let mut to: BTreeSet<Recipient> = active(&lab.all[1]);
+    assert!(to.contains(&rec44), "CONTROL: m7 re-keys to m44");
+    to.insert(Identity::generate().unwrap().recipient());
+    convergence::rekey_to(&lab.all[1], &EpochAudience::Everyone, &to);
+    let mut all = lab.all.clone();
+    all.push(m44);
+    convergence::carry(&all, 0);
+    convergence::carry(&all, 1);
+    let log = log_of(&lab.all[0]);
+    assert!(
+        log.removed_recipients().is_empty(),
+        "CONTROL: the log holds no Remove"
+    );
+    assert!(
+        log.rekey_dues().iter().any(|due| {
+            due.audience == EpochAudience::Everyone && due.coverage && !due.rotation
+        }),
+        "CONTROL: [everyone] is due a coalesce no removal made: {:?}",
+        log.rekey_dues()
+    );
+    let identity = read_identity(&lab.all[0]).unwrap().unwrap();
+    let opened = log.open_audience_entries(&identity).unwrap().unwrap();
+    let (_, me, _) = member_key(&lab.all[0]);
+    let flight = log_entries::Flight::of_batch(&log, &opened, &me);
+    let bound = log_entries::rekey_keyed_bound(
+        &log,
+        &opened,
+        &flight,
+        &EpochAudience::Everyone,
+        &log.current_recipients(&EpochAudience::Everyone),
+        &log.removed_recipients(),
+        None,
+    );
+    let keyed = log.counts().keyed;
+    (lab, all, rec44, keyed, bound)
+}
+
+/// One-mesh §8, "The 8,500 stop": the ranked tender's coalesce of two `[everyone]` heads no
+/// `Remove` set apart ([`stop_lab`]) is an automatic batch no writer waits on. In the largest
+/// keyed budget whose scaled stop ([`crate::membership_log::RecordBudgets::automatic_keyed_stop`])
+/// the log's keyed records and the coalesce's planned ones pass, the seven Macs' passes over 12
+/// steps sign the heal's one `Wrap` (of m22's head, to m44, at the same fill) and no epoch, and
+/// `[everyone]` stays due. In the smallest budget whose stop takes them, after the heal's `Wrap`
+/// too, the same passes sign one coalesce, within the planned bound, which wraps m44, and nothing
+/// is due after. There the heal's `Wrap` is signed where the gap closer's turn comes before the
+/// tender's, and is not needed where the coalesce came first: which comes first follows the
+/// ranks the lab's random keys draw, so the test counts a heal's `Wrap` (of an epoch the passes
+/// did not mint) as at most one.
+///
+/// NEGATIVE CONTROLS:
+/// - the contrast, run in the test: the smallest budget that fits the coalesce lies one to a few
+///   keyed records above the one that holds it, and there the coalesce is signed, while past the
+///   stop the heal is signed alone, so the stop holds the re-key and not the heal;
+/// - `within_automatic_stop` returning `ready` at once (no stop; restored with cp from a backup
+///   plus touch, confirmed with cmp): the test fails "the coalesce waits past the stop: 36 keyed +
+///   10 planned > 45", left `{Everyone: 1}`, right `{}`.
+#[test]
+fn past_the_automatic_stop_a_coalesce_no_removal_made_waits_and_a_heal_does_not() {
+    let stop_of = |keyed: usize| keyed_budget(keyed).automatic_keyed_stop();
+    // A heal's `Wrap`: to m44, of an epoch the passes did not mint (a coalesce wraps m44 its own).
+    let heal_of = |signed: &[Record], rec44: &Recipient| {
+        let minted: BTreeSet<RecordId> = signed
+            .iter()
+            .filter(|record| record.kind() == Kind::Epoch)
+            .map(|record| *record.id())
+            .collect();
+        signed
+            .iter()
+            .filter(|record| {
+                matches!(record.body(), Body::Wrap { epoch, recipient, .. }
+                    if recipient == rec44 && !minted.contains(epoch))
+            })
+            .count()
+    };
+
+    let (lab, all, rec44, keyed, bound) = stop_lab();
+    let past = (keyed..)
+        .take_while(|&k| stop_of(k) < keyed + bound)
+        .last()
+        .expect("a budget whose stop the coalesce passes");
+    assert!(
+        past > keyed + 1,
+        "CONTROL: the log takes the heal under the hard bound"
+    );
+    let t0 = aterm_time::unix_millis().unwrap_or(0);
+    let signed = keyed_budget(past).within(|| passes(&all, t0, 12));
+    assert_eq!(
+        convergence::epochs_by_audience(&signed),
+        BTreeMap::new(),
+        "the coalesce waits past the stop: {} keyed + {bound} planned > {}",
+        keyed,
+        stop_of(past)
+    );
+    assert_eq!(
+        (signed.len(), heal_of(&signed, &rec44)),
+        (1, 1),
+        "the heal's Wrap is signed at the same fill"
+    );
+    let held = log_of(&lab.all[0]);
+    assert!(
+        held.rekey_dues()
+            .iter()
+            .any(|due| due.audience == EpochAudience::Everyone && due.coverage),
+        "the coalesce stays due"
+    );
+    lab.macs.server.stop();
+
+    let (lab, all, rec44, keyed, bound) = stop_lab();
+    let below = (keyed..)
+        .find(|&k| stop_of(k) >= keyed + 1 + bound)
+        .expect("a budget whose stop takes the coalesce");
+    assert!(
+        below > past && below - past <= 3,
+        "CONTROL: the contrast lies just above the stop ({past} then {below})"
+    );
+    let signed = keyed_budget(below).within(|| passes(&all, t0, 12));
+    assert_eq!(
+        convergence::epochs_by_audience(&signed),
+        BTreeMap::from([(EpochAudience::Everyone, 1)]),
+        "CONTROL: below the stop the coalesce is signed"
+    );
+    let heal = heal_of(&signed, &rec44);
+    assert!(heal <= 1, "at most the one heal: {heal}");
+    assert!(
+        signed.len() - heal <= bound,
+        "the bound is never below what the coalesce signs: {} > {bound}",
+        signed.len() - heal
+    );
+    let after = log_of(&lab.all[0]);
+    assert!(after.rekey_dues().is_empty());
+    assert!(
+        after.wraps_maximal_audience_to(&EpochAudience::Everyone, &rec44),
+        "the coalesce wraps m44"
+    );
+    lab.macs.server.stop();
+}
+
+/// The numbers of a refusal's text, in order.
+fn numbers_of(text: &str) -> Vec<usize> {
+    text.split(|c: char| !c.is_ascii_digit())
+        .filter(|word| !word.is_empty())
+        .map(|word| word.parse().unwrap())
+        .collect()
+}
+
+/// One-mesh §8: `aterm members remove` (`fleet remove`) refuses up front where the log's keyed
+/// records, its own batch and the worst case of the re-keys it makes due (here a coalesce of
+/// `[everyone]` and of Commons, the audiences m40 is in, which m7 rotates itself) would pass the
+/// keyed budget: in a budget the log's records fill exactly, and in one a record short of the
+/// three, it signs nothing and prints the fill (records held, the batch, the worst case, the
+/// limit), and the error names no value. In the budget that takes all three it removes m40, and
+/// signs no more keyed records than its batch's bound.
+///
+/// NEGATIVE CONTROLS:
+/// - the contrast, run in the test: one keyed record more of budget than the second refusal had
+///   and the removal is signed, so the refusal is the fill's; the budget the own batch alone fits
+///   (`keyed + batch`) still refuses, so the worst case is reserved;
+/// - `draft_removal` with no fill check (`if false && fill.passes()`; restored with cp from a
+///   backup plus touch, confirmed with cmp): the first removal signs into the log's hard bound and
+///   fails with the log's own "membership log holds its limit of keyed records (Epoch, Wrap, Put,
+///   Delete, Node, Name)", no fill and no "the membership log is full", so the test's first
+///   refusal assert fails.
+#[test]
+fn a_removal_whose_worst_case_passes_the_keyed_budget_refuses_and_prints_the_fill() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"never-printed".as_slice())]);
+    let m7 = &macs.m7;
+    let (_m40, actor40, rec40) = let_in(&macs, "m40", "m40");
+    let before = log_of(m7);
+    let keyed = before.counts().keyed;
+    let held: BTreeSet<RecordId> = before.records().map(|r| *r.id()).collect();
+
+    let refused = |limit: usize| {
+        let error = keyed_budget(limit)
+            .within(|| remove_member(m7, &join_code(&rec40), false))
+            .expect_err("the removal refuses");
+        let text = error.to_string();
+        assert!(text.contains("the membership log is full"), "{text}");
+        assert!(!text.contains("never-printed"), "no value: {text}");
+        let after: BTreeSet<RecordId> = log_of(m7).records().map(|r| *r.id()).collect();
+        assert_eq!(after, held, "nothing is signed");
+        numbers_of(&text)
+    };
+    let fill = refused(keyed);
+    let [held_keyed, batch, worst, limit] = fill.as_slice() else {
+        panic!("the fill's four numbers: {fill:?}");
+    };
+    let (batch, worst) = (*batch, *worst);
+    assert_eq!((*held_keyed, *limit), (keyed, keyed));
+    assert!(batch > 0 && worst > 0, "{fill:?}");
+    assert_eq!(
+        refused(keyed + batch + worst - 1),
+        vec![keyed, batch, worst, keyed + batch + worst - 1]
+    );
+    assert_eq!(
+        refused(keyed + batch),
+        vec![keyed, batch, worst, keyed + batch],
+        "CONTROL: the own batch fits, the worst case does not"
+    );
+
+    keyed_budget(keyed + batch + worst)
+        .within(|| remove_member(m7, &join_code(&rec40), false))
+        .expect("CONTROL: with room for the worst case m7 removes m40");
+    let after = log_of(m7);
+    assert!(after.membership().removal(&actor40).is_some());
+    assert!(
+        after.counts().keyed - keyed <= batch,
+        "the batch's bound is never below what it signs: {} > {batch}",
+        after.counts().keyed - keyed
+    );
+    macs.server.stop();
+}
+
+/// What [`writer_over_removal`] saw: the lab, the records the publish signed, what each of the
+/// three passes signed, m7's batch, and whether m22's waiting file was there after the publish
+/// and is after the passes.
+struct WriterOverRemoval {
+    lab: convergence::Six,
+    published: Vec<Record>,
+    pass: [Vec<Record>; 3],
+    chain: Vec<Record>,
+    waited: bool,
+    waits_after: bool,
+}
+
+/// The shape of a writer that holds a `Remove` whose rotation it lacks: of six Macs (m22 and m7
+/// admins), m7 removes m42 and m22 holds only its `Remove`, a prefix of m7's batch, when it
+/// publishes `shared` = v2, `dont_wait` setting `log_entries::WRITERS_DONT_WAIT` for the publish.
+/// Then m22's pass runs at `t0` (the rotation is still due: m22 waits the remover's grace); it
+/// takes m7's whole batch, its pass runs a step later and once more a step after that, and every
+/// other Mac takes its records.
+fn writer_over_removal(dont_wait: bool) -> WriterOverRemoval {
+    let lab = convergence::six_with(true);
+    let (m22, m7) = (&lab.all[0], &lab.all[1]);
+    let base = convergence::ids(m7);
+    test_remove_unposted(m7, &join_code(&lab.recipients[4])).expect("m7 removes m42");
+    let chain = convergence::signed_since(m7, &base);
+    save_records(m22, &encode_records(&chain[..1])).unwrap();
+    assert!(
+        log_of(m22)
+            .rekey_dues()
+            .iter()
+            .any(|due| due.audience == EpochAudience::Everyone && due.rotation),
+        "CONTROL: m22 holds the Remove, not its rotation"
+    );
+
+    let before = convergence::ids(m22);
+    log_entries::WRITERS_DONT_WAIT.with(|cell| cell.set(dont_wait));
+    let admin = admin_open(m22).expect("m22 is an admin");
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, "shared", b"v2")
+        .expect("edit");
+    let published = admin_publish(m22, &admin, &doc);
+    log_entries::WRITERS_DONT_WAIT.with(|cell| cell.set(false));
+    published.expect("the person's publish does not fail");
+    let published = convergence::signed_since(m22, &before);
+    let waited = log_entries::waiting_file(m22).exists();
+
+    let t0 = aterm_time::unix_millis().unwrap_or(0);
+    let first = vault_pass_at(m22, t0).unwrap();
+    save_records(m22, &encode_records(&chain)).unwrap();
+    let second = vault_pass_at(m22, t0 + log_entries::GAP_STEP_MS).unwrap();
+    let third = vault_pass_at(m22, t0 + 2 * log_entries::GAP_STEP_MS).unwrap();
+    convergence::carry(&lab.all, 0);
+    let waits_after = log_entries::waiting_file(m22).exists();
+    WriterOverRemoval {
+        lab,
+        published,
+        pass: [first, second, third],
+        chain,
+        waited,
+        waits_after,
+    }
+}
+
+/// One-mesh M4, "Writers wait for the new key" ([`writer_over_removal`]): m22, which holds m7's
+/// `Remove` of m42 and not its rotation, publishes `shared` = v2. The publish succeeds and signs
+/// nothing: the newest `[everyone]` epoch m22 holds still wraps m42, and the write waits in
+/// m22's `everyone.waiting`. Its pass while the rotation is due signs nothing either. Once m7's
+/// batch arrives, m22's next pass signs the one `Put`, under m7's new epoch, which no `Wrap`
+/// hands m42; the pass after signs nothing, nothing waits, and the other Macs read v2.
+///
+/// NEGATIVE CONTROLS:
+/// - `log_entries::WRITERS_DONT_WAIT` (the writer writes at once, as before), run in the test as
+///   a CONTROL, and once with it set for the first run too: m22's publish signs a fresh
+///   `[everyone]` epoch with its `Put` and a fresh Commons epoch with the descriptor while the
+///   newest epochs it holds still wrap m42, and the test fails "the publish signs nothing while
+///   the newest epoch wraps m42: [Epoch, Wrap, Wrap, Wrap, Wrap, Wrap, Put, Epoch, Wrap, Wrap,
+///   Wrap, Wrap, Wrap, Put]";
+/// - the writer's Commons block minting for the departure alone again (`true || !commons_waits`;
+///   restored with cp from a backup plus touch, confirmed with cmp): the test fails "the publish
+///   signs nothing while the newest epoch wraps m42: [Epoch, Wrap, Wrap, Wrap, Wrap, Wrap, Put]",
+///   a Commons epoch beside the rotation due.
+#[test]
+fn a_writer_that_holds_a_remove_keeps_its_everyone_put_unsigned_until_the_new_key() {
+    let run = writer_over_removal(false);
+    let r = &run.lab.recipients;
+    assert!(
+        run.published.is_empty(),
+        "the publish signs nothing while the newest epoch wraps m42: {:?}",
+        run.published.iter().map(Record::kind).collect::<Vec<_>>()
+    );
+    assert!(run.waited, "the write waits in everyone.waiting");
+    assert!(
+        run.pass[0].is_empty(),
+        "nothing is signed while the rotation is due"
+    );
+    let puts: Vec<RecordId> = run.pass[1]
+        .iter()
+        .filter_map(|record| match record.body() {
+            Body::Put { epoch, .. } => Some(*epoch),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        (run.pass[1].len(), puts.len()),
+        (1, 1),
+        "the pass after the rotation signs the one Put"
+    );
+    let rotation = run
+        .chain
+        .iter()
+        .find(|record| {
+            matches!(
+                record.body(),
+                Body::Epoch {
+                    audience: EpochAudience::Everyone,
+                    ..
+                }
+            )
+        })
+        .map(|record| *record.id())
+        .expect("m7's batch rotates [everyone]");
+    assert_eq!(puts[0], rotation, "the Put goes under m7's new epoch");
+    // The key boundary: the epoch's key is m7's, its minter's, and each `Wrap` of it is sealed to
+    // the recipient it names. (A reader's view says nothing here: the log reads nothing for a
+    // recipient it removed, whatever the keys.)
+    let log = log_of(&run.lab.all[0]);
+    assert_eq!(
+        log.get(&rotation).map(|record| *record.actor()),
+        Some(run.lab.actors[1]),
+        "m7 minted it"
+    );
+    assert!(
+        !epochs_wrapped_to(&log, &r[4]).contains(&rotation),
+        "no Wrap hands m42 the epoch the write is sealed under"
+    );
+    assert!(run.pass[2].is_empty(), "signed exactly once");
+    assert!(!run.waits_after, "nothing waits after");
+    for i in [1, 2, 3] {
+        assert_eq!(
+            convergence::shared(&run.lab.all[i]).as_deref(),
+            Some(b"v2".as_slice()),
+            "every member reads the edit"
+        );
+    }
+    run.lab.macs.server.stop();
+
+    let control = writer_over_removal(true);
+    let kinds: Vec<Kind> = control.published.iter().map(Record::kind).collect();
+    assert!(
+        kinds.contains(&Kind::Put) && kinds.contains(&Kind::Epoch),
+        "CONTROL: the writer that does not wait signs at once: {kinds:?}"
+    );
+    assert!(!control.waited, "CONTROL: nothing waits");
+    control.lab.macs.server.stop();
+}
+
+/// The epoch the op that wins `name` in `[everyone]` is sealed under, as `paths` opens its log.
+fn winning_epoch(paths: &Paths, name: &str) -> Option<RecordId> {
+    let identity = read_identity(paths).unwrap().unwrap();
+    let log = log_of(paths);
+    let opened = log.open_audience_entries(&identity).unwrap()?;
+    let winner = opened
+        .winning_ops
+        .get(&(Audience::Everyone, name.to_owned()))?;
+    match log.get(winner)?.body() {
+        Body::Put { epoch, .. } | Body::Delete { epoch, .. } => Some(*epoch),
+        _ => None,
+    }
+}
+
+/// One-mesh M4 beside F15: a writer that holds m7's `Remove` of m42 and not its rotation, and
+/// deletes `shared` from `[everyone]`, which also holds `kept`, writes at once rather than wait:
+/// a fresh `[everyone]` epoch no `Wrap` hands m42, the `Delete` and `kept` resealed under it, and
+/// nothing waits or is pending. m44, which m22 lets in next, is handed the fresh epoch and no
+/// `Wrap` of the epoch `shared` = v1 is sealed under, so it cannot open the deleted value; it
+/// reads `kept` from the reseal (a carry, which the register names by the op it carries).
+///
+/// NEGATIVE CONTROL: an edit that leaves `[everyone]` waiting as any other while the rotation is
+/// due (`let waits = rotation_waits;` in `draft_document_diff_with`; restored with cp from a
+/// backup plus touch, confirmed with cmp): the publish signs nothing, the admission hands m44
+/// the old epoch, and the test fails "m44 is handed no Wrap of the epoch shared = v1 is sealed
+/// under".
+#[test]
+fn a_delete_from_everyone_while_a_rotation_is_due_writes_at_once_and_reseals_what_stays() {
+    let lab = convergence::six_with(true);
+    let (m22, m7) = (&lab.all[0], &lab.all[1]);
+    let r = &lab.recipients;
+    let admin = admin_open(m22).expect("m22 is an admin");
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, "kept", b"k1")
+        .expect("edit");
+    admin_publish(m22, &admin, &doc).expect("m22 writes kept");
+    convergence::carry(&lab.all, 0);
+    let old = winning_epoch(m22, "shared").expect("shared = v1 is sealed under an epoch");
+    assert_eq!(
+        winning_epoch(m22, "kept"),
+        Some(old),
+        "CONTROL: kept is sealed under the epoch shared = v1 is"
+    );
+
+    let base = convergence::ids(m7);
+    test_remove_unposted(m7, &join_code(&r[4])).expect("m7 removes m42");
+    let chain = convergence::signed_since(m7, &base);
+    save_records(m22, &encode_records(&chain[..1])).unwrap();
+    assert!(
+        log_of(m22)
+            .rekey_dues()
+            .iter()
+            .any(|due| due.audience == EpochAudience::Everyone && due.rotation),
+        "CONTROL: m22 holds the Remove, not its rotation"
+    );
+
+    let before = convergence::ids(m22);
+    let admin = admin_open(m22).expect("m22 is an admin");
+    let mut doc = admin.doc.clone();
+    assert!(
+        doc.unset_entry(&Audience::Everyone, "shared")
+            .expect("unset"),
+        "CONTROL: shared is in [everyone]"
+    );
+    admin_publish(m22, &admin, &doc).expect("the person's publish does not fail");
+    let published = convergence::signed_since(m22, &before);
+    let waits = log_entries::waiting_file(m22).exists() || log_entries::waiting_pending(m22);
+    let (m44, _, r44) = let_in_by(&lab.macs, m22, "m44", "m44");
+    let handed = epochs_wrapped_to(&log_of(m22), &r44);
+    assert!(
+        !handed.contains(&old),
+        "m44 is handed no Wrap of the epoch shared = v1 is sealed under"
+    );
+
+    let fresh = published
+        .iter()
+        .find(|record| {
+            matches!(
+                record.body(),
+                Body::Epoch {
+                    audience: EpochAudience::Everyone,
+                    ..
+                }
+            )
+        })
+        .map(|record| *record.id())
+        .unwrap_or_else(|| {
+            panic!(
+                "the delete is written at once, under a fresh [everyone] epoch: {:?}",
+                published.iter().map(Record::kind).collect::<Vec<_>>()
+            )
+        });
+    assert!(handed.contains(&fresh), "m44 is handed the fresh epoch");
+    assert!(
+        !epochs_wrapped_to(&log_of(m22), &r[4]).contains(&fresh),
+        "no Wrap hands m42 the fresh epoch"
+    );
+    assert!(
+        published.iter().any(|record| matches!(
+            record.body(),
+            Body::Delete { epoch, .. } if *epoch == fresh
+        )),
+        "the Delete goes under the fresh epoch"
+    );
+    assert!(
+        published.iter().any(|record| matches!(
+            record.body(),
+            Body::Put { epoch, .. } if *epoch == fresh
+        )),
+        "kept is resealed under it"
+    );
+    assert_eq!(convergence::shared(m22), None, "shared is deleted");
+    let identity44 = read_identity(&m44).unwrap().unwrap();
+    let read44 = log_of(&m44)
+        .open_audience_entries(&identity44)
+        .unwrap()
+        .expect("m44 reads the log");
+    let everyone44 = &read44.by_audience[&Audience::Everyone];
+    assert_eq!(
+        everyone44.get("kept").map(|entry| entry.value.as_slice()),
+        Some(b"k1".as_slice()),
+        "m44 reads kept from its reseal"
+    );
+    assert!(!everyone44.contains_key("shared"), "and not shared");
+    assert!(!waits, "nothing waits or is pending");
+    lab.macs.server.stop();
+}
+
+/// How [`cut_publish`] ends m22's publish early.
+#[derive(Clone, Copy)]
+enum Cut {
+    /// Before any server took the version (`CUT_BEFORE_STORE`).
+    BeforeStore,
+    /// Once the servers stored it, before the publish kept anything (`CUT_AFTER_STORE`).
+    AfterStore,
+    /// As [`Cut::AfterStore`], and m22 then publishes `shared` = v3 from the text it had opened
+    /// before, which the server refuses as not newer.
+    AfterStoreThenStale,
+}
+
+/// What [`cut_publish`] saw: whether m22's write was pending and whether it waited after the
+/// publish, whether it waited after m22's sync, and what m22's passes signed once m7's batch
+/// arrived.
+struct CutPublish {
+    lab: convergence::Six,
+    pending: bool,
+    waiting: bool,
+    landed: bool,
+    signed: Vec<Record>,
+}
+
+/// [`writer_over_removal`]'s shape with the publish cut short by `cut`: m22, which holds m7's
+/// `Remove` of m42 and not its rotation, publishes `shared` = v2 and the publish ends with an
+/// error. m22 then syncs, takes m7's whole batch, and its pass runs twice, a step apart.
+fn cut_publish(cut: Cut) -> CutPublish {
+    let lab = convergence::six_with(true);
+    let (m22, m7) = (&lab.all[0], &lab.all[1]);
+    let base = convergence::ids(m7);
+    test_remove_unposted(m7, &join_code(&lab.recipients[4])).expect("m7 removes m42");
+    let chain = convergence::signed_since(m7, &base);
+    save_records(m22, &encode_records(&chain[..1])).unwrap();
+
+    let admin = admin_open(m22).expect("m22 is an admin");
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, "shared", b"v2")
+        .expect("edit");
+    match cut {
+        Cut::BeforeStore => CUT_BEFORE_STORE.with(|cell| cell.set(true)),
+        Cut::AfterStore | Cut::AfterStoreThenStale => {
+            CUT_AFTER_STORE.with(|cell| cell.set(true));
+        }
+    }
+    let published = admin_publish(m22, &admin, &doc);
+    assert!(published.is_err(), "CONTROL: the publish ends early");
+    let pending = log_entries::waiting_pending(m22);
+    let waiting = log_entries::waiting_file(m22).exists();
+    if let Cut::AfterStoreThenStale = cut {
+        let mut later = admin.doc.clone();
+        later
+            .set_entry(&Audience::Everyone, "shared", b"v3")
+            .expect("edit");
+        let refused = admin_publish(m22, &admin, &later).expect_err("CONTROL: a stale publish");
+        assert!(
+            refused.to_string().contains("not newer"),
+            "CONTROL: the server holds the cut publish's sequence: {refused}"
+        );
+    }
+    sync(m22, None).expect("m22 syncs");
+    let landed = log_entries::waiting_file(m22).exists();
+
+    save_records(m22, &encode_records(&chain)).unwrap();
+    let t0 = aterm_time::unix_millis().unwrap_or(0);
+    let mut signed = vault_pass_at(m22, t0).unwrap();
+    signed.extend(vault_pass_at(m22, t0 + log_entries::GAP_STEP_MS).unwrap());
+    CutPublish {
+        lab,
+        pending,
+        waiting,
+        landed,
+        signed,
+    }
+}
+
+/// The `[everyone]` `Put`s among `records` (a `Put`'s name is sealed; m22 writes only `shared`).
+fn everyone_puts(records: &[Record]) -> usize {
+    records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.body(),
+                Body::Put {
+                    audience: EpochAudience::Everyone,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+/// One-mesh M4 ([`cut_publish`]): a write that waits for the new key is pending on the version
+/// that carries it and waits only once a server took that version. A publish that ended before
+/// any server took it leaves the write pending: m22's sync reads its old version, and once m7's
+/// rotation arrives its passes sign no `Put` of `shared`, so the edit the person saw fail never
+/// lands. A publish that ended once the servers stored its version leaves the write pending too,
+/// m22's sync reads that version and the write waits, and the pass after the rotation signs the
+/// one `Put`.
+///
+/// NEGATIVE CONTROL: a publish's waiting writes kept straight in `everyone.waiting`, as before
+/// (`wait_for_key` landing its pending set at once, `land_waiting_held` after the write;
+/// restored with cp from a backup plus touch, confirmed with cmp): the publish no server took
+/// signs its `Put` once the rotation arrives, and the test fails "a publish no server took never
+/// signs its write".
+#[test]
+fn a_waiting_write_is_signed_only_once_a_server_took_its_version() {
+    let never = cut_publish(Cut::BeforeStore);
+    assert_eq!(
+        everyone_puts(&never.signed),
+        0,
+        "a publish no server took never signs its write"
+    );
+    assert!(
+        never.pending && !never.waiting,
+        "the write is pending, not waiting"
+    );
+    assert!(!never.landed, "nothing waits after the sync");
+    assert!(
+        log_entries::waiting_pending(&never.lab.all[0]),
+        "the write stays pending on a version no server holds"
+    );
+    never.lab.macs.server.stop();
+
+    let stored = cut_publish(Cut::AfterStore);
+    assert!(
+        stored.pending && !stored.waiting,
+        "the write is pending, not waiting"
+    );
+    assert!(stored.landed, "the sync that reads the version lands it");
+    assert!(
+        !log_entries::waiting_pending(&stored.lab.all[0]),
+        "nothing is pending after"
+    );
+    assert_eq!(
+        everyone_puts(&stored.signed),
+        1,
+        "the pass after the rotation signs the one Put"
+    );
+    stored.lab.macs.server.stop();
+}
+
+/// One-mesh M4 ([`cut_publish`]): a publish whose version the server stored ends before it hears
+/// so, and m22 publishes again, `shared` = v3, from the text it had opened before; the server
+/// holds the first version's sequence and refuses the second as not newer. The first publish's
+/// write stays pending beside the second's, which the refusal drops: m22's sync reads the stored
+/// version and lands it, and the pass after the rotation signs `shared` = v2, which the stored
+/// version's text carries.
+///
+/// NEGATIVE CONTROL: `wait_for_key` replacing the pending sets with its own, as before
+/// (`sets.clear();` before its push; restored with cp from a backup plus touch, confirmed with
+/// cmp): the refusal drops the only set, m22's sync lands nothing, and the test fails "the sync
+/// that reads the stored version lands its write".
+#[test]
+fn a_waiting_write_on_a_stored_version_outlasts_a_later_publish_refused_as_not_newer() {
+    let run = cut_publish(Cut::AfterStoreThenStale);
+    assert!(
+        run.pending && !run.waiting,
+        "the first write is pending, not waiting"
+    );
+    assert!(
+        run.landed,
+        "the sync that reads the stored version lands its write"
+    );
+    assert!(
+        !log_entries::waiting_pending(&run.lab.all[0]),
+        "nothing is pending after"
+    );
+    assert_eq!(
+        everyone_puts(&run.signed),
+        1,
+        "the pass after the rotation signs the one Put"
+    );
+    assert_eq!(
+        convergence::shared(&run.lab.all[0]).as_deref(),
+        Some(b"v2".as_slice()),
+        "m22 reads the stored version's edit"
+    );
+    run.lab.macs.server.stop();
+}
+
+/// The audience a `Epoch`, `Put` or `Delete` record names, for a failure's message.
+fn audience_of(record: &Record) -> Option<EpochAudience> {
+    match record.body() {
+        Body::Epoch { audience, .. }
+        | Body::Put { audience, .. }
+        | Body::Delete { audience, .. } => Some(audience.clone()),
+        _ => None,
+    }
+}
+
+/// What [`concurrent_removals_and_a_write`] saw: the lab, the scaled stop and limit, the keyed
+/// records before the publish, what the publish and then the passes signed, and whether a write
+/// still waits on m7 after them.
+struct ConcurrentRemovals {
+    lab: convergence::Six,
+    stop: usize,
+    limit: usize,
+    keyed: usize,
+    published: Vec<Record>,
+    signed: Vec<Record>,
+    waits_after: bool,
+}
+
+/// Two concurrent removals and a held write: of six Macs (m22 and m7 admins), m22 removes m42
+/// and m40 removes m43, each on its own side, and every Mac takes both batches: each newest
+/// `[everyone]` and Commons epoch wraps a removed Mac, so both are due a coalesce a held `Remove`
+/// made due, the removers' to sign first. The keyed budget is scaled so the log's records fill it
+/// as 8,600 fill 12,288, past the stop. At that fill m7, an admin and no remover (its own pass
+/// waits the removers' grace), publishes `shared` = v2, and then the four remaining Macs' passes
+/// run 16 steps, `stop_holds` setting `remove::STOP_HOLDS_REMOVALS` for all of it.
+fn concurrent_removals_and_a_write(stop_holds: bool) -> ConcurrentRemovals {
+    let lab = convergence::six_with(true);
+    let (m22, m7, m40) = (&lab.all[0], &lab.all[1], &lab.all[2]);
+    test_remove_unposted(m22, &join_code(&lab.recipients[4])).expect("m22 removes m42");
+    test_remove_unposted(m40, &join_code(&lab.recipients[5])).expect("m40 removes m43");
+    convergence::carry(&lab.all, 0);
+    convergence::carry(&lab.all, 2);
+    let log = log_of(m7);
+    for audience in [EpochAudience::Everyone, EpochAudience::Commons] {
+        assert!(
+            log.rekey_dues()
+                .iter()
+                .any(|due| due.audience == audience && due.rotation),
+            "CONTROL: {audience:?} is due a coalesce the removals made"
+        );
+    }
+    let keyed = log.counts().keyed;
+    let budgets = scaled_budget(keyed, 8_600);
+    let stop = budgets.automatic_keyed_stop();
+    assert!(
+        keyed > stop,
+        "CONTROL: the fill is past the stop: {keyed} > {stop}"
+    );
+
+    let before = convergence::ids(m7);
+    let t0 = aterm_time::unix_millis().unwrap_or(0);
+    remove::STOP_HOLDS_REMOVALS.with(|cell| cell.set(stop_holds));
+    let (published, signed) = budgets.within(|| {
+        let admin = admin_open(m7).expect("m7 is an admin");
+        let mut doc = admin.doc.clone();
+        doc.set_entry(&Audience::Everyone, "shared", b"v2")
+            .expect("edit");
+        admin_publish(m7, &admin, &doc).expect("the person's publish does not fail");
+        let published = convergence::signed_since(m7, &before);
+        (published, passes(&lab.all[..4], t0, 16))
+    });
+    remove::STOP_HOLDS_REMOVALS.with(|cell| cell.set(false));
+    let waits_after = log_entries::waiting_file(m7).exists();
+    ConcurrentRemovals {
+        stop,
+        limit: budgets.keyed,
+        keyed,
+        published,
+        signed,
+        waits_after,
+        lab,
+    }
+}
+
+/// One-mesh §8 and M4 together ([`concurrent_removals_and_a_write`]): at a fill of 8,600 keyed
+/// records scaled, past the stop, the coalesce of `[everyone]` and of Commons that the two
+/// concurrent removals made due is signed, one epoch of each, because writers wait on it; m7's
+/// publish signed nothing, and its `Put` is signed after the coalesce, under the new
+/// `[everyone]` epoch, which wraps neither removed Mac. The log then holds more than the stop and
+/// no more than its limit, and nothing waits.
+///
+/// NEGATIVE CONTROL: `remove::STOP_HOLDS_REMOVALS` (the stop holds the removals' coalesce too),
+/// run in the test as a CONTROL, and once with it set for the first run too: the same passes sign
+/// nothing, m7's write still waits, and the test fails "the coalesce is signed past the stop",
+/// left `{}`, right `{Everyone: 1, Commons: 1}`.
+#[test]
+fn two_concurrent_removals_past_the_stop_coalesce_and_the_held_put_is_then_signed() {
+    let run = concurrent_removals_and_a_write(false);
+    let r = &run.lab.recipients;
+    assert!(
+        run.published.is_empty(),
+        "the publish signs nothing: {:?}",
+        run.published
+            .iter()
+            .map(|record| (record.kind(), audience_of(record)))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        convergence::epochs_by_audience(&run.signed),
+        BTreeMap::from([(EpochAudience::Everyone, 1), (EpochAudience::Commons, 1)]),
+        "the coalesce is signed past the stop"
+    );
+    let m7 = &run.lab.all[1];
+    let log = log_of(m7);
+    let identity = read_identity(m7).unwrap().unwrap();
+    let opened = log.open_audience_entries(&identity).unwrap().unwrap();
+    let newest = opened.maximal_epochs[&EpochAudience::Everyone].clone();
+    assert_eq!(newest.len(), 1, "one newest [everyone] epoch");
+    let wrapped = &opened.wrapped_recipients[&newest[0]];
+    assert!(!wrapped.contains(&r[4]) && !wrapped.contains(&r[5]));
+    let (_, actor7, _) = member_key(m7);
+    let winner = opened.winning_ops[&(Audience::Everyone, "shared".to_owned())];
+    let put = log.get(&winner).expect("the winner");
+    assert_eq!(*put.actor(), actor7, "m7's write is the winner");
+    assert!(
+        matches!(put.body(), Body::Put { epoch, .. } if *epoch == newest[0]),
+        "m7's Put goes under the coalesced epoch"
+    );
+    assert!(
+        run.signed.iter().any(|record| record.id() == &winner),
+        "signed by the passes, after the publish"
+    );
+    for paths in &run.lab.all[..4] {
+        assert_eq!(
+            convergence::shared(paths).as_deref(),
+            Some(b"v2".as_slice()),
+            "every member reads the edit"
+        );
+    }
+    assert!(!run.waits_after, "nothing waits");
+    let keyed_after = log.counts().keyed;
+    assert!(
+        run.stop < run.keyed && keyed_after <= run.limit,
+        "past the stop ({} < {}), within the limit ({keyed_after} <= {})",
+        run.stop,
+        run.keyed,
+        run.limit
+    );
+    run.lab.macs.server.stop();
+
+    let control = concurrent_removals_and_a_write(true);
+    assert_eq!(
+        convergence::epochs_by_audience(&control.signed),
+        BTreeMap::new(),
+        "CONTROL: a stop that holds the removals' coalesce signs nothing"
+    );
+    assert!(control.waits_after, "CONTROL: m7's write still waits");
+    control.lab.macs.server.stop();
+}
+
+/// One-mesh §8 for `aterm secrets revoke`: its log half (`log_entries::draft_retire_in_log_with`)
+/// is a person's removal too, and reserves the room of the re-keys it makes due as `members
+/// remove` does. m22 revokes m40: in a budget a keyed record short of the log's records, the
+/// batch and the worst case it prints, it refuses with the fill, signs nothing and m40 stays a
+/// member; in the budget that takes all three it removes m40.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp):
+/// `draft_retire_in_log_with` with no fill check (`if false && fill.passes()`): the revoke at the
+/// log's own keyed count signs into the log's hard bound and fails "removal cannot fit: at least
+/// 13 complete records … (membership log holds its limit of keyed records (Epoch, Wrap, Put,
+/// Delete, Node, Name))", with no fill, and the first refusal assert fails.
+#[test]
+fn a_revoke_whose_worst_case_passes_the_keyed_budget_refuses_and_prints_the_fill() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"never-printed".as_slice())]);
+    let m22 = &macs.m22;
+    let (_m40, actor40, _) = let_in(&macs, "m40", "m40");
+    sync(m22, None).expect("m22 syncs m40's admission");
+    let admin = admin_open(m22).expect("admin");
+    assert!(
+        admin.doc.machines().iter().any(|m| m.name == "m40"),
+        "CONTROL: the envelope names m40"
+    );
+    let before = log_of(m22);
+    let keyed = before.counts().keyed;
+    let held: BTreeSet<RecordId> = before.records().map(|r| *r.id()).collect();
+    let refused = |limit: usize| {
+        let Err(error) = keyed_budget(limit).within(|| admin_revoke(m22, &admin, "m40", false))
+        else {
+            panic!("the revoke refuses at {limit}");
+        };
+        let text = error.to_string();
+        assert!(text.contains("the membership log is full"), "{text}");
+        assert!(!text.contains("never-printed"), "no value: {text}");
+        let after = log_of(m22);
+        assert_eq!(
+            after.records().map(|r| *r.id()).collect::<BTreeSet<_>>(),
+            held,
+            "nothing is signed"
+        );
+        assert!(after.membership().contains(&actor40), "m40 stays a member");
+        numbers_of(&text)
+    };
+    let fill = refused(keyed);
+    let [_, batch, worst, _] = fill.as_slice() else {
+        panic!("the fill's four numbers: {fill:?}");
+    };
+    let room = keyed + batch + worst;
+    assert!(*batch > 0 && *worst > 0, "{fill:?}");
+    assert_eq!(
+        refused(room - 1),
+        vec![keyed, *batch, *worst, room - 1],
+        "a record short"
+    );
+    keyed_budget(room)
+        .within(|| admin_revoke(m22, &admin, "m40", false))
+        .expect("CONTROL: with room for the worst case m22 revokes m40");
+    assert!(log_of(m22).membership().removal(&actor40).is_some());
+    macs.server.stop();
+}
+
+/// The worst case of a removal ([`RemovalFill`]) counts two re-keys of an audience the remover's
+/// batch does not mint (a ranked holder's rotation, then a coalesce of the heads a concurrent
+/// removal leaves) and one of each it does. m22 puts `ring-cred` in `[m22 m40]`, which m7 is not
+/// in; m7's removal of m40 mints `[everyone]` and Commons, so its fill's worst case passes its
+/// batch by exactly twice the bound of the ring's re-key, which is in no batch.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp):
+/// `RemovalFill::of` with one re-key for every audience (`let rekeys = 1`): fails "two re-keys of
+/// the ring: [14, 8, 11, 14], the ring's bound 3", left 3, right 6.
+#[test]
+fn a_removal_reserves_two_rekeys_of_an_audience_it_does_not_mint() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let (_m40, _, rec40) = let_in(&macs, "m40", "m40");
+    sync(m22, None).expect("m22 syncs m40's admission");
+    let ring = Audience::Hosts(vec!["m22".to_owned(), "m40".to_owned()]);
+    let admin = admin_open(m22).expect("admin");
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&ring, "ring-cred", b"ring-v1").expect("ring");
+    admin_publish(m22, &admin, &doc).expect("publish the ring");
+    sync(m7, None).expect("m7 syncs");
+    let lists = EpochAudience::from(&ring);
+    let log = log_of(m7);
+    assert!(
+        log.wraps_maximal_audience_to(&lists, &rec40),
+        "CONTROL: the ring's epoch wraps m40"
+    );
+    let identity = read_identity(m7).unwrap().unwrap();
+    let opened = log.open_audience_entries(&identity).unwrap().unwrap();
+    assert!(
+        !log_entries::opens_newest(&opened, &lists)
+            && log_entries::opens_newest(&opened, &EpochAudience::Everyone)
+            && log_entries::opens_newest(&opened, &EpochAudience::Commons),
+        "CONTROL: m7 mints [everyone] and Commons, not the ring"
+    );
+    let (_, me, _) = member_key(m7);
+    let flight = log_entries::Flight::of_batch(&log, &opened, &me);
+    let mut gone = log.removed_recipients();
+    gone.insert(rec40);
+    let ring_bound = log_entries::rekey_keyed_bound(
+        &log,
+        &opened,
+        &flight,
+        &lists,
+        &BTreeSet::new(),
+        &gone,
+        None,
+    );
+    assert!(ring_bound > 0);
+
+    let keyed = log.counts().keyed;
+    let error = keyed_budget(keyed)
+        .within(|| remove_member(m7, &join_code(&rec40), false))
+        .expect_err("the removal refuses");
+    let fill = numbers_of(&error.to_string());
+    let [_, batch, worst, _] = fill.as_slice() else {
+        panic!("the fill's four numbers: {fill:?}");
+    };
+    assert_eq!(
+        worst - batch,
+        2 * ring_bound,
+        "two re-keys of the ring: {fill:?}, the ring's bound {ring_bound}"
+    );
+    macs.server.stop();
+}
+
+/// F21 and the planned cost ([`log_entries::rekey_keyed_bound`]): for an audience a Mac does not
+/// open whole, the bound counts the names it reads, its keyed tombstones, and each `Put` and
+/// `Delete` sealed under an epoch whose key it lacks, not every write the log ever held there. On
+/// m41 of the keyed split ([`keyed_split`]), which lacks the key of the uncovered keyed epoch E,
+/// after m22 writes `other` sixteen times: the bound lies below the count of `[everyone]` writes
+/// the log holds (which the old bound added its epoch and `Wrap`s to), and never below what m7's
+/// reseal of `[everyone]` signs.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): the bound
+/// counting every `Put` and `Delete` of the audience (its old arm): fails "the bound counts no
+/// superseded write: 31, of 25 writes".
+#[test]
+fn the_planned_cost_of_an_audience_not_opened_whole_counts_no_superseded_write() {
+    let split = keyed_split(false);
+    split.heal();
+    let (m22, m7, m41) = (&split.macs.m22, &split.macs.m7, &split.m41);
+    for i in 0..16 {
+        test_put_everyone(m22, "other", format!("o-{i}").as_bytes()).expect("m22 writes other");
+    }
+    split.heal();
+    let log = log_of(m41);
+    let identity = read_identity(m41).unwrap().unwrap();
+    let opened = log.open_audience_entries(&identity).unwrap().unwrap();
+    assert!(
+        !opened
+            .fully_unwrapped_audiences
+            .contains(&EpochAudience::Everyone),
+        "CONTROL: m41 does not open [everyone] whole"
+    );
+    let (_, a41, _) = member_key(m41);
+    let flight = log_entries::Flight::of_batch(&log, &opened, &a41);
+    let seats = log.current_recipients(&EpochAudience::Everyone);
+    let removed = log.removed_recipients();
+    let bound = log_entries::rekey_keyed_bound(
+        &log,
+        &opened,
+        &flight,
+        &EpochAudience::Everyone,
+        &seats,
+        &removed,
+        None,
+    );
+    let writes = log
+        .records()
+        .filter(|record| {
+            matches!(record.body(),
+                Body::Put { audience, .. } | Body::Delete { audience, .. }
+                    if *audience == EpochAudience::Everyone)
+        })
+        .count();
+    assert!(
+        bound < writes,
+        "the bound counts no superseded write: {bound}, of {writes} writes"
+    );
+
+    let t0 = aterm_time::unix_millis().unwrap_or(0);
+    let resealed: Vec<Record> = tend_epochs_at(m7, t0).expect("m7 tends");
+    let epoch = resealed
+        .iter()
+        .find(|record| {
+            matches!(
+                record.body(),
+                Body::Epoch {
+                    audience: EpochAudience::Everyone,
+                    ..
+                }
+            )
+        })
+        .map(|record| *record.id())
+        .expect("CONTROL: m7 reseals [everyone]");
+    let signed = resealed
+        .iter()
+        .filter(|record| match record.body() {
+            Body::Epoch { audience, .. }
+            | Body::Put { audience, .. }
+            | Body::Delete { audience, .. } => *audience == EpochAudience::Everyone,
+            Body::Wrap { epoch: of, .. } => *of == epoch || *of == split.epoch,
+            _ => false,
+        })
+        .count();
+    assert!(
+        signed <= bound,
+        "the bound is never below what the reseal signs: {signed} > {bound}"
+    );
+    split.macs.server.stop();
 }

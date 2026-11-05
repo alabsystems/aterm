@@ -180,12 +180,17 @@ pub enum CheckAnswer {
 
 /// THE ANSWER `tail` (the check's reply) GIVES, read literally. `turn_said` is the agent's earlier
 /// messages in the same turn, read for needs only, and only those no later word of the turn
-/// retracted ([`needs::standing_before`]: the agent's last word wins); `cut` is the reply having been taller than
-/// the rows read, so it is never [`CheckAnswer::Landed`]: a reply of the word alone cannot be cut.
+/// retracted ([`needs::standing_before`]: an earlier message's own none for that message, the
+/// reply's for all); `cut` is the reply having been taller than the rows read, so it is never
+/// [`CheckAnswer::Landed`]: a reply of the word alone cannot be cut.
 #[must_use]
-pub fn land_check_answer(tail: &str, turn_said: Option<&str>, cut: bool) -> CheckAnswer {
+pub fn land_check_answer(
+    tail: &str,
+    turn_said: Option<needs::Before<'_>>,
+    cut: bool,
+) -> CheckAnswer {
     let turn_said = needs::standing_before(turn_said, tail);
-    let needs_said = [Some(tail), turn_said]
+    let needs_said = [Some(tail), turn_said.as_deref()]
         .into_iter()
         .flatten()
         .any(|t| !needs::needs_you(t).is_empty());

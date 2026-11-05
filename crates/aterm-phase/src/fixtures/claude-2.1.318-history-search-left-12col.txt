@@ -1,0 +1,51 @@
+# claude-code 2.1.318 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (12x50, aterm 0.154.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Claude Code's prompt-history search (ctrl+r) in a 12-column window left with Esc after its query look matched SCENE-CM please look over an empty composer (`claude-2.1.318-history-search-12col`): the match stays in the composer over three rows, the cursor on its last · cursor=39,2
+           /
+           a
+           t
+           .
+           l
+           a
+           O
+           k
+           /
+           p
+           r
+           o
+           j
+
+
+❯ SCENE-CM
+  please
+  look
+
+  Read 1
+  file
+  (ctrl+o to
+  expand)
+
+⏺ Implemente
+  d the
+  parser
+  module and
+  its unit
+  tests in
+  this turn.
+
+✻ Baked for
+  9s · done
+  3:45 PM
+
+────────────
+❯ SCENE-CM
+  please
+  look
+────────────
+  ⏵⏵ auto
+
+
+
+
+
+
+
+

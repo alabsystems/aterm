@@ -511,7 +511,7 @@ pub fn cmd_first_key(args: &[String]) -> Res {
             "\n{dropped} presses dropped: the window was not in its arm's state a minute past its quiet (dropped.tsv)"
         );
     }
-    let _ = std::fs::write(o.out.join("summary.txt"), &summary);
+    let _ = crate::util::write_fresh(&o.out.join("summary.txt"), &summary);
     print!("{summary}");
     Ok(0)
 }
@@ -666,10 +666,7 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
     std::fs::create_dir_all(&raw_dir)
         .map_err(|e| format!("cannot make {}: {e}", raw_dir.display()))?;
     let tsv = o.out.join("presses.tsv");
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&tsv)
+    let mut file = crate::util::append_regular_file(&tsv)
         .map_err(|e| format!("cannot open {}: {e}", tsv.display()))?;
     if file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
         use std::io::Write as _;
@@ -683,7 +680,7 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
         let arm = &o.arms[i];
         let wanted = config(o, arm);
         if wanted != config_now {
-            std::fs::write(&toml_path, crate::instance::bell_off(&wanted))
+            crate::util::atomic_write(&toml_path, crate::instance::bell_off(&wanted).as_bytes())
                 .map_err(|e| format!("cannot write {}: {e}", toml_path.display()))?;
             config_now = wanted;
         }
@@ -719,16 +716,12 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
             );
             eprintln!("first-key: dropped press {line}");
             let dropped_tsv = o.out.join("dropped.tsv");
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&dropped_tsv)
-                .and_then(|mut f| {
-                    use std::io::Write as _;
-                    writeln!(f, "{line}")
-                });
-            let _ = std::fs::write(
-                raw_dir.join(format!("{press}-{}-dropped.txt", arm.name)),
+            let _ = crate::util::append_regular_file(&dropped_tsv).and_then(|mut f| {
+                use std::io::Write as _;
+                writeln!(f, "{line}")
+            });
+            let _ = crate::util::write_fresh(
+                &raw_dir.join(format!("{press}-{}-dropped.txt", arm.name)),
                 &status_raw,
             );
             dropped += 1;
@@ -776,8 +769,8 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
         let p_raw = call(&mut conn, "metrics percentiles")?;
         let p = fields(&p_raw);
         // Every field of both replies, beside the row, for what a column does not carry.
-        let _ = std::fs::write(
-            raw_dir.join(format!("{press}-{}.txt", arm.name)),
+        let _ = crate::util::write_fresh(
+            &raw_dir.join(format!("{press}-{}.txt", arm.name)),
             format!("{status_raw}\n{m_raw}\n{p_raw}\n"),
         );
         ctl(&inst, &["key", "ctrl+u"])?;
@@ -896,7 +889,7 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
             );
         }
     }
-    inst.stop();
+    inst.stop().map_err(Fail::die)?;
     Ok((rows, dropped))
 }
 

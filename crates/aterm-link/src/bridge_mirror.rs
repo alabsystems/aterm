@@ -98,12 +98,34 @@ pub(super) struct MirrorRun {
     /// A busy answer (`fenced`, `adopting`, an empty bucket) waits until then.
     retry_at: Option<Instant>,
     /// A snapshot the endpoint held back to its rate (`due=`, a moved mail count) is due then:
-    /// a take is owed at that instant though nothing appends to wake one.
+    /// a take is owed at that instant though nothing appends to wake one. Until then a take
+    /// owed only by wakes of the sessions that hold covers ([`MirrorRun::held`]) waits for an
+    /// owed inbox commit's write ([`Bridge::mirror_behind_the_commit`]).
     held_back: Option<Instant>,
-    /// When the loop first found a take due that nothing would carry: the pass waits from then
-    /// for the loop's next write, at most [`IDLE_ACK_GRACE`] ([`Bridge::mirror_rides_nothing`],
-    /// critic item E04).
+    /// The sessions whose snapshot the endpoint's last empty answer held back to its rate
+    /// (`held=`, [`mirror::Taken::held`]), each until [`MirrorRun::held_back`] at the soonest.
+    /// The hold is per session: any other session's snapshot is in a take as soon as its log
+    /// owes one (critic item E04c's review).
+    held: BTreeSet<String>,
+    /// A wake since that answer that the hold may not cover: an endpoint event of a session
+    /// [`MirrorRun::held`] does not name, or a wake of no session (a gap, an attach, the
+    /// roster's backstop). The take it owes may carry a snapshot, so it does not wait for the
+    /// commit's write ([`Bridge::mirror_woken_by`], critic item E04c's review).
+    unheld: bool,
+    /// When the loop first held a take: one nothing would carry waits from then for an inbox
+    /// commit to fall due, at most [`IDLE_ACK_GRACE`] ([`Bridge::mirror_rides_nothing`], critic
+    /// item E04). A take inside the endpoint's rate hold that waited for a commit's write
+    /// ([`Bridge::mirror_behind_the_commit`], critic item E04c) is dated from then too, so once
+    /// that commit is written it is not held a grace more for another to fall due.
     uncarried: Option<Instant>,
+    /// The inbox offset whose commit a take inside the endpoint's rate hold waits to see
+    /// written: what [`Bridge::inbox_commit_due`] named when the pass first waited
+    /// ([`Bridge::mirror_behind_the_commit`], critic item E04c).
+    behind: Option<u64>,
+    /// The last take left a backlog at the endpoint: it said `more=1`, or came back with every
+    /// slot it asked. The take after its landing drains that backlog, so it is never held for a
+    /// commit to carry ([`Bridge::mirror_rides_nothing`], critic item E04's review).
+    drains: bool,
     /// The batch in flight and the node's total.
     pin: Pin,
     /// Per slot: whether THIS process may have sent it (a never-sent slot's
@@ -186,7 +208,11 @@ impl MirrorRun {
                 owed: false,
                 retry_at: None,
                 held_back: None,
+                held: BTreeSet::new(),
+                unheld: false,
                 uncarried: None,
+                behind: None,
+                drains: false,
                 pin: Pin {
                     key,
                     ..Pin::default()
@@ -244,11 +270,10 @@ impl MirrorRun {
         self.uncarried
     }
 
-    /// Date the hold of a take nothing would carry from `at` (a grace ago, so a test reaches
-    /// its end without waiting it out).
+    /// Whether work is owed: a take, a send or a landing.
     #[cfg(test)]
-    pub(super) fn date_uncarried_for_tests(&mut self, at: Instant) {
-        self.uncarried = Some(at);
+    pub(super) fn owed(&self) -> bool {
+        self.owed
     }
 
     /// The batch in flight and what came of each slot.
@@ -728,10 +753,27 @@ impl Bridge {
         }
     }
 
-    /// Something may have been appended to a session log: a take is owed.
+    /// Something may have been appended to some session's log (a gap, an attach, the roster's
+    /// backstop): a take is owed, and no rate hold is known to cover it ([`MirrorRun::unheld`]).
     pub(super) fn mirror_wake(&mut self) {
         if let Some(m) = self.mirror.as_deref_mut() {
             m.owed = true;
+            m.unheld = true;
+        }
+    }
+
+    /// An endpoint event of the session `local` (`EVENT <local> …`): something may have been
+    /// appended to its log, so a take is owed. The take waits behind an owed commit's write only
+    /// while every session woken since the last empty answer is one that answer's rate hold
+    /// covers ([`MirrorRun::held`], [`Bridge::mirror_behind_the_commit`]); an event of any other
+    /// session, or of one this bridge does not list, may owe its snapshot at once.
+    pub(super) fn mirror_woken_by(&mut self, local: Option<&str>) {
+        let sid = local
+            .and_then(|l| l.parse::<u64>().ok())
+            .and_then(|l| self.locals.get(&l));
+        if let Some(m) = self.mirror.as_deref_mut() {
+            m.owed = true;
+            m.unheld |= !sid.is_some_and(|sid| m.held.contains(sid));
         }
     }
 
@@ -769,7 +811,7 @@ impl Bridge {
         }
     }
 
-    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing; no earlier than a held first pass's instant ([`FirstPass::Held`]), nor, for a take nothing would carry once its hold began, than [`IDLE_ACK_GRACE`] past that ([`Bridge::mirror_rides_nothing`]).
+    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing; no earlier than a held first pass's instant ([`FirstPass::Held`]), nor, for a take nothing would carry once its hold began, than [`IDLE_ACK_GRACE`] past that ([`Bridge::mirror_rides_nothing`]), nor, for a take inside the endpoint's rate hold that only wakes of the sessions it holds owe, than the owed commit's write ([`Bridge::mirror_behind_the_commit`]).
     pub(super) fn mirror_due(&self, now: Instant) -> Option<Instant> {
         if !self.mirror_engaged() || self.conn.is_none() {
             return None;
@@ -788,29 +830,42 @@ impl Bridge {
             }
             _ => due,
         };
+        let due = match (due, self.mirror_behind_the_commit(now)) {
+            (Some(at), Some(written)) => Some(at.max(written)),
+            _ => due,
+        };
         match m.first_pass {
             FirstPass::Held { until, .. } => due.map(|at| at.max(until)),
             FirstPass::Free | FirstPass::Attached { .. } => due,
         }
     }
 
-    /// A PASS THAT OWES NOTHING WAITS FOR THE LOOP'S NEXT WRITE (critic item E04): whether a
-    /// pass due now would take a fresh batch with no inbox commit for its burst to carry
+    /// A TAKE NOTHING WOULD CARRY WAITS FOR A COMMIT TO CARRY (critic item E04): whether a pass
+    /// due now would take a fresh batch with no inbox commit for its burst to carry
     /// ([`Bridge::mirror_has_a_commit_to_carry`]), in an open that holds the pin's fence
     /// ([`StateDir::logpin_fence_held`]). Such a pass is held from when the loop first finds it
-    /// due ([`Bridge::mirror_step`]) for at most [`IDLE_ACK_GRACE`], and goes as soon as its
-    /// burst would carry a commit. A sender's snapshot of the mail count its own post moved
-    /// falls due before the delivery owes a commit; on one node the delivery comes well inside
-    /// the grace, so the pass behind it takes the sender's snapshot and the recipient's in one
-    /// take, and its burst carries the commit ahead of both: one write and one writer batch where
-    /// they were two. With no commit coming (a post to another node's session, or to a person)
-    /// the take goes alone at the grace's end, so the hold puts no take off by more than that.
-    /// Not held: a pass with a pinned batch (a resend, a re-pin, a recovered batch), and an
-    /// open's first pass, which makes the fence and sends the commit its deliveries owe alone
-    /// ahead of it ([`Bridge::commit_ahead_of_the_fence`], critic item D06), so nothing would
-    /// ride it. A post does not end the hold: a take pins its batch before any slot goes, so a
-    /// post that carried one would wait behind the take, and the post's own delivery on this node
-    /// owes the commit the pass then rides.
+    /// due ([`Bridge::mirror_step`]) for at most [`IDLE_ACK_GRACE`]: it goes as soon as an inbox
+    /// commit falls due for its burst to carry, or alone once the grace is out, and nothing else
+    /// ends the hold. A sender's snapshot of the mail count its own post moved falls due before
+    /// the delivery owes a commit; on one node the delivery comes well inside the grace, so the
+    /// pass behind it takes the sender's snapshot and the recipient's in one take, and its burst
+    /// carries the commit ahead of both: one write and one writer batch where they were two. A
+    /// take that comes back empty (a snapshot the endpoint holds back to its rate) carries
+    /// nothing, and the round's settle holds the commit from the round's start
+    /// ([`Bridge::mirror_pass_then_settle`]), so the take's ctl round trip runs inside the
+    /// commit's grace, not ahead of it; once an answer said the endpoint holds a snapshot back,
+    /// a take before that hold's end that only wakes of the sessions it holds owe waits for the
+    /// commit's write instead ([`Bridge::mirror_behind_the_commit`]). With no commit coming (a
+    /// post to another node's session, or to a person) the take goes alone at the grace's end,
+    /// so the hold puts no take off by more than that.
+    ///
+    /// Not held: a pass with a pinned batch (a resend, a re-pin, a recovered batch); an open's
+    /// first pass, which makes the fence and sends the commit its deliveries owe alone ahead of
+    /// it ([`Bridge::commit_ahead_of_the_fence`], critic item D06), so nothing would ride it; and
+    /// the take after a landing whose take left a backlog ([`MirrorRun::drains`]), which drains
+    /// it at once as each batch lands. A post does not end the hold: a take pins its batch before
+    /// any slot goes, so a post that carried one would wait behind the take, and the post's own
+    /// delivery on this node owes the commit the pass then rides.
     pub(super) fn mirror_rides_nothing(&self) -> bool {
         #[cfg(test)]
         if self
@@ -819,11 +874,91 @@ impl Bridge {
         {
             return false;
         }
+        #[cfg(test)]
+        let drains = |m: &MirrorRun| {
+            m.drains
+                && !self
+                    .fx
+                    .mutant(crate::sim::world::Mutant::MirrorHoldsADrainingTake)
+        };
+        #[cfg(not(test))]
+        let drains = |m: &MirrorRun| m.drains;
         self.mirror
             .as_deref()
-            .is_some_and(|m| m.pin.slots.is_empty() && !m.repin)
+            .is_some_and(|m| m.pin.slots.is_empty() && !m.repin && !drains(m))
             && !self.mirror_has_a_commit_to_carry()
             && self.state.logpin_fence_held()
+    }
+
+    /// A TAKE INSIDE THE ENDPOINT'S RATE HOLD GOES AFTER THE COMMIT'S WRITE (critic item E04c):
+    /// the endpoint's last answer to a take came back empty and said when a snapshot it holds
+    /// back to its rate falls due ([`MirrorRun::held_back`]) and whose snapshots it holds back
+    /// ([`MirrorRun::held`]). The hold is per session: until then those sessions' snapshots stay
+    /// back, and a delivery's or a post's mail marks stay local, but any other session's
+    /// snapshot is in the next take as soon as its log owes one. So only a take every wake since
+    /// that answer owes to a session the hold names ([`Bridge::mirror_woken_by`]) comes back
+    /// empty, unless one of them appended a record of the bus class. Such a take, with nothing
+    /// pinned and no backlog to drain, waits while an inbox commit is owed for the loop's next
+    /// write ([`Bridge::mirror_has_a_commit_to_carry`]) until the commit owed when it first
+    /// waited ([`MirrorRun::behind`]) is written: alone at its grace's end, carried by a publish,
+    /// or sent ahead of the next item off the bus. Its `log-take` ctl round trip then runs while
+    /// the broker flushes the commit, not ahead of the commit's write, which a round trip that
+    /// crossed the commit's [`IDLE_ACK_GRACE`] put off by itself, with nothing riding the
+    /// commit. A take that any other wake owes ([`MirrorRun::unheld`]) may carry a snapshot, so
+    /// it goes as E04's rule has it and its burst carries the commit
+    /// ([`Bridge::mirror_rides_nothing`]): waiting would send the commit alone and the snapshot
+    /// in a write of its own behind it (critic item E04c's review).
+    ///
+    /// What bounds it: the wait ends once that one commit is written, whatever later deliveries
+    /// owe, so it lasts no longer than that commit is held, which past its grace is only while
+    /// the round's settle keeps it back for an inbox record still queued; and it ends at the rate
+    /// hold's end, or at a wake the hold does not cover. The take is dated from when it first
+    /// waited ([`MirrorRun::uncarried`]), so E04's hold for a commit to fall due holds it no
+    /// longer than a grace from then once the commit is written. At the rate hold's end the
+    /// snapshot is due, the take comes back with it, and its burst carries the commit as E04's
+    /// rule has it. A record of the bus class a held session appended inside the hold, with no
+    /// wake the hold does not cover since, goes in that take, behind the commit, rather than
+    /// riding it.
+    ///
+    /// Returns the latest instant the wait ends: the held commit's grace end (a grace from now
+    /// for one the round's settle has yet to hold), no later than the rate hold's end. It is
+    /// `now` or earlier while the round's settle has yet to send a commit whose grace is out,
+    /// which the pass waits for ([`Bridge::mirror_step`]). `None`: the pass waits on no commit.
+    pub(super) fn mirror_behind_the_commit(&self, now: Instant) -> Option<Instant> {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::RateHeldTakeAheadOfTheCommit)
+        {
+            return None;
+        }
+        #[cfg(test)]
+        let unheld = |m: &MirrorRun| {
+            m.unheld
+                && !self
+                    .fx
+                    .mutant(crate::sim::world::Mutant::RateHoldCoversEverySession)
+        };
+        #[cfg(not(test))]
+        let unheld = |m: &MirrorRun| m.unheld;
+        let m = self.mirror.as_deref()?;
+        let hold_ends = m.held_back.filter(|&at| now < at)?;
+        let waits = m.pin.slots.is_empty()
+            && !m.repin
+            && !m.drains
+            && !unheld(m)
+            && self.mirror_has_a_commit_to_carry()
+            && m.behind.is_none_or(|off| !self.commit_written_through(off));
+        waits.then(|| (self.commit_held.unwrap_or(now) + IDLE_ACK_GRACE).min(hold_ends))
+    }
+
+    /// Whether an inbox commit through `off` is written: owed on the link, or landed.
+    fn commit_written_through(&self, off: u64) -> bool {
+        self.committed_through(off)
+            || self
+                .conn
+                .as_ref()
+                .is_some_and(|link| link.owed().any(|then| then.commits_through(off)))
     }
 
     /// WHETHER THE LOOP HOLDS THE MIRROR'S PASS BACK FOR A ROUND (critic item D06): the first
@@ -929,10 +1064,20 @@ impl Bridge {
         let _ = self.ctl_request(&reason.request());
     }
 
-    /// THE PASS: re-pin after a collision, take when nothing is pinned, send what is owed, and settle a batch whose every slot concluded. A take nothing would carry is held first, from the round that finds it due ([`Bridge::mirror_rides_nothing`]).
+    /// THE PASS: re-pin after a collision, take when nothing is pinned, send what is owed, and settle a batch whose every slot concluded. A take nothing would carry is held first, from the round that finds it due ([`Bridge::mirror_rides_nothing`]), and a take inside the endpoint's rate hold that only wakes of the sessions it holds owe waits for an owed commit's write, a commit whose grace is out included, which the round's settle sends after this pass ([`Bridge::mirror_behind_the_commit`]).
     pub(super) fn mirror_step(&mut self) {
         let now = self.fx.now();
-        if self.mirror_due(now).is_none_or(|at| at > now) {
+        // The wait is noted before the due check, which the wait itself puts off.
+        let behind = self
+            .mirror_behind_the_commit(now)
+            .and_then(|_| self.inbox_commit_due());
+        if let (Some(off), Some(m)) = (behind, self.mirror.as_deref_mut()) {
+            if m.owed {
+                m.behind.get_or_insert(off);
+                m.uncarried.get_or_insert(now);
+            }
+        }
+        if behind.is_some() || self.mirror_due(now).is_none_or(|at| at > now) {
             return;
         }
         let rides_nothing = self.mirror_rides_nothing();
@@ -946,7 +1091,10 @@ impl Bridge {
         if let Some(m) = self.mirror.as_deref_mut() {
             m.retry_at = None;
             m.held_back = None;
+            m.held.clear();
+            m.unheld = false;
             m.uncarried = None;
+            m.behind = None;
             if m.sent_inc != inc {
                 for o in &mut m.outcome {
                     if *o == Outcome::Sending {
@@ -1047,17 +1195,30 @@ impl Bridge {
                 return;
             }
         };
-        let mirror::Taken { slots, more, due } = match mirror::parse_take(&header, &body) {
+        let mirror::Taken {
+            slots,
+            more,
+            due,
+            held,
+        } = match mirror::parse_take(&header, &body) {
             Ok(taken) => taken,
             Err(e) => {
                 self.mirror_stop(&e, MirrorReason::Endpoint);
                 return;
             }
         };
+        // Slots that never pin (a failure below) are taken again as owed work; a batch that
+        // pins drains a backlog only if its take left one.
+        if let Some(m) = self.mirror.as_deref_mut() {
+            m.drains = more || !slots.is_empty();
+        }
         if slots.is_empty() {
             if let Some(m) = self.mirror.as_deref_mut() {
                 m.owed = more;
                 m.held_back = due.map(|wait| now + wait);
+                // A wake from here on is judged against this answer's hold alone.
+                m.held = held;
+                m.unheld = false;
             }
             if more {
                 self.mirror_retry_in(BUSY_WAIT);
@@ -1109,6 +1270,8 @@ impl Bridge {
             stderr_line!("aterm-link: mirror: the pin could not be written ({e}); nothing sent");
             m.clear_batch();
             m.retry_at = Some(now + DEADLINE_RETRY);
+        } else {
+            m.drains = more || k >= n;
         }
     }
 
@@ -1386,6 +1549,12 @@ impl Bridge {
             if room < BURST_ROOM {
                 return;
             }
+            // Behind the broker's rate limit ([`Bridge::rate`]): every slot stays owed, sent once
+            // the hold is over.
+            if let Some(left) = self.rate_held() {
+                self.mirror_retry_in(left);
+                return;
+            }
             #[cfg(test)]
             let bare = self
                 .fx
@@ -1485,7 +1654,8 @@ impl Bridge {
                 stderr_line!(
                     "aterm-link: mirror: the broker refused a slot for now ({e}); sent again"
                 );
-                self.mirror_retry_in(DEADLINE_RETRY);
+                // A rate-limited one once the bucket has refilled, as the broker names it.
+                self.mirror_retry_in(crate::rate_hold::wait_of(&e).unwrap_or(DEADLINE_RETRY));
                 Outcome::Owed
             }
             Err(_) => Outcome::Owed,

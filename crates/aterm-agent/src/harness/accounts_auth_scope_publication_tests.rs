@@ -107,6 +107,15 @@ impl Publication {
     }
 
     fn change(&self, operation: &str, after: &str) -> Result<Vec<Event>, String> {
+        self.change_from(&self.before, operation, after)
+    }
+
+    fn change_from(
+        &self,
+        before: &str,
+        operation: &str,
+        after: &str,
+    ) -> Result<Vec<Event>, String> {
         let held = self.store.acquire().unwrap();
         self.store.transact_sync_held(
             &held,
@@ -114,7 +123,7 @@ impl Publication {
             &mut None,
             SyncTarget {
                 path: &self.path,
-                before: Some(&self.before),
+                before: Some(before),
                 after: Some(after),
                 mode: None,
             },
@@ -153,6 +162,7 @@ impl Publication {
                             NOW + 1,
                         )
                     }
+                    "displaced" => note_displaced(state, logins, "work", "new-default", NOW + 1),
                     "checked" => note_checked_sign_in(state, logins, "work", NOW + 1),
                     "default-made" => note_default_login_made(state, logins, "work", None, NOW + 1),
                     "renewed" => note_renewed(
@@ -205,6 +215,46 @@ fn fresh_auth_before_raw_identity_replacement_refuses_every_publication_image() 
             assert!(!fixture.store.sync_needs_recovery());
         }
     }
+}
+
+/// A row written over has no login here, whatever else its record said: the word says so of its
+/// final login, not of the entry login a transaction's edit may have replaced, and it counts over
+/// an older retired word. m8 (2026-11-05) held `auth: signed-out` with `auth_retired: true`, read
+/// `limited` and then would read `usable`, so a Mac could rotate onto an account with no login.
+#[test]
+fn a_row_written_over_reads_signed_out_though_its_policy_changed_or_its_word_was_retired() {
+    let read = |fixture: &Publication| {
+        let records = fixture
+            .store
+            .read_account_records(Some(&fixture.path), NOW + 1)
+            .unwrap();
+        let row = records.roster.row("work").unwrap();
+        (
+            records.state.accounts["work"].current_auth(row),
+            condition(row, &records.state, true, NOW + 1),
+        )
+    };
+
+    let same_sync = Publication::new(true);
+    same_sync.change("displaced", &same_sync.after).unwrap();
+    assert_eq!(read(&same_sync), (Auth::SignedOut, Condition::SignedOut));
+
+    let retired_before = Publication::new(true);
+    retired_before
+        .change("retained", &retired_before.after)
+        .unwrap();
+    assert_eq!(
+        read(&retired_before).0,
+        Auth::Unseen,
+        "CONTROL: a word of the login a policy edit replaced is retired"
+    );
+    retired_before
+        .change_from(&retired_before.after, "displaced", &retired_before.after)
+        .unwrap();
+    assert_eq!(
+        read(&retired_before),
+        (Auth::SignedOut, Condition::SignedOut)
+    );
 }
 
 #[test]

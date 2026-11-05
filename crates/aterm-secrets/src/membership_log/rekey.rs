@@ -47,9 +47,6 @@ thread_local! {
     /// The negative control of [`secure_twins`]: while set, no newest epochs are twins, so
     /// identical concurrent epochs are due a coalesce as every concurrent pair once was.
     pub(crate) static TWINS_DUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The negative control of settledness: while set, every epoch reads as settled
-    /// ([`Log::unsettled`]), so nothing waits on a minter's batch and no `Wrap` is in flight.
-    pub(crate) static UNSETTLED_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The negative control of [`Log::batch_may_wrap`]: while set, no `Wrap` a held prefix lacks
     /// is in flight, so every one reads as a recipient left out on purpose, as before.
     pub(crate) static PREFIX_BLIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -64,6 +61,22 @@ thread_local! {
     /// The negative control of [`RekeyDue::carriers`]: while set, a member that minted every
     /// newest epoch carries the audience with no `Wrap` of it, as it once did.
     pub(crate) static MINTERS_CARRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of settledness: while set, every epoch reads as settled
+    /// ([`Log::unsettled`]), so nothing waits on a minter's batch and no `Wrap` is in flight. A
+    /// test sets it for its thread; a lab instance turns it on for its whole process with
+    /// `unsettled-ok` in `ATERM_TEST_NEGATIVE_CONTROL` ([`unsettled_ok`]).
+    pub(crate) static UNSETTLED_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`UNSETTLED_OK`] is on: set on this thread, or named for this process
+/// (`unsettled-ok`, [`aterm_types::negative_control::on`]).
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn unsettled_ok() -> bool {
+    UNSETTLED_OK.with(std::cell::Cell::get) || aterm_types::negative_control::on("unsettled-ok")
 }
 
 /// One audience due a new epoch ([`Log::rekey_dues`]).
@@ -85,6 +98,11 @@ pub struct RekeyDue {
     pub removers: BTreeSet<MemberId>,
     /// The Macs those removers took out: the removals whose rotation the other members wait for.
     pub removals: BTreeSet<MemberId>,
+    /// Every Mac an effective `Remove` took out whose recipient a newest epoch still wraps,
+    /// whether or not a remover can carry the audience yet. A tender keeps when it first saw
+    /// each, so a removal that waits on a remover only once a heal wraps that remover still
+    /// counts its grace from when this Mac first saw the `Remove`.
+    pub removed: BTreeSet<MemberId>,
     /// The current members that can carry the audience: each holds a counting `Wrap` of every
     /// newest epoch, and its recipient is not removed. A minter that wrapped an epoch only to
     /// others (an admin writing a host list it is not in) holds no key of it.
@@ -268,6 +286,7 @@ impl Log {
                 .collect();
             let mut removers: BTreeSet<MemberId> = BTreeSet::new();
             let mut removals: BTreeSet<MemberId> = BTreeSet::new();
+            let mut removed_seats: BTreeSet<MemberId> = BTreeSet::new();
             for (target, removal) in membership.removed() {
                 if !seats
                     .get(target)
@@ -275,6 +294,7 @@ impl Log {
                 {
                     continue;
                 }
+                removed_seats.insert(*target);
                 let carrying: Vec<MemberId> = removal
                     .by
                     .iter()
@@ -314,6 +334,7 @@ impl Log {
                 reseal,
                 removers,
                 removals,
+                removed: removed_seats,
                 carriers,
                 resealers,
                 reseal_first,
@@ -327,8 +348,8 @@ impl Log {
     /// `Epoch`, `Put` or any other record settles it). An epoch it does not hold is not named.
     #[must_use]
     pub fn unsettled(&self, epochs: &[RecordId]) -> Vec<RecordId> {
-        #[cfg(test)]
-        if UNSETTLED_OK.with(std::cell::Cell::get) {
+        #[cfg(any(test, debug_assertions))]
+        if unsettled_ok() {
             return Vec::new();
         }
         let effective = self.effective();

@@ -27,30 +27,7 @@ pub fn mark_ran(code_dir: &Path) {
         return;
     };
     let home = dir.join(label).join(id);
-    let ran_path = home.join(RAN);
-    #[cfg(unix)]
-    let wrote = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&ran_path)
-            .and_then(|file| {
-                if !file.metadata()?.is_file() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("{} is not a regular file", ran_path.display()),
-                    ));
-                }
-                Ok(())
-            })
-    };
-    #[cfg(not(unix))]
-    let wrote = std::fs::write(&ran_path, b"");
-    if let Err(e) = wrote {
+    if let Err(e) = aterm_uds::deadline::try_mark_ran(&home) {
         eprintln!(
             "aterm acaffeine: cannot mark {} as run from: {e}",
             home.display()
@@ -185,9 +162,18 @@ fn copy_bundle(origin: &Path, bundle: &Path, code_dir: &Path, label: &str) -> io
     let made = std::fs::create_dir(&partial)
         .and_then(|()| copy_tree(bundle, &partial.join(top)))
         .and_then(|()| {
-            print
-                .as_ref()
-                .map_or(Ok(()), |print| std::fs::write(partial.join(SOURCE), print))
+            print.as_ref().map_or(Ok(()), |print| {
+                use std::io::Write as _;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+                }
+                let mut f = opts.open(partial.join(SOURCE))?;
+                f.write_all(print.as_bytes())
+            })
         })
         .and_then(|()| std::fs::rename(&partial, &home));
     if let Err(e) = made {
@@ -283,11 +269,15 @@ fn ran_copy(code_dir: &Path, label: &str, print: &str, inner: &Path) -> Option<P
     std::fs::read_dir(&slot)
         .ok()?
         .flatten()
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|ft| ft.is_dir())
+                && Path::new(&entry.file_name())
+                    .extension()
+                    .is_none_or(|e| e != "partial")
+        })
         .map(|entry| entry.path())
         .find(|home| {
-            std::fs::symlink_metadata(home).is_ok_and(|meta| meta.file_type().is_dir())
-                && home.extension().is_none_or(|e| e != "partial")
-                && is_regular_file(&home.join(RAN))
+            is_regular_file(&home.join(RAN))
                 && read_regular_capped(&home.join(SOURCE))
                     .is_some_and(|text| text == print.as_bytes())
                 && home.join(inner).is_file()
@@ -508,19 +498,52 @@ fn remove_entry(path: &Path, dir: bool) -> io::Result<()> {
 
 #[cfg(unix)]
 fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
-    let meta = std::fs::symlink_metadata(src)?;
-    let kind = meta.file_type();
+    copy_tree_kind(src, dst, std::fs::symlink_metadata(src)?.file_type())
+}
+
+#[cfg(unix)]
+fn copy_tree_kind(src: &Path, dst: &Path, kind: std::fs::FileType) -> io::Result<()> {
     if kind.is_symlink() {
         std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)
     } else if kind.is_dir() {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let meta = std::fs::symlink_metadata(src)?;
         std::fs::create_dir(dst)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
-            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+            let ft = entry.file_type()?;
+            copy_tree_kind(&entry.path(), &dst.join(entry.file_name()), ft)?;
         }
-        std::fs::set_permissions(dst, meta.permissions())
+        let dir_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dst)?;
+        let perms = meta.permissions();
+        if dir_fd
+            .metadata()
+            .is_ok_and(|m| m.permissions().mode() & 0o7777 == perms.mode() & 0o7777)
+        {
+            return Ok(());
+        }
+        dir_fd.set_permissions(perms)
     } else if kind.is_file() {
-        std::fs::copy(src, dst).map(drop)
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let (mut source, src_meta) = aterm_uds::regular_file::open(src)?;
+        let perms = src_meta.permissions();
+        let mut sink = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(perms.mode())
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+            .open(dst)?;
+        std::io::copy(&mut source, &mut sink)?;
+        if sink
+            .metadata()
+            .is_ok_and(|m| m.permissions().mode() & 0o7777 == perms.mode() & 0o7777)
+        {
+            return Ok(());
+        }
+        sink.set_permissions(perms)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -639,6 +662,7 @@ fn read_regular_capped(path: &Path) -> Option<Vec<u8>> {
 
 fn read_capped_inner(path: &Path, nofollow: bool) -> Option<Vec<u8>> {
     use std::io::Read as _;
+    #[cfg(not(unix))]
     if nofollow && !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
         return None;
     }
@@ -647,7 +671,7 @@ fn read_capped_inner(path: &Path, nofollow: bool) -> Option<Vec<u8>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let mut flags = libc::O_NONBLOCK;
+        let mut flags = libc::O_NONBLOCK | libc::O_CLOEXEC;
         if nofollow {
             flags |= libc::O_NOFOLLOW;
         }

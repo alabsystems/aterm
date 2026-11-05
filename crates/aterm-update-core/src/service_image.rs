@@ -140,15 +140,11 @@ fn valid_executable(path: &Path) -> bool {
 }
 
 fn valid_revision(s: &str) -> bool {
-    s.len() == 40
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    aterm_codec::hex::is_lower(s, 40)
 }
 
 fn valid_hash(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    aterm_codec::hex::is_lower(s, 64)
 }
 #[cfg(unix)]
 fn error(e: impl std::fmt::Display) -> String {
@@ -256,13 +252,36 @@ fn resolve_confined_symlink(root: &Path, path: &Path, first_target: &Path) -> Re
 /// Symlinks are bound by their exact target and may resolve only within the image.
 pub fn image_digest(root: &Path) -> Result<String, String> {
     use std::os::unix::fs::PermissionsExt;
-    fn walk(root: &Path, path: &Path, hash: &mut aterm_digest::Sha256) -> Result<(), String> {
-        let meta = std::fs::symlink_metadata(path).map_err(error)?;
+    fn walk(
+        root: &Path,
+        path: &Path,
+        known_type: Option<std::fs::FileType>,
+        hash: &mut aterm_digest::Sha256,
+    ) -> Result<(), String> {
         let name = path
             .strip_prefix(root)
             .map_err(error)?
             .to_str()
             .ok_or("non-UTF8 image name")?;
+        if known_type.is_some_and(|ft| ft.is_file()) {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(path)
+                .map_err(error)?;
+            let opened = file.metadata().map_err(error)?;
+            if !opened.is_file() {
+                return Err("service image entry changed during hashing".into());
+            }
+            hash.update((name.len() as u64).to_be_bytes());
+            hash.update(name.as_bytes());
+            hash.update((opened.permissions().mode() & 0o7777).to_be_bytes());
+            hash.update(b"f");
+            hash.update(sha256_open_file(file)?.as_bytes());
+            return Ok(());
+        }
+        let meta = std::fs::symlink_metadata(path).map_err(error)?;
         hash.update((name.len() as u64).to_be_bytes());
         hash.update(name.as_bytes());
         hash.update((meta.permissions().mode() & 0o7777).to_be_bytes());
@@ -289,12 +308,12 @@ pub fn image_digest(root: &Path) -> Result<String, String> {
             hash.update(b"d");
             let mut entries = std::fs::read_dir(path)
                 .map_err(error)?
-                .map(|e| e.map(|e| e.path()))
+                .map(|e| e.map(|e| (e.file_name(), e.file_type().ok())))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(error)?;
-            entries.sort();
-            for entry in entries {
-                walk(root, &entry, hash)?;
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, entry_type) in entries {
+                walk(root, &path.join(name), entry_type, hash)?;
             }
         } else {
             return Err("special file in service image".into());
@@ -307,7 +326,7 @@ pub fn image_digest(root: &Path) -> Result<String, String> {
     let root = root.canonicalize().map_err(error)?;
     let mut hash = aterm_digest::Sha256::new();
     hash.update(b"aterm-service-image-v1\0");
-    walk(&root, &root, &mut hash)?;
+    walk(&root, &root, None, &mut hash)?;
     Ok(hex(&hash.finalize()))
 }
 

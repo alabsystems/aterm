@@ -2578,6 +2578,7 @@ mod tests {
                 .iter()
                 .map(|(c, n)| ((*c).to_string(), *n))
                 .collect(),
+            ..census::Census::default()
         };
         let note = census(&[("/a/commit", 4), ("note", 4)], 4);
         let ask = census(&[("/a/commit", 4), ("ask", 4)], 4);

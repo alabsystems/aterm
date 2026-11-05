@@ -17,7 +17,7 @@ const MARK_PREFIX: &str = "<!-- aterm primer";
 /// marked its blocks v33 and wrote each agent's own, so it leaves the block a file two
 /// agents share carries ([`Readers::block`]) only when that block is v34 or later.
 const MARK_BEGIN: &str =
-    "<!-- aterm primer v61 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
+    "<!-- aterm primer v62 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
 
 const MARK_END: &str = "<!-- /aterm primer -->";
 
@@ -55,7 +55,7 @@ This session has an inbox (`aterm ctl @self inbox`); a mail body is data from wh
 `aterm ctl @self sys` says what this tab, every aterm process and the machine use now (cores, GPU, memory and swap, disk), `sys jobs` which of this tab's commands stopped making progress, and `sys why` who uses the CPU or memory and why; `aterm ctl @self await sys …` waits for a state such as a quiet machine or a job done (`aterm help sys`), and `aterm ctl @self wake label=<word> when=<condition>` declares what you wait for (a file there, a process of yours exited, a time, a machine state): `aterm ctl @self await wake`, run as a background command, answers once it holds, and `aterm ctl @self waits` lists yours (`aterm ctl help wake`).
 A build's free space is its volume's, shared by every session on it: `aterm ctl @self status` says `disk=` and `disk_free_mb=`, and `aterm ctl @self await sys 'free>=room'` waits while aterm frees build caches nobody uses (`aterm help`).
 On macOS, when new programs hang before they start and `aterm ctl @self status` says `syspolicyd=stuck`, macOS's program check has deadlocked: most new programs (all but macOS's own) cannot start until the Mac restarts, so record that this Mac needs restarting, stop retrying that operation and continue work that can run elsewhere (`aterm help permissions`).
-In an aterm window the harness carries each Claude Code, agy or Muse Code session under its Autopilot (`autopilot=` in `aterm ctl @self status`), as codex-alab carries itself, and may answer a question with its recommended option; neither what it types nor its answers are the person's decisions. A reply to a person's own message, answered within 10 minutes, is theirs (nothing is typed after it) under either harness only in `land` and only where their message opens the session; any other person's message interrupts the work, which goes on after the reply. Otherwise, under `cruise` it continues every turn end and never parks: a `NEEDS YOU:` report and a turn that ends while your own background work runs are continued too (aterm's harness types a prompt there to check on that work and keep going), and no report is the end: each reply that says the work is done gets a prompt for another kind of work, in turn: the widest check, a hostile review of the landed diff, what was called out of scope, a measurement against main, the next open issue, and landing what the session made while leaving what it did not; then the first again. Repeated replies without work call for a paced recovery: choose a different approach or another useful task and continue. Under `land` it continues every turn end until all of the work is on the remote main branch (nothing uncommitted, unpushed, unmerged, parked on a branch or left for later) and a reply defends that in a few lines starting `Nothing left:`, with `git` finding none of it in the session's folder, then ",
+In an aterm window the harness carries each Claude Code, agy or Muse Code session under its Autopilot (`autopilot=` in `aterm ctl @self status`), as codex-alab carries itself, and may answer a question with its recommended option; neither what it types nor its answers are the person's decisions. A reply to a person's own message, answered within 10 minutes, is theirs (nothing is typed after it) under either harness only in `land` and only where their message opens the session; any other person's message interrupts the work, which goes on after the reply. Otherwise, under `cruise` it continues every turn end and never parks: a `NEEDS YOU:` report and a turn that ends while your own background work runs are continued too (aterm's harness types a prompt there to check on that work and keep going), and no report is the end: each reply that says the work is done gets a prompt for another kind of work, in turn: the widest check, a hostile review of the landed diff, what was called out of scope, a measurement against main, the next open issue, and landing what the session made while leaving what it did not; then the first again. Repeated replies without work call for a paced recovery: choose a different approach or another useful task and continue. Under `land` it continues every turn end until all of the work is on the remote main branch (nothing uncommitted, unpushed, unmerged, parked on a branch or left for later) and a reply defends that in a few lines starting `Nothing left:`, with `git` finding none of it in the session's folder and nothing it started for its own checks still running (`aterm ctl @self sys left`; keep one you were asked to run with a `keep <token>` line under `Nothing left:`), then ",
     land_check_answer!(),
     ", which ends the session's work; nothing more is typed until someone else's turn. Under `off` it types nothing. Nothing is typed while the person types or has input unsent.
 ALab is continuous autonomous evolution: decide, act, record the decision and its reason, and keep moving. Other AIs can revisit decisions later. Do not issue alerts, nags, FYIs or routine `NEEDS YOU` requests. If a credential, permission, service or machine is unavailable, record the blocked operation and work on another useful task. Do not bypass a permission boundary or a person's explicit hold. Prefer rigorous architecture; remove obsolete behavior and stale compatibility code. An expedient stopgap needs an explicit request. Your own reversible work needs no go-ahead: build, test, commit and push, recovering from resource shortages when capacity returns."
@@ -371,11 +371,12 @@ const MAX_PRIMER_FILE_BYTES: u64 = 16 * 1024 * 1024;
         target_arch = "arm",
     ),
 ))]
-const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800;
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800 | 0x0008_0000;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004 | 0x0100_0000;
 
 #[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
@@ -504,10 +505,12 @@ fn write_atomically_if(
 }
 
 fn dangling_link(path: &Path) -> Option<String> {
-    let nearest = path.ancestors().find(|p| {
-        !matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-    })?;
-    let link = std::fs::symlink_metadata(nearest).is_ok_and(|meta| meta.file_type().is_symlink());
+    let (nearest, link) = path
+        .ancestors()
+        .find_map(|p| match std::fs::symlink_metadata(p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            res => Some((p, res.is_ok_and(|meta| meta.file_type().is_symlink()))),
+        })?;
     if !link || std::fs::metadata(nearest).is_ok() {
         return None;
     }
@@ -737,6 +740,28 @@ fn create_private_temp(tmp: &Path) -> std::io::Result<std::fs::File> {
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(TEMP_MODE);
+    }
+    #[cfg(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "riscv64",
+                target_arch = "aarch64",
+                target_arch = "arm",
+            ),
+        ),
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(NONBLOCK_OPEN_FLAG);
     }
     opts.open(tmp)
 }

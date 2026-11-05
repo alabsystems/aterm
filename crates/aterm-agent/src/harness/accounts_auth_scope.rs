@@ -208,6 +208,11 @@ impl ManagedScope {
         }
     }
 
+    /// A word of the row's final login, which no retirement of an earlier word speaks for.
+    pub(super) fn reinstate(&mut self) {
+        self.retired = false;
+    }
+
     /// A state-only observation is of the transaction's entry login, not a later replacement.
     pub(super) fn observe_entry(&mut self) {
         let retired_at_entry = self.retired;
@@ -339,6 +344,11 @@ pub(super) fn finish(
         .filter(|event| matches!(event.kind, Kind::Renewed | Kind::SignedIn))
         .map(|event| event.account.as_str())
         .collect();
+    let written_over: BTreeSet<_> = events
+        .iter()
+        .filter(|event| event.kind == Kind::Displaced)
+        .map(|event| (event.account.as_str(), event.t))
+        .collect();
     let mut changed = false;
     for (label, account) in &mut state.accounts {
         let current = Context::of(
@@ -384,7 +394,15 @@ pub(super) fn finish(
                 logins.auth_contexts.entries.clear();
                 return Err("authentication observation no longer matches the final login; nothing recorded".into());
             }
-            account.auth_scope.retired = true;
+            // A row written over this transaction has no login: that word is of its final login,
+            // so a change to its login's description does not retire it.
+            let of_final = account.auth == Auth::SignedOut
+                && account
+                    .auth_at
+                    .is_some_and(|at| written_over.contains(&(label.as_str(), at)));
+            if !of_final {
+                account.auth_scope.retired = true;
+            }
         }
         if account.auth_scope.retired
             && let Some(binding) = logins.labels.get_mut(label)

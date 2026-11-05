@@ -12,7 +12,6 @@ use crate::{
     age::{self, Identity},
 };
 use astream_wire::sync::{Digest, MAX_PARENTS};
-use ring::signature::{ED25519, UnparsedPublicKey};
 #[cfg(unix)]
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -121,9 +120,9 @@ impl Node {
         };
         let mut signed = domain.to_vec();
         signed.extend_from_slice(&bytes[..split]);
-        UnparsedPublicKey::new(&ED25519, authority)
-            .verify(&signed, &bytes[split..])
-            .map_err(|_| Error::new("control node signature did not verify"))?;
+        if !crate::ed25519::verifies(&authority, &signed, &bytes[split..]) {
+            return Err(Error::new("control node signature did not verify"));
+        }
         let mut reader = Reader {
             bytes: &bytes[..split],
             at: 0,

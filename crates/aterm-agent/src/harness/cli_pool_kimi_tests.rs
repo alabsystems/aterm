@@ -311,7 +311,10 @@ fn published_kimi_profiles_renew_in_place_and_refuse_changed_authority_without_d
                 &host,
                 &store,
                 (row, &path, &records.logins),
-                None,
+                (
+                    None,
+                    crate::harness::sign_in_ladder::asked_fixture(Cli::Kimi, &row.label),
+                ),
                 &mut out,
                 &mut err,
             );
@@ -406,7 +409,10 @@ fn an_ambiguous_default_kimi_credential_defers_before_any_login_or_refresh() {
         &host,
         &store,
         (records.roster.row("one").unwrap(), &path, &records.logins),
-        None,
+        (
+            None,
+            crate::harness::sign_in_ladder::asked_fixture(Cli::Kimi, "one"),
+        ),
         &mut Vec::new(),
         &mut err,
     );
@@ -673,7 +679,10 @@ fn rejected_kimi_profile_reauthenticates_only_with_current_evidence_and_prerequi
                 &host,
                 &store,
                 (records.roster.row("one").unwrap(), &roster, &records.logins),
-                None,
+                (
+                    None,
+                    crate::harness::sign_in_ladder::asked_fixture(Cli::Kimi, "one"),
+                ),
                 &mut Vec::new(),
                 &mut err,
             );

@@ -298,6 +298,88 @@ pub(crate) fn read_captured(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> 
     aterm_uds::atomic_file::read_regular(path.as_ref(), u64::MAX).map(|(bytes, _)| bytes)
 }
 
+/// Write `bytes` to a fresh regular file at `path` (unlinking any existing entry first and
+/// creating exclusively with `create_new(true)`).
+pub(crate) fn write_fresh(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    opts.open(path)?.write_all(bytes.as_ref())
+}
+
+/// Copy a regular file at `from` (`O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`) to a fresh regular file
+/// at `to` (`create_new(true)` + `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`), preserving permissions.
+pub(crate) fn copy_regular_fresh(
+    from: impl AsRef<Path>,
+    to: impl AsRef<Path>,
+) -> std::io::Result<u64> {
+    let (mut reader, meta) = aterm_uds::regular_file::open(from.as_ref())?;
+    let to = to.as_ref();
+    let _ = std::fs::remove_file(to);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let mut writer = opts.open(to)?;
+    let copied = std::io::copy(&mut reader, &mut writer)?;
+    writer.set_permissions(meta.permissions())?;
+    Ok(copied)
+}
+
+/// Copy a regular file at `from` (`O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`) to a fresh regular file
+/// at `to` (`create_new(true)` + `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`), setting `mode` on the
+/// open destination descriptor.
+#[cfg(unix)]
+pub(crate) fn copy_regular_fresh_mode(
+    from: impl AsRef<Path>,
+    to: impl AsRef<Path>,
+    mode: u32,
+) -> std::io::Result<u64> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let (mut reader, _) = aterm_uds::regular_file::open(from.as_ref())?;
+    let to = to.as_ref();
+    let _ = std::fs::remove_file(to);
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(to)?;
+    let copied = std::io::copy(&mut reader, &mut writer)?;
+    writer.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    Ok(copied)
+}
+
+/// Open a fresh regular file at `path` suitable for child `Stdio` redirection (`O_NOFOLLOW | O_CLOEXEC`,
+/// without `O_NONBLOCK` so the child's stdio description stays blocking).
+pub(crate) fn create_stdio_file(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
+    let path = path.as_ref();
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    opts.open(path)
+}
+
+/// Set directory permissions using the shared descriptor/nofollow recovery operation.
+#[cfg(unix)]
+pub(crate) fn set_dir_mode_nofollow(dir: impl AsRef<Path>, mode: u32) -> std::io::Result<()> {
+    aterm_uds::private_file::set_dir_mode_nofollow(dir.as_ref(), mode)
+}
+
 impl MeasureArtifact {
     /// The bundle at `app`.
     ///
@@ -420,6 +502,10 @@ pub struct Ctx {
     pub cursor_pacing: bool,
     /// Run only the test compilation stage, never a release qualification.
     pub compile_only: bool,
+    /// The test children carry `aterm-spec/checkers` ([`stages::CHECKERS_FEATURE`]) and the test
+    /// run owes [`checks::GOLDEN`]'s test: under `release`, whose run of the suite that is, and
+    /// under `--as-release`, which compiles it or reruns it.
+    pub checkers_in_tests: bool,
     /// `--app <APP>`.
     pub measure_artifact: Option<MeasureArtifact>,
     /// Requested `--test-jobs` ceiling; [`Self::test_jobs`] applies admission.
@@ -554,6 +640,7 @@ impl Ctx {
             no_windows: false,
             cursor_pacing: false,
             compile_only: false,
+            checkers_in_tests: false,
             measure_artifact: None,
             test_jobs: testrun::DEFAULT_JOBS,
             test_threads: pinned_threads,
@@ -610,6 +697,14 @@ impl Ctx {
     #[must_use]
     pub const fn with_release(mut self, release: bool) -> Self {
         self.release = release;
+        self.checkers_in_tests = release;
+        self
+    }
+
+    /// `--as-release` ([`Ctx::checkers_in_tests`]).
+    #[must_use]
+    pub const fn with_checkers_in_tests(mut self, checkers: bool) -> Self {
+        self.checkers_in_tests = checkers;
         self
     }
 
@@ -825,7 +920,12 @@ impl Ctx {
         }
     }
 
-    /// The command that reruns `check` alone over this run's selection.
+    /// The command that reruns `check` over this run's selection, as this run ran it: a release's
+    /// `test` and `doc` rows name `--as-release`, without which they carry no
+    /// [`stages::CHECKERS_FEATURE`] and `test` owes no [`checks::GOLDEN`] test, so would pass what
+    /// failed. A cone's `lint` row names the cone's base: `-p` over its crates would lint every
+    /// target of each and the crates it left out ([`stages::tippy_passes`]). A lint rerun pulls
+    /// `cells` as any dev lint does ([`checks::pulls_cells`]).
     #[must_use]
     pub fn rerun(&self, check: Check) -> String {
         let mut cmd = format!("targo --unverified verify {}", check.name());
@@ -833,6 +933,10 @@ impl Ctx {
             match &self.scope {
                 Scope::Workspace => cmd.push_str(" --all"),
                 s if s.selects_nothing() => {}
+                Scope::Changed(cone) if check == Check::Lint => {
+                    cmd.push_str(" --base ");
+                    cmd.push_str(&cone.base);
+                }
                 s => {
                     for c in s.crates() {
                         cmd.push_str(" -p ");
@@ -846,6 +950,9 @@ impl Ctx {
         }
         if self.compile_only && matches!(check, Check::Test | Check::Checkers) {
             cmd.push_str(" --compile-only");
+        }
+        if self.checkers_in_tests && matches!(check, Check::Test | Check::Doc) {
+            cmd.push_str(" --as-release");
         }
         if self.no_windows && check.spec().stages.iter().any(|id| id.opens_windows()) {
             cmd.push_str(" --no-windows");
@@ -1066,6 +1173,15 @@ pub(crate) fn admission(
 ) -> String {
     let bound = claim.record().need.quiet.unwrap_or_default();
     if claim.record().need.quiet_policy == aterm_capacity::QuietPolicy::Timing {
+        if let Ok(aterm_capacity::Protection::Loaded(observed)) = claim.timing_protection() {
+            return format!(
+                "{} loaded timing reservation after {}: {}; ran without a qualified quiet \
+                 admission (stated, not a finding: a busy machine never blocks a release)",
+                if first { "acquired" } else { "retained" },
+                aterm_capacity::span(claim.waited()),
+                aterm_capacity::Unqualified::Admission(observed),
+            );
+        }
         let evidence = claim.record().timing;
         return evidence.admission.map_or_else(
             || "timing reservation with unknown admission CPU; no measurement qualification".into(),
@@ -1095,8 +1211,10 @@ pub(crate) fn admission(
 /// Run a timed stage on the run's quiet machine ([`Quiet`]): the first one's claim is admitted
 /// before it starts, waiting for the load within its patience ([`aterm_capacity::QUIET_PATIENCE`])
 /// and saying once a minute what it waits for, and let go when the last one's `f` and any bounded
-/// worker it left running end. Unavailable, forced or expired timing admission starts no
-/// callback. A later stage replaces an expired cached reservation through fresh admission;
+/// worker it left running end. A machine that stays busy through that patience admits it loaded
+/// ([`aterm_capacity::AtBound::RunLoaded`]): the stage runs and its time line says so (owner
+/// ruling 2026-11-05: a busy machine never blocks a release). Unavailable, blind, forced or
+/// expired timing admission starts no callback. A later stage replaces an expired cached reservation through fresh admission;
 /// existing stage and bounded-worker shares retain ownership of their original claim record,
 /// without extending its expired protection.
 /// Measurement collectors establish their own fresh entry after compilation;
@@ -1120,7 +1238,7 @@ fn quietly<T>(
         quiet,
         title,
         f,
-        aterm_capacity::Claim::timing_admission,
+        aterm_capacity::Claim::timing_protection,
         |q, need, mode| (q.admit)(need, mode),
     )
 }
@@ -1132,7 +1250,7 @@ fn quietly_with<T>(
     f: impl FnOnce() -> T,
     check: impl Fn(
         &aterm_capacity::Claim,
-    ) -> Result<aterm_capacity::CpuWindow, aterm_capacity::TimingIssue>,
+    ) -> Result<aterm_capacity::Protection, aterm_capacity::TimingIssue>,
     mut admit: impl FnMut(
         &Quiet,
         aterm_capacity::Need,
@@ -1173,7 +1291,9 @@ fn quietly_with<T>(
             }
             None => match admit(
                 &q,
-                aterm_capacity::Need::timing(format!("verify {title}")).ends_when_stuck(STUCK_ENDS),
+                aterm_capacity::Need::timing(format!("verify {title}"))
+                    .runs_loaded()
+                    .ends_when_stuck(STUCK_ENDS),
                 mode,
             ) {
                 Ok(claim) => {
@@ -1762,7 +1882,9 @@ fn run_with(
                         _ => 0.0,
                     };
                     let mine: Vec<&Report> = p.reports.iter().flatten().collect();
-                    let scope = if check.reads(&ctx.scope) {
+                    let scope = if check == Check::Lint {
+                        ctx.scope.lint_label()
+                    } else if check.reads(&ctx.scope) {
                         ctx.scope.label()
                     } else {
                         String::new()
@@ -1945,7 +2067,25 @@ fn open_log(chosen: Option<&Path>, cwd: &Path, ctx: &Ctx) -> Option<(PathBuf, st
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::File::create(&path) {
+    let open = (|| -> std::io::Result<std::fs::File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let f = opts.open(&path)?;
+        if !f.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        f.set_len(0)?;
+        Ok(f)
+    })();
+    match open {
         Ok(f) => Some((path, f)),
         Err(e) => {
             eprintln!("verify: cannot write the run log {}: {e}", path.display());
@@ -2134,7 +2274,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         let (scope, said) = changed::cone(&base, &sel);
         (scope, Some(said))
     };
-    let wanted = checks::with_pulled(&parsed.checks, parsed.release, |p| scope.includes_crate(p));
+    let wanted = parsed.wanted(|p| scope.includes_crate(p));
     let cells_pulled = checks::pulls_cells(&wanted, parsed.release, !scope.selects_nothing());
     let wanted = if cells_pulled {
         checks::with(&wanted, Check::Cells)
@@ -2144,6 +2284,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     let ctx = Ctx::new_with_tools(root, scope, env, scratch.clone(), tools)
         .with_checks(&wanted)
         .with_release(parsed.release)
+        .with_checkers_in_tests(parsed.release || parsed.as_release)
         .with_fix(parsed.fix)
         .with_cells(parsed.cells.clone())
         .with_cells_pulled(cells_pulled)
@@ -2207,17 +2348,25 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         }
     };
     #[cfg(unix)]
-    let_disk_go(disk, log_file.as_mut());
+    let_disk_go(disk, code == exit::PASS, log_file.as_mut());
     end_run(&ctx, &scratch);
     code
 }
 
 /// Let the run's disk claim `held` go, saying in `log` what it claimed and what the run grew:
-/// what it took kept for the next run of its scope (`atpkg::admit_disk::Admitted::finish`),
-/// unless an interrupt ended the run ([`stopping`]), which stopped short of its work and so wrote
-/// less than a run of its scope writes (`atpkg::admit_disk::Admitted::abandon`).
+/// what it took kept for the next run of its scope on its directories and, where it `passed`, in
+/// this machine's record for every checkout (`atpkg::admit_disk::Admitted::finish_whole`; a run
+/// that failed may have stopped short of what its scope writes, so it is kept for its own
+/// directories alone, `atpkg::admit_disk::Admitted::finish_here`), unless an interrupt ended the
+/// run ([`stopping`]), which stopped short of its work and so wrote less than a run of its scope
+/// writes (`atpkg::admit_disk::Admitted::abandon`). The line says which records took it
+/// ([`kept_line`]).
 #[cfg(unix)]
-fn let_disk_go(held: Option<atpkg::admit_disk::Admitted>, log: Option<&mut std::fs::File>) {
+fn let_disk_go(
+    held: Option<atpkg::admit_disk::Admitted>,
+    passed: bool,
+    log: Option<&mut std::fs::File>,
+) {
     let Some(held) = held else {
         return;
     };
@@ -2225,10 +2374,16 @@ fn let_disk_go(held: Option<atpkg::admit_disk::Admitted>, log: Option<&mut std::
     let (took, kept) = if stopping() {
         (
             held.abandon(),
-            "; the run was interrupted, so that is not kept for its scope",
+            "; the run was interrupted, so that is not kept for its scope".to_owned(),
         )
     } else {
-        (held.finish(), "")
+        let done = if passed {
+            held.finish_whole()
+        } else {
+            held.finish_here()
+        };
+        let kept = kept_line(passed, &done);
+        (done.run, kept)
     };
     let line = format!(
         "disk: claimed {claimed}; this run grew its directories by {} (they held {} at most){kept}",
@@ -2236,6 +2391,30 @@ fn let_disk_go(held: Option<atpkg::admit_disk::Admitted>, log: Option<&mut std::
         atpkg::admit_disk::size(took.peak)
     );
     let _ = log.map(|f| writeln!(f, "{line}"));
+}
+
+/// What a finished run's disk line says it kept (`let_disk_go`): which of the record beside its
+/// directories and the machine's record for its other checkouts took it, and why the second did
+/// not where it did not.
+#[cfg(unix)]
+fn kept_line(passed: bool, done: &atpkg::admit_disk::Finished) -> String {
+    let here = match &done.here {
+        Ok(()) => "; kept for its scope here".to_owned(),
+        Err(e) => format!("; not kept for its scope here: its record could not be written ({e})"),
+    };
+    let machine = match &done.machine {
+        _ if !passed => "; it did not pass, so not for this machine's other checkouts".to_owned(),
+        Some(Ok(())) => "; kept for this machine's other checkouts".to_owned(),
+        Some(Err(e)) => {
+            format!(
+                "; not kept for this machine's other checkouts: its record could not be written ({e})"
+            )
+        }
+        None => "; not kept for this machine's other checkouts: this run keeps no record of them \
+                 (no account state directory, or a build directory verify does not place)"
+            .to_owned(),
+    };
+    format!("{here}{machine}")
 }
 
 /// The end of a run that has reported ([`run_with`]) and let its disk claim go (`let_disk_go`):
@@ -2307,8 +2486,17 @@ pub fn standin(path: &Path, body: &str) {
     {
         return;
     }
-    std::fs::write(path, &text).expect("write");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .expect("open");
+    file.write_all(text.as_bytes()).expect("write");
+    file.set_permissions(std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
 }
 
 /// [`standin`] for a body that varies.
@@ -2334,7 +2522,7 @@ pub fn standin_body(path: &Path, body: &str) {
         SERIAL.fetch_add(1, Ordering::Relaxed)
     ));
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, format!("{body}\n")).expect("write the stand-in's body");
+    write_fresh(&tmp, format!("{body}\n")).expect("write the stand-in's body");
     std::fs::rename(&tmp, &data).expect("rename the stand-in's body into place");
     standin(path, r#". "$0.body""#);
 }
@@ -2354,7 +2542,7 @@ pub fn find_on_path(name: &OsStr, path: &OsStr) -> Option<PathBuf> {
 }
 
 /// aterm's directories in this user's cache ([`aterm_uds::host::user_cache`]) on [`host_user_cache`].
-pub use aterm_uds::host::{host_user_cache, user_cache};
+pub use aterm_uds::host::host_user_cache;
 
 #[cfg(all(test, unix))]
 mod quiet_interrupt_tests;
@@ -2374,6 +2562,31 @@ mod memory_claim_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_permission_changes_refuse_links_and_regular_files() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let directory = root.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        set_dir_mode_nofollow(&directory, 0o700).unwrap();
+        let link = root.path().join("link");
+        symlink(&directory, &link).unwrap();
+        assert!(set_dir_mode_nofollow(&link, 0o777).is_err());
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        let file = root.path().join("file");
+        std::fs::write(&file, b"untouched").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(set_dir_mode_nofollow(&file, 0o777).is_err());
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
 
     /// A child's captured output past the cap on the files verify reads is read whole (a sparse
     /// file, so the test writes no 128 MiB to disk).
@@ -2516,6 +2729,9 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
+            // Each stand-in driver prints its sysroot and exits, so its answer must come: the
+            // discovery's probes of them wait on the hang detector, not the product's 5 s.
+            toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
             let runnable = |path: &Path, body: &str| {
                 std::fs::create_dir_all(path.parent().expect("bin")).expect("mkdir");
                 std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write");

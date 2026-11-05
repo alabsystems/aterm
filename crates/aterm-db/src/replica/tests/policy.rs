@@ -129,6 +129,280 @@ fn vault_read_spans_session_admission_and_ends_with_the_local_batch() {
     );
 }
 
+/// Another of this Mac's rounds ingesting into `p`'s first table: a writer's commit, which overtakes
+/// an observer of that table it lands inside.
+fn overtaking_ingest(p: &Pair) -> impl Fn() + 'static {
+    let (bootstrap, path, scope) = (p.lab.bootstrap(0), p.paths[0].clone(), p.scope);
+    move || {
+        let writer = Session::open(&bootstrap).unwrap();
+        Store::open(&writer, &path, scope)
+            .unwrap()
+            .commit_catalog(&writer, b"overtaking-ingest")
+            .unwrap();
+    }
+}
+
+/// A read that another of this Mac's rounds overtakes with an ingest is read afresh, not refused:
+/// its observer sees the witness advance, and the next read holds the new operation.
+///
+/// NEGATIVE CONTROL: with `LOCAL_READS` at 1, the first read's refusal comes back and the round
+/// is lost, as it was for both its peers.
+#[test]
+fn a_round_reads_afresh_when_another_rounds_ingest_overtakes_its_read() {
+    let p = Pair::new(false, 1);
+    let replica = p.replica(0);
+    let peer = p.lab.bootstrap(1).request().unwrap().binding().actor();
+    let round = replica.round(peer).unwrap();
+    let overtake = overtaking_ingest(&p);
+
+    let mut reads = 0;
+    let known = round
+        .local(peer, |session| {
+            reads += 1;
+            let store = Store::observe(session, &p.paths[0], p.scope)?;
+            if reads == 1 {
+                overtake();
+            }
+            Ok(store.inventory(session)?.count())
+        })
+        .unwrap();
+    assert_eq!((reads, known), (2, 2));
+
+    // A table that never stops advancing ends the reads.
+    let mut reads = 0;
+    let kept_advancing = round.local(peer, |session| {
+        reads += 1;
+        let store = Store::observe(session, &p.paths[0], p.scope)?;
+        overtake();
+        Ok(store.inventory(session)?.count())
+    });
+    assert_eq!(reads, LOCAL_READS);
+    assert!(kept_advancing.unwrap_err().is_snapshot_changed());
+
+    // Any other refusal is the read's answer at once.
+    let mut reads = 0;
+    let busy = round.local(peer, |_| -> Result<()> {
+        reads += 1;
+        Err(Error::busy())
+    });
+    assert_eq!(reads, 1);
+    assert!(busy.unwrap_err().is_busy());
+    let (mut refusal, mut cause) = (None, None);
+    assert!(Round::table_read::<()>(Err(Error::busy()), &mut refusal, &mut cause).is_err());
+    assert_eq!((refusal, cause), (None, None));
+}
+
+/// A conflict proof of `p`'s table by its second writer, which its first holds none of.
+fn conflict_proof(p: &Pair) -> Vec<u8> {
+    let author = p.lab.bootstrap(1);
+    let session = Session::open(&author).unwrap();
+    let mut store = Store::open(&session, &p.paths[1], p.scope).unwrap();
+    let receipt = store.commit_catalog(&session, b"proof source").unwrap();
+    let first = store.wire(&session, &receipt.id).unwrap().unwrap();
+    let mut second = first.to_vec();
+    let end = second.len() - 64;
+    second[end - 1] ^= 1;
+    crate::table::tests::resign(&author, &mut second);
+    crate::table::conflict::Conflict::from_pair(&session, p.scope, first, &second)
+        .unwrap()
+        .wire()
+        .to_vec()
+}
+
+/// A peer's bytes for a [`Stream`]: its inventory, available and holding nothing.
+const EMPTY_INVENTORY: [u8; 5] = [1, 0, 0, 0, 0];
+
+/// `Round::inventory` and `Round::conflicts` overtaken inside their store's open: the store's last
+/// check is what refuses, and the round reads afresh. A table that keeps advancing through every
+/// read defers, with the cause a store this side cannot read now has, and tells the peer so.
+///
+/// NEGATIVE CONTROL: without the `is_snapshot_changed` arm in `Round::inventory` or
+/// `Round::conflicts`, the first overtaken open is the read's refusal and the round defers on it,
+/// as the islands test's round did; without their `table_read`, a table that keeps advancing
+/// costs both peers the round.
+#[test]
+fn a_rounds_table_reads_take_a_fresh_read_when_overtaken_and_defer_when_it_keeps_advancing() {
+    use crate::table::store::{with_each_replay_observed, with_replay_observer};
+    use aterm_types::network_state::RepairCause;
+
+    let p = Pair::new(false, 1);
+    let proof = conflict_proof(&p);
+    let replica = p.replica(0);
+    let peer = p.lab.bootstrap(1).request().unwrap().binding().actor();
+    let round = replica.round(peer).unwrap();
+    let id = p.scope.digest();
+
+    let (mut refusal, mut cause) = (None, None);
+    let inventory = with_replay_observer(overtaking_ingest(&p), || {
+        round.inventory(peer, id, &mut refusal, &mut cause)
+    })
+    .unwrap();
+    assert_eq!((refusal, cause), (None, None));
+    assert_eq!(
+        inventory
+            .expect("an overtaken read is read afresh")
+            .known
+            .len(),
+        2,
+        "the fresh read holds the overtaking operation"
+    );
+
+    let overtake = {
+        let (bootstrap, path, scope) = (p.lab.bootstrap(0), p.paths[0].clone(), p.scope);
+        let proof = proof.clone();
+        move || {
+            let writer = Session::open(&bootstrap).unwrap();
+            Store::open(&writer, &path, scope)
+                .unwrap()
+                .ingest_conflict(&writer, &proof)
+                .unwrap();
+        }
+    };
+    let mut incoming = EMPTY_INVENTORY.to_vec();
+    incoming.extend(0u32.to_le_bytes());
+    incoming.extend(Sha256::digest(&proof));
+    incoming.push(1);
+    let mut stream = Stream {
+        input: Cursor::new(incoming),
+        output: Vec::new(),
+    };
+    let (mut repair, mut report) = (Repair::default(), Report::default());
+    let went_on = with_replay_observer(overtake, || {
+        round.conflicts(
+            &mut stream,
+            peer,
+            Side::Responder,
+            id,
+            &mut repair,
+            &mut report,
+        )
+    })
+    .unwrap();
+    assert!(went_on);
+    assert_eq!(repair.deferral, None);
+    assert_eq!(
+        (report.deferred, report.conflicts_sent),
+        (0, 1),
+        "the fresh read holds the overtaking proof, which the peer lacked"
+    );
+
+    let (mut refusal, mut cause) = (None, None);
+    let inventory = with_each_replay_observed(overtaking_ingest(&p), || {
+        round.inventory(peer, id, &mut refusal, &mut cause)
+    })
+    .unwrap();
+    assert!(inventory.is_none());
+    assert!(refusal.unwrap().contains("reopen and verify"));
+    assert_eq!(cause, Some(RepairCause::NotReady));
+
+    let mut stream = Stream {
+        input: Cursor::new(EMPTY_INVENTORY.to_vec()),
+        output: Vec::new(),
+    };
+    let (mut repair, mut report) = (Repair::default(), Report::default());
+    let went_on = with_each_replay_observed(overtaking_ingest(&p), || {
+        round.conflicts(
+            &mut stream,
+            peer,
+            Side::Responder,
+            id,
+            &mut repair,
+            &mut report,
+        )
+    })
+    .unwrap();
+    assert!(!went_on);
+    let why = repair.deferral.unwrap();
+    assert_eq!(why.inventory, "conflicts");
+    assert_eq!(why.local_cause, Some(RepairCause::NotReady));
+    assert!(!why.retaining_primary_conflicts && !why.peer_unavailable);
+    assert_eq!(report.deferred, 1);
+    assert_eq!(
+        stream.output,
+        [0],
+        "the peer hears the inventory is unavailable"
+    );
+}
+
+/// A table that keeps advancing through every read of an outgoing batch fails the round, with
+/// nothing on the wire, rather than sending the empty batch `receive_batch` would accept: a peer's
+/// round that hears an inventory holding what it lacks and then an empty batch reads as having
+/// left nothing to fetch, which the second half shows.
+///
+/// NEGATIVE CONTROL: with `send_batch` sending an empty batch on this refusal, the first half
+/// fails. With `drained_table` no longer believing an empty batch, the second half fails, and the
+/// sender could defer.
+#[test]
+fn a_batch_its_sender_cannot_read_fails_the_round_since_an_empty_one_says_nothing_is_left() {
+    use crate::table::store::with_each_replay_observed;
+
+    let p = Pair::new(false, 1);
+    let source = p.lab.bootstrap(0);
+    let session = Session::observe(&source).unwrap();
+    let sender = session.actor();
+    let held: Vec<Digest> = Store::observe(&session, &p.paths[0], p.scope)
+        .unwrap()
+        .inventory(&session)
+        .unwrap()
+        .copied()
+        .collect();
+    drop(session);
+    let id = p.scope.digest();
+    let receiver_actor = p.lab.bootstrap(1).request().unwrap().binding().actor();
+    let replica = p.replica(0);
+    let round = replica.round(receiver_actor).unwrap();
+
+    let mut stream = Stream::default();
+    let mut report = Report::default();
+    let refused = with_each_replay_observed(overtaking_ingest(&p), || {
+        round.send_batch(
+            &mut stream,
+            receiver_actor,
+            |session| {
+                round.prepare_batch(session, id, &held, |session, store, key| {
+                    Ok(store.wire(session, key)?.unwrap().to_vec())
+                })
+            },
+            BatchKind::Operation,
+            &mut report,
+        )
+    });
+    assert!(refused.unwrap_err().is_snapshot_changed());
+    assert!(stream.output.is_empty(), "no batch said nothing is left");
+
+    let mut incoming = EMPTY_INVENTORY.to_vec();
+    incoming.extend(0u32.to_le_bytes());
+    incoming.push(1);
+    incoming.extend(u32::try_from(held.len()).unwrap().to_le_bytes());
+    incoming.extend(held.concat());
+    incoming.extend(0u32.to_le_bytes());
+    let mut stream = Stream {
+        input: Cursor::new(incoming),
+        output: Vec::new(),
+    };
+    let replica = p.replica(1);
+    let round = replica.round(sender).unwrap();
+    let mut report = Report {
+        table: Some(id),
+        ..Report::default()
+    };
+    round
+        .table(
+            &mut stream,
+            sender,
+            Side::Responder,
+            id,
+            &mut Repair::default(),
+            &mut report,
+        )
+        .unwrap();
+    assert_eq!(p.count(1), 0, "the peer still lacks what the sender holds");
+    assert_eq!(
+        crate::runtime::RepairRound::completed_with(report).drained_table(),
+        Some(id)
+    );
+}
+
 #[test]
 fn policy_changes_before_session_open_refuse_the_old_round() {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
@@ -394,11 +668,25 @@ fn scenario(policy: i64, receiving: bool, point: u8) -> [(i64, i64, i64); 3] {
     [first, retry, restored]
 }
 
+/// Whether a fixture selection's real run is walked: half of them, so that each of the 8 policies
+/// meets both directions and both session boundaries. The direction and the point only choose the
+/// entry to `Round::admit` and which boundary carries the fault, and both reach the same
+/// `check_table_policy`; `outbound_policy_is_rechecked_after_preparing_payload` holds the send-only
+/// recheck. GAP: a defect specific to one policy, one direction and one boundary together is not
+/// seen for the other 16 selections.
+const fn walked(policy: i64, receiving: bool, point: u8) -> bool {
+    (policy + receiving as i64 + point as i64) % 2 == 0
+}
+
 /// [`scenario`] once per fixture selection: Attempt, Retry and Restore read the three
 /// phases of one real run, so a selection runs once, not once per phase.
 fn scenario_once(policy: i64, receiving: bool, point: u8) -> [(i64, i64, i64); 3] {
     type Runs = BTreeMap<(i64, bool, u8), [(i64, i64, i64); 3]>;
     static RUNS: std::sync::Mutex<Runs> = std::sync::Mutex::new(BTreeMap::new());
+    assert!(
+        walked(policy, receiving, point),
+        "a selection outside the walk would run a Lab the test does not count"
+    );
     let key = (policy, receiving, point);
     if let Some(run) = RUNS.lock().unwrap().get(&key) {
         return *run;
@@ -449,24 +737,33 @@ fn policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected() 
         model.actions.len()
     );
     let states = aterm_spec::interp::reachable_states(&model);
-    // Every selection's real run, each on its own Lab, on the lane's places.
-    let selections: Vec<_> = states
+    let selection = |state: &aterm_spec::interp::State| {
+        (
+            state["policy"],
+            state["receiving"] == 1,
+            state["point"] as u8,
+        )
+    };
+    // Each walked selection's real run, each on its own Lab, on the lane's places. A new policy or
+    // fixture axis moves these counts.
+    let selections: BTreeSet<_> = states.iter().map(selection).collect();
+    let run: Vec<_> = selections
         .iter()
-        .map(|state| {
-            (
-                state["policy"],
-                state["receiving"] == 1,
-                state["point"] as u8,
-            )
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
+        .copied()
+        .filter(|&(policy, receiving, point)| walked(policy, receiving, point))
         .collect();
-    aterm_spec::fs_lane::each(&selections, |&(policy, receiving, point)| {
+    assert_eq!((selections.len(), run.len()), (32, 16));
+    aterm_spec::fs_lane::each(&run, |&(policy, receiving, point)| {
         scenario_once(policy, receiving, point)
     });
     for state in states {
+        let (policy, receiving, point) = selection(&state);
         for action in &model.actions {
+            if matches!(action.name, "Attempt" | "Retry" | "Restore")
+                && !walked(policy, receiving, point)
+            {
+                continue;
+            }
             if model.action_enabled(action.name, &state) {
                 let next = policy_transition(&state, action.name);
                 let successors = model.successors(action.name, &state);
@@ -487,6 +784,7 @@ fn policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected() 
     }
     let mut changed = model.init_state();
     changed.insert("policy", 3);
+    changed.insert("point", 1);
     let mut forged = policy_transition(&changed, "Attempt");
     forged.insert("accepted", 1);
     assert!(!model.successors("Attempt", &changed).contains(&forged));

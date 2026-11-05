@@ -66,15 +66,40 @@ if [ "${1:-}" = "--real" ]; then
 fi
 "#;
 
+enum AbrewSlot {
+    Stub(Vec<u8>),
+    Missing,
+    Foreign,
+}
+
+fn classify_abrew_slot(path: &Path) -> AbrewSlot {
+    match crate::metadata_io::read_bounded_regular(path, 16 * 1024) {
+        Ok(bytes)
+            if String::from_utf8_lossy(&bytes)
+                .lines()
+                .take(3)
+                .any(|l| matches!(l.trim(), STUB_MARKER | LEGACY_STUB_MARKER)) =>
+        {
+            AbrewSlot::Stub(bytes)
+        }
+        Ok(_) => AbrewSlot::Foreign,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => AbrewSlot::Missing,
+        Err(_) if std::fs::symlink_metadata(path).is_ok() => AbrewSlot::Foreign,
+        Err(_) => AbrewSlot::Missing,
+    }
+}
+
+fn read_abrew_stub(path: &Path) -> Option<Vec<u8>> {
+    match classify_abrew_slot(path) {
+        AbrewSlot::Stub(bytes) => Some(bytes),
+        AbrewSlot::Missing | AbrewSlot::Foreign => None,
+    }
+}
+
 /// Whether the file at `path` is an abrew stub (by its marker line).
 #[must_use]
 pub fn is_abrew_stub(path: &Path) -> bool {
-    crate::metadata_io::read_bounded_regular(path, 16 * 1024).is_ok_and(|b| {
-        String::from_utf8_lossy(&b)
-            .lines()
-            .take(3)
-            .any(|l| matches!(l.trim(), STUB_MARKER | LEGACY_STUB_MARKER))
-    })
+    read_abrew_stub(path).is_some()
 }
 
 /// Lay or refresh the stub for a layout (never over a foreign file).
@@ -115,25 +140,20 @@ fn plan(layout: &Layout, embedder: &crate::stub::Embedder) -> Plan {
         return Plan::Nothing;
     }
     let path = stub_path(layout);
-    let standing = is_abrew_stub(&path)
-        .then(|| crate::metadata_io::read_bounded_regular_utf8(&path, 16 * 1024).ok())
-        .flatten()
-        .and_then(|body| crate::stub::sh_named_atpkg(&body, "ATPKG"));
+    let slot = classify_abrew_slot(&path);
+    let standing = match &slot {
+        AbrewSlot::Stub(bytes) => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|body| crate::stub::sh_named_atpkg(body, "ATPKG")),
+        AbrewSlot::Missing | AbrewSlot::Foreign => None,
+    };
     let offered = embedder.embed(standing.as_deref());
     let atpkg = crate::stub::named(offered.as_deref());
     let body = stub_body(atpkg);
-    match std::fs::symlink_metadata(&path) {
-        Err(_) => Plan::Lay(path, body),
-        Ok(_) if is_abrew_stub(&path) => {
-            if crate::metadata_io::read_bounded_regular(&path, 16 * 1024)
-                .is_ok_and(|have| have == body.as_bytes())
-            {
-                Plan::Nothing
-            } else {
-                Plan::Lay(path, body)
-            }
-        }
-        Ok(_) => Plan::Nothing, // foreign: never touched
+    match slot {
+        AbrewSlot::Stub(have) if have == body.as_bytes() => Plan::Nothing,
+        AbrewSlot::Stub(_) | AbrewSlot::Missing => Plan::Lay(path, body),
+        AbrewSlot::Foreign => Plan::Nothing, // foreign: never touched
     }
 }
 
@@ -156,9 +176,10 @@ fn doctor_row_with(
     use crate::doctor::{Level, Row};
     use aterm_converge::Class;
     let path = stub_path(layout);
+    let slot = classify_abrew_slot(&path);
     let row = |level, text| (Row { level, text }, Class::Relay);
-    if is_abrew_stub(&path)
-        && crate::metadata_io::read_bounded_regular_utf8(&path, 16 * 1024).is_ok_and(|body| {
+    if let AbrewSlot::Stub(bytes) = &slot
+        && std::str::from_utf8(bytes).ok().is_some_and(|body| {
             body.lines()
                 .take(3)
                 .any(|line| line.trim() == LEGACY_STUB_MARKER)
@@ -182,29 +203,29 @@ fn doctor_row_with(
             "abrew off (`abrew on` re-enables); brew never falls back to Homebrew".to_string(),
         );
     }
-    if is_abrew_stub(&path) {
-        let body =
-            crate::metadata_io::read_bounded_regular_utf8(&path, 16 * 1024).unwrap_or_default();
-        if !body.lines().take(3).any(|line| line.trim() == STUB_MARKER) {
-            return row(
-                Level::Warn,
-                "reroute stub brew needs native-only refresh; run aterm pkg repair".to_string(),
-            );
+    match slot {
+        AbrewSlot::Stub(bytes) => {
+            let body = std::str::from_utf8(&bytes).unwrap_or_default();
+            if !body.lines().take(3).any(|line| line.trim() == STUB_MARKER) {
+                return row(
+                    Level::Warn,
+                    "reroute stub brew needs native-only refresh; run aterm pkg repair".to_string(),
+                );
+            }
+            let live = stub_names_live_atpkg(body);
+            if live {
+                row(
+                    Level::Ok,
+                    "reroute stub brew laid (native atpkg only)".to_string(),
+                )
+            } else {
+                row(
+                    Level::Warn,
+                    "reroute stub brew names no live atpkg; brew refuses commands until aterm pkg repair re-lays it".to_string(),
+                )
+            }
         }
-        let live = stub_names_live_atpkg(&body);
-        if live {
-            row(
-                Level::Ok,
-                "reroute stub brew laid (native atpkg only)".to_string(),
-            )
-        } else {
-            row(
-                Level::Warn,
-                "reroute stub brew names no live atpkg; brew refuses commands until aterm pkg repair re-lays it".to_string(),
-            )
-        }
-    } else if std::fs::symlink_metadata(&path).is_ok() {
-        (
+        AbrewSlot::Foreign => (
             Row {
                 level: Level::Warn,
                 text: format!(
@@ -213,13 +234,12 @@ fn doctor_row_with(
                 ),
             },
             Class::Person,
-        )
-    } else {
-        row(
+        ),
+        AbrewSlot::Missing => row(
             Level::Warn,
             "reroute stub brew missing; the next aterm session lays it — now: aterm pkg repair"
                 .to_string(),
-        )
+        ),
     }
 }
 

@@ -21,6 +21,19 @@ pub const HOLD: Duration = Duration::from_secs(10);
 /// When the warm's process group is killed, counted from its start.
 pub const DEADLINE: Duration = Duration::from_secs(30);
 
+/// TEST SEAM ([`aterm_types::dev_seam!`]): a count of milliseconds that [`run_hidden`]'s waits
+/// (its [`DEADLINE`], its login shell's budget and that read's grace) each last at least, so a
+/// test whose program and login shell must answer waits out only its hang detector on a loaded
+/// machine.
+pub const WAITS_AT_LEAST_ENV: &str = "ATPKG_WARM_WAITS_AT_LEAST_MS";
+
+/// [`WAITS_AT_LEAST_ENV`] as a debug build was given it, else zero.
+fn waits_at_least() -> Duration {
+    aterm_types::dev_seam!(WAITS_AT_LEAST_ENV)
+        .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+        .map_or(Duration::ZERO, Duration::from_millis)
+}
+
 const POLL: Duration = Duration::from_millis(50);
 
 /// Warm each of `programs`.
@@ -168,13 +181,14 @@ pub fn run_hidden(rest: &[OsString]) -> ExitCode {
     if let Some(request) = Request::parse(rest).filter(|_| !running_as_root()) {
         let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
         let home = aterm_types::dirs::home_dir();
+        let floor = waits_at_least();
         let _ = warm(
             &request,
             &inherited,
-            login_shell_env,
+            || login_shell_env(floor),
             home.as_deref(),
             HOLD,
-            DEADLINE,
+            DEADLINE.max(floor),
         );
     }
     ExitCode::SUCCESS
@@ -228,9 +242,10 @@ const ASKED_MARK: &str = "ATPKG_WARM_ASKED";
 /// The person's login shell's environment ([`persons_setup`]): `<shell> -l -i -c
 /// '/usr/bin/env -0 ATPKG_WARM_ASKED=1'` — the shell [`login_shell`] picks — in a session
 /// of its own (no controlling terminal for `-i` to take; its id is the group the budget
-/// kills), its stdin and stderr `/dev/null`.
+/// kills), its stdin and stderr `/dev/null`. [`LOGIN_BUDGET`] and [`LOGIN_GRACE`] each last
+/// at least `floor`.
 #[cfg(unix)]
-fn login_shell_env() -> Option<Vec<(OsString, OsString)>> {
+fn login_shell_env(floor: Duration) -> Option<Vec<(OsString, OsString)>> {
     use std::io::Read as _;
     let shell = login_shell(std::env::var_os("SHELL"))?;
     let mut child = aterm_uds::spawnfd::command(&shell)
@@ -259,7 +274,7 @@ fn login_shell_env() -> Option<Vec<(OsString, OsString)>> {
             }
         }
     });
-    let deadline = std::time::Instant::now() + LOGIN_BUDGET;
+    let deadline = std::time::Instant::now() + LOGIN_BUDGET.max(floor);
     let answered = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
@@ -275,7 +290,7 @@ fn login_shell_env() -> Option<Vec<(OsString, OsString)>> {
     if !answered {
         return None;
     }
-    let stop = deadline.max(std::time::Instant::now()) + LOGIN_GRACE;
+    let stop = deadline.max(std::time::Instant::now()) + LOGIN_GRACE.max(floor);
     let mut out = Vec::new();
     while let Ok(chunk) =
         chunks.recv_timeout(stop.saturating_duration_since(std::time::Instant::now()))
@@ -292,7 +307,7 @@ fn login_shell_env() -> Option<Vec<(OsString, OsString)>> {
 
 /// No login shell to ask off Unix, where no warm is started ([`spawn_landed`]).
 #[cfg(not(unix))]
-fn login_shell_env() -> Option<Vec<(OsString, OsString)>> {
+fn login_shell_env(_floor: Duration) -> Option<Vec<(OsString, OsString)>> {
     None
 }
 
@@ -420,7 +435,7 @@ fn warm_with_launch(
         prefix: request.prefix.clone(),
     };
     let program = request.spec.program;
-    if crate::active_builds(&layout).get(program) != Some(&request.build) {
+    if crate::active_build_of(&layout, program) != Some(request.build) {
         return None;
     }
     let tool = ToolName::new(program)?;

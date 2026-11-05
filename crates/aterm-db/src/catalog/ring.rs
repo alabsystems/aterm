@@ -290,16 +290,17 @@ const FLOOR_LEN: usize = FLOOR_MAGIC.len() + 8;
 impl Ring {
     /// The table of period `epoch`: a deterministic identity in its own domain, at generation 1.
     pub(crate) fn scope(&self, trust: Trust, epoch: u64) -> Result<Scope> {
-        let mut bytes = DOMAIN.to_vec();
-        bytes.extend_from_slice(&trust.network);
-        bytes.extend_from_slice(&trust.authority);
-        bytes.extend_from_slice(&trust.genesis);
+        let mut sha = aterm_digest::Sha256::new();
+        sha.update(DOMAIN);
+        sha.update(trust.network);
+        sha.update(trust.authority);
+        sha.update(trust.genesis);
         for word in [self.application, self.role] {
-            bytes.extend_from_slice(&(word.len() as u64).to_le_bytes());
-            bytes.extend_from_slice(word.as_bytes());
+            sha.update((word.len() as u64).to_le_bytes());
+            sha.update(word.as_bytes());
         }
-        bytes.extend_from_slice(&epoch.to_le_bytes());
-        let hash = aterm_digest::Sha256::digest(&bytes);
+        sha.update(epoch.to_le_bytes());
+        let hash = sha.finalize();
         let mut table: [u8; 16] = hash[..16].try_into().expect("fixed digest width");
         table[0] |= 0x80;
         Scope::new(trust, table, 1)
@@ -416,7 +417,8 @@ impl RingState {
     }
 
     fn encode(&self) -> Vec<u8> {
-        let mut bytes = STATE_MAGIC.to_vec();
+        let mut bytes = Vec::with_capacity(STATE_MAGIC.len() + 8 + 1 + self.held.len() * 8);
+        bytes.extend_from_slice(STATE_MAGIC);
         bytes.extend_from_slice(&self.floor.to_le_bytes());
         bytes.push(u8::try_from(self.held.len()).expect("held periods are bounded"));
         for epoch in &self.held {
@@ -434,19 +436,21 @@ impl RingState {
             return Err(damaged());
         }
         let (chunks, _) = rest.as_chunks::<8>();
-        let held: BTreeSet<u64> = chunks
-            .iter()
-            .map(|chunk| u64::from_le_bytes(*chunk))
-            .collect();
-        let state = Self {
+        // One spelling per state: sorted, distinct periods.
+        let mut held = BTreeSet::new();
+        let mut prev: Option<u64> = None;
+        for chunk in chunks {
+            let epoch = u64::from_le_bytes(*chunk);
+            if prev.is_some_and(|p| p >= epoch) {
+                return Err(damaged());
+            }
+            prev = Some(epoch);
+            held.insert(epoch);
+        }
+        Ok(Self {
             floor: u64::from_le_bytes(*floor),
             held,
-        };
-        // One spelling per state: sorted, distinct periods.
-        if state.encode() != bytes {
-            return Err(damaged());
-        }
-        Ok(state)
+        })
     }
 }
 
@@ -942,7 +946,7 @@ impl Directory {
     /// # Errors
     /// A ring table's scope cannot be formed.
     pub(crate) fn ring_permits(&self, session: &Session<'_>, id: Digest, now: u64) -> Result<bool> {
-        Ok(self.ring_window(session, now)?.contains(&id))
+        Ok(self.ring_of(session, id, now)?.is_some())
     }
 
     /// Every table of every ring's current window (`RingState::current`); a damaged ring state

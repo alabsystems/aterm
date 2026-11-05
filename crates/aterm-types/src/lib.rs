@@ -8,8 +8,13 @@
 // Registers the `trust` tool so `#[trust::…]` attributes resolve under the Trust verifier.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
+// On a Trust compiler the machine-number anchors are `macro_rules!` attributes
+// (crates/aterm-spec-anchor/anchor_rules.rs), which only test and debug builds expand.
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
+pub mod mesh_switch;
 mod mutex_ext;
+pub mod negative_control;
 pub use mutex_ext::MutexExt;
 
 mod trust_fmt;
@@ -25,8 +30,13 @@ pub mod clt_shim;
 
 pub mod fleet_name;
 pub mod identity;
+pub mod lab_window_guard;
+pub mod machine_name;
 pub mod needs;
 pub mod network_state;
+pub mod private_edit;
+#[cfg(not(target_family = "wasm"))]
+pub mod reach;
 pub mod version;
 
 mod cursor;

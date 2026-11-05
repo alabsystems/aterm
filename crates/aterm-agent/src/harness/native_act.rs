@@ -17,6 +17,299 @@ pub const MAX_RESUME: usize = 16 * 1024;
 /// Maximum arguments or environment entries in one retained native command.
 pub const MAX_COMMAND_ITEMS: usize = 256;
 
+/// The billing authority used when planning a deferred model launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ColdBilling {
+    /// Keep the existing model without a billing move.
+    Keep,
+    /// A model move must preserve the captured standard profile.
+    PreserveProfile,
+    /// A model move relies on usage credits remaining enabled.
+    UsageCredits,
+}
+
+/// Captured account intent; this never changes the immutable seed command.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ColdIntent {
+    pub login: Option<String>,
+    pub home: Option<String>,
+    pub auth_observed: bool,
+    pub stored_login: bool,
+    pub conversation: Option<String>,
+    pub profile: Option<super::profile::Context>,
+    pub mode: super::accounts::Mode,
+    pub billing: ColdBilling,
+}
+
+impl std::fmt::Debug for ColdIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ColdIntent(redacted)")
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColdIntentWire {
+    login: Option<String>,
+    home: Option<String>,
+    auth_observed: bool,
+    stored_login: bool,
+    conversation: Option<String>,
+    profile: Option<ColdProfileWire>,
+    mode: String,
+    billing: ColdBilling,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColdProfileWire {
+    plain: String,
+    records: String,
+    selection: super::profile::Selection,
+    home: Option<String>,
+    config: Option<String>,
+    login: Option<String>,
+}
+
+fn bounded_cold_text(value: &str) -> bool {
+    value.len() <= MAX_PATH && !value.contains(['\0', '\r', '\n'])
+}
+
+impl ColdIntent {
+    pub fn encode(&self) -> Option<String> {
+        let profile = match &self.profile {
+            None => None,
+            Some(p) => Some(ColdProfileWire {
+                plain: p.plain.to_str()?.to_owned(),
+                records: p.records.to_str()?.to_owned(),
+                selection: p.selection,
+                home: p.home.clone(),
+                config: p.config.clone(),
+                login: p.login.clone(),
+            }),
+        };
+        let wire = ColdIntentWire {
+            login: self.login.clone(),
+            home: self.home.clone(),
+            auth_observed: self.auth_observed,
+            stored_login: self.stored_login,
+            conversation: self.conversation.clone(),
+            profile,
+            mode: self.mode.as_str().into(),
+            billing: self.billing,
+        };
+        let text = aterm_json::to_string(&wire).ok()?;
+        (text.len() <= MAX_RESUME && Self::parse(&text).is_some()).then_some(text)
+    }
+    pub fn parse(text: &str) -> Option<Self> {
+        if text.len() > MAX_RESUME {
+            return None;
+        }
+        let w: ColdIntentWire = aterm_json::from_str(text).ok()?;
+        for s in [&w.login, &w.home, &w.conversation].into_iter().flatten() {
+            if !bounded_cold_text(s) {
+                return None;
+            }
+        }
+        let profile = match w.profile {
+            None => None,
+            Some(p) => {
+                if ![&p.plain, &p.records]
+                    .into_iter()
+                    .all(|s| bounded_cold_text(s))
+                    || [&p.home, &p.config, &p.login]
+                        .into_iter()
+                        .flatten()
+                        .any(|s| !bounded_cold_text(s))
+                {
+                    return None;
+                }
+                Some(super::profile::Context {
+                    plain: p.plain.into(),
+                    records: p.records.into(),
+                    selection: p.selection,
+                    home: p.home,
+                    config: p.config,
+                    login: p.login,
+                })
+            }
+        };
+        Some(Self {
+            login: w.login,
+            home: w.home,
+            auth_observed: w.auth_observed,
+            stored_login: w.stored_login,
+            conversation: w.conversation,
+            profile,
+            mode: super::accounts::Mode::parse(&w.mode)?,
+            billing: w.billing,
+        })
+    }
+}
+
+/// Policy facts derived by the exact owned helper; credential values never cross the wire.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdEnvironmentFacts {
+    pub login: Option<String>,
+    pub default_home: bool,
+    pub stored_login: bool,
+    pub home: Option<String>,
+    /// Actual CLAUDE_CONFIG_DIR; distinct from the Anthropic profile store.
+    pub config: Option<String>,
+    pub profile_configs: Option<String>,
+    pub selection: super::profile::Selection,
+    pub inherited_named: bool,
+    pub cwd: String,
+}
+impl std::fmt::Debug for ColdEnvironmentFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ColdEnvironmentFacts(redacted)")
+    }
+}
+impl ColdEnvironmentFacts {
+    pub fn encode(&self) -> Option<String> {
+        let text = aterm_json::to_string(self).ok()?;
+        (text.len() <= MAX_RESUME && Self::parse(&text).is_some()).then_some(text)
+    }
+    pub fn parse(text: &str) -> Option<Self> {
+        if text.len() > MAX_RESUME {
+            return None;
+        }
+        let v: Self = aterm_json::from_str(text).ok()?;
+        if !std::path::Path::new(&v.cwd).is_absolute()
+            || !bounded_cold_text(&v.cwd)
+            || v.default_home != v.config.as_ref().is_none_or(|value| value.is_empty())
+            || [&v.login, &v.home, &v.config, &v.profile_configs]
+                .into_iter()
+                .flatten()
+                .any(|s| !bounded_cold_text(s))
+        {
+            return None;
+        }
+        Some(v)
+    }
+    pub fn observe(env: &[String], intent: &ColdIntent, cwd: &std::path::Path) -> Option<Self> {
+        let mut names = std::collections::BTreeSet::new();
+        for entry in env {
+            let (name, value) = entry.split_once('=')?;
+            if name.is_empty() || name.contains('\0') || value.contains('\0') || !names.insert(name)
+            {
+                return None;
+            }
+        }
+        let cwd = cwd.to_str()?.to_owned();
+        let mut effective = env.to_vec();
+        let inherited_named = effective
+            .iter()
+            .filter_map(|s| s.split_once('='))
+            .any(|(k, v)| k == super::accounts::LOGIN_ENV && !v.is_empty());
+        if intent.auth_observed || intent.login.is_some() {
+            effective.retain(|s| {
+                s.split_once('=')
+                    .is_none_or(|(k, _)| k != super::accounts::LOGIN_ENV)
+            });
+            effective.push(format!(
+                "{}={}",
+                super::accounts::LOGIN_ENV,
+                intent.login.as_deref().unwrap_or_default()
+            ));
+        }
+        if let Some(home) = &intent.home {
+            effective.retain(|s| {
+                s.split_once('=')
+                    .is_none_or(|(k, _)| k != super::accounts::HOME_ENV)
+            });
+            effective.push(format!("{}={home}", super::accounts::HOME_ENV));
+        }
+        let who = super::accounts::ProcessLogin::of_env(
+            effective.iter().filter_map(|s| s.split_once('=')),
+        );
+        let home = effective
+            .iter()
+            .filter_map(|s| s.split_once('='))
+            .find(|(k, _)| *k == super::accounts::HOMEDIR_ENV)
+            .map(|(_, v)| v.to_owned());
+        let profile_configs = super::accounts::profile_configs_dir(
+            effective.iter().filter_map(|s| s.split_once('=')),
+        )
+        .map(|p| p.to_str().map(str::to_owned))
+        .map_or(Some(None), |v| v.map(Some))?;
+        let selection =
+            super::profile::Selection::of_env(effective.iter().filter_map(|s| s.split_once('=')));
+        let result = Self {
+            login: who.login,
+            default_home: who.default_home,
+            stored_login: who.stored_login,
+            home,
+            config: effective
+                .iter()
+                .filter_map(|s| s.split_once('='))
+                .find(|(key, _)| *key == super::accounts::HOME_ENV)
+                .map(|(_, value)| value.to_owned()),
+            profile_configs,
+            selection,
+            inherited_named,
+            cwd,
+        };
+        result.encode()?;
+        Some(result)
+    }
+    /// Interpret the environment the immutable seed will actually execute under.
+    /// Raw inherited exports remain local and are not changed by this observation.
+    pub fn observe_for_command(
+        raw: &[String],
+        intent: &ColdIntent,
+        seed: &RestartCommand,
+        cwd: &std::path::Path,
+    ) -> Option<Self> {
+        let mut names = std::collections::BTreeSet::new();
+        for entry in raw {
+            let (key, value) = entry.split_once('=')?;
+            if key.is_empty() || key.contains('\0') || value.contains('\0') || !names.insert(key) {
+                return None;
+            }
+        }
+        let inherited_named = raw
+            .iter()
+            .filter_map(|s| s.split_once('='))
+            .any(|(key, value)| key == super::accounts::LOGIN_ENV && !value.is_empty());
+        let mut effective = raw.to_vec();
+        if let Some(unset) = &seed.unset {
+            effective.retain(|entry| {
+                entry
+                    .split_once('=')
+                    .is_none_or(|(key, _)| !unset.iter().any(|name| name == key))
+            });
+        }
+        for (key, value) in &seed.env {
+            if key == super::accounts::LOGIN_ENV
+                && (intent.auth_observed || intent.login.is_some())
+                && value != intent.login.as_deref().unwrap_or_default()
+            {
+                return None;
+            }
+            if key == super::accounts::HOME_ENV
+                && intent.home.as_ref().is_some_and(|home| home != value)
+            {
+                return None;
+            }
+            effective.retain(|entry| entry.split_once('=').is_none_or(|(name, _)| name != key));
+            effective.push(format!("{key}={value}"));
+        }
+        let mut facts = Self::observe(&effective, intent, cwd)?;
+        facts.inherited_named = inherited_named;
+        Some(facts)
+    }
+    pub fn process_login(&self) -> super::accounts::ProcessLogin {
+        super::accounts::ProcessLogin {
+            login: self.login.clone(),
+            default_home: self.default_home,
+            stored_login: self.stored_login,
+        }
+    }
+}
+
 /// A constructor's selected command, before shell quoting. Both the legacy line and the
 /// one-shot launcher use this exact selection, including line-length/shim/tap fallbacks.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +330,8 @@ pub struct RestartCommand {
     pub heal: Option<String>,
     /// The original shell's quoting/command dialect.
     pub dialect: super::upgrade::Dialect,
+    /// Account identity bound to this exact command; absent legacy attribution grants nothing.
+    pub account_intent: Option<Box<super::accounts_pool::ExecutionIntent>>,
 }
 
 impl RestartCommand {
@@ -66,6 +361,69 @@ impl RestartCommand {
             argv,
         )
         .ok()
+    }
+
+    /// Render a deferred launcher without applying planned account exports before observation.
+    #[must_use]
+    pub fn cold_launcher_line(
+        &self,
+        launcher: &Image,
+        socket: &str,
+        sid: &str,
+        binding: &Binding,
+        phase: ImagePhase,
+    ) -> Option<String> {
+        let mut seed = self.clone();
+        seed.env.clear();
+        seed.unset = None;
+        seed.launcher_line(launcher, socket, sid, binding, phase)
+    }
+
+    /// Only a server-selected login may differ from the immutable seed.
+    #[must_use]
+    pub fn cold_resolution_agrees(&self, resolved: &Self) -> bool {
+        let mut expected = self.clone();
+        let mut actual = resolved.clone();
+        let Some(intent) = resolved.account_intent.as_deref() else {
+            return false;
+        };
+        if super::accounts_pool::ExecutionIntent::from_value(&intent.to_value()).as_ref()
+            != Some(intent)
+        {
+            return false;
+        }
+        // Deferred seeds have no account authority; resolution supplies the canonical intent.
+        // A seed already carrying authority cannot silently replace that retained intent.
+        if expected.account_intent.is_none() {
+            actual.account_intent = None;
+        }
+
+        expected
+            .env
+            .retain(|(k, _)| k != super::accounts::LOGIN_ENV);
+        actual.env.retain(|(k, _)| k != super::accounts::LOGIN_ENV);
+        // Preserve the optional-vector shape and every non-selector unset entry.
+        if let Some(names) = &mut expected.unset {
+            names.retain(|name| name != super::accounts::LOGIN_ENV);
+        }
+        if let Some(names) = &mut actual.unset {
+            names.retain(|name| name != super::accounts::LOGIN_ENV);
+        }
+        let login_exports = resolved
+            .env
+            .iter()
+            .filter(|(k, _)| k == super::accounts::LOGIN_ENV)
+            .count();
+        let login_unsets = resolved.unset.as_ref().map_or(0, |names| {
+            names
+                .iter()
+                .filter(|name| name.as_str() == super::accounts::LOGIN_ENV)
+                .count()
+        });
+        expected == actual
+            && login_exports <= 1
+            && login_unsets <= 1
+            && (login_exports == 0 || login_unsets == 0)
     }
 
     /// The fixed physical helper command. Its argv carries only the original operation,
@@ -152,6 +510,15 @@ impl RestartCommand {
             self.dialect.hook_ext(),
         )
         .ok()?;
+        if let Some(intent) = &self.account_intent {
+            let value = intent.to_value();
+            if super::accounts_pool::ExecutionIntent::from_value(&value).as_ref()
+                != Some(intent.as_ref())
+            {
+                return None;
+            }
+            write!(out, " account={}", json(&value.to_string())).ok()?;
+        }
         (out.len() <= MAX_REQUEST).then(|| out.trim_start().to_string())
     }
 
@@ -186,6 +553,15 @@ impl RestartCommand {
         let cwd = optional(take(&mut words, "cwd")?)?;
         let heal = optional(take(&mut words, "heal")?)?;
         let dialect = super::upgrade::Dialect::from_exe_name(take(&mut words, "dialect")?)?;
+        let account_intent = match words.remove("account") {
+            None => None,
+            Some(encoded) => {
+                let value = aterm_json::from_str(&text_blob(encoded, MAX_RESUME)?).ok()?;
+                Some(Box::new(super::accounts_pool::ExecutionIntent::from_value(
+                    &value,
+                )?))
+            }
+        };
         let command = Self {
             image,
             program,
@@ -195,6 +571,7 @@ impl RestartCommand {
             cwd,
             heal,
             dialect,
+            account_intent,
         };
         (words.is_empty() && command.encode().as_deref() == Some(encoded)).then_some(command)
     }
@@ -317,11 +694,13 @@ pub enum Constructor {
     OwnImage,
     /// The private built-in's retained signal/launcher/rollback constructor.
     PrivateRestart,
+    /// A sealed built-in cold relaunch with owned-helper account resolution.
+    ColdRestart,
 }
 
 impl Constructor {
     /// The canonical discovery order. A capability is not an action ticket.
-    pub const ALL: [Self; 2] = [Self::OwnImage, Self::PrivateRestart];
+    pub const ALL: [Self; 3] = [Self::OwnImage, Self::PrivateRestart, Self::ColdRestart];
 
     /// This constructor's strict wire word.
     #[must_use]
@@ -329,6 +708,7 @@ impl Constructor {
         match self {
             Self::OwnImage => "own-image",
             Self::PrivateRestart => "private-restart",
+            Self::ColdRestart => "cold-restart",
         }
     }
 }
@@ -360,6 +740,8 @@ pub enum NativePlan {
         socket: String,
         /// The exact selected forward command, captured before the first signal.
         forward: Box<RestartCommand>,
+        /// Deferred account policy evaluated only by the owned launcher.
+        cold: Option<Box<ColdIntent>>,
         /// At most one old-image rollback, also captured before the first signal.
         rollback: Option<Box<RestartCommand>>,
     },
@@ -371,7 +753,8 @@ impl NativePlan {
     pub const fn constructor(&self) -> Constructor {
         match self {
             Self::OwnImage { .. } => Constructor::OwnImage,
-            Self::Restart { .. } => Constructor::PrivateRestart,
+            Self::Restart { cold: Some(_), .. } => Constructor::ColdRestart,
+            Self::Restart { cold: None, .. } => Constructor::PrivateRestart,
         }
     }
 }
@@ -520,6 +903,8 @@ pub enum Request {
     Resume(Binding, ImagePhase, String, u64),
     /// Register the exact one-shot aterm child and retained kernel exit witness before exec.
     Attach(Binding, ImagePhase),
+    /// Supply derived policy facts from the exact attached helper.
+    Resolve(Binding, ImagePhase, ColdEnvironmentFacts),
     /// Recheck current guards and the original deadline immediately before the fixed exec.
     Execute(Binding, ImagePhase),
     /// Record only the bound one-shot child's actual exec errno, never arbitrary outcome text.
@@ -676,6 +1061,12 @@ impl Request {
                         shell: read_process(&mut words, "shell")?,
                         launcher: read_image(&mut words, "launcher")?,
                         socket: text_blob(take(&mut words, "socket")?, MAX_PATH)?,
+                        cold: match words.remove("cold") {
+                            None | Some("-") => None,
+                            Some(text) => {
+                                Some(Box::new(ColdIntent::parse(&text_blob(text, MAX_RESUME)?)?))
+                            }
+                        },
                         forward: Box::new(RestartCommand::parse(&text_blob(
                             take(&mut words, "forward")?,
                             MAX_REQUEST,
@@ -733,6 +1124,11 @@ impl Request {
             "recover" => Self::Recover(read_binding(&mut words)?),
             "signal" => Self::Signal(read_binding(&mut words)?),
             "attach" => Self::Attach(read_binding(&mut words)?, read_phase(&mut words)?),
+            "resolve" => Self::Resolve(
+                read_binding(&mut words)?,
+                read_phase(&mut words)?,
+                ColdEnvironmentFacts::parse(&text_blob(take(&mut words, "facts")?, MAX_RESUME)?)?,
+            ),
             "execute" => Self::Execute(read_binding(&mut words)?, read_phase(&mut words)?),
             "exec-failed" => {
                 let binding = read_binding(&mut words)?;
@@ -815,6 +1211,7 @@ impl Request {
                         launcher,
                         socket,
                         forward,
+                        cold,
                         rollback,
                     } => {
                         out.push_str(" plan=restart");
@@ -841,6 +1238,14 @@ impl Request {
                             },
                         )
                         .ok()?;
+                        if let Some(intent) = cold {
+                            write!(
+                                out,
+                                " cold={}",
+                                aterm_codec::hex::encode_lower(intent.encode()?.as_bytes())
+                            )
+                            .ok()?;
+                        }
                     }
                 }
                 if let Self::CancelPrepare(cancel) = self {
@@ -864,6 +1269,16 @@ impl Request {
             Self::Signal(b) => write!(out, "signal {}", b.words()).ok()?,
             Self::Attach(b, phase) => {
                 write!(out, "attach {} phase={}", b.words(), phase.word()).ok()?
+            }
+            Self::Resolve(b, phase, facts) => {
+                write!(
+                    out,
+                    "resolve {} phase={} facts={}",
+                    b.words(),
+                    phase.word(),
+                    aterm_codec::hex::encode_lower(facts.encode()?.as_bytes())
+                )
+                .ok()?;
             }
             Self::Execute(b, phase) => {
                 write!(out, "execute {} phase={}", b.words(), phase.word()).ok()?
@@ -960,12 +1375,29 @@ pub enum Reply {
     /// A private builtin completion also retained this positively observed new child for
     /// later crash admission. The frozen external OwnImage receipt is unchanged.
     RestartCommitted(Box<super::native_observe::SavedObservation>),
+    /// Historical cold completion retains the executed account intent even without a new watch.
+    ColdRestartCommitted {
+        claim: ClaimOutcome,
+        observation: Option<Box<super::native_observe::SavedObservation>>,
+        intent: Box<super::accounts_pool::ExecutionIntent>,
+    },
     /// The retained fixed signal was delivered, or its exact process had already exited.
     Signalled,
     /// The retained fixed continuation reached the kernel in full.
     Resumed(ImagePhase),
     /// The bound launcher's fixed command data, before permission for its first exec.
     Launch {
+        command: RestartCommand,
+        deadline_us: u64,
+    },
+    /// Request private derived facts before choosing a deferred command.
+    NeedEnvironment {
+        seed: RestartCommand,
+        intent: Box<ColdIntent>,
+        deadline_us: u64,
+    },
+    /// The server-selected deferred command, after account admission.
+    ResolvedLaunch {
         command: RestartCommand,
         deadline_us: u64,
     },
@@ -976,6 +1408,9 @@ pub enum Reply {
     /// The sealed attempt has no pending writes and accepted no bytes; the same plan may
     /// be tried at a fresh guarded prompt without minting another native operation.
     Unwritten,
+    /// This exact phase's attached helper died, its group is gone and its input
+    /// attempt settled, all without an exec grant. The same plan may retry.
+    Unissued(ImagePhase),
 }
 
 impl Reply {
@@ -1091,11 +1526,33 @@ impl Reply {
                 match words.next() {
                     None => Self::Committed(outcome),
                     Some(word) if outcome == ClaimOutcome::Builtin => {
-                        let saved = super::native_observe::SavedObservation::parse(&text_blob(
-                            word.strip_prefix("observation=")?,
-                            MAX_REQUEST,
-                        )?)?;
-                        Self::RestartCommitted(Box::new(saved))
+                        if let Some(encoded) = word.strip_prefix("account-intent=") {
+                            let text = text_blob(encoded, MAX_REQUEST)?;
+                            let value: aterm_json::Value = aterm_json::from_str(&text).ok()?;
+                            let intent = super::accounts_pool::ExecutionIntent::from_value(&value)?;
+                            if aterm_json::to_string(&intent.to_value()).ok()? != text {
+                                return None;
+                            }
+                            let observation = match words.next() {
+                                None => None,
+                                Some(word) => Some(Box::new(
+                                    super::native_observe::SavedObservation::parse(&text_blob(
+                                        word.strip_prefix("observation=")?,
+                                        MAX_REQUEST,
+                                    )?)?,
+                                )),
+                            };
+                            Self::ColdRestartCommitted {
+                                claim: outcome,
+                                observation,
+                                intent: Box::new(intent),
+                            }
+                        } else {
+                            let saved = super::native_observe::SavedObservation::parse(
+                                &text_blob(word.strip_prefix("observation=")?, MAX_REQUEST)?,
+                            )?;
+                            Self::RestartCommitted(Box::new(saved))
+                        }
                     }
                     Some(_) => return None,
                 }
@@ -1108,6 +1565,33 @@ impl Reply {
                 "rollback" => ImagePhase::Rollback,
                 _ => return None,
             }),
+            "need-environment" => {
+                let deadline_us = canonical_number(words.next()?.strip_prefix("deadline-us=")?)?;
+                let seed = RestartCommand::parse(&text_blob(
+                    words.next()?.strip_prefix("seed=")?,
+                    MAX_REQUEST,
+                )?)?;
+                let intent = ColdIntent::parse(&text_blob(
+                    words.next()?.strip_prefix("intent=")?,
+                    MAX_RESUME,
+                )?)?;
+                Self::NeedEnvironment {
+                    seed,
+                    intent: Box::new(intent),
+                    deadline_us,
+                }
+            }
+            "resolved-launch" => {
+                let deadline_us = canonical_number(words.next()?.strip_prefix("deadline-us=")?)?;
+                let command = RestartCommand::parse(&text_blob(
+                    words.next()?.strip_prefix("command=")?,
+                    MAX_REQUEST,
+                )?)?;
+                Self::ResolvedLaunch {
+                    command,
+                    deadline_us,
+                }
+            }
             "launch" => {
                 let deadline_us = canonical_number(words.next()?.strip_prefix("deadline-us=")?)?;
                 let command = RestartCommand::parse(&text_blob(
@@ -1131,6 +1615,11 @@ impl Reply {
                 },
             )),
             "unwritten" => Self::Unwritten,
+            "unissued" => Self::Unissued(match words.next()?.strip_prefix("phase=")? {
+                "forward" => ImagePhase::Forward,
+                "rollback" => ImagePhase::Rollback,
+                _ => return None,
+            }),
             _ => return None,
         };
         words.next().is_none().then_some(reply)
@@ -1178,7 +1667,9 @@ pub fn commit<S: std::io::Read + std::io::Write>(
         sid,
         &Request::Commit(binding.clone(), phase, version.to_string()),
     ) {
-        Ok(Reply::Committed(_) | Reply::RestartCommitted(_)) => Decision::Committed,
+        Ok(
+            Reply::Committed(_) | Reply::RestartCommitted(_) | Reply::ColdRestartCommitted { .. },
+        ) => Decision::Committed,
         Ok(Reply::Decision(decision)) => decision,
         Ok(_) | Err(_) => Decision::Unknown,
     }
@@ -1340,7 +1831,15 @@ mod tests {
             ("-", Vec::new()),
             ("own-image", vec![Constructor::OwnImage]),
             ("private-restart", vec![Constructor::PrivateRestart]),
-            ("own-image,private-restart", Constructor::ALL.to_vec()),
+            ("cold-restart", vec![Constructor::ColdRestart]),
+            (
+                "own-image,private-restart",
+                vec![Constructor::OwnImage, Constructor::PrivateRestart],
+            ),
+            (
+                "own-image,private-restart,cold-restart",
+                Constructor::ALL.to_vec(),
+            ),
         ] {
             assert_eq!(
                 Reply::parse(&format!("OK native-act state=constructors plans={words}")),
@@ -1351,6 +1850,10 @@ mod tests {
             "",
             "own-image,own-image",
             "private-restart,own-image",
+            "cold-restart,own-image",
+            "own-image,cold-restart,private-restart",
+            "cold-restart,cold-restart",
+            "cold-restart,unknown",
             "unknown",
             "own-image,unknown",
             "- extra=1",
@@ -1448,5 +1951,166 @@ mod tests {
             Some(Reply::Decision(Decision::ProvenNotCommittedRollbackSafe))
         );
         assert!(!format!("{binding:?}").contains(&binding.capability));
+    }
+}
+
+#[cfg(test)]
+mod cold_wire_tests {
+    use super::*;
+
+    #[test]
+    fn cold_facts_keep_credentials_local_and_preserve_known_empty() {
+        let intent = ColdIntent {
+            login: None,
+            home: None,
+            auth_observed: false,
+            stored_login: true,
+            conversation: None,
+            profile: None,
+            mode: super::super::accounts::Mode::Wall,
+            billing: ColdBilling::Keep,
+        };
+        assert!(
+            ColdEnvironmentFacts::observe(
+                &["HOME=/one".into(), "HOME=/two".into()],
+                &intent,
+                std::path::Path::new("/fixture")
+            )
+            .is_none()
+        );
+        let empty =
+            ColdEnvironmentFacts::observe(&[], &intent, std::path::Path::new("/fixture")).unwrap();
+        assert!(empty.default_home && empty.stored_login);
+        assert_eq!(empty.selection, super::super::profile::Selection::Standard);
+        assert_eq!(
+            super::super::profile::Selection::of_exec_env(&[]),
+            super::super::profile::Selection::Unknown
+        );
+        let secret = "synthetic-credential-never-on-wire";
+        let facts = ColdEnvironmentFacts::observe(
+            &[format!("ANTHROPIC_API_KEY={secret}")],
+            &intent,
+            std::path::Path::new("/fixture"),
+        )
+        .unwrap();
+        assert!(!facts.stored_login);
+        let encoded = facts.encode().unwrap();
+        assert!(!encoded.contains(secret));
+        assert!(!format!("{facts:?}").contains(secret));
+        assert_eq!(ColdEnvironmentFacts::parse(&encoded), Some(facts));
+        let encoded = intent.encode().unwrap();
+        assert_eq!(ColdIntent::parse(&encoded), Some(intent));
+    }
+
+    #[test]
+    fn cold_facts_refuse_unknown_duplicate_and_oversize_authority_fields() {
+        let text = r#"{"login":null,"default_home":true,"stored_login":true,"home":null,"config":null,"profile_configs":null,"selection":"Standard","inherited_named":false,"cwd":"/fixture"}"#;
+        assert!(ColdEnvironmentFacts::parse(text).is_some());
+        assert!(
+            ColdEnvironmentFacts::parse(&text.replacen("{", "{\"config\":\"/other\",", 1))
+                .is_none()
+        );
+        assert!(
+            ColdEnvironmentFacts::parse(
+                &text.replace("\"default_home\":true", "\"default_home\":false")
+            )
+            .is_none()
+        );
+        assert!(
+            ColdEnvironmentFacts::parse(&text.replacen("{", "{\"login\":\"other\",", 1)).is_none()
+        );
+        assert!(
+            ColdEnvironmentFacts::parse(&text.replace("Standard", "future-selector")).is_none()
+        );
+        assert!(
+            ColdEnvironmentFacts::parse(&text.replace(
+                "\"home\":null",
+                &format!("\"home\":\"{}\"", "x".repeat(MAX_PATH + 1))
+            ))
+            .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod cold_completion_receipt_tests {
+    use super::*;
+    #[test]
+    fn completed_cold_intent_survives_with_or_without_a_future_observation() {
+        let process = |pid| Process {
+            pid,
+            birth: u64::from(pid) * 10,
+            parent: 22,
+            group: pid,
+            session: 22,
+            image: Image {
+                path: b"/private/vendor".to_vec(),
+                device: 7,
+                inode: 8,
+            },
+        };
+        let saved = super::super::native_observe::SavedObservation {
+            registration: super::super::native_observe::Registration {
+                id: "1".repeat(32),
+                host_epoch: "2".repeat(32),
+                vendor: process(33),
+                shell: process(22),
+            },
+            binding: super::super::native_observe::ObservationBinding {
+                id: "1".repeat(32),
+                host_epoch: "2".repeat(32),
+                capability: "3".repeat(64),
+            },
+        };
+        for intent in [
+            super::super::accounts_pool::ExecutionIntent::external(),
+            super::super::accounts_pool::ExecutionIntent::Stored {
+                namespace: "4".repeat(64),
+                login: Some("/private/login".into()),
+                owner: Some("work".into()),
+                generation: "5".repeat(64),
+            },
+        ] {
+            let text = aterm_json::to_string(&intent.to_value()).unwrap();
+            let account = aterm_codec::hex::encode_lower(text.as_bytes());
+            let observation = aterm_codec::hex::encode_lower(saved.encode().unwrap().as_bytes());
+            let plain = format!(
+                "OK native-act state=committed claim=builtin revision=- account-intent={account}"
+            );
+            for with_watch in [false, true] {
+                let wire = if with_watch {
+                    format!("{plain} observation={observation}")
+                } else {
+                    plain.clone()
+                };
+                assert_eq!(
+                    Reply::parse(&wire),
+                    Some(Reply::ColdRestartCommitted {
+                        claim: ClaimOutcome::Builtin,
+                        observation: with_watch.then(|| Box::new(saved.clone())),
+                        intent: Box::new(intent.clone())
+                    })
+                );
+                for tail in [
+                    " extra=1",
+                    &format!(" account-intent={account}"),
+                    &format!(" observation={observation} observation={observation}"),
+                ] {
+                    assert!(Reply::parse(&(wire.clone() + tail)).is_none());
+                }
+            }
+            let old = format!(
+                "OK native-act state=committed claim=builtin revision=- observation={observation}"
+            );
+            assert_eq!(
+                Reply::parse(&old),
+                Some(Reply::RestartCommitted(Box::new(saved.clone())))
+            );
+            assert!(Reply::parse(&(old + &format!(" account-intent={account}"))).is_none());
+            assert!(Reply::parse(&plain.replace("claim=builtin", "claim=lost")).is_none());
+            let noncanonical = aterm_codec::hex::encode_lower(format!(" {text}").as_bytes());
+            assert!(Reply::parse(&plain.replace(&account, &noncanonical)).is_none());
+            assert!(Reply::parse(&plain.replace(&account, "7b7d")).is_none());
+        }
     }
 }

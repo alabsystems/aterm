@@ -1210,6 +1210,7 @@ fn leg_words(
             (_, None) => "a need named earlier in its reply".to_owned(),
         },
         HoldLeg::Repo => safe(repo_words(held, said, Files::Shown)),
+        HoldLeg::Left => aterm_agent::harness::acts::left_words(held.left),
         HoldLeg::Open => safe(open_leg(held.open_words(), said, form)),
         HoldLeg::Unread | HoldLeg::Defense | HoldLeg::Cut => {
             leg.fixed_words().unwrap_or_default().to_owned()
@@ -1242,6 +1243,10 @@ fn spoken_leg(
         },
         HoldLeg::Repo => format!("{}.", repo_words(held, said, Files::Spoken)),
         HoldLeg::Unread => "A repository that could not be read.".to_owned(),
+        HoldLeg::Left => capital(&format!(
+            "{}.",
+            aterm_agent::harness::acts::left_words(held.left)
+        )),
         HoldLeg::Open if said.is_some_and(|s| !s.open.is_empty()) => {
             let said = said.unwrap_or_else(|| unreachable!("guarded"));
             let first = said.open.first().map(|q| speakable(q)).unwrap_or_default();
@@ -1422,13 +1427,14 @@ pub(crate) fn need_title(ask: &crate::needs::HarnessAsk) -> String {
     title_safe(&crate::harness_screen::need_head(ask))
 }
 
-/// A HARNESS'S NEED AS A SCREEN READER HEARS IT, in the chip's accessibility description (§12.2.1; the W4 title slice): the hold's own need sentence ([`spoken_leg`]: `Needs you: <the need>. And 1 more.`, glyph-free), then `Carrying on.`, as the entry says the work goes on.
+/// A HARNESS'S NEED AS A SCREEN READER HEARS IT, in the chip's accessibility description (§12.2.1; the W4 title slice): the hold's own need sentence ([`spoken_leg`]: `Needs you: <the need>. And 1 more.`, glyph-free), then the entry's own tail as a sentence (`NeedTail::sentence` of `NeedTail::words`, the one source the title's `need_head` reads too; the post-landing review, 2026-11-02).
 #[must_use]
 /// Formats `ask` for the chip's screen-reader accessibility description.
 pub(crate) fn need_spoken(ask: &crate::needs::HarnessAsk) -> String {
     format!(
-        "{} Carrying on.",
-        spoken_leg(LandHeld::default(), HoldLeg::Needs, Some(ask), None)
+        "{} {}",
+        spoken_leg(LandHeld::default(), HoldLeg::Needs, Some(ask), None),
+        ask.tail.sentence()
     )
 }
 

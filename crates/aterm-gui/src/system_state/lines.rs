@@ -270,7 +270,7 @@ pub(crate) fn scope_pending(status: &SetupStatus) -> bool {
 }
 
 /// Whether this is an ALab Mac as far as the page can tell, for the lockup's words (§4.5): its
-/// vault is the ALab vault and reads in sync, or the plan in force sets up the ALab profile
+/// vault is the ALab vault with its local cache ready, or the plan in force sets up the ALab profile
 /// that only an ALab Mac's plan holds by itself.
 pub(crate) fn alab_lockup(status: &SetupStatus, selection: Selection) -> bool {
     let in_alab_vault = status.plan.as_ref().is_some_and(|plan| {
@@ -278,7 +278,7 @@ pub(crate) fn alab_lockup(status: &SetupStatus, selection: Selection) -> bool {
     }) && status.observed.iter().any(|row| {
         row.subject == Subject::Setting(Setting::Secrets)
             && row.standing == Standing::InPlace
-            && row.now.as_deref() == Some("In sync")
+            && row.now.as_deref() == Some(Setting::Secrets.wanted())
     });
     let profile = [Line::Mac, Line::Accounts]
         .iter()
@@ -561,6 +561,21 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
     }
     // A failed step: what failed, why, and what aterm does next (§4.8). A step running the
     // plan again can change, aterm runs again by itself; nothing here waits for a press.
+    if let Some(row) = rows.iter().find(|row| {
+        row.managed
+            && row.subject == Subject::Sync(super::SyncKind::Accounts)
+            && row.standing == Some(Standing::Waiting)
+    }) {
+        items.push(
+            CardItem::new(
+                "sync-accounts",
+                Mark::Waiting,
+                "AI account provisioning pending",
+            )
+            .reason(row.note.clone())
+            .for_row(row.subject),
+        );
+    }
     let plan = app.reviewed_plan();
     let steps = Steps::of(status, rows, Some(&plan));
     for subject in &steps.failed {
@@ -789,6 +804,12 @@ fn line_state(
         .filter(|row| card.iter().any(|item| item.subject == Some(row.subject)))
         .collect();
     if let Some(first) = carded.first() {
+        if card
+            .iter()
+            .any(|item| item.subject == Some(first.subject) && item.mark == Mark::Waiting)
+        {
+            return with_lead(LineState::new(Mark::Waiting, waiting_for(first)));
+        }
         let failed = card
             .iter()
             .any(|item| item.subject == Some(first.subject) && item.mark == Mark::Failed);
@@ -893,6 +914,16 @@ fn line_state(
     if managed.iter().any(|row| unread(row)) {
         return with_lead(LineState::checking(line));
     }
+    let pending_grants = managed
+        .iter()
+        .filter(|row| matches!(&row.value, RowValue::Muted(word) if word == super::OFFERED_WORD))
+        .count();
+    if pending_grants > 0 {
+        return with_lead(LineState::new(
+            Mark::Waiting,
+            format!("{pending_grants} macOS grants pending"),
+        ));
+    }
     if managed.is_empty() {
         // Nothing of it applies on this Mac (every row not needed).
         return with_lead(LineState::new(Mark::Done, "Nothing to set up here"));
@@ -947,7 +978,7 @@ pub(crate) fn waiting_for(row: &RowView) -> String {
 }
 
 /// What is true now of a line whose rows are all as wanted (§4.3): `Caps Lock is Control ·
-/// Dock 3 apps`, `Joined · in sync`.
+/// Dock 3 apps`, `Joined · local cache ready`.
 fn now_words(line: Line, managed: &[&RowView]) -> String {
     let value = |setting: Setting| {
         managed
@@ -976,8 +1007,8 @@ fn now_words(line: Line, managed: &[&RowView]) -> String {
             .to_owned(),
         ],
         Line::Secrets => vec![match value(Setting::Secrets) {
-            Some("In sync") | None => "Joined · in sync".to_owned(),
             Some(other) => format!("Joined · {}", other.to_lowercase()),
+            None => "No local reading".to_owned(),
         }],
         Line::Developer => [
             value(Setting::Spotlight).map(|_| "Rust docs out of Spotlight".to_owned()),
@@ -1065,6 +1096,7 @@ pub(crate) fn progress(
             row.managed
                 && (row.settled() || row.changed_by_you)
                 && row.chip != Some(super::Chip::Waiting)
+                && !matches!(&row.value, RowValue::Muted(word) if word == super::OFFERED_WORD)
                 && !card.iter().any(|item| item.subject == Some(row.subject))
                 && !steps.failed.contains(&row.subject)
                 && !steps.retried.contains(&row.subject)
@@ -1108,6 +1140,8 @@ fn phase_words(app: &SystemStateApp, hero: &Hero, card: &[CardItem]) -> String {
         super::CHECKING => "Checking",
         SETTING_UP => "Setup running",
         READY => "Setup finished",
+        "Selected setup complete" => "Selected setup finished",
+        "Setup incomplete" => "Setup incomplete",
         TRIES_AGAIN => "Waiting to try again",
         STOPPED => "Setup stopped",
         super::EVERYTHING_LEFT_AS_IS => "Nothing to set up",
@@ -1223,8 +1257,16 @@ fn hero_words(app: &SystemStateApp, rows: &[RowView], card: &[CardItem]) -> Hero
         hero.sub = STARTING.to_owned();
         return hero;
     }
-    if detail.set_up {
-        hero.headline = READY.to_owned();
+    if detail.set_up && done == total && total > 0 {
+        let disabled = Setting::ALL
+            .into_iter()
+            .filter(|setting| !app.reviewed_plan().selection.contains(*setting))
+            .count();
+        hero.headline = if disabled == 0 {
+            READY.to_owned()
+        } else {
+            "Selected setup complete".to_owned()
+        };
         // After a Check that failed as a whole, the rows are what aterm read before.
         let stale = detail.text.ends_with(super::AS_LAST_READ);
         hero.sub = match status.ready_in {
@@ -1233,9 +1275,17 @@ fn hero_words(app: &SystemStateApp, rows: &[RowView], card: &[CardItem]) -> Hero
             }
             _ => counts.clone(),
         };
+        if disabled > 0 {
+            hero.sub = format!("{} · {disabled} disabled", hero.sub);
+        }
         if stale {
             hero.sub = format!("{} · {}", hero.sub, super::AS_LAST_READ);
         }
+        return hero;
+    }
+    if detail.set_up {
+        hero.headline = "Setup incomplete".to_owned();
+        hero.sub = counts.clone();
         return hero;
     }
     if held {

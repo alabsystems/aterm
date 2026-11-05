@@ -836,7 +836,7 @@ fn execution_work_view(
     execution_work_read(a, host, sid, born, case, false).progress
 }
 
-fn execution_case(case: i64, project: bool, legacy_hidden: bool) -> [i64; 13] {
+fn execution_case(case: i64, project: bool, legacy_hidden: bool) -> [i64; 14] {
     execution_case_at(case, project, legacy_hidden, false, 0)
 }
 
@@ -846,7 +846,7 @@ fn execution_case_at(
     legacy_hidden: bool,
     elapsed: bool,
     legacy_expiry: u8,
-) -> [i64; 13] {
+) -> [i64; 14] {
     use aterm_agent::harness::account_progress::{self as facts, ProgressPhase};
     let sid = "s-execution-model";
     let (a, mut idle, host, born) = execution_fixture(sid);
@@ -1100,7 +1100,19 @@ fn execution_case_at(
                 .any(|s| s.starts_with(facts::EXECUTION_HISTORY_PREFIX))
         })),
         i64::from(wake),
+        i64::from(
+            view.as_ref()
+                .is_some_and(|value| !value.independent_work.is_empty()),
+        ),
     ]
+}
+
+fn diagnostic_variants(before: &aterm_spec::interp::State) -> &'static [u8] {
+    if before["activity"] == 3 && before["diagnostic_ok"] == 0 {
+        &[1, 2, 3, 4] // Missing, zero-time, future-time and a different diagnostic row.
+    } else {
+        &[0]
+    }
 }
 
 fn execution_activity_transition(
@@ -1109,34 +1121,44 @@ fn execution_activity_transition(
 ) -> aterm_spec::interp::State {
     let mut observed = None;
     for off in [false, true] {
-        let values = progress::expired_activity_tests::expired_activity_observation(
-            before["elapsed"] == 1 || legacy == 2,
-            before["activity_rows_changed"] == 1 && legacy != 3,
-            legacy != 1,
-            1,
-            off,
-        );
-        let mut after = before.clone();
-        after.insert("stage", 2);
-        for (field, value) in [
-            ("view", values[0]),
-            ("deadline", values[1]),
-            ("current", values[2]),
-            ("historical", values[3]),
-            ("counts_unknown", values[4]),
-            ("authority", values[6]),
-            ("retained", values[6]),
-            ("retry", values[8]),
-            ("wake", values[9]),
-            ("visible", i64::from(values[2] == 1 || values[3] == 1)),
-        ] {
-            after.insert(field, value);
-        }
-        assert_eq!(values[7], 0, "active work acquired a historical diagnostic");
-        if let Some(expected) = &observed {
-            assert_eq!(expected, &after, "Off changed the execution observation");
-        } else {
-            observed = Some(after);
+        for &diagnostic_variant in diagnostic_variants(before) {
+            let values = progress::expired_activity_tests::expired_activity_observation(
+                before["elapsed"] == 1 || legacy == 2,
+                before["activity_rows_changed"] == 1 && legacy != 3,
+                legacy != 1,
+                if before["activity"] == 3 { 3 } else { 1 },
+                off,
+                diagnostic_variant,
+            );
+            let mut after = before.clone();
+            after.insert("stage", 2);
+            for (field, value) in [
+                ("view", values[0]),
+                ("deadline", values[1]),
+                ("current", values[2]),
+                ("historical", values[3]),
+                ("counts_unknown", values[4]),
+                ("authority", values[6]),
+                ("retained", values[6]),
+                ("retry", values[8]),
+                ("wake", values[9]),
+                ("visible", i64::from(values[2] == 1 || values[3] == 1)),
+                ("work_visible", values[10]),
+                ("activity_history", i64::from(values[7] > 0)),
+            ] {
+                after.insert(field, value);
+            }
+            if before["activity"] != 3 {
+                assert_eq!(values[7], 0, "active work acquired a historical diagnostic");
+            }
+            if let Some(expected) = &observed {
+                assert_eq!(
+                    expected, &after,
+                    "Off or invalid-diagnostic variants changed the projection"
+                );
+            } else {
+                observed = Some(after);
+            }
         }
     }
     observed.unwrap()
@@ -1148,18 +1170,14 @@ fn retained_normal_execution_transition(
 ) -> aterm_spec::interp::State {
     let mut observed = None;
     for resumed in [false, true] {
-        let activity_kinds: &[i64] = if before["activity"] == 0 {
-            &[0, 3] // Empty and inactive B must project the same retained A history.
-        } else {
-            std::slice::from_ref(&before["activity"])
-        };
-        for &activity_kind in activity_kinds {
+        for &diagnostic_variant in diagnostic_variants(before) {
             let context_present = before["context"] == 1 && before["context_record"] == 1;
             let values = progress::retired_activity_tests::retired_activity_observation(
                 if legacy == 4 { 1 } else { before["normal"] },
                 context_present && legacy != 3,
-                activity_kind,
+                before["activity"],
                 resumed,
+                diagnostic_variant,
             );
             let mut after = before.clone();
             after.insert("stage", 2);
@@ -1168,8 +1186,15 @@ fn retained_normal_execution_transition(
                 ("counts_unknown", values[6]),
                 ("deadline", values[2]),
                 ("generic_safe", values[7]),
-                ("retry", i64::from(values[0] == 7 || values[6] == 1)),
-                ("wake", i64::from(values[0] == 7 || values[6] == 1)),
+                (
+                    "retry",
+                    i64::from(values[0] == 7 || values[6] == 1 || values[8] == 1),
+                ),
+                (
+                    "wake",
+                    i64::from(values[0] == 7 || values[6] == 1 || values[8] == 1),
+                ),
+                ("work_visible", values[8]),
                 ("forecasts", i64::from(values[1] == 1 || values[2] == 1)),
                 ("paused", values[3]),
                 ("retained", values[4]),
@@ -1180,7 +1205,7 @@ fn retained_normal_execution_transition(
             if let Some(expected) = &observed {
                 assert_eq!(
                     expected, &after,
-                    "Off/resumed and empty/inactive projections differ"
+                    "retirement or invalid-diagnostic variants changed the projection"
                 );
             } else {
                 observed = Some(after);
@@ -1290,6 +1315,21 @@ fn independent_execution_transition(
                                 .map(aterm_agent::harness::accounts_sync::LoginIdentity::for_test),
                         }]),
                         2 => None,
+                        3 => Some(vec![aterm_agent::harness::accounts_sync::LoginActivity {
+                            label: "work-2".into(),
+                            route: Some("fixture-browser".into()),
+                            active: false,
+                            observed_at: now,
+                            next_at: Some(now + 900),
+                            diagnostic: if before["diagnostic_ok"] == 1 {
+                                Some(aterm_agent::harness::accounts_sync::LoginDiagnostic::from_exit_for_test(
+                                    roster.row("work-2").unwrap(), now - 1, 1, None,
+                                ))
+                            } else { None },
+                            identity: roster.row("work-2").map(
+                                aterm_agent::harness::accounts_sync::LoginIdentity::for_test,
+                            ),
+                        }]),
                         _ => unreachable!(),
                     }
                 },
@@ -1334,6 +1374,20 @@ fn independent_execution_transition(
             );
             after.insert("retry", i64::from(retry));
             after.insert("wake", i64::from(wake));
+            after.insert(
+                "work_visible",
+                i64::from(
+                    view.as_ref()
+                        .is_some_and(|value| !value.independent_work.is_empty()),
+                ),
+            );
+            after.insert(
+                "activity_history",
+                i64::from(
+                    view.as_ref()
+                        .is_some_and(|value| !value.login_diagnostics.is_empty()),
+                ),
+            );
         }
         _ => panic!("unknown independent activity action {action}"),
     }
@@ -1357,6 +1411,14 @@ pub(crate) fn execution_transition(
     let mut after = before.clone();
     if action == "Case" {
         after.insert("case", before["case"] + 1);
+        return after;
+    }
+    if action == "WorkSettles" {
+        after.insert("activity", 3);
+        return after;
+    }
+    if action == "RejectDiagnostic" {
+        after.insert("diagnostic_ok", 0);
         return after;
     }
     if before["case"] == 22 {
@@ -1405,6 +1467,7 @@ pub(crate) fn execution_transition(
             ("current", 10),
             ("historical", 11),
             ("wake", 12),
+            ("work_visible", 13),
         ]
     };
     for &(field, index) in fields {
@@ -1418,7 +1481,7 @@ pub(crate) fn execution_transition(
 fn execution_visibility_conforms_to_the_actual_gate_and_rejects_hidden_off_control() {
     use aterm_spec::verify;
     let model = aterm_models_harness::account_execution_visibility_model();
-    assert_eq!(model.mutant_dials(), (1..=38).collect::<Vec<_>>());
+    assert_eq!(model.mutant_dials(), (1..=45).collect::<Vec<_>>());
     let coverage = verify::prove_and_catch_scalar(&model, "account execution visibility");
     if verify::checkers_required() {
         assert_eq!(coverage, verify::Covered::InterpreterAndTy);
@@ -1453,6 +1516,43 @@ fn execution_visibility_conforms_to_the_actual_gate_and_rejects_hidden_off_contr
         "{transitions} actual transitions, {independent_transitions} independent-context transitions"
     );
     let independent = aterm_spec::interp::reachable_states(&model);
+    let settled_normal = independent
+        .iter()
+        .find(|state| {
+            state["case"] == 22
+                && state["stage"] == 1
+                && state["normal"] == 1
+                && state["context"] == 1
+                && state["context_record"] == 1
+                && state["activity"] == 3
+                && state["diagnostic_ok"] == 1
+        })
+        .unwrap();
+    let hidden_history = retained_normal_execution_transition(settled_normal, 3);
+    assert!(!model.check_invariant("SettledHistoryUsesCurrentContext", &hidden_history));
+    assert!(
+        !model
+            .successors("Project", settled_normal)
+            .contains(&hidden_history)
+    );
+    let settled_gate = independent
+        .iter()
+        .find(|state| {
+            state["case"] == 20
+                && state["stage"] == 1
+                && state["elapsed"] == 0
+                && state["activity_rows_changed"] == 1
+                && state["activity"] == 3
+                && state["diagnostic_ok"] == 1
+        })
+        .unwrap();
+    let hidden_history = execution_activity_transition(settled_gate, 1);
+    assert!(!model.check_invariant("SettledHistoryUsesCurrentContext", &hidden_history));
+    assert!(
+        !model
+            .successors("Project", settled_gate)
+            .contains(&hidden_history)
+    );
     for (elapsed, legacy, law) in [
         (1, 1, "CurrentWorkVisible"),
         (0, 2, "CurrentWorkVisible"),
@@ -1463,6 +1563,7 @@ fn execution_visibility_conforms_to_the_actual_gate_and_rejects_hidden_off_contr
             .find(|state| {
                 state["case"] == 20
                     && state["stage"] == 1
+                    && state["activity"] == 0
                     && state["activity_rows_changed"] == 1
                     && state["elapsed"] == elapsed
             })
@@ -1473,6 +1574,31 @@ fn execution_visibility_conforms_to_the_actual_gate_and_rejects_hidden_off_contr
         assert!(!model.check_invariant(law, &old));
         assert!(!model.successors("Project", before).contains(&old));
     }
+    let live = independent
+        .iter()
+        .find(|state| {
+            state["case"] == 20
+                && state["stage"] == 1
+                && state["activity"] == 0
+                && state["elapsed"] == 0
+                && state["activity_rows_changed"] == 1
+        })
+        .unwrap();
+    let hidden_work = execution_activity_transition(live, 1);
+    assert!(!model.check_invariant("CurrentScopedWorkVisible", &hidden_work));
+    let normal = independent
+        .iter()
+        .find(|state| {
+            state["case"] == 22
+                && state["stage"] == 1
+                && state["normal"] == 1
+                && state["context"] == 1
+                && state["context_record"] == 1
+                && state["activity"] == 1
+        })
+        .unwrap();
+    let hidden_work = retained_normal_execution_transition(normal, 3);
+    assert!(!model.check_invariant("CurrentScopedWorkVisible", &hidden_work));
     for (context, legacy, law) in [
         (1, 1, "IndependentWorkVisible"),
         (3, 2, "ContextScopeRespected"),

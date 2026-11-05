@@ -174,7 +174,17 @@ fn register(
 ) -> Result<(aterm_uds::spawnfd::Child, String), String> {
     let instance = aterm_agent::node_service::random_alab_instance_name();
     let log = home.join("member.advert");
-    let file = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+    let _ = std::fs::remove_file(&log);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = opts
+        .open(&log)
+        .map_err(|e| format!("{}: {e}", log.display()))?;
     let err = file
         .try_clone()
         .map_err(|e| format!("{}: {e}", log.display()))?;
@@ -191,7 +201,7 @@ fn register(
 /// Serve as the Allowing member until killed ([`Ask`], the module docs).
 ///
 /// # Errors
-/// The record could not be opened, HOME holds no Commons control that may allow, or the
+/// The record could not be opened, HOME is no member that may allow, or the
 /// listener could not bind; each but the first is also a `refused` line.
 pub(crate) fn member(ask: &Ask) -> Result<(), String> {
     let out = Arc::new(Out::open(&ask.out)?);
@@ -255,15 +265,23 @@ pub(crate) fn member(ask: &Ask) -> Result<(), String> {
     })
 }
 
-/// HOME's Commons state once it reads as a member that may allow, within [`LOCAL_WITHIN`].
+/// HOME's membership once it reads as a member that may allow, within [`LOCAL_WITHIN`].
 fn wait_local(paths: &Paths) -> Result<Local, String> {
     let started = Instant::now();
     loop {
         let why = match Local::of(paths) {
             Ok(Some(local)) if local.can_allow() => return Ok(local),
-            Ok(Some(_)) => "no Commons roster binds this member, so it cannot allow".to_owned(),
-            Ok(None) => "this member holds no Commons control".to_owned(),
-            Err(error) => format!("this member's Commons state: {error}"),
+            Ok(Some(_)) => {
+                "neither its membership log seats this member nor a Commons roster binds it, so \
+                 it cannot allow"
+                    .to_owned()
+            }
+            Ok(None) => {
+                "this Mac reads as no member: no vault, one not applied or still busy, no seat in \
+                 its membership log, or no pinned Commons anchor"
+                    .to_owned()
+            }
+            Err(error) => format!("this member's membership: {error}"),
         };
         if started.elapsed() >= LOCAL_WITHIN {
             return Err(format!("{why} ({} s on)", LOCAL_WITHIN.as_secs()));
@@ -280,11 +298,7 @@ fn flat(text: &str) -> String {
 /// A fleet secret no one else holds: the listener proves it to no one and serves no op by it.
 fn fresh_secret() -> Result<FleetSecret, String> {
     let mut bytes = [0u8; FleetSecret::MAX_LEN];
-    std::io::Read::read_exact(
-        &mut std::fs::File::open("/dev/urandom").map_err(|e| format!("/dev/urandom: {e}"))?,
-        &mut bytes,
-    )
-    .map_err(|e| format!("/dev/urandom: {e}"))?;
+    aterm_uds::rand::fill(&mut bytes).map_err(|e| format!("entropy: {e}"))?;
     FleetSecret::new(&bytes).map_err(|_| "a fleet secret of the wrong length".to_owned())
 }
 

@@ -12,7 +12,7 @@ use crate::explain::fixtures::{
     tab2_build_1048, two_coalitions_1421, wrapped_1218,
 };
 use crate::explain::{CoalLane, LeadIdentity, Voucher};
-use crate::model::{MemCounters, MemSample, Pressure, Thermal, Vitals};
+use crate::model::{MemCounters, MemSample, Pressure, Thermal, Throttle, Vitals};
 use crate::sys::json::{SPLIT_PARTS, contract_violations};
 use crate::sys::view::{Reply, render_json, render_text};
 use crate::sys::{Ctx, Freshness, Machine, TabFact, Target, apply_delta, fingerprints};
@@ -153,7 +153,7 @@ fn field(line: &str, key: &str) -> i64 {
 }
 
 const EXAMPLE_A: &str = "\
-OK 16 sys v=1 view=why subject=global.cpu as_of=17:32:41.200 age_ms=120 window_ms=5000 next=7f3a.7
+OK 18 sys v=1 view=why subject=global.cpu as_of=17:32:41.200 age_ms=120 window_ms=5000 next=7f3a.7
 why     global cpu: 3.3 of 18 cores busy, easing; mostly macOS services (2.17c); Spotlight, after start-up; this tab is not the cause
 split tab_mc=200 aterm_rest_mc=200 others_mc=730 services_mc=2170 unaccounted_mc=0 exact=exact via=coalitions n=9
 you tab=1 role=minor cpu_mc=200 share_pm=61
@@ -170,6 +170,8 @@ pass trend=easing src=kernel
 do class=none may=agent destructive=0
 cannot what=index_progress why=unsupported
 cannot what=index_folder why=needs_privilege:root
+CPU hardware: not sampled; `sys cores` reads it
+OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude another limit
 ";
 
 #[test]
@@ -181,7 +183,7 @@ fn example_a_spotlight_after_start_up() {
     assert_eq!(a, EXAMPLE_A);
     assert!(a.len() <= REPLY_MAX, "{} bytes", a.len());
     let bare = why("why", &c);
-    assert!(bare.starts_with("OK 17 sys v=1 view=why subject=global.cpu "));
+    assert!(bare.starts_with("OK 19 sys v=1 view=why subject=global.cpu "));
     assert_eq!(lines(&bare, "who").len(), 8);
     assert!(lines(&bare, "more").is_empty());
     assert!(bare.len() <= REPLY_MAX, "{} bytes", bare.len());
@@ -260,9 +262,11 @@ fn example_b_a_calm_mac_is_two_lines() {
     let c = ctx(&w, &s, true);
     assert_eq!(
         why("why", &c),
-        "OK 2 sys v=1 view=why subject=global as_of=22:10:02.120 age_ms=120 window_ms=5000 next=7f3a.7
+        "OK 4 sys v=1 view=why subject=global as_of=22:10:02.120 age_ms=120 window_ms=5000 next=7f3a.7
 why     calm: 0.4 of 18 cores busy; memory 16.6 GiB used · available not reported · 128 GiB total, pressure normal; swap 0; no cause open
 you tab=1 role=minor basis=machine_calm cpu_mc=120 share_pm=300
+CPU hardware: not sampled; `sys cores` reads it
+OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude another limit
 "
     );
     let j = render_json(&q("why --json"), &c);
@@ -335,7 +339,7 @@ fn the_memory_reply_reads_its_classes_and_footprints() {
     let t = why("why mem top=3", &c);
     assert_eq!(
         t,
-        "OK 13 sys v=1 view=why subject=global.mem as_of=22:10:02.120 age_ms=120 window_ms=5000 next=7f3a.7
+        "OK 15 sys v=1 view=why subject=global.mem as_of=22:10:02.120 age_ms=120 window_ms=5000 next=7f3a.7
 why     global memory: 16.5 of 128 GiB used; pressure normal; swap 0; nothing compressed; no cause open; this tab is not the cause
 classes total_bytes=137438953472 app_bytes=12545392640 wired_bytes=5132959744 compressed_bytes=0 used_bytes=17678352384 cache_bytes=27967258624 free_bytes=89733971968 src=kernel
 classes not_in_vm_bytes=2059370496 src=derived
@@ -349,6 +353,8 @@ pass trend=steady src=kernel
 do class=none may=agent destructive=0
 cannot what=wired_by_process why=needs_privilege:root
 cannot what=uncharged_memory why=unsupported
+CPU hardware: not sampled; `sys cores` reads it
+OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude another limit
 "
     );
     let classes = lines(&t, "classes");
@@ -847,8 +853,8 @@ fn a_context_with_no_covering_cause_is_the_headline() {
 
     let hot = Scene {
         thermal: Some(Thermal {
-            level: Throttle::Light,
-            raw: 1,
+            level: Throttle::Heavy,
+            raw: 2,
             low_power: Some(false),
             exact: true,
         }),
@@ -856,15 +862,63 @@ fn a_context_with_no_covering_cause_is_the_headline() {
     };
     let s = read(&hot, 3);
     let cpu = why("why cpu", &ctx(&w, &s, true));
-    assert!(cpu.contains("; throttled: light; "), "{cpu}");
+    assert!(cpu.contains("; thermal serious; "), "{cpu}");
     assert_eq!(
         lines(&cpu, "cause"),
-        ["cause id=throttled level=light low_power=0 sure=held src=kernel"]
+        ["cause id=throttled level=serious low_power=0 sure=held src=kernel"]
     );
     assert!(
         cpu.contains("\ncannot what=remedy why=unsupported\n"),
         "{cpu}"
     );
+}
+
+/// The cause engine names `throttled` only where the level claims throttling: an exact OS
+/// level of serious or above, a heuristic level of light or above, or Low Power Mode. Fair
+/// ("slightly elevated") names none, so `sys why` on a calm Mac at Fair is calm and says no
+/// "throttled". Control: the code before A2 S3 named `throttled level=light` at Fair.
+#[test]
+fn fair_names_no_throttled_cause() {
+    let w = mac();
+    let at = |level, raw, exact, low_power| Scene {
+        thermal: Some(Thermal {
+            level,
+            raw,
+            low_power,
+            exact,
+        }),
+        ..calm_1510()
+    };
+    let fair = read(&at(Throttle::Light, 1, true, Some(false)), 3);
+    let c = ctx(&w, &fair, true);
+    for text in ["why", "why cpu"] {
+        let t = why(text, &c);
+        assert!(lines(&t, "cause").is_empty(), "{text}: {t}");
+        assert!(!t.contains("throttled"), "{text}: {t}");
+    }
+    assert_eq!(
+        bare_subject(&fair),
+        Bare::Calm,
+        "a calm Mac at Fair is calm"
+    );
+    assert!(
+        why("why cpu", &c).contains("\ndo class=none "),
+        "nothing needs doing at Fair"
+    );
+    for (scene, word) in [
+        (at(Throttle::Heavy, 2, true, Some(false)), "serious"),
+        (at(Throttle::Severe, 3, true, Some(false)), "critical"),
+        (at(Throttle::Light, 1, false, None), "light"),
+        (at(Throttle::Light, 1, true, Some(true)), "fair"),
+    ] {
+        let t = why("why cpu", &ctx(&w, &read(&scene, 3), true));
+        let named: Vec<&str> = lines(&t, "cause")
+            .into_iter()
+            .filter(|l| l.starts_with("cause id=throttled "))
+            .collect();
+        assert_eq!(named.len(), 1, "{word}: {t}");
+        assert!(named[0].contains(&format!(" level={word} ")), "{t}");
+    }
 }
 
 #[test]
@@ -951,7 +1005,7 @@ fn each_cause_says_its_own_words() {
     assert!(t.contains("; throttled: low power; "), "{t}");
     assert_eq!(
         cause(&t, "throttled"),
-        "cause id=throttled level=none low_power=1 sure=held src=kernel"
+        "cause id=throttled level=nominal low_power=1 sure=held src=kernel"
     );
 
     let t = why_of(&tab2_build_1048(), "why");
@@ -1187,6 +1241,83 @@ fn the_hardware_block_gives_way_before_the_last_who_rows() {
     assert!(cores.contains("CPU hardware: native IOReport"), "{cores}");
 }
 
+/// A `sys why` over a snapshot that took no CPU Stats sample (the deck's readings take none,
+/// and an unforced `sys why` pulls for none; A2 §6.4) says so in one line, first among its
+/// `cpu_hardware` lines and for each subject, in place of the clauses that need a sample and the
+/// pointer to inspect them, which `sys cores` prints; the clauses that need none stay: the OS
+/// thermal state and saved underuse. Its JSON says `not_sampled`. A snapshot that took one prints the IOReport clauses and no
+/// such line. CONTROL: the S2 commit's reply dropped the thermal and saved-underuse lines with
+/// the sample, which the counts here fail.
+#[test]
+fn a_why_without_cpu_stats_says_so_and_keeps_what_needs_none() {
+    let mut s = read(&long_workers_1032(), 3);
+    assert!(s.hardware.is_none(), "the scene takes no CPU Stats sample");
+    s.thermal = Some(Thermal {
+        level: crate::model::Throttle::Light,
+        raw: 1,
+        low_power: Some(false),
+        exact: true,
+    });
+    s.cpu_diagnostics = Some(crate::hardware::Bundle {
+        version: 1,
+        since_ns: s.at_ns,
+        last_ns: s.at_ns,
+        resolved_ns: None,
+        frames: vec![crate::hardware::Frame {
+            clusters: Vec::new(),
+            busy: Vec::new(),
+            kernel_window_ns: None,
+            at_ns: s.at_ns,
+            at_unix_ms: s.at_unix_ms,
+            counters: Vec::new(),
+            hardware: None,
+            thermal: None,
+            wait: None,
+            workers: Vec::new(),
+        }],
+    });
+    let w = mac();
+    let hardware_lines = |text: &str, s: &Snapshot| -> Vec<String> {
+        render_text(&q(text), &ctx(&w, s, true))
+            .lines
+            .iter()
+            .filter(|l| l.key == "cpu_hardware")
+            .map(|l| l.text.clone())
+            .collect()
+    };
+    for text in ["why", "why mem", "why cpu"] {
+        let hw = hardware_lines(text, &s);
+        assert_eq!(
+            hw[0], "CPU hardware: not sampled; `sys cores` reads it",
+            "{text}"
+        );
+        let kept = |p: &str| hw.iter().filter(|l| l.starts_with(p)).count();
+        assert_eq!(kept("OS thermal state 1"), 1, "{text}: {hw:?}");
+        assert_eq!(kept("Saved CPU underuse: 1 frames"), 1, "{text}: {hw:?}");
+        assert_eq!(kept("Inspect/export:"), 0, "{text}: {hw:?}");
+        assert_eq!(kept("CPU hardware: native IOReport"), 0, "{text}: {hw:?}");
+        assert_eq!(kept("Online CPUs"), 0, "{text}: {hw:?}");
+        let j = render_json(&q(&format!("{text} --json")), &ctx(&w, &s, true));
+        assert_eq!(
+            j.get("cpu_hardware"),
+            Some(&Jv::why("not_sampled")),
+            "{text}"
+        );
+    }
+    let mut sampled = s;
+    sampled.hardware = Some(crate::hardware::Sample::unavailable("warming"));
+    let hw = hardware_lines("why top=3", &sampled);
+    assert!(
+        hw[0].starts_with("CPU hardware: native IOReport"),
+        "a sampled snapshot prints the block: {hw:?}"
+    );
+    assert!(
+        hw.iter().any(|l| l.starts_with("Inspect/export:")),
+        "{hw:?}"
+    );
+    assert!(!hw.iter().any(|l| l.contains("not sampled")), "{hw:?}");
+}
+
 #[test]
 fn the_cut_counts_a_since_replys_delta_header() {
     let base = read(&long_workers_1032(), 3);
@@ -1407,7 +1538,7 @@ fn a_cold_why_names_its_cause_with_no_opened() {
     let s = read(&spotlight_1032(), 1);
     let t = why("why", &ctx(&w, &s, true));
     assert!(
-        t.starts_with("OK 17 sys v=1 view=why subject=global.cpu "),
+        t.starts_with("OK 18 sys v=1 view=why subject=global.cpu "),
         "{t}"
     );
     let spotlight = lines(&t, "cause")[0];
@@ -1465,7 +1596,7 @@ fn a_why_reply_is_as_old_as_its_split() {
     let c = ctx(&w, &s, true);
     let t = why("why", &c);
     assert!(
-        t.starts_with("OK 17 sys v=1 view=why subject=global.cpu as_of=17:32:41.200 age_ms=1120 window_ms=5000 "),
+        t.starts_with("OK 18 sys v=1 view=why subject=global.cpu as_of=17:32:41.200 age_ms=1120 window_ms=5000 "),
         "{t}"
     );
     let j = render_json(&q("why --json"), &c);
@@ -1538,6 +1669,7 @@ const EXAMPLE_A_JSON: &str = r#"{"schema":1,
 "do":[{"class":"none","may":"agent","destructive":0}],
 "cannot":[{"what":"index_progress","reason":{"why":"unsupported"}},
 {"what":"index_folder","reason":{"why":"needs_privilege:root"}}],
+"cpu_hardware":{"why":"not_sampled"},
 "events":[]}"#;
 
 const MEM_1142_JSON: &str = r#"{"schema":1,
@@ -1562,6 +1694,7 @@ const MEM_1142_JSON: &str = r#"{"schema":1,
 "do":[{"class":"none","may":"agent","destructive":0}],
 "cannot":[{"what":"wired_by_process","reason":{"why":"needs_privilege:root"}},
 {"what":"uncharged_memory","reason":{"why":"unsupported"}}],
+"cpu_hardware":{"why":"not_sampled"},
 "events":[]}"#;
 
 #[test]
@@ -1825,33 +1958,41 @@ fn an_unmeasured_coalition_reads_no_cpu() {
 }
 
 #[test]
+/// An unchanged reply folds every value line into one `same` line. The CPU-hardware block's
+/// notes are evidence, not values: a `since=` reply sends them again, here the OS thermal state.
 fn since_folds_every_unchanged_record() {
     let w = mac();
     let s = example_a();
     let c = ctx(&w, &s, true);
     for text in ["why top=6", "why mem", "why"] {
         let first = render_text(&q(text), &c);
-        let keys: Vec<&str> = first.lines.iter().map(|l| l.key.as_str()).collect();
+        let (values, notes): (Vec<_>, Vec<_>) = first.lines.iter().partition(|l| l.value);
+        let keys: Vec<&str> = values.iter().map(|l| l.key.as_str()).collect();
         let mut unique = keys.clone();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), keys.len(), "{keys:?}");
-        assert!(first.lines.iter().all(|l| l.value), "{keys:?}");
+        let notes: Vec<&str> = notes.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            notes,
+            [
+                "OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude another limit"
+            ],
+            "{text}"
+        );
         let mut again = render_text(&q(text), &c);
         let folded = apply_delta(&mut again, &fingerprints(&first));
         assert_eq!(folded.len(), keys.len());
-        assert_eq!(again.lines.len(), 1);
-        assert!(
-            again.lines[0].text.starts_with("same why,"),
-            "{}",
-            again.lines[0].text
-        );
+        let left: Vec<&str> = again.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(left[0].starts_with("same why,"), "{left:?}");
+        assert_eq!(left[1], notes[0]);
     }
     let first = render_text(&q("why top=6"), &c);
     let mut cut = render_text(&q("why top=5"), &c);
     apply_delta(&mut cut, &fingerprints(&first));
     let kept: Vec<&str> = cut.lines.iter().map(|l| l.key.as_str()).collect();
-    assert_eq!(kept, ["same", "more"]);
+    assert_eq!(kept, ["same", "more", "cpu_hardware"]);
 }
 
 #[test]

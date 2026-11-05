@@ -12,6 +12,10 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "restore_claude_auth.rs"]
+mod claude_auth;
+pub(crate) use claude_auth::ClaudeAuthRestore;
+
 /// The current on-disk schema.
 pub(crate) const SCHEMA: u32 = 2;
 const LEGACY_SCHEMA: u32 = 1;
@@ -188,6 +192,7 @@ pub(crate) struct AgentRestore {
     pub version: Option<String>,
     pub home: Option<String>,
     pub login: Option<String>,
+    pub claude_auth: Option<ClaudeAuthRestore>,
     pub run: Option<RunRestore>,
     pub word: String,
     pub cause: Option<String>,
@@ -220,6 +225,8 @@ mod leaf {
         pub(super) home: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) login: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) claude_auth: Option<super::ClaudeAuthRestore>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) codex: Option<super::CodexRestore>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -257,6 +264,7 @@ impl From<leaf::AgentRestore> for AgentRestore {
             version: leaf.version,
             home: leaf.home,
             login: leaf.login,
+            claude_auth: leaf.claude_auth,
             run: match (leaf.codex, leaf.muse, leaf.agy, &leaf.gemini) {
                 (Some(codex), None, None, None) => Some(RunRestore::Codex(codex)),
                 (None, Some(muse), None, None) => Some(RunRestore::Muse(muse)),
@@ -292,6 +300,7 @@ impl From<AgentRestore> for leaf::AgentRestore {
             version: agent.version,
             home: agent.home,
             login: agent.login,
+            claude_auth: agent.claude_auth,
             codex,
             word: agent.word,
             cause: agent.cause,
@@ -323,7 +332,22 @@ impl<'de> Deserialize<'de> for AgentRestore {
                 "an agent restore has more than one run table",
             ));
         }
-        Ok(Self::from(leaf))
+        let agent = Self::from(leaf);
+        let claude = match agent.agent() {
+            Some(aterm_agent::harness::upgrade::Agent::Claude) => true,
+            Some(
+                aterm_agent::harness::upgrade::Agent::Codex
+                | aterm_agent::harness::upgrade::Agent::Muse
+                | aterm_agent::harness::upgrade::Agent::Agy,
+            )
+            | None => false,
+        };
+        if agent.claude_auth.is_some() && !claude {
+            return Err(serde::de::Error::custom(
+                "Claude authentication attribution belongs only to a Claude restore",
+            ));
+        }
+        Ok(agent)
     }
 }
 
@@ -454,6 +478,13 @@ impl AgentRestore {
     /// The durable half of the relaunch snapshot `snap`.
     pub(crate) fn of(snap: aterm_agent::harness::relaunch::Snapshot) -> Self {
         let word = snap.agent().word().to_string();
+        let claude_auth = (matches!(snap.run, AgentRun::Claude) && snap.auth_observed).then(|| {
+            ClaudeAuthRestore {
+                stored_login: snap.stored_login,
+                profile: snap.profile.map(Into::into),
+                launch_env: snap.launch_env.map(|env| env.entries().to_vec()),
+            }
+        });
         let (session, lane_session) = match &snap.run {
             AgentRun::Muse(_) | AgentRun::Agy(_) => (None, snap.session),
             AgentRun::Claude | AgentRun::Codex(_) => (snap.session, None),
@@ -470,6 +501,7 @@ impl AgentRestore {
             version: snap.version,
             home: snap.home,
             login: snap.login,
+            claude_auth,
             run: match snap.run {
                 AgentRun::Claude => None,
                 AgentRun::Codex(run) => Some(RunRestore::Codex(CodexRestore {
@@ -497,6 +529,22 @@ impl AgentRestore {
     }
 
     /// The relaunch snapshot of this agent in the reopened tab `tab`, whose shell is `shell`.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ClaudeRestoreAuth",
+            action = "NextCase",
+            reason = "Choose captured, legacy, or wrong-provider restore metadata."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ClaudeRestoreAuth",
+            action = "Restore",
+            project = "restore::claude_auth::tests::restore_transition"
+        )
+    )]
     pub(crate) fn snapshot(
         self,
         tab: String,
@@ -507,6 +555,19 @@ impl AgentRestore {
             return None;
         }
         let agent = self.agent()?;
+        let auth_observed = self.claude_auth.is_some();
+        let (stored_login, profile, launch_env) = self
+            .claude_auth
+            .map(|auth| {
+                (
+                    auth.stored_login,
+                    auth.profile.map(Into::into),
+                    auth.launch_env
+                        .as_deref()
+                        .and_then(aterm_agent::harness::accounts::LaunchEnv::of_record),
+                )
+            })
+            .unwrap_or_default();
         let mut session = self.session;
         let run = match (agent, self.run) {
             (Agent::Claude, _) => AgentRun::Claude,
@@ -560,8 +621,10 @@ impl AgentRestore {
             claude_dir: None,
             login: self.login,
             home: self.home,
-            stored_login: false,
-            profile: None,
+            stored_login,
+            auth_observed,
+            profile,
+            launch_env,
         })
     }
 }
@@ -1504,6 +1567,11 @@ pub(crate) struct RestoredTab {
     /// an older build ignores it, losing only the grouping.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub parked: bool,
+    /// A tab its task opened for itself ([`crate::tab_model::Tab::ephemeral`]), which goes once its
+    /// task concluded. A parked tab is one whatever this says, as a manifest from before the mark
+    /// has it; an older build ignores it, and the tab stays a person's there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
 }
 
 impl RestoredTab {
@@ -1764,7 +1832,8 @@ pub(crate) struct WindowLayout {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_item: Option<usize>,
     /// The window showed its Workers list (`docs/DESIGN-workers-tab-2026-11-02.md`), which has no
-    /// item of its own: restore opens the list again and brings it to the front.
+    /// item of its own: restore opens the list again and brings it to the front. With no tab
+    /// beside it, it is a lone list ([`Self::is_lone_workers_list`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workers_in_front: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1772,6 +1841,37 @@ pub(crate) struct WindowLayout {
 }
 
 impl WindowLayout {
+    /// The row names no tab of any kind.
+    pub(crate) fn holds_no_tab(&self) -> bool {
+        self.tabs.is_empty() && self.native_tabs.is_empty() && self.restored_tabs.is_empty()
+    }
+
+    /// All a capture describes of the window is a Workers list with no worker in it: the list stood
+    /// alone, or beside a private document's tab, which no capture describes. Only a handoff to a
+    /// target that declares `desk1` carries such a row ([`Self::kept_in_layout`]), and a restore
+    /// rebuilds it as that list with no shell.
+    pub(crate) fn is_lone_workers_list(&self) -> bool {
+        self.workers_in_front && self.holds_no_tab()
+    }
+
+    /// Restoring this row leaves no terminal in the window.
+    pub(crate) fn holds_no_terminal(&self) -> bool {
+        if self.restored_tabs.is_empty() {
+            self.tabs.is_empty()
+        } else {
+            self.restored_tabs
+                .iter()
+                .all(|tab| tab.root.first_terminal_leaf().is_none())
+        }
+    }
+
+    /// Whether a capture keeps this row: a window with nothing to bring back would come back as a
+    /// new shell the person never had, unless the capture carries lone lists for a target that
+    /// rebuilds them.
+    pub(crate) fn kept_in_layout(&self, carry_lone_lists: bool) -> bool {
+        !self.holds_no_tab() || (carry_lone_lists && self.workers_in_front)
+    }
+
     /// The handed-off shell id of the pane this window's bootstrap session fills.
     pub(crate) fn bootstrap_local_id(&self) -> Option<u64> {
         match self.bootstrap_terminal_leaf() {
@@ -1886,6 +1986,28 @@ impl WindowLayout {
         }
         for tab in &mut self.restored_tabs {
             tab.sanitize();
+        }
+    }
+
+    /// The row a capture writes for a window that holds only an empty Workers list.
+    #[cfg(test)]
+    pub(crate) const fn lone_workers_list(rows: u16, cols: u16) -> Self {
+        Self {
+            rows,
+            cols,
+            active_tab: 0,
+            outer_x: None,
+            outer_y: None,
+            maximized: None,
+            inner_px: None,
+            presence_row: false,
+            show: WindowShow::UNKNOWN,
+            tabs: Vec::new(),
+            native_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            active_item: None,
+            workers_in_front: true,
+            restored_tabs: Vec::new(),
         }
     }
 
@@ -2025,6 +2147,7 @@ impl RestoredTab {
             focused_path: focused.unwrap_or_default(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         })
     }
 
@@ -2045,6 +2168,7 @@ impl RestoredTab {
             focused_path: Vec::new(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         })
     }
 }
@@ -2098,6 +2222,7 @@ impl RestoreManifest {
 
     /// Apply the layout caps in the writer.
     pub(crate) fn fold_into_caps(&mut self) {
+        self.lone_lists_give_up_their_slots();
         let over_tab_cap = |window: &WindowLayout| window.restored_tabs.len() > MAX_TABS_PER_WINDOW;
         if self.windows.len() <= MAX_WINDOWS && !self.windows.iter().any(over_tab_cap) {
             return;
@@ -2169,6 +2294,24 @@ impl RestoreManifest {
         self.fold = fold;
     }
 
+    /// A lone Workers list holds nothing, so no window folds for one: only as many lists as fit
+    /// beside the windows with tabs stay, the earliest first, and one left out counts in no fold.
+    fn lone_lists_give_up_their_slots(&mut self) {
+        let lists = self
+            .windows
+            .iter()
+            .filter(|window| window.is_lone_workers_list())
+            .count();
+        let mut room = MAX_WINDOWS.saturating_sub(self.windows.len() - lists);
+        self.windows.retain(|window| {
+            let stays = !window.is_lone_workers_list() || room > 0;
+            if window.is_lone_workers_list() && stays {
+                room -= 1;
+            }
+            stays
+        });
+    }
+
     fn spill_host_for(&self, donor: usize) -> Option<usize> {
         let count = self.windows.len();
         (donor + 1..count)
@@ -2232,11 +2375,17 @@ impl RestoreManifest {
         })
     }
 
-    /// Whether there is anything worth restoring (at least one window with one tab).
+    /// Whether there is nothing worth restoring: no window with a tab or a lone Workers list.
     pub(crate) fn is_empty(&self) -> bool {
         self.windows
             .iter()
-            .all(|w| w.tabs.is_empty() && w.native_tabs.is_empty() && w.restored_tabs.is_empty())
+            .all(|w| w.holds_no_tab() && !w.is_lone_workers_list())
+    }
+
+    /// Whether a window's row is a lone Workers list ([`WindowLayout::is_lone_workers_list`]).
+    #[cfg(unix)]
+    pub(crate) fn carries_lone_workers_list(&self) -> bool {
+        self.windows.iter().any(WindowLayout::is_lone_workers_list)
     }
 
     /// The exact set of live terminal ids a seamless-update layout carries, sorted and distinct.
@@ -2503,6 +2652,7 @@ impl RestoreManifest {
                 focused_path: Vec::new(),
                 zoomed: false,
                 parked: false,
+                ephemeral: false,
             }],
         }])
     }
@@ -3226,18 +3376,25 @@ fn with_restore_lock_seeing<T, E: From<RestoreFault>>(
     let lock_path = restore_lock_path(path).ok_or_else(|| {
         RestoreFault::settled(format!("restore manifest {} has no parent", path.display()))
     })?;
-    let lock = OpenOptions::new()
+    let mut lock_opts = OpenOptions::new();
+    lock_opts
         .read(true)
         .write(true)
         .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|error| {
-            RestoreFault::io(
-                format_args!("open restore lock {}", lock_path.display()),
-                &error,
-            )
-        })?;
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        lock_opts
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let lock = lock_opts.open(&lock_path).map_err(|error| {
+        RestoreFault::io(
+            format_args!("open restore lock {}", lock_path.display()),
+            &error,
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3328,11 +3485,15 @@ fn create_unique_restore_sibling(
     let seed = next_restore_seed();
     for attempt in 0_u32..64 {
         let candidate = restore_sibling_path(parent, name, purpose, seed, attempt);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        match opts.open(&candidate) {
             Ok(file) => return Ok((candidate, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -3446,7 +3607,12 @@ fn move_restore_file(source: &Path, target: &Path, replace: bool) -> std::io::Re
 
 #[cfg(unix)]
 fn sync_restore_directory(path: &Path, flush: Flush) -> std::io::Result<()> {
-    crate::durable::finish(&File::open(path)?, flush)
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    crate::durable::finish(&handle, flush)
 }
 
 #[cfg(not(unix))]
@@ -3638,7 +3804,7 @@ fn take_holding_result(
                     read
                 }
                 None => {
-                    let read = match File::open(&taken) {
+                    let read = match crate::logging::open_regular_nonblock(&taken) {
                         Ok(file) => read_take(&file, &taken),
                         Err(error) => {
                             crate::logging::stderr_line!(
@@ -3743,7 +3909,7 @@ fn hold_take(path: &Path) -> Option<crate::native_document_host::HeldAdvisoryLoc
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .ok()?;
     let lock = crate::native_document_host::HeldAdvisoryLock::try_lock(file).ok()?;
@@ -3988,9 +4154,12 @@ mod cold_resume_environment_tests;
 mod tests {
     use super::*;
 
+    /// THE PARKED BIT AND THE EPHEMERAL MARK ROUND-TRIP, EACH ON ITS OWN, AND A RECORD WITH
+    /// NEITHER READS AS A PERSON'S SHOWN TAB: a person's tab writes neither key, so an older
+    /// build's record reads as one.
     #[test]
-    fn the_parked_bit_round_trips_and_an_old_record_reads_as_a_shown_tab() {
-        let tab = |parked| RestoredTab {
+    fn the_parked_bit_and_the_mark_round_trip_and_an_old_record_reads_as_a_shown_tab() {
+        let tab = |parked, ephemeral| RestoredTab {
             root: RestoredSplitTree::leaf(RestoredView::Placeholder(PlaceholderLeafRestore {
                 restore_tag: "gone".to_string(),
                 reason: "gone".to_string(),
@@ -4000,18 +4169,25 @@ mod tests {
             focused_path: Vec::new(),
             zoomed: false,
             parked,
+            ephemeral,
         };
-        let shown = aterm_toml::to_string(&tab(false)).expect("serializes");
-        assert!(!shown.contains("parked"), "{shown}");
+        let shown = aterm_toml::to_string(&tab(false, false)).expect("serializes");
+        assert!(
+            !shown.contains("parked") && !shown.contains("ephemeral"),
+            "{shown}"
+        );
         assert_eq!(
             aterm_toml::from_str::<RestoredTab>(&shown).expect("an old record reads"),
-            tab(false)
+            tab(false, false)
         );
-        let parked = aterm_toml::to_string(&tab(true)).expect("serializes");
-        assert_eq!(
-            aterm_toml::from_str::<RestoredTab>(&parked).expect("reads"),
-            tab(true)
-        );
+        for (parked, ephemeral) in [(true, true), (false, true), (true, false)] {
+            let wrote = aterm_toml::to_string(&tab(parked, ephemeral)).expect("serializes");
+            assert_eq!(wrote.contains("ephemeral"), ephemeral, "{wrote}");
+            assert_eq!(
+                aterm_toml::from_str::<RestoredTab>(&wrote).expect("reads"),
+                tab(parked, ephemeral)
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -4442,6 +4618,58 @@ mod tests {
         }))
     }
 
+    /// The row a handoff carries for a window that held only an empty Workers list reads as a
+    /// layout and round-trips as `outgoing_layout_wire` requires, unlike a bare row with no tab.
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_workers_list_row_is_a_layout_and_round_trips() {
+        let lone = WindowLayout::lone_workers_list(24, 80);
+        assert!(lone.is_lone_workers_list() && lone.holds_no_tab() && lone.holds_no_terminal());
+        let desk = RestoreManifest::new(vec![lone.clone()]);
+        assert!(!desk.is_empty(), "a lone list is something to place");
+        assert!(desk.carries_lone_workers_list());
+        let wire = desk.to_toml().expect("the row serializes");
+        assert_eq!(
+            RestoreManifest::from_toml(&wire).as_ref(),
+            Some(&desk),
+            "the parent's own read-back holds"
+        );
+
+        let bare = WindowLayout {
+            workers_in_front: false,
+            ..lone.clone()
+        };
+        assert!(!bare.is_lone_workers_list());
+        let nothing = RestoreManifest::new(vec![bare.clone()]);
+        assert!(nothing.is_empty(), "CONTROL: a window with nothing in it");
+        assert!(!nothing.carries_lone_workers_list());
+
+        let mut beside_a_tab = held_desk(None);
+        let tabbed = beside_a_tab.windows[0].clone();
+        assert!(!tabbed.is_lone_workers_list(), "CONTROL: it has a tab");
+        beside_a_tab.windows.push(lone.clone());
+        assert!(beside_a_tab.carries_lone_workers_list());
+
+        for (row, keeps_lists, kept) in [
+            (&lone, true, true),
+            (&lone, false, false),
+            (&bare, true, false),
+            (&bare, false, false),
+            (&tabbed, true, true),
+            (&tabbed, false, true),
+        ] {
+            assert_eq!(
+                row.kept_in_layout(keeps_lists),
+                kept,
+                "{row:?} with lone lists kept={keeps_lists}"
+            );
+        }
+        assert!(
+            !tabbed.holds_no_terminal(),
+            "CONTROL: a window with terminals restores terminals"
+        );
+    }
+
     fn held_desk(exited: Option<u64>) -> RestoreManifest {
         let mut settings = NativeLeafRestore::settings("/text-fonts".to_string());
         settings.settings_drafts = vec![SettingsDraftRestore {
@@ -4489,12 +4717,14 @@ mod tests {
                     focused_path: vec![RestoreBranch::Second],
                     zoomed: false,
                     parked: false,
+                    ephemeral: false,
                 },
                 RestoredTab {
                     root: RestoredSplitTree::leaf(RestoredView::Native(settings)),
                     focused_path: Vec::new(),
                     zoomed: false,
                     parked: false,
+                    ephemeral: false,
                 },
             ],
         }])
@@ -4605,6 +4835,31 @@ mod tests {
 
         let exact = RestoreManifest::from_toml(&held_desk(Some(7)).to_toml().unwrap()).unwrap();
         assert_eq!(exact.clone().placed_for_handed(&[0, 7]), Ok(exact));
+    }
+
+    /// A row whose shells were all retired at intake holds no terminal, though it keeps its
+    /// legacy mirror: the restore reads `restored_tabs`, and so does the first paint's guard.
+    #[test]
+    fn a_row_retired_at_intake_holds_no_terminal() {
+        let parsed = RestoreManifest::from_toml(&held_desk(Some(7)).to_toml().unwrap()).unwrap();
+        assert!(
+            !parsed.windows[0].holds_no_terminal(),
+            "CONTROL: two shells"
+        );
+        let retired = parsed
+            .clone()
+            .placed_for_handed(&[])
+            .expect("a layout with no shell handed is placed");
+        assert!(
+            !retired.windows[0].tabs.is_empty(),
+            "PRECONDITION: the mirror"
+        );
+        assert!(retired.windows[0].holds_no_terminal());
+        let one = parsed.placed_for_handed(&[0]).expect("one shell handed");
+        assert!(
+            !one.windows[0].holds_no_terminal(),
+            "CONTROL: one shell stays"
+        );
     }
 
     #[test]
@@ -4732,6 +4987,7 @@ mod tests {
             focused_path: Vec::new(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         });
         RestoreManifest::new(vec![window])
     }
@@ -5151,6 +5407,7 @@ focused = true
                     focused_path: Vec::new(),
                     zoomed: false,
                     parked: false,
+                    ephemeral: false,
                 })
                 .collect(),
         }
@@ -5207,6 +5464,86 @@ focused = true
         );
         assert!(!wire.contains("fold"), "no fold table: {}", &wire[..200]);
         assert!(folded.admits_whole());
+    }
+
+    /// A lone list holds nothing, so it costs no window with tabs its slot, and one left out is
+    /// no fold. A list's window can still host a spill of shown tabs: it then holds tabs and no
+    /// list.
+    #[test]
+    fn a_lone_list_never_costs_a_window_its_slot() {
+        let lone = || WindowLayout::lone_workers_list(30, 100);
+        let tabbed = |count: u64| -> Vec<WindowLayout> {
+            (0..count)
+                .map(|shell| shells_window(shell..shell + 1))
+                .collect()
+        };
+        let fold = |windows: Vec<WindowLayout>| {
+            let mut desk = RestoreManifest::new(windows);
+            desk.fold_into_caps();
+            desk
+        };
+        let cap = MAX_WINDOWS as u64;
+
+        let mut one_list_first = vec![lone()];
+        one_list_first.extend(tabbed(cap));
+        assert_eq!(
+            fold(one_list_first),
+            RestoreManifest::new(tabbed(cap)),
+            "at the cap the list goes, every window keeps its own row and nothing folds"
+        );
+
+        let mut one_list_last = tabbed(cap);
+        one_list_last.push(lone());
+        assert_eq!(
+            fold(one_list_last),
+            RestoreManifest::new(tabbed(cap)),
+            "the same past the end"
+        );
+
+        let mut past_the_cap = vec![lone()];
+        past_the_cap.extend(tabbed(cap + 1));
+        assert_eq!(
+            fold(past_the_cap),
+            fold(tabbed(cap + 1)),
+            "a desk past the cap folds what it would have folded with no list"
+        );
+
+        let mut one_slot = vec![lone(), lone()];
+        one_slot.extend(tabbed(cap - 1));
+        let kept = fold(one_slot);
+        assert_eq!(kept.windows.len(), MAX_WINDOWS);
+        assert!(
+            kept.windows[0].is_lone_workers_list(),
+            "the earliest list stays"
+        );
+        assert!(
+            !kept.windows[1].is_lone_workers_list(),
+            "the other gave up its slot"
+        );
+        assert_eq!(kept.fold, LayoutFold::default());
+
+        let lists = fold(vec![lone(); MAX_WINDOWS + 1]);
+        assert_eq!(
+            lists.windows.len(),
+            MAX_WINDOWS,
+            "lists alone keep every slot there is"
+        );
+        assert!(lists.windows.iter().all(WindowLayout::is_lone_workers_list));
+        assert_eq!(lists.fold, LayoutFold::default());
+
+        let mut room = tabbed(cap - 2);
+        room.insert(1, lone());
+        let before = RestoreManifest::new(room);
+        let mut within = before.clone();
+        within.fold_into_caps();
+        assert_eq!(within, before, "CONTROL: within the caps nothing changes");
+
+        let host = fold(vec![shells_window(0..257), lone()]);
+        assert_eq!(host.windows[0].restored_tabs.len(), MAX_TABS_PER_WINDOW);
+        assert_eq!(host.windows[1].restored_tabs.len(), 1);
+        assert!(!host.windows[1].is_lone_workers_list());
+        assert_eq!(host.fold.windows, 0);
+        assert!(host.admits_whole(), "the spill's new home reads back");
     }
 
     #[test]
@@ -5515,6 +5852,7 @@ focused = true
                     focused_path: Vec::new(),
                     zoomed: false,
                     parked: false,
+                    ephemeral: false,
                 })
                 .take(2),
             );
@@ -5711,6 +6049,7 @@ metadata = "opaque=copy-me"
             focused_path: Vec::new(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         }];
         assert!(
             RestoreManifest::from_toml(&aterm_toml::to_string(&manifest).unwrap()).is_none(),
@@ -5869,6 +6208,7 @@ metadata = "opaque=copy-me"
                 focused_path: Vec::new(),
                 zoomed: false,
                 parked: false,
+                ephemeral: false,
             }],
         };
         let leaf_of = |m: &RestoreManifest| match &m.windows[0].restored_tabs[0].root {
@@ -5985,6 +6325,7 @@ metadata = "opaque=copy-me"
         } = &mut hosted.windows[0].restored_tabs[0].root
         {
             leaf.agent = Some(Box::new(AgentRestore {
+                claude_auth: None,
                 word: String::new(),
                 pid: 4242,
                 start: "Sat Sep 27 01:02:03 2026".into(),
@@ -6436,6 +6777,7 @@ metadata = "opaque=copy-me"
             out
         }
         let claude = AgentRestore {
+            claude_auth: None,
             word: String::new(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),
@@ -6473,6 +6815,8 @@ metadata = "opaque=copy-me"
     #[test]
     fn a_restored_agent_names_the_tab_it_ran_in_only_for_another() {
         let snap = |tab: &str| aterm_agent::harness::relaunch::Snapshot {
+            launch_env: None,
+            auth_observed: true,
             tab: tab.to_string(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),
@@ -6506,6 +6850,7 @@ metadata = "opaque=copy-me"
     fn a_tabs_holds_ride_its_leaf_and_its_agent_is_not_promised() {
         use crate::fabric::{CARRIED_UNREADABLE, Hold};
         let agent = AgentRestore {
+            claude_auth: None,
             word: String::new(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),
@@ -6607,6 +6952,8 @@ metadata = "opaque=copy-me"
         use aterm_agent::harness::relaunch::{CodexRun, Snapshot};
         use aterm_agent::harness::upgrade::Agent;
         let claude = Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: "s-old".into(),
@@ -6657,18 +7004,29 @@ metadata = "opaque=copy-me"
         let mut claude_with_run = read(&wire(&codex));
         claude_with_run.word = "claude".to_string();
         assert_eq!(claude_with_run.agent(), None, "claude beside a Codex run");
-        let newer = read(&format!("word = \"opencode\"\n{}", wire(&claude)));
+        assert!(
+            aterm_toml::from_str::<AgentRestore>(&format!(
+                "word = \"opencode\"\n{}",
+                wire(&claude)
+            ))
+            .is_err(),
+            "an unknown provider must not carry Claude authentication attribution"
+        );
+        let mut foreign = AgentRestore::of(claude.clone());
+        foreign.claude_auth = None;
+        let foreign_wire = aterm_toml::to_string(&foreign).unwrap();
+        let newer = read(&format!("word = \"opencode\"\n{foreign_wire}"));
         assert_eq!(newer.agent(), None);
         assert!(
             newer.snapshot("s-new".into(), 6161).is_none(),
             "relaunched by nothing"
         );
-        let muse_no_run = read(&format!("word = \"muse\"\n{}", wire(&claude)));
+        let muse_no_run = read(&format!("word = \"muse\"\n{foreign_wire}"));
         assert_eq!(muse_no_run.agent(), None, "muse without its run");
         assert!(muse_no_run.resume_line().is_none());
         assert!(muse_no_run.snapshot("s-new".into(), 6161).is_none());
         for word in ["agy", "gemini"] {
-            let no_run = read(&format!("word = \"{word}\"\n{}", wire(&claude)));
+            let no_run = read(&format!("word = \"{word}\"\n{foreign_wire}"));
             assert_eq!(no_run.agent(), None, "{word} without its run");
             assert_eq!(no_run.name(), None, "{word}");
             assert!(no_run.resume_line().is_none(), "{word}");
@@ -6731,6 +7089,8 @@ metadata = "opaque=copy-me"
         }
 
         let ran = |home: Option<&str>, login: Option<&str>| Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: "s-old".into(),
@@ -6819,6 +7179,7 @@ metadata = "opaque=copy-me"
                 home_env: Some("/Users//me/lab codex/".into()),
                 self_claimed: None,
             }),
+            auth_observed: false,
             ..ran(None, None)
         };
         let ran_codex = codex.codex().cloned().expect("a Codex's run");
@@ -6978,7 +7339,10 @@ metadata = "opaque=copy-me"
         let written = aterm_toml::to_string(&old).expect("0.101.0's record");
         let neither = AgentRestore {
             tab: None,
-            ..AgentRestore::of(ran(None, None))
+            ..AgentRestore::of(Snapshot {
+                auth_observed: false,
+                ..ran(None, None)
+            })
         };
         assert_eq!(
             aterm_toml::to_string(&neither).expect("this build's"),
@@ -7013,6 +7377,7 @@ metadata = "opaque=copy-me"
     fn a_handed_tab_program_names_no_shell_and_a_shells_job_its_shell() {
         use aterm_agent::harness::relaunch::NO_SHELL;
         let agent = AgentRestore {
+            claude_auth: None,
             word: String::new(),
             pid: 4242,
             start: "Sat Sep 27 01:02:03 2026".into(),
@@ -7128,6 +7493,8 @@ metadata = "opaque=copy-me"
         }
 
         let claude = Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: "s-old".into(),
@@ -7171,10 +7538,21 @@ metadata = "opaque=copy-me"
             let older = aterm_toml::from_str::<AgentRestore0105>(&text).expect("0.105.0 reads it");
             assert_eq!(agent_0105(&older), Some(agent), "{text}");
             assert!(text.contains("tab = \"s-old\"\n"), "{text}");
+            let mut legacy = AgentRestore::of(snap.clone());
+            legacy.tab = None;
+            legacy.claude_auth = None;
+            let older_text = aterm_toml::to_string(&older).expect("0.105.0 writes it");
             assert_eq!(
-                aterm_toml::to_string(&older).expect("0.105.0 writes it"),
-                text.replace("tab = \"s-old\"\n", ""),
-                "this build writes {agent}'s leaf as 0.105.0 does"
+                older_text,
+                aterm_toml::to_string(&legacy).unwrap(),
+                "0.105.0 preserves its known fields for {agent}"
+            );
+            assert!(
+                aterm_toml::from_str::<AgentRestore>(&older_text)
+                    .unwrap()
+                    .claude_auth
+                    .is_none(),
+                "older writers do not invent captured attribution"
             );
         }
 
@@ -7521,8 +7899,18 @@ metadata = "opaque=copy-me"
                 );
             }
         }
-        let claude_word: AgentRestore =
-            aterm_toml::from_str(&format!("{}{gemini_table}", wire(&claude))).expect("read");
+        assert!(
+            aterm_toml::from_str::<AgentRestore>(&format!("{}{gemini_table}", wire(&claude)))
+                .is_err(),
+            "a retired provider's table must not carry Claude authentication attribution"
+        );
+        let mut legacy_claude = AgentRestore::of(claude.clone());
+        legacy_claude.claude_auth = None;
+        let claude_word: AgentRestore = aterm_toml::from_str(&format!(
+            "{}{gemini_table}",
+            aterm_toml::to_string(&legacy_claude).unwrap()
+        ))
+        .expect("read");
         assert!(
             claude_word.retired() && claude_word.agent().is_none(),
             "a retired table beside Claude Code's word is no agent's"
@@ -7635,6 +8023,8 @@ metadata = "opaque=copy-me"
         let exe = exe.to_str().unwrap();
         let make_restore = |auth_path: Option<&str>| {
             AgentRestore::of(aterm_agent::harness::relaunch::Snapshot {
+                launch_env: None,
+                auth_observed: true,
                 tab: "s-held".into(),
                 pid: 4242,
                 start: "Wed Oct 28 08:00:00 2026".into(),

@@ -3,6 +3,13 @@
 
 //! Recovered membership records under the current vault and admitted key set, kept within a
 //! byte budget ([`MAX_BYTES`]).
+//!
+//! A read whose opened records file shows the [`fsx::FileStamp`] an entry was read under takes
+//! that entry without reading the file again: the stamp tells one file's contents from another's,
+//! and every writer of this file renames a new one over it. Any other read streams the file, and
+//! a file past [`MAX_INPUT_BYTES`] is hashed whole. On a Mac whose records file had grown past
+//! that bound, each Commons check in a repair round re-hashed it: 3.6 MB about 200 times a round,
+//! which held an idle 0.154.0 at two to four cores (2026-11-05, m117).
 
 use super::{Paths, fsx, sha256};
 use crate::{
@@ -36,15 +43,22 @@ struct Cache {
     budget: usize,
     #[cfg(test)]
     hashes: std::sync::atomic::AtomicUsize,
+    /// How many reads streamed the records file ([`observe`]).
+    #[cfg(test)]
+    observations: std::sync::atomic::AtomicUsize,
 }
 
 struct Entry {
     vault: String,
     keys: Option<Vec<[u8; 32]>>,
+    network: Option<crate::membership_log::RecordId>,
     /// The budgets its store holds records within: the same bytes recover to another store under
     /// others.
     budgets: RecordBudgets,
     digest: [u8; 32],
+    /// The stamp of the newest opened file these bytes were read from, unchanged across that
+    /// read.
+    stamp: fsx::FileStamp,
     bytes: Option<SecretBytes>,
     store: Store,
     /// Its record/index, file, entry and context charge ([`MAX_BYTES`]).
@@ -62,6 +76,8 @@ impl Cache {
             budget,
             #[cfg(test)]
             hashes: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            observations: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -80,19 +96,39 @@ impl Cache {
             paths.records_data_file()?;
             return Ok(store);
         };
+        let stamp = reader.stamp();
+        let keys = store.keys().map(<[[u8; 32]]>::to_vec);
+        let network = store.pinned_network();
+        let budgets = store.budgets();
+        let same_context = |entry: &Entry| {
+            entry.vault == vault
+                && entry.keys == keys
+                && entry.network == network
+                && entry.budgets == budgets
+        };
+        // A recovered store roots another genesis under different admitted
+        // keys, and keeps other records under other budgets. Reuse only under
+        // the current key and budget context, and only for the file as it is
+        // now: the stamp its bytes were read under, or the bytes themselves.
+        if let Ok(entries) = self.entries.lock()
+            && let Some(entry) = entries
+                .iter()
+                .find(|entry| same_context(entry) && entry.stamp == stamp)
+        {
+            after_observation();
+            reader.check_unchanged()?;
+            paths.records_data_file()?;
+            return Ok(entry.store.clone());
+        }
+        #[cfg(test)]
+        self.observations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let observed = observe(&mut reader)?;
         reader.check_unchanged()?;
         after_observation();
-        let keys = store.keys().map(<[[u8; 32]]>::to_vec);
-        let budgets = store.budgets();
-        let same_context =
-            |entry: &Entry| entry.vault == vault && entry.keys == keys && entry.budgets == budgets;
-        // A recovered store roots another genesis under different admitted
-        // keys, and keeps other records under other budgets. Reuse only after
-        // reading the current bytes, key and budget context.
         if let Observed::Small(bytes) = &observed
-            && let Ok(entries) = self.entries.lock()
-            && let Some(entry) = entries.iter().find(|entry| {
+            && let Ok(mut entries) = self.entries.lock()
+            && let Some(entry) = entries.iter_mut().find(|entry| {
                 same_context(entry)
                     && entry
                         .bytes
@@ -102,6 +138,7 @@ impl Cache {
         {
             reader.check_unchanged()?;
             paths.records_data_file()?;
+            entry.stamp = stamp;
             return Ok(entry.store.clone());
         }
         #[cfg(test)]
@@ -112,11 +149,12 @@ impl Cache {
             Observed::Large(digest) => *digest,
         };
         let same = |entry: &Entry| same_context(entry) && entry.digest == digest;
-        if let Ok(entries) = self.entries.lock()
-            && let Some(entry) = entries.iter().find(|entry| same(entry))
+        if let Ok(mut entries) = self.entries.lock()
+            && let Some(entry) = entries.iter_mut().find(|entry| same(entry))
         {
             reader.check_unchanged()?;
             paths.records_data_file()?;
+            entry.stamp = stamp;
             return Ok(entry.store.clone());
         }
         let (store, bytes) = match observed {
@@ -163,8 +201,10 @@ impl Cache {
                 entries.push_back(Entry {
                     vault,
                     keys,
+                    network,
                     budgets,
                     digest,
+                    stamp,
                     bytes,
                     store: store.clone(),
                     kept,
@@ -332,6 +372,40 @@ mod tests {
             );
         }
         assert_eq!(cache.hashes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_retained_genesis_pin_cannot_reuse_an_unpinned_cached_root() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        fsx::ensure_private_dir(&paths.dir).unwrap();
+        let wire = signed(&SIGNER, 1);
+        fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+        let cache = Cache::new();
+        let unpinned = cache
+            .read(&paths, "fixture".into(), Store::with_compiled(None))
+            .unwrap();
+        let network = *unpinned.log().unwrap().network();
+        assert_ne!(network, [92; 32]);
+        let wrong = cache
+            .read(
+                &paths,
+                "fixture".into(),
+                Store::with_compiled(Some([92; 32])),
+            )
+            .unwrap();
+        assert!(
+            wrong.log().is_none(),
+            "same bytes do not bypass a different root pin"
+        );
+        let correct = cache
+            .read(
+                &paths,
+                "fixture".into(),
+                Store::with_compiled(Some(network)),
+            )
+            .unwrap();
+        assert_eq!(correct.log().unwrap().network(), &network);
     }
 
     #[test]
@@ -560,24 +634,78 @@ mod tests {
         );
     }
 
+    /// A read of the records file as it was last read takes the kept store without reading it:
+    /// a large file is streamed and hashed once to observe it and once to decode it, and a small
+    /// one hashed once, then neither is read again. The same bytes renamed over it are a new
+    /// file, read again and taken from the entry they match, under whose stamp the next read is
+    /// not; a rewrite of the same length in place is a new stamp too (its times), and is read.
+    /// NEGATIVE CONTROL: with the stamp test in `read_then`'s first lookup forced true, no file
+    /// is read again once one was: this test fails at the renamed file's count, and
+    /// `warmed_membership_still_reads_current_bytes_and_admitted_keys` and
+    /// `the_cache_keeps_its_entries_within_its_byte_budget` get a store from before a write.
     #[test]
-    fn large_membership_inputs_keep_the_existing_digest_path() {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let paths = Paths::for_home(home.path());
-        fsx::ensure_private_dir(&paths.dir).unwrap();
-        fsx::write_atomic(&paths.records_file(), &vec![0; MAX_INPUT_BYTES + 1], 0o600).unwrap();
-        let cache = Cache::new();
-        for _ in 0..2 {
+    fn an_unchanged_records_file_is_taken_by_its_stamp_without_reading_it() {
+        for large in [false, true] {
+            let home = aterm_tempfile::tempdir().unwrap();
+            let paths = Paths::for_home(home.path());
+            fsx::ensure_private_dir(&paths.dir).unwrap();
+            let mut wire = signed(&SIGNER, 1);
+            if large {
+                wire.resize(MAX_INPUT_BYTES + 64, 0);
+            }
+            fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+            let cache = Cache::new();
+            let counts = || {
+                (
+                    cache.observations.load(Ordering::Relaxed),
+                    cache.hashes.load(Ordering::Relaxed),
+                )
+            };
+            let read = || {
+                cache
+                    .read(&paths, "fixture".into(), base(&SIGNER))
+                    .unwrap()
+                    .encode()
+            };
+            let cold = if large { (1, 2) } else { (1, 1) };
+            for _ in 0..3 {
+                assert_eq!(read(), signed(&SIGNER, 1));
+                assert_eq!(counts(), cold, "large={large}");
+            }
+
+            fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+            let renamed = (cold.0 + 1, cold.1 + usize::from(large));
+            for _ in 0..2 {
+                assert_eq!(read(), signed(&SIGNER, 1));
+                assert_eq!(counts(), renamed, "large={large}");
+            }
+
+            let mut other = signed(&OTHER, 2);
+            other.resize(wire.len(), 0);
+            let before = fsx::stamp(&paths.records_file()).unwrap();
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(paths.records_file())
+                    .unwrap();
+                file.write_all(&other).unwrap();
+                file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(1))
+                    .unwrap();
+            }
+            let after = fsx::stamp(&paths.records_file()).unwrap();
+            assert_eq!((after.ino, after.len), (before.ino, before.len));
+            assert_ne!(after, before);
             assert!(
                 cache
                     .read(&paths, "fixture".into(), base(&SIGNER))
                     .unwrap()
                     .log()
-                    .is_none()
+                    .is_none(),
+                "large={large}: the rewritten file holds no record under SIGNER"
             );
+            assert_eq!(counts().0, renamed.0 + 1, "large={large}");
         }
-        // First observation and its cold decode, then the second warm observation.
-        assert_eq!(cache.hashes.load(Ordering::Relaxed), 3);
     }
 
     #[test]

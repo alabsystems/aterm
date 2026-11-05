@@ -6,6 +6,16 @@
 mod generate;
 mod xml;
 
+fn write_fresh(path: &std::path::Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let _ = std::fs::remove_file(path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(bytes.as_ref())
+}
+
 fn main() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let root = root.as_path();
@@ -18,7 +28,7 @@ fn main() {
     };
     for (rel, text) in files {
         let path = root.join(&rel);
-        if let Err(e) = std::fs::write(&path, text) {
+        if let Err(e) = write_fresh(&path, text) {
             eprintln!("wayland-scan: {}: {e}", path.display());
             std::process::exit(1);
         }

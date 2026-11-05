@@ -442,7 +442,16 @@ fn write_replacing(file: &std::path::Path, text: &str) {
         return;
     }
     let sibling = file.with_extension(format!("txt.{}.tmp", std::process::id()));
-    if std::fs::write(&sibling, text).is_ok() && std::fs::rename(&sibling, file).is_err() {
+    let _ = std::fs::remove_file(&sibling);
+    let wrote = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&sibling)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(text.as_bytes())
+        });
+    if wrote.is_err() || std::fs::rename(&sibling, file).is_err() {
         let _ = std::fs::remove_file(&sibling);
     }
 }

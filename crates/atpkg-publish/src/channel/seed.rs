@@ -82,15 +82,21 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// Return any reasons why the seal's trust pack may not be published yet.
 #[must_use]
 pub fn publish_refusals(ctx: &Ctx, trust_repo: &Path, seal: &Path) -> Vec<String> {
-    let repo = ctx.shown(trust_repo);
     let receipt = crate::identity::read_regular_text(
         &seal.join(atpkg::lineage::SEED_MINT_FILE),
         crate::identity::MAX_META_BYTES,
     )
     .unwrap_or_default();
-    let repin = field(&receipt, "repin_commit").unwrap_or_default();
-    let tag = field(&receipt, "repin_release_tag").unwrap_or_default();
-    let commit = field(&receipt, "repin_compiler_git_commit_hash").unwrap_or_default();
+    publish_refusals_for_receipt(ctx, trust_repo, &receipt)
+}
+
+/// Return any reasons why the seal's trust pack with `receipt` may not be published yet.
+#[must_use]
+pub fn publish_refusals_for_receipt(ctx: &Ctx, trust_repo: &Path, receipt: &str) -> Vec<String> {
+    let repo = ctx.shown(trust_repo);
+    let repin = field(receipt, "repin_commit").unwrap_or_default();
+    let tag = field(receipt, "repin_release_tag").unwrap_or_default();
+    let commit = field(receipt, "repin_compiler_git_commit_hash").unwrap_or_default();
     if let Err(why) = git(trust_repo, &["fetch", "-q", "origin", "main"]) {
         return vec![format!(
             "cannot fetch {repo}'s origin main ({why}), so nothing says main pins this seal's \

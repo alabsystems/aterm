@@ -489,8 +489,8 @@ impl<S: Schema> EventLog<S> {
 
     /// The log's bytes, ending in its seal ([`LogFault::TooLarge`]).
     pub fn encode(&self, schema: &S) -> Result<Vec<u8>, LogFault> {
-        let mut out = Vec::new();
-        let mut body = Enc::new();
+        let mut out = Vec::with_capacity(self.inputs.len().saturating_add(2).saturating_mul(64));
+        let mut body = Enc::with_capacity(320);
         body.u8(RECORD_VERSION);
         body.u8(KIND_HEADER);
         body.raw(&LOG_MAGIC);
@@ -502,14 +502,14 @@ impl<S: Schema> EventLog<S> {
         put_record(&mut out, 0, body.as_bytes())?;
         for (k, i) in self.inputs.iter().enumerate() {
             let step = len_u64(k).saturating_add(1);
-            let mut body = Enc::new();
+            body.clear();
             body.u8(RECORD_VERSION);
             body.u8(KIND_EVENT);
             schema.encode_input(i, &mut body);
             put_record(&mut out, step, body.as_bytes())?;
         }
         let n = len_u64(self.inputs.len());
-        let mut body = Enc::new();
+        body.clear();
         body.u8(RECORD_VERSION);
         body.u8(KIND_SEAL);
         body.u64(n);

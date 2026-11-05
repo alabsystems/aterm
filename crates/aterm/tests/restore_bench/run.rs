@@ -7,7 +7,9 @@
 //! waits for every session's journal to have caught up and its region to be in the keeper's
 //! custody, SIGKILLs A by its own pid, and boots B in the same world. B's own clocks say how
 //! long its HELLO, its one-after-another admission of the offers, the placing of every
-//! recovered session and their history imports took (`metrics` `startup_keeper_*`); the
+//! recovered session and their history imports took, and when its recovery-count fence's
+//! SYNCs were written and answered, it lifted and it first let a request past (`metrics`
+//! `startup_keeper_*`); the
 //! bench's clock says when B first served a request past its recovery-count fence (which
 //! refuses `aterm ctl` clients, not the window), when every session's `status` first read a
 //! `restore=` and when every history import was in (its lines plus `history_lost=` back to A's
@@ -74,6 +76,16 @@ pub struct Round {
     pub seam_copies: u64,
     pub seam_plants: u64,
     pub seam_ms: f64,
+    /// B's recovery-count fence on B's own clocks (`metrics` `startup_keeper_fence_*`,
+    /// `_sync_*`, `_served_ms`), each from the answered HELLO less the seam's work: the old
+    /// journal authorities it waited on, the last SYNC written behind a new journal's COMPANION
+    /// (of those whose answers confirmed them), the slowest one SYNC to its answer read, the
+    /// fence lifting (the last answer read) and the first control request past it.
+    pub fence_cohort: u64,
+    pub sync_sent_ms: f64,
+    pub sync_answer_max_ms: f64,
+    pub fence_ms: f64,
+    pub b_served_ms: f64,
     /// The bench's clock, from just before B's spawn: B's ready signal, B serving past its
     /// recovery-count fence (late by at most `served_window_ms`), every session's `status`
     /// reading a `restore=`, every history import in.
@@ -109,6 +121,13 @@ impl Round {
         self.restored_ms - self.birth_to_hello_ms()
     }
 
+    /// B's ready signal to the first request it served past its fence, on the bench's clock:
+    /// how long a client that dials at ready waits on the fence.
+    #[must_use]
+    pub fn ready_to_served_ms(&self) -> f64 {
+        self.served_ms - self.ready_ms
+    }
+
     fn json(&self) -> Value {
         json!({
             "sessions": self.sessions,
@@ -128,9 +147,15 @@ impl Round {
             "seam_copies": self.seam_copies,
             "seam_plants": self.seam_plants,
             "seam_ms": stats::round3(self.seam_ms),
+            "fence_cohort": self.fence_cohort,
+            "sync_sent_ms": stats::round3(self.sync_sent_ms),
+            "sync_answer_max_ms": stats::round3(self.sync_answer_max_ms),
+            "fence_ms": stats::round3(self.fence_ms),
+            "b_served_ms": stats::round3(self.b_served_ms),
             "spawn_to_ready_ms": stats::round3(self.ready_ms),
             "spawn_to_served_ms": stats::round3(self.served_ms),
             "served_window_ms": stats::round3(self.served_window_ms),
+            "ready_to_served_ms": stats::round3(self.ready_to_served_ms()),
             "spawn_to_restored_ms": stats::round3(self.restored_ms),
             "hello_to_restored_ms": stats::round3(self.hello_to_restored_ms()),
             "spawn_to_imported_ms": stats::round3(self.imported_ms),
@@ -167,8 +192,26 @@ const B_COLUMNS: [Column; 6] = [
     ("seam_ms", "the seam's own work", |r| r.seam_ms),
 ];
 
+/// B's recovery-count fence on B's own clocks (`metrics`).
+const FENCE_COLUMNS: [Column; 4] = [
+    (
+        "sync_sent_ms",
+        "HELLO → last confirming SYNC written",
+        |r| r.sync_sent_ms,
+    ),
+    (
+        "sync_answer_max_ms",
+        "slowest one SYNC → its answer read",
+        |r| r.sync_answer_max_ms,
+    ),
+    ("fence_ms", "HELLO → the fence lifted", |r| r.fence_ms),
+    ("b_served_ms", "HELLO → first request past it", |r| {
+        r.b_served_ms
+    }),
+];
+
 /// The readings on the bench's clock, from just before B's spawn.
-const BENCH_COLUMNS: [Column; 7] = [
+const BENCH_COLUMNS: [Column; 8] = [
     ("spawn_to_ready_ms", "spawn → ready", |r| r.ready_ms),
     (
         "spawn_to_served_ms",
@@ -178,6 +221,11 @@ const BENCH_COLUMNS: [Column; 7] = [
     ("served_window_ms", "served's window", |r| {
         r.served_window_ms
     }),
+    (
+        "ready_to_served_ms",
+        "ready → served",
+        Round::ready_to_served_ms,
+    ),
     (
         "spawn_to_restored_ms",
         "spawn → every `restore=` read",
@@ -242,12 +290,17 @@ pub fn measure(spec: &Spec) -> Report {
                 let r = crash_and_restore(spec, n);
                 eprintln!(
                     "{PROGRESS}   HELLO {:.1} ms after B's birth, offers admitted in {:.1} ms and \
-                     placed at {:.1} ms (the seam's own work {:.1} ms off both), served at {:.1} \
-                     ms, every restore= at {:.1} ms, every import at {:.1} ms (load {})",
+                     placed at {:.1} ms (the seam's own work {:.1} ms off both), the fence's \
+                     last SYNC at {:.1} ms and its lift at {:.1} ms after the HELLO; ready at \
+                     {:.1} ms, served at {:.1} ms, every restore= at {:.1} ms, every import at \
+                     {:.1} ms (load {})",
                     r.birth_to_hello_ms(),
                     r.admit_ms,
                     r.placed_ms,
                     r.seam_ms,
+                    r.sync_sent_ms,
+                    r.fence_ms,
+                    r.ready_ms,
                     r.served_ms,
                     r.restored_ms,
                     r.imported_ms,
@@ -262,7 +315,7 @@ pub fn measure(spec: &Spec) -> Report {
     let at_end = profile::identity(&exe).unwrap_or_else(|why| why);
     let arm = Profile::of_binary(&exe);
     let json = json!({
-        "schema": "aterm-restore-bench-v2",
+        "schema": "aterm-restore-bench-v3",
         "spec": spec.words(),
         "arm": spec.arm.word(),
         "profile": arm.map_or("unknown", Profile::name),
@@ -285,6 +338,7 @@ pub fn measure(spec: &Spec) -> Report {
 pub(crate) fn size_json(n: u32, rounds: &[Round]) -> Value {
     let summary: aterm_json::Map = B_COLUMNS
         .iter()
+        .chain(&FENCE_COLUMNS)
         .chain(&BENCH_COLUMNS)
         .map(|(key, _, read)| ((*key).to_string(), stats::to_json(&column(rounds, *read))))
         .collect();
@@ -320,14 +374,27 @@ pub fn markdown(spec: &Spec, sizes: &[(u32, Vec<Round>)]) -> String {
     md.extend(timing_table(&B_COLUMNS, sizes));
     md.push(String::new());
     md.push(
+        "B's recovery-count fence on B's own clocks (`metrics` `startup_keeper_sync_sent_ms`, \
+         `_sync_answer_max_ms`, `_fence_ms`, `_served_ms`), from the answered HELLO and less the \
+         seam's own work. Each adopted session's new journal reaches the keeper as a COMPANION \
+         between two SYNCs; the keeper's answer to the second confirms it. The fence lifts at \
+         the last such answer read, once every old journal authority has one, and the first \
+         request past it follows:"
+            .to_string(),
+    );
+    md.push(String::new());
+    md.extend(timing_table(&FENCE_COLUMNS, sizes));
+    md.push(String::new());
+    md.push(
         "The bench's clock, from just before B's spawn, which holds the seam's own work (it runs \
          before B's control socket listens). Everything after ready waits on B's recovery-count \
          fence, which refuses `aterm ctl` requests until the keeper confirmed every adopted \
          session's new journal; B's window does not wait on it. Served is asked every 2 ms and is \
          late by at most its window (from the last refused request, or ready, to the served \
-         answer); `restore=` and the imports are polled, a sweep of B's sessions every 2 ms, so \
-         each is late by at most its longest sweep. HELLO → `restore=` is the bench's reading \
-         less B's birth → HELLO."
+         answer); ready → served is how long a client that dials at ready waits on the fence. \
+         `restore=` and the imports are polled, a sweep of B's sessions every 2 ms, so each is \
+         late by at most its longest sweep. HELLO → `restore=` is the bench's reading less B's \
+         birth → HELLO."
             .to_string(),
     );
     md.push(String::new());
@@ -482,6 +549,11 @@ fn crash_and_restore(spec: &Spec, n: u32) -> Round {
         seam_copies: 0,
         seam_plants: 0,
         seam_ms: 0.0,
+        fence_cohort: 0,
+        sync_sent_ms: 0.0,
+        sync_answer_max_ms: 0.0,
+        fence_ms: 0.0,
+        b_served_ms: 0.0,
         ready_ms: ms(ready.saturating_duration_since(b.spawned)),
         served_ms: ms(admitted.answered.saturating_duration_since(b.spawned)),
         served_window_ms,
@@ -540,6 +612,16 @@ fn crash_and_restore(spec: &Spec, n: u32) -> Round {
     round.admit_max_ms = needed("startup_keeper_admit_max_ms");
     round.placed_ms = needed("startup_keeper_placed_ms");
     round.settled_ms = reading("startup_keeper_imported_ms");
+    round.fence_cohort = counter("startup_keeper_fence_cohort");
+    assert_eq!(
+        round.fence_cohort,
+        u64::from(n),
+        "B's fence waited on every journal A left"
+    );
+    round.sync_sent_ms = needed("startup_keeper_sync_sent_ms");
+    round.sync_answer_max_ms = needed("startup_keeper_sync_answer_max_ms");
+    round.fence_ms = needed("startup_keeper_fence_ms");
+    round.b_served_ms = needed("startup_keeper_served_ms");
     let copies = reading("startup_keeper_seam_copies").map(|v| v as u64);
     let plants = reading("startup_keeper_seam_plants").map(|v| v as u64);
     round.seam_copies = copies.unwrap_or(0);

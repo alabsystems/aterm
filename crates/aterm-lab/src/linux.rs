@@ -60,7 +60,7 @@ less what the VM's directory holds) and waits for room before it waits for the l
 holders; once it holds the lane, the boot claims the guest's 16 GiB and 8 vCPUs in this Mac's capacity ledger (`aterm pkg
 capacity`) and waits while they do not fit with 8 GiB to spare beside them, naming the claims that hold the room once a
 minute (NOT RUN at once only on a Mac too small for them); --admit now boots at once, saying what it lacks or would have
-waited for. The guest's builds run as many jobs as cores the claim was granted (CARGO_BUILD_JOBS). A lima VM still running
+waited for. The guest's builds run as many jobs as cores the claim was granted (CARGO_BUILD_JOBS), and it keeps 16 GiB of swap, which a compile's peak pages into. A lima VM still running
 after the one-shot run that booted it died is stopped as `down` stops it, and booted afresh; one an `up` or a --keep-up run
 left is adopted. Lima uses ~/Library/Caches/aterm/lima.noindex (or explicit LIMA_HOME), with creation
 receipts for its namespace and each VM. An existing namespace or VM without matching receipts is
@@ -772,28 +772,28 @@ impl Lima {
             }
         };
         let mut err_text = String::new();
-        let err_reader = child.stderr.take().map(|mut e| {
-            std::thread::spawn(move || {
-                let mut s = String::new();
-                let _ = e.read_to_string(&mut s);
-                s
-            })
-        });
+        let err_reader = child
+            .stderr
+            .take()
+            .map(|e| std::thread::spawn(move || read_lines(e, MAX_GUEST_STREAM, |_| {})));
         let mut text = String::new();
+        let mut cut = false;
         if let Some(out) = child.stdout.take() {
             let stdout = std::io::stdout();
-            for line in BufReader::new(out).lines() {
-                let Ok(line) = line else { break };
-                {
-                    let mut lock = stdout.lock();
-                    let _ = writeln!(lock, "{prefix}{line}");
-                }
-                text.push_str(&line);
-                text.push('\n');
+            let read = read_lines(out, MAX_GUEST_STREAM, |line| {
+                let mut lock = stdout.lock();
+                let _ = writeln!(lock, "{prefix}{line}");
+            });
+            text = read.text;
+            cut = read.cut;
+            if cut {
+                let _ = child.kill();
             }
         }
         if let Some(h) = err_reader {
-            err_text = h.join().unwrap_or_default();
+            let read = h.join().unwrap_or_default();
+            err_text = read.text;
+            cut |= read.cut;
         }
         let status = child.wait();
         text.push_str(&err_text);
@@ -801,7 +801,8 @@ impl Lima {
             text.push_str(&ended_on_signal(*status));
         }
         Out {
-            code: status.ok().and_then(|s| s.code()),
+            // A verdict is judged on the text, so a run whose text was cut has none to give.
+            code: status.ok().and_then(|s| s.code()).filter(|_| !cut),
             text,
             secs: t0.elapsed().as_secs_f64(),
             signal: None,
@@ -866,7 +867,11 @@ pub fn host_disk_bytes(state: &VmState) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
     ["disk", "diffdisk"]
         .iter()
-        .find_map(|f| std::fs::metadata(state.dir.join(f)).ok())
+        .find_map(|f| {
+            std::fs::symlink_metadata(state.dir.join(f))
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+        })
         .map(|m| m.blocks() * 512)
 }
 
@@ -1336,6 +1341,7 @@ pub fn boot_run(
         cold,
         on: base.to_path_buf(),
         stuck_ends: None,
+        machine: None,
     }
 }
 
@@ -2338,8 +2344,77 @@ fn cmd_destroy() -> Res {
     Ok(0)
 }
 
+/// The most of one stream of a guest run [`read_lines`] reads. A verbose test run reaches tens of
+/// MiB (docs/measured); this stops a runaway printer, which no other bound on a run's rows does.
+const MAX_GUEST_STREAM: usize = 256 * 1024 * 1024;
+
+/// The longest piece of a line [`read_lines`] holds at once.
+const MAX_LINE_PIECE: u64 = 1024 * 1024;
+
+/// What [`read_lines`] read.
+#[derive(Default)]
+struct ReadLines {
+    /// Every line read, whole up to where the read stopped.
+    text: String,
+    /// The stream passed its limit, so `text` is not all of it and says so on its last line.
+    cut: bool,
+}
+
+/// Read `from` to its end or until the next line would pass `limit` bytes, handing `each` every
+/// line (a longer one in pieces of [`MAX_LINE_PIECE`], bytes that are not UTF-8 replaced). What
+/// is returned is therefore always a prefix of the stream. Stopping drops the reader, closing the
+/// writer's pipe, and a caller must not read a clean verdict from text that was cut.
+fn read_lines(from: impl Read, limit: usize, mut each: impl FnMut(&str)) -> ReadLines {
+    let mut reader = BufReader::new(from);
+    let mut read = ReadLines::default();
+    let mut piece = Vec::new();
+    loop {
+        piece.clear();
+        match reader
+            .by_ref()
+            .take(MAX_LINE_PIECE)
+            .read_until(b'\n', &mut piece)
+        {
+            Ok(0) | Err(_) => return read,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&piece);
+        let line = line.strip_suffix('\n').unwrap_or(&line);
+        each(line);
+        if read.text.len().saturating_add(line.len()).saturating_add(1) > limit {
+            read.cut = true;
+            read.text.push_str(&format!(
+                "[output passed {limit} bytes: the read stopped here]\n"
+            ));
+            return read;
+        }
+        read.text.push_str(line);
+        read.text.push('\n');
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A stream past the limit stops there, keeps only a prefix, and says it was cut.
+    #[test]
+    fn a_stream_past_the_limit_stops_and_says_it_was_cut() {
+        let input = "abcdefg\n".repeat(10);
+        let read = super::read_lines(input.as_bytes(), 20, |_| {});
+        assert!(read.cut);
+        assert_eq!(
+            read.text,
+            "abcdefg\nabcdefg\n[output passed 20 bytes: the read stopped here]\n"
+        );
+    }
+
+    /// Bytes that are not UTF-8 neither end the read nor lose the lines around them.
+    #[test]
+    fn a_line_that_is_not_utf8_does_not_end_the_read() {
+        let read = super::read_lines(&b"one\n\xff\ntwo\n"[..], 1024, |_| {});
+        assert!(!read.cut);
+        assert_eq!(read.text, "one\n\u{fffd}\ntwo\n");
+    }
+
     use super::*;
 
     #[test]

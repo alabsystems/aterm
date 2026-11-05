@@ -508,7 +508,8 @@ fn heal(layout: &Layout, why: io::Error) -> io::Result<Status> {
     let path = layout.status();
     let aside = corrupt_path(layout, u64::try_from(crate::flow::now_unix()).unwrap_or(0));
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
-        std::fs::hard_link(&path, &aside).or_else(|_| std::fs::copy(&path, &aside).map(|_| ()))?;
+        std::fs::hard_link(&path, &aside)
+            .or_else(|_| crate::metadata_io::copy_regular_file(&path, &aside).map(|_| ()))?;
     } else {
         std::fs::rename(&path, &aside)?;
     }

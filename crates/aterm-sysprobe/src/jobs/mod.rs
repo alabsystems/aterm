@@ -185,6 +185,58 @@ pub struct Counters {
     pub runnable_ns: Option<u64>,
     /// Page-ins (`ri_pageins`, Linux major faults).
     pub pageins: Option<u64>,
+    /// The largest physical footprint it has had (macOS `ri_lifetime_max_phys_footprint`);
+    /// `None` on Linux.
+    pub peak_footprint: Option<u64>,
+}
+
+/// `pid`'s children, sorted (macOS `proc_listchildpids`): read at a shell's prompt, the jobs it
+/// left running. One kernel call; `None` where refused, past 255 children (the list may be
+/// cut), and off macOS.
+#[must_use]
+pub fn child_pids(pid: u32) -> Option<Vec<u32>> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::child_pids(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// `pid`'s own CPU plus the CPU of every child it reaped, ns (macOS `proc_pid_rusage`'s
+/// `ri_{user,system}_time` and `ri_child_{user,system}_time`): read before and after a command a
+/// shell ran, the difference is what the shell and the command's processes spent. One kernel
+/// call; `None` where refused or gone, and off macOS.
+#[must_use]
+pub fn cpu_with_reaped_ns(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::cpu_with_reaped_ns(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// `pid`'s lifetime counters ([`Counters`]: its own CPU, its reaped children's, its largest
+/// footprint, …; macOS `proc_pid_rusage`): read as a terminal closes, its tree's sum is what its
+/// processes spent. One kernel call; `None` where refused or gone, and off macOS.
+#[must_use]
+pub fn counters_of(pid: u32) -> Option<Counters> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::counters_of(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// A TCP connection's state.
@@ -1083,7 +1135,7 @@ fn tail_has_lf_ino(path: &Path, from: u64, to: u64, want_ino: u64) -> Option<boo
         let at = to - len as u64;
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)
             .ok()?;
         let meta = file.metadata().ok()?;

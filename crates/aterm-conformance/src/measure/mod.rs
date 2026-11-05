@@ -117,7 +117,7 @@ pub(crate) fn open_regular_file_with_meta(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     #[cfg(not(unix))]
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
@@ -167,4 +167,35 @@ pub(crate) fn read_regular_file(path: &std::path::Path) -> std::io::Result<Vec<u
 pub(crate) fn read_regular_text(path: &std::path::Path) -> std::io::Result<String> {
     String::from_utf8(read_regular_file(path)?)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Write `bytes` to a fresh regular file at `path` (unlinking any existing entry first and
+/// creating exclusively with `create_new(true)`).
+pub fn write_fresh(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = path.as_ref();
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    opts.open(path)?.write_all(bytes.as_ref())
+}
+
+pub(crate) fn create_stdio_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    opts.open(path)
 }

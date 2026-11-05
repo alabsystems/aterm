@@ -51,6 +51,7 @@ pub fn judged(chain: Chain, s: Scenario) -> bool {
                 | Scenario::O1
                 | Scenario::SwitchAgent
                 | Scenario::SwitchSeq
+                | Scenario::CommandDraft
                 | Scenario::SwitchFlip
                 | Scenario::SwitchOverHeld
                 | Scenario::SwitchBusy

@@ -179,16 +179,29 @@ const TRAFFIC_SCAN_MAX: u64 = 1 << 20;
 pub const STALE_WORK_MS: u64 = 10 * 60 * 1000;
 
 /// The bound on every socket this report and the operator's one-shot broker commands open: the
-/// dial, and each read and write ([`transport::connect`]). This module, the roster (`cli`) and
-/// the brief read it through [`io_timeout`]; a person's commands (`person`) keep it fixed,
-/// beneath their subscription's silence bound.
+/// dial, and each read and write ([`transport::connect`]). This module, the roster (`cli`), the
+/// brief and a person's commands (`person`) read it through [`io_timeout`].
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The development seam that replaces [`IO_TIMEOUT`] (milliseconds; debug builds and
 /// `dev-seams` only): a test on a loaded machine bounds these sockets, the doctor's read of an
 /// instance among them, within its one-minute hang detector, so an instance or broker the load
-/// keeps from answering for 3 s is waited for rather than reported as unanswerable.
+/// keeps from answering for 3 s is waited for rather than reported as unanswerable. A debug
+/// build's listener scan, which names the broker's process ([`listener_pid`]), waits it in
+/// place of the scan's own 10 s, and `on`'s and `off`'s reads of each instance in place of
+/// their own 8 s (`enable::io_timeout`).
 const IO_TIMEOUT_SEAM: &str = "ATERM_FABRIC_IO_TIMEOUT_MS";
+
+/// The [`IO_TIMEOUT_SEAM`] a development build was given, read once; `None` in a shipped build,
+/// which compiles the read out.
+pub(crate) fn io_seam() -> Option<Duration> {
+    static AT: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        aterm_types::dev_seam!(IO_TIMEOUT_SEAM)
+            .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?))
+            .map(Duration::from_millis)
+    })
+}
 
 /// [`IO_TIMEOUT`], or the [`IO_TIMEOUT_SEAM`] a development build was given. The unit tests'
 /// brokers and instances run in-process, so a socket one of them answers late is a loaded
@@ -198,12 +211,7 @@ pub(crate) fn io_timeout() -> Duration {
     const UNSEAMED: Duration = IO_TIMEOUT;
     #[cfg(test)]
     const UNSEAMED: Duration = aterm_spec::wait::MUST_HAPPEN;
-    static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *AT.get_or_init(|| {
-        aterm_types::dev_seam!(IO_TIMEOUT_SEAM)
-            .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?))
-            .map_or(UNSEAMED, Duration::from_millis)
-    })
+    io_seam().unwrap_or(UNSEAMED)
 }
 
 const WORK_KINDS: [&str; 2] = ["task", "ask"];
@@ -649,43 +657,17 @@ pub fn presence_in_toml(text: &str) -> Result<Option<crate::presence::Mode>, Str
 /// command line did not say.
 #[must_use]
 pub fn presence_from_config() -> crate::presence::Mode {
-    key_from_config(
+    presence_from_config_at(config_path().as_deref())
+}
+
+fn presence_from_config_at(path: Option<&Path>) -> crate::presence::Mode {
+    key_from_config_at(
+        path,
         presence_in_toml,
         crate::presence::Mode::Meta,
-        "presence defaults to meta",
+        crate::presence::Mode::Minimal,
+        "presence is minimal",
     )
-}
-
-fn key_from_config<T: Copy>(
-    in_toml: fn(&str) -> Result<Option<T>, String>,
-    default: T,
-    fallback: &str,
-) -> T {
-    key_from_config_or(in_toml, default, default, fallback)
-}
-
-fn read_toml_file(path: &Path) -> std::io::Result<String> {
-    use std::io::Read as _;
-    const MAX_TOML_BYTES: u64 = 1024 * 1024;
-    let (file, meta) = aterm_uds::regular_file::open(path)?;
-    if meta.len() > MAX_TOML_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "config file exceeds size limit",
-        ));
-    }
-    let cap = usize::try_from(meta.len().min(MAX_TOML_BYTES))
-        .unwrap_or(0)
-        .saturating_add(1);
-    let mut text = String::with_capacity(cap);
-    file.take(MAX_TOML_BYTES + 1).read_to_string(&mut text)?;
-    if text.len() as u64 > MAX_TOML_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "config file exceeds size limit",
-        ));
-    }
-    Ok(text)
 }
 
 fn key_from_config_or<T>(
@@ -694,12 +676,22 @@ fn key_from_config_or<T>(
     broken: T,
     fallback: &str,
 ) -> T {
-    let Some(path) = config_path() else {
+    key_from_config_at(config_path().as_deref(), in_toml, absent, broken, fallback)
+}
+
+fn key_from_config_at<T>(
+    path: Option<&Path>,
+    in_toml: fn(&str) -> Result<Option<T>, String>,
+    absent: T,
+    broken: T,
+    fallback: &str,
+) -> T {
+    let Some(path) = path else {
         return absent;
     };
-    let text = match read_toml_file(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return absent,
+    let text = match aterm_types::dirs::read_aterm_config_text(path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return absent,
         Err(e) => {
             eprintln!(
                 "aterm-link: {} could not be read ({e}); {fallback}",
@@ -730,7 +722,11 @@ pub fn receipts_in_toml(text: &str) -> Result<Option<bool>, String> {
 /// command line said neither `--receipts` nor `--no-receipts`.
 #[must_use]
 pub fn receipts_from_config() -> bool {
-    key_from_config(receipts_in_toml, true, "receipts default to on")
+    receipts_from_config_at(config_path().as_deref())
+}
+
+fn receipts_from_config_at(path: Option<&Path>) -> bool {
+    key_from_config_at(path, receipts_in_toml, true, false, "receipts are off")
 }
 
 /// `[fabric] log` in `text`: `"auto"`, `"off"` or `"turns"`.
@@ -769,9 +765,9 @@ pub fn resolve_command(
     let Some(path) = path else {
         return Ok(None);
     };
-    let text = match read_toml_file(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+    let text = match aterm_types::dirs::read_aterm_config_text(path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     Ok(command_in_toml(&text)
@@ -871,10 +867,22 @@ fn bridges_among(children: &[aterm_ctl::census::Child]) -> Vec<u32> {
 /// or two processes hold the listener ([`the_one_holder`]).
 pub(crate) fn listener_pid(sock: &str) -> Result<Option<u32>, String> {
     let path = Path::new(sock);
-    let held = aterm_uds::holders::scan_listener_holders(path, &[])
+    let held = scan_listener(path)
         .map_err(|e| format!("the listener scan cannot tell ({e})"))
         .and_then(|scan| the_one_holder(&scan));
     unknown_unless_unbound(held, || aterm_uds::holders::bound_at(path))
+}
+
+/// The listener scan of `path` ([`aterm_uds::holders::scan_listener_holders`]), its connection
+/// (macOS) or reads (Linux) waited for the [`IO_TIMEOUT_SEAM`] in place of the scan's 10 s where
+/// a debug build was given one: the loaded machine a test runs on, which can hold the command's
+/// sockets past their 3 s, can hold the scan past its 10 s too.
+fn scan_listener(path: &Path) -> io::Result<aterm_uds::holders::HolderScan> {
+    #[cfg(all(debug_assertions, any(target_vendor = "apple", target_os = "linux")))]
+    if let Some(hang) = io_seam() {
+        return aterm_uds::holders::scan_listener_holders_within(path, &[], hang);
+    }
+    aterm_uds::holders::scan_listener_holders(path, &[])
 }
 
 /// `held`, the scan's answer ([`listener_pid`]), but where it is unknown and a probe of the
@@ -1498,6 +1506,39 @@ fn health_json(b: &BrokerView, now_ms: u64) -> J {
                         J::Obj(vec![
                             ("records", J::Num(r.records)),
                             ("bytes", J::Num(r.bytes)),
+                        ])
+                    }),
+                ),
+                // How long the broker process's flushes took, and its slow ones, each with
+                // its index, kind, start and end on the clock named, as the holds row sums them up,
+                // and how many calls were still running as it read them; null in a snapshot an
+                // older broker wrote.
+                (
+                    "process_flush_times",
+                    h.process_flush_times.as_ref().map_or(J::Null, |t| {
+                        J::Obj(vec![
+                            ("clock", J::s(t.clock.word())),
+                            ("full_ns", J::Num(t.full_ns)),
+                            ("barrier_ns", J::Num(t.barrier_ns)),
+                            ("plain_ns", J::Num(t.plain_ns)),
+                            ("slow_count", J::Num(t.slow_count)),
+                            (
+                                "slow",
+                                J::Arr(
+                                    t.slow
+                                        .iter()
+                                        .map(|f| {
+                                            J::Obj(vec![
+                                                ("index", J::Num(f.index)),
+                                                ("kind", J::s(f.kind.word())),
+                                                ("start_ns", J::Num(f.start_ns)),
+                                                ("end_ns", J::Num(f.end_ns)),
+                                            ])
+                                        })
+                                        .collect(),
+                                ),
+                            ),
+                            ("running", J::Num(t.running)),
                         ])
                     }),
                 ),
@@ -4122,7 +4163,13 @@ pub fn publish_exited(report: &Report, ghosts: &[(String, String)]) -> io::Resul
         let rewritten = retired_body(body);
         let subject = crate::subject::session_face(&cfg.fleet, node, sid, "presence");
         let seq = state.reserve_next_sequence(inc)?;
-        let (off, deduped) = conn.publish(producer_id, seq, &subject, rewritten.as_bytes())?;
+        // Under the node's producer, whose bucket the broker's rate limit keeps: a refusal is
+        // waited out and sent again at the same sequence ([`crate::rate_hold::waiting_out`]).
+        let (off, deduped) = crate::rate_hold::waiting_out(
+            || conn.publish(producer_id, seq, &subject, rewritten.as_bytes()),
+            IO_TIMEOUT,
+            std::thread::sleep,
+        )?;
         if deduped {
             return Err(io::Error::other(format!(
                 "the broker deduped the retirement of @{sid} at @{off}: this node's \
@@ -5942,6 +5989,48 @@ fn tail_faces(
 mod tests {
     use super::*;
 
+    /// A linked `aterm.toml` says what its file says, and `doctor`'s fabric row reads it.
+    #[cfg(unix)]
+    #[test]
+    fn the_fabric_command_reads_through_a_linked_aterm_toml() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let real = dir.path().join("dotfiles.toml");
+        aterm_uds::atomic_file::write(&real, b"[fabric]\ncommand = \"astream serve\"\n", 0o600)
+            .expect("write");
+        let link = dir.path().join("aterm.toml");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let (_, command) = resolve_command(None, Some(&link))
+            .expect("read")
+            .expect("a command");
+        assert_eq!(command, words("astream serve"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refused_config_does_not_enable_receipts_or_presence_metadata() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("aterm.toml");
+        aterm_uds::atomic_file::write(
+            &path,
+            b"[fabric]\nreceipts = false\npresence = \"minimal\"\ncommand = \"astream serve\"\n",
+            0o600,
+        )
+        .unwrap();
+        let receipts = || receipts_from_config_at(Some(&path));
+        let presence = || presence_from_config_at(Some(&path));
+        assert!(!receipts());
+        assert_eq!(presence(), crate::presence::Mode::Minimal);
+        assert!(resolve_command(None, Some(&path)).unwrap().is_some());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(!receipts());
+        assert_eq!(presence(), crate::presence::Mode::Minimal);
+        assert!(resolve_command(None, Some(&path)).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(receipts());
+        assert_eq!(presence(), crate::presence::Mode::Meta);
+    }
+
     fn words(line: &str) -> Vec<String> {
         aterm_types::fabric_command::split_line(line)
     }
@@ -7269,9 +7358,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("atfab-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch");
         let path = dir.join("aterm.toml");
-        std::fs::write(
+        aterm_uds::atomic_file::write(
             &path,
-            "[fabric]\ncommand = \"aterm-link serve --fleet file\"\n",
+            b"[fabric]\ncommand = \"aterm-link serve --fleet file\"\n",
+            0o600,
         )
         .expect("write");
         let (src, c) = resolve_command(None, Some(&path))
@@ -7293,7 +7383,7 @@ mod tests {
             Ok(None)
         );
         assert_eq!(resolve_command(None, None), Ok(None));
-        std::fs::write(&path, "[fabric\n").expect("write");
+        aterm_uds::atomic_file::write(&path, b"[fabric\n", 0o600).expect("write");
         assert!(resolve_command(None, Some(&path)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8436,6 +8526,20 @@ mod tests {
             records: 2,
             bytes: 400,
         });
+        h.process_flush_times = Some(astream_sys::FlushTimes {
+            clock: astream_sys::FlushClock::Machine,
+            full_ns: 9_000_000,
+            barrier_ns: 300_000,
+            plain_ns: 0,
+            slow_count: 1,
+            slow: vec![astream_sys::SlowFlush {
+                index: 0,
+                kind: astream_sys::FlushKind::Full,
+                start_ns: 70,
+                end_ns: 4_000_070,
+            }],
+            running: 0,
+        });
         let read = |writer, h: &BrokerHealth| HealthRead {
             health: h.clone(),
             writer,
@@ -8446,15 +8550,23 @@ mod tests {
             Some(
                 "5 record(s) in 2.0 KiB (resident=2/400 B of 5), 3 subject(s), 0 pending \
                  will(s), 0 group commit(s); 4 connection(s), 0 parked tail(s); 7 full, 2 \
-                 barrier and 1 plain flush(es) by its process since it started (astream's \
-                 <log>.health, written 1m ago)"
+                 barrier and 1 plain flush(es) by its process since it started; its flushes \
+                 took 9.0 ms full, 0.3 ms barrier and 0.0 ms plain; 1 slower than 1 ms, 1 \
+                 kept, the slowest a 4.0 ms full (astream's <log>.health, written 1m ago)"
             )
         );
-        // `--json` carries every fact the row shows, the process's tally and the residency
-        // among them; an older broker's snapshot, which carries neither, reads null there and
-        // says so in the row.
+        // `--json` carries every fact the row shows, the process's tally, its flush times and
+        // the residency among them; an older broker's snapshot, which carries none of them,
+        // reads null there and says so in the row.
         assert!(
             render_json(&r).contains(r#""process_flushes":{"full":7,"barrier":2,"plain":1}"#),
+            "{}",
+            render_json(&r)
+        );
+        assert!(
+            render_json(&r).contains(
+                r#""process_flush_times":{"clock":"machine","full_ns":9000000,"barrier_ns":300000,"plain_ns":0,"slow_count":1,"slow":[{"index":0,"kind":"full","start_ns":70,"end_ns":4000070}],"running":0}"#
+            ),
             "{}",
             render_json(&r)
         );
@@ -8466,9 +8578,15 @@ mod tests {
         let mut older = h.clone();
         older.process_flushes = None;
         older.resident = None;
+        older.process_flush_times = None;
         r.broker.snapshot = Some(Ok(read(HealthWriter::Serving, &older)));
         assert!(
             render_json(&r).contains(r#""process_flushes":null"#),
+            "{}",
+            render_json(&r)
+        );
+        assert!(
+            render_json(&r).contains(r#""process_flush_times":null"#),
             "{}",
             render_json(&r)
         );

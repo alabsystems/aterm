@@ -413,6 +413,55 @@ struct Placement<'a> {
     native_image: bool,
     disclaim: Option<&'a std::ffi::CStr>,
     suspended: bool,
+    /// The task type the child starts as, in place of the one it inherits ([`TaskType`]).
+    #[cfg(target_vendor = "apple")]
+    task: Option<TaskType>,
+}
+
+/// The task type a child starts as (`posix_spawnattr_setprocesstype_np`) in place of the one
+/// it inherits from this process: on macOS a task's type decides its band, so a child of a
+/// launchd job of `ProcessType` `Background` (darwin-bg: priority 4 at every class) started as
+/// another type leaves that band. Elsewhere a spawn has no task type and none is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskType {
+    /// A standard daemon (`POSIX_SPAWN_PROC_TYPE_DAEMON_STANDARD`): no band, each thread at
+    /// the class it asks for.
+    Standard,
+    /// A background daemon (`POSIX_SPAWN_PROC_TYPE_DAEMON_BACKGROUND`): the band launchd starts
+    /// a `Background` job in, every thread at priority 4 ([`start_children_in_background_band`]).
+    Background,
+    /// An interactive daemon (`POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE`): what launchd starts a
+    /// job of `ProcessType` `Interactive` as, no band, each thread at the class it asks for, as a
+    /// standard daemon's ([`Command::start_as_interactive_daemon`]).
+    Interactive,
+}
+
+/// Whether every child this process starts from now on, but one started out of the band
+/// ([`Command::leave_background_band`]), starts in the background band
+/// ([`start_children_in_background_band`]).
+#[cfg(target_vendor = "apple")]
+static CHILDREN_IN_BAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From now on start every child of this process in macOS's background band, as a child of a
+/// launchd job of `ProcessType` `Background` starts (a background daemon task: every thread at
+/// priority 4 whatever class it asks for), but one started with
+/// [`Command::leave_background_band`]; an in-place exec keeps this process's own type. For a
+/// process that left such a job's band to lift one thread, whose children stay where the job
+/// ran them (the vault subscriber's converge runner). Elsewhere nothing changes.
+pub fn start_children_in_background_band() {
+    #[cfg(target_vendor = "apple")]
+    CHILDREN_IN_BAND.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// The task type a spawn sets: `asked` ([`Command::leave_background_band`]), else the background
+/// band for a child (not an in-place exec, `replace`) of a process that starts its children there
+/// ([`start_children_in_background_band`]).
+#[cfg(target_vendor = "apple")]
+fn task_for(asked: Option<TaskType>, replace: bool) -> Option<TaskType> {
+    asked.or_else(|| {
+        (!replace && CHILDREN_IN_BAND.load(std::sync::atomic::Ordering::Acquire))
+            .then_some(TaskType::Background)
+    })
 }
 
 impl Default for Placement<'_> {
@@ -432,6 +481,8 @@ impl Default for Placement<'_> {
             native_image: false,
             disclaim: None,
             suspended: false,
+            #[cfg(target_vendor = "apple")]
+            task: None,
         }
     }
 }
@@ -655,6 +706,12 @@ mod platform {
     const POSIX_SPAWN_START_SUSPENDED: i16 = 0x0080;
     const POSIX_SPAWN_SETSID: i16 = 0x0400;
     const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
+    /// `<spawn_private.h>`'s `POSIX_SPAWN_PROC_TYPE_DAEMON_STANDARD`.
+    const PROC_TYPE_DAEMON_STANDARD: i32 = 0x300;
+    /// `<spawn_private.h>`'s `POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE`.
+    const PROC_TYPE_DAEMON_INTERACTIVE: i32 = 0x400;
+    /// `<spawn_private.h>`'s `POSIX_SPAWN_PROC_TYPE_DAEMON_BACKGROUND`.
+    const PROC_TYPE_DAEMON_BACKGROUND: i32 = 0x500;
     const O_RDONLY: i32 = 0;
     const O_WRONLY: i32 = 1;
     const SIGPIPE_BIT: u32 = 1 << (13 - 1);
@@ -680,6 +737,7 @@ mod platform {
         fn posix_spawnattr_setsigmask(attr: *mut Attr, mask: *const u32) -> i32;
         fn posix_spawnattr_setsigdefault(attr: *mut Attr, mask: *const u32) -> i32;
         fn posix_spawnattr_setpgroup(attr: *mut Attr, pgroup: i32) -> i32;
+        fn posix_spawnattr_setprocesstype_np(attr: *mut Attr, kind: i32) -> i32;
         fn posix_spawn_file_actions_init(actions: *mut Actions) -> i32;
         fn posix_spawn_file_actions_destroy(actions: *mut Actions) -> i32;
         fn posix_spawn_file_actions_addopen(
@@ -921,6 +979,14 @@ mod platform {
             }
             if let Some(set_disclaim) = disclaim {
                 check(set_disclaim(&mut objects.attr, 1))?;
+            }
+            if let Some(task) = super::task_for(place.task, place.replace) {
+                let kind = match task {
+                    super::TaskType::Standard => PROC_TYPE_DAEMON_STANDARD,
+                    super::TaskType::Background => PROC_TYPE_DAEMON_BACKGROUND,
+                    super::TaskType::Interactive => PROC_TYPE_DAEMON_INTERACTIVE,
+                };
+                check(posix_spawnattr_setprocesstype_np(&mut objects.attr, kind))?;
             }
             for (target, slot) in (0..).zip(place.stdio) {
                 let null_mode = if target == 0 { O_RDONLY } else { O_WRONLY };
@@ -1795,10 +1861,14 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 /// Request a parent-death tie ([`crate::tether`]), killed outright or crashed included, for a
 /// helper this process stops or bounds by its own clock (a read or a stream that never ends by
 /// itself), which would otherwise run on, adopted, for as long as it can. The first signal is
-/// `SIGTERM`, subject to the platform's conditions. On Linux the tie is to the spawning THREAD
-/// (`PR_SET_PDEATHSIG`), so spawn from a thread that outlives the child, and a child that ignores
-/// `SIGTERM` runs on. On Darwin the spawn runs through this executable
-/// ([`crate::tether::executable`]), whose watcher sends `SIGKILL`
+/// `SIGTERM`, subject to the platform's conditions. On Linux the tie is the parent-death signal
+/// (`PR_SET_PDEATHSIG`), which the kernel sends when the forking thread exits, so the spawn forks
+/// on one of the tether's threads, each of which lives as long as this process: the tie is the
+/// process's, whichever thread asked, and a child that ignores `SIGTERM` runs on. An exec in this
+/// process's place ends its other threads, so on Linux it sends the child the signal too, where
+/// Darwin's watcher waits for an exit. A spawn whose fork cannot reach such a thread (none was
+/// free and a new one could not start) fails, with nothing started. On Darwin the spawn runs
+/// through this executable ([`crate::tether::executable`]), whose watcher sends `SIGKILL`
 /// [`END_GRACE`](crate::process::END_GRACE) after the `SIGTERM` to the same process only
 /// ([`crate::tether::end_watched`]); an unreadable identity or a thread that has not run gets no
 /// signal and the watcher exits, so the child can run on. In a process whose `main` never called

@@ -72,16 +72,26 @@ fn a_slow_spawn_spends_the_budget() {
         Some(observed)
     };
     let budget = Duration::from_millis(50);
-    capture_bounded_impl(shell("printf hello"), budget, 1024, slow_spawn(budget * 2))
-        .expect_err("a spawn held past the budget leaves the child no time");
+    capture_bounded_impl(
+        shell("printf hello"),
+        budget,
+        1024,
+        None,
+        slow_spawn(budget * 2),
+    )
+    .expect_err("a spawn held past the budget leaves the child no time");
 
     let got = capture_bounded_impl(
         shell("printf hello"),
         HANG_DETECTOR,
         1024,
+        None,
         slow_spawn(budget * 2),
     )
     .expect("the child runs within a budget that covers its spawn");
+    let Ended::Exited(got) = got else {
+        panic!("nothing was watched for, so nothing stops it: {got:?}");
+    };
     assert_eq!(got.stdout, b"hello");
 }
 
@@ -109,7 +119,7 @@ fn capture_a_hanging_group(tag: &str, script: &str, path: &str) -> (libc::pid_t,
         std::fs::read_to_string(&report).is_ok_and(|r| r.ends_with('\n'))
     });
     let started = std::time::Instant::now();
-    let why = capture_bounded_impl(cmd, Duration::from_millis(200), 1024, Some(observed))
+    let why = capture_bounded_impl(cmd, Duration::from_millis(200), 1024, None, Some(observed))
         .expect_err("a hung child is an error, not a wait");
     let took = started.elapsed();
     let report = std::fs::read_to_string(&pgid_file).unwrap_or_default();
@@ -212,6 +222,10 @@ const ESCAPED_HOLDER_CAP_TICKS: u32 = 2_400; // x 50 ms
 #[cfg(unix)]
 const ESCAPE_STAGE: &str = "ATERM_ALIGN_ESCAPE_STAGE";
 
+/// Set as well when the stage's capture child prints [`STOP`] on stderr once its holder escaped.
+#[cfg(unix)]
+const ESCAPE_STOP: &str = "ATERM_ALIGN_ESCAPE_STOP";
+
 /// The escape test's capture ([`escaped_holder_stage`]).
 #[cfg(unix)]
 fn escaped_pipe_command(done: &Path, exited: &Path, escaped: &Path) -> Command {
@@ -257,6 +271,7 @@ fn escaped_holder_stage() -> ! {
         path("ATERM_ALIGN_ESCAPE_ESCAPED"),
     );
     let top = aterm_uds::spawnfd::descriptor_bound();
+    let print_stop = std::env::var_os(ESCAPE_STOP).is_some();
     let interrupted = || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
     let mut sync: [libc::c_int; 2] = [-1, -1];
     // SAFETY: `pipe` fills the two-element array; after `fork` the holder makes only
@@ -312,6 +327,9 @@ fn escaped_holder_stage() -> ! {
                         break n;
                     }
                 };
+                if print_stop {
+                    libc::write(2, STOP.as_ptr().cast(), STOP.len());
+                }
                 libc::_exit(if got == 1 { 0 } else { 1 })
             }
         }
@@ -429,6 +447,7 @@ fn escaped_descendant_holding_stdout_cannot_retain_a_reader_thread() {
         cmd,
         Duration::from_secs(2),
         1024,
+        None,
         Some(Arc::clone(&observed)),
     );
     let returned = CaptureObservedState::from(observed.as_ref());
@@ -462,4 +481,133 @@ fn stdout_is_capped_and_the_exit_code_reported() {
     let got = capture_bounded(shell("exit 7"), HANG_DETECTOR, 16).expect("it runs");
     assert_eq!(got.code, Some(7));
     assert!(!got.success());
+}
+
+/// The stop text the watched-capture tests print.
+const STOP: &[u8] = b"Authentication required";
+
+#[cfg(unix)]
+#[test]
+fn a_stop_text_on_stdout_ends_the_capture_before_its_deadline() {
+    let started = std::time::Instant::now();
+    let got = capture_bounded_until(
+        shell("printf 'Authentication required. Please visit'; \"$ATERM_TEST_SLEEP\" 120"),
+        HANG_DETECTOR,
+        1024,
+        STOP,
+    );
+    assert_eq!(got, Ok(Ended::Stopped));
+    assert!(
+        started.elapsed() < HANG_DETECTOR,
+        "it waited out its deadline: {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stop_text_on_stderr_ends_the_capture_and_reaps_the_child() {
+    let observed = Arc::new(CaptureLifecycleObservation::default());
+    let got = capture_bounded_impl(
+        shell("printf 'Authentication ' >&2; printf 'required' >&2; \"$ATERM_TEST_SLEEP\" 120"),
+        HANG_DETECTOR,
+        1024,
+        Some(STOP),
+        Some(Arc::clone(&observed)),
+    );
+    assert_eq!(
+        got,
+        Ok(Ended::Stopped),
+        "a match split across writes still counts"
+    );
+    assert_capture_return_conforms(
+        CaptureObservedState::from(observed.as_ref()),
+        false,
+        "reader_done",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stop_text_written_just_before_exit_is_still_seen() {
+    let got = capture_bounded_until(
+        shell("printf '{}'; printf 'Authentication required' >&2; exit 1"),
+        HANG_DETECTOR,
+        1024,
+        STOP,
+    );
+    assert_eq!(got, Ok(Ended::Stopped));
+}
+
+#[test]
+fn a_watched_capture_without_the_stop_text_reports_as_before() {
+    let line = if cfg!(windows) {
+        "<nul set /p =hello& exit 0"
+    } else {
+        "printf hello; printf 'some log' >&2"
+    };
+    let got = capture_bounded_until(shell(line), HANG_DETECTOR, 1024, STOP).expect("it runs");
+    let Ended::Exited(got) = got else {
+        panic!("no stop text was printed: {got:?}");
+    };
+    assert_eq!(got.stdout, b"hello");
+    assert!(got.success());
+}
+
+#[test]
+fn a_stop_text_split_across_chunks_is_found() {
+    let mut seen = Vec::new();
+    assert!(!append_and_find(&mut seen, b"xx Authentication ", STOP));
+    assert!(append_and_find(&mut seen, b"required", STOP));
+    let mut seen = Vec::new();
+    let found = STOP
+        .chunks(1)
+        .map(|byte| append_and_find(&mut seen, byte, STOP))
+        .collect::<Vec<_>>();
+    assert_eq!(found.iter().filter(|f| **f).count(), 1, "{found:?}");
+    assert_eq!(found.last(), Some(&true), "found on its last byte");
+    assert!(!append_and_find(
+        &mut Vec::new(),
+        b"Authentication requir",
+        STOP
+    ));
+}
+
+/// A capture stopped on stderr while a holder outside the killed group keeps stdout open joins
+/// its reader at once (the cancel pipe), not when the deadline would have freed it.
+#[cfg(unix)]
+#[test]
+fn a_stop_on_stderr_returns_while_an_escaped_holder_keeps_stdout() {
+    let tmp = temp_dir("escaped-stop");
+    let done = tmp.path().join("done");
+    let exited = tmp.path().join("exited");
+    let escaped = tmp.path().join("escaped");
+    let mut holder = EscapedHolderGuard::new(done.clone(), exited.clone());
+    let mut cmd = escaped_pipe_command(&done, &exited, &escaped);
+    cmd.env(ESCAPE_STOP, "1");
+    let observed = Arc::new(CaptureLifecycleObservation::default());
+    let marker = escaped.clone();
+    settle_until(&observed, move || marker.exists());
+    let started = std::time::Instant::now();
+    let result = capture_bounded_impl(
+        cmd,
+        HANG_DETECTOR,
+        1024,
+        Some(STOP),
+        Some(Arc::clone(&observed)),
+    );
+    let took = started.elapsed();
+    let returned = CaptureObservedState::from(observed.as_ref());
+    let holder_held_on = !exited.exists();
+    holder.release();
+    assert_eq!(result, Ok(Ended::Stopped));
+    assert!(
+        holder_held_on,
+        "the holder still held stdout when the capture returned"
+    );
+    assert!(
+        took < HANG_DETECTOR,
+        "the reader was freed only by the deadline: {took:?}"
+    );
+    assert_capture_return_conforms(returned, false, "reader_done");
 }

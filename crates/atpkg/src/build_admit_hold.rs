@@ -319,11 +319,14 @@ impl Drop for Unarmed {
 #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 fn note_reads(reads: &std::path::Path, meter: &aterm_capacity::tree_meter::TreeMeter) {
     use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     let pids: Vec<String> = meter.survivors().iter().map(u32::to_string).collect();
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(reads)
+        && file.metadata().is_ok_and(|m| m.is_file())
     {
         let _ = writeln!(file, "reads {}", pids.join(" "));
     }
@@ -340,8 +343,6 @@ struct Trace {
 
 #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 fn trace_record(event: impl FnOnce() -> aterm_json::Value) {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     thread_local! {
         static TRACE: std::cell::RefCell<Option<Trace>> = std::cell::RefCell::new(
             std::env::var_os(TRACE_ENV).map(|path| Trace {
@@ -375,19 +376,7 @@ fn trace_record(event: impl FnOnce() -> aterm_json::Value) {
         let Ok(bytes) = aterm_json::to_vec(&body) else {
             return;
         };
-        let temporary = trace.path.with_extension("pending");
-        let result = (|| -> std::io::Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o600)
-                .open(&temporary)?;
-            file.write_all(&bytes)?;
-            drop(file);
-            std::fs::rename(&temporary, &trace.path)
-        })();
-        let _ = result;
+        let _ = aterm_uds::atomic_file::write(&trace.path, &bytes, 0o600);
     });
 }
 

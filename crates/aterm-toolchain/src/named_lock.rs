@@ -232,12 +232,29 @@ impl From<io::Error> for Refused {
 /// A held lock whose file names this process; the record is cleared before the lock goes.
 #[derive(Debug)]
 pub struct NamedLock {
-    lock: RecordLock,
+    /// Taken only by the consuming Unix close-only transfer. An ordinary guard
+    /// retains its record-clearing and explicit-unlock destruction semantics.
+    lock: Option<RecordLock>,
     holder: Holder,
     waited: Duration,
 }
 
 impl NamedLock {
+    /// Transfer the actual held Unix description without clearing its advisory
+    /// holder record or issuing LOCK_UN when this original guard is destroyed.
+    /// Each returned guard or explicitly exported duplicate closes only its own
+    /// description; the kernel releases the lock after the final copy closes.
+    /// The retained holder record may outlive its process and is advisory, never
+    /// proof of admission, timing qualification or child-group drain.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn into_close_only(mut self) -> crate::record_lock::CloseOnlyLock {
+        self.lock
+            .take()
+            .expect("a named lock owns its guard until consuming transfer")
+            .into_close_only()
+    }
+
     /// The record this lock's file holds: its taker, since the moment the taker had the lock.
     #[must_use]
     pub fn holder(&self) -> &Holder {
@@ -254,13 +271,17 @@ impl NamedLock {
 impl std::ops::Deref for NamedLock {
     type Target = File;
     fn deref(&self) -> &File {
-        &self.lock
+        self.lock
+            .as_ref()
+            .expect("a named lock owns its guard until consuming transfer")
     }
 }
 
 impl Drop for NamedLock {
     fn drop(&mut self) {
-        let _ = self.lock.set_len(0);
+        if let Some(lock) = &self.lock {
+            let _ = lock.set_len(0);
+        }
     }
 }
 
@@ -443,25 +464,24 @@ fn waits_for(path: &Path, me: &Holder, holder: Option<&Holder>) -> String {
 /// `lock`, had after `waited`, its record now `me`'s since this moment. A record that cannot be
 /// written (a full disk) is cleared and the lock kept: a waiter then names a run that wrote no
 /// record, which this one is.
-fn named(lock: RecordLock, me: &Holder, waited: Duration) -> NamedLock {
-    let mut held = NamedLock {
-        lock,
-        holder: Holder {
-            since: now_secs(),
-            ..me.clone()
-        },
-        waited,
+fn named(mut lock: RecordLock, me: &Holder, waited: Duration) -> NamedLock {
+    let holder = Holder {
+        since: now_secs(),
+        ..me.clone()
     };
-    let line = held.holder.line();
-    let written = held
-        .lock
+    let line = holder.line();
+    let written = lock
         .set_len(0)
-        .and_then(|()| held.lock.seek(io::SeekFrom::Start(0)))
-        .and_then(|_| held.lock.write_all(line.as_bytes()));
+        .and_then(|()| lock.seek(io::SeekFrom::Start(0)))
+        .and_then(|_| lock.write_all(line.as_bytes()));
     if written.is_err() {
-        let _ = held.lock.set_len(0);
+        let _ = lock.set_len(0);
     }
-    held
+    NamedLock {
+        lock: Some(lock),
+        holder,
+        waited,
+    }
 }
 
 /// Open (creating) `path` for locking and its record, never truncated: a lock file is a
@@ -481,7 +501,7 @@ fn open(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
@@ -506,7 +526,7 @@ fn open_regular_existing(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = options.open(path)?;
     let meta = file.metadata()?;
@@ -596,6 +616,53 @@ mod tests {
         drop(held);
         assert_eq!(read(&path), None, "the record goes with the lock");
         drop(take(&path, &me, Wait::No, &mut quiet, &|| false).expect("free again"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_only_transfer_keeps_the_original_holder_record_and_native_lock() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = scratch("close-only");
+        let path = dir.path().join("lane.lock");
+        let original = take(&path, &holder("original"), Wait::No, &mut quiet, &|| false)
+            .expect("the original lock");
+        let record = std::fs::read(&path).unwrap();
+        let identity = original.metadata().unwrap();
+        let transferred = original.into_close_only();
+        let duplicate = transferred.try_clone().unwrap();
+        let exported = duplicate.try_clone_fd().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), record);
+        let actual = transferred.metadata().unwrap();
+        assert_eq!(
+            (actual.dev(), actual.ino()),
+            (identity.dev(), identity.ino())
+        );
+        drop(transferred);
+        assert!(matches!(
+            take(&path, &holder("contender"), Wait::No, &mut quiet, &|| false),
+            Err(Refused::Held(_))
+        ));
+        drop(duplicate);
+        assert!(matches!(
+            take(&path, &holder("contender"), Wait::No, &mut quiet, &|| false),
+            Err(Refused::Held(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), record);
+        drop(exported);
+        let next = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the final transferred description to close",
+            || match take(&path, &holder("next"), Wait::No, &mut quiet, &|| false) {
+                Ok(next) => Some(next),
+                Err(Refused::Held(_)) => None,
+                Err(why) => panic!("reacquisition failed: {why:?}"),
+            },
+        );
+        assert_eq!(read(&path).as_ref(), Some(next.holder()));
+        assert_eq!(next.holder().verb, "next");
+        drop(next);
+        assert_eq!(read(&path), None, "ordinary record clearing remains intact");
     }
 
     /// The waiter names the holder once it has waited a tick, then has the lock as soon as the

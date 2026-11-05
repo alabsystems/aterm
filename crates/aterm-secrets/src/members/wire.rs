@@ -174,6 +174,29 @@ fn unescape_within(text: &str, max: usize) -> Result<String> {
         .ok_or_else(bad)
 }
 
+/// The field a lab identity's `ask`, `run` and `prove` lines carry (`lab=1`,
+/// `docs/DESIGN-alab-one-mesh-2026-11-05.md` A12), from its Commons device's mark
+/// ([`crate::commons::bootstrap::Device::lab`]); nothing for any other identity. It sits outside
+/// every message the line's signatures cover, so a member before it checks those signatures as
+/// before and ignores the field, as it ignores every key it does not read. A host on the path
+/// could strip it: the joiner refuses the live ALab by itself before it dials, and the field is
+/// what a member adds to that.
+pub(super) fn lab_field(lab: Option<crate::LabMark>) -> &'static str {
+    if lab.is_some() { " lab=1" } else { "" }
+}
+
+/// Whether `line` carries the lab mark ([`lab_field`]).
+///
+/// # Errors
+/// Its `lab` field holds anything but `1`.
+pub(super) fn marked(line: &Line<'_>) -> Result<bool> {
+    match line.get("lab") {
+        Err(_) => Ok(false),
+        Ok("1") => Ok(true),
+        Ok(_) => Err(Error::new("a join exchange line's lab is not 1")),
+    }
+}
+
 /// The longest reason a `NO` line carries.
 const MAX_WHY: usize = 400;
 
@@ -279,5 +302,20 @@ mod tests {
         assert_eq!(busy_left("OK left=90"), None);
         assert_eq!(busy_left("NO left=90 why=refused"), None);
         assert_eq!(busy_left("NO busy=1 busy=0 left=90 why=busy"), None);
+    }
+
+    /// The lab mark is one `lab=1` field a line parses with, absent for any other identity, and
+    /// any other value is refused rather than read as unmarked.
+    #[test]
+    fn the_lab_field_round_trips_and_takes_only_one() {
+        let marked_line = format!("ask node=00{}", lab_field(Some(crate::LabMark::TestBinary)));
+        assert_eq!(marked_line, "ask node=00 lab=1");
+        assert!(marked(&Line::parse(&marked_line)).unwrap());
+        let plain = format!("ask node=00{}", lab_field(None));
+        assert_eq!(plain, "ask node=00");
+        assert!(!marked(&Line::parse(&plain)).unwrap());
+        for other in ["ask lab=0", "ask lab=", "ask lab=yes"] {
+            assert!(marked(&Line::parse(other)).is_err(), "{other}");
+        }
     }
 }

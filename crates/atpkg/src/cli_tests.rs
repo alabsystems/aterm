@@ -6018,6 +6018,9 @@ fn make_archive(dir: &Path, prog: &str, build: u64) -> PathBuf {
     }
     let mut tar = Vec::new();
     tar.extend(entry(&format!("bin/{prog}"), b"#!/bin/true\n"));
+    if prog == "trust" {
+        tar.extend(entry("lib/rustlib/sysroot", b""));
+    }
     tar.resize(tar.len() + 1024, 0);
     let path = dir.join(format!("{prog}-{build}.tar.zst"));
     std::fs::write(&path, crate::extract::fixtures::zstd_bytes(&tar)).unwrap();
@@ -9545,6 +9548,7 @@ fn an_apply_only_pass_that_flips_trust_re_lays_the_rustup_view() {
         b"#!/bin/true\n# build 4800\n",
     )
     .unwrap();
+    std::fs::create_dir_all(layout.build_dir("trust", 4800).join("lib/rustlib")).unwrap();
     let rustup = scratch("apply-only-seam-rustup");
     std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
     let _ = crate::seam::reassert(&layout, &rustup);
@@ -13025,6 +13029,41 @@ fn a_vendor_fresh_install_streams_on_the_progress_file() {
     assert_eq!(file.overall.bytes_total, payload.len() as u64);
     assert_eq!(file.overall.programs_done, 1);
     assert_eq!(file.programs["claude"].phase, crate::progress::Phase::Done);
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+}
+
+/// AN INSTALL WRITES ITS PASS WHERE ITS SPAWNER SAID. `install <program> --progress-file` is how a
+/// worker's launcher installs its program (`aterm-gui`'s `task_launch::install_argv`), and the
+/// startup deadline judges that install by this file's work, so a pass that writes nothing reads as
+/// a hung install however fast its bytes arrive. CONTROL: with no file named, none is written.
+#[test]
+fn an_install_given_a_progress_file_writes_its_pass_there() {
+    use crate::vendor_direct::lane::world::{self, Fake, native_exe};
+    let _slot = crate::progress::own_pass_slot();
+    let f = Fake::default();
+    f.publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    let trust = world::trust();
+
+    let unnamed = world::layout("install-no-progress");
+    do_install_with(&unnamed, &f, "stable", "claude", &world_seams(&trust)).expect("installed");
+    assert_eq!(crate::progress::read_progress(&unnamed), None);
+
+    let layout = world::layout("install-progress");
+    let progress = layout.progress_file();
+    let seams = PassSeams {
+        progress: Some(&progress),
+        ..world_seams(&trust)
+    };
+    do_install_with(&layout, &f, "stable", "claude", &seams).expect("installed");
+    let file = crate::progress::read_progress(&layout).expect("a progress file");
+    assert_eq!(file.pass, "install");
+    assert!(file.generation.is_some(), "a pass names itself");
+    assert!(file.ended_unix.is_some(), "the pass ended");
+    assert!(
+        file.programs.contains_key("claude"),
+        "its work is on the file: {file:?}"
+    );
+    let _ = std::fs::remove_dir_all(&unnamed.prefix);
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 

@@ -63,7 +63,7 @@ pub fn help() -> String {
     format!("usage: aterm doctor {GRAMMAR}\n{HELP_ROWS}")
 }
 
-const ROWS: [(&str, &str, &str, &str); 15] = [
+const ROWS: [(&str, &str, &str, &str); 16] = [
     ("shell:", SHELL, "shell", "the shell aterm starts"),
     (
         "privacy:",
@@ -125,6 +125,12 @@ const ROWS: [(&str, &str, &str, &str); 15] = [
         "base.session.instances",
         "session",
         "the aterm instances and other aterm programs running as you",
+    ),
+    (
+        "leftovers:",
+        "base.session.leftovers",
+        "session",
+        "what closed tabs and dead verify runs left running",
     ),
     (
         "fabric:",

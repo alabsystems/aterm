@@ -10,6 +10,8 @@ use std::ffi::OsString;
 use std::ops::ControlFlow;
 use std::process::ExitCode;
 
+mod lab_window;
+
 #[cfg(target_os = "macos")]
 mod compact_zone;
 #[cfg(unix)]
@@ -27,8 +29,6 @@ use aterm_cli::{AliasRoute, alias_route};
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
-#[cfg(all(test, unix))]
-aterm_secrets::memoized_x25519_in_tests!();
 #[cfg(all(test, unix))]
 aterm_db::admission_waits_in_tests!(aterm_spec::wait::MUST_HAPPEN);
 
@@ -193,6 +193,7 @@ fn run_init(entry: InitEntry) -> ExitCode {
         full_disk_access: &aterm_cli::macos_doctor::full_disk_access,
         records: &aterm_cli::macos_doctor::InitRecords,
         grants: aterm_cli::macos_doctor::init_grants,
+        workstation_check: &aterm_cli::macos_doctor::check_background_workstation,
         walk: match entry {
             InitEntry::Typed(_) => &aterm_cli::init_permissions_walk,
             InitEntry::PackageFollowUp => &|_| None,
@@ -210,6 +211,9 @@ fn run_init(entry: InitEntry) -> ExitCode {
         full_disk_access: &|| None,
         records: &aterm_machines::init::NoRecords,
         grants: aterm_machines::init::no_grants,
+        workstation_check: &|| {
+            aterm_machines::init::WorkstationObservation::Unavailable("macOS only".into())
+        },
         walk: &|_| None,
         converge: &converge::Live,
         alab: &aterm_machines::init_secrets::alab_member_here,
@@ -267,12 +271,28 @@ fn node_unavailable() -> ExitCode {
 #[cfg(unix)]
 static NODE_COMMONS: std::sync::OnceLock<aterm_db::runtime::Runtime> = std::sync::OnceLock::new();
 
+/// A scratch host starts Commons only with an explicit guarded debug attachment.
+/// Other automatic lanes still see its private-state or CI marker and stay off.
+#[cfg(unix)]
+fn commons_host_enabled() -> bool {
+    let unmarked =
+        std::env::var_os("ATERM_STATE_HOME").is_none() && std::env::var_os("CI").is_none();
+    #[cfg(any(test, debug_assertions))]
+    {
+        unmarked || aterm_db::runtime::private_attachment_port().is_ok()
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        unmarked
+    }
+}
+
 /// Start `aterm node serve`'s background Commons runtime (C22) while `[swarm] enabled` leaves
 /// sharing on, else once a person turns it on ([`commons_lan::when_sharing_on`]), publishing its
 /// observation to the account claims and its peers to the node job's "network moved" signal.
 #[cfg(unix)]
 fn spawn_node_commons_runtime() {
-    if std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some() {
+    if !commons_host_enabled() {
         return;
     }
     let Ok(paths) = aterm_secrets::client::Paths::live() else {
@@ -369,6 +389,11 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
         // at its queue's class. First, as a thread started earlier keeps the default class.
         aterm_gui::hold_process_as_background_work();
         aterm_gui::install_session_log();
+        // First, before the job's Commons runtime, listener or update checker starts: a build
+        // this job staged and ended its last run for goes in now, with no window here to apply
+        // it. That boot execs the build it installed and does not return
+        // (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.13).
+        let boot = aterm_gui::apply_node_update_at_boot();
         // The job's automatic LAN uses go only while `[swarm] enabled` leaves sharing on.
         if let Some(home) = aterm_types::dirs::home_dir() {
             commons_lan::install_sharing(&home);
@@ -381,7 +406,7 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
             commons_lan::hold_first_uses_for_the_step(&config, commons_lan::Host::NodeServe);
         }
         spawn_node_commons_runtime();
-        return aterm_gui::run_node_serve();
+        return aterm_gui::run_node_serve(boot);
     }
     let Some(home) = aterm_types::dirs::home_dir() else {
         eprintln!("aterm node: HOME is not set");
@@ -421,6 +446,10 @@ const CTL_LOCAL: aterm_ctl::LocalVerbs = aterm_ctl::LocalVerbs {
     fleet_drive: Some(aterm_agent::drive_fleet),
     #[cfg(not(unix))]
     fleet_drive: None,
+    #[cfg(unix)]
+    fleet_node: Some(aterm_agent::fleet_node),
+    #[cfg(not(unix))]
+    fleet_node: None,
 };
 
 fn ctl_cast_drift(job: &aterm_ctl::CastDriftJob<'_>) -> Result<String, String> {
@@ -557,8 +586,27 @@ fn stale_developer_dir() -> Option<&'static str> {
     Some(aterm_types::clt_shim::DEVELOPER_DIR_ENV)
 }
 
+/// The bound a front-door test sets, in milliseconds, for the CPU-policy collector's wait for its
+/// ack (`ATERM_CPU_POLICY_HANG_MS`, a development seam): none in a shipped build.
+#[cfg(target_os = "macos")]
+fn cpu_policy_hang() -> Option<std::time::Duration> {
+    aterm_types::dev_seam!("ATERM_CPU_POLICY_HANG_MS")
+        .and_then(|ms| ms.to_str()?.parse().ok())
+        .map(std::time::Duration::from_millis)
+}
+
 pub(crate) fn main() -> ExitCode {
-    let code = front_door_main();
+    let mut argv: Vec<OsString> = std::env::args_os().collect();
+    // Before even the build-holder/tether helper entries may fork or spawn.
+    // This original opaque description remains live through the whole GUI run.
+    let lab_window_guard = match lab_window::enter(&mut argv) {
+        Ok(guard) => guard,
+        Err(why) => {
+            eprintln!("aterm: {why}");
+            return ExitCode::from(2);
+        }
+    };
+    let code = front_door_main(argv, lab_window_guard.is_present());
     // A pass the lab's mailbox discovery started on its own thread finishes before a
     // short-lived invocation returns (a bounded wait; nothing runs in most processes).
     #[cfg(unix)]
@@ -566,7 +614,7 @@ pub(crate) fn main() -> ExitCode {
     code
 }
 
-fn front_door_main() -> ExitCode {
+fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     // First, while this process has one thread: a build's claim holder forks away from its
     // front's spawn (BUILD-ADMIT), and a window's tethered helper starts as its verb.
     if let Some(code) = atpkg::build_admit::hold::entry() {
@@ -623,6 +671,17 @@ fn front_door_main() -> ExitCode {
     // otherwise, and its doctor counts them; the read runs only when one of those asks for it.
     #[cfg(unix)]
     atpkg::peers::set_fleet(unit_peers::fleet);
+    // With the mesh switch on, a download takes a member's unit over a `Units` op of its node
+    // service first, and dials its port 7487 where that gives none. Inert with it off.
+    #[cfg(unix)]
+    atpkg::peers::set_units_dialer(aterm_gui::dial_units);
+    // With the mesh switch on, a fleet dial meets an `atm/1` listener by the verdict this Mac's
+    // own listener judges by, and a listener that seats no `Node` record for this Mac's key is
+    // offered it at its desk (aterm-net reads no membership log itself). Inert with it off.
+    #[cfg(unix)]
+    aterm_gui::judge_mesh_dials();
+    #[cfg(unix)]
+    aterm_net::fleet_member::on_unknown_to(aterm_agent::mesh_offer::offer_node);
     // Once a look heard the Local Network switch on, no route to a LAN vault host is a host that
     // did not answer (a LAN this Mac left), never the permission.
     #[cfg(target_os = "macos")]
@@ -652,7 +711,7 @@ fn front_door_main() -> ExitCode {
     aterm_machines::init_secrets::on_lan_heard(aterm_cli::macos_doctor::LAN_KEEPER);
     // The fixed collector runs before GUI initialization or any per-user state is read.
     #[cfg(target_os = "macos")]
-    let early_args: Vec<_> = std::env::args_os().skip(1).collect();
+    let early_args = argv.get(1..).unwrap_or(&[]);
     #[cfg(target_os = "macos")]
     if early_args
         .first()
@@ -662,9 +721,18 @@ fn front_door_main() -> ExitCode {
             eprintln!("CPU policy collection requires its owned anonymous output pipe");
             return ExitCode::from(2);
         }
-        return ExitCode::from(aterm_sysprobe::cpu_policy::collector_entry(
-            &early_args[1..],
-        ));
+        return ExitCode::from(match cpu_policy_hang() {
+            // A front-door test, this role's parent, acks and reads it: the role's deadline covers
+            // the ack wait and the collection it wraps, and 5 s more, as the shipped pairing's
+            // `COLLECT_FOR` + 5 s does for 5 s.
+            Some(hang) => aterm_sysprobe::cpu_policy::collector_entry_within(
+                &early_args[1..],
+                hang.saturating_add(aterm_sysprobe::cpu_policy::COLLECT_FOR)
+                    .saturating_add(std::time::Duration::from_secs(5)),
+                hang,
+            ),
+            None => aterm_sysprobe::cpu_policy::collector_entry(&early_args[1..]),
+        });
     }
     aterm_gui::mark_rust_main_start();
     #[cfg(unix)]
@@ -683,7 +751,7 @@ fn front_door_main() -> ExitCode {
     alab_seen::install();
     #[cfg(windows)]
     let _ = aterm_gui::attach_parent_console();
-    let mut args_os = std::env::args_os();
+    let mut args_os = argv.into_iter();
     let argv0_os: Option<OsString> = args_os.next();
     let rest: Vec<OsString> = args_os.collect();
 
@@ -987,6 +1055,12 @@ fn front_door_main() -> ExitCode {
     let windowish = is_windowish(scan, force_session, stdin_is_terminal());
     let mode_args = take_no_reroute(&strip_mode_flags(&rest));
     if windowish {
+        if lab_window_guarded {
+            // The actual guarded image must retain its original description.
+            // Forwarding a plain launch would leave that custody in this short-
+            // lived sender instead of the window it was intended to protect.
+            return run_window(mode_args, WindowHost::ThisProcess, &rest);
+        }
         let spawn = match plain_launch_policy(&rest) {
             ControlFlow::Break(code) => return code,
             ControlFlow::Continue(spawn) => spawn,
@@ -1597,7 +1671,7 @@ fn spawn_acaffeine_watch() {
 }
 
 /// Only long-lived ordinary hosts contend for Commons transport ownership.
-/// One-shot verbs return before these call sites; private labs are inert.
+/// One-shot verbs return before these call sites; private labs need a guarded attachment.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static COMMONS_RUNTIME: std::sync::OnceLock<aterm_db::runtime::Runtime> =
     std::sync::OnceLock::new();
@@ -1642,7 +1716,7 @@ fn claims_observation() -> Option<aterm_types::network_state::NetworkObservation
             .try_publication()
             .map(account_claims::current_observation);
     }
-    if std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some() {
+    if !commons_host_enabled() {
         return None;
     }
     aterm_db::runtime::read_live_publication(
@@ -1658,10 +1732,7 @@ fn claims_observation() -> Option<aterm_types::network_state::NetworkObservation
 /// ([`commons_lan::when_sharing_on`]).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spawn_commons_runtime(host: commons_lan::Host) {
-    if std::env::var_os("ATERM_STATE_HOME").is_some()
-        || std::env::var_os("CI").is_some()
-        || COMMONS_RUNTIME.get().is_some()
-    {
+    if !commons_host_enabled() || COMMONS_RUNTIME.get().is_some() {
         return;
     }
     let Ok(paths) = aterm_secrets::client::Paths::live() else {
@@ -1721,7 +1792,7 @@ fn start_commons_runtime(
 fn network_state_source() -> Option<aterm_gui::NetworkSnapshotSource> {
     use std::sync::OnceLock;
 
-    if std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some() {
+    if !commons_host_enabled() {
         return None;
     }
 
@@ -4971,14 +5042,27 @@ mod alab_watch_tests {
                 watch.faults.push_back(Some((1, false)));
                 watch.replacement = Some(replacement);
                 widen_on_alab_signal(&mut watch);
-                assert!(
-                    watch.recovered.is_empty(),
-                    "a later choice remains authoritative"
-                );
-                assert_eq!(
-                    watch.looks, 2,
-                    "the retained ticket confirms its retirement"
-                );
+                match replacement {
+                    Replacement::Stop => {
+                        assert!(watch.recovered.is_empty(), "an explicit Stop holds setup");
+                        assert_eq!(
+                            watch.looks, 2,
+                            "the retained ticket confirms its retirement"
+                        );
+                    }
+                    Replacement::Person => {
+                        assert_eq!(
+                            watch.recovered.len(),
+                            1,
+                            "fleet membership expands a saved plan"
+                        );
+                        assert_eq!(
+                            watch.looks, 3,
+                            "the replacement plan receives its own upgrade"
+                        );
+                    }
+                    Replacement::OldStop(_) => unreachable!(),
+                }
                 assert!(!watch.setup.widens().unwrap());
             }
         }
@@ -6787,7 +6871,6 @@ fn wait_while_queued(let_go: impl Fn() -> bool) -> bool {
 const SETUP_HOOKS: aterm_cli::macos_doctor::SetupHooks = aterm_cli::macos_doctor::SetupHooks {
     stop: setup_stop_requested,
     stage: setup_stage,
-    on_screen: aterm_gui::system_state_on_screen,
     developer_tools: aterm_gui::offer_developer_tools_install,
 };
 
@@ -8016,6 +8099,14 @@ fn initial_setup_status() -> aterm_gui::SetupStatus {
     let startup_retrying = STARTUP_RETRY.lock().is_ok_and(|retry| retry.retrying());
     add_startup_retry(&mut status, startup_retrying);
     add_setup_readings(&mut status);
+    if status.plan.as_ref().is_some_and(|plan| {
+        plan.selection
+            .contains(aterm_types::macos_setup::Setting::Secrets)
+    }) {
+        status
+            .observed
+            .push(doctor::ai_accounts_setup_observation());
+    }
     add_vault_not_joined(
         &mut status,
         SETUP_VAULT_NOT_JOINED.load(std::sync::atomic::Ordering::Acquire),
@@ -8208,11 +8299,20 @@ fn heal_unread_setup() {
 /// (System State design §3.5): the log names them, and the exceptions digest keeps the fact.
 #[cfg(target_os = "macos")]
 fn note_setup_set_aside(set: &aterm_cli::macos_doctor::SetAside) {
+    note_set_aside_in(&SET_ASIDE_SAID, set);
+}
+
+/// [`note_setup_set_aside`], raising `said` (the process's [`SET_ASIDE_SAID`]).
+#[cfg(target_os = "macos")]
+fn note_set_aside_in(
+    said: &std::sync::atomic::AtomicBool,
+    set: &aterm_cli::macos_doctor::SetAside,
+) {
     let kept = set.kept.join(", ");
     aterm_log::warn!(
         "System State: saved setup records could not be read and were set aside as {kept}"
     );
-    SET_ASIDE_SAID.store(true, std::sync::atomic::Ordering::Release);
+    said.store(true, std::sync::atomic::Ordering::Release);
     aterm_gui::note_setup_set_aside(&kept);
 }
 
@@ -8227,7 +8327,17 @@ static SET_ASIDE_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// §3.5): `clear` runs once, until aterm sets a saved setup aside again.
 #[cfg(target_os = "macos")]
 fn set_aside_as_read(recovered: Option<bool>, clear: impl FnOnce()) {
-    if recovered == Some(false) && SET_ASIDE_SAID.swap(false, std::sync::atomic::Ordering::AcqRel) {
+    set_aside_read_in(&SET_ASIDE_SAID, recovered, clear);
+}
+
+/// [`set_aside_as_read`] against `said` (the process's [`SET_ASIDE_SAID`]).
+#[cfg(target_os = "macos")]
+fn set_aside_read_in(
+    said: &std::sync::atomic::AtomicBool,
+    recovered: Option<bool>,
+    clear: impl FnOnce(),
+) {
+    if recovered == Some(false) && said.swap(false, std::sync::atomic::Ordering::AcqRel) {
         clear();
     }
 }
@@ -9875,8 +9985,8 @@ mod initial_setup_result_tests {
         );
         assert!(!status.cancelled);
         assert_eq!(status.plan, Some(reviewed));
-        // Set up now asks for no macOS grant: they are on offer, a press of their own away.
-        assert!(!status.permissions.unwrap().allowed);
+        // Resuming the selected Permissions stage starts its automatic steps.
+        assert!(status.permissions.unwrap().allowed);
     }
 
     #[test]
@@ -13230,7 +13340,7 @@ fn nested_new_tab() -> ExitCode {
 
 fn payload_boundary(rest: &[OsString]) -> usize {
     rest.iter()
-        .position(|a| matches!(a.to_string_lossy().as_ref(), "-e" | "--command" | "--"))
+        .position(|a| matches!(a.to_str(), Some("-e" | "--command" | "--")))
         .unwrap_or(rest.len())
 }
 
@@ -13240,7 +13350,7 @@ fn strip_flags(rest: &[OsString], flags: &[&str]) -> Vec<OsString> {
     let boundary = payload_boundary(rest);
     rest.iter()
         .enumerate()
-        .filter(|(i, a)| *i >= boundary || !flags.contains(&a.to_string_lossy().as_ref()))
+        .filter(|(i, a)| *i >= boundary || a.to_str().is_none_or(|s| !flags.contains(&s)))
         .map(|(_, a)| a.clone())
         .collect()
 }
@@ -13257,7 +13367,7 @@ fn take_no_reroute(rest: &[OsString]) -> Vec<OsString> {
         .get(..payload_boundary(rest))
         .unwrap_or(rest)
         .iter()
-        .any(|a| a.to_string_lossy() == NO_REROUTE_FLAG)
+        .any(|a| a == NO_REROUTE_FLAG)
     {
         aterm_log::env::set(atpkg::reroute::PASSTHROUGH_ENV, "1");
     } else {
@@ -13304,7 +13414,7 @@ fn window_verb(verb: &str, args: &[OsString], host: WindowHost) -> ExitCode {
     // grammar's "unknown option": these verbs dispatch to no tool that could answer it.
     if args
         .first()
-        .is_some_and(|a| matches!(a.to_string_lossy().as_ref(), "-h" | "--help"))
+        .is_some_and(|a| matches!(a.to_str(), Some("-h" | "--help")))
     {
         println!("{}", aterm_cli::window_verb_usage(verb));
         if let Some(v) = aterm_cli::Verb::from_operand(verb) {
@@ -14129,12 +14239,10 @@ fn pending_stub_resolves(tool: &str) -> bool {
 
 fn is_windowish(scan: &[OsString], force_session: bool, stdin_tty: bool) -> bool {
     !force_session
-        && (scan.iter().any(|a| {
-            matches!(
-                a.to_string_lossy().as_ref(),
-                "--window" | "--headless" | "--diagnose"
-            )
-        }) || !stdin_tty)
+        && (scan
+            .iter()
+            .any(|a| matches!(a.to_str(), Some("--window" | "--headless" | "--diagnose")))
+            || !stdin_tty)
 }
 
 fn stdin_is_terminal() -> bool {

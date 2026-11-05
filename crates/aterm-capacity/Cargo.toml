@@ -35,6 +35,8 @@ aterm-toolchain = { workspace = true }
 # A claim's record is one JSON object a line. First-party; aterm-sysprobe
 # already links it.
 aterm-json = { workspace = true }
+# Typed, duplicate-rejecting observational cache-work records; workspace serde is first-party.
+serde = { workspace = true, features = ["derive"] }
 # The workspace's one epoch-clock read (`aterm_time::unix_millis`), for a
 # claim's start. No dependencies.
 aterm-time = { workspace = true }
@@ -49,6 +51,16 @@ aterm-toml = { workspace = true }
 # then renamed over it. Workspace crates; aterm-types already links both.
 aterm-tempfile = { workspace = true }
 aterm-durable = { workspace = true }
+# Each admission decided in this user's ledger is one `kind=admission` row in
+# this Mac's telemetry log (Continuum TM-0): the row schema and the bounded,
+# rotated log. Workspace crate; of its dependencies only aterm-digest (the
+# workspace's first-party SHA-256) is new to this crate's graph.
+aterm-telemetry = { workspace = true }
+# Every platform: `kept_out` opens the ledger's lock and record files out of a
+# concurrent spawn's inherited descriptors (a no-op wrapper off unix), and on
+# unix the account identity for the window's state/config roots under a
+# scratch home. Workspace crate; aterm-types already links it.
+aterm-uds = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # Physical isolation from readers that reap a free v1 lock before decoding a claim.
@@ -56,19 +68,13 @@ aterm-dirfd = { workspace = true }
 # Shared native CPU unit leases, including their account path and record parser.
 # Kept in the core toolchain so Targo and the resource report cannot diverge.
 trust-build-cpu = { workspace = true }
-# Account identity for the window's state/config roots under a scratch home.
-# The shared ledger directory itself comes from core Trust above.
-# Workspace crate; aterm-types already links it.
-aterm-uds = { workspace = true }
 # `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` for bounded regular-file opens, and `kill`/`signal` in
 # interrupt tests: aterm-libc, first-party, which aterm-toolchain already links.
 libc = { workspace = true }
 
 [dev-dependencies]
 aterm-models-capacity = { workspace = true }
-# The stand-in holder dies by `kill_self_now()`, and is started by
-# `spawnfd::command`; the one-minute hang detector (`aterm_spec::wait`).
-aterm-uds = { workspace = true }
+# The one-minute hang detector (`aterm_spec::wait`).
 aterm-spec = { workspace = true }
 
 [lints]

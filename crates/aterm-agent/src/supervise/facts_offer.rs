@@ -33,8 +33,8 @@ pub const OFFER_MS: i64 = 30_000;
 /// The kinds a proven self-claim's act may carry (`kinds=`): a call at no progress only, the one
 /// kind the self-claim's reading carries (aterm-gui's `vitals_jobs::facts_reading` reads no held
 /// part). The occupancy kinds (`hold`, `wake`) are aterm's occupancy lines, typed only under
-/// grants the owner seals, which no act of another process's carries; `program-check`, which
-/// rides aterm's own turn-end acts, is not served in this gap.
+/// grants the owner seals, which no act of another process's carries; `program-check` and
+/// `overlap`, which ride aterm's own turn-end acts, are not served in this gap.
 pub const SERVED_KINDS: [FactKind; 1] = [FactKind::NoProgress];
 
 /// [`Pick::Why`]: no reading, or one older than [`super::facts::FACT_FRESH_MS`].
@@ -85,12 +85,13 @@ impl<C> Default for SelfClaimFacts<C> {
     }
 }
 
-/// `reading`'s served part: its calls at no progress, and no held programs.
+/// `reading`'s served part: its calls at no progress, and no held programs or leftovers.
 fn served(reading: &FactsReading) -> FactsReading {
     FactsReading {
         as_of_ms: reading.as_of_ms,
         no_progress: reading.no_progress.clone(),
         held: None,
+        left: None,
     }
 }
 

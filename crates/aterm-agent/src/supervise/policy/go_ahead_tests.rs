@@ -186,24 +186,37 @@ fn every_go_ahead_row_reads_as_its_section_however_it_wraps() {
 }
 
 /// Ending a process is irreversible, so a park whose work runs `aterm ctl end` (in its words or
-/// in the code it carries) gets no standing go-ahead, as one that would `kill` gets none.
-/// NEGATIVE CONTROL: drop `ctl end` from the outward phrases, and both park. The same park
-/// without the end gets the go-ahead.
+/// in the code it carries), or ends a process in plain words (`end`, `stop` or `shut down`, in
+/// any form, before a process noun), gets no standing go-ahead, as one that would `kill` gets
+/// none.
+/// NEGATIVE CONTROL: drop `ctl end` from the outward phrases, and the first two park; drop the
+/// process nouns, and the plain ones park; read `end` alone, and `ending`, `stop` and `shut down`
+/// park. The same park without the end gets the go-ahead, and so does one that names the end of
+/// a run or stops something that is no process.
 #[test]
 fn a_question_about_ending_a_process_gets_no_go_ahead() {
     for reply in [
         "NEEDS YOU: say \"go\" so I can end the leftover with `aterm ctl end \
          2606@1792098840004410:331` and rerun the checks.",
         "Waiting for your go-ahead to run aterm ctl end 2606@1792098840004410:331 and rebuild.",
+        "NEEDS YOU: say \"go\" so I can end the leftover processes and rerun the checks.",
+        "Waiting for your go-ahead to end my stale dev server before I rebuild.",
+        "Waiting for your go-ahead before ending the leftover dev server and rebuilding.",
+        "NEEDS YOU: say \"go\" so I can stop the preview server and rerun the checks.",
+        "Waiting for your go-ahead to shut down the docs watcher before I rebuild.",
+        "Waiting for your go-ahead to shutdown the dev server and rebuild.",
     ] {
         for text in [reply.to_string(), rendered(reply)] {
             assert!(parked("", &text).is_none(), "{text:?}");
         }
     }
-    assert!(
-        parked("", "NEEDS YOU: say \"go\" so I can rerun the checks.").is_some(),
-        "the control parks"
-    );
+    for reply in [
+        "NEEDS YOU: say \"go\" so I can rerun the checks.",
+        "NEEDS YOU: say \"go\" so I can rerun the checks at the end of the job.",
+        "NEEDS YOU: say \"go\" so I can stop the build and rerun the checks.",
+    ] {
+        assert!(parked("", reply).is_some(), "the control parks: {reply:?}");
+    }
 }
 
 #[test]

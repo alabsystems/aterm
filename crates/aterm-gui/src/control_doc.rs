@@ -14,6 +14,10 @@ pub(crate) fn cmd_doc(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     serve_doc(rest, &mut |query| ask_main(proxy, query))
 }
 
+/// `doc read`'s refusal of a private edit's document
+/// ([`crate::native_document_journal::private_uri`]), before any of its text.
+const REFUSED_PRIVATE: &str = "ERR refused private doc\n";
+
 /// `doc <rest>`'s reply, the main thread asked through `ask`.
 pub(crate) fn serve_doc(
     rest: &str,
@@ -43,8 +47,16 @@ pub(crate) fn serve_doc(
                     Err(error) => return format!("ERR {error}\n"),
                 },
             };
+            if let DocNames::Uri(names) = &names
+                && names
+                    .iter()
+                    .any(|name| crate::native_document_journal::private_uri(name))
+            {
+                return REFUSED_PRIVATE.to_string();
+            }
             match ask(DocQuery::Read(names)) {
                 Ok(DocAnswer::Text(text)) => read_reply(&text, lines),
+                Ok(DocAnswer::Refused) => REFUSED_PRIVATE.to_string(),
                 Ok(DocAnswer::Unknown) => format!("ERR unknown doc {doc}\n"),
                 Ok(other) => format!("ERR doc read answered {other:?}\n"),
                 Err(error) => format!("ERR {error}\n"),

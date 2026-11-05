@@ -98,8 +98,11 @@ pub const LOOPBACK_PORT_ENV: &str = "ATERM_DEBUG_COMMONS_LOOPBACK_PORT";
 
 /// The native startup lab's preflight, before it starts any runtime or opens
 /// custody. Only a debug build can acknowledge the guarded private attachment.
+///
+/// # Errors
+/// No private port is configured, or its port or loopback guard is invalid.
 #[cfg(any(test, debug_assertions))]
-pub(crate) fn private_attachment_port() -> Result<u16> {
+pub fn private_attachment_port() -> Result<u16> {
     isolation::port()?.ok_or_else(|| crate::Error::new("no private Commons attachment configured"))
 }
 
@@ -290,9 +293,10 @@ impl Network {
     }
 
     #[cfg(test)]
-    fn observed(&self, transport: &transport::Transport) {
+    fn observed(&self, transport: &mut transport::Transport) {
         if let Some(attachment) = &self.isolated {
-            attachment.observe(transport.application_observations());
+            let rounds = transport.take_finished_rounds();
+            attachment.observe(transport.application_observations(), rounds);
         }
     }
 }
@@ -1385,7 +1389,7 @@ fn serve_selected(
                 lab.tick(paths, now);
             }
             #[cfg(test)]
-            network.observed(&transport);
+            network.observed(&mut transport);
             let contacts = transport.take_contacts();
             if let Some(hearing) = &mut hearing {
                 hearing.tick(paths, &bootstrap, &contacts, now);

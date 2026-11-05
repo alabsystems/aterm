@@ -268,7 +268,7 @@ impl Planned for Arc<BrokerRecord> {
 }
 
 /// One retained record as the planning reads it: what [`Planned`] gives, and its broker time.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Entry<'a> {
     pub(crate) offset: u64,
     pub(crate) subject: &'a str,
@@ -277,14 +277,56 @@ pub(crate) struct Entry<'a> {
 }
 
 /// The retained records a planning reads, from the base, in offset order: a [`View`]'s
-/// slice, or the log's packed tier (`tier.rs`), which keeps no struct per record to slice.
+/// slice, or the log's paged tier (`tier.rs`), which keeps no struct per record to slice.
 pub(crate) trait Records {
-    /// How many records there are.
-    fn count(&self) -> usize;
+    /// A walk of records' entries with their indices, in offset order.
+    type Entries<'a>: Iterator<Item = (usize, Entry<'a>)>
+    where
+        Self: 'a;
     /// Record `i`'s entry.
     fn entry(&self, i: usize) -> Option<Entry<'_>>;
+    /// Records `from..to`'s entries with their indices (`to` clamped to the count), each
+    /// [`entry`](Self::entry)'s answer and skipping an index that answers none: what a
+    /// planning's walks read, so records held in pages are walked a page at a time.
+    fn entries(&self, from: usize, to: usize) -> Self::Entries<'_>;
     /// Record `i` whole, or `None` for records held only as entries.
     fn whole(&self, i: usize) -> Option<Arc<BrokerRecord>>;
+}
+
+/// [`Records::entries`] by [`Records::entry`] an index, for records a slice holds.
+#[cfg(any(test, debug_assertions))]
+pub(crate) struct ByIndex<'a, S: ?Sized> {
+    recs: &'a S,
+    i: usize,
+    hi: usize,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl<'a, S: Records + ?Sized> ByIndex<'a, S> {
+    /// Records `from..to`'s entries (`to` at most their count).
+    pub(crate) fn new(recs: &'a S, from: usize, to: usize) -> ByIndex<'a, S> {
+        ByIndex {
+            recs,
+            i: from,
+            hi: to,
+        }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl<'a, S: Records + ?Sized> Iterator for ByIndex<'a, S> {
+    type Item = (usize, Entry<'a>);
+
+    fn next(&mut self) -> Option<(usize, Entry<'a>)> {
+        while self.i < self.hi {
+            let i = self.i;
+            self.i = i.saturating_add(1);
+            if let Some(e) = self.recs.entry(i) {
+                return Some((i, e));
+            }
+        }
+        None
+    }
 }
 
 /// A [`View`]'s records: the slice, and the broker times beside it.
@@ -296,8 +338,13 @@ struct Listed<'a, R> {
 
 #[cfg(any(test, debug_assertions))]
 impl<R: Planned> Records for Listed<'_, R> {
-    fn count(&self) -> usize {
-        self.records.len()
+    type Entries<'a>
+        = ByIndex<'a, Self>
+    where
+        Self: 'a;
+
+    fn entries(&self, from: usize, to: usize) -> ByIndex<'_, Self> {
+        ByIndex::new(self, from, to.min(self.records.len()))
     }
 
     fn entry(&self, i: usize) -> Option<Entry<'_>> {
@@ -421,19 +468,10 @@ struct Walk {
     aged_to: u64,
 }
 
-/// Records `from..to`'s entries with their indices (`to` clamped to the count).
-fn entries<S: Records + ?Sized>(
-    recs: &S,
-    from: usize,
-    to: usize,
-) -> impl Iterator<Item = (usize, Entry<'_>)> {
-    (from..to.min(recs.count())).filter_map(move |i| Some((i, recs.entry(i)?)))
-}
-
 fn walk<S: Records + ?Sized>(rules: &Retention, v: &Scene<'_>, recs: &S) -> Walk {
     let mut bytes = rules.per_class(0u64);
     let mut aged_to = v.base;
-    for (_, rec) in entries(recs, 0, usize::MAX) {
+    for (_, rec) in recs.entries(0, usize::MAX) {
         let c = rules.class_of(rec.subject);
         if let Some(slot) = bytes.get_mut(c) {
             *slot = slot.saturating_add(rec.bytes);
@@ -496,7 +534,7 @@ fn natural_cut<S: Records + ?Sized>(
         }
     }
     let mut cut = v.base;
-    for (_, rec) in entries(recs, 0, usize::MAX) {
+    for (_, rec) in recs.entries(0, usize::MAX) {
         if left == 0 && rec.offset >= w.aged_to {
             break;
         }
@@ -623,7 +661,7 @@ pub(crate) fn plan_over<S: Records + ?Sized>(
     let kept = kept_bytes(rules, v, recs, cut);
     let below = usize::try_from(cut.saturating_sub(v.base)).unwrap_or(usize::MAX);
     let mut fresh: BTreeMap<u64, (usize, u64, Option<u64>)> = BTreeMap::new();
-    for (idx, rec) in entries(recs, 0, below) {
+    for (idx, rec) in recs.entries(0, below) {
         let (off, subject) = (rec.offset, rec.subject);
         if is_hidden_subject(subject) {
             continue;
@@ -719,7 +757,7 @@ fn kept_bytes<S: Records + ?Sized>(
 ) -> Vec<u64> {
     let mut acc = rules.per_class(0u64);
     let skip = usize::try_from(cut.saturating_sub(v.base)).unwrap_or(usize::MAX);
-    for (_, rec) in entries(recs, skip, usize::MAX) {
+    for (_, rec) in recs.entries(skip, usize::MAX) {
         let c = rules.class_of(rec.subject);
         if let Some(slot) = acc.get_mut(c) {
             *slot = slot.saturating_add(rec.bytes);

@@ -7,8 +7,12 @@
 //! checks, loop-preventing [`SubjectRewrite`] rules, and Chandy-Lamport consistent cuts
 //! ([`FederatedCut`]) across independent per-host broker logs.
 
-use crate::client::{connect, AnyClient, Closer, Event, Pipelined, Transport, ACK_SEQ_BASE};
+use crate::broker::IDLE_MARK_DEADLINE;
+use crate::client::{
+    broker_refusal, connect, AnyClient, Closer, Event, Pipelined, Transport, ACK_SEQ_BASE,
+};
 use crate::logid::{Lineage, LogIdentity};
+use crate::proto::{Gap, ERR_ORIGIN_REFUSED, ERR_SUBJECT_BOUND};
 use crate::store::is_hidden_subject;
 use astream_wire::{CausalCut, CausalEdge, CutViolation, Filter, Offset as WireOffset, Subject};
 
@@ -17,7 +21,7 @@ pub type Offset = u64;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(clean_islands)]
@@ -55,6 +59,13 @@ pub enum FederationWire {
         /// Pinned 32-byte Ed25519 public key expected from the remote broker.
         expected_server: [u8; astream_aead::ID_PUB_LEN],
     },
+    /// A stream the embedder already authenticated ([`Broker::serve_stream`] at the other end).
+    /// [`FederationEndpoint::endpoint`] only names the peer; `connect_timeout` is the dialer's
+    /// to apply.
+    ///
+    /// [`Broker::serve_stream`]: crate::Broker::serve_stream
+    #[cfg(feature = "stream")]
+    Stream(Arc<dyn crate::stream_link::StreamDial>),
 }
 
 impl fmt::Debug for FederationWire {
@@ -63,6 +74,8 @@ impl fmt::Debug for FederationWire {
             FederationWire::Client(t) => write!(f, "FederationWire::Client({t:?})"),
             #[cfg(feature = "identity")]
             FederationWire::Identity { .. } => f.write_str("FederationWire::Identity(<pinned>)"),
+            #[cfg(feature = "stream")]
+            FederationWire::Stream(_) => f.write_str("FederationWire::Stream(<dialer>)"),
         }
     }
 }
@@ -123,6 +136,21 @@ impl FederationEndpoint {
         }
     }
 
+    /// Create an endpoint over streams `dial` opens to the broker named `peer`.
+    #[cfg(feature = "stream")]
+    #[must_use]
+    pub fn stream(peer: &str, dial: Arc<dyn crate::stream_link::StreamDial>) -> Self {
+        Self {
+            endpoint: peer.to_string(),
+            wire: FederationWire::Stream(dial),
+            connect_timeout: None,
+            io_timeout: Some(Duration::from_secs(10)),
+            #[cfg(feature = "cap")]
+            caps: Vec::new(),
+            grant_tags: Vec::new(),
+        }
+    }
+
     /// Attach a capability keyring presented on every dial/reconnect.
     #[cfg(feature = "cap")]
     #[must_use]
@@ -164,6 +192,8 @@ impl FederationEndpoint {
                 expected_server,
                 self.connect_timeout,
             )?,
+            #[cfg(feature = "stream")]
+            FederationWire::Stream(dialer) => crate::client::connect_stream(dialer.dial()?),
         };
         if let Some(io_to) = self.io_timeout {
             closer.set_read_timeout(Some(io_to))?;
@@ -340,6 +370,16 @@ pub struct FederationConfig {
     pub producer_id: u64,
     /// Subject prefix mapping and loop-prevention policy.
     pub rewrite: SubjectRewrite,
+    /// RELAY rather than mirror: carry each record under its ORIGIN's `(producer_id, producer_seq)`
+    /// instead of `(producer_id, src_offset)`, with its subject and its body, the origin's signed
+    /// envelope, unchanged. The key is then the same
+    /// on every broker, so bridges may form any graph, cycles included, each broker appends a
+    /// record once, and mirrored records may be re-exported. `producer_id` goes unused. A mirror's
+    /// key names one path, so a mirror on a cycle echoes forever. Relay runs by push alone
+    /// ([`FederationBridge::run`]), only over owner-shaped subjects (`astream_cap::relay_owner`),
+    /// and needs the `cap` feature. On guarded brokers the source takes a read grant
+    /// over `filter` and a write grant over `group`, and the destination a relay grant.
+    pub relay: bool,
 }
 
 /// Cross-broker provenance receipt emitted for each mirrored record, directly convertible
@@ -381,14 +421,22 @@ pub struct FederationReport {
     pub mirrored: usize,
     /// Subset of `mirrored` that deduplicated against an existing record on `dest`.
     pub deduped: usize,
-    /// Records skipped by loop-exclusion / hop-limit / prefix policy.
+    /// Records skipped by loop-exclusion / hop-limit / prefix policy, and, on a relay, those whose
+    /// producer is not their subject's owner: no destination would take them.
     pub skipped: usize,
+    /// Relayed records the destination refused for good: a bad signature, a revoked or unknown
+    /// origin, or an origin over its subject budget there. Not retried; the rest of the burst
+    /// still lands, so one bad record does not stop an edge.
+    pub refused: usize,
     /// Highest `source` offset durably committed for `group` at the end of this step, if any.
     pub committed_upto: Option<Offset>,
     /// Bridge's next `source` fetch cursor after this step.
     pub next_cursor: Offset,
     /// Provenance links (`src_log@src_offset -> dst_log@dst_offset`) produced in this step.
     pub links: Vec<FederationLink>,
+    /// What retention gave up on `source` below this bridge's group, as its tail was told
+    /// ([`FederationBridge::run`] only): records it will never mirror.
+    pub gaps: Vec<Gap>,
 }
 
 /// Failure modes of [`FederationBridge`].
@@ -467,6 +515,8 @@ pub struct FederationBridge {
     src_log: LogIdentity,
     dst_log: LogIdentity,
     cursor: Offset,
+    closer: FederationBridgeCloser,
+    liveness: Duration,
 }
 
 impl FederationBridge {
@@ -487,6 +537,19 @@ impl FederationBridge {
         }
         if let Err(msg) = cfg.rewrite.validate() {
             return Err(FederationError::Config(msg));
+        }
+        if cfg.relay {
+            if !cfg!(feature = "cap") {
+                return Err(FederationError::Config(
+                    "a relay bridge needs astream-broker's `cap` feature".to_string(),
+                ));
+            }
+            if !cfg.rewrite.strip_prefix.is_empty() || !cfg.rewrite.add_prefix.is_empty() {
+                return Err(FederationError::Config(
+                    "a relay carries a record under its own subject: it takes no prefix rewrite"
+                        .to_string(),
+                ));
+            }
         }
 
         let (mut src_ctl, src_closer) = match cfg.source.dial() {
@@ -517,6 +580,8 @@ impl FederationBridge {
             src_log,
             dst_log,
             cursor,
+            closer: FederationBridgeCloser::default(),
+            liveness: IDLE_MARK_DEADLINE,
         })
     }
 
@@ -599,6 +664,11 @@ impl FederationBridge {
     /// dedup keys, and durably commit `cfg.group` on `source` only after `dest` acknowledges
     /// the entire batch.
     pub fn sync_once(&mut self, max_records: usize) -> Result<FederationReport, FederationError> {
+        if self.cfg.relay {
+            return Err(FederationError::Config(
+                "a relay bridge runs by push: FederationBridge::run".to_string(),
+            ));
+        }
         let bounded_max = max_records.clamp(1, FEDERATION_BATCH_CAP) as u32;
         let ((records, (page_next, _head)), _gap) =
             match self
@@ -611,8 +681,7 @@ impl FederationBridge {
 
         let fetched = records.len();
         let max_seq = ACK_SEQ_BASE.saturating_sub(1);
-        let mut staged: Vec<(Offset, u64, String, Vec<u8>)> =
-            Vec::with_capacity(fetched.min(FEDERATION_BATCH_CAP));
+        let mut staged: Vec<Staged> = Vec::with_capacity(fetched.min(FEDERATION_BATCH_CAP));
         let mut highest_src_off: Option<Offset> = None;
         let mut skipped = 0usize;
 
@@ -629,10 +698,13 @@ impl FederationBridge {
                 continue;
             }
             match self.cfg.rewrite.apply(&src_subj) {
-                Ok(Some(dst_subj)) => {
-                    let seq = federation_seq_clamp(src_off, max_seq);
-                    staged.push((src_off, seq, dst_subj, body));
-                }
+                Ok(Some(dst_subj)) => staged.push(Staged {
+                    src_off,
+                    producer_id: self.cfg.producer_id,
+                    seq: federation_seq_clamp(src_off, max_seq),
+                    subject: dst_subj,
+                    body,
+                }),
                 Ok(None) => {
                     skipped = skipped.saturating_add(1);
                 }
@@ -640,42 +712,7 @@ impl FederationBridge {
             }
         }
 
-        let mut links: Vec<FederationLink> =
-            Vec::with_capacity(staged.len().min(FEDERATION_BATCH_CAP));
-        let mut deduped_count = 0usize;
-
-        if !staged.is_empty() {
-            let mut pipe_ops: Vec<Pipelined<'_>> =
-                Vec::with_capacity(staged.len().min(FEDERATION_BATCH_CAP));
-            for (_src_off, seq, dst_subj, body) in &staged {
-                pipe_ops.push(Pipelined::Publish {
-                    producer_id: self.cfg.producer_id,
-                    producer_seq: *seq,
-                    subject: dst_subj.as_str(),
-                    body: body.as_slice(),
-                });
-            }
-            if let Err(e) = self.dst.send_pipelined(&pipe_ops) {
-                return Err(FederationError::Io(e));
-            }
-            for (src_off, _seq, dst_subj, _body) in staged {
-                let (dst_off, deduped) = match self.dst.recv_publish_ack() {
-                    Ok(ack) => ack,
-                    Err(e) => return Err(FederationError::Io(e)),
-                };
-                if deduped {
-                    deduped_count = deduped_count.saturating_add(1);
-                }
-                links.push(FederationLink {
-                    src_log: self.src_log,
-                    src_offset: src_off,
-                    dst_log: self.dst_log,
-                    dst_offset: dst_off,
-                    deduped,
-                    dst_subject: dst_subj,
-                });
-            }
-        }
+        let (links, deduped_count, _refused) = self.mirror(staged)?;
 
         let committed_upto = match highest_src_off {
             Some(upto) => {
@@ -698,10 +735,421 @@ impl FederationBridge {
             mirrored: links.len(),
             deduped: deduped_count,
             skipped,
+            refused: 0,
             committed_upto,
             next_cursor: self.cursor,
             links,
+            gaps: Vec::new(),
         })
+    }
+
+    /// Pipeline `staged` onto `dest` and read every ack: the mirrored links, how many of them
+    /// deduplicated, and how many relayed records were refused for good.
+    fn mirror(
+        &mut self,
+        staged: Vec<Staged>,
+    ) -> Result<(Vec<FederationLink>, usize, usize), FederationError> {
+        let mut links: Vec<FederationLink> =
+            Vec::with_capacity(staged.len().min(FEDERATION_BATCH_CAP));
+        let mut deduped_count = 0usize;
+        let mut refused = 0usize;
+        if staged.is_empty() {
+            return Ok((links, deduped_count, refused));
+        }
+        let mut pipe_ops: Vec<Pipelined<'_>> =
+            Vec::with_capacity(staged.len().min(FEDERATION_BATCH_CAP));
+        for rec in &staged {
+            pipe_ops.push(if self.cfg.relay {
+                Pipelined::Relay {
+                    producer_id: rec.producer_id,
+                    producer_seq: rec.seq,
+                    subject: rec.subject.as_str(),
+                    body: rec.body.as_slice(),
+                }
+            } else {
+                Pipelined::Publish {
+                    producer_id: rec.producer_id,
+                    producer_seq: rec.seq,
+                    subject: rec.subject.as_str(),
+                    body: rec.body.as_slice(),
+                }
+            });
+        }
+        if let Err(e) = self.dst.send_pipelined(&pipe_ops) {
+            return Err(FederationError::Io(e));
+        }
+        drop(pipe_ops);
+        // A refusal pays its ack, so every owed ack is read before any error returns: the
+        // connection stays in step, though the caller reconnects on an error anyway.
+        let mut failed = None;
+        for rec in staged {
+            let (dst_off, deduped) = match self.dst.recv_publish_ack() {
+                Ok(ack) => ack,
+                Err(e) => {
+                    let refused_for_good = self.cfg.relay
+                        && matches!(
+                            broker_refusal(&e),
+                            Some(r) if r.code == ERR_SUBJECT_BOUND || r.code == ERR_ORIGIN_REFUSED
+                        );
+                    if refused_for_good {
+                        refused = refused.saturating_add(1);
+                    } else if failed.is_none() {
+                        failed = Some(e);
+                    }
+                    if self.dst.owed_acks() == 0 {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if deduped {
+                deduped_count = deduped_count.saturating_add(1);
+            }
+            links.push(FederationLink {
+                src_log: self.src_log,
+                src_offset: rec.src_off,
+                dst_log: self.dst_log,
+                dst_offset: dst_off,
+                deduped,
+                dst_subject: rec.subject,
+            });
+        }
+        match failed {
+            Some(e) => Err(FederationError::Io(e)),
+            None => Ok((links, deduped_count, refused)),
+        }
+    }
+
+    /// A handle that stops [`run`](Self::run) from another thread.
+    #[must_use]
+    pub fn closer(&self) -> FederationBridgeCloser {
+        self.closer.clone()
+    }
+
+    /// How long a [`run`](Self::run) waits for any word from its source before it calls the source
+    /// lost. A source writes an idle mark every [`IDLE_MARK`](crate::broker::IDLE_MARK) with
+    /// nothing else to say; a deadline shorter than its broker's idle mark ends the run of a
+    /// source that is only quiet.
+    pub const fn set_liveness_deadline(&mut self, deadline: Duration) {
+        self.liveness = deadline;
+    }
+
+    /// Mirror until stopped, by push: park on a `subscribe_group` of `source`, so a record reaches
+    /// `dest` as soon as `source` can deliver it and an idle bridge does nothing at all. Up to `max_records` (`1..=256`) go to `dest` as one pipelined
+    /// burst, cut where the source says its tail caught up ([`Request::BurstMarks`]), and the group
+    /// is committed once per burst, only after `dest` acknowledged all of it. `on_burst` sees the
+    /// report of each; a burst of nothing but a retention gap is reported too, for a caller that
+    /// repairs on one.
+    ///
+    /// Returns `Ok(())` once [`FederationBridgeCloser::close`] ends it. A lost connection, or a
+    /// source silent past its liveness deadline ([`IDLE_MARK_DEADLINE`] unless
+    /// [`set_liveness_deadline`](Self::set_liveness_deadline) says otherwise), is an `Err`, with
+    /// no retry here: the durable group and the destination's dedup make the next
+    /// `run` (after [`reconnect`](Self::reconnect), when the link is back) resume exactly.
+    ///
+    /// [`Request::BurstMarks`]: crate::proto::Request::BurstMarks
+    pub fn run(
+        &mut self,
+        max_records: usize,
+        on_burst: &mut dyn FnMut(&FederationReport),
+    ) -> Result<(), FederationError> {
+        let burst_cap = max_records.clamp(1, FEDERATION_BATCH_CAP);
+        let (client, closer) = match self.cfg.source.dial() {
+            Ok(pair) => pair,
+            Err(e) => return Err(FederationError::Io(e)),
+        };
+        // Parked before the first read, so a stop can end a source that stops answering at any
+        // point, and that read keeps the endpoint's io timeout until the tail is open.
+        if !self.closer.park(closer.clone()) {
+            return Ok(());
+        }
+        let _released = ReleasedOnExit(self.closer.clone());
+        let mut sub = match self.open_tail(client) {
+            Ok(sub) => sub,
+            Err(_) if self.closer.stopping() => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        // A healthy source writes at least an idle mark in this time, however quiet it is, so
+        // this does no work on a bridge with nothing to carry: it only makes a source that
+        // vanished without a FIN the same lost connection as one that hung up.
+        if let Err(e) = closer.set_read_timeout(Some(self.liveness)) {
+            return Err(FederationError::Io(e));
+        }
+        let mut burst = Burst::default();
+        loop {
+            let event = sub.recv_event();
+            match event {
+                Ok(Some(Event::Delivery {
+                    offset,
+                    subject,
+                    body,
+                })) => {
+                    burst.take(self, offset, sub.last_origin(), subject, body)?;
+                    if burst.fetched >= burst_cap {
+                        let upto = burst.next;
+                        self.finish_burst(&mut burst, upto, on_burst)?;
+                    }
+                }
+                Ok(Some(Event::Mark { next, .. })) => {
+                    self.finish_burst(&mut burst, next, on_burst)?;
+                }
+                Ok(Some(Event::Gap(gap))) => burst.gaps.push(gap),
+                Ok(None) => {
+                    if self.closer.stopping() {
+                        return Ok(());
+                    }
+                    return Err(FederationError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "source broker closed the bridge's subscription",
+                    )));
+                }
+                Err(_) if self.closer.stopping() => return Ok(()),
+                Err(e) => return Err(FederationError::Io(e)),
+            }
+        }
+    }
+
+    /// The handshake of a [`run`](Self::run)'s subscription, up to its open tail.
+    fn open_tail(
+        &mut self,
+        mut client: AnyClient,
+    ) -> Result<crate::client::AnySubscription, FederationError> {
+        let found = read_client_identity(&mut client, "source")?;
+        let lineage = client.log_lineage().cloned();
+        self.verify_or_adopt_source_identity(found, lineage.as_ref())?;
+        let asked = match client.burst_marks() {
+            Ok(true) if self.cfg.relay => client.origin_stamps(),
+            other => other,
+        };
+        match asked {
+            Ok(true) => {}
+            Ok(false) => return Err(FederationError::Config(
+                "the source broker predates this bridge's asks: run the same astream release on both ends"
+                    .to_string(),
+            )),
+            Err(e) => return Err(FederationError::Io(e)),
+        }
+        match client.subscribe_group(&self.cfg.group, &self.cfg.filter) {
+            Ok(sub) => Ok(sub),
+            Err(e) => Err(FederationError::Io(e)),
+        }
+    }
+
+    /// Mirror `burst`, commit the group to `upto` on `source`, and report. Nothing delivered is
+    /// nothing to commit: a tail that only scanned past other subjects moves no cursor.
+    fn finish_burst(
+        &mut self,
+        burst: &mut Burst,
+        upto: Offset,
+        on_burst: &mut dyn FnMut(&FederationReport),
+    ) -> Result<(), FederationError> {
+        let taken = std::mem::take(burst);
+        if taken.fetched == 0 && taken.gaps.is_empty() {
+            return Ok(());
+        }
+        let (links, deduped, refused) = self.mirror(taken.staged)?;
+        let mut committed_upto = None;
+        if taken.fetched > 0 {
+            if let Err(e) = self.src_ctl.commit(&self.cfg.group, upto) {
+                return Err(FederationError::Io(e));
+            }
+            committed_upto = Some(upto);
+            self.cursor = federation_cursor_advance(self.cursor, upto);
+        }
+        on_burst(&FederationReport {
+            fetched: taken.fetched,
+            mirrored: links.len(),
+            deduped,
+            skipped: taken.skipped,
+            refused,
+            committed_upto,
+            next_cursor: self.cursor,
+            links,
+            gaps: taken.gaps,
+        });
+        Ok(())
+    }
+}
+
+/// A record staged for `dest`.
+struct Staged {
+    src_off: Offset,
+    /// Its key on `dest`: `(cfg.producer_id, src_off)` for a mirror, its origin's for a relay.
+    producer_id: u64,
+    seq: u64,
+    subject: String,
+    body: Vec<u8>,
+}
+
+/// What [`FederationBridge::run`] gathered since its last commit.
+#[derive(Default)]
+struct Burst {
+    staged: Vec<Staged>,
+    fetched: usize,
+    skipped: usize,
+    /// The offset after the last record delivered.
+    next: Offset,
+    gaps: Vec<Gap>,
+}
+
+impl Burst {
+    fn take(
+        &mut self,
+        bridge: &FederationBridge,
+        src_off: Offset,
+        origin: Option<(u64, u64)>,
+        src_subj: String,
+        body: Vec<u8>,
+    ) -> Result<(), FederationError> {
+        if src_off >= ACK_SEQ_BASE {
+            return Err(FederationError::OffsetInReservedHalf(src_off));
+        }
+        self.fetched = self.fetched.saturating_add(1);
+        self.next = src_off.saturating_add(1);
+        if is_hidden_subject(&src_subj) {
+            self.skipped = self.skipped.saturating_add(1);
+            return Ok(());
+        }
+        let dst_subj = match bridge.cfg.rewrite.apply(&src_subj) {
+            Ok(Some(dst_subj)) => dst_subj,
+            Ok(None) => {
+                self.skipped = self.skipped.saturating_add(1);
+                return Ok(());
+            }
+            Err(msg) => return Err(FederationError::Rewrite(msg)),
+        };
+        let (producer_id, seq) = if bridge.cfg.relay {
+            let Some((id, seq)) = origin else {
+                return Err(FederationError::Config(format!(
+                    "the source broker delivered offset {src_off} without its origin"
+                )));
+            };
+            if !relay_owns(&dst_subj, id) {
+                self.skipped = self.skipped.saturating_add(1);
+                return Ok(());
+            }
+            (id, seq)
+        } else {
+            let seq = federation_seq_clamp(src_off, ACK_SEQ_BASE.saturating_sub(1));
+            (bridge.cfg.producer_id, seq)
+        };
+        self.staged.push(Staged {
+            src_off,
+            producer_id,
+            seq,
+            subject: dst_subj,
+            body,
+        });
+        Ok(())
+    }
+}
+
+/// Whether a record of `subject` from producer `id` is one a relay may carry: skipped here, it is
+/// not sent to a destination that could only refuse it.
+#[cfg(feature = "cap")]
+fn relay_owns(subject: &str, id: u64) -> bool {
+    astream_cap::relay_producer_of(subject) == Some(id)
+}
+
+/// A build without `cap` opens no relay bridge ([`FederationBridge::open`]).
+#[cfg(not(feature = "cap"))]
+const fn relay_owns(_subject: &str, _id: u64) -> bool {
+    false
+}
+
+/// Stops a [`FederationBridge::run`] from another thread: it shuts the parked subscription, and
+/// `run` returns `Ok(())`. Idempotent. Clones are handles on the one bridge.
+#[derive(Clone, Debug, Default)]
+pub struct FederationBridgeCloser {
+    state: Arc<BridgeCloserState>,
+}
+
+#[derive(Debug, Default)]
+struct BridgeCloserState {
+    /// The caller's [`close`](FederationBridgeCloser::close): for good.
+    closed: AtomicBool,
+    /// This [`FederationRunner::run`] is over, because a sibling ended. The next one starts afresh.
+    run_ended: AtomicBool,
+    parked: Mutex<Option<Closer>>,
+}
+
+impl FederationBridgeCloser {
+    /// End the bridge's `run`, now or as soon as it dials.
+    pub fn close(&self) {
+        self.state.closed.store(true, Ordering::Release);
+        self.shut_parked();
+    }
+
+    /// Whether [`close`](Self::close) has been called.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.state.closed.load(Ordering::Acquire)
+    }
+
+    fn shut_parked(&self) {
+        let parked = self
+            .state
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(closer) = parked.as_ref() {
+            closer.close();
+        }
+    }
+
+    /// End this runner's run of the bridge, leaving it free to run again.
+    fn end_run(&self) {
+        self.state.run_ended.store(true, Ordering::Release);
+        self.shut_parked();
+    }
+
+    fn begin_run(&self) {
+        self.state.run_ended.store(false, Ordering::Release);
+    }
+
+    /// Whether `run` was asked to end, rather than having lost its connection.
+    fn stopping(&self) -> bool {
+        self.is_closed() || self.state.run_ended.load(Ordering::Acquire)
+    }
+
+    /// Hold `closer` for a later stop; `false` if that stop already came, with `closer` shut.
+    /// Under the lock, so a stop meets either its flag or this closer.
+    fn park(&self, closer: Closer) -> bool {
+        let mut parked = self
+            .state
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stopping() {
+            closer.close();
+            return false;
+        }
+        *parked = Some(closer);
+        true
+    }
+
+    /// Shut what is parked and let it go. A run that ended leaves no connection behind it: the
+    /// source's tail would stay parked on it, holding a thread and a connection slot, until
+    /// something else ended it.
+    fn release(&self) {
+        let parked = self
+            .state
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(closer) = parked {
+            closer.close();
+        }
+    }
+}
+
+/// Releases a bridge's parked connection however its `run` ends, a panic in `on_burst` included.
+struct ReleasedOnExit(FederationBridgeCloser);
+
+impl Drop for ReleasedOnExit {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -709,6 +1157,7 @@ impl Drop for FederationBridge {
     fn drop(&mut self) {
         self.src_closer.close();
         self.dst_closer.close();
+        self.closer.release();
     }
 }
 
@@ -1148,16 +1597,32 @@ pub fn parse_federation_rules(text: &str) -> Result<Vec<FederationRule>, String>
     Ok(rules)
 }
 
+/// Ends a [`FederationRunner::run`] when one of its bridges ends, however it ended.
+struct EndsTheRun(FederationRunnerCloser);
+
+impl Drop for EndsTheRun {
+    fn drop(&mut self) {
+        for bridge in &self.0.bridges {
+            bridge.end_run();
+        }
+    }
+}
+
 /// Thread-safe cooperative stop handle for [`FederationRunner`].
 #[derive(Clone, Debug)]
 pub struct FederationRunnerCloser {
     stopped: Arc<AtomicBool>,
+    bridges: Vec<FederationBridgeCloser>,
 }
 
 impl FederationRunnerCloser {
-    /// Signal the [`FederationRunner`] to stop before its next rule/poll step.
+    /// Signal the [`FederationRunner`] to stop before its next rule step, and end its
+    /// [`run`](FederationRunner::run).
     pub fn close(&self) {
         self.stopped.store(true, Ordering::Release);
+        for bridge in &self.bridges {
+            bridge.close();
+        }
     }
 
     /// Whether [`Self::close`] has been invoked.
@@ -1209,6 +1674,7 @@ impl FederationRunner {
                 filter: rule.filter.clone(),
                 producer_id: rule.producer_id.unwrap_or(default_producer_id),
                 rewrite: rule.rewrite.clone(),
+                relay: false,
             };
             let bridge = FederationBridge::open(cfg)?;
             let s_id = bridge.source_identity();
@@ -1249,11 +1715,12 @@ impl FederationRunner {
         })
     }
 
-    /// Return a thread-safe handle that stops continuous polling loops cleanly.
+    /// Return a thread-safe handle that stops [`run`](Self::run) cleanly.
     #[must_use]
     pub fn closer(&self) -> FederationRunnerCloser {
         FederationRunnerCloser {
             stopped: Arc::clone(&self.stopped),
+            bridges: self.bridges.iter().map(FederationBridge::closer).collect(),
         }
     }
 
@@ -1372,22 +1839,64 @@ impl FederationRunner {
         Ok(out)
     }
 
+    /// Run every bridge by push ([`FederationBridge::run`]), one thread per rule, until
+    /// [`FederationRunnerCloser::close`] or the first failure, which ends the others and is
+    /// returned. Each bridge's own ending ends this run, a panic in `on_burst` included, and leaves
+    /// the runner free to [`reconnect_all`](Self::reconnect_all) and run again; only the closer's
+    /// `close` is for good. `on_burst` sees `(group, report)`, from those threads.
+    pub fn run(
+        &mut self,
+        on_burst: &(dyn Fn(&str, &FederationReport) + Sync),
+    ) -> Result<(), FederationError> {
+        let closer = self.closer();
+        for bridge in &closer.bridges {
+            bridge.begin_run();
+        }
+        let rules = &self.rules;
+        let bridges = &mut self.bridges;
+        std::thread::scope(|scope| {
+            let mut running = Vec::with_capacity(bridges.len().min(MAX_FEDERATION_RULES));
+            for (rule, bridge) in rules.iter().zip(bridges.iter_mut()) {
+                let closer = closer.clone();
+                running.push(scope.spawn(move || {
+                    let _ends_the_run = EndsTheRun(closer);
+                    bridge.run(rule.batch_size, &mut |report| {
+                        on_burst(&rule.group, report);
+                    })
+                }));
+            }
+            let mut first = Ok(());
+            for thread in running {
+                match thread.join() {
+                    Ok(Err(e)) if first.is_ok() => first = Err(e),
+                    Err(panicked) => std::panic::resume_unwind(panicked),
+                    _ => {}
+                }
+            }
+            first
+        })
+    }
+
     /// Record all [`FederationReport`] cursors and [`FederationLink`] provenance receipts into
     /// `cut`, then heal `cut` so it forms a Chandy-Lamport consistent cross-broker cut.
     pub fn record_into_cut(&self, reports: &[(String, FederationReport)], cut: &mut FederatedCut) {
-        let mut all_links: Vec<FederationLink> = Vec::new();
         for (_group, rep) in reports {
-            if rep.next_cursor > 0 {
-                cut.advance(self.src_log, rep.next_cursor);
-            }
-            for link in &rep.links {
-                cut.advance(link.src_log, link.src_offset.saturating_add(1));
-                cut.advance(link.dst_log, link.dst_offset.saturating_add(1));
-                all_links.push(link.clone());
-            }
+            Self::record_report(self.src_log, rep, cut);
         }
-        if !all_links.is_empty() {
-            let _ = cut.heal(&all_links);
+    }
+
+    /// [`record_into_cut`](Self::record_into_cut) for the one report of `src_log`'s bridge that
+    /// a [`run`](Self::run) burst hands over.
+    pub fn record_report(src_log: LogIdentity, rep: &FederationReport, cut: &mut FederatedCut) {
+        if rep.next_cursor > 0 {
+            cut.advance(src_log, rep.next_cursor);
+        }
+        for link in &rep.links {
+            cut.advance(link.src_log, link.src_offset.saturating_add(1));
+            cut.advance(link.dst_log, link.dst_offset.saturating_add(1));
+        }
+        if !rep.links.is_empty() {
+            let _ = cut.heal(&rep.links);
         }
     }
 }
@@ -2443,6 +2952,7 @@ impl FederationMesh {
     pub fn closer(&self) -> FederationRunnerCloser {
         FederationRunnerCloser {
             stopped: Arc::clone(&self.stopped),
+            bridges: Vec::new(),
         }
     }
 
@@ -2647,6 +3157,7 @@ impl FederationMesh {
             filter,
             producer_id,
             rewrite: rw,
+            relay: false,
         })?;
 
         Ok(ActiveRegionBridge {

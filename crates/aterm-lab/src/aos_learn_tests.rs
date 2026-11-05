@@ -11,6 +11,20 @@ use aterm_spec::wait::MUST_HAPPEN;
 
 use super::*;
 
+#[test]
+fn capped_read_retains_absence_bounds_and_regular_file_checks() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let path = root.path().join("data");
+    assert_eq!(read_capped(&path, 4).unwrap(), None);
+    fs::write(&path, b"four").unwrap();
+    assert_eq!(read_capped(&path, 4).unwrap(), Some(b"four".to_vec()));
+    assert!(read_capped(&path, 3).is_err());
+    assert!(read_capped(root.path(), 4).is_err());
+    let linked = root.path().join("linked");
+    std::os::unix::fs::symlink(&path, &linked).unwrap();
+    assert_eq!(read_capped(&linked, 4).unwrap(), Some(b"four".to_vec()));
+}
+
 fn args(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| (*s).to_owned()).collect()
 }

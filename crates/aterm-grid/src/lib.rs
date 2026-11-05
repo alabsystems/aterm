@@ -16,7 +16,6 @@ pub mod damage;
 pub mod extra;
 pub mod extra_collection;
 mod extra_collection_shifts;
-mod history_reads;
 /// Page-backed storage internals ([`PageStore`]; [`Row`] is their safe boundary).
 #[cfg(any(test, debug_assertions))]
 pub mod page;
@@ -43,7 +42,6 @@ pub use grid::{
 };
 pub use grid::{MaterializedRow, materialize_from_line, stored_line_cells};
 pub use grid::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
-pub use history_reads::observe_history_effects;
 
 pub use cell::{Cell, CellFlags, PackedColor, PackedColors};
 pub use damage::{

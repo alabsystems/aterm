@@ -562,6 +562,7 @@ impl AiSigninDoc {
                         mailbox_password: route.mailbox_password,
                         totp_secret: route.totp_secret,
                         receives: vec![key],
+                        registry: None,
                     });
                 }
                 opened_count += 1;
@@ -766,6 +767,8 @@ pub enum MailCodeRefusal {
     UnauthorizedEmail,
     /// Listener holds no steward mailbox capable of serving `mail-code`.
     NotSteward,
+    /// The roster or claims needed to authorize the requester could not be read this pass.
+    RosterBusy,
     /// No matching verification code or link is currently present for the requested email.
     NoCodeYet,
     /// Encrypting the credential to the requester's age recipient failed.
@@ -784,6 +787,7 @@ impl MailCodeRefusal {
             Self::UnknownRequester => "unknown-requester".to_owned(),
             Self::UnauthorizedEmail => "unauthorized-email".to_owned(),
             Self::NotSteward => "not-steward".to_owned(),
+            Self::RosterBusy => "roster-busy".to_owned(),
             Self::NoCodeYet => "no-code-yet".to_owned(),
             Self::SealFailed => "seal-failed".to_owned(),
         }
@@ -793,6 +797,9 @@ impl MailCodeRefusal {
     #[must_use]
     pub fn from_wire(wire: &str) -> Self {
         let trimmed = wire.trim();
+        if trimmed == "roster-busy" {
+            return Self::RosterBusy;
+        }
         if trimmed == "denied" {
             return Self::Denied;
         }
@@ -1127,33 +1134,41 @@ fn append_audit_record(state_dir: &Path, audit: &MailCodeAudit) {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let _ = aterm_uds::private_file::ensure_private_dir(state_dir);
     let path = state_dir.join(MAIL_CODE_AUDIT_FILE);
-    if let Ok(existing) = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&path)
-        && let Ok(meta) = existing.metadata()
-        && meta.is_file()
-        && meta.len() >= MAIL_CODE_AUDIT_MAX_BYTES
-    {
-        let _ = existing.set_permissions(std::fs::Permissions::from_mode(0o600));
-        drop(existing);
+    let open_audit = |p: &Path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(p)
+            .ok()
+            .and_then(|f| {
+                let meta = f.metadata().ok()?;
+                meta.is_file().then_some((f, meta))
+            })
+    };
+    let Some((mut f, mut meta)) = open_audit(&path) else {
+        return;
+    };
+    if meta.len() >= MAIL_CODE_AUDIT_MAX_BYTES {
+        if meta.permissions().mode() & 0o7777 != 0o600 {
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        drop(f);
         let prev = state_dir.join(MAIL_CODE_AUDIT_PREV_FILE);
         if !std::fs::symlink_metadata(&prev).is_ok_and(|m| m.file_type().is_dir()) {
             let _ = std::fs::remove_file(&prev);
             let _ = std::fs::rename(&path, &prev);
         }
+        let Some(reopened) = open_audit(&path) else {
+            return;
+        };
+        (f, meta) = reopened;
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        && f.metadata().is_ok_and(|m| m.is_file())
-    {
+    if meta.permissions().mode() & 0o7777 != 0o600 {
         let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
-        let _ = writeln!(f, "{}", audit.log_line());
     }
+    let _ = writeln!(f, "{}", audit.log_line());
 }
 
 /// Evaluate one `mail-code <email>` request against the steward's local state (`state_dir`,
@@ -1206,6 +1221,9 @@ fn steward_handle_mail_code_with_key(
     }
 
     let paths = aterm_secrets::client::Paths::for_home(home);
+    let roster = ai_pool::read_pass_roster(&paths)
+        .map_err(|_| MailCodeRefusal::RosterBusy)?
+        .ok_or(MailCodeRefusal::NotSteward)?;
     if aterm_secrets::client::local_recipient_denied_in_roster(&paths) {
         return Err(MailCodeRefusal::NotSteward);
     }
@@ -1238,15 +1256,10 @@ fn steward_handle_mail_code_with_key(
         }
     }
 
-    let roster = aterm_secrets::client::swarm_roster(&paths)
-        .ok()
-        .flatten()
-        .ok_or(MailCodeRefusal::NotSteward)?;
-
     let pool_path = home.join(".secrets").join(ai_pool::AI_POOL_FILE);
     let pool = read_regular_nofollow_bounded(&pool_path, 4 * 1024 * 1024)
         .and_then(|raw| Pool::from_toml(&raw, &pool_path.display().to_string()).ok());
-    let claims = super::claims::read_book(home);
+    let claims = super::claims::read_book(home).map_err(|_| MailCodeRefusal::RosterBusy)?;
 
     let key_hex = proof_key.map(|k| k.hex());
     let authorized = authorize_mail_code_inner(
@@ -1355,10 +1368,9 @@ fn read_regular_nofollow_bounded(path: &Path, max: u64) -> Option<String> {
 }
 
 #[cfg(unix)]
-fn read_standby_steward_labels(home: &Path) -> Vec<String> {
+fn read_standby_steward_labels(home: &Path, roster: Option<&SwarmRoster>) -> Vec<String> {
     let mut out = Vec::new();
     let paths = aterm_secrets::client::Paths::for_home(home);
-    let roster = aterm_secrets::client::swarm_roster(&paths).ok().flatten();
     let push_label = |out: &mut Vec<String>, label: &str| {
         let trimmed = label.trim();
         let is_denied = roster.as_ref().is_some_and(|r| {
@@ -1490,19 +1502,41 @@ fn peer_matches_label(
 /// Order strictly the steward-candidate peers (`standby_labels` from `swarm-policy.toml`, then
 /// `Via::Issuer`) for `FleetOp::MailCode` relay, excluding `own_node` and ordinary non-steward
 /// `Via::IssuerBook` / `Via::Joined` members so relay never fans out `O(N)`.
+///
+/// # Errors
+/// The roster is unread, including a vault writer outlasting this pass's bounded wait.
 #[cfg(unix)]
-#[must_use]
 pub fn select_steward_relay_peers<'a>(
     peers: &'a [aterm_net::fleet_member::Peer],
     own_node: &str,
     standby_labels: &[String],
     home_dir: Option<&Path>,
+) -> Result<Vec<&'a aterm_net::fleet_member::Peer>, String> {
+    let roster = match home_dir {
+        Some(home) => ai_pool::read_pass_roster(&aterm_secrets::client::Paths::for_home(home))?,
+        None => None,
+    };
+    Ok(select_steward_relay_peers_with_roster(
+        peers,
+        own_node,
+        standby_labels,
+        home_dir,
+        roster,
+    ))
+}
+
+#[cfg(unix)]
+fn select_steward_relay_peers_with_roster<'a>(
+    peers: &'a [aterm_net::fleet_member::Peer],
+    own_node: &str,
+    standby_labels: &[String],
+    home_dir: Option<&Path>,
+    roster: Option<SwarmRoster>,
 ) -> Vec<&'a aterm_net::fleet_member::Peer> {
     use aterm_net::fleet_member::{Peer, Via};
     let (roster, denied_nodes, log_keys) = match home_dir {
         Some(home) => {
             let paths = aterm_secrets::client::Paths::for_home(home);
-            let roster = aterm_secrets::client::swarm_roster(&paths).ok().flatten();
             let denied = if roster.is_none() {
                 // Neither the roster nor the deny list read: no steward can be told from a
                 // revoked Mac, so the request goes to none until one is.
@@ -1593,12 +1627,15 @@ pub fn select_steward_relay_peers<'a>(
 
 /// Dial a steward peer over `FleetOp::MailCode` to fetch and decrypt the newest verification
 /// credential for `target_email` when `cfg.relay_enabled` is active.
+///
+/// # Errors
+/// The roster remains busy or unread during the bounded read.
 #[cfg(unix)]
 pub fn fetch_relay_mail_credential(
     cfg: &MailboxConfig,
     target_email: &str,
     within: Duration,
-) -> Option<MailboxCredential> {
+) -> Result<Option<MailboxCredential>, String> {
     fetch_relay_mail_credential_by(cfg, target_email, within, None)
 }
 
@@ -1608,6 +1645,47 @@ pub(super) fn fetch_relay_mail_credential_by(
     target_email: &str,
     within: Duration,
     inherited: Option<super::auth_deadline::Deadline<'_>>,
+) -> Result<Option<MailboxCredential>, String> {
+    if !cfg.relay_enabled {
+        return Ok(None);
+    }
+    let Some(home) = cfg.relay_home.as_deref() else {
+        return Ok(None);
+    };
+    let clock = std::time::Instant::now;
+    let deadline = inherited.map_or_else(
+        || super::auth_deadline::Deadline::new(within, &clock),
+        |deadline| deadline.limited(within),
+    );
+    let remaining = deadline.remaining().unwrap_or_default();
+    let roster = ai_pool::read_pass_roster_until(
+        &aterm_secrets::client::Paths::for_home(home),
+        std::time::Instant::now() + remaining.min(within).min(Duration::from_millis(250)),
+    )?;
+    let mut busy = false;
+    let credential = fetch_relay_mail_credential_in(
+        cfg,
+        target_email,
+        within,
+        Some(deadline),
+        roster,
+        &mut busy,
+    );
+    if busy {
+        Err("steward swarm roster busy; sign-in deferred".to_owned())
+    } else {
+        Ok(credential)
+    }
+}
+
+#[cfg(unix)]
+fn fetch_relay_mail_credential_in(
+    cfg: &MailboxConfig,
+    target_email: &str,
+    within: Duration,
+    inherited: Option<super::auth_deadline::Deadline<'_>>,
+    roster: Option<SwarmRoster>,
+    busy: &mut bool,
 ) -> Option<MailboxCredential> {
     let clock = std::time::Instant::now;
     let deadline = inherited.map_or_else(
@@ -1631,8 +1709,13 @@ pub(super) fn fetch_relay_mail_credential_by(
     let secret = aterm_net::fleet::read_key_file(state_dir).ok()?;
 
     let config_path = home.join(".config/aterm/aterm.toml");
-    let claimed_label = ai_pool::resolve_local_pool_identity(Some(home), Some(&config_path), None)
-        .map(|id| id.primary);
+    let claimed_label = ai_pool::resolve_local_pool_identity_with_roster(
+        Some(home),
+        Some(&config_path),
+        None,
+        roster.clone(),
+    )
+    .map(|id| id.primary);
 
     let req = MailCodeRequest {
         email: target_email.trim().to_ascii_lowercase(),
@@ -1658,8 +1741,14 @@ pub(super) fn fetch_relay_mail_credential_by(
         }
     }
 
-    let standby_labels = read_standby_steward_labels(home);
-    let ordered = select_steward_relay_peers(&peers, me.node(), &standby_labels, Some(home));
+    let standby_labels = read_standby_steward_labels(home, roster.as_ref());
+    let ordered = select_steward_relay_peers_with_roster(
+        &peers,
+        me.node(),
+        &standby_labels,
+        Some(home),
+        roster,
+    );
     // No deny list read: the request, which names the mailbox, goes to no peer until one is.
     let denied_nodes = aterm_secrets::client::swarm_denied_nodes(&paths)
         .ok()
@@ -1688,6 +1777,10 @@ pub(super) fn fetch_relay_mail_credential_by(
                 | MailCodeRefusal::SealFailed
                 | MailCodeRefusal::NoCodeYet
                 | MailCodeRefusal::Denied => continue,
+                MailCodeRefusal::RosterBusy => {
+                    *busy = true;
+                    return None;
+                }
                 MailCodeRefusal::InvalidRequest(_) => return None,
             },
             Err(_) => continue,
@@ -1702,10 +1795,54 @@ pub fn fetch_relay_mail_credential(
     _cfg: &MailboxConfig,
     _target_email: &str,
     _within: Duration,
-) -> Option<MailboxCredential> {
-    None
+) -> Result<Option<MailboxCredential>, String> {
+    Ok(None)
 }
 
 #[cfg(test)]
 #[path = "ai_signin_tests.rs"]
 mod tests;
+
+/// A steward's catch-all mailbox from the lab registry (one-mesh design step A9).
+#[cfg(test)]
+mod registry_tests {
+    use super::super::{alab_roster, headless_oauth::registry_tests as fixture};
+    use super::*;
+
+    /// A registry mailbox that receives every address, its password held, is a catch-all login
+    /// with no `ai-mailbox.toml` present; one address's own mailbox is not.
+    /// NEGATIVE CONTROL: with the registry's routes left out of discovery, the catch-all reads
+    /// `false`.
+    #[test]
+    fn a_registry_catch_all_mailbox_is_a_stewards_login() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let mut all = fixture::mailbox();
+        all.receives = vec!["*".into()];
+        let steward = alab_roster::with_mail(vec![all], fixture::secrets(), || {
+            super::super::headless_oauth::discover_mailbox_config_files(
+                Some(home.path()),
+                None,
+                None,
+            )
+            .is_some_and(|cfg| has_catch_all_login(&cfg))
+        });
+        assert!(steward);
+        let mut own = fixture::mailbox();
+        own.login = "ai1@example.test".into();
+        own.receives = vec!["ai1@example.test".into()];
+        let not = alab_roster::with_mail(vec![own], fixture::secrets(), || {
+            super::super::headless_oauth::discover_mailbox_config_files(
+                Some(home.path()),
+                None,
+                None,
+            )
+            .is_some_and(|cfg| has_catch_all_login(&cfg))
+        });
+        assert!(!not);
+        assert_eq!(
+            alab_roster::reveals(),
+            0,
+            "judging a steward reveals nothing"
+        );
+    }
+}

@@ -35,12 +35,12 @@ pub struct Finding {
 /// facts differ from the owner's statement on its machine row, where the facts win in views.
 pub fn facts(read: &OwnedRead, live: &BTreeSet<String>, machines: &Projection) -> Vec<Finding> {
     let mut found = Vec::new();
-    let mut by_machine = BTreeMap::<&str, Vec<String>>::new();
-    let mut by_hint = BTreeMap::<&str, Vec<String>>::new();
+    let mut by_machine = BTreeMap::<&str, Vec<&str>>::new();
+    let mut by_hint = BTreeMap::<&str, Vec<&str>>::new();
     for (uuid, row) in read.rows.iter().filter(|(uuid, _)| live.contains(*uuid)) {
         let text = |column: &str| row.value.get(column).and_then(Value::as_str);
         if let Some(mac) = text("mac") {
-            by_machine.entry(mac).or_default().push(uuid.clone());
+            by_machine.entry(mac).or_default().push(uuid.as_str());
             match machines.rows.get(mac) {
                 None => found.push(Finding {
                     kind: "facts-machine-unknown",
@@ -64,15 +64,15 @@ pub fn facts(read: &OwnedRead, live: &BTreeSet<String>, machines: &Projection) -
             }
         }
         if let Some(hint) = text("hw_hint") {
-            by_hint.entry(hint).or_default().push(uuid.clone());
+            by_hint.entry(hint).or_default().push(uuid.as_str());
         }
     }
-    let shared = |kind, by: BTreeMap<&str, Vec<String>>, found: &mut Vec<Finding>| {
+    let shared = |kind, by: BTreeMap<&str, Vec<&str>>, found: &mut Vec<Finding>| {
         for pks in by.into_values().filter(|pks| pks.len() > 1) {
             found.push(Finding {
                 kind,
                 collection: MACHINE_FACTS.name,
-                pks,
+                pks: pks.into_iter().map(str::to_owned).collect(),
             });
         }
     };
@@ -192,8 +192,9 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
     let addresses = &projections[ADDRESS.name];
     let mailboxes = &projections[MAILBOX.name];
     let live = |p: &Projection, pk: &str| p.rows.get(pk).is_some_and(cell::Row::live);
-    let text =
-        |row: &cell::Row, column: &str| row.get(column).and_then(Value::as_str).map(str::to_owned);
+    fn text<'a>(row: &'a cell::Row, column: &str) -> Option<&'a str> {
+        row.get(column).and_then(Value::as_str)
+    }
     // Preferences: a live one is keyed by its pair and names a machine and an account still live. It is a mapping
     // and has no cap: several machines may prefer one account, and one machine any number.
     let accounts = &projections[ACCOUNT.name];
@@ -204,7 +205,7 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
     {
         // The key derives from the pair, so a row whose cells say another pair says two mappings.
         if let (Some(machine), Some(account)) = (text(row, "machine"), text(row, "account"))
-            && keys::preference_pk(&machine, &account).ok().as_deref() != Some(pk.as_str())
+            && keys::preference_pk(machine, account).ok().as_deref() != Some(pk.as_str())
         {
             found.push(Finding {
                 kind: "preference-key-mismatch",
@@ -213,23 +214,23 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
             });
         }
         if let Some(machine) = text(row, "machine")
-            && machines.rows.contains_key(&machine)
-            && !live(machines, &machine)
+            && machines.rows.contains_key(machine)
+            && !live(machines, machine)
         {
             found.push(Finding {
                 kind: "preference-on-retired-machine",
                 collection: PREFERENCE.name,
-                pks: vec![pk.clone(), machine],
+                pks: vec![pk.clone(), machine.to_owned()],
             });
         }
         if let Some(account) = text(row, "account")
-            && accounts.rows.contains_key(&account)
-            && !live(accounts, &account)
+            && accounts.rows.contains_key(account)
+            && !live(accounts, account)
         {
             found.push(Finding {
                 kind: "preference-for-retired-account",
                 collection: PREFERENCE.name,
-                pks: vec![pk.clone(), account],
+                pks: vec![pk.clone(), account.to_owned()],
             });
         }
     }
@@ -240,23 +241,23 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
         .filter(|(_, r)| r.live())
     {
         if let Some(login) = text(row, "login")
-            && addresses.rows.contains_key(&login)
-            && !live(addresses, &login)
+            && addresses.rows.contains_key(login)
+            && !live(addresses, login)
         {
             found.push(Finding {
                 kind: "account-login-retired",
                 collection: ACCOUNT.name,
-                pks: vec![pk.clone(), login],
+                pks: vec![pk.clone(), login.to_owned()],
             });
         }
         if let Some(identity) = text(row, "identity")
-            && addresses.rows.contains_key(&identity)
-            && !live(addresses, &identity)
+            && addresses.rows.contains_key(identity)
+            && !live(addresses, identity)
         {
             found.push(Finding {
                 kind: "account-identity-retired",
                 collection: ACCOUNT.name,
-                pks: vec![pk.clone(), identity],
+                pks: vec![pk.clone(), identity.to_owned()],
             });
         }
     }
@@ -269,7 +270,7 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
             if other_row
                 .fields
                 .get("aliases")
-                .is_some_and(|f| f.members().contains(label.as_str()))
+                .is_some_and(|f| f.members().contains(label))
             {
                 found.push(Finding {
                     kind: "label-ambiguous",
@@ -283,13 +284,13 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
     // live, or back to itself.
     for (pk, row) in addresses.rows.iter().filter(|(_, r)| r.live()) {
         if let Some(target) = text(row, "alias_of")
-            && addresses.rows.contains_key(&target)
-            && !live(addresses, &target)
+            && addresses.rows.contains_key(target)
+            && !live(addresses, target)
         {
             found.push(Finding {
                 kind: "alias-of-retired",
                 collection: ADDRESS.name,
-                pks: vec![pk.clone(), target],
+                pks: vec![pk.clone(), target.to_owned()],
             });
         }
         if super::mail::alias_cycle(addresses, pk) {
@@ -300,23 +301,23 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
             });
         }
         if let Some(mailbox) = text(row, "mailbox")
-            && mailboxes.rows.contains_key(&mailbox)
-            && !live(mailboxes, &mailbox)
+            && mailboxes.rows.contains_key(mailbox)
+            && !live(mailboxes, mailbox)
         {
             found.push(Finding {
                 kind: "address-mailbox-retired",
                 collection: ADDRESS.name,
-                pks: vec![pk.clone(), mailbox],
+                pks: vec![pk.clone(), mailbox.to_owned()],
             });
         }
         if let Some(hint) = text(row, "mailbox_hint")
-            && mailboxes.rows.contains_key(&hint)
-            && !live(mailboxes, &hint)
+            && mailboxes.rows.contains_key(hint)
+            && !live(mailboxes, hint)
         {
             found.push(Finding {
                 kind: "address-mailbox-hint-retired",
                 collection: ADDRESS.name,
-                pks: vec![pk.clone(), hint],
+                pks: vec![pk.clone(), hint.to_owned()],
             });
         }
         if let (Some(mailbox), Some(hint)) = (text(row, "mailbox"), text(row, "mailbox_hint"))
@@ -324,6 +325,16 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
         {
             found.push(Finding {
                 kind: "mailbox-guess-differs",
+                collection: ADDRESS.name,
+                pks: vec![pk.clone()],
+            });
+        }
+        if row.get("protected") == Some(&Value::Bool(true))
+            && (row.get("mailbox").is_some_and(|v| !v.is_null())
+                || row.get("mailbox_hint").is_some_and(|v| !v.is_null()))
+        {
+            found.push(Finding {
+                kind: "protected-address-has-mailbox",
                 collection: ADDRESS.name,
                 pks: vec![pk.clone()],
             });

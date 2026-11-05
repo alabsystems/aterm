@@ -502,21 +502,16 @@ impl Drop for RetireLock {
 
 /// `log`'s lock, or the refusal of a log a running broker holds.
 fn retire_lock(log: &Path) -> Result<RetireLock, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let at = log.display();
-    let meta = std::fs::symlink_metadata(log).map_err(|e| format!("{at}: {e}"))?;
-    if !meta.file_type().is_file() {
-        return Err(format!("{at} is not a file; it is left as it was"));
-    }
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
-    }
-    let holding = opts.open(log).map_err(|e| {
-        #[cfg(unix)]
-        if e.raw_os_error() == Some(libc::ELOOP) {
+    opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    let holding: std::fs::File = aterm_uds::kept_out(|| opts.open(log)).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP)
+            || (e.kind() != std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(log).is_ok_and(|m| !m.file_type().is_file()))
+        {
             return format!("{at} is not a file; it is left as it was");
         }
         format!("{at}: {e}")

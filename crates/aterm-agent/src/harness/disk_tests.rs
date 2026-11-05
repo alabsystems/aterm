@@ -1881,3 +1881,55 @@ fn the_text_form_spells_paths_plain_and_the_row_keeps_its_own() {
         assert!(line.contains(r"\\?\C:\Users\u\repo\target"), "{line}");
     }
 }
+
+/// THE DISK'S LINES ARE ATERM'S OWN WORDS: the resume after `ENOSPC` and the ask to free space
+/// are pasted through a fenced `turn`, which a person's key between the paste and the Enter
+/// leaves unsent in the composer (`turn … reason=person typed=0 pasted=<n>`); the hosted loop
+/// reads either as the harness's own (`Composer::Own`: asked about, never sent), never as a
+/// person's draft it enters once their grace is out.
+/// NEGATIVE CONTROL: `upgrade::OWN_HEADS` without `RESUME_HEAD` and `ask::LINE_HEAD`, and each
+/// line reads as a person's draft.
+#[test]
+fn the_disks_lines_left_in_the_composer_are_aterms_own_words() {
+    let named = [
+        "~/aterm's builds 2.0 GiB".to_owned(),
+        "$HOME/trust 1.0 GiB".to_owned(),
+    ];
+    let mut texts = vec![
+        resume_text("ENOSPC", 0, &[]),
+        resume_text("EDQUOT", 3 << 30, &[]),
+        resume_text("ENOSPC", 3 << 30, &named),
+    ];
+    let holders = [Hog {
+        built_s_ago: None,
+        path: PathBuf::from("/Users//u/aterm/target"),
+        bytes: 40 << 30,
+        bytes_partial: false,
+        why: "cargo build output".to_owned(),
+        serves: Some(PathBuf::from("/Users//u/aterm")),
+    }];
+    for (mount, done, holders) in [
+        ("/System/Volumes/Data", ask::Done::Spent, &holders[..]),
+        ("/", ask::Done::Inodes, &[][..]),
+    ] {
+        texts.push(ask::line(&ask::Line {
+            mount: Path::new(mount),
+            total: 1000 << 30,
+            free: 18 << 30,
+            floor: 25 << 30,
+            emergency: false,
+            done,
+            holders,
+            checkout: Some(Path::new("/Users//u/aterm")),
+            shared: false,
+            home: Some(Path::new("/Users//u")),
+            projected: None,
+        }));
+    }
+    for text in &texts {
+        assert!(
+            crate::harness::upgrade::own_words(text) && crate::harness::upgrade::own_draft(text),
+            "{text}"
+        );
+    }
+}

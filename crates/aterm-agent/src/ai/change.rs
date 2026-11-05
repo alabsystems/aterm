@@ -13,7 +13,12 @@ pub const CHANGE_MAX: usize = 200 * 1024;
 /// The largest untracked file read into the change.
 pub const UNTRACKED_FILE_MAX: u64 = 64 * 1024;
 /// Each git run's time limit.
+#[cfg(not(test))]
 pub const GIT_BUDGET: Duration = Duration::from_secs(20);
+/// Each git run's time limit: the unit tests run real git on a scratch repository, so a run a
+/// loaded machine holds is waited for by the hang detector, not read as a refusal.
+#[cfg(test)]
+pub const GIT_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// Which base the change is taken from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,26 +75,29 @@ pub fn git_program(path_var: Option<&str>, cwd: &Path) -> Option<PathBuf> {
     fenced.push(real(cwd));
     std::env::split_paths(path_var?)
         .filter(|dir| dir.is_absolute())
-        .filter_map(|dir| std::fs::canonicalize(dir).ok())
-        .filter(|dir| !fenced.iter().any(|f| dir.starts_with(f)))
-        .map(|dir| dir.join(if cfg!(windows) { "git.exe" } else { "git" }))
-        .filter_map(|path| std::fs::canonicalize(path).ok())
-        .filter(|path| !fenced.iter().any(|f| path.starts_with(f)))
-        .find(|path| {
-            let Ok(meta) = path.metadata() else {
-                return false;
-            };
+        .filter_map(|dir| {
+            let cand = dir.join(if cfg!(windows) { "git.exe" } else { "git" });
+            let meta = cand.metadata().ok()?;
             if !meta.is_file() {
-                return false;
+                return None;
             }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                meta.permissions().mode() & 0o111 != 0
+                if meta.permissions().mode() & 0o111 == 0 {
+                    return None;
+                }
             }
-            #[cfg(not(unix))]
-            true
+            let real_dir = std::fs::canonicalize(&dir).ok()?;
+            if fenced.iter().any(|f| real_dir.starts_with(f)) {
+                return None;
+            }
+            let path =
+                std::fs::canonicalize(real_dir.join(if cfg!(windows) { "git.exe" } else { "git" }))
+                    .ok()?;
+            (!fenced.iter().any(|f| path.starts_with(f))).then_some(path)
         })
+        .next()
 }
 
 fn git_env(var: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
@@ -293,7 +301,12 @@ fn path_of_open(_file: &std::fs::File) -> Option<PathBuf> {
     None
 }
 
+#[cfg(test)]
 fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
+    new_file_hunk_in(root, &real(root), rel)
+}
+
+fn new_file_hunk_in(root: &Path, real_root: &Path, rel: &str) -> Option<String> {
     use std::io::Read as _;
     if rel.is_empty() || rel.contains(['\n', '\r', '\0']) {
         return None;
@@ -304,7 +317,7 @@ fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     #[cfg(windows)]
     {
@@ -316,7 +329,9 @@ fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
     if !meta.is_file() || meta.len() > UNTRACKED_FILE_MAX {
         return None;
     }
-    let own = rel.split('/').fold(real(root), |at, part| at.join(part));
+    let own = rel
+        .split('/')
+        .fold(real_root.to_path_buf(), |at, part| at.join(part));
     if path_of_open(&file)? != own {
         return None;
     }
@@ -332,12 +347,12 @@ fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
     if text.contains('\0') {
         return None;
     }
-    let lines: Vec<&str> = text.lines().collect();
+    let line_count = text.lines().count();
     let mut out = format!(
-        "diff --git a/{rel} b/{rel}\nnew file (untracked)\n--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,{} @@\n",
-        lines.len()
+        "diff --git a/{rel} b/{rel}\nnew file (untracked)\n--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,{line_count} @@\n"
     );
-    for l in lines {
+    out.reserve(text.len().saturating_add(line_count));
+    for l in text.lines() {
         out.push('+');
         out.push_str(l);
         out.push('\n');
@@ -604,8 +619,13 @@ pub fn collect(
         diff = git.run(&refs, &[]).map_err(Refused)?;
     }
     let mut untracked_files = 0usize;
+    let real_root = if untracked.is_empty() {
+        PathBuf::new()
+    } else {
+        real(&root_path)
+    };
     for name in &untracked {
-        if let Some(hunk) = new_file_hunk(&root_path, name) {
+        if let Some(hunk) = new_file_hunk_in(&root_path, &real_root, name) {
             diff.push_str(&hunk);
             untracked_files += 1;
         }

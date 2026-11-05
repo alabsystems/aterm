@@ -741,7 +741,9 @@ pub(crate) enum AiAsk {
 }
 
 fn wake_stamp(path: Option<&Path>) -> Option<(Option<std::time::SystemTime>, u64)> {
-    let meta = std::fs::metadata(path?).ok()?;
+    let meta = std::fs::symlink_metadata(path?)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?;
     #[cfg(unix)]
     let file = std::os::unix::fs::MetadataExt::ino(&meta);
     #[cfg(not(unix))]
@@ -1145,6 +1147,7 @@ impl App {
             return;
         };
         aterm_log::info!("ai: a tab opens to run `aterm {}`", args.join(" "));
+        let _act = crate::tab_marks::ActScope::gesture("signin");
         self.open_off_loop(
             window,
             crate::tab_spawn::SpawnPlace::Tab,

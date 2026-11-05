@@ -78,7 +78,9 @@ impl Mark {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         let file = options.open(&taking)?;
         let lock = match RecordLock::try_lock(file, RECORD) {
@@ -205,7 +207,7 @@ fn live(path: &Path) -> Option<Waiting> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let mut file = options.open(path).ok()?;
     let metadata = file.metadata().ok()?;

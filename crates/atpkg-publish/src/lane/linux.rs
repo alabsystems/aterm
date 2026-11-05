@@ -516,6 +516,8 @@ struct Detail {
     published: Option<PathBuf>,
     /// The published manifest's targets.
     published_rows: BTreeSet<Triple>,
+    /// The locally staged manifest's targets.
+    staged_rows: BTreeSet<Triple>,
 }
 
 impl Run<'_> {
@@ -598,10 +600,9 @@ impl Run<'_> {
         let slug = ctx.index_slug();
         let (n, head) = quad::fetch_head(ctx, &slug, &work.join("head"))?;
         crate::artifact::sign::elect_from_head(ctx, &head);
-        self.state.check_index(n)?;
+        let seen = self.state.check_index(n)?;
         self.tx.say(format!(
-            "channel index head: atpkg-index-{n} (last processed: {})",
-            self.state.index_seen()?
+            "channel index head: atpkg-index-{n} (last processed: {seen})"
         ));
         let channel = head.index.channels.first().cloned().ok_or_else(|| {
             Error::refused(format!(
@@ -648,6 +649,7 @@ impl Run<'_> {
             let mut d = Detail {
                 published: None,
                 published_rows: BTreeSet::new(),
+                staged_rows: BTreeSet::new(),
             };
             if !matches!(class, Class::Vendor | Class::AppleOnly) {
                 let sl = ctx.staging_slug(&repo);
@@ -671,7 +673,7 @@ impl Run<'_> {
                         ));
                     }
                 }
-                let staged_rows = self.staged_rows(&staged_dir, &name, build);
+                d.staged_rows = self.staged_rows(&staged_dir, &name, build);
                 for t in &opts.triples {
                     let latched = staged_dir
                         .join(format!("BLOCKED-{name}-{build}-{t}.md"))
@@ -683,7 +685,7 @@ impl Run<'_> {
                         *t,
                         row_state(
                             d.published_rows.contains(t),
-                            staged_rows.contains(t),
+                            d.staged_rows.contains(t),
                             latched,
                             can.contains(t),
                         ),
@@ -733,13 +735,17 @@ impl Run<'_> {
             let p = &mut programs[i];
             let published = detail.get(&p.name).and_then(|d| d.published.clone());
             if self.stage(p, published.as_deref(), &staged_dir, &work, n)? {
+                let rows = self.staged_rows(&staged_dir, &p.name, p.build);
+                if let Some(d) = detail.get_mut(&p.name) {
+                    d.staged_rows = rows;
+                }
                 outcome.staged.push(p.name.clone());
             }
         }
 
         for p in &programs {
             let Some(g) = &p.group else { continue };
-            let staged_rows = self.staged_rows(&staged_dir, &p.name, p.build);
+            let staged_rows = &detail[&p.name].staged_rows;
             for t in &opts.triples {
                 if p.rows.get(t) != Some(&RowState::Published) && !staged_rows.contains(t) {
                     holds.not_ready(g, Some(*t), &p.name);
@@ -766,9 +772,10 @@ impl Run<'_> {
                 continue;
             }
             let d = &detail[&p.name];
-            let new: Vec<Triple> = self
-                .staged_rows(&staged_dir, &p.name, p.build)
-                .into_iter()
+            let new: Vec<Triple> = d
+                .staged_rows
+                .iter()
+                .copied()
                 .filter(|t| opts.triples.contains(t) && !d.published_rows.contains(t))
                 .collect();
             if new.is_empty() {
@@ -1184,7 +1191,7 @@ impl Run<'_> {
         let Some(from) = from else {
             return Ok(false);
         };
-        std::fs::copy(&from, &base)
+        crate::identity::copy_regular_file(&from, &base)
             .map_err(|e| Error::io(format!("copy {}", from.display()), &e))?;
         let mut any = false;
         for t in p.need() {
@@ -1250,9 +1257,9 @@ impl Run<'_> {
                 .map(|n| n.to_os_string())
                 .ok_or_else(|| Error::refused("the pack's asset names no file"))?;
             move_file(&outcome.asset, &dir.join(asset_name))?;
-            std::fs::copy(&outcome.manifest, &staged)
+            crate::identity::copy_regular_file(&outcome.manifest, &staged)
                 .map_err(|e| Error::io(format!("stage {}", staged.display()), &e))?;
-            std::fs::copy(&outcome.manifest, &base)
+            crate::identity::copy_regular_file(&outcome.manifest, &base)
                 .map_err(|e| Error::io(format!("copy {}", base.display()), &e))?;
             let _ = std::fs::remove_file(staged.with_extension("toml.sig"));
             let _ = std::fs::remove_dir_all(&out);
@@ -1660,7 +1667,8 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }
-    std::fs::copy(from, to).map_err(|e| Error::io(format!("copy {}", from.display()), &e))?;
+    crate::identity::copy_regular_file(from, to)
+        .map_err(|e| Error::io(format!("copy {}", from.display()), &e))?;
     let _ = std::fs::remove_file(from);
     Ok(())
 }

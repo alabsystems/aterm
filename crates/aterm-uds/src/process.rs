@@ -737,6 +737,31 @@ pub fn is_stopped(pid: u32) -> bool {
     }
 }
 
+/// The signals `pid` ignores now (bit `n - 1` for signal `n`), as the kernel reports them: macOS's
+/// `kinfo_proc` ([`aterm_sysprobe::kproc::ignored_signals`]), Linux's `/proc/<pid>/status`. `None`
+/// when the process is gone, its record cannot be read, or this platform has no reader.
+#[must_use]
+pub fn ignored_signals(pid: i32) -> Option<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        u32::try_from(pid)
+            .ok()
+            .and_then(aterm_sysprobe::kproc::ignored_signals)
+            .map(u64::from)
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        read_proc_text(std::path::Path::new(&format!("/proc/{pid}/status")))
+            .ok()
+            .and_then(|status| procfs::ignored_signals(&status))
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// `pid`'s short BSD record ([`BsdShortInfo`]).
 #[cfg(target_vendor = "apple")]
 #[must_use]
@@ -903,7 +928,11 @@ impl ProcDir {
 
     /// `pid`'s directory under `proc`.
     fn of(proc: &std::path::Path, pid: i32) -> Option<Self> {
-        std::fs::File::open(proc.join(pid.to_string()))
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(proc.join(pid.to_string()))
             .ok()
             .map(Self)
     }
@@ -916,7 +945,7 @@ impl ProcDir {
             libc::openat(
                 self.0.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
             )
         };
         if fd < 0 {
@@ -1630,8 +1659,13 @@ fn proc_stat_status_stat(pid: i32) -> Option<[String; 3]> {
 /// read shows nothing).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn proc_shows_every_process() -> bool {
-    read_proc_text(std::path::Path::new("/proc/self/mountinfo"))
-        .is_ok_and(|mounts| procfs::shows_every_process(&mounts))
+    // A busy host's table (thousands of overlay mounts) outgrows `read_proc_text`'s per-pid cap.
+    const MAX_MOUNT_TABLE_BYTES: u64 = 16 * 1024 * 1024;
+    crate::atomic_file::read_regular(
+        std::path::Path::new("/proc/self/mountinfo"),
+        MAX_MOUNT_TABLE_BYTES,
+    )
+    .is_ok_and(|(mounts, _)| procfs::shows_every_process(&String::from_utf8_lossy(&mounts)))
 }
 
 /// One `/proc/<pid>/stat` read of a group listing ([`stat_read`]).
@@ -1760,6 +1794,7 @@ pub mod procfs {
     /// reads a row at a time up to the first such row, and a read that fails finds none.
     #[must_use]
     pub fn maps_executable(mut maps: impl std::io::BufRead, path: &[u8]) -> bool {
+        use std::io::{BufRead as _, Read as _};
         if path.is_empty() {
             return false;
         }
@@ -1774,7 +1809,8 @@ pub mod procfs {
         let mut row = Vec::new();
         loop {
             row.clear();
-            if maps
+            if (&mut maps)
+                .take(64 * 1024)
                 .read_until(b'\n', &mut row)
                 .map_or(true, |read| read == 0)
             {
@@ -1798,6 +1834,13 @@ pub mod procfs {
                 return true;
             }
         }
+    }
+
+    /// The ignored-signal mask (`SigIgn:`, hex) in a `/proc/<pid>/status` text.
+    #[must_use]
+    pub fn ignored_signals(status: &str) -> Option<u64> {
+        let mask = status.lines().find_map(|l| l.strip_prefix("SigIgn:"))?;
+        u64::from_str_radix(mask.trim(), 16).ok()
     }
 
     /// The effective uid in a `/proc/<pid>/status` text.
@@ -2120,21 +2163,8 @@ fn cmdline_as_run(pid: u32) -> Option<(Vec<u8>, bool)> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_proc_bounded(pid: u32, name: &std::ffi::CStr) -> Option<Vec<u8>> {
     use std::io::Read as _;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-    let dir = std::fs::File::open(format!("/proc/{pid}")).ok()?;
-    // SAFETY: `dir` is open for the call and the name is NUL-terminated.
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return None;
-    }
-    // SAFETY: `openat` just returned `fd`, which nothing else owns.
-    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let dir = ProcDir::of(std::path::Path::new("/proc"), i32::try_from(pid).ok()?)?;
+    let file = dir.open(name)?;
     let mut bytes = Vec::new();
     file.take((PROCESS_ARGV_MAX + 1) as u64)
         .read_to_end(&mut bytes)
@@ -2256,11 +2286,16 @@ pub fn kill_self_now() -> ! {
     std::process::abort()
 }
 
-/// How long [`kill_group_until_empty`] signals a group that has not emptied: a member `SIGKILL`
-/// cannot end (one blocked in the kernel, on a stale mount) is left to the kernel after this
-/// rather than holding the caller.
-#[cfg(target_vendor = "apple")]
+/// How long [`kill_group_until_empty`] signals a group that has not emptied (Apple's rounds; one
+/// signal elsewhere needs no bound): a member `SIGKILL` cannot end (one blocked in the kernel, on
+/// a stale mount) is left to the kernel after this rather than holding the caller.
+#[cfg(all(unix, not(test)))]
 const GROUP_KILL_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+/// A unit test's is the one-minute hang detector (`aterm_spec::wait::MUST_HAPPEN`, which this
+/// crate sits below): its groups' members all die, but a loaded machine can keep a shell killed
+/// mid-fork from exiting within 5 s, and a round that stops first leaves the fork's child running.
+#[cfg(all(unix, test))]
+const GROUP_KILL_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The longest pause between two of [`kill_group_until_empty`]'s signals.
 #[cfg(target_vendor = "apple")]
@@ -2286,6 +2321,26 @@ const GROUP_KILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(2
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn kill_group_until_empty(pgid: i32) -> std::io::Result<()> {
+    kill_group_capped(pgid, GROUP_KILL_CAP)
+}
+
+/// [`kill_group_until_empty`] with the caller's bound on repeated signal rounds.
+/// The caller must still own the unreaped group leader. This does not prove that the group
+/// drained: a member blocked in the kernel may remain after the bound. Off Apple one signal
+/// is sent. A test requiring eventual drain uses its one-minute hang detector as the cap.
+///
+/// # Errors
+/// As [`kill_group_until_empty`]'s.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn kill_group_until_empty_within(pgid: i32, cap: std::time::Duration) -> std::io::Result<()> {
+    kill_group_capped(pgid, cap)
+}
+
+/// [`kill_group_until_empty`], its Apple rounds ending after at most `cap`.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn kill_group_capped(pgid: i32, cap: std::time::Duration) -> std::io::Result<()> {
     if pgid <= 1 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -2297,13 +2352,19 @@ pub fn kill_group_until_empty(pgid: i32) -> std::io::Result<()> {
     }
     #[cfg(target_vendor = "apple")]
     {
-        let until = std::time::Instant::now() + GROUP_KILL_CAP;
+        let start = std::time::Instant::now();
         let mut pause = std::time::Duration::from_millis(1);
-        while signal_group(pgid) && std::time::Instant::now() < until {
-            std::thread::sleep(pause);
+        while !cap.saturating_sub(start.elapsed()).is_zero() && signal_group(pgid) {
+            let left = cap.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(pause.min(left));
             pause = (pause * 2).min(GROUP_KILL_PAUSE);
         }
     }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = cap;
     Ok(())
 }
 
@@ -2342,17 +2403,28 @@ fn env_host_name(env: Option<std::ffi::OsString>) -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
-/// The name the other machines of this one's LAN reach it by.
+/// The name the other machines of this one's LAN reach it by: a dotted HostName, else
+/// `<LocalHostName>.local`, else the kernel's name.
+///
+/// Never `$HOSTNAME`, which a shell exported before a rename keeps stale in everything it starts;
+/// and a bare HostName (`m8`, as aterm's name rule sets it) yields to the Bonjour name, which the
+/// LAN resolves where a bare word does not.
 #[must_use]
 pub fn lan_host_name() -> Option<String> {
-    lan_host_name_over(std::env::var_os("HOSTNAME"))
+    lan_name(configured_host_name, bonjour_host_name, os_host_name)
 }
 
-fn lan_host_name_over(env: Option<std::ffi::OsString>) -> Option<String> {
-    env_host_name(env)
-        .or_else(configured_host_name)
-        .or_else(|| bonjour_host_name().map(|name| format!("{name}.local")))
-        .or_else(os_host_name)
+/// [`lan_host_name`]'s order over its three readers, each asked only when the one before it
+/// gives nothing usable.
+fn lan_name(
+    configured: impl FnOnce() -> Option<String>,
+    bonjour: impl FnOnce() -> Option<String>,
+    kernel: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    configured()
+        .filter(|name| name.contains('.'))
+        .or_else(|| bonjour().map(|name| format!("{name}.local")))
+        .or_else(kernel)
 }
 
 #[cfg(target_os = "macos")]
@@ -2560,16 +2632,36 @@ mod host_name_tests {
             super::os_host_name()
         );
         assert_eq!(super::host_name_over(None), super::os_host_name());
+    }
+
+    #[test]
+    fn the_lan_name_is_a_dotted_host_name_else_bonjour_else_the_kernel() {
+        let some = |name: &'static str| move || Some(name.to_owned());
+        let none = || None::<String>;
+        let unasked = || -> Option<String> { panic!("asked after an earlier reader answered") };
         assert_eq!(
-            super::lan_host_name_over(Some(" my-override.local ".into())).as_deref(),
-            Some("my-override.local"),
-            "the override names the machine to its LAN too"
+            super::lan_name(some("m8.lab.example"), unasked, unasked).as_deref(),
+            Some("m8.lab.example")
         );
+        assert_eq!(
+            super::lan_name(some("m8"), some("m8"), unasked).as_deref(),
+            Some("m8.local"),
+            "a bare HostName yields to the name the LAN resolves"
+        );
+        assert_eq!(
+            super::lan_name(none, some("m8"), unasked).as_deref(),
+            Some("m8.local")
+        );
+        assert_eq!(
+            super::lan_name(some("m8"), none, some("m8")).as_deref(),
+            Some("m8")
+        );
+        assert_eq!(super::lan_name(none, none, none), None);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_lan_name_is_the_configured_name_else_the_bonjour_name() {
+    fn the_lan_name_reads_what_scutil_reads() {
         let scutil = |key: &str| {
             let out = crate::spawnfd::command("/usr/sbin/scutil")
                 .args(["--get", key])
@@ -2585,9 +2677,10 @@ mod host_name_tests {
         assert!(computer.is_some(), "the read gives the ComputerName");
         assert_eq!(computer, scutil("ComputerName"));
         let want = configured
+            .filter(|name| name.contains('.'))
             .or_else(|| scutil("LocalHostName").map(|local| format!("{local}.local")))
             .or_else(super::os_host_name);
-        assert_eq!(super::lan_host_name_over(None), want);
+        assert_eq!(super::lan_host_name(), want);
     }
 
     #[test]
@@ -4348,6 +4441,17 @@ mod parent_and_path_tests {
             );
             assert_eq!(read, None, "a program the child opened itself is no proof");
         }
+    }
+
+    #[test]
+    fn linux_reads_the_ignored_signal_mask_as_hex() {
+        use super::procfs;
+        assert_eq!(
+            procfs::ignored_signals("Name:\tsh\nSigIgn:\t0000000000000001\nSigCgt:\t0\n"),
+            Some(1)
+        );
+        assert_eq!(procfs::ignored_signals("SigIgn:\tnot hex\n"), None);
+        assert_eq!(procfs::ignored_signals("Name:\tsh\n"), None);
     }
 
     #[cfg(target_os = "linux")]

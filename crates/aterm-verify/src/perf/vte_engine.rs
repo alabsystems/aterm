@@ -248,18 +248,14 @@ pub(super) fn share(part: &Path, shared: &Path) -> Result<(), String> {
 
 /// The SHA-256 prefix of every payload, name and bytes, in order: the shared folder's name.
 fn digest(payloads: &[Payload]) -> String {
-    let mut all = Vec::new();
+    let mut hasher = aterm_digest::Sha256::new();
     for p in payloads {
         for part in [p.name.as_bytes(), &p.setup, &p.once] {
-            all.extend_from_slice(&(part.len() as u64).to_le_bytes());
-            all.extend_from_slice(part);
+            hasher.update((part.len() as u64).to_le_bytes());
+            hasher.update(part);
         }
     }
-    aterm_digest::Sha256::digest(all)
-        .iter()
-        .take(6)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    aterm_codec::hex::encode_lower(&hasher.finalize()[..6])
 }
 
 /// A PTY at `rows` x `cols`: `(master, slave)`, both close-on-exec.
@@ -409,8 +405,10 @@ fn describe(payloads: &[Payload]) -> Vec<String> {
     payloads
         .iter()
         .map(|p| {
-            let digest = aterm_digest::Sha256::digest([p.setup.as_slice(), &p.once].concat());
-            let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+            let mut hasher = aterm_digest::Sha256::new();
+            hasher.update(&p.setup);
+            hasher.update(&p.once);
+            let hex = aterm_codec::hex::encode_lower(&hasher.finalize()[..6]);
             let setup = if p.setup.len() <= 32 {
                 format!("setup {:?}", String::from_utf8_lossy(&p.setup))
             } else {
@@ -504,7 +502,7 @@ fn capture_here(
     capture_scripts(benchmarks, out)?;
     if let Some(bin) = vtebench {
         let stream_path = out.join(STREAM);
-        let stream = std::fs::File::create(&stream_path)
+        let stream = crate::create_stdio_file(&stream_path)
             .map_err(|e| format!("{}: {e}", stream_path.display()))?;
         let ran = command(bin)
             .arg("--benchmarks")
@@ -567,7 +565,7 @@ fn capture_scripts_on(
             .ok_or_else(|| format!("{}: not a benchmark name", dir.display()))?;
         let write = |ext: &str, bytes: &[u8]| {
             let p = out.join(format!("{name}.{ext}"));
-            std::fs::write(&p, bytes).map_err(|e| format!("{}: {e}", p.display()))
+            crate::write_fresh(&p, bytes).map_err(|e| format!("{}: {e}", p.display()))
         };
         let setup = dir.join("setup");
         if setup.is_file() {

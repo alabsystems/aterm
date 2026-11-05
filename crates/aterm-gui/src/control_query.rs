@@ -43,6 +43,10 @@ pub(crate) fn visible_row(t: &Terminal, r: usize) -> String {
 
 pub(crate) use aterm_control::wire::trimmed_len;
 
+#[path = "control_reveal.rs"]
+mod reveal;
+pub(crate) use reveal::{SpawnMark, cmd_reveal, mark_ctl_spawned};
+
 /// The `text` grammar, as the wire states it on a usage error.
 pub(crate) const TEXT_USAGE: &str =
     "ERR usage: text [--json] [trim] [tail=<n>|rows=<a>-<b>] [order=<logical|display>]\n";
@@ -1565,6 +1569,45 @@ pub(crate) fn devtools_reply(outcome: crate::devtools_helper::HandOver) -> Strin
         HandOver::OpenFailed => "ERR devtools: System Settings did not open\n".to_string(),
         other => format!("OK {}\n", other.as_str()),
     }
+}
+
+/// Read the existing setup observation without a session, probe, input or focus change.
+pub(crate) fn cmd_setup(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    setup_status_over(rest, &|| {
+        control_media::call_main_within(proxy, std::time::Duration::from_millis(500), |reply| {
+            Wake::ReadSetupStatus { reply }
+        })
+        .map_err(|error| error.to_string())
+    })
+}
+
+fn setup_status_over(rest: &str, read: &dyn Fn() -> Result<String, String>) -> String {
+    if rest.trim() != "status" {
+        return "ERR usage: setup status\n".into();
+    }
+    match read() {
+        Ok(state) => format!("OK schema=1 setup={state}\n"),
+        Err(error) => format!("ERR {error}\n"),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn background_setup_status_only_reads_and_rejects_action_words_before_posting() {
+    let reads = std::cell::Cell::new(0);
+    let reply = setup_status_over("status", &|| {
+        reads.set(reads.get() + 1);
+        Ok("done;offered:lan".into())
+    });
+    assert_eq!(reply, "OK schema=1 setup=done;offered:lan\n");
+    assert_eq!(reads.get(), 1);
+    for rest in ["", "start", "on", "status now"] {
+        assert!(
+            setup_status_over(rest, &|| panic!("an invalid query posted a wake"))
+                .starts_with("ERR usage:")
+        );
+    }
+    assert!(setup_status_over("status", &|| Err("unavailable".into())).starts_with("ERR "));
 }
 
 /// `devtools hand-over [now]` -> one status line. `now` is `permissions walk now devtools`:

@@ -126,13 +126,13 @@ fn read_bound(
     proving_gone: bool,
 ) -> Result<Option<Pending>, String> {
     let path = path(checkout)?;
-    if std::fs::symlink_metadata(&path)
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    {
-        return Ok(None);
-    }
-    let bytes = crate::metadata_io::read_bounded_regular(&path, MAX_BYTES)
-        .map_err(|error| format!("snapshot removal receipt cannot be read: {error}"))?;
+    let bytes = match crate::metadata_io::read_bounded_regular(&path, MAX_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!("snapshot removal receipt cannot be read: {error}"));
+        }
+    };
     let pending: Pending = aterm_json::from_slice(&bytes)
         .map_err(|error| format!("snapshot removal receipt is invalid: {error}"))?;
     let [seconds, nanos] = pending.started;
@@ -158,8 +158,8 @@ fn read_bound(
             return Err("snapshot was replaced after removal began".to_owned());
         }
         let gitfile = wt.join(".git");
-        match std::fs::symlink_metadata(&gitfile) {
-            Ok(_) if super::gitfile_text(&gitfile).as_ref() == Some(&pending.gitfile) => {}
+        match crate::metadata_io::read_bounded_regular(&gitfile, 4096) {
+            Ok(bytes) if bytes == pending.gitfile => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => {
                 return Err(
@@ -178,8 +178,8 @@ fn read_bound(
             return Err("snapshot Git entry changed after removal began".to_owned());
         }
         let gitdir = pending.entry.join("gitdir");
-        match std::fs::symlink_metadata(&gitdir) {
-            Ok(_) if super::gitfile_text(&gitdir).as_ref() == Some(&pending.gitdir) => {}
+        match crate::metadata_io::read_bounded_regular(&gitdir, 4096) {
+            Ok(bytes) if bytes == pending.gitdir => {}
             Err(error) if pending.tree_gone && error.kind() == std::io::ErrorKind::NotFound => {}
             _ => {
                 return Err(
@@ -256,7 +256,9 @@ fn write(checkout: &Path, pending: &Pending, replace: bool) -> Result<(), String
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
         let mut file = options.open(&draft)?;
         file.write_all(&bytes)?;

@@ -93,14 +93,7 @@ pub fn sources_under(
         }
     };
     if let Some(managed) = managed {
-        file(managed.join(MANAGED_FILE), &mut out);
-        match drop_ins(&managed.join(DROP_INS)) {
-            Ok(paths) => paths.into_iter().for_each(|p| file(p, &mut out)),
-            Err(why) => out.push(Source {
-                name: managed.join(DROP_INS).display().to_string(),
-                text: Err(why),
-            }),
-        }
+        out.extend(managed_sources(managed, fence));
     }
     let argv = worker.argv();
     for value in flag_values(argv, "--settings") {
@@ -157,6 +150,24 @@ pub fn sources_under(
     out
 }
 
+/// The managed documents of the folder `managed`: its [`MANAGED_FILE`], then each drop-in of its
+/// [`DROP_INS`] (a drop-in folder that cannot be listed is a source that cannot be read).
+fn managed_sources(managed: &Path, fence: Option<&Path>) -> Vec<Source> {
+    let file = |path: PathBuf| Source {
+        text: read_settings_in(fence, &path),
+        name: path.display().to_string(),
+    };
+    let mut out = vec![file(managed.join(MANAGED_FILE))];
+    match drop_ins(&managed.join(DROP_INS)) {
+        Ok(paths) => out.extend(paths.into_iter().map(file)),
+        Err(why) => out.push(Source {
+            name: managed.join(DROP_INS).display().to_string(),
+            text: Err(why),
+        }),
+    }
+    out
+}
+
 /// Claude Code's managed preference domains for `worker`, in `dir`.
 #[must_use]
 pub fn managed_preferences(worker: &WorkerEnv, dir: &Path) -> Vec<Source> {
@@ -173,6 +184,14 @@ pub fn managed_preferences(worker: &WorkerEnv, dir: &Path) -> Vec<Source> {
             text: Err("are a managed preference domain this reader does not parse".to_string()),
         })
         .collect()
+}
+
+/// Whether `argv` sets `flag`, alone or as `flag=value`, before a `--`.
+fn flag_set(argv: &[String], flag: &str) -> bool {
+    argv.iter()
+        .map(String::as_str)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == flag || arg.strip_prefix(flag).is_some_and(|r| r.starts_with('=')))
 }
 
 /// Each value `argv` gives `flag`, as `flag value` or `flag=value`, in order.
@@ -221,6 +240,181 @@ pub(crate) fn parsed(
             (s.name, value)
         })
         .collect()
+}
+
+/// The server-managed settings Claude Code keeps in its configuration directory (2.1.316:
+/// `remote-settings.json` beside the user's `settings.json`), which may pin the sign-in method.
+const REMOTE_SETTINGS: &str = "remote-settings.json";
+
+/// The variable that names another managed settings folder, and the one that names another
+/// server-managed copy, in Claude Code's own environment list. Claude Code 2.1.316's public build
+/// compiles both overrides out (its folder's getter and its copy's answer nothing), so it reads
+/// [`MANAGED_DIR`] and [`REMOTE_SETTINGS`]; the pin reader reads what they name as well, on the
+/// safe side (the post-landing review, 2026-11-02): a build that honours them pins there too.
+const PIN_PATH_VARS: [(&str, bool); 2] = [
+    ("CLAUDE_CODE_MANAGED_SETTINGS_PATH", true),
+    ("CLAUDE_CODE_REMOTE_SETTINGS_PATH", false),
+];
+
+/// The flags that start, or attach to, a cloud session (2.1.316: `--cloud`, its deprecated
+/// alias `--remote`, `--teleport`, `--attach-serve`): its `/login` is claude.ai's alone and opens
+/// the browser at once, whatever the settings say.
+const CLOUD_FLAGS: [&str; 4] = ["--cloud", "--remote", "--teleport", "--attach-serve"];
+
+/// The keys that name a policy helper: an executable that computes managed settings at startup,
+/// whose output may pin the sign-in method (2.1.316: `forceLoginMethod` from its output, beside
+/// the static documents'). The pin reader runs no executable, so a document that names one is
+/// read as [`super::login::LoginPin::Unread`] unless a static document pins a method.
+const POLICY_HELPER_KEYS: [&str; 2] = ["policyHelper", "policyHelpers"];
+
+/// WHAT THE AGENT'S SETTINGS MAKE OF `/login` ([`super::login::LoginPin`]): every document of the
+/// chain [`sources_under`] reads, its managed preference domains ([`managed_preferences`]) and its
+/// server-managed copy ([`REMOTE_SETTINGS`], in the configuration directory
+/// [`WorkerEnv::claude_dir`] names, `CLAUDE_CONFIG_DIR` included), and what the agent's
+/// environment names in their place ([`PIN_PATH_VARS`]), read by [`login_pin`]; an agent started
+/// on a cloud session ([`CLOUD_FLAGS`]) is [`super::login::LoginPin::Method`] whatever they say.
+#[must_use]
+pub fn login_pin_under(
+    worker: &WorkerEnv,
+    launch: &Path,
+    managed: Option<&Path>,
+    prefs: &Path,
+    fence: Option<&Path>,
+) -> super::login::LoginPin {
+    if CLOUD_FLAGS.iter().any(|flag| flag_set(worker.argv(), flag)) {
+        return super::login::LoginPin::Method;
+    }
+    let mut all = sources_under(worker, launch, managed, fence);
+    all.extend(managed_preferences(worker, prefs));
+    let remote = match worker.claude_dir(launch) {
+        Ok(dir) if dir.is_absolute() => {
+            let path = dir.join(REMOTE_SETTINGS);
+            Source {
+                name: path.display().to_string(),
+                text: read_settings_in(fence, &path),
+            }
+        }
+        Ok(_) | Err(_) => Source {
+            name: format!("the user's {REMOTE_SETTINGS}"),
+            text: Err("cannot be found".to_string()),
+        },
+    };
+    all.push(remote);
+    for (var, folder) in PIN_PATH_VARS {
+        let Some(named) = worker.var(var).filter(|v| !v.trim().is_empty()) else {
+            continue;
+        };
+        let path = Path::new(named);
+        if !path.is_absolute() {
+            all.push(Source {
+                name: format!("{var}={named}"),
+                text: Err("is not an absolute path".to_string()),
+            });
+        } else if folder {
+            all.extend(managed_sources(path, fence));
+        } else {
+            all.push(Source {
+                name: path.display().to_string(),
+                text: read_settings_in(fence, path),
+            });
+        }
+    }
+    login_pin(&all)
+}
+
+/// THE PIN `sources` PUT ON `/login` ([`super::login::LoginPin`]), on the safe side: a
+/// `forceLoginMethod` that names a method anywhere in any document (`claudeai`, `console`, or a
+/// word this build does not know) is [`super::login::LoginPin::Method`], whatever source wins in
+/// Claude Code's own merge; else a gateway anywhere (`forceLoginGatewayUrl` set, or
+/// `forceLoginMethod` `gateway`) is [`super::login::LoginPin::Gateway`]; else a source that is
+/// there and cannot be read or parsed (a managed preference domain, which this reader does not
+/// parse, included), or that names a policy helper whose output it cannot read
+/// ([`POLICY_HELPER_KEYS`]), is [`super::login::LoginPin::Unread`]. Each document is read whole, nested
+/// objects too, since the server-managed copy's shape is Claude Code's own. A missing document
+/// pins nothing. The cost of the safe side is one `/login` the person types where aterm could
+/// have; never a browser brought forward by aterm's key.
+#[must_use]
+pub fn login_pin(sources: &[Source]) -> super::login::LoginPin {
+    use super::login::LoginPin;
+    let (mut gateway, mut unread) = (false, false);
+    for source in sources {
+        let value = match &source.text {
+            Ok(None) => continue,
+            Ok(Some(text)) => match parse(text) {
+                Ok(value) => value,
+                Err(_) => {
+                    unread = true;
+                    continue;
+                }
+            },
+            Err(_) => {
+                unread = true;
+                continue;
+            }
+        };
+        match pin_in(&value) {
+            LoginPin::Method => return LoginPin::Method,
+            LoginPin::Gateway => gateway = true,
+            LoginPin::Picker | LoginPin::Unread => {}
+        }
+        if let Value::Object(map) = &value
+            && POLICY_HELPER_KEYS
+                .iter()
+                .any(|key| map.get(*key).is_some_and(|v| !v.is_null()))
+        {
+            unread = true;
+        }
+    }
+    if gateway {
+        LoginPin::Gateway
+    } else if unread {
+        LoginPin::Unread
+    } else {
+        LoginPin::Picker
+    }
+}
+
+/// The pin one parsed document holds ([`login_pin`]), its nested objects read too.
+fn pin_in(value: &Value) -> super::login::LoginPin {
+    use super::login::LoginPin;
+    match value {
+        Value::Object(map) => {
+            let mut found = LoginPin::Picker;
+            match map.get("forceLoginMethod") {
+                Some(Value::String(word)) if word.trim() == "gateway" => {
+                    found = LoginPin::Gateway;
+                }
+                Some(Value::String(word)) if !word.trim().is_empty() => return LoginPin::Method,
+                _ => {}
+            }
+            if map
+                .get("forceLoginGatewayUrl")
+                .is_some_and(|url| !url.is_null())
+            {
+                found = LoginPin::Gateway;
+            }
+            for nested in map.values() {
+                match pin_in(nested) {
+                    LoginPin::Method => return LoginPin::Method,
+                    LoginPin::Gateway => found = LoginPin::Gateway,
+                    LoginPin::Picker | LoginPin::Unread => {}
+                }
+            }
+            found
+        }
+        Value::Array(items) => {
+            let mut found = LoginPin::Picker;
+            for item in items {
+                match pin_in(item) {
+                    LoginPin::Method => return LoginPin::Method,
+                    LoginPin::Gateway => found = LoginPin::Gateway,
+                    LoginPin::Picker | LoginPin::Unread => {}
+                }
+            }
+            found
+        }
+        _ => LoginPin::Picker,
+    }
 }
 
 /// A settings document's text as Claude Code's settings loader reads it.
@@ -434,8 +628,12 @@ fn drop_ins(dir: &Path) -> Result<Vec<PathBuf>, String> {
     };
     let mut out: Vec<PathBuf> = entries
         .filter_map(Result::ok)
+        .filter(|e| {
+            Path::new(&e.file_name())
+                .extension()
+                .is_some_and(|x| x == "json")
+        })
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .collect();
     if out.len() > MAX_DROP_INS {
         return Err(format!("hold more than {MAX_DROP_INS} documents"));

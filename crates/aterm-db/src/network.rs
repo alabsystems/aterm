@@ -88,6 +88,20 @@ impl Repair {
 }
 type Repairs = Mutex<BTreeMap<Actor, Repair>>;
 
+/// Retry `attempt` while another local command holds the database. Each holds it for one edit or
+/// exchange, so a command waits its turn rather than failing beside a neighbour.
+pub(crate) fn while_busy<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let deadline = Instant::now() + WITHIN;
+    loop {
+        match attempt() {
+            Err(error) if error.is_busy() && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 pub(crate) struct Deadline {
     done: mpsc::Sender<Instant>,
     join: Option<thread::JoinHandle<()>>,
@@ -231,7 +245,7 @@ fn send_operations(
 ) -> Result<(usize, usize)> {
     repair.deferred.retain(|id| !remote.contains(id));
     let records = {
-        let db = Database::open(dir)?;
+        let db = while_busy(|| Database::open(dir))?;
         let cursor = repair.cursor;
         // Sweep past deferred prefixes even when retry hints expired. A peer
         // returning infrequently must not offer the same rejected page forever.
@@ -295,11 +309,14 @@ fn receive_operations(stream: &mut (impl Read + Write), dir: &Path) -> Result<(u
         let wire = receive_frame(stream, MAX_OPERATION)?;
         let id = aterm_digest::Sha256::digest(&wire);
         // All bytes arrive before taking the writer lock. A silent or slow peer
-        // can consume a connection slot but cannot hold up a local edit.
-        let retained = Database::open(dir).and_then(|mut db| {
-            let fresh = db.ingest(&wire)?;
-            let refused = db.history.refusals().any(|(retained, _)| retained == &id);
-            Ok((fresh, refused))
+        // can consume a connection slot but cannot hold up a local edit. A neighbour's
+        // turn at the lock is no reason to defer: the peer would not offer it again for a while.
+        let retained = while_busy(|| {
+            Database::open(dir).and_then(|mut db| {
+                let fresh = db.ingest(&wire)?;
+                let refused = db.history.refusals().any(|(retained, _)| retained == &id);
+                Ok((fresh, refused))
+            })
         });
         let verdict = match retained {
             Ok((fresh, refused)) => {
@@ -316,6 +333,15 @@ fn receive_operations(stream: &mut (impl Read + Write), dir: &Path) -> Result<(u
         stream.flush()?;
     }
     Ok((received, deferred))
+}
+/// How many of the peer's operations this replica still does not hold. A peer stops offering one
+/// it was refused for its retry window, so a round in which it offers nothing proves nothing.
+pub(crate) fn unretained(dir: &Path, remote: &BTreeSet<Digest>) -> Result<usize> {
+    let db = while_busy(|| Database::open(dir))?;
+    Ok(remote
+        .iter()
+        .filter(|id| db.history.wire(id).is_none())
+        .count())
 }
 
 /// Receive one connection with native link evidence. No journal lock is held
@@ -354,6 +380,7 @@ fn server_exchange(
     stream: &mut (impl Read + Write),
     repairs: &Repairs,
 ) -> Result<Report> {
+    crate::fleet_db::refuse_unfinished(dir)?;
     let capability = receive_frame(stream, 256)?;
     let actor = authenticate(credentials, peer, &capability)?;
     let mut repair = repairs
@@ -365,7 +392,7 @@ fn server_exchange(
     repair.prepare(actor);
     send_frame(stream, credentials.capability.bytes())?;
     let remote = receive_inventory(stream)?;
-    let local = Database::open(dir)?
+    let local = while_busy(|| Database::open(dir))?
         .history
         .index
         .inventory()
@@ -391,6 +418,7 @@ pub fn sync_round(dir: &Path, peer: SocketAddr) -> Result<Report> {
 /// Continue repair past a peer's temporary deferrals without claiming they synced.
 pub fn sync_round_with(dir: &Path, peer: SocketAddr, repair: &mut Repair) -> Result<Report> {
     let credentials = Credentials::load(dir)?;
+    crate::fleet_db::refuse_unfinished(dir)?;
     let (secret, identity) = transport(&credentials)?;
     let (tcp, locality) =
         Connection::connect(peer, scope(peer), Duration::from_secs(3))?.into_parts();
@@ -405,7 +433,7 @@ pub fn sync_round_with(dir: &Path, peer: SocketAddr, repair: &mut Repair) -> Res
     let capability = receive_frame(stream, 256)?;
     let actor = authenticate(&credentials, dialed.peer.as_ref(), &capability)?;
     repair.prepare(actor);
-    let local = Database::open(dir)?
+    let local = while_busy(|| Database::open(dir))?
         .history
         .index
         .inventory()
@@ -419,7 +447,7 @@ pub fn sync_round_with(dir: &Path, peer: SocketAddr, repair: &mut Repair) -> Res
     Ok(Report {
         sent,
         received,
-        deferred: incoming_deferred + outgoing_deferred,
+        deferred: incoming_deferred.max(unretained(dir, &remote)?) + outgoing_deferred,
     })
 }
 fn scope(address: SocketAddr) -> Scope {
@@ -498,6 +526,120 @@ pub fn serve_until(
         },
         &running,
         HANDSHAKE,
+        move |served, _| {
+            let peer = served.peer_node().cloned();
+            let credentials = Credentials::load(&dir).map_err(std::io::Error::other)?;
+            served
+                .answer(|stream| {
+                    server_exchange(&dir, &credentials, peer.as_ref(), stream, &repairs)
+                        .map_err(std::io::Error::other)
+                })
+                .map(|_| ())
+        },
+        move |event| {
+            if let fleet::FleetEvent::Stopped(reason) = event {
+                *error.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
+            }
+        },
+    );
+    running.store(false, Ordering::Release);
+    let _ = outbound.join();
+    let error = stopped.lock().unwrap_or_else(|p| p.into_inner()).take();
+    error.map_or(Ok(()), |reason| Err(Error::new(&reason)))
+}
+
+/// Exchange one bounded round with a fleet peer over exporter-bound TLS (`FleetOp::Database`),
+/// allowing normal OS routing across multi-homed fleet interfaces.
+pub fn sync_fleet_round_with(dir: &Path, peer: SocketAddr, repair: &mut Repair) -> Result<Report> {
+    let credentials = Credentials::load(dir)?;
+    crate::fleet_db::refuse_unfinished(dir)?;
+    let (secret, identity) = transport(&credentials)?;
+    let tcp = aterm_uds::connect_tcp(&peer, Duration::from_secs(3))?;
+    let _deadline = Deadline::arm(&tcp)?;
+    let mut dialed =
+        fleet::client_handshake_as(tcp, &secret, Some(&identity), FleetOp::Database, WITHIN)
+            .map_err(|_| Error::new("database TLS peer authentication failed"))?;
+    let stream = dialed.transport.stream();
+    send_frame(stream, credentials.capability.bytes())?;
+    let capability = receive_frame(stream, 256)?;
+    let actor = authenticate(&credentials, dialed.peer.as_ref(), &capability)?;
+    repair.prepare(actor);
+    let local = while_busy(|| Database::open(dir))?
+        .history
+        .index
+        .inventory()
+        .copied()
+        .collect();
+    send_inventory(stream, &local)?;
+    let remote = receive_inventory(stream)?;
+    let (sent, outgoing_deferred) = send_operations(stream, dir, &remote, repair)?;
+    let (received, incoming_deferred) = receive_operations(stream, dir)?;
+    Ok(Report {
+        sent,
+        received,
+        deferred: incoming_deferred.max(unretained(dir, &remote)?) + outgoing_deferred,
+    })
+}
+
+/// Serve the fleet database over a standard `TcpListener` (supporting `0.0.0.0:7485` and
+/// dual-homed fleet Macs) with full `FleetOp::Database` TLS and capability authentication.
+pub fn serve_fleet_until(
+    dir: &Path,
+    listener: std::net::TcpListener,
+    running: Arc<AtomicBool>,
+    peers: Arc<Mutex<Vec<SocketAddr>>>,
+) -> Result<()> {
+    let credentials = Credentials::load(dir)?;
+    let (secret, identity) = transport(&credentials)?;
+    let outbound = {
+        let dir = dir.to_path_buf();
+        let running = running.clone();
+        thread::Builder::new()
+            .name("db-fleet-anti-entropy".into())
+            .spawn(move || {
+                let mut repairs = BTreeMap::new();
+                while running.load(Ordering::Acquire) {
+                    let peers = peers.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    for peer in &peers {
+                        if !running.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let mut repair = repairs.remove(peer).unwrap_or_default();
+                        let _ = sync_fleet_round_with(&dir, *peer, &mut repair);
+                        if repairs.len() >= 64 {
+                            repairs.pop_first();
+                        }
+                        repairs.insert(*peer, repair);
+                    }
+                    let jitter = crate::crypto::random::<1>().map_or(0, |b| u64::from(b[0]));
+                    for _ in 0..(10 + jitter / 40) {
+                        if !running.load(Ordering::Acquire) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            })?
+    };
+    let stopped = Arc::new(Mutex::new(None));
+    let error = stopped.clone();
+    let dir = dir.to_path_buf();
+    let repairs = Arc::new(Mutex::new(BTreeMap::new()));
+    let listening = fleet::Listening {
+        secret,
+        scope: FleetScope::Facts,
+        node: Some(identity),
+        serves: &[FleetOp::Database],
+        slots: 16,
+        per_source: 4,
+        lifetime: WITHIN,
+    };
+    const SERVED_OPS: &[FleetOp] = &[FleetOp::Database];
+    fleet::serve_offering(
+        &listener,
+        &listening,
+        Arc::new(|| (FleetScope::Facts, SERVED_OPS)),
+        &running,
         move |served, _| {
             let peer = served.peer_node().cloned();
             let credentials = Credentials::load(&dir).map_err(std::io::Error::other)?;

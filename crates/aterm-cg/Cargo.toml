@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's CoreGraphics declarations (active displays, bounds, modes; CGImage layout reads) for the windowing backend and the GUI's window capture, held to the SDK headers."
+description = "aterm's CoreGraphics declarations (active displays, bounds, modes; CGImage layout reads; a native event's source process) for the windowing backend and the GUI's window capture, held to the SDK headers."
 
 # ZERO third-party dependencies, like aterm-objc, which it builds on. Its own
 # crate rather than a feature of aterm-objc: CoreGraphics is a GUI framework

@@ -390,45 +390,84 @@ fn the_claim_task_is_one_guarded_string() {
         "never start a paid trial",
         "never sign in with or create new credentials",
         "Never ask a question.",
-        "or the Chrome tools are not available, stop",
+        "If the page asks for any of that, stop.",
     ] {
         assert!(task.contains(guard), "{guard}: {task}");
     }
+    // A BROWSER NOT CONNECTED YET IS WAITED FOR, never a stop (the owner, 2026-11-04: a worker
+    // that stopped because the Chrome tools were missing was the blocking message to end).
+    assert!(
+        !task.contains("Chrome tools are not available"),
+        "no stop on missing tools: {task}"
+    );
+    // IT TRIES AGAIN WITH THE TOOLS IT HAS: it has no command to wait with (`CLAIM_TOOLS`), so
+    // the task names no wait, only its tries of the Chrome tools.
+    assert!(
+        task.contains(&format!(
+            "call them again, up to {CLAIM_CONNECT_TRIES} times in all"
+        )) && !task.contains("sleep")
+            && !task.contains("Bash"),
+        "{task}"
+    );
     assert!(
         task.ends_with(
-            "End with one reply starting `Nothing left:` that says CLAIMED: <what was claimed> \
-             or NOT CLAIMED: <why>, and no NEEDS YOU line: the person reads your reply in this \
-             tab."
+            "If you claimed it, end with one reply starting `Nothing left: CLAIMED: <what was \
+             claimed>`. If you did not, end with one reply whose first line is `Could not \
+             finish: NOT CLAIMED: <why>`, with no `Nothing left:` line. Write no NEEDS YOU \
+             line: the person reads your reply in this tab."
         ),
         "{task}"
     );
     assert!(!task.contains('\n'), "one line");
 }
 
-/// THE CLAIM TASK'S LAST REPLY LANDS AUTOPILOT LAND: each reply the task asks for, claimed or
-/// not and whatever the common reasons, is a clean defense to Land's own reader
-/// ([`crate::supervise::policy::turn_end::clean_defense`]), so Land types nothing more. CONTROL:
-/// the task's old last line (no `Nothing left:`) and a defense with a NEEDS YOU line hold Land.
+/// THE CLAIM TASK'S LAST REPLY CONCLUDES AUTOPILOT LAND EITHER WAY. A claim is a clean defense
+/// to Land's own reader ([`crate::supervise::policy::turn_end::clean_defense`]), which Land's
+/// check lands, and no worker's word that it could not finish. No claim is the worker's own
+/// `Could not finish:` ([`crate::supervise::policy::needs::could_not_finish`]), which a managed
+/// Land worker concludes as failed at once, its why the reply's, and no defense. CONTROLS: the
+/// task's old `Nothing left: NOT CLAIMED:` ending is a defense and no such word; a `Could not
+/// finish:` under a `Nothing left:` line, or past the first line, concludes nothing; a defense
+/// with a NEEDS YOU line holds Land.
 #[test]
-fn the_claim_tasks_last_reply_lands_autopilot_land() {
+fn the_claim_tasks_last_reply_concludes_autopilot_land() {
+    use crate::supervise::policy::needs::could_not_finish;
     use crate::supervise::policy::turn_end::clean_defense;
     for reply in [
         "Nothing left: CLAIMED: the $250 cloud session credit for this account.",
         "Nothing left: CLAIMED: Claim your $250 cloud session credit. The page confirmed it.",
         "Nothing left: CLAIMED: the Max plan API credits.",
-        "Nothing left: NOT CLAIMED: the page asks for payment details.",
-        "Nothing left: NOT CLAIMED: the Chrome tools are not available.",
-        "Nothing left: NOT CLAIMED: the page says this credit was already claimed.",
-        "Nothing left: NOT CLAIMED: the page asks to start a paid trial.",
-        "Nothing left: NOT CLAIMED: aterm declined the action on the page.",
     ] {
         assert!(clean_defense(Some(reply)), "{reply}");
+        assert_eq!(could_not_finish(reply), None, "{reply}");
+    }
+    for why in [
+        "NOT CLAIMED: the page asks for payment details.",
+        "NOT CLAIMED: the Claude in Chrome extension stayed unconnected for 20 minutes.",
+        "NOT CLAIMED: the page says this credit was already claimed.",
+        "NOT CLAIMED: the page asks to start a paid trial.",
+        "NOT CLAIMED: aterm declined the action on the page.",
+    ] {
+        let reply = format!("Could not finish: {why}");
+        assert_eq!(could_not_finish(&reply), Some(why), "{reply}");
+        assert!(!clean_defense(Some(&reply)), "{reply}");
+        let explained = format!("{reply}\nI opened the claim page twice; it never loaded.");
+        assert_eq!(could_not_finish(&explained), Some(why), "{explained}");
+    }
+    for held in [
+        "Nothing left: NOT CLAIMED: the page asks for payment details.",
+        "Nothing left: Could not finish: NOT CLAIMED: the page asks for payment details.",
+        "Could not finish: NOT CLAIMED: the page asks for payment details.\nNothing left: \
+         nothing to land.",
+        "The page did not load.\nCould not finish: NOT CLAIMED: the page did not load.",
+    ] {
+        assert_eq!(could_not_finish(held), None, "{held}");
     }
     for held in [
         "NOT CLAIMED: the page asks for payment details.",
         "CLAIMED: the $250 cloud session credit.",
-        "Nothing left: NOT CLAIMED: the page asks for payment details.\nNEEDS YOU: add a payment \
-         method on claude.ai.",
+        "Nothing left: CLAIMED: the $250 cloud session credit.\nNEEDS YOU: add a payment method \
+         on claude.ai.",
     ] {
         assert!(!clean_defense(Some(held)), "{held}");
     }
@@ -545,4 +584,57 @@ fn duplicate_org_status_keys_take_the_last_json_entry() {
     }"#;
     let found = parse(reversed.as_bytes()).expect("valid JSON");
     assert_eq!(found.len(), 1, "{found:?}");
+}
+
+/// A CLAIM WORKER'S SETTINGS DOCUMENT IS `autoMode` ALONE, with [`CLAIM_ENVIRONMENT`] and each of
+/// [`CLAIM_HARD_DENY`] as auto mode's classifier reads them (the shape 2.1.318's request carried
+/// in the real-Claude lab), and the rules name every act [`claim_task`] forbids. No rule needs a
+/// shell quote of its own, and the document leaves room on a worker's line. CONTROL: the
+/// classifier's other lists (`allow`, `soft_deny`) are absent, so the document loosens nothing.
+#[test]
+fn a_claim_workers_settings_are_auto_modes_hard_rules_alone() {
+    let doc = claim_settings();
+    let value: Value = aterm_json::from_str(doc).expect("a JSON object");
+    let object = value.as_object().expect("an object");
+    assert_eq!(object.keys().collect::<Vec<_>>(), ["autoMode"], "{doc}");
+    let auto = value["autoMode"]
+        .as_object()
+        .expect("autoMode is an object");
+    let mut keys: Vec<&String> = auto.keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["environment", "hard_deny"],
+        "CONTROL: nothing allowed: {doc}"
+    );
+    let list = |key: &str| -> Vec<String> {
+        value["autoMode"][key]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|rule| rule.as_str().expect("a string").to_owned())
+            .collect()
+    };
+    assert_eq!(list("environment"), CLAIM_ENVIRONMENT, "{doc}");
+    assert_eq!(list("hard_deny"), CLAIM_HARD_DENY, "{doc}");
+    let rules = CLAIM_HARD_DENY.join(" ").to_lowercase();
+    for act in [
+        "billing",
+        "plan",
+        "usage",
+        "payment",
+        "spend",
+        "buying",
+        "extra usage",
+        "trial",
+        "signing in",
+        "credential",
+    ] {
+        assert!(rules.contains(act), "{act}: {rules}");
+    }
+    for rule in CLAIM_ENVIRONMENT.iter().chain(CLAIM_HARD_DENY) {
+        assert!(!rule.contains(['\'', '\\', '"']), "{rule}");
+    }
+    assert!(doc.len() < 500, "{} bytes: {doc}", doc.len());
+    assert!(std::ptr::eq(doc, claim_settings()), "made once");
 }

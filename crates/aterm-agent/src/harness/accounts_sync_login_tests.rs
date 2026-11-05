@@ -32,9 +32,10 @@ impl Desk {
         let (home, config) = (root.join("home"), root.join("config"));
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&config).unwrap();
-        fs::write(
-            config.join("aterm.toml"),
-            format!("[fleet]\nmachine = \"{machine}\"\n"),
+        aterm_uds::atomic_file::write(
+            &config.join("aterm.toml"),
+            format!("[fleet]\nmachine = \"{machine}\"\n").as_bytes(),
+            0o600,
         )
         .unwrap();
         Self {
@@ -189,9 +190,11 @@ fn displaced(store: &accounts::Store) -> Vec<accounts::Event> {
 
 /// m2's afternoon: m2-2 held the default login and was pinned; the person's `/login` signed
 /// the default login in as m2's account, writing over m2-2's one login. m2 is the default row
-/// now, and m2-2 is signed out, unpinned, no longer served, one `displaced` event on record and
-/// first in line for the sign-in ladder. CONTROLS: a sync whose default login is the same
-/// account writes no event, before the move and after it.
+/// now, and m2-2 is signed out, unpinned, no longer served and one `displaced` event on record.
+/// No session here runs on it, so the sign-in ladder leaves it for a person or a session
+/// (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4); once a session here runs on it, it is
+/// the ladder's. CONTROLS: a sync whose default login is the same account writes no event,
+/// before the move and after it.
 #[test]
 fn a_moved_default_login_leaves_the_row_it_wrote_over_signed_out_and_next_to_sign_in() {
     let desk = Desk::new("m2");
@@ -244,19 +247,57 @@ fn a_moved_default_login_leaves_the_row_it_wrote_over_signed_out_and_next_to_sig
     );
     let next = auto_renew_candidates(&moved, &state, &logins, NOW + 60);
     assert!(
+        next.iter().all(|row| row.label != "m2-2"),
+        "no session here runs on the row written over: {next:?}"
+    );
+    let mut running = state.clone();
+    let _ = accounts::note_session(&mut running, "s-tab", "m2-2", None, NOW + 60);
+    let next = auto_renew_candidates(&moved, &running, &logins, NOW + 60);
+    assert!(
         next.iter().any(|row| row.label == "m2-2"),
-        "the row written over is signed in by the ladder: {next:?}"
+        "a session here runs on the row written over: {next:?}"
     );
 
     sync(&desk, &fleet, "m2", "fb@example.test", NOW + 90);
     assert_eq!(displaced(&store).len(), 1, "CONTROL: one event per move");
 }
 
+/// A row written over reads signed out whatever its own directory holds: a footprint there is no
+/// login (`accounts::login_made`), and its next sign-in says otherwise.
+#[test]
+fn a_row_written_over_reads_signed_out_whatever_its_own_directory_holds() {
+    for footprint in [false, true] {
+        let desk = Desk::new("m2");
+        let store = desk.store();
+        let fleet = fleet_of(&[
+            ("m2", "m2", "fb@example.test"),
+            ("m2-2", "m2", "proton.m2@example.test"),
+        ]);
+        sync(&desk, &fleet, "m2", "proton.m2@example.test", NOW);
+        if footprint {
+            let dir = store.logins_dir().join("m2-2");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".claude.json"), "{}").unwrap();
+        }
+        let moved = sync(&desk, &fleet, "m2", "fb@example.test", NOW + 60);
+        let row = moved.row("m2-2").unwrap();
+        assert!(row.dir.is_some());
+        assert_eq!(displaced(&store).len(), 1, "footprint={footprint}");
+        let (state, _) = store.load(NOW + 60).unwrap();
+        assert_eq!(
+            accounts::condition(row, &state, true, NOW + 60),
+            accounts::Condition::SignedOut,
+            "footprint={footprint}"
+        );
+    }
+}
+
 /// m2's morning (2026-10-27): m2-2 was on record as signed out (its own login seen ended) with a
 /// failed automatic sign-in, and the default login held m2; a person's `/login` signed the
 /// default login in as m2-2's account. m2 is displaced, and m2-2 holds a login made now: Ok,
 /// served, not expired, no failed sign-in, no ended login on record, not a candidate of the
-/// sign-in ladder, and the sessions that ran on the default login are its. CONTROLS: m2-2's
+/// sign-in ladder, and the sessions that ran on the default login are its, so no session here
+/// runs on m2 and the ladder leaves it for a person (§4.15 rule 4). CONTROLS: m2-2's
 /// login then seen ended while the default login still names it stays signed out at the next
 /// sync (a login merely still matched is not one made now); a row moved onto the default login
 /// by a relabel of the same account keeps its sign-out.
@@ -349,8 +390,8 @@ fn a_default_login_moved_onto_a_signed_out_row_makes_that_rows_login_now() {
         "the ladder does not sign in a login made now: {next:?}"
     );
     assert!(
-        next.iter().any(|row| row.label == "m2"),
-        "the row written over is the ladder's: {next:?}"
+        next.iter().all(|row| row.label != "m2"),
+        "the sessions on the row written over moved with the default login: {next:?}"
     );
     assert_eq!(state.sessions["s-tab-1"].account, "m2-2");
     assert_eq!(state.sessions["s-tab-2"].account, "m2-2");

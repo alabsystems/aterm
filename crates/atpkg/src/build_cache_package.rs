@@ -508,6 +508,7 @@ fn footprint(root: &Path) -> Option<u64> {
     let mut stack = vec![root.to_path_buf()];
     let mut bytes = 0u64;
     while let Some(path) = stack.pop() {
+        aterm_uds::progress::tick();
         let info = std::fs::symlink_metadata(&path).ok()?;
         if info.uid() != uid || info.dev() != root_id.device {
             return None;
@@ -1167,8 +1168,7 @@ fn settled_with(
 #[cfg(unix)]
 fn executable_stamp(path: &Path) -> Option<[u64; 6]> {
     use std::os::unix::fs::MetadataExt as _;
-    let file = crate::metadata_io::open_regular(path).ok()?;
-    let info = file.metadata().ok()?;
+    let (_, info) = crate::metadata_io::open_regular_with_meta(path).ok()?;
     (info.mode() & 0o111 != 0 && info.mode() & 0o022 == 0).then_some([
         info.dev(),
         info.ino(),

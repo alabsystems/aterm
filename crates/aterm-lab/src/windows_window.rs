@@ -2123,7 +2123,7 @@ pub fn cmd_window(args: &[String]) -> Res {
     } else {
         "window.txt"
     });
-    let _ = std::fs::write(&path, &report);
+    let _ = crate::util::write_fresh(&path, &report);
     println!(
         "windows: {} rows, {failed} failed, {:.0} s, tree {tree}; report {}",
         rows.len(),
@@ -2136,7 +2136,7 @@ pub fn cmd_window(args: &[String]) -> Res {
 /// Copy [`desk::HELPER`] to [`desk::HELPER_PATH`] in the guest.
 pub(crate) fn put_helper(up: &Up) -> Result<(), String> {
     let helper = up.layout.run().join("desk.ps1");
-    let put = std::fs::write(&helper, desk::HELPER)
+    let put = crate::util::write_fresh(&helper, desk::HELPER)
         .map_err(|e| e.to_string())
         .and_then(|()| {
             let made = up

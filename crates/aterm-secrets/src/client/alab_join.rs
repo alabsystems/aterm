@@ -256,6 +256,7 @@ mod tests {
         std::fs::write(&settings, "[swarm]\nenabled = true\n").unwrap();
         let chosen = Config {
             source: Source::Path(root.path().join("personal.vault")),
+            mirrors: Vec::new(),
             name: "personal".into(),
             signer: None,
             followed: Vec::new(),

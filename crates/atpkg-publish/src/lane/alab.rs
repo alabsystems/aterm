@@ -485,10 +485,9 @@ fn locked(
     if !opts.dry_run {
         state.clear_head_failures();
     }
-    state.check_index(n)?;
+    let seen = state.check_index(n)?;
     tx.say(format!(
-        "channel index head: atpkg-index-{n} (last processed: {})",
-        state.index_seen()?
+        "channel index head: atpkg-index-{n} (last processed: {seen})"
     ));
     let channel = head.index.channels.first().cloned().ok_or_else(|| {
         Error::refused(format!(
@@ -877,11 +876,18 @@ fn horizon_note(ctx: &Ctx, head: &VerifiedQuad) -> Result<Option<String>> {
     }))
 }
 
+enum CachedLedger {
+    Missing,
+    Invalid(String),
+    Parsed(aterm_json::Value),
+}
+
 struct Clones<'a> {
     ctx: &'a Ctx,
     dir: PathBuf,
     dry_run: bool,
     seen: BTreeMap<String, std::result::Result<PathBuf, String>>,
+    ledger: Option<CachedLedger>,
 }
 
 impl<'a> Clones<'a> {
@@ -891,7 +897,21 @@ impl<'a> Clones<'a> {
             dir: state.dir.join("progs"),
             dry_run,
             seen: BTreeMap::new(),
+            ledger: None,
         }
+    }
+
+    fn ledger(&mut self, path: &Path) -> &CachedLedger {
+        let ctx = self.ctx;
+        self.ledger.get_or_insert_with(|| {
+            let Ok(text) = crate::identity::read_regular_text(path, SUMS_CAP) else {
+                return CachedLedger::Missing;
+            };
+            match aterm_json::from_str(&text) {
+                Ok(v) => CachedLedger::Parsed(v),
+                Err(e) => CachedLedger::Invalid(format!("{} does not parse: {e}", ctx.shown(path))),
+            }
+        })
     }
 
     fn of(&mut self, def: &ProgramDef) -> std::result::Result<PathBuf, String> {
@@ -1023,8 +1043,15 @@ fn signed_release(
         why,
     };
     let clone = clones.of(def).map_err(unresolved)?;
-    let dev_commit =
-        resolve_dev(ctx, &opts.ledger, def.repo, &public_commit, &clone).map_err(unresolved)?;
+    let dev_commit = resolve_dev(
+        ctx,
+        &opts.ledger,
+        clones.ledger(&opts.ledger),
+        def.repo,
+        &public_commit,
+        &clone,
+    )
+    .map_err(unresolved)?;
     let build = crate::git::rev_count(&clone, &dev_commit).map_err(|e| ReleaseGap::Unresolved {
         tag: tag.clone(),
         why: e.to_string(),
@@ -1089,32 +1116,13 @@ fn signed_commit(
                 .map_err(|e| format!("read {f}: {e}"))?,
         );
     }
-    let [_, _, roster_file, roster_sig_file] = quad::QUAD_FILES;
-    let roster = crate::identity::read_regular_bytes(
-        &head.file(roster_file),
-        crate::identity::MAX_META_BYTES,
-    )
-    .map_err(|e| e.to_string())?;
-    let roster_sig = crate::identity::read_regular_bytes(
-        &head.file(roster_sig_file),
-        crate::identity::MAX_META_BYTES,
-    )
-    .map_err(|e| e.to_string())?;
-    let anchor: Vec<&str> = ctx.anchor.iter().map(String::as_str).collect();
-    atpkg_keys::verify_signed(
-        &anchor,
-        roster,
-        &roster_sig,
-        &bytes[0],
-        &bytes[1],
-        ctx.now_unix,
-    )
-    .map_err(|e| format!("SHA256SUMS.sig does not verify under the channel's roster: {e:?}"))?;
+    atpkg_keys::verify_signed_by_roster(&head.roster, &bytes[0], &bytes[1], ctx.now_unix)
+        .map_err(|e| format!("SHA256SUMS.sig does not verify under the channel's roster: {e:?}"))?;
     let text = String::from_utf8_lossy(&bytes[0]);
     let field = |key: &str| {
         text.lines()
             .find_map(|l| l.strip_prefix(key))
-            .map(|v| v.trim().to_string())
+            .map(str::trim)
     };
     let (got_repo, got_tag) = (
         field("# repo: ").unwrap_or_default(),
@@ -1127,25 +1135,29 @@ fn signed_commit(
     }
     field("# commit: ")
         .filter(|c| c.len() == 40 && c.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_owned)
         .ok_or_else(|| "the signed SHA256SUMS names no commit".to_string())
 }
 
 fn resolve_dev(
     ctx: &Ctx,
-    ledger: &Path,
+    ledger_path: &Path,
+    ledger: &CachedLedger,
     repo: &str,
     public_commit: &str,
     clone: &Path,
 ) -> std::result::Result<String, String> {
     let short = &public_commit[..public_commit.len().min(12)];
-    let text = crate::identity::read_regular_text(ledger, SUMS_CAP).map_err(|_| {
-        format!(
-            "no engine ledger at {} to map the signed commit {short} to a dev commit",
-            ctx.shown(ledger)
-        )
-    })?;
-    let value: aterm_json::Value = aterm_json::from_str(&text)
-        .map_err(|e| format!("{} does not parse: {e}", ctx.shown(ledger)))?;
+    let value = match ledger {
+        CachedLedger::Missing => {
+            return Err(format!(
+                "no engine ledger at {} to map the signed commit {short} to a dev commit",
+                ctx.shown(ledger_path)
+            ));
+        }
+        CachedLedger::Invalid(err) => return Err(err.clone()),
+        CachedLedger::Parsed(v) => v,
+    };
     let src = value
         .get("mappings")
         .and_then(|m| m.get(repo))
@@ -1160,13 +1172,13 @@ fn resolve_dev(
             format!(
                 "{} has no {repo} row whose release_rev is the signed commit {short} — `git -C \
                  ~/publication pull --ff-only`, or the promote ran elsewhere",
-                ctx.shown(ledger)
+                ctx.shown(ledger_path)
             )
         })?;
     if src.len() != 40 || !src.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!(
             "{} maps the signed commit {short} to `{src}`, which is not a 40-hex dev commit",
-            ctx.shown(ledger)
+            ctx.shown(ledger_path)
         ));
     }
     crate::git::run(
@@ -1346,7 +1358,7 @@ fn pack(
             ));
         }
         let copy = out.join(format!("merge-base-{name}-{build}.toml"));
-        std::fs::copy(&outcome.manifest, &copy)
+        crate::identity::copy_regular_file(&outcome.manifest, &copy)
             .map_err(|e| format!("copy {}: {e}", outcome.manifest.display()))?;
         base = Some(copy);
         last = Some(outcome.manifest);

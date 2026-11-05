@@ -853,8 +853,8 @@ fn an_empty_composer_is_blank_or_a_placeholder_and_nothing_else() {
     );
     assert_eq!(
         composer_dim_row(&blank, Some((1, 2))),
-        Some(1),
-        "blank: read, as it always was"
+        None,
+        "blank: the rows decide, so no cell is asked"
     );
     let two_rows = rows(&[
         "─────────────────",
@@ -863,6 +863,11 @@ fn an_empty_composer_is_blank_or_a_placeholder_and_nothing_else() {
         "─────────────────",
     ]);
     assert!(!composer_is_empty(&two_rows, Some((1, 2)), true));
+    assert_eq!(
+        composer_dim_row(&two_rows, Some((1, 2))),
+        None,
+        "a blank first row over text: the rows decide"
+    );
     let typing = rows(&["─────────────────", "❯ we'd want", "─────────────────"]);
     assert!(!composer_is_empty(&typing, Some((1, 11)), false));
     assert!(

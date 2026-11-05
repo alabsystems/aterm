@@ -9,14 +9,24 @@ use aterm_spec::interp::State;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
+/// Where the rig's need ids start, apart from its keys (1 and 2), which a told escalation also marks.
+const NEED_BASE: u64 = 1_000;
+
 struct Rig {
     app: crate::App,
     now: Instant,
     next_prime: u64,
     notice: bool,
+    /// The need id the escalation shown stands for: each ObserveNew* a new need, so the told-once
+    /// memory (§14.18) never hides one, and Reobserve and Tick the same.
+    need: u64,
 }
 
 fn escalation(session: u64, key: u64) -> Escalation {
+    escalation_of(session, key, key)
+}
+
+fn escalation_of(session: u64, key: u64, need: u64) -> Escalation {
     Escalation {
         session,
         kind: EscalationKind::Attention,
@@ -26,6 +36,12 @@ fn escalation(session: u64, key: u64) -> Escalation {
         body: "attention".to_string(),
         headline: super::headline(aterm_types::needs::NeedWord::Ask),
         report: None,
+        needs: vec![super::NeedId {
+            id: need,
+            read: super::NeedRead::Whole,
+            body: "attention".to_string(),
+        }],
+        owner_turn: 0,
     }
 }
 
@@ -36,6 +52,7 @@ impl Rig {
             now: Instant::now(),
             next_prime: 1,
             notice: false,
+            need: NEED_BASE,
         }
     }
 
@@ -46,6 +63,7 @@ impl Rig {
         self.now = Instant::now();
         self.next_prime = 1;
         self.notice = false;
+        self.need = NEED_BASE;
     }
 
     fn project(&self) -> State {
@@ -101,11 +119,12 @@ impl Rig {
                 }
                 let label = self.project()["label"] as u64;
                 let key = if action.starts_with("ObserveNew") {
+                    self.need += 1;
                     if label == 1 { 2 } else { 1 }
                 } else {
                     label
                 };
-                let current = (key > 0).then(|| escalation(0, key));
+                let current = (key > 0).then(|| escalation_of(0, key, self.need));
                 let out = self.app.presence.herald.note(
                     0,
                     current.as_ref(),

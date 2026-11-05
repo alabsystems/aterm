@@ -10,6 +10,8 @@ use aterm_types::macos_setup::{Plan, Subject};
 
 mod check;
 pub use check::{check_initial_setup, check_initial_setup_observed};
+mod background_observation;
+pub use background_observation::check_background_workstation;
 mod observation;
 pub use observation::{InitialSetupObservation, InitialSetupObserved};
 mod authorization;
@@ -4395,10 +4397,8 @@ struct Records {
     /// decision ([`save_older_cancel`]): every reader presents every group at Leave as is while
     /// it stands ([`Self::present`]).
     cancelled: Option<Plan>,
-    /// A person pressed for macOS's grants on this Mac ([`note_person_asked_for_access`]): only
-    /// then do the window's access steps put a macOS prompt or page on screen. Automatic setup
-    /// keeps its Permissions group on, reads the grants and finishes without that press. Records
-    /// an older aterm left read as its rule did ([`PersonAccess::Older`]).
+    /// Historical explicit permission request on this Mac. Kept to read older setup records;
+    /// current acquisition follows the admitted Permissions selection automatically.
     person_access: bool,
 }
 
@@ -4817,15 +4817,6 @@ fn older_rule_allows(records: &Records) -> bool {
     steps_of(&older) == PermissionSteps::Allowed
 }
 
-/// Whether macOS's grants are being acquired for this Mac's records ([`Records::person_access`]).
-fn person_access_admits(root: &Path) -> bool {
-    match person_access_at(root) {
-        PersonAccess::Asked => true,
-        PersonAccess::NotAsked => false,
-        PersonAccess::Older => Records::read(root).is_ok_and(|records| records.person_access),
-    }
-}
-
 /// Before this build first writes a plan or a progress record over an older aterm's
 /// ([`PersonAccess::Older`]): an approval that aterm's rule gave carries over as a person's
 /// ([`PersonAccess::Asked`]), so it outlives the records that showed it. Nothing is written
@@ -4912,7 +4903,6 @@ fn permission_steps(records: &Records, progress: Option<Progress>, plan: &Plan) 
     // themselves. Only a person's Cancel or Stop holds them.
     let allowed = !cancelled
         && !run_stopped
-        && records.person_access
         && match records.progress {
             Some(_) => admitted && selected,
             None => {
@@ -4927,7 +4917,7 @@ fn permission_steps(records: &Records, progress: Option<Progress>, plan: &Plan) 
     } else if cancelled
         || run_stopped
         || held_restore
-        || (records.progress.is_some() && admitted && !(selected && records.person_access))
+        || (records.progress.is_some() && admitted && !selected)
     {
         PermissionSteps::Off
     } else {
@@ -5209,14 +5199,6 @@ pub struct SetupHooks {
     pub stop: fn(u64) -> bool,
     /// A stage started or ended.
     pub stage: for<'a> fn(StageEvent<'a>),
-    /// Whether System State is the visible view of a focused window with a person at this Mac
-    /// now: input within the last minute and the screen unlocked, read as the stage asks
-    /// (`aterm_gui::system_state_on_screen`). The Accounts stage, a person stage, may
-    /// raise macOS's Accessibility and Automation prompts and drives Messages and FaceTime, so it
-    /// runs only then (design §6, init-on-by-default design §6.4), and each sign-out reads it
-    /// again right before its clicks; otherwise it parks, and the window wakes the run when the
-    /// page is in front to a person again.
-    pub on_screen: fn() -> bool,
     /// The exact run revision and whether its Repositories stage waits on Apple's Command Line
     /// Tools, which only a root install with the person's password adds: `true`, at the end of
     /// an unstopped pass whose stage waits on them, and the window starts that install in a
@@ -5238,7 +5220,6 @@ impl SetupHooks {
     pub const NONE: Self = Self {
         stop: |_| false,
         stage: |_| {},
-        on_screen: || false,
         developer_tools: |_, _| {},
     };
 }
@@ -7258,7 +7239,7 @@ fn execute_pass(
                     },
                 },
                 Stage::Repositories => host.repositories(repository_vault.as_ref()),
-                Stage::Accounts => match host.accounts(root, hooks.on_screen) {
+                Stage::Accounts => match host.accounts(root, || true) {
                     Ok(Some(result)) => {
                         page = result.page;
                         Ok(result.rows)
@@ -7613,12 +7594,8 @@ mod tests {
 
     type StageReading = (bool, Vec<Setting>, Vec<Subject>);
 
-    /// A pass nobody stops, with a person at System State in front: its sign-outs run
-    /// ([`SetupHooks::on_screen`]), where [`SetupHooks::NONE`]'s only read.
-    const AT_THE_PAGE: SetupHooks = SetupHooks {
-        on_screen: || true,
-        ..SetupHooks::NONE
-    };
+    /// A pass nobody stops; acquisition no longer requires a particular page to be visible.
+    const AT_THE_PAGE: SetupHooks = SetupHooks::NONE;
 
     #[derive(Default)]
     struct Fake {
@@ -9036,21 +9013,20 @@ mod tests {
         assert!(!finished_at(root.path()).unwrap());
     }
 
-    /// An automatic admission keeps Permissions in its plan and admits no step: Local Network's
-    /// first LAN use goes on (`Off`, no wait for a step), until a person's press on this Mac.
+    /// Automatic setup starts selected permission steps without a second opt-in.
     #[test]
-    fn permission_steps_need_a_persons_press_whatever_the_automatic_plan_selects() {
+    fn automatic_setup_starts_selected_permission_steps() {
         let root = aterm_tempfile::tempdir().unwrap();
         let plan = selected(&[Setting::Permissions, Setting::Secrets]);
         authorize_reading(root.path(), &plan, || Ok(None)).unwrap();
         assert_eq!(
             permission_steps_at(root.path()),
-            Ok(PermissionSteps::Off),
-            "no press: no step"
+            Ok(PermissionSteps::Allowed),
+            "the admitted plan starts its steps automatically"
         );
         let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
         assert!(snapshot.plan.selection.contains(Setting::Permissions));
-        assert!(!snapshot.permissions_allowed);
+        assert!(snapshot.permissions_allowed);
         note_person_asked_at(root.path()).unwrap();
         assert_eq!(
             permission_steps_at(root.path()),
@@ -9098,15 +9074,15 @@ mod tests {
         );
         assert_eq!(person_access_at(root.path()), PersonAccess::NotAsked);
         assert!(
-            !permissions_allowed(root.path()),
-            "CONTROL: nothing carried"
+            permissions_allowed(root.path()),
+            "selected permissions start automatically"
         );
     }
 
-    /// A person's press is this Mac's: the record names its hardware UUID, and one another Mac
-    /// wrote (a home migrated or restored here) admits no prompt. Negative control: this Mac's.
+    /// A historical press belongs to its hardware UUID. Automatic acquisition follows this
+    /// Mac's admitted plan regardless of that historical press.
     #[test]
-    fn a_press_recorded_on_another_mac_asks_for_nothing_here() {
+    fn automatic_permission_steps_do_not_depend_on_another_macs_press() {
         let root = aterm_tempfile::tempdir().unwrap();
         authorize_reading(
             root.path(),
@@ -9120,7 +9096,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(person_access_at(root.path()), PersonAccess::NotAsked);
-        assert!(!permissions_allowed(root.path()));
+        assert!(permissions_allowed(root.path()));
         note_person_asked_at(root.path()).unwrap();
         assert_eq!(person_access_at(root.path()), PersonAccess::Asked);
         assert!(
@@ -9247,7 +9223,7 @@ mod tests {
             );
             assert_eq!(outcome.is_err(), cut_at_plan);
             assert_eq!(person_access_at(root.path()), PersonAccess::NotAsked);
-            assert!(!permissions_allowed(root.path()), "{cut_at_plan}");
+            assert!(permissions_allowed(root.path()), "{cut_at_plan}");
         }
 
         let verified = aterm_tempfile::tempdir().unwrap();
@@ -9701,8 +9677,8 @@ mod tests {
         );
         assert_eq!(saved_plan(root.path()).unwrap(), Some(reviewed.clone()));
         let page = snapshot_at(root.path(), reviewed.clone()).unwrap();
-        // Set up now asks for no macOS grant: they are on offer, a press of their own away.
-        assert!(!page.cancelled && !page.permissions_allowed);
+        // Set up now also starts the selected permission steps.
+        assert!(!page.cancelled && page.permissions_allowed);
         note_person_asked_at(root.path()).unwrap();
         assert!(
             snapshot_at(root.path(), reviewed.clone())
@@ -9787,8 +9763,8 @@ mod tests {
         .expect("admitted");
         assert_eq!(saved_plan(root.path()).unwrap(), Some(reviewed.clone()));
         let page = snapshot_at(root.path(), Plan::default()).unwrap();
-        // Set up now asks for no macOS grant: they are on offer.
-        assert!(!page.cancelled && !page.permissions_allowed);
+        // Set up now starts the selected permission steps.
+        assert!(!page.cancelled && page.permissions_allowed);
         let records = Records::read(root.path()).unwrap();
         assert_eq!(
             records.restored.map(|restored| restored.left),
@@ -9816,10 +9792,10 @@ mod tests {
     fn permission_policy_carries_only_what_an_older_aterm_allowed() {
         for (state, verified, allowed) in [
             ("applied", true, true),
-            ("applied", false, false),
-            ("pending", false, false),
+            ("applied", false, true),
+            ("pending", false, true),
             ("cancelled", true, false),
-            ("restored", true, false),
+            ("restored", true, true),
         ] {
             let root = aterm_tempfile::tempdir().unwrap();
             save_automatic_plan(root.path(), Selection::all().workstation()).unwrap();
@@ -9922,13 +9898,13 @@ mod tests {
 
             let revision = launch_startup(root.path()).expect("the offer admits the run");
             let admitted = snapshot_at(root.path(), Plan::default()).unwrap();
-            assert!(!admitted.permissions_allowed, "{case}: on offer");
+            assert!(admitted.permissions_allowed, "{case}: automatic steps");
             assert!(!admitted.finished, "{case}");
             assert_eq!(admitted.plan.selection, wanted, "{case}");
             let host = run_pass(root.path(), revision);
             assert_eq!(host.calls, [Stage::Permissions], "{case}");
             let done = snapshot_at(root.path(), Plan::default()).unwrap();
-            assert!(done.finished && !done.permissions_allowed, "{case}");
+            assert!(done.finished && done.permissions_allowed, "{case}");
             assert_eq!(launch_startup(root.path()), None, "{case}");
             assert_eq!(
                 bring_forward_restored_at(root.path()).unwrap(),
@@ -9990,7 +9966,7 @@ mod tests {
             leave_restored_as_is(root.path()).unwrap();
             assert!(!finished_at(root.path()).unwrap(), "{state}: the offer");
             let revision = launch_startup(root.path()).expect("the offer admits it");
-            assert!(!permissions_allowed(root.path()), "{state}: on offer");
+            assert!(permissions_allowed(root.path()), "{state}: automatic steps");
             let host = run_pass(root.path(), revision);
             assert_eq!(host.calls, [Stage::Permissions], "{state}");
         }
@@ -11805,8 +11781,8 @@ mod tests {
         assert_ne!(admitted.done & Stage::Workstation.bit(), 0);
         assert!(admission_at(root.path()).unwrap().is_some());
         assert!(
-            !permissions_allowed(root.path()),
-            "an explicit apply asks for no macOS grant: on offer"
+            permissions_allowed(root.path()),
+            "an explicit apply starts selected permission steps"
         );
         assert_eq!(Withholding::withheld(root.path()), [WIDGETS]);
         assert_eq!(doctor.notification_center_writes(), 0);
@@ -12716,6 +12692,7 @@ mod tests {
         let file = ConfiguredVault {
             config: aterm_secrets::client::Config {
                 source: aterm_secrets::transport::Source::Path(home.path().join("team.vault")),
+                mirrors: Vec::new(),
                 name: "team".into(),
                 signer: None,
                 followed: Vec::new(),
@@ -12942,7 +12919,6 @@ mod tests {
         let hooks = SetupHooks {
             stop,
             stage,
-            on_screen: || true,
             developer_tools: |_, _| {},
         };
         let root = aterm_tempfile::tempdir().unwrap();
@@ -13113,7 +13089,7 @@ mod tests {
     /// say nobody is on screen and the sign-outs park; before, they said a person was there and
     /// a pass with no presence hook ran the sign-outs.
     #[test]
-    fn the_sign_outs_wait_for_system_state_on_screen_and_park_without_it() {
+    fn admitted_account_setup_does_not_wait_for_system_state_on_screen() {
         let root = aterm_tempfile::tempdir().unwrap();
         let plan = selected(&[Setting::Widgets, Setting::Messages]);
         let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
@@ -13121,7 +13097,7 @@ mod tests {
             accounts_pending: true,
             ..Fake::default()
         };
-        let (report, next) = execute_initial_for_revision(
+        let (_, next) = execute_initial_for_revision(
             &mut host,
             root.path(),
             revision,
@@ -13130,21 +13106,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        // The sign-outs did not run: they wait, and the run parks rather than retries.
-        assert_eq!(host.calls, [Stage::Workstation]);
-        assert_eq!(next, SetupNext::Park);
-        assert!(report.rows.iter().any(|row| row.status == WAITING));
-        assert_eq!(
-            progress(root.path()).unwrap().unwrap().done & Stage::Accounts.bit(),
-            0
-        );
-        // With System State on screen to a person they run.
-        host.calls.clear();
-        let (_, next) =
-            execute_initial_for_revision(&mut host, root.path(), revision, &mut None, AT_THE_PAGE)
-                .unwrap()
-                .unwrap();
-        assert_eq!(host.calls, [Stage::Accounts]);
+        assert_eq!(host.calls, [Stage::Workstation, Stage::Accounts]);
         assert_eq!(next, SetupNext::Done);
         assert!(finished_at(root.path()).unwrap());
     }
@@ -13154,7 +13116,7 @@ mod tests {
     /// once and holds only the person stage, the sign-outs, which park until a person is at the
     /// page (init-on-by-default design §6.1, §6.4, the owner's ruling of 2026-10-25).
     #[test]
-    fn a_mac_nobody_is_at_runs_its_background_stages_and_parks_only_the_sign_outs() {
+    fn an_admitted_mac_runs_every_possible_stage_without_an_input_requirement() {
         let root = aterm_tempfile::tempdir().unwrap();
         let revision = authorize_at(root.path(), &Plan::default())
             .unwrap()
@@ -13163,10 +13125,7 @@ mod tests {
             accounts_pending: true,
             ..Fake::default()
         };
-        let nobody = SetupHooks {
-            on_screen: || false,
-            ..SetupHooks::NONE
-        };
+        let nobody = SetupHooks::NONE;
         let (_, next) =
             execute_initial_for_revision(&mut host, root.path(), revision, &mut None, nobody)
                 .unwrap()
@@ -13183,9 +13142,9 @@ mod tests {
                 host.calls
             );
         }
-        assert_eq!(next, SetupNext::Park, "the sign-outs park");
+        assert_eq!(next, SetupNext::Done);
         let done = progress(root.path()).unwrap().unwrap().done;
-        assert_eq!(done & Stage::Accounts.bit(), 0, "the sign-outs wait");
+        assert_ne!(done & Stage::Accounts.bit(), 0, "the sign-outs complete");
         for stage in [
             Stage::Workstation,
             Stage::Spotlight,
@@ -13687,6 +13646,7 @@ mod tests {
                 config: Some(Config {
                     name: aterm_secrets::transport::vault_name(&source).unwrap(),
                     source,
+                    mirrors: Vec::new(),
                     signer: Some(pin.unwrap_or([3; 32])),
                     followed: Vec::new(),
                     host: "m22".into(),
@@ -19477,8 +19437,8 @@ mod tests {
         older(root.path(), false);
         let revision = launch_startup(root.path()).expect("the offer admits the plan");
         assert!(
-            !permissions_allowed(root.path()),
-            "an automatic offer: on offer"
+            permissions_allowed(root.path()),
+            "an automatic setup starts its permission steps"
         );
         let host = run_pass(root.path(), revision);
         assert_eq!(host.calls, [Stage::Permissions, Stage::Accounts]);
@@ -19931,8 +19891,8 @@ mod tests {
         // The offer waits for a focused window; the person runs `aterm doctor --apply` meanwhile.
         doctor_apply(root.path());
         assert!(
-            !permissions_allowed(root.path()),
-            "`doctor --apply` asks for no macOS grant: on offer"
+            permissions_allowed(root.path()),
+            "`doctor --apply` starts selected permission steps"
         );
         let revision = launch_startup(root.path()).expect("the admitted run goes on");
         let host = run_pass(root.path(), revision);
@@ -20376,6 +20336,7 @@ mod tests {
                         source: aterm_secrets::transport::Source::Url(
                             aterm_types::macos_setup::DEFAULT_VAULT_URL.into(),
                         ),
+                        mirrors: Vec::new(),
                         name: "alab".into(),
                         signer: Some([7; 32]),
                         followed: Vec::new(),

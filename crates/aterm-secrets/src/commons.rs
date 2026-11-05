@@ -14,6 +14,8 @@ pub mod binding;
 pub mod bootstrap;
 pub mod constraints;
 #[cfg(unix)]
+pub mod everyone_key;
+#[cfg(unix)]
 pub mod hearing;
 #[cfg(unix)]
 pub mod history;

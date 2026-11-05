@@ -20,7 +20,9 @@ use aterm_net::fleet_member::{
     read_whole, register_by,
 };
 
-use crate::headless_boot::{self, Instance, POLL_GAP, boot_session, ctl, ctl_ok, field, status};
+use crate::headless_boot::{
+    self, Instance, POLL_GAP, boot_session, ctl, ctl_ok, field, status, watchers,
+};
 
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 
@@ -267,7 +269,9 @@ const RETRY_MS: &str = "100";
 // stopped aterm) are read under each verb's own wait (its `--timeout`, or the one it keeps),
 // which these seams do not reach but a drive's: no [`peers_answered`] or [`survey_answered`] read
 // meets one, and the drives that do name a tenth of a second for theirs
-// ([`a_drives_deadline_is_the_worlds_seam`]).
+// ([`a_drives_deadline_is_the_worlds_seam`]). The one `--host any` read that does, past the member
+// `a_walled_codex_member_is_never_picked_by_any_host_end_to_end` stopped, dials a port that refuses
+// at once, so the survey's seam costs it nothing.
 // Every aterm here, and every verb, is given the hang detector for the book's lock too
 // ([`LOCK_WAIT_SEAM`]), not the 2 s a person's verb waits: each holder is an aterm (or this test)
 // on this machine that lets it go once its read-modify-write is made, which a loaded machine can
@@ -302,22 +306,31 @@ fn boot_world(
     headless_boot::boot_with(
         prefix,
         |tmp, cmd| {
-            let hang = HANG.as_millis().to_string();
-            let round = HANG
-                .saturating_mul(aterm_net::fleet_member::HEARTBEAT_MEMBERS as u32 + 1)
-                .as_millis()
-                .to_string();
-            cmd.env(aterm_net::loopback::SEAM, "1")
-                .env(ISSUER_WITHIN_SEAM, &hang)
-                .env(HOLDER_SEAM, &hang)
-                .env(HANDSHAKE_SEAM, &hang)
-                .env(LOCK_WAIT_SEAM, &hang)
-                .env(HEARTBEAT_WITHIN_SEAM, round)
-                .env(LIFETIME_SEAM, NEVER_MS);
+            world_seams(cmd);
             configure(tmp, cmd);
         },
         ready,
     )
+}
+
+/// The loopback guard and the seams every aterm of a test's fleet runs under.
+#[expect(
+    clippy::disallowed_types,
+    reason = "headless_boot::boot_with's hook, on the binary under test it isolates"
+)]
+fn world_seams(cmd: &mut std::process::Command) {
+    let hang = HANG.as_millis().to_string();
+    let round = HANG
+        .saturating_mul(aterm_net::fleet_member::HEARTBEAT_MEMBERS as u32 + 1)
+        .as_millis()
+        .to_string();
+    cmd.env(aterm_net::loopback::SEAM, "1")
+        .env(ISSUER_WITHIN_SEAM, &hang)
+        .env(HOLDER_SEAM, &hang)
+        .env(HANDSHAKE_SEAM, &hang)
+        .env(LOCK_WAIT_SEAM, &hang)
+        .env(HEARTBEAT_WITHIN_SEAM, round)
+        .env(LIFETIME_SEAM, NEVER_MS);
 }
 
 fn boot(port: u16) -> Instance {
@@ -698,16 +711,46 @@ fn survey_answered(root: &Path, args: &[&str]) -> Output {
 }
 
 fn ctl_with(root: &Path, args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Output {
+    ctl_as(root, Typed::Words(args), stdin, env)
+}
+
+/// How a test's `aterm ctl` gets its words.
+#[derive(Clone, Copy, Debug)]
+enum Typed<'a> {
+    /// Each word as the test has it, no shell between.
+    Words(&'a [&'a str]),
+    /// One line bash reads as a person's line after `aterm ctl `, its words bash's own (an
+    /// unquoted `name=~/…` is the home of the Mac bash runs on by then).
+    Bash(&'a str),
+}
+
+/// `aterm ctl` with its words `typed`, under the isolation every test's client has.
+fn ctl_as(root: &Path, typed: Typed<'_>, stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Output {
     headless_boot::until_served(|| {
         let aterm = crate::launch_isolation::aterm_executable();
-        #[expect(
-            clippy::disallowed_types,
-            reason = "the binary under test, isolated by launch_isolation::apply (it inherits nothing)"
-        )]
-        let mut cmd = std::process::Command::new(aterm);
-        cmd.arg("ctl")
-            .args(args)
-            .stdin(stdin.map_or_else(Stdio::null, |_| Stdio::piped()))
+        let mut cmd = match typed {
+            Typed::Words(args) => {
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = "the binary under test, isolated by launch_isolation::apply (it inherits nothing)"
+                )]
+                let mut cmd = std::process::Command::new(&aterm);
+                cmd.arg("ctl").args(args);
+                cmd
+            }
+            Typed::Bash(line) => {
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = "macOS's own bash running the binary under test, isolated by launch_isolation::apply (it inherits nothing)"
+                )]
+                let mut cmd = std::process::Command::new("/bin/bash");
+                // The binary is bash's `$0`: the isolation strips every `ATERM_*` variable.
+                cmd.args(["-c", &format!("exec \"$0\" ctl {line}")])
+                    .arg(&aterm);
+                cmd
+            }
+        };
+        cmd.stdin(stdin.map_or_else(Stdio::null, |_| Stdio::piped()))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         crate::launch_isolation::apply(&mut cmd, root);
@@ -724,7 +767,7 @@ fn ctl_with(root: &Path, args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str
             pipe.write_all(bytes).expect("write its stdin");
         }
         crate::child_output::wait_and_read(child, Instant::now() + HANG)
-            .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit"))
+            .unwrap_or_else(|| panic!("aterm ctl {typed:?} did not exit"))
     })
 }
 
@@ -1375,6 +1418,7 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
             );
             fleet_ok(tmp, &["allow", "drive", "--all"], None);
             std::fs::create_dir_all(tmp.join("work")).unwrap();
+            std::fs::create_dir_all(tmp.join("home/work")).unwrap();
             cmd.env("SHELL", "/bin/zsh")
                 .env("ATERM_STATE_HOME", tmp.join("state"))
                 .args(["-e", "/bin/cat"]);
@@ -1506,6 +1550,85 @@ fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
     }
     let missing = format!("cwd={}", member.tmp.join("missing").display());
     assert!(drive_refused(&issuer.tmp, &target, &["spawn", &missing]).contains("no such folder"));
+    // A folder named in the driven Mac's home resolves there: the shell starts in the member's
+    // `~/work`, which the issuer's home does not hold. Typed as the help writes it, quoted, the
+    // word reaches the client as `cwd=~/work` through bash. Negative control: unquoted, bash makes
+    // it the issuer's own `~/work` first, an absolute path the member has no folder at.
+    assert!(!issuer.tmp.join("home/work").exists());
+    let unquoted = ctl_as(
+        &issuer.tmp,
+        Typed::Bash(&format!("--host {target} spawn cwd=~/work")),
+        None,
+        &[],
+    );
+    assert_eq!(unquoted.status.code(), Some(1), "{unquoted:?}");
+    let refused = String::from_utf8_lossy(&unquoted.stderr);
+    assert!(
+        refused.contains("no such folder")
+            && refused.contains(&issuer.tmp.join("home/work").display().to_string()),
+        "{refused}"
+    );
+    let quoted = ctl_as(
+        &issuer.tmp,
+        Typed::Bash(&format!("--host {target} spawn 'cwd=~/work'")),
+        None,
+        &[],
+    );
+    assert!(quoted.status.success(), "{quoted:?}");
+    let reply = String::from_utf8_lossy(&quoted.stdout).into_owned();
+    let homed = reply.trim().strip_prefix("OK ").expect("plain shell sid");
+    let at_homed = format!("@{homed}");
+    aterm_spec::wait::until_within(HANG, "the home-relative shell's prompt", || {
+        let (blocks, _) = drive_ok(&issuer.tmp, &target, &[&at_homed, "blocks"]);
+        blocks.contains(" entering ").then_some(())
+    });
+    drive_ok(
+        &issuer.tmp,
+        &target,
+        &[
+            &at_homed,
+            "turn",
+            "settle=submitted",
+            "submit_window=20000",
+            "timeout=20000",
+            "pwd; (exit 5)",
+        ],
+    );
+    let pwd_block = aterm_spec::wait::until_within(HANG, "the pwd's exit", || {
+        let (blocks, _) = drive_ok(&issuer.tmp, &target, &[&at_homed, "blocks"]);
+        blocks
+            .lines()
+            .find(|line| line.contains(" complete ") && line.contains(" exit=5 "))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(str::to_owned)
+    });
+    let (output, _) = drive_ok(
+        &issuer.tmp,
+        &target,
+        &[&at_homed, "blocktext", &pwd_block, "trim"],
+    );
+    assert_eq!(
+        output
+            .lines()
+            .find(|line| line.starts_with('/'))
+            .and_then(|line| Path::new(line).canonicalize().ok()),
+        Some(member.tmp.join("home/work").canonicalize().unwrap()),
+        "the member's ~/work: {output}"
+    );
+    for (cwd, said) in [
+        ("cwd=~/missing", "no such folder ~/missing"),
+        ("cwd=~/Documents", "macOS guards"),
+    ] {
+        let refused = drive_refused(&issuer.tmp, &target, &["spawn", cwd]);
+        assert!(refused.contains(said), "{cwd}: {refused}");
+    }
+    let leaving = drive_in(&issuer.tmp, &target, &["spawn", "cwd=~/../x"]);
+    assert!(!leaving.status.success(), "{leaving:?}");
+    assert!(
+        String::from_utf8_lossy(&leaving.stderr).contains("may leave the home"),
+        "refused here, never sent: {leaving:?}"
+    );
+    drive_ok(&issuer.tmp, &target, &[&at_homed, "close"]);
     drive_ok(&issuer.tmp, &target, &[&at, "close"]);
     let left = ctl_ok(&member, &["sessions"]);
     assert!(
@@ -1863,6 +1986,438 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     ctl_ok(&member, &[&at, "send", "z"]);
 }
 
+/// A stand-in Claude Code a worker runs until its tab closes, so the worker stays open on the
+/// board until the test closes it.
+const STANDIN_CLAUDE_STAYS: &str = "#!/bin/sh\n\
+    case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
+    exec /bin/sleep 600\n";
+
+/// The workers a `board --json` read (`out`, which must have succeeded) lists, each a map of its
+/// row's keys.
+fn board_workers(out: &Output) -> Vec<std::collections::BTreeMap<String, String>> {
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "a board read: {out:?}");
+    let read: aterm_json::Value =
+        aterm_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"));
+    read.get("workers")
+        .and_then(aterm_json::Value::as_array)
+        .unwrap_or_else(|| panic!("a workers array: {text}"))
+        .iter()
+        .map(|row| {
+            row.as_object()
+                .unwrap_or_else(|| panic!("a worker object: {text}"))
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_owned()))
+                .collect()
+        })
+        .collect()
+}
+
+/// The fleet task board (`docs/DESIGN-fleet-task-board-2026-11-04.md`): a dispatcher spawns two
+/// labelled workers onto a member over the fleet and its session closes; its Mac's board keeps
+/// each one's member, label and brief digest, never the brief; a dispatcher started on a third
+/// Mac, knowing no sid, reads that board over a drive and, before either worker moves, waits on
+/// every open row at the member, where the workers run, until each one moves; a Mac the
+/// dispatching one does not let drive it reads nothing; and the board's keeper closes each row
+/// once its worker's tab is gone.
+#[test]
+fn a_dispatcher_on_another_mac_resumes_every_worker_from_the_boards_open_rows() {
+    let (holder, port) = hold_a_port();
+    drop(holder);
+    let port_word = port.to_string();
+    let issuer = boot_world(
+        "abdi",
+        |tmp, cmd| {
+            fleet_ok(
+                tmp,
+                &[
+                    "init",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &port_word,
+                    "--allow",
+                    "content",
+                ],
+                None,
+            );
+            cmd.env("ATERM_STATE_HOME", tmp.join("state")).args([
+                "--lines",
+                "24",
+                "--columns",
+                "80",
+            ]);
+        },
+        |_| true,
+    );
+    let (_, person) = boot_session(&issuer);
+    fleet_reads(&issuer, &person, "listening");
+    let code = std::fs::read_to_string(issuer.tmp.join("state/fleet-join-code")).expect("a code");
+    let node_of = |root: &Path| {
+        std::fs::read_to_string(root.join("state/fleet-node"))
+            .expect("its node id")
+            .trim()
+            .to_owned()
+    };
+    let issuer_node = node_of(&issuer.tmp);
+    let issuer_at = listen_of(&issuer.tmp);
+    let joined = |tag: &str| {
+        let world = World(headless_boot::scratch_root(tag));
+        let (holder, port) = hold_a_port();
+        drop(holder);
+        fleet_ok(
+            &world.0,
+            &[
+                "join",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--at",
+                &issuer_at,
+            ],
+            Some(&code),
+        );
+        world
+    };
+    // The Mac a dispatcher restarts on, and one the dispatching Mac never lets drive it, both
+    // joined before the member, whose join then binds them.
+    let resumer = joined("abdr");
+    let resumer_node = node_of(&resumer.0);
+    let stranger = joined("abds");
+    fleet_ok(
+        &issuer.tmp,
+        &["allow", "drive", "--from", &resumer_node],
+        None,
+    );
+
+    let (holder, member_port) = hold_a_port();
+    drop(holder);
+    let member_port_word = member_port.to_string();
+    let member = boot_world(
+        "abdm",
+        |tmp, cmd| {
+            fleet_ok(
+                tmp,
+                &[
+                    "join",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &member_port_word,
+                    "--at",
+                    &issuer_at,
+                ],
+                Some(&code),
+            );
+            fleet_ok(
+                tmp,
+                &[
+                    "allow",
+                    "drive",
+                    "--from",
+                    &issuer_node,
+                    "--from",
+                    &resumer_node,
+                ],
+                None,
+            );
+            let cfg = tmp.join("cfg/aterm/aterm.toml");
+            let base = std::fs::read_to_string(&cfg).expect("the isolation config");
+            assert!(
+                base.contains(crate::launch_isolation::HARNESS_OFF),
+                "{base}"
+            );
+            std::fs::write(
+                &cfg,
+                format!(
+                    "{}[harness]\nrelaunch = false\nupgrade = false\n",
+                    base.replace(crate::launch_isolation::HARNESS_OFF, "")
+                ),
+            )
+            .expect("write the config");
+            let bin = tmp.join("bin");
+            headless_boot::standin(&bin.join("claude"), STANDIN_CLAUDE_STAYS);
+            std::fs::create_dir_all(tmp.join("work")).expect("the workers' folder");
+            cmd.env("SHELL", "/bin/zsh")
+                .env("ATERM_STATE_HOME", tmp.join("state"))
+                .env("ATERM_DEBUG_FLEET_RETRY_MS", NEVER_MS)
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
+                )
+                .args(["--lines", "24", "--columns", "80"]);
+        },
+        |_| true,
+    );
+    let (_, member_sid) = boot_session(&member);
+    fleet_reads(&member, &member_sid, "listening");
+    let member_node = node_of(&member.tmp);
+    let target = format!("127.0.0.1:{member_port}");
+    let work = member.tmp.join("work");
+    let work = work.to_str().expect("a UTF-8 scratch path");
+
+    // The dispatcher: a tab of its own on the issuer, one `aterm ctl` per worker in it, each
+    // ended once it spawned.
+    let opened = ctl_ok(&issuer, &["spawn"]);
+    let dispatcher = opened
+        .split_whitespace()
+        .find(|w| w.starts_with("s-"))
+        .unwrap_or_else(|| panic!("the dispatcher's tab: {opened}"))
+        .to_owned();
+    let briefs: [(&str, &[u8]); 2] = [
+        ("dx1-a", b"brief one: land the board"),
+        ("dx1-b", b"brief two: read it back"),
+    ];
+    let mut sids = Vec::new();
+    for (label, brief) in briefs {
+        let spawned = ctl_with(
+            &issuer.tmp,
+            &[
+                "--host",
+                &target,
+                "spawn",
+                "agent=claude",
+                &format!("label={label}"),
+                &format!("cwd={work}"),
+                "-",
+            ],
+            Some(brief),
+            &[("ATERM_PARENT_SESSION_ID", &dispatcher)],
+        );
+        let stdout = String::from_utf8_lossy(&spawned.stdout);
+        assert!(
+            spawned.status.success(),
+            "spawn over the fleet: {spawned:?}"
+        );
+        sids.push(
+            stdout
+                .split_whitespace()
+                .find(|w| w.starts_with("s-"))
+                .unwrap_or_else(|| panic!("a sid: {stdout}"))
+                .to_owned(),
+        );
+    }
+
+    let here = board_workers(&ctl_in(&issuer.tmp, &["board", "--json"]));
+    assert_eq!(here.len(), 2, "one row per worker: {here:?}");
+    for ((label, brief), sid) in briefs.iter().zip(&sids) {
+        let row = here
+            .iter()
+            .find(|row| row.get("sid") == Some(sid))
+            .unwrap_or_else(|| panic!("{sid} on the board: {here:?}"));
+        let digest: String = aterm_digest::Sha256::digest(brief)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        for (key, want) in [
+            ("label", (*label).to_owned()),
+            ("node", member_node.clone()),
+            ("program", "claude".to_owned()),
+            ("cwd", work.to_owned()),
+            ("from", dispatcher.clone()),
+            ("brief", format!("sha256:{digest}")),
+            ("brief_bytes", brief.len().to_string()),
+        ] {
+            assert_eq!(
+                row.get(key).map(String::as_str),
+                Some(want.as_str()),
+                "{key}: {row:?}"
+            );
+        }
+        assert_ne!(row.get("state").map(String::as_str), Some("closed"));
+    }
+    for file in std::fs::read_dir(issuer.tmp.join("state/board")).expect("the board") {
+        let bytes = std::fs::read(file.expect("a board file").path()).unwrap_or_default();
+        for (_, brief) in briefs {
+            assert!(
+                !bytes.windows(brief.len()).any(|w| w == brief),
+                "the board keeps a brief's digest, never its text"
+            );
+        }
+    }
+
+    // The dispatcher's session ends: what it started is on the board alone.
+    let closed = ctl_ok(&issuer, &[&format!("@{dispatcher}"), "close"]);
+    assert!(closed.starts_with("OK closed"), "{closed}");
+
+    // A dispatcher restarted on the resumer's Mac knows no sid: the board names every open row.
+    let there = board_workers(&drive_in(&resumer.0, &issuer_at, &["board", "--json"]));
+    let open: Vec<&str> = there
+        .iter()
+        .filter(|row| row.get("state").map(String::as_str) != Some("closed"))
+        .filter_map(|row| row.get("sid").map(String::as_str))
+        .collect();
+    assert_eq!(open.len(), 2, "the resumer reads both open rows: {there:?}");
+    assert!(
+        sids.iter().all(|sid| open.contains(&sid.as_str())),
+        "{there:?}"
+    );
+    let (mine, _) = drive_ok(
+        &resumer.0,
+        &issuer_at,
+        &["board", &format!("from=@{dispatcher}"), "label=dx1-a"],
+    );
+    let rows: Vec<&str> = mine.lines().filter(|l| l.starts_with("worker ")).collect();
+    assert!(
+        rows.len() == 1 && rows[0].contains(&format!("sid={}", sids[0])),
+        "a filter takes one dispatcher's rows of one label: {mine}"
+    );
+
+    // The resumed wait starts while both workers work, past the revs the resumer read: a wait
+    // that armed after a worker moved still answers with that move, whatever the keeper has
+    // written on the board since.
+    let since = there
+        .iter()
+        .filter_map(|row| row.get("rev")?.parse::<u64>().ok())
+        .min()
+        .unwrap_or_else(|| panic!("each row's rev: {there:?}"));
+    // Each worker's launch line has run (its stand-in is the tab's foreground program), so its
+    // launcher, which watches the tab until the shell's prompt, watches it no longer.
+    for sid in &sids {
+        let mut last = String::new();
+        let launched = aterm_spec::wait::within(HANG, POLL_GAP, || {
+            last = status(&member, sid);
+            (field(&last, "program") == Some("sleep")).then_some(())
+        });
+        assert!(launched.is_some(), "{sid}'s launch line never ran: {last}");
+    }
+    let resumed = std::thread::spawn({
+        let (root, at) = (resumer.0.clone(), issuer_at.clone());
+        let since = format!("since={since}");
+        move || {
+            drive_in(
+                &root,
+                &at,
+                &["await", "task", "board", "all", &since, "timeout=60000"],
+            )
+        }
+    });
+    // It waits at the member, beside the board's keeper, now the one other waiter on each
+    // worker, with at most one leg parked at a time.
+    let ended = std::cell::Cell::new(false);
+    let parked = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        if resumed.is_finished() {
+            ended.set(true);
+            return Some(());
+        }
+        sids.iter()
+            .all(|sid| watchers(&member, sid) >= 2)
+            .then_some(())
+    });
+    if ended.get() {
+        let out = resumed.join().expect("the resumed wait");
+        panic!(
+            "the resumed wait answered before any worker moved: {}",
+            headless_boot::said(&out)
+        );
+    }
+    assert!(
+        parked.is_some(),
+        "the resumed wait never waited at the member"
+    );
+
+    // The workers move at the member: one landed, one failed.
+    let (a, b) = (format!("@{}", sids[0]), format!("@{}", sids[1]));
+    ctl_ok(&member, &[&a, "task", "mark", "done", "why=landed"]);
+    ctl_ok(
+        &member,
+        &[&b, "task", "mark", "failed", "why=could-not-finish"],
+    );
+
+    let out = resumed.join().expect("the resumed wait");
+    assert!(
+        out.status.success(),
+        "the resumed wait: {}",
+        headless_boot::said(&out)
+    );
+    let waited = String::from_utf8_lossy(&out.stdout);
+    for (sid, state, label) in [(&sids[0], "done", "dx1-a"), (&sids[1], "failed", "dx1-b")] {
+        let row = waited
+            .lines()
+            .find(|row| row.starts_with(&format!("@{sid} ")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the resumed wait answers {sid}: {}",
+                    headless_boot::said(&out)
+                )
+            });
+        assert_eq!(field(row, "state"), Some(state), "{row}");
+        assert_eq!(field(row, "label"), Some(label), "{row}");
+        assert_eq!(
+            field(row, "task_news"),
+            Some("1"),
+            "it woke on the worker's move: {row}"
+        );
+        assert!(
+            !row.contains("read=board"),
+            "the row is the member's answer, not the board's copy: {row}"
+        );
+    }
+
+    let refused = drive_refused(&stranger.0, &issuer_at, &["board"]);
+    assert!(
+        refused.contains(aterm_types::control_verbs::DRIVE_UNGRANTED),
+        "a Mac the dispatching one does not let drive it reads no board: {refused}"
+    );
+
+    // The dispatching Mac's keeper follows the workers with no dispatcher running.
+    let states = |rows: &[std::collections::BTreeMap<String, String>]| -> Vec<Option<String>> {
+        sids.iter()
+            .map(|sid| {
+                rows.iter()
+                    .find(|row| row.get("sid") == Some(sid))
+                    .and_then(|row| row.get("state").cloned())
+            })
+            .collect()
+    };
+    let mut last = Vec::new();
+    let moved = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        last = board_workers(&ctl_in(&issuer.tmp, &["board", "--json"]));
+        (states(&last) == [Some("done".to_owned()), Some("failed".to_owned())]).then_some(())
+    });
+    assert!(
+        moved.is_some(),
+        "the keeper records each worker's move: {last:?}"
+    );
+    for sid in &sids {
+        let (closed, _) = drive_ok(&issuer.tmp, &target, &[&format!("@{sid}"), "close"]);
+        assert!(closed.starts_with("OK closed"), "{closed}");
+    }
+    let kept = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        last = board_workers(&ctl_in(&issuer.tmp, &["board", "--json"]));
+        (states(&last) == [Some("closed".to_owned()), Some("closed".to_owned())]).then_some(())
+    });
+    assert!(
+        kept.is_some(),
+        "the keeper closes each row once its tab is gone: {last:?}"
+    );
+    let concluded: Vec<Option<&str>> = sids
+        .iter()
+        .map(|sid| {
+            last.iter()
+                .find(|row| row.get("sid") == Some(sid))
+                .and_then(|row| row.get("conclusion").map(String::as_str))
+        })
+        .collect();
+    assert_eq!(
+        concluded,
+        [Some("finished"), Some("failed")],
+        "a closed row keeps its conclusion: {last:?}"
+    );
+    let none = drive_in(
+        &resumer.0,
+        &issuer_at,
+        &["await", "task", "board", "since=0"],
+    );
+    assert!(
+        none.status.success()
+            && none.stdout.is_empty()
+            && String::from_utf8_lossy(&none.stderr).contains("OK board: no open worker"),
+        "{none:?}"
+    );
+}
+
 const NEVER_MS: &str = "600000";
 
 /// A member's heartbeat period where a test waits on what one brings.
@@ -2002,6 +2557,646 @@ fn driven_pair_beating(
     let (_, worker) = boot_session(&member);
     fleet_reads(&member, &worker, "listening");
     (issuer, member, worker, format!("127.0.0.1:{member_port}"))
+}
+
+/// `git` in `dir`, hermetic, for a member's checkout.
+fn member_git(dir: &Path, args: &[&str]) -> String {
+    let mut git = aterm_uds::fixture_git::git();
+    git.args([
+        "-c",
+        "user.name=Andrew Yates",
+        "-c",
+        "user.email=a@example.invalid",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+    ])
+    .args(args)
+    .current_dir(dir);
+    let out = aterm_uds::deadline::output_until(&mut git, Instant::now() + HANG)
+        .unwrap_or_else(|e| panic!("git {args:?} within the hang detector: {e}"));
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// A FLEET SURVEY CARRIES EACH MEMBER'S HOME AND CHECKOUTS, AND `--host any` PLACES BY THEM: the
+/// member's home holds a clone of github.com/acme/trust, which its survey reports with its HEAD
+/// once its read beside the survey ends (the issuer's own home, none); a `need=` it meets passes
+/// placement (and stops at its accounts, of which this fixture has none), one it does not is
+/// refused with its count, before any spawn. Negative control: a need for a repository its home
+/// does not hold.
+#[test]
+fn a_fleet_survey_carries_each_members_checkouts_and_any_host_places_by_them() {
+    let (issuer, member, _worker, _target) = driven_pair(("ahri", "ahrm"));
+    let home = member.tmp.join("home");
+    let trust = home.join("trust");
+    std::fs::create_dir_all(&trust).expect("a checkout");
+    member_git(&trust, &["init", "-q", "."]);
+    std::fs::write(trust.join("a.txt"), "one\n").expect("a.txt");
+    member_git(&trust, &["add", "a.txt"]);
+    member_git(&trust, &["commit", "-q", "-m", "one"]);
+    member_git(
+        &trust,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/trust.git",
+        ],
+    );
+    let head = member_git(&trust, &["rev-parse", "HEAD"]);
+    let home_word = home.display().to_string();
+
+    let mut last = String::new();
+    let hosts =
+        aterm_spec::wait::until_within(HANG, "the member's checkouts in its survey", || {
+            let read = survey_answered(&issuer.tmp, &["survey", "--fleet", "--json"]);
+            assert!(read.status.success(), "{read:?}");
+            last = String::from_utf8_lossy(&read.stdout).into_owned();
+            let hosts: aterm_json::Value =
+                aterm_json::from_str(&last).unwrap_or_else(|e| panic!("not JSON ({e}): {last}"));
+            let read_it = hosts.as_array().into_iter().flatten().any(|host| {
+                host.get("repos")
+                    .and_then(aterm_json::Value::as_array)
+                    .is_some_and(|repos| !repos.is_empty())
+            });
+            read_it.then_some(hosts)
+        });
+    let hosts = hosts.as_array().expect("an array");
+    let homed: Vec<&aterm_json::Value> = hosts
+        .iter()
+        .filter(|host| {
+            host.get("instance")
+                .and_then(|i| i.get("home"))
+                .and_then(aterm_json::Value::as_str)
+                .is_some()
+        })
+        .collect();
+    assert!(homed.len() >= 2, "both members say their home: {last}");
+    let of_member = hosts
+        .iter()
+        .find(|host| {
+            host.get("instance")
+                .and_then(|i| i.get("home"))
+                .and_then(aterm_json::Value::as_str)
+                == Some(home_word.as_str())
+        })
+        .unwrap_or_else(|| panic!("the member's home {home_word}: {last}"));
+    let instance = of_member.get("instance").expect("its instance");
+    for key in ["home_free_mb", "repos_at"] {
+        assert!(
+            instance
+                .get(key)
+                .and_then(aterm_json::Value::as_str)
+                .is_some_and(|v| !v.is_empty() && v != "-"),
+            "{key}: {last}"
+        );
+    }
+    let repos = of_member.get("repos").and_then(aterm_json::Value::as_array);
+    let trust_row = repos
+        .into_iter()
+        .flatten()
+        .find(|row| row.get("name").and_then(aterm_json::Value::as_str) == Some("trust"))
+        .unwrap_or_else(|| panic!("the member's trust checkout: {last}"));
+    for (key, want) in [
+        ("head", head.as_str()),
+        ("branch", "main"),
+        ("dirty", "0"),
+        ("path", &trust.display().to_string()),
+    ] {
+        assert_eq!(
+            trust_row.get(key).and_then(aterm_json::Value::as_str),
+            Some(want),
+            "{key}: {last}"
+        );
+    }
+    let text = survey_answered(&issuer.tmp, &["survey", "--fleet"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains(&format!("\n    trust main@{} no origin main", &head[..12])),
+        "{text}"
+    );
+
+    // `--host any` reads every member as `survey --fleet` does, within the same seam.
+    let twice = (2 * HANG).as_millis().to_string();
+    let any = |args: &[&str]| {
+        let mut all = vec!["--host", "any", "spawn", "agent=claude"];
+        all.extend_from_slice(args);
+        ctl_with(&issuer.tmp, &all, None, &[(SURVEY_WITHIN_SEAM, &twice)])
+    };
+    let refused = any(&["need=repo:nope", "-"]);
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        said.contains("need=repo:nope")
+            && said.contains("1 lack a checkout it needs (repo:nope)")
+            && said.contains("so none meets them"),
+        "{said}"
+    );
+    let met = any(&["need=repo:trust,free:1m", "cwd=$HOME/trust", "-"]);
+    let said = String::from_utf8_lossy(&met.stderr);
+    assert!(!met.status.success(), "no account to run it on: {met:?}");
+    assert!(
+        said.contains("none of the 1 that meet them has an enrolled, unwalled claude account"),
+        "{said}"
+    );
+}
+
+/// `--host any` end to end, on macOS alone: its fixture is one fake login of Codex's, whose launch
+/// reads its usage over the network, so every aterm of it runs in the Seatbelt jail that kills the
+/// process that asks for anything but loopback, which only macOS has.
+#[cfg(target_os = "macos")]
+mod any_host_walled {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::accounts_upkeep_live_headless::alive;
+
+    /// The stand-in `codex`: `--version` answers at once, and any other call writes its words to
+    /// `$HOME/codex-ran` (written aside, then renamed), which only a launch does.
+    const STANDIN_CODEX: &str = "#!/bin/sh\n\
+        case \"$1\" in --version) echo 'codex-cli 0.163.0'; exit 0 ;; esac\n\
+        printf '%s\\n' \"$*\" > \"$HOME/codex-ran.part\" && \
+        mv \"$HOME/codex-ran.part\" \"$HOME/codex-ran\"\n";
+
+    /// The file [`STANDIN_CODEX`] leaves in a member's home once a launch reached it.
+    const CODEX_RAN: &str = "home/codex-ran";
+
+    /// A window's use, in percent, and its reset, in Unix seconds.
+    type Window = (f64, i64);
+
+    /// A loopback stand-in for ChatGPT's usage endpoint that keeps a launch's read off the real
+    /// provider: every request line it was asked, and to each the same answer, `body`. Dropping it
+    /// joins its thread.
+    struct UsageStub {
+        port: u16,
+        asked: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl UsageStub {
+        fn start(body: String) -> Self {
+            let (listener, port) = hold_a_port();
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let (asked, stop) = (Arc::clone(&asked), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        if stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if let Ok(stream) = stream {
+                            Self::serve(stream, &asked, &body);
+                        }
+                    }
+                })
+            };
+            Self {
+                port,
+                asked,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        /// One request: its first line kept, `body` answered, the connection closed.
+        fn serve(mut stream: TcpStream, asked: &Mutex<Vec<String>>, body: &str) {
+            let _ = stream.set_read_timeout(Some(HANG));
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && head.len() < 64 * 1024 {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => return,
+                }
+            }
+            let line = String::from_utf8_lossy(&head)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            asked.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    impl Drop for UsageStub {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Its accept returns for this one connection, and the loop sees `stop`.
+            if TcpStream::connect(("127.0.0.1", self.port)).is_ok()
+                && let Some(thread) = self.thread.take()
+            {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Unsigned as any fake login's: nothing here checks a signature.
+    fn fake_jwt(claims: &aterm_json::Value) -> String {
+        let segment = |bytes: &[u8]| {
+            aterm_codec::base64::encode(bytes)
+                .expect("base64")
+                .trim_end_matches('=')
+                .replace('+', "-")
+                .replace('/', "_")
+        };
+        format!(
+            "{}.{}.sig",
+            segment(br#"{"alg":"RS256","typ":"JWT"}"#),
+            segment(&aterm_json::to_vec(claims).expect("its claims"))
+        )
+    }
+
+    /// `label`, the one enrolled Codex row of the scratch world `root`, on a fake login with no
+    /// refresh token, so nothing here can ask the provider for one; its usage read at `base`, the
+    /// test's [`UsageStub`]; and a rollout of its own sessions, opened by that login half a minute
+    /// ago, that read `five_hour` and `week`: with no record of the row yet, those are the figures
+    /// a survey of it has (`codex_limits::login_sample`).
+    fn lay_codex_row(root: &Path, label: &str, base: &str, five_hour: Window, week: Window) {
+        const ACCOUNT: &str = "acct-any-1";
+        const USER: &str = "user-any";
+        const THREAD: &str = "01900000-0000-7000-8000-000000000001";
+        std::fs::write(
+            root.join("cfg/aterm/accounts-codex.toml"),
+            format!("[[account]]\nlabel='{label}'\nclass='dedicated'\n"),
+        )
+        .expect("write the roster");
+        let codex = root.join("home/.codex");
+        std::fs::create_dir_all(&codex).expect("the Codex home");
+        std::fs::write(
+            codex.join("config.toml"),
+            format!("chatgpt_base_url = \"{base}\"\n"),
+        )
+        .expect("write Codex's config");
+        let token = fake_jwt(&aterm_json::json!({
+            "email": "a@example.test",
+            "https://api.openai.com/auth": {
+                "chatgpt_user_id": USER,
+                "chatgpt_account_id": ACCOUNT,
+            }
+        }));
+        std::fs::write(
+            codex.join("auth.json"),
+            aterm_json::to_vec(&aterm_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {"id_token": token, "access_token": token, "account_id": ACCOUNT}
+            }))
+            .expect("JSON"),
+        )
+        .expect("write the login");
+
+        let at_s = i64::try_from(aterm_time::unix_secs().expect("a clock")).expect("a time") - 30;
+        let at = aterm_agent::harness::usage::rfc3339_utc(at_s);
+        let stamp = format!("{}.000Z", &at[..19]);
+        let day = codex.join(format!(
+            "sessions/{}/{}/{}",
+            &at[..4],
+            &at[5..7],
+            &at[8..10]
+        ));
+        std::fs::create_dir_all(&day).expect("the rollout's day");
+        let meta = format!(
+            "{{\"timestamp\":\"{stamp}\",\"type\":\"session_meta\",\"payload\":{{\"session_id\":\
+             \"{THREAD}\",\"id\":\"{THREAD}\",\"history_mode\":\"paginated\",\
+             \"creator_account_id\":\"{ACCOUNT}\",\"creator_user_id\":\"{USER}\",\"timestamp\":\
+             \"{stamp}\",\"cwd\":\"/stand-in/project\",\"originator\":\"codex-tui\",\
+             \"cli_version\":\"0.163.0\",\"source\":\"cli\",\"model_provider\":\"openai\",\
+             \"base_instructions\":{{\"text\":\"You are Codex (stand-in)\"}}}}}}\n"
+        );
+        let slot = |(used, reset): Window, minutes: u64| {
+            format!(
+                "{{\"used_percent\":{used:.1},\"window_minutes\":{minutes},\"resets_at\":{reset}}}"
+            )
+        };
+        let rate = format!(
+            "{{\"timestamp\":\"{stamp}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\
+             \"token_count\",\"info\":null,\"rate_limits\":{{\"limit_id\":\"codex\",\"limit_name\"\
+             :null,\"primary\":{},\"secondary\":{},\"credits\":{{\"has_credits\":true,\
+             \"unlimited\":false,\"balance\":\"12\"}},\"individual_limit\":null,\
+             \"spend_control_reached\":null,\"plan_type\":null,\"rate_limit_reached_type\":null}}}}\
+             }}\n",
+            slot(five_hour, 300),
+            slot(week, 10_080),
+        );
+        std::fs::write(
+            day.join(format!(
+                "rollout-{}-{THREAD}.jsonl",
+                at[..19].replace(':', "-")
+            )),
+            format!("{meta}{rate}"),
+        )
+        .expect("write the rollout");
+    }
+
+    /// An aterm of the fleet in the network jail
+    /// ([`crate::accounts_upkeep_live_headless::NETWORK_JAIL`]), so that what asks for anything but
+    /// loopback dies at once and this test sees it gone. Its session is listening.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "headless_boot::boot_jailed's hook, on the binary under test it isolates"
+    )]
+    fn jailed_world(
+        prefix: &str,
+        configure: impl FnOnce(&Path, &mut std::process::Command),
+    ) -> Instance {
+        let inst = headless_boot::boot_jailed(
+            prefix,
+            crate::accounts_upkeep_live_headless::NETWORK_JAIL,
+            |tmp, cmd| {
+                world_seams(cmd);
+                cmd.env("ATERM_STATE_HOME", tmp.join("state"))
+                    .env("ATERM_LOG", "info")
+                    .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
+                    .args(["--lines", "24", "--columns", "80"]);
+                configure(tmp, cmd);
+            },
+            |_| true,
+        );
+        let (_, sid) = boot_session(&inst);
+        fleet_reads(&inst, &sid, "listening");
+        inst
+    }
+
+    /// A member of `issuer`'s fleet that lets it drive it, supervises its workers, runs
+    /// [`STANDIN_CODEX`] for `codex`, and holds `label` ([`lay_codex_row`]), written before it
+    /// boots, since a listener keeps its facts a while.
+    fn codex_member(
+        prefix: &str,
+        issuer: &Instance,
+        issuer_node: &str,
+        code: &str,
+        row: (&str, &str, Window, Window),
+    ) -> Instance {
+        let (holder, port) = hold_a_port();
+        drop(holder);
+        let port = port.to_string();
+        let (label, base, five_hour, week) = row;
+        jailed_world(prefix, |tmp, cmd| {
+            fleet_ok(
+                tmp,
+                &[
+                    "join",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &port,
+                    "--at",
+                    &listen_of(&issuer.tmp),
+                ],
+                Some(code),
+            );
+            fleet_ok(tmp, &["allow", "drive", "--from", issuer_node], None);
+            let cfg = tmp.join("cfg/aterm/aterm.toml");
+            let text = std::fs::read_to_string(&cfg).expect("the isolation config");
+            assert!(
+                text.contains(crate::launch_isolation::HARNESS_OFF),
+                "{text}"
+            );
+            std::fs::write(
+                &cfg,
+                format!(
+                    "{}[harness]\nrelaunch = false\nupgrade = false\n",
+                    text.replace(crate::launch_isolation::HARNESS_OFF, "")
+                ),
+            )
+            .expect("write the config");
+            lay_codex_row(tmp, label, base, five_hour, week);
+            let bin = tmp.join("bin");
+            headless_boot::standin(&bin.join("codex"), STANDIN_CODEX);
+            cmd.env("SHELL", headless_boot::login_shell().path).env(
+                "PATH",
+                format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
+            );
+        })
+    }
+
+    /// The Codex row `label` of a `survey --fleet --json` read, by its field names.
+    fn codex_row<'a>(hosts: &'a aterm_json::Value, label: &str) -> Option<&'a aterm_json::Value> {
+        let says = |row: &aterm_json::Value, key: &str, want: &str| {
+            row.get(key).and_then(aterm_json::Value::as_str) == Some(want)
+        };
+        hosts
+            .as_array()?
+            .iter()
+            .filter_map(|host| host.get("accounts")?.as_array())
+            .flatten()
+            .find(|row| says(row, "pool", "codex") && says(row, "id", label))
+    }
+
+    /// A MEMBER WHOSE CODEX ROW STANDS AT A WALL IS NEVER PICKED, by real aterms over real TCP on
+    /// loopback, though its week is the lower figure, so ranking alone would choose it: only
+    /// `Row::takes` keeps it out. The issuer asks: it is never a candidate itself, since a fleet
+    /// read leaves out this machine and a drive refuses it. The worker lands on the free member,
+    /// where it runs the stand-in `codex`, and on no other: the walled member has no such session,
+    /// ran no `codex`, and its usage was never asked for. NEGATIVE CONTROL: with the free member
+    /// stopped, the same spawn is refused, naming what the walled member lacks, and starts nothing.
+    ///
+    /// This holds where a launch's read of the row may go, not that one is made. Whatever reaches
+    /// the stub must have asked for the free row, and a read that leaves loopback kills the aterm
+    /// that asked, which [`alive`] sees of each. It does not require a read to arrive, since that
+    /// read's own bound ([`aterm_agent::harness::accounts_pool::USAGE_READ_WAIT`]) has no seam and
+    /// the launch goes on without it, so a loaded machine could miss it:
+    /// `a_lone_row_is_read_as_the_row_a_launch_starts_on` holds that a launch reads.
+    #[test]
+    fn a_walled_codex_member_is_never_picked_by_any_host_end_to_end() {
+        const WALLED: &str = "walled";
+        const FREE: &str = "free";
+        const TASK: &str = "a task from the issuer, for whichever Mac can take it";
+
+        let now = i64::try_from(aterm_time::unix_secs().expect("a clock")).expect("a time");
+        let (five_hour_reset, week_reset) = (now + 4 * 3600, now + 5 * 86_400);
+        let stub = UsageStub::start(
+            aterm_json::json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": 10.0,
+                        "limit_window_seconds": 18_000,
+                        "reset_at": five_hour_reset,
+                    },
+                    "secondary_window": {
+                        "used_percent": 60.0,
+                        "limit_window_seconds": 604_800,
+                        "reset_at": week_reset,
+                    },
+                }
+            })
+            .to_string(),
+        );
+        let base = |member: &str| format!("http://127.0.0.1:{}/{member}/backend-api", stub.port);
+
+        let (holder, port) = hold_a_port();
+        drop(holder);
+        let port = port.to_string();
+        let mut issuer = jailed_world("awci", |tmp, _| {
+            fleet_ok(tmp, &["init", "--host", "127.0.0.1", "--port", &port], None);
+        });
+        let code =
+            std::fs::read_to_string(issuer.tmp.join("state/fleet-join-code")).expect("a code");
+        let issuer_node =
+            std::fs::read_to_string(issuer.tmp.join("state/fleet-node")).expect("its node id");
+        let issuer_node = issuer_node.trim();
+        let mut walled = codex_member(
+            "awcw",
+            &issuer,
+            issuer_node,
+            &code,
+            (
+                WALLED,
+                &base(WALLED),
+                (100.0, five_hour_reset),
+                (5.0, week_reset),
+            ),
+        );
+        let mut free = codex_member(
+            "awcf",
+            &issuer,
+            issuer_node,
+            &code,
+            (
+                FREE,
+                &base(FREE),
+                (10.0, five_hour_reset),
+                (60.0, week_reset),
+            ),
+        );
+
+        let hosts = aterm_spec::wait::until_within(HANG, "both members' rows in a survey", || {
+            let read = survey_answered(&issuer.tmp, &["survey", "--fleet", "--json"]);
+            assert!(read.status.success(), "{read:?}");
+            let text = String::from_utf8_lossy(&read.stdout);
+            let hosts: aterm_json::Value =
+                aterm_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"));
+            (codex_row(&hosts, WALLED).is_some() && codex_row(&hosts, FREE).is_some())
+                .then_some(hosts)
+        });
+        let word = |label: &str, key: &str| {
+            codex_row(&hosts, label)
+                .and_then(|row| row.get(key))
+                .and_then(aterm_json::Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| panic!("{label}'s {key}: {hosts:?}"))
+        };
+        for (label, condition, five_hour, week) in [
+            (WALLED, "limited", "100", "5"),
+            (FREE, "usable", "10", "60"),
+        ] {
+            assert_eq!(word(label, "condition"), condition, "{hosts:?}");
+            assert_eq!(word(label, "enrolled"), "1", "{hosts:?}");
+            assert_eq!(word(label, "pct5"), five_hour, "{hosts:?}");
+            assert_eq!(word(label, "pct7"), week, "{hosts:?}");
+            assert_ne!(word(label, "read_at"), "-", "{hosts:?}");
+        }
+
+        let twice = (2 * HANG).as_millis().to_string();
+        let any = || {
+            ctl_with(
+                &issuer.tmp,
+                &["--host", "any", "spawn", "agent=codex", "-"],
+                Some(TASK.as_bytes()),
+                &[(SURVEY_WITHIN_SEAM, &twice)],
+            )
+        };
+        let placed = any();
+        let said = String::from_utf8_lossy(&placed.stderr);
+        assert!(placed.status.success(), "{placed:?}");
+        let chose = said
+            .lines()
+            .find(|line| line.starts_with("--host any: chose "))
+            .unwrap_or_else(|| panic!("no choice said: {said}"));
+        println!("{chose}");
+        assert!(
+            chose.contains(&format!("codex account {FREE} 7d 60% 5h 10%,"))
+                && chose.ends_with("the best of 1 that can take it"),
+            "{chose}"
+        );
+        let stdout = String::from_utf8_lossy(&placed.stdout);
+        let sid = stdout
+            .split_whitespace()
+            .find(|word| word.starts_with("s-"))
+            .unwrap_or_else(|| panic!("a sid: {stdout}"));
+        let at = format!("@{sid}");
+        let record = ctl_ok(&free, &[&at, "task"]);
+        assert!(record.starts_with("OK task rev="), "{record}");
+        let elsewhere = ctl(&walled, &[&at, "status"]);
+        assert!(
+            !elsewhere.status.success(),
+            "the walled member has the worker: {elsewhere:?}"
+        );
+
+        let ran = aterm_spec::wait::within(HANG, POLL_GAP, || {
+            std::fs::read_to_string(free.tmp.join(CODEX_RAN)).ok()
+        })
+        .unwrap_or_else(|| {
+            let ask = |args: &[&str]| headless_boot::said(&ctl(&free, args));
+            panic!(
+                "the worker's codex never ran.\ntask: {}\nscreen: {}\nasked: {:?}\nlog:\n{}",
+                ask(&[&at, "task"]),
+                ask(&[&at, "text", "trim"]),
+                stub.asked(),
+                headless_boot::log_tail(&free.log)
+            )
+        });
+        assert!(ran.contains(TASK), "{ran}");
+        let nothing_on_the_wall = || {
+            assert!(
+                !walled.tmp.join(CODEX_RAN).exists(),
+                "a codex ran on the walled member"
+            );
+            // The jail keeps a read off the provider; this says who asked, of whatever came.
+            let asked = stub.asked();
+            assert!(
+                asked
+                    .iter()
+                    .all(|line| line.starts_with(&format!("GET /{FREE}/backend-api/wham/usage "))),
+                "something but the free member's launch asked for usage: {asked:?}"
+            );
+        };
+        nothing_on_the_wall();
+
+        alive(&mut free);
+        drop(free);
+        let refused = any();
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(
+            said.contains(
+                "--host any: no Mac can take agent=codex: 1 members answered, 1 of them let this \
+                 Mac drive them"
+            ) && said.contains("none of those has an enrolled, unwalled codex account"),
+            "{said}"
+        );
+        assert!(
+            !said.contains("--host any: chose"),
+            "the refusal chose: {said}"
+        );
+        nothing_on_the_wall();
+        let sessions = ctl_ok(&walled, &["sessions"]);
+        let open = sessions
+            .lines()
+            .filter(|line| line.starts_with(|c: char| c.is_ascii_digit()))
+            .count();
+        assert_eq!(open, 1, "only its boot session: {sessions}");
+        // The jail killed neither aterm that is left: what reached past loopback would be gone.
+        alive(&mut issuer);
+        alive(&mut walled);
+    }
 }
 
 #[test]

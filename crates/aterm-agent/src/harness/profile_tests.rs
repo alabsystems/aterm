@@ -9,6 +9,133 @@ use aterm_tempfile::TempDir as Tmp;
 
 use super::*;
 
+struct FooterFixture<'a> {
+    argv: &'a [String],
+    env: &'a [String],
+}
+
+impl super::super::provider_read::FooterHost for FooterFixture<'_> {
+    fn owns(&self, argv: &[String], env: &[String]) -> bool {
+        self.argv == argv && self.env == env
+    }
+}
+
+fn muse_subscription_for(
+    argv: &[String],
+    env: &[String],
+    home: &Path,
+    prev: &SubscriptionDisplay,
+    now: i64,
+) -> Option<SubscriptionDisplay> {
+    super::muse_subscription_for(argv, env, home, prev, now, &FooterFixture { argv, env })
+}
+
+fn agy_subscription_for(
+    argv: &[String],
+    env: &[String],
+    home: &Path,
+    prev: &SubscriptionDisplay,
+    model: Option<&str>,
+    now: i64,
+) -> Option<SubscriptionDisplay> {
+    super::agy_subscription_for(
+        argv,
+        env,
+        home,
+        prev,
+        model,
+        now,
+        &FooterFixture { argv, env },
+    )
+}
+
+fn agy_subscription_in_dir(
+    argv: &[String],
+    env: &[String],
+    cwd: Option<&Path>,
+    home: &Path,
+    prev: &SubscriptionDisplay,
+    model: Option<&str>,
+    now: i64,
+) -> Option<SubscriptionDisplay> {
+    super::agy_subscription_in_dir(
+        argv,
+        env,
+        cwd,
+        home,
+        prev,
+        model,
+        now,
+        &FooterFixture { argv, env },
+    )
+}
+
+#[cfg(unix)]
+fn agy_subscription_with_store(
+    argv: &[String],
+    env: &[String],
+    home: &Path,
+    prev: &SubscriptionDisplay,
+    model: Option<&str>,
+    now: i64,
+    store: Option<&super::super::agy_quota_store::Store>,
+) -> Option<SubscriptionDisplay> {
+    super::agy_subscription_with_store_in_dir(
+        argv,
+        env,
+        None,
+        home,
+        prev,
+        model,
+        now,
+        store,
+        &FooterFixture { argv, env },
+    )
+}
+
+#[test]
+fn footer_authority_requires_the_running_handles_own_process_arguments() {
+    let argv = vec!["agy".to_owned()];
+    let other_argv = vec!["muse".to_owned()];
+    let env = vec!["HOME=isolated".to_owned()];
+    let host = FooterFixture {
+        argv: &argv,
+        env: &env,
+    };
+    let (use_token, probes) = super::super::provider_read::captured(|| {
+        footer_read_use(
+            &host,
+            &other_argv,
+            &env,
+            super::super::provider_read::Read::AgyUsage,
+            Path::new("isolated"),
+        )
+    });
+    assert!(use_token.is_none());
+    assert!(probes.is_empty());
+    assert!(
+        footer_read_use(
+            &host,
+            &argv,
+            &["HOME=another".to_owned()],
+            super::super::provider_read::Read::AgyUsage,
+            Path::new("isolated")
+        )
+        .is_none()
+    );
+    assert!(
+        footer_read_use(
+            &host,
+            &argv,
+            &env,
+            super::super::provider_read::Read::AgyUsage,
+            Path::new("isolated")
+        )
+        .is_some(),
+        "CONTROL: the running handle's own arguments mint authority"
+    );
+}
+
 const UUID: &str = "0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a";
 
 const SENTINEL: &str = "S3NT1NEL";
@@ -2214,7 +2341,23 @@ fn an_agy_usage_fetch_is_bounded_whole() {
     let (tx, fetched) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let budget = std::time::Duration::from_secs(1);
-        let _ = tx.send(fetch_agy_usage_doc(&exe, &[], None, &home, budget));
+        let config = super::super::upgrade_agy::config_dir(&[], home.to_str(), &home).unwrap();
+        let token = super::super::provider_read::Use::fixture(
+            super::super::provider_read::Read::AgyUsage,
+            &config,
+            None,
+        );
+        let _ = tx.send(fetch_agy_usage_doc(
+            &exe,
+            &[],
+            None,
+            None,
+            &home,
+            budget,
+            token,
+            0,
+            None,
+        ));
     });
     let got = fetched.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
     // A stand-in the budget cut before it wrote its receipt left no child to look for.
@@ -2225,7 +2368,11 @@ fn an_agy_usage_fetch_is_bounded_whole() {
         got.is_ok(),
         "the fetch still waits on agy's child {child:?} holding its stdout"
     );
-    assert_eq!(got.ok(), Some(None), "a read cut at its budget has no doc");
+    assert_eq!(
+        got.ok().map(|fetch| fetch.ok()),
+        Some(None),
+        "a read cut at its budget has no doc"
+    );
     let gone = aterm_spec::wait::within(
         aterm_spec::wait::MUST_HAPPEN,
         std::time::Duration::from_millis(20),

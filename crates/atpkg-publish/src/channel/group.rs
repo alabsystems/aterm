@@ -268,12 +268,14 @@ fn tree_bytes(dir: &Path) -> u64 {
             continue;
         };
         for e in entries.flatten() {
-            let Ok(meta) = std::fs::symlink_metadata(e.path()) else {
+            let Ok(kind) = e.file_type() else {
                 continue;
             };
-            if meta.is_dir() {
+            if kind.is_dir() {
                 stack.push(e.path());
-            } else if meta.is_file() {
+            } else if kind.is_file()
+                && let Ok(meta) = e.metadata()
+            {
                 #[cfg(unix)]
                 let first = seen.insert((meta.dev(), meta.ino()));
                 #[cfg(not(unix))]
@@ -348,16 +350,9 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
     let seal = &req.seal;
     let upload = req.mode == Mode::Upload;
 
-    let exec = |p: &Path| {
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt as _;
-        #[cfg(unix)]
-        return std::fs::metadata(p)
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
-        #[cfg(not(unix))]
-        return p.is_file();
-    };
-    if !exec(&seal.join("bin/trustc")) {
+    let exec = atpkg::toolchain::is_executable_file;
+    let trustc_exec = exec(&seal.join("bin/trustc"));
+    if !trustc_exec {
         pf.problems.push(format!(
             "the seal has no executable bin/trustc: {}",
             ctx.shown(seal)
@@ -375,7 +370,7 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
             ctx.shown(seal)
         ));
     }
-    if seal.join("bin/trustc").is_file() {
+    if trustc_exec || seal.join("bin/trustc").is_file() {
         match parts.probe.trustc_vv(seal) {
             Ok(vv) => {
                 pf.seal_commit = vv_field(&vv, "commit-hash").unwrap_or_default();
@@ -501,8 +496,11 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
             if let Some(text) = &receipt {
                 pf.seed_line = Some(seed::describe(text));
                 if upload {
-                    pf.problems
-                        .extend(seed::publish_refusals(ctx, &req.trust_repo, seal));
+                    pf.problems.extend(seed::publish_refusals_for_receipt(
+                        ctx,
+                        &req.trust_repo,
+                        text,
+                    ));
                 } else {
                     pf.notes.push(format!(
                         "the seed pin: publishing (--upload) waits until {}'s origin main \

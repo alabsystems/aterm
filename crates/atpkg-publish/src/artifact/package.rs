@@ -220,7 +220,7 @@ fn is_commit(s: &str) -> bool {
 pub fn read_package(dir: &Path, tool: &str, triple: Triple) -> Result<Package> {
     let root = std::fs::canonicalize(dir)
         .map_err(|e| Error::refused(format!("the package {} ({e})", dir.display())))?;
-    if !atpkg::alab::is_alab_package(&root) {
+    let Some(entry) = atpkg::alab::validated_entrypoint_of(&root) else {
         return Err(Error::refused(format!(
             "{} is not an ALab package: a {} of layout 1 whose entrypoint is a file in it, and \
              {} beside it (alab/package.sh lays both)",
@@ -228,13 +228,13 @@ pub fn read_package(dir: &Path, tool: &str, triple: Triple) -> Result<Package> {
             atpkg::alab::PACKAGE_JSON,
             atpkg::alab::ALAB_BUILD_JSON
         )));
-    }
-    let entry = atpkg::alab::entrypoint_of(&root);
+    };
     let want = Path::new("bin").join(tool);
-    if entry.as_deref() != Some(want.as_path()) {
+    if entry != want {
         return Err(Error::refused(format!(
-            "the package's entrypoint is {entry:?}, not {} — the shim of `{tool}` runs \
+            "the package's entrypoint is {:?}, not {} — the shim of `{tool}` runs \
              bin/{tool}",
+            Some(entry),
             want.display()
         )));
     }
@@ -286,7 +286,7 @@ pub fn read_package(dir: &Path, tool: &str, triple: Triple) -> Result<Package> {
         binaries_sha256: field("binaries_sha256")?,
         id: field("id")?,
     };
-    let upstream = atpkg::alab::upstream_of(&root);
+    let upstream = atpkg::alab::parse_upstream_value(&build);
     Ok(Package {
         root,
         version,
@@ -471,7 +471,7 @@ fn unhex(hex: &str) -> Option<Vec<u8>> {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    aterm_codec::hex::encode_lower(bytes)
 }
 
 /// The digest package.sh records for a sysroot's compiler binaries: SHA-256 over, for `bin/trustc` (else `bin/rustc`) and then each `lib/librustc_driver-*.dylib` in name order, the file's name, a NUL and the raw SHA-256 of its bytes.
@@ -486,13 +486,12 @@ pub fn binaries_sha256(sysroot: &Path) -> Result<String> {
     let mut drivers: Vec<PathBuf> = std::fs::read_dir(sysroot.join("lib"))
         .map_err(|e| Error::io(format!("read {}/lib", sysroot.display()), &e))?
         .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name().is_some_and(|n| {
-                let n = n.to_string_lossy();
-                n.starts_with("librustc_driver-") && n.ends_with(".dylib")
-            })
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("librustc_driver-") && n.ends_with(".dylib"))
         })
+        .map(|e| e.path())
         .collect();
     drivers.sort();
     let mut h = aterm_digest::Sha256::new();
@@ -565,12 +564,12 @@ pub fn check_compiler(
 pub fn check_tree(dir: &Path, triple: Triple, exposes: &[String]) -> Result<usize> {
     let files = super::relocate::walk_files(dir)
         .map_err(|e| Error::refused(format!("walk {}: {e}", dir.display())))?;
-    let objects: Vec<PathBuf> = files
+    let objects: Vec<(PathBuf, arch::Object)> = files
         .into_iter()
         .map(|rel| dir.join(rel))
-        .filter(|p| arch::read(p).is_some())
+        .filter_map(|p| arch::read(&p).map(|obj| (p, obj)))
         .collect();
-    let n = arch::gate(triple, &objects)?;
+    let n = arch::gate_objects(triple, &objects)?;
     atpkg::install::check_alab_pack(dir, exposes).map_err(|e| {
         Error::refused(format!(
             "the client's ALab pack gate refuses {}: {e}",

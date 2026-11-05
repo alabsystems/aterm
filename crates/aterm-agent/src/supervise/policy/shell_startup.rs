@@ -38,11 +38,15 @@ impl Kind {
     }
 }
 
-/// Startup aliases and functions, plus whether the shell may be zsh ([`Self::may_run_zsh`]).
+/// Startup aliases and functions, plus whether the shell may be zsh ([`Self::may_run_zsh`]),
+/// whether zsh's `EXTENDED_GLOB` may be on ([`Self::may_extended_glob`]) and whether a glob may
+/// meet a name's leading dot ([`Self::may_dot_glob`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShellStartup {
     names: Vec<(String, String, bool)>,
     zsh: bool,
+    extended_glob: bool,
+    dot_glob: bool,
 }
 
 /// Words that make the shell parse text of the line as a command again, so
@@ -56,16 +60,56 @@ impl ShellStartup {
         self.zsh
     }
 
+    /// Whether zsh's `EXTENDED_GLOB` may be on when the Bash tool runs the line under zsh: a zsh
+    /// snapshot sets it (`setopt extendedglob`, in any spelling zsh reads) or holds a line at its
+    /// top level that this check does not read ([`parse_snapshot`]), a `.zshenv` zsh reads is not
+    /// proven to set no option ([`zshenv_sets_no_option`]), or zsh may run with no snapshot of its
+    /// own read. zsh's default is off. The Bash tool's own `setopt NO_EXTENDED_GLOB
+    /// NO_BARE_GLOB_QUAL`, which Claude Code 2.1.284 runs after sourcing the snapshot (commit
+    /// 0f8552bf66; the process line `harness::upgrade_drive_tests` keeps), only turns options off,
+    /// so a version without it changes nothing here, and nothing here counts on it.
+    #[must_use]
+    pub const fn may_extended_glob(&self) -> bool {
+        self.extended_glob
+    }
+
+    /// Whether a `*`, a `?` or a bracket expression may meet a name's leading `.` in the Bash
+    /// tool's shell: a snapshot holds a line at its top level that this check does not read
+    /// ([`parse_snapshot`]), a `.zshenv` zsh reads is not proven to set no option
+    /// ([`zshenv_sets_no_option`]), a shell the Bash tool may run has no snapshot of its own read,
+    /// or bash may run with `GLOBIGNORE` in its environment. zsh's `GLOB_DOTS` and bash's
+    /// `dotglob` are off by default, and a snapshot that turns either on is no startup this check
+    /// reads at all ([`ZSH_INERT`], [`BASH_SHOPTS`]); bash 3.2.57 ignores a `GLOBIGNORE` it gets
+    /// from its environment (MEASURED 2026-11-05 in a folder holding `a.json` and
+    /// `.credentials.json`: `GLOBIGNORE=zz bash -c 'echo *.json'` printed `a.json` alone, and
+    /// `bash -c 'GLOBIGNORE=zz; echo *.json'` both), which a newer bash that `CLAUDE_CODE_SHELL`
+    /// names is not measured to do.
+    #[must_use]
+    pub const fn may_dot_glob(&self) -> bool {
+        self.dot_glob
+    }
+
     /// Each alias and function read.
     #[must_use]
     pub fn names(&self) -> &[(String, String, bool)] {
         &self.names
     }
 
-    /// The startup [`Self::names`] and [`Self::may_run_zsh`] describe.
+    /// The startup [`Self::names`], [`Self::may_run_zsh`], [`Self::may_extended_glob`] and
+    /// [`Self::may_dot_glob`] describe.
     #[must_use]
-    pub const fn of_parts(names: Vec<(String, String, bool)>, zsh: bool) -> Self {
-        Self { names, zsh }
+    pub const fn of_parts(
+        names: Vec<(String, String, bool)>,
+        zsh: bool,
+        extended_glob: bool,
+        dot_glob: bool,
+    ) -> Self {
+        Self {
+            names,
+            zsh,
+            extended_glob,
+            dot_glob,
+        }
     }
 
     /// `Err` naming the alias or function `line` may run.
@@ -106,8 +150,9 @@ const MAX_SESSION_ENV_DIRS: usize = 4096;
 const CLAUDE_PART: &str = "# Check for rg availability";
 
 /// zsh options (`setopt`) that do not affect non-interactive `zsh -c` command resolution or paths
-/// (`extendedglob` among them because a proven line under zsh holds none of its operators,
-/// `classify::plain_zsh_line`).
+/// (`noextendedglob` among them: `extendedglob` is no inert option but one a snapshot's
+/// [`ShellStartup::may_extended_glob`] records, under which a proven line holds none of its
+/// operators, `classify::plain_zsh_line`).
 pub const ZSH_INERT: &[&str] = &[
     "alwayslastprompt",
     "noalwayslastprompt",
@@ -155,7 +200,6 @@ pub const ZSH_INERT: &[&str] = &[
     "errreturn",
     "evallineno",
     "noevallineno",
-    "extendedglob",
     "noextendedglob",
     "nobareglobqual",
     "extendedhistory",
@@ -355,6 +399,7 @@ fn shell_relevant(key: &str) -> bool {
             | "SHELLOPTS"
             | "BASHOPTS"
             | "POSIXLY_CORRECT"
+            | "GLOBIGNORE"
     )
 }
 
@@ -412,8 +457,21 @@ pub fn read(worker: &WorkerEnv, launch: &Path, windows: bool) -> Result<ShellSta
     }
     for kind in kinds {
         match kind {
-            Kind::Zsh => zshenv(worker)?,
-            Kind::Bash => bash_env(worker)?,
+            Kind::Zsh => {
+                let unproven = zshenv(worker)?;
+                state.extended_glob |= unproven;
+                state.dot_glob |= unproven;
+            }
+            Kind::Bash => {
+                bash_env(worker)?;
+                state.dot_glob |= worker.var("GLOBIGNORE").is_some();
+            }
+        }
+        // A shell that may run with no snapshot of its own read: Claude Code writes one from the
+        // person's startup before the command it runs, unseen by this check.
+        if !snapshots.iter().any(|(k, _)| *k == kind) {
+            state.extended_glob |= kind == Kind::Zsh;
+            state.dot_glob = true;
         }
     }
     Ok(state)
@@ -530,7 +588,13 @@ fn hook_env_scripts(claude: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Read one snapshot's person's part (everything above [`CLAUDE_PART`]).
+/// Read one snapshot's person's part (everything above [`CLAUDE_PART`]). A zsh snapshot's
+/// `setopt extendedglob` (any spelling zsh reads: case and `_` ignored) marks
+/// [`ShellStartup::may_extended_glob`]. A line at either snapshot's top level other than the
+/// forms read here (a zsh function's opening line, a `setopt`, a bash `set -o`, `shopt` or
+/// `eval $'…'`, an `alias --`), a blank, a comment, a closing brace and Claude Code's own
+/// `unalias -a 2>/dev/null || true` may set an option unseen: it marks
+/// [`ShellStartup::may_dot_glob`], and in a zsh snapshot [`ShellStartup::may_extended_glob`].
 pub fn parse_snapshot(
     kind: Kind,
     text: &str,
@@ -576,7 +640,10 @@ pub fn parse_snapshot(
                 )?;
             }
             (Kind::Zsh, ["setopt", name]) => {
-                if !ZSH_INERT.contains(&name.to_ascii_lowercase().replace('_', "").as_str()) {
+                let option = name.to_ascii_lowercase().replace('_', "");
+                if option == "extendedglob" {
+                    state.extended_glob = true;
+                } else if !ZSH_INERT.contains(&option.as_str()) {
                     return Err(named());
                 }
             }
@@ -624,11 +691,20 @@ pub fn parse_snapshot(
                     false,
                 )?;
             }
+            _ if !line.starts_with('#') && !SNAPSHOT_LINES.contains(&line.trim_end()) => {
+                state.extended_glob |= kind == Kind::Zsh;
+                state.dot_glob = true;
+            }
             _ => {}
         }
     }
     Ok(())
 }
+
+/// The lines at a snapshot's top level, besides comments and the forms [`parse_snapshot`] reads,
+/// that set no option: a blank, a function's closing brace, and Claude Code's own line before the
+/// functions.
+const SNAPSHOT_LINES: &[&str] = &["", "}", "unalias -a 2>/dev/null || true"];
 
 /// Record `name` (`what` it is, and whether an `alias`), or `Err` for one the
 /// shell runs whatever the line says ([`ALWAYS_RUN`], zsh's `TRAP…`
@@ -915,13 +991,17 @@ const KEEPS_COMMAND: &[&str] = &[
 /// `Err` naming a `.zshenv` zsh reads before every Bash tool command (the
 /// worker's `$ZDOTDIR`'s, else `$HOME`'s; `/etc/zshenv`; a Debian-built zsh's
 /// `/etc/zsh/zshenv`) that holds what the snapshot would not show
-/// ([`zshenv_hazard`]), or that cannot be read.
-fn zshenv(worker: &WorkerEnv) -> Result<(), String> {
+/// ([`zshenv_hazard`]), or that cannot be read; else whether one of them is not
+/// proven to set no option ([`zshenv_sets_no_option`]), so that `EXTENDED_GLOB`
+/// and `GLOB_DOTS` may be on ([`ShellStartup::may_extended_glob`],
+/// [`ShellStartup::may_dot_glob`]).
+fn zshenv(worker: &WorkerEnv) -> Result<bool, String> {
     let dot = worker
         .var("ZDOTDIR")
         .filter(|d| !d.is_empty())
         .or_else(|| worker.var("HOME").filter(|h| !h.is_empty()))
         .map(|d| Path::new(d).join(".zshenv"));
+    let mut unproven = false;
     for path in dot
         .into_iter()
         .chain(["/etc/zshenv", "/etc/zsh/zshenv"].map(PathBuf::from))
@@ -938,22 +1018,33 @@ fn zshenv(worker: &WorkerEnv) -> Result<(), String> {
                 path.display()
             ));
         }
+        unproven |= !zshenv_sets_no_option(&text);
     }
-    Ok(())
+    Ok(unproven)
 }
 
-/// `.zshenv` constructs that may alter options, aliases, or functions invisibly to the snapshot.
+/// `line`, a `.zshenv` line, without the comment that ends it, if any.
+fn zshenv_code(line: &str) -> &str {
+    let comment = line.char_indices().find(|&(at, c)| {
+        c == '#'
+            && !line[..at].contains(['\'', '"', '\\', '`'])
+            && line[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|p| p.is_whitespace() || ";&|(".contains(p))
+    });
+    comment.map_or(line, |(at, _)| &line[..at])
+}
+
+/// `.zshenv` constructs that may alter options, aliases, or functions invisibly to the snapshot:
+/// a function, one of [`ZSHENV_WORDS`], a word naming a parameter of [`ZSHENV_NAMES`], or a
+/// parameter flag. MEASURED 2026-11-05 with zsh 5.9, each in a `.zshenv` a `zsh -c` read:
+/// `options+=(extendedglob on)` and `options=(extendedglob on)` set that option, as
+/// `${(P)n::=on}` after `n=options\[extendedglob\]` did, and `histchars='!^x'` (or `HISTCHARS`)
+/// made a word opening with `#` no comment (`docs/measured/classifier-zsh-glob-2026-11-05.md`).
 pub fn zshenv_hazard(text: &str) -> Option<String> {
     for (n, line) in text.lines().enumerate() {
-        let comment = line.char_indices().find(|&(at, c)| {
-            c == '#'
-                && !line[..at].contains(['\'', '"', '\\', '`'])
-                && line[..at]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|p| p.is_whitespace() || ";&|(".contains(p))
-        });
-        let code = comment.map_or(line, |(at, _)| &line[..at]);
+        let code = zshenv_code(line);
         let forms = [
             code.to_string(),
             unquote_once(code),
@@ -962,10 +1053,22 @@ pub fn zshenv_hazard(text: &str) -> Option<String> {
         if forms.iter().any(|f| f.contains("()")) {
             return Some(format!("its line {} defines a function", n + 1));
         }
+        if forms.iter().any(|f| f.contains("${(")) {
+            return Some(format!("its line {} holds a parameter flag `${{(`", n + 1));
+        }
         for form in &forms {
             for word in form.split(|c: char| c.is_whitespace() || ";&|(){}[]`\"'".contains(c)) {
                 if let Some(word) = ZSHENV_WORDS.iter().find(|w| **w == word) {
                     return Some(format!("its line {} runs `{word}`", n + 1));
+                }
+            }
+            for word in form.split(|c: char| c.is_whitespace() || ";&|(){}`\"'".contains(c)) {
+                let named = ZSHENV_NAMES.iter().find(|name| {
+                    word.strip_prefix(**name)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['=', '+', '[']))
+                });
+                if let Some(name) = named {
+                    return Some(format!("its line {} names `{name}`", n + 1));
                 }
             }
         }
@@ -975,11 +1078,71 @@ pub fn zshenv_hazard(text: &str) -> Option<String> {
 
 /// The words of a `.zshenv` line that may set what the snapshot's listing
 /// would not show, or run code this check does not read ([`zshenv_hazard`],
-/// whose verdict quotes one of these and nothing else of the line).
+/// whose verdict quotes one of these, of [`ZSHENV_NAMES`] or `${(`, and nothing
+/// else of the line).
 const ZSHENV_WORDS: &[&str] = &[
     "emulate", "setopt", "unsetopt", "options", "set", "source", ".", "eval", "alias", "function",
     "autoload", "zmodload", "builtin", "exec", "trap", "hash",
 ];
+
+/// The parameters a `.zshenv` word that names one (alone, or led by it and then `=`, `+=` or a
+/// subscript: `options+=(…)`, `options[x]=on`, `histchars=…`, `print -v options[x] on`) makes a
+/// [`zshenv_hazard`]: `options`, whose elements are zsh's options, and `histchars`
+/// (`HISTCHARS`), whose third character opens a comment where `#` would.
+const ZSHENV_NAMES: &[&str] = &["options", "histchars", "HISTCHARS"];
+
+/// Whether every line of `text`, a `.zshenv` with no [`zshenv_hazard`], is proven to set no
+/// option: blank or a comment, or an optional `export` and then words each `NAME=VALUE` (or,
+/// after `export`, a bare `NAME`) whose `NAME` is none that changes which `.zshenv` zsh reads
+/// next (`ZDOTDIR`, `HOME`), on a line with no quote holding a blank, no `\`, `` ` ``, `;`, `&`,
+/// `|`, `<`, `>`, `(`, `)`, `[` or `]`, and no `$` but one before a `NAME` or `{NAME}`. A
+/// `.zshenv` any other line holds may set `EXTENDED_GLOB` or `GLOB_DOTS`
+/// ([`ShellStartup::may_extended_glob`], [`ShellStartup::may_dot_glob`]): [`zshenv_hazard`] reads
+/// words, and a name built at run time is none.
+fn zshenv_sets_no_option(text: &str) -> bool {
+    let name = |w: &str| {
+        w.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let plain_dollars = |code: &str| {
+        code.match_indices('$').all(|(at, _)| {
+            let rest = &code[at + 1..];
+            let braced = rest
+                .strip_prefix('{')
+                .and_then(|r| r.split_once('}'))
+                .is_some_and(|(n, _)| name(n));
+            let bare = rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+            braced || bare
+        })
+    };
+    text.lines().all(|line| {
+        let code = zshenv_code(line).trim();
+        if code.is_empty() {
+            return true;
+        }
+        if code.contains(['\\', '`', ';', '&', '|', '<', '>', '(', ')', '[', ']'])
+            || !plain_dollars(code)
+        {
+            return false;
+        }
+        let mut words = code.split_whitespace().peekable();
+        let export = words.next_if_eq(&"export").is_some();
+        words.peek().is_some()
+            && words.all(|w| {
+                let target = w.split_once('=').map_or(w, |(n, _)| n);
+                let quoted = w.matches(['\'', '"']).count() % 2 == 1;
+                (export || w.contains('='))
+                    && name(target)
+                    && !quoted
+                    && !["ZDOTDIR", "HOME"].contains(&target)
+            })
+    })
+}
 
 /// `Err` naming a variable of the worker's that makes bash read a file before
 /// a command or sets its options.

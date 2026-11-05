@@ -21,7 +21,7 @@ pub const PEER_CHECK_HANG: Duration = Duration::from_secs(10);
 static PEER_WAITS_FOR_TEST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Wait at least `within` for each peer wait in this process: a serving keeper's check of each
-/// dial, and a CLI verb's connect, check and answer.
+/// dial, a CLI verb's connect, check and answer, and launchd's answer to each `launchctl`.
 ///
 /// A test whose keeper and verbs must answer sets the hang detector here in each process it
 /// starts: past the product's bounds a loaded machine would read as a silent `trustd`.

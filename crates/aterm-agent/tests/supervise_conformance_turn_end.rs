@@ -13,8 +13,9 @@ use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::exception::FUTILE_AFTER_TRIES;
 use aterm_agent::supervise::policy::needs::NEEDS_ACK;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, DONE_CHECK, HostTurn, NO_WORK_ACTS, RULE_API_RETRY, RULE_CONTINUE, RULE_DONE_CHECK,
-    TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, WaitKind, decide_turn_end,
+    CommandEnter, Composer, DONE_CHECK, HostTurn, NO_WORK_ACTS, RULE_API_RETRY, RULE_CONTINUE,
+    RULE_DONE_CHECK, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, WaitKind,
+    decide_turn_end,
 };
 use aterm_agent::supervise::{QuestionPriority, SupervisorConfig};
 use aterm_models_harness::supervisor_turn_end_model;
@@ -137,7 +138,9 @@ fn reading(
         reset_at: None,
         jitter: Duration::ZERO,
         resumes_by_itself: false,
-        composer: if st["draft"] == 1 && st["box_up"] == 0 {
+        composer: if st["draft"] == 1 && st["box_up"] == 0 && st["command"] == 1 {
+            Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Runs)
+        } else if st["draft"] == 1 && st["box_up"] == 0 {
             Composer::Typed
         } else {
             Composer::Empty
@@ -152,6 +155,7 @@ fn reading(
         turn_said: Some(crate::common::earlier(earlier)),
         said_lines: None,
         turn_lines: None,
+        turn_breaks: Default::default(),
         opened_by: None,
         message_drawn: false,
         submits: None,
@@ -194,6 +198,7 @@ fn reading(
         login_at_wall: None,
         login_method: None,
         login_shared: None,
+        login_pin: aterm_agent::supervise::policy::login::LoginPin::Picker,
         login_moved: false,
         roster: None,
         wall_remembered: false,
@@ -205,6 +210,7 @@ fn reading(
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
+        leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
         fact: None,
         wake: None,
     }
@@ -372,6 +378,12 @@ fn expected(m: &Model, st: &State) -> Verdict {
     if m.action_enabled("Escalate", st) {
         return Verdict::Escalate;
     }
+    // A person's command standing past their grace is their hold (§14.17.5.8): no act over it,
+    // no Enter, and no wait for one, the same reply's quiet included; the point is decided again
+    // when it goes.
+    if command_holds(st) {
+        return Verdict::Nothing;
+    }
     // The same reply again, or the wall's tries spent at it: no act, and no wait for one, past a
     // person's grace.
     if held(m, st) && st["person"] == 0 {
@@ -385,6 +397,17 @@ fn expected(m: &Model, st: &State) -> Verdict {
         "a free point where nothing holds and nothing is done: {st:?}"
     );
     Verdict::Wait
+}
+
+/// Whether a person's command stands in the composer, past their grace and no wait of the
+/// policy's own due first (`CommandLeft`).
+fn command_holds(st: &State) -> bool {
+    st["draft"] == 1
+        && st["command"] == 1
+        && st["box_up"] == 0
+        && st["person"] == 0
+        && st["wall"] != 1
+        && st["backoff"] == 0
 }
 
 /// The real policy's clocks, scaled so that each of the model's runs alone:
@@ -483,7 +506,8 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
         )
     };
     match action {
-        "BoxAppears" | "BoxLeaves" | "PersonTypes" | "GraceEnds" | "DraftLeft" => {}
+        "BoxAppears" | "BoxLeaves" | "PersonTypes" | "GraceEnds" | "DraftLeft" | "CommandLeft"
+        | "DraftCleared" => {}
         "WallAppears" => {
             let r = TurnEndReading {
                 person: None,
@@ -758,6 +782,7 @@ fn holds_at(m: &Model, st: &State, real: &Real, cfg: &SupervisorConfig) -> Verdi
         && st["other"] == 0
         && st["box_up"] == 0
         && !held(m, st)
+        && !command_holds(st)
         && (st["pending"] == 0 || st["pending"] == 3)
     {
         assert_ne!(got, Verdict::Nothing, "a silent point at {st:?}");
@@ -1420,6 +1445,33 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
 #[test]
 fn the_walls_words_read_as_a_refused_request() {
     assert_eq!(aterm_phase::classify_wall(REFUSED_MESSAGE), Some(REFUSED));
+}
+
+/// Negative control for §14.17.5.8, a person's command left standing: the old rule (`Buggy = 15`,
+/// the draft step's Enter on any draft past the person's grace) sends it and breaks
+/// `NeverSendsAPersonsCommand` on its path, where the real decider holds (`Nothing`) as the model
+/// without it does; a prompt draft on the same path is sent by both.
+#[test]
+fn the_model_that_sends_a_persons_command_disagrees_with_the_real_decider() {
+    let base = Instant::now() + Duration::from_secs(3600);
+    let m = supervisor_turn_end_model();
+    let cfg = policy();
+    for (left, sent) in [("CommandLeft", false), ("DraftLeft", true)] {
+        let path = ["HumanWork", left, "GraceEnds"];
+        let (st, real) = replay(&m, &path, base);
+        let act = verdict(&decided(&real, &st, &cfg), &st);
+        assert_eq!(act, expected(&m, &st), "{left}: {st:?}");
+        assert_eq!(act == Verdict::Submit, sent, "{left}: {st:?}");
+        assert_eq!(m.action_enabled("SubmitDraft", &st), sent, "{left}: {st:?}");
+        let old = aterm_spec::interp::with_buggy(&m, 15);
+        let (mut st, _) = replay(&old, &path, base);
+        assert!(old.fire("SubmitDraft", &mut st), "{left}: {st:?}");
+        assert_eq!(
+            old.check_invariant("NeverSendsAPersonsCommand", &st),
+            sent,
+            "{left}: {st:?}"
+        );
+    }
 }
 
 /// Negative control for §14.17.5's blocked reply: the old rule (`Buggy = 9`, an answer that names

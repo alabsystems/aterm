@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::super::log_entries_tests::{member_key, newcomer, two_macs};
+use super::super::log_entries_tests::{TwoMacs, join_host, member_key, newcomer, two_macs};
 use super::*;
 use crate::age;
 use crate::membership_log::{
@@ -447,6 +447,52 @@ fn a_founder_listed_with_no_binding_comes_back_under_its_label() {
         log.membership().node(&node(5)),
         NodeStanding::Member(Mac(15).id())
     );
+}
+
+/// A founder the genesis lists with its recipient and neither a binding nor a node key, as it
+/// lists m9 (one-mesh S1): the Mac that holds that recipient (the possession challenge proves it)
+/// proves itself from the home ALab LAN and takes the founder's own label, `m9`, not the next free
+/// one. Off the LAN with no fleet key it is told no seat, as any Mac is; a Mac with another
+/// recipient on the LAN takes a new label.
+///
+/// NEGATIVE CONTROL: `decide` matching an unproved founder by node key alone (its `by_recipient`
+/// arm cut): the LAN proof is `Decision::Lan` and the first assert fails.
+#[test]
+fn a_founder_listed_with_no_node_key_comes_back_by_its_recipient_under_its_label() {
+    const M9: Mac = Mac(9);
+    let root = Root::of(ME.request().binding());
+    let founders = vec![
+        founder(ME, "m1", Some(node(1))),
+        Founder {
+            recipient: M9.identity().recipient(),
+            binding: None,
+            node_key: None,
+            name: "m9".to_owned(),
+            label: "m9".to_owned(),
+        },
+    ];
+    let mut log = Log::new(Record::genesis(&[99; 32], root, founders, 1).unwrap()).unwrap();
+    let decision = decided_on_lan(&log, M9, 0x39, T0);
+    assert_eq!(
+        decision,
+        Decision::Founder {
+            label: "m9".to_owned()
+        }
+    );
+    assert!(
+        refused(&decided(&log, M9, 0x39, false, T0)),
+        "off the LAN with no fleet key"
+    );
+    assert_eq!(decided_on_lan(&log, Mac(19), 0x39, T0), Decision::Lan);
+    apply(&mut log, M9, 0x39, &decision, T0);
+    let membership = log.membership();
+    assert_eq!(membership.label(&M9.id()), Some("m9"));
+    assert_eq!(
+        membership.get(&M9.id()).map(|m| m.binding.recipient()),
+        Some(M9.identity().recipient()),
+        "the seat binds the founder's own recipient"
+    );
+    assert!(membership.unproved().is_empty(), "the founder is proved");
 }
 
 /// A node key no seat binds lets a Mac in only where it also proved the fleet's current key.
@@ -1127,9 +1173,10 @@ fn reader_0147(mut wire: &[u8]) -> Result<Vec<(u8, Option<u8>)>, String> {
 /// End to end on two real vault folders (synthetic keys, a loopback server): m7 publishes its
 /// fleet node key in its own `Node` record, then its vault key changes (a fresh vault folder,
 /// as after a reinstall). m22, shown the proof of that node key alone, lets it back in with
-/// nobody: under the label m7, with the node key, reading `[everyone]` at once. Every record m22
-/// signs and every record the Mac takes is one a 0.147 Mac reads (`Remove`, an `Admit` of
-/// `Manual`, `Wrap`s).
+/// nobody: under the label m7, with the node key, reading `[everyone]` at once, while the old
+/// binding is in no epoch newer than the `Remove` (the batch rotates `[everyone]` and Commons
+/// without it, [`sign_seat_move`]). Every record m22 signs and every record the Mac takes is one
+/// a 0.147 Mac reads (`Remove`, an `Admit` of `Manual`, `Wrap`s, `Epoch`s and `Put`s).
 ///
 /// NEGATIVE CONTROLS: `admit_by_proof` signing the `Admit` without the `Remove` of the old seat
 /// (`let mut signed = Vec::new();` in place of the insert and `vec![remove]`): the evaluator
@@ -1144,6 +1191,7 @@ fn a_mac_whose_vault_key_changed_takes_its_seat_back_by_proof_with_nobody() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let (m22, m7) = (&macs.m22, &macs.m7);
     let (_, old, _) = member_key(m7);
+    let old_recipient = read_identity(m7).unwrap().unwrap().recipient();
     let pair = node_pair(7);
     let n7 = node(7);
     publish_local_node_key(m7, n7, |network, actor| {
@@ -1207,8 +1255,13 @@ fn a_mac_whose_vault_key_changed_takes_its_seat_back_by_proof_with_nobody() {
     assert_eq!(tail[0], (3, None), "a Remove of the old seat first");
     assert_eq!(tail[1], (2, Some(2)), "then an Admit of Manual");
     assert!(
-        tail[2..].iter().all(|r| *r == (6, None)),
-        "then Wraps: {tail:?}"
+        tail[2..].contains(&(5, None)),
+        "then its Wraps and the rotation that leaves the old key out: {tail:?}"
+    );
+    let (_, wrapping) = epochs_after_remove_wrapping(m22, &old, &old_recipient);
+    assert!(
+        wrapping.is_empty(),
+        "the old binding reads an epoch newer than its Remove: {wrapping:?}"
     );
 
     // The Mac the move left out (m7's old vault folder) is offered no Undo of it.
@@ -1446,6 +1499,7 @@ fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguou
         name: "new-mac",
         fleet: false,
         lan: false,
+        lab: false,
         fresh: &unread,
     };
     let seated_elsewhere = Book {
@@ -1696,6 +1750,825 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
     assert_eq!(membership.label(&me), Some("m7"));
     macs.server.stop();
     drop(macs.root);
+}
+
+/// m22 narrows Commons control to itself and m7 syncs: m7 stays in the vault and in its log seat,
+/// while the current signed Commons epochs leave it out of control (`control-excluded`), as they
+/// left 55 of ALab's 58 members on 2026-11-04. m7 opened Commons while it held control (the
+/// fixture enrolled it), so it pinned the network's anchor then.
+fn exclude_m7_from_commons(macs: &TwoMacs) {
+    use crate::commons::{Observation, Unavailable};
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    narrow_commons_to_m22(m22);
+    sync(m7, None).expect("m7 syncs");
+    assert!(matches!(
+        crate::commons::observe(m7).unwrap(),
+        Observation::Unavailable(Unavailable::ControlExcluded)
+    ));
+    assert!(matches!(
+        status(m7).unwrap().membership,
+        Membership::In { .. }
+    ));
+    assert!(admits_by_log(m7), "the log still seats m7");
+}
+
+/// The admin `m22` addresses the Commons control entry to itself alone and publishes.
+fn narrow_commons_to_m22(m22: &Paths) {
+    let admin = admin_open(m22).unwrap();
+    let mut doc = admin.doc.clone();
+    let control = doc
+        .entries()
+        .into_iter()
+        .find(|entry| entry.name == crate::commons::ENTRY)
+        .expect("the Commons control entry");
+    doc.unset_entry(&control.audience, crate::commons::ENTRY)
+        .unwrap();
+    doc.set_entry(
+        &Audience::Hosts(vec!["m22".to_owned()]),
+        crate::commons::ENTRY,
+        control.value.as_slice(),
+    )
+    .unwrap();
+    // As a 0.154.0 Mac minted it: the current carry keeps every seat (one-mesh M1).
+    crate::client::log_entries::as_0154(|| admin_publish(m22, &admin, &doc))
+        .expect("publish the narrowed Commons control");
+}
+
+/// Every byte of the Commons custody at `paths` (its claim, device, pin and control journal), so a
+/// test can show that nothing granted, wrote or claimed Commons control there.
+fn commons_custody(paths: &Paths) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn walk(dir: &Path, out: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(&paths.dir.join("commons"), &mut out);
+    let claim = paths.dir.join("commons.claim");
+    out.insert(claim.clone(), std::fs::read(&claim).unwrap());
+    out
+}
+
+/// A member the current Commons epochs leave out of control is a member still: its log seats it
+/// (owner, 2026-11-02: membership is the log, Commons control governs application data), so it
+/// has a desk, under the anchor it pinned, and allows by its seat. A Mac on its home ALab LAN that
+/// proves itself to that desk is let in through the log, with nobody: the member's `Admit` and
+/// `[everyone]` `Wrap`s, the log bundle the new Mac writes, and the records the member posts, which
+/// the other member reads it seated from. None of it writes, grants or claims Commons control: the
+/// member's Commons custody stays byte for byte, it stays `control-excluded`, and the new Mac holds
+/// no Commons control either, which the epochs' holders give it.
+///
+/// NEGATIVE CONTROL (in-test oracle): the old `Local::of` was `None` wherever
+/// `Bootstrap::cached_until` was, which it is for this member (asserted below), so the old rule
+/// gave it no desk and "the excluded member has a desk" fails. By hand: the seated arm of
+/// `Local::of` answering `Ok(None)` fails there.
+#[test]
+fn a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_by_its_proof() {
+    use crate::commons::bootstrap::{Bootstrap, Device};
+    use crate::members::desk::{self, Desk, Local};
+    use crate::members::join::{self, Stream};
+    use crate::members::joiner::Joining;
+    // Every server this thread reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let trust = Bootstrap::required(m22).unwrap().trust();
+    exclude_m7_from_commons(&macs);
+    let custody = commons_custody(m7);
+
+    // The old rule's only gate: no Commons bootstrap, so no desk.
+    assert!(
+        Bootstrap::cached(m7).unwrap().is_none(),
+        "the oracle: the old desk had nothing to stand on here"
+    );
+    let local = Local::of(m7)
+        .expect("m7's state reads")
+        .expect("the excluded member has a desk");
+    assert!(local.can_allow(), "its log seat lets it allow");
+    assert_eq!(
+        local.trust(),
+        trust,
+        "the anchor m7 pinned, the log's network"
+    );
+    let log7 = load_records(m7).unwrap().log().unwrap().clone();
+    let m7_actor = *log7
+        .membership()
+        .members()
+        .iter()
+        .find(|(_, member)| member.binding.writer() == local.key())
+        .expect("the desk's key is m7's seat")
+        .0;
+    let desk = std::sync::Mutex::new(Desk::new(local.with_automatic_lan([])));
+
+    let fresh = Paths::for_home(&macs.root.path().join("fresh"));
+    machine_identity(&fresh).expect("identity");
+    let device = Device::open(&fresh).expect("device").expect("an identity");
+    let pair = node_pair(31);
+    let joining = Joining {
+        records_bound: crate::crossing::RecordsBound::uncrossed(),
+        device: &device,
+        node: node(31),
+        name: "fresh".to_owned(),
+        model: "Mac16,10".to_owned(),
+    };
+    let prefix = format!("aterm-fleet/v3 record {}\0", desk::PROVE_RECORD);
+    let sign_node = |message: &[u8]| -> [u8; 64] {
+        pair.sign(&[prefix.as_bytes(), message].concat())
+            .as_ref()
+            .try_into()
+            .unwrap()
+    };
+    let now = aterm_time::unix_millis().unwrap();
+    std::thread::scope(|scope| {
+        let dial = |_: &str| -> crate::Result<Box<dyn Stream>> {
+            let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+            for end in [&ours, &theirs] {
+                end.set_read_timeout(Some(Duration::from_secs(60)))?;
+            }
+            let desk = &desk;
+            scope.spawn(move || {
+                let decide = |proving: &desk::Proving<'_>| {
+                    assert!(proving.lan, "a proof from the home ALab LAN");
+                    prove_at_ms(m7, proving, CURRENT, now)
+                };
+                let refuses = |proving: &desk::Proving<'_>| {
+                    refuses_before_possession_at_ms(m7, proving, CURRENT, now)
+                };
+                let _ = desk::serve_with(
+                    desk,
+                    &mut ours,
+                    "192.168.1.19".parse().unwrap(),
+                    &|_| Err(crate::Error::new("no phrase runs here")),
+                    Some(desk::Proof {
+                        decide: &decide,
+                        refuses: &refuses,
+                        fleet: None,
+                    }),
+                );
+            });
+            Ok(Box::new(theirs))
+        };
+        let joined = join::prove_first(&fresh, &dial, &joining, &sign_node, &["m7:7".to_owned()])
+            .unwrap_or_else(|missed| panic!("the excluded member let nobody in: {missed:?}"));
+        assert!(matches!(joined.admission, join::Admission::Logged));
+    });
+
+    assert_eq!(load_state(&fresh).unwrap().membership, Stored::In);
+    assert_eq!(
+        std::fs::read(fresh.home.join(".secrets/shared")).unwrap(),
+        b"everyone-v1"
+    );
+    let fresh_actor = device
+        .request(trust.network, trust.authority)
+        .unwrap()
+        .binding()
+        .actor();
+    let seated = load_records(&fresh).unwrap().log().unwrap().membership();
+    assert_eq!(
+        seated.get(&fresh_actor).and_then(|m| m.admitted_by),
+        Some(m7_actor),
+        "m7's Admit lets the new Mac in"
+    );
+    assert!(matches!(
+        crate::commons::observe(&fresh).unwrap(),
+        crate::commons::Observation::Unavailable(_)
+    ));
+
+    // The records reach the vault's server, and the other member reads the new Mac seated.
+    assert!(post_records_to_servers(m7).expect("m7 posts its records") >= 1);
+    sync_records(m22, None).expect("m22 pulls the records");
+    assert!(
+        load_records(m22)
+            .unwrap()
+            .log()
+            .unwrap()
+            .membership()
+            .contains(&fresh_actor)
+    );
+
+    // Nothing touched Commons control on the excluded member.
+    assert!(matches!(
+        crate::commons::observe(m7).unwrap(),
+        crate::commons::Observation::Unavailable(crate::commons::Unavailable::ControlExcluded)
+    ));
+    assert!(
+        commons_custody(m7) == custody,
+        "the excluded member's Commons custody changed"
+    );
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// One connection to `desk`, served as the window's desk serves it (`desk::serve_with`, whose run
+/// hands the bundle [`hand_over`] builds on `member`) while `joiner` speaks, each end with a
+/// one-minute hang detector.
+fn served_by<T>(
+    desk: &std::sync::Mutex<crate::members::desk::Desk>,
+    member: &Paths,
+    joiner: impl FnOnce(&mut std::os::unix::net::UnixStream) -> T,
+) -> (crate::Result<Option<crate::members::desk::Let>>, T) {
+    let (mut ours, mut theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
+    for end in [&ours, &theirs] {
+        end.set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("timeout");
+    }
+    std::thread::scope(|scope| {
+        let served = scope.spawn(move || {
+            crate::members::desk::serve_with(
+                desk,
+                &mut ours,
+                "192.0.2.9".parse().unwrap(),
+                &|handing| hand_over(member, handing),
+                None,
+            )
+        });
+        let said = joiner(&mut theirs);
+        drop(theirs);
+        (served.join().expect("the member's end"), said)
+    })
+}
+
+/// The excluded member's desk lets in a Mac a person allowed, as the window's desk runs it: the
+/// Mac asks, the desk greets it as a member that can allow under the anchor it pinned, a person
+/// allows the row, and the Mac runs the phrase (CPace, the possession challenge) over
+/// `desk::serve_with`, whose run hands it the membership log ([`hand_over`]): m7's `Admit` and
+/// `[everyone]` `Wrap`s, which the Mac writes and is in by. No Commons control is asked of either.
+///
+/// NEGATIVE CONTROL (in-test oracle): as in
+/// [`a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_by_its_proof`], the old rule gave
+/// this member no desk, so "the excluded member has a desk" fails under it.
+#[test]
+fn a_member_commons_control_leaves_out_lets_in_a_mac_a_person_allowed() {
+    use crate::commons::bootstrap::{Bootstrap, Device};
+    use crate::members::bundle::Handed;
+    use crate::members::desk::{Answer, Desk, Local};
+    use crate::members::joiner::{self, Joining};
+    // Every server this thread reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let trust = Bootstrap::required(m22).unwrap().trust();
+    exclude_m7_from_commons(&macs);
+    let custody = commons_custody(m7);
+    assert!(
+        Bootstrap::cached(m7).unwrap().is_none(),
+        "the oracle: the old desk had nothing to stand on here"
+    );
+    let local = Local::of(m7)
+        .expect("m7's state reads")
+        .expect("the excluded member has a desk");
+    assert_eq!(local.trust(), trust, "the anchor m7 pinned");
+    let m7_actor = *load_records(m7)
+        .unwrap()
+        .log()
+        .unwrap()
+        .membership()
+        .members()
+        .iter()
+        .find(|(_, member)| member.binding.writer() == local.key())
+        .expect("the desk's key is m7's seat")
+        .0;
+    let desk = std::sync::Mutex::new(Desk::new(local));
+
+    let fresh = Paths::for_home(&macs.root.path().join("allowed"));
+    machine_identity(&fresh).expect("identity");
+    let device = Device::open(&fresh).expect("device").expect("an identity");
+    let joining = Joining {
+        records_bound: crate::crossing::RecordsBound::uncrossed(),
+        device: &device,
+        node: node(32),
+        name: "allowed".to_owned(),
+        model: "Mac16,10".to_owned(),
+    };
+    let (served, asked) = served_by(&desk, m7, |stream| {
+        let greeting = joiner::greeting(stream)?;
+        assert!(
+            greeting.can_allow,
+            "the desk greets as a member that can allow"
+        );
+        joiner::ask(stream, &greeting, &joining)
+    });
+    served.expect("the ask is served");
+    assert_eq!(asked.expect("asked"), Answer::Asking);
+    let words = {
+        let mut desk = desk.lock().unwrap();
+        let now = aterm_time::Instant::now();
+        let row = desk.rows(now)[0].id;
+        let phrase = desk.allow(row, now).expect("a person allows the row");
+        desk.words(phrase, now).expect("live").join(" ")
+    };
+    let phrase = crate::phrase::Phrase::parse(&words).expect("three words");
+    let (served, ran) = served_by(&desk, m7, |stream| {
+        let greeting = joiner::greeting(stream)?;
+        joiner::run(stream, &greeting, &joining, &phrase)
+    });
+    let bundle = ran.expect("the run hands the bundle");
+    let let_in = served
+        .expect("the run is served")
+        .expect("a run that sent its bundle");
+    assert!(let_in.logged, "the log, not F10's files");
+    assert!(matches!(bundle.handed, Handed::Log { .. }));
+
+    write_from_log_bundle(&fresh, &bundle).expect("the Mac writes the log bundle");
+    assert_eq!(load_state(&fresh).unwrap().membership, Stored::In);
+    assert_eq!(
+        std::fs::read(fresh.home.join(".secrets/shared")).unwrap(),
+        b"everyone-v1"
+    );
+    let fresh_actor = device
+        .request(trust.network, trust.authority)
+        .unwrap()
+        .binding()
+        .actor();
+    assert_eq!(
+        load_records(&fresh)
+            .unwrap()
+            .log()
+            .unwrap()
+            .membership()
+            .get(&fresh_actor)
+            .and_then(|m| m.admitted_by),
+        Some(m7_actor),
+        "m7's Admit lets the new Mac in"
+    );
+    assert!(matches!(
+        crate::commons::observe(m7).unwrap(),
+        crate::commons::Observation::Unavailable(crate::commons::Unavailable::ControlExcluded)
+    ));
+    assert!(
+        commons_custody(m7) == custody,
+        "the excluded member's Commons custody changed"
+    );
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// A vault pass that holds an excluded member's state while its desk reads its seat delays the
+/// read, as the Commons observation before it waits for a busy vault: the seat is read once the
+/// pass ends, and a pass that still holds the state at the read's deadline is a refusal that
+/// says so, no sooner than that deadline. The pass ends only once the second read is waiting for
+/// it (its first blocked try, through `OBSERVE_BLOCKED`), so that read starts while the pass still
+/// holds the state.
+///
+/// NEGATIVE CONTROLS: `log_seat` reading with `open_local_member_signer_until` (the read that
+/// does not wait, as before): the held read fails at once with "busy or unavailable", and "a pass
+/// still holding the state at the deadline" fails. `log_entries::observe_signer_until`
+/// observing the state once (`StateLock::observe(paths)?`, the same error text): "no sooner than
+/// its deadline" fails, and with that assert cut, "the read waits for the pass that holds the
+/// state" fails.
+#[test]
+fn an_excluded_members_seat_read_waits_for_a_vault_pass() {
+    use crate::commons::bootstrap::Bootstrap;
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let trust = Bootstrap::required(m22).unwrap().trust();
+    exclude_m7_from_commons(&macs);
+    let held = StateLock::take(m7).expect("a pass holds m7's state");
+    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+    let error = seated_member(m7, Some(deadline))
+        .err()
+        .expect("a pass still holding the state at the deadline");
+    assert!(
+        std::time::Instant::now() >= deadline,
+        "the held read returns no sooner than its deadline: {error}"
+    );
+    assert!(error.to_string().contains("at the deadline"), "{error}");
+    let (waiting, waits) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let read = scope.spawn(move || {
+            let mut waiting = Some(waiting);
+            super::super::OBSERVE_BLOCKED.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if let Some(waiting) = waiting.take() {
+                        let _ = waiting.send(());
+                    }
+                }));
+            });
+            let read = seated_member(
+                m7,
+                Some(std::time::Instant::now() + Duration::from_secs(60)),
+            );
+            super::super::OBSERVE_BLOCKED.with(|hook| hook.borrow_mut().take());
+            read
+        });
+        waits
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the read waits for the pass that holds the state");
+        drop(held);
+        let (_, pinned) = read
+            .join()
+            .expect("the reader")
+            .expect("the seat reads once the pass ends")
+            .expect("m7 is seated");
+        assert_eq!(pinned, trust);
+    });
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// A seated member whose own vault pass holds its state when its desk asks whether it can allow
+/// ([`admits_by_log`], which `members::desk::Local::of` asks right after a Commons read that waits
+/// for such a pass) is told it can once the pass ends, though the pass brought a record in: the
+/// pass pulls a record m22 posted and ends while the read waits on it
+/// ([`crate::client::OBSERVE_BLOCKED`]), and the seat is read from the log the pass left.
+///
+/// NEGATIVE CONTROLS: `log_seat` reading with `open_local_member_signer_until` (a read that does
+/// not wait): it finds the state held, never reaches the hook, and "the read waits for the pass"
+/// fails. `log_seat` loading its log before the wait (as 04dc05e579 did): that log is behind the
+/// vault snapshot the pass wrote, and "m7's log seats it once the pass ends" fails.
+#[test]
+fn a_seated_members_allow_read_waits_for_a_vault_pass() {
+    let _answering = ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    assert!(admits_by_log(m7), "m7's log seats it");
+    let pair = node_pair(22);
+    publish_local_node_key(m22, node(22), |network, actor| {
+        pair.sign(&node_proof_message(network, actor))
+            .as_ref()
+            .try_into()
+            .unwrap()
+    })
+    .expect("m22 publishes its node key")
+    .expect("a Node record");
+    post_records_to_servers(m22).expect("m22 posts its records");
+    let held = StateLock::take(m7).expect("a pass holds m7's state");
+    let (blocks, blocked) = std::sync::mpsc::channel::<()>();
+    let (ends, ended) = std::sync::mpsc::channel::<()>();
+    let (seated, waits, pulled) = std::thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            let waits = std::rc::Rc::new(std::cell::Cell::new(0));
+            let count = std::rc::Rc::clone(&waits);
+            crate::client::OBSERVE_BLOCKED.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    count.set(count.get() + 1);
+                    let _ = blocks.send(());
+                    ended
+                        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                        .expect("the pass ends");
+                }));
+            });
+            // The hang detector, not the desk's own wait: a real pass runs while the read waits.
+            let seated = super::super::admit::admits_by_log_until(
+                m7,
+                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            );
+            crate::client::OBSERVE_BLOCKED.with(|hook| hook.borrow_mut().take());
+            (seated, waits.get())
+        });
+        blocked
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the read waits for the pass that holds the state");
+        // The pass: it lets the state go and m7's own pass pulls m22's record in, while the read
+        // still waits in its hook.
+        drop(held);
+        let pulled = sync_records(m7, None).expect("m7's pass pulls m22's record");
+        ends.send(()).expect("the reader waits");
+        let (seated, waits) = reader.join().expect("the reader");
+        (seated, waits, pulled)
+    });
+    assert!(pulled >= 1, "the pass brought m22's record in");
+    assert_eq!(waits, 1, "the read found m7's state held once");
+    assert!(seated, "m7's log seats it once the pass ends");
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// A member's write while its own vault pass holds its state waits for the pass, though the pass
+/// brings a record in: m7's state is held, the write waits on it
+/// ([`crate::client::OBSERVE_BLOCKED`]), the pass pulls a record m22 posted and ends, and the
+/// write puts its value under the newest `[everyone]` epoch, read from the log the pass left.
+///
+/// NEGATIVE CONTROL: `test_put_everyone` drafting under `author_and_commit_records` (one
+/// observation that does not wait, as before): it finds the state held, never reaches the hook,
+/// and "the write waits for the pass" fails.
+#[test]
+fn a_members_write_waits_for_its_own_vault_pass() {
+    let _answering = ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let pair = node_pair(22);
+    publish_local_node_key(m22, node(22), |network, actor| {
+        pair.sign(&node_proof_message(network, actor))
+            .as_ref()
+            .try_into()
+            .unwrap()
+    })
+    .expect("m22 publishes its node key")
+    .expect("a Node record");
+    post_records_to_servers(m22).expect("m22 posts its records");
+    let held = StateLock::take(m7).expect("a pass holds m7's state");
+    let (blocks, blocked) = std::sync::mpsc::channel::<()>();
+    let (ends, ended) = std::sync::mpsc::channel::<()>();
+    let (put, pulled) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            let mut blocks = Some(blocks);
+            crate::client::OBSERVE_BLOCKED.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if let Some(blocks) = blocks.take() {
+                        let _ = blocks.send(());
+                        ended
+                            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                            .expect("the pass ends");
+                    }
+                }));
+            });
+            let put = test_put_everyone(m7, "written-while-a-pass-ran", b"v");
+            crate::client::OBSERVE_BLOCKED.with(|hook| hook.borrow_mut().take());
+            put
+        });
+        blocked
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the write waits for the pass that holds the state");
+        drop(held);
+        let pulled = sync_records(m7, None).expect("m7's pass pulls m22's record");
+        ends.send(()).expect("the writer waits");
+        (writer.join().expect("the writer"), pulled)
+    });
+    assert!(pulled >= 1, "the pass brought m22's record in");
+    put.expect("the write lands once the pass ends");
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// A member's removal while its own vault pass holds its state waits for the pass, though the
+/// pass brings a record in. The churn lab found this: a `members remove` that met its Mac's
+/// subscriber applying refused at once, "the vault state is busy or unavailable while reading
+/// its signer". m22's state is held, and its removal of m7, an admin of the envelope 0.145 Macs
+/// read, waits on it ([`crate::client::OBSERVE_BLOCKED`]). The pass pulls a record m7 posted
+/// and ends. The removal then signs from the log the pass left: m7 is out of m22's log, and the
+/// removal still says m7 keeps the envelope's signing key.
+///
+/// NEGATIVE CONTROLS:
+/// - `author_and_commit_records` drafting with no observation, as before (`draft_observation`
+///   returning `Ok(None)`). The draft's signer read finds the state held, the removal never
+///   reaches the hook, and "the removal waits for the pass" fails.
+/// - `vault_admin_named` read before the draft, as before: its read finds the state held and
+///   names no admin, and "the removal says m7 keeps the signing key" fails.
+#[test]
+fn a_members_removal_waits_for_its_own_vault_pass() {
+    let _answering = ServersAnswering::set();
+    let macs = super::super::log_entries_tests::two_macs_with(
+        &[(Audience::Everyone, "shared", b"everyone-v1".as_slice())],
+        true,
+    );
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let pair = node_pair(7);
+    publish_local_node_key(m7, node(7), |network, actor| {
+        pair.sign(&node_proof_message(network, actor))
+            .as_ref()
+            .try_into()
+            .unwrap()
+    })
+    .expect("m7 publishes its node key")
+    .expect("a Node record");
+    post_records_to_servers(m7).expect("m7 posts its records");
+    let seat = |paths: &Paths| {
+        let store = load_records(paths).unwrap();
+        crate::client::log_entries::open_local_member_signer(paths, store.log().unwrap())
+            .unwrap()
+            .expect("a seat")
+            .0
+    };
+    let m7_seat = seat(m7);
+    let held = StateLock::take(m22).expect("a pass holds m22's state");
+    let (blocks, blocked) = std::sync::mpsc::channel::<()>();
+    let (ends, ended) = std::sync::mpsc::channel::<()>();
+    let (removal, pulled) = std::thread::scope(|scope| {
+        let remover = scope.spawn(move || {
+            let mut blocks = Some(blocks);
+            crate::client::OBSERVE_BLOCKED.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if let Some(blocks) = blocks.take() {
+                        let _ = blocks.send(());
+                        ended
+                            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                            .expect("the pass ends");
+                    }
+                }));
+            });
+            let removal = remove_member(m22, "m7", false);
+            crate::client::OBSERVE_BLOCKED.with(|hook| hook.borrow_mut().take());
+            removal
+        });
+        blocked
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the removal waits for the pass that holds the state");
+        drop(held);
+        let pulled = sync_records(m22, None).expect("m22's pass pulls m7's record");
+        ends.send(()).expect("the remover waits");
+        (remover.join().expect("the remover"), pulled)
+    });
+    assert!(pulled >= 1, "the pass brought m7's record in");
+    let removal = removal.expect("the removal lands once the pass ends");
+    assert!(removal.signed > 0, "the removal signed its batch");
+    assert!(
+        removal
+            .envelope_notes
+            .iter()
+            .any(|note| note.contains("m7 was an admin") && note.contains("signing key")),
+        "the removal says m7 keeps the signing key: {:?}",
+        removal.envelope_notes
+    );
+    let after = load_records(m22).unwrap();
+    assert!(
+        !after.log().unwrap().membership().contains(&m7_seat),
+        "m7 is out of m22's log"
+    );
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// Copy the file or directory `from` to `to`, keeping each file's mode and making each directory
+/// this user's alone, as Commons custody is held.
+fn copy_private(from: &Path, to: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kind = std::fs::symlink_metadata(from).unwrap().file_type();
+    if kind.is_dir() {
+        std::fs::create_dir(to).unwrap();
+        std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            copy_private(&entry.path(), &to.join(entry.file_name()));
+        }
+    } else {
+        assert!(kind.is_file(), "{} is no file", from.display());
+        std::fs::copy(from, to).unwrap();
+    }
+}
+
+/// The parts of the pinned Commons anchor at `paths`: the pin, its claim, and the control journal
+/// that carries the anchor too.
+fn anchor_parts(paths: &Paths) -> [std::path::PathBuf; 3] {
+    [
+        paths.dir.join("commons/default.pin"),
+        paths.dir.join("commons.claim"),
+        paths.dir.join("commons/control"),
+    ]
+}
+
+/// NEGATIVE CONTROLS for the log-seat rule: no desk for a Mac with no vault; for a Mac its vault
+/// lets in, holding Commons custody and a pinned anchor, that its log seats nowhere (its Commons
+/// control narrowed away, so only the seat is missing); for a Commons-excluded member that lost
+/// its pinned anchor; an error for one whose pin its claim does not name, and for one whose pin,
+/// claim and control journal agree on another network than its membership log's (no other anchor
+/// stands in for the log's); and no desk for a member its log removed.
+///
+/// Each was also run as a mutant. `log_seat`, for the desk's read (with a deadline), taking the
+/// device it opens whether or not the log seats it (`Some(_) => return
+/// Ok(Device::open_existing(paths).ok().map(|device| (device, *root)))`): `m9` gets a desk and "no
+/// seat" fails. `seated_member`'s root check cut (`if false && root != …`): the agreeing foreign
+/// anchor gets a desk and "an anchor naming another network than the log" fails.
+#[test]
+fn no_vault_no_seat_no_pinned_anchor_or_a_removal_gives_no_desk() {
+    use crate::commons::bootstrap::{Bootstrap, Device, established_trust};
+    use crate::commons::{Observation, Unavailable};
+    use crate::members::desk::Local;
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    exclude_m7_from_commons(&macs);
+
+    let bare = Paths::for_home(&macs.root.path().join("bare"));
+    machine_identity(&bare).expect("identity");
+    Device::open(&bare).expect("device").expect("an identity");
+    assert!(Local::of(&bare).expect("readable").is_none(), "no vault");
+
+    // m9 is approved after Genesis v2: no record admits it, so the log seats it nowhere.
+    let m9 = Paths::for_home(&macs.root.path().join("m9"));
+    let m9_rec = machine_identity(&m9).unwrap().recipient().to_bech32();
+    {
+        let admin = admin_open(m22).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.add_machine("m9", &m9_rec).unwrap();
+        admin_publish_approved(m22, &admin, &doc, std::slice::from_ref(&m9_rec)).unwrap();
+    }
+    join_host(&m9, &format!("{}#{}", macs.url, macs.signer), "m9");
+    // Its approval addressed Commons control to it: it opens Commons while it holds control, so
+    // it holds a device and pins the network's anchor, as m7 did. The admin then narrows control
+    // to itself again.
+    Bootstrap::required(&m9).expect("m9 opens Commons while control reaches it");
+    narrow_commons_to_m22(m22);
+    sync(&m9, None).expect("m9 syncs");
+    assert!(matches!(
+        status(&m9).unwrap().membership,
+        Membership::In { .. }
+    ));
+    let observed = crate::commons::observe(&m9).unwrap();
+    assert!(
+        matches!(
+            observed,
+            Observation::Unavailable(Unavailable::ControlExcluded | Unavailable::ControlNotVisible)
+        ),
+        "{:?}",
+        match &observed {
+            Observation::Unavailable(reason) => reason.code(),
+            Observation::Visible(_) => "visible",
+        }
+    );
+    assert!(m9.dir.join("commons/device.age").is_file(), "m9's device");
+    assert!(m9.dir.join("commons/default.pin").is_file(), "m9's pin");
+    assert_eq!(
+        established_trust(&m9).expect("m9's anchor reads"),
+        Some(Bootstrap::required(m22).unwrap().trust()),
+        "m9 pinned the network's anchor"
+    );
+    assert!(!admits_by_log(&m9));
+    assert!(Local::of(&m9).expect("readable").is_none(), "no seat");
+    assert!(!member_by_log(&m9).expect("readable"));
+
+    let pin = m7.dir.join("commons/default.pin");
+    let pinned = std::fs::read(&pin).unwrap();
+    std::fs::rename(&pin, pin.with_extension("gone")).unwrap();
+    assert!(
+        Local::of(m7).expect("readable").is_none(),
+        "no pinned anchor"
+    );
+    assert!(!member_by_log(m7).expect("readable"));
+    std::fs::rename(pin.with_extension("gone"), &pin).unwrap();
+    let mut other = pinned.clone();
+    other[4] ^= 1;
+    fsx::write_atomic(&pin, &other, 0o600).unwrap();
+    let error = Local::of(m7).err().expect("a pin its claim does not name");
+    assert!(
+        error
+            .to_string()
+            .contains("differs from its retained history claim"),
+        "{error}"
+    );
+    fsx::write_atomic(&pin, &pinned, 0o600).unwrap();
+
+    // Another network's anchor, whole: the pin, claim and control journal of a member of another
+    // vault's network, which agree with each other, beside m7's own device, which m7's log seats.
+    let elsewhere = macs.root.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let elsewhere = test_commons_excluded(&elsewhere).expect("a member of another network");
+    let foreign = established_trust(&elsewhere.member)
+        .expect("its anchor reads")
+        .expect("it pinned one");
+    assert_ne!(
+        foreign.network,
+        Bootstrap::required(m22).unwrap().trust().network
+    );
+    let kept = |path: &Path| path.with_extension("kept");
+    for (own, theirs) in anchor_parts(m7)
+        .iter()
+        .zip(anchor_parts(&elsewhere.member).iter())
+    {
+        std::fs::rename(own, kept(own)).unwrap();
+        copy_private(theirs, own);
+    }
+    assert_eq!(
+        established_trust(m7).expect("the foreign anchor agrees with itself"),
+        Some(foreign)
+    );
+    let error = Local::of(m7)
+        .err()
+        .expect("an anchor naming another network than the log");
+    assert!(
+        error
+            .to_string()
+            .contains("names another network than its membership log"),
+        "{error}"
+    );
+    for own in anchor_parts(m7) {
+        if own.is_dir() {
+            std::fs::remove_dir_all(&own).unwrap();
+        } else {
+            std::fs::remove_file(&own).unwrap();
+        }
+        std::fs::rename(kept(&own), &own).unwrap();
+    }
+    elsewhere.server.stop();
+    assert!(Local::of(m7).unwrap().is_some(), "the pinned anchor again");
+    assert!(member_by_log(m7).expect("readable"));
+
+    remove_member(m22, "m7", false).expect("m22 removes m7");
+    sync(m7, None).expect("m7 syncs its removal");
+    assert!(
+        Local::of(m7).expect("readable").is_none(),
+        "removed by its log"
+    );
+    assert!(!member_by_log(m7).expect("readable"));
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// The seam other crates' tests build a Commons-excluded member with ([`test_commons_excluded`])
+/// builds one this crate's desk reads as a member that can allow.
+#[test]
+fn the_commons_excluded_seam_builds_a_seated_member_with_a_desk() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let fixture = test_commons_excluded(root.path()).expect("the seam's member");
+    let local = crate::members::desk::Local::of(&fixture.member)
+        .expect("its state reads")
+        .expect("the excluded member has a desk");
+    assert!(local.can_allow());
+    fixture.server.stop();
 }
 
 /// When `read_newest` pulls records that either deny the proving Mac in `aterm-swarm-roster` or
@@ -2219,4 +3092,758 @@ fn record_budgets_and_the_proof_reserve_conform() {
         (5, 3, 1),
         "the mutant signs the Admit, and the held total refuses its Wrap"
     );
+}
+
+/// A12: a lab identity's proof is refused on the live ALab genesis: before the possession
+/// challenge where the desk checks first ([`refuses_before_possession_at_ms`]), and at the
+/// decision where it does not ([`prove_at_ms`]), with nothing signed either way. The same proof on
+/// another genesis, a lab's, lets the Mac in. The pair shows the refusal bites.
+#[test]
+fn a_lab_identitys_proof_is_refused_on_the_live_genesis_and_let_in_on_another() {
+    use crate::client::with_live_genesis;
+    use crate::members::desk::{self, Desk, Local};
+    use crate::members::join::{self, Stream};
+    use crate::members::joiner::Joining;
+    let _answering = ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let pair = node_pair(8);
+    let n7 = node(8);
+    publish_local_node_key(m7, n7, |network, actor| {
+        pair.sign(&node_proof_message(network, actor))
+            .as_ref()
+            .try_into()
+            .unwrap()
+    })
+    .expect("m7 publishes its node key")
+    .expect("a Node record");
+    post_records_to_servers(m7).expect("m7 posts its records");
+    sync_records(m22, None).expect("m22 pulls m7's Node record");
+    let desk = std::sync::Mutex::new(Desk::new(
+        Local::of(m22)
+            .expect("m22's desk")
+            .expect("m22 is a member"),
+    ));
+
+    let lab = Paths::for_home(&macs.root.path().join("m7-lab"));
+    machine_identity(&lab).expect("identity");
+    let device = crate::commons::bootstrap::Device::open(&lab)
+        .expect("device")
+        .expect("an identity");
+    assert_eq!(device.lab(), Some(crate::LabMark::TestBinary));
+    let joining = Joining {
+        records_bound: crate::crossing::RecordsBound::uncrossed(),
+        device: &device,
+        node: n7,
+        name: "m7".to_owned(),
+        model: "Mac15,3".to_owned(),
+    };
+    let prefix = format!("aterm-fleet/v3 record {}\0", desk::PROVE_RECORD);
+    let sign_node = |message: &[u8]| -> [u8; 64] {
+        pair.sign(&[prefix.as_bytes(), message].concat())
+            .as_ref()
+            .try_into()
+            .unwrap()
+    };
+    // A day past m7's last record (its `Node`), so the old seat is dark.
+    let later = aterm_time::unix_millis().unwrap() + DARK_FOR_MS + 1;
+    // One proof from the lab identity to m22's desk, m22 on the live genesis (`live`) or not, its
+    // desk asking the check before possession first (`checks_first`) or not.
+    let prove = |live: bool, checks_first: bool| {
+        std::thread::scope(|scope| {
+            let dial = |_: &str| -> crate::Result<Box<dyn Stream>> {
+                let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+                for end in [&ours, &theirs] {
+                    end.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
+                }
+                let desk = &desk;
+                scope.spawn(move || {
+                    let decide = |proving: &desk::Proving<'_>| {
+                        with_live_genesis(live, || prove_at_ms(m22, proving, CURRENT, later))
+                    };
+                    let refuses = |proving: &desk::Proving<'_>| {
+                        checks_first
+                            .then(|| {
+                                with_live_genesis(live, || {
+                                    refuses_before_possession_at_ms(m22, proving, CURRENT, later)
+                                })
+                            })
+                            .flatten()
+                    };
+                    let _ = desk::serve_with(
+                        desk,
+                        &mut ours,
+                        std::net::IpAddr::from([192, 0, 2, 22]),
+                        &|_| Err(crate::Error::new("no phrase runs here")),
+                        Some(desk::Proof {
+                            decide: &decide,
+                            refuses: &refuses,
+                            fleet: None,
+                        }),
+                    );
+                });
+                Ok(Box::new(theirs))
+            };
+            join::prove_first(&lab, &dial, &joining, &sign_node, &["m22:7".to_owned()])
+        })
+    };
+    let records = || load_records(m22).unwrap().log().unwrap().records().count();
+    let before = records();
+
+    let missed = prove(true, true).expect_err("refused before possession");
+    assert!(!missed.signed_maybe, "{missed:?}");
+    assert_eq!(missed.refused[0].1, desk::LAB_REFUSED, "{missed:?}");
+    let missed = prove(true, false).expect_err("refused at the decision");
+    assert_eq!(missed.refused[0].1, desk::LAB_REFUSED, "{missed:?}");
+    assert_eq!(records(), before, "m22 signed nothing for a lab identity");
+    assert_ne!(load_state(&lab).unwrap().membership, Stored::In);
+
+    let joined = prove(false, true).expect("let in on another genesis");
+    assert_eq!(joined.name, "m7");
+    assert_eq!(load_state(&lab).unwrap().membership, Stored::In);
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// The last `Remove` in `paths`'s log naming `seat`, and every epoch after it in the log's causal
+/// order that wraps `recipient`: a moved or removed seat's binding must be in none of them.
+fn epochs_after_remove_wrapping(
+    paths: &Paths,
+    seat: &MemberId,
+    recipient: &age::Recipient,
+) -> (RecordId, Vec<RecordId>) {
+    let store = load_records(paths).unwrap();
+    let log = store.log().unwrap();
+    let identity = read_identity(paths).unwrap().unwrap();
+    let opened = log.open_audience_entries(&identity).unwrap().unwrap();
+    let order: Vec<&Record> = log.records().collect();
+    let at = order
+        .iter()
+        .rposition(|r| matches!(r.body(), Body::Remove { member, .. } if member == seat))
+        .expect("a Remove of the seat");
+    let wrapping = order[at + 1..]
+        .iter()
+        .filter(|r| r.kind() == Kind::Epoch)
+        .filter(|r| {
+            opened
+                .wrapped_recipients
+                .get(r.id())
+                .is_some_and(|set| set.contains(recipient))
+        })
+        .map(|r| *r.id())
+        .collect();
+    (*order[at].id(), wrapping)
+}
+
+/// Whether `paths`'s newest `[everyone]` epochs each wrap `recipient`.
+fn newest_everyone_wraps(paths: &Paths, recipient: &age::Recipient) -> bool {
+    let store = load_records(paths).unwrap();
+    let log = store.log().unwrap();
+    let identity = read_identity(paths).unwrap().unwrap();
+    let opened = log.open_audience_entries(&identity).unwrap().unwrap();
+    let newest = log.newest_epochs(&EpochAudience::Everyone);
+    !newest.is_empty()
+        && newest.iter().all(|epoch| {
+            opened
+                .wrapped_recipients
+                .get(epoch)
+                .is_some_and(|set| set.contains(recipient))
+        })
+}
+
+/// m7 is rebuilt with its fleet node key kept (a fresh vault folder) a minute after its old seat
+/// signed its `Node` record: no proof moves the seat within [`DARK_FOR_MS`], and today's person's
+/// Allow refused it ("already bound to a different seat"). A person's Allow on m22 now signs the
+/// batch a proof's `Replace` signs ([`sign_seat_move`]): the `Remove` of the old seat cut at its
+/// last record, the `Admit` under `m7` with the node key, and the `[everyone]` and Commons
+/// rotation. The Mac keeps its label and reads `[everyone]`, while the old binding is in no epoch
+/// newer than the `Remove`. With a 0.147 member in the fleet book, the Allow refuses first.
+///
+/// NEGATIVE CONTROL: `sign_seat_move` without its `rotate_after_removal` (an early `return
+/// Ok(signed)` before it): the batch mints no epoch and the `Kind::Epoch` assert fails.
+#[test]
+fn a_persons_allow_moves_a_kept_key_seat_that_signed_a_minute_ago() {
+    let _answering = ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let (_, old, _) = member_key(m7);
+    let old_recipient = read_identity(m7).unwrap().unwrap().recipient();
+    let pair = node_pair(17);
+    let n7 = node(17);
+    publish_local_node_key(m7, n7, |network, actor| {
+        pair.sign(&node_proof_message(network, actor))
+            .as_ref()
+            .try_into()
+            .unwrap()
+    })
+    .expect("m7 publishes its node key")
+    .expect("a Node record");
+    post_records_to_servers(m7).expect("m7 posts its records");
+    sync_records(m22, None).expect("m22 pulls m7's Node record");
+    let (fresh, request, _) = newcomer(macs.root.path(), m22, "m7-fresh");
+    let new_recipient = request.binding().recipient();
+    let minute_later = aterm_time::unix_millis().unwrap() + 60_000;
+
+    // No proof moves it: the old seat signed within the day.
+    let proven = Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
+        request: &request,
+        node: n7,
+        name: "m7",
+        fleet: false,
+        lan: false,
+        fresh: true,
+        book: CURRENT,
+    };
+    let by_proof = admit_by_proof(m22, &proven, minute_later).expect("proof");
+    assert!(
+        matches!(&by_proof, Readmit::Refused(why) if why.contains("last day")),
+        "{by_proof:?}"
+    );
+
+    let allow = |book: Book| {
+        super::super::admit::log_path(
+            m22,
+            &request,
+            n7,
+            "m7",
+            minute_later,
+            (
+                Some(crate::members::bundle::Reader::BoundedLog(
+                    crate::crossing::RecordsBound::uncrossed(),
+                )),
+                false,
+                (book, true),
+            ),
+            None,
+        )
+        .expect("the Allow runs")
+    };
+    // A member heard on 0.147 would read the moved seat as removed: the Allow waits.
+    let held = allow(Book::default());
+    assert!(
+        matches!(&held, super::super::admit::ByLog::KeptOut(why) if why.contains("0.148")),
+        "{held:?}"
+    );
+
+    let moved = allow(CURRENT);
+    let super::super::admit::ByLog::Admitted(admission) = moved else {
+        panic!("the person's Allow does not move m7's seat: {moved:?}");
+    };
+    assert_eq!(admission.label, "m7", "the label carries over");
+    let kinds: Vec<Kind> = admission.signed.iter().map(Record::kind).collect();
+    assert_eq!(&kinds[..2], &[Kind::Remove, Kind::Admit], "{kinds:?}");
+    assert!(
+        kinds.contains(&Kind::Epoch),
+        "the batch rotates [everyone]: {kinds:?}"
+    );
+    let store = load_records(m22).unwrap();
+    let membership = store.log().unwrap().membership();
+    let me = request.binding().actor();
+    assert_eq!(membership.label(&me), Some("m7"));
+    assert_eq!(membership.node(&n7), NodeStanding::Member(me));
+    assert!(!membership.contains(&old), "the old seat is out");
+
+    let (_, wrapping) = epochs_after_remove_wrapping(m22, &old, &old_recipient);
+    assert!(
+        wrapping.is_empty(),
+        "the old binding reads an epoch newer than its Remove: {wrapping:?}"
+    );
+    assert!(newest_everyone_wraps(m22, &new_recipient));
+    assert!(!newest_everyone_wraps(m22, &old_recipient));
+    assert!(
+        store.log().unwrap().rekey_dues().is_empty(),
+        "nothing is left due"
+    );
+    // The rebuilt Mac reads [everyone] from the log alone.
+    let identity = read_identity(&fresh).unwrap().unwrap();
+    let entries = store
+        .log()
+        .unwrap()
+        .open_entries(&identity)
+        .unwrap()
+        .unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.name == "shared" && e.value.as_slice() == b"everyone-v1"),
+        "the moved Mac reads [everyone]"
+    );
+    // The Mac left out by the move is offered no Undo of it.
+    sync_records(m7, None).expect("m7 pulls the move");
+    assert!(undo_offers(m7).expect("undo offers").is_empty());
+
+    // A second Allow signs nothing new.
+    let again = allow(CURRENT);
+    assert!(
+        matches!(&again, super::super::admit::ByLog::Admitted(a) if a.signed.is_empty()),
+        "{again:?}"
+    );
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// The negative control A15 names, run on every test pass: [`sign_seat_move`] without its
+/// `Remove` of the old seat. The evaluator, over what was signed, does not seat the Mac under the
+/// old label with its node key (the old seat holds both still), so the person's Allow keeps
+/// nothing, and m22's records are what they were.
+#[test]
+fn a_seat_move_without_its_remove_is_refused_by_the_evaluator() {
+    let _answering = ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let pair = node_pair(18);
+    let n7 = node(18);
+    publish_local_node_key(m7, n7, |network, actor| {
+        pair.sign(&node_proof_message(network, actor))
+            .as_ref()
+            .try_into()
+            .unwrap()
+    })
+    .unwrap()
+    .unwrap();
+    post_records_to_servers(m7).unwrap();
+    sync_records(m22, None).unwrap();
+    let (_fresh, request, _) = newcomer(macs.root.path(), m22, "m7-fresh");
+    let before = load_records(m22).unwrap().inventory();
+    let allow = || {
+        super::super::admit::log_path(
+            m22,
+            &request,
+            n7,
+            "m7",
+            aterm_time::unix_millis().unwrap() + 60_000,
+            (
+                Some(crate::members::bundle::Reader::BoundedLog(
+                    crate::crossing::RecordsBound::uncrossed(),
+                )),
+                false,
+                (CURRENT, true),
+            ),
+            None,
+        )
+        .expect("the Allow runs")
+    };
+    MOVE_WITHOUT_REMOVE.with(|on| on.set(true));
+    let dropped = allow();
+    MOVE_WITHOUT_REMOVE.with(|on| on.set(false));
+    assert!(
+        matches!(&dropped, super::super::admit::ByLog::KeptOut(why) if why.contains("would not seat")),
+        "{dropped:?}"
+    );
+    assert_eq!(
+        load_records(m22).unwrap().inventory(),
+        before,
+        "nothing was kept"
+    );
+    // CONTROL: the same Allow with the Remove moves the seat.
+    assert!(matches!(allow(), super::super::admit::ByLog::Admitted(_)));
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// What a person's Allow of a node key a live seat holds still refuses, read from the log alone
+/// ([`super::super::admit::allowed`]): the seat moves to the new key under its label where the
+/// Mac proved the node key and the fleet book reads moved seats, and not where a member runs
+/// 0.147 or the Mac only names the key; a key two seats hold is not moved; and a seat a quorum
+/// removed stays out, however the person presses.
+///
+/// NEGATIVE CONTROL: `allowed_seat_move` returning `None` for `NodeStanding::Contested` (folded
+/// into the `Unknown` arm): the contested key reads as no move, the Allow is refused only as a
+/// key bound to another seat, and the `contested` assert fails.
+#[test]
+fn a_persons_allow_still_refuses_a_contested_key_a_quorums_removal_and_0147() {
+    let allowed = |log: &Log, mac: Mac, tag: u8, restore: bool, book: Book| {
+        super::super::admit::allowed(
+            log,
+            mac.request().binding(),
+            node(tag),
+            (restore, true),
+            book,
+        )
+    };
+    let log = alab();
+    let moved = allowed(&log, Mac(12), 2, false, CURRENT).expect("the Allow moves SEAT");
+    let (seat, _, label) = moved.expect("a move");
+    assert_eq!((seat, label.as_str()), (SEAT.id(), "m2"));
+    // A Mac that only names the seat's node key (an ask proves none) moves nothing.
+    let named = super::super::admit::allowed(
+        &log,
+        Mac(12).request().binding(),
+        node(2),
+        (false, false),
+        CURRENT,
+    );
+    assert!(
+        named
+            .as_ref()
+            .is_err_and(|why| why.contains("did not prove")),
+        "{named:?}"
+    );
+    let old = allowed(&log, Mac(12), 2, false, Book::default());
+    assert!(
+        old.as_ref().is_err_and(|why| why.contains("0.148")),
+        "{old:?}"
+    );
+
+    let mut contested = alab();
+    node_record(&mut contested, LISTED, 2, 4);
+    assert_eq!(
+        contested.membership().node(&node(2)),
+        NodeStanding::Contested
+    );
+    let refused = allowed(&contested, Mac(12), 2, false, CURRENT);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|why| why.contains("two seats hold")),
+        "contested: {refused:?}"
+    );
+
+    let mut quorum = alab();
+    let cutoff = *quorum
+        .records()
+        .filter(|r| r.actor() == &SEAT.id())
+        .last()
+        .unwrap()
+        .id();
+    for by in [ME, LISTED] {
+        keep(
+            &mut quorum,
+            by,
+            T0,
+            Body::Remove {
+                member: SEAT.id(),
+                cutoff,
+            },
+        );
+    }
+    assert!(
+        quorum
+            .membership()
+            .removal(&SEAT.id())
+            .is_some_and(|r| r.quorum)
+    );
+    for restore in [false, true] {
+        let refused = allowed(&quorum, Mac(12), 2, restore, CURRENT);
+        assert!(
+            refused.as_ref().is_err_and(|why| why.contains("quorum")),
+            "restore={restore}: {refused:?}"
+        );
+    }
+}
+
+/// A8's churn finding, on two real vault folders: m22's removal of m7 reached the log as a bare
+/// `Remove` (its remover killed before the rotation of its batch), and m7 then came back with a
+/// fresh vault key and its node key kept by a person's "Allow again". The restoring `Admit`
+/// supersedes the removed seat, and before this fix the evaluator then dropped its recipient from
+/// the removed ones: no rotation was ever due, and every newest `[everyone]` epoch still wrapped
+/// the removed binding. A `Remove` now keeps counting its recipient as removed until an epoch that
+/// excludes it is minted: the rotation is due at once, the ranked minter's pass mints it, and the
+/// old binding is in no epoch newer than the `Remove`.
+///
+/// NEGATIVE CONTROL: the superseded-seat loop at the end of `Log::evaluate`'s membership
+/// (`membership_log/eval.rs`) cut: `rekey_dues` is empty after the restore and the `due` assert
+/// fails.
+#[test]
+fn allow_again_of_a_kept_node_key_rotates_out_the_removed_binding() {
+    let _answering = ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let (_, old, _) = member_key(m7);
+    let old_recipient = read_identity(m7).unwrap().unwrap().recipient();
+    let pair = node_pair(19);
+    let n7 = node(19);
+    publish_local_node_key(m7, n7, |network, actor| {
+        pair.sign(&node_proof_message(network, actor))
+            .as_ref()
+            .try_into()
+            .unwrap()
+    })
+    .unwrap()
+    .unwrap();
+    post_records_to_servers(m7).unwrap();
+    sync_records(m22, None).unwrap();
+    let now = aterm_time::unix_millis().unwrap();
+    // The bare Remove a killed remover leaves: no rotation after it.
+    log_entries::author_and_commit_records(m22, |store| {
+        let mut log = store.log().unwrap().clone();
+        let (me, device, incarnation) =
+            log_entries::open_local_member_signer(m22, &log)?.expect("m22 signs");
+        let cutoff = *log
+            .records()
+            .filter(|r| r.actor() == &old)
+            .last()
+            .unwrap()
+            .id();
+        let remove = device.with_seed(|seed| {
+            log.draft(
+                &me,
+                now,
+                Body::Remove {
+                    member: old,
+                    cutoff,
+                },
+            )
+            .sign(seed, incarnation)
+        })?;
+        log.insert(remove.clone())?;
+        Ok((vec![remove], ()))
+    })
+    .expect("m22 keeps a bare Remove");
+    assert!(
+        newest_everyone_wraps(m22, &old_recipient),
+        "CONTROL: a partial removal"
+    );
+
+    let (_fresh, request, _) = newcomer(macs.root.path(), m22, "m7-fresh");
+    let restored = super::super::admit::log_path(
+        m22,
+        &request,
+        n7,
+        "m7",
+        now + 1,
+        (
+            Some(crate::members::bundle::Reader::BoundedLog(
+                crate::crossing::RecordsBound::uncrossed(),
+            )),
+            true,
+            (CURRENT, true),
+        ),
+        None,
+    )
+    .expect("Allow again runs");
+    assert!(
+        matches!(&restored, super::super::admit::ByLog::Admitted(a) if a.label == "m7"),
+        "{restored:?}"
+    );
+    let store = load_records(m22).unwrap();
+    let log = store.log().unwrap();
+    let me = request.binding().actor();
+    assert_eq!(log.membership().node(&n7), NodeStanding::Member(me));
+    assert!(
+        log.removed_recipients().contains(&old_recipient),
+        "the removed binding still counts as removed"
+    );
+    let due = log.rekey_dues();
+    assert!(
+        due.iter()
+            .any(|d| d.audience == EpochAudience::Everyone && d.rotation),
+        "due: {:?}",
+        due.iter().map(|d| &d.audience).collect::<Vec<_>>()
+    );
+    // The ranked minter's passes, an injected clock past the settle grace.
+    for pass in 0..3u64 {
+        tend_epochs_at(m22, now + 2 + pass * 10 * 60 * 1000).expect("a vault pass");
+    }
+    let (_, wrapping) = epochs_after_remove_wrapping(m22, &old, &old_recipient);
+    assert!(wrapping.is_empty(), "{wrapping:?}");
+    assert!(!newest_everyone_wraps(m22, &old_recipient));
+    assert!(newest_everyone_wraps(m22, &request.binding().recipient()));
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// The swarm roster a member derives from the log after a seat move: the old seat's row (its
+/// recipient now counts as removed) moves to the deny lists, but its node key and label are the
+/// moved seat's now, so the Mac that took the seat back is denied nowhere. Found by review of
+/// A15: the old row's node key went to `deny_nodes`, and every reader of the overlaid roster held
+/// the returned Mac out.
+///
+/// NEGATIVE CONTROL: `overlay_log_membership`'s removed-row loop without its `seated_nodes`
+/// check: the moved seat's node key is denied and the first assert fails.
+#[test]
+fn a_moved_seat_is_denied_by_no_roster_row_of_its_old_seat() {
+    let mut log = alab();
+    let decision = decided(&log, Mac(12), 2, false, T0);
+    apply(&mut log, Mac(12), 2, &decision, T0);
+    assert!(
+        log.recipient_is_removed(&SEAT.identity().recipient()),
+        "CONTROL: the old seat's recipient counts as removed"
+    );
+    let mut roster = crate::swarm_roster::SwarmRoster {
+        members: vec![crate::swarm_roster::SwarmMember {
+            recipient: SEAT.identity().recipient().to_bech32(),
+            vault_name: "m2".to_owned(),
+            label: "m2".to_owned(),
+            aliases: Vec::new(),
+            hint: None,
+            hw_hint: None,
+            admitted_ms: 0,
+            claimed_label: None,
+            claimed_at_ms: None,
+            node_id: None,
+            node_key: Some(aterm_codec::hex::encode_lower(&node(2))),
+        }],
+        deny_labels: Vec::new(),
+        deny_nodes: Vec::new(),
+    };
+    super::super::roster::overlay_log_membership(&log, None, &mut roster);
+    assert!(
+        !roster.is_node_denied(&aterm_codec::hex::encode_lower(&node(2))),
+        "the moved seat's node key is denied: {roster:?}"
+    );
+    let moved = log.membership().get(&Mac(12).id()).cloned().unwrap();
+    assert!(
+        !log_entries::member_denied_by_roster(&roster, &moved),
+        "{roster:?}"
+    );
+    // A live seat the signed roster itself denies (by an alias of its row), which the log never
+    // removed, stays denied: only a log-removed row's node key is lifted for the seat that holds
+    // it now.
+    let admitted = log.membership().get(&ADMITTED.id()).cloned().unwrap();
+    let mut denying = crate::swarm_roster::SwarmRoster {
+        members: vec![crate::swarm_roster::SwarmMember {
+            recipient: ADMITTED.identity().recipient().to_bech32(),
+            vault_name: "m3".to_owned(),
+            label: "m3".to_owned(),
+            aliases: vec!["m30".to_owned()],
+            hint: None,
+            hw_hint: None,
+            admitted_ms: 0,
+            claimed_label: None,
+            claimed_at_ms: None,
+            node_id: None,
+            node_key: Some(aterm_codec::hex::encode_lower(&node(3))),
+        }],
+        deny_labels: vec!["m30".to_owned()],
+        deny_nodes: Vec::new(),
+    };
+    super::super::roster::overlay_log_membership(&log, None, &mut denying);
+    assert!(
+        denying.is_node_denied(&aterm_codec::hex::encode_lower(&node(3))),
+        "{denying:?}"
+    );
+    assert!(log_entries::member_denied_by_roster(&denying, &admitted));
+}
+
+/// A proof with nobody's Allow readmits a Mac to the vault it is configured for and never moves it
+/// to another: a Mac vault A let go proves its node key to a member of vault B, whose log binds
+/// that key to a seat (the same Mac's, from when it was in B), and B's member lets it in by the
+/// proof. The bundle is refused under the state lock before anything is written, so the Mac stays
+/// configured for A, with A's version, digests and cached envelope. Only a person's phrase, or
+/// `aterm secrets join`, moves a Mac to another vault.
+///
+/// NEGATIVE CONTROL: write the proof's bundle as a phrase's is written (`prove_first` calling
+/// `client::write_from_log_bundle` for `client::readmit_from_log_bundle`): the Mac is let into
+/// B ("a proof never moves the Mac").
+#[test]
+fn a_proof_never_moves_a_mac_to_another_vault() {
+    use crate::members::desk::{self, Desk, Local};
+    use crate::members::join::{self, Stream};
+    use crate::members::joiner::Joining;
+    let _answering = ServersAnswering::set();
+    let a = two_macs(&[(Audience::Everyone, "shared", b"a".as_slice())]);
+    let b = two_macs(&[(Audience::Everyone, "shared", b"b".as_slice())]);
+    let mac = &a.m7;
+    let admin = admin_open(&a.m22).unwrap();
+    admin_revoke(&a.m22, &admin, "m7", false).unwrap();
+    let _ = sync(mac, None);
+    let state = load_state(mac).unwrap();
+    assert_eq!(
+        state.membership,
+        Stored::Revoked,
+        "PRECONDITION: A let m7 go"
+    );
+    let floor = (state.seq, state.digest, state.records_digest);
+    let cache = std::fs::read(mac.cache_file()).unwrap();
+    let configured_before = config(mac).unwrap();
+    let pair = node_pair(8);
+    let n7 = node(8);
+    publish_local_node_key(&b.m7, n7, |network, actor| {
+        pair.sign(&node_proof_message(network, actor))
+            .as_ref()
+            .try_into()
+            .unwrap()
+    })
+    .expect("B's m7 publishes the node key")
+    .expect("a Node record");
+    post_records_to_servers(&b.m7).expect("B's m7 posts its records");
+    sync_records(&b.m22, None).expect("B's m22 pulls the Node record");
+    let desk = std::sync::Mutex::new(Desk::new(
+        Local::of(&b.m22)
+            .expect("B's m22's desk")
+            .expect("B's m22 is a member"),
+    ));
+    let device = crate::commons::bootstrap::Device::open(mac)
+        .expect("device")
+        .expect("an identity");
+    let joining = Joining {
+        records_bound: crate::crossing::RecordsBound::uncrossed(),
+        device: &device,
+        node: n7,
+        name: "m7".to_owned(),
+        model: "Mac15,3".to_owned(),
+    };
+    let prefix = format!("aterm-fleet/v3 record {}\0", desk::PROVE_RECORD);
+    let sign_node = |message: &[u8]| -> [u8; 64] {
+        pair.sign(&[prefix.as_bytes(), message].concat())
+            .as_ref()
+            .try_into()
+            .unwrap()
+    };
+    // A day past B's m7's last record (its `Node`), so its seat is dark.
+    let later = aterm_time::unix_millis().unwrap() + DARK_FOR_MS + 1;
+    let decided = std::sync::Mutex::new(Vec::new());
+    let decide = |proving: &desk::Proving<'_>| {
+        let decision = prove_at_ms(&b.m22, proving, CURRENT, later);
+        decided.lock().unwrap().push(decision.is_ok());
+        decision
+    };
+    let tried = std::thread::scope(|scope| {
+        let dial = |_: &str| -> crate::Result<Box<dyn Stream>> {
+            let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+            for end in [&ours, &theirs] {
+                end.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
+            }
+            let (desk, decide) = (&desk, &decide);
+            scope.spawn(move || {
+                drop(desk::serve_with(
+                    desk,
+                    &mut ours,
+                    std::net::IpAddr::from([192, 0, 2, 22]),
+                    &|_| Err(crate::Error::new("no phrase runs here")),
+                    Some(desk::Proof {
+                        decide,
+                        refuses: &|_| None,
+                        fleet: None,
+                    }),
+                ));
+            });
+            Ok(Box::new(theirs))
+        };
+        join::prove_first(mac, &dial, &joining, &sign_node, &["m22:7".to_owned()])
+    });
+    assert_eq!(
+        *decided.lock().unwrap(),
+        [true],
+        "PRECONDITION: B's member lets the Mac in by its proof"
+    );
+    let missed = match tried {
+        Ok(joined) => panic!(
+            "a proof never moves the Mac: it joined B as {}",
+            joined.name
+        ),
+        Err(missed) => missed,
+    };
+    assert!(
+        missed.refused[0].1.contains("another vault"),
+        "the bundle is refused as another vault's: {missed:?}"
+    );
+    let after = load_state(mac).unwrap();
+    assert_eq!(after.membership, Stored::Revoked, "the Mac stays let go");
+    assert_eq!(
+        (after.seq, after.digest, after.records_digest),
+        floor,
+        "with A's floor"
+    );
+    assert_eq!(std::fs::read(mac.cache_file()).ok(), Some(cache));
+    assert!(
+        config(mac).unwrap() == configured_before,
+        "and configured for A"
+    );
+    a.server.stop();
+    b.server.stop();
 }

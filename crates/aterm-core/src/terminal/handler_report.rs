@@ -81,8 +81,8 @@ impl TerminalHandler<'_> {
 
         self.modes.mouse_encoding = MouseEncoding::X10;
 
-        self.modes.bidi_mode = crate::config::BiDiMode::Implicit;
-        self.modes.bidi_direction = aterm_types::ParagraphDirection::Auto;
+        self.modes.bidi_mode = self.host_bidi.mode;
+        self.modes.bidi_direction = self.host_bidi.direction;
         self.modes.bidi_box_mirroring = false;
         self.modes.bidi_autodetection = false;
         self.modes.bidi_arrow_swap = true;
@@ -184,6 +184,14 @@ impl TerminalHandler<'_> {
                 self.send_response(cap, b"\x1b[?27;1;0;0n");
             }
             996 => {
+                // What this read did to the scheme is settled first, as a read that ended before
+                // the query would have settled it: the answer then re-latches the same scheme.
+                super::state_accessors::settle_color_scheme_after_output(
+                    self.modes,
+                    self.color,
+                    self.policy,
+                    self.transient,
+                );
                 let scheme = self.color.reported_scheme().0;
                 let mut response = StackResponse::<16>::new();
                 let _ = write!(response, "\x1b[?997;{}n", scheme.dsr_code());
@@ -496,6 +504,135 @@ mod color_scheme_tests {
                 admitted,
                 "{gap_ms} ms later by the slices' clocks, {pause:?} later by the system's: {answer:?}"
             );
+        }
+    }
+
+    /// A 2031 the program enables after either reset reports only what changes later, however the
+    /// bytes are batched: the reset's own return to the default background is settled quietly.
+    /// NEGATIVE CONTROL: with `reset_common_fields` leaving the latch and the `2031` arm not
+    /// settling it, `` RIS then 2031 in one batch: no change `` fails (either alone holds it).
+    #[test]
+    fn a_2031_after_a_reset_pushes_only_later_changes() {
+        for case in [
+            "RIS then 2031 in one batch",
+            "RIS, then 2031",
+            "the host's reset, then 2031",
+        ] {
+            let mut term = Terminal::new(24, 80);
+            term.process(b"\x1b]11;#ffffff\x1b\\");
+            assert!(
+                term.take_reports().is_none(),
+                "PRECONDITION: no push without 2031"
+            );
+            match case {
+                "RIS then 2031 in one batch" => term.process(b"\x1bc\x1b[?2031h"),
+                "RIS, then 2031" => {
+                    term.process(b"\x1bc");
+                    term.process(b"\x1b[?2031h");
+                }
+                _ => {
+                    term.reset();
+                    term.process(b"\x1b[?2031h");
+                }
+            }
+            assert_eq!(term.take_reports(), None, "{case}: no change");
+            term.process(b"\x1b]11;#ffffff\x1b\\");
+            assert_eq!(
+                term.take_reports().unwrap_or_default(),
+                b"\x1b[?997;2n",
+                "{case}: a later change pushes"
+            );
+        }
+    }
+
+    /// A scheme change the program's output makes is settled under the 2031 it was made under,
+    /// wherever the reads end: one made before `?2031h` is never pushed, and one made under 2031 is
+    /// pushed though `?2031l` or a RIS follows it in the same read.
+    /// NEGATIVE CONTROL: with the `2031` arm not settling, `` before ?2031h, one read `` and
+    /// `` under 2031, then ?2031l, one read `` fail; with `reset_terminal_state` not settling,
+    /// `` under 2031, then RIS, one read `` fails.
+    #[test]
+    fn a_scheme_change_is_settled_under_the_2031_it_was_made_under() {
+        const LIGHT: &[u8] = b"\x1b]11;#ffffff\x1b\\";
+        for (case, enabled, then, pushed) in [
+            ("before ?2031h", false, &b"\x1b[?2031h"[..], None),
+            (
+                "under 2031, then ?2031l",
+                true,
+                b"\x1b[?2031l",
+                Some(&b"\x1b[?997;2n"[..]),
+            ),
+            (
+                "under 2031, then RIS",
+                true,
+                b"\x1bc",
+                Some(&b"\x1b[?997;2n"[..]),
+            ),
+        ] {
+            for one_read in [true, false] {
+                let mut term = Terminal::new(24, 80);
+                if enabled {
+                    term.process(b"\x1b[?2031h");
+                }
+                assert_eq!(
+                    term.take_reports(),
+                    None,
+                    "PRECONDITION: {case}: nothing yet"
+                );
+                if one_read {
+                    term.process(&[LIGHT, then].concat());
+                } else {
+                    term.process(LIGHT);
+                    term.process(then);
+                }
+                let reads = if one_read { "one read" } else { "two reads" };
+                assert_eq!(term.take_reports().as_deref(), pushed, "{case}, {reads}");
+            }
+        }
+    }
+
+    /// The host's reset leaves the latch at the scheme it leaves, as a batch's end would: a rebase
+    /// to the baseline afterwards changes nothing.
+    /// NEGATIVE CONTROL: with `reset_common_fields` leaving the latch, `` the rebase changes no
+    /// scheme `` fails.
+    #[test]
+    fn the_hosts_reset_leaves_no_scheme_change_owed() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b]11;#ffffff\x1b\\");
+        assert_eq!(
+            term.color_scheme(),
+            Appearance::Light,
+            "PRECONDITION: light"
+        );
+        term.reset();
+        let baseline = term.color_baseline();
+        assert!(
+            !term.rebase_colors(&baseline).scheme_changed,
+            "the rebase changes no scheme"
+        );
+    }
+
+    /// DSR 996 answers after what the read did to the scheme is settled, as a read that ended
+    /// before it would have: a change made under 2031 is pushed, then answered.
+    /// NEGATIVE CONTROL: with the `996` arm not settling, `` one read `` gets the answer alone.
+    #[test]
+    fn a_996_after_a_change_in_its_read_sees_the_push_first() {
+        const LIGHT: &[u8] = b"\x1b]11;#ffffff\x1b\\";
+        for one_read in [true, false] {
+            let mut term = Terminal::new(24, 80);
+            term.process(b"\x1b[?2031h");
+            let mut reports = Vec::new();
+            if one_read {
+                term.process(&[LIGHT, b"\x1b[?996n"].concat());
+            } else {
+                term.process(LIGHT);
+                reports.extend(term.take_reports().unwrap_or_default());
+                term.process(b"\x1b[?996n");
+            }
+            reports.extend(term.take_reports().unwrap_or_default());
+            let reads = if one_read { "one read" } else { "two reads" };
+            assert_eq!(reports, b"\x1b[?997;2n", "{reads}: the push");
+            assert_eq!(drain(&mut term), b"\x1b[?997;2n", "{reads}: the answer");
         }
     }
 

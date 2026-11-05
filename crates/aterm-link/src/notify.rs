@@ -13,7 +13,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::body::Body;
-use crate::bridge::ACK_DEADLINE;
+use crate::bridge::ack_deadline;
 use crate::notify_need::{NeedWatch, Pair, Step};
 use crate::subject::{is_fleet, is_principal};
 use crate::transport::{self, Backoff, Closer, Conn};
@@ -1249,9 +1249,9 @@ impl Notifier {
         }
     }
 
-    /// One broker connection with every capability attached ([`ACK_DEADLINE`]).
+    /// One broker connection with every capability attached ([`ack_deadline`]).
     fn connect(&self) -> io::Result<Conn> {
-        let (mut conn, _closer) = transport::connect(&self.cfg.broker, ACK_DEADLINE)?;
+        let (mut conn, _closer) = transport::connect(&self.cfg.broker, ack_deadline())?;
         transport::attach_cap_files(&mut conn, &self.cfg.cap_files)?;
         Ok(conn)
     }
@@ -1291,7 +1291,7 @@ impl Notifier {
             astream_broker::broker_refusal(e)
                 .is_some_and(astream_broker::BrokerRefusal::is_permanent)
         };
-        let Ok((mut conn, _closer)) = transport::connect(&self.cfg.broker, ACK_DEADLINE) else {
+        let Ok((mut conn, _closer)) = transport::connect(&self.cfg.broker, ack_deadline()) else {
             return Ok(());
         };
         match transport::attach_cap_files(&mut conn, &self.cfg.cap_files) {
@@ -2722,7 +2722,7 @@ fn connect_for_reader(
     seen: &mut Option<u64>,
     seen_on: &mut Option<PathBuf>,
 ) -> io::Result<(Conn, Closer, u64, ReadLog)> {
-    let (mut conn, closer) = transport::connect(&cfg.broker, ACK_DEADLINE)?;
+    let (mut conn, closer) = transport::connect(&cfg.broker, ack_deadline())?;
     transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
     let log = log_of(&mut conn, cfg)?;
     let store = Store {
@@ -3126,6 +3126,7 @@ fn parse_rate(s: &str) -> Result<(u32, u64), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::ACK_DEADLINE;
 
     #[test]
     fn follow_handoff_buffers_no_row_for_a_stalled_executor() {

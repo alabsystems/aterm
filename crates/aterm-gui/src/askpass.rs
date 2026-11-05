@@ -340,7 +340,9 @@ fn set_marker_at(path: &std::path::Path, off: bool) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         match options.open(path) {
             Ok(_) => Ok(()),

@@ -22,6 +22,11 @@ const ACTIONS: [&str; 12] = [
     "OldAttach",
 ];
 
+/// The model's scenario off the boot volume, where a disk can vanish within one boot.
+fn off_the_boot_volume() -> aterm_spec::derive::Model {
+    interp::with_consts(&incarnation_lease_model(), &[("OffVolume", 1)])
+}
+
 #[test]
 fn incarnation_lease_fires_every_committed_move() {
     let model = incarnation_lease_model();
@@ -32,34 +37,75 @@ fn incarnation_lease_fires_every_committed_move() {
             "{action} fires at the committed configuration: {committed:?}"
         );
     }
+    assert!(
+        !committed.contains("Vanish"),
+        "the boot volume's disk never vanishes within a boot: {committed:?}"
+    );
+}
+
+#[test]
+fn incarnation_lease_off_the_boot_volume_vanishes_and_never_trusts_a_lease() {
+    let off = interp::fired_actions(&off_the_boot_volume());
+    for action in ACTIONS.iter().filter(|a| **a != "Take").chain(&["Vanish"]) {
+        assert!(
+            off.contains(action),
+            "{action} fires off the boot volume: {off:?}"
+        );
+    }
+    assert!(
+        !off.contains("Take"),
+        "off the boot volume every take flushes `inc`, whatever boot its lease names: {off:?}"
+    );
+    let named = walk(
+        &off_the_boot_volume(),
+        &["Plan", "TakeFlushed", "Present", "Plan"],
+    );
+    assert_eq!(
+        (
+            named["c_lb"],
+            named["boot"],
+            named["tr"],
+            named["pn"],
+            named["sp"]
+        ),
+        (1, 1, 0, 2, 1),
+        "the lease names this boot, and is not trusted by it: the next take leases one \
+         incarnation above `inc`: {named:?}"
+    );
 }
 
 #[test]
 fn incarnation_lease_each_defect_breaks_its_own_invariant_and_the_fence() {
     let model = incarnation_lease_model();
-    for (buggy, invariant) in [
-        (1, "Fence"),
-        (2, "LeaseDurable"),
-        (3, "LeaseDurable"),
-        (4, "Durable"),
+    let off = off_the_boot_volume();
+    for (config, buggy, invariant) in [
+        (&model, 1, "Fence"),
+        (&model, 2, "LeaseDurable"),
+        (&model, 3, "LeaseDurable"),
+        (&model, 4, "Durable"),
+        (&off, 5, "Fence"),
     ] {
         for claim in [invariant, "Fence"] {
-            let mutant = only(&interp::with_buggy(&model, buggy), claim);
+            let mutant = only(&interp::with_buggy(config, buggy), claim);
             assert!(
                 interp::bmc(&mutant).is_err(),
                 "Buggy = {buggy} must break {claim}"
             );
             assert!(
-                interp::bmc(&only(&model, claim)).is_ok(),
+                interp::bmc(&only(config, claim)).is_ok(),
                 "{claim} holds with no defect on"
             );
         }
     }
+    assert!(
+        interp::bmc(&interp::with_buggy(&model, 5)).is_ok(),
+        "on the boot volume the named boot is the trusted one: Buggy = 5 is no defect there"
+    );
 }
 
 #[test]
 fn incarnation_lease_the_traced_counterexamples_end_where_the_doc_says() {
-    let model = incarnation_lease_model();
+    let (model, off) = (incarnation_lease_model(), off_the_boot_volume());
     let first_boot: &[&str] = &[
         "Plan",
         "TakeFlushed",
@@ -70,12 +116,19 @@ fn incarnation_lease_the_traced_counterexamples_end_where_the_doc_says() {
         "Present",
     ];
     let run_out: &[&str] = &["Plan", "KillRenamed"];
-    let traces: [(i64, Vec<&str>); 4] = [
+    let traces: [(&_, i64, Vec<&str>); 5] = [
         (
+            &model,
             1,
             [first_boot, &["PowerLoss", "Plan", "Take", "Present"]].concat(),
         ),
         (
+            &off,
+            5,
+            [first_boot, &["Vanish", "Plan", "Take", "Present"]].concat(),
+        ),
+        (
+            &model,
             2,
             [
                 first_boot,
@@ -93,6 +146,7 @@ fn incarnation_lease_the_traced_counterexamples_end_where_the_doc_says() {
             .concat(),
         ),
         (
+            &model,
             3,
             [
                 first_boot,
@@ -110,6 +164,7 @@ fn incarnation_lease_the_traced_counterexamples_end_where_the_doc_says() {
             .concat(),
         ),
         (
+            &model,
             4,
             vec![
                 "Plan",
@@ -122,20 +177,20 @@ fn incarnation_lease_the_traced_counterexamples_end_where_the_doc_says() {
             ],
         ),
     ];
-    for (buggy, steps) in traces {
-        let mutant = interp::with_buggy(&model, buggy);
+    for (config, buggy, steps) in traces {
+        let mutant = interp::with_buggy(config, buggy);
         let end = walk(&mutant, &steps);
         assert!(
             !mutant.check_invariant("Fence", &end),
             "Buggy = {buggy}: {steps:?} presents an incarnation twice: {end:?}"
         );
-        let mut state = model.init_state();
+        let mut state = config.init_state();
         for step in &steps {
-            if !model.fire(step, &mut state) {
+            if !config.fire(step, &mut state) {
                 break;
             }
             assert!(
-                model.check_invariant("Fence", &state),
+                config.check_invariant("Fence", &state),
                 "Buggy = 0 keeps the fence along {steps:?}: {state:?}"
             );
         }

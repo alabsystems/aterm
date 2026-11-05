@@ -62,34 +62,9 @@ impl SlotWhy {
     }
 }
 
-/// Extract a canonical `(N, "m<N>")` label ONLY when `name` starts with `m<N>` (`N >= 1`).
-///
-/// Mid-string tokens such as `"Mac-mini-M4"` or `"macbook-m3"` return `None`.
-#[must_use]
-pub fn leading_m_label(name: &str) -> Option<(u32, String)> {
-    let trimmed = name.trim_ascii();
-    let bytes = trimmed.as_bytes();
-    let (&first, rest) = bytes.split_first()?;
-    if first != b'm' && first != b'M' {
-        return None;
-    }
-    let (&first_digit, _) = rest.split_first()?;
-    if !first_digit.is_ascii_digit() || first_digit == b'0' {
-        return None;
-    }
-    let digit_len = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-    if digit_len == 0 || digit_len > 6 {
-        return None;
-    }
-    if let Some(&after) = rest.get(digit_len)
-        && after.is_ascii_alphanumeric()
-    {
-        return None;
-    }
-    let digits = std::str::from_utf8(&rest[..digit_len]).ok()?;
-    let n: u32 = digits.parse().ok()?;
-    (n >= 1).then(|| (n, format!("m{n}")))
-}
+/// A canonical `(N, "m<N>")` label only when `name` starts with `m<N>`
+/// ([`aterm_types::machine_name::Number::leading`], the one rule).
+pub use aterm_secrets::swarm_roster::leading_m_label;
 
 /// This Mac's canonical swarm label and legacy aliases used to match `warm` sets in `ai-pool.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,11 +183,33 @@ pub fn resolve_pool_identity_pure(
 
 /// Resolve this Mac's [`LocalPoolIdentity`] from the local vault state, `aterm.toml`, and system
 /// hostnames.
-#[must_use]
+///
+/// # Errors
+/// The roster cannot be read, including a writer still holding its lock after the bounded wait.
 pub fn resolve_local_pool_identity(
     home: Option<&Path>,
     config: Option<&Path>,
     machine_override: Option<&str>,
+) -> Result<Option<LocalPoolIdentity>, String> {
+    #[cfg(unix)]
+    let roster = home
+        .map(|home| read_pass_roster(&aterm_secrets::client::Paths::for_home(home)))
+        .transpose()?
+        .flatten();
+    Ok(resolve_local_pool_identity_with_roster(
+        home,
+        config,
+        machine_override,
+        #[cfg(unix)]
+        roster,
+    ))
+}
+
+pub(super) fn resolve_local_pool_identity_with_roster(
+    home: Option<&Path>,
+    config: Option<&Path>,
+    machine_override: Option<&str>,
+    #[cfg(unix)] roster: Option<aterm_secrets::swarm_roster::SwarmRoster>,
 ) -> Option<LocalPoolIdentity> {
     let config_machine = read_config_machine_raw(config);
     #[cfg(unix)]
@@ -240,9 +237,7 @@ pub fn resolve_local_pool_identity(
                 )
             })
                 || aterm_secrets::client::local_recipient_denied_in_roster(&paths);
-            let members = aterm_secrets::client::swarm_roster(&paths)
-                .ok()
-                .flatten()
+            let members = roster
                 .map(|mut r| {
                     if let Some(my_rec) = rec.as_deref()
                         && let Some(rm) = r.member_by_recipient(my_rec)
@@ -326,6 +321,60 @@ pub fn resolve_local_pool_identity(
         &hosts,
     )
     .and_then(filter_denied)
+}
+
+/// A background pass waits briefly for a vault apply; contention is never an empty roster.
+#[cfg(unix)]
+pub(crate) fn read_pass_roster(
+    paths: &aterm_secrets::client::Paths,
+) -> Result<Option<aterm_secrets::swarm_roster::SwarmRoster>, String> {
+    read_pass_roster_until(
+        paths,
+        std::time::Instant::now() + Duration::from_millis(250),
+    )
+}
+
+#[cfg(unix)]
+pub(super) fn read_pass_roster_until(
+    paths: &aterm_secrets::client::Paths,
+    deadline: std::time::Instant,
+) -> Result<Option<aterm_secrets::swarm_roster::SwarmRoster>, String> {
+    #[cfg(any(test, debug_assertions))]
+    if UNWAITED_ROSTER.with(std::cell::Cell::get) {
+        return aterm_secrets::client::test_unwaited_roster(paths).map_err(|why| why.to_string());
+    }
+    aterm_secrets::client::swarm_roster_until(paths, deadline).map_err(|why| {
+        if why.kind() == aterm_secrets::ErrorKind::VaultBusy {
+            format!("swarm roster busy: {why}")
+        } else {
+            format!("swarm roster unread: {why}")
+        }
+    })
+}
+
+#[cfg(all(unix, any(test, debug_assertions)))]
+thread_local! {
+    static UNWAITED_ROSTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restore the old reader for a contention test's negative control.
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "negative control called by tests, retained in debug lab builds"
+    )
+)]
+pub(super) fn test_without_roster_wait<R>(read: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNWAITED_ROSTER.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(UNWAITED_ROSTER.with(|flag| flag.replace(true)));
+    read()
 }
 
 pub(crate) fn read_bounded_bytes(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
@@ -967,7 +1016,7 @@ fn toml_str_array(items: &[String]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::harness::accounts;
     #[cfg(unix)]
@@ -978,7 +1027,7 @@ mod tests {
     const NOW: i64 = 1_762_000_000;
 
     #[cfg(unix)]
-    fn seed_local_swarm_roster(home: &Path, label: &str, aliases: &[&str]) {
+    pub(in crate::harness) fn seed_local_swarm_roster(home: &Path, label: &str, aliases: &[&str]) {
         let srv_dir = aterm_tempfile::tempdir().expect("server dir");
         let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let running = aterm_secrets::server::start(
@@ -1111,7 +1160,33 @@ warm = ["m3"]
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, "[fleet]\nmachine = \"m999\"\n").unwrap();
 
+        let paths = aterm_secrets::client::Paths::for_home(home);
+        let writer = std::rc::Rc::new(std::cell::RefCell::new(Some(
+            aterm_secrets::client::test_hold_state_lock(&paths).unwrap(),
+        )));
+        let pass = || resolve_local_pool_identity(Some(home), Some(&config), None).unwrap();
+        assert!(
+            read_pass_roster_until(&paths, std::time::Instant::now())
+                .unwrap_err()
+                .contains("roster busy")
+        );
+        assert_ne!(
+            test_without_roster_wait(pass).map(|id| id.primary),
+            Some("m100".to_owned()),
+            "negative control loses the assigned label under the writer",
+        );
+        let release = writer.clone();
+        let id = aterm_secrets::client::test_with_denied_nodes_busy(
+            move || drop(release.borrow_mut().take()),
+            pass,
+        )
+        .expect("the pass reads the roster after the writer");
+        assert_eq!(id.primary, "m100");
+        assert_eq!(id.aliases, ["m32"]);
+        assert!(writer.borrow().is_none(), "the pass met the writer");
+
         let id = resolve_local_pool_identity(Some(home), Some(&config), None)
+            .unwrap()
             .expect("swarm-roster resolves identity");
         assert_eq!(id.primary, "m100");
         assert_eq!(id.aliases, vec!["m32".to_owned()]);
@@ -1173,7 +1248,7 @@ warm = ["m3"]
             None
         );
         assert_eq!(
-            resolve_local_pool_identity(Some(&denied_home), Some(&denied_cfg), None),
+            resolve_local_pool_identity(Some(&denied_home), Some(&denied_cfg), None).unwrap(),
             None
         );
 
@@ -1196,7 +1271,7 @@ warm = ["m3"]
             None
         );
         assert_eq!(
-            resolve_local_pool_identity(Some(&denied_home), Some(&denied_cfg), None),
+            resolve_local_pool_identity(Some(&denied_home), Some(&denied_cfg), None).unwrap(),
             None
         );
         // Even if `aterm.toml` claims a different label (`m200`), a machine whose vault
@@ -1204,7 +1279,7 @@ warm = ["m3"]
         // cannot fall back to `aterm.toml`.
         fs::write(&denied_cfg, "[fleet]\nmachine = \"m200\"\n").unwrap();
         assert_eq!(
-            resolve_local_pool_identity(Some(&denied_home), Some(&denied_cfg), None),
+            resolve_local_pool_identity(Some(&denied_home), Some(&denied_cfg), None).unwrap(),
             None
         );
     }
@@ -1382,7 +1457,7 @@ warm = ["m3"]
         seed_local_swarm_roster(&home, "m100", &["m32"]);
         aterm_types::fs_restricted::ensure_private_dir(&secrets_dir).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
-        fs::write(config_dir.join("aterm.toml"), "").unwrap();
+        aterm_uds::atomic_file::write(&config_dir.join("aterm.toml"), b"", 0o600).unwrap();
 
         let roster_path = config_dir.join("accounts.toml");
         let codex_roster_path = config_dir.join("accounts-codex.toml");

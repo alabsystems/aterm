@@ -54,21 +54,27 @@ pub(super) fn run(live: &Live, cmd: &Cmd, input: &[u8]) -> Result<Ran, RunFailed
         let written = writer.join();
         let output = output.map_err(|error| match error {
             CompleteOutputError::Run(RunError::TimedOut) => RunFailed::TimedOut(cmd.budget),
-            CompleteOutputError::Run(RunError::Spawn(_) | RunError::Wait(_)) => {
-                RunFailed::Spawn("child spawn or wait failed".into())
+            CompleteOutputError::Run(RunError::Spawn(_)) => {
+                RunFailed::Spawn("child spawn failed".into())
+            }
+            CompleteOutputError::Run(RunError::Capture(_)) => {
+                RunFailed::AfterStart("child output capture setup failed".into())
+            }
+            CompleteOutputError::Run(RunError::Wait(_)) => {
+                RunFailed::AfterStart("child wait failed".into())
             }
             CompleteOutputError::StdoutRead(_) => {
-                RunFailed::Refused("complete stdout read failed".into())
+                RunFailed::AfterStart("complete stdout read failed".into())
             }
             CompleteOutputError::StdoutTooLarge { limit } => {
-                RunFailed::Refused(format!("complete stdout exceeds {limit} bytes"))
+                RunFailed::AfterStart(format!("complete stdout exceeds {limit} bytes"))
             }
             CompleteOutputError::StdoutIncomplete => {
-                RunFailed::Refused("complete stdout did not reach EOF".into())
+                RunFailed::AfterStart("complete stdout did not reach EOF".into())
             }
         })?;
         if !matches!(written, Ok(Ok(()))) {
-            return Err(RunFailed::Refused(
+            return Err(RunFailed::AfterStart(
                 "the input pipe did not accept the complete request".into(),
             ));
         }
@@ -155,6 +161,7 @@ mod tests {
         let error = live
             .run_complete_stdout_input(&Cmd::new("/bin/cat"), &input)
             .unwrap_err();
+        assert!(matches!(error, RunFailed::AfterStart(_)), "{error:?}");
         assert!(error.to_string().contains("complete stdout exceeds"));
         let error = live
             .run_complete_stdout_input(

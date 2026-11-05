@@ -20,6 +20,17 @@
 //! `--admit now` starts at once and says what it lacks. Only a need above what the volume holds
 //! over its floor is refused. A need above what it has free over its floor now waits for space
 //! freed, which no other run's end gives, and reserves nothing against the runs behind it.
+//!
+//! Those directories are each checkout's own (the shared cache keeps one build directory per
+//! workspace path), so a fresh worktree's hold no run of anything and its record beside them none:
+//! every first run claimed [`COLD_BYTES`] less the verify tool's own build, 72 GiB for a scoped run
+//! that wrote 3 GiB, and waited on a Mac with 170 GB free (V1, DA-MACHINE-FOOTPRINT). So a run that
+//! passed is kept in the machine's record too, under this user's aterm state directory
+//! ([`MACHINE_FOOTPRINT`]), by what it built ([`selection_of`]), and a run with no run of its scope
+//! on its own directories claims what runs in this machine's checkouts bound
+//! (`aterm_capacity::MachineFootprints::cover`): its own selection's run, a wider one's, or those of
+//! selections whose crates together hold its, where that is less than the cold budget less what its
+//! directories hold.
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +49,13 @@ pub const COLD_BYTES: u64 = 72 * GIB;
 
 /// The file in `<target>/verify` keeping what the last runs wrote (`aterm_capacity::Footprints`).
 pub const FOOTPRINT: &str = "footprint.json";
+
+/// The file under this user's aterm state directory (`aterm_types::dirs::account_state_dir`)
+/// keeping what the runs that passed in every checkout on this machine wrote
+/// (`aterm_capacity::MachineFootprints`), beside the stages' memory
+/// (`aterm_capacity::book::VERIFY_RECORD`): a record of what a scope writes, not a cache, so a
+/// build cache emptied leaves it true; and a test binary's state directory is its own.
+pub const MACHINE_FOOTPRINT: &str = "verify/disk-footprint.json";
 
 /// Whether `check` builds into the run's directories: every check but those that only read the
 /// tree (fmt, census, forge) or the network (export).
@@ -97,19 +115,87 @@ pub fn scope_of(ctx: &Ctx) -> String {
     scope
 }
 
+/// What a run builds as the machine's record keeps it (`atpkg::admit_disk::Machinewide`), so a
+/// run in another checkout bounds it only where it did the same work: its work is the checks it
+/// runs that build, sorted, each that does not read the selection marked `:tree` (what it builds
+/// does not follow `-p`'s crates: `cells` named under the change cone lints every cell's whole
+/// graph, and cells the cone pulled lint the cone closed over its dependents in each cell's
+/// graph, more than a `-p` run of the same crates does), then whatever else changes what they
+/// write, as a rerun's command says it: the cells `--cell` chose, cells the
+/// selection pulled, `--compile-only`, `--no-windows` where a check opens windows, and
+/// `--cursor-pacing` and `--app` for `measure`. Its crates are the selection's, sorted and each
+/// once (none for the empty cone); `None` for the whole workspace, or where no check that builds
+/// reads the selection.
+#[must_use]
+pub fn selection_of(ctx: &Ctx) -> atpkg::admit_disk::Selection {
+    let building: Vec<Check> = ctx.checks.iter().copied().filter(|c| builds(*c)).collect();
+    let has = |check: Check| building.contains(&check);
+    let mut checks: Vec<String> = building
+        .iter()
+        .map(|c| {
+            if c.reads(&ctx.scope) {
+                c.name().to_owned()
+            } else {
+                format!("{}:tree", c.name())
+            }
+        })
+        .collect();
+    checks.sort_unstable();
+    checks.dedup();
+    let mut work = checks.join(" ");
+    if has(Check::Cells) && !ctx.cells.is_empty() {
+        let mut cells = ctx.cells.clone();
+        cells.sort_unstable();
+        cells.dedup();
+        work.push_str(" --cell ");
+        work.push_str(&cells.join(","));
+    }
+    if has(Check::Cells) && ctx.cells_pulled {
+        work.push_str(" pulled-cells");
+    }
+    if ctx.compile_only && (has(Check::Test) || has(Check::Checkers)) {
+        work.push_str(" --compile-only");
+    }
+    if ctx.no_windows
+        && building
+            .iter()
+            .any(|c| c.spec().stages.iter().any(|id| id.opens_windows()))
+    {
+        work.push_str(" --no-windows");
+    }
+    if has(Check::Measure) && ctx.cursor_pacing {
+        work.push_str(" --cursor-pacing");
+    }
+    if has(Check::Measure) && ctx.measure_artifact.is_some() {
+        work.push_str(" --app");
+    }
+    let crates =
+        (building.iter().any(|c| c.reads(&ctx.scope)) && !ctx.scope.is_workspace()).then(|| {
+            let mut crates = ctx.scope.crates().to_vec();
+            crates.sort_unstable();
+            crates.dedup();
+            crates
+        });
+    atpkg::admit_disk::Selection { work, crates }
+}
+
 /// The run's disk as it is claimed: its build directory and `<target>/verify`, measured, on the
-/// target's volume, kept by its scope ([`scope_of`]). `None` when no check it runs builds.
+/// target's volume, kept by its scope ([`scope_of`]) there, and by what it builds
+/// ([`selection_of`]) in the machine's record ([`MACHINE_FOOTPRINT`]) where this user has a state
+/// directory and the build directory is the one verify places ([`Ctx::main_build_dir`]): one
+/// the caller chose is not measured, so a run there grows `<target>/verify` alone, which bounds
+/// nothing another checkout's build writes. `None` when no check it runs builds.
 #[must_use]
 pub fn run_of(ctx: &Ctx) -> Option<atpkg::admit_disk::Run> {
     if !ctx.checks.iter().any(|c| builds(*c)) {
         return None;
     }
-    let mut dirs: Vec<PathBuf> = ctx
+    let build = ctx
         .main_build_dir
         .as_deref()
-        .and_then(|v| build_dir_path(v, &ctx.root))
-        .into_iter()
-        .collect();
+        .and_then(|v| build_dir_path(v, &ctx.root));
+    let measured = build.is_some();
+    let mut dirs: Vec<PathBuf> = build.into_iter().collect();
     dirs.push(ctx.state_dir());
     let names: Vec<&str> = ctx.checks.iter().map(|c| c.name()).collect();
     let scope = if ctx.checks.iter().any(|c| c.reads(&ctx.scope)) {
@@ -125,6 +211,12 @@ pub fn run_of(ctx: &Ctx) -> Option<atpkg::admit_disk::Run> {
         cold: COLD_BYTES,
         on: ctx.target_dir.clone(),
         stuck_ends: Some(crate::STUCK_ENDS),
+        machine: aterm_types::dirs::account_state_dir()
+            .filter(|_| measured)
+            .map(|state| atpkg::admit_disk::Machinewide {
+                record: state.join(MACHINE_FOOTPRINT),
+                selection: selection_of(ctx),
+            }),
     })
 }
 
@@ -352,5 +444,191 @@ mod tests {
         )
         .expect("lint builds");
         assert_eq!(run.scope, "lint -p a");
+    }
+
+    /// A RUN'S SELECTION IN THE MACHINE'S RECORD is its building checks, sorted, each that builds
+    /// the whole tree whatever is selected marked `:tree`, what else changes their writes, and
+    /// the crates the selection names, sorted: the order they were named in and a check that only
+    /// reads the tree keep it; the whole workspace, or work no selection changes, names no crates;
+    /// `cells` under the change cone, which it does not read, is another work than under `-p`,
+    /// which it does.
+    #[test]
+    fn a_runs_selection_is_its_work_and_the_crates_it_did_it_for() {
+        let at = |scope: crate::Scope, checks: &[Check]| {
+            Ctx::new(
+                PathBuf::from("/w/aterm"),
+                scope,
+                crate::EnvSnapshot::default(),
+                PathBuf::from("/tmp/x"),
+            )
+            .with_checks(checks)
+        };
+        let p = |names: &[&str]| {
+            crate::Scope::packages(&names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>())
+        };
+        let sel = |work: &str, crates: Option<&[&str]>| atpkg::admit_disk::Selection {
+            work: work.to_owned(),
+            crates: crates.map(|c| c.iter().map(|n| (*n).to_owned()).collect()),
+        };
+        let narrow = selection_of(&at(p(&["b", "a"]), &[Check::Test, Check::Lint, Check::Fmt]));
+        assert_eq!(narrow, sel("lint test", Some(&["a", "b"])));
+        assert_eq!(
+            selection_of(&at(p(&["a", "b"]), &[Check::Lint, Check::Test])),
+            narrow
+        );
+        assert_eq!(
+            selection_of(&at(crate::Scope::workspace(), &[Check::Lint, Check::Test])),
+            sel("lint test", None)
+        );
+        assert_eq!(
+            selection_of(&at(p(&["a"]), &[Check::Cells, Check::Lint])),
+            sel("cells lint", Some(&["a"]))
+        );
+        let cone = || crate::Scope::changed("origin/main", vec!["a".to_owned()], true);
+        assert_eq!(
+            selection_of(&at(cone(), &[Check::Cells, Check::Lint])),
+            sel("cells:tree lint", Some(&["a"]))
+        );
+        assert_eq!(
+            selection_of(&at(
+                crate::Scope::changed("origin/main", Vec::new(), false),
+                &[Check::Lint]
+            )),
+            sel("lint", Some(&[]))
+        );
+        assert_eq!(
+            selection_of(&at(p(&["a"]), &[Check::Appkit])),
+            sel("appkit:tree", None)
+        );
+        assert_eq!(
+            selection_of(&at(p(&["a"]), &[Check::Test]).with_compile_only(true)),
+            sel("test --compile-only", Some(&["a"]))
+        );
+        assert_eq!(
+            selection_of(&at(p(&["a"]), &[Check::Lint]).with_no_windows(true)),
+            sel("lint", Some(&["a"])),
+            "no check of it opens windows"
+        );
+        assert_eq!(
+            selection_of(&at(p(&["a"]), &[Check::Appkit]).with_no_windows(true)),
+            sel("appkit:tree --no-windows", None)
+        );
+        assert_eq!(
+            selection_of(
+                &at(crate::Scope::workspace(), &[Check::Cells])
+                    .with_cells(vec!["win".to_owned(), "linux".to_owned()])
+            ),
+            sel("cells:tree --cell linux,win", None)
+        );
+    }
+
+    /// A run that builds names the machine's record under this user's aterm state directory (a
+    /// test binary's own here), by its selection, where it measures the build directory verify
+    /// places. NEGATIVE CONTROL: a build directory the caller chose is not measured, so its runs,
+    /// which grew `<target>/verify` alone, are kept for no other checkout.
+    #[test]
+    fn a_run_names_the_machines_record_only_where_it_measures_its_build() {
+        let mut ctx = Ctx::new(
+            PathBuf::from("/w/aterm"),
+            crate::Scope::packages(&["a".to_owned()]),
+            crate::EnvSnapshot::default(),
+            PathBuf::from("/tmp/x"),
+        )
+        .with_checks(&[Check::Lint]);
+        ctx.main_build_dir = Some("build.build-dir='/c{workspace-root}/.cargo-build'".to_owned());
+        let run = run_of(&ctx).expect("a run that builds");
+        assert_eq!(run.dirs[0], PathBuf::from("/c/w/aterm/.cargo-build"));
+        let machine = run.machine.expect("kept machine-wide");
+        let state = aterm_types::dirs::account_state_dir().expect("a test binary's state");
+        assert_eq!(machine.record, state.join(MACHINE_FOOTPRINT));
+        assert_eq!(machine.selection, selection_of(&ctx));
+        ctx.main_build_dir = None;
+        let run = run_of(&ctx).expect("a run that builds");
+        assert_eq!(run.dirs, vec![ctx.state_dir()]);
+        assert_eq!(run.machine, None, "its build directory is not measured");
+    }
+
+    /// ONLY A RUN THAT PASSED IS KEPT FOR THIS MACHINE'S OTHER CHECKOUTS (`crate::let_disk_go`):
+    /// one that failed may have stopped short of what its scope writes, so it is kept beside its
+    /// directories alone, and each run's disk line says which records took it. NEGATIVE CONTROL:
+    /// the same run, passed, is in the machine's record, and its line says so.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_run_that_passed_is_kept_for_this_machines_other_checkouts() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("verify-disk-machine-")
+            .tempdir()
+            .expect("scratch");
+        let record = dir.path().join("state").join(MACHINE_FOOTPRINT);
+        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+        let finished = |name: &str, passed: bool| -> String {
+            let checkout = dir.path().join(name);
+            let build = checkout.join("build");
+            std::fs::create_dir_all(&build).expect("the build directory");
+            let run = atpkg::admit_disk::Run {
+                what: format!("verify lint -p a ({name})"),
+                scope: "lint -p a".to_owned(),
+                dirs: vec![build.clone()],
+                record: checkout.join(FOOTPRINT),
+                cold: 1 << 30,
+                on: dir.path().to_path_buf(),
+                stuck_ends: None,
+                machine: Some(atpkg::admit_disk::Machinewide {
+                    record: record.clone(),
+                    selection: atpkg::admit_disk::Selection {
+                        work: "lint".to_owned(),
+                        crates: Some(vec!["a".to_owned()]),
+                    },
+                }),
+            };
+            let held = atpkg::admit_disk::admit_on(
+                run,
+                &ledger,
+                &aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14)),
+                aterm_capacity::Admit::Now,
+                aterm_capacity::Pace::default(),
+                &mut atpkg::admit_disk::Reclaim::of(
+                    Box::new(|_, _| (0, Vec::new(), Vec::new())),
+                    Box::new(|_, _, _| None),
+                    Box::new(|_, _| Vec::new()),
+                ),
+                &mut |_| {},
+            )
+            .expect("the run's disk claim");
+            std::fs::write(build.join("unit.rlib"), [0u8; 1 << 16]).expect("the run's writes");
+            let log_path = checkout.join("log");
+            let mut log = std::fs::File::create(&log_path).expect("the log");
+            crate::let_disk_go(Some(held), passed, Some(&mut log));
+            assert_eq!(
+                aterm_capacity::Footprints::load(&checkout.join(FOOTPRINT))
+                    .runs()
+                    .len(),
+                1,
+                "kept beside its directories"
+            );
+            std::fs::read_to_string(&log_path).expect("the log")
+        };
+        let kept_machine_wide = || {
+            aterm_capacity::MachineFootprints::load(&record)
+                .rows()
+                .iter()
+                .map(|r| r.runs.len())
+                .sum::<usize>()
+        };
+        let failed = finished("failed", false);
+        assert_eq!(kept_machine_wide(), 0, "{failed}");
+        assert!(
+            failed.contains(
+                "; kept for its scope here; it did not pass, so not for this machine's other \
+                 checkouts"
+            ),
+            "{failed}"
+        );
+        let passed = finished("passed", true);
+        assert_eq!(kept_machine_wide(), 1, "{passed}");
+        assert!(
+            passed.contains("; kept for its scope here; kept for this machine's other checkouts"),
+            "{passed}"
+        );
     }
 }

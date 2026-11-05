@@ -322,11 +322,7 @@ fn global_clauses(ctx: &Ctx<'_>, s: &Snapshot) -> Vec<String> {
         parts.push("cores measuring (the first sample has no interval)".into());
     }
     if let Some(t) = s.thermal {
-        parts.push(if t.level == crate::model::Throttle::None {
-            "throttle none".into()
-        } else {
-            format!("throttled: {}", t.level.word())
-        });
+        parts.push(t.phrase());
     }
     if let Some(w) = s.global.wait.filter(|w| *w >= 0.1) {
         parts.push(format!("≥{} waiting for a core (own processes)", c1(w)));
@@ -528,7 +524,7 @@ fn event_line(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Line {
         EventKind::Pressure { from, to } => {
             t.push_str(&format!(" from={} to={}", from.word(), to.word()));
         }
-        EventKind::Throttle { from, to } => {
+        EventKind::Thermal { from, to } => {
             t.push_str(&format!(" from={} to={}", from.word(), to.word()));
         }
         EventKind::Swap { started, bps } => {
@@ -638,7 +634,7 @@ fn event_json(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Jv {
             o.set("from", Jv::s(from.word()));
             o.set("to", Jv::s(to.word()));
         }
-        EventKind::Throttle { from, to } => {
+        EventKind::Thermal { from, to } => {
             o.set("from", Jv::s(from.word()));
             o.set("to", Jv::s(to.word()));
         }
@@ -1100,15 +1096,31 @@ fn machine_line(ctx: &Ctx<'_>, s: &Snapshot) -> String {
     format!("machine  {}", parts.join(" · "))
 }
 
-fn throttle_words(s: &Snapshot) -> String {
+/// The JSON `thermal` object: `{word, raw, exact, low_power}`, `low_power` unavailable where
+/// the OS says nothing of it.
+pub(super) fn thermal_json(t: crate::model::Thermal) -> Jv {
+    Jv::obj([
+        ("word", Jv::s(t.word())),
+        ("raw", Jv::u(u64::from(t.raw))),
+        ("exact", Jv::Bool(t.exact)),
+        (
+            "low_power",
+            t.low_power.map_or_else(|| Jv::why("unsupported"), Jv::Bool),
+        ),
+    ])
+}
+
+/// The `thermal` line's words: the OS's word and its raw level, or the counter heuristic's
+/// clause and what it estimates from.
+fn thermal_words(s: &Snapshot) -> String {
     match s.thermal {
         Some(t) => {
             let mut w = if t.exact {
-                format!("{} (thermal state {})", t.level.word(), t.raw)
+                format!("{} (OS level {})", t.word(), t.raw)
             } else {
                 format!(
                     "{} (estimate: thermal zones against their trip points, and the throttle counters)",
-                    t.level.word()
+                    t.phrase()
                 )
             };
             if let Some(lp) = t.low_power {
@@ -1193,7 +1205,7 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
         th.push_str(&format!(" · load {:.2} / {:.2} / {:.2}", l[0], l[1], l[2]));
     }
     lines.push(line("threads", th));
-    lines.push(line("throttle", format!("throttle {}", throttle_words(s))));
+    lines.push(line("thermal", format!("thermal  {}", thermal_words(s))));
     lines.push(line("gpu", format!("gpu      {}", gpu_words(s))));
     if let Some(m) = s.mem.as_ref() {
         lines.push(line(
@@ -1585,7 +1597,7 @@ fn cores_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
              many cores' worth each process uses"
         },
     ));
-    lines.push(line("throttle", format!("throttle {}", throttle_words(s))));
+    lines.push(line("thermal", format!("thermal {}", thermal_words(s))));
 }
 
 fn gpu_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
@@ -2521,9 +2533,9 @@ fn global_json(s: &Snapshot) -> Jv {
         ),
     );
     o.set(
-        "throttle",
+        "thermal",
         s.thermal
-            .map_or_else(|| Jv::why("unsupported"), |t| Jv::s(t.level.word())),
+            .map_or_else(|| Jv::why("unsupported"), |t| Jv::s(t.word())),
     );
     o.set("gpu_pm", gpu_device_json(s));
     if let Some(m) = s.mem.as_ref() {
@@ -2761,21 +2773,9 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             );
             o.set("split_exact", Jv::s("heuristic"));
             o.set(
-                "throttle",
-                s.thermal.map_or_else(
-                    || Jv::why("unsupported"),
-                    |t| {
-                        let mut th = Jv::obj([
-                            ("level", Jv::s(t.level.word())),
-                            ("raw", Jv::u(u64::from(t.raw))),
-                            ("exact", Jv::Bool(t.exact)),
-                        ]);
-                        if let Some(lp) = t.low_power {
-                            th.set("low_power", Jv::Bool(lp));
-                        }
-                        th
-                    },
-                ),
+                "thermal",
+                s.thermal
+                    .map_or_else(|| Jv::why("unsupported"), thermal_json),
             );
             if ctx.owner_class {
                 let top: Vec<Jv> = s
@@ -2868,9 +2868,9 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
                 }),
             );
             o.set(
-                "throttle",
+                "thermal",
                 s.thermal
-                    .map_or_else(|| Jv::why("unsupported"), |t| Jv::s(t.level.word())),
+                    .map_or_else(|| Jv::why("unsupported"), |t| Jv::s(t.word())),
             );
         }
         View::Gpu => o.set("gpu", gpu_json(q, ctx, s)),
@@ -2900,9 +2900,12 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
         o.set("scheduling_context", scheduling_context_json(ctx, s));
     }
     if matches!(q.view, View::Cores | View::Why) {
-        if let Some(h) = &s.hardware {
-            o.set("cpu_hardware", super::hardware::sample_json(h));
-        }
+        o.set(
+            "cpu_hardware",
+            s.hardware
+                .as_ref()
+                .map_or_else(|| Jv::why("not_sampled"), super::hardware::sample_json),
+        );
         if let Some(b) = &s.cpu_diagnostics {
             o.set("cpu_diagnostic_bundle", super::hardware::bundle_json(b));
         }

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Google credentials from an authenticated, explicitly referenced vault entry.
-//! A mailbox password, a local file or a matching filename is not a Google credential.
+//! Google credentials from an explicitly bound vault entry or canonical Gmail registry row.
+//! No address guess, local file or unrelated mailbox supplies a Google credential.
 
 use std::path::Path;
 
@@ -150,6 +150,37 @@ impl Bundle {
     }
 }
 
+#[cfg(unix)]
+fn registry_bundle(mailbox: &super::alab_roster::LabMailbox) -> Result<Bundle, Error> {
+    use super::alab_roster::{self, Part};
+    if !mailbox.held.contains(&Part::Password) {
+        return Err(Error::MissingEntry);
+    }
+    let parts: &[Part] = if mailbox.held.contains(&Part::Totp) {
+        &[Part::Password, Part::Totp]
+    } else {
+        &[Part::Password]
+    };
+    let values = alab_roster::reveal_bound(mailbox, parts).map_err(|_| Error::Unavailable)?;
+    let password = &values[0];
+    if password.is_empty() || password.len() > 4096 || password.chars().any(char::is_control) {
+        return Err(Error::InvalidBundle);
+    }
+    let authenticator = if mailbox.held.contains(&Part::Totp) {
+        let seed = &values[1];
+        if super::headless_oauth::generate_totp_at(seed, 0).is_none() {
+            return Err(Error::InvalidBundle);
+        }
+        Some(SecretBytes::from(seed.as_bytes()))
+    } else {
+        None
+    };
+    Ok(Bundle {
+        password: SecretBytes::from(password.as_bytes()),
+        authenticator,
+    })
+}
+
 /// Loaded Google credentials with a retained authenticated-vault observation.
 /// This is not proof of provider acceptance or permission to use an account's budget.
 pub struct Credentials {
@@ -158,7 +189,9 @@ pub struct Credentials {
     #[cfg(unix)]
     paths: aterm_secrets::client::Paths,
     #[cfg(unix)]
-    snapshot: aterm_secrets::client::EntrySnapshot,
+    snapshot: Option<aterm_secrets::client::EntrySnapshot>,
+    #[cfg(unix)]
+    registry: Option<super::alab_roster::LabMailbox>,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -180,6 +213,26 @@ impl Credentials {
         {
             use aterm_secrets::client::{self, Paths};
             let paths = Paths::for_home(home);
+            if let Some(key) = reference.strip_prefix("registry-mailbox:") {
+                let mut found = super::alab_roster::mail()
+                    .into_iter()
+                    .filter(|m| m.pk == key);
+                let mailbox = found.next().ok_or(Error::MissingEntry)?;
+                if found.next().is_some()
+                    || mailbox.service.as_deref() != Some("gmail")
+                    || !mailbox.login.eq_ignore_ascii_case(identity.email())
+                {
+                    return Err(Error::WrongIdentity);
+                }
+                let bundle = registry_bundle(&mailbox)?;
+                return Ok(Self {
+                    email: identity.email().to_owned(),
+                    bundle,
+                    paths,
+                    snapshot: None,
+                    registry: Some(mailbox),
+                });
+            }
             let config = client::config(&paths)
                 .map_err(|_| Error::Unavailable)?
                 .ok_or(Error::MissingVault)?;
@@ -192,7 +245,8 @@ impl Credentials {
                 email: identity.email().to_owned(),
                 bundle,
                 paths,
-                snapshot,
+                snapshot: Some(snapshot),
+                registry: None,
             })
         }
         #[cfg(not(unix))]
@@ -217,12 +271,24 @@ impl Credentials {
     pub fn check_current(&mut self) -> Result<(), Error> {
         #[cfg(unix)]
         {
+            if let Some(mailbox) = &self.registry {
+                let current = registry_bundle(mailbox).map_err(|_| Error::Changed)?;
+                if current.password.as_slice() != self.bundle.password.as_slice()
+                    || current.authenticator.as_ref().map(|s| s.as_slice())
+                        != self.bundle.authenticator.as_ref().map(|s| s.as_slice())
+                {
+                    return Err(Error::Changed);
+                }
+                return Ok(());
+            }
             let entry = self
                 .snapshot
+                .as_ref()
+                .ok_or(Error::Changed)?
                 .read(&self.paths)
                 .map_err(|_| Error::Unavailable)?
                 .ok_or(Error::Changed)?;
-            self.snapshot = entry.snapshot().clone();
+            self.snapshot = Some(entry.snapshot().clone());
             Ok(())
         }
         #[cfg(not(unix))]
@@ -279,6 +345,109 @@ mod tests {
             Bundle::parse(SecretBytes::from(VALUE.as_bytes()), "another@example.com"),
             Err(Error::WrongIdentity)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_registry_credentials_bind_service_identity_and_current_secret() {
+        use super::super::alab_roster::{self, LabMailbox, Part};
+        let source = "[[identities]]\nid='one'\nemail='person@example.com'\nregistry_mailbox='mb-0123456789abcdef'\n[[bindings]]\nprovider='agy'\naccount='work'\nidentity='one'\nexpected_email='person@example.com'\n";
+        let registry = super::super::google_identity::Registry::parse(source).unwrap();
+        let identity = registry.resolve("agy", "work").unwrap().0;
+        let root = aterm_tempfile::tempdir().unwrap();
+        for case in 0..6 {
+            let mailbox = LabMailbox {
+                pk: "mb-0123456789abcdef".into(),
+                login: if case == 2 {
+                    "another@example.com"
+                } else {
+                    "person@example.com"
+                }
+                .into(),
+                service: Some(if case == 1 { "proton" } else { "gmail" }.into()),
+                webmail: None,
+                receives: Vec::new(),
+                held: if case == 3 {
+                    Vec::new()
+                } else {
+                    vec![Part::Password, Part::Totp]
+                },
+            };
+            let rows = if case == 4 {
+                vec![mailbox.clone(), mailbox.clone()]
+            } else {
+                vec![mailbox.clone()]
+            };
+            alab_roster::with_mail(
+                rows,
+                vec![
+                    ((&mailbox.pk, Part::Password), "fixture-registry-password"),
+                    ((&mailbox.pk, Part::Totp), "JBSWY3DPEHPK3PXP"),
+                ],
+                || {
+                    let credentials = Credentials::load(identity, root.path());
+                    if (1..=4).contains(&case) {
+                        assert!(credentials.is_err(), "case {case}");
+                        return;
+                    }
+                    let mut credentials = credentials.unwrap();
+                    assert!(
+                        credentials
+                            .with_google_page("https://not-google.example/", |_, _| panic!(
+                                "wrong origin exposed credentials"
+                            ))
+                            .is_err()
+                    );
+                    credentials
+                        .with_google_page("https://accounts.google.com/login", |password, seed| {
+                            assert_eq!(password, "fixture-registry-password");
+                            assert_eq!(seed, Some("JBSWY3DPEHPK3PXP"));
+                        })
+                        .unwrap();
+                    let changed = if case == 5 {
+                        "changed-registry-password"
+                    } else {
+                        "fixture-registry-password"
+                    };
+                    let mut new_binding = mailbox.clone();
+                    if case == 0 {
+                        new_binding.login = "replacement@example.com".into();
+                    }
+                    alab_roster::with_mail(
+                        vec![new_binding],
+                        vec![
+                            ((&mailbox.pk, Part::Password), changed),
+                            ((&mailbox.pk, Part::Totp), "JBSWY3DPEHPK3PXP"),
+                        ],
+                        || {
+                            assert!(matches!(credentials.check_current(), Err(Error::Changed)));
+                            assert!(
+                                credentials
+                                    .with_google_page(
+                                        "https://accounts.google.com/",
+                                        |_, _| panic!("changed credential reached browser")
+                                    )
+                                    .is_err()
+                            );
+                        },
+                    );
+                },
+            );
+        }
+        for broken in [
+            source.replace(
+                "registry_mailbox=",
+                "credential_ref='google-one'\nregistry_mailbox=",
+            ),
+            source.replace("mb-0123456789abcdef", "../escape"),
+            source.replace("mb-0123456789abcdef", "mb-wrong"),
+        ] {
+            assert!(super::super::google_identity::Registry::parse(&broken).is_err());
+        }
+        assert!(
+            !root.path().join(".secrets").exists(),
+            "registry source required no materialized credential file"
+        );
     }
 
     #[cfg(unix)]

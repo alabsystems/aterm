@@ -272,6 +272,10 @@ pub(crate) mod tests {
                 .collect();
             aterm_codec::base64::decode(&standard).ok()
         };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an RS256 assertion is RSA, which astream's Ed25519 verify does not cover"
+        )]
         ring::signature::UnparsedPublicKey::new(
             &ring::signature::RSA_PKCS1_2048_8192_SHA256,
             public,

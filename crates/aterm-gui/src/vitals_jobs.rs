@@ -21,7 +21,7 @@ use aterm_vitals::jobs::{
     NamingSelector, NamingTicket, ProcState, Standing, StartWait, SweepProc, TcpState, TermWord,
     ThreadState, TierB, TtyMode,
 };
-use aterm_vitals::left::LeftView;
+use aterm_vitals::left::{LeftRow, LeftView};
 use aterm_vitals::model::TabRoot;
 
 /// The engine's fast cadence, also the floor between passes, so a 2 Hz lens does not double the
@@ -269,7 +269,7 @@ pub(crate) struct JobsPass {
     naming_fresh: bool,
     /// The tab a session-mate's environment ties each program outside every job that has not
     /// started to, by pid, as the leftover pass last judged it ([`Self::tie_held`]).
-    ties: BTreeMap<u32, u64>,
+    ties: BTreeMap<u32, aterm_vitals::left::Tie>,
 }
 
 impl JobsPass {
@@ -297,8 +297,10 @@ impl JobsPass {
 
     /// Takes the leftover pass's ties of programs that have not started to live tabs
     /// ([`crate::vitals_left::LeftPass::ties`]): the next pass names each such program by its
-    /// tab, which its job's tab, where it has one, overrides in the engine.
-    pub(crate) fn tie_held(&mut self, ties: BTreeMap<u32, u64>) {
+    /// tab, and by an agent's call where it was born after that tab's agent started (as the judge
+    /// reads an agent's own program, [`aterm_vitals::left::Tie::after_agent`]), which its job's
+    /// tab and kind, where it has a job, override in the engine.
+    pub(crate) fn tie_held(&mut self, ties: BTreeMap<u32, aterm_vitals::left::Tie>) {
         self.ties = ties;
     }
 
@@ -401,9 +403,7 @@ impl JobsPass {
             },
             readers.exe_name,
         );
-        for h in &mut held {
-            h.tab = self.ties.get(&h.pid).copied();
-        }
+        name_tied(&mut held, &self.ties);
         let lanes = self.reader.lanes();
         let tick = JobTick {
             at_ms,
@@ -426,10 +426,22 @@ impl JobsPass {
             grant_ms: grant.grant_ms,
         };
         let view = self.jobs.absorb(&tick);
+        crate::telemetry_host::jobs_passed(&mut self.jobs, at_ms);
         self.naming_fresh = true;
         self.next_ms = Some(at_ms + next_pass_ms(view.demand));
         self.view = Some(Arc::new(view));
         self.view.clone()
+    }
+}
+
+/// Names each program that has not started by the leftover pass's tie of it
+/// ([`JobsPass::tie_held`]): the tie's tab, and an agent's call where it was born after that tab's
+/// agent started; the engine prefers a job's own tab and kind, where the program has a job.
+fn name_tied(held: &mut [HeldProc], ties: &BTreeMap<u32, aterm_vitals::left::Tie>) {
+    for h in held {
+        let tie = ties.get(&h.pid);
+        h.tab = tie.map(|t| t.key);
+        h.job = tie.filter(|t| t.after_agent).map(|_| JobKind::AgentCall);
     }
 }
 
@@ -487,6 +499,7 @@ pub(crate) fn held_list(
                 aterm: true,
                 wait,
                 tab: None,
+                job: None,
                 started_ms: m.start_facts.as_ref().and_then(|f| fork_ms(f, now_us)),
             })
         })
@@ -525,6 +538,7 @@ pub(crate) fn held_list(
                 aterm: in_aterm(p.pid),
                 wait,
                 tab: None,
+                job: None,
                 started_ms: facts.as_ref().and_then(|f| fork_ms(f, now_us)),
             });
         }
@@ -656,17 +670,43 @@ struct Posted {
 }
 
 /// The view the loop last adopted, with its tabs' session ids, read by the harness workers' stall
-/// canary ([`JobsBoard::evidence`]); one leaf-locked slot.
+/// canary ([`JobsBoard::evidence`]), and the leftover view of the same snapshot
+/// ([`JobsBoard::leftover`]); each one leaf-locked slot.
 pub(crate) struct JobsBoard {
     slot: Mutex<Option<Posted>>,
+    left: Mutex<Option<Arc<LeftView>>>,
 }
 
 impl JobsBoard {
-    /// An empty board: every session's evidence is `Unknown`.
+    /// An empty board: every session's evidence is `Unknown`, and no left row is read.
     pub(crate) const fn new() -> Self {
         Self {
             slot: Mutex::new(None),
+            left: Mutex::new(None),
         }
+    }
+
+    /// Post the leftover view of the snapshot the loop adopted (`None` where it carries none).
+    pub(crate) fn post_left(&self, left: Option<Arc<LeftView>>) {
+        *self.left.lock().unwrap_or_else(PoisonError::into_inner) = left;
+    }
+
+    /// WHAT SESSION `sid`'S AGENT MAY BE TOLD of the processes it left running at `now_ms` (unix
+    /// ms; `harness_host::WorkerIdle::facts`): its left rows in the newest leftover view posted,
+    /// each re-proved by `lives` after the lock is let go ([`leftover_reading`]); `None` with none
+    /// posted. Only the `Arc`'s copy runs under the lock.
+    pub(crate) fn leftover(
+        &self,
+        sid: &str,
+        now_ms: i64,
+        lives: fn(&str) -> bool,
+    ) -> Option<aterm_agent::supervise::LeftoverReading> {
+        let view = self
+            .left
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        leftover_reading(&view, sid, now_ms, lives)
     }
 
     /// Post `view`, its tabs' session ids `sids`, read at `now`.
@@ -755,13 +795,15 @@ impl JobsBoard {
     /// says at `now` (`docs/DESIGN-leftover-processes-2026-10-16.md` §6.3;
     /// `harness_host::WorkerIdle::facts`): the view's held rows (`Findings.program_check`) of this
     /// session's tab named [`JobKind::AgentCall`], members of one of its agent's calls or of what
-    /// one left (an orphan unit is named by the job it outlived), oldest (held longest) first, each
-    /// held for its `for_ms` as of the view, with the view's age; `None` with no view or one older
-    /// than [`JOBS_FRESH`]. A held member of the
-    /// shell's own jobs, or of what one left, is the person's, never the agent's, and so is one in
-    /// a nested terminal session (`JobKind::Nested`: sudo's, `script`'s, or an agent's pty call,
-    /// whose consumer the engine names a person). The rows are copied under the lock and nothing
-    /// else is done there.
+    /// one left (an orphan unit is named by the job it outlived), and the held rows outside every
+    /// job that a session-mate's environment ties to this tab and that were born after its agent
+    /// started, which the tie names the same (W-session, [`JobsPass::tie_held`]: a program born
+    /// and orphaned between two readings), oldest (held longest) first, each held
+    /// for its `for_ms` as of the view, with the view's age; `None` with no view or one older than
+    /// [`JOBS_FRESH`]. A held member of the shell's own jobs, or of what one left, is the
+    /// person's, never the agent's, and so is one in a nested terminal session
+    /// (`JobKind::Nested`: sudo's, `script`'s, or an agent's pty call, whose consumer the engine
+    /// names a person). The rows are copied under the lock and nothing else is done there.
     pub(crate) fn held(&self, sid: &str, now: Instant) -> Option<(Duration, Vec<HeldCall>)> {
         let (age, mut held) = {
             let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
@@ -790,6 +832,55 @@ impl JobsBoard {
         held.sort_by_key(|h| std::cmp::Reverse(h.held_ms));
         Some((age, held))
     }
+}
+
+/// The agent's left rows of session `sid` in `view` as the facts seam reads them at `now_ms` (unix
+/// ms): the rows [`aterm_vitals::left::agents_left_read`] gives (the ones `status left=` counts),
+/// each re-proved at the ask by `lives` on its token ([`left_lives`] live: the process it names is
+/// that one still), as the held part's programs are, so a fact is told from a part as of now
+/// whatever the view's age. How many it proves, the oldest's age told on by the view's age, as of
+/// `now_ms`. A view that names none is a part with none, as of the view; a partial view (its sweep
+/// stopped at its cap, or its reading at its bound of new candidates) can say a row is left but
+/// never that none is, and a re-proof that proves none of its rows proves no absence: each is a
+/// part unread (`None`), which neither opens nor closes an episode.
+pub(crate) fn leftover_reading(
+    view: &LeftView,
+    sid: &str,
+    now_ms: i64,
+    lives: fn(&str) -> bool,
+) -> Option<aterm_agent::supervise::LeftoverReading> {
+    let rows = aterm_vitals::left::agents_left_read(view, sid)?;
+    let as_of_ms = i64::try_from(view.as_of_ms).ok()?;
+    if rows.is_empty() {
+        return Some(aterm_agent::supervise::LeftoverReading {
+            as_of_ms,
+            count: 0,
+            oldest_ms: None,
+        });
+    }
+    let age_ms = now_ms.saturating_sub(as_of_ms).max(0).unsigned_abs();
+    let proved: Vec<&LeftRow> = rows
+        .into_iter()
+        .filter(|r| r.token.as_deref().is_some_and(lives))
+        .collect();
+    (!proved.is_empty()).then(|| aterm_agent::supervise::LeftoverReading {
+        as_of_ms: now_ms,
+        count: u32::try_from(proved.len()).unwrap_or(u32::MAX),
+        oldest_ms: proved
+            .iter()
+            .filter_map(|r| r.started_ms)
+            .max()
+            .map(|ms| ms.saturating_add(age_ms)),
+    })
+}
+
+/// Whether the process a left row's `token` names is that one still (the leftover part's
+/// re-proof at the ask, [`leftover_reading`]): its identity read now (`end`'s own read,
+/// [`aterm_uds::process::read_identity`]) is the token's, pid, birth and, where the kernel keeps
+/// one, pid version, so an ended process, a reused pid and an exec since are not.
+pub(crate) fn left_lives(token: &str) -> bool {
+    aterm_uds::process::Identity::parse(token)
+        .is_some_and(|id| aterm_uds::process::read_identity(id.pid).is_some_and(|now| now == id))
 }
 
 /// Whether macOS's program check still holds the same exec that the view timed (the facts'
@@ -834,10 +925,11 @@ fn has_run(pid: u32, ms: u64) -> bool {
 /// WHAT SESSION `sid`'S AGENT MAY BE TOLD of its calls at no progress at (`now`, `now_ms`), as
 /// the facts seam reads it: the board's no-progress calls ([`JobsBoard::facts`] at `now`), each
 /// leader re-proved alive at its birth by `lives` after the board's lock is let go, the reading
-/// stamped `now_ms` less the view's age; its held programs unread (`held` is `None`). `None` with
-/// no view or one older than [`JOBS_FRESH`]. Both clocks are given, so a test moves them
-/// together. The one reading aterm's own loop (`harness_host::WorkerIdle::facts`, which adds
-/// the held part) and a proven self-claim's act (`harness fact`) both take.
+/// stamped `now_ms` less the view's age; its held programs and left rows unread (`held` and
+/// `left` are `None`). `None` with no view or one older than [`JOBS_FRESH`]. Both clocks are
+/// given, so a test moves them together. The one reading aterm's own loop
+/// (`harness_host::WorkerIdle::facts`, which adds the held part and the left rows) and a proven
+/// self-claim's act (`harness fact`) both take.
 pub(crate) fn facts_reading(
     board: &JobsBoard,
     lives: fn(u32, u64) -> bool,
@@ -855,6 +947,7 @@ pub(crate) fn facts_reading(
             .map(|(_, call)| call)
             .collect(),
         held: None,
+        left: None,
     })
 }
 
@@ -1001,7 +1094,14 @@ fn job_tabs(
 /// no output, as it is no edge for the output wake ([`crate::vitals_host::ScreenMoves`]): counted,
 /// it would keep a program at rest running and the engine reading every 2 s.
 #[derive(Debug, Default)]
-pub(crate) struct JobFeed(Mutex<Fed>);
+pub(crate) struct JobFeed(Mutex<Fed>, crate::telemetry_host::CmdMeter);
+
+impl JobFeed {
+    /// The session's command edges for its telemetry rows ([`crate::telemetry_host::CmdMeter`]).
+    pub(crate) const fn meter(&self) -> &crate::telemetry_host::CmdMeter {
+        &self.1
+    }
+}
 
 #[derive(Debug, Default)]
 struct Fed {
@@ -1499,6 +1599,7 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
             logical_writes: c.logical_writes,
             runnable_ns: c.runnable_ns,
             pageins: c.pageins,
+            peak_footprint: c.peak_footprint,
         }),
         threads: p.threads.as_ref().map(|ts| {
             ts.iter()
@@ -1768,6 +1869,7 @@ pub(crate) mod tests {
             label: label.into(),
             program: String::new(),
             tab_id: None,
+            agent_leader: None,
         };
         let raw = TtyMode {
             canonical: false,
@@ -2143,6 +2245,7 @@ pub(crate) mod tests {
             label: "Tab 1".into(),
             program: String::new(),
             tab_id: None,
+            agent_leader: None,
         }];
         let mut pass = JobsPass::new();
         let first = pass
@@ -2577,6 +2680,7 @@ pub(crate) mod tests {
             label: "Tab 1".into(),
             program: String::new(),
             tab_id: None,
+            agent_leader: None,
         };
         let after_grant = |grant: &GrantFacts| {
             pass()
@@ -3044,6 +3148,7 @@ pub(crate) mod tests {
                 teller: None,
                 token: None,
                 foreground: false,
+                after_agent: false,
             }],
             ..LeftView::default()
         }
@@ -3301,6 +3406,105 @@ pub(crate) mod tests {
             "a view past the bound"
         );
         assert_eq!(JobsBoard::new().held("s-a", later), None, "no view");
+    }
+
+    /// The board, posted `posted`, over the engine's view of held programs outside every job
+    /// that W-session ties to tab 4 (session `s-a`), one born after its agent started (702) and
+    /// one before (704), and to tab 5 (`s-b`, 703, after its agent), beside one call's member of
+    /// tab 4's (701).
+    fn tied_board(posted: Instant) -> JobsBoard {
+        use aterm_vitals::jobs::{HeldProc, JobTick, Jobs, StartWait};
+        use aterm_vitals::left::Tie;
+        let held = |pid| HeldProc {
+            pid,
+            exec: u64::from(pid),
+            exec_version: Some(u64::from(pid)),
+            name: "sh".into(),
+            aterm: true,
+            wait: StartWait::ProgramCheck,
+            ..HeldProc::default()
+        };
+        let tie = |key, after_agent| Tie {
+            key,
+            closed: false,
+            after_agent,
+        };
+        let mut rows = vec![held(702), held(703), held(704)];
+        name_tied(
+            &mut rows,
+            &BTreeMap::from([
+                (702, tie(4, true)),
+                (703, tie(5, true)),
+                (704, tie(4, false)),
+            ]),
+        );
+        let mut engine = Jobs::new();
+        let tick = |at_ms| JobTick {
+            at_ms,
+            read_ms: at_ms,
+            self_uid: Some(501),
+            held: rows.clone(),
+            ..JobTick::default()
+        };
+        engine.absorb(&tick(1_000));
+        let mut view = engine.absorb(&tick(601_000));
+        view.findings.program_check.push(aterm_vitals::jobs::Named {
+            pid: 701,
+            exec_version: Some(701),
+            name: "sh".into(),
+            tab: Some(4),
+            job: Some(JobKind::AgentCall),
+            for_ms: 30_000,
+        });
+        let view = Arc::new(view);
+        let board = JobsBoard::new();
+        board.post(
+            view,
+            BTreeMap::from([(4, "s-a".to_string()), (5, "s-b".to_string())]),
+            posted,
+        );
+        board
+    }
+
+    /// A SESSION-MATE TIED HELD ROW COUNTS ONCE ITS AGENT HAD STARTED: a held program in no job
+    /// (born and orphaned between two readings) that a session-mate's environment ties to this
+    /// tab, born after the tab's agent started, is this tab's agent's to be told of, beside its
+    /// calls' members; one born before the agent started is the person's, never told.
+    /// NEGATIVE CONTROL: name every tied program an agent's call, and the person's is told too.
+    #[test]
+    fn a_session_mate_tied_held_row_counts() {
+        let posted = Instant::now();
+        let board = tied_board(posted);
+        let (_, rows) = board
+            .held("s-a", posted + Duration::from_secs(1))
+            .expect("a fresh view");
+        let pids: Vec<u32> = rows.iter().map(|h| h.pid).collect();
+        assert_eq!(
+            pids,
+            vec![702, 701],
+            "held longest first, the person's never"
+        );
+    }
+
+    /// ANOTHER SESSION'S HELD ROW DOES NOT COUNT: a program W-session ties to tab 5 is session
+    /// `s-b`'s, never `s-a`'s, and a session no held row is tied to is told of none.
+    #[test]
+    fn another_sessions_held_row_does_not() {
+        let posted = Instant::now();
+        let board = tied_board(posted);
+        let later = posted + Duration::from_secs(1);
+        let pids = |sid: &str| -> Vec<u32> {
+            board
+                .held(sid, later)
+                .expect("a fresh view")
+                .1
+                .iter()
+                .map(|h| h.pid)
+                .collect()
+        };
+        assert_eq!(pids("s-b"), vec![703]);
+        assert!(!pids("s-a").contains(&703));
+        assert_eq!(pids("s-c"), Vec::<u32>::new());
     }
 
     /// A HELD PID IS PROVED ONLY IN A PROCESS AS OLD AS ITS TOLD WAIT ([`held_as_long`]): this

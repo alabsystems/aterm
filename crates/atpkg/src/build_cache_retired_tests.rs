@@ -254,11 +254,15 @@ fn the_gates_leftovers_go_once_unused() {
     drop(g.dir);
 }
 
-/// An actually running image keeps every retired gate route. The child proves execution
-/// before any removal can touch its image; after it is reaped, the same leftover can go.
+/// An actually running image keeps a retired snapshot, from its tree or from git's entry for it.
+/// The child proves execution before any removal can touch its image; after it is reaped, the same
+/// leftover can go. The cells lane and the lock share one arm of a pass, and the kernel reader
+/// matches an image by path prefix whichever root holds it, so
+/// [`used_or_unknown_ownership_keeps_retired_leftovers`] holds those two with a stated holder. The
+/// gap: a kernel read that misses an image only under those two path shapes.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn running_images_keep_retired_snapshots_cells_and_locks_until_reaped() {
+fn running_images_keep_a_retired_snapshot_until_reaped() {
     use aterm_uds::deadline::{KeptUntilRan, ad_hoc_copy, cat_echoes, kill_within};
     use aterm_uds::spawnfd::{Child, Stdio};
 
@@ -270,7 +274,7 @@ fn running_images_keep_retired_snapshots_cells_and_locks_until_reaped() {
     }
 
     let mut outcomes = Vec::new();
-    for route in 0..4 {
+    for route in [0, 3] {
         let g = gate();
         let checkout = g.checkout();
         let paths = [
@@ -308,19 +312,17 @@ fn running_images_keep_retired_snapshots_cells_and_locks_until_reaped() {
         };
         let fence = super::super::fence::Fence::new(&processes);
         let done = super::retire_on(&roots, now, &GitCli, &fence);
-        let retired_root = if route == 3 { &paths[0] } else { &paths[route] };
         let held = done
             .iter()
-            .find(|(left, _)| left.path == *retired_root)
+            .find(|(left, _)| left.path == paths[0])
             .is_some_and(|(_, result)| result.is_err())
             && image.is_file();
-        let snapshot_unchanged = (route != 0 && route != 3)
-            || (paths[0].join(".git").is_file()
-                && paths[1].is_dir()
-                && GitCli
-                    .run(&checkout, &["worktree", "list", "--porcelain"])
-                    .out
-                    .contains(&*paths[0].to_string_lossy()));
+        let snapshot_unchanged = paths[0].join(".git").is_file()
+            && paths[1].is_dir()
+            && GitCli
+                .run(&checkout, &["worktree", "list", "--porcelain"])
+                .out
+                .contains(&*paths[0].to_string_lossy());
         kill_within(&mut running.0, Duration::from_secs(60));
         assert!(
             running.0.try_wait().unwrap().is_some(),
@@ -341,7 +343,9 @@ fn running_images_keep_retired_snapshots_cells_and_locks_until_reaped() {
 }
 
 /// The retired paths share the fail-closed ownership policy for cwd, files and unknown
-/// processes. Clearing that same observation permits the existing eligible cleanup.
+/// processes. Clearing that same observation permits the existing eligible cleanup. A holder of
+/// the cells lane and the lock alone keeps both while the snapshot goes, and a later pass, once
+/// they are free, takes what the snapshot left.
 #[test]
 fn used_or_unknown_ownership_keeps_retired_leftovers() {
     use aterm_uds::holders::{PathScan, PathUse};
@@ -396,6 +400,42 @@ fn used_or_unknown_ownership_keeps_retired_leftovers() {
     );
     assert!(done.iter().all(|(_, result)| result.is_ok()), "{done:?}");
     assert!(paths.iter().all(|path| !path.exists()));
+
+    let g = gate();
+    let leftovers = [g.cells(), g.lock()];
+    let holding = std::cell::Cell::new(true);
+    let processes = |dirs: &[PathBuf], _: &[u32]| {
+        let users = leftovers
+            .iter()
+            .filter(|path| holding.get() && dirs.iter().any(|dir| path.starts_with(dir)))
+            .map(|path| PathUse {
+                pid: 23,
+                how: "exe",
+                path: path.join("held"),
+            })
+            .collect();
+        Ok(PathScan {
+            users,
+            ..PathScan::default()
+        })
+    };
+    let fence = super::super::fence::Fence::new(&processes);
+    let done = super::retire_on(&g.roots, g.now, &GitCli, &fence);
+    for path in &leftovers {
+        assert!(
+            done.iter()
+                .find(|(left, _)| left.path == *path)
+                .is_some_and(|(_, result)| result.is_err()),
+            "{}: {done:?}",
+            path.display()
+        );
+        assert!(path.is_dir(), "{}", path.display());
+    }
+    assert!(!g.snapshot().exists(), "{done:?}");
+    holding.set(false);
+    let done = super::retire_on(&g.roots, g.now, &GitCli, &fence);
+    assert!(done.iter().all(|(_, result)| result.is_ok()), "{done:?}");
+    assert!(leftovers.iter().all(|path| !path.exists()));
 }
 
 /// A git entry acquired after the snapshot tree went stays, and the failed snapshot

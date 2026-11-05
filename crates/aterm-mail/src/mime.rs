@@ -9,15 +9,19 @@ pub fn parse(bytes: &[u8]) -> Result<Message, String> {
     if bytes.len() > crate::wire::MAX_MESSAGE {
         return Err("Message exceeds size limit".into());
     }
-    let (headers, _) = split(bytes);
+    let (headers, content) = split(bytes);
+    let from = header(&headers, "from");
+    let to = header(&headers, "to");
+    let subject = header(&headers, "subject");
+    let date = header(&headers, "date");
     Ok(Message {
         id: String::new(),
-        from: header(&headers, "from"),
-        to: header(&headers, "to"),
-        subject: header(&headers, "subject"),
-        date: header(&headers, "date"),
+        from,
+        to,
+        subject,
+        date,
         unread: false,
-        text: body(bytes, 0)?,
+        text: body_with_split(headers, content, 0)?,
     })
 }
 
@@ -90,10 +94,18 @@ fn parameter<'a>(value: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn body(bytes: &[u8], depth: usize) -> Result<String, String> {
+    let (headers, content) = split(bytes);
+    body_with_split(headers, content, depth)
+}
+
+fn body_with_split(
+    headers: Vec<(String, String)>,
+    content: &[u8],
+    depth: usize,
+) -> Result<String, String> {
     if depth >= 16 {
         return Err("MIME nesting exceeds limit".into());
     }
-    let (headers, content) = split(bytes);
     let kind = raw_header(&headers, "content-type");
     let media = media_type(kind);
     if media_type(raw_header(&headers, "content-disposition")).eq_ignore_ascii_case("attachment") {
@@ -110,13 +122,20 @@ fn body(bytes: &[u8], depth: usize) -> Result<String, String> {
             return Err("Invalid MIME boundary".into());
         }
         let delimiter = format!("--{boundary}");
+        let close_delimiter = format!("{delimiter}--");
         let mut parts = Vec::new();
         let mut start = None;
         let mut offset = 0usize;
         for line in content.split_inclusive(|b| *b == b'\n') {
-            let line_text = String::from_utf8_lossy(line);
-            let trimmed = line_text.trim_end_matches(['\r', '\n', ' ', '\t']);
-            if trimmed == delimiter || trimmed == format!("{delimiter}--") {
+            let mut trimmed = line;
+            while let Some((&last, head)) = trimmed.split_last() {
+                if matches!(last, b'\r' | b'\n' | b' ' | b'\t') {
+                    trimmed = head;
+                } else {
+                    break;
+                }
+            }
+            if trimmed == delimiter.as_bytes() || trimmed == close_delimiter.as_bytes() {
                 if let Some(at) = start.take() {
                     let raw_part = &content[at..offset];
                     let part = raw_part
@@ -125,7 +144,7 @@ fn body(bytes: &[u8], depth: usize) -> Result<String, String> {
                         .unwrap_or(raw_part);
                     parts.push(part);
                 }
-                if trimmed.ends_with("--") && trimmed != delimiter {
+                if trimmed == close_delimiter.as_bytes() {
                     break;
                 }
                 start = Some(offset + line.len());
@@ -137,20 +156,18 @@ fn body(bytes: &[u8], depth: usize) -> Result<String, String> {
         }
         let mut fallback = String::new();
         for part in parts.into_iter().take(256) {
-            let (part_headers, _) = split(part);
+            let (part_headers, part_content) = split(part);
             let part_media = media_type(raw_header(&part_headers, "content-type"));
+            let is_plain_or_untyped =
+                part_media.is_empty() || part_media.eq_ignore_ascii_case("text/plain");
             let text = if is_digest && part_media.is_empty() {
                 // RFC 2046 §5.1.5: untyped parts in `multipart/digest` are `message/rfc822`,
                 // whose inner payload is another MIME message after the part's own headers.
-                let (_, inner_message) = split(part);
-                body(inner_message, depth + 1)?
+                body(part_content, depth + 1)?
             } else {
-                body(part, depth + 1)?
+                body_with_split(part_headers, part_content, depth + 1)?
             };
-            if is_alternative
-                && (part_media.is_empty() || part_media.eq_ignore_ascii_case("text/plain"))
-                && !text.is_empty()
-            {
+            if is_alternative && is_plain_or_untyped && !text.is_empty() {
                 return Ok(text);
             }
             if !text.is_empty() {
@@ -203,7 +220,7 @@ fn charset(bytes: &[u8], name: &str) -> String {
 }
 
 fn quoted_printable(bytes: &[u8], word: bool) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
         if bytes[at] == b'=' {
@@ -300,8 +317,8 @@ pub fn words(mut input: &str) -> String {
 }
 
 pub fn html_text(html: &str) -> String {
-    let mut output = String::new();
-    let mut hidden: Vec<String> = Vec::new();
+    let mut output = String::with_capacity(html.len());
+    let mut hidden: Vec<&'static str> = Vec::new();
     let mut cursor = html;
     while !cursor.is_empty() {
         if let Some(after_comment_open) = cursor.strip_prefix("<!--") {
@@ -320,22 +337,40 @@ pub fn html_text(html: &str) -> String {
                 .trim_end_matches('/')
                 .split_whitespace()
                 .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            match token.as_str() {
-                "script" | "style" | "head" if !self_closing => {
-                    hidden.push(token);
+                .unwrap_or("");
+            if !self_closing {
+                if token.eq_ignore_ascii_case("script") {
+                    hidden.push("script");
+                    continue;
+                } else if token.eq_ignore_ascii_case("style") {
+                    hidden.push("style");
+                    continue;
+                } else if token.eq_ignore_ascii_case("head") {
+                    hidden.push("head");
+                    continue;
                 }
-                "/script" | "/style" | "/head" => {
-                    let closing = token.trim_start_matches('/');
-                    if let Some(pos) = hidden.iter().rposition(|open| open == closing) {
-                        hidden.truncate(pos);
-                    }
+            }
+            if let Some(closing) = token.strip_prefix('/')
+                && (closing.eq_ignore_ascii_case("script")
+                    || closing.eq_ignore_ascii_case("style")
+                    || closing.eq_ignore_ascii_case("head"))
+            {
+                if let Some(pos) = hidden
+                    .iter()
+                    .rposition(|open| open.eq_ignore_ascii_case(closing))
+                {
+                    hidden.truncate(pos);
                 }
-                "br" | "/p" | "/div" | "/li" | "/tr" if hidden.is_empty() => {
-                    output.push('\n');
-                }
-                _ => {}
+                continue;
+            }
+            if hidden.is_empty()
+                && (token.eq_ignore_ascii_case("br")
+                    || token.eq_ignore_ascii_case("/p")
+                    || token.eq_ignore_ascii_case("/div")
+                    || token.eq_ignore_ascii_case("/li")
+                    || token.eq_ignore_ascii_case("/tr"))
+            {
+                output.push('\n');
             }
             continue;
         }
@@ -371,16 +406,28 @@ pub fn html_text(html: &str) -> String {
     decoded.push_str(rest);
     let mut text = String::with_capacity(decoded.len());
     for line in decoded.lines() {
-        let visible: String = line
-            .chars()
-            .filter(|ch| !matches!(ch, '\u{ad}' | '\u{34f}' | '\u{200b}' | '\u{feff}'))
-            .collect();
-        let line = visible.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !line.is_empty() {
-            if !text.is_empty() {
-                text.push('\n');
+        let mut line_started = false;
+        let mut need_space = false;
+        for ch in line.chars() {
+            if matches!(ch, '\u{ad}' | '\u{34f}' | '\u{200b}' | '\u{feff}') {
+                continue;
             }
-            text.push_str(&line);
+            if ch.is_whitespace() {
+                if line_started {
+                    need_space = true;
+                }
+            } else {
+                if !line_started {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    line_started = true;
+                } else if need_space {
+                    text.push(' ');
+                }
+                need_space = false;
+                text.push(ch);
+            }
         }
     }
     if decoded.ends_with('\n') && !text.is_empty() {

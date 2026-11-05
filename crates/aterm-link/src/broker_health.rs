@@ -98,7 +98,8 @@ pub const POISONED_ROW_WORD: &str = "POISONED";
 /// `process_flushes`, `astream_sys::flush_tally` as the snapshot took it: calls, so a refused
 /// barrier and the full flush that answered it are one of each). A snapshot an older broker
 /// wrote may carry no tally or no residency, and the row says so ([`NO_PROCESS_FLUSHES`],
-/// [`NO_RESIDENCY`]), never zeros.
+/// [`NO_RESIDENCY`]), never zeros. Then how long those flushes took and the slow ones
+/// ([`flush_times`] of astream's `process_flush_times`), or [`NO_FLUSH_TIMES`].
 #[must_use]
 pub fn holds(h: &astream_broker::BrokerHealth) -> String {
     let flushed = match &h.process_flushes {
@@ -108,6 +109,12 @@ pub fn holds(h: &astream_broker::BrokerHealth) -> String {
         ),
         None => NO_PROCESS_FLUSHES.to_string(),
     };
+    let flushed = format!(
+        "{flushed}; {}",
+        h.process_flush_times
+            .as_ref()
+            .map_or_else(|| NO_FLUSH_TIMES.to_string(), flush_times)
+    );
     let resident = h.resident.map_or_else(
         || NO_RESIDENCY.to_string(),
         |r| residency(r.records, r.bytes, h.retained_records),
@@ -150,6 +157,37 @@ pub const NO_RESIDENCY: &str = "its residency not in the snapshot";
 /// than this build's wrote.
 pub const NO_PROCESS_FLUSHES: &str =
     "its process's flushes not in the snapshot (a broker older than this build)";
+
+/// The end of [`holds`] for a snapshot that carries no flush times: one an astream older than
+/// this build's wrote.
+pub const NO_FLUSH_TIMES: &str =
+    "its process's flush times not in the snapshot (a broker older than this build)";
+
+/// How long a broker process's flushes took (astream's `process_flush_times`,
+/// `astream_sys::flush_times` as the snapshot took it): each kind's total, how many were
+/// slower than 1 ms (`astream_sys::SLOW_FLUSH_NS`), how many of those its ring kept and, when it
+/// keeps one, the slowest of them, so a stall another process saw can be lined up with the ring
+/// (`fabric --json`'s `process_flush_times` lists each, on the clock it names).
+#[must_use]
+pub fn flush_times(t: &astream_sys::FlushTimes) -> String {
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let slowest = t
+        .slow
+        .iter()
+        .max_by_key(|f| f.ns())
+        .map_or_else(String::new, |f| {
+            format!(", the slowest a {:.1} ms {}", ms(f.ns()), f.kind.word())
+        });
+    format!(
+        "its flushes took {:.1} ms full, {:.1} ms barrier and {:.1} ms plain; {} slower than 1 \
+         ms, {} kept{slowest}",
+        ms(t.full_ns),
+        ms(t.barrier_ns),
+        ms(t.plain_ns),
+        t.slow_count,
+        t.slow.len(),
+    )
+}
 
 /// Whether `read` reflects the broker currently serving the socket.
 #[must_use]
@@ -666,6 +704,28 @@ mod tests {
             records: 2,
             bytes: 300,
         });
+        health.process_flush_times = Some(astream_sys::FlushTimes {
+            clock: astream_sys::FlushClock::Machine,
+            full_ns: 41_000_000,
+            barrier_ns: 2_600_000,
+            plain_ns: 0,
+            slow_count: 3,
+            slow: vec![
+                astream_sys::SlowFlush {
+                    index: 1,
+                    kind: astream_sys::FlushKind::Full,
+                    start_ns: 900_000_000,
+                    end_ns: 907_500_000,
+                },
+                astream_sys::SlowFlush {
+                    index: 2,
+                    kind: astream_sys::FlushKind::Barrier,
+                    start_ns: 910_000_000,
+                    end_ns: 911_250_000,
+                },
+            ],
+            running: 0,
+        });
         let read = |writer| HealthRead {
             health: health.clone(),
             writer,
@@ -681,6 +741,28 @@ mod tests {
             unknown.contains("11 full, 13 barrier and 2 plain flush(es)"),
             "{unknown}"
         );
+        assert!(
+            unknown.contains(
+                "; its flushes took 41.0 ms full, 2.6 ms barrier and 0.0 ms plain; 3 slower than \
+                 1 ms, 2 kept, the slowest a 7.5 ms full"
+            ),
+            "the broker's flush times and its ring: {unknown}"
+        );
+        // A ring that holds no flush (none slower than 1 ms yet) has no slowest to name.
+        let quiet = flush_times(&astream_sys::FlushTimes {
+            clock: astream_sys::FlushClock::Machine,
+            full_ns: 400_000,
+            barrier_ns: 0,
+            plain_ns: 0,
+            slow_count: 0,
+            slow: Vec::new(),
+            running: 0,
+        });
+        assert_eq!(
+            quiet,
+            "its flushes took 0.4 ms full, 0.0 ms barrier and 0.0 ms plain; 0 slower than 1 ms, \
+             0 kept"
+        );
         let other = snapshot_row(&read(HealthWriter::Serving), Some(8), 1_000);
         assert!(
             other.contains("is not the pid serving the socket"),
@@ -691,9 +773,16 @@ mod tests {
         // never read as zero.
         health.process_flushes = None;
         health.resident = None;
+        health.process_flush_times = None;
         let older = holds(&health);
-        assert!(older.ends_with(NO_PROCESS_FLUSHES), "{older}");
-        assert!(!older.contains(" full,"), "{older}");
+        assert!(
+            older.ends_with(&format!("{NO_PROCESS_FLUSHES}; {NO_FLUSH_TIMES}")),
+            "{older}"
+        );
+        assert!(
+            !older.contains(" full,") && !older.contains("ms full"),
+            "{older}"
+        );
         assert!(
             older.starts_with(&format!("3 record(s) in 0 B ({NO_RESIDENCY}), ")),
             "{older}"

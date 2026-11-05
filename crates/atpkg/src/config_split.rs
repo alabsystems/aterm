@@ -119,14 +119,38 @@ fn diff_tables(prefix: &str, a: &aterm_toml::Table, b: &aterm_toml::Table, out: 
 #[cfg(target_os = "macos")]
 const LAUNCHCTL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Combined group-signal/reap polling after an unanswered read-only query.
+#[cfg(target_os = "macos")]
+const LAUNCHCTL_CLEANUP: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// launchd's `XDG_CONFIG_HOME` for this account, the one an app opened from Finder inherits;
 /// `None` when it has none or `launchctl` did not answer.
 #[cfg(target_os = "macos")]
 fn launchd_xdg_config_home() -> Option<std::ffi::OsString> {
-    use std::os::unix::ffi::OsStringExt as _;
     let mut cmd = aterm_uds::spawnfd::command("/bin/launchctl");
     cmd.args(["getenv", "XDG_CONFIG_HOME"]);
-    let out = aterm_uds::deadline::output_within(&mut cmd, LAUNCHCTL_BUDGET).ok()?;
+    let (out, ()) = match aterm_uds::deadline::output_until_complete_stdout_retained(
+        &mut cmd,
+        std::time::Instant::now() + LAUNCHCTL_BUDGET,
+        LAUNCHCTL_CLEANUP,
+        (),
+    ) {
+        Ok(answer) => answer,
+        Err(failure) => {
+            let (_, custody) = failure.into_parts();
+            // An unavailable value needs no group-drain receipt, but the actual child
+            // remains owned until a positive reap. Never interpret failure as no dispatch.
+            custody.reap_in_background();
+            return None;
+        }
+    };
+    launchd_value(out)
+}
+
+/// Decode only the complete stdout of a successful query, preserving native path bytes.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn launchd_value(out: std::process::Output) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
     let mut value = out.stdout;
     while value.last().is_some_and(|b| *b == b'\n') {
         value.pop();

@@ -244,6 +244,73 @@ fn swarm_denied_nodes_until_with(
     }
 }
 
+/// Read the current verified swarm roster, waiting only for
+/// a concurrent vault writer until `deadline`, so a writer mid-apply is never read as "no
+/// roster". The shared observation is held across the read and released before returning the
+/// owned roster. `Ok(None)` is what the applied copy says (no vault configured here, no applied
+/// copy, a copy that names no roster), never a writer's moment.
+///
+/// # Errors
+/// Local state or the verified cache cannot be read safely, the roster is malformed, or a
+/// writer still holds the state lock at `deadline`
+/// ([`crate::ErrorKind::VaultBusy`]).
+pub fn swarm_roster_until(
+    paths: &Paths,
+    deadline: Instant,
+) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
+    #[cfg(any(test, debug_assertions))]
+    if UNWAITED_ROSTER.with(std::cell::Cell::get) {
+        return super::test_unwaited_roster(paths);
+    }
+    swarm_roster_until_with(paths, deadline, std::thread::sleep)
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static UNWAITED_ROSTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run a negative control with the old roster read that answers absence under a writer.
+#[cfg(any(test, debug_assertions))]
+pub fn test_without_roster_wait<T>(read: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNWAITED_ROSTER.with(|old| old.set(self.0));
+        }
+    }
+    let _restore = Restore(UNWAITED_ROSTER.with(|old| old.replace(true)));
+    read()
+}
+
+fn swarm_roster_until_with(
+    paths: &Paths,
+    deadline: Instant,
+    mut wait: impl FnMut(Duration),
+) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        StateLock::narrow_owned(paths)?;
+        match StateLock::observe_classified(paths)? {
+            StateObservation::Held(lock) => return super::roster::swarm_roster_held(paths, &lock),
+            // No lock file: no copy was ever applied here, so no roster either way
+            // ([`super::roster::with_roster_observation`]'s absent arm).
+            StateObservation::Absent => return Ok(None),
+            StateObservation::Busy => {}
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::of_kind(
+                crate::ErrorKind::VaultBusy,
+                "this Mac's swarm roster is busy: a vault writer still holds its state lock",
+            ));
+        }
+        busy_observed();
+        wait(backoff.min(remaining));
+        backoff = (backoff * 2).min(Duration::from_millis(50));
+    }
+}
+
 enum DeniedObservation {
     Answer(Option<Vec<String>>),
     Busy(Option<Config>),
@@ -255,7 +322,18 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Run a fixture's callback after the deny reader observes a busy state lock.
+/// A fixture's action ([`test_with_denied_nodes_busy`]) where a reader met a busy state lock.
+fn busy_observed() {
+    #[cfg(any(test, debug_assertions))]
+    DENIED_NODES_BUSY.with(|slot| {
+        if let Some(busy) = slot.borrow_mut().as_mut() {
+            busy();
+        }
+    });
+}
+
+/// Run a fixture's callback after the deny reader observes a busy state lock, and before the
+/// roster's bounded reader ([`swarm_roster_until`]) waits out one.
 /// This observes contention; it does not change whether the reader waits.
 #[cfg(any(test, debug_assertions))]
 pub fn test_with_denied_nodes_busy<R>(busy: impl FnMut() + 'static, read: impl FnOnce() -> R) -> R {
@@ -315,12 +393,7 @@ fn observe_denied_nodes(
             StateLock::observe_classified(paths)?,
             StateObservation::Busy
         ) {
-            #[cfg(any(test, debug_assertions))]
-            DENIED_NODES_BUSY.with(|slot| {
-                if let Some(busy) = slot.borrow_mut().as_mut() {
-                    busy();
-                }
-            });
+            busy_observed();
             return Ok(DeniedObservation::Busy(None));
         }
         return Ok(DeniedObservation::Answer(Some(Vec::new())));
@@ -330,12 +403,7 @@ fn observe_denied_nodes(
     }
     let observation = StateLock::observe_classified(paths)?;
     if matches!(observation, StateObservation::Busy) {
-        #[cfg(any(test, debug_assertions))]
-        DENIED_NODES_BUSY.with(|slot| {
-            if let Some(busy) = slot.borrow_mut().as_mut() {
-                busy();
-            }
-        });
+        busy_observed();
         return Ok(DeniedObservation::Busy(Some(expected)));
     }
     held_denied_nodes(paths, &expected, observation, after_entry).map(DeniedObservation::Answer)
@@ -593,6 +661,46 @@ mod tests {
         assert_eq!(read, Some(vec!["m99".to_owned()]));
         // The returned owned list holds no reader lease across its caller's network work.
         assert!(StateLock::try_take(&paths).unwrap().is_some());
+    }
+
+    /// A writer mid-apply holds the state lock: the bounded roster read waits it out and reads the
+    /// roster the copy holds; past its deadline it says the roster is busy, never that there is
+    /// none. NEGATIVE CONTROL: the unbounded read takes the same moment as no roster.
+    #[test]
+    fn bounded_roster_waits_out_a_writer_and_is_busy_past_its_deadline() {
+        let (root, paths) = denial_fixture();
+        let settled =
+            swarm_roster_until(&paths, Instant::now() + aterm_spec::wait::MUST_HAPPEN).unwrap();
+        assert!(settled.is_some(), "the fixture publishes a roster");
+        let mut writer = Some(StateLock::take(&paths).unwrap());
+        assert_eq!(test_unwaited_roster(&paths).unwrap(), None);
+        let busy = swarm_roster_until(&paths, Instant::now()).unwrap_err();
+        assert_eq!(busy.kind(), crate::ErrorKind::VaultBusy);
+        let mut waits = 0;
+        let read = swarm_roster_until_with(
+            &paths,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            |_| {
+                waits += 1;
+                drop(writer.take());
+            },
+        )
+        .unwrap();
+        assert_eq!(waits, 1);
+        assert_eq!(read, settled);
+        // The returned roster holds no reader lease across its caller's network work.
+        assert!(StateLock::try_take(&paths).unwrap().is_some());
+        // A folder no copy was ever applied to has no roster, and nothing to wait for.
+        let none = Paths::for_home(&root.path().join("never"));
+        assert_eq!(
+            swarm_roster_until_with(
+                &none,
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                |_| { panic!("nothing holds an absent vault") }
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -896,11 +1004,17 @@ mod tests {
         );
         assert_eq!(mode(&lock), 0o600);
         widen(&lock);
-        assert!(super::super::swarm_roster_now(&admin_paths).is_ok());
+        assert!(
+            swarm_roster_until(&admin_paths, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+                .is_ok()
+        );
         assert_eq!(mode(&lock), 0o600);
         // The roster's own read narrows it too, past its memo.
         widen(&lock);
-        assert!(swarm_roster(&admin_paths).is_ok());
+        assert!(
+            swarm_roster_until(&admin_paths, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+                .is_ok()
+        );
         assert_eq!(mode(&lock), 0o600, "the roster's read narrows the lock");
 
         // Narrowed through the descriptor: a file renamed to the lock's name after the checks

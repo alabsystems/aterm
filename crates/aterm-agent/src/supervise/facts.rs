@@ -14,7 +14,7 @@
 //! its condition has been seen clear once ([`FactsState::observe_closed`]), so a restart never
 //! tells it twice.
 //!
-//! Four kinds, in priority order among what a reading names (a wake's line is ranked at a break
+//! Five kinds, in priority order among what a reading names (a wake's line is ranked at a break
 //! by the occupancy door, `occupancy::rules::rank`, not by this order):
 //!
 //! * [`FactKind::NoProgress`]: a live background call of this session's agent that the host's
@@ -43,6 +43,23 @@
 //!   (`occupancy::wakes`), told once an episode. Its episode is the wake's
 //!   (`occupancy::wakes_seen::wake_episode`: its declaration's stamp and ordinal), which a
 //!   successor names again exactly, so a seed holds it told per episode, never kind-wide.
+//! * [`FactKind::Leftover`]: processes this session's agent started that still run
+//!   (`docs/DESIGN-leftovers-by-default-2026-10-30.md` §4; the agent's left rows,
+//!   `aterm_vitals::left::agents_left`), read through [`FactsReading::left`]
+//!   ([`LeftoverReading`]). Its episode is shaped as the held programs' is: it opens at the first
+//!   fresh reading that names a row and closes at a fresh reading that names none, its id the
+//!   opening reading's time, so a seed holds the kind. It rides only the prompts the turn-end
+//!   policy types anyway (`policy::turn_end::FACT_RIDES`), never a break's line
+//!   ([`FactKind::rides_breaks`]).
+//! * [`FactKind::Overlap`]: other sessions of this aterm that change a file this session's branch
+//!   changes, read from the sessions' work records through its own door (`IdleHost::overlap`,
+//!   [`OverlapReading`], as old as the oldest record it rests on), told as a count and those
+//!   sessions' sids. Its episode is one set of
+//!   peers ([`EpisodeKey::overlap`], their sids folded), which a successor names again exactly:
+//!   the same peers with more files are not told again, a new peer is a new episode, and a
+//!   present, fresh reading that names no peer, or other ones, closes it
+//!   ([`FactsState::observe_overlap`]). It rides a prompt the turn-end policy types anyway, after
+//!   every other kind, and is never typed at a break: the stuck line reads [`FactsReading`] alone.
 //!
 //! A line any door wrote into the composer and did not submit (`Written::Left`) is neither told
 //! nor untold: it is LEFT ([`Left`]), its episode told by no door again and a wake's claim kept,
@@ -56,6 +73,7 @@ use std::collections::BTreeMap;
 
 use super::background::BackgroundCall;
 use super::occupancy::door::LeftRow;
+use super::overlap::{OverlapReading, PeerSid};
 
 /// What a fact is about, in priority order: where two open episodes are untold, the first kind
 /// is told first.
@@ -72,15 +90,23 @@ pub enum FactKind {
     Hold,
     /// A wake of the agent's book whose condition held (`wake@v1`; the occupancy design's §4.1).
     Wake,
+    /// Processes the agent started that still run ([`LeftoverReading`]): told after the
+    /// others a reading names, a record of what it may end before it is done.
+    Leftover,
+    /// Other sessions of this aterm that change a file this session's branch changes
+    /// ([`OverlapReading`]).
+    Overlap,
 }
 
 impl FactKind {
     /// Every kind, in priority order.
-    pub const ALL: [FactKind; 4] = [
+    pub const ALL: [FactKind; 6] = [
         FactKind::NoProgress,
         FactKind::ProgramCheck,
         FactKind::Hold,
         FactKind::Wake,
+        FactKind::Leftover,
+        FactKind::Overlap,
     ];
 
     /// The ledger rule a row of this kind is booked under, `fact-<kind>@v1`. Stable: a successor
@@ -92,6 +118,8 @@ impl FactKind {
             FactKind::ProgramCheck => "fact-program-check@v1",
             FactKind::Hold => "fact-hold@v1",
             FactKind::Wake => "fact-wake@v1",
+            FactKind::Leftover => "fact-leftover@v1",
+            FactKind::Overlap => "fact-overlap@v1",
         }
     }
 
@@ -103,6 +131,8 @@ impl FactKind {
             FactKind::ProgramCheck => "program-check",
             FactKind::Hold => "hold",
             FactKind::Wake => "wake",
+            FactKind::Leftover => "leftover",
+            FactKind::Overlap => "overlap",
         }
     }
 
@@ -120,22 +150,31 @@ impl FactKind {
 
     /// Whether a seed holds the whole kind told ([`FactsState::seed`]): a kind whose episode ids
     /// a successor cannot name again exactly. A no-progress episode's id folds the call's group
-    /// and its leader's birth, and a wake's its declaration's stamp and ordinal, which survive a
-    /// restart, so its own key carries it (the slice-2 plan's S3); a held episode's and the
-    /// hold's are the times they opened, which a successor places anew.
+    /// and its leader's birth, a wake's its declaration's stamp and ordinal, and an overlap's its
+    /// peers' sids, which survive a restart, so its own key carries it; a held episode's, the
+    /// hold's and the leftover episode's are the times they opened, which a successor places anew.
     fn seeds_whole(self) -> bool {
         use crate::supervise::occupancy::fault::{Fault, armed};
         match self {
-            FactKind::NoProgress => false,
-            FactKind::ProgramCheck | FactKind::Hold => true,
+            FactKind::NoProgress | FactKind::Overlap => false,
+            FactKind::ProgramCheck | FactKind::Hold | FactKind::Leftover => true,
             FactKind::Wake => armed(Fault::KindWideWakeSeed),
         }
+    }
+
+    /// Whether the stuck line may tell it at a break of the agent's own background work
+    /// (`[harness] stuck_break_note`; [`FactsState::pending_at_break`]): a call at no progress and
+    /// a held program, which the background work waits on, and neither a leftover nor an overlap,
+    /// which ride only a prompt typed anyway.
+    #[must_use]
+    pub const fn rides_breaks(self) -> bool {
+        !matches!(self, FactKind::Leftover | FactKind::Overlap)
     }
 }
 
 /// One episode of a kind's condition: the kind and an id (a job's `(pgid, leader birth)` folded,
-/// [`Self::no_progress`], which survives a restart; for the held programs, the opening reading's
-/// time, and for the hold, the episode's start, each in Unix milliseconds).
+/// [`Self::no_progress`], which survives a restart; for the held programs and the leftovers, the
+/// opening reading's time, and for the hold, the episode's start, each in Unix milliseconds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EpisodeKey {
     /// What the episode is of.
@@ -164,6 +203,18 @@ impl EpisodeKey {
     #[must_use]
     pub fn of_call(call: &BackgroundCall) -> Option<Self> {
         call.birth.map(|birth| Self::no_progress(call.pgid, birth))
+    }
+
+    /// The overlap episode with the sessions `peers`: FNV-1a over their sids, sorted and joined
+    /// by new lines, so one set of peers is one episode however it is listed.
+    #[must_use]
+    pub fn overlap(peers: &[PeerSid]) -> Self {
+        let mut sids: Vec<&str> = peers.iter().map(PeerSid::as_str).collect();
+        sids.sort_unstable();
+        Self {
+            kind: FactKind::Overlap,
+            id: aterm_hash::fnv1a_64(sids.join("\n").as_bytes()),
+        }
     }
 }
 
@@ -290,8 +341,9 @@ pub struct Fact {
 /// WHAT THE HOST READ FOR THIS SESSION'S AGENT (`IdleHost::facts`): the live background calls of
 /// THIS session's agent that made no progress, each regardless of the others, worst (quiet
 /// longest) first, as of `as_of_ms` (unix ms), and the programs of its calls macOS's program
-/// check holds ([`Self::held`], as of its own time). Plain values only: this crate takes no
-/// dependency on the engine's types.
+/// check holds ([`Self::held`], as of its own time), and the processes it started that still run
+/// ([`Self::left`], as of its own time). Plain values only: this crate takes no dependency on the
+/// engine's types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FactsReading {
     /// When the reading was taken, unix ms.
@@ -302,6 +354,61 @@ pub struct FactsReading {
     /// neither opens nor closes an episode; `Some` with no program where none is held, which
     /// closes one.
     pub held: Option<HeldReading>,
+    /// The agent's left rows ([`FactKind::Leftover`]): `None` where they were not read (no
+    /// leftover view, a partial one, or a tape recorded before they were read), which neither
+    /// opens nor closes an episode; `Some` with a count of 0 where none is left, which closes one.
+    pub left: Option<LeftoverReading>,
+}
+
+/// THE AGENT'S LEFT ROWS THE HOST READ FOR THIS SESSION ([`FactsReading::left`]): how many
+/// processes its agent started still run (`aterm_vitals::left::agents_left`: offered rows its
+/// session's environment ties to its tab, born after its agent started, and the offered members
+/// of a dead verify run that rode in it) and the oldest one's age, as of the leftover view that
+/// named them (`as_of_ms`, unix ms). Numbers only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeftoverReading {
+    /// When the leftover view was read, unix ms.
+    pub as_of_ms: i64,
+    /// How many rows it names.
+    pub count: u32,
+    /// The oldest one's fork age at that reading, ms; `None` with no row, or none whose age read.
+    pub oldest_ms: Option<u64>,
+}
+
+impl LeftoverReading {
+    /// No older than [`NO_PROGRESS_FRESH_MS`] at `now_ms`: a part that may open or close an
+    /// episode.
+    #[must_use]
+    pub fn fresh_at(&self, now_ms: i64) -> bool {
+        now_ms.saturating_sub(self.as_of_ms) <= NO_PROGRESS_FRESH_MS
+    }
+
+    /// No older than [`FACT_FRESH_MS`] at `now_ms`: a part a fact may be told from.
+    #[must_use]
+    pub fn tells_at(&self, now_ms: i64) -> bool {
+        now_ms.saturating_sub(self.as_of_ms) <= FACT_FRESH_MS
+    }
+
+    /// THE LEFTOVER SENTENCE, from a closed template of numbers only (system awareness §14.4: no
+    /// exe word, path, argv or imperative): how many processes, and the oldest's age in the words
+    /// the held sentence uses (`aterm_uds::process::held_age`), left out where no age was read.
+    /// Empty with none.
+    #[must_use]
+    pub fn told(&self) -> String {
+        let age = self.oldest_ms.map(aterm_uds::process::held_age);
+        match (self.count, age) {
+            (0, _) => String::new(),
+            (1, age) => format!(
+                "1 process this session started still runs{}; `aterm ctl @self sys left` lists it",
+                age.map_or_else(String::new, |age| format!(", for {age}"))
+            ),
+            (n, age) => format!(
+                "{n} processes this session started still run{}; `aterm ctl @self sys left` lists \
+                 them",
+                age.map_or_else(String::new, |age| format!(", the oldest for {age}"))
+            ),
+        }
+    }
 }
 
 /// One program of the agent's calls (or an orphan of one) that macOS's program check holds.
@@ -433,6 +540,9 @@ pub struct FactsState {
     /// The held episode open now ([`FactKind::ProgramCheck`]): opened by a fresh reading that
     /// names a held program, closed by a fresh one that names none ([`Self::observe`]).
     held_open: Option<EpisodeKey>,
+    /// The leftover episode open now ([`FactKind::Leftover`]): opened by a fresh reading that
+    /// names a row, closed by a fresh one that names none ([`Self::observe`]).
+    left_open: Option<EpisodeKey>,
     /// Each episode whose line stands left in the composer ([`Self::leave`]), until a look
     /// settles it ([`Self::look`]).
     left: BTreeMap<EpisodeKey, Left>,
@@ -456,13 +566,27 @@ impl FactsState {
     /// ([`FactKind::ProgramCheck`]), present and fresh ([`HeldReading::fresh_at`]): naming a
     /// program, it opens the held episode where none is open (keyed by its own time) and keeps
     /// the open one whichever programs it names; naming none, it closes the episode and forgets
-    /// it. The no-progress part ([`FactKind::NoProgress`]), present and fresh: a told episode it
-    /// no longer names is over (the call made progress or ended) and forgotten. An absent or
-    /// stale part opens, closes and forgets nothing.
+    /// it. The leftover part ([`FactKind::Leftover`]), present and fresh
+    /// ([`LeftoverReading::fresh_at`]), opens and closes its own episode the same way. The
+    /// no-progress part ([`FactKind::NoProgress`]), present and fresh: a told episode it no longer
+    /// names is over (the call made progress or ended) and forgotten. An absent or stale part
+    /// opens, closes and forgets nothing.
     pub fn observe(&mut self, reading: Option<&FactsReading>, now_ms: i64) {
         let Some(r) = reading else {
             return;
         };
+        if let Some(left) = r.left.as_ref().filter(|l| l.fresh_at(now_ms)) {
+            if left.count == 0 {
+                self.left_open = None;
+                self.observe_closed(FactKind::Leftover, &[]);
+            } else {
+                let key = *self.left_open.get_or_insert(EpisodeKey {
+                    kind: FactKind::Leftover,
+                    id: left.as_of_ms.unsigned_abs(),
+                });
+                self.observe_closed(FactKind::Leftover, &[key]);
+            }
+        }
         if let Some(held) = r.held.as_ref().filter(|h| h.fresh_at(now_ms)) {
             if held.programs.is_empty() {
                 self.held_open = None;
@@ -486,10 +610,27 @@ impl FactsState {
     /// from the reading's own part, told only while it is at most [`FACT_FRESH_MS`] old
     /// ([`FactsReading::tells_at`]); the held programs from the episode [`Self::observe`] opened,
     /// told only while the held part names one and is that young by its own time
-    /// ([`HeldReading::tells_at`]). The others wait, and one whose episode closes meanwhile is
-    /// never told late.
+    /// ([`HeldReading::tells_at`]); the leftovers likewise, by their own part's time
+    /// ([`LeftoverReading::tells_at`]). The others wait, and one whose episode closes meanwhile is
+    /// never told late. The fact a prompt typed at a turn end carries; a break's is
+    /// [`Self::pending_at_break`].
     #[must_use]
     pub fn pending(&self, reading: Option<&FactsReading>, now_ms: i64) -> Option<Fact> {
+        self.pending_of(reading, now_ms, |_| true)
+    }
+
+    /// [`Self::pending`] among the kinds a break's stuck line tells ([`FactKind::rides_breaks`]).
+    #[must_use]
+    pub fn pending_at_break(&self, reading: Option<&FactsReading>, now_ms: i64) -> Option<Fact> {
+        self.pending_of(reading, now_ms, FactKind::rides_breaks)
+    }
+
+    fn pending_of(
+        &self,
+        reading: Option<&FactsReading>,
+        now_ms: i64,
+        admits: impl Fn(FactKind) -> bool,
+    ) -> Option<Fact> {
         let r = reading?;
         let mut open: Vec<(EpisodeKey, String, i64)> = Vec::new();
         if let (Some(key), Some(held)) = (
@@ -499,6 +640,14 @@ impl FactsState {
                 .filter(|h| h.tells_at(now_ms) && !h.programs.is_empty()),
         ) {
             open.push((key, held.told(), held.as_of_ms));
+        }
+        if let (Some(key), Some(left)) = (
+            self.left_open,
+            r.left
+                .as_ref()
+                .filter(|l| l.tells_at(now_ms) && l.count > 0),
+        ) {
+            open.push((key, left.told(), left.as_of_ms));
         }
         if r.tells_at(now_ms) {
             open.extend(
@@ -510,13 +659,45 @@ impl FactsState {
         open.sort_by_key(|(key, ..)| key.kind);
         open.into_iter()
             .find(|(key, text, _)| {
-                !self.is_spoken_for(*key) && !text.is_empty() && text.chars().count() <= FACT_CAP
+                admits(key.kind)
+                    && !self.is_spoken_for(*key)
+                    && !text.is_empty()
+                    && text.chars().count() <= FACT_CAP
             })
             .map(|(key, text, as_of_ms)| Fact {
                 key,
                 text,
                 as_of_ms,
             })
+    }
+
+    /// FOLD IN THE OVERLAP THE HOST READ at `now_ms` ([`FactKind::Overlap`]): a present reading
+    /// young enough to tell ([`OverlapReading::tells_at`]) names the one overlap episode open now
+    /// (none where it names no peer), so a told one it no longer names is over and forgotten. An
+    /// absent or older reading forgets nothing.
+    pub fn observe_overlap(&mut self, reading: Option<&OverlapReading>, now_ms: i64) {
+        let Some(r) = reading.filter(|r| r.tells_at(now_ms)) else {
+            return;
+        };
+        let open: Vec<EpisodeKey> = r.episode().into_iter().collect();
+        self.observe_closed(FactKind::Overlap, &open);
+    }
+
+    /// THE OVERLAP TO TELL NOW: the episode a reading young enough to tell names
+    /// ([`OverlapReading::tells_at`]), where it was not told and stands left in no composer, its
+    /// sentence within [`FACT_CAP`]; else `None`.
+    #[must_use]
+    pub fn pending_overlap(&self, reading: Option<&OverlapReading>, now_ms: i64) -> Option<Fact> {
+        let r = reading.filter(|r| r.tells_at(now_ms))?;
+        let key = r.episode()?;
+        let text = r.told();
+        (!self.is_spoken_for(key) && !text.is_empty() && text.chars().count() <= FACT_CAP).then(
+            || Fact {
+                key,
+                text,
+                as_of_ms: r.as_of_ms(),
+            },
+        )
     }
 
     /// `key` was told at `at_ms`: where its act was taken, never where it was decided.

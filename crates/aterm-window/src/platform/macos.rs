@@ -23,6 +23,7 @@
 //! set_application_should_terminate_handler(allow_termination);
 //! ```
 
+use crate::event::InputOrigin;
 use crate::event_loop::EventLoopBuilder;
 use crate::keyboard::ModifiersState;
 use crate::monitor::MonitorHandle;
@@ -34,36 +35,43 @@ pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
     crate::platform_impl::set_quit_confirm_hook(handler);
 }
 
-/// The original native key before Option handling or input-method interpretation.
+/// The original native key or mouse event before Option handling or input-method
+/// interpretation.
 ///
 /// LOCAL PATCH (aterm): identity only; the window layer assigns it no input authority.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct NativeKeyEvent {
-    /// `NSEventTypeKeyDown` (10) or `NSEventTypeKeyUp` (11).
+pub struct NativeInputEvent {
+    /// The `NSEventType`: `NSEventTypeKeyDown` (10) or `NSEventTypeKeyUp` (11) for a key, or a
+    /// mouse button's down or up or `NSEventTypeScrollWheel` (22).
     pub kind: usize,
-    /// The native virtual keycode.
+    /// The native virtual keycode of a key; 0 for a mouse event, which has none.
     pub keycode: u16,
     /// The native timestamp in seconds since boot.
     pub timestamp: f64,
+    /// The Unix process ID of the process the event came from (`kCGEventSourceUnixProcessID`,
+    /// [`aterm_cg::event_source_pid`]): the process that posted it, or 0 for the HID system.
+    pub source_pid: i64,
 }
 
-/// Install the application's classifier before its first window receives a key.
+/// Install the application's classifier before its first window receives a key or a click.
 ///
-/// The first registration takes effect. Each native key is classified once before it can
-/// generate window callbacks; that application's decision is retained through deferred
-/// delivery. The window layer does not interpret the decision or grant any authority.
+/// The first registration takes effect. Each native key, mouse button and scroll event is
+/// classified once before it can generate window callbacks; that application's decision is
+/// retained through deferred delivery. The window layer does not interpret the decision or grant
+/// any authority.
 #[inline]
-pub fn set_window_key_classifier(classifier: fn(NativeKeyEvent) -> bool) {
-    crate::platform_impl::set_window_key_classifier(classifier);
+pub fn set_window_input_classifier(classifier: fn(NativeInputEvent) -> InputOrigin) {
+    crate::platform_impl::set_window_input_classifier(classifier);
 }
 
-/// The application's retained source-key decision for this window-event callback.
+/// The application's retained source decision for this window-event callback.
 ///
-/// `None` means outside retained callback delivery. `Some(false)` also names callbacks
-/// generated without a source key, so they never borrow a later AppKit event's identity.
+/// `None` means outside retained callback delivery. `Some(InputOrigin::Person)` also names
+/// callbacks generated without a classified native event, so they never borrow a later AppKit
+/// event's identity.
 #[inline]
-pub fn window_event_posted() -> Option<bool> {
-    crate::platform_impl::window_event_posted()
+pub fn window_event_origin() -> Option<InputOrigin> {
+    crate::platform_impl::window_event_origin()
 }
 
 /// Printable ASCII character produced only via an Option chord on `key` under the active keyboard layout.

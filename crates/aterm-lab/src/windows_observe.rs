@@ -80,8 +80,7 @@ fn retain_failure(summary: &str, raw: Option<(&[u8], &[u8])>) -> String {
     // durability operation fails; a guard's Drop must not erase the diagnostic.
     let path = dir.keep();
     let written = (|| {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        crate::util::set_dir_mode_nofollow(&path, 0o700)?;
         aterm_uds::private_file::check_private_dir(&path)?;
         write_failure(&path, summary, raw)?;
         aterm_durable::Flush::Durable.dir(

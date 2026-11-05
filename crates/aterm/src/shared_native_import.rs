@@ -21,18 +21,24 @@ pub(super) fn resolve(
     let Some(rest) = selector.strip_prefix("import:") else {
         return Ok(None);
     };
-    let parts: Vec<_> = rest.split(':').collect();
-    if parts.len() != 3 {
+    let mut parts = rest.split(':');
+    let (Some(source_str), Some(record_str), Some(column_str), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
         return Err("import selection needs exact source, record and column".into());
-    }
-    let source = super::super::digest::<32>(parts[0])?;
-    if aterm_codec::hex::encode_lower(&source) != parts[0] {
+    };
+    let source = super::super::digest::<32>(source_str)?;
+    if source_str.bytes().any(|b| b.is_ascii_uppercase()) {
         return Err("import source digest is not canonical".into());
     }
-    let record: u64 = parts[1].parse().map_err(|_| "invalid import record")?;
-    let column: u64 = parts[2].parse().map_err(|_| "invalid import column")?;
-    if record.to_string() != parts[1] || column.to_string() != parts[2] || record < 2 || column == 0
-    {
+    let record: u64 = record_str.parse().map_err(|_| "invalid import record")?;
+    let column: u64 = column_str.parse().map_err(|_| "invalid import column")?;
+    let canonical_pos = |s: &str| {
+        s.as_bytes()
+            .first()
+            .is_some_and(|b| matches!(b, b'1'..=b'9'))
+    };
+    if !canonical_pos(record_str) || !canonical_pos(column_str) || record < 2 || column == 0 {
         return Err("import coordinates must be canonical positive integers".into());
     }
     let snapshot = Imports::at_until(paths.clone(), deadline)
@@ -43,7 +49,7 @@ pub(super) fn resolve(
     }
     let cell = snapshot
         .cells
-        .get(&("sources".into(), parts[0].into()))
+        .get(&("sources".into(), source_str.into()))
         .filter(|cell| !cell.stopped && cell.candidates.len() == 1)
         .ok_or("import source is absent or conflicted")?;
     let candidate = &cell.candidates[0];

@@ -275,13 +275,30 @@ fn ris_retires_the_previous_surface_anchor_and_pending_input() {
     );
     assert_eq!(after.surface.terminal_id, stamp.surface.terminal_id);
     assert!(reset.resolve(anchor).is_none());
-    assert!(reset.anchors().iter().all(Option::is_none));
+    assert_eq!(
+        reset
+            .anchors()
+            .iter()
+            .flatten()
+            .map(|a| a.block_id)
+            .collect::<Vec<_>>(),
+        [anchor.block_id],
+        "the running command keeps its block through the RIS, on the new surface"
+    );
     assert_eq!(reset.ink_at(8, 2), Some(false));
     assert_eq!(reset.selection_target(), None);
     assert!(!s.term.text_selection().has_selection());
-    assert_eq!(s.brain.console_anchor_id(), None);
+    assert_eq!(
+        s.brain.console_anchor_id(),
+        Some(anchor.block_id),
+        "the pet takes the running block again on the new surface"
+    );
     assert_eq!(s.brain.console_input_kind(), None);
-    assert_eq!(s.brain.console_event_seq(), 0);
+    assert_eq!(
+        s.brain.console_event_seq(),
+        after.content_seq,
+        "no event from before the RIS: only the running block's output on the new surface"
+    );
     assert_eq!(
         s.brain.console_input_consumed_seq(),
         s.brain.console_input_seq()

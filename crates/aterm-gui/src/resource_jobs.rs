@@ -1044,6 +1044,7 @@ mod tests {
                 label: "Tab 1".into(),
                 program: "codex".into(),
                 tab_id: None,
+                agent_leader: None,
             }],
             procs: observed.procs,
             delegated: observed.delegated,

@@ -84,6 +84,68 @@ pub fn inspect_membership_history_until(
     }))
 }
 
+/// The newest `[everyone]` epoch this Mac holds, read from the authenticated local log under a
+/// shared lock, writing nothing ([`crate::commons::everyone_key`]): its id and key.
+/// `None` where there is no local history, no identity, or this Mac does not hold the newest
+/// epoch's key.
+///
+/// # Errors
+/// As [`inspect_membership_history_until`], or a wrap addressed to this Mac does not open.
+pub(crate) fn newest_everyone_until(
+    paths: &super::Paths,
+    deadline: std::time::Instant,
+) -> Result<
+    Option<(
+        crate::membership_log::RecordId,
+        zeroize::Zeroizing<[u8; 32]>,
+    )>,
+> {
+    let _lock = match super::StateLock::observe_classified(paths)? {
+        super::StateObservation::Absent => return Ok(None),
+        super::StateObservation::Held(lock) => lock,
+        super::StateObservation::Busy => super::StateLock::observe_until(paths, deadline)?
+            .ok_or_else(|| {
+                crate::Error::of_kind(
+                    crate::ErrorKind::VaultBusy,
+                    "local membership history is busy",
+                )
+            })?,
+    };
+    let Some(config) = super::config(paths)? else {
+        return Ok(None);
+    };
+    let Some(log) = super::log_entries::trusted_local_log(paths, &config)? else {
+        return Ok(None);
+    };
+    let Some(identity) = super::read_identity(paths)? else {
+        return Ok(None);
+    };
+    newest_everyone(&log, &identity)
+}
+
+/// The lowest id among the causally newest counting `[everyone]` epochs (M6's tie-break) whose
+/// key `identity` holds, with that key. No older epoch stands in: members with one log name one
+/// epoch, and a Mac that lacks the newest key (a wrap gap, a removal) gets `None`.
+///
+/// # Errors
+/// A wrap addressed to `identity` does not open.
+pub(crate) fn newest_everyone(
+    log: &crate::membership_log::Log,
+    identity: &crate::age::Identity,
+) -> Result<
+    Option<(
+        crate::membership_log::RecordId,
+        zeroize::Zeroizing<[u8; 32]>,
+    )>,
+> {
+    let newest = log.newest_epochs(&crate::membership_log::EpochAudience::Everyone);
+    let Some(lowest) = newest.iter().min() else {
+        return Ok(None);
+    };
+    let mut held = log.unwrap_epochs(identity)?;
+    Ok(held.remove(lowest).map(|key| (*lowest, key)))
+}
+
 fn membership_inventory(log: &crate::membership_log::Log) -> [u8; 32] {
     let mut ids: Vec<_> = log.records().map(|record| record.id()).collect();
     ids.sort_unstable();
@@ -352,7 +414,10 @@ mod tests {
         let foreign = client::log_entries_tests::two_macs(&[]);
         let wire = client::load_records(&foreign.m7).unwrap().encode();
         crate::fsx::write_atomic(&macs.m7.records_file(), &wire, 0o600).unwrap();
-        assert!(history(&macs.m7).unwrap().is_none());
+        assert!(
+            history(&macs.m7).is_err(),
+            "the retained root makes foreign replacement explicit damage"
+        );
         assert_eq!(std::fs::read(macs.m7.records_file()).unwrap(), wire);
         macs.server.stop();
         foreign.server.stop();

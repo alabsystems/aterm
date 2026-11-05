@@ -370,7 +370,19 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
     let _removed = RemoveOnDrop(&dir);
     let source = dir.join("probe.c");
     let program = dir.join("probe.out");
-    if let Err(error) = std::fs::write(&source, PROBE_SOURCE) {
+    let write_source = || -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut f = opts.open(&source)?;
+        f.write_all(PROBE_SOURCE.as_bytes())
+    };
+    if let Err(error) = write_source() {
         return CcVerdict::Unproven {
             driver: resolved,
             why: format!("could not write {}: {error}", source.display()),

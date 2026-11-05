@@ -70,7 +70,7 @@ fn stamp_of(path: &Path, owner: u32) -> Option<Vec<u8>> {
     let max = aterm_types::macos_setup::PLACEHOLDER_STAMP_MAX;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .ok()?;
     let meta = file.metadata().ok()?;

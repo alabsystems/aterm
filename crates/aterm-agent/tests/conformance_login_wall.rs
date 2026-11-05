@@ -17,7 +17,8 @@ use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::approval::Decision;
 use aterm_agent::supervise::policy::exception::{Exception, Urgency, exception_for};
 use aterm_agent::supervise::policy::login::{
-    LoginShared, PickerGate, RULE_LOGIN_BACK_OUT, pick_method, picker_gate, renewal_followed,
+    LoginPin, LoginShared, PickerGate, RULE_LOGIN_BACK_OUT, pick_method, picker_gate,
+    renewal_followed,
 };
 use aterm_agent::supervise::policy::notice::LOGIN_BACK_DIALOG;
 use aterm_agent::supervise::policy::outlook::ExceptionKind;
@@ -470,8 +471,17 @@ fn earlier(s: &S) -> S {
     then
 }
 
-fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>, PickerGate) {
-    supervisor_drawn(s, &|r| r, false)
+/// The real code at `s`, the session's Claude Code settings making `pin` of `/login` (the model's
+/// `Forced` is any pin but [`LoginPin::Picker`]).
+fn supervisor_at(s: &S, pin: LoginPin) -> (TurnEndAction, Option<Exception>, PickerGate) {
+    supervisor_drawn(
+        s,
+        &|r| TurnEndReading {
+            login_pin: pin,
+            ..r
+        },
+        false,
+    )
 }
 
 /// [`supervisor_at`] with each reading the wall's state is decided on drawn by `drawn`, and,
@@ -528,11 +538,9 @@ fn supervisor_drawn(
         tell(&mut st, &r);
         st.observe(&r, t0);
         let r = advised(&st, s["renewed"] == 1, r);
-        return (
-            settled(&st, &r, &cfg, t0),
-            exception_for(&st, &r, &cfg, t0),
-            gate_at(&st, &r),
-        );
+        // What stands once the person's grace is over: the act, and the exception read then.
+        let (decided, r, at) = settled_at(&st, &r, &cfg, t0);
+        return (decided, exception_for(&st, &r, &cfg, at), gate_at(&st, &r));
     } else {
         long
     };
@@ -551,15 +559,6 @@ fn supervisor_drawn(
         exception_for(&st, &r, &cfg, now),
         gate_at(&st, &r),
     )
-}
-
-fn settled(
-    st: &TurnEndState,
-    r: &TurnEndReading,
-    cfg: &SupervisorConfig,
-    now: Instant,
-) -> TurnEndAction {
-    settled_at(st, r, cfg, now).0
 }
 
 fn settled_at(
@@ -644,8 +643,8 @@ struct Supervised {
 }
 
 impl Supervised {
-    fn at(s: &S) -> Self {
-        let (decided, exception, gate) = supervisor_at(s);
+    fn at(s: &S, pin: LoginPin) -> Self {
+        let (decided, exception, gate) = supervisor_at(s, pin);
         let carry = gate == PickerGate::Carried;
         // The picker is a box: the approval loop, not the turn end, backs out of it.
         let backs = s["picker"] == 1 && dialog_up(s) && gate.backs_out();
@@ -671,6 +670,8 @@ impl Supervised {
 struct Looks {
     upgrades: BTreeMap<S, Upgrade>,
     supervisors: BTreeMap<S, Supervised>,
+    /// What the session's settings make of `/login` in this walk.
+    pin: LoginPin,
 }
 
 impl Looks {
@@ -680,10 +681,11 @@ impl Looks {
             .upgrades
             .entry(only(&UPGRADE_VARS))
             .or_insert_with_key(|vars| upgrade_at(m, vars));
+        let pin = self.pin;
         let sv = self
             .supervisors
             .entry(only(&SUPERVISOR_VARS))
-            .or_insert_with_key(Supervised::at);
+            .or_insert_with_key(|vars| Supervised::at(vars, pin));
         (up, sv)
     }
 }
@@ -1106,5 +1108,75 @@ fn a_person_told_to_close_aterms_dialog_breaks_its_law() {
     for s in &back_elsewhere {
         assert!(model.action_enabled("BackOut", s), "{s:?}");
         assert!(!model.action_enabled("TellClose", s), "{s:?}");
+    }
+}
+
+/// A PINNED SIGN-IN METHOD (the post-landing review, 2026-11-02): where the session's Claude Code
+/// settings pin how it signs in (`forceLoginMethod`: Claude Code 2.1.316's `/login` then starts
+/// the browser sign-in one tick after its Enter, no picker drawn), or name a gateway, or cannot be
+/// read, the real code types no `/login` and tells the person at once; the model under `Forced`
+/// agrees with it state by state, its laws hold, and the knob that types `/login` over the pin
+/// (`TypeOverPin`, the guard on `origin/main` `21b1e42025`, which read no pin) both breaks
+/// `NoBrowserOpenedByAterm` and disagrees with the real code. Negative control: the arm's pin
+/// check (`turn_end.rs`, the `WallKind::Auth` arm's `reading.login_pin.why()`) taken out, the
+/// real code types `/login` over the pin, and the walk fails where `TellNow` is enabled.
+#[test]
+fn a_pinned_sign_in_method_conforms_to_the_login_wall_model() {
+    let base = harness_login_wall_model();
+    let law = "NoBrowserOpenedByAterm";
+    let model = aterm_spec::interp::with_consts(&base, &[("Forced", 1)]);
+    let over = aterm_spec::interp::with_consts(&base, &[("Forced", 1), ("TypeOverPin", 1)]);
+    assert!(
+        !aterm_spec::interp::violated_invariants(&model).contains(law),
+        "the model under a pin, as written"
+    );
+    assert!(
+        aterm_spec::interp::violated_invariants(&over).contains(law),
+        "the guard that reads no pin opens the browser"
+    );
+    assert!(
+        !aterm_spec::interp::violated_invariants(&aterm_spec::interp::with_consts(
+            &base,
+            &[("TypeOverPin", 1)]
+        ))
+        .contains(law),
+        "the knob opens nothing where no pin stands"
+    );
+    let states = reachable(&model);
+    assert!(states.len() > 50, "{} states", states.len());
+    let renew_clean = real_renewal_is_clean();
+    let picked = [picks(false), picks(true)];
+    for pin in [LoginPin::Method, LoginPin::Gateway, LoginPin::Unread] {
+        let mut looks = Looks {
+            pin,
+            ..Looks::default()
+        };
+        let mut told = false;
+        let mut caught = false;
+        for s in &states {
+            let env = model.eval_env(s);
+            for inv in &model.invariants {
+                assert!(model.check_invariant_in(inv, &env), "{} at {s:?}", inv.name);
+            }
+            let (up, sv) = looks.at(&model, s);
+            assert!(
+                agrees(&model, s, (up, sv), renew_clean, picked),
+                "{pin:?} at {s:?}: the supervisor {:?} ({:?}), its exception {:?}",
+                sv.decided,
+                sv.sup,
+                sv.exception
+            );
+            assert_ne!(sv.sup, Some("TypeLogin"), "{pin:?} at {s:?}");
+            told |= s["wall"] == 1 && s["track"] == 0 && sv.ask == Some("TellNow");
+            caught |= !agrees(&over, s, (up, sv), renew_clean, picked);
+        }
+        assert!(
+            told,
+            "{pin:?}: the person is told at a pinned wall somewhere"
+        );
+        assert!(
+            caught,
+            "{pin:?}: the guard that reads no pin disagrees somewhere"
+        );
     }
 }

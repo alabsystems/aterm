@@ -221,8 +221,7 @@ impl RolloutTap {
         }
         self.fold.set_writer(self.running.as_deref());
         let held = self.bound.as_ref().and_then(|b| {
-            let file = super::footer::open_regular(&b.path)?;
-            let meta = file.metadata().ok()?;
+            let (file, meta) = super::footer::open_regular_with_meta(&b.path)?;
             (super::session_usage::open_identity(&file, &meta) == b.id && meta.len() >= b.pos)
                 .then_some(file)
         });
@@ -271,8 +270,8 @@ impl RolloutTap {
     /// Find the thread's rollout, validate its first row via [`gate`], and bind the fold.
     fn bind(&mut self) -> Result<std::fs::File, Refusal> {
         let path = rollout_path(&self.home, &self.thread).ok_or(Refusal::NoRollout)?;
-        let file = super::footer::open_regular(&path).ok_or(Refusal::NoRollout)?;
-        let meta = file.metadata().map_err(|_| Refusal::NoRollout)?;
+        let (file, meta) =
+            super::footer::open_regular_with_meta(&path).ok_or(Refusal::NoRollout)?;
         let id = super::session_usage::open_identity(&file, &meta);
         let first = first_line_of(&file).ok_or(Refusal::NoMeta)?;
         let build = gate(&first, &self.thread)?;

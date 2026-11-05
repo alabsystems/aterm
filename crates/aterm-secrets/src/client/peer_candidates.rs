@@ -21,6 +21,13 @@ pub(super) enum PeerUse {
 }
 
 impl PeerUse {
+    /// Whether this purpose's peers are read for the vault itself (its envelope or its records),
+    /// which a Mac's mirrors serve ([`Config::mirrors`]), rather than sent a join or read for a
+    /// join queue, which only the vault's servers hold.
+    pub(super) const fn vault_read(self) -> bool {
+        matches!(self, Self::Records | Self::Envelope | Self::Reader)
+    }
+
     const fn index(self) -> usize {
         match self {
             Self::Records => 0,

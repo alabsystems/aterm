@@ -800,7 +800,8 @@ impl InitialSetupAuthorization {
                 let finished = records_finished(&current.records);
                 if current != *baseline
                     || (finished && admission != Admission::Upgrade)
-                    || (admission == Admission::Upgrade && !current.records.provisional)
+                    || (admission == Admission::Upgrade
+                        && scope::upgrade_of(&current.records, || true).is_none())
                 {
                     self.state = AuthorizationState::Ended;
                     return Ok(None);
@@ -935,6 +936,7 @@ mod tests {
                 source: aterm_secrets::transport::Source::Url(format!(
                     "https://{name}.example/v1/{name}"
                 )),
+                mirrors: Vec::new(),
                 name: name.into(),
                 signer: Some([7; 32]),
                 followed: Vec::new(),
@@ -1585,7 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_provisional_plan_widens_keeping_its_stages_and_a_persons_plan_never_does() {
+    fn fleet_expansion_widens_finished_and_saved_partial_plans() {
         let root = aterm_tempfile::tempdir().unwrap();
         let narrow = selected(&[Setting::Permissions]);
         let first = admit(root.path(), &narrow, Admission::Automatic).unwrap();
@@ -1606,12 +1608,12 @@ mod tests {
         assert_eq!(saved_plan(root.path()).unwrap(), Some(full.clone()));
         assert!(saved_plan_provisional(root.path()).unwrap());
 
-        // A person's plan is theirs: no upgrade replaces it.
+        // Fleet admission also expands a saved partial plan.
         let other = aterm_tempfile::tempdir().unwrap();
         admit(other.path(), &narrow, Admission::Person).unwrap();
         assert!(!saved_plan_provisional(other.path()).unwrap());
-        assert_eq!(admit(other.path(), &full, Admission::Upgrade), None);
-        assert_eq!(saved_plan(other.path()).unwrap(), Some(narrow));
+        assert!(admit(other.path(), &full, Admission::Upgrade).is_some());
+        assert_eq!(saved_plan(other.path()).unwrap(), Some(full));
     }
 
     #[test]

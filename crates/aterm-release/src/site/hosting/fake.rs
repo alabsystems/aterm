@@ -142,6 +142,10 @@ impl Drop for Fake {
     }
 }
 
+const MAX_FAKE_LINE_BYTES: u64 = 64 << 10;
+const MAX_FAKE_HEADERS: usize = 128;
+const MAX_FAKE_BODY_BYTES: usize = 256 << 20;
+
 /// One request off `stream`, answered.
 fn serve(stream: TcpStream, state: &Mutex<State>, origins: &Origins, public: &[u8]) {
     let _ = stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN));
@@ -150,7 +154,13 @@ fn serve(stream: TcpStream, state: &Mutex<State>, origins: &Origins, public: &[u
     };
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() || line.is_empty() {
+    if (&mut reader)
+        .take(MAX_FAKE_LINE_BYTES + 1)
+        .read_line(&mut line)
+        .is_err()
+        || line.is_empty()
+        || line.len() as u64 > MAX_FAKE_LINE_BYTES
+    {
         return;
     }
     let mut parts = line.split_whitespace();
@@ -160,8 +170,16 @@ fn serve(stream: TcpStream, state: &Mutex<State>, origins: &Origins, public: &[u
     );
     let mut headers = Vec::new();
     loop {
+        if headers.len() >= MAX_FAKE_HEADERS {
+            return;
+        }
         let mut h = String::new();
-        if reader.read_line(&mut h).is_err() {
+        if (&mut reader)
+            .take(MAX_FAKE_LINE_BYTES + 1)
+            .read_line(&mut h)
+            .is_err()
+            || h.len() as u64 > MAX_FAKE_LINE_BYTES
+        {
             return;
         }
         let h = h.trim_end();
@@ -185,6 +203,9 @@ fn serve(stream: TcpStream, state: &Mutex<State>, origins: &Origins, public: &[u
         .filter(|l| l.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|l| l.parse::<usize>().ok())
         .unwrap_or(0);
+    if length > MAX_FAKE_BODY_BYTES {
+        return;
+    }
     let mut body = vec![0; length];
     if reader.read_exact(&mut body).is_err() {
         return;

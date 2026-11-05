@@ -521,7 +521,10 @@ fn ctl_image(exe: &str, to: &Path) -> Result<String, String> {
             String::from_utf8_lossy(&reply.stderr).trim()
         ));
     };
-    std::fs::copy(&wrote, to).map_err(|e| format!("{}: {e}", wrote.display()))?;
+    let (bytes, _) = aterm_uds::atomic_file::read_regular(&wrote, 64 << 20)
+        .map_err(|e| format!("{}: {e}", wrote.display()))?;
+    aterm_uds::atomic_file::write(to, &bytes, 0o644)
+        .map_err(|e| format!("{}: {e}", to.display()))?;
     let _ = std::fs::remove_file(&wrote);
     Ok(size)
 }

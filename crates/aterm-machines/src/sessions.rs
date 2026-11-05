@@ -343,17 +343,23 @@ pub fn scan_aterm_sessions_in_dir(
 
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
+            let file_name = e.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
             if !name.ends_with(".sock") {
                 continue;
             }
-            if let Some(pid) = aterm_types::control_socket::instance_pid(&name) {
+            if let Some(pid) = aterm_types::control_socket::instance_pid(name) {
                 remember(pid, dir.join(name));
             }
         }
     }
     if let Ok(entries) = std::fs::read_dir(dir.join("graph")) {
         for e in entries.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
             let Some(body) = read_owned_text(&e.path(), 64 * 1024) else {
                 continue;
             };

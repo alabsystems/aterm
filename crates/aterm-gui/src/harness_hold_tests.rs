@@ -73,6 +73,7 @@ pub(crate) fn ask() -> crate::needs::HarnessAsk {
         others: Vec::new(),
         program: aterm_phase::Program::Claude,
         tail: crate::needs::NeedTail::CarryingOn,
+        entry_first: None,
     }
 }
 
@@ -195,6 +196,7 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
             stashes: 2,
             unpushed: 0,
             unlanded: 4,
+            left: 2,
             open: [None; 4],
             nudges: 1,
             ..held()
@@ -205,11 +207,13 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
         hold_words(&every, None, HoldForm::Line, Some(TODAY), None).as_deref(),
         Some(
             "not landed yet: a need named earlier in its reply; 1 changed file, 2 stashes, 4 \
-             commits not on the remote main; what it listed as left; no \u{201c}Nothing \
-             left:\u{201d} defense yet; a reply too tall to read whole \u{b7} landing since 14:02 \
-             \u{b7} 1 nudge"
+             commits not on the remote main; 2 processes left running; what it listed as left; \
+             no \u{201c}Nothing left:\u{201d} defense yet; a reply too tall to read whole \u{b7} \
+             landing since 14:02 \u{b7} 1 nudge"
         )
     );
+    let spoken = hold_words(&every, None, HoldForm::Spoken, Some(TODAY), None).expect("spoken");
+    assert!(spoken.contains("2 processes left running."), "{spoken}");
     let unread = glass(
         LandHeld {
             legs: HoldLeg::Unread.bit() | HoldLeg::Defense.bit(),

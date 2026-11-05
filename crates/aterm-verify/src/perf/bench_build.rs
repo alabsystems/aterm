@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The MEASURED lanes' build support, shared by `fabric`, `restore-e2e` and `commons-quiet`: the arm's cargo
-//! profile read back from cargo's own plan and config before anything runs ([`prepare`]), the
-//! aterm the bench launches pinned by path and identity ([`Built`], [`another_build`]), the bench
-//! run with its words in one environment variable ([`run_bench`]), and the provenance an entry
-//! records (the load average, the CPUs, the next free entry name).
+//! The bench lanes' build support, shared by the MEASURED lanes `fabric`, `restore-e2e` and
+//! `commons-quiet` and by the FLOOR lane `fabric-counts`, which builds and runs the fabric bench
+//! as `fabric` does: the arm's cargo profile read back from cargo's own plan and config before
+//! anything runs ([`prepare`]), the aterm the bench launches pinned by path and identity
+//! ([`Built`], [`another_build`]), the bench run with its words in one environment variable
+//! ([`run_bench`]), and the provenance an entry records (the load average, the CPUs, the next
+//! free entry name). [`run_bench`] admits a run by what it reads ([`Entry`]): `fabric`'s and
+//! `restore-e2e`'s timed runs on fresh measurement-entry evidence, `fabric-counts`' counted runs
+//! at the load they find, so a change to it or to [`prepare`] changes that floor lane too.
 
 use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
@@ -114,20 +118,35 @@ pub(crate) fn prepare<'a>(
     ))
 }
 
-/// Build `build_args`'s bench without executing it, obtain fresh measurement-entry evidence,
-/// then execute Cargo's exact artifact with `words` in `env`. Echo stderr lines beginning
-/// with `progress`, and return stdout.
+/// How a bench run is admitted: whether what it reads is time or counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Entry {
+    /// It times: fresh postcompile measurement-entry evidence ([`super::measurement_entry`]) is
+    /// taken before it runs and must still qualify when it exits.
+    Timed,
+    /// It counts (`fabric-counts`): no admission, so it runs at the load it finds, which the lane
+    /// reports beside its counts.
+    Counted,
+}
+
+/// Build `build_args`'s bench without executing it, then execute Cargo's exact artifact with the
+/// words of `knobs` (the variable and its words) and the separate OS-native output path in its
+/// named variable (`output`), admitted as `entry` says: a timed run first obtains fresh
+/// measurement-entry evidence. Echo stderr lines beginning with `progress`, and return stdout.
 ///
 /// # Errors
-/// A bench that does not start, or exits unsuccessfully (`what` names it, with both tails).
+/// A bench that does not start, or exits unsuccessfully (`what` names it, with both tails); a
+/// timed run whose admission is refused or lapsed.
 pub(crate) fn run_bench(
     targo: &Targo<'_>,
     build_args: &[&str],
-    env: &str,
-    words: &str,
+    knobs: (&str, &str),
+    output: (&str, &Path),
     progress: &str,
     what: &str,
+    entry: Entry,
 ) -> Result<String, Halt> {
+    let (env, words) = knobs;
     let mut bench_args = vec!["-q", "--no-run", "--message-format=json-render-diagnostics"];
     bench_args.extend_from_slice(build_args);
     eprintln!("  $ {}", targo.display("bench", &bench_args));
@@ -139,29 +158,65 @@ pub(crate) fn run_bench(
         .ok_or_else(|| Halt::Fail("measurement build names no bench target".into()))?;
     let executable = built_executable(&messages, name, "bench")?;
     eprintln!(
-        "  $ {env}=\"{words}\" {}",
-        format_args!("{} --bench", executable.display())
+        "  $ {env}=\"{words}\" {}={:?} {} --bench",
+        output.0,
+        output.1,
+        executable.display()
     );
     let mut command = aterm_uds::spawnfd::command(&executable);
     targo.environment(&mut command);
     command.current_dir(workspace_root()).arg("--bench");
-    let _entry = super::measurement_entry().map_err(Halt::Timing)?;
+    let admitted = match entry {
+        Entry::Timed => Some(super::measurement_entry().map_err(Halt::Timing)?),
+        Entry::Counted => None,
+    };
+    set_bench_environment(&mut command, env, words, output);
     let mut child = command
-        .env(env, words)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not execute {}: {e}", executable.display()))?;
-    let stdout = child.stdout.take().map(|out| {
+    let stdout = child.stdout.take().map(|mut out| {
         std::thread::spawn(move || {
+            use std::io::Read as _;
             let mut text = String::new();
-            let _ = std::io::Read::read_to_string(&mut std::io::BufReader::new(out), &mut text);
+            let _ = (&mut out).take(16 * 1024 * 1024).read_to_string(&mut text);
+            let _ = std::io::copy(&mut out, &mut std::io::sink());
             text
         })
     });
     let mut tail: Vec<String> = Vec::new();
     if let Some(err) = child.stderr.take() {
-        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+        use std::io::Read as _;
+        const MAX_BENCH_STDERR_LINE: usize = 64 << 10;
+        let mut reader = std::io::BufReader::new(err);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match (&mut reader)
+                .take((MAX_BENCH_STDERR_LINE as u64) + 1)
+                .read_until(b'\n', &mut buf)
+            {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if !buf.ends_with(b"\n") && buf.len() > MAX_BENCH_STDERR_LINE {
+                while let Ok(chunk) = reader.fill_buf() {
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    let nl = chunk.iter().position(|&b| b == b'\n');
+                    let len = chunk.len();
+                    if let Some(nl) = nl {
+                        reader.consume(nl + 1);
+                        break;
+                    }
+                    reader.consume(len);
+                }
+            }
+            let line = String::from_utf8_lossy(&buf)
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
             if line.starts_with(progress) {
                 eprintln!("  {line}");
             }
@@ -175,9 +230,11 @@ pub(crate) fn run_bench(
         .wait()
         .map_err(|e| format!("could not wait for measurement executable: {e}"))?;
     let stdout = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
-    _entry
-        .timing_admission()
-        .map_err(|why| Halt::Timing(why.to_string()))?;
+    if let Some(admitted) = &admitted {
+        admitted
+            .timing_admission()
+            .map_err(|why| Halt::Timing(why.to_string()))?;
+    }
     if !status.success() {
         let out_tail: Vec<&str> = stdout.lines().rev().take(TAIL).collect();
         return Err(Halt::Fail(format!(
@@ -365,6 +422,10 @@ fn build_bench(targo: &Targo<'_>, build_args: &[&str]) -> Result<PathBuf, Halt> 
 
 fn built_binary(messages: &str, name: &str) -> Result<PathBuf, String> {
     built_executable(messages, name, "bin")
+}
+
+fn set_bench_environment(command: &mut Command, env: &str, words: &str, output: (&str, &Path)) {
+    command.env(env, words).env(output.0, output.1);
 }
 
 /// Cargo's exact executable artifact, matched by both target name and target kind.
@@ -711,6 +772,28 @@ mod tests {
             built_executable(&library_tests, "aterm_db", "lib"),
             Ok(PathBuf::from("/cache/deps/aterm_db-test"))
         );
+    }
+
+    #[test]
+    fn bench_output_environment_keeps_os_paths() {
+        let keeps = |path: &Path| {
+            let mut command = aterm_uds::spawnfd::command("not-executed");
+            set_bench_environment(&mut command, "KNOBS", "samples=3", ("OUTPUT", path));
+            let vars: Vec<_> = command.get_envs().collect();
+            assert!(vars.contains(&(
+                std::ffi::OsStr::new("KNOBS"),
+                Some(std::ffi::OsStr::new("samples=3"))
+            )));
+            assert!(vars.contains(&(std::ffi::OsStr::new("OUTPUT"), Some(path.as_os_str()))));
+        };
+        keeps(Path::new("/scratch/with spaces"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            keeps(&PathBuf::from(std::ffi::OsString::from_vec(
+                b"/scratch/non-utf8-\xff".to_vec(),
+            )));
+        }
     }
 
     #[test]

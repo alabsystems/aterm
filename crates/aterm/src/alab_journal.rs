@@ -484,7 +484,7 @@ mod tests {
     fn a_note_made_while_the_journal_is_off_is_never_spooled() {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let config = scratch.path().join("aterm.toml");
-        std::fs::write(&config, "[alab]\njournal = false\n").unwrap();
+        aterm_uds::atomic_file::write(&config, b"[alab]\njournal = false\n", 0o600).unwrap();
         let glue = Glue {
             spool: Some(Spool::at(scratch.path().join("alab"))),
             publishing: Publishing::new(Some(config.clone())),
@@ -546,7 +546,7 @@ mod tests {
         )
         .unwrap();
         let config = scratch.path().join("aterm.toml");
-        std::fs::write(&config, "[alab]\njournal = false\n").unwrap();
+        aterm_uds::atomic_file::write(&config, b"[alab]\njournal = false\n", 0o600).unwrap();
         let spool = Spool::at(scratch.path().join("alab"));
         backfill_at(&spool, &state, &home, Some(&config), now).unwrap();
         assert!(journal::backfilled(&state));

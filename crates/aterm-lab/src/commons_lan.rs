@@ -18,16 +18,23 @@ use aterm_secrets::commons::bootstrap::Bootstrap;
 use aterm_types::network_state::Visibility;
 use aterm_uds::private_file;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[path = "commons_lan_claims.rs"]
 mod claims;
+#[path = "commons_lan_emails.rs"]
+mod emails;
 
 const HANG: Duration = Duration::from_secs(60);
 const CAPSULE_LIMIT: usize = 32 * 1024;
+/// The most recipients one synthetic vault approves: labels `m2` … `m9`.
+const MAX_RECIPIENTS: usize = 8;
+/// The longest ordinary host run: an hour, so one host stays up across a run of edits; its
+/// `stop` marker ends it sooner.
+const MAX_RUN_S: u64 = 3600;
 const APPLICATION: &str = "lan-startup-data";
-const USAGE: &str = "commons-lan prepare-recipient <new-world> | prepare-source <new-world> <recipient-key> | join <world> <capsule-file> | run <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | db <aterm> <world> <db-command> [args...] | declare <world> | write <world> <key> | read <world> | claim <world> <counter> <since> <until> | release <world> <counter> <until> | claims <world>";
+const USAGE: &str = "commons-lan prepare-recipient <new-world> | prepare-source <new-world> <recipient-key>... | join <world> <capsule-file> | run <aterm> <world> <seconds> | node <aterm> <world> <seconds> | pair <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | db <aterm> <world> <db-command> [args...] | declare <world> | write <world> <key> | read <world> | claim <world> <counter> <since> <until> | release <world> <counter> <until> | claims <world> | emails-fixture <world> <seed> | emails-set <aterm> <world> <seed> <row> <column> <value-or-tag> | emails-wait <aterm> <world> <digest>|!<digest> <seconds>";
 
 /// The flag that lets a `commons-lan` verb drive a world the live default ALab vault admitted: it
 /// names the vault and what stays in it, a member no run takes out.
@@ -43,13 +50,7 @@ fn emit(value: &Value) -> Result<(), Fail> {
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> Result<(), Fail> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(fail)?;
+    let mut file = crate::util::create_new_regular_file(path, 0o600).map_err(fail)?;
     file.write_all(bytes).map_err(fail)
 }
 
@@ -99,7 +100,12 @@ fn prepare_recipient(root: &Path) -> Result<Value, Fail> {
     )
 }
 
-fn prepare_source(root: &Path, recipient: &str) -> Result<Value, Fail> {
+fn prepare_source(root: &Path, recipients: &[String]) -> Result<Value, Fail> {
+    if recipients.is_empty() || recipients.len() > MAX_RECIPIENTS {
+        return Err(Fail::usage(format!(
+            "prepare-source approves 1 to {MAX_RECIPIENTS} recipients"
+        )));
+    }
     let world = prepare(root, "source")?;
     let paths = Paths::for_home(&world.home);
     let vault = world.dir.join("fixture.vault");
@@ -107,26 +113,40 @@ fn prepare_source(root: &Path, recipient: &str) -> Result<Value, Fail> {
         client::create(&paths, &vault.to_string_lossy(), None, Some("m1")).map_err(fail)?;
     let admin = client::admin_open(&paths).map_err(fail)?;
     let mut doc = admin.doc.clone();
-    doc.add_machine("m2", recipient).map_err(fail)?;
-    client::admin_publish_approved(&paths, &admin, &doc, &[recipient.into()]).map_err(fail)?;
+    // Each recipient takes the next label after the source's `m1`, in the order named.
+    let hosts: Vec<String> = (2..)
+        .take(recipients.len())
+        .map(|n| format!("m{n}"))
+        .collect();
+    for (host, recipient) in hosts.iter().zip(recipients) {
+        doc.add_machine(host, recipient).map_err(fail)?;
+    }
+    client::admin_publish_approved(&paths, &admin, &doc, recipients).map_err(fail)?;
     let genesis =
         client::seed_vault_genesis(&paths, &world.dir.join("fixture.genesis")).map_err(fail)?;
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o600)).map_err(fail)?;
+    aterm_uds::regular_file::open(&vault)
+        .and_then(|(f, _)| f.set_permissions(std::fs::Permissions::from_mode(0o600)))
+        .map_err(fail)?;
     let bytes = aterm_secrets::fsx::read_private(&vault, CAPSULE_LIMIT)
         .map_err(fail)?
         .ok_or_else(|| Fail::die("synthetic vault publication is missing"))?;
-    let capsule = json!({"schema":1,"signer":created.signer,"recipient":recipient,
-        "vault_hex":hex::encode_lower(bytes.as_slice())});
-    if aterm_json::to_vec(&capsule).map_err(fail)?.len() > CAPSULE_LIMIT {
-        return Err(Fail::die(
-            "synthetic vault capsule exceeds its transfer bound",
-        ));
+    let vault_hex = hex::encode_lower(bytes.as_slice());
+    let mut capsules = Vec::with_capacity(recipients.len());
+    for (host, recipient) in hosts.iter().zip(recipients) {
+        let capsule = json!({"schema":1,"signer":created.signer,"recipient":recipient,
+            "host":host,"vault_hex":vault_hex});
+        if aterm_json::to_vec(&capsule).map_err(fail)?.len() > CAPSULE_LIMIT {
+            return Err(Fail::die(
+                "synthetic vault capsule exceeds its transfer bound",
+            ));
+        }
+        capsules.push(capsule);
     }
     Ok(
         json!({"schema":1,"role":"source","world":world.dir.display().to_string(),
         "genesis":hex::encode_lower(&genesis.digest),"genesis_members":genesis.members,
-        "capsule":capsule}),
+        "capsules":capsules}),
     )
 }
 
@@ -148,6 +168,14 @@ fn join_recipient(root: &Path, capsule: &[u8]) -> Result<Value, Fail> {
             "synthetic vault capsule is for another recipient",
         ));
     }
+    let host = capsule["host"]
+        .as_str()
+        .filter(|host| {
+            host.strip_prefix('m')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                && host.len() <= 8
+        })
+        .ok_or_else(|| Fail::die("synthetic vault capsule names no recipient label"))?;
     let signer = capsule["signer"]
         .as_str()
         .filter(|key| !key.is_empty() && key.len() <= 256 && !key.chars().any(char::is_control))
@@ -162,7 +190,7 @@ fn join_recipient(root: &Path, capsule: &[u8]) -> Result<Value, Fail> {
         &paths,
         &JoinOptions {
             source: format!("{}#{signer}", file.display()),
-            host: Some("m2".into()),
+            host: Some(host.into()),
             interactive: false,
             wait: Duration::ZERO,
             confirm: &|_| false,
@@ -208,9 +236,32 @@ fn prepare_run(root: &Path, live: bool) -> Result<(World, String), Fail> {
     Ok((world, role))
 }
 
-fn run(aterm: &Path, root: &Path, seconds: u64, follows: Option<u32>, live: bool) -> Res {
-    if !(60..=600).contains(&seconds) {
-        return Err(Fail::usage("commons-lan run takes 60 to 600 seconds"));
+/// Observe what the ordinary host established without preparing its custody.
+fn observed_admission(paths: &Paths, deadline: Instant) -> bool {
+    let Ok((bootstrap, journal)) = Bootstrap::established_with_journal_until(paths, deadline)
+    else {
+        return false;
+    };
+    drop(journal);
+    bootstrap.is_log_backed().unwrap_or(false)
+        && bootstrap
+            .log_witness()
+            .is_ok_and(|witness| witness.is_some())
+        && bootstrap.access().is_ok_and(|access| access.is_some())
+}
+
+fn run(
+    aterm: &Path,
+    root: &Path,
+    seconds: u64,
+    follows: Option<u32>,
+    live: bool,
+    mut ready: Option<std::sync::mpsc::SyncSender<(u32, PathBuf)>>,
+) -> Res {
+    if !(60..=MAX_RUN_S).contains(&seconds) {
+        return Err(Fail::usage(format!(
+            "commons-lan run takes 60 to {MAX_RUN_S} seconds"
+        )));
     }
     let aterm = std::fs::canonicalize(aterm).map_err(fail)?;
     let (world, role) = prepare_run(root, live)?;
@@ -257,13 +308,7 @@ fn run(aterm: &Path, root: &Path, seconds: u64, follows: Option<u32>, live: bool
         if !instance.running() {
             return Err(Fail::die("ordinary host exited during startup"));
         }
-        let admitted = Bootstrap::required(&Paths::for_home(&world.home)).is_ok_and(|bootstrap| {
-            bootstrap.is_log_backed().unwrap_or(false)
-                && bootstrap
-                    .log_witness()
-                    .is_ok_and(|witness| witness.is_some())
-                && bootstrap.access().is_ok_and(|access| access.is_some())
-        });
+        let admitted = observed_admission(&Paths::for_home(&world.home), hang);
         if admitted
             && let Ok(observation) = aterm_db::network_state::read_live_observation(&config)
             && observation.visibility == Visibility::Active
@@ -277,6 +322,11 @@ fn run(aterm: &Path, root: &Path, seconds: u64, follows: Option<u32>, live: bool
                 &aterm_json::to_vec(&active).map_err(fail)?,
             )?;
             emit(&active)?;
+            if let Some(ready) = ready.take() {
+                ready
+                    .send((pid as u32, run.clone()))
+                    .map_err(|_| Fail::die("paired host stopped waiting for its owner"))?;
+            }
             break;
         }
         if Instant::now() >= hang {
@@ -332,6 +382,174 @@ fn run(aterm: &Path, root: &Path, seconds: u64, follows: Option<u32>, live: bool
     Ok(0)
 }
 
+/// Keep the lab's node owned across every reporting and observation error.
+struct OwnedNode(aterm_uds::spawnfd::Child);
+
+impl Drop for OwnedNode {
+    fn drop(&mut self) {
+        aterm_uds::deadline::kill_within(&mut self.0, HANG);
+    }
+}
+
+/// Run the shipped headless node service (`aterm node serve`) in a prepared profile until
+/// `seconds` pass or the run's `stop` marker appears, as the 2026-11-04 three-Mac runs did. Unlike
+/// [`run`] it starts no window and disclaims nothing: the service is this command's child, so
+/// macOS charges its Local Network use to whatever started this command (a tab of the installed
+/// app), where an unbundled debug window's own identity holds no grant (`No route to host`,
+/// docs/measured/commons-window-lan-boundary-2026-11-04.md). Each phase is one JSON line and a
+/// file in the run's folder: `started`, `active` once the profile is admitted and its own
+/// observer is Active, then `stopped` with the service's exit, after `SIGTERM` and, past the
+/// one-minute hang detector, `SIGKILL`.
+fn node(aterm: &Path, root: &Path, seconds: u64, live: bool) -> Res {
+    if !(60..=MAX_RUN_S).contains(&seconds) {
+        return Err(Fail::usage(format!(
+            "commons-lan node takes 60 to {MAX_RUN_S} seconds"
+        )));
+    }
+    let aterm = std::fs::canonicalize(aterm).map_err(fail)?;
+    let (world, role) = prepare_run(root, live)?;
+    let run = world.dir.clone();
+    let mut env = world.env();
+    env.retain(|(key, _)| key != "ATERM_STATE_HOME" && key != "CI");
+    let log = crate::util::create_new_regular_file(&run.join("node.log"), 0o600).map_err(fail)?;
+    let err = log.try_clone().map_err(fail)?;
+    let mut owned = OwnedNode(
+        aterm_uds::spawnfd::command(&aterm)
+            .env_clear()
+            .envs(env)
+            .current_dir(&world.home)
+            .args(["node", "serve"])
+            .setsid(true)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(log)
+            .stderr(err)
+            .spawn()
+            .map_err(fail)?,
+    );
+    let child = &mut owned.0;
+    let pid = child.id();
+    let phase = |name: &str, value: Value| -> Result<(), Fail> {
+        write_new(
+            &run.join(format!("{name}.json")),
+            &aterm_json::to_vec(&value).map_err(fail)?,
+        )?;
+        emit(&value)
+    };
+    let stopped = |child: &mut aterm_uds::spawnfd::Child| -> Result<Value, Fail> {
+        if child.try_wait().map_err(fail)?.is_none() {
+            child.terminate().map_err(fail)?;
+            let hang = Instant::now() + HANG;
+            while child.try_wait().map_err(fail)?.is_none() && Instant::now() < hang {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let status = match child.try_wait().map_err(fail)? {
+            Some(status) => status.to_string(),
+            None => {
+                aterm_uds::deadline::kill_within(child, HANG);
+                "killed after the hang detector".into()
+            }
+        };
+        Ok(
+            json!({"phase":"stopped","role":role,"run":run.display().to_string(),
+            "node_pid":pid,"exit":status}),
+        )
+    };
+    phase(
+        "started",
+        json!({"phase":"started","role":role,"run":run.display().to_string(),"node_pid":pid,
+            "log":run.join("node.log").display().to_string()}),
+    )?;
+    let config = world.cfg.join("aterm/aterm.toml");
+    let hang = Instant::now() + HANG;
+    loop {
+        if let Err(error) = stop::check() {
+            emit(&stopped(child)?)?;
+            return Err(error.into());
+        }
+        if child.try_wait().map_err(fail)?.is_some() {
+            emit(&stopped(child)?)?;
+            return Err(Fail::die("the node service exited during startup"));
+        }
+        let admitted = observed_admission(&Paths::for_home(&world.home), hang);
+        if admitted
+            && let Ok(observation) = aterm_db::network_state::read_live_observation(&config)
+            && observation.visibility == Visibility::Active
+            && observation.via_local_process == Some(pid)
+        {
+            phase(
+                "active",
+                json!({"phase":"active","role":role,"run":run.display().to_string(),
+                    "node_pid":pid,"commons_admitted":true,
+                    "network":aterm_db::network_state::value(&observation)}),
+            )?;
+            break;
+        }
+        if Instant::now() >= hang {
+            let network = aterm_db::network_state::read_live_observation(&config)
+                .map(|observation| aterm_db::network_state::value(&observation))
+                .unwrap_or_else(|error| json!({"relay_error":format!("{:?}",error.kind())}));
+            phase(
+                "unavailable",
+                json!({"phase":"unavailable","role":role,"run":run.display().to_string(),
+                    "node_pid":pid,"commons_admitted":admitted,"network":network}),
+            )?;
+            emit(&stopped(child)?)?;
+            return Err(Fail::die("the node service did not become active"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let until = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < until
+        && !run.join("stop").try_exists().map_err(fail)?
+        && stop::check().is_ok()
+        && child.try_wait().map_err(fail)?.is_none()
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let exited_early = child.try_wait().map_err(fail)?.is_some();
+    emit(&stopped(child)?)?;
+    if exited_early {
+        return Err(Fail::die(
+            "the node service exited before the requested stop",
+        ));
+    }
+    Ok(0)
+}
+
+/// Start the owner and its local follower under one process's quiet reservation.
+/// Independent lab commands reserve the machine separately and cannot overlap.
+fn pair(aterm: &Path, root: &Path, seconds: u64, live: bool) -> Res {
+    std::thread::scope(|scope| {
+        let (ready, owner_ready) = std::sync::mpsc::sync_channel(1);
+        let owner = scope.spawn(|| run(aterm, root, seconds, None, live, Some(ready)));
+        let joined = |result: std::thread::Result<Res>| {
+            result.map_err(|_| Fail::die("paired Commons owner panicked"))?
+        };
+        let Ok((pid, owner_run)) = owner_ready.recv() else {
+            return joined(owner.join());
+        };
+        let followed = run(aterm, root, seconds, Some(pid), live, None);
+        let stop = if owner.is_finished() || owner_run.join("stop").try_exists().map_err(fail)? {
+            Ok(())
+        } else {
+            request_stop(&owner_run)
+        };
+        let original = joined(owner.join());
+        followed?;
+        stop?;
+        original
+    })
+}
+
+fn request_stop(run: &Path) -> Result<(), Fail> {
+    let marker = private_file::read_private(run, "lab-run", 64).map_err(fail)?;
+    if marker.as_slice() != b"commons-lan-run/1\n" {
+        return Err(Fail::die("not an owned Commons LAN run"));
+    }
+    write_new(&run.join("stop"), b"")
+}
+
 fn table_snapshot(world: &World) -> Result<Value, Fail> {
     let paths = Paths::for_home(&world.home);
     let table = Table::application(&paths, APPLICATION, "items")?;
@@ -355,29 +573,29 @@ fn table_snapshot(world: &World) -> Result<Value, Fail> {
     )
 }
 
-/// Run the shipped database CLI against a prepared profile, including while its
-/// app is stopped. Only inert proposal/data commands are admitted; no credential
-/// activation, membership or service command can pass through this entry point.
-fn database(aterm: &Path, root: &Path, args: &[String], live: bool) -> Res {
-    if !matches!(
-        args.first().map(String::as_str),
+/// Whether `commons-lan db` passes `args` to the shipped database CLI: inert proposal and data
+/// commands, the lab model's import and check, and the owner's emails view. No credential
+/// activation, membership or service command passes, and `emails --show-passwords` reaches a
+/// process with no terminal, which the view refuses (one-mesh design §4.8).
+fn admitted_db(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
         Some(
-            "nonce"
-                | "commons-status"
-                | "commons-tables"
-                | "commons-inventory"
-                | "accounts-init"
-                | "accounts-write"
-                | "accounts-get"
-                | "accounts-scan"
-                | "accounts-history"
-        )
-    ) {
-        return Err(Fail::usage(
-            "commons-lan db accepts proposal/data commands only",
-        ));
+            "nonce" | "commons-status" | "commons-tables" | "commons-inventory" | "accounts-init"
+            | "accounts-write" | "accounts-get" | "accounts-scan" | "accounts-history" | "emails",
+        ) => true,
+        Some("alab") => matches!(args.get(1).map(String::as_str), Some("import" | "check")),
+        _ => false,
     }
-    let (world, _) = open(root, live)?;
+}
+
+/// Run the shipped database CLI against a prepared profile, including while its
+/// app is stopped, with `stdin` as its standard input; what it wrote.
+fn db_output(
+    aterm: &Path,
+    world: &World,
+    args: &[String],
+    stdin: aterm_uds::spawnfd::Stdio,
+) -> Result<std::process::Output, Fail> {
     let mut env = world.env();
     env.retain(|(key, _)| key != "ATERM_STATE_HOME" && key != "CI");
     let mut command = aterm_uds::spawnfd::command(std::fs::canonicalize(aterm).map_err(fail)?);
@@ -387,7 +605,19 @@ fn database(aterm: &Path, root: &Path, args: &[String], live: bool) -> Res {
         .current_dir(&world.home)
         .arg("db")
         .args(args);
-    let output = aterm_uds::deadline::output_within(&mut command, HANG).map_err(fail)?;
+    aterm_uds::deadline::output_until_from(&mut command, stdin, Instant::now() + HANG).map_err(fail)
+}
+
+/// Run the shipped database CLI against a prepared profile, including while its
+/// app is stopped. Only the commands [`admitted_db`] names pass through this entry point.
+fn database(aterm: &Path, root: &Path, args: &[String], live: bool) -> Res {
+    if !admitted_db(args) {
+        return Err(Fail::usage(
+            "commons-lan db accepts proposal/data commands, `alab import|check` and `emails` only",
+        ));
+    }
+    let (world, _) = open(root, live)?;
+    let output = db_output(aterm, &world, args, aterm_uds::spawnfd::Stdio::null())?;
     std::io::stdout().write_all(&output.stdout).map_err(fail)?;
     std::io::stderr().write_all(&output.stderr).map_err(fail)?;
     Ok(output.status.code().unwrap_or(1))
@@ -400,8 +630,8 @@ pub fn cmd(args: &[String]) -> Res {
     let args: Vec<String> = args.iter().filter(|arg| *arg != LIVE).cloned().collect();
     let value = match args.as_slice() {
         [verb, root] if verb == "prepare-recipient" => prepare_recipient(Path::new(root))?,
-        [verb, root, recipient] if verb == "prepare-source" => {
-            prepare_source(Path::new(root), recipient)?
+        [verb, root, recipients @ ..] if verb == "prepare-source" => {
+            prepare_source(Path::new(root), recipients)?
         }
         [verb, root, capsule] if verb == "join" => {
             let bytes = aterm_secrets::fsx::read_private(Path::new(capsule), CAPSULE_LIMIT)
@@ -422,6 +652,29 @@ pub fn cmd(args: &[String]) -> Res {
                 seconds.parse().map_err(fail)?,
                 None,
                 live,
+                None,
+            );
+        }
+        [verb, aterm, root, seconds] if verb == "node" => {
+            if !seconds.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(Fail::usage("node needs a whole number of seconds"));
+            }
+            return node(
+                Path::new(aterm),
+                Path::new(root),
+                seconds.parse().map_err(fail)?,
+                live,
+            );
+        }
+        [verb, aterm, root, seconds] if verb == "pair" => {
+            if !seconds.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(Fail::usage("pair needs a whole number of seconds"));
+            }
+            return pair(
+                Path::new(aterm),
+                Path::new(root),
+                seconds.parse().map_err(fail)?,
+                live,
             );
         }
         [verb, aterm, root, seconds, owner] if verb == "follow" => {
@@ -440,15 +693,11 @@ pub fn cmd(args: &[String]) -> Res {
                 seconds.parse().map_err(fail)?,
                 Some(owner),
                 live,
+                None,
             );
         }
         [verb, run] if verb == "stop" => {
-            let run = Path::new(run);
-            let marker = private_file::read_private(run, "lab-run", 64).map_err(fail)?;
-            if marker.as_slice() != b"commons-lan-run/1\n" {
-                return Err(Fail::die("not an owned Commons LAN run"));
-            }
-            write_new(&run.join("stop"), b"")?;
+            request_stop(Path::new(run))?;
             json!({"stop_requested":true})
         }
         [verb, root] if verb == "declare" => {
@@ -490,6 +739,28 @@ pub fn cmd(args: &[String]) -> Res {
             claims::write(Path::new(root), counter, None, until, live)?
         }
         [verb, root] if verb == "claims" => claims::read(Path::new(root), live)?,
+        [verb, root, seed] if verb == "emails-fixture" => {
+            let (world, _) = open(Path::new(root), live)?;
+            emails::fixture(&world, seed)?
+        }
+        [verb, aterm, root, seed, row, column, value] if verb == "emails-set" => {
+            let (world, _) = open(Path::new(root), live)?;
+            emails::set(Path::new(aterm), &world, seed, row, column, value)?
+        }
+        [verb, aterm, root, digest, seconds] if verb == "emails-wait" => {
+            if !seconds.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(Fail::usage("emails-wait needs a whole number of seconds"));
+            }
+            let (world, _) = open(Path::new(root), live)?;
+            let (value, code) = emails::wait(
+                Path::new(aterm),
+                &world,
+                digest,
+                seconds.parse().map_err(fail)?,
+            )?;
+            emit(&value)?;
+            return Ok(code);
+        }
         _ => return Err(Fail::usage(USAGE)),
     };
     emit(&value)?;
@@ -499,6 +770,32 @@ pub fn cmd(args: &[String]) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_node_reporting_still_stops_the_owned_child() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let report = dir.path().join("started.json");
+        write_new(&report, b"already published").unwrap();
+        let (result, mut input) = {
+            let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+            let mut owned = OwnedNode(
+                aterm_uds::spawnfd::command(cat)
+                    .stdin(aterm_uds::spawnfd::Stdio::piped())
+                    .stdout(aterm_uds::spawnfd::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let input = aterm_uds::deadline::cat_echoes(&mut owned.0);
+            (write_new(&report, b"replacement"), input)
+        };
+        assert!(result.is_err(), "the phase publication must fail");
+        assert!(
+            input.write_all(b"still running?\n").is_err(),
+            "the child must be stopped even though its stdin remains held"
+        );
+        assert_eq!(std::fs::read(&report).unwrap(), b"already published");
+    }
 
     #[test]
     fn database_cli_refuses_authority_and_arbitrary_commands_before_launch() {
@@ -558,10 +855,11 @@ mod tests {
         let synthetic = parent.path().join("synthetic");
         let source = parent.path().join("source");
         let pending = prepare_recipient(&synthetic).unwrap();
-        let prepared = prepare_source(&source, pending["recipient"].as_str().unwrap()).unwrap();
+        let prepared =
+            prepare_source(&source, &[pending["recipient"].as_str().unwrap().into()]).unwrap();
         join_recipient(
             &synthetic,
-            &aterm_json::to_vec(&prepared["capsule"]).unwrap(),
+            &aterm_json::to_vec(&prepared["capsules"][0]).unwrap(),
         )
         .unwrap();
         assert!(
@@ -614,8 +912,9 @@ mod tests {
         let recipient = parent.path().join("recipient");
         let source = parent.path().join("source");
         let pending = prepare_recipient(&recipient).unwrap();
-        let prepared = prepare_source(&source, pending["recipient"].as_str().unwrap()).unwrap();
-        let capsule = aterm_json::to_vec(&prepared["capsule"]).unwrap();
+        let prepared =
+            prepare_source(&source, &[pending["recipient"].as_str().unwrap().into()]).unwrap();
+        let capsule = aterm_json::to_vec(&prepared["capsules"][0]).unwrap();
         let wrong = parent.path().join("wrong-recipient");
         prepare_recipient(&wrong).unwrap();
         assert!(join_recipient(&wrong, &capsule).is_err());
@@ -636,5 +935,28 @@ mod tests {
             recipient_key(&Paths::for_home(&recipient.join("home"))).unwrap(),
             pending["recipient"].as_str().unwrap()
         );
+    }
+
+    #[test]
+    fn startup_observer_cannot_recreate_missing_custody() {
+        let parent = crate::instance::world_parent();
+        let recipient = parent.path().join("recipient");
+        let source = parent.path().join("source");
+        let pending = prepare_recipient(&recipient).unwrap();
+        prepare_source(&source, &[pending["recipient"].as_str().unwrap().into()]).unwrap();
+        let paths = Paths::for_home(&source.join("home"));
+        drop(Bootstrap::required(&paths).unwrap());
+        assert!(observed_admission(&paths, Instant::now() + HANG));
+        let lock = paths.dir.join("commons.lock");
+        std::fs::remove_file(&lock).unwrap();
+
+        assert!(!observed_admission(&paths, Instant::now() + HANG));
+        assert!(!lock.exists(), "observing startup must not prepare custody");
+
+        // The old probe is the negative control: merely asking it to read the
+        // same prepared source recreates the missing custody lock.
+        drop(Bootstrap::required(&paths).unwrap());
+        assert!(lock.exists());
+        assert!(observed_admission(&paths, Instant::now() + HANG));
     }
 }

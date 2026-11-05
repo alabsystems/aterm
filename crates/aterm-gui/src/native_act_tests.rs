@@ -10,11 +10,21 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Barrier, mpsc};
 
 #[cfg(unix)]
+#[path = "native_deferred_restart_tests.rs"]
+mod deferred_restart;
+#[cfg(unix)]
 #[path = "native_restart_slots_tests.rs"]
 mod restart_slots;
 
 #[path = "native_closed_restart_tests.rs"]
 mod closed_restart;
+#[path = "native_closed_restart_model_tests.rs"]
+mod closed_restart_model;
+#[path = "native_continuation_phase_tests.rs"]
+mod continuation_phase;
+
+#[path = "native_account_continuation_tests.rs"]
+mod account_continuation_tests;
 #[cfg(unix)]
 #[path = "native_resume_only_tests.rs"]
 mod resume_only;
@@ -25,15 +35,71 @@ mod initial_cancel;
 #[path = "native_constructor_capability_tests.rs"]
 mod constructor_capabilities;
 
+#[cfg(unix)]
+#[path = "native_account_execution_tests.rs"]
+mod account_execution;
+#[cfg(unix)]
+#[path = "native_issuer_tests.rs"]
+mod issuer;
+#[cfg(unix)]
+#[path = "native_publication_tests.rs"]
+mod publication;
+#[cfg(unix)]
+#[path = "native_receipt_tests.rs"]
+mod receipts;
+
 const PATIENCE: Duration = Duration::from_secs(60);
 
 type PublicationGate = (mpsc::SyncSender<()>, Arc<(Mutex<bool>, std::sync::Condvar)>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JournalEvent {
+    Prepare,
+    MayExecute,
+    NoExec,
+    Seal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JournalState {
+    Prepared,
+    MayExecute,
+    NoExec,
+    Sealed,
+}
+
+struct JournalEntry {
+    prepare: Prepare,
+    binding: Binding,
+    state: JournalState,
+    predecessor: Option<String>,
+    successor: Option<String>,
+}
+
 struct Facts {
+    #[cfg(unix)]
+    native_journal: Option<aterm_agent::harness::native_receipts::testing::Journal>,
+    journal: Mutex<BTreeMap<String, JournalEntry>>,
+    prepared_history: Mutex<Vec<(Prepare, Binding)>>,
+    prepare_journal_allowed: AtomicBool,
+    prepare_journal_ack: AtomicBool,
+    prepare_journal_panic: AtomicBool,
+    prepare_journal_gate: Option<PublicationGate>,
+    grant_journal_allowed: AtomicBool,
+    grant_journal_gate: Option<PublicationGate>,
+    grant_journal_calls: AtomicU32,
+    sealed_history: Mutex<Vec<(Prepare, Binding)>>,
+    seal_journal_allowed: AtomicBool,
+    receipt_allowed: AtomicBool,
+    receipt_readable: AtomicBool,
+    historical_pin_probe: Option<(std::sync::Weak<crate::SessionCtx>, Arc<AtomicBool>)>,
+    receipt_history: Mutex<Vec<(Prepare, Binding)>>,
+    receipt_gate: Option<PublicationGate>,
     processes: Arc<Mutex<BTreeMap<u32, Process>>>,
     foreground: AtomicU32,
     signals: AtomicU32,
     constructors: AtomicBool,
+    account_allowed: AtomicBool,
     reservation: Option<(Arc<Barrier>, Arc<Barrier>)>,
     completion: Option<(Arc<Barrier>, Arc<Barrier>)>,
     completion_seen: AtomicBool,
@@ -50,11 +116,96 @@ struct Facts {
 }
 
 impl Facts {
+    /// The host double rejects the same illegal transitions as the real issuer
+    /// journal. History vectors are observations, not permission to advance.
+    fn journal_event(
+        &self,
+        prepare: &Prepare,
+        binding: &Binding,
+        event: JournalEvent,
+    ) -> Option<bool> {
+        let mut journal = self.journal.lock().unwrap();
+        let previous = journal.get(&prepare.id);
+        if previous.is_some_and(|old| old.prepare != *prepare || old.binding != *binding) {
+            return None;
+        }
+        let prior = previous.map(|old| old.state);
+        let predecessor = previous.and_then(|old| old.predecessor.clone());
+        let successor = previous.and_then(|old| old.successor.clone());
+        let state = match (prior, event) {
+            (None, JournalEvent::Prepare) => JournalState::Prepared,
+            (Some(JournalState::Prepared), JournalEvent::Prepare)
+            | (Some(JournalState::MayExecute), JournalEvent::MayExecute)
+            | (Some(JournalState::NoExec), JournalEvent::NoExec)
+            | (Some(JournalState::Sealed | JournalState::NoExec), JournalEvent::Seal) => {
+                return Some(false);
+            }
+            (Some(JournalState::Prepared), JournalEvent::MayExecute) => JournalState::MayExecute,
+            (Some(JournalState::Prepared), JournalEvent::NoExec) => JournalState::NoExec,
+            (Some(JournalState::Prepared | JournalState::MayExecute), JournalEvent::Seal) => {
+                JournalState::Sealed
+            }
+            _ => return None,
+        };
+        journal.insert(
+            prepare.id.clone(),
+            JournalEntry {
+                prepare: prepare.clone(),
+                binding: binding.clone(),
+                state,
+                predecessor,
+                successor,
+            },
+        );
+        Some(true)
+    }
+
+    fn prepare_record_allowed(&self) -> bool {
+        if let Some((entered, proceed)) = &self.prepare_journal_gate {
+            entered.send(()).unwrap();
+            let (lock, ready) = &**proceed;
+            let (guard, waited) = ready
+                .wait_timeout_while(lock.lock().unwrap(), PATIENCE, |go| !*go)
+                .unwrap();
+            assert!(
+                *guard && !waited.timed_out(),
+                "prepare journal worker was not released"
+            );
+        }
+        self.prepare_journal_allowed.load(Ordering::SeqCst)
+    }
+
+    fn prepare_record_acknowledged(&self) -> bool {
+        assert!(
+            !self.prepare_journal_panic.load(Ordering::SeqCst),
+            "injected panic after a committed preparation"
+        );
+        self.prepare_journal_ack.load(Ordering::SeqCst)
+    }
+
     fn new() -> Self {
         let actor = process(4242, 1, 4242, 400, 2);
         // A separate child session/group is legal for a supervisor's inner PTY.
         let child = process(500, 4242, 500, 500, 3);
         Self {
+            #[cfg(unix)]
+            native_journal: None,
+            journal: Mutex::new(BTreeMap::new()),
+            prepared_history: Mutex::new(Vec::new()),
+            prepare_journal_allowed: AtomicBool::new(true),
+            prepare_journal_ack: AtomicBool::new(true),
+            prepare_journal_panic: AtomicBool::new(false),
+            prepare_journal_gate: None,
+            grant_journal_allowed: AtomicBool::new(true),
+            grant_journal_gate: None,
+            grant_journal_calls: AtomicU32::new(0),
+            sealed_history: Mutex::new(Vec::new()),
+            seal_journal_allowed: AtomicBool::new(true),
+            receipt_allowed: AtomicBool::new(true),
+            receipt_readable: AtomicBool::new(true),
+            historical_pin_probe: None,
+            receipt_history: Mutex::new(Vec::new()),
+            receipt_gate: None,
             processes: Arc::new(Mutex::new(BTreeMap::from([
                 (actor.pid, actor),
                 (child.pid, child),
@@ -63,6 +214,7 @@ impl Facts {
             foreground: AtomicU32::new(4242),
             signals: AtomicU32::new(0),
             constructors: AtomicBool::new(true),
+            account_allowed: AtomicBool::new(true),
             reservation: None,
             completion: None,
             completion_seen: AtomicBool::new(false),
@@ -87,6 +239,249 @@ impl Facts {
 }
 
 impl Kernel for Facts {
+    fn account_admission(
+        &self,
+        _: &aterm_agent::harness::accounts_pool::ExecutionIntent,
+    ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
+        self.account_allowed
+            .load(Ordering::SeqCst)
+            .then_some(None)
+            .ok_or(())
+    }
+    fn record_successor(
+        &self,
+        predecessor: &Prepare,
+        predecessor_binding: &Binding,
+        prepare: &Prepare,
+        binding: &Binding,
+    ) -> bool {
+        if !self.prepare_record_allowed() {
+            return false;
+        }
+        #[cfg(unix)]
+        if self.native_journal.as_ref().is_some_and(|journal| {
+            journal
+                .successor(predecessor, predecessor_binding, prepare, binding)
+                .is_err()
+        }) {
+            return false;
+        }
+        let mut journal = self.journal.lock().unwrap();
+        let Some(parent) = journal.get(&predecessor.id) else {
+            return false;
+        };
+        if parent.prepare != *predecessor
+            || parent.binding != *predecessor_binding
+            || parent.state != JournalState::NoExec
+            || predecessor.host_epoch != prepare.host_epoch
+            || predecessor.id == prepare.id
+        {
+            return false;
+        }
+        if let Some(old) = journal.get(&prepare.id) {
+            let exact = old.state == JournalState::Prepared
+                && old.prepare == *prepare
+                && old.binding == *binding
+                && old.predecessor.as_ref() == Some(&predecessor.id)
+                && parent.successor.as_ref() == Some(&prepare.id);
+            drop(journal);
+            return exact && self.prepare_record_acknowledged();
+        }
+        if parent.successor.is_some() {
+            return false;
+        }
+        journal.get_mut(&predecessor.id).unwrap().successor = Some(prepare.id.clone());
+        journal.insert(
+            prepare.id.clone(),
+            JournalEntry {
+                prepare: prepare.clone(),
+                binding: binding.clone(),
+                state: JournalState::Prepared,
+                predecessor: Some(predecessor.id.clone()),
+                successor: None,
+            },
+        );
+        drop(journal);
+        self.prepared_history
+            .lock()
+            .unwrap()
+            .push((prepare.clone(), binding.clone()));
+        self.prepare_record_acknowledged()
+    }
+    fn record_prepared(&self, prepare: &Prepare, binding: &Binding) -> bool {
+        if !self.prepare_record_allowed() {
+            return false;
+        }
+        #[cfg(unix)]
+        if self.native_journal.as_ref().is_some_and(|journal| {
+            journal
+                .record(
+                    prepare,
+                    binding,
+                    aterm_agent::harness::native_receipts::testing::Append::Prepare,
+                )
+                .is_err()
+        }) {
+            return false;
+        }
+        let Some(changed) = self.journal_event(prepare, binding, JournalEvent::Prepare) else {
+            return false;
+        };
+        if changed {
+            self.prepared_history
+                .lock()
+                .unwrap()
+                .push((prepare.clone(), binding.clone()));
+        }
+        self.prepare_record_acknowledged()
+    }
+    fn record_may_execute(&self, prepare: &Prepare, binding: &Binding) -> bool {
+        self.grant_journal_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some((entered, proceed)) = &self.grant_journal_gate {
+            entered.send(()).unwrap();
+            let (lock, ready) = &**proceed;
+            let (guard, waited) = ready
+                .wait_timeout_while(lock.lock().unwrap(), PATIENCE, |go| !*go)
+                .unwrap();
+            assert!(
+                *guard && !waited.timed_out(),
+                "grant journal worker was not released"
+            );
+        }
+        self.grant_journal_allowed.load(Ordering::SeqCst)
+            && self
+                .journal_event(prepare, binding, JournalEvent::MayExecute)
+                .is_some()
+    }
+    fn record_sealed(&self, prepare: &Prepare, binding: &Binding) -> bool {
+        if !self.seal_journal_allowed.load(Ordering::SeqCst) {
+            return false;
+        }
+        #[cfg(unix)]
+        if self.native_journal.as_ref().is_some_and(|journal| {
+            journal
+                .record(
+                    prepare,
+                    binding,
+                    aterm_agent::harness::native_receipts::testing::Append::Seal,
+                )
+                .is_err()
+        }) {
+            return false;
+        }
+        let Some(changed) = self.journal_event(prepare, binding, JournalEvent::Seal) else {
+            return false;
+        };
+        if changed {
+            self.sealed_history
+                .lock()
+                .unwrap()
+                .push((prepare.clone(), binding.clone()));
+        }
+        true
+    }
+    fn recorded_operation(&self, id: &str) -> Result<bool, ()> {
+        if !self.receipt_readable.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        Ok(self
+            .prepared_history
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(prepare, _)| prepare.id == id)
+            || self
+                .receipt_history
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(prepare, _)| prepare.id == id))
+    }
+    fn record_noexec(&self, prepare: &Prepare, binding: &Binding) -> bool {
+        if !self.receipt_allowed.load(Ordering::SeqCst) {
+            return false;
+        }
+        #[cfg(unix)]
+        if self.native_journal.as_ref().is_some_and(|journal| {
+            journal
+                .record(
+                    prepare,
+                    binding,
+                    aterm_agent::harness::native_receipts::testing::Append::NoExec,
+                )
+                .is_err()
+        }) {
+            return false;
+        }
+        if let Some((entered, proceed)) = &self.receipt_gate {
+            entered.send(()).unwrap();
+            let (lock, ready) = &**proceed;
+            let guard = lock.lock().unwrap();
+            let (guard, waited) = ready
+                .wait_timeout_while(guard, PATIENCE, |go| !*go)
+                .unwrap();
+            assert!(
+                *guard && !waited.timed_out(),
+                "receipt worker was not released"
+            );
+        }
+        let Some(changed) = self.journal_event(prepare, binding, JournalEvent::NoExec) else {
+            return false;
+        };
+        if changed {
+            self.receipt_history
+                .lock()
+                .unwrap()
+                .push((prepare.clone(), binding.clone()));
+        }
+        true
+    }
+    fn historical_noexec(&self, request: &Request) -> bool {
+        if let Some((ctx, probe)) = &self.historical_pin_probe {
+            let id = match request {
+                Request::Prepare(prepare) => &prepare.id,
+                Request::Query(binding) | Request::Reconcile(binding) => &binding.id,
+                _ => unreachable!(),
+            };
+            probe.store(
+                ctx.upgrade().is_some_and(|ctx| {
+                    ctx.fenced_writes
+                        .native
+                        .lock()
+                        .unwrap()
+                        .receipt_flights
+                        .get(id)
+                        .copied()
+                        .unwrap_or(0)
+                        > 0
+                }),
+                Ordering::SeqCst,
+            );
+        }
+        if !self.receipt_readable.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.receipt_history
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(prepare, binding)| match request {
+                Request::Prepare(actual) => actual.as_ref() == prepare,
+                Request::Query(actual) | Request::Reconcile(actual) => actual == binding,
+                _ => false,
+            })
+    }
+    fn account_execution(
+        &self,
+        _: &RestartCommand,
+        _: u32,
+        _: Option<&ColdEnvironmentFacts>,
+    ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
+        self.account_allowed
+            .load(Ordering::SeqCst)
+            .then_some(None)
+            .ok_or(())
+    }
     fn constructor_enabled(&self, _: Constructor) -> bool {
         self.constructors.load(Ordering::Acquire)
     }
@@ -214,6 +609,7 @@ fn image(inode: u64) -> Image {
 
 fn restart_command(inode: u64) -> RestartCommand {
     RestartCommand {
+        account_intent: None,
         image: image(inode),
         program: format!("/image-{inode}"),
         argv: vec!["--resume".into(), "captured-conversation".into()],
@@ -331,6 +727,7 @@ fn native_actual_admission_rejects_wrong_duty_revision_actor_connection_and_plan
     }
     let mut restart = original.clone();
     restart.plan = NativePlan::Restart {
+        cold: None,
         observation: None,
         process: facts.process(4242).unwrap(),
         shell: process(400, 1, 400, 400, 4),
@@ -345,6 +742,72 @@ fn native_actual_admission_rejects_wrong_duty_revision_actor_connection_and_plan
     );
     assert!(ctx.fenced_writes.native.lock().unwrap().by_id.is_empty());
     assert_eq!(facts.signals.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn sealed_cold_restart_admission_requires_builtin_relaunch_without_rollback() {
+    use aterm_agent::harness::native_act::{ColdBilling, ColdIntent};
+    for case in 0..4 {
+        let (handle, facts, mut request, mut actor) = closed_restart::fixture(7980 + case);
+        let NativePlan::Restart { cold, rollback, .. } = &mut request.plan else {
+            unreachable!();
+        };
+        *cold = Some(Box::new(ColdIntent {
+            login: None,
+            home: None,
+            auth_observed: false,
+            stored_login: true,
+            conversation: Some("captured-conversation".into()),
+            profile: None,
+            mode: aterm_agent::harness::accounts::Mode::Wall,
+            billing: ColdBilling::Keep,
+        }));
+        *rollback = None;
+        assert_eq!(request.plan.constructor(), Constructor::ColdRestart);
+        match case {
+            1 => actor.principal = Principal::Instance,
+            2 => {
+                let NativePlan::Restart { rollback, .. } = &mut request.plan else {
+                    unreachable!();
+                };
+                *rollback = Some(Box::new(restart_command(2)));
+            }
+            3 => request.duty = Scope::Upgrade,
+            _ => {}
+        }
+        let reply = run(
+            &handle.ctx,
+            &facts,
+            Request::prepare(request.clone()),
+            actor,
+        );
+        if case == 0 {
+            assert!(
+                matches!(Reply::parse(reply.trim_end()), Some(Reply::Admitted(_))),
+                "{reply}"
+            );
+            let table = handle.ctx.fenced_writes.native.lock().unwrap();
+            let operation = table.by_id.get(&request.id).unwrap().lock().unwrap();
+            assert_eq!(operation.request, request);
+        } else {
+            assert_eq!(reply, DENIED, "case {case}");
+            assert!(
+                handle
+                    .ctx
+                    .fenced_writes
+                    .native
+                    .lock()
+                    .unwrap()
+                    .by_id
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            facts.signals.load(Ordering::SeqCst),
+            0,
+            "prepare is not an effect"
+        );
+    }
 }
 
 #[test]
@@ -649,6 +1112,7 @@ fn private_constructor_executes_only_its_signal_and_retained_continuation() {
     request.expected_human_seq = Some(ctx.human_input.seq());
     request.duty = Scope::Relaunch;
     request.plan = NativePlan::Restart {
+        cold: None,
         observation: None,
         process: old,
         shell,

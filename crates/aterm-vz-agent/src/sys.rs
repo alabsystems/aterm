@@ -95,6 +95,31 @@ mod tests {
         assert!(!alive(u32::MAX));
         assert!(alive(std::process::id()));
     }
+
+    /// The declared `O_NOFOLLOW` is this architecture's: an open of a symlink with it
+    /// fails with `ELOOP` (40 on Linux), where the same open without it follows the link.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_declared_nofollow_refuses_a_symlink() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let open = |flags| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(flags)
+                .open(&link)
+        };
+        assert!(
+            open(O_NONBLOCK | O_CLOEXEC).is_ok(),
+            "the link itself opens"
+        );
+        let refused = open(O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(40), "{refused}");
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -133,6 +158,19 @@ mod linux {
     const MS_BIND: c_ulong = 4096;
     const MNT_DETACH: c_int = 2;
     const UMOUNT_NOFOLLOW: c_int = 8;
+
+    /// `open(2)`'s `O_NONBLOCK` (`<asm-generic/fcntl.h>`, the same on every 64-bit Linux).
+    pub const O_NONBLOCK: c_int = 0o4_000;
+    /// `open(2)`'s `O_CLOEXEC` (`<asm-generic/fcntl.h>`, the same on every 64-bit Linux).
+    pub const O_CLOEXEC: c_int = SOCK_CLOEXEC;
+    /// `open(2)`'s `O_NOFOLLOW`, which differs by architecture: arm64's `<asm/fcntl.h>`
+    /// moves it to 0o100000, and x86_64 keeps asm-generic's 0o400000. Another
+    /// architecture has no value here, so a build for it fails where the flag is used.
+    #[cfg(target_arch = "aarch64")]
+    pub const O_NOFOLLOW: c_int = 0o100_000;
+    /// `open(2)`'s `O_NOFOLLOW` on x86_64 (asm-generic's value).
+    #[cfg(target_arch = "x86_64")]
+    pub const O_NOFOLLOW: c_int = 0o400_000;
 
     /// Any CID: a listener's own.
     pub const VMADDR_CID_ANY: u32 = u32::MAX;

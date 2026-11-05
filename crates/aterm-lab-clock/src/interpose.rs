@@ -156,7 +156,10 @@ fn reread(file: &Path) -> bool {
     }) else {
         return false;
     };
-    if !f.metadata().is_ok_and(|m| m.is_file()) {
+    let Ok(fmeta) = f.metadata() else {
+        return false;
+    };
+    if !fmeta.is_file() || fmeta.size() > 64 {
         return false;
     }
     let mut n = 0;
@@ -174,11 +177,12 @@ fn reread(file: &Path) -> bool {
     let Some(off) = buf.get(..n).and_then(parse_offset) else {
         return false;
     };
+    let fsize = i64::try_from(fmeta.size()).unwrap_or(i64::MAX);
     OFF_NS.store(off, Ordering::Relaxed);
-    SEEN_INO.store(meta.ino(), Ordering::Relaxed);
-    SEEN_SIZE.store(size, Ordering::Relaxed);
-    SEEN_MTIME.store(meta.mtime(), Ordering::Relaxed);
-    SEEN_MTIME_NS.store(meta.mtime_nsec(), Ordering::Relaxed);
+    SEEN_INO.store(fmeta.ino(), Ordering::Relaxed);
+    SEEN_SIZE.store(fsize, Ordering::Relaxed);
+    SEEN_MTIME.store(fmeta.mtime(), Ordering::Relaxed);
+    SEEN_MTIME_NS.store(fmeta.mtime_nsec(), Ordering::Relaxed);
     FILE_READS.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -220,8 +224,23 @@ fn write_record(config: &Config) {
         Path::new(OsStr::from_bytes(path.bytes())),
         Path::new(OsStr::from_bytes(tmp.bytes())),
     );
-    if std::fs::write(tmp, body.bytes()).is_ok() {
+    let _ = std::fs::remove_file(tmp);
+    let wrote = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(0x0004 | 0x0100)
+            .open(tmp)
+    }
+    .and_then(|mut f| {
+        use std::io::Write as _;
+        f.write_all(body.bytes())
+    });
+    if wrote.is_ok() {
         let _ = std::fs::rename(tmp, path);
+    } else {
+        let _ = std::fs::remove_file(tmp);
     }
 }
 

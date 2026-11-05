@@ -119,14 +119,14 @@ impl Drop for Blowfish {
 
 /// Proton's fixed-cost bcrypt representation, including the $2y$ prefix.
 pub(super) fn hash(password: &[u8], salt: &[u8; 16]) -> String {
-    let mut key = zeroize::Zeroizing::new(password[..password.len().min(72)].to_vec());
-    if key.len() < 72 {
-        key.push(0);
-    }
+    let pw_len = password.len().min(72);
+    let mut key_buf = zeroize::Zeroizing::new([0u8; 72]);
+    key_buf[..pw_len].copy_from_slice(&password[..pw_len]);
+    let key = &key_buf[..(pw_len + 1).min(72)];
     let mut state = Blowfish::init_state();
-    state.salted_expand_key(salt, &key);
+    state.salted_expand_key(salt, key);
     for _ in 0..1024 {
-        state.expand_key(&key);
+        state.expand_key(key);
         state.expand_key(salt);
     }
     let mut words = [
@@ -142,15 +142,17 @@ pub(super) fn hash(password: &[u8], salt: &[u8; 16]) -> String {
     for (word, bytes) in words.iter().zip(result.as_chunks_mut::<4>().0.iter_mut()) {
         bytes.copy_from_slice(&word.to_be_bytes());
     }
-    let encoded = format!("$2y$10${}{}", encode(salt), encode(&result[..23]));
+    let mut encoded = String::with_capacity(60);
+    encoded.push_str("$2y$10$");
+    encode_into(salt, &mut encoded);
+    encode_into(&result[..23], &mut encoded);
     words.zeroize();
     result.zeroize();
     encoded
 }
 
-fn encode(input: &[u8]) -> String {
+fn encode_into(input: &[u8], output: &mut String) {
     const ALPHABET: &[u8] = b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut output = String::new();
     let mut bits = 0u32;
     let mut count = 0;
     for byte in input {
@@ -164,5 +166,4 @@ fn encode(input: &[u8]) -> String {
     if count > 0 {
         output.push(char::from(ALPHABET[((bits << (6 - count)) & 63) as usize]));
     }
-    output
 }

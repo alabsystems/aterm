@@ -110,7 +110,12 @@ impl Pool {
 
     /// `text` as the `aterm.toml` beside the rosters.
     fn config(&self, text: &str) {
-        std::fs::write(self.env.config.as_deref().expect("aterm.toml"), text).expect("aterm.toml");
+        aterm_uds::atomic_file::write(
+            self.env.config.as_deref().expect("aterm.toml"),
+            text.as_bytes(),
+            0o600,
+        )
+        .expect("aterm.toml");
     }
 
     /// Codex's login kept in the OS keyring (`cli_auth_credentials_store` in its default home's
@@ -2580,7 +2585,15 @@ impl crate::harness::codex_rotation::UsageReader for LawReader {
         _: Option<&str>,
         now: i64,
         _: Duration,
+        use_token: crate::harness::provider_read::Use,
     ) -> Option<crate::harness::codex_app_login::IdentifiedUsage> {
+        use_token
+            .begin_home(
+                crate::harness::provider_read::Read::CodexEndpoint,
+                path,
+                now,
+            )
+            .ok()?;
         let (account, spent) = self.answers.get(path)?;
         let usage = crate::harness::codex_app_login::usage_from_backend(
             &aterm_json::json!({
@@ -2933,19 +2946,13 @@ impl Pool {
     /// What `aterm ai review` and the doctor say of a launch on the records as they stand: the
     /// review runs under the row `decided` names, on this machine's own login where it names none,
     /// and runs nothing where it is refused; the doctor's row says it is refused just then.
-    fn law_fact(&self, host: &LawHost) -> crate::ai::facts::Facts {
+    fn law_fact(&self) -> crate::ai::facts::Facts {
         let (cli, now) = (self.cli, self.env.now);
         let home = self.env.home.clone().expect("a home");
         let shown = home.display().to_string();
         let var = move |name: &str| (name == "HOME").then(|| shown.clone());
         // The Codex a launch runs, which the facts read from atpkg's layout.
         let prefix = self.tmp.path().join("pkg");
-        std::fs::create_dir_all(prefix.join("agents")).expect("atpkg's agents");
-        std::fs::write(
-            prefix.join("agents/codex"),
-            crate::harness::codex_alab::twin_text(&host.program),
-        )
-        .expect("atpkg's launcher");
         // One mode for every pool, as `aterm ai` reads it, unless a switch turns one pool off.
         let (policy, _) = SupervisorConfig::from_path(self.env.config.as_deref());
         let accounts_mode = [Cli::Codex, Cli::Grok, Cli::Kimi]
@@ -2967,15 +2974,22 @@ impl Pool {
         crate::ai::facts::gather(&machine, cli.connector())
     }
 
+    /// The Codex a launch runs, the one `host`'s build names, in atpkg's layout where
+    /// [`Self::law_fact`] reads it.
+    fn lay_launcher(&self, host: &LawHost) {
+        let agents = self.tmp.path().join("pkg/agents");
+        std::fs::create_dir_all(&agents).expect("atpkg's agents");
+        std::fs::write(
+            agents.join("codex"),
+            crate::harness::codex_alab::twin_text(&host.program),
+        )
+        .expect("atpkg's launcher");
+    }
+
     /// Whether the doctor and a review agree with what `launch_now` decided.
-    fn law_review(
-        &self,
-        host: &LawHost,
-        decided: &LawSays,
-        records: &accounts::AccountRecords,
-    ) -> Vec<String> {
+    fn law_review(&self, decided: &LawSays, records: &accounts::AccountRecords) -> Vec<String> {
         let now = self.env.now;
-        let mut fact = self.law_fact(host);
+        let mut fact = self.law_fact();
         let doctor = fact
             .login_pool()
             .is_some_and(|pool| pool.launch_refused.is_some());
@@ -3319,7 +3333,7 @@ impl Pool {
         // The launch below writes its claim, so what reads the records as they stand comes first.
         // The records `use` leaves are shapes the laid worlds hold too, so a review reads those.
         if as_laid {
-            wrong.extend(self.law_review(host, &decided, &records));
+            wrong.extend(self.law_review(&decided, &records));
         }
         let unread = |_: Cli, _: &Path, _: Option<&str>, _: i64| None;
         let env_says = match crate::harness::accounts_pool::launch_env_for(
@@ -3356,7 +3370,21 @@ impl Pool {
 /// decides nothing. The switches that turn rotation off for a whole harness or one agent cross with
 /// fewer, since they read off what `accounts = "off"` does, as Codex's login in the OS keyring does.
 /// On a build that is not there `use` says so and the report names no row whatever the records say,
-/// and no launch is judged, so it takes a few pairs and no claim.
+/// and [`Pool::law_disagreements`] judges no launch, so it takes one usable pair and one with no
+/// login, each with no pin under rotation on and with one under `accounts = "off"`, and no claim.
+/// `every_step_a_surface_names_can_be_taken` reads these worlds too, and does read a launch's refusal
+/// there. On a Codex that is not there a pin on a row of its own draws one, by a path of its own
+/// under each of rotation on and `accounts = "off"` (`accounts_pool::refused_pin`), that names
+/// `accounts use main`, so Codex's usable pair also takes a pin on `work` under each. Only Codex has
+/// that refusal (`accounts_pool::default_only`), and that pin makes no surface of Grok's or Kimi's
+/// name anything more.
+///
+/// A claim crosses those pairs and every hold on the two Codex builds there, and on Grok and Kimi
+/// only the pair where both rows can serve, since `launch_now` and what a claim decides read no
+/// CLI past the default-only gate these builds do not take. THE GAP: a defect in Grok's or Kimi's
+/// claims away from that pair goes unseen; and those two share an arm Codex does not take (no
+/// contextual auth, and claims that apply to Claude and Codex alone), so a defect in it that a
+/// claim away from that pair shows is seen by no build.
 fn law_worlds(build: LawBuild) -> Vec<LawWorld> {
     use LawLogin::{Displaced, Low, Moved, NotEnrolled, SignedOut, Usable, Walled, WeeklyWalled};
     const LOGINS: [LawLogin; 4] = [Usable, SignedOut, NotEnrolled, Walled];
@@ -3399,19 +3427,34 @@ fn law_worlds(build: LawBuild) -> Vec<LawWorld> {
             .chain([None])
             .map(move |work| (main, work))
     });
-    let a_few_pairs = [
-        (Usable, Some(Usable)),
-        (SignedOut, Some(Usable)),
-        (Walled, Some(Walled)),
-        (NotEnrolled, None),
-        (Usable, None),
-    ];
-    let pairs: Vec<_> = if build.missing() {
-        a_few_pairs.to_vec()
-    } else {
-        every_pair.collect()
-    };
-    for logins in pairs {
+    if build.missing() {
+        for logins in [(Usable, Some(Usable)), (NotEnrolled, None)] {
+            worlds.push(world(
+                logins,
+                LawHold::None,
+                LawClaim::None,
+                LawRotation::On,
+            ));
+            worlds.push(world(
+                logins,
+                LawHold::Pin("main"),
+                LawClaim::None,
+                LawRotation::AccountsOff,
+            ));
+        }
+        if build.cli() == Cli::Codex {
+            for rotation in [LawRotation::On, LawRotation::AccountsOff] {
+                worlds.push(world(
+                    (Usable, Some(Usable)),
+                    LawHold::Pin("work"),
+                    LawClaim::None,
+                    rotation,
+                ));
+            }
+        }
+        return worlds;
+    }
+    for logins in every_pair {
         for hold in HOLDS {
             worlds.push(world(logins, hold, LawClaim::None, LawRotation::On));
         }
@@ -3424,10 +3467,10 @@ fn law_worlds(build: LawBuild) -> Vec<LawWorld> {
             ));
         }
     }
-    if build.missing() {
-        return worlds;
-    }
     for logins in CLAIMED {
+        if build.cli() != Cli::Codex && logins != (Usable, Some(Usable)) {
+            continue;
+        }
         let claims = CLAIMS.into_iter().filter(|claim| {
             logins.1.is_some()
                 || !matches!(
@@ -3519,6 +3562,7 @@ fn law_worlds(build: LawBuild) -> Vec<LawWorld> {
 fn law_share(build: LawBuild, share: &[LawWorld]) -> (usize, Vec<(String, String)>) {
     let pool = Pool::of(build.cli(), "launch-law");
     let host = build.program(&pool);
+    pool.lay_launcher(&host);
     let mut wrong = Vec::new();
     for world in share {
         let mut say = |what: &str, found: Vec<String>| {
@@ -3629,7 +3673,7 @@ fn law_share(build: LawBuild, share: &[LawWorld]) -> (usize, Vec<(String, String
 /// refused-ness, never words. No world spawns anything. Claude Code is outside this law: it has no
 /// `launch_now` (a Claude session starts on the login it is started with, and its moves are the
 /// supervisor's), and its `next:` has its own tests. A launch and a sign-in share one program here
-/// ([`LawHost`]).
+/// ([`LawHost`]). What Grok and Kimi cross a claim with, and the gap that leaves, is [`law_worlds`]'s.
 #[test]
 fn the_launch_surfaces_agree_and_no_launch_does_what_it_must_refuse() {
     let builds = [
@@ -3672,7 +3716,8 @@ fn the_launch_surfaces_agree_and_no_launch_does_what_it_must_refuse() {
          {count} disagreements, {:?}",
         started.elapsed()
     );
-    // The matrix's size, so a build or a share that quietly runs nothing is a failure.
+    // The matrix's size, to the world the code builds, so a build or a share that quietly runs
+    // nothing is a failure: a build that is not there is only four or six of them.
     let matrix: usize = builds
         .into_iter()
         .filter(|build| links_here(build.cli()))
@@ -3680,7 +3725,7 @@ fn the_launch_surfaces_agree_and_no_launch_does_what_it_must_refuse() {
         .sum();
     assert_eq!(worlds, matrix, "every world of the matrix runs");
     if builds.iter().all(|build| links_here(build.cli())) {
-        assert!(matrix >= 1994, "the matrix shrank: {matrix} worlds");
+        assert!(matrix >= 1544, "the matrix shrank: {matrix} worlds");
     }
     assert_eq!(
         count,
@@ -3744,6 +3789,7 @@ impl Pool {
                 roster_path: &path,
                 own_dir: row.dir.as_deref(),
                 codex_program: None,
+                sign_in: crate::harness::sign_in_ladder::asked_fixture(self.cli, label),
             },
             self.env.now,
             "login",
@@ -3762,13 +3808,16 @@ impl Pool {
     }
 }
 
-/// A ROSTER OF THIS MACHINE'S OWN LOGIN ALONE, AT ITS WALL, IS WHERE A LAUNCH RUNS, SO THE REPORT
-/// NAMES IT AND WAITS FOR NOTHING: `next.to` is `main`, with what stands on it in `to_note`, and
-/// `main` is not under `not next`, as `launch_env_for` starts at once on the login it carries.
-/// CONTROL: the owner's pin on the walled row: report and launch name the row, and nothing is said
-/// to stand on it, since the owner asked for it.
+/// A ROSTER OF THIS MACHINE'S OWN LOGIN ALONE IS WHERE A LAUNCH RUNS UNTIL A WALL STANDS ON IT.
+/// Free, the report names it and nothing waits, as `launch_env_for` starts at once on the login it
+/// carries. At its wall a Codex worker sent there would only show that wall, so the launch is
+/// refused and held as any pool's is: `next` waits until the wall ends, and `main` is under `not
+/// next`. Another CLI's launch reads no row, so it could only wait a wall out on its record: it
+/// still runs as it is, and `next` says what stands on it. CONTROL: the owner's pin on the walled
+/// row: report and launch name the row, and nothing is said to stand on it, since the owner asked
+/// for it.
 #[test]
-fn a_lone_default_row_at_its_wall_is_next_as_a_launch_runs_on_it() {
+fn a_lone_default_row_at_its_wall_waits_as_a_launch_holds_for_it() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
         if !links_here(cli) {
             continue;
@@ -3777,16 +3826,36 @@ fn a_lone_default_row_at_its_wall_is_next_as_a_launch_runs_on_it() {
         let pool = Pool::of(cli, "lone-wall");
         let main = pool.roster().row("main").expect("main").clone();
         pool.rows(&[main]);
-        pool.wall("main", pool.env.now + 7200);
         let program = (cli == Cli::Codex).then(|| pool.new.clone());
+        let (_, free) = pool.report(program.as_deref());
+        assert_eq!(free["next"]["to"].as_str(), Some("main"), "{at}: {free}");
+        assert_eq!(free["next"]["wait_until"], Value::Null, "{at}: {free}");
+        assert_eq!(pool.launch_on(program.as_deref()), Ok(None), "{at}");
+
+        pool.wall("main", pool.env.now + 7200);
         let (text, doc) = pool.report(program.as_deref());
         let next = &doc["next"];
-        assert_eq!(next["to"].as_str(), Some("main"), "{at}: {doc}");
-        assert_eq!(next["wait_until"], Value::Null, "{at}: {doc}");
-        let note = next["to_note"].as_str().expect("what stands on the row");
-        assert_eq!(next_line(&text), format!("next: main ({note})"), "{at}");
-        assert!(!not_next_json(&doc).contains_key("main"), "{at}: {doc}");
-        assert_eq!(pool.launch_on(program.as_deref()), Ok(None), "{at}");
+        if cli == Cli::Codex {
+            assert_eq!(next["to"], Value::Null, "{at}: {doc}");
+            assert!(!next["wait_until"].is_null(), "{at}: {doc}");
+            assert!(
+                next_line(&text).starts_with("next: wait until"),
+                "{at}: {text}"
+            );
+            assert!(not_next_json(&doc).contains_key("main"), "{at}: {doc}");
+            let refused = pool.launch_on(program.as_deref()).expect_err("walled");
+            assert!(refused.contains("no usable account"), "{at}: {refused}");
+        } else {
+            assert_eq!(next["to"].as_str(), Some("main"), "{at}: {doc}");
+            assert_eq!(next["wait_until"], Value::Null, "{at}: {doc}");
+            assert!(
+                next["to_note"]
+                    .as_str()
+                    .is_some_and(|note| note.contains("limited until")),
+                "{at}: {doc}"
+            );
+            assert_eq!(pool.launch_on(program.as_deref()), Ok(None), "{at}");
+        }
 
         pool.pin("main");
         let (_, doc) = pool.report(program.as_deref());
@@ -4481,13 +4550,18 @@ fn use_and_the_report_say_one_thing_of_a_running_session() {
     }
 }
 
-/// aterm SAYS IT SIGNS A ROW IN BY ITSELF ONLY WHERE IT DOES: not under `[harness] logins = "off"`,
-/// which keeps that off and is named, and not with the CLI not there, whose install leads, on the
-/// `not next:` line and on Grok Build's `sign-in needed:` (Codex's too: aterm's browser sign-in runs
-/// in process, and what it signs in runs nothing until Codex is there). CONTROL: with neither, Kimi
-/// Code CLI's and Codex's rows say it, the sign-in they name there too.
+/// A ROW NO SESSION HERE RUNS ON IS TOLD IT WAITS FOR ITS SIGN-IN ONLY WHERE THAT SIGN-IN HAS A ROUTE:
+/// not under `[harness] logins = "off"`, which keeps that off and is named, and not with the CLI not
+/// there, whose install leads, on the `not next:` line and on Grok Build's `sign-in needed:` (Codex's
+/// too: aterm's browser sign-in runs in process, and what it signs in runs nothing until Codex is
+/// there). A Kimi Code CLI row says it only while its ledger's last word on its browser is a window
+/// a person signed in: not on a profile directory a stopped attempt made, another row's window, or
+/// after a later attempt stopped for a person, where it names the step that gives it a route.
+/// Nothing here promises a sign-in by itself: `claudes_report_says_by_itself_only_where_a_session_runs_on_it`
+/// holds that promise to a session. CONTROL: with neither switch nor absence, Kimi Code CLI's row
+/// with that window and Codex's say it, the sign-in they name there too.
 #[test]
-fn aterm_says_it_signs_a_row_in_by_itself_only_where_it_does() {
+fn a_row_nobody_runs_on_waits_only_where_its_sign_in_has_a_route() {
     let line = |text: &str, start: &str| -> String {
         text.lines()
             .find(|line| line.trim_start().starts_with(start))
@@ -4506,23 +4580,94 @@ fn aterm_says_it_signs_a_row_in_by_itself_only_where_it_does() {
         pool.no_work_login();
         pool.change_row("work", |row| row.email = Some("work@example.com".into()));
         let renew = format!("aterm harness accounts renew work --cli {at}");
+        if cli == Cli::Kimi {
+            let no_route = |why: &str| {
+                let (text, _) = pool.report_on(&build.program(&pool));
+                let said = line(&text, "not next:");
+                assert!(!said.contains("waits for"), "{why}: {text}");
+                assert!(
+                    said.contains("aterm harness accounts browser work --cli kimi"),
+                    "{why}: {text}"
+                );
+            };
+            no_route("nothing on record");
+            let store = pool.env.accounts_store_for(cli).unwrap();
+            let shared = store.shared_dir();
+            std::fs::create_dir_all(crate::harness::headless_oauth::row_browser_profile(
+                cli,
+                &shared,
+                &shared,
+                "work",
+                Some("work@example.com"),
+            ))
+            .unwrap();
+            no_route("a directory an attempt made");
+            let sign_in = |label, at, why: &str| {
+                accounts::Event::new(at, accounts::Kind::SignIn, label).because(why)
+            };
+            let window = "www.kimi.ai window done session-kept";
+            let now = pool.env.now;
+            store.save(&accounts::State::default()).unwrap();
+            store.append(&[sign_in("main", now - 3, window)]).unwrap();
+            no_route("another row's window");
+            store
+                .append(&[
+                    sign_in("work", now - 2, window),
+                    sign_in("work", now - 1, "www.kimi.ai device needs-you"),
+                ])
+                .unwrap();
+            no_route("an attempt that stopped for a person since");
+            store.append(&[sign_in("work", now, window)]).unwrap();
+        }
         let (text, _) = pool.report_on(&build.program(&pool));
         let said = line(&text, "not next:");
         assert!(
-            said.contains("by itself") && said.contains(&renew),
+            said.contains("waits for") && said.contains(&renew) && !said.contains("by itself"),
             "CONTROL: {at}: {text}"
         );
+        {
+            let store = pool.env.accounts_store_for(cli).unwrap();
+            if cli == Cli::Codex {
+                store.save(&accounts::State::default()).unwrap();
+            }
+            let roster = pool.env.accounts_roster_for(cli).unwrap();
+            let sign_in = |at, why: &str| {
+                store
+                    .transact_pool_logins_within(&[], &roster, at, &mut None, |_, _, logins| {
+                        accounts::admit_workflow(logins, "work")?;
+                        Ok(vec![
+                            accounts::Event::new(at, accounts::Kind::SignIn, "work").because(why),
+                        ])
+                    })
+                    .unwrap();
+            };
+            let now = pool.env.now + 10;
+            sign_in(now - 1, "auth.vendor.example browser bot-check");
+            let (text, _) = pool.report_on(&build.program(&pool));
+            let said = line(&text, "not next:");
+            assert!(
+                !said.contains("waits for"),
+                "{at}: a bot check on record: {text}"
+            );
+            assert!(said.contains("accounts browser work"), "{at}: {text}");
+            sign_in(now, "auth.vendor.example window done session-kept");
+            let (text, _) = pool.report_on(&build.program(&pool));
+            assert!(
+                line(&text, "not next:").contains("waits for"),
+                "CONTROL: a signed-in window since: {text}"
+            );
+        }
         pool.config("[harness]\nlogins = \"off\"\n");
         let (text, _) = pool.report_on(&build.program(&pool));
         let said = line(&text, "not next:");
-        assert!(!said.contains("by itself"), "{at}: logins off: {text}");
+        assert!(!said.contains("waits for"), "{at}: logins off: {text}");
         assert!(said.contains("logins"), "{at}: names the switch: {text}");
         assert!(said.contains(&renew), "{at}: logins off: {text}");
         pool.config("");
         let (text, _) = pool.report_on(&gone.program(&pool));
         let said = line(&text, "not next:");
         assert_eq!(
-            said.contains("by itself"),
+            said.contains("waits for"),
             !needs_program,
             "{at}: no program: {text}"
         );
@@ -4553,11 +4698,12 @@ fn aterm_says_it_signs_a_row_in_by_itself_only_where_it_does() {
     }
 }
 
-/// CLAUDE CODE'S REPORT SAYS aterm SIGNS A ROW IN BY ITSELF ONLY WHERE A ROUTE DOES IT WITH NOBODY AT
-/// THIS MAC, AS `aterm ai status` SAYS: a row signed out, with no mailbox and no profile, names the
-/// browser step that gives it one. CONTROL: with a mailbox configured, it says it.
+/// CLAUDE CODE'S REPORT SAYS aterm SIGNS A ROW IN BY ITSELF ONLY WHERE A SESSION HERE RUNS ON IT AND A
+/// ROUTE DOES IT WITH NOBODY AT THIS MAC (`DESIGN-alab-one-mesh-2026-11-05` §4.15): a row signed out,
+/// with no mailbox and no profile, names the browser step that gives it one; with a mailbox and no
+/// session on it, it waits for its sign-in, a person's. CONTROL: with a session on it, it says it.
 #[test]
-fn claudes_report_says_by_itself_only_where_a_route_does_it() {
+fn claudes_report_says_by_itself_only_where_a_session_runs_on_it() {
     let tmp = tmp_dir("claude-route");
     let mut env = env_at(&tmp);
     env.sock = None;
@@ -4598,7 +4744,21 @@ fn claudes_report_says_by_itself_only_where_a_route_does_it() {
     )
     .expect("a mailbox");
     let said = not_next(&env);
-    assert!(said.contains("by itself"), "CONTROL: a mailbox: {said}");
+    assert!(!said.contains("by itself"), "no session on it: {said}");
+    assert!(
+        said.contains("waits for `aterm harness accounts renew work`"),
+        "no session on it: {said}"
+    );
+    store
+        .transact(env.now, &mut None, |state| {
+            Ok(accounts::note_session(
+                state, "s-work", "work", None, env.now,
+            ))
+        })
+        .expect("a session on the row");
+    let said = not_next(&env);
+    assert!(said.contains("by itself"), "CONTROL: a session: {said}");
+    assert!(!said.contains("waits for"), "CONTROL: a session: {said}");
 }
 
 /// `accounts login` WITH NO TERMINAL SAYS WHAT A TERMINAL WOULD NOT MEND FIRST: a program that is not

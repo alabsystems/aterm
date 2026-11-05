@@ -372,14 +372,17 @@ fn under_work(mut screen: Vec<String>, work: &str) -> Vec<String> {
 /// the screen shows none of it. The phase reads a question or a limit's notice there (the notice
 /// and the question are read before the soft busy of the work), but a restart in place would end
 /// the work, which no process row names for an agent of its own process: the line is held `not at
-/// rest` at every due while the work runs, the host is asked for no restart, and the resumed turn
-/// settles the line. A monitor the done row names at that limit, under the progress row of a
-/// workflow that ended (which Claude Code leaves drawn at its full bar, ahead of the monitor in the
-/// screen reader's first rule), is held the same. Before, the rest took any question or limit's
-/// phase as rest: the host was asked `restart:input-lost` over the running work; and the monitor
-/// under that progress row read as no work, the restart asked over it. Negative control by
-/// mutation: the background work dropped from [`Session::custody_at_rest`]: a restart asked in
-/// each case.
+/// rest` at every due while the work runs (each hold the journal records after the one that formed
+/// the custody says so; a record is written at each change of what holds the line), the host is
+/// asked for no restart, and the next turn settles the line (`went with a turn`, and by nothing
+/// else). A monitor the done row names at that limit, under the progress row of a workflow that
+/// ended (which Claude Code leaves drawn at its full bar, ahead of the monitor in the screen
+/// reader's first rule), is held the same. Before, the rest took any question or limit's phase as
+/// rest: the host was asked `restart:input-lost` over the running work; and the monitor under that
+/// progress row read as no work, the restart asked over it. Negative controls by mutation: the
+/// background work dropped from [`Session::custody_at_rest`]: a restart asked in each case; the
+/// turn's settle journaled as the program's end in [`Session::custody_turned`]: the settle wrong
+/// in each case.
 #[test]
 fn a_line_lost_over_the_agents_own_background_work_is_never_restarted_while_it_runs() {
     let mut wrong = Vec::new();
@@ -421,12 +424,28 @@ fn a_line_lost_over_the_agents_own_background_work_is_never_restarted_while_it_r
         let noted = &run.noted;
         let held = held_formed(noted);
         let restarts = run.host.said("restart:");
+        let holds: Vec<&String> = held_lines(noted)
+            .into_iter()
+            .filter(|l| !l.contains(" typed, not submitted ("))
+            .collect();
+        let ways = [
+            Settles::Drawn,
+            Settles::Person,
+            Settles::Turn,
+            Settles::Ended,
+        ]
+        .into_iter()
+        .filter(|how| settled(noted, *how))
+        .collect::<Vec<_>>();
         if !held.is_some_and(|f| f.ends_with("(input=clear)"))
             || !restarts.is_empty()
-            || !noted.iter().any(|l| l.contains("not at rest"))
+            || holds.is_empty()
+            || !holds.iter().all(|l| l.contains("not at rest"))
+            || ways != [Settles::Turn]
         {
             wrong.push(format!(
-                "{tag}: held={held:?} restarts={restarts:?}\n{noted:#?}\n{}",
+                "{tag}: held={held:?} restarts={restarts:?} holds={holds:#?} settled={ways:?}\n\
+                 {noted:#?}\n{}",
                 run.t.evidence()
             ));
         }
@@ -486,6 +505,84 @@ fn a_line_lost_under_a_progress_row_its_workflow_outlived_is_restarted_in_place(
     assert!(
         !noted.iter().any(|l| l.contains("not at rest")),
         "never held not at rest: {noted:#?}"
+    );
+}
+
+/// `screen` with its footer's pill counting `work` (`· 1 MCP task ·`) and nothing else.
+fn counted_in_footer(mut screen: Vec<String>, work: &str) -> Vec<String> {
+    let footer = screen.last_mut().expect("the footer");
+    *footer = format!("{footer} · {work} · ↓ to manage");
+    screen
+}
+
+/// A LINE LOST OVER WORK ONLY THE FOOTER'S PILL COUNTS IS NEVER RESTARTED WHILE IT RUNS
+/// (ATERM-KI-1101-3, [`Session::custody_at_rest`], `aterm_phase::phase::work_running`): the
+/// worker's turn ends on a question or on a weekly limit whose reset has passed, its done row
+/// naming nothing left running, and the pill counts work of the agent's own under one of Claude
+/// Code 2.1.286's labels (read from its source; no capture draws them: `1 MCP task`, `2
+/// background tasks`, `◇ 1 cloud session`); the loop writes the point's line, `status` reads it
+/// clear and the screen shows none of it. The
+/// phase reads the question or the limit ahead of the pill's soft busy, but a restart in place
+/// would end that work, so the line is held `not at rest` and the host is asked for no restart.
+/// Before, the rest read the pill's count as work only for a shell or a monitor alone: the host
+/// was asked `restart:input-lost` over each of these. The controls are the question's and the
+/// limit's restarts with no work counted
+/// (`a_line_lost_at_a_question_point_is_restarted_as_at_an_idle_one`,
+/// `a_line_lost_at_a_limits_point_after_its_reset_is_restarted_as_at_an_idle_one`).
+#[test]
+fn a_line_lost_over_work_only_the_footers_pill_counts_is_never_restarted_while_it_runs() {
+    let mut wrong = Vec::new();
+    for (tag, point, limit) in [
+        (
+            "question-mcp",
+            counted_in_footer(ended(ASKED), "1 MCP task"),
+            false,
+        ),
+        (
+            "question-tasks",
+            counted_in_footer(ended(ASKED), "2 background tasks"),
+            false,
+        ),
+        (
+            "limit-cloud",
+            counted_in_footer(weekly_limited(), "◇ 1 cloud session"),
+            true,
+        ),
+    ] {
+        let mut screens = vec![busy_screen(), point];
+        screens.extend(resumed());
+        let run = lost_run_at(
+            &format!("pill-{tag}"),
+            screens,
+            Some(AccountHost::scripted(&[], &["relaunched"])),
+            |m, policy| {
+                policy.answer_questions = !limit;
+                policy.resume_limits = limit;
+                m.screen_cols.insert(4, 2 + LINE.len());
+                m.cell_attrs_on.insert(4, "none");
+            },
+            |s| {
+                if limit {
+                    s.set_clock(AFTER_RESET, PDT);
+                }
+            },
+        );
+        let noted = &run.noted;
+        let held = held_formed(noted);
+        let restarts = run.host.said("restart:");
+        if !held.is_some_and(|f| f.ends_with("(input=clear)"))
+            || !restarts.is_empty()
+            || !noted.iter().any(|l| l.contains("not at rest"))
+        {
+            wrong.push(format!(
+                "{tag}: held={held:?} restarts={restarts:?}\n{noted:#?}\n{}",
+                run.t.evidence()
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "no restart in place over the work the pill counts: {wrong:#?}"
     );
 }
 

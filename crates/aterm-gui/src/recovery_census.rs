@@ -411,12 +411,12 @@ fn find_evidence(dir: &Path, pid: u32, birth: u64) -> Evidence {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.file_type().is_file() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
             continue;
         }
         if panic_report_pid(name) == Some(pid) {
-            if mtime_secs(&meta) + 1 >= birth {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.file_type().is_file() && mtime_secs(&meta) + 1 >= birth {
                 evidence.panic_at = Some(panic_report_time(&entry.path()));
             }
             continue;
@@ -425,6 +425,10 @@ fn find_evidence(dir: &Path, pid: u32, birth: u64) -> Evidence {
             continue;
         };
         if marker_pid != pid || marker_birth + 2 < birth {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.file_type().is_file() {
             continue;
         }
         if meta.len() > 0 {
@@ -452,12 +456,17 @@ fn newest_artifact_owner(dir: &Path) -> Option<(u32, u64)> {
         if markers::parse(unconsumed(name)).is_some_and(|m| m.owner == MarkerOwner::Other) {
             continue;
         }
+        let Some((pid, birth)) =
+            marker_pid_birth(name).or_else(|| panic_report_pid(name).map(|p| (p, 0)))
+        else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         let mtime = mtime_secs(&meta);
-        let owner = marker_pid_birth(name).or_else(|| panic_report_pid(name).map(|p| (p, 0)));
-        if let Some((pid, birth)) = owner
-            && newest.is_none_or(|(t, _, _)| mtime >= t)
-        {
+        if newest.is_none_or(|(t, _, _)| mtime >= t) {
             newest = Some((mtime, pid, birth));
         }
     }

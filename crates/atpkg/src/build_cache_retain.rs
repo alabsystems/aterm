@@ -75,15 +75,20 @@ pub fn retain(home: &Path, root: &Path) -> Result<PathBuf, String> {
         return Err("retention does not reclassify a source directory as a cache".into());
     }
     let index = super::index(&home).ok_or("cache index is unavailable")?;
-    let admission = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(index.join("locks.noindex/admission.lock"))
-        .map_err(|_| "cache admission lock is unavailable")?;
+    let admission = aterm_uds::kept_out(|| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(index.join("locks.noindex/admission.lock"))
+    })
+    .map_err(|_| "cache admission lock is unavailable")?;
+    if !admission.metadata().is_ok_and(|m| m.is_file()) {
+        return Err("cache admission lock is unavailable".into());
+    }
     let _admission =
         crate::lock::Flock::try_lock(admission).map_err(|_| "cache admission is busy")?;
     // A staged payload keeps the original registration and gate. Taking a gate at the
@@ -426,12 +431,15 @@ pub(in crate::build_cache) fn publication_lock(
     root: impl std::os::fd::AsFd,
 ) -> Option<crate::lock::Flock> {
     use aterm_dirfd::{Mode, OFlags};
-    let fd = aterm_dirfd::openat(
-        root.as_fd(),
-        ".",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
+    let fd = aterm_uds::kept_out(|| {
+        aterm_dirfd::openat(
+            root.as_fd(),
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+    })
     .ok()?;
     crate::lock::Flock::try_lock(std::fs::File::from(fd)).ok()
 }
@@ -584,7 +592,8 @@ pub(super) fn write_marker(root: &aterm_dirfd::OwnedFd, receipt: &Receipt) -> Re
             | aterm_dirfd::OFlags::CREATE
             | aterm_dirfd::OFlags::EXCL
             | aterm_dirfd::OFlags::NOFOLLOW
-            | aterm_dirfd::OFlags::CLOEXEC,
+            | aterm_dirfd::OFlags::CLOEXEC
+            | aterm_dirfd::OFlags::NONBLOCK,
         aterm_dirfd::Mode::from_bits(0o600),
     )
     .map_err(|_| "cache retention marker cannot be created")?;

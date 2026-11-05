@@ -31,8 +31,16 @@ fn parse_u32(s: &str) -> Option<u32> {
 /// Every well-formed account in `passwd`'s text (`name:x:uid:gid:gecos:home:shell`).
 fn accounts(passwd: &str) -> impl Iterator<Item = User> + '_ {
     passwd.lines().filter_map(|line| {
-        let f: Vec<&str> = line.split(':').collect();
-        if f.len() != 7 || f[0].is_empty() || f[0].starts_with('#') {
+        let mut f = [""; 7];
+        let mut count = 0;
+        for part in line.split(':') {
+            if count >= 7 {
+                return None;
+            }
+            f[count] = part;
+            count += 1;
+        }
+        if count != 7 || f[0].is_empty() || f[0].starts_with('#') {
             return None;
         }
         Some(User {
@@ -50,7 +58,13 @@ fn accounts(passwd: &str) -> impl Iterator<Item = User> + '_ {
 /// None is, or more than one is, or its uid or gid is 0: which.
 pub fn lane_user(passwd: &str) -> Result<User, String> {
     let mut found: Vec<User> = accounts(passwd)
-        .filter(|u| !u.name.contains('/') && u.home == format!("/home/{}.guest", u.name))
+        .filter(|u| {
+            !u.name.contains('/')
+                && u.home
+                    .strip_prefix("/home/")
+                    .and_then(|s| s.strip_suffix(".guest"))
+                    == Some(u.name.as_str())
+        })
         .collect();
     match found.len() {
         1 => {
@@ -87,8 +101,17 @@ pub fn lane_user(passwd: &str) -> Result<User, String> {
 pub fn groups(group: &str, user: &User) -> Vec<u32> {
     let mut out = vec![user.gid];
     for line in group.lines() {
-        let f: Vec<&str> = line.split(':').collect();
-        if f.len() != 4 || f[0].is_empty() || f[0].starts_with('#') {
+        let mut f = [""; 4];
+        let mut count = 0;
+        for part in line.split(':') {
+            if count >= 4 {
+                count += 1;
+                break;
+            }
+            f[count] = part;
+            count += 1;
+        }
+        if count != 4 || f[0].is_empty() || f[0].starts_with('#') {
             continue;
         }
         let Some(gid) = parse_u32(f[2]) else {

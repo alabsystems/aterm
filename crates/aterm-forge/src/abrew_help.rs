@@ -428,11 +428,14 @@ fn run_with(
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| e.to_string())?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
+        let mut file = opts.open(&path).map_err(|e| e.to_string())?;
         file.write_all(&encoded).map_err(|e| e.to_string())?;
         return Ok(Outcome {
             ok: true,
@@ -469,8 +472,21 @@ fn run_with(
     }
     .map_err(|e| e.to_string())?;
     let candidate = scratch.path().join("help_texts.rs");
-    std::fs::write(&candidate, render(&capture, &generator, &digest(&bytes)))
-        .map_err(|e| e.to_string())?;
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
+        opts.open(&candidate)
+            .and_then(|mut f| {
+                use std::io::Write as _;
+                f.write_all(render(&capture, &generator, &digest(&bytes)).as_bytes())
+            })
+            .map_err(|e| e.to_string())?;
+    }
     formatter(root, &candidate)?;
     let formatted = aterm_uds::atomic_file::read_regular_text(&candidate, MAX_BYTES)
         .map_err(|e| e.to_string())?;
@@ -484,7 +500,26 @@ fn run_with(
         Err(e) => return Err(e.to_string()),
     };
     if options.mode == Mode::Write && !same {
-        std::fs::write(&candidate, &stamped).map_err(|e| e.to_string())?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
+        opts.open(&candidate)
+            .and_then(|mut f| {
+                use std::io::Write as _;
+                if !f.metadata()?.is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "not a regular file",
+                    ));
+                }
+                f.set_len(0)?;
+                f.write_all(stamped.as_bytes())
+            })
+            .map_err(|e| e.to_string())?;
         std::fs::rename(&candidate, &destination).map_err(|e| e.to_string())?;
     }
     Ok(Outcome {

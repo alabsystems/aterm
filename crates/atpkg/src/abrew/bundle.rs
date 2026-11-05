@@ -399,10 +399,10 @@ fn dump_formulae(
     struct Row {
         name: String,
         full: String,
-        keg: std::path::PathBuf,
         version: String,
         on_request: bool,
         deps: Vec<String>,
+        used_options: Vec<String>,
     }
     let mut rows: Vec<Row> = Vec::new();
     let installed = prefix.installed(Kind::Formula);
@@ -421,9 +421,8 @@ fn dump_formulae(
             .linked_keg_version(&short)
             .unwrap_or_else(|| i.version.clone());
         let keg = prefix.keg(&short, &version);
-        let on_request =
-            super::prefix::receipt_word(&keg, "installed_on_request").as_deref() != Some("false");
-        let deps = super::prefix::receipt_runtime_deps(&keg).unwrap_or_else(|| {
+        let (on_request, runtime_deps, used_options) = super::prefix::receipt_dump_fields(&keg);
+        let deps = runtime_deps.unwrap_or_else(|| {
             api.formula(&short)
                 .map(|f| f.dependencies)
                 .unwrap_or_default()
@@ -431,10 +430,10 @@ fn dump_formulae(
         rows.push(Row {
             name: short,
             full,
-            keg,
             version,
             on_request,
             deps,
+            used_options,
         });
     }
     // Step 2: dependency topology (brew `Topo`).
@@ -488,7 +487,7 @@ fn dump_formulae(
             }
         }
         line.push_str(&format!("brew \"{}\"", row.full));
-        let mut args = super::prefix::receipt_used_options(&row.keg);
+        let mut args = row.used_options.clone();
         if row.version.starts_with("HEAD") {
             args.push("HEAD".to_owned());
         }
@@ -1230,7 +1229,8 @@ fn clean_formula_rows(prefix: &Prefix, api: &super::api::Api) -> Vec<CleanFormul
                 .formula(&i.name)
                 .ok()
                 .or_else(|| super::tap::lookup(prefix, &full));
-            let runtime_deps = super::prefix::receipt_runtime_deps(&keg).unwrap_or_else(|| {
+            let (receipt_deps, poured) = super::prefix::receipt_cleanup_fields(&keg);
+            let runtime_deps = receipt_deps.unwrap_or_else(|| {
                 record
                     .as_ref()
                     .map(|f| f.dependencies.clone())
@@ -1251,7 +1251,7 @@ fn clean_formula_rows(prefix: &Prefix, api: &super::api::Api) -> Vec<CleanFormul
                     .as_ref()
                     .map(|f| f.build_dependencies.clone())
                     .unwrap_or_default(),
-                poured: super::prefix::receipt_bool(&keg, "poured_from_bottle").unwrap_or(false),
+                poured,
                 aliases: record.map(|f| f.aliases).unwrap_or_default(),
                 oldnames: oldnames_by_name.get(&i.name).cloned().unwrap_or_default(),
                 keepme,
@@ -1519,6 +1519,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+const MAX_BREWFILE_BYTES: usize = 4 * 1024 * 1024;
+
 fn read_stdin_brewfile() -> Result<String, String> {
     use std::io::Read as _;
     STDIN_BREWFILE.with(|cell| {
@@ -1527,11 +1529,21 @@ fn read_stdin_brewfile() -> Result<String, String> {
         }
         let mut text = String::new();
         std::io::stdin()
+            .take((MAX_BREWFILE_BYTES as u64) + 1)
             .read_to_string(&mut text)
             .map_err(|e| format!("abrew: cannot read stdin: {e}"))?;
+        if text.len() > MAX_BREWFILE_BYTES {
+            return Err("abrew: cannot read stdin: file exceeds size limit".to_string());
+        }
         *cell.borrow_mut() = Some(text.clone());
         Ok(text)
     })
+}
+
+/// The text of the Brewfile file at `path`, up to 4 MiB: a link there (a dotfiles checkout) is
+/// followed, as brew follows it, and what it ends at must be a regular file.
+pub(crate) fn read_brewfile_file(path: &Path) -> std::io::Result<String> {
+    crate::metadata_io::read_bounded_regular_utf8_follow_final_links(path, MAX_BREWFILE_BYTES)
 }
 
 /// Read a Brewfile path (`./Brewfile` by default, as brew's is;
@@ -1541,7 +1553,7 @@ pub fn read_brewfile(path: Option<&Path>) -> Result<String, String> {
         return read_stdin_brewfile();
     }
     let p = path.map_or_else(|| std::path::PathBuf::from("Brewfile"), Path::to_path_buf);
-    crate::metadata_io::read_bounded_regular_utf8(&p, 4 * 1024 * 1024).map_err(|e| {
+    read_brewfile_file(&p).map_err(|e| {
         // brew's `Brewfile.read` maps any ENOENT here.
         if e.kind() == std::io::ErrorKind::NotFound {
             "Error: No Brewfile found".to_string()
@@ -1558,16 +1570,17 @@ pub fn read_brewfile(path: Option<&Path>) -> Result<String, String> {
 #[must_use]
 pub fn deps_brewfile_path(value: Option<&str>) -> std::path::PathBuf {
     if let Some(value) = value.filter(|v| !v.is_empty()) {
-        return if value == "-" {
-            std::path::PathBuf::from("/dev/stdin")
-        } else {
-            std::path::PathBuf::from(value)
-        };
+        return std::path::PathBuf::from(value);
     }
     if let Some(value) = std::env::var_os("HOMEBREW_BUNDLE_FILE")
         && value.to_string_lossy().chars().any(|c| !c.is_whitespace())
     {
-        return std::path::PathBuf::from(value);
+        // Only the flag's `-` means stdin ([`read_brewfile`]); here it is a file of that name.
+        return if value == "-" {
+            std::path::PathBuf::from("./-")
+        } else {
+            std::path::PathBuf::from(value)
+        };
     }
     std::path::PathBuf::from("Brewfile")
 }
@@ -1659,6 +1672,25 @@ pub fn parse_brewfile_deps(text: &str) -> (Vec<(Kind, String)>, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Brewfile that is a link in a dotfiles checkout reads as brew reads it.
+    #[test]
+    #[cfg(unix)]
+    fn a_linked_brewfile_reads_through_its_link() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let real = tmp.path().join("dotfiles-Brewfile");
+        std::fs::write(&real, "brew \"wget\"\n").unwrap();
+        let link = tmp.path().join("Brewfile");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(read_brewfile(Some(&link)).unwrap(), "brew \"wget\"\n");
+    }
+
+    /// `--brewfile=-` names stdin, which `read_brewfile` reads directly: `/dev/stdin` is a link
+    /// and a pipe, neither of which the file reader takes.
+    #[test]
+    fn a_dash_brewfile_is_left_for_the_stdin_reader() {
+        assert_eq!(deps_brewfile_path(Some("-")), Path::new("-"));
+    }
 
     #[test]
     #[cfg(unix)]

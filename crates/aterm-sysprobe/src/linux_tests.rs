@@ -957,6 +957,95 @@ fn the_sweep_reads_a_fixture_proc() {
     assert_eq!(Root::new(tree(&[]).path()).processes(100, 4096), None);
 }
 
+/// A `comm` cut at its 15 bytes is read whole from the process's `exe` link (an unlinked image's
+/// ` (deleted)` left off) or its `argv[0]`, where either begins with it; a shorter one is whole as
+/// it stands; and one neither says whole ends in the mark: a kernel thread's, and one whose
+/// arguments were rewritten into a title, which names another file. NEGATIVE CONTROL: the same
+/// cut name with no `exe` link or argument words is marked.
+#[test]
+fn the_sweep_reads_a_cut_comm_whole_or_marks_it() {
+    let stat = |pid: u32, comm: &str, flags: u32| {
+        format!("{pid} ({comm}) S 1 {pid} {pid} 0 -1 {flags} 0 0 0 0 1 1 0 0 20 0 1 0 50 0 0\n")
+    };
+    let user = 4_194_304;
+    let rows = [
+        (
+            10,
+            "kube-controller",
+            user,
+            Some("/usr/bin/kube-controller-manager\0--leader\0"),
+        ),
+        (11, "zsh", user, Some("-zsh\0")),
+        (
+            12,
+            "abcdefghijklmno",
+            user,
+            Some("abcdefghijklmnop: worker /etc/abcdefghijklmnop.conf\0"),
+        ),
+        (13, "systemd-journal", user, None),
+        (14, "kworker/0:1H-kb", 2_129_984, Some("")),
+    ];
+    let mut files: Vec<(String, String)> = Vec::new();
+    for (pid, comm, flags, cmdline) in rows {
+        files.push((format!("proc/{pid}/stat"), stat(pid, comm, flags)));
+        files.push((
+            format!("proc/{pid}/status"),
+            "RssAnon:\t    100 kB\n".to_owned(),
+        ));
+        if let Some(cmdline) = cmdline {
+            files.push((format!("proc/{pid}/cmdline"), cmdline.to_owned()));
+        }
+    }
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let root = tree(&borrowed);
+    let names = |root: &Path| {
+        let mut sweep = Root::new(root).processes(100, 4096).expect("a sweep");
+        sweep.procs.sort_by_key(|p| p.pid);
+        sweep
+            .procs
+            .into_iter()
+            .map(|p| (p.pid, p.name))
+            .collect::<Vec<_>>()
+    };
+    // Only a Unix file system holds the link.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        "/opt/bin/systemd-journald-extra (deleted)",
+        root.path().join("proc/13/exe"),
+    )
+    .expect("an exe link");
+    let journal = if cfg!(unix) {
+        "systemd-journald-extra"
+    } else {
+        "systemd-journal\u{2026}"
+    };
+    assert_eq!(
+        names(root.path()),
+        [
+            (10, "kube-controller-manager".to_owned()),
+            (11, "zsh".to_owned()),
+            (12, "abcdefghijklmno\u{2026}".to_owned()),
+            (13, journal.to_owned()),
+            (14, "kworker/0:1H-kb\u{2026}".to_owned()),
+        ]
+    );
+    let bare = tree(
+        &borrowed
+            .iter()
+            .copied()
+            .filter(|(rel, _)| !rel.ends_with("cmdline"))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        names(bare.path())[0],
+        (10, "kube-controller\u{2026}".to_owned()),
+        "CONTROL"
+    );
+}
+
 /// Each process's birth is its boot-clock start against `/proc/uptime` and the wall clock read
 /// once a sweep. NEGATIVE CONTROL: a tree with no `/proc/uptime` reads no birth.
 #[test]

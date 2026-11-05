@@ -207,9 +207,10 @@ fn rotation_off_never_starts_on_a_pin_another_mac_holds() {
         world.claimed_two(Cli::Claude);
         world.on_main(Cli::Claude, &[]);
         pin(world, Cli::Claude, "work").expect("pin work");
-        std::fs::write(
-            world.cfg.join("aterm.toml"),
-            "[harness]\naccounts = \"off\"\n",
+        aterm_uds::atomic_file::write(
+            &(world.cfg.join("aterm.toml")),
+            ("[harness]\naccounts = \"off\"\n").as_ref(),
+            0o600,
         )
         .expect("aterm.toml");
         assert_eq!(world.seat().mode_for(Cli::Claude), Mode::Off);
@@ -266,8 +267,12 @@ fn rotation_off_never_starts_on_a_pin_another_mac_holds() {
     m3.claimed_two(Cli::Claude);
     m3.on_main(Cli::Claude, &[]);
     pin(&m3, Cli::Claude, "work").expect("pin work");
-    std::fs::write(m3.cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n")
-        .expect("aterm.toml");
+    aterm_uds::atomic_file::write(
+        &(m3.cfg.join("aterm.toml")),
+        ("[harness]\naccounts = \"off\"\n").as_ref(),
+        0o600,
+    )
+    .expect("aterm.toml");
     let full = Arc::new(Replica::refusing(
         "cc03",
         "table operation capacity exhausted",

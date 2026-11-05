@@ -302,10 +302,12 @@ pub const fn is_bus_step(kind: Kind) -> bool {
     )
 }
 
-/// An actor as the bus names it: an edge's sid by its alias, `-` with none.
+/// An actor as the bus names it: an edge's sid by its alias, `-` with none, and `-` for another
+/// Mac's drive, whose host this Mac's book names and no bus reader needs.
 fn bus_actor(by: Actor, alias: &dyn Fn(&ShortId) -> Option<ShortId>) -> Actor {
     match by {
         Actor::Sid(sid) => alias(&sid).map_or(Actor::Nobody, Actor::sid),
+        Actor::Fleet(_) => Actor::Nobody,
         other => other,
     }
 }

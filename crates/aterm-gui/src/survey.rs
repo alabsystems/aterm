@@ -389,8 +389,12 @@ pub(crate) struct Here {
 }
 
 impl Here {
-    /// Snapshot [`Here`] for a non-driving local reader.
+    /// Snapshot [`Here`] for a non-driving local reader. Its facts carry the home's checkouts as
+    /// their last read found them, and a read older than
+    /// [`aterm_agent::harness::repo_work::home::REFRESH`] starts again beside this one, so the
+    /// survey never waits on git ([`refresh_home_repos`]).
     pub(crate) fn now() -> Here {
+        refresh_home_repos();
         let node = node_id_opt();
         Here {
             host: aterm_uds::process::lan_host_name(),
@@ -403,7 +407,8 @@ impl Here {
     }
 
     /// Snapshot [`Here`] from the 1-minute listener cache (refreshed once per [`FACTS_CACHE_TTL`],
-    /// or immediately if `<state>/fleet-node` changed).
+    /// or immediately if `<state>/fleet-node` changed), with the home's checkouts as their latest
+    /// read found them.
     #[cfg(any(unix, test))]
     pub(crate) fn cached_for_listener() -> Here {
         static CACHE: std::sync::Mutex<Option<(std::time::Instant, Here)>> =
@@ -418,7 +423,15 @@ impl Here {
                 && now.saturating_duration_since(*at) < FACTS_CACHE_TTL
                 && cached.facts.as_ref().and_then(|f| f.node.as_deref()) == live_node.as_deref()
             {
-                return cached.clone();
+                // The checkouts' read runs on its own clock ([`refresh_home_repos`]), so a cached
+                // snapshot says the latest one, never one a minute behind it.
+                let mut here = cached.clone();
+                drop(guard);
+                refresh_home_repos();
+                if let Some(facts) = here.facts.as_mut() {
+                    facts.take_latest_repos();
+                }
+                return here;
             }
         }
         let fresh = Self::now();
@@ -467,14 +480,13 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
         .and_then(|f| f.node.clone())
         .unwrap_or_else(node_token);
     let instances = here.instances;
-    let facts_tokens = here
-        .facts
-        .as_ref()
-        .map_or_else(String::new, |f| f.header_tokens());
+    let facts_tokens = here.facts.as_ref().map_or_else(String::new, |f| {
+        f.header_tokens(level == SurveyLevel::Content)
+    });
     let extra_lines: Vec<String> = here
         .facts
         .as_ref()
-        .map_or_else(Vec::new, |f| f.extra_lines());
+        .map_or_else(Vec::new, |f| f.extra_lines(level == SurveyLevel::Content));
     let extra_bytes: usize = extra_lines.iter().map(|l| l.len() + 1).sum();
     let drive = if here.drive { " drive=1" } else { "" };
     let head = |cut: usize, sent: usize, extra_count: usize| {
@@ -538,6 +550,36 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
         out.push('\n');
     }
     out
+}
+
+/// Start a read of the home's checkouts beside the caller where the last is stale
+/// ([`aterm_agent::harness::repo_work::home::refresh`]), the home the survey's facts name
+/// ([`home_to_read`]), no git started while macOS's program check holds new starts back.
+pub(crate) fn refresh_home_repos() {
+    if let Some(home) = home_to_read() {
+        refresh_home_repos_in(&home);
+    }
+}
+
+/// The home [`refresh_home_repos`] reads: `$HOME`, absolute, the one the survey's facts name;
+/// `None` in a test binary (by its name, in every profile), whose `$HOME` is the person's, never
+/// a test's to read, and where this program cannot say which it is.
+pub(crate) fn home_to_read() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    if aterm_uds::test_binary::is_test_binary(&exe) {
+        return None;
+    }
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|home| home.is_absolute())
+}
+
+/// [`refresh_home_repos`] for an explicit `home` (`aterm node serve`'s).
+pub(crate) fn refresh_home_repos_in(home: &Path) {
+    fn held() -> bool {
+        crate::program_check_watch::starts_held(&crate::program_check_watch::BOARD)
+    }
+    aterm_agent::harness::repo_work::home::refresh(home, held);
 }
 
 fn node_id_opt() -> Option<String> {

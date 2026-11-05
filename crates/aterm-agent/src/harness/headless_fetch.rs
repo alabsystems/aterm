@@ -352,10 +352,8 @@ fn ensure_headless_with(
     })
 }
 
-/// The lowercase sha256 of the file at `path`.
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let (mut file, _) = super::disk::versions::open_regular_file(path)
-        .map_err(|e| format!("the download cannot be read: {e}"))?;
+/// The lowercase sha256 of an already-opened regular file handle.
+fn sha256_opened(mut file: std::fs::File) -> Result<String, String> {
     let mut hash = aterm_digest::Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -367,7 +365,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         }
         hash.update(&buf[..n]);
     }
-    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(aterm_codec::hex::encode_lower(&hash.finalize()))
 }
 
 /// Whether [`CURL`] is here to fetch with: a file (or a link to one) with an execute bit. A
@@ -529,16 +527,16 @@ fn place(
     if stopped() {
         return Err(none(format!("the download failed: {STOPPED}")));
     }
-    let got = std::fs::metadata(&file)
-        .map_err(|_| none("the download left no file".to_owned()))?
-        .len();
+    let (opened, meta) = super::disk::versions::open_regular_file(&file)
+        .map_err(|_| none("the download left no file".to_owned()))?;
+    let got = meta.len();
     if got != archive.bytes {
         return Err(none(format!(
             "the download is {got} bytes and the pin is {}",
             archive.bytes
         )));
     }
-    let hash = sha256_file(&file).map_err(none)?;
+    let hash = sha256_opened(opened).map_err(none)?;
     if !hash.eq_ignore_ascii_case(&archive.sha256) {
         return Err(none(format!(
             "the download hashes to {hash} and the pin is {}",

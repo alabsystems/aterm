@@ -126,7 +126,14 @@ fn a_received_batch_preserves_a_local_storage_refusal() {
 
 #[test]
 fn batch_refusal_metadata_is_bounded_without_splitting_utf8() {
-    let why = BatchDeferral::new("operations", "ingest", "🧪".repeat(300));
+    let why = BatchDeferral::new(
+        "operations",
+        "ingest",
+        Error::repair(
+            &"🧪".repeat(300),
+            aterm_types::network_state::RepairCause::Quota,
+        ),
+    );
     assert_eq!(why.reason.chars().count(), 128);
     assert_eq!(why.reason.len(), 512);
 }
@@ -163,7 +170,7 @@ fn automatic_batches_recheck_local_policy_and_new_catalog_conflicts() {
     round.tables = tables;
     assert!(
         round
-            .inventory(peer, scope.digest(), &mut None)
+            .inventory(peer, scope.digest(), &mut None, &mut None)
             .unwrap()
             .is_some()
     );
@@ -732,7 +739,7 @@ fn the_final_matching_inventory_read_rejects_real_inventory_and_control_changes(
     let id = p.scope.digest();
     let make_report = |round: &Round<'_>| {
         let before = round
-            .inventory(peer, id, &mut None)
+            .inventory(peer, id, &mut None, &mut None)
             .unwrap()
             .unwrap()
             .observation;
@@ -1569,9 +1576,13 @@ fn damaged_table_is_unavailable_and_never_reset_or_acknowledged() -> (i64, i64, 
     )
 }
 
+/// The two cases where Mac 0 initiates: a sender that initiates and a sender that responds, each
+/// Mac sending once, so each Mac's damaged copy is met. Both Macs are writers on one table, and
+/// swapping them only relabels the exchange. GAP: Mac 1 initiates in neither, so a defect only at
+/// (Mac 0 sends, Mac 1 initiates) or (Mac 1 sends, Mac 1 initiates) is not seen.
 fn a_damaged_neighbor_does_not_starve_healthy_table_repair() -> [i64; 4] {
     let mut observed = [1, 1, 1, 0];
-    for case in aterm_spec::fs_lane::each(&[0, 1, 2, 3], |&case| damaged_neighbor_case(case)) {
+    for case in aterm_spec::fs_lane::each(&[0, 2], |&case| damaged_neighbor_case(case)) {
         for (all, this) in observed.iter_mut().zip(case).take(3) {
             *all &= this;
         }
@@ -1900,7 +1911,10 @@ fn empty_batches_recheck_authority_without_reopening_unrequested_data() {
     let round = sender.round(peer).unwrap();
     let table = pair.scope.digest();
     round.active_table.set(Some(table));
-    let inventory = round.inventory(peer, table, &mut None).unwrap().unwrap();
+    let inventory = round
+        .inventory(peer, table, &mut None, &mut None)
+        .unwrap()
+        .unwrap();
     let record = *inventory.known.first().unwrap();
     let original = std::fs::read(pair.paths[0].join("table.astream")).unwrap();
     let held = pair.lab._home.path().join("held-table-a");

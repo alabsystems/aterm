@@ -5,6 +5,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use aterm_window::event::InputOrigin;
+
 /// A parsed hardware-key injection request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HwKeySpec {
@@ -68,28 +70,56 @@ pub(crate) const NS_EVENT_TYPE_KEY_DOWN: usize = 10;
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) const NS_EVENT_TYPE_KEY_UP: usize = 11;
 
+/// `NSEventTypeLeftMouseUp`, a click tests stand in.
+#[cfg(test)]
+pub(crate) const NS_EVENT_TYPE_LEFT_MOUSE_UP: usize = 2;
+
 /// Whether an `NSEventType` is a key-down or key-up, the kinds a burst posts.
-#[cfg_attr(any(test, not(target_os = "macos")), allow(dead_code))]
 pub(crate) const fn is_key_kind(kind: usize) -> bool {
     matches!(kind, NS_EVENT_TYPE_KEY_DOWN | NS_EVENT_TYPE_KEY_UP)
 }
 
-/// One key event, as the main thread can tell a burst's apart from a person's in
-/// `-[NSApp currentEvent]`: its `NSEventType`, virtual keycode and timestamp (seconds since boot).
+/// Whether an `NSEventType` can choose a native menu or toolbar item: a key (by its key
+/// equivalent) or a mouse button's down or up (`NSEventTypeLeftMouseDown` 1 through
+/// `NSEventTypeRightMouseUp` 4, `NSEventTypeOtherMouseDown` 25 and `NSEventTypeOtherMouseUp` 26).
+#[cfg(target_os = "macos")]
+pub(crate) const fn is_chooser_kind(kind: usize) -> bool {
+    is_key_kind(kind) || matches!(kind, 1..=4 | 25 | 26)
+}
+
+/// One native key or mouse event, as the main thread can tell a burst's or another process's
+/// apart from a person's in `-[NSApp currentEvent]`: its `NSEventType`, virtual keycode (0 for a
+/// mouse event) and timestamp (seconds since boot), and the process it came from
+/// (`kCGEventSourceUnixProcessID`, read by `aterm_cg::event_source_pid`; [`HID_SYSTEM`] for a
+/// keyboard's key or a mouse's click).
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct PostedKey {
+pub(crate) struct NativeInput {
     pub kind: usize,
     pub keycode: u16,
     pub timestamp: f64,
+    pub source_pid: i64,
 }
 
-impl PostedKey {
-    /// Whether `seen` is this event: the same kind and key, stamped within [`STAMP_SLACK`].
+/// The source process of an event the HID system delivered from a keyboard or a mouse: the
+/// person's hand.
+pub(crate) const HID_SYSTEM: i64 = 0;
+
+impl NativeInput {
+    /// Whether `seen` is this event: the same kind and key, stamped within [`STAMP_SLACK`]. The
+    /// source is not compared: the ledger waits only for keys this process posted.
     fn is(&self, seen: &Self) -> bool {
         self.kind == seen.kind
             && self.keycode == seen.keycode
             && (self.timestamp - seen.timestamp).abs() <= STAMP_SLACK
+    }
+
+    /// Whether another process posted it: System Events' `keystroke` or `click`, `CGEventPost`
+    /// from a program in a tab (which inherits aterm's Accessibility grant), or a person's own
+    /// relay (Screen Sharing, an on-screen keyboard). Its source is neither the HID system nor
+    /// this process, so no hand is known to have pressed it here ([`InputOrigin::Relayed`]).
+    fn relayed(&self) -> bool {
+        self.source_pid != HID_SYSTEM && self.source_pid != i64::from(std::process::id())
     }
 }
 
@@ -108,8 +138,8 @@ const LEDGER_CAP: usize = 4 * 2 * MAX_COUNT as usize;
 /// it again.
 #[derive(Debug, Default)]
 struct Ledger {
-    waiting: std::collections::VecDeque<PostedKey>,
-    found: Option<PostedKey>,
+    waiting: std::collections::VecDeque<NativeInput>,
+    found: Option<NativeInput>,
 }
 
 impl Ledger {
@@ -122,7 +152,7 @@ impl Ledger {
     /// closed, never dropping a key it waits for.
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     #[must_use]
-    fn note(&mut self, keys: &[PostedKey]) -> bool {
+    fn note(&mut self, keys: &[NativeInput]) -> bool {
         if keys.len() > self.room() {
             return false;
         }
@@ -135,7 +165,7 @@ impl Ledger {
     /// post (`hwkey::post`), and AppKit dequeues the key-downs (and the key-ups) in the order they
     /// were posted, so each of those left the queue before it unseen (an input method or a modal
     /// panel took it) and would only hold room.
-    fn take(&mut self, seen: &PostedKey) -> bool {
+    fn take(&mut self, seen: &NativeInput) -> bool {
         if self.found.is_some_and(|found| found.is(seen)) {
             return true;
         }
@@ -163,25 +193,31 @@ static LEDGER: std::sync::Mutex<Ledger> = std::sync::Mutex::new(Ledger {
 thread_local! {
     /// The test build's ledger: one per test thread, where its burst and its dispatch both run.
     static LEDGER: std::cell::RefCell<Ledger> = std::cell::RefCell::new(Ledger::default());
-    /// The test build's stand-in for `-[NSApp currentEvent]` ([`current_key`]).
-    pub(crate) static CURRENT_KEY_STUB: std::cell::Cell<Option<PostedKey>> =
+    /// The test build's stand-in for `-[NSApp currentEvent]` ([`current_input`]).
+    pub(crate) static CURRENT_INPUT_STUB: std::cell::Cell<Option<NativeInput>> =
         const { std::cell::Cell::new(None) };
     /// The source verdict retained by the window callback being delivered.
-    static WINDOW_EVENT_POSTED_STUB: std::cell::Cell<Option<bool>> =
+    static WINDOW_EVENT_ORIGIN_STUB: std::cell::Cell<Option<InputOrigin>> =
         const { std::cell::Cell::new(None) };
+    /// The test build's [`NOTED`]: one per test thread, as the ledger is, so a burst one test
+    /// noted never lets another test's classifier consult the ledger.
+    static NOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Deliver a test callback with its retained source verdict, restoring an enclosing callback
 /// even if the delivery unwinds. This never queries AppKit.
 #[cfg(test)]
-pub(crate) fn with_window_event_posted_for_test<R>(posted: bool, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<bool>);
+pub(crate) fn with_window_event_origin_for_test<R>(
+    origin: InputOrigin,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<InputOrigin>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            WINDOW_EVENT_POSTED_STUB.with(|current| current.set(self.0));
+            WINDOW_EVENT_ORIGIN_STUB.with(|current| current.set(self.0));
         }
     }
-    let _restore = Restore(WINDOW_EVENT_POSTED_STUB.with(|current| current.replace(Some(posted))));
+    let _restore = Restore(WINDOW_EVENT_ORIGIN_STUB.with(|current| current.replace(Some(origin))));
     f()
 }
 
@@ -200,7 +236,28 @@ fn with_ledger<R>(f: impl FnOnce(&mut Ledger) -> R) -> R {
 
 /// Set once a burst noted a key in this process: until then no key is a burst's, and classifying
 /// a native key need not consult the ledger.
+#[cfg(not(test))]
 static NOTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a burst noted a key ([`NOTED`]).
+fn noted() -> bool {
+    #[cfg(not(test))]
+    {
+        NOTED.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    {
+        NOTED.with(std::cell::Cell::get)
+    }
+}
+
+/// Record that a burst noted a key ([`NOTED`]).
+fn set_noted() {
+    #[cfg(not(test))]
+    NOTED.store(true, Ordering::Release);
+    #[cfg(test)]
+    NOTED.with(|noted| noted.set(true));
+}
 
 /// Record `keys` (one press: its key-down and key-up) as a burst's, before they are posted, or
 /// refuse them all, unposted, while the ledger waits for as many keys as it can hold.
@@ -209,14 +266,14 @@ static NOTED: AtomicBool = AtomicBool::new(false);
 ///
 /// The `ERR hwkey: busy` reply line when the ledger has no room for all of `keys`.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
-pub(crate) fn note_posted(keys: &[PostedKey]) -> Result<(), String> {
+pub(crate) fn note_posted(keys: &[NativeInput]) -> Result<(), String> {
     if !with_ledger(|ledger| ledger.note(keys)) {
         return Err(format!(
             "ERR hwkey: busy: {LEDGER_CAP} keys bursts posted are still waiting for aterm to \
              take them, so this burst posts no more\n"
         ));
     }
-    NOTED.store(true, Ordering::Release);
+    set_noted();
     Ok(())
 }
 
@@ -226,15 +283,16 @@ pub(crate) fn note_posted(keys: &[PostedKey]) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 static POSTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The key event AppKit is dispatching now (a test build's stand-in: [`CURRENT_KEY_STUB`]).
-fn current_key() -> Option<PostedKey> {
+/// The key or mouse event AppKit is dispatching now (a test build's stand-in:
+/// [`CURRENT_INPUT_STUB`]).
+fn current_input() -> Option<NativeInput> {
     #[cfg(test)]
     {
-        CURRENT_KEY_STUB.with(std::cell::Cell::get)
+        CURRENT_INPUT_STUB.with(std::cell::Cell::get)
     }
     #[cfg(all(not(test), target_os = "macos"))]
     {
-        crate::platform::current_key_event()
+        crate::platform::current_input_event()
     }
     #[cfg(all(not(test), not(target_os = "macos")))]
     {
@@ -242,32 +300,42 @@ fn current_key() -> Option<PostedKey> {
     }
 }
 
-/// Whether the native event AppKit is dispatching now is a key a burst posted. Native menu and
-/// toolbar callbacks can run in a nested loop beneath a window callback from a different key,
-/// so their readers consult the current native event rather than that callback's retained source.
-pub(crate) fn current_event_posted() -> bool {
-    NOTED.load(Ordering::Acquire) && current_key().is_some_and(event_posted)
+/// Where the native event AppKit is dispatching now came from ([`classify`]): the key that chose
+/// a native menu or toolbar item by its key equivalent, or the click that chose it. Native menu
+/// and toolbar callbacks can run in a nested loop beneath a window callback from a different
+/// event, so their readers consult the current native event rather than that callback's
+/// retained source.
+pub(crate) fn current_event_origin() -> InputOrigin {
+    current_input().map_or(InputOrigin::Person, classify)
 }
 
-/// Whether this window callback came from a key a burst posted. The native source classifies
-/// it before queueing a callback, including text an input method composes or commits. A retained
-/// false verdict also masks an unrelated current key. Outside a retained window callback, a
-/// native reader can still classify the event AppKit is dispatching now.
-pub(crate) fn window_callback_posted() -> bool {
+/// Where this window callback came from ([`classify`]). The native source classifies a key, a
+/// click or a scroll before queueing a callback, including text an input method composes or
+/// commits. A retained person's verdict also masks an unrelated current event. Outside a
+/// retained window callback, a native reader can still classify the event AppKit is dispatching
+/// now.
+pub(crate) fn window_callback_origin() -> InputOrigin {
     #[cfg(test)]
-    let retained = WINDOW_EVENT_POSTED_STUB.with(std::cell::Cell::get);
+    let retained = WINDOW_EVENT_ORIGIN_STUB.with(std::cell::Cell::get);
     #[cfg(all(not(test), target_os = "macos"))]
-    let retained = aterm_window::platform::macos::window_event_posted();
+    let retained = aterm_window::platform::macos::window_event_origin();
     #[cfg(all(not(test), not(target_os = "macos")))]
-    let retained: Option<bool> = None;
-    retained.unwrap_or_else(current_event_posted)
+    let retained: Option<InputOrigin> = None;
+    retained.unwrap_or_else(current_event_origin)
 }
 
-/// Whether `seen`, a key event a native monitor holds before AppKit dispatches it, is a key a
-/// burst posted ([`current_event_posted`] for the event in dispatch). Taken from the ledger once
-/// found, as a dispatch takes it.
-pub(crate) fn event_posted(seen: PostedKey) -> bool {
-    NOTED.load(Ordering::Acquire) && with_ledger(|ledger| ledger.take(&seen))
+/// Where `seen`, a native event a native monitor holds before AppKit dispatches it, or the one
+/// in dispatch ([`current_event_origin`]), came from: a key a burst posted, taken from the
+/// ledger once found as a dispatch takes it ([`InputOrigin::Posted`]); one another process
+/// posted ([`NativeInput::relayed`], [`InputOrigin::Relayed`]); else the person's hand.
+pub(crate) fn classify(seen: NativeInput) -> InputOrigin {
+    if is_key_kind(seen.kind) && noted() && with_ledger(|ledger| ledger.take(&seen)) {
+        InputOrigin::Posted
+    } else if seen.relayed() {
+        InputOrigin::Relayed
+    } else {
+        InputOrigin::Person
+    }
 }
 
 /// One burst: `count` presses `interval_ms` apart, each posted by `post_one` (told how many this
@@ -719,19 +787,20 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                 }
                 let up = key_event(NS_EVENT_TYPE_KEY_UP);
                 // The main thread tells the key from a person's by these, as it dispatches it
-                // (`current_event_posted`), so it is recorded before AppKit can dispatch it.
+                // (`current_event_origin`), so it is recorded before AppKit can dispatch it.
                 // SAFETY: `-type` (`-(NSEventType)`, an `NSUInteger`) and `-timestamp`
                 // (`-(NSTimeInterval)`) are scalar getters on a live key event this thread built
                 // and has not yet posted.
                 let stamp = |event: Id| unsafe {
-                    PostedKey {
+                    NativeInput {
                         kind: appkit::send_usize(event, sel!(type)),
                         keycode: spec.keycode,
                         timestamp: appkit::send_f64(event, sel!(timestamp)),
+                        source_pid: i64::from(std::process::id()),
                     }
                 };
                 let press: Vec<Id> = [down, up].into_iter().filter(|e| !e.is_null()).collect();
-                let keys: Vec<PostedKey> = press.iter().map(|&event| stamp(event)).collect();
+                let keys: Vec<NativeInput> = press.iter().map(|&event| stamp(event)).collect();
                 let _order = POSTING
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -811,9 +880,12 @@ pub(crate) fn post(_spec: &HwKeySpec, _window_number: i64) -> Result<u32, String
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    use aterm_window::event::InputOrigin;
+
     use super::{
-        CURRENT_KEY_STUB, FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, LEDGER_CAP, Ledger, MAX_COUNT,
-        NS_EVENT_TYPE_KEY_DOWN, NS_EVENT_TYPE_KEY_UP, PostedKey, current_event_posted, note_posted,
+        CURRENT_INPUT_STUB, FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, HID_SYSTEM, LEDGER_CAP,
+        Ledger, MAX_COUNT, NS_EVENT_TYPE_KEY_DOWN, NS_EVENT_TYPE_KEY_UP,
+        NS_EVENT_TYPE_LEFT_MOUSE_UP, NativeInput, classify, current_event_origin, note_posted,
         parse_hwkey, run_burst,
     };
 
@@ -828,10 +900,11 @@ mod tests {
     /// taken.
     #[test]
     fn a_full_ledger_refuses_keys_rather_than_forget_one() {
-        let key = |n: u32, kind: usize| PostedKey {
+        let key = |n: u32, kind: usize| NativeInput {
             kind,
             keycode: 9,
             timestamp: 3_000.0 + f64::from(n),
+            source_pid: HID_SYSTEM,
         };
         let half = u32::try_from(LEDGER_CAP / 2).expect("a small cap");
         let down = |n| key(n, NS_EVENT_TYPE_KEY_DOWN);
@@ -876,31 +949,36 @@ mod tests {
     /// found.
     #[test]
     fn the_main_thread_tells_a_posted_key_from_a_persons() {
-        let at = |key: PostedKey| {
-            CURRENT_KEY_STUB.with(|current| current.set(Some(key)));
-            let posted = current_event_posted();
-            CURRENT_KEY_STUB.with(|current| current.set(None));
+        let at = |key: NativeInput| {
+            CURRENT_INPUT_STUB.with(|current| current.set(Some(key)));
+            let posted = current_event_origin() == InputOrigin::Posted;
+            CURRENT_INPUT_STUB.with(|current| current.set(None));
             posted
         };
-        let down = PostedKey {
+        let down = NativeInput {
             kind: NS_EVENT_TYPE_KEY_DOWN,
             keycode: 9,
             timestamp: 5_000.123_456_789,
+            source_pid: HID_SYSTEM,
         };
         note_posted(&[down]).expect("room");
-        assert!(!current_event_posted(), "no event is being dispatched");
-        let later = PostedKey {
+        assert_eq!(
+            current_event_origin(),
+            InputOrigin::Person,
+            "no event is being dispatched"
+        );
+        let later = NativeInput {
             timestamp: 5_000.2,
             ..down
         };
         assert!(!at(later), "the person's ⌘V a moment later");
-        let up = PostedKey {
+        let up = NativeInput {
             kind: NS_EVENT_TYPE_KEY_UP,
             ..down
         };
         assert!(!at(up), "another kind");
-        assert!(!at(PostedKey { keycode: 8, ..down }), "another key");
-        let rounded = PostedKey {
+        assert!(!at(NativeInput { keycode: 8, ..down }), "another key");
+        let rounded = NativeInput {
             timestamp: 5_000.123_456_79,
             ..down
         };
@@ -915,58 +993,152 @@ mod tests {
         assert!(!at(down), "the key-down, once the key-up was found");
     }
 
+    /// INPUT ANOTHER PROCESS POSTED IS RELAYED, A BURST'S KEY POSTED: a key or click whose source
+    /// is neither the HID system nor this process (System Events' `keystroke` or `click`, a tab's
+    /// program's `CGEventPost`, Screen Sharing) is relayed though no burst noted it, both to a
+    /// native monitor and as the event in dispatch (a menu's key equivalent, or the click that
+    /// chose the item), and it takes nothing from the ledger; the same key or click from the HID
+    /// system, or a key from this process no burst noted, is the person's; the burst's key is
+    /// still found, and is the burst's.
+    /// NEGATIVE CONTROL: with `NativeInput::relayed` answering false (the classifier as it was
+    /// before it read the source), another process's key and click were the person's.
+    #[test]
+    fn input_another_process_posted_is_relayed_and_a_bursts_key_posted() {
+        let here = i64::from(std::process::id());
+        let key = |n: u32, source_pid: i64| NativeInput {
+            kind: NS_EVENT_TYPE_KEY_DOWN,
+            keycode: 1,
+            timestamp: 7_000.0 + f64::from(n),
+            source_pid,
+        };
+        let click = |n: u32, source_pid: i64| NativeInput {
+            kind: NS_EVENT_TYPE_LEFT_MOUSE_UP,
+            keycode: 0,
+            ..key(n, source_pid)
+        };
+        let at = |event: NativeInput| {
+            CURRENT_INPUT_STUB.with(|current| current.set(Some(event)));
+            let origin = current_event_origin();
+            CURRENT_INPUT_STUB.with(|current| current.set(None));
+            origin
+        };
+        let burst = key(0, here);
+        note_posted(&[burst]).expect("room");
+
+        assert_eq!(
+            classify(key(1, here + 1)),
+            InputOrigin::Relayed,
+            "held by a native monitor"
+        );
+        assert_eq!(at(key(2, here + 1)), InputOrigin::Relayed, "in dispatch");
+        assert_eq!(at(click(3, here + 1)), InputOrigin::Relayed, "a click");
+        assert_eq!(at(key(4, HID_SYSTEM)), InputOrigin::Person, "a keyboard's");
+        assert_eq!(at(click(5, HID_SYSTEM)), InputOrigin::Person, "a mouse's");
+        assert_eq!(
+            classify(key(6, here)),
+            InputOrigin::Person,
+            "this process's key no burst noted"
+        );
+        assert_eq!(at(burst), InputOrigin::Posted, "the burst's key is found");
+    }
+
+    /// ANOTHER PROCESS'S INPUT IS RELAYED BEFORE ANY BURST: in a process (here, a test thread)
+    /// where no burst has noted a key, the ledger is never consulted, and a key or click from
+    /// another process is still relayed.
+    /// NEGATIVE CONTROL: with the relayed check behind the noted gate (`noted() && (burst ||
+    /// relayed)`, the gate's shape before the source was read), both were the person's.
+    #[test]
+    fn another_processs_input_is_relayed_before_any_burst_noted_a_key() {
+        let elsewhere = i64::from(std::process::id()) + 1;
+        let key = NativeInput {
+            kind: NS_EVENT_TYPE_KEY_DOWN,
+            keycode: 1,
+            timestamp: 7_500.0,
+            source_pid: elsewhere,
+        };
+        assert!(!super::noted(), "PRECONDITION: no burst noted a key here");
+        assert_eq!(classify(key), InputOrigin::Relayed);
+        let click = NativeInput {
+            kind: NS_EVENT_TYPE_LEFT_MOUSE_UP,
+            keycode: 0,
+            ..key
+        };
+        assert_eq!(classify(click), InputOrigin::Relayed);
+        assert_eq!(
+            classify(NativeInput {
+                source_pid: HID_SYSTEM,
+                ..key
+            }),
+            InputOrigin::Person
+        );
+    }
+
     /// A native menu or toolbar callback in a nested loop reads its own current key, while a
     /// deferred window callback keeps its original source. Neither reader borrows the other's
-    /// decision, including the physical callback's definitive false verdict.
+    /// decision, including the physical callback's definitive person's verdict.
     #[test]
     fn native_readers_do_not_borrow_a_retained_window_callbacks_source() {
-        let a = PostedKey {
+        let a = NativeInput {
             kind: NS_EVENT_TYPE_KEY_DOWN,
             keycode: 0,
             timestamp: 6_700.0,
+            source_pid: HID_SYSTEM,
         };
-        let physical_b = PostedKey {
+        let physical_b = NativeInput {
             timestamp: 6_701.0,
             ..a
         };
-        let posted_b = PostedKey {
+        let posted_b = NativeInput {
             timestamp: 6_702.0,
             ..a
         };
         note_posted(&[a, posted_b]).expect("room");
-        let retained_a = super::event_posted(a);
-        assert!(retained_a);
-        CURRENT_KEY_STUB.with(|current| current.set(Some(physical_b)));
-        super::with_window_event_posted_for_test(retained_a, || {
-            assert!(!current_event_posted(), "the nested native key is physical");
-            assert!(
-                super::window_callback_posted(),
+        let retained_a = classify(a);
+        assert_eq!(retained_a, InputOrigin::Posted);
+        CURRENT_INPUT_STUB.with(|current| current.set(Some(physical_b)));
+        super::with_window_event_origin_for_test(retained_a, || {
+            assert_eq!(
+                current_event_origin(),
+                InputOrigin::Person,
+                "the nested native key is physical"
+            );
+            assert_eq!(
+                super::window_callback_origin(),
+                InputOrigin::Posted,
                 "the window callback still belongs to A"
             );
-            CURRENT_KEY_STUB.with(|current| current.set(Some(posted_b)));
-            super::with_window_event_posted_for_test(false, || {
-                assert!(current_event_posted(), "the nested native key is posted");
-                assert!(
-                    !super::window_callback_posted(),
+            CURRENT_INPUT_STUB.with(|current| current.set(Some(posted_b)));
+            super::with_window_event_origin_for_test(InputOrigin::Person, || {
+                assert_eq!(
+                    current_event_origin(),
+                    InputOrigin::Posted,
+                    "the nested native key is posted"
+                );
+                assert_eq!(
+                    super::window_callback_origin(),
+                    InputOrigin::Person,
                     "the physical callback stays physical"
                 );
             });
-            CURRENT_KEY_STUB.with(|current| current.set(Some(physical_b)));
-            assert!(
-                !super::event_posted(a),
+            CURRENT_INPUT_STUB.with(|current| current.set(Some(physical_b)));
+            assert_eq!(
+                classify(a),
+                InputOrigin::Person,
                 "PRECONDITION: B consumed A's raw ledger identity"
             );
-            assert!(
-                super::window_callback_posted(),
+            assert_eq!(
+                super::window_callback_origin(),
+                InputOrigin::Posted,
                 "the enclosing callback is restored"
             );
-            assert!(!current_event_posted());
+            assert_eq!(current_event_origin(), InputOrigin::Person);
         });
-        assert!(
-            !super::window_callback_posted(),
+        assert_eq!(
+            super::window_callback_origin(),
+            InputOrigin::Person,
             "outside a callback the raw reader is used"
         );
-        CURRENT_KEY_STUB.with(|current| current.set(None));
+        CURRENT_INPUT_STUB.with(|current| current.set(None));
     }
 
     /// System State (or a gateway card) coming to the front after the second key of five stops

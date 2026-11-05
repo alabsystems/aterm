@@ -464,8 +464,8 @@ impl Live {
             })
             .filter_map(|(n, _)| {
                 let p = dir.join(n);
-                let len = crate::sys::scratch_file(&p).ok()??.metadata().ok()?.len();
-                Some((p, len))
+                let (_, meta) = crate::sys::scratch_file_with_meta(&p).ok()??;
+                Some((p, meta.len()))
             })
             .collect()
     }
@@ -494,8 +494,15 @@ impl Ops for Live {
 
     fn journal_lines(&mut self, run: &Run) -> Vec<String> {
         self.tail.lines(&Self::journals(run), |p, from| {
-            let mut f = crate::sys::scratch_file(p).ok()??;
-            let mut buf = Vec::new();
+            let (mut f, meta) = crate::sys::scratch_file_with_meta(p).ok()??;
+            let len = meta.len();
+            let cap = usize::try_from(
+                len.saturating_sub(from)
+                    .min(64 * 1024 * 1024)
+                    .saturating_add(1),
+            )
+            .unwrap_or(0);
+            let mut buf = Vec::with_capacity(cap);
             f.seek(SeekFrom::Start(from)).ok()?;
             f.take(64 * 1024 * 1024).read_to_end(&mut buf).ok()?;
             Some(buf)

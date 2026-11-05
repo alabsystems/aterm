@@ -125,7 +125,11 @@ pub fn system_awake_since() -> u64 {
     #[cfg(target_os = "linux")]
     {
         use std::io::Read as _;
-        std::fs::File::open("/proc/stat")
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open("/proc/stat")
             .ok()
             .and_then(|f| {
                 let mut stat = String::with_capacity(4096);
@@ -220,6 +224,8 @@ pub struct Row {
     pub source: String,
     /// Where the upgrade stands.
     pub phase: Phase,
+    /// A retained unissued restart waits without escalating or consuming its conversation.
+    pub native_retired_unissued: bool,
     /// Since when the session has been behind (unix seconds).
     pub behind_since: u64,
     /// The last wait a step recorded ([`upgrade::wait_word`]), empty after an act.
@@ -391,6 +397,7 @@ impl Row {
             to: st.to.clone(),
             source: st.source.clone(),
             phase: st.phase.clone(),
+            native_retired_unissued: st.native_retired_unissued,
             behind_since: read_age(st),
             wait: st.wait.clone(),
             wait_since: st.wait_since,
@@ -596,19 +603,24 @@ impl Row {
     /// Whether the upgrade will move this session to the target at a turn end with nobody's help.
     #[must_use]
     pub fn moving(&self, now: u64) -> bool {
-        matches!(
-            self.phase,
-            Phase::Pending
-                | Phase::Announced { .. }
-                | Phase::Exiting { .. }
-                | Phase::Relaunched { .. }
-        ) && !self.owner_holds(now)
+        !self.native_retired_unissued
+            && matches!(
+                self.phase,
+                Phase::Pending
+                    | Phase::Announced { .. }
+                    | Phase::Exiting { .. }
+                    | Phase::Relaunched { .. }
+            )
+            && !self.owner_holds(now)
             && self.stall(now).is_none_or(|s| s == "overdue")
     }
 
     /// Why this upgrade will not move on its own, as one word.
     #[must_use]
     pub fn stall(&self, now: u64) -> Option<String> {
+        if self.native_retired_unissued {
+            return None;
+        }
         if self.owner_holds(now) {
             return None;
         }
@@ -644,6 +656,9 @@ impl Row {
     }
 
     fn stuck(&self, now: u64) -> Option<&'static str> {
+        if self.native_retired_unissued {
+            return None;
+        }
         let seen = if self.ended_unstamped {
             self.exited_at.max(1)
         } else {
@@ -1299,6 +1314,13 @@ impl Row {
     /// The one word a roster carries for this upgrade, `<state>/<to>/<why>/<age>`.
     #[must_use]
     pub fn column(&self, now: u64) -> String {
+        if self.native_retired_unissued {
+            return format!(
+                "held/{}/native-retired-unissued/{}",
+                word(&self.to),
+                upgrade::span(now.saturating_sub(self.behind_since))
+            );
+        }
         let to = word(&self.to);
         let behind = upgrade::span(now.saturating_sub(self.behind_since));
         let (state, why, age) = match &self.phase {
@@ -1453,6 +1475,10 @@ impl Row {
     #[must_use]
     pub fn to_json(&self, now: u64) -> Value {
         let mut o = Map::new();
+        o.insert(
+            "native_retired_unissued".into(),
+            Value::Bool(self.native_retired_unissued),
+        );
         o.insert("schema".into(), Value::from(1u64));
         o.insert("kind".into(), Value::from("upgrade-status"));
         for (k, v) in [
@@ -1573,6 +1599,9 @@ impl Row {
     /// `--status`'s sentence under [`Self::line`].
     #[must_use]
     pub fn summary(&self, now: u64) -> String {
+        if self.native_retired_unissued {
+            return "restart held; its conversation is retained".into();
+        }
         let restarting = matches!(self.phase, Phase::Exiting { .. } | Phase::Relaunched { .. });
         let why = match &self.request {
             _ if self.phase == Phase::Done => "done".to_string(),
@@ -2209,6 +2238,9 @@ impl Row {
     /// How loud this upgrade is ([`Attention`]).
     #[must_use]
     pub fn attention(&self, now: u64) -> Attention {
+        if self.native_retired_unissued {
+            return Attention::Quiet;
+        }
         if self.owner_holds(now) {
             return Attention::Quiet;
         }
@@ -3570,15 +3602,19 @@ fn read_records(opts: &Opts, now: u64) -> (Vec<Row>, bool, Vec<Unread>) {
             whole = false;
             continue;
         };
-        let path = entry.path();
-        if path.extension().is_none_or(|x| x != "json")
+        let name = entry.file_name();
+        if Path::new(&name).extension().is_none_or(|x| x != "json")
             || entry.file_type().is_ok_and(|kind| kind.is_dir())
         {
             continue;
         }
-        let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+        let Some(session) = Path::new(&name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+        else {
             continue;
         };
+        let path = entry.path();
         let text = match super::read_record_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => continue,
@@ -4179,6 +4215,9 @@ fn ask_within(
     let (flying, mut candidates): (Vec<_>, Vec<_>) = candidates
         .into_iter()
         .partition(|(_, st)| st.tab == sid && st.in_flight());
+    if flying.iter().any(|(_, st)| st.native_retired_unissued) {
+        return Err(crate::harness::native_restart::WAIT_RETIRED_UNISSUED.into());
+    }
     candidates.retain(|(_, st)| {
         st.is_upgrade()
             && matches!(
@@ -4870,6 +4909,7 @@ impl View {
             let opts = Opts {
                 home: std::path::PathBuf::new(),
                 state: std::path::PathBuf::new(),
+                account_roster: None,
                 sock: Some(sock),
                 token: None,
                 only_sid: None,

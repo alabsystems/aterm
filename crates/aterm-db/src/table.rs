@@ -70,24 +70,26 @@ impl Scope {
     }
     /// The exact table identifier used in signed revocation cutoff facts.
     pub fn digest(&self) -> Digest {
-        let mut bytes = b"aterm/commons/table-id/1\0".to_vec();
-        bytes.extend_from_slice(&self.bytes());
-        Sha256::digest(&bytes)
+        let mut hash = Sha256::new();
+        hash.update(b"aterm/commons/table-id/1\0");
+        hash.update(self.bytes());
+        hash.finalize()
     }
-    fn bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(SCOPE_LEN);
-        bytes.extend_from_slice(&self.trust.network);
-        bytes.extend_from_slice(&self.trust.authority);
-        bytes.extend_from_slice(&self.trust.genesis);
-        bytes.extend_from_slice(&self.table);
-        bytes.extend_from_slice(&self.generation.to_le_bytes());
+    fn bytes(&self) -> [u8; SCOPE_LEN] {
+        let mut bytes = [0u8; SCOPE_LEN];
+        bytes[..16].copy_from_slice(&self.trust.network);
+        bytes[16..48].copy_from_slice(&self.trust.authority);
+        bytes[48..80].copy_from_slice(&self.trust.genesis);
+        bytes[80..96].copy_from_slice(&self.table);
+        bytes[96..SCOPE_LEN].copy_from_slice(&self.generation.to_le_bytes());
         bytes
     }
     fn key(&self, roster: &Digest, epoch: u64, network_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
         let prk = Zeroizing::new(hkdf_extract(b"aterm/commons/table-key/1\0", network_key));
-        let mut info = self.bytes();
-        info.extend_from_slice(roster);
-        info.extend_from_slice(&epoch.to_le_bytes());
+        let mut info = [0u8; SCOPE_LEN + 32 + 8];
+        info[..SCOPE_LEN].copy_from_slice(&self.bytes());
+        info[SCOPE_LEN..SCOPE_LEN + 32].copy_from_slice(roster);
+        info[SCOPE_LEN + 32..].copy_from_slice(&epoch.to_le_bytes());
         Zeroizing::new(hkdf_expand_32(&prk, &info))
     }
 }
@@ -363,11 +365,14 @@ impl<'a> Session<'a> {
     }
 
     /// Every current member's binding, for an application that names who has answered.
-    pub(crate) fn members(&self) -> Vec<aterm_secrets::commons::binding::Binding> {
-        let roster = aterm_secrets::client::swarm_roster(self.bootstrap.paths())
-            .ok()
-            .flatten();
-        self.access
+    pub(crate) fn members(&self) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
+        let roster = aterm_secrets::client::swarm_roster_until(
+            self.bootstrap.paths(),
+            crate::admission::deadline(),
+        )
+        .map_err(failure)?;
+        Ok(self
+            .access
             .members()
             .iter()
             .filter(|member| {
@@ -376,7 +381,7 @@ impl<'a> Session<'a> {
                     .is_some_and(|r| binding_denied_in_roster(r, member.binding()))
             })
             .map(|member| member.binding().clone())
-            .collect()
+            .collect())
     }
 
     /// Share this batch's validated control context with a detached endpoint
@@ -433,19 +438,22 @@ impl<'a> Session<'a> {
     /// Every binding [`Self::members`] names whose actor [`Self::peer_writer`] accepts, under
     /// one membership check and one roster read rather than one of each per member (each roster
     /// read verifies the vault and its log).
-    pub(crate) fn writers(&self) -> Vec<aterm_secrets::commons::binding::Binding> {
+    pub(crate) fn writers(&self) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
         if !self.access.is_current(&self.journal) {
-            return Vec::new();
+            return Err(Error::new(
+                "Commons membership changed during writer observation",
+            ));
         }
         let members = self.access.members();
-        self.members()
+        Ok(self
+            .members()?
             .into_iter()
             .filter(|binding| {
                 members.iter().any(|member| {
                     member.binding().actor() == binding.actor() && member.role() == Role::Writer
                 })
             })
-            .collect()
+            .collect())
     }
 
     /// Current admitted writers only; duplicate stable machine identities are
@@ -465,9 +473,11 @@ impl<'a> Session<'a> {
                 "Commons membership changed during target observation",
             ));
         }
-        let roster = aterm_secrets::client::swarm_roster(self.bootstrap.paths())
-            .ok()
-            .flatten();
+        let roster = aterm_secrets::client::swarm_roster_until(
+            self.bootstrap.paths(),
+            crate::admission::deadline(),
+        )
+        .map_err(failure)?;
         Ok(self
             .access
             .members()
@@ -655,18 +665,59 @@ impl<'a> Session<'a> {
     pub fn observe(bootstrap: &'a Bootstrap) -> Result<Self> {
         let journal =
             Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
-        bootstrap.revalidate_custody().map_err(failure)?;
-        Self::from_journal(bootstrap, journal, None)
+        Self::from_observed_journal(bootstrap, journal, None)
     }
 
     pub(crate) fn observe_until(
         bootstrap: &'a Bootstrap,
         deadline: std::time::Instant,
     ) -> Result<Self> {
+        Self::observe_within(bootstrap, deadline, &|| deadline)
+    }
+
+    /// [`Self::observe_until`] under [`crate::generation::Observation::observe_within`]'s two
+    /// bounds. `read_by` also stays this session's bound on its later generation checks.
+    pub(crate) fn observe_within(
+        bootstrap: &'a Bootstrap,
+        read_by: std::time::Instant,
+        wait: &dyn Fn() -> std::time::Instant,
+    ) -> Result<Self> {
         let journal =
             Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
         bootstrap.revalidate_custody().map_err(failure)?;
-        Self::from_journal(bootstrap, journal, Some(deadline))
+        let generation = if crate::generation::is_candidate(bootstrap.paths()) {
+            Some(crate::generation::Observation::observe_within(
+                bootstrap.paths(),
+                read_by,
+                wait,
+            )?)
+        } else {
+            crate::generation::guard_until(bootstrap.paths(), false, read_by)?;
+            None
+        };
+        Self::with_generation(bootstrap, journal, generation, Some(read_by))
+    }
+
+    /// Keep the read-only control prefix returned with an established bootstrap.
+    /// Equal trust does not make another directory this installation's custody,
+    /// and a writer cannot become a read-only session through this entry point.
+    pub(crate) fn from_observed_journal(
+        bootstrap: &'a Bootstrap,
+        journal: Journal,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        if journal.directory() != bootstrap.journal_dir() {
+            return Err(Error::new(
+                "Commons session journal belongs to another custody directory",
+            ));
+        }
+        if journal.is_writer() {
+            return Err(Error::new(
+                "Commons observed session requires a read-only journal",
+            ));
+        }
+        bootstrap.revalidate_custody().map_err(failure)?;
+        Self::from_journal(bootstrap, journal, deadline)
     }
 
     fn from_journal(
@@ -693,10 +744,24 @@ impl<'a> Session<'a> {
             }
             None
         };
+        Self::with_generation(bootstrap, journal, generation, deadline)
+    }
+
+    fn with_generation(
+        bootstrap: &'a Bootstrap,
+        journal: Journal,
+        generation: Option<crate::generation::Observation>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
         let access = bootstrap
             .access_in(&journal)
             .map_err(failure)?
-            .ok_or_else(|| Error::new("Commons membership is not ready for table access"))?;
+            .ok_or_else(|| {
+                Error::repair(
+                    "Commons membership is not ready for table access",
+                    aterm_types::network_state::RepairCause::NotReady,
+                )
+            })?;
         Ok(Self {
             bootstrap,
             journal,
@@ -818,6 +883,30 @@ impl<'a> Session<'a> {
     pub const fn epoch(&self) -> u64 {
         self.access.generation()
     }
+    /// The signed audience observation that identifies a Secret cell's key epoch.
+    pub(crate) fn secret_basis(&self) -> Digest {
+        *self.access.basis()
+    }
+
+    /// Derive a table key under a current or retained audience observation. The
+    /// same historical handoffs used for table operations keep inner seals readable.
+    pub(crate) fn secret_key(&self, scope: Scope, basis: &Digest) -> Result<Zeroizing<[u8; 32]>> {
+        if basis == self.access.basis() {
+            return self
+                .access
+                .with_key(&self.journal, |key| scope.key(basis, self.epoch(), key))
+                .map_err(failure);
+        }
+        let history = self
+            .bootstrap
+            .historical(&self.journal, &self.access, *basis)
+            .map_err(failure)?;
+        history
+            .with_key(&self.journal, |key| {
+                scope.key(basis, history.generation(), key)
+            })
+            .map_err(failure)
+    }
     /// The lab this session's membership belongs to.
     pub(crate) fn trust(&self) -> Trust {
         self.journal.trust()
@@ -853,10 +942,12 @@ impl<'a> Session<'a> {
     pub(crate) fn may_write(&self) -> Result<()> {
         if self.access.local().role() != Role::Writer
             || !self.access.is_current(&self.journal)
-            || aterm_secrets::client::swarm_roster(self.bootstrap.paths())
-                .ok()
-                .flatten()
-                .is_some_and(|r| binding_denied_in_roster(&r, self.access.local().binding()))
+            || aterm_secrets::client::swarm_roster_until(
+                self.bootstrap.paths(),
+                crate::admission::deadline(),
+            )
+            .map_err(failure)?
+            .is_some_and(|r| binding_denied_in_roster(&r, self.access.local().binding()))
         {
             return Err(Error::new(
                 "current Commons membership does not grant table writing",
@@ -874,10 +965,12 @@ impl<'a> Session<'a> {
         if !self.journal.is_writer()
             || self.access.local().role() != Role::Writer
             || !self.access.is_current(&self.journal)
-            || aterm_secrets::client::swarm_roster(self.bootstrap.paths())
-                .ok()
-                .flatten()
-                .is_some_and(|r| binding_denied_in_roster(&r, self.access.local().binding()))
+            || aterm_secrets::client::swarm_roster_until(
+                self.bootstrap.paths(),
+                crate::admission::deadline(),
+            )
+            .map_err(failure)?
+            .is_some_and(|r| binding_denied_in_roster(&r, self.access.local().binding()))
         {
             return Err(Error::new(
                 "current Commons membership does not grant table writing",
@@ -886,9 +979,29 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// Require the selected completed application generation for one local read.
+    /// This grants no writer role and does not change historical read semantics.
+    pub(crate) fn require_current_application_generation(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        let deadline = self
+            .generation_deadline
+            .map_or(deadline, |bound| bound.min(deadline));
+        match &self.generation {
+            Some(observation) => observation.check(true, false, deadline),
+            None => crate::generation::guard_until(self.paths(), true, deadline),
+        }
+    }
+
     fn generation_guard(&self, authoring: bool) -> Result<()> {
         let Some(observation) = &self.generation else {
-            return crate::generation::guard(self.bootstrap.paths(), authoring);
+            return crate::generation::guard_until(
+                self.bootstrap.paths(),
+                authoring,
+                self.generation_deadline
+                    .unwrap_or_else(crate::admission::deadline),
+            );
         };
         observation.check(
             authoring,
@@ -900,7 +1013,12 @@ impl<'a> Session<'a> {
 
     pub(crate) fn mutation_guard(&self) -> Result<()> {
         let Some(observation) = &self.generation else {
-            return crate::generation::allow_mutation(self.bootstrap.paths());
+            return match self.generation_deadline {
+                Some(deadline) => {
+                    crate::generation::allow_mutation_until(self.bootstrap.paths(), deadline)
+                }
+                None => crate::generation::allow_mutation(self.bootstrap.paths()),
+            };
         };
         observation.check(
             false,
@@ -939,7 +1057,10 @@ impl<'a> Session<'a> {
         {
             return Err(Error::new("table operation exceeds its bound"));
         }
-        let mut wire = b"ACTO1".to_vec();
+        let mut wire = Vec::with_capacity(
+            5 + SCOPE_LEN + 181 + causal.parents.len() * 32 + payload.len() + 16 + 64,
+        );
+        wire.extend_from_slice(b"ACTO1");
         wire.extend_from_slice(&scope.bytes());
         wire.extend_from_slice(self.access.basis());
         wire.extend_from_slice(&self.access.generation().to_le_bytes());
@@ -954,7 +1075,8 @@ impl<'a> Session<'a> {
         let salt = crypto::random()?;
         wire.extend_from_slice(&salt);
         wire.extend_from_slice(&((payload.len() + 16) as u32).to_le_bytes());
-        let mut body = payload.to_vec();
+        let mut body = Zeroizing::new(Vec::with_capacity(payload.len() + 16));
+        body.extend_from_slice(payload);
         self.access
             .with_key(&self.journal, |network_key| {
                 crypto::cipher(
@@ -965,7 +1087,7 @@ impl<'a> Session<'a> {
                 .seal_in_place_append_tag(
                     aead::Nonce::assume_unique_for_key([0; 12]),
                     aead::Aad::from(&wire),
-                    &mut body,
+                    &mut *body,
                 )
                 .map_err(|_| Error::new("table encryption failed"))
             })

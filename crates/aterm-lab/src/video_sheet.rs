@@ -87,10 +87,10 @@ impl Options {
 }
 
 fn read(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
-    let file = crate::sys::scratch_file(path)
+    let (file, meta) = crate::sys::scratch_file_with_meta(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .ok_or_else(|| format!("{}: missing file", path.display()))?;
-    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    let size = meta.len();
     if size > limit as u64 {
         return Err(format!("{}: exceeds {limit} bytes", path.display()));
     }

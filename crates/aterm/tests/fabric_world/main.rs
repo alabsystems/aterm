@@ -17,6 +17,9 @@ aterm_durable::plain_durable_flushes_in_tests!();
 
 mod harness;
 mod harness_tests;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "../support/native_claude.rs"]
+mod native_claude;
 
 mod at_rest;
 mod bridge_e2e;
@@ -44,6 +47,7 @@ mod one_state_dir;
 mod ordered;
 mod owner_ask;
 mod presence;
+mod rate_limit;
 mod receipt_edge_cases;
 mod receipts;
 mod replaced_log;

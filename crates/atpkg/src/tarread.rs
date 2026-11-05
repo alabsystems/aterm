@@ -607,7 +607,8 @@ impl<R: Read> Entry<'_, '_, R> {
         if self.size > MAX_EXTENSION_BODY {
             return Err(bad("global PAX body is implausibly large"));
         }
-        let mut body = Vec::new();
+        let mut body =
+            Vec::with_capacity(usize::try_from(self.size.saturating_add(1)).unwrap_or(0));
         self.read_to_end(&mut body)?;
         if body.len() as u64 != self.size {
             return Err(io::Error::new(

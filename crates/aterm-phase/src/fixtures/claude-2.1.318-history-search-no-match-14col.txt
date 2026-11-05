@@ -1,0 +1,51 @@
+# claude-code 2.1.318 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (14x50, aterm 0.154.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Claude Code's prompt-history search (ctrl+r) open in a 14-column window, query zzq matching nothing, over an empty composer; the search's label breaks within its letters in its own column beside the query, and a blank row stands within it: `no z… ⏵⏵`, a blank row, then `ma`, `tc`, `hi`, `ng`, `p`, `ro`, `mp`, `t:` · cursor=39,8
+           ng
+           /…/
+           tmp
+           /at
+           .Qr
+           OB/
+           pro
+           j
+
+
+❯ alpha old
+  prompt one
+
+⏺ Hi! I am the
+  local lab
+  stub, not a
+  model.
+  (reply 1)
+
+✻ Brewed for
+  0s · done
+  11:15 AM
+
+❯ beta old
+  prompt two
+
+⏺ Hi! I am the
+  local lab
+  stub, not a
+  model.
+  (reply 2)
+
+✻ Churned for
+  0s · done
+  11:15 AM
+
+──────────────
+❯
+──────────────
+  no z… ⏵⏵
+
+  ma
+  tc
+  hi
+  ng
+  p
+  ro
+  mp
+  t:
+

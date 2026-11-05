@@ -1373,9 +1373,9 @@ impl Shot<'_> {
     }
 
     fn keep(&self, suffix: &str, r: &Reply) {
-        let _ = std::fs::write(self.path(suffix), &r.stdout);
+        let _ = crate::util::write_fresh(&self.path(suffix), &r.stdout);
         if !r.stderr.is_empty() {
-            let _ = std::fs::write(self.path(&format!("{suffix}.stderr")), &r.stderr);
+            let _ = crate::util::write_fresh(&self.path(&format!("{suffix}.stderr")), &r.stderr);
         }
     }
 
@@ -1466,9 +1466,9 @@ impl Shot<'_> {
                 return Err(reply_text(&reply));
             }
             let (png, metadata) = image_bytes(&reply.stdout)?;
-            std::fs::write(dest, png).map_err(|e| format!("{}: {e}", dest.display()))?;
+            crate::util::write_fresh(dest, png).map_err(|e| format!("{}: {e}", dest.display()))?;
             let meta = dest.with_extension("image-meta.txt");
-            std::fs::write(&meta, format!("{metadata}\n"))
+            crate::util::write_fresh(&meta, format!("{metadata}\n"))
                 .map_err(|e| format!("{}: {e}", meta.display()))
         })();
         if let Err(error) = &saved {
@@ -1550,7 +1550,8 @@ impl Shot<'_> {
         match kept {
             Ok(files) => {
                 for (suffix, body) in files {
-                    let _ = std::fs::write(self.path(&format!("{frame}.{suffix}")), body);
+                    let _ =
+                        crate::util::write_fresh(&self.path(&format!("{frame}.{suffix}")), body);
                 }
             }
             Err(error) => {
@@ -1572,7 +1573,7 @@ impl Shot<'_> {
         };
         match twin {
             Ok(png) => {
-                let _ = std::fs::write(self.path(&format!("{frame}.clean.png")), png);
+                let _ = crate::util::write_fresh(&self.path(&format!("{frame}.clean.png")), png);
             }
             Err(error) => {
                 self.note(&format!("settings card clean: {error}"));
@@ -1718,8 +1719,8 @@ impl Shot<'_> {
         let window = crate::util::read_regular_text(&self.path("dims.txt")).unwrap_or_default();
         match pane_dims(&window, &panes.stdout) {
             Some(pane) => {
-                let _ = std::fs::write(self.path("window.dims.txt"), &window);
-                let _ = std::fs::write(self.path("dims.txt"), format!("{pane}\n"));
+                let _ = crate::util::write_fresh(&self.path("window.dims.txt"), &window);
+                let _ = crate::util::write_fresh(&self.path("dims.txt"), format!("{pane}\n"));
             }
             None => {
                 self.note("the caret's pane's grid is not known; its frames keep the window's");
@@ -2062,7 +2063,7 @@ fn gallery_program(
         return Ok(args);
     }
     let script = dir.join("paint.sh");
-    std::fs::write(&script, paint(scenario, theme))
+    crate::util::write_fresh(&script, paint(scenario, theme))
         .map_err(|e| format!("cannot write {}: {e}", script.display()))?;
     Ok(vec![
         "/bin/sh".to_string(),
@@ -2139,9 +2140,16 @@ impl Gallery {
     }
 
     /// Stop it by its group and keep its log as `<name>.gui.log`; `--keep` retains its world.
-    fn end(&self, mut live: Live, name: &str) {
-        live.inst.stop();
-        let _ = std::fs::copy(&live.inst.log, self.out.join(format!("{name}.gui.log")));
+    fn end(&mut self, mut live: Live, name: &str) {
+        if let Err(why) = live.inst.stop() {
+            live._world.keep();
+            self.fails += 1;
+            eprintln!("trail-gallery: [{name}] instance cleanup failed: {why}");
+        }
+        let _ = crate::util::copy_regular_file(
+            &live.inst.log,
+            self.out.join(format!("{name}.gui.log")),
+        );
     }
 
     /// Every style the Settings picker offers, read from a probe instance.
@@ -2175,9 +2183,9 @@ impl Gallery {
                 }
             }
         }
-        live.inst.stop();
+        let cleanup = live.inst.stop();
         drop(live);
-        found.ok_or_else(|| {
+        let found = found.ok_or_else(|| {
             Fail::exit(
                 3,
                 format!(
@@ -2185,7 +2193,8 @@ impl Gallery {
                     self.aterm.display()
                 ),
             )
-        })
+        });
+        crate::instance::after_stop(found, cleanup)
     }
 
     /// One style, theme and scenario on a fresh instance.
@@ -2238,7 +2247,7 @@ impl Gallery {
         rainbow_expected: bool,
     ) -> Result<(), Stopped> {
         let tsv_path = self.out.join(format!("{name}.frames.tsv"));
-        let tsv = File::create(&tsv_path);
+        let tsv = crate::util::create_regular_file(&tsv_path);
         let wire = inst.connect().map_err(|e| {
             eprintln!("trail-gallery: [{name}] no held control connection ({e}); keys and ticks are client runs");
         });
@@ -2345,7 +2354,7 @@ pub fn cmd_trail_gallery(args: &[String]) -> Res {
         )
     })?;
     let pids_path = out.join("gallery.pids");
-    let pids = File::create(&pids_path).map_err(|e| {
+    let pids = crate::util::create_regular_file(&pids_path).map_err(|e| {
         Fail::exit(
             3,
             format!("trail-gallery: cannot write {}: {e}", pids_path.display()),

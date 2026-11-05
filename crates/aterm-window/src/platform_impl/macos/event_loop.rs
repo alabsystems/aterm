@@ -22,7 +22,8 @@ use aterm_objc::cf::{
 // `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
 // and its framework bindings.
 use aterm_objc::send::{
-    send_bool_sel, send_id, send_id_usize, send_usize, send_v, send_v_id, send_v_id_bool,
+    send_bool_cls, send_bool_sel, send_id, send_id_usize, send_usize, send_v, send_v_id,
+    send_v_id_bool,
 };
 use aterm_objc::{autoreleasepool, class, sel, Id, MainThread, Obj};
 
@@ -37,6 +38,7 @@ use super::event::dummy_event;
 use super::monitor::{self, MonitorHandle};
 use super::observer::setup_control_flow_observers;
 use super::wake_queue;
+use super::window::WinitWindow;
 use crate::error::EventLoopError;
 use crate::event::Event;
 use crate::event_loop::{ActiveEventLoop as RootWindowTarget, ControlFlow, EventLoopClosed};
@@ -452,21 +454,33 @@ pub(super) unsafe fn stop_app_immediately(app: Id) {
     });
 }
 
-/// Closes all application windows on exit.
+/// Closes this backend's own windows on exit, so each delegate's `windowWillClose:` runs.
+///
+/// LOCAL PATCH (aterm): only `WinitWindow`s are closed, where upstream closed every window in
+/// `-[NSApp windows]`. That list also holds windows AppKit owns: an `NSAlert`'s panel and, on
+/// macOS 27, the panel's `_NSGlassEffectWindow` child, which the panel's frame view holds
+/// strongly and which is released when closed. Closing that child frees it under the frame view,
+/// and when an alert was answered in the same run-loop turn as the exit (a Quit confirmation),
+/// the turn's pool then deallocates the frame view, which releases the freed child: SIGSEGV in
+/// `objc_release`. Those windows are AppKit's to close.
 /// # Safety
 /// `app` must be the live shared `NSApplication`.
 pub(super) unsafe fn notify_windows_of_exit(app: Id) {
     // LOCAL PATCH (aterm): the array is walked by index, in an explicit pool: `-windows` is +0
     // autoreleased and `-close` runs a whole teardown inside it.
     autoreleasepool(|_| {
-        // SAFETY: `-windows`, `-count`, `-objectAtIndex:` and `-close` match AppKit signatures on
-        // `app`; `-windows` answers a snapshot, so a `-close` cannot shift the indices.
+        let own = <WinitWindow as aterm_objc::ClassType>::class();
+        // SAFETY: `-windows`, `-count`, `-objectAtIndex:`, `-isKindOfClass:` (`B@:#`) and
+        // `-close` match AppKit signatures on `app` and its windows; `-windows` answers a
+        // snapshot, so a `-close` cannot shift the indices, and each window is live in it.
         unsafe {
             let windows = send_id(app, sel!(windows));
             let n = send_usize(windows, sel!(count));
             for i in 0..n {
                 let window = send_id_usize(windows, sel!(objectAtIndex:), i);
-                send_v(window, sel!(close));
+                if send_bool_cls(window, sel!(isKindOfClass:), own) {
+                    send_v(window, sel!(close));
+                }
             }
         }
     });

@@ -290,7 +290,7 @@ fn setup_field_names_what_a_parked_run_asks_for_and_what_is_on_offer() {
             vec![offer.clone(), observed(vault, Standing::InPlace, None)],
         )
     };
-    assert_eq!(setup_field(&finished), "done;offered:debugger");
+    assert_eq!(setup_field(&finished), "pending:debugger;needs:debugger");
     let no_offer = SetupStatus {
         finished: true,
         ..status(selection, vec![observed(vault, Standing::InPlace, None)])
@@ -315,7 +315,7 @@ fn setup_field_names_what_a_parked_run_asks_for_and_what_is_on_offer() {
         *offered = offer.clone();
         assert_eq!(
             setup_field(&parked),
-            "done;asking:vault;offered:debugger",
+            "pending:debugger;needs:debugger",
             "{parked_as}"
         );
     }
@@ -794,7 +794,7 @@ fn a_verified_fda_grant_recovers_a_waiting_restore_with_permissions_held() {
     assert!(!RECOVERY.with(|state| state.borrow().0));
     assert_eq!(records().len(), before, "a completed fact is no admission");
     assert!(held.access_revision().is_none());
-    assert!(!held.person_permission_admission_stands());
+    assert!(!held.permission_steps_admitted());
 }
 
 /// The Local Network step: nothing before an approved revision; then once per revision, first,
@@ -1906,8 +1906,12 @@ fn the_local_network_step_waits_for_its_moment_and_honours_the_opt_outs() {
     });
     approve(&mut app, 5);
     app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired, "System State is not frontmost");
-    assert_eq!(app.system_state_access_step(), None);
+    assert_eq!(
+        triggers(),
+        fired + 1,
+        "the step starts without System State in front"
+    );
+    let fired = triggers();
 
     for privacy in [
         crate::app_config::PrivacyConfig {
@@ -2001,10 +2005,10 @@ fn a_held_local_network_step_names_its_hold_once_per_change() {
     assert_eq!(triggers(), fired, "held: nothing asked");
     assert_eq!(
         app.access_steps.local_network_held.as_deref(),
-        Some(&["System State is not in view in the aterm window last focused".to_owned()][..]),
-        "the revision no longer holds it; out of view, only that is said"
+        Some(&["a key was typed into aterm in the last 10 s".to_owned()][..]),
+        "the keyboard rest is reported even with System State out of view"
     );
-    for (focused, typed) in [(false, None), (true, Some(now)), (false, Some(now))] {
+    for (focused, typed) in [(false, Some(now)), (true, Some(now)), (false, Some(now))] {
         focus(&mut app, focused);
         app.last_keystroke_at = typed;
         assert_eq!(
@@ -2014,28 +2018,6 @@ fn a_held_local_network_step_names_its_hold_once_per_change() {
         );
     }
 
-    assert!(app.open_system_state_tab(), "System State in front");
-    let wid = app.frontmost_window.expect("a front window");
-    assert!(app.commit_glassless_native_frame(wid));
-    let line = app
-        .note_local_network_hold(now, Some(5))
-        .expect("the hold changed");
-    assert_eq!(
-        line,
-        "system state: the Local Network step waits (revision 5): no aterm window has keyboard \
-         focus",
-        "System State in view: the front's own part, and no quiet part"
-    );
-    focus(&mut app, true);
-    assert!(app.system_state_frontmost(), "precondition: in front");
-    let line = app
-        .note_local_network_hold(now, Some(5))
-        .expect("the hold changed");
-    assert_eq!(
-        line,
-        "system state: the Local Network step waits (revision 5): a key was typed into aterm in \
-         the last 10 s"
-    );
     assert_eq!(
         app.note_local_network_hold(now, Some(5)),
         None,
@@ -2074,8 +2056,11 @@ fn system_state_out_of_view_is_the_local_network_steps_one_hold() {
         approve(&mut app, 5);
         app
     };
-    let now = Instant::now() + crate::devtools_helper::COLD_START_SETTLE;
-    let said = |app: &App| app.local_network_holds(now);
+    let said = |app: &App| {
+        app.local_network_holds(
+            Instant::now() + crate::devtools_helper::COLD_START_SETTLE + Duration::from_secs(1),
+        )
+    };
 
     let mut behind = fresh();
     assert!(
@@ -2086,7 +2071,7 @@ fn system_state_out_of_view_is_the_local_network_steps_one_hold() {
         focus(&mut behind, focused);
         assert_eq!(
             said(&behind),
-            ["System State is not in view in the aterm window last focused"],
+            ["a macOS dialog or page this process started counts as up"],
             "behind, a dialog counting up, focused {focused}"
         );
     }
@@ -2109,7 +2094,7 @@ fn system_state_out_of_view_is_the_local_network_steps_one_hold() {
         focus(&mut split, focused);
         assert_eq!(
             said(&split),
-            ["System State is not the active view in the aterm window last focused"],
+            ["a macOS dialog or page this process started counts as up"],
             "laid out beside the active pane, focused {focused}"
         );
     }
@@ -2117,7 +2102,10 @@ fn system_state_out_of_view_is_the_local_network_steps_one_hold() {
     let mut active = fresh();
     assert!(active.open_system_state_tab(), "System State in front");
     focus(&mut active, false);
-    assert_eq!(said(&active), ["no aterm window has keyboard focus"]);
+    assert_eq!(
+        said(&active),
+        ["a macOS dialog or page this process started counts as up"]
+    );
 }
 
 /// While System State's Local Network step is still to run and nothing but a lasting reason
@@ -2271,17 +2259,12 @@ fn the_steps_wait_while_macos_idle_time_cannot_be_read() {
     let now = Instant::now() + crate::devtools_helper::COLD_START_SETTLE + Duration::from_secs(1);
     app.last_person_input_at = now.checked_sub(crate::devtools_helper::PRESENT_WITHIN);
     app.tick_local_network_step(now);
-    assert_eq!(triggers(), fired, "nobody known to be at the Mac: no alert");
     assert_eq!(
-        app.access_steps.local_network_held.as_deref(),
-        Some(
-            &[
-                "macOS's idle time could not be read, and nobody typed, clicked or scrolled in \
-               aterm in the last 5 min"
-                    .to_owned()
-            ][..]
-        )
+        triggers(),
+        fired + 1,
+        "an unavailable idle clock does not block setup"
     );
+    assert_eq!(app.access_steps.local_network_held, None);
     let clicked = now + Duration::from_secs(1);
     app.last_person_input_at = Some(clicked);
     app.tick_local_network_step(clicked);
@@ -2349,19 +2332,10 @@ fn the_steps_key_rest_counts_from_aterm_taking_focus_back() {
     app.tick_local_network_step(now);
     assert_eq!(
         triggers(),
-        fired,
-        "keys typed elsewhere may still be coming"
+        fired + 1,
+        "a focus change does not restart automatic setup's keyboard rest"
     );
-    assert_eq!(
-        app.access_steps.local_network_held.as_deref(),
-        Some(
-            &[
-                "an aterm window took keyboard focus back in the last 10 s (keys typed while none \
-               had it were not seen)"
-                    .to_owned()
-            ][..]
-        )
-    );
+    assert_eq!(app.access_steps.local_network_held.as_deref(), None);
     app.tick_local_network_step(back + QUIET_FOR);
     assert_eq!(
         triggers(),
@@ -3207,11 +3181,11 @@ fn the_windows_own_steps_wait_for_system_state_through_the_tick() {
     }
     assert_eq!(
         test_arms::fda_counts().0,
-        opens,
-        "System State is not in front"
+        opens + 1,
+        "automatic acquisition starts while System State is in the background"
     );
-    assert_eq!(app.devtools_helper.fda_queued(), Some(Origin::Automatic));
-    assert_eq!(app.system_state_access_step(), None);
+    assert_eq!(app.devtools_helper.fda_queued(), None);
+    assert_eq!(app.system_state_access_step(), Some(Access::FullDiskAccess));
 
     set_front(true);
     let t2 = t1 + RECHECK_EVERY * 3;
@@ -3237,8 +3211,8 @@ fn the_windows_own_steps_wait_for_system_state_through_the_tick() {
     app.tick_consent_lanes(t3);
     app.tick_consent_lanes(t3 + RECHECK_EVERY);
     assert!(
-        !app.consent_launch.walking(),
-        "not while System State is away"
+        app.consent_launch.walking(),
+        "folder acquisition starts without opening System State"
     );
     set_front(true);
     app.tick_consent_lanes(t3 + RECHECK_EVERY * 2);
@@ -3299,7 +3273,11 @@ fn a_clients_act_on_full_disk_access_is_held_as_the_windows_own() {
     assert_eq!(opens(), before);
     set_front(false);
     app.tick_consent_lanes(Instant::now());
-    assert_eq!(opens(), before, "it waits for the step moment");
+    assert_eq!(
+        opens(),
+        before + 1,
+        "it starts without a visit to System State"
+    );
     set_front(true);
     app.tick_consent_lanes(Instant::now() + crate::devtools_helper::RECHECK_EVERY);
     assert_eq!(opens(), before + 1);
@@ -3450,10 +3428,7 @@ fn a_debugger_turned_off_on_record_is_the_rows_opt_out_at_launch() {
     ];
     for (name, observed, want) in cases {
         let app = launched(observed);
-        assert!(
-            !app.person_permission_admission_stands(),
-            "{name}: no admission"
-        );
+        assert!(!app.permission_steps_admitted(), "{name}: no admission");
         assert_eq!(
             app.access_opt_outs(),
             [None, None, want, None],
@@ -3754,10 +3729,14 @@ fn a_trigger_that_found_no_lan_looks_again_once_the_network_moves_at_its_moment(
     app.tick_local_network_step(moved);
     assert_eq!(
         app.next_access_step_deadline(moved),
-        Some(moved + RECHECK_EVERY),
-        "focused on a terminal tab: the next look for its moment"
+        None,
+        "the network move was consumed while aterm was in the background"
     );
-    assert_eq!(failed_triggers(), tried + 1, "never away from its moment");
+    assert_eq!(
+        failed_triggers(),
+        tried + 2,
+        "retried without waiting for focus"
+    );
 
     // Back at System State: it looks, finds no LAN again, and waits for the next move.
     app.access_steps.set_reach(reach);
@@ -3780,7 +3759,7 @@ fn a_trigger_that_found_no_lan_looks_again_once_the_network_moves_at_its_moment(
     });
     approve(&mut app, 8);
     app.tick_local_network_step(back);
-    assert_eq!(app.access_steps.local_network_retry, None);
+    assert_eq!(app.access_steps.local_network_retry, Some((8, None)));
     assert!(
         app.next_access_step_deadline(back)
             .is_none_or(|at| at > back),
@@ -3845,12 +3824,16 @@ fn a_trigger_with_no_socket_looks_again_a_minute_later_at_its_moment() {
         Some(due + retry),
         "focused on a terminal tab: the retry was moved on a minute"
     );
-    assert_eq!(failed_triggers(), tried + 1, "never away from its moment");
+    assert_eq!(
+        failed_triggers(),
+        tried + 2,
+        "retried while System State was in the background"
+    );
     app.access_steps.set_reach(reach);
     app.tick_local_network_step(due + retry);
     assert_eq!(
         failed_triggers(),
-        tried + 2,
+        tried + 3,
         "back at its moment: it looks again"
     );
 }
@@ -4049,10 +4032,11 @@ fn a_clients_act_on_a_row_waits_for_the_step_moment() {
     let opens = test_arms::opens();
     assert!(!app.open_access_from_system_state(Access::DeveloperTools, false));
     assert_eq!(app.devtools_helper.queued(), Some(Origin::SystemStateAct));
+    app.access_steps.set_reach(with_dialog_up);
     for park in 0..3 {
         app.tick_consent_lanes(t0 + RECHECK_EVERY * park);
     }
-    assert_eq!(test_arms::opens(), opens, "System State is not in front");
+    assert_eq!(test_arms::opens(), opens, "another dialog owns the slot");
     set_front(true);
     app.access_steps.set_reach(with_dialog_up);
     let t1 = t0 + RECHECK_EVERY * 3;
@@ -4073,12 +4057,13 @@ fn a_clients_act_on_a_row_waits_for_the_step_moment() {
         crate::platform::take_opened_urls().is_empty(),
         "queued, never opened at once"
     );
+    app.access_steps.set_reach(with_dialog_up);
     for park in 0..3 {
         app.tick_consent_lanes(t0 + RECHECK_EVERY * park);
     }
     assert!(
         crate::platform::take_opened_urls().is_empty(),
-        "System State is not in front"
+        "another dialog owns the slot"
     );
     set_front(true);
     app.access_steps.set_reach(with_dialog_up);
@@ -4107,8 +4092,9 @@ fn a_clients_act_on_a_row_waits_for_the_step_moment() {
         "opened once"
     );
 
-    // An act System State never comes to the front for lapses.
+    // An act whose dialog slot never becomes available lapses.
     set_front(false);
+    app.access_steps.set_reach(with_dialog_up);
     assert!(!app.open_access_from_system_state(Access::LocalNetwork, false));
     let asked = t2 + super::PANE_HOLD;
     app.tick_consent_lanes(asked + ASKED_LAPSE);
@@ -5636,12 +5622,8 @@ fn an_ask_the_developer_tools_step_carried_waits_for_the_steps_spctl_run() {
                 RUNS.load(Ordering::SeqCst),
                 app.devtools_helper.queued()
             ),
-            if refused_at_end {
-                (opens, 1, Some(Origin::SystemStateAct))
-            } else {
-                (opens, 1, Some(Origin::Automatic))
-            },
-            "refused at its end {refused_at_end}: the moment passed, so nothing comes up"
+            (opens + 1, 1, None),
+            "refused at its end {refused_at_end}: an available slot opens automatically"
         );
         HANDED.with(|handed| handed.set(true));
         set_front(true);
@@ -5765,6 +5747,7 @@ fn a_full_disk_access_grant_brings_the_developer_tools_page_in_the_same_process(
             Some(Origin::Automatic),
             "not on the list: the page is asked for in this process"
         );
+        let opens = test_arms::opens();
         set_front(false);
         let start = Instant::now();
         while app.devtools_helper.listing_ahead() {
@@ -5797,7 +5780,6 @@ fn a_full_disk_access_grant_brings_the_developer_tools_page_in_the_same_process(
                 "PRECONDITION: the list read again names Terminal"
             );
         }
-        let opens = test_arms::opens();
         parks(&mut app, &mut t, 1);
         assert_eq!(
             test_arms::opens(),
@@ -6607,8 +6589,8 @@ fn a_switch_off_at_launch_holds_the_access_check_until_it_is_on() {
         parks(&mut app, &mut t, 2);
         assert_eq!(
             test_arms::fda_counts().0,
-            opens,
-            "{off}: not before the step moment"
+            opens + 1,
+            "{off}: acquisition starts in the background"
         );
         set_front(true);
         parks(&mut app, &mut t, 1);

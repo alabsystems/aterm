@@ -295,6 +295,29 @@ pub const fn federation_seq_clamp(src_offset: u64, max_seq: u64) -> u64 {
     }
 }
 
+/// `relay_floor_raise` as `relay_island.rs` defines it in Clean:
+/// `if floor < seq then seq else floor`.
+#[cfg(any(test, all(feature = "retention", feature = "relay")))]
+#[must_use]
+pub const fn relay_floor_raise(floor: u64, seq: u64) -> u64 {
+    if floor < seq {
+        seq
+    } else {
+        floor
+    }
+}
+
+/// `relay_floor_admits` as `relay_island.rs` defines it in Clean:
+/// `if floor < seq then 1 else 0`.
+#[must_use]
+pub const fn relay_floor_admits(floor: u64, seq: u64) -> u64 {
+    if floor < seq {
+        1
+    } else {
+        0
+    }
+}
+
 /// `failover_epoch_advance` as `failover_island.rs` defines it in Clean:
 /// `if cur_epoch < proposed_epoch then proposed_epoch else cur_epoch`.
 #[must_use]
@@ -498,6 +521,11 @@ mod tests {
         );
         assert_eq!(answers(|[a, b]| crate::failover_epoch_advance(a, b)), want);
         assert_eq!(answers(|[a, b]| super::failover_epoch_advance(a, b)), want);
+        assert_eq!(
+            answers(|[a, b]| crate::relay_floor::relay_floor_raise(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::relay_floor_raise(a, b)), want);
         assert_eq!(answers(|[a, b]| crate::refill_join_cursor_max(a, b)), want);
         assert_eq!(answers(|[a, b]| super::refill_join_cursor_max(a, b)), want);
         let want = "000011012";
@@ -517,6 +545,12 @@ mod tests {
         assert_eq!(answers(|[a, b]| super::refill_debt_clamp(a, b)), want);
         assert_eq!(answers(|[a, b]| crate::sticky_fence_min_seq(a, b)), want);
         assert_eq!(answers(|[a, b]| super::sticky_fence_min_seq(a, b)), want);
+        let want = "011001000";
+        assert_eq!(
+            answers(|[a, b]| crate::relay_floor::relay_floor_admits(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::relay_floor_admits(a, b)), want);
         let want = "100110111";
         assert_eq!(
             answers(|[a, b]| crate::sticky_fence_seq_allowed(a, b)),

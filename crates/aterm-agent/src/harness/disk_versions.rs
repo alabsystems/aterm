@@ -441,7 +441,7 @@ impl Hashes {
             }
             hash.update(&buf[..n]);
             read = read.saturating_add(n as u64);
-            super::beat::tick(1);
+            aterm_uds::progress::tick();
         }
         let after = file.metadata().map_err(err)?;
         if Stamp::of(&file, &after) != stamp || read != stamp.len {

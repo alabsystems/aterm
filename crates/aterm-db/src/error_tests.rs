@@ -109,6 +109,18 @@ fn failure_words_do_not_create_a_local_contention_classification() {
 }
 
 #[test]
+fn pending_enrollment_is_typed_and_retains_its_classification_through_context() {
+    let pending = Error::enrollment_pending().context("table observation");
+    assert!(pending.is_enrollment_pending());
+    assert!(
+        !pending.is_busy(),
+        "enrollment is distinct from writer contention"
+    );
+    assert!(!Error::new(ENROLLMENT_PENDING).is_enrollment_pending());
+    assert!(!Error::busy().is_enrollment_pending());
+}
+
+#[test]
 fn local_context_retains_known_contention_and_snapshot_changes() {
     use aterm_secrets::ErrorKind;
     let mut errors = vec![Error::busy(), Error::snapshot_changed()];

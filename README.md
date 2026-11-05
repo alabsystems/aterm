@@ -216,7 +216,7 @@ Type `sit`, `kitty jump` or `good kitty` and a space, and the cat does it
 </p>
 
 `cursor_trail_style` takes `rainbow kitty pet` (also `rainbow kitty`, `kitty`),
-`rainbow kitty underline`, `rainbow dog pet`, `rainbow kitty flying`,
+`rainbow underline`, `rainbow dog pet`, `rainbow kitty flying`,
 `rainbow kitty flat`, `phaser`, `fire`, `water`, `laser` (shown as Lightning),
 `comet`, `sparkle`, `lumen`, `beam`, `classic` or `off`; Settings ▸ Cursor
 Styles previews each, and Settings ▸ Sound picks the typing sound. **Sparkle

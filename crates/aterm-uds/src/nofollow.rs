@@ -233,23 +233,37 @@ pub fn open_evtonly(_path: &Path, _want: Kind) -> io::Result<OwnedFd> {
 /// # Errors
 /// `open(2)`'s, as [`open_evtonly`]'s; `EFTYPE` for a path that is not a regular file
 /// ([`not_regular`]); `Unsupported` off macOS.
+pub fn open_reader(path: &Path) -> io::Result<OwnedFd> {
+    open_reader_with_identity(path).map(|(fd, _)| fd)
+}
+
+/// [`open_reader`], paired with the [`Identity`] from the admission `fstat(2)`.
+/// # Errors
+/// Same as [`open_reader`].
 #[cfg(target_os = "macos")]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn open_reader(path: &Path) -> io::Result<OwnedFd> {
+pub fn open_reader_with_identity(path: &Path) -> io::Result<(OwnedFd, Identity)> {
     use std::os::fd::AsFd as _;
     let fd = open_with(path, libc::O_RDONLY | libc::O_NONBLOCK)?;
     let st = fstat_of(fd.as_fd())?;
     if kind_of_mode(st.st_mode) != Kind::File {
         return Err(io::Error::from_raw_os_error(libc::EFTYPE));
     }
-    Ok(fd)
+    Ok((
+        fd,
+        Identity {
+            dev: u64::from(st.st_dev.cast_unsigned()),
+            ino: st.st_ino,
+            size: u64::try_from(st.st_size).unwrap_or(0),
+        },
+    ))
 }
 
 /// See the macOS twin: nothing is opened here.
 /// # Errors
 /// Always `Unsupported`.
 #[cfg(not(target_os = "macos"))]
-pub fn open_reader(_path: &Path) -> io::Result<OwnedFd> {
+pub fn open_reader_with_identity(_path: &Path) -> io::Result<(OwnedFd, Identity)> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 

@@ -24,8 +24,8 @@ fn home() -> aterm_tempfile::TempDir {
         std::fs::Permissions::from_mode(0o600),
     )
     .expect("private token");
-    std::fs::write(dir.path().join("config.toml"), format!(
-        "default_model = \"model\"\n[providers.\"{PROVIDER}\"]\ntype = \"kimi\"\nbase_url = \"{}\"\napi_key = \"\"\n[providers.\"{PROVIDER}\".oauth]\nstorage = \"file\"\nkey = \"oauth/kimi-code-env-0e4f99c69cc27850\"\noauth_host = \"https://auth.kimi.ai\"\n[models.model]\nprovider = \"{PROVIDER}\"\n", base(Region::Global))).expect("config");
+    aterm_uds::atomic_file::write(&dir.path().join("config.toml"), format!(
+        "default_model = \"model\"\n[providers.\"{PROVIDER}\"]\ntype = \"kimi\"\nbase_url = \"{}\"\napi_key = \"\"\n[providers.\"{PROVIDER}\".oauth]\nstorage = \"file\"\nkey = \"oauth/kimi-code-env-0e4f99c69cc27850\"\noauth_host = \"https://auth.kimi.ai\"\n[models.model]\nprovider = \"{PROVIDER}\"\n", base(Region::Global)).as_bytes(), 0o600).expect("config");
     dir
 }
 

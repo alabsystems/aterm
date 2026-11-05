@@ -112,6 +112,17 @@ fn resolve(path: &Path) -> io::Result<Location> {
     }
 }
 
+/// Canonical spelling, resolving existing ancestors even when the leaf is absent.
+/// # Errors
+/// The path is relative, unreadable, dangling, non-directory, or its missing
+/// suffix cannot be resolved without ambiguity.
+pub(in crate::harness) fn canonical_directory(path: &Path) -> Result<PathBuf, String> {
+    match resolve(path).map_err(|why| why.to_string())? {
+        Location::Directory { path, .. } => Ok(path),
+        Location::Default => Err("directory is unspecified".into()),
+    }
+}
+
 /// Another roster row or binding that retains this explicit directory.
 /// Unknown filesystem ownership refuses instead of treating a failed lookup as separation.
 pub(in crate::harness) fn retained_directory_owner<'a>(

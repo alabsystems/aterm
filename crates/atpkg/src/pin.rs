@@ -87,8 +87,10 @@ pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bo
         .join(format!(".pins.tmp-{}-{seq}", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let staged = crate::platform::create_private_new(&tmp)
-        .and_then(|mut f| io::Write::write_all(&mut f, body.as_bytes()))
-        .and_then(|()| crate::platform::harden_file(&tmp))
+        .and_then(|mut f| {
+            io::Write::write_all(&mut f, body.as_bytes())?;
+            crate::platform::set_mode_on(&f, 0o600)
+        })
         .and_then(|()| fs::rename(&tmp, &dest));
     if let Err(err) = staged {
         let _ = fs::remove_file(&tmp);

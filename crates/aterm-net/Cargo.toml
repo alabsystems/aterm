@@ -25,15 +25,18 @@ aterm-digest = { workspace = true }
 # The workspace's one hex codec: a proof's tag and the certificate fingerprint.
 aterm-codec = { workspace = true }
 # Portable fleet-name vocabulary is shared with census readers on every platform;
-# on Unix, whether this process is a private aterm (`not_own_account`, its state
-# root), which reaches no fleet default port (loopback.rs).
+# `reach`, the person's ports (the fleet's and LAN toolset sharing's), which a
+# private aterm neither listens on nor dials, asked first by loopback.rs.
 aterm-types = { workspace = true }
 rustls = { workspace = true }
-# Each node's own key (fleet.rs, the module doc's Nodes): Ed25519 signing and
-# verification. ring is already rustls's provider here (the workspace row's
-# `ring` feature), so this adds an edge, not a crate; Ed25519 takes none of
-# its features.
+# Each node's own key (fleet.rs, the module doc's Nodes): Ed25519 signing. ring is
+# already rustls's provider here (the workspace row's `ring` feature), so this adds
+# an edge, not a crate; Ed25519 takes none of its features.
 ring = { workspace = true }
+# Every Ed25519 verification (`NodeKey::verifies`): astream's strict check, which
+# refuses the small-order keys and commitments ring alone takes. Its `signature`
+# feature is ring, zeroize and getrandom, all already in this graph.
+astream-aead = { path = "../../vendor/astream/crates/astream-aead", default-features = false, features = ["signature"] }
 # The anchor attributes' registry (std-only): the `#[cfg_attr(any(test,
 # debug_assertions), aterm_spec_anchor::refines(…))]` anchors of
 # `NetSlotDisplacement` (the listener's slots and the watchdog's claim,

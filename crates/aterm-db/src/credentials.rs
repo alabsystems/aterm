@@ -780,24 +780,29 @@ fn facts(paths: &Paths, now_ms: u64) -> Result<need::Facts> {
     need::facts(paths, now_ms / MS).map_err(crate::table::failure)
 }
 
-fn context(facts: &need::Facts, session: &Session<'_>, scope: Scope, now_ms: u64) -> Context {
-    Context {
+fn context(
+    facts: &need::Facts,
+    session: &Session<'_>,
+    scope: Scope,
+    now_ms: u64,
+) -> Result<Context> {
+    Ok(Context {
         policy: facts.policy,
         signer: facts.sight.as_ref().map(|sight| sight.signer),
         network: scope.trust().network,
         members: session
-            .members()
+            .members()?
             .iter()
             .map(aterm_secrets::commons::binding::Binding::actor)
             .collect(),
         scope: Some(scope.digest()),
         writers: session
-            .writers()
+            .writers()?
             .into_iter()
             .map(|binding| (binding.actor(), binding))
             .collect(),
         now_ms,
-    }
+    })
 }
 
 fn with_store<T>(
@@ -837,7 +842,7 @@ pub fn observe(paths: &Paths) -> Result<Observation> {
     let at_ms = now_ms();
     let facts = facts(paths, at_ms)?;
     crate::documents::application::observe_store(paths, descriptor, |session, store, scope| {
-        let context = context(&facts, session, scope, at_ms);
+        let context = context(&facts, session, scope, at_ms)?;
         let log = Log::read_with(session, store, scope, decode)?;
         let snapshot = log.snapshot();
         Ok(Observation {
@@ -978,7 +983,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
     let facts = facts(paths, now_ms)?;
     let mut moves = Vec::new();
     let (mut report, network, book) = with_store(paths, |session, store, scope| {
-        let context = context(&facts, session, scope, now_ms);
+        let context = context(&facts, session, scope, now_ms)?;
         let log = Log::read_with(session, store, scope, decode)?;
         let writer = session.writer().is_ok() && log.writable(session.actor()).is_ok();
         let book = Book::read(&log, &context);
@@ -1248,7 +1253,7 @@ pub fn give_from(
         session.writer()?;
         let log = Log::read_with(session, store, scope, decode)?;
         log.writable(session.actor())?;
-        let context = context(&facts, session, scope, now);
+        let context = context(&facts, session, scope, now)?;
         let book = Book::read(&log, &context);
         let threads: Vec<_> = book
             .threads
@@ -1363,7 +1368,7 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
     let mut report = Custodian::default();
     let (plans, network) = with_store(paths, |session, store, scope| {
         session.writer()?;
-        let mut context = context(&facts, session, scope, now_ms);
+        let mut context = context(&facts, session, scope, now_ms)?;
         context.signer = Some(admin.custodian_signer().map_err(crate::table::failure)?);
         let log = Log::read_with(session, store, scope, decode)?;
         log.writable(session.actor())?;

@@ -92,9 +92,42 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     open_regular_with_meta(path).map(|(file, _)| file)
 }
 
+#[cfg(unix)]
+pub(crate) fn set_regular_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    open_regular(path)?.set_permissions(std::fs::Permissions::from_mode(mode))
+}
+
+/// Copy one regular, non-link file to a fresh regular destination without following a final
+/// symlink at either endpoint, preserving source permissions.
+pub(crate) fn copy_regular_file(src: &Path, dst: &Path) -> io::Result<u64> {
+    let (mut reader, meta) = open_regular_with_meta(src)?;
+    let _ = std::fs::remove_file(dst);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let mut writer = opts.open(dst)?;
+    let copied = std::io::copy(&mut reader, &mut writer)?;
+    writer.set_permissions(meta.permissions())?;
+    Ok(copied)
+}
+
 /// Read one regular, non-link file through the same handle used for admission.
 pub(crate) fn read_bounded_regular(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
-    let (mut file, before) = open_regular_with_meta(path)?;
+    let (file, before) = open_regular_with_meta(path)?;
+    read_bounded_regular_file(file, &before, limit)
+}
+
+/// Read one already-opened regular, non-link file bounded by `limit`.
+pub(crate) fn read_bounded_regular_file(
+    mut file: std::fs::File,
+    before: &std::fs::Metadata,
+    limit: usize,
+) -> io::Result<Vec<u8>> {
     let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
     if before.len() > limit_u64 {
         return Err(too_large(limit));
@@ -105,7 +138,9 @@ pub(crate) fn read_bounded_regular(path: &Path, limit: usize) -> io::Result<Vec<
             "package metadata byte limit cannot be represented",
         )
     })?;
-    let initial_capacity = usize::try_from(before.len()).unwrap_or(limit).min(limit);
+    let initial_capacity = usize::try_from(before.len().min(limit_u64).saturating_add(1))
+        .unwrap_or(sentinel)
+        .min(sentinel);
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(initial_capacity).map_err(|error| {
         io::Error::new(
@@ -131,12 +166,23 @@ pub(crate) fn read_bounded_regular(path: &Path, limit: usize) -> io::Result<Vec<
 
 /// Reads at most `limit` leading bytes of a regular, non-link file.
 pub(crate) fn read_head(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    read_head_with_meta(path, limit).map(|(head, _meta)| head)
+}
+
+/// [`read_head`] together with the opened descriptor's `fstat` metadata.
+pub(crate) fn read_head_with_meta(
+    path: &Path,
+    limit: usize,
+) -> io::Result<(Vec<u8>, std::fs::Metadata)> {
     let (file, before) = open_regular_with_meta(path)?;
-    let cap = usize::try_from(before.len()).unwrap_or(limit).min(limit);
+    let max = limit.saturating_add(1);
+    let cap = usize::try_from(before.len().saturating_add(1))
+        .unwrap_or(max)
+        .min(max);
     let mut head = Vec::with_capacity(cap);
     file.take(u64::try_from(limit).unwrap_or(u64::MAX))
         .read_to_end(&mut head)?;
-    Ok(head)
+    Ok((head, before))
 }
 
 /// Reduce a regular file one bounded UTF-8 line at a time. The admitted handle's initial

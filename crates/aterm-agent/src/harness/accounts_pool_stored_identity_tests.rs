@@ -34,14 +34,21 @@ fn a_passthrough_codex_launch_checks_the_known_default_identity() {
             accounts::append_rows_for(Cli::Codex, "", &roster.rows).unwrap(),
         )
         .unwrap();
-        std::fs::write(
-            world.cfg.join("aterm.toml"),
-            format!("[harness]\naccounts = \"{mode}\"\n"),
+        aterm_uds::atomic_file::write(
+            &(world.cfg.join("aterm.toml")),
+            (format!("[harness]\naccounts = \"{mode}\"\n")).as_ref(),
+            0o600,
         )
         .unwrap();
         let auth = world.home.join(".codex/auth.json");
         let no_poll = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
-            panic!("a pass-through launch reads no provider usage")
+            panic!("a refused or unmanaged launch reads no provider usage")
+        };
+        // Rotation off reads nothing. A lone row is the row a launch starts on, so a launch on an
+        // accepted login reads it, and one on a refused login never gets as far as that.
+        let accepted_read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+            assert!(lone, "rotation off reads no provider usage");
+            None
         };
         let replaced = coherent_codex_auth(Some("other@example.test"));
         std::fs::write(&auth, &replaced).unwrap();
@@ -53,7 +60,7 @@ fn a_passthrough_codex_launch_checks_the_known_default_identity() {
             let accepted = coherent_codex_auth(email);
             std::fs::write(&auth, &accepted).unwrap();
             assert_eq!(
-                super::super::launch_env(&world.seat(), Cli::Codex, &no_poll).unwrap(),
+                super::super::launch_env(&world.seat(), Cli::Codex, &accepted_read).unwrap(),
                 None
             );
             assert!(matches!(
@@ -63,6 +70,61 @@ fn a_passthrough_codex_launch_checks_the_known_default_identity() {
             assert_eq!(std::fs::read(&auth).unwrap(), accepted);
         }
     }
+}
+
+/// A WALL'S END IS NO ANSWER TO A LOGIN THAT NAMES ANOTHER ACCOUNT: a lone launch holds only while
+/// the wall is its whole refusal, so one that a wait cannot end stalls at once, naming that, not
+/// two minutes on naming a wall. A login with no file here has no wall to wait out, and the launch
+/// runs as it is. CONTROL: the same wall under the row's own login is held for, until it ends.
+#[test]
+fn a_lone_launch_holds_for_its_wall_and_never_for_a_login_a_wait_cannot_mend() {
+    let world = World::new("lone-wall-identity");
+    world.two(Cli::Codex);
+    let mut roster = world.seat().roster(Cli::Codex).unwrap();
+    roster.rows[0].email = Some("owner@example.test".into());
+    roster.rows[0].identity_email = Some("owner@example.test".into());
+    roster.rows.truncate(1);
+    std::fs::write(
+        world.cfg.join(Cli::Codex.accounts().roster_file),
+        accounts::append_rows_for(Cli::Codex, "", &roster.rows).unwrap(),
+    )
+    .unwrap();
+    let until = NOW + 3600;
+    world
+        .seat()
+        .store(Cli::Codex)
+        .transact(NOW, &mut None, |state| {
+            Ok(accounts::note_wall(
+                state,
+                "main",
+                accounts::SESSION_LIMIT,
+                Some(until),
+                NOW,
+                NOW,
+            ))
+        })
+        .unwrap();
+    let auth = world.home.join(".codex/auth.json");
+    let no_read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> { None };
+
+    std::fs::write(&auth, coherent_codex_auth(Some("owner@example.test"))).unwrap();
+    let opens = launch_opening(&world.seat(), Cli::Codex, None).expect("the wall's end");
+    assert!(opens >= until, "held for the wall: {opens}");
+    let refused = super::super::launch_env(&world.seat(), Cli::Codex, &no_read).unwrap_err();
+    assert!(refused.contains("no usable account"), "{refused}");
+
+    std::fs::write(&auth, coherent_codex_auth(Some("other@example.test"))).unwrap();
+    assert_eq!(launch_opening(&world.seat(), Cli::Codex, None), None);
+    let refused = super::super::launch_env(&world.seat(), Cli::Codex, &no_read).unwrap_err();
+    assert!(refused.contains("other@example.test"), "{refused}");
+
+    std::fs::remove_file(&auth).unwrap();
+    assert_eq!(launch_opening(&world.seat(), Cli::Codex, None), None);
+    assert_eq!(
+        super::super::launch_env(&world.seat(), Cli::Codex, &no_read).unwrap(),
+        None,
+        "no login here, no wall of it: the launch shows the sign-in screen as it always did"
+    );
 }
 
 #[test]
@@ -82,9 +144,10 @@ fn a_default_identity_mismatch_does_not_refuse_an_independent_pinned_login() {
         accounts::append_rows_for(Cli::Codex, "", &roster.rows).unwrap(),
     )
     .unwrap();
-    std::fs::write(
-        world.cfg.join("aterm.toml"),
-        "[harness]\naccounts = 'off'\n",
+    aterm_uds::atomic_file::write(
+        &(world.cfg.join("aterm.toml")),
+        ("[harness]\naccounts = 'off'\n").as_ref(),
+        0o600,
     )
     .unwrap();
     let default_auth = world.home.join(".codex/auth.json");
@@ -493,8 +556,12 @@ fn cached_usage_identity_case(named: bool) {
                 std::fs::write(candidate.join("auth.json"), bytes).unwrap();
             }
             if off {
-                std::fs::write(world.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n")
-                    .unwrap();
+                aterm_uds::atomic_file::write(
+                    &(world.cfg.join("aterm.toml")),
+                    ("[harness]\naccounts='off'\n").as_ref(),
+                    0o600,
+                )
+                .unwrap();
             }
             let seat = world.seat();
             let roster = seat.roster(Cli::Codex).unwrap();

@@ -13,8 +13,9 @@ use std::net::{IpAddr, SocketAddr};
 /// does not read on (sharing off, or a file that cannot be read,
 /// `docs/DESIGN-alab-swarm-2026-10-27.md` §9), none while macOS has not asked about Local
 /// Network, since a dial of a LAN address would ask it then, nor once it was refused, and says
-/// which; none an isolated debug drive's loopback guard refuses to dial; none while this Mac's
-/// deny list cannot be read.
+/// which; none the fleet's guard refuses to dial ([`aterm_net::loopback::check`]: off an
+/// isolated debug drive's loopback, and every member from a private aterm, since the port is the
+/// person's); none while this Mac's deny list cannot be read.
 pub(crate) fn fleet() -> atpkg::peers::Fleet {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return atpkg::peers::Fleet::default();
@@ -49,7 +50,12 @@ pub(crate) fn fleet() -> atpkg::peers::Fleet {
     let reaches = |ip: IpAddr| routes.dials(None, Some(ip));
     #[cfg(not(unix))]
     let reaches = |_: IpAddr| true;
-    fleet_of(sharing, &members, local_network_holds, reaches)
+    fleet_of(sharing, &members, local_network_holds, reaches, may_dial)
+}
+
+/// Whether the fleet's guard lets this process dial `at` ([`aterm_net::loopback::check`]).
+fn may_dial(at: SocketAddr) -> bool {
+    aterm_net::loopback::check(aterm_net::loopback::Reach::Dial(at)).is_ok()
 }
 
 /// The fleet's addresses (`addrs` under a deny list) as this Mac's deny list in `vault` lets them
@@ -93,12 +99,14 @@ fn local_network_holds() -> Option<&'static str> {
 
 /// [`fleet`] of what it read: `sharing`, what `[swarm] enabled` reads (asked first: sharing
 /// off dials no member, and reads no Local Network state); `members`, the fleet's addresses;
-/// `local_network`, why macOS holds the dials, if it does.
+/// `local_network`, why macOS holds the dials, if it does; `reaches`, whether this network
+/// reaches a member; `guard`, whether this process may dial a member's toolset server.
 fn fleet_of(
     sharing: Result<bool, String>,
     members: &[IpAddr],
     local_network: impl FnOnce() -> Option<&'static str>,
     reaches: impl Fn(IpAddr) -> bool,
+    guard: impl Fn(SocketAddr) -> bool,
 ) -> atpkg::peers::Fleet {
     let held = match sharing {
         Ok(true) => local_network().map(str::to_owned),
@@ -130,7 +138,7 @@ fn fleet_of(
     let dial = reached
         .iter()
         .map(|ip| SocketAddr::new(*ip, atpkg::peers::DEFAULT_PORT))
-        .filter(|at| aterm_net::loopback::check(aterm_net::loopback::Reach::Dial(*at)).is_ok())
+        .filter(|at| guard(*at))
         .map(|at| at.to_string())
         .collect();
     atpkg::peers::Fleet {
@@ -142,7 +150,7 @@ fn fleet_of(
 
 #[cfg(test)]
 mod tests {
-    use super::{fleet_of, members_of};
+    use super::{fleet_of, may_dial, members_of};
     use std::net::{IpAddr, Ipv4Addr};
 
     /// A download lets in no member's address while this Mac's deny list cannot be read (a failed
@@ -183,7 +191,7 @@ mod tests {
     #[test]
     fn a_download_dials_no_member_unless_sharing_reads_on() {
         let members = [IpAddr::V4(Ipv4Addr::new(192, 168, 1, 30))];
-        let on = fleet_of(Ok(true), &members, || None, |_| true);
+        let on = fleet_of(Ok(true), &members, || None, |_| true, |_| true);
         assert_eq!(on.dial.len(), 1, "sharing on: the member is dialed");
         assert_eq!(on.held, None);
         for (sharing, says) in [
@@ -198,6 +206,7 @@ mod tests {
                 &members,
                 || panic!("sharing held: no Local Network read"),
                 |_| true,
+                |_| true,
             );
             assert!(held.dial.is_empty(), "{sharing:?}: no member dialed");
             assert_eq!(held.members, 1, "{sharing:?}: the server's count stays");
@@ -207,9 +216,34 @@ mod tests {
                 held.held
             );
         }
-        let refused = fleet_of(Ok(true), &members, || Some("macOS refused"), |_| true);
+        let refused = fleet_of(
+            Ok(true),
+            &members,
+            || Some("macOS refused"),
+            |_| true,
+            |_| true,
+        );
         assert!(refused.dial.is_empty());
         assert_eq!(refused.held.as_deref(), Some("macOS refused"));
+    }
+
+    /// A private aterm (this Cargo test binary) races none of its fleet members for a toolset: the
+    /// guard [`super::fleet`] dials by refuses each member's toolset server, at the person's port,
+    /// loopback or LAN, while the server's count stays and nothing claims the network holds it.
+    ///
+    /// NEGATIVE CONTROL (2026-11-03): with the guard refusing the fleet's port alone, the shape
+    /// before, both members are dialed and this fails.
+    #[test]
+    fn a_private_aterm_dials_no_member_at_the_persons_toolset_port() {
+        let members = [
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 30)),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ];
+        let private = fleet_of(Ok(true), &members, || None, |_| true, may_dial);
+        assert!(private.dial.is_empty(), "dialed {:?}", private.dial);
+        assert_eq!((private.members, private.held), (2, None));
+        let control = fleet_of(Ok(true), &members, || None, |_| true, |_| true);
+        assert_eq!(control.dial.len(), 2, "the control: {:?}", control.dial);
     }
 
     /// Away from the ALab LAN a download races only the fleet members this network reaches;
@@ -221,14 +255,14 @@ mod tests {
         let home = IpAddr::V4(Ipv4Addr::new(192, 168, 4, 30));
         let here = IpAddr::V4(Ipv4Addr::new(172, 20, 10, 5));
         let away = |ip: IpAddr| ip == here;
-        let fleet = fleet_of(Ok(true), &[home, here], || None, away);
+        let fleet = fleet_of(Ok(true), &[home, here], || None, away, |_| true);
         assert_eq!(
             fleet.dial,
             [format!("{here}:{}", atpkg::peers::DEFAULT_PORT)],
             "only the member this network reaches"
         );
         assert_eq!((fleet.members, fleet.held), (2, None));
-        let none = fleet_of(Ok(true), &[home], || None, away);
+        let none = fleet_of(Ok(true), &[home], || None, away, |_| true);
         assert!(none.dial.is_empty());
         assert_eq!(none.members, 1);
         assert!(none.held.is_some(), "the network holds it");

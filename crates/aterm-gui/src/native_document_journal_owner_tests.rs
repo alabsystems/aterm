@@ -3,10 +3,11 @@
 
 //! Tests for draft journal owner identity and the launch sweep.
 
-use super::super::{DraftJournalHost, encode_journal};
+use super::super::DraftJournalHost;
 use super::*;
 use crate::document_store::DocumentSnapshot;
 use crate::native_document_io::JournalRecord;
+use crate::native_document_io::encode_journal;
 
 struct Root {
     path: PathBuf,
@@ -87,6 +88,36 @@ fn candidate(path: &Path) -> Option<(Candidate, ContentFingerprint)> {
 
 fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+#[test]
+fn a_clean_prefix_does_not_authorize_sweeping_an_uninterpreted_tail() {
+    let root = Root::new("torn-prefix");
+    let gone = root.host();
+    let path = open_clean(&gone, "file:///tmp/torn-prefix.md", "baseline");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.push(bytes[8]);
+    let (read, tail) =
+        recover_journal_image_for(gone.key_for("file:///tmp/torn-prefix.md"), &bytes).unwrap();
+    assert!(holds_no_draft(&read), "the interpreted prefix is clean");
+    assert!(
+        tail.unwrap().byte_len() < bytes.len() as u64,
+        "the whole image is not"
+    );
+    fs::write(&path, &bytes).unwrap();
+    // Give the candidate a matching mark: otherwise the fingerprint check alone keeps it,
+    // and the decoder's incomplete-image check would not be exercised.
+    write_mark(
+        &path,
+        &sys::open_regular(&path).unwrap(),
+        ContentFingerprint::of(&bytes),
+        &BTreeSet::from([gone.owner_id().unwrap()]),
+    )
+    .unwrap();
+    drop(gone);
+    let sweep = sweep_unheld_journals(&root.path);
+    assert_eq!(sweep.removed, 0, "{sweep:?}");
+    assert_eq!(fs::read(&path).unwrap(), bytes);
 }
 
 #[test]

@@ -228,12 +228,14 @@ struct FxDesk {
 /// The rows a park draws from the store and the status item rather than
 /// from a session (`SessionHandoff::from_store`, `App::fleet_told_rows`):
 /// the fleet needs whose notice the owner was told, the bus mirror's closed
-/// sessions, and whether a bridge served the mirror.
+/// sessions, whether a bridge served the mirror, and the workers whose tabs
+/// the reaper closed (`RetiredWorkers::carry_rows`).
 #[derive(Default)]
 struct FxDrawn {
     fleet_told: Vec<String>,
     mirror_dropped: Vec<String>,
     mirror_served: bool,
+    retired_workers: Vec<String>,
 }
 
 fn fx_machine_names() -> Vec<String> {
@@ -430,6 +432,7 @@ fn fx_tab(root: crate::restore::RestoredSplitTree) -> crate::restore::RestoredTa
         focused_path,
         zoomed: false,
         parked: false,
+        ephemeral: false,
     }
 }
 
@@ -739,6 +742,7 @@ fn fx_park_policy(
         known: true,
         grant_chunks: true,
         grant_empty: false,
+        grant_desk: false,
     };
     assert_eq!(
         park.carry_ceiling(),
@@ -873,7 +877,7 @@ fn fx_capture(
         let mut stripped = 0;
         if rung == CarryRung::StrippedLinks {
             let exact = guard
-                .checkpoint_carry(history as usize)
+                .checkpoint_carry(crate::seamless::carried_lines(&checkpoint) as usize)
                 .expect("a link-dense desk is at Ground");
             assert_eq!(
                 checkpoint.history_lines, exact.history_lines,
@@ -1241,6 +1245,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         mirror_dropped: desk.drawn.mirror_dropped.clone(),
         mirror_served: desk.drawn.mirror_served,
         machine_names: fx_machine_names(),
+        retired_workers: desk.drawn.retired_workers.clone(),
     };
     let mut layout = desk.layout.clone();
     layout.fold_into_caps();
@@ -2081,8 +2086,10 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name,
             item.local_id
         );
-        let crossed =
-            usize::try_from(report.imported + u64::from(checkpoint.history_lines)).unwrap();
+        let crossed = usize::try_from(
+            report.imported + u64::from(crate::seamless::carried_lines(&checkpoint)),
+        )
+        .unwrap();
         assert_eq!(
             crossed as u64 + dropped,
             parent.len() as u64,
@@ -2982,7 +2989,9 @@ fn fx_link_dense_history_desk() -> FxDesk {
     );
     notes.process(fx_link_row(12, 8192, "ci.example.test", "log").as_bytes());
     notes.process(b"\r\n");
-    for line in 0..80 {
+    // Past the 256 lines the screen carry holds of the saved primary, so the line crosses in the
+    // history sidecar, whose import strips its links.
+    for line in 0..320 {
         notes.process(
             format!(
                 "- job {line:02}: \x1b[32mpassed\x1b[0m in {}s\r\n",
@@ -3490,6 +3499,7 @@ fn fx_agent(
 ) -> crate::restore::AgentRestore {
     crate::restore::AgentRestore {
         pid,
+        claude_auth: None,
         start: "Mon Oct 19 09:14:02 2026".to_string(),
         program: format!("/home/dev/.local/bin/{program}"),
         argv: vec![program.to_string()],
@@ -3502,6 +3512,39 @@ fn fx_agent(
         word: word.to_string(),
         cause: None,
         tab: None,
+    }
+}
+
+fn fx_claude_auth(
+    config: &str,
+    selection: aterm_agent::harness::profile::Selection,
+) -> crate::restore::ClaudeAuthRestore {
+    let records = std::path::PathBuf::from(config);
+    // What a stored login on its own home records of its shell's environment: the entries its
+    // account checks read, its custom home and its selector named empty.
+    let launch_env = vec![
+        "HOME=/home/dev".to_string(),
+        format!("{}={config}", aterm_agent::harness::accounts::HOME_ENV),
+        format!("{}=", aterm_agent::harness::accounts::LOGIN_ENV),
+    ];
+    crate::restore::ClaudeAuthRestore {
+        stored_login: true,
+        launch_env: Some(launch_env),
+        profile: Some(
+            aterm_agent::harness::profile::Context {
+                plain: aterm_agent::harness::profile::path_in(
+                    std::path::Path::new("/home/dev"),
+                    Some(config),
+                    &records,
+                ),
+                records,
+                selection,
+                home: Some("/home/dev".into()),
+                config: Some(config.into()),
+                login: Some(String::new()),
+            }
+            .into(),
+        ),
     }
 }
 
@@ -3806,6 +3849,7 @@ fn fx_carried_state_desk() -> FxDesk {
         };
     let owed = leaf_of(1, "zsh", &|leaf| {
         leaf.agent = Some(Box::new(AgentRestore {
+            claude_auth: None,
             pid: 48_213,
             start: "Mon Oct 19 09:14:02 2026".to_string(),
             program: "/home/dev/.local/bin/codex-alab".to_string(),
@@ -3897,14 +3941,18 @@ fn fx_carried_state_desk() -> FxDesk {
         agent.version = Some("2.1.302".to_string());
         agent.home = Some("/home/dev/.claude-work".to_string());
         agent.login = Some(String::new());
+        agent.claude_auth = Some(fx_claude_auth(
+            "/home/dev/.claude-work",
+            aterm_agent::harness::profile::Selection::Standard,
+        ));
         agent.cause = Some("asked".to_string());
         agent.tab = Some(format!("s-{:020x}", 0x00ff_0000_0006_u64));
         leaf.agent = Some(Box::new(agent));
     });
     let worker_sid = sessions[2].record.sid.clone();
-    // The worker is a parked tab (docs/DESIGN-workers-tab-2026-11-02.md): its leaf carries its
-    // task record's row, as its session does, it sits behind the window's shown tabs, and the
-    // window showed its Workers list when captured.
+    // The worker is a parked tab (docs/DESIGN-workers-tab-2026-11-02.md), marked ephemeral as
+    // every worker's tab lands: its leaf carries its task record's row, as its session does, it
+    // sits behind the window's shown tabs, and the window showed its Workers list when captured.
     let worker_task = format!(
         "rev=3 state=working from=ctl since={} result_bytes=0 attention=0",
         release_ms + 3_000_000
@@ -3921,6 +3969,10 @@ fn fx_carried_state_desk() -> FxDesk {
         agent.version = Some("2.1.302".to_string());
         agent.home = Some("/home/dev/.claude-work".to_string());
         agent.login = Some(String::new());
+        agent.claude_auth = Some(fx_claude_auth(
+            "/home/dev/.claude-work",
+            aterm_agent::harness::profile::Selection::CustomOauth,
+        ));
         agent.tab = Some(worker_sid.clone());
         leaf.supervised = Some(Box::new(agent));
         leaf.task = Some(worker_task.clone());
@@ -3947,6 +3999,7 @@ fn fx_carried_state_desk() -> FxDesk {
     let co_view = leaf_of(0, "zsh", &|leaf| leaf.theme = Some("Nord".to_string()));
     let mut parked_worker = fx_tab(worker);
     parked_worker.parked = true;
+    parked_worker.ephemeral = true;
     let mut behind = fx_window(
         ROWS,
         COLS,
@@ -3965,7 +4018,27 @@ fn fx_carried_state_desk() -> FxDesk {
         )],
         mirror_dropped: mailbox.mirror_dropped,
         mirror_served: mailbox.mirror_served,
+        // A worker the reaper closed once it finished (crate::retired_workers): the park
+        // carries its row, on no page, so its manager's `result` and `await task` still
+        // answer in the successor.
+        retired_workers: vec![format!(
+            "sid=s-{:020x} closed={} title=claude%20worker words=Done rev=2 state=done \
+             from=ctl since={} result_bytes=0 attention=0 age_ms=600000",
+            0x00ff_0000_0007_u64,
+            release_ms + 3_500_000,
+            release_ms + 2_900_000
+        )],
     };
+    assert_eq!(
+        crate::retired_workers::RetiredWorkers::default().adopt(
+            &drawn_rows.retired_workers,
+            None,
+            std::time::Instant::now(),
+            u64::try_from(release_ms + 3_600_000).unwrap(),
+        ),
+        1,
+        "the retired worker's row reads back"
+    );
     assert_eq!(
         crate::fleet_glance::parse_told(&drawn_rows.fleet_told).len(),
         1,
@@ -4330,6 +4403,26 @@ fn fx_fold_desk() -> FxDesk {
     }
 }
 
+/// A window that held only an empty Workers list, with no session: a parent sends this row only
+/// to a target that declares `desk1`, and it writes no field of its own beyond the flag.
+fn fx_lone_workers_list_desk() -> FxDesk {
+    FxDesk {
+        name: "lone-workers-list",
+        nonce_seed: 0x0100_001A,
+        ceiling: aterm_update_core::handoff_policy::CarryCeiling::Full,
+        window: fx_window_carry(ROWS, COLS, false),
+        sessions: Vec::new(),
+        layout: crate::restore::RestoreManifest::new(vec![
+            crate::restore::WindowLayout::lone_workers_list(ROWS, COLS),
+        ]),
+        connections: Vec::new(),
+        next_turn_id: None,
+        fabric_attached: Vec::new(),
+        held: Vec::new(),
+        drawn: FxDrawn::default(),
+    }
+}
+
 fn fx_variants_desk() -> FxDesk {
     use crate::restore::{
         PlaceholderLeafRestore, RestoreBranch, RestoreManifest, RestoredSplitTree, RestoredTab,
@@ -4397,6 +4490,7 @@ fn fx_variants_desk() -> FxDesk {
                 focused_path: vec![RestoreBranch::Second],
                 zoomed: false,
                 parked: false,
+                ephemeral: false,
             }
         } else {
             fx_tab(leaf)
@@ -4497,6 +4591,7 @@ fn generate_handoff_fixtures() {
         fx_held_history_desk(false),
         fx_fold_desk(),
         fx_variants_desk(),
+        fx_lone_workers_list_desk(),
     ] {
         let mut desk = desk;
         fx_capture_leaves(&mut desk);
@@ -4540,6 +4635,9 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("layout", "TerminalLeafRestore.holds"),
     ("layout", "TerminalLeafRestore.profile"),
     ("layout", "CodexRestore.carried"),
+    // Context::of_exec_env returns no profile for an unknown filename selector,
+    // so a production capture never writes this variant into Claude attribution.
+    ("layout", "Filename::Unknown"),
     // Gemini CLI is retired (agy replaces it): the legacy table only identifies a retired
     // run, and no handoff writes it. v0.140.0 recorded the former fields' omission; older
     // immutable desks continue to hold the reader to those bytes (tests/fixtures/handoff/README.md).

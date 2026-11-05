@@ -123,7 +123,7 @@ impl VerifyOutcome {
 /// Verify one program's active build against the signed `tree_root` recorded in `status.toml`.
 #[must_use]
 pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
-    let active = crate::ops::active_builds(layout).get(program).copied();
+    let active = crate::ops::active_build_of(layout, program);
     let store_selected = crate::ops::which(layout, program)
         .and_then(|path| crate::ops::program_build_of_target(&path))
         .is_some_and(|(name, build)| name == program && Some(build) == active);

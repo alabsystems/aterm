@@ -8,7 +8,7 @@
 
 use super::super::reach::tests::{Rng, disagreements, walked};
 use super::super::reach::{MUTANT, Mutant, Reach, reserved_for};
-use super::weigh::{GENERATED, corpus, generated_log};
+use super::weigh::{corpus, generated_logs};
 use super::*;
 
 /// Every held record in or reachable from `roots`, by walking parents: the walk the index
@@ -670,13 +670,12 @@ fn insert_checks_and_seats_give_the_verdicts_of_the_walks_they_replaced() {
     let mut verdicts = Verdicts::default();
     let mut rng = Rng(20_261_103);
     let mut waited = 0;
-    let logs = corpus()
-        .into_iter()
-        .chain((1..=GENERATED).map(|seed| (format!("generated {seed}"), generated_log(seed))))
-        .chain([("every kind".to_owned(), every_kind().0)]);
+    let hand_made = corpus();
+    let every_kind = [("every kind".to_owned(), every_kind().0)];
+    let logs = hand_made.iter().chain(generated_logs()).chain(&every_kind);
     for (name, log) in logs {
-        check_both_ways(&log, true, 40, &mut rng, &mut verdicts);
-        let (wrong, most) = seats_while_waiting(&log);
+        check_both_ways(log, true, 40, &mut rng, &mut verdicts);
+        let (wrong, most) = seats_while_waiting(log);
         assert_eq!(wrong, 0, "{name}: seats while waiting");
         waited = waited.max(most);
         assert_eq!(verdicts.disagreements, 0, "{name}");

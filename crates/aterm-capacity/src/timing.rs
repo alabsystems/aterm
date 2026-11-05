@@ -23,8 +23,14 @@ pub enum TimingIssue {
     Expired,
     /// An explicit immediate override cannot qualify measurements.
     Now,
-    /// Patience forced admission cannot qualify measurements.
-    Bound,
+    /// The machine stayed busy through its patience: at its bound a valid CPU window and a
+    /// readable load failed the quiet criterion. A need that runs loaded
+    /// ([`crate::AtBound::RunLoaded`]) is admitted and states it ([`Protection::Loaded`]); a strict
+    /// one is refused with this, and neither qualifies a measurement.
+    Loaded,
+    /// No CPU window formed at its patience bound: the counters went backwards, froze or changed
+    /// topology on the last read, so nothing says the machine is merely busy.
+    Blind,
     /// The platform did not provide a finite, nonnegative load.
     LoadUnknown,
     /// Actual local admission provenance is missing or weak.
@@ -50,7 +56,14 @@ impl std::fmt::Display for TimingIssue {
             Self::Unavailable => "actual CPU counters unavailable",
             Self::Expired => "timing reservation expired",
             Self::Now => "--admit now is not measurement qualification",
-            Self::Bound => "forced admission is not measurement qualification",
+            Self::Loaded => {
+                "the machine stayed busy through its patience; a loaded admission is not \
+                 measurement qualification"
+            }
+            Self::Blind => {
+                "no CPU window formed at its patience bound: the counters went backwards, froze \
+                 or changed topology"
+            }
             Self::LoadUnknown => "load observation unavailable",
             Self::UnknownAdmission => "timing admission provenance unavailable",
             Self::Persistence => {
@@ -189,8 +202,78 @@ pub enum TimingCause {
     Wait,
     /// Explicit `--admit now` is diagnostic-only.
     Now,
-    /// Patience forced admission is diagnostic-only.
-    Bound,
+    /// Admitted at its patience bound on a valid CPU window and a readable load that failed the
+    /// quiet criterion, for a need that runs loaded ([`crate::AtBound::RunLoaded`]): its work runs
+    /// and states it, and it never qualifies a measurement. Its wire word stays `bound`, the word
+    /// every build reads, so a build that predates it keeps the claim's reservation.
+    Loaded,
+}
+
+/// What a measured claim's CPU window and load read when it was admitted or entered loaded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Observed {
+    /// The CPU window that failed, or met, the quiet criterion.
+    pub window: CpuWindow,
+    /// The 1-minute load read with it.
+    pub load1: f64,
+    /// The quiet bound on that load.
+    pub max: f64,
+}
+
+impl std::fmt::Display for Observed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CPU {:.1}% busy over {:.1}s (quiet is under {:.0}%), load {:.1} (quiet is at most {:.1})",
+            self.window.busy_ticks as f64 * 100.0 / self.window.total_ticks as f64,
+            self.window.interval_ns as f64 / 1e9,
+            aterm_vitals::sys::predicate::QUIET_CPU_PERCENT,
+            self.load1,
+            self.max,
+        )
+    }
+}
+
+/// What a measured claim's admission protects ([`crate::Claim::timing_protection`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Protection {
+    /// Admitted on a quiet CPU window and load; a measurement still needs its fresh entry.
+    Qualified(CpuWindow),
+    /// Admitted loaded at its patience bound ([`TimingCause::Loaded`]): its work runs and says so.
+    Loaded(Observed),
+}
+
+/// Why a measurement ran without a qualified quiet admission: stated beside its result, never a
+/// finding (owner ruling 2026-11-05: a busy machine never blocks a release).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Unqualified {
+    /// Its claim was admitted loaded at its patience bound.
+    Admission(Observed),
+    /// Its fresh entry window read busy, or its load over the bound.
+    Entry(Observed),
+    /// Its timing hold ended before the work did.
+    Lapsed,
+}
+
+impl std::fmt::Display for Unqualified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(o) => write!(f, "admitted loaded at its patience bound: {o}"),
+            Self::Entry(o) => write!(f, "entered on a busy machine: {o}"),
+            Self::Lapsed => f.write_str("its timing hold ended before the work did"),
+        }
+    }
+}
+
+/// A measurement entry that states what it ran on ([`crate::Claim::stated_entry`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatedEntry {
+    /// The fresh entry window.
+    pub window: CpuWindow,
+    /// The load read with it.
+    pub load1: f64,
+    /// Why the measurement runs unqualified; empty when admission and entry were both quiet.
+    pub unqualified: Vec<Unqualified>,
 }
 
 /// Compact evidence appended under the existing claim's guard; absence never proves readiness.
@@ -216,7 +299,7 @@ impl TimingEvidence {
             TimingCause::Unknown => "unknown",
             TimingCause::Wait => "wait",
             TimingCause::Now => "now",
-            TimingCause::Bound => "bound",
+            TimingCause::Loaded => "bound",
         };
         json!({"cause":cause,"admitted_ms":self.admitted_ms,"admission":self.admission.map(CpuWindow::value),"entry":self.entry.map(CpuWindow::value),"admission_load1":self.admission_load1,"entry_load1":self.entry_load1})
     }
@@ -225,7 +308,7 @@ impl TimingEvidence {
         let cause = match value.get("cause").and_then(Value::as_str) {
             Some("wait") => TimingCause::Wait,
             Some("now") => TimingCause::Now,
-            Some("bound") => TimingCause::Bound,
+            Some("bound") => TimingCause::Loaded,
             _ => return Self::default(),
         };
         let Some(admitted_ms) = value.get("admitted_ms").and_then(Value::as_u64) else {

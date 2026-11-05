@@ -89,22 +89,19 @@ pub(crate) fn retired(trust: Trust) -> Vec<Retired> {
 /// subscribed.
 pub(crate) fn sealed_at(entry: Option<&Entry>, descriptor: &Descriptor) -> Option<u64> {
     let entry = entry?;
-    let twin = Descriptor {
-        version: descriptor.version.checked_add(1)?,
-        ..descriptor.clone()
-    };
+    descriptor.version.checked_add(1)?;
     if entry.state == State::Subscribed
         || !entry
             .declarations
             .iter()
-            .all(|d| d.descriptor == *descriptor || d.descriptor == twin)
+            .all(|d| d.descriptor == *descriptor || d.descriptor.is_twin_of(descriptor))
     {
         return None;
     }
     entry
         .declarations
         .iter()
-        .filter(|d| d.descriptor == twin)
+        .filter(|d| d.descriptor.is_twin_of(descriptor))
         .map(|d| d.authored_ms)
         .max()
 }
@@ -212,12 +209,10 @@ fn read_seen(dir: &std::path::Path) -> Result<BTreeMap<Digest, u64>> {
 }
 
 fn write_seen(dir: &std::path::Path, seen: &BTreeMap<Digest, u64>) -> Result<()> {
-    let mut text = String::new();
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(seen.len() * 86);
     for (id, at) in seen {
-        text.push_str(&aterm_codec::hex::encode_lower(id));
-        text.push(' ');
-        text.push_str(&at.to_string());
-        text.push('\n');
+        let _ = writeln!(text, "{} {at}", aterm_codec::hex::encode_lower(id));
     }
     aterm_journal::create_private_dir_durable(dir)?;
     aterm_journal::write_private_durable(dir, SEEN, text.as_bytes())?;

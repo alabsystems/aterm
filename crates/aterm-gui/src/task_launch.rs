@@ -30,7 +30,12 @@ const FIRST_PROMPT_LOOK: Duration = Duration::from_secs(1);
 /// between its ticks.
 pub(crate) const PROMPT_SETTLE: Duration = Duration::from_millis(250);
 
+/// How long a fish's `--version` is waited for ([`fish_says`]). A unit test's fish is its own
+/// stand-in, which answers, so there it is the hang detector.
+#[cfg(not(test))]
 const VERSION_WAIT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const VERSION_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 fn no_frame(agent: &str) -> String {
     format!(
@@ -386,11 +391,39 @@ fn is_result_file_of(name: &str, sid: &SessionId) -> bool {
 
 const TASKS_DIR_SCAN: usize = 65_536;
 
-/// Remove session `sid`'s task files once the session is gone.
-pub(crate) fn retire_task_file(sid: &SessionId) {
+/// Remove session `sid`'s task files once the session is gone: its task file, and its result
+/// files unless `keep_results` (a worker aterm closed keeps them while its retired row stands,
+/// [`crate::retired_workers`], then [`retire_result_files`]).
+pub(crate) fn retire_task_file(sid: &SessionId, keep_results: bool) {
     if let Some(dir) = crate::task_record::tasks_dir() {
-        retire_task_file_in(&dir, sid);
+        retire_files_in(
+            &dir,
+            std::slice::from_ref(sid),
+            if keep_results {
+                Retire::TaskFile
+            } else {
+                Retire::All
+            },
+        );
     }
+}
+
+/// Remove session `sid`'s result files, its task file gone with its session already.
+pub(crate) fn retire_result_files(sid: &SessionId) {
+    if let Some(dir) = crate::task_record::tasks_dir() {
+        retire_files_in(&dir, std::slice::from_ref(sid), Retire::Results);
+    }
+}
+
+/// Which of a session's files [`retire_files_in`] removes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retire {
+    /// Its task file (and an older build's trust sidecar beside it) and its result files.
+    All,
+    /// Its task file alone.
+    TaskFile,
+    /// Its result files alone.
+    Results,
 }
 
 /// Remove the task files ([`retire_task_file`]) of every session `store` still holds with a task
@@ -418,14 +451,10 @@ fn retire_task_files_in(dir: &Path, store: &Store, parked: &[SessionId]) {
         })
         .map(|h| h.sid)
         .collect();
-    retire_files_in(dir, &tasked);
+    retire_files_in(dir, &tasked, Retire::All);
 }
 
-fn retire_task_file_in(dir: &Path, sid: &SessionId) {
-    retire_files_in(dir, std::slice::from_ref(sid));
-}
-
-fn retire_files_in(dir: &Path, sids: &[SessionId]) {
+fn retire_files_in(dir: &Path, sids: &[SessionId], which: Retire) {
     if sids.is_empty() {
         return;
     }
@@ -442,9 +471,14 @@ fn retire_files_in(dir: &Path, sids: &[SessionId]) {
             aterm_log::warn!("task file {}: not removed: {e}", dir.join(name).display());
         }
     };
-    for sid in sids {
-        remove(std::ffi::OsStr::new(&task_file_name(sid)));
-        remove(std::ffi::OsStr::new(&trust_file_name(sid)));
+    if which != Retire::Results {
+        for sid in sids {
+            remove(std::ffi::OsStr::new(&task_file_name(sid)));
+            remove(std::ffi::OsStr::new(&trust_file_name(sid)));
+        }
+    }
+    if which == Retire::TaskFile {
+        return;
     }
     let names = match pinned.names_up_to(TASKS_DIR_SCAN) {
         Ok(names) => names,
@@ -497,16 +531,19 @@ pub(crate) struct Launch {
     pub(crate) caller: Option<Arc<SessionCtx>>,
     /// [`TaskOrder::chrome`].
     pub(crate) chrome: bool,
+    /// What the supervisor may approve on a permission box (`[harness] approve`) when the worker
+    /// was registered: a claim worker's mode follows it ([`worker_fresh`]).
+    pub(crate) approve: aterm_agent::supervise::config::Approve,
 }
 
 /// Start the worker's launcher.
 pub(crate) fn launch_worker(work: Launch) {
-    let (ctx, local) = (Arc::clone(&work.ctx), work.local);
+    let (ctx, local, agent) = (Arc::clone(&work.ctx), work.local, work.agent);
     let started = std::thread::Builder::new()
         .name(format!("aterm-worker-{local}"))
         .spawn(move || run_worker_launch(&work));
     if started.is_err() {
-        stall_task(&ctx, local, "its launcher thread could not start");
+        stall_refused_task(&ctx, local, agent, "its launcher thread could not start");
     }
 }
 
@@ -603,18 +640,12 @@ fn pool_opening(
     accounts_pool::launch_opening(seat, pool, Some(&starter.exe))
 }
 
-fn pool_wait_for<'a>(
+pub(crate) fn pool_wait_for<'a>(
     work: &'a Launch,
     held_because: &'static str,
 ) -> impl FnMut(&PoolWait) -> bool + 'a {
-    let alive = move || {
-        work.store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_local(work.local)
-            .is_some_and(|h| !matches!(h.state, SessionState::Exited))
-    };
-    let mut mark = None;
+    let alive = move || session_alive(work);
+    let mut mark: Option<PoolHoldMark<'a>> = None;
     let mut noted = None;
     let mut sub = None;
     move |next| match next {
@@ -625,15 +656,19 @@ fn pool_wait_for<'a>(
         PoolWait::Hold { until, why, look } => {
             if noted != Some(*until) {
                 noted = Some(*until);
+                let until_words =
+                    aterm_types::rfc3339::format_rfc3339(u64::try_from(*until).unwrap_or(0));
+                aterm_log::info!(
+                    "worker session {}: launch held until {until_words}: {held_because}",
+                    work.local
+                );
                 note_launch(
                     &work.ctx,
-                    format!(
-                        "held until {} ({why}): {held_because}",
-                        aterm_types::rfc3339::format_rfc3339(u64::try_from(*until).unwrap_or(0))
-                    ),
+                    format!("held until {until_words} ({why}): {held_because}"),
                 );
             }
-            mark.get_or_insert_with(|| InstallingMark::of(&work.ctx));
+            mark.get_or_insert_with(|| PoolHoldMark::of(&work.ctx))
+                .until(*until, held_because);
             let sub = sub.get_or_insert_with(|| {
                 crate::session_watch::Subscription::single(&work.ctx.watchers)
             });
@@ -642,7 +677,9 @@ fn pool_wait_for<'a>(
                 .checked_add(*look)
                 .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
             loop {
-                if !alive() {
+                // A stall the deadline marked ends a hold as it ends the wait for a prompt: a line
+                // typed once the row opens would start a worker nobody is waiting for.
+                if !alive() || task_moved_on(&work.ctx).is_some() {
                     return false;
                 }
                 let left = end.saturating_duration_since(Instant::now());
@@ -656,9 +693,8 @@ fn pool_wait_for<'a>(
 }
 
 /// [`pooled_starter`] through [`pool_attempts`] for `work`: a hold is noted on its launch record
-/// and marks its session as its launcher's still ([`InstallingMark`]) until the launch starts or
-/// stalls, so the startup deadline does not judge a worker whose line is not typed yet; each wait
-/// ends early where the session ends.
+/// and marks its session ([`PoolHoldMark`]) until the launch starts or stalls, so the startup
+/// deadline names the hold; each wait ends early where the session ends or its task moved on.
 fn pooled_starter_held(
     work: &Launch,
     starter: aterm_agent::harness::worker::Starter,
@@ -770,21 +806,21 @@ impl NativeGoogleAdmission {
 
 fn run_worker_launch(work: &Launch) {
     if work.dialect == Dialect::Fish && !fish_answer(&work.shell) {
-        stall(
+        stall_refused(
             work,
             "its fish is older than 3.4 (or did not say its version)",
         );
         return;
     }
     let Some(cli) = aterm_agent::harness::worker::worker_cli(work.agent) else {
-        stall(work, "its agent has no worker line");
+        stall_refused(work, "its agent has no worker line");
         return;
     };
     let (caller, found) = worker_starter_of(work, cli);
     let caller = match pooled_starter_held(work, caller, cli) {
         Ok(caller) => caller,
         Err(why) => {
-            stall(work, &why);
+            stall_gave_up(work, &why);
             return;
         }
     };
@@ -794,7 +830,7 @@ fn run_worker_launch(work: &Launch) {
         aterm_types::dirs::home_dir().as_deref(),
         &|note| note_launch(&work.ctx, note),
         &|| InstallingMark::of(&work.ctx),
-        &AtpkgStore,
+        &AtpkgStore(&work.ctx),
         |starter| {
             let _google_mark =
                 native_google_agent(work.agent).then(|| InstallingMark::of(&work.ctx));
@@ -807,6 +843,11 @@ fn run_worker_launch(work: &Launch) {
             return;
         }
     };
+    let admitted = if found == (Found::Parent { lent: false }) {
+        admitted.past_the_twin(cli, work.model.as_deref())
+    } else {
+        admitted
+    };
     let caller = admitted.starter();
     let rotated = match agy_rotation_held(work, caller) {
         Ok(rotated) => {
@@ -817,7 +858,7 @@ fn run_worker_launch(work: &Launch) {
         }
         Err(why) => {
             note_launch(&work.ctx, format!("agy quota: {why}"));
-            stall(work, &why);
+            stall_gave_up(work, &why);
             return;
         }
     };
@@ -837,22 +878,22 @@ fn run_worker_launch(work: &Launch) {
         Some(aterm_agent::harness::agy_quota::Pick::Rotate { to, .. }) => Some(to.as_str()),
         _ => work.model.as_deref(),
     };
-    // A worker runs with its parent's permissions (owner ruling 2026-11-02), the disk-free worker
-    // included. A credit claim worker (`work.chrome`) starts where every box is raised, whatever
-    // the person's settings say: its rule fences what it does in their own browser.
+    // A worker runs with its parent's permissions (owner ruling 2026-11-02), held to Claude Code's
+    // auto floor (`aterm_agent::harness::worker::starter`), the disk-free worker included. A
+    // credit claim worker (`work.chrome`) names its own mode and tools ([`worker_fresh`]).
     let config = crate::app_config::config_path();
-    let mut fresh = worker_fresh(model, here, work.chrome);
+    let mut fresh = worker_fresh(model, here, work.chrome, work.approve);
     fresh.config = config.as_deref();
     let line = aterm_agent::harness::worker::line(cli, work.dialect, &admitted, &fresh);
     match line {
         Ok(line) => {
             let Some(proxy) = work.proxy.as_ref() else {
-                stall(work, "its main-thread launch endpoint is gone");
+                stall_refused(work, "its main-thread launch endpoint is gone");
                 return;
             };
             let typed = type_at_prompt(work, prompt, |prompt| {
                 if let Err(why) = google.check(&admitted) {
-                    return Ok(Err(Untyped::Refused(why)));
+                    return Ok(Err(Untyped::Blocked(why)));
                 }
                 crate::control::control_media::call_main(proxy, |reply| crate::Wake::WorkerLaunch {
                     sid: work.ctx.self_id.clone(),
@@ -887,26 +928,50 @@ fn run_worker_launch(work: &Launch) {
             aterm_log::info!("worker session {}: launch line {note}", work.local);
             note_launch(&work.ctx, note);
         }
-        Err(why) => stall(work, &format!("its launch line cannot be written: {why}")),
+        Err(why) => stall_refused(work, &format!("its launch line cannot be written: {why}")),
     }
 }
 
 /// What a worker's line names beside its program: `model`, its folder trusted where `here`,
 /// and the person's browser where `chrome` ([`TaskOrder::chrome`]). A credit claim worker, the
-/// one `chrome` worker ([`crate::harness_host::credit_claim`]), starts with every box raised
-/// (`default`), whatever the person's settings say, so its approval rule fences what it does; any
-/// other worker takes its permissions from its [`Starter`](aterm_agent::harness::worker::Starter).
+/// one `chrome` worker ([`crate::harness_host::credit_claim`]), starts in the mode
+/// [`claim_worker_mode`] gives `approve`, whatever the person's Claude Code settings say, and
+/// with [`credit_offers::CLAIM_TOOLS`](aterm_agent::harness::credit_offers::CLAIM_TOOLS) its only
+/// built-in tools, so no mode lets it run a command, write a file, fetch a page or ask; its
+/// approval rule (`claim-worker@v1`) judges any box Claude Code still raises there, and in auto
+/// mode, which raises none for a Chrome action, the classifier reads the rules of
+/// [`credit_offers::claim_settings`](aterm_agent::harness::credit_offers::claim_settings). Any other
+/// worker takes its permissions from its [`Starter`](aterm_agent::harness::worker::Starter), and
+/// `approve` is not read for it.
 pub(crate) fn worker_fresh(
     model: Option<&str>,
     here: bool,
     chrome: bool,
+    approve: aterm_agent::supervise::config::Approve,
 ) -> aterm_agent::harness::worker::Fresh<'_> {
     aterm_agent::harness::worker::Fresh {
         config: None,
         model,
         trusted_here: here,
-        permission_mode: chrome.then_some("default"),
+        permission_mode: chrome.then(|| claim_worker_mode(approve)),
         chrome,
+        tools: chrome.then_some(aterm_agent::harness::credit_offers::CLAIM_TOOLS),
+        settings: chrome.then(aterm_agent::harness::credit_offers::claim_settings),
+    }
+}
+
+/// The permission mode a credit claim worker starts in ([`worker_fresh`]), one of
+/// [`aterm_agent::harness::worker::CLAUDE_PERMISSION_MODE`]'s modes: Claude Code's auto mode, so
+/// nothing it does waits on a person (owner, 2026-11-04: "started in auto / yolo mode"), except
+/// where `[harness] approve = "none"` keeps every approval the person's: there every box is
+/// raised (`default`) and handed to them, as the supervisor hands every other box.
+pub(crate) const fn claim_worker_mode(
+    approve: aterm_agent::supervise::config::Approve,
+) -> &'static str {
+    match approve {
+        aterm_agent::supervise::config::Approve::None => "default",
+        aterm_agent::supervise::config::Approve::Safe
+        | aterm_agent::supervise::config::Approve::All => "auto",
     }
 }
 
@@ -926,10 +991,11 @@ pub(crate) trait ProgramStore {
     fn install(&self, program: &str) -> Result<(), String>;
 }
 
-/// atpkg's own store, and its verified install run as `aterm pkg install <program>` runs it.
-pub(crate) struct AtpkgStore;
+/// atpkg's own store, and its verified install run as `aterm pkg install <program>` runs it, for
+/// the launcher of the session it holds.
+pub(crate) struct AtpkgStore<'a>(&'a SessionCtx);
 
-impl AtpkgStore {
+impl AtpkgStore<'_> {
     /// The atpkg that installs here, or why none can: none beside aterm, an inert package
     /// manager (no package root key pinned in this build), or no store configured.
     fn installer() -> Result<(std::path::PathBuf, atpkg::store::Layout), String> {
@@ -949,10 +1015,10 @@ impl AtpkgStore {
     }
 }
 
-impl ProgramStore for AtpkgStore {
+impl ProgramStore for AtpkgStore<'_> {
     fn present(&self, program: &str) -> bool {
         atpkg::store::resolve_configured()
-            .is_some_and(|layout| atpkg::ops::active_builds(&layout).contains_key(program))
+            .is_some_and(|layout| atpkg::ops::active_build_of(&layout, program).is_some())
     }
 
     fn held(&self, program: &str) -> Option<String> {
@@ -963,40 +1029,133 @@ impl ProgramStore for AtpkgStore {
 
     fn install(&self, program: &str) -> Result<(), String> {
         let (atpkg, layout) = Self::installer()?;
+        install_with(&atpkg, &layout, program, self.0)
+    }
+}
+
+/// Run `atpkg`'s verified install of `program` on `layout` for the launcher of `ctx`, whose timeline
+/// hears the child's pid as soon as it runs: what a store shared with every other pass says of this
+/// install is what that process writes (`crate::harness_host::InstallWork`).
+fn install_with(
+    atpkg: &Path,
+    layout: &atpkg::store::Layout,
+    program: &str,
+    ctx: &SessionCtx,
+) -> Result<(), String> {
+    let mut cmd = crate::qos::atpkg_command(atpkg);
+    cmd.args(crate::pass_lead(
+        aterm_types::dirs::runs_under_private_state_root(),
+    ));
+    let run = crate::run_atpkg_pass(
+        install_argv(program, Some(layout)),
+        cmd,
+        Some(&crate::spawn::atpkg_child_path()),
+        Some(layout),
+        false,
+        &|_: crate::Wake| {},
+        &|pid| {
+            ctx.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set_worker_install_child(pid);
+        },
+    )
+    .map_err(|e| format!("it could not run: {e}"))?;
+    if run.clean() {
+        return Ok(());
+    }
+    let why = run.why();
+    Err(if why.is_empty() {
+        format!("it exited {:?} and said nothing", run.code)
+    } else {
+        why
+    })
+}
+
+/// A credit claim's Chrome ([`crate::harness_host::credit_claim::ready`]), which aterm puts in
+/// place on a Mac alone.
+#[cfg(target_os = "macos")]
+impl AtpkgStore<'_> {
+    /// Why atpkg's brew installs no cask `cask` here unattended, or `None` where it does: a
+    /// person keeps it off as they keep any package off ([`kept_off`]), aterm's brew is off
+    /// (`[abrew] enabled = false`, or `abrew off`), or no atpkg here can install
+    /// ([`Self::installer`]).
+    pub(crate) fn cask_held(cask: &str) -> Option<String> {
+        let cfg = atpkg::config::load();
+        kept_off(cask, &cfg, atpkg::store::resolve_from(&cfg).as_ref())
+            .or_else(|| {
+                (!atpkg::config::load_abrew().enabled()).then(|| {
+                    "aterm's brew is off (`[abrew] enabled = false` in aterm.toml)".to_string()
+                })
+            })
+            .or_else(|| {
+                atpkg::abrew::prefix::Prefix::resolve()
+                    .is_disabled()
+                    .then(|| {
+                        "aterm's brew is off (`abrew off`; `abrew on` turns it on)".to_string()
+                    })
+            })
+            .or_else(|| Self::installer().err())
+    }
+
+    /// Install cask `cask` by atpkg's brew, as `aterm pkg abrew install --cask <cask>` does,
+    /// waiting for it to end: into its prefix's own `Applications` folder
+    /// ([`atpkg::abrew::prefix::Prefix::applications`]).
+    ///
+    /// # Errors
+    ///
+    /// Why it did not finish cleanly: no atpkg to run, or what the install said as it failed.
+    pub(crate) fn install_cask(cask: &str) -> Result<(), String> {
+        let (atpkg, _) = Self::installer()?;
         let mut cmd = crate::qos::atpkg_command(&atpkg);
         cmd.args(crate::pass_lead(
             aterm_types::dirs::runs_under_private_state_root(),
-        ));
-        let run = crate::run_atpkg_pass(
-            install_argv(program, Some(&layout)),
-            cmd,
-            Some(&crate::spawn::atpkg_child_path()),
-            Some(&layout),
-            false,
-            &|_: crate::Wake| {},
-        )
-        .map_err(|e| format!("it could not run: {e}"))?;
-        if run.clean() {
+        ))
+        .args(["abrew", "install", "--cask", cask])
+        .env("PATH", crate::spawn::atpkg_child_path())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::piped());
+        let out = cmd.output().map_err(|e| format!("it could not run: {e}"))?;
+        if out.status.success() {
             return Ok(());
         }
-        let why = run.why();
-        Err(if why.is_empty() {
-            format!("it exited {:?} and said nothing", run.code)
-        } else {
-            why
+        let said = String::from_utf8_lossy(&out.stderr);
+        let last = said
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .map(|line| atpkg::progress::sanitize_for_tty(line, 200));
+        Err(match last {
+            Some(line) => format!("it exited {:?}: {line}", out.status.code()),
+            None => format!("it exited {:?} and said nothing", out.status.code()),
         })
     }
 }
 
 /// Why atpkg installs no `program` here by what `cfg` (aterm.toml's `[packages]`) and `layout`
 /// (atpkg's store, where one is configured) say, or `None`: the pure policy core of
-/// [`AtpkgStore::held`]. `[packages] exclude` names it, a person removed it, atpkg may install
-/// nothing unattended here (a person's no to installs, or an inert manager, by atpkg's own
-/// reading, the one its update pass completes the default set by:
-/// [`atpkg::adoption::unattended_install_off`]), or atpkg serves no build of it for this
-/// machine. A spawn is a lead's request, not the person's, so it installs nothing a person kept
-/// off.
+/// [`AtpkgStore::held`]. A person keeps it off ([`kept_off`]), or atpkg serves no build of it
+/// for this machine.
 pub(crate) fn held_in(
+    program: &str,
+    cfg: &atpkg::config::PackagesConfig,
+    layout: Option<&atpkg::store::Layout>,
+) -> Option<String> {
+    kept_off(program, cfg, layout).or_else(|| {
+        (!atpkg::vendor_direct::served_here(program))
+            .then(|| format!("atpkg serves no {program} build for this machine"))
+    })
+}
+
+/// Why a person keeps `program` off this machine by what `cfg` and `layout` say ([`held_in`]),
+/// or `None`: `[packages] exclude` names it, a person removed it, or atpkg may install nothing
+/// unattended here (a person's no to installs, or an inert manager, by atpkg's own reading, the
+/// one its update pass completes the default set by:
+/// [`atpkg::adoption::unattended_install_off`]). A spawn, and a credit claim's Chrome
+/// (`AtpkgStore::cask_held`, on a Mac), are aterm's requests, not the person's, so they
+/// install nothing a person kept off.
+pub(crate) fn kept_off(
     program: &str,
     cfg: &atpkg::config::PackagesConfig,
     layout: Option<&atpkg::store::Layout>,
@@ -1019,15 +1178,9 @@ pub(crate) fn held_in(
             Ok(_) => {}
         }
     }
-    if let Some(off) =
-        layout.and_then(|layout| atpkg::adoption::unattended_install_off(layout, cfg))
-    {
-        return Some(off.to_string());
-    }
-    if !atpkg::vendor_direct::served_here(program) {
-        return Some(format!("atpkg serves no {program} build for this machine"));
-    }
-    None
+    layout
+        .and_then(|layout| atpkg::adoption::unattended_install_off(layout, cfg))
+        .map(str::to_string)
 }
 
 /// The argv of atpkg's verified install of `program` (after any pass lead): the verb
@@ -1052,7 +1205,9 @@ pub(crate) fn install_argv(
 /// the launch line says so
 /// ([`aterm_agent::harness::worker::Admitted::kept_off`]). While the install runs, the session
 /// carries the mark `installing` makes ([`InstallingMark`]), so the startup deadline does not
-/// count the install as a start that never came.
+/// count the install as a start that never came until no work has moved in it for
+/// [`crate::harness_host::INSTALL_QUIET_LIMIT`]. The launcher sets the same mark around the Google
+/// preparation that follows this (`run_worker_launch`).
 ///
 /// # Errors
 ///
@@ -1116,12 +1271,18 @@ pub(crate) const fn refused_why(refused: &aterm_agent::harness::worker::Refused)
     }
 }
 
-/// A session's launcher is installing its worker's program, or holding its launch until a pool
-/// row opens ([`pooled_starter_held`]): set on the session's timeline while it lives, and cleared
+/// A session's launcher is installing its worker's program, or preparing a Google worker's sign-in
+/// (`NativeGoogleAdmission::prepare`): set on the session's timeline while it lives, and cleared
 /// when it drops, on an error or a panic too
 /// ([`crate::session_timeline::SessionTimeline::worker_installing`]). The startup deadline does
-/// not judge a worker while this stands. It lives only in this process, so a seamless update's
-/// successor, which has no launcher, judges the worker as usual.
+/// not judge a worker by its 120 s while this stands, since an install ordinarily ends by itself,
+/// in a line or a stall. Once no work of its own has moved for
+/// [`crate::harness_host::INSTALL_QUIET_LIMIT`], it stalls the worker naming what holds its screen;
+/// the launcher then types nothing when the work ends, and nothing ends atpkg's child
+/// (ATERM-KI-1105-2). Its own work is what the atpkg child it spawned writes ([`install_with`]), so
+/// a sign-in check, which has no such child, has that limit whole, whatever else moves on the
+/// store. The mark lives only in this process, so a seamless update's successor, which has no
+/// launcher, judges the worker as usual.
 pub(crate) struct InstallingMark<'a>(&'a SessionCtx);
 
 impl<'a> InstallingMark<'a> {
@@ -1145,6 +1306,43 @@ impl Drop for InstallingMark<'_> {
     }
 }
 
+/// A session's launcher is holding its worker's launch until a pool opens
+/// ([`pooled_starter_held`], [`agy_rotation_held`]): set on the session's timeline while it lives,
+/// and cleared when it drops, on an error or a panic too
+/// ([`crate::session_timeline::SessionTimeline::worker_pool_hold`]). Unlike an install, what it
+/// waits for may be days off, so the startup deadline does judge it: the worker stalls naming the
+/// hold ([`crate::harness_host::StartupHold::LaunchHeld`]), which ends the wait ([`task_moved_on`]).
+pub(crate) struct PoolHoldMark<'a>(&'a SessionCtx);
+
+impl<'a> PoolHoldMark<'a> {
+    /// A mark on `ctx`'s timeline, which holds nothing until [`Self::until`] says what for.
+    pub(crate) const fn of(ctx: &'a SessionCtx) -> Self {
+        Self(ctx)
+    }
+
+    /// Say that the hold runs until `until` (Unix seconds), `because` nothing can take it now.
+    pub(crate) fn until(&self, until: i64, because: &'static str) {
+        self.0
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_worker_pool_hold(Some(crate::session_timeline::WorkerPoolHold {
+                until,
+                because,
+            }));
+    }
+}
+
+impl Drop for PoolHoldMark<'_> {
+    fn drop(&mut self) {
+        self.0
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_worker_pool_hold(None);
+    }
+}
+
 fn note_launch(ctx: &SessionCtx, note: String) {
     ctx.timeline
         .lock()
@@ -1163,14 +1361,8 @@ pub(crate) fn await_prompt(work: &Launch, settle: Duration) -> Result<PromptFenc
     let sub = crate::session_watch::Subscription::single(&work.ctx.watchers);
     let mut held = Held::default();
     loop {
-        let alive = work
-            .store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_local(work.local)
-            .is_some_and(|h| !matches!(h.state, SessionState::Exited));
-        if !alive {
-            return Err("its shell ended before its line was typed".to_string());
+        if !session_alive(work) {
+            return Err(SHELL_ENDED.to_string());
         }
         if let Some(why) = task_moved_on(&work.ctx) {
             return Err(why);
@@ -1249,8 +1441,12 @@ pub(crate) enum Untyped {
     /// The prompt the launcher saw was redrawn, or is no longer input-ready, and nothing was
     /// written: its launcher looks again ([`type_at_prompt`]).
     Unsettled,
-    /// Why the worker stalls.
+    /// The shell or its live launch ended, a person used it, or its task moved on: `stalled
+    /// why=shell` where the record still says `working`.
     Refused(String),
+    /// Nothing in the shell or from a person stopped it, and the line could not be typed: `stalled
+    /// why=startup`, naming why ([`stall_refused`]).
+    Blocked(String),
 }
 
 /// Type `line` at `prompt`, the input-ready prompt `work`'s launcher saw, through `admit` (the
@@ -1294,6 +1490,10 @@ pub(crate) fn type_at_prompt<E: std::fmt::Display>(
                 stall(work, &why);
                 return None;
             }
+            Ok(Err(Untyped::Blocked(why))) => {
+                stall_refused(work, &why);
+                return None;
+            }
             Err(why) => {
                 note_launch(
                     &work.ctx,
@@ -1310,8 +1510,9 @@ pub(crate) fn type_at_prompt<E: std::fmt::Display>(
 /// # Errors
 ///
 /// [`Untyped::Unsettled`] where the screen moved off `prompt` before anything was written;
-/// [`Untyped::Refused`] where the launch is gone, its task moved on ([`task_moved_on`]), its
-/// session is parked or halted, a person used it, or the write was not taken.
+/// [`Untyped::Refused`] where the launch is gone, its task moved on ([`task_moved_on`]) or a
+/// person used it; [`Untyped::Blocked`] where its session is parked or halted, or the write was not
+/// taken.
 pub(crate) fn type_launch_line(
     store: &Store,
     sid: &SessionId,
@@ -1335,10 +1536,12 @@ pub(crate) fn type_launch_line(
         return Err(Untyped::Refused(why));
     }
     if ctx.update_parked.is_parked() {
-        return refused("its session is parked for an update");
+        return Err(Untyped::Blocked(
+            "its session is parked for an update".to_string(),
+        ));
     }
     if let Some(why) = crate::fabric::halt_refusal(ctx.as_ref(), "send") {
-        return Err(Untyped::Refused(why));
+        return Err(Untyped::Blocked(why));
     }
     let mut bytes = line.as_bytes().to_vec();
     bytes.push(0x0d);
@@ -1367,21 +1570,23 @@ pub(crate) fn launch_line_typed(
 ) -> Result<&'static str, Untyped> {
     use crate::control::GuardedInput;
     use crate::input::Delivery;
-    let refused = |why: &str| Err(Untyped::Refused(why.to_string()));
+    let blocked = |why: &str| Err(Untyped::Blocked(why.to_string()));
     match result {
         // The fence decides both before a byte is written.
         GuardedInput::Changed | GuardedInput::Skipped => Err(Untyped::Unsettled),
-        GuardedInput::Person => refused("a person used its session before the launch"),
+        GuardedInput::Person => Err(Untyped::Refused(
+            "a person used its session before the launch".to_string(),
+        )),
         GuardedInput::Pressed(Delivery::Full) => Ok("written whole"),
         GuardedInput::Pressed(Delivery::PartialInDoubt { .. }) => Ok("written in part"),
-        GuardedInput::Pressed(Delivery::BusyZero) => refused("its input sink is busy"),
-        GuardedInput::Pressed(Delivery::Failed) => refused("its input write failed"),
+        GuardedInput::Pressed(Delivery::BusyZero) => blocked("its input sink is busy"),
+        GuardedInput::Pressed(Delivery::Failed) => blocked("its input write failed"),
     }
 }
 
 /// Why a worker's line must not be typed because its task record is no longer `working`: a
-/// deadline stalled it (an install that outran the startup deadline in another process, say), a
-/// lead marked it, or it has no record at all. The lead has then been told the task did not
+/// deadline stalled it (a pool hold past the startup deadline, or an install that outran it in
+/// another process, say), a lead marked it, or it has no record at all. The lead has then been told the task did not
 /// start, and a line typed now would start a worker it does not know about, beside any it
 /// spawned again.
 pub(crate) fn task_moved_on(ctx: &SessionCtx) -> Option<String> {
@@ -1479,12 +1684,69 @@ fn stall_why(work: &Launch, word: &'static str, why: &str) {
     stall_task_why(&work.ctx, work.local, word, why);
 }
 
-/// [`stall`] of session `local` by its parts.
-pub(crate) fn stall_task(ctx: &SessionCtx, local: u64, why: &str) {
-    stall_task_why(ctx, local, "shell", why);
+/// [`stall`] for a launch its launcher gave up on before typing, for a reason no shell or person
+/// caused: `stalled why=startup` at once, with the cause and the member in `attention=` under one
+/// lock ([`crate::harness_host::StartupHold::Refused`]), so a dispatcher can place the next worker
+/// elsewhere. A record that moved on already says what became of the task and keeps its attention.
+fn stall_refused(work: &Launch, why: &str) {
+    note_launch(&work.ctx, format!("never typed ({why})"));
+    stall_refused_task(&work.ctx, work.local, work.agent, why);
 }
 
-/// [`stall_task`] with the task record's `why=` word `word`. Only a `working` record takes the
+/// Why a worker's launch never typed where its shell went first.
+const SHELL_ENDED: &str = "its shell ended before its line was typed";
+
+/// Whether `work`'s session is still there to type into.
+fn session_alive(work: &Launch) -> bool {
+    work.store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_local(work.local)
+        .is_some_and(|h| !matches!(h.state, SessionState::Exited))
+}
+
+/// A launcher that gave up waiting on a pool: its shell's end ends that wait too, and then the
+/// pool's refusal is not why ([`stall`]); otherwise it is ([`stall_refused`]).
+pub(crate) fn stall_gave_up(work: &Launch, why: &str) {
+    if session_alive(work) {
+        stall_refused(work, why);
+    } else {
+        stall(work, SHELL_ENDED);
+    }
+}
+
+/// [`stall_refused`] of session `local` by its parts.
+pub(crate) fn stall_refused_task(
+    ctx: &SessionCtx,
+    local: u64,
+    agent: aterm_phase::Program,
+    why: &str,
+) {
+    aterm_log::warn!("worker session {local}: {why}; nothing was typed");
+    let words = crate::harness_host::StartupHold::Refused {
+        agent,
+        why: why.to_owned(),
+        on: crate::harness_host::member_label(),
+    }
+    .attention();
+    let mut mark = TaskMark::new(TaskState::Stalled);
+    mark.why = Some("startup");
+    let marked = crate::task_record::mark_session_task_with(
+        ctx,
+        local,
+        Some(&mark),
+        crate::task_record::AttentionEdit::Raise(&words),
+        ctx.fabric.fence_wait(),
+        |task, _| task.is_some_and(|task| task.state == TaskState::Working),
+    );
+    if marked.is_err() {
+        aterm_log::warn!(
+            "worker session {local}: the stall was not marked (an update was committing)"
+        );
+    }
+}
+
+/// [`stall`] of session `local` by its parts, with the task record's `why=` word `word`. Only a `working` record takes the
 /// mark: one that moved on already says what became of the task ([`task_moved_on`]), and a
 /// deadline's stall keeps its attention.
 pub(crate) fn stall_task_why(ctx: &SessionCtx, local: u64, word: &'static str, why: &str) {
@@ -1564,6 +1826,9 @@ enum Found {
     Front,
     /// None: the plain word under the shell's own.
     Plain,
+    /// None, in a worker no session started: `lent`, whether the session `ls` names as its parent
+    /// lent it flags.
+    Parent { lent: bool },
 }
 
 impl Found {
@@ -1576,6 +1841,12 @@ impl Found {
                  it yet"
             ),
             Self::Plain => format!("no {product} of a starter's: plain `{}`", agent.name()),
+            Self::Parent { lent: true } => {
+                format!("no {product} of a starter's: its parent's flags")
+            }
+            Self::Parent { lent: false } => {
+                format!("no {product} of a starter's, and its parent lent no flags")
+            }
         }
     }
 }
@@ -1588,17 +1859,21 @@ fn worker_starter_of(
         .caller
         .as_deref()
         .and_then(|ctx| agent_of_session(work, ctx, cli));
-    let how = found.as_ref().map_or(Found::Plain, |(_, how)| *how);
+    let mut how = found.as_ref().map_or(Found::Plain, |(_, how)| *how);
     let mut starter = line_starter(cli, found.map(|(s, _)| s));
     // A worker no session started (the harness's own, or a spawn from outside a session) has as
     // its parent the session `ls` names: its program and login stay the worker's own, and its
-    // permissions are that session's (owner ruling 2026-11-02). A claim worker's fence names its
-    // own mode.
+    // permissions are that session's (owner ruling 2026-11-02), held to Claude Code's auto floor
+    // (`aterm_agent::harness::worker::starter`). A claim worker names its own mode and tools
+    // ([`worker_fresh`]).
     if work.caller.is_none()
         && !work.chrome
         && let Some((parent, _)) =
             parent_ctx(work).and_then(|ctx| agent_of_session(work, &ctx, cli))
     {
+        how = Found::Parent {
+            lent: parent.args.as_ref().is_ok_and(|args| !args.is_empty()),
+        };
         starter.args = parent.args;
     }
     (starter, how)
@@ -1612,7 +1887,9 @@ fn parent_ctx(work: &Launch) -> Option<Arc<SessionCtx>> {
 }
 
 /// What session `ctx`'s agent of `cli`'s kind lends a worker's line, and how it was found, with
-/// the mode its permission pill shows now where it shows one.
+/// the mode its permission pill shows now where it shows one, a Claude Code starter's route read
+/// at its folder and at the worker's own (the spawn's `cwd=`, else where the worker's shell
+/// stands), whose project settings may name a gateway the starter's lack.
 fn agent_of_session(
     work: &Launch,
     ctx: &SessionCtx,
@@ -1628,16 +1905,18 @@ fn agent_of_session(
         StarterGroup::Named(g) | StarterGroup::Front(g) => g,
     };
     let pid = u32::try_from(pgid).ok().filter(|p| *p > 0)?;
-    let starter = aterm_agent::harness::worker::starter(cli, pid, &aterm_types::dirs::home_dir()?)?;
-    let starter = match (
-        cli.agent,
-        crate::harness_host::screen_rows(&work.store, ctx.self_id.as_str()),
-    ) {
-        (aterm_phase::Program::Claude, Some(rows)) => {
-            aterm_agent::harness::worker::with_shown_mode(starter, &rows)
-        }
-        _ => starter,
-    };
+    let starter = aterm_agent::harness::worker::starter(
+        cli,
+        pid,
+        &aterm_types::dirs::home_dir()?,
+        || crate::harness_host::screen_rows(&work.store, ctx.self_id.as_str()),
+        || {
+            work.trusted_cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .or_else(|| shell_cwd(&work.store, &work.ctx))
+        },
+    )?;
     Some((
         starter,
         match group {
@@ -1752,13 +2031,47 @@ fn claude_pick(
     let Some(from) = accounts::judged_label(&roster, &who) else {
         return Ok(None);
     };
-    let (state, _) = seat.store(cli).load(seat.now)?;
+    let (state, _) = seat.store(cli).load_judged(seat.now, &roster)?;
     let enrolled = accounts::enrolled_for(cli, &roster);
     let Some(row) = accounts::worker_row(&roster, &state, &enrolled, from, mode, seat.now) else {
         return Ok(None);
     };
     let env = accounts_pool::login_env(cli, row, seat.home).map_err(|why| why.to_string())?;
     Ok(Some((from.to_owned(), env)))
+}
+
+/// Until when (unix seconds) the Claude Code login a worker of `starter` would start on
+/// ([`claude_starter_in`]) is at a usage limit, or `None` where it can run: where the host would
+/// move it to another row ([`claude_pick`]) it runs there, else its starter's own row is walled
+/// where the accounts store reads it
+/// [`Limited`](aterm_agent::harness::accounts::Condition::Limited). A login that is
+/// no roster row's, and accounts that cannot be read, read as no wall: a launch never fails on
+/// the accounts' records, and the wall shows itself in the worker's first reply.
+pub(crate) fn claude_worker_wall(
+    starter: &aterm_agent::harness::worker::Starter,
+    seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+) -> Option<i64> {
+    use aterm_agent::harness::accounts;
+    if matches!(claude_pick(starter, seat), Ok(Some(_))) {
+        return None;
+    }
+    let cli = accounts::Cli::Claude;
+    let who = accounts::ProcessLogin::of_env_for(
+        cli,
+        starter.env.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+    );
+    let roster = seat.bound_roster(cli).ok()?;
+    let row = roster.row(accounts::judged_label(&roster, &who)?)?;
+    let (state, _) = seat.store(cli).load(seat.now).ok()?;
+    let enrolled = accounts::enrolled_for(cli, &roster);
+    match accounts::condition(row, &state, enrolled.contains(&row.label), seat.now) {
+        accounts::Condition::Limited { until } => Some(until),
+        accounts::Condition::NotEnrolled
+        | accounts::Condition::SignedOut
+        | accounts::Condition::Low
+        | accounts::Condition::Usable
+        | accounts::Condition::Unseen => None,
+    }
 }
 
 pub(crate) fn pooled_starter_in(

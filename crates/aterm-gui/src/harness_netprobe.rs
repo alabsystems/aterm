@@ -1128,6 +1128,34 @@ pub(crate) fn stored_login_of_agent(pid: u32, argv: &[String], cwd: &str) -> boo
     )
 }
 
+/// What agent `pid`'s Claude Code settings make of `/login` (`claude_settings::login_pin_under`,
+/// the post-landing review of 2026-11-02): read under its own environment (its
+/// `CLAUDE_CONFIG_DIR` or home), its launch directory and this Mac's managed settings, the
+/// fence the route's reader uses. An environment that cannot be read is
+/// [`LoginPin::Unread`](aterm_agent::supervise::policy::login::LoginPin::Unread).
+pub(crate) fn login_pin_of_agent(
+    pid: u32,
+    argv: &[String],
+    cwd: &str,
+) -> aterm_agent::supervise::policy::login::LoginPin {
+    use aterm_agent::supervise::policy::login::LoginPin;
+    let Some(env) = atpkg::caller_shell::process_args(pid).map(|a| a.env) else {
+        return LoginPin::Unread;
+    };
+    let worker = WorkerEnv::new(atpkg::caller_shell::ProcArgs {
+        argv: argv.to_vec(),
+        env,
+        ..Default::default()
+    });
+    claude_settings::login_pin_under(
+        &worker,
+        Path::new(cwd),
+        claude_settings::MANAGED_DIR.map(Path::new),
+        Path::new(claude_settings::MANAGED_PREFERENCES_DIR),
+        aterm_types::dirs::home_dir().as_deref(),
+    )
+}
+
 /// Whether a relaunch line of `argv` in `cwd` finds its settings chain admit the usage tap,
 /// read as the relaunch's own gate reads it (`upgrade_drive::tap_settings_admit`: under the
 /// host's home, `settings.json` and `cowork_settings.json` alike), not as the running

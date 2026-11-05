@@ -132,6 +132,16 @@ pub fn validate_bounded_font_file(path: &Path, max_bytes: usize) -> io::Result<(
     Ok(())
 }
 
+/// Whether `path` opens as an admitted regular font file starting with the `ttcf` TrueType Collection magic.
+#[must_use]
+pub(crate) fn is_ttc_font_file(path: &Path) -> bool {
+    let Ok((mut file, _, _)) = open_regular(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).is_ok() && &magic == b"ttcf"
+}
+
 /// Read one same-handle regular font file into a bounded byte vector.
 pub fn read_bounded_font_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();

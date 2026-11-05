@@ -335,12 +335,14 @@ pub const ANCHORS: &[Anchor] = &[
         "Claude Code will automatically deny this request in",
         "2.1.281",
     ),
-    // 2.1.316's words for the same countdown (`… in 1:59, to avoid holding up an unattended
-    // session`); 2.1.308 was the last build measured with `deny`.
+    // The same countdown's later words (`… in 1:59, to avoid holding up an unattended session`):
+    // read in 2.1.314's build, which no longer holds the `deny` words, measured on 2.1.316, and the
+    // only countdown words the 2.1.316, 2.1.317 and 2.1.318 builds hold. 2.1.308 was the last build
+    // measured with `deny`; no build between was read.
     lit(
         "box.auto_block",
         "Claude Code will automatically block this request in",
-        "2.1.316",
+        "2.1.314",
     ),
     lit("trust.title", "Accessing workspace:", "2.1.280"),
     lit("trust.yes", "Yes, I trust this folder", "2.1.280"),
@@ -789,6 +791,9 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.287",
     ),
     lit("reset.continue", "send a message to continue", "2.1.287"),
+    // The `/limit-reset` command's name (`var Oj="limit-reset"` in 2.1.318, `PZ` in 2.1.303); the
+    // screen echoes it typed as `❯ /limit-reset`, its answer on the `⎿` row under it.
+    lit("reset.command", "limit-reset", "2.1.303"),
     lit("wall.fable", "You've reached your Fable limit", "2.1.267"),
     lit("wall.auto_continue", "continuing automatically", "2.1.268"),
     lit(

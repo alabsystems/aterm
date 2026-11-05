@@ -439,44 +439,63 @@ fn perl_classes_are_pinned() {
     pin(PERL_DIGEST);
 }
 
+/// Unicode 18.0.0's `CaseFolding.txt`, the fold table's source (`src/unicode.rs`).
+const CASE_FOLDING: &str = include_str!("fixtures/CaseFolding-18.0.0.txt");
+
+/// Every row of [`CASE_FOLDING`]: a code point, its status (`C`, `S`, `F` or `T`) and its fold.
+fn case_folding_rows() -> Vec<(char, &'static str, Vec<char>)> {
+    let scalar = |hex: &str| {
+        u32::from_str_radix(hex, 16)
+            .ok()
+            .and_then(char::from_u32)
+            .expect("CaseFolding.txt names scalar values")
+    };
+    CASE_FOLDING
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('#').next()?.split(';').map(str::trim);
+            let (code, status, fold) = (fields.next()?, fields.next()?, fields.next()?);
+            Some((scalar(code), status, fold.split(' ').map(scalar).collect()))
+        })
+        .collect()
+}
+
 #[test]
 fn case_folding_is_pinned() {
-    let mut lower_bucket: BTreeMap<char, Vec<char>> = BTreeMap::new();
-    let mut upper_bucket: BTreeMap<char, Vec<char>> = BTreeMap::new();
-    let mut cased: Vec<char> = Vec::new();
-    for cp in 0u32..0x11_0000 {
-        let Some(c) = char::from_u32(cp) else {
-            continue;
-        };
-        let lo = c.to_lowercase().next().expect("non-empty mapping");
-        let up = c.to_uppercase().next().expect("non-empty mapping");
-        lower_bucket.entry(lo).or_default().push(c);
-        upper_bucket.entry(up).or_default().push(c);
-        if !c.to_lowercase().eq([c]) || !c.to_uppercase().eq([c]) {
-            cased.push(c);
+    let rows = case_folding_rows();
+    let mut orbit: BTreeMap<char, BTreeSet<char>> = BTreeMap::new();
+    for (code, status, fold) in &rows {
+        if matches!(*status, "C" | "S") {
+            let [to] = fold[..] else {
+                panic!("U+{:04X}'s simple fold is one code point", *code as u32)
+            };
+            let mut joined: BTreeSet<char> = [*code, to].into();
+            for c in [*code, to] {
+                joined.extend(orbit.get(&c).into_iter().flatten().copied());
+            }
+            for &c in &joined {
+                orbit.insert(c, joined.clone());
+            }
         }
+    }
+    let mut cased: BTreeMap<char, BTreeSet<char>> = BTreeMap::new();
+    for (code, _, fold) in &rows {
+        for c in std::iter::once(code).chain(fold) {
+            cased.entry(*c).or_default();
+        }
+        cased.entry(*code).or_default().extend(fold.iter().copied());
     }
 
     let mut buf = [0u8; 4];
-    for &c in &cased {
+    for (&c, folds_to) in &cased {
         let src = aterm_regex::escape(&c.to_string());
         let single = aterm_regex::Regex::new(&format!("(?i){src}")).expect("compiles");
         let class = aterm_regex::Regex::new(&format!("(?i)[{src}]")).expect("compiles");
 
         let mut candidates: BTreeSet<char> = ('a'..='z').chain('A'..='Z').collect();
         candidates.insert(c);
-        candidates.extend(c.to_lowercase().chain(c.to_uppercase()));
-        for key in [
-            c,
-            c.to_lowercase().next().expect("non-empty"),
-            c.to_uppercase().next().expect("non-empty"),
-        ] {
-            for bucket in [&lower_bucket, &upper_bucket] {
-                if let Some(v) = bucket.get(&key) {
-                    candidates.extend(v.iter().copied());
-                }
-            }
-        }
+        candidates.extend(folds_to.iter().copied());
+        candidates.extend(orbit.get(&c).into_iter().flatten().copied());
         feed(&(c as u32).to_le_bytes());
         for other in &candidates {
             let s: &str = other.encode_utf8(&mut buf);
@@ -954,7 +973,7 @@ fn escape_round_trips() {
 const BUILTIN_DIGEST: &str = "736c9a64662e49c0";
 const SYNTAX_DIGEST: &str = "d9526bd496b9392f";
 const PERL_DIGEST: &str = "6212cb3a3e2938ec";
-const FOLD_DIGEST: &str = "47803473ede5742a";
+const FOLD_DIGEST: &str = "2866280e483e3be4";
 const EXOTIC_DIGEST: &str = "033f0d201ef6505a";
 const ZERO_WIDTH_DIGEST: &str = "c6278ff2ce852f5c";
 const NULLABLE_DIGEST: &str = "75190a174fd22dac";

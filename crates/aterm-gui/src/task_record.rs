@@ -137,6 +137,13 @@ pub(crate) const WHY_EXPIRED: &str = "expired";
 /// (`aterm_agent::supervise::REPEATED_WHY`).
 pub(crate) const WHY_REPEATED: &str = aterm_agent::supervise::REPEATED_WHY;
 
+/// `why=` of a `failed` managed worker whose account hit a usage limit that resets too far off to
+/// wait for, with no other account or model to move to (`aterm_agent::supervise::USAGE_LIMIT_WHY`):
+/// the supervisor marks it and types nothing into it again, so its tab goes as any concluded
+/// worker's does (`worker_reaper::settled`), and whoever started it (its manager, or the credit
+/// claim's next try) may start it again.
+pub(crate) const WHY_USAGE_LIMIT: &str = aterm_agent::supervise::USAGE_LIMIT_WHY;
+
 /// `why=` of an agent that left its tab with nothing to bring it back.
 pub(crate) const WHY_EXIT: &str = "exit";
 
@@ -172,6 +179,7 @@ pub(crate) const TASK_WHY: &[&str] = &[
     WHY_OFF_CTL,
     WHY_EXPIRED,
     WHY_REPEATED,
+    WHY_USAGE_LIMIT,
 ];
 
 /// A failed conclusion's words for a person, by its `why=` (the Workers row, Done for you and the
@@ -187,6 +195,9 @@ pub(crate) fn failed_words(state: TaskState, why: Option<&str>) -> String {
         (_, Some(WHY_OFF_CTL)) => "a manager or a script turned Autopilot off".to_string(),
         (_, Some(WHY_EXPIRED)) => "its time ran out".to_string(),
         (_, Some(WHY_REPEATED)) => "it kept repeating the same reply".to_string(),
+        (_, Some(WHY_USAGE_LIMIT)) => {
+            "its account hit a usage limit that resets too far off to wait for".to_string()
+        }
         (_, Some(WHY_EXIT)) | (TaskState::Exited, None) => {
             "its agent exited before landing".to_string()
         }
@@ -277,6 +288,11 @@ pub(crate) struct TaskRecord {
     /// `no-remote`, `no-repo`, …; [`checked_word`]); none where the mark said none (a landing with
     /// no receipt, codex-alab's own, a hand's mark).
     pub(crate) checked: Option<String>,
+    /// What the landing that marked it done read of the processes its agent started that still
+    /// ran (`left=`, `docs/DESIGN-leftovers-by-default-2026-10-30.md` §2: `0`, `kept:<n>`, `<n>`
+    /// or `unchecked`; [`left_word`]); none where the mark said none (a landing whose host read
+    /// none, codex-alab's own, a hand's mark).
+    pub(crate) left: Option<String>,
     /// Agent exit code for an `exited` task, if known.
     pub(crate) exit: Option<i32>,
     /// An `exited` task that had finished before its agent left, whatever word finished it: an exit
@@ -371,7 +387,7 @@ impl TaskRecord {
         }
     }
 
-    /// ` why= checked= exit= result_path=`, each only when set.
+    /// ` why= checked= left= exit= result_path=`, each only when set.
     fn push_optional(&self, out: &mut String) {
         if let Some(why) = self.why {
             out.push_str(" why=");
@@ -380,6 +396,10 @@ impl TaskRecord {
         if let Some(checked) = &self.checked {
             out.push_str(" checked=");
             out.push_str(checked);
+        }
+        if let Some(left) = &self.left {
+            out.push_str(" left=");
+            out.push_str(left);
         }
         if let Some(exit) = self.exit {
             out.push_str(&format!(" exit={exit}"));
@@ -518,6 +538,10 @@ impl TaskRecord {
                 Some(word) => Some(checked_word(word)?),
                 None => None,
             },
+            left: match field("left") {
+                Some(word) => Some(left_word(word)?),
+                None => None,
+            },
             exit: match field("exit") {
                 Some(code) => Some(parse_exit_i32(code)?),
                 None => None,
@@ -583,6 +607,18 @@ pub(crate) fn checked_word(value: &str) -> Option<String> {
     aterm_agent::harness::land_receipt::valid_checked_word(value).then(|| value.to_owned())
 }
 
+/// THE `left=` WORD `value` IS, as a landing's done line writes it
+/// (`aterm_agent::harness::leftover::LeftWord::word`): `0`, `kept:<n>`, `<n>` or `unchecked`;
+/// `None` for any other.
+pub(crate) fn left_word(value: &str) -> Option<String> {
+    aterm_agent::harness::leftover::LeftWord::of_word(value).map(|_| value.to_owned())
+}
+
+/// THE REFUSAL OF A HAND MARK'S `left=`: as for `checked=` ([`CHECKED_BY_HAND`]), the word says
+/// what aterm's own loop read at a landing, so only that loop writes it.
+pub(crate) const LEFT_BY_HAND: &str = "ERR task mark: left= is what aterm's own landing read of the \
+     processes its agent left running; a hand mark cannot set it\n";
+
 /// THE REFUSAL OF A HAND MARK'S `checked=` (the post-landing review, 2026-11-01): the word says
 /// what aterm itself checked at a landing, so only aterm's own loop writes it (its connection's
 /// [`Principal::Harness`]); a mark any other owner-socket caller makes names none.
@@ -628,6 +664,8 @@ pub(crate) struct TaskMark {
     pub(crate) why: Option<&'static str>,
     /// What aterm checked at the landing ([`TaskRecord::checked`], [`checked_word`]).
     pub(crate) checked: Option<String>,
+    /// What the landing read of the agent's left processes ([`TaskRecord::left`], [`left_word`]).
+    pub(crate) left: Option<String>,
     /// Agent exit code.
     pub(crate) exit: Option<i32>,
     /// Result size in bytes.
@@ -638,7 +676,7 @@ pub(crate) struct TaskMark {
 
 /// Usage error line for `task`.
 pub(crate) const TASK_USAGE: &str = "ERR usage: task [mark <working|done|exited|stalled|failed> \
-     [from=<s-…|ctl>] [why=<word>] [checked=<word>] [exit=<n>] [result_bytes=<n>] \
+     [from=<s-…|ctl>] [why=<word>] [checked=<word>] [left=<word>] [exit=<n>] [result_bytes=<n>] \
      [result_path=<pct>]]\n";
 
 impl TaskMark {
@@ -650,6 +688,7 @@ impl TaskMark {
             from: None,
             why: None,
             checked: None,
+            left: None,
             exit: None,
             result_bytes: 0,
             result_path: None,
@@ -687,6 +726,14 @@ impl TaskMark {
                         "ERR task mark: checked= is <head>@<ref>, pushed, no-remote, no-repo or \
                          gone\n"
                             .to_string()
+                    })?);
+                }
+                "left" if state != TaskState::Done => {
+                    return Err("ERR task mark: left= marks a done task\n".into());
+                }
+                "left" => {
+                    mark.left = Some(left_word(value).ok_or_else(|| {
+                        "ERR task mark: left= is 0, kept:<n>, <n> or unchecked\n".to_string()
                     })?);
                 }
                 "exit" => mark.exit = Some(parse_exit_i32(value).ok_or_else(usage)?),
@@ -729,6 +776,7 @@ impl TaskMark {
                 from,
                 why: self.why,
                 checked: self.checked.clone(),
+                left: self.left.clone(),
                 exit: self.exit,
                 finished: false,
                 result_bytes: self.result_bytes,
@@ -749,7 +797,8 @@ impl TaskMark {
         };
         // AN EXIT DOES NOT REWRITE HOW THE TASK ENDED: an agent that leaves after its task finished,
         // whatever word finished it, or after a failed conclusion, keeps that end's `why=` and
-        // `checked=`, and the fact that it finished stays on the record ([`TaskRecord::finished`]).
+        // `checked=` and `left=`, and the fact that it finished stays on the record
+        // ([`TaskRecord::finished`]).
         let finished =
             self.state == TaskState::Exited && current.conclusion() == Some(Conclusion::Finished);
         let ended_before =
@@ -760,10 +809,16 @@ impl TaskMark {
         } else {
             self.checked.clone()
         };
+        let left = if ended_before {
+            current.left.clone()
+        } else {
+            self.left.clone()
+        };
         let same = current.state == self.state
             && current.from == from
             && current.why == why
             && current.checked == checked
+            && current.left == left
             && current.exit == self.exit
             && current.finished == finished
             && current.result_bytes == self.result_bytes
@@ -786,6 +841,7 @@ impl TaskMark {
         next.from = from;
         next.why = why;
         next.checked = checked;
+        next.left = left;
         next.exit = self.exit;
         next.finished = finished;
         next.result_bytes = self.result_bytes;
@@ -1248,14 +1304,44 @@ pub(crate) fn note_autopilot_word(ctx: &SessionCtx, local_id: u64) -> Option<std
 /// Usage error line for `result`.
 pub(crate) const RESULT_USAGE: &str = "ERR usage: result [full]\n";
 
+/// `result [full]`'s `full`, or its usage line.
+fn result_full(rest: &str) -> Result<bool, String> {
+    match rest.trim() {
+        "" => Ok(false),
+        "full" => Ok(true),
+        _ => Err(RESULT_USAGE.to_string()),
+    }
+}
+
+/// `result [full]` for a worker whose tab aterm closed, its task's end `record`
+/// ([`crate::retired_workers`]): its result file, kept while its row stands, read as a live
+/// worker's is, with no session left to read a missed result again from.
+pub(crate) fn retired_result(record: &TaskRecord, rest: &str) -> String {
+    match result_full(rest) {
+        Ok(full) => answer_result(record, |path| {
+            aterm_agent::harness::result::answer(path, full)
+        }),
+        Err(usage) => usage,
+    }
+}
+
+/// `record`'s `result` reply: `read` of its result file where an end left one, else why there is
+/// none.
+fn answer_result(record: &TaskRecord, read: impl FnOnce(&Path) -> String) -> String {
+    match (&record.result_path, record.state) {
+        (Some(path), TaskState::Done | TaskState::Exited | TaskState::Failed) => read(path),
+        (_, TaskState::Done) => "ERR result unavailable why=no-snapshot\n".to_string(),
+        (_, state) => format!("ERR result unavailable why={}\n", state.as_str()),
+    }
+}
+
 /// Handles `result [full]` on `ctx` (session `local_id`): a result the done edge missed is read
 /// again (`result::reread_with`), a codex landing's that knew no conversation by the one the
 /// worker's claim names now (`self_claim::rollout_target`, the landing's own resolver).
 pub(crate) fn cmd_result(ctx: &SessionCtx, local_id: u64, rest: &str) -> String {
-    let full = match rest.trim() {
-        "" => false,
-        "full" => true,
-        _ => return RESULT_USAGE.to_string(),
+    let full = match result_full(rest) {
+        Ok(full) => full,
+        Err(usage) => return usage,
     };
     let record = ctx
         .timeline
@@ -1266,20 +1352,16 @@ pub(crate) fn cmd_result(ctx: &SessionCtx, local_id: u64, rest: &str) -> String 
     let Some(record) = record else {
         return "ERR no task\n".to_string();
     };
-    match (&record.result_path, record.state) {
-        (Some(path), TaskState::Done | TaskState::Exited | TaskState::Failed) => {
-            let claim = || crate::self_claim::rollout_target(ctx).map(|t| (t.home, t.thread));
-            match aterm_agent::harness::result::reread_with(path, claim) {
-                Some(found) => {
-                    repair_result(ctx, local_id, &record, path, &found);
-                    found.answer(path, full)
-                }
-                None => aterm_agent::harness::result::answer(path, full),
+    answer_result(&record, |path| {
+        let claim = || crate::self_claim::rollout_target(ctx).map(|t| (t.home, t.thread));
+        match aterm_agent::harness::result::reread_with(path, claim) {
+            Some(found) => {
+                repair_result(ctx, local_id, &record, path, &found);
+                found.answer(path, full)
             }
+            None => aterm_agent::harness::result::answer(path, full),
         }
-        (_, TaskState::Done) => "ERR result unavailable why=no-snapshot\n".to_string(),
-        (_, state) => format!("ERR result unavailable why={}\n", state.as_str()),
-    }
+    })
 }
 
 /// Marks `record` (as `result` read it) again with `found`'s size as its `result_bytes=`, when
@@ -1298,6 +1380,7 @@ fn repair_result(
         from: Some(record.from.clone()),
         why: record.why,
         checked: record.checked.clone(),
+        left: record.left.clone(),
         exit: record.exit,
         result_bytes: found.bytes(),
         result_path: record.result_path.clone(),
@@ -1331,15 +1414,18 @@ pub(crate) fn restore_row(ctx: &SessionCtx) -> Option<String> {
 }
 
 /// Restores a parked worker's record ([`restore_row`]) onto `ctx`, in a restore other than a
-/// seamless update. A worker still running when the image was taken reads `working
-/// why=restored`, which no startup or held deadline reads as one just spawned, or, where its agent
-/// is not coming back, `exited why=exit`: `gone` (a plain quit forgets it, and no keeper handed its
-/// shell back), or a disposable worker whose shell did not come back running (`kept`). aterm's disk
-/// worker is disposable: a later need starts a new one, so a cold restart never relaunches it
+/// seamless update. A worker whose agent was `followed` when the image was taken, or whose record
+/// already says it ran (a `why=`), reads `working why=restored`, which no startup or held deadline
+/// reads as one just spawned. One neither says of, in a shell a keeper handed back (`kept`), may
+/// never have had its line typed, and the launcher that would have typed it ended with the process:
+/// it reads `working` from now, so the startup deadline judges what its screen shows. Otherwise, where its agent is not coming
+/// back, it reads `exited why=exit`: gone (a plain quit forgets it, and no keeper handed its shell
+/// back), or a disposable worker whose shell did not come back running. aterm's disk worker is
+/// disposable: a later need starts a new one, so a cold restart never relaunches it
 /// ([`disposable_worker`]). Returns whether this is such a worker, whose agent the restore leaves
 /// unlaunched. One whose relaunch is over without its agent is marked exited then
 /// ([`mark_restored_over`]).
-pub(crate) fn seed_restored(ctx: &SessionCtx, row: &str, gone: bool, kept: bool) -> bool {
+pub(crate) fn seed_restored(ctx: &SessionCtx, row: &str, followed: bool, kept: bool) -> bool {
     let now = Instant::now();
     let now_unix_ms = unix_ms_now();
     let Some(mut record) =
@@ -1351,7 +1437,7 @@ pub(crate) fn seed_restored(ctx: &SessionCtx, row: &str, gone: bool, kept: bool)
         return false;
     };
     let disposable = !kept && disposable_worker(record.trusted_cwd.as_deref());
-    let gone = gone || disposable;
+    let gone = (!followed && !kept) || disposable;
     match record.state {
         TaskState::Working | TaskState::Stalled if gone => {
             record.rev += 1;
@@ -1362,6 +1448,12 @@ pub(crate) fn seed_restored(ctx: &SessionCtx, row: &str, gone: bool, kept: bool)
             record.attention = false;
             record.since = now;
             record.since_unix_ms = now_unix_ms;
+        }
+        TaskState::Working if !followed && record.why.is_none() => {
+            record.why = None;
+            record.since = now;
+            record.since_unix_ms = now_unix_ms;
+            record.carried_entered = Some(record.entered);
         }
         TaskState::Working => {
             record.why = Some(WHY_RESTORED);
@@ -1468,6 +1560,16 @@ fn task_reply(ctx: &SessionCtx, record: Option<&TaskRecord>) -> String {
     )
 }
 
+/// The `task` reply for a worker whose tab aterm closed once its task concluded
+/// ([`crate::retired_workers`]): its final record, with no agent, program or attention, its session
+/// gone.
+pub(crate) fn retired_task_reply(record: &TaskRecord) -> String {
+    format!(
+        "OK task {} agent=- program_state=- attention=-\n",
+        record.wire_fields()
+    )
+}
+
 /// Handles `task` and `task mark …` on `ctx` (session `local_id`).
 pub(crate) fn cmd_task(ctx: &SessionCtx, local_id: u64, scope: Scope, rest: &str) -> String {
     let rest = rest.trim();
@@ -1495,6 +1597,9 @@ pub(crate) fn cmd_task(ctx: &SessionCtx, local_id: u64, scope: Scope, rest: &str
     };
     if parsed.checked.is_some() && crate::control::serving_principal() != Principal::Harness {
         return CHECKED_BY_HAND.to_string();
+    }
+    if parsed.left.is_some() && crate::control::serving_principal() != Principal::Harness {
+        return LEFT_BY_HAND.to_string();
     }
     if parsed.state == TaskState::Failed
         && crate::control::serving_principal() != Principal::Harness
@@ -1675,7 +1780,8 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
 
 /// Formats a single `await task` reply row (` conclusion=` once the task ended,
 /// [`TaskRecord::conclusion`], ` why=` where something said, ` checked=` where a landing named what
-/// aterm checked, §14.9 slice 9c, and ` fact= fact_rev=` at its end once the record's fact word was
+/// aterm checked, §14.9 slice 9c, ` left=` where it read the agent's left processes, and ` fact=
+/// fact_rev=` at its end once the record's fact word was
 /// ever edited, [`TaskRecord::push_fact`]); `program` is the `program_state=` column, a claim shown
 /// beside `agent=` that no wait reads. A tab closed on a task with no conclusion yet reads
 /// `conclusion=failed`: nothing is left to finish it.
@@ -1708,6 +1814,10 @@ pub(crate) fn await_row(
         if let Some(checked) = &record.checked {
             row.push_str(" checked=");
             row.push_str(checked);
+        }
+        if let Some(left) = &record.left {
+            row.push_str(" left=");
+            row.push_str(left);
         }
         record.push_fact(&mut row);
     }

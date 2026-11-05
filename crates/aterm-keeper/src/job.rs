@@ -175,7 +175,27 @@ pub enum JobState {
     Loaded { pid: Option<u32> },
 }
 
+/// How long one `launchctl` may take before it is killed and its call fails.
+#[cfg(not(test))]
 const LAUNCHCTL_HANG: std::time::Duration = std::time::Duration::from_secs(30);
+/// A unit test's is its one-minute hang detector: launchd answers every `launchctl`, and a
+/// loaded machine only slows it.
+#[cfg(test)]
+const LAUNCHCTL_HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+
+/// [`LAUNCHCTL_HANG`], or the longer floor a test set on this process's peer waits
+/// (`identity::set_peer_waits_for_test`): `tests/` and the roles they start link this library
+/// without `cfg(test)`.
+fn launchctl_hang() -> std::time::Duration {
+    #[cfg(unix)]
+    {
+        crate::identity::peer_wait(LAUNCHCTL_HANG)
+    }
+    #[cfg(not(unix))]
+    {
+        LAUNCHCTL_HANG
+    }
+}
 
 fn launchctl_io_error(err: aterm_uds::deadline::RunError) -> io::Error {
     match err {
@@ -192,8 +212,8 @@ fn launchctl_io_error(err: aterm_uds::deadline::RunError) -> io::Error {
 pub fn state(label: &str) -> io::Result<JobState> {
     let mut cmd = aterm_uds::spawnfd::command("/bin/launchctl");
     cmd.arg("print").arg(format!("{}/{label}", gui_domain()));
-    let out =
-        aterm_uds::deadline::output_within(&mut cmd, LAUNCHCTL_HANG).map_err(launchctl_io_error)?;
+    let out = aterm_uds::deadline::output_within(&mut cmd, launchctl_hang())
+        .map_err(launchctl_io_error)?;
     if !out.status.success() {
         return Ok(JobState::Absent);
     }
@@ -212,8 +232,8 @@ pub fn state(label: &str) -> io::Result<JobState> {
 fn run_launchctl(argv: &[String]) -> io::Result<()> {
     let mut cmd = aterm_uds::spawnfd::command("/bin/launchctl");
     cmd.args(argv);
-    let out =
-        aterm_uds::deadline::output_within(&mut cmd, LAUNCHCTL_HANG).map_err(launchctl_io_error)?;
+    let out = aterm_uds::deadline::output_within(&mut cmd, launchctl_hang())
+        .map_err(launchctl_io_error)?;
     if out.status.success() {
         Ok(())
     } else {

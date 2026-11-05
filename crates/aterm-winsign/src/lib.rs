@@ -158,6 +158,32 @@ const MAX_HOST_READ_BYTES: u64 = 1024 * 1024;
 /// The real machine.
 pub struct RealHost;
 
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "aarch64", target_arch = "arm")
+))]
+const OPEN_FLAGS: i32 = 0o100_000 | 0o4000 | 0o2_000_000;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(target_arch = "aarch64", target_arch = "arm"))
+))]
+const OPEN_FLAGS: i32 = 0o400_000 | 0o4000 | 0o2_000_000;
+#[cfg(target_os = "openbsd")]
+const OPEN_FLAGS: i32 = 0x0200 | 0x0004 | 0x0001_0000;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const OPEN_FLAGS: i32 = 0x0100 | 0x0004 | 0x0100_0000;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "openbsd",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+const OPEN_FLAGS: i32 = 0x0100 | 0x0004;
+
 impl Host for RealHost {
     fn env(&self, key: &str) -> Option<String> {
         std::env::var(key).ok().filter(|v| !v.is_empty())
@@ -176,11 +202,6 @@ impl Host for RealHost {
     }
     fn read_to_string(&self, path: &Path) -> Result<String, String> {
         use std::io::Read;
-        let pre =
-            std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if !pre.file_type().is_file() {
-            return Err(format!("{}: not a regular file", path.display()));
-        }
         #[cfg(any(
             all(
                 any(target_os = "linux", target_os = "android"),
@@ -201,13 +222,9 @@ impl Host for RealHost {
         ))]
         let file = {
             use std::os::unix::fs::OpenOptionsExt as _;
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800;
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004;
             std::fs::OpenOptions::new()
                 .read(true)
-                .custom_flags(NONBLOCK_OPEN_FLAG)
+                .custom_flags(OPEN_FLAGS)
                 .open(path)
                 .map_err(|e| format!("{}: {e}", path.display()))?
         };
@@ -229,19 +246,19 @@ impl Host for RealHost {
             target_os = "openbsd",
             target_os = "dragonfly",
         )))]
-        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let file = {
+            let pre =
+                std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            if !pre.file_type().is_file() {
+                return Err(format!("{}: not a regular file", path.display()));
+            }
+            std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?
+        };
         let meta = file
             .metadata()
             .map_err(|e| format!("{}: {e}", path.display()))?;
         if !meta.is_file() {
             return Err(format!("{}: not a regular file", path.display()));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if (pre.dev(), pre.ino()) != (meta.dev(), meta.ino()) {
-                return Err(format!("{}: file changed during open", path.display()));
-            }
         }
         if meta.len() > MAX_HOST_READ_BYTES {
             return Err(format!(
@@ -299,7 +316,7 @@ impl Host for RealHost {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
+                opts.mode(0o600).custom_flags(OPEN_FLAGS);
             }
             match opts.open(&candidate) {
                 Ok(file) => break (candidate, file),

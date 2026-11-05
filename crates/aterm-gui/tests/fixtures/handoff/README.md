@@ -209,6 +209,8 @@ desks have no row.
   (`history_withheld`).
 - `fold` (v0.108.0): 65 windows, one past `MAX_WINDOWS`, so the layout folds.
 - `variants` (v0.108.0): every carried enum variant no other desk takes.
+- `lone-workers-list` (v0.155.0): a window that held only an empty Workers list,
+  with no session, which a parent sends only to a target that declares `desk1`.
 
 ## Producer shapes by release
 

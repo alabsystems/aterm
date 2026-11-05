@@ -76,15 +76,17 @@ pub fn signing_lease(home: &Path) -> Result<SigningLease, String> {
         }
         let dir = home.join(".aterm/apple");
         crate::fsx::ensure_private_dir(&dir).map_err(|error| error.to_string())?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(dir.join(".signing.lock"))
-            .map_err(|error| format!("signing lock: {error}"))?;
+        let file: std::fs::File = aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(dir.join(".signing.lock"))
+        })
+        .map_err(|error| format!("signing lock: {error}"))?;
         let meta = file
             .metadata()
             .map_err(|error| format!("signing lock: {error}"))?;
@@ -95,7 +97,6 @@ pub fn signing_lease(home: &Path) -> Result<SigningLease, String> {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .map_err(|error| format!("secure signing lock: {error}"))?;
         }
-        aterm_uds::keep_out_of_children(&file).map_err(|error| format!("signing lock: {error}"))?;
         #[expect(
             clippy::disallowed_methods,
             reason = "nonblocking private keychain transaction lease, released by LockedFile"
@@ -142,7 +143,7 @@ fn make_private(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
     {
         Ok(file) => file,
@@ -1023,7 +1024,7 @@ fn stored_password(home: &Path) -> Stored {
         Ok(_) => {}
         Err(e) => return Stored::Unreadable(e.to_string()),
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     if let Err(e) = file.take(MAX_PASSWORD_BYTES + 1).read_to_end(&mut bytes) {
         return Stored::Unreadable(e.to_string());
     }
@@ -1119,6 +1120,7 @@ fn create_password_with(
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(&partial)
         .and_then(|mut file| fill(&mut file, format!("{password}\n").as_bytes()))
         .and_then(|()| std::fs::hard_link(&partial, &path));
@@ -2338,14 +2340,14 @@ fn prepare_existing_pair_with(
     {
         kc.install_pair(cert, key)?;
     }
-    std::fs::set_permissions(kc.release(), std::fs::Permissions::from_mode(0o600)).map_err(
-        |error| {
+    aterm_uds::regular_file::open(&kc.release())
+        .and_then(|(f, _)| f.set_permissions(std::fs::Permissions::from_mode(0o600)))
+        .map_err(|error| {
             Refusal::new(
                 format!("secure the owned signing keychain: {error}"),
                 "automatic setup will retry",
             )
-        },
-    )?;
+        })?;
     if !kc
         .holds(team, expected_sha1)
         .map_err(|why| Refusal::new(why, "automatic setup will retry"))?

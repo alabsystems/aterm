@@ -182,6 +182,7 @@ fn pass(fake: &Arc<Fake>, records: Option<PathBuf>) -> LeftPass {
         kernel: Arc::clone(fake) as Arc<dyn LeftKernel + Send + Sync>,
         records,
         boot: || Some("b".to_owned()),
+        ..LeftReaders::inert()
     })
 }
 
@@ -196,6 +197,11 @@ fn world() -> Arc<Fake> {
 
 /// A request naming tab 7 (session `s-7`, its shell pid 200), or no tab.
 fn req(tab: bool) -> Request {
+    led(tab, None)
+}
+
+/// [`req`], tab 7 naming `leader` as its agent's group leader.
+fn led(tab: bool, leader: Option<u32>) -> Request {
     Request {
         self_pid: SELF,
         tabs: tab
@@ -206,6 +212,7 @@ fn req(tab: bool) -> Request {
                 shell_pid: 200,
                 label: "Tab 2".into(),
                 program: "zsh".into(),
+                agent_leader: leader,
             })
             .into_iter()
             .collect(),
@@ -257,8 +264,10 @@ fn a_closed_tabs_count_leaves_out_the_rows_it_offers_no_token() {
 
 /// `end`'s re-proof reads the one pid again on fresh state and judges it against the view's live
 /// and closed tabs: a closed tab's survivor still offers the token the view offered, from that
-/// closed tab; this instance and a pid gone since read as none. NEGATIVE CONTROL: judge it
-/// against no closed tab, and the survivor offers nothing.
+/// closed tab; this instance and a pid gone since read as none, and records that do not read or a
+/// table that does not list read as unread, not as gone. NEGATIVE CONTROL: judge it
+/// against no closed tab, and the survivor offers nothing; read unreadable records as none, and
+/// the survivor reads.
 #[test]
 fn the_reread_judges_one_pid_again_against_the_views_tabs() {
     let fake = world();
@@ -279,20 +288,45 @@ fn the_reread_judges_one_pid_again_against_the_views_tabs() {
         kernel: Arc::clone(&fake) as Arc<dyn LeftKernel + Send + Sync>,
         records: None,
         boot: || Some("b".to_owned()),
+        ..LeftReaders::inert()
     };
-    let again = reread(&readers, &view.live, &view.closed, SELF, 2606, 3_000).expect("read again");
+    let again = reread(&readers, &view.live, &view.closed, SELF, 2606, 3_000)
+        .view()
+        .expect("read again");
     let again = &again.rows[0];
     assert_eq!(
         (again.tier, again.from.clone(), again.token.clone()),
         (Tier::Offer, Source::Closed(7), shown.token.clone())
     );
-    assert!(
-        reread(&readers, &view.live, &view.closed, SELF, SELF, 3_000).is_none(),
+    assert_eq!(
+        reread(&readers, &view.live, &view.closed, SELF, SELF, 3_000),
+        Reread::Read(None),
         "this instance"
     );
+    // A rendezvous whose records do not read (a file where the folder should be), and a table
+    // that does not list (this instance's own lineage lost), say nothing of the survivor.
+    let unreadable = LeftReaders {
+        kernel: Arc::clone(&fake) as Arc<dyn LeftKernel + Send + Sync>,
+        records: Some(std::env::current_exe().expect("this test binary")),
+        boot: || Some("b".to_owned()),
+        ..LeftReaders::inert()
+    };
+    assert_eq!(
+        reread(&unreadable, &view.live, &view.closed, SELF, 2606, 3_000),
+        Reread::Unread,
+        "records that do not read"
+    );
+    fake.remove(i32::try_from(SELF).expect("a pid"));
+    assert_eq!(
+        reread(&readers, &view.live, &view.closed, SELF, 2606, 3_000),
+        Reread::Unread,
+        "a table that does not list"
+    );
+    fake.add(i32::try_from(SELF).expect("a pid"), 90, 20, None);
     fake.remove(2606);
-    assert!(
-        reread(&readers, &view.live, &view.closed, SELF, 2606, 3_000).is_none(),
+    assert_eq!(
+        reread(&readers, &view.live, &view.closed, SELF, 2606, 3_000),
+        Reread::Read(None),
         "gone since"
     );
 }
@@ -474,7 +508,7 @@ fn a_stale_dead_seen_cache_adopts_the_first_recorded_horizon() {
     assert_eq!((first.horizon, first.at_ms), (1200, 1500));
 
     fake.add(2606, 1, 1600, None);
-    pass.append_dead_seen(&*fake, SELF, &[stale], 2000);
+    pass.append_dead_seen(&*fake, SELF, &mut [stale], 2000);
     assert_eq!(pass.records.list[0].1.dead_seen, Some(1200));
     assert_eq!(pass.records.list[0].1.dead_seen_ms, Some(1500));
     let records = aterm_uds::runs::read_records(dir.path()).unwrap();
@@ -491,7 +525,8 @@ fn a_stale_dead_seen_cache_adopts_the_first_recorded_horizon() {
 }
 
 /// A held program outside every job is tied to the live tab its group-mate's environment names
-/// (its own is never read), for the jobs pass to name it by; its row gets no token.
+/// (its own is never read), for the jobs pass to name it by, and the tie says it was not born
+/// after an agent started there (none was seen); its row gets no token.
 #[test]
 fn a_held_programs_tie_is_handed_to_the_jobs_pass() {
     use aterm_vitals::jobs::{Findings, Named};
@@ -520,7 +555,14 @@ fn a_held_programs_tie_is_handed_to_the_jobs_pass() {
         .expect("a view");
     assert_eq!(
         pass.ties(),
-        BTreeMap::from([(2606, 7)]),
+        BTreeMap::from([(
+            2606,
+            left::Tie {
+                key: 7,
+                closed: false,
+                after_agent: false,
+            }
+        )]),
         "its group-mate's environment names tab 7's session"
     );
     let row = view.rows.iter().find(|r| r.pid == 2606).expect("listed");
@@ -624,9 +666,14 @@ fn an_unstarted_programs_tie_is_handed_to_the_jobs_pass_whatever_keeps_it() {
     let sweep = fake.sweep();
     pass.tick(1_000, Some(&sweep), true, &req(true), Some(&jobs), 0)
         .expect("a view");
+    let tab_7 = left::Tie {
+        key: 7,
+        closed: false,
+        after_agent: false,
+    };
     assert_eq!(
         pass.ties(),
-        BTreeMap::from([(2606, 7), (2607, 7), (2608, 7)]),
+        BTreeMap::from([(2606, tab_7), (2607, tab_7), (2608, tab_7)]),
         "each group-mate's environment names tab 7's session; 2609, which the view does not \
          name, is tied to none"
     );
@@ -657,4 +704,265 @@ fn a_dead_runs_horizon_is_read_after_its_launcher_is_found_dead() {
         .filter(|l| l.starts_with("dead_seen "))
         .collect();
     assert_eq!(seen, ["dead_seen uniqueid=1600 at=1000"], "{text}");
+}
+
+/// Tab 7 whose agent (pid 300, unique id 1200, the shell's child) the host names, with what it
+/// left: a `nohup` its short call started at 1500, which no jobs pass saw as an agent call, and the
+/// person's own from 1100, before the agent, each left in the group of the shell that started it;
+/// read at [`AT_MS`].
+fn agents_tab(leader: Option<u32>) -> (Arc<Fake>, LeftPass, Arc<LeftView>) {
+    let fake = world();
+    fake.add(300, 200, 1200, None);
+    fake.add(2606, 1, 1500, Some("s-7"));
+    fake.group(2606, 2600);
+    fake.add(2607, 1, 1100, Some("s-7"));
+    fake.group(2607, 2500);
+    fake.add(2608, 1, 1600, None);
+    fake.group(2608, 2600);
+    let mut pass = pass(&fake, None);
+    let sweep = fake.sweep();
+    let view = pass
+        .tick(AT_MS, Some(&sweep), true, &led(true, leader), None, 0)
+        .expect("a view");
+    (fake, pass, view)
+}
+
+/// When [`agents_tab`] reads, unix ms: a minute after the fake's births.
+const AT_MS: u64 = 1_792_000_060_000;
+
+/// Each row's tier, source and whether it was born while an agent ran in its tab.
+fn after(view: &LeftView, pid: u32) -> (Tier, Source, bool) {
+    let row = view.rows.iter().find(|r| r.pid == pid).expect("listed");
+    (row.tier, row.from.clone(), row.after_agent)
+}
+
+/// An agent stretch still open, from `since`.
+const fn open_span(since: u64) -> left::AgentSpan {
+    left::AgentSpan { since, until: None }
+}
+
+/// THE AGENT'S OWN START OPENS ITS WINDOW: with no agent call seen in tab 7, the agent's group
+/// leader the host names dates the tab's agent start, so the `nohup` its short call left reads as
+/// born after the agent and the person's older one does not; the tab's close keeps the start.
+/// NEGATIVE CONTROL: fold no named leader into the tab's agent start, and the agent's `nohup`
+/// reads as born before it.
+#[test]
+fn the_agents_own_start_opens_its_window() {
+    let (fake, mut pass, view) = agents_tab(Some(300));
+    assert_eq!(after(&view, 2606), (Tier::Offer, Source::Tab(7), true));
+    assert_eq!(after(&view, 2607), (Tier::Offer, Source::Tab(7), false));
+    assert_eq!(view.live[0].agent_spans, [open_span(1200)]);
+    fake.remove(200);
+    let closed = tick(&mut pass, &fake, AT_MS + 1_000, false);
+    assert_eq!(closed.closed[0].agent_spans, [open_span(1200)]);
+}
+
+/// AN AGENT GONE FROM ITS TAB CLOSES ITS WINDOW: tab 7's agent (unique id 1200) leaves its
+/// `nohup` (1500) and exits; the next reading names no agent there, so its stretch closes at that
+/// reading's horizon. The server the person then starts by hand (1600) is born outside every
+/// stretch, so when a second agent (2000) starts in the same shell the server reads as the
+/// person's: not the agent's left row, while the first agent's `nohup` still is. NEGATIVE CONTROL:
+/// keep the stretch open when a reading names no agent (the earliest agent start alone), and the
+/// person's server reads as born after the agent and counts in its `left=`.
+#[test]
+fn an_agent_gone_from_its_tab_closes_its_window() {
+    let fake = world();
+    fake.add(300, 200, 1200, None);
+    fake.add(2606, 1, 1500, Some("s-7"));
+    fake.group(2606, 2600);
+    let mut pass = pass(&fake, None);
+    let read = |pass: &mut LeftPass, at_ms, leader| {
+        let sweep = fake.sweep();
+        pass.tick(at_ms, Some(&sweep), true, &led(true, leader), None, 0)
+            .expect("a view")
+    };
+    read(&mut pass, AT_MS, Some(300));
+    fake.remove(300);
+    let gone = read(&mut pass, AT_MS + 1_000, None);
+    assert_eq!(
+        gone.live[0].agent_spans,
+        [left::AgentSpan {
+            since: 1200,
+            until: Some(1500)
+        }],
+        "closed at the horizon of the reading that named no agent"
+    );
+    fake.add(2608, 1, 1600, Some("s-7"));
+    fake.group(2608, 2500);
+    fake.add(400, 200, 2000, None);
+    let view = read(&mut pass, AT_MS + 2_000, Some(400));
+    assert_eq!(after(&view, 2606), (Tier::Offer, Source::Tab(7), true));
+    assert_eq!(after(&view, 2608), (Tier::Offer, Source::Tab(7), false));
+    assert_eq!(
+        aterm_vitals::left::agents_left(&view, "s-7")
+            .iter()
+            .map(|r| r.pid)
+            .collect::<Vec<_>>(),
+        [2606],
+        "the person's server is not the agent's"
+    );
+    assert!(
+        crate::sys_host::status_left(Some(&view), None, true, Some("s-7"), AT_MS + 2_000)
+            .starts_with("left=1:")
+    );
+}
+
+/// [`agents_tab`]'s view with the agent's `nohup` aged 60 s at the reading, whatever the kernel
+/// here reads of ages.
+fn aged(view: &LeftView) -> LeftView {
+    let mut aged = view.clone();
+    for row in aged.rows.iter_mut().filter(|r| r.pid == 2606) {
+        row.started_ms = Some(60_000);
+    }
+    aged
+}
+
+/// Every left row proves alive at the ask.
+fn alive(_: &str) -> bool {
+    true
+}
+
+/// ONE VIEW COUNTS THE AGENT'S LEFT ROWS ALIKE for `status left=` and the leftover fact: tab 7's
+/// view holds the agent's `nohup`, the person's older one and a process nothing ties (named),
+/// and both read one row, aged alike to now, the fact's sentence naming no path or executable; a
+/// view of the person's `nohup` and the untied process alone reads none in both, and no view reads
+/// `left=-`. NEGATIVE CONTROL: have `status` count the tab's offered rows, and it reads two while
+/// the fact reads one; leave the view's age out of `status`, and its age is the reading's.
+#[test]
+fn one_view_counts_left_alike_for_status_and_the_fact() {
+    let (_fake, _pass, view) = agents_tab(Some(300));
+    let view = aged(&view);
+    let now = AT_MS + 5_000;
+    let status = crate::sys_host::status_left(Some(&view), None, true, Some("s-7"), now);
+    let fact = crate::vitals_jobs::leftover_reading(&view, "s-7", now.try_into().unwrap(), alive)
+        .expect("a whole view");
+    assert_eq!(status, "left=1:65000");
+    assert_eq!((fact.count, fact.oldest_ms), (1, Some(65_000)), "{fact:?}");
+    let told = fact.told();
+    assert!(!told.contains('/') && !told.contains("sleep"), "{told}");
+
+    let person = LeftView {
+        rows: view
+            .rows
+            .iter()
+            .filter(|r| r.pid != 2606)
+            .cloned()
+            .collect(),
+        ..view.clone()
+    };
+    assert_eq!(person.rows.len(), 2, "{:?}", person.rows);
+    assert_eq!(
+        crate::sys_host::status_left(Some(&person), None, true, Some("s-7"), AT_MS),
+        "left=0:-"
+    );
+    assert_eq!(
+        crate::vitals_jobs::leftover_reading(&person, "s-7", AT_MS.try_into().unwrap(), alive)
+            .map(|f| f.count),
+        Some(0)
+    );
+    assert_eq!(
+        crate::sys_host::status_left(None, None, true, Some("s-7"), AT_MS),
+        "left=-"
+    );
+}
+
+/// A PARTIAL VIEW IS UNREAD ALIKE for `status left=` and the leftover fact: the same view whose
+/// sweep stopped at its cap, or whose reading stopped at its bound of new candidates, reads
+/// `left=-` and no fact part, whether it names the agent's row or none, so it neither says none is
+/// left nor closes an episode. NEGATIVE CONTROL: count a partial view, and its `0` and `1` read as
+/// whole.
+#[test]
+fn a_partial_view_is_unread_alike_for_status_and_the_fact() {
+    let (_fake, _pass, view) = agents_tab(Some(300));
+    let none = LeftView {
+        rows: view
+            .rows
+            .iter()
+            .filter(|r| r.pid != 2606)
+            .cloned()
+            .collect(),
+        ..(*view).clone()
+    };
+    let ms: i64 = AT_MS.try_into().unwrap();
+    for whole in [(*view).clone(), none] {
+        for partial in [
+            LeftView {
+                complete: false,
+                ..whole.clone()
+            },
+            LeftView {
+                bounded: true,
+                ..whole.clone()
+            },
+        ] {
+            assert_eq!(
+                crate::sys_host::status_left(Some(&partial), None, true, Some("s-7"), AT_MS),
+                "left=-",
+                "{partial:?}"
+            );
+            assert_eq!(
+                crate::vitals_jobs::leftover_reading(&partial, "s-7", ms, alive),
+                None
+            );
+        }
+        assert_ne!(
+            crate::sys_host::status_left(Some(&whole), None, true, Some("s-7"), AT_MS),
+            "left=-",
+            "the same view whole is read"
+        );
+    }
+}
+
+/// A VIEW NAMING AN AGENT'S LEFT ROW SPEAKS FOR A MINUTE: it is read again on the slow cadence
+/// ([`aterm_vitals::left::holds_an_offer`]), so a minute past its reading its reader has stopped
+/// delivering and `status` reads `left=-` rather than a count that may name a process gone since;
+/// a view naming none, which no timer reads again, speaks on while its reader runs and not once it
+/// stops. NEGATIVE CONTROL: gate `left=` by nothing, and the minute-old count is printed.
+#[test]
+fn a_stale_left_view_reads_unread() {
+    let (_fake, _pass, view) = agents_tab(Some(300));
+    assert!(aterm_vitals::left::holds_an_offer(&view));
+    let fresh = AT_MS + u64::try_from(crate::vitals_jobs::JOBS_FRESH.as_millis()).unwrap();
+    let status = |v: &LeftView, reader, now| {
+        crate::sys_host::status_left(Some(v), None, reader, Some("s-7"), now)
+    };
+    assert!(status(&view, true, fresh).starts_with("left=1:"));
+    assert_eq!(status(&view, true, fresh + 1), "left=-");
+    let none = LeftView {
+        rows: view
+            .rows
+            .iter()
+            .filter(|r| r.pid != 2606)
+            .cloned()
+            .collect(),
+        ..(*view).clone()
+    };
+    assert!(!aterm_vitals::left::holds_an_offer(&none));
+    assert_eq!(status(&none, true, fresh + 600_000), "left=0:-");
+    assert_eq!(status(&none, false, fresh + 1), "left=-");
+}
+
+/// THE FACT'S LEFT PART IS AS OF THE ASK: each of the agent's rows is re-proved by its token at the
+/// ask, so a view 20 s old gives a part stamped now with the oldest's age told on to now, which a
+/// turn end may tell; a row the re-proof finds gone (ended, or its pid another process's) is not
+/// counted, and none proved is a part unread, never one with none. NEGATIVE CONTROL: stamp the
+/// part with the view's own time, and a 20 s old view's part is past the tell gate.
+#[test]
+fn the_facts_left_part_is_as_of_the_ask() {
+    let (_fake, _pass, view) = agents_tab(Some(300));
+    let view = aged(&view);
+    let now: i64 = (AT_MS + 20_000).try_into().unwrap();
+    let part = crate::vitals_jobs::leftover_reading(&view, "s-7", now, alive).expect("proved");
+    assert_eq!(
+        (part.as_of_ms, part.count, part.oldest_ms),
+        (now, 1, Some(80_000))
+    );
+    assert!(part.tells_at(now));
+    fn gone(_: &str) -> bool {
+        false
+    }
+    assert_eq!(
+        crate::vitals_jobs::leftover_reading(&view, "s-7", now, gone),
+        None
+    );
 }

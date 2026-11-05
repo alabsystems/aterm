@@ -40,7 +40,7 @@ pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
             ),
         ));
     }
-    same_device(src, dst)?;
+    same_device(src, &meta, dst)?;
     std::fs::copy(src, dst).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -53,29 +53,35 @@ pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = opts.open(dst)?;
+    let dst_meta = file.metadata()?;
+    if !dst_meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", dst.display()),
+        ));
+    }
     file.set_modified(modified)?;
-    file.set_permissions(meta.permissions())?;
+    if dst_meta.permissions() != meta.permissions() {
+        file.set_permissions(meta.permissions())?;
+    }
     Ok(())
 }
 
 /// Refuse when `dst`'s parent directory is not on `src`'s device.
 #[cfg(unix)]
-fn same_device(src: &Path, dst: &Path) -> io::Result<()> {
+fn same_device(src: &Path, src_meta: &std::fs::Metadata, dst: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
-    let (s, p) = (
-        std::fs::symlink_metadata(src)?,
-        std::fs::symlink_metadata(parent)?,
-    );
-    one_volume(src, parent, Some(s.dev()), Some(p.dev()))
+    let p = std::fs::symlink_metadata(parent)?;
+    one_volume(src, parent, Some(src_meta.dev()), Some(p.dev()))
 }
 
 /// Always refuses off Unix where volume identity and copy-on-write cloning are unavailable.
 #[cfg(not(unix))]
-fn same_device(src: &Path, dst: &Path) -> io::Result<()> {
+fn same_device(src: &Path, _src_meta: &std::fs::Metadata, dst: &Path) -> io::Result<()> {
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     one_volume(src, parent, None, None)
 }
@@ -134,20 +140,29 @@ fn attributes_match(s: &std::fs::Metadata, a: &std::fs::Metadata) -> bool {
     matches!((s.modified(), a.modified()), (Ok(x), Ok(y)) if x == y)
 }
 
+fn open_if_regular(path: &Path) -> io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+    match crate::metadata_io::open_regular_with_meta(path) {
+        Ok(opened) => Ok(Some(opened)),
+        Err(err) => {
+            let meta = std::fs::symlink_metadata(path)?;
+            if !meta.is_file() { Ok(None) } else { Err(err) }
+        }
+    }
+}
+
 /// Whether the regular files `a` and `b` hold the same bytes, read in bounded chunks.
 ///
 /// # Errors
 /// Either file cannot be opened or read. A length difference is `Ok(false)` without a read.
 pub(crate) fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
     use std::io::Read as _;
-    let (ma, mb) = (std::fs::symlink_metadata(a)?, std::fs::symlink_metadata(b)?);
-    if !ma.is_file() || !mb.is_file() || ma.len() != mb.len() {
+    let (Some((mut fa, oma)), Some((mut fb, omb))) = (open_if_regular(a)?, open_if_regular(b)?)
+    else {
+        return Ok(false);
+    };
+    if oma.len() != omb.len() {
         return Ok(false);
     }
-    let (mut fa, mut fb) = (
-        crate::metadata_io::open_regular(a)?,
-        crate::metadata_io::open_regular(b)?,
-    );
     let (mut ba, mut bb) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
     loop {
         let n = fa.read(&mut ba)?;

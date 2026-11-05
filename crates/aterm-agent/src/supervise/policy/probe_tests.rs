@@ -65,20 +65,24 @@ fn each_answer_reads_back_as_it_was_written() {
     ] {
         assert_eq!(reread(&v), v);
     }
-    let startup = ShellStartup::of_parts(
-        vec![(
-            "ll".to_string(),
-            "an alias in /c/shell-snapshots/s.sh".to_string(),
-            true,
-        )],
-        true,
-    );
-    for s in [
-        Ok(startup),
-        Err("the Bash tool's zsh starts with `setopt x`".to_string()),
-    ] {
+    // Every combination of the three flags, so a tape that drops or swaps one rereads otherwise.
+    for bits in 0..8_u8 {
+        let startup = ShellStartup::of_parts(
+            vec![(
+                "ll".to_string(),
+                "an alias in /c/shell-snapshots/s.sh".to_string(),
+                true,
+            )],
+            bits & 1 != 0,
+            bits & 2 != 0,
+            bits & 4 != 0,
+        );
+        let s = Ok(startup);
         assert_eq!(reread(&s), s);
     }
+    let s: Result<ShellStartup, String> =
+        Err("the Bash tool's zsh starts with `setopt x`".to_string());
+    assert_eq!(reread(&s), s);
     let asks = vec![
         OwnerAsk {
             kind: AskKind::Rule {

@@ -53,6 +53,31 @@ pub(crate) struct GestureMarks {
     pub(crate) controller: bool,
     /// An accessibility client's request ([`AgentsState::assistive_gesture`]).
     pub(crate) assistive: bool,
+    /// A key, click or scroll another process posted ([`AgentsState::relayed_gesture`]).
+    pub(crate) relayed: bool,
+}
+
+impl GestureMarks {
+    /// The marks of a native key or click from `origin` that chose a menu or toolbar item: a
+    /// key an `hwkey` burst posted is a control client's, one another process posted relayed.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn of(origin: aterm_window::event::InputOrigin) -> Self {
+        use aterm_window::event::InputOrigin;
+        Self {
+            controller: origin == InputOrigin::Posted,
+            assistive: false,
+            relayed: origin == InputOrigin::Relayed,
+        }
+    }
+
+    /// Every mark either `self` or `other` has.
+    pub(crate) const fn union(self, other: Self) -> Self {
+        Self {
+            controller: self.controller || other.controller,
+            assistive: self.assistive || other.assistive,
+            relayed: self.relayed || other.relayed,
+        }
+    }
 }
 
 /// The window side of the Agents rows, one field on the App.
@@ -88,6 +113,13 @@ pub(crate) struct AgentsState {
     /// ([`App::person_only_press_refusal`]); everywhere else a screen reader's press is the
     /// person's.
     pub(crate) assistive_gesture: bool,
+    /// The gesture being dispatched came from a key, click or scroll another process posted into
+    /// the window ([`App::with_origin_mark`], `aterm_window::event::InputOrigin::Relayed`): a
+    /// person's own relay (Screen Sharing, an on-screen keyboard) and a program holding aterm's
+    /// Accessibility grant, as every tab's program does through aterm, send the same events. No
+    /// person is known to stand behind it for the owner's keys ([`crate::owner_keys_save`]);
+    /// everywhere else it is the person's.
+    pub(crate) relayed_gesture: bool,
     /// How many control-client gestures were dispatched in this process
     /// ([`App::with_gesture_source`] with `controller` set), anywhere. System
     /// State reads it when it takes a page action, so no control client's
@@ -465,7 +497,8 @@ pub(crate) fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let mut file = opts.open(path)?;
     file.write_all(text.as_bytes())
@@ -732,8 +765,9 @@ impl App {
     }
 
     /// Why `hwkey` may post nothing into the front window now: a gateway card
-    /// open there ([`Self::gateway_card_open`]), or System State its active view
-    /// ([`Self::system_state_active_in`]). `None` where it may.
+    /// open there ([`Self::gateway_card_open`]), System State its active view
+    /// ([`Self::system_state_active_in`]), or a private document in any of its
+    /// tabs ([`Self::window_holds_private`]). `None` where it may.
     pub(crate) fn hwkey_front_refusal(&self) -> Option<&'static str> {
         let wid = self.frontmost_window?;
         if self.gateway_card_open(wid) {
@@ -741,9 +775,13 @@ impl App {
                 "a palette, Overview or tab menu is open: its rows are the person's (close it)",
             );
         }
-        self.system_state_active_in(wid).then_some(
-            "System State is in front: its buttons are the person's (press them in the window)",
-        )
+        if self.system_state_active_in(wid) {
+            return Some(
+                "System State is in front: its buttons are the person's (press them in the window)",
+            );
+        }
+        self.window_holds_private(wid)
+            .then_some(crate::app_control::PRIVATE_WINDOW_REFUSED)
     }
 
     /// Tell a running `hwkey` burst whether the front window holds the person's
@@ -781,6 +819,46 @@ impl App {
         out
     }
 
+    /// Run `f` with the dispatch marked by where its native input came from (`origin`): a key an
+    /// `hwkey` burst posted carries the controller mark ([`Self::with_controller_mark`]), and one
+    /// another process posted the relayed mark ([`AgentsState::relayed_gesture`]). A mark an
+    /// enclosing dispatch already set is kept, and both are restored after.
+    pub(crate) fn with_origin_mark<R>(
+        &mut self,
+        origin: aterm_window::event::InputOrigin,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        use aterm_window::event::InputOrigin;
+        self.with_controller_mark(origin == InputOrigin::Posted, |app| {
+            app.with_relayed_mark(origin == InputOrigin::Relayed, f)
+        })
+    }
+
+    /// Run `f` with the dispatch marked as another process's relayed input when `relayed` is set
+    /// ([`AgentsState::relayed_gesture`]), keeping a mark an enclosing dispatch already set, and
+    /// restoring the mark after.
+    fn with_relayed_mark<R>(&mut self, relayed: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        let marked = relayed || self.agents.relayed_gesture;
+        let prior = std::mem::replace(&mut self.agents.relayed_gesture, marked);
+        let out = f(self);
+        self.agents.relayed_gesture = prior;
+        out
+    }
+
+    /// Where the gesture being dispatched came from, as its window-input marks say: a control
+    /// client's ([`Self::person_gesture_refused`]), another process's
+    /// ([`AgentsState::relayed_gesture`]), else the person's.
+    pub(crate) const fn gesture_origin(&self) -> aterm_window::event::InputOrigin {
+        use aterm_window::event::InputOrigin;
+        if self.agents.controller_gesture {
+            InputOrigin::Posted
+        } else if self.agents.relayed_gesture {
+            InputOrigin::Relayed
+        } else {
+            InputOrigin::Person
+        }
+    }
+
     /// Run `f` with the dispatch marked as an accessibility client's request
     /// ([`AgentsState::assistive_gesture`]), restoring the mark after.
     pub(crate) fn with_assistive_source<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -796,32 +874,39 @@ impl App {
         GestureMarks {
             controller: self.agents.controller_gesture,
             assistive: self.agents.assistive_gesture,
+            relayed: self.agents.relayed_gesture,
         }
     }
 
     /// Run `f` under `marks`, a gesture's marks a post carried ([`Self::gesture_marks`]): a
     /// control client's as [`Self::with_gesture_source`] runs one, an accessibility client's as
-    /// [`Self::with_assistive_source`] does.
+    /// [`Self::with_assistive_source`] does, and another process's relayed input under the relayed
+    /// mark.
     pub(crate) fn with_gesture_marks<R>(
         &mut self,
         marks: GestureMarks,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        if marks.assistive {
-            self.with_assistive_source(|app| app.with_gesture_source(marks.controller, f))
-        } else {
-            self.with_gesture_source(marks.controller, f)
-        }
+        self.with_relayed_mark(marks.relayed, |app| {
+            if marks.assistive {
+                app.with_assistive_source(|app| app.with_gesture_source(marks.controller, f))
+            } else {
+                app.with_gesture_source(marks.controller, f)
+            }
+        })
     }
 
     /// Who stands behind the gesture being dispatched where no person at the window is known
-    /// to: a control client ([`Self::person_gesture_refused`]) or an accessibility client
-    /// ([`AgentsState::assistive_gesture`]). `None` for a person's own.
+    /// to: a control client ([`Self::person_gesture_refused`]), an accessibility client
+    /// ([`AgentsState::assistive_gesture`]) or another process's relayed input
+    /// ([`AgentsState::relayed_gesture`]). `None` for a person's own.
     pub(crate) const fn gesture_unvouched(&self) -> Option<crate::owner_keys_save::Unvouched> {
         if self.agents.controller_gesture {
             Some(crate::owner_keys_save::Unvouched::Controller)
         } else if self.agents.assistive_gesture {
             Some(crate::owner_keys_save::Unvouched::Assistive)
+        } else if self.agents.relayed_gesture {
+            Some(crate::owner_keys_save::Unvouched::Relayed)
         } else {
             None
         }
@@ -1208,7 +1293,7 @@ impl App {
             manager,
             stoppable,
             workers,
-            parked: self.session_is_parked(session),
+            worker: self.session_is_ephemeral(session),
         }
     }
 

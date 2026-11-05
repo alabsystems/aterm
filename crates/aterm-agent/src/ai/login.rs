@@ -401,7 +401,7 @@ pub fn pool_target(
         ));
     }
     if let Some(why) = &pool.sign_in_refused {
-        return Err(format!("no local sign-in can repair this account: {why}"));
+        return Err(format!("this sign-in cannot repair this account: {why}"));
     }
     if default_home_sign_in(pool)
         && let Some(label) = &pool.default_label
@@ -579,7 +579,7 @@ pub fn refusal(f: &Facts, row: &Row) -> Option<String> {
             .as_ref()
             .and_then(|a| a.sign_in_refused.as_deref())
     {
-        return Some(format!("no local sign-in can repair this account: {why}"));
+        return Some(format!("this sign-in cannot repair this account: {why}"));
     }
     let pooled_default = match (f.login_pool(), crate::harness::accounts::Cli::parse(c.id)) {
         (Some(pool), Some(cli)) if !default_home_sign_in(pool) => {

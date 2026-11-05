@@ -1122,6 +1122,8 @@ fn slow_approver_past_output_grace_still_drains_buffered_signed_in_line() {
         }
     }
 
+    // The shipped grace, which this approver outlasts.
+    let _grace = GraceSet::set(OUTPUT_GRACE);
     let tmp = aterm_tempfile::tempdir().expect("tmp");
     let drove = stand_in_drive_in(tmp.path(), "kimi 0", &mut SlowApprover);
     assert_eq!(

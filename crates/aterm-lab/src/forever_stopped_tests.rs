@@ -69,7 +69,11 @@ fn the_ask_lists_first_presses_and_the_report_carries_on() {
         ("agy", "Antigravity CLI"),
         ("muse", "Muse Code"),
     ] {
-        let tip = report_words(product, false);
+        let tip = report_words(
+            product,
+            aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+            false,
+        );
         let ours = chrome(true, Some(&tip), ASK_SID);
         let read = Read::of(&ours, "cruise-n");
         assert_eq!((read.ask, read.report), (Some(0), Some(1)), "{read:?}");
@@ -96,7 +100,15 @@ fn the_ask_lists_first_presses_and_the_report_carries_on() {
             );
         }
         if program != "claude" {
-            let claude = chrome(true, Some(&report_words("Claude Code", false)), ASK_SID);
+            let claude = chrome(
+                true,
+                Some(&report_words(
+                    "Claude Code",
+                    aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+                    false,
+                )),
+                ASK_SID,
+            );
             assert!(
                 matches!(judged(&claude, program), Verdict::Fail(_)),
                 "CONTROL: {program}'s row said Claude Code"
@@ -122,7 +134,11 @@ fn an_ask_never_read_is_unobserved_and_one_never_listed_fails() {
         ..Seen::default()
     };
     assert!(matches!(first(&none, &cx), Verdict::Unobserved(_)));
-    let tip = report_words("Claude Code", false);
+    let tip = report_words(
+        "Claude Code",
+        aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+        false,
+    );
     let mut alone = chrome(true, Some(&tip), ASK_SID);
     alone = alone
         .lines()

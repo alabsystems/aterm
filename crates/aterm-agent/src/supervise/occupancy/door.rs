@@ -615,6 +615,16 @@ pub fn left_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, Left)> {
                 };
                 LeftRow::Fact { door }
             }
+            // A leftover and an overlap ride the turn end's acts alone: neither has a line of its
+            // own at a break (`FactKind::rides_breaks`).
+            FactKind::Leftover | FactKind::Overlap => {
+                if word("door=") != Some(FactDoor::TurnEnd.word()) {
+                    continue;
+                }
+                LeftRow::Fact {
+                    door: FactDoor::TurnEnd,
+                }
+            }
         };
         let left = Left {
             row,

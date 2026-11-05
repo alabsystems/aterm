@@ -319,8 +319,21 @@ fn place(entry: &Path, id: &str, archive: &[u8], sha256: &str) -> Result<(), Str
     unpack(archive, id, &staging.path().join(PACKAGE))
         .map_err(|e| format!("`{id}.crate` did not unpack: {e}"))?;
     let stamp = staging.path().join(STAMP);
-    std::fs::write(&stamp, format!("{sha256}\n"))
-        .map_err(|e| format!("could not write {}: {e}", stamp.display()))?;
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
+        opts.open(&stamp)
+            .and_then(|mut f| {
+                use std::io::Write as _;
+                f.write_all(format!("{sha256}\n").as_bytes())
+            })
+            .map_err(|e| format!("could not write {}: {e}", stamp.display()))?;
+    }
     match std::fs::rename(staging.path(), entry) {
         Ok(()) => {
             let _ = staging.keep();
@@ -440,16 +453,19 @@ fn unpack(archive: &[u8], top: &str, into: &Path) -> Result<usize, String> {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("`{path}`'s folder could not be made: {e}"))?;
                 }
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&dest)
-                    .map_err(|e| {
-                        format!(
-                            "`{path}` could not be written ({e}): a second member at one \
-                             path is refused"
-                        )
-                    })?;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+                }
+                let mut file = opts.open(&dest).map_err(|e| {
+                    format!(
+                        "`{path}` could not be written ({e}): a second member at one \
+                         path is refused"
+                    )
+                })?;
                 copy_exact(&mut tar, size, &mut file)?;
                 skip(&mut tar, padding(size))?;
             }

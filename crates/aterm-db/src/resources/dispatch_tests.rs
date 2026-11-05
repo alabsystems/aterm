@@ -652,11 +652,19 @@ pub(crate) fn dispatch_transition(
     next
 }
 
+/// Walks 88 of the model's 135 steps on a real store: those whose `retried` and `wrong` latches
+/// agree, `Retry` with only `wrong` set (the wrong-then-retry order), and `WrongOperation` from
+/// phase 6 with only `retried` set (retry-then-wrong on lost custody or no admission, a prefix no
+/// step with both latches reaches, since phase 6 then enables nothing). Elsewhere a step with one
+/// latch runs a prefix some step with both also runs: `dispatch_transition` always retries, then
+/// tries the wrong operation, and neither may change anything.
+/// GAP: the other 47 steps are not walked, so a defect where only a retry, or only a wrong
+/// operation, changes a later action's result and the other latch hides it is not seen here.
 #[test]
 fn invocation_lifecycle_conforms_and_duplicate_entry_is_detected() {
     let model = aterm_models_db::resource_dispatch_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
-    let steps: Vec<_> = aterm_spec::interp::reachable_states(&model)
+    let every: Vec<_> = aterm_spec::interp::reachable_states(&model)
         .iter()
         .flat_map(|state| {
             model
@@ -667,6 +675,17 @@ fn invocation_lifecycle_conforms_and_duplicate_entry_is_detected() {
                 .collect::<Vec<_>>()
         })
         .collect();
+    let steps: Vec<_> = every
+        .iter()
+        .filter(|(state, action)| {
+            state["retried"] == state["wrong"]
+                || (*action == "Retry" && state["wrong"] == 1)
+                || (*action == "WrongOperation" && state["phase"] == 6)
+        })
+        .cloned()
+        .collect();
+    // A new action, phase or latch moves these counts, so it cannot fall out of the walk quietly.
+    assert_eq!((every.len(), steps.len()), (135, 88));
     // Each step builds its own Lab in its own temporary home, so the steps share
     // nothing and run on the lane's places.
     let reached = aterm_spec::fs_lane::each(&steps, |(state, action)| {

@@ -618,13 +618,17 @@ impl App {
             session.ctx.sink.clone(),
             session.ctx.ui_waiting.clone(),
         );
-        if session.master >= 0 {
-            Self::register_session(&self.store, &session, lineage_parent);
+        let registered = session.master >= 0;
+        if registered {
+            Self::register_session(&self.store, &session, lineage_parent.clone());
         }
         let layout = pane::PaneTree::new(sid);
         let tab = crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &layout)
             .expect("tab/view identity space");
         self.pool_insert(session);
+        if registered {
+            self.note_tab_open(sid, wid, false, lineage_parent.as_ref(), "new-window");
+        }
         let metrics = self.unattached_window_metrics();
         let ws = WindowState::new_terminal(
             term,
@@ -2180,9 +2184,9 @@ impl App {
         if !cfg!(any(target_os = "macos", windows)) && !busy {
             return true;
         }
-        // Keep shutdown in the ordinary event loop. A native NSAlert introduces a nested
-        // modal loop and a separately animated glass window whose teardown can outlive the
-        // answer; the in-window question owns its replay until the shutdown barriers run.
+        // The question owns its replay until the shutdown barriers run, and its answer comes
+        // back through the ordinary event loop: a Mac window shows it as a sheet, which runs no
+        // nested modal loop (`close_sheet`).
         self.present_close_banner(wid, prompt, replay)
     }
 
@@ -2222,7 +2226,7 @@ impl App {
         }
     }
 
-    /// Park a destructive question on the in-window banner over `wid` and refuse the gesture.
+    /// Park a destructive question over `wid` and refuse the gesture.
     pub(crate) fn present_close_banner(
         &mut self,
         wid: WindowId,
@@ -2262,28 +2266,64 @@ impl App {
             }
             return false;
         }
-        if !self.close_question_input_ready(wid) {
+        let refusal = pending.wire_refusal();
+        if !self.stand_close_question(pending, by_person) {
             return false;
         }
-        self.pending_action_refusal = Some(pending.wire_refusal());
+        self.pending_action_refusal = Some(refusal);
         self.stash_deferred_close_attribution(wid);
-        self.close_banner = Some(pending);
-        self.raise_close_question(wid, by_person);
         false
     }
 
-    /// As with the former native alert, keys queued before a Mac question appeared cannot
-    /// answer it. Stub and headless windows never enter AppKit.
-    fn close_question_input_ready(&self, wid: WindowId) -> bool {
+    /// Stand `pending` as the open question: its window raised (and focused when `focus`), and a
+    /// Mac window showing it as a native sheet. `false`, with nothing standing, when a Mac
+    /// window's key queue would not drain, so a key queued before the question could answer it.
+    /// Stub and headless windows never enter AppKit, and draw the question in the window.
+    fn stand_close_question(
+        &mut self,
+        pending: crate::close_confirm::PendingClose,
+        focus: bool,
+    ) -> bool {
+        let wid = pending.wid;
         #[cfg(target_os = "macos")]
-        if self
+        let mut pending = pending;
+        #[cfg(target_os = "macos")]
+        let native = match self
             .windows
             .get(&wid)
-            .is_some_and(|window| window.os_window.is_some())
+            .and_then(|window| window.os_window.as_deref())
         {
-            return crate::appkit::MainThread::new().is_some_and(crate::hwkey::fence_queued_keys);
+            Some(window) => {
+                let Some(fence) = crate::close_sheet::fence() else {
+                    return false;
+                };
+                Some((crate::close_sheet::parent_of(window), fence))
+            }
+            None => None,
+        };
+        self.raise_close_question(wid, focus);
+        #[cfg(target_os = "macos")]
+        if let Some((parent, fence)) = native {
+            let persons = !pending.wire_may_answer();
+            pending.sheet = parent.zip(self.proxy.clone()).and_then(|(parent, proxy)| {
+                crate::close_sheet::present(
+                    parent,
+                    &pending.prompt,
+                    pending.serial(),
+                    persons,
+                    proxy,
+                    fence,
+                )
+            });
+            if pending.sheet.is_none() {
+                aterm_log::warn!(
+                    "close/quit question over window {}: no native sheet could be built; it \
+                     stands in the window",
+                    wid.0
+                );
+            }
         }
-        let _ = wid;
+        self.close_banner = Some(pending);
         true
     }
 
@@ -2333,17 +2373,14 @@ impl App {
                 };
                 next.prompt = prompt;
             }
-            if !self.close_question_input_ready(next.wid) {
-                next.replay.cancel();
-                continue;
+            let (replay, focus) = (next.replay, !next.wire_may_answer());
+            if !self.stand_close_question(next, focus) {
+                replay.cancel();
             }
-            let (wid, focus) = (next.wid, !next.wire_may_answer());
-            self.close_banner = Some(next);
-            self.raise_close_question(wid, focus);
         }
     }
 
-    /// Answer the in-window close/quit banner.
+    /// Answer the standing close/quit question; dropping it ends its sheet, if one shows it.
     pub(crate) fn answer_close_banner(
         &mut self,
         proceed: bool,
@@ -2463,6 +2500,14 @@ impl App {
         }
     }
 
+    /// The close/quit question window `wid` draws as its band: one standing over it that no
+    /// native sheet presents.
+    pub(crate) fn close_band(&self, wid: WindowId) -> Option<&crate::close_confirm::PendingClose> {
+        self.close_banner
+            .as_ref()
+            .filter(|pending| pending.wid == wid && pending.in_window())
+    }
+
     /// The `controls front` line for the close/quit confirm.
     pub(crate) fn close_confirm_controls_line(&self) -> Option<String> {
         match self.close_banner.as_ref() {
@@ -2524,6 +2569,7 @@ impl App {
         {
             return;
         }
+        self.note_quit_by();
         let anchor = self
             .frontmost_window
             .filter(|w| self.windows.contains_key(w))
@@ -2620,7 +2666,19 @@ impl App {
     #[cfg(unix)]
     pub(crate) fn on_unattended_quit(&mut self, el: &ActiveEventLoop, cause: &'static str) {
         self.quit_unattended.get_or_insert(cause);
+        // Nobody at a window asked: its tabs' closes name no actor.
+        self.quit_by
+            .get_or_insert(crate::session_store::ExitActor::Unknown);
         self.on_quit_requested(el);
+    }
+
+    /// Who asks for the quit now, once ([`crate::App::quit_by`]): the act under way's actor (a
+    /// control client's `invoke` of Quit), else the person (⌘Q, the menu, the Dock, a logout).
+    pub(crate) fn note_quit_by(&mut self) {
+        self.quit_by.get_or_insert_with(|| {
+            crate::tab_marks::acting()
+                .map_or(crate::session_store::ExitActor::Human, |acting| acting.by)
+        });
     }
 
     /// Stateful counterpart of AppKit's bare `applicationShouldTerminate:` callback.
@@ -2648,6 +2706,7 @@ impl App {
         ) {
             return;
         }
+        self.note_quit_by();
         let policy = self.close_confirm;
         if confirmed {
             self.close_confirm = CloseConfirm::Programmatic;
@@ -2665,7 +2724,7 @@ impl App {
         el.exit();
     }
 
-    /// Keep the native request's identity while its in-window question is outstanding.
+    /// Keep the native request's identity while its question is outstanding.
     #[cfg(unix)]
     fn native_termination_ready(&mut self, generation: u64) -> bool {
         if !crate::menu::native_termination_is_current(generation) {

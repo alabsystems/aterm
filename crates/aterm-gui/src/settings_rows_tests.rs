@@ -1804,34 +1804,33 @@ fn assert_list_tops(compiled: &crate::native_ui::CompiledUi, room_bottom: f32, c
 fn no_list_top_slices_a_line_in_a_short_window() {
     at_each_text_scale(&[2.0], "short list tops", |_| {
         for route in SettingsRoute::ALL {
-            for (width, height) in [(1_564.0, 180.0), (1_564.0, 240.0)] {
-                let mut lab = Lab::new("");
-                lab.state_mut().navigate(route);
+            let (width, height) = (1_564.0, least_view(2.0).1);
+            let mut lab = Lab::new("");
+            lab.state_mut().navigate(route);
+            let _ = lab.compile(width, height);
+            let limit = lab.state().scroll_plan().map_or(0, |plan| plan.limit());
+            for top in [0, limit] {
+                lab.state_mut().scroll_page_to(top);
+                lab.state_mut().page_reveal = None;
                 let _ = lab.compile(width, height);
-                let limit = lab.state().scroll_plan().map_or(0, |plan| plan.limit());
-                for top in [0, limit] {
-                    lab.state_mut().scroll_page_to(top);
-                    lab.state_mut().page_reveal = None;
-                    let _ = lab.compile(width, height);
-                    let rail = lab.state().navigation_scroll.get();
-                    let rail_limit = lab.state().navigation_scroll_limit.get();
-                    lab.state().navigation_scroll.set(if rail >= 20.0 {
-                        rail - 20.0
-                    } else {
-                        (rail + 20.0).min(rail_limit)
-                    });
-                    let compiled = lab.compile(width, height);
-                    let room_bottom = lab
-                        .state()
-                        .scroll_plan()
-                        .and_then(|plan| compiled_list(&compiled, &plan))
-                        .map_or(height, |(list, room)| list.y + room);
-                    assert_list_tops(
-                        &compiled,
-                        room_bottom,
-                        &format!("{route:?} {width}×{height} at 2× screen {top}"),
-                    );
-                }
+                let rail = lab.state().navigation_scroll.get();
+                let rail_limit = lab.state().navigation_scroll_limit.get();
+                lab.state().navigation_scroll.set(if rail >= 20.0 {
+                    rail - 20.0
+                } else {
+                    (rail + 20.0).min(rail_limit)
+                });
+                let compiled = lab.compile(width, height);
+                let room_bottom = lab
+                    .state()
+                    .scroll_plan()
+                    .and_then(|plan| compiled_list(&compiled, &plan))
+                    .map_or(height, |(list, room)| list.y + room);
+                assert_list_tops(
+                    &compiled,
+                    room_bottom,
+                    &format!("{route:?} {width}×{height} at 2× screen {top}"),
+                );
             }
         }
     });
@@ -2310,14 +2309,16 @@ fn the_theme_cards_rows_keep_the_row_rule_at_every_size() {
                 SettingsRoute::Modified,
             ] {
                 for (width, height) in [
-                    (178.0, 420.0),
-                    (206.0, 420.0),
+                    least_view(scale),
                     (262.0, 420.0),
                     (318.0, 294.0),
                     (444.0, 350.0),
                     (584.0, 348.0),
                     (760.0, 446.0),
-                ] {
+                ]
+                .into_iter()
+                .filter(|(width, height)| reachable(scale, *width, *height))
+                {
                     let service = VersionedConfigService::new(source.to_string()).expect("fixture");
                     let (mut runtime, instance, view) = setup();
                     {
@@ -4961,9 +4962,11 @@ fn a_one_line_rows_name_keeps_its_floor_on_every_page() {
 /// screen: Home at 1564x180 drew its 2× screen from the stop it was at, and
 /// the next frame from the stop after, where the scroll it was asked for
 /// stood. On a list's last screen, which starts where the list's end puts
-/// it, the stop is on the screen whole. At 80×24 and 102×29, and at the
-/// short windows 60×20, 102×12, 80×16 and 220×12, where what a screen starts
-/// with is often listed otherwise at the other size
+/// it, the stop is on the screen whole. At 584x348 and 738x418, and at the
+/// short windows 444x292 and 738x264, where what a screen starts with is often
+/// listed otherwise at the other size; 264pt is the least height that stands at
+/// 2× ([`least_view`]). Past Compact, 1564x264 on Home and Themes alone: a fault
+/// past Compact only on the other pages goes unseen.
 #[test]
 fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
     let set_scale = |scale: f32| {
@@ -5010,15 +5013,21 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
             ]
             .into_iter()
             .flat_map(move |route| {
+                // The walk holds one view from 1× to 2×, so the view stands at 2× too
+                // ([`reachable`]). The one view past Compact, Wide at 1× and Medium at 2×, is
+                // walked on Home, its named fault's page, and Themes, whose list is built apart
+                // (`list_page_whole`).
+                let past_compact = matches!(route, SettingsRoute::Home | SettingsRoute::Themes)
+                    .then_some((1_564.0, least_view(2.0).1));
                 [
                     (584.0, 348.0),
                     (738.0, 418.0),
                     (444.0, 292.0),
-                    (738.0, 180.0),
-                    (584.0, 236.0),
-                    (1_564.0, 180.0),
+                    (738.0, least_view(2.0).1),
                 ]
-                .map(|(width, height)| (focus, route, width, height))
+                .into_iter()
+                .chain(past_compact)
+                .map(move |(width, height)| (focus, route, width, height))
             })
         })
         .collect::<Vec<_>>();
@@ -5394,6 +5403,19 @@ fn status_form_set(lab: &Lab, feedback: &str, words: &str) -> Option<String> {
         .find(|form| bare(form) == bare(words))
 }
 
+/// `lines` of status `feedback` as their words: a word too long for the bar's line is set across
+/// lines, hyphenated, and a hyphen of the status's own stays.
+fn set_words<'a>(lines: impl IntoIterator<Item = &'a str>, feedback: &str) -> String {
+    lines.into_iter().fold(String::new(), |joined, line| {
+        match joined.strip_suffix('-') {
+            Some(head) if !feedback.contains(&format!("{}-", line_tail(head))) => {
+                format!("{head}{line}")
+            }
+            _ => format!("{joined} {line}"),
+        }
+    })
+}
+
 /// Every line of a status's words under `prefix` in `lab`'s `width`x`height` window.
 fn every_status_line(lab: &mut Lab, width: f32, height: f32, prefix: &str) -> Vec<String> {
     let mut lines: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
@@ -5416,6 +5438,11 @@ fn every_status_line(lab: &mut Lab, width: f32, height: f32, prefix: &str) -> Ve
     };
     let mut scrolled = 0;
     read(&lab.compile(width, height));
+    // Words with nowhere to scroll are all on this frame. A wheel would go on to the list, and a
+    // press's bar moves on with it, to other words (`SettingsViewState::press_stands`).
+    if lab.state().status_scroll.borrow().limit <= 0.01 {
+        return lines.into_values().collect();
+    }
     while scrolled < 64 {
         lab.dispatch(AppEvent::ScrollAt {
             lines: 1,
@@ -5531,15 +5558,19 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                         !matches!(route, SettingsRoute::Messages | SettingsRoute::Themes)
                     })
                     .flat_map(move |route| {
+                        // The narrowest column a status is read in, where its bar stands over the
+                        // list or docks and a word can hyphenate. Only the default theme reads
+                        // it: the light theme's column is not judged.
+                        let narrowest = source.is_empty().then_some((least_view(scale).0, 348.0));
                         [
                             (584.0, 348.0),
                             (444.0, 292.0),
-                            (178.0, 348.0),
-                            (1_564.0, 180.0),
-                            (738.0, 180.0),
-                            (584.0, 236.0),
+                            (1_564.0, least_view(scale).1),
+                            (584.0, least_view(scale).1),
                         ]
-                        .map(|(width, height)| (source, route, width, height))
+                        .into_iter()
+                        .chain(narrowest)
+                        .map(move |(width, height)| (source, route, width, height))
                     })
             })
             .collect::<Vec<_>>();
@@ -5634,7 +5665,10 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                                 .filter(|word| *word != separator)
                                 .collect::<String>()
                         };
-                        let read = status_words(&after, "settings/status/visual");
+                        let read = set_words(
+                            status_words(&after, "settings/status/visual").split_whitespace(),
+                            &feedback,
+                        );
                         let (px, face) = crate::native_ui::text_paint_metrics(
                             SemanticRole::Status,
                             StyleRef::Plain,
@@ -5654,7 +5688,7 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                             .collect();
                         let every =
                             every_status_line(&mut lab, width, height, "settings/status/visual");
-                        let all = every.join(" ");
+                        let all = set_words(every.iter().map(String::as_str), &feedback);
                         // The status, or the shorter form of it its bar's lines hold, else the
                         // one that says what changed first ([`shown_status`]).
                         let form = status_form_set(&lab, &feedback, &all);
@@ -5783,8 +5817,20 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                         && (now.height - was.height).abs() < 0.5
                         && (now.y - was.y).abs() > 0.5
                     {
+                        // The keyboard reads a control with the detail under it (`Reveal::Keep`),
+                        // so a focus lifts the two into the room, the control alone where they
+                        // do not fit.
                         let least = (was.bottom() - bottom).max(0.0);
-                        if (was.y - now.y - least).abs() > 0.5 {
+                        let least_with_detail = pressed
+                            .as_str()
+                            .strip_prefix("settings/control/")
+                            .and_then(|name| {
+                                let detail = format!("settings/detail/{name}");
+                                before.paint.iter().find(|node| node.key.as_str() == detail)
+                            })
+                            .map_or(least, |detail| (detail.rect.bottom() - bottom).max(0.0));
+                        let moved = was.y - now.y;
+                        if (moved - least).abs() > 0.5 && (moved - least_with_detail).abs() > 0.5 {
                             faults
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -7121,15 +7167,7 @@ fn a_bar_held_over_a_press_keeps_its_room_when_the_list_scrolls() {
         }
         let feedback = lab.state().feedback.clone().unwrap_or_default();
         let every = every_status_line(&mut lab, width, height, "settings/status/visual");
-        // A word too long for the bar's line is set across lines, hyphenated.
-        let joined = every.iter().fold(String::new(), |joined, line| {
-            match joined.strip_suffix('-') {
-                Some(head) if !feedback.contains(&format!("{}-", line_tail(head))) => {
-                    format!("{head}{line}")
-                }
-                _ => format!("{joined} {line}"),
-            }
-        });
+        let joined = set_words(every.iter().map(String::as_str), &feedback);
         assert!(
             status_form_set(&lab, &feedback, &joined).is_some(),
             "every word of the status, or of the form of it the bar shows: {every:#?} of \
@@ -7295,13 +7333,13 @@ fn no_row_keeps_a_blank_line_for_what_it_may_say() {
             (1_074.0, 684.0),
             (444.0, 292.0),
             (1_074.0, 900.0),
-            (164.0, 348.0),
-            (178.0, 292.0),
             (234.0, 348.0),
             (290.0, 376.0),
             (304.0, 420.0),
+            least_view(scale),
         ]
         .into_iter()
+        .filter(|(width, height)| reachable(scale, *width, *height))
         .flat_map(|size| [(size, ""), (size, written.as_str())])
         .flat_map(|(size, source)| {
             SettingsRoute::ALL
@@ -7615,34 +7653,28 @@ fn a_status_bar_never_moves_or_covers_the_switch_pressed() {
         let mut presses = Vec::new();
         for source in ["", "theme = \"GitHub Light\"\n"] {
             for ((width, height), in_flight) in [
-                (164.0, 348.0),
-                (178.0, 348.0),
-                (192.0, 348.0),
                 (234.0, 348.0),
-                (178.0, 420.0),
                 (304.0, 348.0),
                 (444.0, 292.0),
                 (584.0, 236.0),
                 (584.0, 348.0),
                 (584.0, 376.0),
-                (738.0, 180.0),
                 (744.0, 420.0),
                 (1_074.0, 684.0),
                 // Where no side of the list holds the bar with its Undo, the dock does, the
                 // Undo beside the words does, its words alone do, or the page moved its list.
-                (164.0, 292.0),
                 (248.0, 292.0),
                 (290.0, 236.0),
                 (290.0, 520.0),
-                // The least window but one: the bar takes the side away from the press, else the
-                // toolbar's place, never the whole page (at 2x in 178x152 it stood over all 100pt
-                // of it, the switch pressed at the list's top under it).
-                (178.0, 152.0),
+                // The least view: the bar takes the side away from the press, else the toolbar's
+                // place, never the whole page.
+                least_view(scale),
             ]
             .into_iter()
             .enumerate()
+            .filter(|(_, (width, height))| reachable(scale, *width, *height))
             .flat_map(|(index, size)| {
-                let frames: &[bool] = if index < 13 { &[true] } else { &[true, false] };
+                let frames: &[bool] = if index < 8 { &[true] } else { &[true, false] };
                 frames.iter().map(move |applying| (size, *applying))
             }) {
                 for route in SettingsRoute::ALL {
@@ -7812,31 +7844,30 @@ fn a_segment_pressed_stays_where_it_was_pressed() {
     // switches' sweep, the last segment a screen draws whole that is not chosen is pressed, a
     // frame drawn while its write is in flight and one after it lands: it is where it was on
     // both, whole, and no status's bar covers it. Negative control: `PressedAt::key_in` returning
-    // the key the press found moves segments at both scales (Cursor & Motion's cursor style at
-    // 164x292 with 1x text: from 189pt to 192pt).
+    // the key the press found moves segments at both scales (Terminal's bidi at the 210x208 least
+    // view with 1x text: from 136pt to 114pt; Keyboard's predictive echo at 290x520 with 2x text:
+    // from 431pt to 416pt).
     at_each_text_scale(&[1.0, 2.0], "a pressed segment stays", |scale| {
         let (mut pressed, mut over) = (0, 0);
         let mut faults = Vec::new();
         for source in ["", "theme = \"GitHub Light\"\n"] {
             for (width, height) in [
-                (164.0, 348.0),
-                (178.0, 348.0),
-                (192.0, 348.0),
+                least_view(scale),
                 (234.0, 348.0),
-                (178.0, 420.0),
                 (304.0, 348.0),
                 (444.0, 292.0),
                 (584.0, 236.0),
                 (584.0, 348.0),
                 (584.0, 376.0),
-                (738.0, 180.0),
                 (738.0, 420.0),
                 (1_074.0, 684.0),
-                (164.0, 292.0),
                 (248.0, 292.0),
                 (290.0, 236.0),
                 (290.0, 520.0),
-            ] {
+            ]
+            .into_iter()
+            .filter(|(width, height)| reachable(scale, *width, *height))
+            {
                 for route in SettingsRoute::ALL {
                     if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
                         continue;
@@ -8379,21 +8410,21 @@ fn the_keyboard_reads_a_status_over_the_list_where_it_stands() {
         |scale| {
             let (mut read, mut over) = (0, 0);
             let mut faults = Vec::new();
-            for (width, height) in [
-                (164.0, 292.0),
-                (164.0, 348.0),
-                (178.0, 348.0),
-                (192.0, 348.0),
-                (206.0, 376.0),
-                (220.0, 420.0),
-                (234.0, 348.0),
-                (178.0, 420.0),
-                (248.0, 292.0),
-                (262.0, 348.0),
-                (276.0, 420.0),
-                (290.0, 236.0),
-                (304.0, 348.0),
-            ] {
+            // Sizes in reach ([`reachable`]) where a bar stands over the list; at most it does
+            // not, and the walk stops at `after_bar_over`. Over widths from the least to 444 in
+            // 14pt steps it stood only at 278 and 292 at 2×, and at 1× mostly at 210 under 264pt.
+            let sizes: &[(f32, f32)] = if scale > 1.5 {
+                &[
+                    (278.0, 320.0),
+                    (278.0, 348.0),
+                    (278.0, 516.0),
+                    (292.0, 320.0),
+                    (292.0, 348.0),
+                ]
+            } else {
+                &[(210.0, 208.0), (210.0, 222.0), (210.0, 236.0)]
+            };
+            for &(width, height) in sizes {
                 for route in SettingsRoute::ALL {
                     if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
                         continue;
@@ -8541,12 +8572,10 @@ fn the_keyboard_reads_a_status_over_the_list_where_it_stands() {
                 faults.len(),
                 faults.join("\n")
             );
-            if scale > 1.5 {
-                assert!(
-                    over > 3 && read == over,
-                    "{over} bars over the list, {read} read"
-                );
-            }
+            assert!(
+                over > 3 && read == over,
+                "{over} bars over the list, {read} read"
+            );
         },
     );
 }
@@ -8614,9 +8643,9 @@ fn rows_read_as_separate_units_at_every_width() {
     // ROWS READ AS SEPARATE UNITS: a stacked row's name, control and words stand 4pt apart, and
     // with nothing under its words the next row's name stood 4pt under them too, as far as from
     // its own control (Keyboard & Input at 178pt: Copy on select's "Unchanged" over "Confirm
-    // multiline paste"). On every page, at every width and text size, the gap from a row's last
-    // line or control to the next row's name is half again the widest gap inside either row,
-    // measured on the words' ink, not their line boxes.
+    // multiline paste"). On every page, at these widths from the least view's up and every text
+    // size, the gap from a row's last line or control to the next row's name is half again the
+    // widest gap inside either row, measured on the words' ink, not their line boxes.
     fn part_of(key: &str) -> Option<(&str, bool)> {
         [
             ("settings/label/", false),
@@ -8647,14 +8676,22 @@ fn rows_read_as_separate_units_at_every_width() {
     }
     at_each_text_scale(&[1.0, 1.5, 2.0], "rows read apart", |scale| {
         let (mut pairs, mut faults) = (0, Vec::new());
-        for width in [164.0, 178.0, 234.0, 304.0, 584.0] {
+        for (width, height) in held_to_least(
+            scale,
+            &[
+                (0.0, 4_000.0),
+                (234.0, 4_000.0),
+                (304.0, 4_000.0),
+                (584.0, 4_000.0),
+            ],
+        ) {
             for route in SettingsRoute::ALL {
                 if matches!(route, SettingsRoute::Messages | SettingsRoute::Themes) {
                     continue;
                 }
                 let mut lab = Lab::new("");
                 lab.state_mut().navigate(route);
-                let compiled = lab.compile(width, 4_000.0);
+                let compiled = lab.compile(width, height);
                 // Each row: the bands of its ink, and whether it holds a control.
                 type Inked = (String, Vec<(f32, f32)>, bool);
                 let mut rows: Vec<Inked> = Vec::new();
@@ -8963,50 +9000,49 @@ fn names_said_twice(compiled: &crate::native_ui::CompiledUi) -> Vec<String> {
 #[test]
 fn a_split_rows_name_is_said_once_a_screen() {
     // A ROW'S NAME IS SAID ONCE ON A SCREEN: a part's caption, said under the row's name or
-    // under the caption of the part before, read as the name of a row of its own (Cursor &
-    // Motion at 164x96: "Motion", Automatic, then "Motion" again over the Animate the screen cut
-    // off; Window & Tabs at 192x180: "Initial columns" over "Initial columns"). Every screen
-    // Page Down and Tab show says each row's name once at most.
+    // under the caption of the part before, read as the name of a row of its own (under today's
+    // floor, Cursor & Motion at 164x96: "Motion", Automatic, then "Motion" again over the Animate
+    // the screen cut off; Window & Tabs at 192x180: "Initial columns" over "Initial columns").
+    // Every screen Page Down and Tab show in the least view says each row's name once at most.
     at_each_text_scale(&[1.0, 1.5, 2.0], "a row's name once a screen", |scale| {
         let mut faults = Vec::new();
         let mut captioned = 0;
-        for (width, height) in [(164.0, 96.0), (178.0, 152.0), (192.0, 180.0)] {
-            for route in [
-                SettingsRoute::CursorMotion,
-                SettingsRoute::WindowTabs,
-                SettingsRoute::Appearance,
-            ] {
-                let mut screens = Vec::new();
-                let mut lab = Lab::new("");
-                lab.state_mut().navigate(route);
-                for _ in 0..120 {
-                    let compiled = lab.compile(width, height);
-                    let last = screens.last().map(|(_, seat)| *seat);
-                    let seat = lab.state().scroll_shown().map(|(_, shown)| shown.start);
-                    if last.is_some() && last == Some(seat) {
-                        break;
-                    }
-                    screens.push((compiled, seat));
-                    lab.dispatch(AppEvent::ScrollPage(1));
+        let (width, height) = least_view(scale);
+        for route in [
+            SettingsRoute::CursorMotion,
+            SettingsRoute::WindowTabs,
+            SettingsRoute::Appearance,
+        ] {
+            let mut screens = Vec::new();
+            let mut lab = Lab::new("");
+            lab.state_mut().navigate(route);
+            for _ in 0..120 {
+                let compiled = lab.compile(width, height);
+                let last = screens.last().map(|(_, seat)| *seat);
+                let seat = lab.state().scroll_shown().map(|(_, shown)| shown.start);
+                if last.is_some() && last == Some(seat) {
+                    break;
                 }
-                let mut lab = Lab::new("");
-                lab.state_mut().navigate(route);
-                let mut seen = std::collections::HashSet::new();
-                while let Some(target) = tab(&mut lab, false, width, height) {
-                    if !seen.insert(target) {
-                        break;
-                    }
-                    screens.push((lab.compile(width, height), None));
+                screens.push((compiled, seat));
+                lab.dispatch(AppEvent::ScrollPage(1));
+            }
+            let mut lab = Lab::new("");
+            lab.state_mut().navigate(route);
+            let mut seen = std::collections::HashSet::new();
+            while let Some(target) = tab(&mut lab, false, width, height) {
+                if !seen.insert(target) {
+                    break;
                 }
-                for (compiled, _) in &screens {
-                    captioned += usize::from(compiled.paint.iter().any(|node| {
-                        node.key.as_str().starts_with("settings/row-caption/")
-                            && matches!(&node.content, UiContent::Text(text) if !text.text.is_empty())
-                    }));
-                    let twice = names_said_twice(compiled);
-                    if !twice.is_empty() {
-                        faults.push(format!("{route:?} {width}x{height}: {twice:?}"));
-                    }
+                screens.push((lab.compile(width, height), None));
+            }
+            for (compiled, _) in &screens {
+                captioned += usize::from(compiled.paint.iter().any(|node| {
+                    node.key.as_str().starts_with("settings/row-caption/")
+                        && matches!(&node.content, UiContent::Text(text) if !text.text.is_empty())
+                }));
+                let twice = names_said_twice(compiled);
+                if !twice.is_empty() {
+                    faults.push(format!("{route:?} {width}x{height}: {twice:?}"));
                 }
             }
         }

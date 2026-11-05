@@ -124,7 +124,7 @@ fn intervals(r: &LaneRun, mut each: impl FnMut(u64, u64, &MomentumGlow, &Momentu
     let mut n = 0usize;
     for call in r.calls() {
         match *call {
-            MomentumEvent::Key { at, tau_bits } => g.on_key(
+            MomentumEvent::Key { at, tau_bits, .. } => g.on_key(
                 origin + Duration::from_nanos(u64::try_from(at).unwrap_or(0)),
                 f32::from_bits(tau_bits),
             ),
@@ -418,7 +418,9 @@ fn no_plan_changes_the_glow_the_judge_reruns() {
                     for call in r.calls() {
                         let at = |t: i128| t0 + Duration::from_nanos(u64::try_from(t).unwrap_or(0));
                         match *call {
-                            MomentumEvent::Key { at: k, tau_bits } => {
+                            MomentumEvent::Key {
+                                at: k, tau_bits, ..
+                            } => {
                                 shipped.key(at(k), f32::from_bits(tau_bits));
                                 fresh.on_key(at(k), f32::from_bits(tau_bits));
                             }

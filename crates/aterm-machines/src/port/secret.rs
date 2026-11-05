@@ -168,12 +168,14 @@ pub(super) enum Read {
 /// [`super::System::ask`]'s and [`super::System::ask_kept`]'s live arm ([`no_core_dumps`],
 /// [`io::ErrorKind::Interrupted`]).
 pub(super) fn ask_tty(prompt: &str, read: Read) -> io::Result<Option<Secret>> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     if read != Read::Shown {
         no_core_dumps();
     }
     let mut tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/dev/tty")?;
     let stops = super::stops::catch();
     let line = ask_on(&mut tty, prompt, read, &|| super::stops::caught().is_some());

@@ -220,6 +220,10 @@ fn signed(
             unknown.insert(keyid.to_string());
             continue;
         };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "npm signs with ECDSA P-256, which astream's Ed25519 verify does not cover"
+        )]
         let verifies = ring::signature::UnparsedPublicKey::new(
             &ring::signature::ECDSA_P256_SHA256_ASN1,
             &key.point[..],

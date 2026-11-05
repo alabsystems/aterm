@@ -1,0 +1,51 @@
+# Muse Code 1.4.14 · MEASURED 2026-11-02, `aterm ctl text` of a private headless aterm (144x50) running the real Muse Code under aterm-lab's stub (scratch HOME, no login): `!` then `ls -la` typed as a person types them. Muse Code takes the `!` into its shell mode: the caret row `! ls -la`, the footer ending `Shell mode`, and no `❯` composer.
+
+  Muse Code 1.4.14
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+! ls -la
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.XXXX/proj · Auto-review                                                                           Shell mode
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

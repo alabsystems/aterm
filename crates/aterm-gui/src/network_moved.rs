@@ -526,6 +526,10 @@ pub(crate) fn browse_runs(set: &dyn Fn(&str) -> bool) -> bool {
 /// [`hear_alab_tcp`], telling `moved` (the process's signal, which [`start_sources`] is starting
 /// before [`process`] holds it) of each move.
 fn hear_alab_tcp_on(moved: &Arc<Moved>, own: &[&str]) {
+    #[cfg(unix)]
+    if aterm_agent::node_service::DiscoveryPolicy::process_discovery().mesh {
+        return;
+    }
     #[cfg(all(not(test), target_os = "macos"))]
     if browse_runs(&crate::converge_lane::env_set) {
         let watch = ALAB_TCP.get_or_init(|| {

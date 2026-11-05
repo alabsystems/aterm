@@ -91,7 +91,7 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     };
     let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
     for f in &files {
-        let len = std::fs::metadata(f)
+        let len = std::fs::symlink_metadata(f)
             .map_err(|e| Error::io(format!("stat {}", f.display()), &e))?
             .len();
         if len > aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND {
@@ -162,7 +162,7 @@ pub fn tag(program: &str, build: u64) -> String {
 /// Returns a refusal if any file exceeds the size bound or `asset` mismatches `signed_sha256`.
 pub fn preflight(asset: &Path, signed_sha256: &str, others: &[PathBuf]) -> Result<()> {
     for f in std::iter::once(asset).chain(others.iter().map(PathBuf::as_path)) {
-        let len = std::fs::metadata(f)
+        let len = std::fs::symlink_metadata(f)
             .map_err(|e| Error::io(format!("stat {}", f.display()), &e))?
             .len();
         if len > aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND {
@@ -312,7 +312,12 @@ pub(crate) fn reserve_pack_version(
 ) -> Result<ReservedPack> {
     let prepared = version::Prepared::new(manifest, files)?;
     if let Some((program, build)) = managed_pack(tag) {
-        version::check_managed_manifest(&prepared.manifest, program, build)?;
+        version::check_managed_manifest_bytes(
+            &prepared.manifest,
+            &prepared.manifest_bytes,
+            program,
+            build,
+        )?;
     }
     let title = format!("atpkg {tag}");
     let unread = |e: HostError| Error::cannot_run(format!("could not read {owner} {tag}: {e}"));
@@ -347,10 +352,10 @@ pub(crate) fn reserve_pack_version(
         }
         Err(e) => return Err(unread(e)),
     };
-    check_staged(host, owner, tag, &before, &prepared.manifest)?;
+    check_staged(host, owner, tag, &before, &prepared)?;
     prepared.acquire(host, owner, tag)?;
     let current = host.release(owner, tag).map_err(unread)?;
-    check_staged(host, owner, tag, &current, &prepared.manifest)?;
+    check_staged(host, owner, tag, &current, &prepared)?;
     Ok(ReservedPack {
         prepared,
         release: current,
@@ -384,9 +389,10 @@ fn check_staged(
     staging: &Slug,
     tag: &str,
     release: &Release,
-    manifest: &Path,
+    prepared: &version::Prepared,
 ) -> Result<()> {
-    let name = manifest
+    let name = prepared
+        .manifest
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -404,7 +410,8 @@ fn check_staged(
     if present.is_empty() {
         return Ok(());
     }
-    let ours = version::read_manifest(manifest)?;
+    let ours = &prepared.manifest_bytes;
+    let version = &prepared.version;
     let tmp = aterm_tempfile::Builder::new()
         .prefix("atpkg-publish-staged-")
         .tempdir()
@@ -418,17 +425,11 @@ fn check_staged(
                 ))
             })?;
         let theirs = version::read_manifest(&tmp.path().join(staged))?;
-        if theirs == ours {
+        if &theirs == ours {
             continue;
         }
-        let version = manifest_version(&ours).ok_or_else(|| {
-            Error::refused(format!(
-                "{} records no version — not a manifest to stage",
-                manifest.display()
-            ))
-        })?;
         let at = match manifest_version(&theirs) {
-            Some(v) if v == version => continue,
+            Some(v) if &v == version => continue,
             Some(v) => format!("at version `{v}`"),
             None => "recording no readable version".to_string(),
         };

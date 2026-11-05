@@ -101,23 +101,27 @@ impl From<&str> for ReceiveError {
 }
 
 fn transient_no_status(status: &str) -> bool {
-    let lower = status.to_ascii_lowercase();
+    let bytes = status.as_bytes();
     [
-        "[unavailable]",
-        "[inuse]",
-        "[serverbug]",
-        "[limit]",
-        "[overquota]",
-        "[clientbug]",
-        "too many simultaneous connections",
-        "maximum number of connections",
-        "temporary system problem",
-        "temporarily unavailable",
-        "server busy",
-        "try again later",
+        b"[unavailable]".as_slice(),
+        b"[inuse]",
+        b"[serverbug]",
+        b"[limit]",
+        b"[overquota]",
+        b"[clientbug]",
+        b"too many simultaneous connections",
+        b"maximum number of connections",
+        b"temporary system problem",
+        b"temporarily unavailable",
+        b"server busy",
+        b"try again later",
     ]
     .iter()
-    .any(|needle| lower.contains(needle))
+    .any(|needle| {
+        bytes
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+    })
 }
 
 fn auth_status_error(status: &str) -> ConnectError {
@@ -191,7 +195,10 @@ impl Imap {
         let idle = capabilities
             .lines
             .iter()
-            .filter(|line| line.to_ascii_uppercase().starts_with("* CAPABILITY "))
+            .filter(|line| {
+                line.get(..13)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("* CAPABILITY "))
+            })
             .flat_map(|line| line.split_whitespace())
             .any(|word| word.eq_ignore_ascii_case("IDLE"));
         session.select(folder, false)?;
@@ -303,11 +310,14 @@ impl Reader {
         if wanted.is_empty() {
             return Ok(Vec::new());
         }
-        let set = wanted
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
+        let mut set = String::with_capacity(wanted.len().saturating_mul(8));
+        for (i, id) in wanted.iter().enumerate() {
+            use std::fmt::Write as _;
+            if i > 0 {
+                set.push(',');
+            }
+            let _ = write!(set, "{id}");
+        }
         let reply = self.session.command(&format!(
             "UID FETCH {set} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])"
         ))?;
@@ -384,7 +394,10 @@ impl Reader {
                     break;
                 };
                 let line = String::from_utf8_lossy(&line);
-                if line.to_ascii_uppercase().starts_with("* BYE") {
+                if line
+                    .get(..5)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("* BYE"))
+                {
                     return Err("IMAP server closed its idle session".into());
                 }
                 if mailbox_change(&line, true) {
@@ -447,11 +460,16 @@ impl Session {
                 self.wire.renew(std::time::Duration::from_secs(60));
                 self.tag += 1;
                 let tag = format!("a{}", self.tag);
-                let login = format!(
-                    "{tag} LOGIN {} {}\r\n",
-                    quoted(username)?,
-                    quoted(password.expose())?
-                );
+                let quoted_user = quoted(username)?;
+                let quoted_pw = zeroize::Zeroizing::new(quoted(password.expose())?);
+                let cap = tag.len() + 7 + quoted_user.len() + 1 + quoted_pw.len() + 2;
+                let mut login = zeroize::Zeroizing::new(String::with_capacity(cap));
+                login.push_str(&tag);
+                login.push_str(" LOGIN ");
+                login.push_str(&quoted_user);
+                login.push(' ');
+                login.push_str(&quoted_pw);
+                login.push_str("\r\n");
                 self.wire.write(login.as_bytes())?;
                 self.receive_status(&tag).map_err(|error| match error {
                     ReceiveError::Status(status) => auth_status_error(&status),
@@ -459,16 +477,17 @@ impl Session {
                 })?;
             }
             Authentication::OAuth { .. } => {
-                let encoded = aterm_codec::base64::encode(
-                    authentication
-                        .xoauth2()
-                        .ok_or("Missing OAuth token")?
-                        .as_bytes(),
-                )
-                .map_err(|e| e.to_string())?;
+                let raw_xoauth2 =
+                    zeroize::Zeroizing::new(authentication.xoauth2().ok_or("Missing OAuth token")?);
+                let encoded = zeroize::Zeroizing::new(
+                    aterm_codec::base64::encode(raw_xoauth2.as_bytes())
+                        .map_err(|e| e.to_string())?,
+                );
+                drop(raw_xoauth2);
                 self.wire.renew(std::time::Duration::from_secs(60));
                 self.tag += 1;
                 let tag = format!("a{}", self.tag);
+                let tag_prefix = format!("{tag} ");
                 self.wire
                     .write(format!("{tag} AUTHENTICATE XOAUTH2\r\n").as_bytes())?;
                 let mut challenged = false;
@@ -481,7 +500,7 @@ impl Session {
                     let text = String::from_utf8_lossy(&line)
                         .trim_end_matches(['\r', '\n'])
                         .to_owned();
-                    if let Some(status) = text.strip_prefix(&format!("{tag} ")) {
+                    if let Some(status) = text.strip_prefix(&tag_prefix) {
                         if status
                             .split_whitespace()
                             .next()
@@ -491,7 +510,10 @@ impl Session {
                         }
                         return Err(auth_status_error(status));
                     }
-                    if text.to_ascii_uppercase().starts_with("* BYE") {
+                    if text
+                        .get(..5)
+                        .is_some_and(|p| p.eq_ignore_ascii_case("* BYE"))
+                    {
                         return Err(ConnectError::Other("IMAP server closed the session".into()));
                     }
                     if !text.starts_with("* ") {
@@ -505,7 +527,10 @@ impl Session {
                         "IMAP authentication continuation exceeded limit".into(),
                     ));
                 }
-                self.wire.write(format!("{encoded}\r\n").as_bytes())?;
+                let mut line = zeroize::Zeroizing::new(Vec::with_capacity(encoded.len() + 2));
+                line.extend_from_slice(encoded.as_bytes());
+                line.extend_from_slice(b"\r\n");
+                self.wire.write(&line)?;
                 self.receive_status(&tag).map_err(|error| match error {
                     ReceiveError::Status(status) => auth_status_error(&status),
                     ReceiveError::Other(message) => ConnectError::Other(message),
@@ -533,6 +558,7 @@ impl Session {
     fn receive_status(&mut self, tag: &str) -> Result<Reply, ReceiveError> {
         let mut reply = Reply::default();
         let mut size = 0usize;
+        let tag_prefix = format!("{tag} ");
         loop {
             let line = self.wire.line()?;
             size = size
@@ -544,7 +570,7 @@ impl Session {
             let text = String::from_utf8_lossy(&line)
                 .trim_end_matches(['\r', '\n'])
                 .to_owned();
-            if let Some(status) = text.strip_prefix(&format!("{tag} ")) {
+            if let Some(status) = text.strip_prefix(&tag_prefix) {
                 if status
                     .split_whitespace()
                     .next()
@@ -555,7 +581,10 @@ impl Session {
                 return Err(ReceiveError::Status(status.to_owned()));
             }
             self.changed |= mailbox_change(&text, false);
-            if text.to_ascii_uppercase().starts_with("* BYE") {
+            if text
+                .get(..5)
+                .is_some_and(|p| p.eq_ignore_ascii_case("* BYE"))
+            {
                 return Err("IMAP server closed the session".into());
             }
             // An OAuth error challenge requires an empty client response before the final NO.
@@ -600,7 +629,12 @@ impl Session {
         fetch_parts(reply)?
             .into_iter()
             .find(|part| {
-                part.id == wanted && part.attributes.to_ascii_uppercase().contains("BODY[]")
+                part.id == wanted
+                    && part
+                        .attributes
+                        .as_bytes()
+                        .windows(6)
+                        .any(|w| w.eq_ignore_ascii_case(b"BODY[]"))
             })
             .ok_or(ReadError::Missing)
     }
@@ -638,7 +672,11 @@ fn fetch_parts(reply: Reply) -> Result<Vec<FetchPart>, String> {
     let mut parts = Vec::new();
     for (index, line) in reply.lines.iter().enumerate() {
         let (attributes, bytes) = if literal_len(line)?.is_some() {
-            if !line.to_ascii_uppercase().contains(" FETCH (") {
+            if !line
+                .as_bytes()
+                .windows(8)
+                .any(|w| w.eq_ignore_ascii_case(b" FETCH ("))
+            {
                 return Err("Unexpected message literal".into());
             }
             let mut attributes = line.clone();
@@ -947,7 +985,7 @@ fn attributes_have_seen(attributes: &str) -> bool {
 }
 
 fn folder_name(input: &str) -> String {
-    let mut result = String::new();
+    let mut result = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(start) = rest.find('&') {
         result.push_str(&rest[..start]);
@@ -963,22 +1001,26 @@ fn folder_name(input: &str) -> String {
             let decoded = if raw_shifted.contains(['/', '=']) {
                 None
             } else {
-                let normalized = raw_shifted.replace(',', "/");
-                let mut padded = normalized;
-                while !padded.len().is_multiple_of(4) {
-                    padded.push('=');
+                let mut padded = Vec::with_capacity((raw_shifted.len() + 3) & !3);
+                for b in raw_shifted.bytes() {
+                    padded.push(if b == b',' { b'/' } else { b });
                 }
-                aterm_codec::base64::decode_strict(padded.as_bytes())
+                while !padded.len().is_multiple_of(4) {
+                    padded.push(b'=');
+                }
+                aterm_codec::base64::decode_strict(&padded)
                     .ok()
                     .filter(|bytes| bytes.len().is_multiple_of(2))
                     .and_then(|bytes| {
-                        let words = bytes
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|b| u16::from_be_bytes([b[0], b[1]]))
-                            .collect::<Vec<_>>();
-                        String::from_utf16(&words).ok()
+                        char::decode_utf16(
+                            bytes
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|b| u16::from_be_bytes(*b)),
+                        )
+                        .collect::<Result<String, _>>()
+                        .ok()
                     })
                     .filter(|decoded| !decoded.chars().any(|ch| (' '..='~').contains(&ch)))
             };

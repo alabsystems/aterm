@@ -24,6 +24,12 @@ pub(super) use rotation::Preparation as RotationPreparation;
 pub(super) use rotation::observe_exec;
 #[cfg(all(test, unix))]
 pub(super) use service::append_child as fixture_append_child;
+#[cfg(all(test, unix))]
+pub(super) use service::observe_terminal_by as fixture_observe_terminal;
+#[cfg(all(test, unix))]
+pub(super) use service::retire_unstarted as fixture_retire_unstarted;
+#[cfg(all(test, unix))]
+pub(super) use service::settle_terminal_native as fixture_settle_terminal_native;
 pub(crate) use service::{cancel_owner, pending};
 
 #[derive(Clone, Debug)]
@@ -356,6 +362,7 @@ fn make_prepare(
         env.push(("CODEX_AUTH_PATH".into(), path.clone()));
     }
     let rollback = RestartCommand {
+        account_intent: None,
         image: process.image.clone(),
         program: program.clone(),
         argv: resume.argv.get(1..)?.to_vec(),
@@ -368,6 +375,7 @@ fn make_prepare(
     env.retain(|(name, _)| name != "CODEX_AUTH_PATH");
     env.push(("CODEX_AUTH_PATH".into(), next.new_auth.to_str()?.into()));
     let forward = RestartCommand {
+        account_intent: None,
         env,
         ..rollback.clone()
     };
@@ -380,6 +388,7 @@ fn make_prepare(
         deadline_us: aterm_agent::harness::native_act::monotonic_us()?.checked_add(120_000_000)?,
         duty: Scope::Relaunch,
         plan: NativePlan::Restart {
+            cold: None,
             process,
             observation: None,
             shell,
@@ -528,14 +537,9 @@ fn serve_inner(
                         renewal::write_receipt(&env, &receipt)?;
                         return Ok(receipt);
                     }
-                    if same_native_host(&receipt)
-                        && receipt.phase == Phase::Committing
-                        && !receipt.launch_attempted
-                        && now_ms() >= receipt.expires_ms
-                    {
-                        receipt.phase = Phase::Retired;
-                        renewal::write_receipt(&env, &receipt)?;
-                    }
+                    // A wall-clock deadline never closes an already claimed
+                    // native operation. Its coordinator reconciles the exact
+                    // request and retires it only against a positive outcome.
                     if !receipt.may_replace() {
                         return Ok(receipt);
                     }
@@ -826,12 +830,9 @@ fn commit(
                     // All nested control/network waits run on this private worker, never
                     // the dispatch lane handling the original Codex request.
                     if renewal::prepare_restart(&opts, &sid, &prepare).is_err() {
-                        if renewal::read_receipt(&worker_env, &id)
-                            .is_some_and(|receipt| !receipt.launch_attempted)
-                        {
-                            reset_before_signal(&worker_env, &id);
-                            remove_seal(&worker_ctx, &id);
-                        }
+                        // A failed or lost preparation reply can follow a durable
+                        // native claim. Keep this exact root and its seal for
+                        // retry; only positive native completion can retire it.
                         return;
                     }
                     let Some(store) = worker_env.accounts_store_for(accounts::Cli::Codex) else {
@@ -1423,6 +1424,7 @@ mod tests {
             image: image.clone(),
         };
         let command = RestartCommand {
+            account_intent: None,
             image: image.clone(),
             program: "/fixture-image".into(),
             argv: vec!["resume".into()],
@@ -1447,6 +1449,7 @@ mod tests {
             deadline_us: u64::MAX,
             duty: Scope::Relaunch,
             plan: NativePlan::Restart {
+                cold: None,
                 process,
                 shell: Process {
                     pid: 42,
@@ -1628,7 +1631,9 @@ mod tests {
                 Some(actor.clone()),
                 Some(Conversation::Facts(Arc::new(AtomicBool::new(true)))),
                 crate::metrics::now_us(),
-                Some(seal.clone())
+                Some(seal.clone()),
+                None,
+                &System(&ctx.native_policy, true),
             )
             .is_err()
         );
@@ -1647,7 +1652,9 @@ mod tests {
                 Some(actor),
                 Some(Conversation::Facts(Arc::new(AtomicBool::new(true)))),
                 crate::metrics::now_us(),
-                Some(seal.clone())
+                Some(seal.clone()),
+                None,
+                &System(&ctx.native_policy, true),
             )
             .is_ok()
         );
@@ -1677,6 +1684,41 @@ mod tests {
         };
         let authority = {
             let meta = ctx.meta.lock().unwrap();
+            let mut cold_request = seal.prepare.clone();
+            let NativePlan::Restart { cold, rollback, .. } = &mut cold_request.plan else {
+                unreachable!();
+            };
+            *cold = Some(Box::new(aterm_agent::harness::native_act::ColdIntent {
+                login: None,
+                home: None,
+                auth_observed: false,
+                stored_login: true,
+                conversation: Some("captured-conversation".into()),
+                profile: None,
+                mode: aterm_agent::harness::accounts::Mode::Wall,
+                billing: aterm_agent::harness::native_act::ColdBilling::Keep,
+            }));
+            *rollback = None;
+            assert_eq!(
+                cold_request.plan.constructor(),
+                aterm_agent::harness::native_act::Constructor::ColdRestart
+            );
+            assert!(
+                capture_native_authority(
+                    &ctx,
+                    &meta,
+                    &cold_request,
+                    &caller,
+                    Some(actor.clone()),
+                    Some(Conversation::Facts(Arc::new(AtomicBool::new(true)))),
+                    crate::metrics::now_us(),
+                    Some(seal.clone()),
+                    None,
+                    &System(&ctx.native_policy, true),
+                )
+                .is_err(),
+                "a real renewal seal cannot authorize a different cold plan"
+            );
             capture_native_authority(
                 &ctx,
                 &meta,
@@ -1686,6 +1728,8 @@ mod tests {
                 Some(Conversation::Facts(Arc::new(AtomicBool::new(true)))),
                 crate::metrics::now_us(),
                 Some(seal.clone()),
+                None,
+                &System(&ctx.native_policy, true),
             )
             .unwrap()
         };
@@ -1699,6 +1743,8 @@ mod tests {
             authority,
             custody: None,
             phase: super::super::Phase::Started,
+            preparation: super::super::Preparation::recorded_for_test(),
+            grant_record: super::super::GrantRecord::None,
             signal_sent: true,
             signal_accepted: Some(true),
             resume_sent: false,
@@ -1711,6 +1757,9 @@ mod tests {
             completion_drain: None,
             resume_phase: None,
             children: [None, None],
+            cold_facts: None,
+            cold_resolving: false,
+            resolved_cold: None,
             effect_started: Arc::new(AtomicBool::new(true)),
             clock: Clock::System,
             observation: None,
@@ -1779,10 +1828,10 @@ mod tests {
     #[test]
     fn codex_renewal_requires_sealed_platform_authority() {
         let policy = crate::native_session_policy::SessionPolicy::default();
-        for kind in Constructor::ALL {
+        for kind in [Constructor::OwnImage, Constructor::PrivateRestart] {
             assert!(
                 !System(&policy, false).constructor_enabled(kind),
-                "an unsealed request cannot use a native constructor"
+                "an unsealed request cannot use a generic native constructor"
             );
         }
         assert!(!System(&policy, true).constructor_enabled(Constructor::OwnImage));
@@ -1790,6 +1839,13 @@ mod tests {
             System(&policy, true).constructor_enabled(Constructor::PrivateRestart),
             cfg!(all(target_os = "macos", target_arch = "aarch64"))
         );
+        for sealed in [false, true] {
+            assert_eq!(
+                System(&policy, sealed).constructor_enabled(Constructor::ColdRestart),
+                crate::native_session_policy::cold_restart_qualified(),
+                "the cold constructor is independent of a Codex renewal seal"
+            );
+        }
     }
 
     #[cfg(unix)]

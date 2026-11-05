@@ -1563,7 +1563,7 @@ pub(crate) fn seed_temporal_keyframe(
     };
     let mut rec = temporal.lock().unwrap_or_else(|p| p.into_inner());
     rec.record_keyframe(checkpoint);
-    rec.spine_watermark().seed(at);
+    rec.seed_spine(at);
     true
 }
 
@@ -1602,7 +1602,7 @@ pub(crate) fn arm_promoted(session: &mut Session, id: u64) -> Result<(), String>
         match seed_of(&engine, id) {
             Some((checkpoint, at)) => {
                 rec.record_keyframe(checkpoint);
-                rec.spine_watermark().seed(at);
+                rec.seed_spine(at);
             }
             None => rec.want_keyframe(),
         }
@@ -2010,7 +2010,7 @@ pub(crate) fn spawn_session(
         temporal: temporal.clone(),
         byte_fanout: byte_fanout.clone(),
         turns: observed.turns,
-        meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+        meta: Arc::default(),
         timeline: observed.timeline,
         fabric: std::sync::Arc::default(),
         idem: Default::default(),
@@ -2049,6 +2049,7 @@ pub(crate) fn spawn_session(
         frame: Default::default(),
         fenced_writes: Default::default(),
         native_policy: Default::default(),
+        spawn_mark: crate::control::SpawnMark::at_spawn(adopted),
         witness: spare.map_or_else(Arc::default, |s| Arc::clone(&s.link.witness)),
     });
     if !adopted && integrated_shell.is_some() {
@@ -2230,6 +2231,7 @@ pub(crate) fn spawn_session(
 
     let mut session = Session {
         child_reaped: std::sync::atomic::AtomicBool::new(false),
+        teardown_started: std::sync::atomic::AtomicBool::new(false),
         child_exit: std::sync::OnceLock::new(),
         exit_watch: None,
         shell_start,
@@ -2640,7 +2642,7 @@ mod temporal_seed_tests {
         recorder
             .lock()
             .unwrap()
-            .apply_inline(crate::temporal::TemporalMsg::RawIn(
+            .apply(crate::temporal::TemporalMsg::RawIn(
                 crate::temporal::InputSlice::at(signed.as_bytes(), clock),
             ));
         let live = crate::term_lock(&term);
@@ -5703,7 +5705,7 @@ fn read_kitty_file(path: &Path) -> Option<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
             .ok()?
     };
@@ -8199,6 +8201,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                                 .as_ref()
                                 .map(|_| crate::temporal::SpinePre::take(&t));
                             let started_before = t.started_command_seq();
+                            let block_before = crate::telemetry_host::mark(&t);
                             let unread = {
                                 #[cfg(any(debug_assertions, feature = "dev-seams"))]
                                 let _cost = crate::recording_cost::begin(
@@ -8255,6 +8258,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                             backlog = t.lazy_backlog_len();
                             let moved = screen_moves.fed(crate::control::screen_gen(&t));
                             job_feed.fed(&t, &bytes[off..end], moved, Instant::now);
+                            job_feed.meter().slice(block_before, &t, fg_shell);
                             if let (Some(tx), Some(pre)) = (&temporal_lane.0, slice_pre)
                                 && temporal_lane.1.needs_input(tx)
                             {

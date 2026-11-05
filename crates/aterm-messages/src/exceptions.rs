@@ -52,6 +52,10 @@ pub enum Family {
     /// macOS's own services that hold far more memory than any service needs
     /// (`vitals.service-memory.<service>`).
     ServiceMemory,
+    /// Processes that outlived the tab or verify run that started them
+    /// (`vitals.proc.<sid>.leftovers`): the leftover view's whole answer, every reading. A fact
+    /// for later, never an alert on screen.
+    Vitals,
     /// The fabric bridge's own state dir (`fabric.state.<cause>`).
     FabricState,
     /// Harness occupancy (`harness.occupancy.<subject>.<cause>`).
@@ -101,6 +105,7 @@ impl Family {
             Self::FleetUnreadable => "fleet.unreadable",
             Self::HugeDir => "vitals.huge-dir",
             Self::ServiceMemory => "vitals.service-memory",
+            Self::Vitals => "vitals.proc",
             Self::FabricState => "fabric.state",
             Self::Occupancy => "harness.occupancy",
             Self::Setup => "setup",
@@ -130,6 +135,7 @@ impl Family {
             | Self::FleetUnreadable
             | Self::HugeDir
             | Self::ServiceMemory
+            | Self::Vitals
             | Self::Secrets
             | Self::Agh
             | Self::Join
@@ -151,7 +157,7 @@ impl Family {
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -170,6 +176,7 @@ impl Family {
         Self::FleetUnreadable,
         Self::HugeDir,
         Self::ServiceMemory,
+        Self::Vitals,
         Self::FabricState,
         Self::Occupancy,
         Self::Setup,
@@ -200,6 +207,7 @@ impl Family {
             | Self::FleetUnreadable
             | Self::HugeDir
             | Self::ServiceMemory
+            | Self::Vitals
             | Self::Setup
             | Self::Secrets
             | Self::Agh

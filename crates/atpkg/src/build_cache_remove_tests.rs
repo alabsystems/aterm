@@ -2875,3 +2875,24 @@ fn a_top_that_will_not_open_is_forecast_to_stay_as_it_stays() {
     assert_eq!(forecast(&stage, NAMED).count, 0);
     assert!(tree(&stage).whole() && !stage.exists());
 }
+
+/// A REMOVAL SAYS IT IS STILL GOING, ENTRY BY ENTRY, where it goes entry by entry: a tree of a
+/// million entries takes minutes on a swapping machine. Off Unix it is one call, so one tick.
+#[test]
+fn a_removal_ticks_for_each_entry() {
+    const ENTRIES: usize = 8;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let top = scratch.path().join("top");
+    std::fs::create_dir(&top).unwrap();
+    for i in 0..ENTRIES {
+        std::fs::write(top.join(i.to_string()), b"x").unwrap();
+    }
+    let before = aterm_uds::progress::ticks_here();
+    assert!(tree(&top).whole());
+    let ticks = aterm_uds::progress::ticks_here() - before;
+    assert!(!top.exists());
+    assert!(
+        ticks >= if cfg!(unix) { ENTRIES } else { 1 },
+        "{ticks} ticks"
+    );
+}

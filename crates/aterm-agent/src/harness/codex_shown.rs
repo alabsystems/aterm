@@ -136,12 +136,12 @@ pub fn shown_in(steps: &Path, build: &str) -> String {
         #[cfg(target_os = "macos")]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            opts.custom_flags(0x0004 | 0x0100);
+            opts.custom_flags(0x0004 | 0x0100 | 0x0100_0000);
         }
         #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            opts.custom_flags(0o100_000 | 0o4000);
+            opts.custom_flags(0o100_000 | 0o4000 | 0o2_000_000);
         }
         #[cfg(all(
             target_os = "linux",
@@ -149,7 +149,7 @@ pub fn shown_in(steps: &Path, build: &str) -> String {
         ))]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            opts.custom_flags(0o400_000 | 0o4000);
+            opts.custom_flags(0o400_000 | 0o4000 | 0o2_000_000);
         }
         let Ok(file) = opts.open(entry.path()) else {
             continue;

@@ -1142,6 +1142,85 @@ fn a_node_record_round_trips_and_a_forged_proof_is_refused() {
     assert!(forged(&node_pair(1), lab.network(), &A.id()).is_ok());
 }
 
+/// A record's signer key of small order signs nothing: not the identity's forgery, which ring
+/// alone takes for every message, and not the zero key's (a point of order 4, which the record's
+/// shape once refused by name) for a record whose signed bytes ring alone takes it for. Ring is
+/// shown to take each forgery, so neither arm passes by ring refusing it.
+///
+/// NEGATIVE CONTROL: `ed25519::verifies` through ring's `UnparsedPublicKey`: each forgery decodes
+/// as a record of its key.
+#[test]
+fn a_small_order_key_signs_no_membership_record() {
+    use crate::ed25519::{FORGED, SMALL_ORDER_KEY, ZERO_KEY, ring_takes, zero_key_forgery};
+    let lab = found(&[(A, "m1"), (B, "m2")]);
+    // MAGIC, VERSION, the network and the kind come before the actor; the signature ends it.
+    let actor = MAGIC.len() + 1 + 32 + 1;
+    // A's record renaming it `name`, its signer key replaced by `key` and its signature by the
+    // one `forge` makes of its signed bytes.
+    let forged = |name: String, key: [u8; 32], forge: &dyn Fn(&[u8]) -> Option<[u8; 64]>| {
+        let mut wire = sign(&lab, A, Body::Name { name }).bytes().to_vec();
+        wire[actor..actor + 32].copy_from_slice(&key);
+        let signed = wire.len() - 64;
+        let signature = forge(&signed_message(&wire[..signed]))?;
+        wire[signed..].copy_from_slice(&signature);
+        Some(wire)
+    };
+    let identity =
+        |message: &[u8]| ring_takes(&SMALL_ORDER_KEY, message, &FORGED).then_some(FORGED);
+    let identity = forged("renamed".into(), SMALL_ORDER_KEY, &identity)
+        .expect("ring alone takes the identity's forgery");
+    let zero = (0..64)
+        .find_map(|n| forged(format!("renamed-{n}"), ZERO_KEY, &zero_key_forgery))
+        .expect("ring alone takes the zero key's forgery of one of 64 records");
+    for (key, wire) in [("identity", identity), ("zero", zero)] {
+        let error = Record::decode(&wire).map(|_| ()).unwrap_err().to_string();
+        assert_eq!(error, "membership record signature failed", "{key}");
+    }
+}
+
+/// A Node record whose node key is of small order binds nothing: not the identity's forgery, and
+/// not the zero key's (which the proof check once refused by name) on a network whose proof
+/// message ring alone takes it for. Ring is shown to take each proof, so neither arm passes by
+/// ring refusing it.
+///
+/// NEGATIVE CONTROL: `ed25519::verifies` through ring's `UnparsedPublicKey`: each forgery is
+/// taken as its node key's proof and the record signs.
+#[test]
+fn a_small_order_node_key_proves_no_node_record() {
+    use crate::ed25519::{FORGED, SMALL_ORDER_KEY, ZERO_KEY, ring_takes, zero_key_forgery};
+    let lab = found(&[(A, "m1"), (B, "m2")]);
+    assert!(
+        ring_takes(
+            &SMALL_ORDER_KEY,
+            &node_proof_message(lab.network(), &A.id()),
+            &FORGED
+        ),
+        "ring alone takes the identity's forgery"
+    );
+    // The proof signs the network, so another founding time is another message.
+    let (zero_lab, zero_proof) = (2..66)
+        .find_map(|authored_ms| {
+            let founders = vec![A.entrant("m1"), B.entrant("m2")];
+            let genesis = Record::found(&FOUNDING_SEED, founders, authored_ms).unwrap();
+            let lab = Log::new(genesis).unwrap();
+            let proof = zero_key_forgery(&node_proof_message(lab.network(), &A.id()))?;
+            Some((lab, proof))
+        })
+        .expect("ring alone takes the zero key's forgery on one of 64 networks");
+    for (lab, node_key, proof) in [
+        (&lab, SMALL_ORDER_KEY, FORGED),
+        (&zero_lab, ZERO_KEY, zero_proof),
+    ] {
+        let body = Body::Node { node_key, proof };
+        let refused = lab.draft(&A.id(), 7, body).sign(&A.seed(), A.incarnation());
+        let error = refused.map(|_| ()).unwrap_err().to_string();
+        assert_eq!(
+            error, "a node record's proof is not its node key's",
+            "{node_key:02x?}"
+        );
+    }
+}
+
 #[test]
 fn a_founder_listed_with_no_node_key_is_bound_by_its_own_node_record() {
     let founders: Vec<Founder> = [(A, "m1"), (B, "m2")]
@@ -1635,6 +1714,8 @@ fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
     );
 }
 
+#[cfg(unix)]
+mod everyone_key;
 mod reach;
 mod readers;
 mod record_budgets;

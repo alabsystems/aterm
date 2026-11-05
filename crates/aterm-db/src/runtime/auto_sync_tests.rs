@@ -15,26 +15,99 @@ use std::{
     net::Ipv4Addr,
 };
 
+/// Completed application rounds that retain nothing new before a wait calls repair stuck. A round
+/// repairs one table and a peer's rounds take the common tables in turn, so a holder's data is a
+/// few rounds away, however long each round takes on a loaded host. A round that selected no table
+/// or deferred its table counts too ([`Progress::rounds`]).
+const ROUNDS_WITHOUT_PROGRESS: u64 = 64;
+
+/// What a runtime's transports have reported ([`Attachment::observe`]).
+#[derive(Default)]
+struct Progress {
+    /// The most operations each table's rounds saw retained. A wait asks for at least so many,
+    /// and a rebuilt transport, which has seen no round yet, says nothing of what its store holds.
+    retained: BTreeMap<Digest, usize>,
+    /// Application rounds that completed, on any table or none, whether or not each exchanged it.
+    rounds: u64,
+}
+impl Progress {
+    fn held(&self, table: &Digest) -> usize {
+        self.retained.get(table).copied().unwrap_or(0)
+    }
+}
+
+/// Whether repair still runs while a wait for one table's operations goes on. It has stopped once
+/// the runtime completes no application round for a hang detector's minute, or once enough of them
+/// complete and retain nothing new on the table. A runtime whose every round fails is silent; one
+/// whose every round defers is not, and stops at the count. Elapsed time judges nothing else: a
+/// chain of slow rounds on a loaded host is repair running, and the data's path through it can
+/// outlast any one budget.
+struct Watch {
+    table: Digest,
+    high_water: usize,
+    rounds: u64,
+    rounds_at_high_water: u64,
+    silent_since: Instant,
+}
+impl Watch {
+    fn new(table: Digest, progress: &Progress, now: Instant) -> Self {
+        Self {
+            table,
+            high_water: progress.held(&table),
+            rounds: progress.rounds,
+            rounds_at_high_water: progress.rounds,
+            silent_since: now,
+        }
+    }
+
+    /// How long a wait may sleep before this must be asked again; `None` once repair has stopped.
+    fn remaining(&mut self, progress: &Progress, now: Instant) -> Option<Duration> {
+        if progress.held(&self.table) > self.high_water {
+            self.high_water = progress.held(&self.table);
+            self.rounds_at_high_water = progress.rounds;
+        }
+        if progress.rounds != self.rounds {
+            self.rounds = progress.rounds;
+            self.silent_since = now;
+        }
+        if progress.rounds - self.rounds_at_high_water >= ROUNDS_WITHOUT_PROGRESS {
+            return None;
+        }
+        aterm_spec::wait::MUST_HAPPEN
+            .checked_sub(now.saturating_duration_since(self.silent_since))
+            .filter(|left| !left.is_zero())
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Attachment {
     pub(super) port: u16,
     pub(super) lan_allowed: Arc<std::sync::atomic::AtomicBool>,
-    progress: Arc<(Mutex<BTreeMap<Digest, usize>>, Condvar)>,
+    progress: Arc<(Mutex<Progress>, Condvar)>,
 }
 impl Attachment {
     pub(super) fn new(port: u16) -> Self {
         Self {
             port,
             lan_allowed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            progress: Arc::new((Mutex::new(BTreeMap::new()), Condvar::new())),
+            progress: Arc::new((Mutex::new(Progress::default()), Condvar::new())),
         }
     }
 
-    pub(super) fn observe(&self, observed: &BTreeMap<Digest, usize>) {
+    /// Note what a transport saw retained, and the `rounds` it finished since its last call.
+    pub(super) fn observe(&self, observed: &BTreeMap<Digest, usize>, rounds: u64) {
         let (state_mu, changed) = &*self.progress;
         let mut state = state_mu.lock().unwrap_or_else(|p| p.into_inner());
-        if *state != *observed {
-            state.clone_from(observed);
+        let mut moved = rounds != 0;
+        state.rounds += rounds;
+        for (table, retained) in observed {
+            let held = state.retained.entry(*table).or_default();
+            if retained > held {
+                *held = *retained;
+                moved = true;
+            }
+        }
+        if moved {
             changed.notify_all();
         }
     }
@@ -47,30 +120,95 @@ impl Attachment {
         );
     }
 
+    /// What this runtime's rounds saw retained once they saw `operations` on `table`, or once
+    /// repair stopped short of that ([`Watch`]).
     fn wait_for_observation(&self, table: Digest, operations: usize) -> BTreeMap<Digest, usize> {
         let (state_mu, changed) = &*self.progress;
         let mut state = state_mu.lock().unwrap_or_else(|p| p.into_inner());
-        let mut high_water = state.get(&table).copied().unwrap_or(0);
-        let mut until = Instant::now() + Duration::from_secs(60);
-        while state.get(&table).copied().unwrap_or(0) < operations {
-            let retained = state.get(&table).copied().unwrap_or(0);
-            if retained > high_water {
-                high_water = retained;
-                until = Instant::now() + Duration::from_secs(60);
-            }
-            let remaining = until.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+        let mut watch = Watch::new(table, &state, Instant::now());
+        while state.held(&table) < operations {
+            let Some(remaining) = watch.remaining(&state, Instant::now()) else {
                 break;
-            }
+            };
             let (next, _) = changed
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(|p| p.into_inner());
             state = next;
         }
         // Release the observer's lock before any caller's assertion can unwind.
-        // Only new high-water progress on this table extends the hang detector.
-        state.clone()
+        state.retained.clone()
     }
+}
+
+/// A wait's verdicts, with the clock in the test's hands. Slow rounds keep repair running past any
+/// one minute; a silent minute is a hang; rounds that retain nothing are stuck however quick.
+#[test]
+fn a_wait_outlasts_slow_rounds_and_stops_when_they_hang_or_retain_nothing() {
+    let table = [7; 32];
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let began = Instant::now();
+    let after = |slow_minutes: u32, seconds: u64| {
+        began + hang * slow_minutes + Duration::from_secs(seconds)
+    };
+
+    let mut progress = Progress::default();
+    let mut watch = Watch::new(table, &progress, began);
+    assert_eq!(watch.remaining(&progress, began), Some(hang));
+    assert_eq!(
+        watch.remaining(&progress, after(0, 59)),
+        Some(Duration::from_secs(1))
+    );
+    // Each round ends just inside the minute since the last: three minutes on, nothing retained.
+    for slow_minutes in 1..=3 {
+        progress.rounds += 1;
+        assert!(
+            watch.remaining(&progress, after(slow_minutes, 0)).is_some(),
+            "a slow round is repair running"
+        );
+    }
+    assert_eq!(
+        watch.remaining(&progress, after(3, 59)),
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        watch.remaining(&progress, after(4, 0)),
+        None,
+        "a silent minute is a hang"
+    );
+
+    let mut progress = Progress::default();
+    let mut watch = Watch::new(table, &progress, began);
+    for round in 1..ROUNDS_WITHOUT_PROGRESS {
+        progress.rounds = round;
+        assert!(watch.remaining(&progress, began).is_some());
+    }
+    progress.retained.insert(table, 1);
+    assert!(
+        watch.remaining(&progress, began).is_some(),
+        "the table's retained count moved"
+    );
+    progress.rounds = 2 * ROUNDS_WITHOUT_PROGRESS - 2;
+    assert!(watch.remaining(&progress, began).is_some());
+    progress.retained.insert([8; 32], 9);
+    progress.rounds += 1;
+    assert_eq!(
+        watch.remaining(&progress, began),
+        None,
+        "rounds that retain nothing on this table are stuck, whatever another table does"
+    );
+}
+
+/// Retained counts only rise: a round that read no inventory, or a rebuilt transport's empty map,
+/// takes nothing from what an earlier round saw.
+#[test]
+fn an_attachment_keeps_what_its_rounds_saw_retained() {
+    let table = [7; 32];
+    let attachment = Attachment::new(0);
+    attachment.observe(&BTreeMap::from([(table, 4)]), 1);
+    attachment.observe(&BTreeMap::from([(table, 0)]), 1);
+    attachment.observe(&BTreeMap::new(), 0);
+    // Already held, so this returns at once: the detector never runs.
+    attachment.wait_for(table, 4, "a held count stays held");
 }
 
 fn start(
@@ -598,7 +736,15 @@ fn automatic_runtime_discovers_tables_catches_up_late_devices_and_transfers_loca
         },
     );
     assert_eq!(relayed.observer.as_ref(), Some(&identity));
-    assert!(follower_progress.progress.0.lock().unwrap().is_empty());
+    assert!(
+        follower_progress
+            .progress
+            .0
+            .lock()
+            .unwrap()
+            .retained
+            .is_empty()
+    );
     owner.stop();
     let taken_over = wait_network(
         &follower_state,
@@ -1358,4 +1504,246 @@ fn two_loopback_islands_write_admit_and_remove_then_join_and_match_inventories()
                 .collect::<Vec<_>>()
         );
     }
+}
+
+/// The registry's default-on owner, not fleet_db's manual server: a cold peer
+/// discovers sealed mailbox rows, edits one, and resumes after both owners restart.
+#[test]
+fn registry_mailbox_secrets_discover_bidirectionally_and_survive_owner_restart() {
+    use crate::{
+        alab::{
+            Registry,
+            mail::{self, Credential, Withheld},
+            registry::{ADDRESS, MAILBOX},
+            secret::Journal,
+        },
+        att::{Handle, REGISTRY},
+        typed::{
+            cell::{self, CellKey, CellValue},
+            keys,
+            secret::Secret,
+        },
+    };
+    use aterm_json::json;
+    const FIRST_TOTP: &str = "JBSWY3DPEHPK3PXP";
+    const SECOND_TOTP: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
+    let observers = aterm_tempfile::Builder::new()
+        .prefix("registry-owner-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let reservation = Multicast::bind(
+        Ipv4Addr::LOCALHOST,
+        Ipv4Addr::new(239, 255, 31, 84),
+        0,
+        LinkScope::Loopback,
+    )
+    .unwrap();
+    let port = reservation.port();
+    for paths in &lab.paths {
+        assert!(!paths.dir.join("commons/tables").exists());
+    }
+    let (owner, owner_progress) = start(&lab, observers.path(), 0, port);
+    let (receiver, receiver_progress) = start(&lab, observers.path(), 1, port);
+    for runtime in [&owner, &receiver] {
+        wait_network(
+            &runtime.network_observation(),
+            "owner active before any application",
+            |s| s.visibility == Visibility::Active && s.observer.is_some(),
+        );
+    }
+    let login = keys::address_pk("owner@example.invalid").unwrap();
+    let mailbox = keys::mailbox_pk(&login).unwrap();
+    let put = |collection: &crate::typed::Collection, row: &str, column: &str, value| {
+        cell::change(
+            collection,
+            CellKey {
+                pk: row,
+                col: column,
+                elem: None,
+            },
+            &CellValue::owner(1, value),
+        )
+        .unwrap()
+    };
+    let source = Registry::at(lab.paths[0].clone());
+    let table = source.open().unwrap();
+    Handle::at(lab.paths[0].clone(), &REGISTRY)
+        .commit_sealed_until(true, crate::admission::deadline(), |_, sealer| {
+            let password = sealer.seal(
+                "address",
+                &login,
+                "password",
+                &Secret::new("fixture-initial-password".into()),
+            )?;
+            let totp = sealer.seal("mailbox", &mailbox, "totp", &Secret::new(FIRST_TOTP.into()))?;
+            Ok((
+                (),
+                vec![vec![
+                    put(&ADDRESS, &login, "addr", json!("owner@example.invalid")),
+                    put(&ADDRESS, &login, "password", json!(password)),
+                    put(&MAILBOX, &mailbox, "label", json!("fixture-mailbox")),
+                    put(&MAILBOX, &mailbox, "service", json!("proton")),
+                    put(&MAILBOX, &mailbox, "code_path", json!("webmail")),
+                    put(&MAILBOX, &mailbox, "login", json!(login)),
+                    put(&MAILBOX, &mailbox, "totp", json!(totp)),
+                    put(
+                        &MAILBOX,
+                        &mailbox,
+                        "webmail",
+                        json!("https://mail.example.invalid/inbox"),
+                    ),
+                ]],
+            ))
+        })
+        .unwrap();
+    let first_count = source.view().unwrap().ops.len();
+    receiver_progress.wait_for(
+        table.digest(),
+        first_count,
+        "cold peer discovers registry and sealed mailbox",
+    );
+    let remote = Registry::at(lab.paths[1].clone());
+    let check = |registry: &Registry, machine: usize, expected: &str, expected_totp: &str| {
+        let rows = mail::sign_in_mailboxes(registry).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].login, "owner@example.invalid");
+        assert!(rows[0].held.contains(&Credential::Password));
+        assert!(rows[0].held.contains(&Credential::Totp));
+        let journal = Journal::at(&observers.path().join(format!("reveals-{machine}")));
+        assert_eq!(
+            mail::reveal_bound(
+                registry,
+                &journal,
+                &mailbox,
+                &[Credential::Password, Credential::Totp],
+                1_000,
+                |found| found.login == "owner@example.invalid"
+                    && found.service.as_deref() == Some("proton"),
+                |values| values.len() == 2
+                    && values[0].as_str() == Some(expected)
+                    && values[1].as_str() == Some(expected_totp),
+            )
+            .unwrap(),
+            Ok(true)
+        );
+    };
+    check(&remote, 1, "fixture-initial-password", FIRST_TOTP);
+    let journal = Journal::at(&observers.path().join("refused-bundles"));
+    let consumed = std::cell::Cell::new(false);
+    assert_eq!(
+        mail::reveal_bound(
+            &remote,
+            &journal,
+            &mailbox,
+            &[Credential::Password, Credential::Totp],
+            1_000,
+            |found| found.login == "another@example.invalid",
+            |_| consumed.set(true),
+        )
+        .unwrap(),
+        Err(Withheld::NoMailbox)
+    );
+    assert!(
+        !consumed.get(),
+        "changed binding exposed a credential bundle"
+    );
+    assert!(
+        !observers
+            .path()
+            .join("refused-bundles/reveals.jsonl")
+            .exists(),
+        "binding was refused before a Secret opened"
+    );
+    assert_eq!(
+        mail::reveal_bound(
+            &remote,
+            &journal,
+            &mailbox,
+            &[Credential::Password, Credential::MailboxPassword],
+            1_000,
+            |found| found.login == "owner@example.invalid",
+            |_| consumed.set(true),
+        )
+        .unwrap(),
+        Err(Withheld::NotSet)
+    );
+    assert!(
+        !consumed.get(),
+        "a missing later part exposed an earlier credential"
+    );
+    Handle::at(lab.paths[1].clone(), &REGISTRY)
+        .commit_sealed_until(false, crate::admission::deadline(), |_, sealer| {
+            let password = sealer.seal(
+                "address",
+                &login,
+                "password",
+                &Secret::new("fixture-reverse-password".into()),
+            )?;
+            let totp = sealer.seal(
+                "mailbox",
+                &mailbox,
+                "totp",
+                &Secret::new(SECOND_TOTP.into()),
+            )?;
+            Ok((
+                (),
+                vec![vec![
+                    put(&ADDRESS, &login, "password", json!(password)),
+                    put(&MAILBOX, &mailbox, "totp", json!(totp)),
+                ]],
+            ))
+        })
+        .unwrap();
+    let second_count = remote.view().unwrap().ops.len();
+    owner_progress.wait_for(
+        table.digest(),
+        second_count,
+        "original owner receives the reverse write",
+    );
+    check(&source, 0, "fixture-reverse-password", SECOND_TOTP);
+    owner.stop();
+    receiver.stop();
+    let inventory = |registry: &Registry| {
+        registry
+            .view()
+            .unwrap()
+            .ops
+            .into_iter()
+            .map(|o| o.id)
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        inventory(&source),
+        inventory(&remote),
+        "bidirectional equality uses authenticated operation ids"
+    );
+    for (machine, registry) in [(0, &source), (1, &remote)] {
+        check(registry, machine, "fixture-reverse-password", SECOND_TOTP);
+    }
+
+    let (owner, _) = start(&lab, observers.path(), 0, port);
+    let (receiver, progress) = start(&lab, observers.path(), 1, port);
+    source
+        .write(vec![vec![put(
+            &MAILBOX,
+            &mailbox,
+            "label",
+            json!("changed-after-restart"),
+        )]])
+        .unwrap();
+    progress.wait_for(
+        table.digest(),
+        source.view().unwrap().ops.len(),
+        "restarted owners resume automatic repair",
+    );
+    receiver.stop();
+    owner.stop();
+    assert_eq!(inventory(&source), inventory(&remote));
+    assert_eq!(
+        mail::sign_in_mailboxes(&remote).unwrap()[0].label,
+        "changed-after-restart"
+    );
+    check(&remote, 1, "fixture-reverse-password", SECOND_TOTP);
 }

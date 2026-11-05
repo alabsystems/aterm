@@ -929,16 +929,22 @@ impl ThemeCatalog {
                 }
                 Err(_) => continue,
             };
-            if entry.path().extension() != Some(std::ffi::OsStr::new("conf")) {
+            if std::path::Path::new(&entry.file_name()).extension()
+                != Some(std::ffi::OsStr::new("conf"))
+            {
                 continue;
             }
-            if file_type.is_symlink() {
-                links.insert(entry.path());
-            } else if !file_type.is_file() {
+            let entry_path = if file_type.is_symlink() {
+                let entry_path = entry.path();
+                links.insert(entry_path.clone());
+                entry_path
+            } else if file_type.is_file() {
+                entry.path()
+            } else {
                 continue;
-            }
+            };
             seen = seen.saturating_add(1);
-            candidates.insert(entry.path());
+            candidates.insert(entry_path);
             if candidates.len() > caps.candidates {
                 candidates.pop_last();
                 truncated = true;
@@ -9612,7 +9618,7 @@ mod cfg_engine_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, "# comment-only generation\n").unwrap();
+        crate::test_scratch::write_config(&path, "# comment-only generation\n");
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .unwrap();
@@ -9648,7 +9654,7 @@ mod cfg_engine_tests {
 
     fn apply_config_text(app: &mut crate::App, dir: &std::path::Path, text: &str) {
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, text).expect("write config");
+        crate::test_scratch::write_config(&path, text);
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .expect("observe");

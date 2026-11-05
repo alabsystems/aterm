@@ -98,7 +98,7 @@ fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
             "machine": chip(),
             "measurement": measurement,
         });
-        std::fs::write(path, format!("{report}\n"))
+        crate::write_fresh(path, format!("{report}\n"))
             .map_err(|error| format!("could not write {}: {error}", path.display()))?;
         Ok(format!("{summary}; report in {}", path.display()))
     } else {

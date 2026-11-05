@@ -10,7 +10,7 @@
 use crate::commons::binding::{BINDING_LEN, Binding};
 use crate::commons::roster::Member;
 use crate::{Error, Result};
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 
 const MAGIC: &[u8; 4] = b"ACA1";
 const DOMAIN: &[u8] = b"aterm/alab/allowed/1\0";
@@ -80,9 +80,9 @@ impl Allowed {
         if &signer == binding.writer() {
             return Err(Error::new("an Allowed is signed by the Mac it allows"));
         }
-        UnparsedPublicKey::new(&ED25519, signer)
-            .verify(&[DOMAIN, &wire[..at]].concat(), &wire[at..])
-            .map_err(|_| Error::new("an Allowed's signature failed"))?;
+        if !crate::ed25519::verifies(&signer, &[DOMAIN, &wire[..at]].concat(), &wire[at..]) {
+            return Err(Error::new("an Allowed's signature failed"));
+        }
         Ok(Self {
             binding,
             signer,

@@ -477,12 +477,13 @@ fn git_helper() -> String {
 }
 
 fn segment(text: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(text.len());
     for b in text.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
     }
     out
@@ -548,26 +549,25 @@ fn release_of(object: &Value) -> Result<Release, HostError> {
 }
 
 fn asset_of(object: &Value, name: &str) -> Result<(u64, u64), HostError> {
-    let named: Vec<&Value> = object["assets"]
+    let mut named = object["assets"]
         .as_array()
-        .map(|assets| {
-            assets
-                .iter()
-                .filter(|a| a["name"].as_str() == Some(name))
-                .collect()
-        })
-        .unwrap_or_default();
-    match named.as_slice() {
-        [] => Err(HostError::NotFound),
-        [asset] => match (asset["id"].as_u64(), asset["size"].as_u64()) {
-            (Some(id), Some(size)) => Ok((id, size)),
-            _ => Err(HostError::Unreachable(format!(
-                "GitHub answered asset {name} with no id or size"
-            ))),
-        },
-        several => Err(HostError::Refused(format!(
+        .into_iter()
+        .flatten()
+        .filter(|a| a["name"].as_str() == Some(name));
+    let Some(asset) = named.next() else {
+        return Err(HostError::NotFound);
+    };
+    let extra = named.count();
+    if extra > 0 {
+        return Err(HostError::Refused(format!(
             "ambiguous: {} assets are named {name}",
-            several.len()
+            extra + 1
+        )));
+    }
+    match (asset["id"].as_u64(), asset["size"].as_u64()) {
+        (Some(id), Some(size)) => Ok((id, size)),
+        _ => Err(HostError::Unreachable(format!(
+            "GitHub answered asset {name} with no id or size"
         ))),
     }
 }
@@ -615,9 +615,10 @@ impl ReleaseHost for RestHost {
                     let _ = std::fs::remove_file(&part);
                     host_error(&e)
                 })?;
-            let got = std::fs::metadata(&part)
-                .map(|m| m.len())
-                .unwrap_or(u64::MAX);
+            let got = std::fs::symlink_metadata(&part)
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .map_or(u64::MAX, |m| m.len());
             if got != size {
                 let _ = std::fs::remove_file(&part);
                 return Err(HostError::Unreachable(format!(

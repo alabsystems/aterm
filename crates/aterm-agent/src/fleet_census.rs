@@ -172,20 +172,110 @@ pub struct CensusSummary {
     pub unlabeled: usize,
     /// Distinct nodes/recipients claiming the same canonical `m<N>` label (`P5` target: `0`).
     pub label_conflicts: usize,
-    /// P3 account shortfall count (`"short by N accounts"`, `0` when pool covers active demand).
+    /// P3's `"short by N accounts"`: how many of [`Self::shortfall`] there are.
     pub shortfall_accounts: usize,
-    /// P3 session-hours lost to account shortfall in the 7-day window.
-    pub shortfall_hours: u64,
+    /// Each CLI of a Mac with sessions, heard within a day, whose every signed-in account is at a
+    /// wall (`"m2 claude"`): one more account there is what would let it move. Read from what the
+    /// Macs report, so it needs no pool file, and a Mac that says nothing counts for nothing. It
+    /// is the wall now, not P3's session-hours at a wall, which nothing measures yet
+    /// (`ATERM-KI-1104-14`). A session's CLI is not on the wire, so whether one wants that CLI now
+    /// is not read: a wall says it was used up within its window.
+    pub shortfall: Vec<String>,
+    /// Whether rotation can happen and has ([`RotationSummary`]); `None` from a census written
+    /// before it was reported.
+    pub rotation: Option<RotationSummary>,
+}
+
+/// Whether rotation can happen across the fleet, and has, from what the Macs with sessions report:
+/// the plain answer to "has this worked?", which a roster or a pool of accounts cannot give.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RotationSummary {
+    /// Macs with sessions heard within a day.
+    pub macs: usize,
+    /// Those that could not read a pool, whose rows of it are unknown, never none.
+    pub unread: usize,
+    /// Those holding two or more rows of one CLI that do not read signed out: the condition of
+    /// rotating at all. A row's login is not proved to work until a session runs on it, so only
+    /// [`Self::moved_7d`] and [`Self::last_move`] say rotation worked.
+    pub two_logins: Vec<String>,
+    /// Those reporting moves, which have the build for it and could read their ledgers.
+    pub reporting: usize,
+    /// Those on which a session proved a row a rotation chose, in the last seven days.
+    pub moved_7d: usize,
+    /// Those that tried more rotations than a session proved, in the last seven days: the move
+    /// failed or nothing has run on its row yet.
+    pub unproven_7d: usize,
+    /// The newest proved rotation any of them keeps, Unix seconds.
+    pub last_move: Option<i64>,
+}
+
+/// How many Macs a census line names before it says how many more there are.
+const NAMED_MAX: usize = 12;
+
+fn named(items: &[String]) -> String {
+    let shown = items
+        .iter()
+        .take(NAMED_MAX)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match items.len().saturating_sub(NAMED_MAX) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
+}
+
+impl RotationSummary {
+    /// The census's line.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let can = if self.two_logins.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", named(&self.two_logins))
+        };
+        let unread = match self.unread {
+            0 => String::new(),
+            n => format!(", {n} of them could not read a pool"),
+        };
+        let moved = if self.reporting == 0 {
+            "whether any has moved is unknown: none of them reports it".to_owned()
+        } else {
+            let unproven = match self.unproven_7d {
+                0 => String::new(),
+                n => format!(" ({n} tried with no proof it worked)"),
+            };
+            format!(
+                "{} of the {} that report moves moved in 7 days{unproven}, last {}",
+                self.moved_7d,
+                self.reporting,
+                self.last_move
+                    .map_or_else(|| "never".to_owned(), crate::harness::usage::rfc3339_utc),
+            )
+        };
+        format!(
+            "rotation: {} of {} Macs with sessions hold two signed-in accounts of one CLI{can}\
+             {unread}; {moved}",
+            self.two_logins.len(),
+            self.macs,
+        )
+    }
 }
 
 impl CensusSummary {
-    /// Canonical P3 shortfall phrase (`"short by N accounts"`).
+    /// Canonical P3 shortfall phrase (`"short by N accounts"`), naming who.
     #[must_use]
     pub fn shortfall_line(&self) -> String {
-        format!(
-            "short by {} accounts ({}h lost to shortfall)",
-            self.shortfall_accounts, self.shortfall_hours
-        )
+        let n = self.shortfall_accounts;
+        let plural = if n == 1 { "" } else { "s" };
+        if self.shortfall.is_empty() {
+            format!("short by {n} account{plural}")
+        } else {
+            format!(
+                "short by {n} account{plural} (every signed-in account of the CLI at a wall: {})",
+                named(&self.shortfall)
+            )
+        }
     }
 }
 
@@ -274,8 +364,6 @@ pub struct CensusInputs {
     pub claims_view: claims::View,
     /// Bonjour LAN hosts (`_ssh._tcp`, `_rfb._tcp`, `_alab._tcp`).
     pub bonjour_hosts: Vec<BonjourHostInput>,
-    /// Additional session-hours lost to pool shortfall observed from journals (P3).
-    pub journal_shortfall_hours: u64,
 }
 
 fn label_sort_key(label: &str) -> (u8, u32, String) {
@@ -288,6 +376,68 @@ fn label_sort_key(label: &str) -> (u8, u32, String) {
 
 fn heard_within(now: u64, at: u64, within: u64) -> bool {
     now.checked_sub(at).is_some_and(|age| age <= within)
+}
+
+/// The strings of a JSON array, none where it is absent.
+fn strings_of(value: Option<&aterm_json::Value>) -> Vec<String> {
+    value
+        .and_then(aterm_json::Value::as_array)
+        .map_or_else(Vec::new, |items| {
+            items
+                .iter()
+                .filter_map(aterm_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+}
+
+/// P3's shortfall and [`RotationSummary`], from the Macs with sessions heard within a day: each
+/// counts a row as signed in where its Mac reports a login and no sign-out.
+fn rotation_of(
+    heartbeats: &BTreeMap<String, &HeartbeatInput>,
+    now_s: u64,
+    now_i64: i64,
+) -> (Vec<String>, RotationSummary) {
+    let mut labels: Vec<&String> = heartbeats.keys().collect();
+    labels.sort_by_key(|label| label_sort_key(label));
+    let mut shortfall = Vec::new();
+    let mut rotation = RotationSummary::default();
+    for label in labels {
+        let hb = heartbeats[label];
+        if hb.facts.sessions == 0
+            || !hb
+                .received_at
+                .is_some_and(|at| heard_within(now_s, at, HEARD_24H_S))
+        {
+            continue;
+        }
+        rotation.macs += 1;
+        rotation.unread += usize::from(!hb.facts.accounts_unread.is_empty());
+        let mut pools: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for acc in &hb.facts.accounts {
+            if acc.enrolled && acc.condition != "signed-out" {
+                let (signed_in, walled) = pools.entry(acc.pool.as_str()).or_default();
+                *signed_in += 1;
+                *walled += usize::from(account_is_walled(acc, now_i64));
+            }
+        }
+        if pools.values().any(|(signed_in, _)| *signed_in >= 2) {
+            rotation.two_logins.push(label.clone());
+        }
+        shortfall.extend(
+            pools
+                .iter()
+                .filter(|(_, (signed_in, walled))| signed_in == walled)
+                .map(|(pool, _)| format!("{label} {pool}")),
+        );
+        if let Some(moves) = hb.facts.moves {
+            rotation.reporting += 1;
+            rotation.moved_7d += usize::from(moves.proven_7d > 0);
+            rotation.unproven_7d += usize::from(moves.tried_7d > moves.proven_7d);
+            rotation.last_move = rotation.last_move.max(moves.last);
+        }
+    }
+    (shortfall, rotation)
 }
 
 fn account_is_walled(acc: &crate::survey_facts::SurveyAccountFact, now_i64: i64) -> bool {
@@ -769,7 +919,7 @@ impl SwarmCensus {
         });
         stragglers.dedup_by(|a, b| a.name.eq_ignore_ascii_case(&b.name));
 
-        // Member summaries and P3 supply read the same selected, un-denied heartbeats.
+        // Member summaries and P3 read the same selected, un-denied heartbeats.
         let mut walled_pool_emails: BTreeSet<(String, String)> = BTreeSet::new();
         for hb in hb_by_label.values() {
             for acc in &hb.facts.accounts {
@@ -785,24 +935,6 @@ impl SwarmCensus {
         ordered_labels.sort_by_key(|lbl| label_sort_key(lbl));
 
         let mut members = Vec::with_capacity(ordered_labels.len());
-        let mut active_leased_demand = 0usize;
-        let mut unwalled_pool_supply = 0usize;
-        if let Some(pool) = &inputs.pool {
-            for acc in &pool.accounts {
-                let provider = acc.provider_str().to_ascii_lowercase();
-                let id_key = acc
-                    .label
-                    .as_deref()
-                    .unwrap_or(&acc.email)
-                    .to_ascii_lowercase();
-                let email_key = acc.email.to_ascii_lowercase();
-                if !walled_pool_emails.contains(&(provider.clone(), id_key))
-                    && !walled_pool_emails.contains(&(provider, email_key))
-                {
-                    unwalled_pool_supply += 1;
-                }
-            }
-        }
 
         let active_claims = claims::Book::of(
             inputs
@@ -890,7 +1022,6 @@ impl SwarmCensus {
                     })
                 })
                 .count();
-            active_leased_demand += leased;
 
             let window = hb.is_some_and(|h| h.facts.window);
             let window_last = hb
@@ -988,20 +1119,7 @@ impl SwarmCensus {
             .commons_member_count
             .unwrap_or_else(|| members.iter().filter(|m| m.in_commons).count());
 
-        // P3 shortfall: active session demand beyond unwalled pool supply.
-        let active_session_demand = members
-            .iter()
-            .filter(|m| m.sessions > 0)
-            .count()
-            .max(active_leased_demand);
-        let shortfall_accounts = if inputs.pool.is_some() {
-            active_session_demand.saturating_sub(unwalled_pool_supply)
-        } else {
-            0
-        };
-        let shortfall_hours = inputs
-            .journal_shortfall_hours
-            .max(shortfall_accounts as u64);
+        let (shortfall, rotation) = rotation_of(&hb_by_label, now_s, now_i64);
 
         let steward = inputs
             .steward
@@ -1023,8 +1141,9 @@ impl SwarmCensus {
                 converge_failed_24h,
                 unlabeled,
                 label_conflicts,
-                shortfall_accounts,
-                shortfall_hours,
+                shortfall_accounts: shortfall.len(),
+                shortfall,
+                rotation: Some(rotation),
             },
         }
     }
@@ -1151,7 +1270,27 @@ impl SwarmCensus {
             "shortfall_accounts".to_owned(),
             Value::from(s.shortfall_accounts as u64),
         );
-        sum.insert("shortfall_hours".to_owned(), Value::from(s.shortfall_hours));
+        sum.insert(
+            "shortfall".to_owned(),
+            Value::Array(s.shortfall.iter().cloned().map(Value::String).collect()),
+        );
+        if let Some(r) = &s.rotation {
+            let mut rotation = aterm_json::Map::new();
+            rotation.insert("macs".to_owned(), Value::from(r.macs as u64));
+            rotation.insert("unread".to_owned(), Value::from(r.unread as u64));
+            rotation.insert(
+                "two_logins".to_owned(),
+                Value::Array(r.two_logins.iter().cloned().map(Value::String).collect()),
+            );
+            rotation.insert("reporting".to_owned(), Value::from(r.reporting as u64));
+            rotation.insert("moved_7d".to_owned(), Value::from(r.moved_7d as u64));
+            rotation.insert("unproven_7d".to_owned(), Value::from(r.unproven_7d as u64));
+            rotation.insert(
+                "last_move".to_owned(),
+                r.last_move.map_or(Value::Null, Value::from),
+            );
+            sum.insert("rotation".to_owned(), Value::Object(rotation));
+        }
         sum.insert(
             "shortfall_text".to_owned(),
             Value::String(s.shortfall_line()),
@@ -1330,7 +1469,20 @@ impl SwarmCensus {
             unlabeled: to_usize(u("unlabeled")),
             label_conflicts: to_usize(u("label_conflicts")),
             shortfall_accounts: to_usize(u("shortfall_accounts")),
-            shortfall_hours: u("shortfall_hours"),
+            shortfall: strings_of(sum.and_then(|s| s.get("shortfall"))),
+            rotation: sum.and_then(|s| s.get("rotation")).map(|r| {
+                let n =
+                    |k: &str| to_usize(r.get(k).and_then(aterm_json::Value::as_u64).unwrap_or(0));
+                RotationSummary {
+                    macs: n("macs"),
+                    unread: n("unread"),
+                    two_logins: strings_of(r.get("two_logins")),
+                    reporting: n("reporting"),
+                    moved_7d: n("moved_7d"),
+                    unproven_7d: n("unproven_7d"),
+                    last_move: r.get("last_move").and_then(aterm_json::Value::as_i64),
+                }
+            }),
         };
 
         Ok(Self {
@@ -1375,6 +1527,9 @@ impl SwarmCensus {
             self.summary.unlabeled,
             self.summary.label_conflicts,
         );
+        if let Some(rotation) = &self.summary.rotation {
+            let _ = writeln!(out, "{}", rotation.line());
+        }
         let _ = writeln!(
             out,
             "POOL    VERSION         WINDOW  SESSIONS  WARM/LEASED/WALLED  ELIGIBLE  CONVERGE  LAST_SEEN  FACTS_AT  FLEET_NAME"
@@ -1489,50 +1644,35 @@ pub fn write_cached_census(state_dir: &Path, census: &SwarmCensus) -> Result<Str
     Ok(json)
 }
 
-/// Gather live [`CensusInputs`] on this Mac (`state_dir`, `home_dir`) at `now_s`.
+/// This Mac's book as the census lists it ([`listed_book`]).
 #[cfg(unix)]
-#[must_use]
-pub fn collect_local_census_inputs(
+struct ListedBook {
+    /// The book's peers, with each node only the copy of its issuer's book names.
+    peers: Vec<aterm_net::fleet_member::Peer>,
+    /// The node of the issuer the book names, and the copy of its book.
+    issuer: Option<String>,
+    issuer_copies: Vec<aterm_net::fleet_member::Peer>,
+    /// This Mac's own node identity.
+    own: Option<aterm_net::fleet::NodeIdentity>,
+}
+
+/// This Mac's book (`state_dir`) as the census lists it, judged by the vault's `roster` and the
+/// membership log `log`: each roster member's node id is bound by this book where the roster
+/// names its key alone, and a peer or member the deny list or the log holds out is added to the
+/// roster's deny list, which the census prunes stored survey facts for, and listed no more. A log
+/// this Mac cannot read now ([`aterm_net::fleet_member::MemberKeys::unreadable`]) judges no key:
+/// it lists no keyed peer but this Mac's own and adds no one to the deny list, so no survey
+/// facts go for its sake.
+#[cfg(unix)]
+fn listed_book(
     state_dir: &Path,
-    home_dir: Option<&Path>,
-    bonjour_hosts: Vec<BonjourHostInput>,
-    now_s: u64,
-) -> CensusInputs {
-    use aterm_net::fleet_member::{Via, read_admitted_pushed_facts, read_issuer_book, read_peers};
+    roster: &mut aterm_secrets::swarm_roster::SwarmRoster,
+    log: Option<&aterm_net::fleet_member::MemberKeys>,
+) -> ListedBook {
+    use aterm_net::fleet_member::{Via, read_issuer_book, read_peers};
 
-    let config_path = home_dir.map(|h| h.join(".config/aterm/aterm.toml"));
-    let steward = ai_pool::resolve_local_pool_identity(home_dir, config_path.as_deref(), None)
-        .map(|id| id.primary);
-
-    let mut roster = aterm_secrets::swarm_roster::SwarmRoster::default();
-    let mut log_keys = None;
-    let mut server_heard = Vec::new();
-    let mut pool = None;
-    let mut commons_labels = BTreeSet::new();
-    let mut commons_member_count = None;
-
-    let mut has_roster = false;
-    let home_paths = home_dir.map(aterm_secrets::client::Paths::for_home);
-    if let (Some(home), Some(paths)) = (home_dir, home_paths.as_ref()) {
-        if let Ok(Some(r)) = aterm_secrets::client::swarm_roster_now(paths) {
-            has_roster = !r.members.is_empty();
-            roster = r;
-        } else if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes_now(paths) {
-            roster.deny_nodes.extend(denied);
-            roster.canonicalize();
-        }
-        log_keys = crate::fleet_log::LocalLog::of(paths).keys();
-        for (vault, subject, at) in aterm_secrets::server::read_last_heard(&paths.served()) {
-            server_heard.push(ServerHeardFact { vault, subject, at });
-        }
-        let pool_path = home.join(".secrets").join(ai_pool::AI_POOL_FILE);
-        if let Some(raw) = read_regular_nofollow_bounded(&pool_path, CENSUS_FILE_MAX_BYTES)
-            && let Ok(parsed) = Pool::from_toml(&raw, &pool_path.display().to_string())
-        {
-            pool = Some(parsed);
-        }
-    }
-
+    let unread = log.is_some_and(|log| log.unread().is_some());
+    let log = log.filter(|_| !unread);
     let mut raw_peers = read_peers(state_dir).unwrap_or_default();
     let issuer_node = raw_peers
         .iter()
@@ -1553,6 +1693,9 @@ pub fn collect_local_census_inputs(
     let own_identity = aterm_net::fleet_member::read_node_identity(state_dir)
         .ok()
         .flatten();
+    let own_key = own_identity
+        .as_ref()
+        .map(aterm_net::fleet::NodeIdentity::key);
     for member in &mut roster.members {
         if member.node_id.is_none()
             && let Some(key_hex) = member.node_key.as_deref()
@@ -1571,7 +1714,7 @@ pub fn collect_local_census_inputs(
         }
     }
     let mut deny_nodes_changed = false;
-    if let Some(ref log) = log_keys {
+    if let Some(log) = log {
         let mut extra_denied = Vec::new();
         for member in &roster.members {
             if let Some(key_hex) = member.node_key.as_deref()
@@ -1591,7 +1734,7 @@ pub fn collect_local_census_inputs(
     }
     if let Some(ref own) = own_identity
         && (aterm_net::fleet::is_denied_key(&own.key(), &roster.deny_nodes)
-            || log_keys.as_ref().is_some_and(|l| l.holds_out(&own.key())))
+            || log.is_some_and(|l| l.holds_out(&own.key())))
     {
         roster.deny_nodes.push(own.node().to_ascii_lowercase());
         roster.deny_nodes.push(own.key().hex());
@@ -1601,7 +1744,7 @@ pub fn collect_local_census_inputs(
         peers.retain(|p| {
             let held_out = p.key.is_some_and(|k| {
                 aterm_net::fleet::is_denied_key(&k, &roster.deny_nodes)
-                    || log_keys.as_ref().is_some_and(|l| l.holds_out(&k))
+                    || log.is_some_and(|l| l.holds_out(&k))
             });
             if held_out {
                 if let Some(node) = p.node.as_deref() {
@@ -1613,7 +1756,9 @@ pub fn collect_local_census_inputs(
                     deny_nodes_changed = true;
                 }
             }
+            let unjudged = unread && p.key.is_some_and(|k| own_key != Some(k));
             !held_out
+                && !unjudged
                 && !p
                     .node
                     .as_deref()
@@ -1630,6 +1775,92 @@ pub fn collect_local_census_inputs(
             });
         }
     }
+    ListedBook {
+        peers: raw_peers,
+        issuer: issuer_node,
+        issuer_copies,
+        own: own_identity,
+    }
+}
+
+/// Gather live [`CensusInputs`] on this Mac (`state_dir`, `home_dir`) at `now_s`.
+///
+/// # Errors
+/// The roster or installed claims table is busy or cannot be read; the caller defers
+/// publishing this pass.
+#[cfg(unix)]
+pub fn collect_local_census_inputs(
+    state_dir: &Path,
+    home_dir: Option<&Path>,
+    bonjour_hosts: Vec<BonjourHostInput>,
+    now_s: u64,
+) -> Result<CensusInputs, String> {
+    collect_local_census_inputs_until(
+        state_dir,
+        home_dir,
+        bonjour_hosts,
+        now_s,
+        std::time::Instant::now() + std::time::Duration::from_millis(250),
+    )
+}
+
+#[cfg(unix)]
+fn collect_local_census_inputs_until(
+    state_dir: &Path,
+    home_dir: Option<&Path>,
+    bonjour_hosts: Vec<BonjourHostInput>,
+    now_s: u64,
+    deadline: std::time::Instant,
+) -> Result<CensusInputs, String> {
+    use aterm_net::fleet_member::{Via, read_admitted_pushed_facts};
+
+    let home_paths = home_dir.map(aterm_secrets::client::Paths::for_home);
+    let read_roster = home_paths
+        .as_ref()
+        .map(|paths| {
+            aterm_secrets::client::swarm_roster_until(paths, deadline)
+                .map_err(|why| format!("swarm roster unread: {why}"))
+        })
+        .transpose()?
+        .flatten();
+    let config_path = home_dir.map(|h| h.join(".config/aterm/aterm.toml"));
+    let steward = ai_pool::resolve_local_pool_identity(home_dir, config_path.as_deref(), None)?
+        .map(|id| id.primary);
+
+    let mut roster = aterm_secrets::swarm_roster::SwarmRoster::default();
+    let mut log_keys = None;
+    let mut server_heard = Vec::new();
+    let mut pool = None;
+    let mut commons_labels = BTreeSet::new();
+    let mut commons_member_count = None;
+
+    let mut has_roster = false;
+    if let (Some(home), Some(paths)) = (home_dir, home_paths.as_ref()) {
+        if let Some(r) = read_roster {
+            has_roster = !r.members.is_empty();
+            roster = r;
+        } else if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes_now(paths) {
+            roster.deny_nodes.extend(denied);
+            roster.canonicalize();
+        }
+        log_keys = crate::fleet_log::LocalLog::of(paths).keys();
+        for (vault, subject, at) in aterm_secrets::server::read_last_heard(&paths.served()) {
+            server_heard.push(ServerHeardFact { vault, subject, at });
+        }
+        let pool_path = home.join(".secrets").join(ai_pool::AI_POOL_FILE);
+        if let Some(raw) = read_regular_nofollow_bounded(&pool_path, CENSUS_FILE_MAX_BYTES)
+            && let Ok(parsed) = Pool::from_toml(&raw, &pool_path.display().to_string())
+        {
+            pool = Some(parsed);
+        }
+    }
+
+    let ListedBook {
+        peers: raw_peers,
+        issuer: issuer_node,
+        issuer_copies,
+        own: own_identity,
+    } = listed_book(state_dir, &mut roster, log_keys.as_deref());
     if let Some(ref paths) = home_paths
         && (paths.dir.join("commons").is_dir()
             || paths.records_data_file().is_ok_and(|path| path.is_file()))
@@ -1738,7 +1969,9 @@ pub fn collect_local_census_inputs(
         .is_some_and(|n| roster.is_node_denied(n))
         || own_identity.as_ref().is_some_and(|id| {
             roster.is_node_denied(&id.key().hex())
-                || log_keys.as_ref().is_some_and(|l| l.holds_out(&id.key()))
+                || log_keys
+                    .as_ref()
+                    .is_some_and(|l| l.unread().is_none() && l.holds_out(&id.key()))
         })
         || own_label_denied;
     if let Some(own) = &own_identity {
@@ -1806,9 +2039,13 @@ pub fn collect_local_census_inputs(
         }
     }
 
-    let (claims_view, claims) = home_dir.and_then(claims::read_book).unwrap_or_default();
+    let (claims_view, claims) = home_dir
+        .map(claims::read_book)
+        .transpose()?
+        .flatten()
+        .unwrap_or_default();
 
-    CensusInputs {
+    Ok(CensusInputs {
         now_s,
         steward,
         roster,
@@ -1822,14 +2059,13 @@ pub fn collect_local_census_inputs(
         claims,
         claims_view,
         bonjour_hosts,
-        journal_shortfall_hours: 0,
-    }
+    })
 }
 
 /// Recompute `<state_dir>/swarm-census.json` on this Mac and return it.
 ///
 /// # Errors
-/// Returns an error if persisting `<state_dir>/swarm-census.json` fails.
+/// The roster or installed claims table cannot be read, or persisting the census fails.
 #[cfg(unix)]
 pub fn refresh_local_census(
     state_dir: &Path,
@@ -1837,7 +2073,7 @@ pub fn refresh_local_census(
     bonjour_hosts: Vec<BonjourHostInput>,
     now_s: u64,
 ) -> Result<SwarmCensus, String> {
-    let inputs = collect_local_census_inputs(state_dir, home_dir, bonjour_hosts, now_s);
+    let inputs = collect_local_census_inputs(state_dir, home_dir, bonjour_hosts, now_s)?;
     let census = SwarmCensus::compute(&inputs);
     write_cached_census(state_dir, &census)?;
     Ok(census)
@@ -1845,13 +2081,16 @@ pub fn refresh_local_census(
 
 #[cfg(unix)]
 fn cached_census_admitted(cached: &SwarmCensus, state_dir: &Path, home_dir: Option<&Path>) -> bool {
-    use aterm_net::fleet_member::{Via, read_admitted_pushed_facts, read_issuer_book, read_peers};
+    use aterm_net::fleet_member::read_admitted_pushed_facts;
 
     let mut roster = aterm_secrets::swarm_roster::SwarmRoster::default();
     let mut log_keys = None;
     let home_paths = home_dir.map(aterm_secrets::client::Paths::for_home);
     if let Some(paths) = home_paths.as_ref() {
-        if let Ok(Some(r)) = aterm_secrets::client::swarm_roster_now(paths) {
+        let Ok(read) = crate::harness::ai_pool::read_pass_roster(paths) else {
+            return false;
+        };
+        if let Some(r) = read {
             roster = r;
         } else if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes_now(paths) {
             roster.deny_nodes.extend(denied);
@@ -1860,103 +2099,11 @@ fn cached_census_admitted(cached: &SwarmCensus, state_dir: &Path, home_dir: Opti
         log_keys = crate::fleet_log::LocalLog::of(paths).keys();
     }
 
-    let mut raw_peers = read_peers(state_dir).unwrap_or_default();
-    let issuer_node = raw_peers
-        .iter()
-        .find(|p| p.via == Via::Issuer)
-        .and_then(|p| p.node.clone());
-    let mut issuer_copies = issuer_node
-        .as_deref()
-        .map(|issuer| read_issuer_book(state_dir, issuer))
-        .unwrap_or_default();
-    for copy in &issuer_copies {
-        if !raw_peers
-            .iter()
-            .any(|p| p.node == copy.node && p.node.is_some())
-        {
-            raw_peers.push(copy.clone());
-        }
-    }
-    let own_identity = aterm_net::fleet_member::read_node_identity(state_dir)
-        .ok()
-        .flatten();
-    for member in &mut roster.members {
-        if member.node_id.is_none()
-            && let Some(key_hex) = member.node_key.as_deref()
-        {
-            if let Some(ref own) = own_identity
-                && own.key().hex().eq_ignore_ascii_case(key_hex)
-            {
-                member.node_id = Some(own.node().to_owned());
-            } else if let Some(node) = raw_peers
-                .iter()
-                .find(|p| p.key.is_some_and(|k| k.hex().eq_ignore_ascii_case(key_hex)))
-                .and_then(|p| p.node.clone())
-            {
-                member.node_id = Some(node);
-            }
-        }
-    }
-    let mut deny_nodes_changed = false;
-    if let Some(ref log) = log_keys {
-        let mut extra_denied = Vec::new();
-        for member in &roster.members {
-            if let Some(key_hex) = member.node_key.as_deref()
-                && let Some(key) = aterm_net::fleet::NodeKey::from_hex(key_hex.trim_ascii())
-                && log.holds_out(&key)
-            {
-                extra_denied.push(key.hex());
-                if let Some(node) = member.node_id.as_deref() {
-                    extra_denied.push(node.trim_ascii().to_ascii_lowercase());
-                }
-            }
-        }
-        if !extra_denied.is_empty() {
-            roster.deny_nodes.extend(extra_denied);
-            deny_nodes_changed = true;
-        }
-    }
-    if let Some(ref own) = own_identity
-        && (aterm_net::fleet::is_denied_key(&own.key(), &roster.deny_nodes)
-            || log_keys.as_ref().is_some_and(|l| l.holds_out(&own.key())))
-    {
-        roster.deny_nodes.push(own.node().to_ascii_lowercase());
-        roster.deny_nodes.push(own.key().hex());
-        deny_nodes_changed = true;
-    }
-    for peers in [&mut raw_peers, &mut issuer_copies] {
-        peers.retain(|p| {
-            let held_out = p.key.is_some_and(|k| {
-                aterm_net::fleet::is_denied_key(&k, &roster.deny_nodes)
-                    || log_keys.as_ref().is_some_and(|l| l.holds_out(&k))
-            });
-            if held_out {
-                if let Some(node) = p.node.as_deref() {
-                    roster.deny_nodes.push(node.to_ascii_lowercase());
-                    deny_nodes_changed = true;
-                }
-                if let Some(key) = p.key {
-                    roster.deny_nodes.push(key.hex());
-                    deny_nodes_changed = true;
-                }
-            }
-            !held_out
-                && !p
-                    .node
-                    .as_deref()
-                    .is_some_and(|n| aterm_net::fleet::is_denied_node(n, &roster.deny_nodes))
-        });
-    }
-    if deny_nodes_changed {
-        roster.canonicalize();
-        for peers in [&mut raw_peers, &mut issuer_copies] {
-            peers.retain(|p| {
-                !p.node
-                    .as_deref()
-                    .is_some_and(|n| aterm_net::fleet::is_denied_node(n, &roster.deny_nodes))
-            });
-        }
-    }
+    let ListedBook {
+        peers: raw_peers,
+        own: own_identity,
+        ..
+    } = listed_book(state_dir, &mut roster, log_keys.as_deref());
 
     let all_facts_count = aterm_net::fleet_member::read_pushed_facts(state_dir).len();
     let admitted_facts = read_admitted_pushed_facts(
@@ -2009,7 +2156,7 @@ fn cached_census_admitted(cached: &SwarmCensus, state_dir: &Path, home_dir: Opti
 /// census of its own book (C24; `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1, F17).
 ///
 /// # Errors
-/// An I/O error message if caching fails.
+/// The roster or installed claims table cannot be read, or caching the census fails.
 #[cfg(unix)]
 pub fn serve_fleet_census(
     state_dir: &Path,
@@ -2024,7 +2171,7 @@ pub fn serve_fleet_census(
     {
         return Ok(cached.to_json());
     }
-    let inputs = collect_local_census_inputs(state_dir, home_dir, Vec::new(), now_s);
+    let inputs = collect_local_census_inputs(state_dir, home_dir, Vec::new(), now_s)?;
     let census = SwarmCensus::compute(&inputs);
     write_cached_census(state_dir, &census)
 }
@@ -2034,7 +2181,7 @@ pub fn serve_fleet_census(
 /// `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1, F17: no Mac dials another for it).
 ///
 /// # Errors
-/// Returns why the census could not be cached.
+/// The roster or installed claims table cannot be read, or caching the census fails.
 #[cfg(unix)]
 pub fn read_or_compute_census(
     state_dir: &Path,

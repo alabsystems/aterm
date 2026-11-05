@@ -279,8 +279,8 @@ pub fn newest_transcript(run: &Run) -> Option<PathBuf> {
         .into_iter()
         .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
         .filter_map(|p| {
-            let f = crate::sys::scratch_file(&p).ok()??;
-            let t = f.metadata().and_then(|m| m.modified()).ok()?;
+            let (_, meta) = crate::sys::scratch_file_with_meta(&p).ok()??;
+            let t = meta.modified().ok()?;
             Some((t, p))
         })
         .max()

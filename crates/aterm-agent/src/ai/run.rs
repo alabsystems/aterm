@@ -55,7 +55,8 @@ impl RunDir {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            open.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         let mut f = open.open(&path)?;
         f.write_all(text.as_bytes())?;
@@ -100,13 +101,17 @@ fn sweep(root: &Path) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
+    let own_pid = std::process::id();
     for e in entries.flatten() {
         if !e.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
         }
-        let name = e.file_name().to_string_lossy().into_owned();
-        let pid = name.split('-').next().and_then(crate::parse_uint::<u32>);
-        if pid.is_some_and(|p| p != std::process::id() && !aterm_uds::process::pid_alive(p)) {
+        let name = e.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|s| s.split('-').next())
+            .and_then(crate::parse_uint::<u32>);
+        if pid.is_some_and(|p| p != own_pid && !aterm_uds::process::pid_alive(p)) {
             let _ = std::fs::remove_dir_all(e.path());
         }
     }

@@ -17,7 +17,7 @@ pub const RAN: &str = aterm_uds::deadline::RAN;
 
 /// Say, in `copy` (the directory [`own_copy`] names), that this keeper runs from it.
 pub fn mark_ran(copy: &Path) {
-    if let Err(e) = std::fs::write(copy.join(RAN), b"") {
+    if let Err(e) = aterm_uds::deadline::try_mark_ran(copy) {
         eprintln!(
             "aterm keeper: cannot mark {} as run from: {e}",
             copy.display()
@@ -154,19 +154,51 @@ fn copy_own_code(exe: &Path, dir: &Path, identity: &Identity) -> Result<Copy, St
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
-    let meta = std::fs::symlink_metadata(src)?;
-    let kind = meta.file_type();
+    copy_tree_kind(src, dst, std::fs::symlink_metadata(src)?.file_type())
+}
+
+fn copy_tree_kind(src: &Path, dst: &Path, kind: std::fs::FileType) -> io::Result<()> {
     if kind.is_symlink() {
         std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)
     } else if kind.is_dir() {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let meta = std::fs::symlink_metadata(src)?;
         std::fs::create_dir(dst)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
-            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+            let ft = entry.file_type()?;
+            copy_tree_kind(&entry.path(), &dst.join(entry.file_name()), ft)?;
         }
-        std::fs::set_permissions(dst, meta.permissions())
+        let dir_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+            .open(dst)?;
+        let perms = meta.permissions();
+        if dir_fd
+            .metadata()
+            .is_ok_and(|m| m.permissions().mode() & 0o7777 == perms.mode() & 0o7777)
+        {
+            return Ok(());
+        }
+        dir_fd.set_permissions(perms)
     } else if kind.is_file() {
-        std::fs::copy(src, dst).map(drop)
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let (mut source, src_meta) = aterm_uds::regular_file::open(src)?;
+        let perms = src_meta.permissions();
+        let mut sink = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(perms.mode())
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+            .open(dst)?;
+        std::io::copy(&mut source, &mut sink)?;
+        if sink
+            .metadata()
+            .is_ok_and(|m| m.permissions().mode() & 0o7777 == perms.mode() & 0o7777)
+        {
+            return Ok(());
+        }
+        sink.set_permissions(perms)
     } else {
         Err(io::Error::other(format!(
             "{} is not a file, a directory or a link",

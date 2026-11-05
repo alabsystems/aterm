@@ -778,14 +778,16 @@ impl AuthEdit {
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
             .open(&path)
         {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(Error::could_not_run(format!("{what}: {e}"))),
         }
-        let (file, meta) = aterm_uds::private_file::open_private(&dirs.config, file)
-            .map_err(|e| as_load(Error::refused(format!("{what}: {e}"))))?;
+        let (file, meta) =
+            aterm_uds::kept_out(|| aterm_uds::private_file::open_private(&dirs.config, file))
+                .map_err(|e| as_load(Error::refused(format!("{what}: {e}"))))?;
         if meta.len() != 0 {
             let shown = tilde(&path, &dirs.home);
             return Err(
@@ -794,8 +796,6 @@ impl AuthEdit {
                 ),
             );
         }
-        aterm_uds::keep_out_of_children(&file)
-            .map_err(|e| Error::could_not_run(format!("{what}: {e}")))?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the auth transaction guard releases by LOCK_UN before closing"
@@ -960,6 +960,7 @@ fn stage_stdin(dirs: &Dirs, req: &AddRequest, token: &[u8]) -> Result<StagedToke
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(&path)
         .map_err(|e| {
             let shown = tilde(&path, &dirs.home);

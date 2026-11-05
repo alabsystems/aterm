@@ -99,6 +99,19 @@ fn coalesce(mut log: Log, paths: &Paths, active: &BTreeSet<Recipient>) -> (Log, 
     (log, minted)
 }
 
+/// Two concurrent epochs of `audience`: m22's wraps both Macs, m7's wraps m7 alone, so m22 holds
+/// only part of the newest keys. m22 (the partial holder) is not ranked and mints nothing; m7
+/// (which opens every newest epoch) coalesces them into one epoch that keeps the values and the
+/// Commons control. That epoch carries m22 too: m22 is a current seat that no `Remove` revoked,
+/// so the `Wrap` m7's fork never gave it was a gap, not a revocation (one-mesh M1, M4,
+/// `docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.2), and after the coalesce m22 opens the audience
+/// whole and nothing stays due there.
+///
+/// NEGATIVE CONTROL: the pre-one-mesh carry (`carried_audience_recipients` dropping every seat a
+/// newest epoch left out, as at 0.154.0) wraps the coalesced epoch to m7 alone: m22 stays left
+/// out of it and cannot open it, and the `audience_left_out_recipient` and
+/// `fully_unwrapped_audiences` assertions on m22 fail (0.154.0's version of this test asserted
+/// exactly that leaving out).
 fn partial_holder(audience: EpochAudience) {
     let _answering = ServersAnswering::set();
     let macs = two_macs(&[(Audience::Everyone, "shared", b"value")]);
@@ -156,8 +169,20 @@ fn partial_holder(audience: EpochAudience) {
                 b"value"
             );
         }
-        assert!(completed.audience_left_out_recipient(&audience, &partial.recipient()));
+        assert!(
+            !completed.audience_left_out_recipient(&audience, &partial.recipient()),
+            "the coalesce dropped a current seat a newest epoch only omitted"
+        );
         assert!(!completed.audience_left_out_recipient(&audience, &full.recipient()));
+        assert!(
+            completed
+                .open_audience_entries(&partial)
+                .unwrap()
+                .unwrap()
+                .fully_unwrapped_audiences
+                .contains(&audience),
+            "the partial holder does not open the coalesced epoch"
+        );
         assert!(
             completed
                 .rekey_dues()

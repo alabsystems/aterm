@@ -92,6 +92,7 @@ fn an_envelope_only_members_admission_observes_a_hidden_everyone_denial() {
     let host = crate::swarm_roster::SwarmRoster::default();
     let config = Config {
         source: Source::Url("http://127.0.0.1:1/v1/dual-roster".to_owned()),
+        mirrors: Vec::new(),
         name: "dual-roster".to_owned(),
         signer: Some(envelope::signer_public(&[31; 32]).unwrap()),
         followed: Vec::new(),

@@ -317,12 +317,21 @@ aterm-messages = { workspace = true }
 # those readers lives in that crate, so the host adds none.
 aterm-sysprobe = { workspace = true }
 aterm-vitals = { workspace = true }
+# The per-action telemetry row and its local log (Continuum TM-0): `telemetry_host`
+# writes a row for each command, agent call and spawn this window sees, from
+# readings it already takes, and answers the `telemetry` verb. Workspace crate.
+aterm-telemetry = { workspace = true }
 # The boot identity bounds delegated process ownership carried over live updates.
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 # The subtree walker: per-folder sizes and entry counts for `sys disk` and the
 # System panel, on the disk walker thread (`diskwalk_host`).
 aterm-diskwalk = { workspace = true }
 aterm-buffer = { path = "../aterm-buffer" }
+# What a hash table allocates (`heap::table_bytes`): the Rewind recorder charges
+# its pool for its image ledger's table by it, and the tests hold it to what this
+# crate's counting allocator sees a `HashMap` free (temporal.rs). Not a new edge
+# in the build graph: aterm-core links it.
+aterm-alloc = { workspace = true }
 aterm-grapheme = { workspace = true }
 aterm-codec = { workspace = true }
 aterm-pty = { workspace = true }
@@ -446,9 +455,6 @@ aterm-digest = { workspace = true }
 aterm-winres = { workspace = true }
 
 [dev-dependencies]
-# The hash-table size a keyframe's charge names (`heap::table_bytes`), held to
-# what this crate's counting allocator sees a `HashMap` free (temporal.rs).
-aterm-alloc = { workspace = true }
 # `verify perf throughput`'s corpus, for the `c_cut_cost` bench (a lib with no
 # dependencies of its own).
 aterm-bench = { path = "../aterm-bench" }
@@ -510,6 +516,9 @@ aterm-win32 = { workspace = true }
 # Windows since LW.3 (`present/win32.rs`, GDI over aterm-win32 above).
 
 [target.'cfg(unix)'.dependencies]
+# The mesh logs and their relay (docs/DESIGN-alab-one-mesh-2026-11-05.md §11 B7a): the node job
+# hosts tables.log and metrics.log, serves their `Bus` streams and relays them to its neighbours.
+aterm-mesh = { workspace = true }
 # `video frames` and the confined artifact store (`pinned_dir.rs`) open every
 # path component relative to a RETAINED directory descriptor and never re-resolve
 # a name afterwards. aterm-dirfd supplies those fd-relative `*at` wrappers over

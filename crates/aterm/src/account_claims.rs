@@ -124,7 +124,11 @@ impl Table for Commons {
         let read = aterm_db::accounts::claims::read(&paths).map_err(|why| why.to_string())?;
         let me = hex::encode_lower(&read.me);
         // One read of the swarm roster names the denied labels and the skewed peers alike.
-        let roster = aterm_secrets::client::swarm_roster(&paths).ok().flatten();
+        let roster = aterm_secrets::client::swarm_roster_until(
+            &paths,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .map_err(|why| why.to_string())?;
         let denied = roster
             .as_ref()
             .map(denied_swarm_labels_from_roster)

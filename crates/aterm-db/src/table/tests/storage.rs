@@ -57,12 +57,24 @@ fn ids(store: &Store, session: &Session<'_>) -> Vec<Digest> {
         .collect()
 }
 
-/// A populated table is reopened and read without changing its records. Run this alone when
-/// measuring: process CPU includes every test on this process. Timing is never a pass condition.
+/// A populated table is reopened and read without changing its records, with an open that writes
+/// and with an observation that does not.
 #[test]
+fn a_populated_table_reads_back_when_reopened_and_observed() {
+    populated_table_reads(0);
+}
+
+/// [`a_populated_table_reads_back_when_reopened_and_observed`] with what each read costs. Run it
+/// alone: process CPU includes every test on this process. Timing is never a pass condition.
+#[test]
+#[ignore = "isolated CPU measurement; run it alone with --ignored --nocapture"]
 fn a_populated_table_reopen_reports_its_cpu() {
+    populated_table_reads(64);
+}
+
+/// Two warm reads each way, then `measured` more whose cost it prints.
+fn populated_table_reads(measured: u32) {
     const RECORDS: usize = 128;
-    const MEASURED: u32 = 64;
     let lab = Lab::new(&[Role::Writer]);
     let root = aterm_tempfile::tempdir().unwrap();
     let path = root.path().join("table");
@@ -118,17 +130,20 @@ fn a_populated_table_reopen_reports_its_cpu() {
         for _ in 0..2 {
             read(observed);
         }
+        if measured == 0 {
+            continue;
+        }
         let before = process_cpu();
         let start = process_cpu();
         let overhead = start - before;
-        for _ in 0..MEASURED {
+        for _ in 0..measured {
             read(observed);
         }
         let elapsed = process_cpu() - start;
         let mode = if observed { "observe" } else { "reopen" };
         eprintln!(
-            "TABLE-READ {RECORDS} records, {mode} process CPU per read over {MEASURED} iterations: {:?} (CPU read {overhead:?})",
-            elapsed / MEASURED
+            "TABLE-READ {RECORDS} records, {mode} process CPU per read over {measured} iterations: {:?} (CPU read {overhead:?})",
+            elapsed / measured
         );
     }
 }

@@ -781,69 +781,158 @@ fn the_guards_cut_takes_no_go_ahead_join() {
     );
 }
 
-/// THE TURN'S LAST WORD ON NEEDS, READ OVER ITS EARLIER MESSAGES BY PARAGRAPH (the second review,
-/// 2026-11-01): the readers join a turn's messages with a blank line, so a paragraph that says no
-/// need stands retracts every need named before it, wherever it sits; a need said after it stands;
-/// one paragraph that names both keeps its need; a last message that says none retracts them all.
-/// The go-ahead reader's cut keeps the retracted part's prose without its needs.
-/// Negative control: [`standing_before`] reading the last message alone (the first round's rule)
-/// keeps the need an earlier paragraph retracted.
+/// THE AGENT'S WORD ON NEEDS (v6 §14.17.13, the post-landing review of 2026-11-02): the last
+/// message's own none retracts every need the turn's earlier messages named; a none in an earlier
+/// message, in the agent's own words, retracts the needs named before it in that same message and
+/// only those; quoted or fenced text is never the agent's word, and one paragraph that names a
+/// need and a none both keeps its need. Where the reader cannot tell the messages apart, the
+/// earlier messages are one. The go-ahead reader's cut keeps the prose of what was retracted,
+/// without its needs, and the fold's list ([`retracted_in`]) names what an earlier message took
+/// back. Negative controls: [`standing_before`] reading the earlier messages from the last
+/// paragraph that says none, quoted lines and message bounds aside (the rule of 2026-11-01 on
+/// `origin/main` `21b1e42025`), drops the lead's own need under a relayed worker's none (`[]`);
+/// reading only the last message (this branch's first cut, d55d270c1a) keeps a need its own
+/// message retracted.
 #[test]
-fn the_turns_last_word_on_needs_reads_its_earlier_messages_by_paragraph() {
+fn the_agents_word_on_needs_retracts_what_it_named_before_it() {
     let need = "./check.sh fails on main. NEEDS YOU: decide whether to delete tests/test_clock.sh.";
     let none = "The flake was mine: fixed it and pushed. NEEDS YOU: nothing";
-    let named = |before: &str, last: &str| {
-        standing_before(Some(before), last).map_or_else(Vec::new, needs_you)
+    let kept = ["decide whether to delete tests/test_clock.sh."];
+    let turn =
+        |messages: &[&str]| joined(Some(messages.iter().map(|m| (*m).to_string()).collect()));
+    let named = |messages: &[&str], last: &str| {
+        let (text, starts) = turn(messages);
+        let text = text.unwrap_or_default();
+        standing_before(Some(Before::new(&text, &starts)), last)
+            .map_or_else(Vec::new, |t| needs_you(&t))
     };
-    let retracted = format!("{need}\n\n{none}");
-    assert_eq!(named(&retracted, "LANDED"), Vec::<String>::new());
+    let lead = "NEEDS YOU: approve the notarization identity in Keychain Access (only you can \
+                unlock it)";
+    let lead_kept =
+        ["approve the notarization identity in Keychain Access (only you can unlock it)"];
+    let relayed = "@s-a reported:\n> Landed the fix on origin/main.\n> NEEDS YOU: nothing";
     assert_eq!(
-        standing_before(Some(&retracted), "LANDED"),
-        Some(none),
-        "the none is read, so a need an earlier point raised comes down"
+        named(&[lead, relayed], "Moving on to the docs while that waits."),
+        lead_kept,
+        "a relayed worker's quoted none, in a message of its own"
     );
-    assert!(says_no_needs(
-        standing_before(Some(&retracted), "LANDED").unwrap_or_default()
-    ));
+    assert_eq!(
+        named(&[&format!("{lead}\n\n{relayed}")], "Moving on."),
+        lead_kept,
+        "a relayed worker's quoted none, in the lead's own message"
+    );
     assert_eq!(
         named(
-            &format!("{retracted}\n\nNEEDS YOU: rotate the deploy key"),
-            "LANDED"
+            &[lead, "@s-a reported:\n\nNEEDS YOU: nothing"],
+            "Moving on."
         ),
-        ["rotate the deploy key"],
-        "a need after the retraction stands"
+        lead_kept,
+        "an unquoted none in a later message retracts nothing named before that message"
+    );
+    let fenced = format!("{lead}\n\n```\nNEEDS YOU: nothing\n```");
+    assert_eq!(named(&[&fenced], "Moving on."), lead_kept, "a fenced none");
+    assert_eq!(
+        named(&[&format!("{need}\n\n{none}")], "LANDED"),
+        Vec::<String>::new(),
+        "a none in the need's own message, after it"
     );
     assert_eq!(
-        named(&format!("{need}\nNEEDS YOU: nothing"), "LANDED"),
-        ["decide whether to delete tests/test_clock.sh."],
+        named(&[&format!("{none}\n\n{need}")], "LANDED"),
+        kept,
+        "a none before the need retracts nothing"
+    );
+    assert_eq!(
+        named(&[need, &format!("Then: {lead}\n\n{none}")], "LANDED"),
+        kept,
+        "only the needs of its own message"
+    );
+    assert_eq!(
+        named(&[&format!("{need}\nNEEDS YOU: nothing")], "LANDED"),
+        kept,
         "one paragraph that names both keeps its need"
     );
     assert_eq!(
-        named(need, "LANDED"),
-        ["decide whether to delete tests/test_clock.sh."]
+        named(&[need], "> NEEDS YOU: nothing"),
+        kept,
+        "a quoted last word"
+    );
+    assert_eq!(named(&[need], "LANDED"), kept);
+    assert_eq!(
+        named(&[need, relayed], "NEEDS YOU: nothing\nLANDED"),
+        Vec::<String>::new()
     );
     assert_eq!(
-        standing_before(Some(need), "NEEDS YOU: nothing\nLANDED"),
-        None
+        standing_before(Some(need.into()), "All done here.\n\nNEEDS YOU: nothing"),
+        None,
+        "the last message's own none retracts every earlier need"
     );
     assert_eq!(standing_before(None, "LANDED"), None);
-    // The go-ahead reader's view: the prose kept, the retracted need cut.
-    let cut = retracted_cut(&retracted, "LANDED");
-    assert!(
-        cut.contains("./check.sh fails on main.") && cut.contains("fixed it"),
-        "{cut}"
-    );
-    assert!(needs_you(&cut).is_empty(), "{cut}");
+    // Messages a reader cannot tell apart are one: the earlier none retracts the need above it.
+    let whole = format!("{need}\n\n{none}");
     assert_eq!(
-        retracted_cut(need, "LANDED"),
-        need,
+        standing_before(Some(whole.as_str().into()), "LANDED")
+            .map_or_else(Vec::new, |t| needs_you(&t)),
+        Vec::<String>::new()
+    );
+    // The fold's list: what an earlier message's own none took back, and nothing else.
+    let (text, starts) = turn(&[lead, &format!("{need}\n\n{none}"), relayed]);
+    let text = text.unwrap_or_default();
+    let before = Before::new(&text, &starts);
+    assert_eq!(retracted_in(before), kept);
+    // Cut at the front (the act's own rows), the messages are still told apart.
+    let rest = &text[lead.len() + 2..];
+    assert_eq!(retracted_in(before.past(rest)), kept);
+    assert_eq!(
+        standing_before(Some(before.past(rest)), "LANDED").map_or_else(Vec::new, |t| needs_you(&t)),
+        Vec::<String>::new()
+    );
+    // The go-ahead reader's view: the prose kept, the retracted need cut.
+    let separate = turn(&[need, none]);
+    let separate_text = separate.0.unwrap_or_default();
+    assert_eq!(
+        retracted_cut(Before::new(&separate_text, &separate.1), "LANDED"),
+        separate_text.as_str(),
         "nothing retracted, nothing cut"
     );
-    let all = retracted_cut(need, "NEEDS YOU: nothing");
+    let cut = retracted_cut(whole.as_str().into(), "LANDED");
     assert!(
-        all.contains("./check.sh fails on main.") && needs_you(&all).is_empty(),
+        cut.contains("./check.sh fails on main.")
+            && cut.contains("fixed it")
+            && needs_you(&cut).is_empty(),
+        "{cut}"
+    );
+    let all = retracted_cut(
+        Before::new(&separate_text, &separate.1),
+        "NEEDS YOU: nothing",
+    );
+    assert!(
+        all.contains("./check.sh fails on main.")
+            && all.contains("fixed it")
+            && needs_you(&all).is_empty(),
         "{all}"
     );
+}
+
+/// THE MESSAGES A READER JOINS ARE TOLD APART WHERE THEY STARTED ([`joined`], [`Before`]): each
+/// start is where a message opens in the joined text, a start the text cannot hold is none, and
+/// the joined text is the readers' own ([`aterm_phase::reader::join_messages`]).
+#[test]
+fn joined_messages_open_where_their_starts_say() {
+    let messages = vec![
+        "one\n\ntwo".to_string(),
+        "three".to_string(),
+        "four".to_string(),
+    ];
+    let (text, starts) = joined(Some(messages.clone()));
+    let text = text.unwrap_or_default();
+    assert_eq!(text, aterm_phase::reader::join_messages(&messages));
+    assert_eq!(
+        Before::new(&text, &starts).messages(),
+        ["one\n\ntwo", "three", "four"]
+    );
+    assert_eq!(Before::whole(&text).messages(), [text.as_str()]);
+    assert_eq!(Before::new(&text, &[0, 3, 999]).messages(), [text.as_str()]);
+    assert_eq!(joined(None), (None, Vec::new()));
 }
 
 /// A NEEDS YOU NAMED AS A NOUN IN ANOTHER CLAUSE IS NO NEED (2026-11-02, aterm 0.148.0: a Cruise
@@ -1102,7 +1191,7 @@ fn a_head_behind_no_determiner_or_past_a_separator_still_names_its_need() {
     for none in ["This turn's NEEDS YOU: none", "Today's NEEDS YOU: nothing"] {
         assert!(says_no_needs(none), "{none:?}");
         assert_eq!(
-            standing_before(Some("NEEDS YOU: approve the release."), none),
+            standing_before(Some("NEEDS YOU: approve the release.".into()), none),
             None,
             "{none:?}"
         );

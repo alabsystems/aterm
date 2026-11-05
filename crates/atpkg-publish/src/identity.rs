@@ -48,15 +48,24 @@ pub(crate) fn open_regular_nonblock(
 }
 
 pub(crate) fn read_regular_bytes(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
     let (file, meta) = open_regular_nonblock(path)?;
+    read_regular_file_bytes(file, &meta, max_bytes)
+}
+
+pub(crate) fn read_regular_file_bytes(
+    file: std::fs::File,
+    meta: &std::fs::Metadata,
+    max_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
     if meta.len() > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("file exceeds {max_bytes} bytes"),
         ));
     }
-    let mut buf = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
+    let cap = usize::try_from(meta.len().min(max_bytes).saturating_add(1)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut buf)?;
     if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
@@ -71,6 +80,38 @@ pub(crate) fn read_regular_bytes(path: &Path, max_bytes: u64) -> std::io::Result
 pub(crate) fn read_regular_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     let bytes = read_regular_bytes(path, max_bytes)?;
     String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+pub(crate) fn copy_regular_file(from: &Path, to: &Path) -> std::io::Result<std::fs::Metadata> {
+    let (mut reader, meta) = open_regular_nonblock(from)?;
+    let _ = std::fs::remove_file(to);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let mut writer = opts.open(to)?;
+    std::io::copy(&mut reader, &mut writer)?;
+    writer.set_permissions(meta.permissions())?;
+    Ok(meta)
+}
+
+#[cfg(unix)]
+pub(crate) fn set_regular_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
 }
 
 fn read_key_bytes(path: &Path) -> std::io::Result<Vec<u8>> {

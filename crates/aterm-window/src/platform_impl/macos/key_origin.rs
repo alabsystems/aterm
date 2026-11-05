@@ -4,35 +4,37 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! Retain the application's source-key classification across deferred window callbacks.
+//! Retain the application's source classification of a native key, click or scroll across
+//! deferred window callbacks.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use crate::platform::macos::NativeKeyEvent;
+use crate::event::InputOrigin;
+use crate::platform::macos::NativeInputEvent;
 
-static CLASSIFIER: OnceLock<fn(NativeKeyEvent) -> bool> = OnceLock::new();
+static CLASSIFIER: OnceLock<fn(NativeInputEvent) -> InputOrigin> = OnceLock::new();
 
 thread_local! {
-    /// The native key handler's decision, also restored while its callbacks run.
+    /// The native input handler's decision, also restored while its callbacks run.
     static SOURCE: Cell<Option<Origin>> = const { Cell::new(None) };
-    /// `None` outside a retained window callback, including a native key handler itself.
-    static DELIVERY: Cell<Option<bool>> = const { Cell::new(None) };
+    /// `None` outside a retained window callback, including a native input handler itself.
+    static DELIVERY: Cell<Option<InputOrigin>> = const { Cell::new(None) };
 }
 
 #[derive(Clone, Copy)]
 struct Origin {
-    key: Option<NativeKeyEvent>,
-    posted: bool,
+    event: Option<NativeInputEvent>,
+    origin: InputOrigin,
 }
 
-pub(crate) fn set_window_key_classifier(classifier: fn(NativeKeyEvent) -> bool) {
+pub(crate) fn set_window_input_classifier(classifier: fn(NativeInputEvent) -> InputOrigin) {
     let _ = CLASSIFIER.set(classifier);
 }
 
-pub(crate) fn window_event_posted() -> Option<bool> {
+pub(crate) fn window_event_origin() -> Option<InputOrigin> {
     DELIVERY.with(Cell::get)
 }
 
@@ -40,7 +42,7 @@ pub(crate) fn window_event_posted() -> Option<bool> {
 #[must_use]
 pub(super) struct Scope {
     prior: Option<Origin>,
-    prior_delivery: Option<bool>,
+    prior_delivery: Option<InputOrigin>,
     _thread: PhantomData<Rc<()>>,
 }
 
@@ -61,29 +63,35 @@ impl Drop for Scope {
     }
 }
 
-/// Classify once, before AppKit can generate or defer any callback from this native key.
-pub(super) fn source(key: NativeKeyEvent) -> Scope {
-    source_with(key, |key| CLASSIFIER.get().is_some_and(|classify| classify(key)))
+/// Classify once, before AppKit can generate or defer any callback from this native event. An
+/// application that installed no classifier has every event read as a person's.
+pub(super) fn source(event: NativeInputEvent) -> Scope {
+    source_with(event, |event| {
+        CLASSIFIER.get().map_or(InputOrigin::Person, |classify| classify(event))
+    })
 }
 
-fn source_with(key: NativeKeyEvent, classify: impl FnOnce(NativeKeyEvent) -> bool) -> Scope {
+fn source_with(
+    event: NativeInputEvent,
+    classify: impl FnOnce(NativeInputEvent) -> InputOrigin,
+) -> Scope {
     // cancelOperation: can be called from the key's interpretation. Its native identity
     // remains the same, even after a nested handler consumed another key's ledger entry.
-    let retained = SOURCE.with(Cell::get).filter(|source| source.key == Some(key));
-    Scope::enter(retained.unwrap_or_else(|| Origin { key: Some(key), posted: classify(key) }))
+    let retained = SOURCE.with(Cell::get).filter(|source| source.event == Some(event));
+    Scope::enter(retained.unwrap_or_else(|| Origin { event: Some(event), origin: classify(event) }))
 }
 
-/// One callback's already decided source; no later key or classifier lookup can change it.
+/// One callback's already decided source; no later event or classifier lookup can change it.
 #[derive(Clone, Copy)]
 pub(super) struct Captured(Origin);
 
 pub(super) fn capture() -> Captured {
-    Captured(SOURCE.with(Cell::get).unwrap_or(Origin { key: None, posted: false }))
+    Captured(SOURCE.with(Cell::get).unwrap_or(Origin { event: None, origin: InputOrigin::Person }))
 }
 
 impl Captured {
     pub(super) fn dispatch<R>(self, handler: impl FnOnce() -> R) -> R {
-        struct RestoreDelivery(Option<bool>);
+        struct RestoreDelivery(Option<InputOrigin>);
         impl Drop for RestoreDelivery {
             fn drop(&mut self) {
                 DELIVERY.with(|current| current.set(self.0));
@@ -91,7 +99,7 @@ impl Captured {
         }
         let _source = Scope::enter(self.0);
         let _delivery =
-            RestoreDelivery(DELIVERY.with(|current| current.replace(Some(self.0.posted))));
+            RestoreDelivery(DELIVERY.with(|current| current.replace(Some(self.0.origin))));
         handler()
     }
 }
@@ -100,14 +108,22 @@ impl Captured {
 mod tests {
     use super::*;
 
-    fn key(keycode: u16) -> NativeKeyEvent {
-        NativeKeyEvent { kind: 10, keycode, timestamp: 1_000.0 + f64::from(keycode) }
+    const PERSON: InputOrigin = InputOrigin::Person;
+    const POSTED: InputOrigin = InputOrigin::Posted;
+
+    fn key(keycode: u16) -> NativeInputEvent {
+        NativeInputEvent {
+            kind: 10,
+            keycode,
+            timestamp: 1_000.0 + f64::from(keycode),
+            source_pid: 0,
+        }
     }
 
     #[test]
     fn queued_callbacks_keep_their_one_source_classification() {
         let calls = Cell::new(0);
-        let decision = Cell::new(true);
+        let decision = Cell::new(POSTED);
         let pending = {
             let _source = source_with(key(14), |seen| {
                 assert_eq!(seen, key(14));
@@ -117,32 +133,49 @@ mod tests {
             [capture(), capture()]
         };
         assert_eq!(calls.get(), 1);
-        decision.set(false);
-        let _later = source_with(key(0), |_| false);
+        decision.set(PERSON);
+        let _later = source_with(key(0), |_| PERSON);
         for callback in pending {
             callback.dispatch(|| {
-                assert_eq!(window_event_posted(), Some(true));
+                assert_eq!(window_event_origin(), Some(POSTED));
                 let _same = source_with(key(14), |_| {
                     panic!("the retained native key cannot be classified again")
                 });
-                capture().dispatch(|| assert_eq!(window_event_posted(), Some(true)));
+                capture().dispatch(|| assert_eq!(window_event_origin(), Some(POSTED)));
             });
         }
         assert_eq!(calls.get(), 1, "delivery never consults the classifier again");
-        assert_eq!(window_event_posted(), None);
-        capture().dispatch(|| assert_eq!(window_event_posted(), Some(false)));
+        assert_eq!(window_event_origin(), None);
+        capture().dispatch(|| assert_eq!(window_event_origin(), Some(PERSON)));
     }
 
     #[test]
     fn a_physical_callback_does_not_borrow_a_later_posted_keys_mark() {
         let physical = {
-            let _source = source_with(key(0), |_| false);
+            let _source = source_with(key(0), |_| PERSON);
             capture()
         };
-        let _later = source_with(key(14), |_| true);
-        physical.dispatch(|| assert_eq!(window_event_posted(), Some(false)));
-        capture().dispatch(|| assert_eq!(window_event_posted(), Some(true)));
-        assert_eq!(window_event_posted(), None);
+        let _later = source_with(key(14), |_| POSTED);
+        physical.dispatch(|| assert_eq!(window_event_origin(), Some(PERSON)));
+        capture().dispatch(|| assert_eq!(window_event_origin(), Some(POSTED)));
+        assert_eq!(window_event_origin(), None);
+    }
+
+    /// A click's callback keeps the verdict of its own native event, a third one beside a
+    /// posted key's and a person's.
+    #[test]
+    fn a_clicks_callback_keeps_its_own_verdict_beside_a_keys() {
+        let click = NativeInputEvent { kind: 2, keycode: 0, timestamp: 1_000.5, source_pid: 7 };
+        let relayed = {
+            let _source = source_with(click, |seen| {
+                assert_eq!(seen, click);
+                InputOrigin::Relayed
+            });
+            capture()
+        };
+        let _later = source_with(key(14), |_| POSTED);
+        relayed.dispatch(|| assert_eq!(window_event_origin(), Some(InputOrigin::Relayed)));
+        capture().dispatch(|| assert_eq!(window_event_origin(), Some(POSTED)));
     }
 
     #[test]
@@ -150,17 +183,17 @@ mod tests {
         let calls = Cell::new(0);
         let _first = source_with(key(14), |_| {
             calls.set(calls.get() + 1);
-            true
+            POSTED
         });
         {
             let _physical = source_with(key(0), |_| {
                 calls.set(calls.get() + 1);
-                false
+                PERSON
             });
-            capture().dispatch(|| assert_eq!(window_event_posted(), Some(false)));
+            capture().dispatch(|| assert_eq!(window_event_origin(), Some(PERSON)));
         }
         let _same = source_with(key(14), |_| panic!("the enclosing key was already classified"));
-        capture().dispatch(|| assert_eq!(window_event_posted(), Some(true)));
+        capture().dispatch(|| assert_eq!(window_event_origin(), Some(POSTED)));
         assert_eq!(calls.get(), 2, "only the two distinct native keys were classified");
     }
 
@@ -168,42 +201,42 @@ mod tests {
     fn keyless_nested_callbacks_mask_and_restore_both_scopes() {
         let keyless = capture();
         let posted = {
-            let _source = source_with(key(14), |_| true);
+            let _source = source_with(key(14), |_| POSTED);
             capture()
         };
         posted.dispatch(|| {
-            assert_eq!(window_event_posted(), Some(true));
+            assert_eq!(window_event_origin(), Some(POSTED));
             keyless.dispatch(|| {
-                assert_eq!(window_event_posted(), Some(false));
-                capture().dispatch(|| assert_eq!(window_event_posted(), Some(false)));
+                assert_eq!(window_event_origin(), Some(PERSON));
+                capture().dispatch(|| assert_eq!(window_event_origin(), Some(PERSON)));
             });
-            assert_eq!(window_event_posted(), Some(true));
-            capture().dispatch(|| assert_eq!(window_event_posted(), Some(true)));
+            assert_eq!(window_event_origin(), Some(POSTED));
+            capture().dispatch(|| assert_eq!(window_event_origin(), Some(POSTED)));
         });
-        assert_eq!(window_event_posted(), None);
-        capture().dispatch(|| assert_eq!(window_event_posted(), Some(false)));
+        assert_eq!(window_event_origin(), None);
+        capture().dispatch(|| assert_eq!(window_event_origin(), Some(PERSON)));
     }
 
     #[test]
     fn a_nested_native_key_does_not_inherit_the_outer_callback_verdict() {
         let posted = {
-            let _source = source_with(key(14), |_| true);
+            let _source = source_with(key(14), |_| POSTED);
             capture()
         };
         posted.dispatch(|| {
-            assert_eq!(window_event_posted(), Some(true));
+            assert_eq!(window_event_origin(), Some(POSTED));
             {
-                let _physical = source_with(key(0), |_| false);
+                let _physical = source_with(key(0), |_| PERSON);
                 assert_eq!(
-                    window_event_posted(),
+                    window_event_origin(),
                     None,
                     "the native handler is not a window callback"
                 );
-                capture().dispatch(|| assert_eq!(window_event_posted(), Some(false)));
-                assert_eq!(window_event_posted(), None);
+                capture().dispatch(|| assert_eq!(window_event_origin(), Some(PERSON)));
+                assert_eq!(window_event_origin(), None);
             }
-            assert_eq!(window_event_posted(), Some(true));
+            assert_eq!(window_event_origin(), Some(POSTED));
         });
-        assert_eq!(window_event_posted(), None);
+        assert_eq!(window_event_origin(), None);
     }
 }

@@ -4,6 +4,7 @@
 //! The provenance bundle (design §10.7): what it names, its bytes, the forgeries it refuses, its publication and its selection's provenance.
 
 use aterm_aos::evidence::TESTED_ASSUMPTIONS;
+use aterm_aos::wire::WireFault;
 use aterm_aos::{ArtifactId, ArtifactKind, Digest};
 
 use super::bundle::{
@@ -638,6 +639,35 @@ fn the_publication_replaces_a_base_of_the_policy_by_its_rule() {
             assert_eq!(got, forged(BundleField::Publication, None), "{what}");
         }
     }
+}
+
+/// A mode byte of 2, the tag of the distributed search removed with design §11's workers, is
+/// refused at decode, naming the tag, even under a good seal.
+#[test]
+fn a_bundle_of_the_removed_distributed_mode_is_refused_naming_its_tag() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
+    let parts = accepted();
+    let mut on_demand = parts.clone();
+    on_demand.selection.mode = Mode::OnDemand;
+    let (search, on_demand) = (parts.encode(), on_demand.encode());
+    let body = search.len() - Digest([0; 32]).0.len();
+    let at: Vec<usize> = (0..body).filter(|&i| search[i] != on_demand[i]).collect();
+    let [at] = at[..] else {
+        panic!("fixture: the mode is one byte of the body, not {at:?}");
+    };
+    let mut bytes = search[..body].to_vec();
+    bytes[at] = 2;
+    let seal = Digest::of(BUNDLE_DOMAIN, &[&bytes]);
+    bytes.extend_from_slice(&seal.0);
+    assert_eq!(
+        UncheckedBundle::decode(&bytes),
+        Err(BundleRefusal::Wire(WireFault::BadTag {
+            field: "selection.mode",
+            tag: 2
+        }))
+    );
 }
 
 /// A search credited to the grid must be the grid's own selection, which `verify` re-runs, while another proposer's selection verifies as declared.

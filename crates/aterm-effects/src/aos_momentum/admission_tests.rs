@@ -91,6 +91,7 @@ fn every_refusal_in_attached_mode_is_a_total_step_that_replays_identically() {
                 let key = MomentumEvent::Key {
                     at: past_ns,
                     tau_bits: MOMENTUM_GLOW_TAU_S.to_bits(),
+                    echo: super::KeyEcho::Seen,
                 };
                 let _ = hosted_mut(h).deliver(&key, false, &mut Vec::new(), &mut Vec::new());
             }),

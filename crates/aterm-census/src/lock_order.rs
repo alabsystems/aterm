@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::{
     CensusOutcome, Floor, collect_rs_files, fn_defined_in, ident_ending_at, is_test_file,
-    parse_source_fns, strip_line_comment,
+    parse_source_fns, strip_line_comment, test_gated_module_files,
 };
 
 /// The walker's limits, printed with a red walk's findings.
@@ -105,7 +105,8 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
       - BLOCKING EDGES ONLY: `try_lock`/`try_read`/`try_write` cannot block, so
         a try-guard is an edge SOURCE (once held it is held) but never an edge
         TARGET. Scope: non-test sources of the scanned crates with `#[cfg(test)]`
-        items masked (test code never compiles into the shipped GUI process);
+        items masked and the files a `#[cfg(test)] mod` declares left out (test
+        code never compiles into the shipped GUI process);
         string/char literals masked before token scans;
         `.read()`/`.write()` with ZERO arguments are assumed RwLock acquisitions
         unless raw-pointer evidence applies (next bullet).
@@ -185,6 +186,31 @@ struct GuardHelper {
 }
 
 const GUARD_HELPERS: &[GuardHelper] = &[
+    GuardHelper {
+        symbol: "posts",
+        identity: "posts",
+        def_file: "crates/aterm-link/src/state.rs",
+    },
+    GuardHelper {
+        symbol: "judge_posts",
+        identity: "posts",
+        def_file: "crates/aterm-link/src/state.rs",
+    },
+    GuardHelper {
+        symbol: "asks",
+        identity: "asks",
+        def_file: "crates/aterm-link/src/state.rs",
+    },
+    GuardHelper {
+        symbol: "link_state",
+        identity: "state",
+        def_file: "crates/aterm-net/src/fleet/link.rs",
+    },
+    GuardHelper {
+        symbol: "live_state",
+        identity: "state",
+        def_file: "crates/aterm-net/src/fleet/link.rs",
+    },
     GuardHelper {
         symbol: "lock_bytes",
         identity: "bytes",
@@ -299,6 +325,11 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         symbol: "spawn_lock_exclusive",
         identity: "SPAWN_LOCK",
         def_file: "crates/aterm-uds/src/spawn_lock.rs",
+    },
+    GuardHelper {
+        symbol: "one_test_at_a_time",
+        identity: "REPO_READ_TESTS",
+        def_file: "crates/aterm-agent/src/harness/repo_home.rs",
     },
 ];
 
@@ -1895,6 +1926,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     let mut sites: Vec<AcqSite> = Vec::new();
     let mut fns: Vec<FnLockFacts> = Vec::new();
     let mut field_types = FieldTypes::default();
+    let mut test_gated = 0usize;
     for crate_dir in &scan.scan_dirs {
         if scan
             .vendored_scanned
@@ -1906,6 +1938,9 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         let mut files = Vec::new();
         let _ = collect_rs_files(&root.join(crate_dir), &mut files);
         files.retain(|p| !is_test_file(p));
+        let gated = test_gated_module_files(&files);
+        test_gated += gated.len();
+        files.retain(|p| !gated.contains(p));
         files.sort();
         for file in files {
             let Ok(text) = crate::tree::read_to_string(&file) else {
@@ -1934,6 +1969,9 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         let mut files = Vec::new();
         let _ = collect_rs_files(&root.join(&v.scan_dir), &mut files);
         files.retain(|p| !is_test_file(p));
+        let gated = test_gated_module_files(&files);
+        test_gated += gated.len();
+        files.retain(|p| !gated.contains(p));
         files.sort();
         let mut per_slice = vec![0usize; v.platform_slices.len()];
         for file in files {
@@ -1975,6 +2013,11 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
             slice_counts.push((v.package.clone(), slice.label, per_slice[i]));
         }
     }
+    let _ = writeln!(
+        log,
+        "    {test_gated} file(s) a `#[cfg(test)] mod` declares left out: test code, which no \
+         shipped process links"
+    );
 
     if sites.is_empty() {
         let _ = writeln!(
@@ -2119,17 +2162,25 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         {
             continue;
         }
+        // A row names aterm's own crates only. One naming a fn private to a vendored or
+        // external-workspace crate would go stale on that crate's next refactor, and astream
+        // lands first, so it could never move the row in the same change.
+        let remedy = if f.namespace == WORKSPACE_NS {
+            "Register it in GUARD_HELPERS (crates/aterm-census/src/lock_order.rs) with its \
+             lock identity — registration EXTENDS coverage; it is not a waiver. (A FREE fn \
+             with a standard method name — `lock`/`read`/… — is NOT exempt: `lock(&X)` call \
+             sites carry no token. If it wraps several different locks, inline the standard \
+             vocabulary at its call sites instead, e.g. `MutexExt::lock_or_recover`.)"
+        } else {
+            "It is not one of aterm's own crates, which are all GUARD_HELPERS can name: spell \
+             the acquisition out at each of its call sites, in that crate's own source."
+        };
         let _ = writeln!(
             log,
             "  ✗ FAIL [OB-7] UNREGISTERED GUARD-RETURNING HELPER — `fn {}` ({}) acquires a \
              lock AND returns a `…Guard`, so its CALLERS hold that lock invisibly (no \
              `.lock()` token at their call sites) and the census cannot place their \
-             held-acquire edges. Register it in GUARD_HELPERS \
-             (crates/aterm-census/src/lock_order.rs) with its lock identity — registration \
-             EXTENDS coverage; it is not a waiver. (A FREE fn with a standard method name \
-             — `lock`/`read`/… — is NOT exempt: `lock(&X)` call sites carry no token. If \
-             it wraps several different locks, inline the standard vocabulary at its call \
-             sites instead, e.g. `MutexExt::lock_or_recover`.)",
+             held-acquire edges. {remedy}",
             f.name, f.span
         );
         failures += 1;
@@ -3890,6 +3941,49 @@ mod tests {
         );
     }
 
+    /// A guard-returning helper in a module only a test build compiles is test code, as one in
+    /// a `tests.rs` is. NEGATIVE CONTROL: the same module declared for every build is shipped
+    /// code, and both of its helpers are red.
+    #[test]
+    fn synthetic_test_gated_module_files_are_left_out() {
+        let sim = [
+            (
+                "crates/aterm-gui/src/extra/sim/mod.rs",
+                "fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {\n    \
+                 m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n",
+            ),
+            (
+                "crates/aterm-gui/src/extra/sim/world.rs",
+                "fn world_guard() -> std::sync::MutexGuard<'static, u32> {\n    \
+                 WORLD_LOCK.lock().unwrap()\n}\n",
+            ),
+        ];
+        let gated = run_synth_files("testgated", "/// The sim.\n#[cfg(test)]\nmod sim;\n", &sim);
+        assert!(gated.ok, "a test-gated module is test code:\n{}", gated.log);
+        assert!(
+            gated
+                .log
+                .contains("2 file(s) a `#[cfg(test)] mod` declares left out"),
+            "the files left out are counted:\n{}",
+            gated.log
+        );
+        let shipped = run_synth_files("testgated-control", "/// The sim.\nmod sim;\n", &sim);
+        assert!(
+            !shipped.ok,
+            "an ungated module is shipped code:\n{}",
+            shipped.log
+        );
+        for helper in ["`fn lock`", "`fn world_guard`"] {
+            assert!(
+                shipped.log.lines().any(
+                    |l| l.contains("UNREGISTERED GUARD-RETURNING HELPER") && l.contains(helper)
+                ),
+                "{helper} is red:\n{}",
+                shipped.log
+            );
+        }
+    }
+
     #[test]
     fn synthetic_unregistered_guard_returning_helper_is_red() {
         let out = run_synth(
@@ -4086,6 +4180,50 @@ mod tests {
                 result.log
             );
         }
+    }
+
+    #[test]
+    fn an_external_workspace_guard_helper_is_red_and_spelled_out_not_registered() {
+        let mut files = synth_helper_files();
+        let gui = files
+            .iter_mut()
+            .find(|(path, _)| path == "crates/aterm-gui/Cargo.toml")
+            .unwrap();
+        gui.1
+            .push_str("\n[dependencies.foreign]\npath = \"../../foreign/lib\"\n");
+        files.push((
+            "foreign/Cargo.toml".into(),
+            "[workspace]\nmembers = [\"lib\"]\n".into(),
+        ));
+        files.push((
+            "foreign/lib/Cargo.toml".into(),
+            "[package]\nname = \"foreign\"\n".into(),
+        ));
+        files.push((
+            "foreign/lib/src/lib.rs".into(),
+            "fn foreign_guard() -> std::sync::MutexGuard<'static, ()> {\n    \
+             alpha_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"
+                .into(),
+        ));
+        let out = run_lock_order_census(&synth_tree(
+            "aterm-lock-census",
+            "external-guard-helper",
+            &files,
+        ));
+        let line = out
+            .log
+            .lines()
+            .find(|l| l.contains("UNREGISTERED GUARD-RETURNING HELPER — `fn foreign_guard`"));
+        assert!(
+            !out.ok && line.is_some(),
+            "another workspace's guard helper must be RED:\n{}",
+            out.log
+        );
+        assert!(
+            line.is_some_and(|l| !l.contains("Register it in GUARD_HELPERS")),
+            "a row cannot name another workspace's fn, so the remedy is not one:\n{}",
+            out.log
+        );
     }
 
     #[test]

@@ -61,9 +61,12 @@ struct Effects {
     desired: Version,
     selected: Option<Version>,
     fail_stage: bool,
+    fail_plan: bool,
     lose_ack: bool,
     fail_readback: bool,
     conflict: bool,
+    reject_selection: bool,
+    selection_refusal_current_unknown: bool,
     unknown: bool,
     expected: Option<ExpectedCurrent>,
 }
@@ -75,9 +78,12 @@ impl Effects {
             desired: version(config),
             selected: None,
             fail_stage: false,
+            fail_plan: false,
             lose_ack: false,
             fail_readback: false,
             conflict: false,
+            reject_selection: false,
+            selection_refusal_current_unknown: false,
             unknown: false,
             expected: None,
         }
@@ -106,6 +112,9 @@ impl Driver for Effects {
     }
     fn plan(&mut self, _: &Config, _: &str) -> Result<()> {
         self.calls.push("plan");
+        if self.fail_plan {
+            return Err(Error::refused("current source no longer matches its plan"));
+        }
         Ok(())
     }
     fn identity(&self, _: &Config, _: &()) -> Result<Version> {
@@ -123,19 +132,38 @@ impl Driver for Effects {
             Ok(())
         }
     }
-    fn select(&mut self, _: &Config, _: &(), expected: ExpectedCurrent) -> Result<()> {
+    fn select(
+        &mut self,
+        _: &Config,
+        _: &(),
+        _: &(),
+        expected: ExpectedCurrent,
+    ) -> std::result::Result<(), SelectionError> {
         self.calls.push("select");
         self.expected = Some(expected);
+        if self.reject_selection {
+            // Another selector can already have selected this identity. That
+            // observation cannot authorize this manager's rejected source.
+            self.selected = Some(self.desired.clone());
+            self.unknown = self.selection_refusal_current_unknown;
+            return Err(SelectionError::Rejected(Error::refused(
+                "source changed before selection",
+            )));
+        }
         if self.conflict {
             let mut other = self.desired.clone();
             other.source = "c".repeat(40);
             other.build = 9;
             self.selected = Some(other);
-            return Err(Error::refused("competing current changed the CAS token"));
+            return Err(SelectionError::Uncertain(Error::refused(
+                "competing current changed the CAS token",
+            )));
         }
         self.selected = Some(self.desired.clone());
         if self.lose_ack {
-            Err(Error::cannot_run("lost selection ACK"))
+            Err(SelectionError::Uncertain(Error::cannot_run(
+                "lost selection ACK",
+            )))
         } else {
             Ok(())
         }
@@ -219,7 +247,7 @@ fn lost_ack_is_reconciled_without_repeating_the_selection() {
 }
 
 #[test]
-fn uncertain_readback_retains_select_marker_and_next_pass_only_observes() {
+fn uncertain_readback_retains_select_marker_then_rechecks_source_without_reselecting() {
     let config = config(Path::new("/not-opened"));
     let mut status = Status::default();
     let mut effects = Effects::new(&config);
@@ -229,8 +257,79 @@ fn uncertain_readback_retains_select_marker_and_next_pass_only_observes() {
     effects.calls.clear();
     pass(&config, &mut status, &mut effects, |_| Ok(()))
         .expect("next checked readback settles ACK");
-    assert_eq!(effects.calls, ["current"]);
+    assert_eq!(effects.calls, ["current", "fetch", "plan"]);
     assert_eq!(status.pending, None);
+}
+
+#[test]
+fn resumed_matching_selection_cannot_skip_fresh_source_validation() {
+    let config = config(Path::new("/not-opened"));
+    let mut effects = Effects::new(&config);
+    effects.selected = Some(effects.desired.clone());
+    effects.fail_plan = true;
+    let mut status = Status {
+        pending: Some(Operation::Select),
+        compiled: Some(effects.desired.clone()),
+        ..Status::default()
+    };
+    let error = pass(&config, &mut status, &mut effects, |_| Ok(()))
+        .expect_err("historical selection cannot establish source freshness");
+    assert!(
+        error
+            .to_string()
+            .contains("current source no longer matches")
+    );
+    assert_eq!(effects.calls, ["current", "fetch", "plan"]);
+    assert_eq!(
+        status.pending, None,
+        "prior rename was conclusively observed"
+    );
+    assert_eq!(status.failures, 1);
+    assert_eq!(status.selected.as_ref(), Some(&effects.desired));
+}
+
+#[test]
+fn matching_current_cannot_override_a_known_source_refusal() {
+    let config = config(Path::new("/not-opened"));
+    let mut status = Status::default();
+    let mut effects = Effects::new(&config);
+    effects.reject_selection = true;
+    let error = pass(&config, &mut status, &mut effects, |_| Ok(()))
+        .expect_err("matching readback cannot accept rejected source");
+    assert!(
+        error
+            .to_string()
+            .contains("source changed before selection")
+    );
+    assert_eq!(status.pending, None, "no selection write was attempted");
+    assert_eq!(status.selected.as_ref(), Some(&effects.desired));
+    assert_eq!(status.failures, 1);
+    assert_eq!(effects.calls.last(), Some(&"current"));
+}
+
+#[test]
+fn unknown_readback_after_known_refusal_cannot_be_reconciled_as_a_lost_ack() {
+    let config = config(Path::new("/not-opened"));
+    let mut status = Status::default();
+    let mut effects = Effects::new(&config);
+    effects.reject_selection = true;
+    effects.selection_refusal_current_unknown = true;
+    assert!(pass(&config, &mut status, &mut effects, |_| Ok(())).is_err());
+    assert_eq!(
+        status.pending, None,
+        "no possible rename needs reconciliation"
+    );
+    assert_eq!(status.selected, None, "old observations are not current");
+    assert!(status.reason.contains("current is unknown"));
+    assert_eq!(status.failures, 1);
+    effects.calls.clear();
+    effects.unknown = false;
+    effects.selected = None;
+    effects.reject_selection = false;
+    pass(&config, &mut status, &mut effects, |_| Ok(()))
+        .expect("a fresh pass can select current source");
+    assert!(effects.calls.contains(&"fetch"));
+    assert!(effects.calls.contains(&"select"));
 }
 
 #[test]

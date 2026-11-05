@@ -3,6 +3,10 @@
 
 //! Shared test fixtures for in-process key minting, roster signing, and fake-host channels.
 
+/// Actual registered-harness source preparation for private native development labs.
+#[cfg(all(debug_assertions, target_os = "macos"))]
+pub mod harness;
+
 use std::path::Path;
 use std::sync::Arc;
 

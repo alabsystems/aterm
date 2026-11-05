@@ -472,8 +472,14 @@ fn digest(sha256: &str) -> String {
 
 /// Where the guest keeps Webster's Second (`web2`), the word list aterm-lexicon's dictionary
 /// gates are curated against: Windows ships none, so the lane lays this Mac's copy
-/// ([`crate::linux_guest::WEB2`]) at the Windows path aterm_uds's `web2` row looks at.
-pub const WEB2: &str = r"C:\usr\share\dict\web2";
+/// ([`crate::linux_guest::WEB2`]) at the Windows place aterm_uds's `web2` row names.
+#[must_use]
+pub fn web2_path() -> &'static str {
+    aterm_uds::host::tool("web2")
+        .places_on("windows")
+        .next()
+        .unwrap_or_else(|| unreachable!("the web2 row names a Windows place"))
+}
 
 /// The provisioning plan, in order, with a `web2` step when this Mac's copy reads
 /// ([`provision_plan`]).
@@ -484,7 +490,7 @@ pub fn provision_steps() -> Vec<Step> {
 }
 
 /// The provisioning plan, in order: its last step checks the `web2` the host copied to
-/// [`WEB2`] has the SHA-256 `web2`, when one is given.
+/// [`web2_path`] has the SHA-256 `web2`, when one is given.
 #[must_use]
 pub fn provision_plan(web2: Option<&str>) -> Vec<Step> {
     let (git_tag, git_file, git_sha) = GIT;
@@ -704,7 +710,7 @@ pub fn provision_plan(web2: Option<&str>) -> Vec<Step> {
             label: "web2",
             script: format!(
                 "{PREAMBLE}$f = {}\n{}\"web2: $((Get-Item $f).Length) bytes\"\n",
-                ps_quote(WEB2),
+                ps_quote(web2_path()),
                 digest(sha)
             ),
             runner: false,
@@ -1329,12 +1335,11 @@ mod tests {
     /// plan without it provisions again once it reads.
     #[test]
     fn the_guest_gets_the_hosts_web2_where_the_web2_row_looks() {
-        assert!(aterm_uds::host::tool("web2").at.contains(&WEB2));
         let sha = "ab".repeat(32);
         let plan = provision_plan(Some(&sha));
         let web2 = plan.last().unwrap_or_else(|| unreachable!());
         assert_eq!(web2.label, "web2");
-        assert!(web2.script.contains(&ps_quote(WEB2)) && web2.script.contains(&sha));
+        assert!(web2.script.contains(&ps_quote(web2_path())) && web2.script.contains(&sha));
         let without = provision_plan(None);
         assert!(without.iter().all(|s| s.label != "web2"));
         assert_ne!(fingerprint(&plan), fingerprint(&without));

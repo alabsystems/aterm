@@ -118,13 +118,6 @@ impl ReplayEngine {
         self.term.process_at(bytes, clock);
     }
 
-    /// Keep the primary history suffix between observed input slices without
-    /// changing this engine's retention settings or replay carry.
-    #[must_use]
-    pub fn trim_replay_history(&mut self, max_history: usize) -> bool {
-        self.term.trim_replay_history(max_history)
-    }
-
     /// Apply a recorded resize under the session's seam policy.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.term.resize_with_policy(rows, cols, self.policy);

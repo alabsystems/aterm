@@ -40,28 +40,7 @@ pub const DEFAULT_RESERVED_RELEASE_LABEL: &str = "m3";
 /// as `"M22.local"`, `"m100-studio"`, or `"m4 (2)"` return `Some((N, "m<N>"))`.
 #[must_use]
 pub fn leading_m_label(name: &str) -> Option<(u32, String)> {
-    let trimmed = name.trim_ascii();
-    let bytes = trimmed.as_bytes();
-    let (&first, rest) = bytes.split_first()?;
-    if first != b'm' && first != b'M' {
-        return None;
-    }
-    let (&first_digit, _) = rest.split_first()?;
-    if !first_digit.is_ascii_digit() || first_digit == b'0' {
-        return None;
-    }
-    let digit_len = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-    if digit_len == 0 || digit_len > 6 {
-        return None;
-    }
-    if let Some(&after) = rest.get(digit_len)
-        && after.is_ascii_alphanumeric()
-    {
-        return None;
-    }
-    let digits = std::str::from_utf8(&rest[..digit_len]).ok()?;
-    let n: u32 = digits.parse().ok()?;
-    (n >= 1).then(|| (n, format!("m{n}")))
+    aterm_types::machine_name::Number::leading(name).map(|n| (n.get(), n.to_string()))
 }
 
 /// One Mac's row in [`SwarmRoster`].

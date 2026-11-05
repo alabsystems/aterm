@@ -132,6 +132,16 @@ pub(crate) fn progress_facts_at(
             ),
         ),
     ];
+    for work in &progress.independent_work {
+        facts.push((
+            "Local pool work".into(),
+            aterm_agent::harness::footer::account_pool_work_text(work),
+        ));
+        facts.push((
+            "Pool work observed".into(),
+            observed_seconds(work.observed_at),
+        ));
+    }
     use aterm_agent::harness::account_progress::OwnClaimBlocker;
     let observation_confirmed = now.is_some_and(|now| {
         (1..=253_402_300_799).contains(&now)
@@ -305,15 +315,10 @@ impl crate::App {
                 if state.route == crate::native_settings::SettingsRoute::Lab)
     }
 
-    /// Only a visible active Lab page owns the periodic read; hidden Settings never keep it awake.
+    /// Only a Lab page on screen ([`Self::view_on_screen`]) owns the periodic read; hidden
+    /// Settings, a tab behind another and a view a zoomed tab hides never keep it awake.
     pub(crate) fn lab_page_shown(&self) -> bool {
-        self.windows.values().any(|window| {
-            !window.occluded
-                && window
-                    .tab_set
-                    .active()
-                    .is_some_and(|tab| tab.root.any_leaf(&mut |view| self.lab_page_in(*view)))
-        })
+        self.view_on_screen(|view| self.lab_page_in(view))
     }
 
     pub(crate) fn lab_state(&self, sessions: &[crate::harness_screen::HarnessSession]) -> LabState {

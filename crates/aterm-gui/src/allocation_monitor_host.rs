@@ -16,7 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Bound on one monitor read. A unit test's source is its own serving thread, which answers, so
+/// its reads wait the hang detector.
+#[cfg(not(test))]
 const READ_WITHIN: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const READ_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
 const RECENT_TERMINALS: usize = 64;
 /// The production notifier cannot retain Host or arbitrary callbacks. A generic
 /// retained closure could otherwise form a cycle back into its own worker.

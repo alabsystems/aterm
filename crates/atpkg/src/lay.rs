@@ -123,21 +123,22 @@ fn stage(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) -> io::R
     let _ = std::fs::remove_file(&tmp);
     let written = (|| -> io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             opts.mode(0o755);
+            opts.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         }
         let mut f = opts.open(&tmp)?;
         use std::io::Write as _;
         f.write_all(&file.body)?;
-        sync(&f)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o755))?;
         }
+        sync(&f)?;
         Ok(())
     })();
     match written {

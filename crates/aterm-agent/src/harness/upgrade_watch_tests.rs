@@ -10,6 +10,7 @@ fn scratch(tag: &str) -> (crate::supervise::ScratchDir, Opts) {
     let opts = Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: Some(dir.join("config/accounts.toml")),
         sock: None,
         token: None,
         only_sid: None,

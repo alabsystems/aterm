@@ -366,12 +366,23 @@ fn local_recipient_denied_with(
     let recipient = my_rec.to_bech32();
     let cfg = super::config(paths)?;
     let state = load_state(paths)?;
-    let local_log = cfg
+    let custody = cfg
         .as_ref()
         .map(|c| super::log_entries::authenticated_custody(paths, c, &state))
-        .transpose()?
-        .flatten()
-        .map(|(log, _)| log);
+        .transpose();
+    if custody.is_err() {
+        // Missing retained records cannot erase a denial authenticated by the cached
+        // envelope. This fallback grants nothing; a complete log still resolves restores.
+        if let Some(config) = &cfg
+            && let Some(bytes) = super::read_verified_cached_envelope(paths, config, &state)?
+            && let Some(roster) =
+                log_entries::denial_roster(None, Some(&envelope::parse(&bytes)?), &identity)?
+            && roster_denies_local(paths, &roster, Some(config), &recipient)
+        {
+            return Ok(true);
+        }
+    }
+    let local_log = custody?.flatten().map(|(log, _)| log);
     if let (Some(c), Some(log)) = (&cfg, &local_log) {
         if log.removes(&my_rec) {
             return Ok(true);
@@ -430,6 +441,7 @@ fn roster_denies_local(
 }
 
 fn resolve_steward_own_label(paths: &Paths, doc: &Document) -> crate::Result<Option<String>> {
+    let local_roster = swarm_roster_until(paths, Instant::now() + Duration::from_millis(250))?;
     if local_recipient_denied_in_roster(paths) {
         return Ok(None);
     }
@@ -451,7 +463,6 @@ fn resolve_steward_own_label(paths: &Paths, doc: &Document) -> crate::Result<Opt
             roster::overlay_log_membership(&log, None, r);
         }
     }
-    let local_roster = roster::swarm_roster(paths).ok().flatten();
     if let Some(ref r) = doc_roster
         && let Some(member) = r.member_by_recipient(&recipient)
     {
@@ -494,6 +505,7 @@ fn resolve_steward_own_label(paths: &Paths, doc: &Document) -> crate::Result<Opt
 }
 
 fn resolve_member_own_label(paths: &Paths, config: &Config) -> crate::Result<Option<String>> {
+    let local_roster = swarm_roster_until(paths, Instant::now() + Duration::from_millis(250))?;
     if local_recipient_denied_in_roster(paths) {
         return Ok(None);
     }
@@ -501,7 +513,6 @@ fn resolve_member_own_label(paths: &Paths, config: &Config) -> crate::Result<Opt
         return Ok(Some(label));
     }
     let recipient = read_identity(paths)?.map(|id| id.recipient().to_bech32());
-    let local_roster = roster::swarm_roster(paths)?;
     if let (Some(r), Some(rec)) = (&local_roster, recipient.as_deref())
         && let Some(member) = r.member_by_recipient(rec)
         && member_is_denied_in_roster(r, member)
@@ -1089,7 +1100,8 @@ pub(crate) fn serves_alab(url: &str, within: Duration) -> crate::Result<()> {
         }
         if left.is_zero() {
             return Err(Error::new(format!(
-                "the moved server did not serve the ALab vault at {url} within {}s",
+                "the moved server did not serve the ALab vault at {} within {}s",
+                transport::describe(url),
                 within.as_secs()
             )));
         }
@@ -1313,3 +1325,12 @@ pub fn steward_ensure_standby_server(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[test]
+fn a_moved_servers_error_omits_url_credentials() {
+    let credential = "synthetic-moved-server-credential";
+    let url = format!("https://user:{credential}@vault.example/v1/alab");
+    let error = serves_alab(&url, Duration::ZERO).unwrap_err().to_string();
+    assert!(!error.contains(credential));
+}

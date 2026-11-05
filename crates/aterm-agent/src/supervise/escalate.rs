@@ -853,11 +853,18 @@ fn entry_key(shown: u64, tail: NeedTail) -> u64 {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// WHAT THE NEEDS ENTRY SAYS THE HARNESS DOES BESIDE THE NEEDS under `mode` ([`NeedTail`]):
-    /// under Land, where it rests on them or the work concluded beside them, the work waits only on
-    /// the person; it carries on otherwise.
+    /// WHAT THE NEEDS ENTRY SAYS THE HARNESS DOES BESIDE THE NEEDS under `mode` ([`NeedTail`]),
+    /// from whether the loop types again: where the stop for replies that repeat with no work
+    /// holds its typing (the decision's own read, `TurnEndState::replies_stop`: the same reply
+    /// again or a no-work run, under any mode, the post-landing review of 2026-11-02), or under
+    /// Land where it rests on the needs or the work concluded beside them, the work waits on the
+    /// person; it carries on otherwise. A later decision that lifts the stop (a new reply, the
+    /// person's turn) says `carrying on` again, the entry re-keyed by its tail ([`entry_key`]).
     fn need_tail(&self, mode: Autopilot) -> NeedTail {
-        if mode == Autopilot::Land && (self.turn_end.land_resting() || self.turn_end.concluded()) {
+        if self.replies_stopped
+            || (mode == Autopilot::Land
+                && (self.turn_end.land_resting() || self.turn_end.concluded()))
+        {
             NeedTail::WaitsOnYou
         } else {
             NeedTail::CarryingOn

@@ -15,6 +15,7 @@ fn a_path_vault_has_no_join_queues_even_with_irrelevant_policy() {
     let recipient = Identity::from_secret_bytes([7; 32]).recipient().to_bech32();
     let config = Config {
         source: Source::Path(std::path::PathBuf::from("unread.vault")),
+        mirrors: Vec::new(),
         name: "team".into(),
         signer: Some([7; 32]),
         followed: Vec::new(),

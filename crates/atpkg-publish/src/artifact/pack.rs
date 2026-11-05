@@ -391,9 +391,15 @@ pub fn harness_identity(
 pub fn built_executables(stream: &[u8], meta: &Metadata) -> Vec<PathBuf> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     for line in String::from_utf8_lossy(stream).lines() {
+        if !line.contains("\"compiler-artifact\"") {
+            continue;
+        }
         let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
             continue;
         };
+        if v.get("reason").and_then(aterm_json::Value::as_str) != Some("compiler-artifact") {
+            continue;
+        }
         let is_bin = v
             .get("target")
             .and_then(|t| t.get("kind"))
@@ -408,8 +414,7 @@ pub fn built_executables(stream: &[u8], meta: &Metadata) -> Vec<PathBuf> {
             .get("manifest_path")
             .and_then(aterm_json::Value::as_str)
             .is_some_and(|m| meta.manifests.contains(m));
-        if v.get("reason").and_then(aterm_json::Value::as_str) == Some("compiler-artifact")
-            && is_bin
+        if is_bin
             && not_test
             && member
             && let Some(exe) = v.get("executable").and_then(aterm_json::Value::as_str)
@@ -553,8 +558,9 @@ pub fn select(meta: &Metadata, exes: &[PathBuf], triple: Triple) -> Result<Selec
 
 fn tail(bytes: &[u8], n: usize) -> String {
     let text = String::from_utf8_lossy(bytes);
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
+    let mut lines: Vec<&str> = text.lines().rev().take(n).collect();
+    lines.reverse();
+    lines.join("\n")
 }
 
 /// Run `targo metadata` in the checkout through the resolved driver (no `--unverified`:
@@ -622,7 +628,18 @@ fn build(
         .run(&run)
         .map_err(|e| Error::cannot_run(format!("the build: {e}")))?;
     let log = stage_dir.join("build.stderr");
-    let _ = std::fs::write(&log, &ran.stderr);
+    let _ = std::fs::remove_file(&log);
+    {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let _ = opts.open(&log).and_then(|mut f| f.write_all(&ran.stderr));
+    }
     if !ran.success() {
         return Err(Error::refused(format!(
             "the build FAILED (see {}):\n{}",
@@ -920,7 +937,8 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
     }
     for (exe, name) in &sel.shipped {
         let dest = stage_root.join("bin").join(name);
-        std::fs::copy(exe, &dest).map_err(|e| Error::io(format!("stage {name}"), &e))?;
+        crate::identity::copy_regular_file(exe, &dest)
+            .map_err(|e| Error::io(format!("stage {name}"), &e))?;
         let _ = tools.strip(&dest, false);
     }
 

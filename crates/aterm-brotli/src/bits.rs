@@ -164,11 +164,14 @@ impl<R: Read> Bits<R> {
     /// After [`Self::align`]: hand `n` whole bytes to `sink`, in pieces. The input ending
     /// first is [`DecodeError::Truncated`].
     pub(crate) fn take_bytes(&mut self, mut n: usize, sink: &mut dyn FnMut(&[u8])) -> Step<()> {
-        while n > 0 && self.nbits >= 8 {
-            sink(&[self.acc as u8]);
-            self.acc >>= 8;
-            self.nbits -= 8;
-            n -= 1;
+        let acc_bytes = ((self.nbits / 8) as usize).min(n);
+        if acc_bytes > 0 {
+            let bytes = self.acc.to_le_bytes();
+            sink(&bytes[..acc_bytes]);
+            let bits = (acc_bytes as u32) * 8;
+            self.acc = self.acc.checked_shr(bits).unwrap_or(0);
+            self.nbits -= bits;
+            n -= acc_bytes;
         }
         if n == 0 {
             return Ok(());

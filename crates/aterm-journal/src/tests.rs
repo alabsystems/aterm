@@ -85,12 +85,18 @@ fn strict_checkpoint_keeps_acknowledged_prefix_and_archives_torn_suffix() {
     );
     drop(log);
     let path = dir.path().join("test.astream");
+    let checkpoint = dir.path().join("test.checkpoint");
+    let before_checkpoint = std::fs::metadata(&checkpoint).unwrap().ino();
     let before = std::fs::read(&path).unwrap();
     let mut file = OpenOptions::new().append(true).open(&path).unwrap();
     file.write_all(b"torn").unwrap();
     aterm_durable::durable(&file).unwrap();
     drop(file);
     let log = open(dir.path());
+    assert_eq!(
+        std::fs::metadata(checkpoint).unwrap().ino(),
+        before_checkpoint
+    );
     assert_eq!(std::fs::read(path).unwrap(), before);
     assert_eq!(log.read_range(Offset::ZERO, 999).unwrap().len(), 1);
     let archived = dir.path().join(format!(

@@ -662,7 +662,7 @@ impl Drag {
 
 /// Create `<marks>/<name>`, then wait for `<marks>/<name>.seen`.
 fn hand_over(marks: &Path, name: &str) -> Result<(), Error> {
-    File::create(marks.join(name)).map_err(|e| fault(format!("{name}: {e}")))?;
+    crate::unix::create_fresh(marks.join(name)).map_err(|e| fault(format!("{name}: {e}")))?;
     let seen = marks.join(format!("{name}.seen"));
     let t0 = Instant::now();
     while !seen.exists() {
@@ -686,7 +686,7 @@ pub(crate) fn run(target: u32, uri: &str, marks: &Path) -> Result<(), Error> {
     let src = x.new_id();
     let root = x.setup.root;
     x.send(&create_window(src, root))?;
-    let report = File::create(marks.join("report"))
+    let report = crate::unix::create_fresh(marks.join("report"))
         .map_err(|e| fault(format!("{}: {e}", marks.display())))?;
     let aware = match x.property_word(target, a.id("XdndAware"))? {
         Some((ATOM_ATOM, version)) => version.to_string(),

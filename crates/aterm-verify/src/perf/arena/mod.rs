@@ -239,15 +239,19 @@ impl Drop for Scratch {
 
 /// Owner-only permissions on a directory the run's state lives in.
 pub(crate) fn private(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    crate::set_dir_mode_nofollow(dir, 0o700)
         .map_err(|e| format!("could not chmod {}: {e}", dir.display()))
 }
 
 /// The lowercase hex SHA-256 of a file, streamed.
 pub(crate) fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file =
+    let file =
         crate::open_regular(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    sha256_opened(file, path)
+}
+
+/// The lowercase hex SHA-256 of an already-opened regular file handle, streamed.
+pub(crate) fn sha256_opened(mut file: std::fs::File, path: &Path) -> Result<String, String> {
     let mut hasher = aterm_digest::Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -259,11 +263,7 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    Ok(aterm_codec::hex::encode_lower(&hasher.finalize()))
 }
 
 /// A program's trimmed stdout, or `None` when it cannot run or fails.
@@ -412,6 +412,7 @@ pub(crate) struct Ghostty {
 pub(crate) fn ghostty_tip(pins: &Pins, dmg: Option<&Path>) -> Result<Ghostty, Halt> {
     let tip = &pins.ghostty.tip;
     let arena = arena_dir()?;
+    let mut verified = false;
     let dmg = match dmg {
         Some(d) => d.to_path_buf(),
         None => {
@@ -447,11 +448,12 @@ pub(crate) fn ghostty_tip(pins: &Pins, dmg: Option<&Path>) -> Result<Ghostty, Ha
                 }
                 std::fs::rename(&part, &d)
                     .map_err(|e| format!("could not place {}: {e}", d.display()))?;
+                verified = true;
             }
             d
         }
     };
-    if sha256_file(&dmg)? != tip.artifact_sha256 {
+    if !verified && sha256_file(&dmg)? != tip.artifact_sha256 {
         return Err(Halt::Fail(format!(
             "{} does not hash to the pinned sha256, so it is not the pinned build{}; {} names \
              it by its per-commit artifact, never the rolling `tip` release, which moves.",
@@ -818,7 +820,7 @@ impl LedgerBook {
             path = self.dir.join(format!("{}-{slug}-{n}.md", ledger.date));
             n += 1;
         }
-        std::fs::write(&path, text)
+        crate::write_fresh(&path, text)
             .map_err(|e| format!("could not write {}: {e}", path.display()))?;
         eprintln!(
             "ledger entry written: {} — fill in the display/thermal/config fields before \

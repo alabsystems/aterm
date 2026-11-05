@@ -61,6 +61,10 @@ impl Stamp {
         ]))
     }
 
+    fn mode(&self) -> u32 {
+        u32::try_from(self.0[3].as_u64().unwrap_or(0)).unwrap_or(0)
+    }
+
     fn value(&self) -> Value {
         Value::Array(self.0.clone())
     }
@@ -103,14 +107,25 @@ fn open(parent: &File, name: &str, create: bool, directory: bool) -> io::Result<
     if directory {
         flags |= OFlags::DIRECTORY;
     }
-    let file = File::from(fd::openat(parent, name, flags, Mode::RUSR | Mode::WUSR)?);
+    let file = aterm_uds::kept_out(|| {
+        fd::openat(parent, name, flags, Mode::RUSR | Mode::WUSR)
+            .map(File::from)
+            .map_err(io::Error::from)
+    })?;
     identity(&file, directory)?;
     Ok(file)
 }
 
 fn bytes(file: &File, limit: usize) -> io::Result<(String, Stamp)> {
     let before = Stamp::read(file)?;
-    let mut data = vec![0u8; limit + 1];
+    let before_len =
+        usize::try_from(before.0[2].as_u64().unwrap_or(u64::MAX)).unwrap_or(usize::MAX);
+    if before_len > limit {
+        return Err(bad(
+            "checkpoint bounded read changed origin or exceeded its bound",
+        ));
+    }
+    let mut data = vec![0u8; before_len + 1];
     let mut n = 0;
     while n < data.len() {
         let got = file.read_at(&mut data[n..], n as u64)?;
@@ -119,7 +134,7 @@ fn bytes(file: &File, limit: usize) -> io::Result<(String, Stamp)> {
         }
         n += got;
     }
-    if n > limit || Stamp::read(file)? != before {
+    if n > before_len || Stamp::read(file)? != before {
         return Err(bad(
             "checkpoint bounded read changed origin or exceeded its bound",
         ));

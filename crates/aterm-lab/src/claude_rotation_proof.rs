@@ -32,6 +32,11 @@
 //! - **R2**: `lab-a` at 95 % of its five-hour window (its own headers, read by the tap), `lab-c`'s
 //!   login made: aterm moves the tab onto `lab-c` at a turn end, before any wall, and `lab-c`
 //!   serves the next prompt with the history.
+//! - **R6** (the owner's tabs, which run their own background jobs): `lab-c` meets its limit
+//!   while a background job of the tab's Claude Code runs (a move relaunches the process the job
+//!   belongs to); aterm does not move the tab while the job runs, which runs to its own end, names
+//!   the tab held by its jobs, and moves it onto `lab-a` once the job ended, `lab-a` serving the
+//!   next turn with the history.
 //!
 //! Every key the lab sends is fenced on the composer's own row and pressed once; nothing is
 //! pressed in a `/login` picker. A process watcher records every Claude Code process of the lab
@@ -41,7 +46,6 @@
 //! evidence's text ([`judge_r1`] and the rest).
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -53,6 +57,7 @@ use aterm_agent::harness::accounts::{
 use aterm_agent::harness::accounts_sync::{FLEET_ROSTER_FILE, FleetRoster, OptIn};
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::approvals::ACCOUNT_MOVE_COMMAND;
+use aterm_agent::supervise::policy::cruise_carry::RULE_BACKGROUND;
 use aterm_agent::supervise::policy::guard::ROW_END;
 use aterm_agent::supervise::policy::row_guard;
 use aterm_agent::supervise::policy::turn_end::{
@@ -111,6 +116,18 @@ pub const P6: &str = "Write one sentence about sails, then stop.";
 pub const P7: &str = "Write one sentence about buoys, then stop.";
 /// R2's next, typed once the tab moved onto `lab-c` at P7's turn end.
 pub const P8: &str = "Write one sentence about jetties, then stop.";
+/// R6's first, which the stub's `bg` mode answers with a background `sleep` ([`job_command`]).
+pub const P9: &str = "bgstart: start the background wait, then stop.";
+/// R6's next, which meets `lab-c`'s limit while that job runs.
+pub const P10: &str = "Write one sentence about moorings, then stop.";
+/// How long R6's background job runs, seconds: past R6's wall by minutes, so a move the job did
+/// not hold would come while it runs ([`judge_r6`]).
+pub const R6_JOB_S: i64 = 300;
+/// How far ahead `lab-c`'s R6 limit resets: past the job's end and the move after it, so no
+/// reset ends the wait the job holds.
+const R6_RESET: Duration = Duration::from_secs(3600);
+/// How often R6 looks at its job while it runs (and at the instance's listing, every fifth).
+const JOB_LOOK: Duration = Duration::from_secs(1);
 /// How far ahead `lab-a`'s R1 limit resets: past R1's move and R3's wall, so R3 waits on it.
 const R1_RESET: Duration = Duration::from_secs(3 * 60);
 /// How far `lab-b`'s R3 limit resets past the instant `lab-a` opens again (its reset and the
@@ -329,6 +346,55 @@ pub struct Leg {
     pub listing: String,
     /// Why the run stopped in this scenario, where it did.
     pub blocked: Option<String>,
+}
+
+/// R6's background job as the lab saw it: the `sleep` the stub's `bgstart` turn started under
+/// the tab's Claude Code ([`job_command`]), looked at every [`JOB_LOOK`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Job {
+    /// Its pid (0: never seen).
+    pub pid: i32,
+    /// When the lab first saw it, ms.
+    pub seen: i64,
+    /// When the lab last saw it running, ms.
+    pub alive: i64,
+    /// When the lab first saw it gone, ms (0: never).
+    pub gone: i64,
+    /// When `lab-c`'s wall was served (the stub's 429 after P10), ms (0: never).
+    pub walled: i64,
+    /// When the instance's listing first named the tab held by its jobs, ms (0: never).
+    pub held: i64,
+    /// That listing (`aterm harness accounts --json`), kept with the run's marks.
+    pub listing: String,
+}
+
+/// The command line of R6's background job: the stub's `bg` mode runs `sleep <s>`
+/// ([`R6_JOB_S`]).
+#[must_use]
+pub fn job_command() -> String {
+    format!("sleep {R6_JOB_S}")
+}
+
+/// Whether `aterm harness accounts --json` (`listing`) names session `sid` held by its jobs: a
+/// row's `sessions` entry of that sid whose `held` is `jobs`, the word a move the tab's own
+/// background shells kept from relaunching it leaves.
+#[must_use]
+pub fn held_by_jobs(listing: &str, sid: &str) -> bool {
+    let Ok(doc) = J::parse(listing) else {
+        return false;
+    };
+    let sid = sid.trim_start_matches('@');
+    doc.get("accounts")
+        .and_then(J::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|row| row.get("sessions").and_then(J::as_arr).unwrap_or_default())
+        .any(|s| {
+            s.get("sid")
+                .and_then(J::as_str)
+                .is_some_and(|v| v.trim_start_matches('@') == sid)
+                && s.get("held").and_then(J::as_str) == Some("jobs")
+        })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -565,21 +631,25 @@ fn logged(aterm_log: &str, needle: &str, (from, until): (i64, i64)) -> Vec<i64> 
 /// its history holds P1 and P2.
 #[must_use]
 pub fn judge_r1(ev: &Ev, leg: &Leg) -> Judged {
-    judge_wall_move(ev, leg, (LABEL_A, LABEL_B, AUTH_B), &[P1, P2])
+    judge_wall_move(ev, leg, leg.from, (LABEL_A, LABEL_B, AUTH_B), &[P1, P2])
 }
 
-/// The wall move R1 and R3's second half judge ([`judge_r1`]): `from` walled, the tab moved to
-/// `to`, which served the next turn under `auth` with `prompts` in its history.
+/// The wall move R1, R3's second half and R6 judge ([`judge_r1`]): `from` walled after
+/// `leg.from`, the tab moved to `to` after `moved_after` (ms; R6's job held it until then), and
+/// `to` served the next turn under `auth` with `prompts` in its history.
 fn judge_wall_move(
     ev: &Ev,
     leg: &Leg,
+    moved_after: i64,
     (from, to, auth): (&str, &str, &str),
     prompts: &[&str],
 ) -> Judged {
     let mut missing = Vec::new();
-    let w = (leg.from, leg.to);
+    let w = (moved_after, leg.to);
     let from_s = leg.from / 1000 - 1;
-    if logged(&ev.aterm_log, &format!(": account advice: move to {to}"), w).is_empty() {
+    let moved_s = moved_after / 1000 - 1;
+    let advised = format!(": account advice: move to {to}");
+    if logged(&ev.aterm_log, &advised, (leg.from, leg.to)).is_empty() {
         missing.push(format!("aterm.log has no `account advice: move to {to}`"));
     }
     if booked_after(&ev.ledger, from, "wall", from_s, |r| {
@@ -589,7 +659,7 @@ fn judge_wall_move(
     {
         missing.push(format!("no five_hour `wall` row for {from}"));
     }
-    let rotated = booked_after(&ev.ledger, from, "rotate", from_s, |r| r.to == to);
+    let rotated = booked_after(&ev.ledger, from, "rotate", moved_s, |r| r.to == to);
     if rotated.is_none() {
         missing.push(format!("no `rotate` row {from} → {to}"));
     }
@@ -707,7 +777,7 @@ pub fn judge_r3(ev: &Ev, leg: &Leg, a_reset: i64) -> Judged {
             (u * 1000 - m.t_ms) / 1000
         ));
     }
-    let wall = judge_wall_move(ev, leg, (LABEL_B, LABEL_A, AUTH_A), &[P1, P2, P3]);
+    let wall = judge_wall_move(ev, leg, leg.from, (LABEL_B, LABEL_A, AUTH_A), &[P1, P2, P3]);
     if wall.verdict != Verdict::Ok {
         missing.push(wall.evidence.clone());
     }
@@ -1084,6 +1154,78 @@ pub fn judge_r2(ev: &Ev, leg: &Leg) -> Judged {
     )
 }
 
+/// How much sooner than [`R6_JOB_S`] past its first sighting R6's job may be seen gone and still
+/// have run to its own end, ms: the job starts before the lab's first look finds it.
+const JOB_SLACK_MS: i64 = 10_000;
+
+/// R6: `lab-c` walled (`job.walled`) while the tab's background job (`job`) ran. The lab saw the
+/// job running at the wall and saw it gone no sooner than its own [`R6_JOB_S`] after it was first
+/// seen (less [`JOB_SLACK_MS`]): nothing ended it; no account restart came between the wall and
+/// its last sighting running; the instance's listing named the tab held by its jobs while it ran
+/// ([`held_by_jobs`]); and from that last sighting the move is [`judge_r1`]'s, onto `lab-a`,
+/// which served the next turn with P1 and P10 in its history.
+#[must_use]
+pub fn judge_r6(ev: &Ev, leg: &Leg, job: &Job) -> Judged {
+    let mut missing = Vec::new();
+    if job.pid == 0 {
+        missing.push(format!(
+            "no background `{}` of the tab was seen",
+            job_command()
+        ));
+    } else {
+        if job.walled == 0 {
+            missing.push(format!("{AUTH_C} was not walled while the job ran"));
+        } else if job.alive < job.walled {
+            missing.push("the job was not running at the wall".into());
+        }
+        if job.gone == 0 {
+            missing.push("the job was not seen to end".into());
+        } else if job.gone + JOB_SLACK_MS < job.seen + R6_JOB_S * 1000 {
+            missing.push(format!(
+                "the job was gone {} s after it was seen, short of its own {R6_JOB_S} s",
+                (job.gone - job.seen) / 1000
+            ));
+        }
+        if job.held == 0 {
+            missing.push("the instance's listing never named the tab held by its jobs".into());
+        }
+        if let Some(s) = any_restart(&ev.journal, (job.walled.max(leg.from), job.alive)) {
+            missing.push(format!(
+                "an account restart while the job ran: `{}`",
+                clip(&s.line, 80)
+            ));
+        }
+        // A move the job holds takes no row: each taken was struck back, and the strike's news
+        // asked it again at once (rp1103a: 371 in the job's 288 s at its wall).
+        let ran = (job.walled.max(leg.from) / 1000, job.alive / 1000);
+        let taken = ev
+            .ledger
+            .iter()
+            .filter(|r| r.account == LABEL_C && r.kind == "rotate" && r.to == LABEL_A)
+            .filter(|r| (ran.0..ran.1).contains(&r.t))
+            .count();
+        if taken > 0 {
+            missing.push(format!(
+                "{taken} rotation(s) {LABEL_C} → {LABEL_A} taken while the job ran"
+            ));
+        }
+    }
+    let after = if job.alive > 0 { job.alive } else { leg.from };
+    let wall = judge_wall_move(ev, leg, after, (LABEL_C, LABEL_A, AUTH_A), &[P1, P10]);
+    if wall.verdict != Verdict::Ok {
+        missing.push(wall.evidence.clone());
+    }
+    Judged::of(
+        &missing,
+        format!(
+            "`{}` ran {} s from before the wall, held: jobs, no move while it ran; {}",
+            job_command(),
+            (job.gone.max(job.seen) - job.seen) / 1000,
+            wall.evidence
+        ),
+    )
+}
+
 /// The stub: every `/v1/messages` request carried a roster row's credential (`oat:lab-a`,
 /// `oat:lab-b` or `oat:lab-c`), so every session ran on a stored login; unproven unless each of
 /// them carried one.
@@ -1324,11 +1466,13 @@ pub fn judge_asked(journal: &[Said], notes: &[Note]) -> Judged {
 }
 
 /// The rules a harness act in this proof may be typed for: the account move and the limit's
-/// resume, and the continue policy's (cruise's) own continuations.
-pub const ALLOWED_RULES: [&str; 8] = [
+/// resume, and the continue policy's (cruise's) own continuations, among them its carry at a
+/// break while the tab's own background job runs (R6's).
+pub const ALLOWED_RULES: [&str; 9] = [
     RULE_ACCOUNT,
     RULE_LIMIT_RESUME,
     RULE_CONTINUE,
+    RULE_BACKGROUND,
     RULE_DONE_CHECK,
     RULE_OPEN_ITEMS,
     RULE_UNCOMMITTED,
@@ -1814,8 +1958,7 @@ pub fn live_login(label: &str, now_ms: i64) -> String {
 /// Write `label`'s live login into `dir` (`.credentials.json`, owner-only), as Claude Code keeps
 /// a login where no keychain answers.
 fn put_login(dir: &Path, label: &str) -> Result<(), Fail> {
-    fs::create_dir_all(dir).map_err(|e| die(&dir.display().to_string(), e))?;
-    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    crate::util::create_private_dir_all(dir).map_err(|e| die(&dir.display().to_string(), e))?;
     let creds = dir.join(".credentials.json");
     crate::sys::put(
         &creds,
@@ -1975,7 +2118,8 @@ fn usage_blocks(five: &str) -> J {
 }
 
 /// Lay the three-row world in the lab's scratch, nowhere else: settings with no `apiKeyHelper`,
-/// no proxy and the stub's own base URL (the route the seam admits); the default login holding
+/// no proxy and the stub's own base URL (the route the seam admits), allowing `Bash(sleep …)`
+/// (R6's background job, so no permission box is drawn for it); the default login holding
 /// `lab-a`'s login, its profile naming `lab-a`'s account; `lab-b`'s login in its own directory;
 /// the fleet file beside the roster, and no roster (the instance's sync writes it); each
 /// credential's baseline figures.
@@ -2007,6 +2151,7 @@ fn lay_world(run: &Run, world: &World) -> Result<(), Fail> {
     env.set("ANTHROPIC_BASE_URL", J::s(crate::lab::stub_base_url(run)));
     env.set("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", J::s("1"));
     crate::verbs::settings_merge(run, &J::obj([("apiKeyHelper", J::Null), ("env", env)]))?;
+    crate::verbs::allow_sleep(run)?;
     let config = crate::verbs::read_scratch(&world.default_login.join(".claude.json"))?;
     let mut config = J::parse(&config).map_err(|e| die("the scratch .claude.json", e))?;
     config.remove("oauthAccount");
@@ -2019,7 +2164,7 @@ fn lay_world(run: &Run, world: &World) -> Result<(), Fail> {
     put_row_login(&world.login_b, LABEL_B, EMAIL_B, UUID_B)?;
     if let Some(logins) = world.login_b.parent() {
         // The store's own logins folder is owner-only, as the store makes it.
-        let _ = fs::set_permissions(logins, fs::Permissions::from_mode(0o700));
+        let _ = crate::util::set_dir_mode_nofollow(logins, 0o700);
     }
     let fleet = fleet_text();
     let parsed = FleetRoster::from_toml(&fleet, "the lab's fleet")
@@ -2123,9 +2268,8 @@ fn start_tab(run: &Run, door: &Door<'_>, sid: &str) -> Result<(), Fail> {
         }
     }
     let script = run.run.join("rotation-launch.sh");
-    atomic_write(&script, launcher(run)?.as_bytes())
+    crate::util::atomic_write_mode(&script, launcher(run)?.as_bytes(), 0o755)
         .map_err(|e| die(&script.display().to_string(), e))?;
-    let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o755));
     on(door, sid, &["send", &start_line(run, &script)])?;
     on(door, sid, &["key", "enter"])?;
     if let Some(why) = crate::forever::empty_composer(door, sid, "claude")?.why("Claude Code") {
@@ -2154,6 +2298,9 @@ struct Marks {
     r5a: Leg,
     r5b: Leg,
     r2: Leg,
+    r6: Leg,
+    /// R6's background job.
+    job: Job,
     /// The lab's own prompts, with when each was entered.
     prompts: Vec<(i64, String)>,
     /// Why the scenarios stopped short, where they did.
@@ -2328,9 +2475,30 @@ impl Drive<'_> {
 
     /// A 429 the stub gave `auth` at or after `from`.
     fn walled(&self, auth: &str, from: i64) -> bool {
+        self.wall_at(auth, from).is_some()
+    }
+
+    /// When the stub first gave `auth` a 429 at or after `from`, ms.
+    fn wall_at(&self, auth: &str, from: i64) -> Option<i64> {
         self.served()
             .iter()
-            .any(|s| s.t_ms >= from && s.auth == auth && s.status == 429)
+            .find(|s| s.t_ms >= from && s.auth == auth && s.status == 429)
+            .map(|s| s.t_ms)
+    }
+
+    /// The pid of R6's background job ([`job_command`]) where one of the lab's processes (a
+    /// descendant of its instance, or one in its jail) runs it now.
+    fn job_pid(&self) -> Option<i32> {
+        let rows = crate::procs::commands();
+        let table: Vec<(i32, i32)> = rows.iter().map(|(p, pp, _)| (*p, *pp)).collect();
+        let family = crate::procs::descendants_in(&table, self.run.instance_pid);
+        let jailed = crate::sys::jail_pids(&self.run.mark).unwrap_or_default();
+        let want = job_command();
+        rows.iter()
+            .find(|(pid, _, command)| {
+                command.trim() == want && (family.contains(pid) || jailed.contains(pid))
+            })
+            .map(|(pid, _, _)| *pid)
     }
 
     /// Type `prompt` where the composer stands empty; a prompt that cannot go in is no stop where
@@ -2404,7 +2572,8 @@ impl Drive<'_> {
     }
 }
 
-/// Run R1, R3, R4, R5a, R5b and R2 on one tab ([`Marks`]); a scenario that cannot go on says why.
+/// Run R1, R3, R4, R5a, R5b, R2 and R6 on one tab ([`Marks`]); a scenario that cannot go on says
+/// why.
 fn scenarios(d: &mut Drive<'_>, m: &mut Marks) -> Result<(), Fail> {
     let (run, world) = (d.run, d.world);
     d.sid = crate::verbs::sid(&d.door);
@@ -2666,7 +2835,114 @@ fn scenarios(d: &mut Drive<'_>, m: &mut Marks) -> Result<(), Fail> {
             return Ok(());
         }
     }
-    d.settle(LABEL_C, at)
+    d.settle(LABEL_C, at)?;
+    r6(d, m)
+}
+
+/// R6: `lab-c`, the tab's account since R2, meets its limit while a background job of the tab's
+/// Claude Code runs ([`Job`]); the job's whole run is watched, then the move after it.
+fn r6(d: &Drive<'_>, m: &mut Marks) -> Result<(), Fail> {
+    let run = d.run;
+    // lab-a's next answers read low again, so the move R6 makes onto it is not followed by
+    // R2's own move off it.
+    crate::verbs::write_headers_for(&run.w, AUTH_A, usage_blocks(BASELINE_5H))?;
+    // A turn that is no `bgstart` (cruise's own, at the job's break) answers in 2 s.
+    crate::verbs::set_auth_mode(run, AUTH_C, &format!("bg:{R6_JOB_S}:2"))?;
+    m.r6.from = now_ms();
+    m.r2.to = m.r6.from;
+    println!(
+        "(R6) {AUTH_C} answers `bgstart` with a background `{}`",
+        job_command()
+    );
+    if let Some(why) = d.prompt(m, P9)? {
+        m.r6.blocked = Some(format!("P9: {why}"));
+        return Ok(());
+    }
+    match d.wait("R6's background job", Duration::from_secs(120), || {
+        d.job_pid()
+    })? {
+        Ok(pid) => {
+            m.job.pid = pid;
+            m.job.seen = now_ms();
+            m.job.alive = m.job.seen;
+        }
+        Err(why) => {
+            m.r6.blocked = Some(why);
+            return Ok(());
+        }
+    }
+    println!("  its job runs: pid {}", m.job.pid);
+    let reset = now_secs() + i64::try_from(R6_RESET.as_secs()).unwrap_or(3600);
+    m.r6.reset = reset;
+    crate::verbs::set_auth_mode(run, AUTH_C, &format!("limit:five_hour:{reset}"))?;
+    let set = now_ms();
+    println!("(R6) {AUTH_C} at its five-hour limit until {reset}, the job running");
+    if let Some(why) = d.meet(m, P10, |d| d.walled(AUTH_C, set))? {
+        m.r6.blocked = Some(format!("P10: {why}"));
+        return Ok(());
+    }
+    match d.wait("R6's wall", HANG, || d.wall_at(AUTH_C, set))? {
+        Ok(at) => m.job.walled = at,
+        Err(why) => {
+            m.r6.blocked = Some(why);
+            return Ok(());
+        }
+    }
+    // The job's whole run, the listing's word for the hold read every fifth look.
+    let end = m.job.seen + R6_JOB_S * 1000 + i64::try_from(HANG.as_millis()).unwrap_or(60_000);
+    let mut looks = 0_u32;
+    loop {
+        if d.job_pid() == Some(m.job.pid) {
+            m.job.alive = now_ms();
+        } else {
+            m.job.gone = now_ms();
+            break;
+        }
+        if m.job.held == 0 && looks % 5 == 0 {
+            let listing = d.listing();
+            if held_by_jobs(&listing, &d.sid) {
+                m.job.held = now_ms();
+                m.job.listing = listing;
+                println!("  the listing names the tab held by its jobs");
+            }
+        }
+        if now_ms() > end {
+            m.r6.blocked = Some(format!(
+                "the job ran past its own {R6_JOB_S} s and a minute more"
+            ));
+            return Ok(());
+        }
+        looks += 1;
+        stop::sleep(JOB_LOOK)?;
+    }
+    println!(
+        "(R6) the job ended {:.0} s after it was seen",
+        (m.job.gone - m.job.seen) as f64 / 1000.0
+    );
+    let after = m.job.alive;
+    let at = match d.wait(
+        "R6's move onto lab-a after the job",
+        d.grace + Duration::from_secs(240),
+        || d.moved(LABEL_A, after),
+    )? {
+        Ok(at) => at,
+        Err(why) => {
+            m.r6.blocked = Some(why);
+            return Ok(());
+        }
+    };
+    println!(
+        "(R6) moved onto {LABEL_A} {:.0} s after the job ended",
+        (at - m.job.gone) as f64 / 1000.0
+    );
+    match d.served_turn("R6's next turn", AUTH_A, at)? {
+        Ok(h) => m.r6.history = h,
+        Err(why) => {
+            m.r6.blocked = Some(why);
+            return Ok(());
+        }
+    }
+    d.settle(LABEL_A, at)
 }
 
 /// The text evidence the judges read, kept before `down` removes the scratch.
@@ -2723,7 +2999,7 @@ impl Kept {
             ("rotation-launches.txt", &launches.to_string()),
             ("rotation-marks.txt", &format!("{marks:#?}\n")),
         ] {
-            let _ = fs::write(to.join(name), text);
+            let _ = crate::util::write_fresh(&to.join(name), text);
         }
     }
 }
@@ -2783,7 +3059,7 @@ fn judge_run(
         leg_row(&close(&m.r1), |l| judge_r1(ev, l), &blocked(&m.r1)),
     ));
     if m.control {
-        for id in ["R3", "R4", "R5a", "R5b", "R2"] {
+        for id in ["R3", "R4", "R5a", "R5b", "R2", "R6"] {
             rows.push((
                 id,
                 Judged {
@@ -2829,6 +3105,10 @@ fn judge_run(
         rows.push((
             "R2",
             leg_row(&close(&m.r2), |l| judge_r2(ev, l), &blocked(&m.r2)),
+        ));
+        rows.push((
+            "R6",
+            leg_row(&close(&m.r6), |l| judge_r6(ev, l, &m.job), &blocked(&m.r6)),
         ));
     }
     rows.push(("stub", judge_stub(&ev.served)));
@@ -2917,8 +3197,8 @@ fn print_verdicts(run: &Run, m: &Marks, rows: &[(&str, Judged)], kept: Option<&P
         println!("  {id:<8} {word:<8} {}", j.evidence);
     }
     if let Some(kept) = kept {
-        let _ = fs::write(
-            kept.join("verdicts.txt"),
+        let _ = crate::util::write_fresh(
+            &kept.join("verdicts.txt"),
             rows.iter()
                 .map(|(id, j)| format!("{id}\t{:?}\t{}\n", j.verdict, j.evidence))
                 .collect::<String>(),
@@ -3077,6 +3357,7 @@ pub fn cmd_claude_rotation_proof(args: &[String]) -> Res {
         &mut marks.r5a,
         &mut marks.r5b,
         &mut marks.r2,
+        &mut marks.r6,
     ] {
         if leg.from > 0 && leg.to == 0 {
             leg.to = end;

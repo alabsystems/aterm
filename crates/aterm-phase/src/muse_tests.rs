@@ -32,12 +32,24 @@ fn edited(rows: &[String], head: &str, with: &str) -> Vec<String> {
 fn captures() -> Vec<(String, String)> {
     crate::text::fixture_files()
         .into_iter()
-        .filter(|(name, _)| name.starts_with("muse-"))
+        .filter(|(name, _)| muse_screen_file(name))
         .collect()
 }
 
+/// A Muse Code capture of a screen: a `-cells` file records cells of one (`ctl cell` replies), no
+/// screen, and is swept as no program's.
+fn muse_screen_file(name: &str) -> bool {
+    name.starts_with("muse-") && !name.ends_with("-cells.txt")
+}
+
+/// A capture no screen sniff names Muse Code's, only its process name: Muse Code gone, its launch
+/// line, and its shell mode, a `!` line typed or pasted (v6 §14.17.5.8), which draws `!` as the
+/// caret and no `❯` composer.
 fn unnamed(file: &str, text: &str) -> bool {
-    file.contains("-exited-") || text == crate::muse::fixtures::LAUNCH_LINE
+    file.contains("-exited-")
+        || text == crate::muse::fixtures::LAUNCH_LINE
+        || text == crate::muse::fixtures::SHELL_MODE_DRAFT
+        || text == crate::muse::fixtures::PASTED_BANG_DRAFT
 }
 
 #[test]
@@ -141,6 +153,25 @@ fn the_history_search_keeps_the_composer_frame_and_is_read_open() {
     let quoted = edited(&closed, "❯", &format!("❯ {}", crate::text::trim(&words)));
     assert!(composer_rules(&quoted).is_some(), "{quoted:#?}");
     assert!(!history_search(&quoted));
+}
+
+/// THE SEARCH IS READ ON EVERY MEASURED SEARCH FRAME AND ON NO OTHER SCREEN: its scoped row at full
+/// width, and a narrow window's, its scope dropped (34 and 26 columns) or cut from the left (22),
+/// told by its place alone between the bottom rule and the footer
+/// (`is_lone_search_row`); none of the other measured screens of Muse Code reads as one.
+/// NEGATIVE CONTROL: `is_lone_search_row` taking the scoped row alone, and the narrow frames read
+/// no search.
+#[test]
+fn the_search_reads_on_every_measured_search_frame_and_on_no_other_screen() {
+    let mut searched = Vec::new();
+    for (name, text) in captures() {
+        let search = name.contains("-history-search") && !name.contains("-left");
+        assert_eq!(history_search(&screen(&text)), search, "{name}");
+        if search {
+            searched.push(name);
+        }
+    }
+    assert_eq!(searched.len(), 5, "{searched:#?}");
 }
 
 #[test]
@@ -309,7 +340,7 @@ fn the_muse_sniff_claims_no_other_programs_screen() {
     let mut swept = 0;
     for (name, text) in crate::text::fixture_files() {
         let r = screen(&text);
-        if name.starts_with("muse-") {
+        if muse_screen_file(&name) {
             assert_eq!(is_muse_screen(&r), !unnamed(&name, &text), "{name}");
             continue;
         }

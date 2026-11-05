@@ -1156,42 +1156,43 @@ impl SupervisorConfig {
     /// [`Self::from_aterm_toml`] over the file at `path`: no path or no file is the defaults.
     #[must_use]
     pub fn from_path(path: Option<&Path>) -> (Self, Vec<String>) {
-        use std::io::Read as _;
-        const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
         let Some(path) = path else {
             return (Self::default(), Vec::new());
         };
-        let read_result = aterm_uds::regular_file::open(path).and_then(|(file, meta)| {
-            if meta.len() > MAX_CONFIG_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "config file exceeds size limit",
-                ));
-            }
-            let cap = usize::try_from(meta.len().min(MAX_CONFIG_BYTES))
-                .unwrap_or(0)
-                .saturating_add(1);
-            let mut bytes = Vec::with_capacity(cap);
-            file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_CONFIG_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "config file exceeds size limit",
-                ));
-            }
-            Ok(bytes)
-        });
-        match read_result {
-            Ok(bytes) => Self::from_aterm_toml(&String::from_utf8_lossy(&bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), Vec::new()),
-            Err(e) => (
-                Self::default(),
-                vec![format!(
-                    "{}: cannot be read ({e}); the defaults apply",
-                    path.display()
-                )],
-            ),
-        }
+        Self::read_path(Some(path)).unwrap_or_else(|e| {
+            Self::unread_config(format!(
+                "{}: cannot be read ({e}); the harness is disabled",
+                path.display()
+            ))
+        })
+    }
+
+    /// Read admitted policy while preserving an unavailable configuration as an error.
+    ///
+    /// # Errors
+    /// Returns the common reader's refusal or I/O error for an existing configuration.
+    pub(crate) fn read_path(
+        path: Option<&Path>,
+    ) -> Result<(Self, Vec<String>), aterm_types::dirs::AtermConfigReadError> {
+        let Some(path) = path else {
+            return Ok((Self::default(), Vec::new()));
+        };
+        Ok(match aterm_types::dirs::read_aterm_config(path)? {
+            Some(bytes) => Self::from_aterm_toml(&String::from_utf8_lossy(&bytes)),
+            None => (Self::default(), Vec::new()),
+        })
+    }
+
+    /// Disable supervision when an existing configuration cannot be admitted or read.
+    #[must_use]
+    pub fn unread_config(note: String) -> (Self, Vec<String>) {
+        (
+            Self {
+                enabled: false,
+                ..Self::default()
+            },
+            vec![note],
+        )
     }
 
     fn set_value(&mut self, key: &str, value: &aterm_toml::Value) -> Result<(), String> {
@@ -3943,6 +3944,49 @@ trust_dialog = false
         assert!(!read("[harness]\nanswer_questions = false\n").answer_questions);
     }
 
+    /// A person's `aterm.toml` in a dotfiles checkout or home-manager's store is their config,
+    /// here as in the window: a link there does not put the defaults in its place.
+    #[cfg(unix)]
+    #[test]
+    fn from_path_reads_through_a_linked_aterm_toml() {
+        let dir = crate::supervise::ScratchDir::new("harness-cfg", "from-path-link");
+        let real = dir.join("dotfiles.toml");
+        aterm_uds::atomic_file::write(&real, b"[harness]\nenabled = false\n", 0o600).unwrap();
+        let link = dir.join("aterm.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (config, notes) = SupervisorConfig::from_path(Some(&link));
+        assert!(!config.enabled, "{notes:?}");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_untrusted_disabled_config_is_refused_without_enabling_the_harness() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::supervise::ScratchDir::new("harness-cfg", "untrusted-disabled");
+        let real = dir.join("dotfiles.toml");
+        std::fs::write(&real, "[harness]\nenabled = false\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let link = dir.join("aterm.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        for path in [&real, &link] {
+            let (config, notes) = SupervisorConfig::from_path(Some(path));
+            assert!(!config.enabled, "a refused file cannot enable automation");
+            assert!(!notes.is_empty(), "an untrusted config must be refused");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_config_does_not_enable_the_harness() {
+        let dir = crate::supervise::ScratchDir::new("harness-cfg", "unreadable");
+        let (config, notes) = SupervisorConfig::from_path(Some(&dir));
+        assert!(
+            !config.enabled,
+            "unreadable config cannot enable automation"
+        );
+        assert!(!notes.is_empty());
+    }
+
     #[test]
     fn from_path_reads_the_file_and_a_missing_one_is_the_defaults() {
         let dir = crate::supervise::ScratchDir::new("harness-cfg", "from-path");
@@ -3955,14 +3999,17 @@ trust_dialog = false
             SupervisorConfig::from_path(None).0,
             SupervisorConfig::default()
         );
-        std::fs::write(&toml, "[harness]\nenabled = false\n").expect("write");
+        aterm_uds::atomic_file::write(&toml, b"[harness]\nenabled = false\n", 0o600)
+            .expect("write");
         assert!(!SupervisorConfig::from_path(Some(&toml)).0.enabled);
-        std::fs::write(&toml, b"# caf\xe9\n[harness]\nenabled = false\n").expect("write");
+        aterm_uds::atomic_file::write(&toml, b"# caf\xe9\n[harness]\nenabled = false\n", 0o600)
+            .expect("write");
         assert!(!SupervisorConfig::from_path(Some(&toml)).0.enabled);
-        std::fs::write(&toml, b"# caf\xe9\n[harness]\nenabled = true\n").expect("write");
+        aterm_uds::atomic_file::write(&toml, b"# caf\xe9\n[harness]\nenabled = true\n", 0o600)
+            .expect("write");
         assert!(SupervisorConfig::from_path(Some(&toml)).0.enabled);
         let (c, notes) = SupervisorConfig::from_path(Some(&dir));
-        assert_eq!(c, SupervisorConfig::default());
+        assert!(!c.enabled);
         assert!(!notes.is_empty());
     }
 
@@ -4057,6 +4104,7 @@ trust_dialog = false
         for text in [
             "[harness]\nquestion_priority = \"long_term\"\n",
             "[harness]\nquestion_priority = \"ask\"\n",
+            "[harness]\nquestion_priority = \"land\"\n",
             "[harness]\nquestion_priority = true\n",
             "[harness]\nquestion_priority = 2.5\n",
             "font_px = \n[harness]\nquestion_priority = \"sometimes\"\n",

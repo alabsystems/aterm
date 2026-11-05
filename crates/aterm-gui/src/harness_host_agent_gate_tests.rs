@@ -204,14 +204,14 @@ fn switching_off_revokes_a_cold_relaunch_read_already_inflight() {
     let mut h = hooks(&world, parking_body(&world));
     h.acts.account_cold = {
         let release = Arc::clone(&release);
-        Arc::new(move |_| {
+        Arc::new(move |_, _| {
             release_after_edit(&release, &entered_tx);
-            None
+            Ok(relaunch::ColdAdmission::Immediate(None))
         })
     };
     h.acts.relaunch_restored = {
         let relaunched = Arc::clone(&relaunched);
-        Arc::new(move |_, _, _, _| {
+        Arc::new(move |_, _, _, _, _| {
             relaunched.fetch_add(1, Ordering::SeqCst);
             "done".to_string()
         })
@@ -357,7 +357,7 @@ fn an_off_on_edit_revokes_an_inflight_restored_landing_read() {
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let released = Arc::clone(&release);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    hooks.acts.relaunch_restored = Arc::new(|_, _, _, _| "adopted".to_string());
+    hooks.acts.relaunch_restored = Arc::new(|_, _, _, _, _| "adopted".to_string());
     hooks.acts.exited = Arc::new(|_, _| true);
     hooks.acts.snapshot = Arc::new(move |sid| {
         release_after_edit(&released, &entered_tx);
@@ -474,14 +474,16 @@ fn an_agent_switched_off_in_the_tab_ends_the_exit_left_to_the_host() {
         a.open.lock().unwrap().insert("s-a".to_string());
         a.set(&[("s-a", Program::Claude)]);
         let mut h = a.hooks();
-        h.acts.relaunch_restored = Arc::new(|_, _, _, _| "refused:inert".to_string());
+        h.acts.relaunch_restored = Arc::new(|_, _, _, _, _| "refused:inert".to_string());
         let (world, line) = (Arc::clone(&a), Arc::clone(&h.acts.relaunch));
-        h.acts.relaunch = Arc::new(move |sid, pid, snap, left, upgrade, asked, carried| {
-            if world.agent_in(sid).is_some_and(|(now, _)| now != snap.pid) {
-                return "wait:shell-prompt".to_string();
-            }
-            line(sid, pid, snap, left, upgrade, asked, carried)
-        });
+        h.acts.relaunch = Arc::new(
+            move |sid, pid, snap, left, upgrade, asked, carried, admit| {
+                if world.agent_in(sid).is_some_and(|(now, _)| now != snap.pid) {
+                    return "wait:shell-prompt".to_string();
+                }
+                line(sid, pid, snap, left, upgrade, asked, carried, admit)
+            },
+        );
         let mut codex_off = on();
         codex_off.off.push(Program::Codex);
         let host = HostHandle::start(codex_off, false, false, h);
@@ -729,7 +731,7 @@ fn an_agent_switched_off_overtakes_a_restored_relaunch_of_its_tab() {
         let a = Arc::new(Acting::default());
         a.open.lock().unwrap().insert("s-a".to_string());
         let mut h = a.hooks();
-        h.acts.relaunch_restored = Arc::new(|_, _, _, _| {
+        h.acts.relaunch_restored = Arc::new(|_, _, _, _, _| {
             hold_this_steps_retry();
             "wait:shell-prompt".to_string()
         });

@@ -3,6 +3,10 @@
 
 //! `aterm-libc-oracle` gate ([`siblings`], [`shape`], [`symbols`], [`controls`]) and authoring
 //! verbs ([`regen`], [`harvest`]).
+//!
+//! STOCK EXCEPTION: the authoring verbs compile the non-host cells with a stock rustup
+//! toolchain that has those targets' std (`--stock`, `stable` by default), because Trust
+//! ships std for its host only.
 
 mod cargo;
 mod cells;
@@ -40,20 +44,7 @@ pub(crate) const MAX_ORACLE_FILE_BYTES: u64 = 256 << 20;
 
 pub(crate) fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
-    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    let file = std::fs::File::open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
+    let (file, meta) = aterm_uds::regular_file::open(path)?;
     if meta.len() > MAX_ORACLE_FILE_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -75,6 +66,18 @@ pub(crate) fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
 pub(crate) fn read_regular_text(path: &Path) -> std::io::Result<String> {
     String::from_utf8(read_regular_file(path)?)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+pub(crate) fn write_fresh(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    }
+    opts.open(path)?.write_all(bytes.as_ref())
 }
 
 const USAGE: &str = "\

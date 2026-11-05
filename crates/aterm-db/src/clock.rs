@@ -584,8 +584,10 @@ impl State {
     /// machine (machine, at, lo, hi, source), every integer little-endian.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = STATE_MAGIC.to_vec();
-        let count = u16::try_from(self.readings.len().min(MAX_READINGS)).expect("bounded count");
+        let count_usize = self.readings.len().min(MAX_READINGS);
+        let mut bytes = Vec::with_capacity(STATE_MAGIC.len() + 2 + 1 + count_usize * ENTRY_LEN);
+        bytes.extend_from_slice(STATE_MAGIC);
+        let count = u16::try_from(count_usize).expect("bounded count");
         bytes.extend_from_slice(&count.to_le_bytes());
         bytes.push(self.last.tag());
         for (machine, reading) in self.readings.iter().take(MAX_READINGS) {
@@ -611,8 +613,16 @@ impl State {
         if count > MAX_READINGS || rest.len() != count * ENTRY_LEN {
             return None;
         }
+        let last = Standing::from_tag(tag)?;
         let mut readings = BTreeMap::new();
+        let mut prev_machine: Option<[u8; 16]> = None;
         for entry in rest.as_chunks::<ENTRY_LEN>().0 {
+            let machine: [u8; 16] = entry[..16].try_into().expect("sixteen");
+            // One spelling: sorted, distinct machines.
+            if prev_machine.is_some_and(|prev| prev >= machine) {
+                return None;
+            }
+            prev_machine = Some(machine);
             let word = |at: usize| -> [u8; 8] { entry[at..at + 8].try_into().expect("eight") };
             let reading = Reading {
                 at_ms: u64::from_le_bytes(word(16)),
@@ -627,14 +637,9 @@ impl State {
             if reading.lo_ms > reading.hi_ms {
                 return None;
             }
-            readings.insert(entry[..16].try_into().expect("sixteen"), reading);
+            readings.insert(machine, reading);
         }
-        let state = Self {
-            last: Standing::from_tag(tag)?,
-            readings,
-        };
-        // One spelling: sorted, distinct machines.
-        (state.encode() == bytes).then_some(state)
+        Some(Self { last, readings })
     }
 
     /// The state in `dir` (the claim directory); none, or any other spelling, reads as no

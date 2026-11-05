@@ -185,14 +185,30 @@ fn a_resync_syncs_only_what_changed_and_writes_only_what_differs() {
     assert_ne!(inodes(&watched)[0], held[0]);
 }
 
-/// The rows a resync leaves with no login here go to the automatic ladder at once, and where
-/// no route can sign one in that is on record (its routes named), with nothing started and no
-/// person asked. CONTROL: a resync that may not sign in (an instance that keeps no fleet
-/// accounts of its own) reports the row and records nothing.
+/// The rows a resync leaves with no login here are reported, and the automatic ladder leaves
+/// them for a person (`accounts login <label>`): no session here can run on a row with no login
+/// here, and no Mac uses it yet (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4), so nothing
+/// is started and nothing is on record, even where a session's record names the row. CONTROL: a
+/// resync that may not sign in (an instance that keeps no fleet accounts of its own) reports the
+/// row the same way.
 #[test]
-fn the_rows_a_resync_leaves_without_a_login_go_to_the_ladder_and_on_record() {
-    for sign_in in [false, true] {
+fn the_rows_a_resync_leaves_without_a_login_are_reported_and_left_for_a_person() {
+    for (sign_in, session) in [(false, false), (true, false), (true, true)] {
         let desk = discovered_desk();
+        if session {
+            desk.store()
+                .transact(NOW - 10, &mut None, |state| {
+                    let mut events = accounts::note_session(state, "s-1", "m27-2", None, NOW - 10);
+                    events.extend(accounts::note_auth(
+                        state,
+                        "m27-2",
+                        accounts::Auth::SignedOut,
+                        NOW - 10,
+                    ));
+                    Ok(events)
+                })
+                .unwrap();
+        }
         let fetch = |_: &Env, source: &str| -> Result<String, String> {
             Err(format!("no fetch in a test: {source}"))
         };
@@ -208,20 +224,13 @@ fn the_rows_a_resync_leaves_without_a_login_go_to_the_ladder_and_on_record() {
         let done = resync_with(&desk.home, &desk.state, (&desk.roster(), NOW, sign_in), &fx);
         assert_eq!(done.to_sign_in, ["m27-2"], "{done:?}");
         assert!(!done.renewal);
-        assert_eq!(
-            started.load(Ordering::SeqCst),
-            0,
-            "no route, so nothing started"
-        );
+        assert_eq!(started.load(Ordering::SeqCst), 0, "nothing started");
         let (logins, _) = desk.store().load_logins(NOW).unwrap();
-        let attempt = logins.get("m27-2").and_then(|b| b.sign_in_attempt.clone());
-        if sign_in {
-            let attempt = attempt.expect("the attempt is on record");
-            assert_eq!(attempt.outcome, accounts::AttemptOutcome::NoRoute);
-            assert!(!attempt.routes.is_empty());
-        } else {
-            assert_eq!(attempt, None, "CONTROL");
-        }
+        assert_eq!(
+            logins.get("m27-2").and_then(|b| b.sign_in_attempt.clone()),
+            None,
+            "nothing on record: sign_in {sign_in}, session {session}"
+        );
     }
 }
 

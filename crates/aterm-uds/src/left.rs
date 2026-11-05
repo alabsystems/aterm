@@ -233,6 +233,67 @@ pub struct Row {
     pub birth_ms: Option<i64>,
 }
 
+impl Row {
+    /// A sweep row in the reader's form.
+    #[must_use]
+    pub fn of(p: &aterm_sysprobe::procs::ProcessReading) -> Self {
+        Self {
+            pid: p.pid,
+            ppid: p.ppid,
+            pgid: p.pgid,
+            start: p.start,
+            cpu_ns: p.cpu_ns,
+            birth_ms: p.birth_ms,
+        }
+    }
+}
+
+/// The rows of `sweep` a reading takes: those of `self_pid`'s user, an exited one (a zombie) left
+/// out; none when the sweep does not say whose `self_pid` is.
+#[must_use]
+pub fn rows_of(sweep: &[aterm_sysprobe::procs::ProcessReading], self_pid: u32) -> Vec<Row> {
+    let Some(uid) = sweep.iter().find(|p| p.pid == self_pid).and_then(|p| p.uid) else {
+        return Vec::new();
+    };
+    sweep
+        .iter()
+        .filter(|p| p.uid == Some(uid))
+        .filter(|p| p.state != aterm_sysprobe::jobs::RunState::Zombie)
+        .map(Row::of)
+        .collect()
+}
+
+/// Records the first `dead_seen` observation of each record of `runs` whose launcher a reading
+/// found dead and that has none as read (§3.3), and takes the pair the record actually keeps into
+/// the run as read. Its proposal is the highest unique id of a table of this uid read after the
+/// launcher was found dead ([`crate::runs::table`]), never a sweep read before that, so whatever
+/// the run started before it died is inside its window; where another reader recorded first, the
+/// run takes that reader's pair instead ([`crate::runs::append_dead_seen`]). A table that does not
+/// read whole proposes none, and a busy, changed, malformed or unwritable record leaves the run
+/// with none: a later reading tries again, and no unrecorded horizon stands in for it.
+pub fn append_dead_seen(k: &dyn LeftKernel, self_pid: u32, runs: &mut [RunRead], at_ms: u64) {
+    if !runs.iter().any(|r| r.dead && r.record.dead_seen.is_none()) {
+        return;
+    }
+    let Some((_, horizon)) = i32::try_from(self_pid)
+        .ok()
+        .and_then(|me| crate::runs::table(k, me))
+    else {
+        return;
+    };
+    for run in runs
+        .iter_mut()
+        .filter(|r| r.dead && r.record.dead_seen.is_none())
+    {
+        let Ok(recorded) = crate::runs::append_dead_seen(&run.path, &run.record, horizon, at_ms)
+        else {
+            continue;
+        };
+        run.record.dead_seen = Some(recorded.horizon);
+        run.record.dead_seen_ms = Some(recorded.at_ms);
+    }
+}
+
 /// What the host knows that the kernel does not, for one reading.
 #[derive(Clone, Copy, Debug)]
 pub struct Known<'a> {
@@ -948,16 +1009,27 @@ impl Reader {
     }
 }
 
+/// A FRESH READ THAT COULD NOT BE MADE ([`read_one`]): this uid's process table did not list, so
+/// whether a pid is gone is unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unread;
+
 /// `pid`'s facts on fresh state, every read made again and none bounded: what `end` re-proves
-/// right before a signal. `None` when it is gone, is this process or one of its ancestors, or
+/// right before a signal. `Ok(None)` when it is gone, is this process or one of its ancestors, or
 /// launchd started it.
-#[must_use]
-pub fn read_one(k: &dyn LeftKernel, pid: u32, known: &Known<'_>) -> Option<Facts> {
-    let lin = k.lineage(i32::try_from(pid).ok()?)?;
-    let me = i32::try_from(known.self_pid).ok()?;
-    let (pids, _) = crate::runs::table(k, me)?;
+///
+/// # Errors
+/// [`Unread`] when this uid's process table cannot be listed ([`crate::runs::table`]).
+pub fn read_one(k: &dyn LeftKernel, pid: u32, known: &Known<'_>) -> Result<Option<Facts>, Unread> {
+    let Some(lin) = i32::try_from(pid).ok().and_then(|pid| k.lineage(pid)) else {
+        return Ok(None);
+    };
+    let (pids, _) = i32::try_from(known.self_pid)
+        .ok()
+        .and_then(|me| crate::runs::table(k, me))
+        .ok_or(Unread)?;
     if !pids.contains(&lin.identity.pid) {
-        return None;
+        return Ok(None);
     }
     let row = Row {
         pid,
@@ -968,7 +1040,7 @@ pub fn read_one(k: &dyn LeftKernel, pid: u32, known: &Known<'_>) -> Option<Facts
     let by_pid = HashMap::from([(pid, &row)]);
     let runs = this_boot(k, known);
     let mut reader = Reader::new();
-    reader
+    Ok(reader
         .judge_rows(
             k,
             known,
@@ -978,7 +1050,7 @@ pub fn read_one(k: &dyn LeftKernel, pid: u32, known: &Known<'_>) -> Option<Facts
             Bounds::FRESH,
         )
         .0
-        .pop()
+        .pop())
 }
 
 #[cfg(test)]

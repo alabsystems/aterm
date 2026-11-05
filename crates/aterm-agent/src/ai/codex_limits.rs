@@ -393,13 +393,104 @@ pub fn pick(rollouts: &[Vec<CodexLimits>], family: &str, now_unix: i64) -> Optio
 /// written last ([`rollout_readings`], [`pick`]).
 #[must_use]
 pub fn home_pick(home: &Path, now_unix: i64) -> Option<Pick> {
+    pick(&home_readings(home), CODEX_FAMILY, now_unix)
+}
+
+/// [`home_pick`] of the readings from `since` on: an older one no longer speaks for the home's row
+/// ([`crate::harness::accounts::Account::room_since`]). A pick keeps a window's largest share across
+/// rollouts and stamps a tie with its earliest reading, so what it picked cannot say this afterwards.
+#[must_use]
+pub fn home_pick_since(home: &Path, since: Option<i64>, now_unix: i64) -> Option<Pick> {
+    pick(
+        &readings_since(home_readings(home), since),
+        CODEX_FAMILY,
+        now_unix,
+    )
+}
+
+/// `rollouts` without the readings from before `since`.
+fn readings_since(
+    mut rollouts: Vec<Vec<CodexLimits>>,
+    since: Option<i64>,
+) -> Vec<Vec<CodexLimits>> {
+    if let Some(since) = since {
+        for rollout in &mut rollouts {
+            rollout.retain(|reading| reading.at_unix >= since);
+        }
+    }
+    rollouts
+}
+
+/// The usage readings of the six (`NEWEST_READ`) rollouts of `home` written last
+/// ([`rollout_readings`]).
+fn home_readings(home: &Path) -> Vec<Vec<CodexLimits>> {
     let mut scratch = Vec::with_capacity(64 * 1024);
-    let rollouts: Vec<Vec<CodexLimits>> = rollouts_by_write(home)
+    rollouts_by_write(home)
         .iter()
         .take(NEWEST_READ)
         .filter_map(|(path, _)| rollout_readings_inner(path, CONTEXT_REACH, true, &mut scratch))
+        .collect()
+}
+
+/// How far back a rollout can hold a window that still runs: the longest a window lasts, a week.
+const LOGIN_REACH_S: i64 = 7 * 86_400;
+
+/// The usage readings of the six (`NEWEST_READ`) rollouts of `home` written last that opened under
+/// the login `key` ([`opening_account`]), judged before the six are counted, so other sessions'
+/// rollouts in the same home never push a login's own out of view, among those that can still hold
+/// a running window ([`LOGIN_REACH_S`]).
+fn login_readings(home: &Path, key: AccountKey, now_unix: i64) -> Vec<Vec<CodexLimits>> {
+    let mut scratch = Vec::with_capacity(64 * 1024);
+    let reach = u64::try_from(now_unix.saturating_sub(LOGIN_REACH_S)).unwrap_or(0);
+    let opened_under_key = |path: &Path| {
+        crate::harness::footer::open_regular(path)
+            .and_then(|file| first_line_of(&file))
+            .as_deref()
+            .and_then(opening_account)
+            == Some(key)
+    };
+    rollouts_by_write(home)
+        .iter()
+        .take_while(|(_, written)| {
+            written
+                .duration_since(std::time::UNIX_EPOCH)
+                .is_ok_and(|since| since.as_secs() >= reach)
+        })
+        .filter(|(path, _)| opened_under_key(path))
+        .take(NEWEST_READ)
+        .filter_map(|(path, _)| rollout_readings_inner(path, CONTEXT_REACH, true, &mut scratch))
+        .collect()
+}
+
+/// The usage sample the rollouts of `homes` hold of the login `key`: what is left of its windows at
+/// `now_unix`, where one of its readings is no older than [`FRESH_S`] or one of them reads a window
+/// full with its reset ahead, since a session stopped at a wall writes no later reading. Only a
+/// rollout opened under that login counts ([`login_readings`]), and one that names no login is left
+/// out rather than guessed at, and so is a reading from before `since`, once the row is known to
+/// have had room ([`crate::harness::accounts::Account::room_since`]).
+///
+/// A ROLLOUT NAMES ONLY THE LOGIN THAT OPENED IT: one resumed under another login keeps its
+/// opening line, and nothing says which login wrote a reading ([`conversation_newest`]). So this
+/// speaks for `key` only in a home no other login writes to, which the caller answers for as things
+/// stand now ([`crate::harness::cli::survey_accounts`]): a login removed from that home within the
+/// week can still have its full reading credited here, which only keeps a row from being picked
+/// until that window resets or a launch reads it. Reads files alone.
+#[must_use]
+pub fn login_sample(
+    homes: &[&Path],
+    key: AccountKey,
+    since: Option<i64>,
+    now_unix: i64,
+) -> Option<Sample> {
+    let rollouts: Vec<Vec<CodexLimits>> = homes
+        .iter()
+        .flat_map(|home| login_readings(home, key, now_unix))
         .collect();
-    pick(&rollouts, CODEX_FAMILY, now_unix)
+    let pick = pick(&readings_since(rollouts, since), CODEX_FAMILY, now_unix)?;
+    let full = pick.windows.iter().any(|window| {
+        window.used_percent >= 100.0 && window.resets_at.is_some_and(|reset| reset > now_unix)
+    });
+    (full || now_unix.saturating_sub(pick.newest) <= FRESH_S).then(|| sample_of(&pick))
 }
 
 /// A [`Pick`] as the account pool's usage [`Sample`]: its five-hour window is the session, its
@@ -1156,6 +1247,141 @@ mod tests {
             .tempdir()
             .expect("tmp");
         assert_eq!(home_sample(home.path(), now), None, "no rollout, no sample");
+    }
+
+    /// A LOGIN'S FIGURES COME ONLY FROM ROLLOUTS THAT OPENED UNDER IT: another login's newer reading
+    /// in the same home never speaks for it, a rollout that names no login is left out rather
+    /// than guessed at, and a reading older than [`FRESH_S`] gives none unless it reads a window
+    /// full with its reset ahead: a session stopped at a wall writes nothing later, so age says
+    /// nothing of that wall, until its window ends.
+    #[test]
+    fn a_logins_sample_is_read_only_from_its_own_fresh_rollouts() {
+        let home = aterm_tempfile::Builder::new()
+            .prefix("codex-login-sample-")
+            .tempdir()
+            .expect("temp dir");
+        let day = home.path().join("sessions/2026/10/16");
+        std::fs::create_dir_all(&day).expect("mkdir");
+        let now_ms = T0;
+        let now = now_ms / 1000;
+        let week = now + 300_000;
+        let write = |name: &str, thread: &str, login, at_ms: i64, used: f64| {
+            let body = [
+                meta_as(at_ms - 1_000, thread, thread, None, Some(PAGINATED), login),
+                rate(at_ms, "codex", None, Some((used, 10_080, week))),
+            ]
+            .concat();
+            std::fs::write(day.join(format!("rollout-{name}-{thread}.jsonl")), body)
+                .expect("write rollout");
+        };
+        write(
+            "2026-10-16T08-00-00",
+            ROOT,
+            Some(LOGIN_A),
+            now_ms - 60_000,
+            100.0,
+        );
+        write(
+            "2026-10-16T09-00-00",
+            SUB,
+            Some(LOGIN_B),
+            now_ms - 5_000,
+            7.0,
+        );
+        write("2026-10-16T10-00-00", OTHER, None, now_ms - 1_000, 3.0);
+
+        let homes = [home.path()];
+        let of = |login, at| login_sample(&homes, key(login).expect("a key"), None, at);
+        assert_eq!(of(LOGIN_A, now).and_then(|s| s.week_pct), Some(100));
+        assert_eq!(of(LOGIN_B, now).and_then(|s| s.week_pct), Some(7));
+        assert_eq!(
+            of(("acct-lab-3", "user-lab"), now),
+            None,
+            "no rollout opened under it"
+        );
+        assert_eq!(
+            of(LOGIN_B, now + FRESH_S + 61),
+            None,
+            "its reading is too old to read"
+        );
+        assert_eq!(
+            of(LOGIN_A, now + FRESH_S + 61).and_then(|s| s.week_pct),
+            Some(100),
+            "a wall outlasts the age of the reading that showed it"
+        );
+        assert_eq!(
+            of(LOGIN_A, week + 1),
+            None,
+            "CONTROL: its window ended, so nothing is left of it"
+        );
+    }
+
+    /// A login's own rollouts are found before the six are counted: however many newer rollouts other
+    /// logins and subagents wrote in that home, its wall stays in view, and a rollout written too
+    /// long ago to hold a running window is not read.
+    #[test]
+    fn newer_rollouts_of_others_never_push_a_logins_wall_out_of_view() {
+        let home = aterm_tempfile::Builder::new()
+            .prefix("codex-login-cap-")
+            .tempdir()
+            .expect("temp dir");
+        let day = home.path().join("sessions/2026/10/16");
+        std::fs::create_dir_all(&day).expect("mkdir");
+        let now_ms = T0;
+        let now = now_ms / 1000;
+        let week = now + 300_000;
+        let set_written = |path: &std::path::Path, at: i64| {
+            let at = std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(u64::try_from(at).expect("after the epoch"));
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open")
+                .set_modified(at)
+                .expect("set its write time");
+        };
+        let write = |name: String, thread: &str, login, at_ms: i64, used: f64| {
+            let body = [
+                meta_as(at_ms - 1_000, thread, thread, None, Some(PAGINATED), login),
+                rate(at_ms, "codex", None, Some((used, 10_080, week))),
+            ]
+            .concat();
+            let path = day.join(format!("rollout-{name}-{thread}.jsonl"));
+            std::fs::write(&path, body).expect("write rollout");
+            path
+        };
+        let own = write(
+            "2026-10-16T08-00-00".to_string(),
+            ROOT,
+            Some(LOGIN_A),
+            now_ms - 3_600_000,
+            100.0,
+        );
+        set_written(&own, now - 3_600);
+        for i in 0..NEWEST_READ * 2 {
+            let login = (i % 2 == 0).then_some(LOGIN_B);
+            let thread = format!("01900000-0000-7000-8000-0000000000{i:02}");
+            let newer = write(
+                format!("2026-10-16T09-00-{i:02}"),
+                &thread,
+                login,
+                now_ms - 60_000,
+                7.0,
+            );
+            set_written(&newer, now - 60);
+        }
+        let homes = [home.path()];
+        let a = key(LOGIN_A).expect("a key");
+        assert_eq!(
+            login_sample(&homes, a, None, now).and_then(|s| s.week_pct),
+            Some(100)
+        );
+        set_written(&own, now - LOGIN_REACH_S - 1);
+        assert_eq!(
+            login_sample(&homes, a, None, now),
+            None,
+            "written too long ago"
+        );
     }
 
     #[test]

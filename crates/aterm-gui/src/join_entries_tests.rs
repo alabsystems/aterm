@@ -17,6 +17,7 @@ fn row(id: u64, name: &str, code: &str) -> Row {
         state: RowState::Asking,
         removed: None,
         restore: false,
+        moves: None,
     }
 }
 

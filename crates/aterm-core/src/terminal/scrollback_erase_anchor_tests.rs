@@ -56,6 +56,7 @@ fn a_running_command_keeps_its_block_through_a_scrollback_erase() {
     for (case, erase, takes_history, moves) in [
         ("ED 3", Erase::Bytes(b"\x1b[3J"), true, false),
         ("clear", Erase::Bytes(b"\x1b[H\x1b[2J\x1b[3J"), true, true),
+        ("RIS", Erase::Bytes(b"\x1bc"), true, true),
         ("Cmd-K", Erase::CmdK, true, false),
         (
             "ED 2 (control)",
@@ -129,15 +130,150 @@ fn a_running_command_keeps_its_block_through_a_scrollback_erase() {
             "{case}: the blocks wholly in the history went with it, and only with an erase: {ids:?}"
         );
     }
+}
 
-    let mut t = with_history();
-    let id = t.current_block().expect("a prompt").id;
-    let seq = t.completed_command_seq();
-    start(&mut t, "reset");
-    t.process(b"\x1bc");
-    finish(&mut t, 5);
-    assert_eq!(probe(&t, id), None, "RIS took the running block");
-    assert_eq!(t.completed_command_seq(), seq, "and its D was refused");
+/// A RIS the running command sends (`reset`, `tput reset`) leaves the shell where it stood: the
+/// `D` the shell writes after it is accepted and counted, and `aterm ctl await block` on the
+/// command ends. NEGATIVE CONTROL: with a reset returning the shell to Ground and no phase,
+/// `` the D is the shell's `` fails.
+#[test]
+fn a_ris_from_the_running_command_leaves_its_d_to_the_shell() {
+    for (case, host) in [("RIS", false), ("the host's reset", true)] {
+        let mut t = with_history();
+        let id = t.current_block().expect("a prompt").id;
+        start(&mut t, "reset");
+        let (started, completed) = (t.started_command_seq(), t.completed_command_seq());
+        if host {
+            t.reset();
+        } else {
+            t.process(b"\x1bc");
+        }
+        assert_eq!(
+            probe(&t, id),
+            Some((BlockState::Executing, None)),
+            "{case}: the running block outlives the reset"
+        );
+        finish(&mut t, 0);
+        assert_eq!(
+            probe(&t, id),
+            Some((BlockState::Complete, Some(0))),
+            "{case}: the D is the shell's"
+        );
+        assert_eq!(t.started_command_seq(), started, "{case}");
+        assert_eq!(t.completed_command_seq(), completed + 1, "{case}");
+        assert_eq!(
+            t.last_finished_block().map(|b| (b.id, b.exit_code)),
+            Some((id, Some(0))),
+            "{case}"
+        );
+        assert_eq!(
+            t.current_block().map(|b| b.id),
+            Some(id + 1),
+            "{case}: the next prompt"
+        );
+    }
+}
+
+/// A completion the shell reported before a RIS stays readable after it, as through `clear`.
+/// NEGATIVE CONTROL: with a reset dropping the blocks and marks, `` the failed command is still
+/// the last `` fails.
+#[test]
+fn a_completion_before_a_ris_stays_readable() {
+    let mut t = term();
+    t.process(PROMPT);
+    start(&mut t, "false");
+    t.process(b"\x1b]133;D;1\x07\x1bc");
+    assert_eq!(
+        t.last_completed_command().and_then(|m| m.exit_code),
+        Some(1),
+        "the failed command is still the last"
+    );
+    assert_eq!(
+        t.newest_completed_block().map(|b| b.exit_code),
+        Some(Some(1)),
+        "and its block"
+    );
+}
+
+/// A RIS sees the marks where its batch's earlier output left them: a top-anchored region's
+/// scroll still pending in the batch moves them before the reset clamps them, never after, so one
+/// batch and the same bytes split before the RIS agree, and no mark ends before it starts.
+/// NEGATIVE CONTROL: with `esc_dispatch` not syncing the absolute-row metadata, `` one batch and
+/// split agree `` fails.
+#[test]
+fn a_ris_after_a_region_scroll_in_its_batch_moves_each_mark_once() {
+    const BEFORE: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07x\r\n\x1b]133;C\x07\x1b[1;2r\x1b[2H\n\n";
+    const AFTER: &[u8] = b"\x1bc\x1b]133;D;0\x07\x1b]133;A\x07";
+    let rows = |t: &Terminal| {
+        let blocks: Vec<_> = t
+            .all_blocks()
+            .map(|b| {
+                (
+                    b.id,
+                    b.prompt_start_row,
+                    b.command_start_row,
+                    b.output_start_row,
+                    b.end_row,
+                )
+            })
+            .collect();
+        let marks: Vec<_> = t
+            .command_marks()
+            .iter()
+            .map(|m| (m.prompt_start_row, m.output_start_row, m.output_end_row))
+            .collect();
+        (blocks, marks)
+    };
+    let mut split = Terminal::new(24, 80);
+    split.process(BEFORE);
+    split.process(AFTER);
+    let mut one = Terminal::new(24, 80);
+    one.process(&[BEFORE, AFTER].concat());
+    assert!(
+        split.grid().visible_to_absolute(0) > 0,
+        "PRECONDITION: the region scroll pushed rows into the history"
+    );
+    assert_eq!(rows(&one), rows(&split), "one batch and split agree");
+    assert!(
+        one.command_marks().iter().all(|m| m
+            .output_start_row
+            .zip(m.output_end_row)
+            .is_none_or(|(s, e)| s <= e)),
+        "no mark ends before it starts: {:?}",
+        rows(&one)
+    );
+}
+
+/// A RIS takes the named marks and annotations `clear` takes, those wholly in the history it
+/// erases, and keeps those on the screen. NEGATIVE CONTROL: with `ResetGroups::reset` clearing
+/// them wholesale again, `` RIS: the screen's mark and annotation stay `` fails.
+#[test]
+fn a_ris_keeps_the_screens_marks_and_annotations_as_clear_does() {
+    for (case, erase) in [
+        ("clear", &b"\x1b[H\x1b[2J\x1b[3J"[..]),
+        ("RIS", &b"\x1bc"[..]),
+    ] {
+        let mut t = term();
+        t.add_named_mark("old");
+        t.add_annotation("old");
+        for i in 0..20 {
+            t.process(format!("{i}\r\n").as_bytes());
+        }
+        t.add_named_mark("live");
+        t.add_annotation("live");
+        t.process(erase);
+        let names: Vec<_> = t
+            .terminal_marks()
+            .iter()
+            .map(|m| m.name.as_deref())
+            .collect();
+        let notes: Vec<_> = t.annotations().iter().map(|a| a.message.as_str()).collect();
+        assert_eq!(
+            (names, notes),
+            (vec![Some("live")], vec!["live"]),
+            "{case}: the screen's mark and annotation stay, the history's go"
+        );
+    }
 }
 
 #[test]

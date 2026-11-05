@@ -944,8 +944,14 @@ pub fn reap_shell(identity: crate::ShellIdentity) {
     reap(identity.pid);
 }
 
+/// The Unix `ignores_hangup` twin: Windows has no `SIGHUP` disposition to read.
+#[must_use]
+pub fn ignores_hangup(_identity: &crate::ShellIdentity) -> bool {
+    false
+}
+
 /// The Unix `reap_shell_in_background` twin.
-pub fn reap_shell_in_background(identity: crate::ShellIdentity) {
+pub fn reap_shell_in_background(identity: crate::ShellIdentity, _ignored_hangup: bool) {
     if identity.pid > 1 {
         std::thread::spawn(move || reap_shell(identity));
     }
@@ -1116,6 +1122,12 @@ pub fn fd_is_tty(_fd: i32) -> bool {
 /// Windows twin of the Unix [`tty_echo`].
 #[must_use]
 pub fn tty_echo(_master: i32) -> Option<crate::TtyEcho> {
+    None
+}
+
+/// Windows twin of the Unix [`foreground_group`]: ConPTY names no foreground process group.
+#[must_use]
+pub fn foreground_group(_master: i32) -> Option<i32> {
     None
 }
 

@@ -35,7 +35,7 @@ use crate::commons::binding::{BINDING_LEN, Binding, REQUEST_LEN, Request};
 use crate::text::Audience;
 use crate::{Error, Result};
 use aterm_digest::Sha256;
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
@@ -54,11 +54,11 @@ pub mod store;
 #[cfg(unix)]
 pub(crate) mod untaken;
 
-pub use admission::{Gap, Signer, admission_audiences};
+pub use admission::{Gap, SeatAudience, Signer, admission_audiences};
 pub use astream_wire::sync::MAX_PARENTS;
 pub use budgets::{
-    Budget, LEGACY_RECORDS, MAX_HELD_RECORDS, MAX_KEYED_RECORDS, MAX_WEIGHED_RECORDS,
-    RecordBudgets, RecordCounts,
+    AUTOMATIC_KEYED_STOP, Budget, LEGACY_RECORDS, MAX_HELD_RECORDS, MAX_KEYED_RECORDS,
+    MAX_WEIGHED_RECORDS, RecordBudgets, RecordCounts,
 };
 pub use entries::{
     CommonsEpochView, Keyed, OpenedAudienceEntries, OpenedEntries, epoch_commitment,
@@ -671,12 +671,13 @@ impl Record {
             Body::Genesis { signer, .. } => signer,
             _ => &actor[..32],
         };
-        UnparsedPublicKey::new(&ED25519, key)
-            .verify(
-                &signed_message(&owned_wire[..body_end]),
-                &owned_wire[body_end..],
-            )
-            .map_err(|_| Error::new("membership record signature failed"))?;
+        if !crate::ed25519::verifies(
+            key,
+            &signed_message(&owned_wire[..body_end]),
+            &owned_wire[body_end..],
+        ) {
+            return Err(Error::new("membership record signature failed"));
+        }
         Ok(Self {
             id: Sha256::digest(&owned_wire),
             header: Arc::new(header),
@@ -869,10 +870,9 @@ fn check_shape(header: &Header, body: &Body) -> Result<()> {
         }
         return Ok(());
     }
-    if header.network == [0; 32] || header.actor[..32] == [0; 32] {
-        return Err(Error::new(
-            "a membership record names its network and signer",
-        ));
+    // A zero signer key is of small order: the signature check refuses it.
+    if header.network == [0; 32] {
+        return Err(Error::new("a membership record names its network"));
     }
     if header.parents.is_empty() {
         return Err(Error::new(
@@ -950,13 +950,14 @@ fn check_shape(header: &Header, body: &Body) -> Result<()> {
                 ));
             }
         }
-        Body::Node { node_key, proof } => {
-            if *node_key == [0; 32] {
-                return Err(Error::new("a node record's proof is not its node key's"));
-            }
-            UnparsedPublicKey::new(&ED25519, node_key)
-                .verify(&node_proof_message(&header.network, &header.actor), proof)
-                .map_err(|_| Error::new("a node record's proof is not its node key's"))?;
+        Body::Node { node_key, proof }
+            if !crate::ed25519::verifies(
+                node_key,
+                &node_proof_message(&header.network, &header.actor),
+                proof,
+            ) =>
+        {
+            return Err(Error::new("a node record's proof is not its node key's"));
         }
         _ => {}
     }
@@ -1297,12 +1298,9 @@ fn decode_text(reader: &mut Reader<'_>) -> Result<String> {
 
 /// `m` and one to five digits with no leading zero: what C11's allowing member writes.
 pub fn is_label(label: &str) -> bool {
-    let Some(digits) = label.strip_prefix('m') else {
-        return false;
-    };
-    (1..MAX_LABEL).contains(&digits.len())
-        && !digits.starts_with('0')
-        && digits.bytes().all(|b| b.is_ascii_digit())
+    label.len() <= MAX_LABEL
+        && aterm_types::machine_name::Number::parse(label)
+            .is_ok_and(|number| number.to_string() == label)
 }
 
 fn put_len(out: &mut Vec<u8>, length: usize, width: usize) -> Result<()> {
@@ -1487,6 +1485,23 @@ impl Log {
             weighing: Arc::default(),
             epochs: Arc::default(),
         })
+    }
+
+    /// Restrict a verified graph to the causal past of held heads, preserving its budgets
+    /// and seat checks. The new graph starts with empty evaluator caches.
+    #[cfg(unix)]
+    pub(crate) fn project_heads(&self, heads: &[RecordId]) -> Result<Self> {
+        let mut records = self.ancestor_closure(heads).into_iter();
+        let first = records
+            .next()
+            .ok_or_else(|| Error::new("membership projection has no genesis"))?;
+        let mut projected = Self::new(first)?;
+        projected.budgets = self.budgets;
+        projected.enforce_seats = self.enforce_seats;
+        for record in records {
+            let _ = projected.insert(record)?;
+        }
+        Ok(projected)
     }
 
     /// What the evaluator reads of this log.

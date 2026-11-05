@@ -105,12 +105,20 @@ pub fn check_staged(
     let mut expected = vec![mf, sig];
     for (asset, want) in release_assets(&pkg) {
         let path = dir.join(&asset);
-        if !staged.contains(&asset) || !path.is_file() {
+        if !staged.contains(&asset) {
             return Err(Error::refused(format!(
                 "{tag} manifest names asset {asset} but the staging release lacks it"
             )));
         }
-        let got = atpkg::sha256_file(&path).map_err(|e| Error::io(format!("hash {asset}"), &e))?;
+        let got = match atpkg::sha256_file(&path) {
+            Ok(got) => got,
+            Err(_) if !path.is_file() => {
+                return Err(Error::refused(format!(
+                    "{tag} manifest names asset {asset} but the staging release lacks it"
+                )));
+            }
+            Err(e) => return Err(Error::io(format!("hash {asset}"), &e)),
+        };
         if got != want {
             return Err(Error::refused(format!(
                 "{tag} asset {asset} hash mismatch vs the signed manifest"
@@ -289,6 +297,8 @@ fn one(
             Probe::Unknown(why) => return Err(unknown(&sig, &why)),
         }
     }
+    let mut pub_mf_bytes = None;
+    let mut pub_sig_bytes = None;
     if public_mf && public_sig {
         let bytes = crate::identity::read_regular_bytes(&pub_dir.join(&mf), MANIFEST_CAP)
             .map_err(|e| Error::io(&mf, &e))?;
@@ -314,6 +324,8 @@ fn one(
             report.skipped.push(tag);
             return Ok(());
         }
+        pub_mf_bytes = Some(bytes);
+        pub_sig_bytes = Some(sig_bytes);
     }
 
     log.say(format!("fetching {staging}@{tag}"));
@@ -337,20 +349,26 @@ fn one(
     })?;
     let (expected, staged_pkg) = check_staged(quad, &dir, &staged_release.assets, program, build)?;
     if public_mf {
-        let same = |name: &str| match (
-            crate::identity::read_regular_bytes(&pub_dir.join(name), MANIFEST_CAP),
-            crate::identity::read_regular_bytes(&dir.join(name), MANIFEST_CAP),
-        ) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
+        let same = |name: &str, cached: Option<&[u8]>| {
+            let pub_bytes = match cached {
+                Some(b) => Ok(b.to_vec()),
+                None => crate::identity::read_regular_bytes(&pub_dir.join(name), MANIFEST_CAP),
+            };
+            match (
+                pub_bytes,
+                crate::identity::read_regular_bytes(&dir.join(name), MANIFEST_CAP),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
         };
-        if !same(&mf) {
+        if !same(&mf, pub_mf_bytes.as_deref()) {
             return Err(Error::refused(format!(
                 "{public}@{tag} serves a manifest that DIFFERS from staging's — a published \
                  pack is immutable; refusing"
             )));
         }
-        if public_sig && !same(&sig) {
+        if public_sig && !same(&sig, pub_sig_bytes.as_deref()) {
             return Err(Error::refused(format!(
                 "{public}@{tag} serves a signature that DIFFERS from staging's — refusing"
             )));

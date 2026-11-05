@@ -300,12 +300,33 @@ fn only_bash_runs_the_installer() {
     }
 }
 
-/// A cut inside a word runs nothing either: at every byte of each top-level line's first
-/// word, and of the last line, `main "$@"; }`. The file is one group, which bash runs
-/// only once its closing brace has arrived. With main alone wrapped, bash ran the cut
-/// word's first letters as a command: `make` (from make_download_dir) built the
-/// Makefile where the run was started, `bundle` ran bundle install, and a bare
-/// `main "$@"` cut just after `main` ran a whole install with no arguments.
+/// How far into an unindented line's first word a cut still decides anything: its first byte, its
+/// whole, and a closer it starts with. Word bytes change bash's parser state only by forming a
+/// reserved word, and only a closer can finish a construct mid-word: in any open construct the
+/// other prefixes are all bash's syntax error at the end of its input. At the top level, one byte
+/// of a word is no reserved word, so it exits 127 or runs a one-letter command.
+fn deciding_prefixes(word: &str) -> Vec<usize> {
+    let closers = ["fi", "done", "esac"]
+        .into_iter()
+        .filter(|closer| word.starts_with(closer))
+        .map(str::len);
+    let mut at: Vec<usize> = closers.chain([1, word.len()]).collect();
+    at.sort_unstable();
+    at.dedup();
+    at
+}
+
+/// A cut inside a word runs nothing either: at each top-level line's first word
+/// ([`deciding_prefixes`]), and at every byte of the last line, `main "$@"; }`. The file is one
+/// group, which bash runs only once its closing brace has arrived. With main alone wrapped, bash
+/// ran the cut word's first letters as a command: `make` (from make_download_dir) built the
+/// Makefile where the run was started, `bundle` ran bundle install, and a bare `main "$@"` cut
+/// just after `main` ran a whole install with no arguments.
+///
+/// Every unindented line stays in the loop, so a group closed early and a pipeline carried on past
+/// its brace each breach at their next word's first byte. The gap: a top-level word whose first
+/// byte is a silent one-letter command, or a function the prefix defined, where a longer prefix
+/// is not inert. No unindented word is one letter today.
 #[test]
 fn a_cut_inside_a_word_runs_nothing() {
     let scratch = Scratch::new();
@@ -315,15 +336,18 @@ fn a_cut_inside_a_word_runs_nothing() {
     let mut cuts = Vec::new();
     let mut start = 0;
     for line in text.split_inclusive('\n') {
-        let word = if start == last {
-            body.len() - last - 1
-        } else if line.starts_with(|c: char| c.is_whitespace() || c == '#') {
-            0
-        } else {
-            line.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .unwrap_or(line.len())
-        };
-        cuts.extend((start + 1..=start + word).map(|at| (at, format!("{:?}", &text[start..at]))));
+        let named = |at: usize| (at, format!("{:?}", &text[start..at]));
+        if start == last {
+            cuts.extend((start + 1..body.len()).map(named));
+        } else if !line.starts_with(|c: char| c.is_whitespace() || c == '#') {
+            let word = line
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(line.len());
+            if word > 0 {
+                let prefixes = deciding_prefixes(&line[..word]);
+                cuts.extend(prefixes.into_iter().map(|at| named(start + at)));
+            }
+        }
         start += line.len();
     }
     let breaches = breaches(&scratch, &text, cuts);
@@ -554,6 +578,108 @@ fn a_dry_run_s_toolset_line_follows_the_console_owner() {
         assert!(plan.contains(want), "console {console}: {plan}");
         assert!(!plan.contains(not), "console {console}: {plan}");
     }
+}
+
+/// What atpkg's seed will not install, no line of the plan promises: a decline, or the consent
+/// `--no-toolchain` persists and a later run without the flag keeps. Its rule is the seed's: under
+/// `[packages]`, `auto_install` when it is there, else its retired spelling.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dry_run_promises_no_toolset_atpkg_would_withhold() {
+    let scratch = Scratch::new();
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    assert_ne!(me, 0, "the suite does not run as root");
+    for (name, toml, declined, withheld) in [
+        ("clear", None, false, false),
+        (
+            "off",
+            Some("[packages]\nauto_install = false\n"),
+            false,
+            true,
+        ),
+        (
+            "retired",
+            Some("[packages]\nseed_install = false # old\n"),
+            false,
+            true,
+        ),
+        (
+            "kept",
+            Some("[packages]\nauto_install = true\nseed_install = false\n"),
+            false,
+            false,
+        ),
+        (
+            "elsewhere",
+            Some("[other]\nauto_install = false\n"),
+            false,
+            false,
+        ),
+        ("declined", None, true, true),
+    ] {
+        for console in [me, me + 1] {
+            let fresh = scratch.home(&format!("withheld-{name}-{console}"));
+            if let Some(toml) = toml {
+                let dir = fresh.home.join(".config/aterm");
+                std::fs::create_dir_all(&dir).expect("config folder");
+                write(&dir.join("aterm.toml"), toml);
+            }
+            if declined {
+                let dir = fresh.home.join("Library/Application Support/aterm/pkg");
+                std::fs::create_dir_all(&dir).expect("prefix");
+                write(&dir.join("declined"), "");
+            }
+            let console = console.to_string();
+            let dry = dry_run_with(
+                &scratch,
+                &fresh,
+                &["--dry-run"],
+                &[
+                    ("ATERM_INSTALL_CONSOLE_UID", console.as_str()),
+                    ("ATERM_NO_TOOLCHAIN", "0"),
+                ],
+            );
+            let plan = dry.run.all();
+            assert_eq!(dry.run.code(), 0, "{name}: {plan}");
+            let promised = plan.contains("toolset: installs on aterm's first launch")
+                || plan.contains("toolset: aterm pkg seed + pkg update");
+            assert_eq!(promised, !withheld, "{name}, console {console}: {plan}");
+            assert_eq!(
+                plan.contains("toolset: none installs"),
+                withheld,
+                "{name}, console {console}: {plan}"
+            );
+            assert_eq!(
+                plan.contains("the toolset hook + "),
+                !withheld,
+                "{name}, console {console}: {plan}"
+            );
+        }
+    }
+    // A seed here reads this shell's file, an aterm opened outside it reads ~/.config's.
+    let fresh = scratch.home("withheld-xdg");
+    let xdg = fresh.home.join("xdg");
+    std::fs::create_dir_all(xdg.join("aterm")).expect("config folder");
+    write(
+        &xdg.join("aterm/aterm.toml"),
+        "[packages]\nauto_install = false\n",
+    );
+    let console = (me + 1).to_string();
+    let dry = dry_run_with(
+        &scratch,
+        &fresh,
+        &["--dry-run"],
+        &[
+            ("ATERM_INSTALL_CONSOLE_UID", console.as_str()),
+            ("ATERM_NO_TOOLCHAIN", "0"),
+            ("XDG_CONFIG_HOME", s(&xdg)),
+        ],
+    );
+    let plan = dry.run.all();
+    assert_eq!(dry.run.code(), 0, "{plan}");
+    assert!(plan.contains("toolset: none installs"), "{plan}");
+    assert!(plan.contains("that launch can still install it"), "{plan}");
 }
 
 /// A dry run makes no folder, so `ensure_dirs_writable` answers for one still to be made

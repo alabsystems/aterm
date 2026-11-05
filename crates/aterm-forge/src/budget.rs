@@ -809,7 +809,19 @@ fn write_body(root: &Path, body: &str) -> Result<(), String> {
         .tempdir_in(dir)
         .map_err(|e| format!("cannot write {} ({e})", path.display()))?;
     let tmp = scratch.path().join("forge-budget.tsv");
-    std::fs::write(&tmp, body).map_err(|e| format!("cannot write {} ({e})", path.display()))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    }
+    opts.open(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(body.as_bytes())
+        })
+        .map_err(|e| format!("cannot write {} ({e})", path.display()))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("cannot write {} ({e})", path.display()))
 }
 

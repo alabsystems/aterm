@@ -492,21 +492,22 @@ fn run_captured(cmd: &Cmd, env: ExecEnv<'_>, machine: Option<&mut Result<String,
             finish(c, cmd, env, None, &label, marks).0
         }
         Capture::Emit => {
-            let log = env
-                .scratch
+            // Quiet transcript writes without changing the short root for Unix sockets.
+            let log = aterm_tempfile::quiet_in(env.scratch)
                 .join(format!("stage.{}.{seq}.log", std::process::id()));
-            let mut file = match File::create(&log) {
+            let mut file = match create_stage_log(&log) {
                 Ok(f) => f,
                 Err(e) => return spawn_failure(cmd, &e.to_string()),
             };
             if let Some(text) = &cmd.preamble
                 && let Err(e) = file.write_all(text.as_bytes())
             {
+                std::fs::remove_file(&log).ok();
                 return spawn_failure(cmd, &e.to_string());
             }
             let stdout_log = machine.as_ref().map(|_| log.with_extension("stdout"));
             let file2 = match &stdout_log {
-                Some(path) => File::create(path),
+                Some(path) => create_stage_log(path),
                 None => file.try_clone(),
             };
             let file2 = match file2 {
@@ -545,6 +546,19 @@ fn run_captured(cmd: &Cmd, env: ExecEnv<'_>, machine: Option<&mut Result<String,
             r
         }
     }
+}
+
+fn create_stage_log(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    options.open(path)
 }
 
 /// The directory a child's tree marks its waits in ([`aterm_toolchain::waits::VAR`]), removed
@@ -1041,7 +1055,12 @@ fn in_group(pid: u32, pgid: u32) -> bool {
 
 /// How long a child its stuck holder ends ([`Clock::stuck`]) has after its `SIGTERM` to say so
 /// before its group gets `SIGKILL`, as the interrupt's handler gives a stage group.
+#[cfg(not(test))]
 const STUCK_GRACE: Duration = Duration::from_secs(2);
+/// A unit test's child is a stand-in that must say why it ends once its `SIGTERM` lands, so it
+/// has the hang detector to say it.
+#[cfg(test)]
+const STUCK_GRACE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// Whether the run must end now: an interrupt is ending it.
 fn ending() -> bool {
@@ -1490,6 +1509,30 @@ pub mod group {
     /// signal regardless ([`end_interrupted`]).
     pub const REPORT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+    /// The grace a test's stand-in run set for its watchdog, in milliseconds (0: none set).
+    #[cfg(test)]
+    static REPORT_GRACE_FOR_TEST_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// Hold this process's interrupted run to `grace` instead of [`REPORT_GRACE`]: a stand-in run
+    /// whose report must happen sets the hang detector, so a loaded host's slow report is not cut
+    /// short; one whose grace must fire keeps [`REPORT_GRACE`].
+    #[cfg(test)]
+    pub(crate) fn set_report_grace_for_test(grace: std::time::Duration) {
+        let ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX).max(1);
+        REPORT_GRACE_FOR_TEST_MS.store(ms, Ordering::SeqCst);
+    }
+
+    /// [`REPORT_GRACE`], or the grace a test set with `set_report_grace_for_test`.
+    fn report_grace() -> std::time::Duration {
+        #[cfg(test)]
+        match REPORT_GRACE_FOR_TEST_MS.load(Ordering::SeqCst) {
+            0 => {}
+            ms => return std::time::Duration::from_millis(ms),
+        }
+        REPORT_GRACE
+    }
+
     /// Counts the spawn-to-registration window.
     pub struct Spawning(());
     impl Spawning {
@@ -1911,7 +1954,7 @@ pub mod group {
             .spawn(move || {
                 let mut sig = [0u8];
                 if read.read_exact(&mut sig).is_ok() {
-                    std::thread::sleep(REPORT_GRACE);
+                    std::thread::sleep(report_grace());
                     let sig = PENDING.load(Ordering::SeqCst);
                     // SAFETY: both take integers only.
                     unsafe {
@@ -3373,14 +3416,15 @@ mod tests {
 
     /// CW-WAIT-UNBOUNDED: a stage child waits on a lock whose named holder lives on and makes no
     /// progress. Once its waiter calls the holder stuck, the run ends the child (`SIGTERM`, so it
-    /// says its own NOT RUN) rather than waiting on, well inside the one-minute hang detector and
-    /// with no ceiling that could end it instead; the child could not run, naming the holder and
-    /// how long it made no progress, at least the waiter's bound; the Linux lane's row reads NOT
-    /// RUN with it; and the holder is never signalled and still runs. Negative control: a holder
-    /// that wakes to work (a waiter in a chain) is waited for past three times the bound from
-    /// the child's own wait mark, then the child has the lock and runs to its end. Neither run
-    /// has a ceiling, so a starved start of the child, which a ceiling counts as work, decides
-    /// neither, and the control's span starts once the child waits, however late it started.
+    /// says its own NOT RUN within [`STUCK_GRACE`]) rather than waiting on, inside the hang
+    /// detector past that grace and with no ceiling that could end it instead; the child could
+    /// not run, naming the holder and how long it made no progress, at least the waiter's bound;
+    /// the Linux lane's row reads NOT RUN with it; and the holder is never signalled and still
+    /// runs. Negative control: a holder that wakes to work (a waiter in a chain) is waited for
+    /// past three times the bound from the child's own wait mark, then the child has the lock and
+    /// runs to its end. Neither run has a ceiling, so a starved start of the child, which a
+    /// ceiling counts as work, decides neither, and the control's span starts once the child
+    /// waits, however late it started.
     #[cfg(unix)]
     #[test]
     fn a_child_waiting_behind_a_stuck_holder_could_not_run() {
@@ -3393,9 +3437,11 @@ mod tests {
             let (tmp, waiter) = (tmp.clone(), waiter.clone());
             std::thread::spawn(move || run(&waiter, ceiled(&tmp, None)))
         };
-        aterm_spec::wait::until_within(HANG_DETECTOR, "the run to end the child", || {
-            running.is_finished().then_some(())
-        });
+        aterm_spec::wait::until_within(
+            STUCK_GRACE + HANG_DETECTOR,
+            "the run to end the child",
+            || running.is_finished().then_some(()),
+        );
         let out = running.join().expect("the run");
         eprintln!(
             "the stuck holder ended the child {:?} after it began",

@@ -16,6 +16,53 @@ use std::{
 const ACTOR: &str = "ATPKG_NATIVE_JOB_TABLE_WORLD";
 const REAL: &str = "ATPKG_NATIVE_JOB_TABLE_REAL";
 
+#[test]
+fn shared_host_wait_services_mixed_interests_and_buffered_work() {
+    use aterm_uds::ready::{Interest, Watch};
+    let jobs = Jobs::new(1).unwrap();
+    let (mut control, mut send) = std::io::pipe().unwrap();
+    let (mut drain, mut input) = std::io::pipe().unwrap();
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let wake = jobs
+        .wait_with(
+            control.as_fd(),
+            &[Watch::new(input.as_fd(), Interest::Write)],
+            false,
+            deadline,
+        )
+        .unwrap();
+    assert!(wake.jobs_hint && !wake.control_ready && !wake.deadline);
+    input.write_all(b"helper-command").unwrap();
+    let mut bytes = [0; 14];
+    drain.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"helper-command");
+    // This is already buffered protocol work, not a claim of ready child state.
+    let wake = jobs
+        .wait_with(control.as_fd(), &[], true, deadline)
+        .unwrap();
+    assert!(wake.jobs_hint && !wake.deadline);
+    send.write_all(b"c").unwrap();
+    let wake = jobs
+        .wait_with(control.as_fd(), &[], true, deadline)
+        .unwrap();
+    assert!(
+        wake.control_ready && wake.jobs_hint && !wake.deadline,
+        "local work must not mask queued host control"
+    );
+    assert!(jobs.wait(control.as_fd(), deadline).unwrap().control_ready);
+    let mut byte = [0];
+    control.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, *b"c");
+    let wake = jobs
+        .wait_with(control.as_fd(), &[], false, Instant::now())
+        .unwrap();
+    assert!(wake.deadline && !wake.jobs_hint && !wake.control_ready);
+    let wake = jobs
+        .wait_with(control.as_fd(), &[], true, Instant::now())
+        .unwrap();
+    assert!(wake.deadline && wake.jobs_hint && !wake.control_ready);
+}
+
 struct Driver {
     jobs: Jobs,
     control: std::io::PipeReader,

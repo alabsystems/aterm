@@ -305,7 +305,8 @@ fn named(log: &mut Log, writer: &[u8; 32], incarnation: [u8; 16], m1: &MemberId,
 
 /// A Mac configured, with no envelope, to read vault `team` at `host`.
 fn member_of(root: &Path, host: &RecordsHost) -> Paths {
-    member_pinned(root, host, &[0x5a; 32])
+    let key = envelope::signer_public(&[7; 32]).expect("the fixture genesis signer");
+    member_pinned(root, host, &key)
 }
 
 /// [`member_of`], pinning the vault key `key`.

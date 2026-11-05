@@ -168,8 +168,9 @@ impl Reference {
         let dir = work.join("reference");
         let src = dir.join("src");
         std::fs::create_dir_all(&src).map_err(io("creating", &src))?;
-        let write =
-            |path: PathBuf, text: &str| std::fs::write(&path, text).map_err(io("writing", &path));
+        let write = |path: PathBuf, text: &str| {
+            crate::write_fresh(&path, text).map_err(io("writing", &path))
+        };
         write(dir.join("Cargo.toml"), probe::MANIFEST)?;
         write(src.join("lib.rs"), &probe::lib_rs(&CELLS))?;
         for cell in &CELLS {
@@ -258,7 +259,7 @@ impl Reference {
     ) -> Result<probe::Measured, Stop> {
         let module = probe::module(cell);
         let file = self.dir.join("src").join(format!("{module}.rs"));
-        std::fs::write(&file, probe.source()).map_err(io("writing", &file))?;
+        crate::write_fresh(&file, probe.source()).map_err(io("writing", &file))?;
         let words = ["check", "--message-format", "json"];
         let outcome = self.cargo(compiler, cell, &words, &[], "the probe")?;
         let reported = probe::reported(&outcome.errors, &format!("{module}.rs"));
@@ -461,7 +462,7 @@ fn seal(files: &[PathBuf]) -> Result<(), Stop> {
         let text = crate::read_regular_text(path).map_err(io("reading", path))?;
         let sealed = aterm_census::seal::stamp(&text)
             .map_err(|e| Stop::Failed(format!("{}: {e}", path.display())))?;
-        std::fs::write(path, sealed).map_err(io("writing", path))?;
+        crate::write_fresh(path, sealed).map_err(io("writing", path))?;
     }
     Ok(())
 }
@@ -522,7 +523,7 @@ pub fn regen(options: &Options, sink: &mut dyn Write) -> Result<Vec<PathBuf>, St
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(io("creating", dir))?;
             }
-            std::fs::write(&path, text).map_err(io("writing", &path))?;
+            crate::write_fresh(&path, text).map_err(io("writing", &path))?;
             written.push(path);
         }
         audit.extend(

@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::jobs::{Class, JobsView, Verdict};
-use crate::model::{Pressure, RowScope, Snapshot, Throttle};
+use crate::model::{Pressure, RowScope, Snapshot, Thermal};
 
 /// Swap traffic (in plus out) at or above this is "swapping".
 pub const SWAP_ACTIVE_BPS: f64 = 1_000_000.0;
@@ -73,12 +73,12 @@ pub enum EventKind {
         /// The level now.
         to: Pressure,
     },
-    /// The thermal level moved.
-    Throttle {
-        /// The level before.
-        from: Throttle,
-        /// The level now.
-        to: Throttle,
+    /// The thermal level moved; each side prints [`Thermal::word`].
+    Thermal {
+        /// The state before.
+        from: Thermal,
+        /// The state now.
+        to: Thermal,
     },
     /// Swap traffic started or stopped.
     Swap {
@@ -161,7 +161,7 @@ impl EventKind {
     pub fn word(&self) -> &'static str {
         match self {
             Self::Pressure { .. } => "pressure",
-            Self::Throttle { .. } => "throttle",
+            Self::Thermal { .. } => "thermal",
             Self::Swap { .. } => "swap",
             Self::Disk { .. } => "disk",
             Self::Load { .. } => "load",
@@ -185,7 +185,7 @@ struct LoadWatch {
 #[derive(Debug, Default)]
 pub struct Detector {
     pressure: Option<Pressure>,
-    throttle: Option<Throttle>,
+    thermal: Option<Thermal>,
     swapping: Option<bool>,
     disk: Option<(String, [bool; 3])>,
     load: HashMap<LoadScope, LoadWatch>,
@@ -232,13 +232,13 @@ impl Detector {
             }
         }
         if let Some(t) = s.thermal {
-            if let Some(before) = self.throttle.filter(|b| *b != t.level) {
-                push(EventKind::Throttle {
+            if let Some(before) = self.thermal.filter(|b| b.level != t.level) {
+                push(EventKind::Thermal {
                     from: before,
-                    to: t.level,
+                    to: t,
                 });
             }
-            self.throttle = Some(t.level);
+            self.thermal = Some(t);
         }
         if let Some(v) = s.volume.as_ref().filter(|v| v.total > 0) {
             let free = v.available;
@@ -489,7 +489,7 @@ pub fn millicores(cores: f32) -> u32 {
 mod tests {
     use super::*;
     use crate::model::{
-        CpuView, MemRates, MemSample, MemView, ScopeView, TabView, Thermal, VolumeSample,
+        CpuView, MemRates, MemSample, MemView, ScopeView, TabView, Throttle, VolumeSample,
     };
     use crate::trend::TrendView;
 
@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn pressure_and_throttle_changes_are_events_and_the_first_reading_is_not() {
+    fn pressure_and_thermal_changes_are_events_and_the_first_reading_is_not() {
         let mut d = Detector::default();
         let mut s = snap(1, 1);
         s.mem = Some(MemView {
@@ -529,7 +529,7 @@ mod tests {
             exact: true,
         });
         let e = d.detect(&s2);
-        assert_eq!(kinds(&e), ["pressure", "throttle"]);
+        assert_eq!(kinds(&e), ["pressure", "thermal"]);
         assert_eq!(e[0].seq, 2);
         assert_eq!(
             e[0].kind,

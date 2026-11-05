@@ -161,7 +161,7 @@ fn set(var: &dyn Fn(&str) -> Option<OsString>, name: &str) -> Option<OsString> {
 }
 
 fn non_empty_file(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
 }
 
 /// The refusal marker of the login file `file` ([`REFUSED_SUFFIX`]).
@@ -175,12 +175,19 @@ pub fn refused_marker(file: &Path) -> PathBuf {
 /// Whether the login file `file` was refused: its marker ([`refused_marker`]) is there and not
 /// older than it. A login written after the marker (grok's own sign-in, or this gate's) is not.
 fn refused(file: &Path) -> bool {
-    let Ok(marker) = std::fs::metadata(refused_marker(file)).and_then(|m| m.modified()) else {
+    let Ok(marker) = std::fs::symlink_metadata(refused_marker(file))
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|m| m.modified().ok())
+        .ok_or(())
+    else {
         return false;
     };
-    std::fs::metadata(file)
-        .and_then(|m| m.modified())
-        .is_ok_and(|written| written <= marker)
+    std::fs::symlink_metadata(file)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|m| m.modified().ok())
+        .is_some_and(|written| written <= marker)
 }
 
 /// Whether the login file `file` signs a launch in: a non-empty file grok has not refused.
@@ -249,7 +256,10 @@ pub fn wall_login(
     match signed_in(var, home) {
         None => WallLogin::SignedOut,
         Some(Signed::File(file)) => {
-            let written = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+            let written = std::fs::symlink_metadata(&file)
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .and_then(|m| m.modified().ok());
             match (written, started) {
                 (Some(written), Some(started)) if written < started => WallLogin::Refused(file),
                 _ => WallLogin::SignedIn(Signed::File(file)),
@@ -1016,6 +1026,11 @@ pub struct Gate<'a> {
     pub stopped: &'a dyn Fn() -> bool,
     /// Unix seconds now.
     pub now: &'a dyn Fn() -> i64,
+    /// THE SIGN-IN DOOR (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.15): begins this
+    /// caller's sign-in at the given time ([`super::sign_in_ladder::SignIn::begin`], on the
+    /// machine's sign-in lock and spacing clock), called once and only where [`run`] decided to
+    /// start one, before grok runs; its refusal, in words, runs nothing.
+    pub begin: &'a dyn Fn(i64) -> Result<(), String>,
 }
 
 /// How one gate ended.
@@ -1135,17 +1150,15 @@ fn lock_file(state: &Path) -> io::Result<std::fs::File> {
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         open.mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
-    let file = open.open(state.join(LOCK_FILE))?;
+    let file = aterm_uds::kept_out(|| open.open(state.join(LOCK_FILE)))?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "grok sign-in lock is not a regular file",
         ));
     }
-    #[cfg(unix)]
-    aterm_uds::keep_out_of_children(&file)?;
     Ok(file)
 }
 
@@ -1295,6 +1308,11 @@ pub fn run(
             until: last.t.saturating_add(PERSON_BACKOFF_SECS),
             outcome: last.outcome,
         };
+    }
+    // The sign-in starts here or not at all: a refused start writes no record, so it leaves
+    // no backoff behind it.
+    if let Err(why) = (gate.begin)(now) {
+        return Ended::NotRun(why);
     }
     remove_stale_staging(gate.state);
     let leading = Leading::write(gate.state, now);
@@ -2022,3 +2040,48 @@ impl Owner for SessionOwner<'_> {
 #[cfg(test)]
 #[path = "grok_signin_tests.rs"]
 mod tests;
+
+/// Grok Build's sign-in reads its row's mailbox from the lab registry (one-mesh design step A9).
+#[cfg(test)]
+mod registry_tests {
+    use super::super::{accounts::Store, alab_roster, headless_oauth::registry_tests as fixture};
+    use super::*;
+
+    /// With no mailbox file present, the live rung's row finds the registry's mailbox for its
+    /// email, so the email is typed and the code read from that mailbox.
+    /// NEGATIVE CONTROL: with no registry mailbox, the row has none (`read.mailbox` false).
+    #[test]
+    fn the_live_rung_reads_its_mailbox_from_the_registry() {
+        let tmp = aterm_tempfile::tempdir().expect("tmp");
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let roster = tmp.path().join("grok-accounts.toml");
+        std::fs::write(
+            &roster,
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"ai1@example.test\"\n",
+        )
+        .unwrap();
+        let store = Store::at_for(&state, Cli::Grok, &home);
+        let read = |mail: Vec<alab_roster::LabMailbox>| {
+            alab_roster::with_mail(mail, fixture::secrets(), || {
+                LiveAuto::new(
+                    Some(roster.clone()),
+                    Some(store.clone()),
+                    Some(home.clone()),
+                    0,
+                )
+                .row()
+                .expect("a store")
+            })
+        };
+        let found = read(vec![fixture::mailbox()]);
+        assert!(
+            found.mailbox,
+            "the registry's mailbox receives the row's email"
+        );
+        assert_eq!(found.approver.mailbox_unready_login, None);
+        assert!(!read(Vec::new()).mailbox);
+    }
+}

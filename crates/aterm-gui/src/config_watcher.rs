@@ -344,6 +344,14 @@ fn watch(
             match config_path_stamp(path) {
                 Err(kind) => {
                     config_needs_retry = true;
+                    if !post_stamp_refusal(
+                        send_harness(&proxy),
+                        &mut last_harness,
+                        &mut harness_stamps,
+                        path,
+                    ) {
+                        break;
+                    }
                     if !post_status(&proxy, &mut config_failure, WatchTarget::Config, Some(kind)) {
                         break;
                     }
@@ -474,9 +482,6 @@ fn watch(
     }
 }
 
-/// The largest refused config [`observed_harness`] still reads (8 MiB).
-const MAX_REJECTED_HARNESS_READ: u64 = 8 << 20;
-
 /// The `[harness]` policy of one watcher read: this thread is the one writer of the policy the
 /// window runs (`App::adopt_harness_policy` handles only its wake).
 fn observed_harness(
@@ -490,14 +495,39 @@ fn observed_harness(
     match observation {
         Ok(observation) => Some(crate::app_config::HarnessPolicy::read(&observation.text)),
         Err(DocumentHostError::InvalidUtf8 | DocumentHostError::TooLarge { .. }) => {
-            let (bytes, _) =
-                aterm_uds::atomic_file::read_regular(path?, MAX_REJECTED_HARNESS_READ).ok()?;
-            Some(crate::app_config::HarnessPolicy::read(
-                &String::from_utf8_lossy(&bytes),
-            ))
+            // Keep owned lossy-comment policy reads, with the same admission
+            // and size cap as every other file-backed harness reader.
+            Some(match path {
+                Some(path) => crate::app_config::HarnessPolicy::read_path(Some(path)),
+                None => unread_harness("failed config observation has no file context".into()),
+            })
         }
-        Err(_) => None,
+        Err(error) => Some(unread_harness(format!(
+            "config observation failed: {error:?}"
+        ))),
     }
+}
+
+fn unread_harness(note: String) -> crate::app_config::HarnessPolicy {
+    let (policy, notes) = aterm_agent::supervise::SupervisorConfig::unread_config(note);
+    crate::app_config::HarnessPolicy { policy, notes }
+}
+
+fn post_stamp_refusal(
+    send: impl FnOnce(crate::harness_policy_cell::StampedHarnessPolicy) -> bool,
+    last: &mut Option<crate::app_config::HarnessPolicy>,
+    stamps: &mut crate::harness_policy_cell::HarnessStampSource,
+    path: &std::path::Path,
+) -> bool {
+    post_harness(
+        send,
+        last,
+        stamps,
+        unread_harness(format!(
+            "{}: config metadata cannot be read",
+            path.display()
+        )),
+    )
 }
 
 /// Post `policy` as the one the window runs when it differs from the one last
@@ -835,7 +865,8 @@ fn theme_directory_stamp_capped(
             let entry = result.map_err(|_| WatchFailureKind::ThemeEntryUnreadable)?;
             let file_type = entry.file_type().map_err(theme_entry_failure_kind)?;
             if !file_type.is_file()
-                || entry.path().extension() != Some(std::ffi::OsStr::new("conf"))
+                || std::path::Path::new(&entry.file_name()).extension()
+                    != Some(std::ffi::OsStr::new("conf"))
             {
                 continue;
             }
@@ -1137,15 +1168,14 @@ pub(crate) mod tests {
         let lexicon = dir.join("lexicon.toml");
         let toy = dir.join("toy.toml");
         std::fs::write(&lexicon, b"[[entry]]\nword = \"purr\"\n").unwrap();
-        std::fs::write(
+        crate::test_scratch::write_config(
             &config,
             format!(
                 "[sparkle_words]\nlexicon = {:?}\ntoy_packs = [{:?}]\n",
                 lexicon.display().to_string(),
                 toy.display().to_string(),
             ),
-        )
-        .unwrap();
+        );
         let observation = config_file_observation(&config).unwrap();
         let feeds = feed_paths_of(&observation.text).expect("the config parses");
         assert_eq!(feeds, vec![lexicon.clone(), toy.clone()]);
@@ -1230,7 +1260,7 @@ pub(crate) mod tests {
         let missing_stamp = path_feed_stamp(&feeds);
         assert_eq!(path_feed_stamp(&feeds), missing_stamp, "idle is no edge");
 
-        std::fs::write(&fleet, "schema = 1\npreferred = \"codex\"\n").unwrap();
+        crate::test_scratch::write_config(&fleet, "schema = 1\npreferred = \"codex\"\n");
         assert_ne!(
             path_feed_stamp(&feeds),
             missing_stamp,
@@ -1267,7 +1297,7 @@ pub(crate) mod tests {
             "an explicitly requested missing document is still refused"
         );
         let missing_stamp = path_feed_stamp(&deleted.path_feed_paths());
-        std::fs::write(&fleet, "schema = 1\npreferred = \"agy\"\n").unwrap();
+        crate::test_scratch::write_config(&fleet, "schema = 1\npreferred = \"agy\"\n");
         assert_ne!(
             path_feed_stamp(&feeds),
             missing_stamp,
@@ -1285,7 +1315,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, "theme = \"Default\"\n").unwrap();
+        crate::test_scratch::write_config(&path, "theme = \"Default\"\n");
         let stamp = config_path_stamp(&path).unwrap();
         let mut content_loads = 0;
 
@@ -1316,14 +1346,14 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, b"theme = \"Nord\"\n").unwrap();
+        crate::test_scratch::write_config(&path, b"theme = \"Nord\"\n");
         let metadata = std::fs::metadata(&path).unwrap();
         let modified = metadata.modified().unwrap();
         let accessed = metadata.accessed().unwrap();
         let before = config_path_stamp(&path).unwrap();
 
         after_ctime_tick(&path);
-        std::fs::write(&path, b"theme = \"Rose\"\n").unwrap();
+        crate::test_scratch::write_config(&path, b"theme = \"Rose\"\n");
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_times(
             std::fs::FileTimes::new()
@@ -1432,10 +1462,15 @@ pub(crate) mod tests {
             let action = if approve { "WriteOn" } else { "WriteOff" };
             self.step(action, |d| {
                 if approve {
-                    std::fs::write(&d.path, "font_px = 14\n[harness]\napprove = \"all\"\n")
-                        .unwrap();
+                    crate::test_scratch::write_config(
+                        &d.path,
+                        "font_px = 14\n[harness]\napprove = \"all\"\n",
+                    );
                 } else {
-                    std::fs::write(&d.path, b"# caf\xe9\n[harness]\nenabled = false\n").unwrap();
+                    crate::test_scratch::write_config(
+                        &d.path,
+                        b"# caf\xe9\n[harness]\nenabled = false\n",
+                    );
                 }
                 d.disk = i64::from(approve);
                 d.edits += 1;
@@ -1488,7 +1523,7 @@ pub(crate) mod tests {
                     "font_px = 12\n[harness]\nenabled = false\n"
                 };
                 let staged = d.dir.join("admitted.toml");
-                std::fs::write(&staged, text).unwrap();
+                crate::test_scratch::write_config(&staged, text);
                 let observation =
                     crate::native_config_service::VersionedConfigService::observe_path(
                         &staged, false,
@@ -1552,7 +1587,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, b"# caf\xe9\n[harness]\nenabled = false\n").unwrap();
+        crate::test_scratch::write_config(&path, b"# caf\xe9\n[harness]\nenabled = false\n");
         let app = crate::App::headless_for_test();
         assert!(
             app.harness_policy.get().policy.enabled,
@@ -1635,10 +1670,129 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Every watcher read carries its `[harness]` policy, a refused one too: a readable file's
-    /// is what `Config::parse` reads; a file refused for a stray non-UTF-8 byte or its size
-    /// still has its `[harness]` lines read lossily, so a kill switch saved beside the byte holds
-    /// at once.
+    /// A chmod alone must withdraw the policy, without waiting for a content edit.
+    #[test]
+    #[cfg(unix)]
+    fn a_metadata_only_config_refusal_withdraws_the_live_harness_policy() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("aterm.toml");
+        let text = "[harness]\nenabled = true\napprove = \"all\"\n";
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = config_path_stamp(&path).unwrap();
+        let admitted = config_file_observation(&path).unwrap();
+        let mut last = None;
+        let mut stamps = crate::harness_policy_cell::HarnessStampSource::new();
+        let mut posted = Vec::new();
+        let policy = observed_harness(Some(&path), &Ok(admitted)).unwrap();
+        assert!(policy.policy.enabled);
+        assert!(post_harness(
+            |policy| {
+                posted.push(policy);
+                true
+            },
+            &mut last,
+            &mut stamps,
+            policy
+        ));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let after = config_path_stamp(&path).unwrap();
+        assert_ne!(before, after, "permissions alone are a metadata edge");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let (_, refused) = prepare_config_edge_with(Some(&before), after, false, || {
+            config_file_observation(&path)
+        })
+        .unwrap();
+        assert!(refused.is_err());
+        let off = observed_harness(Some(&path), &refused)
+            .expect("an ownership refusal must replace prior harness authority");
+        assert!(!off.policy.enabled);
+        assert!(post_harness(
+            |policy| {
+                posted.push(policy);
+                true
+            },
+            &mut last,
+            &mut stamps,
+            off.clone()
+        ));
+        assert!(!last.as_ref().unwrap().policy.enabled);
+        assert_eq!(posted.len(), 2);
+        assert!(post_harness(
+            |policy| {
+                posted.push(policy);
+                true
+            },
+            &mut last,
+            &mut stamps,
+            off
+        ));
+        assert_eq!(posted.len(), 2, "an unchanged refusal does not repost");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let restored = observed_harness(Some(&path), &config_file_observation(&path)).unwrap();
+        assert!(restored.policy.enabled);
+        assert!(post_harness(
+            |policy| {
+                posted.push(policy);
+                true
+            },
+            &mut last,
+            &mut stamps,
+            restored
+        ));
+        assert_eq!(posted.len(), 3);
+    }
+
+    #[test]
+    fn a_failed_stamp_replaces_prior_policy_and_missing_context_cannot_enable_it() {
+        let mut last = Some(crate::app_config::HarnessPolicy::read(
+            "[harness]\nenabled = true\n",
+        ));
+        let mut stamps = crate::harness_policy_cell::HarnessStampSource::new();
+        let mut posted = Vec::new();
+        assert!(last.as_ref().unwrap().policy.enabled);
+        let path = std::path::Path::new("unavailable/aterm.toml");
+        assert!(super::post_stamp_refusal(
+            |policy| {
+                posted.push(policy);
+                true
+            },
+            &mut last,
+            &mut stamps,
+            path
+        ));
+        assert!(!last.as_ref().unwrap().policy.enabled);
+        assert_eq!(posted.len(), 1);
+        assert!(super::post_stamp_refusal(
+            |policy| {
+                posted.push(policy);
+                true
+            },
+            &mut last,
+            &mut stamps,
+            path
+        ));
+        assert_eq!(posted.len(), 1, "an unchanged failed stamp does not repost");
+        for error in [
+            crate::native_document_host::DocumentHostError::InvalidUtf8,
+            crate::native_document_host::DocumentHostError::TooLarge { limit: 1 },
+        ] {
+            assert!(!observed_harness(None, &Err(error)).unwrap().policy.enabled);
+        }
+        assert!(
+            crate::app_config::HarnessPolicy::read_path(None)
+                .policy
+                .enabled,
+            "explicit no-config startup retains its defaults"
+        );
+    }
+
+    /// Accepted document observations keep their own text. Failed file observations use
+    /// the common reader, including owned lossy comments, its cap and missing-file defaults.
     #[test]
     fn every_watcher_read_carries_its_harness_policy() {
         use crate::native_document_host::DocumentHostError;
@@ -1651,7 +1805,7 @@ pub(crate) mod tests {
         let path = dir.join("aterm.toml");
 
         let text = "font_px = 13\n[harness]\napprove = \"safe\"\nenabled = false\n";
-        std::fs::write(&path, text).unwrap();
+        crate::test_scratch::write_config(&path, text);
         let readable = config_file_observation(&path);
         let policy = observed_harness(Some(&path), &readable).expect("a readable read");
         assert_eq!(
@@ -1661,7 +1815,7 @@ pub(crate) mod tests {
         );
         assert!(!policy.policy.enabled, "{policy:?}");
 
-        std::fs::write(&path, b"# caf\xe9\n[harness]\nenabled = false\n").unwrap();
+        crate::test_scratch::write_config(&path, b"# caf\xe9\n[harness]\nenabled = false\n");
         let refused = config_file_observation(&path);
         assert!(
             matches!(refused, Err(DocumentHostError::InvalidUtf8)),
@@ -1670,7 +1824,7 @@ pub(crate) mod tests {
         let policy = observed_harness(Some(&path), &refused).expect("a refused read");
         assert!(!policy.policy.enabled, "the kill switch holds: {policy:?}");
 
-        std::fs::write(&path, b"# caf\xe9\n[harness]\napprove = \"all\"\n").unwrap();
+        crate::test_scratch::write_config(&path, b"# caf\xe9\n[harness]\napprove = \"all\"\n");
         let refused = config_file_observation(&path);
         let lifted = observed_harness(Some(&path), &refused).expect("a refused read");
         assert!(lifted.policy.enabled, "lifting it holds too: {lifted:?}");
@@ -1679,7 +1833,7 @@ pub(crate) mod tests {
             "[harness]\nenabled = false\n# {}\n",
             "x".repeat(crate::native_config_service::MAX_CONFIG_FILE_BYTES)
         );
-        std::fs::write(&path, big).unwrap();
+        crate::test_scratch::write_config(&path, big);
         let refused = config_file_observation(&path);
         assert!(
             matches!(refused, Err(DocumentHostError::TooLarge { .. })),
@@ -1690,12 +1844,18 @@ pub(crate) mod tests {
 
         std::fs::remove_file(&path).unwrap();
         assert!(
-            observed_harness(Some(&path), &refused).is_none(),
-            "a file gone before the re-read writes no policy — never the defaults"
+            observed_harness(Some(&path), &refused)
+                .unwrap()
+                .policy
+                .enabled,
+            "a real missing file uses the absent-file defaults"
         );
         assert!(
-            observed_harness(Some(&path), &Err(DocumentHostError::NotAFile)).is_none(),
-            "another refusal writes no policy"
+            !observed_harness(Some(&path), &Err(DocumentHostError::NotAFile))
+                .unwrap()
+                .policy
+                .enabled,
+            "another refusal withdraws prior authority"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1709,14 +1869,14 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, "font_px = 12\n").unwrap();
+        crate::test_scratch::write_config(&path, "font_px = 12\n");
         let startup = config_file_observation(&path).unwrap();
         assert!(!initial_config_observation_changed(
             Some(&startup.baseline),
             &startup
         ));
 
-        std::fs::write(&path, "font_px = 14\n").unwrap();
+        crate::test_scratch::write_config(&path, "font_px = 14\n");
         let edited = config_file_observation(&path).unwrap();
         assert!(initial_config_observation_changed(
             Some(&startup.baseline),
@@ -1738,13 +1898,13 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, b"theme = \"Nord\"\n").unwrap();
+        crate::test_scratch::write_config(&path, b"theme = \"Nord\"\n");
         let metadata = std::fs::metadata(&path).unwrap();
         let modified = metadata.modified().unwrap();
         let accessed = metadata.accessed().unwrap();
         let before = config_file_stamp(&path).unwrap();
 
-        std::fs::write(&path, b"theme = \"Rose\"\n").unwrap();
+        crate::test_scratch::write_config(&path, b"theme = \"Rose\"\n");
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_times(
             std::fs::FileTimes::new()
@@ -1768,11 +1928,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, "font_px = 12\n").unwrap();
+        crate::test_scratch::write_config(&path, "font_px = 12\n");
         let a = config_file_observation(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         let missing = config_file_observation(&path).unwrap();
-        std::fs::write(&path, "font_px = 14\n").unwrap();
+        crate::test_scratch::write_config(&path, "font_px = 14\n");
         let b = config_file_observation(&path).unwrap();
         assert_ne!(a.baseline, missing.baseline);
         assert_ne!(missing.baseline, b.baseline);
@@ -1787,6 +1947,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
+        crate::test_scratch::write_config(&path, "");
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(crate::native_config_service::MAX_CONFIG_FILE_BYTES as u64 + 1)
             .unwrap();
@@ -1813,8 +1974,8 @@ pub(crate) mod tests {
         let first = dir.join("first.toml");
         let second = dir.join("second.toml");
         let logical = dir.join("aterm.toml");
-        std::fs::write(&first, b"theme = \"Nord\"\n").unwrap();
-        std::fs::write(&second, b"theme = \"Nord\"\n").unwrap();
+        crate::test_scratch::write_config(&first, b"theme = \"Nord\"\n");
+        crate::test_scratch::write_config(&second, b"theme = \"Nord\"\n");
         symlink(&first, &logical).unwrap();
         let before = config_file_stamp(&logical).unwrap();
 
@@ -2152,7 +2313,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        crate::test_scratch::write_config(&path, [0xff, 0xfe]);
         let error = config_file_observation(&path).unwrap_err();
         assert_eq!(
             config_failure_kind(&error),
@@ -2170,9 +2331,9 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, "font_px = 12\n").unwrap();
+        crate::test_scratch::write_config(&path, "font_px = 12\n");
         let first = config_file_observation(&path).unwrap().baseline;
-        std::fs::write(&path, "font_px = 14\n").unwrap();
+        crate::test_scratch::write_config(&path, "font_px = 14\n");
         let second = config_file_observation(&path).unwrap().baseline;
         assert_ne!(first, second);
 

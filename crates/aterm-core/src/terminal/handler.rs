@@ -102,6 +102,8 @@ define_terminal_handler! {
     notify_total: u64 => notify_total,
     default_cursor_style: aterm_types::CursorStyle => default_cursor_style,
     host_alternate_scroll: bool => host_alternate_scroll,
+    // The host's BiDi configuration, the baseline every reset returns the BiDi mode to.
+    host_bidi: crate::config::BiDiConfig => bidi_state.config,
     notifications: super::NotificationState => notifications,
     clipboard: super::ClipboardState => clipboard,
     iterm2: super::Iterm2State => iterm2,

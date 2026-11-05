@@ -39,15 +39,30 @@
 //!
 //! # The worker's fence
 //!
-//! The worker starts in [`CLAIM_FOLDER`] under the harness state directory, with every box
-//! raised (`--permission-mode default`, whatever the person's settings say), and the supervisor
-//! knows it by that trusted folder ([`is_claim_folder`]). Its approval rule (`RULE_CLAIM_WORKER`
-//! in `supervise::policy::approval`) passes only a Claude in Chrome action pressed once (never
-//! the site-wide grant) on a vendor page [`claim_page`] admits and that tool's own reads
-//! ([`CHROME_TOOL`]); it hands every question to a person and declines every other tool's box.
-//! Its task ends in the one reply Autopilot Land lands on (`Nothing left:`), and the window's
-//! host ends it 30 minutes after it started or a person last typed in its tab, and closes the
-//! tab 30 minutes after that unless it is its window's last tab.
+//! The worker starts in [`CLAIM_FOLDER`] under the harness state directory, and the supervisor
+//! knows it by that trusted folder ([`is_claim_folder`]). It starts in Claude Code's auto mode,
+//! so nothing it does waits on a person (owner, 2026-11-04: "started in auto / yolo mode"), or
+//! with every box raised (`--permission-mode default`) where `[harness] approve = "none"` keeps
+//! every approval the person's; either way with [`CLAIM_TOOLS`] its only built-in tools
+//! (`--tools`), so no mode lets it run a command, edit or write a file, fetch a page, start a
+//! subagent or ask a question: its Claude in Chrome tools are what it acts with. Its approval
+//! rule (`RULE_CLAIM_WORKER` in `supervise::policy::approval`) decides every box Claude Code
+//! still raises in it: it passes only a Claude in Chrome action pressed once (never the
+//! site-wide grant) on a vendor page [`claim_page`] admits and that tool's own reads
+//! ([`CHROME_TOOL`]); it declines every question on the dialog's own Esc and every other box on
+//! its `No`, or on its own Esc where it has no `No` (Claude in Chrome's), so nothing it raises
+//! waits on a person. Auto mode raises no box for a Claude in Chrome action: it hands each one to
+//! its own classifier, and with no usable answer runs none (measured on 2.1.318,
+//! `docs/measured/claude-chrome-auto-2026-11-05.md`). So the worker starts, in either mode, with
+//! [`claim_settings`], whose `autoMode` rules that classifier reads (default mode reads none):
+//! [`CLAIM_HARD_DENY`] names the acts the task forbids as ones it blocks whatever the worker is
+//! asked, beside the task's own words ([`claim_task`]). Its task ends in
+//! one of two replies ([`claim_task`]): `Nothing left: CLAIMED: <what>`, the defense Autopilot
+//! Land's check lands, or a first line `Could not finish: NOT CLAIMED: <why>`, which a managed
+//! Land worker concludes as failed. The window's host closes its tab three minutes after its
+//! task concluded (the reaper's `LINGER`), unless the tab is its window's last; a task that never
+//! concludes it ends 30 minutes after the worker started or a person last typed in its tab,
+//! which concludes it.
 //!
 //! # What is never read
 //!
@@ -92,6 +107,59 @@ pub const CLAIM_FOLDER: &str = "credit-claim";
 /// included, reads `<server> - <tool>`. Its site actions raise Claude in Chrome's own box
 /// instead ([`claim_page`]).
 pub const CHROME_TOOL: &str = "Claude in Chrome[";
+
+/// The only built-in tools a claim worker has (Claude Code's `--tools`,
+/// [`super::worker::Fresh::tools`]): `ToolSearch`, which loads a deferred tool, as Claude in
+/// Chrome's are loaded. Its Chrome tools are an MCP server's, which the list leaves; every
+/// built-in that acts (`Bash`, `Edit`, `Write`, `WebFetch`, `Agent`) or asks (`AskUserQuestion`)
+/// is absent, so no permission mode, auto's included, lets it run one.
+pub const CLAIM_TOOLS: &[&str] = &["ToolSearch"];
+
+/// What auto mode's classifier is told a claim worker is for (`autoMode.environment`,
+/// [`claim_settings`]). No word in it, or in [`CLAIM_HARD_DENY`], needs a shell quote of its own
+/// (`'` or `\`), which would spend the worker line's bytes.
+pub const CLAIM_ENVIRONMENT: &[&str] =
+    &["Only task: claim one free Claude credit on the claim page the prompt names"];
+
+/// The acts auto mode's classifier blocks in a claim worker whatever its prompt or a page says
+/// (`autoMode.hard_deny`, [`claim_settings`]; Claude Code: "Security-boundary actions the
+/// classifier should block unconditionally (user intent does not clear these)"): the acts
+/// [`claim_task`] forbids. A claim page and the confirmation its claim shows are named outside
+/// the first, so the claim itself is not one of them.
+pub const CLAIM_HARD_DENY: &[&str] = &[
+    "Opening or acting on a billing, plan, pricing, usage, spend-limit, subscription, payment, \
+     checkout or upgrade page or setting (not the claim page or its confirmation)",
+    "Entering payment details, buying anything, turning on extra usage, changing a plan or \
+     limit, or starting a trial",
+    "Signing in with or creating any credential, key or account",
+];
+
+/// THE SETTINGS DOCUMENT A CLAIM WORKER STARTS WITH (Claude Code's `--settings`,
+/// [`super::worker::Fresh::settings`]): `autoMode` with [`CLAIM_ENVIRONMENT`] and
+/// [`CLAIM_HARD_DENY`], and nothing else, so it moves no login, route or hook. Claude Code reads
+/// `autoMode` from this flag and not from a project's settings (2.1.318), and a line carrying it
+/// goes without aterm's usage tap ([`super::tap::launch_value`]): a claim worker's figures are
+/// not on its footer, the cost of rules that, by Claude Code's account of `hard_deny`, neither its
+/// prompt nor a page lifts.
+#[must_use]
+pub fn claim_settings() -> &'static str {
+    static DOC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DOC.get_or_init(|| {
+        let list = |rules: &[&str]| {
+            let quoted: Vec<String> = rules
+                .iter()
+                .copied()
+                .map(crate::supervise::journal::json_str)
+                .collect();
+            format!("[{}]", quoted.join(","))
+        };
+        format!(
+            r#"{{"autoMode":{{"environment":{},"hard_deny":{}}}}}"#,
+            list(CLAIM_ENVIRONMENT),
+            list(CLAIM_HARD_DENY)
+        )
+    })
+}
 
 /// The words a page a claim worker acts on may not hold after its host, lowercased, anywhere in
 /// its path, query or fragment: the pages that bill, sell, change a plan or a spend limit, or
@@ -525,8 +593,13 @@ fn words_ok(line: &str) -> Option<String> {
 }
 
 /// The task a claim worker is given: one string, opening with the harness's mark, naming the
-/// offer's link and words, what the worker must never do, and the one reply it ends with, which
-/// Autopilot Land lands on (`Nothing left:` with no NEEDS YOU line).
+/// offer's link and words, what the worker must never do, how many times it tries a browser
+/// that is not connected yet ([`CLAIM_CONNECT_TRIES`]) before it gives up, and the one reply it
+/// ends with. A claim
+/// ends on `Nothing left: CLAIMED:` (a defense, which Autopilot Land's check lands); no claim
+/// ends on a first line `Could not finish: NOT CLAIMED:` and no `Nothing left:` line, which a
+/// managed Land worker concludes as failed at that point (`needs::could_not_finish`). Neither
+/// carries a NEEDS YOU line: nothing in a claim waits on a person.
 #[must_use]
 pub fn claim_task(offer: &Offer) -> String {
     format!(
@@ -539,15 +612,26 @@ pub fn claim_task(offer: &Offer) -> String {
              enter, add or change payment details; never buy anything; never turn on extra \
              usage or change the plan, billing or spend limits; never start a paid trial; never \
              sign in with or create new credentials. Never ask a question. If the page asks for \
-             any of that, or the Chrome tools are not available, stop. There is nothing to \
-             commit, push or land. End with one reply starting `Nothing left:` that says \
-             CLAIMED: <what was claimed> or NOT CLAIMED: <why>, and no NEEDS YOU line: the \
-             person reads your reply in this tab."
+             any of that, stop. aterm checked for Google Chrome and its Claude extension, and \
+             installed what was missing, before it started you: if your Claude in Chrome tools \
+             say the extension is not connected or no browser is connected, call them again, up \
+             to {tries} times in all (the person may be signing in to claude.ai in the \
+             extension), and only then give up. There is nothing to commit, push or land. If you \
+             claimed it, end with one reply starting `Nothing left: CLAIMED: <what was \
+             claimed>`. If you did not, end with one reply whose first line \
+             is `Could not finish: NOT CLAIMED: <why>`, with no `Nothing left:` line. Write no \
+             NEEDS YOU line: the person reads your reply in this tab."
         ),
         url = offer.url,
         words = offer.words,
+        tries = CLAIM_CONNECT_TRIES,
     )
 }
+
+/// How many times a claim worker calls its Claude in Chrome tools while they say no browser or
+/// extension is connected ([`claim_task`]) before it ends with `Could not finish: NOT CLAIMED:`.
+/// It has no command to wait with ([`CLAIM_TOOLS`]), so its tries are the tool calls themselves.
+pub const CLAIM_CONNECT_TRIES: u32 = 10;
 
 /// The file: the four keys read; every other key skipped.
 #[derive(Default, Deserialize)]

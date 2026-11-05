@@ -35,8 +35,14 @@ fn left(text: &str) -> bool {
     [EXITED, lab::EXIT, lab::BG_EXITED].contains(&text)
 }
 
+/// A capture no screen sniff names agy's, only its process name: agy gone, a split half, its
+/// launch line, and its bash mode (v6 §14.17.5.8), which draws `!` as the caret and no `>`
+/// composer.
 fn unnamed(text: &str) -> bool {
-    left(text) || text == lab::SPLIT_HALF || text == crate::agy::fixtures::LAUNCH_LINE
+    left(text)
+        || text == lab::SPLIT_HALF
+        || text == crate::agy::fixtures::LAUNCH_LINE
+        || text == lab::BASH_MODE_DRAFT
 }
 
 fn captures() -> Vec<(String, String)> {

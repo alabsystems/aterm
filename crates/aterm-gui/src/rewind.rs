@@ -1246,7 +1246,7 @@ impl App {
         })
     }
 
-    /// Bring `session`'s view's faith up to the recorder's verdicts, which later folds (a rekey, `temporal`) may have reached.
+    /// Bring `session`'s view's faith up to the recorder's verdicts, which later folds (the idle judge, `temporal`, `temporal judge`, a view's own judging) may have reached.
     pub(crate) fn refresh_rewind_faith(&mut self, session: u64) {
         if let Some(faith) = self.rewind_faith(session)
             && let Some(view) = self.pool.rewind_mut(session)

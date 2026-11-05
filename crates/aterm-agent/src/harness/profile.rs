@@ -502,7 +502,7 @@ pub fn default_home_key(user_home: &Path) -> Option<AccountKey> {
 }
 
 /// The profile filename selected by a process's own exec environment.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Selection {
     /// The exec environment was not read, or disagrees on the selector.
     #[default]
@@ -520,10 +520,15 @@ impl Selection {
         if env.is_empty() {
             return Self::Unknown;
         }
+        Self::of_env(env.iter().filter_map(|word| word.split_once('=')))
+    }
+
+    /// Select from a known local environment, including a known empty environment.
+    #[must_use]
+    pub fn of_env<'a>(env: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
         let mut selected = None;
         for (_, value) in env
-            .iter()
-            .filter_map(|word| word.split_once('='))
+            .into_iter()
             .filter(|(name, _)| *name == "CLAUDE_CODE_CUSTOM_OAUTH_URL")
         {
             let custom = !value.is_empty();
@@ -576,6 +581,34 @@ fn exec_var<'a>(env: &'a [String], name: &str) -> Option<Option<&'a str>> {
 }
 
 impl Context {
+    /// Resolve the profile paths of one known execution environment, including known absence.
+    /// No credential contents are read by this path calculation.
+    #[must_use]
+    pub fn of_directory_facts(
+        user_home: &Path,
+        cwd: &str,
+        home: Option<&str>,
+        config: Option<&str>,
+        login: Option<&str>,
+        selection: Selection,
+    ) -> Option<Self> {
+        if selection == Selection::Unknown {
+            return None;
+        }
+        let vars = HomeVars { home, config };
+        let records = Records::at(user_home, vars, || {
+            Path::new(cwd).is_absolute().then(|| PathBuf::from(cwd))
+        });
+        let records = records.dir()?;
+        Some(Self {
+            plain: super::upgrade_drive::profile_in(user_home, vars, records),
+            records: records.to_path_buf(),
+            selection,
+            home: home.map(str::to_owned),
+            config: config.map(str::to_owned),
+            login: login.map(str::to_owned),
+        })
+    }
     /// The profile paths of already-resolved records.
     pub(super) fn of_exec_env(user_home: &Path, records: &Path, env: &[String]) -> Option<Self> {
         let vars = HomeVars {
@@ -751,6 +784,118 @@ pub fn answers_to(env: &[String], user_home: &Path, email: &str) -> Option<bool>
 pub struct IdentityObservation {
     pub email_matches: Option<bool>,
     pub principal: Option<[u8; 32]>,
+}
+
+/// Local identity evidence, not authentication or a credential lease.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum IdentityEvidence {
+    Missing,
+    Present {
+        observation: IdentityObservation,
+        email_digest: Option<[u8; 32]>,
+    },
+}
+impl std::fmt::Debug for IdentityEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "IdentityEvidence::Missing",
+            Self::Present { .. } => "IdentityEvidence::Present(redacted)",
+        })
+    }
+}
+
+/// Read local identity evidence without collapsing unavailable files into absence.
+/// # Errors
+/// Unavailable, dangling, non-file, oversized or malformed profile evidence.
+pub fn identity_evidence_in_home(home: &Path, email: &str) -> std::io::Result<IdentityEvidence> {
+    identity_evidence_at(&home.join(".claude.json"), Some(home), email)
+}
+
+/// Default Claude profile evidence uses the user's plain profile and record namespace.
+/// # Errors
+/// As [`identity_evidence_in_home`].
+pub fn default_identity_evidence(
+    user_home: &Path,
+    email: &str,
+) -> std::io::Result<IdentityEvidence> {
+    identity_evidence_at(
+        &user_home.join(".claude.json"),
+        Some(&user_home.join(".claude")),
+        email,
+    )
+}
+
+fn evidence_metadata(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+                Ok(_) => Err(std::io::Error::other("profile entry is unavailable")),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn identity_evidence_at(
+    plain: &Path,
+    records: Option<&Path>,
+    email: &str,
+) -> std::io::Result<IdentityEvidence> {
+    let mut selected = plain.to_path_buf();
+    if let Some(records) = records {
+        let legacy = records.join(".config.json");
+        if let Some(meta) = evidence_metadata(&legacy)? {
+            if !meta.is_file() {
+                return Err(std::io::Error::other(
+                    "legacy profile is not a regular file",
+                ));
+            }
+            if meta.len() > 0
+                || (!meta.permissions().readonly() && evidence_metadata(plain)?.is_none())
+            {
+                selected = legacy;
+            }
+        }
+    }
+    if evidence_metadata(&selected)?.is_none() {
+        return Ok(IdentityEvidence::Missing);
+    }
+    read_with(&selected, |bytes| {
+        let Obj(raw) =
+            aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+        let raw = raw.ok_or(NoProfile::Unreadable)?;
+        let email_digest = raw
+            .oauth
+            .0
+            .and_then(|oauth| oauth.address.0)
+            .and_then(|address| {
+                let mut normalized = address.trim().to_ascii_lowercase().into_bytes();
+                let result = if normalized.is_empty() {
+                    None
+                } else {
+                    let mut digest = aterm_digest::Sha256::new();
+                    digest.update(b"aterm/cold-profile-email/v1\0");
+                    digest.update((normalized.len() as u64).to_be_bytes());
+                    digest.update(&normalized);
+                    Some(digest.finalize())
+                };
+                wipe(&mut normalized);
+                let mut original = address.into_bytes();
+                wipe(&mut original);
+                result
+            });
+        Ok(IdentityEvidence::Present {
+            observation: IdentityObservation {
+                email_matches: answers_from_bytes(bytes, email).ok().flatten(),
+                principal: principal_from_bytes(bytes).ok().flatten(),
+            },
+            email_digest,
+        })
+    })
+    .map_err(|_| std::io::Error::other("profile identity evidence unavailable"))
 }
 
 /// Read retained sign-in identity evidence once, including legacy-path precedence.
@@ -1202,6 +1347,35 @@ pub fn subscription_and_plan_for(
     Some((selected.subscription(now), plan))
 }
 
+pub(crate) struct FooterUse<'a> {
+    account: super::provider_read::Account,
+    host: &'a dyn super::provider_read::FooterHost,
+    argv: &'a [String],
+    env: &'a [String],
+}
+
+impl FooterUse<'_> {
+    pub(super) fn account(self) -> Option<super::provider_read::Account> {
+        self.host.owns(self.argv, self.env).then_some(self.account)
+    }
+}
+
+fn footer_read_use(
+    host: &dyn super::provider_read::FooterHost,
+    argv: &[String],
+    env: &[String],
+    read: super::provider_read::Read,
+    config: &Path,
+) -> Option<super::provider_read::Use> {
+    let running = super::provider_read::Running::footer_use(FooterUse {
+        account: super::provider_read::Account::in_home(read, config, None),
+        host,
+        argv,
+        env,
+    })?;
+    Some(super::provider_read::Use::session_read_use(running))
+}
+
 type MuseUsageCacheKey = (PathBuf, String);
 
 /// One account's usage cache: when a fetch was last kicked or landed, and the last
@@ -1270,6 +1444,7 @@ fn abs_home_dir(env: &[String], user_home: &Path) -> PathBuf {
 /// and account under the one age rule ([`WeeklyFigure::words`]). The refresh runs only
 /// where the process's own binary resolves; a screen card's words in `prev` stand while
 /// no figure is current, as agy's do ([`agy_subscription_for`]).
+/// A provider read additionally requires `host` to own this process's arguments and environment.
 #[must_use]
 pub fn muse_subscription_for(
     argv: &[String],
@@ -1277,6 +1452,7 @@ pub fn muse_subscription_for(
     user_home: &Path,
     prev: &SubscriptionDisplay,
     now: i64,
+    host: &dyn super::provider_read::FooterHost,
 ) -> Option<SubscriptionDisplay> {
     let var = |key: &str| non_empty_env_var(env, key);
     if var("META_API_KEY").is_some() {
@@ -1348,6 +1524,13 @@ pub fn muse_subscription_for(
             muse_serve_env(env, &home_dir),
             home_dir,
             now,
+            footer_read_use(
+                host,
+                argv,
+                env,
+                super::provider_read::Read::MuseUsage,
+                &config,
+            )?,
         );
     }
     let (figure, fetched_plan) = match cached.and_then(|entry| entry.reading) {
@@ -1383,6 +1566,7 @@ fn kick_muse_usage_fetch(
     serve_env: Vec<(&'static str, std::ffi::OsString)>,
     home_dir: PathBuf,
     now: i64,
+    use_token: super::provider_read::Use,
 ) -> bool {
     if MUSE_USAGE_FETCHING.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return false;
@@ -1411,7 +1595,18 @@ fn kick_muse_usage_fetch(
                 }
             }
             let _done = FetchDone;
-            let reading = super::muse_usage::fetch(&exe, serve_env, &home_dir);
+            let Ok(permit) = use_token.begin(
+                super::provider_read::Account::in_home(
+                    super::provider_read::Read::MuseUsage,
+                    &spawned_key.0,
+                    None,
+                ),
+                now,
+                super::journal::realm_key("meta", &spawned_key.1),
+            ) else {
+                return;
+            };
+            let reading = super::muse_usage::fetch(&exe, serve_env, &home_dir, permit);
             let done = aterm_time::unix_secs()
                 .and_then(|secs| i64::try_from(secs).ok())
                 .unwrap_or(now);
@@ -1426,13 +1621,6 @@ fn kick_muse_usage_fetch(
             );
         });
     if spawned.is_ok() {
-        super::provider_read::note(&super::provider_read::ProbeEvent {
-            at: now,
-            read: super::provider_read::Read::MuseUsage,
-            account: None,
-            login: super::journal::realm_key("meta", &key.1),
-            why: super::provider_read::InUse::LiveSession,
-        });
         true
     } else {
         let mut guard = MUSE_USAGE_CACHE
@@ -1770,12 +1958,13 @@ where
         .ok()?
         .flatten()
         .filter_map(|e| {
-            let p = e.path();
-            let name = p.file_name()?.to_str()?;
+            let file_name = e.file_name();
+            let name = file_name.to_str()?;
             if !name.starts_with("cli-")
                 || !Path::new(name)
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
+                || !e.file_type().is_ok_and(|kind| kind.is_file())
             {
                 return None;
             }
@@ -1783,7 +1972,7 @@ where
             if !meta.is_file() {
                 return None;
             }
-            Some((meta.modified().ok()?, p))
+            Some((meta.modified().ok()?, e.path()))
         })
         .collect();
     logs.sort_by_key(|a| std::cmp::Reverse(a.0));
@@ -2215,8 +2404,8 @@ fn muse_active_session_lock(
             .into_iter()
             .flatten()
             .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
             .map(|e| e.path())
-            .filter(|p| p.is_dir())
             .collect();
         out.sort();
         out.reverse();
@@ -2291,17 +2480,36 @@ fn agy_exe_for(argv: &[String], env: &[String], user_home: &Path) -> Option<Path
     launched_exe_for(argv, env, user_home, "agy")
 }
 
-/// agy's `/usage` doc, read whole within `budget` ([`super::align::capture_bounded`], as the
+/// agy's `/usage` doc, read whole within `budget` ([`super::align::capture_bounded_until`], as the
 /// quota store reads it; a running agy's subscription read spends
 /// [`super::agy_quota_store::LAUNCH_READ_BUDGET`], the budget a launch's own read has): at the
 /// budget agy and whatever it started that still holds its stdout are killed, and there is no doc.
+/// An agy that prints its sign-in prompt ([`super::agy_quota_store::SIGN_IN_PROMPT`]) is killed
+/// then, never left waiting for a person, and the failure says it is signed out.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the bound read carries the process environment, deadline and journal context explicitly"
+)]
 fn fetch_agy_usage_doc(
     exe: &Path,
     argv: &[String],
     cfg_var: Option<&str>,
+    ssh: Option<&str>,
     home: &Path,
     budget: std::time::Duration,
-) -> Option<Vec<u8>> {
+    use_token: super::provider_read::Use,
+    now: i64,
+    login: Option<super::journal::Key>,
+) -> Result<Vec<u8>, &'static str> {
+    let config = cfg_var
+        .map(PathBuf::from)
+        .or_else(|| super::upgrade_agy::config_dir(argv, home.to_str(), home))
+        .ok_or("agy home unavailable")?;
+    let _permit = use_token.begin(
+        super::provider_read::Account::in_home(super::provider_read::Read::AgyUsage, &config, None),
+        now,
+        login,
+    )?;
     let mut cmd = aterm_uds::spawnfd::command(exe);
     cmd.args(super::upgrade_agy::config_flags(argv))
         .arg("--log-file")
@@ -2311,9 +2519,27 @@ fn fetch_agy_usage_doc(
     if let Some(cfg) = cfg_var {
         cmd.env("AGY_CLI_CONFIG_DIR", cfg);
     }
-    let got = super::align::capture_bounded(cmd, budget, super::agy_quota::MAX_STDOUT).ok()?;
-    got.success().then_some(got.stdout)
+    // The session's `SSH_CONNECTION` selects agy's grant store (its file backend over SSH, the OS
+    // keyring otherwise): the probe asks the store the session signed in with.
+    if let Some(ssh) = ssh {
+        cmd.env("SSH_CONNECTION", ssh);
+    }
+    match super::align::capture_bounded_until(
+        cmd,
+        budget,
+        super::agy_quota::MAX_STDOUT,
+        super::agy_quota_store::SIGN_IN_PROMPT,
+    ) {
+        Ok(super::align::Ended::Exited(got)) if got.success() => Ok(got.stdout),
+        Ok(super::align::Ended::Stopped) => Err(SIGNED_OUT_FOOTER),
+        _ => Err("footer usage read failed"),
+    }
 }
+
+/// The failure a footer read notes when agy met its sign-in prompt: the running session's grant
+/// no longer serves a new process.
+const SIGNED_OUT_FOOTER: &str = "signed-out (expired): agy asked for a Google sign-in on a \
+                                 footer usage read; `aterm harness agy login <account>` signs it in again";
 
 fn agy_quota_store_for(
     argv: &[String],
@@ -2376,6 +2602,7 @@ fn agy_override_object(argv: &[String], cwd: Option<&Path>, user_home: &Path) ->
 }
 
 /// The account and weekly quota an `agy` process is signed in as ([`SubscriptionDisplay`]).
+/// A provider read additionally requires `host` to own its arguments and environment.
 #[must_use]
 pub fn agy_subscription_for(
     argv: &[String],
@@ -2384,13 +2611,18 @@ pub fn agy_subscription_for(
     prev: &SubscriptionDisplay,
     model: Option<&str>,
     now: i64,
+    host: &dyn super::provider_read::FooterHost,
 ) -> Option<SubscriptionDisplay> {
-    agy_subscription_in_dir(argv, env, None, user_home, prev, model, now)
+    agy_subscription_in_dir(argv, env, None, user_home, prev, model, now, host)
 }
 
 /// [`agy_subscription_for`] resolving a relative `--settings` file path against `cwd` when `cwd`
 /// is an absolute directory.
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the running-process handle binds this footer's argv and environment"
+)]
 pub fn agy_subscription_in_dir(
     argv: &[String],
     env: &[String],
@@ -2399,28 +2631,26 @@ pub fn agy_subscription_in_dir(
     prev: &SubscriptionDisplay,
     model: Option<&str>,
     now: i64,
+    host: &dyn super::provider_read::FooterHost,
 ) -> Option<SubscriptionDisplay> {
     let var = |key: &str| non_empty_env_var(env, key);
     let store = agy_quota_store_for(argv, var("HOME"), var("AGY_CLI_CONFIG_DIR"), user_home);
-    agy_subscription_with_store_in_dir(argv, env, cwd, user_home, prev, model, now, store.as_ref())
-}
-
-#[cfg(all(test, unix))]
-fn agy_subscription_with_store(
-    argv: &[String],
-    env: &[String],
-    user_home: &Path,
-    prev: &SubscriptionDisplay,
-    model: Option<&str>,
-    now: i64,
-    store: Option<&super::agy_quota_store::Store>,
-) -> Option<SubscriptionDisplay> {
-    agy_subscription_with_store_in_dir(argv, env, None, user_home, prev, model, now, store)
+    agy_subscription_with_store_in_dir(
+        argv,
+        env,
+        cwd,
+        user_home,
+        prev,
+        model,
+        now,
+        store.as_ref(),
+        host,
+    )
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "internal helper threading cwd and test quota store together"
+    reason = "internal helper threading the running process, cwd and test quota store together"
 )]
 fn agy_subscription_with_store_in_dir(
     argv: &[String],
@@ -2431,6 +2661,7 @@ fn agy_subscription_with_store_in_dir(
     model: Option<&str>,
     now: i64,
     store: Option<&super::agy_quota_store::Store>,
+    host: &dyn super::provider_read::FooterHost,
 ) -> Option<SubscriptionDisplay> {
     let var = |key: &str| non_empty_env_var(env, key);
     if var(super::witness::AGY_GATEWAY_URL).is_some()
@@ -2564,20 +2795,25 @@ fn agy_subscription_with_store_in_dir(
                     fallback
                 } else if let Some(exe) = agy_exe_for(argv, env, user_home) {
                     usage_read = true;
-                    super::provider_read::note(&super::provider_read::ProbeEvent {
-                        at: now,
-                        read: super::provider_read::Read::AgyUsage,
-                        account: None,
-                        login: super::journal::realm_key("google", &email),
-                        why: super::provider_read::InUse::LiveSession,
-                    });
-                    let bytes = fetch_agy_usage_doc(
+                    let fetch = fetch_agy_usage_doc(
                         &exe,
                         argv,
                         var("AGY_CLI_CONFIG_DIR").filter(|dir| Path::new(dir).is_absolute()),
+                        var("SSH_CONNECTION"),
                         &home_dir,
                         super::agy_quota_store::LAUNCH_READ_BUDGET,
+                        footer_read_use(
+                            host,
+                            argv,
+                            env,
+                            super::provider_read::Read::AgyUsage,
+                            &config,
+                        )?,
+                        now,
+                        super::journal::realm_key("google", &email),
                     );
+                    let failed = fetch.as_ref().err().copied();
+                    let bytes = fetch.ok();
                     let fetched = bytes
                         .as_deref()
                         .and_then(|b| parse_agy_usage_json(b, third_party, now));
@@ -2595,7 +2831,7 @@ fn agy_subscription_with_store_in_dir(
                                 doc,
                             });
                         } else {
-                            store.note_failure("footer usage read failed", now);
+                            store.note_failure(failed.unwrap_or("footer usage read failed"), now);
                         }
                     }
                     let mut guard = AGY_USAGE_CACHE
@@ -2893,7 +3129,7 @@ fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     options.open(path)
 }
@@ -3823,3 +4059,58 @@ impl<'de> Deserialize<'de> for IsFable {
 #[path = "profile_tests.rs"]
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cold_identity_evidence_tests {
+    use super::*;
+    #[test]
+    fn missing_unknown_and_unavailable_identity_evidence_are_distinct() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        assert_eq!(
+            identity_evidence_in_home(dir.path(), "expected@example.test").unwrap(),
+            IdentityEvidence::Missing
+        );
+        let plain = dir.path().join(".claude.json");
+        std::fs::write(&plain, b"{}").unwrap();
+        assert_eq!(
+            identity_evidence_in_home(dir.path(), "expected@example.test").unwrap(),
+            IdentityEvidence::Present {
+                observation: IdentityObservation::default(),
+                email_digest: None
+            }
+        );
+        std::fs::write(&plain, b"not JSON").unwrap();
+        assert!(identity_evidence_in_home(dir.path(), "expected@example.test").is_err());
+        std::fs::remove_file(&plain).unwrap();
+        std::fs::create_dir(&plain).unwrap();
+        assert!(identity_evidence_in_home(dir.path(), "expected@example.test").is_err());
+    }
+    #[test]
+    fn email_only_identity_evidence_binds_normalized_email_without_principal() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        let write = |email: &str| {
+            std::fs::write(
+                &path,
+                aterm_json::to_vec(&aterm_json::json!({"oauthAccount":{"emailAddress":email}}))
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        write("First@Example.Test");
+        let first = identity_evidence_in_home(dir.path(), "").unwrap();
+        write(" first@example.test ");
+        assert_eq!(identity_evidence_in_home(dir.path(), "").unwrap(), first);
+        write("second@example.test");
+        assert_ne!(identity_evidence_in_home(dir.path(), "").unwrap(), first);
+        assert!(!format!("{first:?}").contains("example"));
+    }
+    #[test]
+    #[cfg(unix)]
+    fn dangling_selected_profile_is_unavailable_not_missing() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("absent"), dir.path().join(".claude.json"))
+            .unwrap();
+        assert!(identity_evidence_in_home(dir.path(), "expected@example.test").is_err());
+    }
+}

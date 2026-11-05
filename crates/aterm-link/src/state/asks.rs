@@ -6,7 +6,7 @@
 //! [`DEADLINES`], each deadline owed a verdict).
 //!
 //! An ask cost the state dir those two replaces between its landing and the `outbox sent` that
-//! releases its sender (`Bridge::post_landed`), 0.23-0.35 ms of an agent's ask (B11); each answer
+//! releases its sender (`Bridge::landing_line`), 0.23-0.35 ms of an agent's ask (B11); each answer
 //! that settled a deadline, and each sweep that changed one, cost the deadline table's replace
 //! again. Here the ask's recipient and its deadline are one append of two records, and a
 //! deadline settled is one record ([`Frame::DeadlineGone`]).

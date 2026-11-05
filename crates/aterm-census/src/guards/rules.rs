@@ -104,9 +104,9 @@ fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
         if !parent.mentions(&["mod"]) {
             continue;
         }
-        for load in parent.loads().into_iter().filter(|l| l.gated && l.top) {
-            if let Some(file) = load.files.into_iter().find(|f| corpus.get(f).is_some()) {
-                push(&mut out, file);
+        for load in parent.loads().iter().filter(|l| l.gated && l.top) {
+            if let Some(file) = load.files.iter().find(|f| corpus.get(f).is_some()) {
+                push(&mut out, file.clone());
             }
         }
     }
@@ -117,10 +117,10 @@ fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
                 continue;
             }
             for load in parent.loads() {
-                if let Some(file) = load.files.into_iter().find(|f| corpus.get(f).is_some())
-                    && !in_declared(&out, &file)
+                if let Some(file) = load.files.iter().find(|f| corpus.get(f).is_some())
+                    && !in_declared(&out, file)
                 {
-                    push(&mut out, file);
+                    push(&mut out, file.clone());
                 }
             }
         }
@@ -135,23 +135,37 @@ fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
 pub(super) struct TestCode {
     /// The files and directories [`declared_test_modules`] names.
     declared: Vec<String>,
+    /// Which files are test code by their paths alone ([`TestCode::read_named`]).
+    named: fn(&str) -> bool,
     /// What a shipped line of a shipped file loads ([`Corpus::shipped_loads`]).
     shipped: std::collections::BTreeSet<String>,
 }
 
 impl TestCode {
     pub(super) fn read(corpus: &Corpus, prefixes: &[&str]) -> Self {
+        Self::read_named(corpus, prefixes, |_| false)
+    }
+
+    /// [`TestCode::read`], where a file `named` calls test code by its path alone (one in a
+    /// `tests` directory) is test code too: it ships only once a shipped line loads it, and what
+    /// it loads ships only then.
+    pub(super) fn read_named(corpus: &Corpus, prefixes: &[&str], named: fn(&str) -> bool) -> Self {
         let declared = declared_test_modules(corpus, prefixes);
-        let named = |rel: &str| in_declared(&declared, rel);
-        let shipped = corpus.shipped_loads(prefixes, &named);
-        Self { declared, shipped }
+        let test = |rel: &str| in_declared(&declared, rel) || named(rel);
+        let shipped = corpus.shipped_loads(prefixes, &test);
+        Self {
+            declared,
+            named,
+            shipped,
+        }
     }
 
     /// Is `rel` test code by its parent's say (the file a test-only `mod` loads, or one in that
-    /// module's own directory: [`declared_test_modules`]) that nothing ships? A file that a
-    /// shipped `mod` or `include!` of a shipped file also loads ships, and is read.
+    /// module's own directory: [`declared_test_modules`]) or by its path
+    /// ([`TestCode::read_named`]), that nothing ships? A file that a shipped `mod` or `include!`
+    /// of a shipped file also loads ships, and is read.
     pub(super) fn holds(&self, rel: &str) -> bool {
-        in_declared(&self.declared, rel) && !self.shipped.contains(rel)
+        (in_declared(&self.declared, rel) || (self.named)(rel)) && !self.shipped.contains(rel)
     }
 
     /// Does a shipped line of a shipped file load `rel`, whatever its name?
@@ -652,6 +666,7 @@ const RESTORE_CRATE: &str = "crates/aterm-restore";
 const OFF_HOST_CRATES: &[&str] = &[
     "crates/aterm-link",
     "crates/aterm-net",
+    "crates/aterm-mesh",
     "crates/aterm-http",
     "crates/aterm-gui-fabric",
 ];
@@ -1204,11 +1219,6 @@ const SUPERVISE_READS: &[(&str, ClockShape, &str)] = &[
         "approvals::open_wall",
         ClockShape::Named,
         "the approval ledger by its path (`approvals::open_wall`)",
-    ),
-    (
-        "approvals::relaunch_waiting",
-        ClockShape::Named,
-        "the approval ledger by its path (`approvals::relaunch_waiting`)",
     ),
     (
         "approvals::bound",
@@ -3251,11 +3261,6 @@ mod tests {
                 "open_wall = approvals::open_wall(path, sid);\n",
                 1,
             ),
-            (
-                "the relaunch's wait read off the ledger by its path",
-                "let w = approvals::relaunch_waiting(path, sid);\n",
-                1,
-            ),
             ("the ledger cut", "approvals::bound(path);\n", 1),
             (
                 "this process's id imported bare",
@@ -3324,8 +3329,7 @@ mod tests {
         let doors = "match self.fx.try_recv_mail(&m.rx) {\n    _ => {}\n}\n\
                      let got = self.fx.recv_mail_timeout(&m.rx, slice);\n\
                      let typed = approvals::typed_at_in(&body, sid);\n\
-                     let w = approvals::open_wall_in(&body, sid);\nself.fx.bound(path);\n\
-                     let r = approvals::relaunch_waiting_in(body, sid);\n";
+                     let w = approvals::open_wall_in(&body, sid);\nself.fx.bound(path);\n";
         let holder = "pub(super) fn default_holder() -> String {\n    \
                       format!(\"aterm-supervise:{}\", std::process::id())\n}\n";
         let found = run(

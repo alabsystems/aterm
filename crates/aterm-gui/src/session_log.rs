@@ -652,6 +652,10 @@ pub(crate) struct SessionLog {
     ask: Option<AskedEnd>,
     /// The runs that left the front for the shell before the open command's D, at most [`LEFT_FRONT_MAX`].
     left_front: Vec<LeftFront>,
+    /// Where the session's tab took its place, as its `tab act=open` said ([`tab::TabPlace`]).
+    tab: Option<tab::TabPlace>,
+    /// What the tab spent, for its close's totals ([`tab::TabSpend`]).
+    spend: tab::TabSpend,
 }
 
 /// A person's gesture as [`SessionLog::person_input`] takes it from the seam (`crate::app_input::note_person_reaching`): the number of the gesture when it opened a burst (`HumanInputStamp::note_reaching`), and whether it reached the program ([`crate::human_input::reaches_program`]).
@@ -739,6 +743,8 @@ impl SessionLog {
             front_pgid: 0,
             ask: None,
             left_front: Vec::new(),
+            tab: None,
+            spend: tab::TabSpend::default(),
         }
     }
 }
@@ -761,6 +767,10 @@ pub(crate) fn exit_actor(actor: &crate::session_store::ExitActor) -> Actor {
         ExitActor::Harness => Actor::Harness,
         #[cfg(any(unix, test))]
         ExitActor::Bridge => Actor::Bridge,
+        ExitActor::Fleet(token) => match Actor::from_word(token) {
+            fleet @ Actor::Fleet(_) => fleet,
+            _ => Actor::Nobody,
+        },
         ExitActor::Unknown => Actor::Nobody,
     }
 }
@@ -783,6 +793,7 @@ pub(crate) const fn exit_out(reason: crate::session_store::ExitReason) -> Sessio
         ExitReason::WindowClose => SessionOut::WindowClose,
         #[cfg(test)]
         ExitReason::AppQuit => SessionOut::AppQuit,
+        ExitReason::Reaper => SessionOut::Reaper,
         ExitReason::Unknown => SessionOut::Unknown,
     }
 }
@@ -3166,6 +3177,10 @@ pub(crate) fn render_brief_all(parts: &[BriefPart], budget: usize) -> String {
 
 #[path = "session_log_mark.rs"]
 mod mark;
+
+#[path = "session_log_tab.rs"]
+mod tab;
+pub(crate) use tab::{TabClose, TabPlace, TreeSpent};
 
 #[path = "session_log_carry.rs"]
 mod carry;

@@ -585,7 +585,11 @@ pub fn present_retry_model() -> Model {
             action Wake when (retry > 0) {
                 retry = 0;
                 ready = 1;
-                remaining = if Buggy == 1 { remaining } else { remaining - 1 };
+                // Remaining is projected from saturating u8 arithmetic even under a bad
+                // retry decision; a scheduling mutant does not change its representation.
+                remaining = if Buggy == 1 { remaining } else {
+                    if remaining > 0 { remaining - 1 } else { 0 }
+                };
                 train = train + 1;
                 parked = 0;
                 outstanding = 1;

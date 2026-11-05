@@ -695,7 +695,7 @@ fn regular_file_equals(path: &Path, expected: &[u8]) -> bool {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
     };
     #[cfg(not(unix))]
@@ -848,11 +848,15 @@ fn collect_old_script_sets(root: &Path, now: std::time::SystemTime) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
+        let is_scratch = name.starts_with(".tmp-") || name.starts_with(".stale-");
+        if !is_scratch && (!is_address(name) || name == own) {
+            continue;
+        }
         let Ok(ft) = entry.file_type() else { continue };
         if !ft.is_dir() || ft.is_symlink() {
             continue;
         }
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+        let Ok(meta) = entry.metadata() else {
             continue;
         };
         if !meta.file_type().is_dir() {
@@ -860,11 +864,11 @@ fn collect_old_script_sets(root: &Path, now: std::time::SystemTime) {
         }
         let modified = meta.modified().unwrap_or(now);
         let age = now.duration_since(modified).unwrap_or_default();
-        if name.starts_with(".tmp-") || name.starts_with(".stale-") {
+        if is_scratch {
             if age >= GC_SCRATCH_AGE {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
-        } else if is_address(name) && name != own {
+        } else {
             sets.push((modified, entry.path()));
         }
     }
@@ -967,7 +971,21 @@ fn windows_absolute(value: Option<std::ffi::OsString>) -> Option<std::ffi::OsStr
 #[cfg_attr(trust_verify, trust::skip)]
 fn write_script(path: &Path, contents: &str) -> Result<(), std::io::Error> {
     use std::io::Write;
-    let mut file = std::fs::File::create(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    file.set_len(0)?;
     file.write_all(contents.as_bytes())
 }
 

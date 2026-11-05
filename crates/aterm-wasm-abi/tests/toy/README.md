@@ -8,9 +8,8 @@
 generator writes for it (an ES module, wasm-bindgen's `--target web` shape),
 and `drive.mjs` loads that glue in a page of the pinned chrome-headless-shell
 and checks it. `targo --unverified verify wasm-glue` holds the generator: it
-regenerates the glue, compares it with `golden/` and runs `drive.mjs`, then
-runs the same driver on wasm-bindgen 0.2.108's glue for a `#[wasm_bindgen]`
-twin of the toy (the oracle row).
+regenerates the glue, compares it with `golden/` and runs `drive.mjs`, with a
+planted conversion bug the driver must catch.
 
 Until 2026-10-22 the generator also wrote a CommonJS `nodejs` flavor and the
 driver ran under node; both are gone (docs/DESIGN-init-system-2026-10-20.md,
@@ -38,5 +37,8 @@ renamed failed, as it must. Class member order and the raw `InitOutput` rows
 (the ABI's own) were not compared.
 
 The script that ran both (`oracle.sh`, a stock toolchain and perl) is
-deleted: it was a one-time comparison, and the generator is now held by
-`verify wasm-glue`, not by wasm-bindgen.
+deleted: it was a one-time comparison. A row of `verify wasm-glue` repeated it
+on demand from 2026-10-16 until 2026-11-04, when it was deleted too: no module
+aterm ships is bound with wasm-bindgen, so the generator is now held by
+`verify wasm-glue`'s goldens and planted bug, and by `wasm-smoke` on the real
+modules.

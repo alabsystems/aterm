@@ -313,8 +313,9 @@ impl Context {
     /// The SHA-256 of the held candidate, read again only when the file is not the one last
     /// read ([`FileStamp`]); `None` for a candidate that is missing, unsafe, or unreadable.
     fn candidate_digest(&self) -> Option<String> {
-        let file = checked_file(&self.dir.join("candidate"), BINARY_LIMIT, false).ok()?;
-        let stamp = FileStamp::of(&file.metadata().ok()?);
+        let (file, md) =
+            checked_file_with_metadata(&self.dir.join("candidate"), BINARY_LIMIT, false).ok()?;
+        let stamp = FileStamp::of(&md);
         let mut hashed = self
             .candidate_hashed
             .lock()
@@ -390,12 +391,33 @@ impl Context {
 }
 
 fn checked_file(path: &Path, cap: u64, executable: bool) -> Result<File, String> {
+    checked_file_with_metadata(path, cap, executable).map(|(file, _)| file)
+}
+
+fn chmod_checked_file(path: &Path, cap: u64, mode: u32) -> Result<File, String> {
+    let (file, md) = checked_file_with_metadata(path, cap, false)?;
+    if md.mode() & 0o7777 != mode {
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(file)
+}
+
+fn checked_file_with_len(path: &Path, cap: u64, executable: bool) -> Result<(File, u64), String> {
+    checked_file_with_metadata(path, cap, executable).map(|(file, md)| (file, md.len()))
+}
+
+fn checked_file_with_metadata(
+    path: &Path,
+    cap: u64,
+    executable: bool,
+) -> Result<(File, fs::Metadata), String> {
     let file = open_no_follow(path)?;
     let md = file.metadata().map_err(|e| e.to_string())?;
     if !file_is_safe(&md, cap, executable) {
         return Err(format!("unsafe update file: {}", path.display()));
     }
-    Ok(file)
+    Ok((file, md))
 }
 
 fn open_no_follow(path: &Path) -> Result<File, String> {
@@ -468,9 +490,9 @@ fn read_small(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    checked_file(path, limit, false)?
-        .take(limit + 1)
+    let (file, len) = checked_file_with_len(path, limit, false)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(len.saturating_add(1)).unwrap_or(0));
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if bytes.len() as u64 > limit {
@@ -495,9 +517,16 @@ fn fresh_file(parent: &Path, stem: &str) -> Result<(PathBuf, File), String> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(&path)
         .map_err(|e| e.to_string())?;
+    if file.metadata().map_or(true, |m| m.mode() & 0o7777 != 0o600)
+        && let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600))
+    {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(error.to_string());
+    }
     Ok((path, file))
 }
 
@@ -589,12 +618,20 @@ thread_local! {
     static HASHED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-fn hash_open_file(mut file: File) -> Result<String, String> {
+fn hash_open_file(file: File) -> Result<String, String> {
+    hash_open_file_with_prefix(&[], file)
+}
+
+fn hash_open_file_with_prefix(prefix: &[u8], mut file: File) -> Result<String, String> {
     #[cfg(test)]
     HASHED.with(|hashed| hashed.set(hashed.get() + 1));
     let mut hash = aterm_digest::Sha256::new();
+    let mut size = prefix.len() as u64;
+    if size > BINARY_LIMIT {
+        return Err("binary grew beyond its size bound".into());
+    }
+    hash.update(prefix);
     let mut buffer = [0u8; 64 * 1024];
-    let mut size = 0u64;
     loop {
         let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
         if count == 0 {
@@ -617,14 +654,14 @@ fn verify_binary(
     let artifact = manifest
         .linux_artifact(target)?
         .ok_or("signed release has no artifact for this Linux target")?;
-    let mut file = checked_file(path, BINARY_LIMIT, false)?;
-    if file.metadata().map_err(|e| e.to_string())?.len() != artifact.size {
+    let (mut file, len) = checked_file_with_len(path, BINARY_LIMIT, false)?;
+    if len != artifact.size {
         return Err("Linux artifact size differs from the signed manifest".into());
     }
     let mut header = [0u8; 64];
     file.read_exact(&mut header).map_err(|e| e.to_string())?;
     target.validate_elf_header(&header)?;
-    if hash_file(path)? != artifact.sha256 {
+    if hash_open_file_with_prefix(&header, file)? != artifact.sha256 {
         return Err("Linux artifact SHA-256 differs from the signed manifest".into());
     }
     let commit = manifest
@@ -968,7 +1005,7 @@ fn steady_clock(boot_id: &Path, time_namespace: &Path) -> Option<Steady> {
     let mut boot = String::new();
     let file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(boot_id)
         .ok()?;
     if !file.metadata().ok()?.is_file() {
@@ -1241,8 +1278,7 @@ fn apply_with_checkpoints(
     if hash_file(&context.target)? != state.installed.sha256 {
         return Err("the installed rollback source changed; refusing to replace it".into());
     }
-    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))
-        .map_err(|e| e.to_string())?;
+    drop(chmod_checked_file(&candidate, BINARY_LIMIT, 0o755)?);
     probe(&candidate, &manifest, native()?)?;
     if hash_file(&candidate)? != identity.sha256 {
         return Err("authenticated candidate changed during its startup probe".into());
@@ -1280,10 +1316,9 @@ fn apply_with_checkpoints(
         .map_err(|e| e.to_string())?;
     ordered_dir(&context.dir)?;
     checkpoint(Checkpoint::Backup)?;
-    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))
-        .map_err(|e| e.to_string())?;
-    aterm_durable::ordered(&checked_file(&candidate, BINARY_LIMIT, true)?)
-        .map_err(|e| e.to_string())?;
+    let candidate_file = chmod_checked_file(&candidate, BINARY_LIMIT, 0o755)?;
+    aterm_durable::ordered(&candidate_file).map_err(|e| e.to_string())?;
+    drop(candidate_file);
     let displaced = state.trial.take().map(|mut trial| {
         trial.displaced = None;
         Box::new(trial)
@@ -1448,13 +1483,15 @@ fn prune_backups(context: &Context, state: &State) {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        let kept_copy = entry
+        if !entry
             .file_name()
             .to_str()
-            .is_some_and(|name| name.starts_with("rollback-"));
-        if kept_copy
-            && keep.as_ref() != Some(&path)
+            .is_some_and(|name| name.starts_with("rollback-"))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if keep.as_ref() != Some(&path)
             && let Err(error) = fs::remove_file(&path)
         {
             aterm_log::warn!(
@@ -1699,9 +1736,7 @@ fn defer_session_verdict_in(
     {
         return Ok(false);
     }
-    let installed = checked_file(&context.target, BINARY_LIMIT, true)?
-        .metadata()
-        .map_err(|e| e.to_string())?;
+    let (_, installed) = checked_file_with_metadata(&context.target, BINARY_LIMIT, true)?;
     if actual_inode()? != (installed.dev(), installed.ino()) {
         return Ok(false);
     }
@@ -1825,9 +1860,7 @@ fn count_start_locked(
     if trial.phase != Phase::Installed || !crate::linux_trial::start_counts(lane, trial.lanes()) {
         return Ok(false);
     }
-    let installed = checked_file(&context.target, BINARY_LIMIT, true)?
-        .metadata()
-        .map_err(|e| e.to_string())?;
+    let (_, installed) = checked_file_with_metadata(&context.target, BINARY_LIMIT, true)?;
     if actual_inode != (installed.dev(), installed.ino()) {
         return Ok(false);
     }
@@ -1986,9 +2019,7 @@ fn confirm_lane_locked(
     {
         return Ok(Confirmed::NotPending);
     }
-    let installed = checked_file(&context.target, BINARY_LIMIT, true)?
-        .metadata()
-        .map_err(|e| e.to_string())?;
+    let (_, installed) = checked_file_with_metadata(&context.target, BINARY_LIMIT, true)?;
     if actual_inode != (installed.dev(), installed.ino()) {
         return Ok(Confirmed::OtherFile);
     }
@@ -2337,8 +2368,7 @@ fn finish_candidate(
     {
         return Err("Linux stage is below its durable build/failure floor".into());
     }
-    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))
-        .map_err(|e| e.to_string())?;
+    drop(chmod_checked_file(&candidate, BINARY_LIMIT, 0o755)?);
     probe(&candidate, &manifest, native()?)?;
     if hash_file(&candidate)? != identity.sha256 {
         return Err("Linux stage changed during its identity probe".into());

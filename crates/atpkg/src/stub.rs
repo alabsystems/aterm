@@ -105,10 +105,10 @@ pub fn program_of_in(layout: &Layout, name: &str) -> String {
 }
 
 fn stub_comes_with(path: &Path) -> Option<String> {
-    let text = crate::metadata_io::read_bounded_regular_utf8(path, 64 * 1024).ok()?;
-    if !text.lines().any(|l| is_marker_line(l, STUB_MARKER)) {
-        return None;
-    }
+    stub_comes_with_in(&read_pending_stub(path)?)
+}
+
+fn stub_comes_with_in(text: &str) -> Option<String> {
     text.lines()
         .map(str::trim)
         .find_map(|l| {
@@ -124,6 +124,7 @@ fn command_stub_executables<'a>(
     layout: &Layout,
     program: &str,
     exposed: &'a [String],
+    embedder: &Embedder,
     keep: &mut BTreeSet<&'a str>,
     files: &mut Vec<crate::lay::Executable>,
 ) {
@@ -137,7 +138,7 @@ fn command_stub_executables<'a>(
         let Some(tool) = ToolName::new(command) else {
             continue;
         };
-        match pending_command_stub_executable(layout, &tool, program) {
+        match pending_command_stub_executable(layout, &tool, program, embedder) {
             Ok(Some(file)) => {
                 files.push(file);
                 keep.insert(command);
@@ -484,11 +485,19 @@ fn is_marker_line(line: &str, marker: &str) -> bool {
             .is_some_and(|rest| rest.trim() == marker)
 }
 
+pub(crate) fn is_pending_stub_body(text: &str) -> bool {
+    text.lines().any(|l| is_marker_line(l, STUB_MARKER))
+}
+
+fn read_pending_stub(path: &Path) -> Option<String> {
+    let text = crate::metadata_io::read_bounded_regular_utf8(path, 64 * 1024).ok()?;
+    is_pending_stub_body(&text).then_some(text)
+}
+
 /// Whether the file at `path` is a pending stub written by this module.
 #[must_use]
 pub fn is_pending_stub(path: &Path) -> bool {
-    crate::metadata_io::read_bounded_regular_utf8(path, 64 * 1024)
-        .is_ok_and(|text| text.lines().any(|l| is_marker_line(l, STUB_MARKER)))
+    read_pending_stub(path).is_some()
 }
 
 /// Whether `tool` currently resolves to a pending stub in this layout.
@@ -507,17 +516,19 @@ pub(crate) fn write_pending_stub(layout: &Layout, tool: &ToolName) -> io::Result
 }
 
 /// The pending stub `write_pending_stub` would lay, rendered but not written.
+#[cfg(test)]
 pub(crate) fn pending_stub_executable(
     layout: &Layout,
     tool: &ToolName,
 ) -> io::Result<Option<crate::lay::Executable>> {
-    pending_bin_stub_executable(layout, tool, None)
+    pending_bin_stub_executable(layout, tool, None, &Embedder::this_process())
 }
 
 fn pending_command_stub_executable(
     layout: &Layout,
     tool: &ToolName,
     program: &str,
+    embedder: &Embedder,
 ) -> io::Result<Option<crate::lay::Executable>> {
     let Some(program) = ToolName::new(program) else {
         return Ok(None);
@@ -527,13 +538,14 @@ fn pending_command_stub_executable(
     {
         return Ok(None);
     }
-    pending_bin_stub_executable(layout, tool, Some(program.as_str()))
+    pending_bin_stub_executable(layout, tool, Some(program.as_str()), embedder)
 }
 
 fn pending_bin_stub_executable(
     layout: &Layout,
     tool: &ToolName,
     comes_with: Option<&str>,
+    embedder: &Embedder,
 ) -> io::Result<Option<crate::lay::Executable>> {
     if cfg!(windows) && !cmd_stub_name_safe(tool.as_str()) {
         return Ok(None);
@@ -541,16 +553,7 @@ fn pending_bin_stub_executable(
     if tool.is_alias() {
         return Ok(None);
     }
-    pending_stub_at(layout, tool, comes_with, layout.shim(tool))
-}
-
-/// [`pending_stub_executable`] for a stub at an explicit path.
-pub(crate) fn pending_stub_executable_at(
-    layout: &Layout,
-    tool: &ToolName,
-    shim: PathBuf,
-) -> io::Result<Option<crate::lay::Executable>> {
-    pending_stub_at(layout, tool, None, shim)
+    pending_stub_at(layout, tool, comes_with, layout.shim(tool), embedder)
 }
 
 fn pending_stub_at(
@@ -558,18 +561,18 @@ fn pending_stub_at(
     tool: &ToolName,
     comes_with: Option<&str>,
     shim: PathBuf,
+    embedder: &Embedder,
 ) -> io::Result<Option<crate::lay::Executable>> {
-    let standing = match std::fs::symlink_metadata(&shim) {
-        Err(_) => None,
-        Ok(_) if is_pending_stub(&shim) => Some(
-            crate::metadata_io::read_bounded_regular_utf8(&shim, 64 * 1024).unwrap_or_default(),
-        ),
+    let standing = match crate::metadata_io::read_bounded_regular_utf8(&shim, 64 * 1024) {
+        Ok(text) if text.lines().any(|l| is_marker_line(l, STUB_MARKER)) => Some(text),
         Ok(_) => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(_) if std::fs::symlink_metadata(&shim).is_ok() => return Ok(None),
+        Err(_) => None,
     };
-    let atpkg =
-        Embedder::this_process().embed(standing.as_deref().and_then(stub_named_atpkg).as_deref());
+    let atpkg = embedder.embed(standing.as_deref().and_then(stub_named_atpkg).as_deref());
     let body = stub_content(tool, comes_with, atpkg.as_deref());
-    if standing.is_some() && stub_is_current(&shim, &body) {
+    if standing.as_deref().is_some_and(|have| have == body) {
         return Ok(None);
     }
     if let Some(dir) = shim.parent() {
@@ -578,6 +581,7 @@ fn pending_stub_at(
     Ok(Some(crate::lay::Executable::new(shim, body)))
 }
 
+#[cfg(all(test, unix))]
 fn stub_is_current(shim: &Path, body: &str) -> bool {
     crate::metadata_io::read_bounded_regular(shim, 64 * 1024)
         .is_ok_and(|have| have == body.as_bytes())
@@ -598,6 +602,9 @@ pub fn remove_stub(layout: &Layout, program: &str) {
         return;
     };
     for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
         let path = entry.path();
         if stub_comes_with(&path).as_deref() == Some(program) {
             let _ = std::fs::remove_file(&path);
@@ -611,6 +618,9 @@ pub fn remove_all_stubs(layout: &Layout) {
         return;
     };
     for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
         let path = entry.path();
         if is_pending_stub(&path) {
             let _ = std::fs::remove_file(&path);
@@ -625,6 +635,7 @@ pub fn lay_adoption_stubs(layout: &Layout, cfg: &crate::config::PackagesConfig) 
         return;
     };
     let triple = crate::cli::current_triple();
+    let embedder = Embedder::this_process();
     let mut files = Vec::new();
     let mut commands = BTreeSet::new();
     for name in compiled_names() {
@@ -635,13 +646,13 @@ pub fn lay_adoption_stubs(layout: &Layout, cfg: &crate::config::PackagesConfig) 
             continue;
         }
         if let Some(tool) = ToolName::new(name) {
-            if let Ok(Some(file)) = pending_stub_executable(layout, &tool) {
+            if let Ok(Some(file)) = pending_bin_stub_executable(layout, &tool, None, &embedder) {
                 files.push(file);
             }
-            command_stub_executables(layout, name, &[], &mut commands, &mut files);
+            command_stub_executables(layout, name, &[], &embedder, &mut commands, &mut files);
             if is_agent_program(name)
                 && let Ok(Some(twin)) =
-                    pending_stub_executable_at(layout, &tool, layout.agent_shim(&tool))
+                    pending_stub_at(layout, &tool, None, layout.agent_shim(&tool), &embedder)
             {
                 files.push(twin);
             }
@@ -659,6 +670,7 @@ pub fn reconcile(
     installed: &BTreeMap<String, u64>,
     exposed: &BTreeMap<String, Vec<String>>,
 ) {
+    let embedder = Embedder::this_process();
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     let mut files = Vec::new();
     for name in wanted {
@@ -668,7 +680,7 @@ pub fn reconcile(
         let Some(tool) = ToolName::new(name) else {
             continue;
         };
-        match pending_stub_executable(layout, &tool) {
+        match pending_bin_stub_executable(layout, &tool, None, &embedder) {
             Ok(Some(file)) => {
                 files.push(file);
                 keep.insert(name.as_str());
@@ -680,7 +692,7 @@ pub fn reconcile(
         }
         if is_agent_program(name)
             && let Ok(Some(twin)) =
-                pending_stub_executable_at(layout, &tool, layout.agent_shim(&tool))
+                pending_stub_at(layout, &tool, None, layout.agent_shim(&tool), &embedder)
         {
             files.push(twin);
         }
@@ -688,6 +700,7 @@ pub fn reconcile(
             layout,
             name,
             exposed.get(name).map_or(&[], Vec::as_slice),
+            &embedder,
             &mut keep,
             &mut files,
         );
@@ -700,17 +713,20 @@ pub fn reconcile(
             continue;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_pending_stub(&path) {
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
                 continue;
             }
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
             };
+            let path = entry.path();
+            let Some(text) = read_pending_stub(&path) else {
+                continue;
+            };
             let logical = ToolName::from_shim_file(name);
             let stays = logical.as_ref().is_some_and(|t| keep.contains(t.as_str()))
-                || stub_comes_with(&path).is_some_and(|program| {
+                || stub_comes_with_in(&text).is_some_and(|program| {
                     wanted.contains(&program)
                         && !installed.contains_key(&program)
                         && !exposed.contains_key(&program)

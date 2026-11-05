@@ -14,7 +14,7 @@ use crate::conformance_support::assert_transition;
 use crate::document_store::{DocumentId, DocumentStore, TextEdit};
 use crate::native_document_io::{
     AtomicSaveProof, AtomicSaveResult, JournalAppendProof, JournalAppendResult, JournalGeneration,
-    ObservedFileVersion, SaveReducer, SaveReduction,
+    JournalLanding, ObservedFileVersion, SaveReducer, SaveReduction,
 };
 use crate::native_document_journal::{
     DocumentJournalStore, JournalCompletion, JournalEffect, JournalLockPatience,
@@ -182,12 +182,11 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
         document,
         JournalGeneration(latest.generation.0 + 1),
         JournalAppendResult::Committed(JournalAppendProof {
-            appended_len: latest.bytes.len(),
+            record_len: latest.bytes.len(),
             encoded_fingerprint: latest.encoded_fingerprint,
-            published_image: latest.expected_image.unwrap(),
+            published: latest.expected_tail.unwrap(),
             file_synced: true,
-            renamed_over_journal: true,
-            directory_synced: true,
+            landing: JournalLanding::Appended,
         }),
     );
     assert_eq!(stale, JournalCompletion::Stale);

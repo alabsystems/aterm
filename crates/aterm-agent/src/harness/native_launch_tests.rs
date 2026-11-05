@@ -556,6 +556,7 @@ fn selected(case: Case, world: &Path) -> io::Result<RestartCommand> {
     };
     let image = Image::at(&program).ok_or_else(|| io::Error::other("selected image unreadable"))?;
     Ok(RestartCommand {
+        account_intent: None,
         image,
         program: program
             .to_str()

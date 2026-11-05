@@ -73,13 +73,16 @@ fn visible_readers(paths: &Paths) -> [bool; 4] {
     let config = configured(paths).unwrap();
     [
         entry::observe_reserved_entry(paths, &config, "aterm-cold-probe")
-            .unwrap()
-            .is_some(),
-        roster::swarm_roster(paths).unwrap().is_some(),
-        sight(paths).unwrap().is_some(),
+            .is_ok_and(|entry| entry.is_some()),
+        swarm_roster_until(
+            paths,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .is_ok_and(|roster| roster.is_some()),
+        sight(paths).is_ok_and(|sight| sight.is_some()),
         matches!(
-            observe_commons(paths).unwrap(),
-            crate::commons::Observation::Visible(_)
+            observe_commons(paths),
+            Ok(crate::commons::Observation::Visible(_))
         ),
     ]
 }
@@ -318,7 +321,22 @@ fn an_envelope_only_observation_cache_cannot_bypass_a_later_log_floor() {
     let lab = log_entries_tests::two_macs(&[]);
     let mut state = load_state(&lab.m7).unwrap();
     let applied = state.records_digest.take().unwrap();
+    let records = std::fs::read(lab.m7.records_file()).unwrap();
     std::fs::remove_file(lab.m7.records_file()).unwrap();
+    // Simulate an older envelope-only installation before this build adopted a frontier.
+    let frontier_files = [
+        "records.frontiers",
+        "frontiers.anchor",
+        "frontiers.astream",
+        "frontiers.checkpoint",
+    ];
+    for name in frontier_files {
+        std::fs::rename(
+            lab.m7.dir.join(name),
+            lab.m7.dir.join(format!("{name}.legacy-test")),
+        )
+        .unwrap();
+    }
     save_state(&lab.m7, &state).unwrap();
     assert!(matches!(
         observe_commons(&lab.m7).unwrap(),
@@ -326,11 +344,14 @@ fn an_envelope_only_observation_cache_cannot_bypass_a_later_log_floor() {
     ));
     // A log application can advance state without replacing its envelope. The
     // cache key must not turn its old empty-log observation into current authority.
+    fsx::write_atomic(&lab.m7.records_file(), &records, 0o600).unwrap();
+    drop(StateLock::take(&lab.m7).unwrap());
+    std::fs::remove_file(lab.m7.records_file()).unwrap();
     state.records_digest = Some(applied);
     save_state(&lab.m7, &state).unwrap();
-    assert!(matches!(
-        observe_commons(&lab.m7).unwrap(),
-        crate::commons::Observation::Unavailable(_)
+    assert!(!matches!(
+        observe_commons(&lab.m7),
+        Ok(crate::commons::Observation::Visible(_))
     ));
     lab.server.stop();
 }
@@ -362,6 +383,7 @@ fn missing_applied_records_do_not_hide_authenticated_roster_denials() {
     let seed = [77; 32];
     let config = Config {
         source: Source::Url("http://127.0.0.1:1/v1/cold".to_owned()),
+        mirrors: Vec::new(),
         name: "cold".to_owned(),
         signer: Some(envelope::signer_public(&seed).unwrap()),
         followed: Vec::new(),
@@ -378,7 +400,14 @@ fn missing_applied_records_do_not_hide_authenticated_roster_denials() {
     // Model the durable applied-log witness after the records themselves were lost.
     state.records_digest = Some([79; 32]);
     save_state(&paths, &state).unwrap();
-    assert!(roster::swarm_roster(&paths).unwrap().is_none());
+    assert!(
+        swarm_roster_until(
+            &paths,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+        )
+        .unwrap()
+        .is_none()
+    );
     assert!(steward::local_recipient_denied_in_roster(&paths));
     assert!(
         admit::roster_keeps_out(&paths, None, request.binding(), [0; 32], None)
@@ -395,7 +424,14 @@ fn missing_applied_records_do_not_hide_authenticated_roster_denials() {
 
     for noncurrent in noncurrent_states(&state) {
         save_state(&paths, &noncurrent).unwrap();
-        assert!(roster::swarm_roster(&paths).unwrap().is_none());
+        assert!(
+            swarm_roster_until(
+                &paths,
+                std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+            )
+            .unwrap()
+            .is_none()
+        );
         assert!(
             steward::local_recipient_denied_in_roster(&paths),
             "noncurrent state must retain authenticated cached denial: {noncurrent:?}"
@@ -588,6 +624,7 @@ fn an_unseeded_denial_probe_honors_record_sidecars() {
         machine_identity(&paths).unwrap();
         let config = Config {
             source: Source::Url("http://127.0.0.1:1/v1/sidecar".to_owned()),
+            mirrors: Vec::new(),
             name: "sidecar".to_owned(),
             signer: Some(envelope::signer_public(&[84; 32]).unwrap()),
             followed: Vec::new(),
@@ -768,10 +805,13 @@ fn a_caller_log_cannot_bypass_lost_roster_denials() {
     save_records(&lab.m7, &load_records(&lab.m22).unwrap().encode()).unwrap();
     sync_with(&lab.m7, std::fs::read(lab.m22.cache_file()).unwrap()).unwrap();
     assert!(
-        roster::swarm_roster(&lab.m7)
-            .unwrap()
-            .unwrap()
-            .is_label_denied("m99")
+        swarm_roster_until(
+            &lab.m7,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN
+        )
+        .unwrap()
+        .unwrap()
+        .is_label_denied("m99")
     );
     std::fs::remove_file(lab.m7.records_file()).unwrap();
     let observed = log_entries::local_swarm_roster_for_log(&lab.m7, &older);

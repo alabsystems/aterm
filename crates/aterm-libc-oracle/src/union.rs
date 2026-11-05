@@ -141,7 +141,7 @@ impl Union {
     /// When the file cannot be written.
     pub fn store(&self, root: &Path) -> Result<(), String> {
         let path = path(root);
-        std::fs::write(&path, self.render()).map_err(|e| format!("{}: {e}", path.display()))
+        crate::write_fresh(&path, self.render()).map_err(|e| format!("{}: {e}", path.display()))
     }
 }
 

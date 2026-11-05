@@ -200,7 +200,7 @@ fn read_token(plan: &SocketPlan) -> Option<TokenIdentity> {
     }
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .ok()?;
     let opened = file.metadata().ok()?;

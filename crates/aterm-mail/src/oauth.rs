@@ -59,16 +59,43 @@ pub struct Tokens {
     pub expires_in: u64,
 }
 
-fn random() -> Result<String, String> {
-    let mut bytes = [0; 32];
-    aterm_uds::rand::fill(&mut bytes).map_err(|e| e.to_string())?;
-    aterm_codec::base64::encode(&bytes)
-        .map(|s| s.trim_end_matches('=').replace('+', "-").replace('/', "_"))
-        .map_err(|e| e.to_string())
+fn url_safe_base64(input: &[u8]) -> Result<String, String> {
+    let mut encoded = aterm_codec::base64::encode(input)
+        .map_err(|e| e.to_string())?
+        .into_bytes();
+    while encoded.last() == Some(&b'=') {
+        encoded.pop();
+    }
+    for b in &mut encoded {
+        match *b {
+            b'+' => *b = b'-',
+            b'/' => *b = b'_',
+            _ => {}
+        }
+    }
+    String::from_utf8(encoded).map_err(|e| e.to_string())
 }
 
-pub fn encode(value: &str) -> String {
-    let mut result = String::new();
+fn random() -> Result<String, String> {
+    let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
+    aterm_uds::rand::fill(&mut *bytes).map_err(|e| e.to_string())?;
+    url_safe_base64(&*bytes)
+}
+
+fn encoded_len(value: &str) -> usize {
+    value
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                1
+            } else {
+                3
+            }
+        })
+        .sum()
+}
+
+fn encode_into(result: &mut String, value: &str) {
     for b in value.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
             result.push(char::from(b));
@@ -77,6 +104,11 @@ pub fn encode(value: &str) -> String {
             let _ = write!(result, "%{b:02X}");
         }
     }
+}
+
+pub fn encode(value: &str) -> String {
+    let mut result = String::with_capacity(encoded_len(value));
+    encode_into(&mut result, value);
     result
 }
 
@@ -86,11 +118,7 @@ pub fn begin(client_id: &str, port: u16, login_hint: Option<&str>) -> Result<Pen
     }
     let verifier = random()?;
     let digest = ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes());
-    let challenge = aterm_codec::base64::encode(digest.as_ref())
-        .map_err(|e| e.to_string())?
-        .trim_end_matches('=')
-        .replace('+', "-")
-        .replace('/', "_");
+    let challenge = url_safe_base64(digest.as_ref())?;
     let state = random()?;
     let redirect_uri = format!("http://127.0.0.1:{port}/oauth/callback");
     let mut authorize_url = format!(
@@ -102,7 +130,8 @@ pub fn begin(client_id: &str, port: u16, login_hint: Option<&str>) -> Result<Pen
         encode(&challenge)
     );
     if let Some(hint) = login_hint {
-        authorize_url.push_str(&format!("&login_hint={}", encode(hint)));
+        authorize_url.push_str("&login_hint=");
+        encode_into(&mut authorize_url, hint);
     }
     Ok(Pending {
         state,
@@ -199,13 +228,20 @@ fn request_until(fields: Vec<(&str, &str)>, end: std::time::Instant) -> Result<T
             kind: ErrorKind::Transport,
         });
     }
-    let body = zeroize::Zeroizing::new(
-        fields
-            .into_iter()
-            .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
-            .collect::<Vec<_>>()
-            .join("&"),
-    );
+    let cap: usize = fields
+        .iter()
+        .enumerate()
+        .map(|(i, (k, v))| usize::from(i > 0) + encoded_len(k) + 1 + encoded_len(v))
+        .sum();
+    let mut body = zeroize::Zeroizing::new(String::with_capacity(cap));
+    for (i, (k, v)) in fields.into_iter().enumerate() {
+        if i > 0 {
+            body.push('&');
+        }
+        encode_into(&mut body, k);
+        body.push('=');
+        encode_into(&mut body, v);
+    }
     let client = aterm_http::Client::new(
         aterm_http::Trust::PlatformVerifier,
         aterm_http::ProxyMode::Environment,
@@ -231,10 +267,12 @@ fn decode_response(status: u16, body: &[u8]) -> Result<Tokens, Error> {
     if status != 200 {
         if let Ok(err_val) = aterm_json::from_slice::<aterm_json::Value>(body)
             && let Some(code) = err_val["error"].as_str()
-            && matches!(
-                code.trim().to_ascii_lowercase().as_str(),
-                "temporarily_unavailable" | "server_error" | "slow_down"
-            )
+            && {
+                let code = code.trim();
+                code.eq_ignore_ascii_case("temporarily_unavailable")
+                    || code.eq_ignore_ascii_case("server_error")
+                    || code.eq_ignore_ascii_case("slow_down")
+            }
         {
             return Err(Error {
                 kind: ErrorKind::Temporary,

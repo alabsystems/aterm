@@ -389,6 +389,7 @@ type Run = Result<std::process::Output, RunError>;
 fn run_refusal(what: &str, error: RunError, timeout: String) -> String {
     match error {
         RunError::Spawn(e) => spawn_refusal(what, &e),
+        RunError::Capture(e) => mark_passing(format!("capture output from started {what}: {e}")),
         RunError::Wait(e) => mark_passing(format!("wait for {what}: {e}")),
         RunError::TimedOut => timeout,
     }
@@ -546,6 +547,9 @@ fn unanswerable_entry(app: &Path, deadline: Instant) -> Option<String> {
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
+            if kind.is_file() {
+                continue;
+            }
             let path = entry.path();
             if kind.is_dir() {
                 dirs.push(path);
@@ -1890,4 +1894,18 @@ mod tests {
         assert!(out.status.success());
         assert_eq!((out.stdout.len(), out.stderr.len()), (300_000, 300_000));
     }
+}
+#[test]
+fn capture_failure_after_start_is_an_unanswered_helper_not_spawn_refusal() {
+    let refusal = run_refusal(
+        "codesign",
+        RunError::Capture(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "capture setup failed after dispatch",
+        )),
+        String::new(),
+    );
+    assert!(refusal.contains("capture output from started codesign"));
+    assert!(!refusal.contains("spawn codesign"));
+    assert!(crate::is_passing_refusal(&refusal));
 }

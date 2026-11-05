@@ -332,7 +332,7 @@ impl Outcome {
                     line: line.clone(),
                 }),
             };
-        let active = crate::ops::active_builds(layout).get(program).copied();
+        let active = crate::ops::active_build_of(layout, program);
         match &self.verdict {
             Verdict::Installed {
                 to,
@@ -508,7 +508,7 @@ pub(crate) fn read_ahead(
     {
         return None;
     }
-    let active = crate::ops::active_builds(layout).get(program).copied();
+    let active = crate::ops::active_build_of(layout, program);
     let stamp = ProgramStamp::read(layout, program).unwrap_or_default();
     let etag = stamp.last_head.and(stamp.etag.clone());
     let head = resolve::read_head(spec, fetcher, etag.as_deref());
@@ -678,7 +678,7 @@ pub(crate) fn plan_one_with(
             asset: None,
         });
     }
-    let active = crate::ops::active_builds(layout).get(program).copied();
+    let active = crate::ops::active_build_of(layout, program);
     let stamp = ProgramStamp::read(layout, program).unwrap_or_default();
     let mut installed = installed_of(layout, program, active);
     if let Installed::Legacy {
@@ -1076,21 +1076,17 @@ fn agree(lane: &Lane<'_>, pending: &Pending) -> Result<Option<Agreement>, FlowEr
 /// disk, one zstd frame that declares the binary's size and carries its XXH64 checksum, and
 /// nothing else (no skippable frame, no frame after it).
 fn decode_companion(dl: &Path, companion: &resolve::Companion) -> Result<(String, u64), String> {
-    use std::io::Read as _;
-    let got = std::fs::symlink_metadata(dl)
-        .ok()
-        .filter(std::fs::Metadata::is_file)
-        .map(|m| m.len());
-    if got != Some(companion.size) {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let (mut file, meta) = crate::metadata_io::open_regular_with_meta(dl)
+        .map_err(|_| format!("it answered no file of its {} bytes", companion.size))?;
+    if meta.len() != companion.size {
         return Err(format!(
             "it answered {} of its {} bytes",
-            got.map_or_else(|| String::from("no file"), |n| n.to_string()),
+            meta.len(),
             companion.size
         ));
     }
-    let open =
-        || crate::metadata_io::open_regular(dl).map_err(|e| format!("open the download: {e}"));
-    let declared = aterm_zstd::declared_content_size(open()?).map_err(|e| e.to_string())?;
+    let declared = aterm_zstd::declared_content_size(&mut file).map_err(|e| e.to_string())?;
     if declared != Some(companion.binary_size) {
         return Err(format!(
             "its zstd frame declares {}, not the binary's {} bytes",
@@ -1098,7 +1094,9 @@ fn decode_companion(dl: &Path, companion: &resolve::Companion) -> Result<(String
             companion.binary_size
         ));
     }
-    let mut decoder = aterm_zstd::Decoder::new(open()?)
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("open the download: {e}"))?;
+    let mut decoder = aterm_zstd::Decoder::new(file)
         .require_checksum()
         .one_frame();
     let mut sha = crate::tree::BulkSha256::new();
@@ -1140,11 +1138,9 @@ fn hold_to_agreement(
     agreed: &Agreement,
 ) -> Result<(), StageError> {
     let path = tree.join("bin").join(exe);
-    let len = std::fs::symlink_metadata(&path)
-        .map_err(StageError::Io)?
-        .len();
-    let sha256 = crate::tree::file_digest(&path, crate::manifest::DigestAlg::Sha256)
-        .map_err(StageError::Io)?;
+    let (file, meta) = crate::metadata_io::open_regular_with_meta(&path).map_err(StageError::Io)?;
+    let len = meta.len();
+    let sha256 = crate::tree::sha256_opened(file).map_err(StageError::Io)?;
     if sha256 == agreed.sha256 && len == agreed.len {
         return Ok(());
     }
@@ -1519,7 +1515,7 @@ fn keep_alab(lane: &Lane<'_>, spec: &'static VendorSpec, build: u64) -> Verdict 
     let (layout, program) = (lane.layout, spec.program);
     let what = crate::alab::build_words(layout, program, build);
     let exposes: Vec<String> = spec.exposes.iter().map(|t| (*t).to_string()).collect();
-    let shimmed = crate::ops::active_builds(layout).get(program).copied() == Some(build);
+    let shimmed = crate::ops::active_build_of(layout, program) == Some(build);
     let Some(why) = Revoked::of(lane.policy, program, build) else {
         if !shimmed
             && crate::store::build_is_complete(&layout.build_dir(program, build))
@@ -1625,11 +1621,11 @@ fn previous_of(
 }
 
 fn retained_below(layout: &Layout, program: &str, below: u64) -> Vec<InstalledView> {
-    let mut views: Vec<InstalledView> = crate::ops::list_installed(layout)
+    let mut views: Vec<InstalledView> = crate::ops::list_installed_for(layout, program)
         .into_iter()
-        .filter(|(p, b)| p == program && is_vendor_build(*b) && *b < below)
-        .filter(|(_, b)| layout.build_dir(program, *b).join("bin").is_dir())
-        .filter_map(|(_, b)| complete_record(&layout.build_dir(program, b)))
+        .filter(|b| is_vendor_build(*b) && *b < below)
+        .filter(|b| layout.build_dir(program, *b).join("bin").is_dir())
+        .filter_map(|b| complete_record(&layout.build_dir(program, b)))
         .map(|r| r.installed_view())
         .collect();
     views.sort_by_key(|v| std::cmp::Reverse(v.version));
@@ -1637,14 +1633,10 @@ fn retained_below(layout: &Layout, program: &str, below: u64) -> Vec<InstalledVi
 }
 
 fn retained_legacy_below(layout: &Layout, program: &str, below: u64) -> Vec<u64> {
-    let mut builds: Vec<u64> = crate::ops::list_installed(layout)
+    let mut builds: Vec<u64> = crate::ops::list_installed_for(layout, program)
         .into_iter()
-        .filter(|(p, b)| p == program && !is_vendor_build(*b) && *b < below)
-        .map(|(_, b)| b)
-        .filter(|b| {
-            let dir = layout.build_dir(program, *b);
-            dir.join("bin").is_dir() && crate::store::build_is_complete(&dir)
-        })
+        .filter(|b| !is_vendor_build(*b) && *b < below)
+        .filter(|b| layout.build_dir(program, *b).join("bin").is_dir())
         .collect();
     builds.sort_unstable_by(|a, b| b.cmp(a));
     builds
@@ -1695,7 +1687,7 @@ pub(crate) fn roll_back_by_hand(
     spec: &'static VendorSpec,
 ) -> Result<HandRollback, String> {
     let program = spec.program;
-    let active = crate::ops::active_builds(layout).get(program).copied();
+    let active = crate::ops::active_build_of(layout, program);
     let alab = active.filter(|b| crate::alab::build_is_alab(layout, program, *b));
     let (from, below) = match installed_of(layout, program, active) {
         Installed::Vendor(current) => (current.version.to_string(), current.build),

@@ -15,7 +15,7 @@ use crate::commons::bootstrap::Device;
 use crate::pake::{ChannelId, Joiner};
 use crate::phrase::Phrase;
 use crate::{Error, Result};
-use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
+use ring::signature::Ed25519KeyPair;
 use std::io::{Read, Write};
 
 /// What a member says first: its writer key, the network it is a member of, its name, and
@@ -171,13 +171,14 @@ pub fn ask_checked<S: Read + Write + ?Sized>(
     wire::write_line(
         stream,
         &format!(
-            "ask request={} node={} name={} model={} sig={} gnonce={}",
+            "ask request={} node={} name={} model={} sig={} gnonce={}{}",
             wire::b64(request.bytes()),
             wire::hex(&joining.node),
             wire::escape(&name),
             wire::escape(&model),
             wire::hex(signature.as_ref()),
-            wire::hex(&nonce)
+            wire::hex(&nonce),
+            wire::lab_field(joining.device.lab())
         ),
     )?;
     let line = wire::read_line(stream)?;
@@ -186,17 +187,16 @@ pub fn ask_checked<S: Read + Write + ?Sized>(
     if parsed.get("gsig").is_err() {
         return Ok((answer, Signed::Unsigned));
     }
-    UnparsedPublicKey::new(&ED25519, &greeting.key)
-        .verify(
-            &greet_message(&nonce, greeting, answer),
-            &parsed.hex::<64>("gsig")?,
-        )
-        .map_err(|_| {
-            Error::new(
-                "that answer is not signed by the member its greeting names: another host may be \
-                 answering as it",
-            )
-        })?;
+    if !astream_aead::signature::verify(
+        &greeting.key,
+        &greet_message(&nonce, greeting, answer),
+        &parsed.hex::<64>("gsig")?,
+    ) {
+        return Err(Error::new(
+            "that answer is not signed by the member its greeting names: another host may be \
+             answering as it",
+        ));
+    }
     Ok((answer, Signed::Verified))
 }
 
@@ -286,13 +286,14 @@ pub fn run_noting_send<S: Read + Write + ?Sized>(
     wire::write_line(
         stream,
         &format!(
-            "run request={} node={} name={} nonce={} sig={} reads=2 ack=1 records-bound={}",
+            "run request={} node={} name={} nonce={} sig={} reads=2 ack=1 records-bound={}{}",
             wire::b64(request.bytes()),
             wire::hex(&joining.node),
             wire::escape(&joining.name),
             wire::hex(&nonce),
             wire::hex(signature.as_ref()),
-            wire::escape(&joining.records_bound.value())
+            wire::escape(&joining.records_bound.value()),
+            wire::lab_field(joining.device.lab())
         ),
     )?;
     sending.sent = true;
@@ -382,13 +383,14 @@ pub fn prove<S: Read + Write + ?Sized>(
     wire::write_line(
         stream,
         &format!(
-            "prove request={} node={} name={} sig={} nodesig={} reads=2 records-bound={}",
+            "prove request={} node={} name={} sig={} nodesig={} reads=2 records-bound={}{}",
             wire::b64(request.bytes()),
             wire::hex(&joining.node),
             wire::escape(&joining.name),
             wire::hex(signature.as_ref()),
             wire::hex(&sign_node(&message)),
-            wire::escape(&joining.records_bound.value())
+            wire::escape(&joining.records_bound.value()),
+            wire::lab_field(joining.device.lab())
         ),
     )?;
     let line = wire::read_line(stream)?;

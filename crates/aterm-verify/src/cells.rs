@@ -172,7 +172,9 @@ pub fn dependents_in_graph(
 }
 
 /// Keep an explicit package selection narrow; close a change cone over this cell's complete
-/// build inputs, including host tools that are absent from its normal library graph.
+/// build inputs, including host tools that are absent from its normal library graph. Only what the
+/// change touched ([`crate::scope::Scope::touches`]) is closed over: a crate of the cone that is
+/// there for its tests alone holds the change in no build of its dependents.
 #[must_use]
 pub fn wanted_in_cell(
     normal: &BTreeSet<String>,
@@ -188,7 +190,7 @@ pub fn wanted_in_cell(
         let seeds = inputs
             .values()
             .flat_map(|nodes| nodes.iter())
-            .filter(|id| scope.includes_crate(&id.name))
+            .filter(|id| scope.touches(&id.name))
             .map(|id| id.name.clone())
             .collect();
         wanted.extend(dependents_in_graph(inputs, &seeds));
@@ -501,10 +503,17 @@ pub const WIN32_ORACLES: [(&str, &str); 2] = [
 
 /// The packages the [`WIN32_ORACLES`] judge: `crates/aterm-win32`, and the windows-sys facades
 /// (`crates/aterm-windows-sys`, which re-exports it, and `crates/aterm-windows-sys-052`), each
-/// the package `windows-sys`, and `aterm-win32-oracle` itself, which only they run. A pulled or
-/// `-p` run owes the oracles only for a selection holding one: they judge those crates alone
-/// (255 s cold here, 2026-10-26).
-pub const WIN32_ORACLE_SUBJECTS: [&str; 3] = ["aterm-win32", "windows-sys", "aterm-win32-oracle"];
+/// the package `windows-sys`. A pulled or `-p` run owes the oracles only for a selection holding
+/// one: they judge those crates alone (255 s cold here, 2026-10-26).
+pub const WIN32_ORACLE_SUBJECTS: [&str; 2] = ["aterm-win32", "windows-sys"];
+
+/// The packages a pulled run owes the oracles for only when the change touched them
+/// ([`crate::scope::Scope::touches`]): the driver, and `aterm-census`, whose lexer tokenizes the
+/// Windows sources the oracle judges, so a change there alters what the oracle reads. The driver
+/// sits in the cone of each of its dependencies, and a change to one of its other four (`aterm-uds`,
+/// `aterm-json`, `aterm-toml`, `aterm-tempfile`) that breaks its end-to-end run, past its own unit
+/// tests, shows only at the next `verify cells` or the next change to a subject.
+pub const WIN32_ORACLE_DRIVERS: [&str; 2] = ["aterm-win32-oracle", "aterm-census"];
 
 /// Does this run check a Windows cell, which brings the [`WIN32_ORACLES`]?
 #[must_use]
@@ -512,16 +521,18 @@ pub fn runs_win32_oracles(cells: &[Cell]) -> bool {
     cells.iter().any(|c| c.triple.ends_with("-pc-windows-msvc"))
 }
 
-/// Does this run owe the [`WIN32_ORACLES`]? It checks a Windows cell and, if a selection narrowed
-/// it (pulled, or `-p`), that selection holds a crate they judge.
+/// Does this run owe the [`WIN32_ORACLES`]? It checks a Windows cell and it did not narrow them
+/// away: its selection holds a subject (the whole workspace holds them all) or touched a driver
+/// ([`WIN32_ORACLE_DRIVERS`]), or it names `cells` with no `-p`.
 #[must_use]
 pub fn owes_win32_oracles(cells: &[Cell], scope: &crate::scope::Scope, pulled: bool) -> bool {
-    let narrowed = pulled || matches!(scope, crate::scope::Scope::Packages(_));
+    use crate::scope::Scope;
     runs_win32_oracles(cells)
-        && (!narrowed
+        && ((!pulled && matches!(scope, Scope::Changed(_)))
             || WIN32_ORACLE_SUBJECTS
                 .iter()
-                .any(|p| scope.includes_crate(p)))
+                .any(|name| scope.includes_crate(name))
+            || WIN32_ORACLE_DRIVERS.iter().any(|name| scope.touches(name)))
 }
 
 /// `targo --unverified run -q -p aterm-win32-oracle --target-dir <cells lane>/win32-oracle-bin
@@ -916,7 +927,8 @@ const PROVISION_RUSTUP: &str = "targo --unverified verify provision rustup";
 
 /// One cell, end to end: its graph, its shims, its toolchain, the lint of its roots, and (off
 /// wasm32) the all-targets pass over its workspace members; of [`narrows`] a selection, the lint and
-/// that pass of the selected members, in a cone run with their dependents in this cell's graph.
+/// that pass of the selected members, in a cone run with the dependents in this cell's graph of what
+/// the change touched ([`wanted_in_cell`]).
 fn check_cell(
     ctx: &Ctx,
     rustup: &Path,
@@ -1078,7 +1090,10 @@ fn check_cell(
         lint_packages(cell, &extra)
     };
     let lint = exec::run(&cargo.lint(&packages), ctx.exec_env());
-    let mut red = Red::default();
+    let mut red = Red {
+        leaves_test_warnings: leaves_test_warnings(ctx.cells_pulled, &cell.triple),
+        ..Red::default()
+    };
     let read = match read_cargo_run_with_discovery(
         &lint,
         &cell.triple,
@@ -1226,6 +1241,15 @@ fn check_cell(
             red.discovery.join("; ")
         ));
     }
+    if !red.unjudged.is_empty() {
+        summary.push_str(&format!(
+            "; {} test-target warning(s) this pulled run does not judge (`targo --unverified verify \
+             cells --cell {}` does): {}",
+            red.unjudged.len(),
+            cell.name,
+            red.unjudged.join("; ")
+        ));
+    }
     match red.status {
         None => CellOutcome::Checked(summary),
         Some(status) => CellOutcome::Failed {
@@ -1241,6 +1265,10 @@ struct Red {
     status: Option<String>,
     detail: Vec<String>,
     discovery: Vec<String>,
+    /// The all-targets pass's rustc warnings are named in `unjudged` rather than found
+    /// ([`leaves_test_warnings`]).
+    leaves_test_warnings: bool,
+    unjudged: Vec<String>,
 }
 
 impl Red {
@@ -1385,6 +1413,16 @@ fn read_cargo_run_with_discovery(
         &read.warnings
     } else {
         &[]
+    };
+    let warnings = if tests && red.leaves_test_warnings {
+        red.unjudged
+            .extend(warnings.iter().take(20).map(|(pkg, rendered)| {
+                let first = rendered.lines().next().unwrap_or_default();
+                format!("in `{pkg}`: {first}")
+            }));
+        &[]
+    } else {
+        warnings
     };
     let n = warnings.len();
     for (pkg, rendered) in warnings.iter().take(20) {
@@ -1815,6 +1853,18 @@ pub struct CargoRead {
     pub warnings: Vec<(String, String)>,
 }
 
+/// Whether a run's all-targets pass of `triple` names its rustc warnings without finding them: a
+/// Windows cell's in a run the selection pulled. They are mostly `cfg(windows)` test helpers gone
+/// dead, and a warning stops no guest `cargo test` (`lab windows exec`), so they would restart this
+/// run's slow checks for code it does not run. The pass stays: a TEST-TARGET-ERROR does stop that
+/// lane, whose whole-crate run costs 8 GiB and one holder at a time. A run naming `cells` judges
+/// these warnings, and the lint pass judges them on shipped code, so a Windows test helper can sit
+/// dead until someone runs `verify cells`.
+#[must_use]
+pub fn leaves_test_warnings(pulled: bool, triple: &str) -> bool {
+    pulled && triple.ends_with("-pc-windows-msvc")
+}
+
 /// Whether a cell's rustc warnings ([`is_cell_warning`]) are findings.
 #[must_use]
 pub fn judges_warnings(triple: &str) -> bool {
@@ -2004,6 +2054,44 @@ mod tests {
 
     fn names(list: &[&str]) -> BTreeSet<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A dev edge holds a cone crate there for its tests only, so a cell's closure starts from what
+    /// the change touched. CONTROL: a cone that knows only its crates closes over all of them, which
+    /// took a change to a model crate through `aterm-core` to `aterm-gui` in every cell.
+    #[test]
+    fn a_cell_closes_the_cone_over_what_the_change_touched() {
+        let id = |name: &str| PkgId {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+        };
+        let inputs = BTreeMap::from([
+            ("aterm-core".to_string(), BTreeSet::from([id("aterm-core")])),
+            (
+                "aterm-gui".to_string(),
+                BTreeSet::from([id("aterm-gui"), id("aterm-core")]),
+            ),
+            (
+                "aterm-models-misc".to_string(),
+                BTreeSet::from([id("aterm-models-misc")]),
+            ),
+        ]);
+        let normal = names(&["aterm-core", "aterm-gui", "aterm-models-misc"]);
+        let cone = vec!["aterm-core".to_string(), "aterm-models-misc".to_string()];
+        let unseeded = crate::scope::Scope::changed("origin/main", cone, true);
+        let seeded = unseeded
+            .clone()
+            .with_seeds(vec!["aterm-models-misc".to_string()]);
+        assert_eq!(
+            wanted_in_cell(&normal, Some(&inputs), &seeded),
+            names(&["aterm-core", "aterm-models-misc"])
+        );
+        assert_eq!(
+            wanted_in_cell(&normal, Some(&inputs), &unseeded),
+            names(&["aterm-core", "aterm-gui", "aterm-models-misc"])
+        );
+        let touched_core = unseeded.with_seeds(vec!["aterm-core".to_string()]);
+        assert!(wanted_in_cell(&normal, Some(&inputs), &touched_core).contains("aterm-gui"));
     }
 
     #[test]
@@ -2254,7 +2342,40 @@ mod tests {
         assert!(!owes_win32_oracles(&win, &cone, true));
         assert!(owes_win32_oracles(&win, &cone, false));
         assert!(owes_win32_oracles(&win, &Scope::workspace(), false));
+        assert!(
+            owes_win32_oracles(&win, &Scope::workspace(), true),
+            "a pulled run the selection widened to the whole workspace"
+        );
         assert!(!owes_win32_oracles(&linux, &Scope::workspace(), false));
+        // The driver is in the cone of each of its dependencies, which does not change what the
+        // oracles judge. CONTROL: a change to the driver itself, to aterm-census, which reads the
+        // Windows sources for it, or to a subject still owes them.
+        let driver_in_cone = |seed: &str| {
+            Scope::changed(
+                "origin/main",
+                vec![seed.to_string(), "aterm-win32-oracle".to_string()],
+                true,
+            )
+            .with_seeds(vec![seed.to_string()])
+        };
+        assert!(!owes_win32_oracles(
+            &win,
+            &driver_in_cone("aterm-uds"),
+            true
+        ));
+        assert!(owes_win32_oracles(
+            &win,
+            &driver_in_cone("aterm-uds"),
+            false
+        ));
+        for seed in ["aterm-census", "aterm-win32-oracle", "aterm-win32"] {
+            assert!(
+                owes_win32_oracles(&win, &driver_in_cone(seed), true),
+                "{seed}"
+            );
+        }
+        let facade = Scope::changed("origin/main", vec!["windows-sys@0.52.0".into()], true);
+        assert!(owes_win32_oracles(&win, &facade, true), "by its spec");
     }
 
     /// A pulled cell is checked for the selected crates its graph holds: the cone's or `-p`'s,
@@ -2741,6 +2862,36 @@ mod tests {
         read_cargo_run(&run, "wasm32-unknown-unknown", &graph, false, &mut red)
             .expect("the compiler ran");
         assert!(red.status.is_none(), "{:?}", red.detail);
+        // A pulled run names a Windows cell's test-target warnings and is not red on them. CONTROL:
+        // the same warnings in its lint pass, a run naming `cells`, and a pulled Linux cell.
+        let run = exec::Run {
+            ok: true,
+            output: out.clone(),
+            code: Some(0),
+            spawn_error: None,
+        };
+        let read = |triple: &str, pulled: bool, tests: bool| {
+            let mut red = Red {
+                leaves_test_warnings: leaves_test_warnings(pulled, triple),
+                ..Red::default()
+            };
+            read_cargo_run(&run, triple, &graph, tests, &mut red).expect("the compiler ran");
+            (red.status, red.unjudged)
+        };
+        let win = "aarch64-pc-windows-msvc";
+        let (status, unjudged) = read(win, true, true);
+        assert_eq!(status, None);
+        assert_eq!(unjudged.len(), 2, "{unjudged:?}");
+        assert!(unjudged[0].starts_with("in `"), "{unjudged:?}");
+        assert_eq!(read(win, true, false).0.as_deref(), Some("WARNING(2)"));
+        assert_eq!(
+            read(win, false, true).0.as_deref(),
+            Some("TEST-TARGET-WARNING(2)")
+        );
+        assert_eq!(
+            read("aarch64-unknown-linux-gnu", true, true).0.as_deref(),
+            Some("TEST-TARGET-WARNING(2)")
+        );
         let clippy_only = warning(
             r#"{"code":"clippy::duration_suboptimal_units","explanation":null}"#,
             "warning: constructing a `Duration` using a smaller unit",

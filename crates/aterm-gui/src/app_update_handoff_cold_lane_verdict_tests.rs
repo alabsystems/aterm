@@ -33,6 +33,7 @@ fn verdict(app: &crate::App, build: u64, passed: bool, reason: Option<String>) {
         policy: None,
         grant_chunks: false,
         grant_empty: false,
+        grant_desk: false,
     });
 }
 
@@ -319,6 +320,7 @@ fn a_cached_roster_wait_holds_the_cold_lane_and_is_never_its_failure() {
             policy: None,
             grant_chunks: false,
             grant_empty: false,
+            grant_desk: false,
         });
     };
     let wait = format!(

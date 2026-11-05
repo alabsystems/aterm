@@ -20,6 +20,219 @@ type BuiltRestoreLeaf = (
     Option<crate::tab_model::TabId>,
 );
 
+#[derive(Debug)]
+pub(crate) struct RestoredWorkerCheck {
+    pub(crate) session: u64,
+    nonce: aterm_session::LaunchNonce,
+    record: crate::task_record::TaskRecord,
+}
+
+impl RestoredWorkerCheck {
+    /// This check, where its worker's agent has ended: the process the leaf names is gone, and
+    /// `shell_leads` says no job stands in front of the shell it ran in. The leaf names one pid, and
+    /// the image can be older than a newer agent or any other job there, which is the roster's to
+    /// name: that pid's death says nothing of what runs in the tab now.
+    fn observed(
+        self,
+        pid: u32,
+        start: &str,
+        presence: aterm_uds::process::ProcessPresence,
+        current_start: Option<&str>,
+        shell_leads: bool,
+    ) -> Option<Self> {
+        (shell_leads && Self::ended(pid, start, presence, current_start)).then_some(self)
+    }
+    fn ended(
+        pid: u32,
+        start: &str,
+        presence: aterm_uds::process::ProcessPresence,
+        current_start: Option<&str>,
+    ) -> bool {
+        pid > 1
+            && !start.is_empty()
+            && (matches!(
+                presence,
+                aterm_uds::process::ProcessPresence::Absent
+                    | aterm_uds::process::ProcessPresence::Exited
+            ) || current_start.is_some_and(|current| current != start))
+    }
+}
+
+/// Whether the shell `pid` on `master` leads its terminal now, with no job in front of it. A read
+/// that failed says no. A kept shell leads its session ([`aterm_pty::record_adopted_shell`]), so its
+/// group is its pid.
+fn shell_leads_its_terminal(master: i32, pid: i32) -> bool {
+    pid > 0 && crate::quit_safety::foreground_pgrp(master) == pid
+}
+
+/// The start of `pid` to compare a leaf's with, where a differing one proves another process holds
+/// the pid: on a Mac, where the kernel stores it, spelled as the leaf's was. Elsewhere `None`, so
+/// only an empty pid proves a death: Linux's `ps -o lstart=` computes the start from the boot time,
+/// which a step of the clock moves, and Windows' spelling here is not a leaf's.
+fn stored_start(pid: u32) -> Option<String> {
+    if cfg!(target_vendor = "apple") {
+        aterm_agent::harness::restart_stamp::kernel_start(pid)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod kept_worker_tests {
+    use super::*;
+    use aterm_uds::process::ProcessPresence;
+
+    /// A JOB IN FRONT OF THE SHELL KEEPS THE WORKER WORKING. The leaf names one pid: with a job in
+    /// front of its shell, as a newer agent the image never saw is, that pid's death says nothing
+    /// of what runs there. CONTROL: with the shell leading its terminal, the same death ends it.
+    #[test]
+    fn a_dead_agents_pid_ends_nothing_with_a_job_in_front_of_its_shell() {
+        let state = aterm_tempfile::tempdir().unwrap();
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let app = App::headless_for_test();
+            let id = app.focused_session_id(WindowId(0)).unwrap();
+            let ctx = app.pool.get(id).unwrap().ctx.clone();
+            crate::task_record::mark_session_task(
+                &ctx,
+                id,
+                &crate::task_record::TaskMark::new(crate::task_record::TaskState::Working),
+            )
+            .unwrap();
+            let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+            let check = || RestoredWorkerCheck {
+                session: id,
+                nonce: ctx.nonce,
+                record: record.clone(),
+            };
+            for presence in [ProcessPresence::Absent, ProcessPresence::Exited] {
+                assert!(
+                    check()
+                        .observed(123, "original", presence, None, false)
+                        .is_none()
+                );
+                assert!(
+                    check()
+                        .observed(123, "original", presence, None, true)
+                        .is_some(),
+                    "CONTROL: the shell leads"
+                );
+            }
+            assert!(
+                check()
+                    .observed(
+                        123,
+                        "original",
+                        ProcessPresence::Present,
+                        Some("replacement"),
+                        false,
+                    )
+                    .is_none()
+            );
+        });
+    }
+
+    /// The read the worker's end rests on says what the kernel does: yes at a prompt, no with a job
+    /// in front, no for a terminal that answers nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_leads_its_terminal_only_with_no_job_in_front_of_it() {
+        use crate::app_restore::crash_journal_program_tests::{
+            kill_all, spawn_leader, type_line, wait_for,
+        };
+        assert!(!shell_leads_its_terminal(-1, 1), "no terminal answers");
+        let home = aterm_tempfile::tempdir().unwrap();
+        let (master, shell) = spawn_leader(&["/bin/sh", "-i"], home.path());
+        wait_for("the shell leads its terminal", || {
+            shell_leads_its_terminal(master, shell)
+        });
+        assert!(!shell_leads_its_terminal(master, 0), "pid 0 is no shell");
+        type_line(master, "/bin/sleep 600\n");
+        let mut job = -1;
+        wait_for("the job in front of the shell", || {
+            job = crate::quit_safety::foreground_pgrp(master);
+            job > 0 && job != shell
+        });
+        let leads = shell_leads_its_terminal(master, shell);
+        kill_all(&[shell, job], &[master]);
+        assert!(!leads, "a job stands in front of it");
+    }
+
+    /// A start is compared only where the kernel stores it. Elsewhere a difference is no proof
+    /// that another process holds the pid.
+    #[test]
+    fn a_start_is_read_for_the_comparison_only_where_the_kernel_stores_it() {
+        assert_eq!(
+            stored_start(std::process::id()).is_some(),
+            cfg!(target_vendor = "apple")
+        );
+    }
+
+    #[test]
+    fn restored_worker_closure_requires_positive_identity_evidence_and_the_same_record() {
+        let state = aterm_tempfile::tempdir().unwrap();
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            for (presence, start, ended) in [
+                (ProcessPresence::Present, Some("original"), false),
+                (ProcessPresence::Unknown, None, false),
+                (ProcessPresence::Present, None, false),
+                (ProcessPresence::Absent, None, true),
+                (ProcessPresence::Exited, None, true),
+                (ProcessPresence::Present, Some("replacement"), true),
+            ] {
+                let mut app = App::headless_for_test();
+                let id = app.focused_session_id(WindowId(0)).unwrap();
+                let ctx = app.pool.get(id).unwrap().ctx.clone();
+                crate::task_record::mark_session_task(
+                    &ctx,
+                    id,
+                    &crate::task_record::TaskMark::new(crate::task_record::TaskState::Working),
+                )
+                .unwrap();
+                let row = crate::task_record::restore_row(&ctx).unwrap();
+                crate::task_record::seed_restored(&ctx, &row, true, true);
+                let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+                assert_eq!(record.why, Some(crate::task_record::WHY_RESTORED));
+                app.finish_restored_worker_check(RestoredWorkerCheck {
+                    session: id,
+                    nonce: aterm_session::LaunchNonce::generate(),
+                    record: record.clone(),
+                });
+                assert_eq!(ctx.timeline.lock().unwrap().task(), Some(&record));
+                let observed = RestoredWorkerCheck {
+                    session: id,
+                    nonce: ctx.nonce,
+                    record: record.clone(),
+                }
+                .observed(123, "original", presence, start, true);
+                assert_eq!(observed.is_some(), ended);
+                if let Some(check) = observed {
+                    app.finish_restored_worker_check(check);
+                    assert_eq!(
+                        ctx.timeline.lock().unwrap().task().unwrap().state,
+                        crate::task_record::TaskState::Exited
+                    );
+                    // An old result cannot overwrite a later working task.
+                    crate::task_record::mark_session_task(
+                        &ctx,
+                        id,
+                        &crate::task_record::TaskMark::new(crate::task_record::TaskState::Working),
+                    )
+                    .unwrap();
+                    let changed = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+                    app.finish_restored_worker_check(RestoredWorkerCheck {
+                        session: id,
+                        nonce: ctx.nonce,
+                        record,
+                    });
+                    assert_eq!(ctx.timeline.lock().unwrap().task(), Some(&changed));
+                } else {
+                    assert_eq!(ctx.timeline.lock().unwrap().task(), Some(&record));
+                }
+            }
+        });
+    }
+}
+
 /// A historical held-tab notice. Codex preparation reads account and executable files, so it
 /// runs off the main thread. Its result is only logged; it never starts or changes a session.
 struct HeldNotice {
@@ -440,9 +653,80 @@ fn recovery_capability(
 }
 
 impl App {
+    pub(crate) fn finish_restored_worker_check(&mut self, check: RestoredWorkerCheck) {
+        let Some(session) = self
+            .pool
+            .get(check.session)
+            .filter(|session| session.ctx.nonce == check.nonce)
+        else {
+            return;
+        };
+        let mut mark = crate::task_record::TaskMark::new(crate::task_record::TaskState::Exited);
+        mark.why = Some(crate::task_record::WHY_EXIT);
+        let _ = crate::task_record::mark_session_task_if(
+            &session.ctx,
+            check.session,
+            &mark,
+            std::time::Duration::ZERO,
+            |current| current == Some(&check.record),
+        );
+    }
+
+    fn check_kept_worker(
+        &self,
+        session: u64,
+        ctx: &crate::SessionCtx,
+        agent: &restore::AgentRestore,
+        shell_leads: bool,
+    ) {
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        let Some(record) = ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .task()
+            .filter(|record| {
+                record.state == crate::task_record::TaskState::Working
+                    && record.why == Some(crate::task_record::WHY_RESTORED)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let check = RestoredWorkerCheck {
+            session,
+            nonce: ctx.nonce,
+            record,
+        };
+        let (pid, start) = (agent.pid, agent.start.clone());
+        let _ = std::thread::Builder::new()
+            .name("aterm-restored-worker".into())
+            .spawn(move || {
+                crate::qos::set_self(crate::qos::Role::Background);
+                let presence = i32::try_from(pid)
+                    .ok()
+                    .map(aterm_uds::process::process_presence)
+                    .unwrap_or(aterm_uds::process::ProcessPresence::Unknown);
+                let current_start = stored_start(pid);
+                if let Some(check) =
+                    check.observed(pid, &start, presence, current_start.as_deref(), shell_leads)
+                {
+                    let _ = proxy.send_event(crate::Wake::RestoredWorkerEnded(check));
+                }
+            });
+    }
     /// Captures the full [`restore::RestoreManifest`] across all open windows.
     pub(crate) fn capture_restore_manifest(&self) -> restore::RestoreManifest {
-        self.capture_manifest(false)
+        self.capture_manifest(false, false)
+    }
+
+    /// The handoff layout with no lone Workers list: what a target without `desk1` is handed, so
+    /// its emptiness says the desk holds no tab.
+    #[cfg(unix)]
+    pub(crate) fn capture_handoff_layout(&self) -> restore::RestoreManifest {
+        self.capture_handoff_layout_for(false)
     }
 
     #[cfg(unix)]
@@ -454,12 +738,13 @@ impl App {
             project = "aterm_gui::settings_draft_carry_conformance::Rig::project"
         )
     )]
-    /// Captures the [`restore::RestoreManifest`] for a seamless-update handoff.
-    pub(crate) fn capture_handoff_layout(&self) -> restore::RestoreManifest {
-        self.capture_manifest(true)
+    /// Captures the [`restore::RestoreManifest`] for a seamless-update handoff, with a window that
+    /// holds only an empty Workers list where `lone_lists` says the target rebuilds one.
+    pub(crate) fn capture_handoff_layout_for(&self, lone_lists: bool) -> restore::RestoreManifest {
+        self.capture_manifest(true, lone_lists)
     }
 
-    fn capture_manifest(&self, handoff: bool) -> restore::RestoreManifest {
+    fn capture_manifest(&self, handoff: bool, lone_lists: bool) -> restore::RestoreManifest {
         let filling_window = self
             .restore_drain
             .as_deref()
@@ -613,13 +898,8 @@ impl App {
                 .and_then(|wid| self.windows.keys().position(|live| *live == wid));
             drain.carry_owed(&mut windows, filling_at, &filling_tabs);
         }
-        // A window with nothing to bring back (an empty Workers list is all it holds) would come
-        // back as a new shell the person never had. After `carry_owed`, which fills by position.
-        windows.retain(|window| {
-            !(window.restored_tabs.is_empty()
-                && window.tabs.is_empty()
-                && window.native_tabs.is_empty())
-        });
+        // After `carry_owed`, which fills by position.
+        windows.retain(|window| window.kept_in_layout(lone_lists));
         let mut manifest = restore::RestoreManifest::new(windows);
         if handoff {
             manifest.fold_into_caps();
@@ -637,6 +917,9 @@ impl App {
             return None;
         }
         let view = leaves[0];
+        if self.view_is_private(view) {
+            return None;
+        }
         let crate::tab_model::View::Native(native) = self.view_store.get(view).copied()? else {
             return None;
         };
@@ -685,33 +968,49 @@ impl App {
         self.tab_restore_descriptor_carrying(tab, false)
     }
 
+    /// A private document's view ([`App::view_is_private`]) is never described: its values live
+    /// only while its reader holds the tab, so a split drops it and its sibling takes its place,
+    /// and a tab that holds nothing else is not restored or reopened.
     fn tab_restore_descriptor_carrying(
         &self,
         tab: &crate::tab_model::Tab,
         carry_drafts: bool,
     ) -> Option<restore::RestoredTab> {
+        /// One captured subtree: described (boxed, as a split holds it), or wholly private and
+        /// left out.
+        enum Captured {
+            Kept(Box<restore::RestoredSplitTree>),
+            Private,
+        }
+
         fn capture(
             app: &App,
             node: &crate::tab_model::SplitTree<crate::tab_model::ViewId>,
             focus: crate::tab_model::ViewId,
             carry_drafts: bool,
-            parked: bool,
+            worker: bool,
             path: &mut Vec<restore::RestoreBranch>,
             focused_path: &mut Option<Vec<restore::RestoreBranch>>,
-        ) -> Option<restore::RestoredSplitTree> {
+        ) -> Option<Captured> {
             match node {
                 crate::tab_model::SplitTree::Leaf(view) => {
+                    if app.view_is_private(*view) {
+                        return Some(Captured::Private);
+                    }
                     if *view == focus {
                         *focused_path = Some(path.clone());
                     }
                     let mut view = app.view_restore_descriptor_carrying(*view, carry_drafts)?;
-                    if parked && let restore::RestoredView::Terminal(leaf) = &mut view {
+                    // A worker's tab, parked or not, carries each leaf's task record.
+                    if worker && let restore::RestoredView::Terminal(leaf) = &mut view {
                         leaf.task = leaf
                             .local_id
                             .and_then(|session| app.pool.get(session))
                             .and_then(|session| crate::task_record::restore_row(&session.ctx));
                     }
-                    Some(restore::RestoredSplitTree::leaf(view))
+                    Some(Captured::Kept(Box::new(restore::RestoredSplitTree::leaf(
+                        view,
+                    ))))
                 }
                 crate::tab_model::SplitTree::Split {
                     axis,
@@ -721,42 +1020,79 @@ impl App {
                 } => {
                     path.push(restore::RestoreBranch::First);
                     let first =
-                        capture(app, first, focus, carry_drafts, parked, path, focused_path)?;
+                        capture(app, first, focus, carry_drafts, worker, path, focused_path)?;
                     path.pop();
                     path.push(restore::RestoreBranch::Second);
                     let second =
-                        capture(app, second, focus, carry_drafts, parked, path, focused_path)?;
+                        capture(app, second, focus, carry_drafts, worker, path, focused_path)?;
                     path.pop();
-                    Some(restore::RestoredSplitTree::Split {
-                        axis: match axis {
-                            crate::tab_model::SplitAxis::Horizontal => {
-                                restore::SplitKind::Horizontal
+                    Some(match (first, second) {
+                        (Captured::Kept(first), Captured::Kept(second)) => {
+                            Captured::Kept(Box::new(restore::RestoredSplitTree::Split {
+                                axis: match axis {
+                                    crate::tab_model::SplitAxis::Horizontal => {
+                                        restore::SplitKind::Horizontal
+                                    }
+                                    crate::tab_model::SplitAxis::Vertical => {
+                                        restore::SplitKind::Vertical
+                                    }
+                                },
+                                ratio: *ratio,
+                                first,
+                                second,
+                            }))
+                        }
+                        (Captured::Kept(kept), Captured::Private)
+                        | (Captured::Private, Captured::Kept(kept)) => {
+                            // The kept side takes this split's place: a focus inside it loses
+                            // this level's branch.
+                            if let Some(focused) = focused_path.as_mut()
+                                && focused.len() > path.len()
+                                && focused.starts_with(path)
+                            {
+                                focused.remove(path.len());
                             }
-                            crate::tab_model::SplitAxis::Vertical => restore::SplitKind::Vertical,
-                        },
-                        ratio: *ratio,
-                        first: Box::new(first),
-                        second: Box::new(second),
+                            Captured::Kept(kept)
+                        }
+                        (Captured::Private, Captured::Private) => Captured::Private,
                     })
                 }
             }
         }
 
         let mut focused_path = None;
-        let root = capture(
+        let Captured::Kept(root) = capture(
             self,
             &tab.root,
             tab.focus,
             carry_drafts,
-            tab.parked,
+            tab.parked || tab.ephemeral,
             &mut Vec::new(),
             &mut focused_path,
-        )?;
+        )?
+        else {
+            return None;
+        };
+        // A focus on a dropped private leaf moves to the kept tree's first leaf.
+        let focused_path = match focused_path {
+            Some(path) => path,
+            None if self.view_is_private(tab.focus) => {
+                let mut path = Vec::new();
+                let mut node = &*root;
+                while let restore::RestoredSplitTree::Split { first, .. } = node {
+                    path.push(restore::RestoreBranch::First);
+                    node = &**first;
+                }
+                path
+            }
+            None => return None,
+        };
         Some(restore::RestoredTab {
-            root,
-            focused_path: focused_path?,
+            root: *root,
+            focused_path,
             zoomed: tab.zoomed,
             parked: tab.parked,
+            ephemeral: tab.ephemeral,
         })
     }
 
@@ -773,6 +1109,9 @@ impl App {
         view: crate::tab_model::ViewId,
         carry_drafts: bool,
     ) -> Option<restore::RestoredView> {
+        if self.view_is_private(view) {
+            return None;
+        }
         match self.view_store.get(view).copied()? {
             crate::tab_model::View::Terminal(terminal) => {
                 let (cwd, title) = self.restore_session_meta(terminal.session);
@@ -2309,7 +2648,10 @@ impl App {
         let outer = (wl.outer_x, wl.outer_y);
         let maximized = wl.maximized;
         let show = wl.show;
-        let Some(wid) = self.create_window_internal_connected(
+        // The window's bootstrap shell is the restore's, as each new shell of its leaves is.
+        let restoring =
+            crate::tab_marks::ActScope::enter(crate::session_store::ExitActor::Harness, "restored");
+        let created = self.create_window_internal_connected(
             el,
             cwd0.as_deref(),
             adopt,
@@ -2317,7 +2659,9 @@ impl App {
             None,
             crate::app_window::CarriedFrame::of(&wl),
             (outer, maximized),
-        ) else {
+        );
+        drop(restoring);
+        let Some(wid) = created else {
             crate::logging::stderr_line!(
                 "aterm-gui: session restore: could not create a window; stopping here"
             );
@@ -2497,6 +2841,10 @@ impl App {
 
     /// Populates window `wid` from a validated [`restore::WindowLayout`] record.
     pub(crate) fn restore_into_window(&mut self, wid: WindowId, wl: restore::WindowLayout) {
+        if wl.is_lone_workers_list() {
+            self.restore_lone_workers_list(wid);
+            return;
+        }
         if !wl.restored_tabs.is_empty() {
             self.restore_recursive_into_window(wid, wl);
             return;
@@ -2796,6 +3144,29 @@ impl App {
         })
     }
 
+    /// Rebuilds a window that held only an empty Workers list: the list is installed first and the
+    /// bootstrap retired after, so the tab set never stands empty, and the person is never left a
+    /// shell they did not have. A handed-off shell stays, as any restore keeps one.
+    fn restore_lone_workers_list(&mut self, wid: WindowId) {
+        self.frontmost_window = Some(wid);
+        if self.window_holds_handed_off_shell(wid) {
+            return;
+        }
+        if !self.install_workers_tab_keeping(wid, None) {
+            crate::logging::stderr_line!(
+                "aterm-gui: session restore: could not reopen a Workers list; keeping bootstrap"
+            );
+            return;
+        }
+        self.remove_restore_bootstrap_terminals(wid);
+        self.resync_active_or_window(wid);
+        debug_assert!(
+            self.structural_invariants_ok(),
+            "{}",
+            self.structural_invariant_violation().unwrap_or_default()
+        );
+    }
+
     fn window_holds_handed_off_shell(&self, wid: WindowId) -> bool {
         self.windows.get(&wid).is_some_and(|window| {
             window.tab_set.tabs().iter().any(|tab| {
@@ -2935,8 +3306,12 @@ impl App {
         let mut tab =
             crate::tab_model::Tab::from_root(tab_id, root, focus, record.zoomed, presentation);
         // A tab with no terminal left is a Recovery tab, and one no leaf's task record came with
-        // has no row to say what it is: each stays where the person sees it.
-        tab.parked = record.parked && pane_tree.is_some() && self.tab_has_task(&tab);
+        // has no row to say what it is and no task to end: each stays where the person sees it,
+        // theirs.
+        let worker = pane_tree.is_some() && self.tab_has_task(&tab);
+        tab.parked = record.parked && worker;
+        tab.ephemeral = (record.ephemeral || record.parked) && worker;
+        self.note_restored_opens(wid, &tab);
         Ok((tab, pane_tree))
     }
 
@@ -3348,13 +3723,11 @@ impl App {
 
     /// Returns whether `wl` should be rebuilt into an empty window host without a bootstrap shell.
     pub(crate) fn restores_without_bootstrap(&self, wl: &restore::WindowLayout) -> bool {
-        let native_only = if wl.restored_tabs.is_empty() {
-            wl.tabs.is_empty() && !wl.native_tabs.is_empty()
-        } else {
-            wl.restored_tabs
-                .iter()
-                .all(|tab| tab.root.first_terminal_leaf().is_none())
-        };
+        if wl.is_lone_workers_list() {
+            return true;
+        }
+        let native_only =
+            wl.holds_no_terminal() && !(wl.restored_tabs.is_empty() && wl.native_tabs.is_empty());
         native_only
             || (!wl.restored_tabs.is_empty()
                 && wl
@@ -3406,7 +3779,8 @@ impl App {
                 .iter()
                 .any(|live| live.handoff_local_id == Some(named))
         });
-        // A parked worker's record, which a seamless update carries on its own road.
+        // A worker's record (its tab parked or ephemeral), which a seamless update carries on its
+        // own road.
         let mut not_resumed = false;
         if ids == LeafIds::Retired
             && !self.handoff_successor
@@ -3420,9 +3794,12 @@ impl App {
                 FillingShell::Unregistered(session) => (session.id, Some(session.ctx.clone())),
             };
             if let Some(ctx) = ctx {
-                let gone = leaf.agent.is_none() && !filled_by_a_live_shell;
-                not_resumed =
-                    crate::task_record::seed_restored(&ctx, row, gone, filled_by_a_live_shell);
+                not_resumed = crate::task_record::seed_restored(
+                    &ctx,
+                    row,
+                    leaf.agent.is_some(),
+                    filled_by_a_live_shell,
+                );
                 // An end the person could read before the quit is no news after it: it comes back
                 // seen, so no chip, row or `•` lights for it again. An end the restore itself made
                 // (an agent that is not coming back) is news.
@@ -3441,7 +3818,7 @@ impl App {
                 }
             }
         }
-        // A disk worker moved to a tab carries no record, and is as disposable as a parked one: its
+        // A disk worker kept as a tab carries no record, and is as disposable as a parked one: its
         // agent's folder says what it is.
         if leaf.task.is_none() && !filled_by_a_live_shell {
             not_resumed |= leaf.agent.as_ref().is_some_and(|agent| {
@@ -3498,9 +3875,19 @@ impl App {
             && let Some(agent) = &leaf.agent
         {
             if !self.handoff_successor && filled_by_a_live_shell {
-                aterm_log::info!(
-                    "restore: the agent of a reattached shell is still running; not relaunched"
-                );
+                let (session, shell) = match &filling {
+                    FillingShell::Registered(id) => (*id, self.pool.get(*id)),
+                    FillingShell::Unregistered(session) => (session.id, Some(*session)),
+                };
+                if let Some((ctx, shell_leads)) = shell.map(|shell| {
+                    (
+                        shell.ctx.clone(),
+                        shell_leads_its_terminal(shell.master, shell.pid),
+                    )
+                }) {
+                    self.check_kept_worker(session, &ctx, agent, shell_leads);
+                }
+                aterm_log::info!("restore: the reattached shell keeps its agent; not relaunched");
             } else if !self.handoff_successor && not_resumed {
                 aterm_log::info!(
                     "restore: the disk worker is not resumed after aterm ended; a later need \
@@ -4592,7 +4979,9 @@ fn save_lost_settings_drafts(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     options.open(&path)?.write_all(text.as_bytes())?;
     prune_lost_settings_drafts(folder);

@@ -489,7 +489,7 @@ fn an_unparsed_aterm_toml_reaches_the_log_by_its_position() {
     let scratch = aterm_tempfile::tempdir().expect("scratch config");
     let path = scratch.path().join("aterm.toml");
     let observed = |sentinel: &str| {
-        std::fs::write(&path, format!("# x\nfont_family = \"{sentinel}\n")).unwrap();
+        crate::test_scratch::write_config(&path, format!("# x\nfont_family = \"{sentinel}\n"));
         VersionedConfigService::observe_path(&path, false).unwrap()
     };
     let mut app = App::headless_for_test();
@@ -610,7 +610,7 @@ fn a_save_an_unreadable_file_refuses_is_worded_through_the_read_after_it() {
 
     let scratch = aterm_tempfile::tempdir().expect("private unreadable config");
     let path = scratch.path().join("aterm.toml");
-    std::fs::write(&path, "theme = \"Default\"\n").unwrap();
+    crate::test_scratch::write_config(&path, "theme = \"Default\"\n");
     let mut service = VersionedConfigService::load_path(&path).unwrap();
     let ConfigPatchResult::Applied { snapshot, .. } = service.patch(ConfigPatchRequest {
         base_revision: service.snapshot().revision,
@@ -1190,7 +1190,7 @@ fn applied_completion_observation_failure_closes_gate_before_pumping_next_write(
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("aterm.toml");
-    std::fs::write(&path, "serious_mode = false\n").unwrap();
+    crate::test_scratch::write_config(&path, "serious_mode = false\n");
 
     let mut app = App::headless_for_test();
     app.native_config_service =
@@ -3184,6 +3184,7 @@ fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
             reason: Some(reason.to_string()),
             grant_chunks: false,
             grant_empty: false,
+            grant_desk: false,
             policy: None,
         });
         if case == 5 {
@@ -3292,6 +3293,7 @@ fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
                 policy: None,
                 grant_chunks: false,
                 grant_empty: false,
+                grant_desk: false,
             });
             assert_eq!(app.arm_native_auto_apply(11, &"ab".repeat(32)), case != 7);
             assert_eq!(
@@ -3335,6 +3337,7 @@ fn a_non_writable_install_location_is_booked_as_the_persons_at_the_arm() {
         )),
         grant_chunks: false,
         grant_empty: false,
+        grant_desk: false,
         policy: None,
     });
     let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
@@ -3420,6 +3423,7 @@ fn a_folder_that_took_the_write_since_it_refused_releases_its_block() {
                 reason: (!passed).then(|| location.to_string()),
                 grant_chunks: false,
                 grant_empty: false,
+                grant_desk: false,
                 policy: None,
             })
         };
@@ -3587,6 +3591,7 @@ fn a_returned_attempt_the_folder_refused_is_the_persons_not_the_builds() {
             reason: Some(reason.to_string()),
             grant_chunks: false,
             grant_empty: false,
+            grant_desk: false,
             policy: None,
         });
         let outcome = app.settle_rearmed_apply_failure(
@@ -3735,6 +3740,7 @@ fn a_press_the_folder_answered_is_not_sent_back_to_the_folder() {
             reason: (!answered).then(|| location.to_string()),
             grant_chunks: false,
             grant_empty: false,
+            grant_desk: false,
             policy: None,
         });
         let message = if answered {
@@ -3821,6 +3827,7 @@ fn a_later_refusal_of_another_cause_names_the_standing_block() {
             reason: Some(refusal.to_string()),
             grant_chunks: false,
             grant_empty: false,
+            grant_desk: false,
             policy: None,
         });
         if settled {
@@ -5627,6 +5634,7 @@ fn stage_one_build_for_test(app: &mut App, build: u64) {
                 policy: None,
                 grant_chunks: false,
                 grant_empty: false,
+                grant_desk: false,
             });
     }
     let current_build = app.native_updater_service.snapshot().current_build;
@@ -6501,6 +6509,7 @@ fn an_armed_lane_looks_at_once_and_starts_as_its_pre_park_read_ends() {
         policy: None,
         grant_chunks: false,
         grant_empty: false,
+        grant_desk: false,
     });
     done.store(true, std::sync::atomic::Ordering::Release);
     force_auto_apply_attempt_now(&mut app);
@@ -6732,6 +6741,7 @@ fn a_check_report_is_never_lost_to_a_read_that_began_before_it() {
                 policy: None,
                 grant_chunks: false,
                 grant_empty: false,
+                grant_desk: false,
             });
     };
     let read = |reason: Option<&str>, began: Instant, ended: Instant| {
@@ -7137,6 +7147,7 @@ fn a_pre_park_verdict_answers_only_for_its_own_artifact() {
         policy: None,
         grant_chunks: false,
         grant_empty: false,
+        grant_desk: false,
     });
     assert_eq!(app.cached_handoff_preverification(&download), Some(false));
     assert_eq!(
@@ -8503,7 +8514,7 @@ fn exact_observation_handoff_conforms_and_preserves_failed_reconciliation() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("aterm.toml");
-    std::fs::write(&path, "serious_mode = false\n").unwrap();
+    crate::test_scratch::write_config(&path, "serious_mode = false\n");
 
     let model = aterm_models_native::native_config_observation_handoff_model();
     let mut app = App::headless_for_test();
@@ -8605,7 +8616,7 @@ fn matching_prepared_generation_reconciliation_admits_without_requeue() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("aterm.toml");
-    std::fs::write(&path, "serious_mode = false\n").unwrap();
+    crate::test_scratch::write_config(&path, "serious_mode = false\n");
 
     let mut app = App::headless_for_test();
     app.native_config_service =
@@ -8716,7 +8727,7 @@ fn a_late_admission_never_moves_the_watchers_harness_policy() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("aterm.toml");
     let older = "font_px = 15\n[harness]\napprove = \"all\"\n";
-    std::fs::write(&path, older).unwrap();
+    crate::test_scratch::write_config(&path, older);
     let observation =
         crate::native_config_service::VersionedConfigService::observe_path(&path, false).unwrap();
     let config = Config::parse(older).unwrap();
@@ -9200,7 +9211,7 @@ fn ordinary_theme_set_retires_older_preview_but_preserves_newer_trial() {
     for newer in [0, 1, 2] {
         let scratch = aterm_tempfile::tempdir().expect("private config");
         let path = scratch.path().join("aterm.toml");
-        std::fs::write(&path, "theme = \"Dracula\"\n").unwrap();
+        crate::test_scratch::write_config(&path, "theme = \"Dracula\"\n");
         let mut app = App::headless_for_test();
         app.native_config_service =
             crate::native_config_service::VersionedConfigService::load_path(&path).unwrap();

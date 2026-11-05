@@ -324,7 +324,7 @@ mod measuring {
                 row.expect,
                 row.meaning()
             )),
-            Disposition::Unproved => Outcome::CouldNotRun(format!(
+            Disposition::Unproved => Outcome::Undecided(format!(
                 "PAINT UNPROVED [{scene}]: the take is not evidence about paint ({}); \
                  take it on an unloaded machine, from an interactive shell or a LaunchAgent \
                  with ProcessType=Interactive.\n  {report}",

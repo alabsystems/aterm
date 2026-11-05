@@ -17,14 +17,16 @@ use aterm_dirfd::{AtFlags, FileType, Mode, OFlags};
 use super::{Executable, ExpectedCurrent, invalid};
 
 pub(super) fn directory(parent: &File, name: &OsStr) -> io::Result<File> {
-    aterm_dirfd::openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(File::from)
-    .map_err(Into::into)
+    aterm_uds::kept_out(|| {
+        aterm_dirfd::openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(io::Error::from)
+    })
 }
 pub(super) fn private(file: &File) -> io::Result<()> {
     owned_verdict(file, astream_sys::owner_private_dir(file)?).map(|_| ())
@@ -99,15 +101,16 @@ impl Parent {
         {
             return Err(invalid("local store prefix must be absolute and bounded"));
         }
-        let root = File::from(
+        let root = aterm_uds::kept_out(|| {
             aterm_dirfd::openat(
                 aterm_dirfd::CWD,
                 "/",
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
-            .map_err(io::Error::from)?,
-        );
+            .map(File::from)
+            .map_err(io::Error::from)
+        })?;
         let mut chain = vec![(OsString::from("/"), root)];
         for component in layout.prefix.components() {
             match component {
@@ -310,7 +313,12 @@ impl<'a> Stage<'a> {
             aterm_dirfd::openat(
                 &bin,
                 &artifact.entry,
-                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::RDWR
+                    | OFlags::CREATE
+                    | OFlags::EXCL
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC
+                    | OFlags::NONBLOCK,
                 Mode::from_bits(0o755),
             )
             .map_err(io::Error::from)?,
@@ -399,7 +407,12 @@ impl<'a> Stage<'a> {
             aterm_dirfd::openat(
                 self.parent.held(),
                 &tmp,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::WRONLY
+                    | OFlags::CREATE
+                    | OFlags::EXCL
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC
+                    | OFlags::NONBLOCK,
                 Mode::from_bits(0o644),
             )
             .map_err(io::Error::from)?,

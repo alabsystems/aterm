@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::commons::binding::Binding;
-use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
+use ring::signature::Ed25519KeyPair;
 
 const MAGIC: &[u8; 4] = b"AKI1";
 const DOMAIN: &[u8] = b"aterm/native-account-input/1\0";
@@ -123,9 +123,9 @@ pub fn open_account_input(
     }
     let mut signed = DOMAIN.to_vec();
     signed.extend_from_slice(&bytes[..prefix + size]);
-    UnparsedPublicKey::new(&ED25519, authority)
-        .verify(&signed, &bytes[prefix + size..])
-        .map_err(|_| Error::new("account input root authorization is invalid"))?;
+    if !crate::ed25519::verifies(authority, &signed, &bytes[prefix + size..]) {
+        return Err(Error::new("account input root authorization is invalid"));
+    }
     let plain = crate::age::decrypt(
         std::slice::from_ref(identity),
         &bytes[prefix..prefix + size],

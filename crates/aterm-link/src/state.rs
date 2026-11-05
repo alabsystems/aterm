@@ -282,13 +282,21 @@ fn tolerate_dir_flush(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
+fn open_dir_nonblock(dir: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(dir)
+}
+
 fn sync_dir_required_as(dir: &Path, flush: aterm_durable::Flush) -> io::Result<()> {
     let dir = if dir.as_os_str().is_empty() {
         Path::new(".")
     } else {
         dir
     };
-    std::fs::File::open(dir).and_then(|d| {
+    open_dir_nonblock(dir).and_then(|d| {
         if flushes_media() {
             flush.file(&d)
         } else {
@@ -383,7 +391,8 @@ pub(crate) struct IncLease {
     /// ([`StateDir::trusted_boot`]); the attach's earlier-boot rules read it on any volume
     /// ([`StateDir::last_ran_in_an_earlier_boot`]).
     pub boot: Option<[u8; 16]>,
-    /// The `inc` the top was flushed into, `None` where the platform names no inode.
+    /// The `inc` the top was flushed into, `None` where none could be named
+    /// ([`StateDir::inc_file`]): a lease that names none is never trusted.
     pub file: Option<IncFile>,
 }
 
@@ -498,8 +507,14 @@ pub(crate) fn plan_incarnation(
     })
 }
 
+/// Whether `dir`, opened following links, is on the boot volume: astream's
+/// [`astream_broker::on_boot_volume`] of it, which compares the opened dir's `st_dev` with `/`'s
+/// (on Apple, `/System/Volumes/Data`'s too). This crate builds only on unix (its root is
+/// `cfg(unix)`), so on every OS the guard compiles on that answer is a device comparison: `/`
+/// answers `true` on each by construction, and `/dev` (devfs on macOS, devtmpfs on Linux) `false`.
+/// A dir that cannot be opened is off it, the safe direction: no lease is trusted there.
 fn on_boot_volume(dir: &Path) -> bool {
-    std::fs::File::open(dir).is_ok_and(|opened| astream_broker::on_boot_volume(&opened))
+    open_dir_nonblock(dir).is_ok_and(|opened| astream_broker::on_boot_volume(&opened))
 }
 
 /// The points of [`StateDir::take_incarnation`] a test can kill it at (`IncSeam::kill_at`).
@@ -514,13 +529,17 @@ pub(crate) enum IncStep {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct IncSeam {
-    /// This boot, as the walk stands it in.
+    /// This boot, as the walk stands it in; the volume probe then opens `/`, on the boot volume
+    /// by construction, unless `off_volume` ([`StateDir::volume_probe`]).
     pub boot: Option<Option<[u8; 16]>>,
-    /// The dir stands off the boot volume.
+    /// The dir stands off the boot volume: the volume probe opens `/dev`, a device filesystem
+    /// that is never the boot volume, so the shipped probe answers it ([`StateDir::volume_probe`]).
     pub off_volume: bool,
     /// The step the next take dies at.
     pub kill_at: Option<IncStep>,
-    /// One defect, the walk's negative controls (the model's `Buggy`).
+    /// One defect, the walk's negative controls (the model's `Buggy`): 1 trusts a lease whatever
+    /// boot it names, 2 whatever top it names, 3 writes the lease before `inc` is flushed, and 5
+    /// trusts by the boot the kernel names, off the boot volume too.
     pub mutant: u8,
     /// The lease a flush covers, short enough for the walk to run one out (the model's `Span`).
     pub span: Option<u64>,
@@ -679,6 +698,8 @@ pub struct StateDir {
     run_fence: std::sync::Mutex<Option<std::fs::File>>,
     undurable: std::sync::Mutex<std::collections::BTreeSet<String>>,
     floor_admitted: std::sync::atomic::AtomicBool,
+    /// The quarantine copy this open made of each source and has yet to see the source gone, by
+    /// [`StateDir::quarantine_try`]: what a recovery tried again reuses.
     quarantine_tried: std::sync::Mutex<BTreeMap<String, QuarantineCopy>>,
     /// The records in flight this open retired into the quarantine, by sequence, from an older
     /// build's file or from the journal: one record, one copy
@@ -700,9 +721,13 @@ pub struct StateDir {
     #[cfg(test)]
     copy_on_every_try: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    one_memory_per_source: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     keep_refused_drops: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     hand_off_without_heads: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    stop_leaves_the_heads_unflushed: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     adopt_after_attach: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -953,6 +978,15 @@ pub(crate) struct Owed {
     pub subjects: BTreeSet<String>,
 }
 
+/// What [`StateDir::settle_posts`] writes for one landed post.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PostSettle<'a> {
+    /// The sequence of its in-flight entry to end ([`journal::Frame::Landed`]).
+    pub(crate) landed: Option<u64>,
+    /// Its reservation to forget, by `(sid, post id)` ([`journal::Frame::Retire`]).
+    pub(crate) retired: Option<(&'a str, u64)>,
+}
+
 /// One record in flight onto this node's own lanes ([`StateDir::in_flight`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InFlight {
@@ -1177,7 +1211,8 @@ const SESSION_PLACES: [(&str, Option<TornKind>); 5] = [
 /// What a run record's write flushed ([`StateDir::begin_run`], [`StateDir::end_run_clean`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Flushed {
-    /// Files of a [`TornKind`], and the mirror's pin, flushed where they are.
+    /// Files of a [`TornKind`], the mirror's pin and the heads a hand-off kept
+    /// ([`journal::HANDED`]), flushed where they are.
     pub files: u64,
     /// Directories whose entries moved, flushed before the record (the root's full flush for the record not counted).
     pub dirs: u64,
@@ -1245,7 +1280,8 @@ impl StartRules {
 pub(crate) struct LastRun {
     /// The boot it ran in, as the kernel names it.
     pub boot: Option<[u8; 16]>,
-    /// Whether it stopped cleanly, every file of a [`TornKind`] on the media.
+    /// Whether it stopped cleanly, every file of a [`TornKind`], the mirror's pin and the heads
+    /// a hand-off kept on the media.
     pub clean: bool,
 }
 
@@ -1534,9 +1570,13 @@ impl StateDir {
             #[cfg(test)]
             copy_on_every_try: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            one_memory_per_source: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             keep_refused_drops: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             hand_off_without_heads: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            stop_leaves_the_heads_unflushed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             adopt_after_attach: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1558,6 +1598,14 @@ impl StateDir {
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// The negative control of a recovery that remembers one copy per source, whatever its
+    /// prefix ([`crate::sim::world::Mutant::OneQuarantineMemoryPerSource`]).
+    #[cfg(test)]
+    pub(crate) fn one_quarantine_memory_per_source(&self, on: bool) {
+        self.one_memory_per_source
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// The negative control of a drop the disk refuses: the open keeps the record
     /// ([`crate::sim::world::Mutant::KeepARefusedDrop`]).
     #[cfg(test)]
@@ -1571,6 +1619,15 @@ impl StateDir {
     #[cfg(test)]
     pub(crate) fn hand_off_without_heads(&self, on: bool) {
         self.hand_off_without_heads
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of a clean stop that vouches for a hand-off's files and leaves the
+    /// heads kept beside them unflushed
+    /// ([`crate::sim::world::Mutant::StopLeavesTheHeadsUnflushed`]).
+    #[cfg(test)]
+    pub(crate) fn stop_leaves_the_heads_unflushed(&self, on: bool) {
+        self.stop_leaves_the_heads_unflushed
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1708,6 +1765,7 @@ impl StateDir {
             .write(true)
             .create_new(true)
             .mode(STATE_FILE_MODE)
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
             .open(&proof);
     }
 
@@ -2418,21 +2476,36 @@ impl StateDir {
     /// build's file was done on a disk too full to write: a record the open dropped is never
     /// published again by it, nor handed to the files at its stop.
     fn append_post_frame(&self, posts: &mut Posts, frame: journal::Frame) -> io::Result<()> {
-        let written = self.write_post_frame(posts, &frame);
-        #[cfg(test)]
-        let held = frame.holds_unwritten()
-            && !(matches!(frame, journal::Frame::Dropped(_))
-                && self
-                    .keep_refused_drops
-                    .load(std::sync::atomic::Ordering::SeqCst));
-        #[cfg(not(test))]
-        let held = frame.holds_unwritten();
-        if written.is_ok() || held {
-            if written.is_err() {
-                posts.dirty = true;
-            }
-            if let Some(index) = posts.index.as_mut() {
-                index.apply(frame);
+        self.append_post_frames(posts, vec![frame])
+    }
+
+    /// Append `frames` to the post journal in one write, in order, and apply each to the index
+    /// as [`StateDir::append_post_frame`] applies one (critic item E07). One `write_all` sends
+    /// their encoded records in order; interruption can leave a complete prefix and a partial
+    /// final record. The next open keeps the complete records and treats that partial record
+    /// as the journal's end ([`journal`]). On a failure none is applied but the facts the open
+    /// holds unwritten.
+    fn append_post_frames(&self, posts: &mut Posts, frames: Vec<journal::Frame>) -> io::Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let written = self.write_post_frames(posts, &frames);
+        for frame in frames {
+            #[cfg(test)]
+            let held = frame.holds_unwritten()
+                && !(matches!(frame, journal::Frame::Dropped(_))
+                    && self
+                        .keep_refused_drops
+                        .load(std::sync::atomic::Ordering::SeqCst));
+            #[cfg(not(test))]
+            let held = frame.holds_unwritten();
+            if written.is_ok() || held {
+                if written.is_err() {
+                    posts.dirty = true;
+                }
+                if let Some(index) = posts.index.as_mut() {
+                    index.apply(frame);
+                }
             }
         }
         written
@@ -2484,15 +2557,17 @@ impl StateDir {
         Ok(file)
     }
 
-    fn write_post_frame(&self, posts: &mut Posts, frame: &journal::Frame) -> io::Result<()> {
+    fn write_post_frames(&self, posts: &mut Posts, frames: &[journal::Frame]) -> io::Result<()> {
         if posts.dirty || posts.len >= posts.compact_at.max(journal::COMPACT_AT) {
             self.rewrite_posts(posts, None)?;
         }
         #[cfg(test)]
         {
             self.refused_by_a_test(journal::FILE)?;
-            if let Some(file) = frame.written_file() {
-                self.refused_by_a_test(&file)?;
+            for frame in frames {
+                if let Some(file) = frame.written_file() {
+                    self.refused_by_a_test(&file)?;
+                }
             }
         }
         let (mut bytes, mut step) = if posts.exists && !posts.attach_unwritten {
@@ -2504,8 +2579,10 @@ impl StateDir {
             }
             .encode_from(posts.next_step)?
         };
-        bytes.extend_from_slice(&journal::encode(step, frame)?);
-        step += 1;
+        for frame in frames {
+            bytes.extend_from_slice(&journal::encode(step, frame)?);
+            step += 1;
+        }
         let path = self.path(journal::FILE);
         let w = crate::fx::Write::Append {
             path: &path,
@@ -2599,9 +2676,9 @@ impl StateDir {
     /// first read ([`StateDir::adopt_legacy_posts`]), this one too if it goes on. A cut between
     /// the files and the unlink leaves both, which that read takes as the same records; so does
     /// a write of the heads the disk refuses, the journal kept for them. A stop
-    /// calls it before its clean stop, which then flushes the files and the journal's directory
-    /// under its record. The attach the journal named stays named in the open, for a journal
-    /// created after. Returns how many records it wrote.
+    /// calls it before its clean stop, which then flushes the files, the heads kept beside them
+    /// and the journal's directory under its record. The attach the journal named stays named in
+    /// the open, for a journal created after. Returns how many records it wrote.
     ///
     /// # Errors
     /// The journal unreadable, or a write: what is written stays, and the journal keeps every
@@ -3361,7 +3438,7 @@ impl StateDir {
                 undurable.insert(name.to_string());
             }
         }
-        if TornKind::of(name).is_some() || name == LOGPIN {
+        if self.a_clean_stop_flushes(name) {
             let mut unflushed = self.unflushed.lock().unwrap_or_else(|e| e.into_inner());
             if durable && finished.is_ok() {
                 unflushed.remove(name);
@@ -3372,26 +3449,46 @@ impl StateDir {
         finished.map(|()| made)
     }
 
+    /// Whether the clean stop's record vouches for `name` ([`StateDir::end_run_clean`]): a file of
+    /// a [`TornKind`], the mirror's pin, and the heads a stop's hand-off kept ([`journal::HANDED`]).
+    /// Those heads are no torn kind, since a torn copy costs no sweep, only its heads
+    /// ([`StateDir::read_handed`]); but unflushed under a clean record, a power cut took them and
+    /// kept the hand-off's files, and the next bridge published each record in flight again at
+    /// its pin unread, twice past a cut that dropped its key (the control:
+    /// `Mutant::StopLeavesTheHeadsUnflushed`).
+    fn a_clean_stop_flushes(&self, name: &str) -> bool {
+        #[cfg(test)]
+        if name == journal::HANDED
+            && self
+                .stop_leaves_the_heads_unflushed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        TornKind::of(name).is_some() || name == LOGPIN || name == journal::HANDED
+    }
+
     /// The bridge lock's file, opened (created) for one take: a regular file, never followed
     /// through a link, and opened without waiting on whatever else the name might hold.
     fn open_bridge_lock(&self) -> io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         let path = self.path("lock");
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
-            .open(&path)?;
+        let file = aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
+                .open(&path)
+        })?;
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("the bridge lock {} is not a regular file", path.display()),
             ));
         }
-        aterm_uds::keep_out_of_children(&file)?;
         Ok(file)
     }
 
@@ -3491,8 +3588,8 @@ impl StateDir {
         self.read("inc-lease").and_then(|s| IncLease::parse(&s))
     }
 
-    /// Which `inc` this dir holds now ([`IncFile`]).
-    #[cfg(unix)]
+    /// Which `inc` this dir holds now ([`IncFile`]): `None` unless it is a regular file on the
+    /// dir's own device.
     pub(crate) fn inc_file(&self) -> Option<IncFile> {
         use std::os::unix::fs::MetadataExt;
         let dir = std::fs::metadata(&self.root).ok()?;
@@ -3504,15 +3601,8 @@ impl StateDir {
         })
     }
 
-    /// No inode to name: never a trusted lease (nor a boot to trust it in: [`on_boot_volume`]).
-    #[cfg(not(unix))]
-    pub(crate) fn inc_file(&self) -> Option<IncFile> {
-        None
-    }
-
     /// The mark this state dir's bridges put on every presence row of a session they write
     /// ([`PRESENCE_MARK`]).
-    #[cfg(unix)]
     #[must_use]
     pub(crate) fn mark(&self, node: &str) -> Option<String> {
         use std::os::unix::fs::MetadataExt;
@@ -3527,28 +3617,44 @@ impl StateDir {
         Some(format!("{:016x}", aterm_hash::fnv1a_64(named.as_bytes())))
     }
 
-    /// No inode to name: no mark, and no row is ever the dir's by one.
-    #[cfg(not(unix))]
-    #[must_use]
-    pub(crate) fn mark(&self, _node: &str) -> Option<String> {
-        None
-    }
-
     /// This boot, when the page cache can vouch for this state dir: the kernel names it and the
     /// dir is on the boot volume ([`on_boot_volume`]). Off it a removable or network disk can
     /// vanish while the kernel runs and take an unflushed `inc-lease` with it, so no lease is
     /// trusted there (e4e7f00368). That line is the reader's, never the writer's: a lease names
     /// the boot it was written in on every volume ([`IncLease::boot`]), and one written off the
     /// boot volume is never trusted on it either, as the `inc` it names is on another device.
+    /// The model's `Plan` trusts by it (`IncarnationLease`, `OffVolume`), and its `Buggy = 5`,
+    /// a lease trusted by the boot it names, presents an incarnation twice after a vanish.
     pub(crate) fn trusted_boot(&self) -> Option<[u8; 16]> {
+        #[cfg(test)]
+        if self.inc_seam().mutant == 5 {
+            return self.kernel_boot();
+        }
+        self.kernel_boot().filter(|_| self.on_the_boot_volume())
+    }
+
+    /// Whether this dir is on the boot volume ([`on_boot_volume`] of [`StateDir::volume_probe`]).
+    fn on_the_boot_volume(&self) -> bool {
+        on_boot_volume(self.volume_probe())
+    }
+
+    /// The dir the volume probe opens: this dir, which a test with no seam judges both ways by
+    /// pointing a linked state dir at `/` and at `/dev`. A test's seam picks another dir whose
+    /// answer is known, never the answer itself, so every test runs the shipped probe: `/dev` off
+    /// the boot volume (`IncSeam::off_volume`), and `/` where it stands in the boot on it, as a
+    /// scratch dir can sit on a separate `/tmp` device.
+    fn volume_probe(&self) -> &Path {
         #[cfg(test)]
         {
             let seam = self.inc_seam();
-            if let Some(boot) = seam.boot {
-                return boot.filter(|_| !seam.off_volume);
+            if seam.off_volume {
+                return Path::new("/dev");
+            }
+            if seam.boot.is_some() {
+                return Path::new("/");
             }
         }
-        crate::durability::this_boot().filter(|_| on_boot_volume(&self.root))
+        &self.root
     }
 
     /// This boot, as the kernel names it (`astream_sys::boot_session`: macOS's
@@ -3721,16 +3827,17 @@ impl StateDir {
         )
     }
 
-    /// Append `off` to the acked self-lane log, ended by its comma, in one `write` to the file
-    /// held open `O_APPEND` ([`StateDir::acked`]). It is opened at the first append, after a
+    /// Append `offs` to the acked self-lane log, each ended by its comma, in one `write` to the
+    /// file held open `O_APPEND` ([`StateDir::acked`]): an ack pass's landed posts are one append
+    /// (critic item E07). It is opened at the first append, after a
     /// replace ([`StateDir::set_self_acked`]) and after an append whose write failed (refused
     /// before it was made, made and failed, or cut short), and refused there unless it is an
     /// owned regular single-link file ([`StateDir::open_for_appends`]).
-    pub(crate) fn append_self_acked(&self, off: u64) -> io::Result<()> {
+    pub(crate) fn append_self_acked(&self, offs: &[u64]) -> io::Result<()> {
         let _call = self.timed(crate::wait_tally::Row::AppendSelfAcked);
         self.count(|ops| ops.appends += 1);
         let path = self.path("acked");
-        let line = AckedLog::render(std::iter::once(off));
+        let line = AckedLog::render(offs.iter().copied());
         let w = crate::fx::Write::Append {
             path: &path,
             bytes: line.as_bytes(),
@@ -4422,7 +4529,7 @@ impl StateDir {
         // Noted once the copy is durable, before the unlink: a move whose unlink or directory
         // flush fails has made its one copy all the same.
         self.note_retired(&copies, &whole);
-        let mut retired = self.remove_moved(copies)?;
+        let mut retired = self.remove_moved(copies, RETIRED_PREFIX)?;
         let mut posts = self.posts()?;
         retired.extend(self.retire_journal_in_flight(&mut posts)?);
         Ok(retired)
@@ -4490,7 +4597,7 @@ impl StateDir {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for (_, from, _) in &entries {
-            tried.remove(from);
+            tried.remove(&self.quarantine_try(RETIRED_PREFIX, from));
         }
         Ok(copied)
     }
@@ -4529,12 +4636,28 @@ impl StateDir {
         prefix: &str,
     ) -> io::Result<Vec<SetAside>> {
         let moved = self.copy_into_quarantine(files, prefix)?;
-        self.remove_moved(moved)
+        self.remove_moved(moved, prefix)
     }
 
-    /// The sources of `moved`, whose copies are durable in the quarantine, unlinked and their
-    /// directories flushed.
-    fn remove_moved(&self, moved: Vec<SetAside>) -> io::Result<Vec<SetAside>> {
+    /// What this open remembers its copy of `from` under: `prefix` with it, since one source has
+    /// two copies in one recovery. A stop's hand-off cut before its unlink leaves a record in the
+    /// journal and its `inflight/<seq>` torn: the sweep copies the file and the disk refuses its
+    /// unlink, the retirement then copies the record under that name (`retired.`), and the
+    /// sweep tried again must still find the file's copy, or it makes a second.
+    fn quarantine_try(&self, prefix: &str, from: &str) -> String {
+        #[cfg(test)]
+        if self
+            .one_memory_per_source
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return from.to_string();
+        }
+        format!("{prefix}{from}")
+    }
+
+    /// The sources of `moved`, whose copies are durable in the quarantine under `prefix`, unlinked
+    /// and their directories flushed.
+    fn remove_moved(&self, moved: Vec<SetAside>, prefix: &str) -> io::Result<Vec<SetAside>> {
         let mut dirs = std::collections::BTreeSet::new();
         for SetAside { from, .. } in &moved {
             let path = self.path(from);
@@ -4545,7 +4668,7 @@ impl StateDir {
             self.quarantine_tried
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .remove(from);
+                .remove(&self.quarantine_try(prefix, from));
             dirs.insert(path.parent().unwrap_or(&self.root).to_path_buf());
         }
         for dir in dirs {
@@ -4587,11 +4710,12 @@ impl StateDir {
         let one_copy = true;
         let mut moved = Vec::new();
         for (from, bytes) in files {
+            let tried_as = self.quarantine_try(prefix, from);
             let tried = self
                 .quarantine_tried
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .get(from)
+                .get(&tried_as)
                 .map(|copy| -> io::Result<QuarantineCopy> {
                     Ok(QuarantineCopy {
                         name: copy.name.clone(),
@@ -4612,7 +4736,7 @@ impl StateDir {
                     let mut to = base.clone();
                     let mut n = 0u32;
                     loop {
-                        match self.publish_quarantine_file(from, &to, bytes) {
+                        match self.publish_quarantine_file(&tried_as, &to, bytes) {
                             Ok(()) => break to,
                             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                                 n = n.checked_add(1).ok_or_else(|| {
@@ -4688,7 +4812,7 @@ impl StateDir {
             && (current.dev(), current.ino()) == (held.dev(), held.ino()))
     }
 
-    fn publish_quarantine_file(&self, from: &str, name: &str, bytes: &[u8]) -> io::Result<()> {
+    fn publish_quarantine_file(&self, tried_as: &str, name: &str, bytes: &[u8]) -> io::Result<()> {
         #[cfg(test)]
         self.refused_by_a_test(name)?;
         let target = self.path(name);
@@ -4716,7 +4840,7 @@ impl StateDir {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(
-                    from.to_string(),
+                    tried_as.to_string(),
                     QuarantineCopy {
                         name: name.to_string(),
                         file,
@@ -4786,13 +4910,18 @@ impl StateDir {
         });
         if !on_the_media {
             let here = self.torn_kind_files()?;
-            let pin = std::fs::symlink_metadata(self.path(LOGPIN))
-                .is_ok_and(|meta| meta.is_file())
-                .then(|| LOGPIN.to_string());
+            let kept = [LOGPIN, journal::HANDED]
+                .into_iter()
+                .filter(|rel| {
+                    self.a_clean_stop_flushes(rel)
+                        && std::fs::symlink_metadata(self.path(rel))
+                            .is_ok_and(|meta| meta.is_file())
+                })
+                .map(str::to_string);
             self.unflushed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .extend(here.into_iter().map(|(_, _, rel)| rel).chain(pin));
+                .extend(here.into_iter().map(|(_, _, rel)| rel).chain(kept));
         }
         // THE OPEN ON THE MEDIA ALREADY (R6): a record that reads as the OPEN this start would
         // write, with a proof standing for that file as it stands, was published by a process of
@@ -4896,7 +5025,7 @@ impl StateDir {
         Flush::Ordered
     }
 
-    /// A clean stop: every file of a [`TornKind`] this run must flush ([`StateDir::begin_run`]), and the mirror's pin, flushed where it is, every such directory flushed (an unlink made since is kept), and only then `run` says the run stopped cleanly.
+    /// A clean stop: every file of a [`TornKind`] this run must flush ([`StateDir::begin_run`]), the mirror's pin and the heads a hand-off kept ([`journal::HANDED`]), flushed where they are, every such directory flushed (an unlink made since is kept), and only then `run` says the run stopped cleanly.
     pub(crate) fn end_run_clean(&self) -> io::Result<Flushed> {
         self.end_run_clean_by(StopRules::ALL)
     }
@@ -5467,6 +5596,41 @@ impl StateDir {
         }
     }
 
+    /// SETTLE AN ACK PASS'S LANDED POSTS in the post journal (critic item E07): for each, in
+    /// order, its in-flight entry's end ([`PostSettle::landed`], as
+    /// [`StateDir::clear_in_flight`] writes it) and then its reservation's
+    /// ([`PostSettle::retired`], as [`StateDir::clear_post_seq`] writes it), each only where the
+    /// journal holds it, every record in one write ([`StateDir::append_post_frames`]). On a
+    /// failure the entries stand and the reservations are forgotten all the same, as each call
+    /// alone would leave them.
+    ///
+    /// # Errors
+    /// The journal unreadable or damaged, or the write: no entry was ended.
+    pub(crate) fn settle_posts(&self, settles: &[PostSettle<'_>]) -> io::Result<()> {
+        let _timed = self.timed(crate::wait_tally::Row::ClearPostSeq);
+        let mut posts = self.posts()?;
+        let index = posts.index();
+        let mut frames = Vec::new();
+        for settle in settles {
+            if let Some(seq) = settle
+                .landed
+                .filter(|seq| index.in_flight.contains_key(seq))
+            {
+                frames.push(journal::Frame::Landed(seq));
+            }
+            if let Some((sid, id)) = settle
+                .retired
+                .filter(|(sid, id)| index.pin(sid, *id).is_some())
+            {
+                frames.push(journal::Frame::Retire {
+                    sid: sid.to_string(),
+                    id,
+                });
+            }
+        }
+        self.append_post_frames(&mut posts, frames)
+    }
+
     /// The producer sequence this bridge reserved for one owed receipt, if any.
     #[must_use]
     pub fn receipt_seq(&self, sid: &str, rid: u64) -> Option<u64> {
@@ -5909,7 +6073,7 @@ mod tests {
         st.set_inbox_owed(5).expect("inbox-owed");
         st.set_self_acked(&std::collections::BTreeSet::from([1, 2]), 8)
             .expect("acked");
-        st.append_self_acked(3).expect("acked, appended");
+        st.append_self_acked(&[3]).expect("acked, appended");
         st.raise_logfloor(11).expect("logfloor");
         let mut seen = Vec::new();
         let mut stack = vec![dir.clone()];
@@ -7409,7 +7573,7 @@ mod tests {
             "no file is the empty log, appendable"
         );
         for off in [5, 7, 9, 7] {
-            st.append_self_acked(off).unwrap();
+            st.append_self_acked(&[off]).unwrap();
         }
         assert_eq!(
             std::fs::read_to_string(dir.join("acked")).unwrap(),
@@ -7465,7 +7629,7 @@ mod tests {
         std::fs::write(&elsewhere, "").unwrap();
         std::os::unix::fs::symlink(&elsewhere, dir.join("acked")).unwrap();
         assert!(
-            st.append_self_acked(1).is_err(),
+            st.append_self_acked(&[1]).is_err(),
             "a planted link is refused"
         );
         assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "");
@@ -7478,10 +7642,10 @@ mod tests {
         let root = std::fs::canonicalize(scratch.path()).expect("canonical state scratch");
         let ordinary = StateDir::open(root.join("ordinary")).expect("ordinary state");
         ordinary
-            .append_self_acked(5)
+            .append_self_acked(&[5])
             .expect("first ordinary append");
         ordinary
-            .append_self_acked(7)
+            .append_self_acked(&[7])
             .expect("second ordinary append");
         assert_eq!(
             std::fs::read(ordinary.path("acked")).expect("ordinary log"),
@@ -7494,7 +7658,7 @@ mod tests {
         const SENTINEL: &[u8] = b"the other file owns these bytes\n";
         std::fs::write(&other, SENTINEL).expect("owned sentinel");
         std::fs::hard_link(&other, linked.path("acked")).expect("owned hardlink");
-        let result = linked.append_self_acked(42);
+        let result = linked.append_self_acked(&[42]);
         let other_bytes = std::fs::read(&other).expect("other file remains readable");
         let state_bytes = std::fs::read(linked.path("acked")).expect("state name remains readable");
         assert!(
@@ -7523,7 +7687,7 @@ mod tests {
             let st = StateDir::open(root.join(format!("keeps-{keeps}"))).expect("state");
             let before = st.ops();
             for off in [1, 2, 3] {
-                st.append_self_acked(off).expect("append");
+                st.append_self_acked(&[off]).expect("append");
             }
             assert_eq!(
                 (st.ops() - before).opens,
@@ -7533,7 +7697,7 @@ mod tests {
             st.keep_acked_across_its_replace(keeps);
             st.set_self_acked(&set(&[2, 3]), 8).expect("replace");
             let before = st.ops();
-            st.append_self_acked(4)
+            st.append_self_acked(&[4])
                 .expect("the append after the replace");
             let (opens, read) = ((st.ops() - before).opens, st.self_acked_log().offsets);
             if keeps {
@@ -7560,7 +7724,7 @@ mod tests {
             std::fs::write(&other, SENTINEL).expect("owned sentinel");
             std::fs::remove_file(st.path("acked")).expect("unlink the replaced log");
             std::fs::hard_link(&other, st.path("acked")).expect("owned hardlink");
-            let result = st.append_self_acked(5);
+            let result = st.append_self_acked(&[5]);
             assert!(
                 result.is_err() && std::fs::read(&other).expect("other") == SENTINEL,
                 "the open after a replace refuses a hard link: {result:?}"
@@ -7585,15 +7749,15 @@ mod tests {
             ("its write is refused", "refused"),
         ] {
             let st = StateDir::open(root.join(dir)).expect("state");
-            st.append_self_acked(1)
+            st.append_self_acked(&[1])
                 .expect("the first append, which opens the log");
             let failed = if dir == "fails" {
                 let read_only = std::fs::File::open(st.path("acked")).expect("acked, read-only");
                 *st.acked.lock().unwrap_or_else(|e| e.into_inner()) = Some(read_only);
-                st.append_self_acked(2)
+                st.append_self_acked(&[2])
             } else {
                 st.refuse_writes_of(Some("acked"));
-                let failed = st.append_self_acked(2);
+                let failed = st.append_self_acked(&[2]);
                 st.refuse_writes_of(None);
                 failed
             };
@@ -7601,7 +7765,7 @@ mod tests {
             std::fs::write(&swap, "7,").expect("a file for the name");
             std::fs::rename(&swap, st.path("acked")).expect("put it at the name");
             let before = st.ops();
-            let next = st.append_self_acked(3);
+            let next = st.append_self_acked(&[3]);
             seen.push((
                 fails,
                 failed.is_err(),
@@ -8720,7 +8884,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_log_switch_refuses_a_dangling_offset_directory() {
         for blocked in ["seen", "topics"] {
@@ -8977,6 +9140,12 @@ mod tests {
             plan(67, 67, true)
         );
         assert_eq!(
+            plan_incarnation(66, f, lease(3, 66, b1), 3, None, 0, span),
+            plan(67, 67, true),
+            "a lease naming this boot, read off the boot volume where no boot is trusted, is not \
+             trusted, and leases one incarnation"
+        );
+        assert_eq!(
             plan_incarnation(INC_MAX - 1, f, None, 0, b1, 0, span),
             plan(INC_MAX, INC_MAX, true)
         );
@@ -9048,6 +9217,84 @@ mod tests {
             assert_eq!(st.lease().map(|l| (l.used, l.top)), Some((inc, inc)));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One take off the boot volume ([`takes_through_a_vanish`]): what it answered, the flushes it
+    /// made, and the lease it left (`used`, `top`, the boot it names).
+    type OffVolumeTake = (
+        Result<u64, String>,
+        u64,
+        Option<(u64, u64, Option<[u8; 16]>)>,
+    );
+
+    /// Three attaches of a dir off the boot volume, all in boot 1, under the take's `mutant`:
+    /// after the second, the disk vanishes and comes back within the boot, holding `inc` as
+    /// flushed and the lease and `seq` the first attach wrote (written back, then nothing more).
+    fn takes_through_a_vanish(mutant: u8) -> Vec<OffVolumeTake> {
+        let dir = scratch(&format!("inclease-vanish-{mutant}"));
+        let st = StateDir::open(&dir).expect("open");
+        st.set_inc_seam(IncSeam {
+            boot: Some(Some(boot_id(1))),
+            off_volume: true,
+            mutant,
+            ..IncSeam::default()
+        });
+        let read = |file: &str| std::fs::read(dir.join(file)).expect(file);
+        let mut written_back = None;
+        let mut takes = Vec::new();
+        for attach in 1..=3 {
+            if attach == 3 {
+                let (lease, seq) = written_back.take().expect("the first attach's files");
+                std::fs::write(dir.join("inc-lease"), lease).expect("the lease on the media");
+                std::fs::write(dir.join("seq"), seq).expect("seq on the media");
+            }
+            let before = st.ops();
+            let taken = st.take_incarnation(0).map_err(|e| e.to_string());
+            let fsyncs = (st.ops() - before).fsyncs;
+            if let Ok(inc) = taken {
+                st.reserve_next_sequence(inc)
+                    .expect("the attach's first sequence");
+            }
+            let lease = st.lease().map(|l| (l.used, l.top, l.boot));
+            takes.push((taken, fsyncs, lease));
+            if attach == 1 {
+                written_back = Some((read("inc-lease"), read("seq")));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        takes
+    }
+
+    /// Off the boot volume the page cache vouches for nothing on a disk that can vanish: a lease
+    /// that names this boot is not trusted ([`StateDir::trusted_boot`]), so each take flushes
+    /// `inc` and leases one incarnation, and the take after a vanish presents none twice (the
+    /// model's `Fence` at `OffVolume = 1`). Its negative control trusts by the boot the lease
+    /// names (mutant 5, the model's `Buggy = 5`).
+    #[test]
+    fn off_the_boot_volume_every_take_flushes_and_a_vanish_presents_no_incarnation_twice() {
+        let b1 = Some(boot_id(1));
+        let shipped = takes_through_a_vanish(0);
+        assert_eq!(
+            shipped,
+            [
+                (Ok(1), 2, Some((1, 1, b1))),
+                (Ok(2), 2, Some((2, 2, b1))),
+                (Ok(3), 2, Some((3, 3, b1))),
+            ],
+            "each take flushes `inc` (its file and its directory) and leaves a lease that names \
+             this boot and leases nothing above it; after the vanish, the take is above both"
+        );
+
+        assert_eq!(
+            takes_through_a_vanish(5),
+            [
+                (Ok(1), 2, Some((1, INC_LEASE, b1))),
+                (Ok(2), 0, Some((2, INC_LEASE, b1))),
+                (Ok(2), 0, Some((2, INC_LEASE, b1))),
+            ],
+            "the control trusts the lease by the boot it names: the second take flushes nothing, \
+             and after the vanish the third presents the second's incarnation again"
+        );
     }
 
     #[test]
@@ -9137,7 +9384,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&c);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_state_dirs_mark_is_its_own_and_a_copy_has_another() {
         const NODE: &str = "n-0123456789abcdef";
@@ -9235,6 +9481,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The seam picks the dir the shipped volume probe opens, never its answer: the dirs it picks
+    /// answer as it says, so every test that stands a dir off the boot volume reaches the probe a
+    /// shipped build runs, and a probe that answered `true` off it fails them.
+    #[test]
+    fn the_seam_stands_a_dir_off_the_boot_volume_through_the_shipped_probe() {
+        assert!(on_boot_volume(Path::new("/")), "/ is the boot volume");
+        assert!(
+            !on_boot_volume(Path::new("/dev")),
+            "/dev is a device filesystem"
+        );
+        let dir = scratch("inclease-probe");
+        let st = StateDir::open(&dir).expect("open");
+        st.set_inc_seam(IncSeam {
+            boot: Some(Some(boot_id(1))),
+            ..IncSeam::default()
+        });
+        assert_eq!(st.trusted_boot(), Some(boot_id(1)), "on the boot volume");
+        st.stand_off_the_boot_volume();
+        assert_eq!(st.trusted_boot(), None, "off the boot volume");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shipped volume probe opens the state dir itself, with no seam: a state dir reached
+    /// through a link is judged by the dir the link points at, so pointed at `/` it is trusted in
+    /// this boot and pointed at `/dev` it is not. A probe that opened any fixed dir in place of this
+    /// one, or answered one way everywhere, fails one of the two wherever the kernel names its boot
+    /// (macOS and Linux, which the test asserts).
+    #[test]
+    fn the_shipped_volume_probe_judges_the_dir_itself() {
+        let (real, link) = (scratch("inclease-real"), scratch("inclease-link"));
+        std::fs::create_dir_all(&real).expect("real");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let st = StateDir::open(&link).expect("open");
+        let boot = crate::durability::this_boot();
+        if cfg!(any(target_vendor = "apple", target_os = "linux")) {
+            assert!(boot.is_some(), "the kernel names its boot");
+        }
+        let point_at = |dir: &str| {
+            std::fs::remove_file(&link).expect("unlink");
+            std::os::unix::fs::symlink(dir, &link).expect("relink");
+        };
+        point_at("/");
+        assert_eq!(st.trusted_boot(), boot, "a dir on the boot volume");
+        point_at("/dev");
+        assert_eq!(st.trusted_boot(), None, "a dir off the boot volume");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
+    }
+
     fn lay_down(st: &StateDir, s: &aterm_spec::interp::State) {
         let v = |name: &str| u64::try_from(s[name]).expect("a model value is not negative");
         let put = |file: &str, held: Option<String>| match held {
@@ -9285,14 +9580,18 @@ mod tests {
         mutant: u8,
         first: bool,
     ) -> (usize, Vec<String>) {
-        let span = model
-            .consts
-            .iter()
-            .find(|(name, _)| *name == "Span")
-            .map(|(_, v)| u64::try_from(*v).expect("a positive span"))
-            .expect("the model declares Span");
+        let constant = |name: &str| {
+            model
+                .consts
+                .iter()
+                .find(|(declared, _)| *declared == name)
+                .map(|(_, v)| u64::try_from(*v).expect("a constant that is not negative"))
+                .unwrap_or_else(|| panic!("the model declares {name}"))
+        };
+        let (span, off_volume) = (constant("Span"), constant("OffVolume") == 1);
         let walk = if first { "control" } else { "walk" };
-        let dir = scratch(&format!("inclease-{walk}-{mutant}"));
+        let volume = if off_volume { "off" } else { "on" };
+        let dir = scratch(&format!("inclease-{walk}-{volume}-{mutant}"));
         let st = StateDir::open(&dir).expect("open");
         let mut seen = std::collections::BTreeSet::new();
         let (mut compared, mut diverged) = (0, Vec::new());
@@ -9325,7 +9624,7 @@ mod tests {
                     kill_at: kill,
                     mutant,
                     span: Some(span),
-                    off_volume: false,
+                    off_volume,
                 });
                 let got = st.take_incarnation(0);
                 let files = read_back(&st);
@@ -9353,61 +9652,86 @@ mod tests {
         (compared, diverged)
     }
 
+    /// The take refines `IncarnationLease` on the boot volume and off it (`OffVolume = 1`, where
+    /// a disk vanishes within one boot): each defect of the take matches the model's own `Buggy`,
+    /// and every control, a defect walked against the committed model, diverges from it. Off the
+    /// boot volume the controls are 3 and 5, the defects that differ there: 1 and 2 bend a trust
+    /// that no boot gives there, and 5 trusts by the boot the lease names.
     #[test]
     fn the_incarnation_lease_refines_its_model() {
         use aterm_spec::interp::{reachable_states, with_consts};
-        let committed = aterm_models_session::incarnation_lease_model();
-        let walk = |buggy: u8| {
-            let model = match buggy {
-                0 => committed.clone(),
-                _ => with_consts(&committed, &[("Buggy", i64::from(buggy)), ("MaxBoot", 2)]),
-            };
-            (
-                buggy,
-                diverging_takes(&model, &reachable_states(&model), buggy, false),
-            )
+        let on = aterm_models_session::incarnation_lease_model();
+        let off = with_consts(&on, &[("OffVolume", 1)]);
+        let defective = |config: &aterm_spec::derive::Model, buggy: u8| match buggy {
+            0 => config.clone(),
+            _ => with_consts(config, &[("Buggy", i64::from(buggy)), ("MaxBoot", 2)]),
         };
-        let roomier = with_consts(&committed, &[("MaxTop", 7), ("MaxBoot", 2)]);
-        let roomier_states = reachable_states(&roomier);
-        let (walks, controls) = std::thread::scope(|scope| {
-            let committed_walk = scope.spawn(|| walk(0));
-            let defective: Vec<_> = (1..=3u8).map(walk).collect();
-            let controls: Vec<_> = (1..=3u8)
-                .map(|mutant| {
-                    (
-                        mutant,
-                        diverging_takes(&roomier, &roomier_states, mutant, true),
-                    )
+        let walks: Vec<_> = [(&on, 0), (&on, 1), (&on, 2), (&on, 3)]
+            .into_iter()
+            .chain([(&off, 0), (&off, 3), (&off, 5)])
+            .map(|(config, buggy)| (config, defective(config, buggy), buggy))
+            .collect();
+        let roomier = |config| with_consts(config, &[("MaxTop", 7), ("MaxBoot", 2)]);
+        let (roomier_on, roomier_off) = (roomier(&on), roomier(&off));
+        let controls = [
+            (&roomier_on, 1),
+            (&roomier_on, 2),
+            (&roomier_on, 3),
+            (&roomier_off, 3),
+            (&roomier_off, 5),
+        ];
+        let volume = |config: &aterm_spec::derive::Model| {
+            if config.consts.contains(&("OffVolume", 1)) {
+                "off the boot volume"
+            } else {
+                "on the boot volume"
+            }
+        };
+        let found = std::thread::scope(|scope| {
+            let runs: Vec<_> = walks
+                .iter()
+                .map(|(config, model, buggy)| {
+                    let run = scope.spawn(move || {
+                        diverging_takes(model, &reachable_states(model), *buggy, false)
+                    });
+                    (false, volume(config), *buggy, run)
                 })
+                .chain(controls.iter().map(|(model, mutant)| {
+                    let run = scope.spawn(move || {
+                        diverging_takes(model, &reachable_states(model), *mutant, true)
+                    });
+                    (true, volume(model), *mutant, run)
+                }))
                 .collect();
-            let committed_walk = committed_walk
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            (
-                std::iter::once(committed_walk)
-                    .chain(defective)
-                    .collect::<Vec<_>>(),
-                controls,
-            )
+            runs.into_iter()
+                .map(|(control, volume, n, run)| {
+                    let found = run
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    (control, volume, n, found)
+                })
+                .collect::<Vec<_>>()
         });
-        for (buggy, (compared, diverged)) in walks {
-            eprintln!("IncarnationLease Buggy = {buggy}: {compared} takes held to the model");
+        for (control, volume, n, (compared, diverged)) in found {
+            if control {
+                assert!(
+                    !diverged.is_empty(),
+                    "the take's defect {n} matched the committed model {volume} in all \
+                     {compared} takes"
+                );
+                continue;
+            }
             assert!(
                 compared > 100,
-                "Buggy = {buggy}: only {compared} takes compared"
+                "Buggy = {n} {volume}: only {compared} takes compared"
             );
             assert!(
                 diverged.is_empty(),
-                "Buggy = {buggy}: the take is not the model's in {} of {compared}:\n{}",
+                "Buggy = {n} {volume}: the take is not the model's in {} of {compared}:\n{}",
                 diverged.len(),
                 diverged.join("\n")
             );
-        }
-        for (mutant, (compared, diverged)) in controls {
-            assert!(
-                !diverged.is_empty(),
-                "the take's defect {mutant} matched the committed model in all {compared} takes"
-            );
+            eprintln!("IncarnationLease Buggy = {n} {volume}: {compared} takes held to the model");
         }
     }
 
@@ -9838,7 +10162,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_sweep_tried_again_after_its_unlinks_failed_moves_each_file_once() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -11010,6 +11333,69 @@ mod tests {
                 on_disk,
                 "the first one is not overwritten"
             );
+        }
+    }
+
+    /// A TORN FILE AND THE RECORD THE JOURNAL HOLDS AT ITS SEQUENCE KEEP ONE COPY EACH: a stop's
+    /// hand-off cut before its unlink leaves a record in the journal and its `inflight/<seq>`
+    /// torn. The recovery copies the file, the disk refuses the unlink, and it goes on to retire
+    /// the record, a copy under the same source's name; tried again, the sweep reuses the file's
+    /// copy. CONTROL ([`crate::sim::world::Mutant::OneQuarantineMemoryPerSource`], as before):
+    /// the record's copy ends the memory of the file's, so the next try makes a second copy of
+    /// the file (the sim's found row for that mutant).
+    #[test]
+    fn a_torn_file_and_the_record_at_its_sequence_keep_one_copy_each() {
+        use std::os::unix::fs::PermissionsExt as _;
+        struct RestoreMode(PathBuf, std::fs::Permissions);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+        for (one_memory, held) in [
+            (false, &["inflight.7", "retired.inflight.7"][..]),
+            (
+                true,
+                &["inflight.7", "inflight.7.1", "retired.inflight.7"][..],
+            ),
+        ] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("torn-and-record")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).expect("open");
+            st.one_quarantine_memory_per_source(one_memory);
+            st.set_inc_seam(in_boot(1));
+            st.begin_run().expect("boot 1's run");
+            st.set_in_flight(&in_flight_entry(7))
+                .expect("in the journal");
+            std::fs::create_dir_all(root.join("inflight")).expect("the folder");
+            std::fs::write(root.join("inflight/7"), b"torn 7").expect("and torn in a file");
+            st.set_inc_seam(in_boot(2));
+            let inflight = root.join("inflight");
+            let mode = |m: u32| {
+                std::fs::set_permissions(&inflight, std::fs::Permissions::from_mode(m))
+                    .expect("chmod");
+            };
+            let _restore = RestoreMode(
+                inflight.clone(),
+                std::fs::metadata(&inflight).unwrap().permissions(),
+            );
+            mode(0o555);
+            st.set_aside_torn().expect_err("the unlink fails");
+            st.retire_in_flight_of_an_earlier_boot()
+                .expect("the record retired");
+            mode(0o755);
+            st.set_aside_torn().expect("the sweep, its folder writable");
+            assert!(!root.join("inflight/7").exists(), "moved");
+            let mut copies: Vec<String> = std::fs::read_dir(root.join(QUARANTINE))
+                .expect("the quarantine")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|n| !n.starts_with('.'))
+                .collect();
+            copies.sort();
+            assert_eq!(copies, held, "one_memory={one_memory}");
         }
     }
 

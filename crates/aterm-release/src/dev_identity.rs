@@ -391,7 +391,7 @@ fn generate(k: &Keychain<'_>, dir: &Path) -> Result<(PathBuf, String), Stop> {
     let key = dir.join("key.pem");
     let cert = dir.join("cert.pem");
     let p12 = dir.join("id.p12");
-    std::fs::write(&config, request_config())
+    crate::durable::write_fresh(&config, request_config())
         .map_err(|e| format!("write {}: {e}", config.display()))?;
     println!("==> generating \"{NAME}\" (RSA-2048, {DAYS} days) with {OPENSSL}");
     let ok = |out: Output, what: &str| {
@@ -460,10 +460,10 @@ fn self_check(k: &Keychain<'_>, hash: &str, dir: &Path) -> Result<(), Stop> {
     let app = dir.join("probe.app");
     let macos = app.join("Contents/MacOS");
     std::fs::create_dir_all(&macos).map_err(|e| format!("create {}: {e}", macos.display()))?;
-    std::fs::copy("/bin/echo", macos.join("probe"))
+    crate::durable::copy_regular_fresh("/bin/echo", macos.join("probe"))
         .map_err(|e| format!("copy /bin/echo into the probe bundle: {e}"))?;
-    std::fs::write(
-        app.join("Contents/Info.plist"),
+    crate::durable::write_fresh(
+        &app.join("Contents/Info.plist"),
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD \
              PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist \

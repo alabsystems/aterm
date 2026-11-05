@@ -147,7 +147,7 @@ impl LaneFidelity {
             let call = &calls[i];
             next_call += 1;
             let (cur, at, geom, cfg) = match *call {
-                MomentumEvent::Key { at, tau_bits } => {
+                MomentumEvent::Key { at, tau_bits, .. } => {
                     g.on_key(instant(origin, offset(at)), f32::from_bits(tau_bits));
                     continue;
                 }

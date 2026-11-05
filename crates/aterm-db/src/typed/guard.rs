@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What no ATT/1 cell may hold (design §3.4): a credential-shaped string, free text that names
+//! What non-Secret ATT/1 cells may not hold (design §3.4): a credential-shaped string, free text that names
 //! a secret (so a plain-word password cannot ride a note), a full phone number (it lives in the
 //! vault; a phone row keeps its last four digits), or an address outside a typed `email` cell
 //! (so every address is masked). A refusal names the rule and never quotes the
-//! value. Secret-named columns are refused at compile time ([`super::Collection::check`]).
+//! value. Secret columns bypass these text guards only with an opaque inner seal;
+//! plaintext is rejected by their type check ([`super::cell::validate`]).
 
 /// Why a value was refused: a rule, never the value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,7 +223,7 @@ fn base32_seed(text: &str) -> bool {
         word.bytes().any(|b| (b'2'..=b'7').contains(&b))
             && word.bytes().any(|b| b.to_ascii_lowercase() > b'f')
     };
-    let words = text.split(|c: char| !c.is_ascii_alphanumeric());
+    let words = text.split(|c: char| !c.is_ascii_alphanumeric() && c != '@');
     if words
         .into_iter()
         .any(|word| word.len() >= SEED_CHARS && base32(word) && digit(word))
@@ -244,8 +245,12 @@ fn base32_seed(text: &str) -> bool {
 
 /// Whether free text names a secret.
 pub fn names_secret(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    SECRET_WORDS.iter().any(|word| lower.contains(word))
+    let bytes = text.as_bytes();
+    SECRET_WORDS.iter().any(|word| {
+        bytes
+            .windows(word.len())
+            .any(|w| w.eq_ignore_ascii_case(word.as_bytes()))
+    })
 }
 
 /// Whether `text` is never shown, not even in a local review on the owner's own Mac: it is shaped
@@ -367,10 +372,9 @@ fn password_shaped(word: &str) -> bool {
 /// The rule it breaks; the value is never quoted.
 pub fn note_cell(value: &str, max: usize) -> Result<(), Refusal> {
     text(value, max)?;
-    let lower = value.to_ascii_lowercase();
-    if lower
+    if value
         .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|word| NOTE_WORDS.contains(&word))
+        .any(|word| NOTE_WORDS.iter().any(|nw| word.eq_ignore_ascii_case(nw)))
     {
         return Err(Refusal::SecretWord);
     }

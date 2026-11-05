@@ -10,7 +10,7 @@ use crate::{
     },
     table::{
         store::{claim_dir, claim_name},
-        tests::{Lab, repair_commons, repair_commons_among, repair_commons_at},
+        tests::{Lab, repair_commons, repair_commons_among_first, repair_commons_at},
     },
 };
 use aterm_json::json;
@@ -36,6 +36,22 @@ fn counter(read: &Read, machine: &[u8; 16]) -> Option<u64> {
         .iter()
         .find(|(m, _)| m == machine)
         .and_then(|(_, body)| body["counter"].as_u64())
+}
+
+/// `rounds` rounds of repair naming day `day`'s claims table, each Mac on its clock in `now`, as a
+/// push names the table that moved. A table both Macs of an exchange hold takes one round; one a
+/// Mac must take up from the other takes a second, and a shortfall fails in the fixture
+/// (`repair_commons_first`). The tests here assert rows, counters and writability in known day
+/// tables, not how repair reached them.
+/// GAP: the tests that repair through this see no ring-table scan order and no idle laps with a
+/// clock set back. `repair_on_a_clock_set_back_a_day_never_resurrects_a_retired_epoch`,
+/// `an_interrupted_day_table_enrollment_costs_nothing_and_resumes`,
+/// `an_unrewritable_ring_state_is_moved_aside_and_claims_go_on` and
+/// `a_damaged_ring_state_is_rebuilt_and_repair_goes_on` stay on the scan.
+pub(super) fn repair_day(lab: &Lab, rounds: usize, day: u64, now: &[u64]) {
+    let table = CLAIMS.scope(lab.bootstrap(0).trust(), day).unwrap();
+    let members: Vec<usize> = (0..lab.paths.len()).collect();
+    repair_commons_among_first(lab, rounds, &members, now, table.digest());
 }
 
 /// Run `f` in a session on `paths`, holding the control writer where `write`.
@@ -163,7 +179,7 @@ fn legacy_read(paths: &Paths) -> Result<Vec<([u8; 16], Value)>> {
     }
     let store = Store::observe(&session, &directory.path(first.scope)?, first.scope)?;
     let log = Log::read_with(&session, &store, first.scope, decode)?;
-    Ok(latest(&[(Source::Legacy(1), log)], &machines(&session))
+    Ok(latest(&[(Source::Legacy(1), log)], &machines(&session)?)
         .into_values()
         .map(|latest| (latest.machine, latest.body))
         .collect())
@@ -175,7 +191,7 @@ fn legacy_write(paths: &Paths, body: &Value) -> Result<()> {
     let session = Session::open(&bootstrap)?;
     let directory = Directory::new(paths, bootstrap.trust());
     let scope = directory.publish(&session, &legacy_descriptor(&bootstrap, 1)?)?;
-    let machine = me(&session, &machines(&session))?;
+    let machine = me(&session, &machines(&session)?)?;
     let mut store = Store::open(&session, &directory.path(scope)?, scope)?;
     store.commit_catalog(&session, &encode(&command(&machine, body)?)?)?;
     Ok(())
@@ -219,18 +235,20 @@ fn a_row_at_another_macs_key_is_inert() {
     let now = at(D, 60);
     write_at(&lab.paths[0], &row(1, now), now, Caps::default()).unwrap();
     write_at(&lab.paths[1], &row(1, now), now, Caps::default()).unwrap();
-    repair_commons_at(&lab, 6, &[now, now]);
+    repair_day(&lab, 1, D, &[now, now]);
     let zero = read_at(&lab.paths[0], now, Caps::default()).unwrap().me;
+    let one = read_at(&lab.paths[1], now, Caps::default()).unwrap().me;
     // Mac 1 signs a row at Mac 0's key.
     let forged = command(&zero, &row(9, now)).unwrap();
     commit_ring(&lab.paths[1], D, now, &encode(&forged).unwrap());
-    repair_commons_at(&lab, 6, &[now, now]);
+    repair_day(&lab, 1, D, &[now, now]);
+    // Inert only means something once the forged record is here, beside each Mac's own row.
+    assert_eq!(ring_counts(&lab.paths[0], now), vec![(D, 3)]);
     for (n, paths) in lab.paths[..2].iter().enumerate() {
-        assert_eq!(
-            counter(&read_at(paths, now, Caps::default()).unwrap(), &zero),
-            Some(1),
-            "Mac {n}"
-        );
+        let read = read_at(paths, now, Caps::default()).unwrap();
+        assert_eq!(counter(&read, &zero), Some(1), "Mac {n}");
+        // A forged row that counted would replace its signer's own: rows go by signer.
+        assert_eq!(counter(&read, &one), Some(1), "Mac {n}");
     }
 }
 
@@ -607,10 +625,15 @@ fn every_rolled_legacy_generation_is_sealed() {
     });
 }
 
-/// A year of the owner's swarm in miniature: 80 days of writes, three on even days and one on odd
-/// days, into day tables of two rows each, so each even day spills into the next day's table.
-/// Every write lands, the row reads back writable, at most four day tables and four enrollment
-/// claims exist, and the catalog holds no record.
+/// The owner's swarm in miniature: 16 days of writes, three on even days and one on odd days, into
+/// day tables of two rows each, so each even day spills into the next day's table. Every write
+/// lands, the row reads back writable, at most four day tables and four enrollment claims exist,
+/// and the catalog holds no record. The window saturates by about day 5, and after that every even
+/// or odd day behaves alike; every time constant on this path, and the ring's `MAX_HELD` of 8, lies
+/// within the 16.
+/// GAP: this run never reaches the 63-table catalog limit itself. A slow leak that needs 17 or more
+/// days to show and that the day-table, claim and catalog counts asserted each day cannot see is
+/// not seen; the counts would catch any leak of those long before 63.
 /// NEGATIVE CONTROL: with retirement off (`Directory::retire` returning before it deletes), the
 /// day tables pile up past four on disk.
 #[test]
@@ -622,7 +645,7 @@ fn a_year_of_daily_writes_never_reaches_capacity() {
         writer_records: 2,
     };
     let mut next = 1;
-    for day in D..D + 80 {
+    for day in D..D + 16 {
         let mut last = None;
         for hour in 1..=if day % 2 == 0 { 3 } else { 1 } {
             let now = at(day, hour * 3600);
@@ -635,12 +658,12 @@ fn a_year_of_daily_writes_never_reaches_capacity() {
         assert_eq!(counter(&read, &read.me), Some(next - 1), "day {}", day - D);
         assert_eq!(read.writable, Ok(()), "day {}", day - D);
         assert!(
-            ring_dirs(paths, D - 1..=D + 81).len() <= 4,
+            ring_dirs(paths, D - 1..=D + 17).len() <= 4,
             "day {}",
             day - D
         );
         assert!(
-            ring_claims(paths, D - 1..=D + 81).len() <= 4,
+            ring_claims(paths, D - 1..=D + 17).len() <= 4,
             "day {}",
             day - D
         );
@@ -725,17 +748,21 @@ fn split_sides_write_the_same_day_tables_and_a_heal_merges_them() {
     let noon = at(D, DAY / 2);
     write_at(&lab.paths[0], &row(1, noon), noon, caps).unwrap();
     write_at(&lab.paths[2], &row(1, noon), noon, caps).unwrap();
-    repair_commons_at(&lab, 10, &[noon; 3]);
+    repair_day(&lab, 2, D, &[noon; 3]);
     // The split: Macs 0 and 1 on one side, Mac 2 alone on the other.
     let later = noon + 3600;
     write_at(&lab.paths[1], &row(1, later), later, caps).unwrap();
     write_at(&lab.paths[0], &row(2, later), later, caps).unwrap();
-    repair_commons_among(&lab, 8, &[0, 1], &[later + 60; 3]);
+    let day = CLAIMS.scope(lab.bootstrap(0).trust(), D).unwrap().digest();
+    repair_commons_among_first(&lab, 1, &[0, 1], &[later + 60; 3], day);
     let late = at(D + 1, 3600);
     write_at(&lab.paths[2], &row(2, late), late, caps).unwrap();
     // The heal, a little after midnight on every clock.
     let heal = at(D + 1, 7200);
-    repair_commons_at(&lab, 10, &[heal; 3]);
+    repair_day(&lab, 1, D, &[heal; 3]);
+    // Day D+1 is Mac 2's alone. Mac 0 took it up in the heal above, where Mac 2 listed it, and
+    // reads it in the first round; Mac 1 takes it up in the first round and reads it in the second.
+    repair_day(&lab, 2, D + 1, &[heal; 3]);
     let me: Vec<_> = (0..3)
         .map(|n| read_at(&lab.paths[n], heal, caps).unwrap().me)
         .collect();
@@ -859,10 +886,10 @@ fn claims_of(read: &Read, machine: &[u8; 16]) -> Option<Value> {
 /// holds its own earlier signed row. On day D+1 it writes on in day D+2's table, which it wrote
 /// while ahead and kept, so its signed history there runs on, and both Macs read its new row.
 /// NEGATIVE CONTROL: a window that never comes below the floor (`RingState::current` as
-/// `clock.max(floor + 1)`) keeps Mac 0 two days ahead, off Mac 1's row (`left: None`,
-/// `right: Some(1)`). `target` refusing only once the floor lies beyond the window (its clock
-/// check as `state.floor > last`) lets Mac 0 write on day D, into day D+1's table (`assertion
-/// failed: read.writable.is_err()`).
+/// `clock.max(floor + 1)`) keeps Mac 0 two days ahead, off day D's table and Mac 1's row (`the
+/// named table was not repaired in the last round`). `target` refusing only once the floor lies
+/// beyond the window (its clock check as `state.floor > last`) lets Mac 0 write on day D, into
+/// day D+1's table (`assertion failed: read.writable.is_err()`).
 #[test]
 fn a_clock_back_from_running_ahead_reads_its_peers_and_never_forks_its_history() {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
@@ -871,7 +898,7 @@ fn a_clock_back_from_running_ahead_reads_its_peers_and_never_forks_its_history()
     for paths in &lab.paths {
         write_at(paths, &row(1, now), now, caps).unwrap();
     }
-    repair_commons_at(&lab, 6, &[now, now]);
+    repair_day(&lab, 1, D, &[now, now]);
     let me: Vec<_> = (0..2)
         .map(|n| read_at(&lab.paths[n], now, caps).unwrap().me)
         .collect();
@@ -879,7 +906,7 @@ fn a_clock_back_from_running_ahead_reads_its_peers_and_never_forks_its_history()
     write_at(&lab.paths[0], &row(1, ahead), ahead, caps).unwrap();
     assert_eq!(ring_dirs(&lab.paths[0], D - 1..=D + 3), vec![D + 2]);
     let back = at(D, 3600);
-    repair_commons_at(&lab, 10, &[back, back]);
+    repair_day(&lab, 2, D, &[back, back]);
     let read = read_at(&lab.paths[0], back, caps).unwrap();
     assert!(read.writable.is_err());
     assert_eq!(counter(&read, &me[1]), Some(1));
@@ -890,7 +917,7 @@ fn a_clock_back_from_running_ahead_reads_its_peers_and_never_forks_its_history()
     assert_eq!(next, 2, "Mac 0 reads its own row of day D+2 on day D+1");
     let marked = json!({"counter": next, "until": floor + DAY, "claims": ["back@example.invalid"]});
     write_at(&lab.paths[0], &marked, floor, caps).unwrap();
-    repair_commons_at(&lab, 10, &[floor, floor]);
+    repair_day(&lab, 2, D + 2, &[floor, floor]);
     for (n, paths) in lab.paths[..2].iter().enumerate() {
         let read = read_at(paths, floor, caps).unwrap();
         assert_eq!(read.writable, Ok(()), "Mac {n}");
@@ -922,7 +949,7 @@ fn a_clock_set_back_two_days_claims_nothing_on_a_view_without_its_peers_today() 
     for paths in &lab.paths {
         write_at(paths, &row(1, yesterday), yesterday, caps).unwrap();
     }
-    repair_commons_at(&lab, 6, &[yesterday, yesterday]);
+    repair_day(&lab, 1, D - 1, &[yesterday, yesterday]);
     let now = at(D, 60);
     for c in [2, 3] {
         let body = json!({"counter": c, "until": now + DAY, "claims": ["a@example.invalid"]});
@@ -930,17 +957,17 @@ fn a_clock_set_back_two_days_claims_nothing_on_a_view_without_its_peers_today() 
     }
     let x = json!({"counter": 2, "until": now + DAY, "claims": ["x@example.invalid"]});
     write_at(&lab.paths[1], &x, now, caps).unwrap();
-    repair_commons_at(&lab, 10, &[now + 10, now + 10]);
+    repair_day(&lab, 1, D, &[now + 10, now + 10]);
     let me: Vec<_> = (0..2)
         .map(|n| read_at(&lab.paths[n], now + 10, caps).unwrap().me)
         .collect();
     let back = at(D - 2, 3600);
-    repair_commons_at(&lab, 10, &[back, now + 20]);
+    repair_day(&lab, 1, D - 1, &[back, now + 20]);
     let read = read_at(&lab.paths[0], back, caps).unwrap();
     assert!(read.writable.is_err());
     let mine = json!({"counter": 2, "until": back + DAY, "claims": ["x@example.invalid"]});
     assert!(write_at(&lab.paths[0], &mine, back, caps).is_err());
-    repair_commons_at(&lab, 10, &[back + 60, now + 60]);
+    repair_day(&lab, 1, D - 1, &[back + 60, now + 60]);
     let peer = read_at(&lab.paths[1], now + 60, caps).unwrap();
     assert_eq!(counter(&peer, &me[0]), Some(3));
     assert_eq!(claims_of(&peer, &me[0]), Some(json!(["a@example.invalid"])));
@@ -968,16 +995,18 @@ fn a_clock_set_back_days_then_righted_writes_on_in_its_own_tables() {
     for paths in &lab.paths {
         write_at(paths, &row(1, now), now, caps).unwrap();
     }
-    repair_commons_at(&lab, 6, &[now, now]);
+    repair_day(&lab, 1, D, &[now, now]);
     let me = read_at(&lab.paths[0], now, caps).unwrap().me;
     let back = at(D - 5, 60);
     assert!(write_at(&lab.paths[0], &row(2, back), back, caps).is_err());
-    repair_commons_at(&lab, 6, &[back, now]);
+    // Day D lies outside this clock's window, so no table can be named: one regular exchange,
+    // whose retirement is what the next line judges.
+    repair_commons_at(&lab, 1, &[back, now]);
     assert_eq!(ring_dirs(&lab.paths[0], D..=D), vec![D]);
     let right = at(D, 120);
     let next = counter(&read_at(&lab.paths[0], right, caps).unwrap(), &me).map_or(1, |c| c + 1);
     write_at(&lab.paths[0], &row(next, right), right, caps).unwrap();
-    repair_commons_at(&lab, 10, &[right, right]);
+    repair_day(&lab, 1, D, &[right, right]);
     for (n, paths) in lab.paths[..2].iter().enumerate() {
         let read = read_at(paths, right, caps).unwrap();
         assert_eq!(read.writable, Ok(()), "Mac {n}");
@@ -1032,7 +1061,7 @@ fn a_mac_back_after_a_long_absence_ranks_above_its_old_row() {
     let mac = read_at(&lab.paths[0], now, caps).unwrap().me;
     let old = command(&mac, &row(57, now)).unwrap();
     commit_ring(&lab.paths[0], D, now, &encode(&old).unwrap());
-    repair_commons_at(&lab, 6, &[now, now]);
+    repair_day(&lab, 2, D, &[now, now]);
     assert_eq!(
         counter(&read_at(&lab.paths[1], now, caps).unwrap(), &mac),
         Some(57)
@@ -1040,7 +1069,7 @@ fn a_mac_back_after_a_long_absence_ranks_above_its_old_row() {
     let back = at(D + 2, 60);
     write_at(&lab.paths[0], &row(1, back), back, caps).unwrap();
     let behind = at(D + 1, 60);
-    repair_commons_at(&lab, 6, &[back, behind]);
+    repair_day(&lab, 2, D + 2, &[back, behind]);
     let read = read_at(&lab.paths[1], behind, caps).unwrap();
     assert_eq!(counter(&read, &mac), Some(1));
 }

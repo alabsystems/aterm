@@ -38,15 +38,36 @@ pub const PROVIDERS: [&str; 6] = [ANTHROPIC, OPENAI, GOOGLE, META, KIMI, XAI];
 /// with `harness/claims.rs` `canonical_pool_realm` on every spelling that accepts, the empty
 /// default included), or the provider word for an unpooled one.
 pub fn canonical_realm(raw: &str) -> Option<&'static str> {
-    match raw.trim_ascii().to_ascii_lowercase().as_str() {
-        "" | "claude" | "anthropic" => Some("claude"),
-        "codex" | "openai" => Some("codex"),
-        "grok" | "x" | "xai" => Some("grok"),
-        "kimi" | "kimi:global" | "kimi-global" => Some("kimi:global"),
-        "kimi:mainland-cn" | "kimi-mainland-cn" | "kimi:cn" | "kimi-cn" => Some("kimi:mainland-cn"),
-        "google" | "gemini" => Some("google"),
-        "meta" => Some("meta"),
-        _ => None,
+    let trimmed = raw.trim_ascii();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("claude")
+        || trimmed.eq_ignore_ascii_case("anthropic")
+    {
+        Some("claude")
+    } else if trimmed.eq_ignore_ascii_case("codex") || trimmed.eq_ignore_ascii_case("openai") {
+        Some("codex")
+    } else if trimmed.eq_ignore_ascii_case("grok")
+        || trimmed.eq_ignore_ascii_case("x")
+        || trimmed.eq_ignore_ascii_case("xai")
+    {
+        Some("grok")
+    } else if trimmed.eq_ignore_ascii_case("kimi")
+        || trimmed.eq_ignore_ascii_case("kimi:global")
+        || trimmed.eq_ignore_ascii_case("kimi-global")
+    {
+        Some("kimi:global")
+    } else if trimmed.eq_ignore_ascii_case("kimi:mainland-cn")
+        || trimmed.eq_ignore_ascii_case("kimi-mainland-cn")
+        || trimmed.eq_ignore_ascii_case("kimi:cn")
+        || trimmed.eq_ignore_ascii_case("kimi-cn")
+    {
+        Some("kimi:mainland-cn")
+    } else if trimmed.eq_ignore_ascii_case("google") || trimmed.eq_ignore_ascii_case("gemini") {
+        Some("google")
+    } else if trimmed.eq_ignore_ascii_case("meta") {
+        Some("meta")
+    } else {
+        None
     }
 }
 
@@ -63,15 +84,8 @@ pub fn provider_of_realm(realm: &str) -> Option<&'static str> {
     }
 }
 
-/// An address lower-cased and ASCII-trimmed, the claims spelling, once it looks like one:
-/// one `@` between a non-empty local part and a dotted domain, no space or control character,
-/// at most 254 bytes. The refusal never quotes it.
-///
-/// # Errors
-/// It does not look like an address.
-pub fn address(raw: &str) -> Result<String> {
-    let trimmed = raw.trim_ascii().to_ascii_lowercase();
-    let well_formed = trimmed.len() <= 254
+fn is_well_formed_address(trimmed: &str) -> bool {
+    trimmed.len() <= 254
         && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
         && trimmed.split_once('@').is_some_and(|(local, domain)| {
             !local.is_empty()
@@ -79,9 +93,25 @@ pub fn address(raw: &str) -> Result<String> {
                 && domain.contains('.')
                 && !domain.starts_with('.')
                 && !domain.ends_with('.')
-        });
-    if well_formed {
-        Ok(trimmed)
+        })
+}
+
+pub(crate) fn is_stored_address(raw: &str) -> bool {
+    raw.trim_ascii().len() == raw.len()
+        && !raw.bytes().any(|b| b.is_ascii_uppercase())
+        && is_well_formed_address(raw)
+}
+
+/// An address lower-cased and ASCII-trimmed, the claims spelling, once it looks like one:
+/// one `@` between a non-empty local part and a dotted domain, no space or control character,
+/// at most 254 bytes. The refusal never quotes it.
+///
+/// # Errors
+/// It does not look like an address.
+pub fn address(raw: &str) -> Result<String> {
+    let trimmed = raw.trim_ascii();
+    if is_well_formed_address(trimmed) {
+        Ok(trimmed.to_ascii_lowercase())
     } else {
         Err(Error::new("not an address"))
     }
@@ -101,17 +131,15 @@ pub fn claims_email(identity: Option<&str>, login: Option<&str>) -> Result<Strin
 }
 
 fn h8(prefix: &str, domain: &[u8], parts: &[&[u8]]) -> String {
-    let mut input = domain.to_vec();
+    let mut sha = Sha256::new();
+    sha.update(domain);
     for (n, part) in parts.iter().enumerate() {
         if n > 0 {
-            input.push(0);
+            sha.update([0]);
         }
-        input.extend_from_slice(part);
+        sha.update(part);
     }
-    format!(
-        "{prefix}-{}",
-        hex::encode_lower(&Sha256::digest(&input)[..8])
-    )
+    format!("{prefix}-{}", hex::encode_lower(&sha.finalize()[..8]))
 }
 
 /// A machine's key from its birth identity: its Commons machine uuid (32 hex) when it
@@ -137,10 +165,11 @@ pub fn planned_machine_pk(label: &str, held: impl Fn(&str) -> bool) -> Option<St
 /// stable across rotations and says nothing of the hardware outside this network. The uuid is read
 /// in one spelling, so two readings of one Mac give one hint.
 pub fn hw_hint(network: &[u8; 16], platform_uuid: &str) -> String {
-    let mut seed = b"aterm/alab/hw-hint-key/1\0".to_vec();
-    seed.extend_from_slice(network);
+    let mut sha = Sha256::new();
+    sha.update(b"aterm/alab/hw-hint-key/1\0");
+    sha.update(network);
     let tag = hmac_sha256_parts(
-        &Sha256::digest(&seed),
+        &sha.finalize(),
         &[
             b"aterm/alab/hw-hint/1",
             platform_uuid.trim().to_ascii_uppercase().as_bytes(),
@@ -194,12 +223,23 @@ pub fn subaccount_pk(account: &str, account_key: &str) -> Result<String> {
     ))
 }
 
+/// A mailbox's key from the key of the address it signs in as (`mailbox.login`): `mb-` and 8
+/// bytes of SHA-256 over a domain and the `ad-` key, so every Mac that knows the login names
+/// the same row with no key file.
+///
+/// # Errors
+/// `login` is not an address key.
+pub fn mailbox_pk(login: &str) -> Result<String> {
+    if !is_digest_pk(login, "ad") {
+        return Err(Error::new("a mailbox's key derives from an address key"));
+    }
+    Ok(h8("mb", b"aterm/alab/mailbox/2\0", &[login.as_bytes()]))
+}
+
 /// Prefixes of keys minted at random.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Random {
-    /// A mailbox: its login is admins-only, so no digest of it may be member-readable.
-    Mailbox,
-    /// A phone: its number is a low-entropy secret.
+    /// A phone: its number is a low-entropy secret, found by its sealed `number` cell.
     Phone,
 }
 
@@ -209,7 +249,6 @@ pub enum Random {
 /// The system random source failed.
 pub fn random_pk(kind: Random) -> Result<String> {
     let prefix = match kind {
-        Random::Mailbox => "mb",
         Random::Phone => "ph",
     };
     Ok(format!(
@@ -258,14 +297,12 @@ pub fn preference_pk(machine: &str, account: &str) -> Result<String> {
     if !is_digest_pk(machine, "mc") || !is_digest_pk(account, "ac") {
         return Err(Error::new("a preference names a machine and an account"));
     }
-    let mut input = b"aterm/alab/preference/1\0".to_vec();
-    input.extend_from_slice(machine.as_bytes());
-    input.push(0);
-    input.extend_from_slice(account.as_bytes());
-    Ok(format!(
-        "pf-{}",
-        hex::encode_lower(&Sha256::digest(&input)[..11])
-    ))
+    let mut sha = Sha256::new();
+    sha.update(b"aterm/alab/preference/1\0");
+    sha.update(machine.as_bytes());
+    sha.update([0]);
+    sha.update(account.as_bytes());
+    Ok(format!("pf-{}", hex::encode_lower(&sha.finalize()[..11])))
 }
 
 /// The CLI word a realm's default account label starts with: the CLI that signs in to it.
@@ -303,27 +340,30 @@ pub fn source_pk(bytes: &[u8]) -> String {
 /// An archived owned record's key in a later table generation (design §3.8): a digest of the
 /// operation it carries, so every Mac that carries one record names one row.
 pub fn archived_pk(operation: &[u8; 32]) -> String {
-    let mut input = b"aterm/alab/archived/1\0".to_vec();
-    input.extend_from_slice(operation);
-    format!("ar-{}", hex::encode_lower(&Sha256::digest(&input)[..8]))
+    let mut sha = Sha256::new();
+    sha.update(b"aterm/alab/archived/1\0");
+    sha.update(operation);
+    format!("ar-{}", hex::encode_lower(&sha.finalize()[..8]))
 }
 
 /// A table roll's cover row (design §3.8): one per generation rolled from and Mac that restated
 /// it, so a Mac's later restatement of what it still held replaces its own earlier cover.
 pub fn roll_pk(from: u32, uuid32: &str) -> String {
-    let mut input = b"aterm/alab/roll/1\0".to_vec();
-    input.extend_from_slice(&from.to_le_bytes());
-    input.push(0);
-    input.extend_from_slice(uuid32.as_bytes());
-    format!("rl-{}", hex::encode_lower(&Sha256::digest(&input)[..8]))
+    let mut sha = Sha256::new();
+    sha.update(b"aterm/alab/roll/1\0");
+    sha.update(from.to_le_bytes());
+    sha.update([0]);
+    sha.update(uuid32.as_bytes());
+    format!("rl-{}", hex::encode_lower(&sha.finalize()[..8]))
 }
 
 /// A writer of a rolled table as its cover row names it: 32 hex digits of a digest of its
 /// Commons actor, which is 48 bytes and would not fit a cover's record at 128 Macs.
 pub fn actor_key(actor: &[u8]) -> String {
-    let mut input = b"aterm/alab/actor/1\0".to_vec();
-    input.extend_from_slice(actor);
-    hex::encode_lower(&Sha256::digest(&input)[..16])
+    let mut sha = Sha256::new();
+    sha.update(b"aterm/alab/actor/1\0");
+    sha.update(actor);
+    hex::encode_lower(&sha.finalize()[..16])
 }
 
 /// A Mac model's key: `hw.model` with `,` replaced by `-` (`Mac16,8` → `Mac16-8`).

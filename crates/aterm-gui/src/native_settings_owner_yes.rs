@@ -23,9 +23,12 @@
 
 use super::{ConsentGestures, OwnerAnswer, QuietStamp, SharedOwnerQuiet};
 
-/// The owner's yes to a macOS access change. One door in this file mints one:
-/// [`owner_confirms_with`], once its gestures' [`ConfirmArm`] raised aterm's alert and the owner
-/// chose its proceed button: the Security page's presses (`SettingsViewState::owner_confirms`).
+/// The owner's yes to a macOS access change, or to a recording that keeps keys aterm cannot see
+/// echoed. One door in this file mints one: [`owner_confirms_with`], once its gestures'
+/// [`ConfirmArm`] raised aterm's alert and the owner chose its proceed button: the Security page's
+/// presses (`SettingsViewState::owner_confirms`), and View ▸ Record Keys Not Echoed…
+/// (`App::toggle_unseen_keys`), whose yes the recording's grant holds for its one attach
+/// (`aos_host::UnseenGrant`, ATERM-KI-1025-1's D12) and drops when that attach ends.
 ///
 /// The debugger-access change is built on it all the way down: only `DebuggerChangeLane::begin`
 /// mints a `debugger_access::ChangeTicket`, and only from a yes; a `DevtoolsJob`, what the worker

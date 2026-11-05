@@ -192,6 +192,13 @@ const QUESTION_KEY: &str = "tab-indented input";
 const ANSWER_KEY: &str = "Nobody is here to choose:";
 const ANSWER_HEAD: &str = "Nobody is here to ";
 
+/// L20 and C5's question dialog, asked by the stub's `AskUserQuestion` in the first turn
+/// ([`dialog_call`]): its Recommended option is new work, the other lands the work.
+pub const DIALOG_QUESTION: &str = "Which should come next for the parser?";
+/// The dialog's Recommended option: new work, which Land starts none of.
+pub const DIALOG_NEW_WORK: &str = "Start the docs site (Recommended)";
+/// The dialog's landing option.
+pub const DIALOG_LANDS: &str = "Push the parser to origin/main";
 const PERSON_ASKS: &str = "tell me what this repository holds so far";
 /// Its reply: a plain answer.
 pub const PERSON_REPLY: &str = "The repository holds a README and nothing else yet.";
@@ -432,6 +439,42 @@ pub fn read_call(h: Harness, file: &Path) -> J {
     J::obj([("name", J::s(name)), ("input", input)])
 }
 
+/// L20 and C5's first-turn tool call: Claude Code's `AskUserQuestion` with [`DIALOG_QUESTION`],
+/// its Recommended option new work ([`DIALOG_NEW_WORK`]) and the other the landing
+/// ([`DIALOG_LANDS`]). The stub calls it once: a conversation holding a tool's result gets the
+/// rule's text ([`crate::stub::scripted_call`]).
+#[must_use]
+pub fn dialog_call() -> J {
+    let option = |label: &str, description: &str| {
+        J::obj([("label", J::s(label)), ("description", J::s(description))])
+    };
+    let question = J::obj([
+        ("question", J::s(DIALOG_QUESTION)),
+        ("header", J::s("Next")),
+        ("multiSelect", J::Bool(false)),
+        (
+            "options",
+            J::Arr(vec![
+                option(DIALOG_NEW_WORK, "Begin a new docs site for the parser"),
+                option(DIALOG_LANDS, "Land the parser as it stands"),
+            ]),
+        ),
+    ]);
+    J::obj([
+        ("name", J::s("AskUserQuestion")),
+        ("input", J::obj([("questions", J::Arr(vec![question]))])),
+    ])
+}
+
+/// Why L20 and C5 are out of this lab's reach on harness `h`: `None` on Claude Code, whose
+/// `AskUserQuestion` the stub scripts.
+#[must_use]
+pub fn dialog_out_of_reach(h: Harness) -> Option<&'static str> {
+    (h != Harness::Claude).then_some(
+        "the stub scripts no question tool of agy's or Muse Code's: L20 and C5 call Claude Code's AskUserQuestion",
+    )
+}
+
 /// Why F3 is out of this lab's reach on harness `h`: `None` where a turn can end on a tool's row
 /// with no words after it.
 #[must_use]
@@ -485,7 +528,8 @@ pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
         | Mode::Resid
         | Mode::Ladder
         | Mode::Angles
-        | Mode::Switch => None,
+        | Mode::Switch
+        | Mode::Dialog => None,
     }
 }
 
@@ -634,6 +678,8 @@ pub enum Mode {
     /// A SYSTEM MESSAGE IS A WAIT (v6 §14.17.5's 12a, `sysmsg`): one chain per system-message
     /// form the stub plays, on every harness, each on a lab of its own ([`sysmsg::Form`]).
     Sysmsg,
+    /// L20 and C5, a question dialog in the first turn under Land and under Cruise (`dialog`).
+    Dialog,
 }
 
 impl Mode {
@@ -660,6 +706,7 @@ impl Mode {
             "outage-land" => Mode::OutageLand,
             "outage-cruise" => Mode::OutageCruise,
             "sysmsg" => Mode::Sysmsg,
+            "dialog" => Mode::Dialog,
             _ => return None,
         })
     }
@@ -689,7 +736,8 @@ impl Mode {
             | Mode::Resid
             | Mode::Ladder
             | Mode::Angles
-            | Mode::Switch => None,
+            | Mode::Switch
+            | Mode::Dialog => None,
         }
     }
 }
@@ -895,6 +943,8 @@ pub enum Chain {
     SwitchAgent,
     /// SWS (the same, under a draft that stands over the switch).
     SwitchSeq,
+    /// SWC (Cruise at rest under a person's command left past their grace: [`switch`]).
+    CommandDraft,
     /// SWF (Cruise in a back-off, switched to Land then Off within 300 ms).
     SwitchFlip,
     /// SWO (Cruise held at the same reply, switched to Land, the same reply to Land's one ask).
@@ -932,6 +982,10 @@ pub enum Chain {
     SysLandDrop,
     /// LLOG (`--mode sysmsg`): an expired login under Land.
     SysLandLogin,
+    /// L20 (`--mode dialog`: a question dialog under Land, answered by the land text).
+    LandDialog,
+    /// C5 (`--mode dialog`: the same dialog under Cruise, answered by its Recommended option).
+    CruiseDialog,
 }
 
 /// The scenarios, by the names the report and the record use.
@@ -1038,6 +1092,10 @@ pub enum Scenario {
     /// The same under a draft: the switch's wake journaled, nothing typed while the draft stands,
     /// land@v1 within 5 s of its clearing ([`switch::judge_draft`]).
     SwitchSeq,
+    /// A person's command (`/help`) left at rest past their grace: nothing sent and the hold
+    /// journalled once; cleared, the loop goes on past the grace from the clearing
+    /// ([`switch::judge_command`], v6 §14.17.5.8).
+    CommandDraft,
     /// Land then Off within 300 ms: nothing typed ([`switch::judge_flip`]).
     SwitchFlip,
     /// A tab held under Cruise switched to Land: land@v1 once, opened by the switch's why, and
@@ -1067,6 +1125,11 @@ pub enum Scenario {
     /// plays it last ([`sysmsg::login`]'s `step`), and the tab goes on once
     /// ([`sysmsg::login::judge_signed_in`]).
     SignedIn(bool),
+    /// A question dialog under Land: the land text in its free-text row (`answer-land@v1`), no
+    /// hand-over, then landed ([`cover::judge_dialog`]).
+    L20,
+    /// The same dialog under Cruise (L20's control): its Recommended option pressed.
+    C5,
 }
 
 impl Scenario {
@@ -1080,6 +1143,8 @@ impl Scenario {
             Scenario::SignedIn(false) => "SGN",
             Scenario::SignedIn(true) => "LSGN",
             Scenario::Witnessed => "WTN",
+            Scenario::L20 => "L20",
+            Scenario::C5 => "C5",
             Scenario::W2 => "W2",
             Scenario::W4 => "W4",
             Scenario::W5 => "W5",
@@ -1140,6 +1205,7 @@ impl Scenario {
             Scenario::Angles => "ANGLES",
             Scenario::SwitchAgent => "SWA",
             Scenario::SwitchSeq => "SWS",
+            Scenario::CommandDraft => "SWC",
             Scenario::SwitchFlip => "SWF",
             Scenario::SwitchOverHeld => "SWO",
             Scenario::SwitchBusy => "SWB",
@@ -1155,6 +1221,28 @@ impl Scenario {
             Scenario::SysLand(sysmsg::Form::Login) => sysmsg::login::what_on(h, true, false),
             Scenario::SignedIn(land) => sysmsg::login::what_on(h, land, true),
             _ => self.what(),
+        }
+    }
+
+    /// [`Self::what_on`] under the lab's login `arm`: Claude Code's expired login under settings
+    /// that pin its method in its own words ([`sysmsg::login::what_forced`]).
+    #[must_use]
+    pub const fn what_under(self, h: Harness, arm: sysmsg::login::LoginArm) -> &'static str {
+        match (self, h, arm) {
+            (
+                Scenario::Sys(sysmsg::Form::Login),
+                Harness::Claude,
+                sysmsg::login::LoginArm::Forced,
+            ) => sysmsg::login::what_forced(false, false),
+            (
+                Scenario::SysLand(sysmsg::Form::Login),
+                Harness::Claude,
+                sysmsg::login::LoginArm::Forced,
+            ) => sysmsg::login::what_forced(true, false),
+            (Scenario::SignedIn(land), Harness::Claude, sysmsg::login::LoginArm::Forced) => {
+                sysmsg::login::what_forced(land, true)
+            }
+            _ => self.what_on(h),
         }
     }
 
@@ -1264,6 +1352,9 @@ impl Scenario {
             Scenario::SwitchSeq => {
                 "switched under a draft: woken, nothing typed over it, land@v1 once it clears"
             }
+            Scenario::CommandDraft => {
+                "a person's command left past their grace: never sent, held once; cleared, goes on"
+            }
             Scenario::SwitchFlip => "Land then Off within 300 ms: nothing typed",
             Scenario::SwitchOverHeld => {
                 "a tab held under Cruise switched to Land: Land asks once, held again at the same \
@@ -1272,6 +1363,10 @@ impl Scenario {
             Scenario::SwitchBusy => {
                 "switched 5 s into a busy turn: nothing typed mid-turn, land@v1 at its point"
             }
+            Scenario::L20 => {
+                "a question dialog under Land: the land text written, never handed over, landed"
+            }
+            Scenario::C5 => "the same dialog under Cruise: its Recommended option pressed",
         }
     }
 }
@@ -1390,12 +1485,13 @@ impl Chain {
     /// The switch's chains (`--mode switch`, [`switch`]): a running Cruise tab's word switched
     /// mid-run, and the Off control. The held chain's tab comes first, so its row stands on the
     /// Harness page's first screen, which is all a read of the page sees.
-    pub const SWITCH: [Chain; 6] = [
+    pub const SWITCH: [Chain; 7] = [
         Chain::SwitchOverHeld,
         Chain::SwitchAgent,
         Chain::SwitchSeq,
         Chain::SwitchFlip,
         Chain::SwitchBusy,
+        Chain::CommandDraft,
         Chain::Off,
     ];
 
@@ -1422,6 +1518,9 @@ impl Chain {
         Chain::SysLandDrop,
         Chain::SysLandLogin,
     ];
+    /// The question dialog's chains (`--mode dialog`): L20 under Land, C5 its Cruise control, and
+    /// the Off control.
+    pub const DIALOG: [Chain; 3] = [Chain::LandDialog, Chain::CruiseDialog, Chain::Off];
 
     /// Every chain of every mode, each once: what `--chains` may name.
     #[must_use]
@@ -1447,6 +1546,7 @@ impl Chain {
             .chain(Chain::OUTAGE_CRUISE)
             .chain(Chain::SYSMSG)
             .chain([Chain::SysWitnessMate])
+            .chain(Chain::DIALOG)
         {
             if !v.contains(&c) {
                 v.push(c);
@@ -1477,6 +1577,7 @@ impl Chain {
             Mode::OutageLand => Chain::OUTAGE_LAND.to_vec(),
             Mode::OutageCruise => Chain::OUTAGE_CRUISE.to_vec(),
             Mode::Sysmsg => Chain::SYSMSG.to_vec(),
+            Mode::Dialog => Chain::DIALOG.to_vec(),
             Mode::Land | Mode::Cruise | Mode::Both => Chain::ALL
                 .into_iter()
                 .filter(|c| match c.autopilot() {
@@ -1504,6 +1605,7 @@ impl Chain {
                 Chain::NarrowTapWall => wall_out_of_reach(h, Mode::WallTapNarrow).is_none(),
                 Chain::LandOutage => wall_out_of_reach(h, Mode::OutageLand).is_none(),
                 Chain::CruiseOutage => wall_out_of_reach(h, Mode::OutageCruise).is_none(),
+                Chain::LandDialog | Chain::CruiseDialog => dialog_out_of_reach(h).is_none(),
                 c => sysmsg::Form::of(*c).is_none_or(|f| f.out_of_reach(h).is_none()),
             })
             .collect()
@@ -1724,6 +1826,7 @@ impl Chain {
             Chain::CruiseAngles => "cruise-angles",
             Chain::SwitchAgent => "switch-agent",
             Chain::SwitchSeq => "switch-seq",
+            Chain::CommandDraft => "command-draft",
             Chain::SwitchFlip => "switch-flip",
             Chain::SwitchOverHeld => "switch-over-held",
             Chain::SwitchBusy => "switch-busy",
@@ -1741,6 +1844,8 @@ impl Chain {
             Chain::SysLandRate => "sys-land-rate",
             Chain::SysLandDrop => "sys-land-drop",
             Chain::SysLandLogin => "sys-land-login",
+            Chain::LandDialog => "land-dialog",
+            Chain::CruiseDialog => "cruise-dialog",
         }
     }
 
@@ -1769,6 +1874,7 @@ impl Chain {
             | Chain::CruiseAngles
             | Chain::SwitchAgent
             | Chain::SwitchSeq
+            | Chain::CommandDraft
             | Chain::SwitchFlip
             | Chain::SwitchOverHeld
             | Chain::SwitchBusy
@@ -1779,7 +1885,8 @@ impl Chain {
             | Chain::SysDrop
             | Chain::SysWitness
             | Chain::SysWitnessMate
-            | Chain::SysLogin => "cruise",
+            | Chain::SysLogin
+            | Chain::CruiseDialog => "cruise",
             Chain::Off | Chain::Mgr => "off",
             _ => "land",
         }
@@ -1840,6 +1947,7 @@ impl Chain {
             Chain::CruiseAngles => &[Scenario::Angles],
             Chain::SwitchAgent => &[Scenario::SwitchAgent],
             Chain::SwitchSeq => &[Scenario::SwitchSeq],
+            Chain::CommandDraft => &[Scenario::CommandDraft],
             Chain::SwitchFlip => &[Scenario::SwitchFlip],
             Chain::SwitchOverHeld => &[Scenario::SwitchOverHeld],
             Chain::SwitchBusy => &[Scenario::SwitchBusy],
@@ -1863,6 +1971,8 @@ impl Chain {
                 Scenario::SysLand(sysmsg::Form::Login),
                 Scenario::SignedIn(true),
             ],
+            Chain::LandDialog => &[Scenario::L20],
+            Chain::CruiseDialog => &[Scenario::C5],
         }
     }
 
@@ -1916,6 +2026,7 @@ impl Chain {
                 | Chain::TapWall
                 | Chain::NarrowTapWall
                 | Chain::LandOutage
+                | Chain::LandDialog
         )
     }
 
@@ -2101,6 +2212,11 @@ impl Chain {
             if let Some(gate) = self.need_gate() {
                 r.set("gate", J::s(gate.as_str()));
             }
+            r
+        };
+        let asking = |text: &str| {
+            let mut r = rule("", text);
+            r.set("tool", dialog_call());
             r
         };
         match self {
@@ -2351,12 +2467,14 @@ impl Chain {
                 .map(|(key, reply)| long(key, reply))
                 .chain([long("", angles::FIRST)])
                 .collect(),
-            Chain::SwitchAgent | Chain::SwitchSeq | Chain::SwitchFlip => vec![
-                rule(NUDGE_KEY, CLEAN),
-                rule(LAND_KEY, CLEAN),
-                rule(CHECK_KEY, CLEAN),
-                rule("", DONE_CLAIM),
-            ],
+            Chain::SwitchAgent | Chain::SwitchSeq | Chain::SwitchFlip | Chain::CommandDraft => {
+                vec![
+                    rule(NUDGE_KEY, CLEAN),
+                    rule(LAND_KEY, CLEAN),
+                    rule(CHECK_KEY, CLEAN),
+                    rule("", DONE_CLAIM),
+                ]
+            }
             // The same reply to every act, Land's one ask at the switch included, which the
             // stand-in takes its time over so its ask is read standing.
             Chain::SwitchOverHeld => {
@@ -2369,6 +2487,17 @@ impl Chain {
                 rule(LAND_KEY, CLEAN),
                 rule(MARK, CLEAN),
                 long("", WORK),
+            ],
+            Chain::LandDialog => vec![
+                landed(),
+                rule(NUDGE_KEY, CLEAN),
+                rule(LAND_KEY, CLEAN),
+                asking(WORK),
+            ],
+            Chain::CruiseDialog => vec![
+                rule(CHECK_KEY, CLEAN),
+                rule(CONTINUE_KEY, DONE_CLAIM),
+                asking(WORK),
             ],
         }
     }
@@ -2690,6 +2819,9 @@ pub struct Cover {
     /// F3: how many of the conversation's requests carried a tool's result back (the stub's
     /// dumps), read once its watch is over.
     pub tool_results: Option<usize>,
+    /// L20, C5: the tool results the conversation carried back (the dialog's answer among them),
+    /// read from the stub's dumps once its watch is over ([`dialog_answers_of`]).
+    pub dialog_answers: Option<Vec<String>>,
     /// F3: the screen's last rows read once the first point after the prompt was journaled, and
     /// when.
     pub first_screen: Option<(i64, Vec<String>)>,
@@ -3236,6 +3368,8 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::SysLand(f) => sysmsg::judge(seen, f, true, program, t0),
             Scenario::SignedIn(land) => sysmsg::login::judge_signed_in(seen, land, program, t0),
             Scenario::Witnessed => sysmsg::judge_witnessed(seen, program, t0),
+            Scenario::L20 => cover::judge_dialog(seen, true, t0),
+            Scenario::C5 => cover::judge_dialog(seen, false, t0),
             Scenario::F18 => cover::judge_person_instant(seen, t0),
             Scenario::Rewrap => cover::judge_rewrap(seen, t0),
             Scenario::Scrolled => cover::judge_scrolled(seen, t0),
@@ -3246,6 +3380,7 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::Angles => angles::judge(seen, t0),
             Scenario::SwitchAgent => switch::judge_at_rest(seen, t0),
             Scenario::SwitchSeq => switch::judge_draft(seen, t0),
+            Scenario::CommandDraft => switch::judge_command(seen, t0),
             Scenario::SwitchFlip => switch::judge_flip(seen, t0),
             Scenario::SwitchOverHeld => switch::judge_over_held(seen, t0),
             Scenario::SwitchBusy => switch::judge_busy(seen, t0),
@@ -3943,6 +4078,37 @@ fn check_text_faults(text: &str, hint: Option<&str>) -> Vec<String> {
         _ => {}
     }
     bad
+}
+
+/// A clean defense's landing (L20's, whose script raises no need): Land's instruction typed, one
+/// land check after its yield, `LANDED` landing the task (`DONE … rule=land@v1`, `status
+/// task=landed`), and nothing typed after it ([`landing_quiet`]).
+fn judge_clean_landing(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
+    let Some((t1, _)) = land else {
+        return Verdict::Unobserved("no land instruction was typed".into());
+    };
+    let check = match the_check(seen, *t1, t0) {
+        Ok(c) => c,
+        Err(v) => return v,
+    };
+    let t2 = check.0;
+    let Some(done) = seen.first_after("DONE ", t2) else {
+        return Verdict::Fail(format!(
+            "no DONE within {} after the land check's LANDED",
+            at(t0, seen.end_ms)
+        ));
+    };
+    let (mut bad, said, _) = landing_quiet(seen, done, false, t0);
+    let checks = checks_after(seen, *t1).len();
+    if checks != 1 {
+        bad.push(format!("{checks} land checks typed, not one"));
+    }
+    let said = format!("land-check@v1 typed at +{}; {said}", at(t0, t2));
+    if bad.is_empty() {
+        Verdict::Pass(said)
+    } else {
+        Verdict::Fail(format!("{said}: {}", bad.join("; ")))
+    }
 }
 
 /// L5 (land-a): the defense at the land act's yield gets one land check at that point (no
@@ -5672,7 +5838,7 @@ pub fn lay_repo_at(
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     std::fs::create_dir_all(bare).map_err(|e| format!("{}: {e}", bare.display()))?;
     let put = |name: &str, text: &str| {
-        std::fs::write(dir.join(name), text).map_err(|e| format!("{name}: {e}"))
+        crate::util::write_fresh(&dir.join(name), text).map_err(|e| format!("{name}: {e}"))
     };
     let g = |args: &[&str]| git(&home, dir, args);
     if repo == Repo::Plain {
@@ -6916,6 +7082,24 @@ fn first_screen_step(door: &Door<'_>, tab: &mut Tab) {
     tab.seen.cover.first_screen = Some((t, rows));
 }
 
+/// L20 and C5: the tool results the conversation's requests carried back (the stub's dumps), each
+/// once, in order.
+fn dialog_answers_of(run: &Run, token: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for body in crate::stub::turn_dumps(&run.w.join("dump"))
+        .into_iter()
+        .filter_map(|(_, p)| std::fs::read(p).ok())
+        .filter(|body| String::from_utf8_lossy(body).contains(token))
+    {
+        for r in crate::stub::message_results(&body) {
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
 fn tool_results_of(run: &Run, token: &str) -> usize {
     crate::stub::turn_dumps(&run.w.join("dump"))
         .into_iter()
@@ -8153,7 +8337,7 @@ fn open_need_gate(run: &Run, tab: &mut Tab, window: bool) {
         return;
     }
     let path = crate::stub::gate_path(&run.w.join("modes"), &gate);
-    match std::fs::write(&path, b"") {
+    match crate::util::write_fresh(&path, b"") {
         Ok(()) => {
             tab.gate_opened = true;
             println!(
@@ -8209,9 +8393,9 @@ fn land_contradicted_work(run: &Run, tab: &mut Tab) {
     .iter()
     .try_for_each(|args| git(&home, &tab.dir, args));
     let path = crate::stub::gate_path(&run.w.join("modes"), &gate);
-    let said = match landed
-        .and_then(|()| std::fs::write(&path, b"").map_err(|e| format!("{}: {e}", path.display())))
-    {
+    let said = match landed.and_then(|()| {
+        crate::util::write_fresh(&path, b"").map_err(|e| format!("{}: {e}", path.display()))
+    }) {
         Ok(()) => {
             let now = now_ms();
             tab.seen.landed_ms = Some(now);
@@ -8295,7 +8479,12 @@ fn finished(tab: &Tab, now: i64) -> bool {
         | Chain::RelaunchWall
         | Chain::TapWall
         | Chain::NarrowTapWall
-        | Chain::LandOutage => false,
+        | Chain::LandOutage
+        | Chain::LandDialog => false,
+        Chain::CruiseDialog => {
+            s.all_acts().first().is_some_and(|(t, _)| now - t >= 30_000)
+                || (s.all_acts().is_empty() && now - tab.t0 > 330_000)
+        }
         // land-contradicted lands (above); a build that holds it instead (main before 4c, whose
         // nudge its script answers with the defense again) is watched past its hold.
         Chain::LandContradicted => {
@@ -8479,6 +8668,7 @@ fn finished(tab: &Tab, now: i64) -> bool {
         Chain::CruiseAngles => angles::watched(s, now, tab.t0),
         Chain::SwitchAgent
         | Chain::SwitchSeq
+        | Chain::CommandDraft
         | Chain::SwitchFlip
         | Chain::SwitchOverHeld
         | Chain::SwitchBusy => switch::watched(tab.chain, s, now),
@@ -8499,7 +8689,13 @@ fn run_check(
     tag: &str,
     h: Harness,
     chains: &[Chain],
-    (surfaces_on, window, tapped, token_login, ready_gate): (bool, bool, bool, bool, bool),
+    (surfaces_on, window, tapped, login, ready_gate): (
+        bool,
+        bool,
+        bool,
+        sysmsg::login::LoginArm,
+        bool,
+    ),
 ) -> Result<Vec<(Scenario, Verdict)>, Fail> {
     let mut run = Run::load(tag)?;
     let (bin, ver) = h.bin_ver(&run);
@@ -8537,7 +8733,7 @@ fn run_check(
     // An expired login's chain launches Claude Code on a claude.ai login of the lab's, so the
     // stub's 401 is that login's ([`sysmsg::login`]): a stored one, the stub its only route
     // ([`sysmsg::login::stored_arm`]), or with `--token-login` the environment's token.
-    let stored = sysmsg::login::stored_arm(h, chains, token_login);
+    let stored = sysmsg::login::stored_arm(h, chains, login);
     let walled = chains.iter().any(|c| c.walled() || (c.login() && !stored));
     let tap_wall = chains.iter().any(|c| c.tapped());
     let extra = if tap_wall && tapped {
@@ -8548,6 +8744,13 @@ fn run_check(
         (Vec::new(), Vec::new())
     };
     let launch = launcher_with(&run, h, &dirs, (walled, stored), extra)?;
+    if stored && login == sysmsg::login::LoginArm::Forced {
+        sysmsg::login::lay_pin(&run)?;
+        println!(
+            "  login     the lab's settings pin the sign-in method (forceLoginMethod {}): /login draws no picker and opens the browser on its Enter",
+            sysmsg::login::PINNED_METHOD
+        );
+    }
     if tap_wall {
         crate::verbs::write_headers(
             &run.w,
@@ -9046,6 +9249,15 @@ fn run_check(
                     );
                     tab.seen.cover.typed = typed;
                 }
+                if matches!(tab.chain, Chain::LandDialog | Chain::CruiseDialog) {
+                    let answers = dialog_answers_of(&run, &tab.chain.token());
+                    println!(
+                        "  [{}] stub    the dialog's answer came back in {} tool result(s)",
+                        tab.chain.name(),
+                        answers.len()
+                    );
+                    tab.seen.cover.dialog_answers = Some(answers);
+                }
                 if switch::switches(tab.chain) {
                     let woke = switch::woke_witness(&run, &tab.sid);
                     println!(
@@ -9158,7 +9370,13 @@ fn run_lab(
     mode: Mode,
     chains: &[Chain],
     keep: bool,
-    (surfaces_on, window, tapped, token_login, ready_gate): (bool, bool, bool, bool, bool),
+    (surfaces_on, window, tapped, login, ready_gate): (
+        bool,
+        bool,
+        bool,
+        sysmsg::login::LoginArm,
+        bool,
+    ),
 ) -> Result<Vec<(Scenario, Verdict)>, Fail> {
     if is_run(tag) {
         return Err(Fail::usage(format!(
@@ -9176,7 +9394,7 @@ fn run_lab(
     }
     // A stored login's process is the default route's only where the instance admits the stub's
     // base URL ([`sysmsg::login::stored_arm`]).
-    u.route_seam |= sysmsg::login::stored_arm(h, chains, token_login);
+    u.route_seam |= sysmsg::login::stored_arm(h, chains, login);
     if let Some(w) = mode.walled()
         && let Some(why) = wall_out_of_reach(h, mode)
     {
@@ -9207,7 +9425,7 @@ fn run_lab(
         tag,
         h,
         chains,
-        (surfaces_on, window, tapped, token_login, ready_gate),
+        (surfaces_on, window, tapped, login, ready_gate),
     );
     if keep {
         println!("forever: lab '{tag}' left up ({LAB} down {tag})");
@@ -9264,8 +9482,9 @@ struct Asked {
     untapped: bool,
     /// `--token-login`: Claude Code's expired-login chains on the environment's OAuth token
     /// (`claude --subscriber`), where nothing names the login's method, not on a stored login
-    /// ([`sysmsg::login::stored_arm`]).
-    token_login: bool,
+    /// ([`sysmsg::login::stored_arm`]); `--forced-login`: on the stored login under settings that
+    /// pin its method ([`sysmsg::login::lay_pin`]).
+    login: sysmsg::login::LoginArm,
     /// `--no-ready-gate`: every tab launched at once and prompted with no look that its program
     /// has finished starting, as the lab ran before slice at1, so Land writes behind input the
     /// program has not read and the held-text path (its `NOTE`, the late draw) is exercised.
@@ -9310,6 +9529,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
     let mut window = false;
     let mut untapped = false;
     let mut token_login = false;
+    let mut forced_login = false;
     let mut ungated = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -9328,7 +9548,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
                 let w = it.next().map(String::as_str);
                 mode = w.and_then(Mode::of).ok_or_else(|| {
                     usage(&format!(
-                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-redraw, wall-switch, wall-unread, wall-cruise, wall-relaunch, wall-tap, wall-tap-narrow, resid, ladder, angles, switch, outage-land, outage-cruise or sysmsg, not {w:?}"
+                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-redraw, wall-switch, wall-unread, wall-cruise, wall-relaunch, wall-tap, wall-tap-narrow, resid, ladder, angles, switch, outage-land, outage-cruise, sysmsg or dialog, not {w:?}"
                     ))
                 })?;
             }
@@ -9364,6 +9584,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
             "--window" => window = true,
             "--untapped" => untapped = true,
             "--token-login" => token_login = true,
+            "--forced-login" => forced_login = true,
             "--no-ready-gate" => ungated = true,
             "-h" | "--help" => return Ok(None),
             s if s.starts_with('-') => return Err(usage(&format!("unknown option '{s}'"))),
@@ -9380,12 +9601,21 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
         surfaces,
         window,
         untapped,
-        token_login,
+        login: match (token_login, forced_login) {
+            (true, true) => {
+                return Err(usage(
+                    "--token-login and --forced-login are two ways in: name one",
+                ));
+            }
+            (true, false) => sysmsg::login::LoginArm::Token,
+            (false, true) => sysmsg::login::LoginArm::Forced,
+            (false, false) => sysmsg::login::LoginArm::Stored,
+        },
         ungated,
     };
-    if asked.token_login && asked.mode != Mode::Sysmsg {
+    if asked.login != sysmsg::login::LoginArm::Stored && asked.mode != Mode::Sysmsg {
         return Err(usage(
-            "--token-login runs the expired login's chains on the environment's token: it takes --mode sysmsg",
+            "--token-login and --forced-login run the expired login's chains: they take --mode sysmsg",
         ));
     }
     if asked.untapped && !matches!(asked.mode, Mode::WallTap | Mode::WallTapNarrow) {
@@ -9414,7 +9644,8 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
 /// [--window] [--untapped] [--token-login] [--no-ready-gate] [tag] [--keep]`, `MODE` one of `land`, `cruise`, `both`, `cover`,
 /// `cap`, `wall`, `wall-hid`, `wall-redraw`, `wall-switch`, `wall-unread`, `wall-cruise`,
 /// `wall-relaunch`, `wall-tap`, `wall-tap-narrow`, `resid`, `ladder`, `angles`, `switch`, `outage-land`,
-/// `outage-cruise` or `sysmsg` (each form's chain on a lab of its own, tagged `<tag>-<form>`).
+/// `outage-cruise`, `sysmsg` (each form's chain on a lab of its own, tagged `<tag>-<form>`) or
+/// `dialog`.
 pub fn cmd_forever(args: &[String]) -> Res {
     let Some(a) = parse_args(args)? else {
         print!("{}", crate::USAGE);
@@ -9523,7 +9754,7 @@ pub fn cmd_forever(args: &[String]) -> Res {
                     a.mode,
                     on_lab,
                     a.keep,
-                    (a.surfaces, a.window, !a.untapped, a.token_login, !a.ungated),
+                    (a.surfaces, a.window, !a.untapped, a.login, !a.ungated),
                 ) {
                     Ok(v) => lines.extend(v.into_iter().map(|(s, v)| (h, s, v))),
                     Err(f) if f.code == 3 => {
@@ -9541,7 +9772,7 @@ pub fn cmd_forever(args: &[String]) -> Res {
             a.mode,
             &chains,
             a.keep,
-            (a.surfaces, a.window, !a.untapped, a.token_login, !a.ungated),
+            (a.surfaces, a.window, !a.untapped, a.login, !a.ungated),
         ) {
             Ok(v) => lines.extend(v.into_iter().map(|(s, v)| (h, s, v))),
             Err(f) if f.code == 3 => {
@@ -9558,7 +9789,7 @@ pub fn cmd_forever(args: &[String]) -> Res {
             h.name(),
             s.id(),
             v.word(),
-            s.what_on(*h)
+            s.what_under(*h, a.login)
         );
     }
     let all_pass = lines.iter().all(|(_, _, v)| matches!(v, Verdict::Pass(_)));

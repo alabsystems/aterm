@@ -58,14 +58,23 @@ pub(super) fn check_reservation(path: &Path, version: &str) -> Result<()> {
 }
 
 pub(super) fn check_managed_manifest(path: &Path, program: &str, build: u64) -> Result<()> {
+    let bytes = read_manifest(path)?;
+    check_managed_manifest_bytes(path, &bytes, program, build)
+}
+
+pub(super) fn check_managed_manifest_bytes(
+    path: &Path,
+    bytes: &[u8],
+    program: &str,
+    build: u64,
+) -> Result<()> {
     let expected = crate::artifact::pkgdoc::manifest_name(program, build);
     if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
         return Err(Error::refused(
             "the supplied manifest name differs from the managed release tag",
         ));
     }
-    let bytes = read_manifest(path)?;
-    let document: aterm_toml::Value = std::str::from_utf8(&bytes)
+    let document: aterm_toml::Value = std::str::from_utf8(bytes)
         .ok()
         .and_then(|text| text.parse().ok())
         .ok_or_else(|| Error::refused("the supplied managed pack manifest is not readable TOML"))?;
@@ -88,6 +97,8 @@ pub(super) fn check_managed_manifest(path: &Path, program: &str, build: u64) -> 
 pub(super) struct Prepared {
     _scratch: aterm_tempfile::TempDir,
     pub(super) manifest: PathBuf,
+    pub(super) manifest_bytes: Vec<u8>,
+    pub(super) version: String,
     pub(super) reservation: PathBuf,
     pub(super) files: Vec<PathBuf>,
     record: Vec<u8>,
@@ -129,7 +140,7 @@ impl Prepared {
                 ));
             }
             if file.file_name() == Some(name) {
-                if read_manifest(file)? != bytes {
+                if file != manifest && read_manifest(file)? != bytes {
                     return Err(Error::refused(
                         "the uploaded manifest differs from the version being reserved",
                     ));
@@ -144,17 +155,30 @@ impl Prepared {
                 "the uploaded files do not contain the exact pack manifest",
             ));
         }
-        std::fs::write(&copied, bytes)
-            .map_err(|error| Error::io("copy the admitted manifest", &error))?;
+        let write_scratch = |path: &Path, data: &[u8], what: &str| -> Result<()> {
+            use std::io::Write as _;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            }
+            opts.open(path)
+                .and_then(|mut f| f.write_all(data))
+                .map_err(|error| Error::io(what, &error))
+        };
+        write_scratch(&copied, &bytes, "copy the admitted manifest")?;
         let mut record = MAGIC.to_vec();
         record.extend_from_slice(&(version.len() as u32).to_le_bytes());
         record.extend_from_slice(version.as_bytes());
-        std::fs::write(&reservation, &record)
-            .map_err(|error| Error::io("write version reservation", &error))?;
+        write_scratch(&reservation, &record, "write version reservation")?;
         ordered.push(copied.clone());
         Ok(Self {
             _scratch: scratch,
             manifest: copied,
+            manifest_bytes: bytes,
+            version,
             reservation,
             files: ordered,
             record,

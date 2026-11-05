@@ -17,9 +17,14 @@ use aterm_json::{Value, json};
 use std::{collections::BTreeMap, fs::OpenOptions, io::Read, path::Path};
 
 const MAX_CSV: usize = 1024 * 1024;
-const MAX_ROWS: usize = 4096;
-const MAX_COLUMNS: usize = 64;
-const MAX_CELL: usize = 8192;
+/// The most records a sheet holds, its header included.
+pub(crate) const MAX_ROWS: usize = 4096;
+/// The most columns a sheet's record holds.
+pub(crate) const MAX_COLUMNS: usize = 64;
+/// The most bytes one cell holds.
+pub(crate) const MAX_CELL: usize = 8192;
+/// The largest xlsx workbook a sheet is read from: its other tabs and styles come with it.
+pub(crate) const MAX_WORKBOOK: usize = 32 * 1024 * 1024;
 /// The sheet's provider columns and the one provider word each names, shared with the typed
 /// lab model (`typed::keys::PROVIDERS`).
 const PROVIDERS: &[(&str, &str)] = &[
@@ -59,12 +64,12 @@ impl Csv {
         Ok(column)
     }
 }
-/// `O_NONBLOCK`, which differs: 0o4000 on Linux, 0x0004 on Darwin and the BSDs.
+/// `O_NONBLOCK | O_CLOEXEC`: 0o4000 | 0o2_000_000 on Linux, 0x0004 | 0x0100_0000 on Darwin/BSDs.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const O_NONBLOCK: i32 = 0o4000;
-/// `O_NONBLOCK`, which differs: 0o4000 on Linux, 0x0004 on Darwin and the BSDs.
+const O_NONBLOCK_CLOEXEC: i32 = 0o4000 | 0o2_000_000;
+/// `O_NONBLOCK | O_CLOEXEC`: 0o4000 | 0o2_000_000 on Linux, 0x0004 | 0x0100_0000 on Darwin/BSDs.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-const O_NONBLOCK: i32 = 0x0004;
+const O_NONBLOCK_CLOEXEC: i32 = 0x0004 | 0x0100_0000;
 
 /// Read a CSV file's bytes within the import's capacity: a regular file only, opened without
 /// blocking on a FIFO, at most 1 MiB.
@@ -72,22 +77,30 @@ const O_NONBLOCK: i32 = 0x0004;
 /// # Errors
 /// It cannot be opened, is not a regular file, or is larger than the import reads.
 pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>> {
+    read_within(path, MAX_CSV)
+}
+
+/// [`read_bounded`] with `max` bytes the most read: an xlsx workbook ([`MAX_WORKBOOK`]).
+///
+/// # Errors
+/// It cannot be opened, is not a regular file, or is larger than `max`.
+pub(crate) fn read_within(path: &Path, max: usize) -> Result<Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(O_NONBLOCK)
+        .custom_flags(O_NONBLOCK_CLOEXEC)
         .open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
-        return Err(Error::new("CSV path is not a regular file"));
+        return Err(Error::new("a sheet's path is not a regular file"));
     }
-    if meta.len() > MAX_CSV as u64 {
-        return Err(Error::new("CSV exceeds import capacity"));
+    if meta.len() > max as u64 {
+        return Err(Error::new("a sheet exceeds import capacity"));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
-    file.take((MAX_CSV + 1) as u64).read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_CSV {
-        return Err(Error::new("CSV exceeds import capacity"));
+    file.take((max + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > max {
+        return Err(Error::new("a sheet exceeds import capacity"));
     }
     Ok(bytes)
 }

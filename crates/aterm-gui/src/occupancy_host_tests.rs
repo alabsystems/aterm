@@ -492,6 +492,7 @@ fn a_slot_holder_counts_for_the_tab_whose_tree_holds_it() {
         label: String::new(),
         program: String::new(),
         tab_id: None,
+        agent_leader: None,
     };
     let tabs = [tab(7, 200), tab(9, 300)];
     let read = |pids: &[u32]| SlotsRead::Read {

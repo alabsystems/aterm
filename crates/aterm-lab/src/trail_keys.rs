@@ -712,7 +712,7 @@ fn queued_insert(run: &Run, p: &Probe<'_>, append: bool) -> Result<bool, Fail> {
 
 fn retain_frame(run: &Run, p: &Probe<'_>, name: &str) -> Result<(), Fail> {
     p.must(&["image", name])?;
-    std::fs::copy(
+    crate::util::copy_regular_file(
         std::path::Path::new(&run.sockdir).join("images").join(name),
         run.run.join(name),
     )

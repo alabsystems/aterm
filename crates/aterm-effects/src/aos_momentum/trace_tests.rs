@@ -427,3 +427,36 @@ fn a_full_window_of_light_page_4095_quad_frames_checks_and_judges() {
         } if cursor == seg_cursor
     ));
 }
+
+#[test]
+fn an_export_with_unseen_keys_checks_cleanly_and_says_how_many() {
+    let t0 = Instant::now();
+    for unseen in [true, false] {
+        let mut host = attached(t0, MomentumCode::Shipped);
+        host.on_key(t0 + ms(5), super::test_fixtures::TAU);
+        host.aos_hold(t0 + ms(1_010));
+        if unseen {
+            host.aos_release_unseen(t0 + ms(40), 3, super::test_fixtures::TAU);
+        } else {
+            host.aos_release(t0 + ms(40), 3, super::test_fixtures::TAU, None);
+        }
+        let trace = host.aos_trace().expect("attached");
+        let live = hosted(&host).state().unseen();
+        let r = trace
+            .check(t0 + ms(3_600_000), BUILD)
+            .expect("the trace checks")
+            .replay;
+        assert_eq!(r.state_digest, trace.head_state, "unseen={unseen}");
+        assert_eq!(r.unseen, live, "unseen={unseen}: the replayed head's count");
+        assert_eq!(
+            (r.counts.keys, r.counts.unseen),
+            (4, if unseen { 3 } else { 0 }),
+            "unseen={unseen}: every key counted, the unseen ones among them"
+        );
+        assert_eq!(
+            r.unseen,
+            if unseen { 3 } else { 0 },
+            "unseen={unseen} (negative control: a proven release counts none)"
+        );
+    }
+}

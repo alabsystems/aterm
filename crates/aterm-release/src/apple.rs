@@ -537,9 +537,11 @@ fn has_terminal() -> bool {
     if cfg!(test) {
         return false;
     }
+    use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(aterm_uds::atomic_file::TTY_PROBE_OPEN_FLAGS)
         .open("/dev/tty")
         .is_ok_and(|f| std::io::IsTerminal::is_terminal(&f))
 }
@@ -820,9 +822,11 @@ fn waiting_text(
 
 /// Ask a question on the controlling terminal and read one whole line back.
 fn tty_line(prompt: &str, max: usize) -> Result<String, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let mut tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(aterm_uds::atomic_file::TTY_OPEN_FLAGS)
         .open("/dev/tty")
         .map_err(|e| format!("cannot open /dev/tty: {e}"))?;
     if !std::io::IsTerminal::is_terminal(&tty) {
@@ -993,7 +997,13 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
 /// A first run's RSA-2048 key and CSR, both made here; existing key material is never
 /// overwritten.
 fn generate(dir: &Path, id: &str) -> Result<PathBuf, Outcome> {
-    if let Err(e) = std::fs::create_dir_all(dir) {
+    if let Err(e) = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    } {
         return Err(Outcome::Blocked {
             what: format!("cannot create {}: {e}", dir.display()),
             fix: "check ownership of ~/.aterm".into(),
@@ -1028,7 +1038,11 @@ fn generate(dir: &Path, id: &str) -> Result<PathBuf, Outcome> {
             fix: "install the Xcode command-line tools (`xcode-select --install`)".into(),
         });
     }
-    if let Err(e) = chmod(&key, 0o600) {
+    if let Err(e) = {
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::durable::open_regular_file(&key)
+            .and_then(|f| f.set_permissions(std::fs::Permissions::from_mode(0o600)))
+    } {
         let _ = std::fs::remove_file(&key);
         return Err(Outcome::Blocked {
             what: format!("could not restrict the new private key to 0600: {e}"),
@@ -1206,7 +1220,7 @@ impl Watch {
 #[cfg(unix)]
 fn surface_csr(csr: &Path, id: &str, named: &Path) -> Option<PathBuf> {
     let visible = named.join(format!("devid-{id}.certSigningRequest"));
-    std::fs::copy(csr, &visible).ok()?;
+    crate::durable::copy_regular_fresh(csr, &visible).ok()?;
     let _ = command("/usr/bin/open").arg("-R").arg(&visible).status();
     Some(visible)
 }
@@ -1754,6 +1768,7 @@ fn temp_cert(bytes: &[u8]) -> Result<PathBuf, String> {
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
             .open(&path)
         {
             Ok(mut f) => {
@@ -1919,11 +1934,15 @@ fn write_credentials_profile_in(
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(&path)
         .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-    if let Err(e) = f
-        .write_all(body.expose())
-        .and_then(|()| crate::durable::sync_all(&f))
+    if let Err(e) = {
+        use std::os::unix::fs::PermissionsExt as _;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+    }
+    .and_then(|()| f.write_all(body.expose()))
+    .and_then(|()| crate::durable::sync_all(&f))
     {
         drop(f);
         let _ = std::fs::remove_file(&path);
@@ -1933,8 +1952,7 @@ fn write_credentials_profile_in(
 }
 
 fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    atpkg::platform::set_mode(path, mode)
 }
 
 /// A local helper may wait for keychain access; unattended provisioning must still finish.

@@ -199,14 +199,31 @@ fn read(path: &Path) -> Result<Option<Record>, String> {
     }
 }
 
+fn write_new_temp(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let _ = std::fs::remove_file(tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut f = opts.open(tmp)?;
+    f.write_all(bytes)
+}
+
 /// Write `r` to `path` whole: a temporary file renamed over it.
 fn write(path: &Path, r: &Record) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
     }
     let tmp = path.with_extension("new");
-    std::fs::write(&tmp, r.render())
+    write_new_temp(&tmp, r.render().as_bytes())
         .and_then(|()| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
         .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
@@ -218,7 +235,8 @@ fn create(path: &Path, r: &Record) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
     }
     let tmp = path.with_extension(format!("new.{}", std::process::id()));
-    std::fs::write(&tmp, r.render()).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    write_new_temp(&tmp, r.render().as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     let linked = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     match linked {

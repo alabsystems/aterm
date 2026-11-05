@@ -1568,6 +1568,7 @@ fn reclaim_removes_only_what_nobody_builds_into() {
     let mut want = vec![
         emptied_leaf.clone(),
         gone_leaf.clone(),
+        fresh_leaf.clone(),
         leftover.clone(),
         beside.clone(),
     ];
@@ -1579,7 +1580,6 @@ fn reclaim_removes_only_what_nobody_builds_into() {
     for kept in [
         &live_leaf,
         &native_leaf,
-        &fresh_leaf,
         &away_leaf,
         &private_leaf,
         &volume_leaf,
@@ -1603,14 +1603,7 @@ fn reclaim_removes_only_what_nobody_builds_into() {
 
     let mut removed = reclaim(&root, home, SystemTime::now() + 29 * DAY);
     removed.sort();
-    let mut want = vec![
-        live_leaf,
-        native_leaf,
-        fresh_leaf,
-        away_leaf,
-        private_leaf,
-        volume_leaf,
-    ];
+    let mut want = vec![live_leaf, native_leaf, away_leaf, private_leaf, volume_leaf];
     want.sort();
     assert_eq!(removed, want);
     assert!(planted.is_dir());
@@ -1620,6 +1613,75 @@ fn reclaim_removes_only_what_nobody_builds_into() {
     std::os::unix::fs::symlink(&root, &linked_root).unwrap();
     assert!(reclaim(&linked_root, home, SystemTime::now()).is_empty());
     assert!(old.is_dir());
+}
+
+/// A REMOVED WORKSPACE'S BUILD DIRECTORY GOES AT ONCE, at the calm daily pass as below the floor:
+/// nobody builds into a removed workspace again (m20, 2026-11-05: 52.8 GiB of removed worktrees'
+/// caches waited out a day's window while a verify's claim waited five hours). [`gone_leaves`]
+/// lists it, and only it, without reading its tree. NEGATIVE CONTROLS: a build holding its
+/// cargo lock keeps it, and a live workspace's build directory written a minute ago stays.
+#[cfg(unix)]
+#[test]
+fn a_removed_workspaces_build_directory_goes_at_once() {
+    let f = Fixture::new("build-cache-gone-now");
+    let root = cache_root(&f.home);
+    std::fs::create_dir_all(&root).unwrap();
+    let home = Some(f.home.as_path());
+    let minute = Duration::from_secs(60);
+    let gone = lay(&root, &f.root.join("home/wt-just-removed"), minute);
+    let busy = lay(&root, &f.root.join("home/wt-removed-mid-build"), minute);
+    let lock = busy.join("debug/.cargo-lock");
+    std::fs::write(&lock, b"").unwrap();
+    age_tree(&busy, minute);
+    let live = f.dir("home/live");
+    std::fs::write(live.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let live_leaf = lay(&root, &live, minute);
+    // A checkout mid-merge: its folder stands, its `Cargo.toml` unlinked a moment.
+    let rewriting = f.dir("home/wt-rewriting");
+    let rewriting_leaf = lay(&root, &rewriting, minute);
+
+    let listed: Vec<PathBuf> = gone_leaves(&root, home).into_iter().collect();
+    let mut want = vec![gone.clone(), busy.clone()];
+    want.sort();
+    assert_eq!(listed, want, "the gone workspaces' build directories alone");
+
+    let held = crate::lock::Flock::try_lock(std::fs::File::open(&lock).unwrap()).unwrap();
+    let went = reclaim_watched(
+        &root,
+        home,
+        SystemTime::now(),
+        ReclaimAfter::CALM,
+        None,
+        &mut |_, _| true,
+    );
+    assert!(
+        matches!(went.as_slice(), [(path, Unused::Gone { idle })] if *path == gone && *idle < DAY),
+        "{went:?}"
+    );
+    assert!(!gone.exists());
+    assert!(busy.is_dir(), "a build holds its lock");
+    assert!(live_leaf.is_dir(), "its workspace stands");
+    assert!(
+        rewriting_leaf.is_dir(),
+        "a folder standing without a manifest waits the stale window"
+    );
+
+    drop(held);
+    let went = reclaim_watched(
+        &root,
+        home,
+        SystemTime::now(),
+        ReclaimAfter::CALM,
+        None,
+        &mut |_, _| true,
+    );
+    assert_eq!(
+        went.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+        vec![busy.clone()],
+        "once the build lets go"
+    );
+    assert!(live_leaf.is_dir());
+    assert!(gone_leaves(&root, home).is_empty());
 }
 
 #[cfg(unix)]
@@ -1680,8 +1742,7 @@ fn reclaim_watched_says_why_each_directory_went() {
     );
     for (path, why) in &went {
         match why {
-            Unused::Gone { idle, after } if *path == gone_leaf => {
-                assert_eq!(*after, RECLAIM_GONE_UNDER_PRESSURE);
+            Unused::Gone { idle } if *path == gone_leaf => {
                 assert!(*idle >= quarter_hour && *idle < DAY, "{idle:?}");
             }
             Unused::Idle { idle } if *path == live_leaf => {
@@ -1698,9 +1759,12 @@ fn reclaim_watched_says_why_each_directory_went() {
     assert!(live.join("Cargo.toml").is_file(), "its workspace stands");
 }
 
+/// Under pressure a removed workspace's build directory, however recently written, is asked for
+/// before it goes (a record that says no keeps it); a live workspace's, one gone with its parent
+/// folder and a linked one stay.
 #[cfg(unix)]
 #[test]
-fn under_pressure_a_removed_workspaces_cache_goes_after_ten_minutes() {
+fn under_pressure_a_removed_workspaces_cache_is_asked_for_then_goes() {
     let f = Fixture::new("build-cache-pressure");
     let root = cache_root(&f.home);
     std::fs::create_dir_all(&root).unwrap();
@@ -1722,9 +1786,6 @@ fn under_pressure_a_removed_workspaces_cache_goes_after_ten_minutes() {
     std::fs::create_dir_all(linked_leaf.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&outside, &linked_leaf).unwrap();
 
-    assert!(reclaim(&root, home, SystemTime::now()).is_empty());
-    assert!(gone_leaf.join("debug/deps/x").is_file());
-
     let mut asked = Vec::new();
     assert!(
         pressure(&root, home, &mut |p| {
@@ -1733,20 +1794,22 @@ fn under_pressure_a_removed_workspaces_cache_goes_after_ten_minutes() {
         })
         .is_empty()
     );
-    assert_eq!(asked, vec![gone_leaf.clone()]);
+    asked.sort();
+    let mut both = vec![gone_leaf.clone(), just_leaf.clone()];
+    both.sort();
+    assert_eq!(asked, both);
     assert!(gone_leaf.join("debug/deps/x").is_file(), "unrecorded, kept");
 
     let mut stood = Vec::new();
-    assert_eq!(
-        pressure(&root, home, &mut |p| {
-            stood.push(p.join("debug/deps/x").is_file());
-            true
-        }),
-        vec![gone_leaf.clone()]
-    );
-    assert_eq!(stood, vec![true]);
-    assert!(!gone_leaf.exists());
-    for kept in [&just_leaf, &live_leaf, &away_leaf] {
+    let mut went = pressure(&root, home, &mut |p| {
+        stood.push(p.join("debug/deps/x").is_file());
+        true
+    });
+    went.sort();
+    assert_eq!(went, both);
+    assert_eq!(stood, vec![true, true]);
+    assert!(!gone_leaf.exists() && !just_leaf.exists());
+    for kept in [&live_leaf, &away_leaf] {
         assert_eq!(
             std::fs::read(kept.join("debug/deps/x")).unwrap(),
             b"0123456789",
@@ -2124,7 +2187,7 @@ fn a_stuck_stage_costs_only_itself(keep: Keep) {
     std::fs::write(stage.join("debug/build/spare"), vec![b'x'; 64 * 1024]).unwrap();
     let held = stage.join("debug/deps/held");
     let kept = Kept::lay(&held, keep);
-    let gone = |why: &Unused| matches!(why, Unused::Gone { after, .. } if *after == RECLAIM_GONE_UNDER_PRESSURE);
+    let gone = |why: &Unused| matches!(why, Unused::Gone { .. });
     let planned = || {
         plan(
             &root,
@@ -3926,26 +3989,19 @@ fn beside_a_session_the_floor_decides_whether_the_shared_cache_is_swept() {
     std::fs::create_dir_all(dead.join("s-hneouhc0uf-1tn8o9j-2awpw")).unwrap();
     age_tree(&dead, Duration::from_secs(2 * 60 * 60));
     let removed = lay(&root, &f.root.join("home/removed"), 2 * DAY);
-    let heard = std::cell::Cell::new(0);
-    let working = || heard.set(heard.get() + 1);
     let pass = |below_floor, record: &mut dyn FnMut(&Path, Unused) -> bool| {
-        reclaim_beside_sessions(
-            &f.home,
-            SystemTime::now(),
-            below_floor,
-            None,
-            &working,
-            record,
-        )
+        reclaim_beside_sessions(&f.home, SystemTime::now(), below_floor, None, record)
     };
+    let ticks = aterm_uds::progress::ticks_here;
 
+    let before = ticks();
     assert_eq!(pass(false, &mut |_, _| true), Vec::new());
     assert!(dead.is_dir() && removed.is_dir());
-    assert_eq!(heard.get(), 0, "no walk, so nothing to hear");
+    assert_eq!(ticks(), before, "no walk, so nothing to hear");
     let went = pass(true, &mut |_, _| false);
     assert!(went.iter().all(|(_, why)| why.nothing_went()), "{went:?}");
     assert!(dead.is_dir() && removed.is_dir());
-    assert!(heard.get() > 0, "the walk says it is working");
+    assert!(ticks() > before, "the walk says it is working");
 
     let went = pass(true, &mut |_, _| true);
     assert!(
@@ -4008,16 +4064,16 @@ fn a_pass_takes_what_costs_nothing_first_and_stops_pruning_once_declined() {
 
 /// EACH LONG STEP OF A PASS SAYS IT IS WORKING ON ITS OWN: a walk that takes nothing, a prune that
 /// moves nothing and a removal, so none hides behind another where it alone is under way. A hung
-/// step still goes quiet. NEGATIVE CONTROL: a walk of nothing says nothing.
+/// step still goes quiet. NEGATIVE CONTROL: a walk of nothing says nothing. Each says so through
+/// [`aterm_uds::progress`], heard only by a hook on the pass's own thread.
 #[cfg(unix)]
 #[test]
 fn each_long_step_of_a_pass_says_it_is_working() {
     fn says(root: &Path, home: &Path, step: impl FnOnce(&mut Sweep<'_, '_>)) -> bool {
-        let heard = std::cell::Cell::new(false);
-        let hears = || heard.set(true);
-        let fence = fence::Fence::default().telling(&hears);
+        let fence = fence::Fence::default();
         let mut decline = |_: &Path, _| false;
         let mut intents = Intents::new(&mut decline);
+        let before = aterm_uds::progress::ticks_here();
         step(&mut Sweep {
             root,
             home: Some(home),
@@ -4032,7 +4088,7 @@ fn each_long_step_of_a_pass_says_it_is_working() {
             pruning: Vec::new(),
             declined: false,
         });
-        heard.get()
+        aterm_uds::progress::ticks_here() > before
     }
     let f = Fixture::new("build-cache-says-working");
     let root = cache_root(&f.home);
@@ -4041,6 +4097,11 @@ fn each_long_step_of_a_pass_says_it_is_working() {
         sweep.walk(&root, 0);
     };
     assert!(!says(&root, &f.home, walks));
+
+    let plain = root.join("no-build-directory-in-it");
+    std::fs::create_dir(&plain).unwrap();
+    assert!(says(&root, &f.home, walks), "a walk that judges nothing");
+    std::fs::remove_dir(&plain).unwrap();
 
     let leaf = lay(&root, &f.root.join("home/removed"), 2 * DAY);
     assert!(says(&root, &f.home, walks), "a walk the record declines");
@@ -4066,16 +4127,18 @@ fn each_long_step_of_a_pass_says_it_is_working() {
     let entry = tooling.join(".provision-reclaim-tool-1");
     std::fs::create_dir_all(&entry).unwrap();
     std::fs::write(entry.join("x"), b"x").unwrap();
-    let heard = std::cell::Cell::new(false);
-    let hears = || heard.set(true);
+    let before = aterm_uds::progress::ticks_here();
     tooling::reclaim_on(
         &tooling,
         SystemTime::now(),
         &mut |_, _| true,
-        &fence::Fence::default().telling(&hears),
+        &fence::Fence::default(),
     );
     assert!(!entry.exists());
-    assert!(heard.get(), "a tooling removal");
+    assert!(
+        aterm_uds::progress::ticks_here() > before,
+        "a tooling removal"
+    );
 }
 
 /// A KEEP PUBLISHED AS A BUILD DIRECTORY'S STALE PARTS MOVE KEEPS THEM: a live workspace's build
@@ -4246,7 +4309,9 @@ fn reclaim_reads_a_build_with_a_target_and_keeps_one_running() {
     let home = Some(f.home.as_path());
     let triple = "aarch64-apple-darwin";
     let lay_triple = |name: &str| {
-        let leaf = build_dir(&root, &f.root.join("home").join(name));
+        let workspace = f.dir(&format!("home/{name}"));
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let leaf = build_dir(&root, &workspace);
         for dir in ["debug/build", &format!("{triple}/debug/deps")] {
             std::fs::create_dir_all(leaf.join(dir)).unwrap();
         }

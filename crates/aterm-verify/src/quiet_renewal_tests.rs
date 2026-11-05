@@ -24,6 +24,73 @@ fn claim(ledger: &Ledger, need: Need, mode: Admit) -> Result<Claim, Error> {
     )
 }
 
+/// `need` admitted at once on a machine every core of which is busy.
+fn busy_claim(ledger: &Ledger, need: Need, mode: Admit) -> Result<Claim, Error> {
+    crate::admit_in(
+        ledger,
+        &crate::timing_test_machine::Measured::busy(&Fixed::new(Reading::of_gib(24, 20, 14))),
+        Pace::default(),
+        need.patience(aterm_capacity::Patience {
+            reserve: std::time::Duration::ZERO,
+            start: std::time::Duration::ZERO,
+            hold: aterm_capacity::QUIET_PATIENCE.hold,
+        }),
+        mode,
+        &mut |_| {},
+    )
+}
+
+/// A TIMED STAGE ON A MACHINE THAT STAYED BUSY THROUGH ITS PATIENCE RUNS, AND ITS TIME LINE SAYS
+/// IT RAN WITHOUT A QUALIFIED QUIET ADMISSION (owner ruling 2026-11-05: a busy machine never
+/// blocks a release). NEGATIVE CONTROL: a strict need on the same machine is refused, and the
+/// stage starts nothing.
+#[test]
+fn a_loaded_stage_admission_runs_the_stage_and_says_so() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let fresh = || {
+        Mutex::new(Quiet {
+            claim: None,
+            left: 1,
+            admit: unused_admit,
+        })
+    };
+    let ran = std::cell::Cell::new(false);
+    let ((), said) = quietly_with(
+        &context(dir.path()),
+        &fresh(),
+        "loaded",
+        || ran.set(true),
+        Claim::timing_protection,
+        |_, need, mode| busy_claim(&ledger, need, mode),
+    )
+    .unwrap();
+    assert!(ran.get());
+    let said = said.expect("the stage's time line");
+    assert!(
+        said.contains("acquired loaded timing reservation")
+            && said.contains("ran without a qualified quiet admission"),
+        "{said}"
+    );
+    let refused = quietly_with(
+        &context(dir.path()),
+        &fresh(),
+        "strict",
+        || panic!("a strict need on a busy machine starts nothing"),
+        Claim::timing_protection,
+        |_, mut need, mode| {
+            need.at_bound = aterm_capacity::AtBound::Refuse;
+            busy_claim(&ledger, need, mode)
+        },
+    );
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("started nothing")),
+        "{refused:?}"
+    );
+}
+
 fn context(dir: &std::path::Path) -> Ctx {
     Ctx::new(
         dir.to_owned(),
@@ -58,7 +125,7 @@ fn a_valid_cached_claim_is_reused_without_admission() {
         &quiet,
         "reuse",
         || assert_eq!(key(&crate::current_quiet_claim().unwrap()), id),
-        Claim::timing_admission,
+        Claim::timing_protection,
         |_, _, _| panic!("valid cache must not readmit"),
     )
     .unwrap();
@@ -81,11 +148,11 @@ fn only_expiry_replaces_a_cached_claim_and_failed_replacement_starts_nothing() {
             failure,
             || panic!("failed replacement must not start callback"),
             |c| {
-                c.timing_admission()?;
+                c.timing_protection()?;
                 if key(c) == id {
                     Err(TimingIssue::Expired)
                 } else {
-                    c.timing_admission()
+                    c.timing_protection()
                 }
             },
             |_, need, _| {
@@ -118,7 +185,7 @@ fn only_expiry_replaces_a_cached_claim_and_failed_replacement_starts_nothing() {
             &quiet,
             "unknown is not expiry",
             || panic!("unknown cache cannot qualify callback"),
-            Claim::timing_admission,
+            Claim::timing_protection,
             |_, _, _| panic!("unknown provenance must not be retried"),
         )
         .is_err()
@@ -159,7 +226,7 @@ fn concurrent_stages_replace_once_and_preserve_the_old_worker_share() {
             assert!(crate::exec::bounded(Some(std::time::Duration::ZERO), walk).is_err());
             ready.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
         },
-        Claim::timing_admission,
+        Claim::timing_protection,
         |_, _, _| panic!("valid old stage must reuse"),
     )
     .unwrap();
@@ -188,7 +255,7 @@ fn concurrent_stages_replace_once_and_preserve_the_old_worker_share() {
                             .unwrap();
                     },
                     |c| {
-                        let real = c.timing_admission()?;
+                        let real = c.timing_protection()?;
                         if key(c) == id {
                             Err(TimingIssue::Expired)
                         } else {

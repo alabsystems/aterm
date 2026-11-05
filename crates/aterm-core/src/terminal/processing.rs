@@ -122,6 +122,9 @@ impl Terminal {
         self.transient.process_now = clock.monotonic;
         self.transient.process_wall_ms = clock.wall_ms;
         let pinned_offset = self.grid.display_offset();
+        // The history the pin reads, which an erase of it in this batch voids. Every reset erases
+        // the main grid's history, the one grid a pin can sit on (the alternate screen keeps none).
+        let pinned_history = self.grid.scrollback_clear_gen();
         let lines_before = self.grid.absolute_row_counter();
         let was_alt = self.modes.alternate_screen;
         self.shell.probe_transitioned = false;
@@ -168,16 +171,17 @@ impl Terminal {
         self.reconcile_color_scheme_after_output();
 
         let parked_main_counter = self.transient.alt_park_main_row_counter.take();
+        let unerased = |grid: &crate::grid::Grid| grid.scrollback_clear_gen() == pinned_history;
         if pinned_offset > 0 {
             let entered_alt = !was_alt && self.modes.alternate_screen;
             if entered_alt {
                 let lines_added = parked_main_counter
                     .unwrap_or(lines_before)
                     .saturating_sub(lines_before);
-                if let Some(main_grid) = self.alt_grid.as_mut() {
+                if let Some(main_grid) = self.alt_grid.as_mut().filter(|grid| unerased(grid)) {
                     main_grid.repin_display_offset(pinned_offset, lines_added);
                 }
-            } else {
+            } else if unerased(&self.grid) {
                 let lines_added = self
                     .grid
                     .absolute_row_counter()
@@ -186,13 +190,17 @@ impl Terminal {
             }
         }
 
-        if let Some((restored_offset, counter_at_swap)) = self.transient.alt_restore_pin.take() {
+        if let Some((restored_offset, counter_at_swap, gen_at_swap)) =
+            self.transient.alt_restore_pin.take()
+        {
             let restored_grid = if self.modes.alternate_screen {
                 self.alt_grid.as_mut()
             } else {
                 Some(&mut self.grid)
             };
-            if let Some(grid) = restored_grid {
+            if let Some(grid) =
+                restored_grid.filter(|grid| grid.scrollback_clear_gen() == gen_at_swap)
+            {
                 let lines_added = grid.absolute_row_counter().saturating_sub(counter_at_swap);
                 grid.repin_display_offset(restored_offset, lines_added);
             }
@@ -645,6 +653,78 @@ mod tests {
                 "a RIS keeps the profiling switch"
             );
         }
+    }
+
+    /// A batch that erases the history (RIS, ED 3) returns a reader scrolled back into it to live
+    /// however the rest of the batch scrolls: a pin taken before the erase names rows that are
+    /// gone, so it is never laid on the new history, whether the reader is on the live grid, on
+    /// the main grid a smcup parked, or on one an rmcup restored before the erase. Without an
+    /// erase the reader stays pinned as the output scrolls (SCR-1).
+    /// NEGATIVE CONTROL: with the pins re-applied whatever the batch erased (as before), the first
+    /// arm leaves the offset at 2 after RIS and 7 after ED 3.
+    #[test]
+    fn an_erased_history_returns_a_pinned_reader_to_live() {
+        use crate::terminal::CustodyTransition;
+        const LINES: &[u8] = b"1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8";
+        let reading = || {
+            let mut term = TerminalBuilder::new()
+                .size(6, 20)
+                .ring_buffer_size(200)
+                .build();
+            for i in 0..10 {
+                term.process(format!("line{i}\r\n").as_bytes());
+            }
+            term.scroll_display(1);
+            assert_eq!(
+                term.grid().display_offset(),
+                1,
+                "PRECONDITION: one line back"
+            );
+            term
+        };
+        for erase in [&b"\x1bc"[..], &b"\x1b[3J"[..]] {
+            let mut term = reading();
+            term.process(&[erase, LINES].concat());
+            assert!(
+                term.grid().scrollback_lines() > 0,
+                "PRECONDITION: {erase:?}: the batch scrolled lines into the new history"
+            );
+            assert_eq!(
+                term.grid().display_offset(),
+                0,
+                "{erase:?}: the reader is back at live"
+            );
+            assert_eq!(
+                term.last_custody_transition(),
+                Some(CustodyTransition::OutputInvalidatesTheCoordinateSpace),
+                "{erase:?}"
+            );
+
+            let mut parked = reading();
+            parked.process(&[erase, LINES, b"\x1b[?1049h"].concat());
+            parked.process(b"\x1b[?1049l");
+            assert_eq!(
+                parked.grid().display_offset(),
+                0,
+                "{erase:?} then smcup: the parked main grid is at live"
+            );
+        }
+
+        let mut restored = reading();
+        restored.process(b"\x1b[?1049h");
+        restored.process(&[&b"\x1b[?1049l\x1b[3J"[..], LINES].concat());
+        assert_eq!(
+            restored.grid().display_offset(),
+            0,
+            "rmcup then ED 3: the restored reader is at live"
+        );
+
+        let mut control = reading();
+        control.process(LINES);
+        assert!(
+            control.grid().display_offset() > 1,
+            "without an erase the reader stays pinned as the output scrolls"
+        );
     }
 
     fn row_text(t: &Terminal, row: u16) -> String {

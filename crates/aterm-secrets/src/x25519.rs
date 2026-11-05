@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! X25519 (RFC 7748 §5) scalar multiplication (`crypto_scalarmult`), and the Elligator 2 map
+//! X25519 (RFC 7748 §5) scalar multiplication, and the Elligator 2 map
 //! onto curve25519 (RFC 9380 §6.7.1) that CPace's generator needs ([`elligator2`]).
+//!
+//! The field is GF(2^255 - 19) in radix 2^51: five `u64` limbs whose products are `u128`. Its
+//! product, square, carry, sum, difference and reduction to bytes follow fiat-crypto's
+//! `curve25519_64` (Erbsen, Philipoom, Gross, Sloan and Chlipala, S&P 2019), the field code ring
+//! and BoringSSL run; fiat-crypto's Coq proof covers that generated code and its limb bounds, not
+//! this Rust. Two types hold the bounds, so the compiler refuses a sum of sums and no limb or
+//! column can overflow: [`Fe`], each limb at most 2^51, and [`Loose`], each at most 3 * 2^51. The
+//! ladder is RFC 7748 §5's pseudocode, line for line, and inversion is ref10's addition chain.
+//! It replaced TweetNaCl's sixteen 16-bit limbs (Schwabe, Viguier, Weerwag and Wiedijk proved that
+//! C correct in Coq, CSF 2021), which the tests keep as an oracle that every output must match.
 //!
 //! The field arithmetic, the ladder and the map run in constant time in their secret inputs: no
 //! branch, loop bound or memory index depends on a field element or a scalar bit. Loops run over
-//! fixed limb counts and public exponents, and choices are made by masks ([`sel25519`],
-//! [`select`], [`equal`]), each behind `black_box`, so the optimizer cannot learn that a mask is
-//! all ones or zero and turn it back into a branch. [`canonical_u`], which checks a public key,
-//! is the one function that compares by value.
+//! fixed limb counts and public exponents, and choices are made by masks ([`cswap`], [`select`],
+//! [`equal`], [`Fe::to_bytes`]), each behind `black_box`, so the optimizer cannot learn that a
+//! mask is all ones or zero and turn it back into a branch. [`canonical_u`], which checks a public
+//! key, is the one function that compares by value.
 
 use zeroize::Zeroize;
 
@@ -20,22 +30,11 @@ pub const BASEPOINT: [u8; 32] = {
     point
 };
 
-type Gf = [i64; 16];
-
-const A24: Gf = [0xDB41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-
-/// curve25519's Montgomery coefficient `A` = 486662 = 0x76d06 (RFC 7748 §4.1).
-const A: Gf = [0x6D06, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-
-const ZERO: Gf = [0; 16];
-
-const ONE: Gf = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-
 /// X25519(scalar, u): the u-coordinate of the clamped scalar times the point with u-coordinate `u`.
 #[inline]
 #[must_use]
 pub fn x25519(scalar: &[u8; 32], u: &[u8; 32]) -> [u8; 32] {
-    crypto_scalarmult(scalar, u)
+    ladder(scalar, u)
 }
 
 /// X25519(scalar, 9): the public key of `scalar`.
@@ -58,168 +57,299 @@ pub(crate) fn canonical_u(point: &[u8; 32]) -> bool {
     point.iter().rev().cmp(MODULUS.iter().rev()).is_lt()
 }
 
-/// One carry pass. This and [`mul`] wrap because a release build does: the Coq proof of the C this
-/// transcribes (ePrint 2021/428) bounds every limb, so a wrap is never reached, and a checked dev
-/// build spent 78% of a ladder's instructions and half its CPU on these two functions' checks.
-/// What [`elligator2`] feeds them (unpacked bytes, `mul` outputs and at most two `add`s or `sub`s
-/// from those) stays within the same limb bound by inspection and not by the proof.
-#[inline]
-fn car25519(o: &mut Gf) {
-    for i in 0..16 {
-        let fold: i64 = if i < 15 { 1 } else { 38 };
-        let next = (i + 1) % 16;
-        o[next] = o[next].wrapping_add(fold.wrapping_mul(o[i] >> 16));
-        o[i] &= 0xffff;
+/// The low 51 bits of a limb.
+const LOW_51: u64 = (1 << 51) - 1;
+
+/// p = 2^255 - 19, limb by limb.
+const P: [u64; 5] = [LOW_51 - 18, LOW_51, LOW_51, LOW_51, LOW_51];
+
+/// An element of GF(p) as five radix-2^51 limbs (its value is the sum of limb i times
+/// 2^(51 i)), each at most 2^51: fiat-crypto's tight bounds. A product, a square, [`carry`] and
+/// [`Fe::from_bytes`] give one; [`add`], [`sub`] and [`Fe::to_bytes`] read one.
+#[derive(Clone, Copy)]
+struct Fe([u64; 5]);
+
+/// A sum or difference of two [`Fe`], each limb at most 3 * 2^51: fiat-crypto's loose bounds.
+/// Only a product, a square and [`carry`] read one, so nothing is added to it before a carry.
+#[derive(Clone, Copy)]
+struct Loose([u64; 5]);
+
+/// The limbs a product, a square or a carry reads: an [`Fe`] or a [`Loose`].
+trait Limbs {
+    fn limbs(&self) -> [u64; 5];
+}
+
+impl Limbs for Fe {
+    #[inline]
+    fn limbs(&self) -> [u64; 5] {
+        self.0
     }
 }
 
-#[inline]
-fn sel25519(p: &mut Gf, q: &mut Gf, b: i64) {
-    let c = std::hint::black_box(!(b - 1));
-    for i in 0..16 {
-        let t = c & (p[i] ^ q[i]);
-        p[i] ^= t;
-        q[i] ^= t;
+impl Limbs for Loose {
+    #[inline]
+    fn limbs(&self) -> [u64; 5] {
+        self.0
     }
 }
 
-fn pack25519(n: &Gf) -> [u8; 32] {
-    let mut t: Gf = *n;
-    let mut m: Gf = [0; 16];
-    car25519(&mut t);
-    car25519(&mut t);
-    car25519(&mut t);
-    for _ in 0..2 {
-        m[0] = t[0] - 0xffed;
-        for i in 1..15 {
-            m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1);
-            m[i - 1] &= 0xffff;
+impl Zeroize for Fe {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Zeroize for Loose {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+const ZERO: Fe = Fe([0; 5]);
+
+const ONE: Fe = Fe([1, 0, 0, 0, 0]);
+
+/// curve25519's Montgomery coefficient `A` = 486662 (RFC 7748 §4.1).
+const A: Fe = Fe([486_662, 0, 0, 0, 0]);
+
+/// RFC 7748 §5's `a24` = (486662 - 2) / 4 = 121665.
+const A24: u64 = 121_665;
+
+impl Fe {
+    /// The element a little-endian u-coordinate names, read as RFC 7748's `decodeUCoordinate`
+    /// reads 255 bits: bit 255 is dropped, and a value at or above p stays unreduced (each limb
+    /// still below 2^51), which the arithmetic takes mod p.
+    fn from_bytes(bytes: &[u8; 32]) -> Self {
+        let mut w = [0u64; 4];
+        for (word, chunk) in w.iter_mut().zip(bytes.as_chunks::<8>().0) {
+            *word = u64::from_le_bytes(*chunk);
         }
-        m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1);
-        let b = (m[15] >> 16) & 1;
-        m[14] &= 0xffff;
-        sel25519(&mut t, &mut m, 1 - b);
+        w[3] &= u64::MAX >> 1;
+        Self([
+            w[0] & LOW_51,
+            ((w[0] >> 51) | (w[1] << 13)) & LOW_51,
+            ((w[1] >> 38) | (w[2] << 26)) & LOW_51,
+            ((w[2] >> 25) | (w[3] << 39)) & LOW_51,
+            w[3] >> 12,
+        ])
     }
-    let mut o = [0u8; 32];
-    for i in 0..16 {
-        o[2 * i] = (t[i] & 0xff) as u8;
-        o[2 * i + 1] = ((t[i] >> 8) & 0xff) as u8;
-    }
-    t.zeroize();
-    m.zeroize();
-    o
-}
 
-fn unpack25519(n: &[u8; 32]) -> Gf {
-    let mut o: Gf = [0; 16];
-    for i in 0..16 {
-        o[i] = i64::from(n[2 * i]) + (i64::from(n[2 * i + 1]) << 8);
-    }
-    o[15] &= 0x7fff;
-    o
-}
-
-#[inline]
-fn add(a: &Gf, b: &Gf) -> Gf {
-    let mut o: Gf = [0; 16];
-    for i in 0..16 {
-        o[i] = a[i] + b[i];
-    }
-    o
-}
-
-#[inline]
-fn sub(a: &Gf, b: &Gf) -> Gf {
-    let mut o: Gf = [0; 16];
-    for i in 0..16 {
-        o[i] = a[i] - b[i];
-    }
-    o
-}
-
-#[inline]
-fn mul(a: &Gf, b: &Gf) -> Gf {
-    let mut t = [0i64; 31];
-    for i in 0..16 {
-        for j in 0..16 {
-            let product = a[i].wrapping_mul(b[j]);
-            t[i + j] = t[i + j].wrapping_add(product);
+    /// The canonical little-endian bytes, the value reduced below p. With every limb at most
+    /// 2^51 the value is below 2p, so it is `h` or `h - p`: fiat-crypto's `to_bytes` subtracts p
+    /// with 51-bit borrows and adds p back, chosen by a mask from the last borrow.
+    fn to_bytes(self) -> [u8; 32] {
+        let mut t = [0u64; 5];
+        let mut borrow = 0u64;
+        for i in 0..5 {
+            // At most 19 above zero, so the low 51 bits lose nothing, and bit 63 is set exactly
+            // when the difference went below zero.
+            let d = self.0[i].wrapping_sub(P[i]).wrapping_sub(borrow);
+            t[i] = d & LOW_51;
+            borrow = d >> 63;
         }
-    }
-    for i in 0..15 {
-        let fold = 38i64.wrapping_mul(t[i + 16]);
-        t[i] = t[i].wrapping_add(fold);
-    }
-    let mut o: Gf = [0; 16];
-    o.copy_from_slice(&t[..16]);
-    car25519(&mut o);
-    car25519(&mut o);
-    o
-}
-
-#[inline]
-fn sqr(a: &Gf) -> Gf {
-    mul(a, a)
-}
-
-fn inv25519(i: &Gf) -> Gf {
-    let mut c: Gf = *i;
-    for a in (0..=253).rev() {
-        c = sqr(&c);
-        if a != 2 && a != 4 {
-            c = mul(&c, i);
+        let mask = std::hint::black_box(0u64.wrapping_sub(borrow));
+        let mut carry = 0u64;
+        for i in 0..5 {
+            let s = t[i] + (P[i] & mask) + carry;
+            t[i] = s & LOW_51;
+            carry = s >> 51;
         }
+        // The carry out of limb 4 is the 2^255 the borrow took, so it is dropped.
+        let words = [
+            t[0] | (t[1] << 51),
+            (t[1] >> 13) | (t[2] << 38),
+            (t[2] >> 26) | (t[3] << 25),
+            (t[3] >> 39) | (t[4] << 12),
+        ];
+        let mut out = [0u8; 32];
+        for (chunk, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+            *chunk = word.to_le_bytes();
+        }
+        t.zeroize();
+        out
     }
-    c
+}
+
+/// `a * b` as a `u128`.
+#[inline]
+fn wide(a: u64, b: u64) -> u128 {
+    u128::from(a) * u128::from(b)
+}
+
+/// Five column sums carried into limbs along fiat-crypto's chain 0, 1, 2, 3, 4, 0, 1, 2:
+/// what passes 2^255 comes back times 19, as 2^255 = 19 (mod p). For the columns of a product
+/// of two [`Loose`] (each below 2^113, column 4 below 2^108) the carry out of limb 4 is below
+/// 2^58, so its 19-fold fits a `u64`, and every limb ends at most 2^51.
+#[inline]
+fn carry_columns(c: [u128; 5]) -> Fe {
+    let mut l = [0u64; 5];
+    let mut carry = 0u128;
+    for i in 0..5 {
+        let column = c[i] + carry;
+        l[i] = (column as u64) & LOW_51;
+        carry = column >> 51;
+    }
+    let low = l[0] + 19 * (carry as u64);
+    l[0] = low & LOW_51;
+    let next = l[1] + (low >> 51);
+    l[1] = next & LOW_51;
+    l[2] += next >> 51;
+    Fe(l)
+}
+
+/// `a * b` (fiat-crypto's `carry_mul`). A limb `i + j` at or past 5 folds into `i + j - 5` times
+/// 19, so each `b_j` that lands there is taken times 19 first (below 2^57).
+#[inline]
+fn mul(a: &impl Limbs, b: &impl Limbs) -> Fe {
+    let [a0, a1, a2, a3, a4] = a.limbs();
+    let [b0, b1, b2, b3, b4] = b.limbs();
+    let (b1_19, b2_19, b3_19, b4_19) = (19 * b1, 19 * b2, 19 * b3, 19 * b4);
+    carry_columns([
+        wide(a0, b0) + wide(a1, b4_19) + wide(a2, b3_19) + wide(a3, b2_19) + wide(a4, b1_19),
+        wide(a0, b1) + wide(a1, b0) + wide(a2, b4_19) + wide(a3, b3_19) + wide(a4, b2_19),
+        wide(a0, b2) + wide(a1, b1) + wide(a2, b0) + wide(a3, b4_19) + wide(a4, b3_19),
+        wide(a0, b3) + wide(a1, b2) + wide(a2, b1) + wide(a3, b0) + wide(a4, b4_19),
+        wide(a0, b4) + wide(a1, b3) + wide(a2, b2) + wide(a3, b1) + wide(a4, b0),
+    ])
+}
+
+/// `a * a` (fiat-crypto's `carry_square`): each cross product once, doubled.
+#[inline]
+fn sqr(a: &impl Limbs) -> Fe {
+    let [a0, a1, a2, a3, a4] = a.limbs();
+    let (a3_19, a4_19) = (19 * a3, 19 * a4);
+    let (a3_38, a4_38) = (2 * a3_19, 2 * a4_19);
+    carry_columns([
+        wide(a0, a0) + wide(a1, a4_38) + wide(a2, a3_38),
+        wide(a0, 2 * a1) + wide(a2, a4_38) + wide(a3, a3_19),
+        wide(a0, 2 * a2) + wide(a1, a1) + wide(a3, a4_38),
+        wide(a0, 2 * a3) + wide(a1, 2 * a2) + wide(a4, a4_19),
+        wide(a0, 2 * a4) + wide(a1, 2 * a3) + wide(a2, a2),
+    ])
+}
+
+/// `a24 * a` (fiat-crypto's `carry_scmul_121666`, with RFC 7748's 121665).
+#[inline]
+fn mul_a24(a: &impl Limbs) -> Fe {
+    carry_columns(a.limbs().map(|limb| wide(A24, limb)))
+}
+
+/// `a`, its limbs carried back to at most 2^51 (fiat-crypto's `carry`).
+#[inline]
+fn carry(a: &Loose) -> Fe {
+    carry_columns(a.0.map(u128::from))
+}
+
+/// `a + b` (fiat-crypto's `add`): each limb at most 2^52.
+#[inline]
+fn add(a: &Fe, b: &Fe) -> Loose {
+    let mut o = [0u64; 5];
+    for i in 0..5 {
+        o[i] = a.0[i] + b.0[i];
+    }
+    Loose(o)
+}
+
+/// `a - b` (fiat-crypto's `sub`): `2p + a - b` limb by limb, so no limb goes below zero (2p's
+/// limbs are at least 2^52 - 38, each `b_i` at most 2^51) and each stays below 3 * 2^51.
+#[inline]
+fn sub(a: &Fe, b: &Fe) -> Loose {
+    let mut o = [0u64; 5];
+    for i in 0..5 {
+        o[i] = 2 * P[i] + a.0[i] - b.0[i];
+    }
+    Loose(o)
+}
+
+/// Swaps `p` and `q` when `bit` is 1 and leaves them when it is 0, by a mask, never a branch.
+/// `bit` must be 0 or 1.
+#[inline]
+fn cswap(p: &mut Fe, q: &mut Fe, bit: u64) {
+    let mask = std::hint::black_box(0u64.wrapping_sub(bit));
+    for i in 0..5 {
+        let t = mask & (p.0[i] ^ q.0[i]);
+        p.0[i] ^= t;
+        q.0[i] ^= t;
+    }
 }
 
 /// `a` when `bit` is 0 and `b` when it is 1, chosen by a mask, never a branch. `bit` must be 0
 /// or 1.
 #[inline]
-fn select(a: &Gf, b: &Gf, bit: i64) -> Gf {
-    let mask = std::hint::black_box(-bit);
-    let mut o: Gf = *a;
-    for i in 0..16 {
-        o[i] ^= mask & (a[i] ^ b[i]);
+fn select(a: &Fe, b: &Fe, bit: u64) -> Fe {
+    let mask = std::hint::black_box(0u64.wrapping_sub(bit));
+    let mut o = a.0;
+    for i in 0..5 {
+        o[i] ^= mask & (a.0[i] ^ b.0[i]);
     }
-    o
+    Fe(o)
 }
 
 /// 1 when `a` and `b` are the same element of GF(p), whatever their limbs, else 0. Both are
-/// packed to their canonical bytes and every byte pair is folded with no early exit.
-fn equal(a: &Gf, b: &Gf) -> i64 {
-    let mut x = pack25519(a);
-    let mut y = pack25519(b);
+/// reduced to their canonical bytes and every byte pair is folded with no early exit.
+fn equal(a: &Fe, b: &Fe) -> u64 {
+    let mut x = a.to_bytes();
+    let mut y = b.to_bytes();
     let mut diff = 0u8;
     for i in 0..32 {
         diff |= x[i] ^ y[i];
     }
     x.zeroize();
     y.zeroize();
-    // `diff - 1` is negative, so all ones after the arithmetic shift, exactly when `diff` is 0.
-    std::hint::black_box(((i64::from(std::hint::black_box(diff)) - 1) >> 8) & 1)
+    // `diff - 1` wraps to all ones, so bit 8 is set, exactly when `diff` is 0.
+    std::hint::black_box((u64::from(std::hint::black_box(diff)).wrapping_sub(1) >> 8) & 1)
 }
 
-/// `i^((p-1)/2)`, Euler's criterion: 1 for a nonzero square, -1 for a non-square, 0 for 0.
-/// (p-1)/2 = 2^254 - 10 has every bit from 253 down set but bits 3 and 0, and that public
-/// exponent alone shapes the loop, as p-2 shapes [`inv25519`].
-fn legendre(i: &Gf) -> Gf {
-    let mut c: Gf = *i;
-    for a in (0..=252).rev() {
-        c = sqr(&c);
-        if a != 3 && a != 0 {
-            c = mul(&c, i);
-        }
+/// `z^(2^k)`: `k` squarings, `k` public.
+fn sqr_n(z: &Fe, k: u32) -> Fe {
+    let mut t = *z;
+    for _ in 0..k {
+        t = sqr(&t);
     }
-    c
+    t
 }
 
-/// RFC 9380 §4's `is_square`: 1 when `i` is a square in GF(p), zero included, else 0.
-fn is_square(i: &Gf) -> i64 {
-    let mut l = legendre(i);
+/// `z^(2^250 - 1)` and `z^11`, the head that ref10's addition chains for p - 2 and (p - 1)/2
+/// share: 249 squarings and 10 products, whose counts are fixed.
+fn pow_2_250_minus_1(z: &impl Limbs) -> (Fe, Fe) {
+    let z2 = sqr(z);
+    let z9 = mul(&sqr_n(&z2, 2), z);
+    let z11 = mul(&z9, &z2);
+    let z_5 = mul(&sqr(&z11), &z9);
+    let z_10 = mul(&sqr_n(&z_5, 5), &z_5);
+    let z_20 = mul(&sqr_n(&z_10, 10), &z_10);
+    let z_40 = mul(&sqr_n(&z_20, 20), &z_20);
+    let z_50 = mul(&sqr_n(&z_40, 10), &z_10);
+    let z_100 = mul(&sqr_n(&z_50, 50), &z_50);
+    let z_200 = mul(&sqr_n(&z_100, 100), &z_100);
+    let z_250 = mul(&sqr_n(&z_200, 50), &z_50);
+    (z_250, z11)
+}
+
+/// `z^(p-2)`, which is `1/z` for a nonzero `z` and 0 for 0: (2^250 - 1) * 2^5 + 11 = 2^255 - 21.
+fn invert(z: &impl Limbs) -> Fe {
+    let (z_250, z11) = pow_2_250_minus_1(z);
+    mul(&sqr_n(&z_250, 5), &z11)
+}
+
+/// `z^((p-1)/2)`, Euler's criterion: 1 for a nonzero square, -1 for a non-square, 0 for 0.
+/// ((2^250 - 1) * 4 + 1) * 4 + 2 = 2^254 - 10 = (p-1)/2, a chain as fixed as [`invert`]'s.
+fn legendre(z: &Fe) -> Fe {
+    let (z_250, _) = pow_2_250_minus_1(z);
+    mul(&sqr_n(&mul(&sqr_n(&z_250, 2), z), 2), &sqr(z))
+}
+
+/// RFC 9380 §4's `is_square`: 1 when `z` is a square in GF(p), zero included, else 0.
+fn is_square(z: &Fe) -> u64 {
+    let mut l = legendre(z);
     let square = equal(&l, &ONE) | equal(&l, &ZERO);
     l.zeroize();
     square
+}
+
+/// `x^3 + A x^2 + x`, the right side of curve25519's equation.
+fn curve(x: &Fe) -> Fe {
+    mul(&add(&mul(&add(x, &A), x), &ONE), x)
 }
 
 /// The u-coordinate of RFC 9380's `map_to_curve_elligator2` for curve25519 (§6.7.1, `Z = 2`,
@@ -231,18 +361,20 @@ fn is_square(i: &Gf) -> i64 {
 /// exceptional case cannot occur for curve25519.
 #[must_use]
 pub fn elligator2(r: &[u8; 32]) -> [u8; 32] {
-    let mut u = unpack25519(r);
-    let mut tv1 = sqr(&u);
-    tv1 = add(&tv1, &tv1);
+    let mut u = Fe::from_bytes(r);
+    let mut u2 = sqr(&u);
+    // Z * u^2, carried so that 1 can be added to it.
+    let mut tv1 = carry(&add(&u2, &u2));
     // x1 = -A / (1 + Z * u^2)
-    let mut x1 = mul(&sub(&ZERO, &A), &inv25519(&add(&tv1, &ONE)));
+    let mut x1 = mul(&sub(&ZERO, &A), &invert(&add(&tv1, &ONE)));
     // gx1 = x1^3 + A * x1^2 + x1
-    let mut gx1 = mul(&add(&mul(&add(&x1, &A), &x1), &ONE), &x1);
-    // x2 = -x1 - A, normalized through `mul` as the ladder normalizes a `sub` before packing.
-    let mut x2 = mul(&sub(&sub(&ZERO, &x1), &A), &ONE);
+    let mut gx1 = curve(&x1);
+    // x2 = -x1 - A
+    let mut x2 = carry(&sub(&carry(&sub(&ZERO, &x1)), &A));
     let mut x = select(&x2, &x1, is_square(&gx1));
-    let out = pack25519(&x);
+    let out = x.to_bytes();
     u.zeroize();
+    u2.zeroize();
     tv1.zeroize();
     x1.zeroize();
     gx1.zeroize();
@@ -251,121 +383,101 @@ pub fn elligator2(r: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-fn crypto_scalarmult(n: &[u8; 32], p: &[u8; 32]) -> [u8; 32] {
-    #[cfg(any(test, debug_assertions))]
-    if seam::memoized() {
-        return seam::through(n, p, ladder);
-    }
-    ladder(n, p)
-}
-
+/// RFC 7748 §5's Montgomery ladder over the clamped scalar `n`, bit 254 down to bit 0, with the
+/// RFC's names: `(x_2 : z_2)` and `(x_3 : z_3)` are the two points, swapped by [`cswap`] when a
+/// scalar bit differs from the one before it. Every value the ladder computes, the RFC's named
+/// ones and each sum, difference and product inside its `x_3`, `z_3` and `z_2` lines, has a
+/// named local, so the last iteration's values are all wiped.
 fn ladder(n: &[u8; 32], p: &[u8; 32]) -> [u8; 32] {
-    let mut z: [u8; 32] = *n;
-    z[31] = (n[31] & 127) | 64;
-    z[0] &= 248;
-    let mut x = unpack25519(p);
-    let mut a: Gf = [0; 16];
-    let mut b: Gf = x;
-    let mut c: Gf = [0; 16];
-    let mut d: Gf = [0; 16];
-    let mut e: Gf;
-    let mut f: Gf;
-    a[0] = 1;
-    d[0] = 1;
-    for i in (0..=254usize).rev() {
-        let r = i64::from((z[i >> 3] >> (i & 7)) & 1);
-        sel25519(&mut a, &mut b, r);
-        sel25519(&mut c, &mut d, r);
-        e = add(&a, &c);
-        a = sub(&a, &c);
-        c = add(&b, &d);
-        b = sub(&b, &d);
-        d = sqr(&e);
-        f = sqr(&a);
-        a = mul(&c, &a);
-        c = mul(&b, &e);
-        e = add(&a, &c);
-        a = sub(&a, &c);
-        b = sqr(&a);
-        c = sub(&d, &f);
-        a = mul(&c, &A24);
-        a = add(&a, &d);
-        c = mul(&c, &a);
-        a = mul(&d, &f);
-        d = mul(&b, &x);
-        b = sqr(&e);
-        sel25519(&mut a, &mut b, r);
-        sel25519(&mut c, &mut d, r);
-        e.zeroize();
-        f.zeroize();
+    let mut k: [u8; 32] = *n;
+    k[0] &= 248;
+    k[31] = (k[31] & 127) | 64;
+    let mut x_1 = Fe::from_bytes(p);
+    let (mut x_2, mut z_2, mut x_3, mut z_3) = (ONE, ZERO, x_1, ONE);
+    let [
+        mut a,
+        mut b,
+        mut c,
+        mut d,
+        mut e,
+        mut da_plus_cb,
+        mut da_minus_cb,
+        mut aa_plus_a24_e,
+    ] = [Loose([0; 5]); 8];
+    let [
+        mut aa,
+        mut bb,
+        mut da,
+        mut cb,
+        mut da_minus_cb_squared,
+        mut a24_e,
+    ] = [ZERO; 6];
+    let mut swap = 0u64;
+    for t in (0..=254usize).rev() {
+        let k_t = u64::from((k[t >> 3] >> (t & 7)) & 1);
+        swap ^= k_t;
+        cswap(&mut x_2, &mut x_3, swap);
+        cswap(&mut z_2, &mut z_3, swap);
+        swap = k_t;
+        a = add(&x_2, &z_2);
+        aa = sqr(&a);
+        b = sub(&x_2, &z_2);
+        bb = sqr(&b);
+        e = sub(&aa, &bb);
+        c = add(&x_3, &z_3);
+        d = sub(&x_3, &z_3);
+        da = mul(&d, &a);
+        cb = mul(&c, &b);
+        da_plus_cb = add(&da, &cb);
+        x_3 = sqr(&da_plus_cb);
+        da_minus_cb = sub(&da, &cb);
+        da_minus_cb_squared = sqr(&da_minus_cb);
+        z_3 = mul(&x_1, &da_minus_cb_squared);
+        x_2 = mul(&aa, &bb);
+        a24_e = mul_a24(&e);
+        aa_plus_a24_e = add(&aa, &a24_e);
+        z_2 = mul(&e, &aa_plus_a24_e);
     }
-    c = inv25519(&c);
-    a = mul(&a, &c);
-    let q = pack25519(&a);
-    z.zeroize();
-    x.zeroize();
-    a.zeroize();
-    b.zeroize();
-    c.zeroize();
-    d.zeroize();
+    cswap(&mut x_2, &mut x_3, swap);
+    cswap(&mut z_2, &mut z_3, swap);
+    let mut inverse = invert(&z_2);
+    let q = mul(&x_2, &inverse).to_bytes();
+    k.zeroize();
+    x_1.zeroize();
+    x_2.zeroize();
+    z_2.zeroize();
+    x_3.zeroize();
+    z_3.zeroize();
+    for loose in [
+        &mut a,
+        &mut b,
+        &mut c,
+        &mut d,
+        &mut e,
+        &mut da_plus_cb,
+        &mut da_minus_cb,
+        &mut aa_plus_a24_e,
+    ] {
+        loose.zeroize();
+    }
+    for product in [
+        &mut aa,
+        &mut bb,
+        &mut da,
+        &mut cb,
+        &mut da_minus_cb_squared,
+        &mut a24_e,
+        &mut inverse,
+    ] {
+        product.zeroize();
+    }
+    swap.zeroize();
     q
 }
 
-/// A test binary's memo of X25519 ([`crate::memoized_x25519_in_tests!`]). The function is
-/// pure, so a test that reads one vault at every lock it takes (each read unwraps the file key
-/// with the device's scalar) computes each scalar and point once, and the answer is the one the
-/// ladder gives. Test and debug builds only, and only once a test binary asks: the memo keeps
-/// scalars in memory and answers in variable time, which no shipped process may do.
-#[cfg(any(test, debug_assertions))]
-pub mod seam {
-    use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, PoisonError};
-
-    /// The most pairs the memo keeps before it starts over.
-    const MOST: usize = 1 << 16;
-
-    /// Each scalar and point computed, with the ladder's answer.
-    type Memo = BTreeMap<([u8; 32], [u8; 32]), [u8; 32]>;
-
-    static ASKED: AtomicBool = AtomicBool::new(false);
-    static MEMO: Mutex<Memo> = Mutex::new(BTreeMap::new());
-
-    /// Memoize this process's X25519 from now on: a test binary's load-time hook calls it.
-    pub fn memoize() {
-        ASKED.store(true, Ordering::Relaxed);
-    }
-
-    /// Whether this process memoizes X25519: aterm-secrets' own tests, and a test binary that
-    /// asked.
-    pub(super) fn memoized() -> bool {
-        cfg!(test) || ASKED.load(Ordering::Relaxed)
-    }
-
-    /// `compute(scalar, point)`, from the memo when this pair was computed before.
-    pub(super) fn through(
-        scalar: &[u8; 32],
-        point: &[u8; 32],
-        compute: fn(&[u8; 32], &[u8; 32]) -> [u8; 32],
-    ) -> [u8; 32] {
-        let key = (*scalar, *point);
-        let known = MEMO
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&key)
-            .copied();
-        if let Some(out) = known {
-            return out;
-        }
-        let out = compute(scalar, point);
-        let mut memo = MEMO.lock().unwrap_or_else(PoisonError::into_inner);
-        if memo.len() >= MOST {
-            memo.clear();
-        }
-        memo.insert(key, out);
-        out
-    }
-}
+/// The field and ladder this one replaced, kept as the tests' oracle.
+#[cfg(test)]
+mod tweetnacl;
 
 #[cfg(test)]
 mod tests {
@@ -422,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RFC 7748's million-iteration vector takes about four minutes even optimized (237 s in the test profile); run with --ignored"]
+    #[ignore = "RFC 7748's million-iteration vector takes about half a minute (27 s in the test profile); run with --ignored"]
     fn rfc7748_5_2_iterated_a_million_times() {
         assert_eq!(
             iterate(1_000_000),
@@ -562,11 +674,6 @@ mod tests {
         ),
     ];
 
-    /// `x^3 + A x^2 + x`, the right side of curve25519's equation.
-    fn curve(x: &Gf) -> Gf {
-        mul(&add(&mul(&add(x, &A), x), &ONE), x)
-    }
-
     #[test]
     fn rfc9380_curve25519_elligator2_vectors() {
         for (u, qx, qy) in RFC9380_J4 {
@@ -574,19 +681,22 @@ mod tests {
             assert_eq!(elligator2(&u), be32(qx), "Q.x for u = {u:02x?}");
             // RFC 9380 §6.7.1 steps 6-7: `y` is odd exactly when `x1` was taken, that is, when
             // `is_square(gx1)` held, so the vector's `Q.y` says what `is_square` must answer.
-            let field = unpack25519(&u);
-            let tv1 = mul(&field, &field);
-            let x1 = mul(&sub(&ZERO, &A), &inv25519(&add(&add(&tv1, &tv1), &ONE)));
-            let odd = i64::from(be32(qy)[0] & 1);
+            let field = Fe::from_bytes(&u);
+            let tv1 = sqr(&field);
+            let x1 = mul(
+                &sub(&ZERO, &A),
+                &invert(&add(&carry(&add(&tv1, &tv1)), &ONE)),
+            );
+            let odd = u64::from(be32(qy)[0] & 1);
             assert_eq!(
                 is_square(&curve(&x1)),
                 odd,
                 "is_square(gx1) for u = {u:02x?}"
             );
             // Q lies on the curve: y^2 = gx(Q.x), a square.
-            let y = unpack25519(&be32(qy));
-            let gx = curve(&unpack25519(&be32(qx)));
-            assert_eq!(equal(&mul(&y, &y), &gx), 1);
+            let y = Fe::from_bytes(&be32(qy));
+            let gx = curve(&Fe::from_bytes(&be32(qx)));
+            assert_eq!(equal(&sqr(&y), &gx), 1);
             assert_eq!(is_square(&gx), 1);
         }
     }
@@ -594,20 +704,20 @@ mod tests {
     #[test]
     fn is_square_answers_for_squares_non_squares_and_zero() {
         // RFC 9380 picks Z = 2 for curve25519 because 2 is no square; -1 is one, as p = 1 mod 4.
-        let two: Gf = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let two = Fe([2, 0, 0, 0, 0]);
         assert_eq!(is_square(&two), 0);
         assert_eq!(is_square(&ZERO), 1);
         assert_eq!(is_square(&ONE), 1);
-        assert_eq!(is_square(&sub(&ZERO, &ONE)), 1);
+        assert_eq!(is_square(&carry(&sub(&ZERO, &ONE))), 1);
         for _ in 0..32 {
             let mut bytes = [0u8; 32];
             aterm_uds::rand::fill(&mut bytes).expect("CSPRNG");
-            let r = unpack25519(&bytes);
+            let r = Fe::from_bytes(&bytes);
             if equal(&r, &ZERO) == 1 {
                 continue;
             }
             assert_eq!(is_square(&r) == 1, has_root(&r), "Euler and a root agree");
-            let square = mul(&r, &r);
+            let square = sqr(&r);
             assert_eq!(is_square(&square), 1);
             assert_eq!(is_square(&mul(&square, &two)), 0);
         }
@@ -615,24 +725,25 @@ mod tests {
 
     #[test]
     fn select_and_equal_choose_by_value_not_by_limbs() {
-        let five: Gf = [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(select(&ONE, &five, 0), ONE);
-        assert_eq!(select(&ONE, &five, 1), five);
+        let five = Fe([5, 0, 0, 0, 0]);
+        assert_eq!(select(&ONE, &five, 0).0, ONE.0);
+        assert_eq!(select(&ONE, &five, 1).0, five.0);
         // p + 5 in limbs (unreduced) is the element 5.
-        let p_plus_five = unpack25519(&hex32(
+        let p_plus_five = Fe::from_bytes(&hex32(
             "f2ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
         ));
+        assert_ne!(p_plus_five.0, five.0);
         assert_eq!(equal(&p_plus_five, &five), 1);
         assert_eq!(equal(&five, &ONE), 0);
         // A difference in the last byte only.
         let mut top = [0u8; 32];
         top[31] = 0x40;
-        assert_eq!(equal(&unpack25519(&top), &ZERO), 0);
+        assert_eq!(equal(&Fe::from_bytes(&top), &ZERO), 0);
     }
 
     /// Whether `x` is a square, by a route that shares no code with [`legendre`] or [`equal`]:
     /// `c = x^((p+3)/8)` squares to `x` or `-x` exactly when `x` is a square, as p = 5 mod 8.
-    fn has_root(x: &Gf) -> bool {
+    fn has_root(x: &Fe) -> bool {
         // (p+3)/8 = 2^252 - 2: every bit from 251 down set but bit 0.
         let mut c = *x;
         for a in (0..=250).rev() {
@@ -641,8 +752,8 @@ mod tests {
                 c = mul(&c, x);
             }
         }
-        let c2 = pack25519(&sqr(&c));
-        c2 == pack25519(x) || c2 == pack25519(&sub(&ZERO, x))
+        let c2 = sqr(&c).to_bytes();
+        c2 == x.to_bytes() || c2 == carry(&sub(&ZERO, x)).to_bytes()
     }
 
     #[test]
@@ -654,7 +765,7 @@ mod tests {
             assert_eq!(x[31] & 0x80, 0, "a canonical u-coordinate");
             assert!(canonical_u(&x));
             assert!(
-                has_root(&curve(&unpack25519(&x))),
+                has_root(&curve(&Fe::from_bytes(&x))),
                 "on the curve, not its twist"
             );
             let mut flipped = r;
@@ -703,35 +814,207 @@ mod tests {
         }
     }
 
-    /// The memo computes a pair once and answers it again with the ladder's answer; another
-    /// point (or scalar) of the pair is computed afresh. Negative control: a memo keyed by
-    /// the scalar alone answered `x25519(alice, bob_public)` with Alice's public key, which
-    /// `rfc7748_6_1_diffie_hellman` refuses.
-    #[test]
-    fn the_memo_answers_a_pair_with_what_the_ladder_computed() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static COMPUTED: AtomicUsize = AtomicUsize::new(0);
-        fn counted(n: &[u8; 32], p: &[u8; 32]) -> [u8; 32] {
-            COMPUTED.fetch_add(1, Ordering::Relaxed);
-            ladder(n, p)
+    /// SplitMix64 (Steele, Lea and Flood, OOPSLA 2014): the differential tests' inputs, the same
+    /// on every run, so a disagreement is found again by the same seed.
+    struct SplitMix(u64);
+
+    impl SplitMix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
         }
-        assert!(seam::memoized(), "aterm-secrets' own tests memoize");
-        let scalar = hex32("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
-        let point = hex32("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
-        let out = hex32("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
-        let mut other = point;
-        other[0] ^= 1;
-        let mut scalar_only = scalar;
-        scalar_only[1] ^= 1;
-        let fresh = |s: &[u8; 32], p: &[u8; 32]| {
-            let before = COMPUTED.load(Ordering::Relaxed);
-            let got = seam::through(s, p, counted);
-            (got, COMPUTED.load(Ordering::Relaxed) - before)
-        };
-        let first = fresh(&scalar, &point);
-        assert!(first.0 == out && first.1 <= 1, "first: {first:?}");
-        assert_eq!(fresh(&scalar, &point), (out, 0), "a repeat is the memo's");
-        assert_eq!(fresh(&scalar, &other).0, ladder(&scalar, &other));
-        assert_eq!(fresh(&scalar_only, &point).0, ladder(&scalar_only, &point));
+
+        fn bytes(&mut self) -> [u8; 32] {
+            let mut out = [0u8; 32];
+            for chunk in out.as_chunks_mut::<8>().0 {
+                *chunk = self.next().to_le_bytes();
+            }
+            out
+        }
+
+        /// A limb in `0..=most`, the ends included one time in eight each.
+        fn limb(&mut self, most: u64) -> u64 {
+            match self.next() % 8 {
+                0 => 0,
+                1 => most,
+                _ => self.next() % (most + 1),
+            }
+        }
+    }
+
+    /// Every encoding the ladder and the map must treat as RFC 7748 does at an edge: the 14
+    /// low-order spellings, 0 to 31, every value from p - 32 to 2^255 - 1 (unreduced from p on),
+    /// and each of those with bit 255 set.
+    fn edge_encodings() -> Vec<[u8; 32]> {
+        let mut points: Vec<[u8; 32]> = [
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+        ]
+        .into_iter()
+        .map(hex32)
+        .collect();
+        for small in 0..32u8 {
+            let mut point = [0u8; 32];
+            point[0] = small;
+            points.push(point);
+        }
+        // 2^255 - 1 - k for k = 0..=50: p - 32 up to 2^255 - 1, with p - 1, p and p + 1 among them.
+        for k in 0..=50u8 {
+            let mut point = [0xff; 32];
+            point[0] = 0xff - k;
+            point[31] = 0x7f;
+            points.push(point);
+        }
+        let top_bit_set: Vec<[u8; 32]> = points
+            .iter()
+            .map(|point| {
+                let mut point = *point;
+                point[31] |= 0x80;
+                point
+            })
+            .collect();
+        points.extend(top_bit_set);
+        points
+    }
+
+    /// The oracle's element with the value of radix-2^51 limbs (each below 2^53), built from
+    /// 16-bit pieces and the powers 2^(51 i), so that no limb code of the new field takes part.
+    fn oracle_of(limbs: [u64; 5]) -> tweetnacl::Gf {
+        let mut sum = tweetnacl::ZERO;
+        for (i, limb) in limbs.into_iter().enumerate() {
+            let mut power = [0u8; 32];
+            power[51 * i / 8] = 1 << (51 * i % 8);
+            let mut pieces = tweetnacl::ZERO;
+            for (j, piece) in pieces.iter_mut().take(4).enumerate() {
+                *piece = i64::try_from((limb >> (16 * j)) & 0xffff).expect("16 bits");
+            }
+            sum = tweetnacl::add(
+                &sum,
+                &tweetnacl::mul(&pieces, &tweetnacl::unpack25519(&power)),
+            );
+        }
+        tweetnacl::mul(&sum, &tweetnacl::ONE)
+    }
+
+    /// The radix-2^51 field against TweetNaCl's, by value: decoding and encoding, products,
+    /// squares, the a24 product, sums and differences, inversion and Euler's criterion, over
+    /// fixed-seed limbs across the whole of each operation's bounds (both ends included, so a
+    /// limb or column that overflowed would panic under the tests' overflow checks) and over the
+    /// edge encodings. Negative controls: dropping `carry_columns`' last carry fails here, as it
+    /// fails RFC 7748's iterated and Diffie-Hellman vectors; `A24` = 121666 fails the a24 product.
+    #[test]
+    fn the_radix_2_51_field_agrees_with_tweetnacls() {
+        use tweetnacl as old;
+        let mut seed = SplitMix(0x7748_9380_2551_9000);
+        let tight = |seed: &mut SplitMix| Fe([(); 5].map(|()| seed.limb(1 << 51)));
+        let loose = |seed: &mut SplitMix| Loose([(); 5].map(|()| seed.limb(3 << 51)));
+        for encoding in edge_encodings() {
+            assert_eq!(
+                Fe::from_bytes(&encoding).to_bytes(),
+                old::pack25519(&old::unpack25519(&encoding)),
+                "{encoding:02x?}"
+            );
+        }
+        let extremes = [Fe([1 << 51; 5]), Fe(P), Fe([LOW_51; 5]), ZERO];
+        for f in extremes {
+            assert_eq!(f.to_bytes(), old::pack25519(&oracle_of(f.0)), "{:x?}", f.0);
+        }
+        let a24 = old::unpack25519(&{
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&121_665u32.to_le_bytes());
+            bytes
+        });
+        for round in 0..2048 {
+            let (a, b) = (loose(&mut seed), loose(&mut seed));
+            let (x, y) = (oracle_of(a.0), oracle_of(b.0));
+            let mul_ok = mul(&a, &b).to_bytes() == old::pack25519(&old::mul(&x, &y));
+            assert!(mul_ok, "mul {:x?} {:x?}", a.0, b.0);
+            assert_eq!(
+                sqr(&a).to_bytes(),
+                old::pack25519(&old::sqr(&x)),
+                "sqr {:x?}",
+                a.0
+            );
+            assert_eq!(
+                mul_a24(&a).to_bytes(),
+                old::pack25519(&old::mul(&x, &a24)),
+                "a24 {:x?}",
+                a.0
+            );
+            assert_eq!(carry(&a).to_bytes(), old::pack25519(&x), "carry {:x?}", a.0);
+            let (f, g) = (tight(&mut seed), tight(&mut seed));
+            let (u, v) = (oracle_of(f.0), oracle_of(g.0));
+            assert_eq!(f.to_bytes(), old::pack25519(&u), "to_bytes {:x?}", f.0);
+            assert_eq!(
+                carry(&add(&f, &g)).to_bytes(),
+                old::pack25519(&old::add(&u, &v)),
+                "add {:x?} {:x?}",
+                f.0,
+                g.0
+            );
+            assert_eq!(
+                carry(&sub(&f, &g)).to_bytes(),
+                old::pack25519(&old::mul(&old::sub(&u, &v), &old::ONE)),
+                "sub {:x?} {:x?}",
+                f.0,
+                g.0
+            );
+            if round % 16 == 0 {
+                assert_eq!(
+                    invert(&a).to_bytes(),
+                    old::pack25519(&old::inv25519(&x)),
+                    "invert {:x?}",
+                    a.0
+                );
+                assert_eq!(
+                    legendre(&f).to_bytes(),
+                    old::pack25519(&old::legendre(&u)),
+                    "legendre {:x?}",
+                    f.0
+                );
+                assert_eq!(is_square(&f), u64::from(old::is_square(&u) == 1));
+            }
+        }
+    }
+
+    /// The ladder against TweetNaCl's, output for output: 1024 fixed-seed scalars and points, and
+    /// three scalars (all zeros, all ones, a seeded one) at every edge encoding (low order, small,
+    /// near p, unreduced, bit 255 set). Negative control: `A24` = 121666 fails here, and so do
+    /// RFC 7748's vectors.
+    #[test]
+    fn the_radix_2_51_ladder_agrees_with_tweetnacls() {
+        let mut seed = SplitMix(0x7748_0005_0002_0001);
+        for _ in 0..1024 {
+            let (scalar, point) = (seed.bytes(), seed.bytes());
+            assert_eq!(
+                ladder(&scalar, &point),
+                tweetnacl::ladder(&scalar, &point),
+                "{scalar:02x?} {point:02x?}"
+            );
+        }
+        let scalars = [[0u8; 32], [0xff; 32], seed.bytes()];
+        for point in edge_encodings() {
+            for scalar in &scalars {
+                assert_eq!(
+                    ladder(scalar, &point),
+                    tweetnacl::ladder(scalar, &point),
+                    "{scalar:02x?} {point:02x?}"
+                );
+            }
+        }
+    }
+
+    /// The map against TweetNaCl's, output for output, over 512 fixed-seed inputs and every
+    /// edge encoding. Negative control: `x2 = -x1 + A` fails here and RFC 9380's vectors.
+    #[test]
+    fn elligator2_agrees_with_tweetnacls() {
+        let mut seed = SplitMix(0x9380_0006_0007_0001);
+        let inputs: Vec<[u8; 32]> = (0..512).map(|_| seed.bytes()).collect();
+        for r in inputs.into_iter().chain(edge_encodings()) {
+            assert_eq!(elligator2(&r), tweetnacl::elligator2(&r), "{r:02x?}");
+        }
     }
 }

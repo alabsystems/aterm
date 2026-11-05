@@ -251,7 +251,8 @@ impl Expr {
             Expr::Iff(a, b) => format!("({} <=> {})", a.to_tla(), b.to_tla()),
             Expr::Forall(idx, lo, hi, body) => {
                 format!(
-                    "\\A {idx} \\in {}..{} : {}",
+                    // A quantifier's body reaches as far right as it can in TLA+.
+                    "(\\A {idx} \\in {}..{} : {})",
                     lo.to_tla(),
                     hi.to_tla(),
                     body.to_tla()
@@ -493,7 +494,12 @@ impl Model {
         }
 
         let action_names: Vec<&str> = self.actions.iter().map(|a| a.name).collect();
-        s.push_str(&format!("Next == {}\n", action_names.join(" \\/ ")));
+        let next = if action_names.is_empty() {
+            "FALSE".to_string()
+        } else {
+            action_names.join(" \\/ ")
+        };
+        s.push_str(&format!("Next == {next}\n"));
         s.push_str("Spec == Init /\\ [][Next]_vars\n");
 
         for inv in &self.invariants {
@@ -1713,9 +1719,18 @@ mod tests {
         assert!(tla.contains("n # lo"), "inequality: {tla}");
         assert!(
             tla.contains(
-                "EvictOldestContiguous == \\A n \\in 1..MaxSeq : (live[n] <=> lo =< n /\\ n =< seq)"
+                "EvictOldestContiguous == (\\A n \\in 1..MaxSeq : (live[n] <=> lo =< n /\\ n =< seq))"
             ),
             "quantified iff invariant: {tla}"
+        );
+    }
+
+    #[test]
+    fn a_quantifier_cannot_swallow_what_follows_it() {
+        let quantified = forall("i", int(0), int(1), le(var("i"), var("x")));
+        assert_eq!(
+            Expr::Iff(Box::new(quantified), Box::new(Expr::Bool(false))).to_tla(),
+            "((\\A i \\in 0..1 : i =< x) <=> FALSE)"
         );
     }
 

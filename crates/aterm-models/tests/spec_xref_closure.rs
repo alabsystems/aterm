@@ -94,6 +94,13 @@ fn spec_xref_closure() {
         aterm_db::accounts::proposals::Proposals::replace_if_current as *const (),
     ));
     std::hint::black_box(aterm_secrets::need::credential_request_environment as fn());
+    // The machine-number anchors on `settle`, `choose` and `check`, and their waivers' host.
+    std::hint::black_box((
+        aterm_types::machine_name::settle as *const (),
+        aterm_types::machine_name::choose as *const (),
+        aterm_types::machine_name::check as *const (),
+        aterm_types::machine_name::machine_number_environment as fn(),
+    ));
     // aterm-capacity's `CapacityCohort` waivers' host, beside its cohort ledger's anchors.
     #[cfg(unix)]
     std::hint::black_box(aterm_capacity::capacity_cohort_environment as fn());
@@ -286,6 +293,27 @@ fn spec_xref_closure() {
             aterm_secrets::client::tend_epochs_at
                 as fn(&aterm_secrets::client::Paths, u64) -> aterm_secrets::Result<Vec<Record>>,
             aterm_secrets::client::epoch_convergence_environment as fn(),
+        ));
+        // `GapHeal`'s anchors beyond the tender's: the remover (which reaches the remover's
+        // rotation), the vault pass (which reaches the closer), the desk's LAN admission, and
+        // the waivers' host.
+        std::hint::black_box((
+            aterm_secrets::client::remove_member
+                as fn(
+                    &aterm_secrets::client::Paths,
+                    &str,
+                    bool,
+                )
+                    -> aterm_secrets::Result<aterm_secrets::client::MemberRemoval>,
+            aterm_secrets::client::vault_pass_at
+                as fn(&aterm_secrets::client::Paths, u64) -> aterm_secrets::Result<Vec<Record>>,
+            aterm_secrets::client::admit_by_proof
+                as fn(
+                    &aterm_secrets::client::Paths,
+                    &aterm_secrets::client::Proven<'_>,
+                    u64,
+                ) -> aterm_secrets::Result<aterm_secrets::client::Readmit>,
+            aterm_secrets::client::gap_heal_environment as fn(),
         ));
     }
     #[expect(

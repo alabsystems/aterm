@@ -284,7 +284,8 @@ fn request_head<R: Read>(reader: &mut BufReader<Take<R>>) -> std::io::Result<Str
     let mut head = String::new();
     loop {
         let start = head.len();
-        let n = reader.read_line(&mut head)?;
+        let rem = MAX_HEAD.saturating_sub(start).saturating_add(1) as u64;
+        let n = (&mut *reader).take(rem).read_line(&mut head)?;
         if head.len() > MAX_HEAD {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

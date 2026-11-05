@@ -52,6 +52,7 @@ fn point(reset_at: Option<Instant>, person: bool) -> TurnEndReading {
         turn_said: None,
         said_lines: None,
         turn_lines: None,
+        turn_breaks: Default::default(),
         opened_by: None,
         message_drawn: false,
         submits: None,
@@ -94,6 +95,7 @@ fn point(reset_at: Option<Instant>, person: bool) -> TurnEndReading {
         login_at_wall: None,
         login_method: None,
         login_shared: None,
+        login_pin: aterm_agent::supervise::policy::login::LoginPin::Picker,
         login_moved: false,
         roster: None,
         wall_remembered: false,
@@ -104,6 +106,7 @@ fn point(reset_at: Option<Instant>, person: bool) -> TurnEndReading {
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(None),
+        leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
         fact: None,
         wake: None,
     }

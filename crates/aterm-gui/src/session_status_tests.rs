@@ -1068,13 +1068,13 @@ fn a_scrollback_erase_never_leaves_the_status_on_an_earlier_exit() {
             .unwrap()
             .last_finished_block()
             .map(|b| b.exit_code),
-        Some(Some(2)),
-        "PRECONDITION: the last D's copy holds an exit other than the published one"
+        Some(Some(0)),
+        "PRECONDITION: reset's D landed after its RIS"
     );
     assert_eq!(
         published(&mut app),
-        "phase=idle outcome=failure exit_code=3 signal=- confidence=strong",
-        "a RIS swallows the D, and the copy of a block this prompt did not close is not read"
+        "phase=idle outcome=success exit_code=- signal=- confidence=strong",
+        "a RIS from the running command leaves its D to the shell: the status is reset's own exit"
     );
 }
 
@@ -2058,6 +2058,72 @@ fn fabric_batch_matches_single_status_fields_for_each_session() {
     );
 }
 
+/// EVERY BATCH ROW CARRIES ITS SESSION'S MEANING FIELDS AS `meta` PRINTS THEM (critic item E05):
+/// `role= attention= user_title=`, each the very token the session's own `meta` record says
+/// (`-` for none, `%2D` for a stored `-`, else percent-encoded), so the Fabric bridge reads no
+/// `@<sid> meta` for a session the batch names; while a writer holds the session's meta the row
+/// leaves all three out, never waiting for it, and the bridge reads that session's alone.
+#[test]
+fn fabric_batch_rows_carry_each_sessions_meaning_fields_as_meta_prints_them() {
+    use crate::session_timeline::{MetaEdit, MetaField};
+    let app = crate::App::headless_for_test();
+    let pooled = app.pool.get(0).expect("session");
+    let (term, ctx) = (pooled.term.clone(), pooled.ctx.clone());
+    let said = |record: &str, key: &str| -> Option<String> {
+        record
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix(key)?.strip_prefix('='))
+            .map(str::to_string)
+    };
+    let fields = ["role", "attention", "user_title"];
+    let agree = |app: &crate::App| {
+        let row = app.fabric_status_fields(0).expect("live session");
+        let (meta, _) = crate::control::cmd_meta(&term, &app.store, 0, &ctx, "");
+        for key in fields {
+            assert_eq!(
+                said(&row, key),
+                said(&meta, key),
+                "{key}= in the batch row as `meta` says it: {row} | {meta}"
+            );
+        }
+        row
+    };
+    let unset = agree(&app);
+    assert!(
+        unset.contains(" role=- attention=- user_title=- gen="),
+        "{unset}"
+    );
+    for (field, value) in [
+        (MetaField::Role, "lead"),
+        (MetaField::Attention, "needs review"),
+        (MetaField::Title, "-"),
+    ] {
+        crate::session_timeline::write_session_meta(
+            &ctx,
+            field,
+            MetaEdit::Set(value),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the meta write");
+    }
+    let set = agree(&app);
+    assert!(
+        set.contains(" role=lead attention=needs%20review user_title=%2D gen="),
+        "{set}"
+    );
+
+    let held = ctx.meta.lock().unwrap();
+    let busy = app.fabric_status_fields(0).expect("live session");
+    drop(held);
+    for key in fields {
+        assert_eq!(said(&busy, key), None, "{key}= left out while held: {busy}");
+    }
+    assert!(
+        busy.contains(" agent="),
+        "the rest of the row stands: {busy}"
+    );
+}
+
 #[test]
 fn fabric_batch_does_not_wait_for_a_background_timeline_writer() {
     use std::sync::mpsc;
@@ -2158,7 +2224,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              program_state_ms \
              last_act os_appearance theme_side reported_scheme scheme_from bg_dark \
              session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_rss_mb \
-             disk disk_free_mb disk_room_mb disk_age_ms job job_quiet_ms program_check syspolicyd \
+             disk disk_free_mb disk_room_mb disk_age_ms job job_quiet_ms program_check left syspolicyd \
              syspolicyd_workers syspolicyd_full_ms service_mem service_mem_top occupancy \
              occupancy_hold ready slots \
              idle_ready_min waits waits_ready supervisor_contract supervisor_scope \

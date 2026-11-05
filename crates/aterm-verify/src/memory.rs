@@ -115,9 +115,9 @@ pub const PLAIN_RECORD: &str = aterm_capacity::book::TARGO_RECORD;
 /// Whether stage `id` compiles, and so claims [`aterm_capacity::cold_claim`] until a run of it is
 /// measured: each such stage runs a cargo or rustdoc build of its own (a test, lint, doctest,
 /// checkers or measuring compile, a cell's or the libc oracle's workspace, the export's release
-/// tools, the web modules, the conformance and Objective-C drives' binaries, `spec-check`, the gpu
-/// oracle's test target, the aterm the codex-alab proof drives, the lab the Linux lane boots its
-/// VM with, which claims its guest's memory as a claim of its own). The stages that run only what
+/// tools, the web modules, the conformance and Objective-C drives' binaries, `spec-check`, the
+/// aterm the codex-alab proof drives, the lab the Linux lane boots its VM with, which claims its
+/// guest's memory as a claim of its own). The stages that run only what
 /// an earlier stage built (the test run, the checkers run, the measuring rows), the ones that
 /// touch no target directory, and the forge's do not. Every stage is named here, so a new one is
 /// placed by the compiler, not by a list it can be left out of.
@@ -130,7 +130,6 @@ pub const fn compiles(id: StageId) -> bool {
         | StageId::Export
         | StageId::LibcOracle
         | StageId::SpecCheck
-        | StageId::GpuOracle
         | StageId::CheckersCompile
         | StageId::MeasurePrebuild
         | StageId::ForeignCells

@@ -158,7 +158,8 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) -> Result<(), 
     for entry in entries {
         let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
         let path = entry.path();
-        let meta = std::fs::symlink_metadata(&path)
+        let meta = entry
+            .metadata()
             .map_err(|e| format!("inspect {}: {e}", path.display()))?;
         let rel = path
             .strip_prefix(root)
@@ -299,23 +300,26 @@ pub fn slices_fit(store: &Path, memory: Option<u64>) -> bool {
     let Some(memory) = memory else {
         return true;
     };
-    let newest = std::fs::read_dir(store)
+    let mut records: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(store)
         .ok()
         .into_iter()
         .flatten()
         .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| {
             let record = e.path().join(COMPLETE_FILE);
             let when = std::fs::symlink_metadata(&record)
                 .ok()
                 .filter(|m| m.is_file())
                 .and_then(|m| m.modified().ok())?;
-            let text = crate::durable::read_regular_text(&record, 1024 * 1024).ok()?;
-            let complete: Complete = aterm_toml::from_str(&text).ok()?;
-            Some((when, complete))
+            Some((when, record))
         })
-        .max_by_key(|(when, _)| *when);
-    let Some((_, complete)) = newest else {
+        .collect();
+    records.sort_by_key(|(when, _)| *when);
+    let Some(complete) = records.into_iter().rev().find_map(|(_, record)| {
+        let text = crate::durable::read_regular_text(&record, 1024 * 1024).ok()?;
+        aterm_toml::from_str::<Complete>(&text).ok()
+    }) else {
         return true;
     };
     let peaks: u64 = complete
@@ -561,35 +565,62 @@ fn needed_keys(repo: &Path) -> Vec<String> {
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     let meta =
         std::fs::symlink_metadata(from).map_err(|e| format!("inspect {}: {e}", from.display()))?;
-    if meta.file_type().is_symlink() {
+    copy_tree_kind(from, to, meta.file_type(), Some(&meta))
+}
+
+fn copy_tree_kind(
+    from: &Path,
+    to: &Path,
+    kind: std::fs::FileType,
+    dir_meta: Option<&std::fs::Metadata>,
+) -> Result<(), String> {
+    if kind.is_symlink() {
         let target =
             std::fs::read_link(from).map_err(|e| format!("read link {}: {e}", from.display()))?;
         return symlink(&target, to);
     }
-    if meta.is_dir() {
+    if kind.is_dir() {
+        let owned_meta;
+        let meta = match dir_meta {
+            Some(meta) => meta,
+            None => {
+                owned_meta = std::fs::symlink_metadata(from)
+                    .map_err(|e| format!("inspect {}: {e}", from.display()))?;
+                &owned_meta
+            }
+        };
         std::fs::create_dir(to).map_err(|e| format!("create {}: {e}", to.display()))?;
-        let mut names: Vec<_> = std::fs::read_dir(from)
+        let mut entries: Vec<_> = std::fs::read_dir(from)
             .map_err(|e| format!("read {}: {e}", from.display()))?
             .flatten()
-            .map(|e| e.file_name())
+            .filter_map(|e| Some((e.file_name(), e.file_type().ok()?)))
             .collect();
-        names.sort();
-        for name in names {
-            copy_tree(&from.join(&name), &to.join(&name))?;
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, ft) in entries {
+            copy_tree_kind(&from.join(&name), &to.join(&name), ft, None)?;
         }
-        return set_mode(to, &meta);
+        return set_mode(to, meta);
     }
     // Streamed, not read whole: a dSYM's DWARF runs to gigabytes, past any whole-file read bound.
-    let mut source = crate::durable::open_regular_file(from)
+    let (mut source, src_meta) = crate::durable::open_regular_file_with_meta(from)
         .map_err(|e| format!("open {}: {e}", from.display()))?;
-    let mut sink = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(to)
-        .map_err(|e| format!("create {}: {e}", to.display()))?;
+    let mut sink =
+        crate::durable::open_create_new(to).map_err(|e| format!("create {}: {e}", to.display()))?;
     std::io::copy(&mut source, &mut sink)
         .map_err(|e| format!("copy {} to {}: {e}", from.display(), to.display()))?;
-    set_mode(to, &meta)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = src_meta.permissions().mode() & 0o7777;
+        if sink
+            .metadata()
+            .map_or(true, |m| m.permissions().mode() & 0o7777 != mode)
+        {
+            sink.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("chmod {}: {e}", to.display()))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -606,11 +637,8 @@ fn symlink(_target: &Path, at: &Path) -> Result<(), String> {
 #[cfg(unix)]
 fn set_mode(path: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(
-        path,
-        std::fs::Permissions::from_mode(meta.permissions().mode() & 0o7777),
-    )
-    .map_err(|e| format!("chmod {}: {e}", path.display()))
+    atpkg::platform::set_mode(path, meta.permissions().mode() & 0o7777)
+        .map_err(|e| format!("chmod {}: {e}", path.display()))
 }
 
 #[cfg(not(unix))]

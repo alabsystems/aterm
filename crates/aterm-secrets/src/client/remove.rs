@@ -13,14 +13,18 @@
 //!   wraps it), wraps each to the members who remain and reseals the current entries under it.
 //!   The `[everyone]` reseal carries the revoke cascade (the Mac's roster row and pool slots, a new
 //!   fleet code, and on `--stolen` the roster's deny-lists). It returns the entries the Mac could read, for rotation
-//!   at the provider, and on `--stolen` the one `NEEDS YOU:` line (C25).
+//!   at the provider, and on `--stolen` the one `NEEDS YOU:` line (C25). It refuses up front,
+//!   signing nothing, where its batch and the re-keys it makes due would pass the log's keyed
+//!   budget ([`RemovalFill`]).
 //! - [`tend_epochs`] is the coverage rule on every vault pass, and the only automatic re-key:
 //!   where removals on two sides of a split left two newest epochs, or a newest epoch is still
 //!   wrapped to a Mac the log removed (a quorum `Remove` voided the remover's rotation, or the
 //!   remover's rotation has not arrived), one member mints one higher epoch that covers them
 //!   ([`log_entries::coalesce_concurrent_commons_epochs`]), in the turn
 //!   [`Log::rekey_dues`] gives it: the remover first, everyone else after a grace. A Commons
-//!   exchange signs nothing.
+//!   exchange signs nothing. A re-key no removal made due waits, unsigned, where it would take
+//!   the log's keyed records past [`crate::membership_log::AUTOMATIC_KEYED_STOP`]
+//!   ([`within_automatic_stop`]).
 //! - [`removed_notes`] names each Mac the log removed, by whom and when, so a removed Mac that asks
 //!   again shows as removed, not new, and a person's "Allow again" restores a plain removal
 //!   ([`super::admit`]). A Mac a quorum removed is not restored by one person's Allow.
@@ -36,7 +40,7 @@ use super::*;
 use crate::commons::bootstrap::Device;
 use crate::membership_log::{
     Body, EpochAudience, Kind, Log, MemberId, Record, RecordId, RekeyDue, Store, Turn, Undo,
-    audience_tag,
+    audience_tag, entries::OpenedAudienceEntries,
 };
 
 /// What [`remove_member`] did.
@@ -177,7 +181,7 @@ impl RemovedNotes {
 }
 
 /// `ms` (UTC) as a month and day: `Oct 30`.
-fn day(ms: u64) -> String {
+pub(super) fn day(ms: u64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
@@ -574,6 +578,22 @@ pub fn vault_admin_named(paths: &Paths, who: &str) -> Option<String> {
 /// This Mac's vault has no trusted log, the log seats no device key of this Mac as a member, `who`
 /// names no member, more than one, this Mac itself or a founder that has proved no key, or a
 /// record fails to sign or keep.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "GapHeal",
+        action = "Remove",
+        project = "aterm_secrets::client::remove::tests::gap_heal::gap_heal_transition"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "GapHeal",
+        action = "RemoveByB",
+        project = "aterm_secrets::client::remove::tests::gap_heal::gap_heal_transition"
+    )
+)]
 pub fn remove_member(paths: &Paths, who: &str, stolen: bool) -> crate::Result<MemberRemoval> {
     if trusted_store(paths)?.is_none() {
         return Err(Error::new(
@@ -582,8 +602,11 @@ pub fn remove_member(paths: &Paths, who: &str, stolen: bool) -> crate::Result<Me
     }
     let identity =
         read_identity(paths)?.ok_or_else(|| Error::new("this Mac has no secrets identity"))?;
-    let vault_admin = vault_admin_named(paths, who);
+    // Read under the draft's observation: a pass that held the state when the person asked
+    // delays this with the draft, rather than hiding the admin behind a busy read.
+    let mut vault_admin = None;
     let (minted, _, report) = log_entries::author_and_commit_records(paths, |store| {
+        vault_admin = vault_admin_named(paths, who);
         draft_removal(paths, store, &identity, Target::Word(who), stolen)
     })?;
     let report = report?;
@@ -889,6 +912,30 @@ fn draft_removal(
         }
     });
 
+    // The batch rotates `[everyone]` and Commons where this Mac opens their newest epochs, and
+    // each host list `rotate_host_lists` mints (`Rotation { hosts: true }` below).
+    let fill = RemovalFill::of(
+        &log,
+        &opened,
+        &actor,
+        &BTreeSet::from([recipient]),
+        Some(&everyone),
+        |audience, newest, gone| {
+            let mints = match audience {
+                EpochAudience::Hosts(_) => {
+                    log_entries::rotates_host_list(&opened, audience, newest, gone)
+                }
+                EpochAudience::Everyone | EpochAudience::Commons => {
+                    log_entries::opens_newest(&opened, audience)
+                }
+            };
+            if mints { Mints::Surely } else { Mints::No }
+        },
+    );
+    if fill.passes() {
+        return refuse(Error::new(fill.refusal()));
+    }
+
     let mut seats_to_remove = vec![(target, cutoff)];
     if is_word_target {
         for (&seat_actor, seat_member) in membership.members() {
@@ -951,6 +998,130 @@ fn draft_removal(
             envelope_notes: Vec::new(),
         }),
     ))
+}
+
+/// How a removal's own batch re-keys an audience the removed Mac may be in ([`RemovalFill`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Mints {
+    /// The batch mints the audience's next epoch: its re-key is in the batch, and what it makes
+    /// due there is at worst one coalesce of the heads a concurrent removal leaves.
+    Surely,
+    /// The batch may mint it (a writer's departure, which mints only for the sections its plan
+    /// reaches): its re-key is counted in the batch, and the worst case is still a ranked
+    /// holder's rotation and a coalesce.
+    Maybe,
+    /// The batch mints nothing there: a ranked holder's rotation and a coalesce at worst.
+    No,
+}
+
+/// What a removal would add to the membership log's keyed records, beside what the log holds
+/// (one-mesh §8, "The 8,500 stop"): the 8,500 stop never holds a re-key a removal made due,
+/// since writers wait on it ([`log_entries::Waiting`]), so a removal reserves that room up front
+/// and refuses, signing nothing, where the log could not take it all ([`RemovalFill::passes`]).
+/// Every way a person removes a Mac weighs it before its `Remove` is signed: `aterm members
+/// remove` ([`draft_removal`]), `aterm secrets revoke` (`log_entries::draft_retire_in_log_with`)
+/// and a publish that puts a Mac's key on a `code-only` line (`log_entries`' writer). A seat move
+/// (`super::readmit`'s `Replace`) is signed only below its proof-admission stop
+/// (`super::readmit::PROVEN_FILL` of the keyed budget, 9,216 records), a quarter of the budget
+/// below the hard bound. Every count is a bound of [`log_entries::rekey_keyed_bound`] over the
+/// log as this Mac holds it when the removal is drafted, never below what is signed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RemovalFill {
+    /// The keyed records the log holds.
+    keyed: usize,
+    /// The keyed records of the removal's own re-keys: the new epoch of every audience its batch
+    /// mints or may mint ([`Mints`]), its `Wrap`s and re-`Put`s with the cascade. Its `Remove`s
+    /// are weighed records, not keyed ones.
+    batch: usize,
+    /// The keyed records of the re-keys it makes due at worst, for each audience whose newest
+    /// epoch wraps a Mac it removes: a ranked holder's rotation where the batch does not surely
+    /// mint there, and one coalesce of the heads a concurrent removal leaves.
+    worst: usize,
+    /// The log's keyed budget ([`crate::membership_log::RecordBudgets::keyed`]).
+    limit: usize,
+}
+
+impl RemovalFill {
+    /// The fill of `me`'s removal of the Macs whose recipients are `removed`, over `log` and
+    /// `opened` as they are before its `Remove`s, with `everyone` the `[everyone]` entries its
+    /// batch puts (`None`: the ones `opened` reads), and `mints` how the batch re-keys an
+    /// audience, given its newest epochs and every recipient the log and the batch remove.
+    pub(super) fn of(
+        log: &Log,
+        opened: &OpenedAudienceEntries,
+        me: &MemberId,
+        removed: &BTreeSet<Recipient>,
+        everyone: Option<&BTreeMap<String, Entry>>,
+        mints: impl Fn(&EpochAudience, &[RecordId], &BTreeSet<Recipient>) -> Mints,
+    ) -> Self {
+        let flight = log_entries::Flight::of_batch(log, opened, me);
+        let mut gone = log.removed_recipients();
+        gone.extend(removed.iter().copied());
+        let mut seats = log.current_recipients(&EpochAudience::Everyone);
+        seats.retain(|seat| !removed.contains(seat));
+        let no_seats = BTreeSet::new();
+        let mut batch = 0usize;
+        let mut worst = 0usize;
+        for (audience, newest) in &opened.maximal_epochs {
+            let mints = mints(audience, newest, &gone);
+            let seats = if matches!(audience, EpochAudience::Hosts(_)) {
+                &no_seats
+            } else {
+                &seats
+            };
+            let next = everyone.filter(|_| *audience == EpochAudience::Everyone);
+            let cost =
+                log_entries::rekey_keyed_bound(log, opened, &flight, audience, seats, &gone, next);
+            if mints != Mints::No {
+                batch = batch.saturating_add(cost);
+            }
+            let wraps_it = newest.iter().any(|epoch| {
+                opened
+                    .wrapped_recipients
+                    .get(epoch)
+                    .is_some_and(|wrapped| !wrapped.is_disjoint(removed))
+            });
+            if wraps_it {
+                let rekeys = if mints == Mints::Surely { 1 } else { 2 };
+                worst = worst.saturating_add(cost.saturating_mul(rekeys));
+            }
+        }
+        Self {
+            keyed: log.counts().keyed,
+            batch,
+            worst,
+            limit: log.budgets().keyed,
+        }
+    }
+
+    /// This fill with `keyed` more records in its batch: what a batch signs beside the removal
+    /// (a seat move's `Admit` `Wrap`s and the moved seat's `Wrap` in each epoch it mints,
+    /// `super::readmit::seat_move_refusal`).
+    pub(super) const fn with_more(self, keyed: usize) -> Self {
+        Self {
+            batch: self.batch.saturating_add(keyed),
+            ..self
+        }
+    }
+
+    /// Whether the log's keyed records, the batch and the worst case together would pass the
+    /// keyed budget.
+    pub(super) const fn passes(self) -> bool {
+        self.keyed
+            .saturating_add(self.batch)
+            .saturating_add(self.worst)
+            > self.limit
+    }
+
+    /// The refusal a person reads: the fill, with no value of any entry.
+    pub(super) fn refusal(self) -> String {
+        format!(
+            "the membership log is full: it holds {} keyed records, and this removal's {} with \
+             the at most {} of the re-keys it makes due would pass its limit of {}, so none of \
+             them is signed",
+            self.keyed, self.batch, self.worst, self.limit
+        )
+    }
 }
 
 /// Every Mac this Mac's trusted log removed, by recipient and writer key ([`RemovedNotes`]): who
@@ -1385,20 +1556,25 @@ pub fn tend_epochs(paths: &Paths) -> crate::Result<Vec<Record>> {
 }
 
 /// One vault pass's re-keys at `now_ms`: the ranked wrap-gap closer
-/// ([`log_entries::close_wrap_gaps`]), then the ranked tender ([`tend_epochs_at`]), the second
-/// whether or not the first fails. Every log member's subscriber runs it after each records pull,
-/// whatever its vault's source ([`vault_pass`]): an exchange signs nothing, so outside a person's
-/// act this is where a wrap gap closes and a due re-key is minted. Returns what they signed,
-/// already in this Mac's records, nothing posted.
+/// ([`log_entries::close_wrap_gaps`]), then the ranked tender ([`tend_epochs_at`]), then the
+/// `[everyone]` writes that waited for a removal's new key ([`log_entries::sign_waiting_writes`],
+/// one-mesh M4), each whether or not one before it fails. Every log member's subscriber runs it
+/// after each records pull, whatever its vault's source ([`vault_pass`]): an exchange signs
+/// nothing, so outside a person's act this is where a wrap gap closes, a due re-key is minted and
+/// a waiting write is signed. Returns what they signed, already in this Mac's records, nothing
+/// posted.
 ///
 /// # Errors
-/// As [`log_entries::close_wrap_gaps`] and [`tend_epochs_at`]; the gap closer's error, once the
+/// As [`log_entries::close_wrap_gaps`], [`tend_epochs_at`] and
+/// [`log_entries::sign_waiting_writes`]; of their errors the first, once the waiting writes and the
 /// tender ran.
 pub fn vault_pass_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> {
     let closed = log_entries::close_wrap_gaps(paths, now_ms);
     let tended = tend_epochs_at(paths, now_ms);
+    let waited = log_entries::sign_waiting_writes(paths, now_ms);
     let mut signed = closed?;
     signed.extend(tended?);
+    signed.extend(waited?);
     Ok(signed)
 }
 
@@ -1446,6 +1622,83 @@ thread_local! {
     /// over a prefix of `[everyone]`'s batch drops a Mac with no seat that batch may still wrap.
     pub(super) static EVERYONE_UNREAD: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the 8,500 stop's exemption (one-mesh §8): while set, the stop
+    /// holds every re-key past it, a rotation a held `Remove` made due too, so the writers that
+    /// wait on that rotation ([`log_entries::Waiting`]) wait for checkpoints with it. A test sets
+    /// it for its thread; a lab instance turns it on for its whole process with
+    /// `stop-holds-removals` in `ATERM_TEST_NEGATIVE_CONTROL`
+    /// ([`aterm_types::negative_control::on`]).
+    pub(super) static STOP_HOLDS_REMOVALS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`STOP_HOLDS_REMOVALS`] is on: set on this thread, or named for this process
+/// (`stop-holds-removals`); never in a release build, which has neither switch.
+fn stop_holds_removals() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        STOP_HOLDS_REMOVALS.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("stop-holds-removals")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// The audiences of `ready` the tender signs at the log's fill (one-mesh §8, "The 8,500 stop"):
+/// - every one a held `Remove` made due ([`RekeyDue::rotation`]: a newest epoch still wraps a
+///   Mac the log removed, the rotation a remover could not mint, and the coalesce of the heads
+///   concurrent removals leave, each of whose epochs wraps the Mac the other removed), at any
+///   fill: writers wait on it ([`log_entries::Waiting`]), and the person's removal reserved its
+///   room ([`RemovalFill`]; a seat move, below the proof-admission stop);
+/// - of the rest (a coalesce of heads no removal left, an F21 reseal's re-`Put`s), each in turn
+///   where the log's keyed records and the bound of what it and the re-keys kept before it sign
+///   ([`log_entries::rekey_keyed_bound`], over the seats `active` they carry) stay within
+///   [`crate::membership_log::RecordBudgets::automatic_keyed_stop`]. One that would pass it stays
+///   due and waits for checkpoints, nothing signed.
+fn within_automatic_stop(
+    log: &Log,
+    opened: &OpenedAudienceEntries,
+    flight: &log_entries::Flight,
+    active: &BTreeSet<Recipient>,
+    ready: Vec<EpochAudience>,
+) -> Vec<EpochAudience> {
+    let made_by_removal: BTreeSet<EpochAudience> = log
+        .rekey_dues()
+        .into_iter()
+        .filter(|due| due.rotation && !stop_holds_removals())
+        .map(|due| due.audience)
+        .collect();
+    let removed = log.removed_recipients();
+    let no_seats = BTreeSet::new();
+    let cost = |audience: &EpochAudience| {
+        let seats = if matches!(audience, EpochAudience::Hosts(_)) {
+            &no_seats
+        } else {
+            active
+        };
+        log_entries::rekey_keyed_bound(log, opened, flight, audience, seats, &removed, None)
+    };
+    let (mut kept, rest): (Vec<EpochAudience>, Vec<EpochAudience>) = ready
+        .into_iter()
+        .partition(|audience| made_by_removal.contains(audience));
+    let mut planned = kept.iter().fold(log.counts().keyed, |sum, audience| {
+        sum.saturating_add(cost(audience))
+    });
+    let stop = log.budgets().automatic_keyed_stop();
+    for audience in rest {
+        let after = planned.saturating_add(cost(&audience));
+        if after <= stop {
+            planned = after;
+            kept.push(audience);
+        }
+    }
+    kept
 }
 
 /// Whether [`UNDECIDED_HOLDS`] holds `audience` past the settle grace: it is set and
@@ -1519,7 +1772,9 @@ fn turn_of(
 ///   waits [`log_entries::REMOVER_GRACE_MS`] from when it first saw the removals the due waits
 ///   on ([`RekeyDue::removals`]), for the remover's own rotation to arrive, so a removal that
 ///   finds the audience due already still gets its grace; with no remover that can carry the
-///   audience, its carriers rank with no grace;
+///   audience, its carriers rank with no grace. A removal's clock starts at the first sight of
+///   its `Remove` ([`RekeyDue::removed`]), so one whose remover can carry only once a heal wraps
+///   it does not restart its grace at the heal;
 /// - an epoch another Mac minted whose batch this Mac may hold only a prefix of
 ///   ([`Log::unsettled`]) holds the audience, until it settles or
 ///   [`log_entries::SETTLE_GRACE_MS`] after this Mac first saw it (a minter whose batch ends in
@@ -1531,6 +1786,9 @@ fn turn_of(
 ///   their batch may still decide a Mac with no seat ([`Log::undecided`]): a re-key reads
 ///   `[everyone]`'s leave-out for each audience and would drop that Mac for good. Past the grace
 ///   what it mints leaves such a Mac out, as a removal's own rotation does.
+///
+/// A re-key no removal made due waits, unsigned and still due, where it would take the log's keyed
+/// records past [`crate::membership_log::AUTOMATIC_KEYED_STOP`] ([`within_automatic_stop`]).
 ///
 /// A ranked Mac that cannot open every newest epoch signs nothing, and the next rank acts a step
 /// later. What it mints carries the recipients a batch may still wrap ([`Log::in_flight`]). It
@@ -1563,31 +1821,64 @@ fn turn_of(
         project = "aterm_secrets::client::remove::tests::convergence::epoch_convergence_transition"
     )
 )]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "GapHeal",
+        action = "Rotate",
+        project = "aterm_secrets::client::remove::tests::gap_heal::gap_heal_transition"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "GapHeal",
+        action = "RotateByB",
+        project = "aterm_secrets::client::remove::tests::gap_heal::gap_heal_transition"
+    )
+)]
 pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> {
-    let Some(store) = trusted_store(paths)? else {
+    let Some((identity, mark, ready)) = look_at_dues(paths, now_ms)? else {
         return Ok(Vec::new());
     };
-    let Some(log) = store.log() else {
-        return Ok(Vec::new());
-    };
-    let Some(identity) = read_identity(paths)? else {
-        return Ok(Vec::new());
-    };
-    let dues = log.rekey_dues();
-    if dues.is_empty() {
-        let _ = std::fs::remove_file(epoch_mark_file(paths));
-        return Ok(Vec::new());
-    }
-    let Some((me, _, _)) = log_entries::open_local_member_signer(paths, log)? else {
-        return Ok(Vec::new());
-    };
-    let earlier = read_tend_mark(paths);
-    let (mark, ready) = ready_rekeys(log, &me, &earlier, now_ms);
-    write_tend_mark(paths, &mark)?;
     if ready.is_empty() {
         return Ok(Vec::new());
     }
     tend_ready_epochs(paths, now_ms, &identity, &mark)
+}
+
+/// The tender's scheduling look of a vault pass at `now_ms` ([`ready_rekeys`]), its clocks kept
+/// in the epoch mark: this Mac's identity, the mark, and the audiences whose re-key is this Mac's
+/// to mint now. `None` with no trusted log, identity or seat, or nothing due (the mark is
+/// dropped then).
+///
+/// # Errors
+/// Local state cannot be read, or the mark cannot be written.
+fn look_at_dues(
+    paths: &Paths,
+    now_ms: u64,
+) -> crate::Result<Option<(Identity, TendMark, Vec<EpochAudience>)>> {
+    let Some(store) = trusted_store(paths)? else {
+        return Ok(None);
+    };
+    let Some(log) = store.log() else {
+        return Ok(None);
+    };
+    let Some(identity) = read_identity(paths)? else {
+        return Ok(None);
+    };
+    let dues = log.rekey_dues();
+    if dues.is_empty() {
+        let _ = std::fs::remove_file(epoch_mark_file(paths));
+        return Ok(None);
+    }
+    let Some((me, _, _)) = log_entries::open_local_member_signer(paths, log)? else {
+        return Ok(None);
+    };
+    let earlier = read_tend_mark(paths);
+    let (mark, ready) = ready_rekeys(log, &me, &earlier, now_ms);
+    write_tend_mark(paths, &mark)?;
+    Ok(Some((identity, mark, ready)))
 }
 
 /// Compute ranks and settledness on the same log snapshot that authoring will use.
@@ -1653,8 +1944,11 @@ fn ready_rekeys(
             held |= waits;
             from = from.max(waited_to);
         }
+        // Each removal's clock starts at this Mac's first sight of its `Remove`, carried or not:
+        // a removal whose remover can carry the audience only once a heal wraps it waits from
+        // there, not from the heal (`GapHeal`'s `Rotate`).
         let mut removed_at = first;
-        for target in &due.removals {
+        for target in &due.removed {
             let at = earlier
                 .removal
                 .get(target)
@@ -1662,7 +1956,9 @@ fn ready_rekeys(
                 .unwrap_or(now_ms)
                 .min(now_ms);
             mark.removal.insert(*target, at);
-            removed_at = removed_at.max(at);
+            if due.removals.contains(target) {
+                removed_at = removed_at.max(at);
+            }
         }
         if grace_from_due() {
             removed_at = first;
@@ -1760,28 +2056,15 @@ fn tend_ready_epochs(
     mark: &TendMark,
 ) -> crate::Result<Vec<Record>> {
     let me_recipient = identity.recipient();
+    // The re-key's carry is the current seats (one-mesh M1, M4): a seat a newest epoch omitted
+    // is a gap the heal closes, never a Mac to drop from the next epoch.
     let active_recipients_of = |log: &Log| -> crate::Result<BTreeSet<Recipient>> {
-        let local_roster = log_entries::local_swarm_roster_for_log(paths, log)?;
-        let membership = log.membership();
-        // A Mac whose `[everyone]` `Wrap` a batch may still deliver is no Mac left out.
-        let flight = log.in_flight(&EpochAudience::Everyone, &me_recipient);
-        Ok(membership
-            .members()
-            .iter()
-            .filter(|(actor, m)| {
-                let recipient = m.binding.recipient();
-                !log.recipient_is_removed(&recipient)
-                    && !membership.member_node_removed(m)
-                    && (flight.contains(&recipient)
-                        || (!log.audience_left_out(&EpochAudience::Everyone, actor)
-                            && !log
-                                .audience_left_out_recipient(&EpochAudience::Everyone, &recipient)))
-                    && !local_roster
-                        .as_ref()
-                        .is_some_and(|r| log_entries::member_denied_by_roster(r, m))
-            })
-            .map(|(_, m)| m.binding.recipient())
-            .collect())
+        let local_roster = log_entries::local_roster_denies_for_log(paths, log, None)?;
+        Ok(log.current_recipients_where(&EpochAudience::Everyone, |m| {
+            local_roster
+                .as_ref()
+                .is_some_and(|r| log_entries::member_denied_by_roster(r, m))
+        }))
     };
     let (minted, _, resealed) = log_entries::author_and_commit_records(paths, |store| {
         let Some(mut log) = store.log().cloned() else {
@@ -1814,12 +2097,16 @@ fn tend_ready_epochs(
         let Some(opened) = log.open_audience_entries(identity)? else {
             return Ok((Vec::new(), false));
         };
+        // Read before the first epoch this pass mints, as `opened` was.
+        let flight = log_entries::Flight::of_batch(&log, &opened, &actor);
+        let still = within_automatic_stop(&log, &opened, &flight, &active, still);
+        if still.is_empty() {
+            return Ok((Vec::new(), false));
+        }
         let resealing = still
             .iter()
             .any(|audience| log_entries::reseal_ready(&opened, audience));
         let mut minted = Vec::new();
-        // Read before the first epoch this pass mints, as `opened` was.
-        let flight = log_entries::Flight::of_batch(&log, &opened, &actor);
         device.with_seed(|writer_seed| {
             let author = AuthorCtx {
                 actor: &actor,
@@ -1988,11 +2275,15 @@ pub fn test_remove_unposted(paths: &Paths, who: &str) -> crate::Result<usize> {
 /// A member's write of the `[everyone]` entry `name` through the log, sealed under the one newest
 /// `[everyone]` epoch this Mac holds, or the lowest id among newest [`secure_twins`] as a writer
 /// seals, and signed with its device key: the stand-in for a member's writer that F8's lane and
-/// the tests put a value with after a removal. Returns the epoch it sealed under.
+/// the tests put a value with after a removal. Returns the epoch it sealed under. A vault pass
+/// that holds this Mac's state delays the write, the hang detector at most
+/// ([`log_entries::author_and_commit_records_until`]: the snapshot and the draft's reads share one
+/// observation), as a person's write is not refused because its own subscriber is applying.
 ///
 /// # Errors
 /// This Mac holds no trusted log, is no member, opens no `[everyone]` epoch, or holds two newest
-/// ones that are not twins (the coverage rule has not run), or a record fails to sign or keep.
+/// ones that are not twins (the coverage rule has not run), a record fails to sign or keep, or a
+/// pass or another local writer still held the state at the hang detector.
 #[cfg(any(test, debug_assertions))]
 pub fn test_put_everyone(paths: &Paths, name: &str, value: &[u8]) -> crate::Result<RecordId> {
     if trusted_store(paths)?.is_none() {
@@ -2000,7 +2291,8 @@ pub fn test_put_everyone(paths: &Paths, name: &str, value: &[u8]) -> crate::Resu
     }
     let identity =
         read_identity(paths)?.ok_or_else(|| Error::new("this Mac has no secrets identity"))?;
-    let (minted, _, epoch) = log_entries::author_and_commit_records(paths, |store| {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let authored = log_entries::author_and_commit_records_until(paths, deadline, |store| {
         let log = store
             .log()
             .ok_or_else(|| Error::new("this Mac holds no membership log"))?;
@@ -2056,6 +2348,11 @@ pub fn test_put_everyone(paths: &Paths, name: &str, value: &[u8]) -> crate::Resu
         })?;
         Ok((vec![put], *epoch))
     })?;
+    let Some((minted, _, epoch)) = authored else {
+        return Err(Error::new(
+            "a vault pass or another local writer still held this Mac's state after a minute",
+        ));
+    };
     if !minted.is_empty() {
         let _ = post_records_to_servers(paths);
     }
@@ -2225,6 +2522,101 @@ pub fn member_list(paths: &Paths) -> crate::Result<Option<Vec<ListedMac>>> {
 )]
 #[doc(hidden)]
 pub fn epoch_convergence_environment() {}
+
+/// Host for `GapHeal`'s environment markers (one-mesh §9; A2's model, A3's conformance test), so
+/// `spec_xref_closure` accounts for every model action: what the lab's shape is, what an old
+/// build mints, when records reach a Mac, a person's roster deny, a Mac's sleep and the clock
+/// are what the Macs around the closer, the tender, the remover and the desk do.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "OldMint",
+        reason = "Environment: a pre-R1 Mac (C) mints by the intersection carry over a partial view, leaving out a Mac whose Admit it holds"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "OldMintOmitsB",
+        reason = "Environment: a pre-R1 Mac (C) mints by the intersection carry, leaving out a current seat it knows"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "Churn",
+        reason = "Environment: the lab shape where one Mac removes another while a second admits a newcomer"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "Deny",
+        reason = "Environment: a person denies a seat in the swarm roster (or its node is removed), reaching every Mac at once"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "DeliverToA",
+        reason = "Environment: a minter's batch reaches A, as a prefix or whole"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "DeliverToB",
+        reason = "Environment: a minter's batch reaches B whole"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "ToA",
+        reason = "Environment: B's records reach A"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "ToB",
+        reason = "Environment: A's records reach B: its batch as a prefix, then the rest, then its heals"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "Sleep",
+        reason = "Environment: A sleeps after its pass ran over what it last received"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "Wake",
+        reason = "Environment: A wakes and pulls every record before its next pass"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "GapHeal",
+        action = "Tick",
+        reason = "Environment: the injected clock passes the next deadline (a rank step, the settle grace, the remover's grace)"
+    )
+)]
+#[doc(hidden)]
+pub fn gap_heal_environment() {}
 
 #[cfg(test)]
 #[path = "remove_tests.rs"]

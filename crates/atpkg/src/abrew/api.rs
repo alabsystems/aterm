@@ -43,9 +43,10 @@ impl Api {
     }
 
     fn fresh(path: &std::path::Path, max_age: Duration) -> bool {
-        std::fs::metadata(path)
-            .and_then(|m| m.modified())
+        std::fs::symlink_metadata(path)
             .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| m.modified().ok())
             .and_then(|m| SystemTime::now().duration_since(m).ok())
             .is_some_and(|age| age < max_age)
     }

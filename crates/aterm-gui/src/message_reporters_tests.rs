@@ -940,6 +940,17 @@ fn every_reporter_message() -> Vec<Message> {
         all.push(super::auto_end_record(
             "verify ended aterm link broker (pid 4242) of its stage group: proof group,tree; gone",
         ));
+        all.push(super::proc_lane_record(
+            "lab refused /w/runs/lab-1/out/result.json: a link in its path, not followed",
+        ));
+        all.push(super::link_record(&aterm_vitals::left::LinkRow {
+            root: 1,
+            checkout: "/w/wt".into(),
+            path: "/w/wt/target".into(),
+            kind: "target".into(),
+            target: aterm_vitals::left::LinkTarget::Gone,
+            seen: "disk".into(),
+        }));
     }
     all.extend(integration_lost_fixtures());
     all.push(integration_rekey_waits("in tab 2", "s-0123456789abcdef"));
@@ -1860,6 +1871,7 @@ fn reopened_with_agent(
 ) -> crate::crash_journal::Reopened {
     let mut reopened = reopened_with_programs(class, programs);
     let claude = crate::restore::AgentRestore {
+        claude_auth: None,
         word: String::new(),
         pid: 4242,
         start: "Sat Sep 27 01:02:03 2026".into(),
@@ -4052,6 +4064,7 @@ fn left_fixture() -> aterm_vitals::left::LeftView {
         teller: None,
         token: Some(format!("{pid}@1792098840004410:331")),
         foreground: false,
+        after_agent: false,
     };
     let tab = |key: u64, label: &str, left: usize| ClosedTab {
         key,
@@ -4061,7 +4074,7 @@ fn left_fixture() -> aterm_vitals::left::LeftView {
         shell_uniqueid: 1_000,
         horizon: 2_000,
         closed_ms: LEFT_NOW - 7_200_000,
-        agent_since: None,
+        agent_spans: Vec::new(),
         left,
     };
     let daemon = LeftRow {
@@ -4132,18 +4145,130 @@ fn a_close_record_names_only_the_processes_end_takes() {
 }
 
 /// What a verify run ended unasked arrives as `appnotice proc <text>` and is a record under the
-/// `proc.` stem, never on any glass. NEGATIVE CONTROL: key it under `harness.`, and the stem is
-/// wrong.
+/// `proc.` stem, never on any glass; a link the lab refused, its line opening `lab`, is one under
+/// `proc.lab-link`. NEGATIVE CONTROL: key it under `harness.`, and the stem is wrong.
 #[test]
 fn appnotice_proc_records_under_the_proc_stem() {
     use aterm_messages::need::Need;
     let text =
         "verify ended aterm link broker (pid 4242) of its stage group: proof group,tree; gone";
-    let record = super::auto_end_record(text);
+    let record = super::proc_lane_record(text);
     assert_eq!(record.key.as_deref(), Some("proc.auto-end"));
     assert_eq!(record.tag, aterm_messages::tags::SYSTEM);
     assert_eq!(*record.need(), Need::Record);
     assert_eq!(record.title, text);
+    let lab = "lab refused /w/runs/lab-1/out/result.json: a link in its path, not followed";
+    let record = super::proc_lane_record(lab);
+    assert_eq!(record.key.as_deref(), Some("proc.lab-link"));
+    assert_eq!(*record.need(), Need::Record);
+    assert_eq!(record.title, "The lab refused a link");
+    assert_eq!(record.detail, [lab]);
+    assert_eq!(
+        super::proc_lane_record("laboratory words").key.as_deref(),
+        Some("proc.auto-end"),
+        "only the word `lab` speaks for the lab"
+    );
+}
+
+/// THE LEFTOVERS ENTRY BUILDS WITH ITS WORDS: a dead verify run's idle member an hour after its
+/// launcher died makes the entry its run's session owns, with a glass title, the reason only the
+/// person has, one step that names `end` and `sys left`, no button, and a detail line by source;
+/// its message raises no fault. A view that names nothing eligible makes none.
+#[test]
+fn the_leftovers_entry_builds_with_its_words() {
+    use aterm_messages::need::Need;
+    use aterm_vitals::left::{ENTRY_AFTER_MS, LeftRow, LeftView, RunRow, Source, State, Tier, Why};
+    let run = "41983-1792163800331520";
+    let member = LeftRow {
+        pid: 4300,
+        state: State::Left,
+        peer: None,
+        check_ms: None,
+        started_ms: Some(36_000_000),
+        cpu_ms: Some(0),
+        exe_judged: Some("/w/wt/target/debug/aterm-link".into()),
+        tier: Tier::Auto,
+        why: Why::LauncherDead,
+        proof: Vec::new(),
+        listen: false,
+        from: Source::Run(run.into()),
+        teller: None,
+        token: Some("4300@1792098840004410:9".into()),
+        foreground: false,
+        after_agent: false,
+    };
+    let view = |dead_ms: u64| LeftView {
+        rows: vec![member.clone()],
+        runs: vec![RunRow {
+            id: run.into(),
+            dead: true,
+            dead_ms: Some(dead_ms),
+            sid: Some("s-cd34".into()),
+            ..RunRow::default()
+        }],
+        ..LeftView::default()
+    };
+    let entries = super::leftovers_entries(&view(10 * ENTRY_AFTER_MS), ENTRY_AFTER_MS);
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.key(), "vitals.proc.s-cd34.leftovers");
+    assert!(entry.mover().is_none(), "no button ends several processes");
+    let msg = entry.message().expect("no EntryFault");
+    assert_eq!(msg.title, "Processes outlived their tab or run");
+    assert_eq!(msg.tag, aterm_messages::tags::SYSTEM);
+    assert_eq!(
+        msg.detail,
+        [
+            "only you know which of them you still want".to_owned(),
+            "End the ones you do not want with aterm ctl end, naming each token from aterm ctl \
+             sys left"
+                .to_owned(),
+            format!("aterm-link from verify run {run}, 10 h")
+        ]
+    );
+    assert!(
+        matches!(msg.need(), Need::Later(_)),
+        "an entry for later: {:?}",
+        msg.need()
+    );
+    assert!(
+        super::leftovers_entries(&view(ENTRY_AFTER_MS - 1), ENTRY_AFTER_MS).is_empty(),
+        "within the hour"
+    );
+}
+
+/// A DANGLING LINK IS RECORDED ONCE: the first view that holds a link the disk watch found
+/// dangling makes one `proc.link` record naming where it is and that nothing repairs it; a later
+/// view holding it again makes none.
+#[test]
+fn a_dangling_link_is_recorded_once() {
+    use aterm_messages::need::Need;
+    use aterm_vitals::left::{LeftView, LinkRow, LinkTarget};
+    let view = LeftView {
+        links: vec![LinkRow {
+            root: 1,
+            checkout: "/w/wt".into(),
+            path: "/w/wt/target".into(),
+            kind: "target".into(),
+            target: LinkTarget::NotMounted,
+            seen: "disk".into(),
+        }],
+        ..LeftView::default()
+    };
+    let mut told = std::collections::VecDeque::new();
+    let first = super::newly_dangling(&mut told, &view);
+    assert_eq!(first.len(), 1);
+    let record = super::link_record(first[0]);
+    assert_eq!(record.key.as_deref(), Some("proc.link"));
+    assert_eq!(*record.need(), Need::Record);
+    assert_eq!(
+        record.detail,
+        [
+            "/w/wt/target: its target's volume is not mounted",
+            "aterm leaves it as it is; aterm ctl sys left scope=aterm lists it"
+        ]
+    );
+    assert!(super::newly_dangling(&mut told, &view).is_empty());
 }
 
 /// This Mac's clock warning (docs/DESIGN-fluid-swarm-2026-10-28.md F22): under Off, a warning

@@ -27,6 +27,8 @@ mod admission;
 mod admit;
 mod bounded;
 mod chain_cache;
+#[cfg(any(test, debug_assertions))]
+mod commons_excluded;
 mod continuity;
 mod control_recovery;
 mod creation;
@@ -45,6 +47,7 @@ mod join_routing;
 mod ledger_publish;
 mod locker_skew;
 mod log_entries;
+mod mirrors;
 mod network_observation;
 mod network_refresh;
 mod open_migration;
@@ -58,17 +61,22 @@ mod removal_plan;
 mod remove;
 mod retirement;
 mod roster;
+mod seat_ask;
 mod steward;
 mod subscriber;
 mod toml_cache;
 mod vault_memo;
 use admin_keys::parse_admin;
 pub use admission::{Evidence as AdmissionEvidence, Method as AdmissionMethod};
+pub(crate) use admit::seated_member;
 pub use admit::{
-    ByLog, LogAdmission, accepts_bundle, admit_by_phrase, admits_by_log, hand_over,
-    log_admitted_actors, post_records_to_servers, write_from_log_bundle,
+    ByLog, LogAdmission, accepts_bundle, admit_by_phrase, admits_by_log, hand_over, hand_over_with,
+    log_admitted_actors, member_by_log, post_records_to_servers, readmit_from_log_bundle,
+    write_from_log_bundle,
 };
 pub use bounded::{join_if_unchanged_until, sync_reader_until};
+#[cfg(any(test, debug_assertions))]
+pub use commons_excluded::{CommonsExcluded, test_commons_excluded};
 pub use continuity::{Split, SplitBy, seat_splits, splits};
 pub use control_recovery::{
     CommonsRecovery, CommonsRecoveryCapacity, CommonsRecoveryPlan, CommonsRecoveryRecipient,
@@ -76,14 +84,18 @@ pub use control_recovery::{
 };
 pub use enrollment::{admin_cached, admin_cached_until};
 pub use entry::{
-    EntryObservation, EntrySnapshot, EntryVersion, VerifiedEntry, observe_verified_entry,
-    read_account_bound_entry, read_verified_entry,
+    EntryObservation, EntrySnapshot, EntryVersion, PublicRosterPair, PublicRosterRead,
+    VerifiedEntry, current_public_roster, observe_verified_entry, read_account_bound_entry,
+    read_verified_entry,
 };
 #[path = "client/mailbox_index.rs"]
 mod mailbox_index;
+#[cfg(any(test, debug_assertions))]
+pub use fleet::test_without_roster_wait;
 pub use fleet::{
     AlabFleet, FLEET_CODE_ENTRY, SWARM_ROSTER_ENTRY, admin_publish_alab_fleet, alab_fleet,
     alab_fleet_code, parse_denied_nodes_toml, swarm_denied_nodes, swarm_denied_nodes_until,
+    swarm_roster_until,
 };
 #[cfg(any(test, debug_assertions))]
 pub use fleet::{test_alab_fleet, test_hold_state_lock, test_with_denied_nodes_busy};
@@ -98,6 +110,9 @@ pub use handover::{
     take_handover_hold, write_from_bundle,
 };
 pub use http204_observation::{VaultHttp204Response, observe_http204_response};
+#[cfg(test)]
+pub(crate) use inspection::newest_everyone;
+pub(crate) use inspection::newest_everyone_until;
 pub use inspection::{
     CommonsControlInspection, MembershipHistoryInspection, inspect_membership_history_until,
 };
@@ -107,12 +122,16 @@ pub use ledger_publish::{
 };
 pub(crate) use log_entries::local_swarm_roster_for_log_held;
 pub use log_entries::{
-    admin_mirror_log, admit_member_in_log, check_log_commons_enrollment, configure_log_member,
-    enroll_commons_member_in_log, keyed_epochs_environment, local_swarm_roster_for_log,
-    member_denied_by_roster, publish_local_node_key, remove_member_in_log, trusted_commons_log,
+    admin_mirror_log, admit_member_in_log, applied_version_names_log, check_log_commons_enrollment,
+    configure_log_member, enroll_commons_member_in_log, keyed_epochs_environment,
+    local_swarm_roster_for_log, member_denied_by_roster, publish_local_node_key,
+    remove_member_in_log, trusted_commons_log,
 };
 pub use mailbox_index::{
     mailbox_component_held, read_mailbox_component, refresh_mailbox_component_index,
+};
+pub use mirrors::{
+    MAX_MIRRORS, MirrorProbe, mirror_notes, mirror_typed, probe_mirror, set_mirrors,
 };
 pub use network_observation::{VaultNetworkMaterialization, VaultNetworkSource};
 pub use network_refresh::{
@@ -120,26 +139,31 @@ pub use network_refresh::{
 };
 use peer_candidates::{PeerDiscovery, PeerUse};
 pub use readmit::{
-    AUTOMATIC_PER_HOUR, Book, How as ReadmitHow, MAX_READMISSIONS, ProofAdmissionCapacity, Proven,
-    READMIT_EVERY_MS, Readmit, admit_by_proof, prove_at, prove_at_ms, refuses_before_possession,
-    refuses_before_possession_at_ms,
+    AUTOMATIC_PER_HOUR, Book, How as ReadmitHow, KeptSeat, MAX_READMISSIONS,
+    ProofAdmissionCapacity, Proven, READMIT_EVERY_MS, Readmit, admit_by_proof, kept_seats,
+    prove_at, prove_at_ms, refuses_before_possession, refuses_before_possession_at_ms,
 };
 pub use remove::{
     ListedMac, MemberRemoval, RemovedNote, RemovedNotes, UndoOffer, UndoShare,
-    epoch_convergence_environment, member_list, read_after_cutoff_lines, remove_member,
-    removed_notes, removes_by_log, reseal_waits, revoke_by_log, tend_epochs, tend_epochs_at,
-    undo_offers, undo_removals, vault_admin_named, vault_pass_at,
+    epoch_convergence_environment, gap_heal_environment, member_list, read_after_cutoff_lines,
+    remove_member, removed_notes, removes_by_log, reseal_waits, revoke_by_log, tend_epochs,
+    tend_epochs_at, undo_offers, undo_removals, vault_admin_named, vault_pass_at,
 };
 #[cfg(any(test, debug_assertions))]
 pub use remove::{test_put_everyone, test_remove_unposted};
+#[cfg(any(test, debug_assertions))]
+pub use retained_history::{
+    RetainedHistoryReadCounts, RetainedHistoryReadOutcomes, test_retained_history_read_counts,
+};
 pub use retirement::{
     Retirement, Revocation, StolenRevocation, admin_retire, admin_revoke, admin_revoke_stolen,
     machine_named_in_vault, repair_half_done_revokes, rotate_fleet_code_text,
 };
+#[cfg(any(test, debug_assertions))]
+pub use roster::test_unwaited_roster;
 pub(crate) use roster::with_roster_observation;
-pub use roster::{
-    admin_seed_swarm_roster, resolve_local_swarm_label, swarm_lease_holder, swarm_roster,
-};
+pub use roster::{admin_seed_swarm_roster, resolve_local_swarm_label, swarm_lease_holder};
+pub use seat_ask::{Seat, accepts_seat, seat, seat_asks, take_seat};
 pub(crate) use steward::local_recipient_denial_held;
 pub(crate) use steward::{AlabRoleContext, AlabRoleObservation, observe_alab_role};
 pub use steward::{
@@ -149,7 +173,7 @@ pub use steward::{
     steward_revoke_check, steward_standby_server_check, stewardship,
 };
 pub use subscriber::mend_subscriber;
-pub use vault_memo::{swarm_denied_nodes_now, swarm_roster_now};
+pub use vault_memo::swarm_denied_nodes_now;
 #[cfg(test)]
 mod approver_queue_tests;
 #[cfg(test)]
@@ -158,6 +182,10 @@ pub(crate) use approver_queue_tests::{
 };
 #[cfg(test)]
 mod birth_tests;
+#[cfg(test)]
+mod desk_node_tests;
+#[cfg(test)]
+mod join_elsewhere_tests;
 #[cfg(test)]
 mod join_tests;
 #[cfg(test)]
@@ -176,6 +204,8 @@ mod peer_selection_tests;
 mod cold_read_tests;
 #[cfg(test)]
 mod envelope_denial_tests;
+#[cfg(test)]
+mod lab_start_over_tests;
 #[cfg(test)]
 mod log_only_tests;
 #[cfg(test)]
@@ -197,15 +227,40 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// The paths under `home`.
-    pub fn for_home(home: &Path) -> Paths {
+    /// Locate the paths under `home` without enrolling, retiring or moving any
+    /// identity. A read-only observer uses this rather than [`Self::for_home`].
+    pub fn locate_for_home(home: &Path) -> Paths {
         Paths {
             home: home.to_path_buf(),
             dir: home.join(".config").join("aterm").join("secrets"),
         }
     }
 
-    /// The paths under this user's home.
+    /// Locate this user's paths without running identity initialization.
+    /// # Errors
+    /// Returns an error when the user's home directory is unavailable.
+    pub fn locate() -> crate::Result<Paths> {
+        aterm_types::dirs::home_dir()
+            .map(|home| Self::locate_for_home(&home))
+            .ok_or_else(|| Error::new("no home directory"))
+    }
+
+    /// The paths under `home`. Where `home` is this user's home, the first such call in a process
+    /// sets a lab identity's vault folder aside where this process would make an unmarked identity
+    /// ([`start_over_live`]), so each use of this Mac's real vault folder after it sees the Mac it
+    /// starts as. Another home (a test's, a scratch one) is left as it is.
+    pub fn for_home(home: &Path) -> Paths {
+        let paths = Self::locate_for_home(home);
+        static STARTED_OVER: std::sync::Once = std::sync::Once::new();
+        if !STARTED_OVER.is_completed()
+            && aterm_types::dirs::home_dir().is_some_and(|live| live == home)
+        {
+            STARTED_OVER.call_once(|| start_over_live(&paths));
+        }
+        paths
+    }
+
+    /// The paths under this user's home ([`Paths::for_home`]).
     pub fn live() -> crate::Result<Paths> {
         aterm_types::dirs::home_dir()
             .map(|home| Paths::for_home(&home))
@@ -304,13 +359,31 @@ impl Paths {
     pub(crate) fn crossed_file(&self) -> PathBuf {
         self.dir.join("records.crossed")
     }
+
+    /// The files that hold the membership history this Mac acknowledged, which
+    /// [`load_acknowledged_records`] reads besides the records: the enrollment claim and the
+    /// journal's anchor, receipts and checkpoint. Every acknowledgement replaces the checkpoint,
+    /// and one can leave [`Self::records_file`] as it was (a write's records made durable before
+    /// it was cut short are acknowledged by the next writer), so a reader that keeps what it read
+    /// until its files change watches these too.
+    #[must_use]
+    pub fn acknowledged_history_files(&self) -> [PathBuf; 4] {
+        retained_history::files(self)
+    }
 }
 
 /// A machine's configured source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config {
-    /// Where the vault is.
+    /// Where the vault is: its one `url` (or path), the source a pass reads first and puts a lost
+    /// copy back to.
     pub source: Source,
+    /// Other addresses of the same vault (`mirrors` in `source.toml`), which a pass reads beside
+    /// its other servers and never writes to, and no join reaches: only the entries [`config`] keeps (a URL of this
+    /// vault's name, with no `#` pin, not the endpoint of `source` or of one before it, at most
+    /// [`MAX_MIRRORS`]); none for a path. What a mirror serves is verified under the one pin and
+    /// floor `source`'s is.
+    pub mirrors: Vec<String>,
     /// The vault's name.
     pub name: String,
     /// The pinned signing key (None for a plain text file at a path).
@@ -319,6 +392,24 @@ pub struct Config {
     pub followed: Vec<[u8; 32]>,
     /// The name this machine asked to be called.
     pub host: String,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mirrors: Vec<_> = self
+            .mirrors
+            .iter()
+            .map(|url| transport::describe(url))
+            .collect();
+        f.debug_struct("Config")
+            .field("source", &self.source)
+            .field("mirrors", &mirrors)
+            .field("name", &self.name)
+            .field("signer", &self.signer)
+            .field("followed", &self.followed)
+            .field("host", &self.host)
+            .finish()
+    }
 }
 
 /// Whether `config` is the ALab vault: pinned to a key this build names for it
@@ -678,7 +769,69 @@ enum StateObservation {
     Held(StateLock),
 }
 
+#[cfg(debug_assertions)]
+std::thread_local! {
+    /// The state lock files a local author on this thread observes across its draft
+    /// ([`Drafting`]).
+    static DRAFTING: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A shared observation of this Mac's state a local author holds across its snapshot and draft
+/// (`log_entries::author_and_commit_records` and its bounded variant): no vault pass takes the
+/// state mid-draft, so the draft's own reads of it (its signer, its roster) see the state its
+/// snapshot was read from rather than finding it busy. The author drops it before any exclusive
+/// take of the same lock. flock(2) grants this thread neither lock while it holds the other, so
+/// in a build with debug assertions an exclusive take of the lock on this thread under it panics
+/// rather than wait on it for good.
+pub(crate) struct Drafting {
+    _lock: StateLock,
+    #[cfg(debug_assertions)]
+    path: PathBuf,
+}
+
+impl Drafting {
+    fn new(lock: StateLock, paths: &Paths) -> Self {
+        #[cfg(debug_assertions)]
+        let path = paths.lock_file();
+        #[cfg(debug_assertions)]
+        DRAFTING.with(|held| held.borrow_mut().push(path.clone()));
+        #[cfg(not(debug_assertions))]
+        let _ = paths;
+        Self {
+            _lock: lock,
+            #[cfg(debug_assertions)]
+            path,
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for Drafting {
+    fn drop(&mut self) {
+        DRAFTING.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(at) = held.iter().rposition(|path| *path == self.path) {
+                held.remove(at);
+            }
+        });
+    }
+}
+
 impl StateLock {
+    /// Panics where an exclusive take of the lock at `path` would wait on this thread's own
+    /// [`Drafting`] observation of it for good.
+    #[cfg(debug_assertions)]
+    fn not_under_own_draft(path: &Path) {
+        DRAFTING.with(|held| {
+            assert!(
+                !held.borrow().iter().any(|drafting| drafting == path),
+                "an exclusive take of {} under this thread's own draft observation of it waits \
+                 for good: drop the observation first",
+                path.display()
+            );
+        });
+    }
+
     fn open_lock_file(paths: &Paths, path: &Path) -> crate::Result<std::fs::File> {
         fsx::ensure_private_dir(&paths.dir)?;
         fsx::open_lock(path)
@@ -691,46 +844,86 @@ impl StateLock {
     /// Finish only a storage transition a previous writer already prepared.
     fn recovered(self, paths: &Paths) -> crate::Result<Self> {
         crate::records_storage::recover_pending(&paths.records_file())?;
+        retained_history::recover_enrollment(paths)?;
+        retained_history::acknowledge(paths, &load_records(paths)?)?;
         Ok(self)
     }
 
     /// [`StateLock::take`] of the lock file at `path` in `paths.dir` ([`publish_lock`]).
     fn take_at(paths: &Paths, path: &Path) -> crate::Result<StateLock> {
-        let file: std::fs::File = Self::open_lock_file(paths, path)?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the take of StateLock, whose Drop releases by LOCK_UN (File::unlock)"
-        )]
-        file.lock()
-            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-        Ok(StateLock(file))
+        #[cfg(debug_assertions)]
+        Self::not_under_own_draft(path);
+        loop {
+            let file: std::fs::File = Self::open_lock_file(paths, path)?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the take of StateLock, whose Drop releases by LOCK_UN (File::unlock)"
+            )]
+            file.lock()
+                .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+            let lock = StateLock(file);
+            if lock.guards(path) {
+                return Ok(lock);
+            }
+        }
+    }
+
+    /// The lock file this holds is still the one at `path`: a lab identity's set-aside renames
+    /// the vault folder while it holds the lock (`start_over_as`), so a take that was waiting
+    /// on that file wakes holding a lock on the kept folder, which guards nothing at `path`. A
+    /// take that finds that drops it and takes the file at `path` again.
+    fn guards(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        self.0
+            .metadata()
+            .is_ok_and(|held| fsx::file_id(path) == Some((held.dev(), held.ino())))
     }
 
     fn take_at_until(paths: &Paths, path: &Path, deadline: Instant) -> crate::Result<StateLock> {
+        #[cfg(debug_assertions)]
+        Self::not_under_own_draft(path);
         publication_current(Some(deadline))?;
-        let file: std::fs::File = Self::open_lock_file(paths, path)?;
-        aterm_uds::file_lock::lock_exclusive_until(
-            &file,
-            deadline,
-            "vault publication lock is busy",
-        )?;
-        let lock = StateLock(file);
+        let lock = loop {
+            let file: std::fs::File = Self::open_lock_file(paths, path)?;
+            aterm_uds::file_lock::lock_exclusive_until(
+                &file,
+                deadline,
+                "vault publication lock is busy",
+            )?;
+            let lock = StateLock(file);
+            if lock.guards(path) {
+                break lock;
+            }
+        };
         publication_current(Some(deadline))?;
-        Ok(lock)
+        if path == paths.lock_file() {
+            lock.recovered(paths)
+        } else {
+            Ok(lock)
+        }
     }
 
     fn try_take(paths: &Paths) -> crate::Result<Option<StateLock>> {
         let path = paths.lock_file();
-        let file: std::fs::File = Self::open_lock_file(paths, &path)?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the non-blocking take of StateLock, whose Drop releases by LOCK_UN (File::unlock)"
-        )]
-        match file.try_lock() {
-            Ok(()) => StateLock(file).recovered(paths).map(Some),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => {
-                Err(Error::new(format!("{}: {e}", path.display())))
+        #[cfg(debug_assertions)]
+        Self::not_under_own_draft(&path);
+        loop {
+            let file: std::fs::File = Self::open_lock_file(paths, &path)?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the non-blocking take of StateLock, whose Drop releases by LOCK_UN (File::unlock)"
+            )]
+            match file.try_lock() {
+                Ok(()) => {
+                    let lock = StateLock(file);
+                    if lock.guards(&path) {
+                        return lock.recovered(paths).map(Some);
+                    }
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(Error::new(format!("{}: {e}", path.display())));
+                }
             }
         }
     }
@@ -738,6 +931,8 @@ impl StateLock {
     /// Try an existing private lock without creating files or repairing their permissions.
     fn try_take_existing(paths: &Paths) -> crate::Result<Option<StateLock>> {
         use std::os::unix::fs::MetadataExt as _;
+        #[cfg(debug_assertions)]
+        Self::not_under_own_draft(&paths.lock_file());
         let Some((file, metadata)) = Self::open_existing(paths, true)? else {
             return Ok(None);
         };
@@ -752,7 +947,15 @@ impl StateLock {
             reason = "nonblocking exclusive take of the existing state lock, released by StateLock Drop"
         )]
         match file.try_lock() {
-            Ok(()) => Ok(Some(Self(file))),
+            Ok(()) => {
+                let lock = Self(file);
+                // A lock file renamed away since it was opened guards nothing here: busy.
+                if lock.guards(&paths.lock_file()) {
+                    lock.recovered(paths).map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(Error::new(error.to_string())),
         }
@@ -795,19 +998,18 @@ impl StateLock {
             }
         }
         let path = paths.lock_file();
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(writable)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
-        {
+        let file = match aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(writable)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&path)
+        }) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(Error::new(format!("{}: {error}", path.display()))),
         };
         let metadata = fsx::lock_metadata(&file, &path)?;
-        aterm_uds::keep_out_of_children(&file)
-            .map_err(|error| Error::new(format!("{}: {error}", path.display())))?;
         Ok(Some((file, metadata)))
     }
 
@@ -821,7 +1023,7 @@ impl StateLock {
     /// as it is, for the observation to refuse as before. `true` when it narrowed one.
     ///
     /// Only the deny list's and roster's reads call this ([`swarm_denied_nodes`],
-    /// [`swarm_roster`] and their memos): a listener that cannot read its deny list refuses every
+    /// [`swarm_roster_until`] and the deny memo): a listener that cannot read its deny list refuses every
     /// peer until it can, so a lock an upgrade found wide must not wait for the next vault sync.
     /// Every other observation reads without repairing anything.
     ///
@@ -902,7 +1104,16 @@ impl StateLock {
             reason = "the shared take of StateLock, whose Drop releases by LOCK_UN (File::unlock)"
         )]
         match file.try_lock_shared() {
-            Ok(()) => Ok(StateObservation::Held(StateLock(file))),
+            Ok(()) => {
+                let lock = StateLock(file);
+                // A lock file renamed away since it was opened guards nothing here: busy, and a
+                // wait opens the one at the path again.
+                Ok(if lock.guards(&path) {
+                    StateObservation::Held(lock)
+                } else {
+                    StateObservation::Busy
+                })
+            }
             Err(std::fs::TryLockError::WouldBlock) => Ok(StateObservation::Busy),
             Err(std::fs::TryLockError::Error(error)) => {
                 Err(Error::new(format!("{}: {error}", path.display())))
@@ -923,10 +1134,24 @@ impl StateLock {
             if remaining.is_zero() {
                 return Ok(None);
             }
+            #[cfg(test)]
+            OBSERVE_BLOCKED.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook();
+                }
+            });
             std::thread::sleep(backoff.min(remaining));
             backoff = (backoff * 2).min(Duration::from_millis(50));
         }
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// A test's action on each blocked try of [`StateLock::observe_until`] that will try again,
+    /// run in the waiting thread, so a hold can end exactly while a reader waits on it.
+    pub(crate) static OBSERVE_BLOCKED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl Drop for StateLock {
@@ -987,7 +1212,7 @@ fn read_etc_hostname() -> Option<String> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open("/etc/hostname")
         .ok()?;
     let meta = file.metadata().ok()?;
@@ -1078,6 +1303,20 @@ pub fn join_code(recipient: &Recipient) -> String {
 }
 
 pub(crate) fn read_identity(paths: &Paths) -> crate::Result<Option<Identity>> {
+    Ok(read_identity_marked(paths)?.map(|(identity, _)| identity))
+}
+
+/// The comment line that marks a lab identity in its file ([`crate::LabMark`]), followed by the
+/// mark's word. A comment, so every build reads the key past it as before (the key is the last
+/// line that is not one).
+const LAB_LINE: &str = "# aterm lab identity: ";
+
+/// This machine's age identity and its lab mark, read together from one read of
+/// `~/.config/aterm/secrets/identity`: the mark is a line starting [`LAB_LINE`], written when the
+/// identity was made ([`install_identity`]).
+pub(crate) fn read_identity_marked(
+    paths: &Paths,
+) -> crate::Result<Option<(Identity, Option<crate::LabMark>)>> {
     let Some(bytes) = fsx::read_private(&paths.identity_file(), 16 << 10)? else {
         return Ok(None);
     };
@@ -1089,12 +1328,17 @@ pub(crate) fn read_identity(paths: &Paths) -> crate::Result<Option<Identity>> {
         .map(str::trim)
         .rfind(|line| !line.is_empty() && !line.starts_with('#'))
         .ok_or_else(|| Error::new("identity: no key in the file"))?;
-    Identity::parse(line).map(Some).map_err(|_| {
+    let mark = text.lines().map(str::trim).find_map(|line| {
+        line.strip_prefix(LAB_LINE)
+            .map(|rest| crate::LabMark::of_word(rest.split_whitespace().next().unwrap_or("")))
+    });
+    let identity = Identity::parse(line).map_err(|_| {
         Error::new(format!(
             "{}: not an age identity",
             paths.identity_file().display()
         ))
-    })
+    })?;
+    Ok(Some((identity, mark)))
 }
 
 /// Read this machine's age identity from `~/.config/aterm/secrets/identity` without creating one.
@@ -1105,16 +1349,35 @@ pub fn read_machine_identity(paths: &Paths) -> crate::Result<Option<Identity>> {
     read_identity(paths)
 }
 
-/// This machine's key, made (0600, age-keygen format) if there is none.
+/// This machine's key, made (0600, age-keygen format) if there is none: a lab identity where
+/// this process makes lab identities ([`crate::lab_identity`] of [`crate::Making::now`]).
 pub fn machine_identity(paths: &Paths) -> crate::Result<Identity> {
+    machine_identity_making(paths, crate::Making::now())
+}
+
+/// [`machine_identity`] as a process that is `making` would make it: the seam a test makes a
+/// release build's unmarked identity with, or a virtual machine's, whatever binary it runs in.
+#[cfg(any(test, debug_assertions))]
+pub fn machine_identity_as(paths: &Paths, making: crate::Making) -> crate::Result<Identity> {
+    machine_identity_making(paths, making)
+}
+
+fn machine_identity_making(paths: &Paths, making: crate::Making) -> crate::Result<Identity> {
     if let Some(identity) = read_identity(paths)? {
         return Ok(identity);
     }
     fsx::ensure_private_dir(&paths.dir)?;
-    install_identity(paths, Identity::generate()?)
+    install_identity(paths, Identity::generate()?, crate::lab_identity(making))
 }
 
-fn install_identity(paths: &Paths, identity: Identity) -> crate::Result<Identity> {
+/// Write `identity` as this machine's key with its lab mark, `mark` (A12): written with the key,
+/// in one new file, so no identity is ever without the mark it was made with, and none gains one
+/// later. Where another process wrote the file first, its key and mark win.
+fn install_identity(
+    paths: &Paths,
+    identity: Identity,
+    mark: Option<crate::LabMark>,
+) -> crate::Result<Identity> {
     let secret = identity.to_bech32();
     let mut file = format!(
         "# aterm secrets machine key: created {} (unix), never copied off this machine.\n# public key: {}\n",
@@ -1122,6 +1385,15 @@ fn install_identity(paths: &Paths, identity: Identity) -> crate::Result<Identity
         identity.recipient().to_bech32()
     )
     .into_bytes();
+    if let Some(mark) = mark {
+        file.extend_from_slice(
+            format!(
+                "{LAB_LINE}{} (it founds its own lab and never joins the live ALab)\n",
+                mark.word()
+            )
+            .as_bytes(),
+        );
+    }
     file.extend_from_slice(secret.as_slice());
     file.push(b'\n');
     let file = SecretBytes::new(file);
@@ -1130,6 +1402,464 @@ fn install_identity(paths: &Paths, identity: Identity) -> crate::Result<Identity
     }
     read_identity(paths)?
         .ok_or_else(|| Error::new("the machine key changed while it was being created; try again"))
+}
+
+/// The record a lab identity's set-aside leaves in the new vault folder ([`start_over_as`]): one
+/// line, `<unix seconds>\t<mark word>\t<the kept folder's name>`, never a key or a value. A fact
+/// for later, read on demand ([`lab_set_aside`]); never an alert.
+const LAB_SET_ASIDE_FILE: &str = "lab-set-aside";
+
+/// How long a set-aside waits for the vault folder's state lock that another process holds. A
+/// lock still held then leaves the folder as it is: the next process to start tries again.
+const LAB_SET_ASIDE_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// What one lab identity's set-aside did (A16): the mark the identity carried and the folder its
+/// vault state is kept in, beside the vault folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabSetAside {
+    /// The set-aside identity's mark.
+    pub mark: crate::LabMark,
+    /// The folder the lab identity's vault state is kept in (`<folder>.lab-<date>`).
+    pub kept: PathBuf,
+}
+
+impl LabSetAside {
+    /// The line `aterm secrets status` shows for it: what was set aside and where it is kept.
+    #[must_use]
+    pub fn status_line(&self) -> String {
+        format!(
+            "set aside: a lab identity ({}), kept as {}; this Mac started over as a new one",
+            self.mark.word(),
+            self.kept.display()
+        )
+    }
+}
+
+/// [`Paths::for_home`]'s once-per-process [`start_over_as`] of this process ([`crate::Making::now`])
+/// on this Mac's vault folder. What it did, or why it could not, is a line in this process's
+/// log; a failure leaves the folder as it was, so this Mac stays the lab identity every desk on
+/// the live ALab refuses until a later process sets it aside.
+fn start_over_live(paths: &Paths) {
+    // Most processes find an unmarked identity or none; only a marked one reads what this
+    // process is (its virtual-machine probe included).
+    if !matches!(read_identity_marked(paths), Ok(Some((_, Some(_))))) {
+        return;
+    }
+    match start_over_as(paths, crate::Making::now(), now()) {
+        Ok(Some(set)) => crate::log_line(&lab_set_aside_line(set.mark, &set.kept)),
+        Ok(None) => {}
+        Err(error) => crate::log_line(&format!(
+            "aterm secrets: this Mac's vault identity is a lab identity, and setting its vault \
+             folder aside did not finish ({error}); a later start tries again"
+        )),
+    }
+}
+
+fn lab_set_aside_line(mark: crate::LabMark, kept: &Path) -> String {
+    format!(
+        "aterm secrets: this Mac's vault identity was a lab identity ({}); its vault folder is \
+         kept as {} and this Mac starts as a new one",
+        mark.word(),
+        kept.display()
+    )
+}
+
+/// A lab identity under a release app starts over (A16): where `making`, what this process is,
+/// would make an unmarked identity ([`crate::lab_identity`] says `None`) and `paths`' vault folder
+/// holds a lab-marked one, rename that folder to `<folder>.lab-<date>` (`-2`, `-3`, … where that
+/// name is taken; `now_secs` dates it, UTC), and run the new-Mac path: a new, unmarked identity in
+/// a new folder, which the LAN rule admits as any new Mac. Nothing is deleted and nothing asks
+/// (first-run setup asks none); the new folder's [`LAB_SET_ASIDE_FILE`] names what was set aside.
+///
+/// `None`, changing nothing: a process that would itself make a lab identity (a test binary, a
+/// debug build, a lab lane's, one in a virtual machine), whose identity a lab identity is meant to
+/// be; an unmarked identity; no identity.
+///
+/// # Errors
+/// The identity file cannot be read, another process holds the folder's state lock past
+/// [`LAB_SET_ASIDE_LOCK_WAIT`], or the rename or the new identity's write fails. A failure before
+/// the rename changes nothing; one after it names the kept folder and leaves a vault folder the
+/// next [`machine_identity`] completes as a new Mac's (or, where a debug build's process made a
+/// lab identity there first, one the next start sets aside again).
+fn start_over_as(
+    paths: &Paths,
+    making: crate::Making,
+    now_secs: u64,
+) -> crate::Result<Option<LabSetAside>> {
+    start_over_then(paths, making, now_secs, || {})
+}
+
+/// [`start_over_as`], running `before_identity` after the new folder's record is written and
+/// before its identity is made: a test's stand-in for another process that makes one there in
+/// that moment.
+fn start_over_then(
+    paths: &Paths,
+    making: crate::Making,
+    now_secs: u64,
+    before_identity: impl FnOnce(),
+) -> crate::Result<Option<LabSetAside>> {
+    if crate::lab_identity(making).is_some() {
+        return Ok(None);
+    }
+    if !matches!(read_identity_marked(paths)?, Some((_, Some(_)))) {
+        return Ok(None);
+    }
+    let (Some(parent), Some(name)) = (paths.dir.parent(), paths.dir.file_name()) else {
+        return Err(Error::new(format!(
+            "{}: the vault folder has no parent to keep it beside",
+            paths.dir.display()
+        )));
+    };
+    let lock_path = paths.lock_file();
+    let lock = fsx::open_lock(&lock_path)?;
+    aterm_uds::file_lock::lock_exclusive_until(
+        &lock,
+        Instant::now() + LAB_SET_ASIDE_LOCK_WAIT,
+        "the vault folder's state lock is busy",
+    )
+    .map_err(|e| Error::new(format!("{}: {e}", lock_path.display())))?;
+    let lock = StateLock(lock);
+    // Under the lock, the folder at the vault's path is still the lab one: another process's
+    // set-aside, which holds this lock while it renames, moved none, or this reads its new one.
+    let Some((_, Some(mark))) = read_identity_marked(paths)? else {
+        return Ok(None);
+    };
+    let kept = rename_aside(parent, &name.to_string_lossy(), &paths.dir, now_secs)?;
+    // The lock file moved with the folder. A take waiting on it wakes to a file no longer at the
+    // lock's path and takes the new folder's instead ([`StateLock::guards`]).
+    drop(lock);
+    let kept_name = kept
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let started = move || -> crate::Result<()> {
+        aterm_durable::durable_dir(parent)?;
+        fsx::ensure_private_dir(&paths.dir)?;
+        fsx::write_atomic(
+            &paths.dir.join(LAB_SET_ASIDE_FILE),
+            format!(
+                "{now_secs}\t{}\t{}\n",
+                mark.word(),
+                kept_name.replace(['\t', '\n'], " ")
+            )
+            .as_bytes(),
+            0o600,
+        )?;
+        before_identity();
+        machine_identity_making(paths, making)?;
+        // A process that makes lab identities (a debug build's) may have made one in the new
+        // folder first; its key wins the write ([`install_identity`]), so say so rather than
+        // report a new Mac. The next start sets that one aside too.
+        if let Some((_, Some(again))) = read_identity_marked(paths)? {
+            return Err(Error::new(format!(
+                "another process made a lab identity ({}) in the new vault folder first",
+                again.word()
+            )));
+        }
+        Ok(())
+    };
+    started().map_err(|error| {
+        Error::new(format!(
+            "the lab identity's vault folder is kept as {}, and the new one is not finished: \
+             {error}",
+            kept.display()
+        ))
+    })?;
+    Ok(Some(LabSetAside { mark, kept }))
+}
+
+/// Rename `dir` (named `name` in `parent`) to the first free `<name>.lab-<YYYY-MM-DD>[-<n>]`,
+/// never over an existing entry (`RenameFlags::NOREPLACE`).
+fn rename_aside(parent: &Path, name: &str, dir: &Path, now_secs: u64) -> crate::Result<PathBuf> {
+    let days = i64::try_from(now_secs / 86_400).unwrap_or(0);
+    let (year, month, day) = aterm_types::rfc3339::civil_from_days(days);
+    let stem = format!("{name}.lab-{year:04}-{month:02}-{day:02}");
+    let parent_dir = std::fs::File::open(parent)
+        .map_err(|e| Error::new(format!("{}: {e}", parent.display())))?;
+    for n in 1..=1000_u32 {
+        let target = if n == 1 {
+            stem.clone()
+        } else {
+            format!("{stem}-{n}")
+        };
+        match aterm_dirfd::renameat_with(
+            &parent_dir,
+            name,
+            &parent_dir,
+            target.as_str(),
+            aterm_dirfd::RenameFlags::NOREPLACE,
+        )
+        .map_err(std::io::Error::from)
+        {
+            Ok(()) => return Ok(parent.join(target)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(e) => {
+                return Err(Error::new(format!(
+                    "{} -> {}: {e}",
+                    dir.display(),
+                    parent.join(target).display()
+                )));
+            }
+        }
+    }
+    Err(Error::new(format!(
+        "{}: every name {stem}[-n] up to 1000 is taken",
+        dir.display()
+    )))
+}
+
+/// The set-aside this vault folder's Mac started over from ([`start_over_as`]), as its record
+/// says: the mark and the kept folder (beside the vault folder). `None` where this folder was not
+/// made by one.
+///
+/// # Errors
+/// The record exists and cannot be read.
+pub fn lab_set_aside(paths: &Paths) -> crate::Result<Option<LabSetAside>> {
+    let Some(bytes) = fsx::read_private(&paths.dir.join(LAB_SET_ASIDE_FILE), 4 << 10)? else {
+        return Ok(None);
+    };
+    let text = String::from_utf8_lossy(bytes.as_slice()).into_owned();
+    let mut fields = text.lines().next().unwrap_or("").split('\t').skip(1);
+    let (Some(mark), Some(kept)) = (fields.next(), fields.next()) else {
+        return Ok(None);
+    };
+    let kept = paths
+        .dir
+        .parent()
+        .map_or_else(|| PathBuf::from(kept), |parent| parent.join(kept));
+    Ok(Some(LabSetAside {
+        mark: crate::LabMark::of_word(mark),
+        kept,
+    }))
+}
+
+/// [`start_over_as`], for a test that states what the process is and the time.
+#[cfg(any(test, debug_assertions))]
+pub fn start_over_lab_identity_as(
+    paths: &Paths,
+    making: crate::Making,
+    now_secs: u64,
+) -> crate::Result<Option<LabSetAside>> {
+    start_over_as(paths, making, now_secs)
+}
+
+impl crate::Making {
+    /// What this process is, read now ([`crate::lab_identity`]): a test binary by its executable's
+    /// name (`aterm_uds::test_binary::is_test_binary`), a build with debug assertions on, a
+    /// process a lab lane marked (`ATERM_LAB_MEMBER_SERVICE` set, whatever its value), and
+    /// whether it runs inside a virtual machine (macOS's `kern.hv_vmm_present`,
+    /// [`aterm_sysprobe::hv_vmm_present`]), as [`Self::reading`] reads them.
+    #[must_use]
+    pub fn now() -> Self {
+        Self::reading(
+            std::env::current_exe().is_ok_and(|exe| aterm_uds::test_binary::is_test_binary(&exe)),
+            aterm_sysprobe::hv_vmm_present,
+        )
+    }
+
+    /// [`Self::now`] for a process that is a test binary or not (`test_binary`), its
+    /// virtual-machine fact read through `virtual_machine`. A test binary, in any crate, reads no
+    /// probe: a test states the fact through [`crate::Making`], so no test's outcome hangs on the
+    /// host it runs on, a macOS VM included, and every identity a test binary makes is marked
+    /// [`crate::LabMark::TestBinary`] first anyway. A probe that does not answer (off macOS, a
+    /// kernel with no such name) is no virtual machine, so a Mac's own hardware never makes a lab
+    /// identity because a probe failed.
+    pub(crate) fn reading(test_binary: bool, virtual_machine: fn() -> Option<bool>) -> Self {
+        Self {
+            test_binary,
+            debug_build: cfg!(debug_assertions),
+            lab_lane: std::env::var_os(crate::discover::LAB_MEMBER_SERVICE_ENV).is_some(),
+            virtual_machine: !test_binary && virtual_machine() == Some(true),
+        }
+    }
+}
+
+/// The lab mark a joiner's lines carry (`members::wire::lab_field`) for an identity whose file
+/// carries `file` (its own mark), in a process that is `making`: the file's mark, or, for an
+/// identity an older build made unmarked, [`crate::LabMark::VirtualMachine`] in a virtual
+/// machine, as [`lab_standing`] counts it, so a member on the live genesis refuses that guest's
+/// ask, run and proof too, whatever members it names.
+pub(crate) fn wire_mark(
+    file: Option<crate::LabMark>,
+    making: crate::Making,
+) -> Option<crate::LabMark> {
+    file.or_else(|| {
+        making
+            .virtual_machine
+            .then_some(crate::LabMark::VirtualMachine)
+    })
+}
+
+/// This Mac's lab mark (A12): its vault identity's, as the identity file says; where it holds no
+/// identity yet, the mark of the one this process would make ([`crate::lab_identity`] of
+/// [`crate::Making::now`]); and in a virtual machine, [`crate::LabMark::VirtualMachine`] for an
+/// identity an older build made there unmarked. `None` for an identity a release build made on a
+/// Mac's own hardware, whatever build reads it now.
+///
+/// # Errors
+/// The identity file cannot be read or holds no key.
+pub fn lab_mark(paths: &Paths) -> crate::Result<Option<crate::LabMark>> {
+    Ok(lab_standing(paths, crate::Making::now())?.map(|(mark, _)| mark))
+}
+
+/// [`lab_mark`] for a process that is `making`, and what makes this Mac one, as its refusal says
+/// it ([`refused_as_lab`]).
+fn lab_standing(
+    paths: &Paths,
+    making: crate::Making,
+) -> crate::Result<Option<(crate::LabMark, &'static str)>> {
+    Ok(match read_identity_marked(paths)? {
+        Some((_, Some(mark))) => Some((mark, "this Mac's vault identity is a lab identity")),
+        // A VM guest's ask reaches a member from its host's address on the home LAN, so an
+        // identity a build before this one made in a VM (a legacy-upgrade guest's) is a lab
+        // identity there all the same. Only the VM counts here: an identity a release build made
+        // stays unmarked under a debug build, so a developer's own Mac keeps its seat.
+        Some((_, None)) => making.virtual_machine.then_some((
+            crate::LabMark::VirtualMachine,
+            "this Mac runs in a virtual machine, so its vault identity is a lab identity",
+        )),
+        None => crate::lab_identity(making).map(|mark| (mark, "this build makes lab identities")),
+    })
+}
+
+/// What a lab identity is told, before anything is dialed, when a join would ask the live ALab.
+pub const LAB_IDENTITY_REFUSAL: &str = "a lab identity founds its own lab; pass its URL";
+
+/// Refuse, before anything is dialed, a join that would ask the live ALab where this Mac is a lab
+/// identity ([`lab_mark`]): [`crate::ErrorKind::LabIdentity`]. The callers decide what asks the
+/// live ALab: `aterm secrets join` with no URL or the default one ([`fn@join`]), a browse of
+/// ALab's members ([`refuse_lab_member_browse`]), a proof over the fleet
+/// ([`refuse_lab_identity_for_fleet`]).
+///
+/// # Errors
+/// [`crate::ErrorKind::LabIdentity`], or the identity file cannot be read.
+pub fn refuse_lab_identity(paths: &Paths) -> crate::Result<()> {
+    refuse_lab_identity_as(paths, crate::Making::now())
+}
+
+/// [`refuse_lab_identity`] for a process that is `making`.
+fn refuse_lab_identity_as(paths: &Paths, making: crate::Making) -> crate::Result<()> {
+    refused_as_lab(paths, making, lab_standing(paths, making)?)
+}
+
+/// The refusal of [`lab_standing`]'s `standing` for a process that is `making`. Where this build
+/// on this hardware would make no lab identity, the mark is a held identity's that a test, a debug
+/// build or a lab lane made, and the refusal says how the Mac rejoins with the release app: once
+/// its vault folder is set aside (kept, never deleted; a release app's start does that to this
+/// user's own folder, [`start_over_as`]), this build makes it a new, unmarked identity, which
+/// joins as a reinstalled Mac does, its node key proving it on the home LAN (`client/readmit.rs`).
+fn refused_as_lab(
+    paths: &Paths,
+    making: crate::Making,
+    standing: Option<(crate::LabMark, &str)>,
+) -> crate::Result<()> {
+    let Some((mark, whose)) = standing else {
+        return Ok(());
+    };
+    let rejoin = if crate::lab_identity(making).is_none() {
+        format!(
+            "; this build makes no lab identity, so with this Mac's vault folder ({}) set aside \
+             (a release app's start does that to its own) it makes a new one that can join ALab",
+            paths.dir.display()
+        )
+    } else {
+        String::new()
+    };
+    Err(Error::of_kind(
+        crate::ErrorKind::LabIdentity,
+        format!("{whose} ({}): {LAB_IDENTITY_REFUSAL}{rejoin}", mark.word()),
+    ))
+}
+
+/// [`refuse_lab_identity`] before a browse for the members on this network with no member named
+/// (`aterm members join`, a waiting Mac's ask): a browse of a lab's own members service
+/// (`ATERM_LAB_MEMBER_SERVICE`, [`crate::discover::member_service`]) finds that lab's members
+/// alone and goes; a browse of ALab's `_alab._tcp` finds the live ALab's.
+///
+/// # Errors
+/// As [`refuse_lab_identity`].
+pub fn refuse_lab_member_browse(paths: &Paths) -> crate::Result<()> {
+    refuse_lab_member_browse_as(
+        paths,
+        std::env::var_os(crate::discover::LAB_MEMBER_SERVICE_ENV).as_deref(),
+        crate::Making::now(),
+    )
+}
+
+fn refuse_lab_member_browse_as(
+    paths: &Paths,
+    service: Option<&std::ffi::OsStr>,
+    making: crate::Making,
+) -> crate::Result<()> {
+    if crate::discover::member_service(service)
+        .is_ok_and(|service| service != crate::discover::MEMBER_SERVICE)
+    {
+        return Ok(());
+    }
+    refused_as_lab(paths, making, lab_standing(paths, making)?)
+}
+
+/// [`refuse_lab_identity`] before a proof over the fleet (`vault-join`), which names no vault:
+/// where this Mac follows a vault that is not ALab's (a lab's, joined by its URL), the proof goes
+/// to that lab's members; where it follows ALab's, or none yet, the fleet's members are the live
+/// ALab's.
+///
+/// # Errors
+/// As [`refuse_lab_identity`], or `source.toml` cannot be read.
+pub fn refuse_lab_identity_for_fleet(paths: &Paths) -> crate::Result<()> {
+    match config(paths)? {
+        Some(config) if !alab_vault(&config) => Ok(()),
+        _ => refuse_lab_identity(paths),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`live_genesis_store`] answers on one test thread, where this crate's unit tests
+    /// compile no ALab genesis: `Some(true)` makes a scratch vault's desk the live ALab's.
+    static LIVE_GENESIS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` on this thread with every vault read as the live ALab's (`on`) or not
+/// ([`on_live_genesis`]): the seam a test puts a scratch desk on the compiled ALab genesis with.
+#[cfg(test)]
+pub(crate) fn with_live_genesis<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LIVE_GENESIS.with(|live| live.set(self.0));
+        }
+    }
+    let _restore = Restore(LIVE_GENESIS.with(|live| live.replace(Some(on))));
+    f()
+}
+
+/// Whether `store` pins the ALab genesis this build compiles ([`crate::membership_log::Store::for_vault`]):
+/// the membership log it holds, or will, is the live ALab's.
+pub(crate) fn live_genesis_store(store: &crate::membership_log::Store) -> bool {
+    #[cfg(test)]
+    if let Some(on) = LIVE_GENESIS.with(std::cell::Cell::get) {
+        return on;
+    }
+    store.pinned_network().is_some_and(|pinned| {
+        crate::membership_log::genesis::compiled().is_ok_and(|compiled| compiled == Some(pinned))
+    })
+}
+
+/// Whether the vault at `paths` is the live ALab's by its genesis (A12): its record store pins
+/// the ALab genesis this build compiles ([`live_genesis_store`]), so the log a member here signs
+/// in is that genesis's. A desk here refuses a lab identity's ask, run and proof; a desk on any
+/// other genesis, a lab's, admits one. A store that cannot be read is the live ALab's unless the
+/// vault config names a lab's vault: a read that fails lets no lab identity in.
+#[must_use]
+pub fn on_live_genesis(paths: &Paths) -> bool {
+    match records_store(paths) {
+        Ok((_, store)) => live_genesis_store(&store),
+        Err(_) => !matches!(config(paths), Ok(Some(config)) if !alab_vault(&config)),
+    }
 }
 
 /// The configured source, if any.
@@ -1168,8 +1898,12 @@ pub fn config(paths: &Paths) -> crate::Result<Option<Config>> {
         followed = cached_chain(paths, pin);
     }
     let host = get("host").unwrap_or("machine").to_string();
+    // A mirror carries no authority, so no entry of `mirrors` fails the read: one this build
+    // does not keep (another vault's, a pin, a later build's form) costs that address alone.
+    let mirrors = mirrors::sorted(&source, &name, table.get("mirrors")).kept;
     Ok(Some(Config {
         source,
+        mirrors,
         name,
         signer,
         followed,
@@ -1186,6 +1920,14 @@ fn save_config(paths: &Paths, config: &Config) -> crate::Result<()> {
         Source::Path(path) => {
             text.push_str(&format!("path = {}\n", toml_str(&path.to_string_lossy())))
         }
+    }
+    // Written only when there are some, so a file with none is rewritten as before.
+    if matches!(config.source, Source::Url(_)) && !config.mirrors.is_empty() {
+        let urls: Vec<String> = config.mirrors.iter().map(|url| toml_str(url)).collect();
+        text.push_str(&format!(
+            "# other addresses of this vault, read beside it and never written to (aterm secrets mirrors)\nmirrors = [{}]\n",
+            urls.join(", ")
+        ));
     }
     text.push_str(&format!("name = {}\n", toml_str(&config.name)));
     if let Some(signer) = &config.signer {
@@ -1278,6 +2020,11 @@ struct State {
     /// one whose file is gone since is a gap the next pass fills. `None` in a state no apply of
     /// this record wrote (an older aterm's), until the next apply.
     own: Option<BTreeSet<String>>,
+    /// The names `aterm secrets keep` made this Mac's own ([`keep`]): each stays in the
+    /// manifest while its entry does, so its anchored set and a new value behave as before,
+    /// and the pass that drops its entry is handed a manifest without it, so the file is left
+    /// as the Mac's own instead of taken back ([`apply_entries`]).
+    kept: BTreeSet<String>,
 }
 
 /// Fingerprint the successful-round inputs relevant to a service health receipt. Ordinary
@@ -1290,6 +2037,7 @@ pub(crate) fn service_health_version(paths: &Paths) -> crate::Result<[u8; 32]> {
         "sequence":state.seq,
         "envelope":state.digest.map(|d|hex(&d)),
         "records":state.records_digest.map(|d|hex(&d)),
+        "retained_history":hex(&retained_history::version(paths)?),
         "state_source":state.source_identity.map(|d|hex(&d)),
         "configured_source":source.map(|d|hex(&d)),
         "membership":state.membership.word(),
@@ -1362,6 +2110,17 @@ fn load_state(paths: &Paths) -> crate::Result<State> {
             .unwrap_or(false),
         manifest,
         pending: digests("pending"),
+        kept: table
+            .get("kept")
+            .and_then(aterm_toml::Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(aterm_toml::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
         own: table
             .get("own")
             .and_then(aterm_toml::Value::as_array)
@@ -1416,6 +2175,10 @@ fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
     }
     if state.failed {
         text.push_str("failed = true\n");
+    }
+    if !state.kept.is_empty() {
+        let names: Vec<String> = state.kept.iter().map(|name| toml_str(name)).collect();
+        text.push_str(&format!("kept = [{}]\n", names.join(", ")));
     }
     if let Some(own) = &state.own {
         let names: Vec<String> = own.iter().map(|name| toml_str(name)).collect();
@@ -1522,6 +2285,46 @@ fn prepare_materialization(paths: &Paths, state: &mut State) -> crate::Result<()
     save_state(paths, state)
 }
 
+/// Whether `next`, a configuration written over `previous`, configures the vault `previous`
+/// configures: the same name, and a key line (the signer and the keys it followed) that keeps a
+/// key of the one before, as the history this Mac acknowledged ties a vault's membership to its
+/// name and keys. A rotation (either side of it), another address or another host name keep it;
+/// another vault, or the name on a line that keeps no key of the one before, is another.
+fn same_vault(previous: &Config, next: &Config) -> bool {
+    let line = |config: &Config| {
+        config
+            .signer
+            .into_iter()
+            .chain(config.followed.iter().copied())
+            .collect::<Vec<_>>()
+    };
+    let before = line(previous);
+    previous.name == next.name && line(next).iter().any(|key| before.contains(key))
+}
+
+/// Whether a configuration of a member's vault, `next` written over `previous` (a member's
+/// `[everyone]` files, a log bundle where this Mac holds no log, or the log-member seam), starts
+/// that vault afresh ([`forget_vault_left`]): no vault before, or another than [`same_vault`]
+/// keeps. A log bundle where this Mac holds a log is judged by the two logs' genesis instead
+/// (`admit::checked_log_bundle`).
+fn moves_vault(previous: Option<&Config>, next: &Config) -> bool {
+    !previous.is_some_and(|previous| same_vault(previous, next))
+}
+
+/// What a move to another vault forgets of `state` before the new vault's records or files are
+/// written (a member's bundle that [`moves_vault`], or the log-member seam): the version, the
+/// envelope digest and the records digest it applied of the vault left, so the new vault's first
+/// records are acknowledged as a first enrollment (`retained_history`), not held to the old vault's
+/// records digest, and its first version is no rollback of (nor a fork at) the old vault's
+/// sequence. The caller removes the vault left's cached envelope too, so this Mac reads the new
+/// vault from its log until its own envelope applies. A configuration of the same vault forgets
+/// none of it, so what this Mac applied stays that vault's floor.
+fn forget_vault_left(state: &mut State) {
+    state.seq = 0;
+    state.digest = None;
+    state.records_digest = None;
+}
+
 /// What `aterm secrets status` shows; reads only local state.
 pub fn status(paths: &Paths) -> crate::Result<Status> {
     let config = config(paths)?;
@@ -1584,7 +2387,11 @@ pub fn conflicts(paths: &Paths) -> crate::Result<Vec<String>> {
     let Some(identity) = read_identity(paths)? else {
         return Ok(Vec::new());
     };
-    let store = load_records(paths)?;
+    let Some(config) = config(paths)? else {
+        return Ok(Vec::new());
+    };
+    let store = load_records_for(paths, &config)?;
+    let store = log_entries::checked_author_projection_for(paths, &config, &store)?;
     let Some(opened) = store
         .log()
         .map(|log| log.open_entry_set(&identity))
@@ -1615,6 +2422,90 @@ pub fn delivered_files(paths: &Paths) -> crate::Result<BTreeSet<PathBuf>> {
         .chain(state.pending.keys())
         .filter_map(|name| materialize::target_path(&paths.home, name).ok())
         .collect())
+}
+
+/// What [`keep`] did with one name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kept {
+    /// Recorded kept: its file, which holds what the vault wrote, is left as the Mac's own once
+    /// its entry goes, as an adopted file is.
+    Kept,
+    /// Nothing changed for this name: why (never the value).
+    Not(String),
+}
+
+/// `aterm secrets keep <name>…`: make each file the vault wrote on this Mac the Mac's own
+/// (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.9, step A14), so a later `Delete` or dropped
+/// entry leaves it. A name is kept only while the manifest (or a cut pass's pending) holds it
+/// and its file holds, by digest, what the vault wrote; a name the manifest does not hold, a
+/// reserved name, an AI CLI's login and a missing or changed file change nothing.
+///
+/// The name is recorded in [`State::kept`] and stays in the manifest while its entry does: taken
+/// out at once, an ` if-absent` file would count as the Mac's own and the vault's files anchored
+/// to it would be withdrawn by the next pass. The pass that drops its entry is handed a manifest
+/// without it, so that pass leaves the file and the name leaves both ([`apply_entries`]). Under
+/// the state lock, so no pass runs between the look and the save. Reads only local state and
+/// digests of the files: no value is returned, and a Mac with no vault state keeps nothing and
+/// creates nothing.
+/// # Errors
+/// The vault's local state cannot be read, locked or saved.
+pub fn keep(paths: &Paths, names: &[String]) -> crate::Result<Vec<(String, Kept)>> {
+    let mut unique: Vec<&String> = Vec::new();
+    for name in names {
+        if !unique.contains(&name) {
+            unique.push(name);
+        }
+    }
+    let not_held = |name: &str| {
+        Kept::Not(format!(
+            "{name} is not in this Mac's manifest: the vault did not write its file here"
+        ))
+    };
+    if matches!(fsx::kind(&paths.state_file()), Ok(fsx::Kind::Missing)) {
+        return Ok(unique
+            .into_iter()
+            .map(|name| (name.clone(), not_held(name)))
+            .collect());
+    }
+    let _lock = StateLock::take(paths)?;
+    let mut state = load_state(paths)?;
+    let mut done = Vec::with_capacity(unique.len());
+    let mut changed = false;
+    for name in unique {
+        let wrote: Vec<&String> = [state.manifest.files.get(name), state.pending.get(name)]
+            .into_iter()
+            .flatten()
+            .collect();
+        let verdict = match materialize::target_path(&paths.home, name) {
+            Err(why) => Kept::Not(format!("{name}: {}", why.0)),
+            Ok(_) if wrote.is_empty() => not_held(name),
+            Ok(target) if matches!(fsx::kind(&target), Ok(fsx::Kind::Missing)) => {
+                Kept::Not(format!(
+                    "{name}: {} is missing: there is no file to keep",
+                    target.display()
+                ))
+            }
+            Ok(target)
+                if !wrote
+                    .iter()
+                    .any(|digest| materialize::holds_digest(&paths.home, name, digest)) =>
+            {
+                Kept::Not(format!(
+                    "{name}: {} does not hold what the vault wrote (changed, unreadable or not a plain file)",
+                    target.display()
+                ))
+            }
+            Ok(_) => {
+                changed |= state.kept.insert(name.clone());
+                Kept::Kept
+            }
+        };
+        done.push((name.clone(), verdict));
+    }
+    if changed {
+        save_state(paths, &state)?;
+    }
+    Ok(done)
 }
 
 /// Whether this machine's join request included a join-password proof.
@@ -1759,6 +2650,7 @@ pub fn materialization_mark(paths: &Paths) -> crate::Result<Option<Materializati
     let mut mark = aterm_digest::Sha256::new();
     mark.update(b"aterm materialization observation/1\0");
     mark.update(source_identity(&config));
+    mark.update(retained_history::version(paths)?);
     mark.update(state.seq.to_be_bytes());
     mark.update([u8::from(ready), u8::from(state.digest.is_some())]);
     if let Some(digest) = state.digest.or(state.records_digest) {
@@ -2706,12 +3598,26 @@ fn keep_config_with(paths: &Paths, into: &Path, expected: ExpectedConfig<'_>) ->
 }
 
 fn apply_entries(paths: &Paths, state: &mut State, entries: &[Entry]) -> crate::Result<Report> {
-    let resumed = std::mem::take(&mut state.pending);
+    let mut resumed = std::mem::take(&mut state.pending);
+    // A kept name whose entry this pass drops is the Mac's own from here: held back from the
+    // manifest (and from a cut pass's pending) this pass is handed, so it is not taken back.
+    let names: BTreeSet<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    let released: Vec<String> = state
+        .kept
+        .iter()
+        .filter(|name| !names.contains(name.as_str()))
+        .cloned()
+        .collect();
+    let mut held = state.manifest.clone();
+    for name in &released {
+        held.files.remove(name);
+        resumed.remove(name);
+    }
     let mut pended = materialize::Pending::new();
     let applied = materialize::apply_resuming(
         &paths.home,
         entries,
-        &state.manifest,
+        &held,
         &resumed,
         now(),
         &mut |held, pending| {
@@ -2730,6 +3636,7 @@ fn apply_entries(paths: &Paths, state: &mut State, entries: &[Entry]) -> crate::
             state.pending = landed(&paths.home, pended, &report.failed);
             state.own = Some(own_entries(entries, &manifest, &report));
             state.manifest = manifest;
+            state.kept.retain(|name| names.contains(name.as_str()));
             Ok(report)
         }
         Err(error) => {
@@ -2903,7 +3810,11 @@ fn cache_intact(paths: &Paths, state: &State) -> bool {
     config(paths).ok().flatten().is_some_and(|config| {
         config.signer.is_none()
             || (state.membership == Stored::In
-                && verified_cached_envelope(paths, &config, state).is_some())
+                && verified_cached_envelope(paths, &config, state).is_some_and(|bytes| {
+                    envelope::parse(&bytes).is_ok_and(|envelope| {
+                        log_entries::trusted_seeded_log(paths, &config, &envelope).is_ok()
+                    })
+                }))
     })
 }
 
@@ -3101,7 +4012,36 @@ fn sync_without_reconcile(
 /// The vault `source.toml` names and this Mac's empty record store for it
 /// ([`records_store_for`]).
 fn records_store(paths: &Paths) -> crate::Result<(String, crate::membership_log::Store)> {
-    records_store_for(config(paths)?.as_ref())
+    let config = config(paths)?;
+    records_store_selected(paths, config.as_ref())
+}
+
+fn records_store_selected(
+    paths: &Paths,
+    config: Option<&Config>,
+) -> crate::Result<(String, crate::membership_log::Store)> {
+    let (name, store) = records_store_for(config)?;
+    if let Some(config) = config
+        && let Some(network) = retained_history::pinned_network(paths, config)?
+    {
+        if store
+            .pinned_network()
+            .is_some_and(|compiled| compiled != network)
+        {
+            return Err(Error::new(
+                "compiled and retained membership roots disagree",
+            ));
+        }
+        return Ok((
+            name,
+            crate::membership_log::Store::with_compiled(Some(network)),
+        ));
+    }
+    let store = match config {
+        Some(config) => store.under(&retained_history::lineage(paths, config)),
+        _ => store,
+    };
+    Ok((name, store))
 }
 
 /// The record store name `config`'s vault keeps and an empty store for it
@@ -3139,13 +4079,88 @@ fn records_store_for(
 /// ([`crate::membership_log::Store::recover`]), and the next write
 /// replaces it, so one refused record never stops this Mac taking records. A file past
 /// [`crate::membership_log::MAX_RECORDS_STREAM`] (a build that bounded its store by count alone
-/// could write one) keeps the records its first that many bytes hold.
+/// could write one) keeps the records its first that many bytes hold. These are the raw records,
+/// a missing file read as none: an authority decision reads [`load_acknowledged_records`].
 ///
 /// # Errors
 /// `source.toml` cannot be read or parsed, the records layout is unavailable, the data cannot
 /// be read, or this build's ALab genesis digest is malformed.
 pub fn load_records(paths: &Paths) -> crate::Result<crate::membership_log::Store> {
     let (vault, store) = records_store(paths)?;
+    records_cache::read(paths, vault, store)
+}
+
+/// This Mac's membership store as an authority decision reads it: [`load_records`], projected
+/// onto the history this Mac acknowledged when a vault is configured. Where that history holds
+/// the store's genesis, the store reads exactly the records it acknowledged, none a writer made
+/// durable since and no writer has acknowledged yet. Every judgment of who belongs grants from
+/// the store read here, admission ([`load_acknowledged_and_ahead`]) included; [`load_records`]
+/// alone serves repair, replication and what this Mac states it holds, which take every record
+/// it holds. With no vault configured the store is [`load_records`]' own.
+///
+/// # Errors
+/// [`load_records`]' errors; the acknowledged history cannot be read; the store's genesis is
+/// one that history holds foreign or retired, or competes with the one it holds for this vault;
+/// and, of kind [`crate::ErrorKind::MembershipHistoryUnavailable`], a store that omits history
+/// this Mac acknowledged (the records file missing while that history holds this vault's
+/// genesis, as the flat layout's file gone reads as an empty store, or a snapshot behind it put
+/// back), a log this Mac has not acknowledged once that history was established, or, before
+/// then, a log other than the one this Mac last applied.
+pub fn load_acknowledged_records(paths: &Paths) -> crate::Result<crate::membership_log::Store> {
+    Ok(acknowledged_read(paths, false)?.acknowledged)
+}
+
+/// [`load_acknowledged_and_ahead`]'s read of this Mac's membership store.
+pub struct AcknowledgedRecords {
+    /// The store as [`load_acknowledged_records`] reads it, which an authority decision grants
+    /// from.
+    pub acknowledged: crate::membership_log::Store,
+    /// The raw store ([`load_records`]) of the same read, where its log holds records the
+    /// acknowledged one does not: a writer made them durable and no writer has acknowledged them
+    /// yet (one cut short between the two, or whose acknowledgement failed). It holds every
+    /// record the acknowledged store holds, as the read refuses a store that omits one, and its
+    /// records verify as every record this Mac keeps does. `None` where the two are one.
+    pub ahead: Option<crate::membership_log::Store>,
+}
+
+/// [`load_acknowledged_records`], with the raw records that read projected where they hold more
+/// ([`AcknowledgedRecords::ahead`]): what admission reads, which grants only from the
+/// acknowledged store and holds out every key either store holds out, so a removal or a rotation
+/// this Mac made durable stands at once, before any writer acknowledges it.
+///
+/// # Errors
+/// As [`load_acknowledged_records`].
+pub fn load_acknowledged_and_ahead(paths: &Paths) -> crate::Result<AcknowledgedRecords> {
+    acknowledged_read(paths, true)
+}
+
+/// One read of the store, projected under the configured vault; with `ahead`, the raw store kept
+/// where the projection dropped records.
+fn acknowledged_read(paths: &Paths, ahead: bool) -> crate::Result<AcknowledgedRecords> {
+    let config = config(paths)?;
+    let (vault, store) = records_store_selected(paths, config.as_ref())?;
+    let raw = records_cache::read(paths, vault, store)?;
+    let Some(config) = config else {
+        return Ok(AcknowledgedRecords {
+            acknowledged: raw,
+            ahead: None,
+        });
+    };
+    let kept = ahead.then(|| raw.clone());
+    let acknowledged = retained_history::project_store(paths, &config, raw)?;
+    let heads =
+        |store: &crate::membership_log::Store| store.log().map(crate::membership_log::Log::heads);
+    let ahead = kept.filter(|raw| heads(raw) != heads(&acknowledged));
+    Ok(AcknowledgedRecords {
+        acknowledged,
+        ahead,
+    })
+}
+
+/// An envelope-verified replacement is evaluated under its prospective configuration,
+/// before that configuration can replace the currently materialized source on disk.
+fn load_records_for(paths: &Paths, config: &Config) -> crate::Result<crate::membership_log::Store> {
+    let (vault, store) = records_store_selected(paths, Some(config))?;
     records_cache::read(paths, vault, store)
 }
 
@@ -3210,6 +4225,7 @@ fn write_record_buffered(
     )
 )]
 fn write_records(paths: &Paths, store: &crate::membership_log::Store) -> crate::Result<()> {
+    retained_history::validate_write(paths, store)?;
     let crosses = crate::crossing::past_legacy(
         store
             .log()
@@ -3229,7 +4245,8 @@ fn write_records(paths: &Paths, store: &crate::membership_log::Store) -> crate::
     }
     write_record_file(&records_file_for_write(paths, store)?, |writer| {
         store.write_encoded(writer)
-    })
+    })?;
+    retained_history::acknowledge(paths, store)
 }
 
 /// Isolate the old regular-file path before publishing custody that an older reader cannot hold.
@@ -3272,6 +4289,13 @@ pub fn records_bound(
 #[cfg(test)]
 #[path = "client/record_persistence_tests.rs"]
 mod record_persistence_tests;
+
+#[cfg(test)]
+#[path = "client/retained_history_tests.rs"]
+mod retained_history_tests;
+
+mod retained_frontier;
+mod retained_history;
 
 /// Retain verified membership records offered over Commons control repair for `(network,
 /// authority)`, returning one durable acknowledgement per wire.
@@ -3381,9 +4405,9 @@ fn retain_commons_records_with(
         .iter()
         .map(|wire| {
             let record = crate::membership_log::Record::decode(wire).ok()?;
-            if let crate::membership_log::Body::Genesis { root, signer, .. } = record.body()
+            if let crate::membership_log::Body::Genesis { root, .. } = record.body()
                 && (*root != expected
-                    || !log_entries::genesis_signer_matches_local_lineage(paths, signer)
+                    || !log_entries::genesis_record_matches_local_lineage(paths, &record)
                         .unwrap_or(false))
             {
                 return None;
@@ -3767,6 +4791,11 @@ fn sync_records_until(
     // it reads, and refusing the whole stream kept those records from every server that holds
     // it.
     let judge = |received| judge_received_records(&local_store, vault_name, received);
+    // A mirror this Mac lists is read and never posted to: what it lacks, it takes from the
+    // vault's servers, not from a member. It is not told who reads
+    // ([`mirrors::ReadOnly::subscriber_for`]), and its answer never vouches that the pass read
+    // the vault's newest records (`answering_bounds` below).
+    let read_only = mirrors::ReadOnly::of(paths, &config, extra_peers);
     // Each answer with whether the pull that asked for it named a memo's heads ([`UNTAKEN`]).
     type PeerRecordsFetch = (String, bool, crate::Result<PeerRecords>);
     let fetch_peers = |peers: &[String]| -> Vec<PeerRecordsFetch> {
@@ -3792,7 +4821,8 @@ fn sync_records_until(
                     peers,
                     within,
                     |url, left, limit| {
-                        transport::fetch_records_within(url, ids(url), left, sub_ref, bound, limit)
+                        let sub = read_only.subscriber_for(url, sub_ref);
+                        transport::fetch_records_within(url, ids(url), left, sub, bound, limit)
                     },
                     |url, read| match read? {
                         transport::Pulled::Fetched(answer) => Ok(PeerRecords::of(answer, judge)),
@@ -3878,7 +4908,10 @@ fn sync_records_until(
         (primary, peer_batches)
     };
     // Keep the answering bounds until ingestion ends: merging uncrossed branches can cross
-    // this Mac's log, making a previously compatible smaller server unable to follow it.
+    // this Mac's log, making a previously compatible smaller server unable to follow it. A
+    // mirror's is none of them: nothing posts a mirror records, so it falls behind by
+    // construction, and a pass only a mirror answered never vouches that this Mac read a
+    // removal (`readmit`'s freshness read fails closed then).
     let answering_bounds: Vec<_> = primary
         .as_ref()
         .ok()
@@ -3887,6 +4920,7 @@ fn sync_records_until(
         .chain(
             peer_batches
                 .iter()
+                .filter(|(url, _, _)| !read_only.holds(url))
                 .filter_map(|(_, _, res)| res.as_ref().ok().and_then(|peer| peer.bound.stated())),
         )
         .collect();
@@ -3959,6 +4993,7 @@ fn sync_records_until(
         if !needs {
             Reposted::satisfied(paths, &url);
         }
+        let post = needs && !read_only.holds(&url);
         let judged = match records {
             Brought::Unjudged(received) if received.byte_len() == 0 => None,
             Brought::Unjudged(received) => Some(judge(received)),
@@ -3967,7 +5002,7 @@ fn sync_records_until(
         match judged {
             None => {
                 any_answered = true;
-                if needs {
+                if post {
                     push_urls.push((url, boot, bound));
                 }
             }
@@ -3975,7 +5010,7 @@ fn sync_records_until(
                 if let Some(batch) = offered(&url, judged) {
                     any_answered = true;
                     verified_batches.push((batch, bound.crossed()));
-                    if needs {
+                    if post {
                         push_urls.push((url, boot, bound));
                     }
                 }
@@ -4104,12 +5139,7 @@ fn sync_records_until(
         let kept = match store.log() {
             None => false,
             Some(_) if rooted || vault_name == crate::ALAB_VAULT => true,
-            Some(log) => match log.genesis().body() {
-                crate::membership_log::Body::Genesis { signer, .. } => {
-                    log_entries::genesis_signer_matches_local_lineage(paths, signer)?
-                }
-                _ => false,
-            },
+            Some(log) => log_entries::commons_log_matches_local_lineage(paths, log)?,
         };
         let added = if kept {
             store.inventory().difference(&before).count()
@@ -4510,6 +5540,11 @@ fn live_alab_peer_urls(_paths: &Paths, config: &Config, found: Option<Found<'_>>
     crate::discover::candidate_urls(defaults, &discovered, &config.name)
 }
 
+/// The vault servers a pass of `config` reads beyond `primary_url` for `purpose`: the policy's
+/// servers and, where `purpose` reads the vault ([`PeerUse::vault_read`]), the mirrors `source.toml` lists,
+/// then `extra_peers` or what `found` discovers ([`PeerDiscovery::select`]). What any of them
+/// serves counts only as far as it verifies under the one pin and floor
+/// ([`peer_selection::select`]); what the pass writes goes to [`mirrors::ReadOnly::servers`].
 fn collect_sync_peer_urls(
     paths: &Paths,
     config: &Config,
@@ -4521,18 +5556,19 @@ fn collect_sync_peer_urls(
     if let Some(selected) = found.and_then(|source| source.preselected(config, primary_url)) {
         return selected;
     }
+    let mut known = policy_peer_urls(paths, config);
+    if purpose.vault_read() {
+        known.extend(config.mirrors.iter().cloned());
+    }
     let direct = PeerDiscovery::direct(None);
-    found.unwrap_or(&direct).select(
-        paths,
-        config,
-        primary_url,
-        &policy_peer_urls(paths, config),
-        extra_peers,
-        purpose,
-    )
+    found
+        .unwrap_or(&direct)
+        .select(paths, config, primary_url, &known, extra_peers, purpose)
 }
 
 struct SyncPeerHead {
+    /// The peer that served it.
+    url: String,
     seq: u64,
     digest: [u8; 32],
     parents: Vec<[u8; 32]>,
@@ -4540,9 +5576,10 @@ struct SyncPeerHead {
     network_body: Option<network_observation::Body>,
 }
 
-/// The head of the vault a peer served in `fetched`, where it verifies under `pin`, with the
-/// network evidence `attempt` binds to its bytes.
+/// The head of the vault the peer at `url` served in `fetched`, where it verifies under `pin`,
+/// with the network evidence `attempt` binds to its bytes.
 fn sync_peer_head(
+    url: &str,
     fetched: Fetched,
     attempt: Option<network_observation::Attempt>,
     config: &Config,
@@ -4556,6 +5593,7 @@ fn sync_peer_head(
         envelope::verify_for_reader(&body, &config.name, pin, &config.followed, None).ok()?;
     let digest = envelope.digest();
     Some(SyncPeerHead {
+        url: url.to_owned(),
         seq: envelope.seq,
         digest,
         parents: envelope.parents,
@@ -4567,7 +5605,7 @@ fn sync_peer_head(
 /// The verified heads every one of `urls` serves `subscriber`, read at once within `total`
 /// ([`fan_out::envelopes_within`]), each read's lookup and connect within
 /// [`transport::PROBE_CONNECT`]: in `urls`' order, without the peers that served none in time or
-/// served one that does not verify.
+/// served one that does not verify. A mirror of `read_only`'s is not told the subscriber.
 fn probe_peers_for_sync(
     paths: &Paths,
     urls: &[String],
@@ -4575,6 +5613,7 @@ fn probe_peers_for_sync(
     pin: &[u8; 32],
     total: Duration,
     subscriber: Option<&str>,
+    read_only: &mirrors::ReadOnly,
 ) -> Vec<SyncPeerHead> {
     if urls.is_empty() {
         return Vec::new();
@@ -4585,9 +5624,10 @@ fn probe_peers_for_sync(
         total,
         |url, left, limit| {
             let connect = Some(transport::PROBE_CONNECT.min(left));
+            let subscriber = read_only.subscriber_for(url, subscriber);
             transport::get_within_as(url, left, connect, subscriber, limit)
         },
-        |fetched| sync_peer_head(fetched, attempt, config, pin),
+        |url, fetched| sync_peer_head(url, fetched, attempt, config, pin),
     )
     .into_iter()
     .flatten()
@@ -4831,6 +5871,11 @@ fn sync_repairing_hearing(
                 _ => Vec::new(),
             })
         };
+        // The mirrors this Mac lists are read beside the servers and never written to: an
+        // admin's heal and its log go to the servers alone.
+        let read_only = std::cell::OnceCell::new();
+        let read_only =
+            || read_only.get_or_init(|| mirrors::ReadOnly::of(paths, &config, extra_peers));
         let mut max_peer_seq: Option<u64> = None;
         let is_local_admin = allow_mirror
             && admin_text_here(paths, &config, &before)
@@ -4849,11 +5894,15 @@ fn sync_repairing_hearing(
                     pin,
                     servers_within(PROBE_DEADLINE),
                     subscriber.as_deref(),
+                    read_only(),
                 );
                 max_peer_seq = found.iter().map(|p| p.seq).max();
                 if is_local_admin && !found.is_empty() {
+                    // A mirror takes no admin publish, so its head is none an admin's heal can
+                    // mend: only the servers' heads count.
                     let mut observed: Vec<HeadLineage> = found
                         .iter()
+                        .filter(|p| !read_only().holds(&p.url))
                         .map(|p| (p.seq, p.digest, p.parents.clone()))
                         .collect();
                     match &primary_result {
@@ -4876,8 +5925,7 @@ fn sync_repairing_hearing(
                         _ => {}
                     }
                     if heads_diverged(&observed) {
-                        let mut mirror_urls = vec![primary_url.clone()];
-                        mirror_urls.extend(peers.iter().cloned());
+                        let mirror_urls = read_only().servers(primary_url, peers);
                         if log_entries::mirror_log_to_servers(paths, &mirror_urls)?.is_some() {
                             refresh.delegated();
                             return sync_repairing_hearing(
@@ -4917,8 +5965,7 @@ fn sync_repairing_hearing(
             && log_entries::current_records_digest(paths, &config, &before)
                 .is_some_and(|digest| Some(digest) != before.records_digest)
         {
-            let mut mirror_urls = vec![primary_url.clone()];
-            mirror_urls.extend(peer_urls().iter().cloned());
+            let mirror_urls = read_only().servers(primary_url, peer_urls());
             if let Ok(Some(_)) = log_entries::mirror_log_to_servers(paths, &mirror_urls) {
                 refresh.delegated();
                 return sync_repairing_hearing(
@@ -4956,8 +6003,7 @@ fn sync_repairing_hearing(
                 log_entries::current_records_digest(paths, &config, &before).as_ref(),
             )
         {
-            let mut mirror_urls = vec![primary_url.clone()];
-            mirror_urls.extend(peer_urls().iter().cloned());
+            let mirror_urls = read_only().servers(primary_url, peer_urls());
             if let Ok(Some(_)) = log_entries::mirror_log_to_servers(paths, &mirror_urls) {
                 refresh.delegated();
                 return sync_repairing_hearing(
@@ -5009,8 +6055,7 @@ fn sync_repairing_hearing(
                         .flatten()
                         .is_some()
                 {
-                    let mut mirror_urls = vec![primary_url.clone()];
-                    mirror_urls.extend(peers.iter().cloned());
+                    let mirror_urls = read_only().servers(primary_url, peers);
                     if log_entries::mirror_log_to_servers(paths, &mirror_urls)?.is_some() {
                         refresh.delegated();
                         return sync_repairing_hearing(
@@ -5033,6 +6078,7 @@ fn sync_repairing_hearing(
                         pin,
                         servers_within(PROBE_DEADLINE),
                         subscriber.as_deref(),
+                        read_only(),
                     )
                     .into_iter()
                     .map(|p| p.seq)
@@ -5468,12 +6514,35 @@ fn apply_until(
         }
     };
     state.heard = now();
+    // A server serves the version a publish of this Mac left `[everyone]` writes pending on: they
+    // wait for the new key from now, whatever became of that publish's reply. Best effort: a
+    // pending set that does not land stays pending for the next read of that version.
+    if log_entries::waiting_pending(paths)
+        && let Ok(Some(identity)) = read_identity(paths)
+    {
+        let _ = log_entries::land_waiting_held(
+            paths,
+            &identity,
+            &log_entries::stored_versions(&envelope),
+        );
+    }
     let mut next_config = config.clone();
     if let Pin::Rotated(new) | Pin::Replaced(new) = pinned {
         next_config.signer = Some(new);
         next_config.followed = envelope.reached_from();
     }
-    let seeded_log = log_entries::trusted_seeded_log(paths, &next_config, &envelope)?;
+    if matches!(pinned, Pin::Rotated(_)) {
+        retained_history::acknowledge_for(
+            paths,
+            &load_records_for(paths, &next_config)?,
+            &next_config,
+        )?;
+    }
+    let seeded_log = if matches!(pinned, Pin::Replaced(_)) {
+        log_entries::replacement_seeded_log(paths, &next_config, &envelope)?
+    } else {
+        log_entries::trusted_seeded_log(paths, &next_config, &envelope)?
+    };
     let current_records_digest = seeded_log.as_ref().map(|(_, d)| *d);
     if !matches!(pinned, Pin::Replaced(_))
         && peer_selection::awaiting_applied_log(&state, current_records_digest)
@@ -5542,6 +6611,11 @@ fn apply_until(
         return Ok(SyncOutcome::Unchanged { seq: state.seq });
     }
     if let Pin::Replaced(_) = pinned {
+        retained_history::acknowledge_replacement(
+            paths,
+            &load_records_for(paths, &next_config)?,
+            &next_config,
+        )?;
         state.seq = 0;
         state.digest = None;
         state.records_digest = None;
@@ -6191,6 +7265,8 @@ fn ask_members_if_due(
         .flatten()
         .filter(|config| matches!(config.source, Source::Url(_)) && alab_vault(config));
     let state = load_state(paths).ok();
+    // A seatless recipient (its locker opened, no seat binds it) asks as a waiting Mac does, with
+    // the same keys, until a seat binds it (one-mesh S1, `seat_ask`).
     let waiting = config.as_ref().is_some_and(|config| {
         state
             .as_ref()
@@ -6198,7 +7274,7 @@ fn ask_members_if_due(
             && (!holds_allowed(paths)
                 || log_entries::trusted_configured_log(paths, config)
                     .is_ok_and(|log| log.is_some()))
-    });
+    }) || seat_ask::asks_for_seat(paths);
     let Some(state) = state.filter(|_| waiting) else {
         // A wait that begins again starts its pauses over.
         asked.at = None;
@@ -6653,6 +7729,11 @@ fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
         else {
             return Ok(None);
         };
+        // A lab identity asks ALab's vault nothing by itself (A12, [`request_join_until`]): it
+        // is passed over here, not refused and logged each pass.
+        if alab_vault(&current) && refuse_lab_identity(paths).is_err() {
+            return Ok(None);
+        }
         let state = load_state(paths)?;
         // A Mac the membership log let in asks too while it holds its `Allowed` (F15): an
         // admin's approver still names it in `[machines]` and the fleet, and a member's one
@@ -8124,15 +9205,18 @@ fn auto_approve_listed(
         let answer = Answered::of(&request);
         if members.contains(&request.recipient) {
             kept.extend(answer);
-            let log_member = |labels: &mut Option<(BTreeMap<String, String>, Vec<String>)>| {
-                labels
-                    .get_or_insert_with(|| roster::log_labels(paths))
-                    .0
-                    .contains_key(&request.recipient)
+            let log_member = |labels: &mut Option<(BTreeMap<String, String>, Vec<String>)>| -> crate::Result<bool> {
+                if let Some((names, _)) = labels {
+                    return Ok(names.contains_key(&request.recipient));
+                }
+                let read = roster::log_labels(paths)?;
+                let member = read.0.contains_key(&request.recipient);
+                *labels = Some(read);
+                Ok(member)
             };
             if request.allowed.is_some()
                 && !admin.served_machines.contains(&request.recipient)
-                && log_member(&mut log_labels)
+                && log_member(&mut log_labels)?
             {
                 unaddressed = true;
             }
@@ -8146,7 +9230,7 @@ fn auto_approve_listed(
                     .any(|(recipient, _, _): &(String, String, String)| {
                         *recipient == request.recipient
                     })
-                && log_member(&mut log_labels)
+                && log_member(&mut log_labels)?
                 && let Some(machine) = doc
                     .machines()
                     .into_iter()
@@ -8167,7 +9251,11 @@ fn auto_approve_listed(
             continue;
         }
         // A member's Allow admits whatever `[join]` says, but never a key the vault let go
-        // (`code-only`): an Allow kept by a Mac later removed cannot bring it back.
+        // (`code-only`) or one the membership log removed and did not restore: an Allow kept by
+        // a Mac later removed cannot bring it back, whichever member signed the removal. A
+        // removal another member signs reaches this admin's log, never its `code-only`; read
+        // only that list, the approver let the removed key back in from a request it had queued
+        // before, the next version left it out, and the two went on for good.
         let allowed = !members.contains(&request.recipient)
             && !code_only.contains(&request.recipient)
             && request.allowed.as_deref().is_some_and(|text| {
@@ -8176,6 +9264,12 @@ fn auto_approve_listed(
                     text,
                     &request,
                 )
+            })
+            && !Recipient::parse(&request.recipient).is_ok_and(|recipient| {
+                seat_log
+                    .get_or_insert_with(|| continuity::trusted_log(paths))
+                    .as_ref()
+                    .is_some_and(|log| log.recipient_is_removed(&recipient))
             });
         let approval = policy.filter(|approval| approval.reads(&request));
         if !allowed && approval.is_none() {
@@ -8247,11 +9341,15 @@ fn auto_approve_listed(
     let roster_before = rostered(&doc);
     if !done.approved.is_empty() || !unrostered.is_empty() {
         newly_named.extend(unrostered);
+        let labels = match log_labels {
+            Some(labels) => labels,
+            None => roster::log_labels(paths)?,
+        };
         roster::maintain_swarm_roster_on_approve(
             admin,
             &mut doc,
             &newly_named,
-            &log_labels.unwrap_or_else(|| roster::log_labels(paths)),
+            &labels,
             aterm_time::unix_millis().unwrap_or(0),
         )?;
     }
@@ -8816,7 +9914,7 @@ fn approve_observed_request_opened(
         admin,
         &mut doc,
         &[(recipient.to_owned(), request.host.clone(), host.clone())],
-        &roster::log_labels(paths),
+        &roster::log_labels(paths)?,
         aterm_time::unix_millis().unwrap_or(0),
     )?;
     let published = admin_publish_approved(paths, admin, &doc, &[recipient.to_owned()])?;
@@ -9319,6 +10417,12 @@ fn request_join_until(
     asker: Asker,
     deadline: Option<Instant>,
 ) -> crate::Result<String> {
+    // A12: an ask nobody typed (the subscriber's re-ask, the handover's ask with its `Allowed`)
+    // goes to ALab's vault only from an identity that is no lab identity. A join a person typed
+    // was judged where they typed it (`join`).
+    if asker == Asker::Again && alab_vault(config) {
+        refuse_lab_identity(paths)?;
+    }
     let identity = machine_identity(paths)?;
     let recipient = identity.recipient();
     let code = join_code(&recipient);
@@ -9420,6 +10524,12 @@ fn join_live(
 ) -> crate::Result<JoinOutcome> {
     expected.check_sharing(paths)?;
     let typed = options.source.trim();
+    // No URL, or the default one (System State's first run passes it), asks the live ALab: a lab
+    // identity is refused before the look and the fetch (A12). A URL a person typed goes; its
+    // vault decides.
+    if typed.is_empty() || crate::is_alab_default_url(typed) {
+        refuse_lab_identity(paths)?;
+    }
     if options.fetched.is_none()
         && alab_signer_built_in()
         && (typed.is_empty() || crate::is_alab_default_url(typed))
@@ -9539,6 +10649,7 @@ fn join_with_until(
         }
         let config = Config {
             source: source.clone(),
+            mirrors: Vec::new(),
             name,
             signer: None,
             followed: Vec::new(),
@@ -9605,8 +10716,19 @@ fn join_with_until(
         Pin::Same => (pin, followed),
         Pin::Rotated(new) | Pin::Replaced(new) => (new, parsed.reached_from()),
     };
+    let replaced = matches!(checked, Pin::Replaced(_));
+    // The vault this Mac read goes on (the same place, name and pin, or a key that pin handed
+    // off to): so does the state it holds of it, and so do its other addresses. Any other join
+    // starts with none, so another vault of that name is never read at this one's addresses.
+    let goes_on = same_place && stored == Some(pin) && !replaced;
+    let mirrors = previous
+        .as_ref()
+        .filter(|_| goes_on)
+        .map(|previous| previous.mirrors.clone())
+        .unwrap_or_default();
     let config = Config {
         source: source.clone(),
+        mirrors,
         name: name.clone(),
         signer: Some(pinned),
         followed,
@@ -9617,9 +10739,8 @@ fn join_with_until(
         creation::permit_join(paths)?;
         expected.check(paths)?;
         let identity = machine_identity(paths)?;
-        let replaced = matches!(checked, Pin::Replaced(_));
         let mut state = load_state(paths)?;
-        if !same_place || stored != Some(pin) || replaced {
+        if !goes_on {
             state.seq = 0;
             state.digest = None;
             state.records_digest = None;
@@ -11129,15 +12250,17 @@ fn publish_as_with_removal(
     // behind. An explicit revoke prepares the entire security operation and keeps it atomically
     // after sealing but before publication: failed publication cannot undo its retirement.
     let mut attempt = 0;
-    let (drafted, bytes, release, pairs) = loop {
+    let (drafted, waiting, bytes, release, pairs) = loop {
         let prepared = match removing.as_ref() {
             Some((recipients, _)) => Some(removal_plan::prepare(
                 paths, admin, doc, &identity, recipients, deadline,
             )?),
             None => None,
         };
-        let drafted = if let Some(prepared) = &prepared {
-            prepared.drafted.clone()
+        // A removal's prepared batch rotates itself; an edit's `[everyone]` writes may wait for
+        // the new key of a removal here whose rotation this Mac lacks (one-mesh M4).
+        let (drafted, waiting) = if let Some(prepared) = &prepared {
+            (prepared.drafted.clone(), log_entries::Waiting::default())
         } else {
             match admin.log_base {
                 log_entries::LogBase::Covers | log_entries::LogBase::Unstamped => {
@@ -11158,10 +12281,16 @@ fn publish_as_with_removal(
                         },
                         deadline,
                     )?
+                    .map_or(
+                        (None, log_entries::Waiting::default()),
+                        |(drafted, waiting)| (Some(drafted), waiting),
+                    )
                 }
                 // A log behind the version edited would draft the older values it holds: the edit goes
                 // out unstamped, read from its lockers until a writer whose log holds it imports it.
-                log_entries::LogBase::Behind | log_entries::LogBase::NoLog => None,
+                log_entries::LogBase::Behind | log_entries::LogBase::NoLog => {
+                    (None, log_entries::Waiting::default())
+                }
             }
         };
         let stamp = drafted.as_ref().and_then(log_entries::Drafted::stamp);
@@ -11233,20 +12362,19 @@ fn publish_as_with_removal(
             }
             retirement::validate_removals(paths, admin, doc)?;
         }
-        break (drafted, bytes, release, pairs);
+        break (drafted, waiting, bytes, release, pairs);
     };
-    // The drafted records are held from here until a server's answer says what became of the
-    // envelope that stamps them: one stored by a publish that never got to keep them (the process
-    // ended, every reply was lost) names records nobody else has, and its writer takes them in from
-    // this hold when it next reads that version (`log_entries::adopt_held_draft`).
+    // The drafted records are held from here until what became of the envelope that stamps them
+    // is known, in a hold of this version's own beside every server the envelope may reach: one
+    // stored by a publish that never got to keep them (the process ended, every reply was lost)
+    // names records nobody else has, and its writer takes them in from that hold when it reads
+    // the version back as a head (`log_entries::adopt_held_draft`), whatever a later publish from
+    // the same opened version was told meanwhile.
     publication_current(deadline)?;
-    if let Some(drafted) = &drafted {
-        log_entries::hold_drafted(paths, drafted)?;
-    }
-    publication_current(deadline)?;
-    let local = match &admin.config.source {
+    let version = envelope::parse(&bytes)?.digest();
+    let bounded_found = PeerDiscovery::empty();
+    let (urls, reach) = match &admin.config.source {
         Source::Url(_) => {
-            let bounded_found = PeerDiscovery::empty();
             let urls = ledger_publish::publish_candidate_urls(
                 paths,
                 &admin.config,
@@ -11259,6 +12387,35 @@ fn publish_as_with_removal(
                     found
                 },
             );
+            let reach = urls.clone();
+            (urls, reach)
+        }
+        Source::Path(path) => (Vec::new(), vec![path.display().to_string()]),
+    };
+    if let Some(drafted) = &drafted {
+        log_entries::hold_drafted(paths, drafted, seq, &version, &reach)?;
+    }
+    // The `[everyone]` writes waiting for the new key are kept from here too, pending on this
+    // version: they wait only once a server took it (`log_entries::land_waiting`), here or at a
+    // later sync or mirror that reads it from a server, and are dropped where every server
+    // refused it.
+    log_entries::wait_for_key(
+        paths,
+        &identity,
+        &waiting,
+        &version,
+        &admin.opened_heads,
+        deadline,
+    )?;
+    publication_current(deadline)?;
+    #[cfg(test)]
+    if CUT_BEFORE_STORE.with(std::cell::Cell::take) {
+        return Err(Error::new(
+            "test: the publish ended before any server took its version",
+        ));
+    }
+    let local = match &admin.config.source {
+        Source::Url(_) => {
             let outcomes = ledger_publish::publish_to_servers_for_admin_until(
                 paths,
                 &admin.config,
@@ -11286,7 +12443,10 @@ fn publish_as_with_removal(
                     })
                 });
                 if refused {
-                    log_entries::forget_held_draft(paths);
+                    // This version's hold alone: a server that refused it as not newer may hold
+                    // an earlier one of this Mac's whose reply was lost.
+                    log_entries::forget_held_draft(paths, seq, &version, deadline);
+                    log_entries::forget_waiting(paths, &identity, &version);
                 }
                 for (_, res) in outcomes {
                     if let Err(err) = res {
@@ -11326,8 +12486,25 @@ fn publish_as_with_removal(
                     deadline,
                     Some(posts_by),
                 )?;
-                log_entries::forget_held_draft(paths);
             }
+            // Its records kept, where it drafted any, this version is this Mac's head: its hold
+            // goes, and the others are settled with its parents and the servers that took it.
+            let took: Vec<String> = outcomes
+                .iter()
+                .filter(|(_, result)| result.is_ok())
+                .map(|(url, _)| url.clone())
+                .collect();
+            log_entries::forget_landed_draft(
+                paths,
+                seq,
+                &version,
+                parents,
+                &took,
+                drafted.is_some(),
+                deadline,
+            );
+            // Best effort: a sync or mirror that reads this version lands them where this does not.
+            let _ = log_entries::land_waiting(paths, &identity, &[version], deadline);
             // A server took this version: it is this Mac's own last version now, the one its
             // mirror carries an approval back from should every server drop it at a heal
             // (`own_head`), unless the one kept still carries a Mac this version lacks.
@@ -11354,23 +12531,37 @@ fn publish_as_with_removal(
             }
         }
         Source::Path(_) => {
-            {
+            let published = {
                 let _lock = configured_admin_until(paths, &admin.config, deadline)?;
-                let published = transport::publish_until(&admin.config.source, &bytes, deadline);
-                if published.as_ref().is_err_and(|err| {
-                    matches!(
-                        err.kind(),
-                        crate::ErrorKind::NotStored | crate::ErrorKind::Refused
-                    )
-                }) {
-                    log_entries::forget_held_draft(paths);
-                }
-                published?;
+                transport::publish_until(&admin.config.source, &bytes, deadline)
+            };
+            if published.as_ref().is_err_and(|err| {
+                matches!(
+                    err.kind(),
+                    crate::ErrorKind::NotStored | crate::ErrorKind::Refused
+                )
+            }) {
+                // This version's hold alone, as above.
+                log_entries::forget_held_draft(paths, seq, &version, deadline);
+                // Outside the state lock, which forgetting the waiting writes takes.
+                log_entries::forget_waiting(paths, &identity, &version);
             }
+            published?;
+            // Best effort, as above.
+            let _ = log_entries::land_waiting(paths, &identity, &[version], deadline);
             if let Some(drafted) = &drafted {
                 log_entries::keep_drafted_until(paths, drafted, &[], deadline, None)?;
-                log_entries::forget_held_draft(paths);
             }
+            // As above: this version is this Mac's head, and the vault's file took it.
+            log_entries::forget_landed_draft(
+                paths,
+                seq,
+                &version,
+                parents,
+                &reach,
+                drafted.is_some(),
+                deadline,
+            );
             match deadline {
                 Some(deadline) => sync_reader_until(paths, deadline)
                     .err()
@@ -11422,6 +12613,13 @@ thread_local! {
     /// A test's cut: the next publish on this thread ends once the servers answered, before it
     /// keeps its records, as a process that ends there does.
     static CUT_AFTER_STORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's cut: the next publish on this thread ends once it kept its records and waiting
+    /// writes held, before any server took its version, as a process that ends there does.
+    static CUT_BEFORE_STORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Shared preflight for publication and irreversible membership retirement.
@@ -11732,6 +12930,7 @@ fn create_initial(
     transport::publish(&source, &bytes)?;
     let config = Config {
         source,
+        mirrors: Vec::new(),
         name: name.clone(),
         signer: Some(signer),
         followed: Vec::new(),
@@ -12553,7 +13752,8 @@ mod tests {
             format!("https://{query}@vault.example/v1/alab#{fragment}"),
         ] {
             let config = Config {
-                source: Source::Url(url),
+                source: Source::Url(url.clone()),
+                mirrors: vec![url],
                 name: "alab".to_owned(),
                 signer: None,
                 followed: Vec::new(),
@@ -13347,6 +14547,7 @@ mod tests {
         let paths = Paths::for_home(&root.path().join("reader"));
         let initial = Config {
             source: Source::Path(source.clone()),
+            mirrors: Vec::new(),
             name: "team".into(),
             signer: None,
             followed: Vec::new(),
@@ -13453,6 +14654,7 @@ mod tests {
         let reader = Paths::for_home(&root.path().join("absent"));
         let expected = Config {
             source: Source::Path(root.path().join("team.secrets")),
+            mirrors: Vec::new(),
             name: "team".into(),
             signer: None,
             followed: Vec::new(),
@@ -13745,6 +14947,7 @@ mod tests {
         let (retired, current, successor, other) = (key(1), key(2), key(3), key(4));
         let config = |signer: Option<[u8; 32]>, followed: Vec<[u8; 32]>| Config {
             source: Source::Url("https://anywhere.example/v1/alab".into()),
+            mirrors: Vec::new(),
             name: "alab".into(),
             signer,
             followed,
@@ -14369,12 +15572,12 @@ mod tests {
         fsx::ensure_private_dir(&paths.dir).expect("state directory");
         let first = Identity::from_secret_bytes([7; 32]);
         let expected = first.recipient();
-        let first = install_identity(&paths, first).expect("first key wins");
+        let first = install_identity(&paths, first, None).expect("first key wins");
         assert_eq!(first.recipient(), expected);
         let held = fsx::read_private(&paths.identity_file(), 16 << 10)
             .expect("read")
             .expect("key");
-        let later = install_identity(&paths, Identity::from_secret_bytes([9; 32]))
+        let later = install_identity(&paths, Identity::from_secret_bytes([9; 32]), None)
             .expect("return the winning key");
         assert_eq!(later.recipient(), expected);
         assert_eq!(
@@ -14391,7 +15594,7 @@ mod tests {
 
         fsx::write_atomic(&paths.identity_file(), b"unrecognized existing work", 0o600)
             .expect("owned sentinel");
-        assert!(install_identity(&paths, Identity::from_secret_bytes([11; 32])).is_err());
+        assert!(install_identity(&paths, Identity::from_secret_bytes([11; 32]), None).is_err());
         assert_eq!(
             fsx::read_private(&paths.identity_file(), 16 << 10)
                 .expect("read")
@@ -14399,6 +15602,433 @@ mod tests {
                 .as_slice(),
             b"unrecognized existing work"
         );
+    }
+
+    /// A12: an identity this test binary makes is a lab identity, its mark written into its file
+    /// with the key. Every build reads the key past the mark (the last line that is no comment),
+    /// the mark reads back, and the Commons device opened from the file carries it.
+    #[test]
+    fn a_new_identity_here_is_marked_in_its_file_and_its_key_reads_as_before() {
+        let home = aterm_tempfile::tempdir().expect("owned home");
+        let paths = Paths::for_home(home.path());
+        let identity = machine_identity(&paths).expect("made");
+        let file = fsx::read_private(&paths.identity_file(), 16 << 10)
+            .expect("read")
+            .expect("the file");
+        let text = file.as_str().expect("UTF-8");
+        assert!(
+            text.lines().any(|line| line
+                == "# aterm lab identity: test-binary (it founds its own lab and never joins the \
+                    live ALab)"),
+            "the mark is in the file"
+        );
+        let key = text
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty() && !line.starts_with('#'))
+            .expect("a key line");
+        assert_eq!(
+            Identity::parse(key).expect("a key").recipient(),
+            identity.recipient(),
+            "a build before the mark reads the same key"
+        );
+        assert_eq!(
+            lab_mark(&paths).expect("read"),
+            Some(crate::LabMark::TestBinary)
+        );
+        let device = crate::commons::bootstrap::Device::open(&paths)
+            .expect("device")
+            .expect("an identity");
+        assert_eq!(device.lab(), Some(crate::LabMark::TestBinary));
+    }
+
+    /// A12: an identity a release build made on a Mac's own hardware stays unmarked under this
+    /// test binary, so a developer's own Mac keeps its seat; one a build inside a virtual machine
+    /// made is marked, whatever binary reads it. Making it again keeps the first file and its mark.
+    #[test]
+    fn a_release_identity_stays_unmarked_here_and_a_virtual_machines_is_marked() {
+        let in_vm = crate::Making {
+            virtual_machine: true,
+            ..crate::Making::default()
+        };
+        for (making, mark) in [
+            (crate::Making::default(), None),
+            (in_vm, Some(crate::LabMark::VirtualMachine)),
+        ] {
+            let home = aterm_tempfile::tempdir().expect("owned home");
+            let paths = Paths::for_home(home.path());
+            let made = machine_identity_as(&paths, making).expect("made");
+            assert_eq!(lab_mark(&paths).expect("read"), mark);
+            assert_eq!(refuse_lab_identity(&paths).is_ok(), mark.is_none());
+            let again = machine_identity(&paths).expect("kept");
+            assert_eq!(again.recipient(), made.recipient());
+            assert_eq!(lab_mark(&paths).expect("read"), mark, "{making:?}");
+        }
+    }
+
+    /// A12: `aterm secrets join` with no URL, or the default one, from a lab identity is refused
+    /// before anything is dialed and configures nothing; a fresh Mac in a build that makes lab
+    /// identities is refused before its key is made. The control: a URL a person typed is dialed
+    /// (the loopback listener there hears it).
+    #[test]
+    fn a_lab_identitys_join_of_the_live_alab_is_refused_before_it_dials() {
+        let options = |source: &str| JoinOptions {
+            source: source.to_owned(),
+            host: Some("m9".to_owned()),
+            interactive: false,
+            wait: Duration::ZERO,
+            confirm: &|_| false,
+            password: JoinPassword::Given(None),
+            fetched: None,
+            requested: &|| {},
+            say: &|_| {},
+        };
+        let home = aterm_tempfile::tempdir().expect("owned home");
+        let paths = Paths::for_home(home.path());
+        let in_vm = crate::Making {
+            virtual_machine: true,
+            ..crate::Making::default()
+        };
+        machine_identity_as(&paths, in_vm).expect("made in a virtual machine");
+        for source in ["", crate::ALAB_DEFAULT_URL] {
+            let refused = join(&paths, &options(source)).expect_err("refused");
+            assert_eq!(refused.kind(), crate::ErrorKind::LabIdentity, "{refused}");
+            assert_eq!(
+                refused.to_string(),
+                format!(
+                    "this Mac's vault identity is a lab identity (virtual-machine): \
+                     {LAB_IDENTITY_REFUSAL}"
+                )
+            );
+            // The bounded join a writer's handover runs (`aterm-db`'s generation) refuses as
+            // well.
+            let bounded = join_if_unchanged_until(
+                &paths,
+                &options(source),
+                None,
+                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            )
+            .expect_err("refused");
+            assert_eq!(bounded.kind(), crate::ErrorKind::LabIdentity, "{bounded}");
+            assert!(
+                config(&paths).expect("read").is_none(),
+                "nothing configured"
+            );
+        }
+
+        let fresh = aterm_tempfile::tempdir().expect("owned home");
+        let fresh = Paths::for_home(fresh.path());
+        let refused = join(&fresh, &options("")).expect_err("refused");
+        assert_eq!(refused.kind(), crate::ErrorKind::LabIdentity, "{refused}");
+        assert!(
+            refused
+                .to_string()
+                .starts_with("this build makes lab identities (test-binary)"),
+            "{refused}"
+        );
+        assert!(
+            read_identity(&fresh).expect("read").is_none(),
+            "no key made"
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("port").port();
+        let (heard, hears) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = heard.send(listener.accept().map(drop).is_ok());
+        });
+        let typed = join(&paths, &options(&format!("http://127.0.0.1:{port}/v1/lab")));
+        assert!(
+            typed.is_err_and(|error| error.kind() != crate::ErrorKind::LabIdentity),
+            "a typed URL is not refused as the live ALab"
+        );
+        assert_eq!(
+            hears.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+            Ok(true),
+            "the typed URL was dialed"
+        );
+    }
+
+    /// A12: a browse for the members on this network is refused to a lab identity where it would
+    /// find ALab's (`_alab._tcp`), and to a value that names no lab service; a browse of a lab's
+    /// own service goes, and so does a release identity's browse.
+    #[test]
+    fn a_member_browse_is_refused_to_a_lab_identity_only_where_it_finds_alab() {
+        let root = aterm_tempfile::tempdir().expect("owned home");
+        let lab = Paths::for_home(&root.path().join("lab"));
+        machine_identity(&lab).expect("made");
+        let release = Paths::for_home(&root.path().join("release"));
+        machine_identity_as(&release, crate::Making::default()).expect("made");
+        let browse = |paths: &Paths, service: Option<&str>| {
+            refuse_lab_member_browse_as(
+                paths,
+                service.map(std::ffi::OsStr::new),
+                crate::Making::now(),
+            )
+        };
+        assert_eq!(
+            browse(&lab, None).expect_err("ALab's members").kind(),
+            crate::ErrorKind::LabIdentity
+        );
+        assert!(browse(&lab, Some("_alab._tcp")).is_err());
+        browse(&lab, Some("_alab-lab-a12x._tcp")).expect("a lab's own members");
+        browse(&release, None).expect("a release identity browses ALab's");
+    }
+
+    /// A12: a proof over the fleet names no vault: a lab identity's is refused where this Mac
+    /// follows ALab's vault, or none yet, and goes where it follows a lab's; a release identity's
+    /// goes either way.
+    #[test]
+    fn a_lab_identitys_proof_over_the_fleet_goes_only_to_a_lab_it_follows() {
+        let root = aterm_tempfile::tempdir().expect("owned home");
+        let lab = Paths::for_home(&root.path().join("lab"));
+        machine_identity(&lab).expect("made");
+        let follows = |signer: [u8; 32]| Config {
+            source: Source::Url("http://127.0.0.1:9/v1/lab".to_owned()),
+            mirrors: Vec::new(),
+            name: "lab".to_owned(),
+            signer: Some(signer),
+            followed: Vec::new(),
+            host: "m9".to_owned(),
+        };
+        assert!(refuse_lab_identity_for_fleet(&lab).is_err(), "no vault yet");
+        let alab = decode_key32(crate::ALAB_SIGNER).expect("the ALab key");
+        save_config(&lab, &follows(alab)).expect("configured");
+        assert!(refuse_lab_identity_for_fleet(&lab).is_err(), "ALab's vault");
+        let own = envelope::signer_public(&[5; 32]).expect("a lab's key");
+        save_config(&lab, &follows(own)).expect("configured");
+        refuse_lab_identity_for_fleet(&lab).expect("its own lab's members");
+
+        let release = Paths::for_home(&root.path().join("release"));
+        machine_identity_as(&release, crate::Making::default()).expect("made");
+        refuse_lab_identity_for_fleet(&release).expect("a release identity proves to ALab");
+    }
+
+    /// A12: an identity a release build made is no lab identity under a debug build or a test, so
+    /// a developer's own Mac keeps its seat; in a virtual machine it is one all the same (a
+    /// legacy-upgrade guest's identity predates the mark), and the refusal says why.
+    ///
+    /// NEGATIVE CONTROL: `lab_standing` reading an unmarked held identity as `None` whatever
+    /// `making` is: the VM refusal fails.
+    #[test]
+    fn an_unmarked_identity_is_a_lab_identity_in_a_virtual_machine_and_under_no_debug_build() {
+        let home = aterm_tempfile::tempdir().expect("owned home");
+        let paths = Paths::for_home(home.path());
+        machine_identity_as(&paths, crate::Making::default()).expect("made");
+        let debug = crate::Making {
+            test_binary: true,
+            debug_build: true,
+            lab_lane: true,
+            virtual_machine: false,
+        };
+        refuse_lab_identity_as(&paths, debug).expect("a release identity keeps its seat");
+        let in_vm = crate::Making {
+            virtual_machine: true,
+            ..crate::Making::default()
+        };
+        let refused = refuse_lab_identity_as(&paths, in_vm).expect_err("refused in a VM");
+        assert_eq!(refused.kind(), crate::ErrorKind::LabIdentity, "{refused}");
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "this Mac runs in a virtual machine, so its vault identity is a lab identity \
+                 (virtual-machine): {LAB_IDENTITY_REFUSAL}"
+            )
+        );
+        assert!(refuse_lab_member_browse_as(&paths, None, in_vm).is_err());
+    }
+
+    /// A12: a release build on a Mac's own hardware that holds an identity a debug build or a
+    /// test made is refused as any build is, and told how the Mac rejoins with it: a new identity
+    /// once the vault folder is set aside (A16's start does that to this user's own folder). A
+    /// build that makes lab identities is told nothing of the kind.
+    ///
+    /// NEGATIVE CONTROL: `refused_as_lab` leaving `rejoin` empty: the release build's refusal names
+    /// no way back.
+    #[test]
+    fn a_release_build_holding_a_debug_made_identity_is_told_how_the_mac_rejoins() {
+        let home = aterm_tempfile::tempdir().expect("owned home");
+        let paths = Paths::for_home(home.path());
+        machine_identity(&paths).expect("made by this test");
+        let release = refuse_lab_identity_as(&paths, crate::Making::default())
+            .expect_err("a held lab identity is refused under a release build too");
+        assert_eq!(
+            release.to_string(),
+            format!(
+                "this Mac's vault identity is a lab identity (test-binary): {LAB_IDENTITY_REFUSAL}; \
+                 this build makes no lab identity, so with this Mac's vault folder ({}) set \
+                 aside (a release app's start does that to its own) it makes a new one that can \
+                 join ALab",
+                paths.dir.display()
+            )
+        );
+        let debug = crate::Making {
+            debug_build: true,
+            ..crate::Making::default()
+        };
+        let lab = refuse_lab_identity_as(&paths, debug).expect_err("refused");
+        assert_eq!(
+            lab.to_string(),
+            format!(
+                "this Mac's vault identity is a lab identity (test-binary): {LAB_IDENTITY_REFUSAL}"
+            )
+        );
+    }
+
+    /// A12: the virtual-machine probe decides `Making::now`'s fact outside a test binary, and a
+    /// guest's unmarked identity is then a lab identity, refused; a probe that reads 0 or does not
+    /// answer is hardware, and a test binary reads no probe at all, so no test hangs on its host.
+    ///
+    /// NEGATIVE CONTROL: `Making::reading` ignoring `virtual_machine`: the guest's identity is
+    /// not refused.
+    #[test]
+    fn the_virtual_machine_probe_marks_a_guest_outside_a_test_binary_only() {
+        let guest = crate::Making::reading(false, || Some(true));
+        assert!(guest.virtual_machine, "{guest:?}");
+        for hardware in [
+            crate::Making::reading(false, || Some(false)),
+            crate::Making::reading(false, || None),
+            crate::Making::reading(true, || Some(true)),
+        ] {
+            assert!(!hardware.virtual_machine, "{hardware:?}");
+        }
+        let home = aterm_tempfile::tempdir().expect("owned home");
+        let paths = Paths::for_home(home.path());
+        machine_identity_as(&paths, crate::Making::default()).expect("made by a release build");
+        let refused = refuse_lab_identity_as(&paths, guest).expect_err("a guest");
+        assert_eq!(refused.kind(), crate::ErrorKind::LabIdentity, "{refused}");
+        refuse_lab_identity_as(&paths, crate::Making::reading(false, || None))
+            .expect("hardware keeps its seat");
+    }
+
+    /// A12: a joiner's lines carry its identity file's mark, or, for an identity an older build
+    /// made unmarked, the virtual-machine mark in a guest, so a member on the live genesis refuses
+    /// such a guest whatever members it names (`--at`).
+    ///
+    /// NEGATIVE CONTROL: `wire_mark` returning the file's mark alone: the guest's lines read
+    /// unmarked.
+    #[test]
+    fn a_guests_unmarked_identity_carries_the_virtual_machine_mark_on_the_wire() {
+        let guest = crate::Making {
+            virtual_machine: true,
+            ..crate::Making::default()
+        };
+        assert_eq!(wire_mark(None, guest), Some(crate::LabMark::VirtualMachine));
+        assert_eq!(wire_mark(None, crate::Making::default()), None);
+        assert_eq!(
+            wire_mark(Some(crate::LabMark::DebugBuild), guest),
+            Some(crate::LabMark::DebugBuild),
+            "the file's own mark stands"
+        );
+    }
+
+    /// A12: an ask nobody typed (the subscriber's re-ask, the handover's) goes to ALab's vault
+    /// from no lab identity: refused before anything is posted, and the subscriber passes over it
+    /// in silence. The same re-ask to another vault goes. Each request carries a proof, which
+    /// `join_routing::post` sends to the configured URL alone (never a browse's ALab mirrors), so
+    /// even a broken refusal reaches only this test's loopback listener.
+    ///
+    /// NEGATIVE CONTROL: drop the guard in `request_join_until` and the pass-over in
+    /// `ask_again_if_due`: the listener hears the lab identity's re-ask of ALab's vault.
+    #[test]
+    fn a_lab_identitys_automatic_reask_of_alabs_vault_is_refused_before_it_posts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let at = listener.local_addr().expect("address");
+        let (heard, hears) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+                if heard.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        let vault = |name: &str, signer: [u8; 32]| Config {
+            source: Source::Url(format!("http://{at}/v1/{name}")),
+            mirrors: Vec::new(),
+            name: name.to_owned(),
+            signer: Some(signer),
+            followed: Vec::new(),
+            host: "m9".to_owned(),
+        };
+        let alab = vault(
+            "alab",
+            decode_key32(crate::ALAB_SIGNER).expect("the ALab key"),
+        );
+        assert!(alab_vault(&alab));
+        let home = aterm_tempfile::tempdir().expect("owned home");
+        let lab = Paths::for_home(home.path());
+        machine_identity(&lab).expect("made by this test");
+        save_config(&lab, &alab).expect("source.toml");
+        let proof = Some(crate::b64::encode_padded(&[1; 32]));
+        save_state(
+            &lab,
+            &State {
+                membership: Stored::Pending,
+                requested: 0,
+                proof: proof.clone(),
+                ..State::default()
+            },
+        )
+        .expect("state.toml");
+
+        let refused = request_join(&lab, &alab, proof.clone(), Asker::Again).expect_err("refused");
+        assert_eq!(refused.kind(), crate::ErrorKind::LabIdentity, "{refused}");
+        let said = std::cell::RefCell::new(Vec::new());
+        ask_again_if_due(&lab, &alab, &|line| said.borrow_mut().push(line.to_owned()));
+        assert!(said.borrow().is_empty(), "passed over in silence: {said:?}");
+        assert!(hears.try_recv().is_err(), "nothing was posted");
+
+        let team = vault("team", [7; 32]);
+        save_config(&lab, &team).expect("source.toml");
+        let _ = request_join(&lab, &team, proof, Asker::Again);
+        hears
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("a re-ask of another vault is posted");
+    }
+
+    /// A12: a member whose vault config cannot be read is on the live genesis: a lab identity is
+    /// refused rather than let in on a failed read. One that follows a lab's vault is not.
+    ///
+    /// NEGATIVE CONTROL: `on_live_genesis` reading a failed store as `false`: the unreadable
+    /// config reads as off it.
+    #[test]
+    fn a_member_whose_vault_cannot_be_read_is_on_the_live_genesis() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = aterm_tempfile::tempdir().expect("owned home");
+        let paths = Paths::for_home(home.path());
+        save_config(
+            &paths,
+            &Config {
+                source: Source::Url("http://127.0.0.1:9/v1/lab".to_owned()),
+                mirrors: Vec::new(),
+                name: "lab".to_owned(),
+                signer: Some(envelope::signer_public(&[5; 32]).expect("a lab's key")),
+                followed: Vec::new(),
+                host: "m9".to_owned(),
+            },
+        )
+        .expect("configured");
+        assert!(!on_live_genesis(&paths), "a lab's vault");
+        let set = |mode| {
+            std::fs::set_permissions(paths.source_file(), std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        };
+        set(0o644);
+        let unread = on_live_genesis(&paths);
+        set(0o600);
+        assert!(config(&paths).is_ok(), "readable again");
+        assert!(unread, "a config no read takes is the live ALab's");
+    }
+
+    /// A12: only a store pinned to the ALab genesis this build compiles is the live ALab's. This
+    /// crate's unit tests compile none, so a pinned scratch store is not, until a test says so.
+    #[test]
+    fn only_a_store_pinned_to_the_compiled_genesis_reads_as_live() {
+        let pinned = crate::membership_log::Store::with_compiled(Some([4; 32]));
+        assert!(!live_genesis_store(&pinned));
+        assert!(with_live_genesis(true, || live_genesis_store(&pinned)));
+        assert!(!live_genesis_store(&pinned), "the seam ends with its run");
     }
 
     #[test]
@@ -14717,6 +16347,175 @@ mod tests {
         for name in [anchor, gap, changed] {
             assert!(at(name).exists(), "{name} is kept");
         }
+    }
+
+    /// `aterm secrets keep` (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.9, step A14; §10
+    /// "Release detach"): a kept file survives its entry's `Delete` with its digest unchanged,
+    /// a vault-written file that was not kept is removed (the control), a name keep cannot
+    /// take changes nothing, and keeping one file of an anchored set withdraws none of the
+    /// others while their entries stay.
+    #[test]
+    fn keep_detaches_each_file_by_digest_and_a_name_it_cannot_keep_changes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = Paths::for_home(root.path());
+        let at = |name: &str| materialize::target_path(root.path(), name).expect("valid");
+        let names = |list: &[&str]| {
+            list.iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>()
+        };
+        // No vault state: nothing is kept, and no vault folder is made.
+        let kept = keep(&paths, &names(&["signing"])).expect("kept");
+        assert!(matches!(kept.as_slice(), [(_, Kept::Not(_))]), "{kept:?}");
+        assert!(!paths.dir.exists(), "keep made {}", paths.dir.display());
+        let entry = |name: &str, value: &[u8], anchor: Option<&str>| Entry {
+            name: name.to_string(),
+            value: SecretBytes::from(value),
+            audience: Audience::Everyone,
+            if_absent: anchor.is_some() || name.ends_with(".key"),
+            anchor: anchor.map(str::to_string),
+        };
+        let (key, profile, signing, changed, missing, token) = (
+            "~/.aterm/release-ring/machine.key",
+            "~/.aterm/release-ring/release-credentials.toml",
+            "signing",
+            "notary",
+            "roster",
+            "token",
+        );
+        let release = [
+            entry(key, b"ring key sentinel", None),
+            entry(profile, b"profile sentinel", Some(key)),
+            entry(signing, b"developer id sentinel", None),
+        ];
+        let rest = [
+            entry(changed, b"notary sentinel", None),
+            entry(missing, b"roster sentinel", None),
+            entry(token, b"dev token sentinel", None),
+        ];
+        let entries: Vec<Entry> = release.iter().chain(&rest).cloned().collect();
+        let mut state = State {
+            seq: 1,
+            ..State::default()
+        };
+        save_state(&paths, &state).expect("saved");
+        let report = apply_entries(&paths, &mut state, &entries).expect("applied");
+        assert_eq!(report.written.len(), entries.len(), "{report:?}");
+        save_state(&paths, &state).expect("saved");
+        std::fs::write(at(changed), b"the person's edit").expect("changed");
+        std::fs::set_permissions(at(changed), std::fs::Permissions::from_mode(0o600))
+            .expect("private");
+        std::fs::remove_file(at(missing)).expect("removed");
+        // Names keep cannot take leave the state byte for byte as it was.
+        let saved = std::fs::read(paths.state_file()).expect("state");
+        let refused = keep(
+            &paths,
+            &names(&[changed, missing, "never-written", crate::commons::ENTRY]),
+        )
+        .expect("looked");
+        assert_eq!(refused.len(), 4, "{refused:?}");
+        for (name, kept) in &refused {
+            let Kept::Not(why) = kept else {
+                panic!("{name} was kept");
+            };
+            assert!(why.contains(name.as_str()), "{why}");
+        }
+        assert_eq!(std::fs::read(paths.state_file()).expect("state"), saved);
+        let digests = |list: &[&str]| {
+            list.iter()
+                .map(|name| materialize::digest_hex(&std::fs::read(at(name)).expect("read")))
+                .collect::<Vec<_>>()
+        };
+        let before = digests(&[key, signing]);
+        // The anchor alone of the key's set, and a name twice.
+        let kept = keep(&paths, &names(&[key, signing, key])).expect("kept");
+        assert_eq!(
+            kept,
+            [
+                (key.to_string(), Kept::Kept),
+                (signing.to_string(), Kept::Kept)
+            ]
+        );
+        let shown = format!("{kept:?} {refused:?}");
+        assert!(!shown.contains("sentinel"), "{shown}");
+        let again = keep(&paths, &names(&[signing])).expect("looked");
+        assert_eq!(again, [(signing.to_string(), Kept::Kept)]);
+        // While the entries stay, a pass leaves every file of the set as the vault's.
+        let mut state = load_state(&paths).expect("state");
+        assert_eq!(
+            state.kept,
+            BTreeSet::from([key.to_string(), signing.to_string()])
+        );
+        let report = apply_entries(&paths, &mut state, &entries).expect("still in the vault");
+        assert!(report.removed.is_empty(), "{report:?}");
+        for name in [key, profile, signing] {
+            assert!(
+                state.manifest.files.contains_key(name),
+                "{name}: {report:?}"
+            );
+            assert!(at(name).exists(), "{name}: {report:?}");
+        }
+        save_state(&paths, &state).expect("saved");
+        // The `Delete`s: the kept files stay as they were, and the unkept ones go.
+        let mut state = load_state(&paths).expect("state");
+        let report = apply_entries(&paths, &mut state, &rest).expect("deleted");
+        assert!(
+            report.removed.iter().any(|name| name == profile),
+            "{report:?}"
+        );
+        assert!(
+            !at(profile).exists(),
+            "the unkept file of the set is taken back"
+        );
+        save_state(&paths, &state).expect("saved");
+        let mut state = load_state(&paths).expect("state");
+        assert!(state.kept.is_empty(), "{:?}", state.kept);
+        for name in [key, signing] {
+            assert!(
+                !state.manifest.files.contains_key(name),
+                "{:?}",
+                state.manifest
+            );
+        }
+        let report = apply_entries(&paths, &mut state, &[]).expect("deleted");
+        assert!(
+            report.removed.iter().any(|name| name == token),
+            "{report:?}"
+        );
+        assert!(!at(token).exists(), "the unkept file is taken back");
+        assert_eq!(
+            digests(&[key, signing]),
+            before,
+            "the kept files are unchanged"
+        );
+    }
+
+    /// A pass cut short after writing a new value leaves the manifest at the old digest and the
+    /// new one pending: the file holds what the vault wrote all the same, and keep takes it.
+    #[test]
+    fn keep_takes_a_file_holding_a_cut_pass_pending_value() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = Paths::for_home(root.path());
+        let target = materialize::target_path(root.path(), "signing").expect("valid");
+        let mut state = State {
+            seq: 1,
+            ..State::default()
+        };
+        state
+            .manifest
+            .files
+            .insert("signing".into(), materialize::digest_hex(b"v1"));
+        state
+            .pending
+            .insert("signing".into(), materialize::digest_hex(b"v2"));
+        save_state(&paths, &state).expect("saved");
+        std::fs::create_dir_all(target.parent().expect("parent")).expect("dir");
+        std::fs::write(&target, b"v2").expect("written");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("private");
+        let kept = keep(&paths, &["signing".to_string()]).expect("kept");
+        assert_eq!(kept, [("signing".to_string(), Kept::Kept)]);
     }
 
     #[test]
@@ -15615,6 +17414,7 @@ mod tests {
                 "http://{}/v1/team",
                 socket.local_addr().expect("address")
             )),
+            mirrors: Vec::new(),
             name: "team".to_string(),
             signer: Some([7; 32]),
             followed: Vec::new(),
@@ -15917,6 +17717,7 @@ mod tests {
         let waiting = request(0);
         let config = Config {
             source: Source::Url("http://vault.invalid:7484/v1/team".to_string()),
+            mirrors: Vec::new(),
             name: "team".to_string(),
             signer: Some([7; 32]),
             followed: Vec::new(),
@@ -16135,6 +17936,7 @@ mod tests {
         let paths = Paths::for_home(root.path());
         let config = Config {
             source: Source::Url("http://127.0.0.1:7484/v1/team".to_string()),
+            mirrors: Vec::new(),
             name: "team".into(),
             signer: Some([1u8; 32]),
             followed: Vec::new(),
@@ -16547,6 +18349,249 @@ mod tests {
             b"inert-token"
         );
         assert_eq!(load_state(&member).unwrap().membership, Stored::In);
+        server.stop();
+    }
+
+    /// A Mac's mirrors (`source.toml`'s `mirrors`) serve it while its url does not answer, under
+    /// the one pin and floor its url's version is read under: a mirror with a newer version is
+    /// applied, a mirror with an older one never rolls the Mac back, and neither is written to.
+    ///
+    /// NEGATIVE CONTROL: leave the mirrors out of the peers a pass reads (`purpose.vault_read()`
+    /// false in `collect_sync_peer_urls`): fails "the newer mirror serves the Mac".
+    #[test]
+    fn a_mirror_serves_a_member_whose_url_is_down_and_never_rolls_it_back() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, url, admin, member) = a_vault_with_a_member(root.path(), &socket);
+        let held_two = std::fs::read(member.cache_file()).expect("seq 2");
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "token", b"new-token")
+            .unwrap();
+        admin_publish(&admin, &opened, &doc).expect("seq 3");
+        let three = served_at(&Source::Url(url.clone())).expect("seq 3 served");
+        let mirror_at = |name: &str, bytes: &[u8]| {
+            let socket = bound();
+            let running = serve(&root.path().join(name), &socket);
+            let mirror = format!("http://{}/v1/team", running.addr);
+            transport::publish(&Source::Url(mirror.clone()), bytes).expect("seeded");
+            (running, mirror)
+        };
+        let (newer, newer_url) = mirror_at("newer", &three);
+        let (older, older_url) = mirror_at("older", &held_two);
+        // The url refuses at once: its server and the listener it was handed are gone.
+        server.stop();
+        drop(socket);
+        let token = || std::fs::read(materialize::target_path(&member.home, "token").unwrap());
+        assert!(sync(&member, None).is_err(), "the url alone is down");
+        assert_eq!(load_state(&member).unwrap().seq, 2);
+
+        let config = configured(&member).unwrap();
+        set_mirrors(&member, &config, &[older_url.clone(), newer_url.clone()]).expect("listed");
+        let started = Instant::now();
+        let outcome = sync(&member, None);
+        println!(
+            "mirror fail-over: url refused, seq 3 applied from a mirror in {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(outcome, Ok(SyncOutcome::Applied { seq: 3, .. })),
+            "the newer mirror serves the Mac: {outcome:?}"
+        );
+        assert_eq!(token().unwrap(), b"new-token");
+        assert_eq!(
+            configured(&member).unwrap().mirrors,
+            [older_url.clone(), newer_url],
+            "a pass keeps the list"
+        );
+
+        newer.stop();
+        let _ = sync(&member, None);
+        assert_eq!(load_state(&member).unwrap().seq, 3, "never rolled back");
+        assert_eq!(token().unwrap(), b"new-token");
+        assert_eq!(
+            served_at(&Source::Url(older_url)).expect("the older mirror"),
+            held_two,
+            "nothing is written to a mirror"
+        );
+        older.stop();
+    }
+
+    /// A Mac's mirrors are read for the vault, its envelope and its records, and never sent a
+    /// join: a join and its re-asks go to the url and the vault's servers alone.
+    ///
+    /// NEGATIVE CONTROL: have `PeerUse::vault_read` hold for `Join`: fails "no join reaches a
+    /// mirror".
+    #[test]
+    fn a_mirror_is_read_for_the_vault_and_never_sent_a_join() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = Paths::for_home(root.path());
+        let url = "http://vault.local:7484/v1/team";
+        let mirror = "http://192.168.1.40:7484/v1/team";
+        let config = Config {
+            source: Source::Url(url.to_owned()),
+            mirrors: vec![mirror.to_owned()],
+            name: "team".to_owned(),
+            signer: Some([7; 32]),
+            followed: Vec::new(),
+            host: "m1".to_owned(),
+        };
+        let peers =
+            |purpose| collect_sync_peer_urls(&paths, &config, url, &[], Some(&FOUND_NONE), purpose);
+        for purpose in [PeerUse::Records, PeerUse::Envelope, PeerUse::Reader] {
+            assert_eq!(peers(purpose), [mirror]);
+        }
+        assert!(peers(PeerUse::Join).is_empty(), "no join reaches a mirror");
+    }
+
+    /// A rejoin of the same vault (its url, name and pin) keeps the Mac's mirrors, as it keeps
+    /// the version it holds; a join that starts afresh (here at another url), which resets that
+    /// version, starts with none.
+    ///
+    /// NEGATIVE CONTROLS: save every join with no mirrors (`mirrors = Vec::new()` in
+    /// `join_with_until`): fails "a rejoin keeps the mirrors"; keep them on every join (drop
+    /// `.filter(|_| goes_on)` there): fails "a join elsewhere starts with no mirrors".
+    #[test]
+    fn a_rejoin_of_the_same_vault_keeps_its_mirrors_and_a_join_elsewhere_starts_with_none() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, url, _admin, member) = a_vault_with_a_member(root.path(), &socket);
+        let mirror = "http://192.168.1.40:7484/v1/team".to_owned();
+        let config = configured(&member).unwrap();
+        set_mirrors(&member, &config, std::slice::from_ref(&mirror)).expect("listed");
+        let signer = crate::b64::encode_padded(&config.signer.expect("pin"));
+        join_pinned(&member, &format!("{url}#{signer}"), "mb");
+        assert_eq!(
+            configured(&member).unwrap().mirrors,
+            [mirror],
+            "a rejoin keeps the mirrors"
+        );
+        assert_eq!(load_state(&member).unwrap().seq, 2);
+
+        let elsewhere_socket = bound();
+        let elsewhere = serve(&root.path().join("elsewhere"), &elsewhere_socket);
+        let elsewhere_url = format!("http://{}/v1/team", elsewhere.addr);
+        let held = std::fs::read(member.cache_file()).expect("seq 2");
+        transport::publish(&Source::Url(elsewhere_url.clone()), &held).expect("seeded");
+        join_pinned(&member, &format!("{elsewhere_url}#{signer}"), "mb");
+        let joined = configured(&member).unwrap();
+        assert_eq!(joined.source, Source::Url(elsewhere_url));
+        assert!(
+            joined.mirrors.is_empty(),
+            "a join elsewhere starts with no mirrors: {:?}",
+            joined.mirrors
+        );
+        elsewhere.stop();
+        server.stop();
+    }
+
+    /// A mirror is read for the vault's records and never vouches that a pass read the newest
+    /// of them, nor hears who reads: nothing posts it records, so it falls behind by
+    /// construction, and `readmit`'s freshness read must fail closed while only a mirror
+    /// answers; a mirror can be a copy a third party keeps, so it is not sent this Mac's
+    /// recipient. A listed mirror the pass's own peers also name is a server, and does both.
+    ///
+    /// NEGATIVE CONTROLS: count a mirror's records bound (drop `.filter(|(url, _, _)|
+    /// !read_only.holds(url))` from `answering_bounds` in `sync_records_until`): fails "a mirror
+    /// alone never vouches the pass fresh"; send it the subscriber (`subscriber_for` returns
+    /// `subscriber`): fails "a mirror is not told who reads".
+    #[test]
+    fn a_mirror_alone_never_vouches_a_records_pass_fresh_nor_hears_who_reads() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, _url, _admin, member) = a_vault_with_a_member(root.path(), &socket);
+        let held_two = std::fs::read(member.cache_file()).expect("seq 2");
+        // A server holding the vault's version and none of its records, listed as a mirror.
+        let listed = |store: &str| {
+            let store = root.path().join(store);
+            let socket = bound();
+            let running = serve(&store, &socket);
+            let url = format!("http://{}/v1/team", running.addr);
+            transport::publish(&Source::Url(url.clone()), &held_two).expect("seeded");
+            let config = configured(&member).unwrap();
+            set_mirrors(&member, &config, std::slice::from_ref(&url)).expect("listed");
+            (running, store, url)
+        };
+        let recipient = read_identity(&member)
+            .unwrap()
+            .unwrap()
+            .recipient()
+            .to_bech32();
+        // What a server stopped (which writes down every read it heard) heard of this Mac.
+        let heard = |store: &Path| {
+            crate::server::read_last_heard(store)
+                .into_iter()
+                .any(|(_, heard, _)| heard == recipient)
+        };
+        // The url refuses at once: its server and the listener it was handed are gone.
+        server.stop();
+        drop(socket);
+        // `readmit::read_newest`'s pass: bounded by the freshness it asks for.
+        let pass = |peers: &[String]| {
+            let by = Instant::now() + PROBE_DEADLINE;
+            sync_records_until(&member, None, peers, None, Some(by), None)
+        };
+        assert!(pass(&[]).is_err(), "the url alone is down");
+
+        let (mirror, mirror_store, _) = listed("mirror");
+        let read = pass(&[]).expect("the mirror answers");
+        assert!(
+            !read.fresh(),
+            "a mirror alone never vouches the pass fresh: {read:?}"
+        );
+        let _ = sync(&member, None);
+        mirror.stop();
+        assert!(!heard(&mirror_store), "a mirror is not told who reads");
+
+        let (named, named_store, named_url) = listed("named");
+        let read = pass(std::slice::from_ref(&named_url)).expect("the server answers");
+        assert!(
+            read.fresh(),
+            "a server named as the pass's own peer vouches for it: {read:?}"
+        );
+        named.stop();
+        assert!(heard(&named_store), "a server is told who reads");
+    }
+
+    /// An admin's pass starts no heal from a mirror's head: nothing writes a mirror, so its
+    /// version lags by construction, and a head two versions behind is one `heads_diverged`
+    /// flags. Neither is anything written to it.
+    ///
+    /// NEGATIVE CONTROL: count every peer's head (drop `.filter(|p| !read_only().holds(&p.url))`
+    /// from the heal's `observed` in `sync_repairing_inner`): fails "a mirror's head starts no
+    /// heal".
+    #[test]
+    fn an_admins_pass_starts_no_heal_from_a_lagging_mirror() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, _url, admin, member) = a_vault_with_a_member(root.path(), &socket);
+        let held_two = std::fs::read(member.cache_file()).expect("seq 2");
+        for value in [b"three".as_slice(), b"four"] {
+            let opened = admin_open(&admin).expect("open");
+            let mut doc = opened.doc.clone();
+            doc.set_entry(&Audience::Everyone, "token", value).unwrap();
+            admin_publish(&admin, &opened, &doc).expect("published");
+        }
+        let mirror_socket = bound();
+        let mirror = serve(&root.path().join("mirror"), &mirror_socket);
+        let mirror_url = format!("http://{}/v1/team", mirror.addr);
+        transport::publish(&Source::Url(mirror_url.clone()), &held_two).expect("seeded");
+        let runs = || log_entries::MIRROR_RUNS.with(std::cell::Cell::get);
+        sync(&admin, None).expect("the admin's pass");
+        let settled = runs();
+        sync(&admin, None).expect("the admin's pass");
+        assert_eq!(runs(), settled, "a settled admin's pass starts no heal");
+
+        let config = configured(&admin).unwrap();
+        set_mirrors(&admin, &config, std::slice::from_ref(&mirror_url)).expect("listed");
+        sync(&admin, None).expect("the admin's pass");
+        assert_eq!(runs(), settled, "a mirror's head starts no heal");
+        assert_eq!(
+            served_at(&Source::Url(mirror_url)).expect("the mirror"),
+            held_two,
+            "nothing is written to a mirror"
+        );
+        mirror.stop();
         server.stop();
     }
 

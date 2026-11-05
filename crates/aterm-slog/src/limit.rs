@@ -154,7 +154,9 @@ impl MarkLimiter {
             Actor::Ctl => return Slot::Ctl,
             Actor::Human => return Slot::Human,
             Actor::Sid(id) => *id,
-            Actor::Aterm | Actor::Vendor | Actor::Nobody => return Slot::Overflow,
+            Actor::Aterm | Actor::Vendor | Actor::Fleet(_) | Actor::Nobody => {
+                return Slot::Overflow;
+            }
         };
         if let Some(i) = self
             .named

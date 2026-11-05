@@ -41,7 +41,7 @@ pub enum CodesignError {
     Unsupported,
     /// `codesign` could not be started.
     Spawn(std::io::Error),
-    /// Waiting for `codesign` failed.
+    /// Waiting for or capturing output from a started `codesign` failed.
     Wait(std::io::Error),
     /// `codesign` did not finish before the deadline and was killed.
     TimedOut,
@@ -218,6 +218,9 @@ pub fn developer_id_verdict(
 ) -> Result<(), CodesignError> {
     let out = run.map_err(|e| match e {
         RunError::Spawn(e) => CodesignError::Spawn(e),
+        RunError::Capture(e) => {
+            CodesignError::Wait(std::io::Error::other(format!("capture after start: {e}")))
+        }
         RunError::Wait(e) => CodesignError::Wait(e),
         RunError::TimedOut => CodesignError::TimedOut,
     })?;
@@ -484,4 +487,16 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
+}
+#[test]
+fn capture_failure_after_start_is_not_spawn_or_a_signature_verdict() {
+    let error = developer_id_verdict(Err(RunError::Capture(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "capture setup failed after dispatch",
+    ))))
+    .unwrap_err();
+    assert!(matches!(&error, CodesignError::Wait(_)));
+    assert!(!error.is_verdict());
+    assert!(!error.judged_nothing_at(Path::new("A.app")));
+    assert!(error.to_string().contains("capture after start"));
 }

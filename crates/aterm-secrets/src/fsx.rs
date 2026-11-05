@@ -9,8 +9,39 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
+fn check_and_narrow_dir_fd(dir: &Path, dir_fd: &File) -> crate::Result<()> {
+    let meta = dir_fd
+        .metadata()
+        .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+    if !meta.is_dir() {
+        return Err(Error::new(format!("{}: not a directory", dir.display())));
+    }
+    if meta.uid() != euid() {
+        return Err(Error::new(format!(
+            "{}: owned by uid {}, not this user",
+            dir.display(),
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o7777 != 0o700 {
+        dir_fd
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+    }
+    Ok(())
+}
+
 /// Ensures `dir` exists as a 0700 directory owned by this user, refusing symlinks.
 pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
+    let open_dir = || {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)
+    };
+    if let Ok(dir_fd) = open_dir() {
+        return check_and_narrow_dir_fd(dir, &dir_fd);
+    }
     match kind(dir)? {
         Kind::Dir => {}
         Kind::Missing => {
@@ -23,9 +54,6 @@ pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(Error::new(format!("{}: {e}", dir.display()))),
             }
-            if kind(dir)? != Kind::Dir {
-                return Err(Error::new(format!("{}: not a directory", dir.display())));
-            }
         }
         Kind::Symlink => {
             return Err(Error::new(format!(
@@ -37,30 +65,8 @@ pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
             return Err(Error::new(format!("{}: not a directory", dir.display())));
         }
     }
-    if let Ok(dir_fd) = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(dir)
-    {
-        let meta = dir_fd
-            .metadata()
-            .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
-        if !meta.is_dir() {
-            return Err(Error::new(format!("{}: not a directory", dir.display())));
-        }
-        if meta.uid() != euid() {
-            return Err(Error::new(format!(
-                "{}: owned by uid {}, not this user",
-                dir.display(),
-                meta.uid()
-            )));
-        }
-        if meta.mode() & 0o7777 != 0o700 {
-            dir_fd
-                .set_permissions(std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
-        }
-        return Ok(());
+    if let Ok(dir_fd) = open_dir() {
+        return check_and_narrow_dir_fd(dir, &dir_fd);
     }
     let meta = std::fs::symlink_metadata(dir)
         .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
@@ -178,8 +184,11 @@ fn read_opened_stamped(
     };
     let refused = |why: String| Unread::Refused(Error::new(format!("{}: {why}", path.display())));
     let failed = |e: io::Error| Unread::Failed(Error::new(format!("{}: {e}", path.display())));
-    let mut bytes = read_buffer(meta.len(), max);
     let limit = u64::try_from(max).unwrap_or(u64::MAX);
+    if past == Past::Refuse && meta.len() > limit {
+        return Err(refused(format!("larger than {max} bytes")));
+    }
+    let mut bytes = read_buffer(meta.len(), max);
     let limit = if past == Past::Head {
         limit
     } else {
@@ -213,7 +222,7 @@ fn open_admitted(
     }
     let file = match OpenOptions::new()
         .read(true)
-        .custom_flags(nofollow | libc::O_NONBLOCK)
+        .custom_flags(nofollow | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
     {
         Ok(file) => file,
@@ -325,7 +334,7 @@ pub(crate) fn open_owned_reader_classified(path: &Path) -> Result<Option<OwnedRe
 /// from 32 bytes, freeing each block it outgrew, with what it had read, unwiped. One byte past
 /// the file lets it see the end without growing; only a file that grows between the `fstat`
 /// and the read still grows it.
-fn read_buffer(len: u64, max: usize) -> Vec<u8> {
+pub(crate) fn read_buffer(len: u64, max: usize) -> Vec<u8> {
     let len = usize::try_from(len).unwrap_or(usize::MAX).min(max);
     Vec::with_capacity(len.saturating_add(1))
 }
@@ -414,21 +423,21 @@ pub fn write_atomic_with(
 /// ownership and a single hard link, narrowing its permissions to `0600`, and keeping its
 /// descriptor out of child processes.
 pub(crate) fn open_lock(path: &Path) -> crate::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    let file = aterm_uds::kept_out(|| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+    })
+    .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
     let metadata = lock_metadata(&file, path)?;
     if metadata.mode() & 0o7777 != 0o600 {
         narrow_lock(&file, path)?;
     }
-    aterm_uds::keep_out_of_children(&file)
-        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
     Ok(file)
 }
 
@@ -570,7 +579,7 @@ pub fn append_at_with(
     }
     let appended = OpenOptions::new()
         .append(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .and_then(|mut file| {
             let metadata = file.metadata()?;
@@ -790,10 +799,15 @@ pub enum Kind {
 
 /// What is at `path` (`lstat`).
 pub fn kind(path: &Path) -> crate::Result<Kind> {
+    kind_and_id(path).map(|(kind, _)| kind)
+}
+
+/// What is at `path` (`lstat`), together with its `(device, inode)` when present.
+pub fn kind_and_id(path: &Path) -> crate::Result<(Kind, Option<(u64, u64)>)> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             let kind = meta.file_type();
-            Ok(if kind.is_symlink() {
+            let k = if kind.is_symlink() {
                 Kind::Symlink
             } else if kind.is_dir() {
                 Kind::Dir
@@ -801,9 +815,10 @@ pub fn kind(path: &Path) -> crate::Result<Kind> {
                 Kind::File
             } else {
                 Kind::Other
-            })
+            };
+            Ok((k, Some((meta.dev(), meta.ino()))))
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Kind::Missing),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Kind::Missing, None)),
         Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
     }
 }
@@ -851,7 +866,7 @@ fn link_then_unlink(from: &Path, to: &Path) -> Result<(), Moved> {
 /// symlink without following it.
 pub fn wipe_and_remove(path: &Path) -> crate::Result<()> {
     if kind(path)? == Kind::File {
-        return wipe(path, |_| Ok(true)).map(drop);
+        return wipe(path, |_, _| Ok(true)).map(drop);
     }
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -862,9 +877,13 @@ pub fn wipe_and_remove(path: &Path) -> crate::Result<()> {
 
 /// Zeroes and removes the regular file at `path` if its contents (up to `max` bytes) pass `ours`.
 pub fn wipe_if(path: &Path, max: usize, ours: impl FnOnce(&[u8]) -> bool) -> crate::Result<bool> {
-    wipe(path, |file| {
-        let mut bytes = read_buffer(file.metadata().map_or(0, |meta| meta.len()), max);
-        let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    wipe(path, |file, meta| {
+        let limit = u64::try_from(max).unwrap_or(u64::MAX);
+        if meta.len() > limit {
+            return Ok(false);
+        }
+        let mut bytes = read_buffer(meta.len(), max);
+        let limit = limit.saturating_add(1);
         if crate::secret::read_to_end_wiping_on_error(file.take(limit), &mut bytes).is_err() {
             return Ok(false);
         }
@@ -874,13 +893,16 @@ pub fn wipe_if(path: &Path, max: usize, ours: impl FnOnce(&[u8]) -> bool) -> cra
 }
 
 /// [`wipe_if`]'s steps, with `judge` reading the file it opened.
-fn wipe(path: &Path, judge: impl FnOnce(&mut File) -> io::Result<bool>) -> crate::Result<bool> {
+fn wipe(
+    path: &Path,
+    judge: impl FnOnce(&mut File, &std::fs::Metadata) -> io::Result<bool>,
+) -> crate::Result<bool> {
     let at = |e: io::Error| Error::new(format!("{}: {e}", path.display()));
     let open = |write: bool| {
         OpenOptions::new()
             .read(true)
             .write(write)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
     };
     let opened = match open(true) {
@@ -901,7 +923,7 @@ fn wipe(path: &Path, judge: impl FnOnce(&mut File) -> io::Result<bool>) -> crate
     };
     let meta = file.metadata().map_err(at)?;
     if !meta.file_type().is_file()
-        || !judge(&mut file).map_err(at)?
+        || !judge(&mut file, &meta).map_err(at)?
         || file_id(path) != Some((meta.dev(), meta.ino()))
     {
         return Ok(false);

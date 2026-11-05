@@ -752,10 +752,11 @@ fn reclaim_kept(base: &Path) {
                     .iter()
                     .all(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
             });
+        if !ours || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
         let path = entry.path();
-        if ours
-            && entry.file_type().is_ok_and(|kind| kind.is_dir())
-            && path.join(aterm_uds::deadline::EXEC_STAMP).is_file()
+        if path.join(aterm_uds::deadline::EXEC_STAMP).is_file()
             && crate::gates::first_exec_hold(&path).is_none()
         {
             let _ = std::fs::remove_dir_all(&path);
@@ -944,8 +945,9 @@ fn steps(
     if !dirty.trim().is_empty() {
         let owed = read_text(&owed_mark).is_some_and(|m| !m.trim().is_empty())
             || !unpushed_owned().is_empty();
-        if !in_flight.is_file() || owed || dry {
-            let (kind, why) = if !in_flight.is_file() {
+        let in_flight_exists = in_flight.is_file();
+        if !in_flight_exists || owed || dry {
+            let (kind, why) = if !in_flight_exists {
                 (Refusal::DirtyOwned, "commit or stash them first")
             } else if owed {
                 (
@@ -1404,7 +1406,7 @@ fn steps(
     // pin publish/config.sh names (a STOCK EXCEPTION: Trust ships only its host std),
     // else on rustup's stable.
     if !dry {
-        std::fs::write(&in_flight, format!("{commit}\n")).map_err(|e| {
+        crate::durable::write_fresh(&in_flight, format!("{commit}\n")).map_err(|e| {
             refusal(
                 Refusal::Io,
                 format!("cannot write {}: {e}", in_flight.display()),
@@ -1480,7 +1482,7 @@ fn steps(
                  engine.js"
             ),
         );
-        std::fs::write(&mark, format!("{commit}\n"))
+        crate::durable::write_fresh(&mark, format!("{commit}\n"))
             .map_err(|e| refusal(Refusal::Io, format!("cannot write {}: {e}", mark.display())))?;
         true
     };
@@ -1598,16 +1600,35 @@ fn steps(
                 ),
             );
         }
-        let written = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&path, &planned[rel]));
-        #[cfg(unix)]
-        let written = written.and_then(|()| {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-        });
-        written
+        let write_page = || -> std::io::Result<()> {
+            use std::io::Write as _;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o644)
+                    .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+            }
+            let mut f = opts.open(&path)?;
+            if !f.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "target is not a regular file",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+            }
+            f.set_len(0)?;
+            f.write_all(planned[rel].as_bytes())
+        };
+        write_page()
             .map_err(|e| refusal(Refusal::Io, format!("cannot write {}: {e}", path.display())))?;
     }
     if !changed.is_empty() {
@@ -1686,7 +1707,7 @@ fn steps(
             .map_err(|e| child_failed("git commit", format!("the site commit failed: {e}")))?;
         say(out, &format!("committed: {subject}"));
         if let Some(head) = git.line(&site_dir, &["rev-parse", "HEAD"]) {
-            let _ = std::fs::write(&owed_mark, format!("{head}\n"));
+            let _ = crate::durable::write_fresh(&owed_mark, format!("{head}\n"));
         }
     }
     let _ = std::fs::remove_file(&in_flight);

@@ -84,6 +84,9 @@ pub fn windows_drive_path_text(decoded: &str) -> Result<String, UriError> {
 
 fn percent_decode(value: &str) -> Result<String, UriError> {
     let bytes = value.as_bytes();
+    if !bytes.contains(&b'%') {
+        return Ok(value.to_string());
+    }
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
@@ -119,9 +122,9 @@ pub fn path_to_file_uri(path: &Path) -> Result<String, UriError> {
         return Err(UriError::Malformed);
     }
     let mut normalized = if cfg!(windows) {
-        raw.strip_prefix(r"\\?\").unwrap_or(raw).replace('\\', "/")
+        std::borrow::Cow::Owned(raw.strip_prefix(r"\\?\").unwrap_or(raw).replace('\\', "/"))
     } else {
-        raw.to_string()
+        std::borrow::Cow::Borrowed(raw)
     };
     if cfg!(windows)
         && (normalized.starts_with("//")
@@ -135,13 +138,14 @@ pub fn path_to_file_uri(path: &Path) -> Result<String, UriError> {
         return Err(UriError::NotAbsolute);
     }
     if cfg!(windows) && !normalized.starts_with('/') {
-        normalized.insert(0, '/');
+        normalized.to_mut().insert(0, '/');
     }
     #[cfg(windows)]
     if !Path::new(&windows_drive_path_text(&normalized)?).is_absolute() {
         return Err(UriError::NotAbsolute);
     }
-    let mut uri = String::from("file://");
+    let mut uri = String::with_capacity(7 + normalized.len());
+    uri.push_str("file://");
     for byte in normalized.bytes() {
         if file_uri_keeps(byte) {
             uri.push(char::from(byte));

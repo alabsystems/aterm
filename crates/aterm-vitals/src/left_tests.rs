@@ -22,7 +22,7 @@ fn closed_tab() -> ClosedTab {
         shell_uniqueid: 1000,
         horizon: 2000,
         closed_ms: 1_792_000_000_000,
-        agent_since: None,
+        agent_spans: Vec::new(),
         left: 0,
     }
 }
@@ -35,7 +35,7 @@ fn live_tab() -> LiveTab {
         shell_pid: 300,
         shell_uniqueid: Some(1000),
         fg_pgid: Some(310),
-        agent_since: None,
+        agent_spans: Vec::new(),
     }
 }
 
@@ -259,7 +259,10 @@ fn a_listener_left_by_a_closed_tab_is_daemon_shaped_and_named() {
 #[test]
 fn an_agents_listener_born_after_its_agent_started_is_offered() {
     let tab = ClosedTab {
-        agent_since: Some(1200),
+        agent_spans: vec![AgentSpan {
+            since: 1200,
+            until: None,
+        }],
         ..closed_tab()
     };
     let mut server = naming(orphan(2606, 1500), "s-closed");
@@ -287,7 +290,10 @@ fn a_group_leader_with_no_tty_outside_every_root_is_daemon_shaped() {
     }
     f.exe = Some("/Users//u/.atpkg/bin/trustd".into());
     let tab = LiveTab {
-        agent_since: Some(1200),
+        agent_spans: vec![AgentSpan {
+            since: 1200,
+            until: None,
+        }],
         ..live_tab()
     };
     let row = judged(&f, &[tab], &[]).unwrap();
@@ -648,8 +654,10 @@ fn a_job_waiting_behind_a_held_member_is_listed_waiting() {
     assert_eq!((row.peer, row.from), (Some(4001), Source::Tab(3)));
 }
 
-/// A view offering a closed tab's or a dead run's row is read again on the slow cadence; an
-/// orphan of a live tab does not ask for it.
+/// A view offering a closed tab's or a dead run's row is read again on the slow cadence, and so
+/// is one naming an agent's left row of a live tab, whose end no edge of its session tells; the
+/// person's orphan of a live tab, born before its agent started, does not ask for it. NEGATIVE
+/// CONTROL: ask for gone owners' rows alone, and the agent's row is never read again.
 #[test]
 fn a_view_offering_a_gone_owners_row_asks_for_its_next_reading() {
     let gone = judged(
@@ -658,15 +666,17 @@ fn a_view_offering_a_gone_owners_row_asks_for_its_next_reading() {
         &[closed_tab()],
     )
     .unwrap();
-    let live = judged(&naming(orphan(2607, 1500), "s-live"), &[live_tab()], &[]).unwrap();
-    assert!(holds_an_offer(&LeftView {
-        rows: vec![gone, live.clone()],
+    let tabs = [agent_tab()];
+    let person = judged(&naming(orphan(2607, 1100), "s-live"), &tabs, &[]).unwrap();
+    let agents = judged(&naming(orphan(2608, 1500), "s-live"), &tabs, &[]).unwrap();
+    let view = |rows: Vec<LeftRow>| LeftView {
+        rows,
+        live: tabs.to_vec(),
         ..LeftView::default()
-    }));
-    assert!(!holds_an_offer(&LeftView {
-        rows: vec![live],
-        ..LeftView::default()
-    }));
+    };
+    assert!(holds_an_offer(&view(vec![gone, person.clone()])));
+    assert!(!holds_an_offer(&view(vec![person.clone()])));
+    assert!(holds_an_offer(&view(vec![person, agents])));
 }
 
 /// The daemon shape is waived for a dead run's member its witness ties (W-group or W-run) that
@@ -735,7 +745,10 @@ fn an_unread_listener_table_offers_no_token() {
     );
     assert!(!row.listen);
     let tab = ClosedTab {
-        agent_since: Some(1200),
+        agent_spans: vec![AgentSpan {
+            since: 1200,
+            until: None,
+        }],
         ..closed_tab()
     };
     assert_eq!(judged(&f, &[], &[tab]).unwrap().tier, Tier::Offer);
@@ -750,7 +763,10 @@ fn an_unread_listener_table_offers_no_token() {
 #[test]
 fn an_aterm_programs_listener_is_no_agents_dev_server() {
     let tab = ClosedTab {
-        agent_since: Some(1200),
+        agent_spans: vec![AgentSpan {
+            since: 1200,
+            until: None,
+        }],
         ..closed_tab()
     };
     let mut f = naming(orphan(2606, 1500), "s-closed");
@@ -806,4 +822,366 @@ fn an_aterm_image_whose_verb_did_not_read_is_named() {
         verdict(&row),
         (State::Orphaned, Why::Orphaned, Tier::Name, false)
     );
+}
+
+/// The view a reading `gone_ms` after `closed_tab()` closed makes of `rows`, with a dead run
+/// whose launcher was found dead `gone_ms` ago and the build directories `build_dirs` the disk
+/// watch keeps.
+fn entry_view(rows: Vec<LeftRow>, gone_ms: u64, build_dirs: &[&str]) -> LeftView {
+    let tab = closed_tab();
+    LeftView {
+        rows,
+        runs: vec![RunRow {
+            id: "41983-1792163800331520".into(),
+            dead: true,
+            dead_ms: Some(gone_ms),
+            sid: Some("s-closed".into()),
+            roots: vec!["/w/wt".into()],
+            left: 1,
+            next_verify: false,
+        }],
+        as_of_ms: tab.closed_ms + gone_ms,
+        closed: vec![tab],
+        build_dirs: build_dirs.iter().map(|d| (*d).to_owned()).collect(),
+        ..LeftView::default()
+    }
+}
+
+/// A closed tab's `nohup` survivor, offered, that has run `age_ms` and spent `cpu_ms` of CPU.
+fn survivor(age_ms: u64, cpu_ms: u64) -> LeftRow {
+    let mut f = naming(orphan(2606, 1500), "s-closed");
+    f.started_ms = Some(age_ms);
+    f.cpu_ms = Some(cpu_ms);
+    let row = judged(&f, &[], &[closed_tab()]).unwrap();
+    assert_eq!(
+        verdict(&row),
+        (State::Left, Why::OwnerGone, Tier::Offer, true)
+    );
+    row
+}
+
+/// A dead verify run's member running its build, idle: its launcher is gone, and it costs nothing.
+fn dead_runs_member() -> LeftRow {
+    let mut f = orphan(4300, 1500);
+    f.exe = Some("/w/wt/target/debug/aterm-link".into());
+    f.exe_under_root = true;
+    f.cpu_ms = Some(0);
+    f.runs = vec![dead_run(true, false, true, false)];
+    let row = judged(&f, &[], &[]).unwrap();
+    assert_eq!(
+        verdict(&row),
+        (State::Left, Why::LauncherDead, Tier::Offer, true)
+    );
+    row
+}
+
+/// A dead run's leftover is aterm's own leak: the Entry names it once its launcher has been dead
+/// an hour, though it costs nothing. NEGATIVE CONTROL: hold a dead run's row to the cost a closed
+/// tab's must meet, and the idle member is not named.
+#[test]
+fn a_dead_runs_leftover_an_hour_old_is_eligible_even_idle() {
+    let row = dead_runs_member();
+    let view = entry_view(vec![row.clone()], ENTRY_AFTER_MS, &[]);
+    assert!(!costs(&row, &view), "idle, and no build directory is kept");
+    assert_eq!(owner_gone_ms(&row, &view), Some(ENTRY_AFTER_MS));
+    assert!(eligible(&row, &view, ENTRY_AFTER_MS));
+}
+
+/// A closed tab's survivor that sleeps (62 ms of CPU in an hour) costs nothing: someone may have
+/// `nohup`ed it on purpose, so the Entry leaves it to `sys left`.
+#[test]
+fn a_closed_tabs_idle_leftover_is_not_eligible() {
+    let row = survivor(3_600_000, 62);
+    let view = entry_view(vec![row.clone()], 2 * ENTRY_AFTER_MS, &[]);
+    assert!(!eligible(&row, &view, ENTRY_AFTER_MS));
+}
+
+/// One second of CPU for each hour of its age is a cost: a survivor that has burned that much is
+/// named, and one just under it is not.
+#[test]
+fn a_closed_tabs_leftover_burning_a_second_an_hour_is_eligible() {
+    let burning = survivor(7_200_000, 2_000);
+    let under = survivor(7_200_000, 1_999);
+    let view = entry_view(vec![burning.clone(), under.clone()], ENTRY_AFTER_MS, &[]);
+    assert!(eligible(&burning, &view, ENTRY_AFTER_MS));
+    assert!(!eligible(&under, &view, ENTRY_AFTER_MS));
+}
+
+/// A survivor running a binary from a build directory the disk watch must keep costs disk, however
+/// idle it is; one outside every kept directory does not.
+#[test]
+fn an_executable_under_a_kept_build_dir_makes_a_closed_tabs_leftover_eligible() {
+    let mut row = survivor(3_600_000, 0);
+    row.exe_judged = Some("/w/other/target/debug/server".into());
+    let kept = entry_view(vec![row.clone()], ENTRY_AFTER_MS, &["/w/other/target"]);
+    assert!(eligible(&row, &kept, ENTRY_AFTER_MS));
+    let elsewhere = entry_view(vec![row.clone()], ENTRY_AFTER_MS, &["/w/other/targets"]);
+    assert!(
+        !eligible(&row, &elsewhere, ENTRY_AFTER_MS),
+        "a directory's name prefix is not its tree"
+    );
+}
+
+/// An orphan of a tab that still lives is never named, however much it burns: its owner is not
+/// gone, so only `sys left` lists it. NEGATIVE CONTROL: read a live tab's row as gone since its
+/// fork, and the burning orphan is named.
+#[test]
+fn an_orphan_of_a_live_tab_is_never_eligible() {
+    let mut f = naming(orphan(2606, 1500), "s-live");
+    f.started_ms = Some(7_200_000);
+    f.cpu_ms = Some(7_000_000);
+    let row = judged(&f, &[live_tab()], &[]).unwrap();
+    assert_eq!(
+        verdict(&row),
+        (State::Orphaned, Why::Orphaned, Tier::Offer, true)
+    );
+    let view = entry_view(vec![row.clone()], 10 * ENTRY_AFTER_MS, &[]);
+    assert!(!eligible(&row, &view, ENTRY_AFTER_MS));
+    assert_eq!(owner_gone_ms(&row, &view), None);
+}
+
+/// Nothing is named before its owner has been gone an hour: not a dead run's member, not a
+/// survivor that burns. NEGATIVE CONTROL: drop the age gate, and both are named at once.
+#[test]
+fn under_an_hour_nothing_is_eligible() {
+    let member = dead_runs_member();
+    let burning = survivor(7_200_000, 7_000_000);
+    let view = entry_view(
+        vec![member.clone(), burning.clone()],
+        ENTRY_AFTER_MS - 1,
+        &[],
+    );
+    assert!(!eligible(&member, &view, ENTRY_AFTER_MS));
+    assert!(!eligible(&burning, &view, ENTRY_AFTER_MS));
+    assert!(
+        eligible(&member, &view, ENTRY_AFTER_MS - 1),
+        "at its own bound"
+    );
+}
+
+/// A row an end does not take is never named, however long its owner has been gone and however
+/// much it burns: a closed tab's daemon (a listener, NAME with no token) and a row a live run
+/// still claims (NEVER) are `sys left`'s to list, and the Entry's one step, ending each by its
+/// token, would have none to name. NEGATIVE CONTROL: drop the tier gate, and the burning daemon
+/// is named.
+#[test]
+fn a_row_an_end_does_not_take_is_never_eligible() {
+    let mut f = naming(orphan(2606, 1500), "s-closed");
+    f.started_ms = Some(7_200_000);
+    f.cpu_ms = Some(7_000_000);
+    f.listener = Some(true);
+    let daemon = judged(&f, &[], &[closed_tab()]).unwrap();
+    assert_eq!(
+        verdict(&daemon),
+        (State::Left, Why::Daemon, Tier::Name, false)
+    );
+    f.listener = Some(false);
+    f.claimed = true;
+    let claimed = judged(&f, &[], &[closed_tab()]).unwrap();
+    assert_eq!(
+        verdict(&claimed),
+        (State::Left, Why::Live, Tier::Never, false)
+    );
+    let view = entry_view(
+        vec![daemon.clone(), claimed.clone()],
+        2 * ENTRY_AFTER_MS,
+        &[],
+    );
+    for row in [&daemon, &claimed] {
+        assert!(costs(row, &view), "it burns");
+        assert_eq!(owner_gone_ms(row, &view), Some(2 * ENTRY_AFTER_MS));
+        assert!(!eligible(row, &view, ENTRY_AFTER_MS), "{row:?}");
+    }
+}
+
+/// A live tab whose agent started at unique id 1200.
+fn agent_tab() -> LiveTab {
+    LiveTab {
+        agent_spans: vec![AgentSpan {
+            since: 1200,
+            until: None,
+        }],
+        ..live_tab()
+    }
+}
+
+/// A row W-session ties to a live tab records whether it was born after that tab's agent
+/// started: one born at 1100, after the shell and before the agent, is offered and reads false;
+/// one born at 1500 reads true; one W-session ties to no session reads false. NEGATIVE CONTROL:
+/// set the field from the tie alone, and the one born before the agent reads true.
+#[test]
+fn a_row_records_whether_it_was_born_after_its_agent() {
+    let tabs = [agent_tab()];
+    let before = judged(&naming(orphan(2606, 1100), "s-live"), &tabs, &[]).unwrap();
+    let after = judged(&naming(orphan(2607, 1500), "s-live"), &tabs, &[]).unwrap();
+    let untied = judged(&orphan(2608, 1500), &tabs, &[]).unwrap();
+    for row in [&before, &after] {
+        assert_eq!(
+            (verdict(row), row.from.clone()),
+            (
+                (State::Orphaned, Why::Orphaned, Tier::Offer, true),
+                Source::Tab(3)
+            ),
+            "{row:?}"
+        );
+    }
+    assert_eq!(untied.from, Source::Unknown);
+    assert_eq!(
+        (before.after_agent, after.after_agent, untied.after_agent),
+        (false, true, false)
+    );
+}
+
+/// THE AGENT'S LEFT ROWS ARE ITS OFFERED SESSION ROWS AND ITS DEAD RUNS': of one view over an
+/// agent's tab (`s-live`, its agent started at 1200) and a tab with no agent (`s-other`), the
+/// agent's are the offered row its session's environment names born after its agent started and
+/// the offered member of a dead verify run that rode in its session. Not its sandboxed row (named,
+/// no token), the person's `nohup` from before the agent, the dead run's AUTO member (the next
+/// verify run's to end), nor the other tab's row, which is that tab's own: born after its shell,
+/// where no agent start is known. No session id names none. NEGATIVE CONTROL: drop the
+/// after-agent filter, and the person's `nohup` counts as the agent's.
+#[test]
+fn the_agents_rows_are_its_offered_session_rows_and_its_dead_runs() {
+    let other = LiveTab {
+        key: 4,
+        sid: "s-other".into(),
+        shell_pid: 400,
+        ..live_tab()
+    };
+    let tabs = [agent_tab(), other];
+    let mut sandboxed = naming(orphan(2607, 1500), "s-live");
+    sandboxed.sandboxed = Some(true);
+    let mut auto = orphan(2609, 1500);
+    auto.exe_under_root = true;
+    auto.runs = vec![dead_run(true, true, true, true)];
+    let mut dead = orphan(2611, 1500);
+    dead.exe_under_root = true;
+    dead.started_ms = Some(7_200_000);
+    dead.runs = vec![dead_run(true, false, true, false)];
+    let facts = [
+        naming(orphan(2606, 1500), "s-live"),
+        sandboxed,
+        naming(orphan(2608, 1100), "s-live"),
+        auto,
+        naming(orphan(2610, 1500), "s-other"),
+        dead,
+    ];
+    let rows: Vec<LeftRow> = facts
+        .iter()
+        .map(|f| judged(f, &tabs, &[]).unwrap())
+        .collect();
+    let tiers: Vec<(u32, Tier)> = rows.iter().map(|r| (r.pid, r.tier)).collect();
+    assert_eq!(
+        tiers,
+        [
+            (2606, Tier::Offer),
+            (2607, Tier::Name),
+            (2608, Tier::Offer),
+            (2609, Tier::Auto),
+            (2610, Tier::Offer),
+            (2611, Tier::Offer),
+        ]
+    );
+    let view = LeftView {
+        rows,
+        runs: vec![RunRow {
+            id: "41983-1792163800331520".into(),
+            dead: true,
+            dead_ms: Some(60_000),
+            sid: Some("s-live".into()),
+            roots: vec!["/w/wt".into()],
+            left: 2,
+            next_verify: true,
+        }],
+        live: tabs.to_vec(),
+        complete: true,
+        ..LeftView::default()
+    };
+    let pids = |sid| -> Vec<u32> { agents_left(&view, sid).iter().map(|r| r.pid).collect() };
+    assert_eq!(pids("s-live"), [2606, 2611]);
+    assert_eq!(
+        pids("s-other"),
+        [2610],
+        "a tab with no agent: after its shell"
+    );
+    assert!(pids("").is_empty() && pids("s-gone").is_empty());
+    assert_eq!(
+        agents_left_count(&view, "s-live"),
+        Some((2, Some(7_200_000)))
+    );
+    assert_eq!(agents_left_count(&view, "s-gone"), Some((0, None)));
+}
+
+/// A PARTIAL VIEW COUNTS NOTHING: the same view whose sweep stopped at its cap, or whose reading
+/// stopped at its bound of new candidates, gives no count for the agent's session, though it
+/// names its row, since it cannot say none is left. NEGATIVE CONTROL: count a partial view, and
+/// it reads as whole.
+#[test]
+fn a_partial_view_counts_no_agents_rows() {
+    let tabs = [agent_tab()];
+    let row = judged(&naming(orphan(2606, 1500), "s-live"), &tabs, &[]).unwrap();
+    let whole = LeftView {
+        rows: vec![row],
+        live: tabs.to_vec(),
+        complete: true,
+        ..LeftView::default()
+    };
+    assert_eq!(
+        agents_left_count(&whole, "s-live"),
+        Some((1, Some(3_600_000)))
+    );
+    for partial in [
+        LeftView {
+            complete: false,
+            ..whole.clone()
+        },
+        LeftView {
+            bounded: true,
+            ..whole.clone()
+        },
+    ] {
+        assert_eq!(agents_left(&partial, "s-live").len(), 1);
+        assert_eq!(agents_left_count(&partial, "s-live"), None, "{partial:?}");
+    }
+}
+
+/// THE STRETCHES AN AGENT RAN IN A TAB: a named agent opens one; a reading that names an agent
+/// whose id it did not read changes nothing; one that names none closes it at its horizon (one
+/// whose horizon is below the start, having read no table, does not); the same agent named again
+/// reopens it whole, and with an earlier start merges the stretches it now overlaps; a later agent
+/// opens its own, and past [`AGENT_SPANS_KEPT`] the oldest two become one. A process born between
+/// two stretches is in neither. NEGATIVE CONTROL: keep one stretch from the earliest start, and the
+/// gap reads as the agent's.
+#[test]
+fn a_tabs_agent_stretches_open_close_and_merge() {
+    let span = |since, until| AgentSpan { since, until };
+    let mut spans = Vec::new();
+    fold_agent(&mut spans, true, Some(1200), 1300);
+    assert_eq!(spans, [span(1200, None)]);
+    fold_agent(&mut spans, true, None, 1400);
+    fold_agent(&mut spans, true, Some(1250), 1400);
+    assert_eq!(spans, [span(1200, None)], "an unread id, a later call");
+    fold_agent(&mut spans, false, None, 0);
+    assert_eq!(spans, [span(1200, None)], "a reading that read no table");
+    fold_agent(&mut spans, false, None, 1500);
+    assert_eq!(spans, [span(1200, Some(1500))]);
+    fold_agent(&mut spans, false, None, 1600);
+    assert_eq!(spans, [span(1200, Some(1500))], "closed once");
+    assert!(spans[0].holds(1500) && !spans[0].holds(1501) && !spans[0].holds(1199));
+    fold_agent(&mut spans, true, Some(1200), 1700);
+    assert_eq!(spans, [span(1200, None)], "the same agent named again");
+    fold_agent(&mut spans, false, None, 1700);
+    fold_agent(&mut spans, true, Some(2000), 2100);
+    assert_eq!(spans, [span(1200, Some(1700)), span(2000, None)]);
+    assert!(!spans.iter().any(|s| s.holds(1800)), "the person's gap");
+    fold_agent(&mut spans, true, Some(1650), 2200);
+    assert_eq!(spans, [span(1200, None)], "an earlier start merges");
+    let mut many = Vec::new();
+    for i in 0..=AGENT_SPANS_KEPT as u64 {
+        fold_agent(&mut many, true, Some(10_000 + i * 100), 10_000 + i * 100);
+        fold_agent(&mut many, false, None, 10_050 + i * 100);
+    }
+    assert_eq!(many.len(), AGENT_SPANS_KEPT);
+    assert_eq!(many[0], span(10_000, Some(10_150)));
+    assert!(!many.iter().any(|s| s.holds(10_175)));
 }

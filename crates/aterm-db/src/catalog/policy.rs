@@ -77,7 +77,7 @@ impl Policy {
                     .as_str()
                     .ok_or_else(|| Error::new("invalid excluded table"))?;
                 let id = crate::database::decode_hex(word)?;
-                if word != aterm_codec::hex::encode_lower(&id) || !excluded.insert(id) {
+                if !excluded.insert(id) {
                     return Err(Error::new("noncanonical or repeated excluded table"));
                 }
             }

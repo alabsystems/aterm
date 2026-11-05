@@ -46,11 +46,7 @@ pub use aterm_update_core::FileLock;
 
 /// Create `path` exclusively (`create_new`: an existing file is never opened and truncated).
 pub(crate) fn create_private_new(path: &Path) -> io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(path)
+    open_create_new_write(path, 0o600)
 }
 
 /// Exclusively create a fresh temporary beside `path`, without opening or removing any
@@ -1647,6 +1643,19 @@ pub(crate) fn parse_sh_shim_target(content: &str) -> Option<PathBuf> {
 /// Bound for reading a shim of either dialect before parsing it.
 pub(crate) const MAX_SHIM_BYTES: usize = 64 * 1024;
 
+/// What a single read of a shim learns: its resolved target (through its body or, on Unix, a
+/// symlink), its exported environment (`NONE` for a link, tombstone, stub, or absent file), and
+/// its UTF-8 regular-file body when `shim` is a regular file within [`MAX_SHIM_BYTES`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShimRead {
+    /// The target `shim` forwards to ([`resolve_shim`]).
+    pub target: Option<PathBuf>,
+    /// The environment `shim` exports ([`shim_env_of`]).
+    pub env: crate::shim_env::ShimEnv,
+    /// The UTF-8 regular-file body of `shim`, when `shim` is a regular file within [`MAX_SHIM_BYTES`].
+    pub body: Option<String>,
+}
+
 /// Read the Windows `.cmd` shim through the bounded, symlink-refusing metadata seam.
 #[cfg(any(windows, test))]
 pub(crate) fn read_cmd_shim_target(path: &Path) -> Option<PathBuf> {
@@ -1666,6 +1675,34 @@ pub(crate) fn read_cmd_shim_env(path: &Path) -> crate::shim_env::ShimEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_changes_recover_unreadable_entries_without_following_links() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let root = crate::testdir::dir("atpkg-chmod-nofollow-");
+        let dir = root.join("directory");
+        let file = root.join("file");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&file, b"private").unwrap();
+        for (entry, restored) in [(&dir, 0o700), (&file, 0o600)] {
+            std::fs::set_permissions(entry, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let result = set_mode(entry, restored);
+            // Keep the fixture removable even if recovery regresses.
+            let observed = std::fs::metadata(entry).unwrap().permissions().mode() & 0o7777;
+            std::fs::set_permissions(entry, std::fs::Permissions::from_mode(restored)).unwrap();
+            result.unwrap();
+            assert_eq!(observed, restored);
+            let link = root.join(format!("link-{restored:o}"));
+            symlink(entry, &link).unwrap();
+            assert!(set_mode(&link, 0o777).is_err());
+            assert_eq!(
+                std::fs::metadata(entry).unwrap().permissions().mode() & 0o7777,
+                restored
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The clamp's decision.
     #[cfg(unix)]

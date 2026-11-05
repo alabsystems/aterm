@@ -1718,7 +1718,10 @@ fn an_unrecorded_bot_check_still_ends_as_a_bot_check() {
             &host,
             &store,
             (&row, &roster_path, &logins),
-            row.dir.as_deref(),
+            (
+                row.dir.as_deref(),
+                crate::harness::sign_in_ladder::asked_fixture(Cli::Kimi, &row.label),
+            ),
             &mut Vec::new(),
             &mut Vec::new(),
         )
@@ -2024,7 +2027,10 @@ fn a_renewal_that_stopped_for_a_person_says_so() {
                 &tmp.path().join("accounts-kimi.toml"),
                 &store.load_logins(env.now).unwrap().0,
             ),
-            row.dir.as_deref(),
+            (
+                row.dir.as_deref(),
+                crate::harness::sign_in_ladder::asked_fixture(Cli::Kimi, &row.label),
+            ),
             &mut out,
             &mut err,
         )
@@ -2084,7 +2090,10 @@ fn a_background_renewal_keeps_its_human_step_when_both_output_streams_are_discar
                 &tmp.path().join("accounts-kimi.toml"),
                 &store.load_logins(env.now).unwrap().0
             ),
-            row.dir.as_deref(),
+            (
+                row.dir.as_deref(),
+                crate::harness::sign_in_ladder::asked_fixture(Cli::Kimi, &row.label)
+            ),
             &mut io::sink(),
             &mut io::sink()
         ),
@@ -2276,6 +2285,22 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
     assert_eq!(*seed.order.borrow(), ["kimi-one", "kimi-two"]);
     kimi_env.now += 40 * 86_400;
     let kimi_store = kimi_env.accounts_store_for(Cli::Kimi).expect("kimi store");
+    // Sessions here ran on both rows within the week: due logins this Mac uses
+    // (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4).
+    let used_here = |now: i64| {
+        kimi_store
+            .transact(now, &mut None, |state| {
+                let mut events = Vec::new();
+                for label in ["kimi-one", "kimi-two"] {
+                    let sid = format!("s-{label}");
+                    events.extend(accounts::note_session(state, &sid, label, None, now - 3600));
+                    state.sessions.remove(&sid);
+                }
+                Ok(events)
+            })
+            .expect("sessions here ran on both rows");
+    };
+    used_here(kimi_env.now);
     let mut note = None;
     kimi_store
         .transact_pool_logins_within(
@@ -2295,28 +2320,38 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
             },
         )
         .expect("record sign_in_task on kimi-one");
-    let due_host = OrderHost {
-        order: std::cell::RefCell::new(Vec::new()),
+    // `--due` starts one account's sign-in and keeps the Mac's ten-minute spacing for the next
+    // (§4.15 rule 4): it says so and leaves that row to a later pass.
+    let due_pass = |env: &Env| {
+        let host = OrderHost {
+            order: std::cell::RefCell::new(Vec::new()),
+        };
+        let (code, out, err) = renew("accounts renew --cli kimi --due", env, &host);
+        assert_eq!(code, exit(0), "{out}{err}");
+        (host.order.into_inner(), out)
     };
-    let (code, out, err) = renew("accounts renew --cli kimi --due", &kimi_env, &due_host);
-    assert_eq!(code, exit(0), "{out}{err}");
+    let (order, out) = due_pass(&kimi_env);
     assert_eq!(
-        *due_host.order.borrow(),
-        vec!["kimi-two".to_owned(), "kimi-one".to_owned()],
+        order,
+        ["kimi-two"],
         "ready kimi-two runs ahead of kimi-one with an unaddressed sign_in_task"
     );
+    assert!(out.contains("kimi-one: not run yet: "), "{out}");
+    kimi_env.now += crate::harness::sign_in_ladder::SPACING_S - 1;
+    assert_eq!(
+        due_pass(&kimi_env).0,
+        Vec::<String>::new(),
+        "inside the spacing"
+    );
+    kimi_env.now += 1;
+    assert_eq!(due_pass(&kimi_env).0, ["kimi-one"], "ten minutes on");
 
     // Negative: once neither row has a sign_in_task, --due runs in roster order.
     kimi_env.now += 40 * 86_400;
-    let plain_host = OrderHost {
-        order: std::cell::RefCell::new(Vec::new()),
-    };
-    let (code, out, err) = renew("accounts renew --cli kimi --due", &kimi_env, &plain_host);
-    assert_eq!(code, exit(0), "{out}{err}");
-    assert_eq!(
-        *plain_host.order.borrow(),
-        vec!["kimi-one".to_owned(), "kimi-two".to_owned()]
-    );
+    used_here(kimi_env.now);
+    let (order, out) = due_pass(&kimi_env);
+    assert_eq!(order, ["kimi-one"]);
+    assert!(out.contains("kimi-two: not run yet: "), "{out}");
 }
 
 #[test]
@@ -2391,8 +2426,12 @@ fn codex_default_completion_rechecks_identity_roster_and_source() {
                     std::fs::write(secrets.join("ai-accounts-codex.toml"), "[[account]]\nlabel = 'main'\nclass = 'dedicated'\nemail = 'other@example.test'\nmachines = ['m1']\n").unwrap();
                 }
                 if race == "policy" {
-                    std::fs::write(env.config.as_ref().unwrap(), "[harness]\nlogins = 'off'\n")
-                        .unwrap();
+                    aterm_uds::atomic_file::write(
+                        env.config.as_ref().unwrap(),
+                        ("[harness]\nlogins = 'off'\n").as_ref(),
+                        0o600,
+                    )
+                    .unwrap();
                 }
                 if race == "identity" {
                     return Some("other@example.test".into());
@@ -2453,9 +2492,10 @@ fn codex_default_completion_runs_in_init_and_upkeep_and_obeys_policy() {
         let path = tmp.path().join("accounts-codex.toml");
         std::fs::write(&path, "[[account]]\nlabel = 'main'\nclass = 'dedicated'\n").unwrap();
         if !policy.is_empty() {
-            std::fs::write(
+            aterm_uds::atomic_file::write(
                 env.config.as_ref().unwrap(),
-                format!("[harness]\n{policy}\n"),
+                (format!("[harness]\n{policy}\n")).as_ref(),
+                0o600,
             )
             .unwrap();
         }
@@ -2573,7 +2613,12 @@ fn codex_default_completion_preserves_pool_holds_and_local_authority() {
         let home = env.home.as_ref().unwrap();
         std::fs::create_dir_all(home.join(".codex")).unwrap();
         std::fs::create_dir_all(home.join(".secrets")).unwrap();
-        std::fs::write(env.config.as_ref().unwrap(), "[fleet]\nmachine = 'm1'\n").unwrap();
+        aterm_uds::atomic_file::write(
+            env.config.as_ref().unwrap(),
+            ("[fleet]\nmachine = 'm1'\n").as_ref(),
+            0o600,
+        )
+        .unwrap();
         let path = tmp.path().join("accounts-codex.toml");
         std::fs::write(&path, "[[account]]\nlabel = 'main'\nclass = 'dedicated'\n").unwrap();
         let source = home.join(".secrets/ai-pool.toml");
@@ -2608,4 +2653,158 @@ fn codex_default_completion_preserves_pool_holds_and_local_authority() {
         assert_eq!(result.is_ok(), label != "main", "{result:?}");
         assert_eq!(read(&source), raw);
     }
+}
+
+/// The sheet at `tmp`'s home whose one line gives `address`'s account to `computer`, in the column
+/// `cells` fills, with this Mac named m16.
+fn sheet_of_other_macs(tmp: &Tmp, env: &Env, cells: &str, address: &str, computer: &str) {
+    let secrets = tmp.path().join("home/.secrets");
+    let config = env.config.clone().expect("a config path");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[fleet]\nmachine = \"m16\"\n").unwrap();
+    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
+    std::fs::write(
+        secrets.join(crate::harness::accounts_sync::ACCOUNTS_CSV_FILE),
+        format!(
+            "m,email,computer,,claude,Open AI,xai,kimi,google,meta,Payment,notes\n\
+             ,{address},{computer},,{cells},,,,\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// A host with nobody at it whose sign-ins each stop at a bot-check, recording the rows they were
+/// for.
+struct BotChecked(RefCell<Vec<String>>);
+
+impl AccountsHost for BotChecked {
+    fn stdin_is_terminal(&self) -> bool {
+        false
+    }
+    fn auth_status(&self, _: &str) -> Result<Captured, String> {
+        Err("unused".to_owned())
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        Err("unused".to_owned())
+    }
+    fn now(&self) -> i64 {
+        1_758_412_900
+    }
+    fn vendor_sign_in(&self, req: &Request<'_>) -> Drove {
+        self.0.borrow_mut().push(req.row.label.clone());
+        Drove {
+            outcome: login_drive::Outcome::BotCheck("a stand-in's check".to_owned()),
+            host: Some("www.kimi.ai".to_owned()),
+        }
+    }
+}
+
+/// ANOTHER MAC'S ACCOUNT IS A PERSON'S TO BORROW (`ATERM-KI-1105-9`): where the sheet gives
+/// `kimi-one`'s account to m22 alone, the report says whose it is and the way to borrow it, stops
+/// counting it among the rows on their way so that it offers listing another, and that way still
+/// runs. `CONTROL`: the sheet naming this Mac.
+#[test]
+fn a_person_can_borrow_another_macs_account_and_the_report_says_whose_it_is() {
+    let (tmp, env) = kimi_env("other-macs-person");
+    let default_login = env
+        .home
+        .as_deref()
+        .unwrap()
+        .join(Cli::Kimi.accounts().default_home)
+        .join("credentials/kimi-code.json");
+    std::fs::create_dir_all(default_login.parent().unwrap()).unwrap();
+    std::fs::write(&default_login, "{}").unwrap();
+    let sheet = |computer: &str| {
+        sheet_of_other_macs(&tmp, &env, ",,,global", "kimi-one@example.com", computer);
+    };
+    let store = env.accounts_store_for(Cli::Kimi).expect("kimi store");
+    let mut note = None;
+    store
+        .transact_logins(env.now, &mut note, |state, _| {
+            let _ = accounts::note_wall(
+                state,
+                ACCOUNTS_OWN_LABEL,
+                "weekly",
+                Some(env.now + 86_400),
+                env.now,
+                env.now,
+            );
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let host = || BotChecked(RefCell::default());
+
+    sheet("m16");
+    let (_, report, _) = renew("accounts --cli kimi", &env, &host());
+    assert!(
+        !report.contains("gives it to") && !report.contains("list another"),
+        "CONTROL: {report}"
+    );
+
+    sheet("m22");
+    let (_, report, _) = renew("accounts --cli kimi", &env, &host());
+    assert!(
+        report.contains("this pool's source gives it to m22")
+            && report.contains("accounts renew kimi-one")
+            && report.contains("list another"),
+        "{report}"
+    );
+
+    let named = host();
+    let _ = renew("accounts renew kimi-one --cli kimi", &env, &named);
+    assert_eq!(*named.0.borrow(), ["kimi-one"], "a person named the row");
+}
+
+/// No report asks anybody to sign in another Mac's account (`ATERM-KI-1105-9`): Grok Build's pool,
+/// whose rows a person signs in, asks for its own and not for one the sheet gives m22, in the
+/// report, its JSON, and the stats. `CONTROL`: the same row while the sheet names this Mac.
+#[test]
+fn no_report_asks_for_a_sign_in_of_another_macs_account() {
+    let tmp = tmp_dir("other-macs-report");
+    let mut env = env_at(&tmp);
+    env.sock = None;
+    let (code, _, err) = run_line(
+        "accounts add grok-one --cli grok --email grok-one@example.com",
+        &env,
+    );
+    assert_eq!(code, exit(0), "{err}");
+    let sheet = |computer: &str| {
+        sheet_of_other_macs(&tmp, &env, ",,1,", "grok-one@example.com", computer);
+    };
+    let asks = "sign-in needed: Run aterm harness accounts login grok-one";
+    let needed = |json: &str| {
+        let doc: Value = aterm_json::from_str(json).unwrap();
+        let row = doc["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["label"] == Value::from("grok-one"))
+            .cloned()
+            .unwrap();
+        (row["sign_in_needed"].clone(), row["belongs_to"].clone())
+    };
+
+    sheet("m16");
+    let (_, report, _) = run_line("accounts --cli grok", &env);
+    assert!(report.contains(asks), "CONTROL: {report}");
+    let (_, stats, _) = run_line("accounts stats --cli grok", &env);
+    assert!(stats.contains(asks), "CONTROL: {stats}");
+    let (_, json, _) = run_line("accounts --cli grok --json", &env);
+    let (asked, whose) = needed(&json);
+    assert_ne!(asked, Value::Null, "CONTROL: {json}");
+    assert_eq!(whose, Value::Null, "CONTROL: {json}");
+
+    sheet("m22");
+    let (_, report, _) = run_line("accounts --cli grok", &env);
+    assert!(!report.contains(asks), "{report}");
+    assert!(report.contains("gives it to m22"), "{report}");
+    let (_, stats, _) = run_line("accounts stats --cli grok", &env);
+    assert!(!stats.contains(asks), "{stats}");
+    let (_, json, _) = run_line("accounts --cli grok --json", &env);
+    let (asked, whose) = needed(&json);
+    assert_eq!(asked, Value::Null, "{json}");
+    assert_eq!(whose, Value::from("m22"), "{json}");
 }

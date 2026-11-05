@@ -4,355 +4,57 @@
 //! FILES, WRITTEN THE CAREFUL WAY: the unix half of [`crate::atomic_file`], whose items it
 //! re-exports.
 
-use super::{MAX_CONFIG_BYTES, read_regular};
+use super::writer::write_landing;
+#[cfg(test)]
+use super::writer::{
+    create_temp_salted, sweep_temps_with, write_captured_landing, write_flushing_dir,
+    write_produced_landing,
+};
+use super::{MAX_CONFIG_BYTES, read_regular, write};
+#[cfg(test)]
+use super::{create_temp_beside, sweep_temps_beside, temp_target, temp_writer, write_checked};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Write `bytes` to `path` with `mode`, whole ([`write_checked`] with no check).
-/// # Errors
-/// No entropy for the temporary name, a clash on every name tried, or a write's own error: `path`
-/// is left as it was. Or the directory's flush after the rename failed: `path` holds `bytes`,
-/// but its entry may not survive a power loss.
-pub fn write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    write_checked(path, bytes, mode, || Ok(()))
-}
-
-/// Produce a file atomically, with the same permissions and durability as [`write`].
-/// The producer must finish and flush any buffering it owns before returning success.
+/// Change an entry's mode without following a final-component symlink, even if
+/// that entry is replaced after the metadata check. Ancestors resolve normally.
+/// Unlike opening for read, this permits an owner to recover mode-000 entries and
+/// harden sockets. A stable symlink is refused; unsupported nofollow chmod fails closed.
 ///
 /// # Errors
-/// As [`write`], or the producer fails. A producer error leaves the old destination intact.
-pub fn write_with(
-    path: &Path,
-    mode: u32,
-    produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
-) -> io::Result<()> {
-    write_produced_landing(
-        path,
-        mode,
-        produce,
-        || Ok(()),
-        |dir| aterm_durable::Flush::Durable.dir(dir),
-    )?
-}
-
-/// Produce a file atomically and return metadata captured from its completed temporary
-/// before closing and renaming it. A caller identifying the path afterward must compare
-/// that path's device and inode; rename can change the file's timestamps.
-///
-/// # Errors
-/// As [`write_with`], or reading the completed temporary's metadata fails.
-pub fn write_with_metadata(
-    path: &Path,
-    mode: u32,
-    produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
-) -> io::Result<std::fs::Metadata> {
-    let (metadata, landed) = write_captured_landing(
-        path,
-        mode,
-        produce,
-        std::fs::File::metadata,
-        || Ok(()),
-        |dir| aterm_durable::Flush::Durable.dir(dir),
-    )?;
-    landed?;
-    Ok(metadata)
-}
-
-/// Write `bytes` to `path` with `mode`: a temporary file beside it, durably flushed
-/// ([`aterm_durable::durable`]), renamed over it, and the directory's entries flushed after
-/// the rename. That flush is best-effort ([`aterm_durable::Flush::dir_best_effort`]): a
-/// directory whose entries cannot be flushed here is no error, and any other failure is.
-/// # Errors
-/// As [`fn@write`], and `check`'s error.
-pub fn write_checked(
-    path: &Path,
-    bytes: &[u8],
-    mode: u32,
-    check: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
-    write_flushing_dir(path, bytes, mode, check, |dir| {
-        aterm_durable::Flush::Durable.dir(dir)
-    })
-}
-
-/// [`write_checked`] with the directory's flush (`flush_dir`) handed in, so a test can make
-/// it fail; its outcome is classified here either way.
-fn write_flushing_dir(
-    path: &Path,
-    bytes: &[u8],
-    mode: u32,
-    check: impl FnOnce() -> io::Result<()>,
-    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<()> {
-    write_landing(path, bytes, mode, check, flush_dir)?
-}
-
-/// What a careful write's rename left ([`write_landing`]): `path` holds the bytes either way.
-/// `Err` is the directory's flush after the rename, failed other than as unavailable, so the
-/// entry may not survive a power loss.
-type Landed = io::Result<()>;
-
-/// [`write_flushing_dir`], telling a failure before the rename (the outer `Err`: `path` is as
-/// it was) from one after it ([`Landed`]).
-fn write_landing(
-    path: &Path,
-    bytes: &[u8],
-    mode: u32,
-    check: impl FnOnce() -> io::Result<()>,
-    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<Landed> {
-    write_produced_landing(
-        path,
-        mode,
-        |writer| writer.write_all(bytes),
-        check,
-        flush_dir,
-    )
-}
-
-struct Temporary {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl Drop for Temporary {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = std::fs::remove_file(&self.path);
-        }
+/// Refuses symlinks, NUL-containing paths, and any filesystem or permission error.
+pub fn set_mode_nofollow(path: &Path, mode: u32) -> io::Result<()> {
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "chmod refuses a symlink",
+        ));
     }
+    chmod_entry_nofollow(path, mode)
 }
 
-fn write_produced_landing(
-    path: &Path,
-    mode: u32,
-    produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
-    check: impl FnOnce() -> io::Result<()>,
-    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<Landed> {
-    write_captured_landing(path, mode, produce, |_| Ok(()), check, flush_dir)
-        .map(|(_, landed)| landed)
-}
-
-fn write_captured_landing<T>(
-    path: &Path,
-    mode: u32,
-    produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
-    capture: impl FnOnce(&std::fs::File) -> io::Result<T>,
-    check: impl FnOnce() -> io::Result<()>,
-    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<(T, Landed)> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let (tmp, file) = create_temp_beside(path, mode)?;
-    let mut temporary = Temporary {
-        path: tmp,
-        armed: true,
+// Separate the kernel operation so the replacement window after metadata can be
+// exercised deterministically, without timing races or production test hooks.
+fn chmod_entry_nofollow(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: name is NUL-terminated and lives through the syscall. NOFOLLOW is
+    // enforced by the kernel/libc operation, not by the preceding metadata read.
+    let rc = unsafe {
+        libc::fchmodat(
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
     };
-    let mut file = file;
-    produce(&mut file)?;
-    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
-    aterm_durable::durable(&file)?;
-    let captured = capture(&file)?;
-    drop(file);
-    check()?;
-    std::fs::rename(&temporary.path, path)?;
-    // The old temporary name is free after the rename; do not remove a later user's file.
-    temporary.armed = false;
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    // Unavailable (a volume that cannot flush a directory, a directory this process may
-    // write but not open) is accepted: the bytes are flushed on their own handle, and the
-    // rename has landed. A failed flush is returned as it came, its errno kept for a caller
-    // that classifies it.
-    Ok((
-        captured,
-        aterm_durable::DirFlushed::classify(flush_dir(dir)).map(|_flushed_or_unavailable| ()),
-    ))
-}
-
-/// The bytes of a temporary name's salt ([`create_temp_beside`]), written as twice as many hex
-/// digits.
-const SALT_BYTES: usize = 4;
-
-/// A NEW file beside `path` to write it through.
-/// # Errors
-/// No entropy for the name, a clash on every try, or the create's own error.
-pub fn create_temp_beside(path: &Path, mode: u32) -> io::Result<(PathBuf, std::fs::File)> {
-    create_temp_salted(path, mode, crate::rand::hex_token::<SALT_BYTES>)
-}
-
-/// An age to pass [`abandoned_temps_beside`] and [`sweep_temps_beside`] as `older_than`: far past
-/// any write through a file [`create_temp_beside`] made, which lasts a flush and a rename, with
-/// a second or so at most of waiting for a lock or checking between.
-pub const ABANDONED_AFTER: Duration = Duration::from_secs(60 * 60);
-
-/// The files [`create_temp_beside`] made beside `path` that no write will rename, sorted, as
-/// [`temp_writer`] reads their names (so none for a `path` that has no name, or one that is not
-/// UTF-8, whose temporaries are named lossily): each a regular
-/// file whose pid names no live process ([`crate::process::pid_alive`]) and that was last
-/// written more than `older_than` ago. A writer that ends between the create and the rename
-/// (killed, or its process exiting under a thread that is still writing) leaves its file for
-/// good. One whose pid names a live process is not named (its writer's, or that of a later
-/// process given the pid, until it ends), nor one written within `older_than` or dated ahead of
-/// this clock, a link, a folder or any other name. A writer on another host that shares the
-/// folder is kept by the age alone: while the time since it last wrote, with however far the
-/// clock that dated the write (its own or the file server's) runs behind this one, stays within
-/// `older_than`.
-/// # Errors
-/// The folder, or an entry of its listing, cannot be read (a missing folder names none).
-pub fn abandoned_temps_beside(path: &Path, older_than: Duration) -> io::Result<Vec<PathBuf>> {
-    abandoned_with(
-        path,
-        older_than,
-        std::time::SystemTime::now(),
-        crate::process::pid_alive,
-    )
-}
-
-/// [`abandoned_temps_beside`] at `now`, with `alive` answering for a writer's pid.
-fn abandoned_with(
-    path: &Path,
-    older_than: Duration,
-    now: std::time::SystemTime,
-    alive: impl Fn(u32) -> bool,
-) -> io::Result<Vec<PathBuf>> {
-    if path.file_name().and_then(|n| n.to_str()).is_none() {
-        return Ok(Vec::new());
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let mut due = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let Some(pid) = temp_writer(path, &entry.file_name()) else {
-            continue;
-        };
-        let old = entry.metadata().is_ok_and(|meta| {
-            meta.is_file()
-                && meta
-                    .modified()
-                    .is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age > older_than))
-        });
-        if old && !alive(pid) {
-            due.push(entry.path());
-        }
-    }
-    due.sort();
-    Ok(due)
-}
-
-/// Remove each file [`abandoned_temps_beside`] names for `path` and `older_than`. Returns how
-/// many went; one that went meanwhile is no error and not counted.
-/// # Errors
-/// As [`abandoned_temps_beside`], or one could not be removed: the first such error, once every
-/// other one was tried.
-pub fn sweep_temps_beside(path: &Path, older_than: Duration) -> io::Result<usize> {
-    sweep_temps_with(
-        path,
-        older_than,
-        std::time::SystemTime::now(),
-        crate::process::pid_alive,
-        |temp| std::fs::remove_file(temp),
-    )
-}
-
-/// [`sweep_temps_beside`] at `now`, with `alive` answering for a writer's pid and `remove`
-/// removing a due file.
-fn sweep_temps_with(
-    path: &Path,
-    older_than: Duration,
-    now: std::time::SystemTime,
-    alive: impl Fn(u32) -> bool,
-    remove: impl Fn(&Path) -> io::Result<()>,
-) -> io::Result<usize> {
-    let (mut removed, mut first) = (0, None);
-    for temp in abandoned_with(path, older_than, now, alive)? {
-        match remove(&temp) {
-            Ok(()) => removed += 1,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                first.get_or_insert(e);
-            }
-        }
-    }
-    first.map_or(Ok(removed), Err)
-}
-
-/// The pid of the writer whose temporary for `path` ([`create_temp_beside`]) is named `name`:
-/// `.<path's name>.tmp.<pid>.<salt>`, the pid in decimal digits and the salt as 8 lowercase hex
-/// digits (`SALT_BYTES`). `None` for any other name, when either name is not UTF-8, and for a
-/// `path` that has no name.
-#[must_use]
-pub fn temp_writer(path: &Path, name: &std::ffi::OsStr) -> Option<u32> {
-    let target = path.file_name()?.to_str()?;
-    let tail = name
-        .to_str()?
-        .strip_prefix('.')?
-        .strip_prefix(target)?
-        .strip_prefix(".tmp.")?;
-    let (pid, salt) = tail.split_once('.')?;
-    let salted = salt.len() == 2 * SALT_BYTES
-        && salt.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    if !salted || pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    pid.parse().ok()
-}
-
-/// The name of the file a temporary named `name` stands in for ([`create_temp_beside`]):
-/// `name` less its leading `.` and its `.tmp.<pid>.<salt>`, in [`temp_writer`]'s grammar, so a
-/// folder's listing can say whose temporaries it holds. `None` for any other name.
-#[must_use]
-pub fn temp_target(name: &std::ffi::OsStr) -> Option<&str> {
-    let (head, _salt) = name.to_str()?.strip_prefix('.')?.rsplit_once('.')?;
-    let (head, _pid) = head.rsplit_once('.')?;
-    let target = head.strip_suffix(".tmp")?;
-    temp_writer(Path::new(target), name).map(|_| target)
-}
-
-fn create_temp_salted(
-    path: &Path,
-    mode: u32,
-    mut salt: impl FnMut() -> io::Result<String>,
-) -> io::Result<(PathBuf, std::fs::File)> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let name = path
-        .file_name()
-        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-    for _ in 0..8 {
-        let salt = salt()?;
-        let tmp = path.with_file_name(format!(".{name}.tmp.{}.{salt}", std::process::id()));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(&tmp)
-        {
-            Ok(f) => return Ok((tmp, f)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!(
-            "every temporary name tried beside {} was already taken",
-            path.display()
-        ),
-    ))
 }
 
 /// `O_NOFOLLOW | O_NONBLOCK` (std adds `O_CLOEXEC`).
@@ -369,6 +71,25 @@ pub const LOCK_OPEN_FLAGS: i32 = 0o400_000 | 0o4000;
 /// No audited values.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 pub const LOCK_OPEN_FLAGS: i32 = 0;
+
+/// `O_NOCTTY | O_NOFOLLOW` (std adds `O_CLOEXEC`) for interactive `/dev/tty` opens.
+#[cfg(target_vendor = "apple")]
+pub const TTY_OPEN_FLAGS: i32 = 0x20000 | 0x0100;
+/// `O_NOCTTY | O_NOFOLLOW` on arm/aarch64 Linux (`O_NOCTTY = 0o400`, `O_NOFOLLOW = 0o100000`).
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+pub const TTY_OPEN_FLAGS: i32 = 0o400 | 0o100_000;
+/// `O_NOCTTY | O_NOFOLLOW` on other Linux (`O_NOCTTY = 0o400`, `O_NOFOLLOW = 0o400000`).
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "aarch64", target_arch = "arm"))
+))]
+pub const TTY_OPEN_FLAGS: i32 = 0o400 | 0o400_000;
+/// No audited values.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+pub const TTY_OPEN_FLAGS: i32 = 0;
+
+/// `O_NOCTTY | O_NOFOLLOW | O_NONBLOCK` (std adds `O_CLOEXEC`) for non-blocking `/dev/tty` probes.
+pub const TTY_PROBE_OPEN_FLAGS: i32 = TTY_OPEN_FLAGS | LOCK_OPEN_FLAGS;
 
 /// How long an edit waits for the config service's write lock.
 pub const CONFIG_LOCK_WAIT: Duration = Duration::from_secs(2);
@@ -414,19 +135,23 @@ impl ConfigWriteLock {
         }
         #[cfg(test)]
         tests::race();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(LOCK_OPEN_FLAGS)
-            .open(&path)?;
-        if !file.metadata()?.is_file() {
+        let file: std::fs::File = crate::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(LOCK_OPEN_FLAGS)
+                .open(&path)
+        })?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
             return Err(not_a_file());
         }
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        crate::keep_out_of_children(&file)?;
+        if meta.permissions().mode() & 0o7777 != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         let deadline = crate::deadline::saturating_after(Instant::now(), wait);
         let mut backoff = Duration::from_millis(1);
         loop {

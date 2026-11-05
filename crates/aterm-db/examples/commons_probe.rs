@@ -558,6 +558,7 @@ mod probe {
                     ..Default::default()
                 }),
                 application_error: None,
+                application_cause: None,
                 application_interrupted: None,
                 application_deferral: None,
                 application_batch_deferral: None,
@@ -595,12 +596,14 @@ mod probe {
                         invalid.application_deferral = Some(replica::InventoryDeferral {
                             inventory: "conflicts",
                             local_error: None,
+                            local_cause: None,
                             retaining_primary_conflicts: false,
                             peer_unavailable: true,
                         })
                     }
                     12 => {
                         invalid.application_batch_deferral = Some(replica::BatchDeferral {
+                            cause: aterm_types::network_state::RepairCause::Other,
                             batch: "operations",
                             stage: "ingest",
                             reason: "local batch refused".into(),

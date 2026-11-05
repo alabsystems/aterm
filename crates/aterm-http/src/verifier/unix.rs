@@ -115,9 +115,9 @@ fn read_pem_file(path: &Path, out: &mut Vec<Vec<u8>>) {
 }
 
 #[cfg(target_os = "macos")]
-const NONBLOCK_OPEN_FLAG: i32 = 0x0004;
+const NONBLOCK_OPEN_FLAG: i32 = 0x0004 | 0x0100_0000;
 #[cfg(not(target_os = "macos"))]
-const NONBLOCK_OPEN_FLAG: i32 = 0o4000;
+const NONBLOCK_OPEN_FLAG: i32 = 0o4000 | 0o2_000_000;
 
 fn read_pem_file_up_to(path: &Path, cap: u64, out: &mut Vec<Vec<u8>>) {
     use std::io::Read as _;
@@ -166,12 +166,12 @@ fn collect_ders(file: Option<&Path>, dirs: &[PathBuf]) -> Vec<Vec<u8>> {
             continue;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(metadata) = std::fs::metadata(&path) else {
-                continue;
-            };
-            if metadata.is_file() {
-                read_pem_file(&path, &mut ders);
+            let is_file = entry
+                .file_type()
+                .map(|ft| ft.is_file() || (ft.is_symlink() && entry.path().is_file()))
+                .unwrap_or(false);
+            if is_file {
+                read_pem_file(&entry.path(), &mut ders);
             }
         }
     }

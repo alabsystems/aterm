@@ -36,11 +36,18 @@ aterm-census.workspace = true
 aterm-sysprobe.workspace = true
 ring.workspace = true
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# Every Ed25519 verification (`crypto::verify`): astream's strict check, which refuses
+# the small-order keys and commitments ring alone takes.
+astream-aead = { path = "../../vendor/astream/crates/astream-aead", default-features = false, features = ["signature"] }
 astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 [target.'cfg(unix)'.dependencies]
 # Database diagnostics and authenticated contacts use the shared network place.
 aterm-netplace.workspace = true
+# The owner's views ask the aterm instance they run under whether its session may see plaintext
+# (`reveal`, docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8): aterm-ctl's discovery and exchange.
+# A path dependency, as every aterm-ctl user's is: the workspace has no aterm-ctl row.
+aterm-ctl = { path = "../aterm-ctl" }
 [dev-dependencies]
 aterm-spec.workspace = true
 aterm-models-db.workspace = true

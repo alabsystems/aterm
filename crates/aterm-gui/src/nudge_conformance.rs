@@ -277,6 +277,9 @@ fn a_superseded_repair_whose_resize_comes_back_is_a_give_up() {
     assert_ne!(rig.debt(), (0, 0), "still displaced");
 }
 
+/// A program that never answers is let go at the engine's size, and the epoch stays at risk. When
+/// it then repaints for a resize of the person's, the repair is the program's: `by=app`, where
+/// `by=nudge` is the word for a heal the nudge's own attempt produced.
 #[test]
 fn a_program_that_never_answers_is_let_go_at_the_engines_size() {
     let mut rig = Rig::nudge_rig(Mode::On, true, true, Answer::Silent);
@@ -295,5 +298,15 @@ fn a_program_that_never_answers_is_let_go_at_the_engines_size() {
         rig.header().contains("verdict=desync-risk"),
         "{}",
         rig.header()
+    );
+    rig.answer = Answer::Repaint;
+    rig.resize(ROWS - 1);
+    let repainted = rig.until(Duration::from_secs(60), |r| r.debt() == (0, 0));
+    assert!(repainted, "the program never repainted:\n{}", rig.header());
+    let session = rig.app.pool.get(0).unwrap();
+    let reply = crate::resize_ledger::cmd_resizes(&session.ctx, &session.term, "");
+    assert!(
+        reply.contains("verdict=healed by=app tried=1"),
+        "the program's repaint, after the give-up: {reply}"
     );
 }

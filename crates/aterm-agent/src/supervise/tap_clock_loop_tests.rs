@@ -319,6 +319,7 @@ fn a_cut_session_walls_wait_is_timed_by_the_taps_reset() {
             unix_ms: TEST_NOW * 1000,
             why: "the older loop's wall wait".to_owned(),
             wait: WaitKind::Other,
+            put_off: None,
         });
         assert!(!s.tap_edge(&opts, 1));
         assert_eq!(host.asks(), 0);
@@ -540,6 +541,7 @@ fn a_cut_walls_tap_clock_outlasts_its_notice() {
             unix_ms: TEST_NOW * 1000,
             why: "the wall's wait".to_owned(),
             wait: WaitKind::Other,
+            put_off: None,
         });
         let moved = s.tap_edge(&opts, 1);
         let (r, a) = decide(&mut s, wall_scrolled_off(), &opts);

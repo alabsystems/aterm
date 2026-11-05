@@ -517,19 +517,57 @@ pub(crate) fn checkpoint_shape_refusal(
             bytes: checkpoint.grid.len(),
         });
     }
+    let inactive = checkpoint_inactive_history(checkpoint);
     if let Some(alt) = checkpoint.alt_grid.as_ref()
-        && !checkpoint_grid_is_canonical(alt, checkpoint.rows, checkpoint.cols, 0)
+        && !checkpoint_grid_is_canonical(alt, checkpoint.rows, checkpoint.cols, inactive)
     {
         return Some(ScreenDigestRefusal::GridNotCanonical {
             local_id,
             which: GridSlot::Inactive,
             rows: checkpoint.rows,
             cols: checkpoint.cols,
-            expected_records: u64::from(checkpoint.rows),
+            expected_records: u64::from(checkpoint.rows) + u64::from(inactive),
             bytes: alt.len(),
         });
     }
     None
+}
+
+/// How many history lines a checkpoint's inactive grid blob `alt` holds above its `rows` visible
+/// records, as its record count says. Only the saved primary under the alternate screen holds any
+/// (the carry gives its history budget to the grid that holds the history), so it is 0 while the
+/// main screen is up, whose inactive grid is the parked alternate screen, which keeps none. Each
+/// canonical check against it refuses a blob whose records are not that many.
+fn inactive_history(rows: u16, alternate_screen: bool, alt: Option<&[u8]>) -> u32 {
+    let Some(alt) = alt.filter(|_| alternate_screen) else {
+        return 0;
+    };
+    alt.get(..4)
+        .and_then(|count| <[u8; 4]>::try_from(count).ok())
+        .map_or(0, u32::from_le_bytes)
+        .saturating_sub(u32::from(rows))
+}
+
+/// [`inactive_history`] of `checkpoint`: the saved primary's carried history while the alternate
+/// screen is up.
+#[must_use]
+pub(crate) fn checkpoint_inactive_history(checkpoint: &TerminalCheckpoint) -> u32 {
+    inactive_history(
+        checkpoint.rows,
+        checkpoint.modes.alternate_screen,
+        checkpoint.alt_grid.as_deref(),
+    )
+}
+
+/// Every history line `checkpoint` carries, in either grid (the alternate screen keeps none, so
+/// one of the two is 0): what admission charges and each grid's byte cap is sized by, and the
+/// budget a carry of the same lines is projected at.
+#[cfg(any(unix, test))]
+#[must_use]
+pub(crate) fn carried_lines(checkpoint: &TerminalCheckpoint) -> u32 {
+    checkpoint
+        .history_lines
+        .saturating_add(checkpoint_inactive_history(checkpoint))
 }
 
 /// Canonical commitment to every required visible-screen checkpoint: sorted by local id, length framed, over canonical wire encodings only (non-canonical ones are refused before hashing).
@@ -579,25 +617,28 @@ fn screen_digest_and_meta_cost(
     for (local_id, checkpoint) in &screens {
         let local_id = *local_id;
         let meta = CheckpointMeta::from_checkpoint(checkpoint);
-        let cap = checkpoint_grid_cap(&meta).ok_or_else(|| ScreenDigestRefusal::MetaUnbounded {
-            local_id,
-            rows: checkpoint.rows,
-            cols: checkpoint.cols,
-            history_lines: checkpoint.history_lines,
-            violation: checkpoint_meta_bound_violation(&meta),
+        let carried = carried_lines(checkpoint);
+        let cap = checkpoint_grid_cap(&meta, carried).ok_or_else(|| {
+            ScreenDigestRefusal::MetaUnbounded {
+                local_id,
+                rows: checkpoint.rows,
+                cols: checkpoint.cols,
+                history_lines: carried,
+                violation: checkpoint_meta_bound_violation(&meta),
+            }
         })?;
         let admitted = admit_checkpoint_dimensions(
             &mut aggregate_cells,
             checkpoint.rows,
             checkpoint.cols,
-            checkpoint.history_lines,
+            carried,
             checkpoint.alt_grid.is_some(),
         )
         .map_err(|bound| ScreenDigestRefusal::DimensionsRefused {
             local_id,
             rows: checkpoint.rows,
             cols: checkpoint.cols,
-            history_lines: checkpoint.history_lines,
+            history_lines: carried,
             has_alt: checkpoint.alt_grid.is_some(),
             bound,
         })?;
@@ -742,6 +783,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         .create(true)
         .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .and_then(|mut f| f.write_all(bytes))
 }
@@ -825,9 +867,10 @@ pub(crate) enum PersonStamp {
     /// (`human_input::HumanInputStamp::typed_awake_ms`): `a<id> <age>`, whose nonnumeric id
     /// older readers ignore.
     TypedAwake(u64),
-    /// The claim look last saw a program running in the session's tab, whose claim worker had
-    /// ended, this many milliseconds ago in awake time (`App::claim_job_seen`), which the tab's
-    /// reading time counts from: `j<id> <age>`, whose nonnumeric id older readers ignore.
+    /// The reaper's look last saw someone else's program running in the session's tab, whose
+    /// worker's task had concluded, this many milliseconds ago in awake time
+    /// (`App::worker_job_seen`), which the tab's reading time counts from: `j<id> <age>`, whose
+    /// nonnumeric id older readers ignore.
     JobSeen(u64),
 }
 
@@ -969,23 +1012,17 @@ pub(crate) fn keep_attempt_in(
     let mut copied = 0;
     for name in names {
         let path = dir.join(&name);
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        let bytes = if meta.file_type().is_file() {
-            read_regular_capped(&path, KEEP_FILE_MAX)
-        } else {
-            None
-        };
-        match bytes {
-            Some(bytes) => {
+        match read_regular_capped_with_meta(&path, KEEP_FILE_MAX) {
+            Some((bytes, meta)) => {
                 aterm_uds::private_file::write_private(&kept, &name, &bytes)?;
                 let mode = meta.permissions().mode() & 0o7777;
                 let _ = writeln!(index, "file {mode:o} {} {name}", bytes.len());
                 copied += 1;
             }
             None => {
-                let _ = writeln!(index, "skip {name}");
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    let _ = writeln!(index, "skip {name}");
+                }
             }
         }
     }
@@ -1009,6 +1046,13 @@ pub(crate) fn take_regular_capped(
 
 /// [`take_regular_capped`]'s read without the consume.
 pub(crate) fn read_regular_capped(path: &std::path::Path, max_bytes: u64) -> Option<Vec<u8>> {
+    read_regular_capped_with_meta(path, max_bytes).map(|(bytes, _)| bytes)
+}
+
+fn read_regular_capped_with_meta(
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> Option<(Vec<u8>, std::fs::Metadata)> {
     use std::io::Read as _;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -1028,7 +1072,7 @@ pub(crate) fn read_regular_capped(path: &std::path::Path, max_bytes: u64) -> Opt
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .ok()?;
-    (u64::try_from(bytes.len()).ok()? <= max_bytes).then_some(bytes)
+    (u64::try_from(bytes.len()).ok()? <= max_bytes).then_some((bytes, metadata))
 }
 
 fn take_grid_capped(
@@ -1360,9 +1404,9 @@ fn dimension_grid_cap(rows: u16, cols: u16, history: u32) -> Option<u64> {
 }
 
 #[cfg(any(unix, test))]
-fn checkpoint_grid_cap(meta: &CheckpointMeta) -> Option<u64> {
+fn checkpoint_grid_cap(meta: &CheckpointMeta, carried: u32) -> Option<u64> {
     checkpoint_meta_is_bounded(meta).then_some(())?;
-    dimension_grid_cap(meta.rows, meta.cols, meta.history_lines)
+    dimension_grid_cap(meta.rows, meta.cols, carried)
 }
 
 /// Which ceiling [`admit_checkpoint_dimensions`] refused a geometry on, so a refusal names the cap that actually bound.
@@ -1408,6 +1452,7 @@ pub(crate) struct WireCaps {
     attrs_bounded_by_columns: bool,
     carries_parser: bool,
     carries_output_state: bool,
+    carries_inactive_history: bool,
 }
 
 impl WireCaps {
@@ -1419,6 +1464,7 @@ impl WireCaps {
             attrs_bounded_by_columns: false,
             carries_parser: true,
             carries_output_state: true,
+            carries_inactive_history: true,
         }
     }
 
@@ -1431,6 +1477,7 @@ impl WireCaps {
             attrs_bounded_by_columns: true,
             carries_parser: false,
             carries_output_state: false,
+            carries_inactive_history: false,
         }
     }
 
@@ -1451,6 +1498,7 @@ impl WireCaps {
             Self {
                 carries_parser: false,
                 carries_output_state: false,
+                carries_inactive_history: false,
                 ..Self::current()
             }
         } else {
@@ -1470,6 +1518,15 @@ impl WireCaps {
     #[must_use]
     pub(crate) const fn carries_output_state(self) -> bool {
         self.carries_output_state
+    }
+
+    /// Whether the successor reads the saved primary's history in the inactive grid of a carry made
+    /// on the alternate screen; one that does not refuses that blob as not canonical (it holds
+    /// exactly its rows there), so the carry gives it none.
+    #[cfg(any(unix, test))]
+    #[must_use]
+    pub(crate) const fn carries_inactive_history(self) -> bool {
+        self.carries_inactive_history
     }
 
     /// The per-grid cell ceiling in force.
@@ -1535,7 +1592,11 @@ impl WireCaps {
                 Some(&checkpoint.grid),
                 checkpoint.history_lines,
             ),
-            (GridSlot::Inactive, checkpoint.alt_grid.as_ref(), 0),
+            (
+                GridSlot::Inactive,
+                checkpoint.alt_grid.as_ref(),
+                checkpoint_inactive_history(checkpoint),
+            ),
         ]
         .into_iter()
         .find_map(|(which, blob, history)| {
@@ -1697,12 +1758,20 @@ fn take_screen_wire(
     let cap = meta
         .and_then(|meta| dimension_grid_cap(meta.rows, meta.cols, meta.history_lines))
         .unwrap_or(MAX_HANDOFF_GRID_BYTES);
+    // Read before its record count can be: the saved primary under the alternate screen may
+    // carry up to the protocol's whole history, which the admission then holds it to.
+    let alt_cap = meta
+        .filter(|meta| meta.modes.alternate_screen)
+        .map_or(Some(cap), |meta| {
+            dimension_grid_cap(meta.rows, meta.cols, MAX_HANDOFF_HISTORY_LINES)
+        })
+        .unwrap_or(MAX_HANDOFF_GRID_BYTES);
     let grid = take_grid_capped(grid_path, dir, cap, remaining).ok_or(
         "has a main grid sidecar that is missing, over its byte cap, or past the handoff's \
          aggregate byte cap",
     )?;
     let alt_grid = match carry.alt_grid_file {
-        Some(_) => Some(take_grid_capped(alt_path, dir, cap, remaining).ok_or(
+        Some(_) => Some(take_grid_capped(alt_path, dir, alt_cap, remaining).ok_or(
             "has an inactive grid sidecar that is missing, over its byte cap, or past the \
              handoff's aggregate byte cap",
         )?),
@@ -1751,19 +1820,25 @@ fn admit_incoming_screen(
             used_cells,
         );
     }
+    let inactive = inactive_history(
+        meta.rows,
+        meta.modes.alternate_screen,
+        wire.alt_grid.as_deref(),
+    );
+    let carried = meta.history_lines.saturating_add(inactive);
     let mut charged = *used_cells;
     if let Err(bound) = admit_checkpoint_dimensions(
         &mut charged,
         meta.rows,
         meta.cols,
-        meta.history_lines,
+        carried,
         meta.alt_cursor.is_some(),
     ) {
         return degrade(
             Some(&meta),
             format!(
-                "{}x{} with {} history line(s) was refused: {bound}",
-                meta.rows, meta.cols, meta.history_lines
+                "{}x{} with {carried} history line(s) was refused: {bound}",
+                meta.rows, meta.cols
             ),
             wire,
             used_cells,
@@ -1780,7 +1855,7 @@ fn admit_incoming_screen(
     if wire
         .alt_grid
         .as_deref()
-        .is_some_and(|alt| !checkpoint_grid_is_canonical(alt, meta.rows, meta.cols, 0))
+        .is_some_and(|alt| !checkpoint_grid_is_canonical(alt, meta.rows, meta.cols, inactive))
     {
         return degrade(
             Some(&meta),
@@ -2021,7 +2096,7 @@ fn repaint_carry(
 
 #[cfg(any(unix, test))]
 fn grid_over_cap(local_id: u64, checkpoint: &TerminalCheckpoint) -> Option<ScreenDigestRefusal> {
-    let cap = dimension_grid_cap(checkpoint.rows, checkpoint.cols, checkpoint.history_lines)?;
+    let cap = dimension_grid_cap(checkpoint.rows, checkpoint.cols, carried_lines(checkpoint))?;
     [
         (GridSlot::Main, Some(&checkpoint.grid)),
         (GridSlot::Inactive, checkpoint.alt_grid.as_ref()),
@@ -2103,10 +2178,12 @@ fn strip_over_cap_links(checkpoint: &mut TerminalCheckpoint) -> Option<usize> {
         .ok()
         .and_then(|history| rows.checked_add(history))
         .and_then(|records| strip_blob_links(&checkpoint.grid, records, record_cap));
+    let inactive = usize::try_from(checkpoint_inactive_history(checkpoint)).ok();
     let alt = checkpoint
         .alt_grid
         .as_deref()
-        .and_then(|alt| strip_blob_links(alt, rows, record_cap));
+        .zip(inactive.and_then(|history| rows.checked_add(history)))
+        .and_then(|(alt, records)| strip_blob_links(alt, records, record_cap));
     let mut lost = 0_usize;
     if let Some((grid, lines)) = main {
         checkpoint.grid = grid;
@@ -2227,8 +2304,14 @@ pub(crate) fn carry_for_wire(
             ));
             continue;
         }
-        let (mut checkpoint, abandoned) =
-            terminal.checkpoint_carry_abandoning_partial(history as usize);
+        // The carry spends its history on the grid that holds it, the saved primary while the
+        // alternate screen is up, which only a successor that reads it there is given.
+        let carried = if terminal.modes().alternate_screen && !caps.carries_inactive_history() {
+            0
+        } else {
+            history as usize
+        };
+        let (mut checkpoint, abandoned) = terminal.checkpoint_carry_abandoning_partial(carried);
         if let Some(state) = abandoned
             && !told_partial
         {
@@ -2336,7 +2419,7 @@ pub(crate) struct WireCarry {
 #[cfg(any(unix, test))]
 fn wire_cells(checkpoint: &TerminalCheckpoint) -> u64 {
     let visible = u64::from(checkpoint.rows).saturating_mul(u64::from(checkpoint.cols));
-    let history = u64::from(checkpoint.history_lines).saturating_mul(u64::from(checkpoint.cols));
+    let history = u64::from(carried_lines(checkpoint)).saturating_mul(u64::from(checkpoint.cols));
     visible
         .saturating_add(history)
         .saturating_add(if checkpoint.alt_grid.is_some() {
@@ -2354,24 +2437,36 @@ fn wire_bytes(checkpoint: &TerminalCheckpoint) -> u64 {
 
 #[cfg(any(unix, test))]
 fn drop_carried_history(checkpoint: &mut TerminalCheckpoint) -> bool {
+    let (rows, cols) = (checkpoint.rows, checkpoint.cols);
+    let inactive = checkpoint_inactive_history(checkpoint);
+    if inactive > 0 {
+        let Some(alt) = checkpoint
+            .alt_grid
+            .as_deref()
+            .and_then(|alt| visible_records(alt, rows, cols, inactive))
+        else {
+            return false;
+        };
+        checkpoint.alt_grid = Some(alt);
+        return true;
+    }
     if checkpoint.history_lines == 0 {
         return false;
     }
-    let Some(lines) = strict_grid_lines(
-        &checkpoint.grid,
-        checkpoint.rows,
-        checkpoint.cols,
-        checkpoint.history_lines,
-    ) else {
+    let Some(grid) = visible_records(&checkpoint.grid, rows, cols, checkpoint.history_lines) else {
         return false;
     };
-    let Some(visible) = lines.get(lines.len().saturating_sub(usize::from(checkpoint.rows))..)
-    else {
-        return false;
-    };
-    checkpoint.grid = aterm_core::scrollback::serialize_lines(visible);
+    checkpoint.grid = grid;
     checkpoint.history_lines = 0;
     true
+}
+
+/// The blob of `bytes`' visible `rows` records, its `history` older ones dropped.
+#[cfg(any(unix, test))]
+fn visible_records(bytes: &[u8], rows: u16, cols: u16, history: u32) -> Option<Vec<u8>> {
+    let lines = strict_grid_lines(bytes, rows, cols, history)?;
+    let visible = lines.get(lines.len().saturating_sub(usize::from(rows))..)?;
+    Some(aterm_core::scrollback::serialize_lines(visible))
 }
 
 #[cfg(any(unix, test))]
@@ -2894,13 +2989,13 @@ fn stamp_held_panes(
             || (!cp.parser_ground && cp.parser.is_none())
             || admit_checkpoint_dimensions(&mut cells, cp.rows, cp.cols, 0, cp.alt_grid.is_some())
                 .is_err()
-            || checkpoint_grid_cap(&meta)
+            || checkpoint_grid_cap(&meta, 0)
                 .is_none_or(|cap| u64::try_from(cp.grid.len()).map_or(true, |len| len > cap))
             || !checkpoint_grid_is_canonical(&cp.grid, cp.rows, cp.cols, 0)
             || cp.alt_grid.is_some() != cp.alt_cursor.is_some()
             || cp.alt_grid.as_ref().is_some_and(|alt| {
                 u64::try_from(alt.len())
-                    .map_or(true, |len| len > checkpoint_grid_cap(&meta).unwrap_or(0))
+                    .map_or(true, |len| len > checkpoint_grid_cap(&meta, 0).unwrap_or(0))
                     || !checkpoint_grid_is_canonical(alt, cp.rows, cp.cols, 0)
             })
             || held_bytes.saturating_add(bytes) > MAX_HELD_AGGREGATE_GRID_BYTES
@@ -3273,23 +3368,25 @@ pub(crate) fn write_outgoing_with_held(
             return Err(WriteOutgoingFailure::Inconsistent);
         };
         let checkpoint_meta = CheckpointMeta::from_checkpoint(cp);
+        let carried = carried_lines(cp);
+        let inactive = checkpoint_inactive_history(cp);
         let admitted_cap = admit_checkpoint_dimensions(
             &mut aggregate_cells,
             cp.rows,
             cp.cols,
-            cp.history_lines,
+            carried,
             cp.alt_grid.is_some(),
         );
         if (!cp.parser_ground && cp.parser.is_none())
             || admitted_cap.is_err()
-            || checkpoint_grid_cap(&checkpoint_meta)
+            || checkpoint_grid_cap(&checkpoint_meta, carried)
                 .is_none_or(|cap| u64::try_from(cp.grid.len()).map_or(true, |len| len > cap))
             || !checkpoint_grid_is_canonical(&cp.grid, cp.rows, cp.cols, cp.history_lines)
             || cp.alt_grid.is_some() != cp.alt_cursor.is_some()
             || cp.alt_grid.as_ref().is_some_and(|alt| {
                 u64::try_from(alt.len()).map_or(true, |len| {
-                    len > checkpoint_grid_cap(&checkpoint_meta).unwrap_or(0)
-                }) || !checkpoint_grid_is_canonical(alt, cp.rows, cp.cols, 0)
+                    len > checkpoint_grid_cap(&checkpoint_meta, carried).unwrap_or(0)
+                }) || !checkpoint_grid_is_canonical(alt, cp.rows, cp.cols, inactive)
             })
         {
             for path in written_blobs {
@@ -3611,6 +3708,8 @@ pub(crate) struct IncomingHandoff {
     pub mirror_dropped: Vec<String>,
     /// Whether the outgoing process's node mirrored ([`crate::session_store::SessionHandoff::mirror_served`]).
     pub mirror_served: bool,
+    /// The outgoing process's retired workers ([`crate::session_store::SessionHandoff::retired_workers`]), the rows as written; adopted into this process's store before its first session ([`crate::retired_workers::RetiredWorkers::adopt`]).
+    pub retired_workers: Vec<String>,
 }
 
 /// Whose content a whole-handoff refusal was about.
@@ -3689,7 +3788,10 @@ pub(crate) fn discard_outgoing_in(dir: &std::path::Path, nonce: &str) {
         return;
     };
     for e in entries.flatten() {
-        if e.file_name().to_string_lossy().starts_with(&prefix) {
+        if e.file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -3707,12 +3809,12 @@ pub(crate) fn retire_outgoing_controls(nonce: &str) {
     };
     for e in entries.flatten() {
         let name = e.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(&prefix)
-            && [".ctl", ".hist", HELD_GRID_SUFFIX, HELD_ALT_SUFFIX]
-                .iter()
-                .any(|suffix| name.ends_with(suffix))
-        {
+        if name.to_str().is_some_and(|name| {
+            name.starts_with(&prefix)
+                && [".ctl", ".hist", HELD_GRID_SUFFIX, HELD_ALT_SUFFIX]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+        }) {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -5952,6 +6054,7 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
         person_stamps: Some(person_stamps_path(std::path::Path::new(&path))),
         mirror_dropped: manifest.mirror_dropped,
         mirror_served: manifest.mirror_served,
+        retired_workers: manifest.retired_workers,
     }
 }
 

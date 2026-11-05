@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The lab importer (docs/DESIGN-alab-lab-model-2026-11-01.md §9, step 6): the owner's two
-//! account sheets and the machines this Mac knows of, planned as typed registry writes. Pure:
-//! the caller hands in the parsed sheets, the registry's cells as they are, and the harness's
-//! reading of a provider cell; nothing here does I/O.
+//! The lab importer (docs/DESIGN-alab-lab-model-2026-11-01.md §9, step 6;
+//! docs/DESIGN-alab-one-mesh-2026-11-05.md §4.7, §8): the owner's sheets, the harness's files,
+//! the machines this Mac knows of and fleet_db replicas' dumps, planned as typed registry
+//! writes. Pure: the caller hands in the parsed sources, the registry's cells as they are, the
+//! table's Secret sealer and the harness's reading of a provider cell; nothing here does I/O.
 //!
-//! - **Three-way, never over the owner.** A cell is written only when it is absent or still
-//!   holds what an earlier import wrote (`cell::import_step`); a cell the owner set, cleared or
-//!   resolved since, or a conflicted one, is left as it is and becomes a finding. A row the
-//!   owner retired is left whole. An unchanged cell costs nothing, so a re-run writes nothing.
+//! - **Never over the owner, and a sheet only fills.** Each source is read in a [`Mode`]. An
+//!   [`Mode::Authoritative`] source (the one replica that holds the corrected rows, imported on
+//!   its own Mac first) writes a cell that is absent or still holds what an import wrote
+//!   (`cell::import_step`). A [`Mode::FillOnly`] source (every sheet, every other replica's
+//!   dump) writes a cell only where it is empty or holds this same source's earlier import; a
+//!   cell another source or the owner wrote differently is left as it is and becomes a
+//!   [`Kind::Differs`] finding, recorded by row key and column only in the source's row
+//!   (`source.differs`), never with a value. A cell the owner set, cleared or resolved since,
+//!   or a conflicted one, is left as it is and becomes a finding. A row the owner retired is
+//!   left whole. An unchanged cell costs nothing, so a re-run writes nothing.
+//! - **Passwords and phone numbers are `Secret` cells.** A dump's password and a full phone
+//!   number are sealed at their cell's coordinates through the table's [`Sealer`], compared by
+//!   opening the stored token (never by its randomized bytes), so a re-run writes nothing. A
+//!   sheet's `Password` column is a has-password flag and never becomes a `Secret`; any `Secret`
+//!   value that reads as a flag (`1`, `yes`, under six characters) is refused with a finding. A
+//!   protected address holds no password ([`crate::typed::check::protected`]).
 //! - **What the sheets stop saying is retracted, three-way too.** A cell an earlier import of
 //!   a source kind read now wrote, and that source no longer states, is withdrawn: a set element
 //!   (a service, an alias) becomes `false`, a region, flow, mailbox link, alias link, note or rank
@@ -29,11 +42,10 @@
 //!   names, and any other column's account only when it names that vendor or none.
 //! - **One key per account**: the canonical account key (`keys::account_pk`) from the claims
 //!   realm and the claims email, one provider word per realm.
-//! - **Mailbox logins never cross**: a receiving mailbox becomes a row with a random key, a
-//!   plain label, a service and a vault entry name; the address codes arrive at stays on this
-//!   Mac ([`MailboxKeys`]), never in a key, a cell or a log line. An address never links to the
-//!   mailbox it is itself (that link would name the mailbox's login), and a mailbox that is
-//!   also an AI login is a finding. No phone row is made from free text.
+//! - **A mailbox is its login's** (one-mesh design §4.7): a receiving mailbox becomes a row keyed
+//!   from its login address's key ([`keys::mailbox_pk`]), with a plain label, a service and its
+//!   `login`, that member-readable address row. A phone's key is random; the importer finds an
+//!   existing phone by opening its `number`. No phone row is made from free text.
 //! - **Labels** go through the one parser (`machines::Reading`): `M109` is `m109`, `m27-2` is
 //!   number 2 on m27, `m3.2` number 2 on m3, a bare `m3` number 1. Every label resolves against
 //!   the live rows' labels and aliases, then the Macs this Mac knows of (by label or alias, and
@@ -48,7 +60,9 @@
 //!   says anything else. Only a run that reads the logins sheet can know that, so only such a
 //!   run writes or withdraws the `+tag` link.
 
-use super::registry::{ACCOUNT, ADDRESS, APPLICATION, MACHINE, MAILBOX, PREFERENCE, SOURCE};
+use super::registry::{
+    ACCOUNT, ADDRESS, DIFFER_COLUMNS, MACHINE, MAILBOX, MAX_DIFFERS, PHONE, PREFERENCE, SOURCE,
+};
 use crate::{
     Error, Result,
     database::Change,
@@ -56,13 +70,24 @@ use crate::{
     typed::{
         Collection,
         cell::{self, CellKey, CellValue, Cells, Field, ImportStep, Projection},
-        guard, keys,
+        check, guard, keys,
+        secret::{MASK, Sealer, Secret, flag_like},
     },
 };
 use aterm_codec::hex;
 use aterm_digest::Sha256;
 use aterm_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+
+pub mod covered;
+mod dump;
+mod toml;
+pub(crate) mod xlsx;
+pub use dump::{DUMP_TABLES, dump_sheets};
+pub use toml::{MAX_BYTES as MAILBOX_TOML_MAX, mailbox_sheet};
 
 /// The source layouts the importer reads, highest precedence first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,6 +95,12 @@ pub enum SheetKind {
     /// The vault's account sheet (`ai-accounts.csv`): `m, email, computer, claude, Open AI,
     /// google, meta, kimi, x, notes`. It outranks the logins sheet.
     Vault,
+    /// The owner's phone inventory sheet (`alab-phones.csv`).
+    Phones,
+    /// The owner's computer inventory sheet (`alab-computers.csv`).
+    Computers,
+    /// The owner's email and alias inventory sheet (`alab-emails.csv`).
+    Emails,
     /// The owner's logins sheet (`ai-account-logins.csv`): `computer, AI login email, services,
     /// codes arrive in (my guess), why I guessed, your correction`.
     Logins,
@@ -77,6 +108,35 @@ pub enum SheetKind {
     FleetAccounts,
     /// The harness's `ai-pool.toml`, its warm lists as [`Stated`] rows.
     AiPool,
+    /// One table of a fleet_db replica's dump (`aterm db dump <file> --show-passwords`), one
+    /// source per table: every column carried ([`dump`]).
+    FleetDb(Dump),
+    /// The harness's `ai-mailbox.toml`: every mailbox it names, each field to its MAILBOX or
+    /// login address cell or refused by name ([`toml`]).
+    MailboxToml,
+}
+
+/// The four tables a fleet_db dump holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Dump {
+    /// First, so a phone's own row names its label before an address names its number.
+    Phones,
+    Emails,
+    /// Before the computers, whose `assigned_accounts` name the accounts.
+    Accounts,
+    Computers,
+}
+
+/// How a source writes over what the registry holds (one-mesh design §8, step 2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Mode {
+    /// The replica that holds the corrected rows, on its own Mac, first: it writes over what an
+    /// import wrote, never over the owner.
+    Authoritative,
+    /// A sheet or another replica: it fills empty cells and its own earlier import's, and every
+    /// other difference is a [`Kind::Differs`] finding.
+    #[default]
+    FillOnly,
 }
 
 impl SheetKind {
@@ -84,9 +144,42 @@ impl SheetKind {
     pub const fn word(self) -> &'static str {
         match self {
             Self::Vault => "vault-sheet",
+            Self::Phones => "phones-csv",
+            Self::Computers => "computers-csv",
+            Self::Emails => "emails-csv",
             Self::Logins => "logins-csv",
             Self::FleetAccounts => "fleet-accounts",
             Self::AiPool => "ai-pool",
+            Self::FleetDb(_) => "fleet-db",
+            Self::MailboxToml => "ai-mailbox",
+        }
+    }
+
+    /// Whether this kind has several files, each its own source, told apart by name.
+    const fn several(self) -> bool {
+        matches!(self, Self::FleetAccounts | Self::FleetDb(_))
+    }
+
+    /// The kind a sheet's header row says it is, for `--compare-sheet`.
+    pub fn detect(headers: &[String]) -> Option<Self> {
+        let has = |name: &str| headers.iter().any(|h| h.trim().eq_ignore_ascii_case(name));
+        let starts = |name: &str| {
+            headers
+                .iter()
+                .any(|h| h.trim().to_ascii_lowercase().starts_with(name))
+        };
+        if has("email address") {
+            Some(Self::Emails)
+        } else if has("ai login email") {
+            Some(Self::Logins)
+        } else if has("email") && has("computer") {
+            Some(Self::Vault)
+        } else if (has("id") || has("machine")) && has("make") {
+            Some(Self::Computers)
+        } else if starts("phone") || has("number") {
+            Some(Self::Phones)
+        } else {
+            None
         }
     }
 
@@ -94,8 +187,10 @@ impl SheetKind {
     const fn origin(self) -> &'static str {
         match self {
             Self::Vault => "sheet",
+            Self::Emails | Self::Phones | Self::Computers => "emails-csv",
             Self::Logins => "logins-csv",
-            Self::FleetAccounts | Self::AiPool => "harness",
+            Self::FleetAccounts | Self::AiPool | Self::MailboxToml => "harness",
+            Self::FleetDb(_) => "fleet-db",
         }
     }
 }
@@ -112,48 +207,146 @@ pub struct Sheet {
     pub sha256: String,
     pub headers: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// How this source writes over the registry.
+    pub mode: Mode,
+    /// The `Secret` values of a dump, by 1-based (row, column): never in `rows`, so no review
+    /// or finding can show one.
+    pub secrets: BTreeMap<(usize, usize), Arc<Secret>>,
+    /// Cells a dump's replica holds concurrent values for, by 1-based (row, column): never
+    /// written, each a finding.
+    pub conflicted: BTreeSet<(usize, usize)>,
+}
+
+/// Whether a sheet header names a credential: its column's cells are flags at most.
+fn secret_header(header: &str) -> bool {
+    let lower = header.trim().to_ascii_lowercase();
+    [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "credential",
+        "totp",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
 }
 
 impl Sheet {
+    /// Whether the source row `row`, key `pk`, records this sheet: the same kind, and for a kind
+    /// with several files the same file. A fleet-accounts file is told apart by its name; a
+    /// replica's dump by its bytes, since every replica's dump may share a file name.
+    fn wrote(&self, pk: &str, row: &cell::Row) -> bool {
+        row.get("kind").and_then(Value::as_str) == Some(self.kind.word())
+            && match self.kind {
+                SheetKind::FleetDb(_) => pk == self.source,
+                kind if kind.several() => {
+                    row.get("name").and_then(Value::as_str) == Some(self.name.as_str())
+                }
+                _ => true,
+            }
+    }
+
     /// Parse `bytes` (at most the importer's CSV caps) as a sheet named `name`.
     ///
     /// # Errors
     /// The bytes are not a CSV within the caps, or it has no header.
     pub fn parse(kind: SheetKind, name: &str, bytes: &[u8]) -> Result<Self> {
-        let mut records = crate::import::parse(bytes)?;
+        let records = crate::import::parse(bytes)?;
+        Self::from_records(kind, name, records, |_| bytes.to_vec())
+    }
+
+    /// The tab `tab` of the xlsx workbook `bytes`, file `name`, as a sheet read as a CSV is
+    /// ([`xlsx::tab`]). Its source is named by its records once each credential column is a
+    /// flag, never by the workbook's bytes, which may hold real passwords: no unsalted digest of
+    /// one reaches the shared `source` row.
+    ///
+    /// # Errors
+    /// The bytes are not a workbook this build reads, it has no such tab, or the tab has no
+    /// header.
+    pub fn xlsx(kind: SheetKind, name: &str, tab: &str, bytes: &[u8]) -> Result<Self> {
+        let records = xlsx::tab(bytes, tab)?;
+        let name = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+        let named = format!("{name}#{}", tab.trim());
+        Self::from_records(kind, &named, records, |sheet| {
+            aterm_json::to_vec(
+                &json!({"tab": tab.trim(), "headers": sheet.headers, "rows": sheet.rows}),
+            )
+            .unwrap_or_default()
+        })
+    }
+
+    /// `records` (header first) as a sheet named `name`, its source named by the bytes `named`
+    /// gives for it once its credential columns are flags.
+    fn from_records(
+        kind: SheetKind,
+        name: &str,
+        mut records: Vec<Vec<String>>,
+        named: impl FnOnce(&Self) -> Vec<u8>,
+    ) -> Result<Self> {
         if records.is_empty() {
             return Err(Error::new("the sheet has no header row"));
         }
         let headers = records.remove(0);
         let name = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
         if name.is_empty() || guard::text(name, 128).is_err() {
+            for record in &mut records {
+                record.iter_mut().for_each(zeroize::Zeroize::zeroize);
+            }
             return Err(Error::new("the sheet's file name cannot be recorded"));
         }
-        Ok(Self {
+        // A credential column of a sheet is a has-password flag (the owner's `alab-emails.csv`
+        // holds `1` there): only whether it is set is kept, so no review or finding shows a cell.
+        for (col, _) in headers.iter().enumerate().filter(|(_, h)| secret_header(h)) {
+            for row in &mut records {
+                if let Some(cell) = row.get_mut(col) {
+                    let set = !cell.trim().is_empty();
+                    zeroize::Zeroize::zeroize(cell);
+                    *cell = if set { "1".into() } else { String::new() };
+                }
+            }
+        }
+        let mut sheet = Self {
             kind,
             name: name.to_owned(),
-            source: keys::source_pk(bytes),
-            sha256: hex::encode_lower(&Sha256::digest(bytes)),
+            source: String::new(),
+            sha256: String::new(),
             headers,
             rows: records,
-        })
+            mode: Mode::FillOnly,
+            secrets: BTreeMap::new(),
+            conflicted: BTreeSet::new(),
+        };
+        let bytes = zeroize::Zeroizing::new(named(&sheet));
+        sheet.source = keys::source_pk(&bytes);
+        sheet.sha256 = hex::encode_lower(&Sha256::digest(&bytes));
+        Ok(sheet)
     }
 
     /// A harness file as a sheet: one row per [`Stated`] row, so its coordinates, source row and
-    /// review work as a sheet's do.
+    /// review work as a sheet's do. The file is read from `~/.secrets`, so its source key and
+    /// `sha256` are its keyed digest under `everyone_key` ([`keyed_source`]), never a plain hash
+    /// of a secrets file, tokens or not.
     ///
     /// # Errors
     /// The file name cannot be recorded.
-    pub fn stated(kind: SheetKind, name: &str, bytes: &[u8], rows: &[Stated]) -> Result<Self> {
+    pub fn stated(
+        kind: SheetKind,
+        name: &str,
+        bytes: &[u8],
+        rows: &[Stated],
+        everyone_key: &[u8; 32],
+    ) -> Result<Self> {
         let name = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
         if name.is_empty() || guard::text(name, 128).is_err() {
             return Err(Error::new("a source's file name cannot be recorded"));
         }
+        let (source, sha256) = keyed_source(HARNESS_SOURCE_DIGEST, bytes, everyone_key);
         Ok(Self {
             kind,
             name: name.to_owned(),
-            source: keys::source_pk(bytes),
-            sha256: hex::encode_lower(&Sha256::digest(bytes)),
+            source,
+            sha256,
             headers: ["realm", "email", "label", "machines"]
                 .map(str::to_owned)
                 .to_vec(),
@@ -168,6 +361,9 @@ impl Sheet {
                     ]
                 })
                 .collect(),
+            mode: Mode::FillOnly,
+            secrets: BTreeMap::new(),
+            conflicted: BTreeSet::new(),
         })
     }
 
@@ -179,6 +375,43 @@ impl Sheet {
             r => self.rows.get(r - 2)?,
         };
         row.get(at.col.checked_sub(1)?).map(String::as_str)
+    }
+
+    /// The address key of each row whose password column is set (a flag, never a value), read
+    /// from the sheet's own address column (an `email`, `login` or `address` header that names no
+    /// other address: not a root, recovery, receiving or forwarding one), with how many rows are
+    /// set and how many of them name no address: what `--compare-sheet` holds against the registry.
+    pub fn password_flags(&self) -> (BTreeSet<String>, usize, usize) {
+        let flags: Vec<usize> = (0..self.headers.len())
+            .filter(|col| secret_header(&self.headers[*col]))
+            .collect();
+        let address = self.column(|h| {
+            (h.contains("email") || h.contains("login") || h == "address")
+                && !["root", "recovery", "receiving", "forward", "alias"]
+                    .iter()
+                    .any(|other| h.contains(other))
+        });
+        let mut keyed = BTreeSet::new();
+        let (mut set, mut unkeyed) = (0, 0);
+        for row in &self.rows {
+            if !flags
+                .iter()
+                .any(|col| row.get(*col).is_some_and(|cell| !cell.trim().is_empty()))
+            {
+                continue;
+            }
+            set += 1;
+            match address
+                .and_then(|col| row.get(col))
+                .and_then(|cell| keys::address_pk(cell.trim()).ok())
+            {
+                Some(pk) => {
+                    keyed.insert(pk);
+                }
+                None => unkeyed += 1,
+            }
+        }
+        (keyed, set, unkeyed)
     }
 
     fn column(&self, wanted: impl Fn(&str) -> bool) -> Option<usize> {
@@ -282,109 +515,6 @@ pub struct KnownMac {
     pub hosts: Vec<String>,
 }
 
-/// Which mailbox key and label each receiving mailbox has, kept on the importing Mac only
-/// (private, beside its vault state), keyed by a digest of the mailbox's address. A mailbox's
-/// key is random, never a digest of its login, so this is how a re-import finds the row it made.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MailboxKeys {
-    entries: BTreeMap<String, (String, String)>,
-}
-
-impl MailboxKeys {
-    fn digest(address: &str) -> String {
-        let mut input = b"aterm/alab/mailbox-key/1\0".to_vec();
-        input.extend_from_slice(address.as_bytes());
-        hex::encode_lower(&Sha256::digest(&input))
-    }
-
-    /// The stored form.
-    pub fn to_json(&self) -> Value {
-        let entries: Map = self
-            .entries
-            .iter()
-            .map(|(digest, (pk, label))| (digest.clone(), json!({"pk": pk, "label": label})))
-            .collect();
-        json!({"format": "alab-mailbox-keys/1", "mailboxes": entries})
-    }
-
-    /// Read the stored form.
-    ///
-    /// # Errors
-    /// It is not one.
-    pub fn from_json(value: &Value) -> Result<Self> {
-        let malformed = || Error::new("the mailbox key file is not one this build reads");
-        let object = value.as_object().ok_or_else(malformed)?;
-        if object.len() != 2
-            || object.get("format").and_then(Value::as_str) != Some("alab-mailbox-keys/1")
-        {
-            return Err(malformed());
-        }
-        let mut entries = BTreeMap::new();
-        let mut pks = BTreeSet::new();
-        let mut labels = BTreeSet::new();
-        for (digest, entry) in object
-            .get("mailboxes")
-            .and_then(Value::as_object)
-            .ok_or_else(malformed)?
-        {
-            let entry_obj = entry.as_object().ok_or_else(malformed)?;
-            if entry_obj.len() != 2 || !hex::is_lower(digest, 64) {
-                return Err(malformed());
-            }
-            let pk = entry_obj
-                .get("pk")
-                .and_then(Value::as_str)
-                .ok_or_else(malformed)?;
-            let label = entry_obj
-                .get("label")
-                .and_then(Value::as_str)
-                .ok_or_else(malformed)?;
-            if !keys::is_digest_pk(pk, "mb")
-                || label.is_empty()
-                || label.contains('@')
-                || guard::text(label, 32).is_err()
-                || !pks.insert(pk.to_owned())
-                || !labels.insert(label.to_owned())
-            {
-                return Err(malformed());
-            }
-            entries.insert(digest.clone(), (pk.to_owned(), label.to_owned()));
-        }
-        Ok(Self { entries })
-    }
-
-    /// The mailbox key of the mailbox that signs in as `login`, where this file gives one.
-    pub fn pk_of(&self, login: &str) -> Option<&str> {
-        let login = keys::address(login).ok()?;
-        self.entries
-            .get(&Self::digest(&login))
-            .map(|(pk, _)| pk.as_str())
-    }
-
-    /// The mailbox keys it holds.
-    pub fn pks(&self) -> BTreeSet<&str> {
-        self.entries.values().map(|(pk, _)| pk.as_str()).collect()
-    }
-
-    /// Mailboxes it names.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Whether it names none.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Record `login`'s mailbox key and label, as an import does: a test seam.
-    #[cfg(any(test, debug_assertions))]
-    pub fn record(&mut self, login: &str, pk: &str, label: &str) {
-        let login = keys::address(login).expect("valid test login");
-        self.entries
-            .insert(Self::digest(&login), (pk.to_owned(), label.to_owned()));
-    }
-}
-
 /// The `sheet` of a coordinate in the swarm roster: its row is the known Mac's 1-based place
 /// in [`Input::macs`], its column 0.
 pub const ROSTER: usize = usize::MAX;
@@ -448,14 +578,24 @@ pub enum Kind {
     NodeAmbiguous,
     /// A known Mac matched no row (`adopt` births none; step 7 does).
     Unadopted,
-    /// Codes for this address arrive at the address itself: no mailbox link is written, since
-    /// it would name that mailbox's login.
-    SelfMailbox,
-    /// A mailbox that receives codes for other rows is also listed as an AI login.
-    MailboxIsLogin,
     /// An earlier import of a sheet read now made this row, and that sheet no longer lists it:
     /// left as it is for the owner to retire.
     NoLongerListed,
+    /// A fill-only source states this cell differently from what another source or the owner
+    /// wrote: left as it is, recorded by key and column in the source's row.
+    Differs,
+    /// A `Secret` value that reads as a flag (`1`, `yes`, under six characters): never written.
+    SecretFlagLike,
+    /// A dump made without `--show-passwords` (`<redacted>`): never written.
+    SecretRedacted,
+    /// A protected address holds no password: the value is never written.
+    ProtectedSecret,
+    /// A dump column with no home in the registry: its name only.
+    Unmapped,
+    /// The dump's replica holds concurrent values for this cell or row: never written.
+    DumpConflicted,
+    /// More than one phone row holds this number: the smallest key is used.
+    DuplicateNumber,
 }
 
 impl Kind {
@@ -481,9 +621,14 @@ impl Kind {
             Self::AdoptedByNode => "adopted-by-node",
             Self::NodeAmbiguous => "node-ambiguous",
             Self::Unadopted => "unadopted",
-            Self::SelfMailbox => "self-mailbox",
-            Self::MailboxIsLogin => "mailbox-is-login",
             Self::NoLongerListed => "no-longer-listed",
+            Self::Differs => "differs",
+            Self::SecretFlagLike => "secret-flag-like",
+            Self::SecretRedacted => "secret-redacted",
+            Self::ProtectedSecret => "protected-secret",
+            Self::Unmapped => "unmapped",
+            Self::DumpConflicted => "dump-conflicted",
+            Self::DuplicateNumber => "duplicate-number",
         }
     }
 }
@@ -540,8 +685,6 @@ pub struct Plan {
     pub findings: Vec<Finding>,
     pub counts: BTreeMap<&'static str, Count>,
     pub planned: Vec<Planned>,
-    /// The mailbox keys, with any minted now.
-    pub keys: MailboxKeys,
 }
 
 /// Everything one import reads.
@@ -549,7 +692,8 @@ pub struct Input<'a> {
     pub sheets: &'a [Sheet],
     pub macs: &'a [KnownMac],
     pub vendors: &'a dyn Vendors,
-    pub keys: MailboxKeys,
+    /// The registry's Secret cells: sealing an imported value and opening a held one.
+    pub sealer: &'a dyn Sealer,
     /// The importing Mac's clock, for the source rows' `at` (a claim, never an ordering input).
     pub now_ms: u64,
     /// Whether a label that resolves to no row births one; `adopt` births none.
@@ -643,37 +787,74 @@ const NOTE_JOIN: &str = "; ";
 /// The sources this run read whole.
 struct ReadNow<'a> {
     kinds: BTreeSet<&'a str>,
-    /// The fleet files read: that kind has several, and reading one says nothing of the others.
-    fleets: BTreeSet<&'a str>,
+    /// The files read of a kind with several: reading one says nothing of the others.
+    files: Vec<&'a Sheet>,
 }
 
 impl ReadNow<'_> {
-    /// Whether the source row `row` is one this run read.
-    fn covers(&self, row: &cell::Row) -> bool {
+    /// Whether the source row `row`, key `pk`, is one this run read.
+    fn covers(&self, pk: &str, row: &cell::Row) -> bool {
         let Some(kind) = row.get("kind").and_then(Value::as_str) else {
             return false;
         };
         self.kinds.contains(kind)
-            && (kind != SheetKind::FleetAccounts.word()
-                || row
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| self.fleets.contains(name)))
+            && (!several_word(kind) || self.files.iter().any(|sheet| sheet.wrote(pk, row)))
     }
 }
 
-/// The source row of the one value `field` holds, if an import wrote it.
-fn source_row<'p>(field: &Field, sources: &'p Projection) -> Option<&'p cell::Row> {
+/// Whether a `source.kind` word names a kind with several files, told apart by name.
+fn several_word(kind: &str) -> bool {
+    kind == SheetKind::FleetAccounts.word() || kind == SheetKind::FleetDb(Dump::Emails).word()
+}
+
+/// What one source does with one cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Decided {
+    Write,
+    Unchanged,
+    /// The owner set it: left, a finding.
+    Owner,
+    Conflicted,
+    /// Another source's import wrote another value and this one only fills: a finding, by key.
+    Differs,
+}
+
+/// Decide one cell: `same` says whether a held value is what the source states. An absent cell
+/// is written, as is one an import wrote empty; one an import wrote is written by an
+/// authoritative source, or by the source that wrote it (`own`: the same kind, and the same
+/// file for a kind with several), and otherwise differs; one the owner set or a conflicted one
+/// is left.
+fn decide(field: Option<&Field>, same: impl Fn(&Value) -> bool, mode: Mode, own: bool) -> Decided {
+    match field {
+        None => Decided::Write,
+        Some(Field::Value(candidate)) if same(&candidate.value.x) => Decided::Unchanged,
+        Some(Field::Value(candidate)) if candidate.value.s.is_some() => {
+            if mode == Mode::Authoritative || own || candidate.value.x.is_null() {
+                Decided::Write
+            } else {
+                Decided::Differs
+            }
+        }
+        Some(Field::Value(_) | Field::Set(_)) => Decided::Owner,
+        Some(Field::Conflict { .. }) => Decided::Conflicted,
+    }
+}
+
+/// The source row of the one value `field` holds, with its key, if an import wrote it.
+fn source_row<'p>(field: &Field, sources: &'p Projection) -> Option<(&'p str, &'p cell::Row)> {
     let Field::Value(candidate) = field else {
         return None;
     };
-    sources.rows.get(candidate.value.s.as_deref()?)
+    sources
+        .rows
+        .get_key_value(candidate.value.s.as_deref()?)
+        .map(|(pk, row)| (pk.as_str(), row))
 }
 
 /// Whether `field` holds what an earlier import of a source this run read wrote. Only such a cell
 /// is ever retracted.
 fn retractable(field: &Field, sources: &Projection, read: &ReadNow<'_>) -> bool {
-    source_row(field, sources).is_some_and(|row| read.covers(row))
+    source_row(field, sources).is_some_and(|(pk, row)| read.covers(pk, row))
 }
 
 /// One wanted register.
@@ -683,10 +864,18 @@ struct Want {
     at: Coord,
 }
 
+/// One wanted `Secret` cell: the plaintext stays in its zeroizing type.
+#[derive(Clone, Debug)]
+struct SecretWant {
+    value: Arc<Secret>,
+    at: Coord,
+}
+
 /// One wanted row.
 #[derive(Clone, Debug, Default)]
 struct RowWant {
     values: BTreeMap<&'static str, Want>,
+    secrets: BTreeMap<&'static str, SecretWant>,
     elements: BTreeMap<(&'static str, String), Coord>,
     /// The coordinate that created the row: its `src`, and its writes' source.
     src: Option<Coord>,
@@ -698,7 +887,11 @@ struct Planner<'a> {
     current: BTreeMap<&'static str, Projection>,
     rows: BTreeMap<(&'static str, String), RowWant>,
     findings: BTreeSet<Finding>,
-    keys: MailboxKeys,
+    /// Phone keys by their number's digits, found or minted this run, so every source naming
+    /// one number names one row.
+    phones: BTreeMap<String, String>,
+    /// Address keys a source read now marks protected.
+    protected: BTreeSet<String>,
     /// Addresses whose accounts and preferences the vault sheet decided, with what it decided.
     decided: BTreeMap<String, (BTreeSet<&'static str>, Coord)>,
     /// The machines and ranks the sheet read so far states for each address.
@@ -722,6 +915,18 @@ struct Planner<'a> {
     logins: BTreeSet<String>,
 }
 
+/// The digits of a phone number as the registry keeps them: ASCII digits only, a US number's
+/// leading country `1` dropped, as fleet_db normalized it. `None` below four digits.
+fn phone_digits(raw: &str) -> Option<String> {
+    let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+    let digits = if digits.len() == 11 && digits.starts_with('1') {
+        digits[1..].to_owned()
+    } else {
+        digits
+    };
+    (digits.len() >= 4).then_some(digits)
+}
+
 /// Every address the sheets list as an AI login (their email column), credential-shaped cells
 /// unread.
 fn listed_logins(sheets: &[Sheet]) -> BTreeSet<String> {
@@ -742,6 +947,31 @@ fn listed_logins(sheets: &[Sheet]) -> BTreeSet<String> {
         }
     }
     logins
+}
+
+/// The label a harness file's keyed source digest derives its key under ([`Sheet::stated`]).
+const HARNESS_SOURCE_DIGEST: &[u8] = b"aterm/alab/harness-source-digest/1\0";
+
+/// A source read from secrets (a fleet_db dump, a `~/.secrets` harness file) as its source key
+/// and `sha256`: HMAC-SHA256 of `bytes` under a key HKDF derives from `everyone_key` (the newest
+/// `[everyone]` epoch's) for `label` alone, as [`covered::replica_digest`] derives its own. Every
+/// member holds that key, so every Mac names one source alike and a changed byte (one password)
+/// is a new source, while a reader of the shared `source` row without the key cannot test a
+/// guess against it, as it could a plain hash.
+pub(crate) fn keyed_source(
+    label: &[u8],
+    bytes: &[u8],
+    everyone_key: &[u8; 32],
+) -> (String, String) {
+    use ring::hmac;
+    let prk = zeroize::Zeroizing::new(aterm_digest::hkdf_extract(label, everyone_key));
+    let derived = zeroize::Zeroizing::new(aterm_digest::hkdf_expand_32(&prk, label));
+    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &*derived), bytes);
+    let tag = tag.as_ref();
+    (
+        format!("sr-{}", hex::encode_lower(&tag[..8])),
+        hex::encode_lower(tag),
+    )
 }
 
 /// The swarm roster's source key and SHA-256: a digest of its canonical form (labels, aliases,
@@ -771,16 +1001,25 @@ fn roster_source(macs: &[KnownMac]) -> (String, String) {
 /// A value the importer built breaks its column's type, which is a bug, not a sheet problem
 /// (sheet problems are findings).
 pub fn plan(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
-    let current = [&ADDRESS, &ACCOUNT, &MACHINE, &PREFERENCE, &MAILBOX, &SOURCE]
-        .into_iter()
-        .map(|collection| (collection.name, cell::project(collection, cells)))
-        .collect();
+    let current = [
+        &ADDRESS,
+        &ACCOUNT,
+        &MACHINE,
+        &PREFERENCE,
+        &MAILBOX,
+        &PHONE,
+        &SOURCE,
+    ]
+    .into_iter()
+    .map(|collection| (collection.name, cell::project(collection, cells)))
+    .collect();
     let mut planner = Planner {
         input,
         current,
         rows: BTreeMap::new(),
         findings: BTreeSet::new(),
-        keys: input.keys.clone(),
+        phones: BTreeMap::new(),
+        protected: BTreeSet::new(),
         decided: BTreeMap::new(),
         placed: BTreeMap::new(),
         unsettled: BTreeSet::new(),
@@ -793,7 +1032,7 @@ pub fn plan(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
         logins: listed_logins(input.sheets),
     };
     let mut order: Vec<usize> = (0..input.sheets.len()).collect();
-    order.sort_by_key(|&n| input.sheets[n].kind);
+    order.sort_by_key(|&n| (input.sheets[n].mode, input.sheets[n].kind));
     for n in order {
         planner.sheet(n)?;
     }
@@ -897,10 +1136,76 @@ impl Planner<'_> {
         let sheet = &self.input.sheets[n];
         match sheet.kind {
             SheetKind::Vault => self.vault(n, sheet),
+            SheetKind::Phones => self.phones(n, sheet)?,
+            SheetKind::Computers => self.computers(n, sheet),
+            SheetKind::Emails => self.emails(n, sheet)?,
             SheetKind::Logins => self.logins(n, sheet)?,
             SheetKind::FleetAccounts | SheetKind::AiPool => self.harness(n, sheet),
+            SheetKind::FleetDb(table) => self.dump(n, sheet, table)?,
+            SheetKind::MailboxToml => self.mailbox_toml(n, sheet)?,
         }
         Ok(())
+    }
+
+    /// Want `value` in the `Secret` cell `collection.pk.col` from `at`: refused when it reads as
+    /// a flag or a redaction, and kept to the first source that states it, a different value
+    /// from a lower one being a disagreement by coordinates only.
+    fn want_secret(
+        &mut self,
+        collection: &'static Collection,
+        pk: &str,
+        col: &'static str,
+        value: Arc<Secret>,
+        at: &Coord,
+    ) {
+        let refused = if value.plaintext() == dump::REDACTED {
+            Some(Kind::SecretRedacted)
+        } else if flag_like(&value) {
+            Some(Kind::SecretFlagLike)
+        } else {
+            None
+        };
+        if let Some(kind) = refused {
+            self.findings.insert(Finding {
+                kind,
+                collection: Some(collection.name),
+                pk: Some(pk.to_owned()),
+                column: Some(col.to_owned()),
+                at: vec![at.clone()],
+            });
+            return;
+        }
+        let mut disagree = None;
+        let row = self.row(collection, pk, at);
+        match row.secrets.get(col) {
+            None => {
+                row.secrets.insert(
+                    col,
+                    SecretWant {
+                        value,
+                        at: at.clone(),
+                    },
+                );
+            }
+            Some(kept) if kept.value.same(&value) => {}
+            Some(kept) => disagree = Some(kept.at.clone()),
+        }
+        if let Some(kept) = disagree {
+            self.findings.insert(Finding {
+                kind: Kind::SourcesDisagree,
+                collection: Some(collection.name),
+                pk: Some(pk.to_owned()),
+                column: Some(col.to_owned()),
+                at: vec![kept, at.clone()],
+            });
+        }
+    }
+
+    /// Mark an address protected from `at`: protection is only ever added, never cleared by an
+    /// import, so a fill-only `false` can never stand between the owner's flag and a password.
+    fn protect(&mut self, address_pk: &str, at: &Coord) {
+        self.protected.insert(address_pk.to_owned());
+        self.want(&ADDRESS, address_pk, "protected", json!(true), at);
     }
 
     /// The address a row names, or a finding. Credential-shaped cells are reported and never
@@ -1353,11 +1658,14 @@ impl Planner<'_> {
             .and_then(|row| row.fields.get(column))
             .filter(|field| field.value().is_some_and(|x| !x.is_null()))
             .and_then(|field| source_row(field, &self.current[SOURCE.name]))
-            .and_then(|row| row.get("kind"))
+            .and_then(|(_, row)| row.get("kind"))
             .and_then(Value::as_str)
             .and_then(|word| {
                 [
                     SheetKind::Vault,
+                    SheetKind::Phones,
+                    SheetKind::Computers,
+                    SheetKind::Emails,
                     SheetKind::Logins,
                     SheetKind::FleetAccounts,
                     SheetKind::AiPool,
@@ -1650,32 +1958,17 @@ impl Planner<'_> {
                 }
                 let at = coord(sheet, n, row, col);
                 match keys::address(text) {
-                    // A link to the mailbox an address is itself would name its login.
-                    Ok(mailbox) if mailbox == address => {
-                        self.find(
-                            Kind::SelfMailbox,
-                            Some(ADDRESS.name),
-                            Some(&address_pk),
-                            vec![at.clone()],
-                        );
-                    }
                     Ok(mailbox) => {
-                        if self.logins.contains(&mailbox) {
-                            self.find(
-                                Kind::MailboxIsLogin,
-                                Some(MAILBOX.name),
-                                None,
-                                vec![at.clone()],
-                            );
-                            // The owner's word that codes for this login arrive at another
-                            // login: the alias link the owner's model names.
-                            if column == "mailbox"
-                                && let Ok(target) = keys::address_pk(&mailbox)
-                            {
-                                self.link_alias(&address_pk, &target, &at);
-                            }
+                        // The owner's word that codes for this login arrive at another listed
+                        // login: the alias link the owner's model names.
+                        if column == "mailbox"
+                            && mailbox != address
+                            && self.logins.contains(&mailbox)
+                            && let Ok(target) = keys::address_pk(&mailbox)
+                        {
+                            self.link_alias(&address_pk, &target, &at);
                         }
-                        let pk = self.mailbox(&mailbox, &at)?;
+                        let pk = self.mailbox(&mailbox, sheet.kind, &at)?;
                         self.want(&ADDRESS, &address_pk, column, json!(pk), &at);
                     }
                     Err(_) => {
@@ -1795,48 +2088,479 @@ impl Planner<'_> {
         accounts
     }
 
-    /// The mailbox that receives at `address`: its key from this Mac's mailbox keys, else a fresh
-    /// random key and label. The address itself goes nowhere in the registry.
-    fn mailbox(&mut self, address: &str, at: &Coord) -> Result<String> {
-        let digest = MailboxKeys::digest(address);
+    /// The mailbox that signs in as `address`: keyed from the address's key
+    /// ([`keys::mailbox_pk`]), with its `login` that address's row (wanted too, from `kind`).
+    /// A new row's label is the first free `<service>-<n>`; a held row keeps the label it has.
+    fn mailbox(&mut self, address: &str, kind: SheetKind, at: &Coord) -> Result<String> {
+        let login = self
+            .address(address, kind, at)
+            .ok_or_else(|| Error::new("a mailbox's login is not an address"))?;
+        let pk = keys::mailbox_pk(&login)?;
         let domain = address.split_once('@').map_or("", |(_, d)| d);
         let (service, code_path) = mailbox_service(domain);
-        let (pk, label) = if let Some(entry) = self.keys.entries.get(&digest) {
-            entry.clone()
-        } else {
-            let pk = keys::random_pk(keys::Random::Mailbox)?;
-            let mut used: BTreeSet<String> = self.minted_labels.clone();
-            used.extend(self.keys.entries.values().map(|(_, label)| label.clone()));
-            if let Some(projection) = self.current.get(MAILBOX.name) {
-                used.extend(
-                    projection
-                        .rows
-                        .values()
-                        .filter_map(|row| row.get("label").and_then(Value::as_str))
-                        .map(str::to_owned),
-                );
-            }
+        let held = self.held(&MAILBOX, &pk, "label").is_some()
+            || self
+                .rows
+                .get(&(MAILBOX.name, pk.clone()))
+                .is_some_and(|row| row.values.contains_key("label"));
+        if !held {
+            let used: BTreeSet<String> = self
+                .current
+                .get(MAILBOX.name)
+                .into_iter()
+                .flat_map(|projection| projection.rows.values())
+                .filter_map(|row| row.get("label").and_then(Value::as_str))
+                .map(str::to_owned)
+                .chain(self.minted_labels.iter().cloned())
+                .collect();
             let label = (1..)
                 .map(|k| format!("{service}-{k}"))
                 .find(|label| !used.contains(label))
                 .ok_or_else(|| Error::new("no mailbox label could be minted"))?;
             self.minted_labels.insert(label.clone());
-            self.keys
-                .entries
-                .insert(digest, (pk.clone(), label.clone()));
-            (pk, label)
-        };
-        self.want(&MAILBOX, &pk, "label", json!(label), at);
+            self.want(&MAILBOX, &pk, "label", json!(label), at);
+        }
         self.want(&MAILBOX, &pk, "service", json!(service), at);
         self.want(&MAILBOX, &pk, "code_path", json!(code_path), at);
-        self.want(
-            &MAILBOX,
-            &pk,
-            "vault_ref",
-            json!({"vault": APPLICATION, "entry": "ai-mailbox.toml", "item": format!("mailbox-{pk}")}),
-            at,
-        );
+        self.want(&MAILBOX, &pk, "login", json!(login), at);
         Ok(pk)
+    }
+
+    /// The phone row of a number (`raw`, at least four digits once read by [`phone_digits`]):
+    /// the row this run already named for it, else the live row whose sealed `number` opens to
+    /// it (the smallest key, with a finding, where several do), else a fresh random key and
+    /// label (`label` where it names one no row holds). Its `number` is wanted as a `Secret`
+    /// and its `last4` beside it.
+    fn phone(&mut self, raw: &str, label: Option<&str>, at: &Coord) -> Result<Option<String>> {
+        let Some(digits) = phone_digits(raw) else {
+            return Ok(None);
+        };
+        let last4 = digits[digits.len() - 4..].to_owned();
+        let number = Arc::new(Secret::new(digits.clone()));
+        let pk = if let Some(pk) = self.phones.get(&digits) {
+            pk.clone()
+        } else {
+            let sealer = self.input.sealer;
+            // Every row holding the number, live ones first: a retired row is found and left as
+            // it is, as a retired address is, never minted again.
+            let mut held: Vec<(bool, String)> = Vec::new();
+            let mut unopened = false;
+            for (pk, row) in &self.current[PHONE.name].rows {
+                let tokens: Vec<&Value> = row
+                    .fields
+                    .get("number")
+                    .map(Field::candidates_x)
+                    .unwrap_or_default();
+                let mut holds = false;
+                for token in tokens.into_iter().filter_map(Value::as_str) {
+                    if sealer.holds(PHONE.name, pk, "number", token, &number) {
+                        holds = true;
+                    } else if sealer.open(PHONE.name, pk, "number", token).is_err() {
+                        unopened = true;
+                    }
+                }
+                if holds {
+                    held.push((!row.live(), pk.clone()));
+                }
+            }
+            held.sort();
+            let live = held.iter().filter(|(retired, _)| !retired).count();
+            if live > 1 {
+                self.findings.insert(Finding {
+                    kind: Kind::DuplicateNumber,
+                    collection: Some(PHONE.name),
+                    pk: held.first().map(|(_, pk)| pk.clone()),
+                    column: Some("number".to_owned()),
+                    at: vec![at.clone()],
+                });
+            }
+            if held.is_empty() && unopened {
+                return Err(Error::new(
+                    "a phone row's number does not open with the key this Mac holds, so whether \
+                     the registry already holds a number is unknown: import where every number opens",
+                ));
+            }
+            let pk = match held.into_iter().map(|(_, pk)| pk).next() {
+                Some(pk) => pk,
+                None => {
+                    let pk = keys::random_pk(keys::Random::Phone)?;
+                    let used: BTreeSet<String> = self.current[PHONE.name]
+                        .rows
+                        .values()
+                        .filter_map(|row| row.get("label").and_then(Value::as_str))
+                        .map(str::to_owned)
+                        .chain(self.minted_labels.iter().cloned())
+                        .collect();
+                    let given = label.filter(|l| !used.contains(*l)).map(str::to_owned);
+                    let label = match given {
+                        Some(label) => label,
+                        None => (1..)
+                            .map(|k| format!("phone-{k}"))
+                            .find(|label| !used.contains(label))
+                            .ok_or_else(|| Error::new("no phone label could be minted"))?,
+                    };
+                    self.minted_labels.insert(label.clone());
+                    self.want(&PHONE, &pk, "label", json!(label), at);
+                    pk
+                }
+            };
+            self.phones.insert(digits, pk.clone());
+            pk
+        };
+        self.want(&PHONE, &pk, "last4", json!(last4), at);
+        self.want_secret(&PHONE, &pk, "number", number, at);
+        Ok(Some(pk))
+    }
+
+    fn phones(&mut self, n: usize, sheet: &Sheet) -> Result<()> {
+        let number = sheet.column(|h| h.starts_with("phone") || h == "number");
+        let carrier = sheet.column(|h| h.starts_with("carrier") || h == "provider");
+        let line_type = sheet.column(|h| h.starts_with("line") || h == "type");
+        let device = sheet.column(|h| h.starts_with("associated") || h.starts_with("device"));
+        let notes = sheet.column(|h| h == "notes");
+        for (index, cells) in sheet.rows.iter().enumerate() {
+            let row = index + 2;
+            if cells.iter().all(|c| c.trim().is_empty()) {
+                continue;
+            }
+            let Some(num_col) = number else {
+                continue;
+            };
+            let raw_num = cells.get(num_col).map_or("", |c| c.trim());
+            let num_at = coord(sheet, n, row, num_col);
+            let Some(pk) = self.phone(raw_num, None, &num_at)? else {
+                if !raw_num.is_empty() {
+                    self.find(Kind::FreeText, Some(PHONE.name), None, vec![num_at]);
+                }
+                continue;
+            };
+            for (col_opt, column, limit) in [
+                (carrier, "carrier", 64),
+                (line_type, "line_type", 32),
+                (device, "device", 64),
+            ] {
+                if let Some(col) = col_opt
+                    && let Some(val) = cells.get(col).map(|c| c.trim()).filter(|c| !c.is_empty())
+                {
+                    let at = coord(sheet, n, row, col);
+                    if guard::text(val, limit).is_ok() && !val.contains('@') {
+                        self.want(&PHONE, &pk, column, json!(val), &at);
+                    } else {
+                        self.note(&PHONE, &pk, &at);
+                    }
+                }
+            }
+            if let Some(col) = notes
+                && let Some(val) = cells.get(col).map(|c| c.trim()).filter(|c| !c.is_empty())
+            {
+                let at = coord(sheet, n, row, col);
+                self.note(&PHONE, &pk, &at);
+                if let Some((text, note_at)) = self.note_text(&PHONE, &pk, &[(at, val.to_owned())])
+                {
+                    self.want(&PHONE, &pk, "note", json!(text), &note_at);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn computers(&mut self, n: usize, sheet: &Sheet) {
+        let id = sheet.column(|h| h == "id" || h == "machine" || h == "label");
+        let make = sheet.column(|h| h == "make");
+        let arch = sheet.column(|h| h == "arch");
+        let os = sheet.column(|h| h == "os");
+        let chip = sheet.column(|h| h == "processor" || h == "chip");
+        let ram = sheet.column(|h| h == "ram" || h == "ram_gb");
+        let disk = sheet.column(|h| h == "hd" || h == "disk" || h == "disk_gb");
+        let aliases = sheet.column(|h| h == "aliases");
+        let nickname = sheet.column(|h| h == "nickname");
+        let nick_aliases = sheet.column(|h| h == "nickname aliases" || h == "nickname_aliases");
+        let location = sheet.column(|h| h == "location");
+        let notes = sheet.column(|h| h == "notes");
+        for (index, cells) in sheet.rows.iter().enumerate() {
+            let row = index + 2;
+            if cells.iter().all(|c| c.trim().is_empty()) {
+                continue;
+            }
+            let Some(id_col) = id else {
+                continue;
+            };
+            let raw_id = cells.get(id_col).map_or("", |c| c.trim());
+            if raw_id.is_empty() {
+                continue;
+            }
+            let id_at = coord(sheet, n, row, id_col);
+            let Ok(label) = Label::parse(raw_id) else {
+                self.find(Kind::FreeText, Some(MACHINE.name), None, vec![id_at]);
+                continue;
+            };
+            let Some(pk) = self.machine_for(label, &id_at) else {
+                continue;
+            };
+            for (col_opt, column, limit) in [
+                (make, "make", 32),
+                (arch, "arch", 16),
+                (os, "os", 32),
+                (chip, "chip", 32),
+                (nickname, "nickname", 64),
+                (location, "location", 64),
+            ] {
+                if let Some(col) = col_opt
+                    && let Some(val) = cells.get(col).map(|c| c.trim()).filter(|c| !c.is_empty())
+                {
+                    let at = coord(sheet, n, row, col);
+                    if guard::text(val, limit).is_ok() && !val.contains('@') {
+                        self.want(&MACHINE, &pk, column, json!(val), &at);
+                    } else {
+                        self.note(&MACHINE, &pk, &at);
+                    }
+                }
+            }
+            for (col_opt, column) in [(ram, "ram_gb"), (disk, "disk_gb")] {
+                if let Some(col) = col_opt
+                    && let Some(val) = cells.get(col).map(|c| c.trim()).filter(|c| !c.is_empty())
+                {
+                    let at = coord(sheet, n, row, col);
+                    let digits: String = val.chars().take_while(char::is_ascii_digit).collect();
+                    if let Ok(num) = digits.parse::<u64>() {
+                        self.want(&MACHINE, &pk, column, json!(num), &at);
+                    } else {
+                        self.note(&MACHINE, &pk, &at);
+                    }
+                }
+            }
+            let mut extra_nick_aliases: Vec<String> = Vec::new();
+            let mut nick_at: Option<Coord> = None;
+            if let Some(col) = aliases
+                && let Some(val) = cells.get(col).map(|c| c.trim()).filter(|c| !c.is_empty())
+            {
+                let at = coord(sheet, n, row, col);
+                for part in val
+                    .split([',', ';', ' '])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let normalized = part.replace('.', "-");
+                    if let Ok(alias_label) =
+                        Label::parse(part).or_else(|_| Label::parse(&normalized))
+                    {
+                        let canon = alias_label.canonical();
+                        if canon != label.canonical() {
+                            self.element(&MACHINE, &pk, "aliases", &canon, &at);
+                        }
+                    } else if guard::text(part, 64).is_ok()
+                        && !part.contains('@')
+                        && !extra_nick_aliases.iter().any(|s| s == part)
+                    {
+                        extra_nick_aliases.push(part.to_owned());
+                        nick_at.get_or_insert_with(|| at.clone());
+                    }
+                }
+            }
+            if let Some(col) = nick_aliases
+                && let Some(val) = cells.get(col).map(|c| c.trim()).filter(|c| !c.is_empty())
+            {
+                let at = coord(sheet, n, row, col);
+                for part in val
+                    .split([',', ';'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if guard::text(part, 64).is_ok()
+                        && !part.contains('@')
+                        && !extra_nick_aliases.iter().any(|s| s == part)
+                    {
+                        extra_nick_aliases.push(part.to_owned());
+                        nick_at.get_or_insert_with(|| at.clone());
+                    }
+                }
+            }
+            if !extra_nick_aliases.is_empty()
+                && let Some(at) = nick_at
+            {
+                extra_nick_aliases.truncate(8);
+                self.want(
+                    &MACHINE,
+                    &pk,
+                    "nickname_aliases",
+                    json!(extra_nick_aliases),
+                    &at,
+                );
+            }
+            if let Some(col) = notes
+                && let Some(val) = cells.get(col).map(|c| c.trim()).filter(|c| !c.is_empty())
+            {
+                let at = coord(sheet, n, row, col);
+                self.note(&MACHINE, &pk, &at);
+                if let Some((text, note_at)) =
+                    self.note_text(&MACHINE, &pk, &[(at, val.to_owned())])
+                {
+                    self.want(&MACHINE, &pk, "note", json!(text), &note_at);
+                }
+            }
+        }
+    }
+
+    fn emails(&mut self, n: usize, sheet: &Sheet) -> Result<()> {
+        let email = sheet.column(|h| h == "email address" || h == "email");
+        let root = sheet.column(|h| h == "root account" || h == "root");
+        let password = sheet.column(|h| h == "password");
+        let status = sheet.column(|h| h == "status" || h == "account status");
+        let provider = sheet.column(|h| h == "provider");
+        let phone = sheet.column(|h| h.starts_with("activation phone") || h == "phone");
+        let protection = sheet.column(|h| h.starts_with("protection"));
+        let notes = sheet.column(|h| h == "notes");
+        let mut seen: BTreeMap<String, Coord> = BTreeMap::new();
+        for (index, cells) in sheet.rows.iter().enumerate() {
+            let row = index + 2;
+            if cells.iter().all(|c| c.trim().is_empty()) {
+                continue;
+            }
+            let has_password = password
+                .and_then(|col| cells.get(col))
+                .is_some_and(|val| !val.trim().is_empty());
+            // Never inspect or copy the Password column if present in an unstripped export.
+            let mut sanitized = cells.clone();
+            if let Some(pw_col) = password
+                && let Some(slot) = sanitized.get_mut(pw_col)
+            {
+                slot.clear();
+            }
+            let Some(address) = self.address_of(n, sheet, row, &sanitized, email) else {
+                continue;
+            };
+            let email_at = coord(sheet, n, row, email.unwrap_or(0));
+            if let Some(first) = seen.get(&address) {
+                self.find(
+                    Kind::DuplicateAddress,
+                    Some(ADDRESS.name),
+                    None,
+                    vec![first.clone(), email_at.clone()],
+                );
+            } else {
+                seen.insert(address.clone(), email_at.clone());
+            }
+            let Some(address_pk) = self.address(&address, SheetKind::Emails, &email_at) else {
+                continue;
+            };
+            let is_protected = protection
+                .and_then(|col| sanitized.get(col))
+                .is_some_and(|val| !val.trim().is_empty());
+            if is_protected && let Some(col) = protection {
+                let at = coord(sheet, n, row, col);
+                self.protect(&address_pk, &at);
+            }
+            if let Some(col) = status
+                && let Some(val) = sanitized
+                    .get(col)
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+            {
+                let at = coord(sheet, n, row, col);
+                let word = match val.to_ascii_lowercase().as_str() {
+                    "active" => "active",
+                    "suspended" => "suspended",
+                    "disabled" => "disabled",
+                    _ => "unknown",
+                };
+                self.want(&ADDRESS, &address_pk, "status", json!(word), &at);
+            }
+            if let Some(col) = provider
+                && let Some(val) = sanitized
+                    .get(col)
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+            {
+                let at = coord(sheet, n, row, col);
+                let word = match val.to_ascii_lowercase().as_str() {
+                    "proton" | "protonmail" => "proton",
+                    "gmail" => "gmail",
+                    "google" => "google",
+                    "outlook" | "hotmail" => "outlook",
+                    "privateemail" => "privateemail",
+                    _ => "other",
+                };
+                self.want(&ADDRESS, &address_pk, "provider", json!(word), &at);
+            }
+            if let Some(col) = phone
+                && let Some(val) = sanitized
+                    .get(col)
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+            {
+                let at = coord(sheet, n, row, col);
+                if let Some(phone_pk) = self.phone(val, None, &at)? {
+                    self.want(&ADDRESS, &address_pk, "phone", json!(phone_pk), &at);
+                } else {
+                    self.note(&ADDRESS, &address_pk, &at);
+                }
+            }
+            if let Some(col) = root
+                && let Some(val) = sanitized
+                    .get(col)
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+            {
+                let at = coord(sheet, n, row, col);
+                if let Ok(root_addr) = keys::address(val) {
+                    if root_addr != address {
+                        self.corrected.insert(address_pk.clone());
+                        if let Some(root_pk) = self.address(&root_addr, SheetKind::Emails, &at) {
+                            self.link_alias(&address_pk, &root_pk, &at);
+                        }
+                        if !is_protected {
+                            let mb_pk = self.mailbox(&root_addr, SheetKind::Emails, &at)?;
+                            self.want(&ADDRESS, &address_pk, "mailbox", json!(mb_pk), &at);
+                        }
+                    } else {
+                        self.want(&ADDRESS, &address_pk, "kind", json!("standalone"), &at);
+                    }
+                } else {
+                    self.find(
+                        Kind::FreeText,
+                        Some(ADDRESS.name),
+                        Some(&address_pk),
+                        vec![at],
+                    );
+                }
+            } else if has_password
+                && !is_protected
+                && let Some(pw_col) = password
+            {
+                // The sheet's flag says this address signs in to its own mailbox; its password,
+                // where there is one, comes from a replica's dump, never from this column.
+                let at = coord(sheet, n, row, pw_col);
+                let mb_pk = self.mailbox(&address, SheetKind::Emails, &at)?;
+                self.want(&ADDRESS, &address_pk, "mailbox", json!(mb_pk), &at);
+                self.want(
+                    &ADDRESS,
+                    &address_pk,
+                    "kind",
+                    json!("standalone"),
+                    &email_at,
+                );
+            }
+            if let Some(col) = notes
+                && let Some(val) = sanitized
+                    .get(col)
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+            {
+                let at = coord(sheet, n, row, col);
+                self.note(&ADDRESS, &address_pk, &at);
+                let has_note = self
+                    .rows
+                    .get(&(ADDRESS.name, address_pk.clone()))
+                    .is_some_and(|r| r.values.contains_key("note"));
+                if !has_note
+                    && let Some((text, note_at)) =
+                        self.note_text(&ADDRESS, &address_pk, &[(at, val.to_owned())])
+                {
+                    self.want(&ADDRESS, &address_pk, "note", json!(text), &note_at);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The live machine rows whose label or an alias is `label`.
@@ -2071,7 +2795,7 @@ impl Planner<'_> {
             current,
             rows,
             findings,
-            keys,
+            protected,
             roster,
             unsettled,
             unsettled_logins,
@@ -2080,10 +2804,9 @@ impl Planner<'_> {
         } = self;
         let mut plan = Plan {
             findings: findings.into_iter().collect(),
-            keys,
             ..Plan::default()
         };
-        let collections = [&ADDRESS, &ACCOUNT, &MACHINE, &PREFERENCE, &MAILBOX];
+        let collections = [&ADDRESS, &ACCOUNT, &MACHINE, &PREFERENCE, &MAILBOX, &PHONE];
         let mut touched_rows: BTreeSet<(usize, &'static str, String)> = BTreeSet::new();
         let mut written_rows = Vec::new();
         // The sources read this run: only what an earlier import of one of them wrote is ever
@@ -2097,11 +2820,10 @@ impl Planner<'_> {
                 .map(SheetKind::word)
                 .chain((!input.macs.is_empty()).then_some("swarm-roster"))
                 .collect(),
-            fleets: input
+            files: input
                 .sheets
                 .iter()
-                .filter(|sheet| sheet.kind == SheetKind::FleetAccounts)
-                .map(|sheet| sheet.name.as_str())
+                .filter(|sheet| sheet.kind.several())
                 .collect(),
         };
         // The `+tag` rule's cells move only on a run that can see the owner's corrections.
@@ -2110,23 +2832,41 @@ impl Planner<'_> {
         // The source this run read that a retraction of `field` is written under: the file of the
         // one that wrote it, by name for a kind with several files.
         let retract_source = |field: &Field| -> Option<(usize, String)> {
-            let wrote = source_row(field, sources)?;
+            let (wrote_pk, wrote) = source_row(field, sources)?;
             let kind = wrote.get("kind").and_then(Value::as_str)?;
             if kind == "swarm-roster" {
                 return (!input.macs.is_empty()).then(|| (ROSTER, roster.0.clone()));
             }
-            let name = wrote.get("name").and_then(Value::as_str);
             input
                 .sheets
                 .iter()
                 .enumerate()
-                .find(|(_, sheet)| {
-                    sheet.kind.word() == kind
-                        && (sheet.kind != SheetKind::FleetAccounts
-                            || Some(sheet.name.as_str()) == name)
-                })
+                .find(|(_, sheet)| sheet.wrote(wrote_pk, wrote))
                 .map(|(n, sheet)| (n, sheet.source.clone()))
         };
+        // How the source at `n` writes, and whether `field` is its own earlier import's. The
+        // swarm roster only fills: what an import wrote otherwise is the owner's correction.
+        let mode_of = |n: usize| {
+            input
+                .sheets
+                .get(n)
+                .map_or(Mode::FillOnly, |sheet| sheet.mode)
+        };
+        let own = |field: Option<&Field>, n: usize| -> bool {
+            let Some((wrote_pk, wrote)) = field.and_then(|field| source_row(field, sources)) else {
+                return false;
+            };
+            if n == ROSTER {
+                return wrote.get("kind").and_then(Value::as_str) == Some("swarm-roster");
+            }
+            input
+                .sheets
+                .get(n)
+                .is_some_and(|sheet| sheet.wrote(wrote_pk, wrote))
+        };
+        // What each source found another import holding otherwise, by key and column.
+        let mut differs: BTreeMap<usize, BTreeSet<(&'static str, String, String)>> =
+            BTreeMap::new();
         let stated: BTreeSet<(&'static str, String)> = rows.keys().cloned().collect();
         for ((name, pk), want) in rows {
             let Some(collection) = collections.iter().copied().find(|c| c.name == name) else {
@@ -2153,6 +2893,33 @@ impl Planner<'_> {
                     && matches!(row.fields.get(crate::typed::LIFECYCLE),
                         Some(Field::Value(candidate)) if candidate.value.s.is_some())
             });
+            // One another import ended that this source only fills stays ended, and nothing of it
+            // is written: a finding, by key.
+            if let Some(row) = revived {
+                let lifecycle = row.fields.get(crate::typed::LIFECYCLE);
+                let decided = decide(
+                    lifecycle,
+                    |held| *held == json!("live"),
+                    mode_of(row_sheet),
+                    own(lifecycle, row_sheet),
+                );
+                if decided != Decided::Write {
+                    count.kept += 1;
+                    differs.entry(row_sheet).or_default().insert((
+                        name,
+                        pk.clone(),
+                        crate::typed::LIFECYCLE.to_owned(),
+                    ));
+                    plan.findings.push(Finding {
+                        kind: Kind::Differs,
+                        collection: Some(name),
+                        pk: Some(pk.clone()),
+                        column: Some(crate::typed::LIFECYCLE.to_owned()),
+                        at: Vec::new(),
+                    });
+                    continue;
+                }
+            }
             if let Some(row) = current_row
                 && !row.live()
                 && revived.is_none()
@@ -2181,10 +2948,19 @@ impl Planner<'_> {
                     Some(elem) => format!("{column}.{elem}"),
                     None => column.to_owned(),
                 };
-                let decided = cell::import_step(field, &x);
+                let mut decided = decide(
+                    field,
+                    |held| *held == x,
+                    mode_of(cell_sheet),
+                    own(field, cell_sheet),
+                );
+                // Provenance moves with a value: another source's coordinates are kept, quietly.
+                if decided == Decided::Differs && matches!(column, "src" | "notes_src") {
+                    decided = Decided::Unchanged;
+                }
                 let count = plan.counts.entry(name).or_default();
                 let outcome = match decided {
-                    ImportStep::Write => {
+                    Decided::Write => {
                         count.cells += 1;
                         touched_rows.insert((cell_sheet, name, pk.clone()));
                         let value = CellValue::imported(collection.version, x.clone(), cell_source);
@@ -2199,16 +2975,23 @@ impl Planner<'_> {
                         )?);
                         Step::Write
                     }
-                    ImportStep::Unchanged => {
+                    Decided::Unchanged => {
                         count.unchanged += 1;
                         Step::Unchanged
                     }
-                    ImportStep::Finding(_) => {
+                    Decided::Owner | Decided::Conflicted | Decided::Differs => {
                         count.kept += 1;
-                        let kind = if field.is_some_and(Field::conflicted) {
-                            Kind::Conflicted
-                        } else {
-                            Kind::OwnerKept
+                        let kind = match decided {
+                            Decided::Conflicted => Kind::Conflicted,
+                            Decided::Differs => {
+                                differs.entry(cell_sheet).or_default().insert((
+                                    name,
+                                    pk.clone(),
+                                    shown.clone(),
+                                ));
+                                Kind::Differs
+                            }
+                            _ => Kind::OwnerKept,
                         };
                         plan.findings.push(Finding {
                             kind,
@@ -2258,6 +3041,90 @@ impl Planner<'_> {
                     field,
                     &mut plan,
                 )?;
+            }
+            // Secret cells: sealed to this cell's coordinates, compared by opening, never shown.
+            let guarded = (name == ADDRESS.name && protected.contains(&pk))
+                || current_row.is_some_and(check::protected);
+            // Merged once `step` is done with them.
+            let mut secret_touched = Vec::new();
+            let mut secret_differs = Vec::new();
+            for (column, wanted) in &want.secrets {
+                let field = current_row.and_then(|r| r.fields.get(*column));
+                let count = plan.counts.entry(name).or_default();
+                if guarded {
+                    count.kept += 1;
+                    plan.findings.push(Finding {
+                        kind: Kind::ProtectedSecret,
+                        collection: Some(name),
+                        pk: Some(pk.clone()),
+                        column: Some((*column).to_owned()),
+                        at: vec![wanted.at.clone()],
+                    });
+                    continue;
+                }
+                let holds = |held: &Value| {
+                    held.as_str().is_some_and(|token| {
+                        input.sealer.holds(name, &pk, column, token, &wanted.value)
+                    })
+                };
+                let decided = decide(
+                    field,
+                    holds,
+                    mode_of(wanted.at.sheet),
+                    own(field, wanted.at.sheet),
+                );
+                let outcome = match decided {
+                    Decided::Write => {
+                        let token = input.sealer.seal(name, &pk, column, &wanted.value)?;
+                        count.cells += 1;
+                        secret_touched.push(wanted.at.sheet);
+                        let value = CellValue::imported(
+                            collection.version,
+                            json!(token),
+                            &wanted.at.source,
+                        );
+                        changes.push(cell::change(
+                            collection,
+                            CellKey {
+                                pk: &pk,
+                                col: column,
+                                elem: None,
+                            },
+                            &value,
+                        )?);
+                        Step::Write
+                    }
+                    Decided::Unchanged => {
+                        count.unchanged += 1;
+                        Step::Unchanged
+                    }
+                    Decided::Owner | Decided::Conflicted | Decided::Differs => {
+                        count.kept += 1;
+                        let kind = match decided {
+                            Decided::Conflicted => Kind::Conflicted,
+                            Decided::Differs => {
+                                secret_differs.push((wanted.at.sheet, (*column).to_owned()));
+                                Kind::Differs
+                            }
+                            _ => Kind::OwnerKept,
+                        };
+                        plan.findings.push(Finding {
+                            kind,
+                            collection: Some(name),
+                            pk: Some(pk.clone()),
+                            column: Some((*column).to_owned()),
+                            at: Vec::new(),
+                        });
+                        Step::Kept
+                    }
+                };
+                plan.planned.push(Planned {
+                    collection: name,
+                    pk: pk.clone(),
+                    column: (*column).to_owned(),
+                    x: json!(MASK),
+                    step: outcome,
+                });
             }
             // What an earlier import of a kind read now wrote here and no sheet states now.
             if let Some(row) = current_row {
@@ -2378,6 +3245,15 @@ impl Planner<'_> {
                     )?;
                 }
             }
+            for n in secret_touched {
+                touched_rows.insert((n, name, pk.clone()));
+            }
+            for (n, column) in secret_differs {
+                differs
+                    .entry(n)
+                    .or_default()
+                    .insert((name, pk.clone(), column));
+            }
             if !changes.is_empty() {
                 written_rows.push(changes);
             }
@@ -2456,6 +3332,9 @@ impl Planner<'_> {
             written_rows.push(vec![change]);
         }
         let mut sources_used: BTreeMap<usize, BTreeMap<&'static str, usize>> = BTreeMap::new();
+        for n in differs.keys() {
+            sources_used.entry(*n).or_default();
+        }
         for (sheet_idx, name, _) in touched_rows {
             *sources_used
                 .entry(sheet_idx)
@@ -2517,6 +3396,22 @@ impl Planner<'_> {
                 .map(|(c, k)| ((*c).to_owned(), json!(k)))
                 .collect();
             let mut changes = Vec::new();
+            let found: Vec<Value> = differs
+                .get(&n)
+                .into_iter()
+                .flatten()
+                .filter_map(|(collection, pk, shown)| {
+                    let (column, elem) = match shown.split_once('.') {
+                        Some((column, elem)) => (column, Some(elem)),
+                        None => (shown.as_str(), None),
+                    };
+                    DIFFER_COLUMNS.contains(&column).then(|| {
+                        json!({"collection": collection, "pk": pk, "column": column, "elem": elem})
+                    })
+                })
+                .take(MAX_DIFFERS)
+                .collect();
+            let found = (!found.is_empty()).then_some(Value::Array(found));
             for (column, x) in [
                 ("kind", json!(kind)),
                 ("name", json!(file)),
@@ -2524,8 +3419,12 @@ impl Planner<'_> {
                 ("rows", json!(count)),
                 ("at", json!(input.now_ms)),
                 ("counts", Value::Object(counts)),
+                ("differs", found.clone().unwrap_or(Value::Null)),
                 (crate::typed::LIFECYCLE, json!("live")),
-            ] {
+            ]
+            .into_iter()
+            .filter(|(column, x)| *column != "differs" || !x.is_null())
+            {
                 let value = CellValue::imported(SOURCE.version, x, source);
                 changes.push(cell::change(
                     &SOURCE,

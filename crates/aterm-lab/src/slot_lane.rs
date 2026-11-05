@@ -396,8 +396,11 @@ fn slot_files(dir: &Path) -> Vec<SlotFile> {
             })
         })
         .filter_map(|e| {
+            if !e.file_type().ok()?.is_file() {
+                return None;
+            }
+            let m = e.metadata().ok()?;
             let path = e.path();
-            let m = std::fs::symlink_metadata(&path).ok()?;
             m.file_type().is_file().then(|| {
                 let pid =
                     match Record::parse(&crate::util::read_regular_file(&path).unwrap_or_default())
@@ -544,7 +547,18 @@ pub fn hold_main(args: &[String]) -> i32 {
         .create(true)
         .truncate(false)
         .mode(0o644)
-        .open(slot);
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+        .open(slot)
+        .and_then(|f| {
+            if f.metadata()?.is_file() {
+                Ok(f)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ))
+            }
+        });
     let Ok(mut file) = file else {
         eprintln!("aterm-lab: {HOLD_VERB}: cannot open {slot}");
         return 1;
@@ -654,24 +668,46 @@ pub fn cmd_slot_lane(args: &[String]) -> Res {
         },
     )?;
     let ran = await_socket(&mut inst, &world).and_then(|()| lane(&inst, &world, &mut holder));
-    inst.stop();
+    let cleanup = inst.stop();
     let ended = holder.end().and_then(|()| holder.finish(MUST).map(|_| ()));
     let instance_ended = !inst.running();
-    if ran.is_ok() && ended.is_ok() && instance_ended {
+    if ran.is_ok() && ended.is_ok() && cleanup.is_ok() && instance_ended {
         world.settled = true;
     }
-    ended?;
-    if !instance_ended {
-        return Err("the instance's exit could not be confirmed; its world was kept".into());
+    let mut cleanup_errors = Vec::new();
+    if let Err(why) = ended {
+        cleanup_errors.push(format!("stand-in cleanup failed: {why}"));
     }
-    match ran {
-        Ok(Some(v)) => Ok(v.end("slot-lane")),
+    if let Err(why) = cleanup {
+        cleanup_errors.push(format!("instance cleanup failed: {why}"));
+    }
+    if !instance_ended {
+        cleanup_errors
+            .push("the instance's exit could not be confirmed; its world was kept".into());
+    }
+    let cleanup = if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(cleanup_errors.join("; "))
+    };
+    let ran = match ran {
+        Ok(Some(mut v)) => {
+            if let Err(why) = &cleanup {
+                v.check(
+                    "the private instance and stand-in cleanup completed",
+                    false,
+                    || why.clone(),
+                );
+            }
+            Ok(v.end("slot-lane"))
+        }
         Ok(None) => Ok(3),
         Err(why) => {
             println!("slot-lane: FAIL (the lane did not run to its end: {why})");
-            Ok(1)
+            Err(Fail::die(format!("the lane did not run to its end: {why}")))
         }
-    }
+    };
+    crate::instance::after_stop(ran, cleanup)
 }
 
 fn lane(inst: &Instance, world: &World, holder: &mut Running) -> Result<Option<Verdict>, String> {

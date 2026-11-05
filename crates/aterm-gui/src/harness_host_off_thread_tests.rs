@@ -308,6 +308,7 @@ fn a_restart_left_names_its_reports_process_while_the_snapshot_lags() {
                 RestartSaid {
                     step: "adopted".to_string(),
                     pid: Some(5151),
+                    claim: RestartClaim::Unclaimed,
                 }
             } else {
                 RestartSaid::step("wait:resume")
@@ -335,6 +336,43 @@ fn a_restart_left_names_its_reports_process_while_the_snapshot_lags() {
         None,
         "a report that names none keeps none"
     );
+    held.let_go();
+}
+
+/// THE HOST ANSWERS THE CLAIM ITS RELAUNCH SAID (ATERM-KI-1101-3): the loop keeps a move's run
+/// past its other acts, and dates the move, by what the host's answer read of the conversation's
+/// record ([`RestartAnswer::claim`]), which the relaunch says once, from the record it left
+/// (`relaunch::restart_as`); the worker passes each claim on as said, the same word
+/// (`wait:resume`) said with each. Negative control by mutation: the claim dropped in
+/// `WorkerIdle::said`: every answer reads no record, and the loop asks the move again as another
+/// run, which restarts over the relaunch its ask landed.
+#[test]
+fn a_restart_answers_the_claim_its_relaunch_said() {
+    let (idle, held) = gated_idle(Program::Claude, Duration::ZERO, |h, _| {
+        let asks = Arc::new(AtomicUsize::new(0));
+        h.acts.restart = Arc::new(move |_, _, _, _, _| RestartSaid {
+            step: "wait:resume".to_string(),
+            pid: None,
+            claim: RestartClaim::ALL[asks.fetch_add(1, Ordering::SeqCst) % RestartClaim::ALL.len()],
+        });
+    });
+    let fallback = Restart::Model {
+        to: "claude-sonnet-5-5".to_string(),
+    };
+    let ask = RestartAsk::of(&fallback, 0);
+    let answers: Vec<Option<RestartAnswer>> = (0..RestartClaim::ALL.len())
+        .map(|_| IdleHost::restart(idle.as_ref(), &fallback, &ask))
+        .collect();
+    let said: Vec<Option<RestartAnswer>> = RestartClaim::ALL
+        .into_iter()
+        .map(|claim| {
+            Some(RestartAnswer {
+                step: "wait:resume".to_string(),
+                claim,
+            })
+        })
+        .collect();
+    assert_eq!(answers, said, "each answer's claim as its relaunch said it");
     held.let_go();
 }
 

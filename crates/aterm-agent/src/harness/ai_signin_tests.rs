@@ -546,10 +546,11 @@ warm = ["m1"]
         let st_dir = steward_state.clone();
         let st_home = steward_home.clone();
         let server_thread = std::thread::spawn(move || {
-            aterm_net::fleet::serve(
+            aterm_net::fleet::serve_with_handshake(
                 &tcp_listener,
                 &listening,
                 &run_flag,
+                HANG,
                 move |served, op| {
                     assert_eq!(op, FleetOp::MailCode);
                     let proof = served.peer_node().cloned();
@@ -728,11 +729,14 @@ warm = ["m1"]
         let peers = vec![issuer];
         let own = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         assert!(
-            select_steward_relay_peers(&peers, own, &[], Some(home.path())).is_empty(),
+            select_steward_relay_peers(&peers, own, &[], Some(home.path()))
+                .unwrap()
+                .is_empty(),
             "no steward is asked while the deny list is unread"
         );
         std::fs::remove_file(&source).unwrap();
         let asked: Vec<&str> = select_steward_relay_peers(&peers, own, &[], Some(home.path()))
+            .unwrap()
             .iter()
             .map(|p| p.host.as_str())
             .collect();
@@ -802,7 +806,7 @@ warm = ["m1"]
         assert_eq!(unpruned_count, 28);
 
         let standbys = vec!["m2".to_owned(), "m22".to_owned()];
-        let selected = select_steward_relay_peers(&peers, own_node, &standbys, None);
+        let selected = select_steward_relay_peers(&peers, own_node, &standbys, None).unwrap();
         let hosts: Vec<&str> = selected.iter().map(|p| p.host.as_str()).collect();
         assert_eq!(
             hosts,
@@ -1137,7 +1141,24 @@ fn read_standby_steward_labels_filters_denied_stewards() {
     )
     .unwrap();
 
-    let labels = read_standby_steward_labels(home_dir.path());
+    let pass = || {
+        let roster = ai_pool::read_pass_roster(&paths).unwrap();
+        read_standby_steward_labels(home_dir.path(), roster.as_ref())
+    };
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(Some(
+        aterm_secrets::client::test_hold_state_lock(&paths).unwrap(),
+    )));
+    assert_ne!(
+        ai_pool::test_without_roster_wait(pass),
+        vec!["m22".to_owned()],
+        "negative control loses the roster's denied label during the pass"
+    );
+    let release = writer.clone();
+    let labels = aterm_secrets::client::test_with_denied_nodes_busy(
+        move || drop(release.borrow_mut().take()),
+        pass,
+    );
+    assert!(writer.borrow().is_none(), "the pass met the writer");
     assert_eq!(
         labels,
         vec!["m22".to_owned()],
@@ -1210,7 +1231,7 @@ fn authorize_mail_code_refuses_mismatched_claimed_label_and_prefers_readmitted_r
         std::fs::write(&outside, "stewards = [\"injected\"]\n").expect("outside");
         std::os::unix::fs::symlink(&outside, secrets.join("swarm-policy.toml"))
             .expect("symlink policy");
-        assert!(read_standby_steward_labels(dir.path()).is_empty());
+        assert!(read_standby_steward_labels(dir.path(), None).is_empty());
     }
 }
 

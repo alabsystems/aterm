@@ -1264,7 +1264,7 @@ fn collect_packages_status_from_layout(
                         }
                         Err(error) => {
                             record_error(format!("Could not read link marker {name:?}: {error}"));
-                            let selected_store = atpkg::active_builds(layout).get(&name).copied();
+                            let selected_store = atpkg::active_build_of(layout, &name);
                             let runs_store = atpkg::which(layout, &name).is_some_and(|target| {
                                 selected_store.is_some_and(|build| {
                                     target.starts_with(layout.build_dir(&name, build))

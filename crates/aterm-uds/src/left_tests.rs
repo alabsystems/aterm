@@ -471,13 +471,15 @@ fn an_unrecorded_dead_run_has_no_automatic_cleanup_authority() {
         };
         let reading = Reader::new().read(&k, &rows(&k), &known);
         assert_eq!(facts_of(&reading, 4000).runs[0].auto, recorded);
-        let fresh = read_one(&k, 4000, &known).unwrap();
+        let fresh = read_one(&k, 4000, &known).unwrap().unwrap();
         assert_eq!(fresh.runs[0].auto, recorded);
         assert!(fresh.runs[0].tree, "the diagnostic tie remains available");
     }
 }
 
-/// Facts read for `end` are read again, none kept and none bounded.
+/// Facts read for `end` are read again, none kept and none bounded; a pid the table no longer
+/// lists is gone, and a table that does not list says nothing of it. NEGATIVE CONTROL: read an
+/// unlisted table as the pid gone, and the last assertion fails.
 #[test]
 fn read_one_reads_every_fact_again() {
     let mut k = world();
@@ -491,12 +493,19 @@ fn read_one_reads_every_fact_again() {
         waiting: &[],
         shells: &[],
     };
-    let f = read_one(&k, 2606, &known).expect("read");
+    let f = read_one(&k, 2606, &known).expect("read").expect("live");
     assert_eq!(f.token.as_deref(), Some("2606@1792000000002606:26060"));
-    assert!(read_one(&k, 2606, &known).is_some());
+    assert!(read_one(&k, 2606, &known).is_ok_and(|f| f.is_some()));
     assert_eq!(k.count("markers"), 2);
-    assert_eq!(read_one(&k, 100, &known), None, "this process");
-    assert_eq!(read_one(&k, 9999, &known), None, "gone");
+    assert_eq!(read_one(&k, 100, &known), Ok(None), "this process");
+    assert_eq!(read_one(&k, 9999, &known), Ok(None), "gone");
+    let mut unlisted = Fake::default();
+    unlisted.add(2606, 1, 2600, 1500);
+    assert_eq!(
+        read_one(&unlisted, 2606, &known),
+        Err(Unread),
+        "no table read: unknown, not gone"
+    );
 }
 
 /// The listener table is one scan of every process's table: a reading reads it at most once a

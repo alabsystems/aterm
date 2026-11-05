@@ -4754,6 +4754,7 @@ pub(crate) mod tests {
             label: "Tab 1".into(),
             program: "claude".into(),
             tab_id: None,
+            agent_leader: None,
         }];
         let mk = |t: u64, busy: &[u64], cpu: &[u64]| Sample {
             at_ns: t * 1_000_000_000,
@@ -4954,6 +4955,7 @@ pub(crate) mod tests {
             label: "Tab 1".into(),
             program: String::new(),
             tab_id: None,
+            agent_leader: None,
         };
         let proc = |pid: u32, ppid: u32, cpu_ms: u64, mib: u64, name: &str| ProcSample {
             start: Some(1),

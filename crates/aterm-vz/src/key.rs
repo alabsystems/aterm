@@ -7,7 +7,7 @@
 //! The agent's `Hello` must carry it, or no frame of that dial is believed. The key never
 //! leaves the helper: the lab's `Ready` carries a hello without it.
 
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::path::Path;
 
 pub use aterm_vz_agent::key::{DISK_BYTES, Key, LEN, same};
@@ -18,7 +18,7 @@ pub use aterm_vz_agent::key::{DISK_BYTES, Key, LEN, same};
 /// `/dev/urandom` could not be read.
 pub fn fresh() -> io::Result<Key> {
     let mut key = [0u8; LEN];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
+    aterm_uds::rand::fill(&mut key)?;
     if key.iter().all(|b| *b == 0) {
         return Err(io::Error::other("/dev/urandom gave 32 zero bytes"));
     }

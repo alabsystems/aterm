@@ -645,6 +645,35 @@ fn native_abs(unix: &str) -> String {
     }
 }
 
+/// The board's row names the folder the spawn's head sends the worker to, for every way a
+/// `cwd=` is given: the regression a relative `cwd=` recorded as typed was.
+#[test]
+fn a_spawned_workers_row_names_the_folder_its_head_sends() {
+    let proj = native_abs("/w/proj");
+    let here = Path::new(&proj);
+    let abs = native_abs("/x y");
+    for given in [
+        None,
+        Some("cwd=sub".to_owned()),
+        Some("cwd=.".to_owned()),
+        Some("cwd=\"my dir\"".to_owned()),
+        Some(format!("cwd={abs}")),
+    ] {
+        let mut args = argv(&["agent=claude"]);
+        args.extend(given.clone());
+        args.push("-".to_owned());
+        let head = worker_spawn_head(None, &args, None, Some(here)).unwrap();
+        let sent = head
+            .split_once(" cwd=")
+            .map(|(_, v)| v.trim_matches('"').to_owned())
+            .unwrap_or_else(|| panic!("{head}"));
+        let folder = worker_folder(&args, Some(here)).expect("a folder");
+        assert_eq!(folder.to_str(), Some(sent.as_str()), "{given:?}: {head}");
+    }
+    assert_eq!(worker_folder(&argv(&["cwd=", "-"]), Some(here)), None);
+    assert_eq!(worker_folder(&argv(&["cwd=sub", "-"]), None), None);
+}
+
 #[test]
 fn a_worker_spawn_line_names_its_folder_and_leaves_the_length_to_the_frame() {
     let args = argv(&["agent=claude", "model=opus", "-"]);
@@ -859,7 +888,10 @@ fn a_workers_starter_is_its_own_session_and_its_aim_unless_told_or_pinned() {
 
 /// A WORKER'S TASK IS SENT ONLY TO A SERVER THAT SAID IT READS IT: over a
 /// stand-in instance, the task follows the line only once the line is
-/// answered `GO <n>`, and a second `GO` is read past to the answer.
+/// answered `GO <n>`, and a second `GO` is read past to the answer. A usage
+/// line is sent no byte of the task; only one that names no `agent=` (an
+/// instance older than workers) is followed by the note to update it, and a
+/// current instance's usage line, with or without the word it refuses, is not.
 #[cfg(unix)]
 #[test]
 fn a_workers_task_follows_only_the_servers_go() {
@@ -888,7 +920,7 @@ fn a_workers_task_follows_only_the_servers_go() {
                 let mut body = vec![0u8; task.len()];
                 r.read_exact(&mut body).expect("the task");
                 rest.extend_from_slice(&body);
-                std::io::Write::write_all(&mut w, b"OK s-new\n").expect("answer");
+                std::io::Write::write_all(&mut w, b"OK s-0e1\n").expect("answer");
             } else {
                 std::io::Write::write_all(&mut w, answers[0].as_bytes()).expect("answer");
             }
@@ -898,27 +930,91 @@ fn a_workers_task_follows_only_the_servers_go() {
     };
     let go: &'static str = aterm_types::control_verbs::task_frame_go(task.len()).leak();
     let srv = serve(vec![go].leak(), listener);
-    let code = worker_exchange(&path, TargetOrigin::Pinned, &head, task, deadline).expect("run");
+    let spawned = std::cell::RefCell::new(None);
+    let code = worker_exchange(
+        &path,
+        TargetOrigin::Pinned,
+        (&head, task),
+        deadline,
+        &spawned,
+    )
+    .expect("run");
     assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        spawned.take().as_deref(),
+        Some("s-0e1"),
+        "the sid the instance answered, for the board"
+    );
     let (listener, first, rest) = srv.join().expect("server");
     assert_eq!(first, format!("{head}\n"));
     assert_eq!(rest, task, "the task, after the GO");
 
     let srv = serve(vec![go, go].leak(), listener);
-    let code = worker_exchange(&path, TargetOrigin::Pinned, &head, task, deadline).expect("run");
+    let code = worker_exchange(
+        &path,
+        TargetOrigin::Pinned,
+        (&head, task),
+        deadline,
+        &spawned,
+    )
+    .expect("run");
     assert_eq!(code, ExitCode::SUCCESS, "a second GO is read past");
     let (listener, _, rest) = srv.join().expect("server");
     assert_eq!(rest, task);
 
-    let srv = serve(
-        &["ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>]\n"],
-        listener,
-    );
-    let code = worker_exchange(&path, TargetOrigin::Pinned, &head, task, deadline).expect("run");
+    let old = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>]";
+    let srv = serve(vec![format!("{old}\n").leak() as &str].leak(), listener);
+    spawned.take();
+    let (code, said) = stderr_lines_of(|| {
+        worker_exchange(
+            &path,
+            TargetOrigin::Pinned,
+            (&head, task),
+            deadline,
+            &spawned,
+        )
+        .expect("run")
+    });
     assert_eq!(code, ExitCode::FAILURE);
-    let (_, first, rest) = srv.join().expect("server");
+    assert_eq!(said, [old, PREDATES_WORKERS]);
+    assert_eq!(spawned.take(), None, "a refused spawn started no worker");
+    let (mut listener, first, rest) = srv.join().expect("server");
     assert_eq!(first, format!("{head}\n"));
     assert!(rest.is_empty(), "not a byte of the task: {rest:?}");
+
+    let grammar = "ERR usage: spawn [window=<id>] [cwd=<path>] [connected=controlled|controller \
+                   place=window|tab of=<sid> | agent=<claude|codex-alab> [autopilot=<land|cruise>] \
+                   len=<n>]";
+    // A current instance's refusal names the word it refuses; a line no one word breaks gets
+    // the usage line alone. Neither is an instance older than workers.
+    for current in [
+        format!("{grammar}; not `autopilot=bogus`"),
+        grammar.to_string(),
+    ] {
+        let srv = serve(vec![format!("{current}\n").leak() as &str].leak(), listener);
+        let (code, said) = stderr_lines_of(|| {
+            worker_exchange(
+                &path,
+                TargetOrigin::Pinned,
+                (&head, task),
+                deadline,
+                &spawned,
+            )
+            .expect("run")
+        });
+        assert_eq!(code, ExitCode::FAILURE);
+        assert_eq!(
+            said,
+            [current.as_str()],
+            "a current instance's refusal, alone"
+        );
+        assert_eq!(spawned.take(), None, "a refused spawn started no worker");
+        let (back, first, rest) = srv.join().expect("server");
+        listener = back;
+        assert_eq!(first, format!("{head}\n"));
+        assert!(rest.is_empty(), "not a byte of the task: {rest:?}");
+    }
+    drop(listener);
 }
 
 #[test]
@@ -2974,7 +3070,12 @@ fn a_front_door_failure_after_the_send_is_delivered() {
     let dir = tokened_socket_dir("fdsend");
     let sock = dir.join("mock.sock");
     let sock_str = sock.to_str().expect("utf8 path").to_string();
-    let send = |reply| front_door_send_within(&sock_str, "spawn\n", HANG_DETECTOR, reply);
+    // The stand-ins answer the accept probe, so each accept is held to the hang detector too.
+    let send = |reply| {
+        with_accept_within(HANG_DETECTOR, || {
+            front_door_send_within(&sock_str, "spawn\n", HANG_DETECTOR, reply)
+        })
+    };
 
     let refused = send(HANG_DETECTOR).expect_err("nothing listens");
     assert!(!front_door_delivered(&refused), "{refused}");
@@ -3347,6 +3448,8 @@ fn implicit_self_targeting_is_exactly_the_flagless_at_self_and_at_dot_shapes() {
         ("await task @.:0", None, Some(7), false),
         ("await task", None, None, true),
         ("await task", None, Some(7), false),
+        ("await task board since=0", None, None, false),
+        ("board", None, None, false),
         ("@. text", None, None, true),
         ("@. text", None, Some(7), false),
         ("@s-abc text", None, None, false),

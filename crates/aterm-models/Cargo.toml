@@ -65,6 +65,7 @@ aterm-search.workspace = true
 aterm-secrets.workspace = true
 aterm-selection.workspace = true
 aterm-session.workspace = true
+aterm-types.workspace = true
 aterm-update.workspace = true
 aterm-vz.workspace = true
 

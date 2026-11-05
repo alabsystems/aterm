@@ -1480,78 +1480,241 @@ pub fn says_no_needs(tail: &str) -> bool {
     read.cleared && read.needs.iter().all(|n| sanitized(n).is_empty())
 }
 
-/// THE AGENT'S LAST WORD ON NEEDS in a turn (v6 §14.17.13, the post-landing review): what the
-/// turn's earlier messages `before` said still stands beside its last message `last` unless a
-/// later word retracts it. A need stands until retracted, and a word that says none stands
-/// ([`says_no_needs`], `NEEDS YOU: nothing`) retracts every need the turn named before it: a last
-/// message that says it leaves `before` read for none (`None`), and an earlier paragraph that says
-/// it alone leaves `before` from that paragraph on (its none, and what came after it). The
-/// readers join a turn's messages with a blank line, so a message's own paragraphs are read as
-/// messages are; one paragraph that names a need and a none both is read as itself, a kept need
-/// ([`needs_you`]), and so is the last message, read whole. The one rule by which every reader of
-/// a turn's needs reads it: the land check's answer (`land_check::land_check_answer`), the fold
-/// that raises the needs on the menu bar (`TurnEndState::fold_turn_needs`), the readers of
-/// `TurnEndReading::needs_before`, and the go-ahead reader ([`retracted_cut`]).
+/// WHERE A TURN'S EARLIER MESSAGES START in the texts its readers hold
+/// (`TurnEndReading::turn_said` and `TurnEndReading::turn_lines`, each its messages joined by
+/// [`aterm_phase::reader::MESSAGE_GAP`]): the byte each message after the first opens at, in
+/// each. Empty where the reader cannot tell the messages apart (a program whose reader answers
+/// one text, a test's words): the text is then read as one message ([`Before::whole`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Breaks {
+    /// In the messages as drawn (`turn_said`).
+    pub said: Vec<usize>,
+    /// In the messages each line the program wrapped read as one (`turn_lines`).
+    pub lines: Vec<usize>,
+}
+
+/// `messages` joined as the readers hold them ([`aterm_phase::reader::join_messages`]), and the
+/// byte each one after the first opens at.
 #[must_use]
-pub fn standing_before<'a>(before: Option<&'a str>, last: &str) -> Option<&'a str> {
-    let before = before?;
-    match retracted_to(before, last) {
-        Retracted::All => None,
-        Retracted::From(at) => Some(&before[at..]),
-    }
-}
-
-/// `before` WITHOUT THE NEEDS THE TURN'S LAST WORD RETRACTED ([`standing_before`]), its prose
-/// kept: the go-ahead reader's view of a turn's earlier messages (`go_ahead::parked`), whose
-/// sentences still say what the work plans and lacks, though a need they named was taken back.
-#[must_use]
-pub fn retracted_cut<'a>(before: &'a str, last: &str) -> Cow<'a, str> {
-    match retracted_to(before, last) {
-        Retracted::All => without_needs(before),
-        Retracted::From(0) => Cow::Borrowed(before),
-        Retracted::From(at) => Cow::Owned(format!(
-            "{}\n\n{}",
-            without_needs(&before[..at]).trim_end(),
-            &before[at..]
-        )),
-    }
-}
-
-/// How much of a turn's earlier messages its last word retracts ([`standing_before`]).
-enum Retracted {
-    /// The last message says no need stands.
-    All,
-    /// The needs named before this byte: the start of the last paragraph that says none alone.
-    From(usize),
-}
-
-fn retracted_to(before: &str, last: &str) -> Retracted {
-    if says_no_needs(last) {
-        return Retracted::All;
-    }
-    let mut paragraphs: Vec<(usize, usize)> = Vec::new();
-    let mut open: Option<usize> = None;
+pub fn joined(messages: Option<Vec<String>>) -> (Option<String>, Vec<usize>) {
+    let Some(messages) = messages else {
+        return (None, Vec::new());
+    };
+    let gap = aterm_phase::reader::MESSAGE_GAP.len();
+    let mut starts = Vec::with_capacity(messages.len().saturating_sub(1));
     let mut at = 0;
-    for line in before.split_inclusive('\n') {
-        if line.trim().is_empty() {
-            if let Some(start) = open.take() {
-                paragraphs.push((start, at));
+    for m in messages.iter().take(messages.len().saturating_sub(1)) {
+        at += m.len() + gap;
+        starts.push(at);
+    }
+    (Some(aterm_phase::reader::join_messages(&messages)), starts)
+}
+
+/// A TURN'S EARLIER MESSAGES as the readers of its needs read them: their joined text, and where
+/// each message after the first opens ([`Breaks`]), counted in the text as read before its front
+/// lost `dropped` bytes ([`Self::past`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Before<'a> {
+    text: &'a str,
+    starts: &'a [usize],
+    dropped: usize,
+}
+
+impl<'a> Before<'a> {
+    /// `text`, its messages opening at `starts` ([`Breaks`]).
+    #[must_use]
+    pub const fn new(text: &'a str, starts: &'a [usize]) -> Self {
+        Self {
+            text,
+            starts,
+            dropped: 0,
+        }
+    }
+
+    /// `text` read as one message.
+    #[must_use]
+    pub const fn whole(text: &'a str) -> Self {
+        Self::new(text, &[])
+    }
+
+    /// The joined text.
+    #[must_use]
+    pub const fn text(self) -> &'a str {
+        self.text
+    }
+
+    /// The messages from where `rest`, the end of [`Self::text`] (the act's own rows cut from the
+    /// turn's opening), begins, still told apart. A `rest` that is not its end is one message.
+    #[must_use]
+    pub fn past(self, rest: &'a str) -> Self {
+        if !self.text.ends_with(rest) {
+            return Self::whole(rest);
+        }
+        Self {
+            text: rest,
+            starts: self.starts,
+            dropped: self.dropped + (self.text.len() - rest.len()),
+        }
+    }
+
+    /// Each message's text, oldest first, the gap that joins them left out. A start that does not
+    /// fall inside the text past the last, right after a gap, is no start.
+    fn messages(self) -> Vec<&'a str> {
+        let gap = aterm_phase::reader::MESSAGE_GAP;
+        let mut out = Vec::with_capacity(self.starts.len() + 1);
+        let mut at = 0;
+        for &start in self.starts {
+            let Some(s) = start.checked_sub(self.dropped) else {
+                continue;
+            };
+            if s <= at
+                || s >= self.text.len()
+                || !self.text.is_char_boundary(s)
+                || !self.text[at..s].ends_with(gap)
+            {
+                continue;
             }
-        } else if open.is_none() {
-            open = Some(at);
+            out.push(&self.text[at..s - gap.len()]);
+            at = s;
+        }
+        out.push(&self.text[at..]);
+        out
+    }
+}
+
+impl<'a> From<&'a str> for Before<'a> {
+    fn from(text: &'a str) -> Self {
+        Self::whole(text)
+    }
+}
+
+/// THE AGENT'S WORD ON NEEDS in a turn (v6 §14.17.13, the post-landing reviews of 2026-11-01 and
+/// 2026-11-02): what the turn's earlier messages `before` named still stands beside its last
+/// message `last`, unless the agent's own word retracts it. A need stands until retracted, by:
+///
+/// - THE LAST WORD: the last message's own word that says none stands ([`retracts`]: `NEEDS YOU:
+///   nothing`, no need beside it) retracts every need the turn named before it, and every need an
+///   earlier point raised ([`retracts`]' other reader, `TurnEndState::fold_turn_needs`): `before`
+///   is read for none (`None`).
+/// - A NONE IN AN EARLIER MESSAGE: a paragraph of an earlier message that says none stands alone
+///   in the agent's own words retracts the needs named before it in that same message, and only
+///   those ([`retracted_at`]); `before` is read from that paragraph on in that message. A need an
+///   earlier message, or an earlier point, named stands, so a relayed worker's closing line in a
+///   message of its own takes no need down. Where the reader cannot tell the messages apart
+///   ([`Breaks`] empty), `before` is one message.
+///
+/// Quoted or fenced text is never the agent's word: a quoted none retracts nothing, and a fenced
+/// line is no need line at all. One paragraph that names a need and a none both is a kept need
+/// ([`needs_you`]), and so is the last message, read whole. The one rule by which every reader of a
+/// turn's needs reads it: the land check's answer (`land_check::land_check_answer`), the fold
+/// that raises the needs on the menu bar (`TurnEndState::fold_turn_needs`, with
+/// [`retracted_in`]), the readers of `TurnEndReading::needs_before`, and the go-ahead reader
+/// ([`retracted_cut`]).
+#[must_use]
+pub fn standing_before<'a>(before: Option<Before<'a>>, last: &str) -> Option<Cow<'a, str>> {
+    let before = before?;
+    (!retracts(last)).then(|| cut_messages(before, |m, at| Cow::Borrowed(&m[at..])))
+}
+
+/// `before` WITHOUT THE NEEDS THE TURN'S WORD RETRACTED ([`standing_before`]), its prose kept: the
+/// go-ahead reader's view of a turn's earlier messages (`go_ahead::parked`), whose sentences
+/// still say what the work plans and lacks, though a need they named was taken back.
+#[must_use]
+pub fn retracted_cut<'a>(before: Before<'a>, last: &str) -> Cow<'a, str> {
+    if retracts(last) {
+        return without_needs(before.text);
+    }
+    cut_messages(before, |m, at| {
+        Cow::Owned(format!(
+            "{}{}{}",
+            without_needs(&m[..at]).trim_end(),
+            aterm_phase::reader::MESSAGE_GAP,
+            &m[at..]
+        ))
+    })
+}
+
+/// THE NEEDS AN EARLIER MESSAGE'S OWN NONE RETRACTED ([`standing_before`]): each named before
+/// the paragraph that retracted it in its message, as [`needs_you`] names it. The fold takes
+/// them off the needs an earlier point raised (`TurnEndState::fold_turn_needs`).
+#[must_use]
+pub fn retracted_in(before: Before<'_>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in before.messages() {
+        if let Some(at) = retracted_at(m) {
+            for need in needs_you(&m[..at]) {
+                if !out.contains(&need) {
+                    out.push(need);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `before`, each message that retracts needs ([`retracted_at`]) as `cut` makes it.
+fn cut_messages<'a>(
+    before: Before<'a>,
+    cut: impl Fn(&'a str, usize) -> Cow<'a, str>,
+) -> Cow<'a, str> {
+    let messages = before.messages();
+    let cuts: Vec<Option<usize>> = messages.iter().map(|m| retracted_at(m)).collect();
+    if cuts.iter().all(Option::is_none) {
+        return Cow::Borrowed(before.text);
+    }
+    let kept: Vec<Cow<'a, str>> = messages
+        .into_iter()
+        .zip(cuts)
+        .map(|(m, at)| at.map_or(Cow::Borrowed(m), |at| cut(m, at)))
+        .collect();
+    Cow::Owned(kept.join(aterm_phase::reader::MESSAGE_GAP))
+}
+
+/// WHERE `message`'S OWN NONE RETRACTS THE NEEDS IT NAMED BEFORE IT ([`standing_before`]): the
+/// byte its last paragraph that says no need stands ([`says_no_needs`]) in the agent's own words
+/// ([`own_line`]) opens at, where a need line comes before it; `None` where none does. A
+/// paragraph ends at a blank line outside a fence.
+fn retracted_at(message: &str) -> Option<usize> {
+    let mut fence = None;
+    let mut at = 0;
+    let mut paragraph: Option<(usize, String)> = None;
+    let mut last = None;
+    let close = |p: Option<(usize, String)>, last: &mut Option<usize>| {
+        if let Some((start, own)) = p
+            && says_no_needs(&own)
+        {
+            *last = Some(start);
+        }
+    };
+    for line in message.split_inclusive('\n') {
+        let fenced = fenced_line(line.trim_end_matches(['\n', '\r']), &mut fence);
+        if !fenced && line.trim().is_empty() {
+            close(paragraph.take(), &mut last);
+        } else {
+            let (_, own) = paragraph.get_or_insert_with(|| (at, String::new()));
+            if !fenced && own_line(line) {
+                own.push_str(line);
+            }
         }
         at += line.len();
     }
-    if let Some(start) = open {
-        paragraphs.push((start, at));
-    }
-    Retracted::From(
-        paragraphs
-            .iter()
-            .rev()
-            .find(|&&(start, end)| says_no_needs(&before[start..end]))
-            .map_or(0, |&(start, _)| start),
-    )
+    close(paragraph.take(), &mut last);
+    last.filter(|&at| !needs_you(&message[..at]).is_empty())
+}
+
+/// Whether `line` is the agent's own word, not quoted ([`QUOTE_MARKS`]).
+fn own_line(line: &str) -> bool {
+    !line.trim_start().starts_with(QUOTE_MARKS)
+}
+
+/// WHETHER THE TURN'S LAST MESSAGE `last` IS THE AGENT'S WORD THAT NO NEED STANDS
+/// ([`standing_before`]): it says no need stands ([`says_no_needs`]) in the agent's own words, its
+/// quoted lines left out ([`own_line`]), so a quoted `NEEDS YOU: nothing` retracts nothing. It
+/// retracts every need the turn named and every need an earlier point raised.
+#[must_use]
+pub fn retracts(last: &str) -> bool {
+    let own: String = last.split_inclusive('\n').filter(|l| own_line(l)).collect();
+    says_no_needs(&own)
 }
 
 /// `tail` without its NEEDS YOU lines (heads, the items under a head, their wrapped rows).
@@ -1765,23 +1928,89 @@ pub fn defense_and_after(tail: &str) -> Option<Vec<&str>> {
     Some(std::iter::once(line).chain(after).collect())
 }
 
-/// `tail` as Land's strict reading of open work takes it.
+/// `tail` as Land's strict reading of open work takes it: its needs left out, and the keep lines
+/// under its defense ([`kept_tokens`]), so a row kept running (`keep <token>: the server you asked
+/// for, still running`) never reads as open work.
 #[must_use]
 pub fn defense_body(tail: &str) -> String {
     let rest = without_needs(tail);
     let mut block = None;
+    let mut defended = false;
     let mut out: Vec<String> = Vec::new();
     for line in rest.lines() {
         if fenced_line(line, &mut block) {
             out.push(line.to_string());
             continue;
         }
+        if defended && keep_line(line).is_some() {
+            continue;
+        }
         match defense_rest(line) {
-            Some(body) => out.push(capitalized(&body)),
+            Some(body) => {
+                defended = true;
+                out.push(capitalized(&body));
+            }
             None => out.push(line.to_string()),
         }
     }
     out.join("\n")
+}
+
+/// THE TOKENS A DEFENSE KEEPS RUNNING: each keep line ([`keep_line`]) under `tail`'s `Nothing
+/// left:` defense, outside a code block, in order and each once, read where [`defense_body`]
+/// reads them: in `tail` with its needs left out ([`without_needs`]), so a keep line inside a
+/// NEEDS YOU block keeps nothing, as the body leaves the whole block out. None where `tail`
+/// defends nothing ([`defense_line`]).
+#[must_use]
+pub fn kept_tokens(tail: &str) -> Vec<aterm_uds::process::Identity> {
+    if defense_line(tail).is_none() {
+        return Vec::new();
+    }
+    let rest = without_needs(tail);
+    let Some((_, after)) = defense_at(&rest) else {
+        return Vec::new();
+    };
+    let mut block = None;
+    let mut kept = Vec::new();
+    for line in after {
+        if fenced_line(line, &mut block) {
+            continue;
+        }
+        if let Some(token) = keep_line(line)
+            && !kept.contains(&token)
+        {
+            kept.push(token);
+        }
+    }
+    kept
+}
+
+/// A KEEP LINE'S TOKEN: past a bullet (`- `, `* `, `1. `, …), the word `keep` in any case (a
+/// colon after it read past), then a process token as `sys left` prints it as `end=`
+/// (`<pid>@<birth>:<idversion>`, or `<pid>@<birth>` where the kernel keeps no pid version:
+/// `crate::harness::leftover::token_of`), bare or in backticks, copied with its `end=` or not.
+/// What follows the token is the line's own words, a bare token's closing mark (`,`, `;`, `:`,
+/// `.`, `)`) read past. `None` for any other line: a word that is no token keeps nothing.
+fn keep_line(line: &str) -> Option<aterm_uds::process::Identity> {
+    let t = line.trim_start();
+    let t = past_marker(t).unwrap_or(t);
+    let (word, rest) = t.split_once(char::is_whitespace)?;
+    if !word
+        .strip_suffix(':')
+        .unwrap_or(word)
+        .eq_ignore_ascii_case("keep")
+    {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let token = match rest.strip_prefix('`') {
+        Some(quoted) => quoted.split_once('`')?.0,
+        None => rest
+            .split(char::is_whitespace)
+            .next()?
+            .trim_end_matches([',', ';', ':', '.', ')']),
+    };
+    crate::harness::leftover::token_of(token.strip_prefix("end=").unwrap_or(token))
 }
 
 /// The key of a set of needs: equal sets, equal keys; `0` for none.

@@ -379,11 +379,11 @@ impl WakeFs for TestFs {
         Vec::new()
     }
 
-    fn reader(&self, path: &Path) -> std::io::Result<std::fs::File> {
+    fn reader(&self, path: &Path) -> std::io::Result<(std::fs::File, (u64, u64, u64))> {
         self.touch(path, Ask::Read);
-        let file = files::Disk.reader(path)?;
+        let (file, id) = files::Disk.reader(path)?;
         self.record_opened(&file);
-        Ok(file)
+        Ok((file, id))
     }
 
     fn watch_cap(&self) -> usize {

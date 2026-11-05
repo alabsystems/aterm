@@ -597,7 +597,7 @@ fn a_carrys_own_rows_name_no_need() {
                 let mut st = TurnEndState::default();
                 st.background_carried(t0(), act);
                 st.fold_break_needs(
-                    r.turn_lines.as_deref(),
+                    r.turn_lines.as_deref().map(Into::into),
                     r.said_lines.as_deref(),
                     r.opens_cut,
                 );

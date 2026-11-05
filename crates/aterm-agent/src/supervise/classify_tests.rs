@@ -2579,7 +2579,9 @@ fn a_plain_line_expands_nothing() {
         "ls \"$HOME\"",
         "echo ${HOME}",
     ] {
-        assert_eq!(plain_zsh_line(line), Ok(()), "{line:?}");
+        for extended_glob in [false, true] {
+            assert_eq!(plain_zsh_line(line, extended_glob), Ok(()), "{line:?}");
+        }
     }
     for line in [
         "path=/x ls",
@@ -2625,11 +2627,44 @@ fn a_plain_line_expands_nothing() {
         "ls \u{1b}[2J",
         "ls 'open",
         "ls \"open",
+    ] {
+        for extended_glob in [false, true] {
+            assert!(
+                plain_zsh_line(line, extended_glob).is_err(),
+                "{line:?} must not be plain"
+            );
+        }
+    }
+}
+
+/// An unquoted `^`, and an unquoted `#` that opens no comment, are `EXTENDED_GLOB`'s operators
+/// (`^x` any name but `x`, `x#` any run of `x`): a line holding one, a substitution's included,
+/// is plain only where the startup cannot set that option, where zsh reads both as text
+/// (MEASURED 2026-11-05, `docs/measured/classifier-zsh-glob-2026-11-05.md`).
+#[test]
+fn an_extended_glob_operator_is_plain_only_with_the_option_off() {
+    for line in [
         "ls a#b",
         "ls ^x",
         "git show HEAD^",
+        "git diff HEAD^^ HEAD",
+        "grep -n ^fn src",
+        "cat ~/.s#h/config",
+        "echo $(ls a#b)",
+        "echo \"$(git show HEAD^)\"",
     ] {
-        assert!(plain_zsh_line(line).is_err(), "{line:?} must not be plain");
+        assert_eq!(plain_zsh_line(line, false), Ok(()), "{line:?}");
+        let why = plain_zsh_line(line, true).expect_err(line);
+        assert!(
+            why.contains("a glob operator under EXTENDED_GLOB"),
+            "{line:?}: {why}"
+        );
+    }
+    // NEGATIVE CONTROL: quoted, or a comment's.
+    for line in ["ls 'a#b' \"a^b\"", "ls # x^y a#b", "grep -n '^fn' src"] {
+        for extended_glob in [false, true] {
+            assert_eq!(plain_zsh_line(line, extended_glob), Ok(()), "{line:?}");
+        }
     }
 }
 
@@ -2650,10 +2685,12 @@ fn a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash() {
         "printf %d \"path[$(id)]\"",
         "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo a))))))))",
     ] {
-        assert_eq!(plain_zsh_line(line), Ok(()), "{line:?}");
+        for extended_glob in [false, true] {
+            assert_eq!(plain_zsh_line(line, extended_glob), Ok(()), "{line:?}");
+        }
     }
     assert!(
-        plain_zsh_line("echo $((x=1,PATH=0))").is_err_and(|e| e.contains("arithmetic")),
+        plain_zsh_line("echo $((x=1,PATH=0))", false).is_err_and(|e| e.contains("arithmetic")),
         "refused as the arithmetic it is"
     );
     let v = classify_command("printf %d \"path[$(id)]\"");
@@ -2710,7 +2747,12 @@ fn a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash() {
         "echo $(echo a)[1]",
         "echo $(echo /a/b):h",
     ] {
-        assert!(plain_zsh_line(line).is_err(), "{line:?} must not be plain");
+        for extended_glob in [false, true] {
+            assert!(
+                plain_zsh_line(line, extended_glob).is_err(),
+                "{line:?} must not be plain"
+            );
+        }
     }
 }
 

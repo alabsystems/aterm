@@ -198,7 +198,7 @@ fn read_pid(file: &Path) -> Option<u32> {
     }
     let opened = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(file)
         .ok()?;
     let meta = opened.metadata().ok()?;

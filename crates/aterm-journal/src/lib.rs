@@ -10,6 +10,10 @@
 //! the prefix the checkpoint attests ([`read_committed`]).
 #![forbid(unsafe_code)]
 #![cfg(unix)]
+#![cfg_attr(
+    all(unix, anchor_rules, any(test, debug_assertions)),
+    feature(macro_attr)
+)]
 
 use astream_broker::{BrokerLog, BrokerRecord, Durability, OpenOptions as LogOptions, Prepared};
 use astream_wire::Offset;
@@ -58,6 +62,11 @@ pub struct Limits {
 }
 struct Layout {
     name: String,
+    anchor: String,
+    astream: String,
+    checkpoint: String,
+    lock: String,
+    archive_prefix: String,
     limits: Limits,
 }
 impl Layout {
@@ -78,14 +87,13 @@ impl Layout {
         }
         Ok(Self {
             name: name.into(),
+            anchor: format!("{name}.anchor"),
+            astream: format!("{name}.astream"),
+            checkpoint: format!("{name}.checkpoint"),
+            lock: format!("{name}.lock"),
+            archive_prefix: format!("{name}-"),
             limits,
         })
-    }
-    fn file(&self, suffix: &str) -> String {
-        format!("{}.{suffix}", self.name)
-    }
-    fn archive_prefix(&self) -> String {
-        format!("{}-", self.name)
     }
 }
 
@@ -103,7 +111,8 @@ pub struct Log {
     pending_anchor: Option<Vec<u8>>,
     anchor: Vec<u8>,
     identity: (u64, u64),
-    writer: WriterLock,
+    writer_identity: (u64, u64),
+    _writer: WriterLock,
 }
 impl Log {
     /// Local directory supplied when this exclusive journal was opened. This
@@ -135,6 +144,54 @@ impl Log {
     /// # Errors
     /// Returns [`Self::open`]'s errors, including `WouldBlock` if the local writer
     /// remains active at the deadline.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalOpen",
+            action = "Missing",
+            reason = "The environment removes the checkpoint before opening"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalOpen",
+            action = "Corrupt",
+            reason = "The environment changes the checkpoint digest before opening"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalOpen",
+            action = "Unenroll",
+            reason = "The caller permits fresh enrollment and the anchor is absent"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalOpen",
+            action = "FailBarrier",
+            reason = "A required directory durability barrier fails in the environment"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "JournalOpen",
+            action = "FailEarly",
+            reason = "The admission directory barrier fails before checkpoint publication"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "JournalOpen",
+            action = "Open",
+            project = "aterm_journal::open_tests::transition"
+        )
+    )]
     pub fn open_until(
         dir: &Path,
         name: &str,
@@ -144,9 +201,11 @@ impl Log {
         deadline: Instant,
     ) -> io::Result<Self> {
         let layout = Layout::new(name, anchor, limits)?;
-        let lock = lock(dir, &layout, deadline)
+        let (lock, writer_identity) = lock(dir, &layout, deadline)
             .map_err(|error| stage_error(&layout, "writer admission", error))?;
-        let fresh = match private_file::read_private(dir, &layout.file("anchor"), 4096) {
+        let judged = private_file::JudgedDir::judge(dir)
+            .map_err(|_| io::Error::other("journal anchor is not private"))?;
+        let fresh = match judged.read(&layout.anchor, 4096) {
             Ok(bytes) if bytes == anchor => false,
             Ok(_) => return Err(io::Error::other("journal anchor changed")),
             Err(PrivateFileError::Missing) if !established => true,
@@ -155,10 +214,10 @@ impl Log {
             }
             Err(_) => return Err(io::Error::other("journal anchor is not private")),
         };
-        match private_file::open_private(dir, &layout.file("astream")) {
+        match judged.open(&layout.astream) {
             Ok(_) => {}
             Err(PrivateFileError::Missing) if fresh => {
-                write_private_durable(dir, &layout.file("astream"), &[])?
+                write_private_durable(dir, &layout.astream, &[])?
             }
             Err(_) => return Err(io::Error::other("journal is not a private regular file")),
         }
@@ -166,28 +225,27 @@ impl Log {
             .map_err(|error| stage_error(&layout, "recovery", error))?;
         let mut checkpoint = None;
         let log = BrokerLog::open_opts(
-            dir.join(layout.file("astream")),
+            dir.join(&layout.astream),
             LogOptions::new(Durability::Strict),
             || {
-                let checked = Checkpoint::load(dir, &layout, fresh)?;
-                let (_, metadata) = private_file::open_private(dir, &layout.file("astream"))
-                    .map_err(|_| io::Error::other("journal is not private"))?;
+                let (checked, present, metadata) = Checkpoint::load(dir, &layout, fresh)?;
                 if metadata.len() != checked.length || (metadata.dev(), metadata.ino()) != identity
                 {
                     return Err(io::Error::other("journal changed between its writer locks"));
                 }
-                checkpoint = Some(checked);
+                checkpoint = Some((checked, present));
                 Ok(Prepared::Nothing)
             },
         )
         .map_err(|error| stage_error(&layout, "astream open", error))?;
-        let mut checkpoint =
+        let (checkpoint, present) =
             checkpoint.ok_or_else(|| io::Error::other("journal was not prepared"))?;
         let stats = log.stats();
         if stats.retained_bytes > limits.bytes
             || stats.retained_records > limits.records
             || stats.base != Offset::ZERO
             || stats.head.0 != stats.retained_records as u64
+            || stats.retained_bytes as u64 != checkpoint.length
         {
             return Err(io::Error::other(
                 "journal capacity or unretained prefix is invalid",
@@ -216,10 +274,13 @@ impl Log {
             }
             scan = Offset(scan.0 + page.len() as u64);
         }
-        checkpoint.extend(dir, &layout, stats.retained_bytes as u64)?;
-        checkpoint.save(dir, &layout)?;
-        let (_, metadata) = private_file::open_private(dir, &layout.file("astream"))
+        if !present {
+            checkpoint.save(dir, &layout)?;
+        }
+        let (_, metadata) = private_file::open_private(dir, &layout.astream)
             .map_err(|_| io::Error::other("journal lost its private inode"))?;
+        // An existing checkpoint may be visible after its previous writer failed the
+        // rename's directory barrier. Finish that publication even without rewriting it.
         aterm_durable::durable_dir(dir)?;
         if (metadata.dev(), metadata.ino()) != identity {
             return Err(io::Error::other("journal inode changed during open"));
@@ -233,7 +294,8 @@ impl Log {
             pending_anchor: fresh.then(|| anchor.to_vec()),
             anchor: anchor.to_vec(),
             identity,
-            writer: lock,
+            writer_identity,
+            _writer: lock,
         };
         opened.intact()?;
         Ok(opened)
@@ -246,7 +308,7 @@ impl Log {
     pub fn finish_open(&mut self) -> io::Result<()> {
         self.intact()?;
         if let Some(anchor) = &self.pending_anchor {
-            write_private_durable(&self.dir, &self.layout.file("anchor"), anchor)?;
+            write_private_durable(&self.dir, &self.layout.anchor, anchor)?;
             self.pending_anchor = None;
         }
         Ok(())
@@ -261,25 +323,21 @@ impl Log {
         let dir = private_file::JudgedDir::judge(&self.dir)
             .map_err(|_| io::Error::other("journal lost its private inode"))?;
         let (_, metadata) = dir
-            .open(&self.layout.file("astream"))
+            .open(&self.layout.astream)
             .map_err(|_| io::Error::other("journal lost its private inode"))?;
         let (_, lock) = dir
-            .open(&self.layout.file("lock"))
+            .open(&self.layout.lock)
             .map_err(|_| io::Error::other("journal lost its writer lease"))?;
-        let held = self.writer.0.metadata()?;
-        let anchor_ok = match dir.read(&self.layout.file("anchor"), 4096) {
+        let anchor_ok = match dir.read(&self.layout.anchor, 4096) {
             Ok(bytes) => bytes == self.anchor,
             Err(PrivateFileError::Missing) => self.pending_anchor.is_some(),
             Err(_) => false,
         };
         if (metadata.dev(), metadata.ino()) != self.identity
             || metadata.len() != self.log.stats().retained_bytes as u64
-            || (lock.dev(), lock.ino()) != (held.dev(), held.ino())
+            || (lock.dev(), lock.ino()) != self.writer_identity
             || !anchor_ok
-            || dir
-                .read(&self.layout.file("checkpoint"), 40)
-                .ok()
-                .as_deref()
+            || dir.read(&self.layout.checkpoint, 40).ok().as_deref()
                 != Some(&self.checkpoint.bytes())
         {
             return Err(io::Error::other("journal or writer lease was replaced"));
@@ -475,7 +533,7 @@ pub fn read_committed(
     // One directory verdict for the three files, as in `Log::intact`.
     let judged = private_file::JudgedDir::judge(dir)
         .map_err(|_| io::Error::other("journal anchor is not private"))?;
-    match judged.read(&layout.file("anchor"), 4096) {
+    match judged.read(&layout.anchor, 4096) {
         Ok(bytes) if bytes == anchor => {}
         Ok(_) => return Err(io::Error::other("journal anchor changed")),
         Err(PrivateFileError::Missing) => {
@@ -490,9 +548,7 @@ pub fn read_committed(
     let malformed = || io::Error::other("journal checkpoint is malformed or not private");
     let mut relinked = 0;
     let checkpoint = loop {
-        let (file, _) = judged
-            .open(&layout.file("checkpoint"))
-            .map_err(|_| malformed())?;
+        let (file, _) = judged.open(&layout.checkpoint).map_err(|_| malformed())?;
         #[cfg(test)]
         tests::read_step(tests::Reading::Opened);
         let mut bytes = Vec::with_capacity(41);
@@ -529,7 +585,7 @@ pub fn read_committed(
     #[cfg(test)]
     tests::read_step(tests::Reading::Checkpointed);
     let (mut file, metadata) = judged
-        .open(&layout.file("astream"))
+        .open(&layout.astream)
         .map_err(|_| io::Error::other("journal is not a private regular file"))?;
     if metadata.len() < length {
         return Err(io::Error::other("journal lost acknowledged bytes"));
@@ -655,21 +711,23 @@ impl Drop for WriterLock {
         let _ = self.0.unlock();
     }
 }
-fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<WriterLock> {
+fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<(WriterLock, (u64, u64))> {
     create_private_dir_durable(dir)?;
     match OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(dir.join(layout.file("lock")))
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+        .open(dir.join(&layout.lock))
     {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
-    let (file, metadata) =
-        aterm_uds::kept_out(|| private_file::open_private(dir, &layout.file("lock")))
-            .map_err(|_| io::Error::other("journal lock is not private"))?;
+    let judged = private_file::JudgedDir::judge(dir)
+        .map_err(|_| io::Error::other("journal lock is not private"))?;
+    let (file, metadata) = aterm_uds::kept_out(|| judged.open(&layout.lock))
+        .map_err(|_| io::Error::other("journal lock is not private"))?;
     aterm_uds::file_lock::lock_exclusive_until_with(
         &file,
         deadline,
@@ -680,12 +738,13 @@ fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<WriterLock
         },
     )?;
     let lock = WriterLock(file);
-    let (_, current) = private_file::open_private(dir, &layout.file("lock"))
+    let writer_identity = (metadata.dev(), metadata.ino());
+    let (_, current) = private_file::open_private(dir, &layout.lock)
         .map_err(|_| io::Error::other("journal lock is not private"))?;
-    if (current.dev(), current.ino()) != (metadata.dev(), metadata.ino()) {
+    if (current.dev(), current.ino()) != writer_identity {
         return Err(io::Error::other("journal lock changed while acquiring it"));
     }
-    Ok(lock)
+    Ok((lock, writer_identity))
 }
 
 fn lock_error(error: std::fs::TryLockError) -> io::Error {
@@ -714,44 +773,61 @@ struct Checkpoint {
     hash: aterm_digest::Sha256,
 }
 impl Checkpoint {
-    fn load(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<Self> {
+    fn load(
+        dir: &Path,
+        layout: &Layout,
+        fresh: bool,
+    ) -> io::Result<(Self, bool, std::fs::Metadata)> {
         let mut checkpoint = Self {
             length: 0,
             hash: aterm_digest::Sha256::new(),
         };
-        match private_file::read_private(dir, &layout.file("checkpoint"), 40) {
+        let judged = private_file::JudgedDir::judge(dir)
+            .map_err(|_| io::Error::other("journal checkpoint is malformed or not private"))?;
+        match judged.read(&layout.checkpoint, 40) {
             Ok(bytes) if bytes.len() == 40 => {
                 let length = u64::from_le_bytes(
                     bytes[..8]
                         .try_into()
                         .map_err(|_| io::Error::other("invalid journal checkpoint"))?,
                 );
-                checkpoint.extend(dir, layout, length)?;
+                let metadata = checkpoint.extend_in(&judged, layout, length)?;
                 if checkpoint.hash.clone().finalize() != bytes[8..] {
                     return Err(io::Error::other(
                         "acknowledged journal history changed; preserve it for authenticated repair",
                     ));
                 }
+                Ok((checkpoint, true, metadata))
             }
             Err(PrivateFileError::Missing) if fresh => {
-                let (_, metadata) = private_file::open_private(dir, &layout.file("astream"))
+                let (_, metadata) = judged
+                    .open(&layout.astream)
                     .map_err(|_| io::Error::other("journal is not private"))?;
                 if metadata.len() != 0 {
                     return Err(io::Error::other(
                         "nonempty journal has no acknowledgement checkpoint",
                     ));
                 }
+                Ok((checkpoint, false, metadata))
             }
-            _ => {
-                return Err(io::Error::other(
-                    "journal checkpoint is malformed or not private",
-                ));
-            }
+            _ => Err(io::Error::other(
+                "journal checkpoint is malformed or not private",
+            )),
         }
-        Ok(checkpoint)
     }
     fn extend(&mut self, dir: &Path, layout: &Layout, length: u64) -> io::Result<()> {
-        let (mut file, metadata) = private_file::open_private(dir, &layout.file("astream"))
+        let judged = private_file::JudgedDir::judge(dir)
+            .map_err(|_| io::Error::other("journal is not private"))?;
+        self.extend_in(&judged, layout, length).map(|_| ())
+    }
+    fn extend_in(
+        &mut self,
+        judged: &private_file::JudgedDir<'_>,
+        layout: &Layout,
+        length: u64,
+    ) -> io::Result<std::fs::Metadata> {
+        let (mut file, metadata) = judged
+            .open(&layout.astream)
             .map_err(|_| io::Error::other("journal is not private"))?;
         if length < self.length
             || length > layout.limits.bytes as u64
@@ -777,7 +853,7 @@ impl Checkpoint {
             remaining -= count as u64;
         }
         self.length = length;
-        Ok(())
+        Ok(metadata)
     }
     fn bytes(&self) -> [u8; 40] {
         let mut bytes = [0; 40];
@@ -786,7 +862,7 @@ impl Checkpoint {
         bytes
     }
     fn save(&self, dir: &Path, layout: &Layout) -> io::Result<()> {
-        write_private_durable(dir, &layout.file("checkpoint"), &self.bytes())
+        write_private_durable(dir, &layout.checkpoint, &self.bytes())
     }
 }
 
@@ -795,14 +871,14 @@ impl Checkpoint {
 /// writer and the physical file are both locked while this happens; astream's
 /// prepare callback rechecks the prefix after taking over the physical lock.
 fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(u64, u64)> {
-    let (_, admitted) = private_file::open_private(dir, &layout.file("astream"))
+    let (_, admitted) = private_file::open_private(dir, &layout.astream)
         .map_err(|_| io::Error::other("journal is not private"))?;
     let file = aterm_uds::kept_out(|| {
         OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(dir.join(layout.file("astream")))
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(dir.join(&layout.astream))
     })?;
     let opened = file.metadata()?;
     if opened.dev() != admitted.dev()
@@ -820,9 +896,7 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
         .map_err(lock_error)
         .map_err(|error| stage_error(layout, "physical recovery lock", error))?;
     let mut held = WriterLock(file);
-    let checkpoint = Checkpoint::load(dir, layout, fresh)?;
-    let (_, checked) = private_file::open_private(dir, &layout.file("astream"))
-        .map_err(|_| io::Error::other("journal is not private"))?;
+    let (checkpoint, _, checked) = Checkpoint::load(dir, layout, fresh)?;
     if checked.dev() != opened.dev() || checked.ino() != opened.ino() {
         return Err(io::Error::other(
             "journal changed while its prefix was checked",
@@ -853,14 +927,17 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
     held.0.read_exact(&mut tail)?;
     let name = format!(
         "{}uncommitted-{}",
-        layout.archive_prefix(),
+        layout.archive_prefix,
         aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&tail))
     );
-    match private_file::read_private(dir, &name, max_journal_bytes) {
+    let judged = private_file::JudgedDir::judge(dir)
+        .map_err(|_| io::Error::other("journal suffix archive is corrupt or not private"))?;
+    match judged.read(&name, max_journal_bytes) {
         Ok(old) if old == tail => {}
         Err(PrivateFileError::Missing) => {
             let mut bytes = tail.len() as u64;
             let mut archives = 0;
+            let uncommitted_prefix = format!("{}uncommitted-", layout.archive_prefix);
             for (count, entry) in std::fs::read_dir(dir)?.enumerate() {
                 if count >= layout.limits.records.saturating_add(32) {
                     return Err(io::Error::other("journal directory exceeds its entry cap"));
@@ -868,14 +945,15 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
                 let entry = entry?;
                 let file_name = entry.file_name();
                 let file_name = file_name.to_string_lossy();
-                if !file_name.starts_with(&format!("{}uncommitted-", layout.archive_prefix())) {
+                if !file_name.starts_with(&uncommitted_prefix) {
                     continue;
                 }
                 archives += 1;
                 if archives >= layout.limits.records {
                     return Err(io::Error::other("journal archive entry capacity exhausted"));
                 }
-                let (_, metadata) = private_file::open_private(dir, &file_name)
+                let (_, metadata) = judged
+                    .open(&file_name)
                     .map_err(|_| io::Error::other("journal suffix archive is not private"))?;
                 bytes = bytes.saturating_add(metadata.len());
             }
@@ -900,5 +978,7 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
     Ok((opened.dev(), opened.ino()))
 }
 
+#[cfg(test)]
+mod open_tests;
 #[cfg(test)]
 mod tests;

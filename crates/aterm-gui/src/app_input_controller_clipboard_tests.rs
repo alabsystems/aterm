@@ -15,6 +15,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use aterm_session::sink::SinkWriter;
+use aterm_window::event::InputOrigin;
 
 use crate::app_take_over::CLIPBOARD_REFUSED;
 use crate::input::{InputEvent, Source};
@@ -514,7 +515,7 @@ fn a_selection_a_controller_started_or_steered_copies_nothing_on_the_persons_rel
 /// A key event as `-[NSApp currentEvent]` names it while it is dispatched, with a stamp no other
 /// key in this thread has: one an `hwkey` burst posted (`posted`, noted in its ledger first, as
 /// `hwkey::post` notes it) or the person's.
-fn current_key(keycode: u16, posted: bool) -> crate::hwkey::PostedKey {
+fn current_key(keycode: u16, posted: bool) -> crate::hwkey::NativeInput {
     thread_local! {
         static STAMPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
@@ -522,10 +523,11 @@ fn current_key(keycode: u16, posted: bool) -> crate::hwkey::PostedKey {
         stamps.set(stamps.get() + 1);
         stamps.get()
     });
-    let key = crate::hwkey::PostedKey {
+    let key = crate::hwkey::NativeInput {
         kind: crate::hwkey::NS_EVENT_TYPE_KEY_DOWN,
         keycode,
         timestamp: 1000.0 + f64::from(stamp),
+        source_pid: crate::hwkey::HID_SYSTEM,
     };
     if posted {
         crate::hwkey::note_posted(&[key]).expect("room");
@@ -534,17 +536,17 @@ fn current_key(keycode: u16, posted: bool) -> crate::hwkey::PostedKey {
 }
 
 /// Run `f` while `key` is the event AppKit is dispatching (the test build's stand-in).
-fn dispatching<R>(key: crate::hwkey::PostedKey, f: impl FnOnce() -> R) -> R {
-    crate::hwkey::CURRENT_KEY_STUB.with(|current| current.set(Some(key)));
+fn dispatching<R>(key: crate::hwkey::NativeInput, f: impl FnOnce() -> R) -> R {
+    crate::hwkey::CURRENT_INPUT_STUB.with(|current| current.set(Some(key)));
     let out = f();
-    crate::hwkey::CURRENT_KEY_STUB.with(|current| current.set(None));
+    crate::hwkey::CURRENT_INPUT_STUB.with(|current| current.set(None));
     out
 }
 
 /// One press of `ch` with `mods` held through the winit key arm's dispatch
 /// ([`App::dispatch_hw_key`], the path a physical key and an `hwkey` post both take): an `hwkey`
 /// burst's (`posted`) or the person's, told apart as the event arrives
-/// (`crate::arriving_key_posted`).
+/// (`crate::arriving_input_origin`).
 fn hw_key(app: &mut App, ch: &str, mods: aterm_window::keyboard::ModifiersState, posted: bool) {
     use aterm_window::event::{ElementState, KeyEvent};
     use aterm_window::keyboard::{
@@ -573,8 +575,8 @@ fn hw_key(app: &mut App, ch: &str, mods: aterm_window::keyboard::ModifiersState,
         is_synthetic: false,
     };
     dispatching(current_key(keycode, posted), || {
-        let posted = crate::arriving_key_posted(&arrived);
-        app.dispatch_hw_key(WID, event, posted);
+        let origin = crate::arriving_input_origin(&arrived);
+        app.dispatch_hw_key(WID, event, origin);
     });
     app.windows.get_mut(&WID).unwrap().mods = ModifiersState::empty();
 }
@@ -658,11 +660,16 @@ fn posted_ime_callbacks_deliver_text_without_claiming_a_person_typed() {
             let _ = program_read(&mut reader, &sink);
             let deliver = |app: &mut App, ime: Ime| {
                 // The callback's retained verdict wins over the opposite ambient key.
+                let origin = if posted {
+                    InputOrigin::Posted
+                } else {
+                    InputOrigin::Person
+                };
                 dispatching(current_key(7, !posted), || {
-                    crate::hwkey::with_window_event_posted_for_test(posted, || {
+                    crate::hwkey::with_window_event_origin_for_test(origin, || {
                         let event = WindowEvent::Ime(ime.clone());
-                        let arrived = crate::arriving_key_posted(&event);
-                        assert_eq!(arrived, posted);
+                        let arrived = crate::arriving_input_origin(&event);
+                        assert_eq!(arrived, origin);
                         app.note_window_input_arrival(&event, arrived);
                         app.dispatch_ime_event(WID, ime, arrived);
                     });
@@ -824,7 +831,7 @@ fn a_key_hwkey_posted_answers_no_in_window_question() {
 /// AN EDIT ITEM A KEY `hwkey` POSTED CHOSE REACHES NO CLIPBOARD: ⌘V and ⌘C reach Edit ▸ Paste and
 /// Copy by their key equivalents, whose native relay posts the item to the event loop; the relay
 /// asks whether the key being dispatched is one a burst posted
-/// ([`crate::tab_spawn::native_post_by_controller`]), so that item runs marked
+/// ([`crate::tab_spawn::native_post_origin`]), so that item runs marked
 /// ([`App::run_posted_menu_action`]): its Paste sends no clipboard and its Copy writes none, and
 /// both answer why. The person's items paste and copy.
 /// NEGATIVE CONTROL: with the relay posting no mark (as on main, `147b22abdc`), the posted ⌘V's
@@ -836,15 +843,16 @@ fn an_edit_item_a_key_hwkey_posted_chose_reaches_no_clipboard() {
     let _ = program_read(&mut reader, &sink);
     let item = |app: &mut App, action: MenuAction, keycode: u16, posted: bool| {
         app.pending_action_refusal = None;
-        let by_controller = dispatching(
+        let by = dispatching(
             current_key(keycode, posted),
-            crate::tab_spawn::native_post_by_controller,
+            crate::tab_spawn::native_post_origin,
         );
-        let gesture = crate::app_take_over::GestureMarks {
-            controller: by_controller,
-            assistive: false,
-        };
-        app.run_posted_menu_action(action, None, gesture, edit_menu_body);
+        app.run_posted_menu_action(
+            action,
+            None,
+            crate::app_take_over::GestureMarks::of(by),
+            edit_menu_body,
+        );
     };
 
     item(&mut app, MenuAction::Paste, 9, true);
@@ -877,6 +885,95 @@ fn an_edit_item_a_key_hwkey_posted_chose_reaches_no_clipboard() {
     let sent = program_read(&mut reader, &sink);
     assert!(sent.contains(SECRET), "the person's Paste sent {sent:?}");
     assert_eq!(app.pending_action_refusal, None);
+    set_board(None);
+}
+
+/// ANOTHER PROCESS'S KEY OR CLICK STILL REACHES THE PERSON'S CLIPBOARD: a key or click whose
+/// native source is another process is a person's own relay as often as a program's (Screen
+/// Sharing, the on-screen Accessibility Keyboard, Voice Control, a remapper that posts events), so
+/// it carries the relayed mark, which fences only the owner's keys: its ⌘V by the key path and its
+/// click on Edit ▸ Paste paste the clipboard, its Edit ▸ Copy copies, and none is refused; an
+/// `hwkey` burst's ⌘V beside them is.
+/// NEGATIVE CONTROL: with the relayed mark taken as the controller mark, as the branch had it at
+/// `a2f973cd8f`, the relayed ⌘V sent nothing (`App::with_origin_mark` marking the key as a
+/// burst's), and so did the relayed click's Paste (`App::with_gesture_marks` marking the item).
+#[test]
+fn another_processs_key_or_click_still_reaches_the_persons_clipboard() {
+    use aterm_window::keyboard::ModifiersState;
+    let (mut app, mut reader, sink) = app_reading_pty();
+    set_board(Some(SECRET));
+    let _ = program_read(&mut reader, &sink);
+    let elsewhere = i64::from(std::process::id()) + 1;
+    let relayed = |kind: usize, keycode: u16| crate::hwkey::NativeInput {
+        kind,
+        source_pid: elsewhere,
+        ..current_key(keycode, false)
+    };
+
+    app.windows.get_mut(&WID).unwrap().mods = ModifiersState::SUPER;
+    let event = aterm_window::event::KeyEvent::synthetic_for_test(
+        aterm_window::keyboard::PhysicalKey::Code(aterm_window::keyboard::KeyCode::KeyV),
+        aterm_window::keyboard::Key::Character("v".into()),
+        Some("v".into()),
+        aterm_window::keyboard::KeyLocation::Standard,
+        aterm_window::event::ElementState::Pressed,
+        false,
+    );
+    let arrived = aterm_window::event::WindowEvent::KeyboardInput {
+        device_id: aterm_window::event::DeviceId::dummy(),
+        event: event.clone(),
+        is_synthetic: false,
+    };
+    app.pending_action_refusal = None;
+    dispatching(relayed(crate::hwkey::NS_EVENT_TYPE_KEY_DOWN, 9), || {
+        let origin = crate::arriving_input_origin(&arrived);
+        assert_eq!(origin, InputOrigin::Relayed);
+        app.dispatch_hw_key(WID, event, origin);
+    });
+    app.windows.get_mut(&WID).unwrap().mods = ModifiersState::empty();
+    if crate::app_input::HARDCODED_SUPER_CHORDS {
+        let sent = program_read(&mut reader, &sink);
+        assert!(sent.contains(SECRET), "the relayed ⌘V sent {sent:?}");
+    }
+    assert_eq!(app.pending_action_refusal, None, "the relayed ⌘V");
+
+    let click = |app: &mut App, action: MenuAction| {
+        app.pending_action_refusal = None;
+        let by = dispatching(
+            relayed(crate::hwkey::NS_EVENT_TYPE_LEFT_MOUSE_UP, 0),
+            crate::tab_spawn::native_post_origin,
+        );
+        assert_eq!(by, InputOrigin::Relayed);
+        app.run_posted_menu_action(
+            action,
+            None,
+            crate::app_take_over::GestureMarks::of(by),
+            edit_menu_body,
+        );
+    };
+    click(&mut app, MenuAction::Paste);
+    let sent = program_read(&mut reader, &sink);
+    assert!(
+        sent.contains(SECRET),
+        "the relayed click's Paste sent {sent:?}"
+    );
+    assert_eq!(app.pending_action_refusal, None, "the relayed Paste");
+    let term = app
+        .front_terminal(WID)
+        .expect("a front terminal")
+        .term
+        .clone();
+    crate::term_lock(&term).process(b"on-screen words\r\n");
+    select_top_line(&mut app);
+    let selected = app.window_selection_text(WID).expect("a selection");
+    click(&mut app, MenuAction::Copy);
+    assert_eq!(board(), Some(selected), "the relayed click's Copy");
+    assert_eq!(app.pending_action_refusal, None, "the relayed Copy");
+
+    set_board(Some(SECRET));
+    hw_key(&mut app, "v", ModifiersState::SUPER, true);
+    let sent = program_read(&mut reader, &sink);
+    assert!(!sent.contains(SECRET), "hwkey's ⌘V sent {sent:?}");
     set_board(None);
 }
 

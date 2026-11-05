@@ -10,15 +10,15 @@ const CONVERSATION: &str = "conversation-a";
 const BORN: u64 = 100;
 const NOW: i64 = 200;
 
-struct Prepared {
-    fixture: Fixture,
-    old: accounts::Row,
-    current: accounts::Row,
-    retained: AccountProgress,
-    context: AccountActivityContext,
+pub(super) struct Prepared {
+    pub(super) fixture: Fixture,
+    pub(super) old: accounts::Row,
+    pub(super) current: accounts::Row,
+    pub(super) retained: AccountProgress,
+    pub(super) context: AccountActivityContext,
 }
 
-fn set_off(fixture: &Fixture, off: bool) {
+pub(super) fn set_off(fixture: &Fixture, off: bool) {
     publish_off(
         &fixture.host.shared,
         &Workers::default(),
@@ -39,7 +39,7 @@ fn set_off(fixture: &Fixture, off: bool) {
 }
 
 // 0 keeps the normal policy; 1 is Off; 2 resumed without another account judgment.
-fn prepare(retirement: u8, execution_until: Option<Instant>) -> Prepared {
+pub(super) fn prepare(retirement: u8, execution_until: Option<Instant>) -> Prepared {
     let fixture = Fixture::new();
     fixture.refresh(false);
     let old = fixture.row();
@@ -129,7 +129,7 @@ fn prepare(retirement: u8, execution_until: Option<Instant>) -> Prepared {
     }
 }
 
-fn entry(row: &accounts::Row, active: bool) -> LoginActivity {
+pub(super) fn entry(row: &accounts::Row, active: bool) -> LoginActivity {
     LoginActivity {
         label: row.label.clone(),
         route: Some("mailbox".into()),
@@ -141,7 +141,7 @@ fn entry(row: &accounts::Row, active: bool) -> LoginActivity {
     }
 }
 
-fn read(
+pub(super) fn read(
     prepared: &Prepared,
     clock: Instant,
     entries: Option<Vec<LoginActivity>>,
@@ -164,7 +164,7 @@ fn read(
     )
 }
 
-fn assert_retained(prepared: &Prepared) {
+pub(super) fn assert_retained(prepared: &Prepared) {
     let kept = prepared.fixture.kept.lock().unwrap();
     let decision = kept
         .account
@@ -187,7 +187,7 @@ fn assert_retained(prepared: &Prepared) {
     assert_eq!(context.rows, prepared.context.rows);
 }
 
-fn files(prepared: &Prepared) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+pub(super) fn files(prepared: &Prepared) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     let store = accounts::Store::at(&prepared.fixture.seat.state);
     [
         store.state_file(),
@@ -237,7 +237,8 @@ pub(in crate::harness_host) fn retired_activity_observation(
     context_present: bool,
     activity_kind: i64,
     resumed: bool,
-) -> [i64; 8] {
+    diagnostic_variant: u8,
+) -> [i64; 9] {
     assert!(matches!(normal, 1 | 2));
     let retirement = if normal == 1 {
         0
@@ -264,13 +265,32 @@ pub(in crate::harness_host) fn retired_activity_observation(
         )
     };
     let images = files(&prepared);
-    let entries = match activity_kind {
+    let mut entries = match activity_kind {
         0 => Some(Vec::new()),
         1 => Some(vec![entry(&prepared.current, true)]),
         2 => None,
         3 => Some(vec![entry(&prepared.current, false)]),
         _ => unreachable!(),
     };
+    if let Some(entries) = &mut entries {
+        for entry in entries {
+            match diagnostic_variant {
+                0 => {}
+                1 => entry.diagnostic = None,
+                2 => entry.diagnostic.as_mut().unwrap().completed_at = 0,
+                3 => entry.diagnostic.as_mut().unwrap().completed_at = NOW + 1,
+                4 => {
+                    entry.diagnostic = Some(LoginDiagnostic::from_exit_for_test(
+                        &prepared.old,
+                        NOW - 1,
+                        1,
+                        None,
+                    ))
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
     let result = read(&prepared, Instant::now(), entries);
     let unavailable = result.is_err();
     let value = result.ok().and_then(|read| read.progress);
@@ -312,6 +332,11 @@ pub(in crate::harness_host) fn retired_activity_observation(
         i64::from(value.as_ref().is_none_or(|value| {
             value.account == prepared.retained.account && value.known == prepared.retained.known
         })),
+        i64::from(
+            value
+                .as_ref()
+                .is_some_and(|value| !value.independent_work.is_empty()),
+        ),
     ]
 }
 
@@ -338,6 +363,10 @@ fn a_retired_normal_decision_does_not_hide_its_current_contexts_actual_sign_in()
         assert_eq!(value.account, prepared.retained.account);
         assert_eq!(value.known, prepared.retained.known);
         assert_eq!(value.wall, prepared.retained.wall);
+        assert!(
+            value.independent_work.is_empty(),
+            "the primary phase already represents this same-scope worker"
+        );
         assert_eq!(read.execution_until, None);
         assert_retained(&prepared);
         assert_eq!(files(&prepared), images);
@@ -349,7 +378,16 @@ fn a_policy_current_normal_decision_keeps_its_captured_account_priority() {
     let prepared = prepare(0, None);
     let clock = Instant::now();
     let current = read(&prepared, clock, Some(vec![entry(&prepared.current, true)])).unwrap();
-    assert_eq!(current.progress, Some(prepared.retained.clone()));
+    let value = current.progress.as_ref().unwrap();
+    assert_eq!(independent_work_tests::primary(value), prepared.retained);
+    assert_eq!(
+        value.independent_work,
+        [independent_work_tests::expected_work(
+            &prepared.current,
+            NOW
+        )]
+    );
+    assert!(current.retry());
     let old = read(&prepared, clock, Some(vec![entry(&prepared.old, true)]))
         .unwrap()
         .progress
@@ -358,6 +396,7 @@ fn a_policy_current_normal_decision_keeps_its_captured_account_priority() {
     assert!(!old.forecasts_paused);
     assert_eq!(old.eligible, prepared.retained.eligible);
     assert_eq!(old.next_at, Some(NOW + 60));
+    assert!(old.independent_work.is_empty());
     assert_retained(&prepared);
 }
 
@@ -418,7 +457,7 @@ fn retired_normal_activity_still_requires_a_current_exact_unambiguous_identity()
 }
 
 #[test]
-fn empty_or_inactive_current_context_keeps_only_the_paused_decision_history() {
+fn settled_current_context_adds_only_its_diagnostic_to_paused_decision_history() {
     for retirement in [1, 2] {
         let prepared = prepare(retirement, None);
         let clock = Instant::now();
@@ -430,13 +469,14 @@ fn empty_or_inactive_current_context_keeps_only_the_paused_decision_history() {
         assert!(baseline.forecasts_paused);
         assert_eq!(baseline.eligible, None);
         assert_eq!(baseline.next_at, None);
-        let inactive = read(
-            &prepared,
-            clock,
-            Some(vec![entry(&prepared.current, false)]),
-        )
-        .unwrap();
-        assert_eq!(inactive.progress, Some(baseline));
+        let completed = entry(&prepared.current, false);
+        let diagnostic = completed.diagnostic.clone().unwrap();
+        let inactive = read(&prepared, clock, Some(vec![completed])).unwrap();
+        let mut expected = baseline;
+        expected.login_diagnostics.push(diagnostic);
+        assert_eq!(inactive.progress, Some(expected));
+        assert!(!inactive.retry());
+        assert_eq!(inactive.next_poll(clock), None);
         assert_retained(&prepared);
     }
 }
@@ -471,7 +511,14 @@ fn a_live_execution_lease_keeps_its_context_and_actual_deadline_while_off() {
     assert_eq!(value.eligible, None);
     assert_eq!(value.next_at, prepared.retained.next_at);
     assert_eq!(read.execution_until, Some(until));
-    assert_eq!(read.next_poll(clock), Some(until));
+    assert_eq!(
+        value.independent_work,
+        [independent_work_tests::expected_work(
+            &prepared.current,
+            NOW
+        )]
+    );
+    assert_eq!(read.next_poll(clock), Some(clock + Duration::from_secs(1)));
     assert_retained(&prepared);
     assert_eq!(files(&prepared), images);
 }

@@ -431,23 +431,16 @@ fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
     eprintln!("aterm link ls:\n{ls}");
 }
 
-/// The line that runs the command `name` ([`marked_line`]), a program that
-/// waits on stdin, with `name`, a copy of `/bin/bash` signed ad hoc
-/// ([`harness::own_image`]), to run it: `status detail=` names only a program
-/// the kernel saw exec, and the copy's image is `name` itself, which never
-/// re-execs.
-fn write_marked_program(dir: &Path, name: &str) -> String {
-    let path = dir.join(format!("{name}.sh"));
-    std::fs::write(&path, "#!/bin/sh\nread _x\n").expect("write the marked program");
-    marked_line(dir, name, &harness::own_image(dir, name), &path)
-}
-
-/// **A `meta` CHANGE AFTER THE FIRST READ REACHES THE BUS BY THE PUSH, AND
-/// ONLY BY THE PUSH.** The roster round reads `meta` only for a slot never read
-/// (or one a `GAP` marked unread); `attention=` — the field remote notifiers and
-/// `glance` read — `role=` and `title=` move on the `EVENT <local> meta` push.
+/// **A `meta` CHANGE AFTER THE FIRST READ REACHES THE BUS BY THE PUSH, AND A
+/// DROPPED PUSH BY THE NEXT ROUND.** `attention=` — the field remote notifiers
+/// and `glance` read — `role=` and `title=` move on the `EVENT <local> meta`
+/// push. Every Ready `sessions status` row also carries the session's `role=
+/// attention= user_title=` (critic item E05), and the roster round folds them
+/// into a slot it already sampled, so a change whose push the bridge dropped
+/// (`drop-meta-event-while-marked`, which marks `fault-fired`) still reaches
+/// the bus once a round reads it.
 #[test]
-fn a_meta_change_after_the_first_read_rides_the_push_alone() {
+fn a_dropped_meta_push_reaches_the_bus_by_the_next_round() {
     let w = World::boot_with(
         "r13-meta-push",
         &[],
@@ -472,18 +465,18 @@ fn a_meta_change_after_the_first_read_rides_the_push_alone() {
 
     let marker = w.state.join("drop-meta-event");
     std::fs::write(&marker, b"1\n").expect("arm the dropped push");
+    let dropped_at = Instant::now();
     assert!(w.verb(&format!("@{sid} meta set attention dropped-b")).ok());
-    let line = write_marked_program(&w.tmp, "r13witness");
-    assert!(w.verb(&format!("@{sid} send {line}")).ok());
-    assert!(w.verb(&format!("@{sid} key enter")).ok());
-    until_field(&w, &sid, "detail", "r13witness");
-    let body = presence_body(&w, &sid).expect("the row");
-    assert_eq!(
-        kv(&body, "attention"),
-        Some("pushed-a"),
-        "a round republished the row after `meta set attention dropped-b` and must not have \
-         carried it — the push is the only path: {body}"
+    until_field(&w, &sid, "attention", "dropped-b");
+    eprintln!(
+        "MEASURED meta set attention (push dropped) -> attention= on the bus by a round: {} ms",
+        dropped_at.elapsed().as_millis()
     );
+    // The one push armed to drop was dropped, so the row above came from a
+    // round: no other path carries a meta change.
+    until("the bridge to drop the `dropped-b` push", || {
+        w.state.join("fault-fired").exists().then_some(())
+    });
 
     std::fs::remove_file(&marker).expect("disarm the dropped push");
     assert!(w.verb(&format!("@{sid} meta set attention pushed-c")).ok());

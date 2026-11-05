@@ -17,11 +17,12 @@ use crate::harness::accounts::Sample;
 use crate::harness::acts::{Act, LandHeld, LandReceipt, TaskFace};
 use crate::harness::disk::Level;
 use crate::harness::hold_said::HoldSaid;
+use crate::harness::leftover::LeftRead;
 use crate::harness::profile::AccountKey;
 use crate::harness::repo_work::{CleanAt, RepoRead, RepoWork};
 use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
-use crate::supervise::facts::{FactsReading, HeldCall, HeldReading};
+use crate::supervise::facts::{FactsReading, HeldCall, HeldReading, LeftoverReading};
 use crate::supervise::fx::Fx;
 use crate::supervise::memory::{AgentMemory, Pressure};
 use crate::supervise::occupancy::wakes::SysWait;
@@ -32,13 +33,15 @@ use crate::supervise::occupancy::{
     FactWord, NoteOutcome, OccupancyReading, OccupancySaid, PaceGrant, RuleId, SlotsSeen,
     WakeClaim, WakeDoor, WakeFacts, WakesSeen,
 };
+use crate::supervise::overlap::OverlapReading;
 use crate::supervise::policy::exception::Exception;
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::reset::{
     ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOutcome, ResetWord,
 };
 use crate::supervise::policy::turn_end::{
-    AccountAdvice, AccountBad, AccountPoint, AgentResumed, HostTurn, Reach, Restart, RestartAsk,
+    AccountAdvice, AccountBad, AccountPoint, AgentResumed, HostTurn, Reach, Restart, RestartAnswer,
+    RestartAsk, RestartClaim,
 };
 use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord, SignInNext};
 use crate::supervise::run::{
@@ -217,6 +220,30 @@ impl TapeArg for Sample {
     }
 }
 
+impl TapeArg for LandHeld {
+    fn fmt_request(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Its `Debug` as before the left leg, the left count after it only where rows held, so a
+        // tape recorded before compares as it was.
+        let mut d = f.debug_struct("LandHeld");
+        d.field("since_ms", &self.since_ms)
+            .field("nudges", &self.nudges)
+            .field("read", &self.read)
+            .field("legs", &self.legs)
+            .field("open", &self.open)
+            .field("changed", &self.changed)
+            .field("untracked", &self.untracked)
+            .field("stashes", &self.stashes)
+            .field("unpushed", &self.unpushed)
+            .field("unlanded", &self.unlanded)
+            .field("sub_unpushed", &self.sub_unpushed)
+            .field("parked", &self.parked);
+        if self.left > 0 {
+            d.field("left", &self.left);
+        }
+        d.finish()
+    }
+}
+
 /// Each type an argument of the host's may be, opted in by name: its `Debug` is the text a tape compares, and holds no `Instant`.
 macro_rules! tape_arg_debug {
     ($($t:ty),* $(,)?) => {
@@ -239,7 +266,6 @@ tape_arg_debug!(
     WaitPlan,
     Act,
     TaskFace,
-    LandHeld,
     HoldSaid,
     LandReceipt,
     Guard,
@@ -511,6 +537,25 @@ impl TapeValue for Option<aterm_phase::LoginMethod> {
                     .ok_or(bad("a login method this build does not know"))
             })
             .transpose()
+    }
+}
+
+/// What the session's settings make of `/login` ([`super::super::IdleHost::login_pin`]) on a
+/// tape: its word. A DOOR NEWER THAN THE TAPE: a recording build with no `host.login_pin` typed
+/// `/login` over every lost login, so its replay reads the picker ([`TapeValue::absent`]), where
+/// the tape's header says that build lacked the door, and only there.
+impl TapeValue for crate::supervise::policy::login::LoginPin {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.word())
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        let word = of_json::<String>(bytes)?;
+        Self::of_word(&word).ok_or(bad("a login pin this build does not know"))
+    }
+
+    fn absent() -> Option<Self> {
+        Some(Self::Picker)
     }
 }
 
@@ -818,9 +863,9 @@ impl TapeValue for BackgroundEvidence {
 }
 
 /// `facts`'s answer as a tape holds it ([`FactsReading`]): when it was taken, each call it
-/// names and its held programs, or `null` for no reading. A tape from a build before the held
-/// programs were read holds none (`held` absent), and a reading that did not read them writes
-/// none.
+/// names, its held programs and its left rows, or `null` for no reading. A tape from a build
+/// before the held programs or the left rows were read holds none (`held`, `left` absent), and a
+/// reading that did not read them writes none.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct FactsWire {
@@ -828,6 +873,18 @@ struct FactsWire {
     no_progress: Vec<CallWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     held: Option<HeldWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    left: Option<LeftoverWire>,
+}
+
+/// The agent's left rows as a tape holds them ([`LeftoverReading`]): numbers only.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct LeftoverWire {
+    as_of_ms: i64,
+    count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oldest_ms: Option<u64>,
 }
 
 /// The held programs as a tape holds them ([`HeldReading`]): when the claim was proved, and each
@@ -871,6 +928,11 @@ impl TapeValue for Option<FactsReading> {
                         .collect(),
                 }
             }),
+            left: r.left.map(|l| LeftoverWire {
+                as_of_ms: l.as_of_ms,
+                count: l.count,
+                oldest_ms: l.oldest_ms,
+            }),
         }))
     }
 
@@ -890,7 +952,50 @@ impl TapeValue for Option<FactsReading> {
                     })
                     .collect(),
             }),
+            left: w.left.map(|l| LeftoverReading {
+                as_of_ms: l.as_of_ms,
+                count: l.count,
+                oldest_ms: l.oldest_ms,
+            }),
         }))
+    }
+
+    fn absent() -> Option<Self> {
+        Some(None)
+    }
+}
+
+/// `overlap`'s answer as a tape holds it ([`OverlapReading`]): when it was read, how many files,
+/// and its peers' sids as words, or `null` for no reading. A tape's peer words are read back
+/// through the closed-template check ([`OverlapReading::new`]), so a tape that holds any other
+/// word does not read back.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct OverlapWire {
+    as_of_ms: i64,
+    files: u32,
+    peers: Vec<String>,
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.overlap` asked nothing there and
+/// typed no overlap, so its replay answers no reading ([`TapeValue::absent`]) where the tape's
+/// header says that build lacked the door, and only there.
+impl TapeValue for Option<OverlapReading> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|r| OverlapWire {
+            as_of_ms: r.as_of_ms(),
+            files: r.files(),
+            peers: r.peers().iter().map(|p| p.as_str().to_string()).collect(),
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        of_json::<Option<OverlapWire>>(bytes)?
+            .map(|w| {
+                let peers: Vec<&str> = w.peers.iter().map(String::as_str).collect();
+                OverlapReading::new(w.as_of_ms, w.files, &peers).ok_or(bad(NOT_WRITTEN))
+            })
+            .transpose()
     }
 
     fn absent() -> Option<Self> {
@@ -930,6 +1035,38 @@ impl TapeValue for Option<AgentResumed> {
 
     fn absent() -> Option<Self> {
         Some(None)
+    }
+}
+
+/// `restart`'s answer as a tape holds it ([`RestartAnswer`]): the host's word and what it read of
+/// the conversation's record ([`RestartClaim::word`]).
+#[derive(Serialize, Deserialize)]
+struct RestartWire {
+    step: String,
+    claim: String,
+}
+
+/// A tape holds the answer whole: a tape whose build answered with the word alone, which no corpus
+/// tape holds (`tests/testdata/tapes`), is one this build does not read, as the claim that build
+/// never said is what the loop goes by now; nor is a claim word this build does not know.
+impl TapeValue for Option<RestartAnswer> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|a| RestartWire {
+            step: a.step.clone(),
+            claim: a.claim.word().to_string(),
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        of_json::<Option<RestartWire>>(bytes)?
+            .map(|w| {
+                Ok(RestartAnswer {
+                    claim: RestartClaim::of_word(&w.claim)
+                        .ok_or(bad("a restart claim this build does not know"))?,
+                    step: w.step,
+                })
+            })
+            .transpose()
     }
 }
 
@@ -1555,6 +1692,50 @@ impl TapeValue for RepoRead {
                 state: w.state,
             }),
         ))
+    }
+}
+
+/// `leftover`'s answer as a tape holds it ([`LeftRead`]): `reading` while the host reads on
+/// (the door's `None`), `not-asked`, `unchecked`, or the rows' tokens as `sys left` prints them.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum LeftReadWire {
+    Reading,
+    NotAsked,
+    Unchecked,
+    Rows(Vec<String>),
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.leftover` asked nothing there, so
+/// its replay reads nothing asked ([`TapeValue::absent`]) where the tape's header says that build
+/// lacked the door, and only there.
+impl TapeValue for Option<LeftRead> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&match self {
+            None => LeftReadWire::Reading,
+            Some(LeftRead::NotAsked) => LeftReadWire::NotAsked,
+            Some(LeftRead::Unchecked) => LeftReadWire::Unchecked,
+            Some(LeftRead::Rows(rows)) => {
+                LeftReadWire::Rows(rows.iter().map(|r| r.token()).collect())
+            }
+        })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(match of_json::<LeftReadWire>(bytes)? {
+            LeftReadWire::Reading => None,
+            LeftReadWire::NotAsked => Some(LeftRead::NotAsked),
+            LeftReadWire::Unchecked => Some(LeftRead::Unchecked),
+            LeftReadWire::Rows(rows) => Some(LeftRead::Rows(
+                rows.iter()
+                    .map(|t| crate::harness::leftover::token_of(t).ok_or(bad(NOT_WRITTEN)))
+                    .collect::<Result<_, _>>()?,
+            )),
+        })
+    }
+
+    fn absent() -> Option<Self> {
+        Some(Some(LeftRead::NotAsked))
     }
 }
 

@@ -476,10 +476,23 @@ impl Device {
             (Some(After::Cut(k)), Write::Append { path, bytes }) => {
                 let len = std::fs::metadata(path).expect("the appended file").len();
                 let keep = len - bytes.len() as u64 + k as u64;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .and_then(|f| f.set_len(keep))
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+                }
+                opts.open(path)
+                    .and_then(|f| {
+                        if !f.metadata()?.is_file() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "not a regular file",
+                            ));
+                        }
+                        f.set_len(keep)
+                    })
                     .expect("cut an append short");
                 self.journal(Write::Append {
                     path,

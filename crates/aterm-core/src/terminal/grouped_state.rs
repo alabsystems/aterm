@@ -199,7 +199,7 @@ impl ColorState {
 /// The last accepted OSC 133 shell integration marker (A/B/C/D), enforcing the A→B→C→D order; out-of-order markers are ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ShellIntegrationPhase {
-    /// No marker has been accepted yet (initial state, or after reset).
+    /// No marker has been accepted yet (the initial state; a reset keeps the phase).
     #[default]
     None,
     /// Prompt start marker accepted (OSC 133 ; A).
@@ -311,19 +311,16 @@ impl ShellIntegrationState {
         }
     }
 
-    /// Reset data fields while preserving the block ID counter.
+    /// What a terminal reset takes from the shell's integration: only the input-start attestation,
+    /// which names a cell of the screen the reset erases. The rest is the shell's or the host's,
+    /// which a child's RIS (or the GUI's manual reset, which is one) does not move: where the shell
+    /// stands in its marks (state, phase and its staleness, the current mark and block), its blocks
+    /// and marks, the cwd it reported at its prompt for its next `A`, and the probe's verdict, which
+    /// a replayed journal holds nowhere else. `reset_common_fields` applies the reset's erase to the
+    /// marks as `clear` does (`note_full_clear` from home, then `forget_erased_history`), so a
+    /// running command's `D` still lands.
     #[inline]
     pub(super) fn reset(&mut self) {
-        self.state = ShellState::Ground;
-        self.phase = ShellIntegrationPhase::None;
-        self.current_mark = None;
-        self.command_marks.clear();
-        self.output_blocks.clear();
-        self.current_block = None;
-        self.held_cwd = None;
-        self.phase_stale = false;
-        self.probe_job_active = false;
-        self.probe_transitioned = false;
         self.input_start_attested = false;
     }
 

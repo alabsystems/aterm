@@ -1257,7 +1257,8 @@ pub(super) struct Lanes {
     #[cfg(all(test, unix))]
     final_replies: OnceLock<&'static super::FinalReplies>,
     /// How long a fresh connection has to make its handshake line whole
-    /// (milliseconds): `AUTH_READ_TIMEOUT`, short in the tests.
+    /// (milliseconds): `AUTH_READ_TIMEOUT`, or the short one a test sets with
+    /// `set_handshake_lifetime`.
     handshake_ms: AtomicU64,
     /// What the parked connections may hold at once, in bytes:
     /// [`PARKED_BYTES_PER_LANE`] per request lane, small in the tests.
@@ -1976,7 +1977,7 @@ impl Lanes {
 
     #[cfg(unix)]
     fn start_parker(self: &Arc<Self>) {
-        let (bell, listen) = match std::os::unix::net::UnixStream::pair() {
+        let (bell, listen) = match aterm_uds::kept_out(std::os::unix::net::UnixStream::pair) {
             Ok(pair) => pair,
             Err(error) => {
                 aterm_log::warn!("control parker has no bell: {error}");

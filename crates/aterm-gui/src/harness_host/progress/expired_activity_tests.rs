@@ -10,16 +10,16 @@ use aterm_agent::harness::accounts_sync::{LoginActivity, LoginDiagnostic, LoginI
 
 static FIXTURES: AtomicU64 = AtomicU64::new(0);
 
-struct Prepared {
-    fixture: ProgressExecutionFixture,
-    sid: String,
-    conversation: String,
-    old: accounts::Row,
-    current: accounts::Row,
-    until: Instant,
+pub(super) struct Prepared {
+    pub(super) fixture: ProgressExecutionFixture,
+    pub(super) sid: String,
+    pub(super) conversation: String,
+    pub(super) old: accounts::Row,
+    pub(super) current: accounts::Row,
+    pub(super) until: Instant,
 }
 
-struct Image {
+pub(super) struct Image {
     execution: BoundProgress,
     normal: Option<BoundProgress>,
     context: Option<AccountActivityContext>,
@@ -27,7 +27,7 @@ struct Image {
     account_calls: [usize; 3],
 }
 
-fn prepare(changed: bool, off: bool) -> Prepared {
+pub(super) fn prepare(changed: bool, off: bool) -> Prepared {
     let sid = format!(
         "s-expired-activity-{}",
         FIXTURES.fetch_add(1, Ordering::SeqCst)
@@ -144,7 +144,7 @@ fn files(prepared: &Prepared) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     .collect()
 }
 
-fn image(prepared: &Prepared) -> Image {
+pub(super) fn image(prepared: &Prepared) -> Image {
     let kept = prepared.fixture.idle.kept.lock().unwrap();
     Image {
         execution: kept.account.execution_progress.clone().unwrap(),
@@ -177,7 +177,7 @@ fn same_context(a: &AccountActivityContext, b: &AccountActivityContext) -> bool 
         && a.rows == b.rows
 }
 
-fn unchanged(prepared: &Prepared, before: &Image) -> bool {
+pub(super) fn unchanged(prepared: &Prepared, before: &Image) -> bool {
     let after = image(prepared);
     same_decision(&after.execution, &before.execution)
         && match (&after.normal, &before.normal) {
@@ -194,7 +194,7 @@ fn unchanged(prepared: &Prepared, before: &Image) -> bool {
         && after.account_calls == before.account_calls
 }
 
-fn entry(prepared: &Prepared, row: &accounts::Row, active: bool) -> LoginActivity {
+pub(super) fn entry(prepared: &Prepared, row: &accounts::Row, active: bool) -> LoginActivity {
     let value = prepared
         .fixture
         .idle
@@ -223,7 +223,11 @@ fn entry(prepared: &Prepared, row: &accounts::Row, active: bool) -> LoginActivit
     }
 }
 
-fn read(prepared: &Prepared, mono: Instant, entries: Option<Vec<LoginActivity>>) -> ProgressRead {
+pub(super) fn read(
+    prepared: &Prepared,
+    mono: Instant,
+    entries: Option<Vec<LoginActivity>>,
+) -> ProgressRead {
     let wall = prepared
         .fixture
         .idle
@@ -280,7 +284,8 @@ pub(in crate::harness_host) fn expired_activity_observation(
     context_current: bool,
     activity_kind: i64,
     off: bool,
-) -> [i64; 10] {
+    diagnostic_variant: u8,
+) -> [i64; 11] {
     let prepared = prepare(changed, off);
     if !context_current {
         prepared
@@ -298,13 +303,35 @@ pub(in crate::harness_host) fn expired_activity_observation(
     } else {
         prepared.until - Duration::from_nanos(1)
     };
-    let entries = match activity_kind {
+    let mut entries = match activity_kind {
         0 => Some(Vec::new()),
         1 => Some(vec![entry(&prepared, &prepared.current, true)]),
         2 => None,
         3 => Some(vec![entry(&prepared, &prepared.current, false)]),
         _ => unreachable!(),
     };
+    if let Some(entries) = &mut entries {
+        for entry in entries {
+            match diagnostic_variant {
+                0 => {}
+                1 => entry.diagnostic = None,
+                2 => entry.diagnostic.as_mut().unwrap().completed_at = 0,
+                3 => {
+                    entry.diagnostic.as_mut().unwrap().completed_at =
+                        entry.observed_at.saturating_add(1)
+                }
+                4 => {
+                    entry.diagnostic = Some(LoginDiagnostic::from_exit_for_test(
+                        &prepared.old,
+                        entry.observed_at,
+                        1,
+                        None,
+                    ))
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
     let read = read(&prepared, mono, entries);
     let value = read.progress.as_ref().unwrap();
     let phase = match value.phase {
@@ -330,6 +357,7 @@ pub(in crate::harness_host) fn expired_activity_observation(
         i64::try_from(value.login_diagnostics.len()).unwrap(),
         i64::from(read.retry()),
         i64::from(read.next_poll(mono).is_some()),
+        i64::from(!value.independent_work.is_empty()),
     ]
 }
 
@@ -361,12 +389,23 @@ fn an_expired_execution_record_does_not_hide_current_work_after_its_binding_chan
             assert!(value.login_diagnostics.is_empty());
             assert_eq!(read.execution_until, None);
             assert_eq!(read.next_poll(mono), Some(mono + Duration::from_secs(1)));
+            assert!(
+                value.independent_work.is_empty(),
+                "the primary phase already represents the same-scope worker"
+            );
         } else {
             assert_eq!(value.phase, ProgressPhase::Waiting);
             assert_eq!(value.next_at, before.execution.value.next_at);
             assert!(!historical(value));
             assert_eq!(read.execution_until, Some(prepared.until));
             assert_eq!(read.next_poll(mono), Some(prepared.until));
+            assert_eq!(
+                value.independent_work,
+                [independent_work_tests::expected_work(
+                    &prepared.current,
+                    entry(&prepared, &prepared.current, true).observed_at
+                )]
+            );
         }
         assert!(value.forecasts_paused);
         assert_eq!(value.known, None);
@@ -419,19 +458,41 @@ fn inactive_new_context_work_cannot_renew_an_expired_execution_forecast() {
     let prepared = prepare(true, true);
     let before = image(&prepared);
     let baseline = read(&prepared, prepared.until, Some(Vec::new()));
-    let inactive = read(
-        &prepared,
-        prepared.until,
-        Some(vec![entry(&prepared, &prepared.current, false)]),
-    );
-    assert_eq!(inactive.progress, baseline.progress);
+    let completed = entry(&prepared, &prepared.current, false);
+    let diagnostic = completed.diagnostic.clone().unwrap();
+    let inactive = read(&prepared, prepared.until, Some(vec![completed]));
+    let mut expected = baseline.progress.unwrap();
+    expected.login_diagnostics.push(diagnostic.clone());
+    assert_eq!(inactive.progress, Some(expected));
     let value = inactive.progress.as_ref().unwrap();
     assert_eq!(value.phase, ProgressPhase::Unknown);
     assert!(historical(value));
     assert_eq!(value.next_at, None);
-    assert!(value.login_diagnostics.is_empty());
+    assert_eq!(
+        value.login_diagnostics.as_slice(),
+        std::slice::from_ref(&diagnostic)
+    );
     assert_eq!(inactive.next_poll(prepared.until), None);
     assert!(unchanged(&prepared, &before));
+}
+
+#[test]
+fn settled_current_history_keeps_a_real_gate_lease_and_its_expired_projection() {
+    let prepared = prepare(true, true);
+    let before = image(&prepared);
+    for mono in [prepared.until - Duration::from_nanos(1), prepared.until] {
+        let baseline = read(&prepared, mono, Some(Vec::new()));
+        let completed = entry(&prepared, &prepared.current, false);
+        let diagnostic = completed.diagnostic.clone().unwrap();
+        let got = read(&prepared, mono, Some(vec![completed]));
+        let mut expected = baseline.progress.clone().unwrap();
+        expected.login_diagnostics.push(diagnostic);
+        assert_eq!(got.progress, Some(expected));
+        assert_eq!(got.execution_until, baseline.execution_until);
+        assert_eq!(got.next_poll(mono), baseline.next_poll(mono));
+        assert!(!got.retry());
+        assert!(unchanged(&prepared, &before));
+    }
 }
 
 #[test]
@@ -475,6 +536,7 @@ fn the_same_roster_keeps_its_existing_expired_activity_deadline_even_while_off()
         assert!(matches!(value.phase, ProgressPhase::SigningIn { .. }));
         assert!(historical(value));
         assert_eq!(value.next_at, next);
+        assert!(value.independent_work.is_empty());
         assert_eq!(read.execution_until, None);
         assert_eq!(
             read.next_poll(prepared.until),

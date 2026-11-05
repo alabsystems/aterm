@@ -1,0 +1,14 @@
+{
+  "_comment": "aterm FABRIC-COUNTS baseline: exact structural counts of the fabric bench's worlds on its default in-process broker, `test` profile: attach at 8 and 32 sessions with both tallies on and 100,000 records behind every session's refill watermark, 2 restarts each; ping-pong, 200 round trips back to back and 50 paced; messaging, 200 round trips, a 500-post burst and 20 paced notes, under aterm's default rate limit. SMALLER-OR-EQUAL: a count above its value here fails, and so does one past its law (lane_meta, fleet_mail and rate_limited 0; a restart's cold reads 2N - 1 at the first restart and N - 1 after), which a recording refuses to write. No ratio and no time is judged. The lane runs at the load it finds and reports it. Re-record with targo --unverified verify perf --record fabric-counts.",
+  "attach_32_lane_meta": 0,
+  "attach_8_lane_meta": 0,
+  "messaging_burst_rate_limited": 0,
+  "messaging_latency_rate_limited": 0,
+  "messaging_paced_rate_limited": 0,
+  "pingpong_fleet_mail": 0,
+  "pingpong_paced_fleet_mail": 0,
+  "restart_32_cold_reads_first": 63,
+  "restart_32_cold_reads_later": 31,
+  "restart_8_cold_reads_first": 15,
+  "restart_8_cold_reads_later": 7
+}

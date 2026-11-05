@@ -4,6 +4,7 @@
 //! Tier-1 for `SupervisorLand` (aterm-models-harness `supervisor_land_model`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::acts::{HoldLeg, LandHeld, TaskFace};
@@ -106,6 +107,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>, reach: Reach) -> TurnEn
         turn_said: Some(crate::common::earlier(at.earlier)),
         said_lines: None,
         turn_lines: None,
+        turn_breaks: Default::default(),
         opened_by: None,
         message_drawn: false,
         submits: None,
@@ -148,6 +150,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>, reach: Reach) -> TurnEn
         login_at_wall: None,
         login_method: None,
         login_shared: None,
+        login_pin: aterm_agent::supervise::policy::login::LoginPin::Picker,
         login_moved: false,
         roster: None,
         wall_remembered: false,
@@ -158,6 +161,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>, reach: Reach) -> TurnEn
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(at.dirty.then(finding)),
+        leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
         fact: None,
         wake: None,
     }
@@ -793,6 +797,15 @@ fn walk_all(
     Ok(verdicts)
 }
 
+/// The real decider and teller over every state the model reaches, once a run: each test that
+/// reads what it found holds that walk's verdicts, and the first to read it pays for it. A walk
+/// that fails an assert panics in every test that reads it. THE GAP: a walk whose result depends
+/// on its run is sampled once a run where it was three times; nothing in it reads its base clock.
+fn clean_walk() -> &'static Result<BTreeMap<String, usize>, String> {
+    static WALK: OnceLock<Result<BTreeMap<String, usize>, String>> = OnceLock::new();
+    WALK.get_or_init(|| walk_all(&supervisor_land_model(), Teller::Loop, HoldTeller::Loop))
+}
+
 #[test]
 fn tier1_the_real_decider_lands_only_on_its_checks_landed_and_never_goes_quiet() {
     assert!(clean_defense(Some(DEFENSE)));
@@ -801,8 +814,8 @@ fn tier1_the_real_decider_lands_only_on_its_checks_landed_and_never_goes_quiet()
     assert!(open_work_strict(Some(TOKEN)).is_empty());
     assert!(!says_done(Some(PROGRESS)) && !says_done(Some(ANSWERED)));
 
-    let m = supervisor_land_model();
-    let verdicts = walk_all(&m, Teller::Loop, HoldTeller::Loop)
+    let verdicts = clean_walk()
+        .as_ref()
         .unwrap_or_else(|e| panic!("the face or the hold told: {e}"));
     for word in [
         "Instruction",
@@ -1104,7 +1117,8 @@ fn tier1_a_measured_outage_holds_the_land_act_and_its_return_types_it() {
 #[test]
 fn tier1_the_real_teller_tells_what_holds_the_landing() {
     let m = supervisor_land_model();
-    let seen = walk_all(&m, Teller::Loop, HoldTeller::Loop)
+    let seen = clean_walk()
+        .as_ref()
         .unwrap_or_else(|e| panic!("the hold told: {e}"));
     for hold in [
         "hold=0 hlegs=0",
@@ -1265,7 +1279,8 @@ fn tier1_a_worker_that_could_not_finish_rests_failed_until_a_turn_runs() {
         aterm_spec::interp::violated_invariants(&typed_in),
         BTreeSet::from(["NeverTypeIntoAFailedTask"]),
     );
-    let verdicts = walk_all(&m, Teller::Loop, HoldTeller::Loop)
+    let verdicts = clean_walk()
+        .as_ref()
         .unwrap_or_else(|e| panic!("the face or the hold told: {e}"));
     assert!(verdicts.contains_key("Nothing"), "{verdicts:?}");
 
@@ -1316,10 +1331,10 @@ fn tier1_a_worker_that_could_not_finish_rests_failed_until_a_turn_runs() {
     assert_eq!(verdict(&unmanaged.decide()), Verdict::Nudge);
 }
 
-/// THE GATES ON THE WORD. A loop's first point is judged before the record is read: the word waits
-/// for [`TurnEndState::set_managed`]. Cruise never rests; a reply the person stopped or a wall cut
-/// gave no such answer; a point with no turn since is the same reply, not a new word. Each case's
-/// negative control is the row before it: the word with the gate open concludes.
+/// THE GATES ON THE WORD. A point judged before any record came back (its read lost): the word
+/// waits for [`TurnEndState::set_managed`]. Cruise never rests; a reply the person stopped or a
+/// wall cut gave no such answer; a point with no turn since is the same reply, not a new word.
+/// Each case's negative control is the row before it: the word with the gate open concludes.
 #[test]
 fn tier1_only_a_managed_land_worker_s_whole_reply_concludes() {
     let now = Instant::now() + Duration::from_secs(3600);

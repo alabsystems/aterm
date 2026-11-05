@@ -181,12 +181,7 @@ fn effect_record(seq: u64, reply: &[u8]) -> EffectRecord {
         seq,
         target: REPLY_TARGET,
         op: REPLY_WRITE,
-        payload: EffectRequest {
-            target: REPLY_TARGET,
-            op: REPLY_WRITE,
-            payload: reply.to_vec(),
-        }
-        .payload_digest(),
+        payload: EffectRequest::digest_payload(reply),
         result: Vec::new(),
     }
 }

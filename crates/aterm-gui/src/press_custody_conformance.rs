@@ -802,57 +802,56 @@ fn output_batches(validated: &mut usize, ev: &mut StepEvidence) {
         );
     }
 
-    {
-        let term = Arc::new(Mutex::new(engine_fixture(6, 4)));
-        {
-            let mut t = term_lock(&term);
-            t.scroll_display(1);
-            arm_selection(&mut t, 0, 1);
-        }
-        let mut c = Press::new();
-        let next = step(
-            &term,
-            &mut c,
-            CustodyTransition::OutputInvalidatesTheCoordinateSpace,
+    // The erase alone, and the erase followed in its batch by output that scrolls new history in:
+    // a pin taken before the erase never lands on the new history.
+    const SCROLLS: &str = "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8";
+    for (erase, route) in [
+        (
+            "\x1b[3J",
             "ED 3 erasing the scrollback the offset and the anchors named",
-            || {
-                term_lock(&term).process(b"\x1b[3J");
-            },
-            validated,
-            ev,
-        );
-        assert_eq!(
-            [next[0], next[1], next[2]],
-            [0, 0, 0],
-            "the space the offset named is gone, so the viewport goes back and the \
-             selection cannot outlive it"
-        );
-    }
-
-    {
-        let term = Arc::new(Mutex::new(engine_fixture(6, 4)));
-        {
-            let mut t = term_lock(&term);
-            t.scroll_display(1);
-            arm_selection(&mut t, 0, 1);
+        ),
+        ("\x1bc", "RIS destroying the coordinate space"),
+    ] {
+        for then in ["", SCROLLS] {
+            let term = Arc::new(Mutex::new(engine_fixture(6, 4)));
+            {
+                let mut t = term_lock(&term);
+                t.scroll_display(1);
+                arm_selection(&mut t, 0, 1);
+            }
+            let what = format!(
+                "{route}{}",
+                if then.is_empty() {
+                    ""
+                } else {
+                    ", then output that scrolls"
+                }
+            );
+            let mut c = Press::new();
+            let next = step(
+                &term,
+                &mut c,
+                CustodyTransition::OutputInvalidatesTheCoordinateSpace,
+                &what,
+                || {
+                    term_lock(&term).process(format!("{erase}{then}").as_bytes());
+                },
+                validated,
+                ev,
+            );
+            assert_eq!(
+                [next[0], next[1], next[2]],
+                [0, 0, 0],
+                "{what}: the space the offset named is gone, so the viewport goes back and the \
+                 selection cannot outlive it"
+            );
+            if !then.is_empty() {
+                assert!(
+                    term_lock(&term).grid().scrollback_lines() > 0,
+                    "{what}: PRECONDITION: the output scrolled new history in"
+                );
+            }
         }
-        let mut c = Press::new();
-        let next = step(
-            &term,
-            &mut c,
-            CustodyTransition::OutputInvalidatesTheCoordinateSpace,
-            "RIS destroying the coordinate space",
-            || {
-                term_lock(&term).process(b"\x1bc");
-            },
-            validated,
-            ev,
-        );
-        assert_eq!(
-            [next[0], next[1], next[2]],
-            [0, 0, 0],
-            "same law, other route"
-        );
     }
 }
 

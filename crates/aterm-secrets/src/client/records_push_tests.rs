@@ -516,3 +516,39 @@ fn the_server_heads_are_read_from_every_candidate_at_once() {
     macs.server.stop();
     drop(macs.root);
 }
+
+/// A Mac's mirrors are read and never posted records ([`mirrors::ReadOnly`]): a mirror lacking
+/// the frontier takes what it lacks from the vault's servers, never from a member. The same
+/// servers named as the pass's own peers are servers, and are posted what they lack.
+///
+/// NEGATIVE CONTROL: post to every peer that lacks the frontier (`let post = needs;` in
+/// `sync_records_until`): fails "a mirror was posted records".
+#[test]
+fn a_mirror_lacking_the_frontier_is_never_posted_records() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let servers = HeldServers::start(2, true);
+    let config = configured(&macs.m22).unwrap();
+    let config = set_mirrors(&macs.m22, &config, &servers.urls).expect("listed");
+    assert_eq!(config.mirrors, servers.urls);
+    {
+        // Every server this pass reads is one on loopback that answers.
+        let _answering = ServersAnswering::set();
+        sync_records_inner(&macs.m22, None, &[], None, None).expect("the pass");
+    }
+    assert_eq!(
+        servers.shared.held().records_posts,
+        0,
+        "a mirror was posted records"
+    );
+    {
+        let _answering = ServersAnswering::set();
+        sync_records_inner(&macs.m22, None, &servers.urls, None, None).expect("the pass");
+    }
+    assert!(
+        servers.shared.held().records_posts > 0,
+        "the pass's own peers are posted what they lack"
+    );
+    drop(servers);
+    macs.server.stop();
+    drop(macs.root);
+}

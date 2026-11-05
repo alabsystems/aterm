@@ -45,9 +45,10 @@ pub fn create(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        o.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
-    o.open(path)
+    aterm_uds::kept_out(|| o.open(path))
 }
 
 /// The one way this module takes a lock: [`held::HeldTape`]'s fields are

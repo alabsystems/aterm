@@ -97,6 +97,9 @@ impl Bed {
                 } else {
                     events.extend(accounts::note_login_end(state, logins, "next", NOW));
                 }
+                // A session here runs on the signed-out row, so the upkeep's door admits it
+                // (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4).
+                events.extend(accounts::note_session(state, "s-next", "next", None, NOW));
                 events.extend(accounts::note_wall(
                     state,
                     "work",
@@ -276,7 +279,7 @@ fn case(provider: i64, fault: i64, later: bool) -> (bool, bool, bool) {
             if later {
                 bed.later();
                 let fresh = read_renewal_candidates(cli, &bed.store, &bed.path, NOW + 1).unwrap();
-                assert!(fresh.tiered.iter().all(|(tier, _)| *tier >= UNNEEDED_TIER));
+                assert!(fresh.tiered.is_empty(), "no session needs the changed row");
                 assert_ne!(fresh.records.raw_roster, captured.raw_roster);
             }
             let admitted = bed

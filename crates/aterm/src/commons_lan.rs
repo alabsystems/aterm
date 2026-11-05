@@ -211,9 +211,7 @@ fn subscriber_asked_here(config: &Path) -> bool {
 /// used the local network ([`SUBSCRIBER_ASKED_HERE`]).
 #[cfg(target_os = "macos")]
 fn subscriber_asked_in(record: &Path, here: &str) -> bool {
-    here_lines(record, SUBSCRIBER_ASKED_HERE)
-        .iter()
-        .any(|line| line == here)
+    has_here(record, SUBSCRIBER_ASKED_HERE, here)
 }
 
 /// A door's two readers ([`door_for`]): whether a person is at this Mac, and whether this is
@@ -1047,22 +1045,28 @@ fn here_lines(record: &Path, file: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether `file` in `record` holds a non-empty line equal to `here`.
+#[cfg(target_os = "macos")]
+fn has_here(record: &Path, file: &str, here: &str) -> bool {
+    !here.is_empty()
+        && aterm_uds::private_file::read_private(record, file, HERE_MAX)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .is_some_and(|text| text.lines().any(|line| line == here))
+}
+
 /// Whether a window of the app `here` names, on the Mac it names, lived through macOS's Local
 /// Network question ([`ASKED_HERE`] in `record`).
 #[cfg(target_os = "macos")]
 fn asked_here(record: &Path, here: &str) -> bool {
-    here_lines(record, ASKED_HERE)
-        .iter()
-        .any(|line| line == here)
+    has_here(record, ASKED_HERE, here)
 }
 
 /// Whether a window of the app `here` names, on the Mac it names, used the LAN ([`USED_HERE`] in
 /// `record`).
 #[cfg(target_os = "macos")]
 fn used_here(record: &Path, here: &str) -> bool {
-    here_lines(record, USED_HERE)
-        .iter()
-        .any(|line| line == here)
+    has_here(record, USED_HERE, here)
 }
 
 /// What `host`'s look reads of aterm's records (pure): `first`, what they say of macOS's Local
@@ -1169,7 +1173,7 @@ mod tests {
             aterm_types::dirs::resolve_aterm_config_path(None, None, Some(home.as_os_str()))
                 .unwrap();
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-        std::fs::write(&config, "[swarm]\nenabled = false\n").unwrap();
+        aterm_uds::atomic_file::write(&config, b"[swarm]\nenabled = false\n", 0o600).unwrap();
         let (started, heard) = std::sync::mpsc::channel();
         let at_once = super::when_sharing_on(home, Duration::from_millis(10), move || {
             let _ = started.send(());

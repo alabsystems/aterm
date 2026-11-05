@@ -703,6 +703,15 @@ pub(crate) struct SessionHandoff {
         deserialize_with = "lenient_rows"
     )]
     pub machine_names: Vec<String>,
+    /// The workers aterm closed once their tasks concluded
+    /// ([`crate::retired_workers::RetiredWorkers::carry_rows`]): the successor answers `result`
+    /// and `await task` for them as this process did, and drops their result files as they age.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_rows"
+    )]
+    pub retired_workers: Vec<String>,
 }
 
 /// Final screen payload carried for an exited `--hold` pane.
@@ -945,6 +954,7 @@ impl SessionHandoff {
             mirror_dropped: store.mirror.draw_tombstones(),
             mirror_served: store.mirror.served(),
             machine_names: crate::tab_label::machine_names_for_handoff(),
+            retired_workers: store.retired_workers.carry_rows(std::time::Instant::now()),
             sessions: handles
                 .into_iter()
                 .map(|h| {
@@ -1107,17 +1117,20 @@ pub(crate) enum ExitReason {
     WindowClose,
     #[cfg(test)]
     AppQuit,
+    /// aterm's reaper of workers' tabs closed it once its task concluded (`App::reap_workers`).
+    Reaper,
     Unknown,
 }
 
 impl ExitReason {
     #[cfg(test)]
-    pub const ALL: [ExitReason; 6] = [
+    pub const ALL: [ExitReason; 7] = [
         ExitReason::ShellExit,
         ExitReason::CtlClose,
         ExitReason::UiClose,
         ExitReason::WindowClose,
         ExitReason::AppQuit,
+        ExitReason::Reaper,
         ExitReason::Unknown,
     ];
 
@@ -1131,25 +1144,40 @@ impl ExitReason {
             ExitReason::WindowClose => "window-close",
             #[cfg(test)]
             ExitReason::AppQuit => "app-quit",
+            ExitReason::Reaper => "reaper",
             ExitReason::Unknown => "unknown",
         }
     }
 }
 
-/// Actor that retired a session (`by=<sid|human|ctl|bridge|harness|->`).
+/// Actor that retired a session (`by=<sid|human|ctl|bridge|harness|fleet:<host>|->`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExitActor {
+    /// A session: an edge-scoped caller's own sid, or the tab an owner-token `aterm ctl` ran
+    /// from (`crate::control::control_session::caller_actor_of`).
     Sid(String),
     Human,
+    /// An owner-token client aterm could not place in any tab (a script, a launchd job).
     Ctl,
     /// aterm's own harness, which ended a worker of its own.
     Harness,
     #[cfg(any(unix, test))]
     Bridge,
+    /// Another Mac's drive over the fleet: the whole `fleet:<host>` token ([`ExitActor::fleet`]).
+    Fleet(String),
     Unknown,
 }
 
 impl ExitActor {
+    /// The fleet driver `host` ([`aterm_slog::Actor::fleet`]'s token), or [`ExitActor::Unknown`]
+    /// for a host with nothing left to name.
+    pub(crate) fn fleet(host: &str) -> Self {
+        match aterm_slog::Actor::fleet(host) {
+            aterm_slog::Actor::Fleet(token) => ExitActor::Fleet(token.as_str().to_string()),
+            _ => ExitActor::Unknown,
+        }
+    }
+
     /// Stable wire token for `by=<actor>`.
     #[must_use]
     pub(crate) const fn as_wire(&self) -> &str {
@@ -1160,6 +1188,7 @@ impl ExitActor {
             ExitActor::Harness => "harness",
             #[cfg(any(unix, test))]
             ExitActor::Bridge => "bridge",
+            ExitActor::Fleet(token) => token.as_str(),
             ExitActor::Unknown => "-",
         }
     }
@@ -1197,6 +1226,7 @@ pub(crate) struct SessionStore {
     history_lost: HashMap<u64, u64>,
     harness_posture: crate::autopilot::HarnessPosture,
     closed_logs: crate::session_log::ClosedLogs,
+    retired_workers: crate::retired_workers::RetiredWorkers,
     journal_retirements: Option<crate::session_log_journal::Retirements>,
     journal_durable: crate::crash_journal::Durable,
     input_replies: crate::control::InputReplies,
@@ -1517,6 +1547,16 @@ impl SessionStore {
             };
             let mut tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let at = tl.slog().now();
+            let task = crate::tab_marks::task_end(&tl);
+            tl.slog_mut().close_tab(
+                crate::session_log::TabClose {
+                    out: crate::session_log::exit_out(reason),
+                    by: crate::session_log::exit_actor(&actor),
+                    why: crate::tab_marks::close_why(reason),
+                    task: task.as_deref(),
+                },
+                at,
+            );
             tl.slog_mut().close_session(
                 crate::session_log::exit_out(reason),
                 crate::session_log::exit_actor(&actor),
@@ -1606,6 +1646,18 @@ impl SessionStore {
     /// Returns the bounded [`crate::session_log::ClosedLogs`] index.
     pub(crate) const fn closed_logs(&self) -> &crate::session_log::ClosedLogs {
         &self.closed_logs
+    }
+
+    /// The workers aterm closed once their tasks concluded ([`crate::retired_workers`]).
+    pub(crate) const fn retired_workers(&self) -> &crate::retired_workers::RetiredWorkers {
+        &self.retired_workers
+    }
+
+    /// [`Self::retired_workers`], to keep or drop a row.
+    pub(crate) const fn retired_workers_mut(
+        &mut self,
+    ) -> &mut crate::retired_workers::RetiredWorkers {
+        &mut self.retired_workers
     }
 
     /// Returns the bus session-log mirror state.
@@ -1958,7 +2010,7 @@ fn handle_ran(
         temporal: Arc::new(Mutex::new(crate::temporal::TemporalRecorder::new())),
         byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
         turns: observed.turns,
-        meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+        meta: Arc::default(),
         timeline: observed.timeline,
         fabric: std::sync::Arc::default(),
         idem: Default::default(),
@@ -1980,6 +2032,7 @@ fn handle_ran(
         witness: Default::default(),
         fenced_writes: Default::default(),
         native_policy: Default::default(),
+        spawn_mark: Default::default(),
     });
     SessionHandle {
         sid,
@@ -3619,6 +3672,7 @@ title = \"zsh\"
                 "ui-close",
                 "window-close",
                 "app-quit",
+                "reaper",
                 "unknown"
             ]
         );

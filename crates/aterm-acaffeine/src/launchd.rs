@@ -625,19 +625,19 @@ pub(crate) fn login_job_programs(
         .flatten()
     {
         let Ok(entry) = entry else { continue };
-        let plist = entry.path();
-        let Some(label) = plist
-            .file_name()
-            .and_then(|name| name.to_str())
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(label) = file_name
+            .to_str()
             .and_then(|name| name.strip_suffix(".plist"))
             .filter(|label| is_label(label))
             .map(str::to_string)
         else {
             continue;
         };
-        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            continue;
-        }
+        let plist = entry.path();
         let Some(args) = crate::code::read_plist(&plist)
             .and_then(|text| crate::code::plist_strings(&text, "ProgramArguments"))
         else {
@@ -1063,7 +1063,7 @@ fn ensure_session_dir(dir: &Path) -> io::Result<()> {
         .create(dir)?;
     let directory = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_DIRECTORY)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(dir)?;
     let meta = directory.metadata()?;
     if !meta.is_dir() || meta.uid() != aterm_uds::peer::our_uid() {
@@ -1072,7 +1072,10 @@ fn ensure_session_dir(dir: &Path) -> io::Result<()> {
             format!("{} is not this user's directory", dir.display()),
         ));
     }
-    directory.set_permissions(std::fs::Permissions::from_mode(0o700))
+    if meta.permissions().mode() & 0o7777 != 0o700 {
+        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// Write the session plist at `plist` (`0644` in a `0700` directory).

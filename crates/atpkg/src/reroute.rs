@@ -1172,17 +1172,16 @@ fn is_twin(path: &Path) -> bool {
 
 /// Whether `path` is one of our stubs: a regular file (never a symlink), small, UTF-8, whose second line is [`STUB_MARKER`].
 #[must_use]
+fn read_reroute_stub(path: &Path) -> Option<String> {
+    let content = crate::metadata_io::read_bounded_regular_utf8(path, MAX_STUB_BYTES).ok()?;
+    (content.lines().nth(1) == Some(STUB_MARKER)).then_some(content)
+}
+
 pub fn is_reroute_stub(path: &Path) -> bool {
     // A symlink is never ours (stubs are laid as regular files), and the bounded
-    // same-handle reader refuses a special or large file on the handle it reads, so a
+    // same-handle reader refuses a link, special or large file on the handle it reads, so a
     // swapped FIFO cannot block it.
-    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return false;
-    }
-    let Ok(content) = crate::metadata_io::read_bounded_regular_utf8(path, MAX_STUB_BYTES) else {
-        return false;
-    };
-    content.lines().nth(1) == Some(STUB_MARKER)
+    read_reroute_stub(path).is_some()
 }
 
 /// Whether `dir` is a reroute directory — ours, under any spelling — by its marker file.
@@ -1199,6 +1198,22 @@ pub enum StubState {
     Foreign,
 }
 
+enum RerouteSlot {
+    Stub(String),
+    Missing,
+    Foreign,
+}
+
+fn classify_reroute_slot(path: &Path) -> RerouteSlot {
+    match crate::metadata_io::read_bounded_regular_utf8(path, MAX_STUB_BYTES) {
+        Ok(content) if content.lines().nth(1) == Some(STUB_MARKER) => RerouteSlot::Stub(content),
+        Ok(_) => RerouteSlot::Foreign,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => RerouteSlot::Missing,
+        Err(_) if std::fs::symlink_metadata(path).is_ok() => RerouteSlot::Foreign,
+        Err(_) => RerouteSlot::Missing,
+    }
+}
+
 /// The state of every row's stub, table order.
 #[must_use]
 pub fn states(layout: &Layout) -> Vec<(&'static str, StubState)> {
@@ -1211,29 +1226,34 @@ pub fn states(layout: &Layout) -> Vec<(&'static str, StubState)> {
 /// The state of the reroute stub named `name` — a [`TABLE`] row's or an agent program's.
 #[must_use]
 pub fn stub_state(layout: &Layout, name: &str) -> StubState {
-    let path = stub_path(layout, name);
-    match std::fs::symlink_metadata(&path) {
-        Err(_) => StubState::Missing,
-        Ok(_) if is_reroute_stub(&path) => StubState::Laid,
-        Ok(_) => StubState::Foreign,
+    match classify_reroute_slot(&stub_path(layout, name)) {
+        RerouteSlot::Stub(_) => StubState::Laid,
+        RerouteSlot::Foreign => StubState::Foreign,
+        RerouteSlot::Missing => StubState::Missing,
     }
+}
+
+struct WantedStub {
+    name: &'static str,
+    lays: Option<String>,
 }
 
 fn wanted_stubs(
     layout: &Layout,
     embedder: &crate::stub::Embedder,
     strict: bool,
-) -> Vec<(&'static str, String)> {
+) -> Vec<WantedStub> {
     let dir = dir(layout);
     let agents = layout.agents_dir();
     TABLE
         .iter()
         .map(|row| {
             let path = dir.join(row.upstream);
-            let standing = is_reroute_stub(&path)
-                .then(|| crate::metadata_io::read_bounded_regular_utf8(&path, MAX_STUB_BYTES).ok())
-                .flatten()
-                .and_then(|body| crate::stub::sh_named_atpkg(&body, "ATPKG"));
+            let slot = classify_reroute_slot(&path);
+            let standing = match &slot {
+                RerouteSlot::Stub(body) => crate::stub::sh_named_atpkg(body, "ATPKG"),
+                RerouteSlot::Missing | RerouteSlot::Foreign => None,
+            };
             let atpkg = embedder.embed(standing.as_deref());
             let body = stub_body_sh(
                 row.upstream,
@@ -1241,13 +1261,27 @@ fn wanted_stubs(
                 &dir,
                 strict,
             );
-            (row.upstream, body)
+            let lays = match slot {
+                RerouteSlot::Stub(have) if have == body => None,
+                RerouteSlot::Foreign => None,
+                RerouteSlot::Stub(_) | RerouteSlot::Missing => Some(body),
+            };
+            WantedStub {
+                name: row.upstream,
+                lays,
+            }
         })
-        .chain(
-            agents_routes(layout)
-                .into_iter()
-                .map(|name| (name, agents_stub_body_sh(name, &agents))),
-        )
+        .chain(agents_routes(layout).into_iter().map(|name| {
+            let path = dir.join(name);
+            let slot = classify_reroute_slot(&path);
+            let body = agents_stub_body_sh(name, &agents);
+            let lays = match slot {
+                RerouteSlot::Stub(have) if have == body => None,
+                RerouteSlot::Foreign => None,
+                RerouteSlot::Stub(_) | RerouteSlot::Missing => Some(body),
+            };
+            WantedStub { name, lays }
+        }))
         .collect()
 }
 
@@ -1284,33 +1318,26 @@ pub(crate) fn lay_with(
     }
     let mut files = Vec::new();
     let wanted = wanted_stubs(layout, embedder, strict);
-    for (name, body) in &wanted {
-        let path = dir.join(name);
-        match std::fs::symlink_metadata(&path) {
-            Err(_) => {}
-            Ok(_) if is_reroute_stub(&path) => {
-                if crate::metadata_io::read_bounded_regular(&path, MAX_STUB_BYTES)
-                    .is_ok_and(|have| have == body.as_bytes())
-                {
-                    continue;
-                }
-            }
-            Ok(_) => continue,
+    for stub in &wanted {
+        if let Some(body) = &stub.lays {
+            files.push(crate::lay::Executable::new(
+                dir.join(stub.name),
+                body.as_bytes(),
+            ));
         }
-        files.push(crate::lay::Executable::new(&path, body.as_bytes()));
     }
     files.iter().try_for_each(crate::lay::write_regenerable)?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(OsStr::to_str) else {
-                continue;
-            };
-            if name.starts_with('.') {
-                continue;
-            }
-            if !wanted.iter().any(|(w, _)| *w == name) && is_reroute_stub(&path) {
-                let _ = std::fs::remove_file(&path);
+            let raw_name = entry.file_name();
+            if let Some(name) = raw_name.to_str()
+                && !name.starts_with('.')
+                && !wanted.iter().any(|w| w.name == name)
+            {
+                let path = entry.path();
+                if is_reroute_stub(&path) {
+                    let _ = std::fs::remove_file(&path);
+                }
             }
         }
     }
@@ -1337,29 +1364,20 @@ pub(crate) fn lay_pending(
         pending.push(DIR_MARKER_FILE.to_owned());
     }
     let wanted = wanted_stubs(layout, embedder, strict);
-    for (name, body) in &wanted {
-        let path = dir.join(name);
-        let lays = match std::fs::symlink_metadata(&path) {
-            Err(_) => true,
-            Ok(_) if is_reroute_stub(&path) => {
-                !crate::metadata_io::read_bounded_regular(&path, MAX_STUB_BYTES)
-                    .is_ok_and(|have| have == body.as_bytes())
-            }
-            Ok(_) => false,
-        };
-        if lays {
-            pending.push((*name).to_owned());
+    for stub in &wanted {
+        if stub.lays.is_some() {
+            pending.push(stub.name.to_owned());
         }
     }
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            let raw_name = entry.file_name();
+            let Some(name) = raw_name.to_str() else {
                 continue;
             };
             if !name.starts_with('.')
-                && !wanted.iter().any(|(w, _)| *w == name)
-                && is_reroute_stub(&path)
+                && !wanted.iter().any(|w| w.name == name)
+                && is_reroute_stub(&entry.path())
             {
                 pending.push(format!("{name} (swept)"));
             }
@@ -1599,23 +1617,32 @@ pub fn unserved_here(layout: &Layout, branded: &str, program: &str) -> Option<St
         .then_some(state)
 }
 
-use crate::ops::{Managed, managed};
+use crate::ops::Managed;
 
 fn installed(layout: &Layout, branded: &str, program: &str) -> Install {
-    if let Some(copy) = managed(layout, branded) {
-        return Install::Runs(copy);
-    }
     let Some(name) = crate::store::ToolName::new(branded) else {
         return Install::Absent;
     };
     let shim = layout.shim(&name);
-    if crate::stub::is_pending_stub(&shim) {
+    let read = crate::platform::read_shim(&shim);
+    if let Some(copy) = crate::ops::managed_from_read(layout, &shim, &read) {
+        return Install::Runs(copy);
+    }
+    if read
+        .body
+        .as_deref()
+        .is_some_and(crate::stub::is_pending_stub_body)
+    {
         return Install::Pending(shim);
     }
-    if crate::cli::is_tombstone_shim(layout, branded) {
+    if read
+        .body
+        .as_deref()
+        .is_some_and(crate::cli::is_tombstone_shim_body)
+    {
         return Install::Shim(shim);
     }
-    if crate::cli::live_without_shim_of(layout, program, branded).is_some() {
+    if read.body.is_none() && crate::cli::live_without_shim_of(layout, program, branded).is_some() {
         return Install::ShimLost;
     }
     Install::Absent

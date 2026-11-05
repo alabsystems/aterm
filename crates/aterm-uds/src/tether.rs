@@ -6,22 +6,29 @@
 //! determine whether the helper ends.
 //!
 //! Linux has the parent-death signal: the child is spawned with `PR_SET_PDEATHSIG` set to
-//! `SIGTERM`, and a child that ignores it runs on. Darwin has none, so a tethered spawn there runs
-//! this process's own executable as [`VERB`] first, under [`NAME`], and that tether leaves a
-//! watcher behind as it execs the child in its own place: the parent's handle names the child
-//! itself, its pid, its signals and its exit status. The watcher is a grandchild of the tether,
-//! adopted by launchd, holding a kqueue `NOTE_EXIT` watch on the parent and on the child. It leads
-//! a session of its own, made before it arms, so a listing of the child's group (a stage sweep's),
-//! a kill of that group and a hangup of the child's terminal never count or reach it; it still ends
-//! with the child by its exit watch. When the parent exits, the watcher attempts to end the child
-//! through [`end_proven`] ([`end_watched`]): `SIGTERM`, then `SIGKILL` to one still there
-//! [`END_GRACE`](crate::process::END_GRACE) later, each signal only while the pid still reads the
-//! birth and kernel unique id the tether read of itself before it forked the watcher ([`Watched`]),
-//! and its one thread has run ([`Proof`]): a child macOS's program check holds before its first
-//! instruction gets no signal. The watcher exits after that attempt, even if the proof did not read
-//! or the thread had not run, including during an exec; such a child can run on. It also exits when
-//! the child exits first. The tether execs the child only once the watcher is armed and the parent
-//! is still its own parent. A kill by the parent's name passes the watcher by.
+//! `SIGTERM`, and a child that ignores it runs on. The kernel sends it when the thread that forked
+//! the child exits, so every tethered spawn forks on a spawner, a thread that lives as long as the
+//! process (`spawned`): the child ends with the process, not with the thread that asked for it,
+//! which may end while the child runs on (its wait handed to the reaper). An exec in the process's
+//! place ends every other thread, the spawners among them, so on Linux it ends tethered children
+//! too, where Darwin's watcher waits for an exit. A process serving [`VERB`] on Linux sets the
+//! signal on itself, so it is tied to whichever thread forked it. Darwin has none, so a tethered
+//! spawn there runs this process's own executable as [`VERB`] first, under [`NAME`], and that
+//! tether leaves a watcher behind as it execs the child in its own place: the parent's handle
+//! names the child itself, its pid, its signals and its exit status. The watcher is a grandchild
+//! of the tether, adopted by launchd, holding a kqueue `NOTE_EXIT` watch on the parent and on the
+//! child. It leads a session of its own, made before it arms, so a listing of the child's group (a
+//! stage sweep's), a kill of that group and a hangup of the child's terminal never count or reach
+//! it; it still ends with the child by its exit watch. When the parent exits, the watcher attempts
+//! to end the child through [`end_proven`] ([`end_watched`]): `SIGTERM`, then `SIGKILL` to one
+//! still there [`END_GRACE`](crate::process::END_GRACE) later, each signal only while the pid
+//! still reads the birth and kernel unique id the tether read of itself before it forked the
+//! watcher ([`Watched`]), and its one thread has run ([`Proof`]): a child macOS's program check
+//! holds before its first instruction gets no signal. The watcher exits after that attempt, even
+//! if the proof did not read or the thread had not run, including during an exec; such a child can
+//! run on. It also exits when the child exits first. The tether execs the child only once the
+//! watcher is armed and the parent is still its own parent. A kill by the parent's name passes the
+//! watcher by.
 
 #[cfg(unix)]
 use std::ffi::OsString;
@@ -308,9 +315,10 @@ fn hold(parent: i32) -> Result<(), String> {
 }
 
 /// `PR_SET_PDEATHSIG` to `SIGTERM`, then the check that `parent` did not die before it was set:
-/// the kernel signals when the THREAD that forked this process exits, and a child that ignores
-/// `SIGTERM` runs on. Async-signal-safe (two system calls), for a spawn's hook between fork and
-/// exec.
+/// the kernel signals when the thread that forked this process exits, which for a tethered spawn
+/// is a spawner ([`spawned`]), alive as long as the process, and for a process serving [`VERB`]
+/// whichever thread forked it; a child that ignores `SIGTERM` runs on. Async-signal-safe (two
+/// system calls), for a spawn's hook between fork and exec.
 ///
 /// # Errors
 /// `prctl`'s, or `ESRCH` when `parent` is no longer this process's parent.
@@ -334,6 +342,129 @@ pub(crate) fn bind(parent: i32) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+    }
+}
+
+/// The name of each thread a tethered spawn forks on, a spawner ([`spawned`]).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const SPAWNER: &str = "aterm-tether-spawner";
+
+/// One fork for a spawner. It is handed the spawner's way to list itself free again, which it
+/// calls once its fork is done and before it answers, so a caller that has its answer finds
+/// that spawner free.
+#[cfg(any(target_os = "linux", test))]
+type Job = Box<dyn FnOnce(&dyn Fn()) + Send>;
+
+/// How a spawner's thread starts: `std::thread::Builder::spawn` of the body, its handle dropped,
+/// since a spawner is never joined.
+#[cfg(any(target_os = "linux", test))]
+type Start = fn(std::thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
+
+/// The threads tethered spawns fork on ([`SPAWNER`]): each free one by the sender of its own
+/// queue. A spawner keeps a sender of its own queue too, so its thread waits for its next job
+/// for as long as the process lives.
+#[cfg(any(target_os = "linux", test))]
+struct Spawners {
+    /// The spawners no job holds; the one freed last is taken first.
+    free: std::sync::Mutex<Vec<std::sync::mpsc::Sender<Job>>>,
+    /// How a new spawner's thread starts ([`start_thread`], but in a test).
+    start: Start,
+}
+
+/// This process's spawners.
+#[cfg(any(target_os = "linux", test))]
+static SPAWNERS: Spawners = Spawners::new(start_thread);
+
+/// `std::thread::Builder::spawn` of `body`, its handle dropped.
+#[cfg(any(target_os = "linux", test))]
+fn start_thread(
+    builder: std::thread::Builder,
+    body: Box<dyn FnOnce() + Send>,
+) -> std::io::Result<()> {
+    builder.spawn(body).map(drop)
+}
+
+/// Runs `spawn` on a spawner ([`SPAWNER`]), a thread that lives as long as the process, and
+/// answers what `spawn` answered. Linux sends a tethered child's parent-death signal when the
+/// thread that forked it exits ([`bind`]), so a child forked here is tied to this process, not to
+/// the calling thread. The call waits for no other call's fork: it takes a free spawner, or
+/// starts one when none is free. `spawn` runs under `catch_unwind`: one that panics answers an
+/// error, and its spawner runs on.
+///
+/// # Errors
+/// `spawn`'s, or an error when it panicked. When no spawner is free and a new one's thread cannot
+/// start, that error, with nothing run and nothing started untethered; the next call tries again.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn spawned<T: Send + 'static>(
+    spawn: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
+    SPAWNERS.run(spawn)
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl Spawners {
+    /// No spawner yet; a new one's thread starts by `start`.
+    const fn new(start: Start) -> Self {
+        Self {
+            free: std::sync::Mutex::new(Vec::new()),
+            start,
+        }
+    }
+
+    /// [`spawned`] over these spawners.
+    fn run<T: Send + 'static>(
+        &'static self,
+        spawn: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+    ) -> std::io::Result<T> {
+        let (answer, answered) = std::sync::mpsc::sync_channel(1);
+        let job: Job = Box::new(move |freed: &dyn Fn()| {
+            let said = std::panic::catch_unwind(std::panic::AssertUnwindSafe(spawn))
+                .unwrap_or_else(|_| Err(std::io::Error::other("a tethered spawn panicked")));
+            freed();
+            let _ = answer.send(said);
+        });
+        let queue = match self.take_free() {
+            Some(queue) => queue,
+            None => self.started()?,
+        };
+        if queue.send(job).is_err() {
+            return Err(std::io::Error::other("a tether spawner has ended"));
+        }
+        answered
+            .recv()
+            .unwrap_or_else(|_| Err(std::io::Error::other("a tether spawner dropped a spawn")))
+    }
+
+    /// A new spawner's queue, once its thread started: the thread runs each job sent to it, then
+    /// lists itself free.
+    fn started(&'static self) -> std::io::Result<std::sync::mpsc::Sender<Job>> {
+        let (queue, waiting) = std::sync::mpsc::channel::<Job>();
+        let own = queue.clone();
+        (self.start)(
+            std::thread::Builder::new().name(SPAWNER.to_owned()),
+            Box::new(move || {
+                for job in waiting {
+                    job(&|| self.list_free(own.clone()));
+                }
+            }),
+        )?;
+        Ok(queue)
+    }
+
+    /// The spawner freed last, taken off the free list; `None` when none is free.
+    fn take_free(&self) -> Option<std::sync::mpsc::Sender<Job>> {
+        self.free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
+    }
+
+    /// List a spawner, by its queue, as free.
+    fn list_free(&self, queue: std::sync::mpsc::Sender<Job>) {
+        self.free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(queue);
     }
 }
 
@@ -749,5 +880,129 @@ mod watcher_tests {
                 control.signals
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod spawner_tests {
+    use super::{SPAWNER, Spawners, spawned, start_thread};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread::{self, ThreadId};
+    use std::time::Duration;
+
+    /// The hang detector for a wait on what must happen.
+    const HANG: Duration = Duration::from_secs(60);
+
+    /// The thread a job ran on, and its name.
+    fn here() -> std::io::Result<(ThreadId, Option<String>)> {
+        let this = thread::current();
+        Ok((this.id(), this.name().map(str::to_owned)))
+    }
+
+    /// A spawn runs on a spawner, never on its caller. Calls made one after another, each from a
+    /// thread that ended before the next began, run on one spawner, which still runs a job after
+    /// every caller ended and after a job that panicked.
+    #[test]
+    fn a_spawner_outlives_its_callers_and_serves_the_next_call() {
+        static ONE_AFTER_ANOTHER: Spawners = Spawners::new(start_thread);
+        let ran: Vec<_> = (0..4)
+            .map(|_| {
+                thread::spawn(|| {
+                    let ran = ONE_AFTER_ANOTHER.run(here).expect("a spawner runs the job");
+                    assert_ne!(
+                        ran.0,
+                        thread::current().id(),
+                        "the job ran on a spawner, not on its caller"
+                    );
+                    ran
+                })
+                .join()
+                .expect("a caller")
+            })
+            .collect();
+        let panicked = ONE_AFTER_ANOTHER.run::<()>(|| panic!("a job that panics"));
+        assert!(panicked.is_err(), "a job that panicked answers an error");
+        let later = ONE_AFTER_ANOTHER
+            .run(here)
+            .expect("a spawner runs a job after its callers ended");
+        assert_eq!(later.1.as_deref(), Some(SPAWNER), "a spawner's name");
+        assert!(
+            ran.iter().all(|job| job.0 == later.0),
+            "one spawner for calls one after another, still running after every caller ended: \
+             {ran:?}, then {later:?}"
+        );
+        let process = spawned(here).expect("this process's spawners run a job");
+        assert_eq!(
+            process.1.as_deref(),
+            Some(SPAWNER),
+            "this process's spawner's name"
+        );
+    }
+
+    /// A call waits for no other call's fork: while one job holds the spawner an earlier call
+    /// left free, another call runs on a spawner of its own and answers.
+    #[test]
+    fn a_spawn_waits_for_no_other_spawns_fork() {
+        static BUSY: Spawners = Spawners::new(start_thread);
+        let earlier = BUSY.run(here).expect("an earlier job ran");
+        let (began, beginning) = mpsc::channel();
+        let (release, held) = mpsc::channel::<()>();
+        let first = thread::spawn(move || {
+            BUSY.run(move || {
+                let _ = began.send(());
+                let _ = held.recv();
+                here()
+            })
+        });
+        beginning.recv_timeout(HANG).expect("the first job began");
+        let (said, answer) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = said.send(BUSY.run(here));
+        });
+        let second = answer
+            .recv_timeout(HANG)
+            .expect("a spawn waits for no other spawn's fork")
+            .expect("the second job ran");
+        drop(release);
+        let first = first
+            .join()
+            .expect("the first caller")
+            .expect("the first job ran");
+        assert_eq!(first.0, earlier.0, "the first took the spawner left free");
+        assert_ne!(first.0, second.0, "the second ran on a spawner of its own");
+        assert_eq!(second.1.as_deref(), Some(SPAWNER), "a spawner's name");
+    }
+
+    /// When a spawner's thread cannot start, the call answers that error, runs nothing and lists
+    /// no spawner, and the next call starts one.
+    #[test]
+    fn a_spawner_that_cannot_start_runs_nothing_and_the_next_call_starts_one() {
+        static REFUSED: AtomicBool = AtomicBool::new(false);
+        fn refuse_once(
+            builder: thread::Builder,
+            body: Box<dyn FnOnce() + Send>,
+        ) -> std::io::Result<()> {
+            if REFUSED.swap(true, Ordering::SeqCst) {
+                start_thread(builder, body)
+            } else {
+                Err(std::io::Error::other("no thread"))
+            }
+        }
+        static REFUSING: Spawners = Spawners::new(refuse_once);
+        let ran = Arc::new(AtomicBool::new(false));
+        let job_ran = Arc::clone(&ran);
+        let refused = REFUSING
+            .run(move || {
+                job_ran.store(true, Ordering::SeqCst);
+                here()
+            })
+            .expect_err("a spawn whose spawner cannot start answers an error");
+        assert_eq!(refused.to_string(), "no thread", "the start's own error");
+        assert!(!ran.load(Ordering::SeqCst), "its job did not run");
+        assert!(REFUSING.take_free().is_none(), "no spawner is listed free");
+        let next = REFUSING.run(here).expect("the next call starts a spawner");
+        assert_eq!(next.1.as_deref(), Some(SPAWNER), "a spawner's name");
     }
 }

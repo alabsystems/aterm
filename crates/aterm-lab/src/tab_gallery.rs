@@ -259,8 +259,8 @@ impl Run {
         let themes = world.cfg.join("aterm/themes");
         std::fs::create_dir_all(&themes).map_err(|e| e.to_string())?;
         for custom in &CUSTOM {
-            std::fs::write(
-                themes.join(format!("{}.conf", custom.0)),
+            crate::util::write_fresh(
+                &themes.join(format!("{}.conf", custom.0)),
                 custom_theme_text(custom),
             )
             .map_err(|e| e.to_string())?;
@@ -292,10 +292,10 @@ impl Run {
             .split_whitespace()
             .nth(3)
             .ok_or("window named no file")?;
-        std::fs::copy(written, &path).map_err(|e| format!("{written}: {e}"))?;
+        crate::util::copy_regular_file(written, &path).map_err(|e| format!("{written}: {e}"))?;
         let chrome = inst.ctl(&["chrome"]);
         ok(&chrome, "chrome")?;
-        std::fs::write(self.out.join(format!("{name}.chrome.txt")), &chrome.stdout)
+        crate::util::write_fresh(&self.out.join(format!("{name}.chrome.txt")), &chrome.stdout)
             .map_err(|e| e.to_string())?;
         let frame = Image::read(&path)?;
         let chips = chips(&chrome.stdout);
@@ -364,14 +364,20 @@ impl Run {
         let mut tiles = Vec::new();
         let (world, mut inst) = self.start(theme, false, &[])?;
         let taken = self.windowed(theme, &stem, &inst, scratch, &mut tiles);
-        inst.stop();
+        let taken = crate::instance::after_stop(taken.map_err(Fail::die), inst.stop());
         drop(world);
-        taken?;
+        taken.map_err(|f| {
+            f.msg
+                .unwrap_or_else(|| "tab-gallery window cleanup failed".into())
+        })?;
         let (world, mut inst) = self.start(theme, true, &["tab_strip_rows = 1".to_string()])?;
         let cells = self.cells(&stem, &inst, &mut tiles);
-        inst.stop();
+        let cells = crate::instance::after_stop(cells.map_err(Fail::die), inst.stop());
         drop(world);
-        cells?;
+        cells.map_err(|f| {
+            f.msg
+                .unwrap_or_else(|| "tab-gallery cell cleanup failed".into())
+        })?;
         sheet::write(
             &self.out.join(format!("{stem}.sheet.png")),
             theme,
@@ -430,9 +436,9 @@ impl Run {
             verdicts: Vec::new(),
         });
         let note = scratch.join(format!("{stem}.md"));
-        std::fs::write(&note, "# note\n").map_err(|e| e.to_string())?;
+        crate::util::write_fresh(&note, "# note\n").map_err(|e| e.to_string())?;
         let code = scratch.join(format!("{stem}.rs"));
-        std::fs::write(&code, "fn main() {}\n").map_err(|e| e.to_string())?;
+        crate::util::write_fresh(&code, "fn main() {}\n").map_err(|e| e.to_string())?;
         let uri = |p: &Path| {
             std::fs::canonicalize(p).map_or_else(
                 |_| format!("file://{}", p.display()),
@@ -502,7 +508,7 @@ impl Run {
             .split_whitespace()
             .nth(3)
             .ok_or("image named no file")?;
-        std::fs::copy(from, &path).map_err(|e| e.to_string())?;
+        crate::util::copy_regular_file(from, &path).map_err(|e| e.to_string())?;
         let frame = Image::read(&path)?;
         let strip = frame.crop(PxBox {
             x0: 0,
@@ -584,7 +590,8 @@ pub fn cmd(args: &[String]) -> Res {
         names.len(),
         out.display()
     ));
-    std::fs::write(out.join("report.txt"), &run.report).map_err(|e| e.to_string())?;
+    crate::util::write_out(&out.join("report.txt"), run.report.as_bytes())
+        .map_err(|e| e.to_string())?;
     Ok(i32::from(run.failed))
 }
 

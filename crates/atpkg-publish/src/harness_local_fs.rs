@@ -95,10 +95,9 @@ struct ExactLock {
 
 impl ExactLock {
     fn take(dir: &Path) -> Result<Self> {
-        let file = private_file::open_private_rw(dir, "manager.lock")
-            .map_err(|e| Error::refused(format!("private manager lock: {e}")))?;
-        aterm_uds::keep_out_of_children(&file)
-            .map_err(|e| Error::io("keep manager lock out of children", &e))?;
+        let file: std::fs::File =
+            aterm_uds::kept_out(|| private_file::open_private_rw(dir, "manager.lock"))
+                .map_err(|e| Error::refused(format!("private manager lock: {e}")))?;
         #[expect(
             clippy::disallowed_methods,
             reason = "this lifetime guard releases by LOCK_UN in Drop"
@@ -116,15 +115,12 @@ impl ExactLock {
         Ok(lock)
     }
     fn check(&self) -> Result<()> {
-        let (named, _) = private_file::open_private(&self.dir, "manager.lock")
+        let (_, named) = private_file::open_private(&self.dir, "manager.lock")
             .map_err(|e| Error::refused(format!("manager lock name changed: {e}")))?;
         let held = self
             .file
             .metadata()
             .map_err(|e| Error::io("read held manager lock", &e))?;
-        let named = named
-            .metadata()
-            .map_err(|e| Error::io("read named manager lock", &e))?;
         if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
             return Err(Error::refused("manager lock was replaced"));
         }
@@ -176,7 +172,7 @@ fn source_root(home: &Path, checkout: &Path) -> Result<(PathBuf, PathBuf, [u64; 
     let identity = [meta.dev(), meta.ino()];
     let digest =
         aterm_digest::Sha256::digest(format!("{}:{}", identity[0], identity[1]).as_bytes());
-    let key: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let key = aterm_codec::hex::encode_lower(&digest);
     let path = anchor
         .join(".local/state/aterm-local-harness/sources")
         .join(key);

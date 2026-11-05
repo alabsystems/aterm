@@ -253,7 +253,11 @@ mod platform {
                 | OFlags::NOFOLLOW
                 | OFlags::CLOEXEC
                 | OFlags::NONBLOCK;
-            let file = File::from(fd::openat(&dir.file, name, flags, Mode::RUSR | Mode::WUSR)?);
+            let file = aterm_uds::kept_out(|| {
+                fd::openat(&dir.file, name, flags, Mode::RUSR | Mode::WUSR)
+                    .map(File::from)
+                    .map_err(io::Error::from)
+            })?;
             let meta = private_tape(&file)?;
             Ok(Tape {
                 stored: Stored {

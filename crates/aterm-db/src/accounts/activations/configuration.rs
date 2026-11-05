@@ -31,6 +31,25 @@ impl Configuration {
         request: &Request,
         deadline: Option<std::time::Instant>,
     ) -> Result<Self> {
+        let proposals = match deadline {
+            Some(deadline) => super::super::proposals::Proposals::at_until(paths.clone(), deadline),
+            None => super::super::proposals::Proposals::at(paths.clone()),
+        };
+        Self::from_snapshot(request, proposals.snapshot()?)
+    }
+
+    pub(super) fn capture_in_session(
+        session: &Session<'_>,
+        record: &Record,
+        deadline: std::time::Instant,
+    ) -> Result<Self> {
+        Self::from_snapshot(
+            record.request(),
+            super::super::proposals::Proposals::snapshot_in_session(session, deadline)?,
+        )
+    }
+
+    fn from_snapshot(request: &Request, snapshot: crate::documents::log::Snapshot) -> Result<Self> {
         #[cfg(test)]
         CAPTURES.with(|count| count.set(count.get() + 1));
         let (table, key, configuration, provider, method) = match &request.action {
@@ -38,11 +57,7 @@ impl Configuration {
             Action::Intent(p) => (p.table, &p.key, p.configuration, &p.provider, &p.method),
             Action::Stop => return Err(Error::new("account is stopped")),
         };
-        let proposals = match deadline {
-            Some(deadline) => super::super::proposals::Proposals::at_until(paths.clone(), deadline),
-            None => super::super::proposals::Proposals::at(paths.clone()),
-        };
-        let snapshot = proposals.snapshot()?;
+
         let plan = super::super::plans::inspect(&snapshot, key)?;
         let digest = aterm_codec::hex::encode_lower(&configuration);
         let row = snapshot

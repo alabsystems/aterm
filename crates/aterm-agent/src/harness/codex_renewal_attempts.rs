@@ -636,7 +636,7 @@ fn write_immutable<T: Serialize>(path: &Path, value: &T) -> Result<(), &'static 
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         open.mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     match open.open(path) {
         Ok(mut file) => {
@@ -674,7 +674,7 @@ fn read_retained(path: &Path) -> Result<Option<(std::fs::File, Vec<u8>)>, &'stat
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     #[cfg(windows)]
     {

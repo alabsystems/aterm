@@ -115,6 +115,14 @@ impl Fields {
         self.title = token(user.unwrap_or(ABSENT), TITLE_CAP);
     }
 
+    /// Whether these fields already say what [`Fields::read_meta`] would take from `header`.
+    #[must_use]
+    pub fn says_meta(&self, header: &str) -> bool {
+        let mut read = self.clone();
+        read.read_meta(header);
+        read == *self
+    }
+
     /// Take `detail=` as `status`/`sessions` report it.
     pub fn set_detail(&mut self, raw: Option<&str>) {
         self.detail = token(raw.unwrap_or(ABSENT), DETAIL_CAP);

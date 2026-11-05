@@ -115,7 +115,10 @@ fn a_renewal_reads_the_machine_only_through_its_guard() {
             &desk.roster(),
             roster.clone(),
             &accounts::Logins::default(),
-            roster.rows[0].clone(),
+            (
+                roster.rows[0].clone(),
+                crate::harness::sign_in_ladder::asked_fixture(Cli::Claude, &roster.rows[0].label),
+            ),
             (None, false),
             NOW,
             guard,
@@ -662,9 +665,10 @@ fn an_auto_rotate_click_obeys_the_configs_switches() {
         ("[harness]\naccounts = \"off\"\n", true, false),
     ] {
         let desk = Desk::new("m27");
-        fs::write(
-            desk.config.join("aterm.toml"),
-            format!("[fleet]\nmachine = \"m27\"\n{switch}"),
+        aterm_uds::atomic_file::write(
+            &desk.config.join("aterm.toml"),
+            format!("[fleet]\nmachine = \"m27\"\n{switch}").as_bytes(),
+            0o600,
         )
         .unwrap();
         let roster = signed_out_row(&desk);

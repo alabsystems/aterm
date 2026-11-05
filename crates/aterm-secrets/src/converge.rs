@@ -40,8 +40,15 @@ pub const RECHECK_MS: u64 = 30 * 60 * 1000;
 /// The runner for `trigger` (`subscriber`, `window` or `setup`): `exe init --converge --trigger
 /// <trigger>`, reading and writing nothing of its starter's (stdio null), in a session of its
 /// own (`setsid`), so a launchd job's restart, which ends its process group, or a terminal's
-/// hangup does not end a pass midway. Responsibility is never disclaimed: the runner's Local
-/// Network use stays the starting app's.
+/// hangup does not end a pass midway. The [`SUBSCRIBER`]'s runner starts out of its starter's
+/// background band ([`aterm_uds::spawnfd::Command::leave_background_band`]): the vault
+/// subscriber is a `Background` launchd job, where every thread runs at priority 4 whatever
+/// class it asks for, and the pass writes the fleet book under its lock, whose taker is lifted
+/// to the default class while it holds it, a lift that band defeats. That runner holds its own
+/// threads at the background class instead, its children started in the band (`aterm init
+/// --converge`), so only the lock's holder is lifted. A window's or the first launch's runner
+/// starts with its starter's process type, in no band, and holds its threads at utility.
+/// Responsibility is never disclaimed: the runner's Local Network use stays the starting app's.
 #[must_use]
 pub fn runner(exe: &Path, trigger: &str) -> Command {
     let mut command = aterm_uds::spawnfd::command(exe);
@@ -50,7 +57,8 @@ pub fn runner(exe: &Path, trigger: &str) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .setsid(true);
+        .setsid(true)
+        .leave_background_band(trigger == SUBSCRIBER);
     command
 }
 
@@ -280,21 +288,34 @@ mod tests {
         );
     }
 
-    /// The runner is `aterm init --converge --trigger <who>` of the program given, and never
+    /// The runner is `aterm init --converge --trigger <who>` of the program given, never
     /// disclaims responsibility (macOS then keeps the runner's Local Network use the starting
-    /// app's); its own session is proven on a started child below.
-    /// NEGATIVE CONTROL: a runner that disclaims responsibility fails here.
+    /// app's), and the subscriber's leaves its starter's background band, so the fleet book's
+    /// lock lift reaches its holder under the vault subscriber's `Background` job (that a child
+    /// so started leaves the band is `aterm_uds`'s
+    /// `a_child_started_out_of_the_background_band_runs_at_the_class_it_asks_for`), where a
+    /// window's or setup's keeps its starter's process type; its own session is proven on a
+    /// started child below.
+    /// NEGATIVE CONTROLS: a runner that disclaims responsibility, a subscriber's that stays in
+    /// the band, or another's that leaves its starter's type, fails here.
     #[test]
-    fn the_runner_is_init_converge_and_never_disclaims_responsibility() {
+    fn the_runner_is_init_converge_the_subscribers_out_of_the_band_never_disclaiming() {
         let exe = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
-        let command = runner(exe, "window");
-        assert_eq!(command.get_program(), exe);
-        let args: Vec<_> = command.get_args().collect();
-        assert_eq!(args, ["init", "--converge", "--trigger", "window"]);
-        assert!(
-            !command.get_disclaim_responsibility(),
-            "the runner's Local Network use stays the starting app's"
-        );
+        for trigger in [SUBSCRIBER, WINDOW, SETUP] {
+            let command = runner(exe, trigger);
+            assert_eq!(command.get_program(), exe);
+            let args: Vec<_> = command.get_args().collect();
+            assert_eq!(args, ["init", "--converge", "--trigger", trigger]);
+            assert!(
+                !command.get_disclaim_responsibility(),
+                "the runner's Local Network use stays the starting app's"
+            );
+            assert_eq!(
+                command.leaves_background_band(),
+                trigger == SUBSCRIBER,
+                "only the subscriber's runner leaves its starter's background band ({trigger})"
+            );
+        }
     }
 
     /// A runner that does not end by itself leaves the start, and the reading of how it stands,

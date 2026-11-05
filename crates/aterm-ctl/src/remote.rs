@@ -12,11 +12,12 @@ use std::time::{Duration, Instant};
 use aterm_types::control_verbs::turn_option_words;
 
 use super::{
-    EXIT_TIMEOUT, LocalVerbs, SELF_SID_ENV, any_host, await_task, bytes_payload,
-    malformed_header_error, print_frame_answer, print_payload, print_stdout_line,
-    read_frame_answer, read_status_line, read_task_payload, reply_is_timeout, request_line,
-    spawn_wire_line, split_selector, stderr_line, stderr_prefixed, stream_count, streams_payload,
-    survey, usage_error, validate_request_line_len, validate_request_parts, worker_starter,
+    EXIT_TIMEOUT, LocalVerbs, MAX_BODY_BYTES, SELF_SID_ENV, any_host, await_task, board,
+    bytes_payload, collect_reply_lines, malformed_header_error, print_frame_answer, print_payload,
+    print_stdout_line, read_bounded_line, read_frame_answer, read_status_line, read_task_payload,
+    redial, reply_is_timeout, request_line, spawn_wire_line, split_selector, stderr_line,
+    stderr_prefixed, stream_count, streams_payload, survey, usage_error, validate_request_line_len,
+    validate_request_parts, worker_starter,
 };
 
 /// A drive connection's stream, as the fleet client hands it over.
@@ -30,6 +31,9 @@ pub struct DriveLink {
     pub stream: Box<dyn DriveStream>,
     /// How the peer is named in what this client says: its host as this machine knows it.
     pub label: String,
+    /// The node id the peer's handshake proved, where the dial knows it: what a board records a
+    /// worker's Mac by ([`crate::board`]).
+    pub node: Option<String>,
 }
 
 /// THE FLEET CLIENT'S DRIVE DIAL the `aterm` binary links.
@@ -224,6 +228,14 @@ pub(crate) fn run(
         parts.extend(["--host".to_owned(), host.to_owned()]);
         return survey::run_survey(&parts, None, None, total, local);
     }
+    let board_read = board::is_board_verb(parts);
+    let board_wait = await_task::is_board_wait(parts);
+    if (board_read || board_wait) && is_any_host(host) {
+        return Err(refused(
+            "a board belongs to the Mac that keeps it: name that Mac with `--host <h>` (`aterm \
+             ctl board` reads this Mac's)",
+        ));
+    }
     let Some(drive) = local.fleet_drive else {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -231,6 +243,24 @@ pub(crate) fn run(
              link: run `aterm ctl --host …`",
         ));
     };
+    if board_read {
+        return board::run_read(parts, Some((host, total, drive)));
+    }
+    if board_wait {
+        // A worker of that board on this Mac is waited on here, never over a drive to itself.
+        let here = crate::resolve_sock_for(None).ok();
+        return await_task::run_board_wait(
+            parts,
+            total,
+            &await_task::BoardSite {
+                at: await_task::BoardAt::Host(host),
+                here: here.as_deref(),
+                own: local.fleet_node.and_then(|node| node()),
+            },
+            Some(drive),
+            &redial::Redial::none(),
+        );
+    }
     if await_task::is_await_task(parts) {
         if is_any_host(host) {
             return await_task::run_driven_any(parts, total, drive, local.fleet_survey);
@@ -249,6 +279,18 @@ pub(crate) fn run(
                  @<sel>",
             ));
         }
+        // `need=` is this client's to judge, by the survey `--host any` reads: no Mac is sent it.
+        let (needs, args): (Vec<String>, Vec<String>) = args
+            .iter()
+            .cloned()
+            .partition(|arg| arg.starts_with(any_host::NEED));
+        let args = args.as_slice();
+        if !needs.is_empty() && !is_any_host(host) {
+            return Err(refused(
+                "need= picks the Mac under --host any: with one Mac named, its survey says what \
+                 it holds (`aterm ctl survey --host <h>`)",
+            ));
+        }
         if !args.iter().any(|arg| arg.starts_with("agent=")) {
             if is_any_host(host) {
                 return Err(refused(
@@ -260,21 +302,32 @@ pub(crate) fn run(
                 drive(host, remaining).map_err(io::Error::other)
             });
         }
-        let head = spawn_head(args, worker_starter(env::var(SELF_SID_ENV).ok()).as_deref())?;
-        let chosen_host = if is_any_host(host) {
-            any_host_node(args, total, local)?
+        let (args, label) = board::take_label(args)?;
+        let starter = worker_starter(env::var(SELF_SID_ENV).ok());
+        let head = spawn_head(&args, starter.as_deref())?;
+        let (chosen_host, mut placed) = if is_any_host(host) {
+            any_host_node(&args, &needs, total, local)?
         } else {
-            host.to_owned()
+            (host.to_owned(), board::Placed::default())
         };
         let task = read_task_payload()?;
-        let (code, spawned_sid) = spawn_exchange(
-            drive(&chosen_host, within.get()).map_err(io::Error::other)?,
-            &format!("{head} len={}", task.len()),
-            &task,
-            within,
-        )?;
+        let link = drive(&chosen_host, within.get()).map_err(io::Error::other)?;
+        placed.node = placed
+            .node
+            .or_else(|| link.node.clone())
+            .or(Some(chosen_host));
+        placed.host = placed.host.or_else(|| Some(link.label.clone()));
+        let (code, spawned_sid) =
+            spawn_exchange(link, &format!("{head} len={}", task.len()), &task, within)?;
         if let Some(sid) = spawned_sid {
-            record_any_sid_host(&sid, &chosen_host);
+            board::record_spawned(&board::spawned(
+                &sid,
+                placed,
+                label,
+                (&args, &task),
+                starter.as_deref(),
+                board::now_ms(),
+            ));
         }
         return Ok(code);
     }
@@ -315,10 +368,22 @@ pub(crate) fn run(
     })
 }
 
+/// Whether a fleet spawn's `cwd=` value (`dir`, unquoted) names a folder of the driven Mac: an
+/// absolute path, or one in its home (`~`, `~/<path>`), which that Mac resolves.
+/// # Errors
+/// `~user`, or a home-relative path with a `..`: why.
+fn fleet_cwd(dir: &str) -> Result<bool, &'static str> {
+    match aterm_types::control_verbs::home_cwd(dir) {
+        Some(Ok(_)) => Ok(true),
+        Some(Err(why)) => Err(why),
+        None => Ok(dir.starts_with('/')),
+    }
+}
+
 /// A plain remote shell carries no task or command and names its one destination folder.
 fn shell_spawn_head(args: &[String]) -> io::Result<String> {
-    const FORM: &str = "a plain fleet shell is spawn cwd=/absolute [raise=false]; no task, \
-                        command or other options";
+    const FORM: &str = "a plain fleet shell is spawn cwd=/absolute|'cwd=~/<path>' [raise=false]; no \
+                        task, command or other options";
     let not = |arg: &str| {
         refused(format!(
             "{FORM}; not `{}`",
@@ -329,7 +394,13 @@ fn shell_spawn_head(args: &[String]) -> io::Result<String> {
     let mut raised = false;
     for arg in args {
         if let Some(dir) = arg.strip_prefix("cwd=") {
-            if !dir.starts_with('/') || cwd.replace(dir).is_some() {
+            if let Err(why) = fleet_cwd(dir) {
+                return Err(refused(format!(
+                    "{FORM}; `{}` {why}",
+                    aterm_codec::tty::one_line(arg, 32)
+                )));
+            }
+            if !fleet_cwd(dir).unwrap_or(false) || cwd.replace(dir).is_some() {
                 return Err(not(arg));
             }
         } else if arg == "raise=false" && !raised {
@@ -384,20 +455,25 @@ fn exchange_with_retry(
 
 /// How `--host any` is used ([`any_host_node`]).
 const ANY_USAGE: &str = "aterm ctl --host any spawn agent=<claude|codex> [model=<m>] \
-                         [autopilot=<land|cruise>] [cwd=<absolute folder there>] - < task";
+                         [autopilot=<land|cruise>] [need=repo:<name>,free:<n>g] \
+                         [cwd=<absolute folder there>|'cwd=~/<path>'] [label=<word>] - < task";
 
-/// The node a `--host any` spawn (its words after `spawn`, `args`) goes to ([`any_host`]): one
-/// survey of every member within the call's `--timeout` (`total`) where that is shorter than a
-/// survey's own, the pick, and a line on stderr naming it. The spawn is sent there as `--host
-/// <node>` sends it, and the worker's later verbs follow it there ([`record_any_sid_host`]).
+/// The node a `--host any` spawn (its words after `spawn`, `args`, and its `need=` words,
+/// `need_words`) goes to ([`any_host`]): one survey of every member within the call's `--timeout`
+/// (`total`) where that is shorter than a survey's own, the pick by its needs (and, for a
+/// `cwd=~/…`, a home the member names) and its accounts, and a line on stderr naming it; with
+/// where the board records the worker (that node, its host, and the account row it was chosen
+/// by, masked). The spawn is sent there as `--host <node>` sends it, and the worker's later verbs
+/// follow it there by its board row ([`board`]).
 /// # Errors
-/// `args` spawn no Claude Code or Codex worker, this client links no fleet, the survey was
-/// refused, or no member can take the worker.
+/// `args` spawn no Claude Code or Codex worker, `need_words` name no need this knows, this client
+/// links no fleet, the survey was refused, or no member can take the worker.
 fn any_host_node(
     args: &[String],
+    need_words: &[String],
     total: Option<Option<Duration>>,
     local: &LocalVerbs,
-) -> io::Result<String> {
+) -> io::Result<(String, board::Placed)> {
     let program = args
         .iter()
         .find_map(|a| a.strip_prefix("agent="))
@@ -408,6 +484,16 @@ fn any_host_node(
                  `{ANY_USAGE}`"
             ))
         })?;
+    let mut needs = any_host::needs_of(need_words).map_err(refused)?;
+    let home_relative = args.iter().any(|arg| {
+        arg.strip_prefix("cwd=")
+            .map(|dir| dir.trim_matches('"'))
+            .and_then(aterm_types::control_verbs::home_cwd)
+            .is_some()
+    });
+    if home_relative {
+        needs.push(any_host::Need::Home);
+    }
     let (Some(fleet_survey), Some(_)) = (local.fleet_survey, local.fleet_drive) else {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -419,8 +505,14 @@ fn any_host_node(
     let read =
         fleet_survey(&survey::FleetAsk { host: None, within }).map_err(fleet_survey_error)?;
     let members = any_host::members_of(&read.peers);
-    let chosen = any_host::pick(program, &members)
-        .map_err(|counts| refused(any_host::none_able(program, &counts, read.alone.as_deref())))?;
+    let chosen = any_host::pick(program, &needs, &members).map_err(|counts| {
+        refused(any_host::none_able(
+            program,
+            &needs,
+            &counts,
+            read.alone.as_deref(),
+        ))
+    })?;
     let member = chosen.member;
     let node = member
         .node
@@ -432,10 +524,16 @@ fn any_host_node(
             "--host any: chose {} ({}): {}",
             aterm_codec::tty::one_line(member.host(), 80),
             member.addr.as_deref().unwrap_or("address unknown"),
-            any_host::why(program, &chosen)
+            any_host::why(program, &needs, &chosen)
         ),
     )?;
-    Ok(node)
+    let placed = board::Placed {
+        node: Some(node.clone()),
+        host: Some(member.host().to_owned()),
+        account: (!chosen.row.label.is_empty())
+            .then(|| aterm_codec::tty::one_line(&survey::masked_label(&chosen.row.label), 32)),
+    };
+    Ok((node, placed))
 }
 
 /// Why a `hold <sid> off` cannot be sent to `host` by this machine, out of the fleet now or
@@ -565,14 +663,16 @@ fn turn_wait(args: &[String], session: Option<&str>, host: &str) -> io::Result<S
 
 /// The request line of a worker's spawn over a drive, without its `len=`:
 /// `spawn <args>`, where `args` end with `-` (the task is on stdin), name no
-/// `len=`, a `cwd=` only absolute — a folder of THIS Mac names nothing there,
-/// so none is added: that Mac's aterm starts it in its own default — and
-/// gain `from=<starter>` ([`worker_starter`]) when they name none.
+/// `len=`, a `cwd=` only absolute or in that Mac's home (`~/<path>`, which it
+/// resolves) — a folder of THIS Mac names nothing there, so none is added:
+/// that Mac's aterm starts it in its own default — and gain `from=<starter>`
+/// ([`worker_starter`]) when they name none.
 fn spawn_head(args: &[String], starter: Option<&str>) -> io::Result<String> {
     let usage = |why: &str| {
         refused(format!(
             "spawn agent= over the fleet: {why} (aterm ctl --host <h> spawn agent=<word> \
-             [model=<m>] [autopilot=<land|cruise>] [cwd=<absolute folder there>] - < task)"
+             [model=<m>] [autopilot=<land|cruise>] [cwd=<absolute folder there>|'cwd=~/<path>'] \
+             [label=<word>] - < task)"
         ))
     };
     if !args.iter().any(|a| a.starts_with("agent=")) {
@@ -592,10 +692,14 @@ fn spawn_head(args: &[String], starter: Option<&str>) -> io::Result<String> {
             .strip_prefix('"')
             .and_then(|d| d.strip_suffix('"'))
             .unwrap_or(dir);
-        if !dir.starts_with('/') {
-            return Err(usage(
-                "cwd= names a folder of that Mac, by its absolute path",
-            ));
+        match fleet_cwd(dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(usage(
+                    "cwd= names a folder of that Mac, by its absolute path or ~/<path> in its home",
+                ));
+            }
+            Err(why) => return Err(usage(&format!("cwd={dir} {why}"))),
         }
     }
     let mut parts = vec!["spawn".to_owned()];
@@ -619,7 +723,9 @@ fn spawn_exchange(
     task: &[u8],
     within: Within,
 ) -> io::Result<(ExitCode, Option<String>)> {
-    let DriveLink { mut stream, label } = link;
+    let DriveLink {
+        mut stream, label, ..
+    } = link;
     let go = aterm_types::control_verbs::task_frame_go(task.len());
     let go = go.trim_end_matches('\n');
     let cut = |e| closed(&label, head, within, e);
@@ -643,28 +749,11 @@ fn spawn_exchange(
     Ok((print_frame_answer(&answer)?, spawned_sid))
 }
 
-const ANY_HOSTS_FILE: &str = "driven-any-hosts.tsv";
-const ANY_HOSTS_MAX: usize = 512;
-
-#[cfg(test)]
-std::thread_local! {
-    static ANY_HOSTS_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn any_hosts_path() -> Option<std::path::PathBuf> {
-    #[cfg(test)]
-    if let Some(custom) = ANY_HOSTS_OVERRIDE.with(|cell| cell.borrow().clone()) {
-        return Some(custom);
-    }
-    super::socket_dir().map(|dir| dir.join(ANY_HOSTS_FILE))
-}
-
 fn is_any_host(host: &str) -> bool {
     host.eq_ignore_ascii_case(any_host::ANY)
 }
 
-fn spawned_sid_from_answer(answer: &str) -> Option<String> {
+pub(crate) fn spawned_sid_from_answer(answer: &str) -> Option<String> {
     let line = answer.trim_end_matches(['\r', '\n']);
     let rest = line.strip_prefix("OK ")?;
     rest.split_whitespace()
@@ -697,7 +786,6 @@ fn any_target_sid<'a>(
     ))
 }
 
-const MAX_ANY_HOSTS_BYTES: usize = 256 * 1024;
 const MAX_ANY_HOST_LEN: usize = 255;
 
 fn valid_any_host(host: &str) -> bool {
@@ -706,85 +794,6 @@ fn valid_any_host(host: &str) -> bool {
         && host.trim() == host
         && !is_any_host(host)
         && !host.chars().any(char::is_control)
-}
-
-fn read_any_sid_hosts() -> Vec<(String, String)> {
-    let Some(path) = any_hosts_path() else {
-        return Vec::new();
-    };
-    #[cfg(unix)]
-    let text = {
-        let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
-        else {
-            return Vec::new();
-        };
-        let Ok(bytes) = aterm_uds::private_file::read_private(parent, name, MAX_ANY_HOSTS_BYTES)
-        else {
-            return Vec::new();
-        };
-        let Ok(text) = String::from_utf8(bytes) else {
-            return Vec::new();
-        };
-        text
-    };
-    #[cfg(not(unix))]
-    let Ok((text, _)) = crate::read_bounded_regular_utf8(&path, MAX_ANY_HOSTS_BYTES as u64) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|line| {
-            let (sid, host) = line.split_once('\t')?;
-            let (sid, host) = (sid.trim(), host.trim());
-            (is_sid(sid) && valid_any_host(host)).then(|| (sid.to_owned(), host.to_owned()))
-        })
-        .collect()
-}
-
-fn record_any_sid_hosts(entries: &[(&str, &str)]) {
-    let valid: Vec<(&str, &str)> = entries
-        .iter()
-        .copied()
-        .filter(|(sid, host)| is_sid(sid) && valid_any_host(host))
-        .collect();
-    if valid.is_empty() {
-        return;
-    }
-    let Some(path) = any_hosts_path() else {
-        return;
-    };
-    let mut rows = read_any_sid_hosts();
-    for (sid, host) in valid {
-        rows.retain(|(existing_sid, _)| existing_sid != sid);
-        rows.push((sid.to_owned(), host.to_owned()));
-    }
-    if rows.len() > ANY_HOSTS_MAX {
-        let drop_n = rows.len() - ANY_HOSTS_MAX;
-        rows.drain(..drop_n);
-    }
-    let mut body = String::new();
-    for (s, h) in rows {
-        body.push_str(&s);
-        body.push('\t');
-        body.push_str(&h);
-        body.push('\n');
-    }
-    #[cfg(unix)]
-    if let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
-        && aterm_uds::private_file::ensure_private_dir(parent).is_ok()
-    {
-        let _ = aterm_uds::private_file::write_private(parent, name, body.as_bytes());
-    }
-    #[cfg(not(unix))]
-    {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&path, body.as_bytes());
-    }
-}
-
-pub(crate) fn record_any_sid_host(sid: &str, host: &str) {
-    record_any_sid_hosts(&[(sid, host)]);
 }
 
 fn survey_within_for_any(total: Option<Option<Duration>>) -> Duration {
@@ -801,21 +810,34 @@ fn fleet_survey_error(refused: survey::FleetRefused) -> io::Error {
     })
 }
 
+/// The Mac each of `sids` runs on, for `--host any @<sid> …` and `--host any await task @…`:
+/// the node this Mac's board recorded when it started that worker ([`board`]), and for a sid the
+/// board does not hold (another dispatcher's worker), the one member a fleet survey finds hosting
+/// it. A survey's finding is not written down: the board holds only workers this Mac started.
+/// # Errors
+/// A sid the board places on this Mac (`--host any` drives other Macs), a survey this client
+/// cannot run or was refused, or a sid no member, or more than one, hosts.
 pub(crate) fn resolve_any_sid_hosts(
     sids: &[&str],
     total: Option<Option<Duration>>,
     survey_fn: Option<crate::FleetSurveyFn>,
 ) -> io::Result<Vec<String>> {
-    let mut table = read_any_sid_hosts();
-    let lookup = |rows: &[(String, String)], target: &str| -> Option<String> {
-        rows.iter()
-            .rev()
-            .find(|(s, _)| s == target)
-            .map(|(_, h)| h.clone())
-    };
+    let board = board::Board::here();
+    let mut placed: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+    for &sid in sids {
+        if let Some(row) = board.as_ref().and_then(|b| b.row(sid)) {
+            placed.insert(sid.to_owned(), row.node.filter(|n| valid_any_host(n)));
+        }
+    }
+    if let Some((sid, _)) = placed.iter().find(|(_, node)| node.is_none()) {
+        return Err(refused(format!(
+            "@{sid} runs on this Mac, by its board: drop `--host any` to reach it"
+        )));
+    }
     let mut discovered: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
-    if sids.iter().any(|sid| lookup(&table, sid).is_none()) {
+    if sids.iter().any(|sid| !placed.contains_key(*sid)) {
         let Some(survey_fn) = survey_fn else {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -844,7 +866,7 @@ pub(crate) fn resolve_any_sid_hosts(
             for session in &survey.sessions {
                 if let Some(found_sid) = session.get("sid") {
                     let clean = found_sid.trim_start_matches('@');
-                    if is_sid(clean) && lookup(&table, clean).is_none() {
+                    if is_sid(clean) && !placed.contains_key(clean) {
                         let nodes = discovered.entry(clean.to_owned()).or_default();
                         if !nodes.iter().any(|existing| existing == node) {
                             nodes.push(node.to_owned());
@@ -853,35 +875,103 @@ pub(crate) fn resolve_any_sid_hosts(
                 }
             }
         }
-        let unique: Vec<(&str, &str)> = discovered
-            .iter()
-            .filter_map(|(sid, nodes)| {
-                (nodes.len() == 1).then_some((sid.as_str(), nodes[0].as_str()))
-            })
-            .collect();
-        record_any_sid_hosts(&unique);
-        for (sid, node) in unique {
-            table.push((sid.to_owned(), node.to_owned()));
-        }
     }
 
     let mut out = Vec::with_capacity(sids.len());
     for &sid in sids {
-        if let Some(host) = lookup(&table, sid) {
-            out.push(host);
+        if let Some(Some(node)) = placed.get(sid) {
+            out.push(node.clone());
             continue;
         }
-        if let Some(nodes) = discovered.get(sid).filter(|nodes| nodes.len() > 1) {
-            return Err(io::Error::other(format!(
-                "--host any found @{sid} on multiple fleet peers ({})",
-                nodes.join(", ")
-            )));
+        match discovered.get(sid).map(Vec::as_slice) {
+            Some([node]) => out.push(node.clone()),
+            Some(nodes) if nodes.len() > 1 => {
+                return Err(io::Error::other(format!(
+                    "--host any found @{sid} on multiple fleet peers ({})",
+                    nodes.join(", ")
+                )));
+            }
+            _ => {
+                return Err(io::Error::other(format!(
+                    "--host any found no live fleet peer hosting @{sid}"
+                )));
+            }
         }
-        return Err(io::Error::other(format!(
-            "--host any found no live fleet peer hosting @{sid}"
-        )));
     }
     Ok(out)
+}
+
+/// `<host>`'s board, read over a drive within `total` (the call's `--timeout`, else a drive's
+/// own wait): `board` sent as `aterm ctl --host <host> board` sends it, a busy answer asked
+/// again until the deadline, and the `OK <n>` reply parsed ([`board::parse_reply`]).
+/// # Errors
+/// The drive was refused, the host answered `ERR …` (an older aterm that serves no board, or a
+/// member that does not let this Mac drive it), or the reply was cut or malformed.
+pub(crate) fn read_board(
+    host: &str,
+    total: Option<Option<Duration>>,
+    drive: FleetDriveFn,
+) -> io::Result<board::Read> {
+    let within = drive_within(total);
+    let started = Instant::now();
+    loop {
+        let remaining = within.get().saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{host} remained busy until this call's deadline; its board was not read"),
+            ));
+        }
+        let link = drive(host, remaining).map_err(io::Error::other)?;
+        match board_exchange(link, within)? {
+            Some(lines) => {
+                return board::parse_reply(&lines).map_err(|why| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("{host}'s board: {why}"))
+                });
+            }
+            None => std::thread::sleep(Duration::from_millis(50).min(remaining)),
+        }
+    }
+}
+
+/// `board` over `link` and its rows; `None` where the peer answered busy (nothing was read).
+/// # Errors
+/// The peer answered `ERR …`, cut the reply, or sent no `OK <n>` header.
+fn board_exchange(link: DriveLink, within: Within) -> io::Result<Option<Vec<String>>> {
+    const REQUEST: &str = "board\n";
+    let DriveLink {
+        mut stream, label, ..
+    } = link;
+    let cut = |e| closed(&label, REQUEST, within, e);
+    stream
+        .write_all(REQUEST.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(cut)?;
+    let mut reader = BufReader::new(stream);
+    let mut status = String::new();
+    if read_status_line(&mut reader, &mut status).map_err(cut)? == 0 {
+        return Err(cut(io::Error::from(io::ErrorKind::UnexpectedEof)));
+    }
+    let complete = status.ends_with('\n');
+    let status = status.trim_end_matches(['\r', '\n']);
+    if complete
+        && status == aterm_types::control_verbs::CONTROL_BUSY_REPLY
+        && reader.buffer().is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(tail) = status.strip_prefix("OK ") else {
+        return Err(io::Error::other(format!("{label}: {status}")));
+    };
+    let count = stream_count(tail).ok_or_else(|| malformed_header_error(status))?;
+    let mut rows = collect_reply_lines(count, MAX_BODY_BYTES, |line| {
+        read_bounded_line(&mut reader, line)
+    })
+    .map_err(cut)?;
+    for row in &mut rows {
+        row.truncate(row.trim_end_matches(['\r', '\n']).len());
+    }
+    Ok(Some(rows))
 }
 
 /// A connection the peer closed, cut or left unanswered past `within` before it answered
@@ -981,7 +1071,9 @@ enum Exchange {
 }
 
 fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::Result<Exchange> {
-    let DriveLink { mut stream, label } = link;
+    let DriveLink {
+        mut stream, label, ..
+    } = link;
     let cut = |e| closed(&label, request, within, e);
     stream
         .write_all(request.as_bytes())

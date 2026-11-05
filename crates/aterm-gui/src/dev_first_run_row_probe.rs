@@ -83,7 +83,7 @@ fn wait_step(path: &Path, wanted: u8) -> bool {
     loop {
         let opened = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path);
         if let Ok(mut file) = opened
             && file.metadata().is_ok_and(|m| m.file_type().is_file())

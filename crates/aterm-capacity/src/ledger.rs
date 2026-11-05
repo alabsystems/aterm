@@ -61,6 +61,17 @@ pub enum Accounting {
     Holder,
     /// Retain the entire budget; a dead or reused holder and closed guards prove no drain.
     Whole,
+    /// An ordinary detached memory claim reserves its full peak without numeric holder
+    /// credit or ancestry. It ends at the final actual guard close, not a cohort journal.
+    Detached,
+}
+
+pub(crate) const DETACHED_MEMORY: &[u8] = b"@aterm-detached-memory/1\n";
+#[cfg(all(test, unix))]
+thread_local! { static DETACH_FAIL: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+#[cfg(all(test, unix))]
+pub(crate) fn fail_detach_after_bytes(bytes: usize) {
+    DETACH_FAIL.with(|failure| failure.set(Some(bytes)));
 }
 
 /// The most of a claim file any reader takes, and where its lock's range starts on Windows: the record lies before it.
@@ -337,7 +348,21 @@ impl Record {
     #[must_use]
     pub fn decode(text: &str, held: bool) -> Option<Record> {
         let mut lines = text.lines();
-        let head: Value = aterm_json::from_str(lines.next()?).ok()?;
+        let encoded_head = lines.next()?;
+        let poisoned = encoded_head.starts_with('@');
+        let restored;
+        let head = if poisoned {
+            // Old readers reject this non-JSON head. Restore it only in memory after the
+            // complete monotone final event exists; an interrupted transfer stays unknown.
+            if !held || !text.as_bytes().ends_with(DETACHED_MEMORY) {
+                return None;
+            }
+            restored = format!("{{{}", encoded_head.strip_prefix('@')?);
+            restored.as_str()
+        } else {
+            encoded_head
+        };
+        let head: Value = aterm_json::from_str(head).ok()?;
         if head.get("v").and_then(Value::as_u64) != Some(1) {
             return None;
         }
@@ -379,20 +404,36 @@ impl Record {
             alone: head.get("alone").and_then(Value::as_bool) == Some(true),
             covers: head.get("covers").and_then(Value::as_bool) == Some(true),
             stuck_ends: None,
+            at_bound: crate::AtBound::Refuse,
         };
         // The lines after the head, in the order they were added: a quiet waiter's `next_ms`,
         // the admission, then the measured writes' (written over in place) and each credit,
         // whichever came first.
         let mut malformed_after = false;
+        let mut detached = false;
+        let mut bad_detach = false;
         let after: Vec<Value> = lines
-            .filter_map(|l| match aterm_json::from_str::<Value>(l) {
-                Ok(value) => Some(value),
-                Err(_) => {
-                    malformed_after = true;
-                    None
+            .filter_map(|l| {
+                if l.starts_with('@') {
+                    if l.as_bytes() == &DETACHED_MEMORY[..DETACHED_MEMORY.len() - 1] && !detached {
+                        detached = true;
+                    } else {
+                        bad_detach = true;
+                    }
+                    return None;
+                }
+                match aterm_json::from_str::<Value>(l) {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        malformed_after = true;
+                        None
+                    }
                 }
             })
             .collect();
+        if bad_detach || detached != poisoned || (detached && (!held || !memory_only(&need))) {
+            return None;
+        }
         let explicit_held = after.iter().find_map(|v| {
             Some(Held {
                 admitted_ms: num(v, "admitted_ms")?,
@@ -400,6 +441,9 @@ impl Record {
                 alone: v.get("alone").and_then(Value::as_bool) == Some(true),
             })
         });
+        if detached && (explicit_held.is_none() || malformed_after) {
+            return None;
+        }
         let held = held.then(|| {
             explicit_held.unwrap_or(Held {
                 admitted_ms: start_ms,
@@ -442,7 +486,11 @@ impl Record {
             timing.admitted_ms = actual;
         }
         Some(Record {
-            accounting: Accounting::Holder,
+            accounting: if detached {
+                Accounting::Detached
+            } else {
+                Accounting::Holder
+            },
             pid: u32::try_from(num(&head, "pid")?).ok()?,
             start_ms,
             seq: num(&head, "seq")?,
@@ -458,6 +506,36 @@ impl Record {
             wrote,
             next_ms,
         })
+    }
+}
+
+pub(crate) fn memory_only(need: &Need) -> bool {
+    need.mem > 0
+        && need.cores == 0
+        && need.disk == 0
+        && need.quiet.is_none()
+        && need.quiet_policy == crate::QuietPolicy::Load
+        && !need.covers
+}
+
+/// An optional owner is needed only for consuming transfer out of Laid's Drop. Normal
+/// callers still dereference the same RecordLock; None is never observable by a live Laid.
+#[derive(Debug)]
+struct ClaimLock(Option<RecordLock>);
+impl From<RecordLock> for ClaimLock {
+    fn from(lock: RecordLock) -> Self {
+        Self(Some(lock))
+    }
+}
+impl std::ops::Deref for ClaimLock {
+    type Target = RecordLock;
+    fn deref(&self) -> &RecordLock {
+        self.0.as_ref().expect("live claim lock")
+    }
+}
+impl std::ops::DerefMut for ClaimLock {
+    fn deref_mut(&mut self) -> &mut RecordLock {
+        self.0.as_mut().expect("live claim lock")
     }
 }
 
@@ -491,13 +569,15 @@ fn next_seq() -> u64 {
 /// A locked claim file. Dropping a cohort claim preserves its file while work is live or unknown.
 #[derive(Debug)]
 pub(crate) struct Laid {
-    lock: RecordLock,
+    lock: ClaimLock,
     path: PathBuf,
     /// The grant its file has written ([`Ledger::admit`]): a rename that failed after it is tried
     /// again under that grant, without writing another.
     granted: Option<Held>,
     #[cfg(unix)]
     custody: Option<cohort_ledger::Custody>,
+    #[cfg(unix)]
+    detaching: Option<Vec<u8>>,
 }
 
 impl Laid {
@@ -509,6 +589,10 @@ impl Laid {
     /// Add `line` to the record, refused where it would reach into the room kept for the
     /// measured writes' line ([`Self::wrote`]) before [`RECORD_MAX`], which no reader passes.
     pub(crate) fn append(&mut self, line: &str) -> io::Result<()> {
+        #[cfg(unix)]
+        if self.detaching.is_some() {
+            return Err(io::Error::other("memory detachment intent is pending"));
+        }
         #[cfg(unix)]
         if self.custody.is_some() {
             return self.append_cohort(line);
@@ -527,6 +611,10 @@ impl Laid {
     /// Write `bytes` as the admitted claim's measured writes ([`Record::wrote`]): the line appended
     /// the first time, at the offset kept in `at`, and written over in place after, at one length.
     pub(crate) fn wrote(&mut self, at: &mut Option<u64>, bytes: u64) -> io::Result<()> {
+        #[cfg(unix)]
+        if self.detaching.is_some() {
+            return Err(io::Error::other("memory detachment intent is pending"));
+        }
         #[cfg(unix)]
         if self.custody.is_some() {
             return self.wrote_cohort(at, bytes);
@@ -550,6 +638,129 @@ impl Laid {
 
 #[cfg(unix)]
 impl Laid {
+    fn check_named_memory(&self) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let original = self.lock.metadata()?;
+        let named = std::fs::symlink_metadata(&self.path)?;
+        if !named.is_file() || (named.dev(), named.ino()) != (original.dev(), original.ino()) {
+            return Err(io::Error::other(
+                "the original memory claim path was replaced",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn detach_memory(&mut self) -> io::Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        if self.custody.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cohort claims cannot detach ordinary memory custody",
+            ));
+        }
+        self.check_named_memory()?;
+        let ledger = Ledger::at(
+            self.path
+                .parent()
+                .ok_or_else(|| io::Error::other("memory claim has no ledger"))?,
+        );
+        if ledger.cohort_aware()? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "detachment cannot replace cohort accounting",
+            ));
+        }
+        // Legacy readers hold this original turn through scan/decide/grant. Once this turn
+        // is ours, none can carry a pre-poison Holder observation past the durable handoff.
+        let _turn = ledger.try_turn()?.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the original ledger admission turn is held",
+            )
+        })?;
+        self.check_named_memory()?;
+        if self.detaching.is_none() {
+            let offset = self.lock.metadata()?.len();
+            if offset.saturating_add(DETACHED_MEMORY.len() as u64) > RECORD_MAX {
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "detached memory marker exceeds the original record bound",
+                ));
+            }
+            let mut original = vec![0; offset as usize];
+            self.lock.read_exact_at(&mut original, 0)?;
+            if original.first() != Some(&b'{') {
+                return Err(io::Error::other(
+                    "the original memory claim is not a plain JSON header",
+                ));
+            }
+            // Record exact original bytes BEFORE any intent byte can reach disk.
+            self.detaching = Some(original);
+        }
+        let original = self.detaching.as_ref().expect("detachment intent");
+        let offset = original.len() as u64;
+        let mut base = vec![0; original.len()];
+        self.lock.read_exact_at(&mut base, 0)?;
+        let mut poisoned = original.clone();
+        poisoned[0] = b'@';
+        if &base != original && base != poisoned {
+            return Err(io::Error::other(
+                "detachment intent's original record changed",
+            ));
+        }
+        let length = self.lock.metadata()?.len();
+        let tail_len = length
+            .checked_sub(offset)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n <= DETACHED_MEMORY.len())
+            .ok_or_else(|| io::Error::other("detachment intent has an unknown tail"))?;
+        let mut tail = vec![0; tail_len];
+        self.lock.read_exact_at(&mut tail, offset)?;
+        if !DETACHED_MEMORY.starts_with(&tail) {
+            return Err(io::Error::other("detachment intent has foreign bytes"));
+        }
+        if &base == original {
+            if tail_len != 0 {
+                return Err(io::Error::other(
+                    "an unpoisoned memory record cannot have a detached tail",
+                ));
+            }
+            // A single-byte irreversible poison makes every old JSON-head reader fail
+            // closed before any tail event can become visible. Never write '{' again.
+            self.lock.write_all_at(b"@", 0)?;
+        }
+        // Order the old-reader fence before appending intent, including on a retry after a
+        // failed poison flush. No descriptor is exported until the final event also flushes.
+        aterm_durable::Flush::Durable.file(&self.lock)?;
+        // Never remove an existing intent byte: a concurrent reader or owner crash must
+        // not expose Holder again. Complete only this exact original owner's missing suffix.
+        let remaining = &DETACHED_MEMORY[tail_len..];
+        self.lock.seek(SeekFrom::Start(length))?;
+        #[cfg(test)]
+        if let Some(bytes) = DETACH_FAIL.with(|failure| failure.take()) {
+            self.lock
+                .write_all(&remaining[..bytes.min(remaining.len())])?;
+            return Err(io::Error::other(
+                "injected original memory intent write/flush failure",
+            ));
+        }
+        self.lock.write_all(remaining)?;
+        aterm_durable::Flush::Durable.file(&self.lock)?;
+        self.check_named_memory()?;
+        Ok(())
+    }
+
+    pub(crate) fn into_close_only(mut self) -> aterm_toolchain::record_lock::CloseOnlyLock {
+        self.lock
+            .0
+            .take()
+            .expect("live claim lock")
+            .into_close_only()
+    }
+
+    pub(crate) fn detach_pending(&self) -> bool {
+        self.detaching.is_some()
+    }
     /// A close-on-exec copy of the claim file's descriptor: the same open file description, so
     /// the same lock, which the kernel lets go only once every descriptor of it is closed (or one
     /// of them lets it go).
@@ -626,10 +837,11 @@ impl Laid {
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
         };
         let laid = Laid {
-            lock,
+            lock: lock.into(),
             path: path.to_path_buf(),
             granted: None,
             custody: None,
+            detaching: None,
         };
         let mut text = String::new();
         let stamp = |m: &std::fs::Metadata| {
@@ -646,7 +858,10 @@ impl Laid {
         let read = (|| {
             use std::os::unix::fs::FileExt as _;
             let before = laid.lock.metadata()?;
-            let mut bytes = vec![0u8; RECORD_MAX as usize + 1];
+            let cap = usize::try_from(before.len().min(RECORD_MAX))
+                .unwrap_or(RECORD_MAX as usize)
+                .saturating_add(1);
+            let mut bytes = vec![0u8; cap];
             let mut length = 0;
             while length < bytes.len() {
                 let read = laid.lock.read_at(&mut bytes[length..], length as u64)?;
@@ -658,7 +873,8 @@ impl Laid {
             if length as u64 > RECORD_MAX {
                 return Err(refused("claim record is too large"));
             }
-            if stamp(&before) != stamp(&laid.lock.metadata()?)
+            if length as u64 != before.len()
+                || stamp(&before) != stamp(&laid.lock.metadata()?)
                 || stamp(&before) != stamp(&std::fs::symlink_metadata(path)?)
             {
                 return Err(refused(
@@ -696,6 +912,12 @@ impl Laid {
         });
         match decoded {
             Ok((record, custody)) => {
+                if record.accounting == Accounting::Detached {
+                    drop(laid.into_close_only());
+                    return Err(refused(
+                        "detached memory requires close-only adoption, not an ordinary claim writer",
+                    ));
+                }
                 let mut laid = laid;
                 laid.granted = record.held;
                 laid.custody = custody;
@@ -715,6 +937,23 @@ impl Laid {
 
 impl Drop for Laid {
     fn drop(&mut self) {
+        if self.lock.0.is_none() {
+            return;
+        }
+        #[cfg(unix)]
+        if self.detaching.is_some() {
+            // Unknown intent cannot run the ordinary unlink/unlock destructor. A copied
+            // actual guard keeps the original record held; final close still ends this
+            // ordinary lifetime. Never apply this policy to cohort writer custody.
+            drop(
+                self.lock
+                    .0
+                    .take()
+                    .expect("live claim lock")
+                    .into_close_only(),
+            );
+            return;
+        }
         #[cfg(unix)]
         if self.custody.is_some() {
             self.drop_cohort();
@@ -1009,11 +1248,9 @@ impl Ledger {
             use std::os::unix::fs::OpenOptionsExt as _;
             options
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
-        let file: File = options.open(&taking)?;
-        #[cfg(unix)]
-        let _ = aterm_uds::keep_out_of_children(&file);
+        let file: File = aterm_uds::kept_out(|| options.open(&taking))?;
         let lock = match RecordLock::try_lock(file, RECORD_MAX) {
             Ok(lock) => lock,
             Err(e) => {
@@ -1028,11 +1265,13 @@ impl Ledger {
             }
         };
         let mut laid = Laid {
-            lock,
+            lock: lock.into(),
             path: taking,
             granted: None,
             #[cfg(unix)]
             custody: None,
+            #[cfg(unix)]
+            detaching: None,
         };
         laid.lock.write_all(record.head_line().as_bytes())?;
         std::fs::rename(&laid.path, &path)?;
@@ -1202,7 +1441,7 @@ pub(crate) fn open_rendezvous(path: &Path) -> io::Result<File> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = options.open(path)?;
+    let file = aterm_uds::kept_out(|| options.open(path))?;
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(io::Error::new(
@@ -1221,8 +1460,6 @@ pub(crate) fn open_rendezvous(path: &Path) -> io::Result<File> {
             ));
         }
     }
-    #[cfg(unix)]
-    let _ = aterm_uds::keep_out_of_children(&file);
     Ok(file)
 }
 

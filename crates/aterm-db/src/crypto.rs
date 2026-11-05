@@ -12,7 +12,7 @@ use aterm_digest::Sha256;
 use ring::{
     aead,
     rand::{SecureRandom, SystemRandom},
-    signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey},
+    signature::{Ed25519KeyPair, KeyPair},
 };
 
 /// Maximum plaintext transaction size; checked before allocation or decryption.
@@ -42,7 +42,8 @@ pub fn public(seed: &[u8; 32]) -> Result<[u8; 32]> {
         .map_err(|_| Error::new("invalid public key size"))
 }
 pub(crate) fn signed(seed: &[u8; 32], domain: &[u8], body: &[u8]) -> Result<[u8; 64]> {
-    let mut message = domain.to_vec();
+    let mut message = Vec::with_capacity(domain.len() + body.len());
+    message.extend_from_slice(domain);
     message.extend_from_slice(body);
     pair(seed)?
         .sign(&message)
@@ -50,18 +51,25 @@ pub(crate) fn signed(seed: &[u8; 32], domain: &[u8], body: &[u8]) -> Result<[u8;
         .try_into()
         .map_err(|_| Error::new("invalid signature size"))
 }
+/// Whether `signature` is `key`'s over `domain` then `body`, strictly
+/// ([`astream_aead::signature::verify`]): a small-order key or commitment, or a signature that
+/// is not 64 bytes, verifies nothing.
 pub(crate) fn verify(key: &[u8; 32], domain: &[u8], body: &[u8], signature: &[u8]) -> Result<()> {
-    let mut message = domain.to_vec();
+    let Ok(signature) = <&[u8; 64]>::try_from(signature) else {
+        return Err(Error::new("database signature did not verify"));
+    };
+    let mut message = Vec::with_capacity(domain.len() + body.len());
+    message.extend_from_slice(domain);
     message.extend_from_slice(body);
-    UnparsedPublicKey::new(&ED25519, key)
-        .verify(&message, signature)
-        .map_err(|_| Error::new("database signature did not verify"))
+    astream_aead::signature::verify(key, &message, signature)
+        .then_some(())
+        .ok_or_else(|| Error::new("database signature did not verify"))
 }
 
 /// Immutable dataset/audience generation. Each audience has a separate key and journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
-    /// Random dataset identity, not a human label or address.
+    /// Dataset identity digest, not a human label or address.
     pub id: Digest,
     /// Bootstrap authority's Ed25519 public key.
     pub root: [u8; 32],
@@ -73,13 +81,23 @@ pub struct Manifest {
 impl Manifest {
     /// Create and sign a dataset descriptor.
     pub fn create(seed: &[u8; 32], namespace: &str) -> Result<Self> {
+        Self::deterministic(seed, random::<32>()?, random::<16>()?, namespace)
+    }
+    /// Create and sign a deterministic dataset descriptor from fixed inputs.
+    pub fn deterministic(
+        seed: &[u8; 32],
+        id: [u8; 32],
+        control_incarnation: [u8; 16],
+        namespace: &str,
+    ) -> Result<Self> {
         if !name(namespace) {
             return Err(Error::new("invalid database namespace"));
         }
-        let mut bytes = b"ATDB1".to_vec();
-        bytes.extend_from_slice(&random::<32>()?);
+        let mut bytes = Vec::with_capacity(5 + 32 + 32 + 16 + 1 + namespace.len() + 64);
+        bytes.extend_from_slice(b"ATDB1");
+        bytes.extend_from_slice(&id);
         bytes.extend_from_slice(&public(seed)?);
-        bytes.extend_from_slice(&random::<16>()?);
+        bytes.extend_from_slice(&control_incarnation);
         bytes.push(namespace.len() as u8);
         bytes.extend_from_slice(namespace.as_bytes());
         bytes.extend_from_slice(&signed(seed, b"aterm-db/manifest/1", &bytes)?);
@@ -157,7 +175,8 @@ impl Capability {
                 "this replica does not hold database admission authority",
             ));
         }
-        let mut raw = manifest.id.to_vec();
+        let mut raw = Vec::with_capacity(CAP_LEN);
+        raw.extend_from_slice(&manifest.id);
         raw.extend_from_slice(&actor);
         raw.push(if control { 2 } else { 1 });
         raw.extend_from_slice(&signed(root_seed, b"aterm-db/writer/1", &raw)?);
@@ -258,7 +277,10 @@ pub fn seal_at(
             "operation exceeds bounds or signing identity differs",
         ));
     }
-    let mut wire = b"ATDO2".to_vec();
+    let mut wire = Vec::with_capacity(
+        5 + 32 + CAP_LEN + 8 + 8 + 32 + 1 + parents.len() * 32 + 32 + 4 + plaintext.len() + 16 + 64,
+    );
+    wire.extend_from_slice(b"ATDO2");
     wire.extend_from_slice(&manifest.id);
     wire.extend_from_slice(cap.bytes());
     wire.extend_from_slice(&sequence.to_le_bytes());
@@ -271,7 +293,8 @@ pub fn seal_at(
     let salt = random::<32>()?;
     wire.extend_from_slice(&salt);
     wire.extend_from_slice(&((plaintext.len() + 16) as u32).to_le_bytes());
-    let mut body = plaintext.to_vec();
+    let mut body = Vec::with_capacity(plaintext.len() + 16);
+    body.extend_from_slice(plaintext);
     cipher(key, &salt, &wire)?
         .seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key([0; 12]),
@@ -349,8 +372,10 @@ pub fn open(manifest: &Manifest, key: &[u8; 32], wire: &[u8]) -> Result<Opened> 
     })
 }
 pub(crate) fn cipher(key: &[u8; 32], salt: &[u8; 32], header: &[u8]) -> Result<aead::LessSafeKey> {
+    const PREFIX: &[u8] = b"aterm-db/payload/1";
     let prk = zeroize::Zeroizing::new(aterm_digest::hkdf_extract(salt, key));
-    let mut info = b"aterm-db/payload/1".to_vec();
+    let mut info = Vec::with_capacity(PREFIX.len() + header.len());
+    info.extend_from_slice(PREFIX);
     info.extend_from_slice(header);
     let subkey = zeroize::Zeroizing::new(aterm_digest::hkdf_expand_32(&prk, &info));
     Ok(aead::LessSafeKey::new(

@@ -869,7 +869,7 @@ fn the_real_read_runs_a_child_and_says_why_in_a_word() {
         ChildRunner {
             program: PathBuf::from("/bin/sh"),
             args: vec!["-c".to_string(), script.to_string()],
-            cap: READ_CAP,
+            cap: aterm_spec::wait::MUST_HAPPEN,
         }
         .run()
     };

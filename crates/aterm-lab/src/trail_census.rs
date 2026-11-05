@@ -1656,7 +1656,7 @@ pub fn report(a: &Args) -> Result<J, String> {
     let core = scene.core();
     if let Some(path) = &a.pixels {
         let path = from_caller(path);
-        std::fs::write(&path, scene.pixels(&core))
+        crate::util::write_fresh(Path::new(&path), scene.pixels(&core))
             .map_err(|e| format!("cannot write {path}: {e}"))?;
     }
     let layers = scene.layers(&core);

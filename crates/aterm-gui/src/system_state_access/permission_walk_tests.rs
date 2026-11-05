@@ -831,7 +831,7 @@ fn watched(lan: bool) -> App {
     app.person_asked_for_access();
     approve(&mut app, 1);
     assert!(
-        app.person_permission_admission_stands(),
+        app.permission_steps_admitted(),
         "precondition: the person's press admits the walk"
     );
     app.devtools_helper.note_cold_start();

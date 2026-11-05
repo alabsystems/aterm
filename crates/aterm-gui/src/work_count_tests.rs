@@ -400,7 +400,7 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
 #[cfg(debug_assertions)]
 fn apply_config_text(app: &mut App, dir: &std::path::Path, text: &str) {
     let path = dir.join("aterm.toml");
-    std::fs::write(&path, text).expect("write config");
+    crate::test_scratch::write_config(&path, text);
     let observation =
         crate::native_config_service::VersionedConfigService::observe_path(&path, false)
             .expect("observe");

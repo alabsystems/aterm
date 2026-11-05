@@ -55,7 +55,10 @@ fn stale_native_lock_recovery_refuses_fresh_future_or_unowned_shapes() {
         match case {
             4 => std::fs::write(&path, b"not a lock directory").unwrap(),
             5 => symlink(home.path(), &path).unwrap(),
-            _ => std::fs::create_dir(&path).unwrap(),
+            _ => std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap(),
         }
         if case == 3 {
             std::fs::write(path.join("keep"), b"not an empty native lock").unwrap();

@@ -179,12 +179,14 @@ impl Inst {
             cap.display(),
             root.join("link").display()
         );
-        std::fs::write(
-            root.join("cfg/aterm/aterm.toml"),
+        aterm_uds::atomic_file::write(
+            &root.join("cfg/aterm/aterm.toml"),
             format!(
                 "tab_strip_rows = 1\n{}{FIXTURE_GUI_CONFIG}\n[fabric]\ncommand = \"{fabric_cmd}\"\n{}\n{}",
                 opts.top, opts.fabric, opts.config
-            ),
+            )
+            .as_bytes(),
+            0o600,
         )
         .expect("the config");
         if let Some(bin) = &opts.path_first {
@@ -768,10 +770,11 @@ fn cli(inst: &Inst, args: &[&str]) -> (i32, String, String) {
 
 /// `<aterm> <args>` as [`cli`] runs it on the machine whose scratch is `root`: its HOME, config,
 /// runtime, state and temporary dirs, and nothing of the test's `ATERM_*` but the verify run's
-/// mark ([`harness::kept_from_runner`]). A `ctl survey`'s probe of each instance and a `fabric
-/// brief`'s read of the bus, which serve, wait half the hang detector
-/// ([`aterm_ctl::PROBE_WITHIN_SEAM`], [`harness::FABRIC_IO_WAIT`]), not their 2 s and 3 s, so
-/// one that never answers is reported before the run is killed.
+/// mark ([`harness::kept_from_runner`]). A `ctl survey`'s probe of each instance, a `fabric
+/// brief`'s read of the bus and a `link notify`'s broker answers, which serve, wait half the hang
+/// detector ([`aterm_ctl::PROBE_WITHIN_SEAM`], [`harness::FABRIC_IO_WAIT`], the seam of
+/// [`harness::ACK_WAIT`]), not their 2 s, 3 s and 5 s, so one that never answers is reported
+/// before the run is killed.
 pub(crate) fn cli_command(aterm: &str, root: &Path, args: &[&str]) -> aterm_uds::spawnfd::Command {
     let mut cmd = aterm_uds::spawnfd::command(aterm);
     harness::kept_from_runner(&mut cmd)
@@ -784,6 +787,7 @@ pub(crate) fn cli_command(aterm: &str, root: &Path, args: &[&str]) -> aterm_uds:
             harness::FABRIC_IO_WAIT.0,
             harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
         )
+        .env(harness::ACK_WAIT.0, (DEADLINE / 2).as_millis().to_string())
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("cfg"))
         .env("XDG_RUNTIME_DIR", root.join("run"))
@@ -1975,8 +1979,8 @@ fn idle_composer() -> String {
 /// scratch `die` file appears, and exits 0 (a clean `/exit`) once the scratch `quit` file does.
 /// While the scratch `hold-register` file exists, a launch that resumes (`--resume`) writes its
 /// session file, and draws its composer, only once the scratch `register` file appears: an agent
-/// that registers its conversation late.
-fn write_relaunch_fake(inst: &Inst) {
+/// that registers its conversation late. It runs on `interpreter`.
+fn write_relaunch_fake(inst: &Inst, interpreter: Interpreter) {
     let fake = fake_path(inst);
     for d in [
         fake.parent().expect("agents/"),
@@ -1986,10 +1990,15 @@ fn write_relaunch_fake(inst: &Inst) {
         std::fs::create_dir_all(d).expect("mkdir");
     }
     std::fs::write(inst.root.join("sc/idle.txt"), idle_composer()).expect("idle screen");
+    let interpreter = match interpreter {
+        Interpreter::Own => harness::own_image(&inst.root, "bash"),
+        Interpreter::Platform => PathBuf::from("/bin/sh"),
+    };
     let text = format!(
-        "#!/bin/sh\n\
+        "#!{}\n\
          case \"$1\" in --version) echo '2.1.281 (Claude Code)'; exit 0 ;; esac\n\
          tmp=${{HOME%/home}}\n\
+         printf '%s\\n' \"$PPID\" > \"$tmp/relaunch-parent\"\n\
          echo \"$$ $*\" >> \"$tmp/launches.log\"\n\
          stty -icanon -echo min 0 time 2 2>/dev/null\n\
          sid={CONVERSATION}; prev=\n\
@@ -2019,7 +2028,8 @@ fn write_relaunch_fake(inst: &Inst) {
          \x20 \"$esc\"*) ;;\n\
          \x20 *) printf '\\033[%s;3H\\033[K[Pasted text #1]' \"$r\" ;;\n\
          \x20 esac\n\
-         done\n"
+         done\n",
+        interpreter.display()
     );
     std::fs::write(&fake, text).expect("the stand-in");
     use std::os::unix::fs::PermissionsExt as _;
@@ -2101,6 +2111,15 @@ fn relaunch_leg(shell: &str, rc: Option<&str>, elsewhere: bool, late: bool) -> S
                 lines.any(|l| l.contains(&supervising)).then_some(())
             },
         );
+        let early = match std::fs::read(a.root.join(format!("typed-{}.log", got[1].0))) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("the pre-registration input journal: {error}"),
+        };
+        assert!(
+            early.is_empty(),
+            "no continuation reaches the agent before it registers: {early:?}"
+        );
         std::fs::write(a.root.join("register"), "").expect("the registration");
     }
     assert_eq!(got.len(), 2, "relaunched once: {got:?}");
@@ -2137,13 +2156,49 @@ fn relaunch_leg(shell: &str, rc: Option<&str>, elsewhere: bool, late: bool) -> S
     });
     assert!(!brief.contains("need=failure"), "{brief}");
     let blocks = a.text(&format!("@{s} blocks 8 --json"));
-    blocks
-        .split("\"cmdline\":\"")
-        .skip(1)
-        .filter_map(|c| c.split('"').next())
-        .find(|c| c.contains("--resume") || c.trim_start().starts_with("builtin :"))
-        .map(str::to_string)
-        .unwrap_or_else(|| panic!("no block holds the relaunch's line: {blocks}"))
+    let (_, body) = blocks
+        .split_once('\n')
+        .expect("the blocks reply has a body");
+    let blocks: aterm_json::Value = aterm_json::from_str(body.trim()).expect("the blocks JSON");
+    let quote = |word: &str| {
+        aterm_agent::harness::upgrade::quote(aterm_agent::harness::upgrade::Dialect::Bash, word)
+    };
+    // The native route's shell block names the owned physical helper, not the vendor
+    // command it obtains from the issuer. The actual resumed PID/argv were checked above.
+    // Physical: the image's canonical path (`Image::at`), which differs from the test's own
+    // spelling of it when the target directory is reached through a symlink (a release
+    // clone's `target -> target.noindex`).
+    let physical = std::fs::canonicalize(harness::aterm()).expect("the aterm under test");
+    let helper = format!(
+        "{} {} {} {}",
+        quote(
+            physical
+                .to_str()
+                .expect("the aterm under test at a UTF-8 path")
+        ),
+        quote("harness"),
+        quote("native-launch"),
+        quote("contract=1")
+    );
+    let session = quote(&format!("session={s}"));
+    let phase = quote("phase=forward");
+    blocks["blocks"]
+        .as_array()
+        .expect("the command blocks")
+        .iter()
+        .filter_map(|block| block["cmdline"].as_str())
+        .find(|line| {
+            line.contains("--resume")
+                || line.trim_start().starts_with("builtin :")
+                || (line.contains(&helper) && line.contains(&session) && line.contains(&phase))
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            panic!(
+                "a block attributes the direct relaunch or its exact owned forward helper \
+                 ({helper} … {session} … {phase}): {body}"
+            )
+        })
 }
 
 /// Legs 6's world: on `shell` (its rc file `rc`, made empty), a tab whose shell runs aterm's
@@ -2151,11 +2206,76 @@ fn relaunch_leg(shell: &str, rc: Option<&str>, elsewhere: bool, late: bool) -> S
 /// `elsewhere`: a subdirectory the shell is not in), the harness hosting it and at its first idle
 /// point.
 fn hosted_stand_in(shell: &str, rc: Option<&str>, elsewhere: bool) -> (Owner, Inst, String) {
+    hosted_stand_in_as(shell, rc, elsewhere, false, Interpreter::Own)
+}
+
+/// What the relaunch stand-in runs on ([`write_relaunch_fake`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interpreter {
+    /// The owned native Claude fixture on Apple Silicon macOS; elsewhere a script on an
+    /// ad-hoc signed copy of `/bin/bash` ([`harness::own_image`]).
+    Own,
+    /// The system's own `/bin/sh`: on macOS an Apple binary, like `/bin/zsh`, whose environment
+    /// macOS shows no other process.
+    Platform,
+}
+
+/// Whether process `pid`'s exec environment can be read by another process.
+fn env_readable(pid: u32) -> bool {
+    atpkg::caller_shell::process_args(pid).is_some_and(|args| !args.env.is_empty())
+}
+
+/// The relaunch stand-in's first shell: its parent, as it wrote it.
+fn relaunch_parent(a: &Inst) -> u32 {
+    std::fs::read_to_string(a.root.join("relaunch-parent"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Give success fixtures a readable shell exec environment with their unmanaged
+/// route already present. The stored-login refusal case retains the platform shell.
+fn relaunch_fixture_shell(root: &Path, shell: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let name = Path::new(shell).file_name().expect("a shell name");
+    let dir = root.join("relaunch-shell");
+    let image = dir.join("image").join(name);
+    let entry = dir.join("bin").join(name);
+    std::fs::create_dir_all(image.parent().unwrap()).expect("the shell image folder");
+    std::fs::create_dir_all(entry.parent().unwrap()).expect("the shell entry folder");
+    aterm_uds::deadline::ad_hoc_copy(Path::new(shell), &image);
+    let quoted = aterm_agent::harness::upgrade::quote(
+        aterm_agent::harness::upgrade::Dialect::Bash,
+        image.to_str().expect("the shell image path"),
+    );
+    std::fs::write(
+        &entry,
+        format!("#!/bin/sh\nexport ANTHROPIC_API_KEY=aterm-fabric-standin\nexec {quoted} \"$@\"\n"),
+    )
+    .expect("the shell entry");
+    std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755))
+        .expect("executable shell entry");
+    entry
+}
+
+fn hosted_stand_in_as(
+    shell: &str,
+    rc: Option<&str>,
+    elsewhere: bool,
+    stored_login: bool,
+    interpreter: Interpreter,
+) -> (Owner, Inst, String) {
     let owner = Owner::boot();
     // Its tabs' shell runs aterm's shell integration, so a command's end says its exit code, and
     // the relaunch's line opens a command of its own.
+    let shell = if stored_login {
+        PathBuf::from(shell)
+    } else {
+        relaunch_fixture_shell(&owner.tmp, shell)
+    };
     let opts = Opts {
-        shell: Some(shell.into()),
+        shell: Some(shell.to_string_lossy().into_owned()),
         ..Opts::default()
     };
     let a = Inst::boot(&owner, "a", NODE_A, opts);
@@ -2163,7 +2283,14 @@ fn hosted_stand_in(shell: &str, rc: Option<&str>, elsewhere: bool) -> (Owner, In
     if let Some(rc) = rc {
         std::fs::write(a.root.join("home").join(rc), "").expect("an rc file");
     }
-    write_relaunch_fake(&a);
+    if interpreter == Interpreter::Own {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        crate::native_claude::place(&a.root, &fake_path(&a), &idle_composer());
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        write_relaunch_fake(&a, interpreter);
+    } else {
+        write_relaunch_fake(&a, interpreter);
+    }
     let s = spawn_tab(&a);
     until_on(&a, &s, DEADLINE, "the shell's integration", || {
         (kv(&status_of(&a, &s), "integration") == Some("on")).then_some(())
@@ -2180,6 +2307,23 @@ fn hosted_stand_in(shell: &str, rc: Option<&str>, elsewhere: bool) -> (Owner, In
     } else {
         format!("cd {} && '{}' --model opus", work.display(), fake.display())
     };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let line = if interpreter == Interpreter::Own {
+        let root = aterm_agent::harness::upgrade::quote(
+            aterm_agent::harness::upgrade::Dialect::Zsh,
+            &a.root.to_string_lossy(),
+        );
+        format!("export ATERM_CLAUDE_FIXTURE_ROOT={root}; {line}")
+    } else {
+        line
+    };
+    // These provider-free fixtures model an explicit unmanaged credential route.
+    // Export only inside this private shell, so resumed stand-ins keep that route.
+    let line = if stored_login {
+        line
+    } else {
+        format!("export ANTHROPIC_API_KEY=aterm-fabric-standin; {line}")
+    };
     type_line(&a, &s, &line);
     program_is(&a, &s, "claude");
     until_on(&a, &s, DEADLINE, "the host attached", || {
@@ -2194,7 +2338,149 @@ fn hosted_stand_in(shell: &str, rc: Option<&str>, elsewhere: bool) -> (Owner, In
         "the harness at the agent's first idle point",
         || host_log(&a).contains("EVENT idle").then_some(()),
     );
+    let pid = launches(&a).first().expect("the native launch").0;
+    let args = atpkg::caller_shell::process_args(pid).expect("the stand-in's exec context");
+    let observed = aterm_agent::harness::accounts::ProcessLogin::of_exec_env(&args.env)
+        .map(|who| who.stored_login);
+    assert!(
+        observed == Some(stored_login)
+            || (interpreter == Interpreter::Platform && observed.is_none()),
+        "fixture authentication attribution: {observed:?}"
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if interpreter == Interpreter::Own {
+        until_on(
+            &a,
+            &s,
+            DEADLINE,
+            "the live native watch acknowledgement",
+            || crate::native_claude::observed(&a.root, &s, pid).then_some(()),
+        );
+    }
     (owner, a, s)
+}
+
+/// A stored route is admitted from the owned helper, without a parent-kernel environment prerequisite.
+#[test]
+fn a_stored_login_relaunch_uses_the_owned_helpers_context() {
+    let (_owner, a, s) =
+        hosted_stand_in_as("/bin/zsh", Some(".zshrc"), false, true, Interpreter::Own);
+    let first = launches(&a);
+    assert_eq!(first.len(), 1, "one initial stored-login agent: {first:?}");
+    std::fs::write(a.root.join("die"), "").unwrap();
+    let got = until_on(
+        &a,
+        &s,
+        DEADLINE,
+        "the admitted stored-login relaunch",
+        || {
+            let got = launches(&a);
+            (got.len() >= 2).then_some(got)
+        },
+    );
+    assert_eq!(got.len(), 2, "relaunched once: {got:?}");
+    assert_ne!(got[0].0, got[1].0, "the helper exec produced a new agent");
+    assert_eq!(got[0], first[0], "the original launch is retained");
+    assert_eq!(got[1].1, format!("--model opus --resume {CONVERSATION}"));
+    let resumed = a
+        .root
+        .join("home/.claude/sessions")
+        .join(format!("{}.json", got[1].0));
+    until_on(
+        &a,
+        &s,
+        DEADLINE,
+        "the resumed body's conversation registration",
+        || {
+            let text = std::fs::read_to_string(&resumed).ok()?;
+            let row: aterm_json::Value = aterm_json::from_str(&text).ok()?;
+            (row["pid"].as_u64() == Some(u64::from(got[1].0))
+                && row["sessionId"].as_str() == Some(CONVERSATION))
+            .then_some(())
+        },
+    );
+    assert_eq!(
+        launches(&a).len(),
+        2,
+        "registration creates no extra launch"
+    );
+    assert!(
+        a.root
+            .join("home/.claude/projects/-w")
+            .join(format!("{CONVERSATION}.jsonl"))
+            .is_file()
+    );
+}
+
+/// An unobservable platform-script agent retains its conversation without relaunching.
+/// The native lane requires crash observation before account admission; the legacy lane
+/// requires a readable launch environment.
+#[test]
+fn a_stored_login_relaunch_keeps_its_wait_when_the_shell_context_is_unavailable() {
+    let (_owner, a, s) = hosted_stand_in_as(
+        "/bin/zsh",
+        Some(".zshrc"),
+        false,
+        true,
+        Interpreter::Platform,
+    );
+    let agent = launches(&a).first().expect("the native launch").0;
+    let evidence = env_readable(relaunch_parent(&a)) || env_readable(agent);
+    eprintln!("an environment to admit on: {evidence}");
+    std::fs::write(a.root.join("die"), "").unwrap();
+    if evidence {
+        until_on(
+            &a,
+            &s,
+            DEADLINE,
+            "the admitted stored-login relaunch",
+            || (launches(&a).len() == 2).then_some(()),
+        );
+    } else {
+        let step = format!("harness @{s}: relaunch ");
+        let refusal = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            " step=wait:native-crash-observation"
+        } else {
+            " step=wait:account"
+        };
+        until_on(&a, &s, DEADLINE, "two refused admission attempts", || {
+            (host_log(&a)
+                .lines()
+                .filter(|line| line.contains(&step) && line.ends_with(refusal))
+                .count()
+                >= 2)
+                .then_some(())
+        });
+        assert_eq!(launches(&a).len(), 1, "no execution without evidence");
+        assert!(
+            a.root
+                .join("home/.claude/projects/-w")
+                .join(format!("{CONVERSATION}.jsonl"))
+                .is_file()
+        );
+    }
+}
+
+/// **THE OWNER'S RULE THAT A RESTART RESUMES ITS WORK, ON macOS's LOGIN SHELL**: a stored-login
+/// Claude Code in a `/bin/zsh` tab, whose environment macOS shows no other process, crashes, and
+/// the harness relaunches it on its conversation, admitted on the launch environment its own exec
+/// environment recorded while it ran.
+#[test]
+fn a_stored_login_relaunch_on_a_platform_shell_resumes_on_its_recorded_launch_environment() {
+    let (_owner, a, s) =
+        hosted_stand_in_as("/bin/zsh", Some(".zshrc"), false, true, Interpreter::Own);
+    assert!(env_readable(launches(&a)[0].0), "the agent's own record");
+    std::fs::write(a.root.join("die"), "").unwrap();
+    let got = until_on(&a, &s, DEADLINE, "the relaunch", || {
+        let got = launches(&a);
+        (got.len() >= 2).then_some(got)
+    });
+    assert_eq!(got.len(), 2, "relaunched once: {got:?}");
+    assert_eq!(
+        got[1].1,
+        format!("--model opus --resume {CONVERSATION}"),
+        "{got:?}"
+    );
 }
 
 /// **LEG 6, THE RELAUNCH ON zsh** (macOS's login shell), the agent in the shell's own directory:

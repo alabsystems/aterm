@@ -451,7 +451,13 @@ fn place_racing(
     let written = (|| -> std::io::Result<bool> {
         std::fs::create_dir(&partial)?;
         let file_at = partial.join(AGENT);
-        let mut file = std::fs::File::create(&file_at)?;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o555)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&file_at)?;
         file.write_all(&bytes)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o555))?;
         aterm_durable::durable(&file)?;

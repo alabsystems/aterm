@@ -97,6 +97,25 @@ impl EpochBy {
     }
 }
 
+/// The repaint nudge's one attempt on an epoch (`crate::app_nudge`). It alone decides who repaired
+/// a healed epoch ([`Epoch::healer`]): `by=nudge` is the attempt's own heal, never a repaint after
+/// the attempt ended without one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attempt {
+    /// No repair was attempted.
+    None,
+    /// The nudge held the PTY for this epoch and the attempt has not ended unrepaired: a repaint
+    /// now is its answer (`by=nudge`).
+    Held,
+    /// The attempt ended superseded by a real resize (the program was given a size of its own): a
+    /// repaint is the program's answer to that size, and the attempt's end is this judge's if the
+    /// epoch comes back to `desync-risk` at its start geometry ([`returned_at_risk`]).
+    Superseded,
+    /// The attempt ended with the program answering no size (the nudge gave up, or a superseding
+    /// resize came back): a repaint after it is the program's own.
+    Unrepaired,
+}
+
 /// Single alternate-screen resize epoch record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Epoch {
@@ -127,12 +146,8 @@ pub(crate) struct Epoch {
     pub(crate) class: ProgramClass,
     pub(crate) verdict: EpochVerdict,
     pub(crate) by: EpochBy,
-    /// Whether a repaint nudge was attempted for this epoch.
-    pub(crate) tried: bool,
-    /// That repair ended superseded by a real resize (the program was given a
-    /// size of its own): its end is this judge's if the epoch comes back to
-    /// `desync-risk` at its start geometry ([`returned_at_risk`]).
-    superseded: bool,
+    /// The repaint nudge's attempt on this epoch (one per epoch).
+    attempt: Attempt,
     /// The verdict reached `desync-risk` or `unjudged` and was logged.
     logged: bool,
     /// `desync-risk` was pushed as an event (its `healed` follows).
@@ -158,8 +173,7 @@ impl Epoch {
             class: ProgramClass::Unknown,
             verdict: EpochVerdict::Open,
             by: EpochBy::None,
-            tried: false,
-            superseded: false,
+            attempt: Attempt::None,
             logged: false,
             announced: false,
         }
@@ -167,6 +181,22 @@ impl Epoch {
 
     const fn healed_by(&self, full_clears: u64, screen_replaced: u64) -> bool {
         full_clears > self.full_clears || screen_replaced > self.screen_replaced
+    }
+
+    /// A repair was attempted (the repaint nudge held the PTY for this epoch): `tried=1`, and the
+    /// epoch is never nudged again.
+    pub(crate) fn tried(&self) -> bool {
+        self.attempt != Attempt::None
+    }
+
+    /// Who repaired the epoch, once it is healed: the nudge while its attempt stands, the program
+    /// otherwise (none was made, or it ended without a repaint).
+    fn healer(&self) -> EpochBy {
+        if self.attempt == Attempt::Held {
+            EpochBy::Nudge
+        } else {
+            EpochBy::App
+        }
     }
 
     /// Returns whether this epoch owed render debt and should appear in `resizes`.
@@ -283,14 +313,14 @@ impl EpochBook {
         let epoch = self.current.as_ref()?;
         (epoch.verdict == EpochVerdict::DesyncRisk
             && epoch.class == ProgramClass::Agent
-            && !epoch.tried)
-            .then_some(NudgeView {
-                epoch: epoch.id,
-                shift: epoch.shift,
-                pushed: epoch.pushed,
-                cut: epoch.cut,
-                drew: epoch.drew,
-            })
+            && !epoch.tried())
+        .then_some(NudgeView {
+            epoch: epoch.id,
+            shift: epoch.shift,
+            pushed: epoch.pushed,
+            cut: epoch.cut,
+            drew: epoch.drew,
+        })
     }
 
     /// Returns whether epoch `id` is still open and potentially desynced.
@@ -305,17 +335,30 @@ impl EpochBook {
         })
     }
 
-    /// Marks epoch `id` as having had a repaint nudge attempted.
+    /// Marks epoch `id` as having had a repaint nudge attempted: tried for good (one try per
+    /// epoch), and a repaint before the attempt ends without one closes the epoch `by=nudge`.
     pub(crate) fn note_tried(&mut self, id: u64) {
-        if let Some(epoch) = self.current.as_mut().filter(|e| e.id == id) {
-            epoch.tried = true;
+        if let Some(epoch) = self
+            .current
+            .as_mut()
+            .filter(|e| e.id == id && e.attempt == Attempt::None)
+        {
+            epoch.attempt = Attempt::Held;
         }
     }
 
     /// Marks epoch `id`'s repair attempt as superseded by a real resize.
     pub(crate) fn note_superseded(&mut self, id: u64) {
         if let Some(epoch) = self.current.as_mut().filter(|e| e.id == id) {
-            epoch.superseded = true;
+            epoch.attempt = Attempt::Superseded;
+        }
+    }
+
+    /// Marks epoch `id`'s repair attempt as ended with the program answering no size (the nudge
+    /// gave up): a repaint after it is the program's own (`by=app`).
+    pub(crate) fn note_unrepaired(&mut self, id: u64) {
+        if let Some(epoch) = self.current.as_mut().filter(|e| e.id == id) {
+            epoch.attempt = Attempt::Unrepaired;
         }
     }
 
@@ -371,8 +414,9 @@ impl EpochBook {
         }
         if let Some(epoch) = self.current.as_mut() {
             if epoch.healed_by(report.full_clears, report.screen_replaced) {
+                let by = epoch.healer();
                 let closed = self.current.take();
-                self.close(closed, EpochVerdict::Healed, EpochBy::App);
+                self.close(closed, EpochVerdict::Healed, by);
             } else {
                 if report.content_seq_before > epoch.quiet_seq {
                     epoch.drew = true;
@@ -424,16 +468,14 @@ impl EpochBook {
         epoch.class = class;
         if !debt.owed() {
             let owed = epoch.had_debt;
-            let tried = epoch.tried;
+            let healer = epoch.healer();
             let healed = epoch.healed_by(probe.full_clears, probe.screen_replaced);
             let since = now_ms.saturating_sub(epoch.last_resize_ms);
             let closed = self.current.take();
             self.look_at_ms = None;
             if owed {
-                let (verdict, by) = if healed && tried {
-                    (EpochVerdict::Healed, EpochBy::Nudge)
-                } else if healed {
-                    (EpochVerdict::Healed, EpochBy::App)
+                let (verdict, by) = if healed {
+                    (EpochVerdict::Healed, healer)
                 } else {
                     (EpochVerdict::Restored, EpochBy::Undo)
                 };
@@ -485,7 +527,7 @@ impl EpochBook {
             }
             if epoch.verdict == EpochVerdict::DesyncRisk
                 && class == ProgramClass::Agent
-                && !epoch.tried
+                && !epoch.tried()
             {
                 note_nudge_due();
             }
@@ -572,8 +614,10 @@ impl EpochBook {
     )
 )]
 fn returned_at_risk(epoch: &mut Epoch) -> Option<u64> {
-    (epoch.verdict == EpochVerdict::DesyncRisk && std::mem::take(&mut epoch.superseded))
-        .then_some(epoch.id)
+    (epoch.verdict == EpochVerdict::DesyncRisk && epoch.attempt == Attempt::Superseded).then(|| {
+        epoch.attempt = Attempt::Unrepaired;
+        epoch.id
+    })
 }
 
 /// Appends the wire representation of `epoch` to `out`.
@@ -595,6 +639,6 @@ pub(crate) fn wire_epoch(out: &mut String, epoch: &Epoch) {
         epoch.class.wire(),
         epoch.verdict.wire(),
         epoch.by.wire(),
-        u8::from(epoch.tried),
+        u8::from(epoch.tried()),
     );
 }

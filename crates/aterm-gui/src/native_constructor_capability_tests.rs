@@ -9,7 +9,7 @@ fn release(gate: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
 }
 
 #[test]
-fn shipping_constructor_discovery_is_empty_and_disabled_new_prepare_has_no_custody() {
+fn shipping_generic_constructors_stay_disabled_and_new_prepare_has_no_custody() {
     let h = crate::session_store::test_handle_on(7950, -1);
     let ctx = Arc::clone(&h.ctx);
     install(&ctx, 71, &[Scope::Upgrade]);
@@ -21,7 +21,19 @@ fn shipping_constructor_discovery_is_empty_and_disabled_new_prepare_has_no_custo
         &System(&ctx.native_policy, false),
         &mut |_| panic!("no mutation"),
     );
-    assert_eq!(shipping, "OK native-act state=constructors plans=-\n");
+    let Some(Reply::Constructors(enabled)) = Reply::parse(shipping.trim_end()) else {
+        panic!("actual constructor discovery: {shipping}");
+    };
+    assert!(!enabled.contains(&Constructor::OwnImage));
+    assert!(!enabled.contains(&Constructor::PrivateRestart));
+    assert_eq!(
+        enabled,
+        if crate::native_session_policy::cold_restart_qualified() {
+            vec![Constructor::ColdRestart]
+        } else {
+            Vec::new()
+        }
+    );
     let facts = Facts::new();
     facts.constructors.store(false, Ordering::Release);
     let model = aterm_models_harness::scoped_native_handoff_model();

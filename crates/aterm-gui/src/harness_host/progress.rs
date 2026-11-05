@@ -5,8 +5,9 @@
 
 use super::*;
 use aterm_agent::harness::account_progress::{
-    AccountProgress, ProgressPhase, enrich_inventory_with_identity,
+    AccountProgress, ActiveSignIn, ProgressPhase, enrich_inventory_with_identity,
 };
+use aterm_agent::harness::accounts_sync::LoginActivityBatch;
 
 #[cfg(test)]
 #[path = "progress/tests.rs"]
@@ -23,6 +24,10 @@ pub(super) mod retired_activity_tests;
 #[cfg(test)]
 #[path = "progress/expired_activity_tests.rs"]
 pub(super) mod expired_activity_tests;
+
+#[cfg(test)]
+#[path = "progress/independent_work_tests.rs"]
+pub(super) mod independent_work_tests;
 
 #[path = "progress/activity.rs"]
 pub(super) mod activity;
@@ -119,10 +124,9 @@ pub(super) struct ProgressRead {
 impl ProgressRead {
     pub(super) fn retry(&self) -> bool {
         self.activity_contended
-            || self
-                .progress
-                .as_ref()
-                .is_some_and(|value| moves_by_itself(&value.phase))
+            || self.progress.as_ref().is_some_and(|value| {
+                moves_by_itself(&value.phase) || !value.independent_work.is_empty()
+            })
     }
 
     #[cfg_attr(
@@ -371,6 +375,35 @@ fn wait_deadline(now: i64, wait: Duration) -> Option<i64> {
     now.checked_add(i64::try_from(seconds).ok()?)
 }
 
+/// Attribute one activity only to an unambiguous full row in its captured roster.
+fn activity_row<'a>(
+    labels: &BTreeSet<String>,
+    rows: &'a [accounts::Row],
+    entry: &aterm_agent::harness::accounts_sync::LoginActivity,
+) -> Option<&'a accounts::Row> {
+    if !labels.contains(&entry.label) {
+        return None;
+    }
+    let mut candidates = rows.iter().filter(|row| row.label == entry.label);
+    let row = candidates.next()?;
+    // A reused or ambiguous label cannot attribute work to another full account row.
+    (candidates.next().is_none() && entry.matches_row(row)).then_some(row)
+}
+
+/// A completed provider fact belongs to this exact row and its original local clock.
+fn completed_diagnostic<'a>(
+    entry: &'a aterm_agent::harness::accounts_sync::LoginActivity,
+    row: &accounts::Row,
+    now: i64,
+) -> Option<&'a aterm_agent::harness::accounts_sync::LoginDiagnostic> {
+    entry.diagnostic.as_ref().filter(|diagnostic| {
+        !entry.active
+            && diagnostic.completed_at > 0
+            && diagnostic.completed_at <= now
+            && diagnostic.matches_row(row)
+    })
+}
+
 /// Keep retained blockers first and append the process-local activity's own
 /// timestamp, never turning a fresh UI read into evidence of a new attempt.
 fn apply_login_activity(
@@ -380,19 +413,10 @@ fn apply_login_activity(
     activity: Vec<aterm_agent::harness::accounts_sync::LoginActivity>,
     now: i64,
 ) {
-    for entry in activity
-        .into_iter()
-        .filter(|entry| labels.contains(&entry.label))
-    {
-        let mut candidates = rows.iter().filter(|row| row.label == entry.label);
-        let Some(row) = candidates.next() else {
+    for entry in activity {
+        let Some(row) = activity_row(labels, rows, &entry) else {
             continue;
         };
-        // A reused label can name a different login. All activity claims belong
-        // to the worker's captured row, including its route and retry clock.
-        if candidates.next().is_some() || !entry.matches_row(row) {
-            continue;
-        }
         if entry.observed_at > 0 && entry.observed_at <= now {
             value
                 .details
@@ -402,10 +426,7 @@ fn apply_login_activity(
                 aterm_agent::harness::usage::rfc3339_utc(entry.observed_at),
             ));
         }
-        if let Some(diagnostic) = entry.diagnostic.as_ref().filter(|diagnostic| {
-            !entry.active && diagnostic.completed_at > 0 && diagnostic.completed_at <= now
-        }) && diagnostic.matches_row(row)
-        {
+        if let Some(diagnostic) = completed_diagnostic(&entry, row, now) {
             value.login_diagnostics.push(diagnostic.clone());
         }
         if entry.active
@@ -689,7 +710,7 @@ impl HostHandle {
         started: Option<u64>,
         conversation: Option<&str>,
     ) -> Result<ProgressRead, ()> {
-        self.account_progress_read_with_activity(
+        self.account_progress_read_with_batch(
             sid,
             pid,
             started,
@@ -700,7 +721,7 @@ impl HostHandle {
                     aterm_time::unix_secs().and_then(|v| i64::try_from(v).ok()),
                 )
             },
-            aterm_agent::harness::accounts_sync::login_activity,
+            aterm_agent::harness::accounts_sync::login_activity_batch,
         )
     }
 
@@ -722,6 +743,39 @@ impl HostHandle {
     ) -> Result<Option<AccountProgress>, ()> {
         self.account_progress_read_with_activity(sid, pid, started, conversation, clock, activity)
             .map(|read| read.progress)
+    }
+
+    /// Existing single-namespace fixtures inject only the namespace they actually observed.
+    #[cfg(test)]
+    pub(super) fn account_progress_read_with_activity(
+        &self,
+        sid: &str,
+        pid: i32,
+        started: Option<u64>,
+        conversation: Option<&str>,
+        clock: impl FnOnce() -> (Instant, Option<i64>),
+        activity: impl FnOnce(
+            &accounts::Store,
+            accounts::Cli,
+            i64,
+        )
+            -> Option<Vec<aterm_agent::harness::accounts_sync::LoginActivity>>,
+    ) -> Result<ProgressRead, ()> {
+        self.account_progress_read_with_batch(
+            sid,
+            pid,
+            started,
+            conversation,
+            clock,
+            |stores, cli, now| {
+                let store = stores[0].or(stores[1])?;
+                let entries = activity(store, cli, now)?;
+                Some(LoginActivityBatch::for_test(
+                    [Some((store, entries)), None],
+                    cli,
+                ))
+            },
+        )
     }
 
     #[cfg_attr(
@@ -764,7 +818,23 @@ impl HostHandle {
             reason = "The native fixture supplies admitted Store publication and refreshed metadata; admission is modeled by AccountRenewalGeneration"
         )
     )]
-    pub(super) fn account_progress_read_with_activity(
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountExecutionVisibility",
+            action = "WorkSettles",
+            reason = "The native fixture supplies the process-local worker's completed observation; this reader neither completes nor retries the worker"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountExecutionVisibility",
+            action = "RejectDiagnostic",
+            reason = "The native fixture supplies missing, mistimed or wrong-row provider evidence to test the reader's admission checks"
+        )
+    )]
+    pub(super) fn account_progress_read_with_batch(
         &self,
         sid: &str,
         pid: i32,
@@ -772,11 +842,10 @@ impl HostHandle {
         conversation: Option<&str>,
         clock: impl FnOnce() -> (Instant, Option<i64>),
         activity: impl FnOnce(
-            &accounts::Store,
+            [Option<&accounts::Store>; 2],
             accounts::Cli,
             i64,
-        )
-            -> Option<Vec<aterm_agent::harness::accounts_sync::LoginActivity>>,
+        ) -> Option<LoginActivityBatch>,
     ) -> Result<ProgressRead, ()> {
         // Sample before cloning any lease. A concurrent silent extension then either appears
         // in this read or leaves its earlier deadline armed, even if this read resumes late.
@@ -823,6 +892,8 @@ impl HostHandle {
             .filter(|until| mono < *until);
         let mut value =
             decision.map_or_else(|| AccountProgress::unknown(0), |bound| bound.value.clone());
+        // Current work is observed from this snapshot, never replayed from a retained judgment.
+        value.independent_work.clear();
         value.forecasts_paused = off || policy_retired;
         // Current decisions and live gates keep their captured metadata. Retired
         // observations may expose independent work without renewing a judgment.
@@ -914,6 +985,15 @@ impl HostHandle {
         }
         let context_only = decision.is_none();
         let active_only = context_only || retired_activity.is_some();
+        let independent_metadata = independent
+            .filter(|context| Arc::ptr_eq(&context.policy, &kept.account.progress_policy))
+            .map(|context| {
+                (
+                    context.state.clone(),
+                    context.labels.clone(),
+                    Arc::clone(&context.rows),
+                )
+            });
         drop(kept);
         // Currentness is monotonic; the wall clock is only for displayed timestamps and activity.
         let mut execution_until = execution_until;
@@ -929,27 +1009,100 @@ impl HostHandle {
         // as the next event; an execution receipt's currentness already used the monotonic clock.
         value.next_at = value.next_at.filter(|at| *at > now);
         let mut activity_contended = false;
-        if let Some(state) = state {
-            let gate_deadline = execution_until.is_some().then_some(value.next_at);
-            let activity = activity(&accounts::Store::at(&state), accounts::Cli::Claude, now);
-            match activity {
-                Some(mut activity) => {
-                    if active_only {
-                        // An observation context is not a decision or a retry forecast.
-                        // It can expose actual work alongside a retired judgment or before one.
-                        activity.retain(|entry| entry.active);
-                        for entry in &mut activity {
-                            entry.next_at = None;
-                            entry.diagnostic = None;
+        let primary_store = state.as_deref().map(accounts::Store::at);
+        let independent_store = independent_metadata
+            .as_ref()
+            .map(|(state, _, _)| accounts::Store::at(state));
+        if primary_store.is_some() || independent_store.is_some() {
+            // Both namespaces come from one process-local try-lock snapshot; no guard
+            // crosses a session lock or a renderer call.
+            let batch = activity(
+                [primary_store.as_ref(), independent_store.as_ref()],
+                accounts::Cli::Claude,
+                now,
+            );
+            if let Some(store) = &primary_store {
+                let gate_deadline = execution_until.is_some().then_some(value.next_at);
+                let activity = batch
+                    .as_ref()
+                    .and_then(|batch| batch.for_store(store, accounts::Cli::Claude));
+                match activity {
+                    Some(activity) => {
+                        let mut activity = activity.to_vec();
+                        if active_only {
+                            // An observation context is not a decision or a retry forecast.
+                            // It can expose actual work alongside a retired judgment or before one.
+                            activity.retain(|entry| entry.active);
+                            for entry in &mut activity {
+                                entry.next_at = None;
+                                entry.diagnostic = None;
+                            }
                         }
+                        apply_login_activity(&mut value, &labels, &rows, activity, now);
                     }
-                    apply_login_activity(&mut value, &labels, &rows, activity, now);
+                    None if execution_active => activity_contended = true,
+                    None => return Err(()),
                 }
-                None if execution_active => activity_contended = true,
-                None => return Err(()),
+                if let Some(deadline) = gate_deadline {
+                    value.next_at = deadline;
+                }
             }
-            if let Some(deadline) = gate_deadline {
-                value.next_at = deadline;
+            if let (Some((_, independent_labels, independent_rows)), Some(store)) =
+                (&independent_metadata, &independent_store)
+            {
+                match batch
+                    .as_ref()
+                    .and_then(|batch| batch.for_store(store, accounts::Cli::Claude))
+                {
+                    Some(activity) => {
+                        let mut diagnostics = Vec::new();
+                        for entry in activity {
+                            let Some(row) =
+                                activity_row(independent_labels, independent_rows, entry)
+                            else {
+                                continue;
+                            };
+                            if !entry.active {
+                                if let Some(diagnostic) = completed_diagnostic(entry, row, now) {
+                                    let represented =
+                                        primary_store.as_ref().is_some_and(|primary| {
+                                            primary.dir == store.dir
+                                                && activity_row(&labels, &rows, entry).is_some()
+                                                && value.login_diagnostics.contains(diagnostic)
+                                        });
+                                    if !represented && !diagnostics.contains(&diagnostic) {
+                                        diagnostics.push(diagnostic);
+                                    }
+                                }
+                                continue;
+                            }
+                            // Equal labels or rows in another namespace do not establish
+                            // that this primary phase already represents the same worker.
+                            let represented = primary_store.as_ref().is_some_and(|primary| {
+                                primary.dir == store.dir
+                                    && activity_row(&labels, &rows, entry).is_some()
+                                    && matches!(&value.phase, ProgressPhase::SigningIn { label, route }
+                                        if label == &entry.label && route == &entry.route)
+                            });
+                            if !represented {
+                                let work = ActiveSignIn {
+                                    label: entry.label.clone(),
+                                    route: entry.route.clone(),
+                                    observed_at: entry.observed_at,
+                                };
+                                if !value.independent_work.contains(&work) {
+                                    value.independent_work.push(work);
+                                }
+                            }
+                        }
+                        // These are completed provider facts, not a renewed judgment,
+                        // another active worker or a forecast from the independent roster.
+                        value
+                            .login_diagnostics
+                            .extend(diagnostics.into_iter().cloned());
+                    }
+                    None => activity_contended = true,
+                }
             }
         }
         if context_only && !current_work && !matches!(value.phase, ProgressPhase::SigningIn { .. })

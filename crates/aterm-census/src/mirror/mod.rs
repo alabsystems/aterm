@@ -525,7 +525,13 @@ pub fn cli(root: &Path, args: &[String]) -> Result<String, String> {
         }
         _ => return Err(usage()),
     }
-    std::fs::write(&path, render(&rows)).map_err(|e| format!("cannot write {REGISTRY}: {e}"))?;
+    let rendered = render(&rows);
+    (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let _ = std::fs::remove_file(&path);
+        crate::tree::open_create_new(&path)?.write_all(rendered.as_bytes())
+    })()
+    .map_err(|e| format!("cannot write {REGISTRY}: {e}"))?;
     Ok(log)
 }
 

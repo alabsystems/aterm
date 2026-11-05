@@ -280,7 +280,7 @@ fn handoff(
     })?;
     if let Some(record) = &deadline_record {
         let path = proof.s.join("upgrade-deadline-record.json");
-        std::fs::write(&path, record.py())
+        crate::util::write_fresh(&path, record.py())
             .map_err(|error| format!("{}: {error}", path.display()))?;
         println!(
             "  maximum witnessed deadline {not_before}: {}",
@@ -448,7 +448,8 @@ fn launch_snapshot(
         ("record", record.clone()),
     ]);
     let path = proof.s.join(name);
-    std::fs::write(&path, snapshot.py()).map_err(|error| format!("{}: {error}", path.display()))?;
+    crate::util::write_fresh(&path, snapshot.py())
+        .map_err(|error| format!("{}: {error}", path.display()))?;
     println!("  kernel/record witness: {}", path.display());
     Ok(kernel_argv0.as_deref() == Some(argv0)
         && kernel_exec_path.as_deref() == Some(argv0)
@@ -510,7 +511,7 @@ pub(super) fn raw_legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), 
     if !produced || !removable {
         return Ok(());
     }
-    std::fs::write(proof.s.join("raw-produced-primary.txt"), producer)
+    crate::util::write_fresh(&proof.s.join("raw-produced-primary.txt"), producer)
         .map_err(|error| format!("cannot preserve produced primary: {error}"))?;
     std::fs::remove_file(&entry)
         .map_err(|error| format!("cannot remove the owned entry symlink: {error}"))?;

@@ -4395,6 +4395,11 @@ impl App {
         let (plan, route) = self
             .active_visible_frame_layout(front)
             .ok_or(CaptureDeferral::Nothing)?;
+        if self.plan_shows_private(&plan) {
+            return Err(CaptureDeferral::Refused(
+                crate::app_control::PRIVATE_VIEW_REFUSED.to_owned(),
+            ));
+        }
         let windowed = self.capture_target(front) == CaptureTarget::Windowed;
         let wants_destination = policy.destination != DestinationDemand::Never;
         let facts = SourceFacts {
@@ -4773,7 +4778,7 @@ impl App {
         self.rerender_capture(wid, &mut input, visuals).map(Some)
     }
 
-    fn snapshot_visible_text(
+    pub(crate) fn snapshot_visible_text(
         &self,
         wid: WindowId,
         route: crate::VisibleContentRoute,
@@ -4798,6 +4803,11 @@ impl App {
                         leaf.view.get(),
                         leaf.focused
                     ));
+                    if self.view_is_private(leaf.view) {
+                        native.push_str(crate::app_control::PRIVATE_VIEW_WITHHELD);
+                        native.push('\n');
+                        continue;
+                    }
                     let Some(raster) = window
                         .leaf_render_cache
                         .get(&leaf.view)
@@ -6060,6 +6070,12 @@ impl App {
                 .send(Err("no window to capture (headless)".to_string()));
             return;
         };
+        if self.window_shows_private(wid) {
+            let _ = request
+                .reply
+                .send(Err(crate::app_control::PRIVATE_VIEW_REFUSED.to_owned()));
+            return;
+        }
         if let Err(error) = self.client_capture_guards(wid) {
             let _ = request.reply.send(Err(error.to_string()));
             return;

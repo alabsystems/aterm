@@ -145,6 +145,13 @@ pub fn supervisor_focus_choice_model() -> Model {
 /// streak's back-off outlives it (`NeverBackOffAfterRealWork`). The stops add no state at
 /// Budget = 0 (52 270 with and without them) and take the scenario Budget = 2 from 85 774 states
 /// to 90 694.
+///
+/// A draft the person leaves may be a command its program runs on Enter (`CommandLeft`: a slash
+/// command, a shell line, an exit word; §14.17.5.8): it stands as their hold, never sent by the
+/// draft step, until they send it (a turn) or clear it (`DraftCleared`). `Buggy = 15` sends it as
+/// a prompt draft is sent, the rule before it (`NeverSendsAPersonsCommand`). It is left at
+/// `Budget = 0` alone, as `RetryAnsweredShort` is, to keep the scenario `Budget = 2` within the
+/// interpreter's states.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_turn_end_model() -> Model {
@@ -168,6 +175,8 @@ pub fn supervisor_turn_end_model() -> Model {
             var pending = 0;
             var waited = 0;
             var draft = 0;
+            var command = 0;
+            var sent_command = 0;
             var typed_blocked = 0;
             var typed_over = 0;
             var typed_early = 0;
@@ -220,6 +229,18 @@ pub fn supervisor_turn_end_model() -> Model {
                 draft = 1;
                 person = 1;
             }
+            action CommandLeft when (
+                Budget == 0 && draft == 0 && pending == 0 && box_up == 0 && other == 0
+            ) {
+                draft = 1;
+                command = 1;
+                person = 1;
+            }
+            action DraftCleared when (command == 1 && pending == 0) {
+                draft = 0;
+                command = 0;
+                person = 1;
+            }
             action GraceEnds when (person == 1) {
                 person = 0;
             }
@@ -238,6 +259,7 @@ pub fn supervisor_turn_end_model() -> Model {
                 earned = 0;
                 long = 1;
                 draft = 0;
+                command = 0;
                 asked = 1;
                 tasked = 1;
                 claim = 0;
@@ -255,6 +277,7 @@ pub fn supervisor_turn_end_model() -> Model {
                 earned = if short > 0 || Buggy == 11 { 1 } else { 0 };
                 long = 0;
                 draft = 0;
+                command = 0;
                 asked = 1;
                 tasked = 1;
                 claim = 0;
@@ -529,13 +552,16 @@ pub fn supervisor_turn_end_model() -> Model {
                 pending = 2;
             }
             action SubmitDraft when (
-                pending == 0 && draft == 1 && (wall == 0 || wall == 2) && tasked == 1 &&
+                pending == 0 && draft == 1 && (command == 0 || Buggy == 15) &&
+                (wall == 0 || wall == 2) && tasked == 1 &&
                 other == 0 && rested == 0 && held == 0 && (same <= 1 || wall == 0) && tries <= Futile - 1 &&
                 (wall == 0 || (wall == 2 && run <= NoWork + Futile - 1)) &&
                 box_up == 0 && person == 0 && backoff == 0 &&
                 (Budget == 0 || used <= Budget - 1)
             ) {
                 draft = 0;
+                sent_command = if command == 1 { 1 } else { sent_command };
+                command = 0;
                 used = if Budget == 0 { used } else { used + 1 };
                 retried = if wall == 2 && retried <= Futile { retried + 1 } else { retried };
                 pending = if wall == 2 { 2 } else { 1 };
@@ -588,6 +614,7 @@ pub fn supervisor_turn_end_model() -> Model {
 
             invariant NeverTypeUnderABoxOrAPerson: typed_blocked == 0;
             invariant NeverTypeOverADraft: typed_over == 0;
+            invariant NeverSendsAPersonsCommand: sent_command == 0;
             invariant NeverTypeBeforeItsBackoff: typed_early == 0;
             invariant NeverEscalateUnderFullPower: escalated == 0;
             invariant WithinTheCap: Budget == 0 || used <= Budget;
@@ -1486,7 +1513,8 @@ pub fn supervisor_land_model() -> Model {
             // ruling 2026-10-27). It is no prompt of aterm's, so it adds nothing to the short
             // streak (v6 §14.17.5.7): the streak stands at the agent's own short answers, and
             // Land's next act waits the back-off they earned, from this point, or none. The
-            // exchange that opens a session is theirs, and lies outside this model, whose walks
+            // exchange that opens a person's session is theirs (a managed worker's opening
+            // message is its task, never theirs), and lies outside this model, whose walks
             // begin after a point.
             action PersonExchange when (pending == 0 && walled == 0 && (said > 0 || landed == 1)) {
                 failed = 0;
@@ -2828,6 +2856,14 @@ pub fn supervisor_survey_press_model() -> Model {
 }
 
 /// Formal model for waiting out or resetting a standing usage-limit wall.
+///
+/// A MANAGED WORKER (`Managed = 1`, the `scenario`: a session a manager waits on, under Land)
+/// never waits out a wall whose reset lies past `Horizon` (`MANAGED_WALL_HORIZON`; the
+/// 2026-11-04 claim workers sat a day at a weekly wall): at its own standing wall, shown or left,
+/// with no take window, dialog or cut notice over it, it concludes its work (`ManagedConcludes`,
+/// `failed why=usage-limit`), and no time passes there before it does (`Tick` is not enabled
+/// there). A reset inside the horizon is waited out as on any tab. This model has no second
+/// account: a move the roster advises comes first and wins (`SupervisorAccountRotation`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_usage_wall_model() -> Model {
@@ -2848,6 +2884,9 @@ pub fn supervisor_usage_wall_model() -> Model {
             const Tapped = 1;
             const CutAt = 4;
             const Dialog = 1;
+            const Managed = 0;
+            const Horizon = 1;
+            scenario Managed = 1;
             var wall = 0;
             var bg = 0;
             var due = 2;
@@ -2908,11 +2947,31 @@ pub fn supervisor_usage_wall_model() -> Model {
                 tries = 0;
                 waited = 0;
             }
-            action Tick when (1 <= wall && clock <= Cap - 1 && (cut == 0 || 1 <= tap)) {
+            // Time passes at a wall except at a managed worker's own wall that resets past the
+            // horizon: there it concludes first (`ManagedConcludes`), and its concluded wall
+            // (`wall = 7`) is its manager's, where nothing more is modelled.
+            action Tick when (
+                1 <= wall && wall <= 6 && clock <= Cap - 1 && (cut == 0 || 1 <= tap) && (
+                    Managed == 0 || held == 1 || 1 <= dialog || cut == 1 || 1 <= view ||
+                    ResetAt <= clock + Horizon || (2 <= wall && wall <= 5) ||
+                    (wall == 6 && mem == 0)
+                )
+            ) {
                 clock = clock + 1;
                 waited = if waited <= Rung2 - 1 { waited + 1 } else { waited };
                 held = 0;
                 unread = 0;
+            }
+
+            // A MANAGED WORKER'S WALL PAST THE HORIZON ENDS ITS WORK: at its own wall, shown
+            // (`wall = 1`) or left and remembered (`wall = 6`), with no take window, `/login` or
+            // cut notice over it, whose reset lies past `Horizon` from now, its work concludes
+            // (`failed why=usage-limit`), its manager's report.
+            action ManagedConcludes when (
+                Managed == 1 && held == 0 && dialog == 0 && cut == 0 && view == 0 &&
+                clock + Horizon + 1 <= ResetAt && (wall == 1 || (wall == 6 && mem == 1))
+            ) {
+                wall = 7;
             }
 
             action WallHides when (Hidden == 1 && wall == 1 && bg == 1 && dialog == 0) {
@@ -3229,6 +3288,15 @@ pub fn supervisor_usage_wall_model() -> Model {
                 dialog = 2;
             }
 
+            // THE 2026-11-04 CLAIM WORKERS: a managed worker waits at a wall that resets a day
+            // and more off, as a person's tab does (`wall = 8`: it sits there until the reset).
+            action ManagedWaitsOut when (
+                Buggy == 1 && Managed == 1 && held == 0 && dialog == 0 && cut == 0 && view == 0 &&
+                clock + Horizon + 1 <= ResetAt && (wall == 1 || (wall == 6 && mem == 1))
+            ) {
+                wall = 8;
+            }
+
             action CreditsReadAsWall when (Buggy == 1 && credits == 1 && wall == 0) {
                 wall = 1;
                 sitting = 0;
@@ -3251,11 +3319,14 @@ pub fn supervisor_usage_wall_model() -> Model {
             // reaches: it closes a person's own `/login` once unused and the act is due
             // (`LoginClosed`), and the person may close it any time.
             invariant NoLoginLeftForGood: dialog <= 1;
+            // A managed worker waits at no wall of its own that resets past the horizon.
+            invariant NoManagedWaitPastHorizon: wall <= 7;
         }
     }
 }
 
-/// Liveness specification asserting a usage-limit wall eventually resumes work when tokens return.
+/// Liveness specification asserting a usage-limit wall eventually resumes work when tokens return,
+/// or, for a managed worker, concludes its work (`wall = 7`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(supervisor_usage_wall_model)]
@@ -3264,7 +3335,7 @@ pub fn supervisor_usage_wall_liveness() -> Liveness {
     Liveness {
         name: "TheUsageWallEnds",
         goal: or_(
-            eq(var("wall"), int(0)),
+            or_(eq(var("wall"), int(0)), eq(var("wall"), int(7))),
             le(var("clock"), sub(var("due"), int(1))),
         ),
         weak: vec!["Tick", "Act", "Taken", "DialogUnused", "LoginClosed"],

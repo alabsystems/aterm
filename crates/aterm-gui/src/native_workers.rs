@@ -2,9 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! The Workers tab (`docs/DESIGN-workers-tab-2026-11-02.md`): one native page per window listing
-//! the window's parked worker tabs, grouped by manager. The rows are published by the host
-//! ([`crate::app_workers`]); the page holds no session and reads no socket. Pressing a row asks
-//! the host through [`WorkersAction`].
+//! the window's parked worker tabs, grouped by manager, and under Finished the workers whose tabs
+//! aterm closed once their tasks concluded ([`crate::retired_workers`]). The rows are published by
+//! the host ([`crate::app_workers`]); the page holds no session and reads no socket. Pressing a
+//! row asks the host through [`WorkersAction`].
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -32,6 +33,9 @@ pub(crate) fn chip_title_of(label: &str) -> String {
 
 /// The group the harness's own workers sit under, and any worker no session manages.
 pub(crate) const ATERM_GROUP: &str = "aterm";
+
+/// The group of the workers whose tabs aterm closed once their tasks concluded, last on the page.
+pub(crate) const FINISHED_GROUP: &str = "Finished";
 
 /// A row's state, in the order the summary line says them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -184,6 +188,9 @@ pub(crate) struct WorkerRow {
     pub(crate) why: Option<String>,
     pub(crate) has_result: bool,
     pub(crate) stoppable: bool,
+    /// A worker whose tab aterm closed once its task concluded ([`crate::retired_workers`]): its
+    /// row sits under [`FINISHED_GROUP`] and offers what it left, not its tab.
+    pub(crate) finished: bool,
 }
 
 impl WorkerRow {
@@ -205,10 +212,12 @@ impl WorkerRow {
         }
     }
 
-    /// The whole row in words, for assistive technology (the painted lines are paint only).
+    /// The whole row in words, for assistive technology (the painted lines are paint only): its
+    /// press opens a running worker's tab, and reads a Finished one's result.
     fn spoken(&self) -> String {
+        let press = if self.finished { "Read" } else { "Open" };
         let mut words = format!(
-            "Open {}: {}, {}",
+            "{press} {}: {}, {}",
             self.title,
             self.state_words(),
             self.meta_words()
@@ -246,12 +255,13 @@ pub(crate) fn summary_words(rows: &[WorkerRow]) -> String {
 
 /// The rows as the page lists them: one group per manager, by its identity, in order of first
 /// appearance with the harness's own last, and in each group the running rows above the concluded
-/// ones, otherwise in tab order. A group's heading is its manager's label, and where two groups'
-/// labels match (two managers both titled `Claude Code`, or one titled `aterm`) each manager's
-/// carries its short sid, so no heading stands for two managers.
+/// ones, otherwise in tab order; then the Finished rows, under [`FINISHED_GROUP`], in the order
+/// their tabs closed. A group's heading is its manager's label, and where two groups' labels match
+/// (two managers both titled `Claude Code`, or one titled `aterm`) each manager's carries its short
+/// sid, so no heading stands for two managers.
 pub(crate) fn grouped(rows: &[WorkerRow]) -> Vec<(String, Vec<&WorkerRow>)> {
     let mut groups: Vec<(Option<&str>, &str, Vec<&WorkerRow>)> = Vec::new();
-    for row in rows {
+    for row in rows.iter().filter(|row| !row.finished) {
         let key = row.manager.as_deref();
         match groups.iter_mut().find(|(manager, ..)| *manager == key) {
             Some((.., members)) => members.push(row),
@@ -281,38 +291,55 @@ pub(crate) fn grouped(rows: &[WorkerRow]) -> Vec<(String, Vec<&WorkerRow>)> {
             _ => (*label).to_owned(),
         })
         .collect();
-    groups
+    let mut listed: Vec<(String, Vec<&WorkerRow>)> = groups
         .into_iter()
         .zip(headings)
         .map(|((.., mut members), heading)| {
             members.sort_by_key(|row| row.state.concluded());
             (heading, members)
         })
-        .collect()
+        .collect();
+    let finished: Vec<&WorkerRow> = rows.iter().filter(|row| row.finished).collect();
+    if !finished.is_empty() {
+        listed.push((FINISHED_GROUP.to_owned(), finished));
+    }
+    listed
 }
 
 /// What a press on the page asks of the host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkersAction {
+    /// A running worker's tab in place, or a Finished worker's result.
     Open(u64),
     Stop(u64),
     ReadResult(u64),
-    MoveToTab(u64),
+    /// Keep as Tab: the worker's tab becomes the person's (`App::keep_as_tab`).
+    Keep(u64),
+    /// A Finished row goes, and the result it kept.
+    Dismiss(u64),
+    /// Every Finished row of the window goes.
+    ClearFinished,
 }
 
 const OPEN: &str = "workers/open/";
 const STOP: &str = "workers/stop/";
 const RESULT: &str = "workers/result/";
-const MOVE: &str = "workers/move/";
+const KEEP: &str = "workers/keep/";
+const DISMISS: &str = "workers/dismiss/";
+const CLEAR_FINISHED: &str = "workers/clear-finished";
 
 /// Parse one of the page's action ids.
 fn action_of(id: &str) -> Option<WorkersAction> {
+    if id == CLEAR_FINISHED {
+        return Some(WorkersAction::ClearFinished);
+    }
     let session = |prefix: &str| id.strip_prefix(prefix)?.parse::<u64>().ok();
     session(OPEN)
         .map(WorkersAction::Open)
         .or_else(|| session(STOP).map(WorkersAction::Stop))
         .or_else(|| session(RESULT).map(WorkersAction::ReadResult))
-        .or_else(|| session(MOVE).map(WorkersAction::MoveToTab))
+        .or_else(|| session(KEEP).map(WorkersAction::Keep))
+        .or_else(|| session(DISMISS).map(WorkersAction::Dismiss))
 }
 
 /// The window's list of workers: the published rows and what the page has asked for.
@@ -372,7 +399,7 @@ impl WorkersViewState {
     /// The inspector's reveal of a listed control ([`crate::app_control`]): a row or one of its
     /// buttons. Whether the key names a row on this page.
     pub(crate) fn reveal_listed_control(&mut self, key: &UiKey) -> bool {
-        let Some(session) = [OPEN, STOP, RESULT, MOVE]
+        let Some(session) = [OPEN, STOP, RESULT, KEEP, DISMISS]
             .into_iter()
             .find_map(|prefix| key.as_str().strip_prefix(prefix))
             .and_then(|session| session.parse().ok())
@@ -484,14 +511,15 @@ impl NativeAppModel for WorkersApp {
                 busy: self.rows.iter().any(|row| !row.state.concluded()),
                 attention: false,
             },
-            closable: self.rows.is_empty(),
+            closable: self.rows.iter().all(|row| row.finished),
             tooltip: Some(format!("{WORKERS_TITLE}: {}", summary_words(&self.rows))),
         }
     }
 
     fn prepare_close(&mut self, _close: CloseRequest, _cx: &mut UpdateCx<'_>) -> CloseReadiness {
-        // The host refuses a close of this tab while workers remain, before it asks here; a
-        // window that closes takes its workers with it.
+        // The host refuses a close of this tab while workers remain, before it asks here, and a
+        // close of it with only Finished rows clears them; a window that closes takes its workers
+        // with it.
         CloseReadiness::Ready
     }
 }
@@ -609,7 +637,8 @@ fn action_button(key: String, label: &str, of_title: &str, style: StyleRef) -> U
     )
 }
 
-/// The buttons a row offers now, and how wide they stand together.
+/// The buttons a row offers now, and how wide they stand together: a running worker's result,
+/// Stop Worker and Keep as Tab; a Finished one's result and Dismiss.
 fn row_actions(row: &WorkerRow) -> (Vec<UiNode>, f32) {
     let mut buttons = Vec::new();
     if row.has_result {
@@ -620,7 +649,7 @@ fn row_actions(row: &WorkerRow) -> (Vec<UiNode>, f32) {
             StyleRef::Secondary,
         ));
     }
-    if row.stoppable {
+    if row.stoppable && !row.finished {
         buttons.push(action_button(
             format!("{STOP}{}", row.session),
             "Stop Worker",
@@ -628,12 +657,21 @@ fn row_actions(row: &WorkerRow) -> (Vec<UiNode>, f32) {
             StyleRef::Quiet,
         ));
     }
-    buttons.push(action_button(
-        format!("{MOVE}{}", row.session),
-        "Move to Tab",
-        &row.title,
-        StyleRef::Quiet,
-    ));
+    buttons.push(if row.finished {
+        action_button(
+            format!("{DISMISS}{}", row.session),
+            "Dismiss",
+            &row.title,
+            StyleRef::Quiet,
+        )
+    } else {
+        action_button(
+            format!("{KEEP}{}", row.session),
+            crate::session_chrome::KEEP_AS_TAB,
+            &row.title,
+            StyleRef::Quiet,
+        )
+    });
     let gap = 6.0 * buttons.len().saturating_sub(1) as f32;
     let width = buttons
         .iter()
@@ -939,18 +977,38 @@ fn page(app: &WorkersApp, view: &WorkersViewState, width: f32, height: f32) -> U
             );
             top += GROUP_GAP + LIST_GAP * 2.0;
         }
-        children.push(
-            UiNode::new(
-                format!("workers/group/{index}/label"),
-                UiContent::Text(TextSpec {
-                    text: name,
-                    role: SemanticRole::Text,
-                    style: StyleRef::Plain,
-                }),
-            )
-            .layout(Layout::default().height(Length::Fixed(label_h))),
+        let finished = members.iter().all(|row| row.finished);
+        let label = UiNode::new(
+            format!("workers/group/{index}/label"),
+            UiContent::Text(TextSpec {
+                text: name,
+                role: SemanticRole::Text,
+                style: StyleRef::Plain,
+            }),
         );
-        top += label_h + LIST_GAP;
+        // The Finished group's heading carries Clear Finished, on a line as tall as its button.
+        let line_h = if finished {
+            label_h.max(m.control_h)
+        } else {
+            label_h
+        };
+        children.push(if finished {
+            let clear = action_button(
+                CLEAR_FINISHED.to_owned(),
+                "Clear Finished",
+                FINISHED_GROUP,
+                StyleRef::Quiet,
+            );
+            plain_group(format!("workers/group/{index}/heading"))
+                .layout(Layout::row().gap(12.0).height(Length::Fixed(line_h)))
+                .children(vec![
+                    label.layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+                    clear,
+                ])
+        } else {
+            label.layout(Layout::default().height(Length::Fixed(line_h)))
+        });
+        top += line_h + LIST_GAP;
         let mut row_top = top;
         for row in &members {
             spans.push((row.session, row_top, m.row_h()));
@@ -1011,6 +1069,7 @@ mod tests {
             from: FROM_CTL.to_owned(),
             why,
             checked: None,
+            left: None,
             exit,
             finished: false,
             result_bytes: 0,
@@ -1042,6 +1101,7 @@ mod tests {
             why: None,
             has_result: false,
             stoppable: !state.concluded(),
+            finished: false,
         }
     }
 
@@ -1223,10 +1283,16 @@ mod tests {
             action_of("workers/result/7"),
             Some(WorkersAction::ReadResult(7))
         );
+        assert_eq!(action_of("workers/keep/7"), Some(WorkersAction::Keep(7)));
         assert_eq!(
-            action_of("workers/move/7"),
-            Some(WorkersAction::MoveToTab(7))
+            action_of("workers/dismiss/7"),
+            Some(WorkersAction::Dismiss(7))
         );
+        assert_eq!(
+            action_of("workers/clear-finished"),
+            Some(WorkersAction::ClearFinished)
+        );
+        assert_eq!(action_of("workers/move/7"), None, "Move to Tab is gone");
         assert_eq!(action_of("workers/open/x"), None);
         assert_eq!(action_of("mail/open/7"), None);
     }
@@ -1248,11 +1314,61 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(labels(&finished), ["workers/result", "workers/move"]);
+        assert_eq!(labels(&finished), ["workers/result", "workers/keep"]);
         assert_eq!(
             labels(&row(2, "a", RowState::Working)),
-            ["workers/stop", "workers/move"]
+            ["workers/stop", "workers/keep"]
         );
+        // A worker whose tab aterm closed offers what it left, never a tab to keep.
+        let closed = WorkerRow {
+            finished: true,
+            ..finished.clone()
+        };
+        assert_eq!(labels(&closed), ["workers/result", "workers/dismiss"]);
+        let no_result = WorkerRow {
+            has_result: false,
+            stoppable: true,
+            ..closed
+        };
+        assert_eq!(labels(&no_result), ["workers/dismiss"], "nothing to stop");
+    }
+
+    /// FINISHED ROWS SIT UNDER FINISHED, LAST, IN THE ORDER THEIR TABS CLOSED, WHOEVER MANAGED
+    /// THEM: a running group keeps its heading. CONTROL: with none finished there is no such group,
+    /// and the page can be closed only when every row is a Finished one.
+    #[test]
+    fn finished_rows_sit_last_under_their_own_heading() {
+        let done = |session, group: &str| WorkerRow {
+            finished: true,
+            ..row(session, group, RowState::Finished)
+        };
+        let rows = [
+            done(7, "lead"),
+            row(1, "lead", RowState::Working),
+            done(3, ATERM_GROUP),
+        ];
+        let groups = grouped(&rows);
+        let headings: Vec<&str> = groups.iter().map(|(heading, _)| heading.as_str()).collect();
+        assert_eq!(headings, ["lead", FINISHED_GROUP]);
+        let finished: Vec<u64> = groups[1].1.iter().map(|row| row.session).collect();
+        assert_eq!(finished, [7, 3]);
+        assert!(
+            grouped(&rows[1..2])
+                .iter()
+                .all(|(heading, _)| heading != FINISHED_GROUP)
+        );
+        let app = |rows: Vec<WorkerRow>| WorkersApp {
+            rows,
+            actions: VecDeque::new(),
+        };
+        let view = WorkersViewState::default();
+        assert!(!app(rows.to_vec()).presentation(&view).closable);
+        assert!(
+            app(vec![done(7, "lead"), done(3, ATERM_GROUP)])
+                .presentation(&view)
+                .closable
+        );
+        assert!(app(Vec::new()).presentation(&view).closable);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+# The NEEDS and needs CLEARED rows of this Mac's lead journal s-ac6db2c482fb349b45ca (2026-10-14 to 10-29),
+# in order: each row's first need as a label (no words; equal words, equal label) and its count.
+# A' is the need that recurs; P<n> the phantom needs that led a set of 4; A the first; X the one after the take-down.
+NEEDS	A	3
+NEEDS	A'	3
+NEEDS	P1	4
+NEEDS	A'	3
+NEEDS	P2	4
+NEEDS	A'	3
+NEEDS	P3	4
+NEEDS	A'	3
+NEEDS	P4	4
+NEEDS	A'	3
+NEEDS	P5	4
+NEEDS	A'	3
+CLEARED
+NEEDS	X	3
+NEEDS	X	4

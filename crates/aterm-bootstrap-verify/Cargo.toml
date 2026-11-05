@@ -16,7 +16,10 @@ name = "aterm-bootstrap-verify"
 path = "src/main.rs"
 
 [dependencies]
-# Ed25519, as the updater's roster chain verifies it (aterm-update-core's roster.rs).
+# Ed25519 by ring's check, which takes a small-order key; the updater's roster chain
+# (aterm-update-core's roster.rs) verifies with astream's strict check, which refuses one.
+# This static verifier, whose SHA-256 install.sh pins, keeps its dependency set and so ring;
+# its keys are the pinned master's and the machine keys the master's signed roster names.
 # No features: verification needs neither an RNG nor alloc.
 ring = { workspace = true }
 # SHA-256 of the store's executable and the candidate: astream-digest's, which the

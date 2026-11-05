@@ -65,7 +65,6 @@ fn request(w: &World) -> Request {
 }
 
 fn harness_tools(w: &World, damage: Damage) -> FakeTools {
-    let source = git(&w.checkout, &["rev-parse", "HEAD"]);
     let version = format!(
         "0.1.0+g{}",
         git(&w.checkout, &["rev-parse", "--short=9", "HEAD"])
@@ -75,6 +74,13 @@ fn harness_tools(w: &World, damage: Damage) -> FakeTools {
     let mut tools = FakeTools::new(HOST);
     tools.answer = Box::new(move |run| {
         let args = run.argv();
+        if args == ["--unverified", "-vV"] {
+            return Some(ran(
+                0,
+                "targo test-driver\nfreshness: rust-and-build-input-content-v1\ncache-integrity: build-script-control-output-v1\ncache-integrity: compiled-build-script-executable-v1\ncache-integrity: build-script-generated-tree-v1\n",
+                "",
+            ));
+        }
         if args.first().map(String::as_str) == Some("metadata") {
             return Some(ran(
                 0,
@@ -86,12 +92,6 @@ fn harness_tools(w: &World, damage: Damage) -> FakeTools {
             assert_eq!(
                 run.env_of(HARNESS_VERSION_ENV).and_then(|s| s.to_str()),
                 Some(version.as_str())
-            );
-            assert!(
-                run.env_of("CARGO_TARGET_DIR")
-                    .unwrap()
-                    .to_string_lossy()
-                    .contains(&source)
             );
             let exe = put_exe(
                 &PathBuf::from(run.env_of("CARGO_TARGET_DIR").unwrap()).join("release/claude-alab"),
@@ -268,6 +268,202 @@ fn a_local_harness_has_one_main_identity_stamp_and_payload_receipt() {
         std::fs::read(built.dest.join("local-build.json")).unwrap(),
         before
     );
+}
+
+#[test]
+fn committed_edits_reuse_only_known_checkout_generations_and_preserve_prior_artifacts() {
+    let w = harness_world("local-harness-edit-reuse");
+    let req = request(&w);
+    let first_tools = harness_tools(&w, Damage::None);
+    let first = build_local::plan(&w.ctx, &req, &first_tools).unwrap();
+    let first_built = build_local::build(&w.ctx, &req, &first, &first_tools).unwrap();
+    let original_receipt = std::fs::read(first_built.dest.join("local-build.json")).unwrap();
+    let original_payload = std::fs::read(first_built.dest.join("bin/claude-alab")).unwrap();
+
+    put(
+        &w.checkout.join("source.rs"),
+        b"committed next generation\n",
+    );
+    git(&w.checkout, &["add", "source.rs"]);
+    git(
+        &w.checkout,
+        &["commit", "-q", "-m", "next source generation"],
+    );
+    git(
+        &w.checkout,
+        &["push", "-q", "origin", "HEAD:refs/heads/main"],
+    );
+    let next_tools = harness_tools(&w, Damage::None);
+    let next = build_local::plan(&w.ctx, &req, &next_tools).unwrap();
+    assert_ne!(first.source, next.source);
+    assert_ne!(
+        first.harness.as_ref().unwrap().version,
+        next.harness.as_ref().unwrap().version
+    );
+    let generation_known = std::fs::metadata(&w.checkout)
+        .unwrap()
+        .created()
+        .is_ok_and(|created| created > std::time::UNIX_EPOCH);
+    if generation_known {
+        assert_eq!(
+            first.command.env_of("CARGO_TARGET_DIR"),
+            next.command.env_of("CARGO_TARGET_DIR")
+        );
+    } else {
+        assert_ne!(
+            first.command.env_of("CARGO_TARGET_DIR"),
+            next.command.env_of("CARGO_TARGET_DIR")
+        );
+    }
+    let next_built = build_local::build(&w.ctx, &req, &next, &next_tools).unwrap();
+    assert_ne!(first_built.dest, next_built.dest);
+    let next_receipt: aterm_json::Value =
+        aterm_json::from_slice(&std::fs::read(next_built.dest.join("local-build.json")).unwrap())
+            .unwrap();
+    assert_eq!(next_receipt["source"].as_str(), Some(next.source.as_str()));
+    assert_eq!(
+        std::fs::read(first_built.dest.join("local-build.json")).unwrap(),
+        original_receipt
+    );
+    assert_eq!(
+        std::fs::read(first_built.dest.join("bin/claude-alab")).unwrap(),
+        original_payload
+    );
+
+    let other_checkout = w.root.join("independent-checkout");
+    git(
+        &w.root,
+        &[
+            "clone",
+            "-q",
+            &git(&w.checkout, &["remote", "get-url", "origin"]),
+            other_checkout.to_str().unwrap(),
+        ],
+    );
+    let independent = Request {
+        checkout: other_checkout,
+        ..req.clone()
+    };
+    let independent_plan = build_local::plan(&w.ctx, &independent, &next_tools).unwrap();
+    assert_eq!(next.source, independent_plan.source);
+    assert_ne!(
+        next.command.env_of("CARGO_TARGET_DIR"),
+        independent_plan.command.env_of("CARGO_TARGET_DIR")
+    );
+
+    let dev = Request {
+        profile: Profile::Dev,
+        ..req.clone()
+    };
+    let dev_plan = build_local::plan(&w.ctx, &dev, &next_tools).unwrap();
+    assert_ne!(
+        next.command.env_of("CARGO_TARGET_DIR"),
+        dev_plan.command.env_of("CARGO_TARGET_DIR")
+    );
+    next_tools.version(
+        &w.bin.join("trustc"),
+        &super::super::fixture::version_text(&"a".repeat(40), HOST),
+    );
+    let other_compiler = build_local::plan(&w.ctx, &req, &next_tools).unwrap();
+    assert_ne!(
+        next.command.env_of("CARGO_TARGET_DIR"),
+        other_compiler.command.env_of("CARGO_TARGET_DIR")
+    );
+}
+
+#[test]
+fn drivers_without_complete_reuse_capabilities_keep_exact_source_targets() {
+    fn legacy_tools(w: &World, version: &str) -> FakeTools {
+        let mut tools = harness_tools(w, Damage::None);
+        let answer = tools.answer;
+        let version = version.to_owned();
+        tools.answer = Box::new(move |run| {
+            if run.argv() == ["--unverified", "-vV"] {
+                Some(ran(0, &version, ""))
+            } else {
+                answer(run)
+            }
+        });
+        tools
+    }
+    for version in [
+        "targo legacy\n",
+        "targo input-only\nfreshness: rust-and-build-input-content-v1\n",
+        "targo output-only\ncache-integrity: build-script-control-output-v1\n",
+        "targo missing-executable-integrity\nfreshness: rust-and-build-input-content-v1\ncache-integrity: build-script-control-output-v1\ncache-integrity: build-script-generated-tree-v1\n",
+        "targo missing-control-integrity\nfreshness: rust-and-build-input-content-v1\ncache-integrity: compiled-build-script-executable-v1\ncache-integrity: build-script-generated-tree-v1\n",
+        "targo missing-input-freshness\ncache-integrity: build-script-control-output-v1\ncache-integrity: compiled-build-script-executable-v1\ncache-integrity: build-script-generated-tree-v1\n",
+        "targo missing-generated-integrity\nfreshness: rust-and-build-input-content-v1\ncache-integrity: build-script-control-output-v1\ncache-integrity: compiled-build-script-executable-v1\n",
+        "cargo foreign\nfreshness: rust-and-build-input-content-v1\ncache-integrity: build-script-control-output-v1\ncache-integrity: compiled-build-script-executable-v1\ncache-integrity: build-script-generated-tree-v1\n",
+    ] {
+        let w = harness_world("local-harness-incomplete-freshness");
+        let req = request(&w);
+        let first = build_local::plan(&w.ctx, &req, &legacy_tools(&w, version)).unwrap();
+        assert_eq!(
+            first.cache_freshness,
+            build_local::CacheFreshness::ExactSource
+        );
+        put(
+            &w.checkout.join("source.rs"),
+            b"new checked source generation\n",
+        );
+        git(&w.checkout, &["add", "source.rs"]);
+        git(&w.checkout, &["commit", "-q", "-m", "next source"]);
+        git(
+            &w.checkout,
+            &["push", "-q", "origin", "HEAD:refs/heads/main"],
+        );
+        let tools = legacy_tools(&w, version);
+        let next = build_local::plan(&w.ctx, &req, &tools).unwrap();
+        assert_eq!(
+            next.cache_freshness,
+            build_local::CacheFreshness::ExactSource
+        );
+        assert_ne!(
+            first.command.env_of("CARGO_TARGET_DIR"),
+            next.command.env_of("CARGO_TARGET_DIR")
+        );
+        assert!(
+            !next
+                .command
+                .argv()
+                .iter()
+                .any(|arg| arg == "-Zchecksum-freshness")
+        );
+        build_local::build(&w.ctx, &req, &next, &tools).unwrap();
+    }
+}
+
+#[test]
+fn original_driver_analysis_capability_must_be_unique_and_does_not_change_default_build_flags() {
+    for (markers, expected) in [(0, false), (1, true), (2, false)] {
+        let w = harness_world("local-harness-original-analysis-capability");
+        let mut tools = harness_tools(&w, Damage::None);
+        let previous = tools.answer;
+        tools.answer = Box::new(move |run| {
+            if run.argv() == ["--unverified", "-vV"] {
+                Some(ran(
+                    0,
+                    &format!(
+                        "targo original-driver\n{}",
+                        "analysis-session: build-json-v1\n".repeat(markers)
+                    ),
+                    "",
+                ))
+            } else {
+                previous(run)
+            }
+        });
+        let plan = build_local::plan(&w.ctx, &request(&w), &tools).unwrap();
+        assert_eq!(plan.analysis_session, expected);
+        assert!(
+            !plan
+                .command
+                .argv()
+                .iter()
+                .any(|arg| arg == "-Zbuild-analysis")
+        );
+    }
 }
 
 #[test]

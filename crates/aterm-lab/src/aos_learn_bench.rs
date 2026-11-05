@@ -10,7 +10,7 @@
 //! and `record`. It shows nothing until both children have exited and every gate is decided.
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,6 +24,7 @@ use aterm_effects::aos_momentum::m6::{
     DurableLog, Ledger, Line, M6_CHAIN_V1, Pair, STORE_DOMAIN, Store, VoidCause, VoidClass,
     ledger_head,
 };
+use aterm_uds::atomic_file::read_regular;
 use aterm_uds::spawnfd::Stdio;
 
 use crate::aos_gpu_bench::{Watch, clean_commit, watch};
@@ -306,11 +307,8 @@ fn capture(out: &Path, name: &str) -> std::io::Result<(File, File)> {
 /// The id of the store under `dir`, from its `store.txt`, which `Store::init` makes first and
 /// whole (by link) before the session's `open` line; `None` when it holds none.
 fn store_id(dir: &Path) -> Option<Digest> {
-    let mut bytes = Vec::new();
-    File::open(dir.join("store.txt"))
-        .and_then(|f| f.take(MAX_STORE_TEXT + 1).read_to_end(&mut bytes))
-        .ok()?;
-    (bytes.len() as u64 <= MAX_STORE_TEXT).then(|| Digest::of(STORE_DOMAIN, &[&bytes]))
+    let (bytes, _) = read_regular(&dir.join("store.txt"), MAX_STORE_TEXT).ok()?;
+    Some(Digest::of(STORE_DOMAIN, &[&bytes]))
 }
 
 /// The line a session ends with.
@@ -747,21 +745,12 @@ fn regular_file(given: &str, flag: &str) -> Result<PathBuf, Fail> {
 
 /// The tests log's digest, refused unless the log names `commit`.
 fn tests_log_digest(path: &Path, commit: &str) -> Result<Digest, Fail> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|f| f.take(MAX_TESTS_LOG + 1).read_to_end(&mut bytes))
-        .map_err(|e| {
-            Fail::usage(format!(
-                "aos-learn-bench: --tests-log {}: {e}",
-                path.display()
-            ))
-        })?;
-    if bytes.len() as u64 > MAX_TESTS_LOG {
-        return Err(Fail::usage(format!(
-            "aos-learn-bench: --tests-log {} passes {MAX_TESTS_LOG} bytes",
+    let (bytes, _) = read_regular(path, MAX_TESTS_LOG).map_err(|error| {
+        Fail::usage(format!(
+            "aos-learn-bench: --tests-log {}: {error}",
             path.display()
-        )));
-    }
+        ))
+    })?;
     if !String::from_utf8_lossy(&bytes).contains(commit) {
         return Err(Fail::die(format!(
             "aos-learn-bench: refused TestsLog: {} does not name the session commit {commit}",

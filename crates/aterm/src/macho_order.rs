@@ -370,7 +370,21 @@ pub(crate) fn write_probe_spacer_object(
     hdr.extend_from_slice(&stroff.to_le_bytes());
     hdr.extend_from_slice(&strsize.to_le_bytes());
 
-    let mut file = std::fs::File::create(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    file.set_len(0)?;
     file.write_all(&hdr)?;
     file.seek(SeekFrom::Start(symoff_u64))?;
     file.write_all(&sym_records)?;
@@ -1143,6 +1157,7 @@ fn extract_c_prefix(sym: &str) -> &str {
 
 /// Writes `symbols` to `path` (one symbol per line) for `ld -order_file`.
 pub(crate) fn write_order_file(path: &Path, symbols: &[String]) -> std::io::Result<()> {
+    use std::io::Write as _;
     let total_bytes: usize = symbols.iter().fold(0usize, |acc, s| {
         acc.saturating_add(s.len()).saturating_add(1)
     });
@@ -1151,7 +1166,19 @@ pub(crate) fn write_order_file(path: &Path, symbols: &[String]) -> std::io::Resu
         buf.push_str(sym);
         buf.push('\n');
     }
-    std::fs::write(path, buf.as_bytes())
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        #[cfg(target_os = "macos")]
+        const FLAGS: i32 = 0x0100 | 0x0100_0000;
+        #[cfg(not(target_os = "macos"))]
+        const FLAGS: i32 = 0o2_000_000;
+        opts.mode(0o600).custom_flags(FLAGS);
+    }
+    opts.open(path)?.write_all(buf.as_bytes())
 }
 
 #[cfg(test)]

@@ -612,6 +612,7 @@ fn every_providers_key_shape_is_refused() {
         "they will be back soon",
         "codes come by email to the hub",
         "digest deadbeefcafe2345abcd",
+        "andrewyates36dmv@gmail.com",
     ] {
         assert!(!guard::credential_shaped(fine), "{fine}");
     }
@@ -688,12 +689,11 @@ fn phone_numbers_stay_out_of_every_cell() {
     assert!(last4("10101").is_err());
 }
 
-/// A schema with a secret-named column that is not a vault reference does not check, so it
-/// cannot build; the same column as a vault reference does.
+/// A schema with a secret-named column must use the inner-sealed Secret type.
 /// NEGATIVE CONTROL: with `secret_named` answering false, the password column checks and this
 /// fails.
 #[test]
-fn secret_named_columns_must_be_vault_references() {
+fn secret_named_columns_must_be_secret() {
     const BAD: Collection = Collection {
         columns: &[
             Column::new("mailbox_password", Ty::Text(64)),
@@ -703,7 +703,7 @@ fn secret_named_columns_must_be_vault_references() {
     };
     const GOOD: Collection = Collection {
         columns: &[
-            Column::new("mailbox_password", Ty::SecretRef),
+            Column::new("mailbox_password", Ty::Secret),
             Column::new("row", Ty::Enum(LIFE)),
         ],
         ..ADDRESS
@@ -712,10 +712,7 @@ fn secret_named_columns_must_be_vault_references() {
         columns: &[Column::new("addr", Ty::Email)],
         ..ADDRESS
     };
-    assert_eq!(
-        BAD.check(),
-        Err("a secret-named column must be a vault reference")
-    );
+    assert_eq!(BAD.check(), Err("a secret-named column must be Secret"));
     assert_eq!(GOOD.check(), Ok(()));
     assert!(NO_LIFECYCLE.check().is_err());
     assert!(
@@ -1028,7 +1025,7 @@ fn every_key_fits_the_grammar() {
         keys::source_pk(b"sheet"),
         keys::model_pk("Mac16,8").unwrap(),
         keys::random_pk(keys::Random::Phone).unwrap(),
-        keys::random_pk(keys::Random::Mailbox).unwrap(),
+        keys::mailbox_pk(&keys::address_pk("a@example.invalid").unwrap()).unwrap(),
     ];
     for (method, _) in keys::METHOD_CODES {
         longest.push(keys::auth_route_pk(&account, method).unwrap());
@@ -1044,6 +1041,18 @@ fn every_key_fits_the_grammar() {
     }
     assert!(keys::preference_pk(&account, &machine).is_err());
     assert!(keys::auth_route_pk(&account, "carrier-pigeon").is_err());
+    // A mailbox's key is its login's: one row for every Mac, and only an address key makes one.
+    let login = keys::address_pk("a@example.invalid").unwrap();
+    assert_eq!(
+        keys::mailbox_pk(&login).unwrap(),
+        keys::mailbox_pk(&login).unwrap()
+    );
+    assert_ne!(
+        keys::mailbox_pk(&login).unwrap(),
+        keys::mailbox_pk(&keys::address_pk("b@example.invalid").unwrap()).unwrap()
+    );
+    assert!(keys::mailbox_pk("a@example.invalid").is_err());
+    assert!(keys::mailbox_pk(&machine).is_err());
     assert_ne!(
         keys::random_pk(keys::Random::Phone).unwrap(),
         keys::random_pk(keys::Random::Phone).unwrap()
@@ -1314,7 +1323,7 @@ mod commons {
                 .filter(|op| !quota.over.contains(&op.id))
                 .collect();
             let members: BTreeMap<Actor, [u8; 16]> = session
-                .members()
+                .members()?
                 .iter()
                 .map(|binding| (binding.actor(), *binding.machine()))
                 .collect();

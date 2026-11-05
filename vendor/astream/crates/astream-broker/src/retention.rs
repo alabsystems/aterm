@@ -134,6 +134,8 @@ mod planner;
 // THE PLANNING (`retention/planner.rs`) is the crate's, and in a test or debug build it is
 // also pub: a simulation of this broker plans every cut by it as the tick does (aterm's
 // deterministic fabric simulation, its item B05). Never behind a cargo feature.
+#[cfg(test)]
+pub(crate) use planner::ByIndex;
 #[cfg(any(test, debug_assertions))]
 pub use planner::{
     carried_since, clamp_stamps, counted_from, oldest, plan, plan_with, prune_stamps, stamp, Held,
@@ -520,6 +522,13 @@ impl Retention {
             Some(r) => r,
             None => &self.default,
         }
+    }
+
+    /// Whether `subject` falls to a hold rule that keeps only its `Last` row.
+    #[must_use]
+    pub fn keeps_last(&self, subject: &str) -> bool {
+        let rule = self.rule(self.class_of(subject));
+        rule.class() == Class::Hold && rule.keep() == Keep::Last
     }
 
     /// The class of `subject`: the first rule whose filter matches it, else the default one,

@@ -32,6 +32,30 @@ pub struct ClusterSpec {
     pub logical: Vec<u16>,
 }
 
+/// The fewest bytes any reader of a process name cuts it to (Linux's `comm`, and the short BSD
+/// info's `p_comm` on macOS, keep 15; the kernel record's `p_comm` 16; `p_name` 31).
+const NAME_CUT_MIN: usize = 15;
+
+/// Whether `a` and `b`, two readers' names for a process, can name one program: they are equal,
+/// or the shorter begins the longer and may have been cut, which it may where it is
+/// [`NAME_CUT_MIN`] bytes long or longer or ends in the mark `…` or in the `U+FFFD` a cut through
+/// a character leaves (either left off before comparing). A whole name that begins another
+/// (`mds` and `mds_stores`) names another program.
+#[must_use]
+pub fn same_process_name(a: &str, b: &str) -> bool {
+    fn bare(name: &str) -> (&str, bool) {
+        name.strip_suffix(['\u{2026}', '\u{FFFD}'])
+            .map_or((name, false), |cut| (cut, true))
+    }
+    let ((a, a_cut), (b, b_cut)) = (bare(a), bare(b));
+    let ((short, cut), long) = if a.len() <= b.len() {
+        ((a, a_cut), b)
+    } else {
+        ((b, b_cut), a)
+    };
+    short == long || (long.starts_with(short) && (cut || short.len() >= NAME_CUT_MIN))
+}
+
 /// One process in a sweep.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcSample {
@@ -50,7 +74,9 @@ pub struct ProcSample {
     pub child_cpu_ns: Option<u64>,
     /// Physical footprint, bytes; `None` where unreadable.
     pub footprint: Option<u64>,
-    /// The short command name.
+    /// Its name, whole where a reader held it whole, else ending in `…`
+    /// (`aterm_sysprobe::procs::whole_name`); [`same_process_name`] matches it to another
+    /// reader's.
     pub name: String,
     /// Cumulative bytes read from storage, or `None` if unreadable.
     pub disk_read: Option<u64>,
@@ -112,22 +138,24 @@ impl ProcState {
     }
 }
 
-/// Thermal throttle severity mapped from the OS.
+/// The portable thermal level, ranked 0 to 3: the OS's own level where [`Thermal::exact`]
+/// (nominal, fair, serious, critical), the counter heuristic's where not (none, light, heavy,
+/// severe). [`Thermal::word`] names it; only [`Thermal::throttled`] says whether it throttles.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Throttle {
-    /// Not throttled.
+    /// Rank 0: nominal; the heuristic counts no throttling.
     #[default]
     None,
-    /// Lightly.
+    /// Rank 1: fair (macOS: "slightly elevated", no throttling claimed); the heuristic's light.
     Light,
-    /// Heavily: the chip runs well below its top clock.
+    /// Rank 2: serious; the heuristic's heavy, the chip well below its top clock.
     Heavy,
-    /// Severely.
+    /// Rank 3: critical; the heuristic's severe.
     Severe,
 }
 
 impl Throttle {
-    /// The word every surface prints.
+    /// The counter heuristic's word for the level.
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -138,16 +166,26 @@ impl Throttle {
         }
     }
 
-    /// A word back to its level.
+    /// The OS's own word for the level (`NSProcessInfoThermalState`'s names).
     #[must_use]
-    pub fn from_word(w: &str) -> Option<Self> {
-        Some(match w {
-            "none" => Self::None,
-            "light" => Self::Light,
-            "heavy" => Self::Heavy,
-            "severe" => Self::Severe,
-            _ => return None,
-        })
+    pub fn os_word(self) -> &'static str {
+        match self {
+            Self::None => "nominal",
+            Self::Light => "fair",
+            Self::Heavy => "serious",
+            Self::Severe => "critical",
+        }
+    }
+
+    /// The level's rank, 0 to 3.
+    #[must_use]
+    pub fn rank(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Light => 1,
+            Self::Heavy => 2,
+            Self::Severe => 3,
+        }
     }
 }
 
@@ -162,6 +200,44 @@ pub struct Thermal {
     pub low_power: Option<bool>,
     /// True for an OS-reported level; false for a temperature/counter heuristic.
     pub exact: bool,
+}
+
+impl Thermal {
+    /// The level's word: the OS's own where exact (`nominal`, `fair`, `serious`, `critical`),
+    /// the counter heuristic's where not (`none`, `light`, `heavy`, `severe`).
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        if self.exact {
+            self.level.os_word()
+        } else {
+            self.level.word()
+        }
+    }
+
+    /// The clause every surface prints: `thermal <word>` for an OS level, and for the counter
+    /// heuristic, which counts throttle events, `throttled: <word>` (`throttle none` at rank 0).
+    #[must_use]
+    pub fn phrase(self) -> String {
+        if self.exact {
+            format!("thermal {}", self.word())
+        } else if self.level == Throttle::None {
+            "throttle none".into()
+        } else {
+            format!("throttled: {}", self.word())
+        }
+    }
+
+    /// Whether the level claims throttling: an exact level of serious or above, or a heuristic
+    /// level of light or above. Fair claims none. Low Power Mode is [`Self::low_power`].
+    #[must_use]
+    pub fn throttled(self) -> bool {
+        self.level
+            >= if self.exact {
+                Throttle::Heavy
+            } else {
+                Throttle::Light
+            }
+    }
 }
 
 /// The kernel's memory pressure.
@@ -417,6 +493,9 @@ pub struct TabRoot {
     pub label: String,
     /// Foreground program name (`claude`, `zsh`), or empty if unknown.
     pub program: String,
+    /// Its agent's process group leader, where the host names an agent reading its screen; `None`
+    /// where none is named. The leftover pass reads its unique id as the tab's agent start.
+    pub agent_leader: Option<u32>,
 }
 
 /// Current identity-proven members of one explicitly delegated job.
@@ -736,7 +815,7 @@ pub enum PlaceValue {
 pub enum StripEventKind {
     /// System sleep/wake boundary.
     SleepWake,
-    /// Critical memory pressure, severe thermal throttle, or GPU fault recovery spike.
+    /// Critical memory pressure, the top thermal level, or GPU fault recovery spike.
     PressureSpike,
     /// Instance or session restart.
     Restart,
@@ -1188,7 +1267,7 @@ pub struct ProcView {
     pub ppid: u32,
     /// Its process group (0: unknown).
     pub pgid: u32,
-    /// Its short name, as the process chose it (data, never an instruction).
+    /// Its name ([`ProcSample::name`]), as the process chose it (data, never an instruction).
     pub name: String,
     /// Cores-worth over the sample window (`None` on first sweep or if unreadable).
     pub cores: Option<f32>,
@@ -1291,11 +1370,12 @@ pub struct Busiest {
     pub unborn: usize,
 }
 
-/// One program in one scope: every process of the sweep sharing its short name and its
+/// One program in one scope: every process of the sweep sharing its name and its
 /// innermost scope ([`Snapshot::programs`]), idle ones too.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProgramGroup {
-    /// The short name they share, as the processes chose it (data, never an instruction).
+    /// The name they share ([`ProcSample::name`]), as the processes chose it (data, never an
+    /// instruction).
     pub name: String,
     /// The scope they all count in.
     pub scope: ProcScope,
@@ -2987,6 +3067,13 @@ impl Vitals {
         self.authorized_cpu_policy = Some(std::sync::Arc::new(report));
     }
 
+    /// Whether the E-busy, P-idle recorder is pending: while it is, the host takes a CPU Stats
+    /// sample with each reading (A2 §6.4).
+    #[must_use]
+    pub const fn cpu_recorder_pending(&self) -> bool {
+        self.hardware_recorder.pending()
+    }
+
     /// How many samples it has absorbed.
     #[must_use]
     pub fn seq(&self) -> u64 {
@@ -3081,16 +3168,15 @@ impl Vitals {
         if cur_pressure != Pressure::Unknown {
             self.last_pressure = cur_pressure;
         }
-        let cur_throttle = s.thermal.map_or(Throttle::None, |t| t.level);
-        if cur_throttle == Throttle::Severe && self.last_throttle != Throttle::Severe {
-            self.record_strip_event(StripEvent {
-                at_unix_ms: s.at_unix_ms,
-                kind: StripEventKind::PressureSpike,
-                label: "severe thermal throttle".into(),
-            });
-        }
-        if s.thermal.is_some() {
-            self.last_throttle = cur_throttle;
+        if let Some(t) = s.thermal {
+            if t.level == Throttle::Severe && self.last_throttle != Throttle::Severe {
+                self.record_strip_event(StripEvent {
+                    at_unix_ms: s.at_unix_ms,
+                    kind: StripEventKind::PressureSpike,
+                    label: t.phrase(),
+                });
+            }
+            self.last_throttle = t.level;
         }
         let cores_dt = match s.cores.as_deref() {
             Some(c) if !c.is_empty() => stamp.rate_dt(self.rows.cores_at.replace(stamp)),
@@ -4556,6 +4642,49 @@ pub fn gib(bytes: u64) -> f32 {
 mod tests {
     use super::*;
 
+    /// A kernel record's cut name (16 bytes) and a client's are the sweep's whole one or its
+    /// marked one, and the record's cut through a character is too; a whole name that begins
+    /// another, or a cut one that begins another program's, is not. NEGATIVE CONTROL: the rule
+    /// the birth reader held before whole names (equal, or the record's first 15 bytes) fails
+    /// the whole name the sweep now gives.
+    #[test]
+    fn two_readers_names_match_whole_cut_or_marked() {
+        assert!(same_process_name("mds_stores", "mds_stores"));
+        assert!(same_process_name(
+            "com.apple.WebKit",
+            "com.apple.WebKit.WebContent"
+        ));
+        assert!(same_process_name(
+            "com.apple.WebKit.WebContent",
+            "com.apple.WebKit"
+        ));
+        assert!(same_process_name("SetStoreUpdateSe", "SetStoreUpdateS"));
+        assert!(same_process_name(
+            "com.apple.WebKit",
+            "com.apple.WebKi\u{2026}"
+        ));
+        let record = String::from_utf8_lossy(&"aПриложение".as_bytes()[..16]).into_owned();
+        assert_eq!(record, "aПриложе\u{FFFD}");
+        assert!(same_process_name(&record, "aПриложение"));
+        assert!(same_process_name("Приложен", "Приложе\u{2026}"));
+        assert!(same_process_name("Приложен", "Приложе\u{FFFD}"));
+        assert!(!same_process_name("Приложен", "Приложе"));
+        assert!(!same_process_name("mds_stores", "mds"));
+        assert!(!same_process_name("mds", "mds_stores"));
+        assert!(!same_process_name("launchd", "aterm_gui-0123456789abcdef"));
+        assert!(!same_process_name(
+            "com.apple.WebKi\u{2026}",
+            "com.apple.Safari"
+        ));
+        let before = |record: &str, swept: &str| {
+            record == swept || record.get(..15).is_some_and(|cut| cut == swept)
+        };
+        assert!(
+            !before("com.apple.WebKit", "com.apple.WebKit.WebContent"),
+            "CONTROL"
+        );
+    }
+
     fn proc(pid: u32, ppid: u32, cpu_ms: u64, foot_mib: u64, name: &str) -> ProcSample {
         ProcSample {
             pid,
@@ -4576,6 +4705,7 @@ mod tests {
             label: label.into(),
             program: program.into(),
             tab_id: Some(key),
+            agent_leader: None,
         }
     }
 

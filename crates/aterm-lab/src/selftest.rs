@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! `selftest [tag] [--keep]`: end-to-end lab self-test driving Claude Code, [`crate::settings_witness`], and jail/stray checks.
-use std::fs;
 use std::time::Duration;
 
 use crate::LAB;
@@ -352,7 +351,7 @@ fn checks(run: &Run) -> Result<Checks, Fail> {
     }
     println!("== lsof -nP -i of the lab's processes (the claude row is the real Claude Code)");
     let lsof = crate::verbs::lsof_text(run).unwrap_or_default();
-    let _ = fs::write(run.run.join("lsof.txt"), &lsof);
+    let _ = crate::util::write_fresh(&run.run.join("lsof.txt"), &lsof);
     for l in lsof.lines() {
         println!("  {l}");
     }
@@ -364,7 +363,7 @@ fn checks(run: &Run) -> Result<Checks, Fail> {
         "== isolation probes (this lab's rules on a replica home: nothing of the owner's is touched)"
     );
     let (iso, probe_text) = crate::probe::run_captured(&run.tag, true)?;
-    let _ = fs::write(run.run.join("probe.txt"), &probe_text);
+    let _ = crate::util::write_fresh(&run.run.join("probe.txt"), &probe_text);
     for l in probe_text.lines() {
         println!("  {l}");
     }

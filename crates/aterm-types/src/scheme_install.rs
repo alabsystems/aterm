@@ -258,11 +258,18 @@ pub fn write_atomically(
         .tempdir_in(dir)
         .map_err(|e| failed(dir, e))?;
     let tmp = stage.path().join("theme");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|e| failed(&tmp, e))?;
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        const FLAGS: i32 = 0x0100 | 0x0100_0000;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        const FLAGS: i32 = 0o2_000_000;
+        open.mode(0o644).custom_flags(FLAGS);
+    }
+    let mut file = open.open(&tmp).map_err(|e| failed(&tmp, e))?;
     let written = file
         .write_all(bytes)
         .and_then(|()| aterm_durable::durable(&file));

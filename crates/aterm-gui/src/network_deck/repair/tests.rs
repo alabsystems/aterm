@@ -10,6 +10,7 @@ use aterm_types::network_state::{
 
 fn observation(outcome: RepairOutcome) -> RepairObservation {
     RepairObservation {
+        cause: None,
         completed_at_ms: 3000,
         outbound: true,
         stage: Some(RepairStage::Application),

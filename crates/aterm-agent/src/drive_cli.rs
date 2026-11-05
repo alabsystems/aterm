@@ -422,16 +422,34 @@ fn write_private(path: &std::path::Path, text: &str) -> Result<(), String> {
     use std::io::Write as _;
 
     let mut o = std::fs::OpenOptions::new();
-    o.create(true).write(true).truncate(true);
+    o.create(true).write(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
+        o.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let mut f = o
         .open(path)
         .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    f.write_all(text.as_bytes())
+    if !f
+        .metadata()
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?
+        .is_file()
+    {
+        return Err(format!(
+            "cannot write {}: not a regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    }
+    f.set_len(0)
+        .and_then(|()| f.write_all(text.as_bytes()))
         .and_then(|()| f.flush())
         .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }

@@ -8,8 +8,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use ring::signature::{ED25519, UnparsedPublicKey};
-
 /// The highest roster `schema` this build understands.
 pub const SUPPORTED_SCHEMA: u32 = 1;
 
@@ -81,15 +79,13 @@ fn verify_under(pubkey_b64: &str, msg: &[u8], sig: &[u8]) -> Result<(), RosterRe
     }
     let pk = aterm_codec::base64::decode_strict(pubkey_b64.as_bytes())
         .map_err(|_| RosterReject::BadKey)?;
-    if pk.len() != 32 {
-        return Err(RosterReject::BadKey);
+    let pk = <&[u8; 32]>::try_from(pk.as_slice()).map_err(|_| RosterReject::BadKey)?;
+    let sig = <&[u8; 64]>::try_from(sig).map_err(|_| RosterReject::BadSig)?;
+    if astream_aead::signature::verify(pk, msg, sig) {
+        Ok(())
+    } else {
+        Err(RosterReject::Verify)
     }
-    if sig.len() != 64 {
-        return Err(RosterReject::BadSig);
-    }
-    UnparsedPublicKey::new(&ED25519, &pk)
-        .verify(msg, sig)
-        .map_err(|_| RosterReject::Verify)
 }
 
 /// Verify the roster's exact bytes under the pinned master keyset.
@@ -187,11 +183,20 @@ impl Roster {
             schema: u32,
         }
         let text = std::str::from_utf8(verified.as_slice()).map_err(|_| RosterReject::Malformed)?;
-        let head: Head = aterm_toml::from_str(text).map_err(|_| RosterReject::Malformed)?;
-        if head.schema > SUPPORTED_SCHEMA {
+        let roster: Roster = match aterm_toml::from_str(text) {
+            Ok(roster) => roster,
+            Err(_) => {
+                if aterm_toml::from_str::<Head>(text)
+                    .is_ok_and(|head| head.schema > SUPPORTED_SCHEMA)
+                {
+                    return Err(RosterReject::Schema);
+                }
+                return Err(RosterReject::Malformed);
+            }
+        };
+        if roster.schema > SUPPORTED_SCHEMA {
             return Err(RosterReject::Schema);
         }
-        let roster: Roster = aterm_toml::from_str(text).map_err(|_| RosterReject::Malformed)?;
         roster.validate()?;
         Ok(roster)
     }
@@ -238,6 +243,19 @@ impl Roster {
         self.revoked.iter().any(|r| r == id)
     }
 
+    fn check_machine_live(&self, m: &Machine, now_unix: i64) -> Result<(), RosterReject> {
+        if self.is_revoked(&m.id) {
+            return Err(RosterReject::Revoked);
+        }
+        if let Some(not_after) = &m.not_after {
+            let until = rfc3339_to_unix(not_after).ok_or(RosterReject::Expired)?;
+            if now_unix >= until {
+                return Err(RosterReject::Expired);
+            }
+        }
+        Ok(())
+    }
+
     /// The named machine, iff it is listed, not revoked, and not itself expired.
     pub fn machine(&self, id: &str, now_unix: i64) -> Result<&Machine, RosterReject> {
         if self.is_revoked(id) {
@@ -248,12 +266,7 @@ impl Roster {
             .iter()
             .find(|m| m.id == id)
             .ok_or(RosterReject::UnknownMachine)?;
-        if let Some(not_after) = &m.not_after {
-            let until = rfc3339_to_unix(not_after).ok_or(RosterReject::Expired)?;
-            if now_unix >= until {
-                return Err(RosterReject::Expired);
-            }
-        }
+        self.check_machine_live(m, now_unix)?;
         Ok(m)
     }
 
@@ -262,7 +275,7 @@ impl Roster {
     pub fn live(&self, now_unix: i64) -> Vec<&Machine> {
         self.machines
             .iter()
-            .filter(|m| self.machine(&m.id, now_unix).is_ok())
+            .filter(|m| self.check_machine_live(m, now_unix).is_ok())
             .collect()
     }
 

@@ -86,6 +86,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         turn_said: None,
         said_lines: None,
         turn_lines: None,
+        turn_breaks: Default::default(),
         opened_by: None,
         message_drawn: false,
         submits: None,
@@ -130,6 +131,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         login_at_wall: None,
         login_method: None,
         login_shared: None,
+        login_pin: crate::supervise::policy::login::LoginPin::Picker,
         login_moved: false,
         roster: None,
         wall_remembered: false,
@@ -141,6 +143,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         record_turn: None,
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,
+        leftover: crate::harness::leftover::LeftRead::NotAsked,
     }
 }
 
@@ -4134,6 +4137,53 @@ fn a_lost_login_is_escalated_over_a_draft_or_with_retries_off() {
     ));
 }
 
+/// A LOST LOGIN WHOSE SETTINGS PIN THE SIGN-IN IS THE PERSON'S TO SIGN IN (the post-landing
+/// review, 2026-11-02): where Claude Code's settings pin the sign-in method (`forceLoginMethod`
+/// `claudeai` or `console`, whose `/login` starts the browser sign-in at once with no picker),
+/// name a gateway, or cannot be read, aterm types no `/login` and tells the person, quietly, to
+/// type it themselves (`login-not-run`, its `{why}` the pin's); with no pin it types `/login` as
+/// before. Negative control: the arm's pin check taken out types `/login` over every pin.
+#[test]
+fn a_lost_login_whose_settings_pin_its_sign_in_is_left_to_the_person() {
+    use super::super::login::LoginPin;
+    use super::super::notice::LOGIN_NOT_RUN;
+    let t = t0();
+    let r = read_screen(
+        &login_screen(&["⏺ Login expired · Please run /login"]),
+        Some(3 * MIN),
+    );
+    assert_eq!(r.wall, Some(WallKind::Auth), "read as the auth wall");
+    let login = TurnEndAction::TypeCommand {
+        command: "/login".to_string(),
+        rule_id: RULE_LOGIN,
+        then: Then::Nothing,
+    };
+    let mut st = TurnEndState::default();
+    st.observe(&r, t);
+    assert_eq!(
+        decide_turn_end(&st, &r, &cfg(), t),
+        login,
+        "no pin: the picker"
+    );
+    for pin in [LoginPin::Method, LoginPin::Gateway, LoginPin::Unread] {
+        let why = pin.why().expect("a pin says why");
+        let pinned = TurnEndReading {
+            login_pin: pin,
+            ..r.clone()
+        };
+        let mut st = TurnEndState::default();
+        st.observe(&pinned, t);
+        let a = decide_turn_end(&st, &pinned, &cfg(), t);
+        assert!(is_escalate(&a, why), "{pin:?}: {a:?}");
+        let told = super::super::exception::exception_for(&st, &pinned, &cfg(), t)
+            .expect("the person is told");
+        let notice = told.notice.as_ref().expect("a notice");
+        assert_eq!(notice.id, LOGIN_NOT_RUN.id, "{pin:?}: {told:?}");
+        assert!(notice.did.contains(why), "{pin:?}: {}", notice.did);
+        assert_eq!(told.when, super::super::exception::Urgency::Now, "{pin:?}");
+    }
+}
+
 #[test]
 fn a_cloud_gateway_sign_in_types_login_once_never_a_retry() {
     let t = t0();
@@ -5169,6 +5219,11 @@ fn a_retrys_hint_never_submits_a_draft_into_it() {
         }
     );
 }
+/// ATERM'S OWN WORDS LEFT IN THE PROMPT ARE NEVER SENT AS A DRAFT: a part of its notice, its release
+/// line, and its continuation after a restart, which a person's gesture between the paste and the
+/// Enter leaves whole and unsent, read off a real Claude Code screen, are [`Composer::Own`]: asked
+/// about (`OWN_WORDS_STAND`), never sent. A person's draft, and one glyph of the mark, are theirs.
+/// NEGATIVE CONTROL: `upgrade::own_draft` without `CONTINUE_HEADS`, and the continuation is a draft.
 #[test]
 fn aterms_own_words_left_in_the_prompt_are_never_sent_as_a_draft() {
     let t = t0();
@@ -5199,6 +5254,14 @@ fn aterms_own_words_left_in_the_prompt_are_never_sent_as_a_draft() {
     );
     assert_eq!(release_whole, Composer::Own);
     assert_eq!(with_draft("[aterm harn", ""), Composer::Own);
+    // The relaunch's continuation, whole and unsent: the person's gesture between its paste and
+    // its Enter stops it there (`turn … reason=person typed=0 pasted=<n>`), and it is aterm's
+    // words, never a person's draft to send.
+    let continuation = with_draft(
+        "[aterm harness] Upgraded: this session was restarted on Claude Code 2.1.291",
+        "(from 2.1.290) and resumed.",
+    );
+    assert_eq!(continuation, Composer::Own);
     let standing = |composer: Composer| TurnEndReading {
         composer,
         ..idle("Done: 12 of 67 divisions now solve.", Some(3 * MIN))
@@ -5217,17 +5280,14 @@ fn aterms_own_words_left_in_the_prompt_are_never_sent_as_a_draft() {
             "{program:?}"
         );
     }
-    for draft in [
-        ("push it as soon as the gates pass", ""),
-        (
-            "[aterm harness] Upgraded: this session was restarted on Claude Code 2.1.291",
-            "(from 2.1.290) and resumed.",
-        ),
-        ("[", ""),
-        ("/exit", ""),
-    ] {
+    for draft in [("push it as soon as the gates pass", ""), ("[", "")] {
         assert_eq!(with_draft(draft.0, draft.1), Composer::Typed, "{draft:?}");
     }
+    // A command is no draft to send either (v6 §14.17.5.8): the person's hold.
+    assert_eq!(
+        with_draft("/exit", ""),
+        Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Runs)
+    );
     for program in [Program::Claude, Program::Codex] {
         let typed = TurnEndReading {
             program,
@@ -5286,13 +5346,15 @@ fn a_draft_over_an_open_menu_is_not_submitted() {
     };
     let clear = menu("/clear");
     let clear: Vec<&str> = clear.iter().map(String::as_str).collect();
+    // A slash draft is a command whatever its menu's Enter does with it (v6 §14.17.5.8): it
+    // stands as the person's hold, never diverted, asked about or sent.
     assert_eq!(
         composer_of(&over("/cl", &clear)),
-        Composer::Diverted(Diversion::Menu)
+        Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Diverted)
     );
     assert_eq!(
         composer_of(&screen(SLASH_MENU_POINTER_DOWN_MEASURED)),
-        Composer::Diverted(Diversion::Menu)
+        Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Diverted)
     );
     let standing = TurnEndReading {
         composer: Composer::Diverted(Diversion::Menu),
@@ -5310,15 +5372,15 @@ fn a_draft_over_an_open_menu_is_not_submitted() {
     assert!(Composer::Diverted(Diversion::Menu).drafted());
     assert_eq!(
         composer_of(&screen(CONTEXT_WALL_COMPACT_MENU_MEASURED)),
-        Composer::Typed
+        Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Runs)
     );
     assert_eq!(
         composer_of(&screen(SLASH_MENU_USAGE_MEASURED)),
-        Composer::Typed
+        Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Runs)
     );
     assert_eq!(
         composer_of(&over("/cl", &["  ⏵⏵ auto mode on (shift+tab to cycle)"])),
-        Composer::Typed
+        Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Runs)
     );
     let typed_reading = TurnEndReading {
         composer: Composer::Typed,
@@ -5362,10 +5424,11 @@ fn a_draft_over_a_menu_is_what_enter_did_with_it_measured() {
             AT_MENU_POINTED_2_1_302,
             Composer::Diverted(Diversion::Menu),
         ),
+        // A slash draft is a command, whatever its menu does (v6 §14.17.5.8).
         (
             "2.1.268 `/cl`",
             SLASH_MENU_2_1_268,
-            Composer::Diverted(Diversion::Menu),
+            Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Diverted),
         ),
         (
             "2.1.268 `and @RE`",
@@ -5502,30 +5565,32 @@ fn a_draft_over_a_selection_drawn_in_colour_only_is_what_enter_runs_measured() {
     };
     let config = screen(SLASH_MENU_CONFIG_2_1_268);
     let copy = screen(SLASH_MENU_COPY_2_1_268);
+    // Whichever entry its menu selects, a slash draft is a command (v6 §14.17.5.8): its Enter
+    // runs one, the draft's or the entry's.
     for (what, rows, measured, composer) in [
         (
             "`/config` selected",
             &config,
             SLASH_MENU_CONFIG_CELLS_2_1_268,
-            Composer::Typed,
+            Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Runs),
         ),
         (
             "`/update-config` selected",
             &config,
             SLASH_MENU_CONFIG_DOWN_CELLS_2_1_268,
-            Composer::Diverted(Diversion::Menu),
+            Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Diverted),
         ),
         (
             "`/copy` of two",
             &copy,
             SLASH_MENU_COPY_CELLS_2_1_268,
-            Composer::Diverted(Diversion::Menu),
+            Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Diverted),
         ),
         (
             "`/fork` of two",
             &copy,
             SLASH_MENU_COPY_DOWN_CELLS_2_1_268,
-            Composer::Diverted(Diversion::Menu),
+            Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Diverted),
         ),
     ] {
         let fg = fg_of(rows, measured);
@@ -5550,9 +5615,15 @@ fn a_draft_over_a_selection_drawn_in_colour_only_is_what_enter_runs_measured() {
         };
         assert_eq!(at(&mut st, &standing, t0()), act);
     }
-    assert_eq!(composer_of(&config, None), Composer::Unknown);
+    assert_eq!(
+        composer_of(&config, None),
+        Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Unread)
+    );
     let cl = screen(SLASH_MENU_2_1_268);
-    assert_eq!(composer_of(&cl, None), Composer::Diverted(Diversion::Menu));
+    assert_eq!(
+        composer_of(&cl, None),
+        Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Diverted)
+    );
     let usage = screen(SLASH_MENU_USAGE_MEASURED);
     let entries = aterm_phase::phase::completion_menu(&usage)
         .expect("the pointed menu")
@@ -5560,7 +5631,10 @@ fn a_draft_over_a_selection_drawn_in_colour_only_is_what_enter_runs_measured() {
         .len();
     let mut colours = vec![Some("999999".to_string()); entries];
     colours[entries - 1] = Some("b1b9f9".to_string());
-    assert_eq!(composer_of(&usage, Some(colours)), Composer::Typed);
+    assert_eq!(
+        composer_of(&usage, Some(colours)),
+        Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Runs)
+    );
 }
 
 #[test]
@@ -11502,6 +11576,262 @@ fn a_usage_wall_with_an_account_to_move_to_is_a_relaunch_under_it() {
     same(&codex, &cfg(), "a Codex");
 }
 
+fn managed() -> TurnEndState {
+    let mut st = TurnEndState::default();
+    st.set_managed(true);
+    st
+}
+
+/// A Land reading of a usage wall of `kind` whose reset is `reset` (`None`: none named).
+fn land_wall(t: Instant, kind: WallKind, reset: Option<Instant>) -> TurnEndReading {
+    TurnEndReading {
+        wall: Some(kind),
+        reset_at: reset,
+        ..land(session_wall(t))
+    }
+}
+
+/// A MANAGED WORKER'S USAGE WALL PAST THE HORIZON ENDS ITS WORK (owner, 2026-11-04: the claim
+/// workers sat a day and more at a weekly wall): under Land, a session a manager waits on whose
+/// session or weekly limit resets past [`MANAGED_WALL_HORIZON`], or names no reset (its first
+/// wait, the back-off's last rung, ends past the horizon), types nothing and concludes
+/// `failed why=usage-limit`, and rests there. A reset inside the horizon is waited out as for any
+/// tab. NEGATIVE CONTROL: a person's tab (no manager), and a managed worker under Cruise, which
+/// never rests, wait for the same wall as before, and nothing concludes them.
+#[test]
+fn a_managed_workers_usage_wall_past_the_horizon_concludes_its_work() {
+    let t = t0();
+    for kind in [WallKind::UsageSession, WallKind::UsageWeekly] {
+        for reset in [Some(t + 60 * MIN), Some(t + 30 * 60 * MIN), None] {
+            let r = land_wall(t, kind, reset);
+            let mut person = TurnEndState::default();
+            let today = at(&mut person, &r, t);
+            assert!(
+                matches!(today, TurnEndAction::WaitUntil { .. }),
+                "CONTROL {kind:?} {reset:?}: {today:?}"
+            );
+            person.conclude_at_wall(&r, &cfg(), &today);
+            person.conclude_at_wall(&r, &cfg(), &TurnEndAction::Nothing);
+            assert_eq!(person.gave_up(), None, "CONTROL a person's tab: {person:?}");
+            let cruising = under(Autopilot::Cruise, r.clone());
+            let mut st = managed();
+            assert!(
+                matches!(at(&mut st, &cruising, t), TurnEndAction::WaitUntil { .. }),
+                "CONTROL Cruise {kind:?} {reset:?}"
+            );
+            st.conclude_at_wall(&cruising, &cfg(), &TurnEndAction::Nothing);
+            assert_eq!(st.gave_up(), None, "CONTROL Cruise never rests: {st:?}");
+
+            let mut st = managed();
+            assert_eq!(
+                at(&mut st, &r, t),
+                TurnEndAction::Nothing,
+                "{kind:?} {reset:?}"
+            );
+            st.conclude_at_wall(&r, &cfg(), &TurnEndAction::Nothing);
+            assert_eq!(st.gave_up(), Some(GaveUp::UsageLimit), "{kind:?} {reset:?}");
+            assert!(st.task_done() && !st.landed(), "{st:?}");
+            assert_eq!(at(&mut st, &r, t + MIN), TurnEndAction::Nothing, "it rests");
+        }
+        let near = land_wall(t, kind, Some(t + 10 * MIN));
+        let today = at(&mut TurnEndState::default(), &near, t);
+        assert!(waits_until(&today, t + 10 * MIN + GRACE), "{today:?}");
+        let mut st = managed();
+        assert_eq!(at(&mut st, &near, t), today, "{kind:?}: inside the horizon");
+        st.conclude_at_wall(&near, &cfg(), &today);
+        assert_eq!(st.gave_up(), None, "{kind:?}: {st:?}");
+    }
+    assert_eq!(
+        GaveUp::of_word(crate::supervise::USAGE_LIMIT_WHY),
+        Some(GaveUp::UsageLimit)
+    );
+    let failed = format!(
+        "FAILED seq=9 rule={RULE_LAND} {} (autopilot land)",
+        GaveUp::UsageLimit.words()
+    );
+    assert_eq!(GaveUp::of_journal_line(&failed), Some(GaveUp::UsageLimit));
+}
+
+/// A MANAGED WORKER'S WALL STILL MOVES FIRST: where the roster advises another account (or the
+/// model's bucket has a fallback model), the move is made as for any tab, and only what it falls
+/// back on changes: a wait for a reset days off becomes one of [`MANAGED_WALL_HORIZON`], so a move
+/// that is not made has the point decided again within it, where the wall concludes the work. A
+/// move decided concludes nothing. NEGATIVE CONTROL: a person's tab falls back on the wait for the
+/// reset itself.
+#[test]
+fn a_managed_workers_wall_moves_first_and_falls_back_within_the_horizon() {
+    let t = t0();
+    let far = t + 30 * 60 * MIN;
+    let horizon = TurnEndAction::WaitUntil {
+        until: t + MANAGED_WALL_HORIZON,
+        why: MANAGED_WALL_AGAIN.to_string(),
+        wait: WaitKind::Other,
+    };
+    let r = advised(&land_wall(t, WallKind::UsageWeekly, Some(far)), "work-2");
+    let person = at(&mut TurnEndState::default(), &r, t);
+    assert!(
+        restarts(
+            &person,
+            &to_account("work-2", AccountAt::Wall),
+            RULE_ACCOUNT
+        ),
+        "CONTROL {person:?}"
+    );
+    assert!(
+        waits_until(otherwise_of(&person), far + GRACE),
+        "CONTROL {person:?}"
+    );
+    let mut st = managed();
+    let moved = at(&mut st, &r, t);
+    assert!(
+        restarts(&moved, &to_account("work-2", AccountAt::Wall), RULE_ACCOUNT),
+        "{moved:?}"
+    );
+    assert_eq!(otherwise_of(&moved), &horizon, "{moved:?}");
+    st.conclude_at_wall(&r, &cfg(), &moved);
+    assert_eq!(st.gave_up(), None, "a move concludes nothing: {st:?}");
+
+    let bucket = WallKind::ModelBucket { consent: false };
+    let r = land_wall(t, bucket, Some(far));
+    let mut st = managed();
+    let fell = at(&mut st, &r, t);
+    assert!(
+        matches!(&fell, TurnEndAction::Restart { why: Restart::Model { to }, .. } if to == "opus"),
+        "{fell:?}"
+    );
+    assert_eq!(otherwise_of(&fell), &horizon, "{fell:?}");
+    let alone = SupervisorConfig {
+        model_fallback: None,
+        ..cfg()
+    };
+    let mut st = managed();
+    assert_eq!(at_under(&mut st, &r, t, &alone), TurnEndAction::Nothing);
+    st.conclude_at_wall(&r, &alone, &TurnEndAction::Nothing);
+    assert_eq!(st.gave_up(), Some(GaveUp::UsageLimit), "{st:?}");
+}
+
+/// A MANAGED WORKER WAITS FOR ANOTHER ACCOUNT THAT FREES UP INSIDE THE HORIZON, whatever its own
+/// wall's reset: the roster's advice to wait for another account (its 5-hour window reopens in
+/// minutes) and the hour's move breaker (a move allowed again in minutes) each cut the wait for a
+/// weekly reset 30 h off short, and that wait stands for a managed worker as for any tab, so
+/// rotation still comes first and nothing concludes there. NEGATIVE CONTROL: the same wall with
+/// no advice, with advice to wait past the horizon, and with the breaker freeing past it,
+/// concludes the work.
+#[test]
+fn a_managed_worker_waits_for_another_account_inside_the_horizon() {
+    let t = t0();
+    let wall = land_wall(t, WallKind::UsageWeekly, Some(t + 30 * 60 * MIN));
+    for soon in [t + 5 * MIN, t + 8 * MIN, t + MANAGED_WALL_HORIZON] {
+        let r = advised_wait(&wall, soon);
+        let person = at(&mut TurnEndState::default(), &r, t);
+        assert!(
+            waits_until(&person, soon),
+            "CONTROL a person's tab: {person:?}"
+        );
+        let mut st = managed();
+        let a = at(&mut st, &r, t);
+        assert_eq!(a, person, "the same wait for a managed worker");
+        st.conclude_at_wall(&r, &cfg(), &a);
+        assert_eq!(st.gave_up(), None, "nothing concludes: {st:?}");
+    }
+    for r in [
+        wall.clone(),
+        advised_wait(&wall, t + MANAGED_WALL_HORIZON + MIN),
+    ] {
+        let mut st = managed();
+        let a = at(&mut st, &r, t);
+        assert_eq!(a, TurnEndAction::Nothing, "CONTROL {:?}", r.account);
+        st.conclude_at_wall(&r, &cfg(), &a);
+        assert_eq!(st.gave_up(), Some(GaveUp::UsageLimit), "CONTROL {st:?}");
+    }
+
+    let moved = advised(&wall, "work-2");
+    let window = TurnEndState::default().timing.window;
+    for (frees, concludes) in [(5 * MIN, false), (MANAGED_WALL_HORIZON + 5 * MIN, true)] {
+        let mut st = managed();
+        st.seed_account_moves(&[window - frees; ACCOUNT_MOVES_PER_WINDOW], t);
+        let a = at(&mut st, &moved, t);
+        st.conclude_at_wall(&moved, &cfg(), &a);
+        if concludes {
+            assert_eq!(a, TurnEndAction::Nothing, "CONTROL {a:?}");
+            assert_eq!(st.gave_up(), Some(GaveUp::UsageLimit), "CONTROL {st:?}");
+        } else {
+            assert!(waits_until(&a, t + frees), "the breaker's wait: {a:?}");
+            assert_eq!(st.gave_up(), None, "{st:?}");
+        }
+    }
+}
+
+/// THE MANAGED WALL IS THE WORKER'S OWN: a wall a moved login left behind, a resume owed past an
+/// account move, `resume_limits` off with the limit episode's word, a `/login` dialog over it, and
+/// Off each leave the managed rule out. NEGATIVE CONTROL: the same managed worker at the same wall
+/// with none of these concludes.
+#[test]
+fn a_managed_wall_is_concluded_only_at_the_workers_own_standing_wall() {
+    let t = t0();
+    let r = land_wall(t, WallKind::UsageWeekly, Some(t + 30 * 60 * MIN));
+    let mut st = managed();
+    st.observe(&r, t);
+    assert!(managed_wall_ends(&st, &r, &cfg()), "CONTROL {st:?}");
+    let off = under(Autopilot::Off, r.clone());
+    assert!(!managed_wall_ends(&st, &off, &cfg()), "Off");
+    let dialog = TurnEndReading {
+        login_screen: Some(aterm_phase::LoginScreen::Browser),
+        ..r.clone()
+    };
+    assert!(!managed_wall_ends(&st, &dialog, &cfg()), "a /login dialog");
+    let taskless = TurnEndReading {
+        taskless: true,
+        ..r.clone()
+    };
+    assert!(!managed_wall_ends(&st, &taskless, &cfg()), "no task");
+    let busy = TurnEndReading {
+        phase: Phase::Busy,
+        ..r.clone()
+    };
+    assert!(!managed_wall_ends(&st, &busy, &cfg()), "no point");
+    let mut moved = st.clone();
+    moved.account_resume = true;
+    assert!(!managed_wall_ends(&moved, &r, &cfg()), "a resume owed");
+    let unresumed = SupervisorConfig {
+        resume_limits: false,
+        ..cfg()
+    };
+    assert!(
+        managed_wall_ends(&moved, &r, &unresumed),
+        "no resume is owed where none is typed"
+    );
+    let mut concluded = st.clone();
+    concluded.conclude_at_wall(&r, &cfg(), &TurnEndAction::Nothing);
+    assert!(
+        concluded.task_done() && !managed_wall_ends(&concluded, &r, &cfg()),
+        "once"
+    );
+}
+
+/// A USAGE-LIMIT CONCLUSION THE LOOP BEFORE THIS ONE MADE STANDS AT ITS WALL (a harness restart):
+/// the record's `failed why=usage-limit` is seeded at the first point though the usage wall still
+/// shows, since that wall is where it was concluded. NEGATIVE CONTROL: a `Could not finish:`
+/// conclusion is opened again at a wall, as before.
+#[test]
+fn a_usage_limit_conclusion_is_seeded_at_its_own_wall() {
+    let t = t0();
+    let r = TurnEndReading {
+        worked: None,
+        ..land_wall(t, WallKind::UsageWeekly, Some(t + 30 * 60 * MIN))
+    };
+    let mut st = managed();
+    st.observe(&r, t);
+    assert!(st.seed_gave_up(GaveUp::UsageLimit), "{st:?}");
+    assert_eq!(st.gave_up(), Some(GaveUp::UsageLimit));
+    let mut st = managed();
+    st.observe(&r, t);
+    assert!(
+        !st.seed_gave_up(GaveUp::CouldNotFinish),
+        "CONTROL a wall opens it again: {st:?}"
+    );
+}
+
 #[test]
 fn a_wall_past_its_reset_is_probed_before_the_account_is_moved() {
     let t = t0();
@@ -15798,6 +16128,29 @@ fn a_done_report_under_land_gets_the_instruction_not_the_check() {
     }
 }
 
+/// LAND'S DIALOG TEXT IS NO LAND ACT: `answer-land@v1` is no land rule and no turn-end act, and
+/// the text it writes (`question::LAND_TEXT`, which opens `Decide yourself:`) reads as no land
+/// act to any reader of a typed Land act (the loop's `is_land_words`, the ledger's
+/// `approvals::delivers_land`, the upgrade's record and the stats' journal reader), so no yield
+/// after a dialog's key is judged a landing; Land's priority's prose rule is no land rule either.
+/// NEGATIVE CONTROL: Land's prose answer reads as a land act to every one of them. MUTANT: a Land
+/// text that opens with `LAND_ANSWER`'s words.
+#[test]
+fn the_land_dialog_text_is_no_land_act() {
+    use super::super::question::LAND_TEXT;
+    use crate::harness::{stats::opens_with_land_words, upgrade::is_land_act};
+    use crate::supervise::approvals::delivers_land;
+    let land = QuestionPriority::Land;
+    assert!(!is_land_rule(land.rule_id()) && !is_continue_rule(land.rule_id()));
+    assert!(!is_land_rule(land.prose_rule_id()));
+    assert!(!is_land_words(LAND_TEXT), "{LAND_TEXT}");
+    assert!(!is_land_act(LAND_TEXT), "{LAND_TEXT}");
+    assert!(!delivers_land(Some(LAND_TEXT)), "{LAND_TEXT}");
+    assert!(!opens_with_land_words(LAND_TEXT), "{LAND_TEXT}");
+    assert!(is_land_words(LAND_ANSWER) && is_land_act(LAND_ANSWER));
+    assert!(delivers_land(Some(LAND_ANSWER)));
+}
+
 #[test]
 fn a_question_under_land_gets_the_land_answer() {
     let now = t0();
@@ -15962,6 +16315,87 @@ fn leaving_land_for_an_off_park_types_the_instruction_again() {
         TurnEndAction::Nothing
     );
     assert!(st.task_done() && st.landed());
+}
+
+/// A MANAGED WORKER'S OPENING EXCHANGE IS ITS TASK'S UNDER LAND, NEVER A PERSON'S (2026-11-04):
+/// a person's gesture inside its first short turn (a box they answered, a click: `person`, no
+/// key) leaves nothing to them. Its `Nothing left: CLAIMED:` defense gets Land's instruction,
+/// and the same defense after it Land's check, whose `LANDED` lands it (the person's gesture
+/// waited out first, as for every session); its first-line `Could not finish: NOT CLAIMED:`
+/// concludes the work as failed at that point. A record of the opening exchange left by a loop
+/// before (an older build's) is not taken up either. NEGATIVE CONTROL: the same readings on a
+/// session no manager waits on are the person's own exchange, left to them, and Off leaves a
+/// managed worker's too.
+#[test]
+fn a_managed_workers_opening_exchange_is_never_a_persons_under_land() {
+    let now = t0();
+    let quick = Some(Duration::from_secs(40));
+    let touched = |said: &str| TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        ..land(idle(said, quick))
+    };
+    let managed = || {
+        let mut st = TurnEndState::default();
+        st.set_managed(true);
+        st
+    };
+    let claimed = "Nothing left: CLAIMED: the $250 cloud session credit for this account.";
+    let not_claimed = "Could not finish: NOT CLAIMED: the page asks for payment details.";
+    for said in [claimed, not_claimed] {
+        let mut st = TurnEndState::default();
+        assert_eq!(
+            at(&mut st, &touched(said), now),
+            TurnEndAction::Nothing,
+            "CONTROL {said}"
+        );
+        assert!(
+            st.left_to_person() && st.gave_up().is_none(),
+            "CONTROL {said}: {st:?}"
+        );
+        let mut st = managed();
+        at(&mut st, &under(Autopilot::Off, touched(said)), now);
+        assert!(st.left_to_person(), "CONTROL Off {said}: {st:?}");
+    }
+    let mut st = managed();
+    let mut r = touched(claimed);
+    let mut a = at(&mut st, &r, now);
+    assert!(!st.left_to_person(), "{st:?}");
+    let mut then = now;
+    if let TurnEndAction::WaitUntil { until, .. } = a {
+        // The person's gesture is waited out (`human_grace_s`), as for every session.
+        then = until;
+        r = TurnEndReading {
+            worked: None,
+            person: Some(Duration::from_secs(8) + (until - now)),
+            ..touched(claimed)
+        };
+        a = at(&mut st, &r, then);
+    }
+    assert_eq!(a, land_instruction(), "Land's own act: {st:?}");
+    st.acted(&a, &r, then);
+    assert!(!st.left_to_person(), "{st:?}");
+    lands_on_check(&mut st, &land(idle(claimed, quick)), then + MIN);
+    assert!(!st.left_to_person() && st.gave_up().is_none(), "{st:?}");
+
+    let mut st = managed();
+    assert_eq!(
+        at(&mut st, &touched(not_claimed), now),
+        TurnEndAction::Nothing
+    );
+    assert_eq!(st.gave_up(), Some(GaveUp::CouldNotFinish), "{st:?}");
+    assert!(st.task_done() && !st.landed() && !st.left_to_person());
+
+    let recorded = |said: &str| TurnEndReading {
+        left_record: true,
+        ..touched(said)
+    };
+    let mut st = TurnEndState::default();
+    at(&mut st, &recorded(claimed), now);
+    assert!(st.left_to_person(), "CONTROL the record: {st:?}");
+    let mut st = managed();
+    let a = at(&mut st, &recorded(claimed), now);
+    assert!(!st.left_to_person(), "{a:?}: {st:?}");
+    assert_ne!(a, TurnEndAction::Nothing, "Land acts: {st:?}");
 }
 
 #[test]
@@ -17530,6 +17964,10 @@ fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
         composer: Composer::Diverted(Diversion::Menu),
         ..gone.clone()
     };
+    let command = TurnEndReading {
+        composer: Composer::Command(aterm_phase::DraftCommand::Slash, CommandEnter::Runs),
+        ..gone.clone()
+    };
     let [relaunch_off, resume_off, cannot_restart, not_made] = MOVE_HELD_WHYS;
     // The restart not made is the one hold a state carries: a move this host could not make.
     let start = |held: Option<&str>| {
@@ -17547,6 +17985,7 @@ fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
         (&drafted, &cfg(), None),
         (&own, &cfg(), None),
         (&diverted, &cfg(), None),
+        (&command, &cfg(), None),
     ];
     let waits_on = |a: &TurnEndAction, held: Option<&str>| {
         matches!(a, TurnEndAction::WaitUntil { why, .. }
@@ -17555,7 +17994,10 @@ fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
     for (shown, under, held) in cases {
         let plain = at_under(&mut start(held), shown, t + MIN, under);
         let typed_login = matches!(&plain, TurnEndAction::TypeCommand { command, .. } if command == "/login")
-            || is_escalate(&plain, "sign in with /login");
+            || is_escalate(
+                &plain,
+                shown.composer.asks().unwrap_or("sign in with /login"),
+            );
         assert!(typed_login, "the control, on no roster row: {plain:?}");
         let ended = renewable(shown, "m7-a");
         let mut st = start(held);
@@ -17609,13 +18051,20 @@ fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
         assert!(is_escalate(&a, reason), "{:?}: {a:?}", shown.composer);
         assert_eq!(
             e.action.to_lowercase().contains("send"),
-            shown.composer != Composer::Own,
+            !matches!(shown.composer, Composer::Own | Composer::Command(..)),
             "{:?}: {e:?}",
             shown.composer
         );
         assert_eq!(
             e.action.contains("menu"),
             shown.composer == Composer::Diverted(Diversion::Menu),
+            "{:?}: {e:?}",
+            shown.composer
+        );
+        // A person's command is theirs to send or clear (v6 §14.17.5.8): never "send the draft".
+        assert_eq!(
+            e.action.contains(super::super::notice::COMMAND_TODO),
+            matches!(shown.composer, Composer::Command(..)),
             "{:?}: {e:?}",
             shown.composer
         );
@@ -18886,6 +19335,11 @@ mod contradicted {
 mod witness_clears {
     use super::*;
     include!("turn_end_witness_tests.rs");
+}
+
+mod left_leg {
+    use super::*;
+    include!("turn_end_left_tests.rs");
 }
 
 #[test]

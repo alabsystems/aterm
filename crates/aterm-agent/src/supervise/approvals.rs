@@ -1029,9 +1029,11 @@ impl Ledger {
         count: Option<&SleepStamp>,
         warn: &mut dyn Write,
     ) -> Option<String> {
-        self.write_counted_with_boot_text(t_ms, row, count, None, warn)
+        self.write_counted_with_boot_text(t_ms, row, count, None, None, warn)
     }
 
+    /// [`Self::write_counted_with_boot_text`] under a wall's or a point's scope (`conversation`,
+    /// `program`, [`Row::to_json_scoped_by`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_scoped_counted(
         &mut self,
@@ -1041,18 +1043,22 @@ impl Ledger {
         captured_boot: Option<&str>,
         conversation: &Conversation,
         program: Option<aterm_phase::Program>,
+        human: Option<u64>,
         warn: &mut dyn Write,
     ) -> Option<String> {
         if !self.journal.is_on() {
             return None;
         }
-        let line = row.to_json_scoped_by(
-            t_ms,
-            self.sid.as_deref(),
-            count,
-            captured_boot,
-            conversation,
-            program,
+        let line = with_human(
+            row.to_json_scoped_by(
+                t_ms,
+                self.sid.as_deref(),
+                count,
+                captured_boot,
+                conversation,
+                program,
+            ),
+            human,
         );
         self.journal.append_raw(&line, warn);
         Some(line)
@@ -1088,19 +1094,25 @@ impl Ledger {
         self.journal.append_raw(&line, warn).then_some(line)
     }
 
+    /// Append `row` stamped `t_ms`, with the Mac's sleep `count` (its boot spelled as
+    /// `captured_boot` where that names the same boot) and, for the accounts probe's write, the
+    /// person's key count `human` it was fenced on ([`PROBE_HUMAN`]).
     pub(crate) fn write_counted_with_boot_text(
         &mut self,
         t_ms: i64,
         row: &Row<'_>,
         count: Option<&SleepStamp>,
         captured_boot: Option<&str>,
+        human: Option<u64>,
         warn: &mut dyn Write,
     ) -> Option<String> {
         if !self.journal.is_on() {
             return None;
         }
-        let line =
-            row.to_json_counted_with_boot_text(t_ms, self.sid.as_deref(), count, captured_boot);
+        let line = with_human(
+            row.to_json_counted_with_boot_text(t_ms, self.sid.as_deref(), count, captured_boot),
+            human,
+        );
         self.journal.append_raw(&line, warn);
         Some(line)
     }
@@ -1465,6 +1477,65 @@ pub const PROBE_TYPED_REASON: &str = "the accounts probe";
 
 pub const PROBE_CLOSED_REASON: &str = "closed";
 
+/// The field of the accounts probe's `typed` row holding the person's key count its write was
+/// fenced on (`if-human=`): what proves, after a restart, that a `/usage` standing is still the
+/// line that write left, with no person's key since ([`ProbeWrote`], v6 §14.17.5.8).
+pub const PROBE_HUMAN: &str = "human";
+
+/// `line` (one JSON object) with [`PROBE_HUMAN`] added where `human` is some.
+fn with_human(mut line: String, human: Option<u64>) -> String {
+    if let Some(n) = human {
+        line.pop();
+        line.push_str(&format!(",\"{PROBE_HUMAN}\":{n}}}"));
+    }
+    line
+}
+
+/// THE ACCOUNTS PROBE'S WRITE A RESTART FINDS OWED ([`probe_wrote`]): its row's screen sequence
+/// (`box_seq`), the window's gesture count it was fenced on ([`PROBE_HUMAN`]; `None` in a row a
+/// build before the field wrote, which proves nothing) and its stamp (`ts`, the ledger's clock),
+/// since which a person's typing the window stamps makes a `/usage` standing theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeWrote {
+    /// The sequence of the screen the write was judged on.
+    pub seq: u64,
+    /// The window's gesture count the write was fenced on.
+    pub human: Option<u64>,
+    /// When the row was booked, just past the write, in Unix milliseconds.
+    pub ts: Option<i64>,
+}
+
+/// The accounts probe's last write for `sid` in the ledger text `body`, where its last row is
+/// that write's `typed` one (no `closed` row after it): the probe a restart owes.
+#[must_use]
+pub fn probe_wrote(body: &str, sid: Option<&str>) -> Option<ProbeWrote> {
+    let sid = sid.map_or_else(
+        || "null".to_string(),
+        |s| json_str(s.trim_start_matches('@')),
+    );
+    let want_sid = format!(",\"sid\":{sid},");
+    let probe_rule = probe_rule_field();
+    let line = body
+        .lines()
+        .rev()
+        .find(|l| l.contains(&want_sid) && l.contains(&probe_rule))
+        .filter(|l| l.contains(",\"decision\":\"typed\","))?;
+    let v = aterm_json::from_str::<aterm_json::Value>(line).ok();
+    let field = |key: &str| {
+        v.as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(aterm_json::Value::as_u64)
+    };
+    Some(ProbeWrote {
+        seq: field("box_seq").unwrap_or(0),
+        human: field(PROBE_HUMAN),
+        ts: v
+            .as_ref()
+            .and_then(|v| v.get("ts"))
+            .and_then(aterm_json::Value::as_i64),
+    })
+}
+
 fn probe_rule_field() -> String {
     format!(
         ",\"rule_id\":{},",
@@ -1472,18 +1543,10 @@ fn probe_rule_field() -> String {
     )
 }
 
+/// Whether the accounts probe's last write for `sid` is owed its close ([`probe_wrote`]).
 #[must_use]
 pub fn probe_owed(body: &str, sid: Option<&str>) -> bool {
-    let sid = sid.map_or_else(
-        || "null".to_string(),
-        |s| json_str(s.trim_start_matches('@')),
-    );
-    let want_sid = format!(",\"sid\":{sid},");
-    let probe_rule = probe_rule_field();
-    body.lines()
-        .rev()
-        .find(|l| l.contains(&want_sid) && l.contains(&probe_rule))
-        .is_some_and(|l| l.contains(",\"decision\":\"typed\","))
+    probe_wrote(body, sid).is_some()
 }
 
 pub const RESET_YES_2_1_287: &str = "Yes, use my reset";
@@ -2648,6 +2711,9 @@ impl Carried {
             land: LandBooks {
                 audited: [None; 3],
                 sent: None,
+                kept: [None; super::policy::turn_end::KEPT_TOKENS],
+                kept_over: false,
+                left_holds: 0,
             },
             pass: WallPass {
                 spent: false,
@@ -2709,9 +2775,16 @@ const AUDITED: &str = "audited ";
 
 const SENT: &str = "sent ";
 
+const KEPT: &str = "kept ";
+
+const KEPT_OVER: &str = "kept past its books";
+
+const LEFT_HOLDS: &str = "left holds ";
+
 /// The ledger's note of the land check's books ([`Carried::land`]): the defenses it audited, then
-/// the one its last check audits once answered, each a reply mark; none while both are empty, so
-/// a ledger with no land check reads as before.
+/// the one its last check audits once answered, each a reply mark, then the tokens the episode's
+/// defenses kept running, whether they kept more than the books hold, and the yields its left leg
+/// held; none while all are empty, so a ledger with no land check reads as before.
 fn land_books_note(books: LandBooks) -> String {
     let audited: Vec<String> = books
         .audited
@@ -2725,6 +2798,16 @@ fn land_books_note(books: LandBooks) -> String {
     }
     if let Some(sent) = books.sent {
         parts.push(format!("{SENT}{sent:016x}"));
+    }
+    let kept: Vec<String> = books.kept.iter().flatten().map(|t| t.token()).collect();
+    if !kept.is_empty() {
+        parts.push(format!("{KEPT}{}", kept.join(" ")));
+    }
+    if books.kept_over {
+        parts.push(KEPT_OVER.to_owned());
+    }
+    if books.left_holds > 0 {
+        parts.push(format!("{LEFT_HOLDS}{}", books.left_holds));
     }
     if parts.is_empty() {
         return String::new();
@@ -2752,6 +2835,22 @@ fn land_books_of(reason: &str) -> Option<LandBooks> {
             for (slot, m) in books.audited[from..].iter_mut().zip(marks) {
                 *slot = Some(m);
             }
+        } else if part == KEPT_OVER {
+            books.kept_over = true;
+        } else if let Some(tokens) = part.strip_prefix(KEPT) {
+            let tokens: Vec<aterm_uds::process::Identity> = tokens
+                .split(' ')
+                .map(crate::harness::leftover::token_of)
+                .collect::<Option<_>>()?;
+            if tokens.len() > books.kept.len() {
+                return None;
+            }
+            let from = books.kept.len() - tokens.len();
+            for (slot, t) in books.kept[from..].iter_mut().zip(tokens) {
+                *slot = Some(t);
+            }
+        } else if let Some(n) = part.strip_prefix(LEFT_HOLDS) {
+            books.left_holds = crate::parse_uint(n)?;
         } else {
             books.sent = Some(mark(part.strip_prefix(SENT)?)?);
         }
@@ -2838,6 +2937,11 @@ pub struct RetryMark {
     /// The wall was read while the host measured the route down (` down=yes`; a row without the
     /// field, as older books write, reads false).
     pub down: bool,
+    /// The outage's resume on a witness met the wall again (` witnessed=yes`,
+    /// `WallTrack::witnessed`; a row without the field, as older books write, reads false): a loop
+    /// that follows leaves the ladder to try it, as this one did, until the agent works again (the
+    /// post-landing review, 2026-11-02).
+    pub witnessed: bool,
 }
 
 const RETRY_LADDER: &str = "the wall's retries";
@@ -2875,11 +2979,12 @@ fn retry_mark(retry: Option<RetryMark>) -> String {
         _ => return String::new(),
     };
     format!(
-        " ({RETRY_LADDER}: {kind} attempts={} ups={} since={}{})",
+        " ({RETRY_LADDER}: {kind} attempts={} ups={} since={}{}{})",
         r.attempts,
         r.ups,
         r.since_ms,
-        if r.down { " down=yes" } else { "" }
+        if r.down { " down=yes" } else { "" },
+        if r.witnessed { " witnessed=yes" } else { "" }
     )
 }
 
@@ -2920,6 +3025,11 @@ fn retry_mark_of(reason: &str) -> Option<RetryMark> {
         ups: crate::parse_uint(field("ups")?)?,
         since_ms: crate::parse_int(field("since")?)?,
         down: match field("down") {
+            None => false,
+            Some("yes") => true,
+            Some(_) => return None,
+        },
+        witnessed: match field("witnessed") {
             None => false,
             Some("yes") => true,
             Some(_) => return None,
@@ -2995,53 +3105,6 @@ pub struct OpenSwitch {
 
 pub const FALLBACK_ASKED: &str =
     "a turn was asked on the fallback: the bucket it left is a wall again";
-
-#[must_use]
-pub fn relaunch_waits_reason(made_unix: i64) -> String {
-    format!("{RELAUNCH_WAITS} (made={made_unix})")
-}
-
-const RELAUNCH_WAITS: &str = "the fallback's relaunch was asked and waits for the host";
-
-#[must_use]
-pub fn relaunch_waiting_in(body: &str, sid: Option<&str>) -> Option<i64> {
-    use super::policy::turn_end::RULE_MODEL_FALLBACK;
-    let want = sid.map(|s| s.trim_start_matches('@').to_string());
-    let mut made = None;
-    for line in act_lines(body) {
-        let typed = line.contains(",\"decision\":\"typed\",");
-        if !typed && !line.contains(RELAUNCH_WAITS) {
-            continue;
-        }
-        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
-            continue;
-        };
-        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
-        if text("sid").map(str::to_string) != want {
-            continue;
-        }
-        if typed {
-            made = None;
-        } else if text("decision") == Some("waiting")
-            && text("rule_id") == Some(RULE_MODEL_FALLBACK)
-        {
-            made = text("reason")
-                .and_then(|r| r.strip_prefix(RELAUNCH_WAITS))
-                .and_then(|r| r.strip_prefix(" (made="))
-                .and_then(|r| r.strip_suffix(')'))
-                .and_then(crate::parse_int);
-        }
-    }
-    made
-}
-
-#[must_use]
-pub fn relaunch_waiting(path: &Path, sid: Option<&str>) -> Option<i64> {
-    relaunch_waiting_in(
-        &crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024).ok()??,
-        sid,
-    )
-}
 
 #[must_use]
 pub fn open_model_switch_in(body: &str, sid: Option<&str>) -> Option<OpenSwitch> {
@@ -3901,9 +3964,15 @@ mod tests {
             walled: false,
             tries: 0,
         };
+        let mut kept_tokens = [None; crate::supervise::policy::turn_end::KEPT_TOKENS];
+        kept_tokens[crate::supervise::policy::turn_end::KEPT_TOKENS - 1] =
+            crate::harness::leftover::token_of("2606@1792098840004410:3");
         let land = LandBooks {
             audited: [None, Some(0x0a), Some(0x0123_4567_89ab_cdef)],
             sent: Some(0xfeed),
+            kept: kept_tokens,
+            kept_over: true,
+            left_holds: 2,
         };
         let at = Carried {
             said: Replies::of(&[kept]),
@@ -5469,6 +5538,7 @@ mod tests {
                 ups: n / 2,
                 since_ms: 1_789_682_580_000 + i64::try_from(n).expect("small"),
                 down: n % 2 == 1,
+                witnessed: n % 3 == 0,
             };
             let carried = Carried {
                 short: 2,
@@ -5520,6 +5590,7 @@ mod tests {
                     ups: 0,
                     since_ms: 7,
                     down: false,
+                    witnessed: false,
                 }),
                 said: Replies::default(),
                 said_reset_ms: None,
@@ -5552,6 +5623,7 @@ mod tests {
                         ups: 0,
                         since_ms: 7,
                         down,
+                        witnessed: false,
                     }),
                     ..Carried::streak(0)
                 },
@@ -5877,6 +5949,7 @@ mod tests {
             ups: 0,
             since_ms: 310_000,
             down: false,
+            witnessed: false,
         };
         let point = |ts: i64, retry: Option<RetryMark>| {
             (
@@ -5977,6 +6050,7 @@ mod tests {
             ups: 0,
             since_ms: 20_000,
             down: false,
+            witnessed: false,
         };
         let point = |ts: i64, retry: Option<RetryMark>| {
             (
@@ -6174,6 +6248,7 @@ mod tests {
             ups: 0,
             since_ms: 20_000,
             down: false,
+            witnessed: false,
         };
         let point = |ts: i64, retry: Option<RetryMark>| -> R {
             (

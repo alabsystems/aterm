@@ -950,13 +950,23 @@ pub fn run(
         grant: None,
         token: None,
     };
+    let now = host.now().max(env.now);
+    let Ok(begun) = super::begin_sign_in(
+        super::person_sign_in(Cli::Claude, label),
+        (Cli::Claude, label),
+        (&store, lock),
+        now,
+        ("shared-renew", err),
+    ) else {
+        return ExitCode::from(1);
+    };
     let result = renew_one_guarded(
-        env, host, &store, &lock, policy, own_dir, &browser, out, err, &mut guard,
+        env, host, &store, &begun, policy, own_dir, &browser, out, err, &mut guard,
     );
     if result == Renewal::Renewed {
         ExitCode::SUCCESS
     } else {
-        guard.failed(&store, policy, &lock, host.now().max(env.now), err);
+        guard.failed(&store, policy, begun.lock(), now, err);
         ExitCode::from(1)
     }
 }
@@ -972,7 +982,7 @@ pub(in crate::harness) fn background(
     env: &Env,
     host: &dyn AccountsHost,
     store: &accounts::Store,
-    signin: &accounts::Lock,
+    signin: &super::Begun,
     policy: accounts::RenewalPolicy<'_>,
     browser: &RenewBrowser,
     authority: &dyn Authority,
@@ -1012,7 +1022,7 @@ pub(in crate::harness) fn background(
         guard.failed(
             store,
             policy,
-            signin,
+            signin.lock(),
             host.now().max(env.now),
             &mut io::sink(),
         );

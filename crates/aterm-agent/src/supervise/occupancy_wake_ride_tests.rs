@@ -662,5 +662,38 @@ fn a_tape_without_slice_twos_doors_carries_no_wake_on_a_points_act() {
     assert_eq!(run(true), (Some(1), 1), "CONTROL: slice 2's doors in");
 }
 
+/// THE OVERLAP WAITS BEHIND A DECLARED WAKE, AS THE KINDS RANK: a point whose act a due wake rides
+/// carries the wake alone, and the overlap is not asked there; the next point, the wake told,
+/// carries the overlap. NEGATIVE CONTROL: an overlap asked where a wake rides takes the act's one
+/// fact slot first.
+#[test]
+fn the_overlap_waits_behind_a_declared_wake() {
+    let host = wake_host(&[job_wake(1, WakeState::Ready)]);
+    *host.overlap.lock().expect("overlap") = Some((1, vec![PEER.to_string()]));
+    let ran = ride_run(
+        "ride-then-overlap",
+        Occupancy::Prompt,
+        host,
+        &[(0, Step::End), (1, Step::End)],
+        &[],
+    );
+    assert!(
+        rode(&ran.sent[0], 1),
+        "CONTROL: the wake first, alone: {:#?}",
+        ran.sent
+    );
+    let overlap = format!(" (aterm: {})", overlap_told());
+    assert!(
+        ran.sent[1].len() == 1 && ran.sent[1][0].ends_with(&overlap),
+        "the wake told, the overlap next: {:#?}",
+        ran.sent
+    );
+    assert_eq!(
+        overlap_asks(&ran.ran.calls),
+        1,
+        "asked only where no wake rides"
+    );
+}
+
 #[path = "occupancy_left_ride_tests.rs"]
 mod left;

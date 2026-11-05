@@ -1,6 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //! Native Trust driver for the independent pinned Windows reference workspaces.
+//!
+//! STOCK EXCEPTION: `oracle` and `oracle-052` resolve a stock rustup toolchain's Cargo and
+//! rustc (`--stock`, `stable` by default; [`tools`]), because Trust ships no Windows std. They
+//! only compile and read import tables: no Windows program runs.
 mod emit;
 mod facade052;
 mod model;
@@ -58,20 +62,7 @@ fn read(path: &Path) -> Result<String> {
     use std::io::Read as _;
     const MAX_ORACLE_FILE_BYTES: u64 = 256 << 20;
     let go = || -> std::io::Result<String> {
-        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "not a regular file",
-            ));
-        }
-        let file = std::fs::File::open(path)?;
-        let meta = file.metadata()?;
-        if !meta.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "not a regular file",
-            ));
-        }
+        let (file, meta) = aterm_uds::regular_file::open(path)?;
         if meta.len() > MAX_ORACLE_FILE_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -91,6 +82,15 @@ fn read(path: &Path) -> Result<String> {
         String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     };
     go().map_err(|e| format!("{}: {e}", path.display()))
+}
+pub(crate) fn write_fresh(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let _ = std::fs::remove_file(path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(bytes.as_ref())
 }
 fn which(name: &str) -> Result<PathBuf> {
     if Path::new(name).is_absolute() {
@@ -146,10 +146,15 @@ fn upstream() -> Result<PathBuf> {
     for e in
         std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}; use --upstream", dir.display()))?
     {
-        let path = e
-            .map_err(|e| e.to_string())?
-            .path()
-            .join(format!("windows-sys-{VERSION}"));
+        let e = e.map_err(|e| e.to_string())?;
+        if !e
+            .file_type()
+            .map(|ft| ft.is_dir() || ft.is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let path = e.path().join(format!("windows-sys-{VERSION}"));
         if path.join("Cargo.toml").is_file() {
             hits.push(path)
         }
@@ -272,6 +277,12 @@ fn toolchain_llvm_nm(rustc: &Path) -> Option<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(rustlib)
         .ok()?
         .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|ft| ft.is_dir() || ft.is_symlink())
+                .unwrap_or(true)
+        })
         .map(|entry| entry.path().join("bin").join(name))
         .filter(|candidate| candidate.is_file())
         .collect();
@@ -291,10 +302,10 @@ fn formatted(
         std::fs::create_dir_all(p.parent().ok_or("output has no parent")?)
             .map_err(|e| e.to_string())?;
         if p.extension().is_some_and(|e| e == "rs") {
-            std::fs::write(&p, with_seal_line(rel, text)?).map_err(|e| e.to_string())?;
+            write_fresh(&p, with_seal_line(rel, text)?).map_err(|e| e.to_string())?;
             paths.push(p)
         } else {
-            std::fs::write(&p, text).map_err(|e| e.to_string())?;
+            write_fresh(&p, text).map_err(|e| e.to_string())?;
         }
     }
     if format && !paths.is_empty() {
@@ -317,7 +328,7 @@ fn formatted(
     for p in &paths {
         let sealed =
             aterm_census::seal::stamp(&read(p)?).map_err(|e| format!("{}: {e}", p.display()))?;
-        std::fs::write(p, sealed).map_err(|e| e.to_string())?;
+        write_fresh(p, sealed).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -471,7 +482,7 @@ fn record(root: &Path, model: &model::Model, tools: &Tools, target: &Path) -> Re
     let data = aterm_json::json!({"windows-sys":VERSION,"host":host,"items":parse_record(&String::from_utf8(answer.stdout).map_err(|e|e.to_string())?)?});
     emit::recorded_tests(&model.up, &model.variants(), &data)?;
     let text = pretty_json(&data)?;
-    std::fs::write(root.join("win32-oracle/recorded.json"), text + "\n")
+    write_fresh(&root.join("win32-oracle/recorded.json"), text + "\n")
         .map_err(|e| e.to_string())?;
     generate(root, model, tools, root, true)
 }

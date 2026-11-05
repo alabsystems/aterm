@@ -10,9 +10,16 @@ use crate::{
     alab::registry::{ADDRESS, COLLECTIONS, MACHINE_FACTS, PROVIDER, REGISTRY},
     catalog::release::Kept,
     table::tests::{Lab, repair_commons, repair_commons_among_first, repair_commons_first},
-    typed::{cell::Field, owned},
+    typed::{
+        cell::Field,
+        owned,
+        secret::{Fixed, Secret},
+    },
 };
 use aterm_secrets::commons::roster::Role;
+
+/// The old generation's sealer and the new one's: one key, two table names.
+const RESEAL: (&dyn Sealer, &dyn Sealer) = (&Fixed("alab/registry"), &Fixed("alab/registry.2"));
 
 fn op(n: u8) -> Digest {
     [n; 32]
@@ -24,6 +31,138 @@ fn plain(x: &str) -> Value {
 
 fn key() -> (String, String) {
     ("provider".to_owned(), "anthropic.site".to_owned())
+}
+
+/// A `Secret` register crosses a roll resealed: the new generation's token opens there to the
+/// same value under the new table's name, it is not the old token, and the old sealer cannot
+/// open it; a re-run once it is carried writes nothing, and an empty candidate stays empty.
+/// NEGATIVE CONTROL: with `restate` skipping `reseal_value`, the carried token is the old one
+/// and does not open under the new table: `` assertion failed: …open… ``.
+#[test]
+fn a_secret_register_is_resealed_across_a_roll() {
+    let (old, new) = RESEAL;
+    let pk = keys::address_pk("ann@example.test").unwrap();
+    let key = (ADDRESS.name.to_owned(), format!("{pk}.password"));
+    let value = Secret::new("synthetic-pass-1".to_owned());
+    let token = old.seal(ADDRESS.name, &pk, "password", &value).unwrap();
+    let stored = CellValue::owner(2, json!(token)).encode();
+    let source = Cells::from([(key.clone(), register(&[(op(1), stored)]))]);
+    let held = BTreeSet::from([op(1)]);
+    let rows = restate(
+        &REGISTRY,
+        &source,
+        &held,
+        &Cells::new(),
+        &BTreeSet::new(),
+        RESEAL,
+    )
+    .unwrap();
+    let change = rows
+        .iter()
+        .flatten()
+        .find(|c| (c.collection.clone(), c.key.clone()) == key)
+        .unwrap();
+    let carried = cell::carried(change.value.as_ref().unwrap()).unwrap();
+    let [(origin, resealed)] = carried.as_slice() else {
+        panic!("one candidate is carried");
+    };
+    assert_eq!(*origin, op(1));
+    let moved = resealed["x"].as_str().unwrap();
+    assert_ne!(moved, token);
+    assert!(new.holds(ADDRESS.name, &pk, "password", moved, &value));
+    assert!(old.open(ADDRESS.name, &pk, "password", moved).is_err());
+    // Carried: a re-run writes nothing.
+    let target = Cells::from([(
+        key.clone(),
+        register(&[(op(9), change.value.clone().unwrap())]),
+    )]);
+    let done = carried_origins([&Command::Write {
+        request: [0; 16],
+        changes: vec![change.clone()],
+    }]);
+    assert!(
+        restate(&REGISTRY, &source, &held, &target, &done, RESEAL)
+            .unwrap()
+            .is_empty()
+    );
+    // An emptied password carries as it is.
+    let cleared = Cells::from([(
+        key,
+        register(&[(op(2), CellValue::owner(2, Value::Null).encode())]),
+    )]);
+    let rows = restate(
+        &REGISTRY,
+        &cleared,
+        &BTreeSet::from([op(2)]),
+        &Cells::new(),
+        &BTreeSet::new(),
+        RESEAL,
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+/// A `Secret` register an older build's roll copied as it was (its token sealed for the old
+/// generation, its origin carried) is resealed, not skipped, and a register a revert left a bare
+/// `null` candidate in rolls rather than refusing the whole roll.
+/// NEGATIVE CONTROL: with `restate` skipping every register whose origins are all carried (the
+/// `opens` check dropped), the copied token stays and never opens under the new table: ``
+/// assertion failed: !rows.is_empty() ``.
+#[test]
+fn a_copied_or_reverted_secret_register_rolls() {
+    let (old, new) = RESEAL;
+    let pk = keys::address_pk("ann@example.test").unwrap();
+    let key = (ADDRESS.name.to_owned(), format!("{pk}.password"));
+    let value = Secret::new("synthetic-pass-2".to_owned());
+    let token = old.seal(ADDRESS.name, &pk, "password", &value).unwrap();
+    let stored = CellValue::owner(2, json!(token)).encode();
+    let source = Cells::from([(key.clone(), register(&[(op(1), stored.clone())]))]);
+    let held = BTreeSet::from([op(1)]);
+    let copied = Cells::from([(key.clone(), register(&[(op(1), stored)]))]);
+    let rows = restate(
+        &REGISTRY,
+        &source,
+        &held,
+        &copied,
+        &BTreeSet::from([op(1)]),
+        RESEAL,
+    )
+    .unwrap();
+    assert!(!rows.is_empty());
+    let carried = written_at(&rows, &key);
+    let [(origin, resealed)] = carried.as_slice() else {
+        panic!("one candidate is carried");
+    };
+    assert_eq!(*origin, op(1));
+    assert!(new.holds(
+        ADDRESS.name,
+        &pk,
+        "password",
+        resealed["x"].as_str().unwrap(),
+        &value
+    ));
+    // A revert's bare `null` candidate rolls as it is.
+    let reverted = Cells::from([(key.clone(), register(&[(op(3), Value::Null)]))]);
+    let rows = restate(
+        &REGISTRY,
+        &reverted,
+        &BTreeSet::from([op(3)]),
+        &Cells::new(),
+        &BTreeSet::new(),
+        RESEAL,
+    )
+    .unwrap();
+    assert_eq!(written_at(&rows, &key), vec![(op(3), Value::Null)]);
+}
+
+/// The candidates `rows` writes into the register `key` names.
+fn written_at(rows: &[Vec<Change>], key: &(String, String)) -> Vec<(Digest, Value)> {
+    let change = rows
+        .iter()
+        .flatten()
+        .find(|c| (c.collection.clone(), c.key.clone()) == *key)
+        .expect("the register is written");
+    cell::carried(change.value.as_ref().unwrap()).unwrap()
 }
 
 /// The candidates `rows` writes into the register [`key`] names, as a reader expands them.
@@ -48,7 +187,7 @@ fn the_restatement_merges_what_each_side_saw() {
     // A first roll: an open conflict stays open.
     let source = Cells::from([(key(), register(&[(op(1), plain("a")), (op(2), plain("b"))]))]);
     let held = BTreeSet::from([op(1), op(2)]);
-    let rows = restate(&REGISTRY, &source, &held, &Cells::new(), &none).unwrap();
+    let rows = restate(&REGISTRY, &source, &held, &Cells::new(), &none, RESEAL).unwrap();
     assert_eq!(
         written(&rows),
         vec![(op(1), plain("a")), (op(2), plain("b"))]
@@ -59,7 +198,7 @@ fn the_restatement_merges_what_each_side_saw() {
         register(&[(op(1), json!({"n": 1}))]),
     )]);
     assert!(
-        restate(&REGISTRY, &owned, &held, &Cells::new(), &none)
+        restate(&REGISTRY, &owned, &held, &Cells::new(), &none, RESEAL)
             .unwrap()
             .is_empty()
     );
@@ -74,7 +213,7 @@ fn the_restatement_merges_what_each_side_saw() {
         changes: rows[0].clone(),
     }]);
     assert!(
-        restate(&REGISTRY, &source, &held, &target, &carried)
+        restate(&REGISTRY, &source, &held, &target, &carried, RESEAL)
             .unwrap()
             .is_empty()
     );
@@ -87,6 +226,7 @@ fn the_restatement_merges_what_each_side_saw() {
         &BTreeSet::from([op(1)]),
         &Cells::new(),
         &none,
+        RESEAL,
     )
     .unwrap();
     let target = Cells::from([(
@@ -101,6 +241,7 @@ fn the_restatement_merges_what_each_side_saw() {
         &BTreeSet::from([op(1), op(3)]),
         &target,
         &carried,
+        RESEAL,
     )
     .unwrap();
     assert_eq!(written(&superseded), vec![(op(3), plain("c"))]);
@@ -112,6 +253,7 @@ fn the_restatement_merges_what_each_side_saw() {
         &BTreeSet::from([op(3)]),
         &target,
         &carried,
+        RESEAL,
     )
     .unwrap();
     assert_eq!(
@@ -127,6 +269,7 @@ fn the_restatement_merges_what_each_side_saw() {
         &BTreeSet::from([op(1), op(3)]),
         &edited,
         &carried,
+        RESEAL,
     )
     .unwrap();
     assert_eq!(
@@ -361,7 +504,10 @@ fn a_roll_restates_everything_and_releases_the_sealed_generation() {
 /// `a_roll_restates_everything_and_releases_the_sealed_generation` holds the regular scan across
 /// generations. NEGATIVE CONTROLS: with `within` always true, m2 releases right after the heal and
 /// its `NotCarried` assertion fails; with `restate` writing the late candidates alone, m1's edit is
-/// lost and the conflict assertion fails.
+/// lost and the conflict assertion fails. It counts who the first roll waits on rather than naming
+/// them, writes no facts row on m2, and asserts that m1 released its first generation only at the
+/// end, not in the cut; nothing runs the regular scan on three Macs. `lab alab-roll`, whose judge
+/// read those, is gone.
 #[test]
 fn a_late_edit_is_carried_before_its_mac_releases() {
     let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
@@ -459,7 +605,12 @@ fn a_late_edit_is_carried_before_its_mac_releases() {
 /// A cover counts only as the Mac its key names wrote it: after a split leaves m2 holding a late
 /// first-generation record no restatement carried, m1 writing a cover row keyed for m2 that
 /// claims all of m2's records does not let m2 release, and the grid shows cover columns
-/// read-only. NEGATIVE CONTROL: with `covers` taking every row whatever its signer, m2's pass
+/// read-only. Each repair names the table that moved, as a push does;
+/// `a_roll_restates_everything_and_releases_the_sealed_generation` holds the regular scan across
+/// generations.
+/// GAP: this test no longer runs regular scans or idle laps during a roll, so a seal or cover row
+/// that arrives only through scan rotation is not seen here.
+/// NEGATIVE CONTROL: with `covers` taking every row whatever its signer, m2's pass
 /// releases the first generation and its `NotCarried` assertion fails.
 #[test]
 fn a_cover_written_for_another_mac_counts_for_nothing() {
@@ -468,13 +619,19 @@ fn a_cover_written_for_another_mac_counts_for_nothing() {
         Registry::at(lab.paths[0].clone()),
         Registry::at(lab.paths[1].clone()),
     );
+    let trust = lab.bootstrap(0).trust();
+    let catalog = crate::catalog::scope(trust).digest();
+    let g1 = att::REGISTRY.descriptor(trust).unwrap().scope.digest();
+    let g2 = att::REGISTRY_2.descriptor(trust).unwrap().scope.digest();
     a.open().unwrap();
     a.seed().unwrap();
-    repair_commons(&lab, 6);
+    repair_commons_first(&lab, 1, catalog);
+    repair_commons_first(&lab, 1, g1);
     a.roll(true, now_ms()).unwrap();
-    repair_commons(&lab, 6);
+    repair_commons_first(&lab, 1, catalog);
+    repair_commons_first(&lab, 1, g2);
     release(&lab, 1);
-    repair_commons(&lab, 6);
+    repair_commons_first(&lab, 1, catalog);
     assert!(a.roll(true, now_ms()).unwrap().sealed);
     // b edits the first generation before it hears the seal.
     b.write(vec![vec![provider(
@@ -483,8 +640,16 @@ fn a_cover_written_for_another_mac_counts_for_nothing() {
         json!("https://late.example.test"),
     )]])
     .unwrap();
-    repair_commons(&lab, 6);
+    // a released the first generation when it sealed, so g2 is the table the two still share.
+    repair_commons_first(&lab, 1, catalog);
+    repair_commons_first(&lab, 1, g2);
     let first = first_id(&lab);
+    // `NotCarried` is also what a Mac with no cover reports, so a's cover must be here first.
+    let cover = keys::roll_pk(1, &keys::uuid32(&lab.machine(0)));
+    assert!(
+        b.view().unwrap().project(&ROLL).rows.contains_key(&cover),
+        "a's cover reached b"
+    );
     assert_eq!(release(&lab, 1).kept, vec![(first, Kept::NotCarried)]);
 
     let actor = |n: usize| {
@@ -515,7 +680,7 @@ fn a_cover_written_for_another_mac_counts_for_nothing() {
         forged("row", json!("live")),
     ]])
     .unwrap();
-    repair_commons(&lab, 6);
+    repair_commons_first(&lab, 1, g2);
     assert_eq!(release(&lab, 1).kept, vec![(first, Kept::NotCarried)]);
     assert!(stores_first(&lab, 1));
     assert!(
@@ -662,5 +827,254 @@ fn the_roll_verb_plans_then_applies() {
         done["released"],
         json!([aterm_codec::hex::encode_lower(&first_id(&lab))])
     );
+    assert_eq!(a.generation().generation, 2);
+}
+
+/// A `Secret` register is reported where any candidate's token does not open under the new
+/// generation's sealer: one sealed for the old table's name (copied as it was), alone or carried
+/// beside a resealed one; a resealed token, a typed `null` and a revert's bare `null` open, and a
+/// column that is not `Secret` is never judged. Coordinates only, never a value.
+/// NEGATIVE CONTROL: with `opens_in` taking any string token as opening, the copied tokens open
+/// and the report is empty: `` assertion `left == right` failed ``.
+#[test]
+fn a_token_sealed_for_the_old_table_is_reported_unopened() {
+    let (old, new) = RESEAL;
+    let value = Secret::new("synthetic-pass-4".to_owned());
+    let at = |addr: &str| keys::address_pk(addr).unwrap();
+    let token = |sealer: &dyn Sealer, pk: &str| {
+        CellValue::owner(
+            2,
+            json!(sealer.seal(ADDRESS.name, pk, "password", &value).unwrap()),
+        )
+        .encode()
+    };
+    let password = |pk: &str| (ADDRESS.name.to_owned(), format!("{pk}.password"));
+    let (copied, resealed, typed_null, bare_null, beside) = (
+        at("ann@example.test"),
+        at("bob@example.test"),
+        at("cy@example.test"),
+        at("di@example.test"),
+        at("ed@example.test"),
+    );
+    let carried_both = cell::carry(&BTreeMap::from([
+        (op(5), token(new, &beside)),
+        (op(6), token(old, &beside)),
+    ]))
+    .unwrap();
+    let cells = Cells::from([
+        (password(&copied), register(&[(op(1), token(old, &copied))])),
+        (
+            password(&resealed),
+            register(&[(op(2), token(new, &resealed))]),
+        ),
+        (
+            password(&typed_null),
+            register(&[(op(3), CellValue::owner(2, Value::Null).encode())]),
+        ),
+        (password(&bare_null), register(&[(op(4), Value::Null)])),
+        (password(&beside), register(&[(op(7), carried_both)])),
+        // Not a Secret column: an `addr` holding a string no sealer opens.
+        (
+            (ADDRESS.name.to_owned(), format!("{copied}.addr")),
+            register(&[(op(8), plain("ann@example.test"))]),
+        ),
+    ]);
+    let mut found = unopened(&REGISTRY, &cells, new);
+    found.sort();
+    let mut wanted = vec![
+        (
+            ADDRESS.name.to_owned(),
+            copied.clone(),
+            "password".to_owned(),
+        ),
+        (ADDRESS.name.to_owned(), beside, "password".to_owned()),
+    ];
+    wanted.sort();
+    assert_eq!(found, wanted);
+    // Under the old generation's own sealer the copied token opens and the resealed one does not.
+    let under_old = unopened(&REGISTRY, &cells, old);
+    assert!(under_old.iter().all(|(_, pk, _)| *pk != copied));
+    assert!(under_old.iter().any(|(_, pk, _)| *pk == resealed));
+}
+
+/// Mac `n` rolls the registry as v0.154.0 did: it declares the second generation and restates
+/// every register of the first into it as it was, a `Secret` cell's token copied (still sealed to
+/// the first generation's table), then writes its cover row last. Its seal step is v0.154.0's and
+/// waits for every Writer's declaration, so it is not run here: `Directory::undeclared` is what
+/// it would wait on.
+fn copying_roll(lab: &Lab, n: usize) {
+    let bootstrap = lab.bootstrap(n);
+    let session = Session::open(&bootstrap).unwrap();
+    let trust = bootstrap.trust();
+    let directory = Directory::new(&lab.paths[n], trust);
+    let (from, to) = (&att::REGISTRY, &att::REGISTRY_2);
+    let old_scope = from.descriptor(trust).unwrap().scope;
+    let old = directory
+        .observe_store_if_exists(&session, old_scope)
+        .unwrap()
+        .unwrap();
+    let old_log = Log::read_with(&session, &old, old_scope, decode).unwrap();
+    let old_view = View::read(from.table, &session, &old_log);
+    let to_descriptor = to.descriptor(trust).unwrap();
+    directory.publish(&session, &to_descriptor).unwrap();
+    directory.endorse(&session, &to_descriptor).unwrap();
+    let mut store = Store::open(
+        &session,
+        &directory.path(to_descriptor.scope).unwrap(),
+        to_descriptor.scope,
+    )
+    .unwrap();
+    let body: Vec<Vec<Change>> = old_view
+        .cells
+        .iter()
+        .filter(|((collection, _), cell)| {
+            !NOT_RESTATED.contains(&collection.as_str())
+                && !cell.stopped
+                && from
+                    .table
+                    .collection(collection)
+                    .is_some_and(|known| known.kind == typed::Kind::Cells)
+        })
+        .map(|((collection, key), cell)| {
+            let copied: BTreeMap<Digest, Value> = cell::origins(cell).into_iter().collect();
+            vec![Change {
+                collection: collection.clone(),
+                key: key.clone(),
+                value: Some(cell::carry(&copied).unwrap()),
+            }]
+        })
+        .collect();
+    let uuid = keys::uuid32(&lab.machine(n));
+    let held = held_of(&old_log);
+    let cover = cover_row(
+        &Projection::default(),
+        from.generation,
+        &uuid,
+        &frontier(&held),
+        held.len(),
+        now_ms(),
+    )
+    .unwrap();
+    let mut records = pack(body).unwrap();
+    records.extend(pack(vec![cover]).unwrap());
+    for changes in records {
+        let request = typed::request_id(APPLICATION, to.table.role, &changes).unwrap();
+        let command = Command::Write { request, changes };
+        application::append(&session, &mut store, &command.encode().unwrap()).unwrap();
+    }
+}
+
+/// Whether Mac `n`'s catalog shows Mac `m` has not declared the registry's second generation.
+fn undeclared_by(lab: &Lab, n: usize, m: usize) -> bool {
+    let bootstrap = lab.bootstrap(n);
+    let session = Session::open(&bootstrap).unwrap();
+    let directory = Directory::new(&lab.paths[n], bootstrap.trust());
+    let descriptor = att::REGISTRY_2.descriptor(bootstrap.trust()).unwrap();
+    Directory::undeclared(
+        &session,
+        &directory.snapshot(&session).unwrap(),
+        &descriptor,
+    )
+    .unwrap()
+    .contains(&lab.machine(m))
+}
+
+/// `aterm db alab check` on Mac `n`: its findings naming a generation whose tokens do not open.
+fn unopened_findings(lab: &Lab, n: usize) -> Vec<Value> {
+    let check = crate::alab::command::run(
+        &lab.paths[n],
+        &["check".to_owned()],
+        None,
+        &mut |_| panic!("a check opens no review"),
+        now_ms(),
+    )
+    .unwrap();
+    check["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["finding"] == json!("generation-unopened"))
+        .cloned()
+        .collect()
+}
+
+/// A v0.154.0-style roll, which copies a `Secret` cell's token as it was into the second
+/// generation (where, sealed to the first table's name, it never opens), is refused at endorse
+/// (one-mesh design §4.8, §11 step A6): the other Mac's release pass leaves it undeclared, so the
+/// roll's seal keeps waiting for that Mac, and its `check` names generation 2 by number and
+/// table digest, never the value. Once this build rolls on the roller, resealing the token, the
+/// other Mac's next pass declares it, the check clears, and the roll seals.
+/// NEGATIVE CONTROL: with `endorse` declaring an `Unopened` generation too (`judged !=
+/// Judged::Unjudged` for `== Judged::Opens`), b's first pass declares the copying roll's
+/// generation: `` assertion failed: undeclared_by(&lab, 0, 1) ``.
+#[test]
+fn a_copying_rolls_secret_token_is_refused_at_endorse() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let a = Registry::at(lab.paths[0].clone());
+    a.open().unwrap();
+    a.seed().unwrap();
+    let pk = keys::address_pk("ann@example.test").unwrap();
+    let token = att::Handle::at(lab.paths[0].clone(), &att::REGISTRY)
+        .seal_secret(
+            ADDRESS.name,
+            &pk,
+            "password",
+            &Secret::new("synthetic-pass-5".to_owned()),
+        )
+        .unwrap();
+    let password = cell::change(
+        &ADDRESS,
+        CellKey {
+            pk: &pk,
+            col: "password",
+            elem: None,
+        },
+        &CellValue::owner(ADDRESS.version, token),
+    )
+    .unwrap();
+    a.write(vec![address("ann@example.test"), vec![password]])
+        .unwrap();
+    repair_commons(&lab, 6);
+
+    copying_roll(&lab, 0);
+    repair_commons(&lab, 6);
+    assert!(undeclared_by(&lab, 1, 1));
+    // b's release pass (a claims write's housekeeping) judges it and declares nothing.
+    release(&lab, 1);
+    repair_commons(&lab, 6);
+    assert!(undeclared_by(&lab, 0, 1));
+    assert!(undeclared_by(&lab, 1, 1));
+    let found = unopened_findings(&lab, 1);
+    let g2 = aterm_codec::hex::encode_lower(
+        &att::REGISTRY_2
+            .descriptor(lab.bootstrap(0).trust())
+            .unwrap()
+            .scope
+            .digest(),
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["generation"], json!(2));
+    assert_eq!(found[0]["table"], json!(g2));
+    assert_eq!(found[0]["cells"], json!(1));
+    assert_eq!(found[0]["endorsed"], json!(false));
+    let line = found[0]["line"].as_str().unwrap();
+    assert!(
+        line.starts_with(&format!("registry generation 2 ({}…) ", &g2[..8]))
+            && line.ends_with("not endorsed"),
+        "{line}"
+    );
+    assert_eq!(a.generation().generation, 1);
+
+    // This build's roll on a reseals the copied token; b's next pass declares, and a seals.
+    let staged = a.roll(true, now_ms()).unwrap();
+    assert!(!staged.sealed && staged.records > 0, "{staged:?}");
+    assert_eq!(staged.waiting, vec![lab.machine(1)]);
+    repair_commons(&lab, 6);
+    release(&lab, 1);
+    repair_commons(&lab, 6);
+    assert!(!undeclared_by(&lab, 0, 1));
+    assert!(unopened_findings(&lab, 1).is_empty());
+    let rolled = a.roll(true, now_ms()).unwrap();
+    assert!(rolled.sealed && rolled.waiting.is_empty(), "{rolled:?}");
     assert_eq!(a.generation().generation, 2);
 }

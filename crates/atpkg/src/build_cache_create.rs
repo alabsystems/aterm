@@ -22,15 +22,18 @@ use std::path::Path;
 
 #[cfg(unix)]
 pub(super) fn pin(path: &Path) -> Option<aterm_dirfd::OwnedFd> {
-    let fd = aterm_dirfd::openat(
-        aterm_dirfd::CWD,
-        path,
-        aterm_dirfd::OFlags::RDONLY
-            | aterm_dirfd::OFlags::DIRECTORY
-            | aterm_dirfd::OFlags::NOFOLLOW
-            | aterm_dirfd::OFlags::CLOEXEC,
-        aterm_dirfd::Mode::empty(),
-    )
+    let fd = aterm_uds::kept_out(|| {
+        aterm_dirfd::openat(
+            aterm_dirfd::CWD,
+            path,
+            aterm_dirfd::OFlags::RDONLY
+                | aterm_dirfd::OFlags::DIRECTORY
+                | aterm_dirfd::OFlags::NOFOLLOW
+                | aterm_dirfd::OFlags::CLOEXEC,
+            aterm_dirfd::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+    })
     .ok()?;
     let captured = aterm_dirfd::fstat(&fd).ok()?;
     let named = identity(path)?;
@@ -87,7 +90,8 @@ fn write_cache_tag(root: &aterm_dirfd::OwnedFd) -> Option<()> {
             | aterm_dirfd::OFlags::CREATE
             | aterm_dirfd::OFlags::EXCL
             | aterm_dirfd::OFlags::NOFOLLOW
-            | aterm_dirfd::OFlags::CLOEXEC,
+            | aterm_dirfd::OFlags::CLOEXEC
+            | aterm_dirfd::OFlags::NONBLOCK,
         aterm_dirfd::Mode::from_bits(0o600),
     )
     .ok()?;

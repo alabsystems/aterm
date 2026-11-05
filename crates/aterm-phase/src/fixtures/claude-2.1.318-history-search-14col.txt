@@ -1,0 +1,51 @@
+# claude-code 2.1.318 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (14x50, aterm 0.154.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Claude Code's prompt-history search (ctrl+r) open in a 14-column window, query a, its match beta old prompt two wrapping the composer onto two rows; the label breaks within its letters: `sea … ⏵⏵`, then `rch`, `pr`, `omp`, `ts:` · cursor=44,7
+▝▜██████▀  Us
+ ▝▝   ▝▝   age
+           Bi
+           lli
+           ng
+           /…/
+           tmp
+           /at
+           .Qr
+           OB/
+           pro
+           j
+
+
+❯ alpha old
+  prompt one
+
+⏺ Hi! I am the
+  local lab
+  stub, not a
+  model.
+  (reply 1)
+
+✻ Brewed for
+  0s · done
+  11:15 AM
+
+❯ beta old
+  prompt two
+
+⏺ Hi! I am the
+  local lab
+  stub, not a
+  model.
+  (reply 2)
+
+✻ Churned for
+  0s · done
+  11:15 AM
+
+──────────────
+❯ beta old
+  prompt two
+──────────────
+  sea … ⏵⏵
+  rch
+  pr
+  omp
+  ts:
+

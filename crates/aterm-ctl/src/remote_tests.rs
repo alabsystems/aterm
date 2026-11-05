@@ -53,6 +53,7 @@ fn link(answer: fn(&str) -> String, seen: &'static Mutex<Vec<String>>) -> DriveL
             seen,
         }),
         label: "lab-mini".to_owned(),
+        node: None,
     }
 }
 
@@ -267,10 +268,29 @@ fn a_spawn_over_a_drive_names_no_folder_of_this_mac() {
         ("-e /bin/sh -c true", "a worker alone"),
         ("agent=claude len=4 -", "len="),
         ("agent=claude cwd=proj -", "absolute path"),
+        ("agent=claude cwd=~bob/proj -", "another account's home"),
+        ("agent=claude cwd=~/../bob -", "may leave the home"),
     ] {
         let refusal = spawn_head(&words(bad), None).expect_err(bad).to_string();
         assert!(refusal.contains(why), "{bad}: {refusal}");
     }
+    // A folder of that Mac's home crosses as written: that Mac resolves it against its own.
+    assert_eq!(
+        spawn_head(
+            &[
+                "agent=claude".to_owned(),
+                "cwd=$HOME/trust/My Crate".to_owned(),
+                "-".to_owned()
+            ],
+            None
+        )
+        .unwrap(),
+        "spawn agent=claude cwd=\"$HOME/trust/My Crate\""
+    );
+    assert_eq!(
+        spawn_head(&words("agent=claude cwd=~ -"), None).unwrap(),
+        "spawn agent=claude cwd=~"
+    );
 }
 
 #[test]
@@ -283,6 +303,24 @@ fn a_plain_fleet_shell_has_one_explicit_folder_and_no_task_channel() {
         shell_spawn_head(&["cwd=/a folder".to_owned(), "raise=false".to_owned()]).unwrap(),
         "spawn cwd=\"/a folder\" raise=false"
     );
+    assert_eq!(
+        shell_spawn_head(&["cwd=~/My Project".to_owned()]).unwrap(),
+        "spawn cwd=\"~/My Project\"",
+        "a folder of that Mac's home, which it resolves"
+    );
+    assert_eq!(
+        shell_spawn_head(&words("cwd=~ raise=false")).unwrap(),
+        "spawn cwd=~ raise=false"
+    );
+    for (bad, why) in [
+        ("cwd=~bob/x", "another account's home"),
+        ("cwd=~/../x", "may leave the home"),
+        ("cwd=~/a/../../x", "may leave the home"),
+    ] {
+        let refusal = shell_spawn_head(&words(bad)).expect_err(bad).to_string();
+        assert!(refusal.contains(why), "{bad}: {refusal}");
+        assert!(refusal.contains(&format!("`{bad}`")), "{bad}: {refusal}");
+    }
     for bad in [
         "",
         "cwd=relative",
@@ -654,6 +692,7 @@ fn a_partial_fleet_send_is_never_repeated() {
             Ok(DriveLink {
                 stream: Box::new(PartialSend(true)),
                 label: "lab-mini".into(),
+                node: None,
             })
         })
         .is_err()
@@ -778,6 +817,7 @@ fn a_drive_cut_before_its_answer_says_what_cuts_one_and_what_may_have_landed() {
     let cut = || DriveLink {
         stream: Box::new(Cut),
         label: "lab-mini".to_owned(),
+        node: None,
     };
     let turned = exchange(cut(), "@s-a1 turn timeout=20000 go\n", "turn", OWN)
         .expect_err("cut")
@@ -843,6 +883,7 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
     let frozen = || DriveLink {
         stream: Box::new(Frozen),
         label: "lab-mini".to_owned(),
+        node: None,
     };
     let turned =
         exchange(frozen(), "@s-a1 turn timeout=20000 go\n", "turn", OWN).expect_err("unanswered");
@@ -880,6 +921,7 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
         Ok(DriveLink {
             stream: Box::new(Frozen),
             label: "lab-mini".to_owned(),
+            node: None,
         })
     }
     let awaited = await_task::run_driven(&words("await task @s-a1"), None, "lab-mini", drive)
@@ -899,6 +941,7 @@ fn a_reply_cut_at_a_shorter_timeout_is_said_as_that_timeout_not_the_peers() {
         Ok(DriveLink {
             stream: Box::new(Frozen),
             label: "lab-mini".to_owned(),
+            node: None,
         })
     }
     let local = LocalVerbs {
@@ -1059,6 +1102,7 @@ fn an_await_over_a_drive_ends_within_ctls_own_timeout() {
             DriveLink {
                 stream: Box::new(Frozen),
                 label: "lab-mini".to_owned(),
+                node: None,
             }
         })
     }
@@ -1101,7 +1145,7 @@ fn any_fleet(ask: &survey::FleetAsk<'_>) -> Result<survey::FleetRead, survey::Fl
             ),
             format!(
                 "account pool=claude id=main condition=usable enrolled=1 pct5=1 pct7={week} \
-                 week_reset=- walled_until=- last_used=-"
+                 week_reset=- walled_until=- last_used=- read_at=1793129900"
             ),
         ]),
         fault: survey::PeerFault::Other,
@@ -1126,17 +1170,135 @@ fn host_any_spawns_on_the_best_member_that_lets_this_mac_drive_it() {
         fleet_drive: Some(never),
         ..LocalVerbs::NONE
     };
+    let (node, placed) =
+        any_host_node(&words("agent=claude -"), &[], None, &local).expect("a pick");
+    assert_eq!(node, "03".repeat(16), "m3, never m2, which grants no drive");
     assert_eq!(
-        any_host_node(&words("agent=claude -"), None, &local).expect("a pick"),
-        "03".repeat(16),
-        "m3, never m2, which grants no drive"
+        placed,
+        crate::board::Placed {
+            node: Some("03".repeat(16)),
+            host: Some("m3.local".to_owned()),
+            account: Some("main".to_owned()),
+        },
+        "the board records the pick: its node, its host and the account row it was chosen by"
     );
-    let none = any_host_node(&words("agent=codex -"), None, &local)
+    let none = any_host_node(&words("agent=codex -"), &[], None, &local)
         .expect_err("no codex row")
         .to_string();
     assert!(
         none.starts_with("--host any: no Mac can take agent=codex: 3 members answered, 2 of them"),
         "{none}"
+    );
+}
+
+/// The survey of [`any_fleet`] with each member's home: m1 (50%) holds a trust checkout its read
+/// of 10 min ago found and 200 GiB free, m2 (no drive, 0%) the same, and m3 (20%) runs an aterm
+/// too old to say anything of its home.
+fn any_fleet_homes(ask: &survey::FleetAsk<'_>) -> Result<survey::FleetRead, survey::FleetRefused> {
+    let mut read = any_fleet(ask)?;
+    for peer in &mut read.peers[..2] {
+        if let Ok(lines) = &mut peer.answer {
+            let host = lines[0]
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix("host="))
+                .map(str::to_owned)
+                .expect("a host");
+            lines[0].push_str(&format!(
+                " home=/Users/{host} home_free_mb={} repos=1 repos_at={} repos_cut=0",
+                200 * 1024,
+                1_793_130_000_000_u64 - 600_000
+            ));
+            lines.push(format!(
+                "repo name=trust path=/Users/{host}/trust \
+                 head=0123456789abcdef0123456789abcdef01234567 branch=main main=origin/main \
+                 behind=4 fetched_at=1793120000000 dirty=0"
+            ));
+        }
+    }
+    Ok(read)
+}
+
+/// `need=` picks the Mac by its own facts and never crosses to it; a `cwd=~/…` needs a Mac that
+/// names its home. The least used Mac (m3) says nothing of its home, so it is never chosen for
+/// either, and a need no Mac meets is refused with the counts.
+#[test]
+fn host_any_places_a_worker_only_where_its_needs_are_met() {
+    fn never(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        panic!("dialled")
+    }
+    let local = LocalVerbs {
+        fleet_survey: Some(any_fleet_homes),
+        fleet_drive: Some(never),
+        ..LocalVerbs::NONE
+    };
+    assert_eq!(
+        any_host_node(&words("agent=claude -"), &[], None, &local)
+            .expect("a pick")
+            .0,
+        "03".repeat(16),
+        "with no needs, the least used week"
+    );
+    let m1 = "01".repeat(16);
+    assert_eq!(
+        any_host_node(
+            &words("agent=claude -"),
+            &words("need=repo:trust,free:150g"),
+            None,
+            &local
+        )
+        .expect("a pick")
+        .0,
+        m1
+    );
+    assert_eq!(
+        any_host_node(&words("agent=claude cwd=$HOME/trust -"), &[], None, &local)
+            .expect("a pick")
+            .0,
+        m1,
+        "a home that resolves $HOME/trust"
+    );
+    let none = any_host_node(
+        &words("agent=claude -"),
+        &words("need=repo:trust,free:250g"),
+        None,
+        &local,
+    )
+    .expect_err("none has 250 GiB")
+    .to_string();
+    assert_eq!(
+        none,
+        "--host any: no Mac can take agent=claude need=repo:trust,free:250g: 3 members answered, \
+         2 of them let this Mac drive them (`aterm fleet allow drive --from <this Mac>` there); \
+         of those, 1 have less free disk than it needs (free:250g), 1 cannot say whether they \
+         meet its needs (an aterm too old to report its home, checkouts and disk, or no read of \
+         its checkouts within 30 min), so none meets them"
+    );
+}
+
+/// `need=` is this client's to judge from the survey `--host any` reads: with one Mac named it
+/// is refused before any dial, never sent.
+#[test]
+fn a_need_names_no_mac_of_its_own() {
+    fn never(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        panic!("dialled")
+    }
+    let local = LocalVerbs {
+        fleet_drive: Some(never),
+        ..LocalVerbs::NONE
+    };
+    let refusal = run(
+        "lab-mini",
+        &words("spawn agent=claude need=repo:trust -"),
+        None,
+        &local,
+    )
+    .expect_err("one Mac named");
+    assert_eq!(refusal.kind(), io::ErrorKind::InvalidInput, "{refusal}");
+    assert!(
+        refusal
+            .to_string()
+            .contains("need= picks the Mac under --host any"),
+        "{refusal}"
     );
 }
 
@@ -1163,6 +1325,10 @@ fn host_any_spawns_a_claude_or_codex_worker_alone() {
         "spawn cwd=/tmp",
         "spawn agent=claude",
         "spawn agent=claude cwd=rel -",
+        "spawn agent=claude cwd=~bob -",
+        "spawn agent=claude need=gpu:1 -",
+        "spawn agent=claude need= -",
+        "spawn agent=claude need=repo:trust,free:150 -",
     ] {
         let refusal = run(ANY_TEST, &words(line), None, &local).expect_err(line);
         assert_eq!(
@@ -1183,28 +1349,34 @@ fn host_any_spawns_a_claude_or_codex_worker_alone() {
 
 const ANY_TEST: &str = any_host::ANY;
 
-struct AnyHostsGuard;
+/// This thread's board, in a scratch folder, while the guard lives.
+fn scratch_board(
+    tag: &str,
+) -> (
+    aterm_tempfile::TempDir,
+    crate::board::HereGuard,
+    crate::board::Board,
+) {
+    let tmp = crate::test_scratch_dir(tag);
+    let dir = tmp.path().join("board");
+    let guard = crate::board::HereGuard::at(&dir);
+    (tmp, guard, crate::board::Board::at(&dir))
+}
 
-impl AnyHostsGuard {
-    fn set(path: std::path::PathBuf) -> Self {
-        ANY_HOSTS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(path));
-        Self
+/// A row of a worker this Mac started on `node` (`None`: this Mac).
+fn started_on(sid: &str, node: Option<&str>) -> crate::board::Row {
+    crate::board::Row {
+        node: node.map(str::to_owned),
+        ..crate::board::Row::started(sid, crate::board::now_ms())
     }
 }
 
-impl Drop for AnyHostsGuard {
-    fn drop(&mut self) {
-        ANY_HOSTS_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
-    }
-}
-
-/// A worker `--host any` spawned is followed to its Mac by its sid: from the table the spawn
-/// recorded, else from the one live, proven member whose survey lists it.
+/// A worker `--host any` spawned is followed to its Mac by its sid: from the board row the
+/// spawn recorded, else from the one live, proven member whose survey lists it.
 #[test]
 fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
     static DIALLED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
-    let tmp = crate::test_scratch_dir("any-follow");
-    let _guard = AnyHostsGuard::set(tmp.path().join("driven-any-hosts.tsv"));
+    let (_tmp, _guard, board) = scratch_board("any-follow");
 
     fn fleet_survey(_: &survey::FleetAsk<'_>) -> Result<survey::FleetRead, survey::FleetRefused> {
         Ok(survey::FleetRead {
@@ -1294,12 +1466,15 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
                 reply: None,
             }),
             label: host.to_owned(),
+            node: None,
         })
     }
 
-    // Record spawned sid -> m3 and verify `await task` and `@s-c25a result` follow m3, while an
-    // unrecorded sid `@s-f00d` falls back to `fleet_survey` and routes to `m4`.
-    record_any_sid_host("s-c25a", "m3");
+    // The board places s-c25a on m3: `await task` and `@s-c25a result` follow it there, while
+    // `@s-f00d`, which the board does not hold, falls back to `fleet_survey` and routes to `m4`.
+    board
+        .record(&started_on("s-c25a", Some("m3")))
+        .expect("record");
     let local = LocalVerbs {
         fleet_drive: Some(drive),
         fleet_survey: Some(fleet_survey),
@@ -1347,26 +1522,18 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
     assert_eq!(crate::exit_for(&unserved_err), ExitCode::from(2));
 }
 
-/// NEGATIVE CONTROL: `driven-any-hosts.tsv` refuses control/newline/tab injection, oversize sids or
-/// hosts, `"any"`, and loose/symlinked files on Unix, and `resolve_any_sid_hosts` neither lets a
-/// survey overwrite an existing recorded binding nor silently picks one peer when multiple proven
-/// peers list the same unrecorded sid.
+/// NEGATIVE CONTROL: `--host any` follows a sid by the board's row before any survey, and a
+/// survey can neither override it nor write a binding down (the board holds only workers this Mac
+/// started); a sid more than one proven peer lists is refused rather than picked; a sid the board
+/// places on this Mac is refused (`--host any` drives other Macs); and a row's file open to
+/// others is not read.
 #[test]
-fn host_any_table_hardens_injection_permissions_recorded_bindings_and_ambiguous_sids() {
-    let tmp = crate::test_scratch_dir("any-harden");
-    let table_path = tmp.path().join("driven-any-hosts.tsv");
-    let _guard = AnyHostsGuard::set(table_path.clone());
-
-    record_any_sid_host("s-c25a", "m3");
-    record_any_sid_host("s-bad1", "m4\ns-c25a\tm-evil");
-    record_any_sid_host("s-bad2", "m4\tm-evil");
-    record_any_sid_host("s-bad3", "any");
-    record_any_sid_host(&format!("s-{}", "a".repeat(63)), "m4");
-    record_any_sid_host("s-bad4", &"m".repeat(256));
-    assert_eq!(
-        read_any_sid_hosts(),
-        vec![("s-c25a".to_owned(), "m3".to_owned())]
-    );
+fn host_any_follows_the_board_first_and_never_records_a_survey() {
+    let (_tmp, _guard, board) = scratch_board("any-harden");
+    board
+        .record(&started_on("s-c25a", Some("m3")))
+        .expect("record");
+    board.record(&started_on("s-0ca1", None)).expect("record");
 
     fn conflicting_survey(
         _: &survey::FleetAsk<'_>,
@@ -1404,17 +1571,23 @@ fn host_any_table_hardens_injection_permissions_recorded_bindings_and_ambiguous_
             alone: None,
         })
     }
+    fn unasked(_: &survey::FleetAsk<'_>) -> Result<survey::FleetRead, survey::FleetRefused> {
+        panic!("surveyed")
+    }
 
     assert_eq!(
-        resolve_any_sid_hosts(&["s-c25a", "s-b001"], None, Some(conflicting_survey)).unwrap(),
-        vec!["m3".to_owned(), "node-b".to_owned()]
+        resolve_any_sid_hosts(&["s-c25a"], None, Some(unasked)).unwrap(),
+        vec!["m3".to_owned()],
+        "a sid the board holds needs no survey"
     );
     assert_eq!(
-        read_any_sid_hosts(),
-        vec![
-            ("s-c25a".to_owned(), "m3".to_owned()),
-            ("s-b001".to_owned(), "node-b".to_owned()),
-        ]
+        resolve_any_sid_hosts(&["s-c25a", "s-b001"], None, Some(conflicting_survey)).unwrap(),
+        vec!["m3".to_owned(), "node-b".to_owned()],
+        "m-a listing s-c25a does not move it off the board's m3"
+    );
+    assert!(
+        board.row("s-b001").is_none(),
+        "a survey's finding is not written down"
     );
     let ambig =
         resolve_any_sid_hosts(&["s-a1b2"], None, Some(conflicting_survey)).expect_err("ambiguous");
@@ -1424,21 +1597,20 @@ fn host_any_table_hardens_injection_permissions_recorded_bindings_and_ambiguous_
             && ambig.to_string().contains("node-b"),
         "{ambig}"
     );
-    assert!(
-        !read_any_sid_hosts().iter().any(|(sid, _)| sid == "s-a1b2"),
-        "ambiguous sid must not be cached"
-    );
+    let here = resolve_any_sid_hosts(&["s-0ca1"], None, Some(unasked)).expect_err("this Mac");
+    assert_eq!(here.kind(), io::ErrorKind::InvalidInput, "{here}");
+    assert!(here.to_string().contains("runs on this Mac"), "{here}");
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&table_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_any_sid_hosts().is_empty());
-        std::fs::remove_file(&table_path).unwrap();
-        let target = tmp.path().join("other.tsv");
-        std::fs::write(&target, "s-c25a\tm3\n").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::os::unix::fs::symlink(&target, &table_path).unwrap();
-        assert!(read_any_sid_hosts().is_empty());
+        let file = board.dir().join("s-c25a");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let loose = resolve_any_sid_hosts(&["s-c25a"], None, Some(conflicting_survey)).unwrap();
+        assert_eq!(
+            loose,
+            vec!["node-a".to_owned()],
+            "a row open to others is not read: the survey places the sid"
+        );
     }
 }

@@ -69,13 +69,21 @@ fn a_need_that_alone_holds_a_landing_says_so_on_the_apps_menu() {
     idle(&app);
     tell(&mut app, &sid, Some(TaskFace::Open));
     report(&mut app);
-    let carries = Some(report_words(aterm_phase::Program::Claude.product(), false));
+    let carries = Some(report_words(
+        aterm_phase::Program::Claude.product(),
+        aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+        false,
+    ));
     assert_eq!(tip(&app), carries, "no hold yet");
     hold(&mut app, &sid, HoldLeg::Needs.bit(), true);
     assert!(app.shown_hold(0).is_some(), "PRECONDITION: the hold stands");
     assert_eq!(
         tip(&app),
-        Some(report_words(aterm_phase::Program::Claude.product(), true)),
+        Some(report_words(
+            aterm_phase::Program::Claude.product(),
+            aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+            true
+        )),
         "the need alone holds the landing"
     );
     hold(
@@ -94,7 +102,11 @@ fn a_need_that_alone_holds_a_landing_says_so_on_the_apps_menu() {
     hold(&mut app, &sid, HoldLeg::Needs.bit(), true);
     assert_eq!(
         tip(&app),
-        Some(report_words(aterm_phase::Program::Claude.product(), true))
+        Some(report_words(
+            aterm_phase::Program::Claude.product(),
+            aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+            true
+        ))
     );
     let session = app.pool.get(0).expect("session 0");
     let (term, ctx) = (session.term.clone(), session.ctx.clone());

@@ -94,7 +94,8 @@ pub fn build(
     );
     std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
     let at = work.join(format!("{STEM}_bg.wasm"));
-    std::fs::write(&at, &bound).map_err(|e| format!("cannot write {}: {e}", at.display()))?;
+    crate::durable::write_fresh(&at, &bound)
+        .map_err(|e| format!("cannot write {}: {e}", at.display()))?;
     world.optimise(&at, out)?;
     let wasm =
         crate::durable::read_file(&at).map_err(|e| format!("cannot read {}: {e}", at.display()))?;
@@ -191,7 +192,9 @@ impl Stage {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o644);
+            options
+                .mode(0o644)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
         }
         let mut file = options
             .open(&path)

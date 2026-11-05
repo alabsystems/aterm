@@ -7,6 +7,32 @@ use std::path::Path;
 
 use super::split;
 
+#[cfg(unix)]
+#[test]
+fn a_complete_launchd_answer_preserves_native_bytes_and_trims_only_newlines() {
+    use std::os::unix::{ffi::OsStringExt as _, process::ExitStatusExt as _};
+    let answer = |code, stdout| std::process::Output {
+        status: std::process::ExitStatus::from_raw(code),
+        stdout,
+        stderr: Vec::new(),
+    };
+    assert_eq!(
+        super::launchd_value(answer(0, b"/private/\xff config\n\n".to_vec())),
+        Some(std::ffi::OsString::from_vec(
+            b"/private/\xff config".to_vec()
+        ))
+    );
+    assert_eq!(super::launchd_value(answer(0, b"\n\n".to_vec())), None);
+    assert_eq!(
+        super::launchd_value(answer(1 << 8, b"/prefix-only".to_vec())),
+        None
+    );
+    assert_eq!(
+        super::launchd_value(answer(0, b"/trailing space \n".to_vec())),
+        Some(std::ffi::OsString::from("/trailing space "))
+    );
+}
+
 fn home() -> crate::testdir::Dir {
     crate::testdir::dir("atpkg-config-split-")
 }

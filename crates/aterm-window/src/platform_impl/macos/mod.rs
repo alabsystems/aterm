@@ -35,7 +35,7 @@ pub(crate) use self::event::{option_only_character, KeyEventExtra};
 pub(crate) use self::event_loop::{
     ActiveEventLoop, EventLoop, EventLoopProxy, PlatformSpecificEventLoopAttributes,
 };
-pub(crate) use self::key_origin::{set_window_key_classifier, window_event_posted};
+pub(crate) use self::key_origin::{set_window_input_classifier, window_event_origin};
 pub(crate) use self::monitor::MonitorHandle;
 pub(crate) use self::window::WindowId;
 pub(crate) use self::window_delegate::PlatformSpecificWindowAttributes;

@@ -405,7 +405,7 @@ pub(crate) fn tape_targets(
 
 /// A bare `--replay` runs the tape's own command line, which whoever made the tape wrote: it
 /// refuses one that writes a local file, `release download` with no `--output -`, and one that
-/// reads a local file into a request, `--notes-file` (release create, edit and ensure), so a file
+/// reads a local file into a request, `--notes-file` or `--input`, so a file
 /// is written or sent only where the person typed it. A file `release upload` or `release
 /// ensure --file` names is only digested under replay, so it stays allowed.
 /// # Errors
@@ -413,11 +413,13 @@ pub(crate) fn tape_targets(
 /// names: release download writes into {path}`, or `a bare --replay reads no file a tape names:
 /// --notes-file {path}`.
 pub(crate) fn bare_replay_rule(verb: &Verb, inv: &Invocation) -> Result<()> {
-    if let Some(file) = inv.flag("--notes-file") {
-        return Err(Error::usage(format!(
-            "a bare --replay reads no file a tape names: --notes-file {file}"
-        ))
-        .with_next("type the command line after --replay"));
+    for flag in ["--notes-file", "--input"] {
+        if let Some(file) = inv.flag(flag) {
+            return Err(Error::usage(format!(
+                "a bare --replay reads no file a tape names: {flag} {file}"
+            ))
+            .with_next("type the command line after --replay"));
+        }
     }
     let output = inv.flag("--output");
     if verb.path != ["release", "download"] || output == Some("-") {

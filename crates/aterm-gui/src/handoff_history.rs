@@ -1391,11 +1391,12 @@ impl std::fmt::Debug for InputWatch {
     }
 }
 
-/// How many lines of the history-holding grid `checkpoint` carries.
+/// How many lines of the history-holding grid `checkpoint` carries: the main grid's, or the saved
+/// primary's while the alternate screen is up.
 #[must_use]
 pub(crate) fn carried_history(checkpoint: &TerminalCheckpoint) -> u64 {
     if checkpoint.modes.alternate_screen {
-        0
+        u64::from(crate::seamless::checkpoint_inactive_history(checkpoint))
     } else {
         u64::from(checkpoint.history_lines)
     }

@@ -6,8 +6,8 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -41,6 +41,11 @@ const FRAME: usize = 4096;
 
 /// NEGATIVE CONTROL: `write_frame_nonparking` delegates to blocking backpressure once
 /// `spilled >= SPILL_CAP`, bounding `|Spill|` by `SPILL_CAP + FRAME + 12` against a wedged peer.
+///
+/// `|Spill|` is read where the producer parks at the cap (`Seam::SpillCapPark`, under the spill's
+/// lock, where the count is the buffer's length), never after: a macOS pipe is no fixed wedge, and
+/// once the kernel grows its buffer the drainer can complete a chunk between the park and a later
+/// read (measured: 508 frames and 511 bytes, two 8 KiB chunks under the cap).
 #[test]
 fn nonparking_spill_is_bounded_against_a_wedged_pty() {
     let mut fds: [libc::c_int; 2] = [-1; 2];
@@ -55,27 +60,19 @@ fn nonparking_spill_is_bounded_against_a_wedged_pty() {
     let sink = Arc::new(SinkWriter::new(write.as_raw_fd()));
     let baseline = net();
 
-    const DRAIN_PARKED: u8 = 1;
-    const FRAME_LOCK_AT_CAP: u8 = 2;
-    let state = Arc::new(AtomicU8::new(0));
+    // The producer's thread alone reads through `weak` (it is joined before `sink` drops).
+    let peak = Arc::new(AtomicUsize::new(0));
     let (parked_tx, parked_rx) = mpsc::sync_channel(1);
     {
-        let state = Arc::clone(&state);
-        sink.seam_for_testing(move |seam| match seam {
-            Seam::DrainPark => {
-                if state.fetch_or(DRAIN_PARKED, Ordering::AcqRel) & FRAME_LOCK_AT_CAP != 0 {
-                    let _ = parked_tx.try_send(());
-                }
-            }
-            Seam::FrameLock => {
-                if state.fetch_or(FRAME_LOCK_AT_CAP, Ordering::AcqRel) & DRAIN_PARKED != 0 {
-                    let _ = parked_tx.try_send(());
-                }
-            }
-            Seam::SpillCapPark => {
+        let weak: Weak<SinkWriter> = Arc::downgrade(&sink);
+        let peak = Arc::clone(&peak);
+        sink.seam_for_testing(move |seam| {
+            if seam == Seam::SpillCapPark
+                && let Some(sink) = weak.upgrade()
+            {
+                peak.fetch_max(sink.spilled_bytes(), Ordering::AcqRel);
                 let _ = parked_tx.try_send(());
             }
-            _ => {}
         });
     }
 
@@ -97,12 +94,17 @@ fn nonparking_spill_is_bounded_against_a_wedged_pty() {
         .recv_timeout(Duration::from_secs(60))
         .expect("non-parking producer must park once spill reaches SPILL_CAP");
 
-    let spilled = sink.spilled_bytes();
     let bound = SinkWriter::SPILL_CAP + FRAME + 12;
+    let parked_at = peak.load(Ordering::Acquire);
     assert!(
-        spilled >= SinkWriter::SPILL_CAP && spilled <= bound,
-        "spill length {spilled}B must sit in [SPILL_CAP={}, {bound}]",
+        parked_at > SinkWriter::SPILL_CAP && parked_at <= bound,
+        "the producer parked at a spill of {parked_at}B, which must sit in (SPILL_CAP={}, {bound}]",
         SinkWriter::SPILL_CAP,
+    );
+    let spilled = sink.spilled_bytes();
+    assert!(
+        spilled <= bound,
+        "spill length {spilled}B must stay at most {bound}B"
     );
     let delta = net() - baseline;
     assert!(

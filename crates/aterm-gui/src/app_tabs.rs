@@ -522,6 +522,8 @@ impl App {
             .map(|session| session.ctx.self_id.as_str().to_string());
         if self.pool.views(session) == Some(1) {
             self.rewind_end(session, "the pane Rewind showed closed");
+            // Its terminal closes with this view: its processes answer for its tab's totals now.
+            self.note_tab_spent(session);
         }
         let dropped = self.pool.detach(session);
         if dropped {
@@ -2905,6 +2907,7 @@ impl App {
             receipt,
             need_alone,
             place: None,
+            owner_turn: h.ctx.human_input.last_plain_enter(),
         }
     }
 
@@ -4139,7 +4142,7 @@ impl App {
         self.install_tab_session_at(owner, session, parent, Some(kept), false);
     }
 
-    /// [`Self::install_tab_session`] for a worker: its tab lands parked, behind what the window shows, and the sync that follows opens the window's Workers tab when this is its first.
+    /// [`Self::install_tab_session`] for a worker: its tab lands parked and ephemeral (it goes once its task concluded, `App::reap_workers`), behind what the window shows, and the sync that follows opens the window's Workers tab when this is its first.
     pub(crate) fn install_tab_session_parked(
         &mut self,
         owner: WindowId,
@@ -4162,13 +4165,15 @@ impl App {
         parked: bool,
     ) {
         let id = session.id;
-        Self::register_session(&self.store, &session, parent);
+        Self::register_session(&self.store, &session, parent.clone());
         let layout = pane::PaneTree::new(id);
         let mut tab =
             crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &layout)
                 .expect("tab/view identity space");
         tab.parked = parked;
+        tab.ephemeral = parked;
         self.pool_insert(session);
+        self.note_tab_open(id, owner, parked, parent.as_ref(), "new-tab");
         if let Some(ws) = self.windows.get_mut(&owner) {
             // By identity: a shown tab seated at the boundary moves a parked front along.
             let front = behind
@@ -4376,7 +4381,7 @@ impl App {
                 if (from < shown) != (to < shown) {
                     return Err(format!(
                         "tab move: {from} and {to} sit either side of the parked workers \
-                         (from {shown}); a worker leaves them by Move to Tab"
+                         (from {shown}); a worker leaves them by Keep as Tab"
                     ));
                 }
                 self.move_tab(wid, from, to);
@@ -5282,12 +5287,13 @@ impl App {
                     .and_then(crate::tab_model::View::terminal_session)
             })
             .collect::<Vec<_>>();
-        let (tab, was_last) = {
+        let (tab, was_last, was_workers) = {
             let ws = self
                 .windows
                 .get_mut(&wid)
                 .ok_or_else(|| "unknown window".to_string())?;
             let was_last = ws.tab_set.len() == 1;
+            let was_workers = ws.tab_set.home() == Some(tab_id);
             let tab = ws
                 .tab_set
                 .remove(tab_id)
@@ -5299,10 +5305,20 @@ impl App {
                 ws.pending_close = true;
             }
             align_terminal_projection_to_active(ws, &self.view_store);
-            (tab, was_last)
+            (tab, was_last, was_workers)
         };
         if was_last {
             self.stash_deferred_close_attribution(wid);
+        }
+        // The Workers tab closes only with no worker left for it: its Finished rows leave the
+        // window's page with it, or the sync would open it again for them; what they left stays
+        // for their managers to read, as Clear Finished keeps it.
+        if was_workers {
+            self.store
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .retired_workers_mut()
+                .unlist_window(wid);
         }
         self.retiring_edit_leaves_in(wid, |app| {
             for view in tab.root.leaves() {
@@ -5476,6 +5492,7 @@ impl App {
                     focused_path: Vec::new(),
                     zoomed: false,
                     parked: false,
+                    ephemeral: false,
                 },
                 index,
             )?;
@@ -6691,7 +6708,15 @@ impl App {
             crate::self_claim::forget_read(stable.as_str());
             self.end_occupancy_lines_of(stable.as_str());
             if tasked {
-                crate::task_launch::retire_task_file(&stable);
+                // A worker aterm closed keeps its results while its retired row stands.
+                let kept = self
+                    .store
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retired_workers()
+                    .by_sid(&stable)
+                    .is_some();
+                crate::task_launch::retire_task_file(&stable, kept);
             }
             crate::proxy::unpublish_session(&stable);
             crate::connections::sweep_session_closed_in(&self.connections, &stable, &self.store);

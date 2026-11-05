@@ -113,8 +113,7 @@ fn walk(
     children.sort_by_key(std::fs::DirEntry::file_name);
     for child in children {
         let path = child.path();
-        let meta = std::fs::symlink_metadata(&path)?;
-        let ft = meta.file_type();
+        let ft = child.file_type()?;
         if ft.is_symlink() {
             let rel = path.strip_prefix(root).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "path escaped tree root")
@@ -130,12 +129,13 @@ fn walk(
                 io::Error::new(io::ErrorKind::InvalidData, "path escaped tree root")
             })?;
             let rel_bytes = rel_line_bytes(rel);
+            let (fsha, meta) = file_sha256_and_meta(&path, buf)?;
             let mode = if crate::platform::HAS_POSIX_MODES {
                 crate::platform::permission_mode(&meta) & 0o7777
             } else {
                 modes.get(&rel_bytes).copied().unwrap_or(0) & 0o7777
             };
-            let fsha = file_sha256_with(&path, buf)?;
+            // Descriptor fstat from file_sha256_and_meta avoids a separate lstat per file.
             out.push(entry_line(&rel_bytes, mode, &fsha));
         } else {
             // device / fifo / socket — must not be in an extracted bundle.
@@ -256,6 +256,30 @@ fn read_chunks(path: &Path, buf: &mut [u8], mut update: impl FnMut(&[u8])) -> io
             return Ok(());
         }
         update(&buf[..n.min(buf.len())]);
+    }
+}
+
+fn file_sha256_and_meta(path: &Path, buf: &mut [u8]) -> io::Result<(String, std::fs::Metadata)> {
+    let (mut f, meta) = crate::metadata_io::open_regular_with_meta(path)?;
+    let mut h = BulkSha256::new();
+    loop {
+        let n = f.read(&mut *buf)?;
+        if n == 0 {
+            return Ok((h.finalize_hex(), meta));
+        }
+        h.update(&buf[..n.min(buf.len())]);
+    }
+}
+
+pub(crate) fn sha256_opened(mut f: std::fs::File) -> io::Result<String> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut h = BulkSha256::new();
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(h.finalize_hex());
+        }
+        h.update(&buf[..n]);
     }
 }
 

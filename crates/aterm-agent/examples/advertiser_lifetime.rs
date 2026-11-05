@@ -6,7 +6,7 @@
 #[cfg(all(target_os = "macos", debug_assertions))]
 mod probe {
     use std::ffi::CString;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::ops::ControlFlow;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -91,7 +91,7 @@ mod probe {
             .name("advertiser-probe-parent".into())
             .spawn(move || {
                 let mut line = String::new();
-                let read = BufReader::new(output).read_line(&mut line);
+                let read = BufReader::new(output.take(4096)).read_line(&mut line);
                 let _ = reported.send(read.map(|_| line));
             })
             .map_err(|e| e.to_string())?;

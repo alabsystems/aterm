@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests Settings layout and text fitting at narrow window widths (from 22 columns up) across
-//! 1×, 1.5×, and 2× text scales.
+//! Tests Settings layout and text fitting at narrow window widths (from the least view up,
+//! [`narrow_widths`]) across 1×, 1.5×, and 2× text scales.
 
 use super::*;
 
-/// Narrow stress widths and small admitted views; [`least_view`] declares the supported
-/// minimum at each text scale.
-pub(super) const NARROW_WIDTHS: [f32; 6] = [164.0, 178.0, 192.0, 234.0, 276.0, 318.0];
+/// The narrow widths Settings stands at at text scale `scale`, tightest first: its least view's
+/// ([`reachable`]), then 234, 276 and 318 where they stand more than 14pt above it: 210, 234, 276
+/// and 318 at 1×; 232, 276 and 318 at 1.5×; 278 and 318 at 2×. The sweeps that take these widths do
+/// not look narrower; named tests still do ([`reachable`] names where such views are drawn).
+pub(super) fn narrow_widths(scale: f32) -> Vec<f32> {
+    let least = least_view(scale).0;
+    std::iter::once(least)
+        .chain(
+            [234.0, 276.0, 318.0]
+                .into_iter()
+                .filter(|width| *width > least + 14.0),
+        )
+        .collect()
+}
+
 pub(super) const NARROW_HEIGHTS: [f32; 2] = [348.0, 516.0];
 
 /// The windows an 80×24, 102×29, 150×48, 167×36 and 220×60 terminal window gives Settings.
@@ -124,13 +136,13 @@ pub(super) fn spilled_nodes(
 
 /// Plain pages keep their words, names and controls in narrow windows, one walk of each page
 /// serving every check: About's wordmark is whole and its type fits its box on the top screen at
-/// every width from 164pt to 1200pt, every height from 348pt to 900pt and every text size; at 1x
-/// and 2x in every narrow window, About's card of facts paints every name and value whole and
-/// inside its box; a setting name wrapped on Harness, AI and Software Update fills the box it is
-/// drawn in (no line breaks before a word that would fit, except where that lets the last line
-/// hold Changed); Harness's and About's buttons keep their words and stay in their column, and are
-/// drawn; a stacked choice (active tab colour, preferred AI) keeps its words with no ellipsis, a
-/// chip standing in for an empty label, and is listed; and a stacked switch on Keyboard & Input,
+/// every width from the least view's to 1200pt, every height from 348pt to 900pt and every text
+/// size; at 1x and 2x in every narrow window, About's card of facts paints every name and value
+/// whole and inside its box; a setting name wrapped on Harness, AI and Software Update fills the
+/// box it is drawn in (no line breaks before a word that would fit, except where that lets the last
+/// line hold Changed); Harness's and About's buttons keep their words and stay in their column, and
+/// are drawn; a stacked choice (active tab colour, preferred AI) keeps its words with no ellipsis,
+/// a chip standing in for an empty label, and is listed; and a stacked switch on Keyboard & Input,
 /// Security, Windows & Tabs, Software Update and Packages is never wider than its line, its
 /// control's words whole, the page drawing switches.
 #[test]
@@ -141,16 +153,28 @@ fn a_plain_narrow_page_keeps_its_words_names_and_controls() {
     const BUTTONS: &str = "a_button_keeps_its_words_in_a_narrow_column";
     const CHOICE: &str = "a_stacked_choice_keeps_its_words";
     const SWITCH: &str = "a_stacked_switch_is_never_wider_than_its_line";
-    const WORDMARK_WIDTHS: [f32; 9] = [
-        164.0, 178.0, 192.0, 234.0, 276.0, 318.0, 584.0, 744.0, 1_200.0,
-    ];
     const WORDMARK_HEIGHTS: [f32; 4] = [348.0, 420.0, 516.0, 900.0];
-    const STACKED_WIDTHS: [f32; 4] = [178.0, 192.0, 234.0, 276.0];
-    const CHOICE_WIDTHS: [f32; 3] = [178.0, 192.0, 234.0];
     const STACKED_HEIGHT: f32 = 516.0;
     at_each_text_scale(&[1.0, 1.5, 2.0], "plain narrow pages", |scale| {
         // Every check but the wordmark's runs at 1x and 2x only.
         let checked = [1.0, 2.0].contains(&scale);
+        let least = least_view(scale).0;
+        let narrow_widths = narrow_widths(scale);
+        let wordmark_widths: Vec<f32> = narrow_widths
+            .iter()
+            .copied()
+            .chain([584.0, 744.0, 1_200.0])
+            .collect();
+        // The narrow columns a row stacks in, and those a choice stacks in: the least view's at
+        // every scale, however wide 2x text makes it.
+        let up_to = |most: f32| -> Vec<f32> {
+            narrow_widths
+                .iter()
+                .copied()
+                .filter(|width| *width <= most || *width == least)
+                .collect()
+        };
+        let (stacked_widths, choice_widths) = (up_to(276.0), up_to(234.0));
         let mut cases = Vec::new();
         if checked {
             for route in [
@@ -158,7 +182,7 @@ fn a_plain_narrow_page_keeps_its_words_names_and_controls() {
                 SettingsRoute::Ai,
                 SettingsRoute::SoftwareUpdate,
             ] {
-                for width in NARROW_WIDTHS {
+                for width in narrow_widths.iter().copied() {
                     for height in NARROW_HEIGHTS {
                         cases.push((route, width, height));
                     }
@@ -170,19 +194,19 @@ fn a_plain_narrow_page_keeps_its_words_names_and_controls() {
                 SettingsRoute::WindowTabs,
                 SettingsRoute::Packages,
             ] {
-                for width in STACKED_WIDTHS {
+                for width in stacked_widths.iter().copied() {
                     cases.push((route, width, STACKED_HEIGHT));
                 }
             }
         }
-        for width in WORDMARK_WIDTHS {
+        for width in wordmark_widths.iter().copied() {
             for height in WORDMARK_HEIGHTS {
                 cases.push((SettingsRoute::About, width, height));
             }
         }
         on_workers(&cases, "plain narrow pages", |&(route, width, height)| {
             let narrow =
-                checked && NARROW_WIDTHS.contains(&width) && NARROW_HEIGHTS.contains(&height);
+                checked && narrow_widths.contains(&width) && NARROW_HEIGHTS.contains(&height);
             let stacked = checked && height == STACKED_HEIGHT;
             let wordmark = route == SettingsRoute::About;
             let facts = wordmark && narrow;
@@ -207,9 +231,9 @@ fn a_plain_narrow_page_keeps_its_words_names_and_controls() {
                 SettingsRoute::Ai => Some(prefs::EDIT_AI_PREFERRED),
                 _ => None,
             }
-            .filter(|_| stacked && CHOICE_WIDTHS.contains(&width));
+            .filter(|_| stacked && choice_widths.contains(&width));
             let switch = stacked
-                && STACKED_WIDTHS.contains(&width)
+                && stacked_widths.contains(&width)
                 && matches!(
                     route,
                     SettingsRoute::KeyboardInput
@@ -614,9 +638,11 @@ fn a_reset_place_never_costs_a_name_more_than_a_line_of_its_own() {
     at_each_text_scale(&[1.0, 2.0], "reset seat", |scale| {
         let mut faults = Vec::new();
         let mut rows = 0;
-        for width in [234.0, 290.0, 318.0] {
+        for (width, height) in
+            held_to_least(scale, &[(234.0, 600.0), (290.0, 600.0), (318.0, 600.0)])
+        {
             for route in SettingsRoute::ALL {
-                for screen in screens_of(|_, _| {}, route, width, 600.0) {
+                for screen in screens_of(|_, _| {}, route, width, height) {
                     for row in screen
                         .paint
                         .iter()
@@ -787,7 +813,7 @@ fn software_update_keeps_its_words() {
     ];
     at_each_text_scale(&[1.0, 2.0], "Software Update", |scale| {
         for (name, status) in &states {
-            for width in NARROW_WIDTHS.into_iter().chain([744.0]) {
+            for width in narrow_widths(scale).into_iter().chain([744.0]) {
                 for height in NARROW_HEIGHTS {
                     let context = format!("{scale}\u{d7} {name} {width}\u{d7}{height}");
                     let update = UpdateState::from_status(1, "0.1.0", Some(status), false);
@@ -812,9 +838,19 @@ fn software_update_keeps_its_words() {
 fn the_compact_toolbar_keeps_its_words() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "the compact toolbar", |scale| {
         let mut buttons = 0;
-        for width in [164.0_f32, 178.0, 192.0, 234.0, 276.0, 318.0, 420.0, 584.0] {
+        for (width, height) in held_to_least(
+            scale,
+            &[
+                (0.0, 516.0),
+                (234.0, 516.0),
+                (276.0, 516.0),
+                (318.0, 516.0),
+                (420.0, 516.0),
+                (584.0, 516.0),
+            ],
+        ) {
             let context = format!("{scale}\u{d7} {width}");
-            let cx = view_cx_at(width, 516.0);
+            let cx = view_cx_at(width, height);
             let (mut runtime, instance, view) = setup();
             go_to_route(&mut runtime, instance, view, SettingsRoute::KeyboardInput);
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
@@ -906,7 +942,7 @@ fn the_compact_toolbar_keeps_its_words() {
 #[test]
 fn a_stacked_cli_row_keeps_its_whole_detail() {
     at_each_text_scale(&[1.0, 2.0], "stacked CLI detail", |scale| {
-        for width in NARROW_WIDTHS {
+        for width in narrow_widths(scale) {
             let prepare = |runtime: &mut NativeRuntime, _: crate::native_app::ViewId| {
                 assert!(runtime.replace_settings_harness(super::ai::fixture(), 1));
             };
@@ -949,9 +985,9 @@ fn says_it_is_under_way(line: &str) -> bool {
 #[test]
 fn a_page_name_is_whole_in_its_column() {
     at_each_text_scale(&[1.0, 2.0], "page names", |scale| {
-        for width in [164.0, 178.0, 192.0, 234.0] {
+        for (width, height) in held_to_least(scale, &[(0.0, 900.0), (234.0, 900.0)]) {
             for route in SettingsRoute::ALL {
-                let screen = top_screen_of(route, width, 900.0);
+                let screen = top_screen_of(route, width, height);
                 let cut = cut_words(&screen, &["settings/page-heading/"]);
                 assert!(
                     cut.is_empty(),
@@ -966,7 +1002,7 @@ fn a_page_name_is_whole_in_its_column() {
 #[test]
 fn the_packages_page_keeps_its_words() {
     at_each_text_scale(&[1.0, 2.0], "Packages", |scale| {
-        for width in NARROW_WIDTHS.into_iter().chain([744.0]) {
+        for width in narrow_widths(scale).into_iter().chain([744.0]) {
             for (height, live) in [348.0, 900.0]
                 .into_iter()
                 .flat_map(|height| [(height, false), (height, true)])
@@ -999,7 +1035,7 @@ fn the_packages_page_keeps_its_words() {
 #[test]
 fn messages_small_buttons_stay_on_the_page() {
     at_each_text_scale(&[1.0, 2.0], "Messages buttons", |scale| {
-        for width in NARROW_WIDTHS {
+        for width in narrow_widths(scale) {
             let screen = top_screen_of(SettingsRoute::Messages, width, 516.0);
             let prefixes = [
                 "settings/messages/copy-all",
@@ -1019,7 +1055,7 @@ fn harness_keeps_its_words_with_sessions_open() {
         .map_or(SWEEP_WORKERS, |n| n.get().div_ceil(2).max(SWEEP_WORKERS));
     at_each_text_scale(&[1.0, 2.0], "Harness sessions", |scale| {
         let mut windows = Vec::new();
-        for width in NARROW_WIDTHS {
+        for width in narrow_widths(scale) {
             for height in NARROW_HEIGHTS {
                 for (fixture, state) in [
                     ("", super::harness::fixture as fn() -> _),
@@ -1179,7 +1215,7 @@ fn search_results_and_modified_keep_their_words() {
     ];
     at_each_text_scale(&[1.0, 1.5, 2.0], "search results", |scale| {
         let mut wrapped = 0;
-        for width in NARROW_WIDTHS {
+        for width in narrow_widths(scale) {
             for height in NARROW_HEIGHTS {
                 for query in ["cursor", "zzqx", ""] {
                     let context = format!("{scale}\u{d7} {width}\u{d7}{height} {query:?}");
@@ -1238,14 +1274,14 @@ fn an_empty_field_drops_no_word_where_its_row_can_grow() {
                 "cursor_trail_style = \"comet\"\n",
             ),
         ] {
-            for width in [178.0, 234.0] {
+            for (width, height) in held_to_least(scale, &[(0.0, 348.0), (234.0, 348.0)]) {
                 let mut lab = super::modified::Lab::new(source);
                 lab.state_mut().navigate(route);
                 let mut page = 0;
                 loop {
                     lab.state_mut().scroll_page_to(page);
                     lab.state_mut().page_reveal = None;
-                    let screen = lab.compile(width, 348.0);
+                    let screen = lab.compile(width, height);
                     for node in &screen.paint {
                         let UiContent::TextField(field) = &node.content else {
                             continue;
@@ -1567,7 +1603,7 @@ fn a_narrow_field_gives_up_its_hint_never_its_words() {
 #[test]
 fn the_fleet_fields_words_keep_it_a_field() {
     at_each_text_scale(&[1.0, 2.0], "fleet words", |scale| {
-        for width in NARROW_WIDTHS {
+        for width in narrow_widths(scale) {
             for height in NARROW_HEIGHTS {
                 let context = format!("{scale}\u{d7} {width}x{height}");
                 let (mut runtime, instance, view) = every_page_runtime();
@@ -1788,7 +1824,7 @@ fn messages_keeps_its_words_with_a_log() {
         "settings/messages/filter/warn",
     ];
     at_each_text_scale(&[1.0, 1.5, 2.0], "Messages with a log", |scale| {
-        for width in NARROW_WIDTHS {
+        for width in narrow_widths(scale) {
             for height in NARROW_HEIGHTS {
                 for open in [false, true] {
                     let context = format!("{scale}\u{d7} {width}\u{d7}{height} open={open}");
@@ -1918,7 +1954,7 @@ fn the_manual_page_s_buttons_keep_their_words() {
         "settings/manual/copy-path",
     ];
     at_each_text_scale(&[1.0, 2.0], "the Manual page's buttons", |scale| {
-        let sizes = NARROW_WIDTHS
+        let sizes = narrow_widths(scale)
             .into_iter()
             .flat_map(|width| NARROW_HEIGHTS.map(|height| (width, height)))
             .chain(WIDE_SIZES);
@@ -2235,7 +2271,7 @@ fn every_pages_first_frame_is_its_second() {
         let windows = SettingsRoute::ALL
             .into_iter()
             .flat_map(|route| {
-                NARROW_WIDTHS
+                narrow_widths(scale)
                     .into_iter()
                     .flat_map(|width| NARROW_HEIGHTS.map(|height| (width, height)))
                     .chain(WIDE_SIZES)
@@ -2361,7 +2397,7 @@ fn first_apart(was: &crate::native_ui::CompiledUi, now: &crate::native_ui::Compi
 fn the_retired_packages_note_keeps_its_words_in_a_narrow_column() {
     let note = atpkg::config::auto_update_note(false, Some(true));
     at_each_text_scale(&[1.0, 2.0], "the retired note", |scale| {
-        for width in NARROW_WIDTHS.into_iter().chain([474.0, 744.0]) {
+        for width in narrow_widths(scale).into_iter().chain([474.0, 744.0]) {
             let context = format!("{scale}\u{d7} {width}");
             let prepare = |runtime: &mut NativeRuntime, _: crate::native_app::ViewId| {
                 let packages = packages_state_with_activity_policy(2, false)
@@ -2469,7 +2505,7 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
     };
     at_each_text_scale(&[1.0, 2.0], "every control and word", |scale| {
         for route in routes {
-            let mut sizes: Vec<(f32, f32)> = NARROW_WIDTHS
+            let mut sizes: Vec<(f32, f32)> = narrow_widths(scale)
                 .into_iter()
                 .flat_map(|width| NARROW_HEIGHTS.map(|height| (width, height)))
                 .chain(WIDE_SIZES[..2].iter().copied())
@@ -3025,12 +3061,12 @@ fn words_cut(
 
 #[test]
 fn every_page_keeps_its_words_and_every_control_whole_on_some_screen() {
-    let sizes: Vec<(f32, f32)> = NARROW_WIDTHS
-        .into_iter()
-        .flat_map(|width| NARROW_HEIGHTS.map(|height| (width, height)))
-        .chain(WIDE_SIZES[..3].iter().copied())
-        .collect();
     at_each_text_scale(&[1.0, 1.5, 2.0], "every page", |scale| {
+        let sizes: Vec<(f32, f32)> = narrow_widths(scale)
+            .into_iter()
+            .flat_map(|width| NARROW_HEIGHTS.map(|height| (width, height)))
+            .chain(WIDE_SIZES[..3].iter().copied())
+            .collect();
         // Each page under each source, but a source that lays the page out as the first does
         // (a theme that changes only its colours): its every screen would repeat the first's.
         let pages: Vec<(SettingsRoute, &str)> = SettingsRoute::ALL
@@ -3718,7 +3754,7 @@ fn the_cursor_link_says_its_whole_label() {
 #[test]
 fn wallpaper_keeps_its_status_and_its_buttons() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "wallpaper", |scale| {
-        for (width, height) in NARROW_WIDTHS
+        for (width, height) in narrow_widths(scale)
             .into_iter()
             .map(|width| (width, 348.0))
             .chain(WIDE_SIZES[..3].iter().copied())
@@ -3743,7 +3779,7 @@ fn a_path_field_keeps_its_file_name() {
             ("/Users//someone/.config/aterm", "/Users//someone"),
             (long, "/Users//someone"),
         ] {
-            for width in NARROW_WIDTHS {
+            for width in narrow_widths(scale) {
                 let context = format!("{scale}\u{d7} {width} {folder}");
                 let (mut runtime, instance, view) = every_page_runtime();
                 {
@@ -3899,34 +3935,33 @@ fn a_pinned_summary_never_starves_the_list() {
 #[test]
 fn a_narrow_row_keeps_its_words_and_its_controls_in_its_card() {
     at_each_text_scale(&[1.5, 2.0], "narrow rows", |scale| {
-        for width in [178.0, 192.0] {
-            for route in [
-                SettingsRoute::Home,
-                SettingsRoute::Sound,
-                SettingsRoute::Appearance,
-                SettingsRoute::Terminal,
-                SettingsRoute::TabColor,
-                SettingsRoute::TextFonts,
-            ] {
-                let context = format!("{scale}\u{d7} {route:?} {width}");
-                let whole = whole_words_of(setup, route);
-                for screen in screens_of(|_, _| {}, route, width, 348.0) {
-                    let failures = screen.fit_failures();
-                    assert!(failures.is_empty(), "{context}: {failures:#?}");
-                    let cut = words_cut(
-                        &screen,
-                        &whole,
-                        &[
-                            "settings/control/",
-                            "settings/color-open/",
-                            "settings/color/",
-                            "settings/display-face/",
-                        ],
-                    );
-                    assert!(cut.is_empty(), "{context}: {cut:#?}");
-                    let spilled = spilled_nodes(&screen, &["settings/display-face/"]);
-                    assert!(spilled.is_empty(), "{context}: {spilled:#?}");
-                }
+        let width = least_view(scale).0;
+        for route in [
+            SettingsRoute::Home,
+            SettingsRoute::Sound,
+            SettingsRoute::Appearance,
+            SettingsRoute::Terminal,
+            SettingsRoute::TabColor,
+            SettingsRoute::TextFonts,
+        ] {
+            let context = format!("{scale}\u{d7} {route:?} {width}");
+            let whole = whole_words_of(setup, route);
+            for screen in screens_of(|_, _| {}, route, width, 348.0) {
+                let failures = screen.fit_failures();
+                assert!(failures.is_empty(), "{context}: {failures:#?}");
+                let cut = words_cut(
+                    &screen,
+                    &whole,
+                    &[
+                        "settings/control/",
+                        "settings/color-open/",
+                        "settings/color/",
+                        "settings/display-face/",
+                    ],
+                );
+                assert!(cut.is_empty(), "{context}: {cut:#?}");
+                let spilled = spilled_nodes(&screen, &["settings/display-face/"]);
+                assert!(spilled.is_empty(), "{context}: {spilled:#?}");
             }
         }
     });
@@ -3935,28 +3970,27 @@ fn a_narrow_row_keeps_its_words_and_its_controls_in_its_card() {
 #[test]
 fn the_themes_page_keeps_its_words_and_buttons_in_its_panel() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "themes narrow", |scale| {
-        for width in [178.0, 192.0] {
-            for height in NARROW_HEIGHTS {
-                let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
-                let whole = whole_words_of(setup, SettingsRoute::Themes);
-                for screen in screens_of(|_, _| {}, SettingsRoute::Themes, width, height) {
-                    let failures = screen.fit_failures();
-                    assert!(failures.is_empty(), "{context}: {failures:#?}");
-                    let cut = words_cut(
-                        &screen,
-                        &whole,
-                        &[
-                            "settings/showcase/card/",
-                            "settings/showcase/footer/",
-                            "settings/showcase/customize",
-                            "settings/showcase/pack",
-                            "settings/showcase/open-folder",
-                        ],
-                    );
-                    assert!(cut.is_empty(), "{context}: {cut:#?}");
-                    let spilled = spilled_nodes(&screen, &["settings/showcase/"]);
-                    assert!(spilled.is_empty(), "{context}: {spilled:#?}");
-                }
+        let width = least_view(scale).0;
+        for height in NARROW_HEIGHTS {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let whole = whole_words_of(setup, SettingsRoute::Themes);
+            for screen in screens_of(|_, _| {}, SettingsRoute::Themes, width, height) {
+                let failures = screen.fit_failures();
+                assert!(failures.is_empty(), "{context}: {failures:#?}");
+                let cut = words_cut(
+                    &screen,
+                    &whole,
+                    &[
+                        "settings/showcase/card/",
+                        "settings/showcase/footer/",
+                        "settings/showcase/customize",
+                        "settings/showcase/pack",
+                        "settings/showcase/open-folder",
+                    ],
+                );
+                assert!(cut.is_empty(), "{context}: {cut:#?}");
+                let spilled = spilled_nodes(&screen, &["settings/showcase/"]);
+                assert!(spilled.is_empty(), "{context}: {spilled:#?}");
             }
         }
     });
@@ -4312,7 +4346,7 @@ fn cjk_settings_copy_wraps_between_its_characters() {
 fn a_cjk_message_title_is_painted_at_every_narrow_width() {
     let title = "設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません";
     at_each_text_scale(&[1.0, 2.0], "CJK message", |scale| {
-        for width in NARROW_WIDTHS {
+        for width in narrow_widths(scale) {
             for height in NARROW_HEIGHTS {
                 let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
                 let (mut runtime, instance, view) = super::setup_with_messages();
@@ -4418,16 +4452,26 @@ fn sheet_screens(
 
 /// Every category's name is whole on the compact category sheet, and no two paint alike: a cell
 /// gives up its arrow, then its pictogram, before its name, and the name takes the lines it
-/// needs, a word broken only where it is wider than a line. At every compact width from the
-/// 164pt window floor, at 1×, 1.5× and 2× text, every category is on some screen.
+/// needs, a word broken only where it is wider than a line. At compact widths from the least
+/// view's ([`held_to_least`]), at 1×, 1.5× and 2× text, every category is on some screen.
 #[test]
 fn every_category_name_is_whole_and_its_own() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "category names", |scale| {
         let mut faults = Vec::new();
-        for width in [164.0_f32, 178.0, 192.0, 234.0, 276.0, 318.0, 420.0, 584.0] {
+        for (width, height) in held_to_least(
+            scale,
+            &[
+                (0.0, 348.0),
+                (234.0, 348.0),
+                (276.0, 348.0),
+                (318.0, 348.0),
+                (420.0, 348.0),
+                (584.0, 348.0),
+            ],
+        ) {
             let context = format!("{scale}\u{d7} {width}");
             let mut painted = BTreeMap::<String, String>::new();
-            for compiled in sheet_screens(SettingsRoute::Home, width, 348.0) {
+            for compiled in sheet_screens(SettingsRoute::Home, width, height) {
                 let cut = cut_words(&compiled, &["settings/categories/"]);
                 if !cut.is_empty() {
                     faults.push(format!("{context}: {cut:#?}"));
@@ -4469,10 +4513,10 @@ fn every_category_name_is_whole_and_its_own() {
     });
 }
 
-/// The compact toolbar holds every control whole: at every compact width from the 164pt floor
-/// to 60 columns, at every text size, on a page and on the category sheet, the leading button,
-/// the title and Search are each whole inside the bar (the toolbar less its insets), each
-/// button a touch target, their words whole.
+/// The compact toolbar holds every control whole: at every compact width from the least view's
+/// ([`held_to_least`]) to 60 columns, at every text size, on a page and on the category sheet, the
+/// leading button, the title and Search are each whole inside the bar (the toolbar less its
+/// insets), each button a touch target, their words whole.
 #[test]
 fn the_compact_toolbar_holds_every_control_whole() {
     at_each_text_scale(
@@ -4480,8 +4524,11 @@ fn the_compact_toolbar_holds_every_control_whole() {
         "the toolbar's controls",
         |scale| {
             let mut faults = Vec::new();
-            for columns in (20..=60).step_by(2) {
-                let width = 164.0 + (columns - 20) as f32 * 7.0;
+            let sizes: Vec<(f32, f32)> = (20..=60)
+                .step_by(2)
+                .map(|columns| (164.0 + (columns - 20) as f32 * 7.0, 348.0))
+                .collect();
+            for (width, height) in held_to_least(scale, &sizes) {
                 for sheet in [false, true] {
                     let context = format!("{scale}\u{d7} {width} sheet:{sheet}");
                     let (mut runtime, instance, view) = setup();
@@ -4499,7 +4546,7 @@ fn the_compact_toolbar_holds_every_control_whole() {
                             .unwrap();
                     }
                     let compiled =
-                        compile_settings_view(&runtime, instance, view, &view_cx_at(width, 348.0));
+                        compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
                     let Some(toolbar) = compiled.semantic(&UiKey::new("settings/compact-toolbar"))
                     else {
                         continue;
@@ -4621,16 +4668,14 @@ fn every_category_is_whole_on_some_screen_of_a_short_sheet() {
 fn every_page_is_named_once_on_screen() {
     let windows = [
         (1.0, 318.0, 208.0),
-        (1.0, 178.0, 210.0),
+        (1.0, 210.0, 208.0),
         (1.0, 584.0, 210.0),
         (1.0, 849.0, 513.0),
         (2.0, 584.0, 348.0),
         (2.0, 444.0, 292.0),
         (2.0, 318.0, 348.0),
-        (2.0, 234.0, 348.0),
-        (2.0, 178.0, 348.0),
-        (2.0, 234.0, 180.0),
-        (2.0, 178.0, 180.0),
+        (2.0, 278.0, 348.0),
+        (2.0, 278.0, 264.0),
     ];
     at_each_text_scale(&[1.0, 2.0], "page names", |scale| {
         let mut faults = Vec::new();

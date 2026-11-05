@@ -392,7 +392,7 @@ mod tests {
             temporal: Arc::new(Mutex::new(crate::temporal::TemporalRecorder::new())),
             byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
             turns: observed.turns,
-            meta: Mutex::new(crate::session_timeline::SessionMeta::default()),
+            meta: Arc::default(),
             timeline: observed.timeline,
             fabric: std::sync::Arc::default(),
             idem: Default::default(),
@@ -414,6 +414,7 @@ mod tests {
             witness: Default::default(),
             fenced_writes: Default::default(),
             native_policy: Default::default(),
+            spawn_mark: Default::default(),
         });
         SessionHandle {
             sid,

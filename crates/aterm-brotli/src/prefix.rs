@@ -79,19 +79,24 @@ impl Code {
             }
         }
         let root = 1usize << ROOT;
-        let mut sub_bits = vec![0u32; root];
+        let mut sub_bits = [0u32; 1 << ROOT];
         for &(r, l) in &codes {
             if l > ROOT {
                 let p = (r as usize) & (root - 1);
                 sub_bits[p] = sub_bits[p].max(l - ROOT);
             }
         }
-        let mut table = vec![0u32; root];
-        for p in 0..root {
-            if sub_bits[p] > 0 {
-                let at = table.len() as u32;
-                table[p] = LINK | (sub_bits[p] << 24) | at;
-                table.resize(table.len() + (1 << sub_bits[p]), 0);
+        let total_len = root
+            + sub_bits
+                .iter()
+                .map(|&b| if b > 0 { 1usize << b } else { 0 })
+                .sum::<usize>();
+        let mut table = vec![0u32; total_len];
+        let mut next_at = root;
+        for (p, &b) in sub_bits.iter().enumerate() {
+            if b > 0 {
+                table[p] = LINK | (b << 24) | next_at as u32;
+                next_at += 1 << b;
             }
         }
         for (s, &(r, l)) in codes.iter().enumerate() {

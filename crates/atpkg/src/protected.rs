@@ -4,8 +4,9 @@
 //! macOS TCC-protected folders ([`under_protected_root`](crate::protected::under_protected_root), [`HOME_FOLDERS`](crate::protected::HOME_FOLDERS),
 //! [`LIBRARY_DOMAINS`](crate::protected::LIBRARY_DOMAINS), [`aterm_containment::sbpl::APP_DATA_ROOTS`], [`ABSOLUTE_ROOTS`](crate::protected::ABSOLUTE_ROOTS)).
 
+use std::borrow::Cow;
 use std::ffi::OsStr;
-use std::path::{Component, Components, Path};
+use std::path::{Component, Components, Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 #[path = "protected_mac.rs"]
@@ -65,9 +66,33 @@ pub const LIBRARY_DOMAINS: &[(&str, &str)] =
 /// Roots that are protected wherever `$HOME` is.
 pub const ABSOLUTE_ROOTS: &[&str] = &["/Volumes"];
 
-/// Whether `path` lies at or under a root macOS guards with a consent dialog.
+/// macOS's data volume: its firmlinks (`/Users`, `/Volumes`, `/private`, …) reach each folder of
+/// it at a `/`-rooted spelling too, so `/System/Volumes/Data/Users//x/Documents` is
+/// `/Users//x/Documents` before any look.
+const DATA_VOLUME: &str = "/System/Volumes/Data";
+
+/// The spellings of `path` that name one folder before any look ([`DATA_VOLUME`]): as written
+/// and, under the data volume, at its `/`-rooted spelling.
+fn spellings(path: &Path) -> impl Iterator<Item = Cow<'_, Path>> {
+    let rooted = relative_under(Path::new(DATA_VOLUME), path)
+        .map(|rest| Cow::Owned(PathBuf::from("/").join(rest.as_path())));
+    std::iter::once(Cow::Borrowed(path)).chain(rooted)
+}
+
+/// Whether `judge` holds for `home` and `path` at any of their [`spellings`].
+fn any_spelling(home: &Path, path: &Path, judge: fn(&Path, &Path) -> bool) -> bool {
+    spellings(home).any(|home| spellings(path).any(|path| judge(&home, &path)))
+}
+
+/// Whether `path` lies at or under a root macOS guards with a consent dialog, at any spelling
+/// macOS resolves to that root before a look (case, Unicode form, the data volume's firmlinks).
 #[must_use]
 pub fn under_protected_root(home: &Path, path: &Path) -> bool {
+    any_spelling(home, path, protected_as_spelled)
+}
+
+/// [`under_protected_root`] for one spelling of `home` and `path`.
+fn protected_as_spelled(home: &Path, path: &Path) -> bool {
     if ABSOLUTE_ROOTS
         .iter()
         .any(|root| relative_under(Path::new(root), path).is_some())
@@ -98,12 +123,17 @@ pub fn under_protected_root(home: &Path, path: &Path) -> bool {
     };
     LIBRARY_DOMAINS.iter().any(|(lib, domain)| {
         component_eq(first, OsStr::new(lib)) && component_eq(second, OsStr::new(domain))
-    }) || under_app_data(home, path)
+    }) || app_data_as_spelled(home, path)
 }
 
 /// Whether `path` is under a file-provider domain ([`under_protected_root`], [`LIBRARY_DOMAINS`]).
 #[must_use]
 pub fn under_file_provider_domain(home: &Path, path: &Path) -> bool {
+    any_spelling(home, path, file_provider_as_spelled)
+}
+
+/// [`under_file_provider_domain`] for one spelling of `home` and `path`.
+fn file_provider_as_spelled(home: &Path, path: &Path) -> bool {
     let Some(rest) = relative_under(home, path) else {
         return false;
     };
@@ -125,6 +155,11 @@ pub fn under_file_provider_domain(home: &Path, path: &Path) -> bool {
 /// Whether `path` lies under an app-data root ([`under_file_provider_domain`], [`HOME_FOLDERS`]).
 #[must_use]
 pub fn under_app_data(home: &Path, path: &Path) -> bool {
+    any_spelling(home, path, app_data_as_spelled)
+}
+
+/// [`under_app_data`] for one spelling of `home` and `path`.
+fn app_data_as_spelled(home: &Path, path: &Path) -> bool {
     let Some(rest) = relative_under(home, path) else {
         return false;
     };
@@ -149,6 +184,8 @@ mod mac_alias_tests {
             "/USERS/caseuser/lIbRaRy/cLoUdStOrAgE/dots",
             "/Users//CaseUser/LIBRARY/GROUP CONTAINERS/dots",
             "/volumes/External/dots",
+            "/system/volumes/DATA/users/caseuser/DOCUMENTS/dots",
+            "/SYSTEM/Volumes/data/VOLUMES/External",
         ] {
             assert!(under_protected_root(home, Path::new(path)), "{path}");
         }
@@ -339,6 +376,48 @@ mod tests {
                 !under_app_data(&home, Path::new(p)),
                 "{p} must not match under_app_data"
             );
+        }
+    }
+
+    /// A guarded folder at the data volume's spelling is guarded: macOS's firmlinks reach
+    /// `/System/Volumes/Data/Users//x/Documents` as `/Users//x/Documents`, and a home spelled either
+    /// way guards the same folders. Negative control: an unguarded folder at that spelling, the
+    /// volume itself, and folders that merely resemble it stay clear.
+    #[test]
+    fn a_guarded_folder_at_the_data_volumes_spelling_is_guarded() {
+        let home = Path::new("/Users//someone");
+        let data = Path::new("/System/Volumes/Data/Users//someone");
+        for p in [
+            "/System/Volumes/Data/Users//someone/Documents/notes.md",
+            "/System/Volumes/Data/Users//someone/Library/CloudStorage/x",
+            "/System/Volumes/Data/Users//someone/Library/Containers/com.apple.Notes",
+            "/System/Volumes/Data/Volumes/External",
+            "/System/Volumes/Data/Users//someone/src/../Desktop",
+        ] {
+            assert!(under_protected_root(home, Path::new(p)), "{p}");
+        }
+        assert!(under_protected_root(
+            data,
+            Path::new("/Users//someone/Desktop/x")
+        ));
+        assert!(under_file_provider_domain(
+            home,
+            Path::new("/System/Volumes/Data/Users//someone/Library/Mobile Documents/x")
+        ));
+        assert!(under_app_data(
+            data,
+            Path::new("/Users//someone/Library/Group Containers/x")
+        ));
+        for p in [
+            "/System/Volumes/Data",
+            "/System/Volumes/Data/Users//someone",
+            "/System/Volumes/Data/Users//someone/src/Documents",
+            "/System/Volumes/Data/Users//other/Documents",
+            "/System/Volumes/Datax/Users//someone/Documents",
+            "/System/Volumes/Preboot/Volumes/x",
+            "/private/System/Volumes/Data/Volumes/x",
+        ] {
+            assert!(!under_protected_root(home, Path::new(p)), "{p}");
         }
     }
 }

@@ -116,17 +116,30 @@ fn valid_subnet(subnet: &str) -> bool {
 }
 
 fn stay_line(stay: &Stay) -> String {
-    let opt = |s: Option<String>| s.unwrap_or_else(|| "-".to_owned());
-    format!(
-        "{} {} {} {} {} {} {}",
-        stay.start_ms,
-        opt(stay.end_ms.map(|ms| ms.to_string())),
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    let _ = write!(out, "{} ", stay.start_ms);
+    match stay.end_ms {
+        Some(ms) => {
+            let _ = write!(out, "{ms} ");
+        }
+        None => out.push_str("- "),
+    }
+    let _ = write!(
+        out,
+        "{} {} {} ",
         stay.at.word(),
-        opt(stay.network.as_ref().map(|id| id.as_str().to_owned())),
-        opt(stay.subnet.clone()),
-        opt(stay.gateway.map(|gw| gw.to_string())),
-        u8::from(stay.from_start)
-    )
+        stay.network.as_ref().map_or("-", NetworkId::as_str),
+        stay.subnet.as_deref().unwrap_or("-"),
+    );
+    match stay.gateway {
+        Some(gw) => {
+            let _ = write!(out, "{gw} ");
+        }
+        None => out.push_str("- "),
+    }
+    let _ = write!(out, "{}", u8::from(stay.from_start));
+    out
 }
 
 fn parse_stay(text: &str) -> Option<Stay> {
@@ -196,28 +209,29 @@ fn quoted(text: &str) -> String {
 /// The record's text.
 #[must_use]
 pub fn format(written: &Written) -> String {
+    use std::fmt::Write as _;
     let mut out = format!(
         "# aterm's network place: the keeper's memory (aterm-netplace). Rewritten whole; never edit.\n\
          schema = {SCHEMA}\nrevision = {}\n",
         written.revision
     );
     if let Some(pid) = written.keeper_pid {
-        out.push_str(&format!("keeper_pid = {pid}\n"));
+        let _ = writeln!(out, "keeper_pid = {pid}");
     }
     if let Some(ms) = written.keeper_started_ms {
-        out.push_str(&format!("keeper_started_ms = {ms}\n"));
+        let _ = writeln!(out, "keeper_started_ms = {ms}");
     }
-    out.push_str(&format!("written_ms = {}\n", written.written_ms));
+    let _ = writeln!(out, "written_ms = {}", written.written_ms);
     if let Some(path) = &written.record.path {
-        out.push_str(&format!("path = {}\n", quoted(&path_line(path))));
+        let _ = writeln!(out, "path = {}", quoted(&path_line(path)));
     }
     out.push_str("stays = [\n");
     for stay in &written.record.stays {
-        out.push_str(&format!("  {},\n", quoted(&stay_line(stay))));
+        let _ = writeln!(out, "  {},", quoted(&stay_line(stay)));
     }
     out.push_str("]\nremembered = [\n");
     for known in &written.record.remembered {
-        out.push_str(&format!("  {},\n", quoted(&known_line(known))));
+        let _ = writeln!(out, "  {},", quoted(&known_line(known)));
     }
     out.push_str("]\n");
     out
@@ -299,7 +313,12 @@ pub fn parse(text: &str) -> Option<Written> {
 /// The record in `dir` ([`dir`]); `None` where it is missing, not private, too large or unread.
 #[must_use]
 pub fn read(dir: &Path) -> Option<Written> {
-    let bytes = aterm_uds::private_file::read_private(dir, FILE, MAX).ok()?;
+    let judged = aterm_uds::private_file::JudgedDir::judge(dir).ok()?;
+    read_in(&judged)
+}
+
+pub(crate) fn read_in(judged: &aterm_uds::private_file::JudgedDir<'_>) -> Option<Written> {
+    let bytes = judged.read(FILE, MAX).ok()?;
     parse(std::str::from_utf8(&bytes).ok()?)
 }
 

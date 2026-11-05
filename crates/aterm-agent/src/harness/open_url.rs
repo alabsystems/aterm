@@ -191,9 +191,12 @@ pub fn write_outcome(path: &Path, met: &Met) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
-    if let Ok(mut file) = opts.open(path) {
+    if let Ok(mut file) = opts.open(path)
+        && file.metadata().is_ok_and(|m| m.is_file())
+    {
         let _ = writeln!(file, "{}", met.line());
     }
 }
@@ -206,7 +209,7 @@ pub fn read_outcome(path: &Path) -> Option<Met> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let file = opts.open(path).ok()?;
     let meta = file.metadata().ok()?;
@@ -3534,7 +3537,14 @@ pub(super) fn curl_output(
 }
 
 const CURL_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// How long one curl run, its input and output included, may take.
+#[cfg(not(test))]
 const CURL_WAIT_BUDGET: Duration = Duration::from_secs(30);
+/// How long one curl run, its input and output included, may take: the unit tests' curls (the
+/// installed one on a `file://` URL, a stand-in script, `sh`) exit on their own, so a first exec
+/// a loaded machine holds is waited for by the hang detector.
+#[cfg(test)]
+const CURL_WAIT_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 fn curl_output_with(
     program: impl AsRef<std::ffi::OsStr>,

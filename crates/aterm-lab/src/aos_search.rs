@@ -16,30 +16,22 @@ use aterm_aos::wire::WireFault;
 use aterm_effects::aos_momentum::bundle::{
     BUNDLE_DOMAIN, BUNDLE_MAGIC, BundleField, BundleRefusal, CandidateBundle, UncheckedBundle,
 };
-use aterm_effects::aos_momentum::dist::{ClaimKind, Refusal};
-use aterm_effects::aos_momentum::lease::LIMITS_V1;
-use aterm_effects::aos_momentum::m4::{
-    CheckLevel, Compared, DistNoOutcome, Evaluator, NoOutcome, Selection, Serial, Spread,
-};
+use aterm_effects::aos_momentum::m4::{Compared, Evaluator, NoOutcome, Selection, Serial, Spread};
 use aterm_effects::aos_momentum::policy::{MAX_DISTINCT, MAX_ROUNDS, PolicyRefusal, Totals};
 use aterm_effects::aos_momentum::search::{
     FileProposer, GridProposer, Mode, Proposer, ProposerId, SearchStats, TrainFeedback,
 };
 
-use crate::aos_workers::{
-    Fault, Phase, Pool, PoolArgs, PoolReport, Stepped, Timed, available, percentiles, say,
-    say_built,
-};
-use crate::instance::{take_flag, take_value, take_values};
+use crate::instance::{take_flag, take_value};
 use crate::lab_build::{LAB_BUILD, check_build};
 use crate::paths::{from_caller, paths};
-use crate::spread::Threads;
+use crate::spread::{Phase, Stepped, Threads, available, say, say_built};
 use crate::{Fail, Res};
 
 /// The verb's own help (`aos-search --help`).
 pub const HELP: &str = "\
 usage: targo --unverified lab aos-search [--grid] [--plans FILE] --out DIR [--toolchain LINE]
-                                         [--threads N | --workers N [--check dominance|all]]
+                                         [--threads N]
        targo --unverified lab aos-search --verify FILE
 
 Aos M4's candidate search, in process (no aterm runs, no window opens): the M4 evaluator under the pinned policy
@@ -55,33 +47,15 @@ the wall time and the events the evaluator stepped. One search per proposer, gri
   --toolchain LINE  the toolchain line each bundle declares, e.g. \"$(targo --unverified --version)\" (default: this
                     lab's build string)
   --threads N       judge each round's distinct candidates on N threads: the local search, its mode `search`
-  --workers N       judge them as jobs in N worker processes of this lab (at most 16 and this host's parallelism;
-                    design §11): a worker's reply is a claim, checked here before the held-out split is read, and
-                    any contradiction, protocol fault, exhaustion or worker shortage voids the command
-  --check LEVEL     with --workers: `dominance` (the default: every refusal re-judged on its prefix, the claimed best
-                    in full, every other admitted claim until the winner dominates it; the bundle's mode is
-                    `distributed`, and its admitted count rests on workers' claims) or `all` (every admitted claim
-                    judged in full; mode `search`)
-  --lease-ms MS     (debug builds, with --workers) the lease window, for tests
-  --hello-ms MS     (debug builds, with --workers) how long a worker may take from its spawn to say hello, for tests:
-                    a test sets it past the run, so a loaded host's slow evaluator build is judged as a stall
-  --grace-ms MS     (debug builds, with --workers) the drain grace after a Cancel, for tests: a test sets it past
-                    the run, so a slow worker's late work is judged however loaded the host
-  --frames          (debug builds) say each step the run takes on stderr, for tests' hang detector: with --workers,
-                    each worker frame taken and its step, and each stretch of the coordinator's own work after a
-                    search's last claim (check, held-out, verify) as it begins; without, the evaluator built, each
-                    candidate trained, and the winner's held-out read and verify as each begins
-  --fault SPEC      (debug builds, with --workers; repeatable) a test fault armed on every worker: NAME@G.S.A[:K]
-                    on search serial G, slot S, attempt A (kill, hang and slow take :K; late, late-lie, dup,
-                    dup-lie, close-lie, lie-refusal, lie-best, inflate, garbage, flood do not), or foreign@W
+  --frames          (debug builds) say each step the run takes on stderr, for tests' hang detector: the evaluator
+                    built, each candidate trained, and the winner's held-out read and verify as each begins
   --verify FILE     no search: decode the bundle FILE and verify it (CandidateBundle::verify_spread on every core, every row re-evaluated)
                     under an evaluator of this lab's build; a bundle of another build is refused ForeignBuild, and one
                     of a dirty build DirtyBuild, before any evaluator is built. One line per check (pass, fail, not-run,
                     none or declared), then `aos-search verify=pass|fail reason=...`
 
 exit: 0 every search had a winner and every bundle verified and was written; 1 this lab's build names no commit, a
-search had no outcome, a bundle did not verify, a file could not be written, or the command's distributed work is void
-(every bundle it wrote is removed); 2 usage; 128+N interrupted by signal N
+search had no outcome, a bundle did not verify, or a file could not be written; 2 usage
 exit (--verify): 0 the bundle verified; 1 it was refused (the reason named); 2 usage, or FILE cannot be read
 ";
 
@@ -104,10 +78,6 @@ pub struct Args {
     pub toolchain: String,
     /// `--threads N`: the local search over N threads.
     pub threads: Option<usize>,
-    /// `--workers N` and its debug overrides.
-    pub workers: Option<PoolArgs>,
-    /// `--check`, with `--workers`.
-    pub check: CheckLevel,
     /// `--frames` (debug builds): the run says its steps on stderr, for tests' hang detector.
     pub frames: bool,
 }
@@ -115,7 +85,7 @@ pub struct Args {
 /// The verb's arguments. Pure.
 /// # Errors
 /// A usage error: an unknown word, a flag without its value or with a bad one, no proposer, no
-/// `--out`, flags that exclude or need each other, or a debug-only flag in a release build.
+/// `--out`, or a debug-only flag in a release build.
 pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     let mut a = args.to_vec();
     let grid = take_flag(&mut a, "--grid");
@@ -123,12 +93,6 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     let out = take_value(&mut a, "--out")?;
     let toolchain = take_value(&mut a, "--toolchain")?;
     let threads = take_value(&mut a, "--threads")?;
-    let workers = take_value(&mut a, "--workers")?;
-    let check = take_value(&mut a, "--check")?;
-    let lease_ms = take_value(&mut a, "--lease-ms")?;
-    let hello_ms = take_value(&mut a, "--hello-ms")?;
-    let grace_ms = take_value(&mut a, "--grace-ms")?;
-    let faults = take_values(&mut a, "--fault")?;
     let frames = take_flag(&mut a, "--frames");
     if let Some(extra) = a.first() {
         return Err(Fail::usage(format!(
@@ -147,84 +111,29 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
             "aos-search: --toolchain needs a non-empty line",
         ));
     }
-    let count = |flag: &str, v: &str, max: usize| match v
-        .bytes()
-        .all(|b| b.is_ascii_digit())
-        .then(|| v.parse::<usize>().ok())
-        .flatten()
-    {
-        Some(n) if (1..=max).contains(&n) => Ok(n),
-        _ => Err(Fail::usage(format!(
-            "aos-search: {flag} takes 1 to {max}, not '{v}'"
-        ))),
-    };
-    let threads = threads.map(|v| count("--threads", &v, 256)).transpose()?;
-    let most = available().min(LIMITS_V1.max_workers);
-    let workers = workers.map(|v| count("--workers", &v, most)).transpose()?;
-    if threads.is_some() && workers.is_some() {
-        return Err(Fail::usage(
-            "aos-search: --threads and --workers are exclusive (aos-search --help)",
-        ));
-    }
-    let check = match (check.as_deref(), workers) {
-        (None, _) => CheckLevel::Dominance,
-        (Some(_), None) => return Err(Fail::usage("aos-search: --check is for --workers")),
-        (Some("dominance"), Some(_)) => CheckLevel::Dominance,
-        (Some("all"), Some(_)) => CheckLevel::All,
-        (Some(other), Some(_)) => {
-            return Err(Fail::usage(format!(
-                "aos-search: --check takes dominance or all, not '{other}'"
-            )));
-        }
-    };
-    let pool_flags =
-        lease_ms.is_some() || hello_ms.is_some() || grace_ms.is_some() || !faults.is_empty();
-    if pool_flags && workers.is_none() {
-        return Err(Fail::usage(
-            "aos-search: --lease-ms, --hello-ms, --grace-ms and --fault are for --workers",
-        ));
-    }
-    if (pool_flags || frames) && !cfg!(debug_assertions) {
-        return Err(Fail::usage(
-            "aos-search: --lease-ms, --hello-ms, --grace-ms, --fault and --frames exist in debug \
-             builds only",
-        ));
-    }
-    let millis = |flag: &str, v: Option<String>| {
-        v.map(|v| {
+    let threads = threads
+        .map(|v| {
             v.bytes()
                 .all(|b| b.is_ascii_digit())
-                .then(|| v.parse::<u64>().ok())
+                .then(|| v.parse::<usize>().ok())
                 .flatten()
-                .filter(|&ms| ms >= 1)
+                .filter(|n| (1..=256).contains(n))
                 .ok_or_else(|| {
-                    Fail::usage(format!("aos-search: {flag} takes milliseconds, not '{v}'"))
+                    Fail::usage(format!("aos-search: --threads takes 1 to 256, not '{v}'"))
                 })
         })
-        .transpose()
-    };
-    let lease_ms = millis("--lease-ms", lease_ms)?;
-    let hello_ms = millis("--hello-ms", hello_ms)?;
-    let grace_ms = millis("--grace-ms", grace_ms)?;
-    for f in &faults {
-        Fault::parse(f).map_err(|why| Fail::usage(format!("aos-search: {why}")))?;
+        .transpose()?;
+    if frames && !cfg!(debug_assertions) {
+        return Err(Fail::usage(
+            "aos-search: --frames exists in debug builds only",
+        ));
     }
-    let workers = workers.map(|workers| PoolArgs {
-        workers,
-        lease_ms,
-        hello_ms,
-        grace_ms,
-        faults,
-        frames,
-    });
     Ok(Args {
         grid,
         plans,
         out,
         toolchain,
         threads,
-        workers,
-        check,
         frames,
     })
 }
@@ -251,41 +160,12 @@ impl<P: Proposer> Proposer for Recorded<P> {
 }
 
 /// How a search judges its candidates.
-enum How<'p> {
+enum How {
     /// M4's serial path, each candidate trained said as a step of the search numbered here under
     /// `--frames` ([`Stepped`]).
     Serial(Option<u32>),
     /// `--threads N`: the local fold over a thread spread, said as [`How::Serial`]'s is.
     Threads(usize, Option<u32>),
-    /// `--workers N`: jobs in the pool, the claims checked here (design §11.3).
-    Workers(&'p mut Pool, CheckLevel),
-}
-
-/// Why a search ended without a winner.
-enum Ended {
-    /// The evaluator's own no-outcome.
-    No(NoOutcome),
-    /// The command's distributed work is void.
-    Void(Refusal),
-}
-
-/// What a distributed search adds to its summary.
-struct Claimed {
-    /// The search's serial in the pool.
-    serial: u32,
-    /// The jobs: the distinct candidates that decode.
-    jobs: usize,
-    /// The rows the accepted claims carry.
-    rows: u64,
-    /// The (job, item) judgments made here at the barrier.
-    local: u64,
-    /// Search start to the last claim accepted.
-    last_claim: Duration,
-    /// Each barrier spread call's task count and wall time.
-    checks: Vec<(usize, Duration)>,
-    /// The barrier's threads.
-    width: usize,
-    check: CheckLevel,
 }
 
 struct Searched {
@@ -308,10 +188,6 @@ struct Searched {
     verify: Option<Duration>,
     /// The bundle file written.
     bundle: Option<PathBuf>,
-    /// Why the command's distributed work is void, when this search found it.
-    void: Option<Refusal>,
-    /// A distributed search's figures.
-    claimed: Option<Claimed>,
 }
 
 fn vs(c: &Compared) -> String {
@@ -325,57 +201,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A distributed search's selection: the pool runs the round's jobs, then the claims are checked
-/// here (design §11.3 step 5) before anything is selected.
-fn distributed<P: Proposer>(
-    ev: &Evaluator,
-    rec: &mut Recorded<P>,
-    pool: &mut Pool,
-    check: CheckLevel,
-    started: Instant,
-    claimed: &mut Option<Claimed>,
-) -> Result<Selection, Ended> {
-    let mut d = ev.distributed(rec, check);
-    let jobs = d.jobs().to_vec();
-    let claims = pool.run(&jobs).map_err(Ended::Void)?;
-    let last_claim = started.elapsed();
-    let rows = claims
-        .iter()
-        .map(|(_, c)| u64::try_from(c.len()).unwrap_or(u64::MAX))
-        .fold(0u64, u64::saturating_add);
-    for (slot, c) in claims {
-        if let Err(no) = d.claim(slot, c) {
-            pool.void(Refusal::Dist(no.clone()));
-            return Err(Ended::Void(Refusal::Dist(no)));
-        }
-    }
-    if pool.frames() {
-        say(pool.serial(), Phase::Check);
-    }
-    let width = available();
-    let threads = Threads(width);
-    let timed = Timed::new(&threads);
-    let (picked, judged) = d.finish_noting(&timed);
-    *claimed = Some(Claimed {
-        serial: pool.serial(),
-        jobs: jobs.len(),
-        rows,
-        local: u64::try_from(judged.len()).unwrap_or(u64::MAX),
-        last_claim,
-        checks: timed.calls(),
-        width,
-        check,
-    });
-    match picked {
-        Ok(s) => Ok(s),
-        Err(DistNoOutcome::Local(no)) => Err(Ended::No(no)),
-        Err(no) => {
-            pool.void(Refusal::Dist(no.clone()));
-            Err(Ended::Void(Refusal::Dist(no)))
-        }
-    }
-}
-
 /// A local search's selection over `spread`, each candidate trained said as a step of search
 /// `said` under `--frames` ([`Stepped`]): a spread changes only speed, so it is
 /// [`Evaluator::select`]'s.
@@ -384,12 +209,11 @@ fn trained<P: Proposer>(
     rec: &mut Recorded<P>,
     spread: &dyn Spread,
     said: Option<u32>,
-) -> Result<Selection, Ended> {
+) -> Result<Selection, NoOutcome> {
     match said {
         Some(serial) => ev.select_spread(rec, &Stepped::new(spread, serial)),
         None => ev.select_spread(rec, spread),
     }
-    .map_err(Ended::No)
 }
 
 fn search<P: Proposer>(
@@ -399,7 +223,7 @@ fn search<P: Proposer>(
     toolchain: &str,
     built: Duration,
     out: &Path,
-    how: How<'_>,
+    how: How,
 ) -> Searched {
     let mut rec = Recorded {
         inner: proposer,
@@ -409,52 +233,29 @@ fn search<P: Proposer>(
     let id = rec.id();
     let stepped_before = ev.stepped();
     let started = Instant::now();
-    let mut claimed = None;
-    let frames = matches!(&how, How::Workers(p, _) if p.frames());
-    let (picked, local) = match how {
+    let (picked, said) = match how {
         How::Serial(said) => (trained(ev, &mut rec, &Serial, said), said),
         How::Threads(n, said) => (trained(ev, &mut rec, &Threads(n), said), said),
-        How::Workers(pool, check) => (
-            distributed(ev, &mut rec, pool, check, started, &mut claimed),
-            None,
-        ),
     };
     let stats = match &picked {
         Ok(selection) => Some(selection.stats()),
-        Err(Ended::No(NoOutcome::NoneAdmitted { stats } | NoOutcome::NoGain { stats, .. })) => {
-            Some(*stats)
-        }
-        Err(Ended::No(NoOutcome::HeldOut { .. } | NoOutcome::Foreign { .. }) | Ended::Void(_)) => {
-            None
-        }
+        Err(NoOutcome::NoneAdmitted { stats } | NoOutcome::NoGain { stats, .. }) => Some(*stats),
+        Err(NoOutcome::HeldOut { .. } | NoOutcome::Foreign { .. }) => None,
     };
-    // The search's serial, when `--frames` says the coordinator's own stretches as steps: the
-    // pool's in a pool run.
-    let said = claimed
-        .as_ref()
-        .filter(|_| frames)
-        .map(|c: &Claimed| c.serial)
-        .or(local);
     if let Some(serial) = said
         && picked.is_ok()
     {
         say(serial, Phase::HeldOut);
     }
     let reading = Instant::now();
-    let outcome = picked.and_then(|selection| ev.held_out(selection).map_err(Ended::No));
+    let outcome = picked.and_then(|selection| ev.held_out(selection));
     let held_out = outcome.is_ok().then(|| reading.elapsed());
     let wall = started.elapsed();
     let stepped = ev.stepped().saturating_sub(stepped_before);
     let mut verify = None;
     let mut bundle_file = None;
-    let mut void = None;
     let result = match outcome {
-        Err(Ended::Void(r)) => {
-            let line = format!("void refusal={} {r}", r.name());
-            void = Some(r);
-            Err(line)
-        }
-        Err(Ended::No(no)) => Err(no.to_string()),
+        Err(no) => Err(no.to_string()),
         Ok(mut admitted) => (|| {
             admitted.declare_toolchain(toolchain);
             let timed = admitted.record_timing(SEARCH_TIMING, wall)
@@ -478,7 +279,7 @@ fn search<P: Proposer>(
                 return Err("the verified bundle is not the one written".to_owned());
             }
             let file = format!("{name}.bundle");
-            std::fs::write(out.join(&file), &bytes)
+            crate::util::write_fresh(&out.join(&file), &bytes)
                 .map_err(|e| format!("cannot write {}: {e}", out.join(&file).display()))?;
             bundle_file = Some(out.join(&file));
             let parts = bundle.parts();
@@ -519,8 +320,6 @@ fn search<P: Proposer>(
         held_out,
         verify,
         bundle: bundle_file,
-        void,
-        claimed,
     }
 }
 
@@ -532,7 +331,7 @@ fn opt_ms(d: Option<Duration>) -> String {
     d.map_or_else(|| "none".to_owned(), ms)
 }
 
-fn summary_of(s: &Searched, report: Option<&PoolReport>, out: &mut String) {
+fn summary_of(s: &Searched, out: &mut String) {
     let _ = writeln!(
         out,
         "search proposer={} {} v{} config={}",
@@ -541,32 +340,16 @@ fn summary_of(s: &Searched, report: Option<&PoolReport>, out: &mut String) {
         s.id.version,
         s.id.config.short()
     );
-    // Under the dominance check, which candidates were admitted rests on workers' claims (§11.3).
-    let on_claims = s
-        .claimed
-        .as_ref()
-        .is_some_and(|c| c.check == CheckLevel::Dominance);
-    let (admitted_key, refused_key) = if on_claims {
-        ("admitted_claimed", "refused_claimed")
-    } else {
-        ("admitted", "refused")
-    };
     let mut refused: BTreeMap<&str, u64> = BTreeMap::new();
     for f in s.shown.iter().filter(|f| !f.is_admitted()) {
         *refused.entry(f.law().unwrap_or("unnamed")).or_insert(0) += 1;
     }
     let shown_admitted = s.shown.iter().filter(|f| f.is_admitted()).count();
     match s.stats {
-        _ if s.void.is_some() => {
-            let _ = writeln!(
-                out,
-                "  counts none (void: no count is built from claimed feedback)"
-            );
-        }
         Some(st) => {
             let _ = writeln!(
                 out,
-                "  counts proposed={} distinct={} {admitted_key}={} oversized={} duplicates={} \
+                "  counts proposed={} distinct={} admitted={} oversized={} duplicates={} \
                  over_budget={} rounds={}",
                 st.proposed,
                 st.distinct,
@@ -585,7 +368,7 @@ fn summary_of(s: &Searched, report: Option<&PoolReport>, out: &mut String) {
             let words: Vec<String> = refused.iter().map(|(k, n)| format!("{k}={n}")).collect();
             let _ = writeln!(
                 out,
-                "  {refused_key} {} unreported={unreported}",
+                "  refused {} unreported={unreported}",
                 if words.is_empty() {
                     "none".to_owned()
                 } else {
@@ -598,13 +381,13 @@ fn summary_of(s: &Searched, report: Option<&PoolReport>, out: &mut String) {
             let _ = writeln!(
                 out,
                 "  counts returned={} (the evaluator's counts are not returned with this outcome) \
-                 shown={} shown_{admitted_key}={shown_admitted}",
+                 shown={} shown_admitted={shown_admitted}",
                 s.returned,
                 s.shown.len()
             );
             let _ = writeln!(
                 out,
-                "  {refused_key} {}",
+                "  refused {}",
                 if words.is_empty() {
                     "none".to_owned()
                 } else {
@@ -623,98 +406,12 @@ fn summary_of(s: &Searched, report: Option<&PoolReport>, out: &mut String) {
             let _ = writeln!(out, "  no-outcome {why}");
         }
     }
-    match &s.claimed {
-        None => {
-            let _ = writeln!(
-                out,
-                "  MEASURED (never scored) wall_ms={} stepped={}",
-                ms(s.wall),
-                s.stepped
-            );
-        }
-        Some(c) => {
-            let trips: Vec<_> = report
-                .map(|r| {
-                    r.trips
-                        .iter()
-                        .filter(|t| t.token.search == c.serial)
-                        .copied()
-                        .collect()
-                })
-                .unwrap_or_default();
-            let stepped_claimed = trips
-                .iter()
-                .map(|t| t.stepped)
-                .fold(0u64, u64::saturating_add);
-            let _ = writeln!(
-                out,
-                "  MEASURED (never scored) wall_ms={} stepped_here={} stepped_claimed={stepped_claimed} \
-                 (declared)",
-                ms(s.wall),
-                s.stepped
-            );
-            let _ = writeln!(
-                out,
-                "  claimed jobs={} rows={} local_judged={} claimed_only={} check={} barrier_threads={}",
-                c.jobs,
-                c.rows,
-                c.local,
-                c.rows.saturating_sub(c.local),
-                match c.check {
-                    CheckLevel::Dominance => "dominance",
-                    CheckLevel::All => "all",
-                },
-                c.width
-            );
-            let checks: Vec<String> = c
-                .checks
-                .iter()
-                .map(|(n, d)| format!("{n}:{}", ms(*d)))
-                .collect();
-            let _ = writeln!(
-                out,
-                "  MEASURED (never scored) last_claim_ms={} check_ms={}",
-                ms(c.last_claim),
-                if checks.is_empty() {
-                    "none".to_owned()
-                } else {
-                    checks.join(",")
-                }
-            );
-            for kind in [ClaimKind::Admitted, ClaimKind::Refused] {
-                let of: Vec<_> = trips.iter().filter(|t| t.kind == kind).collect();
-                let trip: Vec<u64> = of
-                    .iter()
-                    .map(|t| t.accepted.saturating_sub(t.leased))
-                    .collect();
-                let over: Vec<u64> = of
-                    .iter()
-                    .map(|t| {
-                        t.accepted
-                            .saturating_sub(t.leased)
-                            .saturating_sub(t.judge_ns)
-                    })
-                    .collect();
-                let p = |xs: &[u64]| {
-                    percentiles(xs).map_or_else(
-                        || "none".to_owned(),
-                        |(a, b, c)| format!("p50={a:.1} p95={b:.1} p99={c:.1}"),
-                    )
-                };
-                let _ = writeln!(
-                    out,
-                    "  MEASURED (never scored) trip_ms class={} n={} {} overhead_ms(declared) {}",
-                    match kind {
-                        ClaimKind::Admitted => "admitted",
-                        ClaimKind::Refused => "refused",
-                    },
-                    of.len(),
-                    p(&trip),
-                    p(&over)
-                );
-            }
-        }
-    }
+    let _ = writeln!(
+        out,
+        "  MEASURED (never scored) wall_ms={} stepped={}",
+        ms(s.wall),
+        s.stepped
+    );
     let _ = writeln!(
         out,
         "  MEASURED (never scored) held_out_ms={} verify_ms={}",
@@ -723,123 +420,21 @@ fn summary_of(s: &Searched, report: Option<&PoolReport>, out: &mut String) {
     );
 }
 
-fn pool_summary(args: &PoolArgs, report: &PoolReport, out: &mut String) {
-    let c = &report.counts;
-    let _ = writeln!(
-        out,
-        "workers n={} window_ms={} faults={}",
-        args.workers,
-        args.limits().window_ns / 1_000_000,
-        if args.faults.is_empty() {
-            "none".to_owned()
-        } else {
-            args.faults.join(",")
-        }
-    );
-    let _ = writeln!(
-        out,
-        "workers counts joined={} leases={} retries={} expired={} lost={} foreign={} cancelled={} \
-         duplicate={} stale={} late_progress={} dropped={}",
-        c.joined,
-        c.leases,
-        c.retries,
-        c.expired,
-        c.lost,
-        c.foreign,
-        c.cancelled,
-        c.duplicate,
-        c.stale,
-        c.late_progress,
-        c.dropped
-    );
-    let _ = writeln!(
-        out,
-        "workers processes spawned={} reaped={} killed={}",
-        report.spawned, report.reaped, report.killed
-    );
-    let mb = |b: u64| b / (1024 * 1024);
-    let _ = writeln!(
-        out,
-        "workers MEASURED (never scored) pool_ms={} peak_rss_mb_max={} peak_rss_mb_sum={} cpu_ms={} \
-         frames_in={} bytes_in={} frames_out={} bytes_out={} queue_max={} core_ms={}",
-        report
-            .pool_ns
-            .map_or_else(|| "none".to_owned(), |ns| ms(Duration::from_nanos(ns))),
-        mb(report.peaks.iter().copied().max().unwrap_or(0)),
-        mb(report.peaks.iter().copied().fold(0u64, u64::saturating_add)),
-        ms(report.cpu),
-        report.wire.frames_in,
-        report.wire.bytes_in,
-        report.wire.frames_out,
-        report.wire.bytes_out,
-        report.wire.queue_max,
-        ms(Duration::from_nanos(report.wire.core_ns))
-    );
-    let fired: Vec<String> = report
-        .fired
-        .iter()
-        .map(|(spec, n)| format!("{spec}={n}"))
-        .collect();
-    let _ = writeln!(
-        out,
-        "workers faults fired={}",
-        if fired.is_empty() {
-            "none".to_owned()
-        } else {
-            fired.join(",")
-        }
-    );
-    for (w, field) in &report.foreign {
-        let _ = writeln!(out, "workers foreign worker={w} field={field}");
-    }
-    for (w, text) in &report.stderr {
-        let last = text.lines().rev().take(3).collect::<Vec<_>>();
-        for line in last.into_iter().rev() {
-            let _ = writeln!(out, "workers stderr worker={w} {}", word(line));
-        }
-    }
-    if let Some(r) = &report.refusal {
-        let _ = writeln!(out, "workers void refusal={} {r}", r.name());
-    }
-}
-
-/// How `args` judge a search, on `pool` when there is one; without one, `--frames` says its steps
-/// as the command's search `serial` (from 1, as a pool numbers its searches).
-fn how<'p>(pool: &'p mut Option<Pool>, args: &Args, serial: usize) -> How<'p> {
+/// How `args` judge a search: `--frames` says its steps as the command's search `serial`, from 1.
+fn how(args: &Args, serial: usize) -> How {
     let said = args
         .frames
         .then(|| u32::try_from(serial).unwrap_or(u32::MAX));
-    match (pool.as_mut(), args.threads) {
-        (Some(p), _) => How::Workers(p, args.check),
-        (None, Some(n)) => How::Threads(n, said),
-        (None, None) => How::Serial(said),
-    }
-}
-
-fn remove_void_bundles(files: &[PathBuf]) -> Result<Vec<PathBuf>, Fail> {
-    let mut removed = Vec::new();
-    let mut failed = Vec::new();
-    for file in files {
-        match std::fs::remove_file(file) {
-            Ok(()) => removed.push(file.clone()),
-            Err(e) => failed.push(format!("{}: {e}", file.display())),
-        }
-    }
-    if failed.is_empty() {
-        Ok(removed)
-    } else {
-        Err(Fail::die(format!(
-            "aos-search: the command is void, but these bundles could not be removed: {}",
-            failed.join("; ")
-        )))
+    match args.threads {
+        Some(n) => How::Threads(n, said),
+        None => How::Serial(said),
     }
 }
 
 /// The searches `args` names.
 /// # Errors
 /// This lab's build names no commit (exit 1, before any evaluator is built), the pinned policy
-/// refused (exit 1), a worker could not be spawned or admitted, a void bundle could not be
-/// removed, or the summary could not be written.
+/// refused (exit 1), or the summary could not be written.
 pub fn run(args: &Args, plans_text: Option<&str>, out: &Path) -> Result<(i32, String), Fail> {
     run_in(args, plans_text, out, LAB_BUILD)
 }
@@ -851,26 +446,11 @@ fn run_in(
     build: &str,
 ) -> Result<(i32, String), Fail> {
     check_build(build)?;
-    // Workers are spawned first, so they build their evaluators while the coordinator builds
-    // its own.
-    let mut pool = match &args.workers {
-        Some(p) => {
-            crate::stop::install();
-            Some(
-                Pool::spawn(p, Instant::now())
-                    .map_err(|e| Fail::die(format!("aos-search: cannot spawn a worker: {e}")))?,
-            )
-        }
-        None => None,
-    };
     let started = Instant::now();
     let ev = Evaluator::v1(build, started)
         .map_err(|e| Fail::die(format!("aos-search: the pinned policy is refused: {e}")))?;
     let built = started.elapsed();
-    if let Some(p) = pool.as_mut() {
-        p.admit(&ev)
-            .map_err(|e| Fail::die(format!("aos-search: the coordinator: {e}")))?;
-    } else if args.frames {
+    if args.frames {
         say_built();
     }
     let mut searched = Vec::new();
@@ -882,13 +462,10 @@ fn run_in(
             &args.toolchain,
             built,
             out,
-            how(&mut pool, args, 1),
+            how(args, 1),
         ));
     }
-    let voided = |searched: &[Searched]| searched.iter().any(|s| s.void.is_some());
-    if let Some(text) = plans_text
-        && !voided(&searched)
-    {
+    if let Some(text) = plans_text {
         searched.push(search(
             &ev,
             "plans",
@@ -896,23 +473,8 @@ fn run_in(
             &args.toolchain,
             built,
             out,
-            how(&mut pool, args, searched.len() + 1),
+            how(args, searched.len() + 1),
         ));
-    }
-    let report = pool.as_mut().map(Pool::shutdown);
-    // A void ends the command: no later search ran, and no bundle it wrote stays, since a
-    // distributed bundle's admitted count rested on workers now shown to contradict themselves.
-    let refusal = report
-        .as_ref()
-        .and_then(|r| r.refusal.clone())
-        .or_else(|| searched.iter().find_map(|s| s.void.clone()));
-    let mut removed = Vec::new();
-    if refusal.is_some() {
-        let files: Vec<PathBuf> = searched.iter().filter_map(|s| s.bundle.clone()).collect();
-        removed = remove_void_bundles(&files)?;
-        for s in &mut searched {
-            s.bundle = None;
-        }
     }
     let mut summary = String::new();
     let _ = writeln!(
@@ -931,52 +493,26 @@ fn run_in(
         let _ = writeln!(summary, "threads n={n}");
     }
     for s in &searched {
-        summary_of(s, report.as_ref(), &mut summary);
-    }
-    if let (Some(p), Some(r)) = (&args.workers, &report) {
-        pool_summary(p, r, &mut summary);
-    }
-    for file in &removed {
-        let _ = writeln!(
-            summary,
-            "aos-search removed {} (the command is void)",
-            file.display()
-        );
+        summary_of(s, &mut summary);
     }
     let winners = searched
         .iter()
         .filter(|s| s.result.is_ok() && s.bundle.is_some())
         .count();
-    let pass = refusal.is_none() && winners == searched.len();
-    match &refusal {
-        Some(r) => {
-            let _ = writeln!(
-                summary,
-                "aos-search result=void refusal={} searches={} winners=0",
-                r.name(),
-                searched.len()
-            );
-        }
-        None => {
-            let _ = writeln!(
-                summary,
-                "aos-search result={} searches={} winners={winners}",
-                if pass { "pass" } else { "fail" },
-                searched.len()
-            );
-        }
-    }
-    std::fs::write(out.join("summary.txt"), &summary).map_err(|e| {
+    let pass = winners == searched.len();
+    let _ = writeln!(
+        summary,
+        "aos-search result={} searches={} winners={winners}",
+        if pass { "pass" } else { "fail" },
+        searched.len()
+    );
+    crate::util::write_fresh(&out.join("summary.txt"), &summary).map_err(|e| {
         Fail::die(format!(
             "aos-search: cannot write {}: {e}",
             out.join("summary.txt").display()
         ))
     })?;
-    let code = match report.as_ref().and_then(|r| r.interrupted) {
-        Some(sig) => 128 + sig,
-        None => i32::from(!pass),
-    };
-    Ok((code, summary))
+    Ok((i32::from(!pass), summary))
 }
 
 /// `--verify FILE`'s file, or `None` when `args` do not ask for it. Pure.
@@ -1330,7 +866,6 @@ fn passed(
                 match s.mode {
                     Mode::Search => "search",
                     Mode::OnDemand => "on-demand",
-                    Mode::Distributed => "distributed",
                 },
                 word(&b.proposer.name),
                 b.proposer.version,
@@ -1372,13 +907,6 @@ fn passed(
             "pass",
             "provenance=rederived (the grid's own selection, re-run on the training split, \
              chose this plan at this round and index with these counts)"
-                .to_owned(),
-        ),
-        Check::Grid if s.mode == Mode::Distributed && b.proposer == GridProposer::new().id() => (
-            "declared",
-            "provenance=declared (the bundle declares a distributed search: which admitted grid \
-             plan won and the admitted count are declared, checked for consistency only; the \
-             plan, round 0 and the grid's counts were checked)"
                 .to_owned(),
         ),
         Check::Grid => (
@@ -1567,8 +1095,6 @@ mod tests {
                 out: "/tmp/x".into(),
                 toolchain: LAB_BUILD.into(),
                 threads: None,
-                workers: None,
-                check: CheckLevel::Dominance,
                 frames: false,
             }
         );
@@ -1589,8 +1115,6 @@ mod tests {
                 out: "o".into(),
                 toolchain: "targo 1.99.0-dev (targo 0.11.0)".into(),
                 threads: None,
-                workers: None,
-                check: CheckLevel::Dominance,
                 frames: false,
             }
         );
@@ -1620,8 +1144,6 @@ not a plan
             out: dir.path().display().to_string(),
             toolchain: "targo test-line".into(),
             threads: None,
-            workers: None,
-            check: CheckLevel::Dominance,
             frames: false,
         };
         let (code, summary) = run(&args, Some(text), dir.path()).expect("runs");
@@ -1716,8 +1238,6 @@ not a plan
                     out: dir.path().display().to_string(),
                     toolchain: "targo test-line".into(),
                     threads: None,
-                    workers: None,
-                    check: CheckLevel::Dominance,
                     frames: false,
                 };
                 let (code, summary) = run_in(
@@ -2127,30 +1647,22 @@ not a plan
         );
     }
 
+    /// A selection credited to the grid is refused at the step that checks it. Two refusals that
+    /// fall before the grid's own re-run run end to end. The grid's own refusals and a good
+    /// grid-credited bundle's lines are read directly off the mapping ([`verify_step`]) and the
+    /// report ([`passed`]), since each end-to-end run re-runs the whole grid: that `verify` refuses
+    /// a selection the grid would not make is `bundle_tests`'
+    /// `a_selection_credited_to_the_grid_is_the_grids`. No test in this crate runs a grid-credited
+    /// bundle through `--verify` to a pass, and this mapping would go stale unseen if `verify`
+    /// checked the grid before the selection.
     #[test]
     fn a_selection_credited_to_the_grid_is_refused_at_the_step_that_checks_it() {
         let bytes = searched_bundle();
         let grid = |b: &mut UncheckedBundle| b.proposer = GridProposer::new().id();
         for (edit, at, reason) in [
             (
-                (|_: &mut UncheckedBundle| {}) as fn(&mut UncheckedBundle),
-                Some(Check::Grid),
-                "Forged{field=Proposer}",
-            ),
-            (
-                |b: &mut UncheckedBundle| {
-                    b.index = 6;
-                    b.selection.stats = SearchStats {
-                        admitted: 17,
-                        ..GRID_STATS
-                    };
-                },
-                Some(Check::Grid),
-                "Forged{field=Stats}",
-            ),
-            (
-                |b: &mut UncheckedBundle| b.round = MAX_ROUNDS,
-                Some(Check::Proposer),
+                (|b: &mut UncheckedBundle| b.round = MAX_ROUNDS) as fn(&mut UncheckedBundle),
+                Check::Proposer,
                 "Forged{field=Proposer}",
             ),
             (
@@ -2161,90 +1673,12 @@ not a plan
                         ..GRID_STATS
                     };
                 },
-                Some(Check::Selection),
+                Check::Selection,
                 "Forged{field=Stats}",
-            ),
-            (
-                |b: &mut UncheckedBundle| {
-                    b.index = 6;
-                    b.selection.stats = GRID_STATS;
-                },
-                None,
-                "none",
             ),
         ] {
             let forged = resealed(&bytes, |b| {
                 grid(b);
-                edit(b);
-            });
-            let (code, r) = report(&forged, TEST_BUILD);
-            match at {
-                Some(at) => {
-                    assert_eq!(code, 1, "{r}");
-                    assert_eq!(statuses(&r), refused_at(at, "pass"), "{reason}:\n{r}");
-                    assert_eq!(
-                        verdict(&r),
-                        format!("aos-search verify=fail reason={reason}")
-                    );
-                }
-                None => {
-                    assert_eq!(code, 0, "{r}");
-                    let mut want = refused_at(Check::Publication, "pass");
-                    want[10].1 = "none".to_owned();
-                    assert_eq!(statuses(&r), want, "{r}");
-                    assert!(r.contains("  check grid=pass provenance=rederived "), "{r}");
-                    assert!(r.contains(" proposer=grid v1 "), "{r}");
-                    assert_eq!(verdict(&r), "aos-search verify=pass reason=none");
-                }
-            }
-        }
-    }
-
-    /// A distributed grid bundle's provenance is declared, yet its plan, round 0 and counts are
-    /// checked against the grid's.
-    #[test]
-    fn a_distributed_grid_bundle_is_declared_and_what_the_grid_fixes_is_checked() {
-        let bytes = searched_bundle();
-        let distributed = |b: &mut UncheckedBundle| {
-            b.proposer = GridProposer::new().id();
-            b.index = 6;
-            b.selection.stats = GRID_STATS;
-            b.selection.mode = Mode::Distributed;
-        };
-        let (code, r) = report(&resealed(&bytes, distributed), TEST_BUILD);
-        assert_eq!(code, 0, "{r}");
-        let mut want = refused_at(Check::Publication, "declared");
-        want[10].1 = "none".to_owned();
-        assert_eq!(statuses(&r), want, "{r}");
-        assert!(
-            r.contains("  check proposer=pass mode=distributed proposer=grid v1 "),
-            "{r}"
-        );
-        assert!(
-            r.contains(
-                "  check grid=declared provenance=declared (the bundle declares a distributed \
-                 search: which admitted grid plan won and the admitted count are declared"
-            ),
-            "{r}"
-        );
-        for (edit, at, reason) in [
-            (
-                (|b: &mut UncheckedBundle| {
-                    b.selection.stats = SearchStats {
-                        proposed: 55,
-                        duplicates: 1,
-                        ..GRID_STATS
-                    };
-                }) as fn(&mut UncheckedBundle),
-                Check::Selection,
-                "Forged{field=Stats}",
-            ),
-            (|b| b.index = 54, Check::Proposer, "Forged{field=Proposer}"),
-            (|b| b.index = 7, Check::Proposer, "Forged{field=Proposer}"),
-            (|b| b.round = 1, Check::Proposer, "Forged{field=Proposer}"),
-        ] {
-            let forged = resealed(&bytes, |b| {
-                distributed(b);
                 edit(b);
             });
             let (code, r) = report(&forged, TEST_BUILD);
@@ -2255,62 +1689,47 @@ not a plan
                 format!("aos-search verify=fail reason={reason}")
             );
         }
+
+        let forged = |field| BundleRefusal::Forged { field, row: None };
+        let mut credited = UncheckedBundle::decode(&bytes).expect("the bundle decodes");
+        grid(&mut credited);
+        assert_eq!(
+            verify_step(&forged(BundleField::Proposer), &credited),
+            Check::Grid,
+            "another plan credited to the grid"
+        );
+        credited.index = 6;
+        credited.selection.stats = SearchStats {
+            admitted: 17,
+            ..GRID_STATS
+        };
+        assert_eq!(
+            verify_step(&forged(BundleField::Stats), &credited),
+            Check::Grid,
+            "counts that hold but are not the grid's"
+        );
+        credited.selection.stats = GRID_STATS;
+        let (status, line) = passed(Check::Grid, &credited, &bytes, "");
+        assert_eq!(status, "pass", "{line}");
+        assert!(line.starts_with("provenance=rederived "), "{line}");
+        let (status, line) = passed(Check::Proposer, &credited, &bytes, "");
+        assert_eq!(status, "pass", "{line}");
+        assert!(line.contains(" proposer=grid v1 "), "{line}");
     }
 
-    /// `--threads` and `--workers` exclude each other; `--check` and the debug overrides need
-    /// `--workers`, but for `--frames`, which a run without a pool takes too.
+    /// `--threads` takes 1 to 256, and `--frames`, which says a run's steps, parses in a debug build
+    /// with or without it.
     #[test]
-    fn the_parallel_flags_are_exclusive_and_bounded() {
+    fn threads_are_bounded_and_frames_parses_with_or_without_threads() {
         let a = parse_args(&words(&["--grid", "--out", "o", "--threads", "4"])).expect("parses");
-        assert_eq!((a.threads, a.workers.is_none()), (Some(4), true));
-        let a = parse_args(&words(&[
-            "--grid",
-            "--out",
-            "o",
-            "--workers",
-            "2",
-            "--check",
-            "all",
-        ]))
-        .expect("parses");
-        assert_eq!(a.check, CheckLevel::All);
-        assert_eq!(a.workers.map(|p| p.workers), Some(2));
-        let a = parse_args(&words(&["--grid", "--out", "o", "--workers", "1"])).expect("parses");
-        assert_eq!(a.check, CheckLevel::Dominance);
-        assert!(
-            usage_of(&["--grid", "--out", "o", "--threads", "2", "--workers", "2"])
-                .contains("exclusive")
-        );
-        assert!(usage_of(&["--grid", "--out", "o", "--check", "all"]).contains("for --workers"));
-        assert!(
-            usage_of(&["--grid", "--out", "o", "--workers", "2", "--check", "some"])
-                .contains("dominance or all")
-        );
-        assert!(usage_of(&["--grid", "--out", "o", "--workers", "0"]).contains("takes 1 to"));
-        assert!(usage_of(&["--grid", "--out", "o", "--workers", "17"]).contains("takes 1 to"));
-        assert!(usage_of(&["--grid", "--out", "o", "--threads", "0"]).contains("takes 1 to"));
-        assert!(usage_of(&["--grid", "--out", "o", "--lease-ms", "10"]).contains("for --workers"));
-        assert!(usage_of(&["--grid", "--out", "o", "--grace-ms", "10"]).contains("for --workers"));
-        assert!(usage_of(&["--grid", "--out", "o", "--hello-ms", "10"]).contains("for --workers"));
-        assert!(
-            usage_of(&["--grid", "--out", "o", "--fault", "dup@1.0.1"]).contains("for --workers")
-        );
-        assert_eq!(
-            (a.frames, a.workers.map(|p| p.frames)),
-            (false, Some(false))
-        );
+        assert_eq!((a.threads, a.frames), (Some(4), false));
+        for bad in ["0", "257", "two", "+1"] {
+            assert!(
+                usage_of(&["--grid", "--out", "o", "--threads", bad]).contains("takes 1 to 256"),
+                "{bad}"
+            );
+        }
         if cfg!(debug_assertions) {
-            let a = parse_args(&words(&[
-                "--grid",
-                "--out",
-                "o",
-                "--workers",
-                "1",
-                "--frames",
-            ]))
-            .expect("parses");
-            assert_eq!((a.frames, a.workers.map(|p| p.frames)), (true, Some(true)));
-            // A run without a pool says its steps too.
             for local in [
                 &["--grid"][..],
                 &["--plans", "p"],
@@ -2318,84 +1737,8 @@ not a plan
             ] {
                 let a = parse_args(&words(&[local, &["--out", "o", "--frames"]].concat()))
                     .expect("parses");
-                assert!(a.frames && a.workers.is_none(), "{local:?}");
+                assert!(a.frames, "{local:?}");
             }
-            let a = parse_args(&words(&[
-                "--grid",
-                "--out",
-                "o",
-                "--workers",
-                "2",
-                "--lease-ms",
-                "10000",
-                "--hello-ms",
-                "86400000",
-                "--grace-ms",
-                "60000",
-                "--fault",
-                "dup@1.0.1",
-                "--fault",
-                "foreign@1",
-            ]))
-            .expect("parses");
-            let p = a.workers.expect("workers");
-            assert_eq!(
-                (p.lease_ms, p.hello_ms, p.grace_ms),
-                (Some(10_000), Some(86_400_000), Some(60_000))
-            );
-            assert_eq!(
-                p.faults,
-                vec!["dup@1.0.1".to_owned(), "foreign@1".to_owned()]
-            );
-            assert!(
-                usage_of(&[
-                    "--grid",
-                    "--out",
-                    "o",
-                    "--workers",
-                    "2",
-                    "--fault",
-                    "dup@1.0"
-                ])
-                .contains("G.S.A")
-            );
-            assert!(
-                usage_of(&["--grid", "--out", "o", "--workers", "2", "--lease-ms", "0"])
-                    .contains("milliseconds")
-            );
-            assert!(
-                usage_of(&["--grid", "--out", "o", "--workers", "2", "--grace-ms", "0"])
-                    .contains("milliseconds")
-            );
         }
-    }
-
-    #[test]
-    fn a_void_reports_failed_bundle_removal_and_attempts_the_rest() {
-        let dir = aterm_tempfile::tempdir().expect("private output directory");
-        let blocked = dir.path().join("grid.bundle");
-        let file = dir.path().join("plans.bundle");
-        std::fs::create_dir(&blocked).expect("deterministic removal obstruction");
-        std::fs::write(&file, b"only fixture bytes").expect("private bundle");
-        let failed = remove_void_bundles(&[blocked.clone(), file.clone()])
-            .expect_err("must not report every bundle removed");
-        assert_eq!(failed.code, 1);
-        assert!(
-            failed
-                .msg
-                .as_deref()
-                .is_some_and(|s| s.contains("grid.bundle"))
-        );
-        assert!(blocked.is_dir());
-        assert!(!file.exists(), "a failure does not skip later removals");
-        std::fs::remove_dir(&blocked).expect("remove only our empty obstruction");
-        std::fs::write(&blocked, b"only fixture bytes").expect("private bundle");
-        assert_eq!(
-            remove_void_bundles(std::slice::from_ref(&blocked))
-                .expect("actual removal")
-                .as_slice(),
-            std::slice::from_ref(&blocked)
-        );
-        assert!(!blocked.exists());
     }
 }

@@ -305,7 +305,7 @@ fn digest_roots_with(
         walk(
             &mut digest,
             &root,
-            &[],
+            &mut Vec::new(),
             &mut BTreeSet::new(),
             0,
             &mut visits,
@@ -325,7 +325,7 @@ fn field(digest: &mut aterm_digest::Sha256, bytes: &[u8]) {
 fn walk(
     digest: &mut aterm_digest::Sha256,
     path: &Path,
-    relative: &[u8],
+    relative: &mut Vec<u8>,
     ancestors: &mut BTreeSet<PathBuf>,
     depth: usize,
     visits: &mut usize,
@@ -346,32 +346,31 @@ fn walk(
     }
     let link = std::fs::symlink_metadata(path)
         .map_err(|e| format!("inspect build input {}: {e}", path.display()))?;
+    let is_symlink = link.file_type().is_symlink();
     field(digest, relative);
-    field(
-        digest,
-        if link.file_type().is_symlink() {
-            b"link"
-        } else {
-            b"entry"
-        },
-    );
-    let resolved = match path.canonicalize() {
-        Ok(resolved) => resolved,
-        // A dangling link has no content: its target text is all of it, and that text is read
-        // in full, so it is evidence rather than an absence (its target appearing changes the
-        // identity). Apple's Command Line Tools ship one in usr/bin (`crashlog`, into an LLDB
-        // framework they do not install). Any other failure to resolve still refuses.
-        Err(err) if link.file_type().is_symlink() && err.kind() == std::io::ErrorKind::NotFound => {
-            let target = std::fs::read_link(path)
-                .map_err(|e| format!("read build input link {}: {e}", path.display()))?;
-            field(digest, b"dangling");
-            field(digest, target.as_os_str().as_encoded_bytes());
-            return Ok(());
-        }
-        Err(e) => return Err(format!("resolve build input {}: {e}", path.display())),
+    field(digest, if is_symlink { b"link" } else { b"entry" });
+    let (resolved, metadata) = if is_symlink {
+        let resolved = match path.canonicalize() {
+            Ok(resolved) => resolved,
+            // A dangling link has no content: its target text is all of it, and that text is read
+            // in full, so it is evidence rather than an absence (its target appearing changes the
+            // identity). Apple's Command Line Tools ship one in usr/bin (`crashlog`, into an LLDB
+            // framework they do not install). Any other failure to resolve still refuses.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let target = std::fs::read_link(path)
+                    .map_err(|e| format!("read build input link {}: {e}", path.display()))?;
+                field(digest, b"dangling");
+                field(digest, target.as_os_str().as_encoded_bytes());
+                return Ok(());
+            }
+            Err(e) => return Err(format!("resolve build input {}: {e}", path.display())),
+        };
+        let metadata = std::fs::metadata(&resolved)
+            .map_err(|e| format!("inspect build input {}: {e}", resolved.display()))?;
+        (std::borrow::Cow::Owned(resolved), metadata)
+    } else {
+        (std::borrow::Cow::Borrowed(path), link)
     };
-    let metadata = std::fs::metadata(&resolved)
-        .map_err(|e| format!("inspect build input {}: {e}", resolved.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -387,42 +386,44 @@ fn walk(
         // A link that resolves to a directory the walk is inside adds only its target text:
         // that directory's content is this walk's already, and following it would never end.
         // A real directory reached again inside itself (after a link above it) still refuses.
-        if ancestors.contains(&resolved) && link.file_type().is_symlink() {
+        if ancestors.contains(resolved.as_ref()) && is_symlink {
             let target = std::fs::read_link(path)
                 .map_err(|e| format!("read build input link {}: {e}", path.display()))?;
             field(digest, b"ancestor");
             field(digest, target.as_os_str().as_encoded_bytes());
             return Ok(());
         }
-        if !ancestors.insert(resolved.clone()) {
+        let resolved_buf = resolved.into_owned();
+        if !ancestors.insert(resolved_buf.clone()) {
             return Err(format!("build input directory cycle: {}", path.display()));
         }
-        let mut entries = std::fs::read_dir(&resolved)
-            .map_err(|e| format!("read build input {}: {e}", resolved.display()))?
+        let mut entries = std::fs::read_dir(&resolved_buf)
+            .map_err(|e| format!("read build input {}: {e}", resolved_buf.display()))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("read build input {}: {e}", resolved.display()))?;
+            .map_err(|e| format!("read build input {}: {e}", resolved_buf.display()))?;
         entries.sort_by(|a, b| {
             a.file_name()
                 .as_encoded_bytes()
                 .cmp(b.file_name().as_encoded_bytes())
         });
+        let prefix_len = relative.len();
         for entry in entries {
-            let mut name = relative.to_vec();
-            if !name.is_empty() {
-                name.push(b'/');
+            if prefix_len > 0 {
+                relative.push(b'/');
             }
-            name.extend_from_slice(entry.file_name().as_encoded_bytes());
+            relative.extend_from_slice(entry.file_name().as_encoded_bytes());
             walk(
                 digest,
                 &entry.path(),
-                &name,
+                relative,
                 ancestors,
                 depth + 1,
                 visits,
                 open,
             )?;
+            relative.truncate(prefix_len);
         }
-        ancestors.remove(&resolved);
+        ancestors.remove(&resolved_buf);
     } else if metadata.is_file() {
         field(digest, b"file");
         let mut file =

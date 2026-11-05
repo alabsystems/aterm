@@ -24,7 +24,7 @@ fn test_session(id: u64) -> Session {
         )),
         byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
         turns: observed.turns,
-        meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+        meta: Arc::default(),
         timeline: observed.timeline,
         fabric: std::sync::Arc::default(),
         idem: Default::default(),
@@ -46,9 +46,11 @@ fn test_session(id: u64) -> Session {
         witness: Default::default(),
         fenced_writes: Default::default(),
         native_policy: Default::default(),
+        spawn_mark: Default::default(),
     });
     Session {
         child_reaped: std::sync::atomic::AtomicBool::new(false),
+        teardown_started: std::sync::atomic::AtomicBool::new(false),
         child_exit: std::sync::OnceLock::new(),
         exit_watch: None,
         shell_start: None,
@@ -100,6 +102,101 @@ fn dropping_last_view_raises_reflow_cancel() {
         cancel.load(std::sync::atomic::Ordering::Acquire),
         "Session::drop must signal an in-flight reflow worker to abandon its job"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn quit_then_drop_hangs_up_a_session_only_once() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let fifo = scratch.path().join("release");
+    let count = scratch.path().join("hups");
+    let done = scratch.path().join("done");
+    let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: this test creates the FIFO and owns the resulting descriptor.
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    let gate = unsafe { libc::open(c_fifo.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    assert!(gate >= 0);
+    let gate = unsafe { OwnedFd::from_raw_fd(gate) };
+    let quote =
+        |path: &std::path::Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+    let handler = format!(
+        "printf H >> {}; read go < {}; printf done > {}; exit 0",
+        quote(&count),
+        quote(&fifo),
+        quote(&done)
+    );
+    let handler = format!("'{}'", handler.replace('\'', "'\\''"));
+    let script = format!("trap {handler} HUP; printf READY; while :; do read line; done");
+    // SAFETY: the test owns its synthetic shell and trusted spawn capabilities.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let exec = vec![
+        std::ffi::OsString::from("/bin/bash"),
+        "-c".into(),
+        script.into(),
+    ];
+    let child = aterm_pty::spawn_shell_with_pid(
+        24,
+        80,
+        &cap,
+        &sandbox,
+        &[],
+        None,
+        None,
+        None,
+        Some(&exec),
+        None,
+        None,
+        aterm_sandbox::Limits::inherit(),
+    )
+    .unwrap();
+    aterm_pty::set_nonblocking(child.master, true).unwrap();
+    let master = unsafe { OwnedFd::from_raw_fd(child.master) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut ready = Vec::new();
+    while !ready.windows(5).any(|word| word == b"READY") && std::time::Instant::now() < deadline {
+        let mut bytes = [0; 256];
+        let n = aterm_pty::read(master.as_raw_fd(), &mut bytes);
+        if n > 0 {
+            ready.extend_from_slice(&bytes[..n as usize]);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    assert!(ready.windows(5).any(|word| word == b"READY"));
+    let mut session = test_session(7623);
+    session.master = master.as_raw_fd();
+    session.pid = child.pid;
+    session.shell_identity = aterm_pty::record_spawned_shell(child.pid);
+    let hold = aterm_pty::hold_reap_kills_for_test();
+    session.hang_up_and_reap(false);
+    while !count.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(count.exists(), "the first hang-up entered its handler");
+    session.hang_up_and_reap(false);
+    drop(session);
+    drop(master);
+    // SAFETY: the test retains the writable FIFO endpoint until the shell has been released.
+    assert_eq!(
+        unsafe { libc::write(gate.as_raw_fd(), b"go\n".as_ptr().cast(), 3) },
+        3
+    );
+    while !done.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(done.exists(), "a second hang-up did not interrupt cleanup");
+    assert_eq!(std::fs::read(&count).unwrap(), b"H");
+    drop(hold);
+    assert!(aterm_pty::wait_for_reaps(std::time::Duration::from_secs(
+        60
+    )));
 }
 
 #[test]

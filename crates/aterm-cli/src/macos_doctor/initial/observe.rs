@@ -229,8 +229,8 @@ enum VaultRead {
     /// ([`aterm_secrets::service::subscriber_off_path`]), so the subscriber that finishes an
     /// approved join does not run. It reads Sync off in place, as [`Self::TurnedOff`] does.
     PendingOff { approve: Option<String> },
-    /// A member whose subscriber runs; `synced` once every file is written.
-    Member { synced: bool },
+    /// A member whose subscriber runs; `cache_ready` meets the vault's local ownership checks.
+    Member { cache_ready: bool },
     /// A member whose subscriber, the process that keeps `~/.secrets` in sync, is installed but
     /// has stayed down past launchd's restart window. Nothing starts it again by itself: the
     /// Secrets stage installs it, so Set up now does.
@@ -266,11 +266,11 @@ enum Subscriber {
     TurnedOff,
 }
 
-/// A member's reading, from whether every file is `written`, its `subscriber`, and `exe` (the
+/// A member's reading, from its local `cache_ready`, its `subscriber`, and `exe` (the
 /// program this aterm runs from, `None` when unknown).
-fn member_read(written: bool, subscriber: Subscriber, exe: Option<&Path>) -> VaultRead {
+fn member_read(cache_ready: bool, subscriber: Subscriber, exe: Option<&Path>) -> VaultRead {
     match subscriber {
-        Subscriber::Running => VaultRead::Member { synced: written },
+        Subscriber::Running => VaultRead::Member { cache_ready },
         Subscriber::TurnedOff => VaultRead::TurnedOff,
         _ if exe.is_some_and(aterm_secrets::service::transient) => VaultRead::Fleeting,
         Subscriber::Stopped => VaultRead::Stopped,
@@ -561,7 +561,7 @@ const ALLOWED: &str = aterm_types::macos_setup::VAULT_ALLOWED_NOTE;
 const WRONG_PASSWORD: &str = "Wrong password";
 
 /// The Secrets vault row in §3.3's words: Not joined, Awaiting code, Other vault, Out of sync,
-/// Not syncing, Not set up, In sync, or Sync off (the person's choice, so in place). A stopped or
+/// Not syncing, Not set up, Local cache ready, or Sync off (the person's choice, so in place). A stopped or
 /// uninstalled subscriber differs, with a note only on a row `selection` manages. `here` is the
 /// note of what aterm last heard at the ALab vault's address when the plan names that vault
 /// ([`scope::heard_at`], [`scope::VaultHere::note`]), kept on a managed row not joined. Where the
@@ -583,8 +583,12 @@ fn vault_observation(
         Standing::Differs
     };
     let (standing, now, note): (Standing, &str, Option<String>) = match read {
-        VaultRead::Member { synced: true } => (Standing::InPlace, "In sync", None),
-        VaultRead::Member { synced: false } => {
+        VaultRead::Member { cache_ready: true } => (
+            Standing::InPlace,
+            Setting::Secrets.wanted(),
+            Some(aterm_types::macos_setup::VAULT_LOCAL_READY_NOTE.to_owned()),
+        ),
+        VaultRead::Member { cache_ready: false } => {
             (Standing::Waiting, "Out of sync", Some(SYNCING.to_owned()))
         }
         VaultRead::Stopped => (
@@ -671,7 +675,7 @@ fn vault_observation(
         VaultRead::Unconfigured | VaultRead::Revoked => (Standing::Differs, "Not joined", None),
         VaultRead::OtherVault => (Standing::Differs, "Other vault", None),
     };
-    // A row in place wants what it reads: In sync, the person's opt-out (as for a grant,
+    // A row in place wants what it reads: local cache ready, the person's opt-out (as for a grant,
     // `access::honor_opt_out`), or Not joined where no vault answered aterm's own join.
     let wanted = if standing == Standing::InPlace {
         now
@@ -967,12 +971,17 @@ mod tests {
             let seen = vault_observation(&read, Selection::all(), here, false);
             (seen.standing, seen.now.unwrap(), seen.note)
         };
-        assert_eq!(
-            words(VaultRead::Member { synced: true }, None),
-            (Standing::InPlace, "In sync".into(), None)
+        let local = vault_observation(
+            &VaultRead::Member { cache_ready: true },
+            Selection::all(),
+            None,
+            false,
         );
+        assert_eq!(local.standing, Standing::InPlace);
+        assert_eq!(local.now.as_deref(), Some(local.wanted.as_str()));
+        assert!(local.note.is_some());
         assert_eq!(
-            words(VaultRead::Member { synced: false }, None),
+            words(VaultRead::Member { cache_ready: false }, None),
             (
                 Standing::Waiting,
                 "Out of sync".into(),
@@ -1048,7 +1057,7 @@ mod tests {
             },
             VaultRead::Allowed,
             VaultRead::Revoked,
-            VaultRead::Member { synced: false },
+            VaultRead::Member { cache_ready: false },
             VaultRead::Stopped,
             VaultRead::NotSetUp,
             VaultRead::TurnedOff,
@@ -1181,8 +1190,8 @@ mod tests {
                 at: JoinPlace::Unknown,
             },
             VaultRead::Allowed,
-            VaultRead::Member { synced: false },
-            VaultRead::Member { synced: true },
+            VaultRead::Member { cache_ready: false },
+            VaultRead::Member { cache_ready: true },
             VaultRead::Stopped,
             VaultRead::NotSetUp,
             VaultRead::TurnedOff,
@@ -1270,7 +1279,7 @@ mod tests {
         }
         assert_eq!(
             member_read(false, Subscriber::Running, Some(image)),
-            VaultRead::Member { synced: false }
+            VaultRead::Member { cache_ready: false }
         );
         assert_eq!(
             member_read(true, Subscriber::Stopped, Some(installed)),
@@ -1287,7 +1296,7 @@ mod tests {
         );
         assert_eq!(
             member_read(true, Subscriber::Running, Some(installed)),
-            VaultRead::Member { synced: true }
+            VaultRead::Member { cache_ready: true }
         );
         let seen = vault_observation(&VaultRead::Fleeting, Selection::all(), None, false);
         assert_eq!(
@@ -1396,6 +1405,7 @@ mod tests {
         let waiting = |source: Source, signer: [u8; 32]| Status {
             config: Some(Config {
                 source,
+                mirrors: Vec::new(),
                 name: "alab".into(),
                 signer: Some(signer),
                 followed: Vec::new(),

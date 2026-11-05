@@ -31,8 +31,10 @@
 //!   new seat under the next free label.
 //!
 //! Only record kinds and evidences a 0.147 Mac takes are signed (`Remove`, `Admit` of
-//! [`Evidence::Manual`], `Wrap`): a record of a kind it does not know would stop it taking any
-//! record of the stream. A 0.147 evaluator does not supersede a seat by its node key: it would
+//! [`Evidence::Manual`], `Wrap`, and the `Epoch`s, `Wrap`s and `Put`s of the rotation that leaves
+//! the old seat's recipient out, [`sign_seat_move`]): a record of a kind it does not know would
+//! stop it taking any record of the stream. A person's Allow of a Mac whose node key a live seat
+//! holds signs the same batch ([`allowed_seat_move`]), waiving the day a proof waits. A 0.147 evaluator does not supersede a seat by its node key: it would
 //! read the moved seat's node key and the new recipient as removed, and its epoch tending would
 //! leave the returned Mac out of every newer key for good. So a seat moves only once every member
 //! the deciding member's fleet book heard lately runs 0.148 or later ([`Book::moved_seats_read`]).
@@ -67,8 +69,8 @@ use crate::commons::binding::Request;
 use crate::members::Allowed;
 use crate::members::bundle::Reader;
 use crate::membership_log::{
-    Body, Budget, Entrant, EpochAudience, Evidence, Kind, Log, MemberId, NodeStanding, Record,
-    RecordCounts, RecordId, Signer, encode_records,
+    Body, Budget, Entrant, EpochAudience, Evidence, Kind, Log, MemberId, NodeStanding,
+    OpenedAudienceEntries, Record, RecordCounts, RecordId, Signer, encode_records,
 };
 
 /// How long after a seat took a new key it may take another by proof: two Macs that hold one
@@ -326,6 +328,289 @@ pub(super) enum Decision {
     Refuse(String),
 }
 
+/// A live seat whose fleet node key a Mac shows under another vault key (a Mac rebuilt with its
+/// node key kept): what a person's Allow card says of it before the Allow moves the seat
+/// ([`kept_seats`], `members::desk::Row::moves`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptSeat {
+    /// The seat that holds the node key now.
+    pub seat: MemberId,
+    /// Its label, which the Mac takes back.
+    pub label: String,
+    /// When the seat last signed a record (its signer's clock, UTC milliseconds); `None` where it
+    /// signed none (a founder the genesis bound).
+    pub last_signed_ms: Option<u64>,
+}
+
+impl KeptSeat {
+    /// The card's words: "m10 is back with a new vault key. Its old key last signed on Nov 5 at
+    /// 14:02 UTC; once you Allow this, that key reads no newer secret".
+    #[must_use]
+    pub fn title(&self) -> String {
+        let when = self.last_signed_ms.map_or_else(
+            || "never signed a record".to_owned(),
+            |ms| format!("last signed on {}", day_and_time(ms)),
+        );
+        format!(
+            "{} is back with a new vault key. Its old key {when}; once you Allow this, that key \
+             reads no newer secret",
+            self.label
+        )
+    }
+}
+
+/// `ms` (UTC) as a day and a minute: `Nov 5 at 14:02 UTC`.
+fn day_and_time(ms: u64) -> String {
+    let minute = (ms / 60_000) % (24 * 60);
+    format!(
+        "{} at {:02}:{:02} UTC",
+        super::remove::day(ms),
+        minute / 60,
+        minute % 60
+    )
+}
+
+/// Every live seat by its fleet node key, as [`KeptSeat`]s: the seats a person's Allow of a Mac
+/// showing that node key under another vault key would move. Read from this Mac's trusted log
+/// without the state lock (the records file is written whole); empty with no such log.
+///
+/// # Errors
+/// Local state cannot be read.
+pub fn kept_seats(paths: &Paths) -> crate::Result<BTreeMap<[u8; 32], KeptSeat>> {
+    let Some(store) = super::remove::trusted_store(paths)? else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(log) = store.log() else {
+        return Ok(BTreeMap::new());
+    };
+    let membership = log.membership();
+    Ok(membership
+        .members()
+        .iter()
+        .filter_map(|(actor, member)| {
+            let node = member.node_key.filter(|nk| *nk != [0; 32])?;
+            (membership.node(&node) == NodeStanding::Member(*actor)
+                && movable_seat(log, actor).is_ok())
+            .then(|| {
+                let last_signed_ms = log
+                    .records()
+                    .filter(|r| r.kind() != Kind::Genesis && r.actor() == actor)
+                    .map(Record::authored_ms)
+                    .max();
+                (
+                    node,
+                    KeptSeat {
+                        seat: *actor,
+                        label: member.label.clone(),
+                        last_signed_ms,
+                    },
+                )
+            })
+        })
+        .collect())
+}
+
+/// The cutoff and label a move of `seat` signs, or why the seat does not move: its recipient or
+/// node key is removed, the newest `[everyone]` epoch leaves it out on purpose, or it claims no
+/// label. The cutoff is the seat's last record the log holds, else the record that let it in.
+fn movable_seat(log: &Log, seat: &MemberId) -> Result<(RecordId, String), &'static str> {
+    let membership = log.membership();
+    let Some(held) = membership.get(seat) else {
+        return Err("the seat this node key names is gone");
+    };
+    if log.recipient_is_removed(&held.binding.recipient())
+        || membership.member_node_removed(held)
+        || log.audience_left_out(&EpochAudience::Everyone, seat)
+    {
+        return Err("the seat this node key names is held out");
+    }
+    let Some(label) = claimed_label(log, seat) else {
+        return Err("the seat this node key names claims no label");
+    };
+    let cutoff = log
+        .records()
+        .filter(|r| r.kind() != Kind::Genesis && r.actor() == seat)
+        .max_by(|a, b| a.sequence().cmp(&b.sequence()).then(b.id().cmp(a.id())))
+        .map_or(held.entry, |r| *r.id());
+    Ok((cutoff, label))
+}
+
+/// What a person's Allow of the Mac `binding` names, showing the node key `node`, does with the
+/// seat that holds that key: `None` where no live seat holds it under another binding (no move;
+/// the Allow goes on as before), else the [`Decision::Replace`] to sign or why not. A person
+/// waives the day a proof waits ([`DARK_FOR_MS`]), the proof's pacing ([`READMIT_EVERY_MS`],
+/// [`MAX_READMISSIONS`]) and the fleet book's other address; what still refuses is a key two
+/// seats hold, a retired key, a seat held out, and, until every member heard reads moved seats,
+/// the 0.148 gate ([`Book::moved_seats_read`]). A quorum's removal and the epoch-omission rule
+/// refuse before this (`admit::kept_out_with_node`).
+pub(super) fn allowed_seat_move(
+    log: &Log,
+    binding: &crate::commons::binding::Binding,
+    node: [u8; 32],
+    book: Book,
+) -> Option<Result<Decision, String>> {
+    if node == [0; 32] {
+        return None;
+    }
+    let membership = log.membership();
+    let seat = match membership.node(&node) {
+        NodeStanding::Member(seat) => seat,
+        NodeStanding::Contested => {
+            return Some(Err(
+                "two seats hold this Mac's node key, so an Allow cannot tell which to move"
+                    .to_owned(),
+            ));
+        }
+        NodeStanding::Retired(_) => {
+            return Some(Err(
+                "a member replaced this Mac's node key with another, so no seat moves to it"
+                    .to_owned(),
+            ));
+        }
+        NodeStanding::Removed(_) | NodeStanding::Unknown => return None,
+    };
+    if seat == binding.actor() || membership.get(&seat).is_some_and(|m| m.binding == *binding) {
+        return None;
+    }
+    Some((|| {
+        let (cutoff, label) = movable_seat(log, &seat).map_err(str::to_owned)?;
+        if !book.moved_seats_read {
+            return Err(format!(
+                "a member heard in the last 14 days runs an aterm older than 0.148, which would \
+                 read {label}'s moved seat as removed and leave this Mac out of the vault's newer \
+                 keys for good: Allow it once every member updated"
+            ));
+        }
+        Ok(Decision::Replace {
+            seat,
+            cutoff,
+            label,
+        })
+    })())
+}
+
+/// Why a move of `seat` by the member `me`, handing on `audiences`, cannot be signed whole, or
+/// `None` where it can: its batch rotates `[everyone]`, Commons and each host list that wraps the
+/// seat's recipient, and a removal reserves that room before its `Remove` is signed
+/// ([`super::remove::RemovalFill`]), with the moved seat's own `Wrap`s counted too.
+pub(super) fn seat_move_refusal(
+    log: &Log,
+    opened: &OpenedAudienceEntries,
+    audiences: &[crate::membership_log::SeatAudience],
+    me: &MemberId,
+    seat: &MemberId,
+) -> Option<String> {
+    let recipient = log.membership().get(seat)?.binding.recipient();
+    let fill = super::remove::RemovalFill::of(
+        log,
+        opened,
+        me,
+        &BTreeSet::from([recipient]),
+        None,
+        |audience, newest, gone| {
+            let mints = match audience {
+                EpochAudience::Hosts(_) => {
+                    log_entries::rotates_host_list(opened, audience, newest, gone)
+                }
+                EpochAudience::Everyone | EpochAudience::Commons => {
+                    log_entries::opens_newest(opened, audience)
+                }
+            };
+            if mints {
+                super::remove::Mints::Surely
+            } else {
+                super::remove::Mints::No
+            }
+        },
+    );
+    // Beside the removal's own re-keys, the batch wraps the moved seat: each epoch its `Admit`
+    // hands on, and at most one `Wrap` in each audience's new epoch.
+    let fill = fill.with_more(
+        Log::admission_wraps(opened, audiences)
+            .len()
+            .saturating_add(opened.maximal_epochs.len()),
+    );
+    fill.passes().then(|| fill.refusal())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of [`sign_seat_move`], on for one test thread: the batch without its `Remove` of
+    /// the old seat, which the evaluator's check after signing must refuse.
+    pub(super) static MOVE_WITHOUT_REMOVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The one batch that moves a seat to a new vault key under its node key, for a proof's
+/// [`Decision::Replace`] and a person's Allow alike: a `Remove` of `seat` cut at `cutoff`, at once
+/// (the signer's next record, which [`moved_by_proof`] and [`seat_moved_by`] read) an `Admit` of
+/// [`Evidence::Manual`] of `entrant` under the seat's label and node key with the `Wrap`s of
+/// `audiences`' epochs, then the rotation of `[everyone]`, Commons and each host list whose newest
+/// epoch wraps the old seat's recipient: new epochs wrapped to every current recipient but that
+/// one, with the entries resealed. The old binding then reads no key newer than the `Remove`.
+/// Signed into `log`; returns the records in order.
+///
+/// # Errors
+/// A record fails to draft, sign or insert.
+pub(super) fn sign_seat_move(
+    log: &mut Log,
+    opened: &OpenedAudienceEntries,
+    audiences: &[crate::membership_log::SeatAudience],
+    signer: &Signer<'_>,
+    (seat, cutoff): (MemberId, RecordId),
+    entrant: Entrant,
+    now_ms: u64,
+) -> crate::Result<Vec<Record>> {
+    let old = log
+        .membership()
+        .get(&seat)
+        .map(|m| m.binding.recipient())
+        .ok_or_else(|| Error::new("the seat to move is no member"))?;
+    let new = entrant.request.binding().recipient();
+    let mut signed = Vec::new();
+    #[cfg(test)]
+    let drop_remove = MOVE_WITHOUT_REMOVE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let drop_remove = false;
+    if !drop_remove {
+        let remove = log
+            .draft(
+                signer.actor,
+                now_ms,
+                Body::Remove {
+                    member: seat,
+                    cutoff,
+                },
+            )
+            .sign(signer.seed, signer.incarnation)?;
+        log.insert(remove.clone())?;
+        signed.push(remove);
+    }
+    signed.extend(log.admit_with(signer, entrant, Evidence::Manual, opened, audiences, now_ms)?);
+    // A Mac whose new vault key keeps its age recipient reads with the same key: nothing to
+    // rotate it out of.
+    if old == new {
+        return Ok(signed);
+    }
+    log_entries::rotate_after_removal(
+        log,
+        opened,
+        &log_entries::AuthorCtx {
+            actor: signer.actor,
+            writer_seed: signer.seed,
+            incarnation: signer.incarnation,
+            authored_ms: now_ms,
+        },
+        &BTreeSet::from([old]),
+        &log_entries::Rotation {
+            everyone: None,
+            hosts: true,
+        },
+        &mut signed,
+    )?;
+    Ok(signed)
+}
+
 /// Whether the log binds `node` to `seat` by authority: the genesis lists it for that founder,
 /// the seat's own `Node` record carries it, whose proof by the key [`Record::decode`] verified,
 /// or the seat took it by proof from a seat bound so ([`moved_by_proof`]). Any other `Admit`'s
@@ -529,15 +814,10 @@ pub(super) fn decide(
     }
     let decision = match membership.node(&node) {
         NodeStanding::Member(seat) => {
-            let Some(held) = membership.get(&seat) else {
-                return refuse("the seat this node key names is gone");
+            let (cutoff, label) = match movable_seat(log, &seat) {
+                Ok(moved) => moved,
+                Err(why) => return refuse(why),
             };
-            if log.recipient_is_removed(&held.binding.recipient())
-                || membership.member_node_removed(held)
-                || log.audience_left_out(&EpochAudience::Everyone, &seat)
-            {
-                return refuse("the seat this node key names is held out");
-            }
             if !bound_by_authority(log, &seat, &node) && !proven.fleet && !proven.lan {
                 return refuse(
                     "only that seat's Admit binds this node key, which no proof by the key backs: \
@@ -577,14 +857,6 @@ pub(super) fn decide(
                      newer keys for good: the seat moves by itself once every member updated",
                 );
             }
-            let Some(label) = claimed_label(log, &seat) else {
-                return refuse("the seat this node key names claims no label");
-            };
-            let cutoff = log
-                .records()
-                .filter(|r| r.kind() != Kind::Genesis && *r.actor() == seat)
-                .max_by(|a, b| a.sequence().cmp(&b.sequence()).then(b.id().cmp(a.id())))
-                .map_or(held.entry, |r| *r.id());
             Decision::Replace {
                 seat,
                 cutoff,
@@ -606,10 +878,17 @@ pub(super) fn decide(
                      seat: a person decides",
                 );
             }
+            // A founder the genesis lists with no node key is the Mac that holds its recipient,
+            // which the possession challenge proves: on the home ALab LAN (or with the fleet's
+            // key) it takes the founder's own label, not a new one (one-mesh S1: m9).
+            let by_recipient = |f: &&crate::membership_log::Founder| {
+                f.node_key.is_none() && f.recipient == recipient && (proven.lan || proven.fleet)
+            };
             if let Some(founder) = membership
                 .unproved()
                 .iter()
                 .find(|f| f.node_key == Some(node))
+                .or_else(|| membership.unproved().iter().find(by_recipient))
             {
                 Decision::Founder {
                     label: founder.label.clone(),
@@ -714,7 +993,9 @@ fn unclaimed(log: &Log, node: &[u8; 32]) -> bool {
 /// On the unsynced pass (`!synced`), a Mac that proved neither the fleet's key nor a claim in the
 /// local log, and asked from off the home ALab LAN, is told [`NO_SEAT`] before touching the roster
 /// or local signer, so an unauthenticated caller learns nothing more of the log or of a copied
-/// recipient and triggers no server read.
+/// recipient and triggers no server read. Past that, a lab identity's proof (`proving.lab`) to a
+/// member whose vault is pinned to the live ALab genesis is refused with
+/// [`crate::members::desk::LAB_REFUSED`], which names nothing of the log (A12).
 fn pre_possession_pass(
     paths: &Paths,
     proving: &crate::members::desk::Proving<'_>,
@@ -727,6 +1008,11 @@ fn pre_possession_pass(
     };
     if !synced && !proving.fleet && !proving.lan && unclaimed(&log, &proving.node) {
         return Err(Some(NO_SEAT.to_owned()));
+    }
+    // A lab identity never joins the live ALab (A12), whatever else it proves: refused before the
+    // possession challenge and before any server read.
+    if proving.lab && super::live_genesis_store(&store) {
+        return Err(Some(crate::members::desk::LAB_REFUSED.to_owned()));
     }
     let source = records_bound(paths, &store).map_err(|_| None)?;
     if !proven.reader.can_take(source) {
@@ -768,7 +1054,8 @@ fn pre_possession_pass(
 /// or of a recipient it may have copied, with no server read, so a Mac that proves itself to each
 /// member in turn waits on none of them. For any other (a Mac on the LAN included) the vault's
 /// newest records come only once [`decide`] would let it in, and the log,
-/// roster, local signer and [`decide`] are checked again on what came back.
+/// roster, local signer and [`decide`] are checked again on what came back. A lab identity's proof
+/// to a member on the live ALab genesis is refused here too ([`crate::members::desk::LAB_REFUSED`]).
 ///
 /// What stays for after possession: [`Book::moved_seats_read`]'s refusal, as the seat moves by itself
 /// once every member updated and a plain ask would put a person's Allow in front of the very seat it
@@ -838,6 +1125,14 @@ fn admitted_name(asked: &str) -> String {
 ///
 /// # Errors
 /// Local state cannot be read or written, or signing fails.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "GapHeal",
+        action = "Admit",
+        project = "aterm_secrets::client::remove::tests::gap_heal::gap_heal_transition"
+    )
+)]
 pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate::Result<Readmit> {
     // The vault's newest records first, from its servers and peers: a member that has not read
     // a removal since (asleep, or away with only the removed Mac) would let that Mac back in. So
@@ -880,6 +1175,11 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
     if !fresh && decision != Decision::Already {
         return Ok(Readmit::Refused(NOT_FRESH.to_owned()));
     }
+    if let Decision::Replace { seat, .. } = &decision
+        && let Some(why) = seat_move_refusal(&log, &opened, &audiences, &me, seat)
+    {
+        return Ok(Readmit::Refused(why));
+    }
     let actor = binding.actor();
     let name = admitted_name(proven.name);
     let entrant = |label: String| Entrant {
@@ -904,29 +1204,18 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
                 seat,
                 cutoff,
                 label,
-            } => {
-                let remove = log
-                    .draft(
-                        &me,
-                        now_ms,
-                        Body::Remove {
-                            member: seat,
-                            cutoff,
-                        },
-                    )
-                    .sign(seed, incarnation)?;
-                log.insert(remove.clone())?;
-                let mut signed = vec![remove];
-                signed.extend(log.admit_with(
-                    &signer,
-                    entrant(label.clone()),
-                    Evidence::Manual,
+            } => (
+                sign_seat_move(
+                    &mut log,
                     &opened,
                     &audiences,
+                    &signer,
+                    (seat, cutoff),
+                    entrant(label.clone()),
                     now_ms,
-                )?);
-                (signed, How::Seat { label })
-            }
+                )?,
+                How::Seat { label },
+            ),
             Decision::Founder { label } => (
                 log.admit_with(
                     &signer,
@@ -980,6 +1269,9 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
         How::Seat { .. } | How::Founder { .. } | How::Fleet { .. } | How::Lan { .. } => {
             membership.node(&proven.node) == NodeStanding::Member(actor)
         }
+    } && match &decision {
+        Decision::Replace { seat, .. } => !membership.contains(seat),
+        _ => true,
     };
     if !label_held || !node_held {
         return Ok(Readmit::Refused(format!(
@@ -1047,7 +1339,9 @@ pub fn prove_at(
     prove_at_ms(paths, proving, book, aterm_time::unix_millis().unwrap_or(0))
 }
 
-/// [`prove_at`] at `now_ms` (this Mac's clock).
+/// [`prove_at`] at `now_ms` (this Mac's clock). A lab identity's proof on the live ALab genesis
+/// is refused before anything is read or signed (A12), as [`refuses_before_possession`] refuses
+/// it before the possession challenge.
 ///
 /// # Errors
 /// As [`prove_at`].
@@ -1057,6 +1351,9 @@ pub fn prove_at_ms(
     book: Book,
     now_ms: u64,
 ) -> crate::Result<SecretBytes> {
+    if proving.lab && on_live_genesis(paths) {
+        return Err(Error::new(crate::members::desk::LAB_REFUSED));
+    }
     let proven = Proven {
         request: proving.request,
         node: proving.node,

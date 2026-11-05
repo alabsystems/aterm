@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use super::{CoalRow, CoalSplit, Lead, Part, Via, Voucher, WhyFacts};
-use crate::model::{MemView, Pressure, Snapshot, Thermal, Throttle};
+use crate::model::{MemView, Pressure, Snapshot, Thermal};
 
 /// A covering cause's floor, millicores (RD §5.3).
 pub const FLOOR_MC: i64 = 500;
@@ -112,7 +112,8 @@ pub enum Context {
     Startup,
     /// Shortly after a wake.
     Wake,
-    /// The machine is throttled (thermal, or Low Power Mode).
+    /// The machine is throttled: a thermal level that claims it ([`Thermal::throttled`]), or
+    /// Low Power Mode.
     Throttled,
     /// Memory pressure is at warn or above.
     Pressure,
@@ -226,13 +227,8 @@ pub enum Evidence {
         /// Swap traffic, bytes per second, where read.
         swap_bps: Option<u64>,
     },
-    /// The throttle.
-    Throttled {
-        /// The thermal level.
-        level: Throttle,
-        /// Low Power Mode, where the OS says.
-        low_power: Option<bool>,
-    },
+    /// The throttle: the thermal state, Low Power Mode with it.
+    Throttled(Thermal),
 }
 
 /// A cause that holds over one window.
@@ -271,10 +267,11 @@ pub fn above_floor(covers_mc: i64, busy_mc: i64) -> bool {
         && i128::from(covers_mc) * 1000 >= i128::from(busy_mc) * i128::from(FLOOR_PM)
 }
 
-/// The machine's throttle, where it holds: thermal at `light` or above, or Low Power Mode.
+/// The machine's throttle, where it holds: an exact thermal level of serious or above, a
+/// heuristic one of light or above ([`Thermal::throttled`]), or Low Power Mode. Fair names none.
 pub(crate) fn throttle(snap: &Snapshot) -> Option<Thermal> {
     snap.thermal
-        .filter(|t| t.level >= Throttle::Light || t.low_power == Some(true))
+        .filter(|t| t.throttled() || t.low_power == Some(true))
 }
 
 /// Memory, where its pressure is at warn or above: `pressure` holds.
@@ -296,13 +293,7 @@ pub(crate) fn machine(snap: &Snapshot) -> Vec<Candidate> {
     };
     let mut out = Vec::new();
     if let Some(t) = throttle(snap) {
-        out.push(context(
-            Context::Throttled,
-            Evidence::Throttled {
-                level: t.level,
-                low_power: t.low_power,
-            },
-        ));
+        out.push(context(Context::Throttled, Evidence::Throttled(t)));
     }
     if let Some(m) = pressed(snap) {
         out.push(context(

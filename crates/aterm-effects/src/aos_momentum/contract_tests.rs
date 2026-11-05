@@ -165,6 +165,7 @@ fn a_tick_past_the_cold_forecast_that_still_draws_breaks_cold_tick_clears() {
     keyed_inputs[last - 1] = MomentumEvent::Key {
         at: 0,
         tau_bits: crate::cursor_momentum::MOMENTUM_GLOW_TAU_S.to_bits(),
+        echo: super::KeyEcho::Seen,
     };
     keyed.observations[last - 1].1 = MomentumObservation::Keyed;
     assert_eq!(contract.judge(schema, &keyed_inputs, &keyed), Verdict::Pass);
@@ -183,6 +184,7 @@ fn a_tick_past_the_cold_forecast_that_still_draws_breaks_cold_tick_clears() {
         MomentumEvent::Key {
             at: 0,
             tau_bits: crate::cursor_momentum::MOMENTUM_GLOW_TAU_S.to_bits(),
+            echo: super::KeyEcho::Seen,
         },
     );
     let mut stale = lit(&run);
@@ -249,6 +251,7 @@ fn refused_inputs_are_judged_by_no_law() {
         MomentumEvent::Key {
             at: 0,
             tau_bits: nan,
+            echo: super::KeyEcho::Seen,
         },
     );
     let mut bent = run.clone();

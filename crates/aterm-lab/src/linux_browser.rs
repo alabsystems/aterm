@@ -165,7 +165,7 @@ pub fn cmd_browser(args: &[String]) -> Res {
     );
     print!("\n{report}");
     let path = results.join("report.txt");
-    if let Err(e) = std::fs::write(&path, &report) {
+    if let Err(e) = crate::util::write_fresh(&path, &report) {
         eprintln!("aterm-lab: linux: {}: {e}", path.display());
     } else {
         println!("report and frames: {}", results.display());

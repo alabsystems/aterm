@@ -280,7 +280,7 @@ impl Job {
         let stdout = process.stdout.take().ok_or("no workload stdout")?;
         let (tx, rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
-            for line in std::io::BufReader::new(stdout).lines() {
+            for line in std::io::BufReader::new(stdout.take(1024 * 1024)).lines() {
                 if tx.send(line.unwrap_or_default()).is_err() {
                     break;
                 }

@@ -181,10 +181,10 @@ pub(super) fn log_look(lock: &Path, pid: u32, started_ms: u64) -> Result<(), Ope
             modified_us(meta).is_some_and(|at| at.saturating_add(CLOCK_SLACK_US) < from_us)
         };
         let sub_log = path.join(mz::LOG);
-        match std::fs::metadata(&sub_log) {
+        match std::fs::symlink_metadata(&sub_log) {
             Ok(meta) if older(&meta) => continue,
             Ok(_) => {}
-            Err(_) => match std::fs::metadata(&path) {
+            Err(_) => match std::fs::symlink_metadata(&path) {
                 Ok(meta) if older(&meta) => continue,
                 _ => return Err(Open::Unreadable),
             },

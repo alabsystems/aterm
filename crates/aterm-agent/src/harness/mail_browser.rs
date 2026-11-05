@@ -3,6 +3,9 @@
 //! Headless browser mailbox transport, using aterm's private CDP pipe and profile.
 
 #[cfg(unix)]
+mod owner;
+
+#[cfg(unix)]
 mod native {
     use super::super::{browser_window::ProfileLock, headless_fetch, headless_oauth as browser};
     use aterm_json::{Value, json};
@@ -38,7 +41,7 @@ mod native {
     }
 
     #[derive(Clone)]
-    struct StoredCredentials {
+    pub(super) struct StoredCredentials {
         email: String,
         login: String,
         password: Secret,
@@ -47,7 +50,7 @@ mod native {
     }
 
     impl StoredCredentials {
-        fn borrowed(&self) -> Credentials<'_> {
+        pub(super) fn borrowed(&self) -> Credentials<'_> {
             Credentials {
                 email: &self.email,
                 login: &self.login,
@@ -70,7 +73,7 @@ mod native {
         }
     }
 
-    /// One native mailbox shared by readers in this process. The profile has one owner.
+    /// Native readers share a process-local cache and one cross-process browser owner.
     pub type SharedMailbox = std::sync::Arc<std::sync::Mutex<aterm_mail::proton::Proton>>;
     type Slot = std::sync::Arc<
         std::sync::Mutex<std::sync::Weak<std::sync::Mutex<aterm_mail::proton::Proton>>>,
@@ -136,8 +139,16 @@ mod native {
         if let Some(mailbox) = slot.upgrade() {
             return Ok(mailbox);
         }
-        let mailbox =
-            HeadlessMail::connect_until(home, credentials, |_| {}, end)?.into_mailbox()?;
+        // Unbounded native Mail startup retains its existing browser setup;
+        // bounded CLI requests only use a browser already installed.
+        if end.is_none() {
+            headless_fetch::ensure_headless_browser(
+                Some(home),
+                &mut headless_fetch::Curl,
+                &|| false,
+            )?;
+        }
+        let mailbox = super::owner::mailbox(home, credentials, end)?;
         let mailbox = std::sync::Arc::new(std::sync::Mutex::new(mailbox));
         *slot = std::sync::Arc::downgrade(&mailbox);
         Ok(mailbox)
@@ -166,8 +177,21 @@ mod native {
             email: &str,
             progress: impl FnMut(&str),
         ) -> Result<Self, String> {
-            let config = browser::discover_mailbox_config(Some(home), None)
-                .ok_or("No stored mail credentials")?;
+            let stored = Self::stored_credentials(
+                browser::discover_mailbox_config(Some(home), None),
+                email,
+            )?;
+            Self::connect_with_credentials(home, stored.borrowed(), progress)
+        }
+
+        /// What `email`'s mailbox signs in with, from a discovered configuration: its login,
+        /// password, second password and TOTP seed, the lab registry's first
+        /// (`MailboxConfig`, one-mesh design step A9), else the mailbox files'.
+        pub(super) fn stored_credentials(
+            config: Option<browser::MailboxConfig>,
+            email: &str,
+        ) -> Result<StoredCredentials, String> {
+            let config = config.ok_or("No stored mail credentials")?;
             let login = config
                 .webmail_user_for(Some(email))
                 .ok_or("No mail login")?;
@@ -176,17 +200,13 @@ mod native {
                 .ok_or("No stored mail password")?;
             let mailbox = config.mailbox_password_for(Some(email));
             let totp = config.totp_secret_for(Some(email));
-            Self::connect_with_credentials(
-                home,
-                Credentials {
-                    email,
-                    login: &login,
-                    password: &password,
-                    mailbox_password: mailbox.as_deref(),
-                    totp_secret: totp.as_deref(),
-                },
-                progress,
-            )
+            Ok(StoredCredentials::from(Credentials {
+                email,
+                login: &login,
+                password: &password,
+                mailbox_password: mailbox.as_deref(),
+                totp_secret: totp.as_deref(),
+            }))
         }
 
         pub fn has_session(home: &Path, email: &str) -> bool {
@@ -212,7 +232,7 @@ mod native {
             operation_remaining(self.operation_deadline, cap)
         }
 
-        fn connect_until(
+        pub(super) fn connect_until(
             home: &Path,
             credentials: Credentials<'_>,
             progress: impl FnMut(&str),
@@ -656,7 +676,7 @@ mod native {
         }
     }
 
-    struct BrowserTransport {
+    pub(super) struct BrowserTransport {
         home: std::path::PathBuf,
         credentials: StoredCredentials,
         session: Option<HeadlessMail>,
@@ -664,7 +684,7 @@ mod native {
     }
 
     impl BrowserTransport {
-        fn new(session: HeadlessMail) -> Result<Self, String> {
+        pub(super) fn new(session: HeadlessMail) -> Result<Self, String> {
             Ok(Self {
                 home: session.home.clone(),
                 credentials: session
@@ -676,7 +696,7 @@ mod native {
             })
         }
 
-        fn session(&mut self) -> Result<&mut HeadlessMail, String> {
+        pub(super) fn session(&mut self) -> Result<&mut HeadlessMail, String> {
             if self.session.is_none() {
                 self.session = Some(HeadlessMail::connect_until(
                     &self.home,
@@ -702,7 +722,7 @@ mod native {
             || error.contains("Mail API request interrupted")
     }
 
-    fn transport_error(message: String) -> aterm_mail::proton::ApiError {
+    pub(super) fn transport_error(message: String) -> aterm_mail::proton::ApiError {
         use aterm_mail::proton_error::Kind;
         let kind = if message.contains("rejected the headless browser credentials") {
             Kind::Credentials
@@ -768,10 +788,8 @@ mod native {
             let _ = self.child.close();
         }
     }
-    fn digest(bytes: &[u8]) -> String {
-        let mut hash = aterm_digest::Sha256::new();
-        hash.update(bytes);
-        hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    pub(super) fn digest(bytes: &[u8]) -> String {
+        aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
     }
 
     fn identity_matches(email: &str, profile: &str) -> bool {
@@ -795,6 +813,38 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The webmail reader's credentials come from the lab registry's mailbox rows with no
+        /// mailbox file or sheet present: its login, password, second password and TOTP seed.
+        /// NEGATIVE CONTROL: with no registry mailbox (an empty `with_mail`), discovery finds
+        /// nothing and the reader says `No stored mail credentials`.
+        #[test]
+        fn the_webmail_reader_signs_in_with_the_registry_mailbox() {
+            use super::super::super::{alab_roster, headless_oauth::registry_tests as fixture};
+            let home = aterm_tempfile::tempdir().unwrap();
+            let email = "ai1@example.test";
+            let stored =
+                alab_roster::with_mail(vec![fixture::mailbox()], fixture::secrets(), || {
+                    HeadlessMail::stored_credentials(
+                        browser::discover_mailbox_config_files(Some(home.path()), None, None),
+                        email,
+                    )
+                })
+                .unwrap();
+            let read = stored.borrowed();
+            assert_eq!(read.login, "owner@example.test");
+            assert_eq!(read.password, "fixture-login-pass");
+            assert_eq!(read.mailbox_password, Some("fixture-second-pass"));
+            assert_eq!(read.totp_secret, Some(fixture::SEED));
+            let none = alab_roster::with_mail(Vec::new(), Vec::new(), || {
+                HeadlessMail::stored_credentials(
+                    browser::discover_mailbox_config_files(Some(home.path()), None, None),
+                    email,
+                )
+            });
+            assert_eq!(none.err().as_deref(), Some("No stored mail credentials"));
+        }
+
         #[test]
         #[ignore = "requires ATERM_MAIL_TEST_ACCOUNT and a live authenticated profile"]
         fn crashed_browser_reconnects_for_a_read() {
@@ -871,3 +921,9 @@ pub use native::{
     Credentials, HeadlessMail, SharedMailbox, operation_remaining, shared_mailbox,
     shared_mailbox_until,
 };
+
+/// Internal detached owner entry, reached only by the aterm executable.
+#[cfg(unix)]
+pub(crate) fn owner_main(home: &std::path::Path, account: &str) -> Result<(), String> {
+    owner::serve(home, account)
+}

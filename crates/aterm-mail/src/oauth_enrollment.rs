@@ -197,7 +197,7 @@ fn ready(stream: &TcpStream, budget: Duration) -> Result<(), Error> {
 }
 
 fn request(stream: &mut TcpStream, end: Instant) -> Result<zeroize::Zeroizing<String>, Error> {
-    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(512));
     while bytes.len() < 16384 {
         let left = end.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -224,7 +224,7 @@ fn request(stream: &mut TcpStream, end: Instant) -> Result<zeroize::Zeroizing<St
 }
 
 fn decode(text: &str) -> Result<String, Error> {
-    let mut bytes = Vec::with_capacity(text.len());
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(text.len()));
     let mut input = text.bytes();
     while let Some(byte) = input.next() {
         bytes.push(match byte {
@@ -239,11 +239,14 @@ fn decode(text: &str) -> Result<String, Error> {
             _ => byte,
         });
     }
-    let text = String::from_utf8(bytes).map_err(|_| error(ErrorKind::InvalidResponse))?;
+    let mut text = zeroize::Zeroizing::new(
+        String::from_utf8(std::mem::take(&mut *bytes))
+            .map_err(|_| error(ErrorKind::InvalidResponse))?,
+    );
     if text.chars().any(char::is_control) {
         return Err(error(ErrorKind::InvalidResponse));
     }
-    Ok(text)
+    Ok(std::mem::take(&mut *text))
 }
 
 fn callback(request: &str, port: u16, state: &str) -> Result<Option<Secret>, Error> {
@@ -260,7 +263,8 @@ fn callback(request: &str, port: u16, state: &str) -> Result<Option<Secret>, Err
     let mut hosts = lines
         .filter_map(|line| line.split_once(':'))
         .filter(|(name, _)| name.eq_ignore_ascii_case("host"));
-    if hosts.next().map(|(_, value)| value.trim().to_owned()) != Some(format!("127.0.0.1:{port}"))
+    let expected_host = format!("127.0.0.1:{port}");
+    if hosts.next().map(|(_, value)| value.trim()) != Some(expected_host.as_str())
         || hosts.next().is_some()
     {
         return Err(invalid());

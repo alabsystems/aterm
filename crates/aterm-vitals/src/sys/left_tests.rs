@@ -5,7 +5,7 @@
 //! program, a live tab's orphan, a dead verify run and its member.
 
 use super::*;
-use crate::left::{ClosedTab, LeftRow, LeftView, Proof, RunRow, Source, State, Tier, Why};
+use crate::left::{ClosedTab, LeftRow, LeftView, LiveTab, Proof, RunRow, Source, State, Tier, Why};
 use crate::sys::json::contract_violations;
 use crate::sys::{Freshness, Machine, TabFact, Target};
 use std::sync::Arc;
@@ -30,6 +30,7 @@ fn row(pid: u32, state: State, tier: Tier, why: Why, from: Source) -> LeftRow {
         teller: None,
         token: None,
         foreground: false,
+        after_agent: false,
     }
 }
 
@@ -99,12 +100,14 @@ pub(crate) fn view_fixture() -> LeftView {
             shell_uniqueid: 1000,
             horizon: 2000,
             closed_ms: 1_792_185_000_000,
-            agent_since: None,
+            agent_spans: Vec::new(),
             left: 1,
         }],
         live: Vec::new(),
         complete: true,
         bounded: false,
+        as_of_ms: 1_792_185_600_000,
+        build_dirs: Vec::new(),
     }
 }
 
@@ -375,4 +378,110 @@ fn no_reading_yet_says_so() {
     assert_eq!(lines.len(), 1);
     assert!(lines[0].starts_with("left  unavailable("), "{lines:?}");
     assert!(contract_violations(&json("left --json", &c)).is_empty());
+}
+
+/// A DANGLING LINK'S ROW NAMES ITS TARGET, AND ITS PATHS ONLY WITH NO CALLER SESSION: no session
+/// owns a link, so a caller in a tab reads its checkout's number and no path, and the owner's
+/// sessionless read the checkout and the link. Only `scope=aterm` shows links at all. The JSON
+/// says the same and keeps the contract.
+#[test]
+fn a_dangling_links_row_names_its_target_and_paths_only_with_no_caller() {
+    use crate::left::{LinkRow, LinkTarget};
+    let mut view = view_fixture();
+    view.links = vec![LinkRow {
+        root: 1,
+        checkout: "/Users//a/src/wt-a".into(),
+        path: "/Users//a/src/wt-a/target".into(),
+        kind: "target".into(),
+        target: LinkTarget::NotMounted,
+        seen: "disk".into(),
+    }];
+    let w = world();
+    let s = snap(view);
+    let owner = ctx(&w, &s, None);
+    let lines = text("left scope=aterm", &owner);
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some(
+            "link state=dangling root=/Users//a/src/wt-a kind=target target=not-mounted \
+             seen=disk path=/Users//a/src/wt-a/target"
+        )
+    );
+    let mine: &[u64] = &[7];
+    let caller = ctx(&w, &s, Some(mine));
+    let lines = text("left scope=aterm", &caller);
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("link state=dangling root=1 kind=target target=not-mounted seen=disk")
+    );
+    assert!(
+        !text("left", &caller).iter().any(|l| l.starts_with("link ")),
+        "a tab's scope shows no link"
+    );
+    let j = json("left scope=aterm --json", &owner);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    let Some(Jv::Arr(links)) = j.get("links") else {
+        panic!("{}", j.to_text());
+    };
+    assert_eq!(links[0].get("target"), Some(&Jv::s("not-mounted")));
+    assert_eq!(
+        links[0].get("path"),
+        Some(&Jv::s("/Users//a/src/wt-a/target"))
+    );
+}
+
+/// EACH OF THE AGENT'S LEFT ROWS SAYS WHOSE COUNT IT IS IN: of two offered rows of the target's
+/// tab, whose agent started at unique id 1200, the one born after the agent prints
+/// `left_of=s-ab12` (text and JSON) and the person's, born before it, prints none, so the rows
+/// `status left=` counts are the ones `sys left` marks; the same view's `status_field` reads one.
+/// NEGATIVE CONTROL: mark every offered row of a live tab, and the person's row reads as the
+/// agent's.
+#[test]
+fn each_agents_left_row_says_whose_count_it_is_in() {
+    let w = world();
+    let mut v = view_fixture();
+    v.live = vec![LiveTab {
+        key: 7,
+        sid: "s-ab12".into(),
+        shell_pid: 300,
+        shell_uniqueid: Some(1000),
+        fg_pgid: None,
+        agent_spans: vec![crate::left::AgentSpan {
+            since: 1200,
+            until: None,
+        }],
+    }];
+    let mut person = v.rows[2].clone();
+    person.pid = 4101;
+    person.token = Some("4101@1792098840004410:12".into());
+    person.teller = None;
+    v.rows[2].after_agent = true;
+    v.rows.push(person);
+    let s = snap(v.clone());
+    let c = ctx(&w, &s, None);
+    let lines = text("left scope=aterm", &c);
+    assert!(
+        proc_line(&lines, 4100).is_some_and(
+            |l| l.ends_with(" teller=s-ab12 left_of=s-ab12 end=4100@1792098840004410:12")
+        ),
+        "{lines:#?}"
+    );
+    assert!(
+        proc_line(&lines, 4101).is_some_and(|l| !l.contains("left_of=")),
+        "{lines:#?}"
+    );
+    let j = json("left scope=aterm --json", &c);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    let Some(Jv::Arr(procs)) = j.get("procs") else {
+        panic!("{}", j.to_text());
+    };
+    let left_of = |pid: u64| {
+        procs
+            .iter()
+            .find(|p| p.get("pid") == Some(&Jv::u(pid)))
+            .and_then(|p| p.get("left_of").cloned())
+    };
+    assert_eq!(left_of(4100), Some(Jv::s("s-ab12")));
+    assert_eq!(left_of(4101), None);
+    assert!(status_field(Some(&v), Some("s-ab12"), 0).starts_with("left=1:"));
 }

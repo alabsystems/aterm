@@ -120,6 +120,92 @@ pub fn retain(broker: &astream_broker::Broker) -> io::Result<()> {
     broker.set_retention(default_rules())
 }
 
+/// THE BROKER'S RATE LIMIT (critic item E06): astream's per-producer token bucket
+/// (`DESIGN-aterm-fabric` T9), keyed by the producer id, which on a guarded broker is the
+/// attached capability's principal. A node's bridge publishes every session of its node, its bus
+/// mirror's slots included, under one producer; each person's and agent's client publishes under
+/// its own. So it bounds a runaway bridge loop, the mirror, or a direct client, and not one
+/// session inside a bridge.
+///
+/// From the shipped traffic as E06 measured it (`docs/measured/fabric/README.md`, "A default
+/// broker rate limit": one node, aterm's ordered broker, `--tally`, four runs at a load of 4.5 to
+/// 15.6 on 18 cores): the 5-sender burst of 500 posts is acked in 43.1 to 50.7 ms, its 510
+/// publishes from the one bridge producer (the 500 notes and 10 `ev` rows; an inbox commit is no
+/// publish) at up to 11,830 a second; the paced notes are about three publishes each, 1.1 s
+/// apart; and the mirror paces itself at [`crate::mirror::RATE_PER_SEC`] with a burst of
+/// [`crate::mirror::RATE_BURST`] slots. The bucket is at least four times each:
+/// [`RATE_RECORDS_PER_SEC`] over the burst's fastest rate (4.2 times), [`RATE_BURST_RECORDS`]
+/// over the mirror's whole burst and the post burst together, which so take at most a quarter of
+/// it however fast a machine sends them. [`RATE_BURST_BYTES`] is four frames at
+/// astream's frame bound, so no record the wire carries is ever past the byte burst (astream
+/// refuses such a record at every try, `record bytes exceed burst_bytes`); the largest the
+/// measured traffic wrote is 198 bytes. [`RATE_BYTES_PER_SEC`] is a whole frame a second: the
+/// burst's notes are 136 bytes each (`2026-11-05-fabric-6065`), 1.61 MB/s at its fastest record
+/// rate, a tenth of it.
+pub const RATE_RECORDS_PER_SEC: u64 = 50_000;
+/// The record bucket's burst ([`RATE_RECORDS_PER_SEC`]).
+pub const RATE_BURST_RECORDS: u64 = 4 * (crate::mirror::RATE_BURST + 512);
+/// The byte bucket's sustained rate, of `subject + body` ([`RATE_RECORDS_PER_SEC`]).
+pub const RATE_BYTES_PER_SEC: u64 = FRAME_BYTES;
+/// The byte bucket's burst ([`RATE_RECORDS_PER_SEC`]).
+pub const RATE_BURST_BYTES: u64 = 4 * FRAME_BYTES;
+
+/// astream's frame bound, which no record's `subject + body` reaches.
+const FRAME_BYTES: u64 = astream_wire::MAX_PAYLOAD_LEN as u64;
+
+/// The rate limit every broker aterm opens publishes under ([`RATE_RECORDS_PER_SEC`]).
+///
+/// # Panics
+/// Never: each bound is a constant within astream's `MAX_RATE_BUDGET`.
+#[must_use]
+pub fn rate_limit() -> astream_broker::RateLimit {
+    astream_broker::RateLimit::records(RATE_RECORDS_PER_SEC, RATE_BURST_RECORDS)
+        .and_then(|limit| limit.with_bytes(RATE_BYTES_PER_SEC, RATE_BURST_BYTES))
+        .unwrap_or_else(|| unreachable!("the default rate limit is refused"))
+}
+
+/// Limit `broker`'s publishes by [`rate_limit`], from this open: called at once after the open,
+/// beside [`retain`], before the broker serves.
+///
+/// # Errors
+/// Astream's refusal of the limit's bounds.
+pub fn limit(broker: &astream_broker::Broker) -> io::Result<()> {
+    broker.set_rate_limit(Some(rate_limit()))
+}
+
+/// The limit a broker serves under (`Broker::rate_limit`, read back after [`limit`]) in a few
+/// words, for `aterm link broker`'s start line: aterm's default ([`rate_summary`]), another, or
+/// none.
+#[must_use]
+pub fn rate_word(served: Option<astream_broker::RateLimit>) -> String {
+    match served {
+        Some(served) if served == rate_limit() => {
+            format!("rate-limited by aterm's default ({})", rate_summary())
+        }
+        Some(served) if served.bytes_per_sec == 0 => format!(
+            "rate-limited at {} records/s (burst {}) per producer",
+            served.records_per_sec, served.burst_records
+        ),
+        Some(served) => format!(
+            "rate-limited at {} records/s (burst {}), {} bytes/s (burst {}) per producer",
+            served.records_per_sec, served.burst_records, served.bytes_per_sec, served.burst_bytes
+        ),
+        None => "unlimited".to_string(),
+    }
+}
+
+/// The limit in a few words, for `aterm link broker`'s start line.
+#[must_use]
+pub fn rate_summary() -> String {
+    const MIB: u64 = 1024 * 1024;
+    format!(
+        "{RATE_RECORDS_PER_SEC} records/s (burst {RATE_BURST_RECORDS}), {} MiB/s (burst {} MiB) \
+         per producer",
+        RATE_BYTES_PER_SEC / MIB,
+        RATE_BURST_BYTES / MIB
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +406,24 @@ mod tests {
             Rule::hold(EV_FILTER).unwrap(),
         ]);
         assert!(!retains_ev(&held, "f", n), "a hold rule over the faces");
+    }
+
+    /// THE START LINE NAMES THE LIMIT THE BROKER SERVES ([`rate_word`]): aterm's default by its
+    /// summary, another by its numbers, none as such.
+    #[test]
+    fn the_start_line_names_the_limit_the_broker_serves() {
+        assert_eq!(
+            rate_word(Some(rate_limit())),
+            format!("rate-limited by aterm's default ({})", rate_summary())
+        );
+        assert_eq!(
+            rate_word(astream_broker::RateLimit::records(10, 3)),
+            "rate-limited at 10 records/s (burst 3) per producer"
+        );
+        assert_eq!(
+            rate_word(astream_broker::RateLimit::records(10, 3).and_then(|l| l.with_bytes(5, 7))),
+            "rate-limited at 10 records/s (burst 3), 5 bytes/s (burst 7) per producer"
+        );
+        assert_eq!(rate_word(None), "unlimited");
     }
 }

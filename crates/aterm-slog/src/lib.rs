@@ -61,6 +61,7 @@ pub use turn::{
     WallJudge, attributes, dismisses, rebase, settle_due, settle_out, tx_close_at, within_lead,
 };
 pub use vocab::{
-    Actor, Conf, Kind, Lvl, Node, Op, RESERVED_ACTOR_WORDS, ShortId, Src, is_reserved_actor_word,
+    Actor, Conf, FLEET_ACTOR_PREFIX, Kind, Lvl, Node, Op, RESERVED_ACTOR_WORDS, ShortId, Src,
+    UNAVAILABLE, is_reserved_actor_word,
 };
-pub use words::{BoxWord, Out, RunOut, SessionOut, StepOut, TurnOut, WallKind, need_rank};
+pub use words::{BoxWord, Out, RunOut, SessionOut, StepOut, TabAct, TurnOut, WallKind, need_rank};

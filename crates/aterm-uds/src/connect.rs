@@ -134,20 +134,15 @@ fn socket(domain: libc::c_int) -> io::Result<OwnedFd> {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: this fresh descriptor has no other owner, including on error paths.
-        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Before the mark, as F_SETFD replaces every descriptor flag.
+        #[cfg(not(target_os = "linux"))]
+        // SAFETY: F_SETFD changes only our descriptor's inheritance flags.
+        if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fd)
     })?;
-    #[cfg(not(target_os = "linux"))]
-    {
-        // SAFETY: F_GETFD reads flags from our live descriptor.
-        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: F_SETFD changes only our descriptor's inheritance flags, keeping its mark.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
     #[cfg(target_vendor = "apple")]
     {
         // Adopting an OwnedFd bypasses std's Apple socket constructor.

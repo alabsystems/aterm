@@ -57,9 +57,32 @@ impl Context {
             && !self.conversation.contains(['\n', '\r', '\0'])
     }
 
+    // Passive capture cannot borrow another supervisor's Relaunch ownership.
+    fn passive_valid(&self) -> bool {
+        self.valid()
+            && self
+                .authority
+                .same_builtin_relaunch_continuity(&self.authority)
+    }
+
+    // A completed native mutation may retain an outcome while its independently admitted
+    // sealed service operates under a foreign claim. That evidence keeps the full claim
+    // revision; only built-in outcomes use the benign host-claim continuity rule.
+    fn outcome_matches(&self, current: &Self) -> bool {
+        if self.passive_valid() {
+            self.matches(current)
+        } else {
+            self.stable_matches(current)
+                && self.authority == current.authority
+                && self.human_seq == current.human_seq
+        }
+    }
+
     fn matches(&self, current: &Self) -> bool {
         self.stable_matches(current)
-            && self.authority == current.authority
+            && self
+                .authority
+                .same_builtin_relaunch_continuity(&current.authority)
             && self.human_seq == current.human_seq
     }
 
@@ -274,7 +297,7 @@ pub(crate) struct Evidence {
     refresh_closed: AtomicBool,
     death: Arc<dyn DeathWitness>,
     // Field order releases capacity only AFTER the owned descriptor has closed.
-    _reservation: ReservationOwner,
+    reservation: ReservationOwner,
 }
 
 impl Evidence {
@@ -300,10 +323,12 @@ impl Evidence {
     }
 
     fn guards(&self, context: &Context, master: i32, kernel: &dyn Kernel) -> bool {
-        self.context.matches(context)
-            && kernel
-                .process(context.actor.pid)
-                .is_some_and(|actual| same_actor(&context.actor, &actual))
+        (match &self.reservation {
+            ReservationOwner::Live { .. } => self.context.matches(context),
+            ReservationOwner::Outcome { .. } => self.context.outcome_matches(context),
+        }) && kernel
+            .process(context.actor.pid)
+            .is_some_and(|actual| same_actor(&context.actor, &actual))
             && kernel.process(self.shell().pid).as_ref() == Some(self.shell())
             && self.vendor().parent == self.shell().pid
             && self.vendor().session == self.shell().session
@@ -781,7 +806,7 @@ impl Store {
                 .expires_us
                 .checked_sub(now_us)
                 .is_some_and(|left| left != 0 && left <= LIFETIME_US)
-            && capture.context.matches(context)
+            && capture.context.outcome_matches(context)
             && kernel
                 .process(context.actor.pid)
                 .is_some_and(|actual| same_actor(&context.actor, &actual))
@@ -821,7 +846,7 @@ impl Store {
             invalidated: AtomicBool::new(false),
             refresh_closed: AtomicBool::new(false),
             death,
-            _reservation: ReservationOwner::Outcome {
+            reservation: ReservationOwner::Outcome {
                 _reserved: reserved,
             },
         }));
@@ -879,7 +904,7 @@ impl Store {
             retired,
         };
         if !registration.is_valid()
-            || !context.valid()
+            || !context.passive_valid()
             || registration.host_epoch != context.host_epoch
         {
             return unknown(retired);
@@ -1013,7 +1038,7 @@ impl Store {
             invalidated: AtomicBool::new(false),
             refresh_closed: AtomicBool::new(false),
             death,
-            _reservation: ReservationOwner::Live {
+            reservation: ReservationOwner::Live {
                 _reserved: reserved,
             },
         }));

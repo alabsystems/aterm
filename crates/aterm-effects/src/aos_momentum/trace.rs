@@ -16,8 +16,8 @@ use aterm_aos::{Digest, TaskIdentity};
 use aterm_time::Instant;
 
 use super::{
-    MOMENTUM_HOST_MAX_EVENTS, MOMENTUM_MAX_EVENTS, MomentumCode, MomentumEvent, MomentumSchema,
-    MomentumState, NoStrandedLight, PrebuiltMomentum, momentum_identity,
+    KeyEcho, MOMENTUM_HOST_MAX_EVENTS, MOMENTUM_MAX_EVENTS, MomentumCode, MomentumEvent,
+    MomentumSchema, MomentumState, NoStrandedLight, PrebuiltMomentum, momentum_identity,
 };
 
 /// The bytes that open a momentum trace file.
@@ -46,7 +46,10 @@ pub struct MomentumTrace {
 /// How many inputs of each kind a log holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EventCounts {
+    /// Every key, seen or not.
     pub keys: usize,
+    /// The keys among [`Self::keys`] logged [`KeyEcho::Unseen`].
+    pub unseen: usize,
     pub resets: usize,
     pub ticks: usize,
     pub queries: usize,
@@ -59,12 +62,20 @@ impl EventCounts {
     pub const fn of(inputs: &[MomentumEvent]) -> Self {
         let mut c = EventCounts {
             keys: 0,
+            unseen: 0,
             resets: 0,
             ticks: 0,
             queries: 0,
         };
         let mut i = 0;
         while i < inputs.len() {
+            if let MomentumEvent::Key {
+                echo: KeyEcho::Unseen,
+                ..
+            } = inputs[i]
+            {
+                c.unseen = c.unseen.saturating_add(1);
+            }
             let slot = match inputs[i] {
                 MomentumEvent::Key { .. } => &mut c.keys,
                 MomentumEvent::Reset => &mut c.resets,
@@ -77,7 +88,7 @@ impl EventCounts {
         c
     }
 
-    /// Every input counted.
+    /// Every input counted (an unseen key once, among the keys).
     #[inline]
     #[must_use]
     pub const fn total(&self) -> usize {
@@ -106,6 +117,10 @@ pub struct TraceReplay {
     pub log_epoch: u64,
     pub first_cursor: u64,
     pub counts: EventCounts,
+    /// The replayed head state's count of keys logged unseen ([`MomentumState::unseen`]): the
+    /// checkpoint's own count included, so a trace cut after a re-anchor or a repair still says
+    /// it holds such keys.
+    pub unseen: u32,
     pub state_digest: Digest,
     pub observation_chain: Digest,
 }
@@ -308,6 +323,22 @@ impl MomentumTrace {
         self.read_at_most(epoch, MOMENTUM_MAX_EVENTS)
     }
 
+    /// How many keys the trace holds that were logged [`KeyEcho::Unseen`]: its checkpoint state's
+    /// count ([`MomentumState::unseen`]) and its log's, so a trace cut after a re-anchor or a
+    /// repair still says it holds them.
+    /// # Errors
+    /// Any of [`Self::read`]'s, or [`TraceFault::Restore`] for a checkpoint of another identity.
+    #[inline]
+    pub fn unseen_keys(&self, epoch: Instant) -> Result<u32, TraceFault> {
+        let read = self.read(epoch)?;
+        let start: MomentumState = read
+            .checkpoint
+            .restore(&read.schema, &self.identity)
+            .map_err(TraceFault::Restore)?;
+        let logged = u32::try_from(read.counts.unseen).unwrap_or(u32::MAX);
+        Ok(start.unseen().saturating_add(logged))
+    }
+
     /// [`Self::read`] refusing, before it decodes an event, a log of more than `max_events` inputs.
     #[inline]
     fn read_at_most(&self, epoch: Instant, max_events: usize) -> Result<ReadTrace, TraceFault> {
@@ -478,6 +509,7 @@ impl MomentumTrace {
             log_epoch: read.log.header().log_epoch,
             first_cursor,
             counts: read.counts,
+            unseen: run.state.unseen(),
             state_digest: run.state_digest,
             observation_chain: run.observation_chain,
         };

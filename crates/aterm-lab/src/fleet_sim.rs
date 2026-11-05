@@ -816,7 +816,7 @@ impl Sim {
                 "m{i:02}: its [fleet] allow was not content"
             )));
         }
-        std::fs::write(&config, &flipped)
+        crate::util::atomic_write(&config, flipped.as_bytes())
             .map_err(|e| Fail::die(format!("m{i:02} config write: {e}")))?;
         let saw = crate::wait_until(world::HANG, || {
             let out = self.read(&["survey", "--host", &host, "--json"]);
@@ -871,7 +871,7 @@ impl Sim {
         };
         let row = self.invocation_row(checks, &stamp, &machine);
         let body = self.record_body(checks, &date, &machine, &earlier, &row, to_docs);
-        std::fs::write(&path, body).map_err(|e| e.to_string())?;
+        crate::util::write_fresh(&path, body).map_err(|e| e.to_string())?;
         Ok(path.to_string_lossy().into_owned())
     }
 

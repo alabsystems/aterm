@@ -519,7 +519,11 @@ fn directory(path: &Path) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(refused("cohort namespace path must be absolute"));
     }
-    let mut dir = File::from(fd::openat(fd::CWD, "/", directory_flags(), Mode::empty())?);
+    let mut dir = aterm_uds::kept_out(|| {
+        fd::openat(fd::CWD, "/", directory_flags(), Mode::empty())
+            .map(File::from)
+            .map_err(io::Error::from)
+    })?;
     for part in path.components() {
         match part {
             Component::RootDir => {}
@@ -535,32 +539,44 @@ fn directory_flags() -> OFlags {
 }
 
 fn child_dir(parent: &File, name: impl fd::Arg) -> io::Result<File> {
-    Ok(File::from(fd::openat(
-        parent,
-        name,
-        directory_flags(),
-        Mode::empty(),
-    )?))
+    aterm_uds::kept_out(|| {
+        fd::openat(parent, name, directory_flags(), Mode::empty())
+            .map(File::from)
+            .map_err(io::Error::from)
+    })
 }
 
 pub(crate) fn regular(parent: &File, name: &str) -> io::Result<File> {
-    let file = File::from(fd::openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    )?);
+    let file = aterm_uds::kept_out(|| {
+        fd::openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(io::Error::from)
+    })?;
     Inode::read(&file, false)?;
     Ok(file)
 }
 
 pub(crate) fn create(parent: &File, name: &str) -> io::Result<File> {
-    Ok(File::from(fd::openat(
-        parent,
-        name,
-        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )?))
+    aterm_uds::kept_out(|| {
+        fd::openat(
+            parent,
+            name,
+            OFlags::RDWR
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::CLOEXEC
+                | OFlags::NONBLOCK,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map(File::from)
+        .map_err(io::Error::from)
+    })
 }
 
 fn read(parent: &File, name: &str) -> io::Result<String> {

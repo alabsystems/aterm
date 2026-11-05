@@ -1977,8 +1977,8 @@ static DESTRUCTIVE_RUNS: std::sync::LazyLock<Vec<Vec<&'static str>>> =
     });
 
 /// Outward or irreversible work: [`DESTRUCTIVE_WORDS`], [`GIT_DESTROYS`] and what leaves the
-/// machine or ends a process (`kill`, `aterm ctl end`); the allow list's own cleanup is the only
-/// exception.
+/// machine or ends a process (`kill`, `aterm ctl end`, `end`, `stop` or `shut down` before a
+/// process noun: [`ends_a_process`]); the allow list's own cleanup is the only exception.
 fn outward(unit: &Unit, says_at: Option<usize>) -> bool {
     const WORDS: &[&str] = &[
         "sent",
@@ -2068,8 +2068,58 @@ fn outward(unit: &Unit, says_at: Option<usize>) -> bool {
             || OUTWARD_PREFIXES.iter().any(|p| w.starts_with(p))
             || PHRASES.iter().any(|p| unit.at(i, p))
             || (inflects(w, "push") && pushes_elsewhere(unit, i))
+            || ends_a_process(unit, i)
     })
 }
+
+/// Whether word `i` is `end`, `stop` or `shut down` (`shutdown`), in any form (`ending`,
+/// `stopped`, `shutting down`), before a process noun ([`PROCESS_NOUNS`]): past its determiners
+/// (`the`, `my`, `those`, …), within the next three words, its clause unbroken (`end the leftover
+/// processes`, `ending my stale dev server`, `stop the preview server`), no preposition between.
+/// Ending a process is never undone, so a question about one gets no standing go-ahead. `end the
+/// day`, `the end of the job` and `stop the build` end none.
+fn ends_a_process(unit: &Unit, i: usize) -> bool {
+    const DETERMINERS: &[&str] = &[
+        "the", "a", "an", "my", "our", "its", "this", "that", "these", "those", "every", "each",
+        "all", "both", "any",
+    ];
+    const ENDS: &[&str] = &[
+        "and", "or", "then", "so", "once", "when", "if", "before", "after", "of", "in", "on",
+        "for", "to", "with", "at", "by",
+    ];
+    let w = unit.word(i);
+    let object = if inflects_any(w, &["end", "stop", "shutdown"]) {
+        i + 1
+    } else if inflects(w, "shut") && unit.word(i + 1) == "down" {
+        i + 2
+    } else {
+        return false;
+    };
+    let from = (object..unit.len())
+        .find(|&k| !DETERMINERS.contains(&unit.word(k)))
+        .unwrap_or(unit.len());
+    (from..(from + 3).min(unit.len()))
+        .take_while(|&k| !ENDS.contains(&unit.word(k)))
+        .any(|k| PROCESS_NOUNS.contains(&unit.word(k)))
+}
+
+/// The nouns of a process `end` may take ([`ends_a_process`]).
+const PROCESS_NOUNS: &[&str] = &[
+    "process",
+    "processes",
+    "leftover",
+    "leftovers",
+    "watcher",
+    "watchers",
+    "server",
+    "servers",
+    "job",
+    "jobs",
+    "daemon",
+    "daemons",
+    "pid",
+    "pids",
+];
 
 /// Whether the push at word `i` names a destination that is not the agent's branch or main:
 /// `to <X>` in its clause within six words, X (past a determiner) not main, master, origin, the

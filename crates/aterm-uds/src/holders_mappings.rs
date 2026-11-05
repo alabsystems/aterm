@@ -90,6 +90,7 @@ fn mac_region(buf: &[u8]) -> Result<Region, Failed> {
 pub(super) fn mac_uses(pid: u32, dirs: &[PathBuf]) -> Result<Option<PathUse>, Failed> {
     let n = i32::try_from(pid).map_err(|_| Failed::Other)?;
     mac_with(pid, dirs, |at| {
+        crate::progress::tick();
         let mut buf = [0u8; ffi::REGION_SIZE];
         clear_errno();
         // SAFETY: `buf` is writable for the SDK-checked record size passed to libproc.
@@ -272,7 +273,7 @@ mod procfs {
             use std::os::unix::fs::OpenOptionsExt as _;
             let file = std::fs::OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
                 .open(proc_dir.join("maps"))?;
             if !file.metadata()?.is_file() {
                 return Err(std::io::Error::new(

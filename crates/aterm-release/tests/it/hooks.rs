@@ -1189,13 +1189,12 @@ fn a_cutter_is_handed_only_when_the_variable_names_its_own_executable() {
 }
 
 #[test]
-fn the_transforms_stub_runs_a_handed_cutter_and_builds_one_only_without() {
+fn publication_stubs_run_a_handed_cutter_and_build_one_only_without() {
     let bash = Path::new("/bin/bash");
     if !bash.exists() {
         aterm_spec::host::could_not_run("/bin/bash is not installed");
     }
     let (_dir, root, _git) = scratch();
-    let stub = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../publish/transforms.sh");
     let (bin, said) = (root.join("bin"), root.join("said"));
     std::fs::create_dir_all(&bin).unwrap();
     for name in ["aterm-release", "targo"] {
@@ -1211,29 +1210,52 @@ fn the_transforms_stub_runs_a_handed_cutter_and_builds_one_only_without() {
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
-    let sourced = |handed: Option<&Path>| {
+    let sourced = |name: &str, handed: Option<&Path>| {
+        let stub = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../publish")
+            .join(name);
         let _ = std::fs::remove_file(&said);
         let mut sh = aterm_uds::spawnfd::command(bash);
-        sh.args(["-c", "set -euo pipefail\n. \"$1\"\n", "transforms"])
-            .arg(&stub)
-            .env("TRUST_STAGE2_BIN", &bin)
-            .env_remove("ATERM_RELEASE_CUTTER")
-            .stdin(aterm_uds::spawnfd::Stdio::null());
+        sh.args([
+            "-c",
+            "stub=$1; shift; set -euo pipefail\n. \"$stub\"\n",
+            "hook",
+        ])
+        .arg(&stub)
+        .env("TRUST_STAGE2_BIN", &bin)
+        .env_remove("ATERM_RELEASE_CUTTER")
+        .stdin(aterm_uds::spawnfd::Stdio::null());
         if let Some(cutter) = handed {
             sh.env("ATERM_RELEASE_CUTTER", cutter);
         }
-        assert!(sh.status().unwrap().success(), "{}", stub.display());
-        std::fs::read_to_string(&said).unwrap()
+        let status = sh.status().unwrap();
+        (
+            status.success(),
+            std::fs::read_to_string(&said).unwrap_or_default(),
+        )
     };
     let cutter = bin.join("aterm-release");
-    let built = format!(
-        "{} --unverified ship hook transforms\n",
-        bin.join("targo").display()
-    );
-    assert_eq!(
-        sourced(Some(&cutter)),
-        format!("{} hook transforms\n", cutter.display())
-    );
-    assert_eq!(sourced(None), built);
-    assert_eq!(sourced(Some(Path::new(""))), built);
+    for (name, verb) in [
+        ("transforms.sh", "transforms"),
+        ("pre-promote", "pre-promote"),
+        ("post-promote", "post-promote"),
+    ] {
+        let built = (
+            true,
+            format!(
+                "{} --unverified ship hook {verb}\n",
+                bin.join("targo").display()
+            ),
+        );
+        assert_eq!(
+            sourced(name, Some(&cutter)),
+            (true, format!("{} hook {verb}\n", cutter.display()))
+        );
+        assert_eq!(sourced(name, None), built);
+        assert_eq!(sourced(name, Some(Path::new(""))), built);
+        assert_eq!(
+            sourced(name, Some(&bin.join("missing cutter"))),
+            (false, String::new())
+        );
+    }
 }

@@ -109,7 +109,7 @@ struct Head {
 /// `malformed`, so it is still logged and answered. Every line, the request line included,
 /// counts toward `HEAD_MAX`, and a read that fails after some bytes is a head cut short.
 fn read_head(reader: &mut BufReader<&TcpStream>) -> Option<Head> {
-    let mut raw = Vec::new();
+    let mut raw = Vec::with_capacity(256);
     let first = u64::try_from(HEAD_MAX + 1).unwrap_or(u64::MAX);
     let ended = reader.by_ref().take(first).read_until(b'\n', &mut raw);
     if raw.is_empty() {
@@ -117,14 +117,18 @@ fn read_head(reader: &mut BufReader<&TcpStream>) -> Option<Head> {
     }
     let mut read = raw.len();
     let cut = ended.is_err() || !raw.ends_with(b"\n");
-    let line = String::from_utf8_lossy(&raw).into_owned();
-    let mut parts = line.split_ascii_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let target = parts.next().unwrap_or("").to_string();
+    let (method, target) = {
+        let line = String::from_utf8_lossy(&raw);
+        let mut parts = line.split_ascii_whitespace();
+        (
+            parts.next().unwrap_or("").to_string(),
+            parts.next().unwrap_or("").to_string(),
+        )
+    };
     let mut malformed = target.is_empty() || cut || read > HEAD_MAX;
     let mut headers = Vec::new();
     while !malformed {
-        let mut raw = Vec::new();
+        raw.clear();
         let room = u64::try_from(HEAD_MAX + 1 - read).unwrap_or(0);
         let n = reader
             .by_ref()
@@ -164,8 +168,11 @@ fn serve_one(stream: &TcpStream, origin: FakeOrigin, state: &Mutex<State>) {
         return;
     };
     let header = |name: &str| crate::header_in(&head.headers, name);
-    let chunked =
-        header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    let chunked = header("transfer-encoding").is_some_and(|v| {
+        v.as_bytes()
+            .windows(7)
+            .any(|w| w.eq_ignore_ascii_case(b"chunked"))
+    });
     let mut body = Vec::new();
     let (mut cut, mut over) = (false, false);
     // What is left to drop once answered: the rest of a body over the bound, so its 413
@@ -176,6 +183,9 @@ fn serve_one(stream: &TcpStream, origin: FakeOrigin, state: &Mutex<State>) {
             .and_then(crate::parse_uint::<u64>)
             .unwrap_or(0);
         let bound = declared.min(BODY_MAX);
+        if let Ok(cap) = usize::try_from(bound.min(64 * 1024)) {
+            body.reserve(cap);
+        }
         let _ = (&mut reader).take(bound).read_to_end(&mut body);
         cut = u64::try_from(body.len()).unwrap_or(u64::MAX) < bound;
         over = !cut && declared > BODY_MAX;
@@ -258,19 +268,22 @@ fn drain(reader: &mut BufReader<&TcpStream>, left: u64) {
 /// only that many bytes of the body after the full head. The fake writes `Connection` and
 /// `Content-Length` itself, so an answer's own header of either name is dropped.
 fn write(stream: &TcpStream, req: &Request, answer: &Answer, cut: Option<usize>) {
+    use std::fmt::Write as _;
     let status = answer.status;
-    let mut out = format!(
+    let mut out = String::with_capacity(192);
+    let _ = write!(
+        out,
         "HTTP/1.1 {status} {}\r\nConnection: close\r\n",
         reason(status)
     );
     if status != 304 {
-        out.push_str(&format!("Content-Length: {}\r\n", answer.body.len()));
+        let _ = write!(out, "Content-Length: {}\r\n", answer.body.len());
     }
     for (name, value) in &answer.headers {
         let own =
             name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection");
         if !own {
-            out.push_str(&format!("{name}: {value}\r\n"));
+            let _ = write!(out, "{name}: {value}\r\n");
         }
     }
     out.push_str("\r\n");

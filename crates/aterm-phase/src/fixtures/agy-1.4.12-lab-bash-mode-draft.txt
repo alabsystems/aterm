@@ -1,0 +1,51 @@
+# agy 1.4.12 · MEASURED 2026-11-02, `aterm ctl text` of a private headless aterm (144x50) running the real Antigravity CLI under aterm-lab's stub (scratch HOME, no login): `!` then `ls -la` typed as a person types them. agy takes the `!` into its bash mode: the caret row `! ls -la`, the footer ` activated bash mode · esc to cancel`, and no `>` composer.
+
+      ▄▀▀▄        Antigravity CLI 1.4.12
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.XXXX/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+! ls -la
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ activated bash mode · esc to cancel                                                                                        Gemini 3.1 Pro · low
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

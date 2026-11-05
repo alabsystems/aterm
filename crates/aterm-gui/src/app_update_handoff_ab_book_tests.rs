@@ -6,7 +6,14 @@
 use std::ffi::CString;
 use std::os::fd::{AsRawFd as _, OwnedFd};
 
-use super::make_cloexec_pipe;
+/// The Commit pipe, both ends kept across the test's own `fork`: the forked child is the
+/// outgoing process and writes the Commit itself. `make_cloexec_pipe` keeps its ends out of
+/// children (`aterm_uds::kept_out`, `FD_CLOFORK`), so the fork would close them in the child and
+/// its drop of the read end would close a descriptor already gone.
+fn forked_commit_pipe() -> (OwnedFd, OwnedFd) {
+    let (read, write) = std::io::pipe().expect("a commit pipe");
+    (OwnedFd::from(read), OwnedFd::from(write))
+}
 
 struct Outgoing {
     status: i32,
@@ -25,8 +32,10 @@ fn outgoing(commit: OwnedFd, read: Option<OwnedFd>, marker: &std::path::Path) ->
     )
     .expect("bounded proof fixture");
     let path = CString::new(marker.as_os_str().as_encoded_bytes()).expect("a path");
-    // SAFETY: fork from a multi-threaded harness; the child makes only
-    // async-signal-safe calls (`write`, `open`, `close`, `_exit`).
+    // SAFETY: fork from the process `test_alone::alone` runs this test in, where no other test's
+    // thread can hold a lock across the fork. The child's own calls are `write`, `open`, `close`
+    // and `_exit`, plus `commit_and_exit`'s exit path (`clean_exit_now`: the log flush and the
+    // crash marker's release), which takes only locks of this process that nothing else holds.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
     if pid == 0 {
@@ -82,9 +91,14 @@ fn outgoing(commit: OwnedFd, read: Option<OwnedFd>, marker: &std::path::Path) ->
 
 #[test]
 fn a_seamless_updates_outgoing_process_never_reaches_its_exit_seam() {
+    // The fork runs alone in its own process: beside the lib suite's other threads, a lock one of
+    // them held at the fork could leave the child signalled (seen once under a full verify).
+    if !crate::test_alone::alone() {
+        return;
+    }
     let scratch = aterm_tempfile::tempdir().expect("scratch folder");
     let marker = scratch.path().join("book-written-at-exit");
-    let (read, write) = make_cloexec_pipe().expect("commit pipe");
+    let (read, write) = forked_commit_pipe();
     let committed = outgoing(write, Some(read), &marker);
     assert_eq!(committed.status, 0, "the Commit's own `_exit(0)`");
     assert_eq!(committed.committed.len(), crate::seamless::READY_WIRE_LEN);
@@ -93,7 +107,7 @@ fn a_seamless_updates_outgoing_process_never_reaches_its_exit_seam() {
         "nothing runs past a landed Commit, the exit seam's book write included"
     );
 
-    let (read, write) = make_cloexec_pipe().expect("commit pipe");
+    let (read, write) = forked_commit_pipe();
     drop(read);
     let refused = outgoing(write, None, &marker);
     assert_eq!(refused.status, 3, "the Commit returned: the seam ran");

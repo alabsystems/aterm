@@ -95,11 +95,37 @@ fn registry_schemas_keep_secrets_and_addresses_out() {
         );
     }
     assert_eq!(pii, ["address.addr"]);
+    // A mailbox's key derives from its login's address key (a member-readable row); a phone's
+    // stays random, since its number is a low-entropy secret.
     assert_eq!(
         (MAILBOX.derive, PHONE.derive),
-        (Derive::Random, Derive::Random)
+        (Derive::Composite, Derive::Random)
     );
-    assert!(MAILBOX.column("receives").is_none() && MAILBOX.column("login").is_none());
+    // A mailbox's patterns name address rows; a domain pattern's dots are no key, so they list.
+    assert!(matches!(
+        MAILBOX.column("receives").map(|c| &c.ty),
+        Some(Ty::Set(inner)) if matches!(**inner, Ty::Ref("address"))
+    ));
+    assert!(matches!(
+        MAILBOX.column("receives_domains").map(|c| &c.ty),
+        Some(Ty::List(..))
+    ));
+    assert!(matches!(
+        MAILBOX.column("login").map(|c| &c.ty),
+        Some(Ty::Ref("address"))
+    ));
+    for (collection, column) in [
+        (&ADDRESS, "password"),
+        (&MAILBOX, "mailbox_password"),
+        (&MAILBOX, "totp"),
+        (&PHONE, "number"),
+    ] {
+        assert!(
+            matches!(collection.column(column).map(|c| &c.ty), Some(Ty::Secret)),
+            "{}.{column}",
+            collection.name
+        );
+    }
 }
 
 /// Apply `records` as one writer's chain to `cells`, as the Commons projection does.
@@ -458,7 +484,7 @@ fn schema_rows_are_published_once_and_never_below_a_visible_version() {
         }
     );
     let address = view.schema(ADDRESS.name);
-    assert!(matches!(address, SchemaState::One { version: 1, .. }));
+    assert!(matches!(address, SchemaState::One { version: 2, .. }));
 }
 
 /// A new grid row of a preference is born under the key of its machine and account, whichever
@@ -518,26 +544,27 @@ fn a_preference_is_born_from_its_pair_and_an_account_reads_its_label() {
 #[test]
 fn a_registry_read_is_partial_before_anything_else_and_projects_only_a_moved_inventory() {
     let unread = || -> Inventory { panic!("a partial history reads no inventory") };
-    let unprojected = || -> view::LabView { panic!("nothing is projected where nothing moved") };
+    let unprojected =
+        || -> crate::Result<view::LabView> { panic!("nothing is projected where nothing moved") };
     let held = Inventory([3; 32]);
     assert!(
         matches!(
             store::lab_read(false, unread, Some(held), unprojected),
-            LabRead::Partial
+            Ok(LabRead::Partial)
         ),
         "a partial history"
     );
     assert!(
         matches!(
             store::lab_read(true, || held, Some(held), unprojected),
-            LabRead::Unchanged
+            Ok(LabRead::Unchanged)
         ),
         "the held inventory"
     );
     let moved = Inventory([4; 32]);
     let mut named = view::LabView::default();
     named.me = Some("pk-me".into());
-    match store::lab_read(true, || moved, Some(held), || named.clone()) {
+    match store::lab_read(true, || moved, Some(held), || Ok(named.clone())).unwrap() {
         LabRead::Projected(view, inventory) => {
             assert_eq!(*view, named, "the projection");
             assert_eq!(inventory, moved, "the inventory it was made from");
@@ -546,8 +573,8 @@ fn a_registry_read_is_partial_before_anything_else_and_projects_only_a_moved_inv
     }
     assert!(
         matches!(
-            store::lab_read(true, || held, None, view::LabView::default),
-            LabRead::Projected(_, inventory) if inventory == held
+            store::lab_read(true, || held, None, || Ok(view::LabView::default())),
+            Ok(LabRead::Projected(_, inventory)) if inventory == held
         ),
         "a first read projects"
     );

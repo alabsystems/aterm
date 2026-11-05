@@ -10,9 +10,8 @@
 //! elevation turns developer mode on (`aterm_machines::root_steps`).
 //!
 //! * It starts by itself once, on a cold first launch or in an update's successor
-//!   ([`starts`], [`WalkLane::note_successor`]): no page aterm brought up before, System State in
-//!   front of an active app, the person present ([`START_PRESENT_WITHIN`], read as the steps read
-//!   it: [`App::person_present_within`]) and not typing ([`START_KEYS_QUIET`]), System Settings
+//!   ([`starts`], [`WalkLane::note_successor`]): no page aterm brought up before and no typing
+//!   ([`START_KEYS_QUIET`]), System Settings
 //!   asking nothing (`App::system_settings_may_ask`), and System State's Local Network step run
 //!   and its alert's hold over ([`App::local_network_step_to_come`]): macOS's answer heard by the
 //!   LAN re-probe, the alert seen answered by the window-list watch, a new window of its owner
@@ -26,9 +25,8 @@
 //!   held a ready walk for [`LOCAL_NETWORK_WAIT`] of unbroken looks and its own moment has not
 //!   come ([`App::waited_out_local_network`]), after which the walk goes first and the step, and
 //!   every step after it asks once it is over: the one exception to
-//!   the Local Network step going first. While it may still start and only the person's absence
-//!   holds it, System State's later steps wait with it ([`App::walk_waits_for_the_person`]), so
-//!   none takes its first page; the Local Network step does not.
+//!   the Local Network step going first. Automatic acquisition requires no visit to System
+//!   State and no recent keyboard activity.
 //!   `aterm ctl permissions walk now` (at most once a minute, [`VERB_AGAIN_AFTER`])
 //!   and the Permissions row's press start one; the verb sent while one is under way joins it
 //!   ([`WalkLane::join`]) and takes back a page the walk passed
@@ -72,8 +70,8 @@ use aterm_types::macos_setup::{Access, AccessOutcome};
 use crate::App;
 use crate::devtools_helper::{Closed, HandOver, Moment, Origin, Page};
 
-/// How recently the person must have touched the keyboard or pointer for the walk to start by
-/// itself: present at the Mac, not away from it.
+/// Presence window for interactive-page timers and the Local Network alert watch. Starting
+/// automatic acquisition does not depend on this window.
 pub(crate) const START_PRESENT_WITHIN: Duration = Duration::from_secs(60);
 
 /// How long the keyboard must have been still for the walk to start by itself: a word being
@@ -98,9 +96,8 @@ pub(crate) const START_KEYS_QUIET: Duration = Duration::from_secs(2);
 /// only a wait on such a part, which would otherwise hold the walk for good; presence and System
 /// Settings asking the two read alike (`App::person_present_within`,
 /// `App::system_settings_asks`), so neither ends it: the walk's presence, held through an
-/// unbroken wait (`StartFacts::present`), keeps the wait counting, and the look at which it runs
-/// out reads the person again: the walk starts only with a touch within [`START_PRESENT_WITHIN`]
-/// of that look.
+/// unbroken wait keeps the wait counting. Automatic acquisition does not require a new touch
+/// when the wait ends.
 pub(crate) const LOCAL_NETWORK_WAIT: Duration = Duration::from_secs(60);
 
 /// How often the window reads the grant the walk's page asks for while the panel is up, until
@@ -205,10 +202,6 @@ impl Subject {
 
 /// What [`starts`] judges, read at the moment it is asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "the start's independent readings, each a yes or no"
-)]
 pub(crate) struct StartFacts {
     /// The process may start the first walk by itself (`App::walk_may_start_by_itself`): the
     /// owner started it, or it is an update's successor ([`WalkLane::note_successor`]). Whether
@@ -216,19 +209,6 @@ pub(crate) struct StartFacts {
     /// before (either page's opening of this TCC identity) is read only once these facts say
     /// start (`App::fresh_mac`).
     pub(crate) cold: bool,
-    /// System State is the visible view of a focused window of the active app.
-    pub(crate) presented: bool,
-    /// A person is known to have been at the Mac within [`START_PRESENT_WITHIN`]
-    /// (`App::person_present_within`: the keyboard or pointer touched then, by macOS's idle time,
-    /// or, where macOS cannot give one, a key, click or scroll in an aterm window then), or the
-    /// walk's wait for the Local Network step counts an unbroken run of looks the person was
-    /// present at the start of (`App::local_network_wait_counting`). One touch so lets that wait
-    /// run out where the idle time cannot be read and pointer motion is not seen; but the look at
-    /// which it runs out, the one that would open System Settings, reads the person again
-    /// (`App::look_for_walk_start`), so the walk starts only with a touch within
-    /// [`START_PRESENT_WITHIN`] of the look that starts it, as the first walk's person stage asks
-    /// (`docs/DESIGN-init-on-by-default-2026-10-25.md` §6.4).
-    pub(crate) present: bool,
     /// A key was typed within [`START_KEYS_QUIET`].
     pub(crate) typing: bool,
 }
@@ -236,7 +216,7 @@ pub(crate) struct StartFacts {
 /// Whether the walk starts by itself now. Pure.
 #[must_use]
 pub(crate) const fn starts(facts: StartFacts) -> bool {
-    facts.cold && facts.presented && facts.present && !facts.typing
+    facts.cold && !facts.typing
 }
 
 /// Whether `word`, an opening `atpkg::devtools::PageMarkers::opened_as` found for `key`'s TCC
@@ -1127,11 +1107,8 @@ impl App {
     /// a ready walk for [`LOCAL_NETWORK_WAIT`] of unbroken looks, and never at a look where the
     /// step's own moment has come ([`Self::waited_out_local_network`]): the walk starts then, says
     /// so in aterm.log with what held the step, and the step, held by the walk as by any of the
-    /// window's gestures, asks after it, never beside it. A look during a flick of focus shorter
-    /// than [`crate::FOCUS_AWAY_FOR`] ([`Self::focus_away_briefly`]) neither starts the walk nor
-    /// breaks that run, and the person present is read as the steps read it
-    /// ([`Self::person_present_within`]), the person read present at the look that began an
-    /// unbroken wait staying present through it ([`StartFacts::present`]). This runs at every park,
+    /// window's gestures, asks after it, never beside it. Readiness does not require a focused
+    /// System State page or a recent-input signal. This runs at every park,
     /// so the in-memory readings come first, the access record once per revision, then the page
     /// markers ([`Self::fresh_mac`]), the declines and the subjects missing (files and grants
     /// read), and System Settings asking last (it may read the window list), read once per look
@@ -1144,35 +1121,22 @@ impl App {
     fn look_for_walk_start(&mut self, now: Instant) {
         self.take_walk_reopen();
         let cold = self.walk_may_start_by_itself();
-        let Some(revision) = self.access_revision().filter(|_| {
-            cold && self.access_steps_allowed() && self.person_permission_admission_stands()
-        }) else {
+        let Some(revision) = self
+            .access_revision()
+            .filter(|_| cold && self.access_steps_allowed() && self.permission_steps_admitted())
+        else {
             self.restart_local_network_wait();
             return;
         };
         let facts = StartFacts {
             cold,
-            presented: self.system_state_in_front(),
-            present: self.person_present_within(START_PRESENT_WITHIN, now)
-                || self.local_network_wait_counting(revision),
             typing: self
                 .last_keystroke_at
                 .is_some_and(|at| now.saturating_duration_since(at) < START_KEYS_QUIET),
         };
-        let ready_beside_front = starts(StartFacts {
-            presented: true,
-            ..facts
-        }) && !self.access_gesture_up(now)
-            && !self.access_dialog_up();
-        if !ready_beside_front {
+        let ready = starts(facts) && !self.access_gesture_up(now) && !self.access_dialog_up();
+        if !ready {
             self.restart_local_network_wait();
-            return;
-        }
-        if !facts.presented {
-            // A flick of focus is no break: the steps' key rest reads the same away rule.
-            if !self.focus_away_briefly(now) {
-                self.restart_local_network_wait();
-            }
             return;
         }
         let ahead_of_local_network = self.local_network_step_to_come();
@@ -1186,12 +1150,6 @@ impl App {
             Some(true) => true,
             None => false,
         };
-        // The look at which the wait runs out opens System Settings: the presence the wait carried
-        // from its first look does not, only a touch within the last minute read now. The wait
-        // stays run out, so the walk starts at the next look that reads the person back.
-        if ran_out && !self.person_present_within(START_PRESENT_WITHIN, now) {
-            return;
-        }
         let reopened = matches!(self.permission_walk.reopened, Reopened::Waits(_));
         let walk = if let Reopened::Waits(left) = &self.permission_walk.reopened {
             let left = left.clone();
@@ -1248,15 +1206,6 @@ impl App {
         } else {
             self.start_walk_by_itself(walk, "first launch", ahead_of_local_network, now);
         }
-    }
-
-    /// Whether the walk's wait for `revision`'s Local Network step counts an unbroken run of ready
-    /// looks now ([`Self::waited_out_local_network`]): the person read present at the look that
-    /// began it stays present through it ([`StartFacts::present`]).
-    fn local_network_wait_counting(&self, revision: u64) -> bool {
-        self.permission_walk
-            .local_network_wait
-            .is_some_and(|wait| wait.revision == revision && !wait.over)
     }
 
     /// Start `walk` by itself, `by` in aterm.log's words; one that goes `ahead` of System State's
@@ -1430,30 +1379,6 @@ impl App {
     /// that notes neither starts none by itself.
     fn walk_may_start_by_itself(&self) -> bool {
         self.devtools_helper.cold_start() || self.permission_walk.successor
-    }
-
-    /// Whether a walk may still start by itself in this process and only the person's absence
-    /// holds it: a windowed macOS instance that may start one ([`StartFacts::cold`]), no walk run
-    /// in it, no look that found an opening holding the start ([`Self::fresh_mac`]: none that
-    /// latched, none held under the key the access marks carry now), and no touch of the
-    /// keyboard or pointer within [`START_PRESENT_WITHIN`], read as the walk's start reads it
-    /// ([`Self::person_present_within`]). System State's own steps wait with it
-    /// (`App::access_step_moment`): a step that brought the Full Disk Access or Developer Tools
-    /// page up while nobody was at the Mac would write the marker that leaves this Mac without
-    /// its first walk. Once the person is back the walk looks first in each turn, under rules the
-    /// step moment needs too (System State in front, the Local Network step run, none of the
-    /// window's gestures and no macOS dialog of aterm's up) and a key rest ([`START_KEYS_QUIET`])
-    /// shorter than the steps' quiet (`devtools_helper::QUIET_FOR`), so it starts, or finds what
-    /// holds it, before a step goes. The Local Network step's own moment does not wait with it,
-    /// so the walk, which waits for that step, is never held by a step that waits for the walk.
-    pub(crate) fn walk_waits_for_the_person(&self, now: Instant) -> bool {
-        cfg!(target_os = "macos")
-            && self.devtools_helper.windowed()
-            && self.walk_may_start_by_itself()
-            && !self.permission_walk.any_walked()
-            && !self.permission_walk.page_seen
-            && !self.person_present_within(START_PRESENT_WITHIN, now)
-            && self.permission_walk.held_under.as_deref() != Some(self.access_marks().fda.as_str())
     }
 
     /// Start a walk over `named` first, then every other subject missing, started `by`
@@ -2299,16 +2224,13 @@ mod tests {
     const fn facts() -> StartFacts {
         StartFacts {
             cold: true,
-            presented: true,
-            present: true,
             typing: false,
         }
     }
 
-    /// A cold first launch with System State in front, the person present 30 s ago and not
-    /// typing, starts the walk; each missing condition holds it.
+    /// Automatic acquisition starts without opening System State or a recent-input requirement.
     #[test]
-    fn the_walk_starts_on_a_cold_first_launch_with_the_person_present() {
+    fn the_walk_starts_automatically_after_the_keyboard_rests() {
         assert!(starts(facts()));
         assert!(
             !starts(StartFacts {
@@ -2324,14 +2246,6 @@ mod tests {
             }),
             "a process that may not start one by itself never"
         );
-        assert!(!starts(StartFacts {
-            presented: false,
-            ..facts()
-        }));
-        assert!(!starts(StartFacts {
-            present: false,
-            ..facts()
-        }));
     }
 
     /// An opening found for a key read before the bundle id or the Mac holds the walk for good

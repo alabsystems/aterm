@@ -55,7 +55,7 @@ pub fn home_guards(homes: &[String]) -> Result<String, String> {
 pub fn stand_ins(bin: &Path) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(bin)?;
     let lab = bin.join("aterm-lab");
-    std::fs::copy(&crate::paths::paths().exe, &lab)?;
+    crate::util::copy_regular_file(&crate::paths::paths().exe, &lab)?;
     std::fs::hard_link(&lab, bin.join("ps"))?;
     Ok(lab)
 }
@@ -302,10 +302,7 @@ impl ApiLog {
     }
 
     fn append(path: &Path, row: &J) -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut f = crate::util::append_regular_file(path)?;
         writeln!(f, "{}", row.dump(PY))
     }
 

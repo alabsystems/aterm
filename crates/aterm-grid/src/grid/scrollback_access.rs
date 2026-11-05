@@ -18,7 +18,6 @@ impl Grid {
         &self,
         selected: &dyn Fn(&aterm_scrollback::ImageSpan) -> bool,
     ) -> bool {
-        crate::history_reads::note();
         self.storage.ring_extras.any_image(selected)
             || self.storage.lazy_buffer.any_image(selected)
             || self
@@ -34,7 +33,6 @@ impl Grid {
         &mut self,
         keep: &mut dyn FnMut(&aterm_scrollback::ImageSpan) -> bool,
     ) -> bool {
-        crate::history_reads::note();
         let ring = self.storage.ring_extras.retain_images(keep);
         let staged = self.storage.lazy_buffer.retain_images(keep);
         let stored = self
@@ -52,7 +50,6 @@ impl Grid {
     /// Drains the lazy buffer and returns a mutable reference to the scrollback storage.
     #[inline]
     pub fn scrollback_mut(&mut self) -> Option<&mut ScrollbackStorage> {
-        crate::history_reads::note();
         self.drain_lazy_buffer();
         self.storage.scrollback_mut()
     }
@@ -106,46 +103,11 @@ impl Grid {
         self.storage.seed_replay_carried_history(max_lines);
     }
 
-    /// Retain at most `keep` history rows between replayed input slices, without
-    /// changing retention settings or the absolute numbering of the live frame.
-    /// Returns false if an in-progress reflow or a stored-prefix failure prevents
-    /// the trim; the caller must discard this speculative replay in that case.
-    ///
-    /// From then on a drain of the staged rows may hold them staged instead
-    /// (`Grid::holds_replay_history`): they are the oldest rows, which this trim
-    /// discards first, so storing them would only materialize and compress rows
-    /// the next trim drops.
-    pub fn trim_replay_history(&mut self, keep: usize) -> bool {
-        if self.storage.scrollback_detached_for_reflow {
-            return false;
-        }
-        self.storage.replay_trim = keep;
-        let mut remove = self.scrollback_lines().saturating_sub(keep);
-        if remove == 0 {
-            return true;
-        }
-        if let Some(store) = self.storage.scrollback.as_mut() {
-            let count = remove.min(store.line_count());
-            if store.truncate_oldest(count).is_err() {
-                return false;
-            }
-            remove -= count;
-        }
-        remove -= self.storage.lazy_buffer.discard_retained_prefix(remove);
-        if remove != 0 {
-            self.evict_oldest_ring_scrollback(remove);
-        }
-        self.clamp_display_offset();
-        self.storage.clamp_replay_carried_history(keep);
-        true
-    }
-
     /// Returns a history line by index (`0` = oldest), or `Ok(None)` when out of bounds.
     pub fn try_get_history_line(
         &self,
         idx: usize,
     ) -> Result<Option<Cow<'_, Line>>, ScrollbackError> {
-        crate::history_reads::note();
         let actual_tiered = self
             .storage
             .scrollback
@@ -188,7 +150,6 @@ impl Grid {
     /// Returns a dense forward iterator over history lines starting at `start` (`0` = oldest).
     #[must_use]
     pub fn history_lines_from(&self, start: usize) -> HistoryLines<'_> {
-        crate::history_reads::note();
         let tiered = self.storage.scrollback.as_ref();
         let tiered_end = tiered.map_or(0, ScrollbackStorage::line_count);
         let lazy_end = tiered_end.saturating_add(self.storage.lazy_buffer_lines());
@@ -225,7 +186,6 @@ impl Grid {
         &self,
         rev_idx: usize,
     ) -> Result<Option<Cow<'_, Line>>, ScrollbackError> {
-        crate::history_reads::note();
         let total = self.storage.scrollback_lines();
         if rev_idx >= total {
             return Ok(None);
@@ -301,7 +261,6 @@ impl Grid {
         rev_idx: usize,
         cols: u16,
     ) -> Option<scroll_materialize::MaterializedRow> {
-        crate::history_reads::note();
         let mut mat = self.materialize_history_row(rev_idx, cols)?;
         if mat.hole
             && let Some((glyph, bg_rgb)) = self.history_wrap_opening(rev_idx, cols)
@@ -382,7 +341,6 @@ impl<'a> Iterator for HistoryLines<'a> {
     type Item = Option<Cow<'a, Line>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        crate::history_reads::note();
         if self.idx >= self.end {
             return None;
         }
@@ -451,44 +409,5 @@ mod tests {
         let total = grid.scrollback_lines();
         let result = grid.try_history_line_rev(total.saturating_sub(1));
         assert!(result.is_err(), "try_history_line_rev: {result:?}");
-    }
-
-    #[test]
-    fn replay_history_trim_keeps_exact_suffix_without_conversion_or_settings_change() {
-        let mut sb = Scrollback::with_defaults();
-        for i in 0..5 {
-            sb.push_str(&format!("stored-{i}"));
-        }
-        let mut grid = Grid::with_tiered_scrollback(4, 40, 8, sb);
-        for i in 0..40 {
-            for ch in format!("row-{i:03}").chars() {
-                grid.write_char(ch);
-            }
-            grid.line_feed();
-            grid.carriage_return();
-        }
-        let before = grid.scrollback_lines();
-        let expected: Vec<_> = grid
-            .history_lines_from(before - 12)
-            .map(|line| line.unwrap().to_string())
-            .collect();
-        let counter = grid.absolute_row_counter();
-        let limit = grid.scrollback_line_limit();
-        let budget = grid.scrollback_memory_budget();
-        crate::test_counters::take_row_to_line_ops();
-        assert!(grid.trim_replay_history(12));
-        assert_eq!(crate::test_counters::take_row_to_line_ops(), 0);
-        assert_eq!(grid.scrollback_lines(), 12);
-        assert_eq!(grid.absolute_row_counter(), counter);
-        assert_eq!(grid.scrollback_line_limit(), limit);
-        assert_eq!(grid.scrollback_memory_budget(), budget);
-        assert!(!grid.storage.lazy_buffer.cut_open());
-        assert_eq!(grid.truncated_lines(), 0);
-        let actual: Vec<_> = grid
-            .history_lines_from(0)
-            .map(|line| line.unwrap().to_string())
-            .collect();
-        assert_eq!(actual, expected);
-        grid.storage.lazy_buffer.assert_running_sums();
     }
 }

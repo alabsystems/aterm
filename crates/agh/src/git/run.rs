@@ -26,6 +26,11 @@ pub enum GitOp {
         /// `--depth`.
         depth: Option<u32>,
     },
+    /// `git clone --quiet --mirror -- <url> <dest>`: a bare snapshot of all refs.
+    Mirror {
+        /// An absent or empty destination.
+        dest: PathBuf,
+    },
     /// `git -C <dir> fetch --quiet --tags --force --recurse-submodules=no <url>
     /// +refs/heads/*:refs/remotes/origin/*`: atpkg-publish's `fetch_repo`, by URL. git reads
     /// a `remote.<URL>.*` section as that URL's remote, so the runner's config screen refuses
@@ -36,10 +41,13 @@ pub enum GitOp {
         /// The clone.
         dir: PathBuf,
     },
-    /// `git -C <dir> fetch --quiet --no-tags --no-write-fetch-head --recurse-submodules=no
+    /// `git -C <dir> -c core.logAllRefUpdates=always fetch --quiet --no-tags
+    /// --no-write-fetch-head --recurse-submodules=no
     /// <url> +refs/heads/main:<into>`: atpkg-publish's `fetch_main`, which reads the main of
     /// record into a person's source checkout and writes no other ref there, so neither its
-    /// remote-tracking refs nor its tags move. Its config screen is `Fetch`'s. The runner
+    /// remote-tracking refs nor its tags move. A per-command `core.logAllRefUpdates=always`
+    /// retains previous snapshots in a reflog, without changing repository configuration.
+    /// Its config screen is `Fetch`'s. The runner
     /// refuses it (Usage, before anything runs) unless `into` is a ref name git accepts under
     /// `refs/` that is not under `refs/heads/`, `refs/tags/` or `refs/remotes/`, so the forced
     /// fetch never moves a branch, a tag or a remote-tracking ref of the checkout.
@@ -106,6 +114,17 @@ impl GitRun {
         )
     }
 
+    /// A complete bare mirror, including custom ref namespaces, into `dest`.
+    #[must_use]
+    pub fn new_mirror(slug: &Slug, dest: &Path) -> GitRun {
+        GitRun::of(
+            slug,
+            GitOp::Mirror {
+                dest: dest.to_path_buf(),
+            },
+        )
+    }
+
     /// A fetch of `slug` into the clone `dir`.
     #[must_use]
     pub fn fetch(slug: &Slug, dir: &Path) -> GitRun {
@@ -166,7 +185,7 @@ impl GitRun {
         self
     }
 
-    /// The same clone, shallow. Any other op is unchanged.
+    /// The same ordinary clone, shallow. Any other op, including a mirror, is unchanged.
     #[must_use]
     pub fn with_depth(mut self, depth: u32) -> GitRun {
         if let GitOp::Clone { depth: shallow, .. } = &mut self.op {
@@ -347,7 +366,7 @@ mod unix {
                 }
                 Ok(())
             }
-            GitOp::Clone { dest, .. } => {
+            GitOp::Clone { dest, .. } | GitOp::Mirror { dest } => {
                 let empty = match std::fs::read_dir(dest) {
                     Ok(mut entries) => entries.next().is_none(),
                     Err(e) => e.kind() == std::io::ErrorKind::NotFound,
@@ -699,7 +718,7 @@ mod unix {
     /// The run's own name for an op, in an exit's why.
     fn op_word(op: &GitOp) -> &'static str {
         match op {
-            GitOp::Clone { .. } => "clone",
+            GitOp::Clone { .. } | GitOp::Mirror { .. } => "clone",
             GitOp::Fetch { .. } | GitOp::FetchMain { .. } => "fetch",
             GitOp::LsRemote { .. } => "ls-remote",
             GitOp::PushDelete { .. } => "push",
@@ -1095,6 +1114,21 @@ mod unix {
         let redactor = children.gh.redactor();
         let url = os(remote.url());
         let (args, cwd): (Vec<OsString>, Option<&Path>) = match &run.op {
+            GitOp::Mirror { dest } => {
+                let dest = std::path::absolute(dest)
+                    .map_err(|e| Error::local(format!("{}: {e}", dest.display())))?;
+                (
+                    vec![
+                        os("clone"),
+                        os("--quiet"),
+                        os("--mirror"),
+                        os("--"),
+                        url,
+                        dest.into_os_string(),
+                    ],
+                    None,
+                )
+            }
             GitOp::Clone { dest, depth } => {
                 let dest = std::path::absolute(dest)
                     .map_err(|e| Error::local(format!("{}: {e}", dest.display())))?;
@@ -1125,6 +1159,8 @@ mod unix {
                 let args = vec![
                     os("-C"),
                     dir.into_os_string(),
+                    os("-c"),
+                    os("core.logAllRefUpdates=always"),
                     os("fetch"),
                     os("--quiet"),
                     os("--no-tags"),

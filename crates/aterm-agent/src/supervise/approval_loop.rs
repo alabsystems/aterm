@@ -5,9 +5,10 @@
 use super::super::policy::WorkerEnv;
 use super::super::policy::approval::RULE_RM_BREAKER_WARN;
 use super::super::policy::approval::{
-    AnswerTarget, ApprovalCtx, Choice, DeclineStep, QuestionPriority, RULE_AUTO_MODE_SETUP,
-    RULE_AUTOCOMPACT_OFFER, RULE_CHROME_INTRO, RULE_LIMIT_RESET, RULE_LIMIT_WAIT, RULE_TRUST_ANY,
-    RULE_TRUST_DIALOG, decide, proof_would_lift, reads_from_stand, unvoiced_tools,
+    AnswerTarget, ApprovalCtx, Choice, DeclineStep, QuestionPriority, RULE_ANSWER_LAND,
+    RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM, RULE_AUTO_MODE_SETUP, RULE_AUTOCOMPACT_OFFER,
+    RULE_CHROME_INTRO, RULE_LIMIT_RESET, RULE_LIMIT_WAIT, RULE_TRUST_ANY, RULE_TRUST_DIALOG,
+    decide, proof_would_lift, reads_from_stand, unvoiced_tools,
 };
 use super::super::policy::box_call;
 use super::super::policy::box_facts::{BoxFacts, QuestionFacts};
@@ -38,6 +39,10 @@ enum Act {
 }
 
 const REASKED_AFTER: usize = 2;
+
+/// Why a policy text the dialog did not draw is never written again ([`Session::decide_box`]).
+pub(super) const NOT_TAKEN: &str =
+    "the dialog did not take the policy text: a text is never written twice";
 
 /// The pause before a re-asked question answered `answered` times is answered again.
 pub(crate) fn reask_pause(answered: usize) -> Duration {
@@ -571,9 +576,12 @@ pub(super) enum DenyClock {
     At { deny: Instant },
 }
 
-/// How long Claude Code's auto-deny countdown runs from the box's first frame: two minutes,
-/// measured on 2.1.301's rm safety check (`docs/measured/real-claude-lab-2026-10-15.md`, "The
-/// auto-deny countdown under a hold").
+/// How long Claude Code's auto-deny countdown runs from the box's first frame by default: two
+/// minutes, measured on 2.1.301's and 2.1.316's rm safety check
+/// (`docs/measured/real-claude-lab-2026-10-15.md`, "The auto-deny countdown under a hold"). Its
+/// server flag (`tengu_splendid_horizon`'s `timeoutMs`, 120000 by default in the 2.1.301, 2.1.307
+/// and 2.1.316 to 2.1.318 builds) sets any window from 5 s to an hour, so a countdown can run
+/// shorter or longer than this.
 pub(super) const AUTO_DENY_WINDOW: Duration = Duration::from_secs(120);
 
 /// When the box an episode reads was drawn, as far as its countdown tells.
@@ -1234,9 +1242,11 @@ impl<C: Ctl> Session<'_, C> {
                 priority: QuestionPriority::default(),
                 own: None,
                 fell_back: false,
+                person: false,
             };
             said_by_session = policy.session_reason();
             if let Some(word) = policy.answer {
+                let word = self.dialog_priority(word, opts);
                 question.priority = word;
                 self.question.deciding = Some(word);
                 let this = prompt
@@ -1260,6 +1270,11 @@ impl<C: Ctl> Session<'_, C> {
                 question.fell_back = key
                     .as_ref()
                     .is_some_and(|k| self.question.fell_back.contains(k));
+                question.person = self
+                    .question
+                    .typed_person
+                    .values()
+                    .any(|&n| Some(n) != screen.human_seq);
                 if let Some(latched) = self.question.mode.filter(|m| *m != word) {
                     return Ok(Decision::Escalate {
                         reason: format!(
@@ -1270,15 +1285,19 @@ impl<C: Ctl> Session<'_, C> {
                         ),
                     });
                 }
-                if let (Some((_, focus)), Some(pending)) = (&this, &self.question.pending)
-                    && pending.kind == PendingKind::Text
-                    && pending.focus == *focus
-                    && box_identity(&screen.rows).as_deref() == Some(pending.identity.as_str())
-                {
+                let not_taken = matches!(
+                    (&this, &self.question.pending),
+                    (Some((_, focus)), Some(pending))
+                        if pending.kind == PendingKind::Text
+                            && pending.focus == *focus
+                            && box_identity(&screen.rows).as_deref()
+                                == Some(pending.identity.as_str())
+                );
+                // The text stand-in (`question::text_instead`): the recommended answer, unless a
+                // person keyed since the text.
+                if not_taken && (word.text().is_none() || question.person) {
                     return Ok(Decision::Escalate {
-                        reason: "the dialog did not take the policy text: a text is never written \
-                                 twice"
-                            .to_string(),
+                        reason: NOT_TAKEN.to_string(),
                     });
                 }
                 if word.text().is_some() {
@@ -1287,10 +1306,16 @@ impl<C: Ctl> Session<'_, C> {
                     if let Some(why) = text_unfenced(&self.caps, screen) {
                         question.priority = QuestionPriority::Recommended;
                         fallback = Some((word, why));
-                    } else if let (Some((key, _)), Some(dialog)) =
-                        (this, prompt.question_dialog.clone())
-                    {
-                        latchable = Some((key, dialog));
+                    } else {
+                        if not_taken {
+                            question.priority = QuestionPriority::Recommended;
+                            fallback = Some((word, NOT_TAKEN.to_string()));
+                        }
+                        if let (Some((key, _)), Some(dialog)) =
+                            (this, prompt.question_dialog.clone())
+                        {
+                            latchable = Some((key, dialog));
+                        }
                     }
                 }
             }
@@ -1436,6 +1461,65 @@ impl<C: Ctl> Session<'_, C> {
             && self.question.typed_person.get(&key).copied() == screen.human_seq
     }
 
+    /// Whether an unconfirmed press of `act` under `rule_id` is policy text, decided again
+    /// rather than handed over: `Some(key)` naming the tab to fall back on where the text never
+    /// reached it, `Some(None)` where it may have (the next decision reads it as its own). A note
+    /// the loop wrote into Muse Code's notes field stays a person's: an Enter there would send it.
+    fn policy_text_unconfirmed(
+        &self,
+        rule_id: &str,
+        act: &Act,
+        p: &aterm_phase::PromptV2,
+        screen: &Screen,
+    ) -> Option<Option<String>> {
+        let note = match act {
+            _ if !matches!(
+                rule_id,
+                RULE_ANSWER_LAND | RULE_ANSWER_LONG_TERM | RULE_ANSWER_SHORT_TERM
+            ) =>
+            {
+                return None;
+            }
+            Act::Approve {
+                choice: Choice::Answer(a),
+                ..
+            } if a.typed().is_some() => false,
+            Act::Approve {
+                choice: Choice::Note { .. },
+                ..
+            } => true,
+            _ => return None,
+        };
+        let key = if note {
+            Some(super::super::policy::question::roles_question_key(p))
+        } else {
+            aterm_phase::parse_prompt_v2(&screen.rows)
+                .and_then(|v| v.question_dialog)
+                .map(|d| question_key(&d, &screen.rows))
+        };
+        let written = key
+            .as_ref()
+            .is_some_and(|k| self.question.typed.contains_key(k));
+        (!(note && written)).then(|| key.filter(|_| !written))
+    }
+
+    /// THE PRIORITY THIS SESSION'S DIALOG IS ANSWERED UNDER: Land's ([`QuestionPriority::Land`])
+    /// over every answering word where the session's Autopilot is Land, else `word`. A switch of
+    /// the Autopilot alone mid-dialog finishes the dialog under its first key's priority, so it is
+    /// never handed to a person; a person's change of a word under Cruise still is.
+    fn dialog_priority(&self, word: QuestionPriority, opts: &SuperviseOpts) -> QuestionPriority {
+        let land = QuestionPriority::Land;
+        let now = if self.autopilot(opts) == Autopilot::Land {
+            land
+        } else {
+            word
+        };
+        match self.question.mode {
+            Some(first) if (first == land) != (now == land) => first,
+            _ => now,
+        }
+    }
+
     /// Whether this session's question dialog is answered by some priority.
     pub(super) fn question_policy_answers(&mut self, opts: &SuperviseOpts) -> Result<bool, Fail> {
         Ok(self.question_policy(opts)?.answer.is_some())
@@ -1528,6 +1612,19 @@ impl<C: Ctl> Session<'_, C> {
         reason: &str,
         box_seq: u64,
     ) {
+        self.ledger_row_fenced(rule_id, outcome, command, reason, (box_seq, None));
+    }
+
+    /// [`Self::ledger_row`] with the person's key count its write was fenced on
+    /// (`at.1`, [`approvals::PROBE_HUMAN`]) beside the screen's sequence (`at.0`).
+    pub(super) fn ledger_row_fenced(
+        &mut self,
+        rule_id: &str,
+        outcome: approvals::Outcome,
+        command: &str,
+        reason: &str,
+        (box_seq, human): (u64, Option<u64>),
+    ) {
         let policy_act = outcome == approvals::Outcome::Typed && !approvals::is_fact_rule(rule_id);
         if policy_act {
             self.left_keys = std::mem::take(&mut self.left_keys)
@@ -1599,6 +1696,7 @@ impl<C: Ctl> Session<'_, C> {
                 captured_boot.as_deref(),
                 &c,
                 program,
+                human,
                 &mut std::io::stderr(),
             ),
             None => self.ledger.write_counted_with_boot_text(
@@ -1606,6 +1704,7 @@ impl<C: Ctl> Session<'_, C> {
                 &entry,
                 count.as_ref(),
                 captured_boot.as_deref(),
+                human,
                 &mut std::io::stderr(),
             ),
         };
@@ -2459,6 +2558,22 @@ impl<C: Ctl> Session<'_, C> {
                     );
                     return Ok(Step::Again { settle: false });
                 }
+                if let Some(key) = self.policy_text_unconfirmed(rule_id, &act, &p, &turn.screen) {
+                    // A text priority hands over no dialog the recommendation would take:
+                    // decided again, the answer stands in (`question::text_instead`); a tab the text
+                    // never reached falls back outright, so it is never tried twice.
+                    if let Some(key) = key {
+                        self.question.fell_back.insert(key);
+                    }
+                    self.ledger_row(
+                        rule_id,
+                        approvals::Outcome::Skipped,
+                        &what,
+                        &format!("{why}: decided again, the recommended answer stands in"),
+                        seq,
+                    );
+                    return Ok(Step::Again { settle: true });
+                }
                 let why = if this.declined.is_some() {
                     format!("the decline could not be carried out: {why}")
                 } else {
@@ -3240,7 +3355,7 @@ mod act_tests {
         ),
         ("decline@v1", Outcome::Declined, "rm -rf /"),
         (RULE_LOGIN, Outcome::Typed, "/login"),
-        ("read-only@classify-v11", Outcome::Skipped, "ls"),
+        ("read-only@classify-v12", Outcome::Skipped, "ls"),
         ("-", Outcome::Escalated, ""),
         ("wall-wait@v1", Outcome::Waiting, ""),
     ];

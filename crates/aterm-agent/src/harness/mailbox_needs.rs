@@ -67,6 +67,7 @@ fn default_route(config: &MailboxConfig) -> Option<MailboxRoute> {
         mailbox_password: config.mailbox_password.clone(),
         totp_secret: config.totp_secret.clone(),
         receives: Vec::new(),
+        registry: None,
     })
 }
 

@@ -2949,6 +2949,66 @@ fn an_update_retires_the_spare_and_a_spare_is_never_activity() {
     assert!(app.spares.swallows(id), "and its late wakes swallowed");
 }
 
+/// A spare held by the warm budget or an update handoff has a time to look again.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_held_gate_with_no_clearing_event_says_when_to_look_again() {
+    let mut app = app_in("/tmp");
+    let t = Instant::now() + 2 * HOUR;
+    let (expired, oldest) = (t - 2 * HOUR, t - Duration::from_secs(60));
+    app.spares.warm_discards = [expired, oldest, t].into_iter().collect();
+    assert_eq!(app.spare_recheck_at("budget", t), Some(oldest + HOUR));
+    assert_eq!(app.spare_recheck_at("update", t), Some(t + UPDATE_RECHECK));
+    assert_eq!(app.spare_recheck_at("power", t), None);
+}
+
+/// A parked spare the `power` gate refused promotes once the host recovers, not an hour later.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_power_refusal_waits_for_the_hosts_recovery_and_no_longer() {
+    let mut app = app_in("/tmp");
+    app.spares.captured = Some(Vec::new());
+    app.config.spare_shell_needs_person = Some(false);
+    let id = app.next_session_id;
+    app.next_session_id += 1;
+    let t = Instant::now();
+    let mut slot = parked_slot(&app, id, Some("/tmp"));
+    slot.since = t;
+    app.spares.slot = Some(slot);
+    app.spares.shared.generation.store(7, Ordering::Release);
+    app.spares.shared.eligible.store(true, Ordering::Release);
+    let asked_freshen = |app: &App| {
+        app.spares
+            .captured
+            .as_ref()
+            .is_some_and(|jobs| jobs.iter().any(|j| matches!(j, Job::Freshen(_))))
+    };
+
+    app.spares.power = || true;
+    app.spare_promote(t);
+    assert_eq!(app.spare_promote_check(t), BookCheck::No("power"));
+    assert!(!asked_freshen(&app), "refused before it asks for a stamp");
+    assert_eq!(app.spares.tick_at.get(), None, "the refusal arms no tick");
+
+    app.spares.power = || false;
+    assert_eq!(
+        app.spares.tick_at.get(),
+        None,
+        "the host's recovery alone wakes nothing"
+    );
+    app.spare_host_power_changed();
+    let woke = Instant::now();
+    assert!(
+        app.spares.tick_at.get().is_some_and(|at| at <= woke),
+        "the host's change is a tick due now"
+    );
+    app.spare_promote(woke);
+    assert!(
+        asked_freshen(&app),
+        "that tick passes the gate it was held at"
+    );
+}
+
 /// Promotion to warm requires a fresh `Job::Freshen` stamp of the rc generation.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]

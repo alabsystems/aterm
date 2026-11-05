@@ -210,7 +210,14 @@ pub fn running(sys: &dyn System, layout: &Layout, run: &str) -> bool {
     holder(sys, layout).is_some_and(|h| h.run == run && holder_live(sys, &h))
 }
 
+/// How long a take, hand-off or release of the run lock waits for `state/run.lock.guard`.
+#[cfg(not(test))]
 const GUARD_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// A unit test's is the one-minute hang detector (`aterm_spec::wait::MUST_HAPPEN`, which this
+/// crate does not depend on): its only holders are the test's own takers, which release it, and
+/// a loaded machine can keep one's durable create past 30 s.
+#[cfg(test)]
+const GUARD_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn guard(sys: &dyn System, layout: &Layout) -> Result<Box<dyn std::any::Any>, String> {
     sys.exclusive(&layout.lock_guard(), GUARD_LIMIT)

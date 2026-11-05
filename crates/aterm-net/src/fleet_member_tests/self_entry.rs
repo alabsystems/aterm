@@ -410,6 +410,37 @@ fn an_observed_higher_self_row_advances_an_unchanged_local_descriptor() {
     assert_eq!(fresh.signed, same_high.signed);
 }
 
+/// Neither signature covers the other, so any member can append record words to a copy of
+/// this node's entry at its current seq; the copy must not become this node's descriptor.
+/// Without the record cleared from what this node keeps, the copy wins the equal-seq tie and is
+/// served as this node's own.
+#[test]
+fn a_copy_of_my_entry_never_puts_a_record_in_my_descriptor() {
+    let state = State::new("self-record-copy");
+    let me = node_identity(state.dir()).unwrap();
+    let endpoint = ("m7.local", 7100, "0.149.0");
+    let mine = self_entry_at(state.dir(), &me, endpoint, 1).unwrap();
+    let injected = Peer::parse(&format!(
+        "{} mname=AAAA mname_sig={}",
+        mine.line(),
+        "0".repeat(128)
+    ))
+    .unwrap();
+    assert!(
+        injected
+            .signed
+            .is_some_and(|signed| signed.record().is_some()),
+        "control: the copy carries record words"
+    );
+    hold_book(state.dir())
+        .unwrap()
+        .observe_self_entries(&me, [injected].into_iter())
+        .unwrap();
+    let fresh = self_entry_at(state.dir(), &me, endpoint, 1).unwrap();
+    assert_eq!(fresh.signed, mine.signed);
+    assert!(!fresh.line().contains("mname"), "{}", fresh.line());
+}
+
 #[test]
 fn heartbeat_recovers_a_higher_self_version_from_an_authenticated_peer() {
     let state = State::new("self-heartbeat");

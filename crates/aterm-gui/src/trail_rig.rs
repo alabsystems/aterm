@@ -105,8 +105,10 @@ impl TrailRig {
     /// # Errors
     /// When `/dev/null`, a scratch directory or the font does not open.
     pub fn new(font: &std::path::Path) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt as _;
         let null = std::fs::OpenOptions::new()
             .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open("/dev/null")
             .map_err(|error| format!("/dev/null: {error}"))?;
         let dir = aterm_tempfile::TempDir::new()
@@ -186,7 +188,8 @@ impl TrailRig {
         std::fs::create_dir_all(&themes)
             .map_err(|error| format!("{}: {error}", themes.display()))?;
         let path = themes.join(format!("{id}.conf"));
-        std::fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))
+        aterm_uds::atomic_file::write(&path, text.as_bytes(), 0o600)
+            .map_err(|error| format!("{}: {error}", path.display()))
     }
 
     /// Write the wallpaper picture a script's `page wallpaper` lays under the page into the rig's
@@ -204,7 +207,8 @@ impl TrailRig {
         .collect();
         let png = crate::app_introspect::encode_rgba8_png(&rgba, WALLPAPER_PX, WALLPAPER_PX)?;
         let path = self.dir.path().join("wallpaper.png");
-        std::fs::write(&path, png).map_err(|error| format!("{}: {error}", path.display()))?;
+        aterm_uds::atomic_file::write(&path, &png, 0o600)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
         path.to_str()
             .map(str::to_string)
             .ok_or_else(|| format!("{}: not UTF-8", path.display()))
@@ -217,7 +221,8 @@ impl TrailRig {
     /// When the file cannot be written or read back, or `toml` is not a config.
     pub fn configure(&mut self, toml: &str, at: Instant) -> Result<(), String> {
         let path = self.dir.path().join("aterm.toml");
-        std::fs::write(&path, toml).map_err(|error| format!("{}: {error}", path.display()))?;
+        aterm_uds::atomic_file::write(&path, toml.as_bytes(), 0o600)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)?;
         let config: Config = aterm_toml::from_str(toml).map_err(|error| error.to_string())?;

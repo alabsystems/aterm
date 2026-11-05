@@ -708,6 +708,33 @@ pub fn candidates<'r>(
         .collect()
 }
 
+/// Whether [`run_review`] would start `id` in its first wave of `count` but for its usage limit:
+/// it is among `cands`, a limit is what keeps it out, its one-shot mode runs at `level`, and fewer
+/// than `count` reviewers that will run come before it. A reviewer further down is reached only if
+/// one ahead of it falls through.
+#[must_use]
+pub fn first_wave_but_for_its_limit(
+    cands: &[(&Row, Option<String>)],
+    id: &str,
+    count: usize,
+    level: Level,
+    now: i64,
+) -> bool {
+    let mut ahead = 0;
+    for (row, skip) in cands {
+        let runs_at_level = level_skip(row.connector, level).is_none();
+        if row.connector.id == id {
+            return ahead < count
+                && runs_at_level
+                && row.limited_until.is_some_and(|until| until > now);
+        }
+        if skip.is_none() && runs_at_level {
+            ahead += 1;
+        }
+    }
+    false
+}
+
 /// Why `c` sits out a review at `level`: its one-shot mode runs at one level whatever it is
 /// given ([`connector::Review::only_at`]), and `level` is another, which nothing would hold it to.
 fn level_skip(c: &Connector, level: Level) -> Option<String> {
@@ -1302,7 +1329,8 @@ pub fn keep(store: &Store, id: &str, json: &str) -> std::io::Result<PathBuf> {
             {
                 continue;
             }
-            let old = std::fs::symlink_metadata(e.path())
+            let old = e
+                .metadata()
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.elapsed().ok())

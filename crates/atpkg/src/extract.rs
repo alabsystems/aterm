@@ -12,7 +12,6 @@ use crate::tarread::EntryType as TarEntryType;
 
 mod ahead;
 mod behind;
-mod zipread;
 
 /// Reason an archive entry was rejected during extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -637,12 +636,26 @@ pub(crate) fn make_dir_exact(
     Ok(())
 }
 
-/// Verify that `dest_root` is an existing empty directory.
+/// Require an empty real directory, or an absent root the caller can create.
+/// Inspection failures are errors, never evidence that a destination is empty.
 pub(crate) fn require_empty_destination(dest_root: &Path) -> Result<(), ExtractError> {
-    if let Ok(mut existing) = std::fs::read_dir(dest_root)
-        && let Some(entry) = existing.next()
-    {
-        let found = entry.map_or_else(|_| dest_root.to_path_buf(), |e| e.path());
+    match std::fs::symlink_metadata(dest_root) {
+        Ok(meta) if meta.is_symlink() => {
+            return Err(ExtractError::Rejected(
+                ExtractReject::ThroughSymlink,
+                dest_root.to_path_buf(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_at(error, "symlink_metadata", dest_root)),
+    }
+    let mut existing =
+        std::fs::read_dir(dest_root).map_err(|error| io_at(error, "read_dir", dest_root))?;
+    if let Some(entry) = existing.next() {
+        let found = entry
+            .map_err(|error| io_at(error, "read_dir", dest_root))?
+            .path();
         let msg = format!(
             "extraction destination is not empty: {}",
             found.to_string_lossy()
@@ -685,10 +698,8 @@ impl<'a> Layer<'a> {
         opts: ExtractOptions,
         budget: Rc<Cell<u64>>,
     ) -> Result<Self, ExtractError> {
-        if fold {
-            require_empty_destination(root)?;
-            std::fs::create_dir_all(root).map_err(|e| io_at(e, "create_dir_all", root))?;
-        }
+        require_empty_destination(root)?;
+        std::fs::create_dir_all(root).map_err(|e| io_at(e, "create_dir_all", root))?;
         Ok(Self {
             root,
             opts,
@@ -994,7 +1005,9 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
     }
 }
 
-/// Extract a `.tar.zst` archive into `dest_root`.
+/// Extract a `.tar.zst` archive into an empty real directory `dest_root`, creating it if absent.
+/// # Errors
+/// An occupied, symlinked or unreadable destination, an invalid archive or an exceeded bound.
 pub fn extract_tar_zst(
     archive: &Path,
     dest_root: &Path,
@@ -1143,7 +1156,53 @@ pub(crate) fn extract_tar_tree(
     )?)
 }
 
-/// Extract a `.zip` archive into `dest_root` and fold its `tree_root`.
+const ZIP_S_IFMT: u32 = 0o170_000;
+const ZIP_S_IFLNK: u32 = 0o120_000;
+const ZIP_S_IFREG: u32 = 0o100_000;
+const ZIP_S_IFDIR: u32 = 0o040_000;
+/// A symlink target longer than `PATH_MAX` names no valid link.
+const MAX_LINK_TARGET: u64 = 4096;
+
+/// `zip: <what>` as an `InvalidData` error, worded as `aterm_codec::zip`'s own.
+fn zip_bad(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("zip: {what}"))
+}
+
+/// Regular / directory / symlink / other, from the name's trailing slash and the Unix
+/// type bits (when the host supplied them).
+fn zip_classify(name: &[u8], unix_mode: u32) -> EntryKind {
+    if name.last() == Some(&b'/') {
+        return EntryKind::Directory;
+    }
+    match unix_mode & ZIP_S_IFMT {
+        0 | ZIP_S_IFREG => EntryKind::Regular,
+        ZIP_S_IFDIR => EntryKind::Directory,
+        ZIP_S_IFLNK => EntryKind::Symlink,
+        _ => EntryKind::Other,
+    }
+}
+
+/// The member name as a path — raw bytes on Unix, UTF-8 or refused elsewhere.
+fn zip_name_to_path(bytes: &[u8]) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|_| zip_bad("member name is not UTF-8"))
+    }
+}
+
+/// Extract a `.zip` archive into `dest_root` through a [`Layer`] and fold its `tree_root`.
+///
+/// `aterm_codec::zip` reads the archive; this lane counts each declared record against
+/// the layer before reading it, refuses encrypted members, NUL or backslash names, kinds
+/// other than regular, directory and (by policy) symlink, and a body or link target
+/// whose length disagrees with its record.
 pub(crate) fn extract_zip_tree(
     archive: &Path,
     dest_root: &Path,
@@ -1151,7 +1210,64 @@ pub(crate) fn extract_zip_tree(
     max_entries: u64,
     opts: ExtractOptions,
 ) -> Result<TreeAccumulator, ExtractError> {
-    zipread::extract(archive, dest_root, max_total_bytes, max_entries, opts)
+    let mut zip = aterm_codec::zip::Archive::open(crate::metadata_io::open_regular(archive)?)?;
+    let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
+    let mut layer = Layer::open(dest_root, max_total_bytes, max_entries, true, opts, budget)?;
+    for _ in 0..zip.len() {
+        layer.next_entry()?;
+        let rec = zip
+            .next_entry()?
+            .ok_or_else(|| zip_bad("central directory holds fewer records than declared"))?;
+        if rec.encrypted() {
+            return Err(zip_bad("encrypted members are not supported").into());
+        }
+        if rec.name.contains(&0) || rec.name.contains(&b'\\') {
+            return Err(zip_bad("member name contains NUL or a backslash").into());
+        }
+        let raw = zip_name_to_path(&rec.name)?;
+        let unix_mode = rec.unix_mode();
+        match zip_classify(&rec.name, unix_mode) {
+            EntryKind::Directory => {
+                layer.directory(&raw, rec.uncomp_size, unix_mode & 0o7777)?;
+            }
+            EntryKind::Regular => {
+                let body = zip.body(&rec)?;
+                let consumed = layer.regular(&raw, unix_mode & 0o7777, body)?;
+                if consumed != rec.uncomp_size {
+                    return Err(zip_bad("member body disagrees with its declared size").into());
+                }
+            }
+            EntryKind::Symlink => {
+                if opts.symlinks == SymlinkPolicy::Refuse {
+                    return Err(ExtractError::Rejected(ExtractReject::DisallowedKind, raw));
+                }
+                if rec.uncomp_size > MAX_LINK_TARGET {
+                    return Err(ExtractError::TooLarge(TooLargeReason::LinkTargetTooLong(
+                        raw.clone(),
+                    )));
+                }
+                let body = zip.body(&rec)?;
+                let mut target = Vec::with_capacity(
+                    usize::try_from(rec.uncomp_size.saturating_add(1)).unwrap_or(0),
+                );
+                body.take(MAX_LINK_TARGET.saturating_add(1))
+                    .read_to_end(&mut target)?;
+                if target.len() as u64 != rec.uncomp_size {
+                    return Err(zip_bad("symlink target disagrees with its declared size").into());
+                }
+                let target = zip_name_to_path(&target)?;
+                layer.symlink(&raw, &target, 0)?;
+            }
+            EntryKind::Hardlink | EntryKind::Other => {
+                return Err(ExtractError::Rejected(ExtractReject::DisallowedKind, raw));
+            }
+        }
+    }
+    // Past the last declared record: the records must fill the directory's declared size.
+    if zip.next_entry()?.is_some() {
+        return Err(zip_bad("central directory holds more records than declared").into());
+    }
+    folded(layer.finish())
 }
 
 /// Archive container format for [`extract_tree`].
@@ -1653,7 +1769,15 @@ pub(crate) fn stage_npm_brotli_binary(
                 written = Some(w);
             }
             Some((false, "package.json")) if manifest.is_none() => {
-                let mut bytes = Vec::new();
+                let mut bytes = Vec::with_capacity(
+                    usize::try_from(
+                        entry
+                            .entry_size()
+                            .min(NPM_PACKAGE_JSON_CAP)
+                            .saturating_add(1),
+                    )
+                    .unwrap_or(0),
+                );
                 (&mut entry)
                     .take(NPM_PACKAGE_JSON_CAP + 1)
                     .read_to_end(&mut bytes)
@@ -2438,6 +2562,48 @@ mod tests {
             ExtractError::Io { err, .. } => err.get_ref()?.downcast_ref(),
             _ => None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_write_only_zstd_lane_refuses_a_preexisting_symlink_destination() {
+        let d = dest("write-only-existing-link");
+        let outside = d.join("outside");
+        let stage = d.join("stage");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
+        let victim = outside.join("tool");
+        std::fs::write(&victim, b"keep outside bytes").unwrap();
+        std::os::unix::fs::symlink(&outside, stage.join("bin")).unwrap();
+        let archive = make_archive(&d, "escape", &[("bin/tool", b'0', "", b"replacement")]);
+        let result = extract_tar_zst(&archive, &stage, 1 << 20, 10);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep outside bytes");
+        assert!(result.is_err(), "an occupied stage must be refused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_symlink_root_is_not_an_extraction_stage() {
+        let d = dest("symlink-root");
+        let outside = d.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let stage = d.join("stage");
+        std::os::unix::fs::symlink(&outside, &stage).unwrap();
+        let archive = make_archive(&d, "escape", &[("tool", b'0', "", b"replacement")]);
+        assert!(extract_tar_zst(&archive, &stage, 1 << 20, 10).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        assert!(
+            extract_tar_zst_tree(
+                &archive,
+                &stage,
+                1 << 20,
+                10,
+                ExtractOptions::default(),
+                FrameChecksum::IfPresent
+            )
+            .is_err()
+        );
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
     }
 
     #[test]

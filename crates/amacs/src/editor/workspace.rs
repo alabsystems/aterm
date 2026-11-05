@@ -23,6 +23,20 @@ use super::view::{
 };
 use crate::store::{DocumentId, DocumentStore, DocumentViewId, EditDelta, TextEdit};
 
+/// What a change to a document opened read-only (`edit … ro=1`, [`DocumentStore::set_read_only`])
+/// says: it is there to be read, and closing its tab ends it.
+pub const READ_ONLY_DOCUMENT: &str = "This document is read-only: read it, then close the tab";
+
+/// What a change to a read-only document says: a directory listing's words, or
+/// [`READ_ONLY_DOCUMENT`].
+pub(crate) fn read_only_words(store: &DocumentStore, document: DocumentId) -> String {
+    if store.directory(document).is_some() {
+        "Directory is read-only".to_owned()
+    } else {
+        READ_ONLY_DOCUMENT.to_owned()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlobalMark {
     pub document: DocumentId,
@@ -341,12 +355,15 @@ impl EditorWorkspace {
         if view.accept_argument_digit(text) {
             return Ok(Vec::new());
         }
-        if store.directory(view.document).is_some() {
+        if store.read_only(view.document) {
             if text.is_empty() {
                 return Ok(Vec::new());
             }
             view.take_prefix_argument();
-            return Ok(vec![EditorEffect::Status("Directory is read-only".into())]);
+            return Ok(vec![EditorEffect::Status(read_only_words(
+                store,
+                view.document,
+            ))]);
         }
         if !self.playing_macro
             && let Some(steps) = &mut self.macros_mut().recording
@@ -669,6 +686,15 @@ impl EditorWorkspace {
                 view.take_prefix_argument();
                 return Ok(vec![EditorEffect::Status("Directory is read-only".into())]);
             }
+        } else if store.read_only(view.document)
+            && (matches!(command.authority(), CommandAuthority::Edit)
+                || matches!(
+                    command,
+                    EditorCommand::Save | EditorCommand::KeepBufferOverDisk
+                ))
+        {
+            view.take_prefix_argument();
+            return Ok(vec![EditorEffect::Status(READ_ONLY_DOCUMENT.into())]);
         }
         let argument_command = matches!(
             command,

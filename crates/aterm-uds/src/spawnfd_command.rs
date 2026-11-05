@@ -181,8 +181,13 @@ pub struct Command {
     disclaim: Option<&'static CStr>,
     /// Start the child stopped at its exec ([`Self::start_suspended`]).
     suspended: bool,
+    /// The task type the child starts as ([`Self::leave_background_band`]).
+    task: Option<super::TaskType>,
     /// End the child when this process dies ([`super::Tether`]).
     tether: bool,
+    /// Fork a tethered child on the calling thread ([`Self::tie_to_this_thread`]).
+    #[cfg(all(test, target_os = "linux"))]
+    this_thread: bool,
 }
 
 /// The stdio a spawn gives a slot the caller left unset.
@@ -239,7 +244,10 @@ impl Command {
             setsid: false,
             disclaim: None,
             suspended: false,
+            task: None,
             tether: false,
+            #[cfg(all(test, target_os = "linux"))]
+            this_thread: false,
         }
     }
 
@@ -391,10 +399,67 @@ impl Command {
         self.suspended
     }
 
+    /// Start the child OUT OF THIS PROCESS'S BACKGROUND BAND (`true`): on macOS as a standard
+    /// daemon task (`POSIX_SPAWN_PROC_TYPE_DAEMON_STANDARD`) in place of the task type it would
+    /// inherit, so a child of a launchd job of `ProcessType` `Background`, whose every thread runs
+    /// at priority 4 whatever class it asks for (a process there cannot leave the band itself),
+    /// runs each of its threads at the class that thread asks for. Measured on macOS 27.0 in a
+    /// private-label `Background` job: a plain child's thread read 4 at the default class, one
+    /// started so read 31 there and 20 at utility. A QoS clamp this process runs under (a
+    /// `Standard` job's, `taskpolicy -c`) and a darwin-bg set on it from outside (`taskpolicy
+    /// -b`) are the child's still. Elsewhere there is no such band, and nothing changes.
+    pub const fn leave_background_band(&mut self, leave: bool) -> &mut Self {
+        self.task = if leave {
+            Some(super::TaskType::Standard)
+        } else {
+            None
+        };
+        self
+    }
+
+    /// Whether the child starts out of this process's background band
+    /// ([`Self::leave_background_band`]).
+    #[must_use]
+    pub const fn leaves_background_band(&self) -> bool {
+        matches!(self.task, Some(super::TaskType::Standard))
+    }
+
+    /// Start the child IN macOS's background band: as a background daemon task
+    /// (`POSIX_SPAWN_PROC_TYPE_DAEMON_BACKGROUND`), the type launchd starts a job of
+    /// `ProcessType` `Background` as, every thread of it at priority 4 (darwin-bg) whatever class
+    /// it asks for. A process that measures that job's band starts its stand-in so. Elsewhere
+    /// there is no such band, and nothing changes.
+    pub const fn enter_background_band(&mut self) -> &mut Self {
+        self.task = Some(super::TaskType::Background);
+        self
+    }
+
+    /// Start the child AS AN INTERACTIVE DAEMON: as the task type
+    /// (`POSIX_SPAWN_PROC_TYPE_DAEMON_INTERACTIVE`) launchd starts a job of `ProcessType`
+    /// `Interactive` as, in place of the type it would inherit, so a child of a process in the
+    /// background band leaves the band and runs each thread at the class it asks for. A thread's
+    /// priority does not tell it from a standard daemon ([`Self::leave_background_band`]), and it
+    /// promises no more: a standard daemon was measured to keep a QoS clamp this process runs
+    /// under (`taskpolicy -c`) and a darwin-bg set on it from outside (`taskpolicy -b`).
+    /// Elsewhere there is no task type, and nothing changes.
+    pub const fn start_as_interactive_daemon(&mut self) -> &mut Self {
+        self.task = Some(super::TaskType::Interactive);
+        self
+    }
+
     /// TEST SEAM: disclaim through the SPI named `spi` instead of [`DISCLAIM_SPI`] — one no image exports, to drive the fail-closed path.
     #[cfg(test)]
     pub(super) fn disclaim_through(&mut self, spi: &'static CStr) -> &mut Self {
         self.disclaim = Some(spi);
+        self
+    }
+
+    /// TEST SEAM: fork a tethered child on the calling thread, not on one of the tether's
+    /// spawners, so Linux's parent-death signal follows that thread and the child dies when the
+    /// thread exits: the per-thread tie the spawners replace, kept as their control.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) const fn tie_to_this_thread(&mut self) -> &mut Self {
+        self.this_thread = true;
         self
     }
 
@@ -1261,6 +1326,7 @@ impl Command {
                 native_image: false,
                 disclaim: self.disclaim,
                 suspended: self.suspended,
+                task: self.task,
             },
         )?;
         drop(handed);
@@ -1400,9 +1466,27 @@ impl Command {
                 command.stderr(std::process::Stdio::piped());
             }
         }
+        // Each try is one fork; the pause between tries runs here, on the calling thread, so a
+        // fork that runs on a spawner holds it for that fork alone.
+        #[cfg(target_os = "linux")]
+        let on_a_spawner = self.forks_on_the_spawner();
+        let command = std::sync::Arc::new(std::sync::Mutex::new(command));
         let mut child = super::past_text_busy(
             super::TEXT_BUSY_FOR,
-            || command.spawn(),
+            || {
+                let command = std::sync::Arc::clone(&command);
+                let fork = move || {
+                    command
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .spawn()
+                };
+                #[cfg(target_os = "linux")]
+                if on_a_spawner {
+                    return crate::tether::spawned(fork);
+                }
+                fork()
+            },
             super::text_busy_pause,
         )?;
         Ok(Child {
@@ -1417,6 +1501,19 @@ impl Command {
             usage: None,
             custody: Arc::new(()),
         })
+    }
+
+    /// Whether the fork runs on one of the tether's spawners (`crate::tether::spawned`), threads
+    /// that live as long as this process, so the parent-death signal `bind` sets comes at this
+    /// process's death, not at the calling thread's: a tethered spawn's does, but one a test ties
+    /// to its own thread (`tie_to_this_thread`).
+    #[cfg(target_os = "linux")]
+    fn forks_on_the_spawner(&self) -> bool {
+        #[cfg(test)]
+        let this_thread = self.this_thread;
+        #[cfg(not(test))]
+        let this_thread = false;
+        self.tether && !this_thread
     }
 
     /// The `std` command this one configures: its explicit descriptor policy first, then

@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+pub use crate::fleet_member::prove_discovery_address;
+
 /// The launchd label and systemd user unit stem for the fleet/swarm node job.
 pub const NODE_LABEL: &str = "systems.alab.aterm-node";
 
@@ -69,6 +71,241 @@ fn node_admin_lock(state_dir: &Path) -> Result<aterm_uds::private_file::PrivateL
 
 /// Bonjour service type advertised by `aterm node serve` on every network (§3.3, C23; F17).
 pub const ALAB_TCP_SERVICE: &str = "_alab._tcp";
+
+/// Discovery policy captured once when this process starts its services.
+pub struct DiscoveryPolicy {
+    /// Whether the node job owns discovery for the whole Mac.
+    pub mesh: bool,
+}
+
+impl DiscoveryPolicy {
+    /// This process's release policy. Tests can construct either policy directly.
+    #[must_use]
+    pub fn process_discovery() -> &'static Self {
+        static POLICY: std::sync::OnceLock<DiscoveryPolicy> = std::sync::OnceLock::new();
+        POLICY.get_or_init(|| Self {
+            mesh: aterm_types::mesh_switch::MESH,
+        })
+    }
+}
+
+/// The node job's single browse, with an address-only cache keyed by proven node id.
+/// The job lock is held before this service starts; windows and CLI processes never start it.
+pub struct MeshDiscovery {
+    /// Captured release policy, independently configurable in tests.
+    pub mesh: bool,
+    watch: Option<std::sync::Arc<aterm_secrets::discover::Watch>>,
+    bell: std::sync::Arc<aterm_secrets::wake::Bell>,
+    addresses: std::collections::BTreeMap<String, std::net::SocketAddr>,
+    next: Option<Instant>,
+    dirty: bool,
+}
+
+/// Address hints are refreshed once per period, with the clock supplied by the caller.
+pub const DISCOVERY_PERIOD: Duration = Duration::from_secs(30);
+const ADDRESS_CACHE: &str = "mesh-addresses";
+
+#[cfg(test)]
+mod mesh_discovery_tests {
+    use super::*;
+
+    fn hint(addr: &str) -> aterm_secrets::discover::Advert {
+        aterm_secrets::discover::Advert {
+            instance: "opaque".into(),
+            host: addr.into(),
+            port: 7100,
+            txt: vec![
+                ("v".into(), "2".into()),
+                ("id".into(), "n-0123456789abcdef".into()),
+                ("port".into(), "7100".into()),
+            ],
+        }
+    }
+
+    #[test]
+    fn one_browse_owned_by_service_and_none_with_mesh_off() {
+        let mut service = MeshDiscovery::new(true);
+        let starts = std::cell::Cell::new(0);
+        let start = |service: &'static str,
+                     bell: &std::sync::Arc<aterm_secrets::wake::Bell>,
+                     own: &[&str]| {
+            starts.set(starts.get() + 1);
+            aterm_secrets::discover::Watch::idle_for(service, bell, own)
+        };
+        let first = service.start_with("own", start).unwrap();
+        let second = service.start_with("own", start).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(starts.get(), 1);
+        assert!(
+            MeshDiscovery::new(false)
+                .start_with("own", |_, _, _| panic!("mesh off"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn address_changes_follow_one_injected_period_and_unproved_hints_never_enter_cache() {
+        let mut service = MeshDiscovery::new(true);
+        let now = Instant::now();
+        let node = "n-0123456789abcdef";
+        let first = "127.0.0.1:7100".parse().unwrap();
+        let second = "127.0.0.2:7100".parse().unwrap();
+        let hints = || vec![hint("peer.local")];
+        assert!(service.refresh(now, hints, |_| Some((node.into(), first))));
+        assert!(!service.refresh(
+            now + DISCOVERY_PERIOD / 2,
+            || panic!("not due"),
+            |_| panic!("not due")
+        ));
+        assert!(service.refresh(now + DISCOVERY_PERIOD, hints, |_| Some((
+            node.into(),
+            second
+        ))));
+        assert_eq!(service.addresses.get(node), Some(&second));
+        assert!(!service.refresh(now + DISCOVERY_PERIOD * 2, hints, |_| None));
+        assert_eq!(service.addresses.get(node), Some(&second));
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        aterm_uds::private_file::ensure_private_dir(scratch.path()).unwrap();
+        service.save(scratch.path()).unwrap();
+        assert_eq!(mesh_addresses(scratch.path()), vec![(node.into(), second)]);
+        let mut restarted = MeshDiscovery::new(true);
+        restarted.restore(scratch.path());
+        assert_eq!(restarted.addresses, service.addresses);
+        let mut legacy = MeshDiscovery::new(false);
+        assert!(!legacy.refresh(
+            now,
+            || panic!("legacy resolves no mesh hints"),
+            |_| panic!("legacy proves no mesh hints")
+        ));
+        assert!(legacy.addresses.is_empty());
+    }
+
+    #[test]
+    fn mesh_txt_has_only_protocol_node_and_port() {
+        assert_eq!(
+            mesh_dns_sd_args("opaque", "n-0123456789abcdef", 7123),
+            [
+                "-R",
+                "opaque",
+                "_alab._tcp",
+                "local",
+                "7123",
+                "v=2",
+                "id=n-0123456789abcdef",
+                "port=7123"
+            ]
+        );
+    }
+}
+
+impl MeshDiscovery {
+    /// Make an unstarted service. Only the node job calls [`Self::start`].
+    #[must_use]
+    pub fn new(mesh: bool) -> Self {
+        Self {
+            mesh,
+            watch: None,
+            bell: std::sync::Arc::new(aterm_secrets::wake::Bell::default()),
+            addresses: std::collections::BTreeMap::new(),
+            next: None,
+            dirty: false,
+        }
+    }
+
+    /// Keep last-known addresses across a node restart, including sleeping members' hints.
+    /// These are authenticated again when dialled, like newly resolved mDNS hints.
+    pub fn restore(&mut self, state: &Path) {
+        if self.mesh {
+            self.addresses.extend(mesh_addresses(state));
+        }
+    }
+
+    /// Start at most one browse for this service, after local-network permission is ready.
+    pub fn start(&mut self, own: &str) -> Option<std::sync::Arc<aterm_secrets::discover::Watch>> {
+        if cfg!(test)
+            || std::env::var_os(aterm_types::world::MARKER).is_some()
+            || std::env::var_os("CI").is_some()
+        {
+            return None;
+        }
+        self.start_with(own, aterm_secrets::discover::Watch::start_for)
+    }
+
+    fn start_with(
+        &mut self,
+        own: &str,
+        start: impl FnOnce(
+            &'static str,
+            &std::sync::Arc<aterm_secrets::wake::Bell>,
+            &[&str],
+        ) -> aterm_secrets::discover::Watch,
+    ) -> Option<std::sync::Arc<aterm_secrets::discover::Watch>> {
+        if !self.mesh {
+            return None;
+        }
+        Some(std::sync::Arc::clone(self.watch.get_or_insert_with(|| {
+            std::sync::Arc::new(start(ALAB_TCP_SERVICE, &self.bell, &[own]))
+        })))
+    }
+
+    /// Resolve fresh hints and replace an address only when `prove` authenticates its node.
+    /// `now` is injected so address-change laws need no wall-clock waits.
+    pub fn refresh(
+        &mut self,
+        now: Instant,
+        hints: impl FnOnce() -> Vec<aterm_secrets::discover::Advert>,
+        mut prove: impl FnMut(
+            &aterm_secrets::discover::Advert,
+        ) -> Option<(String, std::net::SocketAddr)>,
+    ) -> bool {
+        if !self.mesh || self.next.is_some_and(|next| now < next) {
+            return false;
+        }
+        self.next = Some(now + DISCOVERY_PERIOD);
+        let mut changed = false;
+        for hint in hints() {
+            if let Some((node, addr)) = prove(&hint) {
+                changed |= self.addresses.insert(node, addr) != Some(addr);
+            }
+        }
+        self.dirty |= changed;
+        changed
+    }
+
+    /// Save only addresses proven by the node job, for CLI processes that run no browse.
+    /// # Errors
+    /// The private address file could not be written.
+    pub fn save(&mut self, state: &Path) -> std::io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let mut text = String::new();
+        for (node, addr) in &self.addresses {
+            text.push_str(&format!("{node} {addr}\n"));
+        }
+        aterm_uds::private_file::write_private(state, ADDRESS_CACHE, text.as_bytes())?;
+        self.dirty = false;
+        Ok(())
+    }
+}
+
+/// Read the node job's saved addresses. They remain dial hints: every use authenticates again.
+#[must_use]
+pub fn mesh_addresses(state: &Path) -> Vec<(String, std::net::SocketAddr)> {
+    let Ok(bytes) = aterm_uds::private_file::read_private(state, ADDRESS_CACHE, 64 * 1024) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (node, addr) = line.split_once(' ')?;
+            aterm_net::fleet::is_node_id(node)
+                .then(|| Some((node.to_owned(), addr.parse().ok()?)))?
+        })
+        .collect()
+}
 
 /// Maximum age (24 h) of this Mac's last ALab vault answer before `_alab._tcp` stops advertising.
 pub const ALAB_MEMBER_TTL_SECS: u64 = 24 * 60 * 60;
@@ -308,6 +545,21 @@ pub fn alab_tcp_dns_sd_args(instance: &str, txt: AlabTcpTxt) -> Vec<String> {
     args
 }
 
+/// The mesh advert carries a protocol revision and untrusted identity/address hints only.
+#[must_use]
+pub fn mesh_dns_sd_args(instance: &str, node: &str, port: u16) -> Vec<String> {
+    vec![
+        "-R".into(),
+        instance.into(),
+        ALAB_TCP_SERVICE.into(),
+        "local".into(),
+        port.to_string(),
+        "v=2".into(),
+        format!("id={node}"),
+        format!("port={port}"),
+    ]
+}
+
 /// Generate a fresh random opaque instance token (`alab-<8 hex>`) carrying no machine identity.
 #[must_use]
 pub fn random_alab_instance_name() -> String {
@@ -388,11 +640,13 @@ pub fn should_advertise_alab_tcp_with(
 /// advertising ([`advertises`]).
 pub struct AlabTcpAdvertiser {
     instance: String,
+    mesh: bool,
+    state: Option<PathBuf>,
     inner: Mutex<AdvertiserInner>,
 }
 
 struct AdvertiserInner {
-    child: Option<(aterm_uds::spawnfd::Child, AlabTcpTxt)>,
+    child: Option<(aterm_uds::spawnfd::Child, Vec<String>)>,
 }
 
 impl Default for AlabTcpAdvertiser {
@@ -407,8 +661,18 @@ impl AlabTcpAdvertiser {
     pub fn new(instance: String) -> Self {
         Self {
             instance,
+            mesh: DiscoveryPolicy::process_discovery().mesh,
+            state: aterm_types::dirs::state_dir(),
             inner: Mutex::new(AdvertiserInner { child: None }),
         }
+    }
+
+    /// Bind the advert's identity to the node service's configured state directory.
+    #[must_use]
+    pub fn at_state(instance: String, state: &Path) -> Self {
+        let mut advertiser = Self::new(instance);
+        advertiser.state = Some(state.to_owned());
+        advertiser
     }
 
     /// The opaque Bonjour instance name it registers, which this process's own browse holds as
@@ -434,12 +698,25 @@ impl AlabTcpAdvertiser {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let (eligible, role) =
             should_advertise_alab_tcp_with(vault_paths, aterm_config, &routes, now_secs);
-        let wanted = eligible.then_some(AlabTcpTxt {
-            role,
-            fleet_port,
-            window: window_open,
-        });
-        reconcile_dns_sd(&mut guard.child, wanted, &self.instance, &spawn_dns_sd);
+        let wanted = eligible
+            .then(|| {
+                if self.mesh {
+                    let state = self.state.as_ref()?;
+                    let node = aterm_net::fleet_member::read_node_identity(state).ok()??;
+                    Some(mesh_dns_sd_args(&self.instance, node.node(), fleet_port))
+                } else {
+                    Some(alab_tcp_dns_sd_args(
+                        &self.instance,
+                        AlabTcpTxt {
+                            role,
+                            fleet_port,
+                            window: window_open,
+                        },
+                    ))
+                }
+            })
+            .flatten();
+        reconcile_dns_sd(&mut guard.child, wanted, &spawn_dns_sd);
     }
 
     /// Stop and reap any running `dns-sd` child immediately.
@@ -481,13 +758,12 @@ pub fn spawn_alab_advertisement_for_probe(
 }
 
 fn reconcile_dns_sd(
-    held: &mut Option<(aterm_uds::spawnfd::Child, AlabTcpTxt)>,
-    wanted: Option<AlabTcpTxt>,
-    instance: &str,
+    held: &mut Option<(aterm_uds::spawnfd::Child, Vec<String>)>,
+    wanted: Option<Vec<String>>,
     spawn: &dyn Fn(&[String]) -> std::io::Result<aterm_uds::spawnfd::Child>,
 ) {
-    if let (Some((child, prev_txt)), Some(txt)) = (held.as_mut(), wanted)
-        && *prev_txt == txt
+    if let (Some((child, prev_txt)), Some(txt)) = (held.as_mut(), wanted.as_ref())
+        && prev_txt == txt
         && matches!(child.try_wait(), Ok(None))
     {
         return;
@@ -496,12 +772,11 @@ fn reconcile_dns_sd(
         let _ = child.kill();
         let _ = child.wait();
     }
-    let Some(txt) = wanted else {
+    let Some(args) = wanted else {
         return;
     };
-    let args = alab_tcp_dns_sd_args(instance, txt);
     if let Ok(child) = spawn(&args) {
-        *held = Some((child, txt));
+        *held = Some((child, args));
     }
 }
 

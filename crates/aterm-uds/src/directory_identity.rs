@@ -34,7 +34,7 @@ pub struct Identity {
 pub fn read(path: &Path) -> io::Result<Identity> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
     let metadata = file.metadata()?;
     Ok(Identity {

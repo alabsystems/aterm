@@ -260,7 +260,7 @@ fn hand_over_as(
             continue;
         }
         let exact = crate::term_lock(&term)
-            .checkpoint_carry_abandoning_partial(carried.history_lines as usize)
+            .checkpoint_carry_abandoning_partial(super::carried_lines(carried) as usize)
             .0;
         if &exact == carried {
             crossed.exact += 1;

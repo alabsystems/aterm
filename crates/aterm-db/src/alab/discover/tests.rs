@@ -36,7 +36,6 @@ fn pk(addr: &str) -> String {
 fn listed(addr: &str) -> Listed {
     Listed {
         addr: addr.into(),
-        own: false,
         receives: true,
     }
 }
@@ -48,14 +47,8 @@ fn listing(target: Option<&str>) -> Listing {
         login: LOGIN.into(),
         target: target.map(str::to_owned),
         listed: vec![
-            Listed {
-                own: true,
-                ..listed(LOGIN)
-            },
-            Listed {
-                own: true,
-                ..listed("owner@pm.example")
-            },
+            listed(LOGIN),
+            listed("owner@pm.example"),
             listed("Ann@Example.test"),
             listed("bob@example.test"),
             listed("new@example.test"),
@@ -162,12 +155,13 @@ fn obs_key() -> String {
 }
 
 /// The owner's link on a listed address names the open mailbox; the observation lists the keys of
-/// the receiving addresses the registry holds, never the login or the account's own addresses
-/// (the login's row included) or a disabled one, and the address being signed in is born, in the
-/// same record, under its key, with no address text anywhere but its `addr` cell.
-/// NEGATIVE CONTROL: with `receiving` keeping the account's own addresses (the `!listed.own`
-/// filter removed), the twin's row is listed: `` left: Observed { .., listed: 4, .. } right:
-/// Observed { .., listed: 3, .. } ``.
+/// the receiving addresses the registry holds, the login and the account's own addresses among
+/// them (a mailbox's login is an address row like any other) but never a disabled one, and the
+/// address being signed in is born, in the same record, under its key, with no address text
+/// anywhere but its `addr` cell.
+/// NEGATIVE CONTROL: with `receiving` leaving the login out again (`Some(addr) != login`), the
+/// login's row is not listed: `` left: Observed { .., listed: 4, .. } right: Observed { ..,
+/// listed: 5, .. } ``.
 #[test]
 fn an_open_mailbox_lists_held_rows_and_births_the_target() {
     let held = cells(registry_cells());
@@ -182,7 +176,7 @@ fn an_open_mailbox_lists_held_rows_and_births_the_target() {
         plan.outcome,
         Outcome::Observed {
             mailbox: MAILBOX_PK.into(),
-            listed: 3,
+            listed: 5,
             born: 1
         }
     );
@@ -190,6 +184,8 @@ fn an_open_mailbox_lists_held_rows_and_births_the_target() {
         pk("ann@example.test"),
         pk("bob@example.test"),
         pk("new@example.test"),
+        pk(LOGIN),
+        pk("owner@pm.example"),
     ];
     want.sort();
     let row = written(&plan);
@@ -218,11 +214,9 @@ fn an_open_mailbox_lists_held_rows_and_births_the_target() {
     ))
     .unwrap();
     assert_eq!(text.matches("new@example.test").count(), 1, "{text}");
-    assert!(!text.contains("owner@"), "the login is nowhere: {text}");
     assert!(
-        !row["addresses"]
-            .to_string()
-            .contains(&pk("owner@pm.example"))
+        !text.contains("owner@"),
+        "the login's text is nowhere: {text}"
     );
     for change in &born {
         assert!(!change.key.contains('@'));
@@ -236,7 +230,7 @@ fn an_open_mailbox_lists_held_rows_and_births_the_target() {
     assert!(row.live());
 }
 
-/// The mailbox comes from this Mac's mailbox key where the importer left one, else from the
+/// The mailbox comes from the key its login derives where that row is here, else from the
 /// owner's links: none is unknown and writes nothing, two hold the pass with a finding by key, a
 /// key whose row is not here yet falls back to the links, and a target the list does not receive,
 /// or that a retired row holds, is not born.
@@ -359,7 +353,7 @@ fn a_row_changes_monthly_and_a_birth_at_once() {
         assert!(plan.changes.is_empty());
     }
     let month = run(&more, None, &held, &mine, NOW + REWRITE_DAYS * DAY);
-    assert!(matches!(month.outcome, Outcome::Observed { listed: 1, .. }));
+    assert!(matches!(month.outcome, Outcome::Observed { listed: 3, .. }));
     assert_eq!(written(&month)["n"], json!(2));
     // A birth is written the same day as the row's last change.
     let born = run(
@@ -643,13 +637,12 @@ fn check_reports_mailbox_obs_ambiguity_and_owner_disagreement() {
 
 /// When a mailbox already receives `MAX_LISTED` held addresses that sort before a newly born
 /// target key, the birth record still lists the newly born target (marking `complete` false);
-/// and when `observe_mailbox` signs in through a short-domain twin or bare-username address,
-/// `alab-mailbox-keys.json` still identifies the mailbox from the account's `own` original
-/// address.
+/// and `observe_mailbox` identifies the mailbox from the key its login's address key derives,
+/// with no key file.
 /// NEGATIVE CONTROL: with `listed.into_iter().take(MAX_LISTED)` dropping the tail unconditionally,
 /// the newly born `zzz` address key is absent from `row["addresses"]`.
 #[test]
-fn a_born_target_past_the_list_cap_stays_listed_and_own_twins_key_the_mailbox() {
+fn a_born_target_past_the_list_cap_stays_listed_and_the_login_keys_the_mailbox() {
     let mut target_addr = String::new();
     let mut target_pk = String::new();
     for i in 0..20_000 {
@@ -666,13 +659,7 @@ fn a_born_target_past_the_list_cap_stays_listed_and_own_twins_key_the_mailbox() 
         put(&MAILBOX, MAILBOX_PK, "label", json!("proton-1")),
         put(&MAILBOX, MAILBOX_PK, "service", json!("proton")),
     ];
-    let mut listed_items = vec![
-        Listed {
-            own: true,
-            ..listed(LOGIN)
-        },
-        listed(&target_addr),
-    ];
+    let mut listed_items = vec![listed(LOGIN), listed(&target_addr)];
     let mut earlier = 0usize;
     let mut seq = 0usize;
     while earlier < MAX_LISTED {
@@ -715,15 +702,16 @@ fn a_born_target_past_the_list_cap_stays_listed_and_own_twins_key_the_mailbox() 
     assert_eq!(addresses.len(), MAX_LISTED);
     assert!(addresses.contains(&json!(target_pk)));
 
-    // Own-twin mailbox key resolution in `Registry::observe_mailbox`:
+    // `Registry::observe_mailbox` keys the mailbox by its login.
     let lab = Lab::new(&[Role::Writer]);
     std::fs::write(lab_config(&lab), "").unwrap();
     let registry = Registry::at(lab.paths[0].clone());
     registry.open().unwrap();
+    let derived = keys::mailbox_pk(&pk(LOGIN)).unwrap();
     registry
         .write(vec![vec![
-            put(&MAILBOX, MAILBOX_PK, "label", json!("proton-1")),
-            put(&MAILBOX, MAILBOX_PK, "service", json!("proton")),
+            put(&MAILBOX, &derived, "label", json!("proton-1")),
+            put(&MAILBOX, &derived, "service", json!("proton")),
             put(
                 &ADDRESS,
                 &pk("bob@example.test"),
@@ -732,26 +720,13 @@ fn a_born_target_past_the_list_cap_stays_listed_and_own_twins_key_the_mailbox() 
             ),
         ]])
         .unwrap();
-    let mut keys = crate::alab::import::MailboxKeys::default();
-    keys.record(LOGIN, MAILBOX_PK, "proton-1");
-    aterm_uds::private_file::ensure_private_dir(&lab.paths[0].dir).unwrap();
-    aterm_uds::private_file::write_private(
-        &lab.paths[0].dir,
-        crate::alab::command::MAILBOX_KEYS,
-        &aterm_json::to_vec(&keys.to_json()).unwrap(),
-    )
-    .unwrap();
-    let twin_listing = Listing {
-        login: "owner@pm.example".into(),
-        ..listing(None)
-    };
     let done = registry
-        .observe_mailbox(&lab_config(&lab), &twin_listing, NOW)
+        .observe_mailbox(&lab_config(&lab), &listing(None), NOW)
         .unwrap();
     assert_eq!(
         done.outcome,
         Outcome::Observed {
-            mailbox: MAILBOX_PK.into(),
+            mailbox: derived,
             listed: 1,
             born: 0,
         }

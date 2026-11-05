@@ -8,10 +8,27 @@
 //! `+tag` to its base, and the list is the mailbox saying it receives the base: the link the list
 //! supplies); else, on a Mac that holds the admins-audience `ai-mailbox.toml`, its route; else the
 //! lead's guess. Pure, over the registry's
-//! projection, so every Mac reads one answer from the same merged rows. A mailbox's login never
-//! appears here: its rows hold only keys.
+//! projection, so every Mac reads one answer from the same merged rows.
+//!
+//! What a sign-in reads of a mailbox (one-mesh design §4.7, §4.8, step A9): [`mailboxes`] names
+//! each live mailbox's login (its `login` row's address), its webmail, its `receives` patterns and
+//! which of its credentials are set, never a value; [`reveal`] hands one credential to the
+//! harness's sign-in through [`super::secret::reveal_sealed`], journalled as `SignIn`. The login
+//! password is the login address's own `password` cell, so the emails table and the mailbox
+//! never hold one fact twice.
 
-use crate::typed::cell::Projection;
+use super::{
+    Registry,
+    registry::{ADDRESS, MAILBOX},
+    secret::{Journal, Surface},
+};
+use crate::{
+    Result,
+    typed::{
+        cell::{Projection, Row},
+        secret::{Cell, Sealer},
+    },
+};
 use aterm_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -102,10 +119,15 @@ fn column<'a>(addresses: &'a Projection, pk: &str, name: &str) -> Option<&'a str
         .filter(|s| !s.is_empty())
 }
 
-/// The next live address `pk` is linked with.
+/// Whether `row` is live and not marked `protected`.
+fn unshielded(row: &crate::typed::cell::Row) -> bool {
+    row.live() && row.get("protected").and_then(Value::as_bool) != Some(true)
+}
+
+/// The next live, unshielded address `pk` is linked with.
 fn linked<'a>(addresses: &'a Projection, pk: &str) -> Option<&'a str> {
     let target = column(addresses, pk, "alias_of")?;
-    addresses.rows.get(target).filter(|row| row.live())?;
+    addresses.rows.get(target).filter(|row| unshielded(row))?;
     Some(target)
 }
 
@@ -128,11 +150,12 @@ pub fn listed_base(
 ) -> Option<(String, String)> {
     let base = untagged(column(addresses, pk, "addr")?)?;
     let base = crate::typed::keys::address_pk(&base).ok()?;
-    addresses.rows.get(&base).filter(|row| row.live())?;
-    let [mailbox] = observed.get(&base)?.iter().collect::<Vec<_>>()[..] else {
+    addresses.rows.get(&base).filter(|row| unshielded(row))?;
+    let set = observed.get(&base)?;
+    if set.len() != 1 {
         return None;
-    };
-    let mailbox = mailbox.clone();
+    }
+    let mailbox = set.first()?.clone();
     Some((base, mailbox))
 }
 
@@ -184,12 +207,7 @@ fn follow(
     pk: &str,
     seen: &mut BTreeSet<String>,
 ) -> Option<Effective> {
-    if !addresses
-        .rows
-        .get(pk)
-        .is_some_and(crate::typed::cell::Row::live)
-        || !seen.insert(pk.to_owned())
-    {
+    if !addresses.rows.get(pk).is_some_and(unshielded) || !seen.insert(pk.to_owned()) {
         return None;
     }
     let found = |mailbox: &str, how| {
@@ -209,7 +227,8 @@ fn follow(
         return Some(reached);
     }
     if let Some(mailboxes) = observed.get(pk)
-        && let [mailbox] = mailboxes.iter().collect::<Vec<_>>().as_slice()
+        && mailboxes.len() == 1
+        && let Some(mailbox) = mailboxes.first()
     {
         return found(mailbox, How::Observed);
     }
@@ -224,6 +243,332 @@ fn follow(
         return found(&mailbox, How::Routed);
     }
     column(addresses, pk, "mailbox_hint").and_then(|mailbox| found(mailbox, How::Hint))
+}
+
+/// A credential a sign-in types for a mailbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Credential {
+    /// The login's password: the login address row's `password`.
+    Password,
+    /// A two-password webmail's second: the mailbox row's `mailbox_password`.
+    MailboxPassword,
+    /// The login's RFC 6238 seed or `otpauth://` URI: the mailbox row's `totp`.
+    Totp,
+}
+
+impl Credential {
+    /// Every credential, in the order a sign-in types them.
+    pub const ALL: [Self; 3] = [Self::Password, Self::MailboxPassword, Self::Totp];
+
+    /// The column that holds it: on the login's address row for [`Self::Password`], else on the
+    /// mailbox row.
+    pub const fn column(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::MailboxPassword => "mailbox_password",
+            Self::Totp => "totp",
+        }
+    }
+}
+
+/// A live mailbox as a sign-in reads it: names, patterns and which credentials are set, never a
+/// credential's value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mailbox {
+    /// Its key (`mb-…`).
+    pub pk: String,
+    /// The owner's plain name for it (`proton-1`).
+    pub label: String,
+    /// Its login address, as the address row holds it (lower-case).
+    pub login: String,
+    /// The login address row's key.
+    pub login_pk: String,
+    pub service: Option<String>,
+    pub code_path: Option<String>,
+    /// Its webmail inbox URL.
+    pub webmail: Option<String>,
+    /// What it receives, as `ai-mailbox.toml`'s `receives` spelled it: each exact address
+    /// (lower-case), then each `*@<domain>`, then `*`.
+    pub receives: Vec<String>,
+    /// The credentials whose cells hold a value, each in one candidate or several.
+    pub held: Vec<Credential>,
+}
+
+fn token_candidates<'a>(row: &'a Row, column: &str) -> Vec<&'a str> {
+    row.fields
+        .get(column)
+        .map(|field| field.candidates_x())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Every live mailbox whose `login` names a live address row, by key ([`Mailbox`]). A mailbox
+/// with a conflicted or missing login, or one whose login row is retired, is no sign-in's.
+pub fn mailboxes(addresses: &Projection, mailboxes: &Projection) -> Vec<Mailbox> {
+    fn text_ref<'a>(row: &'a Row, column: &str) -> Option<&'a str> {
+        row.fields
+            .get(column)
+            .filter(|field| !field.conflicted())
+            .and_then(|field| field.value())
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+    let text = |row: &Row, column: &str| text_ref(row, column).map(str::to_owned);
+    let mut out = Vec::new();
+    for (pk, row) in mailboxes.rows.iter().filter(|(_, row)| row.live()) {
+        let Some(login_pk) = text_ref(row, "login") else {
+            continue;
+        };
+        let Some(login_row) = addresses.rows.get(login_pk).filter(|r| r.live()) else {
+            continue;
+        };
+        let Some(login) = text(login_row, "addr") else {
+            continue;
+        };
+        let mut receives: Vec<String> = row
+            .fields
+            .get("receives")
+            .map(|field| field.members())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|address| addresses.rows.get(address))
+            .filter(|address| address.live())
+            .filter_map(|address| text_ref(address, "addr"))
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let mut any = false;
+        for domain in row
+            .fields
+            .get("receives_domains")
+            .filter(|field| !field.conflicted())
+            .and_then(|field| field.value())
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if domain == "*" {
+                any = true;
+            } else {
+                receives.push(format!("*@{}", domain.to_ascii_lowercase()));
+            }
+        }
+        if any {
+            receives.push("*".to_owned());
+        }
+        let held = Credential::ALL
+            .into_iter()
+            .filter(|which| {
+                let holder = match which {
+                    Credential::Password => login_row,
+                    _ => row,
+                };
+                !token_candidates(holder, which.column()).is_empty()
+            })
+            .collect();
+        out.push(Mailbox {
+            pk: pk.clone(),
+            label: text(row, "label").unwrap_or_default(),
+            login,
+            login_pk: login_pk.to_owned(),
+            service: text(row, "service"),
+            code_path: text(row, "code_path"),
+            webmail: text(row, "webmail"),
+            receives,
+            held,
+        });
+    }
+    out
+}
+
+/// Why a credential could not be handed to a sign-in: value-free words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Withheld {
+    /// No live mailbox with a live login has this key.
+    NoMailbox,
+    /// The cell is empty.
+    NotSet,
+    /// The cell holds two different values; the owner picks one (§4.8, "Conflicts").
+    TwoValues,
+    /// A candidate does not open here.
+    Unopened,
+}
+
+impl Withheld {
+    /// The reason in words, naming no value.
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::NoMailbox => "no live mailbox with a live login has that key",
+            Self::NotSet => "not set in the registry",
+            Self::TwoValues => "two values in the registry: the owner picks one",
+            Self::Unopened => "a value in the registry does not open on this Mac",
+        }
+    }
+}
+
+/// One credential a sign-in asks for: mailbox `mailbox`'s `which`, revealed at `when_ms`.
+#[derive(Clone, Copy, Debug)]
+pub struct Ask<'a> {
+    pub mailbox: &'a str,
+    pub which: Credential,
+    pub when_ms: u64,
+}
+
+/// Hand `ask`'s credential to `consume`, journalled once as a sign-in's reveal. Candidates that
+/// open to one value are one value; two different values are withheld until the owner picks
+/// one, so a sign-in never guesses between them.
+///
+/// # Errors
+/// Journalling fails ([`super::secret::reveal_sealed`]).
+pub fn reveal_in<T>(
+    addresses: &Projection,
+    mailboxes: &Projection,
+    sealer: &dyn Sealer,
+    journal: &Journal,
+    ask: Ask<'_>,
+    consume: impl FnOnce(&str) -> T,
+) -> Result<std::result::Result<T, Withheld>> {
+    let Some(found) = self::mailboxes(addresses, mailboxes)
+        .into_iter()
+        .find(|m| m.pk == ask.mailbox)
+    else {
+        return Ok(Err(Withheld::NoMailbox));
+    };
+    let column = ask.which.column();
+    let (collection, row_pk, row) = match ask.which {
+        Credential::Password => (
+            ADDRESS.name,
+            found.login_pk.as_str(),
+            addresses.rows.get(&found.login_pk),
+        ),
+        Credential::MailboxPassword | Credential::Totp => (
+            MAILBOX.name,
+            found.pk.as_str(),
+            mailboxes.rows.get(&found.pk),
+        ),
+    };
+    let Some(row) = row else {
+        return Ok(Err(Withheld::NoMailbox));
+    };
+    let tokens = token_candidates(row, column);
+    let Some((first, rest)) = tokens.split_first() else {
+        return Ok(Err(Withheld::NotSet));
+    };
+    let Ok(held) = sealer.open(collection, row_pk, column, first) else {
+        return Ok(Err(Withheld::Unopened));
+    };
+    for token in rest {
+        match sealer.open(collection, row_pk, column, token) {
+            Ok(other) if other.same(&held) => {}
+            Ok(_) => return Ok(Err(Withheld::TwoValues)),
+            Err(_) => return Ok(Err(Withheld::Unopened)),
+        }
+    }
+    drop(held);
+    let cell = Cell {
+        table: sealer.table(),
+        collection,
+        row: row_pk,
+        column,
+    };
+    super::secret::reveal_sealed(
+        journal,
+        sealer,
+        first,
+        cell,
+        Surface::SignIn,
+        ask.when_ms,
+        consume,
+    )
+    .map(Ok)
+}
+
+/// The registry's live mailboxes on this Mac ([`mailboxes`]), read as an observer.
+///
+/// # Errors
+/// The registry is not declared here or its log does not read.
+pub fn sign_in_mailboxes(registry: &Registry) -> Result<Vec<Mailbox>> {
+    let view = crate::att::Handle::at(registry.paths().clone(), &crate::att::REGISTRY).view()?;
+    Ok(mailboxes(&view.project(&ADDRESS), &view.project(&MAILBOX)))
+}
+
+/// [`reveal_in`] over this Mac's registry, its Secret keys resolved inside the table session.
+///
+/// # Errors
+/// The registry is not declared here, its log does not read, a key is unavailable, or the
+/// journal fails.
+pub fn reveal<T>(
+    registry: &Registry,
+    journal: &Journal,
+    ask: Ask<'_>,
+    consume: impl FnOnce(&str) -> T,
+) -> Result<std::result::Result<T, Withheld>> {
+    crate::att::Handle::at(registry.paths().clone(), &crate::att::REGISTRY).view_sealed(
+        |view, sealer| {
+            reveal_in(
+                &view.project(&ADDRESS),
+                &view.project(&MAILBOX),
+                sealer,
+                journal,
+                ask,
+                consume,
+            )
+        },
+    )
+}
+
+/// Reveal a complete credential bundle from one sealed registry observation.
+/// The admitted metadata is checked before any Secret cell opens; all requested parts
+/// must succeed before the consumer receives any plaintext. Epoch keys stay in this module.
+///
+/// # Errors
+/// The registry, key or journal is unavailable. Withholds incomplete or changed bindings.
+pub fn reveal_bound<T>(
+    registry: &Registry,
+    journal: &Journal,
+    mailbox: &str,
+    parts: &[Credential],
+    when_ms: u64,
+    accept: impl FnOnce(&Mailbox) -> bool,
+    consume: impl FnOnce(&[aterm_secrets::SecretBytes]) -> T,
+) -> Result<std::result::Result<T, Withheld>> {
+    crate::att::Handle::at(registry.paths().clone(), &crate::att::REGISTRY).view_sealed(
+        |view, sealer| {
+            let addresses = view.project(&ADDRESS);
+            let mailboxes = view.project(&MAILBOX);
+            let Some(found) = self::mailboxes(&addresses, &mailboxes)
+                .into_iter()
+                .find(|m| m.pk == mailbox)
+            else {
+                return Ok(Err(Withheld::NoMailbox));
+            };
+            if !accept(&found) {
+                return Ok(Err(Withheld::NoMailbox));
+            }
+            let mut values = Vec::with_capacity(parts.len());
+            for part in parts {
+                match reveal_in(
+                    &addresses,
+                    &mailboxes,
+                    sealer,
+                    journal,
+                    Ask {
+                        mailbox,
+                        which: *part,
+                        when_ms,
+                    },
+                    |value| aterm_secrets::SecretBytes::from(value.as_bytes()),
+                )? {
+                    Ok(value) => values.push(value),
+                    Err(why) => return Ok(Err(why)),
+                }
+            }
+            Ok(Ok(consume(&values)))
+        },
+    )
 }
 
 #[cfg(test)]

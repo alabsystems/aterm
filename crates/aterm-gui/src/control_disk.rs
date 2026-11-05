@@ -16,7 +16,7 @@ use crate::disk_board::{Board, PassSummary, Shelf, VolumeRow, Watch};
 /// The reply to a `vol=` that is not an absolute path once decoded.
 pub(crate) const USAGE: &str = aterm_vitals::sys::predicate::USAGE;
 
-/// A beat this old, while the watch runs, is a stalled watch.
+/// How old a beat is before it can mean a stalled watch ([`stalled`]).
 pub(crate) const STALL: Duration =
     Duration::from_secs(crate::harness_host::DISK_TICK.as_secs().saturating_mul(2));
 
@@ -117,7 +117,7 @@ pub(crate) struct Facts {
     pub(crate) demand: bool,
     /// The watch is running (not suspended, not before its first look).
     pub(crate) running: bool,
-    /// Its beat is [`STALL`] old.
+    /// Its beat says it has stalled ([`stalled`]).
     pub(crate) beat_old: bool,
     /// A pass adopted this wait's need, ran every tier it may and left free space below it.
     pub(crate) spent: bool,
@@ -130,10 +130,18 @@ pub(crate) enum Decision {
     Met,
     /// What is left is not aterm's to free: `ERR unmet`.
     Unmet,
-    /// The wait holds a demand and the running watch made no progress for [`STALL`]: `ERR unavailable free why=watch-stalled`.
+    /// The wait holds a demand and the running watch has [`stalled`]: `ERR unavailable free why=watch-stalled`.
     Stalled,
     /// Park on.
     Park,
+}
+
+/// Whether the running watch has stalled, from how old its beat is and how long this wait has been
+/// poking for a look. A look in flight with a beat [`STALL`] old has made no progress. Between looks
+/// an old beat says only that none has started, and a poke starts one, so there it takes this wait
+/// having poked as long with none begun.
+fn stalled(look_in_flight: bool, beat_age: Duration, poking: Duration) -> bool {
+    beat_age >= STALL && (look_in_flight || poking >= STALL)
 }
 
 /// THE DECISION, pure: met on a reading that holds.
@@ -311,6 +319,19 @@ fn unix_now() -> i64 {
     aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX))
 }
 
+/// The demand a wait holds: its id on the board, and when it first poked the watch for it.
+#[derive(Clone, Copy)]
+struct Demanded {
+    id: u64,
+    poked: Instant,
+}
+
+/// Whether `pass` ran for a demand at least as large as a wait's `need`. A pass records no start, so
+/// one that began before this wait's demand, for as large a need as another wait's, counts too.
+fn took(pass: &PassSummary, need: Option<u64>) -> bool {
+    need.is_some_and(|n| pass.demand.is_some_and(|d| d >= n))
+}
+
 /// THE WAIT over `shelf`: arm, latch or register a demand, park until it answers.
 pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> String {
     let armed = Instant::now();
@@ -374,7 +395,7 @@ pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> St
         return met_reply(&row, 0);
     }
     let seen = shelf.board_lock().last_pass.as_ref().map(|p| p.ended_at);
-    let mut demand: Option<u64> = None;
+    let mut demand: Option<Demanded> = None;
     if let (Some(need), true) = (need, who.owner_class)
         && row.reading.free < need
     {
@@ -408,7 +429,10 @@ pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> St
         let id = shelf
             .board_lock()
             .demand(who.session, key.clone(), need, who.cwd.clone(), armed);
-        demand = Some(id);
+        demand = Some(Demanded {
+            id,
+            poked: Instant::now(),
+        });
         (env.poke)(need);
     }
     let answer = park(
@@ -421,8 +445,8 @@ pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> St
         deadline,
         env,
     );
-    if let Some(id) = demand {
-        shelf.publish(|b| b.drop_demand(id));
+    if let Some(d) = demand {
+        shelf.publish(|b| b.drop_demand(d.id));
     }
     answer
 }
@@ -437,14 +461,14 @@ fn park(
     wait: &SysWait,
     key: &VolumeKey,
     path: &Path,
-    (need, demand, mut seen): (Option<u64>, Option<u64>, Option<Instant>),
+    (need, demand, mut seen): (Option<u64>, Option<Demanded>, Option<Instant>),
     armed: Instant,
     deadline: Instant,
     env: &Env<'_>,
 ) -> String {
     let mut freed = 0u64;
     let mut adopted: Option<PassSummary> = None;
-    let mut poked_at = Instant::now();
+    let mut poked_at = demand.map_or_else(Instant::now, |d| d.poked);
     loop {
         let g = shelf.board_lock();
         if !wait.observes_low_free()
@@ -490,8 +514,19 @@ fn park(
             drop(g);
             return ROOM_UNKNOWN.to_owned();
         }
+        let taken = adopted.as_ref().is_some_and(|p| took(p, need));
         let (running, beat_old) = match g.watch {
-            Watch::Running { beat } => (true, beat.elapsed() >= STALL),
+            Watch::Running { beat } => (
+                true,
+                // A pass that took this wait's demand ends its pokes ([`FRESH`], below).
+                stalled(
+                    g.look_in_flight,
+                    beat.elapsed(),
+                    demand
+                        .filter(|_| !taken)
+                        .map_or(Duration::ZERO, |d| d.poked.elapsed()),
+                ),
+            ),
             Watch::NotStarted | Watch::Suspended => (false, false),
         };
         let facts = Facts {
@@ -499,9 +534,7 @@ fn park(
             demand: demand.is_some(),
             running,
             beat_old,
-            spent: adopted
-                .as_ref()
-                .is_some_and(|p| p.spent && need.is_some_and(|n| p.demand.is_some_and(|d| d >= n))),
+            spent: adopted.as_ref().is_some_and(|p| p.spent && took(p, need)),
         };
         let decision = decide(&facts);
         let now = Instant::now();
@@ -526,7 +559,13 @@ fn park(
                 };
                 return unmet_reply(&row, need.unwrap_or(0), freed, why, adopted.as_ref());
             }
-            Decision::Stalled => return "ERR unavailable free why=watch-stalled\n".to_owned(),
+            Decision::Stalled => {
+                aterm_log::warn!(
+                    "harness disk watch: no progress for {} s; a wait for free space answers watch-stalled",
+                    STALL.as_secs()
+                );
+                return "ERR unavailable free why=watch-stalled\n".to_owned();
+            }
             Decision::Park => {}
         }
         if (env.hung_up)() {
@@ -548,7 +587,9 @@ fn park(
                 Err(u) => return format!("ERR unavailable free why={}\n", u.word()),
             }
         }
-        if let Some(n) = need.filter(|_| demand.is_some() && adopted.is_none())
+        // A pass adopts no demand while nothing is watched, so a poke then would only force a pass.
+        // Read here: a change of it wakes no wait.
+        if let Some(n) = need.filter(|_| demand.is_some() && !taken && shelf.board_lock().watched)
             && poked_at.elapsed() >= FRESH
         {
             (env.poke)(n);

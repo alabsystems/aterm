@@ -79,7 +79,7 @@ pub struct Instance {
     pub sock: String,
     // Fields drop in order, after the owned child is stopped and the lifeline is cut.
     world: WorldGuard,
-    /// Released last, after the scratch world and its spare FIFOs are swept.
+    /// Released last, after the scratch world is removed.
     _lease: std::sync::Arc<aterm_spec::subprocess_lane::SubprocessLease>,
 }
 
@@ -90,16 +90,8 @@ impl Drop for Instance {
     }
 }
 
-/// Remove a scratch world whose instances (and keeper) are dead, first releasing the spare FIFOs
-/// they left as the next launch in the world would, since no launch comes to a removed world: a
-/// spare of this build ends at its hold's end-of-file once its instance is gone, but one whose
-/// hold opens its FIFO's path (an older build's) waits in that open for ever.
+/// Remove a scratch world whose instances (and keeper) are dead.
 pub fn remove_world(root: &Path) {
-    aterm_shell_integration::spare_fifo::sweep_dead(
-        &root
-            .join("run/aterm")
-            .join(aterm_shell_integration::SPARE_DIR),
-    );
     for _ in 0..40 {
         if std::fs::remove_dir_all(root).is_ok() || !root.exists() {
             return;

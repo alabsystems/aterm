@@ -365,10 +365,23 @@ impl Booter {
             std::fs::create_dir_all(dir)?;
         }
         let staged = path.with_extension(format!("staged-{}", std::process::id()));
-        std::fs::write(&staged, self.line())?;
-        std::fs::rename(&staged, path).inspect_err(|_| {
-            let _ = std::fs::remove_file(&staged);
-        })
+        let _ = std::fs::remove_file(&staged);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        opts.open(&staged)
+            .and_then(|mut f| {
+                use std::io::Write as _;
+                f.write_all(self.line().as_bytes())
+            })
+            .and_then(|()| std::fs::rename(&staged, path))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&staged);
+            })
     }
 
     /// Whether this booter's process still runs: its pid, born when the record says.

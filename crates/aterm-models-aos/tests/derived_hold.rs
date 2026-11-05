@@ -10,12 +10,15 @@ use aterm_spec::derive::{InvariantKind, Model};
 use aterm_spec::interp::{self, State};
 
 /// Each dial and the one law it is written to break.
-const DIALS: [(i64, &str); 5] = [
+const DIALS: [(i64, &str); 8] = [
     (1, "NothingLoggedWhileHeld"),
     (2, "OnlyEchoedKeysLogged"),
     (3, "HostedGlowMatchesItsLog"),
     (4, "AttachStartsFromRest"),
     (5, "OnlyEchoedKeysLogged"),
+    (6, "UnseenOnlyWithOptIn"),
+    (7, "MaskedKeyNeverLogged"),
+    (8, "OptInEndsWithItsAttach"),
 ];
 
 /// The state after firing `steps` in order from `model`'s initial state, each of which must be
@@ -132,4 +135,64 @@ fn an_unproven_run_stops_the_recording_and_the_next_attach_starts_from_rest() {
     let leaky = interp::with_buggy(&model, 1);
     let s = walk(&leaky, &["Attach", "Hold", "Tick"]);
     assert!(!leaky.check_invariant("NothingLoggedWhileHeld", &s));
+}
+
+#[test]
+fn a_held_run_is_logged_unseen_only_under_the_grant_and_never_over_a_mask() {
+    let model = aos_key_hold_model();
+    let s = walk(&model, &["Attach", "Hold"]);
+    assert!(
+        !model.action_enabled("Unproven", &s),
+        "without the grant an unproven run is only refuted"
+    );
+    let s = walk(&model, &["Attach", "OptIn", "Hold", "Hold", "Unproven"]);
+    assert_eq!(
+        (s["att"], s["held"], s["glow"], s["unseen"], s["optin"]),
+        (1, 0, 1, 0, 1),
+        "logged unseen, still recording, the glow tainted"
+    );
+    let s = walk(&model, &["Attach", "OptIn", "Hold", "Mask"]);
+    assert!(
+        !model.action_enabled("Unproven", &s),
+        "a mask where the key should show leaves only the refute"
+    );
+    assert!(!model.action_enabled("Echo", &s), "no echo after a mask");
+    assert!(model.action_enabled("Refute", &s));
+    let s = walk(&model, &["Attach", "OptIn", "Hold"]);
+    assert!(
+        !model.action_enabled("Lapse", &s),
+        "a grant ends with keys held only by the refute"
+    );
+
+    let ungranted = interp::with_buggy(&model, 6);
+    let s = walk(&ungranted, &["Attach", "Hold", "Unproven"]);
+    assert!(!ungranted.check_invariant("UnseenOnlyWithOptIn", &s));
+    let over_mask = interp::with_buggy(&model, 7);
+    let s = walk(&over_mask, &["Attach", "OptIn", "Hold", "Mask", "Unproven"]);
+    assert!(!over_mask.check_invariant("MaskedKeyNeverLogged", &s));
+}
+
+#[test]
+fn the_grant_ends_with_its_attach() {
+    let model = aos_key_hold_model();
+    for end in ["Detach", "Private"] {
+        let s = walk(&model, &["Attach", "OptIn", end]);
+        assert_eq!((s["att"], s["optin"]), (0, 0), "{end}");
+    }
+    let s = walk(&model, &["Attach", "OptIn", "Hold", "Refute"]);
+    assert_eq!((s["att"], s["optin"]), (0, 0));
+    let s = walk(&model, &["Attach", "OptIn", "Lapse"]);
+    assert_eq!(
+        (s["att"], s["optin"]),
+        (1, 0),
+        "the person's stop or the program leaving"
+    );
+    assert!(
+        !model.action_enabled("OptIn", &walk(&model, &[])),
+        "no grant without a recording"
+    );
+
+    let outlives = interp::with_buggy(&model, 8);
+    let s = walk(&outlives, &["Attach", "OptIn", "Detach"]);
+    assert!(!outlives.check_invariant("OptInEndsWithItsAttach", &s));
 }

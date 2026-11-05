@@ -324,7 +324,9 @@ impl Files for Live {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
         }
         let mut file = options.open(&staged)?;
         let written = file

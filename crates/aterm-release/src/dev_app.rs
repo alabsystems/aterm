@@ -452,7 +452,7 @@ fn first_run(run: &dyn Run, exe: &Path, marks: &Path) -> Option<String> {
     cmd.arg("--version");
     let out = run.run(&mut cmd, FIRST_EXEC_HANG).ok()?;
     if out.status.code().is_some() {
-        let _ = std::fs::write(marks.join(RAN), "");
+        let _ = aterm_uds::deadline::try_mark_ran(marks);
         let _ = std::fs::remove_dir_all(marks);
     }
     let text = String::from_utf8_lossy(&out.stdout);
@@ -570,7 +570,7 @@ fn assemble(
     if pin {
         plist = crate::bundle::set_plist_string(&plist, DEV_MARK_KEY, "true")?;
     }
-    std::fs::write(&plist_path, plist)
+    crate::durable::write_fresh(&plist_path, plist)
         .map_err(|e| format!("write {}: {e}", plist_path.display()))?;
     Ok(app)
 }
@@ -688,7 +688,16 @@ fn applications_dir(home: &Path) -> Result<PathBuf, String> {
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     let meta =
         std::fs::symlink_metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
-    if meta.file_type().is_symlink() {
+    copy_tree_kind(src, dst, meta.file_type(), Some(&meta))
+}
+
+fn copy_tree_kind(
+    src: &Path,
+    dst: &Path,
+    kind: std::fs::FileType,
+    dir_meta: Option<&std::fs::Metadata>,
+) -> Result<(), String> {
+    if kind.is_symlink() {
         let target =
             std::fs::read_link(src).map_err(|e| format!("readlink {}: {e}", src.display()))?;
         #[cfg(unix)]
@@ -698,19 +707,50 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
         let _ = target;
         return Ok(());
     }
-    if meta.is_dir() {
+    if kind.is_dir() {
+        let owned_meta;
+        let meta = match dir_meta {
+            Some(meta) => meta,
+            None => {
+                owned_meta = std::fs::symlink_metadata(src)
+                    .map_err(|e| format!("stat {}: {e}", src.display()))?;
+                &owned_meta
+            }
+        };
         std::fs::create_dir(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
         let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("read {}: {e}", src.display()))?;
-            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("stat {}: {e}", src.display()))?;
+            copy_tree_kind(&entry.path(), &dst.join(entry.file_name()), ft, None)?;
         }
-        return std::fs::set_permissions(dst, meta.permissions())
+        return atpkg::platform::set_mode(dst, atpkg::platform::permission_mode(meta) & 0o7777)
             .map_err(|e| format!("chmod {}: {e}", dst.display()));
     }
-    std::fs::copy(src, dst)
+    if !kind.is_file() {
+        return Err(format!(
+            "{} is not a regular file, directory, or symlink",
+            src.display()
+        ));
+    }
+    let (mut source, src_meta) = crate::durable::open_regular_file_with_meta(src)
+        .map_err(|e| format!("open {}: {e}", src.display()))?;
+    let mut sink = crate::durable::open_create_new(dst)
+        .map_err(|e| format!("create {}: {e}", dst.display()))?;
+    std::io::copy(&mut source, &mut sink)
         .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
-    Ok(())
+    let perms = src_meta.permissions();
+    #[cfg(unix)]
+    if sink.metadata().is_ok_and(|m| {
+        use std::os::unix::fs::PermissionsExt as _;
+        m.permissions().mode() & 0o7777 == perms.mode() & 0o7777
+    }) {
+        return Ok(());
+    }
+    sink.set_permissions(perms)
+        .map_err(|e| format!("chmod {}: {e}", dst.display()))
 }
 
 /// Install `app` into `dir` as [`DEV_APP_NAME`], replacing a previous dev install: a

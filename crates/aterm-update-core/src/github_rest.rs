@@ -142,8 +142,8 @@ impl Token {
                 ));
             }
         };
-        match file.metadata() {
-            Ok(meta) if meta.is_file() => {}
+        let meta = match file.metadata() {
+            Ok(meta) if meta.is_file() => meta,
             Ok(_) => {
                 return Err(format!(
                     "cannot read the token file {}: not a regular file",
@@ -156,8 +156,15 @@ impl Token {
                     path.display()
                 ));
             }
+        };
+        if meta.len() > TOKEN_FILE_CAP as u64 {
+            return Err(format!(
+                "cannot read the token file {}: exceeds {TOKEN_FILE_CAP} bytes",
+                path.display()
+            ));
         }
-        let mut bytes = Vec::new();
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
         if let Err(e) = file
             .take((TOKEN_FILE_CAP + 1) as u64)
             .read_to_end(&mut bytes)
@@ -616,13 +623,15 @@ fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    let mut bytes = Vec::new();
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(meta.len().min(cap).saturating_add(1)).unwrap_or(0));
     file.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
@@ -784,8 +793,20 @@ impl Client {
             Body::Empty => args.extend(["--max-time", API_SECS].map(String::from)),
             Body::Json(json) => {
                 let file = scratch.0.join("request.json");
-                std::fs::write(&file, json)
-                    .map_err(|e| RestError::Local(format!("write the request body: {e}")))?;
+                {
+                    use std::io::Write as _;
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.write(true).create_new(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt as _;
+                        opts.mode(0o600)
+                            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+                    }
+                    opts.open(&file)
+                        .and_then(|mut f| f.write_all(json))
+                        .map_err(|e| RestError::Local(format!("write the request body: {e}")))?;
+                }
                 args.extend([
                     "--max-time".to_string(),
                     API_SECS.to_string(),

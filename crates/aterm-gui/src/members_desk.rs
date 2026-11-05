@@ -45,8 +45,8 @@ pub(crate) const UNDO_PREFIX: &str = "members.undo.";
 /// How often the lane looks at the desk for a change the band shows.
 const READ_EVERY: Duration = Duration::from_secs(2);
 
-/// How often the lane reads this Mac's Commons state again: a new roster binding lets it allow,
-/// and a Mac that left the vault drops its desk.
+/// How often the lane reads this Mac's membership again: a new log seat or roster binding lets it
+/// allow, and a Mac that left the vault drops its desk.
 const LOCAL_EVERY: Duration = Duration::from_secs(30);
 
 /// What `allow` and `invite` say in place of the phrase, `lasts` being how long the phrase shown
@@ -78,8 +78,8 @@ pub(crate) type Shared = Arc<Mutex<Desk>>;
 /// Where a desk is kept: empty until this Mac is a member, and empty again once it left.
 type Slot = Mutex<Option<Shared>>;
 
-/// The desk of a windowed instance, made once this Mac holds Commons state and dropped once it
-/// left the vault ([`spawn_lane`]).
+/// The desk of a windowed instance, made once this Mac is a member and dropped once it left the
+/// vault ([`spawn_lane`]).
 static LIVE: Slot = Mutex::new(None);
 
 /// Set when the desk changed in a way the band shows; the next park reads it.
@@ -112,10 +112,6 @@ pub(crate) fn serve_ask(
         let _ = members::refuse(stream, "this Mac is not an ALab member yet");
         return;
     };
-    let bundle = |handing: &desk::Handing<'_>| {
-        let paths = aterm_secrets::client::Paths::live()?;
-        aterm_secrets::client::hand_over(&paths, handing)
-    };
     // A Mac that is ALab's already but whose vault key changed proves its fleet node key on this
     // connection and is let back in with nobody (`aterm_secrets::client::readmit`), as far as
     // this Mac's fleet book allows it (read here, on the connection's thread).
@@ -128,6 +124,20 @@ pub(crate) fn serve_ask(
             Some(peer.ip()),
             aterm_time::unix_millis().unwrap_or(0),
         )
+    };
+    // A person's Allow of a Mac whose node key a live seat holds moves that seat to it, as far
+    // as the same book allows (one-mesh A15).
+    let bundle = |handing: &desk::Handing<'_>| {
+        let paths = aterm_secrets::client::Paths::live()?;
+        let peers = aterm_types::dirs::state_dir()
+            .and_then(|state| aterm_net::fleet_member::read_peers(&state).ok());
+        let book = aterm_agent::vault_join::book_word_read(
+            peers.as_deref(),
+            &handing.node,
+            Some(peer.ip()),
+            aterm_time::unix_millis().unwrap_or(0),
+        );
+        aterm_secrets::client::hand_over_with(&paths, handing, book)
     };
     let prove = |proving: &desk::Proving<'_>| {
         let paths = aterm_secrets::client::Paths::live()?;
@@ -216,6 +226,14 @@ pub(crate) fn attach_relayed(stream: aterm_uds::CtlStream, peer: SocketAddr) -> 
     attach_relayed_to(desk, stream, peer)
 }
 
+/// Each read and write of a relayed `ask` on the window's end, within aterm-net's
+/// `HANDSHAKE_WITHIN`; a unit test's asking Macs are its own threads, which answer, so theirs wait
+/// the hang detector.
+#[cfg(not(test))]
+const RELAYED_ASK_WITHIN: Duration = aterm_net::fleet::HANDSHAKE_WITHIN;
+#[cfg(test)]
+const RELAYED_ASK_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
+
 /// [`attach_relayed`] on `desk`.
 pub(crate) fn attach_relayed_to(
     desk: Option<Shared>,
@@ -226,8 +244,8 @@ pub(crate) fn attach_relayed_to(
         "aterm-members-ask",
         crate::qos::Role::Responsive,
         move || {
-            let _ = stream.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN));
-            let _ = stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN));
+            let _ = stream.set_read_timeout(Some(RELAYED_ASK_WITHIN));
+            let _ = stream.set_write_timeout(Some(RELAYED_ASK_WITHIN));
             let mut go = [0u8; 3];
             if std::io::Read::read_exact(&mut stream, &mut go).is_ok() && &go == b"go\n" {
                 serve_ask(desk.as_ref(), &mut stream, peer);
@@ -272,8 +290,8 @@ fn post_allowed(allowed: Allowed, logged: bool) {
     }
 }
 
-/// Start the desk of a windowed macOS instance, off the event loop: read this Mac's Commons
-/// state every [`LOCAL_EVERY`] ([`follow_local`]: the desk made once it is a member, dropped
+/// Start the desk of a windowed macOS instance, off the event loop: read this Mac's membership
+/// every [`LOCAL_EVERY`] ([`follow_local`]: the desk made once it is a member, dropped
 /// once it left), and mark each change the band shows ([`App::follow_member_requests`]).
 /// Whether the thread started.
 pub(crate) fn spawn_lane(headless: bool) -> bool {
@@ -306,7 +324,7 @@ pub(crate) fn spawn_lane(headless: bool) -> bool {
                 }
                 if moved.wait(READ_EVERY) != crate::network_moved::Woke::Timer {
                     follow_network(&LIVE);
-                    // The member's home ALab LAN is read with its Commons state
+                    // The member's home ALab LAN is read with its membership
                     // (`Local::automatically_admits`): read both again at once after a move.
                     looked = None;
                 }
@@ -321,10 +339,10 @@ pub(crate) fn spawn_lane(headless: bool) -> bool {
     }
 }
 
-/// Read this Mac's Commons state under `paths` into `slot`: a member's desk made, or refreshed
-/// keeping what it heard; none once this Mac left the vault ([`left`]), so its rows end, an
-/// `ask` is refused and Allow finds no desk. A vault mid-apply and unreadable state leave `slot`
-/// as it was.
+/// Read this Mac's membership under `paths` into `slot` ([`Local::of`]: its membership log seat,
+/// whether or not Commons control is its own): a member's desk made, or refreshed keeping what it
+/// heard; none once this Mac left the vault ([`left`]), so its rows end, an `ask` is refused and
+/// Allow finds no desk. A vault mid-apply and unreadable state leave `slot` as it was.
 fn follow_local(slot: &Slot, paths: &aterm_secrets::client::Paths) {
     match Local::of(paths) {
         Ok(Some(local)) => {
@@ -338,7 +356,7 @@ fn follow_local(slot: &Slot, paths: &aterm_secrets::client::Paths) {
         Ok(None) if left(paths) => *slot.lock_or_recover() = None,
         Ok(None) => {}
         Err(error) => {
-            aterm_log::warn!("members: this Mac's Commons state: {error}");
+            aterm_log::warn!("members: this Mac's membership: {error}");
         }
     }
 }
@@ -420,22 +438,28 @@ pub(crate) fn undo_notice(offer: &aterm_secrets::client::UndoOffer) -> Message {
         .key(&format!("{UNDO_PREFIX}{}", offer.code))
 }
 
-/// Whether this Mac's vault says it is no member, and not just for a moment: none configured,
-/// not admitted, revoked, no Commons control grant, or no identity of its own. A busy vault, an
-/// apply still pending or incomplete and every other read leave the desk as it was.
+/// Whether this Mac's vault says it is no member, and not just for a moment, once [`Local::of`]
+/// found none: none configured, not admitted, revoked, no identity of its own, or Commons control
+/// that is not its own while it is no member by its membership log either
+/// ([`aterm_secrets::client::member_by_log`]: the log seats it nowhere, removed it, or it holds no
+/// pinned Commons anchor). A seated member with its pinned anchor whose read found none for a
+/// moment (a vault pass held its state past the read's deadline) keeps its desk, as a member that
+/// holds Commons control does. A busy vault, an apply still pending or incomplete and every other
+/// read leave the desk as it was.
 fn left(paths: &aterm_secrets::client::Paths) -> bool {
     use aterm_secrets::commons::{Observation, Unavailable};
-    matches!(
-        aterm_secrets::commons::observe(paths),
+    match aterm_secrets::commons::observe(paths) {
         Ok(Observation::Unavailable(
             Unavailable::Unconfigured
-                | Unavailable::NotAdmitted
-                | Unavailable::Revoked
-                | Unavailable::MissingIdentity
-                | Unavailable::ControlExcluded
-                | Unavailable::ControlNotVisible
-        ))
-    )
+            | Unavailable::NotAdmitted
+            | Unavailable::Revoked
+            | Unavailable::MissingIdentity,
+        )) => true,
+        Ok(Observation::Unavailable(
+            Unavailable::ControlExcluded | Unavailable::ControlNotVisible,
+        )) => matches!(aterm_secrets::client::member_by_log(paths), Ok(false)),
+        _ => false,
+    }
 }
 
 /// What the digest files of a desk: the requests still asking, and whether this Mac can allow.
@@ -883,6 +907,12 @@ impl App {
                         ),
                         (None, RowState::Allowed(_)) => "allowed".to_owned(),
                         (None, _) => "asking".to_owned(),
+                    };
+                    let state = match &row.moves {
+                        Some(kept) => {
+                            format!("{state} moves={}", crate::control::pct_encode(&kept.label))
+                        }
+                        None => state,
                     };
                     reply.push_str(&format!(
                         "request name={} model={} from={} code={} state={state}\n",

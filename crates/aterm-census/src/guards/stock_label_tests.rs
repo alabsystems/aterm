@@ -125,6 +125,12 @@ const PACKAGE_J: &str = "[package]\nname = \"aterm-j\"\nautobins = false\n\n\
 /// A library rooted at the file Cargo also discovers as the package's binary.
 const PACKAGE_K: &str = "[package]\nname = \"aterm-k\"\n\n[lib]\npath = \"src/main.rs\"\n";
 
+/// Library discovery off, and a `[lib]` with no `path`: Cargo roots it at `src/lib.rs`.
+const PACKAGE_L: &str = "[package]\nname = \"aterm-l\"\nautolib = false\n\n[lib]\n";
+
+/// A plain package, for the tests that plant their own targets in it.
+const PACKAGE_P: &str = "[package]\nname = \"aterm-p\"\nedition = \"2024\"\n";
+
 /// A `fn main` whose work is Windows-only, and which only reports anywhere else.
 const STUB: &str =
     "fn main() {\n    #[cfg(windows)]\n    win::run();\n    eprintln!(\"Windows only\");\n}\n";
@@ -228,6 +234,13 @@ fn a_target_with_no_work_on_trusts_host_is_found() {
                       #[cfg(not(unix))]\nfn main() {\n    eprintln!(\"unix only\");\n}\n";
     let nested_inner =
         "fn main() {\n    serve();\n    mod w {\n        #![cfg(windows)]\n    }\n}\n";
+    let let_plus = "fn main() {\n    #[cfg(windows)]\n    \
+                    let code = match win::run() { _ => 1 } + win::extra();\n    \
+                    eprintln!(\"Windows only\");\n}\n";
+    let attrs_on_main = "#[cfg(windows)]\n#[allow(unused)]\nfn main() {\n    win::run();\n}\n\n\
+                         #[cfg(not(windows))]\nfn main() {\n    eprintln!(\"Windows only\");\n}\n";
+    let wrapped_first = "fn main() {\n    #[cfg(all(\n        windows,\n        debug_assertions,\n    \
+                         ))]\n    win::run();\n    eprintln!(\"Windows only\");\n}\n";
     let found = run(
         &STOCK_LABEL,
         &[
@@ -272,6 +285,9 @@ fn a_target_with_no_work_on_trusts_host_is_found() {
             ("crates/aterm-d/src/bin/inner_gate.rs", inner_gate),
             ("crates/aterm-d/src/bin/inner_host.rs", inner_host),
             ("crates/aterm-d/src/bin/nested_inner.rs", nested_inner),
+            ("crates/aterm-d/src/bin/let_plus.rs", let_plus),
+            ("crates/aterm-d/src/bin/attrs_on_main.rs", attrs_on_main),
+            ("crates/aterm-d/src/bin/wrapped_first.rs", wrapped_first),
             ("crates/aterm-d/src/bin/dirbin/main.rs", STUB),
             ("crates/aterm-d/src/bin/dirbin/helper.rs", WHOLE),
             ("crates/aterm-d/tests/dirtest/main.rs", STUB),
@@ -298,6 +314,8 @@ fn a_target_with_no_work_on_trusts_host_is_found() {
             ("crates/aterm-j/src/bin/other.rs", WHOLE),
             ("crates/aterm-k/Cargo.toml", PACKAGE_K),
             ("crates/aterm-k/src/main.rs", STUB),
+            ("crates/aterm-l/Cargo.toml", PACKAGE_L),
+            ("crates/aterm-l/src/lib.rs", WHOLE),
         ],
     );
     assert_eq!(
@@ -312,14 +330,17 @@ fn a_target_with_no_work_on_trusts_host_is_found() {
             "crates/aterm-d/examples/direx/main.rs:2",
             "crates/aterm-d/examples/feature_gated.rs:1",
             "crates/aterm-d/src/bin/agent.rs:1",
+            "crates/aterm-d/src/bin/attrs_on_main.rs:1",
             "crates/aterm-d/src/bin/client.rs:2",
             "crates/aterm-d/src/bin/dirbin/main.rs:2",
             "crates/aterm-d/src/bin/gated_static.rs:2",
             "crates/aterm-d/src/bin/inner_gate.rs:2",
+            "crates/aterm-d/src/bin/let_plus.rs:2",
             "crates/aterm-d/src/bin/result_stub.rs:2",
             "crates/aterm-d/src/bin/result_swap.rs:1",
             "crates/aterm-d/src/bin/typed.rs:2",
             "crates/aterm-d/src/bin/visible.rs:2",
+            "crates/aterm-d/src/bin/wrapped_first.rs:2",
             "crates/aterm-d/src/windowed.rs:1",
             "crates/aterm-d/tests/dirtest/main.rs:2",
             "crates/aterm-d/tests/live_bus.rs:3",
@@ -328,6 +349,7 @@ fn a_target_with_no_work_on_trusts_host_is_found() {
             "crates/aterm-h/Cargo.toml:0",
             "crates/aterm-i/src/main.rs:3",
             "crates/aterm-k/src/main.rs:2",
+            "crates/aterm-l/src/lib.rs:3",
         ]
     );
     let detail = |path: &str| {
@@ -351,6 +373,10 @@ fn a_target_with_no_work_on_trusts_host_is_found() {
         fallback("all(windows, not(test))")
     );
     assert_eq!(detail("result_swap.rs"), fallback("windows"));
+    assert_eq!(
+        detail("wrapped_first.rs"),
+        fallback("all(windows, debug_assertions)")
+    );
     assert_eq!(
         detail("aterm-d/tests/live_bus.rs"),
         format!(
@@ -406,6 +432,11 @@ fn an_item_ends_where_rust_ends_it() {
             "A if f::<u8, u8>() => work(),",
         ),
         ("lets_go! { a }\nnext();", "lets_go! { a }"),
+        (
+            "let x = match y { A => 1 } + f();\nnext();",
+            "let x = match y { A => 1 } + f();",
+        ),
+        ("match x { _ => a }?;\nnext();", "match x { _ => a }?;"),
     ] {
         assert_eq!(&code[..item_end(code, 0)], item, "{code}");
     }
@@ -456,6 +487,11 @@ fn a_call_is_work_unless_it_reports_constructs_converts_or_exits() {
             false,
         ),
         ("let b = a::<B> > (c);", None, false),
+        ("let g = serve::<u8>; if a < b || c > (d) {}", None, false),
+        ("let s = \"x\".to_owned();", None, false),
+        ("match (a, b) { _ => () }", None, false),
+        ("let (a, b) = (1, 2);", None, false),
+        ("let n = x as (u8);", None, false),
         ("serve()", None, true),
         ("check(a || b)", None, true),
         ("x.collect::<Vec<_>>()", None, true),
@@ -500,4 +536,356 @@ fn a_predicate_is_false_on_trusts_host_only_when_the_host_fixes_every_name_it_tu
     ] {
         assert_eq!(on_trust(pred), holds, "{pred}");
     }
+}
+
+#[test]
+fn a_channel_bound_as_a_default_is_found() {
+    let binding = "fn f() -> String {\n    let mut stock = \"stable\".to_string();\n    stock\n}\n";
+    let field = "fn f(args: &Args) -> Options {\n    Options {\n        out: args.out.clone(),\n        \
+                 stock: args.stock.clone().unwrap_or_else(|| \"stable\".into()),\n    }\n}\n";
+    let unwrapped = "fn f(env: &Env) -> &str {\n    \
+                     let toolchain = env.pin.as_deref().unwrap_or(\"nightly\");\n    toolchain\n}\n";
+    let typed =
+        "fn f() -> String {\n    let stock: String = String::from(\"beta\");\n    stock\n}\n";
+    let assigned =
+        "fn f(mut rustup_channel: String) {\n    rustup_channel = \"stable\".into();\n}\n";
+    let owned = "fn f() -> String {\n    let stock = \"stable\".to_owned();\n    stock\n}\n";
+    let literal = "fn f() -> Options {\n    Options { stock: \"stable\".into() }\n}\n";
+    let not_stock = "fn f(env: &Env, name: &str, a: u8) {\n    \
+                     let pin = env.wasm_pin.as_deref().unwrap_or(\"stable\");\n    \
+                     let toolchain_ok = name == \"stable\";\n    \
+                     let toolchain = \"stable\" == name;\n    \
+                     let stock = pick(a, \"stable\");\n    \
+                     let stock = pick(\"stable\");\n    \
+                     let stock = [\"stable\"];\n    \
+                     let label = \"stable\".to_string();\n    \
+                     let stock = \"stablex\".to_string();\n    \
+                     let row = Row { name: \"stable\".into() };\n    \
+                     stock += \"stable\";\n    \
+                     println!(\"{stock} {x}\", stock = \"stable\", x = 1);\n}\n\
+                     #[cfg(test)]\nmod tests {\n    \
+                     fn t() { let stock = \"stable\".to_string(); }\n}\n";
+    let found = run(
+        &STOCK_LABEL,
+        &[
+            ("crates/aterm-c/src/binding.rs", binding),
+            ("crates/aterm-c/src/field.rs", field),
+            ("crates/aterm-c/src/unwrapped.rs", unwrapped),
+            ("crates/aterm-c/src/typed.rs", typed),
+            ("crates/aterm-c/src/assigned.rs", assigned),
+            ("crates/aterm-c/src/owned.rs", owned),
+            ("crates/aterm-c/src/literal.rs", literal),
+            ("crates/aterm-c/src/not_stock.rs", not_stock),
+        ],
+    );
+    assert_eq!(
+        spots(&found),
+        [
+            "crates/aterm-c/src/assigned.rs:2",
+            "crates/aterm-c/src/binding.rs:2",
+            "crates/aterm-c/src/field.rs:4",
+            "crates/aterm-c/src/literal.rs:2",
+            "crates/aterm-c/src/owned.rs:2",
+            "crates/aterm-c/src/typed.rs:2",
+            "crates/aterm-c/src/unwrapped.rs:2",
+        ]
+    );
+    let details: Vec<&str> = found.iter().map(|f| f.detail.as_str()).collect();
+    assert_eq!(
+        details,
+        [
+            "rustup_channel = \"stable\"",
+            "stock = \"stable\"",
+            "stock: \"stable\"",
+            "stock: \"stable\"",
+            "stock = \"stable\"",
+            "stock = \"beta\"",
+            "toolchain = \"nightly\"",
+        ]
+        .map(|seen| format!("selects a stock toolchain: `{seen}`{NO_LABEL}"))
+    );
+}
+
+#[test]
+fn a_chained_or_joined_toolchain_argument_is_found() {
+    let chain = "fn f(c: &mut Cmd) {\n    c.arg(\"run\").arg(\"stable\");\n}\n";
+    let flag = "fn f(c: &mut Cmd) {\n    c.arg(\"--toolchain\").arg(\"nightly\");\n}\n";
+    let wrapped = "fn f() -> Cmd {\n    let mut c = Command::new(\"rustup\");\n    c.arg(\"run\")\n        \
+                   .arg(\"beta\")\n        .arg(\"cargo\");\n    c\n}\n";
+    let joined = "fn f(c: &mut Cmd) {\n    c.arg(\"--toolchain=stable\");\n}\n";
+    let env = "fn f(c: &mut Cmd) {\n    c.arg(\"RUSTUP_TOOLCHAIN=nightly-2026-01-01\");\n}\n";
+    let not_stock = "fn f(c: &mut Cmd, t: &str) {\n    c.arg(\"run\").arg(\"--release\");\n    \
+                     c.arg(\"--toolchain\").arg(t);\n    c.arg(\"--toolchain=trust\");\n    \
+                     c.arg(\"--toolchain=stablex\");\n    c.arg(\"run\");\n    c.arg(\"stable\");\n    \
+                     c.arg(\"RUSTUP_TOOLCHAIN=stable cargo\");\n    \
+                     c.args([\"run\"]).arg(\"stable\");\n    \
+                     c.arg(\"run\").env(\"X\", \"stable\");\n}\n";
+    let found = run(
+        &STOCK_LABEL,
+        &[
+            ("crates/aterm-c/src/chain.rs", chain),
+            ("crates/aterm-c/src/flag.rs", flag),
+            ("crates/aterm-c/src/wrapped.rs", wrapped),
+            ("crates/aterm-c/src/joined.rs", joined),
+            ("crates/aterm-c/src/env.rs", env),
+            ("crates/aterm-c/src/not_stock.rs", not_stock),
+        ],
+    );
+    assert_eq!(
+        spots(&found),
+        [
+            "crates/aterm-c/src/chain.rs:2",
+            "crates/aterm-c/src/env.rs:2",
+            "crates/aterm-c/src/flag.rs:2",
+            "crates/aterm-c/src/joined.rs:2",
+            "crates/aterm-c/src/wrapped.rs:3",
+        ]
+    );
+    let details: Vec<&str> = found.iter().map(|f| f.detail.as_str()).collect();
+    assert_eq!(
+        details,
+        [
+            ".arg(\"run\").arg(\"stable\")",
+            "\"RUSTUP_TOOLCHAIN=nightly-2026-01-01\"",
+            ".arg(\"--toolchain\").arg(\"nightly\")",
+            "\"--toolchain=stable\"",
+            ".arg(\"run\").arg(\"beta\")",
+        ]
+        .map(|seen| format!("selects a stock toolchain: `{seen}`{NO_LABEL}"))
+    );
+}
+
+#[test]
+fn a_call_path_word_that_names_rustup_or_a_toolchain_is_read() {
+    let prefixed = "fn f(c: &mut Cmd) {\n    rustup_run(c, \"stable\");\n}\n";
+    let inner = "fn f(c: &mut Cmd) {\n    my_rustup::run(c, \"beta\");\n}\n";
+    let capital = "fn f(r: &Path) -> Tc {\n    Toolchain::resolve(r, \"stable\")\n}\n";
+    let not_stock =
+        "fn f(c: &mut Cmd) {\n    run(c, \"stable\");\n    rusty_run(c, \"stable\");\n}\n";
+    let found = run(
+        &STOCK_LABEL,
+        &[
+            ("crates/aterm-c/src/prefixed.rs", prefixed),
+            ("crates/aterm-c/src/inner.rs", inner),
+            ("crates/aterm-c/src/capital.rs", capital),
+            ("crates/aterm-c/src/not_stock.rs", not_stock),
+        ],
+    );
+    assert_eq!(
+        spots(&found),
+        [
+            "crates/aterm-c/src/capital.rs:2",
+            "crates/aterm-c/src/inner.rs:2",
+            "crates/aterm-c/src/prefixed.rs:2",
+        ]
+    );
+}
+
+#[test]
+fn a_gate_on_the_env_abi_width_or_endian_is_read() {
+    for (pred, holds) in [
+        ("target_env = \"musl\"", Some(false)),
+        ("target_env = \"msvc\"", Some(false)),
+        ("target_env = \"\"", Some(true)),
+        ("target_abi = \"sim\"", Some(false)),
+        ("target_abi = \"\"", Some(true)),
+        ("target_pointer_width = \"32\"", Some(false)),
+        ("target_pointer_width = \"64\"", Some(true)),
+        ("target_endian = \"big\"", Some(false)),
+        ("target_endian = \"little\"", Some(true)),
+        ("all(unix, target_env = \"gnu\")", Some(false)),
+    ] {
+        assert_eq!(on_trust(pred), holds, "{pred}");
+    }
+    let gated = |pred: &str| format!("#![cfg({pred})]\n#[test]\nfn t() {{}}\n");
+    let (musl, msvc, w32, big, w64, little) = (
+        gated("target_env = \"musl\""),
+        gated("target_env = \"msvc\""),
+        gated("target_pointer_width = \"32\""),
+        gated("target_endian = \"big\""),
+        gated("target_pointer_width = \"64\""),
+        gated("target_endian = \"little\""),
+    );
+    let found = run(
+        &STOCK_LABEL,
+        &[
+            ("crates/aterm-p/Cargo.toml", PACKAGE_P),
+            ("crates/aterm-p/tests/musl.rs", musl.as_str()),
+            ("crates/aterm-p/tests/msvc.rs", msvc.as_str()),
+            ("crates/aterm-p/tests/w32.rs", w32.as_str()),
+            ("crates/aterm-p/tests/big.rs", big.as_str()),
+            ("crates/aterm-p/tests/w64.rs", w64.as_str()),
+            ("crates/aterm-p/tests/little.rs", little.as_str()),
+        ],
+    );
+    assert_eq!(
+        spots(&found),
+        [
+            "crates/aterm-p/tests/big.rs:1",
+            "crates/aterm-p/tests/msvc.rs:1",
+            "crates/aterm-p/tests/musl.rs:1",
+            "crates/aterm-p/tests/w32.rs:1",
+        ]
+    );
+}
+
+#[test]
+fn an_async_or_extern_main_is_read() {
+    let tokio = "#[tokio::main]\nasync fn main() {\n    #[cfg(windows)]\n    win::run().await;\n    \
+                 eprintln!(\"Windows only\");\n}\n";
+    let pub_async = "pub async fn main() {\n    #[cfg(windows)]\n    win::run().await;\n    \
+                     eprintln!(\"Windows only\");\n}\n";
+    let extern_c = "#![no_main]\n\n#[unsafe(no_mangle)]\n\
+                    pub extern \"C\" fn main(_: i32, _: *const *const u8) -> i32 {\n    \
+                    #[cfg(windows)]\n    win::run();\n    eprintln!(\"Windows only\");\n    2\n}\n";
+    let unsafe_extern = "#![no_main]\n\n#[unsafe(no_mangle)]\n\
+                         pub unsafe extern \"C\" fn main(_: i32, _: *const *const u8) -> i32 {\n    \
+                         #[cfg(windows)]\n    win::run();\n    eprintln!(\"Windows only\");\n    2\n}\n";
+    let async_works = "#[tokio::main]\nasync fn main() {\n    #[cfg(windows)]\n    win::init();\n    \
+                       serve().await;\n}\n";
+    let not_main = "async fn main_loop() {\n    #[cfg(windows)]\n    win::run();\n}\n\n\
+                    fn main() {\n    serve();\n}\n";
+    let nested = "mod lane {\n    async fn main() {\n        serve().await;\n    }\n}\n\n\
+                  fn main() {\n    #[cfg(windows)]\n    win::run();\n    eprintln!(\"Windows only\");\n}\n";
+    let found = run(
+        &STOCK_LABEL,
+        &[
+            ("crates/aterm-p/Cargo.toml", PACKAGE_P),
+            ("crates/aterm-p/src/bin/tokio.rs", tokio),
+            ("crates/aterm-p/src/bin/pub_async.rs", pub_async),
+            ("crates/aterm-p/src/bin/extern_c.rs", extern_c),
+            ("crates/aterm-p/src/bin/unsafe_extern.rs", unsafe_extern),
+            ("crates/aterm-p/src/bin/async_works.rs", async_works),
+            ("crates/aterm-p/src/bin/not_main.rs", not_main),
+            ("crates/aterm-p/src/bin/nested.rs", nested),
+        ],
+    );
+    assert_eq!(
+        spots(&found),
+        [
+            "crates/aterm-p/src/bin/extern_c.rs:5",
+            "crates/aterm-p/src/bin/nested.rs:8",
+            "crates/aterm-p/src/bin/pub_async.rs:2",
+            "crates/aterm-p/src/bin/tokio.rs:3",
+            "crates/aterm-p/src/bin/unsafe_extern.rs:5",
+        ]
+    );
+}
+
+#[test]
+fn a_macro_is_work_unless_it_reports_stops_or_builds_a_value() {
+    for (code, work) in [
+        ("aterm_p::serve_main!();", true),
+        ("serve_main! {}", true),
+        ("serve_main![]", true),
+        ("serve_main! (cfg)", true),
+        ("include!(\"serve.rs\");", true),
+        ("assert!(serve());", true),
+        ("eprintln!(\"no\");", false),
+        ("std::println!(\"no\")", false),
+        ("panic! { \"no\" }", false),
+        ("let s = format!(\"{}\", 1);", false),
+        ("let v = vec![1, 2];", false),
+        ("eprintln!(\"{}: Windows only\", module_path!());", false),
+        ("let at = (file!(), line!(), column!());", false),
+        ("dbg!(\"Windows only\");", false),
+        ("assert!(cfg!(windows), \"Windows only\");", false),
+        ("debug_assert_eq!(a, b);", false),
+        ("let help = include_str!(\"help.txt\");", false),
+        ("log::error!(\"Windows only\");", false),
+        ("tracing::warn!(\"Windows only\")", false),
+        ("if !(a) { return; }", false),
+        ("let b = a != (c);", false),
+        ("let a = [0][0];", false),
+        ("let x = v[0];", false),
+        ("if a { return; }", false),
+    ] {
+        assert_eq!(works(code, &[]), work, "{code}");
+    }
+    let served =
+        "fn main() {\n    #[cfg(windows)]\n    win::init();\n    aterm_p::serve_main!();\n}\n";
+    let braced =
+        "fn main() {\n    #[cfg(windows)]\n    win::init();\n    aterm_p::serve_main! {}\n}\n";
+    let dbg_stub =
+        "fn main() {\n    #[cfg(windows)]\n    win::run();\n    dbg!(\"Windows only\");\n}\n";
+    let assert_stub = "fn main() {\n    #[cfg(windows)]\n    win::run();\n    \
+                       assert!(cfg!(windows), \"Windows only\");\n}\n";
+    let found = run(
+        &STOCK_LABEL,
+        &[
+            ("crates/aterm-p/Cargo.toml", PACKAGE_P),
+            ("crates/aterm-p/src/bin/served.rs", served),
+            ("crates/aterm-p/src/bin/braced.rs", braced),
+            ("crates/aterm-p/src/bin/reported.rs", STUB),
+            ("crates/aterm-p/src/bin/dbg_stub.rs", dbg_stub),
+            ("crates/aterm-p/src/bin/assert_stub.rs", assert_stub),
+        ],
+    );
+    assert_eq!(
+        spots(&found),
+        [
+            "crates/aterm-p/src/bin/assert_stub.rs:2",
+            "crates/aterm-p/src/bin/dbg_stub.rs:2",
+            "crates/aterm-p/src/bin/reported.rs:2",
+        ]
+    );
+}
+
+#[test]
+fn a_call_through_a_tuple_field_is_work() {
+    for (code, work) in [
+        ("handlers.0()", true),
+        ("let code = run.1(args);", true),
+        ("Wrapper(0)", false),
+    ] {
+        assert_eq!(works(code, &[]), work, "{code}");
+    }
+}
+
+#[test]
+fn a_shipped_module_named_for_tests_is_read() {
+    let env = "fn f(cmd: &mut Cmd) {\n    cmd.env(\"RUSTUP_TOOLCHAIN\", \"stable\");\n}\n";
+    let lib = "pub mod run;\npub mod testrun;\npub mod test_binary;\n\
+               #[path = \"lane_tests.rs\"]\nmod lane;\n\
+               #[cfg(test)]\nmod rig;\n#[cfg(test)]\nmod test_util;\n#[cfg(test)]\nmod tests;\n";
+    let suite =
+        "mod common;\n#[path = \"../src/shared_tests.rs\"]\nmod shared;\n\n#[test]\nfn t() {}\n";
+    // aterm-q: what a shipped line loads from a `tests` directory (a `tests` module, a `#[path]`)
+    // is read, and a `tests.rs` nothing loads is not. aterm-c's `shared_tests.rs` is loaded only
+    // by a test target, which ships nothing.
+    let shipping_lib = "pub mod tests;\npub mod shim;\n";
+    let shim = "#[path = \"../tests/support.rs\"]\npub mod support;\n";
+    let found = run(
+        &STOCK_LABEL,
+        &[
+            ("crates/aterm-q/src/lib.rs", shipping_lib),
+            ("crates/aterm-q/src/shim.rs", shim),
+            ("crates/aterm-q/src/tests/mod.rs", env),
+            ("crates/aterm-q/tests/support.rs", env),
+            ("crates/aterm-q/src/old/tests.rs", env),
+            ("crates/aterm-c/src/shared_tests.rs", env),
+            ("crates/aterm-c/src/lib.rs", lib),
+            ("crates/aterm-c/src/run.rs", env),
+            ("crates/aterm-c/src/testrun.rs", env),
+            ("crates/aterm-c/src/test_binary.rs", env),
+            ("crates/aterm-c/src/lane_tests.rs", env),
+            ("crates/aterm-c/src/rig.rs", env),
+            ("crates/aterm-c/src/test_util.rs", env),
+            ("crates/aterm-c/src/tests.rs", env),
+            ("crates/aterm-c/src/loose_tests.rs", env),
+            ("crates/aterm-c/tests/suite.rs", suite),
+            ("crates/aterm-c/tests/common/mod.rs", env),
+        ],
+    );
+    assert_eq!(
+        spots(&found),
+        [
+            "crates/aterm-c/src/lane_tests.rs:2",
+            "crates/aterm-c/src/run.rs:2",
+            "crates/aterm-c/src/test_binary.rs:2",
+            "crates/aterm-c/src/testrun.rs:2",
+            "crates/aterm-q/src/tests/mod.rs:2",
+            "crates/aterm-q/tests/support.rs:2",
+        ]
+    );
 }

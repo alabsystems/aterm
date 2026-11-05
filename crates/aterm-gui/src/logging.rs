@@ -767,9 +767,12 @@ pub(crate) fn rotate_if_oversized(path: &Path, rotate_at: u64, ours: FileId) -> 
     };
     #[cfg(all(test, unix))]
     crate::parked_fork::fork_if_armed();
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
         return Rotation::Kept;
     };
+    if !meta.is_file() {
+        return Rotation::Kept;
+    }
     if ours.is_some() && file_id(&meta) != ours {
         return Rotation::Moved;
     }
@@ -797,7 +800,8 @@ pub(crate) struct RotatingFile {
 impl RotatingFile {
     /// Open `path` for appending, `0600`, rotating it first if it is already over the budget (an older copy is kept; nothing is truncated).
     pub(crate) fn open(path: PathBuf, budget: RotationBudget) -> std::io::Result<Self> {
-        let rotated = std::fs::metadata(&path).is_ok_and(|m| budget.oversized(m.len()))
+        let rotated = std::fs::symlink_metadata(&path)
+            .is_ok_and(|m| m.is_file() && budget.oversized(m.len()))
             && rotate_if_oversized(&path, budget.rotate_at, None) == Rotation::Rotated;
         let file = open_append_0600(&path)?;
         let id = file.metadata().ok().and_then(|m| file_id(&m));
@@ -836,7 +840,10 @@ impl RotatingFile {
     fn check(&mut self) {
         self.since_check = 0;
         self.last_check = Instant::now();
-        let on_disk = std::fs::metadata(&self.path).ok().and_then(|m| file_id(&m));
+        let on_disk = std::fs::symlink_metadata(&self.path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| file_id(&m));
         if on_disk.is_none() || on_disk != self.id {
             self.reopen();
         }
@@ -877,7 +884,7 @@ pub(crate) fn open_append_0600(path: &Path) -> std::io::Result<File> {
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
     if !f.metadata()?.is_file() {
         return Err(std::io::Error::new(
@@ -925,7 +932,7 @@ fn create_0600(path: &Path) -> std::io::Result<File> {
         .write(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
     if !f.metadata()?.is_file() {
         return Err(std::io::Error::new(

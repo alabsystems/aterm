@@ -22,11 +22,18 @@ pub struct EffectRequest {
 }
 
 impl EffectRequest {
+    /// Returns the payload digest stored in an [`EffectRecord`] for `payload`.
+    #[inline]
+    #[must_use]
+    pub fn digest_payload(payload: &[u8]) -> Digest {
+        Digest::of(EFFECT_PAYLOAD_DOMAIN, &[payload])
+    }
+
     /// Returns the payload digest stored in an [`EffectRecord`].
     #[inline]
     #[must_use]
     pub fn payload_digest(&self) -> Digest {
-        Digest::of(EFFECT_PAYLOAD_DOMAIN, &[&self.payload])
+        Self::digest_payload(&self.payload)
     }
 }
 

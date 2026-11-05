@@ -1725,19 +1725,59 @@ fn sparse_shared_preparation_passes_do_not_starve_later_candidates() {
         ])
     };
     let start = Instant::now();
-    for seconds in [0, 901, 1802, 2703] {
+    // Each pass a spacing apart on the wall clock, so only the cooldown's clock decides.
+    for (pass, seconds) in [0, 901, 1802, 2703].into_iter().enumerate() {
         bed.with_preparations(&discover, &inline, &guard, |fx| {
             assert!(shared_renewal::prepare_shared_with_clock(
                 &bed.home,
                 &bed.state,
                 &bed.roster,
-                NOW,
+                NOW + crate::harness::sign_in_ladder::SPACING_S * i64::try_from(pass).unwrap(),
                 fx,
                 || start + Duration::from_secs(seconds),
             ));
         });
     }
     assert_eq!(*calls.lock().unwrap(), [1, 2, 1, 2]);
+}
+
+/// Two accounts' adoptions on one Mac start at least ten minutes apart on the wall clock, whatever
+/// the cooldown's clock allows: the second waits, and starts once the spacing has passed.
+#[test]
+fn two_accounts_adoptions_start_ten_minutes_apart() {
+    let bed = Bed::with_custody(None, false);
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let offered = calls.clone();
+    let discover = move |_: &Path| {
+        Ok(vec![
+            unstarted_candidate(1, &offered),
+            unstarted_candidate(2, &offered),
+        ])
+    };
+    let start = Instant::now();
+    for (now, admitted) in [
+        (NOW, true),
+        (NOW + crate::harness::sign_in_ladder::SPACING_S - 1, false),
+        (NOW + crate::harness::sign_in_ladder::SPACING_S, true),
+    ] {
+        bed.with_preparations(&discover, &inline, &guard, |fx| {
+            assert_eq!(
+                shared_renewal::prepare_shared_with_clock(
+                    &bed.home,
+                    &bed.state,
+                    &bed.roster,
+                    now,
+                    fx,
+                    || start + Duration::from_secs(901),
+                ),
+                admitted,
+                "at {} s",
+                now - NOW
+            );
+        });
+    }
+    assert_eq!(*calls.lock().unwrap(), [1, 2]);
 }
 
 #[test]
@@ -1767,7 +1807,8 @@ fn shared_candidate_history_is_independent_across_networks() {
                         &bed.home,
                         &bed.state,
                         &bed.roster,
-                        NOW,
+                        NOW + crate::harness::sign_in_ladder::SPACING_S
+                            * i64::try_from(index).unwrap(),
                         fx,
                         || start + Duration::from_secs(seconds),
                     ),
@@ -1811,7 +1852,7 @@ fn reissued_shared_candidate_runs_without_resetting_its_peer_cooldown() {
                 &bed.home,
                 &bed.state,
                 &bed.roster,
-                NOW,
+                NOW + crate::harness::sign_in_ladder::SPACING_S * i64::try_from(seconds).unwrap(),
                 fx,
                 || start + Duration::from_secs(seconds),
             ));
@@ -1947,7 +1988,7 @@ fn shared_candidates_in_cooldown_do_not_block_an_unseen_candidate() {
                 &bed.home,
                 &bed.state,
                 &bed.roster,
-                NOW,
+                NOW + crate::harness::sign_in_ladder::SPACING_S * i64::try_from(seconds).unwrap(),
                 fx,
                 || start + Duration::from_secs(seconds),
             ));

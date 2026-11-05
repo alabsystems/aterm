@@ -1703,3 +1703,219 @@ fn the_verbs_exit_is_the_tables_and_under_the_control_the_control_rows() {
     );
     assert_eq!(verdict_code(true, &passing), 1, "no control row");
 }
+
+/// The local midnight lab `rp1103b`'s stub stamps count from: 2026-11-03 00:00 PST.
+const DAY6: i64 = 1_793_692_800_000;
+/// `rp1103b`'s tab (Claude Code 2.1.317, 2026-11-03).
+const SID6: &str = "s-2ace6a33337999bc00a0";
+/// `rp1103b`'s `lab-c` login, R6's walled row.
+const DIR_C_R6: &str = "/private/tmp/at.lab-501/rotation-s-d9bdc-58e7f358/runs/rp1103b/scratch/state/harness/claude-harness/accounts/logins/lab-c";
+
+/// `rp1103b`'s stub log at R6, cut as [`STUB_LOG`]: `lab-c`'s wall at P10, Claude Code's own turn
+/// for the job's end (its `<task-notification>`) at that wall again, and `lab-a`'s turn once the
+/// tab moved.
+const STUB_LOG_R6: &str = r#"15:18:59.241 POST /v1/messages -> 429 body=56112B mode=limit:five_hour:1793751538 kind=main model=claude-opus-5-5 stream=true max_tokens=128000 msgs=22 tools=13 sys=6217c last_user="Write one sentence about moorings, then stop.~" auth=oat:lab-c
+15:23:58.398 POST /v1/messages -> 429 body=57063B mode=limit:five_hour:1793751538 kind=main model=claude-opus-5-5 stream=true max_tokens=128000 msgs=22 tools=13 sys=6217c last_user="Write one sentence about moorings, then stop. <system-remind~" auth=oat:lab-c
+15:24:01.744 POST /v1/messages -> 200 body=58713B mode=ok kind=main model=claude-opus-5-5 stream=true max_tokens=128000 msgs=22 tools=13 sys=6217c last_user="Write one sentence about moorings, then stop. <system-remind~" auth=oat:lab-a
+"#;
+
+/// `rp1103b`'s journal at R6 (its records cut to `t`, `sid`, `kind`, `phase`, `seq` and `line`):
+/// three asks of the move the job held, each put off (`wait:changed`) on the back-off, and the
+/// move from the wall Claude Code's turn for the job's end met again.
+const JOURNAL_R6: &str = r#"{"t":1793747940091,"sid":"s-2ace6a33337999bc00a0","kind":"limited","phase":"-","seq":1622,"line":"LIMITED seq=1622 handled: ⚠ Usage limit reached · limit resets 4:18pm — Continuing automatically at 4:18pm · Esc to cancel"}
+{"t":1793747940254,"sid":"s-2ace6a33337999bc00a0","kind":"other","phase":"-","seq":null,"line":"HOST seq=1622 restart:account step=wait:changed"}
+{"t":1793747940255,"sid":"s-2ace6a33337999bc00a0","kind":"waiting","phase":"-","seq":1622,"line":"WAITING seq=1622 until=2026-11-03T23:19:10Z restart:account waits: wait:changed"}
+{"t":1793747950280,"sid":"s-2ace6a33337999bc00a0","kind":"other","phase":"-","seq":null,"line":"HOST seq=1624 restart:account step=wait:changed"}
+{"t":1793747950281,"sid":"s-2ace6a33337999bc00a0","kind":"waiting","phase":"-","seq":1624,"line":"WAITING seq=1624 until=2026-11-03T23:20:10Z restart:account waits: wait:changed"}
+{"t":1793747995812,"sid":"s-2ace6a33337999bc00a0","kind":"other","phase":"-","seq":null,"line":"HOST seq=1624 restart:account step=wait:changed"}
+{"t":1793747995813,"sid":"s-2ace6a33337999bc00a0","kind":"waiting","phase":"-","seq":1624,"line":"WAITING seq=1624 until=2026-11-03T23:24:56Z restart:account waits: wait:changed"}
+{"t":1793748238979,"sid":"s-2ace6a33337999bc00a0","kind":"event","phase":"limited","seq":1895,"line":"EVENT limited seq=1895 message=⚠ Usage limit reached · limit resets 4:18pm — Continuing automatically at 4:18pm · Esc to cancel reset=4:18pm"}
+{"t":1793748240624,"sid":"s-2ace6a33337999bc00a0","kind":"other","phase":"-","seq":null,"line":"HOST seq=1895 restart:account step=adopted"}
+{"t":1793748240628,"sid":"s-2ace6a33337999bc00a0","kind":"restarted","phase":"account-rotate@v1","seq":1895,"line":"RESTARTED seq=1895 rule=account-rotate@v1 relaunch under account lab-a (from the limit its turn ended on; the same conversation)"}
+{"t":1793748241703,"sid":"s-2ace6a33337999bc00a0","kind":"continued","phase":"usage-resume@v1","seq":460,"line":"CONTINUED seq=460 rule=usage-resume@v1 [aterm harness] The usage limit has cleared; continue where you stopped."}
+"#;
+
+/// `rp1103b`'s accounts' ledger at R6 (its `pk` cut): `lab-c`'s wall, and the one rotation onto
+/// `lab-a`, after the job.
+const LEDGER_R6: &str = r#"{"account":"lab-c","kind":"proven","sid":"s-2ace6a33337999bc00a0","t":1793747937,"to":null,"why":""}
+{"account":"lab-c","kind":"wall","sid":"s-2ace6a33337999bc00a0","t":1793747939,"to":null,"why":"five_hour until 1793751538"}
+{"account":"lab-c","kind":"rotate","sid":"s-2ace6a33337999bc00a0","t":1793748239,"to":"lab-a","why":""}
+{"account":"lab-c","kind":"move","sid":"s-2ace6a33337999bc00a0","t":1793748240,"to":"lab-a","why":""}
+{"account":"lab-a","kind":"proven","sid":"s-2ace6a33337999bc00a0","t":1793748242,"to":null,"why":""}
+"#;
+
+/// `rp1103a`'s rows of one ask of R6's move before the fix (its `pk` cut): the rotation the move
+/// took, and the strike of the relaunch the job refused. It booked 371 such pairs in 288 s.
+const TAKEN_R6: &str = r#"{"account":"lab-c","kind":"rotate","sid":"s-b378b1a4f4751c031d69","t":1793741592,"to":"lab-a","why":""}
+{"account":"lab-a","kind":"struck","sid":"s-b378b1a4f4751c031d69","t":1793741592,"to":"lab-c","why":"not moved: wait:changed"}
+"#;
+
+/// `rp1103b`'s aterm.log at R6, its harness lines.
+const ATERM_LOG_R6: &str = "\
+1793747940.087 21652 INFO aterm_gui::harness_host: harness @s-2ace6a33337999bc00a0: account advice: move to lab-a
+1793747940.169 21652 INFO aterm_gui::harness_host: harness @s-2ace6a33337999bc00a0: account wall wall lab-c
+1793747940.254 21652 INFO aterm_gui::harness_host: harness @s-2ace6a33337999bc00a0: account move to lab-a: wait:changed
+1793747950.280 21652 INFO aterm_gui::harness_host: harness @s-2ace6a33337999bc00a0: account move to lab-a: wait:changed
+1793747995.812 21652 INFO aterm_gui::harness_host: harness @s-2ace6a33337999bc00a0: account move to lab-a: wait:changed
+1793748238.975 21652 INFO aterm_gui::harness_host: harness @s-2ace6a33337999bc00a0: account advice: move to lab-a
+1793748240.578 21652 INFO aterm_gui::harness_host: harness @s-2ace6a33337999bc00a0: restart:account pid=72010 tab=s-2ace6a33337999bc00a0 session=25f12c2d-0380-41c4-a702-af650d776754 from=2.1.317 to=2.1.317(same) step=adopted
+1793748240.624 21652 INFO aterm_gui::harness_host: harness @s-2ace6a33337999bc00a0: account move to lab-a: adopted
+";
+
+/// `rp1103b`'s upgrade ledger at R6: the move's `restart:account` and the process it adopted.
+const DRIVE_LEDGER_R6: &str = r#"{"detail":"SIGTERM","from":"2.1.317","pid":63875,"session":"25f12c2d-0380-41c4-a702-af650d776754","step":"restart:account","t":1793748239,"tab":"s-2ace6a33337999bc00a0","to":"2.1.317(same)"}
+{"detail":"the relaunched agent holds the conversation; resumed while idle, nothing typed","from":"2.1.317","pid":72010,"session":"25f12c2d-0380-41c4-a702-af650d776754","step":"adopted","t":1793748240,"tab":"s-2ace6a33337999bc00a0","to":"2.1.317(same)"}
+"#;
+
+/// `rp1103b`'s listing when it first named the tab held (`Job::listing`), cut to each row's
+/// `label`, `active` and `sessions`.
+const LISTING_R6: &str = r#"{"accounts":[{"active":false,"label":"lab-a","sessions":[]},{"active":false,"label":"lab-b","sessions":[]},{"active":true,"label":"lab-c","sessions":[{"at":1793747940,"at_rfc3339":"2026-11-03T23:19:00Z","held":"jobs","sid":"s-2ace6a33337999bc00a0"}]}],"active":"lab-c","kind":"accounts","schema":1}"#;
+
+/// R6's evidence in `rp1103b`, the run that passed: the excerpts, the job as the lab saw it and
+/// the moved-to turn's history (its first and last user texts, cut to their prompts).
+fn r6() -> (Ev, Leg, Job) {
+    let ev = Ev {
+        journal: journal_of(JOURNAL_R6),
+        ledger: rows_of(LEDGER_R6),
+        aterm_log: ATERM_LOG_R6.into(),
+        served: served_of(STUB_LOG_R6, DAY6),
+        launches: launches_of(&format!(
+            "1793747935322 63875 {DIR_C_R6} resume\n1793748240169 72010 {DEFAULT_LOGIN} resume\n"
+        )),
+        drive_ledger: DRIVE_LEDGER_R6.into(),
+        dirs: vec![
+            (LABEL_A.into(), DEFAULT_LOGIN.into()),
+            (LABEL_C.into(), DIR_C_R6.into()),
+        ],
+        sid: SID6.into(),
+    };
+    let leg = Leg {
+        from: 1_793_747_937_910,
+        to: 1_793_748_242_770,
+        reset: 1_793_751_538,
+        history: vec![
+            format!("<system-reminder>\n…\n</system-reminder>\n\n{P1}"),
+            format!("{P10}\n\n<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n…"),
+        ],
+        ..Leg::default()
+    };
+    let job = Job {
+        pid: 63957,
+        seen: 1_793_747_938_847,
+        alive: 1_793_748_237_581,
+        gone: 1_793_748_238_598,
+        walled: 1_793_747_939_241,
+        held: 1_793_747_944_890,
+        listing: LISTING_R6.into(),
+    };
+    (ev, leg, job)
+}
+
+#[test]
+fn the_listing_names_the_tab_held_by_its_jobs_and_nothing_else_does() {
+    assert!(held_by_jobs(LISTING_R6, SID6));
+    assert!(
+        held_by_jobs(LISTING_R6, &format!("@{SID6}")),
+        "a sid as `ctl` names it"
+    );
+    for (why, listing, sid) in [
+        (
+            "held by nothing",
+            LISTING_R6.replace("\"held\":\"jobs\",", "\"held\":null,"),
+            SID6,
+        ),
+        (
+            "held by a person's hand",
+            LISTING_R6.replace("\"held\":\"jobs\"", "\"held\":\"line\""),
+            SID6,
+        ),
+        ("another tab", LISTING_R6.into(), "s-0000000000000000000a"),
+        ("no listing", "accounts: none".into(), SID6),
+    ] {
+        assert!(!held_by_jobs(&listing, sid), "{why}");
+    }
+}
+
+#[test]
+fn r6_holds_the_move_for_the_jobs_end_and_fails_on_a_move_or_a_row_taken_while_it_ran() {
+    let (ev, leg, job) = r6();
+    let held = judge_r6(&ev, &leg, &job);
+    assert_eq!(held.verdict, Verdict::Ok, "{}", held.evidence);
+    let fails = |ev: &Ev, job: &Job, says: &str| {
+        let j = judge_r6(ev, &leg, job);
+        assert_eq!(j.verdict, Verdict::Fail, "{says}: {}", j.evidence);
+        assert!(j.evidence.contains(says), "{says}: {}", j.evidence);
+    };
+    // The job as the lab saw it: never, not at the wall, never ended, or ended early, and the
+    // listing never naming the hold.
+    for (turned, says) in [
+        (
+            Job::default(),
+            "no background `sleep 300` of the tab was seen",
+        ),
+        (
+            Job {
+                walled: 0,
+                ..job.clone()
+            },
+            "oat:lab-c was not walled while the job ran",
+        ),
+        (
+            Job {
+                alive: job.walled - 1,
+                ..job.clone()
+            },
+            "the job was not running at the wall",
+        ),
+        (
+            Job {
+                gone: 0,
+                ..job.clone()
+            },
+            "the job was not seen to end",
+        ),
+        (
+            Job {
+                gone: job.seen + 100_000,
+                ..job.clone()
+            },
+            "short of its own 300 s",
+        ),
+        (
+            Job {
+                held: 0,
+                ..job.clone()
+            },
+            "never named the tab held by its jobs",
+        ),
+    ] {
+        fails(&ev, &turned, says);
+    }
+    // The move made while the job ran: its restart at the second ask.
+    let mut early = ev.clone();
+    for s in &mut early.journal {
+        if s.line.starts_with("RESTARTED ") {
+            s.t_ms = 1_793_747_950_281;
+        }
+    }
+    fails(&early, &job, "an account restart while the job ran");
+    // rp1103a's rotation and strike at each of rp1103b's three asks: rows taken while it ran.
+    let mut taken = ev.clone();
+    for at in [1_793_747_940, 1_793_747_950, 1_793_747_995] {
+        taken
+            .ledger
+            .extend(rows_of(TAKEN_R6).into_iter().map(|r| Row { t: at, ..r }));
+    }
+    fails(
+        &taken,
+        &job,
+        "3 rotation(s) lab-c → lab-a taken while the job ran",
+    );
+    // No move after it: the wall move's own judge names what is missing.
+    let mut stayed = ev.clone();
+    stayed.journal.retain(|s| !s.line.starts_with("RESTARTED "));
+    fails(&stayed, &job, "no RESTARTED account-rotate@v1 onto lab-a");
+    let mut unbooked = ev;
+    unbooked.ledger.retain(|r| r.kind != "rotate");
+    fails(&unbooked, &job, "no `rotate` row lab-c → lab-a");
+}

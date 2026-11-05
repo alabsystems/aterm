@@ -12,6 +12,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
+mod recovery;
+
 /// Where the tools install.
 pub const CLT_DIR: &str = "/Library/Developer/CommandLineTools";
 
@@ -81,6 +83,9 @@ pub struct Table {
     /// `true` turns developer mode on and adds the console account to `_developer`
     /// ([`crate::root_steps::DeveloperMode`]).
     pub debugger: Option<bool>,
+    /// Only the built-in, already authorized root batch retains install custody.
+    #[serde(skip)]
+    pub(crate) retained_root_run: bool,
 }
 
 /// The items `table` asks for: developer mode before the tools, as it takes a moment and their
@@ -98,6 +103,7 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
         items.push(Box::new(CommandLineTools {
             planned: Mutex::new(None),
             unfinished: Mutex::new(None),
+            retained_root_run: table.retained_root_run,
         }));
     }
     Ok(items)
@@ -185,6 +191,7 @@ struct CommandLineTools {
     planned: Mutex<Option<Planned>>,
     /// Why the last probe or apply left the tools uninstalled ([`Item::unfinished`]).
     unfinished: Mutex<Option<Unfinished>>,
+    retained_root_run: bool,
 }
 
 /// A failure of the install, in its words for a person's own terminal and its class for the
@@ -324,14 +331,17 @@ fn stamp(sys: &dyn System) -> Vec<u8> {
 /// without following a link or waiting on a pipe ([`System::read_owned_file`]); `None` for one
 /// Apple's or an older aterm's install left empty, or any other.
 fn stamped(sys: &dyn System) -> Option<Vec<u8>> {
+    read_stamp(sys).ok().filter(|bytes| !bytes.is_empty())
+}
+
+/// Read bounded, root-owned placeholder bytes without losing admission failures.
+fn read_stamp(sys: &dyn System) -> std::io::Result<Vec<u8>> {
     sys.read_owned_file(
         Path::new(PLACEHOLDER),
         0,
         aterm_types::macos_setup::PLACEHOLDER_STAMP_MAX,
         false,
     )
-    .ok()
-    .filter(|bytes| !bytes.is_empty())
 }
 
 /// Whether Apple's installer window is over with nothing else installing, by `listed` (what
@@ -384,8 +394,9 @@ fn placeholder_held_by_a_live_run(sys: &dyn System) -> bool {
 }
 
 /// The placeholder this run put in place, removed when the install ends, and only while it is
-/// still this run's (one a later run took over stays) and Apple's installer window is not
-/// listed ([`apple_window_listed`]). A window open then came up beside this run's placeholder
+/// still this run's (one a later run took over stays) and no Apple installer is listed
+/// ([`installers_listed`]). A command-line installer which starts during a network wait also
+/// keeps the placeholder it uses. A window open then came up beside this run's placeholder
 /// (`xcode-select --install`'s, or one a `git` or another stub raised meanwhile), so it made none
 /// of its own, and its install needs the file to find the tools in Apple's catalog: the
 /// placeholder stays for it, the window unlinks it when its request ends, and every reader holds
@@ -401,7 +412,7 @@ struct Placeholder<'a> {
 impl Drop for Placeholder<'_> {
     fn drop(&mut self) {
         if stamped(self.sys).as_deref() == Some(self.stamp.as_slice())
-            && !apple_window_listed(self.sys)
+            && !installers_listed(self.sys).is_some_and(|owners| !owners.is_empty())
         {
             let _ = self.sys.remove(Path::new(PLACEHOLDER));
         }
@@ -494,13 +505,19 @@ impl CommandLineTools {
         }
         match sys.create_new(placeholder, &stamp, 0o644) {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match holder(sys, true) {
-                Holder::Install | Holder::Unread => {
+                Holder::Install => {
                     return Err(Failure::new(
                         Unfinished::Busy,
                         format!(
                             "another install of the Command Line Tools is running ({PLACEHOLDER} \
                              is its)"
                         ),
+                    ));
+                }
+                Holder::Unread => {
+                    return Err(Failure::new(
+                        Unfinished::Unread,
+                        "the current installer owner could not be read".into(),
                     ));
                 }
                 Holder::AppleWindow => return Ok(None),
@@ -524,6 +541,16 @@ impl CommandLineTools {
             return Self::through_open_window(sys);
         };
         let _placeholder = Placeholder { sys, stamp };
+        Self::install_catalog(sys, None)
+    }
+
+    fn install_catalog(
+        sys: &dyn System,
+        custody: Option<&recovery::Custody<'_>>,
+    ) -> Result<(), Failure> {
+        if let Some(custody) = custody {
+            custody.ready()?;
+        }
         say("reading Apple's software catalog (minutes on a slow network)");
         let list = Cmd::new(SOFTWAREUPDATE).arg("-l").budget(LIST_BUDGET);
         let listed = run_ok(sys, &list).map_err(|why| Failure::new(Unfinished::Catalog, why))?;
@@ -546,6 +573,9 @@ impl CommandLineTools {
         // cannot be read at all hides it.
         if apple_window_listed(sys) {
             return Self::through_open_window(sys);
+        }
+        if let Some(custody) = custody {
+            custody.ready()?;
         }
         let labels = parse_labels(&listed);
         let Some(label) = pick(&labels) else {
@@ -695,7 +725,9 @@ impl CommandLineTools {
             }
             (true, None) => Planned::Select,
             (false, _) => {
-                if let Some(why) = low_data(sys) {
+                if !self.retained_root_run
+                    && let Some(why) = low_data(sys)
+                {
                     return Probe::Blocked { why: why.into() };
                 }
                 // softwareupdate owns catalog reachability and its recovery. A separate
@@ -782,7 +814,11 @@ impl Item for CommandLineTools {
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         let applied = (|| {
             if !installed(sys).map_err(|why| Failure::new(Unfinished::Other, why))? {
-                Self::install(sys)?;
+                if self.retained_root_run {
+                    recovery::install(sys)?;
+                } else {
+                    Self::install(sys)?;
+                }
             }
             if selected(sys)
                 .map_err(|why| Failure::new(Unfinished::Other, why))?
@@ -836,6 +872,368 @@ mod tests {
             cache_dir: "/c".into(),
             disrupt: true,
         }
+    }
+
+    fn retained_system() -> Fake {
+        let sys = Fake::root();
+        sys.born(std::process::id(), 123)
+            .running(&[])
+            .on("/usr/bin/xcode-select -p", none_selected())
+            .on("/usr/bin/xcode-select -p", none_selected())
+            .on("/usr/bin/xcode-select -p", Ran::ok(&format!("{CLT_DIR}\n")))
+            .on(RETAINED_INSTALL, installed_quietly())
+            .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
+            .on(PKGUTIL, Ran::ok(RECEIPT))
+            .on(
+                "/usr/bin/xcode-select --switch /Library/Developer/CommandLineTools",
+                Ran::ok(""),
+            );
+        sys
+    }
+
+    const RETAINED_INSTALL: &str =
+        "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'";
+
+    fn retained_items() -> Vec<Box<dyn Item>> {
+        expand(
+            &Table {
+                command_line_tools: Some(true),
+                retained_root_run: true,
+                ..Table::default()
+            },
+            &ctx(),
+        )
+        .unwrap()
+    }
+
+    fn slept_ms(sys: &Fake) -> u64 {
+        sys.calls()
+            .iter()
+            .filter_map(|call| {
+                call.strip_prefix("sleep ")?
+                    .strip_suffix("ms")?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn retained_install_recovers_after_a_prolonged_outage_in_one_custody() {
+        let sys = retained_system();
+        for _ in 0..7 {
+            sys.on(
+                SOFTWAREUPDATE_LIST,
+                Ran::exit(1, "catalog network unavailable"),
+            );
+        }
+        sys.on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST));
+        sys.on_sleep(|sys, _| {
+            assert_eq!(stamped(sys), Some(stamp(sys)));
+            assert_eq!(holder(sys, true), Holder::Install);
+        });
+        let items = retained_items();
+        let rows = engine::run(&items, Mode::Apply, &sys, &ctx(), &mut NoJournal);
+        assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+        assert!(slept_ms(&sys) > 10 * 60 * 1000);
+        let calls = sys.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == RETAINED_INSTALL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("create "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("remove "))
+                .count(),
+            1
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.contains("sudo") || call.contains("xcode-select --install"))
+        );
+        assert!(sys.written(PLACEHOLDER).is_none());
+        assert_eq!(items[0].unfinished(), None);
+    }
+
+    #[test]
+    fn a_network_transition_wakes_the_retained_retry_before_its_timer() {
+        let sys = retained_system();
+        sys.install_path(crate::port::InstallNetworkReading {
+            revision: 1,
+            available: false,
+            constrained: false,
+        });
+        sys.on(
+            SOFTWAREUPDATE_LIST,
+            Ran::exit(1, "catalog network unavailable"),
+        )
+        .on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST));
+        sys.on_sleep(|sys, _| {
+            sys.install_path(crate::port::InstallNetworkReading {
+                revision: 2,
+                available: true,
+                constrained: false,
+            });
+        });
+        recovery::install(&sys).unwrap();
+        assert_eq!(slept_ms(&sys), 2000);
+        assert!(installed(&sys).unwrap());
+    }
+
+    #[test]
+    fn low_data_mode_clears_in_the_same_authorized_run() {
+        let mut sys = retained_system();
+        sys.low_data = Some(true);
+        sys.install_path(crate::port::InstallNetworkReading {
+            revision: 1,
+            available: true,
+            constrained: true,
+        });
+        sys.on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST));
+        sys.on_sleep(|sys, _| {
+            assert!(
+                !sys.calls()
+                    .iter()
+                    .any(|call| call.starts_with(SOFTWAREUPDATE))
+            );
+            sys.install_path(crate::port::InstallNetworkReading {
+                revision: 2,
+                available: true,
+                constrained: false,
+            });
+        });
+        let items = retained_items();
+        let rows = engine::run(&items, Mode::Apply, &sys, &ctx(), &mut NoJournal);
+        assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+        assert_eq!(slept_ms(&sys), 2000);
+    }
+
+    #[test]
+    fn stop_during_network_wait_releases_only_the_original_custody() {
+        let sys = retained_system();
+        sys.on(
+            SOFTWAREUPDATE_LIST,
+            Ran::exit(1, "catalog network unavailable"),
+        );
+        sys.on_sleep(|sys, _| {
+            sys.stop_now();
+        });
+        assert_eq!(
+            recovery::install(&sys).unwrap_err().class,
+            Unfinished::Stopped
+        );
+        assert_eq!(slept_ms(&sys), 2000);
+        assert!(sys.written(PLACEHOLDER).is_none());
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|call| call.as_str() == RETAINED_INSTALL)
+        );
+    }
+
+    #[test]
+    fn another_generation_keeps_its_placeholder_and_is_not_retried() {
+        let sys = retained_system();
+        sys.on(
+            SOFTWAREUPDATE_LIST,
+            Ran::exit(1, "catalog network unavailable"),
+        );
+        let other_pid = std::process::id().saturating_add(1);
+        sys.on_sleep(move |sys, _| {
+            sys.born(other_pid, 456).file(
+                PLACEHOLDER,
+                aterm_types::macos_setup::placeholder_stamp(other_pid, 456).as_bytes(),
+            );
+        });
+        assert_eq!(recovery::install(&sys).unwrap_err().class, Unfinished::Busy);
+        assert_eq!(slept_ms(&sys), 2000);
+        assert_eq!(
+            sys.written(PLACEHOLDER).unwrap(),
+            aterm_types::macos_setup::placeholder_stamp(other_pid, 456).into_bytes()
+        );
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|call| call.as_str() == RETAINED_INSTALL)
+        );
+    }
+
+    #[test]
+    fn unread_process_custody_is_not_treated_as_a_network_outage() {
+        let sys = Fake::root();
+        assert_eq!(
+            recovery::install(&sys).unwrap_err().class,
+            Unfinished::Unread
+        );
+        assert_eq!(slept_ms(&sys), 0);
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|call| call.starts_with(SOFTWAREUPDATE))
+        );
+    }
+
+    #[test]
+    fn a_baseline_file_cannot_claim_the_retained_root_context() {
+        assert!(
+            crate::baseline::parse(
+                "schema = 1\n[developer]\ncommand_line_tools = true\nretained_root_run = true\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn retained_recovery_waits_for_an_external_window_and_respects_its_cancellation() {
+        let sys = retained_system();
+        sys.on(
+            SOFTWAREUPDATE_LIST,
+            Ran::exit(1, "catalog network unavailable"),
+        );
+        let sleeps = std::sync::atomic::AtomicUsize::new(0);
+        sys.on_sleep(move |sys, _| {
+            if sleeps.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                installers(sys, Some("apple"));
+            } else {
+                sys.remove(Path::new(PLACEHOLDER)).unwrap();
+                installers(sys, None);
+            }
+        });
+        assert_eq!(
+            recovery::install(&sys).unwrap_err().class,
+            Unfinished::WindowClosed
+        );
+        assert!(!sys.calls().iter().any(
+            |call| call.as_str() == RETAINED_INSTALL || call.contains("xcode-select --install")
+        ));
+    }
+
+    #[test]
+    fn an_installer_refusal_is_not_retried_as_a_network_outage() {
+        let sys = Fake::root();
+        sys.born(std::process::id(), 123)
+            .running(&[])
+            .on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST))
+            .on(RETAINED_INSTALL, Ran::exit(1, "Downloaded Command Line Tools\nInstalling Command Line Tools\nInstaller refused"));
+        assert_eq!(
+            recovery::install(&sys).unwrap_err().class,
+            Unfinished::Installer
+        );
+        assert_eq!(slept_ms(&sys), 0);
+        assert_eq!(
+            sys.calls()
+                .iter()
+                .filter(|call| call.as_str() == RETAINED_INSTALL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn retained_recovery_cannot_authorize_a_nonroot_process() {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        assert_eq!(
+            recovery::install(&sys).unwrap_err().class,
+            Unfinished::Other
+        );
+        assert!(sys.calls().is_empty());
+    }
+
+    #[test]
+    fn an_existing_installer_finishes_before_the_authorized_run_claims_the_tools() {
+        let sys = retained_system();
+        sys.file(PLACEHOLDER, b"").running(&[SOFTWAREUPDATE]);
+        sys.on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST));
+        sys.on_sleep(|sys, _| {
+            assert_eq!(sys.written(PLACEHOLDER), Some(Vec::new()));
+            assert!(
+                !sys.calls()
+                    .iter()
+                    .any(|call| call.starts_with(SOFTWAREUPDATE))
+            );
+            sys.running(&[]);
+        });
+        recovery::install(&sys).unwrap();
+        assert!(installed(&sys).unwrap());
+        assert_eq!(slept_ms(&sys), 2000);
+        assert_eq!(
+            sys.calls()
+                .iter()
+                .filter(|call| call.as_str() == RETAINED_INSTALL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn another_command_line_installer_holds_the_same_authorized_run() {
+        let sys = retained_system();
+        sys.on(
+            SOFTWAREUPDATE_LIST,
+            Ran::exit(1, "catalog network unavailable"),
+        )
+        .on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST));
+        let ticks = std::sync::atomic::AtomicUsize::new(0);
+        sys.on_sleep(move |sys, _| {
+            let tick = ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(stamped(sys), Some(stamp(sys)));
+            assert!(
+                !sys.calls()
+                    .iter()
+                    .any(|call| call.as_str() == RETAINED_INSTALL)
+            );
+            if tick == 0 {
+                sys.running(&[SOFTWAREUPDATE]);
+            }
+            if tick == 3 {
+                sys.running(&[]);
+            }
+        });
+        recovery::install(&sys).unwrap();
+        assert_eq!(slept_ms(&sys), 7000);
+        assert!(installed(&sys).unwrap());
+        assert_eq!(
+            sys.calls()
+                .iter()
+                .filter(|call| call.as_str() == RETAINED_INSTALL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn stop_leaves_the_placeholder_needed_by_an_external_installer() {
+        let sys = retained_system();
+        sys.on(
+            SOFTWAREUPDATE_LIST,
+            Ran::exit(1, "catalog network unavailable"),
+        );
+        sys.on_sleep(|sys, _| {
+            sys.running(&[SOFTWAREUPDATE]).stop_now();
+        });
+        assert_eq!(
+            recovery::install(&sys).unwrap_err().class,
+            Unfinished::Stopped
+        );
+        assert_eq!(sys.written(PLACEHOLDER), Some(stamp(&sys)));
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|call| call.as_str() == RETAINED_INSTALL)
+        );
     }
 
     const VM_LIST: &str = "Software Update Tool\n\
@@ -1094,6 +1492,7 @@ Software Update found the following new or updated software:\n\
             &Table {
                 command_line_tools: Some(true),
                 debugger: Some(true),
+                ..Table::default()
             },
             &ctx(),
         )
@@ -1115,6 +1514,7 @@ Software Update found the following new or updated software:\n\
             &Table {
                 command_line_tools: Some(true),
                 debugger: None,
+                ..Table::default()
             },
             &ctx(),
         )
@@ -1152,6 +1552,7 @@ Software Update found the following new or updated software:\n\
             &Table {
                 command_line_tools: Some(true),
                 debugger: None,
+                ..Table::default()
             },
             &ctx(),
         )
@@ -1246,6 +1647,7 @@ Software Update found the following new or updated software:\n\
             &Table {
                 command_line_tools: Some(true),
                 debugger: None,
+                ..Table::default()
             },
             &ctx(),
         )
@@ -1592,6 +1994,7 @@ Software Update found the following new or updated software:\n\
             &Table {
                 command_line_tools: Some(true),
                 debugger: None,
+                ..Table::default()
             },
             &ctx(),
         )
@@ -1627,6 +2030,7 @@ Software Update found the following new or updated software:\n\
             &Table {
                 command_line_tools: Some(true),
                 debugger: None,
+                ..Table::default()
             },
             &ctx(),
         )
@@ -1671,6 +2075,7 @@ Software Update found the following new or updated software:\n\
             &Table {
                 command_line_tools: Some(true),
                 debugger: None,
+                ..Table::default()
             },
             &ctx(),
         )
@@ -1713,6 +2118,7 @@ Software Update found the following new or updated software:\n\
             &Table {
                 command_line_tools: Some(true),
                 debugger: None,
+                ..Table::default()
             },
             &ctx(),
         )
@@ -1743,6 +2149,7 @@ Software Update found the following new or updated software:\n\
             &Table {
                 command_line_tools: Some(true),
                 debugger: None,
+                ..Table::default()
             },
             &ctx(),
         )
@@ -1758,6 +2165,7 @@ Software Update found the following new or updated software:\n\
                 &Table {
                     command_line_tools: Some(false),
                     debugger: None,
+                    ..Table::default()
                 },
                 &ctx()
             )
@@ -2018,7 +2426,7 @@ Software Update found the following new or updated software:\n\
         let unread = stale_marker();
         assert_eq!(
             CommandLineTools::install(&unread).unwrap_err().class,
-            Unfinished::Busy
+            Unfinished::Unread
         );
         assert!(unread.written(PLACEHOLDER).is_some());
     }
@@ -2376,6 +2784,7 @@ Software Update found the following new or updated software:\n\
                 &Table {
                     command_line_tools: Some(true),
                     debugger: None,
+                    ..Table::default()
                 },
                 &ctx(),
             )

@@ -163,7 +163,7 @@ fn read_bytes_slurps_main_and_wal_in_memory_without_links_or_copies() {
         // SAFETY: `fifo_c` is a valid NUL-terminated path in the test's private tempdir.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         assert_eq!(
-            open_no_link(&wal).unwrap_err().kind(),
+            crate::regular_file::open(&wal).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData,
             "the shared regular-file opener refuses the FIFO without blocking"
         );

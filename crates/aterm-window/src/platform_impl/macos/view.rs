@@ -576,6 +576,7 @@ aterm_objc::declare_class! {
         @sel(mouseDown:)
         fn mouse_down(&self, event: Id) {
             trace_scope!("mouseDown:");
+            let _source = mouse_source(event);
             self.mouse_motion(event);
             self.mouse_click(event, ElementState::Pressed);
         }
@@ -583,6 +584,7 @@ aterm_objc::declare_class! {
         @sel(mouseUp:)
         fn mouse_up(&self, event: Id) {
             trace_scope!("mouseUp:");
+            let _source = mouse_source(event);
             self.mouse_motion(event);
             self.mouse_click(event, ElementState::Released);
         }
@@ -590,6 +592,7 @@ aterm_objc::declare_class! {
         @sel(rightMouseDown:)
         fn right_mouse_down(&self, event: Id) {
             trace_scope!("rightMouseDown:");
+            let _source = mouse_source(event);
             self.mouse_motion(event);
             self.mouse_click(event, ElementState::Pressed);
         }
@@ -597,6 +600,7 @@ aterm_objc::declare_class! {
         @sel(rightMouseUp:)
         fn right_mouse_up(&self, event: Id) {
             trace_scope!("rightMouseUp:");
+            let _source = mouse_source(event);
             self.mouse_motion(event);
             self.mouse_click(event, ElementState::Released);
         }
@@ -604,6 +608,7 @@ aterm_objc::declare_class! {
         @sel(otherMouseDown:)
         fn other_mouse_down(&self, event: Id) {
             trace_scope!("otherMouseDown:");
+            let _source = mouse_source(event);
             self.mouse_motion(event);
             self.mouse_click(event, ElementState::Pressed);
         }
@@ -611,6 +616,7 @@ aterm_objc::declare_class! {
         @sel(otherMouseUp:)
         fn other_mouse_up(&self, event: Id) {
             trace_scope!("otherMouseUp:");
+            let _source = mouse_source(event);
             self.mouse_motion(event);
             self.mouse_click(event, ElementState::Released);
         }
@@ -655,6 +661,7 @@ aterm_objc::declare_class! {
         @sel(scrollWheel:)
         fn scroll_wheel(&self, event: Id) {
             trace_scope!("scrollWheel:");
+            let _source = mouse_source(event);
             self.mouse_motion(event);
 
             // SAFETY: `-scrollingDeltaX`/`-scrollingDeltaY` are `d16@0:8` and
@@ -1175,16 +1182,31 @@ fn mouse_button(event: Id) -> MouseButton {
 /// Classify the original key before replacement, interpretation or a deferred callback.
 fn key_source(event: Id) -> super::key_origin::Scope {
     // SAFETY: keyDown:/keyUp: receive a live NSEvent key, and cancelOperation: checks its
-    // current event is non-nil and key-down/up first. `-type` is Q16@0:8, `-keyCode` S16@0:8,
-    // and `-timestamp` d16@0:8; each getter is defined for these key events.
-    let key = unsafe {
-        crate::platform::macos::NativeKeyEvent {
+    // current event is non-nil and key-down/up first. `-keyCode` is S16@0:8, defined for these
+    // key events.
+    let keycode = unsafe { send_u16(event, sel!(keyCode)) };
+    input_source(event, keycode)
+}
+
+/// Classify a mouse button's down or up, or a scroll, before any callback it generates: a click
+/// another process posted is told apart from the person's as a key is.
+fn mouse_source(event: Id) -> super::key_origin::Scope {
+    input_source(event, 0)
+}
+
+/// Classify the live NSEvent `event` (its `keycode` read by the caller, 0 for a mouse event).
+fn input_source(event: Id, keycode: u16) -> super::key_origin::Scope {
+    // SAFETY: the callers' live NSEvent. `-type` is Q16@0:8 and `-timestamp` d16@0:8, defined
+    // on every event, and `event_source_pid` reads any live NSEvent.
+    let native = unsafe {
+        crate::platform::macos::NativeInputEvent {
             kind: send_usize(event, sel!(type)),
-            keycode: send_u16(event, sel!(keyCode)),
+            keycode,
             timestamp: send_f64(event, sel!(timestamp)),
+            source_pid: aterm_cg::event_source_pid(event),
         }
     };
-    super::key_origin::source(key)
+    super::key_origin::source(native)
 }
 
 /// Returns a `+1` key event, stripping Option characters when [`option_is_alt`] holds.

@@ -470,10 +470,24 @@ pub fn ask_allowed(paths: &Paths) -> crate::Result<String> {
 ///
 /// # Errors
 /// This Mac is already in a vault, its key is not the one the bundle allows, the bundle's files
-/// are not one `[everyone]` locker, or a write failed.
+/// are not one `[everyone]` locker, the history this Mac acknowledged refuses the records it holds
+/// under the bundle's configuration (`checked_files_bundle`), or a write failed. Each of these
+/// but the last refuses before anything is written.
 pub fn write_from_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report> {
     let _lock = StateLock::take(paths)?;
-    let (config, mut state, entries) = checked_files_bundle(paths, bundle)?;
+    let CheckedFiles {
+        config,
+        mut state,
+        entries,
+        afresh,
+    } = checked_files_bundle(paths, bundle)?;
+    // A bundle of another vault than the one this Mac's state holds (one that let it go) starts
+    // that vault afresh, as a log bundle's write does, so its first version is no rollback.
+    if afresh {
+        super::forget_vault_left(&mut state);
+        super::prepare_materialization(paths, &mut state)?;
+        crate::fsx::wipe_and_remove(&paths.cache_file())?;
+    }
     save_config(paths, &config)?;
     let report = apply_entries(paths, &mut state, &entries)?;
     state.membership = Stored::Pending;
@@ -486,12 +500,24 @@ pub fn write_from_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report
     Ok(report)
 }
 
-/// [`write_from_bundle`]'s checks, writing nothing: the configuration it would save, this Mac's
-/// state and the bundle's files (`client::accepts_bundle`).
-pub(super) fn checked_files_bundle(
-    paths: &Paths,
-    bundle: &Bundle,
-) -> crate::Result<(Config, State, Vec<Entry>)> {
+/// What a files bundle this Mac takes writes ([`checked_files_bundle`]).
+pub(super) struct CheckedFiles {
+    config: Config,
+    state: State,
+    entries: Vec<Entry>,
+    /// The bundle configures another vault than the one this Mac's state holds
+    /// (`client::moves_vault`), and its write starts that vault afresh.
+    afresh: bool,
+}
+
+/// [`write_from_bundle`]'s checks, writing nothing (`client::accepts_bundle`): the configuration
+/// it would save, this Mac's state, the bundle's files and whether it moves this Mac to another
+/// vault. The history this Mac acknowledged judges the records this Mac holds under the bundle's
+/// configuration, as the next acknowledgement under it will
+/// (`retained_history::validate_configured`), so a configuration under which that history refuses
+/// them (this Mac's own vault's log under another vault name) is refused before anything is
+/// written, rather than leaving every later take of the state refused.
+pub(super) fn checked_files_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedFiles> {
     let Handed::Files(files) = &bundle.handed else {
         return Err(Error::new(
             "the member's bundle carries no [everyone] files",
@@ -535,6 +561,7 @@ pub(super) fn checked_files_bundle(
         .ok_or_else(|| Error::new("the member's bundle names no vault server"))?;
     let config = Config {
         source: Source::Url(server),
+        mirrors: Vec::new(),
         name: bundle.vault.clone(),
         signer: Some(bundle.signer),
         followed: bundle.followed.clone(),
@@ -545,7 +572,19 @@ pub(super) fn checked_files_bundle(
             "the member's bundle pins a retired vault signer",
         ));
     }
-    Ok((config, state, entries))
+    let afresh = super::moves_vault(current.as_ref(), &config);
+    super::retained_history::validate_configured(
+        paths,
+        &config,
+        &super::load_records_for(paths, &config)?,
+        afresh,
+    )?;
+    Ok(CheckedFiles {
+        config,
+        state,
+        entries,
+        afresh,
+    })
 }
 
 /// Hand the Mac at `joiner` the Allow `member` signs for it under `host`, as a run does, so its

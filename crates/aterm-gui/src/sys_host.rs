@@ -115,6 +115,9 @@ struct State {
     /// The last pull a `sys jobs` sent, the engine armed: another view's pull keeps the
     /// engine's cadence, so a `sys jobs` keeps its own gap too.
     last_jobs_pull: Option<Instant>,
+    /// The last pull a `sys cores`, `sys report` or forced `sys why` sent, CPU Stats armed:
+    /// another view's pull takes no CPU Stats sample, so these keep their own gap too.
+    last_hardware_pull: Option<Instant>,
     /// The explicit naming operation spanning capture, sampling and fresh publication.
     naming: Option<crate::sys_naming::Live>,
     pacing: Pacing,
@@ -307,47 +310,70 @@ impl Shared {
 
     /// A whole snapshot at most `fresh` old, pulling one when needed.
     pub(crate) fn fresh(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
-        self.fresh_by(fresh, force, Part::Whole)
+        self.fresh_by(fresh, force, Part::Whole, false)
     }
 
-    /// [`Self::fresh`] for a `sys why`, judged by its split set's age while the coalition lane reads.
+    /// [`Self::fresh`] for a `sys why`, judged by its split set's age while the coalition lane
+    /// reads, and when forced by its CPU Stats sample too, which a forced `sys why` prints.
     pub(crate) fn fresh_why(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
-        self.fresh_by(fresh, force, Part::Split)
+        self.fresh_by(fresh, force, Part::Split, force)
     }
 
     /// The snapshot `q` reads, as fresh as it asks: a `sys why` by its split set, arming `split`
-    /// while it waits, and a `sys jobs` by its jobs view, arming `jobs` (the stuck engine) while
-    /// it waits.
+    /// while it waits, a `sys jobs` by its jobs view, arming `jobs` (the stuck engine) while it
+    /// waits, and a `sys cores`, `sys report` or forced `sys why` by its CPU Stats sample too,
+    /// arming `hardware` while it waits ([`Self::fresh_by`]'s `hardware`).
     pub(crate) fn fresh_for(
         &self,
         q: &SysQuery,
         split: &Arming,
         jobs: &Arming,
+        hardware: &Arming,
     ) -> (Option<Held>, Freshness) {
         let fresh_ms = q.fresh_ms.unwrap_or_else(|| q.freshness_default_ms());
         let fresh = Duration::from_millis(fresh_ms);
         match q.view {
             View::Why => {
+                let force = fresh_ms == 0;
                 let _armed = split.arm();
-                self.fresh_why(fresh, fresh_ms == 0)
+                let _hardware = force.then(|| hardware.arm());
+                self.fresh_why(fresh, force)
             }
             View::Jobs => {
                 let _armed = jobs.arm();
-                self.fresh_by(fresh, fresh_ms == 0, Part::Jobs)
+                self.fresh_by(fresh, fresh_ms == 0, Part::Jobs, false)
+            }
+            View::Cores | View::Report => {
+                let _armed = hardware.arm();
+                self.fresh_by(fresh, fresh_ms == 0, Part::Whole, true)
             }
             _ => self.fresh(fresh, fresh_ms == 0),
         }
     }
 
-    fn fresh_by(&self, fresh: Duration, force: bool, part: Part) -> (Option<Held>, Freshness) {
+    /// The snapshot judged by `part`, at most `fresh` old unless `force`d. With `hardware`, it
+    /// also needs a CPU Stats sample, which only a lens, the recorder or a pull that prints it
+    /// takes (A2 §6.4): a snapshot without one is never fresh, and a pull for one waits as a cold
+    /// pull does, since its pull reads a pair where no sample is warm.
+    fn fresh_by(
+        &self,
+        fresh: Duration,
+        force: bool,
+        part: Part,
+        hardware: bool,
+    ) -> (Option<Held>, Freshness) {
         let split = part == Part::Split;
         let now = Instant::now();
         let mut g = self.lock();
         let have = g.held.clone();
-        let landed = |h: &Held| match part {
-            Part::Whole => Some(h.at),
-            Part::Split => split_landed(h),
-            Part::Jobs => Some(jobs_landed(h)),
+        let sampled = |h: &Held| !hardware || h.snap.hardware.is_some();
+        let landed = |h: &Held| {
+            match part {
+                Part::Whole => Some(h.at),
+                Part::Split => split_landed(h),
+                Part::Jobs => Some(jobs_landed(h)),
+            }
+            .filter(|_| sampled(h))
         };
         if let Some(h) = have.as_ref()
             && !force
@@ -362,13 +388,24 @@ impl Shared {
             !whole(&h.snap)
                 || h.at.elapsed() > crate::vitals_host::COLD_AFTER
                 || (split && split_cold(h))
+                || !sampled(h)
         });
         let pacing = g.pacing;
         let armed = split && have.as_ref().is_none_or(|h| h.snap.coal_lane.on());
-        let last_pull = if armed {
-            g.last_split_pull
-        } else if part == Part::Jobs {
-            g.last_jobs_pull
+        // Each armed need keeps its own gap: the pull that answers must have been sent for every
+        // one, so the gap runs from the oldest of their last pulls (none when one never pulled).
+        let needs = [
+            (armed, g.last_split_pull),
+            (part == Part::Jobs, g.last_jobs_pull),
+            (hardware, g.last_hardware_pull),
+        ];
+        let last_pull = if needs.iter().any(|(need, _)| *need) {
+            needs
+                .iter()
+                .filter(|(need, _)| *need)
+                .map(|(_, at)| *at)
+                .min()
+                .flatten()
         } else {
             g.last_pull
         };
@@ -399,6 +436,9 @@ impl Shared {
                     if part == Part::Jobs {
                         g.last_jobs_pull = Some(now);
                     }
+                    if hardware {
+                        g.last_hardware_pull = Some(now);
+                    }
                 }
             }
         }
@@ -414,6 +454,7 @@ impl Shared {
                     || !h.snap.coal_lane.on()
                     || split_ns(&h.snap).is_some_and(|ns| Some(ns) != old_split))
                 && (part != Part::Jobs || h.snap.jobs_age_ms == 0)
+                && sampled(h)
             {
                 return (Some(h.clone()), Freshness::Fresh);
             }
@@ -1150,6 +1191,7 @@ pub(crate) fn cmd_sys(
         &q,
         &crate::vitals_host::SPLIT_ARMED,
         &crate::vitals_host::JOBS_ARMED,
+        &crate::vitals_host::HARDWARE_ARMED,
     );
     let held = with_services(
         &q,
@@ -1576,6 +1618,48 @@ impl crate::App {
             aterm_vitals::sys::jobs_view::program_check_field(held, &[session], age_ms)
         )
     }
+
+    /// `status`'s `left=` field for the session whose id is `sid`: its agent's left rows in the
+    /// adopted snapshot's leftover view, the oldest's age told on to now by that view's own reading
+    /// time ([`aterm_vitals::sys::left::status_field`]), while that view speaks for now by its own
+    /// age ([`status_left`]). No read of its own: `left=-` until a reading has judged one.
+    pub(crate) fn status_left_field(&self, sid: Option<&str>) -> String {
+        let snap = self.vitals.snapshot.as_ref();
+        status_left(
+            snap.and_then(|s| s.left.as_deref()),
+            snap.and_then(|s| s.jobs.as_deref()),
+            self.vitals.reader_runs(),
+            sid,
+            aterm_time::unix_millis().unwrap_or(0),
+        )
+    }
+}
+
+/// [`crate::App::status_left_field`] over the leftover view `view` and the jobs view `jobs` of one
+/// snapshot at `now_ms` (unix ms), `reader` saying whether their reader runs. The view speaks for
+/// now while it is at most [`crate::vitals_jobs::JOBS_FRESH`] old by its own reading time (a
+/// reading that reads no process table carries the last one with its time), or of any age while
+/// its reader runs and no timer reads it again ([`crate::vitals_jobs::read_on_a_timer`]): a view
+/// that names an agent's left row is read again within 30 s, so past the minute its reader has
+/// stopped delivering and the count it gave may name a process that ended since; else `left=-`.
+pub(crate) fn status_left(
+    view: Option<&aterm_vitals::left::LeftView>,
+    jobs: Option<&aterm_vitals::jobs::JobsView>,
+    reader: bool,
+    sid: Option<&str>,
+    now_ms: u64,
+) -> String {
+    let age = |v: &aterm_vitals::left::LeftView| now_ms.saturating_sub(v.as_of_ms);
+    let timer = |v: &aterm_vitals::left::LeftView| {
+        jobs.map_or_else(
+            || aterm_vitals::left::holds_an_offer(v),
+            |j| crate::vitals_jobs::read_on_a_timer(j, Some(v)),
+        )
+    };
+    let view = view.filter(|v| {
+        Duration::from_millis(age(v)) <= crate::vitals_jobs::JOBS_FRESH || (reader && !timer(v))
+    });
+    aterm_vitals::sys::left::status_field(view, sid, view.map_or(0, age))
 }
 
 #[cfg(test)]

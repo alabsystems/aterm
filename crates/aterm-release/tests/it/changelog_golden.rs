@@ -156,6 +156,30 @@ fn the_generated_harness_line_alone_is_no_release_notes() {
     assert_eq!(changelog::gate_unreleased(hand).unwrap().entries, 1);
 }
 
+/// An entry left above `## [Unreleased]` (a merge that placed it after a release rolled the
+/// section) belongs to no section, so the gate names its line. CONTROL: the same entry under
+/// `[Unreleased]` passes, and so do a bullet inside a preamble comment and a preamble blockquote.
+#[test]
+fn an_entry_above_every_section_is_refused() {
+    let stranded = "# Changelog\n\nPreamble prose.\n\n- **A fix.** Its words.\n## [Unreleased]\n\n\
+                    ### Fixed\n\n- **Another fix.**\n\n## [0.25] - x\n- y\n";
+    for section in ["Unreleased", "0.25"] {
+        let err = changelog::gate_section(stranded, section)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line 5: an entry above the first"), "{err}");
+    }
+    let placed = "# Changelog\n\nPreamble prose.\n\n## [Unreleased]\n\n### Fixed\n\n\
+                  - **A fix.** Its words.\n- **Another fix.**\n\n## [0.25] - x\n- y\n";
+    assert_eq!(changelog::gate_unreleased(placed).unwrap().entries, 2);
+    let commented = "<!-- a note\n- not an entry\n-->\n> - quoted\n## [Unreleased]\n- **A fix.**\n";
+    assert_eq!(changelog::gate_unreleased(commented).unwrap().entries, 1);
+    assert_eq!(
+        changelog::gate_unreleased(FIX_REAL_CASES).unwrap().entries,
+        3
+    );
+}
+
 #[test]
 fn gate_refuses_every_empty_shape() {
     let empties = [

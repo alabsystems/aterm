@@ -330,7 +330,12 @@ pub(crate) fn write_starter_config(path: &std::path::Path) -> std::io::Result<()
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o644);
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
     options
         .open(path)?
         .write_all(starter_config_for(path).as_bytes())
@@ -440,7 +445,7 @@ const STARTER_CONFIG: &str = concat!(
 # load_adaptive_motion = true      # shed decorative effects under sustained render overload (smooth scroll stays on)
 # cursor_trail_style = \"rainbow kitty pet\"  # cursor motion trail + light crown (DEFAULT; off on Windows):
 #                                  #   rainbow kitty pet (aliases: \"rainbow kitty\", \"kitty\", \"rainbow kitty tall\")
-#                                  #   | rainbow kitty underline | rainbow dog pet
+#                                  #   | rainbow underline (alias: \"rainbow kitty underline\") | rainbow dog pet
 #                                  #   | rainbow kitty flying (aliases: \"flying kitty\", \"kitty flying\", \"nyan rainbow\", \"nyan\", \"rainbow\")
 #                                  #   | rainbow kitty flat (aliases: \"rainbow flat\", \"flat rainbow\", \"nyan flat\")
 #                                  #   | phaser | fire | water | laser (alias: \"lightning\") | comet | sparkle | lumen | beam

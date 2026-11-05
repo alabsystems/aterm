@@ -272,6 +272,7 @@ fn write_txn_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         .append(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
     file.write_all(bytes)?;
     aterm_durable::durable(&file)
@@ -356,7 +357,14 @@ fn begin_roster_transaction(
     })
     .and_then(|()| write_txn_file(&body_path, bytes))
     .and_then(|()| write_txn_file(&sig_path, sig))
-    .and_then(|()| aterm_durable::ordered(&std::fs::File::open(&staged)?));
+    .and_then(|()| {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&staged)?;
+        aterm_durable::ordered(&dir)
+    });
     if let Err(e) = staged_result {
         let _ = std::fs::remove_dir_all(&staged);
         return Err(concat(&[
@@ -669,7 +677,7 @@ pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
         .read(true)
         .write(true)
         .create(false)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(&lock_path)
         .map_err(|e| {
             concat(&[
@@ -955,6 +963,18 @@ pub struct Planned {
     roster_machines: Vec<String>,
     roster_was_fresh: bool,
     now: u64,
+}
+
+impl Planned {
+    /// The exact signed public pair this plan will publish on a successful write.
+    /// This contains no machine key or master phrase and grants no signing authority.
+    #[must_use]
+    pub fn public_roster(&self) -> RosterSnapshot {
+        RosterSnapshot {
+            raw: self.roster_bytes.clone(),
+            sig: self.roster_sig.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Planned {
@@ -1527,6 +1547,24 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600, "the machine key must be owner-only");
         let pkcs8 = std::fs::read(&paths.key).unwrap();
         assert_eq!(crate::pubkey_b64(&pkcs8).unwrap(), report.machine_pubkey);
+    }
+
+    #[test]
+    fn the_planned_public_snapshot_matches_the_successfully_published_pair() {
+        let dir = scratch("planned-public-pair");
+        let paths = paths_in(&dir);
+        write_fixture(&paths);
+        let pre = preflight(Verb::Setup, "m3", &paths).unwrap();
+        let seed = seed_of(PAPER);
+        let planned = plan(pre, &seed, NOW).unwrap();
+        let expected = planned.public_roster();
+        write_pins(&planned).unwrap();
+        write_rest(planned).unwrap();
+        assert_eq!(std::fs::read(&paths.roster).unwrap(), expected.raw);
+        assert_eq!(
+            std::fs::read(concat(&[&paths.roster, ".sig"])).unwrap(),
+            expected.sig
+        );
     }
 
     #[test]

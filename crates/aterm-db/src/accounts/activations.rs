@@ -123,7 +123,7 @@ impl Activations {
         Configuration,
         Vec<aterm_secrets::commons::binding::Binding>,
     )> {
-        let (record, members) = self.observe_store(|session, store, scope| {
+        let (record, members, configuration) = self.observe_store(|session, store, scope| {
             let history = History::read(session, store, scope.trust())?;
             let statuses = history.statuses();
             let Some(State::Ready(head)) = statuses.get(&account) else {
@@ -132,9 +132,13 @@ impl Activations {
             let record = history.records[head].clone();
             intents::current(&history, &record)?;
             let members = prepared_members(session, &history, &statuses, &record)?;
-            Ok((record, members))
+            let configuration = Configuration::capture_in_session(
+                session,
+                &record,
+                self.deadline.unwrap_or_else(crate::admission::deadline),
+            )?;
+            Ok((record, members, configuration))
         })?;
-        let configuration = Configuration::capture_until(&self.paths, &record, self.deadline)?;
         after();
         self.observe_store(|session, store, scope| {
             let history = History::read(session, store, scope.trust())?;
@@ -156,16 +160,20 @@ impl Activations {
         account: Digest,
         after_capture: impl FnOnce(),
     ) -> Result<(Record, Configuration)> {
-        let record = self.observe_store(|session, store, scope| {
+        let (record, configuration) = self.observe_store(|session, store, scope| {
             let history = History::read(session, store, scope.trust())?;
             let State::Ready(head) = history.status(account) else {
                 return Err(Error::new("account has no unique current root decision"));
             };
             let record = history.records[&head].clone();
             intents::current(&history, &record)?;
-            Ok(record)
+            let configuration = Configuration::capture_in_session(
+                session,
+                &record,
+                self.deadline.unwrap_or_else(crate::admission::deadline),
+            )?;
+            Ok((record, configuration))
         })?;
-        let configuration = Configuration::capture_until(&self.paths, &record, self.deadline)?;
         after_capture();
         self.observe_store(|session, store, scope| {
             let history = History::read(session, store, scope.trust())?;
@@ -398,15 +406,22 @@ impl Activations {
         account: Digest,
         expected: &aterm_secrets::client::Config,
     ) -> Result<Preparation> {
-        let (observed, paths) = self.with_store(false, |session, store, scope| {
-            let history = History::read(session, store, scope.trust())?;
-            let State::Ready(id) = history.status(account) else {
-                return Err(Error::new("account has no complete preparation decision"));
-            };
-            intents::current(&history, &history.records[&id])?;
-            session.permit_account(&history.records[&id])?;
-            Ok((history.records[&id].clone(), session.paths().clone()))
-        })?;
+        let (observed, paths, configuration) =
+            self.with_store(false, |session, store, scope| {
+                let history = History::read(session, store, scope.trust())?;
+                let State::Ready(id) = history.status(account) else {
+                    return Err(Error::new("account has no complete preparation decision"));
+                };
+                intents::current(&history, &history.records[&id])?;
+                session.permit_account(&history.records[&id])?;
+                let observed = history.records[&id].clone();
+                let configuration = Configuration::capture_in_session(
+                    session,
+                    &observed,
+                    self.deadline.unwrap_or_else(crate::admission::deadline),
+                )?;
+                Ok((observed, session.paths().clone(), configuration))
+            })?;
         let recovered = paths != self.paths;
         let caller_current = || -> Result<()> {
             if aterm_secrets::client::config(&self.paths)
@@ -430,7 +445,6 @@ impl Activations {
         } else {
             expected.clone()
         };
-        let configuration = Configuration::capture_until(&self.paths, &observed, self.deadline)?;
         self.with_store(false, |session, store, scope| {
             let history = History::read(session, store, scope.trust())?;
             let State::Ready(id) = history.status(account) else {

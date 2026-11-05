@@ -50,6 +50,7 @@ fn every_key() -> Vec<Rec> {
                     aterm_slog::BoundedText::new(*key, "SECRET-TEXT ~/src 中 %")
                         .expect("text survives"),
                 ),
+                Cap::Sample => Val::Word(aterm_slog::UNAVAILABLE),
             };
             let f = Fields::new().with(*key, val).expect("fits its own cap");
             rec(
@@ -452,12 +453,19 @@ fn phase_5_task_key_and_kind_are_appended_and_local() {
 #[test]
 fn phase_5_act_key_is_appended_and_closed() {
     assert_eq!(Key::Act.tier(), Tier::Wire);
-    let words: Vec<&str> = aterm_slog::ActWord::ALL.iter().map(|a| a.word()).collect();
-    assert_eq!(words, ACT_WORDS);
+    let words: Vec<&str> = aterm_slog::ActWord::ALL
+        .iter()
+        .map(|a| a.word())
+        .chain(aterm_slog::TabAct::ALL.iter().map(|a| a.word()))
+        .collect();
+    assert_eq!(words, ACT_WORDS, "the input acts, then the tab acts");
     for w in ACT_WORDS {
+        let input = aterm_slog::ActWord::from_word(w).map(aterm_slog::ActWord::word);
+        let tab = aterm_slog::TabAct::from_word(w).map(aterm_slog::TabAct::word);
         assert_eq!(
-            aterm_slog::ActWord::from_word(w).map(aterm_slog::ActWord::word),
-            Some(*w)
+            input.xor(tab),
+            Some(*w),
+            "{w}: one act of one kind names it"
         );
     }
     assert!(Fields::new().word(Key::Act, "approve").is_ok());
@@ -1386,6 +1394,185 @@ fn a9_mail_gap_is_appended_local_at_its_keys_tiers() {
     );
 }
 
+/// THE TAB MARK (the Workers as subagents design (2026-11-04) §7): appended last, local,
+/// its keys appended at the tiers their values are: a window's number, the parked bit, the
+/// worker's task end and the close's samples are wire facts, the account a host fact. A sample
+/// holds a count or `unavailable`, never anything else, and an older reader skips the kind and
+/// every new key. NEGATIVE CONTROLS: `unknown`, which every closed word decodes to, is no sample;
+/// a sample key refuses a word; a count key refuses `unavailable`.
+#[test]
+fn the_tab_mark_is_appended_local_and_its_samples_say_unavailable() {
+    assert_eq!(Kind::ALL.last(), Some(&Kind::Tab), "the last kind");
+    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
+    assert_eq!(kind_at(Kind::Tab), kind_at(Kind::MailGap).map(|i| i + 1));
+    assert_eq!(Kind::Tab.word(), "tab");
+    assert!(Kind::Tab.is_mark() && Kind::Tab.node_level().is_none());
+    assert_eq!(Kind::from_word("tab"), Kind::Tab);
+    assert_eq!(
+        FIELDS.last().map(|(k, ..)| *k),
+        Some(Key::Account),
+        "appended: every earlier key keeps its index"
+    );
+    assert_eq!(
+        [
+            Key::Window,
+            Key::Parked,
+            Key::TaskEnd,
+            Key::WallS,
+            Key::CpuS,
+            Key::PeakMb,
+            Key::Tokens,
+            Key::Account,
+        ]
+        .map(|k| (k.word(), k.tier(), k.cap())),
+        [
+            ("window", Tier::Wire, Cap::U),
+            ("parked", Tier::Wire, Cap::U),
+            (
+                "task",
+                Tier::Wire,
+                Cap::Tok(aterm_slog::Charset::Rollup, 64)
+            ),
+            ("wall_s", Tier::Wire, Cap::Sample),
+            ("cpu_s", Tier::Wire, Cap::Sample),
+            ("peak_mb", Tier::Wire, Cap::Sample),
+            ("tokens", Tier::Wire, Cap::Sample),
+            ("account", Tier::Host, Cap::Text(64)),
+        ]
+    );
+    let f = Fields::new()
+        .word(Key::Act, "close")
+        .and_then(|f| f.word(Key::Why, "concluded"))
+        .and_then(|f| f.id(Key::Parent, "s-7725"))
+        .and_then(|f| f.u(Key::Window, 0))
+        .and_then(|f| f.u(Key::Parked, 1))
+        .and_then(|f| f.word(Key::Out, "reaper"))
+        .and_then(|f| f.tok(Key::TaskEnd, "failed:could-not-finish"))
+        .and_then(|f| f.sample(Key::WallS, Some(212)))
+        .and_then(|f| f.sample(Key::CpuS, None))
+        .and_then(|f| f.sample(Key::PeakMb, None))
+        .and_then(|f| f.sample(Key::Tokens, Some(48_211)))
+        .and_then(|f| f.text(Key::Account, "m9-2"))
+        .expect("a worker close's twelve fields");
+    let r = Rec {
+        seq: 77,
+        t: 1_762_312_000_000,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k: Kind::Tab,
+        f,
+        src: Src::Aterm,
+        conf: Conf::Exact,
+        by: Actor::Harness,
+    };
+    let host = encode(&r, Tier::Host).expect("fits");
+    assert_eq!(
+        host,
+        "77 mark - tab act=close why=concluded parent=s-7725 window=0 parked=1 out=reaper \
+         task=failed:could-not-finish wall_s=212 cpu_s=unavailable peak_mb=unavailable \
+         tokens=48211 account=m9-2 by=harness src=aterm conf=exact t=1762312000000"
+    );
+    assert_eq!(decode(&host), Ok(r.clone()), "{host}");
+    let wire = encode(&r, Tier::Wire).expect("fits");
+    assert!(
+        wire.contains(" cpu_s=unavailable ")
+            && !wire.contains("account=")
+            && !wire.contains("parent="),
+        "the wire tier keeps the samples, not the host facts: {wire}"
+    );
+    assert!(!r.is_bus_class() && !r.is_turn_class(), "local");
+    let sampled = |raw: &str| {
+        decode(&format!("1 mark - tab cpu_s={raw} t=1"))
+            .expect("a line")
+            .f
+            .get(Key::CpuS)
+            .cloned()
+    };
+    assert_eq!(sampled("17"), Some(Val::U(17)));
+    assert_eq!(
+        sampled("unavailable"),
+        Some(Val::Word(aterm_slog::UNAVAILABLE))
+    );
+    assert_eq!(sampled("unknown"), None, "CONTROL: `unknown` is no sample");
+    assert_eq!(sampled("0x11"), None, "CONTROL: nor anything but a count");
+    assert!(
+        Fields::new().with(Key::CpuS, Val::Word("unknown")).is_err(),
+        "CONTROL: a sample key holds no other word"
+    );
+    assert!(
+        Fields::new().sample(Key::Window, None).is_err(),
+        "CONTROL: a count key holds no `unavailable`"
+    );
+    let older = host
+        .replace(" tab ", " zz-kind-of-phase-9 ")
+        .replace(" window=", " zz_window=")
+        .replace(" parked=", " zz_parked=")
+        .replace(" task=", " zz_task=")
+        .replace(" wall_s=", " zz_wall_s=")
+        .replace(" cpu_s=", " zz_cpu_s=")
+        .replace(" peak_mb=", " zz_peak_mb=")
+        .replace(" tokens=", " zz_tokens=")
+        .replace(" account=", " zz_account=");
+    let read = decode(&older).expect("an older reader still reads it");
+    assert_eq!(read.k, Kind::Unknown, "{older}");
+    assert_eq!(
+        read.f.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        [Key::Act, Key::Why, Key::Parent, Key::Out],
+        "only the keys it knew: {older}"
+    );
+}
+
+/// A FLEET DRIVER'S ACTOR is `fleet:<host>`, its host held to the id alphabet and cut to fit,
+/// and reads back as itself; the bus names it nobody, as it names an edge's sid with no alias.
+/// NEGATIVE CONTROLS: a bare `fleet:` is no driver; a sid stays a sid; the person stays `human`
+/// on the bus.
+#[test]
+fn a_fleet_drivers_actor_reads_back_and_crosses_the_bus_as_nobody() {
+    let m9 = Actor::fleet("m9");
+    assert_eq!(m9.word(), "fleet:m9");
+    assert_eq!(Actor::from_word("fleet:m9"), m9);
+    assert_eq!(
+        Actor::fleet("Andrew's Mac Pro").word(),
+        "fleet:Andrew-s-Mac-Pro"
+    );
+    let long = Actor::fleet(&"h".repeat(80));
+    assert_eq!(long.word().len(), ShortId::MAX, "{}", long.word());
+    assert_eq!(Actor::fleet("  "), Actor::Nobody, "no host, no driver");
+    assert_eq!(
+        Actor::from_word("fleet:"),
+        Actor::Nobody,
+        "CONTROL: a bare prefix"
+    );
+    assert!(
+        matches!(Actor::from_word("s-7725"), Actor::Sid(_)),
+        "CONTROL: a sid stays a sid"
+    );
+    assert!(!m9.is_owner() && !m9.is_trusted() && !m9.is_proven());
+    let close = |by: Actor| Rec {
+        seq: 9,
+        t: 1_762_312_000_000,
+        op: Op::Close,
+        node: Node::SESSION,
+        par: None,
+        k: Kind::Spawn,
+        f: Fields::new().word(Key::Out, "ctl-close").expect("an out"),
+        src: Src::Aterm,
+        conf: Conf::Exact,
+        by,
+    };
+    let local = encode(&close(m9), Tier::Host).expect("fits");
+    assert!(local.contains(" by=fleet:m9 "), "{local}");
+    assert_eq!(decode(&local).map(|r| r.by), Ok(m9));
+    let bus = aterm_slog::encode_mirror(&close(m9), Tier::WireMeta, 1, None, &|_| None)
+        .expect("a session close crosses");
+    assert!(!bus.contains("fleet:"), "{bus}");
+    let person =
+        aterm_slog::encode_mirror(&close(Actor::Human), Tier::WireMeta, 1, None, &|_| None)
+            .expect("a session close crosses");
+    assert!(person.contains("by=human"), "CONTROL: {person}");
+}
+
 #[test]
 fn occupancy_fact_keys_are_appended_wire_and_an_older_reader_skips_them() {
     for (key, word, cap) in [
@@ -1442,10 +1629,11 @@ fn turn_by_is_appended_wire_and_an_older_reader_skips_it() {
         ("turn_by", Tier::Wire, Cap::Word(TURN_BY_WORDS))
     );
     assert_eq!(TURN_BY_WORDS, ["harness"]);
+    let key_at = |key: Key| FIELDS.iter().position(|(k, ..)| *k == key);
     assert_eq!(
-        FIELDS.last().map(|(k, ..)| *k),
-        Some(Key::TurnBy),
-        "appended: every earlier key keeps its index"
+        key_at(Key::TurnBy).map(|i| i + 1),
+        key_at(Key::Window),
+        "appended: every earlier key keeps its index, the tab mark's keys after it"
     );
     for actor in ["human", "ctl", "vendor", "-"] {
         assert!(

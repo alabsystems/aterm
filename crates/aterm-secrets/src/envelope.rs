@@ -4,7 +4,7 @@
 //! The signed envelope a vault URL serves (docs/DESIGN-secrets-2026-10-20.md §5).
 
 use crate::{Error, b64};
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 
 mod digest_cache;
 
@@ -659,22 +659,16 @@ pub fn endorse(old_seed: &[u8; 32], name: &str, new_signer: &[u8; 32]) -> crate:
         .map_err(|_| Error::new("envelope: an Ed25519 signature is not 64 bytes"))
 }
 
-fn verify_endorsement(
-    previous: &[u8; 32],
-    endorsement: &[u8; 64],
-    name: &str,
-    signer: &[u8; 32],
-) -> Result<(), ring::error::Unspecified> {
-    UnparsedPublicKey::new(&ED25519, previous)
-        .verify(handoff_message(name, signer).as_bytes(), endorsement)
-}
-
 /// Whether link `index` of `handoff` verifies: link `k`'s key must have signed link
 /// `k + 1`'s key, and the last link's key `signer`.
 fn link_holds(handoff: &[Link], index: usize, name: &str, signer: &[u8; 32]) -> bool {
     let (previous, endorsement) = &handoff[index];
     let next = handoff.get(index + 1).map_or(signer, |(key, _)| key);
-    verify_endorsement(previous, endorsement, name, next).is_ok()
+    astream_aead::signature::verify(
+        previous,
+        handoff_message(name, next).as_bytes(),
+        endorsement,
+    )
 }
 
 /// The first link of `handoff`, from index `from` on, whose endorsement does not verify.
@@ -690,9 +684,7 @@ pub fn fingerprint(public: &[u8; 32]) -> String {
         if index > 0 {
             out.push('-');
         }
-        for byte in pair {
-            out.push_str(&format!("{byte:02x}"));
-        }
+        aterm_codec::hex::push_lower(&mut out, pair);
     }
     out
 }
@@ -710,14 +702,18 @@ impl Envelope {
 
     /// Check the signature over the signed bytes with `signer`.
     pub fn verify_signature(&self) -> crate::Result<()> {
-        UnparsedPublicKey::new(&ED25519, &self.signer)
-            .verify(&self.raw[..self.signed_len], &self.signature)
-            .map_err(|_| {
-                Error::new(format!(
-                    "envelope: the signature does not verify under its signer {}",
-                    fingerprint(&self.signer)
-                ))
-            })
+        if astream_aead::signature::verify(
+            &self.signer,
+            &self.raw[..self.signed_len],
+            &self.signature,
+        ) {
+            Ok(())
+        } else {
+            Err(Error::new(format!(
+                "envelope: the signature does not verify under its signer {}",
+                fingerprint(&self.signer)
+            )))
+        }
     }
 
     /// Refuse an envelope whose signer is a retired key ([`Retired`]); a retired key as a `previous-signer` is not refused.

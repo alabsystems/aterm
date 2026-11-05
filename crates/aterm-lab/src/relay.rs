@@ -167,10 +167,7 @@ pub fn parse_ptyrec(args: &[String]) -> Option<(&str, &[String])> {
 }
 
 fn append(path: &str) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    crate::util::append_regular_file(std::path::Path::new(path))
 }
 
 /// The size a take hands on when its outer side is no terminal: ptyrec's

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The measured phases, each selected scenario over its own world, booted as the fabric suite boots it (`harness::World`: a guarded broker in this process, opened with aterm's own options for the arm's tier — ordered at aterm's horizon by default — and retained by aterm's default rules as `aterm link broker` retains it, a headless `aterm`, and the real `aterm link serve` child it launched, its bus mirror at `--log auto`; [`boot_world`] takes an arm's `retention=off`, `log=off` and tick interval).
+//! The measured phases, each selected scenario over its own world, booted as the fabric suite boots it (`harness::World`: a guarded broker in this process, opened with aterm's own options for the arm's tier — ordered at aterm's horizon by default — and retained by aterm's default rules as `aterm link broker` retains it, a headless `aterm`, and the real `aterm link serve` child it launched, its bus mirror at `--log auto`; [`boot_world`] takes an arm's `retention=off`, `log=off` and tick interval). With `broker_process=background` or `interactive` each world's broker is instead `aterm link broker` in a process of its own, as its launchd job starts it ([`outside`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -37,6 +37,9 @@ mod backlog;
 
 #[path = "run/tallies.rs"]
 mod tallies;
+
+#[path = "run/outside.rs"]
+mod outside;
 
 /// What a run hands back.
 pub struct Report {
@@ -610,11 +613,13 @@ fn beside_line(c: &census::Census, rounds: usize, of: usize) -> String {
     )
 }
 
-/// The broker's retention ticks so far.
+/// The broker's retention ticks so far, and the publishes it refused for the rate
+/// (`BrokerStats::rate_limited`, critic item E06).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Ticks {
     run: u64,
     skipped: u64,
+    rate_limited: u64,
 }
 
 /// The broker's ticks now: read through `Broker::stats`, under the log lock, so never inside a timed round trip.
@@ -623,6 +628,7 @@ fn ticks(broker: &Broker) -> Ticks {
     Ticks {
         run: stats.retention_ticks,
         skipped: stats.retention_skips,
+        rate_limited: stats.rate_limited,
     }
 }
 
@@ -631,6 +637,7 @@ fn ticks_between(before: Ticks, after: Ticks) -> Ticks {
     Ticks {
         run: after.run - before.run,
         skipped: after.skipped - before.skipped,
+        rate_limited: after.rate_limited - before.rate_limited,
     }
 }
 
@@ -639,12 +646,13 @@ fn ticks_json(t: Ticks) -> Value {
     json!({ "run": t.run, "skipped": t.skipped })
 }
 
-/// A window's ticks for the report's tables, beside its flushes.
+/// A window's ticks for the report's tables, beside its flushes, and its refusals for the rate.
 fn ticks_line(t: Ticks) -> String {
     format!(
         "Retention ticks in the window (`BrokerStats::retention_ticks`, `retention_skips`): {} \
-         run, {} skipped.\n",
-        t.run, t.skipped
+         run, {} skipped. Publishes the broker refused for the rate in the window \
+         (`BrokerStats::rate_limited`): {}.\n",
+        t.run, t.skipped, t.rate_limited
     )
 }
 
@@ -792,6 +800,13 @@ fn boot_world(tag: &str, spec: &Spec, env: &[(&str, &str)]) -> World {
         Log::Off => &["--log", "off"],
     };
     let w = World::boot_arm(tag, opts_for(spec), spec.retention, flags, env);
+    if !spec.rate_limit {
+        w.broker
+            .as_ref()
+            .expect("the world serves its own broker")
+            .set_rate_limit(None)
+            .expect("lift the broker's rate limit");
+    }
     if let Some(ms) = spec.retention_interval_ms {
         w.broker
             .as_ref()
@@ -1345,6 +1360,7 @@ fn paced_report(
             .collect::<aterm_json::Map>(),
         "flushes": flushes_json(raw.flushes, n),
         "retention_ticks": ticks_json(raw.ticks),
+        "rate_limited": raw.ticks.rate_limited,
         "ev_between_delivery_and_commit": {"records": before, "notes_with_any": notes_before, "per_note": per(before)},
         "ev_in_the_commits_batch": {"records": with, "notes_with_any": notes_with, "per_note": per(with)},
         "shapes": shapes
@@ -1440,9 +1456,17 @@ fn served_line_of(broker: &Broker, spec: &Spec) -> String {
             "retains nothing (no retention rules: a broker from before astream's R4)".to_string()
         }
     };
+    let limits = match broker.rate_limit() {
+        Some(limit) if limit == aterm_link::broker_rules::rate_limit() => format!(
+            "limits each producer by aterm's default ({}, `broker_rules::limit`)",
+            aterm_link::broker_rules::rate_summary()
+        ),
+        Some(limit) => format!("limits each producer by {limit:?}"),
+        None => "limits no producer's rate".to_string(),
+    };
     format!(
         "The world's broker serves **{}** (asked {}, reason {:?}; horizon {horizon}; {} \
-         escalation rules) and {retains}; the bridge runs `--log {}`{}.\n",
+         escalation rules), {retains} and {limits}; the bridge runs `--log {}`{}.\n",
         aterm_link::durability::tier_name(s.served),
         aterm_link::durability::tier_name(s.requested),
         s.reason,
@@ -1671,6 +1695,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "visible_to_commit_acked_ms": stats::to_json(&visible_to_committed),
             "flushes": flushes_json(lat_raw.flushes, lat.len()),
             "retention_ticks": ticks_json(lat_raw.ticks),
+            "rate_limited": lat_raw.ticks.rate_limited,
             "census": census::to_json(&lat_census, lat.len(), (lat_lo, lat_hi)),
             "between_delivery_and_commit": {
                 "what": "the records the broker wrote between a delivery and its inbox commit, over every round trip (warm-up included); each round trip waits for its commit before the next post",
@@ -1699,6 +1724,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "broker_batches_per_message": (n > 0).then(|| stats::round3(bur.batches as f64 / n as f64)),
             "flushes": flushes_json(bur.flushes, n),
             "retention_ticks": ticks_json(bur.ticks),
+            "rate_limited": bur.ticks.rate_limited,
             "deliver_ms": stats::to_json(&b_deliver),
             "post_to_acked_ms": stats::to_json(&b_to_acked),
             "acked_to_visible_ms": stats::to_json(&b_acked_to_visible),
@@ -1852,6 +1878,9 @@ struct Round {
     /// The records the broker read back cold from just before the kill to the attach's last row
     /// and every live mail (`Broker::cold_reads`, read outside the timed window, D10d).
     cold_reads: u64,
+    /// What the broker's residency tier ran over the same window ([`backlog::tier_tally`], D10f):
+    /// `None` from a build that counts nothing.
+    tier: Option<astream_broker::TierTally>,
 }
 
 /// The bridge's pid from its state dir, if it has written one.
@@ -1986,6 +2015,8 @@ struct Backlog {
     held: backlog::Held,
     /// The records the broker read back cold in each restart ([`Round::cold_reads`], D10d).
     cold_per_restart: Vec<u64>,
+    /// What the broker's residency tier ran in each restart ([`Round::tier`], D10f).
+    tier_per_restart: Vec<Option<astream_broker::TierTally>>,
 }
 
 /// One `| … | n | mean | p50 | p95 | p99 | max |` cell run of `values`.
@@ -2061,6 +2092,11 @@ fn backlog_report(
             "steady_outside_ms": stats::to_json(outside),
             "held": held_json(&b.held),
             "cold_reads_per_restart": b.cold_per_restart,
+            "tier_per_restart": b
+                .tier_per_restart
+                .iter()
+                .map(|t| t.map_or(Value::Null, backlog::tier_json))
+                .collect::<Vec<_>>(),
         }));
     }
     md.push(String::new());
@@ -2125,6 +2161,7 @@ fn backlog_report(
         ));
     }
     md.push(String::new());
+    tier_report(backlogs, md);
     json!({
         "records": spec.backlog,
         "body_bytes": backlog::FILL_BODY_LEN,
@@ -2161,6 +2198,46 @@ fn held_row(read: &str, held: &backlog::Held) -> String {
         mib(held.peak_footprint),
         held.cold_reads
     )
+}
+
+/// The backlog's table of what the broker's residency tier ran in each restart (D10f), pushed
+/// onto `md`; a line saying the build counts nothing when no restart was counted. Its columns
+/// after the restart, heading and cells alike, are [`backlog::tier_counts`]'s, in that order.
+fn tier_report(backlogs: &[Backlog], md: &mut Vec<String>) {
+    md.push(
+        "**What each restart ran through the broker's residency tier** (D10f): astream's \
+         `Broker::tier_tally`, read where the cold reads are. Pushes are the records promoted; \
+         lookups the one-record reads by index (a cold read takes two); walks the reads of a \
+         range of summaries a page at a time (a filtered read's scan is one, `Tier::scan`, and \
+         takes no lookup) and rows the records they read; subject walks (the pending wills) and \
+         the pages naming the subject they read; wide the values read from the tier's maps of \
+         values no column holds.\n"
+            .to_string(),
+    );
+    if backlogs
+        .iter()
+        .all(|b| b.tier_per_restart.iter().all(Option::is_none))
+    {
+        md.push(
+            "This build counts nothing (a build without debug assertions keeps no tally).\n"
+                .to_string(),
+        );
+        return;
+    }
+    let counts = backlog::tier_counts(astream_broker::TierTally::default());
+    let mut heading = vec!["sessions", "restart"];
+    heading.extend(counts.iter().map(|c| c.column));
+    md.push(format!("| {} |", heading.join(" | ")));
+    md.push(format!("|{}", "---:|".repeat(heading.len())));
+    for b in backlogs {
+        for (i, t) in b.tier_per_restart.iter().enumerate() {
+            let Some(t) = t else { continue };
+            let mut row = vec![b.sessions.to_string(), (i + 1).to_string()];
+            row.extend(backlog::tier_counts(*t).iter().map(|c| c.n.to_string()));
+            md.push(format!("| {} |", row.join(" | ")));
+        }
+    }
+    md.push(String::new());
 }
 
 /// `held` as the report's JSON carries it.
@@ -2284,6 +2361,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                         t.free_wait();
                     }
                     let cold_before = broker.cold_reads();
+                    let tier_before = backlog::tier_tally(broker);
                     let mark = broker.visible_head();
                     let mut watch = w
                         .god()
@@ -2353,6 +2431,9 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     await_attach(&mut watch, &node_subject, &session_subjects, new_pid);
                     drop(watch);
                     let cold_reads = broker.cold_reads().saturating_sub(cold_before);
+                    let tier = backlog::tier_tally(broker)
+                        .zip(tier_before)
+                        .map(|(now, before)| now.since(before));
                     if let Some(t) = counted.as_mut() {
                         let at = tallies::At {
                             bridge: new_pid,
@@ -2376,6 +2457,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                         t_every_mail_seen,
                         t_posted,
                         cold_reads,
+                        tier,
                     });
                 }
                 stop_steady.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2397,6 +2479,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     steady: backlog::split(&beats, &windows),
                     held: backlog::held(broker),
                     cold_per_restart: size_rounds.iter().map(|r| r.cold_reads).collect(),
+                    tier_per_restart: size_rounds.iter().map(|r| r.tier).collect(),
                 });
             }
             rounds.extend(size_rounds);
@@ -2500,6 +2583,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "kill_to_live_mail_ms": stats::round3(ms(r.t_kill, r.t_mail_seen)),
             "kill_to_every_live_mail_ms": ms_opt(Some(r.t_kill), r.t_every_mail_seen).map(stats::round3),
             "cold_reads": r.cold_reads,
+            "tier": r.tier.map_or(Value::Null, backlog::tier_json),
         }));
         let rec = records.entry(r.sessions).or_default();
         rec.censuses.push(c);
@@ -2695,15 +2779,47 @@ fn retention_note(spec: &Spec) -> String {
         }
         (Log::Off, _) => "`--log off` (no bus mirror)",
     };
-    let at_rest = if spec.at_rest {
-        " **Sealed at rest:** the log and its `.state` and `.held` under a key, its `.seal` binding \
-         required (what ships: what `aterm link broker` opens with a `rest.key` beside it); the \
-         yardstick's brokers are not."
-    } else {
-        " **Not sealed at rest** (`--at-rest off`: a plaintext log, which a fabric root no longer \
-         ships)."
+    // An arm whose broker runs in a process of its own boots no yardstick.
+    let at_rest = match (spec.at_rest, spec.broker_process.outside()) {
+        (true, false) => {
+            " **Sealed at rest:** the log and its `.state` and `.held` under a key, its `.seal` \
+             binding required (what ships: what `aterm link broker` opens with a `rest.key` beside \
+             it); the yardstick's brokers are not."
+        }
+        (true, true) => {
+            " **Sealed at rest:** the log and its `.state` and `.held` under a key, its `.seal` \
+             binding required (what ships: what `aterm link broker` opens with a `rest.key` beside \
+             it)."
+        }
+        (false, _) => {
+            " **Not sealed at rest** (`--at-rest off`: a plaintext log, which a fabric root no \
+             longer ships)."
+        }
     };
     format!("**Retention:** the log {rules}{tick}; the bridge runs {mirror}.{at_rest}")
+}
+
+/// What the run's broker limits, for the report's head beside [`retention_note`] (critic item E06).
+fn rate_limit_note(spec: &Spec) -> String {
+    if spec.rate_limit {
+        // A broker in a process of its own keeps its `BrokerStats` there (`run/outside.rs`).
+        let counted = if spec.broker_process.outside() {
+            "no window counts the publishes it refused for the rate: its `BrokerStats` stay in its \
+             own process"
+        } else {
+            "each window counts the publishes it refused for the rate (`BrokerStats::rate_limited`)"
+        };
+        format!(
+            "**Rate limit:** every world's broker limits each producer by aterm's default ({}; \
+             `aterm_link::broker_rules::limit`, what `aterm link broker` sets at every open); \
+             {counted}.",
+            aterm_link::broker_rules::rate_summary()
+        )
+    } else {
+        "**No rate limit** (`--rate-limit off`: every world's broker limits no producer, as no \
+         `aterm link broker` before critic item E06 did)."
+            .to_string()
+    }
 }
 
 /// Run only the selected scenario.
@@ -2725,25 +2841,51 @@ pub fn measure(spec: &Spec) -> Report {
     let binary_at_start = binary_identity();
     let clock = Clock::start();
     let started = Instant::now();
+    let outside = spec.broker_process.outside();
     let (messaging, messaging_md) = measure_scenario(spec.scenario, Scenario::Messaging, || {
-        messaging(spec, clock)
+        if outside {
+            outside::messaging(spec, clock)
+        } else {
+            messaging(spec, clock)
+        }
     });
     let (pingpong, pingpong_md) = measure_scenario(spec.scenario, Scenario::Pingpong, || {
-        pingpong::measure(spec, clock)
+        if outside {
+            outside::pingpong(spec, clock)
+        } else {
+            pingpong::measure(spec, clock)
+        }
     });
-    let (attach, attach_md) =
-        measure_scenario(spec.scenario, Scenario::Attach, || attach(spec, clock));
-    let (handoff, handoff_md) = measure_scenario(spec.scenario, Scenario::Handoff, || {
-        handoff::measure(spec, clock)
+    let (attach, attach_md) = measure_scenario(spec.scenario, Scenario::Attach, || {
+        if outside {
+            outside::attach(spec, clock)
+        } else {
+            attach(spec, clock)
+        }
     });
-    let (asks, asks_md) =
-        measure_scenario(spec.scenario, Scenario::Ask, || ask::measure(spec, clock));
-    let (cross, cross_md) =
-        measure_scenario(spec.scenario, Scenario::Ask, || cross::measure(spec, clock));
+    // The worlds only an in-process broker serves: with a broker of its own `spec::parse`
+    // refuses them by name, and `all` is the three above.
+    let inproc_only = |scenario: Scenario, measure: &dyn Fn() -> (Value, Vec<String>)| {
+        if outside {
+            (Value::Null, Vec::new())
+        } else {
+            measure_scenario(spec.scenario, scenario, measure)
+        }
+    };
+    let (handoff, handoff_md) = inproc_only(Scenario::Handoff, &|| handoff::measure(spec, clock));
+    let (asks, asks_md) = inproc_only(Scenario::Ask, &|| ask::measure(spec, clock));
+    let (cross, cross_md) = inproc_only(Scenario::Ask, &|| cross::measure(spec, clock));
+    let broker = if outside {
+        outside::note(spec)
+    } else {
+        broker_note(spec)
+    };
     let mut md = vec![
-        format!("**Broker:** {}", broker_note(spec)),
+        format!("**Broker:** {broker}"),
         String::new(),
         retention_note(spec),
+        String::new(),
+        rate_limit_note(spec),
         String::new(),
     ];
     if spec.scenario != Scenario::All {
@@ -2770,8 +2912,9 @@ pub fn measure(spec: &Spec) -> Report {
         "build": arm.map_or("a binary in neither arm's build directory", Profile::describe),
         "aterm_binary": harness::aterm(),
         "aterm_binary_identity": { "start": binary_at_start, "end": binary_at_end },
-        "broker": broker_note(spec),
+        "broker": broker,
         "retention": retention_note(spec),
+        "rate_limit": rate_limit_note(spec),
         "clock": "one monotonic origin in the bench process; microsecond stamps",
         "elapsed_s": stats::round3(elapsed_s),
         "messaging": messaging,
@@ -2795,6 +2938,29 @@ fn binary_identity() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The report's head claims only what the arm measured: an arm whose broker runs in a
+    /// process of its own counts no refusal for the rate (its `BrokerStats` are not the bench's
+    /// to read) and boots no yardstick, while the in-process arm does both.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_head_of_a_broker_process_arm_claims_no_refusal_count_and_no_yardstick() {
+        use super::*;
+
+        let inproc = crate::spec::parse("scenario=messaging", Path::new("/s")).expect("inproc");
+        assert!(rate_limit_note(&inproc).contains("BrokerStats::rate_limited"));
+        assert!(retention_note(&inproc).contains("yardstick"));
+        for arm in ["background", "interactive"] {
+            let words = format!("scenario=messaging broker_process={arm}");
+            let outside = crate::spec::parse(&words, Path::new("/s")).expect("outside");
+            let (rate, retention) = (rate_limit_note(&outside), retention_note(&outside));
+            assert!(
+                !rate.contains("BrokerStats::rate_limited") && rate.contains("no window counts"),
+                "{arm}: {rate}"
+            );
+            assert!(!retention.contains("yardstick"), "{arm}: {retention}");
+        }
+    }
+
     /// The attach table keeps every row a run measured, an empty one too (a
     /// relaxed run's `pid -> every row durable`, an acked head that never
     /// landed), and leaves out only the backlog's own two rows on a run
@@ -2922,7 +3088,8 @@ mod tests {
             Duration::from_millis(ORDERED_HORIZON_MS),
             aterm_link::durability::ORDERED_HORIZON
         );
-        let spec = |words: &str| crate::spec::parse(&format!("out=/o {words}")).expect(words);
+        let spec =
+            |words: &str| crate::spec::parse(words, std::path::Path::new("/s")).expect(words);
         let bare = opts_for(&spec(""));
         let shipped = harness::broker_opts(aterm_link::durability::default_for(true));
         assert_eq!(
@@ -3083,6 +3250,7 @@ mod tests {
             text: String::new(),
             head: String::new(),
             commit: commit.then(|| ("/f/f1/cur/n-x/node/inbox".to_string(), 10)),
+            bytes: 0,
         };
         let recs = [
             rec(9, "/f/f1/pub/n-x/s-a/ev", false),

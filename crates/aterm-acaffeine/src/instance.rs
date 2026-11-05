@@ -90,9 +90,9 @@ impl Instance {
             use std::os::unix::fs::OpenOptionsExt as _;
             options
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
-        let file = options.open(path)?;
+        let file = aterm_uds::kept_out(|| options.open(path))?;
         if !private_lock_file(&file.metadata()?) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -102,8 +102,6 @@ impl Instance {
                 ),
             ));
         }
-        #[cfg(unix)]
-        aterm_uds::keep_out_of_children(&file)?;
         if !take(&file)? {
             return Ok(None);
         }
@@ -206,9 +204,11 @@ fn adopt_fd(fd: i32, path: &Path) -> Option<Instance> {
         return None;
     }
     if fd <= 2 {
+        use std::os::unix::fs::OpenOptionsExt as _;
         let null = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open("/dev/null")
             .ok()?;
         // SAFETY: two open descriptors; `dup2` replaces slot `fd` with `/dev/null` atomically.
@@ -297,7 +297,7 @@ pub fn last_holder(path: &Path) -> Option<Holder> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = options.open(path).ok()?;
     let meta = file.metadata().ok()?;

@@ -23,11 +23,10 @@ fn headless_worker_if_requested() {
         unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) },
         libc::SIG_ERR
     );
-    std::fs::write(
-        PathBuf::from(world).join("ready"),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    // Readiness is the name appearing, so its reader must find the whole pid behind it.
+    let world = PathBuf::from(world);
+    std::fs::write(world.join("ready.partial"), std::process::id().to_string()).unwrap();
+    std::fs::rename(world.join("ready.partial"), world.join("ready")).unwrap();
     if std::env::var_os(STOP).is_some() {
         // SAFETY: only this private worker stops itself after actual readiness.
         assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) }, 0);

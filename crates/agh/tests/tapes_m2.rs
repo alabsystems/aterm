@@ -82,6 +82,16 @@ fn a_one_shot_recording_against_github_com_is_refused() {
             ],
             "ref create",
         ),
+        (
+            vec![
+                "ref",
+                "update-atomic",
+                "alabsystems/aterm",
+                "--input",
+                "absent.json",
+            ],
+            "ref update-atomic",
+        ),
         (vec!["api", "-X", "POST", refs], "api"),
         (vec!["api", "--method", "post", refs], "api"),
         (vec!["api", "--method=Post", refs], "api"),
@@ -111,6 +121,7 @@ fn provision_and_git_verbs_are_refused() {
         &["auth", "import", "dev2", "--from-gh", "--tier", "dev"][..],
         &["auth", "git-credential", "get"][..],
         &["repo", "clone", APP, "d"][..],
+        &["repo", "fetch-main", APP, "d"][..],
         &["policy", "grant", "fixture-caller", "alabsystems/aterm"][..],
     ] {
         let mut args = vec!["--record", t_arg];
@@ -276,6 +287,10 @@ fn git_requests_are_canonical() {
     let dir = Path::new("dir-of-the-fetch");
     let text = |run: &GitRun| String::from_utf8(canon::git_request(run)).expect("UTF-8");
     let runs = [
+        (
+            GitRun::new_mirror(&slug, dest).with_depth(1),
+            "git clone-mirror fixture-dev/app".to_string(),
+        ),
         (
             GitRun::new_clone(&slug, dest).with_depth(1),
             "git clone fixture-dev/app\ndepth 1".to_string(),

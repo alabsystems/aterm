@@ -24,7 +24,9 @@ fn native_deaf_worker_if_requested() {
         unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) },
         libc::SIG_ERR
     );
-    std::fs::write(world.join("ready"), std::process::id().to_string()).unwrap();
+    // Readiness is the name appearing, so its reader must find the whole pid behind it.
+    std::fs::write(world.join("ready.partial"), std::process::id().to_string()).unwrap();
+    std::fs::rename(world.join("ready.partial"), world.join("ready")).unwrap();
     let _ = std::io::stdin().read_line(&mut String::new()).unwrap();
 }
 

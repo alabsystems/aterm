@@ -213,9 +213,10 @@ const BROKE: &str =
 /// Why a recording session with no break open replays nothing.
 const NOTHING_REPLAYS: &str = "nothing recorded replays now";
 
-/// `rewind check [export]`: every replayable chain replayed under this build as the pane task and judged by `pane.faithful-replay`, with no live effect; `export` also writes the first failing chain (else the newest) as a pane trace, mode 0600, under the state directory's `rewind/`, for `aos check`.
+/// `rewind check [export]`: first every pending witness judged ([`crate::temporal::judge_all`]), so the recorder holds a full-equality verdict on each, then every replayable chain replayed under this build as the pane task and judged by `pane.faithful-replay` against its witnesses' digests, with no live effect and no verdict posted; `export` also writes the first failing chain (else the newest) as a pane trace, mode 0600, under the state directory's `rewind/`, for `aos check`.
 fn check_verb(ctx: &crate::SessionCtx, export: bool) -> String {
     let _consumer = crate::temporal::consumer_demand();
+    let _ = crate::temporal::judge_all(&ctx.temporal);
     let chains = {
         let rec = ctx
             .temporal
@@ -566,5 +567,47 @@ mod tests {
         ] {
             assert_eq!(parse(rest), Err(USAGE.to_string()), "{rest:?}");
         }
+    }
+
+    /// `rewind check` first judges every pending witness of every kept chain ([`crate::temporal::judge_all`]), so none is left pending, and its digest check answers the line the chains checked before any was judged.
+    #[test]
+    fn rewind_check_judges_before_its_digest_check() {
+        use crate::rewind::tests::{slice, start_recording, witness};
+        use crate::temporal::keyframe_of;
+        let app = crate::scripted_redraw_fixture::scripted_app();
+        start_recording(&app);
+        let s = app.pool.get(0).expect("session 0");
+        let _ = slice(&app, b"one\r\n");
+        witness(&app, &crate::term_lock(s.live_term()));
+        {
+            let term = crate::term_lock(s.live_term());
+            let mut rec = s.ctx.temporal.lock().expect("recorder");
+            rec.record_keyframe(keyframe_of(&term, usize::MAX).expect("keyable"));
+        }
+        let _ = slice(&app, b"two\r\n");
+        witness(&app, &crate::term_lock(s.live_term()));
+        let (pending, before) = {
+            let rec = s.ctx.temporal.lock().expect("recorder");
+            let build = aterm_types::version::build_id();
+            let checks: Vec<PaneCheck> = rec
+                .pane_chains()
+                .expect("chains")
+                .iter()
+                .map(|chain| chain.check(PaneCode::ThisBuild, &build))
+                .collect();
+            (rec.pending(), check_line(&checks))
+        };
+        assert_eq!(pending, 2, "fixture: a pending witness in each chain");
+        assert!(
+            before.starts_with("chains=2 ") && before.contains(" verdict=pass "),
+            "fixture: {before}"
+        );
+        assert_eq!(check_verb(&s.ctx, false), format!("OK {before}\n"));
+        let rec = s.ctx.temporal.lock().expect("recorder");
+        assert_eq!(
+            (rec.pending(), rec.witnessed(), rec.diverged()),
+            (0, 2, 0),
+            "every pending witness judged"
+        );
     }
 }

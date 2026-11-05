@@ -6,7 +6,7 @@
 //! ledger (`aterm_capacity`), what their last runs of that kind wrote ([`aterm_capacity::Footprints`]),
 //! or, where none was measured here, the kind's cold budget less what its directories hold. A
 //! volume short of it is relieved first: the build cache's pass under pressure
-//! ([`crate::build_cache::ReclaimAfter::for_claim`]) and, inside aterm, the window's disk
+//! ([`crate::build_cache::ReclaimAfter::by_floor`]) and, inside aterm, the window's disk
 //! watch asked for the room (`await sys free>=`). Then the run waits, saying once a minute what
 //! it needs, what is free and what holds the most, instead of failing at `ENOSPC` hours in,
 //! having said first why it needs that ([`aterm_capacity::Estimate`]). A
@@ -35,6 +35,11 @@
 //! (a `-p` run's growth is not what a whole-tree run writes, nor the reverse), and one kept
 //! before runs were tagged (the build cache's move among them) counts wherever it was measured
 //! until it leaves the record, but only for a kind with one scope.
+//! A kind whose directories are each checkout's own (verify's) keeps each run that did all its
+//! work in the machine's record as well ([`Machinewide`], [`aterm_capacity::MachineFootprints`]),
+//! by what it built, and a run with no run of its scope measured on its own directories (a fresh
+//! worktree's) claims what runs in this machine's checkouts bound it to, where that is less than
+//! the cold budget less what they hold ([`aterm_capacity::Estimate::or_machine`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,13 +47,13 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use aterm_capacity::{
-    Footprints, Ledger, Live, Machine, Meter, Need, Pace, Relief, Short, Shortfall, admit_relieved,
-    allocated_until,
+    Footprints, Ledger, Live, Machine, MachineFootprints, Meter, Need, Pace, Relief, Short,
+    Shortfall, admit_relieved, allocated_until,
 };
 
 /// What a caller passes and reads back, so verify, the trust lane and the lab claim through
 /// this module alone.
-pub use aterm_capacity::{Admit, Error, Estimate, Footprint, gib, size};
+pub use aterm_capacity::{Admit, Cover, Error, Estimate, Footprint, Selection, gib, size};
 
 /// One run's disk, as it is claimed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +77,36 @@ pub struct Run {
     /// progress for this long ([`aterm_capacity::Need::ends_when_stuck`]): [`Error::Stuck`].
     /// `None`: it waits as long as they hold.
     pub stuck_ends: Option<Duration>,
+    /// Where a kind whose directories are each checkout's own keeps its runs of every checkout on
+    /// this machine, and what this run builds; `None` for a kind whose directories are the
+    /// machine's own (a VM's) or that keeps none.
+    pub machine: Option<Machinewide>,
+}
+
+/// THE MACHINE'S RECORD OF A KIND WHOSE DIRECTORIES ARE EACH CHECKOUT'S OWN (verify's build
+/// directory and `<target>/verify`): a fresh worktree's hold no run of anything, so its record
+/// beside them ([`Run::record`]) has none to read, and a run of a scope run in another checkout
+/// claims what that run bounds ([`aterm_capacity::MachineFootprints::cover`]) instead of the
+/// cold budget. Kept only for a run that did all its work ([`Admitted::finish_whole`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Machinewide {
+    /// The record's file, the same for every checkout on this machine.
+    pub record: PathBuf,
+    /// What the run builds, as the record keeps it.
+    pub selection: Selection,
+}
+
+/// WHAT A FINISHED RUN TOOK, AND WHICH RECORDS TOOK IT ([`Admitted::finish_here`],
+/// [`Admitted::finish_whole`]), so what its log says it kept is what it kept.
+#[derive(Debug)]
+pub struct Finished {
+    /// What it took.
+    pub run: Footprint,
+    /// Whether the record beside its directories took it ([`Run::record`]).
+    pub here: std::io::Result<()>,
+    /// Whether the machine's record took it ([`Run::machine`]): `None` where it was not offered
+    /// (a run that did not do all its work, or of a kind, or in a place, that keeps none).
+    pub machine: Option<std::io::Result<()>>,
 }
 
 /// An admitted run: its claim held, and its writes measured, until [`Self::finish`].
@@ -79,6 +114,7 @@ pub struct Run {
 pub struct Admitted {
     meter: Meter,
     record: PathBuf,
+    machine: Option<Machinewide>,
     /// What it claimed, and why.
     pub estimate: Estimate,
     /// How long it waited for room.
@@ -86,13 +122,37 @@ pub struct Admitted {
 }
 
 impl Admitted {
-    /// The run is over: let its claim go, and keep what it took for the next run of its kind.
+    /// The run is over: let its claim go, and keep what it took for the next run of its kind on
+    /// its directories ([`Run::record`]), but not for this machine's other checkouts
+    /// ([`Run::machine`]): a run that failed may have stopped short of what its scope writes, and
+    /// what other checkouts claim would then be too little (on its own directories, a heavier run
+    /// it kept bounds it, as it always did).
     pub fn finish(self) -> Footprint {
+        self.finish_here().run
+    }
+
+    /// [`Self::finish`], saying whether the record beside its directories took the run.
+    pub fn finish_here(self) -> Finished {
         let run = self.meter.finish();
         let mut kept = Footprints::load(&self.record);
         kept.push(run);
-        let _ = kept.save(&self.record);
-        run
+        Finished {
+            run,
+            here: kept.save(&self.record),
+            machine: None,
+        }
+    }
+
+    /// The run did all its work (verify: every check passed), so it built every unit of its
+    /// scope: let its claim go and keep what it took on its directories ([`Self::finish_here`])
+    /// and, where its kind keeps them ([`Run::machine`]), in the machine's record for every
+    /// checkout, under its lock. A record that cannot be written leaves the one before, and the
+    /// run's next kin claim by it; [`Finished`] says which took it.
+    pub fn finish_whole(mut self) -> Finished {
+        let machine = self.machine.take();
+        let mut done = self.finish_here();
+        done.machine = machine.map(|m| MachineFootprints::keep(&m.record, m.selection, done.run));
+        done
     }
 
     /// The run was cut short (an interrupt ended it): let its claim go and return what it took,
@@ -163,13 +223,18 @@ pub fn admit_on(
     let tag = dirs_tag(&run.dirs);
     let scope = scope_tag(&run.scope);
     let kept = Footprints::load(&run.record);
-    let estimate = kept.need(holds, run.cold, tag, scope);
+    let across = run
+        .machine
+        .as_ref()
+        .map(|m| (MachineFootprints::load(&m.record), m.selection.clone()));
+    let estimate = need_of(&kept, across.as_ref(), holds, run.cold, tag, scope);
     let mut sizing = Sizing {
         relief,
         dirs: &run.dirs,
         tag,
         scope,
         kept,
+        across,
         cold: run.cold,
         holds,
         estimate,
@@ -212,6 +277,7 @@ pub fn admit_on(
     Ok(Admitted {
         meter: Meter::start(run.dirs, tag, scope, holds, claim),
         record: run.record,
+        machine: run.machine,
         estimate,
         waited,
     })
@@ -277,8 +343,11 @@ struct Sizing<'a> {
     tag: u64,
     /// What the run builds ([`scope_tag`]): the runs kept of that scope are counted.
     scope: Option<u64>,
-    /// What its kind's last runs took.
+    /// What its kind's last runs took on its directories.
     kept: Footprints,
+    /// What its kind's runs took in this machine's checkouts, and what it builds, where its kind
+    /// keeps them ([`Run::machine`]).
+    across: Option<(MachineFootprints, Selection)>,
     /// What its kind writes into empty directories.
     cold: u64,
     /// What its directories held at the last measure.
@@ -291,6 +360,22 @@ struct Sizing<'a> {
     relieved: bool,
 }
 
+/// What a run claims when its directories, tagged `tag`, hold `holds` and it builds `scope`: what
+/// its kind's runs on them (`kept`) bound ([`Footprints::need`]), or, with none of its scope, what
+/// the machine's runs (`across`: its record and the run's selection) bound where lower
+/// ([`Estimate::or_machine`]).
+fn need_of(
+    kept: &Footprints,
+    across: Option<&(MachineFootprints, Selection)>,
+    holds: u64,
+    cold: u64,
+    tag: u64,
+    scope: Option<u64>,
+) -> Estimate {
+    kept.need(holds, cold, tag, scope)
+        .or_machine(across.and_then(|(m, selection)| m.cover(selection, holds, cold)))
+}
+
 impl Relief for Sizing<'_> {
     fn relieve(&mut self, short: &Shortfall, say: &mut dyn FnMut(&str), stopped: Stopped<'_>) {
         self.relief.relieve(short, say, stopped);
@@ -299,6 +384,10 @@ impl Relief for Sizing<'_> {
 
     fn holders(&mut self, short: &Shortfall, stopped: Stopped<'_>) -> Option<String> {
         self.relief.holders(short, stopped)
+    }
+
+    fn renewed(&mut self, stopped: Stopped<'_>) -> bool {
+        self.relief.renewed(stopped)
     }
 
     fn resized(&mut self, say: &mut dyn FnMut(&str), stopped: Stopped<'_>) -> Option<u64> {
@@ -311,7 +400,14 @@ impl Relief for Sizing<'_> {
             return None;
         }
         self.holds = holds;
-        let estimate = self.kept.need(holds, self.cold, self.tag, self.scope);
+        let estimate = need_of(
+            &self.kept,
+            self.across.as_ref(),
+            holds,
+            self.cold,
+            self.tag,
+            self.scope,
+        );
         // A smaller figure (the directories grew meanwhile) leaves the claim, and why it is what
         // it is, as they were: a waiting claim is never made smaller.
         if estimate.bytes < self.estimate.bytes {
@@ -413,7 +509,20 @@ pub struct Reclaim {
     /// run's directories held: its pass removed something, or the window's disk watch answered
     /// (its own passes, run for the room asked, know no run's directories).
     touched: bool,
+    /// The build directories of gone workspaces now ([`crate::build_cache::gone_leaves`]), read
+    /// at each waiting look; `None` reads none, and the relief is never renewed.
+    gone: Option<Gone>,
+    /// What `gone` listed as the last relief's pass began: a directory it did not list then (its
+    /// workspace removed since) renews the relief ([`Relief::renewed`]). One the pass kept (a
+    /// build holds it) is listed, so it renews nothing.
+    gone_after: std::collections::BTreeSet<PathBuf>,
+    /// Whether the last relief was asked for disk: only a disk shortfall is renewed, so a wait
+    /// short of memory or load alone never relieves again at every look.
+    short_of_disk: bool,
 }
+
+/// The build directories of gone workspaces now, cheaply ([`crate::build_cache::gone_leaves`]).
+pub type Gone = Box<dyn FnMut() -> std::collections::BTreeSet<PathBuf>>;
 
 impl Reclaim {
     /// The relief made of these parts.
@@ -425,7 +534,18 @@ impl Reclaim {
             largest,
             named: None,
             touched: false,
+            gone: None,
+            gone_after: std::collections::BTreeSet::new(),
+            short_of_disk: false,
         }
+    }
+
+    /// This relief, renewed at a waiting look short of disk where `gone` lists a build directory
+    /// it did not list as the last pass began ([`Relief::renewed`]).
+    #[must_use]
+    pub fn watching(mut self, gone: Gone) -> Reclaim {
+        self.gone = Some(gone);
+        self
     }
 
     /// The live relief: [`crate::build_cache::reclaim_home_watched`] where the build cache is on
@@ -461,6 +581,17 @@ impl Reclaim {
             Box::new(ask_watch),
             Box::new(move |mount, stopped| largest_on(mount, &own, stopped)),
         )
+        .watching(Box::new(|| {
+            aterm_types::dirs::home_dir()
+                .filter(|_| cfg!(target_os = "macos"))
+                .map(|home| {
+                    crate::build_cache::gone_leaves(
+                        &crate::build_cache::cache_root(&home),
+                        Some(&home),
+                    )
+                })
+                .unwrap_or_default()
+        }))
     }
 }
 
@@ -510,15 +641,24 @@ fn recorder<'a>(
 
 impl Relief for Reclaim {
     fn relieve(&mut self, short: &Shortfall, say: &mut dyn FnMut(&str), stopped: Stopped<'_>) {
+        self.short_of_disk = disk_short(short).is_some();
         let Some((need, mount, floor, reserved, above_floor)) = disk_short(short) else {
             return;
         };
         let room = Room {
             mount: &mount,
-            after: crate::build_cache::ReclaimAfter::for_claim(above_floor == 0),
+            after: crate::build_cache::ReclaimAfter::by_floor(above_floor == 0),
         };
+        if let Some(gone) = self.gone.as_mut() {
+            // Before the pass: one removed while it runs renews the next look.
+            self.gone_after = gone();
+        }
         let (freed, removed, stayed) = (self.pass)(room, stopped);
         self.touched |= !removed.is_empty();
+        if !removed.is_empty() {
+            // What held the volume changed: the next wait line reads its holders again.
+            self.named = None;
+        }
         if stopped() {
             return;
         }
@@ -571,6 +711,13 @@ impl Relief for Reclaim {
             format!("largest on {}: {}", mount.display(), each.join(", "))
         });
         (!named.is_empty()).then(|| named.clone())
+    }
+
+    fn renewed(&mut self, stopped: Stopped<'_>) -> bool {
+        let Some(gone) = self.gone.as_mut().filter(|_| self.short_of_disk) else {
+            return false;
+        };
+        !stopped() && gone().iter().any(|leaf| !self.gone_after.contains(leaf))
     }
 }
 

@@ -78,7 +78,11 @@ pub fn write_marker(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        const FLAGS: i32 = 0x0100 | 0x0100_0000;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        const FLAGS: i32 = 0o2_000_000;
+        options.mode(0o600).custom_flags(FLAGS);
     }
     let mut file = options.open(&tmp)?;
     let written = file

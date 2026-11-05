@@ -166,6 +166,7 @@ fn reading(st: &State, worked: Option<Duration>, real: &Real) -> TurnEndReading 
         turn_said: None,
         said_lines: None,
         turn_lines: None,
+        turn_breaks: Default::default(),
         opened_by: None,
         message_drawn: false,
         submits: None,
@@ -218,6 +219,7 @@ fn reading(st: &State, worked: Option<Duration>, real: &Real) -> TurnEndReading 
         login_at_wall: None,
         login_method: None,
         login_shared: None,
+        login_pin: aterm_agent::supervise::policy::login::LoginPin::Picker,
         login_moved: false,
         roster: None,
         wall_remembered: false,
@@ -228,6 +230,7 @@ fn reading(st: &State, worked: Option<Duration>, real: &Real) -> TurnEndReading 
         record_turn: None,
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
+        leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
         fact: None,
         wake: None,
     }

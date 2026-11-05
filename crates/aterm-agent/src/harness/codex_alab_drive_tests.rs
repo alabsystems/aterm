@@ -572,6 +572,7 @@ impl Rig {
         let opts = Opts {
             home: user,
             state: dir.join("state"),
+            account_roster: None,
             sock: Some(sock),
             token: None,
             only_sid: None,
@@ -623,6 +624,8 @@ impl Rig {
 
     fn snap(&self, home_env: Option<String>) -> crate::harness::relaunch::Snapshot {
         crate::harness::relaunch::Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: TAB.to_string(),
@@ -1415,6 +1418,7 @@ fn prune_opts(dir: &Path) -> Opts {
     Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: None,

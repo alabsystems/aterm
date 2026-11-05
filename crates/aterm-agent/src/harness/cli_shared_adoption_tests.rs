@@ -78,9 +78,11 @@ struct Host {
     state: PathBuf,
 }
 fn write_login(path: &Path, email: &str) {
-    fs::write(
-        path.join(".claude.json"),
-        format!(r#"{{"oauthAccount":{{"emailAddress":"{email}","accountUuid":"provider-uuid"}}}}"#),
+    aterm_uds::atomic_file::write(
+        &path.join(".claude.json"),
+        format!(r#"{{"oauthAccount":{{"emailAddress":"{email}","accountUuid":"provider-uuid"}}}}"#)
+            .as_bytes(),
+        0o600,
     )
     .unwrap();
     let credential = path.join(".credentials.json");
@@ -361,16 +363,31 @@ fn run_with_provider(
     provider: Arc<dyn shared_provider::Provider>,
 ) -> Result<bool, String> {
     let store = env.accounts_store();
-    let signin = store.signin_now().unwrap().unwrap();
     let mut candidate = candidate(approval);
     candidate.provider = provider;
-    super::super::shared_adoption::adopt(
-        env,
-        host,
-        &store,
-        &signin,
-        &env.accounts_roster().unwrap(),
-        candidate,
+    let roster = env.accounts_roster().unwrap();
+    let signin = adoption_sign_in(&store, &roster, &candidate);
+    super::super::shared_adoption::adopt(env, host, &store, &signin, &roster, candidate)
+}
+
+/// The started sign-in [`super::super::shared_adoption::adopt`] takes for `candidate`, naming
+/// the row the upkeep's adoption names ([`crate::harness::accounts_sync::shared_renewal::adoption_label`]).
+fn adoption_sign_in(
+    store: &accounts::Store,
+    roster: &Path,
+    candidate: &Candidate,
+) -> crate::harness::sign_in_ladder::Begun {
+    let text = accounts::roster_text(roster)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let raw = Roster::parse_for(candidate.cli, &text)
+        .unwrap_or_else(|_| Roster::parse_for(candidate.cli, "").unwrap());
+    let label = crate::harness::accounts_sync::shared_renewal::adoption_label(candidate, &raw);
+    crate::harness::sign_in_ladder::begun_fixture(
+        store.signin_now().unwrap().unwrap(),
+        candidate.cli,
+        &label,
     )
 }
 
@@ -591,9 +608,9 @@ fn automatic_first_adoption_does_not_substitute_a_headless_profile_for_a_require
             let attempt = logins.shared.latest(grant.source).unwrap();
             write_login(Path::new(&attempt.intent.staging), EMAIL);
         }
-        let signin = store.signin_now().unwrap().unwrap();
         let mut named = candidate(&approval);
         named.row.browser = Some("required-profile".into());
+        let signin = adoption_sign_in(&store, &env.accounts_roster().unwrap(), &named);
         assert!(
             super::super::shared_adoption::adopt(
                 &env,

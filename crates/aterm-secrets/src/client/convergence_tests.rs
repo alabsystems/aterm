@@ -15,19 +15,19 @@ use crate::membership_log::{
 
 /// Six lab Macs: `m22`, `m7` and four `m7` lets in, each holding every record; their actors and
 /// age recipients, in that order.
-struct Six {
-    macs: TwoMacs,
-    all: Vec<Paths>,
-    actors: Vec<MemberId>,
-    recipients: Vec<Recipient>,
+pub(super) struct Six {
+    pub(super) macs: TwoMacs,
+    pub(super) all: Vec<Paths>,
+    pub(super) actors: Vec<MemberId>,
+    pub(super) recipients: Vec<Recipient>,
 }
 
-fn six() -> Six {
+pub(super) fn six() -> Six {
     six_with(false)
 }
 
 /// [`six`], with `m7` an admin too where `m7_admin`.
-fn six_with(m7_admin: bool) -> Six {
+pub(super) fn six_with(m7_admin: bool) -> Six {
     let macs = two_macs_with(
         &[(Audience::Everyone, "shared", b"v1".as_slice())],
         m7_admin,
@@ -54,13 +54,13 @@ fn six_with(m7_admin: bool) -> Six {
     }
 }
 
-fn ids(paths: &Paths) -> BTreeSet<RecordId> {
+pub(super) fn ids(paths: &Paths) -> BTreeSet<RecordId> {
     log_of(paths).records().map(|record| *record.id()).collect()
 }
 
 /// The records `paths` holds that `before` does not name, in its log's order: what it signed
 /// since, each after the one it signed before.
-fn signed_since(paths: &Paths, before: &BTreeSet<RecordId>) -> Vec<Record> {
+pub(super) fn signed_since(paths: &Paths, before: &BTreeSet<RecordId>) -> Vec<Record> {
     log_of(paths)
         .records()
         .filter(|record| !before.contains(record.id()))
@@ -90,7 +90,7 @@ fn prefix(chain: &[Record], k: u64) -> &[Record] {
 }
 
 /// Every `Epoch` of `signed`, counted by audience.
-fn epochs_by_audience(signed: &[Record]) -> BTreeMap<EpochAudience, usize> {
+pub(super) fn epochs_by_audience(signed: &[Record]) -> BTreeMap<EpochAudience, usize> {
     let mut out = BTreeMap::new();
     for record in signed {
         if let Body::Epoch { audience, .. } = record.body() {
@@ -131,7 +131,11 @@ fn wrapped_by(log: &Log, epoch: &RecordId) -> BTreeSet<Recipient> {
 /// `Wrap`s to each member `to` keeps, in recipient order, and the `shared` entry, the Commons
 /// control descriptor or a host list's first entry resealed under it, all at one `authored_ms`.
 /// Returns the batch, kept in `paths`' records.
-fn rekey(paths: &Paths, audience: &EpochAudience, to: impl Fn(&Recipient) -> bool) -> Vec<Record> {
+pub(super) fn rekey(
+    paths: &Paths,
+    audience: &EpochAudience,
+    to: impl Fn(&Recipient) -> bool,
+) -> Vec<Record> {
     let recipients: BTreeSet<Recipient> = log_of(paths)
         .membership()
         .members()
@@ -143,7 +147,7 @@ fn rekey(paths: &Paths, audience: &EpochAudience, to: impl Fn(&Recipient) -> boo
 }
 
 /// [`rekey`] wrapped to `recipients`, a Mac with no seat among them or not.
-fn rekey_to(
+pub(super) fn rekey_to(
     paths: &Paths,
     audience: &EpochAudience,
     recipients: &BTreeSet<Recipient>,
@@ -200,7 +204,7 @@ fn rekey_to(
 }
 
 /// The `[everyone]` entry `shared` as the Mac at `paths` opens it from its records.
-fn shared(paths: &Paths) -> Option<Vec<u8>> {
+pub(super) fn shared(paths: &Paths) -> Option<Vec<u8>> {
     let identity = read_identity(paths).unwrap().unwrap();
     let opened = log_of(paths).open_audience_entries(&identity).unwrap()?;
     opened
@@ -218,7 +222,7 @@ fn in_order(lab: &Six) -> (Vec<Recipient>, Vec<usize>) {
 }
 
 /// Every Mac of `all` takes `from`'s records.
-fn carry(all: &[Paths], from: usize) {
+pub(super) fn carry(all: &[Paths], from: usize) {
     let wire = load_records(&all[from]).unwrap().encode();
     for (i, paths) in all.iter().enumerate() {
         if i != from {
@@ -424,10 +428,23 @@ struct M4 {
     seatless: Option<Recipient>,
 }
 
+/// `f` run with `log_entries::OLD_CARRY` set where `old` is, as a 0.154.0 Mac of a mixed lab
+/// signs (one-mesh M5): its removals keep each recipient with no seat that every newest epoch
+/// wraps. The switch's earlier value is restored after.
+fn as_0154<T>(old: bool, f: impl FnOnce() -> T) -> T {
+    let was = log_entries::OLD_CARRY.with(|cell| cell.replace(old || cell.get()));
+    let out = f();
+    log_entries::OLD_CARRY.with(|cell| cell.set(was));
+    out
+}
+
 /// [`M4`]: of six Macs in recipient order `r0..r5`, where `seatless` first m22 (an admin) lets a
 /// `[machines]`-only key S into `[everyone]`, which sorts above every lab Mac; then `r0`'s Mac X
 /// removes `r1`'s and `r5`'s Mac A removes `r4`'s, each on its own side, and A's batch wraps S
-/// last.
+/// last. Only a 0.154.0 carry still keeps a recipient no seat binds (one-mesh M1, M4: the
+/// current carry drops it), so with S both removals are signed as 0.154.0 Macs sign them
+/// ([`as_0154`]), a mixed lab whose holds stay (M5); X's passes run the current code. With no
+/// S the removals are the current code's.
 fn m4_lab(seatless: bool) -> M4 {
     let lab = six();
     let (r, order) = in_order(&lab);
@@ -442,8 +459,10 @@ fn m4_lab(seatless: bool) -> M4 {
         key
     });
     let (x, a) = (&lab.all[order[0]], &lab.all[order[5]]);
-    test_remove_unposted(x, &join_code(&r[1])).expect("X removes r1");
-    let chain = a_removes_r4(a, &r);
+    let chain = as_0154(seatless.is_some(), || {
+        test_remove_unposted(x, &join_code(&r[1])).expect("X removes r1");
+        a_removes_r4(a, &r)
+    });
     if let Some(key) = &seatless {
         let epoch = chain
             .iter()
@@ -476,8 +495,9 @@ fn m4_shape(rest: Option<u64>) -> (Option<u64>, BTreeSet<Recipient>, Vec<Recipie
 
 /// [`m4_shape`], and where `seatless` first m22 (an admin) lets a `[machines]`-only key S into
 /// `[everyone]`, which sorts above every lab Mac, so both removals carry it and A's batch wraps
-/// it last. Returns the step of X's first signed record, the recipients of its first
-/// `[everyone]` epoch if it signs one, the recipients, and S.
+/// it last (both signed as 0.154.0 Macs sign them, [`m4_lab`]). Returns the step of X's first
+/// signed record, the recipients of its first `[everyone]` epoch if it signs one, the
+/// recipients, and S.
 fn m4_shape_with(
     rest: Option<u64>,
     seatless: bool,
@@ -533,10 +553,14 @@ fn m4_shape_with(
 /// [`log_entries::SETTLE_GRACE_MS`] from first sight, and what X mints then still carries `r3`
 /// and `r5`, whose `Wrap`s the rest of A's batch may still bring ([`Log::in_flight`]).
 ///
-/// NEGATIVE CONTROLS: with `UNSETTLED_OK` (every epoch reads as settled), X mints
-/// at its first turn from the prefix, reads `r3` and `r5`, whose `Wrap`s it lacks, as left out
-/// on purpose, and its new epoch wraps only `r0` and `r2`; with `PREFIX_BLIND` (no batch may
-/// wrap more than this Mac holds) the mint after the grace narrows the same way.
+/// The carry is the current seats (one-mesh M1, M4), so the mint after the grace carries `r3` and
+/// `r5` even with `PREFIX_BLIND` (no batch may wrap more than this Mac holds), where X reads their
+/// missing `Wrap`s as left out on purpose: a missing `Wrap` is a gap, never a revocation.
+///
+/// NEGATIVE CONTROLS: with `UNSETTLED_OK` (every epoch reads as settled), X mints at its first
+/// turn from the prefix; with `log_entries::OLD_CARRY` and `PREFIX_BLIND` (0.154.0's carry, which
+/// drops a left-out seat no batch may still wrap) the mint after the grace wraps only `r0` and
+/// `r2`.
 #[test]
 fn nothing_is_signed_from_an_epoch_held_as_a_prefix_until_its_batch_settles() {
     let (first, wraps, r) = m4_shape(Some(5));
@@ -559,21 +583,27 @@ fn nothing_is_signed_from_an_epoch_held_as_a_prefix_until_its_batch_settles() {
     PREFIX_BLIND.with(|cell| cell.set(false));
     assert_eq!(
         blind,
+        BTreeSet::from([r[0], r[2], r[3], r[5]]),
+        "prefix-blind, the mint after the grace still carries every current seat"
+    );
+
+    PREFIX_BLIND.with(|cell| cell.set(true));
+    log_entries::OLD_CARRY.with(|cell| cell.set(true));
+    let (_, narrowed, r) = m4_shape(None);
+    log_entries::OLD_CARRY.with(|cell| cell.set(false));
+    PREFIX_BLIND.with(|cell| cell.set(false));
+    assert_eq!(
+        narrowed,
         BTreeSet::from([r[0], r[2]]),
-        "CONTROL: prefix-blind, the mint after the grace narrows"
+        "CONTROL: the old carry, prefix-blind, narrows the mint after the grace"
     );
 
     UNSETTLED_OK.with(|cell| cell.set(true));
-    let (early, narrowed, r) = m4_shape(Some(5));
+    let (early, _, _) = m4_shape(Some(5));
     UNSETTLED_OK.with(|cell| cell.set(false));
     assert!(
         early.is_some_and(|k| k <= 1),
         "CONTROL: settledness off, X mints from the prefix: {early:?}"
-    );
-    assert_eq!(
-        narrowed,
-        BTreeSet::from([r[0], r[2]]),
-        "CONTROL: settledness off narrows the new epoch"
     );
 }
 
@@ -746,8 +776,13 @@ fn enrollment_after_twenty_rotations_wraps_the_admission_epochs_and_history_come
     let (macs, before, signed, m10, history) = enroll_after_history();
     let identity22 = read_identity(&macs.m22).unwrap().unwrap();
     let opened = before.open_audience_entries(&identity22).unwrap().unwrap();
-    let admission =
-        Log::admission_epochs(&opened, &[EpochAudience::Everyone, EpochAudience::Commons]);
+    let admission = Log::admission_epochs(
+        &opened,
+        &[
+            crate::membership_log::SeatAudience::Everyone,
+            crate::membership_log::SeatAudience::Commons,
+        ],
+    );
     assert!(
         signed.len() <= 1 + admission.len(),
         "{} signed for {} admission epochs",
@@ -851,22 +886,35 @@ fn removal_over_prefix() -> (BTreeSet<Recipient>, Vec<Recipient>) {
 
 /// A removal signed over a prefix of another Mac's batch ([`removal_over_prefix`]) carries the
 /// Macs the rest of that batch may still wrap: X's rotation wraps `r3` and `r5` as well as `r0`
-/// and `r2`.
+/// and `r2`, the current seats once `r1` and `r4` are removed. The carry is the current seats
+/// (one-mesh M1, M4), so it holds even with `PREFIX_BLIND`, where X reads the `Wrap`s to `r3`
+/// and `r5` it lacks as left out on purpose: a missing `Wrap` is a gap, never a revocation.
 ///
-/// NEGATIVE CONTROL: with `PREFIX_BLIND` (no batch may wrap more than this Mac holds) X reads
-/// the `Wrap`s to `r3` and `r5` it lacks as left out on purpose and wraps only `r0` and `r2`.
+/// NEGATIVE CONTROL: with `log_entries::OLD_CARRY` and `PREFIX_BLIND` (0.154.0's carry, which
+/// drops a left-out seat no batch may still wrap) X wraps only `r0` and `r2`.
 #[test]
 fn a_removal_over_a_prefix_of_another_batch_carries_the_macs_it_may_still_wrap() {
     let (wraps, r) = removal_over_prefix();
     assert_eq!(wraps, BTreeSet::from([r[0], r[2], r[3], r[5]]));
 
     PREFIX_BLIND.with(|cell| cell.set(true));
+    let (blind, r) = removal_over_prefix();
+    PREFIX_BLIND.with(|cell| cell.set(false));
+    assert_eq!(
+        blind,
+        BTreeSet::from([r[0], r[2], r[3], r[5]]),
+        "prefix-blind, the rotation still carries every current seat"
+    );
+
+    PREFIX_BLIND.with(|cell| cell.set(true));
+    log_entries::OLD_CARRY.with(|cell| cell.set(true));
     let (narrowed, r) = removal_over_prefix();
+    log_entries::OLD_CARRY.with(|cell| cell.set(false));
     PREFIX_BLIND.with(|cell| cell.set(false));
     assert_eq!(
         narrowed,
         BTreeSet::from([r[0], r[2]]),
-        "CONTROL: prefix-blind, the rotation narrows"
+        "CONTROL: the old carry, prefix-blind, narrows the rotation"
     );
 }
 
@@ -1100,9 +1148,10 @@ fn write_over_prefix() -> (Vec<Record>, Vec<bool>) {
 /// the edit once the batch arrives. A writer made to mint (`log_entries::FRESH_OVER_PREFIX`)
 /// carries the Macs the batch may still wrap, so they read it too.
 ///
-/// NEGATIVE CONTROL: with `FRESH_OVER_PREFIX` and `PREFIX_BLIND` (a writer mints over an
-/// unsettled epoch from what it holds alone, as before), the fresh epoch leaves every Mac above
-/// X out and none of them reads the edit.
+/// NEGATIVE CONTROL: with `FRESH_OVER_PREFIX`, `PREFIX_BLIND` and `OLD_GAP_RULE` (0.154.0's
+/// writer: it mints over an unsettled epoch from what it holds alone, and no heal wraps a Mac it
+/// left out), the fresh epoch leaves every Mac above X out and none of them reads the edit.
+/// Without `OLD_GAP_RULE` the vault pass of X's own publish heals those gaps.
 #[test]
 fn a_writer_over_a_prefix_of_a_rekey_seals_under_it_and_every_mac_reads_the_edit() {
     let (signed, reads) = write_over_prefix();
@@ -1128,7 +1177,9 @@ fn a_writer_over_a_prefix_of_a_rekey_seals_under_it_and_every_mac_reads_the_edit
         "the fresh epoch carries the Macs the batch may still wrap: {reads:?}"
     );
     PREFIX_BLIND.with(|cell| cell.set(true));
+    crate::membership_log::admission::OLD_GAP_RULE.with(|cell| cell.set(true));
     let (_, reads) = write_over_prefix();
+    crate::membership_log::admission::OLD_GAP_RULE.with(|cell| cell.set(false));
     PREFIX_BLIND.with(|cell| cell.set(false));
     log_entries::FRESH_OVER_PREFIX.with(|cell| cell.set(false));
     assert!(
@@ -1189,17 +1240,22 @@ fn a_removal_that_finds_the_audience_due_still_gets_its_grace() {
     );
 }
 
-/// Three concurrent Commons re-keys ([`rekey`]): m22's and m40's wrap every Mac, m7's leaves m43
-/// out, so the audience is due a re-key covering them, which its carriers rank for with no
-/// grace. B, a carrier ranked `k` >= 1, holds m22's and m7's at `t0`, and m40's, which arrives
-/// settled, at `t0` + 30 seconds; its passes run then and at each step to `t0` + `k` steps.
-/// Returns `k` and what each pass signed.
-fn settled_head(moves: bool) -> (usize, Vec<Vec<Record>>) {
+/// Three concurrent Commons re-keys ([`rekey`], [`rekey_to`]): m22's and m40's wrap the six
+/// Macs, m7's the six and S, a key no seat binds, so the heads differ and the audience is due a
+/// re-key covering them, which its carriers rank for with no grace. Every seat holds every head,
+/// so the heal has no gap to close (one-mesh M5: a head that omitted a seat would leave a gap one
+/// `Wrap` closes, after which the heads are twins and nothing is due). B, a carrier ranked
+/// `k` >= 1, holds m22's and m7's at `t0`, and m40's, which arrives settled, at `t0` + 30
+/// seconds; its passes run then and at each step to `t0` + `k` steps. Returns `k`, what each
+/// pass signed and S.
+fn settled_head(moves: bool) -> (usize, Vec<Vec<Record>>, Recipient) {
     let lab = six();
     let third = rekey(&lab.all[2], &EpochAudience::Commons, |_| true);
     let first = rekey(&lab.all[0], &EpochAudience::Commons, |_| true);
-    let left_out = lab.recipients[5];
-    let second = rekey(&lab.all[1], &EpochAudience::Commons, |r| *r != left_out);
+    let mut to: BTreeSet<Recipient> = lab.recipients.iter().copied().collect();
+    let seatless = key_above(to.last().expect("six Macs")).recipient();
+    to.insert(seatless);
+    let second = rekey_to(&lab.all[1], &EpochAudience::Commons, &to);
     let turn_of = |log: &Log, actor: &MemberId| {
         log.rekey_dues()
             .into_iter()
@@ -1241,17 +1297,18 @@ fn settled_head(moves: bool) -> (usize, Vec<Vec<Record>>) {
     }
     remove::HEADS_MOVE_RANKS.with(|cell| cell.set(false));
     lab.macs.server.stop();
-    (turn.rank, passes)
+    (turn.rank, passes, seatless)
 }
 
 /// A head that arrives settled moves no rank ([`settled_head`]): B signs nothing before its
-/// rank's step and mints the one covering Commons epoch at it.
+/// rank's step and mints the one covering Commons epoch at it, wrapped to the current seats and
+/// not to S, which no seat binds (one-mesh M1, M4).
 ///
 /// NEGATIVE CONTROL: with `remove::HEADS_MOVE_RANKS` (a head moves the ranks to when this Mac
 /// first saw it) the third head puts B's step 30 seconds later, and B signs nothing at it.
 #[test]
 fn a_head_that_arrives_settled_moves_no_rank() {
-    let (k, passes) = settled_head(false);
+    let (k, passes, seatless) = settled_head(false);
     let (last, waited) = passes.split_last().unwrap();
     assert!(
         waited.iter().all(Vec::is_empty),
@@ -1262,8 +1319,15 @@ fn a_head_that_arrives_settled_moves_no_rank() {
         BTreeMap::from([(EpochAudience::Commons, 1)]),
         "B mints at its rank's step {k}"
     );
+    assert!(
+        !last.iter().any(|record| matches!(
+            record.body(),
+            Body::Wrap { recipient, .. } if *recipient == seatless
+        )),
+        "B's covering epoch drops S: {last:?}"
+    );
 
-    let (_, passes) = settled_head(true);
+    let (_, passes, _) = settled_head(true);
     assert!(
         passes.iter().all(Vec::is_empty),
         "CONTROL: a head that moves the ranks puts B past its step: {passes:?}"
@@ -1440,28 +1504,34 @@ fn a_gap_on_a_batch_that_settles_late_is_closed_once() {
     );
 }
 
-/// The m4 shape with a Mac S that has no seat ([`m4_shape_with`]): A's batch wraps S last, so
-/// X's prefix lacks its `Wrap`, which only the rest of the batch says is coming or left out on
-/// purpose (a retirement). X waits for the batch [`log_entries::SETTLE_GRACE_MS`] from first
-/// sight, as for any prefix: where it arrives within the grace, X's one higher epoch wraps S
-/// with the seated Macs. Past the grace X re-keys over the prefix, carries the seated Macs in
-/// flight and leaves S out, as a removal's own rotation over it would: no record marks a
-/// batch's end, so a whole one reads as a prefix until its minter signs again
-/// ([`a_batch_that_ends_in_wraps_holds_a_removal_only_the_settle_grace`]).
+/// The m4 shape with a Mac S that has no seat ([`m4_shape_with`]), in a mixed lab: both
+/// removers carry as 0.154.0 did, so A's batch wraps S last and X's prefix lacks its `Wrap`,
+/// which only the rest of the batch says is coming or left out on purpose (a retirement). X
+/// waits for the batch [`log_entries::SETTLE_GRACE_MS`] from first sight, as for any prefix
+/// (one-mesh M5: the holds stay): where it arrives within the grace, X's one higher epoch wraps
+/// every seated Mac neither removal names and not S, which no seat binds and so is no member
+/// (M1, M4), however a 0.154.0 batch wrapped it. Past the grace X re-keys over the prefix,
+/// carries the seated Macs in flight and leaves S out: no record marks a batch's end, so a
+/// whole one reads as a prefix until its minter signs again
+/// ([`a_batch_that_ends_in_wraps_holds_a_removal_only_the_settle_grace`]). Under the current
+/// carry alone no batch wraps S at all, so it holds nothing: the hold matters only while a
+/// 0.154.0 Mac still mints.
 ///
-/// NEGATIVE CONTROL: with `remove::UNDECIDED_HOLDS` (the grace does not let the audience go
-/// while S is undecided, as before) X mints no `[everyone]` epoch at any step.
+/// NEGATIVE CONTROLS: with `remove::UNDECIDED_HOLDS` (the grace does not let the audience go
+/// while S is undecided, as before) X mints no `[everyone]` epoch at any step; with
+/// `log_entries::OLD_CARRY` on X's passes too (X a 0.154.0 Mac as well), X's epoch after the
+/// batch wraps S again.
 #[test]
 fn a_mac_with_no_seat_holds_the_rekey_only_the_settle_grace() {
     let grace = log_entries::SETTLE_GRACE_MS / GAP_STEP_MS;
     let (first, settled, r, seatless) = m4_shape_with(Some(5), true);
-    let seatless = seatless.unwrap();
+    assert!(seatless.is_some(), "the shape lets S into [everyone]");
     let settled = settled.expect("X re-keys once the batch settles");
     assert!(first.is_some_and(|k| k < grace), "signed at {first:?}");
     assert_eq!(
         settled,
-        BTreeSet::from([r[0], r[2], r[3], r[5], seatless]),
-        "X's epoch after the batch wraps S and every Mac neither removal names"
+        BTreeSet::from([r[0], r[2], r[3], r[5]]),
+        "X's epoch after the batch wraps every Mac neither removal names, and not S"
     );
 
     let (silent, past, r, seatless) = m4_shape_with(None, true);
@@ -1481,6 +1551,13 @@ fn a_mac_with_no_seat_holds_the_rekey_only_the_settle_grace() {
     assert_eq!(
         held, None,
         "CONTROL: an undecided hold mints no [everyone] epoch"
+    );
+
+    let (_, old, _, seatless) = as_0154(true, || m4_shape_with(Some(5), true));
+    assert!(
+        old.expect("a 0.154.0 X re-keys once the batch settles")
+            .contains(&seatless.unwrap()),
+        "CONTROL: the 0.154.0 carry keeps S"
     );
 }
 
@@ -1832,37 +1909,52 @@ fn m4_one_pass() -> (BTreeSet<Recipient>, Vec<Recipient>) {
     (wraps, r)
 }
 
-/// A tender pass that re-keys `[everyone]` and then Commons ([`m4_one_pass`]) reads what is in
-/// flight before its first mint: the Commons epoch carries `r3` and `r5`, whose `[everyone]`
-/// `Wrap`s A's batch may still bring.
+/// A tender pass that re-keys `[everyone]` and then Commons ([`m4_one_pass`]) carries every
+/// current seat into its Commons epoch: `r3` and `r5`, whose `[everyone]` `Wrap`s A's batch may
+/// still bring, as well as `r0` and `r2`. The tender feeds the current seats to the carry
+/// (one-mesh M1, M4), so the Commons epoch carries them even with
+/// `log_entries::FLIGHT_AFTER_MINT`, where Commons reads what is in flight after the pass's own
+/// `[everyone]` epoch and sees `r3` and `r5` as left out of `[everyone]`.
 ///
-/// NEGATIVE CONTROL: with `log_entries::FLIGHT_AFTER_MINT` Commons reads what is in flight after
-/// the pass's own `[everyone]` epoch, reads `r3` and `r5` as left out of `[everyone]`, and its
-/// epoch wraps only `r0` and `r2`.
+/// NEGATIVE CONTROL: with `log_entries::OLD_CARRY` and `log_entries::FLIGHT_AFTER_MINT`
+/// (0.154.0's carry, which drops a left-out seat nothing in flight may wrap) the Commons epoch
+/// wraps only `r0` and `r2`.
 #[test]
 fn a_tender_pass_reads_the_flight_before_its_first_mint_for_every_audience() {
     let (wraps, r) = m4_one_pass();
     assert_eq!(wraps, BTreeSet::from([r[0], r[2], r[3], r[5]]));
 
     log_entries::FLIGHT_AFTER_MINT.with(|cell| cell.set(true));
+    let (late, r) = m4_one_pass();
+    log_entries::FLIGHT_AFTER_MINT.with(|cell| cell.set(false));
+    assert_eq!(
+        late,
+        BTreeSet::from([r[0], r[2], r[3], r[5]]),
+        "read after the mint, Commons still carries every current seat"
+    );
+
+    log_entries::FLIGHT_AFTER_MINT.with(|cell| cell.set(true));
+    log_entries::OLD_CARRY.with(|cell| cell.set(true));
     let (narrowed, r) = m4_one_pass();
+    log_entries::OLD_CARRY.with(|cell| cell.set(false));
     log_entries::FLIGHT_AFTER_MINT.with(|cell| cell.set(false));
     assert_eq!(
         narrowed,
         BTreeSet::from([r[0], r[2]]),
-        "CONTROL: read after the mint, Commons narrows"
+        "CONTROL: the old carry, read after the mint, narrows Commons"
     );
 }
 
 /// A host list's shape over a prefix of `[everyone]` with a Mac with no seat. Of six Macs in
 /// recipient order `r0..r5`, m22 (an admin) lets a `[machines]`-only key S into `[everyone]` as
 /// `m99` (S sorts above every lab Mac) and publishes a ring of `r0`'s Mac X, `r4`'s and S. A
-/// (`r5`'s Mac, not in the ring) removes `r4`'s: its batch wraps `[everyone]` to S last and
-/// cannot rotate the ring, so the ring's one carrier, X, ranks first with no grace. X holds A's
-/// batch only through its `[everyone]` `Wrap` to `r2` ([`a_prefix`]) from step 0, and the rest of
-/// it from step `rest` if one is given. X's passes run at steps `0..=15`. Returns the step X
-/// re-keys the ring at, the recipients its epoch wraps, whether the ring's newest epochs wrap S
-/// after the last step, and S.
+/// (`r5`'s Mac, not in the ring) removes `r4`'s as a 0.154.0 Mac of a mixed lab does
+/// ([`as_0154`]; the current carry drops S from `[everyone]`, one-mesh M1, M4): its batch wraps
+/// `[everyone]` to S last and cannot rotate the ring, so the ring's one carrier, X, ranks first
+/// with no grace. X holds A's batch only through its `[everyone]` `Wrap` to `r2` ([`a_prefix`])
+/// from step 0, and the rest of it from step `rest` if one is given. X's passes run the current
+/// code at steps `0..=15`. Returns the step X re-keys the ring at, the recipients its epoch
+/// wraps, whether the ring's newest epochs wrap S after the last step, and S.
 fn ring_over_seatless_prefix(
     rest: Option<u64>,
 ) -> (Option<u64>, BTreeSet<Recipient>, bool, Recipient) {
@@ -1890,7 +1982,7 @@ fn ring_over_seatless_prefix(
         "CONTROL: the ring wraps S"
     );
     let (x, a) = (&lab.all[order[0]], &lab.all[order[5]]);
-    let chain = a_removes_r4(a, &r);
+    let chain = as_0154(true, || a_removes_r4(a, &r));
     let epoch = chain
         .iter()
         .find(|record| matches!(record.body(), Body::Epoch { .. }))
@@ -1933,6 +2025,9 @@ fn ring_over_seatless_prefix(
 /// ([`ring_over_seatless_prefix`]): X re-keys the ring once A's batch arrives, and its epoch
 /// keeps S. A batch that never settles holds the ring only the settle grace, after which X's
 /// epoch leaves S out, as a removal's own rotation over the prefix would.
+/// A host list keeps its own carry (one-mesh M5: the heal never wraps one), so this hold
+/// matters while a 0.154.0 Mac's `[everyone]` batch may still wrap S; an `[everyone]` epoch of
+/// the current carry never wraps S, and the ring's next re-key after it leaves S out.
 ///
 /// NEGATIVE CONTROL: with `remove::EVERYONE_UNREAD` (a re-key waits on its own audience's
 /// epochs alone, as before) X re-keys the ring from the prefix at its first pass, reads S as
@@ -1994,7 +2089,8 @@ struct ConvergenceShapes {
     /// m22's removal batch.
     rotation_chain: Vec<Record>,
     /// `Prefix` ([`m4_lab`]'s with S, a Mac with no seat): X removes `r1` and holds
-    /// [`a_prefix`] of A's removal of `r4`, which wraps S last.
+    /// [`a_prefix`] of A's removal of `r4`, which wraps S last: both removals signed with the
+    /// 0.154.0 carry of a mixed lab, X's passes the current tender's.
     prefix: Six,
     /// X's home.
     prefix_x: &'static str,
@@ -2066,8 +2162,9 @@ impl ConvergenceShapes {
         let settled = six();
         let third = rekey(&settled.all[2], &EpochAudience::Commons, |_| true);
         let first = rekey(&settled.all[0], &EpochAudience::Commons, |_| true);
-        let left_out = settled.recipients[5];
-        let second = rekey(&settled.all[1], &EpochAudience::Commons, |r| *r != left_out);
+        let mut to: BTreeSet<Recipient> = settled.recipients.iter().copied().collect();
+        to.insert(key_above(to.last().expect("six Macs")).recipient());
+        let second = rekey_to(&settled.all[1], &EpochAudience::Commons, &to);
         let turn_of = |log: &Log, actor: &MemberId| {
             log.rekey_dues()
                 .into_iter()

@@ -498,7 +498,7 @@ fn checks(run: &Run) -> Result<Before, Fail> {
          touched)"
     );
     let (iso, probe_text) = crate::probe::run_captured(&run.tag, true)?;
-    let _ = fs::write(run.run.join("probe.txt"), &probe_text);
+    let _ = crate::util::write_fresh(&run.run.join("probe.txt"), &probe_text);
     for l in probe_text.lines() {
         println!("  {l}");
     }

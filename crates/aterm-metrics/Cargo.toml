@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "ALab metrics on metrics.log: each Mac's own rows, their subjects and codecs, the log's retention, and the exact merge every fleet view reads"
+
+[dependencies]
+# The window summary every counter row carries (`summary::Summary`, `Window`, `Rollup`: the
+# reader that keeps one revision per identity, AS2) and the subject grammar the broker takes
+# (`subject::Subject`, `Filter`).
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+# `retention`: the rules `metrics.log` is retained by (`rules`), the classes the broker plans
+# its cut with, and `Keep::Last`, under which a relayed row at or below the subject's current
+# one is a duplicate (AS1's highest-sequence rows).
+astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["retention"] }
+
+[dev-dependencies]
+# The relay grammar a node's subjects travel under: every metrics subject's relay owner, and
+# the producer a relayed row of it must carry, is its node (`relay_owner`, `relay_producer_of`).
+astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
+# The deterministic generator the merge's property test draws samples and deliveries from.
+aterm-spec.workspace = true
+# A scratch folder for the broker the highest-sequence test opens.
+aterm-tempfile.workspace = true
+
+[lints]
+workspace = true

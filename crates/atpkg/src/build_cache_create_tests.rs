@@ -446,6 +446,111 @@ fn an_explicit_managed_producer_refuses_unknown_output_but_queries_and_defaults_
     );
 }
 
+/// The decision behind the front's hand-on of `verify provision`'s fish build
+/// (`registered::tests::the_front_hands_on_a_build_of_a_workspace_atpkg_never_manages`): a
+/// package in a scratch under `~/Library/Caches`, a folder of HOME atpkg never looks into, is
+/// never a workspace it manages, as one outside HOME is none, so a build run in it owes its
+/// explicit target (named again in `CARGO_TARGET_DIR`) no managed custody, and none is refused or
+/// claimed. A workspace atpkg manages owes it still: named through a link from there, read
+/// through the link as atpkg reads its workspace, or with its target there, where atpkg cannot
+/// keep one. A package in HOME itself is no managed workspace either.
+#[test]
+fn only_a_workspace_atpkg_manages_owes_custody_of_its_explicit_target() {
+    let world = World::new();
+    let scratch = world
+        .home
+        .join("Library/Caches/aterm/tooling.noindex/.provision-fish-1_0_0");
+    let src = scratch.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("Cargo.toml"),
+        "[package]\nname = \"fish\"\nversion = \"4.9.3\"\n",
+    )
+    .unwrap();
+    let target = scratch.join("target.noindex");
+    let named = target.clone().into_os_string();
+    let env = |name: &str| (name == "CARGO_TARGET_DIR").then(|| named.clone());
+    let machine = super::super::super::Machine {
+        home: Some(&world.home),
+        root: None,
+        cwd: Some(&src),
+        env: &env,
+        read: &|_| Ok(None),
+        writable: &|_| Some(true),
+    };
+    let build = |manifest: Option<&Path>| {
+        let mut args: Vec<String> = ["--unverified", "build", "--release"]
+            .map(String::from)
+            .into();
+        if let Some(manifest) = manifest {
+            args.extend(["--manifest-path".into(), manifest.display().to_string()]);
+        }
+        args.extend(["--target-dir".into(), target.display().to_string()]);
+        args
+    };
+    let decide = |args: &[String]| {
+        super::super::observe_for_producer(
+            args,
+            super::super::super::Tool::Targo,
+            &world.home,
+            &machine,
+            true,
+        )
+    };
+    let record = world
+        .home
+        .join(INDEX)
+        .join(format!("{}.json", key(&target).unwrap()));
+
+    assert!(
+        !decide(&build(None)).unwrap(),
+        "the package a build run in ~/Library finds is outside HOME cache custody"
+    );
+    assert!(
+        !target.exists() && !record.exists(),
+        "nothing is claimed for a build atpkg never manages"
+    );
+
+    std::os::unix::fs::symlink(&world.owner, scratch.join("linked")).unwrap();
+    assert!(
+        decide(&build(Some(&scratch.join("linked/Cargo.toml")))).is_err(),
+        "a managed workspace named through a link in ~/Library owes its explicit target custody"
+    );
+    assert!(
+        decide(&build(Some(&world.owner.join("Cargo.toml")))).is_err(),
+        "a managed workspace's explicit target in ~/Library is one atpkg cannot keep"
+    );
+    assert!(!target.exists() && !record.exists());
+
+    // HOME itself is no workspace atpkg manages either: a package there, built into a target
+    // directly in HOME, owes that target no custody.
+    let manifest = world.home.join("Cargo.toml");
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"home\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let in_home = world.home.join("t");
+    let args: Vec<String> = [
+        "--unverified".to_owned(),
+        "build".to_owned(),
+        "--manifest-path".to_owned(),
+        manifest.display().to_string(),
+        "--target-dir".to_owned(),
+        in_home.display().to_string(),
+    ]
+    .into();
+    assert!(
+        !decide(&args).unwrap(),
+        "a package in HOME itself is outside HOME cache custody"
+    );
+    let record = world
+        .home
+        .join(INDEX)
+        .join(format!("{}.json", key(&in_home).unwrap()));
+    assert!(!in_home.exists() && !record.exists());
+}
+
 /// What cargo writes into `CACHEDIR.TAG` as it makes a build directory itself (it writes none
 /// into a folder that stood before it was named), as cargo 1.47 onward and targo write it.
 const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\

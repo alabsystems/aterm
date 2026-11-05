@@ -1030,13 +1030,10 @@ pub fn live_without_shim_of(
             {
                 return None;
             }
-            crate::active_builds(layout).get(program).copied()?
+            crate::active_build_of(layout, program)?
         }
     };
-    if !crate::list_installed(layout)
-        .iter()
-        .any(|(p, b)| p == program && *b == build)
-    {
+    if !crate::ops::is_build_installed(layout, program, build) {
         return None;
     }
     let binary = crate::ops::tool_in_build(&layout.build_dir(program, build), &name)?;
@@ -1188,7 +1185,12 @@ struct TypedPass(bool);
 
 impl TypedPass {
     fn begin(name: &str) -> Self {
-        Self(tty_progress_path().is_some_and(|p| crate::progress::begin_pass(p, name)))
+        Self::on(tty_progress_path(), name)
+    }
+
+    /// A pass on `file`, where one is named.
+    fn on(file: Option<&std::path::Path>, name: &str) -> Self {
+        Self(file.is_some_and(|p| crate::progress::begin_pass(p, name)))
     }
 }
 
@@ -1879,7 +1881,7 @@ fn selfupdate_plan(
         Verdict::Help => return forward(Some(selfupdate::help_line(row))),
         Verdict::PassThrough => return forward(None),
         Verdict::Declined(d) => {
-            let active = crate::ops::active_builds(layout).get(row.program).copied();
+            let active = crate::ops::active_build_of(layout, row.program);
             return SelfUpdatePlan::Refuse(
                 match crate::alab::agent(row.program).filter(|_| {
                     !crate::alab::vendor_chosen(layout, row.program)
@@ -1894,7 +1896,7 @@ fn selfupdate_plan(
         Verdict::Check { .. } => {}
     }
     if !enabled {
-        let build = crate::ops::active_builds(layout).get(row.program).copied();
+        let build = crate::ops::active_build_of(layout, row.program);
         return SelfUpdatePlan::Disabled(selfupdate::disabled_line(row, build));
     }
     SelfUpdatePlan::Check { row }
@@ -1907,7 +1909,7 @@ fn selfupdate_check(
     bound: u64,
 ) -> ExitCode {
     use std::io::Write as _;
-    let active = crate::ops::active_builds(layout).get(row.program).copied();
+    let active = crate::ops::active_build_of(layout, row.program);
     let have = crate::vendor_direct::have_words(layout, row.program, active);
     if !crate::alab::vendor_chosen(layout, row.program)
         && active.is_some_and(|b| crate::alab::build_is_alab(layout, row.program, b))
@@ -1935,7 +1937,7 @@ fn selfupdate_check(
             return ExitCode::from(126);
         }
     };
-    let build = || crate::ops::active_builds(layout).get(row.program).copied();
+    let build = || crate::ops::active_build_of(layout, row.program);
     match status.code() {
         Some(0) => ExitCode::SUCCESS,
         Some(2) => ExitCode::from(2),
@@ -3321,7 +3323,7 @@ fn which_line_in(
             },
         );
     }
-    if let Some(build) = crate::active_builds(layout).get(tool).copied() {
+    if let Some(build) = crate::active_build_of(layout, tool) {
         let state = managed_state_of(layout, tool, build, row_of(tool).as_ref());
         let mut exposes = crate::installed_exposes(layout, tool).unwrap_or_default();
         exposes.sort();
@@ -4344,15 +4346,17 @@ fn program_disabled_here(
             .any(|tool| is_tombstone_shim(layout, tool))
 }
 
+pub(crate) fn is_tombstone_shim_body(body: &str) -> bool {
+    body.contains(" was yanked/revoked")
+}
+
 /// Whether `bin/<tool>` is a tombstone.
 pub(crate) fn is_tombstone_shim(layout: &crate::store::Layout, tool: &str) -> bool {
     let Some(tool) = crate::store::ToolName::new(tool) else {
         return false;
     };
-    let shim = layout.shim(&tool);
-    crate::platform::resolve_shim(&shim).is_none()
-        && crate::metadata_io::read_bounded_regular_utf8(&shim, crate::platform::MAX_SHIM_BYTES)
-            .is_ok_and(|body| body.contains(" was yanked/revoked"))
+    let read = crate::platform::read_shim(&layout.shim(&tool));
+    read.target.is_none() && read.body.as_deref().is_some_and(is_tombstone_shim_body)
 }
 
 fn run_list(layout: Option<crate::store::Layout>, human: bool) -> ExitCode {
@@ -5283,7 +5287,7 @@ fn failure_row(
     program: &str,
     state: String,
 ) -> crate::ProgramStatus {
-    let live = crate::active_builds(layout).get(program).copied();
+    let live = crate::active_build_of(layout, program);
     let recorded = crate::status::read(layout).and_then(|s| s.programs.get(program).cloned());
     crate::ProgramStatus {
         installed_build: live,
@@ -6689,11 +6693,9 @@ pub(crate) fn cache_plan_words(why: crate::build_cache::Unused) -> String {
     };
     match why {
         Unused::Requested => "explicit retirement of one registered ordinary cache".to_owned(),
-        Unused::Gone { idle, after } => format!(
-            "candidate for the whole folder: its workspace is gone and nothing wrote it for {} \
-             (age threshold {})",
-            days(idle),
-            days(after)
+        Unused::Gone { idle } => format!(
+            "candidate for the whole folder: its workspace is gone (nothing wrote it for {})",
+            days(idle)
         ),
         Unused::Idle { idle } => format!(
             "candidate for the whole folder: nothing wrote it for {}, a month or more",
@@ -6726,7 +6728,7 @@ pub(crate) fn cache_plan_words(why: crate::build_cache::Unused) -> String {
         Unused::Tooling { idle, after } => format!(
             "candidate for the whole tool folder: no use observed for {} (age threshold \
              {}; `targo --unverified verify provision` lays it again, with `--linux` for the \
-             Linux lane's rows and `--record` for wasm-bindgen)",
+             Linux lane's rows)",
             days(idle),
             days(after)
         ),
@@ -7747,7 +7749,9 @@ fn do_install_with_index(
     let anchor = (seams.anchor)(layout);
     let now = (seams.now)();
     let mut resolved_assets = std::collections::BTreeMap::new();
-    let typed = TypedPass::begin("install");
+    // On a person's meter's file or the one `--progress-file` named: aterm's startup deadline judges
+    // a worker's install by that file's work (aterm-gui's `harness_host::INSTALL_QUIET_LIMIT`).
+    let pass = TypedPass::on(seams.progress, "install");
     let result = match crate::vendor_direct::spec(program) {
         Some(spec) => {
             let owned = pre_resolved
@@ -7781,7 +7785,7 @@ fn do_install_with_index(
             &mut resolved_assets,
         ),
     };
-    drop(typed);
+    drop(pass);
     match &result {
         Ok(r) if r.vendor.is_some() => {}
         Ok(r) => {
@@ -8992,7 +8996,7 @@ impl ProbePackagesConfig {
                     return &self.cfg;
                 }
             };
-            if stamp.is_some() && std::fs::File::open(path).is_err() {
+            if stamp.is_some() && crate::platform::open_for_sync(path).is_err() {
                 self.cfg = crate::config::PackagesConfig::unreadable_table();
                 self.seen = None;
                 return &self.cfg;
@@ -12811,7 +12815,7 @@ fn record_vendor_status(
     let (program, vendor) = (outcome.spec.program, outcome.spec.vendor);
     let line = outcome.line();
     let said = line.strip_prefix("atpkg: ").unwrap_or(&line).to_string();
-    let active = crate::active_builds(layout).get(program).copied();
+    let active = crate::active_build_of(layout, program);
     let prior = crate::status::read(layout).and_then(|s| s.programs.get(program).cloned());
     let recorded = active.and_then(|b| {
         if crate::vendor_direct::is_vendor_build(b) {

@@ -507,14 +507,12 @@ pub fn merge(base: Vec<u8>, header: &Header, row: &Row) -> Result<Doc> {
         .get("artifact")
         .and_then(aterm_toml::Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    let field = |r: &aterm_toml::Value, k: &str| {
-        r.get(k)
-            .and_then(aterm_toml::Value::as_str)
-            .map(str::to_string)
-    };
+    fn field<'a>(r: &'a aterm_toml::Value, k: &str) -> Option<&'a str> {
+        r.get(k).and_then(aterm_toml::Value::as_str)
+    }
     if rows
         .iter()
-        .any(|r| field(r, "target").as_deref() == Some(row.triple.as_str()))
+        .any(|r| field(r, "target") == Some(row.triple.as_str()))
     {
         return Err(Error::refused(format!(
             "the merge base already carries an [[artifact]] row for {} — a duplicate leaves \
@@ -524,7 +522,7 @@ pub fn merge(base: Vec<u8>, header: &Header, row: &Row) -> Result<Doc> {
     }
     if rows
         .iter()
-        .any(|r| field(r, "asset").as_deref() == Some(row.asset.as_str()))
+        .any(|r| field(r, "asset") == Some(row.asset.as_str()))
     {
         return Err(Error::refused(format!(
             "the merge base already names asset `{}` — two rows, one file name: their \
@@ -680,14 +678,12 @@ pub fn merge_bottle(base: Vec<u8>, header: &Header, row: &BottleRow) -> Result<D
         .get("artifact")
         .and_then(aterm_toml::Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    let field = |r: &aterm_toml::Value, k: &str| {
-        r.get(k)
-            .and_then(aterm_toml::Value::as_str)
-            .map(str::to_string)
-    };
+    fn field<'a>(r: &'a aterm_toml::Value, k: &str) -> Option<&'a str> {
+        r.get(k).and_then(aterm_toml::Value::as_str)
+    }
     if rows
         .iter()
-        .any(|r| field(r, "target").as_deref() == Some(row.triple.as_str()))
+        .any(|r| field(r, "target") == Some(row.triple.as_str()))
     {
         return Err(Error::refused(format!(
             "the merge base already carries an [[artifact]] row for {} — a duplicate leaves \
@@ -697,7 +693,7 @@ pub fn merge_bottle(base: Vec<u8>, header: &Header, row: &BottleRow) -> Result<D
     }
     if rows
         .iter()
-        .any(|r| field(r, "asset").as_deref() == Some(row.asset.as_str()))
+        .any(|r| field(r, "asset") == Some(row.asset.as_str()))
     {
         return Err(Error::refused(format!(
             "the merge base already names asset `{}` — two rows, one file name: their \

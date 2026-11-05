@@ -3,19 +3,20 @@
 
 //! Integration test suite for `aterm-lexicon`.
 
-/// Webster's Second from the first place aterm_uds's `web2` row names that reads. It is a word
-/// list, not a program, so it is read where it lies rather than resolved as a runnable tool
-/// (which wants an execute bit macOS's mode-0444 copy has not).
+/// Webster's Second from the first of this host's places aterm_uds's `web2` row names that
+/// reads. It is a word list, not a program, so it is read where it lies rather than resolved
+/// as a runnable tool (which wants an execute bit macOS's mode-0444 copy has not).
 fn web2_words() -> String {
     let row = aterm_spec::host::tool("web2");
-    row.at
+    let places: Vec<&str> = row.places().collect();
+    places
         .iter()
         .find_map(|at| std::fs::read_to_string(at).ok())
         .unwrap_or_else(|| {
             aterm_spec::host::could_not_run(format!(
                 "the dictionary gates walk Webster's Second, the list their allowlists are \
                  curated against, and none reads here (looked at {}): {}",
-                row.at.join(" and "),
+                places.join(" and "),
                 row.remedy()
             ))
         })

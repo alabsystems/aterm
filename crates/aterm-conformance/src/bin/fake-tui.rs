@@ -267,7 +267,10 @@ mod shapes {
             }
         }
         let _ = stdout.flush();
-        let _ = std::fs::write(out, format!("{}\n", start.elapsed().as_micros()));
+        let _ = aterm_conformance::measure::write_fresh(
+            out,
+            format!("{}\n", start.elapsed().as_micros()),
+        );
     }
 
     /// Run the shape `args` name; `false` for anything else.

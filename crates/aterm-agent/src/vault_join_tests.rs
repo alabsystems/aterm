@@ -482,7 +482,9 @@ fn a_vault_join_over_the_fleets_channel_reaches_the_desk_only_as_the_channel_pro
     use aterm_secrets::commons::bootstrap::Device;
     let root = aterm_tempfile::tempdir().expect("scratch");
     let fresh = Paths::for_home(&root.path().join("m7-fresh"));
-    client::machine_identity(&fresh).expect("identity");
+    // A release build's identity: a lab identity proves to no fleet member
+    // ([`a_lab_identity_proves_itself_to_no_fleet_member`]).
+    client::machine_identity_as(&fresh, aterm_secrets::Making::default()).expect("identity");
     let device = Device::open(&fresh).expect("device").expect("an identity");
     let m7 = NodeIdentity::from_seed(&"07".repeat(16), &[7; 32]).expect("node");
     let joining = Joining {
@@ -605,4 +607,108 @@ fn a_vault_join_over_the_fleets_channel_reaches_the_desk_only_as_the_channel_pro
 fn an_unread_book_lets_no_seat_move() {
     assert_eq!(book_word_read(None, &[7; 32], None, 1), Book::default());
     assert!(book_word_read(Some(&[]), &[7; 32], None, 1).moved_seats_read);
+}
+
+/// A12: a lab identity (one this test binary makes) that follows no lab's vault proves itself to
+/// no fleet member: the fleet's members are the live ALab's, so `prove_over_fleet` refuses before
+/// it dials, and a loopback member records no connection. The same proof from an identity a
+/// release build made dials it: the pair shows the refusal bites.
+///
+/// NEGATIVE CONTROL: drop the `refuse_lab_identity_for_fleet` return in `prove_over_fleet`: the
+/// lab identity dials, and the loopback member hears it.
+#[test]
+fn a_lab_identity_proves_itself_to_no_fleet_member() {
+    use aterm_secrets::commons::bootstrap::Device;
+    let root = aterm_tempfile::tempdir().expect("scratch");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback member");
+    let port = listener.local_addr().expect("its address").port();
+    let (rang, rings) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+            if rang.send(()).is_err() {
+                break;
+            }
+        }
+    });
+    let peers = [(
+        "127.0.0.1".to_owned(),
+        Some(std::net::Ipv4Addr::LOCALHOST.into()),
+        port,
+    )];
+    let secret = FleetSecret::new(&mint_secret().unwrap()).unwrap();
+    let m7 = NodeIdentity::from_seed(&"07".repeat(16), &[7; 32]).expect("node");
+    let prove = |paths: &Paths| {
+        let device = Device::open(paths).expect("device").expect("an identity");
+        let joining = Joining {
+            records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
+            device: &device,
+            node: *m7.key().bytes(),
+            name: "m7".to_owned(),
+            model: "Mac15,3".to_owned(),
+        };
+        prove_over_fleet(paths, &joining, (&secret, &m7), &peers, None)
+    };
+
+    let lab = Paths::for_home(&root.path().join("m7-lab"));
+    client::machine_identity(&lab).expect("identity");
+    let missed = prove(&lab).expect_err("a lab identity is refused");
+    assert!(!missed.signed_maybe, "{missed:?}");
+    assert!(
+        missed.refused[0].1.contains(client::LAB_IDENTITY_REFUSAL),
+        "{missed:?}"
+    );
+    assert!(rings.try_recv().is_err(), "no member was dialed");
+
+    let release = Paths::for_home(&root.path().join("m7-release"));
+    client::machine_identity_as(&release, aterm_secrets::Making::default()).expect("identity");
+    let missed = prove(&release).expect_err("the loopback member hangs up");
+    assert!(
+        !missed.refused[0].1.contains(client::LAB_IDENTITY_REFUSAL),
+        "{missed:?}"
+    );
+    rings
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("a release identity dials the member");
+}
+
+/// A12: a member following the ALab vault is on the live genesis by the genesis this build
+/// compiles: this crate builds `aterm-secrets` apart from its own unit tests, which compile none,
+/// so this is where the real comparison runs. One following a lab's vault is not, and one whose
+/// vault config no read takes is, so a lab identity is refused rather than let in.
+///
+/// NEGATIVE CONTROL: `live_genesis_store` reading `false` for every store: the ALab member reads
+/// as off the live genesis.
+#[test]
+fn a_member_following_alabs_vault_is_on_the_live_genesis_and_a_labs_member_is_not() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = aterm_tempfile::tempdir().expect("scratch");
+    let following = |name: &str, vault: &str, signer: &str| {
+        let paths = Paths::for_home(&root.path().join(name));
+        std::fs::create_dir_all(&paths.dir).expect("vault folder");
+        std::fs::set_permissions(&paths.dir, std::fs::Permissions::from_mode(0o700))
+            .expect("private");
+        let source = paths.dir.join("source.toml");
+        std::fs::write(
+            &source,
+            format!(
+                "url = \"http://127.0.0.1:9/v1/{vault}\"\nname = \"{vault}\"\n\
+                 signer = \"{signer}\"\nhost = \"m9\"\n"
+            ),
+        )
+        .expect("source.toml");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).expect("private");
+        assert!(
+            client::config(&paths).expect("read").is_some(),
+            "{name} follows a vault"
+        );
+        (paths, source)
+    };
+    let (alab, _) = following("alab", "alab", aterm_secrets::ALAB_SIGNER);
+    assert!(client::on_live_genesis(&alab), "ALab's vault");
+    let lab_signer = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=";
+    let (lab, source) = following("lab", "lab", lab_signer);
+    assert!(!client::on_live_genesis(&lab), "a lab's vault");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    assert!(client::on_live_genesis(&lab), "a config no read takes");
 }

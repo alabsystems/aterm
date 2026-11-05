@@ -473,6 +473,62 @@ fn fake_path(tmp: &Path) -> PathBuf {
     atpkg::store::default_prefix(&tmp.join("home")).join("agents/claude")
 }
 
+/// The line that starts the relaunch fake in the tab's shell. These provider-free fixtures model
+/// an explicit unmanaged credential route, exported only inside this private shell. On a
+/// qualified native host the owned helper observes this route itself before account admission.
+fn relaunch_fake_line(tmp: &Path) -> String {
+    let quote = |path: &Path| {
+        aterm_agent::harness::upgrade::quote(
+            aterm_agent::harness::upgrade::Dialect::Bash,
+            &path.to_string_lossy(),
+        )
+    };
+    format!(
+        "export ANTHROPIC_API_KEY=aterm-host-live-standin ATERM_CLAUDE_FIXTURE_ROOT={}; cd {} && {} --model opus",
+        quote(tmp),
+        quote(&tmp.join("work")),
+        quote(&fake_path(tmp))
+    )
+}
+
+/// The interpreter the relaunch fakes run under: on macOS [`claude_image`], the test's own image,
+/// whose exec environment the harness reads to learn the agent's login (it reads none from a
+/// platform `/bin/sh`, and then treats the agent as the default stored login); `/bin/sh`
+/// elsewhere.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn relaunch_interpreter(inst: &Instance) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        claude_image(inst)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = inst;
+        PathBuf::from("/bin/sh")
+    }
+}
+
+/// A shell whose exec environment can be observed for legacy dispatch admission. The
+/// provider-free relaunch fixtures test resumption, while fabric's stored-login case
+/// separately holds the refusal when a platform shell supplies no environment. The fixture
+/// credential route is set at shell exec, because kernel attribution reads that initial environment.
+fn relaunch_shell(inst: &Instance) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let path = inst.tmp.join("shell/bash");
+        if !path.exists() {
+            std::fs::create_dir_all(path.parent().unwrap()).expect("the shell folder");
+            aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/bash"), &path);
+        }
+        path
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = inst;
+        PathBuf::from("/bin/bash")
+    }
+}
+
 fn place_fake(fake: &Path, text: &str) {
     headless_boot::standin(fake, text);
 }
@@ -601,6 +657,7 @@ fn write_world(tmp: &Path) {
         ),
         ("c1-opt2.txt", focus_on_option(&c1_field, "2. Blue")),
         ("c1-field.type", c1_field.clone()),
+        ("c1-field.txt", c1_field.clone()),
         ("c1-long.txt", typed_283(QUESTION_283_TYPED_LONG_TERM, long)),
         (
             "c3-opt1.txt",
@@ -1177,32 +1234,50 @@ fn under_long_term_a_person_s_text_is_handed_to_them_and_nothing_is_typed() {
 }
 
 #[test]
-fn a_policy_text_the_dialog_does_not_take_is_written_once_and_handed_over() {
-    let inst = boot("c", LONG_TERM_ON);
-    run_fake(
-        &inst,
-        "k1",
-        &[
-            "c1-opt1.txt",
-            "c1-opt2.txt",
-            "c1-field.type",
-            "c1-field.type",
-        ],
-    );
-    let text = text_read(QuestionPriority::LongTerm);
-    let said = escalated_after(&inst, "k1", "policy text", &["down", "down", &text], HANG);
-    assert!(said.contains("claude question"), "{said}");
-    assert_eq!(
-        ledger_rows(&inst, "answer-long-term@v1", "approved"),
-        Vec::<String>::new(),
-        "no approval for a text never read back"
-    );
-    assert_eq!(
-        ledger_rows(&inst, "answer-long-term@v1", "escalated").len(),
-        1,
-        "{}",
-        ledger(&inst)
-    );
+fn a_policy_text_the_dialog_does_not_take_is_written_once_then_recommended_is_taken() {
+    for (tag, priority) in [
+        ("cl", QuestionPriority::LongTerm),
+        ("cs", QuestionPriority::ShortTerm),
+    ] {
+        let config = format!("question_priority = \"{}\"\n", priority.word());
+        let inst = boot(tag, &config);
+        run_fake(
+            &inst,
+            "k1",
+            &[
+                "c1-opt1.txt",
+                "c1-opt2.txt",
+                "c1-field.type",
+                // Identical unchanged field, with the fake now reading navigation keys.
+                "c1-field.txt",
+                "c1-opt2.txt",
+                "c1-opt1.txt",
+                "worked.until",
+                "done.look",
+            ],
+        );
+        let text = text_read(priority);
+        keys_until(
+            &inst,
+            "k1",
+            &["down", "down", &text, "up", "up", "enter"],
+            HANG,
+        );
+        told_by_the_worker(&inst, priority.rule_id(), priority.word(), 1);
+        let approved = ledger_rows(&inst, priority.rule_id(), "approved");
+        assert!(approved[0].contains("recommended"), "{approved:?}");
+        assert_eq!(
+            ledger_rows(&inst, priority.rule_id(), "skipped").len(),
+            1,
+            "the unconfirmed text is not approved: {}",
+            ledger(&inst)
+        );
+        assert!(
+            ledger_rows(&inst, priority.rule_id(), "escalated").is_empty(),
+            "{}",
+            ledger(&inst)
+        );
+    }
 }
 
 #[test]
@@ -1484,13 +1559,19 @@ fn autopilot_off_keeps_the_hosts_hands_off_until_the_session_opts_in() {
 
 const CONVERSATION: &str = "0badf00d-1111-2222-3333-444455556666";
 
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn write_relaunch_fake(inst: &Instance) {
     std::fs::write(inst.tmp.join("sc/idle.txt"), bypass_start()).expect("idle screen");
     let fake = format!(
-        "#!/bin/sh\n\
+        "#!{interpreter}\n\
          case \"$1\" in --version) echo '2.1.281 (Claude Code)'; exit 0 ;; esac\n\
          tmp=${{HOME%/home}}\n\
          echo \"$$ $*\" >> \"$tmp/launches.log\"\n\
+         if [ -n \"${{ATERM_RESTART_ENV_PROBE+x}}\" ]; then\n\
+         \x20 outer=0; agent=0; helper=0\n\
+         \x20 case \"$ATERM_RESTART_ENV_PROBE\" in outer) outer=1 ;; agent) agent=1 ;; helper) helper=1 ;; esac\n\
+         \x20 printf '%s %s %s %s\\n' \"$$\" \"$outer\" \"$agent\" \"$helper\" >> \"$tmp/launch-env.log\"\n\
+         fi\n\
          stty -icanon -echo min 0 time 2 2>/dev/null\n\
          sid={CONVERSATION}; prev=\n\
          for a in \"$@\"; do [ \"$prev\" = --resume ] && sid=$a; prev=$a; done\n\
@@ -1516,9 +1597,15 @@ fn write_relaunch_fake(inst: &Instance) {
          \x20 \"$esc\"*) ;;\n\
          \x20 *) printf '\\033[%s;3H\\033[K[Pasted text #1]' \"$r\" ;;\n\
          \x20 esac\n\
-         done\n"
+         done\n",
+        interpreter = relaunch_interpreter(inst).display(),
     );
     place_fake(&fake_path(&inst.tmp), &fake);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_native_relaunch_fake(inst: &Instance) {
+    crate::native_claude::place(&inst.tmp, &fake_path(&inst.tmp), &bypass_start());
 }
 
 fn launches(inst: &Instance) -> Vec<(u32, String)> {
@@ -1620,16 +1707,40 @@ fn first_launch(inst: &Instance) -> Vec<(u32, String)> {
 
 #[test]
 fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
-    let inst = boot("r", "");
+    let inst = boot_on("r", "", 40, None, true, |root| {
+        vec![
+            ("ATERM_RESTART_ENV_PROBE", "outer".into()),
+            ("ATERM_CLAUDE_FIXTURE_ROOT", root.display().to_string()),
+        ]
+    });
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    write_native_relaunch_fake(&inst);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     write_relaunch_fake(&inst);
     let sel = format!("@{}", inst.sid);
-    let tmp = inst.tmp.display();
-    ctl_ok(&inst, &[&sel, "send", "/bin/bash --norc --noprofile -i"]);
+    let shell = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "/bin/bash --norc --noprofile -i".to_string()
+    } else {
+        format!(
+            "ANTHROPIC_API_KEY=aterm-host-live-standin '{}' --norc --noprofile -i",
+            relaunch_shell(&inst).display()
+        )
+    };
+    ctl_ok(&inst, &[&sel, "send", &shell]);
     ctl_ok(&inst, &[&sel, "key", "enter"]);
     program_is(&inst, "bash", HANG);
+    let quote = |path: &Path| {
+        aterm_agent::harness::upgrade::quote(
+            aterm_agent::harness::upgrade::Dialect::Bash,
+            &path.to_string_lossy(),
+        )
+    };
+    // The foreground shell exports `helper` after the first agent ends, before reading the
+    // relaunch command. Neither the app's nor the old agent's cached environment can pass.
     let line = format!(
-        "cd {tmp}/work && '{}' --model opus",
-        fake_path(&inst.tmp).display()
+        "cd {} && export ATERM_RESTART_ENV_PROBE=agent && {} --model opus; export ATERM_RESTART_ENV_PROBE=helper",
+        quote(&inst.tmp.join("work")),
+        quote(&fake_path(&inst.tmp)),
     );
     ctl_ok(&inst, &[&sel, "send", &line]);
     ctl_ok(&inst, &[&sel, "key", "enter"]);
@@ -1641,10 +1752,38 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
         |s| field(s, "supervisor").is_some_and(|v| v.starts_with("aterm-harness")),
     );
     let first = first_launch(&inst);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let context = atpkg::caller_shell::process_args(first[0].0)
+            .expect("the native fixture's actual execution context");
+        assert_eq!(
+            aterm_agent::harness::accounts::ProcessLogin::of_exec_env(&context.env)
+                .map(|who| who.stored_login),
+            Some(true),
+            "the native cold regression must exercise stored-login admission"
+        );
+    }
     assert_eq!(
         first.iter().map(|(_, a)| a.as_str()).collect::<Vec<_>>(),
         ["--model opus"],
         "{first:?}"
+    );
+    let first_environment = until(
+        HANG,
+        "the first agent's environment observation",
+        || std::fs::read_to_string(inst.tmp.join("launch-env.log")).unwrap_or_default(),
+        |rows| {
+            rows.lines().any(|line| {
+                line.split_once(' ').is_some_and(|(pid, flags)| {
+                    pid.parse::<u32>() == Ok(first[0].0) && flags.split_whitespace().count() == 3
+                })
+            })
+        },
+    );
+    assert_eq!(
+        first_environment,
+        format!("{} 0 1 0\n", first[0].0),
+        "the first agent observed the shell's export, not the app's environment"
     );
     until(
         HANG,
@@ -1663,6 +1802,13 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
         "the relaunch snapshot of the agent kept",
         || harness_lines(&inst),
         |l| l.contains(&kept),
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    until(
+        HANG,
+        "the native watch acknowledged before the crash",
+        || crate::native_claude::observed(&inst.tmp, &inst.sid, first[0].0).to_string(),
+        |bound| bound == "true",
     );
     std::fs::write(inst.tmp.join("die"), "").expect("crash");
     let deadline = Instant::now() + HANG;
@@ -1730,6 +1876,11 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
         "the continuation typed into the relaunched agent; record: {record}\nharness log:\n{}",
         harness_lines(&inst)
     );
+    assert_eq!(
+        exec_log(&inst, "launch-env.log"),
+        [(*old, "0 1 0".to_owned()), (*new, "0 0 1".to_owned())],
+        "the relaunched body observed the helper's execution environment, not either cached source"
+    );
 }
 
 /// The screen a resume draws over a conversation whose last act was the restart its own tool call
@@ -1764,12 +1915,13 @@ fn restored_screen(draft: &str) -> String {
 
 /// [`write_relaunch_fake`], its resumed process drawing the [`restored_screen`] until a line is
 /// typed into it, and holding `draft` in its composer until the `undraft` file stands.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn write_restarting_fake(inst: &Instance, draft: &str) {
     std::fs::write(inst.tmp.join("sc/idle.txt"), bypass_start()).expect("idle screen");
     std::fs::write(inst.tmp.join("sc/restored.txt"), restored_screen(draft)).expect("restored");
     std::fs::write(inst.tmp.join("sc/cleared.txt"), restored_screen("")).expect("cleared");
     let fake = format!(
-        "#!/bin/sh\n\
+        "#!{interpreter}\n\
          case \"$1\" in --version) echo '2.1.281 (Claude Code)'; exit 0 ;; esac\n\
          tmp=${{HOME%/home}}\n\
          echo \"$$ $*\" >> \"$tmp/launches.log\"\n\
@@ -1803,22 +1955,30 @@ fn write_restarting_fake(inst: &Instance, draft: &str) {
          \x20 esac\n\
          done\n",
         draft_len = draft.chars().count(),
+        interpreter = relaunch_interpreter(inst).display(),
     );
     place_fake(&fake_path(&inst.tmp), &fake);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_restarting_fake(inst: &Instance, draft: &str) {
+    write_native_relaunch_fake(inst);
+    std::fs::write(inst.tmp.join("sc/restored.txt"), restored_screen(draft)).expect("restored");
+    std::fs::write(inst.tmp.join("sc/cleared.txt"), restored_screen("")).expect("cleared");
 }
 
 /// The fake started in the tab, under a shell a relaunch can type at: its pid, for the `restart`
 /// the caller asks of it.
 fn start_the_fake(inst: &Instance) -> u32 {
     let sel = format!("@{}", inst.sid);
-    let tmp = inst.tmp.display();
-    ctl_ok(inst, &[&sel, "send", "/bin/bash --norc --noprofile -i"]);
+    let shell = format!(
+        "ANTHROPIC_API_KEY=aterm-host-live-standin '{}' --norc --noprofile -i",
+        relaunch_shell(inst).display()
+    );
+    ctl_ok(inst, &[&sel, "send", &shell]);
     ctl_ok(inst, &[&sel, "key", "enter"]);
     program_is(inst, "bash", HANG);
-    let line = format!(
-        "cd {tmp}/work && '{}' --model opus",
-        fake_path(&inst.tmp).display()
-    );
+    let line = relaunch_fake_line(&inst.tmp);
     ctl_ok(inst, &[&sel, "send", &line]);
     ctl_ok(inst, &[&sel, "key", "enter"]);
     program_is(inst, "claude", HANG);
@@ -1880,6 +2040,13 @@ fn restart_stands_ready(inst: &Instance, pid: u32) {
         "the host's hand on the session",
         || status(inst),
         |s| field(s, "supervisor").is_some_and(|v| v.starts_with("aterm-harness")),
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    until(
+        HANG,
+        "the native restart process has an acknowledged live watch",
+        || crate::native_claude::observed(&inst.tmp, &inst.sid, pid).to_string(),
+        |ready| ready == "true",
     );
 }
 
@@ -2175,6 +2342,67 @@ fn claude_image(inst: &Instance) -> PathBuf {
 
 #[cfg(target_os = "macos")]
 fn stage_upgrade_fake(inst: &Instance, version: &str, asked: bool) -> PathBuf {
+    stage_fake_under(inst, version, asked, "")
+}
+
+/// [`stage_upgrade_fake`] under the twin a store lays, whose prelude adds yolo to a line holding
+/// nothing it reads as typed. The prelude is the whole one an activation writes: a version probe
+/// pins no other body. The idle screen it leaves shows no permission pill, whose mode would be
+/// lent to a worker.
+#[cfg(target_os = "macos")]
+fn stage_yolo_fake(inst: &Instance, version: &str) -> PathBuf {
+    let mut prelude = atpkg::platform::twin_prelude(
+        "claude",
+        &atpkg::store::default_prefix(&inst.tmp.join("home")),
+        None,
+        atpkg::selfupdate::verbs_of("claude"),
+        &atpkg::yolo::policy_of("claude"),
+    );
+    prelude.push_str(&atpkg::launch_tap::sh_prelude("claude", None));
+    let staged = stage_fake_under(inst, version, false, &prelude);
+    for name in ["sc/idle.txt", "sc/idle.frame"] {
+        let path = inst.tmp.join(name);
+        let screen = std::fs::read_to_string(&path).expect("the idle screen");
+        let pill = "⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(screen.contains(pill), "the pill to take off: {screen}");
+        std::fs::write(&path, screen.replace(pill, "? for shortcuts")).expect("the idle screen");
+    }
+    staged
+}
+
+/// Runs `version`'s installed twin with `flags` on its line, under bash, until the host attaches,
+/// with `env` (`KEY=value `, or nothing) in front of it. `flags` reach the build as typed, so its
+/// first launch holds them alone.
+#[cfg(target_os = "macos")]
+fn run_on_the_twin(inst: &Instance, version: &str, env: &str, flags: &str) {
+    let sel = format!("@{}", inst.sid);
+    ctl_ok(inst, &[&sel, "send", "/bin/bash --norc --noprofile -i"]);
+    ctl_ok(inst, &[&sel, "key", "enter"]);
+    program_is(inst, "bash", HANG);
+    let line = format!(
+        "cd {}/work && {env}'{}' {flags}",
+        inst.tmp.display(),
+        fake_path(&inst.tmp).display()
+    );
+    ctl_ok(inst, &[&sel, "send", &line]);
+    ctl_ok(inst, &[&sel, "key", "enter"]);
+    program_is(inst, "claude", HANG);
+    until(
+        HANG,
+        "the host attached",
+        || status(inst),
+        |s| field(s, "supervisor").is_some_and(|v| v.starts_with("aterm-harness")),
+    );
+    let first = first_launch(inst);
+    assert_eq!(
+        first.iter().map(|(_, a)| a.as_str()).collect::<Vec<_>>(),
+        [format!("{version} {flags}")],
+        "{first:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn stage_fake_under(inst: &Instance, version: &str, asked: bool, prelude: &str) -> PathBuf {
     assert!(
         launches(inst).is_empty(),
         "{version} staged after a launch: {:?}",
@@ -2286,7 +2514,7 @@ fn stage_upgrade_fake(inst: &Instance, version: &str, asked: bool) -> PathBuf {
         &fake_path(&inst.tmp),
         &build,
         &atpkg::shim_env::ShimEnv::NONE,
-        "",
+        prelude,
     )
     .expect("the twin atpkg lays for the build");
     let staged = fake_path(&inst.tmp).with_file_name(format!("claude.{version}"));
@@ -2606,6 +2834,111 @@ fn a_session_nobody_asked_anything_is_restarted_afresh_with_nothing_typed() {
     );
     let typed = std::fs::read_to_string(inst.tmp.join("typed.log")).unwrap_or_default();
     assert!(typed.is_empty(), "typed into the agent: {typed:?}");
+}
+
+/// A session that runs with nothing on its line stays that way across an upgrade: the restart runs
+/// the new build the managed twin execs, not the twin, which would turn it yolo. The session starts
+/// on a twin with no prelude, the one way a bare line stays bare under this fake: run by the build's
+/// own path, its image is a shell, which cannot answer `--version` as a real build's image does.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_restart_with_nothing_on_its_line_stays_out_of_the_twins_yolo() {
+    let inst = boot_upgrade_on_the_shipped_clock("ybr", "relaunch = false\n", Some(SHORT_SETTLE_S));
+    let current = stage_upgrade_fake(&inst, "2.1.281", false);
+    let newer = stage_yolo_fake(&inst, "2.1.282");
+    install(&inst, &current);
+    run_on_the_twin(&inst, "2.1.281", "", "");
+    land(&inst, &newer);
+    let got = upgrade_until(
+        &inst,
+        Instant::now(),
+        || launches(&inst),
+        |got| got.len() >= 2,
+    );
+    assert_eq!(
+        got.get(1).map(|(_, args)| args.as_str()),
+        Some("2.1.282 "),
+        "the new build with nothing added: {got:?}\nharness log:\n{}\njournal:\n{}",
+        harness_lines(&inst),
+        journal(&inst)
+    );
+}
+
+/// The line of the worker `aterm ctl spawn` starts from outside any session, whose parent runs the
+/// yolo twin with `env` in front of it. The parent's `--model` reaches its build as typed, so it
+/// lends its worker no permission flag; the launch tap records what the worker's build was given.
+#[cfg(target_os = "macos")]
+fn worker_of_a_parent_on_the_twin(tag: &str, env: &str) -> String {
+    let inst = boot_on(tag, "relaunch = false\n", 40, None, true, |tmp| {
+        let agents = fake_path(tmp);
+        let agents = agents.parent().expect("agents/").display().to_string();
+        vec![
+            ("PATH", format!("{agents}:/usr/bin:/bin:/usr/sbin:/sbin")),
+            ("SHELL", "/bin/bash".to_string()),
+        ]
+    });
+    let current = stage_yolo_fake(&inst, "2.1.281");
+    install(&inst, &current);
+    run_on_the_twin(&inst, "2.1.281", env, "--model opus");
+    let sel = format!("@{}", inst.sid);
+    let mut spawn =
+        headless_boot::client_command(&inst, &[&sel, "spawn", "agent=claude", "raise=false", "-"]);
+    spawn.stdin(std::process::Stdio::piped());
+    let out = headless_boot::until_served(|| {
+        let mut child = spawn.spawn().expect("spawn aterm ctl");
+        let mut stdin = child.stdin.take().expect("its stdin");
+        std::io::Write::write_all(&mut stdin, b"the task").expect("write the task");
+        drop(stdin);
+        crate::child_output::wait_and_read(
+            child,
+            Instant::now() + headless_boot::CLIENT_EXIT_DEADLINE,
+        )
+        .expect("aterm ctl exits")
+    });
+    assert!(
+        out.status.success(),
+        "spawn: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let deadline = Instant::now() + HANG;
+    let got = loop {
+        let got = launches(&inst);
+        if got.len() >= 2 || Instant::now() >= deadline {
+            break got;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    match got.get(1) {
+        Some((_, args)) => args.clone(),
+        None => panic!(
+            "no worker launched: {got:?}\nharness log:\n{}\ninstance log:\n{}",
+            harness_lines(&inst),
+            std::fs::read_to_string(inst.tmp.join("state/logs/aterm.log")).unwrap_or_default()
+        ),
+    }
+}
+
+/// A worker whose parent names no mode starts at a Claude Code worker's floor (owner, 2026-11-04),
+/// on Anthropic's own route, and the twin leaves a named mode as typed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_whose_parent_names_no_mode_starts_at_the_floor() {
+    assert_eq!(
+        worker_of_a_parent_on_the_twin("ybf", ""),
+        "2.1.281 --permission-mode auto -- the task"
+    );
+}
+
+/// A parent whose requests leave Anthropic's API keeps its worker off that floor, so the worker's
+/// line holds nothing the twin reads as typed. It runs with its parent's permissions all the same
+/// (owner ruling 2026-11-02): the build the twin execs, not the twin, which would turn it yolo.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_gateway_worker_with_no_flags_stays_out_of_the_twins_yolo() {
+    assert_eq!(
+        worker_of_a_parent_on_the_twin("ybw", "ANTHROPIC_BASE_URL=https://gateway.invalid "),
+        "2.1.281 -- the task"
+    );
 }
 
 #[cfg(target_os = "macos")]

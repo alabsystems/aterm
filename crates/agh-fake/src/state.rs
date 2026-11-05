@@ -59,6 +59,8 @@ pub(crate) struct Repo {
     pub(crate) branches: BTreeMap<String, String>,
     /// Tag name to sha, in the order set.
     pub(crate) tags: Vec<(String, String)>,
+    /// Fully qualified refs outside the branch and tag namespaces.
+    pub(crate) other_refs: BTreeMap<String, String>,
     /// `(base, head)` to what the comparison answers.
     pub(crate) compares: Vec<(String, String, CompareSpec)>,
     /// What `releases/latest` answers.
@@ -99,6 +101,9 @@ impl Repo {
 
     /// Resolves a branch or tag name (or the default branch) to its commit SHA.
     pub(crate) fn resolve(&self, reference: &str) -> String {
+        if let Some(sha) = self.other_refs.get(reference) {
+            return sha.clone();
+        }
         if let Some(sha) = self.branches.get(reference) {
             return sha.clone();
         }
@@ -145,16 +150,20 @@ impl Repo {
         self.commits.iter().position(|c| c.sha == sha)
     }
 
-    /// Whether `sha` is a branch or tag head, or a commit `add_commit` gave.
+    /// Whether `sha` is a ref target or a commit `add_commit` gave.
     pub(crate) fn knows_sha(&self, sha: &str) -> bool {
         self.branches.values().any(|s| s == sha)
             || self.tags.iter().any(|(_, s)| s == sha)
+            || self.other_refs.values().any(|s| s == sha)
             || self.commits.iter().any(|c| c.sha == sha)
     }
 
     /// Whether the fake models any of this repository's git: a ref or a commit.
     pub(crate) fn models_git(&self) -> bool {
-        !self.branches.is_empty() || !self.tags.is_empty() || !self.commits.is_empty()
+        !self.branches.is_empty()
+            || !self.tags.is_empty()
+            || !self.other_refs.is_empty()
+            || !self.commits.is_empty()
     }
 
     /// The sha a release's `target_commitish` names: a branch's head, a sha the repository
@@ -174,20 +183,21 @@ impl Repo {
         None
     }
 
-    /// The sha `reference` (`refs/heads/…` or `refs/tags/…`) points at.
+    /// The OID a fully qualified `reference` points at.
     pub(crate) fn ref_sha(&self, reference: &str) -> Option<String> {
         if let Some(name) = reference.strip_prefix("refs/heads/") {
             return self.branches.get(name).cloned();
         }
-        let name = reference.strip_prefix("refs/tags/")?;
+        let Some(name) = reference.strip_prefix("refs/tags/") else {
+            return self.other_refs.get(reference).cloned();
+        };
         self.tags
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, s)| s.clone())
     }
 
-    /// Point `reference` (`refs/heads/…` or `refs/tags/…`) at `sha`; a reference of another
-    /// namespace, or with an empty name, changes nothing (callers check it first).
+    /// Point a fully qualified `reference` at `sha`; callers validate its name.
     pub(crate) fn set_ref(&mut self, reference: &str, sha: &str) {
         if let Some(name) = reference
             .strip_prefix("refs/heads/")
@@ -200,19 +210,27 @@ impl Repo {
         {
             self.tags.retain(|(n, _)| n != name);
             self.tags.push((name.to_string(), sha.to_string()));
+        } else if reference
+            .strip_prefix("refs/")
+            .is_some_and(|n| !n.is_empty())
+        {
+            self.other_refs
+                .insert(reference.to_string(), sha.to_string());
         }
     }
 
-    /// Remove `reference` (`refs/heads/…` or `refs/tags/…`).
+    /// Remove a fully qualified `reference`.
     pub(crate) fn delete_ref(&mut self, reference: &str) {
         if let Some(name) = reference.strip_prefix("refs/heads/") {
             self.branches.remove(name);
         } else if let Some(name) = reference.strip_prefix("refs/tags/") {
             self.tags.retain(|(n, _)| n != name);
+        } else {
+            self.other_refs.remove(reference);
         }
     }
 
-    /// Every ref, `refs/heads/…` and `refs/tags/…` with its sha, sorted.
+    /// Every fully qualified ref with its OID, sorted.
     pub(crate) fn refs(&self) -> Vec<(String, String)> {
         let mut refs: Vec<(String, String)> = self
             .branches
@@ -224,6 +242,11 @@ impl Repo {
                     .map(|(name, sha)| (format!("refs/tags/{name}"), sha.clone())),
             )
             .collect();
+        refs.extend(
+            self.other_refs
+                .iter()
+                .map(|(name, sha)| (name.clone(), sha.clone())),
+        );
         refs.sort();
         refs
     }
@@ -500,6 +523,7 @@ impl State {
             commits: Vec::new(),
             branches: BTreeMap::new(),
             tags: Vec::new(),
+            other_refs: BTreeMap::new(),
             compares: Vec::new(),
             latest: Latest::Auto,
         });

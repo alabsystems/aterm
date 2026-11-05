@@ -7,7 +7,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
+use aterm_agent::supervise::config::OwnerKeys;
+
 const UNDO_LIMIT: usize = 64;
+
+/// Why a write this service admits (Settings, Manual, `ctl settings`, an undo of one) that
+/// would move the owner's keys from the file's is refused ([`VersionedConfigService::patch`]).
+const OWNER_KEYS_REFUSED: &str = "aterm.toml's [harness] occupancy keys are the owner's: \
+     Settings never writes them; edit them in aterm.toml at the window yourself";
+
 /// Admission budget shared by startup, watcher reloads and Manual's semantic analysis.
 pub(crate) const MAX_CONFIG_FILE_BYTES: usize = atpkg::config::MAX_PACKAGES_CONFIG_BYTES;
 
@@ -654,6 +662,11 @@ impl VersionedConfigService {
             return ConfigPatchResult::Unchanged {
                 snapshot: self.snapshot(),
             };
+        }
+        // The owner's keys change only by a person at the window, in the file itself
+        // (`owner_keys_save`): no write admitted here moves them from the file's.
+        if OwnerKeys::of(&next) != OwnerKeys::of(&self.durable_text) {
+            return self.rejected(OWNER_KEYS_REFUSED);
         }
 
         // A rejected patch answers its writer (Settings, Manual, `ctl settings`); no log keeps it.
@@ -1401,7 +1414,7 @@ mod tests {
 
         let config_path = dir.join("aterm.toml");
         let fleet_path = dir.join(aterm_agent::ai::config::FLEET_FILE);
-        std::fs::write(&config_path, &text).unwrap();
+        crate::test_scratch::write_config(&config_path, &text);
         let observe = |service: &mut VersionedConfigService| {
             let observation = VersionedConfigService::observe_path(&config_path, false).unwrap();
             let mut prepared = VersionedConfigService::prepare_observation(
@@ -1415,7 +1428,7 @@ mod tests {
         let absent = observe(&mut service);
         assert_eq!(absent.config.ai.settings().preferred.0.id, "claude");
 
-        std::fs::write(&fleet_path, "schema = 1\npreferred = \"codex\"\n").unwrap();
+        crate::test_scratch::write_config(&fleet_path, "schema = 1\npreferred = \"codex\"\n");
         let resolved = observe(&mut service);
         assert_eq!(resolved.text, absent.text);
         assert_eq!(resolved.semantic_values, absent.semantic_values);
@@ -1600,7 +1613,7 @@ mod tests {
     fn observation_rejects_non_utf8_oversize_and_non_file_inputs() {
         let dir = unique_config_dir("observation-errors");
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, [0xff]).unwrap();
+        crate::test_scratch::write_config(&path, [0xff]);
         let utf8_error = VersionedConfigService::observe_path(&path, false).unwrap_err();
         assert!(utf8_error.contains("not valid UTF-8"), "{utf8_error}");
 
@@ -1627,19 +1640,19 @@ mod tests {
     fn reconciliation_gate_stays_closed_until_a_stable_valid_disk_generation_is_admitted() {
         let dir = unique_config_dir("reconciliation-gate");
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, "serious_mode = false\n").unwrap();
+        crate::test_scratch::write_config(&path, "serious_mode = false\n");
         let mut service = VersionedConfigService::load_path(&path).unwrap();
         service.mark_reconciliation_required();
         assert!(service.reconciliation_required());
 
-        std::fs::write(&path, "serious_mode = [\n").unwrap();
+        crate::test_scratch::write_config(&path, "serious_mode = [\n");
         assert!(service.synchronize_from_disk().is_err());
         assert!(
             service.reconciliation_required(),
             "a malformed observation cannot reopen structured persistence"
         );
 
-        std::fs::write(&path, "serious_mode = true\n").unwrap();
+        crate::test_scratch::write_config(&path, "serious_mode = true\n");
         let admitted = service.synchronize_from_disk().unwrap();
         assert!(!service.reconciliation_required());
         assert_eq!(
@@ -1658,7 +1671,7 @@ mod tests {
         let dir = unique_config_dir("unparsed-binding");
         let path = dir.join("aterm.toml");
         let malformed = "theme = [\n";
-        std::fs::write(&path, malformed).unwrap();
+        crate::test_scratch::write_config(&path, malformed);
         let observation = VersionedConfigService::observe_path(&path, false).unwrap();
         let mut service = VersionedConfigService::new(String::new()).unwrap();
         service
@@ -1697,8 +1710,8 @@ mod tests {
         let first = dir.join("first.toml");
         let second = dir.join("second.toml");
         let logical = dir.join("aterm.toml");
-        std::fs::write(&logical, "theme = \"Default\"\n").unwrap();
-        std::fs::write(&second, "theme = \"Dracula\"\n").unwrap();
+        crate::test_scratch::write_config(&logical, "theme = \"Default\"\n");
+        crate::test_scratch::write_config(&second, "theme = \"Dracula\"\n");
         let mut service = VersionedConfigService::load_path(&logical).unwrap();
         let base = service.snapshot().revision;
         let result = service.patch(edit(
@@ -2041,6 +2054,48 @@ mod tests {
         );
     }
 
+    /// No Settings write moves the owner's keys (root `[harness]`'s `occupancy`,
+    /// `occupancy_source` and `occupancy_rule`): a patch that would set, change or remove one is
+    /// refused and the text stays the file's, whichever key it names; the owner edits them in
+    /// aterm.toml at the window ([`crate::owner_keys_save`]). NEGATIVE CONTROL: another key of
+    /// the same table writes, and keeps the owner's keys as they were.
+    #[test]
+    fn a_settings_write_never_moves_the_owners_keys() {
+        let source = "[harness]\noccupancy = \"prompt\"\n";
+        let mut service = VersionedConfigService::new(source.into()).unwrap();
+        for (key, value) in [
+            ("harness.occupancy", Some("cruise")),
+            ("harness.occupancy", None),
+            ("harness.occupancy_source", Some("settings")),
+            ("harness.occupancy_rule", Some("always")),
+            ("harness", None),
+        ] {
+            let base = service.snapshot().revision;
+            let result = service.patch(edit(base, key, ExpectedValue::Any, value));
+            assert!(
+                matches!(
+                    &result,
+                    ConfigPatchResult::Rejected { message, .. } if message == OWNER_KEYS_REFUSED
+                ),
+                "{key} = {value:?}: {result:?}"
+            );
+            assert_eq!(&*service.snapshot().text, source, "{key} = {value:?}");
+        }
+
+        let base = service.snapshot().revision;
+        let result = service.patch(edit(
+            base,
+            "harness.dismiss_surveys",
+            ExpectedValue::Any,
+            Some("false"),
+        ));
+        let ConfigPatchResult::Applied { snapshot, .. } = result else {
+            panic!("another [harness] key writes: {result:?}");
+        };
+        assert_eq!(OwnerKeys::of(&snapshot.text), OwnerKeys::of(source));
+        assert_ne!(&*snapshot.text, source);
+    }
+
     #[test]
     fn a_value_the_key_already_holds_is_no_write() {
         let source = "font_px = 14  # projector\nbidi = \"disabled\"\n";
@@ -2309,11 +2364,10 @@ enabled = false
         assert_eq!(service.snapshot(), undone);
 
         let config_path = path.with_extension("toml");
-        std::fs::write(
+        crate::test_scratch::write_config(
             &config_path,
             format!("theme = \"Nord\"\ncursor_nyan_sprite = {second_source:?}\n"),
-        )
-        .unwrap();
+        );
         let observation = VersionedConfigService::observe_path(&config_path, false).unwrap();
         let prepared = VersionedConfigService::prepare_observation(
             observation,
@@ -2335,7 +2389,7 @@ enabled = false
         assert!(matches!(rejected_reset, ConfigPatchResult::Rejected { .. }));
         assert_eq!(service.snapshot(), source_changed);
 
-        std::fs::write(&config_path, "theme = \"Nord\"\n").unwrap();
+        crate::test_scratch::write_config(&config_path, "theme = \"Nord\"\n");
         let observation = VersionedConfigService::observe_path(&config_path, false).unwrap();
         let prepared = VersionedConfigService::prepare_observation(
             observation,

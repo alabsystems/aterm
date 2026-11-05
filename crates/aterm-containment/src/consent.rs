@@ -278,6 +278,10 @@ pub fn probe_fda(gate: ProbeGate) -> FdaProbe {
 /// The hidden verb `aterm __tcc-open <path>` ([`run_open_probe_verb`]).
 pub const OPEN_PROBE_VERB: &str = "__tcc-open";
 
+/// The one line [`run_open_probe_verb`] writes to stderr, before it exits 1, when it is not
+/// given one path on macOS.
+pub const OPEN_PROBE_REFUSAL: &str = "aterm __tcc-open: one path, on macOS";
+
 #[cfg(target_os = "macos")]
 const OPEN_PROBE_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -345,7 +349,7 @@ pub fn run_open_probe_verb(args: &[std::ffi::OsString]) -> std::process::ExitCod
         return std::process::ExitCode::SUCCESS;
     }
     let _ = args;
-    eprintln!("aterm {OPEN_PROBE_VERB}: one path, on macOS");
+    eprintln!("{OPEN_PROBE_REFUSAL}");
     std::process::ExitCode::FAILURE
 }
 
@@ -5225,7 +5229,7 @@ mod tests {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .write(true)
-            .custom_flags(libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(gate)
             .and_then(|mut gate| gate.write_all(format!("{said}\n").as_bytes()))
     }

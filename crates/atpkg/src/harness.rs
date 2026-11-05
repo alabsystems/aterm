@@ -192,8 +192,8 @@ fn local_build_manifest(
     }
     let entry = std::path::Path::new("bin").join(command);
     let exe_path = root.join(&entry);
-    let meta = std::fs::symlink_metadata(&exe_path).ok()?;
-    if !meta.file_type().is_file() || crate::platform::is_reparse(&meta) || meta.len() == 0 {
+    let (exe_file, meta) = crate::metadata_io::open_regular_with_meta(&exe_path).ok()?;
+    if meta.len() == 0 {
         return None;
     }
     if let Some(executables) = v.get("executables") {
@@ -206,7 +206,7 @@ fn local_build_manifest(
         if exe.get("path").and_then(aterm_json::Value::as_str) != Some(expected_path.as_str())
             || size != meta.len()
             || !hex_len(sha256, 64)
-            || crate::sha256_file(&exe_path).ok().as_deref() != Some(sha256)
+            || crate::tree::sha256_opened(exe_file).ok().as_deref() != Some(sha256)
         {
             return None;
         }

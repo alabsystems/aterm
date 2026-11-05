@@ -32,16 +32,16 @@ use crate::supervise::classify::{
 };
 
 /// Rule identifier for the read-only Bash classifier approval rule.
-pub const RULE_READ_ONLY: &str = "read-only@classify-v11";
+pub const RULE_READ_ONLY: &str = "read-only@classify-v12";
 /// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note
 /// (`This command requires approval`).
-pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v6";
+pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v7";
 /// The rm circuit-breaker rule's id; it does not run [`proof_gaps_clear`], whose assignments the
 /// rm resolver follows.
 pub const RULE_RM_BREAKER: &str = "rm-breaker@v10";
 /// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a
 /// command that names no rm.
-pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v11";
+pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v12";
 /// The rm circuit breaker the safe rules could not prove, approved with a warning under
 /// `approve = "safe"` ([`rm_breaker_warn`]).
 pub const RULE_RM_BREAKER_WARN: &str = "rm-breaker-warn@v1";
@@ -85,7 +85,7 @@ pub const RULE_CHROME_INTRO: &str = "chrome-intro@v1";
 /// `aterm harness disk` ([`crate::harness::disk::fence::runs_harness_disk`]) is approved under
 /// it, and every other permission box the worker raises is declined under it, with
 /// [`DISK_WORKER_DECLINE`] or, for such a Bash box that a proof did not hold for, why not.
-pub const RULE_DISK_WORKER: &str = "disk-worker@v3";
+pub const RULE_DISK_WORKER: &str = "disk-worker@v4";
 
 /// What [`RULE_DISK_WORKER`] types into a disk-free worker's refusal of a command that is not a
 /// read nor `aterm harness disk` or a System State read, and of every other tool's box.
@@ -130,13 +130,17 @@ const READ_RULES: &[&str] = &[
 ];
 
 /// A credit-claim worker's fence ([`ApprovalCtx::claim_worker`],
-/// [`crate::harness::credit_offers`]): its questions go to a person whatever `answer_questions`
-/// says; a Claude in Chrome action keeps the rules' approval only where it presses the box's
+/// [`crate::harness::credit_offers`]): its questions are declined on the dialog's own Esc, never
+/// handed to a person, whatever `answer_questions` says ([`CLAIM_WORKER_QUESTION`]); a Claude in
+/// Chrome action keeps the rules' approval only where it presses the box's
 /// one-shot allow (never the site-wide grant for the session) on a page
 /// [`crate::harness::credit_offers::claim_page`] admits; a Claude in Chrome tool's own Tool box
 /// ([`crate::harness::credit_offers::CHROME_TOOL`]) is decided as for every session; every other
-/// tool box is declined ([`CLAIM_WORKER_TOOLS`]). Under `approve = "none"` every permission box
-/// stays the owner's.
+/// tool box is declined ([`CLAIM_WORKER_TOOLS`]), a Bash box among them: the worker starts with
+/// no built-in tool but `ToolSearch` ([`crate::harness::credit_offers::CLAIM_TOOLS`]). A box it
+/// declines that has no `No` to amend (Claude in Chrome's own) is refused on its own Esc
+/// ([`CLAIM_WORKER_ESC`]), never handed to a person. Under `approve = "none"` every permission
+/// box stays the owner's.
 pub const RULE_CLAIM_WORKER: &str = "claim-worker@v1";
 
 /// Why [`RULE_CLAIM_WORKER`] declines a claim worker's box of a tool other than Claude in
@@ -145,14 +149,18 @@ pub const CLAIM_WORKER_TOOLS: &str = "aterm's credit-claim worker uses only its 
                                       tools, on the vendor's claim pages";
 
 /// What [`RULE_CLAIM_WORKER`]'s refusal tells the worker to do, of a tool's box and a page off
-/// its claim alike.
+/// its claim alike: the claim task's own ending where it cannot go on
+/// ([`crate::harness::credit_offers::claim_task`]), a failed conclusion, never a defense.
 pub const CLAIM_WORKER_FIX: &str = "Go on without it on the claim page, or end with one reply \
-                                    starting `Nothing left: NOT CLAIMED:` and why";
+                                    whose first line is `Could not finish: NOT CLAIMED:` and \
+                                    why, with no `Nothing left:` line";
 
 /// A question dialog answered under the priority word `long-term` ([`QuestionPriority::LongTerm`]).
 pub const RULE_ANSWER_LONG_TERM: &str = "answer-long-term@v1";
 /// The same under `short-term` ([`super::question::SHORT_TERM_TEXT`]).
 pub const RULE_ANSWER_SHORT_TERM: &str = "answer-short-term@v1";
+/// A question dialog answered under Autopilot Land ([`QuestionPriority::Land`]).
+pub const RULE_ANSWER_LAND: &str = "answer-land@v1";
 /// A prose question answered under `long-term` with its policy text instead of
 /// `[harness] answer_text`.
 pub const RULE_PROSE_LONG_TERM: &str = "prose-long-term@v1";
@@ -166,15 +174,26 @@ pub enum QuestionPriority {
     Recommended,
     LongTerm,
     ShortTerm,
+    /// Autopilot Land's: never a word a person sets; the approval loop takes it for a session
+    /// whose Autopilot is Land.
+    Land,
 }
 
 impl QuestionPriority {
-    /// Every priority, in [`Self::WORDS`]' order.
+    /// The three a person sets, in [`Self::WORDS`]' order.
     pub const ALL: [Self; 3] = [Self::Recommended, Self::LongTerm, Self::ShortTerm];
     /// The words the config key and the session word spell them with, in [`Self::ALL`]'s order.
     pub const WORDS: [&'static str; 3] = ["recommended", "long-term", "short-term"];
+    /// Every priority: [`Self::ALL`] and [`Self::Land`].
+    pub const EVERY: [Self; 4] = [
+        Self::Recommended,
+        Self::LongTerm,
+        Self::ShortTerm,
+        Self::Land,
+    ];
 
-    /// The priority `word` names, or `None` for any other text.
+    /// The priority `word` names, or `None` for any other text (`land` included: no person
+    /// sets it).
     #[must_use]
     pub fn parse(word: &str) -> Option<Self> {
         let word = word.trim();
@@ -183,13 +202,20 @@ impl QuestionPriority {
             .find(|p| p.word().eq_ignore_ascii_case(word))
     }
 
-    /// Its word: `recommended`, `long-term`, `short-term`.
+    /// The priority a box's facts or a tape name by its [`Self::word`], `land` included.
+    #[must_use]
+    pub fn of_fact(word: &str) -> Option<Self> {
+        Self::EVERY.into_iter().find(|p| p.word() == word)
+    }
+
+    /// Its word: `recommended`, `long-term`, `short-term`, `land`.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
             Self::Recommended => Self::WORDS[0],
             Self::LongTerm => Self::WORDS[1],
             Self::ShortTerm => Self::WORDS[2],
+            Self::Land => "land",
         }
     }
 
@@ -200,14 +226,17 @@ impl QuestionPriority {
             Self::Recommended => super::question::RULE_ANSWER_RECOMMENDED,
             Self::LongTerm => RULE_ANSWER_LONG_TERM,
             Self::ShortTerm => RULE_ANSWER_SHORT_TERM,
+            Self::Land => RULE_ANSWER_LAND,
         }
     }
 
-    /// The rule a prose question answered under it is ledgered as.
+    /// The rule a prose question answered under it is ledgered as. Land's prose is
+    /// [`super::turn_end::LAND_ANSWER`], which `words_act` types without this priority; its
+    /// arm is the plain answer, no land act.
     #[must_use]
     pub const fn prose_rule_id(self) -> &'static str {
         match self {
-            Self::Recommended => super::turn_end::RULE_ANSWER,
+            Self::Recommended | Self::Land => super::turn_end::RULE_ANSWER,
             Self::LongTerm => RULE_PROSE_LONG_TERM,
             Self::ShortTerm => RULE_PROSE_SHORT_TERM,
         }
@@ -220,6 +249,7 @@ impl QuestionPriority {
             Self::Recommended => None,
             Self::LongTerm => Some(super::question::LONG_TERM_TEXT),
             Self::ShortTerm => Some(super::question::SHORT_TERM_TEXT),
+            Self::Land => Some(super::question::LAND_TEXT),
         }
     }
 }
@@ -485,6 +515,8 @@ pub struct ApprovalCtx {
     pub python_allow: Vec<String>,
     pub question_priority: QuestionPriority,
     pub question_own: Option<QuestionPriority>,
+    /// A person gave input since the loop's first policy text on this dialog.
+    pub question_person: bool,
     pub screen_cols: u16,
     pub screen_rows: usize,
     pub question_fell_back: bool,
@@ -553,6 +585,7 @@ impl ApprovalCtx {
             python_allow: Vec::new(),
             question_priority: defaults.question_priority,
             question_own: None,
+            question_person: false,
             screen_cols: 0,
             screen_rows: 0,
             question_fell_back: false,
@@ -855,7 +888,10 @@ fn decide_box(
             disk_fence(reading, rows, ctx, decided.clone()),
         )
     } else if ctx.claim_worker {
-        ("claim-worker", claim_fence(reading, ctx, decided.clone()))
+        (
+            "claim-worker",
+            claim_fence(reading, rows, ctx, decided.clone()),
+        )
     } else {
         return decided;
     };
@@ -868,31 +904,32 @@ fn decide_box(
 }
 
 /// [`RULE_CLAIM_WORKER`]'s fence over `decided`, what the rules made of a credit-claim worker's
-/// box. A question is handed to a person, never answered, whatever `answer_questions` and
-/// `approve` say: the worker's task asks none, and nobody chose for the person what one asks.
+/// box. A question is declined, never answered and never handed to a person, whatever
+/// `answer_questions` and `approve` say ([`claim_question`]): the worker's task asks none, and
+/// nobody chose for the person what one asks.
 /// Of a tool box ([`fenced`]) under `approve = "none"`, the owner's decision stands. A Claude in
 /// Chrome action ([`PromptKind::Browser`]) keeps an approval only where it presses the box's
 /// one-shot allow on a page [`crate::harness::credit_offers::claim_page`] admits
 /// ([`claim_action`]); a refusal pressed or a hand-off the rules made stands. A Claude in Chrome
 /// tool's Tool box ([`crate::harness::credit_offers::CHROME_TOOL`]: its reads and navigation; its
 /// site actions raise the browser box) is decided as for every session. Every other tool box is
-/// declined on its `No`. A box with no `No` to amend (Claude in Chrome's own has `Deny` and no
-/// amend), or one the reader does not vouch for, is handed to a person, as nothing is pressed on
+/// declined on its `No`. A box the fence declines that has no `No` to amend (Claude in Chrome's
+/// own has `Deny (esc)` and no amend) is refused on its own Esc ([`claim_esc`]), so no person is
+/// asked and the worker goes on from its task; only one the reader does not vouch for, or one
+/// with neither a `No` nor an Esc that refuses, is handed to a person, as nothing is pressed on
 /// it ([`disk_fence`]'s rule).
-fn claim_fence(reading: &Reading, ctx: &ApprovalCtx, decided: Decision) -> Decision {
+fn claim_fence(
+    reading: &Reading,
+    rows: &[String],
+    ctx: &ApprovalCtx,
+    decided: Decision,
+) -> Decision {
     use crate::harness::credit_offers;
     let Some(p) = reading.prompt.as_ref() else {
         return decided;
     };
     if p.kind == PromptKind::Question {
-        return match decided {
-            Decision::Escalate { .. } => decided,
-            answered => Decision::escalate(format!(
-                "a credit-claim worker's question is the person's to answer: its fence \
-                 ({RULE_CLAIM_WORKER}) answers none ({})",
-                said(&answered)
-            )),
-        };
+        return claim_question(reading, p, rows, decided);
     }
     if !fenced(p.kind) || ctx.approve == Approve::None {
         return decided;
@@ -916,12 +953,21 @@ fn claim_fence(reading: &Reading, ctx: &ApprovalCtx, decided: Decision) -> Decis
         } else {
             p.command.as_str()
         };
+        let subject = format!("{} box: {shown}", p.kind.name());
         decline(
             RULE_CLAIM_WORKER,
             p,
             decline_text(what, why, CLAIM_WORKER_FIX),
-            format!("{} box: {shown}", p.kind.name()),
+            subject.clone(),
         )
+        .or_else(|no| {
+            claim_esc(
+                p,
+                rows,
+                &format!("{subject}{SUBJECT_OPTION}{CLAIM_WORKER_ESC}"),
+            )
+            .map_err(|esc| format!("{no}, and {esc}"))
+        })
         .unwrap_or_else(|not| not_declined(&not))
     };
     match p.kind {
@@ -937,6 +983,78 @@ fn claim_fence(reading: &Reading, ctx: &ApprovalCtx, decided: Decision) -> Decis
         PromptKind::Tool if p.command.starts_with(credit_offers::CHROME_TOOL) => decided,
         _ => refused("this tool call", CLAIM_WORKER_TOOLS),
     }
+}
+
+/// What [`RULE_CLAIM_WORKER`]'s refusal of a claim worker's box with no `No` to amend says it
+/// pressed: Claude in Chrome's own box (`Deny (esc)`), whose refusal takes no words.
+pub const CLAIM_WORKER_ESC: &str = "Esc, the box's own refusal: aterm's credit-claim worker \
+                                    does not take this action";
+
+/// [`RULE_CLAIM_WORKER`]'s press of `p`'s own `Esc` refusal ([`aterm_phase::prompt::CancelEffect::Reject`]),
+/// on its focused row, guarded by that row, for a box or dialog the fence declines that has no
+/// `No` to amend: a question, or Claude in Chrome's box (`Deny (esc)`). It types nothing.
+/// `Err`: the box reads no `Esc` that refuses, or no focused row is on the rows read, and nothing
+/// is pressed.
+fn claim_esc(p: &PromptV2, rows: &[String], subject: &str) -> Result<Decision, String> {
+    if !p
+        .cancel
+        .as_ref()
+        .is_some_and(|c| c.effect == aterm_phase::prompt::CancelEffect::Reject)
+    {
+        return Err("it reads no `Esc` that refuses it".to_string());
+    }
+    let Some((focused, row)) = p
+        .focused()
+        .and_then(|o| rows.get(o.row).map(|row| (o, row)))
+    else {
+        return Err("no focused row is on the rows read".to_string());
+    };
+    Ok(Decision::Approve {
+        rule_id: RULE_CLAIM_WORKER,
+        choice: Choice::FocusKey {
+            steps: 0,
+            label: focused.label.clone(),
+            key: "esc",
+        },
+        guard: row_guard(row),
+        subject: subject.to_string(),
+        unproven: None,
+    })
+}
+
+/// What [`RULE_CLAIM_WORKER`]'s decline of a claim worker's question says it pressed.
+pub const CLAIM_WORKER_QUESTION: &str = "Esc, the whole dialog declined with nothing chosen: \
+                                         aterm's credit-claim worker asks no question";
+
+/// [`RULE_CLAIM_WORKER`]'s decline of a claim worker's question `p`, whatever the rules made of
+/// it (`decided`): the dialog's own `Esc to cancel`, which declines the whole dialog with nothing
+/// chosen (measured, `docs/measured/claude-code-dialogs-2026-09-24.md`), pressed on the focused
+/// row. The worker's task asks no question and says how it ends, so the worker goes on from its
+/// task and Autopilot Land's next act, and no person is asked. A question dialog has no `No` to
+/// type a refusal into, and only a policy's own fixed text is ever written into one, so the
+/// decline types nothing ([`claim_esc`]). Where the reader does not vouch for the dialog, or it
+/// reads no `Esc` that cancels or no focused row, nothing is pressed and it is handed over, as an
+/// unread box is.
+fn claim_question(reading: &Reading, p: &PromptV2, rows: &[String], decided: Decision) -> Decision {
+    let not_declined = |not: &str| {
+        Decision::escalate(format!(
+            "a credit-claim worker's question, which its fence ({RULE_CLAIM_WORKER}) declines, \
+             was not declined: {not} ({})",
+            said(&decided)
+        ))
+    };
+    if !draws_claude_boxes(reading.program)
+        || reading.phase != Phase::Prompt
+        || !reading.phase_authoritative
+    {
+        return not_declined("no box the reader vouches for");
+    }
+    claim_esc(
+        p,
+        rows,
+        &format!("{}{SUBJECT_OPTION}{CLAIM_WORKER_QUESTION}", p.title),
+    )
+    .unwrap_or_else(|not| not_declined(&not))
 }
 
 /// Why the Claude in Chrome box `p`, approved with `choice`, is no action of a claim worker's
@@ -1222,7 +1340,7 @@ fn decide_unfenced(
                 rows,
                 ctx.question_priority,
                 ctx.question_own,
-                ctx.question_fell_back,
+                (ctx.question_fell_back, ctx.question_person),
                 pane,
             )
         } else {
@@ -2224,12 +2342,15 @@ fn reading_name(line: &str) -> &'static str {
     }
 }
 
+/// `Ok` when the Bash tool's shell may not be zsh, or every reading is a plain zsh line
+/// ([`plain_zsh_line`]), held to `EXTENDED_GLOB`'s operators where the startup may set it
+/// ([`ShellStartup::may_extended_glob`]).
 fn plain_under_zsh(readings: &[String], ctx: &ApprovalCtx) -> Result<(), String> {
-    if !ctx.shell.as_ref().is_ok_and(ShellStartup::may_run_zsh) {
+    let Some(shell) = ctx.shell.as_ref().ok().filter(|s| s.may_run_zsh()) else {
         return Ok(());
-    }
+    };
     for line in readings {
-        plain_zsh_line(line)
+        plain_zsh_line(line, shell.may_extended_glob())
             .map_err(|why| format!("not a plain line under zsh ({}): {why}", reading_name(line)))?;
     }
     Ok(())
@@ -2487,7 +2608,14 @@ fn readings_read_only_from(
     start: Start<'_>,
 ) -> Result<(), String> {
     readings_proven(readings, python_allow)?;
-    secrets_unreached(readings, &default_secrets(home), home, start, &|_| false)
+    secrets_unreached(
+        readings,
+        &default_secrets(home),
+        home,
+        start,
+        &|_| false,
+        LeadingDot::Any,
+    )
 }
 
 /// The advisory word's verdict ([`readings_read_only`]) on `line`, a shell command line as typed,
@@ -3306,7 +3434,9 @@ impl Start<'_> {
 }
 
 /// [`secrets_unreached`] for the session `ctx` describes: its relative paths start in its cwd
-/// and where its Bash tool stands, or anywhere when its cwd is unknown.
+/// and where its Bash tool stands, or anywhere when its cwd is unknown; a glob meets a leading
+/// dot only by a literal one once its Bash tool's shell startup is read and proven to leave
+/// every glob off a leading dot ([`LeadingDot`], [`ShellStartup::may_dot_glob`]).
 fn secrets_unreached_in(
     readings: &[String],
     ctx: &ApprovalCtx,
@@ -3318,14 +3448,48 @@ fn secrets_unreached_in(
     } else {
         Start::Unknown
     };
-    secrets_unreached(readings, &ctx.secrets, ctx.home.as_deref(), start, passed)
+    let dot = if ctx.shell.as_ref().is_ok_and(|s| !s.may_dot_glob()) {
+        LeadingDot::Literal
+    } else {
+        LeadingDot::Any
+    };
+    secrets_unreached(
+        readings,
+        &ctx.secrets,
+        ctx.home.as_deref(),
+        start,
+        passed,
+        dot,
+    )
+}
+
+/// How a glob meets a name's leading `.`: only by a literal `.`, as bash and zsh glob by default,
+/// or also by a `*`, a `?` or a bracket expression, as under bash's `dotglob` or zsh's
+/// `GLOB_DOTS`. MEASURED 2026-11-05 with bash 3.2.57 and zsh 5.9 (`/bin/zsh -f`) in a directory
+/// holding `a.json` and `.credentials.json` and a home holding `.config/gh/hosts.yml` and
+/// `.ssh/config`: `*.json` expanded to `a.json` alone, and `?credentials.json`,
+/// `[.]credentials.json`, `~/?ssh/config`, `~/[.]ssh/config` and `~/*/gh/hosts.yml` to nothing
+/// (bash printed each as written, zsh found no match), with `EXTENDED_GLOB` on or off and with
+/// `GLOBIGNORE=zz` in bash's environment (bash took the variable, `echo $GLOBIGNORE` printing
+/// `zz`, and did not set `dotglob` by it, as it does for one the line sets); zsh with `setopt
+/// globdots` expanded the first three to `.credentials.json` (`*.json` to it and `a.json`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LeadingDot {
+    /// Only a literal `.`: the Bash tool's shell, whose startup [`super::shell_startup::read`]
+    /// proved free of `dotglob` and `GLOB_DOTS` (an option outside its inert lists fails the
+    /// read) and of every line that may set either unseen ([`ShellStartup::may_dot_glob`]).
+    Literal,
+    /// Any of them: a shell whose options this check does not know (the advisory word's, and a
+    /// startup that may set one unseen).
+    Any,
 }
 
 /// `Ok` when no path a reading's commands may read lies under a secret rule, as the shell
 /// resolves it: each operand ([`path_operands_except`], the words of a command `passed` holds
 /// read as naming no file) read by [`operand_comps`], a relative one also against every
 /// directory the line may run it in ([`line_bases`]) and below each it cannot place
-/// ([`secret_led`]); a glob held to the rules by what it may expand to ([`secret_reach`]); and
+/// ([`secret_led`]); a glob held to the rules by what it may expand to ([`secret_reach`], a
+/// leading dot met as `dot` says); and
 /// every tree a reader descends ([`descends`]) held to the home-rooted rules above which it
 /// starts, within the levels it reads (below a directory it cannot place, only a tree that is an
 /// operand or the `.` a reader names none in place of).
@@ -3342,6 +3506,7 @@ fn secrets_unreached(
     home: Option<&Path>,
     start: Start<'_>,
     passed: &dyn Fn(&[String]) -> bool,
+    dot: LeadingDot,
 ) -> Result<(), String> {
     if secrets.is_empty() {
         return Ok(());
@@ -3356,7 +3521,7 @@ fn secrets_unreached(
         let bases = line_bases(&segments, start, home);
         for op in &operands {
             let reach = windows_reach(op, home, &bases, true, windows);
-            if let Some(rule) = reach.secret(secrets, 0) {
+            if let Some(rule) = reach.secret(secrets, 0, dot) {
                 return Err(format!("a read of a secret {rule} ({name}): {op}"));
             }
             if doubt.is_none() {
@@ -3374,7 +3539,7 @@ fn secrets_unreached(
                     // only where the line may stand.
                     reach.tails.clear();
                 }
-                if let Some(rule) = reach.secret(secrets, below) {
+                if let Some(rule) = reach.secret(secrets, below, dot) {
                     return Err(format!(
                         "a read of a secret {rule} ({name}): {} descends from {root}",
                         program(&seg[run.at])
@@ -3588,18 +3753,19 @@ struct Reach {
 
 impl Reach {
     /// The rule it may fall under, read `below` levels down ([`secret_reach`] over its
-    /// components, [`secret_led`] over its tails), named.
-    fn secret(&self, secrets: &[SecretRule], below: usize) -> Option<String> {
+    /// components, [`secret_led`] over its tails, each glob meeting a leading dot as `dot`
+    /// says), named.
+    fn secret(&self, secrets: &[SecretRule], below: usize, dot: LeadingDot) -> Option<String> {
         if let Some(rule) = self
             .comps
             .iter()
-            .find_map(|c| secret_reach(c, secrets, below))
+            .find_map(|c| secret_reach(c, secrets, below, dot))
         {
             return Some(format!("({rule:?})"));
         }
         self.tails
             .iter()
-            .find_map(|t| secret_led(t, secrets, below))
+            .find_map(|t| secret_led(t, secrets, below, dot))
             .map(|rule| format!("({rule:?}) from a directory this check cannot place"))
     }
 
@@ -3729,12 +3895,13 @@ fn secret_led<'a>(
     tail: &[String],
     secrets: &'a [SecretRule],
     below: usize,
+    dot: LeadingDot,
 ) -> Option<&'a SecretRule> {
     secrets.iter().find(|rule| match rule {
         SecretRule::Under(dir) => path_readings(&dir.to_string_lossy())
             .iter()
-            .any(|d| (0..d.len()).any(|j| reaches(tail, &d[j..], below))),
-        _ => secret_reach(tail, std::slice::from_ref(*rule), below).is_some(),
+            .any(|d| (0..d.len()).any(|j| reaches(tail, &d[j..], below, dot))),
+        _ => secret_reach(tail, std::slice::from_ref(*rule), below, dot).is_some(),
     })
 }
 
@@ -3914,21 +4081,22 @@ fn secret_reach<'a>(
     comps: &[String],
     secrets: &'a [SecretRule],
     below: usize,
+    dot: LeadingDot,
 ) -> Option<&'a SecretRule> {
     secrets.iter().find(|rule| match rule {
         SecretRule::Under(dir) => path_readings(&dir.to_string_lossy())
             .iter()
-            .any(|d| reaches(comps, d, below)),
+            .any(|d| reaches(comps, d, below, dot)),
         SecretRule::Component(_) | SecretRule::Basename(_) if below > 0 => false,
-        SecretRule::Component(name) => comps.iter().any(|c| component_meets(c, name)),
-        SecretRule::Basename(glob) => comps.last().is_some_and(|c| basename_meets(c, glob)),
+        SecretRule::Component(name) => comps.iter().any(|c| component_meets(c, name, dot)),
+        SecretRule::Basename(glob) => comps.last().is_some_and(|c| basename_meets(c, glob, dot)),
     })
 }
 
 /// Whether some expansion of `comps` names `dir` or a path under it, or a directory at most
 /// `below` levels above it: each component compared by [`component_meets`], a whole `**` (zsh's,
 /// and bash's under `globstar`) taking any run of components.
-fn reaches(comps: &[String], dir: &[String], below: usize) -> bool {
+fn reaches(comps: &[String], dir: &[String], below: usize, dot: LeadingDot) -> bool {
     let (n, m) = (comps.len(), dir.len());
     let mut ok = vec![vec![false; m + 1]; n + 1];
     for i in (0..=n).rev() {
@@ -3940,7 +4108,7 @@ fn reaches(comps: &[String], dir: &[String], below: usize) -> bool {
             } else if matches!(comps[i].as_str(), "**" | "***") {
                 ok[i + 1][j] || ok[i][j + 1]
             } else {
-                component_meets(&comps[i], &dir[j]) && ok[i + 1][j + 1]
+                component_meets(&comps[i], &dir[j], dot) && ok[i + 1][j + 1]
             };
         }
     }
@@ -4037,12 +4205,19 @@ fn tokens_meet(a: &[Tok], b: &[Tok]) -> bool {
     ok[0][0]
 }
 
+/// Whether `toks`, a glob's tokens ([`glob_tokens`]), may meet a name that `dotted` says opens
+/// with `.`: always under [`LeadingDot::Any`], and under [`LeadingDot::Literal`] only by a
+/// literal `.` first.
+fn dot_met(toks: &[Tok], dotted: bool, dot: LeadingDot) -> bool {
+    dot == LeadingDot::Any || !dotted || toks.first() == Some(&Tok::Lit('.'))
+}
+
 /// Whether the shell may expand `pattern`, one path component of a word, to `name`, ignoring
-/// case as the default volume does: `*` any run of characters (a leading dot too, as under
-/// `dotglob` or zsh's `GLOB_DOTS`), `?` and a bracket expression any one, and a component
-/// holding an extended-glob group (`(…|…)`) any name ([`glob_tokens`]); a short 8.3 name's basis
+/// case as the default volume does: `*` any run of characters, `?` and a bracket expression any
+/// one, a leading dot of `name` met as `dot` says ([`dot_met`]), and a component holding an
+/// extended-glob group (`(…|…)`) any name ([`glob_tokens`]); a short 8.3 name's basis
 /// ([`SHORT`]) also any long name Windows may have made it of ([`short_meets`]).
-fn component_meets(pattern: &str, name: &str) -> bool {
+fn component_meets(pattern: &str, name: &str, dot: LeadingDot) -> bool {
     if let Some(basis) = pattern.strip_prefix(SHORT)
         && short_meets(basis, name)
     {
@@ -4051,19 +4226,21 @@ fn component_meets(pattern: &str, name: &str) -> bool {
     if !pattern.contains(['*', '?', '[', '(', '|']) {
         return same_name(pattern, name);
     }
+    let dotted = name.starts_with('.');
     let name: Vec<Tok> = folded(name).chars().map(Tok::Lit).collect();
-    glob_tokens(pattern).is_none_or(|toks| tokens_meet(&toks, &name))
+    glob_tokens(pattern).is_none_or(|toks| dot_met(&toks, dotted, dot) && tokens_meet(&toks, &name))
 }
 
 /// Whether `c`, a path's last component and a glob the shell may expand, may name a file the
 /// basename rule `glob` (its `*` and `?` as [`glob_match`] reads them) matches: `glob` matched
-/// against `c` as written, or some expansion of `c` ([`glob_tokens`], a `*` taking a leading dot
-/// too) matching `glob` when one of the two holds no `*`: a literal rule's every spelling
-/// (`.netr?`, `.npmr[c]`, `.pypi*`, `*.json` for `.credentials.json`) and a `*`-free glob's
-/// (`a.pe?` for `*.pem`). A `*` in both is held as written, so `cat src/*.rs` stays a read,
-/// though `id_rsa*` names `id_rsa.rs`. A short 8.3 name's basis ([`SHORT`]) also meets a rule
-/// some long name Windows may have made it of matches ([`short_meets`]).
-fn basename_meets(c: &str, glob: &str) -> bool {
+/// against `c` as written, or some expansion of `c` ([`glob_tokens`], a rule's leading dot met
+/// as `dot` says, [`dot_met`]) matching `glob` when one of the two holds no `*`: a literal rule's
+/// every spelling (`.netr?`, `.npmr[c]`, `.pypi*`, and under [`LeadingDot::Any`] `*.json` for
+/// `.credentials.json`) and a `*`-free glob's (`a.pe?` for `*.pem`). A `*` in both is held as
+/// written, so `cat src/*.rs` stays a read, though `id_rsa*` names `id_rsa.rs`. A short 8.3
+/// name's basis ([`SHORT`]) also meets a rule some long name Windows may have made it of matches
+/// ([`short_meets`]).
+fn basename_meets(c: &str, glob: &str, dot: LeadingDot) -> bool {
     if let Some(basis) = c.strip_prefix(SHORT)
         && short_meets(basis, glob)
     {
@@ -4080,8 +4257,11 @@ fn basename_meets(c: &str, glob: &str) -> bool {
             ch => Tok::Lit(ch),
         })
         .collect();
+    let dotted = rule.first() == Some(&Tok::Lit('.'));
     glob_tokens(c).is_none_or(|toks| {
-        !(toks.contains(&Tok::Star) && rule.contains(&Tok::Star)) && tokens_meet(&toks, &rule)
+        !(toks.contains(&Tok::Star) && rule.contains(&Tok::Star))
+            && dot_met(&toks, dotted, dot)
+            && tokens_meet(&toks, &rule)
     })
 }
 

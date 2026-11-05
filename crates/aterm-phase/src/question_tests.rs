@@ -2422,3 +2422,241 @@ fn a_button_row_a_residue_is_glued_to_is_never_read_whole() {
     );
     assert!(misread.is_empty(), "{misread:#?}");
 }
+
+/// A CHARACTER IS COUNTED IN THE CELLS THE GRID DRAWS IT IN: [`cell_width`] is the width aterm's
+/// grid reads for every code point (`aterm_grapheme::char_width`, the table its write path reads:
+/// none, one or two cells), [`VS16_WIDENS`] holds the one-cell characters a VS16 widens
+/// (`aterm_grapheme::is_vs16_emoji_capable`) and [`is_modifier_base`] the ones a skin tone folds
+/// onto (`aterm_grapheme::is_emoji_modifier_base`), so the grid's layout of a row ([`Columns`],
+/// [`cells`], and the side panel's rule [`crate::phase::panel_cut`] finds by them) is read on the
+/// grid's own tables.
+#[test]
+fn a_character_is_counted_in_the_cells_the_grid_draws_it_in() {
+    let differ: Vec<String> = (0..=u32::from(char::MAX))
+        .filter_map(char::from_u32)
+        .filter(|&c| {
+            cell_width(c) != aterm_grapheme::char_width(c)
+                || in_ranges(&VS16_WIDENS, c)
+                    != (aterm_grapheme::is_vs16_emoji_capable(c)
+                        && aterm_grapheme::char_width(c) == 1)
+                || is_modifier_base(c) != aterm_grapheme::is_emoji_modifier_base(c)
+        })
+        .take(20)
+        .map(|c| format!("U+{:04X}", u32::from(c)))
+        .collect();
+    assert!(differ.is_empty(), "{differ:?}");
+    for table in [&WIDE[..], &ZERO, &VS16_WIDENS] {
+        assert!(table.windows(2).all(|w| w[0].1 < w[1].0), "in order, apart");
+    }
+}
+
+/// `written` as aterm's grid reads it back, by the grid's own layout of it
+/// (`aterm_grapheme::GridColumns`): the same text, but that a VS15 the grid narrows a two-cell
+/// cell by is followed by a space, the cell it empties. The grid's readback also drops what it
+/// stores in no cell (a joining character with no cell before it, one past a cell's 16), which
+/// no count takes; [`a_row_the_grid_reads_back_is_counted_in_the_cells_it_paints`] holds this
+/// text's cells to the columns the grid paints.
+fn as_read_back(written: &str) -> String {
+    use aterm_grapheme::GridStep;
+    let mut grid = aterm_grapheme::GridColumns::new();
+    let mut wide = false;
+    let mut out = String::new();
+    for c in written.chars() {
+        out.push(c);
+        match grid.step(c) {
+            GridStep::Opens { width, .. } => wide = width == 2,
+            GridStep::Joins { widened: true } => wide = true,
+            GridStep::Joins { widened: false } if c == '\u{fe0e}' && wide => {
+                out.push(' ');
+                wide = false;
+            }
+            GridStep::Joins { .. } | GridStep::Folds { .. } => {}
+        }
+    }
+    out
+}
+
+/// A ROW IS COUNTED IN THE CELLS THE GRID LAYS IT OUT IN: [`cells`] of a row as the grid reads it
+/// back ([`as_read_back`]) is `aterm_grapheme::str_grid_columns` of the text written, the grid's
+/// own layout of a line (`GridColumns`, which aterm-core's
+/// `grid_columns_agree_with_what_the_grid_paints` holds to the painted grid), on every code point
+/// alone, after a one-cell base, before a VS16, a VS15 and a skin tone, after a joiner and after a
+/// flag's first half.
+#[test]
+fn a_row_is_counted_in_the_cells_the_grid_lays_it_out_in() {
+    use super::cells;
+    const AROUND: [(&str, &str); 8] = [
+        ("", ""),
+        ("a", ""),
+        ("", "\u{fe0f}"),
+        ("", "\u{fe0e}"),
+        ("", "\u{1f3fd}"),
+        ("", "\u{fe0f}\u{1f3fd}"),
+        ("\u{1f44d}\u{200d}", ""),
+        ("\u{1f1fa}", ""),
+    ];
+    let mut wrong = Vec::new();
+    let mut text = String::new();
+    for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+        for (before, after) in AROUND {
+            text.clear();
+            text.push_str(before);
+            text.push(c);
+            text.push_str(after);
+            let grid = aterm_grapheme::str_grid_columns(&text);
+            let read = as_read_back(&text);
+            if cells(&read) != grid && wrong.len() < 20 {
+                wrong.push(format!("{read:?}: grid {grid} vs {}", cells(&read)));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `written` and a `|` after it drawn on a row of aterm's grid: the row as the grid reads it back
+/// ([`read_back`]'s read) and the column the marker is painted in.
+fn painted_before_marker(written: &str) -> (String, usize) {
+    let mut term = aterm_core::terminal::Terminal::new(3, 120);
+    term.process(format!("{written}|").as_bytes());
+    let col = (0..120u16)
+        .find(|&c| term.get_line_text(0, Some((c, c))).as_deref() == Some("|"))
+        .expect("the marker is painted somewhere");
+    (term.row_text(0).expect("row 0"), usize::from(col))
+}
+
+/// A ROW THE GRID READS BACK IS COUNTED IN THE CELLS IT IS PAINTED IN: the readers count a row
+/// as aterm's grid reads it back ([`read_back`]: aterm-core's `Terminal::row_text`, the text the
+/// server's `screen_rows` hands them), not as it was written, and the two differ where a VS15
+/// narrows a two-cell character: the grid empties that cell's right half
+/// (`narrow_previous_cell_for_vs15`), its cursor staying past it, and reads the emptied cell back
+/// as a space, which any character the row then stores there follows. Written through the grid
+/// with a `|` after it, at a row's start, after two spaces and before a word, each sample
+/// aterm-core's `grid_columns_agree_with_what_the_grid_paints` paints and each cluster the side
+/// panel's cut counts (a VS16 and a VS15 after a one-cell and a two-cell character, joiners, skin
+/// tones, flags, a keycap, combining marks, Hangul jamo, and a joining character with no cell
+/// before it) is counted by [`cells`] in the columns the marker is painted after, the read-back
+/// row split there ([`split_at_cell`]) keeps the marker whole after it, and so is the text
+/// [`as_read_back`] models the readback by. Counted as
+/// written before (found in review, 2026-11-05), a VS15 after `✅`, `⌚`, `🚀` or `中` put the
+/// rest of the row a cell right of where the grid paints it.
+#[test]
+fn a_row_the_grid_reads_back_is_counted_in_the_cells_it_paints() {
+    use super::cells;
+    const SAMPLES: &[(&str, &str)] = &[
+        ("ascii", "ab"),
+        ("cjk", "\u{4e2d}\u{6587}"),
+        ("latin + combining", "e\u{301}"),
+        ("devanagari ka + vowel II", "\u{915}\u{940}"),
+        (
+            "devanagari conjunct na+virama+da+II",
+            "\u{928}\u{94d}\u{926}\u{940}",
+        ),
+        ("bengali conjunct", "\u{995}\u{9cd}\u{9b7}\u{9be}"),
+        ("keycap 1 + VS16 + U+20E3", "1\u{fe0f}\u{20e3}"),
+        (
+            "emoji ZWJ family",
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
+        ),
+        ("emoji ZWJ profession", "\u{1f469}\u{200d}\u{1f4bb}"),
+        ("emoji + skin tone", "\u{1f44d}\u{1f3fd}"),
+        ("ninja + skin tone", "\u{1f977}\u{1f3fd}"),
+        ("non-base emoji + skin tone", "\u{1f680}\u{1f3fd}"),
+        ("non-base heart + skin tone", "\u{1f90d}\u{1f3fd}"),
+        ("text-default base + skin tone", "\u{261d}\u{1f3fd}"),
+        (
+            "text-default base + VS16 + skin tone",
+            "\u{261d}\u{fe0f}\u{1f3fd}",
+        ),
+        ("a skin tone alone", "\u{1f3fd}"),
+        ("emoji ZWJ skin tone", "\u{1f44d}\u{200d}\u{1f3fd}"),
+        ("regional indicator flag", "\u{1f1fa}\u{1f1f8}"),
+        ("two flags", "\u{1f1ef}\u{1f1f5}\u{1f1fa}\u{1f1f8}"),
+        ("three regional indicators", "\u{1f1ef}\u{1f1f5}\u{1f1fa}"),
+        ("VS15 text presentation", "\u{2764}\u{fe0e}"),
+        ("VS16 emoji presentation", "\u{2764}\u{fe0f}"),
+        (
+            "VS16 then VS15 on a one-cell emoji",
+            "\u{2764}\u{fe0f}\u{fe0e}",
+        ),
+        ("VS16 copyright", "\u{a9}\u{fe0f}"),
+        ("VS16 play button", "\u{25b6}\u{fe0f}"),
+        ("VS16 information", "\u{2139}\u{fe0f}"),
+        ("VS16 double exclamation", "\u{203c}\u{fe0f}"),
+        ("VS16 left-right arrow", "\u{2194}\u{fe0f}"),
+        ("VS16 warning", "\u{26a0}\u{fe0f}"),
+        ("VS16 on a letter", "a\u{fe0f}"),
+        ("VS16 on a two-cell emoji", "\u{2705}\u{fe0f}"),
+        ("VS15 on a two-cell emoji", "\u{2705}\u{fe0e}"),
+        ("VS15 on a watch", "\u{231a}\u{fe0e}"),
+        ("VS15 on a rocket", "\u{1f680}\u{fe0e}"),
+        ("VS15 on a CJK ideograph", "\u{4e2d}\u{fe0e}"),
+        (
+            "VS15 then VS16 on a two-cell emoji",
+            "\u{2705}\u{fe0e}\u{fe0f}",
+        ),
+        (
+            "VS15 then a mark on a two-cell emoji",
+            "\u{2705}\u{fe0e}\u{301}",
+        ),
+        ("ZWJ emoji on a narrow base", "\u{2764}\u{200d}\u{1f525}"),
+        (
+            "devanagari explicit half form",
+            "\u{915}\u{94d}\u{200d}\u{937}",
+        ),
+        ("sinhala yansaya", "\u{d9a}\u{dca}\u{200d}\u{dba}"),
+        ("sinhala sri", "\u{dc1}\u{dca}\u{200d}\u{dbb}\u{dd3}"),
+        ("emoji ZWJ ZWJ emoji", "\u{1f44d}\u{200d}\u{200d}\u{1f44d}"),
+        (
+            "emoji ZWJ mark ZWJ emoji",
+            "\u{1f44d}\u{200d}\u{308}\u{200d}\u{1f44d}",
+        ),
+        ("flag halves around a mark", "\u{1f1fa}\u{301}\u{1f1f8}"),
+        ("ASCII after a ZWJ", "\u{1f44d}\u{200d}a"),
+        ("a box rule after a ZWJ", "x\u{200d}\u{2502}"),
+        ("résumé with combining marks", "re\u{301}sume\u{301}"),
+        ("Hangul jamo", "\u{1100}\u{1161}\u{11a8}"),
+        ("a ZWJ with no cell before it", "\u{200d}"),
+        ("a VS16 with no cell before it", "\u{fe0f}"),
+        ("a mark with no cell before it", "\u{301}"),
+        (
+            "a ZWJ then an emoji with no cell before it",
+            "\u{200d}\u{2705}",
+        ),
+        (
+            "a cell full of marks, then a joiner and an emoji",
+            "e\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\
+             \u{301}\u{301}\u{301}\u{301}\u{301}\u{200d}\u{1f525}",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (label, sample) in SAMPLES {
+        for (before, after) in [("", ""), ("  ", ""), ("", " ask"), ("  ", " ask")] {
+            let written = format!("{before}{sample}{after}");
+            let (row, painted) = painted_before_marker(&written);
+            let Some(drawn) = row.strip_suffix('|') else {
+                wrong.push(format!("{label} in {written:?}: read back {row:?}"));
+                continue;
+            };
+            if cells(drawn) != painted {
+                wrong.push(format!(
+                    "{label} in {written:?}: painted {painted} vs {} for {drawn:?}",
+                    cells(drawn)
+                ));
+            }
+            if cells(&as_read_back(&written)) != painted {
+                wrong.push(format!(
+                    "{label} in {written:?}: painted {painted} vs {} modelled {:?}",
+                    cells(&as_read_back(&written)),
+                    as_read_back(&written)
+                ));
+            }
+            if split_at_cell(&row, painted) != (drawn, "|") {
+                wrong.push(format!(
+                    "{label} in {written:?}: split {:?}",
+                    split_at_cell(&row, painted)
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

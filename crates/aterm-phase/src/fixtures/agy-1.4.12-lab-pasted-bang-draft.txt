@@ -1,0 +1,51 @@
+# agy 1.4.12 · MEASURED 2026-11-02, `aterm ctl text` of a private headless aterm (144x50) running the real Antigravity CLI under aterm-lab's stub (scratch HOME, no login): `!echo pasted-probe` pasted as one bracketed paste into the empty composer. agy keeps a pasted `!` as text in its `>` composer (`> !echo pasted-probe`), not its bash mode.
+
+      ▄▀▀▄        Antigravity CLI 1.4.12
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.XXXX/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> !echo pasted-probe
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                            Gemini 3.1 Pro · low
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

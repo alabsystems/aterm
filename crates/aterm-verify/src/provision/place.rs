@@ -168,9 +168,9 @@ pub(super) fn fetch_checked(
             Some(words) => Refused::CouldNotRun(words),
             None => Refused::Failed(e),
         })?;
-    let got = std::fs::metadata(&file)
-        .map_err(|e| format!("{url} left no file: {e}"))?
-        .len();
+    let (opened, meta) =
+        aterm_uds::regular_file::open(&file).map_err(|e| format!("{url} left no file: {e}"))?;
+    let got = meta.len();
     if got != bytes {
         return Err(format!(
             "{url} is {got} bytes, the pin is {bytes}: the archive changed under its version; \
@@ -178,7 +178,7 @@ pub(super) fn fetch_checked(
         )
         .into());
     }
-    let hash = crate::perf::arena::sha256_file(&file)?;
+    let hash = crate::perf::arena::sha256_opened(opened, &file)?;
     if hash != sha256 {
         return Err(format!(
             "{url} hashes to {hash}, the pin is {sha256}: the archive changed under its version; \
@@ -319,14 +319,16 @@ pub(super) fn lay_built(
     if let Some(dir) = exe.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     }
-    std::fs::copy(program, &exe).map_err(|e| format!("could not copy the build: {e}"))?;
+    crate::copy_regular_fresh(program, &exe)
+        .map_err(|e| format!("could not copy the build: {e}"))?;
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+        aterm_uds::regular_file::open(&exe)
+            .and_then(|(f, _)| f.set_permissions(std::fs::Permissions::from_mode(0o755)))
             .map_err(|e| format!("chmod {}: {e}", exe.display()))?;
     }
     if let Some(name) = licence.file_name().filter(|_| licence.is_file()) {
-        std::fs::copy(licence, tree.join(name))
+        crate::copy_regular_fresh(licence, tree.join(name))
             .map_err(|e| format!("could not keep {}: {e}", licence.display()))?;
     }
     let foreign = atpkg::macho::foreign_dylibs(&exe)
@@ -376,7 +378,8 @@ pub(super) const TAR: &str = aterm_uds::os_path!("tar");
 /// nothing writes.
 pub(super) fn read_only(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
+    aterm_uds::regular_file::open(path)
+        .and_then(|(f, _)| f.set_permissions(std::fs::Permissions::from_mode(0o444)))
         .map_err(|e| format!("could not make {} read-only: {e}", path.display()))
 }
 
@@ -460,8 +463,22 @@ pub(super) fn read_stamp(dir: &Path) -> Option<Stamp> {
 /// row in place as use. Only a stamp that is a file: a link is never followed.
 pub(super) fn touch_stamp(dir: &Path) {
     let path = dir.join(super::STAMP);
-    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file())
-        && let Ok(file) = std::fs::File::options().append(true).open(&path)
+    #[cfg(unix)]
+    let open = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+    };
+    #[cfg(not(unix))]
+    let open = if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+        std::fs::File::options().append(true).open(&path)
+    } else {
+        return;
+    };
+    if let Ok(file) = open
+        && file.metadata().is_ok_and(|m| m.is_file())
     {
         let _ = file.set_modified(std::time::SystemTime::now());
     }

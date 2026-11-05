@@ -32,6 +32,10 @@ mod watch;
 #[path = "owner_keys_save_tests.rs"]
 mod owner_keys_save_tests;
 
+#[cfg(all(test, unix))]
+#[path = "app_documents_private_tests.rs"]
+mod private_tests;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigEditorRevealDecision {
     Select {
@@ -271,9 +275,9 @@ struct PendingDocumentClose {
 struct PendingDocumentSaveIntent {
     seq: aterm_buffer::Seq,
     source_view: crate::tab_model::ViewId,
-    /// Whether control clients or accessibility clients alone asked for it, so its replay is a
-    /// control client's ([`crate::owner_keys_save`]); a person's request merged in makes it the
-    /// person's.
+    /// Whether control clients, accessibility clients or other processes' input alone asked for
+    /// it, so its replay is a control client's ([`crate::owner_keys_save`]); a person's request
+    /// merged in makes it the person's.
     controller: bool,
 }
 
@@ -3283,9 +3287,9 @@ impl App {
     }
 
     /// Why the save of `document` now is refused ([`crate::owner_keys_save`]): it is the
-    /// aterm.toml in force, a control client or an accessibility client made the save or an
-    /// edit no person here is known to have made reached it, and the owner's keys in its text
-    /// differ from the file's.
+    /// aterm.toml in force, a control client, an accessibility client or another process's input
+    /// made the save or an edit no person here is known to have made reached it, and the owner's
+    /// keys in its text differ from the file's.
     fn owner_keys_save_refusal(&self, document: DocumentId) -> Option<String> {
         let provenance = crate::owner_keys_save::Provenance::new(
             self.gesture_unvouched().is_some(),
@@ -4705,14 +4709,18 @@ impl App {
         let reopenable = self.closed_recovery.document_uris(now_ms);
         let mut deadline: Option<u64> = None;
         let mut released = Vec::new();
+        let mut private_released = false;
         for document in self.document_store.document_ids() {
             if !self.document_unheld(document) {
                 continue;
             }
             let uri = self.document_store.canonical_uri(document);
+            private_released |= uri.is_some_and(crate::native_document_journal::private_uri);
+            // A private edit's document is never kept for a closed tab's reopening.
             let kept_until = reopenable
                 .iter()
                 .filter(|(named, _)| Some(*named) == uri)
+                .filter(|(named, _)| !crate::native_document_journal::private_uri(named))
                 .map(|(_, expires_ms)| *expires_ms)
                 .max();
             match kept_until {
@@ -4725,6 +4733,9 @@ impl App {
         self.native_documents.release_due = false;
         self.native_documents.release_deadline_ms = deadline;
         released.retain(|document| self.document_store.release(*document).is_ok());
+        if private_released {
+            sweep_private_scratch();
+        }
         let host = &mut self.native_documents;
         for document in &released {
             if let Some(grant) = host.persistence.forget(*document) {
@@ -5352,7 +5363,16 @@ impl App {
         {
             return Err("The path changed between a file and a directory; close its existing buffer before reopening it".into());
         }
-        let access = if kind == AppKind::Editor {
+        // `edit … ro=1`: a fresh buffer nothing changes or saves. A buffer already open for the
+        // file may hold changes and a writable grant, so it is never made read-only in place.
+        let read_only = match placement {
+            Placement::NewTabAfter { ticket } => self.native_documents.edits.read_only(ticket),
+            Placement::FocusOrNewTab | Placement::NewTab => false,
+        };
+        if read_only && existing.is_some() {
+            return Err("ERR refused open: a read-only edit opens a file no buffer holds\n".into());
+        }
+        let access = if kind == AppKind::Editor && !read_only {
             GrantAccess::ReadWrite
         } else {
             GrantAccess::ReadOnly
@@ -5364,6 +5384,21 @@ impl App {
             .map_err(|error| format!("document open failed: {error}"))?;
         let mut recovery_notice = None;
         let document = if let Some(document) = existing {
+            document
+        } else if crate::native_document_journal::private_uri(&granted.grant.canonical_uri) {
+            // A private edit's document keeps no draft journal: nothing it holds reaches the
+            // drafts folder, and what an earlier open left there goes before the buffer opens.
+            let document = self
+                .document_store
+                .open(granted.grant.canonical_uri.clone(), granted.text.clone());
+            if let Some(journals) = self.native_documents.journals.as_mut()
+                && let Err(error) = journals.decline(document, &granted.grant.canonical_uri)
+            {
+                let _ = self.document_store.remove_if_unattached(document);
+                return Err(format!(
+                    "a private document's earlier draft could not be removed: {error}"
+                ));
+            }
             document
         } else {
             let decision = self
@@ -5431,6 +5466,12 @@ impl App {
             }
             document
         };
+        if read_only && let Err(error) = self.document_store.set_read_only(document) {
+            let _ = self.document_store.remove_if_unattached(document);
+            return Err(format!(
+                "the read-only document could not be marked: {error:?}"
+            ));
+        }
         if let Some(listing) = granted.directory.clone() {
             self.replace_directory_listing(document, listing)?;
         }
@@ -5850,6 +5891,24 @@ fn journal_completion_error(completion: JournalCompletion) -> Option<String> {
               not an expect: rustc does not lint a fn the declarative anchors rebuild"
 )]
 fn editor_carry_waivers() {}
+
+/// Once amacs lets go of a private edit's document, sweep aterm's own scratch root
+/// ([`aterm_types::private_edit::scratch_root`]) for grid scratch folders whose maker died before
+/// removing its own (a live maker removes its own when its edit ends), on a background thread: the
+/// release never waits on the disk. The sweep never starts from the document's path, which a
+/// controller's `edit` may name anywhere.
+fn sweep_private_scratch() {
+    if cfg!(test) {
+        return;
+    }
+    let spawned =
+        crate::qos::spawn_lane_thread("aterm-private-sweep", crate::qos::Role::Background, || {
+            aterm_types::private_edit::sweep_dead(&aterm_types::private_edit::scratch_root(), None);
+        });
+    if let Err(error) = spawned {
+        aterm_log::warn!("private edit sweep not started: {error}");
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -11841,6 +11900,7 @@ mod tests {
             focused_path: vec![crate::restore::RestoreBranch::Second],
             zoomed,
             parked: false,
+            ephemeral: false,
         }];
         app.restore_into_window(WindowId(0), layout);
         app
@@ -12115,6 +12175,7 @@ mod tests {
                                     focused_path: Vec::new(),
                                     zoomed: false,
                                     parked: false,
+                                    ephemeral: false,
                                 })
                                 .collect();
                             layout.active_item = Some(1);
@@ -12569,6 +12630,7 @@ mod tests {
             focused_path: vec![crate::restore::RestoreBranch::First],
             zoomed: false,
             parked: false,
+            ephemeral: false,
         }];
         let collapse_layout = layout.clone();
         let mut failures = Vec::new();
@@ -14102,7 +14164,7 @@ mod tests {
         app.ask_next_queued_close();
         assert_eq!(
             app.close_banner.as_ref().map(|banner| banner.prompt.title),
-            Some("Are you sure you want to quit aterm?"),
+            Some(crate::quit_safety::QUIT_TITLE),
             "closing the other window quits aterm once the handoff replays both closes"
         );
     }

@@ -44,6 +44,14 @@
 //!   a reading around a span of a process's work counts every flush it asked the OS
 //!   for through this crate, whatever the broker's own counts say (astream-broker's
 //!   benches gate it, and its `<log>.health` carries it).
+//! - [`flush_times`]: how long those calls took, by kind, and the last
+//!   [`SLOW_FLUSHES_KEPT`] slower than [`SLOW_FLUSH_NS`] (1 ms), each with its kind, start
+//!   and end on [`clock_ns`], the clock a caller reads to line its own stalls up with a
+//!   flush: on Apple the machine's `CLOCK_UPTIME_RAW` (the clock std's `Instant` reads
+//!   there), so two processes' readings compare; elsewhere this process's own
+//!   ([`FLUSH_CLOCK`]). Each flush is counted as it begins and timed as it returns, in one
+//!   door every flush of the crate goes through, and astream-broker's `<log>.health`
+//!   carries the totals and the ring.
 //! - [`boot_session`]: THIS BOOT of the machine as the kernel names it, as 16 bytes.
 //!   Two readings are equal exactly when no boot came between them, which is the
 //!   question a log that trusts the page cache asks — "has the kernel holding my
@@ -90,7 +98,8 @@
 //! `fsync` behind [`plain_fsync`] and behind [`full_sync`] in a test's debug process,
 //! `sysctlbyname("kern.bootsessionuuid")` behind [`boot_session`], `poll` behind
 //! `socket_hung_up`, `fcntl(F_GETFD)` and `fcntl(F_SETFD)` behind [`close_on_fork`],
-//! and `signal(SIGHUP)` behind [`install_sighup_handler`]. `owner`
+//! `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` behind [`clock_ns`], and `signal(SIGHUP)`
+//! behind [`install_sighup_handler`]. `owner`
 //! (`cfg(unix)`): `geteuid` behind [`euid`] and [`owner_private`], and on Apple
 //! `acl_get_fd_np`, `acl_get_entry`, `acl_get_tag_type` and `acl_free` behind
 //! [`owner_private`] and [`owner_private_dir`]; the per-OS `O_NONBLOCK` and
@@ -142,7 +151,12 @@
 
 use std::fs::File;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+
+mod flush_times;
+pub use flush_times::{
+    clock_ns, flush_times, slow_flushes_missed, FlushClock, FlushKind, FlushTimes, SlowFlush,
+    FLUSH_CLOCK, SLOW_FLUSHES_KEPT, SLOW_FLUSH_NS,
+};
 
 #[cfg(target_vendor = "apple")]
 macro_rules! apple_ffi {
@@ -173,6 +187,12 @@ macro_rules! apple_ffi {
         // SAFETY: `F_SETFD` sets one descriptor's flags from an int and touches no memory;
         // the descriptor is retained by a BorrowedFd for the call.
         unsafe { fcntl($fd, F_SETFD, $flags) }
+    };
+    (uptime_raw_ns($clock:expr)) => {
+        // SAFETY: `clock_gettime_nsec_np` takes a clock id by value, touches no memory and
+        // returns the reading (0 for a clock id it does not know, which `CLOCK_UPTIME_RAW` is
+        // not: Darwin has defined it since macOS 10.12).
+        unsafe { clock_gettime_nsec_np($clock) }
     };
     (install_sighup($sig:expr, $handler:expr)) => {
         // SAFETY: `SIGHUP` is a valid standard POSIX signal number and `$handler` is an
@@ -444,13 +464,15 @@ pub fn test_plain_fsync() -> bool {
 /// # Errors
 /// The flush's own error.
 pub fn full_sync(file: &File) -> io::Result<()> {
-    // Counted `full` whatever a test's process takes underneath: the call is a full flush.
-    let _ = FULL_FLUSHES.fetch_add(1, Ordering::Relaxed);
-    #[cfg(all(debug_assertions, target_vendor = "apple"))]
-    if test_plain_fsync() {
-        return apple::plain_fsync(file);
-    }
-    file.sync_all()
+    // Counted and timed `full` whatever a test's process takes underneath: the call is a
+    // full flush.
+    flush_times::timed(FlushKind::Full, || {
+        #[cfg(all(debug_assertions, target_vendor = "apple"))]
+        if test_plain_fsync() {
+            return apple::plain_fsync(file);
+        }
+        file.sync_all()
+    })
 }
 
 /// [`full_sync`] for `file`'s data and the metadata a read of it needs:
@@ -460,12 +482,13 @@ pub fn full_sync(file: &File) -> io::Result<()> {
 /// # Errors
 /// The flush's own error.
 pub fn full_sync_data(file: &File) -> io::Result<()> {
-    let _ = FULL_FLUSHES.fetch_add(1, Ordering::Relaxed);
-    #[cfg(all(debug_assertions, target_vendor = "apple"))]
-    if test_plain_fsync() {
-        return apple::plain_fsync(file);
-    }
-    file.sync_data()
+    flush_times::timed(FlushKind::Full, || {
+        #[cfg(all(debug_assertions, target_vendor = "apple"))]
+        if test_plain_fsync() {
+            return apple::plain_fsync(file);
+        }
+        file.sync_data()
+    })
 }
 
 /// Order every write to `file` issued before this call ahead of every write issued
@@ -477,15 +500,16 @@ pub fn full_sync_data(file: &File) -> io::Result<()> {
 /// then flushes in full instead. Elsewhere: [`File::sync_data`], a full flush, which
 /// orders everything because it persists everything.
 pub fn barrier_sync(file: &File) -> io::Result<()> {
-    let _ = BARRIERS.fetch_add(1, Ordering::Relaxed);
-    #[cfg(target_vendor = "apple")]
-    {
-        apple::barrier_fsync(file)
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        file.sync_data()
-    }
+    flush_times::timed(FlushKind::Barrier, || {
+        #[cfg(target_vendor = "apple")]
+        {
+            apple::barrier_fsync(file)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            file.sync_data()
+        }
+    })
 }
 
 /// A plain `fsync(2)` of `file`, retried while it is interrupted (`EINTR`), in every
@@ -500,25 +524,17 @@ pub fn barrier_sync(file: &File) -> io::Result<()> {
 /// The flush's own error.
 #[cfg(unix)]
 pub fn plain_fsync(file: &File) -> io::Result<()> {
-    let _ = PLAIN_FLUSHES.fetch_add(1, Ordering::Relaxed);
-    #[cfg(target_vendor = "apple")]
-    {
-        apple::plain_fsync(file)
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        file.sync_all()
-    }
+    flush_times::timed(FlushKind::Plain, || {
+        #[cfg(target_vendor = "apple")]
+        {
+            apple::plain_fsync(file)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            file.sync_all()
+        }
+    })
 }
-
-/// The [`full_sync`] and [`full_sync_data`] calls this process has made ([`flush_tally`]).
-static FULL_FLUSHES: AtomicU64 = AtomicU64::new(0);
-
-/// The [`barrier_sync`] calls this process has made ([`flush_tally`]).
-static BARRIERS: AtomicU64 = AtomicU64::new(0);
-
-/// The [`plain_fsync`] calls this process has made ([`flush_tally`]).
-static PLAIN_FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// How many flushes this process has asked this crate for since it started, by kind
 /// ([`flush_tally`]).
@@ -547,12 +563,14 @@ pub struct FlushTally {
 /// call here and escapes the tally. The count is process-wide, so it reads one
 /// caller's flushes alone only in a process where nothing else flushes through this
 /// crate meanwhile: astream-broker's benches, which gate it, run one broker each.
+/// [`flush_times`] is how long the same calls took.
 #[must_use]
 pub fn flush_tally() -> FlushTally {
+    let ledger = &flush_times::LEDGER;
     FlushTally {
-        full: FULL_FLUSHES.load(Ordering::Relaxed),
-        barrier: BARRIERS.load(Ordering::Relaxed),
-        plain: PLAIN_FLUSHES.load(Ordering::Relaxed),
+        full: ledger.count(FlushKind::Full),
+        barrier: ledger.count(FlushKind::Barrier),
+        plain: ledger.count(FlushKind::Plain),
     }
 }
 

@@ -28,7 +28,12 @@
 //!     [`acts::SWITCH_ASKED`] while its answer is out, held again at the same answer and nothing
 //!     typed past it ([`judge_over_held`], [`asked_line`]);
 //!   - `switch-busy`: switched [`BUSY_SWITCH_MS`] into a long busy turn: nothing typed mid-turn,
-//!     land@v1 within [`BUSY_LAND_MS`] of the turn's point ([`judge_busy`]).
+//!     land@v1 within [`BUSY_LAND_MS`] of the turn's point ([`judge_busy`]);
+//!   - `command-draft` (no switch, v6 §14.17.5.8): a person's command ([`command_draft`]: a typed
+//!     [`COMMAND_DRAFT`], agy's pasted [`AGY_COMMAND_DRAFT`]) put in at rest and left standing
+//!     [`COMMAND_PAST_MS`] past their grace: nothing typed or sent while it stands and its hold
+//!     journalled once ([`turn_end::COMMAND_STANDS`]); cleared, the loop's next act comes past the
+//!     grace from the clearing, never the command ([`judge_command`]).
 //!
 //! A wait at rest the switch wakes is journaled by the loop as `NOTE seq=<n> autopilot=<w> the
 //! session's Autopilot word moved: decided after a <ms> ms settle` ([`wake_after`]), within
@@ -76,6 +81,32 @@ pub const DRAFT_BEFORE_MS: i64 = 5_000;
 
 /// How long the draft stands past the switch before the lab clears it.
 pub const DRAFT_PAST_MS: i64 = 10_000;
+
+/// `command-draft`'s draft under Claude Code and Muse Code ([`command_draft`]): a command a person
+/// might leave in the composer, harmless where a build sends it (each shows its help and runs no
+/// turn), as `/clear` or `/logout` would not be.
+pub const COMMAND_DRAFT: &str = "/help";
+
+/// `command-draft`'s draft under agy ([`command_draft`]): a `!` line pasted, which agy 1.4.12's `>`
+/// composer keeps as text (measured: `agy::fixtures::lab::PASTED_BANG_DRAFT`), harmless where a
+/// build sends it (`true` does nothing). A typed `/help` is no negative control there: agy's `/`
+/// menu leaves main's read of it unauthoritative, so main decides nothing on it and sends nothing;
+/// a typed `!` opens agy's bash mode, which draws no composer (v6 §14.17.5.8).
+pub const AGY_COMMAND_DRAFT: &str = "!true";
+
+/// How `command-draft` puts its command in under `h`: the text, and whether it goes in as one
+/// bracketed paste (agy's, which no person's key stamps) rather than typed `as=person`.
+#[must_use]
+pub const fn command_draft(h: Harness) -> (&'static str, bool) {
+    match h {
+        Harness::Claude | Harness::Muse => (COMMAND_DRAFT, false),
+        Harness::Agy => (AGY_COMMAND_DRAFT, true),
+    }
+}
+
+/// How long past the person's grace from the command's typing the lab leaves it standing before it
+/// clears it: past the decision the grace's end owes, and the hold that decision journals.
+pub const COMMAND_PAST_MS: i64 = 30_000;
 
 /// The words ending the `WAITING` line the loop journals for the person who typed a draft: its
 /// hands-off hold, until their grace runs out.
@@ -167,6 +198,8 @@ pub struct Switched {
 /// `switch-seq`'s draft ([`word_step`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Draft {
+    /// What went in: `command-draft`'s command ([`command_draft`]); empty for `switch-seq`'s.
+    pub text: String,
     /// When its `send` went in.
     pub typed_ms: i64,
     /// Whether it stood in the composer as typed.
@@ -197,6 +230,7 @@ pub const fn switches(chain: Chain) -> bool {
         chain,
         Chain::SwitchAgent
             | Chain::SwitchSeq
+            | Chain::CommandDraft
             | Chain::SwitchFlip
             | Chain::SwitchOverHeld
             | Chain::SwitchBusy
@@ -900,6 +934,103 @@ pub fn judge_draft(seen: &Seen, t0: i64) -> Verdict {
     verdict(&said, &bad)
 }
 
+/// SWC: A PERSON'S COMMAND STANDS (v6 §14.17.5.8). The harness's command ([`command_draft`]), put
+/// in at rest in Cruise's first back-off and left standing past the person's grace from then:
+/// nothing typed from its typing to its clearing (main's draft step sent it at the grace's end,
+/// `CONTINUED … continue@v1 /help`), and its hold journalled once in that span, by the draft
+/// step's command arm (`HOLD … why=command …`, [`turn_end::COMMAND_STANDS`]). Cleared by the
+/// person, the loop goes on: its next act comes past the person's grace from the clearing, within
+/// [`CLEAR_READ_MS`] of it, and is never the command.
+#[must_use]
+pub fn judge_command(seen: &Seen, t0: i64) -> Verdict {
+    let Some(d) = seen.cover.draft.as_ref() else {
+        return Verdict::Unobserved(format!(
+            "no command was typed (no back-off at rest within {})",
+            at(t0, seen.end_ms)
+        ));
+    };
+    if !d.stood {
+        return Verdict::Unobserved(format!(
+            "the command typed at +{} never stood in the composer",
+            at(t0, d.typed_ms)
+        ));
+    }
+    let grace_end = d.typed_ms + person_grace_ms();
+    let mut said = vec![
+        format!("{} from +{}", d.text, at(t0, d.typed_ms)),
+        format!("the person's grace to +{}", at(t0, grace_end)),
+    ];
+    let mut bad = Vec::new();
+    let until = d.cleared_ms.unwrap_or(seen.end_ms);
+    let over = acts_between(seen, d.typed_ms - 1, until);
+    if !over.is_empty() {
+        bad.push(format!(
+            "typed while the command stood (to +{}): {}",
+            at(t0, until),
+            named(&over, t0)
+        ));
+    }
+    let holds: Vec<&Line> = seen
+        .journal
+        .iter()
+        .filter(|(t, l)| {
+            *t >= d.typed_ms
+                && *t <= until
+                && l.starts_with("HOLD ")
+                && l.ends_with(turn_end::COMMAND_STANDS)
+        })
+        .collect();
+    match holds.as_slice() {
+        [(th, lh)] => said.push(format!("held +{} ({})", at(t0, *th), one_line(lh, 100))),
+        [] => bad.push(format!(
+            "no hold journaled for the person's command (`HOLD … {}`) from +{} to +{}",
+            one_line(turn_end::COMMAND_STANDS, 40),
+            at(t0, d.typed_ms),
+            at(t0, until)
+        )),
+        more => bad.push(format!("the hold journaled {} times", more.len())),
+    }
+    let Some(cleared) = d.cleared_ms.filter(|_| d.emptied) else {
+        if bad.is_empty() {
+            return Verdict::Unobserved(format!(
+                "the command stood from +{}, but it was not cleared",
+                at(t0, d.typed_ms)
+            ));
+        }
+        return verdict(&said, &bad);
+    };
+    said.push(format!("cleared at +{}", at(t0, cleared)));
+    let held_to = cleared + person_grace_ms();
+    let inside = acts_between(seen, cleared, held_to - HOLD_SKEW_MS);
+    if !inside.is_empty() {
+        bad.push(format!(
+            "typed inside the person's grace from the clearing (to +{}): {}",
+            at(t0, held_to),
+            named(&inside, t0)
+        ));
+    }
+    match acts_between(seen, cleared, i64::MAX).first() {
+        None => bad.push(format!(
+            "nothing typed past the clearing within {}: the loop did not go on",
+            at(t0, seen.end_ms)
+        )),
+        Some((ta, la)) => {
+            said.push(format!("then +{} {}", at(t0, *ta), one_line(la, 80)));
+            if *ta > held_to + CLEAR_READ_MS {
+                bad.push(format!(
+                    "the next act came {} past the grace from the clearing, past {} s",
+                    at(0, ta - held_to),
+                    CLEAR_READ_MS / 1000
+                ));
+            }
+            if !d.text.is_empty() && la.trim_end().ends_with(d.text.as_str()) {
+                bad.push(format!("the command was sent: +{}", at(t0, *ta)));
+            }
+        }
+    }
+    verdict(&said, &bad)
+}
+
 /// SWF: Land then Off within [`FLIP_WITHIN_MS`] in its back-off at rest, both writes taken: its
 /// wake journaled, nothing typed from the flip on, `autopilot=off` standing, watched past the
 /// back-off's due. A Land write that did not take would leave Off's wake, word and quiet to pass
@@ -1343,6 +1474,10 @@ pub fn watched(chain: Chain, seen: &Seen, now: i64) -> bool {
                     LAND_WATCH_MS,
                 )
         }
+        Chain::CommandDraft => since(
+            seen.cover.draft.as_ref().and_then(|d| d.cleared_ms),
+            person_grace_ms() + CLEAR_READ_MS + LAND_WITHIN_MS,
+        ),
         Chain::SwitchFlip => {
             let due = rest_from(seen, i64::MIN)
                 .and_then(|(_, l)| backoff_due(l))
@@ -1488,6 +1623,91 @@ pub(in crate::forever) fn word_step(
             set(door, tab, &["land"]);
         }
         Chain::SwitchSeq => draft_step(door, h, tab, now, rest)?,
+        Chain::CommandDraft => command_step(door, h, tab, now, rest)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `command-draft`'s steps: the harness's command ([`command_draft`]) put in [`DRAFT_AFTER_MS`]
+/// into the back-off at rest, typed `as=person` as `switch-seq`'s draft is ([`draft_step`]) or
+/// pasted, and cleared by backspaces `as=person` [`COMMAND_PAST_MS`] past the person's grace from
+/// then.
+fn command_step(
+    door: &Door<'_>,
+    h: Harness,
+    tab: &mut Tab,
+    now: i64,
+    rest: Option<i64>,
+) -> Result<(), Fail> {
+    let agent = h.name();
+    let (command, pasted) = command_draft(h);
+    // The composer's row as the reader takes it, or its text told from a placeholder by its cell
+    // (`stand_on`): agy's and Muse Code's empty composers draw a grey hint.
+    let standing = |text: &str| {
+        at_composer(door, &tab.sid, agent).as_deref() == Some(text)
+            || super::stand_on(door, &tab.sid, agent, &on(door, &tab.sid, &["text"]))
+                == super::Stand::Composer(text.to_string())
+    };
+    match tab.seen.cover.draft.clone() {
+        None if rest.is_some_and(|t| now >= t + DRAFT_AFTER_MS) => {
+            let typed = now_ms();
+            let who = format!("@{}", tab.sid);
+            let r = if pasted {
+                door.ctl(&[&who, "paste", command])?
+            } else {
+                door.ctl(&[&who, "send", "as=person", command])?
+            };
+            // A hang detector, never a budget (`draft_step`'s).
+            let stood = r.code == 0 && crate::wait_until(super::DRAFT_HANG, || standing(command));
+            println!(
+                "  [{}] +{} command \"{command}\" {} ({}): {}",
+                tab.chain.name(),
+                at(tab.t0, typed),
+                if pasted { "pasted" } else { "sent" },
+                one_line(r.stdout.trim(), 60),
+                if stood {
+                    "it stands in the composer"
+                } else {
+                    "it did NOT stand in the composer"
+                }
+            );
+            tab.seen.cover.draft = Some(Draft {
+                text: command.to_string(),
+                typed_ms: typed,
+                stood,
+                ..Draft::default()
+            });
+        }
+        Some(d)
+            if d.stood
+                && d.cleared_ms.is_none()
+                && now >= d.typed_ms + person_grace_ms() + COMMAND_PAST_MS =>
+        {
+            let who = format!("@{}", tab.sid);
+            let before = at_composer(door, &tab.sid, agent);
+            for _ in 0..command.chars().count() {
+                door.ctl(&[&who, "key", "as=person", "backspace"])?;
+            }
+            let cleared = now_ms();
+            let emptied = crate::wait_until(super::DRAFT_HANG, || standing(""));
+            println!(
+                "  [{}] +{} command cleared by {} backspace(s) (it read {:?} before): {}",
+                tab.chain.name(),
+                at(tab.t0, cleared),
+                command.chars().count(),
+                before.unwrap_or_default(),
+                if emptied {
+                    "the composer stands empty"
+                } else {
+                    "the composer did NOT stand empty"
+                }
+            );
+            if let Some(d) = tab.seen.cover.draft.as_mut() {
+                d.cleared_ms = Some(cleared);
+                d.emptied = emptied;
+            }
+        }
         _ => {}
     }
     Ok(())

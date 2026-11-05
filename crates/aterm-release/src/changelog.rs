@@ -92,11 +92,46 @@ fn conflict_marker_head(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// The 1-based line of the first top-level entry (`- ` or `* `) above the first `## ` heading,
+/// outside HTML comments: an entry there belongs to no section, so no release's notes carry it.
+fn entry_above_every_section(text: &str) -> Option<usize> {
+    let mut in_comment = false;
+    for (idx, raw) in text.lines().enumerate() {
+        if raw.starts_with("## ") {
+            return None;
+        }
+        let mut line = raw;
+        if in_comment {
+            match line.find("-->") {
+                Some(p) => {
+                    line = &line[p + 3..];
+                    in_comment = false;
+                }
+                None => continue,
+            }
+        }
+        if line.starts_with("- ") || line.starts_with("* ") {
+            return Some(idx + 1);
+        }
+        if let Some(start) = line.rfind("<!--") {
+            in_comment = !line[start..].contains("-->");
+        }
+    }
+    None
+}
+
 /// The same gate over any section: a recut re-cuts a version whose body an earlier wedged cut already rolled into `## [X.Y.Z]`, so it judges that section (the fresh `[Unreleased]` above it is legitimately empty).
+/// An entry above the first `## ` heading is refused too: no section holds it, so the release would drop it without a word.
 pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
     if !has_section(text, section) {
         return Err(Error::new(format!(
             "{CHANGELOG_FILE} has no \"## [{section}]\" section"
+        )));
+    }
+    if let Some(line) = entry_above_every_section(text) {
+        return Err(Error::new(format!(
+            "{CHANGELOG_FILE} line {line}: an entry above the first `## ` heading belongs to no \
+             section, so no release's notes would carry it — move it under \"## [{section}]\""
         )));
     }
     let body = real_body(text, section);

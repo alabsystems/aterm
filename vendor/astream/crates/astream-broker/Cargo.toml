@@ -32,6 +32,11 @@ handshake = ["aead", "astream-aead/handshake"]
 # Client::connect_tcp_identity) — mutual signed-DH (SIGMA/Ed25519), no shared
 # secret. Implies handshake and enables astream-aead's identity (pulls Ed25519).
 identity = ["handshake", "astream-aead/identity"]
+# Off by default: accept relayed records (Broker::set_origin_keys, `origin`). A relayed
+# record's body is its origin's Ed25519 signature and the payload, checked before it is
+# appended, so a build without this refuses every relayed record. The Ed25519 is ring's, through
+# astream-aead, with no handshake or transport.
+relay = ["cap", "dep:astream-aead", "dep:astream-digest", "astream-aead/signature"]
 # Off by default: encrypt-at-rest for the durable log (Broker::open_encrypted /
 # BrokerLog::open_encrypted, and BrokerLog::seal_plaintext, the offline seal of a
 # plaintext log). Seals each record's payload and the .state/.held sidecars on disk
@@ -46,6 +51,11 @@ at-rest = ["dep:astream-aead"]
 # Maintains an authenticated monotonic head watermark (a `<log>.hw` sidecar) so a
 # write-capable attacker cannot silently truncate/roll back the log. Implies at-rest.
 anti-rollback = ["at-rest"]
+# Off by default: serve and dial over a byte stream the embedder already authenticated
+# (Broker::serve_stream, FederationWire::Stream, `connect_stream`). Off, the serve path's
+# connection stays a closed set of concrete transports (`Conn`), which a verified lane can follow;
+# a stream link is a `dyn` callee it cannot. std-only.
+stream = []
 # ON by default (`default` above): retention — the caller's compactions
 # (Broker::retain_before / BrokerLog::retain_before, keeping surviving offsets absolute),
 # the writer's caps, and the retention rules (Broker::set_retention: the prefix rule's
@@ -61,6 +71,7 @@ astream-wire = { workspace = true }
 astream-sys = { workspace = true }
 astream-cap = { workspace = true, optional = true }
 astream-aead = { workspace = true, optional = true }
+astream-digest = { workspace = true, optional = true }
 
 # Dev-only, and IN-TREE (not third-party): the cognition-routing test publishes a
 # REAL astream-agent CogRecord through the bus. astream-agent's own lib graph is

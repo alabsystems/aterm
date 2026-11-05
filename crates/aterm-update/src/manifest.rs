@@ -57,14 +57,19 @@ pub(crate) fn write_durable(
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(&tmp)?;
-        if !file.metadata()?.is_file() {
+        let meta = file.metadata()?;
+        if !meta.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "refusing to write non-regular file",
             ));
         }
-        file.set_len(0)?;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        if meta.len() != 0 {
+            file.set_len(0)?;
+        }
+        if meta.permissions().mode() & 0o7777 != 0o600 {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         file.write_all(text.as_bytes())?;
         aterm_durable::refusal_accepted(crate::durable::finish(&file, flush))
     })();
@@ -291,16 +296,13 @@ impl Ready {
 
 fn cheap_staged_identity_matches(ready: &Ready, app: &Path) -> Option<bool> {
     let plist = app.join("Contents/Info.plist");
-    let metadata = match std::fs::symlink_metadata(&plist) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+    let text = match crate::read_ledger_text_checked(&plist) {
+        Ok(Some(text)) => text,
+        Ok(None) => match std::fs::symlink_metadata(&plist) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            _ => return Some(false),
+        },
         Err(_) => return Some(false),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Some(false);
-    }
-    let Some(text) = crate::read_ledger_text(&plist) else {
-        return Some(false);
     };
     let Some(build) =
         xml_plist_string(&text, "<key>CFBundleVersion</key>").and_then(crate::parse_uint::<u64>)

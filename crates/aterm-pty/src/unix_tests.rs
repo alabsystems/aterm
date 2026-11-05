@@ -1812,22 +1812,19 @@ mod dead_pty_spawns {
             }
         }
         let pid = libc::pid_t::try_from(child.id()).expect("pid");
-        // SAFETY: `getsid`, `getpgid` and `tcgetpgrp` read kernel process/tty ids with no memory aliasing.
-        let (sid, pgid, tpgid) = unsafe {
-            (
-                libc::getsid(pid),
-                libc::getpgid(pid),
-                libc::tcgetpgrp(master.as_raw_fd()),
-            )
-        };
+        // SAFETY: `getsid` and `getpgid` read kernel process ids with no memory aliasing.
+        let (sid, pgid) = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
+        let tpgid = foreground_group(master.as_raw_fd());
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(sid, pid, "child leads its own session");
         assert_eq!(pgid, pid, "child leads its own process group");
         assert_eq!(
-            tpgid, pid,
+            tpgid,
+            Some(pid),
             "child holds the pty's foreground controlling terminal"
         );
+        assert_eq!(foreground_group(-1), None, "no descriptor names no group");
     }
 
     /// `spawn_session_leader_on_pty` checks `dead_pty` before forking: a first fresh pty whose

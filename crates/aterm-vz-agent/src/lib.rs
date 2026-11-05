@@ -53,9 +53,9 @@ pub const COMMAND_PORT: u32 = 1024;
 pub const WATCH_PORT: u32 = 1025;
 
 #[cfg(target_os = "macos")]
-const NONBLOCK_OPEN_FLAG: i32 = 0x0004;
+pub(crate) const NONBLOCK_OPEN_FLAG: i32 = 0x0004 | 0x0100_0000;
 #[cfg(all(unix, not(target_os = "macos")))]
-const NONBLOCK_OPEN_FLAG: i32 = 0o4000;
+pub(crate) const NONBLOCK_OPEN_FLAG: i32 = 0o4000 | 0o2_000_000;
 
 pub(crate) fn open_nonblock(path: &Path) -> io::Result<std::fs::File> {
     #[cfg(unix)]

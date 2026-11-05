@@ -116,7 +116,7 @@ fn value(path: &Path) -> Result<Value> {
     aterm_json::from_slice(&read(path)?).map_err(fail)
 }
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    aterm_codec::hex::encode_lower(bytes)
 }
 fn job(s: &str) -> Result<Job> {
     match s {

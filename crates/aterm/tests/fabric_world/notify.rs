@@ -13,9 +13,18 @@ use crate::harness;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use aterm_models_session::notify_follow_checkpoint_model;
 use harness::{FLEET, Fleet, until};
+
+/// The bound a `--once` run puts on each broker answer ([`harness::ACK_WAIT`]'s seam) and on
+/// each page command (`--exec-timeout`): half the hang detector, so an answer that never comes
+/// or a command that never ends fails the run in words before [`harness::output_within`]'s
+/// bound on it ends the test. A follower, which nothing bounds, waits the hang detector for
+/// both. Each replaces the product's bound (5 s, 30 s): the broker is the test's own, and a
+/// command a test holds (a FIFO it releases once its checks are done) ends when the test lets it.
+const ONCE_WAIT: Duration = Duration::from_secs(harness::DEADLINE.as_secs() / 2);
 
 struct Run {
     status: std::process::ExitStatus,
@@ -54,7 +63,7 @@ impl Watch {
         )
     }
 
-    fn argv(&self, on: &str, exec: &str, extra: &[&str]) -> Vec<String> {
+    fn argv(&self, on: &str, exec: &str, exec_within: Duration, extra: &[&str]) -> Vec<String> {
         let mut v: Vec<String> = ["notify", "--fleet", FLEET, "--broker", &self.sock]
             .into_iter()
             .map(str::to_string)
@@ -70,6 +79,8 @@ impl Watch {
             exec,
             "--since",
             "start",
+            "--exec-timeout",
+            &exec_within.as_millis().to_string(),
         ]
         .iter()
         .map(|s| (*s).to_string())
@@ -84,10 +95,12 @@ impl Watch {
     }
 
     fn once_with(&self, on: &str, exec: &str, extra: &[&str], env: &[(&str, &str)]) -> Run {
-        let mut args = self.argv(on, exec, extra);
+        let mut args = self.argv(on, exec, ONCE_WAIT, extra);
         args.push("--once".to_string());
         let mut cmd = Command::new(harness::aterm_to_launch());
-        cmd.arg("link").args(&args);
+        cmd.arg("link")
+            .args(&args)
+            .env(harness::ACK_WAIT.0, ONCE_WAIT.as_millis().to_string());
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -112,7 +125,11 @@ impl Watch {
         let err = out.try_clone().expect("stdio clone");
         let mut cmd = aterm_uds::spawnfd::command(harness::aterm_to_launch());
         cmd.arg("link")
-            .args(self.argv(on, exec, extra))
+            .args(self.argv(on, exec, harness::DEADLINE, extra))
+            .env(
+                harness::ACK_WAIT.0,
+                harness::ACK_WAIT.1.as_millis().to_string(),
+            )
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(out)
             .stderr(err);

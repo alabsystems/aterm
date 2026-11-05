@@ -66,6 +66,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Paths, Config) {
     machine_identity(&paths).unwrap();
     let config = Config {
         source: Source::Url("http://127.0.0.1:1/v1/team".into()),
+        mirrors: Vec::new(),
         name: "team".into(),
         signer: None,
         followed: Vec::new(),

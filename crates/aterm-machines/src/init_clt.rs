@@ -72,7 +72,7 @@ pub enum Unfinished {
     WindowClosed,
     /// The tools already on this Mac refuse to build ([`Found::Refuses`]).
     Refuses,
-    /// Whether they are installed could not be told ([`Found::Unknown`]).
+    /// Tool state or live installer custody could not be verified ([`Found::Unknown`]).
     Unread,
     /// The run is not in the person's own Mac login.
     NotOwnLogin,
@@ -120,12 +120,10 @@ impl Unfinished {
             Self::AppleWindow => Some(86),
             Self::Other => Some(87),
             Self::WindowClosed => Some(88),
-            Self::Password
-            | Self::Refuses
-            | Self::Unread
-            | Self::NotOwnLogin
-            | Self::LowData
-            | Self::NotAdmin => None,
+            Self::Unread => Some(89),
+            Self::Password | Self::Refuses | Self::NotOwnLogin | Self::LowData | Self::NotAdmin => {
+                None
+            }
         }
     }
 
@@ -194,7 +192,7 @@ impl Unfinished {
             }
             Self::WindowClosed => "Apple's installer window closed without installing them",
             Self::Refuses => "the developer tools already on this Mac do not work",
-            Self::Unread => "aterm could not tell whether they are installed",
+            Self::Unread => "aterm could not verify the developer tools or their installer",
             Self::NotOwnLogin => "it runs only in your own Mac login",
             Self::LowData => "Low Data Mode is on, so the download waits",
             Self::NotAdmin => "only an administrator of this Mac can install them",
@@ -224,17 +222,15 @@ impl Unfinished {
 
 /// The tab's last line while Low Data Mode holds the download back ([`Unfinished::LowData`]).
 pub const TAB_LOW_DATA: &str = "Low Data Mode is on, so the download waits. Turn it off in \
-                                System Settings \u{203a} Network, then press Install\u{2026} \
-                                again.";
+                                System Settings \u{203a} Network; setup resumes automatically.";
 
 /// The tab's last line in an account that is no administrator's ([`Unfinished::NotAdmin`]).
 pub const TAB_NOT_ADMIN: &str = "Only an administrator of this Mac can install Apple's Command \
                                  Line Tools. Ask one to install them from their own login.";
 
 /// The one line the tab says before macOS asks for the password, with the tools missing.
-pub const TAB_INTRO: &str = "aterm is installing Apple's Command Line Tools, which git and your \
-                             GitHub repositories need, and turning on developer mode. macOS asks \
-                             for your Mac password once.";
+pub const TAB_INTRO: &str = "aterm is installing Apple's Command Line Tools for building software \
+                             and turning on developer mode. macOS asks for your Mac password once.";
 
 /// [`TAB_INTRO`] on a Mac that has the tools, where the elevation runs for its other root steps
 /// ([`crate::root_steps::Owed`]).
@@ -344,9 +340,10 @@ pub type Owing = Box<dyn Fn(&dyn System) -> Vec<crate::root_steps::Owed> + Send 
 /// the person's account.
 #[must_use]
 pub fn plain_name(word: &str) -> Option<String> {
-    aterm_secrets::swarm_roster::leading_m_label(word)
-        .filter(|(_, canonical)| canonical == word)
-        .map(|(_, canonical)| canonical)
+    aterm_types::machine_name::Number::parse(word)
+        .ok()
+        .map(|number| number.to_string())
+        .filter(|canonical| canonical == word)
 }
 
 impl CommandLineTools {
@@ -2022,6 +2019,7 @@ mod tests {
             (86, Unfinished::AppleWindow),
             (87, Unfinished::Other),
             (88, Unfinished::WindowClosed),
+            (89, Unfinished::Unread),
         ] {
             assert_eq!(why.code(), Some(code), "{why:?}");
             assert_eq!(
@@ -2033,7 +2031,7 @@ mod tests {
         for code in [
             Some(2),
             Some(79),
-            Some(89),
+            Some(90),
             Some(101),
             Some(126),
             Some(127),
@@ -2175,7 +2173,7 @@ mod tests {
                 codes.push(code);
             }
         }
-        assert_eq!(codes.len(), 9);
+        assert_eq!(codes.len(), 10);
         assert!(TAB_LOW_DATA.contains("Low Data Mode") && TAB_LOW_DATA.contains("Network"));
         assert!(TAB_NOT_ADMIN.contains("administrator"));
         for line in [TAB_INTRO, TAB_INSTALLED] {

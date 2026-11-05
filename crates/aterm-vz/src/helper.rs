@@ -712,10 +712,11 @@ impl<M: Machine> Core<M> {
                 .write(true)
                 .truncate(true)
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(&plan.console_log)
                 .map_err(|e| note!("console.log {}: {e}", plan.console_log.display()))
                 .ok()
+                .filter(|f| f.metadata().is_ok_and(|m| m.is_file()))
         };
         self.console = Console::new();
         self.watch = Some(Watch::new(now));

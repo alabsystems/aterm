@@ -52,7 +52,7 @@ fn run_operation(world: &World, cli: Cli, operation: i64, mut arm: impl FnMut())
             let before = super::super::pool_snapshot(&world.seat(), cli).unwrap();
             let home_path = world.home.join(cli.accounts().default_home);
             arm();
-            super::super::poll_usage(
+            super::poll_fixture(
                 &world.seat(),
                 cli,
                 &before,

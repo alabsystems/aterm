@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use aterm_uds::private_file::{self, PrivateDir};
 
 use super::{Built, Plan, Profile, Request, executable_of, safe_name};
-use crate::artifact::tools::{Run, Tools};
+use crate::artifact::tools::{Ran, Run, Tools};
 use crate::artifact::{arch, pack, toolchain};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
@@ -68,21 +68,21 @@ fn reserve_private_dir(home: &Path, path: &Path) -> Result<()> {
         .create(path)
         .map_err(|e| Error::io(format!("reserve {}", path.display()), &e))?;
     // This call made the name exclusively; only that new directory is normalized.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| Error::io("set new private directory mode", &e))?;
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .and_then(|f| f.set_permissions(std::fs::Permissions::from_mode(0o700)))
+            .map_err(|e| Error::io("set new private directory mode", &e))?;
+    }
     private_file::check_private_dir(path)
         .map_err(|e| Error::io("check private harness directory", &e))
 }
 
 fn payload(path: &Path, private: bool) -> Result<Payload> {
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|e| Error::io(format!("inspect {}", path.display()), &e))?;
-    if !meta.is_file() || !atpkg::platform::dir_meta_is_private(&meta) {
-        return Err(Error::refused(
-            "a harness executable must be a regular non-link file",
-        ));
-    }
-    let mut file = if private {
+    let (mut file, opened) = if private {
         let parent = path
             .parent()
             .ok_or_else(|| Error::refused("executable has no parent"))?;
@@ -92,15 +92,10 @@ fn payload(path: &Path, private: bool) -> Result<Payload> {
             .ok_or_else(|| Error::refused("executable has no ordinary name"))?;
         private_file::open_private(parent, name)
             .map_err(|e| Error::refused(format!("private harness executable: {e}")))?
-            .0
     } else {
         crate::identity::open_regular_nonblock(path)
             .map_err(|e| Error::io("open compiler output", &e))?
-            .0
     };
-    let opened = file
-        .metadata()
-        .map_err(|e| Error::io("compiler output metadata", &e))?;
     if !opened.is_file() || !atpkg::platform::dir_meta_is_private(&opened) {
         return Err(Error::refused(
             "the executable is not an owned non-writable regular file",
@@ -122,11 +117,7 @@ fn payload(path: &Path, private: bool) -> Result<Payload> {
     if size != opened.len() {
         return Err(Error::refused("the executable changed while hashing"));
     }
-    let sha256 = hash
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let sha256 = aterm_codec::hex::encode_lower(&hash.finalize());
     Ok(Payload { size, sha256 })
 }
 
@@ -140,6 +131,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(path)
         .map_err(|e| Error::io(format!("create {}", path.display()), &e))?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
@@ -160,6 +152,7 @@ fn copy_new(from: &Path, to: &Path) -> Result<()> {
         .write(true)
         .create_new(true)
         .mode(0o700)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(to)
         .map_err(|e| Error::io(format!("reserve {}", to.display()), &e))?;
     std::io::copy(&mut input, &mut output)
@@ -195,7 +188,67 @@ pub(super) fn destination(req: &Request, plan: &Plan) -> PathBuf {
     ))
 }
 
-pub(super) fn build(ctx: &Ctx, req: &Request, plan: &Plan, tools: &dyn Tools) -> Result<Built> {
+/// Prepared artifact custody retaining the original pack and toolchain leases.
+/// Only the existing checked preparation path can construct this state.
+pub struct HarnessBuild {
+    req: Request,
+    plan: Plan,
+    home: PathBuf,
+    checkout: PathBuf,
+    target: PathBuf,
+    dest: PathBuf,
+    logs: PathBuf,
+    analysis_home: Option<PathBuf>,
+    _turn: aterm_update_core::FileLock,
+    _lease: std::sync::Arc<toolchain::Held>,
+    _target_lease: aterm_capacity::epoch_target::TargetLease,
+}
+
+/// Original artifact acceptance and ancillary observations, kept independent.
+pub struct HarnessCompletion {
+    /// The unchanged native/source/artifact acceptance result.
+    pub built: Result<Built>,
+    /// Exact-session observations, or a closed unavailable reason.
+    pub cache_work: aterm_capacity::cache_work::Collection,
+}
+
+#[path = "build_local_harness_epoch.rs"]
+mod epoch;
+
+#[path = "build_local_harness_cache_work.rs"]
+mod cache_work;
+pub use cache_work::HarnessCacheWork;
+
+impl HarnessBuild {
+    /// Original manifest to dispatch through the execution owner.
+    #[must_use]
+    pub fn manifest(&self) -> PathBuf {
+        self.checkout.join("Cargo.toml")
+    }
+
+    /// Stable compiler target, independent of epoch transport and artifact.
+    #[must_use]
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// Lend this original target to one actual owner compile while retaining
+    /// exclusivity through subsequent artifact acceptance.
+    /// # Errors
+    /// Another live loan or a changed original target/lock inode.
+    pub fn target_loan(&mut self) -> Result<aterm_capacity::epoch_target::TargetLoan> {
+        self._target_lease
+            .loan()
+            .map_err(|e| Error::io("lend original compiler target", &e))
+    }
+}
+
+/// Prepare the existing native artifact builder before compilation.
+/// The returned value retains the original pack and toolchain leases.
+/// # Errors
+/// Invalid source/compiler identity, unsafe ancestry, an existing immutable
+/// artifact reservation, or unavailable original locks and toolchain custody.
+pub fn prepare(ctx: &Ctx, req: &Request, plan: &Plan) -> Result<HarnessBuild> {
     if super::harness_compiler(&plan.compiler_text)? != plan.compiler {
         return Err(Error::refused(
             "the harness plan's compiler differs from its checked -vV identity",
@@ -223,6 +276,8 @@ pub(super) fn build(ctx: &Ctx, req: &Request, plan: &Plan, tools: &dyn Tools) ->
         .filter(|target| target.starts_with(&plan.out))
         .ok_or_else(|| Error::refused("the harness target must be in its admitted output root"))?;
     ancestry(&ctx.home, &target, true)?;
+    let _target_lease = aterm_capacity::epoch_target::TargetLease::acquire(&target)
+        .map_err(|e| Error::io("retain original compiler target", &e))?;
     let profile = target.join(match req.profile {
         Profile::Release => "release",
         Profile::Dev => "debug",
@@ -265,132 +320,183 @@ pub(super) fn build(ctx: &Ctx, req: &Request, plan: &Plan, tools: &dyn Tools) ->
         .collect::<Vec<_>>()
         .join(" ");
     write_new(&logs.join("build-command.txt"), shown_command.as_bytes())?;
+    eprintln!("atpkg-publish: local harness logs in {}", ctx.shown(&logs));
+    Ok(HarnessBuild {
+        req: req.clone(),
+        plan: plan.clone(),
+        home: ctx.home.clone(),
+        checkout: checkout.to_path_buf(),
+        target,
+        dest,
+        logs,
+        analysis_home: cache_work::original_cargo_home(plan),
+        _turn,
+        _lease: std::sync::Arc::new(_lease),
+        _target_lease,
+    })
+}
+
+pub(super) fn build(ctx: &Ctx, req: &Request, plan: &Plan, tools: &dyn Tools) -> Result<Built> {
+    let prepared = prepare(ctx, req, plan)?;
     let mut command = plan.command.clone();
     command.args.push("--message-format=json".into());
-    eprintln!("atpkg-publish: local harness logs in {}", ctx.shown(&logs));
     let ran = tools
         .run(&command)
         .map_err(|e| Error::cannot_run(format!("the build: {e}")))?;
-    write_new(&logs.join("build.stderr"), &ran.stderr)?;
-    if !ran.success() {
-        return Err(Error::refused(format!(
-            "the harness build failed; see {}",
-            logs.display()
-        )));
+    prepared.complete(ctx, tools, ran)
+}
+
+impl HarnessBuild {
+    fn complete(self, ctx: &Ctx, tools: &dyn Tools, ran: Ran) -> Result<Built> {
+        if self.home != ctx.home {
+            return Err(Error::refused(
+                "prepared harness home changed before completion",
+            ));
+        }
+        let Self {
+            req,
+            plan,
+            checkout,
+            target,
+            dest,
+            logs,
+            _turn,
+            _lease,
+            _target_lease,
+            ..
+        } = self;
+        let identity = plan
+            .harness
+            .as_ref()
+            .ok_or_else(|| Error::refused("prepared harness source identity is missing"))?;
+        _target_lease
+            .check()
+            .map_err(|e| Error::io("reprove original compiler target", &e))?;
+        write_new(&logs.join("build.stdout"), &ran.stdout)?;
+        write_new(&logs.join("build.stderr"), &ran.stderr)?;
+        if !ran.success() {
+            return Err(Error::refused(format!(
+                "the harness build failed; see {}",
+                logs.display()
+            )));
+        }
+        identity.recheck(&checkout)?;
+        if plan.bins.len() != 1 || plan.metadata.expose != plan.bins {
+            return Err(Error::refused(
+                "a local harness must produce exactly its declared tool",
+            ));
+        }
+        let bin = &plan.bins[0];
+        if !safe_name(bin) {
+            return Err(Error::refused("unsafe local harness tool name"));
+        }
+        let exe = executable_of(&ran.stdout, bin)
+            .ok_or_else(|| Error::refused("the harness build produced no unique executable"))?;
+        if !exe.starts_with(&target) {
+            return Err(Error::refused(
+                "the compiler output leaves its admitted target",
+            ));
+        }
+        ancestry(
+            &ctx.home,
+            exe.parent()
+                .ok_or_else(|| Error::refused("compiler output has no parent"))?,
+            false,
+        )?;
+        let before = payload(&exe, false)?;
+        ancestry(
+            &ctx.home,
+            dest.parent()
+                .ok_or_else(|| Error::refused("artifact has no parent"))?,
+            true,
+        )?;
+        // Reserve once and write in place. A failed or unproved first start never
+        // permits a later attempt to rename, remove or overwrite this path.
+        reserve_private_dir(&ctx.home, &dest)?;
+        reserve_private_dir(&ctx.home, &dest.join("bin"))?;
+        let staged = dest.join("bin").join(bin);
+        copy_new(&exe, &staged)?;
+        if payload(&staged, true)? != before || payload(&exe, false)? != before {
+            return Err(Error::refused(
+                "the harness executable changed while staging",
+            ));
+        }
+        arch::gate(plan.triple, std::slice::from_ref(&staged))?;
+        ancestry(&ctx.home, &dest, false)?;
+        private_file::check_private_dir(&dest)
+            .map_err(|e| Error::io("recheck harness artifact", &e))?;
+        let _private = private_file::open_private(
+            staged
+                .parent()
+                .ok_or_else(|| Error::refused("harness bin absent"))?,
+            bin,
+        )
+        .map_err(|e| Error::refused(format!("private executable before version proof: {e}")))?;
+        let mut version = Run::new(&staged, ["--version"]).bounded();
+        version.clear_env = true;
+        version.env.push(("HOME".into(), ctx.home.clone().into()));
+        let probe = tools
+            .run(&version)
+            .map_err(|e| Error::refused(format!("harness version probe: {e}")))?;
+        write_new(
+            &logs.join(format!("{bin}-version.txt")),
+            probe.text().as_bytes(),
+        )?;
+        if !probe.success() || !version_proof(&probe.stdout, &req.program, &identity.version) {
+            return Err(Error::refused(
+                "the harness did not report its exact compiled build version",
+            ));
+        }
+        identity.recheck(&checkout)?;
+        ancestry(&ctx.home, &dest, false)?;
+        _target_lease
+            .check()
+            .map_err(|e| Error::io("reprove target after version proof", &e))?;
+        private_file::check_private_dir(&dest)
+            .map_err(|e| Error::io("recheck harness artifact", &e))?;
+        if payload(&staged, true)? != before || payload(&exe, false)? != before {
+            return Err(Error::refused(
+                "the harness executable changed during its version proof",
+            ));
+        }
+        let relative = format!("bin/{bin}");
+        write_new(
+            &dest.join("SHA256SUMS"),
+            format!("{}  {relative}\n", before.sha256).as_bytes(),
+        )?;
+        let record = aterm_json::json!({
+            "schema": 2, "origin": "local-build", "program": req.program,
+            "source": identity.source, "build_number": identity.build_number,
+            "version": identity.version, "source_policy": "clean-main", "command": bin,
+            "compiler": plan.compiler, "sysroot": plan.sysroot.display().to_string(),
+            "target": plan.triple.as_str(), "policy": req.policy.as_str(),
+            "profile": req.profile.as_str(), "checkout": checkout.display().to_string(),
+            "logs": logs.display().to_string(), "exposes": plan.metadata.expose,
+            "executables": [{"path": relative, "size": before.size, "sha256": before.sha256}]
+        });
+        let encoded = aterm_json::to_vec(&record)
+            .map_err(|e| Error::cannot_run(format!("local receipt: {e}")))?;
+        aterm_durable::durable_dir(&dest.join("bin"))
+            .map_err(|e| Error::io("flush harness bin", &e))?;
+        // The complete receipt is last; a partial artifact is retained and never installed.
+        write_new(&dest.join("local-build.json"), &encoded)?;
+        aterm_durable::durable_dir(&dest).map_err(|e| Error::io("flush harness receipt", &e))?;
+        aterm_durable::durable_dir(
+            dest.parent()
+                .ok_or_else(|| Error::refused("artifact has no parent"))?,
+        )
+        .map_err(|e| Error::io("flush harness artifact parent", &e))?;
+        Ok(Built {
+            link: vec![
+                "aterm".into(),
+                "pkg".into(),
+                "link".into(),
+                req.program.clone(),
+                dest.display().to_string(),
+                relative,
+            ],
+            dest,
+            logs,
+        })
     }
-    identity.recheck(checkout)?;
-    if plan.bins.len() != 1 || plan.metadata.expose != plan.bins {
-        return Err(Error::refused(
-            "a local harness must produce exactly its declared tool",
-        ));
-    }
-    let bin = &plan.bins[0];
-    if !safe_name(bin) {
-        return Err(Error::refused("unsafe local harness tool name"));
-    }
-    let exe = executable_of(&ran.stdout, bin)
-        .ok_or_else(|| Error::refused("the harness build produced no unique executable"))?;
-    if !exe.starts_with(&target) {
-        return Err(Error::refused(
-            "the compiler output leaves its admitted target",
-        ));
-    }
-    ancestry(
-        &ctx.home,
-        exe.parent()
-            .ok_or_else(|| Error::refused("compiler output has no parent"))?,
-        false,
-    )?;
-    let before = payload(&exe, false)?;
-    ancestry(
-        &ctx.home,
-        dest.parent()
-            .ok_or_else(|| Error::refused("artifact has no parent"))?,
-        true,
-    )?;
-    // Reserve once and write in place. A failed or unproved first start never
-    // permits a later attempt to rename, remove or overwrite this path.
-    reserve_private_dir(&ctx.home, &dest)?;
-    reserve_private_dir(&ctx.home, &dest.join("bin"))?;
-    let staged = dest.join("bin").join(bin);
-    copy_new(&exe, &staged)?;
-    if payload(&staged, true)? != before || payload(&exe, false)? != before {
-        return Err(Error::refused(
-            "the harness executable changed while staging",
-        ));
-    }
-    arch::gate(plan.triple, std::slice::from_ref(&staged))?;
-    ancestry(&ctx.home, &dest, false)?;
-    private_file::check_private_dir(&dest)
-        .map_err(|e| Error::io("recheck harness artifact", &e))?;
-    let _private = private_file::open_private(
-        staged
-            .parent()
-            .ok_or_else(|| Error::refused("harness bin absent"))?,
-        bin,
-    )
-    .map_err(|e| Error::refused(format!("private executable before version proof: {e}")))?;
-    let mut version = Run::new(&staged, ["--version"]).bounded();
-    version.clear_env = true;
-    version.env.push(("HOME".into(), ctx.home.clone().into()));
-    let probe = tools
-        .run(&version)
-        .map_err(|e| Error::refused(format!("harness version probe: {e}")))?;
-    write_new(
-        &logs.join(format!("{bin}-version.txt")),
-        probe.text().as_bytes(),
-    )?;
-    if !probe.success() || !version_proof(&probe.stdout, &req.program, &identity.version) {
-        return Err(Error::refused(
-            "the harness did not report its exact compiled build version",
-        ));
-    }
-    identity.recheck(checkout)?;
-    ancestry(&ctx.home, &dest, false)?;
-    private_file::check_private_dir(&dest)
-        .map_err(|e| Error::io("recheck harness artifact", &e))?;
-    if payload(&staged, true)? != before || payload(&exe, false)? != before {
-        return Err(Error::refused(
-            "the harness executable changed during its version proof",
-        ));
-    }
-    let relative = format!("bin/{bin}");
-    write_new(
-        &dest.join("SHA256SUMS"),
-        format!("{}  {relative}\n", before.sha256).as_bytes(),
-    )?;
-    let record = aterm_json::json!({
-        "schema": 2, "origin": "local-build", "program": req.program,
-        "source": identity.source, "build_number": identity.build_number,
-        "version": identity.version, "source_policy": "clean-main", "command": bin,
-        "compiler": plan.compiler, "sysroot": plan.sysroot.display().to_string(),
-        "target": plan.triple.as_str(), "policy": req.policy.as_str(),
-        "profile": req.profile.as_str(), "checkout": checkout.display().to_string(),
-        "logs": logs.display().to_string(), "exposes": plan.metadata.expose,
-        "executables": [{"path": relative, "size": before.size, "sha256": before.sha256}]
-    });
-    let encoded = aterm_json::to_vec(&record)
-        .map_err(|e| Error::cannot_run(format!("local receipt: {e}")))?;
-    aterm_durable::durable_dir(&dest.join("bin"))
-        .map_err(|e| Error::io("flush harness bin", &e))?;
-    // The complete receipt is last; a partial artifact is retained and never installed.
-    write_new(&dest.join("local-build.json"), &encoded)?;
-    aterm_durable::durable_dir(&dest).map_err(|e| Error::io("flush harness receipt", &e))?;
-    aterm_durable::durable_dir(
-        dest.parent()
-            .ok_or_else(|| Error::refused("artifact has no parent"))?,
-    )
-    .map_err(|e| Error::io("flush harness artifact parent", &e))?;
-    Ok(Built {
-        link: vec![
-            "aterm".into(),
-            "pkg".into(),
-            "link".into(),
-            req.program.clone(),
-            dest.display().to_string(),
-            relative,
-        ],
-        dest,
-        logs,
-    })
 }

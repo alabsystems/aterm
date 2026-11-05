@@ -71,6 +71,29 @@ impl<C: Ctl> Session<'_, C> {
         self.facts.state.pending(reading.as_ref(), now_ms)
     }
 
+    /// Returns the untold overlap that `action` may carry ([`FactKind::Overlap`]), if any, asked
+    /// once the facts reading and a declared wake gave none, as the kinds rank. It is the host's
+    /// own door ([`IdleHost::overlap`]), apart from [`IdleHost::facts`], so a reading of the jobs
+    /// forgets no overlap and the break's stuck line, which reads the jobs alone, never carries
+    /// one.
+    pub(super) fn overlap_for(
+        &mut self,
+        action: &TurnEndAction,
+        opts: &SuperviseOpts,
+    ) -> Option<Fact> {
+        if !opts.policy.facts || !fact_may_ride(&self.turn_end, action) {
+            return None;
+        }
+        let host = opts.idle_host.clone()?;
+        if self.fx.replay_lacks_host_door("host.overlap") {
+            return None;
+        }
+        let reading = host.overlap();
+        let now_ms = self.now_unix_ms();
+        self.facts.state.observe_overlap(reading.as_ref(), now_ms);
+        self.facts.state.pending_overlap(reading.as_ref(), now_ms)
+    }
+
     /// The decision is `action`: the fact it carries (`fact`, or a declared wake's `wake`, where
     /// it rode) waits for the act.
     pub(super) fn fact_offer(
@@ -182,7 +205,7 @@ impl<C: Ctl> Session<'_, C> {
         let reading = host.facts();
         let now_ms = self.now_unix_ms();
         self.facts.state.observe(reading.as_ref(), now_ms);
-        let Some(fact) = self.facts.state.pending(reading.as_ref(), now_ms) else {
+        let Some(fact) = self.facts.state.pending_at_break(reading.as_ref(), now_ms) else {
             return Ok(false);
         };
         let now = at + waited;

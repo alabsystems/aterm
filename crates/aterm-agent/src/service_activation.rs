@@ -48,7 +48,7 @@ fn value(path: &Path) -> Result<Value> {
     aterm_json::from_slice(&read(path)?).map_err(fail)
 }
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    aterm_codec::hex::encode_lower(bytes)
 }
 fn signature(v: &Value) -> Result<[u8; 64]> {
     let s = v["signature"]
@@ -113,6 +113,37 @@ fn check_denied(paths: &Paths, node: &str, key: &aterm_net::fleet::NodeKey) -> R
     }
     Ok(())
 }
+/// The signed membership frontier an activation request names (`prepare_request`) and its
+/// target checks (`verify_candidate`): the heads of this Mac's store as authority reads it
+/// ([`client::load_acknowledged_records`]), hex, the store its membership verdict is read from.
+/// Records a write made durable and no writer has acknowledged yet are not in it.
+///
+/// # Errors
+/// [`client::load_acknowledged_records`]' errors: a store that omits history this Mac
+/// acknowledged (its records file gone, an older snapshot put back) refuses, of kind
+/// [`aterm_secrets::ErrorKind::MembershipHistoryUnavailable`], rather than naming raw heads.
+pub(crate) fn membership_frontier(paths: &Paths) -> Result<Vec<String>> {
+    Ok(client::load_acknowledged_records(paths)?
+        .frontier()
+        .iter()
+        .map(|id| hex(id))
+        .collect())
+}
+
+/// Refuse an activation whose `health` omits a head of this Mac's [`membership_frontier`].
+///
+/// # Errors
+/// [`membership_frontier`]'s errors; the frontier is empty, or `health.records` omits a head of it.
+pub(crate) fn require_membership_frontier(paths: &Paths, health: &HealthRequirement) -> Result<()> {
+    let frontier = membership_frontier(paths)?;
+    if frontier.is_empty() || frontier.iter().any(|id| !health.records.contains(id)) {
+        return Err(fail(
+            "activation omits the current signed membership frontier",
+        ));
+    }
+    Ok(())
+}
+
 /// Native service operations with the same authority and health checks in every caller.
 pub struct NativeBackend {
     paths: Paths,
@@ -265,6 +296,7 @@ impl Backend for NativeBackend {
         let body = aterm_json::to_vec(&transaction::request_value(r)).map_err(fail)?;
         let membership = crate::fleet_log::LocalLog::of(&self.paths)
             .keys()
+            .filter(|keys| keys.unread().is_none())
             .ok_or_else(|| fail("current signed membership unavailable"))?;
         if !membership.admits(&key) || !membership.admits(&identity()?.key()) {
             return Err(fail("requester or target lacks current signed membership"));
@@ -413,17 +445,7 @@ impl Backend for NativeBackend {
                 "activation health target differs from configured vault",
             ));
         }
-        let frontier = client::load_records(&self.paths)?.frontier();
-        if frontier.is_empty()
-            || frontier
-                .iter()
-                .any(|id| !r.health.records.contains(&hex(id)))
-        {
-            return Err(fail(
-                "activation omits the current signed membership frontier",
-            ));
-        }
-        Ok(())
+        require_membership_frontier(&self.paths, &r.health)
     }
     fn install(&mut self, job: Job, unit: &Unit) -> Result<()> {
         self.proof = None;
@@ -575,11 +597,7 @@ pub fn prepare_request(
         client::Membership::In { seq, .. } => seq,
         _ => return Err(fail("not a vault member")),
     };
-    let records = client::load_records(paths)?
-        .frontier()
-        .iter()
-        .map(|r| hex(r))
-        .collect();
+    let records = membership_frontier(paths)?;
     let store = Store::new(store_root(paths)).map_err(fail)?;
     Ok(Request {
         node: identity()?.node().into(),
@@ -618,6 +636,7 @@ pub fn authorize_rpc(paths: &Paths, requester: &str, key: &str) -> Result<()> {
     check_denied(paths, requester, &key)?;
     let membership = crate::fleet_log::LocalLog::of(paths)
         .keys()
+        .filter(|keys| keys.unread().is_none())
         .ok_or_else(|| fail("current signed membership unavailable"))?;
     if !membership.admits(&key) || !membership.admits(&identity()?.key()) {
         return Err(fail("RPC requester or target is no longer a member"));

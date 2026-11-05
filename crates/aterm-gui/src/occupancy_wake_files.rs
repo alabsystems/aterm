@@ -186,10 +186,11 @@ pub(crate) trait WakeFs: Send + Sync {
     fn watch(&self, path: &Path, what: Watched, id: u64) -> io::Result<WatchFd>;
     /// The watches that fired within `timeout`.
     fn wait(&self, timeout: Duration) -> Vec<Fired>;
-    /// A reader of the regular file at `path` (`O_NONBLOCK | O_NOFOLLOW_ANY`, then `S_ISREG`).
+    /// A reader of the regular file at `path` (`O_NONBLOCK | O_NOFOLLOW_ANY`, then `S_ISREG`),
+    /// paired with its `(dev, ino, size)` identity from the same `fstat`.
     /// # Errors
     /// The open's, or `EFTYPE` for anything but a regular file.
-    fn reader(&self, path: &Path) -> io::Result<std::fs::File>;
+    fn reader(&self, path: &Path) -> io::Result<(std::fs::File, (u64, u64, u64))>;
     /// The process's watch budget.
     fn watch_cap(&self) -> usize;
 }
@@ -899,8 +900,7 @@ impl Arms<'_> {
         per_atom: u64,
         left: &mut u64,
     ) -> io::Result<bool> {
-        let mut file = self.fs.reader(at)?;
-        let (dev, ino, size) = identity_of(&file)?;
+        let (mut file, (dev, ino, size)) = self.fs.reader(at)?;
         let (held, read) =
             entry
                 .reader
@@ -1010,21 +1010,6 @@ fn nothing_regular(error: &io::Error) -> bool {
     #[cfg(not(unix))]
     {
         error.kind() == io::ErrorKind::NotFound
-    }
-}
-
-/// A reader's file: its device, inode and size.
-fn identity_of(file: &std::fs::File) -> io::Result<(u64, u64, u64)> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let meta = file.metadata()?;
-        Ok((meta.dev(), meta.ino(), meta.len()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
 
@@ -1195,10 +1180,11 @@ impl WakeFs for Disk {
         Vec::new()
     }
 
-    fn reader(&self, path: &Path) -> io::Result<std::fs::File> {
+    fn reader(&self, path: &Path) -> io::Result<(std::fs::File, (u64, u64, u64))> {
         #[cfg(unix)]
         {
-            aterm_uds::nofollow::open_reader(path).map(std::fs::File::from)
+            aterm_uds::nofollow::open_reader_with_identity(path)
+                .map(|(fd, id)| (std::fs::File::from(fd), (id.dev, id.ino, id.size)))
         }
         #[cfg(not(unix))]
         {

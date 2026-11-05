@@ -2345,9 +2345,9 @@ fn parse_v0_145_envelope_grammar(bytes: &[u8]) -> Result<(String, u64, usize), S
         return Err("envelope: lines follow `signature:`".to_owned());
     }
     let signed_prefix_len = text.len() - sig_line.len() - 1;
-    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &signer)
-        .verify(&bytes[..signed_prefix_len], &sig)
-        .map_err(|_| "envelope: signature verification failed".to_owned())?;
+    if !astream_aead::signature::verify(&signer, &bytes[..signed_prefix_len], &sig) {
+        return Err("envelope: signature verification failed".to_owned());
+    }
     Ok((name.to_owned(), seq, locker_count))
 }
 
@@ -4156,6 +4156,7 @@ fn a_mac_a_release_behind_a_rotation_roots_the_genesis_the_new_key_signed() {
             &member,
             &Config {
                 source: Source::Url("http://alab-secrets.local:7484/v1/alab".to_owned()),
+                mirrors: Vec::new(),
                 name: crate::ALAB_VAULT.to_owned(),
                 signer: Some(signer),
                 followed,

@@ -221,7 +221,7 @@ fn an_unchanged_mode_file_cannot_resurrect_an_exhausted_prearm() {
             .starts_with("limit:five_hour:")
     );
     assert!(stub.mode().starts_with("limit:five_hour:"));
-    stub.set_mode(mode, false);
+    stub.set_mode(mode).unwrap();
     assert_eq!(stub.mode(), mode);
     assert!(stub.st().limit_arm.is_none());
     assert!(
@@ -229,7 +229,7 @@ fn an_unchanged_mode_file_cannot_resurrect_an_exhausted_prearm() {
             .unwrap()
             .starts_with("limit:five_hour:")
     );
-    stub.set_mode("ok", false);
+    stub.set_mode("ok").unwrap();
     assert_eq!(
         stub.mode_for_request(mode, true).unwrap(),
         "ok",
@@ -352,7 +352,7 @@ fn replaced_finite_mode_admits_its_current_allowance(from_file: bool) {
             std::fs::write(&file, &replacement).unwrap();
             assert_eq!(stub.mode(), replacement);
         } else {
-            stub.set_mode(&replacement, false);
+            stub.set_mode(&replacement).unwrap();
         }
         assert!(stub.st().limit_arm.is_none());
         assert!(messages_at_snapshot(&stub, &snapshot, side).starts_with("HTTP/1.1 200 "));
@@ -402,7 +402,7 @@ fn replaced_finite_mode_admits_its_current_allowance(from_file: bool) {
             assert!(arm.raised_ms > 0);
             assert!((240_000..300_000).contains(&(arm.reset_s * 1000 - arm.raised_ms)));
         }
-        stub.set_mode("ok", false);
+        stub.set_mode("ok").unwrap();
         assert!(messages_at_snapshot(&stub, &snapshot, main).starts_with("HTTP/1.1 200 "));
         assert!(
             stub.st().limit_arm.is_none(),
@@ -429,7 +429,7 @@ fn replaced_finite_mode_admits_its_current_allowance(from_file: bool) {
             std::fs::write(&file, malformed).unwrap();
             assert_eq!(stub.mode(), malformed);
         } else {
-            stub.set_mode(malformed, false);
+            stub.set_mode(malformed).unwrap();
         }
         for body in [main.as_slice(), side.as_slice()] {
             let refused = messages_at_snapshot(&stub, &snapshot, body);
@@ -527,12 +527,12 @@ fn every_admitting_protocol_refuses_a_reserved_mode_replaced_after_its_snapshot(
                 _ => unreachable!(),
             })
         };
-        stub.set_mode(original, false);
+        stub.set_mode(original).unwrap();
         assert!(
             answer_for("ok").starts_with("HTTP/1.1 200 "),
             "{protocol}: ordinary control"
         );
-        stub.set_mode("limit-after:bad", false);
+        stub.set_mode("limit-after:bad").unwrap();
         let answer = answer_for(&snapshot);
         assert!(answer.starts_with("HTTP/1.1 400 "), "{protocol}: {answer}");
         let error = J::parse(answer.split_once("\r\n\r\n").unwrap().1).unwrap();
@@ -1332,8 +1332,8 @@ fn each_headers_verb_keeps_the_others_entries() {
 
 #[test]
 fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
-    let dir = std::env::temp_dir().join(format!("lab-stub-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(scratch.path()).unwrap();
     let log = dir.join("stub.log");
     let mode_file = dir.join("mode");
     std::fs::write(&mode_file, "ok\n").unwrap();
@@ -1507,7 +1507,6 @@ fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
             .any(|(i, _)| *i == n + 1),
         "the side call is no turn"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2988,4 +2987,28 @@ fn an_anthropic_rate_limit_names_its_wait_in_its_header_alone() {
         "{}",
         body.py()
     );
+}
+
+#[test]
+fn a_failed_mode_write_keeps_the_active_mode_and_refuses_the_control_request() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mode_file = dir.path().join("mode");
+    std::fs::create_dir(&mode_file).unwrap();
+    let args = Args {
+        mode_file: Some(mode_file.clone()),
+        ..Args::default()
+    };
+    let stub = Stub::new(args.clone());
+    assert!(stub.set_mode("overloaded").is_err());
+    assert_eq!(stub.mode(), "ok");
+    assert!(mode_file.is_dir());
+
+    let (port, _) = start(args).unwrap();
+    let port = port.to_string();
+    assert!(
+        control(&port, "/__mode?m=overloaded")
+            .unwrap_err()
+            .ends_with("answered 500")
+    );
+    assert_eq!(control(&port, "/__mode").unwrap(), r#"{"mode": "ok"}"#);
 }

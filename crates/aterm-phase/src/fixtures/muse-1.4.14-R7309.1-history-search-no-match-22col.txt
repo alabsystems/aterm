@@ -1,0 +1,51 @@
+# muse 1.4.14-R7309.1 · MEASURED 2026-11-04, `aterm ctl text` of a private headless aterm (22x50, aterm 0.154.0) running the real Muse Code, launched by path with the lab fake key and `--base-url` the local stub of the API (crates/aterm-lab) · Muse Code's prompt-history search (ctrl+r) open in a 22-column window, query zzq matching nothing, over an empty composer: the search row is cut from the left (` matching prompt: zzq`), the cursor after the query · cursor=20,21
+
+  Muse Code 1.4.14
+
+❯ alpha old prompt one
+
+◆ Hi! I am the local
+  lab stub, not a
+  model. (reply 1)
+
+❯ beta old prompt two
+
+◆ Hi! I am the local
+  lab stub, not a
+  model. (reply 2)
+
+◆ Recap: ok
+
+── Voice input (⌥ + …
+❯
+──────────────────────
+ matching prompt: zzq
+  lab-stub · high · p…
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

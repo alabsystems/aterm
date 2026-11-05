@@ -181,6 +181,7 @@ fn exercise(reader: i64, shape: i64, fault: i64) -> [bool; 4] {
             };
             let agent = WalledAgent {
                 screen_wall: None,
+                sync: true,
                 snap: &snap,
                 session: "unused",
                 own: true,

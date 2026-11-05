@@ -79,7 +79,7 @@ impl Inventory {
             if matches!(name, HEADER | MUTATION | CLOSED) || name == latest.name {
                 let file = open(root, name, false, false)?;
                 let (text, stamp) = bytes(&file, MAX_ENTRY)?;
-                if file.metadata()?.mode() & 0o111 != 0 {
+                if stamp.mode() & 0o111 != 0 {
                     return Err(bad("terminal inventory contains executable data"));
                 }
                 if (name == HEADER && text != transaction.anchor.header)

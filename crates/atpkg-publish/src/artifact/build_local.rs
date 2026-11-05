@@ -18,6 +18,10 @@ use crate::triple::Triple;
 #[path = "build_local_harness.rs"]
 mod harness;
 
+/// Original prepared harness custody and the shared artifact-validation path.
+#[cfg(unix)]
+pub use harness::{HarnessBuild, HarnessCacheWork, HarnessCompletion, prepare as prepare_harness};
+
 /// Which lane builds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Policy {
@@ -86,6 +90,10 @@ pub struct Plan {
     pub source: String,
     /// A registered harness's clean main identity; ordinary local builds retain their own lane.
     pub harness: Option<pack::HarnessIdentity>,
+    /// Whether this exact driver implements complete content freshness for reusable inputs.
+    pub cache_freshness: CacheFreshness,
+    /// The original immutable driver uniquely reports genuine JSON session markers.
+    pub analysis_session: bool,
     /// The compiler's commit.
     pub compiler: String,
     /// The compiler's `-vV`, verbatim.
@@ -100,6 +108,124 @@ pub struct Plan {
     pub bins: Vec<String>,
     /// The artifact root.
     pub out: PathBuf,
+}
+
+/// Cache eligibility, not proof or resource authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheFreshness {
+    /// Keep compiler state isolated by full source identity.
+    ExactSource,
+    /// The actual driver reports content freshness for Rust and declared build inputs.
+    ContentInputsV1,
+}
+
+pub(crate) const CONTENT_CONFIG: &str = "build.fingerprint=\"content\"";
+pub(crate) const CHECKSUM_FLAG: &str = "-Zchecksum-freshness";
+
+fn driver_capabilities(tools: &dyn Tools, program: &Path) -> (CacheFreshness, bool) {
+    let mut query = Run::new(program, ["--unverified", "-vV"]).bounded();
+    query.clear_env = true;
+    let Ok(output) = tools.run(&query) else {
+        return (CacheFreshness::ExactSource, false);
+    };
+    let complete = output.success()
+        && output.stdout.len() <= 8192
+        && std::str::from_utf8(&output.stdout).is_ok_and(|text| {
+            text.starts_with("targo ")
+                && text
+                    .lines()
+                    .any(|line| line == "freshness: rust-and-build-input-content-v1")
+                && text
+                    .lines()
+                    .any(|line| line == "cache-integrity: build-script-control-output-v1")
+                && text
+                    .lines()
+                    .any(|line| line == "cache-integrity: compiled-build-script-executable-v1")
+                && text
+                    .lines()
+                    .any(|line| line == "cache-integrity: build-script-generated-tree-v1")
+        });
+    let analysis = output.success()
+        && output.stdout.len() <= 8192
+        && std::str::from_utf8(&output.stdout).is_ok_and(|text| {
+            text.starts_with("targo ")
+                && text
+                    .lines()
+                    .filter(|line| *line == "analysis-session: build-json-v1")
+                    .count()
+                    == 1
+        });
+    (
+        if complete {
+            CacheFreshness::ContentInputsV1
+        } else {
+            CacheFreshness::ExactSource
+        },
+        analysis,
+    )
+}
+
+// Mutable compiler state spans source generations. Cargo owns dependency/configuration
+// invalidation; the original TargetLease serializes compilation through acceptance.
+// This path is never artifact or proof authority: immutable destinations, stamps and
+// source rechecks still bind the exact source generation.
+pub(crate) fn harness_cache_key(
+    checkout: &Path,
+    source: &str,
+    compiler: &str,
+    triple: Triple,
+    profile: Profile,
+    policy: Policy,
+    freshness: CacheFreshness,
+) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let directory = std::fs::symlink_metadata(checkout)
+            .map_err(|e| Error::io("read original compiler checkout identity", &e))?;
+        if !directory.file_type().is_dir() {
+            return Err(Error::refused(
+                "compiler checkout is not an original directory",
+            ));
+        }
+        // Birth time distinguishes a recreated checkout even if its inode was reused.
+        // Filesystems without a usable birth time keep exact-source isolation;
+        // missing reuse metadata must not prevent an otherwise valid build.
+        let generation = match (freshness, directory.created()) {
+            (CacheFreshness::ExactSource, _) => format!("source-{source}"),
+            (_, Ok(created)) => match created.duration_since(std::time::UNIX_EPOCH) {
+                Ok(age) if !age.is_zero() => format!("content-v1-generation-{:x}", age.as_nanos()),
+                _ => format!("source-{source}"),
+            },
+            (_, Err(error)) if error.kind() == std::io::ErrorKind::Unsupported => {
+                format!("source-{source}")
+            }
+            (_, Err(error)) => {
+                return Err(Error::io(
+                    "read original compiler checkout generation",
+                    &error,
+                ));
+            }
+        };
+        // Package-cache admission requires a single direct child, never nested targets.
+        Ok(PathBuf::from(format!(
+            "checkout-{:x}-{:x}-{generation}-{compiler}-{}-{}-{}.noindex",
+            directory.dev(),
+            directory.ino(),
+            triple.as_str(),
+            profile.as_str(),
+            policy.as_str(),
+        )))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            checkout, source, compiler, triple, profile, policy, freshness,
+        );
+        Err(Error::refused(
+            "local harness compiler reuse requires an original Unix checkout identity",
+        ))
+    }
 }
 
 /// The producer's immutable local harness namespace, without opening or authorizing it.
@@ -304,8 +430,17 @@ pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
     for b in &bins {
         args.extend([OsString::from("--bin"), OsString::from(b)]);
     }
+    let (cache_freshness, analysis_session) =
+        if harness.is_some() && req.policy == Policy::Unverified {
+            driver_capabilities(tools, &tc.targo())
+        } else {
+            (CacheFreshness::ExactSource, false)
+        };
+    if cache_freshness == CacheFreshness::ContentInputsV1 {
+        args.extend(["--config", CONTENT_CONFIG, CHECKSUM_FLAG].map(OsString::from));
+    }
     let mut command = Run::new(program_bin, args);
-    command.cwd = Some(checkout);
+    command.cwd = Some(checkout.clone());
     let mut path = tc.bin.clone().into_os_string();
     if let Some(inherited) = std::env::var_os("PATH") {
         path.push(":");
@@ -331,8 +466,15 @@ pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
             out.join(".ubd")
                 .join("targets.noindex")
                 .join(program)
-                .join(&source)
-                .join(&compiler)
+                .join(harness_cache_key(
+                    &checkout,
+                    &source,
+                    &compiler,
+                    triple,
+                    req.profile,
+                    req.policy,
+                    cache_freshness,
+                )?)
                 .into(),
         ));
     }
@@ -340,6 +482,8 @@ pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
         command,
         source,
         harness,
+        cache_freshness,
+        analysis_session,
         compiler,
         compiler_text,
         sysroot,
@@ -362,12 +506,36 @@ pub struct Built {
 }
 
 fn write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
-    std::fs::write(path, bytes).map_err(|e| Error::io(format!("write {}", path.display()), &e))
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| Error::io(format!("write {}", path.display()), &e))?;
+    if !f
+        .metadata()
+        .map_err(|e| Error::io(format!("write {}", path.display()), &e))?
+        .is_file()
+    {
+        return Err(Error::refused(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    f.set_len(0)
+        .and_then(|()| f.write_all(bytes.as_ref()))
+        .map_err(|e| Error::io(format!("write {}", path.display()), &e))
 }
 
 fn executable_of(stream: &[u8], bin: &str) -> Option<PathBuf> {
     let mut found: Vec<PathBuf> = String::from_utf8_lossy(stream)
         .lines()
+        .filter(|l| l.contains("\"compiler-artifact\""))
         .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
         .filter(|v| {
             v.get("reason").and_then(aterm_json::Value::as_str) == Some("compiler-artifact")
@@ -447,10 +615,11 @@ pub fn build(ctx: &Ctx, req: &Request, plan: &Plan, tools: &dyn Tools) -> Result
     write(&run_dir.join("build.log"), &ran.stderr)?;
     if !ran.success() {
         let log = String::from_utf8_lossy(&ran.stderr);
-        let lines: Vec<&str> = log.lines().collect();
+        let mut lines: Vec<&str> = log.lines().rev().take(30).collect();
+        lines.reverse();
         return Err(Error::refused(format!(
             "the build failed:\n{}",
-            lines[lines.len().saturating_sub(30)..].join("\n")
+            lines.join("\n")
         )));
     }
     let checkout = plan.command.cwd.clone().unwrap_or_default();
@@ -488,7 +657,8 @@ pub fn build(ctx: &Ctx, req: &Request, plan: &Plan, tools: &dyn Tools) -> Result
         })?;
         arch::gate(plan.triple, std::slice::from_ref(&exe))?;
         let staged = run_dir.join("root/bin").join(bin);
-        std::fs::copy(&exe, &staged).map_err(|e| Error::io(format!("stage {bin}"), &e))?;
+        crate::identity::copy_regular_file(&exe, &staged)
+            .map_err(|e| Error::io(format!("stage {bin}"), &e))?;
         let mut started = false;
         for probe in ["--help", "--version"] {
             let r = tools

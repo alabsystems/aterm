@@ -253,7 +253,9 @@ mod imp {
         parent: Fd,
         name: impl aterm_dirfd::Arg,
     ) -> io::Result<OwnedFd> {
-        openat(parent, name, directory_flags(), Mode::empty()).map_err(Into::into)
+        aterm_uds::kept_out(|| {
+            openat(parent, name, directory_flags(), Mode::empty()).map_err(io::Error::from)
+        })
     }
 
     fn is_directory(fd: &impl aterm_dirfd::AsFd) -> io::Result<bool> {
@@ -723,13 +725,15 @@ mod imp {
             name: &OsStr,
         ) -> io::Result<std::fs::File> {
             validate_component(name)?;
-            let fd = openat(
-                self.leaf(),
-                name,
-                OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(io::Error::from)?;
+            let fd = aterm_uds::kept_out(|| {
+                openat(
+                    self.leaf(),
+                    name,
+                    OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(io::Error::from)
+            })?;
             let stat = fstat(&fd).map_err(io::Error::from)?;
             if !FileType::from_raw_mode(stat.st_mode).is_file() || stat.st_nlink != 1 {
                 return Err(io::Error::new(
@@ -1434,8 +1438,9 @@ mod imp {
                 | OFlags::NOFOLLOW
                 | OFlags::NONBLOCK
                 | OFlags::CLOEXEC;
-            let fd = openat(self.leaf(), name, flags, Mode::RUSR | Mode::WUSR)
-                .map_err(io::Error::from)?;
+            let fd = aterm_uds::kept_out(|| {
+                openat(self.leaf(), name, flags, Mode::RUSR | Mode::WUSR).map_err(io::Error::from)
+            })?;
             let file = PinnedFile {
                 dir: self.clone(),
                 name: name.to_os_string(),
@@ -1466,8 +1471,9 @@ mod imp {
                 | OFlags::NOFOLLOW
                 | OFlags::NONBLOCK
                 | OFlags::CLOEXEC;
-            let fd = openat(self.leaf(), name, flags, Mode::RUSR | Mode::WUSR)
-                .map_err(io::Error::from)?;
+            let fd = aterm_uds::kept_out(|| {
+                openat(self.leaf(), name, flags, Mode::RUSR | Mode::WUSR).map_err(io::Error::from)
+            })?;
             let file = std::fs::File::from(fd);
             if !is_regular_file(&file)? {
                 return Err(io::Error::new(
@@ -3845,8 +3851,11 @@ mod tests {
             reason = "the negative control: a lock let go by the close alone"
         )]
         lease.try_lock().unwrap();
+        // The lease's own descriptor is kept out of children (`aterm_uds::kept_out` marks it
+        // close-on-fork), so the control hands the child a duplicate a fork does copy.
+        let inherited = lease.try_clone().unwrap();
         let child = ParkedChild::fork();
-        drop(lease);
+        drop((lease, inherited));
         assert!(
             refused(),
             "control: closed, not unlocked, the child's copy holds it"

@@ -291,25 +291,26 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// directory while a build holds one.
 const CARGO_LOCKS: &[&str] = &[".cargo-build-lock", ".cargo-lock", ".cargo-artifact-lock"];
 
-/// A build directory whose workspace is seen gone goes once unwritten this long.
-pub const RECLAIM_GONE: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Below the disk watch's floor, a build directory whose workspace is seen gone goes once unwritten this long ([`ReclaimAfter::UNDER_PRESSURE`]) instead of [`RECLAIM_GONE`]: nobody builds into a removed workspace again, and a day of waiting is a day of a full disk.
-pub const RECLAIM_GONE_UNDER_PRESSURE: Duration = Duration::from_secs(10 * 60);
-
 /// Any build directory goes once unwritten this long, whatever its workspace's state: it is a cache, and a month on the compiler has usually moved and cargo would rebuild anyway.
 pub const RECLAIM_IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// An empty mirror folder of the shared cache (the path down to a build directory, holding none
+/// now) goes once unwritten this long, so a build about to make its build directory there does
+/// not find the folder removed under it.
+const MIRROR_QUIET: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A build directory under the root the cache moved from ([`moved_from`]) goes whole once unwritten this long with no build holding its locks ([`reclaim_moved`]), and the root once empty. No build of this version writes there, so nothing is moved into the new root: cargo keeps absolute paths in a build directory (build scripts' output, dep-info), so a moved one would rebuild anyway, and new builds make the new root before a pass runs. Only a shim laid before the move, or a checkout's verify built from older code, still builds there; it holds cargo's locks while it does, and an hour quiet means it has stopped, at worst costing that checkout one fresh build in whichever root its code names.
 pub const MOVED_AFTER: Duration = Duration::from_secs(60 * 60);
 
-/// How long a pass waits on what no build reads again, each kind unwritten that long. Whether the
-/// volume is below its floor chooses both ([`Self::by_floor`], [`Self::for_claim`]), so neither
-/// can be passed for the other. The locks and process checks around a removal never depend on it.
+/// How long a pass waits on a stale part of a live workspace's build directory, unwritten that
+/// long. Whether the volume is below its floor chooses it ([`Self::by_floor`]), for a run's
+/// claim that does not fit too, since a claim can fall short well above the floor. It is also
+/// the wait of a build directory whose workspace folder stands without a manifest. One whose
+/// workspace folder was removed has no wait: nobody builds into a removed workspace again, so it
+/// goes at the first pass that finds no build holding its cargo locks and no process using it
+/// (the checks around every removal, which never depend on this).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReclaimAfter {
-    /// A build directory whose workspace is seen gone, whole.
-    pub gone: Duration,
     /// A stale part of a build directory that stays ([`stale::decide`]).
     pub stale: Duration,
 }
@@ -317,12 +318,10 @@ pub struct ReclaimAfter {
 impl ReclaimAfter {
     /// The volume has room.
     pub const CALM: Self = Self {
-        gone: RECLAIM_GONE,
         stale: RECLAIM_STALE,
     };
     /// The volume is below the disk watch's floor.
     pub const UNDER_PRESSURE: Self = Self {
-        gone: RECLAIM_GONE_UNDER_PRESSURE,
         stale: RECLAIM_STALE_UNDER_PRESSURE,
     };
     /// By whether the volume is below the disk watch's floor.
@@ -334,25 +333,8 @@ impl ReclaimAfter {
             Self::CALM
         }
     }
-    /// A run's claim that does not fit: a gone workspace's build directory goes as it does below
-    /// the floor, since nobody builds there again; a live workspace's stale parts wait unless the
-    /// volume is below its floor too, since a claim can fall short well above it.
-    #[must_use]
-    pub const fn for_claim(below_floor: bool) -> Self {
-        Self {
-            gone: RECLAIM_GONE_UNDER_PRESSURE,
-            stale: if below_floor {
-                RECLAIM_STALE_UNDER_PRESSURE
-            } else {
-                RECLAIM_STALE
-            },
-        }
-    }
     /// The root the cache moved from ([`reclaim_moved`]), where nothing is pruned in part.
-    const MOVED: Self = Self {
-        gone: MOVED_AFTER,
-        stale: RECLAIM_STALE,
-    };
+    const MOVED: Self = Self::CALM;
 }
 
 /// The shim's half, rendered ahead of a `targo`/`targo-tippy` shim's `exec` on macOS:
@@ -644,8 +626,11 @@ pub enum Unused {
     /// An explicit request names this genuine registered ordinary cache. Its current
     /// identity, complete Cargo locks and process-use gates still hold before retirement.
     Requested,
-    /// Its workspace is seen gone ([`checkout::gone_placed`]) and nothing wrote it for `idle`, at least the pass's window `after` ([`RECLAIM_GONE`], or [`RECLAIM_GONE_UNDER_PRESSURE`] below the disk watch's floor).
-    Gone { idle: Duration, after: Duration },
+    /// Its workspace is seen gone ([`checkout::gone_placed`]); nothing wrote it for `idle`. With
+    /// the workspace's folder removed it goes at once: nobody builds into a removed workspace
+    /// again, and the cargo-lock and process checks around the removal keep one a build still
+    /// holds. A folder standing without a manifest waits the pass's `after.stale`.
+    Gone { idle: Duration },
     /// Nothing wrote it for `idle`, [`RECLAIM_IDLE`] or more: it goes whatever its workspace's state, which was not looked at — it may still be there.
     Idle { idle: Duration },
     /// It is under the root the cache moved from ([`moved_from`]), which no build of this version writes, and nothing wrote it for `idle`, at least `after` ([`MOVED_AFTER`]): it goes whatever its workspace's state.
@@ -855,9 +840,8 @@ impl<'r> Intents<'r> {
 }
 
 /// Removes the build directories under the cache `root` that nobody builds into or uses any
-/// more, and returns those removed whole: one unwritten for [`RECLAIM_GONE`] whose workspace is
-/// seen gone ([`checkout::gone`], `home` naming the folders it never looks into), and any
-/// unwritten for [`RECLAIM_IDLE`]. A live process or unreadable ownership keeps its cache.
+/// more, and returns those removed whole: one whose workspace is seen gone ([`checkout::gone`],
+/// `home` naming the folders it never looks into), and any unwritten for [`RECLAIM_IDLE`]. A live process or unreadable ownership keeps its cache.
 pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf> {
     reclaim_watched(root, home, now, ReclaimAfter::CALM, None, &mut |_, _| true)
         .into_iter()
@@ -868,7 +852,7 @@ pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf
         .collect()
 }
 
-/// [`reclaim`] as the window's disk watch runs it, `record` asked before each removal (`false` keeps it), each directory returned with why it went ([`Unused`]), each stage a removal could not finish with what stayed of it ([`Unused::Stayed`]), and each entry whose intent `record` put on record and nothing of which went (its rename aside refused after the check, or the pass stopped before its move, or, moved aside, before its removal, returned as its stage: [`Refusal`]) with [`Unused::Refused`], so every intent on record closes with an outcome ([`Intents`]): a gone workspace's build directory goes once unwritten for `after.gone`, and a stale part of one that stays for `after.stale` ([`ReclaimAfter::CALM`] while the volume is only low, [`ReclaimAfter::UNDER_PRESSURE`] below the floor); and with `placing` (the home volume's device and a complete mount table), a workspace nested in a removed checkout is gone too ([`checkout::gone_placed`]).
+/// [`reclaim`] as the window's disk watch runs it, `record` asked before each removal (`false` keeps it), each directory returned with why it went ([`Unused`]), each stage a removal could not finish with what stayed of it ([`Unused::Stayed`]), and each entry whose intent `record` put on record and nothing of which went (its rename aside refused after the check, or the pass stopped before its move, or, moved aside, before its removal, returned as its stage: [`Refusal`]) with [`Unused::Refused`], so every intent on record closes with an outcome ([`Intents`]): a gone workspace's build directory goes at once, and a stale part of one that stays once unwritten for `after.stale` ([`ReclaimAfter::CALM`] while the volume is only low, [`ReclaimAfter::UNDER_PRESSURE`] below the floor); and with `placing` (the home volume's device and a complete mount table), a workspace nested in a removed checkout is gone too ([`checkout::gone_placed`]).
 pub fn reclaim_watched(
     root: &Path,
     home: Option<&Path>,
@@ -1083,7 +1067,6 @@ impl Sweep<'_, '_> {
             return false;
         }
         let permitted = || {
-            self.fence.working();
             (self.permitted)()
                 && registered::retention::allows_tree(original)
                 && registered::retention::allows_walk(stage)
@@ -1125,7 +1108,6 @@ impl Sweep<'_, '_> {
     /// stays staged for a later pass, which finishes it only while custody at `leaf` allows),
     /// and removed with the locks let go.
     fn prune(&mut self, dir: &Path, leaf: &Path) -> bool {
-        self.fence.working();
         if self.declined || !(self.permitted)() || !registered::retention::allows_tree(leaf) {
             return false;
         }
@@ -1236,7 +1218,7 @@ impl Sweep<'_, '_> {
     /// came to use before its removal, as its stage ([`Refusal::Staged`]).
     fn walk(&mut self, dir: &Path, depth: usize) -> bool {
         let (root, home, now) = (self.root, self.home, self.now);
-        let quiet = last_written(dir).is_some_and(|t| age(now, t) >= RECLAIM_GONE);
+        let quiet = last_written(dir).is_some_and(|t| age(now, t) >= MIRROR_QUIET);
         let Ok(entries) = std::fs::read_dir(dir) else {
             return false;
         };
@@ -1247,9 +1229,9 @@ impl Sweep<'_, '_> {
             .collect();
         let mut any = false;
         for child in children {
+            aterm_uds::progress::tick();
             let name = child.file_name().unwrap_or_default();
             if name == LEAF {
-                self.fence.working();
                 let judged = if self.moved {
                     unused(&child, &|seen| moved(seen, now))
                 } else {
@@ -1344,8 +1326,10 @@ fn moved(seen: &Seen, now: SystemTime) -> Option<Unused> {
     })
 }
 
-/// Why the build directory of `workspace`, as [`look`] `seen` it, goes whole: idle at least
-/// `after.gone` with its workspace seen gone, or [`RECLAIM_IDLE`] whatever its state.
+/// Why the build directory of `workspace`, as [`look`] `seen` it, goes whole: [`RECLAIM_IDLE`]
+/// unwritten whatever its state; its workspace seen gone with its folder removed, however
+/// recently it was written; or seen gone with its folder standing without a manifest (a git
+/// checkout rewriting its `Cargo.toml`, a branch without one) once unwritten for `after.stale`.
 fn whole(
     workspace: &Path,
     seen: &Seen,
@@ -1355,18 +1339,20 @@ fn whole(
     placing: Option<&checkout::Placing>,
 ) -> Option<Unused> {
     let idle = age(now, seen.newest);
-    if idle < after.gone {
-        None
-    } else if idle >= RECLAIM_IDLE {
+    if idle >= RECLAIM_IDLE {
         Some(Unused::Idle { idle })
-    } else if checkout::gone_placed(workspace, home, placing).is_ok() {
-        Some(Unused::Gone {
-            idle,
-            after: after.gone,
-        })
+    } else if checkout::gone_placed(workspace, home, placing).is_ok()
+        && (!folder_stands(workspace) || idle >= after.stale)
+    {
+        Some(Unused::Gone { idle })
     } else {
         None
     }
+}
+
+/// Whether anything stands at `workspace` (not followed): only a removed folder is gone at once.
+fn folder_stands(workspace: &Path) -> bool {
+    std::fs::symlink_metadata(workspace).is_ok()
 }
 
 /// Every cargo lock in `locks` taken without waiting: `None` when a build holds one, or one
@@ -1620,22 +1606,11 @@ pub fn reclaim_home_watched(
     placing: Option<&checkout::Placing>,
     record: &mut dyn FnMut(&Path, Unused) -> bool,
 ) -> Vec<(PathBuf, Unused)> {
-    reclaim_home_told(after, placing, &|| {}, record)
-}
-
-/// [`reclaim_home_watched`] for a pass something waits on: `working` hears its progress, so a long
-/// removal reads as work and a hung one still goes quiet.
-pub fn reclaim_home_told(
-    after: ReclaimAfter,
-    placing: Option<&checkout::Placing>,
-    working: &dyn Fn(),
-    record: &mut dyn FnMut(&Path, Unused) -> bool,
-) -> Vec<(PathBuf, Unused)> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }
     aterm_types::dirs::home_dir().map_or_else(Vec::new, |home| {
-        let fence = fence::Fence::default().telling(working);
+        let fence = fence::Fence::default();
         reclaim_roots(
             &home,
             SystemTime::now(),
@@ -1646,6 +1621,44 @@ pub fn reclaim_home_told(
             record,
         )
     })
+}
+
+/// THE BUILD DIRECTORIES OF REMOVED WORKSPACES under the shared cache `root`: each [`LEAF`] whose
+/// workspace ([`workspace_of`]) has no folder and is seen gone ([`checkout::gone_placed`], `home`
+/// naming the folders it never looks into), which a pass takes at once. It reads the mirror folders and stats each workspace, never a
+/// build directory's own tree, so a wait can ask it at every look ([`crate::admit_disk`]); what it
+/// lists a pass ([`reclaim_home_watched`]) takes whole once no build holds it.
+#[must_use]
+pub fn gone_leaves(root: &Path, home: Option<&Path>) -> std::collections::BTreeSet<PathBuf> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        home: Option<&Path>,
+        depth: usize,
+        out: &mut std::collections::BTreeSet<PathBuf>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let child = entry.path();
+            if entry.file_name() == LEAF {
+                if workspace_of(root, dir).is_some_and(|ws| {
+                    !folder_stands(&ws) && checkout::gone_placed(&ws, home, None).is_ok()
+                }) {
+                    out.insert(child);
+                }
+            } else if !is_stage(&entry.file_name(), OsStr::new(DOOMED)) && depth < MAX_DEPTH {
+                walk(root, &child, home, depth + 1, out);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(root, root, home, 0, &mut out);
+    out
 }
 
 /// WHAT COSTS NOTHING GOES FIRST, ACROSS EVERY ROOT, because a pass may stop at a goal: the root
@@ -1704,14 +1717,12 @@ fn reclaim_roots(
 /// registered caches, and below the floor all of `home`'s cache too, as [`reclaim_home_watched`]
 /// does with no session. At this look nothing else reaches a stale part of a profile in use: its
 /// disk pass takes a profile's whole `incremental/`, and only once it stands idle. Off macOS there
-/// is no such cache, so only the registered caches are swept. A waiter's wait reads the look's
-/// beat, so `working` hears each root's progress.
+/// is no such cache, so only the registered caches are swept.
 pub fn reclaim_beside_sessions(
     home: &Path,
     now: SystemTime,
     below_floor: bool,
     placing: Option<&checkout::Placing>,
-    working: &dyn Fn(),
     record: &mut dyn FnMut(&Path, Unused) -> bool,
 ) -> Vec<(PathBuf, Unused)> {
     reclaim_roots(
@@ -1720,7 +1731,7 @@ pub fn reclaim_beside_sessions(
         ReclaimAfter::by_floor(below_floor),
         placing,
         below_floor && cfg!(target_os = "macos"),
-        &fence::Fence::default().telling(working),
+        &fence::Fence::default(),
         record,
     )
 }

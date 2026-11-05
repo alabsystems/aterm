@@ -115,8 +115,13 @@
 //! a composer that reads empty (the carry-on's `wait:draft`,
 //! `relaunch::continuation_composer_empty`; the disk ask's `disk_ask::HeldBy::Draft`), so never
 //! onto a line drawn there. `ProgramEnds` is
-//! the program's own end (a crash, an exit), which may come at any state; the host's upgrade is
-//! `HostUpgrades`.
+//! the program's own end (a crash, an exit), which may come at any state where no ask awaits the
+//! host's answer (`asked = 0`; a restart deferred and standing, `restart` 3, included): the loop's
+//! ask is one call the host answers before the loop reads again (`IdleHost::restart`), so an end
+//! during that call is read as one after the host's answer, which the model explores from every
+//! answer's state; the restart's own end of the process is `RestartMade` or
+//! `RestartMadeDeferred`. No law is checked at a state with an ask awaiting its answer and the
+//! program ended before that answer. The host's upgrade is `HostUpgrades`.
 //! That no writer writes while the custody stands (`cust == 0` on the writes) is the session's
 //! own checks (`Session::custody_gate`, the occupancy guards' draft, the accounts probe's
 //! `PendingInput`, the survey's `0`), held by the loop's tests, not by the bind; that none is

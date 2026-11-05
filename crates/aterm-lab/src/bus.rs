@@ -129,23 +129,37 @@ pub fn lay(
     }
     let state = live.join("state");
     for d in [keys, state.as_path()] {
-        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        crate::util::create_private_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
     for d in [keys, live, state.as_path()] {
-        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))
+        crate::util::set_dir_mode_nofollow(d, 0o700)
             .map_err(|e| format!("{}: {e}", d.display()))?;
     }
     let mut random = [0u8; 40];
-    {
-        use std::io::Read as _;
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut random))
-            .map_err(|e| format!("/dev/urandom: {e}"))?;
-    }
+    aterm_uds::rand::fill(&mut random).map_err(|e| format!("/dev/urandom: {e}"))?;
     let secret = keys.join("mint.secret");
-    let write_private = |path: &Path, bytes: &[u8]| {
-        std::fs::write(path, bytes)
-            .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)))
+    let write_private = |path: &Path, bytes: &[u8]| -> Result<(), String> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if !f
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .is_file()
+        {
+            return Err(format!("{}: not a regular file", path.display()));
+        }
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        f.set_len(0)
+            .and_then(|()| f.write_all(bytes))
             .map_err(|e| format!("{}: {e}", path.display()))
     };
     write_private(&secret, &random[..32])?;
@@ -320,7 +334,7 @@ impl Fabric {
             }
         })?;
         let said = dir.join("broker.out");
-        let log = std::fs::File::create(&said).map_err(|e| format!("broker.out: {e}"))?;
+        let log = crate::util::create_stdio_file(&said).map_err(|e| format!("broker.out: {e}"))?;
         let err = log.try_clone().map_err(|e| format!("broker.out: {e}"))?;
         let argv = laid.broker_argv();
         let mut broker = aterm_uds::spawnfd::command(&argv[0]);
@@ -368,10 +382,20 @@ impl Fabric {
     /// The file could not be opened or written.
     pub fn name_in(&self, config: &Path) -> Result<(), String> {
         use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .append(true)
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
             .open(config)
-            .and_then(|mut f| f.write_all(self.table.as_bytes()))
+            .and_then(|mut f| {
+                if !f.metadata()?.is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "not a regular file",
+                    ));
+                }
+                f.write_all(self.table.as_bytes())
+            })
             .map_err(|e| format!("cannot name the bridge in {}: {e}", config.display()))
     }
 

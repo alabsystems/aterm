@@ -65,8 +65,7 @@ fn init_subprocess_pool_dir(dir: &Path, slots: usize) -> std::io::Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        crate::set_dir_mode_nofollow(dir, 0o700)?;
     }
     let create = |path: PathBuf, contents: Option<usize>| -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
@@ -74,7 +73,8 @@ fn init_subprocess_pool_dir(dir: &Path, slots: usize) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            opts.mode(0o600);
+            opts.mode(0o600)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
         }
         let mut file = opts.open(path)?;
         #[cfg(unix)]
@@ -262,7 +262,8 @@ fn write_record(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600);
+            open.mode(0o600)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
         }
         match open.open(dir.join(format!("{seq:06}.rec"))) {
             Ok(mut f) => return f.write_all(bytes),
@@ -782,13 +783,36 @@ fn first_error(log: &str) -> String {
 /// Decide the test run's row exactly as the serial child's was decided. A test
 /// whose macOS service (`trustd`, the disk-image service) did not answer ends
 /// COULD NOT RUN itself (`aterm_uds::deadline::require_trust_service`), so its
-/// row says so through [`crate::libtest::environment_refusals`].
-fn decide(r: &mut Report, run: &Run, label: &str, env: &[(OsString, OsString)]) {
+/// row says so through [`crate::libtest::environment_refusals`]. Under `release`, and under the
+/// `--as-release` its red row prints, a passing run that did not pass
+/// [`crate::checks::GOLDEN`]'s test is COULD NOT RUN too, whichever way its binaries were run.
+fn decide(ctx: &crate::Ctx, r: &mut Report, run: &Run, label: &str, env: &[(OsString, OsString)]) {
+    if ctx.checkers_in_tests && crate::stages::compared_no_frame(run) {
+        r.cannot_run(format!(
+            "{label} — {} did not run, so no frame was held to its twin",
+            crate::checks::GOLDEN.1
+        ));
+        return;
+    }
     r.decide_test_child(run, label, env);
 }
 
-fn feature_args(command: &Cmd) -> String {
+/// What a rerun of one binary of `command` adds to that binary's `-p <crate> <target>` spec: the
+/// command's feature flags, and `-p` for each package a `<package>/<feature>` among them names,
+/// because cargo refuses that feature beside a selection with no direct dependency on the package.
+pub(crate) fn feature_args(command: &Cmd) -> String {
     let mut kept = Vec::new();
+    let mut providers: Vec<String> = Vec::new();
+    let mut note = |value: &str| {
+        for feature in value.split([',', ' ']) {
+            if let Some((package, _)) = feature.split_once('/') {
+                let package = package.trim_end_matches('?');
+                if !providers.iter().any(|p| p == package) {
+                    providers.push(package.to_string());
+                }
+            }
+        }
+    };
     let mut args = command.args.iter();
     while let Some(arg) = args.next() {
         let arg = arg.to_string_lossy();
@@ -798,19 +822,29 @@ fn feature_args(command: &Cmd) -> String {
         if matches!(arg.as_ref(), "--features" | "-F") {
             kept.push(arg.into_owned());
             if let Some(value) = args.next() {
-                kept.push(crate::findings::shell_word(&value.to_string_lossy()));
+                let value = value.to_string_lossy();
+                note(&value);
+                kept.push(crate::findings::shell_word(&value));
             }
         } else if matches!(arg.as_ref(), "--all-features" | "--no-default-features")
             || arg.starts_with("--features=")
             || arg.starts_with("-F=")
         {
+            if let Some((_, value)) = arg.split_once('=') {
+                note(value);
+            }
             kept.push(crate::findings::shell_word(&arg));
         }
     }
-    kept.join(" ")
+    providers
+        .iter()
+        .map(|package| format!("-p {package}"))
+        .chain(kept)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-fn serial_feature_reruns(run: &mut Run, features: &str) {
+pub(crate) fn serial_feature_reruns(run: &mut Run, features: &str) {
     if features.is_empty() {
         return;
     }
@@ -922,7 +956,7 @@ pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
         let mut out = exec::run(serial, ctx.exec_env());
         serial_feature_reruns(&mut out, &features);
         r.raw(out.output.as_str());
-        decide(r, &out, label, &env);
+        decide(ctx, r, &out, label, &env);
     };
     let dir = ctx.scratch.join(format!(
         "test-records.{}.{}",
@@ -973,7 +1007,7 @@ pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
         }
         serial_feature_reruns(&mut pass, &features);
         r.raw(pass.output.as_str());
-        decide(r, &pass, label, &env);
+        decide(ctx, r, &pass, label, &env);
         return;
     }
     let exes = take_recording_executables(&mut pass.output);
@@ -1029,7 +1063,7 @@ pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
     let all = combined(&bins, &runs);
     r.raw(all.output.as_str());
     r.raw(poles(&bins, &walls, total));
-    decide(r, &all, label, &env);
+    decide(ctx, r, &all, label, &env);
 }
 
 static RECORDING: AtomicUsize = AtomicUsize::new(0);
@@ -1072,6 +1106,90 @@ mod tests {
         assert_eq!(
             std::fs::read(&scratch).expect("retained blocker"),
             b"retained"
+        );
+    }
+
+    /// A release holds its run to the golden test on the path cargo runs the binaries on, when the
+    /// recording left nothing: the serial fallback. CONTROL: the name that test really has passes,
+    /// and a run that is no release asks nothing of it.
+    #[cfg(unix)]
+    #[test]
+    fn a_release_refuses_a_serial_run_that_never_reached_the_golden_test() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let row_of = |test: &str, as_run: fn(crate::Ctx) -> crate::Ctx| {
+            let tmp = aterm_tempfile::tempdir().expect("scratch");
+            let targo = tmp.path().join("targo");
+            std::fs::write(
+                &targo,
+                format!(
+                    "#!/bin/sh\n\
+                     if [ \"$1\" = --config ]; then\n\
+                     printf '     Running unittests src/lib.rs (target/debug/deps/aterm_gpu-1)\\n'\n\
+                     exit 0\n\
+                     fi\n\
+                     printf 'running 1 test\\ntest {test} ... ok\\n\\n'\n\
+                     printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 \
+                     filtered out; finished in 0.00s\\n'\n"
+                ),
+            )
+            .expect("the stand-in");
+            std::fs::set_permissions(&targo, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+            let ctx = as_run(crate::Ctx::new(
+                tmp.path().to_path_buf(),
+                crate::Scope::workspace(),
+                crate::EnvSnapshot::default(),
+                tmp.path().to_path_buf(),
+            ));
+            let mut report = Report::new("the test run");
+            run_tests(&ctx, &mut report, "fixture", &Cmd::new(&targo));
+            let raw: Vec<_> = report.entries.iter().map(|e| format!("{e:?}")).collect();
+            assert!(
+                raw.iter()
+                    .any(|e| e.contains("run by cargo, one at a time")),
+                "the fixture took the serial path: {raw:?}"
+            );
+            let mut rows = report.entries.iter().filter_map(|entry| match entry {
+                crate::ladder::Entry::Ladder { outcome, label, .. } => {
+                    Some((*outcome, label.clone()))
+                }
+                _ => None,
+            });
+            let row = rows.next().expect("a row");
+            assert!(rows.next().is_none(), "{raw:?}");
+            row
+        };
+        let row = |test: &str, release: bool| {
+            row_of(
+                test,
+                if release {
+                    |c| c.with_release(true)
+                } else {
+                    |c| c
+                },
+            )
+        };
+        let golden = crate::checks::GOLDEN.1;
+        let renamed = "frame_record_tests::renamed";
+        let (refused, label) = row(renamed, true);
+        assert_eq!(
+            refused,
+            crate::ladder::Outcome::Fail(crate::ladder::Severity::CouldNotRun),
+            "{label}"
+        );
+        assert!(
+            label.contains(golden) && label.contains("did not run"),
+            "{label}"
+        );
+        assert_eq!(
+            row(&format!("renderer::{golden}"), true).0,
+            crate::ladder::Outcome::Ok
+        );
+        assert_eq!(row(renamed, false).0, crate::ladder::Outcome::Ok);
+        assert_eq!(
+            row_of(renamed, |c| c.with_checkers_in_tests(true)).0,
+            crate::ladder::Outcome::Fail(crate::ladder::Severity::CouldNotRun),
+            "the command a release's red row prints refuses what the release did"
         );
     }
 
@@ -1646,7 +1764,7 @@ mod tests {
         let features = feature_args(&command);
         assert_eq!(
             features,
-            "--features aterm-spec/checkers --no-default-features"
+            "-p aterm-spec --features aterm-spec/checkers --no-default-features"
         );
         let mut serial_failure = all.clone();
         serial_feature_reruns(&mut serial_failure, &features);
@@ -1659,7 +1777,7 @@ mod tests {
             assert_eq!(
                 findings[0].rerun.as_deref(),
                 Some(
-                    "targo --unverified test -p x --test b --features aterm-spec/checkers --no-default-features -- t::broke --exact"
+                    "targo --unverified test -p x --test b -p aterm-spec --features aterm-spec/checkers --no-default-features -- t::broke --exact"
                 )
             );
         }

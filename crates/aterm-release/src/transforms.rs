@@ -85,7 +85,8 @@ pub fn run(inputs: &Inputs) -> Result<Vec<String>, String> {
             let text =
                 crate::durable::read_text(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
             if let Some((pruned, gone)) = prune_lock(&text, &withheld)? {
-                std::fs::write(&lock, pruned).map_err(|e| format!("{}: {e}", lock.display()))?;
+                crate::durable::write_fresh(&lock, pruned)
+                    .map_err(|e| format!("{}: {e}", lock.display()))?;
                 for package in gone {
                     said.push(format!("  lock-prune: {package}"));
                 }
@@ -221,19 +222,43 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
-        std::fs::write(&target, &bytes).map_err(|e| format!("{}: {e}", target.display()))?;
-        #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            let perm = if mode == "100755" { 0o755 } else { 0o644 };
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(perm))
+            use std::io::Write as _;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                let perm = if mode == "100755" { 0o755 } else { 0o644 };
+                opts.mode(perm)
+                    .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+            }
+            let mut f = opts
+                .open(&target)
+                .map_err(|e| format!("{}: {e}", target.display()))?;
+            if !f
+                .metadata()
+                .map_err(|e| format!("{}: {e}", target.display()))?
+                .is_file()
+            {
+                return Err(format!("{}: not a regular file", target.display()));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let perm = if mode == "100755" { 0o755 } else { 0o644 };
+                f.set_permissions(std::fs::Permissions::from_mode(perm))
+                    .map_err(|e| format!("{}: {e}", target.display()))?;
+            }
+            f.set_len(0)
+                .and_then(|()| f.write_all(&bytes))
                 .map_err(|e| format!("{}: {e}", target.display()))?;
         }
     }
     let root_manifest = dest.join("Cargo.toml");
     let text = crate::durable::read_text(&root_manifest)
         .map_err(|e| format!("{}: {e}", root_manifest.display()))?;
-    std::fs::write(&root_manifest, memberless_root(&text)?)
+    crate::durable::write_fresh(&root_manifest, memberless_root(&text)?)
         .map_err(|e| format!("{}: {e}", root_manifest.display()))?;
     let license = git(
         root,
@@ -247,7 +272,8 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
         }
         crate::durable::read_file(&path).map_err(|e| format!("LICENSE: {e}"))
     })?;
-    std::fs::write(dest.join("LICENSE"), license).map_err(|e| format!("LICENSE: {e}"))?;
+    crate::durable::write_fresh(&dest.join("LICENSE"), license)
+        .map_err(|e| format!("LICENSE: {e}"))?;
     let named: Vec<String> = crates.iter().map(|c| format!("`{c}`")).collect();
     let readme = format!(
         "# vendor/astream\n\n\
@@ -266,7 +292,8 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
          may not be released there yet.\n",
         named.join(", ")
     );
-    std::fs::write(dest.join("README.md"), readme).map_err(|e| format!("README.md: {e}"))?;
+    crate::durable::write_fresh(&dest.join("README.md"), readme)
+        .map_err(|e| format!("README.md: {e}"))?;
     Ok((rev, crates))
 }
 
@@ -824,7 +851,7 @@ fn strip_targets(export: &Path) -> Result<Vec<(String, String, String)>, String>
             .map_err(|e| format!("{}: {e}", manifest.display()))?;
         let dir = manifest.parent().unwrap_or(export);
         if let Some((stripped, gone)) = strip_manifest(&text, dir) {
-            std::fs::write(&manifest, stripped)
+            crate::durable::write_fresh(&manifest, stripped)
                 .map_err(|e| format!("{}: {e}", manifest.display()))?;
             let rel = manifest
                 .strip_prefix(export)
@@ -844,6 +871,10 @@ fn rewrite_tree(dir: &Path) -> Result<(), String> {
     if !meta.file_type().is_dir() {
         return Err(format!("{}: not a plain directory", dir.display()));
     }
+    rewrite_dir(dir)
+}
+
+fn rewrite_dir(dir: &Path) -> Result<(), String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for entry in entries {
         let e = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -852,7 +883,7 @@ fn rewrite_tree(dir: &Path) -> Result<(), String> {
             .file_type()
             .map_err(|e| format!("{}: {e}", path.display()))?;
         if kind.is_dir() {
-            rewrite_tree(&path)?;
+            rewrite_dir(&path)?;
         } else if kind.is_file() {
             let bytes =
                 crate::durable::read_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -861,7 +892,8 @@ fn rewrite_tree(dir: &Path) -> Result<(), String> {
             }
             let out = rewrite(&bytes);
             if out != bytes {
-                std::fs::write(&path, out).map_err(|e| format!("{}: {e}", path.display()))?;
+                crate::durable::write_fresh(&path, &out)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
             }
         }
     }

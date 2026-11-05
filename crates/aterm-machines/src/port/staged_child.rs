@@ -57,13 +57,20 @@ pub(super) fn spawn<'s>(
     let (program, args) = live.argv(cmd)?;
     let (read, write) = io::pipe().map_err(|e| RunFailed::Spawn(e.to_string()))?;
     let open_log = || {
-        std::fs::OpenOptions::new()
+        let f = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(log)
-            .map_err(|e| RunFailed::Spawn(format!("{}: {e}", log.display())))
+            .map_err(|e| RunFailed::Spawn(format!("{}: {e}", log.display())))?;
+        if !f.metadata().is_ok_and(|m| m.is_file()) {
+            return Err(RunFailed::Spawn(format!(
+                "{}: not a regular file",
+                log.display()
+            )));
+        }
+        Ok(f)
     };
     let stdout = open_log()?;
     let stderr = open_log()?;

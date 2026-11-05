@@ -109,7 +109,7 @@ fn note_child_in(release: &Path, step: Step, pid: u32) -> PathBuf {
     let started = started_of(pid).unwrap_or_default();
     let note = crate::release::child_note(release, pid);
     let _ = std::fs::create_dir_all(release);
-    let _ = std::fs::write(
+    let _ = crate::durable::write_fresh(
         &note,
         format!("pid {pid}\nstarted {started}\nstep {}\n", step.name()),
     );
@@ -478,11 +478,7 @@ impl Real {
 
     fn logged_to(&self, step: Step, cmd: &mut Command, stream: bool) -> Ran {
         let log = self.step_log(step);
-        let mut file = match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)
-        {
+        let mut file = match crate::durable::open_append(&log, true) {
             Ok(f) => f,
             Err(e) => {
                 return Ran {
@@ -604,10 +600,7 @@ impl Real {
             .collect();
         let kept = self.logs.join("audit-rows.jsonl");
         if !rows.is_empty()
-            && let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&kept)
+            && let Ok(mut f) = crate::durable::open_append(&kept, true)
         {
             let _ = writeln!(f, "{}", rows.join("\n"));
         }
@@ -631,7 +624,7 @@ impl Real {
         let path = self.engine.join("verification-log.jsonl");
         let text = crate::durable::read_text(&path).unwrap_or_default();
         let merged = audit_rows_merged(&text, &rows);
-        let recorded = std::fs::write(&path, merged).is_ok()
+        let recorded = crate::durable::write_fresh(&path, merged).is_ok()
             && self
                 .engine_git(&[
                     "commit",
@@ -940,7 +933,7 @@ impl Real {
             ),
             Err(e) => (-1, format!("cannot run {}: {e}", pubbin.display())),
         };
-        let _ = std::fs::write(&log, format!("{handed}\n{text}"));
+        let _ = crate::durable::write_fresh(&log, format!("{handed}\n{text}"));
         let mut run = EngineRun::read(code, &text);
         let out = root.join("publish/.out");
         let export = out.join("export");
@@ -996,7 +989,7 @@ impl Real {
 
     fn dry_clone(&self, base: &Path, root: &Path, r: &str) -> Result<(), String> {
         let log = base.join("dry-run-clone.log");
-        let _ = std::fs::write(&log, "");
+        let _ = crate::durable::write_fresh(&log, "");
         let _ = std::fs::remove_dir_all(base.join("dry-run"));
         if base.join("dry-run").exists() {
             return Err(format!(
@@ -1015,7 +1008,7 @@ impl Real {
                     .args(args),
             );
             if let Ok(o) = &out
-                && let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log)
+                && let Ok(mut f) = crate::durable::open_append(&log, false)
             {
                 let _ = f.write_all(&o.stderr);
             }
@@ -1177,7 +1170,7 @@ impl Real {
             }
         };
         if !added {
-            let _ = std::fs::write(&log, &text);
+            let _ = crate::durable::write_fresh(&log, &text);
             return not_run(
                 format!(
                     "rustup could not add wasm32-unknown-unknown to the wasm32 pin {}",
@@ -1203,7 +1196,7 @@ impl Real {
                 false
             }
         };
-        let _ = std::fs::write(&log, &text);
+        let _ = crate::durable::write_fresh(&log, &text);
         if ok {
             return Outcome::Pass(format!(
                 "wasm32 engine: aterm-wasm compiles for wasm32-unknown-unknown on {}",
@@ -1295,11 +1288,7 @@ impl Real {
         })?;
         match self.export_gate(&scratch, &c.commit).0 {
             Outcome::Pass(note) => {
-                if let Ok(mut log) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(self.step_log(self.step))
-                {
+                if let Ok(mut log) = crate::durable::open_append(&self.step_log(self.step), true) {
                     let _ = writeln!(log, "early source scan: {note}");
                 }
                 Ok(())
@@ -1326,11 +1315,7 @@ impl Real {
         self.compat_check(c)?;
         self.engine_sync()?;
         let (mut cmd, handed) = self.stage_command(&c.commit, prover, target);
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.step_log(self.step))
-        {
+        if let Ok(mut file) = crate::durable::open_append(&self.step_log(self.step), true) {
             let _ = writeln!(file, "{handed}");
         }
         let ran = self.logged(self.step, &mut cmd);
@@ -1383,9 +1368,9 @@ impl Real {
             "aterm-verify",
             "--",
             "test",
-            "checkers",
             "--all",
             "--compile-only",
+            "--as-release",
         ]);
         let ran = self.logged(self.step, &mut cmd);
         if ran.code != 0 {
@@ -1413,6 +1398,8 @@ impl Real {
             "--unverified",
             "test",
             "--workspace",
+            "--features",
+            "aterm-spec/checkers",
             "--test",
             "spec_xref_closure",
         ]);
@@ -1491,11 +1478,7 @@ impl Real {
         let log = self.side_log(self.step, "x86_64-check");
         match crate::buildplan::compat_check(&self.repo, &c.commit, &log) {
             Ok(note) => {
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(self.step_log(self.step))
-                {
+                if let Ok(mut file) = crate::durable::open_append(&self.step_log(self.step), true) {
                     let _ = writeln!(file, "{note}");
                 }
                 Ok(())
@@ -1712,17 +1695,13 @@ impl Real {
             ));
         }
         let log = self.log_path(Step::AfterCut);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)
-            .map_err(|e| {
-                Refusal::new(
-                    format!("cannot open {}: {e}", log.display()),
-                    format!("{RELEASE_COMMAND} again once it is writable"),
-                )
-                .could_not_run()
-            })?;
+        let file = crate::durable::open_append(&log, true).map_err(|e| {
+            Refusal::new(
+                format!("cannot open {}: {e}", log.display()),
+                format!("{RELEASE_COMMAND} again once it is writable"),
+            )
+            .could_not_run()
+        })?;
         let mut out = StepLog {
             file,
             echo: self.verbose,
@@ -2018,11 +1997,7 @@ fn cut_refusal(gate: &str, why: &str) -> Refusal {
 }
 
 fn append_output(log: &Path, out: &std::process::Output) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-    {
+    if let Ok(mut f) = crate::durable::open_append(log, true) {
         let _ = f.write_all(&out.stdout);
         let _ = f.write_all(&out.stderr);
     }
@@ -2474,7 +2449,7 @@ fn keep_reports(out: &Path, to: &Path) {
     }
     for entry in std::fs::read_dir(out).into_iter().flatten().flatten() {
         if entry.file_type().is_ok_and(|t| t.is_file()) {
-            let _ = std::fs::copy(entry.path(), to.join(entry.file_name()));
+            let _ = crate::durable::copy_regular_fresh(entry.path(), to.join(entry.file_name()));
         }
     }
 }
@@ -3076,11 +3051,7 @@ impl Backend for Real {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{line}");
         let _ = out.flush();
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.logs.join("transcript.log"))
-        {
+        if let Ok(mut f) = crate::durable::open_append(&self.logs.join("transcript.log"), true) {
             let _ = writeln!(f, "{line}");
         }
     }
@@ -3154,15 +3125,20 @@ impl Backend for Real {
     }
 
     fn times(&mut self) -> String {
-        std::fs::read_to_string(self.state.join("steps.tsv")).unwrap_or_default()
+        crate::durable::read_text(&self.state.join("steps.tsv")).unwrap_or_default()
     }
 
     fn record_time(&mut self, version: &str, step: Step, secs: u64) {
         let _ = std::fs::create_dir_all(&self.state);
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.state.join("steps.tsv"))
+        let mut open = std::fs::OpenOptions::new();
+        open.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
+        if let Ok(mut f) = open.open(self.state.join("steps.tsv"))
+            && f.metadata().is_ok_and(|m| m.is_file())
         {
             let _ = writeln!(f, "{}\t{version}\t{}\t{secs}", now(), step.name());
         }
@@ -3252,7 +3228,7 @@ impl Backend for Real {
             ));
         }
         let field = |path: &Path, key: &str| {
-            std::fs::read_to_string(path).ok().and_then(|t| {
+            crate::durable::read_text(path).ok().and_then(|t| {
                 t.lines().find_map(|l| {
                     let (k, v) = l.split_once('=')?;
                     (k.trim() == key).then(|| v.trim().trim_matches('"').to_string())
@@ -3411,7 +3387,8 @@ impl Backend for Real {
     }
 
     fn engine_rows(&mut self, commit: Option<&str>) -> EngineRows {
-        let text = std::fs::read_to_string(self.engine.join("mappings.json")).unwrap_or_default();
+        let text =
+            crate::durable::read_text(&self.engine.join("mappings.json")).unwrap_or_default();
         engine_rows_in(&text, commit)
     }
 
@@ -3501,7 +3478,7 @@ impl Backend for Real {
 
     fn candidate_missing(&mut self) -> Result<Option<String>, String> {
         let path = self.repo.join("publish/.out/attestation.json");
-        let text = std::fs::read_to_string(&path)
+        let text = crate::durable::read_text(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let Some((attested, tree)) = attested_candidate(&text) else {
             return Ok(Some(format!(
@@ -3766,11 +3743,7 @@ impl Backend for Real {
                 let mut cmd = self.child(targo, None);
                 cmd.args(args);
                 let out = self.output_forwarded(&mut cmd).map_err(|e| e.to_string())?;
-                if let Ok(mut log) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(self.step_log(self.step))
-                {
+                if let Ok(mut log) = crate::durable::open_append(&self.step_log(self.step), true) {
                     let _ = log.write_all(&out.stdout);
                     let _ = log.write_all(&out.stderr);
                 }
@@ -3852,7 +3825,7 @@ impl Backend for Real {
             },
         };
         let attestation =
-            std::fs::read_to_string(self.repo.join("publish/.out/attestation.json")).ok();
+            crate::durable::read_text(&self.repo.join("publish/.out/attestation.json")).ok();
         let attested = attestation
             .as_deref()
             .is_some_and(|t| attestation_promotes(t, &c.commit));
@@ -3951,7 +3924,7 @@ impl Backend for Real {
                 aterm_uds::host::tool("gitleaks").remedy(),
             ));
         }
-        let seam = std::fs::read_to_string(self.engine.join("bin/pub"))
+        let seam = crate::durable::read_text(&self.engine.join("bin/pub"))
             .is_ok_and(|t| t.contains("run_pre_promote_hook"));
         if !seam {
             blocks.push(Refusal::new(
@@ -6110,10 +6083,10 @@ mod tests {
                 .contains("required workspace test compilation failed")
         );
         assert!(failed_build.fixtures.is_none());
+        let compiled = std::fs::read_to_string(real.step_log(Step::Build)).unwrap();
         assert!(
-            std::fs::read_to_string(real.step_log(Step::Build))
-                .unwrap()
-                .contains("--compile-only")
+            compiled.contains("--compile-only") && compiled.contains("--as-release"),
+            "{compiled}"
         );
         std::fs::remove_file(bin.join("targo")).unwrap();
         std::os::unix::fs::symlink("/usr/bin/true", bin.join("targo")).unwrap();
@@ -6188,18 +6161,20 @@ mod tests {
                 assert_eq!(cmd.get_current_dir(), Some(dir.path()));
                 let args = cmd.get_args().collect::<Vec<_>>();
                 assert_eq!(
-                    args[..5],
+                    args[..7],
                     [
                         "--unverified",
                         "test",
                         "--workspace",
+                        "--features",
+                        "aterm-spec/checkers",
                         "--test",
                         "spec_xref_closure"
                     ]
                 );
-                assert_eq!(args.len(), 7);
-                assert_eq!(args[5], "--config");
-                assert!(args[6].to_string_lossy().contains(".noindex"));
+                assert_eq!(args.len(), 9);
+                assert_eq!(args[7], "--config");
+                assert!(args[8].to_string_lossy().contains(".noindex"));
                 Ran {
                     code,
                     detail: vec!["unbound model action".into()],

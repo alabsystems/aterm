@@ -1531,8 +1531,12 @@ pub(crate) fn tombstoned_in_place<'a>(
     };
     let tombstones: Vec<ToolName> = entries
         .flatten()
-        .filter(|e| crate::platform::resolve_shim(&e.path()).is_none())
-        .filter_map(|e| ToolName::from_shim_file(e.file_name().to_str()?))
+        .filter_map(|e| Some((ToolName::from_shim_file(e.file_name().to_str()?)?, e)))
+        .filter_map(|(t, e)| {
+            crate::platform::resolve_shim(&e.path())
+                .is_none()
+                .then_some(t)
+        })
         .collect();
     if tombstones.is_empty() {
         return false;
@@ -2858,13 +2862,11 @@ pub fn rollback_returning_index(
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<(RollbackReport, TrustedIndex), FlowError> {
-    let current = *crate::ops::active_builds(layout)
-        .get(program)
-        .ok_or_else(|| {
-            FlowError::Rollback(format!(
-                "{program} is not installed \u{2014} nothing to roll back (aterm pkg list shows what is)"
-            ))
-        })?;
+    let current = crate::ops::active_build_of(layout, program).ok_or_else(|| {
+        FlowError::Rollback(format!(
+            "{program} is not installed \u{2014} nothing to roll back (aterm pkg list shows what is)"
+        ))
+    })?;
     let index = verify_select_fresh(fetcher, layout, anchor, floor, now_unix)?;
     let coherence_group = index
         .program(program)
@@ -2876,14 +2878,10 @@ pub fn rollback_returning_index(
         .iter()
         .find(|c| c.name == channel)
         .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
-    let mut lower: Vec<u64> = crate::ops::list_installed(layout)
+    let lower: Vec<u64> = crate::ops::list_installed_for(layout, program)
         .into_iter()
-        .filter(|(p, _)| p == program)
-        .map(|(_, b)| b)
         .filter(|&b| b < current)
         .collect();
-    lower.sort_unstable();
-    lower.dedup();
     let target = lower
         .iter()
         .rev()
@@ -3743,17 +3741,18 @@ fn another_program_is_installed_as(layout: &Layout, name: &str) -> bool {
         b.file_name()
             .to_str()
             .and_then(crate::store::parse_build_name)
-            .is_some_and(|_| crate::store::build_is_complete(&b.path()))
+            .is_some()
+            && b.file_type().is_ok_and(|t| t.is_dir() || t.is_symlink())
+            && crate::store::build_is_complete(&b.path())
     })
 }
 
 fn shim_free_or_owned_by(layout: &Layout, program: &str, shim: &Path) -> bool {
-    match std::fs::symlink_metadata(shim) {
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-        Ok(_) => crate::platform::resolve_shim(shim)
-            .and_then(|t| crate::ops::store_build_of(&layout.prefix, &t))
-            .is_some_and(|(owner, _)| owner == program),
+    if let Some(target) = crate::platform::resolve_shim(shim) {
+        return crate::ops::store_build_of(&layout.prefix, &target)
+            .is_some_and(|(owner, _)| owner == program);
     }
+    std::fs::symlink_metadata(shim).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn apply_sysroot_bundle(reloc: &str) -> Result<(), FlowError> {

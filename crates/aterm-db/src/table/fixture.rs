@@ -4,8 +4,8 @@
 //! A scratch Commons lab: `n` Macs, each its own vault custody under one temporary home that
 //! goes when the lab drops, joined to one test vault and enrolled as the roles given, and the
 //! repair exchange a runtime would run between them over loopback. The tests' fixture, and the
-//! dev seam `lab alab-roll` drives (design §11 step 13); it touches no real Mac's state. Absent
-//! from release builds.
+//! dev seam `lab reveal-tab` seeds its lab instance's world with (one-mesh design §11 A17); it
+//! touches no real Mac's state. Absent from release builds.
 
 #![allow(
     clippy::unwrap_used,
@@ -36,18 +36,17 @@ pub fn repair_commons(lab: &Lab, rounds: usize) {
     repair_commons_with(lab, rounds, &members, None, None);
 }
 
-/// [`repair_commons`] among `members` alone (the first exchanges with each other), as one side
-/// of a split, each on the system clock.
-pub fn repair_commons_within(lab: &Lab, rounds: usize, members: &[usize]) {
-    repair_commons_with(lab, rounds, members, None, None);
-}
-
 /// [`repair_commons`] with each round repairing `table` first, as a push names it
-/// (`crate::runtime::Pusher`), with no regular scan: for a test that knows which table moved.
+/// (`crate::runtime::Pusher`), with no regular scan: for a test that knows which table moved. A
+/// table the two sides of an exchange do not both hold falls back to one regular-scan exchange
+/// while the side that lacks it takes it up, so each of the first Mac's exchanges must complete
+/// and the last round must have repaired `table` with every peer: a test whose rounds fall short,
+/// or whose exchange fails, fails here, not on what its repair did not deliver.
 #[cfg(test)]
 pub fn repair_commons_first(lab: &Lab, rounds: usize, table: [u8; 32]) {
     let members: Vec<usize> = (0..lab.paths.len()).collect();
-    repair_commons_with(lab, rounds, &members, None, Some(table));
+    let reports = repair_commons_with(lab, rounds, &members, None, Some(table));
+    assert_repaired(&reports[0], rounds, members.len() - 1, table);
 }
 
 /// [`repair_commons_among`] with each round repairing `table` first ([`repair_commons_first`]).
@@ -60,7 +59,32 @@ pub fn repair_commons_among_first(
     table: [u8; 32],
 ) {
     assert_eq!(now.len(), lab.paths.len(), "one clock per Mac");
-    repair_commons_with(lab, rounds, members, Some(now), Some(table));
+    let reports = repair_commons_with(lab, rounds, members, Some(now), Some(table));
+    assert_repaired(&reports[0], rounds, members.len() - 1, table);
+}
+
+/// The first Mac's `reports` of `rounds` rounds with `peers` peers hold one per exchange, and the
+/// last `peers`, the last round's, each repaired `table`. A failed exchange reports nothing, so
+/// without the count the last `peers` would reach back into an earlier round.
+#[cfg(test)]
+fn assert_repaired(
+    reports: &[crate::replica::Report],
+    rounds: usize,
+    peers: usize,
+    table: [u8; 32],
+) {
+    assert_eq!(
+        reports.len(),
+        rounds * peers,
+        "an exchange completed no application repair"
+    );
+    for report in &reports[reports.len() - peers..] {
+        assert_eq!(
+            report.table,
+            Some(table),
+            "the named table was not repaired in the last round"
+        );
+    }
 }
 
 /// [`repair_commons`] with each Mac's ring windows placed by its own clock, `now[n]` seconds.
@@ -165,10 +189,27 @@ impl Lab {
     pub fn with_foundation(roles: &[Role]) -> Self {
         Self::build(roles, roles.len(), true)
     }
+    /// A lab whose home is `home` (Mac `n`'s at `<home>/m<n>`), enrolled as `roles`: a caller
+    /// that must name the home, as `lab reveal-tab` names its lab instance's world.
+    pub fn in_home(home: aterm_tempfile::TempDir, roles: &[Role]) -> Self {
+        Self::build_in(home, roles, roles.len(), false)
+    }
     fn build(roles: &[Role], enrolled: usize, foundation: bool) -> Self {
         #[cfg(test)]
         aterm_spec::fs_lane::join();
-        let home = aterm_tempfile::tempdir().unwrap();
+        Self::build_in(
+            aterm_tempfile::tempdir().unwrap(),
+            roles,
+            enrolled,
+            foundation,
+        )
+    }
+    fn build_in(
+        home: aterm_tempfile::TempDir,
+        roles: &[Role],
+        enrolled: usize,
+        foundation: bool,
+    ) -> Self {
         let source = home.path().join("test.vault");
         let paths: Vec<_> = (0..roles.len())
             .map(|n| Paths::for_home(&home.path().join(format!("m{}", n + 1))))
@@ -284,6 +325,7 @@ impl Lab {
         let session = super::Session::observe(&bootstrap).unwrap();
         *session
             .members()
+            .unwrap()
             .iter()
             .find(|binding| binding.actor() == session.actor())
             .expect("a lab Mac is in its own roster")

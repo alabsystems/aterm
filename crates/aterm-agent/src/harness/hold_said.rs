@@ -37,21 +37,26 @@ pub const WAITS_ON_YOU: &str = land_check::WAITS_ON_YOU;
 /// What a need's entry says the harness does beside it while it works on (§12.2.1).
 pub const CARRYING_ON: &str = "carrying on";
 
-/// What a need's entry says where nothing carries on beside it: Land rests on the need or
-/// landed beside it. Apart from the hold's own [`WAITS_ON_YOU`], which says Land has not landed.
+/// What a need's entry says where nothing carries on beside it: the loop types nothing more
+/// (the stop for replies that repeat with no work holds it, under any mode), or Land rests on the
+/// need or landed beside it. Apart from the hold's own [`WAITS_ON_YOU`], which says Land has not
+/// landed.
 pub const NEED_WAITS: &str = "waits on you";
 
 /// WHAT A NEED'S ENTRY SAYS THE HARNESS DOES BESIDE IT (§12.2.1; the second review of the
 /// post-landing fixes, 2026-11-01): the menu bar's and the border's entry (`<program> needs you:
 /// … — <tail>`) and the page's state line (`needs you: …; <tail>`) end with these words, which
-/// the window reads back off the entry. Land types nothing while it rests on the need or after
-/// the work landed beside it, so there the work waits on the person.
+/// the window reads back off the entry. The loop types nothing while the stop for replies that
+/// repeat holds it (the post-landing review, 2026-11-02), and Land types nothing while it rests on
+/// the need or after the work landed beside it, so there the work waits on the person.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NeedTail {
-    /// The harness works on past the need: Cruise, or Land with more than the need left.
+    /// The harness works on past the need: Cruise, or Land with more than the need left, its
+    /// typing not stopped.
     #[default]
     CarryingOn,
-    /// Under Land the work waits on the person: Land rests on the need, or it landed.
+    /// The work waits on the person: the loop's typing stopped at a reply that repeats, or under
+    /// Land it rests on the need or landed.
     WaitsOnYou,
 }
 
@@ -66,6 +71,16 @@ impl NeedTail {
             Self::CarryingOn => CARRYING_ON,
             Self::WaitsOnYou => NEED_WAITS,
         }
+    }
+
+    /// The tail's words as a sentence (`Waits on you.`): what the chip's description speaks after
+    /// the need (`harness_glass::need_spoken`), and what the forever lab hears there.
+    #[must_use]
+    pub fn sentence(self) -> String {
+        let mut chars = self.words().chars();
+        chars.next().map_or_else(String::new, |first| {
+            format!("{}{}.", first.to_uppercase(), chars.as_str())
+        })
     }
 }
 

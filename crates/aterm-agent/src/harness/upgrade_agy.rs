@@ -712,6 +712,17 @@ pub fn config_dir_or(
     Some(gemini.join(app))
 }
 
+/// The file agy's native file backend keeps its Google grant in, under the config
+/// (`<config>/antigravity-oauth-token`; measured in `docs/measured/agy-headless-auth-route-2026-11-03.md`).
+pub const GRANT_FILE: &str = "antigravity-oauth-token";
+
+/// The grant file of the native agy profile `profile` (a HOME) on its default config
+/// (`<profile>/.gemini/antigravity-cli/antigravity-oauth-token`).
+#[must_use]
+pub fn profile_grant(profile: &Path) -> PathBuf {
+    profile.join(GEMINI_DIR).join(APP_DATA_DIR).join(GRANT_FILE)
+}
+
 /// The presence lock of `conversation` under the config `config`.
 #[must_use]
 pub fn presence_lock(config: &Path, conversation: &str) -> PathBuf {

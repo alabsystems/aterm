@@ -5,6 +5,7 @@
 
 use aterm_agent::supervise::policy::land_check::land_check_text;
 use aterm_agent::supervise::policy::needs::{NEEDS_ACK, NEEDS_HINT};
+use aterm_agent::supervise::policy::question::LAND_TEXT;
 use aterm_agent::supervise::policy::turn_end::{
     DONE_ANGLES, DONE_TAIL, continuation_text, done_check_text, land_answer_text, land_nudge_text,
     land_text,
@@ -80,7 +81,10 @@ pub(crate) fn questions(cfg: &SupervisorConfig, session: Option<&str>) -> String
 /// `done_check_tail` came with v6's 5a, after the rest, and `land_check_text` with 13a, after
 /// them: a reader keys on names, and one that meets a reply without them keeps `done_check_text`
 /// whole (the tests' `done_checks_of`, the downgrade parse such a reader writes).
-pub(crate) const ACT_TEXT_KEYS: [&str; 9] = [
+/// `land_question_text`, the policy text Land writes into a question dialog's free-text row
+/// (`answer-land@v1`), came after them all; `questions=` never says `land`, which a reader would
+/// take for a word it does not know.
+pub(crate) const ACT_TEXT_KEYS: [&str; 10] = [
     "done_check_text",
     "land_text",
     "land_nudge_text",
@@ -90,16 +94,18 @@ pub(crate) const ACT_TEXT_KEYS: [&str; 9] = [
     "done_check_angles",
     "done_check_tail",
     "land_check_text",
+    "land_question_text",
 ];
 
 /// Autopilot Cruise / Land's fixed words as aterm's own loop types them for a session whose
 /// standing rules read `rules`, keyed by [`ACT_TEXT_KEYS`]: the four whole acts through the
 /// turn-end policy's own composers (the rules after the words; the done check is its first
 /// angle's whole act), the two suffixes bare, then Cruise's six angles in order, one to a line,
-/// and the words that follow each, bare; last the land check, a whole act in its plain form
-/// (the hinted one needs aterm's reader of the report).
+/// and the words that follow each, bare; then the land check, a whole act in its plain form
+/// (the hinted one needs aterm's reader of the report); last Land's dialog text, bare (a
+/// free-text row takes no rules).
 #[must_use]
-pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 9] {
+pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 10] {
     let [
         done_check,
         land,
@@ -110,6 +116,7 @@ pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 9] {
         angles,
         tail,
         check,
+        question,
     ] = ACT_TEXT_KEYS;
     [
         (done_check, done_check_text(rules, false)),
@@ -121,6 +128,7 @@ pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 9] {
         (angles, DONE_ANGLES.join("\n")),
         (tail, DONE_TAIL.to_string()),
         (check, land_check_text(None, false, rules)),
+        (question, LAND_TEXT.to_string()),
     ]
 }
 
@@ -180,6 +188,10 @@ pub(crate) fn reply_serving(
     for (key, value) in act_texts(rules) {
         line.push_str(&format!(" {key}={}", enc(&value)));
     }
+    line.push_str(&format!(
+        " land_checks={}",
+        aterm_agent::supervise::policy::turn_end::LAND_CHECKS
+    ));
     line.push('\n');
     line
 }
@@ -483,8 +495,10 @@ mod tests {
             .copied()
             .chain(["questions"])
             .chain(ACT_TEXT_KEYS)
+            .chain(["land_checks"])
             .collect();
         assert_eq!(keys, want);
+        assert_eq!(field(&line, "land_checks").as_deref(), Some("git,left"));
         let mut back = SupervisorConfig::default();
         for (key, _) in cfg.texts() {
             let raw = field(&line, key).expect(key);
@@ -623,6 +637,7 @@ mod tests {
                 ("done_check_angles", DONE_ANGLES.join("\n")),
                 ("done_check_tail", DONE_TAIL.to_string()),
                 ("land_check_text", LAND_CHECK.to_string()),
+                ("land_question_text", LAND_TEXT.to_string()),
             ]
         );
         let rules = "never force-push";
@@ -636,7 +651,11 @@ mod tests {
         for ((key, with), (_, without)) in ruled.iter().zip(&bare) {
             let suffix = matches!(
                 *key,
-                "needs_hint_text" | "needs_ack_text" | "done_check_angles" | "done_check_tail"
+                "needs_hint_text"
+                    | "needs_ack_text"
+                    | "done_check_angles"
+                    | "done_check_tail"
+                    | "land_question_text"
             );
             assert_eq!(with.contains(rules), !suffix, "{key}: {with}");
             if suffix {
@@ -745,6 +764,30 @@ mod tests {
             Some(vec![DONE_CHECK_FIXED_BEFORE.to_string()])
         );
         assert_eq!(done_checks_of("OK effective=on"), None);
+    }
+
+    /// LAND'S DIALOG TEXT IS ITS OWN KEY, AND `questions=` NEVER SAYS `land`: a session under Land
+    /// reads `land_question_text=` as the loop writes it into a free-text row, bare of the standing
+    /// rules, and `questions=` as the word configured, which a reader that knows no `land` keeps
+    /// answering by. NEGATIVE CONTROL: main's reply has no such key. MUTANT: `questions=` the
+    /// priority the loop takes under Land.
+    #[test]
+    fn lands_dialog_text_is_its_own_key_and_questions_never_says_land() {
+        let land = SupervisorConfig {
+            autopilot: Autopilot::Land,
+            ..SupervisorConfig::default()
+        };
+        let line = reply(&facts(land.clone()), Some("never force-push"), true);
+        assert_eq!(
+            field(&line, "land_question_text"),
+            Some(crate::control::pct_encode(LAND_TEXT))
+        );
+        assert_eq!(field(&line, "questions").as_deref(), Some("recommended"));
+        let mut long = land;
+        long.set("question_priority", "long-term")
+            .expect("a priority");
+        let line = reply(&facts(long), None, true);
+        assert_eq!(field(&line, "questions").as_deref(), Some("long-term"));
     }
 
     #[test]

@@ -1806,3 +1806,180 @@ fn an_integrated_zsh_says_its_b_starts_the_buffer_only_over_an_empty_one() {
     sh.send_bytes(b"\x15");
     sh.finish();
 }
+
+/// bash-preexec's shape where aterm meets it: it installs from its own line in `PROMPT_COMMAND` at
+/// the first prompt unless its first line is already there, and then runs every hook itself, between
+/// a first and a last line of its own (the last sets the mode the next command's preexec needs). With
+/// `__bp_newest` it is its unreleased master: it repairs those two lines at each prompt, and on bash
+/// 5.3 hooks `PS0` in place of the `DEBUG` trap. `docs/measured/bash-preexec-2026-11-04.md` holds the
+/// same matrix run against the real 0.4.1, 0.5.0, 0.6.0 and master.
+#[cfg(unix)]
+const BASH_PREEXEC_SHAPE: &str = r#"
+__bp_install_string=$'__bp_trap_string="$(trap -p DEBUG)"\ntrap - DEBUG\n__bp_install'
+[[ -z "$__bp_newest" ]] || __bp_install_string='__bp_install "$_"'
+__bp_set_status() { return "$1"; }
+__bp_run_preexec() {
+    local __bp_n __bp_line __bp_f
+    read -r __bp_n __bp_line <<<"$(HISTTIMEFORMAT= builtin history 1)"
+    [[ -n "$__bp_line" ]] || return 0
+    for __bp_f in "${preexec_functions[@]}"; do "$__bp_f" "$__bp_line"; done
+}
+__bp_preexec_invoke_exec() {
+    __bp_last_argument_prev_command=${1-}
+    (( ${__bp_inside_preexec:-0} == 0 )) || return 0
+    local __bp_inside_preexec=1
+    [[ -n "${__bp_preexec_interactive_mode-}" ]] || return 0
+    __bp_preexec_interactive_mode=
+    case $BASH_COMMAND in __bp_*) return 0 ;; esac
+    __bp_run_preexec
+}
+__bp_interactive_mode() { __bp_preexec_interactive_mode=on; }
+__bp_own_lines() {
+    [[ "$PROMPT_COMMAND" == __bp_precmd_invoke_cmd$'\n'* &&
+        "$PROMPT_COMMAND" == *$'\n'__bp_interactive_mode ]] && return 0
+    local __bp_e=${PROMPT_COMMAND//__bp_precmd_invoke_cmd$'\n'/}
+    __bp_e=${__bp_e//$'\n'__bp_interactive_mode/}
+    PROMPT_COMMAND=__bp_precmd_invoke_cmd$'\n'$__bp_e$'\n'__bp_interactive_mode
+}
+__bp_precmd_invoke_cmd() {
+    local __bp_status=$? __bp_f
+    (( ${__bp_inside_precmd:-0} == 0 )) || return 0
+    local __bp_inside_precmd=1
+    for __bp_f in "${precmd_functions[@]}"; do __bp_set_status "$__bp_status"; "$__bp_f"; done
+    [[ -z "$__bp_newest" ]] || __bp_own_lines
+}
+__bp_hook_preexec_proc=__bp_hook_preexec_into_debug
+if [[ -n "$__bp_newest" ]] &&
+    (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )); then
+    __bp_hook_preexec_proc=__bp_hook_preexec_into_ps0
+fi
+__bp_install() {
+    [[ "${PROMPT_COMMAND-}" != *__bp_precmd_invoke_cmd* ]] || return 1
+    if [[ "$__bp_hook_preexec_proc" == *_ps0 ]]; then
+        PS0=${PS0-}'${ __bp_run_preexec >&2; }'
+    else
+        trap '__bp_preexec_invoke_exec "$_"' DEBUG
+    fi
+    local __bp_e=${PROMPT_COMMAND//"$__bp_install_string"/}
+    PROMPT_COMMAND=__bp_precmd_invoke_cmd$'\n'$__bp_e$'\n'__bp_interactive_mode
+    __bp_precmd_invoke_cmd
+    __bp_interactive_mode
+}
+[[ -z "$__bp_newest" ]] || declare -ft __bp_install
+PROMPT_COMMAND=${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}$__bp_install_string
+bp_seen() { /bin/echo "bp-saw[$1]"; }
+bp_pre() { /bin/echo POSTPROG; }
+preexec_functions=(bp_seen)
+precmd_functions=(bp_pre)
+"#;
+
+/// A bash whose rc loaded bash-preexec gets each typed line's marks once, with its own status, and
+/// bash-preexec's hooks run once a line, with the line's D before a prompt hook's program and its C
+/// after a preexec hook's. On main the line after the first reported bash-preexec's own function as
+/// the command, or nothing at all, and every prompt installed bash-preexec again. A `DEBUG` trap the
+/// rc set goes on running.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_runs_bash_preexec_and_reports_each_command() {
+    let lines = [
+        ("echo one$((40+2))", "0", "echo\\x20one$((40+2))"),
+        ("false", "1", "false"),
+        (
+            "a=1; echo two$((40+2)); echo three",
+            "0",
+            "a=1\\x3b\\x20echo\\x20two$((40+2))\\x3b\\x20echo\\x20three",
+        ),
+        ("false", "1", "false"),
+        ("echo four$((40+2))", "0", "echo\\x20four$((40+2))"),
+    ];
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        for (newest, rc_trap) in [("", false), ("", true), ("1", false), ("1", true)] {
+            let case = format!("{bash} newest={newest:?} rc_trap={rc_trap}");
+            let fx = LiveFixture::new();
+            let dir = install_script_set(&fx.base).expect("install");
+            let after = if rc_trap {
+                "rcdbg=0\ntrap 'rcdbg=$((rcdbg+1))' DEBUG\n"
+            } else {
+                ""
+            };
+            std::fs::write(
+                fx.home.join(".bashrc"),
+                format!(
+                    "HISTFILE=/dev/null\n__bp_newest={newest}\n{BASH_PREEXEC_SHAPE}\
+                     PROMPT_COMMAND=\"$PROMPT_COMMAND\"'; rctail=$((rctail+1))'\n{after}"
+                ),
+            )
+            .expect(".bashrc");
+            let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &dir, &[("ATERM_CHILD", "1")]);
+            sh.wait_for_line_editor();
+            let from = sh.len();
+            let mut end = from;
+            for (line, status, _) in lines {
+                end = sh.run_line(line, status);
+            }
+            let text = stdout_between(&sh, from, end);
+            let between = |word: &str, stop: &[char]| -> Vec<String> {
+                text.split(word)
+                    .skip(1)
+                    .map(|rest| rest.split(stop).next().unwrap_or("").to_string())
+                    .collect()
+            };
+            assert_eq!(
+                between("\x1b]633;E;", &[';', '\x07']),
+                lines.map(|(_, _, reported)| reported),
+                "{case}: {text:?}"
+            );
+            assert_eq!(
+                between("\x1b]133;D", &['\x07']),
+                lines.map(|(_, status, _)| format!(";{status}")),
+                "{case}: {text:?}"
+            );
+            assert_eq!(text.matches("\x1b]133;C").count(), lines.len(), "{case}");
+            assert_eq!(text.matches("bp-saw[").count(), lines.len(), "{case}");
+            assert_eq!(text.matches("POSTPROG").count(), lines.len(), "{case}");
+            let start = sh.len();
+            let stop = sh.run_line("/bin/echo tail-ran-$((rctail >= 5))", "0");
+            let out = stdout_between(&sh, start, stop);
+            assert!(out.contains("tail-ran-1"), "{case}: {out:?}");
+            sh.run_line("preexec_functions=()", "0");
+            let start = sh.len();
+            let stop = sh.run_line("/bin/echo emptied", "0");
+            let out = stdout_between(&sh, start, stop);
+            assert!(out.contains("133;C"), "{case}: the list came back: {out:?}");
+            let all = sh.transcript();
+            assert!(
+                !all.contains("syntax error") && !all.contains("bad array subscript"),
+                "{case}: {all}"
+            );
+            let failed = &text[text.find("bp-saw[false").expect("the hook saw the line")..];
+            let at = |word: &str| {
+                failed
+                    .find(word)
+                    .unwrap_or_else(|| panic!("{case}: {word}"))
+            };
+            assert!(
+                at("\x1b]133;C") < at("\x1b]133;D") && at("\x1b]133;D") < at("POSTPROG"),
+                "{case}: {failed:?}"
+            );
+            if rc_trap {
+                let read = |sh: &mut LiveShell| -> u32 {
+                    let start = sh.len();
+                    let stop = sh.run_line("/bin/echo rc-ran-$rcdbg", "0");
+                    let out = stdout_between(sh, start, stop);
+                    out.split("rc-ran-")
+                        .filter_map(|rest| {
+                            let digits: String =
+                                rest.chars().take_while(char::is_ascii_digit).collect();
+                            digits.parse().ok()
+                        })
+                        .next()
+                        .unwrap_or_else(|| panic!("{case}: {out:?}"))
+                };
+                let (first, second) = (read(&mut sh), read(&mut sh));
+                assert!(second > first, "{case}: the rc's trap stopped at {first}");
+            }
+            sh.finish();
+        }
+    }
+}

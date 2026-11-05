@@ -136,12 +136,12 @@ pub(crate) fn lay_drivers(root: &Path, site: &Path) -> Result<(), String> {
         let path = entry.map_err(|e| e.to_string())?.path();
         if path.extension().is_some_and(|x| x == "mjs") {
             let name = path.file_name().unwrap_or_default();
-            std::fs::copy(&path, into.join(name))
+            crate::copy_regular_fresh(&path, into.join(name))
                 .map_err(|e| format!("could not copy {}: {e}", path.display()))?;
         }
     }
     let font = font(root);
-    std::fs::copy(&font, site.join(FONT))
+    crate::copy_regular_fresh(&font, site.join(FONT))
         .map_err(|e| format!("could not copy {}: {e}", font.display()))?;
     Ok(())
 }

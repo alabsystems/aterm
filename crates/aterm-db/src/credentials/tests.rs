@@ -279,7 +279,7 @@ fn a_posted_legacy_notary_request_is_reissued_with_its_entry_binding() {
     let facts = facts(paths, 1_000_000_000).unwrap();
     with_store(paths, |session, store, scope| {
         let log = Log::read_with(session, store, scope, decode)?;
-        let ctx = super::context(&facts, session, scope, 1_000_000_000);
+        let ctx = super::context(&facts, session, scope, 1_000_000_000)?;
         let current = Book::read(&log, &ctx);
         let old_key = request_key(&session.actor(), &raised.id);
         assert!(!current.threads.contains_key(&old_key));

@@ -275,7 +275,8 @@ mod unix {
                         | OFlags::CREATE
                         | OFlags::EXCL
                         | OFlags::NOFOLLOW
-                        | OFlags::CLOEXEC,
+                        | OFlags::CLOEXEC
+                        | OFlags::NONBLOCK,
                     Mode::RUSR | Mode::WUSR,
                 )
                 .map_err(|e| e.to_string())?,

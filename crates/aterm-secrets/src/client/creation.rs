@@ -25,7 +25,7 @@ impl Lease {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&path)
         {
             Ok(file) => {
@@ -137,6 +137,7 @@ impl Pending {
         let env = envelope::parse(&self.envelope)?;
         Ok(Config {
             source: self.intent.source.clone(),
+            mirrors: Vec::new(),
             name: env.name,
             signer: Some(env.signer),
             followed: Vec::new(),

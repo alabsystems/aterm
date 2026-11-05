@@ -258,7 +258,7 @@ fn ensure_dir(prefix: &Path) -> io::Result<PathBuf> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
         let opened = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&d)?;
         let metadata = opened.metadata()?;
         // SAFETY: `geteuid` has no preconditions and reads this process's effective UID.
@@ -292,7 +292,7 @@ fn open_rendezvous(path: &Path) -> io::Result<File> {
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
@@ -310,7 +310,7 @@ fn open_regular_existing_with_meta(path: &Path) -> io::Result<(File, std::fs::Me
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = options.open(path)?;
     let meta = file.metadata()?;
@@ -390,7 +390,9 @@ pub fn take(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         let file: std::fs::File = options.open(&taking)?;
         let mut file =
@@ -611,29 +613,57 @@ pub fn live(prefix: &Path) -> io::Result<Vec<(Subject, Holders)>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    let mut subjects = std::collections::BTreeSet::new();
+    let mut by_subject: std::collections::BTreeMap<Subject, Result<Vec<String>, String>> =
+        std::collections::BTreeMap::new();
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        if let Some(stem) = name
+        let Some(subject) = name
             .strip_suffix(LEASE_SUFFIX)
             .and_then(|n| n.split_once(HOLDER_SEP))
-            .map(|(stem, _)| stem)
-            && let Some(subject) = Subject::parse_stem(stem)
-        {
-            subjects.insert(subject);
+            .and_then(|(stem, _)| Subject::parse_stem(stem))
+        else {
+            continue;
+        };
+        let slot = by_subject.entry(subject).or_insert_with(|| Ok(Vec::new()));
+        if slot.is_err() {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(ft) if ft.is_file() => {}
+            Ok(_) => {
+                *slot = Err(format!("{name}: not a regular file"));
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                *slot = Err(format!("{name}: {e}"));
+                continue;
+            }
+        }
+        match probe_file(&entry.path(), false) {
+            Ok(Some(who)) => {
+                if let Ok(live) = slot {
+                    live.push(who);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => *slot = Err(format!("{name}: {e}")),
         }
     }
-    Ok(subjects
+    Ok(by_subject
         .into_iter()
-        .map(|s| {
-            let h = holders(prefix, &s);
-            (s, h)
+        .filter_map(|(subject, slot)| match slot {
+            Ok(mut live) if !live.is_empty() => {
+                live.sort();
+                Some((subject, Holders::Held(live)))
+            }
+            Ok(_) => None,
+            Err(why) => Some((subject, Holders::Unknown(why))),
         })
-        .filter(|(_, h)| h.in_use())
         .collect())
 }
 

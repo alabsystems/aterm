@@ -31,7 +31,6 @@
 //! the tab. Judges are pure functions of the evidence's text ([`judge_s1`] and the rest).
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -1004,8 +1003,7 @@ fn lay_world(run: &Run, world: &World) -> Result<(), Fail> {
     atomic_write(&to, config.dump(crate::pyjson::COMPACT).as_bytes())
         .map_err(|e| die(&to.display().to_string(), e))?;
     for dir in [&world.login_a, &world.login_b] {
-        fs::create_dir_all(dir).map_err(|e| die(&dir.display().to_string(), e))?;
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        crate::util::create_private_dir_all(dir).map_err(|e| die(&dir.display().to_string(), e))?;
         let creds = dir.join(".credentials.json");
         crate::sys::put(
             &creds,
@@ -1075,7 +1073,6 @@ fn start_tab(
     let text = launcher(run, login);
     crate::verbs::record_launch(run, sid, &text)?;
     let script = crate::verbs::launch_path(run, sid);
-    let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o755));
     let line = format!("sh {}", shell_quote(&script.to_string_lossy()));
     on(door, sid, &["send", &line])?;
     on(door, sid, &["key", "enter"])?;
@@ -1561,7 +1558,7 @@ fn judge_run(ev: &Evidence, ran: &Ran<'_>) -> Vec<(&'static str, Judged)> {
     let acts = |sid: &str| {
         let t = tape_acts(drive, sid);
         if let Some(kept) = &ev.keep {
-            let _ = fs::write(kept.join(format!("acts-{sid}.txt")), &t);
+            let _ = crate::util::write_fresh(&kept.join(format!("acts-{sid}.txt")), &t);
         }
         acts_of(&t)
     };
@@ -1691,8 +1688,8 @@ fn print_verdicts(run: &Run, marks: &Marks, rows: &[(&str, Judged)], kept: Optio
         println!("  {id:<8} {word:<8} {}", j.evidence);
     }
     if let Some(kept) = kept {
-        let _ = fs::write(
-            kept.join("verdicts.txt"),
+        let _ = crate::util::write_fresh(
+            &kept.join("verdicts.txt"),
             rows.iter()
                 .map(|(id, j)| format!("{id}\t{:?}\t{}\n", j.verdict, j.evidence))
                 .collect::<String>(),
@@ -1841,9 +1838,9 @@ pub fn cmd_claude_login_proof(args: &[String]) -> Res {
     };
     if let Some((kept, _, _)) = &down {
         for (f, text) in &store_files {
-            let _ = fs::write(kept.join(format!("accounts-{f}")), text);
+            let _ = crate::util::write_fresh(&kept.join(format!("accounts-{f}")), text);
         }
-        let _ = fs::write(kept.join("roster.toml"), &roster);
+        let _ = crate::util::write_fresh(&kept.join("roster.toml"), &roster);
         println!("lab '{tag}' is down; logs kept in {}", kept.display());
     }
     if let Err(f) = &outcome {

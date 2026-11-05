@@ -32,6 +32,7 @@ mod graph;
 mod installer;
 mod keys;
 mod lifeline;
+mod m6_names;
 mod machines;
 mod mint;
 mod mirror_rows;
@@ -93,6 +94,7 @@ pub const GUARDS: &[Rule] = &[
     rules::SUPERVISE_FX,
     bridge_fx::BRIDGE_FX,
     aos_step::AOS_STEP_CLOCK,
+    m6_names::M6_NAMES,
     rules::STORE_CURRENT,
     keys::KEY_MATERIAL,
     captures::CAPTURE_PRIVACY,
@@ -321,6 +323,7 @@ impl Corpus {
             let rel = crate::rel_path(root, &path);
             files.push(SourceFile::new(rel, raw));
         }
+        files.sort_by(|a, b| a.rel.cmp(&b.rel));
         let mut paths = Vec::new();
         walk(root, "", &Ignored::read(root), &mut paths)?;
         paths.sort();
@@ -383,7 +386,11 @@ impl Corpus {
 
     /// The file at `rel`, if the corpus holds it.
     pub(crate) fn get(&self, rel: &str) -> Option<&SourceFile> {
-        self.files.iter().find(|f| f.rel == rel)
+        self.files
+            .binary_search_by(|f| f.rel.as_str().cmp(rel))
+            .ok()
+            .map(|i| &self.files[i])
+            .or_else(|| self.files.iter().find(|f| f.rel == rel))
     }
 
     /// The files under `prefix` that compile only under `test`: each file a test-gated `mod`
@@ -391,7 +398,7 @@ impl Corpus {
     /// such a file declares, unless a shipped line also loads it.
     pub(crate) fn test_only(&self, prefix: &str) -> BTreeSet<String> {
         let prefixes = [prefix];
-        let loads: Vec<(&str, Vec<Load>)> = self
+        let loads: Vec<(&str, &[Load])> = self
             .under(&prefixes)
             .map(|f| (f.rel.as_str(), f.loads()))
             .collect();
@@ -424,7 +431,7 @@ impl Corpus {
         prefixes: &[&str],
         test: &dyn Fn(&str) -> bool,
     ) -> BTreeSet<String> {
-        let loads: Vec<(&str, Vec<Load>)> = self
+        let loads: Vec<(&str, &[Load])> = self
             .under(prefixes)
             .map(|f| (f.rel.as_str(), f.loads()))
             .collect();
@@ -656,6 +663,7 @@ pub(crate) struct SourceFile {
     pub(crate) raw: String,
     lexed: OnceLock<Lexed>,
     shipped: OnceLock<Vec<bool>>,
+    loads: OnceLock<Vec<Load>>,
 }
 
 /// One line of a file, in both views (byte-aligned).
@@ -674,6 +682,7 @@ impl SourceFile {
             raw,
             lexed: OnceLock::new(),
             shipped: OnceLock::new(),
+            loads: OnceLock::new(),
         }
     }
 
@@ -733,16 +742,18 @@ impl SourceFile {
     /// directory, or inside an inline module against that module's directory;
     /// else `name.rs` or `name/mod.rs` in the module's own directory — and each
     /// `include!` of a literal, against the file's directory.
-    pub(crate) fn loads(&self) -> Vec<Load> {
-        let dir_owner = matches!(self.name(), "lib.rs" | "main.rs" | "mod.rs");
-        let manifest_dir = self
-            .rel
-            .find("/src/")
-            .or_else(|| self.rel.find("/tests/"))
-            .or_else(|| self.rel.find("/benches/"))
-            .or_else(|| self.rel.find("/examples/"))
-            .map(|i| &self.rel[..i]);
-        self.loads_in(dir_owner, manifest_dir)
+    pub(crate) fn loads(&self) -> &[Load] {
+        self.loads.get_or_init(|| {
+            let dir_owner = matches!(self.name(), "lib.rs" | "main.rs" | "mod.rs");
+            let manifest_dir = self
+                .rel
+                .find("/src/")
+                .or_else(|| self.rel.find("/tests/"))
+                .or_else(|| self.rel.find("/benches/"))
+                .or_else(|| self.rel.find("/examples/"))
+                .map(|i| &self.rel[..i]);
+            self.loads_in(dir_owner, manifest_dir)
+        })
     }
 
     /// Like [`Self::loads`], with `dir_owner` true when `self` owns its parent directory directly
@@ -1200,8 +1211,8 @@ pub(crate) mod tests {
         let lib = corpus.get("crates/x/src/lib.rs").map(SourceFile::loads);
         let loads: Vec<(Vec<String>, bool, bool)> = lib
             .unwrap_or_default()
-            .into_iter()
-            .map(|l| (l.files, l.gated, l.top))
+            .iter()
+            .map(|l| (l.files.clone(), l.gated, l.top))
             .collect();
         let s = |p: &str| p.to_string();
         assert_eq!(

@@ -63,8 +63,8 @@ pub fn rollouts_by_write(home: &Path) -> Vec<(PathBuf, SystemTime)> {
         std::fs::read_dir(p)
             .map(|d| {
                 d.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
                     .map(|e| e.path())
-                    .filter(|p| p.is_dir())
                     .collect()
             })
             .unwrap_or_default()

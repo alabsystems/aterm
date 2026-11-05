@@ -58,6 +58,18 @@ fn account_progress_gallery() {
                 None,
             )),
         );
+    let long_label = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzlabelendingx";
+    let mut long_row = shared_row.clone();
+    long_row.label = long_label.into();
+    let long_diagnostic = aterm_agent::harness::accounts_sync::LoginDiagnostic::from_exit_for_test(
+        &long_row,
+        1_793_039_950,
+        1,
+        Some(aterm_agent::harness::open_url::Met::new(
+            aterm_agent::harness::open_url::MetWord::BrowserControl,
+            None,
+        )),
+    );
     let mut manifest = String::from(
         "# Synthetic owner-bound account facts and Claude-style screen; no live account state.\nscene\tcolumns\trows\tfile\n",
     );
@@ -261,6 +273,24 @@ fn account_progress_gallery() {
             "No eligible alternate account",
         ),
         (
+            "activity-menu-shared-failure-long-label",
+            120,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            Some(1_793_040_160),
+            "No eligible alternate account",
+        ),
+        (
+            "activity-menu-shared-failure-long-label-narrow",
+            60,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            Some(1_793_040_160),
+            "No eligible alternate account",
+        ),
+        (
             "activity-menu-shared-failure-newest-short",
             40,
             ProgressPhase::Waiting,
@@ -408,6 +438,60 @@ fn account_progress_gallery() {
             "A sign-in attempt is active",
         ),
         (
+            "independent-pool-work",
+            120,
+            ProgressPhase::Waiting,
+            1,
+            Some("weekly"),
+            Some(1_793_040_300),
+            "Recorded account decision",
+        ),
+        (
+            "independent-pool-work-narrow",
+            60,
+            ProgressPhase::Waiting,
+            1,
+            Some("weekly"),
+            Some(1_793_040_300),
+            "Recorded account decision",
+        ),
+        (
+            "activity-menu-independent-pool-work",
+            120,
+            ProgressPhase::Waiting,
+            1,
+            Some("weekly"),
+            Some(1_793_040_300),
+            "Recorded account decision",
+        ),
+        (
+            "activity-menu-independent-pool-work-narrow",
+            60,
+            ProgressPhase::Waiting,
+            1,
+            Some("weekly"),
+            Some(1_793_040_300),
+            "Recorded account decision",
+        ),
+        (
+            "activity-menu-independent-execution-work",
+            120,
+            ProgressPhase::Waiting,
+            0,
+            None,
+            Some(1_793_040_300),
+            aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING,
+        ),
+        (
+            "activity-menu-independent-execution-work-narrow",
+            60,
+            ProgressPhase::Waiting,
+            0,
+            None,
+            Some(1_793_040_300),
+            aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING,
+        ),
+        (
             "transcript-wall",
             120,
             ProgressPhase::Watching,
@@ -472,9 +556,19 @@ fn account_progress_gallery() {
             wall: wall.map(str::to_owned),
             details: vec![detail.into()],
             login_diagnostics: Vec::new(),
+            independent_work: Vec::new(),
             next_at,
             own_claim: None,
         };
+        if name.contains("independent-") {
+            progress
+                .independent_work
+                .push(aterm_agent::harness::account_progress::ActiveSignIn {
+                    label: "operations-account-01".into(),
+                    route: Some("mailbox".into()),
+                    observed_at: progress.observed_at - 10,
+                });
+        }
         if name.contains("newest-short") {
             use aterm_agent::harness::{
                 accounts_sync::LoginDiagnostic,
@@ -495,6 +589,8 @@ fn account_progress_gallery() {
                 Some(Met::new(MetWord::BrowserControl, None)),
             );
             progress.login_diagnostics.extend([older, newest]);
+        } else if name.contains("long-label") {
+            progress.login_diagnostics.push(long_diagnostic.clone());
         } else if name.contains("shared-failure") {
             progress.login_diagnostics.push(shared_diagnostic.clone());
         }
@@ -545,6 +641,7 @@ fn account_progress_gallery() {
             && !recheck_unavailable
             && !observer_busy
             && !autopilot_off
+            && !name.contains("independent-")
         {
             progress
                 .details
@@ -581,6 +678,33 @@ fn account_progress_gallery() {
         let menu_progress = facts
             .account_progress_view()
             .map(std::borrow::Cow::into_owned);
+        if name.contains("independent-") {
+            let observed = menu_progress.as_ref().unwrap();
+            assert_eq!(observed.phase, ProgressPhase::Waiting);
+            assert_eq!(observed.account.as_deref(), Some("fixture-current"));
+            assert_eq!(observed.next_at, Some(1_793_040_300));
+            assert_eq!(observed.independent_work.len(), 1);
+            let spoken = crate::claude_facts::fact_spoken_of(
+                &facts,
+                None,
+                crate::claude_lights::Fact::Account,
+                aterm_agent::harness::footer::FactMask::default(),
+            )
+            .0;
+            assert!(spoken.contains("operations-account-01") && spoken.contains("mailbox"));
+            let reply =
+                crate::harness_recovery_verb::cmd("recovery", true, || Ok(menu_progress.clone()));
+            assert!(
+                reply
+                    .split_whitespace()
+                    .any(|field| field == "phase=waiting")
+            );
+            assert!(
+                reply
+                    .split_whitespace()
+                    .any(|field| field == "independent_work_count=1")
+            );
+        }
         if observer_busy {
             let recorded = retained.as_ref().unwrap();
             use aterm_agent::harness::account_progress::{
@@ -692,8 +816,13 @@ fn account_progress_gallery() {
             app.open_fact_menu(wid, session, fact, anchor, true);
             // Use the production menu projection with a synthetic roster, so
             // the gallery performs no account-file or provider reads.
+            let alternate = if name.contains("long-label") {
+                long_label
+            } else {
+                "fixture-alternate"
+            };
             let roster = aterm_agent::harness::accounts::Roster {
-                rows: ["fixture-current", "fixture-alternate"]
+                rows: ["fixture-current", alternate]
                     .map(|label| aterm_agent::harness::accounts::Row {
                         label: label.into(),
                         dir: Some(format!("/synthetic/{label}")),
@@ -1102,6 +1231,7 @@ fn network_history_gallery() {
                 RepairOutcome::Exchanged
             };
             snapshot.network.peers[0].last_repair = Some(RepairObservation {
+                cause: None,
                 completed_at_ms: snapshot.network.observed_at_ms - 10_000,
                 outbound: true,
                 stage: Some(RepairStage::Application),

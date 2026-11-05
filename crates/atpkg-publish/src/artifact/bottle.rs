@@ -210,7 +210,7 @@ pub fn materialize_symlinks(root: &Path) -> Result<()> {
         for link in links {
             let mut cur = link.clone();
             let mut hops = 0usize;
-            let target_path = loop {
+            let (target_path, meta) = loop {
                 if hops >= 16 {
                     return Err(Error::refused(format!(
                         "symlink loop in bottle stage at {}",
@@ -225,7 +225,7 @@ pub fn materialize_symlinks(root: &Path) -> Result<()> {
                     ))
                 })?;
                 if !meta.file_type().is_symlink() {
-                    break cur;
+                    break (cur, meta);
                 }
                 let raw = std::fs::read_link(&cur)
                     .map_err(|e| Error::io(format!("readlink {}", cur.display()), &e))?;
@@ -254,9 +254,6 @@ pub fn materialize_symlinks(root: &Path) -> Result<()> {
                 cur = norm;
                 hops += 1;
             };
-            let meta = std::fs::symlink_metadata(&target_path).map_err(|e| {
-                Error::io(format!("stat symlink target {}", target_path.display()), &e)
-            })?;
             std::fs::remove_file(&link)
                 .map_err(|e| Error::io(format!("rm symlink {}", link.display()), &e))?;
             if meta.is_file() {
@@ -287,16 +284,13 @@ fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> 
         return haystack.to_vec();
     }
     let mut out = Vec::with_capacity(haystack.len());
-    let mut i = 0;
-    while i < haystack.len() {
-        if haystack[i..].starts_with(needle) {
-            out.extend_from_slice(replacement);
-            i += needle.len();
-        } else {
-            out.push(haystack[i]);
-            i += 1;
-        }
+    let mut rest = haystack;
+    while let Some(pos) = rest.windows(needle.len()).position(|w| w == needle) {
+        out.extend_from_slice(&rest[..pos]);
+        out.extend_from_slice(replacement);
+        rest = &rest[pos + needle.len()..];
     }
+    out.extend_from_slice(rest);
     out
 }
 
@@ -329,32 +323,60 @@ pub fn rewrite_bottle_text(stage: &Path) -> Result<()> {
     ];
     for rel in files {
         let path = stage.join(&rel);
-        let meta = std::fs::metadata(&path)
+        let (file, meta) = crate::identity::open_regular_nonblock(&path)
             .map_err(|e| Error::io(format!("stat {}", path.display()), &e))?;
         if let Some(key) = inode_key(&meta)
             && !seen.insert(key)
         {
             continue;
         }
-        let bytes = crate::identity::read_regular_bytes(&path, 64 * 1024 * 1024)
+        let bytes = crate::identity::read_regular_file_bytes(file, &meta, 64 * 1024 * 1024)
             .map_err(|e| Error::io(format!("read {}", path.display()), &e))?;
         if bytes.contains(&0) || !bytes.windows(10).any(|w| w == b"@@HOMEBREW") {
             continue;
         }
-        let mut updated = bytes.clone();
+        let mut updated = bytes;
+        let mut changed = false;
         for (old, new) in pairs {
-            updated = replace_bytes(&updated, old, new);
+            if updated.windows(old.len()).any(|w| w == *old) {
+                let replaced = replace_bytes(&updated, old, new);
+                if replaced != updated {
+                    changed = true;
+                    updated = replaced;
+                }
+            }
         }
-        if updated != bytes {
+        if changed {
+            use std::io::Write as _;
             let perms = meta.permissions();
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+                let _ = crate::identity::set_regular_mode(&path, 0o644);
             }
-            std::fs::write(&path, &updated)
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+            }
+            let mut f = opts
+                .open(&path)
+                .map_err(|e| Error::io(format!("open {}", path.display()), &e))?;
+            if !f
+                .metadata()
+                .map_err(|e| Error::io(format!("stat {}", path.display()), &e))?
+                .is_file()
+            {
+                return Err(Error::refused(format!(
+                    "bottle: {} is not a regular file",
+                    path.display()
+                )));
+            }
+            f.set_len(0)
+                .and_then(|()| f.write_all(&updated))
                 .map_err(|e| Error::io(format!("write {}", path.display()), &e))?;
-            let _ = std::fs::set_permissions(&path, perms);
+            let _ = f.set_permissions(perms);
         }
     }
     Ok(())
@@ -439,7 +461,8 @@ pub fn rewrite_bottle_objects(
         if !backend.is_native_object(&path) {
             continue;
         }
-        if let Ok(meta) = std::fs::metadata(&path)
+        if let Ok(meta) = std::fs::symlink_metadata(&path)
+            && meta.is_file()
             && meta.len() > 0
             && let Some(key) = inode_key(&meta)
         {
@@ -467,7 +490,6 @@ pub fn rewrite_bottle_objects(
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
             if refs
                 .id
                 .as_deref()
@@ -475,7 +497,7 @@ pub fn rewrite_bottle_objects(
                 || refs.needed.iter().any(|d| d.starts_with("@@HOMEBREW_"))
                 || refs.rpaths.iter().any(|r| r.starts_with("@@HOMEBREW_"))
             {
-                let _ = std::fs::set_permissions(&obj, std::fs::Permissions::from_mode(0o755));
+                let _ = crate::identity::set_regular_mode(&obj, 0o755);
             }
         }
 
@@ -513,12 +535,11 @@ pub fn rewrite_bottle_objects(
                 std::fs::create_dir_all(&vendored_dir)
                     .map_err(|e| Error::io(format!("mkdir {}", vendored_dir.display()), &e))?;
                 let dest = vendored_dir.join(&base);
-                std::fs::copy(src, &dest)
+                crate::identity::copy_regular_file(src, &dest)
                     .map_err(|e| Error::io(format!("copy donor {}", src.display()), &e))?;
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+                    let _ = crate::identity::set_regular_mode(&dest, 0o755);
                 }
                 stage_libs.insert(base.clone(), vendored_dir.clone());
                 vendored.insert(base.clone());
@@ -625,13 +646,27 @@ pub fn install_git_wrapper(program: &str, stage: &Path) -> Result<bool> {
         std::fs::remove_file(&bin_git)
             .map_err(|e| Error::io(format!("rm {}", bin_git.display()), &e))?;
     }
-    std::fs::write(&bin_git, GIT_WRAPPER.as_bytes())
-        .map_err(|e| Error::io(format!("write {}", bin_git.display()), &e))?;
-    #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&bin_git, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| Error::io(format!("chmod {}", bin_git.display()), &e))?;
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o755)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut f = opts
+            .open(&bin_git)
+            .map_err(|e| Error::io(format!("open {}", bin_git.display()), &e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            f.set_permissions(std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| Error::io(format!("chmod {}", bin_git.display()), &e))?;
+        }
+        f.write_all(GIT_WRAPPER.as_bytes())
+            .map_err(|e| Error::io(format!("write {}", bin_git.display()), &e))?;
     }
     Ok(true)
 }

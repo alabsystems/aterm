@@ -3641,6 +3641,15 @@ impl crate::App {
                 continue;
             }
             visited.push(id);
+            // The telemetry rows name a session by its public id, read here before the guard.
+            if let Some(h) = self
+                .store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .by_local(id)
+            {
+                crate::telemetry_host::note_sid(id, h.sid.as_str());
+            }
             let (master, pid) = (session.master, session.pid);
             let latest_output_ns = session
                 .latest_output_activity_ns
@@ -3683,6 +3692,7 @@ impl crate::App {
                 )
             };
             let blocks = block_read(&guard, from, since_wall, &session.ctx.ran);
+            crate::telemetry_host::commands_seen(session.ctx.job_feed.meter(), id, &guard, &blocks);
             let (program, front_agent) = {
                 let timeline = session
                     .ctx
@@ -4378,20 +4388,27 @@ impl crate::App {
         };
         let detail = detail.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode);
         let agent = match pooled.ctx.timeline.try_lock() {
-            Ok(timeline) => Some(timeline.agent().word),
-            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner().agent().word),
-            Err(std::sync::TryLockError::WouldBlock) => None,
+            Ok(timeline) => format!("agent={}", timeline.agent().word),
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                format!("agent={}", p.into_inner().agent().word)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => "agent_deferred=1".to_string(),
         };
-        Some(match agent {
-            Some(word) => format!(
-                "sid={session} revision={revision} hold={hold} hold_origin={hold_origin} \
-                 detail={detail} agent={word} gen={generation}"
-            ),
-            None => format!(
-                "sid={session} revision={revision} hold={hold} hold_origin={hold_origin} \
-                 detail={detail} agent_deferred=1 gen={generation}"
-            ),
-        })
+        // The presence row's meaning fields, as `meta` prints them (critic item E05), so the
+        // bridge reads no `@<sid> meta` for a session this row names. Under a try_lock as the
+        // verdict is: while a writer holds the session's meta the row leaves all three out, and
+        // the bridge reads that session's `meta` alone.
+        let meta = match pooled.ctx.meta.try_lock() {
+            Ok(meta) => format!(" {}", crate::control::presence_meta_tokens(&meta)),
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                format!(" {}", crate::control::presence_meta_tokens(&p.into_inner()))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => String::new(),
+        };
+        Some(format!(
+            "sid={session} revision={revision} hold={hold} hold_origin={hold_origin} \
+             detail={detail} {agent}{meta} gen={generation}"
+        ))
     }
 
     /// Formats the `status` wire record for `session` (without the leading `OK `).
@@ -4526,9 +4543,10 @@ impl crate::App {
             .by_local(session)
             .map(|h| h.sid.as_str().to_string());
         let input = format!(
-            "{input} {} {} {} {} {} {}",
+            "{input} {} {} {} {} {} {} {}",
             crate::disk_board::status_fields(session, reported_cwd.as_deref()),
             self.status_job_fields(session),
+            self.status_left_field(occupancy_sid.as_deref()),
             crate::program_check_watch::status_fields(),
             crate::services_watch::status_fields(),
             crate::occupancy_host::status_fields(occupancy_sid.as_deref()),

@@ -169,6 +169,20 @@ flags! {
         DIRECTORY = libc::O_DIRECTORY;
         /// `O_NOFOLLOW` — fail if the final component is a symlink.
         NOFOLLOW = libc::O_NOFOLLOW;
+        /// `O_NOFOLLOW_ANY` (`sys/fcntl.h`, macOS 11 on) — fail with `ELOOP` if any component of
+        /// the path is a symlink, the final one included: one open reaches the entry the path
+        /// names by real entries alone. Spelled here: the generated `libc` cell does not carry it.
+        #[cfg(target_vendor = "apple")]
+        NOFOLLOW_ANY = 0x2000_0000;
+        /// `O_SEARCH` (macOS: `O_EXEC | O_DIRECTORY`) — a folder opened to look names up in
+        /// alone: no read permission on it is needed, a `*at` call may resolve names relative
+        /// to it, and `fsync` takes it.
+        #[cfg(target_vendor = "apple")]
+        SEARCH = libc::O_SEARCH;
+        /// `O_PATH` — a descriptor that only locates the entry: no read or write permission on
+        /// it is needed, and a `*at` call may resolve names relative to it.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        PATH = libc::O_PATH;
         /// `O_NONBLOCK` — open without blocking on a FIFO or device.
         NONBLOCK = libc::O_NONBLOCK;
         /// `O_CLOEXEC`.
@@ -330,6 +344,13 @@ impl FileType {
     #[must_use]
     pub const fn is_file(self) -> bool {
         self.0 == libc::S_IFREG as u32
+    }
+
+    /// A symbolic link.
+    #[inline]
+    #[must_use]
+    pub const fn is_symlink(self) -> bool {
+        self.0 == libc::S_IFLNK as u32
     }
 }
 

@@ -468,14 +468,153 @@ pub fn is_test_file(path: &Path) -> bool {
         || s.contains("proofs_")
 }
 
+/// The files among `files` that only a test build compiles, as only a test build compiles a
+/// `tests.rs` ([`is_test_file`]): the files a `#[cfg(test)] mod <name>;` in one of them brings
+/// in, which are the module's own file and, where the module has a folder, every file under it.
+/// A file that some other declaration also brings in, from a file that is not itself
+/// test-only, stays in, and so do the modules it declares in turn. That other declaration is
+/// typically `#[cfg(not(test))] mod <name>;` beside the gated one.
+///
+/// Only a declaration at the start of a line is read, with `#[path]` honoured. One inside an
+/// inline `mod { }` is not, and its files stay in, so a scan that drops these reads more,
+/// never less.
+pub fn test_gated_module_files(files: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
+    // Each declaration: the file it is in, whether it is test-only, the module's own file, and
+    // the folder its submodules sit in.
+    let mut decls: Vec<(&PathBuf, bool, PathBuf, Option<PathBuf>)> = Vec::new();
+    for file in files {
+        let (Ok(text), Some(dir)) = (tree::read_to_string(file), file.parent()) else {
+            continue;
+        };
+        for decl in mod_decls(&text) {
+            let (module_file, folder) = if let Some(path) = decl.path {
+                let module_file = dir.join(path);
+                let folder = (module_file.file_name() == Some("mod.rs".as_ref()))
+                    .then(|| module_file.parent().map(Path::to_path_buf))
+                    .flatten();
+                (module_file, folder)
+            } else {
+                let owns_folder = file
+                    .file_name()
+                    .is_some_and(|n| n == "mod.rs" || n == "lib.rs" || n == "main.rs");
+                let base = match (owns_folder, file.file_stem()) {
+                    (false, Some(stem)) => dir.join(stem),
+                    _ => dir.to_path_buf(),
+                };
+                let flat = base.join(format!("{}.rs", decl.name));
+                let folder = base.join(&decl.name);
+                let module_file = if files.contains(&flat) {
+                    flat
+                } else {
+                    folder.join("mod.rs")
+                };
+                (module_file, Some(folder))
+            };
+            decls.push((file, decl.test_only, module_file, folder));
+        }
+    }
+    let mut gated: std::collections::BTreeSet<PathBuf> = files
+        .iter()
+        .filter(|f| {
+            decls.iter().any(|(_, test_only, module_file, folder)| {
+                *test_only
+                    && (*f == module_file || folder.as_ref().is_some_and(|d| f.starts_with(d)))
+            })
+        })
+        .cloned()
+        .collect();
+    // A module a file outside the test-only set declares for every build is shipped, and so is
+    // what that module declares: repeat until nothing more comes back.
+    loop {
+        let shipped: Vec<&PathBuf> = decls
+            .iter()
+            .filter(|(from, test_only, _, _)| !test_only && !gated.contains(*from))
+            .map(|(_, _, module_file, _)| module_file)
+            .collect();
+        let before = gated.len();
+        gated.retain(|f| !shipped.contains(&f));
+        if gated.len() == before {
+            return gated;
+        }
+    }
+}
+
+/// One `mod <name>;` declaration: its name, its `#[path]` if it has one, and whether
+/// `#[cfg(test)]` is among its attributes.
+struct ModDecl {
+    name: String,
+    path: Option<String>,
+    test_only: bool,
+}
+
+/// Each `mod <name>;` declaration that starts a line of `text`, with the attributes on the
+/// lines just above it (comment lines may stand between them) and on its own line.
+fn mod_decls(text: &str) -> Vec<ModDecl> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let mut attrs: Vec<&str> = Vec::new();
+        let mut item = *line;
+        while let Some(end) = item.strip_prefix("#[").and_then(|_| item.find(']')) {
+            attrs.push(&item[..=end]);
+            item = item[end + 1..].trim_start();
+        }
+        let item = item.split("//").next().unwrap_or_default().trim();
+        let item = match item.strip_prefix("pub") {
+            Some(scoped) if scoped.starts_with('(') => scoped
+                .split_once(')')
+                .map_or("", |(_, after)| after.trim_start()),
+            Some(public) => public.trim_start(),
+            None => item,
+        };
+        let Some(name) = item
+            .strip_prefix("mod ")
+            .and_then(|m| m.trim().strip_suffix(';'))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        for above in lines[..i].iter().rev() {
+            let above = above.trim_end();
+            if above.starts_with("#[") {
+                attrs.push(above);
+            } else if !above.trim_start().starts_with("//") {
+                break;
+            }
+        }
+        let path = attrs.iter().find_map(|attr| {
+            attr.strip_prefix("#[path")
+                .and_then(|a| a.trim_start().strip_prefix('='))
+                .and_then(|a| a.trim().strip_suffix(']'))
+                .and_then(|a| a.trim().strip_prefix('"'))
+                .and_then(|a| a.strip_suffix('"'))
+                .map(str::to_string)
+        });
+        out.push(ModDecl {
+            name: name.to_string(),
+            path,
+            test_only: attrs.contains(&"#[cfg(test)]"),
+        });
+    }
+    out
+}
+
 /// Recursively collects `*.rs` files under `dir`, skipping `target/` and hidden directories.
 pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    if !tree::exists(dir) {
-        return Ok(());
-    }
-    for entry in tree::read_dir(dir)? {
-        let path = entry?;
-        if tree::is_dir(&path) {
+    let entries = match tree::read_dir_typed(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let (path, is_dir) = entry?;
+        if is_dir {
             let name = path
                 .file_name()
                 .map_or(&b""[..], std::ffi::OsStr::as_encoded_bytes);
@@ -863,6 +1002,9 @@ fn sweep_markers(root: &Path, files: &[PathBuf]) -> Vec<Marker> {
         let Ok(text) = tree::read_to_string(file) else {
             continue;
         };
+        if !text.contains("// COST: UNBOUNDED(") {
+            continue;
+        }
         let rel = crate::rel_path(root, file);
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
@@ -1443,6 +1585,54 @@ mod tests {
         ] {
             assert!(!is_test_file(Path::new(path)), "{path}");
         }
+    }
+
+    #[test]
+    fn a_test_gated_module_and_its_folder_are_test_code_and_nothing_else_is() {
+        let lib = "#[cfg(test)]\n/// The sim.\nmod sim;\npub mod shipped;\n\
+                   #[cfg(test)]\npub mod both;\n#[cfg(not(test))]\nmod both;\n\
+                   #[cfg(test)]\n#[path = \"probe_impl.rs\"]\nmod probe;\n\
+                   #[cfg(any(test, debug_assertions))]\nmod seams;\n\
+                   #[cfg(test)]\nmod inner;\nmod outer {\n    mod inner;\n}\n";
+        let shipped = "#[cfg(test)] pub(crate) mod fixture; // one line\nmod kept;\n";
+        let files: Vec<(String, String)> = [
+            ("crates/a/src/lib.rs", lib),
+            ("crates/a/src/sim/mod.rs", "mod world;\n"),
+            ("crates/a/src/sim/world.rs", ""),
+            ("crates/a/src/simulate.rs", ""),
+            ("crates/a/src/shipped.rs", shipped),
+            ("crates/a/src/shipped/fixture.rs", ""),
+            ("crates/a/src/shipped/kept.rs", ""),
+            ("crates/a/src/probe_impl.rs", ""),
+            ("crates/a/src/seams.rs", ""),
+            ("crates/a/src/outer/inner.rs", ""),
+            ("crates/a/src/inner.rs", ""),
+            (
+                "crates/a/src/both.rs",
+                "mod child;\n#[cfg(test)]\nmod probe;\n",
+            ),
+            ("crates/a/src/both/child.rs", ""),
+            ("crates/a/src/both/probe.rs", ""),
+        ]
+        .iter()
+        .map(|(rel, text)| ((*rel).to_string(), (*text).to_string()))
+        .collect();
+        let root = synth_tree("aterm-census-gated", "gated", &files);
+        let mut all = Vec::new();
+        collect_rs_files(&root.join("crates"), &mut all).expect("every entry reads");
+        let gated = test_gated_module_files(&all);
+        let expected: std::collections::BTreeSet<PathBuf> = [
+            "crates/a/src/sim/mod.rs",
+            "crates/a/src/sim/world.rs",
+            "crates/a/src/shipped/fixture.rs",
+            "crates/a/src/probe_impl.rs",
+            "crates/a/src/both/probe.rs",
+            "crates/a/src/inner.rs",
+        ]
+        .iter()
+        .map(|rel| root.join(rel))
+        .collect();
+        assert_eq!(gated, expected);
     }
 
     fn empty_files(name: &str, files: &[&str]) -> crate::tree::memory::Tree {

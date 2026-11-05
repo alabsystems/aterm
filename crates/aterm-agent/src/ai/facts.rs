@@ -198,7 +198,8 @@ pub struct ClaudeAccounts {
     pub unread: Option<String>,
     /// Why the selected credential cannot execute, independently of its login health.
     pub launch_refused: Option<String>,
-    /// Why no local sign-in can repair the selected account, with no eligible alternative.
+    /// Why `aterm ai login` cannot repair the selected account, with no eligible alternative: it
+    /// needs another authority, or its source gives it to another Mac and no person named it.
     pub sign_in_refused: Option<String>,
     /// Whether the row has an email and renews by itself.
     pub renews: bool,
@@ -224,7 +225,8 @@ pub struct ClaudeAccounts {
     /// vendor's own sign-in, or a check that found no login all write the same word.
     pub signed_out_at: Option<i64>,
     /// The next not-enrolled or signed-out row to sign into when the serving row is limited,
-    /// when that row has an email.
+    /// when that row has an email, never one its source gives other Macs alone
+    /// ([`crate::harness::accounts_sync::rows_of_other_macs_at`]).
     pub next_sign_in: Option<String>,
     /// aterm's own sign-in of the row a sign-in renews (`next_sign_in`, else this row) that
     /// failed and stands on record.
@@ -397,7 +399,9 @@ pub struct CliAccounts {
     pub roster: PathBuf,
     /// Why the roster is refused, when it is.
     pub refused: Option<String>,
-    /// Why the serving account requires shared authority or an execution grant before local sign-in.
+    /// Why `aterm ai login` cannot repair the serving account: it requires shared authority or an
+    /// execution grant before local sign-in, or its source gives it to another Mac and no person
+    /// named it.
     pub sign_in_refused: Option<String>,
     /// The row a sign-in signs in next: the first with an email whose login is not made here,
     /// else the first due. A CLI whose renewals cannot approve its page (Grok Build's,
@@ -501,10 +505,14 @@ pub struct CliAccounts {
     pub served_at: Option<i64>,
     /// When a renewal last bound the serving row, in unix seconds.
     pub renewed_at: Option<i64>,
+    /// When the serving row last had room on a read's or the owner's word
+    /// ([`crate::harness::accounts::Account::room_since`]), in unix seconds.
+    pub room_since: Option<i64>,
     /// Another row with an email that is signed out or not enrolled when the serving row is
     /// limited or signed out (never where [`Self::default_only`], since no other row runs
-    /// there, nor under rotation off, which takes no row but the owner's pin), else the serving
-    /// row itself where it has an email and is signed out.
+    /// there, nor under rotation off, which takes no row but the owner's pin, nor one its source
+    /// gives other Macs alone), else the serving row itself where it has an email and is signed
+    /// out.
     pub next_sign_in: Option<String>,
     /// aterm's own sign-in of the row a sign-in signs in ([`Self::sign_in_target`]) that failed
     /// and stands on record.
@@ -589,7 +597,11 @@ pub fn home_of(
 }
 
 fn mtime(path: &Path) -> Option<i64> {
-    let t = std::fs::metadata(path).ok()?.modified().ok()?;
+    let t = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?
+        .modified()
+        .ok()?;
     i64::try_from(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()).ok()
 }
 
@@ -692,6 +704,30 @@ fn local_sign_in_refusal(
         Ok(Some(_)) => Some("this account requires a fresh root-authorized shared sign-in".into()),
         Err(why) => Some(why),
     }
+}
+
+/// The Mac `label`'s account belongs to, where no person named that row by pinning it.
+fn unnamed_holder<'a>(
+    other_macs: &'a std::collections::BTreeMap<String, String>,
+    state: &crate::harness::accounts::State,
+    label: &str,
+) -> Option<&'a str> {
+    let pinned = state.pinned && state.active.as_deref() == Some(label);
+    other_macs
+        .get(label)
+        .filter(|_| !pinned)
+        .map(String::as_str)
+}
+
+/// Why `aterm ai login` signs in no row of `holder`'s: nobody named it, and that command also runs
+/// with nobody here. It names the verb that borrows it.
+fn another_macs_refusal(
+    cli: crate::harness::accounts::Cli,
+    label: &str,
+    holder: Option<&str>,
+) -> Option<String> {
+    let sign_in = crate::harness::accounts_step::Step::sign_in(cli, label, true);
+    holder.map(|holder| crate::harness::cli::another_macs_words(holder, &sign_in))
 }
 
 fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
@@ -798,25 +834,46 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         accounts::Condition::SignedOut | accounts::Condition::NotEnrolled
     );
     let local = |row: &accounts::Row| local_sign_in_refusal(row, &state, &logins).is_none();
-    let local_roster = accounts::Roster {
-        rows: bound
-            .rows
-            .iter()
-            .filter(|row| local(row))
-            .cloned()
-            .collect(),
+    let other_macs = match (m.home.as_deref(), m.harness_state.as_deref(), &m.roster) {
+        (Some(home), Some(state_dir), Some(roster_path))
+            if limited_until.is_some() || signed_out =>
+        {
+            crate::harness::accounts_sync::rows_of_other_macs_at(
+                accounts::Cli::Claude,
+                (home, state_dir),
+                roster_path,
+                (&raw_roster, &logins),
+                m.now,
+            )
+        }
+        _ => std::collections::BTreeMap::new(),
     };
+    let unnamed_holder = unnamed_holder(&other_macs, &state, &row.label);
     let next_sign_in = if (limited_until.is_some() || signed_out) && (!state.pinned || local(&row))
     {
+        let local_roster = accounts::Roster {
+            rows: bound
+                .rows
+                .iter()
+                .filter(|row| local(row) && !other_macs.contains_key(&row.label))
+                .cloned()
+                .collect(),
+        };
         accounts::renew_next(&local_roster, &state, &enrolled, Some(&row.label), m.now).or_else(
-            || (signed_out && local(&row) && row.email.is_some()).then(|| row.label.clone()),
+            || {
+                (signed_out && unnamed_holder.is_none() && local(&row) && row.email.is_some())
+                    .then(|| row.label.clone())
+            },
         )
     } else {
         None
     };
     let sign_in_refused = next_sign_in
         .is_none()
-        .then(|| local_sign_in_refusal(&row, &state, &logins))
+        .then(|| {
+            local_sign_in_refusal(&row, &state, &logins)
+                .or_else(|| another_macs_refusal(accounts::Cli::Claude, &row.label, unnamed_holder))
+        })
         .flatten();
     let target = next_sign_in.as_deref().unwrap_or(&row.label);
     let target_email = bound.row(target).and_then(|r| r.email.as_deref());
@@ -1030,12 +1087,11 @@ fn store_file_in(dir: &Path, c: &Connector) -> Option<(PathBuf, Option<i64>)> {
 /// The end of Codex's usage limit from its own `rate_limits` readings
 /// ([`super::codex_limits::home_pick`]): the latest reset ahead of a window at 100%, read only
 /// from a reading no older than [`super::codex_limits::FRESH_S`]. A reading older than `since` is
-/// ignored.
+/// ignored ([`super::codex_limits::home_pick_since`]).
 fn codex_limit(home: &Path, since: Option<i64>, now: i64) -> Option<i64> {
     use super::codex_limits as limits;
-    let pick = limits::home_pick(home, now)?;
-    if now.saturating_sub(pick.newest) > limits::FRESH_S || since.is_some_and(|at| pick.newest < at)
-    {
+    let pick = limits::home_pick_since(home, since, now)?;
+    if now.saturating_sub(pick.newest) > limits::FRESH_S {
         return None;
     }
     pick.windows
@@ -1158,7 +1214,7 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
             {
                 home.as_ref()
                     .ok()
-                    .and_then(|h| codex_limit(h, p.renewed_at, m.now))
+                    .and_then(|h| codex_limit(h, p.renewed_at.max(p.room_since), m.now))
             } else {
                 None
             }
@@ -1278,6 +1334,18 @@ fn pool_for_with(
     let enrolled_here = accounts::enrolled_in(cli, &bound, user_home);
     let emails = bound.rows.iter().filter(|r| r.email.is_some()).count();
     let local = |row: &accounts::Row| local_sign_in_refusal(row, &state, &logins).is_none();
+    let other_macs =
+        m.harness_state
+            .as_deref()
+            .map_or_else(std::collections::BTreeMap::new, |state_dir| {
+                crate::harness::accounts_sync::rows_of_other_macs_at(
+                    cli,
+                    (user_home, state_dir),
+                    &roster_path,
+                    (&raw_roster, &logins),
+                    m.now,
+                )
+            });
     let executable =
         |row: &accounts::Row| row.held_by.is_none() && state.execution_verdict(&row.label).is_ok();
     let with_email = || bound.rows.iter().filter(|r| local(r) && r.email.is_some());
@@ -1306,7 +1374,7 @@ fn pool_for_with(
         })
         .map(|r| r.label.clone());
     let next = with_email()
-        .find(|r| !enrolled_here.contains(&r.label))
+        .find(|r| !enrolled_here.contains(&r.label) && !other_macs.contains_key(&r.label))
         .map(|r| r.label.clone())
         .or_else(|| due.first().cloned())
         .or_else(|| {
@@ -1635,6 +1703,7 @@ fn pool_for_with(
                         .iter()
                         .filter(|r| {
                             local(r)
+                                && !other_macs.contains_key(&r.label)
                                 && r.class == cls
                                 && r.label != row.label
                                 && r.email.is_some()
@@ -1651,7 +1720,11 @@ fn pool_for_with(
                         .next()
                 })
                 .or_else(|| {
-                    (signed_out && local(row) && row.email.is_some()).then(|| row.label.clone())
+                    (signed_out
+                        && unnamed_holder(&other_macs, &state, &row.label).is_none()
+                        && local(row)
+                        && row.email.is_some())
+                    .then(|| row.label.clone())
                 });
             if state.pinned && !local(row) {
                 out.next_sign_in = None;
@@ -1663,6 +1736,10 @@ fn pool_for_with(
         let binding = logins.get(&row.label);
         out.served_at = binding.and_then(|b| b.served_at);
         out.renewed_at = binding.and_then(|b| b.renewed_at);
+        out.room_since = state
+            .accounts
+            .get(&row.label)
+            .and_then(accounts::Account::room_since);
         if row.email.is_some() {
             let ls = accounts::login_state(row, &logins, &state, m.now);
             if let LoginState::Due { by } = ls {
@@ -1692,7 +1769,15 @@ fn pool_for_with(
         out.next = None;
     }
     if out.next.is_none() {
-        out.sign_in_refused = serving.and_then(|row| local_sign_in_refusal(row, &state, &logins));
+        out.sign_in_refused = serving.and_then(|row| {
+            local_sign_in_refusal(row, &state, &logins).or_else(|| {
+                another_macs_refusal(
+                    cli,
+                    &row.label,
+                    unnamed_holder(&other_macs, &state, &row.label),
+                )
+            })
+        });
     }
     // What stands on record of the row a sign-in signs in, and the switches that keep aterm's
     // own sign-ins off here.

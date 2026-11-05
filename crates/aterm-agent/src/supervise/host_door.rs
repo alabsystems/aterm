@@ -102,6 +102,38 @@ macro_rules! idle_host_trait {
     };
     (@act act) => { true };
     (@act) => { false };
+    (@taped take_provider_read_account [$($act:ident)?] [] [$ret:ty]) => {
+        fn take_provider_read_account(&self) -> $ret { self.inner().take_provider_read_account() }
+    };
+    (@replay take_provider_read_account [] [$ret:ty]) => {
+        fn take_provider_read_account(&self) -> $ret { None }
+    };
+    (@taped account_probe [$($act:ident)?] [] [$ret:ty]) => {
+        fn account_probe(&self) -> $ret {
+            let mut token = None;
+            let inner = self.inner();
+            let outcome: Result<(), ProbeNo> = self.ask("host.account_probe", $crate::supervise::run::host_door::idle_host_trait!(@request), || inner.account_probe().map(|held| token = Some(held)), true);
+            outcome.and_then(|()| token.ok_or(ProbeNo::NoAccounts))
+        }
+    };
+    (@replay account_probe [] [$ret:ty]) => {
+        fn account_probe(&self) -> $ret {
+            let outcome: Result<(), ProbeNo> = self.ask("host.account_probe", $crate::supervise::run::host_door::idle_host_trait!(@request));
+            outcome.map(|()| crate::harness::provider_read::Use::replay_use())
+        }
+    };
+    (@taped account_probe_typed [$($act:ident)?] [$arg:ident: $ty:ty] []) => {
+        fn account_probe_typed(&self, $arg: $ty) {
+            let inner = self.inner();
+            self.tell("host.account_probe_typed", $crate::supervise::run::host_door::idle_host_trait!(@request), || inner.account_probe_typed($arg), false);
+        }
+    };
+    (@replay account_probe_typed [$arg:ident: $ty:ty] []) => {
+        fn account_probe_typed(&self, $arg: $ty) {
+            drop($arg);
+            self.tell("host.account_probe_typed", $crate::supervise::run::host_door::idle_host_trait!(@request));
+        }
+    };
     (@taped $name:ident [$($act:ident)?] [$($arg:ident: $ty:ty),*] []) => {
         fn $name(&self $(, $arg: $ty)*) {
             let inner = self.inner();
@@ -207,12 +239,15 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         None
     }
     /// The restart in place `why`, asked as `ask` ([`super::super::policy::turn_end::RestartAsk`]:
-    /// the same at every ask of one restart), and the host's word for what it did.
+    /// the same at every ask of one restart), and the host's answer
+    /// ([`super::super::policy::turn_end::RestartAnswer`]): its word for what it did, and what it
+    /// read of the conversation's record once it answered
+    /// ([`super::super::policy::turn_end::RestartClaim`]).
     act fn restart(
         &self,
         why: &super::super::policy::turn_end::Restart,
         ask: &super::super::policy::turn_end::RestartAsk,
-    ) -> Option<String> {
+    ) -> Option<super::super::policy::turn_end::RestartAnswer> {
         let _ = (why, ask);
         None
     }
@@ -283,6 +318,12 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// reads take.
     fn repo_work(&self) -> Option<crate::harness::repo_work::RepoRead> {
         Some(crate::harness::repo_work::RepoRead::Clean)
+    }
+    /// THE PROCESSES THE SESSION'S AGENT STARTED THAT STILL RUN, each re-proved now
+    /// ([`crate::harness::leftover::LeftRead`]): asked only where [`Self::repo_work`] is, and
+    /// `None` while the read goes on, as that door's is. A host that reads none was not asked.
+    fn leftover(&self) -> Option<crate::harness::leftover::LeftRead> {
+        Some(crate::harness::leftover::LeftRead::NotAsked)
     }
     fn lifted_off(&self) -> bool {
         false
@@ -501,6 +542,15 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Which other sessions of this aterm change a file this session's branch changes, read from
+    /// their work records ([`crate::supervise::overlap::OverlapReading`], as old as the oldest
+    /// record it rests on); `None` where nothing was read (no record of this session's young
+    /// enough to compare, or a host that keeps none). Asked at a turn end's decision only, so no
+    /// break line carries it.
+    fn overlap(&self) -> Option<crate::supervise::overlap::OverlapReading> {
+        None
+    }
+
     fn break_taken(&self) {}
 
     fn occupancy_said(&self, said: &crate::supervise::occupancy::OccupancySaid) {
@@ -601,6 +651,15 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// WHAT THE SESSION'S CLAUDE CODE SETTINGS MAKE OF `/login`
+    /// ([`super::super::policy::login::LoginPin`], the post-landing review of 2026-11-02): asked
+    /// at a lost login before aterm types `/login`, read from the settings the session's own
+    /// process reads (`claude_settings::login_pin_under`). A host that reads none answers
+    /// [`super::super::policy::login::LoginPin::Picker`], so `/login` is typed as before.
+    fn login_pin(&self) -> super::super::policy::login::LoginPin {
+        super::super::policy::login::LoginPin::Picker
+    }
+
     fn roster_word(&self) -> Option<super::super::policy::turn_end::RosterWord> {
         None
     }
@@ -619,11 +678,15 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         let _ = days;
     }
 
-    act fn account_probe(&self) -> Result<(), ProbeNo> {
+    fn take_provider_read_account(&self) -> Option<crate::harness::provider_read::Account> {
+        None
+    }
+
+    act fn account_probe(&self) -> Result<crate::harness::provider_read::Use, ProbeNo> {
         Err(ProbeNo::NoAccounts)
     }
 
-    fn account_probe_typed(&self) {}
+    fn account_probe_typed(&self, _use_token: crate::harness::provider_read::Use) {}
 
     fn account_probed(&self, read: Result<&crate::harness::accounts::Sample, ProbeMiss>) {
         let _ = read;

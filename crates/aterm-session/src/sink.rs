@@ -831,6 +831,12 @@ impl SinkWriter {
         aterm_pty::tty_echo(self.master)
     }
 
+    /// The process group that leads this sink's terminal's foreground, if the read names one.
+    #[must_use]
+    pub fn foreground_group(&self) -> Option<i32> {
+        aterm_pty::foreground_group(self.master)
+    }
+
     /// Cache a caller-observed `tty_swallows_input` hint so [`Self::tty_swallows_input`] can answer without a `tcgetattr` syscall on every keystroke.
     pub fn set_tty_swallows_hint(&self, swallows: bool) {
         self.shared
@@ -2657,8 +2663,14 @@ mod tests {
         assert_eq!(sink.write_frame(b"abc").expect("write"), 3);
         assert_eq!(sink.input_backlog(), None);
         assert_eq!(sink.tty_echo(), None);
+        assert_eq!(
+            sink.foreground_group(),
+            None,
+            "a socket leads no foreground"
+        );
         assert_eq!(SinkWriter::new(-1).input_backlog(), None);
         assert_eq!(SinkWriter::new(-1).tty_echo(), None);
+        assert_eq!(SinkWriter::new(-1).foreground_group(), None);
     }
 
     #[test]

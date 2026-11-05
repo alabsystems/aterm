@@ -51,12 +51,9 @@ pub enum StageId {
     Census,
     /// Trust checkers over registered formal models (`spec-check`).
     SpecCheck,
-    /// Holds this host's GPU arm to its CPU twins, with the record of wgpu's frames a signal,
-    /// after [`Self::Test`], on its build in the main target.
-    GpuOracle,
     /// Compiles `aterm-spec/checkers` tests (`--no-run`) in [`Lane::CheckersTarget`].
     CheckersCompile,
-    /// Runs `aterm-spec/checkers` tests after [`Self::Test`] and [`Self::GpuOracle`].
+    /// Runs `aterm-spec/checkers` tests after [`Self::Test`].
     SpecCheckers,
     /// Prebuilds measuring test binaries (`--no-run`) before the first exclusive barrier.
     MeasurePrebuild,
@@ -384,7 +381,7 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         },
         spec(
             StageId::Tippy,
-            format!("tippy lint ({label})"),
+            format!("tippy lint ({})", scope.lint_label()),
             Lane::TippyTarget,
         ),
         spec(
@@ -405,27 +402,18 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
                 Lane::AfterCompile,
             )
         },
-        StageSpec {
-            after_stages: vec![StageId::Test],
-            ..spec(
-                StageId::GpuOracle,
-                "gpu oracle (aterm-gpu's frame record: this host's arm against wgpu's \
-                 recorded frames; after the test run, on its build)",
-                Lane::MainTarget,
-            )
-        },
         spec(
             StageId::CheckersCompile,
             format!("checkers compile ({checker_label} with aterm-spec/checkers, --no-run)"),
             Lane::CheckersTarget,
         ),
         StageSpec {
-            after_stages: vec![StageId::Test, StageId::GpuOracle],
+            after_stages: vec![StageId::Test],
             ..spec(
                 StageId::SpecCheckers,
                 format!(
                     "checkers ({checker_label} with aterm-spec/checkers: per-step ty \
-                 agreement; after the test run and the gpu oracle's)"
+                 agreement; after the test run)"
                 ),
                 Lane::CheckersTarget,
             )
@@ -668,6 +656,101 @@ mod tests {
             plan(&ctx(&[Check::Test], Scope::Workspace))
                 .iter()
                 .any(|s| s.id == StageId::Test)
+        );
+    }
+
+    /// A release's red `test` or `doc` row prints a command the CLI takes and that runs the check
+    /// as the release did: without `--as-release` it carries no feature and owes no golden test,
+    /// so what failed there would pass. CONTROL: a plain run's and another check's name no flag.
+    #[test]
+    fn a_releases_red_test_row_reruns_as_the_release_ran() {
+        let release =
+            ctx(&[Check::Test, Check::Doc, Check::Lint], Scope::Workspace).with_release(true);
+        for check in [Check::Test, Check::Doc] {
+            let printed = release.rerun(check);
+            assert_eq!(
+                printed,
+                format!(
+                    "targo --unverified verify {} --all --as-release",
+                    check.name()
+                )
+            );
+            let words = printed
+                .strip_prefix("targo --unverified verify ")
+                .expect("the verb")
+                .split(' ');
+            let parsed = crate::cli::parse(words).expect("the CLI takes what the row prints");
+            assert!(parsed.as_release && parsed.all && parsed.checks == [check]);
+            assert_eq!(
+                parsed.wanted(|p| Scope::Workspace.includes_crate(p)),
+                [check],
+                "no release runs what `test` would pull"
+            );
+        }
+        let without = crate::cli::parse(["test", "--all"]).expect("parses");
+        assert_eq!(
+            without.wanted(|p| Scope::Workspace.includes_crate(p)),
+            [Check::Test, Check::WasmSmoke],
+            "a plain `test --all` still pulls it"
+        );
+        let compiled =
+            crate::cli::parse(["test", "--all", "--compile-only", "--as-release"]).expect("parses");
+        assert_eq!(
+            compiled.wanted(|p| Scope::Workspace.includes_crate(p)),
+            [Check::Test]
+        );
+        assert!(!release.rerun(Check::Lint).contains("--as-release"));
+        let plain = ctx(&[Check::Test], Scope::Workspace);
+        assert_eq!(
+            plain.rerun(Check::Test),
+            "targo --unverified verify test --all"
+        );
+        assert_eq!(
+            plain
+                .with_checkers_in_tests(true)
+                .with_compile_only(true)
+                .rerun(Check::Test),
+            "targo --unverified verify test --all --compile-only --as-release"
+        );
+    }
+
+    /// A cone's red `lint` row reruns the cone by its base, which runs the same passes: `-p` over
+    /// its crates would lint every target of each, and the crates the cone's lint left out.
+    /// CONTROL: `test` and `doc` take every crate of the cone, so theirs name them; `-p` and the
+    /// workspace rerun as they ran.
+    #[test]
+    fn a_cones_red_lint_row_reruns_the_cone_by_its_base() {
+        let cone = Scope::changed(
+            "origin/main",
+            vec!["dev".to_string(), "seed".to_string()],
+            true,
+        )
+        .with_all_targets(vec!["seed".to_string()])
+        .with_unlinted(vec!["dev".to_string()]);
+        let plain = ctx(&[Check::Lint, Check::Test, Check::Doc], cone);
+        let printed = plain.rerun(Check::Lint);
+        assert_eq!(printed, "targo --unverified verify lint --base origin/main");
+        let words = printed
+            .strip_prefix("targo --unverified verify ")
+            .expect("the verb")
+            .split(' ');
+        let parsed = crate::cli::parse(words).expect("the CLI takes what the row prints");
+        assert_eq!(parsed.checks, [Check::Lint]);
+        assert_eq!(parsed.base.as_deref(), Some("origin/main"));
+        assert!(parsed.packages.is_empty() && !parsed.all && parsed.narrows());
+        for (check, name) in [(Check::Test, "test"), (Check::Doc, "doc")] {
+            assert_eq!(
+                plain.rerun(check),
+                format!("targo --unverified verify {name} -p dev -p seed")
+            );
+        }
+        assert_eq!(
+            ctx(&[Check::Lint], Scope::crate_only("seed")).rerun(Check::Lint),
+            "targo --unverified verify lint -p seed"
+        );
+        assert_eq!(
+            ctx(&[Check::Lint], Scope::Workspace).rerun(Check::Lint),
+            "targo --unverified verify lint --all"
         );
     }
 
@@ -1033,45 +1116,33 @@ mod tests {
     #[test]
     fn the_feature_builds_compile_beside_the_test_run_and_test_after_it() {
         use crate::sched::{awaited, ready};
-        let p = plan(&ctx(&RELEASE, Scope::workspace()));
+        let p = plan(&ctx(&[Check::Test, Check::Checkers], Scope::workspace()));
         let at = |id| p.iter().position(|s| s.id == id).expect("planned");
         let none = vec![false; p.len()];
         assert!(
             ready(&p, &none, &none, 0, at(StageId::CheckersCompile), u64::MAX),
             "the checkers compile at t0"
         );
-        assert_eq!(
-            p[at(StageId::GpuOracle)].lane,
-            Lane::MainTarget,
-            "the oracle runs on the test run's build"
-        );
-        let (test, oracle, checkers) = (
-            at(StageId::Test),
-            at(StageId::GpuOracle),
-            at(StageId::SpecCheckers),
-        );
-        assert_eq!(awaited(&p, oracle).collect::<Vec<_>>(), [test]);
-        assert_eq!(awaited(&p, checkers).collect::<Vec<_>>(), [test, oracle]);
+        let (test, checkers) = (at(StageId::Test), at(StageId::SpecCheckers));
+        assert_eq!(awaited(&p, checkers).collect::<Vec<_>>(), [test]);
         let mut done = none.clone();
         for id in [StageId::TestCompile, StageId::CheckersCompile] {
             done[at(id)] = true;
         }
         assert!(
-            !ready(&p, &done, &done, 0, oracle, u64::MAX),
-            "the oracle waits for the test run"
+            !ready(&p, &done, &done, 0, checkers, u64::MAX),
+            "the checkers wait for the test run"
         );
         done[test] = true;
-        assert!(ready(&p, &done, &done, 0, oracle, u64::MAX));
-        assert!(
-            !ready(&p, &done, &done, 0, checkers, u64::MAX),
-            "the checkers wait for the oracle"
-        );
-        done[oracle] = true;
         assert!(ready(&p, &done, &done, 0, checkers, u64::MAX));
-        for alone in [Check::Checkers, Check::GpuOracle] {
-            let p = plan(&ctx(&[alone], Scope::workspace()));
-            assert!(p.iter().all(|s| s.after_stages.is_empty()), "{alone:?}");
-        }
+        let alone = plan(&ctx(&[Check::Checkers], Scope::workspace()));
+        assert!(alone.iter().all(|s| s.after_stages.is_empty()));
+        // The release runs its suite once, with the feature, in the main lane.
+        let release = plan(&ctx(&RELEASE, Scope::workspace()));
+        assert!(release.iter().all(|s| {
+            !matches!(s.id, StageId::CheckersCompile | StageId::SpecCheckers)
+                && s.lane != Lane::CheckersTarget
+        }));
     }
 }
 

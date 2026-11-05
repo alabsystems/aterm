@@ -238,7 +238,29 @@ mod tests {
         execs: RefCell<Vec<Exec>>,
     }
 
-    const SHIM: &str = "/Users//alice/.local/state/aterm/clt-shim";
+    /// The root of an absolute path on the host the test runs on: a drive's on Windows, where
+    /// a `/`-rooted path is relative and so never a shim's own ([`own_dir`]).
+    #[cfg(not(windows))]
+    const ROOT: &str = "/";
+    #[cfg(windows)]
+    const ROOT: &str = r"C:\";
+
+    /// `rest`, `/`-separated, under [`ROOT`].
+    fn at(rest: &str) -> PathBuf {
+        rest.split('/')
+            .fold(PathBuf::from(ROOT), |path, part| path.join(part))
+    }
+
+    /// This account's shim directory.
+    fn shim() -> PathBuf {
+        at("Users/alice/.local/state/aterm/clt-shim")
+    }
+
+    /// `entries` as one `PATH`, joined by this host's separator (`;` on Windows) as the
+    /// dispatch splits it.
+    fn path_of(entries: &[PathBuf]) -> OsString {
+        std::env::join_paths(entries).expect("PATH entries")
+    }
 
     /// Where the fake keeps Apple's own tools: never run, only named.
     const STUBS: &str = "/stand-in/usr/bin";
@@ -265,7 +287,7 @@ mod tests {
         }
 
         fn shim_dir(&self) -> Option<PathBuf> {
-            Some(PathBuf::from(SHIM))
+            Some(shim())
         }
 
         fn exec(
@@ -325,9 +347,12 @@ mod tests {
         let fake = Fake {
             present: true,
             carries: vec!["git"],
-            path: Some(OsString::from(format!(
-                "/opt/homebrew/bin:{SHIM}:/usr/bin:/bin"
-            ))),
+            path: Some(path_of(&[
+                at("opt/homebrew/bin"),
+                shim(),
+                at("usr/bin"),
+                at("bin"),
+            ])),
             ..Fake::default()
         };
         let code = run_with(
@@ -345,8 +370,8 @@ mod tests {
             vec![OsString::from("status"), OsString::from("-s")]
         );
         assert_eq!(
-            execs[0].3.as_deref(),
-            Some(OsStr::new("/opt/homebrew/bin:/usr/bin:/bin")),
+            execs[0].3,
+            Some(path_of(&[at("opt/homebrew/bin"), at("usr/bin"), at("bin")])),
             "the shim directory is off the PATH Apple's tool gets"
         );
     }
@@ -361,7 +386,7 @@ mod tests {
         let fake = Fake {
             present: true,
             carries: vec!["git", "cc", "clang", "ld"],
-            path: Some(OsString::from(format!("{SHIM}:/usr/bin:/bin"))),
+            path: Some(path_of(&[shim(), at("usr/bin"), at("bin")])),
             ..Fake::default()
         };
         let _ = run_with(&fake, "xcrun", &[OsString::from("--show-sdk-path")]);
@@ -372,7 +397,7 @@ mod tests {
             "xcrun ran nothing and said: {:?}",
             fake.warnings.borrow()
         );
-        assert_eq!(execs[0].3.as_deref(), Some(OsStr::new("/usr/bin:/bin")));
+        assert_eq!(execs[0].3, Some(path_of(&[at("usr/bin"), at("bin")])));
     }
 
     /// A person's Stop, an install that ended unfinished, or an account that may not install them
@@ -384,7 +409,7 @@ mod tests {
     fn with_nothing_installing_the_tools_it_fails_plainly_and_never_runs_a_stub() {
         for tool in ["git", "cc", "python3", "pagestuff", "xcrun"] {
             let fake = Fake {
-                path: Some(OsString::from(format!("{SHIM}:/usr/bin:/bin"))),
+                path: Some(path_of(&[shim(), at("usr/bin"), at("bin")])),
                 ..Fake::default()
             };
             assert_eq!(run_with(&fake, tool, &[]), 69, "{tool}");
@@ -433,7 +458,7 @@ mod tests {
         );
         let present = Fake {
             present: true,
-            path: Some(OsString::from("/usr/bin:/bin")),
+            path: Some(path_of(&[at("usr/bin"), at("bin")])),
             ..Fake::default()
         };
         let _ = run_with(&present, "xcrun", &rest);
@@ -476,19 +501,10 @@ mod tests {
     /// to this account's directory.
     #[test]
     fn the_shim_finds_its_directory_from_the_path_it_ran_by_not_home() {
-        let home = || {
-            Some(PathBuf::from(
-                "/Users//elsewhere/.local/state/aterm/clt-shim",
-            ))
-        };
-        assert_eq!(
-            own_dir(Some(PathBuf::from(format!("{SHIM}/git"))), "git", home),
-            Some(PathBuf::from(SHIM))
-        );
+        let home = || Some(at("Users/elsewhere/.local/state/aterm/clt-shim"));
+        assert_eq!(own_dir(Some(shim().join("git")), "git", home), Some(shim()));
         for exe in [
-            Some(PathBuf::from(
-                "/Applications/aterm.app/Contents/MacOS/aterm",
-            )),
+            Some(at("Applications/aterm.app/Contents/MacOS/aterm")),
             Some(PathBuf::from("clt-shim/git")),
             None,
         ] {

@@ -3770,11 +3770,12 @@ fn a_cleared_block_history_is_said_once_and_only_when_it_took_a_command() {
         ("clear", 0, 0, 2),
         ("clear seen running", 0, 0, 2),
         ("a clear past an unread command", 1, 2, 3),
-        ("reset", 1, 2, 2),
-        ("reset seen running", 0, 2, 2),
-        ("reset seen running, a command after it", 0, 2, 3),
+        // A RIS erases what `clear` does and, like it, takes no block that was on the screen.
+        ("reset", 0, 0, 2),
+        ("reset seen running", 0, 0, 2),
+        ("reset seen running, a command after it", 0, 0, 3),
         ("cmd-k", 0, 0, 2),
-        ("ris", 0, 2, 2),
+        ("ris", 0, 0, 2),
     ] {
         let mut term = aterm_core::terminal::Terminal::new(24, 80);
         let (tl, hand) = opened();
@@ -3840,12 +3841,24 @@ fn a_cleared_block_history_is_said_once_and_only_when_it_took_a_command() {
         assert_eq!(evicted_gaps(&tl), gaps, "{case}: {:?}", lines_of(&tl));
     }
 
+    // Blocks 0 and 1 lie wholly in the history a long command's output pushed them into, and
+    // ED 3 takes them: a read from block 1 says it dropped one, reads block 2 and resumes past it.
     let mut term = aterm_core::terminal::Terminal::new(24, 80);
     term.process(prompt);
     term.process(b"ls\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\");
     term.process(prompt);
-    term.process(b"\x1bc");
+    term.process(b"true\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\");
     term.process(prompt);
+    term.process(b"seq 30\r\n\x1b]133;C\x1b\\");
+    term.process(&b"n\r\n".repeat(30));
+    term.process(b"\x1b]133;D;0\x1b\\");
+    term.process(prompt);
+    term.process(b"\x1b[3J");
+    assert_eq!(
+        term.all_blocks().next().map(|b| b.id),
+        Some(2),
+        "PRECONDITION: the erase took blocks 0 and 1"
+    );
     let read = crate::session_status::block_read(
         &term,
         Some(1),
@@ -3856,7 +3869,7 @@ fn a_cleared_block_history_is_said_once_and_only_when_it_took_a_command() {
     let (tl, hand) = opened();
     blocks(&tl, &hand, 100, &read);
     assert_eq!(evicted_gaps(&tl), 1, "{:?}", lines_of(&tl));
-    assert_eq!(tl.lock().unwrap().slog().block_cursor(), Some(2));
+    assert_eq!(tl.lock().unwrap().slog().block_cursor(), Some(3));
 }
 
 #[test]
@@ -3895,9 +3908,10 @@ fn an_idle_clear_after_a_seen_command_writes_no_gap() {
                 for i in 0..4 {
                     sweep_term(&tl, &hand, &term, 100 + i * 250);
                 }
+                // A RIS takes no block on the screen, as ED 3 and Cmd-K do not: no read loses one.
                 assert_eq!(
                     evicted_gaps(&tl),
-                    usize::from(ran && clear == "ris"),
+                    0,
                     "{clear} swept={swept} ran={ran}: {:?}",
                     lines_of(&tl)
                 );
@@ -3993,7 +4007,19 @@ fn the_cap_owes_a_look_only_for_a_block_that_may_yet_be_a_fact() {
         );
         assert_eq!(read.more, more, "n={n} running={running}");
         blocks(&tl, &hand, 10, &read);
-        term.process(b"\x1bc");
+        // Every block the read saw, and any the cap left unread, scrolls wholly into the
+        // history, which ED 3 then erases (a RIS would keep the blocks on the screen).
+        if running {
+            term.process(b"\x1b]133;D;0\x1b\\");
+            term.process(prompt);
+        }
+        term.process(&b"\r\n".repeat(30));
+        term.process(b"\x1b[3J");
+        assert!(
+            term.all_blocks()
+                .all(|b| b.id >= u64::try_from(n).unwrap_or(u64::MAX)),
+            "n={n} running={running}: PRECONDITION: the erase took every command's block"
+        );
         term.process(prompt);
         sweep_term(&tl, &hand, &term, 100);
         sweep_term(&tl, &hand, &term, 200);
@@ -4303,10 +4329,9 @@ fn lost_command_oracle(cfg: OracleCfg) -> OracleTally {
                 }
                 64..=67 => feed(&mut term, b"\x1b[3J", ms),
                 68..=70 => term.clear_scrollback(),
-                71..=73 => {
-                    feed(&mut term, b"\x1bc", ms);
-                    phase = Idle;
-                }
+                // A RIS erases as `clear` does and leaves the shell where it stands: a running
+                // command's D still lands, and only blocks wholly in the history go.
+                71..=73 => feed(&mut term, b"\x1bc", ms),
                 74 if cfg.adopt && adopt_at.len() < 3 => {
                     let cp = term.checkpoint();
                     let meta = CheckpointMeta::from_checkpoint(&cp);
@@ -4480,12 +4505,17 @@ fn the_block_read_says_every_lost_command_and_nothing_else() {
         }
     }
 
+    // Without the started count the reader misjudges a loss: since a RIS erases as `clear` does
+    // (and no longer drops every block), it misses gaps rather than inventing them.
     let no_count = lost_command_oracle(OracleCfg {
-        seeds: (1, 25),
+        seeds: (1, 100),
         mutate: |r| r.started = None,
         ..base
     });
-    assert!(no_count.false_gaps > 0, "{no_count:?}");
+    assert!(
+        no_count.false_gaps + no_count.missed_gaps > 0,
+        "{no_count:?}"
+    );
     let blind = lost_command_oracle(OracleCfg {
         seeds: (1, 25),
         mutate: |r| {
@@ -7030,5 +7060,144 @@ fn a_told_epoch_at_the_top_saturates_nothing() {
     assert!(
         eps.windows(2).all(|w| w[0] < w[1]) && eps.iter().all(|&e| e <= EPOCH_CEILING),
         "one process issued {eps:?}"
+    );
+}
+
+/// A TAB'S PLACE AND ITS AGENTS' SPEND CROSS A SEAMLESS UPDATE (`tab v=1`, `spend v=1`): the
+/// adopted log's close of it names the window and parent its open named, counts `wall_s=` from
+/// that open, in the predecessor, and counts the tokens of the conversation that ended there
+/// with the one still running, under the login last read.
+/// CONTROL: a log no open placed carries no place, and its close writes no `tab` mark.
+#[test]
+fn a_tabs_place_is_carried_and_its_close_counts_from_the_open() {
+    let epochs = process(None);
+    let mut pred = spawned_in(&epochs, 1_000, 0);
+    let parent = aterm_slog::ShortId::new("s-0123456789abcdef0123");
+    let opened = at(1_000).wall_ms;
+    pred.open_tab(
+        TabPlace {
+            opened_wall: opened,
+            window: 3,
+            parked: true,
+            parent,
+        },
+        "task",
+        Actor::Harness,
+        at(1_000),
+    );
+    assert!(
+        pred.host_lines(at(1_000)).iter().any(|l| *l
+            == format!("tab v=1 opened={opened} window=3 parked=1 parent=s-0123456789abcdef0123")),
+        "{:?}",
+        pred.host_lines(at(1_000))
+    );
+    pred.note_agent_usage("c:conv-1".to_string(), Some(100), Some("m9 2".to_string()));
+    pred.note_agent_usage("c:conv-2".to_string(), Some(40), None);
+    let mut next = carried_in(&epochs, &mut pred, 61_000);
+    assert_eq!(
+        next.tab_place(),
+        Some(TabPlace {
+            opened_wall: opened,
+            window: 3,
+            parked: true,
+            parent,
+        })
+    );
+    next.close_tab(
+        TabClose {
+            out: aterm_slog::SessionOut::UiClose,
+            by: Actor::Human,
+            why: None,
+            task: None,
+        },
+        at(61_000),
+    );
+    let tabs: Vec<_> = next
+        .log()
+        .window()
+        .filter(|r| r.k == Kind::Tab)
+        .map(|r| aterm_slog::encode(r, Tier::Host).expect("fits"))
+        .collect();
+    let close = tabs.last().expect("the carried open and its close");
+    assert!(
+        close.contains(
+            " act=close parent=s-0123456789abcdef0123 window=3 parked=1 out=ui-close wall_s=60 "
+        ),
+        "{close}"
+    );
+    assert!(close.contains(" tokens=140 "), "{close}");
+    assert!(!close.contains(" account=unavailable "), "{close}");
+
+    let mut bare = spawned_in(&epochs, 2_000, 0);
+    let mut after = carried_in(&epochs, &mut bare, 3_000);
+    assert_eq!(after.tab_place(), None, "CONTROL: nothing placed it");
+    after.close_tab(
+        TabClose {
+            out: aterm_slog::SessionOut::UiClose,
+            by: Actor::Human,
+            why: None,
+            task: None,
+        },
+        at(3_000),
+    );
+    assert!(
+        after.log().window().all(|r| r.k != Kind::Tab),
+        "CONTROL: no tab, no close"
+    );
+}
+
+/// A TAB'S TOKENS ARE EVERY AGENT RUN'S IT HELD: a run's last whole read stands though a later
+/// read of it was partial, a new conversation banks the one before, and the login is the last
+/// one read. CONTROL: a run the footer never read whole leaves the tab's tokens `unavailable`,
+/// never a sum that reads as all of them, and so does a tab no agent ran in.
+#[test]
+fn a_tabs_tokens_are_each_runs_last_whole_read_and_one_never_read_whole_leaves_them_unread() {
+    let epochs = process(None);
+    let closed = |feed: &dyn Fn(&mut SessionLog)| -> String {
+        let mut log = spawned_in(&epochs, 1_000, 0);
+        log.open_tab(
+            TabPlace {
+                opened_wall: at(1_000).wall_ms,
+                window: 0,
+                parked: true,
+                parent: None,
+            },
+            "task",
+            Actor::Harness,
+            at(1_000),
+        );
+        feed(&mut log);
+        log.close_tab(
+            TabClose {
+                out: aterm_slog::SessionOut::Reaper,
+                by: Actor::Harness,
+                why: Some("concluded"),
+                task: None,
+            },
+            at(5_000),
+        );
+        log.log()
+            .window()
+            .filter(|r| r.k == Kind::Tab)
+            .map(|r| aterm_slog::encode(r, Tier::Host).expect("fits"))
+            .next_back()
+            .expect("its close")
+    };
+    let close = closed(&|log| {
+        log.note_agent_usage("c:a".to_string(), Some(100), Some("m9-2".to_string()));
+        log.note_agent_usage("c:a".to_string(), Some(150), None);
+        log.note_agent_usage("c:a".to_string(), None, None);
+        log.note_agent_usage("c:b".to_string(), Some(40), Some("m9-3".to_string()));
+    });
+    assert!(close.contains(" tokens=190 account=m9-3 "), "{close}");
+    let close = closed(&|log| {
+        log.note_agent_usage("c:a".to_string(), None, None);
+        log.note_agent_usage("c:b".to_string(), Some(40), None);
+    });
+    assert!(close.contains(" tokens=unavailable "), "CONTROL: {close}");
+    let close = closed(&|_| {});
+    assert!(
+        close.contains(" tokens=unavailable account=unavailable "),
+        "CONTROL: {close}"
     );
 }

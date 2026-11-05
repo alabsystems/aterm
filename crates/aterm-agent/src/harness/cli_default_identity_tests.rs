@@ -47,9 +47,10 @@ impl Fixture {
             accounts::append_rows_for(Cli::Codex, "", &rows).unwrap(),
         )
         .unwrap();
-        std::fs::write(
+        aterm_uds::atomic_file::write(
             env.config.as_ref().unwrap(),
-            format!("[harness]\naccounts = \"{mode}\"\n"),
+            format!("[harness]\naccounts = \"{mode}\"\n").as_bytes(),
+            0o600,
         )
         .unwrap();
         let store = env.accounts_store_for(Cli::Codex).unwrap();

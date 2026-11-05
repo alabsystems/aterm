@@ -94,6 +94,14 @@ fn pct_or_dash(v: Option<&str>, max: usize) -> String {
     }
 }
 
+/// The most bytes of an agent run's key or login a `spend` line carries.
+pub(super) const SPEND_TEXT_MAX: usize = 128;
+const _: () = assert!(
+    "spend v=1 banked=18446744073709551615 run= tokens=18446744073709551615 account=".len()
+        + 3 * 2 * SPEND_TEXT_MAX
+        <= aterm_slog::CARRY_MAX_LINE
+);
+
 /// The most bytes of a waiting name's program name that cross.
 pub(super) const PENDING_NAME_MAX: usize = 200;
 /// The most bytes of a waiting name's verdict word that cross (a word is a few letters).
@@ -193,6 +201,24 @@ impl SessionLog {
             self.arrivals,
             self.observed.carry_tokens()
         ));
+        if let Some(t) = self.tab {
+            out.push(format!(
+                "tab v=1 opened={} window={} parked={} parent={}",
+                t.opened_wall,
+                t.window,
+                u8::from(t.parked),
+                t.parent.as_ref().map_or("-", ShortId::as_str)
+            ));
+        }
+        if let Some(spend) = self.spend_carry() {
+            out.push(format!(
+                "spend v=1 banked={} run={} tokens={} account={}",
+                opt_wall(spend.banked),
+                pct_or_dash(Some(spend.run), SPEND_TEXT_MAX),
+                opt_wall(spend.run_tokens),
+                pct_or_dash(spend.account, SPEND_TEXT_MAX)
+            ));
+        }
         if let Some(c) = self.cmd {
             out.push(format!(
                 "cmd blk={} node={} wall_from={} child_end={} detailed={}",
@@ -341,6 +367,36 @@ impl SessionLog {
                     }
                     self.observed
                         .read_carry(|k| kv(line, k).map(str::to_string));
+                }
+                "tab" if kv(line, "v") == Some("1") => {
+                    let read = || -> Option<super::TabPlace> {
+                        Some(super::TabPlace {
+                            opened_wall: num(line, "opened")?,
+                            window: num(line, "window")?,
+                            parked: match kv(line, "parked")? {
+                                "0" => false,
+                                "1" => true,
+                                _ => return None,
+                            },
+                            parent: match kv(line, "parent")? {
+                                "-" => None,
+                                p => Some(ShortId::new(p)?),
+                            },
+                        })
+                    };
+                    if let Some(place) = read() {
+                        self.carry_tab(place);
+                    }
+                }
+                "spend" if kv(line, "v") == Some("1") => {
+                    if let (Some(banked), Some(Some(run)), Some(run_tokens), Some(account)) = (
+                        opt_num(line, "banked"),
+                        opt_text(line, "run"),
+                        opt_num(line, "tokens"),
+                        opt_text(line, "account"),
+                    ) {
+                        self.carry_spend(banked, Some(run), run_tokens, account);
+                    }
                 }
                 "cmd" => {
                     self.cmd = read_cmd(line, &self.log, at);

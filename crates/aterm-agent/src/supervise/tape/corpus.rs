@@ -177,6 +177,10 @@ const fn word_goes_on(b: u8) -> bool {
     b.is_ascii_alphabetic() || b >= 0x80
 }
 
+/// The fewest bytes a [word](Scrub::word) takes: a shorter one, taken everywhere, would rewrite the
+/// text around it.
+const WORD_FLOOR: usize = 3;
+
 /// The macOS directories under `/private` that the root's links name.
 const PRIVATE: [&str; 3] = ["tmp", "var", "etc"];
 
@@ -219,13 +223,33 @@ impl Scrub {
     /// # Errors
     /// A word shorter than three bytes, or one with a space or a `/`: taken everywhere, it would rewrite the text around it.
     pub fn word(&mut self, from: &str, to: &str) -> Result<&mut Self, String> {
-        if from.len() < 3 || from.bytes().any(|b| b.is_ascii_whitespace() || b == b'/') {
+        if from.len() < WORD_FLOOR || from.bytes().any(|b| b.is_ascii_whitespace() || b == b'/') {
             return Err(format!(
                 "{from:?}: a scrub takes a word of three bytes or more, with no space or `/`"
             ));
         }
         self.add(from.as_bytes(), to, true);
         Ok(self)
+    }
+
+    /// Take the host name `host` as [`token::HOST`]: as a [word](Self::word) where it is one, and a
+    /// name under a word's three bytes (`m8`), which taken alone would rewrite the text around it
+    /// (`m80`), in the two spellings a Mac writes it joined to another name: the shell prompt's
+    /// `user@host` and Bonjour's `host.local`.
+    /// # Errors
+    /// An empty host, or a host or `user` with a space or a `/`.
+    pub fn host(&mut self, host: &str, user: &str) -> Result<&mut Self, String> {
+        if host.len() >= WORD_FLOOR {
+            return self.word(host, token::HOST);
+        }
+        if host.is_empty() {
+            return Err("a scrub takes a host name of one byte or more".to_string());
+        }
+        self.word(
+            &format!("{user}@{host}"),
+            &format!("{}@{}", token::USER, token::HOST),
+        )?
+        .word(&format!("{host}.local"), &format!("{}.local", token::HOST))
     }
 
     /// Take `from` as `to`, and — where the press guard spells it otherwise

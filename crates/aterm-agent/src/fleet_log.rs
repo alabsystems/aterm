@@ -5,10 +5,51 @@
 //! §4.1, F17): which node keys the log admits and which it holds out, for the fleet listener's
 //! handshake, a join it answers, the signed book entries it merges and a drive it admits.
 //!
-//! The log is the record store F13 fills (the secrets directory's `records`,
-//! `aterm_secrets::client::load_records`); this reads it back, evaluates it, and keeps the verdict
-//! until the file changes. A Mac whose store holds no genesis yet has no verdict, and admission
-//! falls back to its book's keyring.
+//! The log is the record store F13 fills (the secrets directory's `records`), read as authority
+//! reads it (`aterm_secrets::client::load_acknowledged_and_ahead`): it grants from the membership
+//! history this Mac acknowledged, and holds out every key that history holds out or the records
+//! ahead of it do, records a writer made durable that no writer has acknowledged yet (one cut
+//! short between the two), so a removal or a rotation stands before its acknowledgement and an
+//! admission waits for one. This reads it back, evaluates it, and keeps the verdict until the
+//! store or a file beside it changes, that history's included. A Mac with no vault, or whose
+//! store holds no genesis yet while the version of its vault it applied names no log, has no
+//! verdict (`None`), and admission falls back to its book's keyring.
+//!
+//! A vault that exists but cannot be read now is no such Mac: a vault apply holding the state lock,
+//! a layout transition cut before its pin, the fenced layout's data file missing, the flat
+//! layout's records file gone or an older snapshot put back behind the history this Mac
+//! acknowledged (the file gone reads as an empty store, which that history, holding the vault's
+//! genesis, tells from a store with no genesis yet), or an older aterm whose reader holds fewer
+//! records than the store's pinned capacity. A reader that read a verdict before keeps it through
+//! such a read, and through a read that finds no log, while the vault it read it under stays
+//! configured: its `source.toml` unchanged, or rewritten for the same vault, its name kept and its
+//! key line keeping a key of the one before (a mirror added, a host renamed, a signer rotation;
+//! `Vault`). A vault's store reads no log only where that history holds no genesis for it under
+//! its configured keys (one no key signs keeps none, and none is left once its files go with the
+//! records): there the flat layout's records file gone still reads as no genesis yet. A store
+//! that reads no log while the version of the vault this Mac applied was written at one
+//! (`aterm_secrets::client::applied_version_names_log`: its locker names the log's heads) fails
+//! its read instead, as that vault's records are not here: after a join of it, before they
+//! arrive, or the records file gone with that history. So a reader with no verdict before falls
+//! back to the book only where the version applied names no log. Once the
+//! configuration names another vault or none (this Mac left, or joined another vault, or its
+//! vault was replaced onto a key line that keeps no key of the one before), the verdict is kept
+//! through neither: a read that fails then answers as one with no verdict to keep, and one that
+//! finds no log where the version applied names none (no vault; a join that waits to be let in,
+//! whose version applied holds no locker for this Mac yet; or a version whose locker carries no
+//! heads) falls back to the book, which admits each Mac it binds and grants, a member of the
+//! vault left included. Once the new vault's log reads, a key it does not
+//! bind is judged as with no log (F17), so the book admits such a Mac still that holds the
+//! fleet secret this Mac holds, one the vault left held out included, until a sync of the new
+//! vault's default fleet code moves this Mac to that fleet (`docs/KNOWN_ISSUES.md`). A reader
+//! with no verdict to keep through a read that fails answers [`MemberKeys::unreadable`], under
+//! which every key stands out, so no node the book alone would admit gets in until the log reads
+//! again. What this Mac may still do under it: its listener keeps running and refuses every
+//! proved dialer, as with no deny list read (`aterm_net::fleet::Denied::under`); its heartbeat and
+//! its survey facts push dial no member; it removes no stored facts, book entry or grant for the
+//! verdict's sake, and its census lists no peer the verdict cannot judge and denies none for it; it
+//! authors no `Node` record for itself ([`ensure_local_node_key_in_log`]); and its census does not
+//! count this Mac itself out.
 
 use aterm_net::fleet::NodeKey;
 use aterm_net::fleet_member::{MemberKeys, Standing};
@@ -58,6 +99,14 @@ pub fn log_member_keys_with_roster(
     log: &Log,
     roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
 ) -> MemberKeys {
+    log_member_standings(log, roster).into_iter().collect()
+}
+
+/// [`log_member_keys_with_roster`]'s standing of each key it names.
+fn log_member_standings(
+    log: &Log,
+    roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
+) -> std::collections::BTreeMap<NodeKey, Standing> {
     let membership = log.membership();
     let member_denied_in_roster =
         |r: &aterm_secrets::swarm_roster::SwarmRoster, rec: &str, label: &str, name: &str| {
@@ -234,11 +283,56 @@ pub fn log_member_keys_with_roster(
             }
         }
     }
-    entries.into_iter().collect()
+    entries
+}
+
+/// The admission of the store `paths` keeps, as authority reads it
+/// ([`aterm_secrets::client::load_acknowledged_and_ahead`]): what the acknowledged log admits
+/// and holds out, and every key the records ahead of it hold out besides. Those records verify
+/// and this Mac made them durable, so a removal or a rotation they hold stands at once; they
+/// grant nothing until a writer acknowledges them. `None` with no log, where the vault has none
+/// this Mac knows of either.
+///
+/// # Errors
+/// The store's read fails; or, of kind [`aterm_secrets::ErrorKind::MembershipHistoryUnavailable`],
+/// it holds no log while the version of the vault this Mac applied was written at one
+/// ([`aterm_secrets::client::applied_version_names_log`]): that vault's records are not here (as
+/// after a join of it, before they arrive), so its removals cannot be read, and the book does not
+/// stand in for them.
+fn acknowledged_member_keys(
+    paths: &aterm_secrets::client::Paths,
+) -> aterm_secrets::Result<Option<MemberKeys>> {
+    let read = aterm_secrets::client::load_acknowledged_and_ahead(paths)?;
+    let Some(log) = read.acknowledged.log() else {
+        if aterm_secrets::client::applied_version_names_log(paths)? {
+            return Err(aterm_secrets::Error::of_kind(
+                aterm_secrets::ErrorKind::MembershipHistoryUnavailable,
+                "the vault's membership log is not here yet",
+            ));
+        }
+        return Ok(None);
+    };
+    let roster = aterm_secrets::client::local_swarm_roster_for_log(paths, log)?;
+    let mut standings = log_member_standings(log, roster.as_ref());
+    if let Some(ahead) = read.ahead.as_ref().and_then(|store| store.log()) {
+        let roster = aterm_secrets::client::local_swarm_roster_for_log(paths, ahead)?;
+        for (key, standing) in log_member_standings(ahead, roster.as_ref()) {
+            if matches!(standing, Standing::Out(_))
+                && !matches!(standings.get(&key), Some(Standing::Out(_)))
+            {
+                standings.insert(key, standing);
+            }
+        }
+    }
+    Ok(Some(standings.into_iter().collect()))
 }
 
 /// How a [`LocalLog`] reads its store: the member keys it evaluates, `None` before a genesis.
 type Reader = Box<dyn Fn() -> aterm_secrets::Result<Option<MemberKeys>> + Send + Sync>;
+
+/// Why a [`MemberKeys::unreadable`] verdict refuses, in the words a refusal quotes.
+pub const UNREAD: &str =
+    "this Mac's membership log cannot be read now (`aterm secrets sync` says why)";
 
 /// What the store file's metadata says of it. A write replaces the whole file
 /// (`aterm_secrets::fsx::write_atomic`), so each one moves it.
@@ -249,7 +343,11 @@ struct Stamp {
     inode: u64,
 }
 
-fn stamp(file: &Path) -> Option<Stamp> {
+/// `file`'s [`Stamp`], `None` where its metadata cannot be read (the file missing included).
+/// Named apart from the lock-taking `stamp`s the lock-order census, which resolves a call by its
+/// name, would take a call to it for (`aterm_uds::exitwatch`'s, `aterm-gui`'s `app_nudge`'s):
+/// [`LocalLog::keys`] calls it with its verdict's lock held.
+fn metadata_stamp(file: &Path) -> Option<Stamp> {
     let meta = std::fs::symlink_metadata(file).ok()?;
     Some(Stamp {
         len: meta.len(),
@@ -263,39 +361,80 @@ fn stamp(file: &Path) -> Option<Stamp> {
 pub struct LocalLog {
     file: PathBuf,
     paths: Option<aterm_secrets::client::Paths>,
+    /// The other files the reader reads; for a store `paths` keeps, the vault's configuration
+    /// (`source.toml`) first.
     aux_files: Vec<PathBuf>,
     read: Reader,
     held: Mutex<Option<Held>>,
+    /// The verdict while the store cannot be read and none was read before: one allocation, so a
+    /// watcher comparing verdicts sees no change until the store reads again.
+    unread: Arc<MemberKeys>,
 }
 
 struct Held {
-    stamp: Stamp,
+    /// `None` while the store's file is missing.
+    stamp: Option<Stamp>,
     aux_stamps: Vec<Option<Stamp>>,
+    /// The vault the verdict was read under; `None` with none pinned, or where its
+    /// configuration moved during the read, so which one the verdict is of is unknown.
+    vault: Option<Vault>,
     keys: Option<Arc<MemberKeys>>,
 }
 
+/// A vault as admission tells one from another: its name and the key line its configuration
+/// pins (its signer and the keys that signer was reached from). It is the same vault while the
+/// name stays and the line keeps a key of the one before ([`Vault::is`]), as the history this Mac
+/// acknowledged ties a vault's membership to its name and keys: a mirror added or a host renamed
+/// changes neither, and a signer rotation pins a new signer reached from the old one, keeping the
+/// old among the keys it followed. A join elsewhere names another vault or pins another line, and
+/// a replacement (the pin giving way to the key this build names for a retired one) pins a line
+/// that keeps no key of the one before unless its handoff chain reached from one.
+#[derive(PartialEq, Eq)]
+struct Vault {
+    name: String,
+    keys: std::collections::BTreeSet<[u8; 32]>,
+}
+
+impl Vault {
+    /// The vault `paths` configures now: `None` with none, one whose configuration does not
+    /// read, or one that pins no signer.
+    fn configured(paths: &aterm_secrets::client::Paths) -> Option<Self> {
+        let config = aterm_secrets::client::config(paths).ok().flatten()?;
+        let signer = config.signer?;
+        Some(Self {
+            name: config.name,
+            keys: std::iter::once(signer).chain(config.followed).collect(),
+        })
+    }
+
+    /// Whether `now` is this vault still: the same name, and a key of this line on its line.
+    fn is(&self, now: &Self) -> bool {
+        self.name == now.name && !self.keys.is_disjoint(&now.keys)
+    }
+}
+
 impl LocalLog {
-    /// The store `paths` keeps (`Paths::records_file`, read by
-    /// `aterm_secrets::client::load_records`).
+    /// The store `paths` keeps (`Paths::records_file`), as authority reads it: granting from
+    /// the history this Mac acknowledged, and holding out what the records ahead of it hold out
+    /// too (`aterm_secrets::client::load_acknowledged_and_ahead`).
     #[must_use]
     pub fn of(paths: &aterm_secrets::client::Paths) -> Self {
         let from = paths.clone();
+        // The vault's configuration first ([`LocalLog::same_vault`]); then the acknowledged
+        // history, which an acknowledgement alone moves.
+        let aux_files = [
+            paths.dir.join("source.toml"),
+            paths.dir.join("state.toml"),
+            paths.dir.join("vault"),
+            paths.dir.join("identity"),
+        ]
+        .into_iter()
+        .chain(paths.acknowledged_history_files())
+        .collect();
         let mut log = Self::reading(
             paths.records_file(),
-            vec![
-                paths.dir.join("state.toml"),
-                paths.dir.join("vault"),
-                paths.dir.join("source.toml"),
-                paths.dir.join("identity"),
-            ],
-            Box::new(move || {
-                let store = aterm_secrets::client::load_records(&from)?;
-                let Some(log) = store.log() else {
-                    return Ok(None);
-                };
-                let roster = aterm_secrets::client::local_swarm_roster_for_log(&from, log)?;
-                Ok(Some(log_member_keys_with_roster(log, roster.as_ref())))
-            }),
+            aux_files,
+            Box::new(move || acknowledged_member_keys(&from)),
         );
         log.paths = Some(paths.clone());
         log
@@ -312,6 +451,11 @@ impl LocalLog {
             Box::new(move || {
                 use std::io::Read as _;
                 const MAX_STORE_BYTES: u64 = 16 * 1024 * 1024;
+                if std::fs::symlink_metadata(&from)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Ok(None);
+                }
                 let (file, meta) = aterm_uds::regular_file::open(&from)
                     .map_err(|e| aterm_secrets::Error::new(format!("the record store: {e}")))?;
                 if meta.len() > MAX_STORE_BYTES {
@@ -345,6 +489,7 @@ impl LocalLog {
             aux_files,
             read,
             held: Mutex::new(None),
+            unread: Arc::new(MemberKeys::unreadable(UNREAD)),
         }
     }
 
@@ -354,38 +499,116 @@ impl LocalLog {
         &self.file
     }
 
-    /// The log's admission now: read again only when the store's file changed since the last read.
-    /// `None` while the store is missing or holds no genesis. A store that cannot be read keeps
-    /// the verdict last read from it (none before a first good read), so a moment's fault never
-    /// lets in a key the log held out.
+    /// The log's admission now: read again only when a file the reader reads changed since the
+    /// last read. `None` only where a read found no log: no vault, or a store with no genesis
+    /// while the version of the vault this Mac applied names no log (one that names one fails
+    /// the read: `acknowledged_member_keys`).
+    /// A store that cannot be read, its data file unresolved or missing included, and the flat
+    /// layout's records file gone while the history this Mac acknowledged holds its genesis,
+    /// keeps the verdict last read from it while the vault it was read under stays configured
+    /// ([`Self::same_vault`]: its configuration unchanged, or rewritten for the same vault), so a
+    /// moment's fault never lets in a key the log held out; with none to keep, or one read under
+    /// another vault or none configured now (this Mac left, joined another vault, or its vault
+    /// was replaced onto another key line), it answers [`MemberKeys::unreadable`], which admits
+    /// no key, so no member of the vault left gets in by the verdict read under it. A store that
+    /// held a genesis does not lose it while the same vault stays configured: one that reads no
+    /// log after a verdict (that file gone where the history holds no genesis for the vault)
+    /// keeps that verdict too, until the store reads a log again or the vault configured is
+    /// another or none.
     pub fn keys(&self) -> Option<Arc<MemberKeys>> {
-        // Taken before the read: a write between the two moves the next stamp.
-        let file = match &self.paths {
-            Some(paths) => paths.records_data_file().ok()?,
-            None => self.file.clone(),
-        };
-        let file_stamp = stamp(&file)?;
-        let aux_stamps: Vec<Option<Stamp>> = self.aux_files.iter().map(|p| stamp(p)).collect();
+        // Taken before the read: a write between the two moves the next stamp. The data file's is
+        // `None` where that file cannot even be resolved.
+        let file_stamp = match &self.paths {
+            Some(paths) => paths.records_data_file().ok(),
+            None => Some(self.file.clone()),
+        }
+        .map(|file| metadata_stamp(&file));
+        let aux_stamps: Vec<Option<Stamp>> =
+            self.aux_files.iter().map(|p| metadata_stamp(p)).collect();
         let mut held = self
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(file_stamp) = file_stamp else {
+            let vault = self.vault();
+            return Some(self.kept_or_unread(held.as_ref(), &aux_stamps, vault.as_ref()));
+        };
         if let Some(held) = held.as_ref()
             && held.stamp == file_stamp
             && held.aux_stamps == aux_stamps
         {
             return held.keys.clone();
         }
+        // Read before the store, as the stamps are.
+        let vault = self.vault();
         let Ok(keys) = (self.read)() else {
-            return held.as_ref().and_then(|held| held.keys.clone());
+            return Some(self.kept_or_unread(held.as_ref(), &aux_stamps, vault.as_ref()));
         };
+        if keys.is_none()
+            && let Some(kept) = self.verdict_to_keep(held.as_ref(), &aux_stamps, vault.as_ref())
+        {
+            return Some(kept);
+        }
+        // A configuration that moved since its stamp leaves unknown which vault the read was of.
+        let vault = vault.filter(|_| {
+            self.aux_files.first().map(|file| metadata_stamp(file)) == aux_stamps.first().copied()
+        });
         let keys = keys.map(Arc::new);
         *held = Some(Held {
             stamp: file_stamp,
             aux_stamps,
+            vault,
             keys: keys.clone(),
         });
         keys
+    }
+
+    /// The vault configured now, for a store `paths` keeps; a test's lab
+    /// (`LocalLog::founded_at`) configures none.
+    fn vault(&self) -> Option<Vault> {
+        self.paths.as_ref().and_then(Vault::configured)
+    }
+
+    /// Whether the vault `held` was read under is configured still (`aux_stamps`, the aux
+    /// files' stamps now, and `now`, the vault configured now): a store `paths` keeps, its
+    /// `source.toml` present and unmoved, or rewritten for the same vault ([`Vault::is`]). A
+    /// test's lab (`LocalLog::founded_at`) configures no vault, so it is never one.
+    fn same_vault(&self, held: &Held, aux_stamps: &[Option<Stamp>], now: Option<&Vault>) -> bool {
+        let unmoved = aux_stamps.first().is_some_and(Option::is_some)
+            && held.aux_stamps.first() == aux_stamps.first();
+        self.paths.is_some()
+            && (unmoved
+                || held
+                    .vault
+                    .as_ref()
+                    .zip(now)
+                    .is_some_and(|(then, now)| then.is(now)))
+    }
+
+    /// The verdict last read from the store where it was read under the vault configured now
+    /// ([`Self::same_vault`]): what a read that fails, or one that finds no log, keeps.
+    fn verdict_to_keep(
+        &self,
+        held: Option<&Held>,
+        aux_stamps: &[Option<Stamp>],
+        now: Option<&Vault>,
+    ) -> Option<Arc<MemberKeys>> {
+        held.filter(|held| self.same_vault(held, aux_stamps, now))
+            .and_then(|held| held.keys.clone())
+    }
+
+    /// What a read that fails answers: the verdict [`Self::verdict_to_keep`], or with none, the
+    /// unread one. A last read that found no log keeps none either: a store that read empty and
+    /// now cannot be read may hold a genesis since. Nor does a verdict read under another vault,
+    /// or under none configured now: its members are not this vault's.
+    fn kept_or_unread(
+        &self,
+        held: Option<&Held>,
+        aux_stamps: &[Option<Stamp>],
+        now: Option<&Vault>,
+    ) -> Arc<MemberKeys> {
+        self.verdict_to_keep(held, aux_stamps, now)
+            .unwrap_or_else(|| Arc::clone(&self.unread))
     }
 }
 
@@ -398,7 +621,8 @@ pub fn ensure_local_node_key_in_log(
     node: &aterm_net::fleet::NodeIdentity,
     log_keys: Option<&MemberKeys>,
 ) -> bool {
-    if log_keys.is_some_and(|keys| keys.admits(&node.key())) {
+    // An unread verdict cannot say whether the key is bound: nothing is authored for its sake.
+    if log_keys.is_some_and(|keys| keys.admits(&node.key()) || keys.unread().is_some()) {
         return false;
     }
     let key_bytes = *node.key().bytes();
@@ -417,6 +641,270 @@ pub fn ensure_local_node_key_in_log(
 mod tests {
     use super::*;
     use aterm_net::fleet::NodeIdentity;
+
+    /// A write to any file the reader reads, the store's or one beside it, alone reads the
+    /// store again; nothing moved serves the verdict held. A lab configures no vault, so a read
+    /// that fails keeps no verdict (`a_read_that_fails_keeps_no_verdict_read_under_another_vault`
+    /// keeps one under the same vault).
+    #[test]
+    fn a_change_to_a_file_beside_the_store_alone_reads_it_again() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let store = root.path().join("records");
+        let beside = root.path().join("vault");
+        aterm_secrets::fsx::write_atomic(&store, b"store", 0o600).unwrap();
+        aterm_secrets::fsx::write_atomic(&beside, b"admit", 0o600).unwrap();
+        let key = NodeIdentity::from_seed(&"e5".repeat(16), &[0x77; 32])
+            .unwrap()
+            .key();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let log = LocalLog::reading(store.clone(), vec![beside.clone()], {
+            let (beside, reads) = (beside.clone(), Arc::clone(&reads));
+            Box::new(move || {
+                reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let standing = match std::fs::read(&beside).unwrap().as_slice() {
+                    b"admit" => Standing::Member,
+                    b"deny" => Standing::Out("denied".to_owned()),
+                    _ => return Err(aterm_secrets::Error::new("unreadable")),
+                };
+                Ok(Some([(key, standing)].into_iter().collect()))
+            })
+        });
+        let reads = || reads.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert!(log.keys().unwrap().admits(&key));
+        assert!(log.keys().unwrap().admits(&key));
+        assert_eq!(reads(), 1, "nothing moved: the verdict held answers");
+
+        aterm_secrets::fsx::write_atomic(&beside, b"deny", 0o600).unwrap();
+        assert!(
+            log.keys().unwrap().holds_out(&key),
+            "the store's own file did not move"
+        );
+        assert_eq!(reads(), 2);
+
+        aterm_secrets::fsx::write_atomic(&beside, b"broken", 0o600).unwrap();
+        let failed = log.keys().unwrap();
+        assert!(
+            failed.holds_out(&key) && failed.unread().is_some(),
+            "a read that fails, with no vault configured to keep a verdict under, admits no key"
+        );
+        assert_eq!(reads(), 3);
+    }
+
+    /// A reader over `store` and `beside` whose first read replaces the file `during` names
+    /// (as every writer of these files does, [`aterm_secrets::fsx::write_atomic`]): how many
+    /// reads its first three calls take, nothing written after that first read.
+    fn reads_after_a_write_during_the_first_read(during: fn(&Path, &Path) -> PathBuf) -> usize {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let store = root.path().join("records");
+        let beside = root.path().join("vault");
+        aterm_secrets::fsx::write_atomic(&store, b"store", 0o600).unwrap();
+        aterm_secrets::fsx::write_atomic(&beside, b"beside", 0o600).unwrap();
+        let written = during(&store, &beside);
+        let key = NodeIdentity::from_seed(&"e5".repeat(16), &[0x77; 32])
+            .unwrap()
+            .key();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let log = LocalLog::reading(store.clone(), vec![beside.clone()], {
+            let reads = Arc::clone(&reads);
+            Box::new(move || {
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    aterm_secrets::fsx::write_atomic(&written, b"written during the read", 0o600)
+                        .unwrap();
+                }
+                Ok(Some([(key, Standing::Member)].into_iter().collect()))
+            })
+        });
+        for _ in 0..3 {
+            assert!(log.keys().unwrap().admits(&key));
+        }
+        reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The stamps are taken before the read: a write to the store's file during a read leaves
+    /// the verdict stamped as the file was before it, so the next call reads the store again,
+    /// and the one after, nothing moved since, serves the verdict held.
+    #[test]
+    fn a_write_to_the_store_during_a_read_reads_it_again() {
+        assert_eq!(
+            reads_after_a_write_during_the_first_read(|store, _| store.to_path_buf()),
+            2
+        );
+    }
+
+    /// As `a_write_to_the_store_during_a_read_reads_it_again`, for a file beside the store.
+    #[test]
+    fn a_write_beside_the_store_during_a_read_reads_it_again() {
+        assert_eq!(
+            reads_after_a_write_during_the_first_read(|_, beside| beside.to_path_buf()),
+            2
+        );
+    }
+
+    /// `source.toml` for the vault `name` pinned to the key `[signer; 32]`, reached from the
+    /// keys `followed` names, as this Mac's `host`.
+    fn configured(name: &str, host: &str, signer: u8, followed: &[u8]) -> String {
+        let key = |byte: u8| format!("\"{}\"", aterm_secrets::b64::encode_padded(&[byte; 32]));
+        let followed: Vec<String> = followed.iter().map(|byte| key(*byte)).collect();
+        format!(
+            "url = \"http://127.0.0.1:9/v1/{name}\"\nname = \"{name}\"\nsigner = {}\n\
+             followed = [{}]\nhost = \"{host}\"\n",
+            key(signer),
+            followed.join(", ")
+        )
+    }
+
+    /// A [`LocalLog`] of the store `paths` keeps whose read admits `key` while the store's file
+    /// says `admit` and fails on any other content; with each read it first runs `during`.
+    fn admitting(
+        paths: &aterm_secrets::client::Paths,
+        key: NodeKey,
+        during: impl Fn() + Send + Sync + 'static,
+    ) -> LocalLog {
+        let store = paths.records_file();
+        let mut log = LocalLog::reading(store.clone(), vec![paths.dir.join("source.toml")], {
+            Box::new(move || {
+                during();
+                match std::fs::read(&store).unwrap().as_slice() {
+                    b"admit" => Ok(Some([(key, Standing::Member)].into_iter().collect())),
+                    _ => Err(aterm_secrets::Error::new("unreadable")),
+                }
+            })
+        });
+        log.paths = Some(paths.clone());
+        log
+    }
+
+    /// A read that fails keeps the verdict last read only while the vault it was read under
+    /// stays configured: its `source.toml` unchanged, or rewritten for the same vault (a host
+    /// renamed, a signer rotation, the old signer among the keys followed). Once that file names
+    /// another vault (another name, or another key line under the same name, as a replacement
+    /// pins) or none, a read that fails, or a data file that cannot be resolved, admits no key,
+    /// so no member of the vault read before gets in by the verdict read under it.
+    #[test]
+    fn a_read_that_fails_keeps_no_verdict_read_under_another_vault() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = aterm_secrets::client::Paths::for_home(root.path());
+        aterm_secrets::fsx::ensure_private_dir(&paths.dir).unwrap();
+        let store = paths.records_file();
+        let source = paths.dir.join("source.toml");
+        let write = |file: &Path, bytes: &[u8]| {
+            aterm_secrets::fsx::write_atomic(file, bytes, 0o600).unwrap();
+        };
+        let configure = |name: &str, host: &str, signer: u8, followed: &[u8]| {
+            write(&source, configured(name, host, signer, followed).as_bytes());
+            let now = aterm_secrets::client::config(&paths).unwrap().unwrap();
+            assert_eq!(
+                (now.name.as_str(), now.signer, now.followed.len()),
+                (name, Some([signer; 32]), followed.len()),
+                "PRECONDITION: the vault configured"
+            );
+        };
+        let unresolved = || {
+            std::fs::remove_file(&store).unwrap();
+            std::fs::create_dir(&store).unwrap();
+            assert!(
+                paths.records_data_file().is_err(),
+                "PRECONDITION: a layout transition cut before its pin"
+            );
+        };
+        let broken = || {
+            std::fs::remove_dir(&store).unwrap();
+            write(&store, b"broken");
+        };
+        write(&store, b"admit");
+        configure("a", "m22", 1, &[]);
+        let key = NodeIdentity::from_seed(&"e5".repeat(16), &[0x77; 32])
+            .unwrap()
+            .key();
+        let log = admitting(&paths, key, || {});
+        let kept = |when: &str| {
+            assert!(
+                log.keys().is_some_and(|keys| keys.admits(&key)),
+                "{when}: the verdict of the vault still configured is dropped"
+            );
+        };
+        let unread = |when: &str| {
+            let keys = log.keys().unwrap_or_else(|| panic!("{when}: a verdict"));
+            assert!(
+                keys.unread().is_some() && !keys.admits(&key),
+                "{when}: the verdict read under the vault before admits its member"
+            );
+        };
+
+        kept("read");
+        write(&store, b"broken");
+        kept("CONTROL: a read that fails under the same configuration");
+        unresolved();
+        kept("CONTROL: a data file unresolved under the same configuration");
+        configure("a", "m22-renamed", 1, &[]);
+        kept("a data file unresolved, the same vault's host renamed");
+        broken();
+        kept("a read that fails, the same vault's host renamed");
+        configure("a", "m22", 2, &[1]);
+        kept("a read that fails after a signer rotation");
+
+        configure("a", "m22", 3, &[]);
+        unread("a read that fails under another key line of the vault's name");
+        configure("b", "m22", 1, &[]);
+        unread("a read that fails under another vault's name");
+        unresolved();
+        unread("the data file unresolved under another vault");
+        broken();
+        write(&store, b"admit");
+        kept("the vault configured now reads a verdict of its own");
+        std::fs::remove_file(&source).unwrap();
+        write(&store, b"broken");
+        unread("a read that fails under no vault");
+    }
+
+    /// A configuration that moves during a read leaves unknown which vault the verdict was read
+    /// under: here another vault's, written during the read, then the vault before written back
+    /// once it is done. A read that fails after that keeps no verdict, though the vault
+    /// configured is the one configured when the read began.
+    #[test]
+    fn a_configuration_that_moves_during_a_read_keeps_no_verdict() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = aterm_secrets::client::Paths::for_home(root.path());
+        aterm_secrets::fsx::ensure_private_dir(&paths.dir).unwrap();
+        let store = paths.records_file();
+        let source = paths.dir.join("source.toml");
+        aterm_secrets::fsx::write_atomic(&store, b"admit", 0o600).unwrap();
+        aterm_secrets::fsx::write_atomic(&source, configured("a", "m22", 1, &[]).as_bytes(), 0o600)
+            .unwrap();
+        let key = NodeIdentity::from_seed(&"e5".repeat(16), &[0x77; 32])
+            .unwrap()
+            .key();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let log = admitting(&paths, key, {
+            let reads = Arc::clone(&reads);
+            let source = source.clone();
+            move || {
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    aterm_secrets::fsx::write_atomic(
+                        &source,
+                        configured("b", "m22", 9, &[]).as_bytes(),
+                        0o600,
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        assert!(log.keys().is_some_and(|keys| keys.admits(&key)));
+        aterm_secrets::fsx::write_atomic(&source, configured("a", "m22", 1, &[]).as_bytes(), 0o600)
+            .unwrap();
+        aterm_secrets::fsx::write_atomic(&store, b"broken", 0o600).unwrap();
+        let keys = log.keys().expect("a verdict");
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "PRECONDITION: the second call reads the store again"
+        );
+        assert!(
+            keys.unread().is_some() && !keys.admits(&key),
+            "a verdict read while the configuration moved is kept as the vault's before it"
+        );
+    }
 
     #[test]
     fn ensure_local_node_key_in_log_binds_founder_and_retires_rotated_key() {
@@ -466,9 +954,12 @@ mod tests {
             Some(&keys_after_1)
         ));
 
-        let roster_1 = aterm_secrets::client::swarm_roster(&paths)
-            .unwrap()
-            .unwrap();
+        let roster_1 = aterm_secrets::client::swarm_roster_until(
+            &paths,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             roster_1
                 .member_by_label_or_alias("m22")
@@ -486,9 +977,12 @@ mod tests {
         assert!(keys_after_2.admits(&node_2.key()));
         assert!(keys_after_2.holds_out(&node_1.key()));
 
-        let roster_2 = aterm_secrets::client::swarm_roster(&paths)
-            .unwrap()
-            .unwrap();
+        let roster_2 = aterm_secrets::client::swarm_roster_until(
+            &paths,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             roster_2
                 .member_by_label_or_alias("m22")
@@ -534,8 +1028,8 @@ mod tests {
         let keys_with_m7 = local_log.keys().expect("keys with m7");
         assert!(keys_with_m7.admits(&node_7.key()));
 
-        // Narrowing `aterm-commons-control-v1` leaves `m7` out of `EpochAudience::Commons`,
-        // while keeping `m7` admitted in `EpochAudience::Everyone` (and in `LocalLog::of`).
+        // Changing the control entry's audience is not a membership revocation.
+        // Omitted wraps can be repaired; LocalLog must still admit m7.
         let admin = aterm_secrets::client::admin_open(&paths).unwrap();
         let mut doc_commons_only = admin.doc.clone();
         let ctrl = doc_commons_only
@@ -559,7 +1053,7 @@ mod tests {
                 .keys()
                 .expect("keys after commons narrowed")
                 .admits(&node_7.key()),
-            "member left out of EpochAudience::Commons only is still a fleet member"
+            "a control-entry audience change does not revoke a fleet member"
         );
 
         // Roster denial is independent: it may already prune that member's machine line.
@@ -573,6 +1067,7 @@ mod tests {
             "roster-denial control starts admitted"
         );
         let records_with_m8 = std::fs::read(paths.records_file()).unwrap();
+        let admitted_store = aterm_secrets::client::load_records(&paths).unwrap();
         let vault_with_m8 = std::fs::read(paths.dir.join("vault")).unwrap();
         let state_with_m8 = std::fs::read(paths.dir.join("state.toml")).unwrap();
         let admin = aterm_secrets::client::admin_open(&paths).unwrap();
@@ -597,7 +1092,9 @@ mod tests {
             "member denied in aterm-swarm-roster must be held out by LocalLog"
         );
 
-        // Only vault/state change here; the records remain at m8's admitted snapshot.
+        // Putting m8's admitted snapshot back is a rollback: the history this Mac acknowledged
+        // is ahead of it, so the store's reader refuses it, and LocalLog keeps the verdict it
+        // last read rather than admitting the denied member again.
         let records_after_deny = std::fs::read(paths.records_file()).unwrap();
         let vault_with_deny = std::fs::read(paths.dir.join("vault")).unwrap();
         let state_with_deny = std::fs::read(paths.dir.join("state.toml")).unwrap();
@@ -605,13 +1102,24 @@ mod tests {
         aterm_secrets::fsx::write_atomic(&paths.dir.join("vault"), &vault_with_m8, 0o600).unwrap();
         aterm_secrets::fsx::write_atomic(&paths.dir.join("state.toml"), &state_with_m8, 0o600)
             .unwrap();
+        let error = aterm_secrets::client::local_swarm_roster_for_log(
+            &paths,
+            admitted_store.log().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            aterm_secrets::ErrorKind::MembershipHistoryUnavailable
+        );
         assert!(
             local_log
                 .keys()
-                .expect("keys before vault-only roster deny")
-                .admits(&node_8.key()),
-            "before vault update, node_8 is admitted"
+                .expect("keys over the older snapshot")
+                .holds_out(&node_8.key()),
+            "an older snapshot put back never admits a member the log held out"
         );
+        aterm_secrets::fsx::write_atomic(&paths.records_file(), &records_after_deny, 0o600)
+            .unwrap();
         aterm_secrets::fsx::write_atomic(&paths.dir.join("vault"), &vault_with_deny, 0o600)
             .unwrap();
         aterm_secrets::fsx::write_atomic(&paths.dir.join("state.toml"), &state_with_deny, 0o600)
@@ -619,28 +1127,19 @@ mod tests {
         assert!(
             local_log
                 .keys()
-                .expect("keys after vault-only roster deny")
-                .holds_out(&node_8.key()),
-            "vault/state.toml alone invalidates LocalLog cache and holds out denied m8"
-        );
-        aterm_secrets::fsx::write_atomic(&paths.records_file(), &records_after_deny, 0o600)
-            .unwrap();
-        assert!(
-            local_log
-                .keys()
-                .expect("keys after restoring denied records")
+                .expect("keys after restoring the deny")
                 .holds_out(&node_8.key())
         );
 
-        // Removing `m7` from `[machines]` without roster-denying m7 rotates
-        // `EpochAudience::Everyone` leaving `m7` out, so `LocalLog::of` holds `node_7` out.
+        // Explicitly retire m7 before removing its vault recipient. An omitted
+        // wrap is repairable, while a signed retirement must hold node_7 out.
         let admin = aterm_secrets::client::admin_open(&paths).unwrap();
-        let mut doc = admin.doc.clone();
+        let doc = &admin.doc;
         assert!(
             doc.machines().iter().any(|m| m.name == "m7"),
-            "Everyone-removal control starts with its machine present"
+            "the revocation control starts with its machine present"
         );
-        let roster = aterm_secrets::swarm_roster::SwarmRoster::from_document(&doc)
+        let roster = aterm_secrets::swarm_roster::SwarmRoster::from_document(doc)
             .unwrap()
             .unwrap();
         assert!(
@@ -652,21 +1151,21 @@ mod tests {
                 .keys()
                 .expect("m7 before removal")
                 .admits(&node_7.key()),
-            "Everyone-removal control starts admitted"
+            "the revocation control starts admitted"
         );
-        assert!(doc.remove_machine("m7", false).unwrap());
-        aterm_secrets::client::admin_publish(&paths, &admin, &doc).unwrap();
+        let revoked = aterm_secrets::client::admin_revoke(&paths, &admin, "m7", false).unwrap();
+        assert!(revoked.retirement.is_some_and(|retired| retired.changed));
         let keys_after_m7_out = local_log.keys().expect("keys after m7 excluded");
         assert!(
             keys_after_m7_out.holds_out(&node_7.key()),
-            "member left out of EpochAudience::Everyone must be held out by LocalLog"
+            "a retired member must be held out by LocalLog"
         );
         let pinned_url = format!("{url}#{}", created.signer);
         aterm_secrets::client::configure_log_member(&m7_paths, &pinned_url, "m7").unwrap();
         aterm_secrets::client::sync_records(&m7_paths, None).unwrap();
         assert!(
             !ensure_local_node_key_in_log(&m7_paths, &node_7, None),
-            "member left out of EpochAudience::Everyone must not author Body::Node"
+            "a retired member must not author Body::Node"
         );
 
         let now = 1_760_000_000_000_u64;
@@ -860,7 +1359,8 @@ mod tests {
         assert!(keys_stale_and_left_out.holds_out(&node_7_pre.key()));
 
         // A crossed source also fences this small local file. The same warm reader must
-        // follow the selected data, observe another rotation, and refuse missing custody.
+        // follow the selected data, observe another rotation, and keep its verdict through
+        // missing custody, under which a fresh reader admits no key at all.
         aterm_secrets::fsx::write_atomic(
             &paths.records_file().with_extension("crossed"),
             b"crossed\n",
@@ -891,7 +1391,17 @@ mod tests {
             paths.records_file().join("saved-current"),
         )
         .unwrap();
-        assert!(local_log.keys().is_none());
+        let kept = local_log
+            .keys()
+            .expect("a store that cannot be read keeps the verdict last read from it");
+        assert!(kept.admits(&node_4.key()) && kept.holds_out(&node_3.key()));
+        let fresh = LocalLog::of(&paths)
+            .keys()
+            .expect("a vault that cannot be read now is no Mac without a log");
+        assert!(
+            !fresh.admits(&node_4.key()) && fresh.holds_out(&node_4.key()),
+            "with no verdict to keep, the book admits no key the log might hold out"
+        );
 
         running.stop();
     }

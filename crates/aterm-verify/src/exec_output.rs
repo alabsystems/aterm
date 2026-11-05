@@ -69,8 +69,8 @@ impl Scope {
         let stderr = directory.path().join("stderr");
         command
             .stdin(Stdio::null())
-            .stdout(std::fs::File::create(&stdout)?)
-            .stderr(std::fs::File::create(&stderr)?);
+            .stdout(crate::create_stdio_file(&stdout)?)
+            .stderr(crate::create_stdio_file(&stderr)?);
         let permit = self.enter()?;
         let status = OwnedChild::run(command, self);
         drop(permit);

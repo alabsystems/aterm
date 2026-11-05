@@ -198,7 +198,8 @@ fn mark(overlay: &Path, name: &str, out: &mut Ensured) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600);
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     match open.open(overlay.join(name)) {
         Ok(_) => {

@@ -37,6 +37,7 @@ fn inspection_does_not_initialize_missing_or_interrupted_enrollment() {
     let claim_dir = claim_dir(&session).unwrap();
     let path = directory.path(scope).unwrap();
     let absent = inspect(&session, scope.digest()).unwrap();
+    assert!(!directory_binding_lost(&session, scope.digest()).unwrap());
     assert_eq!(absent.claim, Claim::Missing);
     assert!(absent.directory.is_none() && absent.prefix.is_none());
     assert!(!claim_dir.exists() && !path.exists());
@@ -47,9 +48,32 @@ fn inspection_does_not_initialize_missing_or_interrupted_enrollment() {
     assert!(Store::join(&session, &path, scope).is_err());
     let claims = files(&claim_dir);
     let interrupted = inspect(&session, scope.digest()).unwrap();
+    assert!(!directory_binding_lost(&session, scope.digest()).unwrap());
     assert_eq!(interrupted.claim, Claim::Pending);
     assert!(interrupted.directory.is_none() && interrupted.prefix.is_none());
+    assert!(
+        Store::observe_if_exists(&session, &path, scope)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        Store::observe(&session, &path, scope)
+            .err()
+            .expect("pending enrollment grants no readable store")
+            .is_enrollment_pending()
+    );
     assert_eq!(files(&claim_dir), claims);
+    assert_eq!(std::fs::read(&path).unwrap(), b"occupied data path");
+
+    let name = claim_name(scope);
+    let mut malformed = claims[&name].clone();
+    malformed[crate::table::store::ANCHOR_LEN] = 1;
+    aterm_uds::private_file::write_private(&claim_dir, &name, &malformed).unwrap();
+    let refused = Store::observe_if_exists(&session, &path, scope)
+        .err()
+        .expect("a pending claim carrying committed state is damage, not absence");
+    assert!(!refused.is_enrollment_pending());
+    assert_eq!(files(&claim_dir)[&name], malformed);
     assert_eq!(std::fs::read(&path).unwrap(), b"occupied data path");
 }
 
@@ -75,6 +99,7 @@ fn a_changed_legacy_device_keeps_a_verifiable_prefix_but_no_writer_permission() 
         || {
             // The exclusive writer stays open; inspection takes no journal writer lock.
             let read = inspect(&session, scope.digest()).unwrap();
+            assert!(directory_binding_lost(&session, scope.digest()).unwrap());
             let identity = read.directory.as_ref().unwrap();
             assert_eq!(identity.recorded_device + 1, identity.observed.dev);
             assert_eq!(identity.recorded_inode, identity.observed.ino);
@@ -160,6 +185,7 @@ fn an_invalid_receipt_commitment_is_never_reported_as_verified() {
     let read = inspect(&session, scope.digest()).unwrap();
     assert!(read.directory.as_ref().unwrap().binding_error.is_none());
     assert!(read.prefix.as_ref().unwrap().is_err());
+    assert!(!directory_binding_lost(&session, scope.digest()).unwrap());
     assert_eq!(read.json()["receipt_prefix"]["state"], json!("refused"));
     assert!(Store::observe(&session, &path, scope).is_err());
     assert_eq!(std::fs::read(&claim_path).unwrap(), claim);
@@ -183,6 +209,7 @@ fn foreign_claims_and_changes_during_inspection_do_not_escape_as_evidence() {
         changed[index] ^= 1;
         std::fs::write(&claim_path, &changed).unwrap();
         assert!(inspect(&session, scope.digest()).is_err());
+        assert!(directory_binding_lost(&session, scope.digest()).is_err());
         assert_eq!(std::fs::read(&claim_path).unwrap(), changed);
     }
     std::fs::write(&claim_path, &original).unwrap();

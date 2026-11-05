@@ -33,38 +33,49 @@ impl Digest {
     /// The digest as 64 lowercase hex digits.
     #[must_use]
     pub fn hex(&self) -> String {
-        let mut s = String::with_capacity(64);
-        push_hex(&mut s, &self.0);
-        s
+        String::from_utf8(self.hex_bytes().to_vec()).unwrap_or_default()
     }
 
     /// First 12 lowercase hex digits of the digest.
     #[must_use]
     pub fn short(&self) -> String {
-        let mut s = String::with_capacity(12);
-        push_hex(&mut s, self.0.get(..6).unwrap_or(&[]));
-        s
+        String::from_utf8(self.short_bytes().to_vec()).unwrap_or_default()
+    }
+
+    #[inline]
+    fn hex_bytes(&self) -> [u8; 64] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = [0u8; 64];
+        for (i, &b) in self.0.iter().enumerate() {
+            out[i * 2] = HEX[usize::from(b >> 4)];
+            out[i * 2 + 1] = HEX[usize::from(b & 0x0f)];
+        }
+        out
+    }
+
+    #[inline]
+    pub(crate) fn short_bytes(&self) -> [u8; 12] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = [0u8; 12];
+        for (i, &b) in self.0[..6].iter().enumerate() {
+            out[i * 2] = HEX[usize::from(b >> 4)];
+            out[i * 2 + 1] = HEX[usize::from(b & 0x0f)];
+        }
+        out
     }
 }
 
 impl fmt::Debug for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.hex())
+        let hex = self.hex_bytes();
+        f.write_str(core::str::from_utf8(&hex).unwrap_or(""))
     }
 }
 
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.hex())
-    }
-}
-
-#[inline]
-fn push_hex(out: &mut String, bytes: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for &b in bytes {
-        out.push(char::from(HEX[usize::from(b >> 4)]));
-        out.push(char::from(HEX[usize::from(b & 0x0f)]));
+        let hex = self.hex_bytes();
+        f.write_str(core::str::from_utf8(&hex).unwrap_or(""))
     }
 }
 
@@ -176,12 +187,13 @@ impl ArtifactId {
 
 impl fmt::Display for ArtifactId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let short = self.digest.short_bytes();
         write!(
             f,
             "{}@{} ({})",
             self.name,
             self.version,
-            self.digest.short()
+            core::str::from_utf8(&short).unwrap_or("")
         )
     }
 }
@@ -205,7 +217,7 @@ impl TaskIdentity {
     /// `Digest::of(b"aterm-aos-identity-v1\0", [the identity's canonical wire encoding])`.
     #[must_use]
     pub fn digest(&self) -> Digest {
-        let mut e = Enc::new();
+        let mut e = Enc::with_capacity(256);
         e.identity(self);
         Digest::of(IDENTITY_DOMAIN, &[e.as_bytes()])
     }

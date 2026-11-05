@@ -12,6 +12,7 @@
 //! thread that reads at once and then every five minutes. A verb a person ran asks and waits for
 //! one read. As the lab's roster source, it is inert in a test, a debug build and a build tool's
 //! run (`alab_view::holds`), and `[alab] roster = false` turns it off.
+//! An unavailable local policy hides held data without discarding its history.
 
 use aterm_agent::harness::alab_seen::{
     self, AccountSeen, Figure, HISTORY_MAX, LastUse, Line, SignedIn, WindowSeen,
@@ -201,16 +202,20 @@ impl Cache {
     /// One read of the registry and the journal window ([`journal_view`] names the Macs); a
     /// failed or unheld read keeps what was held.
     fn read(&self) {
-        if crate::alab_view::turned_off(&self.config) {
-            *self
-                .held
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            *self
-                .lab
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            return;
+        match crate::alab_view::roster_policy(&self.config) {
+            crate::alab_view::LocalRosterPolicy::Enabled => {}
+            crate::alab_view::LocalRosterPolicy::Unavailable => return,
+            crate::alab_view::LocalRosterPolicy::Disabled => {
+                *self
+                    .held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                *self
+                    .lab
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                return;
+            }
         }
         let now = aterm_time::unix_millis().unwrap_or(0) / 1000;
         let mut last = self
@@ -259,6 +264,12 @@ impl Cache {
 
 impl alab_seen::Source for &'static Cache {
     fn seen(&self, wait: bool) -> Option<Arc<alab_seen::Seen>> {
+        if !matches!(
+            crate::alab_view::roster_policy(&self.config),
+            crate::alab_view::LocalRosterPolicy::Enabled
+        ) {
+            return None;
+        }
         let held = self
             .held
             .lock()
@@ -307,6 +318,62 @@ pub(crate) fn install() {
 mod tests {
     use super::*;
     use aterm_db::alab::journal::seen::Seen;
+
+    #[test]
+    fn cached_journal_policy_refusal_hides_but_preserves_history_until_recovery() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let config = home.path().join("aterm.toml");
+        let history = Arc::new(alab_seen::Seen {
+            accounts: [("ac-fixture".into(), AccountSeen::default())].into(),
+            at: 42,
+        });
+        // Exercise the actual Source getter without starting its registry worker.
+        let cache: &'static Cache = Box::leak(Box::new(Cache {
+            paths: Paths::for_home(home.path()),
+            config: config.clone(),
+            held: Mutex::new(Some(Arc::clone(&history))),
+            lab: Mutex::new(None),
+            reader: OnceLock::from(()),
+        }));
+        let active = || alab_seen::Source::seen(&cache, false);
+        assert!(
+            Arc::ptr_eq(&active().unwrap(), &history),
+            "missing config defaults on"
+        );
+        let write =
+            |text: &str| aterm_uds::atomic_file::write(&config, text.as_bytes(), 0o600).unwrap();
+        write("[alab]\nroster = true\n");
+        assert!(Arc::ptr_eq(&active().unwrap(), &history));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o664)).unwrap();
+            assert!(active().is_none());
+            cache.read();
+            assert!(Arc::ptr_eq(
+                cache.held.lock().unwrap().as_ref().unwrap(),
+                &history
+            ));
+        }
+        for malformed in ["[alab\n", "[alab]\nroster = 'not-a-boolean'\n"] {
+            write(malformed);
+            assert!(active().is_none());
+            cache.read();
+            assert!(Arc::ptr_eq(
+                cache.held.lock().unwrap().as_ref().unwrap(),
+                &history
+            ));
+        }
+        write("[alab]\nroster = true\n");
+        assert!(Arc::ptr_eq(&active().unwrap(), &history));
+        write("[alab]\nroster = false\n");
+        assert!(active().is_none());
+        cache.read();
+        assert!(
+            cache.held.lock().unwrap().is_none(),
+            "explicit off retains its clearing behavior"
+        );
+    }
 
     /// A Mac with no binding is named by its enrollment's uuid, never left blank, and the harness
     /// form of an empty journal is empty.

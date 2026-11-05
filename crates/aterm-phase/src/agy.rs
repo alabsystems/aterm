@@ -16,7 +16,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 9, "0.9");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 10, "0.10");
 
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 
@@ -681,17 +681,32 @@ pub fn said_history_stop(row: &str) -> bool {
 /// blank line. A tool's output under its `●`/`○` row is none.
 #[must_use]
 pub fn turn_said_before(rows: &[String]) -> Option<String> {
+    turn_messages_before(rows).map(|m| crate::reader::join_messages(&m))
+}
+
+/// [`turn_said_before`] reply by reply, oldest first.
+#[must_use]
+pub fn turn_messages_before(rows: &[String]) -> Option<Vec<String>> {
     let (_, said) = turn_before(rows, crate::wrap::said_rows)?;
-    (!said.is_empty()).then(|| said.join("\n\n"))
+    (!said.is_empty()).then_some(said)
 }
 
 /// [`turn_said_before`], its lines read as [`said_lines`] reads them.
 #[must_use]
 pub fn turn_lines_before(rows: &[String], apart: crate::reader::Apart) -> Option<String> {
+    turn_message_lines_before(rows, apart).map(|m| crate::reader::join_messages(&m))
+}
+
+/// [`turn_lines_before`] reply by reply, oldest first.
+#[must_use]
+pub fn turn_message_lines_before(
+    rows: &[String],
+    apart: crate::reader::Apart,
+) -> Option<Vec<String>> {
     let (_, said) = turn_before(rows, |said| {
         crate::wrap::said_lines(rows, said, REPLY_MARGIN, apart)
     })?;
-    (!said.is_empty()).then(|| said.join("\n\n"))
+    (!said.is_empty()).then_some(said)
 }
 
 /// Whether the turn [`said_tail`]'s reply ends is whole on `rows`: the reply is
@@ -2245,6 +2260,14 @@ pub mod fixtures {
         /// `[Pasted text #1 +60 lines]`, the footer's left side blank and the model drawn, as
         /// beside a draft.
         pub const TALL_PASTE: &str = include_str!("fixtures/agy-1.4.12-lab-tall-paste.txt");
+        /// agy 1.4.12's bash mode with `ls -la` typed after `!` (v6 §14.17.5.8): the caret row
+        /// `! ls -la`, the footer ` activated bash mode · esc to cancel`, no `>` composer.
+        pub const BASH_MODE_DRAFT: &str =
+            include_str!("fixtures/agy-1.4.12-lab-bash-mode-draft.txt");
+        /// agy 1.4.12 with `!echo pasted-probe` pasted into the empty composer: a pasted `!` is
+        /// text in the `>` composer, not bash mode.
+        pub const PASTED_BANG_DRAFT: &str =
+            include_str!("fixtures/agy-1.4.12-lab-pasted-bang-draft.txt");
         /// A command task running on after the turn: the panel (`  ● [17:50:42] … running`)
         /// under the empty composer, the footer counting `1 task(s)`.
         pub const BG_TASK: &str = include_str!("fixtures/agy-1.4.0-lab-bg-task.txt");

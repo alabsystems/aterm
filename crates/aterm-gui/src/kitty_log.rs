@@ -756,9 +756,15 @@ fn atomic_write_toml(path: &Path, value: &impl Serialize) -> bool {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let write_result = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let write_result = opts
         .open(&tmp)
         .and_then(|mut file| file.write_all(text.as_bytes()));
     if write_result.is_err() {

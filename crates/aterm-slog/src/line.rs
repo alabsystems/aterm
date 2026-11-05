@@ -134,6 +134,11 @@ pub fn encode_mirror(
             aliased.by = alias(&sid).map_or(Actor::Nobody, Actor::sid);
             encode_bus(&aliased, tier, ep, ms)
         }
+        Actor::Fleet(_) => {
+            let mut unnamed = rec.clone();
+            unnamed.by = Actor::Nobody;
+            encode_bus(&unnamed, tier, ep, ms)
+        }
         _ => encode_bus(rec, tier, ep, ms),
     }
 }
@@ -214,6 +219,9 @@ pub(crate) fn decode_val(key: Key, raw: &str) -> Option<Val> {
         Cap::Id => ShortId::new(raw).map(Val::Id),
         Cap::Tok(..) => BoundedToken::new(key, &pct::decode(raw)).map(Val::Tok),
         Cap::Text(_) => BoundedText::new(key, &pct::decode(raw)).map(Val::Text),
+        Cap::Sample => parse_u(raw).map(Val::U).or_else(|| {
+            (raw == crate::vocab::UNAVAILABLE).then_some(Val::Word(crate::vocab::UNAVAILABLE))
+        }),
     }
 }
 

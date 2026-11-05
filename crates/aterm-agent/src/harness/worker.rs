@@ -55,6 +55,12 @@ pub struct WorkerCli {
     /// CLI flag that lets the run drive the person's own browser ([`Fresh::chrome`]); `None` for a CLI
     /// with no such flag.
     pub chrome_flag: Option<&'static str>,
+    /// CLI flag that names, comma-joined, the only built-in tools the run has ([`Fresh::tools`]);
+    /// `None` for a CLI with no such flag.
+    pub tools_flag: Option<&'static str>,
+    /// CLI flag that hands the run one settings document of its own ([`Fresh::settings`]); `None`
+    /// for a CLI with no such flag.
+    pub settings_flag: Option<&'static str>,
     /// Environment pairs set on a fresh start and dropped first when tight on space.
     pub nicety: &'static [(&'static str, &'static str)],
     /// Starter environment variables naming directories that must be absolute when carried.
@@ -65,7 +71,8 @@ pub struct WorkerCli {
     homes: fn(&ProcArgs, &Path) -> Vec<(String, String)>,
     /// The flags of the starter's argv a worker's line carries ([`Starter::args`]):
     /// the ones its relaunch lane carries that move its config or say how it
-    /// reaches its provider.
+    /// reaches its provider; Claude Code's permission mode, which [`starter`] holds to
+    /// the worker's floor ([`claude_starter_args`]).
     flags: fn(&[String]) -> Result<Vec<String>, String>,
     /// Why a worker carrying this environment must not start, under the user's home: a CLI
     /// that, signed out, opens a sign-in page by itself and never reads its task
@@ -99,6 +106,22 @@ pub const CLAUDE_PERMISSION_MODE: ModeFlag = ModeFlag {
 /// person's own Chrome, where their sign-ins are.
 pub const CLAUDE_CHROME_FLAG: &str = "--chrome";
 
+/// Claude Code's `--tools`: the only built-in tools the run has (the real-Claude lab's lean launch,
+/// `--tools Read`, ran 2.1.310 with Read its one tool, `crates/aterm-lab/src/autopilot_scenes.rs`).
+/// A tool the run lacks is never called, whatever its permission mode or rules say. It names the
+/// built-in set alone, so an MCP server's tools, Claude in Chrome's among them, stay (the lean
+/// launch drops those with `--strict-mcp-config` beside it).
+pub const CLAUDE_TOOLS_FLAG: &str = "--tools";
+
+/// Claude Code's `--settings`: one settings document, as a JSON object or a file's path, read
+/// above the user's and project's own. Measured on 2.1.318 in the real-Claude lab
+/// (`docs/measured/claude-chrome-auto-2026-11-05.md`): of two on one line only the last is read,
+/// and auto mode's classifier rules (`autoMode`) are read from it while a project's
+/// `.claude/settings.json` and `settings.local.json` are not, a trusted folder's included. A line
+/// that carries one is never handed aterm's usage tap, whose value is a `--settings` too
+/// ([`super::tap::launch_value`]).
+pub const CLAUDE_SETTINGS_FLAG: &str = "--settings";
+
 /// Why a worker carrying an environment (its variables, then the user's home where known) must
 /// not start: a CLI's sign-in floor ([`grok::signed_out`]).
 type LoginGate = fn(&[(String, String)], Option<&Path>) -> Option<String>;
@@ -106,14 +129,29 @@ type LoginGate = fn(&[(String, String)], Option<&Path>) -> Option<String>;
 /// Claude Code's plan mode, as `--permission-mode` and the pill's flag spell it.
 const CLAUDE_PLAN: &str = "plan";
 
-/// The permission flags of a Claude Code starter's argv, for its worker: a worker runs with its
-/// parent's permissions (owner ruling 2026-11-02). The last of `--dangerously-skip-permissions`
-/// and `--permission-mode` wins, as Claude Code reads them; [`claude_mode_flags`] spells a mode
-/// the starter moved to since it started. Plan mode never rides: it says what the starter is doing
-/// now, not what it may do, and a worker in it could do no work.
+/// The mode a Claude Code worker starts in where the mode its starter lends is below the floor,
+/// or where it lends none ([`claude_worker_mode`]).
+pub const CLAUDE_WORKER_FLOOR: &str = "auto";
+
+/// The modes at or above a Claude Code worker's floor, which a starter lends its worker as they
+/// are ([`claude_worker_mode`]): none of them stops for a person's box on each edit or command.
+const CLAUDE_FLOOR_KEEPS: [&str; 3] = [CLAUDE_WORKER_FLOOR, "dontAsk", "bypassPermissions"];
+
+/// The permission flags of a Claude Code starter's argv ([`claude_flags_mode`]): the mode its
+/// worker takes from it, which [`starter`] then holds to the floor ([`claude_worker_mode`]).
+/// [`claude_mode_flags`] spells a mode the starter moved to since it started.
 fn claude_permission_flags(argv: &[String]) -> Result<Vec<String>, String> {
+    Ok(claude_flags_mode(argv.iter().skip(1))
+        .map_or_else(Vec::new, |mode| claude_mode_flags(&mode)))
+}
+
+/// The permission mode Claude Code reads from `tokens`, a run's flags up to a `--`, as
+/// `--permission-mode` spells it. The last of `--dangerously-skip-permissions` and
+/// `--permission-mode` wins, as Claude Code reads them. Plan mode never rides: it says what the
+/// starter is doing now, not what it may do, and a worker in it could do no work.
+fn claude_flags_mode<'a>(tokens: impl IntoIterator<Item = &'a String>) -> Option<String> {
     let mut mode = None;
-    let mut tokens = argv.iter().skip(1);
+    let mut tokens = tokens.into_iter();
     while let Some(tok) = tokens.next() {
         match tok.as_str() {
             "--" => break,
@@ -134,7 +172,7 @@ fn claude_permission_flags(argv: &[String]) -> Result<Vec<String>, String> {
             }
         }
     }
-    Ok(mode.map_or_else(Vec::new, |mode| claude_mode_flags(&mode)))
+    mode
 }
 
 /// The flags that start a Claude Code worker in `mode`, as the permission pill or a
@@ -150,15 +188,155 @@ fn claude_mode_flags(mode: &str) -> Vec<String> {
     }
 }
 
-/// `starter` as its Claude Code shows itself on `rows`, its tab's screen: the mode on the pill is
-/// the one it runs in now, which a shift+tab may have moved from its argv's. A screen showing no
-/// pill (a box covers it), or plan mode's, leaves the argv's ([`claude_permission_flags`]).
-#[must_use]
-pub fn with_shown_mode(mut starter: Starter, rows: &[String]) -> Starter {
-    if let Some(mode) = super::relaunch::screen_mode(rows).filter(|m| m != CLAUDE_PLAN) {
-        starter.args = Ok(claude_mode_flags(&mode));
+/// THE MODE A CLAUDE CODE WORKER STARTS IN, from the one its starter lends it (`inherited`, as
+/// `--permission-mode` or the pill's flag spells it; `None` where the starter names none or is
+/// planning). A worker is fully automated by default (owner, 2026-11-04: "these workers likely
+/// need to be started in auto / yolo mode!"), which supersedes, for this floor, the ruling that a
+/// worker runs with its parent's permissions (owner ruling 2026-11-02). Where `floored`, a
+/// starter in a mode that stops for a person's box (manual, `acceptEdits`), or one that names
+/// none, lends [`CLAUDE_WORKER_FLOOR`], and one at or above the floor ([`CLAUDE_FLOOR_KEEPS`]:
+/// auto, `dontAsk`, bypass) lends its own, so aterm never raises a worker to bypass. Not
+/// `floored`, for a starter whose requests leave Anthropic's own API ([`claude_route_kept`]),
+/// the worker keeps its starter's mode, as the 2026-11-02 ruling has it: through a gateway, auto
+/// mode raises a classifier billing notice that nothing answers, and in the lab its classifier
+/// then refused every command (`docs/measured/workers-lab-2026-10-16.md`, "Auto mode blocks a
+/// gateway's Bash").
+fn claude_worker_mode(inherited: Option<&str>, floored: bool) -> Option<&str> {
+    if !floored {
+        return inherited;
     }
-    starter
+    Some(
+        inherited
+            .filter(|mode| CLAUDE_FLOOR_KEEPS.contains(mode))
+            .unwrap_or(CLAUDE_WORKER_FLOOR),
+    )
+}
+
+/// The permission flags a Claude Code worker starts with, from the flags its starter lends it
+/// (`inherited`: its argv's, [`claude_permission_flags`], or its pill's), held to the floor
+/// where `floored` ([`claude_worker_mode`]).
+fn claude_worker_flags(inherited: &[String], floored: bool) -> Vec<String> {
+    let mode = claude_flags_mode(inherited);
+    claude_worker_mode(mode.as_deref(), floored).map_or_else(Vec::new, claude_mode_flags)
+}
+
+/// The mode a Claude Code starter shows on `rows`, its tab's screen (`None`: none was read), as
+/// `--permission-mode` spells it: the mode on the pill is the one it runs in now, which a
+/// shift+tab may have moved from its argv's. A screen showing no pill (a box covers it), or plan
+/// mode's, shows none, and the argv's stands.
+fn claude_shown_mode(rows: Option<&[String]>) -> Option<String> {
+    rows.and_then(super::relaunch::screen_mode)
+        .filter(|mode| mode != CLAUDE_PLAN)
+}
+
+/// Whether `key`, a variable of a Claude Code launch's environment or settings, takes its
+/// requests off Anthropic's own API: a route variable ([`super::netwatch::ROUTE_KEYS`]: a
+/// gateway's base URL, a cloud provider's switch or endpoint, a socket) other than a proxy's,
+/// which carries them to the same API.
+fn leaves_the_api(key: &str) -> bool {
+    use super::witness::{HTTP_PROXY_KEYS, HTTPS_PROXY_KEYS};
+    super::netwatch::ROUTE_KEYS.contains(&key)
+        && !HTTPS_PROXY_KEYS.contains(&key)
+        && !HTTP_PROXY_KEYS.contains(&key)
+}
+
+/// WHY A CLAUDE CODE WORKER KEEPS ITS STARTER'S PERMISSION MODE in place of the floor
+/// ([`claude_worker_mode`]), from `facts`, its starter's exec environment and the settings
+/// documents it reads: a variable that takes its requests off Anthropic's own API
+/// ([`leaves_the_api`]) set, not blank, in either, or an environment or a settings document that
+/// could not be read or parsed, which leaves the route untold. `None`: the route is Anthropic's
+/// own, and the floor holds. The starter's are read in place of the worker's, which do not exist
+/// until its line runs: a variable the person's shell startup exports reaches both. The lab's
+/// stub, which a development seam counts as the default route elsewhere
+/// ([`super::netwatch::lab_route`]), is a gateway here: auto mode's classifier gets no answer it
+/// can read from it.
+fn claude_route_kept(facts: &super::netwatch::RouteFacts) -> Option<String> {
+    use super::netwatch::{Source, settings_of};
+    let leaves = |key: &str, value: &str| leaves_the_api(key) && !value.trim().is_empty();
+    let Some(env) = &facts.env else {
+        return Some("its environment could not be read".to_string());
+    };
+    if let Some((key, _)) = env
+        .iter()
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(key, value)| leaves(key, value))
+    {
+        return Some(format!("{key} in its environment"));
+    }
+    for (at, source) in &facts.settings {
+        match source {
+            Source::Missing => {}
+            Source::Unreadable => return Some(format!("{at} could not be read")),
+            Source::Text(text) => {
+                let Some(settings) = settings_of(text) else {
+                    return Some(format!("{at} could not be parsed"));
+                };
+                if let Some((key, _)) = settings.env.iter().find(|(key, value)| leaves(key, value))
+                {
+                    return Some(format!("{key} in {at}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// What decides the route of Claude Code process `process`, launched in `cwd` (`None`: not
+/// known), under the user's `home`, read now: its exec environment, and every settings document
+/// it reads ([`crate::supervise::policy::claude_settings::sources_under`], the managed ones in
+/// `managed`, and the managed preference domains in `prefs`), none opened inside a file-provider
+/// domain of `home`.
+fn claude_route_facts(
+    process: &ProcArgs,
+    cwd: Option<&Path>,
+    home: &Path,
+    managed: Option<&Path>,
+    prefs: &Path,
+) -> super::netwatch::RouteFacts {
+    use crate::supervise::policy::{WorkerEnv, claude_settings};
+    let worker = WorkerEnv::new(process.clone());
+    let settings = claude_settings::sources_under(
+        &worker,
+        cwd.unwrap_or_else(|| Path::new("")),
+        managed,
+        Some(home),
+    )
+    .into_iter()
+    .chain(claude_settings::managed_preferences(&worker, prefs))
+    .map(|source| (source.name, super::netwatch::Source::from(source.text)))
+    .collect();
+    super::netwatch::RouteFacts {
+        env: Some(process.env.clone()),
+        settings,
+    }
+}
+
+/// The flags a Claude Code starter whose argv is `argv` lends its worker's line: the mode its
+/// pill shows on `shown`, its tab's screen ([`claude_shown_mode`]), else its argv's
+/// ([`claude_permission_flags`]), held to the floor where every route in `routes` is Anthropic's
+/// own ([`claude_route_kept`], [`claude_worker_mode`]). The route is decided once, here, for the
+/// argv's mode and the pill's alike, so a starter whose route keeps its mode lends the pill's as
+/// it is, whatever its argv names. `routes` holds one reading per folder whose project settings
+/// the worker's Claude Code may read: the starter's, and the worker's own launch folder where that
+/// is another; a route any of them names keeps the mode. The reason a route keeps it is logged.
+fn claude_starter_args(
+    cli: &WorkerCli,
+    argv: &[String],
+    shown: Option<&[String]>,
+    routes: &[super::netwatch::RouteFacts],
+) -> Result<Vec<String>, String> {
+    let kept = routes.iter().find_map(claude_route_kept);
+    if let Some(why) = &kept {
+        aterm_log::info!(
+            "worker: its starter's Claude Code lends its own permission mode, with no floor: \
+             {why}"
+        );
+    }
+    let inherited = match claude_shown_mode(shown) {
+        Some(mode) => Ok(claude_mode_flags(&mode)),
+        None => (cli.flags)(argv),
+    };
+    inherited.map(|inherited| claude_worker_flags(&inherited, kept.is_none()))
 }
 
 /// The flags of a Codex starter's argv that move its config, say how it reaches its provider or
@@ -249,6 +427,8 @@ pub static WORKERS: [WorkerCli; 5] = [
         trust_flag: None,
         permission_flag: Some(CLAUDE_PERMISSION_MODE),
         chrome_flag: Some(CLAUDE_CHROME_FLAG),
+        tools_flag: Some(CLAUDE_TOOLS_FLAG),
+        settings_flag: Some(CLAUDE_SETTINGS_FLAG),
         nicety: &super::relaunch::CLAUDE_LAUNCH_ENV,
         dirs: &[super::accounts::HOME_ENV, super::accounts::HOMEDIR_ENV],
         launches: Launches::Claude,
@@ -266,6 +446,8 @@ pub static WORKERS: [WorkerCli; 5] = [
         trust_flag: None,
         permission_flag: None,
         chrome_flag: None,
+        tools_flag: None,
+        settings_flag: None,
         nicety: &[],
         dirs: &[
             super::codex_alab::HOME_ENV,
@@ -292,6 +474,8 @@ pub static WORKERS: [WorkerCli; 5] = [
         trust_flag: None,
         permission_flag: None,
         chrome_flag: None,
+        tools_flag: None,
+        settings_flag: None,
         nicety: &[],
         dirs: &[super::upgrade_agy::HOME_ENV],
         launches: Launches::Image {
@@ -311,6 +495,8 @@ pub static WORKERS: [WorkerCli; 5] = [
         trust_flag: Some("--trust-workspace"),
         permission_flag: None,
         chrome_flag: None,
+        tools_flag: None,
+        settings_flag: None,
         nicety: &[],
         dirs: &[
             super::upgrade_muse::DATA_ENV,
@@ -339,6 +525,8 @@ pub static WORKERS: [WorkerCli; 5] = [
         trust_flag: None,
         permission_flag: None,
         chrome_flag: None,
+        tools_flag: None,
+        settings_flag: None,
         nicety: &[grok::NO_SELF_UPDATE],
         dirs: &[grok::HOME_ENV],
         launches: Launches::Image {
@@ -619,6 +807,47 @@ impl Admitted {
         ))
     }
 
+    /// This admission for a Claude Code worker whose parent lends it no flags, typed as the build
+    /// atpkg's managed twin execs where its line, with `model`, holds nothing the twin reads as
+    /// typed: the word would reach the twin, which adds yolo, and a worker off the floor runs with
+    /// its parent's permissions (owner ruling 2026-11-02). A parent lends none only where its route
+    /// keeps its worker off the floor ([`starter`]) and it names no mode: at the floor the line
+    /// names `auto`, which the twin runs as typed. Such a worker starts without the twin's usage
+    /// tap, as one typed by its starter's image does. Read after admission, because admission can
+    /// lay the twin. With no such twin the starter stays as it is.
+    #[must_use]
+    pub fn past_the_twin(self, cli: &WorkerCli, model: Option<&str>) -> Self {
+        self.past_the_twin_by(cli, model, || {
+            let twin = super::upgrade_drive::managed_agent_twin(cli.word)?;
+            super::upgrade_drive::twin_build(&twin, cli.word)
+        })
+    }
+
+    /// [`Self::past_the_twin`] with the twin's build read by `build`.
+    #[must_use]
+    fn past_the_twin_by(
+        mut self,
+        cli: &WorkerCli,
+        model: Option<&str>,
+        build: impl FnOnce() -> Option<PathBuf>,
+    ) -> Self {
+        let (Launches::Claude, Ok(args)) = (&cli.launches, &self.starter.args) else {
+            return self;
+        };
+        let mut flags = args.clone();
+        if let Some(model) = model.or(cli.default_model) {
+            flags.extend([cli.model_flag.to_string(), model.to_string()]);
+        }
+        if matches!(
+            atpkg::yolo::decide(cli.word, &flags),
+            atpkg::yolo::Launch::Default(_)
+        ) && let Some(build) = build()
+        {
+            self.starter.exe = build;
+        }
+        self
+    }
+
     /// The starter the line carries.
     #[must_use]
     pub const fn starter(&self) -> &Starter {
@@ -677,12 +906,47 @@ pub fn admit(
     Ok(Admitted { starter, readiness })
 }
 
-/// Read process `pid` under `home` as a starter of `cli`'s kind, or `None`.
+/// Read process `pid` under `home` as a starter of `cli`'s kind, or `None`. A Claude Code
+/// starter's mode is read here, from `shown`'s rows (its tab's screen, whose pill shows the mode it
+/// runs in now; `None` where none was read) over its argv, and held to its worker's floor where
+/// its route is read ([`claude_starter_args`]): at the starter's own folder and at `worker_cwd`'s,
+/// the folder the worker's line runs in (the spawn's `cwd=`), whose project settings may name a
+/// route the starter's lack. Another agent's starter calls neither, so its caller never decides
+/// which kind of agent reads them.
 #[must_use]
-pub fn starter(cli: &WorkerCli, pid: u32, home: &Path) -> Option<Starter> {
+pub fn starter(
+    cli: &WorkerCli,
+    pid: u32,
+    home: &Path,
+    shown: impl FnOnce() -> Option<Vec<String>>,
+    worker_cwd: impl FnOnce() -> Option<PathBuf>,
+) -> Option<Starter> {
     if let Launches::Claude = cli.launches {
         let c = super::relaunch::caller_claude(pid, home)?;
-        let argv = atpkg::caller_shell::process_args(pid)?.argv;
+        let process = atpkg::caller_shell::process_args(pid)?;
+        let shown = shown();
+        let worker_cwd = worker_cwd();
+        let routes = {
+            use crate::supervise::policy::claude_settings::{MANAGED_DIR, MANAGED_PREFERENCES_DIR};
+            let cwd = aterm_sysprobe::process_cwd(pid);
+            let at = |cwd: Option<&Path>| {
+                claude_route_facts(
+                    &process,
+                    cwd,
+                    home,
+                    MANAGED_DIR.map(Path::new),
+                    Path::new(MANAGED_PREFERENCES_DIR),
+                )
+            };
+            let mut routes = vec![at(cwd.as_deref())];
+            routes.extend(
+                worker_cwd
+                    .as_deref()
+                    .filter(|own| Some(*own) != cwd.as_deref())
+                    .map(|own| at(Some(own))),
+            );
+            routes
+        };
         let env = super::relaunch::required_env(
             c.home.as_deref(),
             c.homedir.as_deref(),
@@ -694,7 +958,7 @@ pub fn starter(cli: &WorkerCli, pid: u32, home: &Path) -> Option<Starter> {
         return Some(Starter {
             exe: c.exe,
             env,
-            args: (cli.flags)(&argv),
+            args: claude_starter_args(cli, &process.argv, shown.as_deref(), &routes),
             unset: Vec::new(),
         });
     }
@@ -752,11 +1016,19 @@ pub struct Fresh<'a> {
     /// Whether the shell stands in the folder its starter trusted for it.
     pub trusted_here: bool,
     /// `--permission-mode`: the mode the CLI starts in, one its [`WorkerCli::permission_flag`]
-    /// takes, or `None` for the one its settings name.
+    /// takes, which no floor moves; `None` for the one its starter lends ([`Starter::args`],
+    /// held to a Claude Code worker's floor by [`starter`]), else the one its settings name.
     pub permission_mode: Option<&'a str>,
     /// Whether the run drives the person's own browser: the CLI's [`WorkerCli::chrome_flag`] (a claim
     /// worker's, [`super::credit_offers::claim_task`]).
     pub chrome: bool,
+    /// The only built-in tools the run has, by the CLI's [`WorkerCli::tools_flag`] (a claim worker's,
+    /// [`super::credit_offers::CLAIM_TOOLS`]), or `None` for every one its settings give.
+    pub tools: Option<&'a [&'a str]>,
+    /// A settings document, a JSON object, the run reads above every other by the CLI's
+    /// [`WorkerCli::settings_flag`] (a claim worker's auto-mode rules,
+    /// [`super::credit_offers::claim_settings`]), or `None` for none.
+    pub settings: Option<&'a str>,
 }
 
 /// Format the shell command line a worker runs at its first prompt, for the starter [`admit`]
@@ -765,8 +1037,9 @@ pub struct Fresh<'a> {
 /// # Errors
 /// The line exceeds its budget, a carried directory is relative, the starter's argv holds a flag
 /// no table knows, `model` starts with `-`, a permission mode is named for a CLI with no such
-/// flag or is none of the modes its flag takes, or a variable [`Starter::unset`] removes is one
-/// its environment sets.
+/// flag or is none of the modes its flag takes, tools are named for a CLI with no such flag or are
+/// none or a name that is not one word, a settings document is named for a CLI with no such flag
+/// or is no JSON object, or a variable [`Starter::unset`] removes is one its environment sets.
 pub fn line(
     cli: &WorkerCli,
     dialect: Dialect,
@@ -859,9 +1132,53 @@ pub(super) fn line_of(
             ));
         }
     };
+    let tools = match (fresh.tools, cli.tools_flag) {
+        (None, _) => None,
+        (Some(_), None) => {
+            return Err(format!(
+                "{} takes no tool list on its command line, so its worker cannot be held to one",
+                cli.agent.product()
+            ));
+        }
+        (Some(tools), Some(flag)) => {
+            let word = |tool: &&str| {
+                !tool.is_empty()
+                    && !tool.starts_with('-')
+                    && tool.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            };
+            if tools.is_empty() || !tools.iter().all(word) {
+                return Err(format!(
+                    "the tool list {tools:?} is none, or names a tool that is not one word"
+                ));
+            }
+            Some((flag, tools.join(",")))
+        }
+    };
+    let settings = match (fresh.settings, cli.settings_flag) {
+        (None, _) => None,
+        (Some(_), None) => {
+            return Err(format!(
+                "{} takes no settings document on its command line, so its worker cannot be \
+                 handed one",
+                cli.agent.product()
+            ));
+        }
+        (Some(doc), Some(_)) if !(doc.starts_with('{') && doc.ends_with('}')) => {
+            return Err(format!("the settings document {doc:?} is no JSON object"));
+        }
+        (Some(doc), Some(flag)) => Some((flag, doc)),
+    };
     let mut flags: Vec<String> = args.to_vec();
     if let Some(flag) = chrome {
         flags.push(flag.to_string());
+    }
+    if let Some((flag, tools)) = tools {
+        flags.push(flag.to_string());
+        flags.push(tools);
+    }
+    if let Some((flag, doc)) = settings {
+        flags.push(flag.to_string());
+        flags.push(doc.to_string());
     }
     if let Some(flag) = cli.trust_flag.filter(|_| fresh.trusted_here) {
         flags.push(flag.to_string());

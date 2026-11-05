@@ -207,12 +207,11 @@ fn open_mode(directory: &File, name: &str, create: bool, write: bool) -> io::Res
     if create {
         flags |= OFlags::CREATE | OFlags::EXCL;
     }
-    let file = File::from(fd::openat(
-        directory,
-        name,
-        flags,
-        FileMode::RUSR | FileMode::WUSR,
-    )?);
+    let file = aterm_uds::kept_out(|| {
+        fd::openat(directory, name, flags, FileMode::RUSR | FileMode::WUSR)
+            .map(File::from)
+            .map_err(io::Error::from)
+    })?;
     let stat = fd::fstat(&file)?;
     // SAFETY: geteuid takes no arguments and reads the effective identity of this process.
     let uid = unsafe { libc::geteuid() };
@@ -266,7 +265,10 @@ fn snapshot(file: &File) -> io::Result<String> {
         )
     };
     let before = file.metadata()?;
-    let mut bytes = vec![0u8; RECORD_MAX as usize + 1];
+    let cap = usize::try_from(before.len().min(RECORD_MAX))
+        .unwrap_or(RECORD_MAX as usize)
+        .saturating_add(1);
+    let mut bytes = vec![0u8; cap];
     let mut length = 0;
     while length < bytes.len() {
         let read = file.read_at(&mut bytes[length..], length as u64)?;
@@ -275,7 +277,10 @@ fn snapshot(file: &File) -> io::Result<String> {
         }
         length += read;
     }
-    if length as u64 > RECORD_MAX || stamp(&before) != stamp(&file.metadata()?) {
+    if length as u64 > RECORD_MAX
+        || length as u64 != before.len()
+        || stamp(&before) != stamp(&file.metadata()?)
+    {
         return Err(refused(
             "cohort record changed during its bounded held-file read",
         ));
@@ -341,10 +346,11 @@ pub(super) fn lay(namespace: &Namespace, record: Record) -> io::Result<(Record, 
         checkpoint,
     };
     let mut laid = Laid {
-        lock,
+        lock: lock.into(),
         path: root.join(&taking),
         granted: None,
         custody: Some(custody),
+        detaching: None,
     };
     let writer = &mut laid.custody.as_mut().expect("cohort claim").writer;
     writer.write_all(head.as_bytes())?;

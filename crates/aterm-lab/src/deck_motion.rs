@@ -308,7 +308,7 @@ pub fn cmd_deck_motion(args: &[String]) -> Res {
         let index = Path::new(index);
         let frames = read_take(index, &args.geom).map_err(Fail::die)?;
         let tsv = index.with_file_name("frames.tsv");
-        std::fs::write(&tsv, frames.tsv())
+        crate::util::write_fresh(&tsv, frames.tsv())
             .map_err(|e| Fail::die(format!("cannot write {}: {e}", tsv.display())))?;
         print!(
             "{}",
@@ -349,7 +349,7 @@ pub fn cmd_deck_motion(args: &[String]) -> Res {
             }
         }
     }
-    let _ = std::fs::write(out.join("deck-motion.txt"), &book);
+    let _ = crate::util::write_fresh(&out.join("deck-motion.txt"), &book);
     if let Some(path) = &args.json_out {
         let mut obj = aterm_json::Map::new();
         for (label, map) in json {
@@ -357,7 +357,7 @@ pub fn cmd_deck_motion(args: &[String]) -> Res {
         }
         let text = aterm_json::to_string(&aterm_json::Value::Object(obj))
             .map_err(|e| Fail::die(format!("deck-motion: --json-out: {e}")))?;
-        std::fs::write(path, text + "\n")
+        crate::util::write_fresh(Path::new(path), text + "\n")
             .map_err(|e| Fail::die(format!("deck-motion: cannot write {path}: {e}")))?;
     }
     println!("deck-motion: {}", out.join("deck-motion.txt").display());
@@ -571,13 +571,12 @@ fn run_take(args: &Args, aterm: &Path, take: Take, dir: &Path) -> Result<TakeRep
         Band::App,
     )?;
     if let Err(f) = inst.await_socket(BOOT) {
-        inst.stop();
-        return Err(f);
+        return crate::instance::after_stop(Err(f), inst.stop());
     }
     let report = record(args, take, &inst, dir);
-    inst.stop();
+    let report = crate::instance::after_stop(report, inst.stop());
     let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::copy(&inst.log, dir.join("gui.log"));
+    let _ = crate::util::copy_regular_file(&inst.log, dir.join("gui.log"));
     report
 }
 
@@ -652,7 +651,7 @@ fn record(args: &Args, take: Take, inst: &Instance, dir: &Path) -> Result<TakeRe
         .ok_or_else(|| Fail::die(format!("video named no index.json: {}", said.trim())))?;
     copy_take(index.parent().unwrap_or(Path::new("/")), dir)?;
     let frames = read_take(&dir.join("index.json"), &args.geom).map_err(Fail::die)?;
-    std::fs::write(dir.join("frames.tsv"), frames.tsv())
+    crate::util::write_fresh(&dir.join("frames.tsv"), frames.tsv())
         .map_err(|e| Fail::die(format!("cannot write frames.tsv: {e}")))?;
     let mut text = frames.summary(&args.geom, args.panel_hz.unwrap_or(HEADLESS_HZ));
     let (before, after) = (fields(&metrics_before), fields(&metrics_after));
@@ -753,10 +752,10 @@ fn record(args: &Args, take: Take, inst: &Instance, dir: &Path) -> Result<TakeRe
             .join(" ")
     );
     let _ = writeln!(text, "load {}", load_average());
-    std::fs::write(dir.join("summary.txt"), &text)
+    crate::util::write_fresh(&dir.join("summary.txt"), &text)
         .map_err(|e| Fail::die(format!("cannot write summary.txt: {e}")))?;
-    std::fs::write(
-        dir.join("metrics.txt"),
+    crate::util::write_fresh(
+        &dir.join("metrics.txt"),
         format!("before {metrics_before}before {pct_before}after {metrics_after}after {pct_after}"),
     )
     .map_err(|e| Fail::die(format!("cannot write metrics.txt: {e}")))?;
@@ -778,10 +777,14 @@ fn copy_take(from: &Path, dir: &Path) -> Result<(), Fail> {
     let entries = std::fs::read_dir(from)
         .map_err(|e| Fail::die(format!("cannot read {}: {e}", from.display())))?;
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
+        let is_file = entry
+            .file_type()
+            .map(|ft| ft.is_file() || (ft.is_symlink() && entry.path().is_file()))
+            .unwrap_or(false);
+        if is_file {
+            let path = entry.path();
             let to = dir.join(entry.file_name());
-            std::fs::copy(&path, &to)
+            crate::util::copy_regular_file(&path, &to)
                 .map_err(|e| Fail::die(format!("cannot copy {}: {e}", path.display())))?;
         }
     }

@@ -24,7 +24,6 @@ const ROOTS: &[(&str, &str)] = &[
 
 const M4: &str = "aterm-effects/src/aos_momentum/m4.rs";
 const PUBLISH: &str = "aterm-effects/src/aos_momentum/publish.rs";
-const DIST: &str = "aterm-effects/src/aos_momentum/dist.rs";
 const SEARCH: &str = "aterm-effects/src/aos_momentum/search.rs";
 const M6: &str = "aterm-effects/src/aos_momentum/m6.rs";
 const JOB: &str = "aterm-gpu/src/compute/job.rs";
@@ -149,16 +148,6 @@ const LOCKS: &[Lock] = &[
         file: PUBLISH,
         code: "E0382",
         line: "fn twice(host: &mut MomentumHost, admitted: Admitted) {",
-    },
-    Lock {
-        file: DIST,
-        code: "E0616",
-        line: "fn rows(c: &Claim) -> usize { c.rows.len() }",
-    },
-    Lock {
-        file: DIST,
-        code: "E0308",
-        line: "fn gate(ev: &Evaluator, c: Claim) { let _ = ev.held_out(c); }",
     },
     Lock {
         file: SEARCH,

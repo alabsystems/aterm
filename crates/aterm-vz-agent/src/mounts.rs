@@ -50,6 +50,9 @@ pub enum Op {
 /// A mountinfo field with its octal escapes (`\040` for a space) decoded.
 fn unescape(field: &str) -> PathBuf {
     use std::os::unix::ffi::OsStringExt as _;
+    if !field.contains('\\') {
+        return PathBuf::from(field);
+    }
     let b = field.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -78,14 +81,14 @@ pub fn parse(mountinfo: &str) -> Vec<Mounted> {
         .lines()
         .filter_map(|line| {
             let (head, tail) = line.split_once(" - ")?;
-            let head: Vec<&str> = head.split(' ').collect();
+            let mut head = head.split(' ');
+            let root = head.nth(3)?;
+            let point = head.next()?;
+            head.next()?;
             let mut tail = tail.split(' ');
-            if head.len() < 6 {
-                return None;
-            }
             Some(Mounted {
-                root: unescape(head[3]),
-                point: unescape(head[4]),
+                root: unescape(root),
+                point: unescape(point),
                 fstype: unescape(tail.next()?).into_os_string().into_string().ok()?,
                 source: unescape(tail.next()?).into_os_string().into_string().ok()?,
             })

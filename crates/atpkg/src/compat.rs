@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Layout;
 use crate::seam::Depth;
+use crate::store::build_stands;
 
 /// `<prefix>/compat`, where exec roots live.
 pub use aterm_toolchain::layout::COMPAT_DIR;
@@ -378,12 +379,25 @@ pub fn ensure_root(layout: &Layout, build_dir: &Path, depth: Depth) -> io::Resul
                 let _ = std::fs::rename(&tmp_bin, &root_bin);
             }
         };
-        if let Err(e) = std::fs::write(root_marker(&tmp), ROOT_MARKER_BODY) {
+        let marker = root_marker(&tmp);
+        let write_marker = || -> io::Result<()> {
+            use std::io::Write as _;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            }
+            let mut f = opts.open(&marker)?;
+            f.write_all(ROOT_MARKER_BODY.as_bytes())
+        };
+        if let Err(e) = write_marker() {
             restore_bin();
             let _ = remove_entry(&tmp);
             return Err(io::Error::new(
                 e.kind(),
-                format!("cannot write {} ({e})", root_marker(&tmp).display()),
+                format!("cannot write {} ({e})", marker.display()),
             ));
         }
         if standing && let Err(e) = std::fs::rename(&root, &aside) {
@@ -543,7 +557,7 @@ fn classify(layout: &Layout, name: &str, path: &Path) -> Option<RootsEntry> {
     }
     let n = name.parse::<u64>().ok().filter(|n| n.to_string() == name)?;
     let build = layout.build_dir(crate::seam::SEAM_PROGRAM, n);
-    Some(match (real_dir(path), build_stands(&build)) {
+    Some(match (crate::store::real_dir(path), build_stands(&build)) {
         (Err(_), _) => RootsEntry::Needed,
         (Ok(false), _) => RootsEntry::Stray(Stray::NotADirectory),
         (Ok(true), Ok(false)) => RootsEntry::Stray(Stray::BuildGone(n)),
@@ -552,42 +566,6 @@ fn classify(layout: &Layout, name: &str, path: &Path) -> Option<RootsEntry> {
         }
         (Ok(true), _) => RootsEntry::Needed,
     })
-}
-
-/// `lstat` of `path` as an answer: `Ok(true)` for a real directory, `Ok(false)` for
-/// provably none (absent, `ENOTDIR` above it, or a non-directory such as a symlink at the
-/// name), and `Err` when the question went unanswered (a component that cannot be
-/// searched).
-#[cfg(unix)]
-fn real_dir(path: &Path) -> io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(m) => Ok(m.is_dir()),
-        Err(e)
-            if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR) =>
-        {
-            Ok(false)
-        }
-        Err(e) => Err(io::Error::new(
-            e.kind(),
-            format!("cannot lstat {} ({e})", path.display()),
-        )),
-    }
-}
-
-/// [`real_dir`] for the store build `build`, which also stands as its `<n>` link to a real
-/// `<n>.noindex` once laid aside ([`aterm_toolchain::layout`]).
-#[cfg(unix)]
-fn build_stands(build: &Path) -> io::Result<bool> {
-    match aterm_toolchain::layout::aside_of(build) {
-        Some(aside) if aterm_toolchain::layout::is_linked_aside(build) => real_dir(&aside),
-        _ => real_dir(build),
-    }
-}
-
-/// Elsewhere no build is laid aside, and [`reconcile`] lays no root.
-#[cfg(not(unix))]
-fn build_stands(build: &Path) -> io::Result<bool> {
-    Ok(std::fs::symlink_metadata(build).is_ok_and(|m| m.is_dir()))
 }
 
 /// `<prefix>/compat/trust`, when it and `<prefix>/compat` are both real directories — the
@@ -784,20 +762,22 @@ pub fn reconcile(layout: &Layout, depth: Depth) -> Report {
                 }),
             }
         }
-        for (shim, target) in shims {
-            let env = crate::platform::shim_env_of(shim);
-            let want = match crate::platform::shim_executable_to_env(shim, target, &env) {
-                Ok(want) => want,
-                Err(e) => {
-                    report
-                        .errors
-                        .push(format!("{} not rendered ({e})", shim.display()));
-                    continue;
-                }
-            };
-            let have =
-                crate::metadata_io::read_bounded_regular(shim, crate::platform::MAX_SHIM_BYTES);
-            if !have.is_ok_and(|bytes| bytes == want.body) {
+        for row in shims {
+            let want =
+                match crate::platform::shim_executable_to_env(&row.shim, &row.target, &row.env) {
+                    Ok(want) => want,
+                    Err(e) => {
+                        report
+                            .errors
+                            .push(format!("{} not rendered ({e})", row.shim.display()));
+                        continue;
+                    }
+                };
+            if !row
+                .body
+                .as_deref()
+                .is_some_and(|have| have.as_bytes() == want.body)
+            {
                 files.push(want);
             }
         }
@@ -814,22 +794,35 @@ pub fn reconcile(layout: &Layout, depth: Depth) -> Report {
     report
 }
 
-fn trust_shims(layout: &Layout) -> std::collections::BTreeMap<u64, Vec<(PathBuf, PathBuf)>> {
-    let mut groups: std::collections::BTreeMap<u64, Vec<(PathBuf, PathBuf)>> =
+struct TrustShim {
+    shim: PathBuf,
+    target: PathBuf,
+    env: crate::shim_env::ShimEnv,
+    body: Option<String>,
+}
+
+fn trust_shims(layout: &Layout) -> std::collections::BTreeMap<u64, Vec<TrustShim>> {
+    let mut groups: std::collections::BTreeMap<u64, Vec<TrustShim>> =
         std::collections::BTreeMap::new();
     if let Ok(listing) = std::fs::read_dir(layout.bin_dir()) {
         for entry in listing.flatten() {
             let shim = entry.path();
-            let Some(target) = crate::platform::resolve_shim(&shim) else {
+            let read = crate::platform::read_shim(&shim);
+            let Some(target) = read.target else {
                 continue;
             };
             if let Some(n) = trust_tool_build(layout, &target) {
-                groups.entry(n).or_default().push((shim, target));
+                groups.entry(n).or_default().push(TrustShim {
+                    shim,
+                    target,
+                    env: read.env,
+                    body: read.body,
+                });
             }
         }
     }
     for shims in groups.values_mut() {
-        shims.sort();
+        shims.sort_by(|a, b| (&a.shim, &a.target).cmp(&(&b.shim, &b.target)));
     }
     groups
 }
@@ -906,28 +899,26 @@ pub fn inspect(layout: &Layout, build: u64) -> Option<Result<Inspection, String>
         };
         let mut shims = Vec::new();
         let mut unrouted = Vec::new();
-        for (shim, target) in trust_shims(layout).remove(&build).unwrap_or_default() {
+        for row in trust_shims(layout).remove(&build).unwrap_or_default() {
             // A shim whose target is not a regular file of the build has nothing to route
             // to (no root carries it, and [`route_for_shim`] answers `None`): it is a broken
             // shim, which doctor's own scan names, not an unrouted one.
-            if !std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_file()) {
+            if !std::fs::symlink_metadata(&row.target).is_ok_and(|m| m.is_file()) {
                 continue;
             }
-            let (Some(name), Some(file)) = (shim.file_name(), target.file_name()) else {
+            let (Some(name), Some(file)) = (row.shim.file_name(), row.target.file_name()) else {
                 continue;
             };
-            if is_stock_copy(&bin, &target) {
+            if is_stock_copy(&bin, &row.target) {
                 continue;
             }
             let name = name.to_string_lossy().into_owned();
             let want = crate::platform::sh_shim_content_routed(
-                &target,
-                &crate::platform::shim_env_of(&shim),
+                &row.target,
+                &row.env,
                 Some(&root.join("bin").join(file)),
             );
-            let routed =
-                crate::metadata_io::read_bounded_regular(&shim, crate::platform::MAX_SHIM_BYTES)
-                    .is_ok_and(|have| have == want.as_bytes());
+            let routed = row.body.as_deref() == Some(want.as_str());
             if !routed {
                 unrouted.push(name.clone());
             }

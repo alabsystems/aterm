@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::table::tests::frontier::{receive, wide_lab, wires};
+use crate::table::tests::frontier::{first_records, receive, wide_lab, wires};
 use astream_wire::sync::MAX_PARENTS;
 use aterm_json::json;
 
@@ -12,17 +12,30 @@ fn row(counter: u64) -> Value {
     json!({"counter": counter, "until": NOW + EPOCH_S, "claims": []})
 }
 
+/// Four writers write through the product path: the three this test works on and the last, past
+/// `LEGACY_MAX_MEMBERS`. The writers between them seal the same row ([`first_records`]), so every
+/// read and capacity check still runs on `MAX_PARENTS + 1` rows and heads.
+/// GAP: those 61 Macs stop running `write_at`'s pass (ring retirement, roll housekeeping and day
+/// table enrollment), so a defect only on a middle Mac is not seen; four Macs still run it.
 #[test]
 fn claim_frontier_admission_preserves_rows_and_both_capacity_limits() {
     let writers = MAX_PARENTS + 1;
+    let last = writers - 1;
     let lab = wide_lab(writers);
-    for paths in &lab.paths {
-        write_at(paths, &row(1), NOW, Caps::default()).unwrap();
+    let written = [0, 1, 2, last];
+    for writer in written {
+        write_at(&lab.paths[writer], &row(1), NOW, Caps::default()).unwrap();
     }
     let period = CLAIMS.epoch_of(NOW);
     let scope = CLAIMS.scope(lab.bootstrap(0).trust(), period).unwrap();
-    let originals = (0..writers)
+    let originals = written
+        .into_iter()
         .flat_map(|writer| wires(&lab, writer, scope))
+        .chain(first_records(&lab, 3..last, scope, |_, session| {
+            // The bytes `write_at` encodes.
+            let machine = me(session, &machines(session).unwrap()).unwrap();
+            encode(&command(&machine, &row(1)).unwrap()).unwrap()
+        }))
         .collect::<Vec<_>>();
     for writer in 0..3 {
         receive(&lab, writer, scope, &originals);

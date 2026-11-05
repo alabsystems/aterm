@@ -3017,33 +3017,43 @@ fn authenticated_readiness_reads_carried_lines_without_waiting() {
 }
 
 #[test]
-fn authenticated_readiness_drains_tail_then_observes_peer_eof() {
+fn authenticated_readiness_keeps_complete_lines_and_discards_a_cut_request() {
     use std::io::Write;
 
-    let (mut client, server) = CtlStream::pair().expect("real control socket pair");
-    server
-        .set_read_timeout(Some(std::time::Duration::from_millis(20)))
-        .expect("arm authenticated recv backstop");
-    let (tx, rx) = std::sync::mpsc::channel();
-    let reader_thread = std::thread::spawn(move || {
-        let mut unread = control_lanes::Unread::default();
-        let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
-        let tail = read_authenticated_request_line(&mut reader, &mut std::io::sink());
-        let eof = read_authenticated_request_line(&mut reader, &mut std::io::sink());
-        let _ = tx.send((tail, eof));
-    });
-    client.write_all(b"final tail").expect("unterminated line");
-    client
-        .shutdown(std::net::Shutdown::Write)
-        .expect("peer write-half close");
-    let result = rx.recv_timeout(EVENTUALLY);
-    let _ = client.shutdown(std::net::Shutdown::Both);
-    let Ok((tail, eof)) = result else {
-        panic!("peer EOF did not release the authenticated reader");
-    };
-    reader_thread.join().expect("reader exits");
-    assert_eq!(tail.as_deref(), Some("final tail"));
-    assert_eq!(eof, None);
+    for tail in ["cut request".to_string(), "x".repeat(12 * 1024)] {
+        let (mut client, server) = CtlStream::pair().expect("real control socket pair");
+        client
+            .set_write_timeout(Some(EVENTUALLY))
+            .expect("bound the frame writer by the hang detector");
+        server
+            .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+            .expect("arm authenticated recv backstop");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader_thread = std::thread::spawn(move || {
+            let mut unread = control_lanes::Unread::default();
+            let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
+            let complete = read_authenticated_request_line(&mut reader, &mut std::io::sink());
+            let tail = read_authenticated_request_line(&mut reader, &mut std::io::sink());
+            let eof = read_authenticated_request_line(&mut reader, &mut std::io::sink());
+            let _ = tx.send((complete, tail, eof));
+        });
+        client.write_all(b"version\n").expect("complete request");
+        client
+            .write_all(tail.as_bytes())
+            .expect("cut request prefix");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("peer write-half close");
+        let result = rx.recv_timeout(EVENTUALLY);
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        let Ok((complete, tail, eof)) = result else {
+            panic!("peer EOF did not release the authenticated reader");
+        };
+        reader_thread.join().expect("reader exits");
+        assert_eq!(complete.as_deref(), Some("version"));
+        assert_eq!(tail, None, "a cut request never becomes a complete command");
+        assert_eq!(eof, None);
+    }
 }
 
 #[test]
@@ -4803,6 +4813,70 @@ fn sessionless_front_paste_is_owner_bare_only_and_terminal_routing_is_unchanged(
 }
 
 #[test]
+fn sessionless_front_scroll_keeps_exact_targets_and_shared_grammar() {
+    for rest in [
+        "",
+        "top",
+        "bottom",
+        "up",
+        "down",
+        "prev-prompt",
+        "next-prompt",
+        "0",
+        "-7",
+        "2147483647",
+        "-2147483648",
+    ] {
+        let expected = Some(Ok(InputEvent::ScrollView(
+            parse_scroll_intent(rest).unwrap(),
+        )));
+        for selector in [None, Some(&Selector::SelfTok)] {
+            assert_eq!(
+                sessionless_front_scroll_event(
+                    rest,
+                    selector,
+                    false,
+                    NativeControlPrincipal::Owner,
+                ),
+                expected,
+            );
+        }
+    }
+    assert!(
+        sessionless_front_scroll_event("down", None, true, NativeControlPrincipal::Owner,)
+            .is_none(),
+        "a terminal front keeps its session route"
+    );
+    for line in [
+        "@7 scroll down",
+        "@0123456789abcdef0123456789abcdef scroll down",
+    ] {
+        let head = control_request::head(line);
+        assert!(
+            sessionless_front_scroll_event(
+                head.rest,
+                head.selector.as_ref(),
+                false,
+                NativeControlPrincipal::Owner,
+            )
+            .is_none(),
+            "an exact selector cannot become a native-front scroll: {line}"
+        );
+    }
+    assert_eq!(
+        sessionless_front_scroll_event("down", None, false, NativeControlPrincipal::Edge),
+        Some(Err("ERR denied\n".into())),
+    );
+    for rest in ["sideways", "2147483648", "-2147483649", "down 3"] {
+        assert_eq!(
+            sessionless_front_scroll_event(rest, None, false, NativeControlPrincipal::Owner),
+            Some(parse_scroll_intent(rest).map(InputEvent::ScrollView)),
+        );
+        assert!(parse_scroll_intent(rest).is_err());
+    }
+}
+
+#[test]
 fn sessionless_front_key_is_owner_bare_only_and_terminal_routing_is_unchanged() {
     let route = sessionless_front_key_event("down", None, false, NativeControlPrincipal::Owner)
         .expect("a native-front key is classified before session resolution")
@@ -5301,6 +5375,43 @@ fn the_fleet_gate_admits_only_fleet_verbs_with_no_selector_or_frame() {
                 None,
                 "{scope:?} {line:?}"
             );
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn background_setup_status_needs_no_fleet_grant_or_authority_elevation() {
+    let store = crate::session_store::new_store();
+    let _driving = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+        node: "03".repeat(16),
+        host: "mac-03".to_owned(),
+    });
+    for content in [false, true] {
+        for drive in [false, true] {
+            let scope = Scope::Fleet { content, drive };
+            let (request, admitted, action) =
+                drive_admission(Request::parse("setup status".to_owned()), scope, &store)
+                    .expect("an authenticated peer can observe setup without any session");
+            assert_eq!(admitted, scope, "a read never becomes owner authority");
+            assert!(action.is_none(), "no drive action is recorded");
+            assert!(fleet_refusal(&request, admitted).is_none());
+            let (routed, form) = route(request.head().verb, request.form()).unwrap();
+            assert_eq!(routed, Route::Meta, "no active terminal is resolved");
+            assert_eq!(form.row.op, aterm_types::control_verbs::OpClass::Read);
+            assert_eq!(form.row.input_class(), Input::NONE);
+
+            for line in [
+                "@self setup status",
+                "permissions walk now",
+                "sudo -- true",
+                "appnotice update hidden",
+            ] {
+                assert!(
+                    fleet_refusal(&Request::parse(line.to_owned()), scope).is_some(),
+                    "observing setup does not authorize {line:?}"
+                );
+            }
         }
     }
 }
@@ -6155,6 +6266,7 @@ fn escalated_op_fences_argument_dependent_seams() {
         "HoldSession",
         "LiftHold",
         "ToggleStatsLens",
+        "RecordUnseenKeys",
     ] {
         let refusal = super::control_media::invoke_refusal(name).expect("refused");
         assert!(refusal.starts_with("ERR denied"), "{name}: {refusal}");
@@ -7087,7 +7199,7 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         )),
         byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
         turns: observed.turns,
-        meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+        meta: Arc::default(),
         timeline: observed.timeline,
         fabric: std::sync::Arc::default(),
         idem: Default::default(),
@@ -7109,6 +7221,7 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         witness: Default::default(),
         fenced_writes: Default::default(),
         native_policy: Default::default(),
+        spawn_mark: Default::default(),
     });
     SessionHandle {
         sid,
@@ -10874,8 +10987,8 @@ fn read_request_line_strips_newline_and_cr() {
     assert_eq!(read_request_line(&mut reader).as_deref(), Some("crlf"));
     assert_eq!(
         read_request_line(&mut reader).as_deref(),
-        Some("last-no-nl"),
-        "EOF yields the tail"
+        None,
+        "EOF discards an incomplete request"
     );
     assert_eq!(read_request_line(&mut reader), None, "then EOF");
 }
@@ -11629,6 +11742,113 @@ fn typed_turn_with(
     );
     let verdict = out.lines().next().unwrap_or("").to_string();
     (verdict, keys.get(), enters.get())
+}
+
+/// A TURN FENCED ON THE PERSON SKIPS A KEY ITS FENCED ROWS NEVER SHOW (finding 1 of the review of the
+/// draft-hold work, `docs/measured/draft-hold-findings-2026-11-04.md`): Claude Code 2.1.318's
+/// Shift+Tab rewrites only its mode row, under the composer's bottom rule (`claude-2.1.318-footer-
+/// auto-idle` against `-footer-plan`, measured), so a turn fenced on the composer's rows (`if-rows=`)
+/// alone pasted and pressed Enter after it, inside the person's grace. With `if-human=` the count of
+/// the person's gestures the caller's read took, a key since stops the turn before its paste, or once
+/// pasted before its Enter, the text left unsubmitted. A repaint off the fenced rows that no person
+/// made moves neither fence.
+/// NEGATIVE CONTROLS: the compares before the paste dropped (under the fence's lock and after it),
+/// and the key-before arm pastes; the compare before the first press dropped, and the key-in-paste
+/// arm presses Enter.
+#[test]
+fn a_turn_fenced_on_the_person_skips_a_key_its_fenced_rows_never_show() {
+    use aterm_types::control_verbs::RowsFence;
+    use std::cell::{Cell, RefCell};
+    let frame = |text: &str| -> String {
+        let rows: Vec<&str> = text.lines().filter(|l| !l.starts_with("# ")).collect();
+        format!("\x1b[H\x1b[2J{}\x1b[7;3H", rows.join("\r\n"))
+    };
+    let idle = frame(include_str!(
+        "../../aterm-phase/src/fixtures/claude-2.1.318-footer-auto-idle.txt"
+    ));
+    let plan = frame(include_str!(
+        "../../aterm-phase/src/fixtures/claude-2.1.318-footer-plan.txt"
+    ));
+    // (arm, the person's key before the turn, their key inside its paste, if-human=) ->
+    // (its verdict's head, pasted, Enters)
+    let run = |before: bool, in_paste: bool, human: bool| -> (String, usize, usize) {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let term = &h.term;
+        term.lock().unwrap().process(idle.as_bytes());
+        let hash = crate::control::rows_hash(&term.lock().unwrap(), 5, 7).expect("in the grid");
+        let fence = RowsFence {
+            first: 5,
+            last: 7,
+            hash,
+        };
+        let base = h.ctx.human_input.seq();
+        let shift_tab = || {
+            h.ctx
+                .human_input
+                .note(crate::metrics::now_us(), crate::human_input::Gesture::Typed);
+            term.lock().unwrap().process(plan.as_bytes());
+        };
+        if before {
+            shift_tab();
+        }
+        let pasted: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let enters = Cell::new(0usize);
+        let paste = |text: &str| {
+            pasted.borrow_mut().push(text.to_string());
+            if in_paste {
+                shift_tab();
+            }
+            term.lock().unwrap().process(text.as_bytes());
+            true
+        };
+        let press = |_: &str| {
+            enters.set(enters.get() + 1);
+            term.lock().unwrap().process(b"\r\n\x1b[2Kresponse\r\n");
+            true
+        };
+        let io = TurnIo {
+            paste: &paste,
+            press: &press,
+            ..TurnIo::paste_only()
+        };
+        let human = if human {
+            format!("if-human={base} ")
+        } else {
+            String::new()
+        };
+        let out = cmd_turn(
+            term,
+            &store,
+            0,
+            &format!("if-rows={fence} {human}submit_verify=seq idle=20 timeout=60000 hello"),
+            &h.ctx,
+            &io,
+        );
+        let head = out.lines().next().unwrap_or_default().to_string();
+        let n = pasted.borrow().len();
+        (head, n, enters.get())
+    };
+    let (head, pasted, enters) = run(true, false, true);
+    assert!(
+        head.starts_with("OK 0 turn skipped reason=person submitted=0 seq="),
+        "a key before the turn: {head}"
+    );
+    assert_eq!((pasted, enters), (0, 0), "a key before the turn: {head}");
+    let (head, pasted, enters) = run(false, true, true);
+    assert!(
+        head.starts_with("OK 0 turn skipped reason=person typed=0 pasted=5 submitted=0 seq="),
+        "a key in the paste: {head}"
+    );
+    assert_eq!((pasted, enters), (1, 0), "a key in the paste: {head}");
+    let (head, pasted, enters) = run(false, false, true);
+    assert!(head.contains(" submitted=1 "), "no key: {head}");
+    assert_eq!((pasted, enters), (1, 1), "no key: {head}");
+    // The line an older caller sends, the person's count left out: the defect, as it stood.
+    let (head, pasted, enters) = run(true, false, false);
+    assert!(head.contains(" submitted=1 "), "no if-human=: {head}");
+    assert_eq!((pasted, enters), (1, 1), "no if-human=: {head}");
 }
 
 #[test]
@@ -13110,7 +13330,9 @@ fn turn_settle_gone_rows() {
 #[test]
 fn turn_reports_only_the_exact_retained_shell_block_witness() {
     const PROMPT: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07";
-    for scenario in ["complete", "running", "multiple", "reset", "screen"] {
+    for scenario in [
+        "complete", "running", "multiple", "reset", "erased", "screen",
+    ] {
         let store = session_store::new_store();
         let h = registered_session(0, -1, PROMPT);
         store.write().unwrap().register(h.clone());
@@ -13135,6 +13357,13 @@ fn turn_reports_only_the_exact_retained_shell_block_witness() {
                     t.process(b"again\r\n\x1b]133;C\x07");
                 } else if scenario == "reset" {
                     t.reset();
+                } else if scenario == "erased" {
+                    t.process(&b"\r\n".repeat(30));
+                    t.process(b"\x1b[3J");
+                    assert!(
+                        t.all_blocks().all(|b| b.id != block),
+                        "PRECONDITION: the erase took the command's block"
+                    );
                 }
             }
             true
@@ -13168,8 +13397,14 @@ fn turn_reports_only_the_exact_retained_shell_block_witness() {
             verdict.contains(&format!(" submit_by={expected}")),
             "{scenario}: {out}"
         );
-        if matches!(scenario, "complete" | "running") {
-            assert_eq!(reported, Some(block.to_string().as_str()), "{out}");
+        // A reset keeps the shell's block as `clear` does (it is the shell's, not the program's);
+        // an erase of the history it scrolled into takes it, and then no block is the witness.
+        if matches!(scenario, "complete" | "running" | "reset") {
+            assert_eq!(
+                reported,
+                Some(block.to_string().as_str()),
+                "{scenario}: {out}"
+            );
         } else {
             assert!(reported.is_none(), "{scenario}: {out}");
         }
@@ -13915,17 +14150,34 @@ fn turn_submit_verification_rows() {
             control: None,
         },
         Row {
-            label: "auto stays strict after a reset took the started blocks",
+            label: "auto stays strict after an erase took the started blocks",
+            seed: [
+                COMMAND,
+                PROMPT,
+                b"\r\n".repeat(30).as_slice(),
+                b"\x1b[3J",
+                PROMPT,
+            ]
+            .concat(),
+            paints: &[b"\r\n[bg] tick"],
+            options: "idle=50 timeout=60000 submit_window=120 presses=2 run",
+            verdict: "submitted=0",
+            presses: 2,
+            why: "strictness holds — the erased stream is not a desynced one",
+            control: Some((
+                |before, _| before.started_blocks == 0,
+                "no started block left at the press: AUTO would degrade to submitted=1",
+            )),
+        },
+        Row {
+            label: "auto stays strict across a reset",
             seed: [COMMAND, b"\x1bc", PROMPT].concat(),
             paints: &[b"\r\n[bg] tick"],
             options: "idle=50 timeout=60000 submit_window=120 presses=2 run",
             verdict: "submitted=0",
             presses: 2,
             why: "strictness holds — the reset stream is not a desynced one",
-            control: Some((
-                |before, _| before.started_blocks == 0,
-                "no started block left at the press: AUTO would degrade to submitted=1",
-            )),
+            control: None,
         },
         Row {
             label: "a shell with no integration takes the line: its echo moves the cursor down",
@@ -16379,13 +16631,14 @@ fn feed_idempotent_an_empty_keyed_payload_consumes_no_sequence() {
 #[test]
 fn owner_and_bridge_differ_at_whoami_and_at_caller_actor() {
     let h = registered_session(0, -1, b"");
+    let store = crate::session_store::new_store();
     assert_eq!(
-        control_session::caller_actor(Scope::Owner, &h.ctx),
+        control_session::caller_actor_of(Scope::Owner, Some(&h.ctx), &store),
         crate::session_store::ExitActor::Ctl,
         "an owner-token close is attributed to a ctl client"
     );
     assert_eq!(
-        control_session::caller_actor(Scope::Bridge, &h.ctx),
+        control_session::caller_actor_of(Scope::Bridge, Some(&h.ctx), &store),
         crate::session_store::ExitActor::Bridge,
         "a bridge close is attributed to the bridge"
     );
@@ -17928,6 +18181,171 @@ fn log_and_brief_answer_a_closed_session_for_the_owner() {
     );
 }
 
+/// `result`, `task` and `await task` ANSWER FOR A WORKER THE REAPER CLOSED, BY ITS SID OR THE
+/// LOCAL ID IT HAD, to its owner and to an edge its session granted a read: what it left outlives
+/// its tab while its retired row stands, a Dismiss included, read as a live worker's is, and a wait
+/// on it answers at once with its end, beside a live target's row in the list's order. CONTROL: an
+/// edge granted nothing; a worker a person closed, which keeps no row; a sid no session had.
+#[test]
+fn a_worker_the_reaper_closed_answers_its_managers_reads_from_its_retired_row() {
+    use super::{ActiveHandle, Scope, Selector, closed_session_reply, dispatch_await_task};
+    use crate::task_record::{TaskMark, TaskState};
+    use crate::worker_reaper::tests::{live, worker_tab};
+    let mut app = crate::App::headless_for_test();
+    let reaped = worker_tab(&mut app);
+    let closed = worker_tab(&mut app);
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-retired-result-")
+        .tempdir()
+        .expect("scratch");
+    let mut since = std::time::Instant::now();
+    let mut sids = Vec::new();
+    for (session, stem) in [(reaped, "s-reaped-1"), (closed, "s-closed-1")] {
+        let snap = aterm_agent::harness::result::snapshot_screen(
+            &dir.path().join("tasks"),
+            stem,
+            "claude",
+            "Fixed the parser.",
+            aterm_agent::harness::result::DoneBy::Turn,
+        )
+        .expect("written");
+        let handle = live(&app, session);
+        let done = TaskMark {
+            why: Some(crate::task_record::WHY_LANDED),
+            result_bytes: snap.bytes,
+            result_path: Some(snap.path.clone()),
+            ..TaskMark::new(TaskState::Done)
+        };
+        let (record, _) =
+            crate::task_record::mark_session_task(&handle.ctx, session, &done).expect("unfenced");
+        since = since.max(record.since);
+        sids.push((handle.sid.clone(), snap.path));
+    }
+    // A manager in another session holds a read of the worker, as a live one's edge does.
+    let granted = {
+        let handle = live(&app, reaped);
+        let token = handle.ctx.edges.lock().unwrap().grant(
+            SessionId::new("s-test-manager"),
+            handle.sid.clone(),
+            Op::ReadScreen,
+            handle.ctx.nonce,
+        );
+        Scope::Edge(token)
+    };
+    let answer = aterm_agent::harness::result::answer(&sids[0].1, false);
+    assert!(answer.starts_with("OK "), "{answer}");
+    assert!(app.close_session_tab_for_test(closed));
+    let steps = app.reap_workers(since + crate::worker_reaper::LINGER);
+    assert_eq!(steps, [(reaped, crate::worker_reaper::Ending::ClosePane)]);
+
+    let sid = sids[0].0.as_str();
+    let by_sid = Selector::parse(sid);
+    for scope in [Scope::Owner, granted] {
+        for selector in [by_sid, Selector::Local(reaped)] {
+            assert_eq!(
+                closed_session_reply(Some(&selector), "result", "", &app.store, scope),
+                answer
+            );
+        }
+    }
+    assert_eq!(
+        closed_session_reply(Some(&by_sid), "result", "bogus", &app.store, Scope::Owner),
+        crate::task_record::RESULT_USAGE
+    );
+    let task = closed_session_reply(Some(&by_sid), "task", "", &app.store, Scope::Owner);
+    assert!(
+        task.starts_with("OK task rev=")
+            && task.contains(" state=done ")
+            && task.contains(" conclusion=finished")
+            && task.ends_with(" agent=- program_state=- attention=-\n"),
+        "{task}"
+    );
+    assert_eq!(
+        closed_session_reply(Some(&by_sid), "task", "mark done", &app.store, Scope::Owner),
+        "ERR no such session\n",
+        "a mark has no session to land in"
+    );
+
+    // A live worker with no news yet, a wait's other target.
+    let waiting = worker_tab(&mut app);
+    let waiting = live(&app, waiting).sid;
+    let active: ActiveHandle = Arc::default();
+    let wait = |list: String, scope: Scope| {
+        let words: Vec<&str> = list.split_whitespace().collect();
+        dispatch_await_task(&words, &active, &app.store, scope)
+    };
+    let reply = wait(format!("@{sid}:1 timeout=60000"), Scope::Owner);
+    let rows: Vec<&str> = reply.lines().collect();
+    assert_eq!(rows.first(), Some(&"OK 1"), "{reply}");
+    let ended = rows[1].to_string();
+    assert!(
+        ended.starts_with(&format!("@{sid} rev="))
+            && ended.contains(" state=closed ")
+            && ended.contains(" conclusion=finished")
+            && ended.ends_with(" task_news=1"),
+        "{reply}"
+    );
+    assert_eq!(
+        wait(format!("@{sid}"), granted),
+        reply,
+        "the edge's wait too"
+    );
+    let reply = wait(
+        format!("@{},@{sid} any timeout=60000", waiting.as_str()),
+        Scope::Owner,
+    );
+    let rows: Vec<&str> = reply.lines().collect();
+    assert_eq!(rows.len(), 3, "{reply}");
+    assert_eq!(rows[0], "OK 2", "{reply}");
+    assert!(
+        rows[1].starts_with(&format!("@{} ", waiting.as_str()))
+            && rows[1].ends_with(" task_news=0"),
+        "{reply}"
+    );
+    assert_eq!(rows[2], ended, "{reply}");
+
+    let ungranted = Scope::Edge(aterm_session::EdgeToken::generate());
+    assert_eq!(
+        closed_session_reply(Some(&by_sid), "result", "", &app.store, ungranted),
+        "ERR no such session\n",
+        "CONTROL: an edge granted nothing"
+    );
+    assert_eq!(
+        wait(format!("@{sid}"), ungranted),
+        format!("ERR no such session @{sid}\n"),
+        "CONTROL: an edge granted nothing waits on nothing"
+    );
+    let by_hand = sids[1].0.as_str();
+    assert_eq!(
+        closed_session_reply(
+            Some(&Selector::parse(by_hand)),
+            "result",
+            "",
+            &app.store,
+            Scope::Owner
+        ),
+        "ERR no such session\n",
+        "CONTROL: a person's close keeps nothing"
+    );
+    assert_eq!(
+        wait(format!("@{sid},@{by_hand}"), Scope::Owner),
+        format!("ERR no such session @{by_hand}\n"),
+        "CONTROL: a person's close keeps nothing to wait on"
+    );
+    let never = aterm_session::SessionId::generate();
+    assert_eq!(
+        wait(format!("@{}", never.as_str()), Scope::Owner),
+        format!("ERR no such session @{}\n", never.as_str()),
+        "CONTROL: a sid no session had"
+    );
+    app.dismiss_finished(reaped);
+    assert_eq!(
+        closed_session_reply(Some(&by_sid), "result", "", &app.store, Scope::Owner),
+        answer,
+        "a Dismiss takes the row off the page, not what it left"
+    );
+}
+
 #[test]
 fn a_close_wakes_its_watchers_only_once_its_log_is_kept() {
     use std::sync::atomic::Ordering;
@@ -19179,6 +19597,53 @@ fn a_guarded_submit_into_a_busy_sink_after_typing_keeps_its_id_in_doubt() {
     );
     assert_eq!(turn(), "ERR in-doubt seq=1\n");
     assert_eq!(pastes.get(), 1, "typed exactly once");
+}
+
+/// A guarded submit fenced on the person (`if-human=`) judges the person under the lock at every
+/// try of its Enter, the retries the busy sink calls for included: a gesture while the sink takes
+/// none of the Enter cuts the turn (`reason=person`, the text left standing), never an Enter after
+/// it. NEGATIVE CONTROL: `guarded_submit` without the person in its fence, and the retries run the
+/// window out (`TURN_SUBMIT_BUSY_LINE`).
+#[test]
+#[cfg(unix)]
+fn a_guarded_submit_fenced_on_the_person_stops_at_a_gesture_in_its_busy_retries() {
+    let store = session_store::new_store();
+    // No nonblocking master: every immediate write of the Enter is `BusyZero`.
+    let h = registered_session(0, -1, b"> ");
+    store.write().unwrap().register(h.clone());
+    let seen = h.ctx.human_input.seq();
+    let (pasted, paste_seen) = std::sync::mpsc::channel::<()>();
+    let reply = std::thread::scope(|s| {
+        let ctx = &h.ctx;
+        // The gesture comes once the text is in, so the turn has pasted it whichever check reads
+        // the person; given time, the check is the Enter's retries'. A turn that never pastes drops
+        // the sender, and the gesture is never made.
+        s.spawn(move || {
+            if paste_seen.recv().is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                ctx.human_input
+                    .note(crate::metrics::now_us(), crate::human_input::Gesture::Typed);
+            }
+        });
+        let paste = move |_: &str| pasted.send(()).is_ok();
+        cmd_turn(
+            &h.term,
+            &store,
+            0,
+            &format!(
+                "submit=guarded:^> submit_window=60000 idle=5 timeout=60000 if-human={seen} hi"
+            ),
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                ..TurnIo::paste_only()
+            },
+        )
+    });
+    assert!(
+        reply.starts_with("OK 0 turn skipped reason=person typed=0 pasted=2 submitted=0"),
+        "{reply}"
+    );
 }
 
 /// A guarded re-press the sink takes none of, after an earlier Enter went, stops the re-presses
@@ -20761,6 +21226,53 @@ fn the_autopilot_words_meta_lines_wait_on_the_journal() {
     );
 }
 
+/// A DRIVE READS WHAT A WORKER THE DRIVEN MAC'S REAPER CLOSED LEFT ([`crate::retired_workers`]):
+/// `@<sid> result` and an `await task` naming its sid pass the gate, read as Owner, as a hosted
+/// worker's do. CONTROL: every other verb on it; a sid nothing hosts or kept.
+#[test]
+fn a_drive_reads_a_reaped_workers_result_and_waits_on_its_end() {
+    const W: &str = "s-00000000000000aa";
+    const GONE: &str = "s-00000000000000dd";
+    const NEVER: &str = "s-00000000000000ee";
+    let hosts = |sid: &SessionId| sid.as_str() == W;
+    let kept = |sid: &SessionId| sid.as_str() == GONE;
+    let no = |_: &SessionId| false;
+    let gate = |line: &str| drive_gate(line, &hosts, &no, &no, &kept);
+    for line in [
+        format!("@{GONE} result"),
+        format!("@{GONE} result full"),
+        format!("await task @{GONE},@{W} since=0"),
+        format!("await task @{GONE}:3 any"),
+    ] {
+        assert_eq!(
+            gate(&line),
+            Ok(DriveLine::Act {
+                line: line.clone(),
+                write: None
+            }),
+            "{line}"
+        );
+    }
+    for verb in ["status", "text", "post hi", "turn hi", "key enter", "close"] {
+        let line = format!("@{GONE} {verb}");
+        let refused = gate(&line).expect_err(&line);
+        assert!(
+            refused.contains("answers only @<sid> result and await task"),
+            "CONTROL: {refused}"
+        );
+    }
+    assert_eq!(
+        gate(&format!("await task @{NEVER}")),
+        Ok(DriveLine::Answer(format!("ERR no such session @{NEVER}\n"))),
+        "CONTROL: a sid nothing kept"
+    );
+    let refused = gate(&format!("@{NEVER} result")).expect_err("never");
+    assert!(
+        refused.contains("the driven Mac hosts"),
+        "CONTROL: {refused}"
+    );
+}
+
 #[test]
 fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
     const W: &str = "s-00000000000000aa";
@@ -20769,13 +21281,22 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
     const CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
     let hosts = |sid: &SessionId| [W, MINE].contains(&sid.as_str());
     let spawned = |sid: &SessionId| sid.as_str() == W;
-    let gate = |line: &str| drive_gate(line, &hosts, &spawned, &|_| false);
+    let gate = |line: &str| drive_gate(line, &hosts, &spawned, &|_| false, &|_| false);
     let wrote = |line: &str| match gate(line) {
         Ok(DriveLine::Act { write, .. }) => write.map(|act| act.verb),
         other => panic!("{line:?} was not admitted: {other:?}"),
     };
     assert_eq!(gate("survey"), Ok(DriveLine::Fleet));
     assert_eq!(gate("version"), Ok(DriveLine::Fleet));
+    // A board is read whole, as Owner; its accept and its formatting are its own Mac's client's.
+    assert_eq!(wrote("board"), None);
+    for refused in [
+        "board accept @s-00000000000000aa passed",
+        "board --json",
+        "@s-00000000000000aa board",
+    ] {
+        assert!(gate(refused).is_err(), "{refused}");
+    }
     #[cfg(unix)]
     {
         assert_eq!(wrote("vault status"), None);
@@ -20997,7 +21518,7 @@ fn every_drive_refusal_names_the_word_it_refuses() {
     const CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
     let hosts = |sid: &SessionId| [W, MINE].contains(&sid.as_str());
     let spawned = |sid: &SessionId| sid.as_str() == W;
-    let gate = |line: &str| drive_gate(line, &hosts, &spawned, &|_| false);
+    let gate = |line: &str| drive_gate(line, &hosts, &spawned, &|_| false, &|_| false);
     // Each refused line and the word its refusal names.
     let mut refusals: Vec<(String, String)> = [
         ("spawn agent=claude identity=x len=5", "identity=x"),
@@ -21060,7 +21581,7 @@ fn every_drive_refusal_names_the_word_it_refuses() {
         .collect();
     // A read of the driver's own untouched shell that its grammar refuses.
     let read = format!("@{W} blocks many");
-    let refused = drive_gate(&read, &hosts, &spawned, &|_| true).expect_err(&read);
+    let refused = drive_gate(&read, &hosts, &spawned, &|_| true, &|_| false).expect_err(&read);
     if !refused.contains("`blocks many`") {
         unnamed.push(format!("{read:?} names no `blocks many`: {refused:?}"));
     }
@@ -21466,9 +21987,10 @@ fn a_still_hosted_workers_old_file_outlives_the_prune() {
 #[test]
 fn a_drives_close_named_after_its_verb_is_told_the_form() {
     let no = |_: &SessionId| false;
-    let refusal = drive_gate("close s-00000000000000aa", &no, &no, &no).expect_err("no selector");
+    let refusal =
+        drive_gate("close s-00000000000000aa", &no, &no, &no, &|_| false).expect_err("no selector");
     assert!(refusal.contains("@s-… close"), "{refusal}");
-    let other = drive_gate("frobnicate", &no, &no, &no).expect_err("another verb");
+    let other = drive_gate("frobnicate", &no, &no, &no, &|_| false).expect_err("another verb");
     assert!(!other.contains("@s-… close"), "{other}");
 }
 
@@ -21548,7 +22070,7 @@ fn a_signal_names_the_program_that_asked_it_but_never_the_harness() {
 #[test]
 fn plain_fleet_shell_grammar_cannot_carry_commands_tasks_or_extra_placement() {
     let no = |_: &SessionId| false;
-    let gate = |line: &str| drive_gate(line, &no, &no, &no);
+    let gate = |line: &str| drive_gate(line, &no, &no, &no, &|_| false);
     let Ok(DriveLine::Act {
         line,
         write: Some(act),
@@ -21593,9 +22115,12 @@ fn owned_shell_history_and_waits_are_bounded_and_not_granted_to_workers() {
         "await block timeout=0",
     ] {
         let line = format!("@{sid} {rest}");
-        assert!(drive_gate(&line, &hosts, &hosts, &hosts).is_ok(), "{line}");
         assert!(
-            drive_gate(&line, &hosts, &hosts, &|_| false).is_err(),
+            drive_gate(&line, &hosts, &hosts, &hosts, &|_| false).is_ok(),
+            "{line}"
+        );
+        assert!(
+            drive_gate(&line, &hosts, &hosts, &|_| false, &|_| false).is_err(),
             "worker: {line}"
         );
     }
@@ -21611,7 +22136,10 @@ fn owned_shell_history_and_waits_are_bounded_and_not_granted_to_workers() {
         "await match secret timeout=1",
     ] {
         let line = format!("@{sid} {rest}");
-        assert!(drive_gate(&line, &hosts, &hosts, &hosts).is_err(), "{line}");
+        assert!(
+            drive_gate(&line, &hosts, &hosts, &hosts, &|_| false).is_err(),
+            "{line}"
+        );
     }
 }
 
@@ -21783,5 +22311,149 @@ fn sys_escalates_its_owner_only_forms_by_its_own_parser() {
     }
 }
 
+/// A DRIVE'S `cwd=~/…` IS A FOLDER OF THIS MAC'S HOME: resolved against the home the drive is
+/// given, the spawn runs with that folder, canonical, quoted where it holds a space. Refused, each
+/// by its own words: a folder that is not there (or a file), a link that leads out of the home,
+/// a path that climbs (`..`), another account's home (`~bob`), a folder macOS guards (never looked
+/// into) and a Mac that names no home. NEGATIVE CONTROL: an absolute `cwd=` passes as it came.
+#[cfg(unix)]
+#[test]
+fn a_drives_home_relative_cwd_resolves_in_this_macs_home_and_stays_there() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let home = tmp.path().join("home");
+    for dir in ["trust/src", "My Project"] {
+        std::fs::create_dir_all(home.join(dir)).expect("a folder");
+    }
+    std::fs::create_dir_all(tmp.path().join("outside")).expect("outside");
+    std::os::unix::fs::symlink(tmp.path().join("outside"), home.join("out")).expect("a link");
+    std::fs::write(home.join("file"), "").expect("a file");
+    let real = |p: &str| {
+        std::fs::canonicalize(home.join(p))
+            .expect("canonical")
+            .display()
+            .to_string()
+    };
+    let no = |_: &SessionId| false;
+    let spawn = |rest: &str, home: Option<&std::path::Path>| {
+        drive_spawn(&format!("spawn {rest}"), rest, &no, home)
+    };
+    let here = Some(home.as_path());
+    assert_eq!(
+        spawn("agent=claude cwd=$HOME/trust len=5", here).expect("a worker in $HOME/trust"),
+        format!("spawn agent=claude cwd={} len=5 raise=false", real("trust"))
+    );
+    assert_eq!(
+        spawn("cwd=$HOME/trust/src/", here).expect("a shell in $HOME/trust/src"),
+        format!("spawn cwd={} raise=false", real("trust/src"))
+    );
+    assert_eq!(
+        spawn("cwd=\"~/My Project\" raise=false", here).expect("a folder with a space"),
+        format!("spawn cwd=\"{}\" raise=false", real("My Project"))
+    );
+    assert_eq!(
+        spawn("cwd=~", here).expect("the home itself"),
+        format!("spawn cwd={} raise=false", real(""))
+    );
+    for (rest, said) in [
+        ("cwd=~/missing", "no such folder ~/missing"),
+        ("agent=claude cwd=~/file len=5", "no such folder ~/file"),
+        ("cwd=~/out", "leaves this Mac's home"),
+        ("cwd=$HOME/trust/../../outside", "may leave the home"),
+        ("cwd=~bob/trust", "another account's home"),
+        ("agent=claude cwd=~/Documents/x len=5", "macOS guards"),
+    ] {
+        let refused = spawn(rest, here).expect_err(rest);
+        assert!(refused.contains(said), "{rest}: {refused}");
+    }
+    // Links are followed by hand: one within the home (or out and back in) resolves; one into a
+    // folder macOS guards is refused before any look there (its target need not exist), and a
+    // loop names no folder.
+    std::os::unix::fs::symlink("trust", home.join("t")).expect("a link in");
+    std::os::unix::fs::symlink("../home/trust/src", home.join("back")).expect("out and back");
+    std::os::unix::fs::symlink(home.join("Documents/never"), home.join("docs")).expect("guarded");
+    std::os::unix::fs::symlink("/Volumes/never", home.join("vol")).expect("a volume");
+    // The data volume's spelling of a guarded folder (a firmlink reaches it as the home's own).
+    let canonical = std::fs::canonicalize(&home).expect("the home, canonical");
+    std::os::unix::fs::symlink(
+        std::path::Path::new("/System/Volumes/Data")
+            .join(canonical.strip_prefix("/").expect("absolute"))
+            .join("Documents/never"),
+        home.join("data"),
+    )
+    .expect("a guarded folder by the data volume");
+    std::os::unix::fs::symlink("loop", home.join("loop")).expect("a loop");
+    assert_eq!(
+        spawn("cwd=~/t", here).expect("a link to $HOME/trust"),
+        format!("spawn cwd={} raise=false", real("trust"))
+    );
+    assert_eq!(
+        spawn("cwd=~/back", here).expect("out and back in"),
+        format!("spawn cwd={} raise=false", real("trust/src"))
+    );
+    for (rest, said) in [
+        ("cwd=~/docs", "for a folder macOS guards"),
+        ("cwd=~/vol", "for a folder macOS guards"),
+        ("cwd=~/data", "for a folder macOS guards"),
+        ("cwd=~/loop", "no such folder ~/loop"),
+        ("cwd=$HOME/trust cwd=/private/tmp", "names one cwd="),
+        (
+            "agent=claude cwd=/private/tmp cwd=$HOME/trust len=5",
+            "names one cwd=",
+        ),
+    ] {
+        let refused = spawn(rest, here).expect_err(rest);
+        assert!(refused.contains(said), "{rest}: {refused}");
+    }
+    // The line the gate passes splits into exactly the words it judged: a quoted word whose key
+    // holds a space (a second `cwd=`, an `agent=` the plain-shell check never saw) or a folder
+    // whose name holds a quote would split into other words once rejoined, so each is refused.
+    std::fs::create_dir_all(home.join("x=\"")).expect("a folder named with a quote");
+    std::os::unix::fs::symlink("x=\"", home.join("q")).expect("a link to it");
+    for (rest, said) in [
+        (
+            "agent=claude cwd=$HOME/trust \" cwd=/private/tmp\" len=5",
+            "a space outside its value",
+        ),
+        (
+            "cwd=$HOME/trust \" agent=claude\" len=5",
+            "a space outside its value",
+        ),
+        ("cwd=$HOME/trust \"a b\"", "a space outside its value"),
+        ("agent=claude cwd=~/q len=5", "holds a quote"),
+        ("cwd=~/q agent=claude\"", "holds a quote"),
+    ] {
+        let refused = spawn(rest, here).expect_err(rest);
+        assert!(refused.contains(said), "{rest}: {refused}");
+    }
+    let homeless = spawn("cwd=$HOME/trust", None).expect_err("no home");
+    assert!(homeless.contains("cannot name"), "{homeless}");
+    let absolute = format!("agent=claude cwd={} len=5", tmp.path().display());
+    assert_eq!(
+        spawn(&absolute, None).expect("an absolute cwd"),
+        format!("spawn {absolute} raise=false")
+    );
+}
+
 #[path = "control_whole_frame_tests.rs"]
 mod whole_frame;
+
+/// `board` reads this Mac's board from its state folder, its header first; any word after it is
+/// a usage error (the client formats `--json` and writes `board accept` itself).
+#[test]
+fn board_answers_this_macs_board_and_takes_no_words() {
+    let reply = board_reply("");
+    assert!(reply.starts_with("OK "), "{reply}");
+    assert!(
+        reply
+            .lines()
+            .nth(1)
+            .is_some_and(|header| header.starts_with("board host=")),
+        "{reply}"
+    );
+    for words in ["--json", "accept @s-00000000000000aa passed"] {
+        assert!(
+            board_reply(words).starts_with("ERR usage: board"),
+            "{words}"
+        );
+    }
+}

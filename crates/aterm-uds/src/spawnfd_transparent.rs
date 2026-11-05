@@ -55,6 +55,7 @@ pub struct TransparentCommand {
     args: Vec<OsString>,
     /// Variables set over this process's environment, in the order they were set.
     env: Vec<(OsString, OsString)>,
+    inherit_env: bool,
 }
 
 /// A [`TransparentCommand`] for `program`.
@@ -65,6 +66,7 @@ pub fn transparent(program: impl AsRef<OsStr>) -> TransparentCommand {
         arg0: None,
         args: Vec::new(),
         env: Vec::new(),
+        inherit_env: true,
     }
 }
 
@@ -81,12 +83,19 @@ impl TransparentCommand {
         if let Some(arg0) = self.arg0 {
             command.arg0(arg0);
         }
+        if !self.inherit_env {
+            command.env_clear();
+        }
         command.args(self.args).envs(self.env);
         command
     }
 
     fn image(&self) -> io::Result<Image> {
-        let mut env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let mut env: Vec<(OsString, OsString)> = if self.inherit_env {
+            std::env::vars_os().collect()
+        } else {
+            Vec::new()
+        };
         for (key, value) in &self.env {
             match env.iter_mut().find(|(k, _)| k == key) {
                 Some(slot) => slot.1.clone_from(value),
@@ -137,12 +146,26 @@ impl TransparentCommand {
         self
     }
 
-    /// Set `key` to `value` in the child's environment, over this process's own (the rest of
-    /// which the child inherits, as `std::process::Command::env` does); a later set of the same
-    /// key wins.
+    /// Set `key` to `value` in the child's environment; a later set of the same key wins.
+    /// The remaining environment is inherited unless [`Self::env_exactly`] replaced it.
     pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
         self.env
             .push((key.as_ref().to_owned(), value.as_ref().to_owned()));
+        self
+    }
+
+    /// Replace the complete child environment; later [`Self::env`] calls overlay it.
+    pub fn env_exactly<I, K, V>(&mut self, vars: I) -> &mut Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.inherit_env = false;
+        self.env.clear();
+        for (name, value) in vars {
+            self.env(name, value);
+        }
         self
     }
 
@@ -220,5 +243,30 @@ impl TransparentCommand {
     /// As [`Self::spawn`]'s, and waiting.
     pub fn status(&mut self) -> io::Result<ExitStatus> {
         self.spawn()?.wait()
+    }
+}
+
+#[cfg(test)]
+mod exact_environment_tests {
+    use super::*;
+    #[test]
+    fn exact_environment_drops_inheritance_and_later_exports_overlay_it() {
+        let mut command = transparent("/bin/sh");
+        command.env("BEFORE", "discard");
+        command.env_exactly([("ONLY", "first")]).env("ONLY", "last");
+        let image = command.image().unwrap();
+        assert_eq!(image.envp.len(), 1);
+        assert!(image.envp[0].as_bytes() == b"ONLY=last");
+        command.env_exactly(std::iter::empty::<(&str, &str)>());
+        assert!(command.image().unwrap().envp.is_empty());
+    }
+    #[test]
+    fn configurable_conversion_preserves_exact_environment_and_overlays() {
+        let mut command = transparent("/usr/bin/env");
+        command.env("BEFORE", "discard");
+        command.env_exactly([("ONLY", "first")]).env("ONLY", "last");
+        let output = command.into_command().output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout == b"ONLY=last\n");
     }
 }

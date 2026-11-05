@@ -870,7 +870,7 @@ mod freedesktop {
             open: impl Fn() -> aterm_dbus::Result<Connection> + Send + 'static,
             clicked: impl Fn(crate::Wake) + Send + 'static,
         ) -> Option<Self> {
-            let pair = UnixStream::pair().and_then(|(wake, rung)| {
+            let pair = aterm_uds::kept_out(UnixStream::pair).and_then(|(wake, rung)| {
                 wake.set_nonblocking(true)?;
                 rung.set_nonblocking(true)?;
                 Ok((wake, rung))
@@ -1834,7 +1834,7 @@ mod tests {
 
         fn server(&self) -> aterm_dbus::Connection {
             use aterm_dbus::{Connection, Message, Value};
-            let mut server = Connection::open(&self.addresses).unwrap();
+            let mut server = Connection::open_within(&self.addresses, HANG).unwrap();
             let owned = server
                 .call(
                     Message::method_call(
@@ -1878,7 +1878,7 @@ mod tests {
         });
 
         let mut bus = super::freedesktop::Bus { conn: None };
-        let open = || Connection::open(&private.addresses);
+        let open = || Connection::open_within(&private.addresses, HANG);
         let loud = super::freedesktop::notify_call("build", "done <b>&</b>", false, true).unwrap();
         let posted = bus.notify(&loud, HANG, &open, None, &mut |_| {});
         assert_eq!(
@@ -2150,7 +2150,7 @@ mod tests {
         let (woke, wakes) = std::sync::mpsc::channel();
         let addresses = private.addresses.clone();
         let poster = super::freedesktop::Poster::start(
-            move || Connection::open(&addresses),
+            move || Connection::open_within(&addresses, HANG),
             move |wake| {
                 let _ = woke.send(wake);
             },
@@ -2265,7 +2265,7 @@ mod tests {
         let (woke, wakes) = std::sync::mpsc::channel();
         let addresses = private.addresses.clone();
         let poster = super::freedesktop::Poster::start(
-            move || Connection::open(&addresses),
+            move || Connection::open_within(&addresses, HANG),
             move |wake| {
                 let _ = woke.send(wake);
             },

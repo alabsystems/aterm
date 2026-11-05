@@ -59,7 +59,8 @@ mod on {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt as _;
-                open.mode(0o600);
+                open.mode(0o600)
+                    .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
             }
             Ok(Self {
                 out: open.open(path)?,

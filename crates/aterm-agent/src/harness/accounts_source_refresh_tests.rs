@@ -29,12 +29,14 @@ fn local_source_desk() -> (Desk, PathBuf) {
     desk.default_login("sol-m27@example.test");
     let source = desk.config.join("team-fleet.toml");
     write_same_stamp(&source, FIRST);
-    fs::write(
-        desk.config.join("aterm.toml"),
-        format!(
+    aterm_uds::atomic_file::write(
+        &(desk.config.join("aterm.toml")),
+        (format!(
             "[fleet]\nmachine='m27'\naccounts_source={}\n",
             aterm_toml::Value::from(source.to_string_lossy().into_owned())
-        ),
+        ))
+        .as_ref(),
+        0o600,
     )
     .unwrap();
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).unwrap();
@@ -210,12 +212,14 @@ fn local_observations_track_path_and_length_without_polling_urls() {
     let other = desk.config.join("other.toml");
     fs::copy(&source, &other).unwrap();
     let configure = |source: &str| {
-        fs::write(
+        aterm_uds::atomic_file::write(
             &config,
-            format!(
+            (format!(
                 "[fleet]\nmachine='m27'\naccounts_source={}\n",
                 aterm_toml::Value::from(source)
-            ),
+            ))
+            .as_ref(),
+            0o600,
         )
         .unwrap();
     };
@@ -229,7 +233,7 @@ fn local_observations_track_path_and_length_without_polling_urls() {
         due(),
         "returning from a URL invalidates the local observation"
     );
-    fs::write(&config, "[fleet]\nmachine='m27'\n").unwrap();
+    aterm_uds::atomic_file::write(&config, ("[fleet]\nmachine='m27'\n").as_ref(), 0o600).unwrap();
     assert!(
         !sync_called_for(
             &desk.home,

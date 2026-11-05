@@ -939,9 +939,9 @@ impl Rng {
 }
 
 /// Every retained record of `log` against what was published (`model`, by offset): read
-/// back cold through its packed slot's frame start equal to the record, its slot's summary
-/// the record's own (offset, subject, plaintext-frame bytes, hidden), and the slots naming
-/// exactly the retained records' subjects.
+/// back through the tier (from its frame start where the budget left it cold) equal to the
+/// record, its summary the record's own (offset, subject, plaintext-frame bytes, hidden),
+/// and the pages naming exactly the retained records' subjects.
 fn check_packed(
     log: &BrokerLog,
     model: &std::collections::BTreeMap<u64, BrokerRecord>,
@@ -985,20 +985,69 @@ fn check_packed(
     Ok(())
 }
 
-/// One seeded stream against a log held at a residency budget of 0: single publishes (a
+/// How a [`packed_stream`] holds its log: sealed at rest or not, its residency budget, the
+/// page size each open repages to (`None`: the production page), and the most records a
+/// batch commits.
+#[derive(Clone, Copy, Debug)]
+struct StreamShape {
+    sealed: bool,
+    budget: usize,
+    page_shift: Option<u32>,
+    batch: u64,
+}
+
+impl StreamShape {
+    /// Seed `seed`'s shape: one of five budgets (the newest alone resident, a few records, a
+    /// few dozen, a few hundred, all), pages from one record to the production page, batches
+    /// small or long enough to fill production pages.
+    fn of(seed: u64, sealed: bool) -> StreamShape {
+        let budgets = [
+            0usize,
+            512,
+            4_096,
+            64 << 10,
+            crate::tier::Tier::RESIDENT_ALL,
+        ];
+        StreamShape {
+            sealed,
+            budget: budgets[(seed % 5) as usize],
+            page_shift: match seed % 3 {
+                0 => None,
+                k => Some(((seed / 3 + k) % 8) as u32),
+            },
+            batch: if seed % 2 == 0 { 6 } else { 40 },
+        }
+    }
+}
+
+/// One seeded stream against a real log held as `shape` says: single publishes (a
 /// re-sent key answered with its original offset and nothing appended), batches, hidden
 /// commit records, reopens (each one's broker times the same as before it) and, with
-/// `retention`, cuts; `check_packed` after every step.
-fn packed_stream(seed: u64) -> (crate::test_scratch::Scratch, BrokerLog) {
+/// `retention`, cuts; after every step `check_packed` (every retained record against what
+/// was published, read back through the tier), the tier's pages against the slot vector
+/// beside them (`Tier::check_shadow`) and, with `retention`, the retention planning over
+/// each (`Tier::check_plans`).
+fn packed_stream(seed: u64, shape: StreamShape) -> (crate::test_scratch::Scratch, BrokerLog) {
     use crate::brecord::GroupCommit;
     use std::collections::BTreeMap;
 
-    let root = crate::test_scratch::Scratch::new(&format!("tier-packed-{seed}"));
+    let root = crate::test_scratch::Scratch::new(&format!(
+        "tier-packed-{seed}-{}",
+        if shape.sealed { "sealed" } else { "plain" }
+    ));
     let path = root.path().join("log");
     let open = |path: &std::path::Path| {
         let mut opts = crate::OpenOptions::new(Durability::Relaxed);
-        opts.resident_budget = Some(0);
-        BrokerLog::open_opts(path, opts, || Ok(crate::Prepared::Nothing)).unwrap()
+        opts.resident_budget = Some(shape.budget);
+        #[cfg(feature = "at-rest")]
+        if shape.sealed {
+            opts.at_rest_key = Some([0x5a; 32]);
+        }
+        let mut log = BrokerLog::open_opts(path, opts, || Ok(crate::Prepared::Nothing)).unwrap();
+        if let Some(shift) = shape.page_shift {
+            log.tier_mut_for_test().repage(shift);
+        }
+        log
     };
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut log = open(&path);
@@ -1038,7 +1087,7 @@ fn packed_stream(seed: u64) -> (crate::test_scratch::Scratch, BrokerLog) {
                 }
             }
         } else if roll < 70 {
-            for _ in 0..1 + rng.below(6) {
+            for _ in 0..1 + rng.below(shape.batch) {
                 let pid = rng.below(4);
                 next_seq[pid as usize] += 1;
                 let pseq = next_seq[pid as usize];
@@ -1082,25 +1131,165 @@ fn packed_stream(seed: u64) -> (crate::test_scratch::Scratch, BrokerLog) {
             }
         }
         if let Err(e) = check_packed(&log, &model) {
-            panic!("seed {seed} step {step}: {e}");
+            panic!("seed {seed} {shape:?} step {step}: {e}");
+        }
+        if let Err(e) = log.tier_for_test().check_shadow() {
+            panic!("seed {seed} {shape:?} step {step}: {e}");
+        }
+        #[cfg(feature = "retention")]
+        {
+            // Within twice the prefix rule's age of the newest record's broker time.
+            let tier = log.tier_for_test();
+            let newest = tier.len().checked_sub(1).and_then(|i| tier.bt(i));
+            let now = newest.unwrap_or(0).saturating_add(rng.below(120_000));
+            if let Err(e) = tier.check_plans(&packed_rules(), now) {
+                panic!("seed {seed} {shape:?} step {step}: {e}");
+            }
         }
     }
     (root, log)
 }
 
+/// The retention rules a [`packed_stream`]'s planning runs over the pages and the slot vector:
+/// one batch subject by its last value, another held by bytes and age, and the rest as the
+/// prefix, by bytes and age.
+#[cfg(feature = "retention")]
+fn packed_rules() -> crate::retention::Retention {
+    use crate::retention::{Retention, Rule};
+    use std::time::Duration;
+    Retention::new(
+        vec![
+            Rule::hold("/f/packed/b1").unwrap().last_only(),
+            Rule::hold("/f/packed/b2")
+                .unwrap()
+                .max_bytes(2_000)
+                .max_age(Duration::from_secs(30)),
+            Rule::prefix("/f/packed/*")
+                .unwrap()
+                .max_bytes(12_000)
+                .max_age(Duration::from_secs(60)),
+        ],
+        Rule::default_hold(),
+    )
+    .unwrap()
+}
+
 #[test]
-fn every_retained_record_reads_back_through_the_packed_tier() {
-    for seed in 0..16 {
-        let (_root, log) = packed_stream(seed);
+fn every_retained_record_reads_back_through_the_paged_tier() {
+    for seed in 0..18 {
+        let (_root, log) = packed_stream(seed, StreamShape::of(seed, false));
         drop(log);
     }
 }
 
-/// The negative control: one slot whose frame start is a byte off is caught.
+#[cfg(feature = "at-rest")]
 #[test]
-fn a_slot_whose_frame_start_is_off_is_caught() {
+fn every_retained_record_reads_back_through_the_paged_tier_sealed_at_rest() {
+    for seed in 0..9 {
+        let (_root, log) = packed_stream(seed, StreamShape::of(seed, true));
+        drop(log);
+    }
+}
+
+/// The record at offset `off` of the cold-read logs: subjects in a small set, bodies of 16
+/// to 32 KiB, so a 16 MiB window holds about 650 and leaves the rest cold.
+fn wide_record(off: u64) -> (String, Vec<u8>) {
+    let n = 16_384 + ((off * 7_919) % 16_384) as usize;
+    let body = (0..n)
+        .map(|k| (off as u8).wrapping_mul(13).wrapping_add(k as u8))
+        .collect();
+    (format!("/f/wide/s{}", off % 5), body)
+}
+
+/// Every retained record read back from a log of 1,200 records reopened at a residency
+/// budget of 0 and of 16 MiB (the budget aterm opens with), equal to what was published;
+/// the tier's pages answer as the slot vector does.
+fn cold_reads_at_both_budgets(sealed: bool) {
+    let root = crate::test_scratch::Scratch::new(if sealed {
+        "tier-wide-sealed"
+    } else {
+        "tier-wide-plain"
+    });
+    let path = root.path().join("log");
+    let open = |budget: usize| {
+        let mut opts = crate::OpenOptions::new(Durability::Relaxed);
+        opts.resident_budget = Some(budget);
+        #[cfg(feature = "at-rest")]
+        if sealed {
+            opts.at_rest_key = Some([0x6b; 32]);
+        }
+        BrokerLog::open_opts(&path, opts, || Ok(crate::Prepared::Nothing)).unwrap()
+    };
+    const N: u64 = 1_200;
+    {
+        let mut log = open(16 << 20);
+        for off in 0..N {
+            let (subject, body) = wide_record(off);
+            if off % 50 == 49 {
+                log.stage_publish(2, off + 1, subject, body).unwrap();
+                log.commit_batch().unwrap();
+            } else {
+                log.publish(2, off + 1, subject, body).unwrap();
+            }
+        }
+    }
+    for budget in [0usize, 16 << 20] {
+        let log = open(budget);
+        let (resident, _, retained) = log.residency();
+        assert_eq!(retained as u64, N, "budget {budget}");
+        if budget == 0 {
+            assert_eq!(resident, 1, "budget 0 keeps the newest alone");
+        } else {
+            assert!(
+                resident > 1 && (resident as u64) < N,
+                "budget {budget}: {resident} of {N} resident, some cold"
+            );
+        }
+        let before = log.cold_reads();
+        let got = log.read_from(Offset(0));
+        assert_eq!(
+            got.len() as u64,
+            N,
+            "budget {budget}: every record reads back"
+        );
+        for rec in &got {
+            let (subject, body) = wide_record(rec.seq.0);
+            assert_eq!(
+                (rec.producer_id, rec.producer_seq, &rec.subject, &rec.body),
+                (2, rec.seq.0 + 1, &subject, &body),
+                "budget {budget}: record {}",
+                rec.seq.0
+            );
+        }
+        assert_eq!(
+            log.cold_reads() - before,
+            N - resident as u64,
+            "budget {budget}: each record outside the window read from the file once"
+        );
+        assert_eq!(
+            log.tier_for_test().check_shadow(),
+            Ok(()),
+            "budget {budget}"
+        );
+    }
+}
+
+#[test]
+fn every_record_reads_back_at_budget_0_and_16_mib() {
+    cold_reads_at_both_budgets(false);
+}
+
+#[cfg(feature = "at-rest")]
+#[test]
+fn every_record_reads_back_at_budget_0_and_16_mib_sealed_at_rest() {
+    cold_reads_at_both_budgets(true);
+}
+
+/// The negative control: one record whose frame start is a byte off is caught.
+#[test]
+fn a_frame_start_one_byte_off_is_caught() {
     for seed in 0..4 {
-        let (_root, mut log) = packed_stream(seed);
+        let (_root, mut log) = packed_stream(seed, StreamShape::of(seed, false));
         let model: std::collections::BTreeMap<u64, BrokerRecord> = (0..log.tier_for_test().len())
             .filter_map(|i| log.record_arc(i))
             .map(|r| (r.seq.0, (*r).clone()))
@@ -1110,10 +1299,48 @@ fn a_slot_whose_frame_start_is_off_is_caught() {
             log.tier_for_test().len() >= 2,
             "seed {seed}: a cold record to skew"
         );
+        log.set_resident_budget(0);
         log.tier_mut_for_test().skew_frame_start(0);
         assert!(
             check_packed(&log, &model).is_err(),
             "seed {seed}: a skewed frame start reads back"
         );
+    }
+}
+
+/// The negative control of the paged tier on a real log: a page whose first frame start and
+/// broker time are its second record's, or pages that begin one record late, are caught by
+/// the cold reads against what was published and by the slot vector beside the pages.
+#[test]
+fn a_page_entry_off_by_one_record_is_caught_on_a_real_log() {
+    use crate::tier::PageMutant;
+    for seed in [1u64, 4, 7] {
+        let shape = StreamShape {
+            budget: 0,
+            page_shift: Some(2),
+            ..StreamShape::of(seed, false)
+        };
+        for mutant in [PageMutant::Base(1), PageMutant::Index] {
+            let (_root, mut log) = packed_stream(seed, shape);
+            let model: std::collections::BTreeMap<u64, BrokerRecord> =
+                (0..log.tier_for_test().len())
+                    .filter_map(|i| log.record_arc(i))
+                    .map(|r| (r.seq.0, (*r).clone()))
+                    .collect();
+            assert_eq!(check_packed(&log, &model), Ok(()));
+            assert!(
+                log.tier_for_test().len() >= 12,
+                "seed {seed}: three pages of four to mutate"
+            );
+            log.tier_mut_for_test().mutate(mutant);
+            assert!(
+                check_packed(&log, &model).is_err(),
+                "seed {seed}: {mutant:?} reads back what was published"
+            );
+            assert!(
+                log.tier_for_test().check_shadow().is_err(),
+                "seed {seed}: {mutant:?} answers as the slot vector"
+            );
+        }
     }
 }

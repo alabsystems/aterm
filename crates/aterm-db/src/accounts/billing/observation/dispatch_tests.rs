@@ -521,11 +521,16 @@ fn composed_dispatch_cannot_take_over_an_ancestor_request_after_writer_successio
             .is_err()
     );
     let next = RequestKey::new([51; 32], [53; 16]).unwrap();
+    let started = Instant::now();
+    let fresh = source
+        .dispatch_until(next, "example-v1", b"new request", deadline(), |_, _| None)
+        .unwrap();
+    // A refusal after the full minute is the hang detector (ATERM-KI-1105-13).
     assert!(
-        source
-            .dispatch_until(next, "example-v1", b"new request", deadline(), |_, _| None)
-            .unwrap()
-            .entered
+        fresh.entered,
+        "a fresh request was withheld after {:?}: {:?}",
+        started.elapsed(),
+        fresh.refusal
     );
     assert_eq!(resources.snapshot().unwrap().used.values().sum::<u64>(), 2);
 }

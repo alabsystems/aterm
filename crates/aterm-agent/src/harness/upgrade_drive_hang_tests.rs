@@ -319,6 +319,7 @@ fn dialling(dir: &Path, sock: &str, bound: Duration) -> Opts {
     Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: Some(sock.to_string()),
         token: Some(HarnessToken::new(TOKEN)),
         only_sid: Some(TAB.to_string()),

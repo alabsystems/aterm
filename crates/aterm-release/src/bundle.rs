@@ -394,7 +394,7 @@ pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
         &spec.git_commit,
         icon,
     )?;
-    std::fs::write(app.join("Contents/Info.plist"), stamped)
+    crate::durable::write_fresh(&app.join("Contents/Info.plist"), stamped)
         .map_err(|e| format!("write Info.plist: {e}"))?;
     println!(
         "    version={} build={} commit={} bundle-id={}",
@@ -402,17 +402,17 @@ pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
     );
 
     if icns.is_file() {
-        std::fs::copy(&icns, resources.join("aterm.icns"))
+        crate::durable::copy_regular_fresh(&icns, resources.join("aterm.icns"))
             .map_err(|e| format!("copy aterm.icns: {e}"))?;
     }
 
     let credits = mac_dir.join("Credits.html");
-    std::fs::copy(&credits, resources.join("Credits.html"))
+    crate::durable::copy_regular_fresh(&credits, resources.join("Credits.html"))
         .map_err(|e| format!("copy {}: {e}", credits.display()))?;
 
     let help = mac_dir.join("Help.html");
     if help.is_file() {
-        std::fs::copy(&help, resources.join("Help.html"))
+        crate::durable::copy_regular_fresh(&help, resources.join("Help.html"))
             .map_err(|e| format!("copy Help.html: {e}"))?;
         println!("    bundled Help.html");
     }
@@ -466,7 +466,8 @@ pub fn place_handoff_policy(
 ) -> Result<aterm_update_core::handoff_policy::PolicyFile, String> {
     let (text, policy) = handoff_policy_for_cut(repo_root)?;
     let dest = app.join(aterm_update_core::handoff_policy::BUNDLE_PATH);
-    std::fs::write(&dest, text.as_bytes()).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    crate::durable::write_fresh(&dest, text.as_bytes())
+        .map_err(|e| format!("write {}: {e}", dest.display()))?;
     Ok(policy)
 }
 
@@ -478,12 +479,17 @@ pub fn place_handoff_policy(
 const EXE_MODE: u32 = 0o555;
 
 fn copy_exe(src: &Path, dst: &Path) -> Result<(), String> {
-    std::fs::copy(src, dst)
+    let (mut reader, _) = crate::durable::open_regular_file_with_meta(src)
+        .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    let mut writer = crate::durable::create_fresh(dst)
+        .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    std::io::copy(&mut reader, &mut writer)
         .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(EXE_MODE))
+        writer
+            .set_permissions(std::fs::Permissions::from_mode(EXE_MODE))
             .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
     }
     Ok(())
@@ -505,8 +511,8 @@ pub fn write_provenance(
     let dwarf = spec
         .out_dir
         .join("aterm.dSYM/Contents/Resources/DWARF/aterm");
-    let has_dsym = std::fs::metadata(&dwarf)
-        .map(|m| m.len() > 0)
+    let has_dsym = std::fs::symlink_metadata(&dwarf)
+        .map(|m| m.is_file() && m.len() > 0)
         .unwrap_or(false);
     let has_aliases = app.join("Contents/MacOS/aterm-ctl").is_symlink();
 
@@ -538,7 +544,8 @@ pub fn write_provenance(
         yes_no(has_dsym),
         yes_no(has_aliases),
     );
-    std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+    crate::durable::write_fresh(&path, body)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     println!("==> wrote {}", path.display());
     Ok(path)
 }

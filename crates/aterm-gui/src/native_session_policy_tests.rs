@@ -127,7 +127,11 @@ fn a_session_policy_does_not_enable_its_sibling_and_disable_keeps_reconciliation
     );
     assert_eq!(
         native_reply(&sibling.ctx, "constructors"),
-        Reply::Constructors(Vec::new())
+        Reply::Constructors(if cold_restart_qualified() {
+            vec![Constructor::ColdRestart]
+        } else {
+            Vec::new()
+        })
     );
     assert!(
         matches!(native_reply(&own.ctx, "info"), Reply::Info { own_image, .. }
@@ -159,6 +163,26 @@ fn a_session_policy_does_not_enable_its_sibling_and_disable_keeps_reconciliation
             .install_fixture_policy(fixture())
             .is_err()
     );
+}
+
+#[test]
+fn a_cold_fixture_constructor_does_not_enable_generic_or_renewal_constructors() {
+    let fixture = fixture().with_quota_rotation();
+    let switch = fixture.constructors();
+    switch.set_enabled(&[Constructor::ColdRestart]);
+    let policy = SessionPolicy {
+        fixture: Some(fixture),
+        ..Default::default()
+    };
+    assert!(policy.constructor_enabled(Constructor::ColdRestart));
+    assert!(!policy.constructor_enabled(Constructor::OwnImage));
+    assert!(!policy.constructor_enabled(Constructor::PrivateRestart));
+    assert!(!policy.renewal_constructor_enabled());
+    assert!(!policy.quota_rotation_enabled());
+    switch.set_enabled(&[Constructor::PrivateRestart]);
+    assert!(!policy.constructor_enabled(Constructor::ColdRestart));
+    assert!(policy.renewal_constructor_enabled());
+    assert!(policy.quota_rotation_enabled());
 }
 
 #[test]

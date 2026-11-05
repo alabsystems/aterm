@@ -223,7 +223,7 @@ fn read_text(path: &Path) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = options.open(path).ok()?;
     let meta = file.metadata().ok()?;
@@ -287,11 +287,11 @@ pub(crate) fn hold_dir(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_DIRECTORY);
+        options.custom_flags(
+            libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
     }
-    let file = options.open(dir)?;
-    #[cfg(unix)]
-    aterm_uds::keep_out_of_children(&file)?;
+    let file = aterm_uds::kept_out(|| options.open(dir))?;
     let until = Instant::now().checked_add(wait);
     loop {
         #[expect(
@@ -346,10 +346,15 @@ fn write_unless(
         let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
         tmp_name.push(format!(".{}.tmp", std::process::id()));
         let tmp = parent.join(tmp_name);
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+        }
+        let file = opts.open(&tmp)?;
         (tmp, file)
     };
     let written = (|| {

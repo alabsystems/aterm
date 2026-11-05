@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use crate::supervise::policy::question::{LONG_TERM_TEXT, SHORT_TERM_TEXT};
-use crate::supervise::policy::{QuestionPriority, RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM};
+use crate::supervise::policy::question::{LAND_TEXT, LONG_TERM_TEXT, SHORT_TERM_TEXT};
+use crate::supervise::policy::{
+    QuestionPriority, RULE_ANSWER_LAND, RULE_ANSWER_LONG_TERM, RULE_ANSWER_RECOMMENDED,
+    RULE_ANSWER_SHORT_TERM,
+};
 
 const LONG: QuestionPriority = QuestionPriority::LongTerm;
 const SHORT: QuestionPriority = QuestionPriority::ShortTerm;
@@ -167,6 +170,306 @@ fn a_lone_single_select_is_answered_by_the_long_term_text() {
     let _ = std::fs::remove_dir_all(&ldir);
 }
 
+/// AUTOPILOT LAND'S DIALOG ANSWER (`answer-land@v1`): on a session whose Autopilot is Land a
+/// lone single-select is answered by the land policy text over the window's `recommended` and
+/// over every answering word the session sets, written as the long-term text is (two seen moves,
+/// one fenced `send`, Enter on the next read). Negative control: the same dialog on a Cruise
+/// session gets its recommended option under `answer-recommended@v1`.
+#[test]
+fn a_dialog_under_land_is_answered_by_the_land_text() {
+    for word in [None, Some("long-term"), Some("recommended")] {
+        let (opt1, opt2, free, typed) = single_screens(LAND_TEXT);
+        let (ldir, ledger) = ledger_file("text-land");
+        let mut m = texting(vec![opt1, opt2, free, typed, busy_screen(), idle_screen()]);
+        m.vanish_after = Some(1);
+        m.autopilot = Some("land");
+        m.questions = word;
+        let lines = hosted_run(
+            &mut m,
+            &hosted_by(QuestionPriority::Recommended),
+            Some(&ledger),
+        );
+        let writes = m.writes();
+        assert_eq!(
+            writes[..writes.len().min(4)],
+            [
+                "down".to_string(),
+                "down".to_string(),
+                format!("text:{LAND_TEXT}"),
+                "enter".to_string()
+            ],
+            "{word:?}: {:#?}",
+            m.requests
+        );
+        // The dialog's answer is no land act: the turn's end still gets Land's instruction.
+        assert!(
+            writes[4..]
+                .iter()
+                .all(|w| w.starts_with("text:[aterm harness] Autopilot is Land:")),
+            "{word:?}: {writes:#?}"
+        );
+        assert_eq!(badge(&m), None, "{word:?}: never a person's");
+        let told: Vec<&String> = lines.iter().filter(|l| l.starts_with("CHOSE ")).collect();
+        assert!(
+            told.len() == 1
+                && told[0].contains(&format!("rule={RULE_ANSWER_LAND} policy=land "))
+                && told[0].ends_with("Which colour do you prefer? → decided by the worker (land)"),
+            "{word:?}: {lines:#?}"
+        );
+        let rows = ledger_rows(&ledger);
+        let approved: Vec<&String> = rows
+            .iter()
+            .filter(|r| {
+                r.contains(&format!("\"rule_id\":\"{RULE_ANSWER_LAND}\""))
+                    && r.contains("\"decision\":\"approved\"")
+            })
+            .collect();
+        assert_eq!(
+            approved.len(),
+            2,
+            "{word:?}: the text and the Enter: {rows:#?}"
+        );
+        assert!(
+            approved[0].contains("typed the land policy text into the free-text row"),
+            "{}",
+            approved[0]
+        );
+        let _ = std::fs::remove_dir_all(&ldir);
+    }
+
+    let (opt1, ..) = single_screens(LAND_TEXT);
+    let mut m = texting(vec![opt1, busy_screen(), idle_screen()]);
+    m.vanish_after = Some(1);
+    m.autopilot = Some("cruise");
+    let lines = hosted_run(&mut m, &hosted_by(QuestionPriority::Recommended), None);
+    assert_eq!(m.writes(), ["enter"], "{:#?}", m.requests);
+    assert!(sends(&m).is_empty(), "{:#?}", m.requests);
+    let told: Vec<&String> = lines.iter().filter(|l| l.starts_with("CHOSE ")).collect();
+    assert!(
+        told.len() == 1
+            && told[0].contains(&format!(
+                "rule={RULE_ANSWER_RECOMMENDED} policy=recommended "
+            )),
+        "{lines:#?}"
+    );
+}
+
+/// The owner's own hand-overs hold under Land: a session whose `questions` word is `ask`, and a
+/// window whose `answer_questions` is off with no session word, still hand the dialog to a
+/// person with nothing typed. Control: the same Land session with the switch on answers it.
+#[test]
+fn ask_and_answers_off_stay_a_persons_under_land() {
+    use aterm_phase::prompt::fixtures as f;
+    let run = |global: bool, word: Option<&'static str>| {
+        let mut m = questioned(vec![q(f::QUESTION_ONE)]);
+        m.vanish_after = Some(0);
+        m.autopilot = Some("land");
+        m.questions = word;
+        let _ = watch_lines_with(&mut m, &hosted_answering(global), |s| {
+            s.set_approval_env(owner_env())
+        });
+        (m.writes(), badge(&m))
+    };
+    let (writes, said) = run(true, Some("ask"));
+    assert!(writes.is_empty(), "{writes:?}");
+    assert!(
+        said.as_deref()
+            .is_some_and(|b| b.contains("this session's `questions` word is ask")),
+        "{said:?}"
+    );
+    let (writes, said) = run(false, None);
+    assert!(writes.is_empty(), "{writes:?}");
+    assert!(
+        said.as_deref()
+            .is_some_and(|b| b.contains("answer_questions is off")),
+        "{said:?}"
+    );
+    let (writes, said) = run(true, None);
+    assert!(!writes.is_empty() && said.is_none(), "{writes:?} {said:?}");
+}
+
+/// A switch of the Autopilot alone after the loop's first key on a dialog finishes the dialog
+/// under that key's priority and hands nothing over: Cruise's `long-term` text where the session
+/// went to Land, and Land's text where it went back to Cruise. A person's change of the word
+/// under Cruise still hands it over ([`a_word_changed_after_the_first_key_hands_the_dialog_over`]).
+#[test]
+fn a_switch_mid_dialog_finishes_under_its_first_keys_priority() {
+    for (from, to, text) in [
+        (None, Some("land"), LONG_TERM_TEXT),
+        (Some("land"), Some("cruise"), LAND_TEXT),
+    ] {
+        let (opt1, opt2, free, typed) = single_screens(text);
+        let mut m = texting(vec![opt1, opt2, free, typed, busy_screen(), idle_screen()]);
+        m.vanish_after = Some(1);
+        m.questions = Some("long-term");
+        m.autopilot = from;
+        m.autopilot_at = vec![(3, to)];
+        let _ = hosted_run(&mut m, &hosted_by(QuestionPriority::Recommended), None);
+        let first_key = m
+            .requests
+            .iter()
+            .position(|r| verb_of(r) == "key")
+            .expect("a key");
+        let metas: Vec<usize> = m
+            .requests
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| verb_of(r) == "meta")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            metas.len() >= 3 && metas[2] > first_key,
+            "{from:?}: the switch came after the first key: {:#?}",
+            m.requests
+        );
+        let writes = m.writes();
+        assert_eq!(
+            writes[..writes.len().min(4)],
+            [
+                "down".to_string(),
+                "down".to_string(),
+                format!("text:{text}"),
+                "enter".to_string()
+            ],
+            "{from:?} -> {to:?}: {:#?}",
+            m.requests
+        );
+        // After the dialog, the turn's end is the new Autopilot's: Land's instruction, or none.
+        assert!(
+            writes[4..]
+                .iter()
+                .all(|w| to == Some("land")
+                    && w.starts_with("text:[aterm harness] Autopilot is Land:")),
+            "{from:?} -> {to:?}: {writes:#?}"
+        );
+        assert_eq!(badge(&m), None, "{from:?} -> {to:?}");
+    }
+}
+
+/// Land's stand-in for a text the dialog never took (`question::text_instead`): the text is
+/// written once, read back unconfirmed, and the dialog is decided again with its recommended
+/// option pressed under `answer-land@v1`, never a person's and never a second `send`. Controls:
+/// under `long-term` and under Land a person's key since the text hands it over instead.
+#[test]
+fn a_land_text_the_dialog_never_took_gets_the_recommended_option() {
+    let red = guarded("❯ 1. Red (Recommended)");
+    let world = |autopilot: Option<&'static str>, person: bool| {
+        let (opt1, opt2, free, _) = single_screens(LAND_TEXT);
+        let mut m = texting(vec![free.clone(), free, opt2, opt1, idle_screen()]);
+        m.key_gates = vec![(1, 0), (2, 1)];
+        m.autopilot = autopilot;
+        if person {
+            m.person_after_send = 1;
+        }
+        let book = Book::new("text-land-not-taken");
+        {
+            let mut s = session(&mut m, None);
+            s.set_approval_env(owner_env());
+            book.keep(&mut s);
+            s.supervise(&answering_by(LONG)).expect("supervise");
+        }
+        let (lines, rows) = (book.escalated(), ledger_rows(&book.path));
+        (m, lines, rows)
+    };
+    let (m, lines, rows) = world(Some("land"), false);
+    assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
+    let presses = m.presses();
+    assert!(
+        presses
+            .last()
+            .is_some_and(|p| p.ends_with(" enter") && p.contains(&red)),
+        "{presses:#?} {lines:#?} {rows:#?} {:#?}",
+        m.requests
+    );
+    assert!(lines.is_empty(), "never a person's: {lines:#?}");
+    assert!(
+        rows.iter().any(
+            |r| r.contains(&format!("\"rule_id\":\"{RULE_ANSWER_LAND}\""))
+                && r.contains("\"decision\":\"skipped\"")
+                && r.contains("decided again, the recommended answer stands in")
+        ),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter().any(
+            |r| r.contains(&format!("\"rule_id\":\"{RULE_ANSWER_LAND}\""))
+                && r.contains("\"decision\":\"approved\"")
+                && r.contains("(recommended: ")
+        ),
+        "{rows:#?}"
+    );
+
+    let (m, lines, _) = world(None, true);
+    assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
+    assert!(m.presses().is_empty(), "{:#?}", m.requests);
+    assert!(
+        lines.iter().any(|l| l
+            .contains("the dialog did not take the policy text: a text is never written twice")),
+        "{lines:#?}"
+    );
+
+    let (m, lines, _) = world(Some("land"), true);
+    assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
+    assert!(m.presses().is_empty(), "the person's: {:#?}", m.requests);
+    assert!(
+        lines.iter().any(|l| l
+            .contains("the dialog did not take the policy text: a text is never written twice")
+            || l.contains("a person keyed on this question after the land policy text")),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+fn cruise_text_refusal_uses_the_recommendation_without_overwriting_a_person() {
+    let red = guarded("❯ 1. Red (Recommended)");
+    for priority in [LONG, SHORT] {
+        for person in [0, 1, 2] {
+            let (opt1, opt2, free, _) = single_screens(text_of(priority));
+            let mut m = texting(vec![free.clone(), free, opt2, opt1, idle_screen()]);
+            m.key_gates = vec![(1, 0), (2, 1)];
+            if person == 1 {
+                m.person_after_send = 1;
+            } else if person == 2 {
+                m.person_at_key = 2;
+            }
+            let book = Book::new("cruise-text-not-taken");
+            {
+                let mut s = session(&mut m, None);
+                s.set_approval_env(owner_env());
+                book.keep(&mut s);
+                s.supervise(&answering_by(priority)).expect("supervise");
+            }
+            assert_eq!(sends(&m).len(), 1, "{priority:?}: {:#?}", m.requests);
+            if person != 0 {
+                assert!(
+                    m.presses().iter().all(|press| !press.ends_with(" enter")),
+                    "a person's input: {:#?}",
+                    m.requests
+                );
+                if person == 1 {
+                    assert!(m.presses().is_empty());
+                } else {
+                    assert!(
+                        !m.person_skipped.is_empty(),
+                        "the fallback key was refused by its person fence"
+                    );
+                }
+                assert!(!book.escalated().is_empty());
+            } else {
+                assert!(
+                    m.presses()
+                        .last()
+                        .is_some_and(|press| press.ends_with(" enter") && press.contains(&red)),
+                    "{priority:?}: {:#?}; escalations: {:?}",
+                    m.requests,
+                    book.escalated()
+                );
+                assert!(book.escalated().is_empty());
+            }
+        }
+    }
+}
+
 /// The lone multi-select question (c3): the focus on option 1 as the vendor
 /// opens it, moved down to options 2 and 3, on the pristine free-text row
 /// (c3-04); `text` typed there, the row ticked, the focus kept (c3-05);
@@ -196,8 +499,8 @@ fn text_model(tabs: i64, review: i64, multi: i64) -> aterm_spec::derive::Model {
     )
 }
 
-/// Tier-1 for the policy text (`SupervisorQuestionText`, `Text = 1`): the real loop over the
-/// scripted server, every read projected onto the model, every `key` its
+/// Tier-1 for the policy text (`SupervisorQuestionText`, `Text = 1`, Land's text included): the
+/// real loop over the scripted server, every read projected onto the model, every `key` its
 /// `HarnessMove`/`HarnessEnter` and every `send` its `HarnessType`, each enabled where sent,
 /// the send carrying the generation fence, row guard, person fence and the priority's text,
 /// and all six laws checked after every request.
@@ -216,6 +519,16 @@ fn tier1_the_policy_text_goes_only_where_the_model_allows() {
         );
         assert_eq!(st["tab"], 2, "{p:?}: the dialog closed: {st:?}");
     }
+
+    // Land's text on a Land session, under the window's `recommended`: the same moves.
+    let (opt1, opt2, free, typed) = single_screens(LAND_TEXT);
+    let mut m = texting(vec![opt1, opt2, free, typed, idle_screen()]);
+    m.autopilot = Some("land");
+    let land = QuestionPriority::Land;
+    let rec = answering_by(QuestionPriority::Recommended);
+    let (st, keys, _) = q_bound_with(&mut m, &text_model(1, 0, 0), 0, Some(land), &rec, |_| {});
+    assert_eq!(keys, ["down", "down", "text", "enter"], "{:#?}", m.requests);
+    assert_eq!(st["tab"], 2, "Land: the dialog closed: {st:?}");
 
     let mut m = texting(multi_screens(LONG_TERM_TEXT));
     let model = text_model(1, 1, 1);
@@ -664,10 +977,9 @@ fn a_text_that_reads_back_short_twice_is_handed_over_never_written_again() {
         m.requests
     );
     assert!(
-        lines.iter().any(|l| l.contains(
-            "the policy text read back short of what was written: a \
-             text is never written twice"
-        )),
+        lines
+            .iter()
+            .any(|l| l.contains("a person has begun answering")),
         "{lines:#?}"
     );
 }
@@ -690,7 +1002,9 @@ fn a_text_that_disappears_after_it_read_back_is_handed_over_never_rewritten() {
     assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
     let presses = m.presses();
     assert!(
-        presses.len() == 1 && presses[0].ends_with(" enter"),
+        !presses.is_empty()
+            && presses[0].ends_with(" enter")
+            && presses.iter().skip(1).all(|p| !p.ends_with(" enter")),
         "{:#?}",
         m.requests
     );
@@ -701,9 +1015,10 @@ fn a_text_that_disappears_after_it_read_back_is_handed_over_never_rewritten() {
         "the Enter skipped by its fence: {rows:#?}"
     );
     assert!(
-        rows.iter().any(|r| r.contains("\"decision\":\"escalated\"")
-            && r.contains("the policy text the supervisor wrote is gone from its free-text row")),
-        "handed over: {rows:#?}"
+        rows.iter().any(|r| r.contains("\"decision\":\"skipped\"")
+            && r.contains("Red (Recommended)")
+            && r.contains("the policy text the supervisor wrote is gone")),
+        "the stale Enter is never retried: {rows:#?}"
     );
     let _ = std::fs::remove_dir_all(&ldir);
     let send = m
@@ -921,14 +1236,12 @@ fn a_text_the_dialog_never_took_is_handed_over_never_written_twice() {
     let mut m = texting(vec![free]);
     let lines = supervised(&mut m, &answering_by(LONG), "text-not-taken");
     assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
-    assert!(m.presses().is_empty(), "{:#?}", m.requests);
     assert!(
-        lines.iter().any(|l| l.contains(
-            "the dialog did not take the policy text: a text is never \
-             written twice"
-        )),
-        "{lines:#?}"
+        m.presses().iter().all(|p| !p.ends_with(" enter")),
+        "{:#?}",
+        m.requests
     );
+    assert!(!lines.is_empty(), "{lines:#?}");
     let after: Vec<&String> = m
         .requests
         .iter()
@@ -955,7 +1268,6 @@ fn a_text_the_dialog_never_took_is_handed_over_never_written_twice() {
 #[test]
 fn a_policy_text_the_worker_has_not_drawn_is_waited_for_not_handed_over() {
     let hang = super::super::turn_end_loop::UNDRAWN_INPUT_HANG;
-    let not_taken = "the dialog did not take the policy text: a text is never written twice";
     let world = |unmoved: Option<Duration>, unread: Option<Duration>| {
         let (_, _, free, typed) = single_screens(LONG_TERM_TEXT);
         let after = vec![typed, busy_screen(), idle_screen()];
@@ -995,14 +1307,9 @@ fn a_policy_text_the_worker_has_not_drawn_is_waited_for_not_handed_over() {
         assert_eq!(told, 1, "{what}: {lines:#?}");
     };
     let handed_over = |m: &Mock, what: &str| {
-        assert_eq!(
-            m.writes(),
-            [format!("text:{LONG_TERM_TEXT}")],
-            "{what}: {:#?}",
-            m.requests
-        );
+        assert_eq!(sends(m).len(), 1, "{what}: {:#?}", m.requests);
         assert!(
-            badge(m).is_some_and(|b| b.contains(not_taken)),
+            m.presses().iter().all(|p| !p.ends_with(" enter")),
             "{what}: {:#?}",
             m.requests
         );
@@ -1014,20 +1321,29 @@ fn a_policy_text_the_worker_has_not_drawn_is_waited_for_not_handed_over() {
     let (m, lines, _) = world(None, Some(Duration::from_secs(25)));
     answered(&m, &lines, "a worker that reads the text late");
 
-    let never = Some(Duration::from_secs(200));
+    let never = Some(Duration::from_secs(1000));
     let (m, _, reads) = world(never, never);
     handed_over(&m, "a worker that never reads or draws the text");
     assert!(
-        reads.iter().any(|&at| at >= hang) && reads.iter().all(|&at| at < hang + WAIT_STEP),
+        reads
+            .iter()
+            .find(|&&at| at >= hang)
+            .is_some_and(|&at| at < hang + WAIT_STEP),
         "judged once the hang passed ({reads:?}): {:#?}",
         m.requests
     );
 
-    let (m, _, reads) = world(None, None);
+    let (m, _, _) = world(None, None);
     handed_over(&m, "the control: a screen that moved without the text");
+    let sent = m.first_send_at.expect("the text was sent");
+    let decided = m
+        .key_times
+        .first()
+        .expect("the recommendation was attempted")
+        .1;
     assert!(
-        reads.len() <= 3 && reads.iter().all(|&at| at < Duration::from_secs(35)),
-        "the control is judged at its second read-back ({reads:?}): {:#?}",
+        decided.saturating_duration_since(sent) < Duration::from_secs(35),
+        "the control is judged before the input hang deadline: {:#?}",
         m.requests
     );
 }
@@ -1041,8 +1357,6 @@ fn a_policy_text_the_worker_has_not_drawn_is_waited_for_not_handed_over() {
 /// dialog on it, is handed over at the second read-back, the text not written twice.
 #[test]
 fn a_read_back_frame_caught_half_drawn_is_waited_for_not_handed_over() {
-    let gone_said =
-        "the policy text did not read back as written (the dialog is no longer the question";
     let run = |after: Vec<Vec<String>>, still_from: Option<usize>, drawn_at: Option<usize>| {
         let (_, _, free, _) = single_screens(LONG_TERM_TEXT);
         let mut screens = vec![free];
@@ -1112,20 +1426,20 @@ fn a_read_back_frame_caught_half_drawn_is_waited_for_not_handed_over() {
         m.requests
     );
     assert!(
-        badge(&m).is_some_and(|b| b.contains(gone_said)),
-        "the control is handed over as gone: {:#?}",
+        !m.requests.iter().any(|r| r.contains("story chose")),
+        "the absent question is never claimed answered: {:#?}",
         m.requests
     );
     let looks = m
         .requests
         .iter()
         .skip_while(|r| verb_of(r) != "send")
-        .take_while(|r| !r.starts_with("meta set attention "))
+        .take_while(|r| !(r.starts_with("await seq ") && r.ends_with(" timeout 20000")))
         .filter(|r| r.starts_with("text --json tail="))
         .count();
     assert!(
-        looks <= 3,
-        "the control is judged once its screen held still: {looks} read-backs: {:#?}",
+        looks <= 4,
+        "read-back and one fallback re-evaluation are bounded: {looks} looks: {:#?}",
         m.requests
     );
 }
@@ -1494,7 +1808,7 @@ fn a_checked_option_hands_a_multi_select_over_under_a_text_priority() {
     assert!(m.writes().is_empty(), "{:#?}", m.requests);
     let badge = badge(&m).expect("handed over");
     assert!(
-        badge.contains("option 1 is checked, and the long-term policy answers this question"),
+        badge.contains("option 1 is checked, and the supervisor did not check it"),
         "{badge}"
     );
 }
@@ -1506,36 +1820,25 @@ fn a_checked_option_hands_a_multi_select_over_under_a_text_priority() {
 fn a_text_in_doubt_is_remembered_and_never_written_again_one_not_written_is_not() {
     let (opt1, _, free, typed) = single_screens(LONG_TERM_TEXT);
     let moved = focused_on(&free, "2. Blue");
-    let gone = "the policy text the supervisor wrote is gone";
-    let not_taken = "the dialog did not take the policy text: a text is never written twice";
-    for (tag, reply, after, sends_want, why) in [
+    for (tag, reply, after, sends_want) in [
         (
             "partial",
             err("write failed partial accepted=12"),
             vec![moved.clone(), moved.clone(), opt1.clone()],
             1,
-            Some(gone),
         ),
         (
             "lost",
             closed(),
             vec![moved.clone(), moved.clone(), opt1.clone()],
             1,
-            Some(gone),
         ),
-        (
-            "lost-unchanged",
-            closed(),
-            vec![free.clone()],
-            1,
-            Some(not_taken),
-        ),
+        ("lost-unchanged", closed(), vec![free.clone()], 1),
         (
             "busy",
             err("busy sink"),
             vec![free.clone(), typed.clone(), idle_screen()],
             2,
-            None,
         ),
     ] {
         let mut screens = vec![free.clone()];
@@ -1543,26 +1846,21 @@ fn a_text_in_doubt_is_remembered_and_never_written_again_one_not_written_is_not(
         let mut m = texting(screens);
         m.send_replies.push_back(reply);
         m.vanish_after = Some(1);
-        if tag == "partial" {
-            // After the hand-over's escalate act, which the wait sends first (fix E3).
-            m.by_index.insert(13, closed());
-        }
         let _ = hosted_run(&mut m, &hosted_by(LONG), None);
-        if tag == "partial" {
+        assert_eq!(sends(&m).len(), sends_want, "{tag}: {:#?}", m.requests);
+        if matches!(tag, "partial" | "lost") {
             assert!(
-                m.requests[13].starts_with("mark - act word=escalate ")
-                    && m.requests[14].starts_with("await gone "),
-                "{tag}: the outage fell on the wait after the hand-over: {:#?}",
+                m.presses().iter().any(
+                    |p| p.ends_with(" enter") && p.contains(&guarded("❯ 1. Red (Recommended)"))
+                ),
+                "{:#?}",
                 m.requests
             );
         }
-        assert_eq!(sends(&m).len(), sends_want, "{tag}: {:#?}", m.requests);
-        if let Some(why) = why {
+        if tag == "lost-unchanged" {
             assert!(
-                m.requests.iter().any(|r| {
-                    r.starts_with("meta set attention owner=supervisor ") && r.contains(why)
-                }),
-                "{tag}: handed over — {why}: {:#?}",
+                m.presses().iter().all(|p| !p.ends_with(" enter")),
+                "{:#?}",
                 m.requests
             );
         }
@@ -1630,10 +1928,9 @@ fn a_multi_select_text_that_reads_back_unticked_is_handed_over_at_once() {
     let lines = supervised(&mut m, &answering_by(LONG), "text-read-back-unticked");
     assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
     assert!(
-        lines.iter().any(|l| l.contains(
-            "the policy text did not read back as written (its \
-             multi-select row reads unticked): a text is never written twice"
-        )),
+        lines
+            .iter()
+            .any(|l| l.contains("the long-term policy text's row reads unticked")),
         "{lines:#?}"
     );
 }

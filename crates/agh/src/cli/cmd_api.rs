@@ -491,7 +491,7 @@ fn body_of(inv: &Invocation, pairs: Vec<Field>) -> Result<Option<Value>> {
 
 /// A bounded JSON body supplied explicitly, avoiding the operating system's argv limit.
 /// Open nonblocking and judge the opened handle so a FIFO cannot wait for a writer.
-fn read_input(file: &str) -> Result<Value> {
+pub(super) fn read_input<T: serde::de::DeserializeOwned>(file: &str) -> Result<T> {
     use std::io::Read as _;
     const MAX: u64 = 8 * 1024 * 1024;
     let unread = |e: &dyn std::fmt::Display| Error::local(format!("{file}: {e}"));
@@ -514,7 +514,7 @@ fn read_input(file: &str) -> Result<Value> {
         return Err(invalid("JSON input exceeds 8 MiB"));
     }
     // Parse errors must not copy request contents (which may include private data).
-    aterm_json::from_slice(&bytes).map_err(|_| invalid("input is not valid JSON"))
+    aterm_json::from_slice(&bytes).map_err(|_| invalid("input is not valid JSON for this request"))
 }
 
 /// The journal as `Raw::send` writes it, keeping the id its `begin` returned: the report names

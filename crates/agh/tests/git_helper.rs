@@ -494,6 +494,12 @@ fn repo_clone_clones_through_the_runner() {
     let head =
         crate::git_runner::host_git(&bare, &["commit-tree", &tree, "-p", &first, "-m", "two"]);
     crate::git_runner::host_git(&bare, &["update-ref", "refs/heads/main", &head]);
+    let attest = format!("refs/attest/soundness/{head}/fixture-host");
+    let record = crate::git_runner::host_git(
+        &bare,
+        &["commit-tree", &tree, "-p", &head, "-m", "evidence"],
+    );
+    crate::git_runner::host_git(&bare, &["update-ref", &attest, &record]);
     let clone = |dir: &Path, extra: &[&str]| {
         let (ctx, captured) = world.ctx(crate::git_runner::git_env());
         let mut ctx = ctx
@@ -561,12 +567,179 @@ fn repo_clone_clones_through_the_runner() {
     let (exit, captured) = clone(&shallow, &["--depth", "1"]);
     assert_eq!(exit, 0, "{}", captured.stderr_text());
     assert!(shallow.join(".git").join("shallow").is_file());
+    assert_eq!(
+        crate::git_runner::host_git(&full, &["for-each-ref", "--format=%(refname)", &attest]),
+        "",
+        "an ordinary clone does not carry custom evidence refs"
+    );
+    let mirror = world.root.path().join("mirror.git");
+    let (exit, captured) = clone(&mirror, &["--mirror"]);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert_eq!(
+        crate::git_runner::host_git(&mirror, &["rev-parse", "--is-bare-repository"]),
+        "true"
+    );
+    assert_eq!(
+        crate::git_runner::host_git(&mirror, &["rev-parse", &attest]),
+        record
+    );
+    assert_eq!(
+        crate::git_runner::host_git(&mirror, &["rev-parse", &format!("{attest}^")]),
+        head
+    );
+    assert_eq!(
+        crate::git_runner::host_git(&mirror, &["rev-parse", "main^"]),
+        first
+    );
+    assert!(!mirror.join("shallow").exists());
+    let (exit, captured) = clone(&mirror, &["--mirror"]);
+    assert_eq!(exit, 2, "{}", captured.stderr_text());
+    let refused = world.root.path().join("shallow-mirror.git");
+    let before = world.fake.seen().len();
+    let (exit, captured) = clone(&refused, &["--mirror", "--depth", "1"]);
+    assert_eq!(exit, 2, "{}", captured.stderr_text());
+    assert!(!refused.exists());
+    assert_eq!(
+        world.fake.seen().len(),
+        before,
+        "invalid modes are refused before routing"
+    );
     let busy = world.root.path().join("busy");
     std::fs::create_dir_all(&busy).expect("the busy directory");
     std::fs::write(busy.join("kept"), b"kept").expect("a file in it");
     let (exit, captured) = clone(&busy, &[]);
     assert_eq!(exit, 2, "{}", captured.stderr_text());
     assert_eq!(std::fs::read(busy.join("kept")).expect("kept"), b"kept");
+}
+
+#[test]
+fn repo_fetch_main_keeps_work_and_refs_and_records_rewinds() {
+    let world = World::with_reader("helper-fetch-main");
+    let bare = crate::git_runner::bare_repo(world.root.path(), "app");
+    let checkout = world.root.path().join("checkout");
+    let invoke = |verb: &str, extra: &[&str]| {
+        let (ctx, captured) = world.ctx(crate::git_runner::git_env());
+        let mut ctx = ctx
+            .with_git_helper(common::helper())
+            .with_git_remote("fixture-dev/app", &bare);
+        let path = checkout.display().to_string();
+        let mut args = vec!["repo", verb, "fixture-dev/app", path.as_str()];
+        args.extend_from_slice(extra);
+        let exit = common::run_cli(&mut ctx, &args);
+        (exit, captured)
+    };
+    let (exit, captured) = invoke("clone", &[]);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    let first = crate::git_runner::host_git(&bare, &["rev-parse", "main"]);
+    let tree = crate::git_runner::host_git(&bare, &["rev-parse", "main^{tree}"]);
+    crate::git_runner::host_git(&checkout, &["update-ref", "refs/stash", &first]);
+    crate::git_runner::host_git(&checkout, &["tag", "local-tag", &first]);
+    let refs = || {
+        crate::git_runner::host_git(
+            &checkout,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        )
+    };
+    let before = refs();
+    let config_before = std::fs::read(checkout.join(".git/config")).expect("local config");
+    let fetch_head = checkout.join(".git/FETCH_HEAD");
+    let marker = format!("{first}\t\tbranch 'main' of fixture\n");
+    std::fs::write(&fetch_head, &marker).expect("old FETCH_HEAD");
+    std::fs::write(checkout.join("local-work"), b"keep this").expect("uncommitted work");
+    let second =
+        crate::git_runner::host_git(&bare, &["commit-tree", &tree, "-p", &first, "-m", "two"]);
+    crate::git_runner::host_git(&bare, &["update-ref", "refs/heads/main", &second]);
+    crate::git_runner::host_git(&bare, &["tag", "remote-tag", &second]);
+    let (exit, captured) = invoke("fetch-main", &["--meta"]);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert_eq!(captured.stdout_text(), "");
+    assert!(captured.stderr_text().contains("as=reader"));
+    assert!(captured.stderr_text().contains("ref=refs/agh/fetched-main"));
+    assert_eq!(
+        crate::git_runner::host_git(&checkout, &["rev-parse", "refs/agh/fetched-main"]),
+        second
+    );
+    // A remote rewind refreshes only the cache; its previous tip stays recoverable.
+    crate::git_runner::host_git(&bare, &["update-ref", "refs/heads/main", &first]);
+    let (exit, captured) = invoke("fetch-main", &[]);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert_eq!(
+        crate::git_runner::host_git(&checkout, &["rev-parse", "refs/agh/fetched-main"]),
+        first
+    );
+    let log = crate::git_runner::host_git(
+        &checkout,
+        &["reflog", "show", "--format=%H", "refs/agh/fetched-main"],
+    );
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        vec![first.as_str(), second.as_str()]
+    );
+    let kept = refs()
+        .lines()
+        .filter(|line| !line.starts_with("refs/agh/"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(kept, before, "branches, tags, remotes and stash stay fixed");
+    assert_eq!(
+        std::fs::read_to_string(fetch_head).expect("FETCH_HEAD"),
+        marker
+    );
+    assert_eq!(
+        std::fs::read(checkout.join("local-work")).expect("local work"),
+        b"keep this"
+    );
+    assert_eq!(
+        crate::git_runner::host_git(&checkout, &["rev-parse", "HEAD"]),
+        first
+    );
+    assert_eq!(
+        std::fs::read(checkout.join(".git/config")).expect("local config"),
+        config_before
+    );
+    // -R leaves DIR as the one positional, just as for cloning.
+    let (ctx, captured) = world.ctx(crate::git_runner::git_env());
+    let mut ctx = ctx
+        .with_git_helper(common::helper())
+        .with_git_remote("fixture-dev/app", &bare);
+    let path = checkout.display().to_string();
+    assert_eq!(
+        common::run_cli(
+            &mut ctx,
+            &["repo", "fetch-main", "-R", "fixture-dev/app", &path]
+        ),
+        0,
+        "{}",
+        captured.stderr_text()
+    );
+    let seen = world.fake.seen().len();
+    for flags in [
+        &["--anonymous"][..],
+        &["--as", "dev"][..],
+        &["--into", "refs/stash"][..],
+    ] {
+        let (exit, captured) = invoke("fetch-main", flags);
+        assert_eq!(exit, 2, "{}", captured.stderr_text());
+    }
+    let absent = world.root.path().join("absent");
+    let absent = absent.display().to_string();
+    for args in [
+        vec!["repo", "fetch-main", "fixture-dev/app"],
+        vec!["repo", "fetch-main", "fixture-dev/app", absent.as_str()],
+    ] {
+        let (mut ctx, captured) = world.ctx(crate::git_runner::git_env());
+        assert_eq!(
+            common::run_cli(&mut ctx, &args),
+            2,
+            "{}",
+            captured.stderr_text()
+        );
+    }
+    assert_eq!(
+        world.fake.seen().len(),
+        seen,
+        "invalid modes and destinations never route"
+    );
 }
 
 /// A scratch root with no agh.toml (or `config`, when given) and the vault's dev token, whose

@@ -182,6 +182,7 @@ pub fn unchanged(fs: &dyn Fs, doomed: &Doomed) -> bool {
 
 /// The newest write in `path`.
 pub fn stamp(fs: &dyn Fs, path: &Path) -> Stamp {
+    aterm_uds::progress::tick();
     let newest = fs.meta(path).and_then(|meta| match meta.kind {
         Kind::Dir => fs
             .list(path)?
@@ -261,6 +262,7 @@ pub fn unit_hash(name: &str) -> Option<&str> {
 
 /// The compiler every JSON of the fingerprint folder `dir` names (its leading `{"rustc":N`).
 fn compiler(fs: &dyn Fs, dir: &Path) -> Option<u64> {
+    aterm_uds::progress::tick();
     let mut seen = None;
     for (name, meta) in fs.list(dir)? {
         if !name.to_str().is_some_and(|n| n.ends_with(".json")) {

@@ -410,6 +410,7 @@ fn outcome_publication_rechecks_nonce_authority_human_epoch_conversation_and_ori
             5 => {
                 fresh.authority = crate::session_timeline::SessionMeta {
                     supervisor_revision: context.authority.revision().wrapping_add(1),
+                    builtin_relaunch_epoch: crate::session_timeline::RelaunchEpoch::for_test(1),
                     ..crate::session_timeline::SessionMeta::default()
                 }
                 .supervisor_authority(0);
@@ -789,6 +790,27 @@ fn live_refresh_extends_only_observation_retention_and_never_a_dead_record() {
 }
 
 #[test]
+fn passive_death_proof_survives_builtin_claim_revision_changes() {
+    let (registration, context, facts) = setup();
+    let mut store = Store::default();
+    let binding = register(&mut store, &registration, &context, &facts, 1);
+    let mut current = context.clone();
+    current.authority = crate::session_timeline::SessionMeta {
+        supervisor_revision: 3,
+        ..Default::default()
+    }
+    .supervisor_authority(0);
+    assert_ne!(context.authority, current.authority);
+    assert_eq!(
+        store.refresh_with(&binding, &current, 9, 2, &facts),
+        Reply::Registered(binding.clone())
+    );
+    facts.crash(&registration);
+    let proof = store.prove_with(&binding, &current, 9, 3, &facts).unwrap();
+    assert!(proof.reprove_with(&current, 9, 4, &facts));
+}
+
+#[test]
 fn actor_or_session_guard_change_invalidates_without_revival() {
     for change in 0..9 {
         let (registration, context, facts) = setup();
@@ -809,6 +831,7 @@ fn actor_or_session_guard_change_invalidates_without_revival() {
             8 => {
                 let meta = crate::session_timeline::SessionMeta {
                     supervisor_revision: context.authority.revision().wrapping_add(1),
+                    builtin_relaunch_epoch: crate::session_timeline::RelaunchEpoch::for_test(1),
                     ..Default::default()
                 };
                 changed.authority = meta.supervisor_authority(0);
@@ -1158,4 +1181,89 @@ fn eviction_and_expiry_return_watch_ownership_before_a_replacement_can_arm() {
     assert!(!checks.bad_disposal.load(Ordering::Acquire));
     drop(store);
     assert_eq!(facts.watches.live.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn sealed_native_outcomes_keep_exact_foreign_authority_without_granting_passive_capture() {
+    let (registration, mut context, facts) = setup();
+    let mut meta = crate::session_timeline::SessionMeta {
+        supervisor: Some(crate::session_timeline::SupervisorClaim {
+            holder: "foreign-relaunch-owner".into(),
+            conn: Some(77),
+            expires_us: None,
+            proven: None,
+            scoped: None,
+        }),
+        supervisor_revision: 7,
+        ..Default::default()
+    };
+    let foreign = meta.supervisor.clone();
+    context.authority = meta.supervisor_authority(10);
+    assert!(context.valid());
+    assert!(!context.passive_valid());
+    let mut store = Store::default();
+    let (passive, retired) = store.reserve(&registration, &context, 10).into_parts();
+    assert!(
+        passive.is_none(),
+        "foreign ownership cannot admit a fresh passive watch"
+    );
+    drop(retired);
+    assert_eq!(facts.watches.opened.load(Ordering::Acquire), 0);
+    let slot = outcome_slot(&mut store, &context, 10, 'a');
+    let native = outcome_watch(&slot, &facts, &registration.vendor);
+    let capture = slot
+        .capture_with(
+            &registration.vendor,
+            &registration.shell,
+            &context,
+            9,
+            11,
+            native,
+            &facts,
+        )
+        .unwrap();
+    let (published, retired) = store
+        .publish_outcome_with(capture, &context, 9, 12, &facts)
+        .into_parts();
+    drop(retired);
+    let published = published.expect("the independently authorized exact outcome can be retained");
+    facts.remove(registration.vendor.pid);
+    facts
+        .foreground
+        .store(registration.shell.group, Ordering::Release);
+    *facts.group_gone.lock().unwrap() = Some(true);
+    facts.death(registration.vendor.pid, 1);
+    assert!(
+        store
+            .prove_with(&published.binding, &context, 9, 13, &facts)
+            .is_some()
+    );
+    // Even unchanged holder text cannot waive a new revision or a foreign release/ABA.
+    meta.supervisor_revision += 1;
+    let mut changed = context.clone();
+    changed.authority = meta.supervisor_authority(14);
+    assert!(!context.outcome_matches(&changed));
+    assert!(
+        store
+            .prove_with(&published.binding, &changed, 9, 14, &facts)
+            .is_none()
+    );
+    meta.supervisor = None;
+    meta.supervisor_revision += 1;
+    changed.authority = meta.supervisor_authority(15);
+    assert!(!context.outcome_matches(&changed));
+    assert!(
+        store
+            .prove_with(&published.binding, &changed, 9, 15, &facts)
+            .is_none()
+    );
+    meta.supervisor = foreign;
+    meta.supervisor_revision += 1;
+    changed.authority = meta.supervisor_authority(16);
+    assert!(!context.outcome_matches(&changed));
+    assert!(
+        store
+            .prove_with(&published.binding, &changed, 9, 16, &facts)
+            .is_none()
+    );
 }

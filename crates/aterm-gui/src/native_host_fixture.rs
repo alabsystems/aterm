@@ -77,7 +77,7 @@ fn fixture_record_native_action(
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(root.join("native-actions.jsonl"))?;
     if !file.metadata()?.is_file() {
         return Err(failure("fixture native trace is not regular"));

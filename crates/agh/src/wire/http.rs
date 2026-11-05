@@ -106,7 +106,19 @@ fn write_guard(req: &WireRequest<'_>) -> Option<WireError> {
         (Some(_), None) => true,
         (None, _) => false,
     };
-    if !on_credential_origin || !permit.covers(path) {
+    let covered = match req.atomic_refs {
+        Some(scope) => scope.covers(
+            permit,
+            req.method,
+            parsed.as_ref().map(|(origin, _)| origin),
+            parsed
+                .as_ref()
+                .map_or(req.url.as_str(), |(_, path)| path.as_str()),
+            &req.body,
+        ),
+        None => permit.covers(path),
+    };
+    if !on_credential_origin || !covered {
         let shown = match (&parsed, on_credential_origin) {
             (Some((origin, _)), false) => format!("{}{path}", origin.base()),
             _ => path.to_string(),
@@ -225,6 +237,7 @@ impl crate::wire::Transport for HttpTransport {
             permit: _,
             body_digest: _,
             as_profile: _,
+            atomic_refs: _,
         } = req;
         let mut builder = self.client.request(http_method(method), &url);
         for (name, value) in &headers {

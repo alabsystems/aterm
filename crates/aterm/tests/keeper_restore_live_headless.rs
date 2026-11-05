@@ -545,6 +545,32 @@ fn a_recovered_window_is_served_once_its_keeper_answers_with_its_link_quiet() {
     await_status(&mut ctl, "restore", "exact");
 }
 
+/// F01 on real processes: B adopts A's journaled session but runs it with no journal of its own
+/// (the seam refuses it, as a failed `SessionJournal::create` does), so no new region ever
+/// replaces A's. B's registration tells the keeper the session has none (COMPANION_RELEASE), the
+/// keeper drops A's region, and its answer to the SYNC behind that lifts B's recovery-count fence:
+/// B is served ([`admitted`], the one-minute must-happen wait), where before it answered
+/// `ERR recovery-count-custody unconfirmed` for the rest of its run. The link idles an hour, so
+/// only the keeper's own answer can lift it.
+#[test]
+fn a_recovered_session_without_a_journal_is_served_once_its_keeper_drops_the_old_one() {
+    let world = world("nj");
+    let root = world.0.clone();
+    let _keeper = keeper(&root);
+    let (a, sock) = boot(&root, "a", &[]);
+    let mut ctl = Ctl::connect(&sock);
+    sessions_in_custody(&root, &mut ctl, 0);
+    drop(ctl);
+    let (_b, mut ctl) = crash_and_recover(
+        &root,
+        a,
+        &[(NO_JOURNAL_SEAM, "1"), (QUIET_SEAM, AN_HOUR_MS)],
+    );
+    await_status(&mut ctl, "journal_off", "seam");
+    await_keeper(&root, "claimed=1");
+    await_keeper(&root, "journals=0");
+}
+
 /// A plain headless instance (no desk seam) that recovers more than one keeper session places
 /// every one, so its fence lifts: it has no glass to wait for before its restore pass.
 #[test]

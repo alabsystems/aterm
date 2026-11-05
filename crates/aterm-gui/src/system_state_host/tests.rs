@@ -90,7 +90,7 @@ mod queued_panes {
                 true
             },
             recorded: |_, _| Some(AccessOutcome::Triggered),
-            quiet: |_, _| true,
+            quiet: |app, _| queued_pane_front(app),
             ..StepsReach::INERT
         });
         app.config.privacy = Some(queued_pane_privacy(None));
@@ -586,7 +586,7 @@ fn an_automatic_offer_withdrawn_after_queueing_restores_only_fresh_policy() {
     });
     fresh(&mut app, policy());
     assert!(!app.workstation_setup.suppresses_permissions());
-    assert!(!app.person_permission_admission_stands());
+    assert!(app.permission_steps_admitted());
     let (send, receive) = mpsc::channel();
     let request = Request::new(Plan::default(), send);
     app.attach_system_state_offer(request.clone());
@@ -617,13 +617,13 @@ fn an_automatic_offer_withdrawn_after_queueing_restores_only_fresh_policy() {
     app.publish_system_state(policy());
     app.receive_system_state_status(Some(before_apply), policy());
     assert!(app.workstation_setup.suppresses_permissions());
-    assert!(!app.person_permission_admission_stands());
+    assert!(!app.permission_steps_admitted());
     fresh(&mut app, policy());
     assert!(
         !app.workstation_setup.suppresses_permissions(),
         "an abandoned automatic answer must converge on fresh durable policy"
     );
-    assert!(!app.person_permission_admission_stands());
+    assert!(app.permission_steps_admitted());
     assert!(
         receive.try_recv().is_err(),
         "the withdrawn offer stays answered once"
@@ -694,7 +694,7 @@ fn a_rejected_automatic_offer_restores_fresh_policy_unless_stopped() {
         assert!(app.workstation_setup.suppresses_permissions());
         fresh(&mut app, policy());
         assert_eq!(app.workstation_setup.suppresses_permissions(), stopped);
-        assert!(!app.person_permission_admission_stands());
+        assert_eq!(app.permission_steps_admitted(), !stopped);
         assert!(app.native_runtime.take_system_state_action().is_none());
         assert!(receive.try_recv().is_err());
     }
@@ -738,7 +738,7 @@ fn an_automatic_offer_with_a_closed_answer_receiver_restores_fresh_policy() {
     assert!(app.workstation_setup.suppresses_permissions());
     fresh(&mut app, policy());
     assert!(!app.workstation_setup.suppresses_permissions());
-    assert!(!app.person_permission_admission_stands());
+    assert!(app.permission_steps_admitted());
 }
 
 #[test]
@@ -783,7 +783,11 @@ fn a_refused_local_decision_keeps_its_permission_hold() {
             intent != "restore",
             "{intent}"
         );
-        assert!(!app.person_permission_admission_stands(), "{intent}");
+        assert_eq!(
+            app.permission_steps_admitted(),
+            intent == "restore",
+            "{intent}"
+        );
     }
 }
 
@@ -1143,7 +1147,7 @@ fn a_waiting_launch_offer_keeps_previous_permission_policy_held_and_allows_only_
     }
     assert!(calls().is_empty());
     assert!(app.workstation_setup.suppresses_permissions());
-    assert!(!app.person_permission_admission_stands());
+    assert!(!app.permission_steps_admitted());
     assert!(request.pending() && receive.try_recv().is_err());
     press(&mut app, wid, view, "system-state/check");
     assert_eq!(
@@ -2441,7 +2445,7 @@ mod observation_start {
             },
         );
         assert_eq!(app.access_revision(), None);
-        assert!(!app.person_permission_admission_stands());
+        assert!(!app.permission_steps_admitted());
         let next = app.system_state_host.next_tick.unwrap();
         tick(&mut app, next);
         assert_eq!(
@@ -2472,7 +2476,7 @@ mod observation_start {
         tick(&mut app, next);
         assert_eq!(reads().len(), 2, "the accepted refresh runs once");
         assert_eq!(app.access_revision(), None);
-        assert!(!app.person_permission_admission_stands());
+        assert!(!app.permission_steps_admitted());
     }
 
     #[test]
@@ -2498,7 +2502,7 @@ mod observation_start {
         assert_eq!(state.headline(), before, "known On readings remain facts");
         assert!(!state.can_open_access(Access::DeveloperTools));
         assert_eq!(app.access_revision(), None);
-        assert!(!app.person_permission_admission_stands());
+        assert!(!app.permission_steps_admitted());
     }
 
     /// While the GitHub repositories need a person, their remedy is the vault's (a token
@@ -4986,7 +4990,7 @@ fn admitted_here(app: &mut App) -> SetupStatus {
     app.note_system_state_apply(Admission::Person);
     app.accepted_initial_setup_apply();
     fresh(app, admitted.clone());
-    assert!(app.person_permission_admission_stands(), "the standing yes");
+    assert!(app.permission_steps_admitted(), "the standing yes");
     admitted
 }
 
@@ -5014,7 +5018,7 @@ fn a_read_that_met_a_write_keeps_the_page_and_the_windows_own_admission() {
     assert!(app.system_state_host.deadline(replied, true) <= Some(next));
     fresh(&mut app, admitted);
     assert!(
-        app.person_permission_admission_stands(),
+        app.permission_steps_admitted(),
         "still the window's own admission"
     );
     assert_eq!(app.access_revision(), Some(5));
@@ -5036,7 +5040,7 @@ fn records_that_keep_changing_show_on_the_page_alone() {
         fresh(&mut app, changing());
     }
     assert!(
-        app.person_permission_admission_stands(),
+        app.permission_steps_admitted(),
         "each read of a run says nothing"
     );
     assert_eq!(app.system_state_host.latest_status(), &admitted);
@@ -5045,7 +5049,7 @@ fn records_that_keep_changing_show_on_the_page_alone() {
     assert!(!app.workstation_setup.suppresses_permissions());
     fresh(&mut app, admitted.clone());
     assert!(
-        app.person_permission_admission_stands(),
+        app.permission_steps_admitted(),
         "the records settled: still the window's own admission"
     );
     assert_eq!(app.access_revision(), Some(5));
@@ -5057,7 +5061,7 @@ fn records_that_keep_changing_show_on_the_page_alone() {
         },
     );
     assert!(app.workstation_setup.suppresses_permissions());
-    assert!(!app.person_permission_admission_stands());
+    assert!(!app.permission_steps_admitted());
 }
 
 /// While the launch's offer waits for the page's first tick its headline is the one signal

@@ -14,6 +14,10 @@
 //!    the compiled ones, published into the new generation; the old generation's cover rows are
 //!    not carried. Past-quota automatic records stay inert: they never project, so nothing of
 //!    them is restated, and the new generation gives every writer its whole quota again.
+//!    A `Secret` cell's token is sealed to its table and coordinates, so each candidate the roll
+//!    carries is opened through the old generation's sealer and sealed again through the new
+//!    one's (`typed::secret::Sealer`): the old token's bytes are never copied, and no plaintext
+//!    leaves the roll.
 //! 2. **Archive.** Each owned row a reader projects (machine facts, mailbox observations) is
 //!    carried as the signed record that wrote it (`registry::ARCHIVED`), still sealed under the
 //!    old table's scope, so its signer and operation digest are its own: a reader authenticates
@@ -60,6 +64,7 @@ use crate::{
         self,
         cell::{self, CellKey, CellValue, Cells, Projection},
         keys, owned,
+        secret::Sealer,
     },
 };
 use astream_wire::sync::{Actor, Digest};
@@ -87,16 +92,22 @@ pub(crate) fn carried_origins<'a>(ops: impl IntoIterator<Item = &'a Command>) ->
 /// the old one. A register is written only where it holds a candidate no roll carried yet; it
 /// then holds that candidate and every other the old generation holds, and whatever the new one
 /// holds that the old history here does not show superseded. One change each. A collection
-/// `table` names as owned or log rows is no register: its rows go as archived records.
+/// `table` names as owned or log rows is no register: its rows go as archived records. A
+/// `Secret` column's candidates go through `reseal` (the old generation's sealer, then the
+/// new one's); a candidate the new generation already holds keeps the token it has there only
+/// where that token opens there: a token an older build's roll copied as it was is sealed for
+/// the old generation, so it is resealed, though its origin counts as carried.
 ///
 /// # Errors
-/// A register would hold more candidates than a carried value lists, or a key breaks a rule.
+/// A register would hold more candidates than a carried value lists, a key breaks a rule, or a
+/// `Secret` cannot be opened or sealed again.
 pub(crate) fn restate(
     table: &typed::Table,
     source: &Cells,
     held: &BTreeSet<Digest>,
     target: &Cells,
     carried: &BTreeSet<Digest>,
+    reseal: (&dyn Sealer, &dyn Sealer),
 ) -> Result<Vec<Vec<Change>>> {
     let mut rows = Vec::new();
     for ((collection, key), cell) in source {
@@ -108,16 +119,41 @@ pub(crate) fn restate(
         {
             continue;
         }
-        let old: BTreeMap<Digest, Value> = cell::origins(cell).into_iter().collect();
-        if old.keys().all(|origin| carried.contains(origin)) {
-            continue;
-        }
+        let mut old: BTreeMap<Digest, Value> = cell::origins(cell).into_iter().collect();
+        let secret = table.collection(collection).and_then(|known| {
+            let parsed = CellKey::parse(key).ok()?;
+            (parsed.elem.is_none()
+                && known
+                    .column(parsed.col)
+                    .is_some_and(|column| matches!(column.ty, typed::Ty::Secret)))
+            .then_some(parsed)
+        });
         let now: BTreeMap<Digest, Value> = target
             .get(&(collection.clone(), key.clone()))
             .map(cell::origins)
             .unwrap_or_default()
             .into_iter()
             .collect();
+        let opens = |value: &Value| {
+            secret
+                .as_ref()
+                .is_none_or(|parsed| opens_in(value, collection, parsed.pk, parsed.col, reseal.1))
+        };
+        if old
+            .keys()
+            .all(|origin| carried.contains(origin) && now.get(origin).is_none_or(opens))
+        {
+            continue;
+        }
+        if let Some(parsed) = &secret {
+            for (origin, value) in &mut old {
+                if let Some(there) = now.get(origin).filter(|there| opens(there)) {
+                    value.clone_from(there);
+                    continue;
+                }
+                reseal_value(value, collection, parsed.pk, parsed.col, reseal)?;
+            }
+        }
         let mut merged: BTreeMap<Digest, Value> = now
             .iter()
             .filter(|(origin, _)| !held.contains(*origin) || old.contains_key(*origin))
@@ -140,6 +176,41 @@ pub(crate) fn restate(
         }]);
     }
     Ok(rows)
+}
+
+/// Whether a `Secret` candidate opens through `sealer`: an empty one (`null`, bare or typed)
+/// holds nothing to open.
+fn opens_in(value: &Value, collection: &str, pk: &str, column: &str, sealer: &dyn Sealer) -> bool {
+    match value.get("x").unwrap_or(value) {
+        Value::Null => true,
+        Value::String(token) => sealer.open(collection, pk, column, token).is_ok(),
+        _ => false,
+    }
+}
+
+/// A `Secret` candidate's token opened through the old generation's sealer and sealed again
+/// through the new one's, in place; an empty candidate (`null`, bare as a revert leaves it or
+/// typed) stays.
+fn reseal_value(
+    value: &mut Value,
+    collection: &str,
+    pk: &str,
+    column: &str,
+    (from, to): (&dyn Sealer, &dyn Sealer),
+) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let Some(object) = value.as_object_mut() else {
+        return Err(Error::new("a Secret register is not a typed cell value"));
+    };
+    let Some(token) = object.get("x").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let secret = from.open(collection, pk, column, token)?;
+    let sealed = to.seal(collection, pk, column, &secret)?;
+    object.insert("x".into(), Value::String(sealed));
+    Ok(())
 }
 
 /// One operation of a table as the covers count it.
@@ -425,34 +496,173 @@ pub(crate) fn covered(
     ))
 }
 
+/// Each `Secret` register of `cells` holding a candidate whose token does not open through
+/// `sealer`, as (collection, pk, column): a token sealed for another table (an older build's roll
+/// copied it as it was) or under a key this Mac does not hold. An empty candidate (`null`, bare
+/// or typed) opens, holding nothing; a column or collection `table` does not name as `Secret` is
+/// no Secret register. Names coordinates only, never a value.
+pub(crate) fn unopened(
+    table: &typed::Table,
+    cells: &Cells,
+    sealer: &dyn Sealer,
+) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for ((collection, key), cell) in cells {
+        let Some(known) = table.collection(collection) else {
+            continue;
+        };
+        let Ok(parsed) = CellKey::parse(key) else {
+            continue;
+        };
+        if parsed.elem.is_some()
+            || !known
+                .column(parsed.col)
+                .is_some_and(|column| matches!(column.ty, typed::Ty::Secret))
+        {
+            continue;
+        }
+        if cell::origins(cell)
+            .iter()
+            .any(|(_, value)| !opens_in(value, collection, parsed.pk, parsed.col, sealer))
+        {
+            out.push((
+                collection.clone(),
+                parsed.pk.to_owned(),
+                parsed.col.to_owned(),
+            ));
+        }
+    }
+    out
+}
+
+/// What this Mac can say of a later registry generation another Mac declared, before it
+/// declares it too (`endorse`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Judged {
+    /// Its store is complete here, holds a roller's cover for the generation before it, and
+    /// every `Secret` candidate opens under its key.
+    Opens,
+    /// It cannot be judged yet: this Mac holds no store of it, its history here is incomplete, no
+    /// cover of the generation before it is there (a roller writes its cover last, so it says the
+    /// restated records before it are there), or its key is unavailable. A later housekeeping
+    /// pass judges it again.
+    Unjudged,
+    /// This many `Secret` registers hold a token that does not open under its key ([`unopened`]):
+    /// a roll by a build that copied tokens as they were (v0.154.0). Endorsing it would let that
+    /// roll seal and strand every such cell, so this Mac does not.
+    Unopened(usize),
+}
+
+/// Judge the registry generation `compiled` (whose predecessor in the chain is `previous`) as
+/// this Mac stores it. Fails closed: whatever cannot be read is [`Judged::Unjudged`].
+fn judge(
+    session: &Session<'_>,
+    directory: &Directory,
+    previous: &Compiled,
+    compiled: &Compiled,
+) -> Judged {
+    let trust = directory.trust();
+    let judged = || -> Result<Judged> {
+        let scope = compiled.descriptor(trust)?.scope;
+        let Some(store) = directory.observe_store_if_exists(session, scope)? else {
+            return Ok(Judged::Unjudged);
+        };
+        let log = Log::read_with(session, &store, scope, decode)?;
+        if !log.awaited(session.actor()).is_empty() {
+            return Ok(Judged::Unjudged);
+        }
+        let view = View::read(compiled.table, session, &log);
+        if covers(
+            &view,
+            owned::commons::historical(session),
+            previous.generation,
+        )
+        .is_empty()
+        {
+            return Ok(Judged::Unjudged);
+        }
+        let name = compiled.name();
+        let sealer = att::sealer(&name, session, scope)?;
+        Ok(match unopened(compiled.table, &view.cells, &sealer).len() {
+            0 => Judged::Opens,
+            n => Judged::Unopened(n),
+        })
+    };
+    judged().unwrap_or(Judged::Unjudged)
+}
+
+/// Each later registry generation this build compiles that `snapshot` names, with its predecessor
+/// and descriptor, judged here ([`judge`]), and whether this Mac has declared it.
+fn later_generations(
+    session: &Session<'_>,
+    directory: &Directory,
+    snapshot: &crate::catalog::Snapshot,
+) -> Vec<(&'static Compiled, crate::catalog::Descriptor, bool, Judged)> {
+    let trust = directory.trust();
+    let chain = att::REGISTRY.chain();
+    let mut out = Vec::new();
+    for pair in chain.windows(2) {
+        let [previous, compiled] = pair else {
+            continue;
+        };
+        let Ok(descriptor) = compiled.descriptor(trust) else {
+            continue;
+        };
+        let Some(entry) = snapshot.entries.get(&descriptor.scope.digest()) else {
+            continue;
+        };
+        let declared = entry
+            .declarations
+            .iter()
+            .any(|d| d.actor == session.actor());
+        out.push((
+            *compiled,
+            descriptor,
+            declared,
+            judge(session, directory, previous, compiled),
+        ));
+    }
+    out
+}
+
 /// Declare, as this Mac, each later registry generation this build compiles that `snapshot`
 /// shows another Mac declared and this one has not (`Directory::endorse`): the evidence a roll
 /// waits for before it seals the generation before it. Housekeeping on a claims write and a
 /// release pass, so it never fails its caller: a Mac that cannot declare now does at a later
 /// write.
+///
+/// A generation is declared only once it is judged to open (`judge`, design one-mesh §4.8, §11
+/// step A6): a roll by a build that copied a `Secret` cell's token as it was (v0.154.0, whose
+/// restatement carried an unknown column as it is) leaves a token sealed to the old table's
+/// name, which never opens in the new one, so this Mac refuses to declare it and the roll's seal
+/// keeps waiting for it, reporting it among the Macs it waits for. Refusing changes nothing
+/// here; a roll by this build reseals every such token (`restate`), and the next pass declares
+/// the generation. A generation this Mac cannot judge yet (no store, an incomplete history, no
+/// roller's cover) waits for a later pass. The roller's own roll declares its target directly,
+/// since its own restatement repairs the generation.
 pub(crate) fn endorse(
     session: &Session<'_>,
     directory: &Directory,
     snapshot: &crate::catalog::Snapshot,
 ) {
-    let trust = directory.trust();
-    for compiled in att::REGISTRY.chain().into_iter().skip(1) {
-        let Ok(descriptor) = compiled.descriptor(trust) else {
-            continue;
-        };
-        let waits = snapshot
-            .entries
-            .get(&descriptor.scope.digest())
-            .is_some_and(|entry| {
-                !entry
-                    .declarations
-                    .iter()
-                    .any(|d| d.actor == session.actor())
-            });
-        if waits {
+    for (_, descriptor, declared, judged) in later_generations(session, directory, snapshot) {
+        if !declared && judged == Judged::Opens {
             let _ = directory.endorse(session, &descriptor);
         }
     }
+}
+
+/// A later registry generation whose `Secret` cells do not all open under its key, as `aterm db
+/// alab check` names it: by generation and table digest, never a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unopened {
+    pub generation: u32,
+    /// Its descriptor's scope digest.
+    pub table: Digest,
+    /// The `Secret` registers holding a token that does not open.
+    pub cells: usize,
+    /// Whether this Mac declared it anyway (before this build refused such a generation).
+    pub declared: bool,
 }
 
 impl Registry {
@@ -516,7 +726,7 @@ impl Registry {
         let to_descriptor = to.descriptor(trust)?;
         let observed = directory.observe_store_if_exists(&session, to_descriptor.scope)?;
         let uuid = session
-            .members()
+            .members()?
             .iter()
             .find(|binding| binding.actor() == session.actor())
             .map(|binding| keys::uuid32(binding.machine()))
@@ -547,7 +757,18 @@ impl Registry {
                 }
                 None => Default::default(),
             };
-            let mut rows = restate(from.table, &old_view.cells, &held, &target, &carried)?;
+            let from_name = from.name();
+            let to_name = to.name();
+            let old_sealer = att::sealer(&from_name, &session, old_scope)?;
+            let new_sealer = att::sealer(&to_name, &session, to_descriptor.scope)?;
+            let mut rows = restate(
+                from.table,
+                &old_view.cells,
+                &held,
+                &target,
+                &carried,
+                (&old_sealer, &new_sealer),
+            )?;
             let registers = rows.len();
             let mut archived = 0;
             let mut operations: BTreeSet<Digest> = BTreeSet::new();
@@ -598,7 +819,7 @@ impl Registry {
         if !apply {
             if fresh {
                 // This Mac declares the next generation when it applies.
-                rolled.waiting = Directory::undeclared(&session, &snapshot, &to_descriptor);
+                rolled.waiting = Directory::undeclared(&session, &snapshot, &to_descriptor)?;
                 rolled
                     .waiting
                     .retain(|machine| keys::uuid32(machine) != uuid);
@@ -659,7 +880,7 @@ impl Registry {
         // (`Directory::endorse`), which only a build that compiles it does.
         if fresh {
             rolled.waiting =
-                Directory::undeclared(&session, &directory.snapshot(&session)?, &to_descriptor);
+                Directory::undeclared(&session, &directory.snapshot(&session)?, &to_descriptor)?;
             if rolled.waiting.is_empty() {
                 rolled.sealed = directory.seal(&session, &from.descriptor(trust)?)?;
             }
@@ -686,6 +907,35 @@ impl Registry {
         endorse(&session, &directory, &directory.snapshot(&session)?);
         let snapshot = directory.snapshot(&session)?;
         directory.release_sealed(&session, &snapshot, now_ms / 1000, &covered)
+    }
+
+    /// Each later registry generation the catalog names whose `Secret` cells do not all open
+    /// under its key (`Judged::Unopened`), which `endorse` refuses to declare: what `aterm db alab
+    /// check` names. A generation this Mac cannot judge yet is not listed. Reads only; declares
+    /// nothing.
+    ///
+    /// # Errors
+    /// No Commons here, or the catalog cannot be read.
+    pub fn unopened(&self) -> Result<Vec<Unopened>> {
+        let deadline = crate::admission::deadline();
+        let paths = crate::application_paths_until(self.paths(), deadline)?;
+        let (bootstrap, journal) = Bootstrap::required_with_journal_until(&paths, deadline)
+            .map_err(crate::table::failure)?;
+        let session = Session::from_admitted_journal_until(&bootstrap, journal, Some(deadline))?;
+        let directory = Directory::new(&paths, bootstrap.trust());
+        let snapshot = directory.snapshot(&session)?;
+        Ok(later_generations(&session, &directory, &snapshot)
+            .into_iter()
+            .filter_map(|(compiled, descriptor, declared, judged)| match judged {
+                Judged::Unopened(cells) => Some(Unopened {
+                    generation: compiled.generation,
+                    table: descriptor.scope.digest(),
+                    cells,
+                    declared,
+                }),
+                Judged::Opens | Judged::Unjudged => None,
+            })
+            .collect())
     }
 }
 

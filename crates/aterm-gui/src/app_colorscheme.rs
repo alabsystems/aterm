@@ -447,7 +447,7 @@ pub(crate) mod install_resolved_colors {
     /// Apply `text` as `aterm.toml` through the prepared config generation admission path.
     pub(crate) fn apply_config_text(app: &mut App, dir: &std::path::Path, text: &str) {
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, text).expect("write config");
+        crate::test_scratch::write_config(&path, text);
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .expect("observe");

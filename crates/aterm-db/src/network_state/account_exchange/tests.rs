@@ -264,6 +264,7 @@ fn completed(report: Report, peer: [u8; 48]) -> RepairRound {
         membership_error: None,
         application: Some(report),
         application_error: None,
+        application_cause: None,
         application_interrupted: None,
         application_deferral: None,
         application_batch_deferral: None,
@@ -332,12 +333,14 @@ fn admitted(
             round.application_deferral = Some(crate::replica::InventoryDeferral {
                 inventory: "operations",
                 local_error: None,
+                local_cause: None,
                 retaining_primary_conflicts: false,
                 peer_unavailable: true,
             })
         }
         "BatchDeferral" => {
             round.application_batch_deferral = Some(crate::replica::BatchDeferral {
+                cause: aterm_types::network_state::RepairCause::Other,
                 batch: "operations",
                 stage: "ingest",
                 reason: "fixed fixture failure".into(),

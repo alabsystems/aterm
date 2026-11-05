@@ -2367,6 +2367,7 @@ fn by_r1(actor: &ExitActor) -> String {
         ExitActor::Ctl => "ctl".to_string(),
         ExitActor::Harness => "harness".to_string(),
         ExitActor::Bridge => "bridge".to_string(),
+        ExitActor::Fleet(token) => token.clone(),
     }
 }
 
@@ -2556,7 +2557,11 @@ fn the_roster_and_the_closed_index_agree_on_every_exit() {
     assert_eq!(b, a + 1, "the first's deregister minted the lower seq");
     let exits = closed_exits(&app);
     let shipped = exits_agree(&app, &rows, &exits, ExitReason::as_str);
-    assert_eq!(shipped, Ok(39), "{shipped:?}");
+    assert_eq!(
+        shipped,
+        Ok(ExitReason::ALL.len() * actors.len() + 3),
+        "every reason by every actor, then the last close and the two interleaved: {shipped:?}"
+    );
     let closers = |exits: &[crate::session_log::ClosedExit]| -> Vec<ExitActor> {
         exits
             .iter()

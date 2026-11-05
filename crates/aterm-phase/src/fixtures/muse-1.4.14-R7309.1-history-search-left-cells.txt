@@ -1,0 +1,4 @@
+# muse 1.4.14-R7309.1 · MEASURED 2026-11-04 · `aterm ctl cell <row> <col>` of the composer row's first glyphs on muse-1.4.14-R7309.1-history-search-left.txt (the match the search left, typed ink), one per line: the row, the column, the reply
+14 2 OK a ccd3db 111318 none
+14 3 OK l ccd3db 111318 none
+14 4 OK p ccd3db 111318 none

@@ -17,7 +17,7 @@ use crate::{
     age::{self, Identity},
 };
 use aterm_digest::Sha256;
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use zeroize::Zeroizing;
 
 const DOMAIN: &[u8] = b"aterm/commons/history-handoff/1\0";
@@ -66,9 +66,13 @@ impl Handoff {
             return Err(Error::new("history handoff has another context or length"));
         }
         let signed = wire.len() - 64;
-        UnparsedPublicKey::new(&ED25519, issuer.writer())
-            .verify(&[DOMAIN, &wire[..signed]].concat(), &wire[signed..])
-            .map_err(|_| Error::new("history handoff signature does not verify"))?;
+        if !crate::ed25519::verifies(
+            issuer.writer(),
+            &[DOMAIN, &wire[..signed]].concat(),
+            &wire[signed..],
+        ) {
+            return Err(Error::new("history handoff signature does not verify"));
+        }
         Ok(Self {
             trust,
             source,

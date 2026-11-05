@@ -558,8 +558,8 @@ impl Floor {
             let mut f = crate::platform::open_create_new_write(tmp, 0o600)?;
             f.write_all(value.to_string().as_bytes())?;
             crate::platform::sync_durable(&f)?;
+            crate::platform::set_mode_on(&f, 0o644)?;
         }
-        crate::platform::set_mode(tmp, 0o644)?;
         std::fs::rename(tmp, &self.path)
     }
 }

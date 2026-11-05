@@ -320,6 +320,7 @@ pub fn edit_files(
             create: missing,
             for_word: for_word.map(str::to_string),
             wait: !args.no_wait,
+            read_only: false,
         };
         let opened = match window.edit(&request) {
             Ok(opened) => opened,
@@ -698,6 +699,7 @@ mod tests {
             create: false,
             for_word: Some(word),
             wait: true,
+            read_only: false,
         };
         for byte in 0..=u8::MAX {
             let sent = request(char::from(byte).to_string()).format().is_ok();

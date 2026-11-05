@@ -224,27 +224,8 @@ impl PartialBake {
         )
     )]
     pub fn seal(self) -> Result<PathBuf, Error> {
-        #[cfg(unix)]
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-                .open(&self.partial)
-                .map_err(|e| io("open", &self.partial, &e))?
-        };
-        #[cfg(not(unix))]
-        let file = std::fs::File::open(&self.partial).map_err(|e| io("open", &self.partial, &e))?;
-        if !file
-            .metadata()
-            .map_err(|e| io("open", &self.partial, &e))?
-            .is_file()
-        {
-            return Err(Error::Io(format!(
-                "could not open {}: not a regular file",
-                self.partial.display()
-            )));
-        }
+        let (file, _) = crate::open_regular_nonblock_with_meta(&self.partial)
+            .map_err(|e| io("open", &self.partial, &e))?;
         aterm_durable::durable(&file).map_err(|e| io("flush", &self.partial, &e))?;
         drop(file);
         crate::read_only(&self.partial)?;
@@ -579,24 +560,14 @@ impl Layers {
                 .map_err(|e| io("write the seed in", &files, &e))?;
             let made = scratch.path().join("seed.iso");
             host.make_iso(&files, &made).map_err(Error::Io)?;
-            let made_meta = std::fs::symlink_metadata(&made).map_err(|e| io("read", &made, &e))?;
-            if !made_meta.file_type().is_file() || made_meta.len() == 0 {
+            let (made_file, made_meta) =
+                crate::open_regular_nonblock_with_meta(&made).map_err(|e| io("open", &made, &e))?;
+            if made_meta.len() == 0 {
                 return Err(Error::Io(format!(
                     "could not make {}: not a non-empty regular file",
                     made.display()
                 )));
             }
-            #[cfg(unix)]
-            let made_file = {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-                    .open(&made)
-            };
-            #[cfg(not(unix))]
-            let made_file = std::fs::File::open(&made);
-            let made_file = made_file.map_err(|e| io("open", &made, &e))?;
             aterm_durable::durable(&made_file).map_err(|e| io("flush", &made, &e))?;
             drop(made_file);
             std::fs::rename(&made, &iso).map_err(|e| io("place", &iso, &e))?;
@@ -619,9 +590,10 @@ impl Layers {
 /// Create `dir` and its missing parents if absent, refusing when `dir` is a symlink or
 /// non-directory.
 fn ensure_real_dir(dir: &Path) -> Result<(), Error> {
-    if let Ok(meta) = std::fs::symlink_metadata(dir)
-        && !meta.file_type().is_dir()
-    {
+    if let Ok(meta) = std::fs::symlink_metadata(dir) {
+        if meta.file_type().is_dir() {
+            return Ok(());
+        }
         return Err(Error::Io(format!(
             "could not create {}: not a real directory",
             dir.display()

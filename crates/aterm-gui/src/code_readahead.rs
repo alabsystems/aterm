@@ -6,12 +6,21 @@
 /// Ask the kernel to read this executable's `__TEXT` into the page cache now.
 #[cfg(target_os = "macos")]
 pub(crate) fn read_ahead_own_code() {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let Some((offset, length)) = own_code_range() else {
         return;
     };
-    let Ok(file) = std::env::current_exe().and_then(std::fs::File::open) else {
+    let Ok(file) = std::env::current_exe().and_then(|exe| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(exe)
+    }) else {
         return;
     };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return;
+    }
     let _ = read_ahead(&file, offset, length);
 }
 

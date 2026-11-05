@@ -1161,8 +1161,9 @@ impl HarnessState {
                 "Waited at limits",
                 waited(today.limit_wait_ms, week.limit_wait_ms),
             ));
-            // The occupancy door's fact lines, by kind: typed under `prompt`, would-be under
-            // `observe`. Shown once a week holds any.
+            // The fact lines, by kind: typed, and would-be under `observe`. Each book's row is
+            // shown for a kind once the week's book holds it, so a kind that has no `observe`
+            // mode shows no would-be row that could only read zero.
             let kinds: std::collections::BTreeSet<&String> = week
                 .facts_told
                 .keys()
@@ -1171,14 +1172,17 @@ impl HarnessState {
             let of =
                 |book: &BTreeMap<String, u64>, kind: &str| book.get(kind).copied().unwrap_or(0);
             for kind in kinds {
-                rows.push(row(
-                    &format!("Facts told ({kind})"),
-                    both(of(&today.facts_told, kind), of(&week.facts_told, kind)),
-                ));
-                rows.push(row(
-                    &format!("Facts it would tell ({kind})"),
-                    both(of(&today.facts_would, kind), of(&week.facts_would, kind)),
-                ));
+                for (label, today_book, week_book) in [
+                    ("Facts told", &today.facts_told, &week.facts_told),
+                    ("Facts it would tell", &today.facts_would, &week.facts_would),
+                ] {
+                    if week_book.contains_key(kind.as_str()) {
+                        rows.push(row(
+                            &format!("{label} ({kind})"),
+                            both(of(today_book, kind), of(week_book, kind)),
+                        ));
+                    }
+                }
             }
         }
         rows.extend(others);
@@ -2876,6 +2880,12 @@ impl App {
         self.view_store.iter().any(|(view, link)| {
             matches!(link, crate::tab_model::View::Native(_)) && self.tabs_page_in(view)
         })
+    }
+
+    /// Whether a Tab Control / Fleet Monitor page is on screen ([`Self::view_on_screen`]), where
+    /// [`Self::tabs_page_shown`] counts one in a tab behind another or in an occluded window too.
+    pub(crate) fn tabs_page_on_screen(&self) -> bool {
+        self.view_on_screen(|view| self.tabs_page_in(view))
     }
 
     /// Something the page shows moved (a host note, a claim, a session's end): republish while a view shows the page.

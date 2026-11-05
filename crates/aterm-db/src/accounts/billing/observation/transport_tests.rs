@@ -7,18 +7,19 @@ use crate::resources::{Observation, Outcome};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) fn transport_transition(
+    world: &super::broker_tests::World,
     before: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    transition_with(before, action, false)
+    transition_with(world, before, action, false)
 }
 
 fn transition_with(
+    (f, broker, token, _): &super::broker_tests::World,
     before: &aterm_spec::interp::State,
     action: &str,
     omit_eof: bool,
 ) -> aterm_spec::interp::State {
-    let (f, broker, token, _) = super::broker_tests::setup();
     let entered = AtomicUsize::new(0);
     let run = |request: &crate::resources::BoundRequest, credential: &[u8], until: Instant| {
         assert_eq!(request.payload(), b"private request");
@@ -33,7 +34,7 @@ fn transition_with(
             .unwrap(),
         )
     };
-    let (served, reply) = transport::tests::exchange(&broker, &token, action, omit_eof, run);
+    let (served, reply) = transport::tests::exchange(broker, token, action, omit_eof, run);
     if action == "Fresh" {
         assert!(served.is_ok(), "server: {served:?}");
         assert!(reply.is_ok(), "client: {reply:?}");
@@ -49,7 +50,7 @@ fn transition_with(
             1,
             "lost reply server: {served:?}"
         );
-        let (_, retry) = transport::tests::exchange(&broker, &token, "Retry", false, |_, _, _| {
+        let (_, retry) = transport::tests::exchange(broker, token, "Retry", false, |_, _, _| {
             panic!("lost reply replay")
         });
         let retry = retry.unwrap();
@@ -58,7 +59,7 @@ fn transition_with(
         assert!(retry.body.is_empty());
     } else if action == "Retry" {
         let (_, retry) =
-            transport::tests::exchange(&broker, &token, "Retry", false, |_, _, _| panic!("replay"));
+            transport::tests::exchange(broker, token, "Retry", false, |_, _, _| panic!("replay"));
         let retry = retry.unwrap();
         assert_eq!(retry.status, Status::Completed);
         assert!(!retry.entered);
@@ -100,21 +101,50 @@ fn transition_with(
     next
 }
 
+/// The model's steps on three worlds: the nine frames the broker refuses with nothing entered or
+/// charged, then `Fresh` on the same world, whose acceptance shows none of them burned the token
+/// or left a charge; `LostReply` and `Retry` each on its own, since each changes the world.
+/// GAP: a refused frame no longer always meets a pristine broker (`Retry`'s first frame does). A
+/// refusal only because of what an earlier refused frame changed, which `Fresh` does not expose,
+/// is not seen.
 #[test]
 fn broker_transport_conforms_and_eof_barrier_is_necessary() {
     let model = aterm_models_db::broker_transport_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let initial = model.init_state();
-    aterm_spec::fs_lane::each(&model.actions, |action| {
-        let next = super::transport_transition(&initial, action.name);
-        assert!(
-            model.successors(action.name, &initial).contains(&next),
-            "{}: {next:?}",
-            action.name
-        );
-        next
+    let worlds: [&[&str]; 3] = [
+        &[
+            "Trailing",
+            "ShortHeader",
+            "ShortBody",
+            "Oversize",
+            "Version",
+            "Expired",
+            "WrongToken",
+            "WrongAdapter",
+            "NoEof",
+            "Fresh",
+        ],
+        &["LostReply"],
+        &["Retry"],
+    ];
+    // A new action falls out of the walk here, not silently.
+    let mut named: Vec<_> = worlds.iter().copied().flatten().copied().collect();
+    let mut actions: Vec<_> = model.actions.iter().map(|action| action.name).collect();
+    named.sort_unstable();
+    actions.sort_unstable();
+    assert_eq!(named, actions);
+    aterm_spec::fs_lane::each(&worlds, |steps| {
+        let world = super::broker_tests::setup();
+        for action in *steps {
+            let next = super::transport_transition(&world, &initial, action);
+            assert!(
+                model.successors(action, &initial).contains(&next),
+                "{action}: {next:?}"
+            );
+        }
     });
-    let unsafe_next = transition_with(&initial, "Trailing", true);
+    let unsafe_next = transition_with(&super::broker_tests::setup(), &initial, "Trailing", true);
     assert!(!model.check_invariant("FrameBeforeEffect", &unsafe_next));
 }
 

@@ -1784,10 +1784,14 @@ fn above_the_floor_or_switched_off_an_ended_sessions_build_is_any_other() {
 #[test]
 fn a_registered_cache_is_visible_after_the_broad_search_has_spent_its_budget() {
     let tmp = Tmp::new("registered-holder");
-    let home = canon(&mkdirs(&tmp.path().join("home")));
-    let workspace = mkdirs(&home.join("codex"));
+    let home = tmp.path().join("home");
+    aterm_uds::private_file::ensure_private_dir(&home).unwrap();
+    let home = canon(&home);
+    let workspace = home.join("codex");
+    aterm_uds::private_file::ensure_private_dir(&workspace).unwrap();
     std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
-    let parent = mkdirs(&home.join(".ubd"));
+    let parent = home.join(".ubd");
+    aterm_uds::private_file::ensure_private_dir(&parent).unwrap();
     let cache = parent.join("codex-build.noindex");
     assert!(atpkg::build_cache::registered::create_checked(&home, &cache, &workspace).unwrap());
     lay_target(&cache);
@@ -2945,12 +2949,12 @@ fn survey_projected(
     report(&s, config)
 }
 
-/// The night's incident (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.2): at `low`, above the
-/// floor, a removed workspace's build cache two hours quiet waited out the day's window; under a
-/// projection it goes whole after the ten minutes every pressure tier holds, every other fence
-/// standing.
+/// The night's incident (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.2), and m20's on
+/// 2026-11-05: a removed workspace's build cache two hours quiet waited out the day's window. At
+/// `low` above the floor, and under a projection, it goes whole after the ten minutes every
+/// pressure tier holds, every other fence standing.
 #[test]
-fn under_a_projection_a_removed_workspaces_build_cache_goes_whole_inside_the_days_window() {
+fn a_removed_workspaces_build_cache_goes_whole_after_ten_quiet_minutes() {
     use crate::harness::disk::fill;
     let tmp = Tmp::new("discover-build-cache-projected");
     let home = mkdirs(&tmp.path().join("home"));
@@ -2963,11 +2967,18 @@ fn under_a_projection_a_removed_workspaces_build_cache_goes_whole_inside_the_day
     let p = fill::Projection::of(40_000_000, low, floor, None);
 
     let (_, rep) = survey_at(&tmp, &roots_at(&tmp), now, low, cfg(true));
-    assert!(
-        whole_paths(&rep).is_empty(),
-        "at plain low the day's window keeps it: {:#?}",
+    assert_eq!(
+        whole_paths(&rep),
+        vec![gone.clone()],
+        "at plain low, no day's window: {:#?}",
         rep.notes
     );
+
+    // NEGATIVE CONTROL: a scan that keeps the day's window takes nothing, at low or projected.
+    let (_, rep) = fill::fault::with(fill::fault::Fault::GoneWaitsTheDay, || {
+        survey_at(&tmp, &roots_at(&tmp), now, low, cfg(true))
+    });
+    assert!(whole_paths(&rep).is_empty(), "{:#?}", rep.rows);
 
     let rep = survey_projected(&tmp, &roots_at(&tmp), now, low, p);
     assert_eq!(whole_paths(&rep), vec![gone.clone()], "{:#?}", rep.notes);
@@ -2989,8 +3000,7 @@ fn under_a_projection_a_removed_workspaces_build_cache_goes_whole_inside_the_day
         rep.notes
     );
 
-    // NEGATIVE CONTROL: a scan that keeps the day's window under a projection takes nothing.
-    let rep = fill::fault::with(fill::fault::Fault::GoneQuietUnderProjection, || {
+    let rep = fill::fault::with(fill::fault::Fault::GoneWaitsTheDay, || {
         survey_projected(&tmp, &roots_at(&tmp), now, low, p)
     });
     assert!(whole_paths(&rep).is_empty(), "{:#?}", rep.rows);
@@ -3010,4 +3020,170 @@ fn under_a_projection_a_removed_workspaces_build_cache_goes_whole_inside_the_day
         just.join("debug/deps/liblay.rlib").is_file(),
         "the fresh one stayed"
     );
+}
+
+/// A checkout in this home whose `target` link names a target that is not there, and the walk
+/// over it.
+fn walk_dangling(tmp: &Tmp, target: &Path) -> (PathBuf, Discovered) {
+    let home = mkdirs(&tmp.path().join("home"));
+    let repo = mkdirs(&home.join("repo"));
+    mkdirs(&repo.join(".git"));
+    symlink(target, repo.join("target")).expect("target link");
+    let d = discover(&roots_at(tmp), Budget::SHIPPED);
+    (canon(&repo), d)
+}
+
+/// A DANGLING TARGET LINK IS RECORDED AND LEFT IN PLACE: a checkout's `target -> target.noindex`
+/// whose `target.noindex` was removed is named with its checkout and its target as the link says
+/// it, found as no build directory, and still the same link after the walk. NEGATIVE CONTROL:
+/// drop the record, and the walk names nothing.
+#[test]
+fn a_dangling_target_link_is_recorded_and_left_in_place() {
+    let tmp = Tmp::new("dangling-target");
+    let (repo, d) = walk_dangling(&tmp, Path::new("target.noindex"));
+    assert_eq!(
+        d.dangling,
+        vec![Dangling {
+            link: repo.join("target"),
+            target: PathBuf::from("target.noindex"),
+            checkout: repo.clone(),
+            state: aterm_vitals::left::LinkTarget::Gone,
+        }]
+    );
+    assert!(d.found.is_empty(), "{:?}", d.found);
+    let link = repo.join("target");
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()),
+        "the link is left where it was"
+    );
+    assert_eq!(
+        std::fs::read_link(&link).expect("still a link"),
+        PathBuf::from("target.noindex"),
+        "and points where it pointed"
+    );
+}
+
+/// A LINK NOT NAMED `target` IS NOT RECORDED: the walk follows a checkout's `target*` link only,
+/// so a dangling `build` or `cache` link is no build link of its, and a `target-tippy` one is.
+#[test]
+fn a_link_not_named_target_is_not_recorded() {
+    let tmp = Tmp::new("dangling-other");
+    let home = mkdirs(&tmp.path().join("home"));
+    let repo = mkdirs(&home.join("repo"));
+    mkdirs(&repo.join(".git"));
+    symlink("gone-build", repo.join("build")).expect("build link");
+    symlink("gone-cache", repo.join("cache")).expect("cache link");
+    symlink("gone-tippy", repo.join("target-tippy")).expect("tippy link");
+    let d = discover(&roots_at(&tmp), Budget::SHIPPED);
+    let links: Vec<PathBuf> = d.dangling.iter().map(|l| l.link.clone()).collect();
+    assert_eq!(links, vec![canon(&repo).join("target-tippy")]);
+}
+
+/// A TARGET ON A VOLUME NOT MOUNTED IS NAMED NOT MOUNTED: a link into the folder this system
+/// mounts volumes in, under a volume that is not there, is a cache on a volume not mounted now,
+/// told apart from one that is gone.
+#[test]
+fn a_target_on_a_volume_not_mounted_is_named_not_mounted() {
+    let Some(&(folder, per_user)) = VOLUME_FOLDERS
+        .iter()
+        .find(|(folder, _)| std::fs::symlink_metadata(folder).is_ok())
+    else {
+        aterm_uds::host::could_not_run("this system has none of the folders it mounts volumes in");
+    };
+    let volume = format!("aterm-absent-volume-{}", std::process::id());
+    let mut target = PathBuf::from(folder);
+    if per_user {
+        target.push(format!("aterm-absent-user-{}", std::process::id()));
+    }
+    target.push(&volume);
+    target.push("cache/target");
+    let tmp = Tmp::new("dangling-unmounted");
+    let (repo, d) = walk_dangling(&tmp, &target);
+    assert_eq!(
+        d.dangling
+            .iter()
+            .map(|l| (l.link.clone(), l.state))
+            .collect::<Vec<_>>(),
+        vec![(
+            repo.join("target"),
+            aterm_vitals::left::LinkTarget::NotMounted
+        )]
+    );
+}
+
+/// A TARGET UNDER AN EMPTY MOUNT POINT IS NAMED NOT MOUNTED: a folder in the folder volumes are
+/// mounted in that is there with nothing mounted on it (`/mnt/<volume>` stays while its volume is
+/// not mounted) is the volume's place, not where the target was; a folder of the same device
+/// deeper in is where it was, so a target missing there is gone. NEGATIVE CONTROL: judge by the
+/// nearest folder that is there alone, and the empty mount point's target reads gone.
+#[test]
+fn a_target_under_an_empty_mount_point_is_named_not_mounted() {
+    let tmp = Tmp::new("dangling-mount-point");
+    let mnt = mkdirs(&canon(tmp.path()).join("mnt"));
+    let point = mkdirs(&mnt.join("nvme"));
+    let folders = [(mnt.to_str().expect("utf-8 scratch"), false)];
+    assert!(on_missing_volume_in(&point.join("cargo-target"), &folders));
+    assert!(
+        on_missing_volume_in(&mnt.join("usb/cache"), &folders),
+        "no folder at all"
+    );
+    let deeper = mkdirs(&point.join("cache"));
+    assert!(
+        !on_missing_volume_in(&deeper.join("target"), &folders),
+        "gone from a folder that is there"
+    );
+}
+
+/// A RELATIVE TARGET THAT CLIMBS OUT OF THE CHECKOUT IS JUDGED WHERE IT LEADS: `../` parts are
+/// taken as the path's own words, so a link into the folder volumes are mounted in through
+/// `../../..` is a target on a volume not mounted, as its absolute spelling is. NEGATIVE CONTROL:
+/// join the target to the link's folder as written, and the walk up meets the climb's own folders
+/// and names it gone.
+#[test]
+fn a_relative_target_that_climbs_out_is_judged_where_it_leads() {
+    let tmp = Tmp::new("dangling-climb");
+    let root = canon(tmp.path());
+    let repo = mkdirs(&root.join("home/alice/repo"));
+    let mnt = mkdirs(&root.join("mnt"));
+    let to = Path::new("../../../mnt/ext/cache");
+    let abs = link_target(&repo, to);
+    assert_eq!(abs, mnt.join("ext/cache"));
+    let folders = [(mnt.to_str().expect("utf-8 scratch"), false)];
+    assert!(on_missing_volume_in(&abs, &folders));
+    assert_eq!(
+        link_target(&repo, Path::new("./target.noindex")),
+        repo.join("target.noindex")
+    );
+}
+
+/// A RECORDED LINK IS READ AGAIN AT EACH LOOK: while it still names its target and that target
+/// is not there it stays, its state read anew; once the target is back, the link is gone or it
+/// names another target, it drops; and the list keeps each link once, the records before a
+/// search's. NEGATIVE CONTROL: keep a record unread, and the rebuilt target still reads dangling.
+#[test]
+fn a_recorded_link_is_read_again_at_each_look() {
+    let tmp = Tmp::new("dangling-again");
+    let (repo, d) = walk_dangling(&tmp, Path::new("target.noindex"));
+    let link = d.dangling[0].clone();
+    assert_eq!(
+        still_dangling(vec![link.clone()], d.dangling.clone()),
+        vec![link.clone()],
+        "once"
+    );
+    mkdirs(&repo.join("target.noindex"));
+    assert_eq!(link.clone().again(), None, "its target is back");
+    std::fs::remove_dir(repo.join("target.noindex")).expect("removed again");
+    assert_eq!(link.clone().again(), Some(link.clone()), "gone again");
+    std::fs::remove_file(&link.link).expect("unlinked");
+    symlink("elsewhere.noindex", &link.link).expect("relinked");
+    assert_eq!(link.again(), None, "it names another target now");
+}
+
+/// THE CENSUS SAYS IT IS STILL GOING, PER PROCESS: it reads each one's arguments and executable, and
+/// nothing bounds how many a user runs.
+#[test]
+fn reading_a_process_ticks() {
+    let before = aterm_uds::progress::ticks_here();
+    let _ = read_process(std::process::id(), None, None);
+    assert_eq!(aterm_uds::progress::ticks_here() - before, 1);
 }

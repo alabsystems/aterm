@@ -841,6 +841,17 @@ impl DedupIndex {
         true
     }
 
+    /// Call `f` with every held `(producer_id, producer_seq, offset)` below offset `min`.
+    #[cfg(all(feature = "retention", feature = "relay"))]
+    pub(crate) fn each_below(&self, min: u64, mut f: impl FnMut(u64, u64, u64)) {
+        self.each(|producer_id, producer_seq, off| {
+            if !crate::store::dedup_retains_from_cut(off, min) {
+                f(producer_id, producer_seq, off);
+            }
+            true
+        });
+    }
+
     /// Every held key and its offset, sorted.
     #[cfg(test)]
     pub(crate) fn entries(&self) -> Vec<((u64, u64), u64)> {

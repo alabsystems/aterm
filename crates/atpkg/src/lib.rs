@@ -200,7 +200,9 @@ pub use manifest::{
     Artifact, Channel, Cost, Index, PkgManifest, Program, SUPPORTED_SCHEMA, TARGETS, parse_pkg,
 };
 pub use net::{DirFetcher, GithubFetcher};
-pub use ops::{active_builds, installed_exposes, list_installed, uninstall, which};
+pub use ops::{
+    active_build_of, active_builds, installed_exposes, list_installed, uninstall, which,
+};
 pub use select::{Candidate, Selected, Selection, select_index};
 pub use sig::{
     Anchor, BuildFloor, Floor, Reject, TrustedIndex, TrustedRoster, VerifiedBytes, admit_roster,

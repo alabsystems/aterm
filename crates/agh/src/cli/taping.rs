@@ -65,12 +65,16 @@ fn api_method(inv: &Invocation) -> String {
 }
 
 /// A one-shot write recorded against github.com (plan §14, body 5): `release create`,
-/// `release ensure`, `ref create`, or an `api` POST, `--dry-run` included.
+/// `release ensure`, `ref create`, `ref update-atomic`, or an `api` POST,
+/// `--dry-run` included.
 fn one_shot(inv: &Invocation) -> bool {
     let path = inv.path.as_slice();
     matches!(
         path,
-        ["release", "create"] | ["release", "ensure"] | ["ref", "create"]
+        ["release", "create"]
+            | ["release", "ensure"]
+            | ["ref", "create"]
+            | ["ref", "update-atomic"]
     ) || (path == ["api"] && api_method(inv) == "POST")
 }
 

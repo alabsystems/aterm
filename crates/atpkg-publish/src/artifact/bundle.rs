@@ -388,11 +388,11 @@ pub fn admit<'a>(
 /// # Errors
 /// An I/O failure, or a special file.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
-    let mut seen: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
+    let mut seen: BTreeMap<u64, (u64, PathBuf)> = BTreeMap::new();
     copy_into(src, dst, &mut seen)
 }
 
-fn copy_into(src: &Path, dst: &Path, seen: &mut BTreeMap<(u64, u64), PathBuf>) -> Result<()> {
+fn copy_into(src: &Path, dst: &Path, seen: &mut BTreeMap<u64, (u64, PathBuf)>) -> Result<()> {
     std::fs::create_dir_all(dst).map_err(|e| Error::io(format!("mkdir {}", dst.display()), &e))?;
     let mut entries: Vec<_> = std::fs::read_dir(src)
         .map_err(|e| Error::io(format!("read {}", src.display()), &e))?
@@ -401,9 +401,9 @@ fn copy_into(src: &Path, dst: &Path, seen: &mut BTreeMap<(u64, u64), PathBuf>) -
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for e in entries {
         let (from, to) = (e.path(), dst.join(e.file_name()));
-        let meta = std::fs::symlink_metadata(&from)
+        let ft = e
+            .file_type()
             .map_err(|err| Error::io(format!("stat {}", from.display()), &err))?;
-        let ft = meta.file_type();
         if ft.is_symlink() {
             let target = std::fs::read_link(&from)
                 .map_err(|err| Error::io(format!("readlink {}", from.display()), &err))?;
@@ -411,17 +411,22 @@ fn copy_into(src: &Path, dst: &Path, seen: &mut BTreeMap<(u64, u64), PathBuf>) -
         } else if ft.is_dir() {
             copy_into(&from, &to, seen)?;
         } else if ft.is_file() {
-            if let Some(key) = inode(&meta)
-                && let Some(first) = seen.get(&key)
+            if let Some(ino) = entry_ino(&e)
+                && let Some((seen_dev, first)) = seen.get(&ino)
             {
-                std::fs::hard_link(first, &to)
-                    .map_err(|err| Error::io(format!("link {}", to.display()), &err))?;
-                continue;
+                let meta = e
+                    .metadata()
+                    .map_err(|err| Error::io(format!("stat {}", from.display()), &err))?;
+                if inode(&meta) == Some((*seen_dev, ino)) {
+                    std::fs::hard_link(first, &to)
+                        .map_err(|err| Error::io(format!("link {}", to.display()), &err))?;
+                    continue;
+                }
             }
-            std::fs::copy(&from, &to)
+            let meta = crate::identity::copy_regular_file(&from, &to)
                 .map_err(|err| Error::io(format!("copy {}", from.display()), &err))?;
-            if let Some(key) = inode(&meta) {
-                seen.insert(key, to);
+            if let Some((dev, ino)) = inode(&meta) {
+                seen.entry(ino).or_insert((dev, to));
             }
         } else {
             return Err(Error::refused(format!(
@@ -431,6 +436,19 @@ fn copy_into(src: &Path, dst: &Path, seen: &mut BTreeMap<(u64, u64), PathBuf>) -
         }
     }
     Ok(())
+}
+
+fn entry_ino(entry: &std::fs::DirEntry) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirEntryExt as _;
+        Some(entry.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = entry;
+        None
+    }
 }
 
 fn symlink(target: &Path, link: &Path) -> Result<()> {
@@ -462,19 +480,23 @@ fn inode(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     }
 }
 
-fn same_inode(a: &Path, b: &Path) -> bool {
+fn same_meta_inode(x: &std::fs::Metadata, y: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        match (std::fs::metadata(a), std::fs::metadata(b)) {
-            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
-            _ => false,
-        }
+        x.dev() == y.dev() && x.ino() == y.ino()
     }
     #[cfg(not(unix))]
     {
-        let _ = (a, b);
+        let _ = (x, y);
         false
+    }
+}
+
+fn same_inode(a: &Path, b: &Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => same_meta_inode(&x, &y),
+        _ => false,
     }
 }
 
@@ -592,14 +614,22 @@ pub fn prune_foreign_targets(root: &Path, triple: Triple, keep: &[String]) -> Re
 pub fn require_target_std(root: &Path) -> Result<()> {
     let rustlib = root.join("lib/rustlib");
     for e in std::fs::read_dir(&rustlib).into_iter().flatten().flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.matches('-').count() < 2 || !e.path().is_dir() {
+        let file_name = e.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let is_dir = e
+            .file_type()
+            .map(|ft| ft.is_dir() || (ft.is_symlink() && e.path().is_dir()))
+            .unwrap_or(false);
+        if name.matches('-').count() < 2 || !is_dir {
             continue;
         }
         let has_std = std::fs::read_dir(e.path().join("lib")).is_ok_and(|rd| {
             rd.flatten().any(|f| {
-                let n = f.file_name().to_string_lossy().into_owned();
-                n.starts_with("libstd-") && n.ends_with(".rlib")
+                f.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("libstd-") && n.ends_with(".rlib"))
             })
         });
         if !has_std {
@@ -651,8 +681,29 @@ pub fn thin_fat(tools: &dyn Tools, root: &Path, triple: Triple) -> Result<Vec<St
             Error::io("read the thinned slice", &e)
         })?;
         let _ = std::fs::remove_file(&tmp);
-        std::fs::write(&path, thin)
-            .map_err(|e| Error::io(format!("write {}", rel.display()), &e))?;
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&path)
+                .map_err(|e| Error::io(format!("open {}", rel.display()), &e))?;
+            if !f
+                .metadata()
+                .map_err(|e| Error::io(format!("stat {}", rel.display()), &e))?
+                .is_file()
+            {
+                return Err(Error::refused(format!(
+                    "{}: not a regular file",
+                    rel.display()
+                )));
+            }
+            f.set_len(0)
+                .and_then(|()| f.write_all(&thin))
+                .map_err(|e| Error::io(format!("write {}", rel.display()), &e))?;
+        }
         thinned.push(rel.to_string_lossy().into_owned());
     }
     Ok(thinned)
@@ -708,11 +759,13 @@ pub enum OneCompiler {
 /// A refusal for two different programs.
 pub fn one_compiler(tools: &dyn Tools, root: &Path) -> Result<OneCompiler> {
     let (r, t) = (root.join("bin/rustc"), root.join("bin/trustc"));
-    let regular = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file());
-    if !regular(&r) || !regular(&t) {
+    let (Ok(rm), Ok(tm)) = (std::fs::symlink_metadata(&r), std::fs::symlink_metadata(&t)) else {
+        return Ok(OneCompiler::NotApplicable);
+    };
+    if !rm.file_type().is_file() || !tm.file_type().is_file() {
         return Ok(OneCompiler::NotApplicable);
     }
-    if same_inode(&r, &t) {
+    if same_meta_inode(&rm, &tm) {
         return Ok(OneCompiler::AlreadyLinked);
     }
     let (rb, tb) = (
@@ -744,18 +797,16 @@ pub fn one_compiler(tools: &dyn Tools, root: &Path) -> Result<OneCompiler> {
 /// A refusal for a link or two different files.
 pub fn compiler_gate(root: &Path) -> Result<OneCompiler> {
     let (r, t) = (root.join("bin/rustc"), root.join("bin/trustc"));
-    let present = |p: &Path| std::fs::symlink_metadata(p).is_ok();
-    if !present(&r) || !present(&t) {
+    let (Ok(rm), Ok(tm)) = (std::fs::symlink_metadata(&r), std::fs::symlink_metadata(&t)) else {
         return Ok(OneCompiler::NotApplicable);
-    }
-    let regular = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file());
-    if !regular(&r) || !regular(&t) {
+    };
+    if !rm.file_type().is_file() || !tm.file_type().is_file() {
         return Err(Error::refused(
             "one-compiler gate FAIL — bin/rustc and bin/trustc must both be regular files \
              (tippy refuses a link)",
         ));
     }
-    if same_inode(&r, &t) {
+    if same_meta_inode(&rm, &tm) {
         return Ok(OneCompiler::AlreadyLinked);
     }
     let (rb, tb) = (
@@ -787,11 +838,16 @@ pub fn strip_symbols(tools: &dyn Tools, root: &Path) -> Result<(usize, usize)> {
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| matches!(e, "rlib" | "rmeta" | "a" | "o"));
-        let path = root.join(&rel);
-        if skip || !arch::read(&path).is_some_and(|o| o.format == arch::Format::MachO) {
+        if skip {
             continue;
         }
-        let meta = std::fs::metadata(&path).map_err(|e| Error::io("stat", &e))?;
+        let path = root.join(&rel);
+        let Some((obj, meta)) = arch::read_with_meta(&path) else {
+            continue;
+        };
+        if obj.format != arch::Format::MachO {
+            continue;
+        }
         let key = inode(&meta).unwrap_or_else(|| {
             solo += 1;
             (u64::MAX, solo)
@@ -981,8 +1037,18 @@ pub fn hello(
 ) -> Result<&'static str> {
     let src = home.join("hello.rs");
     let exe = home.join("hello");
-    std::fs::write(&src, "fn main(){ println!(\"hello, atpkg sysroot\"); }\n")
-        .map_err(|e| Error::io("write hello.rs", &e))?;
+    let _ = std::fs::remove_file(&src);
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&src)
+            .and_then(|mut f| f.write_all(b"fn main(){ println!(\"hello, atpkg sysroot\"); }\n"))
+            .map_err(|e| Error::io("write hello.rs", &e))?;
+    }
     let what = || {
         format!(
             "{} against {}",
@@ -1052,14 +1118,24 @@ pub fn tippy_gate(tools: &dyn Tools, root: &Path, home: &Path) -> Result<bool> {
     let _ = std::fs::remove_dir_all(&krate);
     std::fs::create_dir_all(krate.join("src"))
         .map_err(|e| Error::io("create the hello crate", &e))?;
-    std::fs::write(
-        krate.join("Cargo.toml"),
-        "[package]\nname = \"tippy-hello\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    let write_new = |path: &Path, bytes: &[u8]| -> std::io::Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?
+            .write_all(bytes)
+    };
+    write_new(
+        &krate.join("Cargo.toml"),
+        b"[package]\nname = \"tippy-hello\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
     )
     .map_err(|e| Error::io("write the hello crate", &e))?;
-    std::fs::write(
-        krate.join("src/main.rs"),
-        "fn main() { println!(\"hello, atpkg sysroot\"); }\n",
+    write_new(
+        &krate.join("src/main.rs"),
+        b"fn main() { println!(\"hello, atpkg sysroot\"); }\n",
     )
     .map_err(|e| Error::io("write the hello crate", &e))?;
     let mut run = hidden(Run::new(&tippy, ["--offline"]), root, home);

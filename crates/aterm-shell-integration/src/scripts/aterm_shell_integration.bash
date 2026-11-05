@@ -751,7 +751,7 @@ __aterm_prompt_end_last() {
 # is not whole commands by itself (no `;` or newline between it and the
 # trampoline's name, or a side bash cannot parse alone) is left where it is.
 __aterm_pc_first() {
-    [[ "${PROMPT_COMMAND-}" != __aterm_prompt_command* ]] || return 0
+    [[ "${PROMPT_COMMAND-}" != __aterm_prompt_command* ]] && (( ! ${__aterm_bp_joined:-0} )) || return 0
     local __aterm_e=${PROMPT_COMMAND-} __aterm_pre __aterm_post __aterm_i __aterm_k= __aterm_nb=0
     local __aterm_before __aterm_after
     if __aterm_pc_more; then
@@ -929,7 +929,7 @@ __aterm_preexec_run() {
     for __aterm_pc_elem in "${PROMPT_COMMAND[@]}"; do
         [[ "$BASH_COMMAND" == "$__aterm_pc_elem" ]] && return
     done
-    [[ "$BASH_COMMAND" == "__aterm_"* ]] && return
+    case $BASH_COMMAND in __aterm_* | __bp_*) return 0 ;; esac
     [[ -n "$2" ]] && return
 
     # Capture only the first simple command of the line.
@@ -938,6 +938,50 @@ __aterm_preexec_run() {
         __aterm_typed_line
         __aterm_line_start "$REPLY"
     fi
+}
+
+# ─── bash-preexec's hooks (`__aterm_bp_joined`, set in the wiring) ───
+#
+# Once per line typed at the prompt, with the line. A DEBUG trap the rc set runs
+# here as it does under bash-preexec in a bare bash, once per line. Returns 0:
+# under `extdebug` a non-zero status skips the command.
+__aterm_bp_preexec() {
+    { local __aterm_flags=$-; set +xv; } 2>/dev/null
+    if [[ -n "$__aterm_prev_debug_handler" ]]; then
+        __aterm_flags_put "$__aterm_flags" 0 "${__bp_last_argument_prev_command-}" &&
+            eval "$__aterm_prev_debug_handler"
+        { __aterm_flags=$-; set +xv; } 2>/dev/null
+    fi
+    [[ -n "$__aterm_last_command" ]] || __aterm_line_start "$1"
+    __aterm_flags_put "$__aterm_flags"
+}
+
+# Before every other prompt hook of bash-preexec's, which keeps PROMPT_COMMAND's
+# first line for itself (its newest version puts it back at each prompt), so a
+# line's D comes before any program those hooks run.
+__aterm_bp_precmd() {
+    { local __aterm_status=$? __aterm_flags=$-; set +xv; } 2>/dev/null
+    ! declare -F __aterm_end_command >/dev/null || __aterm_end_command "$__aterm_status"
+    __aterm_flags_put "$__aterm_flags" "$__aterm_status"
+}
+
+# Keep `__aterm_bp_precmd` first in `precmd_functions` and `__aterm_bp_preexec`
+# last in `preexec_functions`: the twin of zsh's `__aterm_hooks_order`.
+__aterm_bp_order() {
+    local __aterm_f __aterm_n=${#preexec_functions[@]}
+    local -a __aterm_keep=()
+    if (( ! __aterm_n )) || [[ "${preexec_functions[__aterm_n - 1]-}" != __aterm_bp_preexec ]]; then
+        for __aterm_f in ${preexec_functions[@]+"${preexec_functions[@]}"}; do
+            [[ "$__aterm_f" == __aterm_bp_preexec ]] || __aterm_keep+=("$__aterm_f")
+        done
+        preexec_functions=(${__aterm_keep[@]+"${__aterm_keep[@]}"} __aterm_bp_preexec)
+    fi
+    [[ "${precmd_functions[0]-}" != __aterm_bp_precmd ]] || return 0
+    __aterm_keep=()
+    for __aterm_f in ${precmd_functions[@]+"${precmd_functions[@]}"}; do
+        [[ "$__aterm_f" == __aterm_bp_precmd ]] || __aterm_keep+=("$__aterm_f")
+    done
+    precmd_functions=(__aterm_bp_precmd ${__aterm_keep[@]+"${__aterm_keep[@]}"})
 }
 
 # Emit command-start marks (633;E, OSC 0 title, and 133;C) for command line `$1`.
@@ -974,7 +1018,7 @@ if [[ ${PS0-} == *'${ __aterm_ps0; }'* ]]; then
     PS0=${PS0/'${ __aterm_ps0; }'/'${| __aterm_ps0; }'}
 fi
 __aterm_body_ps0() {
-    (( __aterm_in_prompt_cmd )) && return 0
+    (( __aterm_in_prompt_cmd || ${__aterm_bp_joined:-0} )) && return 0
     [[ -z "$__aterm_last_command" && "$__aterm_hist_mark" == [1-9]* &&
         "$__aterm_hist_mark" != *[!0-9]* &&
         "${HISTCMD-}" == "$((__aterm_hist_mark + 1))" ]] || return 0
@@ -1172,7 +1216,12 @@ __aterm_body_prompt_command() {
     export -n PS1
 
     # Arm `__aterm_prompt_end` if array elements remain, or capture `$HISTCMD` now.
-    if __aterm_pc_more; then
+    # A joined shell needs neither (bash-preexec is its gate and hands it the line),
+    # and a trailer would run after `__bp_interactive_mode`, which must stay last:
+    # bash-preexec drops its mode on the next line of PROMPT_COMMAND it sees.
+    if (( ${__aterm_bp_joined:-0} )); then
+        __aterm_bp_order
+    elif __aterm_pc_more; then
         if [[ "${PROMPT_COMMAND[-1]}" == __aterm_prompt_end ]]; then
             __aterm_prompt_end_armed=1
         else
@@ -1300,6 +1349,7 @@ if (( __aterm_fresh_load )); then
     __aterm_prev_debug_handler=""
     __aterm_tmp=""
     if [[ -z "${__aterm_rc_debug_handed-}" ]]; then
+        __aterm_debug_armed=1
         __aterm_tmp=$(trap -p DEBUG 2>/dev/null)
     elif [[ -n "${__aterm_rc_debug_trap+x}" ]]; then
         __aterm_tmp=$__aterm_rc_debug_trap
@@ -1319,12 +1369,50 @@ if (( __aterm_fresh_load )); then
     fi
 fi
 
+# BASH-PREEXEC (atuin's documented setup, bash-it, iTerm2's copy) installs at the
+# first prompt from a line its rc code leaves in PROMPT_COMMAND. A version that
+# hooks the DEBUG trap needs that line at the top level: evaled by the trampoline,
+# a function, bash hides the trap from it and puts the outer one back as the
+# function returns, and each later prompt installs it again, one more line of
+# PROMPT_COMMAND and one more run of every hook each time. And it runs a user's
+# hooks itself, with its own lines first and last in PROMPT_COMMAND. So while it
+# waits (by its own names) its line runs after the trampoline, and aterm's marks
+# come from its hook lists (`__aterm_bp_preexec`, `__aterm_bp_precmd`), which also
+# see a line that opens with a subshell where it hooks PS0. No trap of aterm's: the
+# version that hooks PS0 leaves the DEBUG trap alone, so an rc's trap goes back.
+if (( __aterm_fresh_load )); then
+    __aterm_bp_joined=0
+    if [[ -n "${__bp_install_string-}" && "${PROMPT_COMMAND[*]-}" == *"$__bp_install_string"* ]] &&
+        declare -F __bp_install >/dev/null; then
+        __aterm_bp_joined=1
+        preexec_functions+=(__aterm_bp_preexec)
+        precmd_functions=(__aterm_bp_precmd ${precmd_functions[@]+"${precmd_functions[@]}"})
+    fi
+fi
+
 # Wire PROMPT_COMMAND, PS0 (bash 5.3+), and the DEBUG trap last (so wiring lines
 # are not captured as user commands).
 if (( __aterm_fresh_load )); then
-    if (( __aterm_prompt_cmd_is_array )); then
+    if (( __aterm_bp_joined )) && [[ "$__aterm_original_prompt_command" == *"$__bp_install_string"* ]]; then
+        # What the rc put beside the line stays chained, and has to parse without it
+        # (`<line>; tail`): a no-op takes its place, gone where nothing needs one, as
+        # bash-preexec's own install does.
+        __aterm_tmp=${__aterm_original_prompt_command//"$__bp_install_string"/:}
+        __aterm_tmp=${__aterm_tmp//$'\n':$'\n'/$'\n'}
+        __aterm_tmp=${__aterm_tmp//$'\n':;/$'\n'}
+        __aterm_tmp=${__aterm_tmp#:$'\n'}
+        __aterm_tmp=${__aterm_tmp#:;}
+        __aterm_tmp=${__aterm_tmp%$'\n':}
+        [[ "$__aterm_tmp" != : ]] || __aterm_tmp=""
+        __aterm_original_prompt_command=$__aterm_tmp
+        unset __aterm_tmp
+        # bash-preexec rebuilds only an array's first element, so the trampoline
+        # stays in it and the rest of that element is chained, as a scalar's is.
+        PROMPT_COMMAND=$'__aterm_prompt_command\n'"$__bp_install_string"
+        __aterm_prompt_cmd_is_array=0
+    elif (( __aterm_prompt_cmd_is_array )); then
         PROMPT_COMMAND=("__aterm_prompt_command" "${PROMPT_COMMAND[@]}")
-        if (( __aterm_pc_arrays )); then
+        if (( __aterm_pc_arrays && ! __aterm_bp_joined )); then
             PROMPT_COMMAND+=(__aterm_prompt_end)
         fi
     else
@@ -1335,7 +1423,18 @@ if (( __aterm_fresh_load )); then
         PS0='${| __aterm_ps0; }'"${PS0-}"
         export -n PS0
     fi
-    trap '__aterm_preexec "$_"' DEBUG
+    # Sourced by hand under functrace, no wrapper took the rc's trap: it is still
+    # armed, and bash-preexec's install takes it as its own hook.
+    if (( __aterm_bp_joined && ${__aterm_debug_armed:-0} )) && [[ "${__bp_hook_preexec_proc-}" != *_ps0 ]]; then
+        __aterm_prev_debug_handler=""
+    fi
+    unset __aterm_debug_armed
+    if (( ! __aterm_bp_joined )); then
+        trap '__aterm_preexec "$_"' DEBUG
+    elif [[ "${__bp_hook_preexec_proc-}" == *_ps0 && -n "$__aterm_prev_debug_handler" ]]; then
+        trap -- "$__aterm_prev_debug_handler" DEBUG
+        __aterm_prev_debug_handler=""
+    fi
 fi
 
 __aterm_flags_put "$__aterm_load_flags"

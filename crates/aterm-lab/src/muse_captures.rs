@@ -207,7 +207,7 @@ impl Cap {
             text.push('\n');
         }
         let f = self.dir.join(format!("muse-{}-{name}.stub.log", self.ver));
-        match fs::write(&f, text) {
+        match crate::util::write_out(&f, text.as_bytes()) {
             Ok(()) => println!("{}", f.display()),
             Err(e) => eprintln!(
                 "aterm-lab: muse-captures: cannot write {}: {e}",
@@ -321,12 +321,13 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         )
         .map_err(Fail::die)?;
         let f = c.dir.join(format!("muse-{}-cli-help.txt", c.ver));
-        fs::write(
+        crate::util::write_out(
             &f,
             format!(
                 "# muse {} · muse --help, in the lab's jail with a scratch HOME (exit {rc})\n{out}",
                 c.ver
-            ),
+            )
+            .as_bytes(),
         )
         .map_err(|e| Fail::die(e.to_string()))?;
         println!("{}", f.display());

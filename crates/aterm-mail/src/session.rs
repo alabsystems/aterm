@@ -50,17 +50,23 @@ pub fn acquire(home: &Path, email: &str) -> Result<Lease, String> {
 
 #[cfg(any(unix, test))]
 fn encode(email: &str, credentials: &Credentials) -> Result<Zeroizing<Vec<u8>>, String> {
-    let mut bytes = Zeroizing::new(b"aterm-mail-session-v1\0".to_vec());
-    bytes.extend_from_slice(&credentials.expires.to_le_bytes());
-    for field in [
+    let fields = [
         email,
         credentials.uid.expose(),
         credentials.access.expose(),
         credentials.refresh.expose(),
-    ] {
+    ];
+    let mut cap = 22 + 8 + 4 * 4;
+    for field in fields {
         if field.is_empty() || field.len() > 8192 || field.chars().any(char::is_control) {
             return Err("Invalid mail session field".into());
         }
+        cap += field.len();
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(cap));
+    bytes.extend_from_slice(b"aterm-mail-session-v1\0");
+    bytes.extend_from_slice(&credentials.expires.to_le_bytes());
+    for field in fields {
         bytes.extend_from_slice(&(field.len() as u32).to_le_bytes());
         bytes.extend_from_slice(field.as_bytes());
     }
@@ -115,13 +121,11 @@ fn decode(email: &str, bytes: &[u8]) -> Result<Credentials, String> {
 
 #[cfg(unix)]
 fn location(home: &Path, email: &str) -> std::path::PathBuf {
-    let mut hash = aterm_digest::Sha256::new();
-    hash.update(email.trim().to_ascii_lowercase().as_bytes());
-    let key: String = hash
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let mut hasher = aterm_digest::Sha256::new();
+    for b in email.trim().bytes() {
+        hasher.update([b.to_ascii_lowercase()]);
+    }
+    let key = aterm_codec::hex::encode_lower(&hasher.finalize());
     home.join(".config/aterm/mail/sessions")
         .join(format!("{key}.age"))
 }

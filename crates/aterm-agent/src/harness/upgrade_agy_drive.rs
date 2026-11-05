@@ -321,7 +321,11 @@ fn crash_left(config: &Path, pid: u32, crash: Option<&Path>, started_ms: u64) ->
         return false;
     }
     let written_ms = |file: &Path| -> Option<u64> {
-        let at = std::fs::metadata(file).ok()?.modified().ok()?;
+        let at = std::fs::symlink_metadata(file)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?
+            .modified()
+            .ok()?;
         u64::try_from(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis()).ok()
     };
     std::fs::read_dir(config.join(ag::CRASHES))
@@ -402,6 +406,8 @@ pub(super) fn snapshot(
     let cwd = k.cwd(pid).unwrap_or_default();
     let started_ms = k.started_ms(pid).unwrap_or(0);
     Ok(super::super::relaunch::Snapshot {
+        auth_observed: false,
+        launch_env: None,
         tab: tab.to_string(),
         pid,
         start,
@@ -836,6 +842,7 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn AgyKernel) -> Result<Plan, NoPl
         detail: e,
     })?;
     Ok(Plan {
+        cold: None,
         command: None,
         shell: st.shell,
         dialect,

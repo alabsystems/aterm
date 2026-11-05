@@ -226,7 +226,7 @@ fn member(paths: &Paths, deadline: Instant) -> Result<String, String> {
             .ok_or("native execution has no local identity")?
             .recipient()
             .to_bech32();
-        let roster = client::swarm_roster(paths)
+        let roster = client::swarm_roster_until(paths, deadline)
             .map_err(|e| e.to_string())?
             .ok_or("native execution needs current swarm membership")?;
         let row = roster
@@ -1049,7 +1049,7 @@ fn set_policy_mode(
         automatic: allocator,
     };
     let roster = with_custody(&paths, &expected, deadline, |active, _| {
-        client::swarm_roster(active)
+        client::swarm_roster_until(active, deadline)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "native policy needs current member bindings".into())
     })?;

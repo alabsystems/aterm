@@ -9635,9 +9635,416 @@ fn held_by_rows_never_need_local_sign_in_or_admit_rotation_target() {
     );
 }
 
+/// When a conversation ran under a login of a row's own directory (`State::login_dir_spans`):
+/// a note under one opens a stretch from its earliest instant; a note on the default login ends
+/// it at that process's start, and drops a stretch that began after it (a move onto such a
+/// login that was not made); a later move opens a stretch of its own. An open stretch runs on an
+/// hour past its last note and lapses there: a note after that ends it at its lapse, and a
+/// process seen there that started after the lapse opens a stretch of its own. A word that is not
+/// a conversation id is no record, and the store reads back what it wrote. What can cut no
+/// standing wall goes, a week on (a stretch ended that long ago, a record no host noted that
+/// long), at the next note or read.
+#[test]
+fn a_conversations_stretches_under_a_login_directory_open_end_and_age_out() {
+    const CONVERSATION: &str = "abd992c0-3cfa-46a4-bb90-3a295f008f70";
+    let span = |since, until| DirSpan { since, until };
+    let mut s = State::default();
+    // Moved onto a row's own login at NOW; its process there is seen from NOW + 5.
+    assert!(note_on_login_dir(&mut s, CONVERSATION, NOW, NOW));
+    assert!(login_dir_spans_hold(&s, CONVERSATION, true, NOW + 5));
+    assert!(
+        !note_on_login_dir(&mut s, CONVERSATION, NOW + 5, NOW),
+        "nothing new"
+    );
+    assert!(
+        note_on_login_dir(&mut s, CONVERSATION, NOW + 5, NOW + HOUR),
+        "noted again"
+    );
+    assert_eq!(
+        s.login_dir_spans[CONVERSATION],
+        LoginDirSpans {
+            spans: vec![span(NOW, None)],
+            at: NOW + HOUR,
+            process: None,
+        }
+    );
+    let noted = &s.login_dir_spans[CONVERSATION];
+    assert!(
+        noted.covers(NOW + 2 * HOUR - 1) && !noted.covers(NOW + 2 * HOUR),
+        "an hour past its last note, no further"
+    );
+    // Moved back onto the default login, its process there started at NOW + 2 h.
+    let back = NOW + 2 * HOUR;
+    assert!(!login_dir_spans_hold(&s, CONVERSATION, false, back));
+    assert!(note_off_login_dir(&mut s, CONVERSATION, back, back));
+    assert!(
+        !note_off_login_dir(&mut s, CONVERSATION, back + HOUR, back + HOUR),
+        "it ended"
+    );
+    let noted = &s.login_dir_spans[CONVERSATION];
+    assert!(noted.covers(NOW) && noted.covers(back - 1));
+    assert!(
+        !noted.covers(NOW - 1) && !noted.covers(back),
+        "the default login's rows are its own"
+    );
+    // Seen on the default login in a process that started at NOW + 600, while its stretch was
+    // still open: the stretch ends after that second, whose rows may be the process before's.
+    let mut same_second = State::default();
+    assert!(note_on_login_dir(&mut same_second, CONVERSATION, NOW, NOW));
+    let started = NOW + 600;
+    assert!(!login_dir_spans_hold(
+        &same_second,
+        CONVERSATION,
+        false,
+        started
+    ));
+    assert!(note_off_login_dir(
+        &mut same_second,
+        CONVERSATION,
+        started,
+        started
+    ));
+    assert!(login_dir_spans_hold(
+        &same_second,
+        CONVERSATION,
+        false,
+        started
+    ));
+    let cut = &same_second.login_dir_spans[CONVERSATION];
+    assert_eq!(cut.spans, [span(NOW, Some(started + 1))]);
+    assert!(
+        cut.covers(started) && !cut.covers(started + 1),
+        "the second it started may be the process before's"
+    );
+    // A move onto a row's own login again at NOW + 4 h: a stretch of its own.
+    let again = NOW + 4 * HOUR;
+    assert!(note_on_login_dir(&mut s, CONVERSATION, again, again));
+    assert_eq!(
+        s.login_dir_spans[CONVERSATION].spans,
+        [span(NOW, Some(back)), span(again, None)]
+    );
+    assert!(!s.login_dir_spans[CONVERSATION].covers(back + HOUR));
+    // That move was not made: the process on the default login, from `back`, is seen again.
+    assert!(note_off_login_dir(&mut s, CONVERSATION, back, again + 9));
+    assert_eq!(
+        s.login_dir_spans[CONVERSATION].spans,
+        [span(NOW, Some(back))]
+    );
+    // A record left with no stretch goes: a process on the default login from before its
+    // stretch began.
+    assert!(note_off_login_dir(&mut s, CONVERSATION, NOW, again + 9));
+    assert_eq!(
+        s.login_dir_spans[CONVERSATION].spans,
+        [span(NOW, Some(NOW + 1))],
+        "one from its start second leaves that second"
+    );
+    assert!(note_off_login_dir(&mut s, CONVERSATION, NOW - 1, again + 9));
+    assert!(s.login_dir_spans.is_empty());
+    assert!(!note_on_login_dir(&mut s, "s-not-a-conversation", NOW, NOW));
+    assert!(s.login_dir_spans.is_empty());
+
+    // Lapsed: seen there again by a process that started at NOW + 3 h, its own stretch; the
+    // hours no host saw are not taken to have run there. A process that started before the
+    // lapse ran there all along.
+    let mut lapsed = State::default();
+    let later = NOW + 3 * HOUR;
+    assert!(note_on_login_dir(&mut lapsed, CONVERSATION, NOW, NOW));
+    assert!(!login_dir_spans_hold(&lapsed, CONVERSATION, true, later));
+    assert!(note_on_login_dir(&mut lapsed, CONVERSATION, later, later));
+    assert_eq!(
+        lapsed.login_dir_spans[CONVERSATION].spans,
+        [span(NOW, Some(NOW + HOUR)), span(later, None)]
+    );
+    assert!(!lapsed.login_dir_spans[CONVERSATION].covers(NOW + 2 * HOUR));
+    assert!(note_on_login_dir(
+        &mut lapsed,
+        CONVERSATION,
+        NOW + 1,
+        later + 9
+    ));
+    assert_eq!(
+        lapsed.login_dir_spans[CONVERSATION].spans,
+        [span(NOW, None)]
+    );
+
+    // Two stretches, the first ended at its lapse, before the default login's process started;
+    // and another conversation's open one.
+    const OTHER: &str = "00000000-0000-4000-8000-000000000002";
+    assert!(note_on_login_dir(&mut s, CONVERSATION, NOW, NOW));
+    assert!(note_off_login_dir(&mut s, CONVERSATION, back, back));
+    assert_eq!(
+        s.login_dir_spans[CONVERSATION].spans,
+        [span(NOW, Some(NOW + HOUR))]
+    );
+    assert!(note_on_login_dir(&mut s, CONVERSATION, again, again));
+    assert!(note_on_login_dir(&mut s, OTHER, NOW, NOW));
+    let read = State::from_json(&s.to_json(), again).expect("its own text");
+    assert_eq!(read.login_dir_spans, s.login_dir_spans);
+    assert!(
+        !State::default().to_json().contains("login_dir_spans"),
+        "an empty record writes nothing"
+    );
+    // A week after the first stretch ended it can cut no standing wall; the open one stays,
+    // its process (started at `again`) seen there still.
+    let week = back + WEEK_WINDOW_S;
+    assert!(
+        note_on_login_dir(&mut s, CONVERSATION, again, week),
+        "the note refreshes it, and the ended stretch goes"
+    );
+    assert_eq!(s.login_dir_spans[CONVERSATION].spans, [span(again, None)]);
+    assert!(
+        !s.login_dir_spans.contains_key(OTHER),
+        "noted by no host for a week: {:?}",
+        s.login_dir_spans
+    );
+    let read = State::from_json(&s.to_json(), week + WEEK_WINDOW_S).expect("its own text");
+    assert!(
+        read.login_dir_spans.is_empty(),
+        "read a week after its last note: {:?}",
+        read.login_dir_spans
+    );
+    let read = State::from_json(&s.to_json(), week + WEEK_WINDOW_S - 1).expect("its own text");
+    assert_eq!(
+        read.login_dir_spans, s.login_dir_spans,
+        "control: within the week"
+    );
+}
+
+/// The process a conversation's open stretch runs in (`LoginDirSpans::process`): a host's
+/// sighting names it, a launch still to start one and a cut on the default login forget it, the
+/// store reads it back, and with no stretch open it goes. While it runs, an accounts sync's look,
+/// saved as its transcript scan reads the record, is a sighting (`seen_running`), so a turn hours
+/// long with no account point does not lapse; gone unseen, it does.
+#[test]
+fn a_stretch_names_the_process_it_runs_in_and_is_seen_while_that_runs() {
+    const CONVERSATION: &str = "abd992c0-3cfa-46a4-bb90-3a295f008f70";
+    let seen = NotedProcess {
+        pid: 4242,
+        start: "Tue Nov 3 21:20:58 2026".to_string(),
+    };
+    let mut s = State::default();
+    assert!(note_seen_on_login_dir(
+        &mut s,
+        CONVERSATION,
+        &seen,
+        NOW,
+        NOW
+    ));
+    assert_eq!(
+        s.login_dir_spans[CONVERSATION].process.as_ref(),
+        Some(&seen)
+    );
+    let read = State::from_json(&s.to_json(), NOW).expect("its own text");
+    assert_eq!(read.login_dir_spans, s.login_dir_spans);
+
+    // A turn of three hours with no account point.
+    let late = NOW + 3 * HOUR;
+    let mut gone = s.login_dir_spans[CONVERSATION].clone();
+    gone.seen_running(late, |_| false);
+    assert!(!gone.covers(late - 1), "gone unseen, it lapsed");
+    let mut runs = s.login_dir_spans[CONVERSATION].clone();
+    runs.seen_running(late, |process| process == &seen);
+    assert_eq!(runs.at, late);
+    assert!(runs.covers(NOW + 2 * HOUR) && runs.covers(late));
+
+    // A launch onto such a login forgets it, and so does a cut on the default login, which
+    // leaves no open stretch for a running process to hold.
+    assert!(note_on_login_dir(&mut s, CONVERSATION, NOW + 60, NOW + 60));
+    assert_eq!(s.login_dir_spans[CONVERSATION].process, None);
+    assert!(note_seen_on_login_dir(
+        &mut s,
+        CONVERSATION,
+        &seen,
+        NOW,
+        NOW + 90
+    ));
+    assert!(note_off_login_dir(
+        &mut s,
+        CONVERSATION,
+        NOW + 600,
+        NOW + 600
+    ));
+    let mut ended = s.login_dir_spans[CONVERSATION].clone();
+    assert_eq!(ended.process, None);
+    ended.seen_running(late, |_| true);
+    assert_eq!(
+        ended.at,
+        NOW + 600,
+        "an ended stretch is held open by nothing"
+    );
+    let mut crafted = State::default();
+    crafted.login_dir_spans.insert(
+        CONVERSATION.to_string(),
+        LoginDirSpans {
+            spans: vec![DirSpan {
+                since: NOW,
+                until: Some(NOW + 600),
+            }],
+            at: NOW + 600,
+            process: Some(seen.clone()),
+        },
+    );
+    let read = State::from_json(&crafted.to_json(), NOW + 600).expect("its own text");
+    assert_eq!(
+        read.login_dir_spans[CONVERSATION].process, None,
+        "no stretch open, no process kept"
+    );
+
+    // A start no snapshot spells is not kept.
+    let odd = NotedProcess {
+        pid: 1,
+        start: "x".repeat(65),
+    };
+    let mut t = State::default();
+    assert!(note_seen_on_login_dir(&mut t, CONVERSATION, &odd, NOW, NOW));
+    assert_eq!(t.login_dir_spans[CONVERSATION].process, None);
+
+    // A transaction whose one edit is the record saves it, and so does one that only ends its
+    // stretch: the store saves a state that compares changed (`impl PartialEq for State`).
+    let dir = tmp("login-dir-spans");
+    let store = Store::at(dir.path());
+    store
+        .transact(NOW, &mut None, |state| {
+            assert!(note_seen_on_login_dir(state, CONVERSATION, &seen, NOW, NOW));
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let saved = store.load(NOW).unwrap().0.login_dir_spans;
+    assert_eq!(
+        saved[CONVERSATION].process.as_ref(),
+        Some(&seen),
+        "{saved:?}"
+    );
+    store
+        .transact(NOW + 600, &mut None, |state| {
+            assert!(note_off_login_dir(
+                state,
+                CONVERSATION,
+                NOW + 600,
+                NOW + 600
+            ));
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let saved = store.load(NOW + 600).unwrap().0.login_dir_spans;
+    assert!(!saved[CONVERSATION].covers(NOW + 601), "{saved:?}");
+}
+
 /// A LOGIN BELONGS TO THE ROW THAT HOLDS IT NOW: once a row takes the default login another row left,
 /// that row's `was` no longer makes it the login's. CONTROL: a login no row holds is the row's that
 /// left it, and two that left it stay two, for a caller to refuse.
+/// A READ LIFTS ONLY THE WALLS IT SHOWS GONE: a window it has a figure for below full, walled before
+/// the read. A full figure, a window with no figure, a month, and a wall written after the read all
+/// stand. An older observer cannot raise a lifted wall again, and a later one can.
+/// The row's own word that it has room: a pin, or the newest read that named a window and found none
+/// full. A later read finding one full keeps that word, or an older full reading in a rollout would
+/// speak again for a window this read showed had room.
+#[test]
+fn a_row_has_room_since_a_pin_or_the_newest_read_that_showed_it() {
+    let mut state = State::default();
+    let mut read = |session_pct, week_pct, at| {
+        let sample = Sample {
+            session_pct,
+            week_pct,
+            at,
+            ..Sample::default()
+        };
+        note_sample(&mut state, "main", sample, 10_000);
+        state.account("main").room_since()
+    };
+    assert_eq!(read(None, None, 100), None, "a read of no window");
+    assert_eq!(read(Some(100), Some(10), 200), None, "a full window");
+    assert_eq!(read(Some(10), Some(99), 300), Some(300));
+    assert_eq!(read(None, Some(99), 400), Some(400));
+    assert_eq!(
+        read(Some(100), Some(12), 500),
+        Some(400),
+        "kept past a full read"
+    );
+    assert_eq!(read(Some(10), None, 600), Some(600));
+    assert_eq!(
+        read(Some(10), None, 20_000),
+        Some(10_000),
+        "never ahead of the clock"
+    );
+    let mut state = State::default();
+    note_sample(
+        &mut state,
+        "main",
+        Sample {
+            session_pct: Some(10),
+            at: 500,
+            ..Sample::default()
+        },
+        10_000,
+    );
+    state.accounts.get_mut("main").expect("the row").cleared_at = Some(400);
+    assert_eq!(
+        state.account("main").room_since(),
+        Some(500),
+        "the newer of the two"
+    );
+    state.accounts.get_mut("main").expect("the row").cleared_at = Some(600);
+    assert_eq!(
+        state.account("main").room_since(),
+        Some(600),
+        "the newer of the two"
+    );
+}
+
+#[test]
+fn a_read_with_room_lifts_only_the_walls_it_shows_gone() {
+    let walled = |window: &str, at: i64| {
+        let mut s = State::default();
+        note_wall(&mut s, "main", window, Some(NOW + DAY), at, at);
+        s
+    };
+    let stands = |s: &State| s.account("main").limited_until(NOW).is_some();
+    let read = |session: Option<u32>, week: Option<u32>| Sample {
+        session_pct: session,
+        week_pct: week,
+        at: NOW,
+        ..Sample::default()
+    };
+    for (case, window, at, sample, lifted) in [
+        ("room", SESSION_LIMIT, NOW - 5, read(Some(40), None), true),
+        ("week", WEEK_LIMIT, NOW - 5, read(None, Some(40)), true),
+        ("full", WEEK_LIMIT, NOW - 5, read(None, Some(100)), false),
+        ("other", WEEK_LIMIT, NOW - 5, read(Some(40), None), false),
+        (
+            "month",
+            MONTH_LIMIT,
+            NOW - 5,
+            read(Some(40), Some(40)),
+            false,
+        ),
+        ("after", SESSION_LIMIT, NOW + 1, read(Some(40), None), false),
+    ] {
+        let mut s = walled(window, at);
+        assert!(stands(&s), "{case}: it stood");
+        let events = note_room(&mut s, "main", &sample, NOW);
+        assert_eq!(stands(&s), !lifted, "{case}");
+        assert_eq!(events.len(), usize::from(lifted), "{case}: {events:?}");
+    }
+
+    let mut s = walled(SESSION_LIMIT, NOW - 5);
+    note_room(&mut s, "main", &read(Some(40), None), NOW);
+    note_wall(&mut s, "main", SESSION_LIMIT, Some(NOW + DAY), NOW - 1, NOW);
+    assert!(!stands(&s), "an older observer does not raise it again");
+    note_wall(
+        &mut s,
+        "main",
+        SESSION_LIMIT,
+        Some(NOW + DAY),
+        NOW + 1,
+        NOW + 1,
+    );
+    assert!(
+        s.account("main").limited_until(NOW + 1).is_some(),
+        "CONTROL: a wall met later stands"
+    );
+}
+
 #[test]
 fn a_login_belongs_to_the_row_that_holds_it_before_any_that_left_it() {
     let row = |label: &str, dir: Option<&str>, was: Vec<Option<&str>>| Row {

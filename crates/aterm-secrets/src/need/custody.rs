@@ -13,7 +13,7 @@
 //! These are pure: callers supply keys and the facts their replica holds.
 
 use crate::Error;
-use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
+use ring::signature::Ed25519KeyPair;
 
 /// The domain of a custodian's attestation of a record body.
 pub const RECORD_DOMAIN: &[u8] = b"aterm/credentials/custodian-record/1\0";
@@ -34,12 +34,6 @@ pub(super) fn sign(seed: &[u8; 32], message: &[u8]) -> crate::Result<[u8; 64]> {
     let signature = key_pair(seed)?.sign(message);
     <[u8; 64]>::try_from(signature.as_ref())
         .map_err(|_| Error::new("custody: an Ed25519 signature is not 64 bytes"))
-}
-
-pub(super) fn verifies(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
-    UnparsedPublicKey::new(&ED25519, key)
-        .verify(message, signature)
-        .is_ok()
 }
 
 /// The record an attestation covers: its kind (`published`, `needs-person`, `retired`…), its
@@ -108,7 +102,7 @@ pub fn attested(
     !record.kind.is_empty()
         && u16::try_from(record.kind.len()).is_ok()
         && record.body.len() <= MAX_BODY
-        && verifies(signer, &attestation_message(network, record), signature)
+        && astream_aead::signature::verify(signer, &attestation_message(network, record), signature)
 }
 
 #[cfg(test)]

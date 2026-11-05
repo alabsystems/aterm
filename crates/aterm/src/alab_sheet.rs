@@ -131,8 +131,14 @@ impl Vendors for Harness {
                     })
                     .collect())
             }
-            SheetKind::Vault | SheetKind::Logins => {
-                Err("CSV sheets are not harness TOML files".to_owned())
+            SheetKind::Vault
+            | SheetKind::Logins
+            | SheetKind::Phones
+            | SheetKind::Computers
+            | SheetKind::Emails => Err("CSV sheets are not harness TOML files".to_owned()),
+            SheetKind::FleetDb(_) => Err("a fleet_db dump is not a harness TOML file".to_owned()),
+            SheetKind::MailboxToml => {
+                Err("mailbox TOML is not a harness account source".to_owned())
             }
         }
     }
@@ -225,6 +231,11 @@ mod tests {
         assert!(
             Harness
                 .stated(SheetKind::Vault, "fleet-accounts.toml", fleet)
+                .is_err()
+        );
+        assert!(
+            Harness
+                .stated(SheetKind::MailboxToml, "ai-mailbox.toml", pool)
                 .is_err()
         );
         assert!(

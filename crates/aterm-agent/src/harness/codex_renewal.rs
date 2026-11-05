@@ -760,7 +760,7 @@ pub fn read_index(path: &Path) -> Result<Option<String>, &'static str> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let mut file = match options.open(path) {
         Ok(file) => file,
@@ -855,13 +855,12 @@ pub fn prepare_restart(
     });
     upgrade_drive::save_checked(opts, &key, &state).map_err(|_| "restart-record")?;
     let mut client = upgrade_drive::connect(opts, sid).map_err(|_| "private-client")?;
-    match super::native_restart::recover(&mut client, sid, &mut state) {
+    let recovery = super::native_restart::recover(opts, &key, &mut client, sid, &mut state);
+    upgrade_drive::save_checked(opts, &key, &state).map_err(|_| "restart-record")?;
+    match recovery {
         Ok(
             super::native_restart::Recovery::Admitted | super::native_restart::Recovery::Completed,
-        ) => {
-            upgrade_drive::save_checked(opts, &key, &state).map_err(|_| "restart-record")?;
-            Ok(())
-        }
+        ) => Ok(()),
         _ => Err("restart-admission"),
     }
 }
@@ -906,7 +905,7 @@ pub fn reconcile_restart(
     let Ok(mut client) = upgrade_drive::connect(opts, sid) else {
         return;
     };
-    let _retired = native_restart::retire(&mut client, sid, &mut state);
+    let _retired = native_restart::retire(opts, &key, &mut client, sid, &mut state);
     let _saved = upgrade_drive::save_checked(opts, &key, &state);
 }
 
@@ -940,7 +939,7 @@ fn drive_admitted(
     let key = format!("renewal-{}", prepare.id);
     let mut state = upgrade_drive::load(opts, &key)?;
     let mut client = upgrade_drive::connect(opts, sid).ok()?;
-    native_restart::recover(&mut client, sid, &mut state).ok()?;
+    native_restart::recover(opts, &key, &mut client, sid, &mut state).ok()?;
     drive_connection(opts, sid, prepare, state, client, signal_original)
 }
 
@@ -954,6 +953,10 @@ pub(super) fn drive_connection(
 ) -> Option<RestartCompletion> {
     use super::{native_act, native_restart, upgrade_drive};
     let key = format!("renewal-{}", prepare.id);
+    if state.native_retired_unissued {
+        upgrade_drive::save_checked(opts, &key, &state).ok()?;
+        return None;
+    }
     let binding = state.native.clone()?;
     let native_act::NativePlan::Restart { process, .. } = &prepare.plan else {
         return None;
@@ -966,11 +969,15 @@ pub(super) fn drive_connection(
             return None;
         }
         if !matches!(signal, upgrade_drive::Terminated::Sent)
-            && native_restart::abort(&mut client, sid, &mut state)
+            && native_restart::abort(opts, &key, &mut client, sid, &mut state)
         {
             upgrade_drive::save_checked(opts, &key, &state).ok()?;
             return Some(RestartCompletion::NotStarted);
         }
+    }
+    if state.native_retired_unissued {
+        upgrade_drive::save_checked(opts, &key, &state).ok()?;
+        return None;
     }
     let started = std::time::Instant::now();
     while native_act::monotonic_us().is_some_and(|now| now < prepare.deadline_us) {
@@ -983,6 +990,10 @@ pub(super) fn drive_connection(
                     RestartCompletion::Forward(observation)
                 }
             });
+        }
+        if state.native_retired_unissued {
+            upgrade_drive::save_checked(opts, &key, &state).ok()?;
+            return None;
         }
         if client.reply_unread() {
             return None;
@@ -1040,8 +1051,8 @@ pub struct History {
 pub fn history(home: &Path, intent: &Intent) -> Option<History> {
     use std::io::Read;
     let path = super::codex_rollout::conversation_rollouts(home, &intent.thread).own?;
-    let file = std::fs::File::open(path).ok()?;
-    if !file.metadata().ok()?.is_file() || file.metadata().ok()?.len() > 512 * 1024 * 1024 {
+    let (file, meta) = super::footer::open_regular_with_meta(&path)?;
+    if meta.len() > 512 * 1024 * 1024 {
         return None;
     }
     history_lines(
@@ -1852,6 +1863,7 @@ mod tests {
             image: launcher.clone(),
         };
         let command = RestartCommand {
+            account_intent: None,
             image: target.clone(),
             program: "/codex".into(),
             argv: vec![],
@@ -1876,6 +1888,7 @@ mod tests {
                 launcher: launcher.clone(),
                 socket: "/socket".into(),
                 forward: Box::new(command),
+                cold: None,
                 rollback: None,
             },
         };

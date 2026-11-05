@@ -494,10 +494,10 @@ impl ChainWalk {
     }
 }
 
-fn probe_trust_chain(layout: &Layout) -> Option<TrustChainProbe> {
+fn probe_trust_chain(layout: &Layout, build: Option<u64>) -> Option<TrustChainProbe> {
     #[cfg(unix)]
     {
-        let build = crate::ops::active_builds(layout).get("trust").copied()?;
+        let build = build?;
         Some(TrustChainProbe {
             build,
             refused: trust_chain_refusals(
@@ -508,7 +508,7 @@ fn probe_trust_chain(layout: &Layout) -> Option<TrustChainProbe> {
     }
     #[cfg(not(unix))]
     {
-        let _ = layout;
+        let _ = (layout, build);
         None
     }
 }
@@ -1000,10 +1000,7 @@ fn retired_key_in(stderr: &str) -> Option<(String, String)> {
 
 fn probe_workspace_policy(layout: &Layout, cwd: &Path) -> Option<WorkspacePolicyProbe> {
     let workspace = workspace_with_trust_table(cwd)?;
-    let trust_build = crate::ops::active_builds(layout)
-        .into_iter()
-        .find(|(p, _)| p == "trust")
-        .map(|(_, b)| b)?;
+    let trust_build = crate::ops::active_build_of(layout, "trust")?;
     let targo = layout
         .build_dir("trust", trust_build)
         .join("bin")
@@ -1156,7 +1153,7 @@ fn rows_reading(
     let path = std::env::var_os("PATH");
     let cfg_account = crate::config::cached().account().map(str::to_string);
     let cfg = crate::config::cached();
-    let trust_build = crate::ops::active_builds(layout).get("trust").copied();
+    let trust_build = crate::ops::active_build_of(layout, "trust");
     let rustup = rustup_binary(home.as_deref());
     let rcs = home.as_deref().map(crate::hooks::RcHome::of_process);
     fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
@@ -1210,7 +1207,7 @@ fn rows_reading(
                 crate::config::cached_machine().rosetta(),
             )
         }),
-        trust_chain: probe_trust_chain(layout),
+        trust_chain: probe_trust_chain(layout, trust_build),
         login_rc: rcs.as_ref().and_then(crate::hooks::account_login_rc),
         zsh: rcs.map(|rcs| rcs.zsh).unwrap_or_default(),
         devtools: None,

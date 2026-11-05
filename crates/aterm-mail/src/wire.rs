@@ -202,13 +202,19 @@ pub(crate) fn bounded_line(reader: &mut impl BufRead) -> Result<Vec<u8>, String>
 }
 
 pub(crate) fn quoted(value: &str) -> Result<String, String> {
-    if value.chars().any(char::is_control) {
-        return Err("Control character in mail protocol argument".into());
+    let mut out = String::with_capacity(value.len().saturating_add(2));
+    out.push('"');
+    for ch in value.chars() {
+        if ch.is_control() {
+            return Err("Control character in mail protocol argument".into());
+        }
+        if matches!(ch, '\\' | '"') {
+            out.push('\\');
+        }
+        out.push(ch);
     }
-    Ok(format!(
-        "\"{}\"",
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    ))
+    out.push('"');
+    Ok(out)
 }
 
 #[cfg(test)]

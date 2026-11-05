@@ -77,7 +77,7 @@ impl Exchange {
     #[must_use]
     pub fn proven(&self, signer: &[u8; 32], signature: &[u8; 64]) -> bool {
         self.message(PROOF_DOMAIN)
-            .is_ok_and(|message| custody::verifies(signer, &message, signature))
+            .is_ok_and(|message| astream_aead::signature::verify(signer, &message, signature))
     }
 
     /// The proof must also name the authenticated custodian actor and its exact
@@ -204,7 +204,11 @@ impl Exchange {
         let signature = delivery[..64].try_into().map_err(|_| refused())?;
         let ciphertext = &delivery[64..];
         if identity.recipient() != self.recipient
-            || !custody::verifies(writer, &self.delivery_message(ciphertext)?, &signature)
+            || !astream_aead::signature::verify(
+                writer,
+                &self.delivery_message(ciphertext)?,
+                &signature,
+            )
         {
             return Err(refused());
         }

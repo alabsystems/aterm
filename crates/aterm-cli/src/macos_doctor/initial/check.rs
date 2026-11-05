@@ -536,6 +536,7 @@ mod tests {
                 source: aterm_secrets::transport::Source::Url(
                     aterm_types::macos_setup::DEFAULT_VAULT_URL.into(),
                 ),
+                mirrors: Vec::new(),
                 name: "alab".into(),
                 signer: Some([7; 32]),
                 followed: Vec::new(),

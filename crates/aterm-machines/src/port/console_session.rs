@@ -57,10 +57,12 @@ pub(super) fn graphic_session() -> Option<bool> {
 /// terminal opens as one.
 pub(super) fn terminal() -> bool {
     use std::io::IsTerminal as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     std::io::stdin().is_terminal()
         && std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open("/dev/tty")
             .is_ok_and(|tty| tty.is_terminal())
 }

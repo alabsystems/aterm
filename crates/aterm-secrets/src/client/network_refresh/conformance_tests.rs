@@ -120,6 +120,7 @@ fn refresh_transition_with(before: &ModelState, action: &str, fault: Fault) -> M
     let paths = Paths::for_home(root.path());
     let mut config = Config {
         source: Source::Url("http://127.0.0.1:1/model-vault".into()),
+        mirrors: Vec::new(),
         name: "model-vault".into(),
         signer: Some([31; 32]),
         followed: vec![[32; 32]],

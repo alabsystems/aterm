@@ -123,13 +123,14 @@ impl IndexCache {
         }
         let tmp = parent.join(format!(".index-cache.tmp-{}", std::process::id()));
         let _ = fs::remove_file(&tmp);
-        let written = crate::platform::create_private_new(&tmp)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+        let written = crate::platform::create_private_new(&tmp).and_then(|mut f| {
+            std::io::Write::write_all(&mut f, text.as_bytes())?;
+            crate::platform::set_mode_on(&f, 0o600)
+        });
         if written.is_err() {
             let _ = fs::remove_file(&tmp);
             return;
         }
-        let _ = crate::platform::harden_file(&tmp);
         if fs::rename(&tmp, &self.path).is_err() {
             let _ = fs::remove_file(&tmp);
         }

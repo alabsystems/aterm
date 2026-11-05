@@ -446,7 +446,7 @@ fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     options.open(path)
 }
@@ -567,6 +567,15 @@ pub fn transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<PathBu
 pub fn transcript_lookup(claude_dir: &Path, entry: &SessionEntry) -> Option<(PathBuf, bool)> {
     #[cfg(test)]
     tests::on_transcript_lookup();
+    find_transcript_in_projects(claude_dir, entry)
+}
+
+/// [`transcript_path`] for a reader that must not guess between two.
+pub fn sole_transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<PathBuf> {
+    find_transcript_in_projects(claude_dir, entry).and_then(|(path, sole)| sole.then_some(path))
+}
+
+fn find_transcript_in_projects(claude_dir: &Path, entry: &SessionEntry) -> Option<(PathBuf, bool)> {
     let projects = claude_dir.join("projects");
     let file = format!("{}.jsonl", entry.session_id);
     let direct = projects.join(project_slug(&entry.cwd)).join(&file);
@@ -576,27 +585,11 @@ pub fn transcript_lookup(claude_dir: &Path, entry: &SessionEntry) -> Option<(Pat
     let mut found = std::fs::read_dir(&projects)
         .ok()?
         .filter_map(Result::ok)
+        .filter(|dir| dir.file_type().is_ok_and(|t| t.is_dir()))
         .map(|dir| dir.path().join(&file))
         .filter(|candidate| candidate.is_file());
     let first = found.next()?;
     Some((first, found.next().is_none()))
-}
-
-/// [`transcript_path`] for a reader that must not guess between two.
-pub fn sole_transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<PathBuf> {
-    let projects = claude_dir.join("projects");
-    let file = format!("{}.jsonl", entry.session_id);
-    let direct = projects.join(project_slug(&entry.cwd)).join(&file);
-    if direct.is_file() {
-        return Some(direct);
-    }
-    let mut found = std::fs::read_dir(&projects)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|dir| dir.path().join(&file))
-        .filter(|candidate| candidate.is_file());
-    let one = found.next()?;
-    found.next().is_none().then_some(one)
 }
 
 /// What the last [`TAIL_BYTES`] of the transcript at `path` say about the model and effort, counting only rows written no earlier than `since`.
@@ -1672,6 +1665,9 @@ pub fn shell_cwds(claude_dir: &Path, launch: &Path) -> Vec<PathBuf> {
     };
     let mut out: Vec<PathBuf> = Vec::new();
     for file in dir.filter_map(Result::ok).take(MAX_SESSION_FILES) {
+        if !file.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
         let name = file.file_name();
         let Some(pid) = name
             .to_str()
@@ -1680,12 +1676,15 @@ pub fn shell_cwds(claude_dir: &Path, launch: &Path) -> Vec<PathBuf> {
         else {
             continue;
         };
+        if !super::upgrade_drive::alive(pid) {
+            continue;
+        }
         let Some(entry) = read_small(&file.path(), MAX_SESSION_FILE_BYTES)
             .and_then(|text| parse_session_entry(&text, pid, None))
         else {
             continue;
         };
-        if entry.cwd != launch || !super::upgrade_drive::alive(pid) {
+        if entry.cwd != launch {
             continue;
         }
         if let Some(cwd) = transcript_path(claude_dir, &entry)
@@ -3450,6 +3449,39 @@ pub fn account_progress_text(
     account_progress_line(progress, narrow, true)
 }
 
+/// Actual local pool work, independent of the session's recorded account decision.
+#[must_use]
+pub fn account_pool_work_text(work: &super::account_progress::ActiveSignIn) -> String {
+    match &work.route {
+        Some(route) => format!("Local pool sign-in: {} via {route}", work.label),
+        None => format!("Local pool sign-in: {}", work.label),
+    }
+}
+
+fn pool_work_text(work: &super::account_progress::ActiveSignIn, narrow: bool) -> String {
+    if narrow {
+        progress_excerpt(&format!("Pool sign-in: {}", work.label))
+    } else {
+        account_pool_work_text(work)
+    }
+}
+
+fn pool_work_minimum(progress: &super::account_progress::AccountProgress) -> Option<String> {
+    use super::account_progress::ProgressPhase;
+    let work = match progress.independent_work.as_slice() {
+        [] => return None,
+        [work] => pool_work_text(work, true),
+        work => format!("{} pool sign-ins", work.len()),
+    };
+    let phase = match progress.phase {
+        ProgressPhase::Switching { .. } => "Switching".into(),
+        ProgressPhase::Verifying { .. } => "Verifying".into(),
+        ProgressPhase::SigningIn { .. } => "Signing in".into(),
+        _ => account_progress_phase(progress),
+    };
+    Some(format!("{phase} · {work}"))
+}
+
 /// A fitted line may omit the deadline; the underlying observation and the
 /// full disclosure still retain it.
 fn account_progress_line(
@@ -3459,11 +3491,19 @@ fn account_progress_line(
 ) -> String {
     if progress.phase == super::account_progress::ProgressPhase::Watching && progress.wall.is_none()
     {
-        return if progress.known.is_none() && progress.eligible.is_none() {
+        let inventory = if progress.known.is_none() && progress.eligible.is_none() {
             "Accounts unknown".into()
         } else {
             progress_inventory(progress).join(" · ")
         };
+        let mut parts = vec![inventory];
+        parts.extend(
+            progress
+                .independent_work
+                .iter()
+                .map(|work| pool_work_text(work, narrow)),
+        );
+        return parts.join(" · ");
     }
     let mut parts = Vec::new();
     if narrow && progress.wall.is_some() {
@@ -3478,6 +3518,8 @@ fn account_progress_line(
     let phase = account_progress_phase(progress);
     parts.push(if narrow {
         progress_excerpt(&phase)
+    } else if !progress.independent_work.is_empty() {
+        format!("Decision: {phase}")
     } else {
         phase
     });
@@ -3490,6 +3532,12 @@ fn account_progress_line(
             None => "Next unknown".into(),
         });
     }
+    parts.extend(
+        progress
+            .independent_work
+            .iter()
+            .map(|work| pool_work_text(work, narrow)),
+    );
     parts.join(" · ")
 }
 
@@ -3650,6 +3698,7 @@ impl FooterFacts {
             progress.phase = ProgressPhase::Unknown;
             progress.eligible = None;
             progress.next_at = None;
+            progress.independent_work.clear();
             for detail in &mut progress.details {
                 if detail.as_str() != UNOBSERVED_RECOVERY_FINDING
                     && !detail.starts_with(EXECUTION_HISTORY_PREFIX)
@@ -3688,6 +3737,7 @@ impl FooterFacts {
                 || progress.wall.is_some()
                 || progress.known.is_some()
                 || progress.eligible.is_some()
+                || !progress.independent_work.is_empty()
         })
     }
 }
@@ -4401,6 +4451,9 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
         minimal.details.clear();
         push_recovery(account_progress_line(&minimal, true, true));
         push_recovery(account_progress_line(&minimal, true, false));
+        if let Some(work) = pool_work_minimum(&minimal) {
+            push_recovery(work);
+        }
         return out;
     }
     let mut out = vec![fact_segments(facts, true)];
@@ -4751,7 +4804,8 @@ pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
         rule_width(
             &[Segment::plain(
                 WALL_MARK,
-                account_progress_line(&minimum, true, false),
+                pool_work_minimum(&minimum)
+                    .unwrap_or_else(|| account_progress_line(&minimum, true, false)),
             )],
             TitleFit::None,
             false,
@@ -5000,3 +5054,7 @@ pub fn claude_footer_model_environment() {}
 #[cfg(test)]
 #[path = "footer_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "footer_independent_work_tests.rs"]
+mod independent_work_tests;

@@ -22,31 +22,47 @@
 //! - `ctl-help`: `aterm ctl --help`;
 //! - `ctl-status`: `aterm ctl --sock <sock> @<sid> status` against a headless `aterm-lab
 //!   instance` of the same aterm, its first session;
-//! - the controls, the programs of `aterm-start-controls`, each an empty `main`:
+//! - the controls, the programs of `aterm-start-controls`, whose `main`s do no work:
+//!   `start-control-none`, `start-control-all` and `start-control-cli` are empty `main`s, and
+//!   `start-control-binds`' only hands its table of addresses to `black_box`.
 //!   `start-control-none` links nothing beyond what every Rust program links;
 //!   `start-control-all` links every dylib aterm's load commands name; `start-control-cli` all of
-//!   those but the window-only frameworks ([`WINDOW_ONLY`]). The lane builds them at every run
-//!   with the flags [`link_flag`] makes of aterm's load commands, so the controls follow what
-//!   aterm links and nothing lists it by hand, and it holds each control's own load commands to
-//!   what it was built to load ([`mislinked`]).
+//!   those but the window-only frameworks ([`WINDOW_ONLY`]); `start-control-binds` what `all`
+//!   links, with chained fixups, and holds the address of every symbol aterm's chained fixups
+//!   import ([`chained_imports`]). The lane builds them at every run with the flags [`link_flag`]
+//!   makes of aterm's load commands and the names its import table gives, so the controls follow
+//!   what aterm links and binds and nothing lists it by hand, and it holds each control's own
+//!   load commands to what it was built to load ([`mislinked`]). The `binds` control is built on
+//!   its own, after the others: where it cannot be built, or aterm's imports cannot be read, it
+//!   is NOT MEASURED and the rest of the run goes on;
+//! - the stops ([`STOPS`]), aterm launched with a verb its `main` refuses at a known point before
+//!   any verb's work: `main` at `main`'s first call, `prelude` once the front door installed its
+//!   hooks and routed argv past its aliases. Each is known by its refusal, its exit code and what
+//!   it writes to stderr, which its probe launch must end with ([`ended_elsewhere`]).
 //!
 //! The split of `aterm --version`: `none` is the trivial start any program pays; `all` over it
 //! is loading aterm's dylibs; aterm over `all` is aterm's own start (its fixups, static
 //! initializers and the verb); `all` over `cli` is what taking the window-only frameworks out of
 //! the link would save a CLI start, which is less than what they cost alone, because the dylibs
-//! `cli` keeps load most of them in turn. Every arm's one unmeasured probe launch runs with
-//! `DYLD_PRINT_LIBRARIES`, and the report attributes the split by the images each one loaded:
-//! the window-only frameworks `cli` loads all the same, the images `all` loads and `cli` does
-//! not, and what aterm loads beyond `all`.
+//! `cli` keeps load most of them in turn. The stops split aterm's own start in turn: `main` over
+//! `all` is loading aterm's image and starting the Rust runtime, `prelude` over `main` the front
+//! door's hooks and argv, and the start over `prelude` its verb. `binds` over `all` is the part
+//! of the image's load that binding aterm's imports costs, which dyld resolves symbol by symbol
+//! at every start (most of it, `docs/measured/cli-start-own-2026-11-04.md`): those beyond the
+//! Rust runtime's own, which `all` binds too and so drop out of the difference. Every arm's one
+//! unmeasured probe launch runs with `DYLD_PRINT_LIBRARIES`, and the report attributes the split
+//! by the images each one loaded: the window-only frameworks `cli` loads all the same, the
+//! images `all` loads and `cli` does not, and what aterm loads beyond `all`.
 //!
 //! The controls link; they do not insert. `DYLD_INSERT_LIBRARIES` naming aterm's dylibs into
 //! the bare control loads the same 588 images as linking them, yet retired 39.03 M instructions
 //! to the linked control's 29.53 M in one run (`docs/measured/cli-start-2026-11-04.md`).
 //!
-//! Judged: each aterm arm's median instructions against a ceiling, its committed baseline times
-//! [`CEILING_RATIO`] (`perf-baseline-cli-start.json`, `--record cli-start` rewrites it). A gated
-//! arm the run did not measure is NOT JUDGED, by name and why. The controls are the OS's costs
-//! and are reported, never judged.
+//! Judged: each of the three starts' ([`GATED`]) median instructions against a ceiling, its
+//! committed baseline times [`CEILING_RATIO`] (`perf-baseline-cli-start.json`, `--record
+//! cli-start` rewrites it), and only they feed the trend. A gated arm the run did not measure is
+//! NOT JUDGED, by name and why. The controls are the OS's costs and the stops are refusals no
+//! caller makes: both split the starts, and are reported, never judged.
 
 use std::path::{Path, PathBuf};
 
@@ -80,12 +96,16 @@ const COMMENT: &str = "aterm CLI-START baseline: the median instructions retired
 /// The package of the control programs.
 const CONTROLS: &str = "aterm-start-controls";
 
-/// The controls: each one's name and its program's.
+/// The controls the split rests on: each one's name and its program's.
 const CONTROL_BINS: [(&str, &str); 3] = [
     ("none", "start-control-none"),
     ("all", "start-control-all"),
     ("cli", "start-control-cli"),
 ];
+
+/// The `binds` control, which prices aterm's imports where the lane can build it: its name and
+/// its program's.
+const BINDS_BIN: (&str, &str) = ("binds", "start-control-binds");
 
 /// The frameworks only aterm's window uses, by short name: the `cli` control links every dylib
 /// aterm links but these. They are what E08's step 2 would defer behind `dlopen`; the report
@@ -108,6 +128,70 @@ const GATED: [(&str, &str); 3] = [
     ("ctl-status", "ctl_status_minstr"),
 ];
 
+/// A stop: aterm launched with `verb` and no other word, which its `main` refuses at a point
+/// before any verb's work, exiting `exit` and writing `says` to stderr (nothing, where it is
+/// empty).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stop {
+    pub name: &'static str,
+    pub verb: &'static str,
+    pub exit: i32,
+    pub says: &'static str,
+}
+
+/// The stops.
+///
+/// - `main`: `aterm __build_hold` with no words, refused by `main`'s first call with 2 and
+///   nothing written, so the launch is aterm's image loaded, the Rust runtime started and its
+///   exit, nothing of `main`'s.
+/// - `prelude`: `aterm __tcc-open` with no path, refused with 1 and its one stderr line once the
+///   front door installed its hooks and routed argv past its aliases and the verbs ahead of it.
+///
+/// The code alone does not place a stop: 2 is also aterm's usage refusal of a word no route
+/// takes (`aterm: unknown command '…'`), which an aterm without the hold verb gives only past
+/// its whole front door. A stop whose probe launch ends with another code or writes anything else
+/// to stderr is not where it should be ([`ended_elsewhere`]), and the lane refuses the run.
+const STOPS: [Stop; 2] = [
+    Stop {
+        name: "main",
+        verb: aterm_uds::build_front::HOLD_VERB,
+        exit: 2,
+        says: "",
+    },
+    Stop {
+        name: "prelude",
+        verb: aterm_containment::consent::OPEN_PROBE_VERB,
+        exit: 1,
+        says: aterm_containment::consent::OPEN_PROBE_REFUSAL,
+    },
+];
+
+/// Why a probe launch of the arm `name`, which must exit `exit` and, where `says` names it, write
+/// just that to stderr, ended elsewhere: it exited `got` and wrote `stderr`, read without the
+/// lines dyld wrote (`dyld[<pid>]: …`). `None` when it ended where it should; where `says` is
+/// `None`, only its code is held.
+pub(crate) fn ended_elsewhere(
+    name: &str,
+    exit: i32,
+    says: Option<&str>,
+    got: Option<i32>,
+    stderr: &str,
+) -> Option<String> {
+    let own: Vec<&str> = stderr.lines().filter(|l| !l.starts_with("dyld[")).collect();
+    let own = own.join("\n");
+    let own = own.trim_end();
+    if got == Some(exit) && says.is_none_or(|says| own == says) {
+        return None;
+    }
+    Some(match says {
+        Some(says) => format!(
+            "{name} exited {got:?} and wrote `{own}`, not {exit} and `{says}`: it did not stop \
+             where it should"
+        ),
+        None => format!("{name} exited {got:?}, not {exit}: {own}"),
+    })
+}
+
 /// One arm's launches, as measured.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Takes {
@@ -116,6 +200,7 @@ pub(crate) struct Takes {
     pub wall_ms: Vec<f64>,
     pub user_ms: Vec<f64>,
     pub system_ms: Vec<f64>,
+    pub resident_mb: Vec<f64>,
 }
 
 /// One arm's summary: medians and the instruction range.
@@ -129,6 +214,8 @@ pub(crate) struct Summary {
     pub wall_ms: f64,
     pub user_ms: f64,
     pub system_ms: f64,
+    /// The resident size the kernel recorded for it at its exit, in MiB.
+    pub resident_mb: f64,
 }
 
 impl Takes {
@@ -155,6 +242,7 @@ impl Takes {
             wall_ms: super::stats::median(&self.wall_ms),
             user_ms: super::stats::median(&self.user_ms),
             system_ms: super::stats::median(&self.system_ms),
+            resident_mb: super::stats::median(&self.resident_mb),
         })
     }
 }
@@ -170,7 +258,18 @@ pub(crate) struct Measured {
     pub summary: Summary,
 }
 
-/// The split of one aterm start by the controls, in instructions.
+/// What the split takes each aterm start over, as medians in instructions: the controls', and
+/// the `binds` control's and the stops' (`(main, prelude)`) where the run measured them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Bases {
+    pub none: f64,
+    pub all: f64,
+    pub cli: f64,
+    pub binds: Option<f64>,
+    pub stops: Option<(f64, f64)>,
+}
+
+/// The split of one aterm start by the controls and the stops, in instructions.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Split {
     pub start: f64,
@@ -178,17 +277,29 @@ pub(crate) struct Split {
     pub frameworks: f64,
     pub deferral: f64,
     pub own: f64,
+    /// aterm's own start by the stops, where the run measured both: loading aterm's image and
+    /// starting the Rust runtime (`main` - `all`), the front door's prelude (`prelude` -
+    /// `main`) and the verb (the start - `prelude`).
+    pub own_by_stop: Option<[f64; 3]>,
+    /// What binding aterm's imports costs (`binds` - `all`), where the run measured it: a part
+    /// of the image's load.
+    pub binding: Option<f64>,
 }
 
 impl Split {
-    /// `start`'s median split by the `none`, `all` and `cli` controls' medians.
-    pub(crate) fn of(start: f64, none: f64, all: f64, cli: f64) -> Split {
+    /// `start`'s median split over `bases`.
+    pub(crate) fn of(start: f64, bases: &Bases) -> Split {
+        let all = bases.all;
         Split {
             start,
-            trivial: none,
-            frameworks: all - none,
-            deferral: all - cli,
+            trivial: bases.none,
+            frameworks: all - bases.none,
+            deferral: all - bases.cli,
             own: start - all,
+            own_by_stop: bases
+                .stops
+                .map(|(main, prelude)| [main - all, prelude - main, start - prelude]),
+            binding: bases.binds.map(|binds| binds - all),
         }
     }
 
@@ -201,17 +312,28 @@ impl Split {
         }
     }
 
-    /// How many rows [`Split::rows`] gives.
-    pub(crate) const ROWS: usize = 4;
-
-    /// Its parts as the report prints them: each one's label and its instructions.
-    pub(crate) fn rows(&self) -> [(&'static str, f64); Self::ROWS] {
-        [
+    /// Its parts as the report prints them: each one's label and its instructions, aterm's own
+    /// by the stops and the binding last where it has them.
+    pub(crate) fn rows(&self) -> Vec<(&'static str, f64)> {
+        let mut rows = vec![
             ("trivial start (none)", self.trivial),
             ("frameworks (all - none)", self.frameworks),
             ("  window-only deferral (all - cli)", self.deferral),
             ("aterm's own (it - all)", self.own),
-        ]
+        ];
+        if let Some([image, prelude, verb]) = self.own_by_stop {
+            rows.push(("  image and runtime (main - all)", image));
+            if let Some(binding) = self.binding {
+                rows.push(("    of it, its imports (binds - all)", binding));
+            }
+            rows.extend([
+                ("  front door prelude (prelude - main)", prelude),
+                ("  the verb (it - prelude)", verb),
+            ]);
+        } else if let Some(binding) = self.binding {
+            rows.push(("  of it, its imports (binds - all)", binding));
+        }
+        rows
     }
 }
 
@@ -321,6 +443,113 @@ pub(crate) fn images_of(stderr: &str) -> Vec<String> {
         .collect()
 }
 
+/// The symbols a Mach-O imports, by its chained fixups' import table (`LC_DYLD_CHAINED_FIXUPS`),
+/// in table order: the binds dyld resolves at its load. A universal file is read at its slice for
+/// `cpu` (a Mach-O `cputype`). Why not, for a file with no such slice or no chained fixups (an
+/// x86_64 aterm links the older opcodes), or a table this reader does not take.
+pub(crate) fn chained_imports(bytes: &[u8], cpu: u32) -> Result<Vec<String>, String> {
+    const MH_MAGIC_64: u32 = 0xfeed_facf;
+    const FAT_MAGIC: u32 = 0xcafe_babe;
+    const FAT_MAGIC_64: u32 = 0xcafe_babf;
+    const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
+    let le = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    let be = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    let be64 = |at: usize| -> Option<u64> {
+        Some(u64::from_be_bytes(
+            bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+        ))
+    };
+    let at = |v: u64| usize::try_from(v).ok();
+    let magic = be(0).ok_or("not a Mach-O: shorter than its magic")?;
+    let slice = if magic == FAT_MAGIC || magic == FAT_MAGIC_64 {
+        let wide = magic == FAT_MAGIC_64;
+        let arches = be(4).ok_or("a universal header with no count")?;
+        let stride = if wide { 32 } else { 20 };
+        (0..arches as usize)
+            .map(|i| 8 + i * stride)
+            .find(|&arch| be(arch) == Some(cpu))
+            .and_then(|arch| {
+                if wide {
+                    at(be64(arch + 8)?)
+                } else {
+                    at(u64::from(be(arch + 8)?))
+                }
+            })
+            .ok_or_else(|| format!("no slice for cputype {cpu:#x}"))?
+    } else {
+        0
+    };
+    if le(slice) != Some(MH_MAGIC_64) {
+        return Err("not a 64-bit Mach-O".into());
+    }
+    if le(slice + 4) != Some(cpu) {
+        return Err(format!("not a Mach-O for cputype {cpu:#x}"));
+    }
+    let ncmds = le(slice + 16).ok_or("a header cut short")?;
+    let mut cmd = slice + 32;
+    let mut fixups = None;
+    for _ in 0..ncmds {
+        let (Some(kind), Some(size)) = (le(cmd), le(cmd + 4)) else {
+            return Err("a load command cut short".into());
+        };
+        if kind == LC_DYLD_CHAINED_FIXUPS {
+            let off = le(cmd + 8).ok_or("LC_DYLD_CHAINED_FIXUPS cut short")?;
+            fixups = Some(slice + off as usize);
+            break;
+        }
+        if size < 8 {
+            return Err("a load command smaller than its header".into());
+        }
+        cmd += size as usize;
+    }
+    let head = fixups.ok_or("no chained fixups (LC_DYLD_CHAINED_FIXUPS)")?;
+    let field = |i: usize| le(head + 4 * i).ok_or("the chained fixups header is cut short");
+    let (imports, symbols, count, format, compressed) =
+        (field(2)?, field(3)?, field(4)?, field(5)?, field(6)?);
+    if compressed != 0 {
+        return Err(format!("symbol names in format {compressed} (compressed)"));
+    }
+    let (stride, name_of): (usize, fn(u64) -> u64) = match format {
+        // DYLD_CHAINED_IMPORT: lib_ordinal 8, weak_import 1, name_offset 23.
+        1 => (4, |e| e >> 9),
+        // DYLD_CHAINED_IMPORT_ADDEND: the same, then an i32 addend.
+        2 => (8, |e| (e & 0xffff_ffff) >> 9),
+        // DYLD_CHAINED_IMPORT_ADDEND64: lib_ordinal 16, weak_import 1, reserved 15,
+        // name_offset 32, then a u64 addend.
+        3 => (16, |e| e >> 32),
+        other => return Err(format!("imports in format {other}")),
+    };
+    let names = head + symbols as usize;
+    (0..count as usize)
+        .map(|i| {
+            let entry = head + imports as usize + i * stride;
+            let raw = if format == 3 {
+                le(entry)
+                    .zip(le(entry + 4))
+                    .map(|(low, high)| u64::from(low) | (u64::from(high) << 32))
+            } else {
+                le(entry).map(u64::from)
+            }
+            .ok_or_else(|| format!("import {i} is past the file's end"))?;
+            let start = names + at(name_of(raw)).ok_or("a name offset past usize")?;
+            let name = bytes
+                .get(start..)
+                .and_then(|rest| rest.split(|b| *b == 0).next())
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| format!("import {i} names no symbol"))?;
+            String::from_utf8(name.to_vec()).map_err(|_| format!("import {i}'s name is not UTF-8"))
+        })
+        .collect()
+}
+
 /// The sid of the first session a `ctl ls` reply lists: a row's third word (`<pid> <local>
 /// <sid> …`).
 pub(crate) fn sid_of_ls(listed: &str) -> Option<String> {
@@ -347,12 +576,13 @@ fn listed(names: &[&str]) -> String {
 /// The report: one row per arm, the split of each aterm arm and the images that attribute it.
 pub(crate) fn report(arms: &[Measured]) -> String {
     let mut s = String::from(
-        "    arm                  instr M  (min-max)          cycles M  user ms   sys ms  wall ms\n",
+        "    arm                  instr M  (min-max)          cycles M  user ms   sys ms  wall ms  \
+         rss MiB\n",
     );
     for a in arms {
         let x = a.summary;
         s.push_str(&format!(
-            "    {:<20} {:>7.2}  ({:>6.2}-{:<6.2})    {:>7.2}  {:>7.2}  {:>7.2}  {:>7.2}\n",
+            "    {:<20} {:>7.2}  ({:>6.2}-{:<6.2})    {:>7.2}  {:>7.2}  {:>7.2}  {:>7.2}  {:>7.2}\n",
             a.name,
             m(x.instructions),
             m(x.min),
@@ -360,33 +590,39 @@ pub(crate) fn report(arms: &[Measured]) -> String {
             m(x.cycles),
             x.user_ms,
             x.system_ms,
-            x.wall_ms
+            x.wall_ms,
+            x.resident_mb
         ));
     }
     let find = |name: &str| arms.iter().find(|a| a.name == name);
     let (Some(none), Some(all), Some(cli)) = (find("none"), find("all"), find("cli")) else {
         return s;
     };
+    let bases = Bases {
+        none: none.summary.instructions,
+        all: all.summary.instructions,
+        cli: cli.summary.instructions,
+        binds: find("binds").map(|binds| binds.summary.instructions),
+        stops: find("main")
+            .zip(find("prelude"))
+            .map(|(main, prelude)| (main.summary.instructions, prelude.summary.instructions)),
+    };
     let starts: Vec<&Measured> = GATED.iter().filter_map(|(arm, _)| find(arm)).collect();
     let splits: Vec<Split> = starts
         .iter()
-        .map(|start| {
-            Split::of(
-                start.summary.instructions,
-                none.summary.instructions,
-                all.summary.instructions,
-                cli.summary.instructions,
-            )
-        })
+        .map(|start| Split::of(start.summary.instructions, &bases))
         .collect();
     s.push_str("    split, instr M and share of the start:  ");
     for start in &starts {
         s.push_str(&format!(" {:>15}", start.name));
     }
     s.push('\n');
-    for row in 0..Split::ROWS {
-        let label = splits.first().map_or("", |x| x.rows()[row].0);
-        s.push_str(&format!("      {label:<36}"));
+    let labels: Vec<&str> = splits
+        .first()
+        .map(|x| x.rows().into_iter().map(|(label, _)| label).collect())
+        .unwrap_or_default();
+    for (row, label) in labels.iter().enumerate() {
+        s.push_str(&format!("      {label:<38}"));
         for split in &splits {
             let v = split.rows()[row].1;
             s.push_str(&format!(" {:>7.2} {:>4.0}%  ", m(v), split.share(v)));
@@ -532,6 +768,24 @@ fn conclude(
     built: bool,
     baseline: &Path,
 ) -> LaneRun {
+    conclude_using(
+        arms,
+        unmeasured,
+        record,
+        built,
+        baseline,
+        super::publication::publish,
+    )
+}
+
+fn conclude_using(
+    arms: &[Measured],
+    unmeasured: &[(String, String)],
+    record: bool,
+    built: bool,
+    baseline: &Path,
+    publish: super::publication::Publisher,
+) -> LaneRun {
     if let Some(refused) = record_refused(record, built) {
         return refused;
     }
@@ -561,7 +815,7 @@ fn conclude(
             ));
         }
         let (comment, _) = super::floors::carried_comment(previous.as_ref(), COMMENT, &utc_date());
-        match std::fs::write(baseline, baseline_json(&values, &comment)) {
+        match publish(baseline, &baseline_json(&values, &comment)) {
             Ok(()) => {
                 eprintln!("  RECORDED baseline -> {}", baseline.display());
                 LaneRun {
@@ -620,6 +874,7 @@ fn json(arms: &[Measured], aterm: &Path, load: &str) -> Value {
         row.insert("wall_ms_median".into(), Value::from(x.wall_ms));
         row.insert("user_ms_median".into(), Value::from(x.user_ms));
         row.insert("system_ms_median".into(), Value::from(x.system_ms));
+        row.insert("resident_mb_median".into(), Value::from(x.resident_mb));
         row.insert(
             "loads".into(),
             Value::Array(a.loads.iter().map(|l| Value::from(l.as_str())).collect()),
@@ -669,7 +924,7 @@ pub(crate) fn run(args: &Args, record: bool) -> LaneRun {
             eprint!("{}", report(&arms));
             if let Some(path) = &args.json_out {
                 let text = json(&arms, &aterm, &load).to_string();
-                if let Err(e) = std::fs::write(path, text + "\n") {
+                if let Err(e) = super::publication::publish(path, &(text + "\n")) {
                     return LaneRun::fail(format!("could not write {}: {e}", path.display()));
                 }
                 eprintln!("  json -> {}", path.display());
@@ -696,7 +951,7 @@ mod live {
 
     use super::super::arena::{self, without_aterm_env};
     use super::super::{LaneRun, driver, workspace_root};
-    use super::{Args, CONTROL_BINS, CONTROLS, DEFAULT_SAMPLES, Measured, Takes};
+    use super::{Args, BINDS_BIN, CONTROL_BINS, CONTROLS, DEFAULT_SAMPLES, Measured, Takes};
 
     /// How long one launch may run before the lane calls it hung: a start takes milliseconds,
     /// and `ctl status` answers within its own default timeout.
@@ -706,22 +961,28 @@ mod live {
     /// boot bound plus a one-minute hang detector.
     const INSTANCE_HUNG: Duration = Duration::from_secs(120);
 
-    /// One arm: its name, the program and arguments it launches, and what it links (a
-    /// control's own load commands; empty for aterm's arms).
+    /// One arm: its name, the program and arguments it launches, what it links (a control's
+    /// own load commands; empty for aterm's arms), the exit code every launch of it must end
+    /// with (a stop's refusal; 0 for every other arm) and, for a stop, what its probe launch must
+    /// write to stderr ([`super::Stop::says`]).
     struct Arm {
         name: String,
         program: PathBuf,
         args: Vec<OsString>,
         loads: Vec<String>,
+        exit: i32,
+        says: Option<&'static str>,
     }
 
-    /// What one launch retired, and how long it took from spawn to its exit.
+    /// What one launch retired, how long it took from spawn to its exit, and its resident size
+    /// in bytes at the exit.
     struct Take {
         instructions: u64,
         cycles: u64,
         user: Duration,
         system: Duration,
         wall: Duration,
+        resident: u64,
     }
 
     /// Build, probe every arm, launch each `samples` times, and summarize: the arms, the aterm
@@ -738,19 +999,31 @@ mod live {
             )));
         }
         let aterm_loads = loads(&aterm).map_err(LaneRun::fail)?;
-        let controls = build_controls(&aterm_loads).map_err(LaneRun::fail)?;
+        let aterm_imports = match imports(&aterm) {
+            Ok(names) => Some(names),
+            Err(why) => {
+                eprintln!("  binds: NOT MEASURED — {why}");
+                None
+            }
+        };
+        let controls =
+            build_controls(&aterm_loads, aterm_imports.as_deref()).map_err(LaneRun::fail)?;
         let mut arms = vec![
             Arm {
                 name: "version".into(),
                 program: aterm.clone(),
                 args: vec!["--version".into()],
                 loads: Vec::new(),
+                exit: 0,
+                says: None,
             },
             Arm {
                 name: "ctl-help".into(),
                 program: aterm.clone(),
                 args: vec!["ctl".into(), "--help".into()],
                 loads: Vec::new(),
+                exit: 0,
+                says: None,
             },
         ];
         let mut unmeasured = Vec::new();
@@ -767,6 +1040,8 @@ mod live {
                         "status".into(),
                     ],
                     loads: Vec::new(),
+                    exit: 0,
+                    says: None,
                 });
                 Some(instance)
             }
@@ -777,6 +1052,14 @@ mod live {
                 None
             }
         };
+        arms.extend(super::STOPS.iter().map(|stop| Arm {
+            name: stop.name.into(),
+            program: aterm.clone(),
+            args: vec![stop.verb.into()],
+            loads: Vec::new(),
+            exit: stop.exit,
+            says: Some(stop.says),
+        }));
         arms.extend(controls);
         let mut images = Vec::with_capacity(arms.len());
         for arm in &arms {
@@ -803,6 +1086,9 @@ mod live {
                 takes[i].wall_ms.push(take.wall.as_secs_f64() * 1e3);
                 takes[i].user_ms.push(take.user.as_secs_f64() * 1e3);
                 takes[i].system_ms.push(take.system.as_secs_f64() * 1e3);
+                takes[i]
+                    .resident_mb
+                    .push(take.resident as f64 / (1024.0 * 1024.0));
             }
         }
         let load_after = super::super::bench_build::load_average();
@@ -837,38 +1123,79 @@ mod live {
             .map_err(|e| format!("cannot read the load commands of {}: {e}", path.display()))
     }
 
+    /// The symbols the Mach-O at `path` imports, at this host's slice ([`super::chained_imports`]).
+    fn imports(path: &Path) -> Result<Vec<String>, String> {
+        const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+        const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+        let cpu = if cfg!(target_arch = "aarch64") {
+            CPU_TYPE_ARM64
+        } else {
+            CPU_TYPE_X86_64
+        };
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        super::chained_imports(&bytes, cpu)
+            .map_err(|why| format!("the imports of {}: {why}", path.display()))
+    }
+
     /// `targo --unverified build --release -p aterm-start-controls`, its `all` control linking
-    /// every dylib in `aterm` (aterm's load commands) and its `cli` control all but the
-    /// window-only ones: each control's arm, held to its own load commands.
-    fn build_controls(aterm: &[String]) -> Result<Vec<Arm>, String> {
+    /// every dylib in `aterm` (aterm's load commands), its `cli` control all but the window-only
+    /// ones and its `binds` control what `all` links and every symbol in `imports` (aterm's):
+    /// each control's arm, held to its own load commands. The `binds` control is built by
+    /// itself, after the others, and only it is optional: without `imports` (an aterm whose
+    /// imports cannot be read) it is not built, and where its build fails it is NOT MEASURED,
+    /// by why, and the run goes on without it.
+    fn build_controls(aterm: &[String], imports: Option<&[String]>) -> Result<Vec<Arm>, String> {
         let cli = super::cli_of(aterm);
         let all_flags = super::link_flags(aterm)?;
         let cli_flags = super::link_flags(&cli)?;
-        let messages = build(
-            &[
+        let imports = imports.map(|names| names.join(" "));
+        // Both builds set the same variables, so the second reuses the first's build script run.
+        let env = [
+            ("ATERM_START_CONTROL_ALL", all_flags.as_str()),
+            ("ATERM_START_CONTROL_CLI", cli_flags.as_str()),
+            ("ATERM_START_CONTROL_BINDS", all_flags.as_str()),
+            (
+                "ATERM_START_CONTROL_IMPORTS",
+                imports.as_deref().unwrap_or(""),
+            ),
+        ];
+        let built = |bins: &[(&str, &str)]| -> Result<Vec<Arm>, String> {
+            let mut args = vec![
                 "--release",
                 "-q",
                 "-p",
                 CONTROLS,
                 "--message-format=json-render-diagnostics",
-            ],
-            &[
-                ("ATERM_START_CONTROL_ALL", &all_flags),
-                ("ATERM_START_CONTROL_CLI", &cli_flags),
-            ],
-        )?;
-        let mut arms = Vec::new();
-        for (name, bin) in CONTROL_BINS {
-            let program = super::super::bench_build::built_executable(&messages, bin, "bin")?;
-            arms.push(Arm {
-                name: name.to_string(),
-                loads: loads(&program)?,
-                program,
-                args: Vec::new(),
-            });
+            ];
+            for (_, bin) in bins {
+                args.extend(["--bin", bin]);
+            }
+            let messages = build(&args, &env)?;
+            bins.iter()
+                .map(|(name, bin)| {
+                    let program =
+                        super::super::bench_build::built_executable(&messages, bin, "bin")?;
+                    Ok(Arm {
+                        name: (*name).to_string(),
+                        loads: loads(&program)?,
+                        program,
+                        args: Vec::new(),
+                        exit: 0,
+                        says: None,
+                    })
+                })
+                .collect()
+        };
+        let mut arms = built(&CONTROL_BINS)?;
+        if imports.is_some() {
+            match built(&[BINDS_BIN]) {
+                Ok(binds) => arms.extend(binds),
+                Err(why) => eprintln!("  binds: NOT MEASURED — {why}"),
+            }
         }
         let none = arms[0].loads.clone();
-        for (arm, want) in arms.iter().zip([&none[..], aterm, &cli[..]]) {
+        for (arm, want) in arms.iter().zip([&none[..], aterm, &cli[..], aterm]) {
             if let Some(why) = super::mislinked(&arm.name, &arm.loads, want, &none) {
                 return Err(why);
             }
@@ -917,8 +1244,11 @@ mod live {
     }
 
     /// Launch `arm` once unmeasured, its output kept and `DYLD_PRINT_LIBRARIES` set: it must
-    /// exit 0 (`ctl-status` must answer `OK`), the program's first exec is behind it before any
-    /// launch is counted, and what it gives back is the images it loaded.
+    /// end with its code and, a stop, with its refusal's stderr ([`super::ended_elsewhere`];
+    /// `ctl-status` must answer `OK`), the program's first exec is behind it before any launch
+    /// is counted, and what it gives back is the images it loaded. Every counted launch runs the
+    /// same program on the same words, so the probe is where a stop is placed; the counted ones
+    /// are held to their code alone, their output discarded.
     fn probe(arm: &Arm) -> Result<Vec<String>, String> {
         let mut cmd = command_of(arm);
         cmd.env("DYLD_PRINT_LIBRARIES", "1");
@@ -926,14 +1256,10 @@ mod live {
             .map_err(|e| format!("{}: {e}", arm.name))?;
         let said = String::from_utf8_lossy(&out.stdout);
         let told = String::from_utf8_lossy(&out.stderr);
-        if !out.status.success() {
-            let own: Vec<&str> = told.lines().filter(|l| !l.starts_with("dyld[")).collect();
-            return Err(format!(
-                "{} exited {:?}: {}",
-                arm.name,
-                out.status.code(),
-                own.join("\n").trim_end()
-            ));
+        if let Some(why) =
+            super::ended_elsewhere(&arm.name, arm.exit, arm.says, out.status.code(), &told)
+        {
+            return Err(why);
         }
         if arm.name == "ctl-status" && !said.starts_with("OK") {
             return Err(format!(
@@ -944,7 +1270,8 @@ mod live {
         Ok(super::images_of(&told))
     }
 
-    /// Launch `arm` once: what it retired, read before the reap, and its spawn-to-exit time.
+    /// Launch `arm` once: what it retired and its resident size, read before the reap, and its
+    /// spawn-to-exit time.
     fn launch(arm: &Arm) -> Result<Take, String> {
         let mut cmd = command_of(arm);
         cmd.stdin(Stdio::null())
@@ -964,8 +1291,8 @@ mod live {
         let status = child
             .wait()
             .map_err(|e| format!("{}: could not reap: {e}", arm.name))?;
-        if !status.success() {
-            return Err(format!("{} exited {status}", arm.name));
+        if status.code() != Some(arm.exit) {
+            return Err(format!("{} exited {status}, not {}", arm.name, arm.exit));
         }
         let usage = usage.ok_or_else(|| format!("{}: proc_pid_rusage named no usage", arm.name))?;
         Ok(Take {
@@ -974,6 +1301,7 @@ mod live {
             user: mach(usage.ri_user_time),
             system: mach(usage.ri_system_time),
             wall,
+            resident: usage.ri_resident_size,
         })
     }
 
@@ -1067,7 +1395,8 @@ mod live {
                 .ok_or("aterm-lab's stdout was not piped")?;
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
-                for line in std::io::BufReader::new(stdout).lines() {
+                use std::io::Read as _;
+                for line in std::io::BufReader::new(stdout.take(1024 * 1024)).lines() {
                     let Ok(line) = line else { break };
                     if tx.send(line).is_err() {
                         break;
@@ -1163,6 +1492,7 @@ mod tests {
                 wall_ms: 1.0,
                 user_ms: 1.0,
                 system_ms: 1.0,
+                resident_mb: 1.0,
             },
         }
     }
@@ -1198,14 +1528,172 @@ mod tests {
         assert_eq!(sid_of_ls("0 0\n"), None);
     }
 
+    /// The controls alone: no stop and no `binds` control measured.
+    const CONTROLS_ONLY: Bases = Bases {
+        none: 15e6,
+        all: 32e6,
+        cli: 29e6,
+        binds: None,
+        stops: None,
+    };
+
     #[test]
     fn the_split_takes_the_controls_from_the_start() {
-        let split = Split::of(50e6, 15e6, 32e6, 29e6);
+        let split = Split::of(50e6, &CONTROLS_ONLY);
         assert_eq!(split.frameworks, 17e6);
         assert_eq!(split.deferral, 3e6);
         assert_eq!(split.own, 18e6);
+        assert_eq!((split.own_by_stop, split.binding), (None, None));
+        assert_eq!(split.rows().len(), 4);
         assert!((split.share(split.frameworks) - 34.0).abs() < 1e-9);
-        assert_eq!(Split::of(0.0, 0.0, 0.0, 0.0).share(1.0), 0.0);
+        let zero = Bases {
+            none: 0.0,
+            all: 0.0,
+            cli: 0.0,
+            ..CONTROLS_ONLY
+        };
+        assert_eq!(Split::of(0.0, &zero).share(1.0), 0.0);
+    }
+
+    /// The stops cut aterm's own start into three parts that add up to it: to `main` over
+    /// `all`, the prelude over `main`, the verb over the prelude; the `binds` control prices
+    /// the binding inside the first.
+    #[test]
+    fn the_stops_split_aterms_own_start_into_parts_that_add_up() {
+        let bases = Bases {
+            binds: Some(41e6),
+            stops: Some((44e6, 47e6)),
+            ..CONTROLS_ONLY
+        };
+        let split = Split::of(50e6, &bases);
+        assert_eq!(split.own_by_stop, Some([12e6, 3e6, 3e6]));
+        assert_eq!(split.binding, Some(9e6));
+        let [image, prelude, verb] = split.own_by_stop.expect("stops");
+        assert_eq!(image + prelude + verb, split.own);
+        let rows = split.rows();
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[4], ("  image and runtime (main - all)", 12e6));
+        assert_eq!(rows[5], ("    of it, its imports (binds - all)", 9e6));
+        assert_eq!(rows[7], ("  the verb (it - prelude)", 3e6));
+    }
+
+    /// What dyld writes first under `DYLD_PRINT_LIBRARIES`, which no stop's refusal is held to.
+    const DYLD: &str = "dyld[501]: <4C4C4410-5555-3144-A1B2-C3D4E5F60718> /tmp/aterm\n\
+                        dyld[501]: <4C4C4411-5555-3144-A1B2-C3D4E5F60718> /usr/lib/libz.dylib\n";
+
+    /// A stop is placed by its refusal, its code and what it writes, not its code alone: an aterm
+    /// without the hold verb exits 2 too, from its usage refusal past the whole front door.
+    #[test]
+    fn a_stop_is_known_by_its_refusal_not_its_code_alone() {
+        let [main, prelude] = STOPS;
+        let ends = |stop: Stop, got: i32, stderr: &str| {
+            ended_elsewhere(stop.name, stop.exit, Some(stop.says), Some(got), stderr)
+        };
+        assert_eq!(ends(main, 2, DYLD), None);
+        let usage = format!(
+            "{DYLD}aterm: unknown command '{}' (try --help)\n",
+            main.verb
+        );
+        let why = ends(main, 2, &usage).expect("a usage refusal is not the hold verb's");
+        assert!(why.contains("unknown command"), "{why}");
+        assert_eq!(ends(prelude, 1, &format!("{DYLD}{}\n", prelude.says)), None);
+        assert!(ends(prelude, 1, DYLD).is_some());
+        assert!(ends(prelude, 0, &format!("{}\n", prelude.says)).is_some());
+        // An arm with nothing to say is held to its code alone.
+        assert_eq!(ended_elsewhere("version", 0, None, Some(0), "x\n"), None);
+        assert!(ended_elsewhere("version", 0, None, Some(1), "x\n").is_some());
+    }
+
+    /// A thin arm64 Mach-O whose chained fixups import `names` in `format` (1, 2 or 3), laid
+    /// out as ld lays one out: the header and one `LC_DYLD_CHAINED_FIXUPS`, then its header,
+    /// its import table and its NUL-terminated names.
+    fn chained(names: &[&str], format: u32) -> Vec<u8> {
+        const ARM64: u32 = 0x0100_000c;
+        let le = |out: &mut Vec<u8>, v: u32| out.extend_from_slice(&v.to_le_bytes());
+        let mut out = Vec::new();
+        for v in [0xfeed_facf, ARM64, 0, 2, 1, 16, 0, 0] {
+            le(&mut out, v);
+        }
+        let data = 48;
+        for v in [0x8000_0034, 16, data, 0] {
+            le(&mut out, v);
+        }
+        let stride = [0, 4, 8, 16][format as usize];
+        let imports = 28;
+        let symbols = imports + stride * names.len() as u32;
+        for v in [0, 0, imports, symbols, names.len() as u32, format, 0] {
+            le(&mut out, v);
+        }
+        let mut offset = 1;
+        let mut text = vec![0u8];
+        for name in names {
+            match format {
+                1 => le(&mut out, 1 | (offset << 9)),
+                2 => {
+                    le(&mut out, 1 | (offset << 9));
+                    le(&mut out, 0);
+                }
+                _ => {
+                    for v in [1, offset, 0, 0] {
+                        le(&mut out, v);
+                    }
+                }
+            }
+            text.extend_from_slice(name.as_bytes());
+            text.push(0);
+            offset += name.len() as u32 + 1;
+        }
+        out.extend_from_slice(&text);
+        out
+    }
+
+    /// The import table is read in all three of dyld's formats, from a thin file and from a
+    /// universal one's slice for the host's CPU; a file with no chained fixups, or none for that
+    /// CPU, is refused by why.
+    /// NEGATIVE CONTROL: reading format 1's name offset from bit 8 (`e >> 8`) fails with
+    /// `left: Err("import 2 names no symbol")`.
+    #[test]
+    fn a_mach_os_imports_are_read_from_its_chained_fixups() {
+        const ARM64: u32 = 0x0100_000c;
+        let names = ["_write", "_OBJC_CLASS_$_NSApplication", "__tlv_bootstrap"];
+        for format in [1, 2, 3] {
+            assert_eq!(
+                chained_imports(&chained(&names, format), ARM64).as_deref(),
+                Ok(&names.map(str::to_string)[..]),
+                "format {format}"
+            );
+        }
+        let thin = chained(&names, 1);
+        let mut fat = Vec::new();
+        for v in [
+            0xcafe_babe_u32,
+            2,
+            0x0100_0007,
+            3,
+            4096,
+            0,
+            12,
+            ARM64,
+            0,
+            4096,
+        ] {
+            fat.extend_from_slice(&v.to_be_bytes());
+        }
+        fat.extend_from_slice(&(thin.len() as u32).to_be_bytes());
+        fat.extend_from_slice(&14u32.to_be_bytes());
+        fat.resize(4096, 0);
+        fat.extend_from_slice(&thin);
+        assert_eq!(chained_imports(&fat, ARM64).map(|n| n.len()), Ok(3));
+        assert_eq!(
+            chained_imports(&fat, 0x0100_0012),
+            Err("no slice for cputype 0x1000012".to_string())
+        );
+        let mut bare = thin;
+        bare[32..36].copy_from_slice(&0x19u32.to_le_bytes());
+        assert_eq!(
+            chained_imports(&bare, ARM64),
+            Err("no chained fixups (LC_DYLD_CHAINED_FIXUPS)".to_string())
+        );
     }
 
     fn owned(paths: &[&str]) -> Vec<String> {
@@ -1318,23 +1806,59 @@ mod tests {
         assert!(matches!(none.status, Status::NotJudged(_)), "{none:?}");
     }
 
+    /// Only the starts are gated: a stop and the `binds` control are reported, but give no
+    /// baseline key and no trend row.
     #[test]
-    fn the_gated_medians_are_in_millions_and_only_the_aterm_arms() {
+    fn the_gated_medians_are_in_millions_and_only_the_starts() {
         let arms = vec![
             arm("version", 54e6, &[], &[]),
             arm("none", 15e6, &[], &[SYS]),
             arm("ctl-status", 60e6, &[], &[]),
+            arm("main", 44e6, &[], &[]),
+            arm("prelude", 47e6, &[], &[]),
+            arm("binds", 41e6, &[], &[SYS]),
         ];
         assert_eq!(
             gated(&arms),
             vec![("version_minstr", 54.0), ("ctl_status_minstr", 60.0)]
         );
+        let dir = scratch();
+        let trended: Vec<String> = conclude(&arms, &[], false, true, &dir.path().join("none"))
+            .samples
+            .into_iter()
+            .map(|s| s.metric)
+            .collect();
+        assert_eq!(trended, ["version_minstr", "ctl_status_minstr"]);
         let text = report(&arms);
         assert!(text.contains("version"), "{text}");
         assert!(
             !text.contains("split"),
             "no split without the controls: {text}"
         );
+    }
+
+    #[test]
+    fn interrupted_cli_publication_preserves_history() {
+        let dir = scratch();
+        let path = dir.path().join(BASELINE_FILE);
+        let arms = starts(50e6);
+        assert_eq!(
+            conclude(&arms, &[], true, true, &path).status,
+            Status::Recorded(path.clone())
+        );
+        let old = std::fs::read(&path).unwrap();
+        assert!(
+            conclude_using(
+                &arms,
+                &[],
+                true,
+                true,
+                &path,
+                super::super::publication::interrupted
+            )
+            .failed()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), old);
     }
 
     /// A gated arm the run could not measure (the headless instance never came up) is NOT
@@ -1470,6 +1994,26 @@ mod tests {
             text.contains("version: 6 images; beyond `all`'s: libobjc.A.dylib\n"),
             "{text}"
         );
+        assert!(
+            !text.contains("image and runtime"),
+            "no stops, no rows: {text}"
+        );
+        let mut stopped = arms;
+        stopped.push(arm("main", 44e6, &[], &[]));
+        stopped.push(arm("prelude", 47e6, &[], &[]));
+        let text = report(&stopped);
+        let row = |label: &str| {
+            text.lines()
+                .find(|l| l.trim_start().starts_with(label))
+                .unwrap_or_else(|| panic!("no `{label}` row: {text}"))
+                .split_whitespace()
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(row("image and runtime (main - all)"), ["24%", "12.00"]);
+        assert_eq!(row("front door prelude (prelude - main)"), ["6%", "3.00"]);
+        assert_eq!(row("the verb (it - prelude)"), ["6%", "3.00"]);
     }
 
     #[test]
@@ -1480,13 +2024,14 @@ mod tests {
             wall_ms: vec![0.5, 0.7, 0.6],
             user_ms: vec![0.2, 0.1, 0.3],
             system_ms: vec![0.4, 0.4, 0.4],
+            resident_mb: vec![9.0, 7.0, 8.0],
         };
         let s = takes.summary().expect("a summary");
         assert_eq!(
             (s.n, s.instructions, s.min, s.max, s.cycles),
             (3, 2.0, 1.0, 3.0, 1.0)
         );
-        assert_eq!((s.user_ms, s.system_ms), (0.2, 0.4));
+        assert_eq!((s.user_ms, s.system_ms, s.resident_mb), (0.2, 0.4, 8.0));
         assert_eq!(Takes::default().summary(), None);
     }
 }

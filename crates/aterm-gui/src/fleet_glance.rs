@@ -1097,6 +1097,8 @@ pub(crate) fn escalation(mac: &FleetMac, need: &FleetNeed) -> crate::status_item
         body: crate::needs::fold_clip(&format!("{} \u{b7} {}: {what}", mac.name, need.who), 120),
         headline: crate::status_item::headline(need.word),
         report: None,
+        needs: Vec::new(),
+        owner_turn: 0,
     }
 }
 

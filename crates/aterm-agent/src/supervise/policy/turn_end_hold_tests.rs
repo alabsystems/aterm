@@ -130,6 +130,7 @@ fn held(legs: &[HoldLeg], open: &[&str], nudges: u32, counts: [u16; 5]) -> LandH
         unlanded: counts[4],
         sub_unpushed: 0,
         parked: 0,
+        left: 0,
     }
 }
 
@@ -597,46 +598,10 @@ fn a_land_hold_is_copy_and_small() {
     );
 }
 
+/// Every word of the tables has its index, and no other word does. That every word a strict reading
+/// names is among them is `every_phrase_keeps_its_contract_on_every_corpus_row`'s.
 #[test]
-fn every_word_the_strict_reading_names_has_an_index() {
-    let mut replies: Vec<String> = super::corpora::land_table()
-        .into_iter()
-        .map(|(_, reply)| reply)
-        .collect();
-    replies.extend(needs::needs_table().into_iter().map(|(_, reply)| reply));
-    let excerpts = super::corpora::open_work_reports()
-        .into_iter()
-        .flat_map(|(_, excerpts)| excerpts);
-    replies.extend(excerpts.map(|(_, text)| text));
-    let replies = &replies;
-    let words: Vec<&'static str> = std::thread::scope(|scope| {
-        let readers: Vec<_> = (0..4)
-            .map(|first| {
-                scope.spawn(move || {
-                    let mut words = Vec::new();
-                    for reply in replies.iter().skip(first).step_by(4) {
-                        words.extend(land_open_words(Some(reply)));
-                        words.extend(open_work_strict(Some(reply)));
-                        words.extend(open_work_strict(Some(&needs::defense_body(reply))));
-                    }
-                    words
-                })
-            })
-            .collect();
-        readers
-            .into_iter()
-            .flat_map(|reader| reader.join().expect("a reader of the replies"))
-            .collect()
-    });
-    let named = words.len();
-    let mut missing: Vec<&str> = words
-        .into_iter()
-        .filter(|&w| !OpenWord::of(w).is_some_and(|i| i.word() == w))
-        .collect();
-    assert!(named > 200, "{named} words named");
-    missing.sort_unstable();
-    missing.dedup();
-    assert!(missing.is_empty(), "no index: {missing:?}");
+fn every_word_of_the_tables_has_an_index() {
     for w in open_words() {
         let i = open_word_index(w).expect("indexed");
         assert_eq!(open_word_at(i), Some(w));

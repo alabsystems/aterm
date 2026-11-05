@@ -1049,7 +1049,11 @@ type Shows = fn(&State) -> bool;
 /// [`tier1_the_real_decider_says_due_exactly_where_the_model_types`] (0..4, stuck runs too) and
 /// [`tier1_a_point_blind_to_the_person_disagrees_at_the_point_alone`] (0..3). Of the faults, only
 /// [`Fault::KUnseeded`] leaves variant 0: it keeps variant 1, the one fault whose disagreements
-/// differ there (more of them).
+/// differ there (more of them). THE GAP's other half: each control of the hold rules walks
+/// [`RuleId::WaitNudge`] alone, since the faults' arms read no rule, so no control proves a walk
+/// sees a planted defect under [`RuleId::HoldRoom`], and a judge blind only to `HoldRoom`'s
+/// disagreements passes. The driver's `HoldRoom` arms stay under the clean strict walks, which
+/// prove agreement only.
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
     let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 14] = [
@@ -1138,30 +1142,26 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
     let mut runs = Vec::new();
     let mut checks = Vec::new();
     for (fault, only, shows, among) in controls {
-        // A control of the hold rules' walks the hold rules alone; the wake's names its rule.
-        for rule in RuleId::ALL
-            .into_iter()
-            .filter(|r| only.map_or(*r != RuleId::Wake, |o| o == *r))
-        {
-            let variants = if fault == Fault::KUnseeded {
-                0..2
-            } else {
-                0..1
-            };
-            for variant in variants {
-                runs.push((
-                    1,
-                    Run {
-                        rule,
-                        variant,
-                        fault: Some(fault),
-                        key: 0,
-                        stuck: false,
-                        blind_point: false,
-                    },
-                ));
-                checks.push((fault, shows, among));
-            }
+        // A control of the hold rules' walks `WaitNudge`; the wake's names its rule.
+        let rule = only.unwrap_or(RuleId::WaitNudge);
+        let variants = if fault == Fault::KUnseeded {
+            0..2
+        } else {
+            0..1
+        };
+        for variant in variants {
+            runs.push((
+                1,
+                Run {
+                    rule,
+                    variant,
+                    fault: Some(fault),
+                    key: 0,
+                    stuck: false,
+                    blind_point: false,
+                },
+            ));
+            checks.push((fault, shows, among));
         }
     }
     // The stuck fact's: over the upgrade's notice with the key on, and with the key off judged

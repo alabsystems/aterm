@@ -33,19 +33,22 @@ fn directory_flags() -> OFlags {
 }
 
 fn child_directory(parent: &File, name: impl fd::Arg) -> io::Result<File> {
-    Ok(File::from(fd::openat(
-        parent,
-        name,
-        directory_flags(),
-        Mode::empty(),
-    )?))
+    aterm_uds::kept_out(|| {
+        fd::openat(parent, name, directory_flags(), Mode::empty())
+            .map(File::from)
+            .map_err(io::Error::from)
+    })
 }
 
 fn directory(path: &Path) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(refused("epoch parent must be absolute"));
     }
-    let mut directory = File::from(fd::openat(fd::CWD, "/", directory_flags(), Mode::empty())?);
+    let mut directory = aterm_uds::kept_out(|| {
+        fd::openat(fd::CWD, "/", directory_flags(), Mode::empty())
+            .map(File::from)
+            .map_err(io::Error::from)
+    })?;
     for component in path.components() {
         match component {
             Component::RootDir => {}
@@ -101,6 +104,37 @@ pub(super) struct Endpoint {
 }
 
 impl Endpoint {
+    pub(super) fn capture_logs(&self, id: u32) -> io::Result<super::epoch_recipe::CapturedLogs> {
+        self.validate()?;
+        let captured = self
+            .captured
+            .as_ref()
+            .ok_or_else(|| refused("missing original epoch directory"))?;
+        let open = |side: &str| -> io::Result<File> {
+            let file = aterm_uds::kept_out(|| {
+                fd::openat(
+                    &captured.directory,
+                    format!("root-{id}.{side}"),
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(io::Error::from)
+            })?;
+            let meta = super::epoch_recipe::check_log(&file)?;
+            if meta.len() != 0 {
+                return Err(refused("root log was written before controller Spawn"));
+            }
+            Ok(file)
+        };
+        let logs = super::epoch_recipe::CapturedLogs {
+            stdout: open("stdout")?,
+            stderr: open("stderr")?,
+        };
+        self.validate()?;
+        Ok(logs)
+    }
+
     pub(super) fn prepare(path: &Path) -> io::Result<Self> {
         let text = path
             .to_str()
@@ -173,12 +207,16 @@ impl Endpoint {
             self.validate_parent()?;
             let directory = child_directory(&self.parent, &self.leaf)?;
             owned(&directory, true)?;
-            let fifo = File::from(fd::openat(
-                &directory,
-                FIFO,
-                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?);
+            let fifo = aterm_uds::kept_out(|| {
+                fd::openat(
+                    &directory,
+                    FIFO,
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(io::Error::from)
+            })?;
             owned(&fifo, true)?;
             let metadata = fifo.metadata()?;
             if !metadata.file_type().is_fifo() || metadata.nlink() != 1 {

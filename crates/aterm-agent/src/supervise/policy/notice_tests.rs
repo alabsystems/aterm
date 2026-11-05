@@ -48,11 +48,12 @@ fn longest_reset() -> String {
         .words()
 }
 
-const LIMITS: [NoticeText; 9] = [
+const LIMITS: [NoticeText; 10] = [
     LIMIT_USE,
     LIMIT_DRAFT,
     LIMIT_DRAFT_OWN,
     LIMIT_DRAFT_MENU,
+    LIMIT_DRAFT_COMMAND,
     LIMIT_UNMADE,
     LIMIT_STAY,
     LIMIT_STAY_HELD,
@@ -540,7 +541,8 @@ fn a_notice_closes_in_words_true_of_how_it_ended() {
 }
 
 /// Whether a step asks a person to sign a roster row in by hand: `accounts renew` or
-/// `accounts login`, which aterm's sign-in ladder runs by itself for every row with an email.
+/// `accounts login`. A notice is an automatic report and never asks; the reports a person runs
+/// name these steps.
 fn asks_a_sign_in(step: &str) -> bool {
     step.contains("accounts renew") || step.contains("accounts login")
 }

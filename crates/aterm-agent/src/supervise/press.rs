@@ -500,11 +500,7 @@ impl<C: Ctl> Session<'_, C> {
                          written twice",
                     );
                 }
-                Back::Empty => {
-                    return unconfirmed(
-                        "the dialog did not take the policy text: a text is never written twice",
-                    );
-                }
+                Back::Empty => return unconfirmed(approval_loop::NOT_TAKEN),
                 Back::Gone | Back::Other(_) => {
                     let why = match reading {
                         Back::Other(why) => why,
@@ -624,7 +620,9 @@ impl<C: Ctl> Session<'_, C> {
             }));
         };
         debug_assert!(
-            QuestionPriority::ALL.iter().any(|p| p.text() == Some(text)),
+            QuestionPriority::EVERY
+                .iter()
+                .any(|p| p.text() == Some(text)),
             "only a policy's own fixed text is ever written into a question"
         );
         let person = format!("if-human={count}");

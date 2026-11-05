@@ -192,6 +192,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         beacon: Instant::now(),
         dial: Instant::now(),
         rotate: Instant::now() + Duration::from_secs(300),
+        versions_at: Instant::now(),
         scope: Scope::Loopback,
         port: 0,
         contacts: Vec::new(),
@@ -202,6 +203,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         stand_in: None,
         permission: None,
         observed: std::collections::BTreeMap::new(),
+        finished_rounds: 0,
     };
     let control = transport.workers[0].channel.clone();
     // Whether stop wins before install or during TLS, it cannot be undone.
@@ -766,6 +768,7 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         beacon: now,
         dial: now,
         rotate: now + Duration::from_secs(300),
+        versions_at: now,
         scope: Scope::Loopback,
         port,
         contacts: Vec::new(),
@@ -776,6 +779,7 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         stand_in: None,
         permission: None,
         observed: std::collections::BTreeMap::new(),
+        finished_rounds: 0,
     }
 }
 

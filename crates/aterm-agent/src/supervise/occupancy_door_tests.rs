@@ -640,6 +640,7 @@ fn each_guard_in_hand_holds_the_due_line_once() {
                     unix_ms: s.unix_ms_of(at),
                     why: "the Mac woke".to_string(),
                     wait: WaitKind::Other,
+                    put_off: None,
                 };
                 (due, false)
             });

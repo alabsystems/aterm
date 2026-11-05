@@ -269,8 +269,10 @@ fn restore_file(shim: &Path, bytes: &[u8], mode: &fs::Permissions) -> std::io::R
     let tmp = rollback_tmp(shim)?;
     let _ = fs::remove_file(&tmp);
     let restored = crate::platform::create_private_new(&tmp)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))
-        .and_then(|()| fs::set_permissions(&tmp, mode.clone()))
+        .and_then(|mut f| {
+            std::io::Write::write_all(&mut f, bytes)?;
+            f.set_permissions(mode.clone())
+        })
         .and_then(|()| fs::rename(&tmp, shim));
     if restored.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -847,9 +849,10 @@ fn write_marker(dest: &Path, marker: &LinkMarker) -> std::io::Result<()> {
         next_temp_seq()
     ));
     let _ = fs::remove_file(&tmp);
-    let staged = crate::platform::create_private_new(&tmp)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
-        .and_then(|()| crate::platform::harden_file(&tmp));
+    let staged = crate::platform::create_private_new(&tmp).and_then(|mut f| {
+        std::io::Write::write_all(&mut f, text.as_bytes())?;
+        crate::platform::set_mode_on(&f, 0o600)
+    });
     if let Err(e) = staged {
         let _ = fs::remove_file(&tmp);
         return Err(e);

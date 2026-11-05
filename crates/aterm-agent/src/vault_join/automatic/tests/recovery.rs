@@ -185,6 +185,7 @@ fn an_existing_seat_recovers_by_proof_on_a_headless_members_port_off_home() {
         name: "recovering",
         fleet: false,
         lan: false,
+        lab: false,
         fresh: &fresh,
     };
     assert!(

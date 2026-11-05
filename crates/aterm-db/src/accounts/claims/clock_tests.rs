@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::{
+    accounts::claims::tests::repair_day,
     clock::{self, Clocks, Reading, Source, Standing},
     table::tests::{Lab, clock_round, repair_commons_at},
 };
@@ -74,11 +75,11 @@ fn hear(lab: &Lab, peers: &[usize], mine: u64, clocks: &[u64]) {
     );
 }
 
-/// Three writers write on day D and hear each other. Mac 0's clock then runs two days ahead, and
-/// it reads Macs 1 and 2 in a marked round each: they read it ahead, so it writes no row (the
-/// refusal says how far and against how many), its read says why it may not write, and it hands
-/// no row on. Once its clock is right again and a round reads it agreeing, it writes on and its
-/// peers read the row.
+/// Three writers write on day D and Mac 0 repairs with each. Mac 0's clock then runs two days
+/// ahead, and it reads Macs 1 and 2 in a marked round each: they read it ahead, so it writes no row
+/// (the refusal says how far and against how many), its read says why it may not write, and it
+/// hands no row on. Once its clock is right again and a round reads it agreeing, it writes on and
+/// its peers read the row.
 ///
 /// Negative control (today's code: no judgement, `clock_of` judging Unknown whatever the file),
 /// Mac 0 wrote its row into day D+2's table, which its peers never read (`called
@@ -92,7 +93,7 @@ fn a_clock_two_days_ahead_writes_no_claim() {
     for paths in &lab.paths {
         write_at(paths, &row(1, now), now, caps).unwrap();
     }
-    repair_commons_at(&lab, 6, &[now; 3]);
+    repair_day(&lab, 1, D, &[now; 3]);
     let a = machine(&lab, 0);
 
     let ahead = at(D + 2, 60);
@@ -145,7 +146,7 @@ fn a_clock_two_days_ahead_writes_no_claim() {
     );
     let next = counter(&read, &a).map_or(1, |c| c + 1);
     write_at(&lab.paths[0], &row(next, floor), floor, caps).unwrap();
-    repair_commons_at(&lab, 6, &[floor; 3]);
+    repair_day(&lab, 2, D + 2, &[floor; 3]);
     for (n, paths) in lab.paths[..3].iter().enumerate().skip(1) {
         assert_eq!(
             counter(&read_at(paths, floor, caps).unwrap(), &a),
@@ -169,7 +170,7 @@ fn a_tie_refuses_leases_and_keeps_home_claims() {
     for paths in &lab.paths {
         write_at(paths, &row(1, now), now, caps).unwrap();
     }
-    repair_commons_at(&lab, 6, &[now; 3]);
+    repair_day(&lab, 1, D, &[now; 3]);
     let ahead = at(D + 2, 60);
     hear(&lab, &[1, 2], ahead, &[now, ahead]);
     let read = read_at(&lab.paths[0], ahead, caps).unwrap();

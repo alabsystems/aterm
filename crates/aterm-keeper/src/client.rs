@@ -3,7 +3,7 @@
 
 //! The window's side of AKP1: [`KeeperClient`] and [`KeeperLink`].
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use crate::frameio::{Incoming, read_frame, write_frame};
 use crate::identity::{CheckError, Identity, IdentityPolicy};
 use crate::wire::{
     CAP_JOURNAL, CAP_LINK, CAP_SENDS_BYE, CAP_SYNC, COMPANION_JOURNAL, Frame, JournalOffer,
-    MarkerRef, MasterHeader, PROTO, PeerClass,
+    MarkerRef, MasterHeader, PROTO, PeerClass, RefuseCode,
 };
 
 /// One OFFER as the window receives it.
@@ -96,6 +96,9 @@ pub struct KeeperClient {
     /// The highest SYNC number the keeper wrote back ([`Self::drain`] reads it): every frame
     /// written before that SYNC was read.
     synced: Cell<u64>,
+    /// The RELEASEs [`Self::retire`] wrote on this connection whose retirement awaits the
+    /// keeper's answer: a [`KeeperLink`] started on this connection owes each one.
+    retiring: RefCell<Vec<(u64, Owe)>>,
 }
 
 impl KeeperClient {
@@ -114,6 +117,7 @@ impl KeeperClient {
             keeper_caps: Cell::new(0),
             syncs: Cell::new(0),
             synced: Cell::new(0),
+            retiring: RefCell::new(Vec::new()),
         })
     }
 
@@ -371,10 +375,12 @@ impl KeeperClient {
     /// Read every frame already waiting, keeping only a SYNC answer; returns `false` once the keeper is gone.
     #[must_use]
     pub fn drain(&self) -> bool {
-        self.drain_with_refusals(|_, _| {})
+        self.drain_with_refusals(|_, _, _| {})
     }
 
-    fn drain_with_refusals(&self, mut refused: impl FnMut(u64, u64)) -> bool {
+    /// [`Self::drain`], telling `refused` each REFUSED it reads: its rdev, its code, and the
+    /// highest SYNC answered before it.
+    fn drain_with_refusals(&self, mut refused: impl FnMut(u64, RefuseCode, u64)) -> bool {
         use std::os::fd::AsRawFd as _;
         loop {
             let mut fds = [crate::sys::PollFd {
@@ -396,9 +402,9 @@ impl KeeperClient {
                     .synced
                     .set(self.synced.get().max(seq.min(self.syncs.get()))),
                 Ok(Some(Incoming {
-                    frame: Frame::Refused { rdev, .. },
+                    frame: Frame::Refused { rdev, code },
                     ..
-                })) => refused(rdev, self.synced.get()),
+                })) => refused(rdev, code, self.synced.get()),
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => return false,
             }
@@ -438,25 +444,95 @@ impl KeeperClient {
             None,
         )
     }
+
+    /// RELEASE `rdev`, a master this connection was offered and the window will not keep, with
+    /// a SYNC right behind it, and report the retirement of the journal the offer carried to
+    /// `observer` once it is confirmed: the keeper answers that SYNC with no refusal of the
+    /// RELEASE before it, or refuses it as naming no record (`NoSuchRecord`: the journal went
+    /// with its record). A [`KeeperLink`] started on this connection owes the retirement
+    /// until then, and tells it again to the next connection if this one ends first. To a keeper
+    /// whose WELCOME stated no [`CAP_SYNC`] the write alone confirms it ([`Owe::written_unsynced`]).
+    /// # Errors
+    /// The RELEASE's write failing; the retirement is still owed to the next connection.
+    pub fn retire(&self, rdev: u64, observer: std::sync::Arc<ReadObserver>) -> io::Result<()> {
+        let written = self.send(&Frame::Release { rdev }, None);
+        let mut owe = Owe::retiring(observer);
+        if written.is_ok() {
+            if !self.keeper_syncs() {
+                owe.written_unsynced(std::time::Instant::now());
+                return Ok(());
+            }
+            owe.sync = self.sync().ok().map(|n| (n, std::time::Instant::now()));
+        }
+        self.retiring.borrow_mut().push((rdev, owe));
+        written
+    }
 }
 
 fn protocol(why: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, why)
 }
 
-/// A replacement region reached the keeper only after a SYNC behind its COMPANION was answered.
+/// The first read the keeper confirmed of a frame reporting to a [`ReadObserver`], on this
+/// process's monotonic clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfirmedRead {
+    /// When the keeper was asked: the SYNC written behind the frame that settled the journal (a
+    /// region's COMPANION, a COMPANION_RELEASE, or the master's RELEASE). A confirmation that
+    /// waited on no SYNC (a RELEASE written to a keeper without [`CAP_SYNC`], or one a REGISTER at
+    /// its rdev confirmed before a SYNC behind it was written) was asked and answered at once,
+    /// so this is [`Self::answer_read`].
+    pub sync_sent: std::time::Instant,
+    /// When the link confirmed it: its worker read the keeper's answer to that SYNC, or the
+    /// REFUSED (`NoSuchRecord`) that confirmed a retirement, or took the REGISTER at its rdev,
+    /// or, to a keeper without [`CAP_SYNC`], wrote the RELEASE.
+    pub answer_read: std::time::Instant,
+}
+
+/// A process-local admission's view of one old journal authority: whether the keeper confirmed
+/// that it can no longer offer that journal, by reading a frame that reports here: a new region
+/// or a COMPANION_RELEASE for the master that carried it
+/// ([`CompanionReceipt::reporting_confirmation`]), or the master's RELEASE
+/// ([`KeeperClient::retire`], [`LinkOp::Retire`], or a [`LinkOp::Release`] of a master whose
+/// last such frame the keeper had not yet confirmed); and when the first such read was asked
+/// for and answered ([`ConfirmedRead`]). A frame that reports here and is superseded before its
+/// confirmation (the master's next COMPANION or COMPANION_RELEASE, or its RELEASE) hands this
+/// on to the frame that superseded it, whose read settles the old journal as well.
+#[derive(Debug, Default)]
+pub struct ReadObserver {
+    read: std::sync::OnceLock<ConfirmedRead>,
+}
+
+impl ReadObserver {
+    /// Whether a frame reporting here was confirmed read.
+    #[must_use]
+    pub fn confirmed(&self) -> bool {
+        self.read.get().is_some()
+    }
+
+    /// The first confirmed read, `None` before it.
+    #[must_use]
+    pub fn confirmation(&self) -> Option<ConfirmedRead> {
+        self.read.get().copied()
+    }
+
+    fn note(&self, read: ConfirmedRead) {
+        let _ = self.read.set(read);
+    }
+}
+
+/// A region (or, for a COMPANION_RELEASE, its absence) reached the keeper only after a SYNC behind
+/// its COMPANION or COMPANION_RELEASE was answered.
 #[derive(Debug, Default)]
 pub struct CompanionReceipt {
     confirmed: std::sync::atomic::AtomicBool,
-    observer: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    observer: Option<std::sync::Arc<ReadObserver>>,
 }
 
 impl CompanionReceipt {
     /// Also publish this exact accepted read to a process-local admission observer.
     #[must_use]
-    pub const fn reporting_confirmation(
-        observer: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
+    pub const fn reporting_confirmation(observer: std::sync::Arc<ReadObserver>) -> Self {
         Self {
             confirmed: std::sync::atomic::AtomicBool::new(false),
             observer: Some(observer),
@@ -469,18 +545,21 @@ impl CompanionReceipt {
         self.confirmed.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn confirm(&self) {
+    fn confirm(&self, sync_sent: std::time::Instant) {
         self.confirmed
             .store(true, std::sync::atomic::Ordering::Release);
         if let Some(observer) = &self.observer {
-            observer.store(true, std::sync::atomic::Ordering::Release);
+            observer.note(ConfirmedRead {
+                sync_sent,
+                answer_read: std::time::Instant::now(),
+            });
         }
     }
 
     /// A captured keeper read, for in-memory queue fixtures only.
     #[cfg(any(test, debug_assertions))]
     pub fn confirm_captured(&self) {
-        self.confirm();
+        self.confirm(std::time::Instant::now());
     }
 }
 
@@ -488,13 +567,54 @@ impl CompanionReceipt {
 struct CompanionFence {
     after: u64,
     until: u64,
+    /// When the SYNC numbered `until` was written.
+    sent: std::time::Instant,
     refused: bool,
 }
 
 #[derive(Debug)]
 struct CompanionRead {
     receipt: std::sync::Arc<CompanionReceipt>,
+    /// The observers of the master's earlier frames this one superseded before the keeper
+    /// confirmed them ([`superseding`]): this frame's confirmation is theirs too.
+    carried: Vec<std::sync::Arc<ReadObserver>>,
     fence: Option<CompanionFence>,
+}
+
+impl CompanionRead {
+    /// The read of a frame the window just queued for a held master, with its own `receipt`, if
+    /// any. It takes on the observers of `was`, the read the master's last frame waited on, when
+    /// the keeper had not yet confirmed that one: the keeper reads frames in order, and its read
+    /// of this one settles the master's region (a new one, or none), so it can no longer offer
+    /// the old journal those observers wait on either.
+    fn superseding(
+        receipt: Option<std::sync::Arc<CompanionReceipt>>,
+        was: Option<Self>,
+    ) -> Option<Self> {
+        let mut carried = was.map(Self::observers).unwrap_or_default();
+        if let Some(own) = receipt.as_ref().and_then(|r| r.observer.as_ref()) {
+            carried.retain(|o| !std::sync::Arc::ptr_eq(o, own));
+        }
+        if receipt.is_none() && carried.is_empty() {
+            return None;
+        }
+        Some(Self {
+            receipt: receipt.unwrap_or_default(),
+            carried,
+            fence: None,
+        })
+    }
+
+    /// Every observer its confirmation reports to.
+    fn observers(self) -> Vec<std::sync::Arc<ReadObserver>> {
+        let mut all = self.carried;
+        if let Some(own) = &self.receipt.observer
+            && !all.iter().any(|o| std::sync::Arc::ptr_eq(o, own))
+        {
+            all.push(std::sync::Arc::clone(own));
+        }
+        all
+    }
 }
 
 const fn note_companion_refusal(read: &mut Option<CompanionRead>, synced: u64) {
@@ -509,12 +629,20 @@ const fn note_companion_refusal(read: &mut Option<CompanionRead>, synced: u64) {
 }
 
 fn confirm_companion(read: &mut Option<CompanionRead>, synced: u64) {
-    if read
+    if let Some(fence) = read
         .as_ref()
-        .is_some_and(|r| r.fence.is_some_and(|f| !f.refused && f.until <= synced))
+        .and_then(|r| r.fence)
+        .filter(|f| !f.refused && f.until <= synced)
         && let Some(read) = read.take()
     {
-        read.receipt.confirm();
+        read.receipt.confirm(fence.sent);
+        let answer_read = std::time::Instant::now();
+        for observer in &read.carried {
+            observer.note(ConfirmedRead {
+                sync_sent: fence.sent,
+                answer_read,
+            });
+        }
     }
 }
 
@@ -529,8 +657,18 @@ pub enum LinkOp {
     },
     /// The newest META of a master.
     Meta { rdev: u64, meta: Vec<u8> },
-    /// A tab or pane closed.
+    /// A tab or pane closed. When the master's last COMPANION or COMPANION_RELEASE reports to a
+    /// [`ReadObserver`] and the keeper had not confirmed it, the RELEASE is a retirement of the
+    /// old journal that observer waits on, as [`Self::Retire`] is: its read closes the record,
+    /// and the journal with it.
     Release { rdev: u64 },
+    /// RELEASE a master the window was offered and will not keep (an adoption it never placed),
+    /// owed until the keeper confirms it, and then report the retirement of the journal its
+    /// offer carried to `observer`: as [`KeeperClient::retire`], whose rules this follows.
+    Retire {
+        rdev: u64,
+        observer: std::sync::Arc<ReadObserver>,
+    },
     /// An update's successor, before its grant.
     Pending { pid: u32 },
     /// The quit, written on the final-exit path just before `exit(0)`.
@@ -544,7 +682,12 @@ pub enum LinkOp {
         receipt: Option<std::sync::Arc<CompanionReceipt>>,
     },
     /// Release any journal region held for `rdev`.
-    CompanionRelease { rdev: u64 },
+    CompanionRelease {
+        rdev: u64,
+        /// Optional read confirmation: the keeper read that the claim has no region, so it
+        /// dropped the one an offer of the master carried (an adopted session with no journal).
+        receipt: Option<std::sync::Arc<CompanionReceipt>>,
+    },
 }
 
 /// Queue bound for ordinary ops.
@@ -1093,16 +1236,81 @@ enum HeldJournal {
         read: Option<CompanionRead>,
     },
     /// It has no region.
-    Released,
+    Released { read: Option<CompanionRead> },
+}
+
+impl HeldJournal {
+    /// The read its last frame waits on, taken: the keeper has not yet confirmed it.
+    fn take_read(&mut self) -> Option<CompanionRead> {
+        match self {
+            Self::Region { read, .. } | Self::Released { read } => read.take(),
+            Self::Unsaid => None,
+        }
+    }
 }
 
 type Held = std::collections::BTreeMap<u64, HeldMaster>;
 
-type Owed = std::collections::BTreeMap<u64, Option<u64>>;
+/// A RELEASE the link owes the keeper (link-worker-delivery (b)).
+#[derive(Debug)]
+struct Owe {
+    /// The SYNC written right behind it on the current connection, and when it was written;
+    /// `None` until one is.
+    sync: Option<(u64, std::time::Instant)>,
+    /// The admission observers its retirement reports to once the keeper confirms it
+    /// ([`LinkOp::Retire`], [`KeeperClient::retire`], and a tab's RELEASE whose master's last
+    /// journal frame was still unconfirmed, [`Self::releasing`]); none for any other RELEASE.
+    retires: Vec<std::sync::Arc<ReadObserver>>,
+}
+
+impl Owe {
+    fn retiring(observer: std::sync::Arc<ReadObserver>) -> Self {
+        Self {
+            sync: None,
+            retires: vec![observer],
+        }
+    }
+
+    /// The RELEASE of `held`, a master the link registered, as a tab's close owes it: a
+    /// retirement of whatever old journal the read its last frame waits on reports to, since the
+    /// keeper's read of the RELEASE closes the record and that journal with it.
+    fn releasing(held: HeldMaster) -> Self {
+        let mut journal = held.journal;
+        Self {
+            sync: None,
+            retires: journal
+                .take_read()
+                .map(CompanionRead::observers)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The keeper confirmed the RELEASE `now`: report the retirement to its observers.
+    fn confirm(&self, now: std::time::Instant) {
+        for observer in &self.retires {
+            observer.note(ConfirmedRead {
+                sync_sent: self.sync.map_or(now, |(_, sent)| sent),
+                answer_read: now,
+            });
+        }
+    }
+
+    /// The RELEASE was written `now` to a keeper whose WELCOME stated no [`CAP_SYNC`]: to it a
+    /// written RELEASE is done (link-worker-delivery (b)), so the write confirms the retirement.
+    /// This is the one rule under which a write alone confirms anything; a COMPANION or
+    /// COMPANION_RELEASE written to such a keeper leaves its receipt pending ([`send_fenced`]).
+    fn written_unsynced(&self, now: std::time::Instant) {
+        self.confirm(now);
+    }
+}
+
+/// The RELEASEs owed, by rdev.
+type Owed = std::collections::BTreeMap<u64, Owe>;
 
 enum Send {
     Register(u64),
     Companion(u64),
+    CompanionRelease(u64),
     Frame(Frame),
 }
 
@@ -1123,6 +1331,10 @@ fn link_worker(
     let mut held: Held = std::collections::BTreeMap::new();
     let mut metas: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();
     let mut owed: Owed = Owed::new();
+    // The boot connection's retirements ([`KeeperClient::retire`]) are this link's to see through.
+    for (rdev, owe) in booted.iter().flat_map(|c| c.retiring.take()) {
+        keep(&mut owed, rdev, owe);
+    }
     let mut client: Option<KeeperClient> = booted;
     let mut backoff = Duration::from_millis(50);
     let mut next_try = std::time::Instant::now();
@@ -1146,20 +1358,22 @@ fn link_worker(
             Woke::Closed => return,
         };
         if let Some(c) = &client {
-            let open = c.drain_with_refusals(|rdev, synced_before| {
+            let open = c.drain_with_refusals(|rdev, code, synced_before| {
                 if let Some(HeldMaster {
-                    journal: HeldJournal::Region { read, .. },
+                    journal: HeldJournal::Region { read, .. } | HeldJournal::Released { read },
                     ..
                 }) = held.get_mut(&rdev)
                 {
                     note_companion_refusal(read, synced_before);
                 }
+                refuse_retirement(&mut owed, rdev, code, synced_before);
             });
-            let synced = c.synced();
-            owed.retain(|_, sync| sync.is_none_or(|n| n > synced));
+            settle_owed(&mut owed, c.synced());
             for h in held.values_mut() {
-                if let HeldJournal::Region { read, .. } = &mut h.journal {
-                    confirm_companion(read, synced);
+                if let HeldJournal::Region { read, .. } | HeldJournal::Released { read } =
+                    &mut h.journal
+                {
+                    confirm_companion(read, c.synced());
                 }
             }
             if !open {
@@ -1169,14 +1383,20 @@ fn link_worker(
             }
         }
         let bye = matches!(op, Some(LinkOp::Bye));
-        let mut must_reach = None;
+        let mut must_reach: Option<(u64, Owe)> = None;
         let send = op.and_then(|op| match op {
             LinkOp::Register {
                 master,
                 header,
                 tag,
             } => {
-                owed.remove(&header.rdev);
+                if let Some(owe) = owed.remove(&header.rdev) {
+                    // A new master at the rdev of an owed RELEASE: the kernel gives a pty's
+                    // device to another only once every descriptor of the old master is closed,
+                    // the keeper's custody copy among them, so the old record, and any journal
+                    // it carried, is gone: what a retirement waited to hear.
+                    owe.confirm(std::time::Instant::now());
+                }
                 held.insert(
                     header.rdev,
                     HeldMaster {
@@ -1190,11 +1410,21 @@ fn link_worker(
             }
             LinkOp::Release { rdev } => {
                 metas.remove(&rdev);
-                let registered = held.remove(&rdev).is_some();
-                if registered {
-                    must_reach = Some(rdev);
+                let registered = held.remove(&rdev);
+                let send = registered.is_some() || client.is_some();
+                if let Some(h) = registered {
+                    must_reach = Some((rdev, Owe::releasing(h)));
                 }
-                (registered || client.is_some()).then_some(Send::Frame(Frame::Release { rdev }))
+                send.then_some(Send::Frame(Frame::Release { rdev }))
+            }
+            LinkOp::Retire { rdev, observer } => {
+                metas.remove(&rdev);
+                let mut owe = Owe::retiring(observer);
+                if let Some(h) = held.remove(&rdev) {
+                    owe.retires.extend(Owe::releasing(h).retires);
+                }
+                must_reach = Some((rdev, owe));
+                Some(Send::Frame(Frame::Release { rdev }))
             }
             LinkOp::Meta { rdev, meta } => {
                 if !held.contains_key(&rdev) {
@@ -1212,23 +1442,15 @@ fn link_worker(
                 receipt,
             } => {
                 let entry = held.get_mut(&rdev)?;
-                entry.journal = HeldJournal::Region {
-                    region,
-                    len,
-                    read: receipt.map(|receipt| CompanionRead {
-                        receipt,
-                        fence: None,
-                    }),
-                };
+                let read = CompanionRead::superseding(receipt, entry.journal.take_read());
+                entry.journal = HeldJournal::Region { region, len, read };
                 peer.journal.then_some(Send::Companion(rdev))
             }
-            LinkOp::CompanionRelease { rdev } => {
+            LinkOp::CompanionRelease { rdev, receipt } => {
                 let entry = held.get_mut(&rdev)?;
-                entry.journal = HeldJournal::Released;
-                peer.journal.then_some(Send::Frame(Frame::CompanionRelease {
-                    rdev,
-                    kind: COMPANION_JOURNAL,
-                }))
+                let read = CompanionRead::superseding(receipt, entry.journal.take_read());
+                entry.journal = HeldJournal::Released { read };
+                peer.journal.then_some(Send::CompanionRelease(rdev))
             }
         });
         if send.is_none() && held.is_empty() && owed.is_empty() {
@@ -1255,17 +1477,13 @@ fn link_worker(
             continue;
         };
         let mut sent = match &send {
-            Send::Register(_) | Send::Companion(_) if fresh => Ok(()),
-            Send::Frame(Frame::Meta { .. } | Frame::CompanionRelease { .. }) if fresh => Ok(()),
+            Send::Register(_) | Send::Companion(_) | Send::CompanionRelease(_) if fresh => Ok(()),
+            Send::Frame(Frame::Meta { .. }) if fresh => Ok(()),
             Send::Register(rdev) => match held.get(rdev) {
                 Some(h) => c.register(&h.master, h.header, h.tag.clone()),
                 None => Ok(()),
             },
-            Send::Companion(_) | Send::Frame(Frame::CompanionRelease { .. })
-                if !c.keeper_journals() =>
-            {
-                Ok(())
-            }
+            Send::Companion(_) | Send::CompanionRelease(_) if !c.keeper_journals() => Ok(()),
             Send::Companion(rdev) => match held.get_mut(rdev) {
                 Some(HeldMaster {
                     journal: HeldJournal::Region { region, len, read },
@@ -1273,15 +1491,35 @@ fn link_worker(
                 }) => send_companion(c, *rdev, region, *len, read),
                 _ => Ok(()),
             },
+            Send::CompanionRelease(rdev) => match held.get_mut(rdev) {
+                Some(HeldMaster {
+                    journal: HeldJournal::Released { read },
+                    ..
+                }) => send_companion_release(c, *rdev, read),
+                _ => Ok(()),
+            },
             Send::Frame(frame) => c.send(frame, None),
         };
         if sent.is_ok()
-            && let Some(rdev) = must_reach
-            && c.keeper_syncs()
+            && let Some((rdev, owe)) = must_reach.take()
         {
-            match c.sync() {
-                Ok(n) => keep(&mut owed, rdev, Some(n)),
-                Err(e) => sent = Err(e),
+            if c.keeper_syncs() {
+                match c.sync() {
+                    Ok(n) => keep(
+                        &mut owed,
+                        rdev,
+                        Owe {
+                            sync: Some((n, std::time::Instant::now())),
+                            ..owe
+                        },
+                    ),
+                    Err(e) => {
+                        sent = Err(e);
+                        must_reach = Some((rdev, owe));
+                    }
+                }
+            } else {
+                owe.written_unsynced(std::time::Instant::now());
             }
         }
         if let Some(ack) = ack {
@@ -1299,21 +1537,70 @@ fn link_worker(
     }
 }
 
-fn owe(owed: &mut Owed, rdev: Option<u64>) {
-    if let Some(rdev) = rdev {
-        keep(owed, rdev, None);
+/// Owe `must_reach`'s RELEASE to the next connection.
+fn owe(owed: &mut Owed, must_reach: Option<(u64, Owe)>) {
+    if let Some((rdev, owe)) = must_reach {
+        keep(owed, rdev, Owe { sync: None, ..owe });
     }
 }
 
-fn keep(owed: &mut Owed, rdev: u64, sync: Option<u64>) {
-    if owed.len() < LINK_QUEUE || owed.contains_key(&rdev) {
-        owed.insert(rdev, sync);
+/// Owe `owe`'s RELEASE of `rdev`, merged with one already owed there. Past [`LINK_QUEUE`] owed
+/// a tab's RELEASE is lost; a retirement never is (the boot cohort it belongs to is fixed).
+fn keep(owed: &mut Owed, rdev: u64, owe: Owe) {
+    let room = owed.len() < LINK_QUEUE || !owe.retires.is_empty();
+    match owed.entry(rdev) {
+        std::collections::btree_map::Entry::Occupied(mut slot) => {
+            let was = slot.get_mut();
+            was.sync = owe.sync;
+            was.retires.extend(owe.retires);
+        }
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            if room {
+                slot.insert(owe);
+            }
+        }
+    }
+}
+
+/// Every owed RELEASE whose SYNC the keeper answered (`synced`) is done, and a retirement among
+/// them confirmed.
+fn settle_owed(owed: &mut Owed, synced: u64) {
+    let now = std::time::Instant::now();
+    owed.retain(|_, owe| match owe.sync {
+        Some((n, _)) if n <= synced => {
+            owe.confirm(now);
+            false
+        }
+        _ => true,
+    });
+}
+
+/// A REFUSED of `rdev` read with `synced_before` the highest SYNC answered: when it came before
+/// the answer to the SYNC behind an owed retirement's RELEASE, it is that RELEASE's (or an
+/// earlier frame's of that rdev, which is taken as its: no retirement is confirmed on a doubt).
+/// One naming no record confirms the retirement, and the RELEASE is owed no more, since the
+/// record went and the journal with it. Any other leaves the journal offerable, so the
+/// retirement's observers are dropped unconfirmed, and the RELEASE stays owed as a plain one,
+/// until its own SYNC is answered (the refusal may be an earlier frame's, the RELEASE still
+/// unread). A REFUSED that is no owed retirement's leaves `owed` as it was.
+fn refuse_retirement(owed: &mut Owed, rdev: u64, code: RefuseCode, synced_before: u64) {
+    let Some(owe) = owed
+        .get_mut(&rdev)
+        .filter(|owe| !owe.retires.is_empty() && owe.sync.is_some_and(|(n, _)| synced_before < n))
+    else {
+        return;
+    };
+    if code == RefuseCode::NoSuchRecord {
+        owe.confirm(std::time::Instant::now());
+        owed.remove(&rdev);
+    } else {
+        owe.retires.clear();
     }
 }
 
 fn unconfirm(owed: &mut Owed) {
-    for sync in owed.values_mut() {
-        *sync = None;
+    for owe in owed.values_mut() {
+        owe.sync = None;
     }
 }
 
@@ -1325,10 +1612,36 @@ const fn unconfirm_companion(read: &mut Option<CompanionRead>) {
 
 fn unconfirm_companions(held: &mut Held) {
     for h in held.values_mut() {
-        if let HeldJournal::Region { read, .. } = &mut h.journal {
+        if let HeldJournal::Region { read, .. } | HeldJournal::Released { read } = &mut h.journal {
             unconfirm_companion(read);
         }
     }
+}
+
+/// Write `frame` (a COMPANION or COMPANION_RELEASE), fenced by a SYNC on each side when `read`
+/// waits on the keeper's read of it and the keeper answers SYNC.
+fn send_fenced(
+    c: &KeeperClient,
+    read: &mut Option<CompanionRead>,
+    frame: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    // An older keeper gives no read evidence. Leave the receipt pending rather than
+    // treating a write, or absence of the capability, as permission to drop its region.
+    if let Some(read) = read.as_mut()
+        && c.keeper_syncs()
+    {
+        let after = c.sync()?;
+        frame()?;
+        let until = c.sync()?;
+        read.fence = Some(CompanionFence {
+            after,
+            until,
+            sent: std::time::Instant::now(),
+            refused: false,
+        });
+        return Ok(());
+    }
+    frame()
 }
 
 fn send_companion(
@@ -1341,22 +1654,18 @@ fn send_companion(
     if !c.keeper_journals() {
         return Ok(());
     }
-    // An older keeper gives no read evidence. Leave the receipt pending rather than
-    // treating a write, or absence of the capability, as permission to drop its region.
-    if let Some(read) = read.as_mut()
-        && c.keeper_syncs()
-    {
-        let after = c.sync()?;
-        c.companion(rdev, region, len)?;
-        let until = c.sync()?;
-        read.fence = Some(CompanionFence {
-            after,
-            until,
-            refused: false,
-        });
+    send_fenced(c, read, || c.companion(rdev, region, len))
+}
+
+fn send_companion_release(
+    c: &KeeperClient,
+    rdev: u64,
+    read: &mut Option<CompanionRead>,
+) -> io::Result<()> {
+    if !c.keeper_journals() {
         return Ok(());
     }
-    c.companion(rdev, region, len)
+    send_fenced(c, read, || c.companion_release(rdev))
 }
 
 fn reconnect(
@@ -1390,7 +1699,9 @@ fn reconnect_inner(
                 HeldJournal::Region { region, len, read } => {
                     send_companion(&c, *rdev, region, *len, read).ok()?;
                 }
-                HeldJournal::Released => c.companion_release(*rdev).ok()?,
+                HeldJournal::Released { read } => {
+                    send_companion_release(&c, *rdev, read).ok()?;
+                }
                 HeldJournal::Unsaid => {}
             }
         }
@@ -1408,12 +1719,16 @@ fn reconnect_inner(
     for rdev in owed.keys() {
         c.send(&Frame::Release { rdev: *rdev }, None).ok()?;
     }
+    let now = std::time::Instant::now();
     if owed.is_empty() || !c.keeper_syncs() {
+        for owe in owed.values() {
+            owe.written_unsynced(now);
+        }
         owed.clear();
     } else {
         let n = c.sync().ok()?;
-        for sync in owed.values_mut() {
-            *sync = Some(n);
+        for owe in owed.values_mut() {
+            owe.sync = Some((n, now));
         }
     }
     Some(c)
@@ -1680,7 +1995,10 @@ mod tests {
             Some((None, Some(false))),
             "a region not yet said is not told as none"
         );
-        assert!(link.enqueue(LinkOp::CompanionRelease { rdev: journaled }));
+        assert!(link.enqueue(LinkOp::CompanionRelease {
+            rdev: journaled,
+            receipt: None
+        }));
         let released = |s: &Server| {
             s.holds(journaled)
                 && view(s, journaled)
@@ -2157,12 +2475,457 @@ mod tests {
         assert!(link.enqueue(op));
         let within = Duration::from_secs(60);
         assert!(link.send_and_wait(LinkOp::Release { rdev }, within));
+        let retired = std::sync::Arc::new(ReadObserver::default());
+        assert!(link.send_and_wait(
+            LinkOp::Retire {
+                rdev: rdev + 1,
+                observer: std::sync::Arc::clone(&retired),
+            },
+            within
+        ));
+        assert!(
+            retired.confirmed(),
+            "to a keeper without CAP_SYNC a written RELEASE is done"
+        );
         assert!(link.send_and_wait(LinkOp::Pending { pid: 1 }, within));
         let kinds = older.join().expect("the older keeper");
         assert_eq!(
             kinds,
-            [Kind::Hello, Kind::Register, Kind::Release, Kind::Pending]
+            [
+                Kind::Hello,
+                Kind::Register,
+                Kind::Release,
+                Kind::Release,
+                Kind::Pending
+            ]
         );
+        link.shutdown();
+    }
+
+    /// A link already speaking to `server`'s keeper (its REGISTER of the device at `own` held
+    /// there), and that master's rdev.
+    fn linked(server: &mut Server, sock: &Path, idle: Duration, own: &str) -> (KeeperLink, u64) {
+        let (own, register) = register_op(own, 9);
+        let link = KeeperLink::start_idling(
+            sock.to_path_buf(),
+            Identity::same_uid(),
+            "t".into(),
+            None,
+            None,
+            true,
+            idle,
+        )
+        .expect("link");
+        assert!(link.enqueue(register));
+        step_until(server, "the link's keeper holds its master", |s| {
+            s.holds(own)
+        });
+        (link, own)
+    }
+
+    /// A window's boot connection to `server`'s keeper: its HELLO answered, no offers.
+    fn booted(server: &mut Server, sock: &Path) -> KeeperClient {
+        let sock = sock.to_path_buf();
+        let hello = std::thread::spawn(move || {
+            let c = KeeperClient::connect(&sock, &Identity::same_uid(), Duration::from_secs(60))
+                .expect("dial");
+            let offers = c.hello_app_marked("t", None, true).expect("the WELCOME");
+            assert!(offers.is_empty(), "premise: nothing to offer");
+            c
+        });
+        step_until(server, "the boot HELLO is answered", |_| {
+            hello.is_finished()
+        });
+        hello.join().expect("the boot HELLO")
+    }
+
+    /// The window retires a journal its keeper still holds ([`LinkOp::Retire`]): the observer
+    /// hears of it once the keeper answers the SYNC behind the RELEASE, and not while the keeper
+    /// holds the connection unread past their write. The negative control's target: a link that
+    /// confirms on the RELEASE's write is caught here.
+    #[test]
+    fn a_retirement_is_confirmed_only_once_the_keeper_answers_the_sync_behind_its_release() {
+        let scratch = crate::test_scratch_dir("retire");
+        let sock = scratch.path().join("k.sock");
+        let mut server = serve(&sock);
+        let (older, _) = linked(&mut server, &sock, IDLE_FOR_GOOD, "/dev/zero");
+        let (rdev, register) = register_op("/dev/null", 1);
+        assert!(older.enqueue(register));
+        step_until(&mut server, "the keeper holds the old master", |s| {
+            s.holds(rdev)
+        });
+        let (link, _) = linked(&mut server, &sock, IDLE_FOR_GOOD, "/dev/random");
+        let observer = std::sync::Arc::new(ReadObserver::default());
+        assert!(
+            link.send_and_wait(
+                LinkOp::Retire {
+                    rdev,
+                    observer: std::sync::Arc::clone(&observer),
+                },
+                Duration::from_secs(60),
+            ),
+            "control: the RELEASE and its SYNC are written"
+        );
+        assert!(
+            server.holds(rdev),
+            "premise: the keeper has read nothing since"
+        );
+        assert!(
+            !observer.confirmed(),
+            "a written RELEASE is not a retirement the keeper confirmed"
+        );
+        step_until(&mut server, "the keeper's answer confirms it", |_| {
+            observer.confirmed()
+        });
+        assert!(!server.holds(rdev), "the keeper closed its copy");
+        let read = observer.confirmation().expect("its read");
+        assert!(read.sync_sent <= read.answer_read);
+        link.shutdown();
+        older.shutdown();
+    }
+
+    /// A REFUSED that is no owed retirement's moves nothing owed: not a plain RELEASE (owed until
+    /// its own SYNC is answered), and not a retirement whose SYNC this connection never wrote or
+    /// had answered before the refusal was read.
+    #[test]
+    fn a_refusal_that_is_no_owed_retirement_s_leaves_what_is_owed() {
+        let now = std::time::Instant::now();
+        let observer = std::sync::Arc::new(ReadObserver::default());
+        let mut owed = Owed::new();
+        owed.insert(
+            5,
+            Owe {
+                sync: Some((3, now)),
+                retires: Vec::new(),
+            },
+        );
+        owed.insert(
+            6,
+            Owe {
+                sync: None,
+                retires: vec![std::sync::Arc::clone(&observer)],
+            },
+        );
+        owed.insert(
+            7,
+            Owe {
+                sync: Some((2, now)),
+                retires: vec![std::sync::Arc::clone(&observer)],
+            },
+        );
+        refuse_retirement(&mut owed, 5, RefuseCode::NotClaimant, 0);
+        refuse_retirement(&mut owed, 6, RefuseCode::NoSuchRecord, 0);
+        refuse_retirement(&mut owed, 7, RefuseCode::NoSuchRecord, 2);
+        assert_eq!(owed.keys().copied().collect::<Vec<_>>(), [5, 6, 7]);
+        assert!(!observer.confirmed(), "no retirement was refused");
+        refuse_retirement(&mut owed, 7, RefuseCode::NoSuchRecord, 1);
+        assert_eq!(owed.keys().copied().collect::<Vec<_>>(), [5, 6]);
+        assert!(
+            observer.confirmed(),
+            "control: the retirement's own refusal confirms it"
+        );
+    }
+
+    /// A retirement's RELEASE refused for any reason but naming no record (or an earlier frame of
+    /// its rdev refused, which is taken as its) drops its observers unconfirmed, since the keeper
+    /// may still offer that journal, but stays owed as a plain RELEASE until its own SYNC is
+    /// answered: the refused frame may be the master's COMPANION, its RELEASE still unread.
+    #[test]
+    fn a_refused_retirement_stays_owed_as_a_plain_release() {
+        let now = std::time::Instant::now();
+        let observer = std::sync::Arc::new(ReadObserver::default());
+        let mut owed = Owed::new();
+        owed.insert(
+            8,
+            Owe {
+                sync: Some((4, now)),
+                retires: vec![std::sync::Arc::clone(&observer)],
+            },
+        );
+        refuse_retirement(&mut owed, 8, RefuseCode::NotClaimant, 3);
+        assert!(
+            owed.get(&8).is_some_and(|owe| owe.retires.is_empty()),
+            "owed still, as a plain RELEASE"
+        );
+        refuse_retirement(&mut owed, 8, RefuseCode::NoSuchRecord, 3);
+        settle_owed(&mut owed, 3);
+        assert!(owed.contains_key(&8), "its own SYNC is not yet answered");
+        settle_owed(&mut owed, 4);
+        assert!(owed.is_empty(), "its SYNC's answer settles it");
+        assert!(
+            !observer.confirmed(),
+            "a refused retirement is never confirmed, not by a later refusal nor by its answer"
+        );
+    }
+
+    /// A RELEASE the keeper refuses because it holds the master for another claim leaves that
+    /// journal offerable, so its retirement is never confirmed, though the SYNC behind it is
+    /// answered; a RELEASE naming no record confirms its retirement (the journal went with it).
+    #[test]
+    fn a_retirement_the_keeper_refuses_for_another_claim_is_not_confirmed() {
+        let scratch = crate::test_scratch_dir("refuse");
+        let sock = scratch.path().join("k.sock");
+        let mut server = serve(&sock);
+        let (link, _) = linked(&mut server, &sock, IDLE_FOR_GOOD, "/dev/zero");
+        let (newer, _) = linked(&mut server, &sock, IDLE_FOR_GOOD, "/dev/random");
+        let (claimed, register) = register_op("/dev/null", 1);
+        assert!(newer.enqueue(register));
+        step_until(&mut server, "a newer link claims the master", |s| {
+            s.holds(claimed)
+        });
+        let held_elsewhere = std::sync::Arc::new(ReadObserver::default());
+        let gone = std::sync::Arc::new(ReadObserver::default());
+        for (rdev, observer) in [(claimed, &held_elsewhere), (claimed ^ 0x5a5a, &gone)] {
+            assert!(link.enqueue(LinkOp::Retire {
+                rdev,
+                observer: std::sync::Arc::clone(observer),
+            }));
+        }
+        step_until(&mut server, "the RELEASE of no record confirms", |_| {
+            gone.confirmed()
+        });
+        assert!(
+            !held_elsewhere.confirmed(),
+            "the keeper keeps the master for the newer claim: its journal is still offerable"
+        );
+        assert!(server.holds(claimed), "the newer claim keeps its master");
+        link.shutdown();
+        newer.shutdown();
+    }
+
+    /// A retirement whose keeper ended before answering is told to the next keeper, which, holding
+    /// no record of the master, confirms it.
+    #[test]
+    fn a_retirement_unanswered_when_its_keeper_ended_is_told_to_the_next_one() {
+        let scratch = crate::test_scratch_dir("reretire");
+        let sock = scratch.path().join("k.sock");
+        let mut first = serve(&sock);
+        let (link, zero) = linked(&mut first, &sock, LINK_POLL, "/dev/zero");
+        let observer = std::sync::Arc::new(ReadObserver::default());
+        assert!(link.send_and_wait(
+            LinkOp::Retire {
+                rdev: zero ^ 0x5a5a,
+                observer: std::sync::Arc::clone(&observer),
+            },
+            Duration::from_secs(60),
+        ));
+        drop(first);
+        assert!(!observer.confirmed(), "the first keeper read nothing");
+        let mut second = serve(&sock);
+        step_until(&mut second, "the next keeper confirms it", |_| {
+            observer.confirmed()
+        });
+        assert!(second.holds(zero), "and holds the link's master again");
+        link.shutdown();
+    }
+
+    /// The boot connection's RELEASE of an offer the window refused ([`KeeperClient::retire`]) is
+    /// seen through by the link started on that connection, once the keeper answers its SYNC.
+    #[test]
+    fn a_boot_connection_s_retirement_is_seen_through_by_its_link() {
+        let scratch = crate::test_scratch_dir("bootret");
+        let sock = scratch.path().join("k.sock");
+        let mut server = serve(&sock);
+        let (older, _) = linked(&mut server, &sock, IDLE_FOR_GOOD, "/dev/zero");
+        let (rdev, register) = register_op("/dev/null", 1);
+        assert!(older.enqueue(register));
+        step_until(&mut server, "the keeper holds the old master", |s| {
+            s.holds(rdev)
+        });
+        let boot = booted(&mut server, &sock);
+        let observer = std::sync::Arc::new(ReadObserver::default());
+        boot.retire(rdev, std::sync::Arc::clone(&observer))
+            .expect("written");
+        let link = KeeperLink::start_idling(
+            sock.clone(),
+            Identity::same_uid(),
+            "t".into(),
+            None,
+            Some(boot),
+            true,
+            IDLE_FOR_GOOD,
+        )
+        .expect("link");
+        assert!(!observer.confirmed(), "the keeper has not read the RELEASE");
+        step_until(&mut server, "the link reads the keeper's answer", |_| {
+            observer.confirmed()
+        });
+        assert!(!server.holds(rdev), "the keeper closed its copy");
+        link.shutdown();
+        older.shutdown();
+    }
+
+    /// An adopted session with no journal tells the keeper so (COMPANION_RELEASE), and the
+    /// receipt it carries is confirmed only once the keeper has read it.
+    #[test]
+    fn a_companion_release_is_confirmed_only_once_the_keeper_has_read_it() {
+        let scratch = crate::test_scratch_dir("relrcpt");
+        let sock = scratch.path().join("k.sock");
+        let mut server = serve(&sock);
+        let (link, _) = linked(&mut server, &sock, IDLE_FOR_GOOD, "/dev/zero");
+        let (rdev, register) = register_op("/dev/null", 1);
+        assert!(link.enqueue(register));
+        let observer = std::sync::Arc::new(ReadObserver::default());
+        assert!(
+            link.send_and_wait(
+                LinkOp::CompanionRelease {
+                    rdev,
+                    receipt: Some(std::sync::Arc::new(
+                        CompanionReceipt::reporting_confirmation(std::sync::Arc::clone(&observer))
+                    )),
+                },
+                Duration::from_secs(60),
+            ),
+            "control: the REGISTER and the fenced COMPANION_RELEASE are written"
+        );
+        assert!(
+            !server.holds(rdev),
+            "premise: the keeper has read nothing since"
+        );
+        assert!(
+            !observer.confirmed(),
+            "a written COMPANION_RELEASE is not a read one"
+        );
+        step_until(&mut server, "the keeper's read confirms it", |_| {
+            observer.confirmed()
+        });
+        assert_eq!(
+            server
+                .core()
+                .companion_view(rdev)
+                .map(|v| (v.offered, v.reader_settled)),
+            Some((None, Some(true))),
+            "the keeper holds no region an offer of it could carry"
+        );
+        link.shutdown();
+    }
+
+    /// A journal region a window would send, and its read-only custody descriptor.
+    fn journal_region() -> (aterm_uds::shm::Region, OwnedFd) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test playing the window makes the region the keeper is sent"
+        )]
+        // SAFETY: this fixture's link and keeper only transfer/hold/query custody, never reopen, map, write or resize it; the returned region remains inert until it is dropped.
+        let made = unsafe { aterm_uds::shm::Region::create(aterm_uds::shm::PAGE) };
+        made.expect("a region")
+    }
+
+    /// A held master's journal frame that reports to a [`ReadObserver`], superseded before the
+    /// link read the keeper's answer to the SYNC behind it, hands that observer on to the frame
+    /// that superseded it. A tab's RELEASE: the keeper's read closes the record, and the old
+    /// journal with it. A receipt-less COMPANION_RELEASE (the journal stopped): its read leaves
+    /// the keeper no region an offer could carry. Every frame is written before the keeper reads
+    /// one, as when the keeper is slow or the link is between connections. Before, the observer
+    /// went with the superseded read, and a recovered window's fence stood for its run.
+    #[test]
+    fn a_journal_frame_superseded_before_its_answer_hands_its_observer_on() {
+        let scratch = crate::test_scratch_dir("supersede");
+        let sock = scratch.path().join("k.sock");
+        let mut server = serve(&sock);
+        let (link, _) = linked(&mut server, &sock, IDLE_FOR_GOOD, "/dev/zero");
+        let within = Duration::from_secs(60);
+        let reporting = |observer: &std::sync::Arc<ReadObserver>| {
+            Some(std::sync::Arc::new(
+                CompanionReceipt::reporting_confirmation(std::sync::Arc::clone(observer)),
+            ))
+        };
+        for (case, journaled, stops) in [
+            ("a session with no journal closed", false, false),
+            ("a journaled session closed", true, false),
+            ("a session's journal stopped", true, true),
+        ] {
+            let (rdev, register) = register_op("/dev/null", 1);
+            let observer = std::sync::Arc::new(ReadObserver::default());
+            let (_region, custody) = journal_region();
+            let journal = if journaled {
+                LinkOp::Companion {
+                    rdev,
+                    region: custody,
+                    len: aterm_uds::shm::PAGE as u64,
+                    receipt: reporting(&observer),
+                }
+            } else {
+                LinkOp::CompanionRelease {
+                    rdev,
+                    receipt: reporting(&observer),
+                }
+            };
+            let next = if stops {
+                LinkOp::CompanionRelease {
+                    rdev,
+                    receipt: None,
+                }
+            } else {
+                LinkOp::Release { rdev }
+            };
+            assert!(link.enqueue(register), "{case}");
+            assert!(link.enqueue(journal), "{case}");
+            assert!(
+                link.send_and_wait(next, within),
+                "{case}: control: every frame is written"
+            );
+            assert!(
+                !server.holds(rdev),
+                "{case}: premise: the keeper has read none of them"
+            );
+            assert!(!observer.confirmed(), "{case}: nothing unread is confirmed");
+            step_until(&mut server, case, |_| observer.confirmed());
+            if stops {
+                assert_eq!(
+                    server
+                        .core()
+                        .companion_view(rdev)
+                        .map(|v| (v.offered, v.reader_settled)),
+                    Some((None, Some(true))),
+                    "{case}: the keeper holds no region an offer of it could carry"
+                );
+                assert!(link.send_and_wait(LinkOp::Release { rdev }, within));
+            }
+            step_until(&mut server, "the record is closed", |s| !s.holds(rdev));
+        }
+        link.shutdown();
+    }
+
+    /// A REGISTER at the rdev of a retirement still owed confirms it at once: the kernel gives a
+    /// pty's device to another master only once every descriptor of the old one, the keeper's
+    /// custody copy among them, is closed, so the old record and its journal are gone. The keeper
+    /// has read nothing when the link takes the REGISTER, so nothing else could confirm it.
+    #[test]
+    fn a_register_at_a_retired_rdev_confirms_the_retirement() {
+        let scratch = crate::test_scratch_dir("reuse");
+        let sock = scratch.path().join("k.sock");
+        let mut server = serve(&sock);
+        let (link, _) = linked(&mut server, &sock, IDLE_FOR_GOOD, "/dev/zero");
+        let (rdev, register) = register_op("/dev/null", 1);
+        let observer = std::sync::Arc::new(ReadObserver::default());
+        let within = Duration::from_secs(60);
+        assert!(
+            link.send_and_wait(
+                LinkOp::Retire {
+                    rdev,
+                    observer: std::sync::Arc::clone(&observer),
+                },
+                within,
+            ),
+            "control: the RELEASE and its SYNC are written"
+        );
+        assert!(!observer.confirmed(), "premise: nothing has confirmed it");
+        assert!(
+            link.send_and_wait(register, within),
+            "the REGISTER at its rdev is written"
+        );
+        assert!(
+            !server.holds(rdev),
+            "premise: the keeper has still read nothing"
+        );
+        let read = observer
+            .confirmation()
+            .expect("the REGISTER at its rdev confirms the retirement");
+        assert!(read.sync_sent <= read.answer_read);
+        step_until(&mut server, "the new master's REGISTER is read", |s| {
+            s.holds(rdev)
+        });
         link.shutdown();
     }
 
@@ -2303,12 +3066,18 @@ mod offer_tests {
             assert!(link.offer(LinkOp::Release { rdev }).is_ok(), "{rdev} fits");
         }
         let marked = u64::MAX;
-        match link.offer(LinkOp::CompanionRelease { rdev: marked }) {
-            Err(Refused::Full(LinkOp::CompanionRelease { rdev })) => assert_eq!(rdev, marked),
+        match link.offer(LinkOp::CompanionRelease {
+            rdev: marked,
+            receipt: None,
+        }) {
+            Err(Refused::Full(LinkOp::CompanionRelease { rdev, .. })) => assert_eq!(rdev, marked),
             other => panic!("a full queue hands the op back: {other:?}"),
         }
         assert!(
-            !link.enqueue(LinkOp::CompanionRelease { rdev: marked - 1 }),
+            !link.enqueue(LinkOp::CompanionRelease {
+                rdev: marked - 1,
+                receipt: None
+            }),
             "control: enqueue drops it"
         );
         let drained = far.drain();
@@ -2320,13 +3089,16 @@ mod offer_tests {
             "neither the refused offer nor the dropped enqueue reached the keeper"
         );
         assert!(
-            link.offer(LinkOp::CompanionRelease { rdev: marked })
-                .is_ok(),
+            link.offer(LinkOp::CompanionRelease {
+                rdev: marked,
+                receipt: None
+            })
+            .is_ok(),
             "drained, the queue takes it"
         );
         assert!(matches!(
             far.drain().as_slice(),
-            [LinkOp::CompanionRelease { rdev }] if *rdev == marked
+            [LinkOp::CompanionRelease { rdev, .. }] if *rdev == marked
         ));
         drop(far);
         assert!(matches!(
@@ -2335,19 +3107,22 @@ mod offer_tests {
         ));
         link.shutdown();
 
-        let observer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer = std::sync::Arc::new(ReadObserver::default());
         let receipt = std::sync::Arc::new(CompanionReceipt::reporting_confirmation(
             std::sync::Arc::clone(&observer),
         ));
         let mut read = Some(CompanionRead {
             receipt: std::sync::Arc::clone(&receipt),
+            carried: Vec::new(),
             fence: None,
         });
         confirm_companion(&mut read, u64::MAX);
         assert!(!receipt.confirmed() && read.is_some());
+        let refused_sent = std::time::Instant::now();
         read.as_mut().expect("pending").fence = Some(CompanionFence {
             after: 6,
             until: 7,
+            sent: refused_sent,
             refused: false,
         });
         note_companion_refusal(&mut read, 5);
@@ -2356,21 +3131,23 @@ mod offer_tests {
         assert!(!receipt.confirmed() && read.is_some());
         note_companion_refusal(&mut read, 6);
         confirm_companion(&mut read, 7);
-        assert!(!observer.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!observer.confirmed() && observer.confirmation().is_none());
         assert!(
             !receipt.confirmed() && read.is_some(),
             "a refusal is not acceptance"
         );
         unconfirm_companion(&mut read);
         confirm_companion(&mut read, 7);
-        assert!(!observer.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!observer.confirmed());
         assert!(
             !receipt.confirmed() && read.is_some(),
             "the disconnected op is unsent"
         );
+        let accepted_sent = refused_sent + Duration::from_nanos(1);
         read.as_mut().expect("pending").fence = Some(CompanionFence {
             after: 0,
             until: 1,
+            sent: accepted_sent,
             refused: false,
         });
         confirm_companion(&mut read, 0);
@@ -2380,7 +3157,18 @@ mod offer_tests {
         );
         confirm_companion(&mut read, 1);
         assert!(receipt.confirmed() && read.is_none());
-        assert!(observer.load(std::sync::atomic::Ordering::Acquire));
+        let confirmed = observer
+            .confirmation()
+            .expect("the observer heard the accepted read");
+        assert_eq!(
+            confirmed.sync_sent, accepted_sent,
+            "the observer times the SYNC whose answer confirmed the read, not a refused one's"
+        );
+        assert!(
+            confirmed.answer_read >= refused_sent,
+            "the answer is read after its SYNC"
+        );
+        assert!(observer.confirmed());
 
         let now = std::time::Instant::now();
         let make = || {
@@ -2424,7 +3212,10 @@ mod offer_tests {
         }
         assert!(
             matches!(
-                link.offer(LinkOp::CompanionRelease { rdev: 1 }),
+                link.offer(LinkOp::CompanionRelease {
+                    rdev: 1,
+                    receipt: None
+                }),
                 Err(Refused::Full(_))
             ),
             "control: an ordinary op finds the queue full"
@@ -2550,6 +3341,7 @@ mod offer_tests {
                 keeper_caps: Cell::new(0),
                 syncs: Cell::new(0),
                 synced: Cell::new(0),
+                retiring: RefCell::new(Vec::new()),
             };
             let got = client.status("t");
             let _held = peer.join().expect("peer");

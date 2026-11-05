@@ -14,10 +14,8 @@
 
 use super::{
     Registry, checks,
-    import::{
-        self, Coord, Finding, Input, KnownMac, MailboxKeys, Plan, Sheet, SheetKind, Step, Vendors,
-    },
-    registry::{self, ACCOUNT, MACHINE, MAILBOX, PREFERENCE, REGISTRY},
+    import::{self, Coord, Finding, Input, KnownMac, Mode, Plan, Sheet, SheetKind, Step, Vendors},
+    registry::{self, ACCOUNT, MACHINE, PHONE, PREFERENCE, REGISTRY},
 };
 use crate::{
     Error, Result,
@@ -27,8 +25,10 @@ use crate::{
         Ty,
         cell::{self, CellKey, CellValue, Projection},
         grid, guard, keys,
+        secret::{Sealer, Secret},
     },
 };
+use astream_wire::sync::Digest;
 use aterm_json::{Map, Value, json};
 use aterm_secrets::client::Paths;
 use std::{
@@ -41,16 +41,42 @@ use std::{
 /// The verbs' help.
 pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\n\
   import [--vault-sheet <csv>] [--logins <csv>] [--fleet-accounts <toml>]... [--ai-pool <toml>]\n\
-         [--dry-run|--apply [--first]] [--review] [--findings] [--show-addresses]\n\
-                    plan the account sheets and the harness's fleet and pool files as registry\n\
-                    writes: a dry run unless --apply. Only empty cells, or cells an import\n\
-                    wrote, are written; the owner's edits stay and show as findings. A note\n\
+         [--emails|--computers|--phones <csv>|<xlsx>[#<tab>]] [--mailbox-toml <toml>]\n\
+         [--fleet-db --authoritative|--fill-only]\n\
+         [--dry-run|--apply] [--review] [--findings] [--show-addresses]\n\
+                    plan the account sheets, this Mac's fleet_db replica (~/.aterm/lab-db, read\n\
+                    in place; no dump is written), the harness's fleet and pool files and its\n\
+                    mailbox file (~/.secrets/ai-mailbox.toml, only when named) as registry\n\
+                    writes: a dry run unless --apply. A sheet is a CSV, or an xlsx workbook's\n\
+                    tab, read in memory (`#<tab>` names it; else the tab the flag names:\n\
+                    Emails, Computers, Phones). A sheet only fills: it\n\
+                    writes empty cells and its own earlier import's, and a cell another import\n\
+                    wrote otherwise is a `differs` finding, by key and column. The replica\n\
+                    that holds the corrections is --authoritative, any other --fill-only; its\n\
+                    passwords and phone numbers become Secret cells, sealed here, and a sheet's\n\
+                    password column is only a flag, never one. After --apply the import judges\n\
+                    each replica cell and records beside the replica whether the registry\n\
+                    covers them all (`covered`, else each uncovered cell by key and column),\n\
+                    with the replica's keyed digest; once covered, fleet_db's put, delete,\n\
+                    load, bootstrap and rekey refuse there. The mailbox file's every field goes\n\
+                    to its MAILBOX or login address cell, its passwords and TOTP seeds as Secret\n\
+                    cells; a field with no column is a finding by name, and after --apply the\n\
+                    report says whether the file is `covered`. The owner's edits stay and show as\n\
+                    findings. A note\n\
                     crosses into its row's note unless it is shaped like a credential, says or\n\
                     reads like a secret or holds an address: then only its coordinates do. --review opens a\n\
                     private review in amacs that shows them (never a credential-shaped cell)\n\
                     and waits; it is removed once closed.\n\
-                    --apply waits until this Mac holds the registry (a peer's repair round\n\
-                    brings it); --first writes where no Mac in the lab holds it yet\n\
+                    --apply into a registry this Mac holds nothing of waits while a peer's\n\
+                    recent repair round shows the lab holds it. It exits 1 where it wrote the\n\
+                    rows but not the providers they name: run it again\n\
+  import --fleet-db --digest\n\
+                    the replica's keyed digest under the newest [everyone] epoch held here (its\n\
+                    first 8 hex) and its row counts, so two holders compare replicas; never a\n\
+                    value, and nothing is imported\n\
+  import --compare-sheet <csv>\n\
+                    what importing the sheet would do, by count, key and column, and how its\n\
+                    password flags meet the registry's Secret cells: never a value\n\
   check             preferences, labels, logins, aliases and mailboxes, then every conflict,\n\
                     dangling\n\
                     reference and unique clash, what this Mac's self-registration decides\n\
@@ -75,9 +101,10 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
   export [--dry-run|--apply]\n\
                     the files older Macs still read, rendered from the lab and its place rows,\n\
                     compared with the vault's and (--apply) published in one admin write\n\
-  machines | accounts | preferences | mail\n\
+  machines | accounts | preferences | mail | phones\n\
                     the registry's rows by key and label; mail shows each address by key, the\n\
-                    mailbox its codes arrive in (key and label) and how, never an address\n\
+                    mailbox its codes arrive in (key and label) and how, never an address;\n\
+                    phones shows each phone row by key, last4, carrier, line type and device\n\
   machines <machine>\n\
                     what runs on it: its facts and model, its preferences by rank with each\n\
                     account's plan and quota, the accounts it runs unpreferred, its latest sum\n\
@@ -102,9 +129,6 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
   The sheets default to ~/.secrets/ai-accounts.csv and ~/ai-account-logins.csv, the harness's\n\
   files to ~/.secrets/fleet-accounts.toml, ai-accounts-<cli>.toml and ai-pool.toml, each read\n\
   when present. Addresses are masked unless --show-addresses is given.\n";
-
-/// Where the importing Mac keeps its mailbox keys: private, beside its vault state.
-pub const MAILBOX_KEYS: &str = "alab-mailbox-keys.json";
 
 /// Opens a review file for the owner and returns once they have closed it: the review folder
 /// lives only that long.
@@ -136,7 +160,11 @@ pub fn main_entry(words: &[String], vendors: Option<&dyn Vendors>) -> ExitCode {
     let now_ms = aterm_time::unix_millis().unwrap_or(0);
     match run(&paths, words, vendors, &mut amacs_wait, now_ms) {
         Ok(value) => match aterm_json::to_string(&value) {
-            Ok(text) => aterm_uds::stdout::answer_exit("aterm db alab", &format!("{text}\n"), 0),
+            Ok(text) => aterm_uds::stdout::answer_exit(
+                "aterm db alab",
+                &format!("{text}\n"),
+                exit_of(&value),
+            ),
             Err(_) => ExitCode::from(1),
         },
         Err(error) => {
@@ -146,18 +174,67 @@ pub fn main_entry(words: &[String], vendors: Option<&dyn Vendors>) -> ExitCode {
     }
 }
 
+/// How long each of an import's passes waits and runs. A person runs an import once and waits on
+/// it, so a product open's 2 s ([`crate::admission`]) is no measure of it: on a loaded Mac that
+/// budget refused a seed pass in 25 of 123 sealed imports. A pass that still overruns this says
+/// so, and running the import again resumes it, since each record's request id is its content's.
+/// The empty-view guard reads this Mac's retained repair history, so the deadline bounds only
+/// the passes that write.
+const IMPORT_PASS: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The key of the report's reason an import's seed pass wrote nothing.
+const SEEDS_FAILED: &str = "seeds_failed";
+
+/// Put what `seeded` did in an import's `report`. The import's rows are written by now whatever
+/// this says, so a failure names what is missing and the step that writes it.
+fn report_seeds(report: &mut Value, seeded: Result<crate::alab::Seeded>) {
+    match seeded {
+        Ok(seeded) => insert(report, "seeds", json!(seeded.records)),
+        Err(error) => {
+            insert(report, "seeds", json!(0));
+            insert(
+                report,
+                SEEDS_FAILED,
+                json!(format!(
+                    "{error}: the rows are written, but the providers, CLIs and plans they name \
+                     are not; a later pass fills them, so run this import again, or on another \
+                     Mac where this one's quota is spent"
+                )),
+            );
+        }
+    }
+}
+
+/// The exit status of a report: 1 where an import wrote its rows but not what they name, so no
+/// script or person takes that for a finished import.
+fn exit_of(report: &Value) -> u8 {
+    u8::from(!report[SEEDS_FAILED].is_null())
+}
+
 #[derive(Default)]
 struct Args {
     apply: bool,
-    first: bool,
     dry_run: bool,
     review: bool,
     findings: bool,
     reveal: bool,
     vault: Option<PathBuf>,
     logins: Option<PathBuf>,
+    computers: Option<PathBuf>,
+    emails: Option<PathBuf>,
+    phones: Option<PathBuf>,
     fleets: Vec<PathBuf>,
     pool: Option<PathBuf>,
+    /// `import --mailbox-toml <file>`: the harness's mailbox file.
+    mailbox_toml: Option<PathBuf>,
+    /// `import --fleet-db`: this Mac's fleet_db replica, read in place, and the mode it is read
+    /// in.
+    fleet_db: bool,
+    dump_mode: Option<Mode>,
+    /// `import --fleet-db --digest`: the replica's keyed digest, importing nothing.
+    digest: bool,
+    /// `import --compare-sheet <csv>`.
+    compare: Option<PathBuf>,
     rank: Option<u64>,
     /// `add machine --model <hw.model>`.
     model: Option<String>,
@@ -215,7 +292,7 @@ fn whole(name: &str, raw: &std::ffi::OsStr) -> Result<u64> {
 }
 
 /// The verbs `run` takes.
-const VERBS: [&str; 19] = [
+const VERBS: [&str; 20] = [
     "import",
     "check",
     "adopt",
@@ -227,6 +304,7 @@ const VERBS: [&str; 19] = [
     "accounts",
     "preferences",
     "mail",
+    "phones",
     "who",
     "quota",
     "log",
@@ -249,7 +327,30 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
         };
         match (verb, word.as_str()) {
             ("import" | "adopt" | "roll" | "export", "--apply") => args.apply = true,
-            ("import", "--first") => args.first = true,
+            ("import", flag @ ("--authoritative" | "--fill-only")) => {
+                let mode = if flag == "--authoritative" {
+                    Mode::Authoritative
+                } else {
+                    Mode::FillOnly
+                };
+                if args.dump_mode.replace(mode).is_some() {
+                    return Err(Error::new(
+                        "import: name the dump's mode once (--authoritative or --fill-only)",
+                    ));
+                }
+            }
+            ("import", "--fleet-db") => {
+                if std::mem::replace(&mut args.fleet_db, true) {
+                    return Err(Error::new("duplicate --fleet-db"));
+                }
+            }
+            ("import", "--digest") => args.digest = true,
+            ("import", "--compare-sheet") => {
+                if args.compare.is_some() {
+                    return Err(Error::new("duplicate --compare-sheet"));
+                }
+                args.compare = Some(value("--compare-sheet")?);
+            }
             ("import" | "adopt" | "roll" | "export", "--dry-run") => args.dry_run = true,
             ("import", "--review") => args.review = true,
             ("import", "--no-review") => args.review = false,
@@ -267,7 +368,31 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 }
                 args.logins = Some(value("--logins")?);
             }
+            ("import", "--computers") => {
+                if args.computers.is_some() {
+                    return Err(Error::new("duplicate --computers"));
+                }
+                args.computers = Some(value("--computers")?);
+            }
+            ("import", "--emails") => {
+                if args.emails.is_some() {
+                    return Err(Error::new("duplicate --emails"));
+                }
+                args.emails = Some(value("--emails")?);
+            }
+            ("import", "--phones") => {
+                if args.phones.is_some() {
+                    return Err(Error::new("duplicate --phones"));
+                }
+                args.phones = Some(value("--phones")?);
+            }
             ("import", "--fleet-accounts") => args.fleets.push(value("--fleet-accounts")?),
+            ("import", "--mailbox-toml") => {
+                if args.mailbox_toml.is_some() {
+                    return Err(Error::new("duplicate --mailbox-toml"));
+                }
+                args.mailbox_toml = Some(value("--mailbox-toml")?);
+            }
             ("import", "--ai-pool") => {
                 if args.pool.is_some() {
                     return Err(Error::new("duplicate --ai-pool"));
@@ -336,8 +461,30 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
             "{verb}: --review goes with a dry run, before --apply"
         )));
     }
-    if args.first && !args.apply {
-        return Err(Error::new(&format!("{verb}: --first goes with --apply")));
+    if args.digest {
+        if !args.fleet_db
+            || args.apply
+            || args.review
+            || args.dump_mode.is_some()
+            || args.mailbox_toml.is_some()
+        {
+            return Err(Error::new(
+                "import: --digest goes with --fleet-db alone; it prints the replica's keyed \
+                 digest and imports nothing",
+            ));
+        }
+    } else if args.fleet_db != args.dump_mode.is_some() {
+        return Err(Error::new(
+            "import: --fleet-db needs its mode named, --authoritative or --fill-only, and the \
+             mode goes with --fleet-db",
+        ));
+    }
+    if args.compare.is_some()
+        && (args.apply || args.review || args.fleet_db || args.mailbox_toml.is_some())
+    {
+        return Err(Error::new(
+            "import: --compare-sheet reports alone; it writes and reviews nothing",
+        ));
     }
     Ok(args)
 }
@@ -389,6 +536,7 @@ pub fn run_io(
         "accounts" => verbs::accounts(paths),
         "preferences" => verbs::preferences(paths),
         "mail" => verbs::mail(paths),
+        "phones" => verbs::phones(paths),
         "who" => verbs::who(paths, &args, io, now_ms),
         "quota" => verbs::quota(paths, &args, io, now_ms),
         "log" => verbs::log(paths, &args, io, now_ms),
@@ -405,7 +553,22 @@ pub fn run_io(
         }
         "check" => {
             let handle = Handle::at(paths.clone(), &att::REGISTRY);
-            let (view, usage) = handle.usage()?;
+            let (view, usage) = match handle.usage() {
+                Ok(read) => read,
+                Err(error) => {
+                    return Ok(json!({
+                        "registry": "not imported",
+                        "why": error.to_string(),
+                        "next": "aterm db alab import --dry-run, then --apply",
+                    }));
+                }
+            };
+            // No import has run where no source row is: what `check` reads is the Macs' own rows.
+            let imported = !view.project(&registry::SOURCE).rows.is_empty();
+            // Two phone rows whose sealed numbers open to one number, by key only.
+            let duplicates = handle
+                .view_sealed(|view, sealer| Ok(duplicate_numbers(&view.project(&PHONE), sealer)))
+                .unwrap_or_default();
             let (mut lab, generic) = checks::lab(&view.cells);
             lab.extend(checks::facts(
                 view.owned
@@ -447,14 +610,29 @@ pub fn run_io(
                     .iter()
                     .map(|found| att::command::capacity_json(table, found, &usage.actor)),
             );
+            // A later generation whose Secret tokens do not open under its key (an older build's
+            // roll copied them): `roll::endorse` refuses it; named by id, never a value.
+            findings.extend(
+                Registry::at(paths.clone())
+                    .unopened()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(unopened_json),
+            );
             Ok(json!({
                 "complete": view.complete,
                 "refused": view.refused.iter().map(|id| aterm_codec::hex::encode_lower(id)).collect::<Vec<_>>(),
+                "registry": if imported { "imported" } else { "not imported" },
+                "next": (!imported).then_some("aterm db alab import --dry-run, then --apply"),
                 "lab": lab.iter().map(|f| json!({
                     "finding": f.kind,
                     "collection": f.collection,
                     "pks": f.pks.iter().map(|pk| att::command::safe_key(pk)).collect::<Vec<_>>(),
-                })).collect::<Vec<_>>(),
+                })).chain(duplicates.iter().map(|pks| json!({
+                    "finding": "duplicate-number",
+                    "collection": PHONE.name,
+                    "pks": pks,
+                }))).collect::<Vec<_>>(),
                 "findings": findings,
                 "registration": registration,
                 "journal": journal,
@@ -469,19 +647,128 @@ pub fn run_io(
     }
 }
 
-/// The sheet at `explicit`, or the default file under `home` when it exists.
+/// `check`'s finding for a later registry generation whose `Secret` tokens do not open under its
+/// key (`roll::Registry::unopened`): its generation and the first 8 hex of its table digest,
+/// how many cells, and whether this Mac endorsed it; never a value.
+fn unopened_json(found: &super::roll::Unopened) -> Value {
+    let id = aterm_codec::hex::encode_lower(&found.table);
+    let short = id.get(..8).unwrap_or(&id);
+    json!({
+        "finding": "generation-unopened",
+        "generation": found.generation,
+        "table": id,
+        "cells": found.cells,
+        "endorsed": found.declared,
+        "line": format!(
+            "registry generation {} ({short}…) holds {} Secret cells whose token does not open \
+             under its key: {}",
+            found.generation,
+            found.cells,
+            if found.declared { "endorsed before this build refused it" } else { "not endorsed" },
+        ),
+    })
+}
+
+/// The live phone rows whose `number` cells open to one number, each group by key: two Macs
+/// that imported one new phone at once. A token that does not open is no duplicate.
+pub(super) fn duplicate_numbers(phones: &Projection, sealer: &dyn Sealer) -> Vec<Vec<String>> {
+    let opened: Vec<(&String, Secret)> = phones
+        .rows
+        .iter()
+        .filter(|(_, row)| row.live())
+        .filter_map(|(pk, row)| {
+            let token = row.get("number")?.as_str()?;
+            Some((pk, sealer.open(PHONE.name, pk, "number", token).ok()?))
+        })
+        .collect();
+    let mut grouped: Vec<Vec<String>> = Vec::new();
+    let mut placed = vec![false; opened.len()];
+    for (i, (pk, number)) in opened.iter().enumerate() {
+        if placed[i] {
+            continue;
+        }
+        let mut group = vec![(*pk).clone()];
+        for (j, (other, same)) in opened.iter().enumerate().skip(i + 1) {
+            if !placed[j] && number.same(same) {
+                placed[j] = true;
+                group.push((*other).clone());
+            }
+        }
+        if group.len() > 1 {
+            grouped.push(group);
+        }
+    }
+    grouped
+}
+
+/// The sheet at `explicit`, or the default file under `home` when it exists. An explicit
+/// `<file>.xlsx`, or `<file>.xlsx#<tab>`, is that workbook's tab ([`workbook`]).
 fn sheet(kind: SheetKind, explicit: Option<&Path>, default: PathBuf) -> Result<Option<Sheet>> {
-    let path = match explicit {
-        Some(path) => path.to_path_buf(),
-        None if default.is_file() => default,
+    let (path, tab) = match explicit {
+        Some(path) => match workbook(path, kind) {
+            Some((file, tab)) => (file, Some(tab)),
+            None => (path.to_path_buf(), None),
+        },
+        None if default.is_file() => (default, None),
         None => return Ok(None),
     };
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| Error::new("a sheet's file name is not UTF-8"))?;
-    let bytes = crate::import::read_bounded(&path)?;
-    Sheet::parse(kind, name, &bytes).map(Some)
+    match tab {
+        Some(tab) => {
+            let bytes = zeroize::Zeroizing::new(crate::import::read_within(
+                &path,
+                crate::import::MAX_WORKBOOK,
+            )?);
+            Sheet::xlsx(kind, name, &tab, &bytes).map(Some)
+        }
+        None => {
+            let bytes = crate::import::read_bounded(&path)?;
+            Sheet::parse(kind, name, &bytes).map(Some)
+        }
+    }
+}
+
+/// The workbook and tab an explicit sheet path names: `<file>.xlsx#<tab>`, or `<file>.xlsx`
+/// alone for the tab named like the flag (`Emails` for `--emails`). A path that is itself a
+/// file is read as it is named, so a `#` in a CSV's name stays part of it. `None` for a CSV.
+fn workbook(path: &Path, kind: SheetKind) -> Option<(PathBuf, String)> {
+    let xlsx = |file: &Path| {
+        file.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"))
+    };
+    if path.is_file() || !path.to_str().is_some_and(|p| p.contains('#')) {
+        return xlsx(path).then(|| (path.to_path_buf(), default_tab(kind).to_owned()));
+    }
+    let (file, tab) = path.to_str()?.rsplit_once('#')?;
+    let file = PathBuf::from(file);
+    (xlsx(&file) && !tab.trim().is_empty()).then(|| (file, tab.trim().to_owned()))
+}
+
+/// The tab a workbook named without one is read from, by the flag that named it.
+const fn default_tab(kind: SheetKind) -> &'static str {
+    match kind {
+        SheetKind::Emails => "Emails",
+        SheetKind::Computers => "Computers",
+        SheetKind::Phones => "Phones",
+        SheetKind::Logins => "Logins",
+        _ => "Accounts",
+    }
+}
+
+/// The harness's mailbox file at `path` as a source ([`import::mailbox_sheet`]), its bytes
+/// zeroed once read.
+fn mailbox_toml(path: &Path) -> Result<Sheet> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| Error::new("the mailbox file's name is not UTF-8"))?;
+    let bytes =
+        zeroize::Zeroizing::new(crate::import::read_within(path, import::MAILBOX_TOML_MAX)?);
+    import::mailbox_sheet(name, &bytes)
 }
 
 /// The non-denied Macs `roster` names: label, aliases and fleet node.
@@ -509,17 +796,21 @@ pub(super) fn known_macs_from_roster(
 }
 
 /// The Macs the vault's swarm roster names: label, aliases and fleet node.
-fn known_macs(paths: &Paths) -> Vec<KnownMac> {
-    let Ok(Some(roster)) = aterm_secrets::client::swarm_roster(paths) else {
-        return Vec::new();
+fn known_macs(paths: &Paths) -> Result<Vec<KnownMac>> {
+    let Some(roster) =
+        aterm_secrets::client::swarm_roster_until(paths, crate::admission::deadline())
+            .map_err(crate::table::failure)?
+    else {
+        return Ok(Vec::new());
     };
-    known_macs_from_roster(&roster)
+    Ok(known_macs_from_roster(&roster))
 }
 
 /// The harness files this import reads: those named, else the ones beside the vault sheet that
 /// exist. A file named and unreadable refuses the run; one found and unreadable is reported in
 /// `unread`, and since its kind then counts as unread this run it retracts nothing and no
-/// preference ends.
+/// preference ends. Each is a secrets file, so its source is keyed under the `[everyone]` key
+/// (`Sheet::stated`): where this Mac holds none, a file is unreadable here, never digested plain.
 fn harness_sheets(
     paths: &Paths,
     args: &Args,
@@ -550,6 +841,7 @@ fn harness_sheets(
         .filter(|(_, path)| path.is_file())
         .collect()
     };
+    let everyone = everyone(paths);
     let mut sheets = Vec::new();
     let mut unread = Vec::new();
     for (kind, path) in files {
@@ -559,13 +851,19 @@ fn harness_sheets(
             .ok_or_else(|| Error::new("a source's file name is not UTF-8"))?
             .to_owned();
         // Never the parser's own words, which may quote a row.
-        let read = crate::import::read_bounded(&path).ok().and_then(|bytes| {
+        let read = everyone.as_ref().and_then(|(_, key)| {
+            let bytes = crate::import::read_bounded(&path).ok()?;
             let text = std::str::from_utf8(&bytes).ok()?;
             let rows = vendors.stated(kind, &name, text).ok()?;
-            Sheet::stated(kind, &name, &bytes, &rows).ok()
+            Sheet::stated(kind, &name, &bytes, &rows, key).ok()
         });
         match read {
             Some(sheet) => sheets.push(sheet),
+            None if named && everyone.is_none() => {
+                return Err(Error::new(&format!(
+                    "this Mac holds no [everyone] key, so {name} cannot be recorded as a source"
+                )));
+            }
             None if named => {
                 return Err(Error::new(&format!(
                     "{name} is not a {} file this build reads",
@@ -581,30 +879,454 @@ fn harness_sheets(
 /// The harness files found and not read, each with its kind.
 type Unread = Vec<(SheetKind, String)>;
 
-/// The importer's mailbox keys ([`MAILBOX_KEYS`]) beside the vault state at `paths`, empty
-/// where this Mac never imported.
+/// This Mac's fleet_db replica, read in place: its folder and its whole dump, passwords
+/// included, zeroed when dropped.
+struct Replica {
+    dir: PathBuf,
+    dump: zeroize::Zeroizing<Vec<u8>>,
+}
+
+/// The name the replica's sources carry (`lab-db#emails`, …).
+const REPLICA: &str = "lab-db";
+
+/// The folder of this Mac's fleet_db replica: `ATERM_LAB_DB_DIR` where it is set, as fleet_db
+/// reads it, else `~/.aterm/lab-db` under this Commons' home. A test binary reads only its
+/// scratch home's, so a runner's `ATERM_LAB_DB_DIR` never leads a test to the person's replica.
+pub(crate) fn replica_dir(paths: &Paths) -> PathBuf {
+    let home = paths.home.join(".aterm").join("lab-db");
+    if std::env::current_exe().is_ok_and(|exe| aterm_uds::test_binary::is_test_binary(&exe)) {
+        return home;
+    }
+    std::env::var_os("ATERM_LAB_DB_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map_or(home, PathBuf::from)
+}
+
+/// Read the replica at `dir` in place, through fleet_db's own read path (`dump_all`, in this
+/// process): no dump file is written, and a folder that holds no replica is refused, never made
+/// one.
 ///
 /// # Errors
-/// The file is there and is not one this build reads.
-pub fn read_keys(paths: &Paths) -> Result<MailboxKeys> {
-    match aterm_uds::private_file::read_private(&paths.dir, MAILBOX_KEYS, 1024 * 1024) {
-        Ok(bytes) => {
-            let value = aterm_json::from_slice(&bytes)
-                .map_err(|_| Error::new("the mailbox key file is not JSON"))?;
-            MailboxKeys::from_json(&value)
+/// No replica is there, its fleet key is not held here, or it cannot be read.
+fn read_replica(dir: &Path) -> Result<Replica> {
+    // fleet_db's `local::CONFIG`: a folder without it holds no replica, and opening one would make
+    // it.
+    if !std::fs::symlink_metadata(dir.join("database.json")).is_ok_and(|meta| meta.is_file()) {
+        return Err(Error::new(
+            "this Mac holds no fleet_db replica to import (~/.aterm/lab-db)",
+        ));
+    }
+    let db = crate::fleet_db::open_at(dir)?;
+    let document = crate::fleet_db::dump_all(&db, true)?;
+    drop(db);
+    let dump = zeroize::Zeroizing::new(
+        aterm_json::to_vec(&document)
+            .map_err(|_| Error::new("the replica could not be read as a dump"))?,
+    );
+    Ok(Replica {
+        dir: dir.to_owned(),
+        dump,
+    })
+}
+
+/// The newest `[everyone]` epoch this Mac holds, its id and key: what a keyed digest is keyed
+/// by. `None` where this Mac holds none.
+pub(crate) fn everyone(paths: &Paths) -> Option<(Digest, zeroize::Zeroizing<[u8; 32]>)> {
+    #[cfg(test)]
+    if let Some(held) = tests::EVERYONE.with(std::cell::Cell::get) {
+        return Some((held.0, zeroize::Zeroizing::new(held.1)));
+    }
+    aterm_secrets::commons::everyone_key::newest(paths)
+        .ok()
+        .flatten()
+        .map(|held| (held.epoch, held.key))
+}
+
+/// `import --fleet-db --digest`: the replica's keyed digest under the newest `[everyone]` epoch
+/// this Mac holds, with its row counts, so two holders compare replicas by digest under the same
+/// epoch. It imports nothing and prints no value.
+///
+/// # Errors
+/// No replica is here, or this Mac holds no `[everyone]` key.
+fn replica_digest_report(paths: &Paths) -> Result<Value> {
+    let replica = read_replica(&replica_dir(paths))?;
+    let (epoch, key) = everyone(paths).ok_or_else(|| {
+        Error::new("this Mac holds no [everyone] key, so the replica cannot be digested")
+    })?;
+    let document: Value = aterm_json::from_slice(&replica.dump)
+        .map_err(|_| Error::new("the replica could not be read as a dump"))?;
+    let rows: Map = crate::fleet_db::TABLES
+        .iter()
+        .map(|table| {
+            let n = document
+                .get(table)
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            ((*table).to_owned(), json!(n))
+        })
+        .collect();
+    drop(document);
+    let epoch = aterm_codec::hex::encode_lower(&epoch);
+    Ok(json!({
+        "replica": REPLICA,
+        "epoch": &epoch[..8],
+        "rows": rows,
+        "digest": import::covered::replica_digest(&replica.dump, &key),
+    }))
+}
+
+/// Judge, after an `--apply`, whether the registry covers every cell of the replica it imported
+/// ([`import::covered::judge`]), and record it beside the replica, with its keyed digest under the
+/// newest `[everyone]` epoch this Mac holds. The report carries the same record.
+///
+/// # Errors
+/// The registry cannot be read back, or the record cannot be written.
+fn record_coverage(
+    paths: &Paths,
+    handle: &Handle,
+    replica: &Replica,
+    sheets: &[Sheet],
+    vendors: &dyn Vendors,
+    now_ms: u64,
+) -> Result<Value> {
+    let uncovered = uncovered(handle, sheets, vendors, now_ms, true)?;
+    let held = everyone(paths);
+    let record = import::covered::Record {
+        covered: uncovered.is_empty(),
+        uncovered: uncovered.len(),
+        digest: held
+            .as_ref()
+            .map(|(_, key)| import::covered::replica_digest(&replica.dump, key)),
+        epoch: held
+            .as_ref()
+            .map(|(epoch, _)| aterm_codec::hex::encode_lower(epoch)),
+        at_ms: now_ms,
+    };
+    import::covered::write(&replica.dir, &record, &uncovered)?;
+    Ok(record.json(&uncovered))
+}
+
+/// The cells of `sheets` the registry does not cover, `sheets` planned alone against the
+/// registry as an `--apply` left it ([`import::covered::judge`]). With `flags`, a flag-shaped
+/// `Secret` value (a replica's has-password `1`) is covered where it agrees with whether the
+/// registry's cell is set; without, it never is (a mailbox file's short value is a real, too
+/// short credential).
+///
+/// # Errors
+/// The registry cannot be read back.
+fn uncovered(
+    handle: &Handle,
+    sheets: &[Sheet],
+    vendors: &dyn Vendors,
+    now_ms: u64,
+    flags: bool,
+) -> Result<Vec<import::covered::Uncovered>> {
+    handle.view_sealed(|view, sealer| {
+        let input = Input {
+            sheets,
+            macs: &[],
+            vendors,
+            sealer,
+            now_ms,
+            births: true,
+            unread: &[],
+        };
+        let plan = import::plan(&input, &view.cells)?;
+        let projections: BTreeMap<&str, Projection> = [
+            &registry::ADDRESS,
+            &registry::MAILBOX,
+            &PHONE,
+            &MACHINE,
+            &ACCOUNT,
+            &PREFERENCE,
+        ]
+        .into_iter()
+        .map(|collection| (collection.name, view.project(collection)))
+        .collect();
+        let set = |collection: &str, pk: &str, column: &str| {
+            projections
+                .get(collection)
+                .and_then(|p| p.rows.get(pk))
+                .and_then(|row| row.get(column))
+                .is_some_and(|value| !value.is_null())
+        };
+        let flag_agrees = |finding: &Finding| {
+            let (Some(collection), Some(pk), Some(column)) =
+                (finding.collection, &finding.pk, &finding.column)
+            else {
+                return false;
+            };
+            let held = set(collection, pk, column);
+            flags
+                && !finding.at.is_empty()
+                && finding
+                    .at
+                    .iter()
+                    .all(|at| flag_at(sheets, at) == Some(held))
+        };
+        Ok(import::covered::judge(&plan, &flag_agrees))
+    })
+}
+
+/// What the replica's `Secret` value at `at` says as a flag word
+/// ([`crate::typed::secret::flag_says`]); `None` where it is no flag word or is not there.
+fn flag_at(sheets: &[Sheet], at: &Coord) -> Option<bool> {
+    let col = at.col.checked_sub(1)?;
+    let value = sheets.get(at.sheet)?.secrets.get(&(at.row, col))?;
+    crate::typed::secret::flag_says(value)
+}
+
+/// How recent a peer's repair round must be to speak for the lab now.
+pub(super) const FRESH_MS: u64 = 15 * 60 * 1000;
+
+/// Why an import into a registry this Mac holds nothing of must wait, read from the node
+/// service's latest repair round with each peer it knows (`peers`, `None` for a peer with no
+/// round retained) (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.7, §8 step 2). Only a round within
+/// [`FRESH_MS`] of `now_ms` speaks, over the registry's `table` (any table where this Mac cannot
+/// name it) or over this Mac's `catalog`. One over the registry that received records, deferred
+/// some or failed exchanging them says the lab holds what this Mac has not heard yet; one that
+/// exchanged and brought nothing says that peer holds nothing more. The caller passes `catalog`
+/// only where this Mac's catalog holds no declaration of the registry by another Mac: only an
+/// import declares it, and a Mac that holds the registry holds its declaration, so a round over
+/// the catalog that exchanged and brought nothing says that peer holds none of the registry,
+/// while one that deferred or failed exchanging the catalog may have held a declaration back, and
+/// one that brought records said nothing this read has weighed. Repair visits only tables some
+/// Mac holds, so before the lab's first import no round over the registry ever comes: without
+/// the catalog's word that import would wait for good wherever a peer is known. Where no peer's
+/// round speaks at all, whether the lab holds the registry is unknown: an import now could write
+/// concurrent candidates over every row and mint a second key for every phone, so it waits too.
+/// `None` where no peer is known or a round that speaks found nothing to bring.
+pub(super) fn empty_view_wait<'r>(
+    table: Option<[u8; 32]>,
+    catalog: Option<[u8; 32]>,
+    peers: impl IntoIterator<Item = Option<&'r aterm_types::network_state::RepairObservation>>,
+    now_ms: u64,
+) -> Option<&'static str> {
+    use aterm_types::network_state::{RepairOutcome, RepairStage};
+    let mut known = false;
+    let mut drained = false;
+    for round in peers {
+        known = true;
+        let Some(round) =
+            round.filter(|round| now_ms.saturating_sub(round.completed_at_ms) <= FRESH_MS)
+        else {
+            continue;
+        };
+        let deferred =
+            round.outcome == RepairOutcome::Deferred || round.deferred.is_some_and(|n| n > 0);
+        let failed =
+            round.outcome == RepairOutcome::Failed && round.stage == Some(RepairStage::Application);
+        let exchanged = matches!(
+            round.outcome,
+            RepairOutcome::Exchanged | RepairOutcome::NoCommonTable
+        );
+        let received = round.received.is_some_and(|n| n > 0);
+        let over_registry = match (table, round.table) {
+            (Some(wanted), Some(seen)) => wanted == seen,
+            _ => true,
+        };
+        if over_registry {
+            if received {
+                return Some(
+                    "a peer's repair round just brought registry records that this Mac has not applied yet",
+                );
+            }
+            if deferred {
+                return Some(
+                    "a peer's repair round deferred registry records: the lab holds what this Mac has not heard",
+                );
+            }
+            if failed {
+                return Some(
+                    "a peer's repair round failed while exchanging the registry: the lab may hold it",
+                );
+            }
+            drained |= exchanged;
+        } else if catalog.is_some() && round.table == catalog {
+            if deferred {
+                return Some(
+                    "a peer's repair round deferred catalog records: one may declare the registry",
+                );
+            }
+            if failed {
+                return Some(
+                    "a peer's repair round failed while exchanging the catalog: it may declare the registry",
+                );
+            }
+            drained |= exchanged && !received;
         }
-        Err(aterm_uds::private_file::PrivateFileError::Missing) => Ok(MailboxKeys::default()),
-        Err(_) => Err(Error::new("the mailbox key file cannot be read")),
+    }
+    (known && !drained).then_some(
+        "no peer's repair round over the registry or the catalog in the last 15 minutes says whether the lab holds it",
+    )
+}
+
+/// What this Mac's catalog says for an import into a registry it holds nothing of, read once
+/// before the writer ([`Registry::catalog_word`]): the catalog's table id where no other Mac's
+/// declaration of the registry is in it, so its rounds speak ([`empty_view_wait`]).
+///
+/// # Errors
+/// Another Mac declared the registry here (the lab holds it), or the catalog cannot be read.
+fn empty_view_catalog(paths: &Paths, ops: usize) -> Result<Option<[u8; 32]>> {
+    if ops > 0 {
+        return Ok(None);
+    }
+    match Registry::at(paths.clone()).catalog_word() {
+        Ok(Some((_, true))) => Err(Error::new(
+            "this Mac holds none of the registry yet and another Mac declared it here, so the lab \
+             holds it; import once its repair round brings it",
+        )),
+        Ok(Some((catalog, false))) => Ok(Some(catalog)),
+        Ok(None) => Ok(None),
+        Err(_) => Err(Error::new(
+            "this Mac holds none of the registry and cannot read whether its catalog declares it",
+        )),
     }
 }
 
-fn save_keys(paths: &Paths, keys: &MailboxKeys) -> Result<()> {
-    let text = aterm_json::to_vec(&keys.to_json())
-        .map_err(|_| Error::new("the mailbox keys could not be encoded"))?;
-    aterm_types::fs_restricted::ensure_private_dir(&paths.dir)
-        .map_err(|_| Error::new("the vault state folder could not be made private"))?;
-    aterm_uds::private_file::write_private(&paths.dir, MAILBOX_KEYS, &text)
-        .map_err(|_| Error::new("the mailbox keys could not be saved"))
+/// [`empty_view_wait`] over this Mac's retained network history, for a registry it holds
+/// `ops` operations of, with the catalog [`empty_view_catalog`] read.
+///
+/// # Errors
+/// The history is there and cannot be read: whether the lab holds the registry is unknown.
+fn empty_view_guard(
+    paths: &Paths,
+    ops: usize,
+    catalog: Option<[u8; 32]>,
+    now_ms: u64,
+) -> Result<()> {
+    if ops > 0 {
+        return Ok(());
+    }
+    let Some(config) = aterm_types::dirs::aterm_config_path() else {
+        return Ok(());
+    };
+    let network = crate::network_state::read_history(&config).map_err(|_| {
+        Error::new("this Mac holds none of the registry and cannot read whether its peers do")
+    })?;
+    let table = Registry::at(paths.clone()).table().ok().flatten();
+    let peers = network.peers.iter().map(|peer| peer.last_repair.as_ref());
+    match empty_view_wait(table, catalog, peers, now_ms) {
+        Some(why) => Err(Error::new(&format!(
+            "this Mac holds none of the registry yet and {why}; import once its repair round brings it"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The sealer a dry run plans with where this Mac holds no registry key: it seals nothing (the
+/// plan is never written, each sealed cell a well-formed token no key opens) and opens nothing.
+struct Unheld;
+
+/// The token [`Unheld`] seals every value to: an authenticated cell's shape, holding nothing.
+fn unheld_token() -> String {
+    format!(
+        "sec1:{}:{}",
+        "0".repeat(64),
+        aterm_secrets::b64::encode_padded(&[0; 28])
+    )
+}
+
+impl Sealer for Unheld {
+    fn table(&self) -> &str {
+        ""
+    }
+
+    fn seal(&self, _: &str, _: &str, _: &str, _: &Secret) -> Result<String> {
+        Ok(unheld_token())
+    }
+
+    fn open(&self, _: &str, _: &str, _: &str, _: &str) -> Result<Secret> {
+        Err(Error::new("this Mac holds no registry key"))
+    }
+}
+
+/// What one import reads but the registry's sealer.
+struct Sources<'a> {
+    sheets: &'a [Sheet],
+    macs: &'a [KnownMac],
+    vendors: &'a dyn Vendors,
+    now_ms: u64,
+    unread: &'a [SheetKind],
+}
+
+impl Sources<'_> {
+    fn input<'b>(&'b self, sealer: &'b dyn Sealer) -> Input<'b> {
+        Input {
+            sheets: self.sheets,
+            macs: self.macs,
+            vendors: self.vendors,
+            sealer,
+            now_ms: self.now_ms,
+            births: true,
+            unread: self.unread,
+        }
+    }
+}
+
+/// The plan of `sources` against this Mac's registry, writing nothing, with how much of it is
+/// held here and the seed records a write would add.
+///
+/// # Errors
+/// The plan fails against the registry this Mac holds; one it cannot open (no key here) is
+/// planned against an empty registry instead.
+fn dry_plan(handle: &Handle, sources: &Sources<'_>) -> Result<(Plan, &'static str, usize)> {
+    let planned = |view: &crate::att::View, sealer: &dyn Sealer| -> Result<_> {
+        let plan = import::plan(&sources.input(sealer), &view.cells)?;
+        let seeds = crate::att::pack(super::seeds::rows_for(&view.cells)?)?.len();
+        Ok((
+            plan,
+            if view.complete {
+                "held"
+            } else {
+                "incomplete here"
+            },
+            seeds,
+        ))
+    };
+    match handle.view_sealed(|view, sealer| Ok(planned(view, sealer))) {
+        Ok(planned) => planned,
+        Err(_) => {
+            let cells = Default::default();
+            let plan = import::plan(&sources.input(&Unheld), &cells)?;
+            let seeds = crate::att::pack(super::seeds::rows_for(&cells)?)?.len();
+            Ok((plan, "not held here", seeds))
+        }
+    }
+}
+
+/// Whether `plan` writes nothing and finds nothing the registry holds otherwise or keeps from
+/// the sources: the sources say what the registry says.
+fn matches_registry(plan: &Plan) -> bool {
+    use import::Kind;
+    plan.rows.is_empty()
+        && !plan.findings.iter().any(|f| {
+            matches!(
+                f.kind,
+                Kind::Differs
+                    | Kind::OwnerKept
+                    | Kind::Conflicted
+                    | Kind::RetiredKept
+                    | Kind::DumpConflicted
+                    | Kind::ProtectedSecret
+                    | Kind::Unmapped
+            )
+        })
+}
+
+/// The `differs` findings by key and column: never a value.
+fn differs_json(plan: &Plan) -> Vec<Value> {
+    plan.findings
+        .iter()
+        .filter(|f| f.kind == import::Kind::Differs)
+        .map(|f| {
+            json!({
+                "collection": f.collection,
+                "pk": f.pk.as_deref().map(crate::att::command::safe_key),
+                "column": f.column,
+            })
+        })
+        .collect()
 }
 
 fn import(
@@ -614,11 +1336,32 @@ fn import(
     review: Review<'_>,
     now_ms: u64,
 ) -> Result<Value> {
+    if let Some(csv) = &args.compare {
+        return compare_sheet(paths, csv, vendors, now_ms);
+    }
+    if args.digest {
+        return replica_digest_report(paths);
+    }
     let mut sheets: Vec<Sheet> = [
         sheet(
             SheetKind::Vault,
             args.vault.as_deref(),
             paths.home.join(".secrets").join("ai-accounts.csv"),
+        )?,
+        sheet(
+            SheetKind::Phones,
+            args.phones.as_deref(),
+            paths.home.join(".secrets").join("alab-phones.csv"),
+        )?,
+        sheet(
+            SheetKind::Computers,
+            args.computers.as_deref(),
+            paths.home.join(".secrets").join("alab-computers.csv"),
+        )?,
+        sheet(
+            SheetKind::Emails,
+            args.emails.as_deref(),
+            paths.home.join(".secrets").join("alab-emails.csv"),
         )?,
         sheet(
             SheetKind::Logins,
@@ -629,75 +1372,68 @@ fn import(
     .into_iter()
     .flatten()
     .collect();
+    let replica = match args.dump_mode.filter(|_| args.fleet_db) {
+        Some(mode) => {
+            let replica = read_replica(&replica_dir(paths))?;
+            // The dump holds passwords: its source is keyed under the `[everyone]` key, never a
+            // plain digest in the shared `source` row (`import::dump_sheets`).
+            let (_, key) = everyone(paths).ok_or_else(|| {
+                Error::new(
+                    "this Mac holds no [everyone] key, so the replica's dump cannot be recorded \
+                     as a source",
+                )
+            })?;
+            let read = import::dump_sheets(REPLICA, &replica.dump, mode, &key)?;
+            let at = sheets.len()..sheets.len() + read.len();
+            sheets.extend(read);
+            Some((replica, at))
+        }
+        None => None,
+    };
     let (harness, unread) = harness_sheets(paths, args, vendors)?;
     sheets.extend(harness);
+    let mailboxes = match &args.mailbox_toml {
+        Some(path) => {
+            sheets.push(mailbox_toml(path)?);
+            Some(sheets.len() - 1)
+        }
+        None => None,
+    };
     if sheets.is_empty() {
         return Err(Error::new(
-            "no sheet to import: give --vault-sheet or --logins, or put the sheets in their places",
+            "no sheet to import: give --vault-sheet, --logins, --mailbox-toml or --fleet-db, or \
+             put the sheets in their places",
         ));
     }
-    let macs = known_macs(paths);
-    let keys = read_keys(paths)?;
+    let macs = known_macs(paths)?;
     let unread_kinds: Vec<SheetKind> = unread.iter().map(|(kind, _)| *kind).collect();
     let unread: Vec<String> = unread.into_iter().map(|(_, name)| name).collect();
-    let input = Input {
+    let sources = Sources {
         sheets: &sheets,
         macs: &macs,
         vendors,
-        keys: keys.clone(),
         now_ms,
-        births: true,
         unread: &unread_kinds,
     };
     let handle = Handle::at(paths.clone(), &att::REGISTRY);
     if args.apply {
-        // A Mac that holds none of the registry would plan every row as new, write concurrent
-        // candidates over every owner edit and mint duplicate mailboxes. Checked before the
-        // registry is declared here, and again under the writer.
-        let unheld = || {
-            Error::new(
-                "this Mac holds none of the registry yet: import where it is held, let a peer's \
-                 repair round bring it here, or pass --first where no Mac in the lab holds it",
-            )
-        };
-        if !args.first && handle.view().map_or(true, |view| view.ops.is_empty()) {
-            return Err(unheld());
-        }
+        // A Mac that holds none of the registry while the lab does would plan every row as new
+        // and write concurrent candidates over every owner edit. Checked before the registry is
+        // declared here, and again under the writer.
+        let held = handle.view().map_or(0, |view| view.ops.len());
+        let catalog = empty_view_catalog(paths, held)?;
+        empty_view_guard(paths, held, catalog, now_ms)?;
         // The compiled providers, CLIs and plans first, in records of their own under this
         // Mac's quota of automatic records, so every account's `provider` names a row. A seed
         // pass that cannot write (this Mac's automatic records are spent) leaves the import to
-        // go ahead; any Mac's later pass fills the same absent cells.
-        let seeded = Registry::at(paths.clone()).seed();
-        let (plan, applied) = handle.commit_derived(true, |view| {
-            if view.ops.is_empty() && !args.first {
-                return Err(unheld());
-            }
-            let plan = import::plan(&input, &view.cells)?;
-            // New mailbox keys beside mailbox rows this Mac has no keys for would be duplicate
-            // mailboxes: those keys stay on the Mac that imported first (until step 11 keeps
-            // them in the vault).
-            let known = keys.pks();
-            let births_mailbox = plan.keys.len() > keys.len()
-                || plan
-                    .counts
-                    .get(MAILBOX.name)
-                    .is_some_and(|c| c.new_rows > 0);
-            if births_mailbox
-                && view
-                    .project(&MAILBOX)
-                    .rows
-                    .keys()
-                    .any(|pk| !known.contains(pk.as_str()))
-            {
-                return Err(Error::new(
-                    "the registry holds mailboxes whose keys are not on this Mac: import on the \
-                     Mac that imported them",
-                ));
-            }
-            if plan.keys != keys {
-                // Before any record names a minted mailbox key, so a re-run finds it.
-                save_keys(paths, &plan.keys)?;
-            }
+        // go ahead, since any Mac's later pass fills the same absent cells; the report and the
+        // exit status say so ([`report_seeds`]).
+        let seeded =
+            Registry::at(paths.clone()).seed_until(std::time::Instant::now() + IMPORT_PASS);
+        let pass = std::time::Instant::now() + IMPORT_PASS;
+        let (plan, applied) = handle.commit_sealed_until(true, pass, |view, sealer| {
+            empty_view_guard(paths, view.ops.len(), catalog, now_ms)?;
+            let plan = import::plan(&sources.input(sealer), &view.cells)?;
             let rows = plan.rows.clone();
             Ok((plan, rows))
         })?;
@@ -711,25 +1447,40 @@ fn import(
             "retried",
             json!(applied.operations.len().saturating_sub(applied.records)),
         );
-        match seeded {
-            Ok(seeded) => insert(&mut report, "seeds", json!(seeded.records)),
-            Err(error) => insert(&mut report, "seeds", json!(error.to_string())),
+        if let Some((replica, at)) = &replica {
+            let record = record_coverage(
+                paths,
+                &handle,
+                replica,
+                &sheets[at.clone()],
+                vendors,
+                now_ms,
+            )?;
+            insert(&mut report, "replica", record);
         }
+        if let Some(at) = mailboxes {
+            let uncovered = uncovered(&handle, &sheets[at..=at], vendors, now_ms, false)?;
+            insert(
+                &mut report,
+                "mailbox_toml",
+                import::covered::report(&uncovered),
+            );
+        }
+        report_seeds(&mut report, seeded);
         return Ok(report);
     }
-    let (cells, registry) = match handle.view() {
-        Ok(view) if view.complete => (view.cells, "held"),
-        Ok(view) => (view.cells, "incomplete here"),
-        Err(_) => (Default::default(), "not held here"),
-    };
-    let plan = import::plan(&input, &cells)?;
+    let (plan, registry, seeds) = dry_plan(&handle, &sources)?;
     let mut report = summary(&plan, &sheets, &macs, registry, args.findings);
     insert(&mut report, "dry_run", json!(true));
     insert(&mut report, "unread", json!(unread));
     let records = crate::att::pack(plan.rows.clone())?.len();
     insert(&mut report, "records", json!(records));
-    let seeds = crate::att::pack(super::seeds::rows_for(&cells)?)?.len();
     insert(&mut report, "seeds", json!(seeds));
+    insert(
+        &mut report,
+        "matches_registry",
+        json!(matches_registry(&plan)),
+    );
     if args.review {
         // The folder lives while the owner looks: dropping it removes it, however the review
         // ends, so no note's text is left behind in a temporary folder.
@@ -739,6 +1490,72 @@ fn import(
         }
     }
     insert(&mut report, "review", json!(args.review));
+    Ok(report)
+}
+
+/// `import --compare-sheet <csv>`: what the sheet's fill-only import would do, counted and keyed
+/// by row key and column, and how its password flags meet the registry's `address.password`
+/// cells (set, held, missing). It writes nothing and prints no value: no cell, no address.
+fn compare_sheet(paths: &Paths, csv: &Path, vendors: &dyn Vendors, now_ms: u64) -> Result<Value> {
+    let name = csv
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| Error::new("a sheet's file name is not UTF-8"))?;
+    let bytes = crate::import::read_bounded(csv)?;
+    let headers = crate::import::parse(&bytes)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::new("the sheet has no header row"))?;
+    let kind = SheetKind::detect(&headers)
+        .ok_or_else(|| Error::new("the sheet's header row names no sheet this build reads"))?;
+    let sheet = Sheet::parse(kind, name, &bytes)?;
+    let (flagged, set, unkeyed) = sheet.password_flags();
+    let sheets = [sheet];
+    let macs = known_macs(paths)?;
+    let handle = Handle::at(paths.clone(), &att::REGISTRY);
+    let sources = Sources {
+        sheets: &sheets,
+        macs: &macs,
+        vendors,
+        now_ms,
+        unread: &[],
+    };
+    let (plan, registry, _) = dry_plan(&handle, &sources)?;
+    let addresses = handle
+        .view()
+        .map(|view| view.project(&registry::ADDRESS))
+        .unwrap_or_default();
+    let sealed = |pk: &String| {
+        addresses
+            .rows
+            .get(pk)
+            .is_some_and(|row| row.live() && row.get("password").is_some_and(|x| !x.is_null()))
+    };
+    let held = flagged.iter().filter(|pk| sealed(pk)).count();
+    let unflagged = addresses
+        .rows
+        .iter()
+        .filter(|(pk, _)| sealed(pk) && !flagged.contains(*pk))
+        .count();
+    let mut report = summary(&plan, &sheets, &[], registry, false);
+    insert(&mut report, "kind", json!(kind.word()));
+    insert(
+        &mut report,
+        "matches_registry",
+        json!(matches_registry(&plan)),
+    );
+    insert(&mut report, "differs", json!(differs_json(&plan)));
+    insert(
+        &mut report,
+        "password_flags",
+        json!({
+            "set": set,
+            "sealed_in_registry": held,
+            "missing_in_registry": flagged.len() - held,
+            "no_address": unkeyed,
+            "sealed_unflagged": unflagged,
+        }),
+    );
     Ok(report)
 }
 
@@ -781,12 +1598,12 @@ fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
             import::Mark::Absent
         }
     }
-    let macs = known_macs(paths);
+    let macs = known_macs(paths)?;
     let input = Input {
         sheets: &[],
         macs: &macs,
         vendors: &NoSheets,
-        keys: MailboxKeys::default(),
+        sealer: &Unheld,
         now_ms,
         births: false,
         unread: &[],
@@ -985,7 +1802,6 @@ fn summary(plan: &Plan, sheets: &[Sheet], macs: &[KnownMac], registry: &str, lis
         "known_macs": macs.len(),
         "counts": counts,
         "findings": kinds,
-        "mailbox_keys": plan.keys.len(),
     });
     if list {
         let listed: Vec<Value> = plan
@@ -1005,9 +1821,10 @@ fn summary(plan: &Plan, sheets: &[Sheet], macs: &[KnownMac], registry: &str, lis
 pub const WITHHELD: &str = "(withheld: shaped like a secret)";
 
 /// A sheet cell for the local review: every word holding `@` masked unless `reveal`; a cell
-/// shaped like a credential or naming a secret is never shown, not even here.
+/// shaped like a credential, naming a secret or holding a phone number (a `Secret` cell's
+/// value) is never shown, not even here.
 fn review_text(text: &str, reveal: bool) -> String {
-    if guard::withheld(text) {
+    if guard::withheld(text) || guard::phone_shaped(text) {
         return WITHHELD.to_owned();
     }
     let flat: String = text
@@ -1141,7 +1958,10 @@ fn write_review(plan: &Plan, sheets: &[Sheet], reveal: bool) -> Result<aterm_tem
     Ok(folder)
 }
 
+#[cfg(unix)]
+pub(crate) mod session;
 mod verbs;
+pub(crate) mod views;
 
 #[cfg(test)]
 mod tests;

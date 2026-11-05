@@ -36,9 +36,6 @@ macro_rules! at {
     };
 }
 
-#[cfg(all(test, unix))]
-aterm_secrets::memoized_x25519_in_tests!();
-
 /// The crate's durability flush ([`durable::sync_all`]).
 mod durable;
 
@@ -60,6 +57,9 @@ pub mod fleet_log;
 /// fleet.
 #[cfg(unix)]
 mod fleet_member;
+/// This machine's name: `machine-name.toml` (`docs/DESIGN-machine-names-2026-11-04.md` §3.3).
+#[cfg(unix)]
+pub mod machine_name;
 /// The production signed-image service backend and immutable native proof.
 #[cfg(unix)]
 pub mod service_activation;
@@ -70,6 +70,9 @@ pub use fleet_member::test_sync_from_vault_at;
 /// `aterm members`: Macs joining ALab and the members that let them in.
 #[cfg(unix)]
 pub mod members_cli;
+/// A Mac an `atm/1` listener does not seat offers that member's desk its `Node` record (B3).
+#[cfg(unix)]
+pub mod mesh_offer;
 /// Bounded, value-free release preparation observations over authenticated control.
 #[cfg(unix)]
 pub mod operational;
@@ -81,8 +84,8 @@ pub mod vault_join;
 #[cfg(unix)]
 pub use fleet_member::{
     FleetCheck, FleetName, FleetSync, FleetSyncError, check_from_cache, drive_fleet,
-    drive_fleet_proven, fleet_name_for, follow_fleet_name, known_peer_count, survey_fleet,
-    sync_from_cache, try_sync_from_cache,
+    drive_fleet_proven, fleet_name_for, fleet_node, follow_fleet_name, known_peer_count,
+    survey_fleet, sync_from_cache, try_sync_from_cache,
 };
 /// The harness core.
 pub mod harness;

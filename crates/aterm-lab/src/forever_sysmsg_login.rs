@@ -10,7 +10,10 @@
 //!   URL its only route, which the instance's route seam admits), so aterm reads its method, a
 //!   subscription's, and the picker rule slice 12a changed is in reach ([`stored_arm`]);
 //!   `--token-login` runs it on the environment's token instead (`claude --subscriber`), where
-//!   nothing names the method. The stub answers it as the Anthropic API answers an expired OAuth
+//!   nothing names the method; `--forced-login` runs it on the stored login under settings that
+//!   pin its method ([`LoginArm::Forced`], [`lay_pin`]), where `/login` draws no picker and opens
+//!   the browser one tick past its Enter, so aterm types none and the person types their own
+//!   (the post-landing review, 2026-11-02). The stub answers it as the Anthropic API answers an expired OAuth
 //!   token: a 401 `authentication_error` ([`claude_spec`], [`EXPIRED`]), which Claude Code draws
 //!   as a lost login its reader names (`Please run /login`). agy and Muse Code get the stub's
 //!   `401`: the Gemini API's `UNAUTHENTICATED` and the Responses API's rejected key, each a login
@@ -51,7 +54,9 @@
 //!   by its own back-off ([`go_on_by`]), or Land's landing ([`land_by`]).
 
 use aterm_agent::supervise::policy::login::{RULE_LOGIN_DONE, RULE_LOGIN_METHOD};
-use aterm_agent::supervise::policy::notice::{LOGIN_CANCELLED, LOGIN_CHOOSE};
+use aterm_agent::supervise::policy::notice::{
+    LOGIN_CANCELLED, LOGIN_CHOOSE, LOGIN_LEFT, LOGIN_NOT_RUN, NoticeText, WHY_PINNED,
+};
 use aterm_agent::supervise::policy::turn_end::{self, RULE_LOGIN, RULE_LOGIN_BACK, TurnEndTiming};
 use aterm_phase::LoginMethod;
 
@@ -92,6 +97,23 @@ pub const HANDOFF_HANG_MS: i64 = 60_000;
 /// The stored login's label ([`lay_stored`]): the stub reads its token as `oat:<label>`.
 pub const STORED_LABEL: &str = "lab-login";
 
+/// How Claude Code's expired-login chains sign in ([`stored_arm`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoginArm {
+    /// A stored claude.ai login of the lab's ([`lay_stored`]): its `/login` draws the method
+    /// picker.
+    #[default]
+    Stored,
+    /// `--token-login`: the environment's token (`claude --subscriber`), where nothing names the
+    /// method.
+    Token,
+    /// `--forced-login`: the stored login under settings that pin its method ([`lay_pin`]), as an
+    /// organization's managed settings or a person's own do (the post-landing review,
+    /// 2026-11-02): its `/login` draws no picker and opens the browser one tick past its Enter,
+    /// so aterm types none ([`judge`]: [`LOGIN_NOT_RUN`] told once, naming the pin).
+    Forced,
+}
+
 /// Whether harness `h`'s run of `chains` takes the expired login on a stored login of the lab's
 /// ([`lay_stored`]): Claude Code's, unless `--token-login` named the environment's token. A
 /// stored login is what a person's `/login` leaves, and the only one whose method aterm reads
@@ -99,8 +121,36 @@ pub const STORED_LABEL: &str = "lab-login";
 /// it alone (in the inline renderer [`lay_stored`] picks): on the environment's token nothing
 /// names the method, and every build leaves the picker to the person.
 #[must_use]
-pub fn stored_arm(h: Harness, chains: &[Chain], token_login: bool) -> bool {
-    h == Harness::Claude && !token_login && chains.iter().any(|c| c.login())
+pub fn stored_arm(h: Harness, chains: &[Chain], login: LoginArm) -> bool {
+    h == Harness::Claude && login != LoginArm::Token && chains.iter().any(|c| c.login())
+}
+
+/// The method [`lay_pin`] pins: a claude.ai subscription's, the stored login's own.
+pub const PINNED_METHOD: &str = "claudeai";
+
+/// PINS THE SIGN-IN METHOD in the lab's own settings (`$CLAUDE_CONFIG_DIR/settings.json` in the
+/// scratch, nowhere else): `forceLoginMethod` [`PINNED_METHOD`], with which Claude Code 2.1.316's
+/// `/login` starts its OAuth flow at once (its dialog's `ready_to_start`), the picker never drawn,
+/// and hands the sign-in to the browser (the lab's inert one) one tick past the Enter.
+///
+/// # Errors
+/// The scratch settings could not be read or written.
+pub fn lay_pin(run: &Run) -> Result<(), Fail> {
+    crate::verbs::settings_merge(run, &J::obj([("forceLoginMethod", J::s(PINNED_METHOD))]))
+        .map(|_| ())
+}
+
+/// Whether the lab's own settings pin the sign-in method ([`lay_pin`]).
+fn pinned(run: &Run) -> bool {
+    crate::verbs::read_scratch(&run.settings())
+        .ok()
+        .and_then(|text| J::parse(&text).ok())
+        .and_then(|d| {
+            d.get("forceLoginMethod")
+                .and_then(J::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|m| !m.is_empty())
 }
 
 /// LAYS THE STORED LOGIN in the lab's scratch, nowhere else, as a person's `/login` leaves one: a
@@ -200,6 +250,9 @@ pub struct Played {
     pub control: Option<bool>,
     /// Claude Code on a stored login of the lab's ([`stored_arm`]), whose method aterm reads.
     pub stored: bool,
+    /// That login under settings that pin its method ([`LoginArm::Forced`]): the person types
+    /// `/login` themselves, which draws no picker.
+    pub forced: bool,
     /// The inert browser's log as the person came to the tab, before any key of theirs: what
     /// aterm or the agent opened while the login was gone.
     pub opened_before: Option<String>,
@@ -300,9 +353,11 @@ pub(super) fn step(
             tab.seen.cover.outage_ms = Some(now);
             let control = crate::recorder::control(run);
             let logged = crate::recorder::nothing_opened("", &crate::util::scratch_text(&control));
+            let stored = h == Harness::Claude && run.route_seam == "1";
             tab.seen.cover.login = Some(Played {
                 control: Some(logged),
-                stored: h == Harness::Claude && run.route_seam == "1",
+                stored,
+                forced: stored && pinned(run),
                 ..Played::default()
             });
             println!(
@@ -328,6 +383,27 @@ pub(super) fn step(
     let played = tab.seen.cover.login.get_or_insert_with(Played::default);
     if played.opened_before.is_none() {
         played.opened_before = Some(opened(run));
+    }
+    if played.forced && played.picked_ms.is_none() && played.no_pick.is_none() {
+        let sent = person_turn(door, &sid, h.name(), "/login")?;
+        let played = tab.seen.cover.login.get_or_insert_with(Played::default);
+        match sent {
+            Some((t, _)) => {
+                played.picked_ms = Some(t);
+                println!(
+                    "  [{name}] +{} person  typed /login (the settings pin the method: no picker)",
+                    at_(t)
+                );
+            }
+            None => {
+                played.no_pick = Some("the composer did not take the person's /login".into());
+                println!(
+                    "  [{name}] +{} person  the composer did NOT take the person's /login",
+                    at_(now)
+                );
+            }
+        }
+        return Ok(());
     }
     if h == Harness::Claude && played.picked_ms.is_none() && played.no_pick.is_none() {
         let screen = on(door, &sid, &["text"]);
@@ -697,6 +773,27 @@ pub const fn what_on(h: Harness, land: bool, signed: bool) -> &'static str {
     }
 }
 
+/// [`what_on`] for Claude Code under `--forced-login` ([`LoginArm::Forced`]): its `/login` draws no
+/// picker and opens the browser at once, so aterm types none and the sign-in is the person's own
+/// `/login`.
+#[must_use]
+pub const fn what_forced(land: bool, signed: bool) -> &'static str {
+    match (land, signed) {
+        (false, false) => {
+            "an expired login under Cruise whose settings pin the sign-in method: no /login typed, the browser left to the person, one quiet need naming the pin, nothing else typed"
+        }
+        (true, false) => {
+            "an expired login under Land whose settings pin the sign-in method: no /login typed, the browser left to the person, one quiet need naming the pin, no act of Land's"
+        }
+        (false, true) => {
+            "the person's own /login over a pinned sign-in method under Cruise: the browser on their key alone, nothing of aterm's past it, then Cruise goes on once"
+        }
+        (true, true) => {
+            "the person's own /login over a pinned sign-in method under Land: the browser on their key alone, nothing of aterm's past it, then Land carries on to its landing"
+        }
+    }
+}
+
 /// The verdict of a judge's findings: a fail where any want failed, else unobserved where a want's
 /// evidence was missing, else a pass.
 fn verdict(said: String, bad: &[String], unseen: &[String]) -> Verdict {
@@ -721,6 +818,18 @@ fn picker_reason(seen: &Seen, from: i64, to: i64) -> Option<&str> {
             (l.starts_with("NOT ESCALATED ") || l.starts_with("ESCALATED "))
                 && l.contains("login method picker")
         })
+}
+
+/// The journal's word on the sign-in the settings pin from `from` to `to`: the escalation's line
+/// that yields to the standing [`LOGIN_NOT_RUN`] (`NOT ESCALATED … the notice login-not-run
+/// stands: …`), whose reason names why aterm typed no `/login` (`LoginPin::why`'s words).
+fn pin_reason(seen: &Seen, from: i64, to: i64) -> Option<&str> {
+    let stands = format!("the notice {} stands: ", LOGIN_NOT_RUN.id);
+    seen.journal
+        .iter()
+        .filter(|(t, _)| *t > from && *t < to)
+        .map(|(_, l)| l.as_str())
+        .find(|l| l.starts_with("NOT ESCALATED ") && l.contains(&stands))
 }
 
 /// A SHORT-TURN BACK-OFF PAST THE POLICY'S OWN LADDER, journaled past the person's prompt at `p`:
@@ -820,7 +929,13 @@ pub fn judge(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdict {
             acts_said(&others, t0)
         ));
     }
-    if logins.len() > 1 {
+    let played = seen.cover.login.clone().unwrap_or_default();
+    if played.forced && !logins.is_empty() {
+        bad.push(format!(
+            "/login TYPED OVER THE PINNED SIGN-IN METHOD: {}",
+            acts_said(&logins, t0)
+        ));
+    } else if logins.len() > 1 {
         bad.push(format!(
             "/login TYPED {} TIMES: {}",
             logins.len(),
@@ -854,7 +969,6 @@ pub fn judge(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdict {
             rows_said(&other_keys, t0)
         ));
     }
-    let played = seen.cover.login.clone().unwrap_or_default();
     match played.opened_before.as_deref() {
         Some(log) if !log.trim().is_empty() => bad.push(format!(
             "THE BROWSER RAN ON ATERM'S KEY: the inert browser logged, before any key of the person's: {}",
@@ -876,12 +990,33 @@ pub fn judge(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdict {
     let ups = escalations(seen, t1, gone_to);
     match h {
         Harness::Claude => {
-            if let Some(why) = played.no_pick.as_deref() {
+            let notice: &NoticeText = if played.forced {
+                &LOGIN_NOT_RUN
+            } else {
+                &LOGIN_CHOOSE
+            };
+            if played.forced {
+                said.push_str(&format!("; the settings pin the method ({PINNED_METHOD})"));
+                match pin_reason(seen, t1, gone_to) {
+                    Some(r) if r.contains(WHY_PINNED) => {
+                        said.push_str("; the need names the pin");
+                    }
+                    Some(r) => bad.push(format!(
+                        "THE NEED NAMES NO PIN: {}",
+                        one_line(r, 160)
+                    )),
+                    None if bad.is_empty() => unseen.push(
+                        "no word on the pinned sign-in in the journal, so the pin was never seen read"
+                            .to_string(),
+                    ),
+                    None => {}
+                }
+            } else if let Some(why) = played.no_pick.as_deref() {
                 unseen.push(format!(
                     "no method picker was drawn when the person came, so its wants (no key of aterm's at it, the browser left to the person) went unobserved: {why}"
                 ));
             }
-            if played.stored {
+            if played.stored && !played.forced {
                 let row = format!("`{}` row", LoginMethod::Subscription.label());
                 match picker_reason(seen, t1, gone_to) {
                     Some(r) if r.contains(&row) => {
@@ -900,18 +1035,19 @@ pub fn judge(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdict {
             }
             let told = login_exceptions(seen, t1, gone_to);
             match told[..] {
-                [(t, l)] if word(l, "notice").as_deref() == Some(LOGIN_CHOOSE.id) => {
+                [(t, l)] if word(l, "notice").as_deref() == Some(notice.id) => {
                     said.push_str(&format!(
                         "; told once at +{} ({}: {})",
                         at(t0, *t),
-                        LOGIN_CHOOSE.id,
+                        notice.id,
                         one_line(l, 120)
                     ));
                 }
                 [(t, l)] => bad.push(format!(
-                    "NOT THE PERSON'S PICK: the login's notice at +{} is not `{}`: {}",
+                    "NOT THE PERSON'S {}: the login's notice at +{} is not `{}`: {}",
+                    if played.forced { "/login" } else { "PICK" },
                     at(t0, *t),
-                    LOGIN_CHOOSE.id,
+                    notice.id,
                     one_line(l, 140)
                 )),
                 [] => {
@@ -934,7 +1070,7 @@ pub fn judge(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdict {
             }
             let band: Vec<BandRow> = posted(seen, t1, gone_to)
                 .into_iter()
-                .filter(|r| r.title.starts_with(LOGIN_CHOOSE.title))
+                .filter(|r| r.title.starts_with(notice.title))
                 .collect();
             match &band[..] {
                 [r] if r.need == "now" => {
@@ -948,7 +1084,7 @@ pub fn judge(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdict {
                 rows => bad.push(format!(
                     "{} BAND ROWS titled \"{}\" while the login was gone",
                     rows.len(),
-                    LOGIN_CHOOSE.title
+                    notice.title
                 )),
             }
         }
@@ -993,7 +1129,8 @@ pub fn judge(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdict {
 /// a pick it logged nothing of fails, as the same miss would have hidden one of aterm's), and from
 /// the person's pick (agy's and Muse Code's sign-in, where they pick nothing) to their prompt
 /// nothing of aterm's but `login-done@v1` (its Enter at `Login successful`, a real sign-in's) and
-/// no login notice but the `login-cancelled` their own Esc draws; past the prompt no `/login`, no
+/// no login notice but the one their own Esc draws (`login-cancelled` over aterm's `/login`,
+/// `login-left` over their own under a pinned method, [`Played::forced`]); past the prompt no `/login`, no
 /// login-back and no escalation again, nothing typed over the person's turn, no back-off past the
 /// policy's ladder ([`past_ladder`]), no short streak past the prompt longer than the one the act
 /// that met the wall was typed on ([`super::streak_kept`]), the login's notice or escalation
@@ -1069,17 +1206,23 @@ pub fn judge_signed_in(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdi
                 rows_said(&keys, t0)
             ));
         }
+        // The notice the person's own Esc draws: over aterm's `/login` its cancellation, over
+        // their own (a pinned method's, where aterm typed none) their sign-in left.
+        let esc_notice = if played.forced {
+            LOGIN_LEFT.id
+        } else {
+            LOGIN_CANCELLED.id
+        };
         let (escs, told): (Vec<_>, Vec<_>) = login_exceptions(seen, from, prompted)
             .into_iter()
             .partition(|(t, l)| {
-                word(l, "notice").as_deref() == Some(LOGIN_CANCELLED.id)
+                word(l, "notice").as_deref() == Some(esc_notice)
                     && played.left_ms.is_some_and(|esc| *t >= esc)
             });
         if let [(t, _)] = escs[..] {
             said.push_str(&format!(
-                "{}the person's Esc drew {} at +{}",
+                "{}the person's Esc drew {esc_notice} at +{}",
                 if said.is_empty() { "" } else { "; " },
-                LOGIN_CANCELLED.id,
                 at(t0, *t)
             ));
         }

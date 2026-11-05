@@ -5,7 +5,12 @@
 //! sealed service must separately admit a new operation against current policy.
 
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+
+#[derive(Debug, Default)]
+struct Succession {
+    retired: bool,
+    successor: Option<Prepare>,
+}
 
 #[derive(Debug)]
 pub(super) struct ClosedRestart {
@@ -13,13 +18,118 @@ pub(super) struct ClosedRestart {
     source: Arc<SharedDeath>,
     children: Vec<(Process, Arc<SharedDeath>)>,
     drain: Option<NativeDrain>,
+    resume_phase: ImagePhase,
     service_owned: bool,
-    retired: AtomicBool,
-    successor: std::sync::OnceLock<Prepare>,
+    succession: std::sync::Mutex<Succession>,
 }
 
 impl ClosedRestart {
+    #[cfg(test)]
+    pub(super) fn projected_state(&self) -> (bool, Option<Prepare>, bool) {
+        let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            succession.retired,
+            succession.successor.clone(),
+            self.children.is_empty(),
+        )
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ClosedRestartEvidence",
+            action = "LoseWatch",
+            reason = "An unavailable retained kernel object is an injected external fact"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ClosedRestartEvidence",
+            action = "SourceDies",
+            reason = "The injected kernel witness observes source death"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ClosedRestartEvidence",
+            action = "GroupDrains",
+            reason = "The injected kernel observes cohort drainage"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ClosedRestartEvidence",
+            action = "InputSettles",
+            reason = "The native input producer settles its owned work"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ClosedRestartEvidence",
+            action = "IssueExec",
+            reason = "Native Execute records the independent child grant"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ClosedRestartEvidence",
+            action = "ChildDies",
+            reason = "The retained child watch reports death"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ClosedRestartEvidence",
+            action = "ChildGroupDrains",
+            reason = "The kernel observes drainage of the issued child cohort"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ClosedRestartEvidence",
+            action = "Capture",
+            project = "native_act::tests::closed_restart_model::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ClosedRestartEvidence",
+            action = "CaptureExited",
+            project = "native_act::tests::closed_restart_model::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ContinuationPhase",
+            action = "StartRollback",
+            reason = "The existing Resume protocol establishes the active rollback phase"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ContinuationPhase",
+            action = "Capture",
+            project = "native_act::tests::continuation_phase::transition"
+        )
+    )]
     pub(super) fn capture(op: &Operation, reason: Retirement, kernel: &dyn Kernel) -> Option<Self> {
+        if matches!(
+            op.grant_record,
+            super::GrantRecord::Writing(_) | super::GrantRecord::Uncertain(_)
+        ) || (reason == Retirement::NotGranted && op.grant_record != super::GrantRecord::None)
+        {
+            return None;
+        }
         let NativePlan::Restart { process, .. } = &op.request.plan else {
             return None;
         };
@@ -57,38 +167,102 @@ impl ClosedRestart {
                 .as_ref()
                 .map(|custody| custody.drain())
                 .or_else(|| op.completion_drain.clone()),
+            resume_phase: op.resume_phase.unwrap_or(ImagePhase::Forward),
             service_owned: op
                 .authority
                 .renewal
                 .as_ref()
                 .is_some_and(|seal| seal.intent_active()),
-            retired: AtomicBool::new(false),
-            successor: std::sync::OnceLock::new(),
+            succession: std::sync::Mutex::new(Succession::default()),
         })
     }
 
     pub(super) fn pinned(&self) -> bool {
-        self.service_owned
-            && self.successor.get().is_none()
-            && !self.retired.load(Ordering::Acquire)
+        self.service_owned && self.available()
     }
 
     pub(super) fn source_watch(&self) -> Arc<SharedDeath> {
         Arc::clone(&self.source)
     }
 
+    /// Carry the rollback latch even if the next operation retires before its
+    /// first Resume. A forward continuation keeps ordinary first-Resume checks.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ContinuationPhase",
+            action = "Admit",
+            project = "native_act::tests::continuation_phase::transition"
+        )
+    )]
+    pub(super) fn initial_resume_phase(&self) -> Option<ImagePhase> {
+        (self.resume_phase == ImagePhase::Rollback).then_some(ImagePhase::Rollback)
+    }
+
+    pub(super) fn noexec(&self) -> bool {
+        // Capture only admits zero children for a positively NotGranted closure.
+        self.children.is_empty()
+    }
+
     pub(super) fn available(&self) -> bool {
-        !self.retired.load(Ordering::Acquire) && self.successor.get().is_none()
+        let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        !succession.retired && succession.successor.is_none()
+    }
+
+    pub(super) fn claimed_by(&self, request: &Prepare) -> bool {
+        let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        !succession.retired && succession.successor.as_ref() == Some(request)
     }
 
     /// Called only at the matched terminal operation's admission boundary.
     /// Exact replays use the existing child operation; absence never remints it.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ClosedRestartEvidence",
+            action = "ClaimA",
+            project = "native_act::tests::closed_restart_model::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ClosedRestartEvidence",
+            action = "ClaimB",
+            project = "native_act::tests::closed_restart_model::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ClosedRestartEvidence",
+            action = "Retry",
+            project = "native_act::tests::closed_restart_model::transition"
+        )
+    )]
     pub(super) fn claim_successor(&self, request: &Prepare) -> bool {
-        self.available() && self.successor.set(request.clone()).is_ok()
+        // Retirement can come from the service after preparation has released
+        // the predecessor's operation lock. Keep its decision and this claim
+        // in one critical section, including the availability check.
+        let mut succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        if succession.retired || succession.successor.is_some() {
+            return false;
+        }
+        succession.successor = Some(request.clone());
+        true
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ClosedRestartEvidence",
+            action = "Retire",
+            project = "native_act::tests::closed_restart_model::transition"
+        )
+    )]
     pub(super) fn retire(&self) {
-        self.retired.store(true, Ordering::Release);
+        let mut succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        succession.retired = true;
     }
 
     pub(super) fn cancelled_without_successor(
@@ -96,9 +270,12 @@ impl ClosedRestart {
         prepare: &Prepare,
         kernel: &dyn Kernel,
     ) -> bool {
+        let cancelled = {
+            let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+            succession.retired && succession.successor.is_none()
+        };
         self.predecessor == *prepare
-            && self.retired.load(Ordering::Acquire)
-            && self.successor.get().is_none()
+            && cancelled
             && self.children.is_empty()
             && self.quiescent(kernel)
     }

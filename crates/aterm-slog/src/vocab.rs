@@ -8,6 +8,10 @@ use std::fmt;
 /// Fallback token substituted for unrecognized vocabulary words.
 pub const UNKNOWN: &str = "unknown";
 
+/// What a sample key ([`crate::Cap::Sample`]) holds where aterm could not take the sample: never
+/// a `0` that reads as a measurement.
+pub const UNAVAILABLE: &str = "unavailable";
+
 /// Record operation on a log node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
@@ -228,6 +232,7 @@ kinds! {
     Shown => "shown",
     Row => "row",
     MailGap => "mail-gap",
+    Tab => "tab",
 }
 
 impl Kind {
@@ -313,6 +318,7 @@ impl Kind {
                 | Kind::Shown
                 | Kind::Row
                 | Kind::MailGap
+                | Kind::Tab
         )
     }
 
@@ -551,9 +557,15 @@ pub enum Actor {
     Vendor,
     /// A session, by its sid (an edge-token connection).
     Sid(ShortId),
+    /// Another Mac driving this one over the fleet: `fleet:<host>`, the whole token held
+    /// ([`Actor::fleet`]).
+    Fleet(ShortId),
     /// Not attributable: `-`.
     Nobody,
 }
+
+/// The prefix of a fleet driver's actor token ([`Actor::Fleet`]).
+pub const FLEET_ACTOR_PREFIX: &str = "fleet:";
 
 impl Actor {
     /// Wire token for this actor.
@@ -567,7 +579,7 @@ impl Actor {
             Actor::Aterm => "aterm",
             Actor::Vendor => "vendor",
             Actor::Sid(sid) if is_reserved_actor_word(sid.as_str()) => "-",
-            Actor::Sid(sid) => sid.as_str(),
+            Actor::Sid(sid) | Actor::Fleet(sid) => sid.as_str(),
             Actor::Nobody => "-",
         }
     }
@@ -582,6 +594,30 @@ impl Actor {
         }
     }
 
+    /// The fleet driver `host` (another Mac as this one's fleet book names it): `fleet:<host>`,
+    /// each byte outside the id alphabet as `-` and the host cut to fit [`ShortId::MAX`];
+    /// [`Actor::Nobody`] for a host with nothing left.
+    #[must_use]
+    pub fn fleet(host: &str) -> Actor {
+        let room = ShortId::MAX - FLEET_ACTOR_PREFIX.len();
+        let host: String = host
+            .trim()
+            .chars()
+            .map(|c| {
+                if c.is_ascii() && is_id_byte(c as u8) {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .take(room)
+            .collect();
+        if host.is_empty() {
+            return Actor::Nobody;
+        }
+        ShortId::new(&format!("{FLEET_ACTOR_PREFIX}{host}")).map_or(Actor::Nobody, Actor::Fleet)
+    }
+
     /// Parse an [`Actor`] from its wire token.
     #[must_use]
     pub fn from_word(word: &str) -> Actor {
@@ -593,6 +629,13 @@ impl Actor {
             "aterm" => Actor::Aterm,
             "vendor" => Actor::Vendor,
             "-" => Actor::Nobody,
+            other if other.starts_with(FLEET_ACTOR_PREFIX) => {
+                if other.len() > FLEET_ACTOR_PREFIX.len() {
+                    ShortId::new(other).map_or(Actor::Nobody, Actor::Fleet)
+                } else {
+                    Actor::Nobody
+                }
+            }
             other => ShortId::new(other).map_or(Actor::Nobody, Actor::sid),
         }
     }
@@ -717,6 +760,8 @@ pub const OUT_WORDS: &[&str] = &[
     "ui-close",
     "window-close",
     "app-quit",
+    // aterm's reaper of workers' tabs closed it once its task concluded (`ExitReason::Reaper`).
+    "reaper",
 ];
 
 /// Closed need vocabulary (`need` and `clear` marks).
@@ -867,6 +912,7 @@ pub const WHY_WORDS: &[&str] = &[
     "off-ctl",
     "expired",
     "repeated",
+    "usage-limit",
     // A post the bridge retired undelivered (`mail-landed why=`, aterm_types'
     // `DeadReason`; `not-carried` and `log-replaced` above are aterm's own).
     "undeliverable",
@@ -878,13 +924,27 @@ pub const WHY_WORDS: &[&str] = &[
     // kernel confirms the agent, or nothing does and the harness only observes it.
     "confirmed",
     "unconfirmed",
+    // Why a tab opened or closed (`tab why=`): the gesture that opened it, or the act of aterm's
+    // own that opened or closed it.
+    "new-tab",
+    "new-window",
+    "split",
+    "spawn",
+    "task",
+    "connect",
+    "claim-credits",
+    "free-disk",
+    "summarize",
+    "concluded",
+    "unstarted",
 ];
 
 /// Closed `input verb=` vocabulary.
 pub const VERB_WORDS: &[&str] = &["send", "key", "paste", "feed", "turn", "unknown"];
 
-/// Closed `act=` control-input action vocabulary.
-pub const ACT_WORDS: &[&str] = &["approve", "deny", "answer"];
+/// Closed `act=` vocabulary: a control input's action ([`crate::ActWord`]), then a tab's
+/// ([`crate::TabAct`]).
+pub const ACT_WORDS: &[&str] = &["approve", "deny", "answer", "open", "close", "keep"];
 
 /// Closed `pool=` rate-limiter pool vocabulary.
 pub const POOL_WORDS: &[&str] = &["shared"];

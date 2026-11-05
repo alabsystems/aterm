@@ -851,6 +851,7 @@ impl App {
                 ));
             }
             HostNote::CreditClaim { sid, offer } => self.start_credit_claim(&sid, offer),
+            HostNote::CreditClaimNotReady { why } => self.credit_claim_not_ready(&why),
             HostNote::ProgramCheckStuck { workers, limit } => {
                 self.post_message(message_reporters::program_check_stuck(workers, limit));
             }
@@ -869,7 +870,7 @@ impl App {
             HostNote::ServiceMemory { told, admin } => self.service_memory(&told, admin),
             HostNote::DiskLooked => {
                 self.vitals_disk_looked(Instant::now());
-                self.end_claim_workers(Instant::now());
+                self.reap_workers(Instant::now());
             }
             HostNote::DiskSettingsRead => {
                 self.host_noted.remove(DISK_CLEANUP_OFF_NOTED);

@@ -528,9 +528,12 @@ fn open_gate(path: &Path) -> Option<std::fs::File> {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     aterm_durable::ordered(&file).ok()?;
     let parent = creation::pin(path.parent()?)?;
     creation::sync_directory(&parent, creation::Point::Gate)?;
@@ -599,19 +602,13 @@ fn marker_binds(marker: &Receipt, receipt: &Receipt) -> bool {
 #[cfg(unix)]
 fn write(path: &Path, receipt: &Receipt) -> Option<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     let parent = path.parent()?;
     let stage = aterm_tempfile::Builder::new()
         .prefix("cache-receipt-")
         .tempdir_in(parent)
         .ok()?;
     let pending = stage.path().join("receipt");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&pending)
-        .ok()?;
+    let mut file = crate::platform::open_create_new_write(&pending, 0o600).ok()?;
     let bytes = aterm_json::to_vec(receipt).ok()?;
     if bytes.len() > MAX_RECORD {
         return None;
@@ -771,9 +768,12 @@ fn create_with_policy(
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(index.join("locks.noindex/admission.lock"))
             .ok()?;
+        if !admission.metadata().ok()?.is_file() {
+            return None;
+        }
         let _admission = crate::lock::Flock::lock(admission).ok()?;
         let key = key(root)?;
         let path = index.join(format!("{key}.json"));
@@ -1468,6 +1468,23 @@ fn under_shared_cache(home: &Path, path: &Path, machine: &super::Machine<'_>) ->
             .is_some_and(|rest| rest.components().any(|c| c.as_os_str() == super::LEAF))
 }
 
+/// Whether the package whose manifest is `manifest` (a path to a `Cargo.toml` or `Targo.toml`,
+/// read through its links as [`workspace`] reads it) lies where atpkg never manages a workspace:
+/// its folder outside [`scope`], as HOME itself, a path outside HOME, a folder of HOME atpkg
+/// never looks into, app data and a file provider's domain are. A build of it owes no managed
+/// custody, wherever its target is.
+fn never_managed(home: &Path, manifest: &Path) -> bool {
+    let resolved = std::fs::canonicalize(manifest).unwrap_or_else(|_| manifest.to_path_buf());
+    resolved
+        .parent()
+        .is_none_or(|package| !scope(home, package))
+}
+
+/// Whether a producer call owes managed custody of its output ([`observe_for_producer`] refuses
+/// it when none can be established): it names a target or build directory under HOME outside
+/// the shared cache, or one atpkg cannot resolve, for a package atpkg could manage. A call whose
+/// manifest lies outside HOME, or that names none and runs outside HOME or in no package there,
+/// owes none, as does one whose package [`never_managed`] names.
 fn requires_managed_explicit(args: &[String], home: &Path, machine: &super::Machine<'_>) -> bool {
     let mut manifest_arg = None;
     let mut words = args.iter().map(String::as_str);
@@ -1488,7 +1505,7 @@ fn requires_managed_explicit(args: &[String], home: &Path, machine: &super::Mach
     let scan_cwd = if let Some(raw) = manifest_arg {
         if !raw.is_empty() {
             if let Some(manifest) = normalize_with_cwd(PathBuf::from(raw), machine.cwd) {
-                if !manifest.starts_with(home) {
+                if !manifest.starts_with(home) || never_managed(home, &manifest) {
                     return false;
                 }
                 manifest
@@ -1506,17 +1523,17 @@ fn requires_managed_explicit(args: &[String], home: &Path, machine: &super::Mach
         let Some(cwd) = machine.cwd.filter(|c| c.starts_with(home) && *c != home) else {
             return false;
         };
-        let has_manifest = cwd
+        let found = cwd
             .ancestors()
             .take_while(|p| p.starts_with(home) && *p != home)
             .take(32)
-            .any(|dir| {
-                super::checkout::MANIFESTS.iter().any(|name| {
-                    let path = dir.join(name);
-                    !matches!((machine.read)(&path), Ok(None)) || path.is_file()
-                })
+            .find_map(|dir| {
+                super::checkout::MANIFESTS
+                    .iter()
+                    .map(|name| dir.join(name))
+                    .find(|path| !matches!((machine.read)(path), Ok(None)) || path.is_file())
             });
-        if !has_manifest {
+        if found.is_none_or(|manifest| never_managed(home, &manifest)) {
             return false;
         }
         cwd.to_path_buf()
@@ -2019,7 +2036,7 @@ pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
             continue;
         }
         let idle = super::age(now, seen.newest);
-        if idle >= super::RECLAIM_GONE && owners_gone(home, &receipt, None) {
+        if owners_gone(home, &receipt, None) {
             // An unheld whole-root retirement already contains these stages.
             if !held {
                 planned.truncate(stage_start);
@@ -2027,10 +2044,7 @@ pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
             planned.push(super::Planned {
                 path: cache.root.clone(),
                 paths: vec![cache.root],
-                why: super::Unused::Gone {
-                    idle,
-                    after: super::RECLAIM_GONE,
-                },
+                why: super::Unused::Gone { idle },
                 held,
                 stays: None,
             });
@@ -2297,7 +2311,6 @@ fn reclaim_selected_on(
                     &receipt,
                     &pending,
                     coordination.as_ref(),
-                    fence,
                 ) {
                     Ok(left) => left,
                     Err(revoked) => {
@@ -2354,10 +2367,8 @@ fn reclaim_selected_on(
                     .or_else(|| {
                         gone.then(|| {
                             super::unused(&cache.root, &|seen| {
-                                let idle = super::age(now, seen.newest);
-                                (idle >= after.gone).then_some(super::Unused::Gone {
-                                    idle,
-                                    after: after.gone,
+                                Some(super::Unused::Gone {
+                                    idle: super::age(now, seen.newest),
                                 })
                             })
                         })
@@ -2467,7 +2478,6 @@ fn reclaim_selected_on(
                 &receipt,
                 pending,
                 coordination.as_ref(),
-                fence,
             ) {
                 Ok(left) => left,
                 Err(revoked) => {
@@ -2563,13 +2573,11 @@ fn remove_pending(
     receipt: &Receipt,
     pending: &Pending,
     coordination: Option<&package::Coordination>,
-    fence: &super::fence::Fence<'_>,
 ) -> Result<super::remove::Left, super::remove::Revoked> {
     let payload = pending.directory.join(PAYLOAD);
     // Custody is read by path above the payload, its stage's own included; the payload's own is
     // the walk's to read, through the folder it holds ([`retention::allows_walk`]).
     let permitted = || {
-        fence.working();
         retention::allows(path, receipt)
             && retention::allows_walk(&payload)
             && coordination.is_none_or(package::Coordination::removal_allowed)
@@ -2783,10 +2791,7 @@ mod tests {
             reclaim_on(
                 &world.home,
                 world.later(),
-                super::super::ReclaimAfter {
-                    gone: Duration::ZERO,
-                    ..super::super::ReclaimAfter::CALM
-                },
+                super::super::ReclaimAfter::CALM,
                 None,
                 &mut |_, _| true,
                 &fence
@@ -3027,10 +3032,7 @@ mod tests {
             let removed = reclaim_selected_on(
                 &world.home,
                 SystemTime::now(),
-                super::super::ReclaimAfter {
-                    gone: Duration::ZERO,
-                    ..super::super::ReclaimAfter::CALM
-                },
+                super::super::ReclaimAfter::CALM,
                 None,
                 &mut |_, _| true,
                 &super::super::fence::Fence::new(&clear),
@@ -3803,7 +3805,6 @@ mod tests {
             world.later(),
             true,
             None,
-            &|| {},
             &mut |_, why| {
                 asked.push(why);
                 asked.len() <= 2
@@ -3837,14 +3838,7 @@ mod tests {
         std::fs::create_dir_all(&unit).unwrap();
         let folder = live_in_shared_cache(&world);
         let pass = |record: &mut dyn FnMut(&Path, super::super::Unused) -> bool| {
-            super::super::reclaim_beside_sessions(
-                &world.home,
-                world.later(),
-                true,
-                None,
-                &|| {},
-                record,
-            )
+            super::super::reclaim_beside_sessions(&world.home, world.later(), true, None, record)
         };
 
         let mut asked = Vec::new();
@@ -3882,7 +3876,6 @@ mod tests {
             world.later(),
             true,
             None,
-            &|| {},
             &mut |_, why| {
                 let dead = matches!(why, super::super::Unused::Gone { .. });
                 gone += usize::from(dead);
@@ -3891,27 +3884,6 @@ mod tests {
         );
         assert_eq!(gone, 1);
         assert!(world.target.is_dir() && !folder.exists());
-    }
-
-    /// A REGISTERED CACHE'S REMOVAL SAYS IT IS WORKING: nothing else of its pass does.
-    #[test]
-    fn a_registered_removal_says_it_is_working() {
-        let world = World::new();
-        world.build();
-        std::fs::remove_dir_all(&world.owner).unwrap();
-        let heard = std::cell::Cell::new(false);
-        let hears = || heard.set(true);
-        let fence = super::super::fence::Fence::default().telling(&hears);
-        let went = reclaim_on(
-            &world.home,
-            world.later(),
-            super::super::ReclaimAfter::CALM,
-            None,
-            &mut |_, _| true,
-            &fence,
-        );
-        assert!(!world.target.exists(), "{went:?}");
-        assert!(heard.get());
     }
 
     #[test]
@@ -4606,6 +4578,19 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn through_clean_front(world: &World, tool: &Path, words: &[String]) -> std::process::Output {
+        through_clean_front_in(world, &world.owner, tool, words, None)
+    }
+
+    /// [`through_clean_front`] run in `cwd`, with `CARGO_TARGET_DIR` set to `target_env` when one
+    /// is given.
+    #[cfg(target_os = "macos")]
+    fn through_clean_front_in(
+        world: &World,
+        cwd: &Path,
+        tool: &Path,
+        words: &[String],
+        target_env: Option<&Path>,
+    ) -> std::process::Output {
         let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
         // Terse progress leaves the exec'd tool's first output line unprefixed.
         command
@@ -4616,7 +4601,7 @@ mod tests {
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .current_dir(&world.owner)
+            .current_dir(cwd)
             .env_clear()
             .env("HOME", &world.home)
             .env(CLEAN_FRONT_HOME, &world.home)
@@ -4629,7 +4614,71 @@ mod tests {
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);
         }
+        if let Some(target) = target_env {
+            command.env("CARGO_TARGET_DIR", target);
+        }
         aterm_uds::deadline::ends_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+    }
+
+    /// `verify provision`'s fish build through the real shim front, its words as the shim hands
+    /// them on (`-`: its block leaves a `*.noindex` target unplaced): the source and its
+    /// `--target-dir`, named again in `CARGO_TARGET_DIR`, in one scratch under
+    /// `~/Library/Caches`, run from that scratch. HOME's `Library` is a folder atpkg never manages
+    /// a workspace in, as it manages none outside HOME, so the front hands the build on and claims
+    /// nothing for it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_front_hands_on_a_build_of_a_workspace_atpkg_never_manages() {
+        let world = World::new();
+        let scratch = world
+            .home
+            .join("Library/Caches/aterm/tooling.noindex/.provision-fish-1_0_0");
+        let src = scratch.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("Cargo.toml"),
+            "[package]\nname = 'fish'\nversion = '4.9.3'\n",
+        )
+        .unwrap();
+        let target = scratch.join("target.noindex");
+        let manifest = src.join("Cargo.toml").display().to_string();
+        let target_dir = target.display().to_string();
+        let words: Vec<String> = [
+            "--unverified",
+            "build",
+            "--release",
+            "--locked",
+            "--no-default-features",
+            "--manifest-path",
+            manifest.as_str(),
+            "--target-dir",
+            target_dir.as_str(),
+        ]
+        .map(String::from)
+        .into();
+        // Echo is an in-place tool: its line proves the front handed it these words, not 75.
+        let out = through_clean_front_in(
+            &world,
+            &scratch,
+            Path::new("/bin/echo"),
+            &words,
+            Some(&target),
+        );
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|line| line == words.join(" ")),
+            "{out:?}"
+        );
+        assert!(!target.exists(), "nothing is claimed for it");
+        assert!(
+            !world
+                .home
+                .join(INDEX)
+                .join(format!("{}.json", key(&target).unwrap()))
+                .exists()
+        );
     }
 
     #[cfg(target_os = "macos")]

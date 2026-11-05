@@ -195,7 +195,8 @@ fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
     );
     aterm_json::from_str::<Value>(&text)
         .map_err(|e| format!("the lane's own JSON does not parse: {e}"))?;
-    std::fs::write(path, text).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    crate::write_fresh(path, text)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     Ok(format!("summary above; every report in {}", path.display()))
 }
 

@@ -606,7 +606,7 @@ pub fn open_regular_write(path: &Path, append_existing: bool) -> std::io::Result
         if !append_existing {
             open.mode(0o600);
         }
-        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     #[cfg(windows)]
     {

@@ -821,6 +821,82 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
     );
 }
 
+/// What a sync says of the rows it added to a pool no upkeep tries names `renew` alone: an
+/// Antigravity row's browser window leaves it no route. CONTROL: Kimi Code CLI's names `browser`.
+#[test]
+fn a_synced_antigravity_row_is_told_only_renew() {
+    for (cli, names_browser) in [(Cli::Agy, false), (Cli::Kimi, true)] {
+        let root = aterm_tempfile::TempDir::new().unwrap();
+        let home = root.path().join("home");
+        let state = root.path().join("state");
+        let config = root.path().join("config");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&config).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let toml = config.join("aterm.toml");
+        fs::write(&toml, "").unwrap();
+        let region = if cli == Cli::Kimi {
+            "region = \"global\"\n"
+        } else {
+            ""
+        };
+        let fetch = |_: &Env, _: &str| -> Result<String, String> {
+            Ok(format!(
+                "[[account]]\nlabel = \"ann\"\nemail = \"ann@example.com\"\n\
+                 machines = [\"m16\"]\n{region}"
+            ))
+        };
+        let env = Env {
+            state,
+            aterm_state: None,
+            cwd: home.clone(),
+            home: Some(home.clone()),
+            claude_dir: Some(home.join(".claude")),
+            claude_config_unusable: None,
+            claude_profile: Some(home.join(".claude.json")),
+            claude_custom_oauth: false,
+            claude_session: None,
+            claude_pid: None,
+            codex_thread: None,
+            agy_conversation: None,
+            codex_home: None,
+            codex_login: None,
+            now: NOW,
+            tz_s: 0,
+            sid: String::new(),
+            sock: None,
+            config: Some(toml),
+            claude_tmp: None,
+            claude_running: None,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_cli_accounts_sync_with(
+            cli,
+            (&env, None),
+            (Some("accounts.toml"), Some("m16"), false),
+            (&mut out, &mut err),
+            &fetch,
+        );
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8_lossy(&err).into_owned(),
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "{}: {err}", cli.id());
+        let said = out
+            .lines()
+            .find(|line| line.starts_with("not signed in yet: "))
+            .unwrap_or_else(|| panic!("{}: {out}", cli.id()));
+        assert!(said.contains("accounts renew"), "{}: {out}", cli.id());
+        assert!(!said.contains("by itself"), "{}: {out}", cli.id());
+        assert_eq!(
+            said.contains("accounts browser"),
+            names_browser,
+            "{}: {out}",
+            cli.id()
+        );
+    }
+}
+
 /// A FIRST LAB SYNC LISTS ONE ACCOUNT ONCE: where Codex's default login names an account the lab
 /// prefers here, that row is the default login's (its lab label, its address, no login directory),
 /// so no `main` stands beside it; where the lab knows the account and prefers it elsewhere, it joins

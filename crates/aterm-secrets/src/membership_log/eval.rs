@@ -1429,6 +1429,21 @@ impl<'a> Graph<'a> {
                 }
             }
         }
+        // A seat a later `Admit` superseded (its node key, writer key or recipient moved to a new
+        // seat) is still a removed Mac's for the epochs: where no current member and no waiting
+        // founder holds its recipient, that recipient counts as removed, so a newest epoch that
+        // still wraps it is due a rotation (`Log::rekey_dues`) until one is minted without it.
+        // Read only here, after the node index and the labels above: the moved node key and the
+        // label stay the new seat's (one-mesh A15; A8's churn run found the old seat of a Mac
+        // back by `allow --again` still wrapped by every newest `[everyone]` epoch).
+        for removed_actor in superseded_by.keys() {
+            if let Some(&recipient) = seat_recipients.get(removed_actor)
+                && !members.values().any(|m| m.binding.recipient() == recipient)
+                && !unproved.iter().any(|f| f.recipient == recipient)
+            {
+                removed_recipients.insert(recipient);
+            }
+        }
         Membership {
             members,
             removed,

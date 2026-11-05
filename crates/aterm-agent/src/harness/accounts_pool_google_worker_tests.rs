@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Synthetic canonical capabilities exercise worker admission, never live authentication.
+//! Synthetic published grants exercise worker admission, never live authentication.
 
 use super::super::{agy_signin, worker};
 use super::*;
@@ -92,7 +92,7 @@ impl World {
 
     fn prepare(&self) -> Result<Option<GooglePoolWorker>, String> {
         prepare_google_worker_with(&self.seat(), self.starter(), |row, profile| {
-            Ok(agy_signin::publication_fixture(
+            Ok(agy_signin::published_fixture(
                 &self.state,
                 profile,
                 &row.label,
@@ -103,16 +103,22 @@ impl World {
 }
 
 #[test]
-fn native_google_worker_rechecks_selection_after_canonical_verification() {
+fn native_google_worker_rechecks_selection_after_its_local_check() {
     for change in 0..6 {
         let world = World::new(Some([1; 32]));
         let config = world.config.join("aterm.toml");
-        std::fs::write(&config, "[harness]\naccounts='wall'\n").unwrap();
+        aterm_uds::atomic_file::write(&config, ("[harness]\naccounts='wall'\n").as_ref(), 0o600)
+            .unwrap();
         let result = prepare_google_worker_with(&world.seat(), world.starter(), |row, profile| {
-            let grant = agy_signin::publication_fixture(&world.state, profile, &row.label, EMAIL);
+            let grant = agy_signin::published_fixture(&world.state, profile, &row.label, EMAIL);
             match change {
                 0 => {
-                    std::fs::write(&config, "[harness]\naccounts='off'\n").unwrap();
+                    aterm_uds::atomic_file::write(
+                        &config,
+                        ("[harness]\naccounts='off'\n").as_ref(),
+                        0o600,
+                    )
+                    .unwrap();
                 }
                 1 | 2 | 5 => {
                     world
@@ -140,7 +146,7 @@ fn native_google_worker_rechecks_selection_after_canonical_verification() {
                         .unwrap();
                 }
                 3 => {
-                    std::fs::write(&config, "[harness").unwrap();
+                    aterm_uds::atomic_file::write(&config, ("[harness").as_ref(), 0o600).unwrap();
                 }
                 4 => {
                     world
@@ -165,7 +171,7 @@ fn native_google_worker_rechecks_selection_after_canonical_verification() {
 }
 
 #[test]
-fn native_google_worker_checks_execution_authority_before_google() {
+fn native_google_worker_checks_execution_authority_before_its_grant_check() {
     for preparation_only in [false, true] {
         let world = World::new(Some([1; 32]));
         world
@@ -186,7 +192,7 @@ fn native_google_worker_checks_execution_authority_before_google() {
             .unwrap();
         assert!(
             prepare_google_worker_with(&world.seat(), world.starter(), |_, _| panic!(
-                "refused account reached Google"
+                "refused account reached its grant check"
             ))
             .is_err()
         );
@@ -252,25 +258,19 @@ fn native_google_worker_keeps_exact_profile_and_rechecks_before_admission() {
                 })
                 .unwrap();
         } else {
-            aterm_secrets::fsx::write_atomic(
-                &world
-                    .profile
-                    .join(".gemini/antigravity-cli/antigravity-oauth-token"),
-                b"replaced",
-                0o600,
-            )
-            .unwrap();
+            // A grant agy rewrote is still its login; one that is gone signs the row out here.
+            let grant = super::super::upgrade_agy::profile_grant(&world.profile);
+            aterm_secrets::fsx::write_atomic(&grant, b"renewed by agy", 0o600).unwrap();
+            assert!(guard.starter().is_ok());
+            std::fs::remove_file(&grant).unwrap();
         }
         assert!(guard.starter().is_err());
     }
 }
 
 #[test]
-fn native_google_worker_refuses_unproved_or_changed_provider_identity() {
-    for principal in [None, Some([2; 32])] {
-        let world = World::new(principal);
-        assert!(world.prepare().is_err());
-    }
+fn native_google_worker_refuses_an_unproved_identity_or_ambiguous_home() {
+    assert!(World::new(None).prepare().is_err());
     let world = World::new(Some([1; 32]));
     let mut starter = world.starter();
     starter
@@ -278,7 +278,7 @@ fn native_google_worker_refuses_unproved_or_changed_provider_identity() {
         .push(("HOME".into(), world.home.to_str().unwrap().into()));
     assert!(
         prepare_google_worker_with(&world.seat(), starter, |_, _| panic!(
-            "ambiguous home reached Google"
+            "ambiguous home reached its grant check"
         ))
         .is_err()
     );
@@ -291,14 +291,14 @@ fn native_google_worker_refuses_unproved_or_changed_provider_identity() {
         .into();
     assert!(
         prepare_google_worker_with(&world.seat(), orphan, |_, _| panic!(
-            "orphan reached Google"
+            "orphan reached its grant check"
         ))
         .is_err()
     );
 }
 
 #[test]
-fn native_google_worker_recovers_rejected_grant_once_in_new_home() {
+fn native_google_worker_renews_a_signed_out_row_once_in_new_home() {
     for scenario in 0..4 {
         let world = World::new(Some([1; 32]));
         let next = world.home.join(".aterm/logins/agy/replacement");
@@ -312,20 +312,21 @@ fn native_google_worker_recovers_rejected_grant_once_in_new_home() {
                 checks.set(checks.get() + 1);
                 if checks.get() == 1 {
                     assert_eq!(profile, world.profile);
-                    return Err(super::super::google_profile::Error::CredentialRejected);
+                    return Err(agy_signin::PublishedRefusal::SignedOut);
                 }
                 assert_eq!(profile, next);
                 if scenario == 1 {
-                    return Err(super::super::google_profile::Error::CredentialRejected);
+                    return Err(agy_signin::PublishedRefusal::SignedOut);
                 }
                 if scenario == 3 {
-                    std::fs::write(
-                        world.config.join("aterm.toml"),
-                        "[harness]\naccounts='off'\n",
+                    aterm_uds::atomic_file::write(
+                        &(world.config.join("aterm.toml")),
+                        ("[harness]\naccounts='off'\n").as_ref(),
+                        0o600,
                     )
                     .unwrap();
                 }
-                Ok(agy_signin::publication_fixture(
+                Ok(agy_signin::published_fixture(
                     &world.state,
                     profile,
                     &row.label,
@@ -379,24 +380,20 @@ fn native_google_worker_recovers_rejected_grant_once_in_new_home() {
 
 #[test]
 fn native_google_worker_renewal_is_not_a_general_failure_retry() {
-    for change in 0..5 {
+    for change in 0..4 {
         let world = World::new(Some([1; 32]));
         let result = recover_google_worker_with(
             &world.seat(),
             world.starter(),
             |_, _| {
                 if change == 0 {
-                    return Err(super::super::google_profile::Error::Refused(
-                        "network unavailable",
-                    ));
-                }
-                if change == 4 {
-                    return Err(super::super::google_profile::Error::Unavailable);
+                    return Err(agy_signin::PublishedRefusal::Refused("profile is held"));
                 }
                 if change == 1 {
-                    std::fs::write(
-                        world.config.join("aterm.toml"),
-                        "[harness]\naccounts='off'\n",
+                    aterm_uds::atomic_file::write(
+                        &(world.config.join("aterm.toml")),
+                        ("[harness]\naccounts='off'\n").as_ref(),
+                        0o600,
                     )
                     .unwrap();
                 } else if change == 2 {
@@ -419,7 +416,7 @@ fn native_google_worker_renewal_is_not_a_general_failure_retry() {
                         })
                         .unwrap();
                 }
-                Err(super::super::google_profile::Error::CredentialRejected)
+                Err(agy_signin::PublishedRefusal::SignedOut)
             },
             |_, _| panic!("failure or changed selection reached authentication"),
         );
@@ -436,10 +433,46 @@ fn native_google_worker_failed_renewal_never_rechecks_or_launches() {
         world.starter(),
         |_, _| {
             checks.set(checks.get() + 1);
-            Err(super::super::google_profile::Error::CredentialRejected)
+            Err(agy_signin::PublishedRefusal::SignedOut)
         },
         |_, _| Err("staged login refused".into()),
     );
     assert!(result.is_err());
     assert_eq!(checks.get(), 1);
+}
+
+/// A launch on a row whose published grant is gone runs the real local check: it answers signed
+/// out with no provider read on record, and the launch's one staged sign-in follows.
+#[test]
+fn native_google_worker_launch_on_a_missing_grant_signs_in_without_a_provider_read() {
+    let world = World::new(Some([1; 32]));
+    let program = world.home.join("agy");
+    aterm_secrets::fsx::write_atomic(&program, b"never run", 0o600).unwrap();
+    let renewals = std::cell::Cell::new(0);
+    let (result, probes) = super::super::provider_read::captured(|| {
+        recover_google_worker_with(
+            &world.seat(),
+            world.starter(),
+            |row, profile| {
+                agy_signin::check_google_published(
+                    &program,
+                    &world.state,
+                    &row.label,
+                    EMAIL,
+                    profile,
+                )
+            },
+            |_, _| {
+                renewals.set(renewals.get() + 1);
+                Err("staged login refused".into())
+            },
+        )
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        renewals.get(),
+        1,
+        "a signed-out row is the launch's sign-in"
+    );
+    assert!(probes.is_empty());
 }

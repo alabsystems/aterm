@@ -1264,6 +1264,7 @@ fn unstarted_findings_list_by_pid_whatever_order_they_come_in() {
         aterm: true,
         wait,
         tab: None,
+        job: None,
         started_ms: None,
     };
     let su = |stopped, traced| StartWait::StoppedUnstarted { stopped, traced };
@@ -9325,5 +9326,219 @@ fn a_front_waits_for_memory_only_while_its_ledger_says_its_claim_waits() {
     assert!(
         waiting.contains(" exe=targo class=waiting wait=memory "),
         "{waiting}"
+    );
+}
+
+/// The codex in front of tab 1, whose unified-exec calls the facts scenario starts.
+const CODEX: u32 = 1300;
+
+/// A call codex's unified exec starts with no terminal (`exec_command`'s default `tty=false`,
+/// codex-rs/core/src/tools/handlers/unified_exec.rs `default_tty`): its leader is a session and a
+/// group of its own (codex's `detach_from_tty`, a `setsid`) with stdin on `/dev/null`, a child of
+/// the codex in front of tab 1.
+fn codex_pipe_call(w: &mut World, pid: u32) {
+    let mut p = Proc::new(pid, CODEX, "perl");
+    p.sid = pid;
+    p.fds.push(aterm_vitals::jobs::Fd {
+        fd: 0,
+        kind: aterm_vitals::jobs::FdKind::Device {
+            tty: false,
+            read: true,
+            ctty: false,
+        },
+    });
+    w.add(p);
+}
+
+/// Descriptor `fd` on the scenario's lock file, which `perl -MFcntl=:flock` opened to `flock` it.
+fn lock_fd(fd: i32) -> aterm_vitals::jobs::Fd {
+    aterm_vitals::jobs::Fd {
+        fd,
+        kind: aterm_vitals::jobs::FdKind::File {
+            regular: true,
+            size: 0,
+            dev: 1,
+            ino: 4_242,
+            lf_tail: None,
+            fresh_dylib: false,
+        },
+    }
+}
+
+/// A codex call's descriptors 1 and 2 on codex's own pipe, `handle` its write end.
+fn codex_pipe(p: &mut Proc, handle: u64) {
+    for fd in [1, 2] {
+        p.fds.push(pipe_end(fd, handle, handle + 1, true, 0, 0));
+    }
+}
+
+/// The facts scenario's world at the end of its waiter's rhythm: codex in front of tab 1, the
+/// holder's call (pid 4100) stopped with the lock, and the waiter's call (pid 4200), which printed
+/// a tick every 0.25 s for 15 s into `facts-ticks.log` (`into_file`) or into codex's own pipe, and
+/// now blocks in `flock`. Every tick codex redraws its screen, which is its own job's output and no
+/// call's.
+fn codex_lock_waiter(into_file: bool) -> World {
+    const RHYTHM_MS: u64 = 15_000;
+    let mut w = World::new();
+    w.run_fg(1, 5, "codex", sleeper(CODEX, "codex"));
+    codex_pipe_call(&mut w, 4100);
+    codex_pipe(w.p(4100), 41_000);
+    w.p(4100).fds.push(lock_fd(3));
+    let _ = w.tick(TICK_MS);
+    w.p(4100).state = ProcState::Stopped;
+    let _ = w.tick(TICK_MS);
+    codex_pipe_call(&mut w, 4200);
+    let ticks = (1, 94_200);
+    if into_file {
+        w.files.insert(
+            ticks,
+            OutFile {
+                size: 0,
+                per_s: 32,
+                lf: Some(true),
+            },
+        );
+        w.p(4200).out = Some(ticks);
+    } else {
+        codex_pipe(w.p(4200), 42_000);
+        // Even read as logical writes, 32 B/s is far under the side-writes allowance.
+        w.p(4200).writes_per_s = 32;
+    }
+    w.p(4200).wakeups_per_s = 4;
+    let _ = run_to(&mut w, RHYTHM_MS, |w, _| w.line_from(1, &[CODEX]));
+    if let Some(file) = w.files.get_mut(&ticks) {
+        file.per_s = 0;
+    }
+    w.p(4200).writes_per_s = 0;
+    w.p(4200).wakeups_per_s = 0;
+    w.p(4200).fds.push(lock_fd(3));
+    w
+}
+
+/// GAP 23'S CALL SHAPE, the one `codex-alab-proof --facts-only` has its model run: a call codex's
+/// unified exec starts with no terminal is the agent's detached call (consumer `agent`), and one
+/// that printed a fast rhythm into a file, then blocks in `flock` on a lock a stopped call of
+/// earlier holds, reads `no_progress` once φ reaches 8 over its own μ (the 10 s floor): 184 s of
+/// quiet, so not at the leg's first turn end (130 s in) and at its second (260 s in). Unsampled,
+/// the lock wait is Tier A's unnamed one (macOS reads no wait channel), capped at quiet, the one
+/// suspect standing that can read `no_progress`: a Tier B naming (`sys name`, never passive) would
+/// make it a lock behind a stopped holder, stuck-capable, which reads stuck instead
+/// ([`a_named_lock_counts_by_its_holder_after_polling_and_expires_on_progress`]). The holder's
+/// call, stopped outside job control, is a stuck-capable suspect of its own (on the 60 s prior,
+/// so still fine here) and never `no_progress`; with the waiter it keeps the engine at its fast
+/// cadence (2 s), so a reading is never older than the 5 s a fact may be told from. NEGATIVE CONTROL: the same rhythm written
+/// into codex's own pipe is progress the engine cannot see (no file, no terminal), so the call's μ
+/// is the 60 s prior and it reads `no_progress` only past 18 min of quiet.
+#[test]
+fn a_codex_pipe_call_blocked_on_a_stopped_holders_lock_reads_no_progress_after_its_rhythm() {
+    let phi_stuck_quiet = |mu: u64| (8 * mu * 2_302_585).div_ceil(1_000_000);
+    let mut w = codex_lock_waiter(true);
+    let mut first = None;
+    let mut at_first_turn = None;
+    for n in 1..=150_u64 {
+        let v = w.tick(TICK_MS);
+        assert_eq!(v.demand, Demand::Fast, "tick {n}: {:?}", v.rows);
+        let holder = v.row("a4100").expect("the holder's call");
+        assert_eq!(
+            (
+                holder.kind,
+                holder.class,
+                holder.standing,
+                holder.no_progress
+            ),
+            (
+                JobKind::AgentCall,
+                Class::Stopped,
+                Some(aterm_vitals::jobs::Standing::Capable),
+                false
+            ),
+            "{}",
+            holder.wire()
+        );
+        let row = v.row("a4200").expect("the waiter's call").clone();
+        if n * TICK_MS == 116_000 {
+            at_first_turn = Some(row.clone());
+        }
+        if row.no_progress {
+            first = Some((v, row));
+            break;
+        }
+    }
+    let before = at_first_turn.expect("the waiter read at the first turn's end");
+    assert_eq!(
+        (before.verdict, before.no_progress),
+        (Verdict::Quiet, false),
+        "{}",
+        before.wire()
+    );
+    let (v, row) = first.expect("the waiter read no_progress");
+    assert_eq!(
+        (row.kind, row.consumer, row.class, row.leader.0),
+        (JobKind::AgentCall, Consumer::Agent, Class::Waiting, 4200),
+        "{}",
+        row.wire()
+    );
+    let wait = row.wait.as_ref().expect("its wait");
+    assert_eq!(
+        (wait.name, wait.leaf, row.standing, row.verdict),
+        (
+            WaitName::Unnamed,
+            4200,
+            Some(aterm_vitals::jobs::Standing::Capped),
+            Verdict::Quiet
+        ),
+        "{}",
+        row.wire()
+    );
+    assert_eq!(
+        (row.mu_ms, row.mu_from),
+        (Some(10_000), Some(MuFrom::Own)),
+        "{}",
+        row.wire()
+    );
+    let quiet = row.quiet_ms.expect("its quiet");
+    let at = phi_stuck_quiet(10_000);
+    assert!(
+        (at..at + TICK_MS).contains(&quiet),
+        "first no_progress at quiet {quiet} ms, φ 8 at {at}: {}",
+        row.wire()
+    );
+    assert!(row.working_descendant.is_none(), "{}", row.wire());
+    assert_eq!(
+        v.rows
+            .iter()
+            .filter(|r| r.no_progress)
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a4200"],
+        "the waiter's is the one call the facts are told of"
+    );
+
+    let mut w = codex_lock_waiter(false);
+    let mut first_pipe = None;
+    for _ in 0..700 {
+        let v = w.tick(TICK_MS);
+        let row = v.row("a4200").expect("the waiter's call").clone();
+        if row.quiet_ms.is_some_and(|q| q <= quiet) {
+            assert!(!row.no_progress, "{}", row.wire());
+        }
+        if row.no_progress {
+            first_pipe = Some(row);
+            break;
+        }
+    }
+    let row = first_pipe.expect("the pipe's waiter reads no_progress at last");
+    assert_eq!(
+        (row.mu_ms, row.mu_from),
+        (Some(60_000), Some(MuFrom::Prior)),
+        "{}",
+        row.wire()
+    );
+    let at = phi_stuck_quiet(60_000);
+    assert!(
+        row.quiet_ms
+            .is_some_and(|q| (at..at + TICK_MS).contains(&q)),
+        "the pipe's waiter: φ 8 at {at}: {}",
+        row.wire()
     );
 }

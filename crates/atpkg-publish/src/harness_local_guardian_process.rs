@@ -152,8 +152,11 @@ pub(super) fn run(
         if let Some(reason) = budget_reason(usage, memory_mib, config.vm_mib) {
             return Err(Error::refused(reason));
         }
+        let judged =
+            private_file::JudgedDir::judge(dir).map_err(|e| Error::refused(e.to_string()))?;
         for name in ["worker.stdout", "worker.stderr"] {
-            if private_file::open_private(dir, name)
+            if judged
+                .open(name)
                 .map_err(|e| Error::refused(e.to_string()))?
                 .1
                 .len()
@@ -338,7 +341,7 @@ fn memory(pid: i32) -> Option<Usage> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(format!("/proc/{pid}/status"))
         .ok()?;
     if !file.metadata().ok()?.is_file() {
@@ -460,9 +463,12 @@ impl Tools for GuardTools<'_> {
             if run.deadline.is_some_and(|limit| start.elapsed() >= limit) {
                 self.stop("local child exceeded its bounded operation deadline");
             }
+            let judged = private_file::JudgedDir::judge(&self.permit.dir)
+                .map_err(|e| RunError::AfterStart(e.to_string()))?;
             for name in [&out_name, &err_name] {
-                if private_file::open_private(&self.permit.dir, name)
-                    .map_err(|e| RunError::Spawn(e.to_string()))?
+                if judged
+                    .open(name)
+                    .map_err(|e| RunError::AfterStart(e.to_string()))?
                     .1
                     .len()
                     > OUTPUT_MAX
@@ -470,15 +476,23 @@ impl Tools for GuardTools<'_> {
                     self.stop("local child output exceeded its complete capture bound");
                 }
             }
-            if child.exited().map_err(|e| RunError::Spawn(e.to_string()))? {
+            if child
+                .exited()
+                .map_err(|e| RunError::AfterStart(e.to_string()))?
+            {
                 break;
             }
             exit.wait(TICK);
         }
-        let status = child.wait().map_err(|e| RunError::Spawn(e.to_string()))?;
+        let status = child
+            .wait()
+            .map_err(|e| RunError::AfterStart(e.to_string()))?;
+        let judged = private_file::JudgedDir::judge(&self.permit.dir)
+            .map_err(|e| RunError::AfterStart(e.to_string()))?;
         let read = |name: &str| {
-            private_file::read_private(&self.permit.dir, name, OUTPUT_MAX as usize)
-                .map_err(|e| RunError::Spawn(e.to_string()))
+            judged
+                .read(name, OUTPUT_MAX as usize)
+                .map_err(|e| RunError::AfterStart(e.to_string()))
         };
         Ok(Ran {
             code: status.code(),

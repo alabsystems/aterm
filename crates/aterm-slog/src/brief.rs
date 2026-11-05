@@ -328,6 +328,7 @@ const fn mark_worth_a_line(k: Kind) -> bool {
             | Kind::Shown
             | Kind::Row
             | Kind::MailGap
+            | Kind::Tab
     )
 }
 

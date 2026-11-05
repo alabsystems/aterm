@@ -389,3 +389,107 @@ fn an_initial_vault_apply_before_source_toml_is_awaited_and_enforced() {
     assert!(fleet_table(&member.config()).unwrap().listen.is_none());
     assert!(!member.places.state.join(GRANT_OWED_FILE).exists());
 }
+
+/// The issuer's vault, beside its fleet state, whose roster labels the member `m77`: a word no
+/// host, book entry or node id of the fixture answers to, so only the roster names it.
+fn labelled_member(pair: &FleetPair) -> Paths {
+    use aterm_secrets::swarm_roster::{ROSTER_ENTRY, SwarmMember, SwarmRoster};
+    let paths = vault_beside(&pair.issuer);
+    let member = own_identity(&pair.member.places).unwrap();
+    let roster = SwarmRoster {
+        members: vec![SwarmMember {
+            label: "m77".to_owned(),
+            aliases: Vec::new(),
+            vault_name: "studio-of-m77".to_owned(),
+            recipient: "age1member".to_owned(),
+            hint: None,
+            hw_hint: None,
+            admitted_ms: 1_760_000_000,
+            claimed_label: None,
+            claimed_at_ms: None,
+            node_id: Some(member.node().to_owned()),
+            node_key: Some(member.key().hex()),
+        }],
+        deny_labels: Vec::new(),
+        deny_nodes: Vec::new(),
+    };
+    let admin = client::admin_open(&paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(&paths, &admin, &doc).unwrap();
+    paths
+}
+
+/// A drive by a Mac's roster label while a vault writer (a subscriber pass) holds the state lock
+/// waits the writer out within its own deadline and reaches the Mac the label names, as it does
+/// with no writer. NEGATIVE CONTROL: the roster read without that wait, under the same writer,
+/// names no Mac by its label, which refused the drive as "no Mac this machine's book records".
+#[test]
+fn a_drive_by_a_roster_label_waits_out_a_vault_writer() {
+    let pair = fleet_pair("label-busy-vault");
+    let paths = labelled_member(&pair);
+    let reached = drive_fleet_in(&pair.issuer.places, "m77", HANG)
+        .err()
+        .expect("the fixture serves no Drive");
+    assert!(reached.ungranted, "the label names the member: {reached:?}");
+
+    let writer = Rc::new(RefCell::new(Some(
+        client::test_hold_state_lock(&paths).unwrap(),
+    )));
+    assert!(
+        client::test_without_roster_wait(|| roster_identities(&pair.issuer.places))
+            .unwrap()
+            .is_empty(),
+        "an unwaited read takes the writer's moment as no roster"
+    );
+    let release = writer.clone();
+    let observed = Rc::new(Cell::new(0));
+    let count = observed.clone();
+    let refused = client::test_with_denied_nodes_busy(
+        move || {
+            count.set(count.get() + 1);
+            drop(release.borrow_mut().take());
+        },
+        || {
+            drive_fleet_in(&pair.issuer.places, "m77", HANG)
+                .err()
+                .expect("the fixture serves no Drive")
+        },
+    );
+    drop(writer.borrow_mut().take());
+    assert_eq!(observed.get(), 1, "the drive met the writer and waited");
+    assert!(
+        refused.ungranted,
+        "the label named the member while the writer held the vault: {refused:?}"
+    );
+}
+
+/// A drive by a roster label whose deadline passes while a vault writer holds the state lock is
+/// refused to try again, saying the roster is unread, and dials nothing: never "no Mac this
+/// machine's book records", which names a current member as unknown.
+#[test]
+fn a_drive_whose_roster_stays_unread_is_refused_to_try_again() {
+    let pair = fleet_pair("label-expired-vault");
+    let paths = labelled_member(&pair);
+    let listener = pair.member_serving.take();
+    listener.set_nonblocking(true).unwrap();
+    let writer = client::test_hold_state_lock(&paths).unwrap();
+    let refused = drive_fleet_in(&pair.issuer.places, "m77", Duration::ZERO)
+        .err()
+        .expect("the roster is unread");
+    drop(writer);
+    assert!(refused.again, "a writer's moment is retryable: {refused:?}");
+    assert!(refused.left.is_none(), "{refused:?}");
+    assert!(refused.why.contains("swarm roster"), "{}", refused.why);
+    assert!(
+        !refused.why.contains("no Mac this machine's book records"),
+        "{}",
+        refused.why
+    );
+    assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+}

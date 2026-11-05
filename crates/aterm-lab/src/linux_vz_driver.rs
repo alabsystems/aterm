@@ -521,7 +521,8 @@ impl Vz {
         let exec = exec_of(&argv, "/", &self.user.env(), false, false);
         let ran = self.run(&exec, None, &mut |_| {});
         written(&ran, |bytes| {
-            std::fs::write(host_path, bytes).map_err(|e| format!("{}: {e}", host_path.display()))
+            crate::util::write_fresh(host_path, bytes)
+                .map_err(|e| format!("{}: {e}", host_path.display()))
         })
     }
 
@@ -639,7 +640,9 @@ impl Vz {
     pub fn host_disk(&self) -> Option<HostDisk> {
         use std::os::unix::fs::MetadataExt as _;
         let path = self.paths.live_disk();
-        let meta = std::fs::metadata(&path).ok()?;
+        let meta = std::fs::symlink_metadata(&path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?;
         Some(HostDisk {
             bytes: meta.blocks() * 512,
             path,
@@ -736,7 +739,7 @@ pub fn unpack_into(bytes: &[u8], host_parent: &Path, name: &Path) -> Result<(), 
     std::fs::create_dir_all(staging.join("tree"))
         .map_err(|e| format!("{}: {e}", staging.display()))?;
     let archive = staging.join("archive.tar.gz");
-    let unpacked = std::fs::write(&archive, bytes)
+    let unpacked = crate::util::write_fresh(&archive, bytes)
         .map_err(|e| format!("{}: {e}", archive.display()))
         .and_then(|()| {
             atpkg::extract::extract_tree(
@@ -770,18 +773,28 @@ fn remove_tree(path: &Path) -> std::io::Result<()> {
 /// Copy the tree `from` to the new path `to`: each file an APFS clone where the volume
 /// can, else a copy; links as links.
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(from)?;
-    if meta.is_symlink() {
+    copy_tree_kind(from, to, std::fs::symlink_metadata(from)?.file_type())
+}
+
+fn copy_tree_kind(from: &Path, to: &Path, kind: std::fs::FileType) -> std::io::Result<()> {
+    if kind.is_symlink() {
         return std::os::unix::fs::symlink(std::fs::read_link(from)?, to);
     }
-    if meta.is_file() {
+    if kind.is_file() {
         return aterm_vz::clone::clone_file(from, to)
-            .or_else(|_| std::fs::copy(from, to).map(|_| ()));
+            .or_else(|_| crate::util::copy_regular_file(from, to).map(|_| ()));
+    }
+    if !kind.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing nonregular file {}", from.display()),
+        ));
     }
     std::fs::create_dir(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
-        copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        let ft = entry.file_type()?;
+        copy_tree_kind(&entry.path(), &to.join(entry.file_name()), ft)?;
     }
     Ok(())
 }
@@ -801,7 +814,7 @@ pub fn wait_ended(paths: &Paths, record: &Record) -> Result<(), String> {
     let size = || {
         [paths.helper_log(), paths.console_log()]
             .iter()
-            .map(|p| std::fs::metadata(p).map_or(0, |m| m.len()))
+            .map(|p| std::fs::symlink_metadata(p).map_or(0, |m| m.len()))
             .sum::<u64>()
     };
     let (mut last, mut since) = (size(), Instant::now());
@@ -1285,7 +1298,10 @@ pub fn down_after(
 /// Each layer file's allocated bytes, as `status` lists them.
 fn allocated(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
-    std::fs::metadata(path).ok().map(|m| m.blocks() * 512)
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|m| m.blocks() * 512)
 }
 
 /// The vz arm's `status`: the live helper's state (no session opens, nothing is signalled:
@@ -1681,7 +1697,7 @@ pub fn smoke_checks(up: &crate::linux::Up, repo: &str, scratch: &Path) -> Vec<Ch
     let t = Instant::now();
     let tree = scratch.join("vz-smoke-in");
     let _ = std::fs::create_dir_all(tree.join("sub"));
-    let _ = std::fs::write(tree.join("sub/file.txt"), "from the Mac\n");
+    let _ = crate::util::write_fresh(&tree.join("sub/file.txt"), "from the Mac\n");
     let _ = g.shell(home, &argv(&["rm", "-rf", "/tmp/vz-smoke-in"]), None);
     let copied = g.copy_dir_in(&tree, "/tmp");
     let read = g.shell(home, &argv(&["cat", "/tmp/vz-smoke-in/sub/file.txt"]), None);
@@ -1742,7 +1758,7 @@ fn swap_check(up: &crate::linux::Up, repo: &str, scratch: &Path) -> Check {
     };
     let other = scratch.join("vz-smoke-share");
     let _ = std::fs::create_dir_all(&other);
-    let _ = std::fs::write(other.join("marker.txt"), "swapped\n");
+    let _ = crate::util::write_fresh(&other.join("marker.txt"), "swapped\n");
     let mine = shares(Path::new(repo), &vz.in_dir);
     let theirs = shares(&other, &vz.in_dir);
     let unit = format!("{}vz-smoke-hold", crate::linux_guest::UNIT_PREFIX);

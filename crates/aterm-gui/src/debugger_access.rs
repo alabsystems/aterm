@@ -290,7 +290,7 @@ pub(crate) fn take_change_lock(config_path: &Path, patience: Duration) -> LockTr
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&path);
         let file = match opened {
             Ok(file) => file,

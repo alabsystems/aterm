@@ -189,7 +189,13 @@ pub enum LineHeld {
     /// The line may still come: unread, read within its minute or not at rest, or no read can say
     /// (`input=-`). A line typed behind it would join it or land beside it, and a restart could
     /// lose it (a copy the worker holds, or input still queued that a shell would read once the
-    /// agent exits), so the upgrade's step waits whole, its restart included.
+    /// agent exits), so the upgrade's step waits whole, its restart included. A line the loop
+    /// judged lost stands too until [`Line::lose`] finds no restart to make for it: while the
+    /// loop's own restart in place for it stands asked ([`Restarts::standing`]: deferred, or made
+    /// with nothing showing it ended the line's process), asked again on its back-off, and from a
+    /// refusal of that restart until the loop weighs the loss again. The upgrade's step waits
+    /// whole then too, for as long as that lasts and the line is held: a deferral that never
+    /// resolves, on a line nothing settles, holds it with no bound.
     Stands,
     /// The loop judged the line lost (read, undrawn a minute on, at rest:
     /// [`super::policy::turn_end::Restart::InputLost`]'s evidence) and makes no restart in place
@@ -338,8 +344,8 @@ pub struct Rest {
     /// dialog and no frame torn mid-redraw.
     pub turn_ended: bool,
     /// The agent's own background work runs under that turn's end, as the read names it (a
-    /// monitor, a shell, a background agent or a workflow the turn left running): a restart in
-    /// place would end it, so the read is no rest while it runs.
+    /// monitor, a shell, a background agent, a workflow or other work the turn left running): a
+    /// restart in place would end it, so the read is no rest while it runs.
     pub working: bool,
     /// The composer shows no typed text (read only where [`Self::turn_ended`]).
     pub clear: bool,
@@ -791,6 +797,12 @@ impl Line {
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The person's key count the line was written under.
+    #[must_use]
+    pub const fn human(&self) -> u64 {
+        self.human
     }
 
     /// Whether `shown` (a draft a read saw) is the line, whitespace aside.

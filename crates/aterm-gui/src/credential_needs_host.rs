@@ -32,8 +32,9 @@ impl crate::App {
         let Ok(paths) = aterm_secrets::client::Paths::live() else {
             return;
         };
-        let stamp = std::fs::metadata(paths.dir.join(aterm_secrets::need::LEDGER))
+        let stamp = std::fs::symlink_metadata(paths.dir.join(aterm_secrets::need::LEDGER))
             .ok()
+            .filter(std::fs::Metadata::is_file)
             .map(|meta| (meta.modified().ok(), meta.len()));
         if self.credential_needs.seen == Some(stamp) {
             return;

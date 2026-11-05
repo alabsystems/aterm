@@ -1120,7 +1120,7 @@ impl crate::flow::Fetcher for DirFetcher {
         if std::fs::hard_link(&src, dest).is_ok() {
             return Ok(());
         }
-        std::fs::copy(&src, dest)
+        crate::metadata_io::copy_regular_file(&src, dest)
             .map(|_| ())
             .map_err(|e| format!("copy {}: {e}", src.display()))
     }

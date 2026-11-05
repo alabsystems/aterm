@@ -27,15 +27,23 @@
 //! Where the member holds a log, neither path lets in a Mac the log removed or a Mac its newest
 //! `[everyone]` epoch left out on purpose ([`ByLog::KeptOut`]): the Allow fails with the reason,
 //! until F16's "removed, Allow again?" row asks the person that question.
+//!
+//! A person's Allow of a Mac whose fleet node key a live seat holds under another vault key (a Mac
+//! rebuilt with its node key kept) moves that seat to it ([`allowed`]): the batch a proof's
+//! `Replace` signs (`super::readmit::sign_seat_move`), under the old seat's label and node key,
+//! with the old recipient rotated out of `[everyone]` and Commons. The Allow waives the day a
+//! proof waits for the old seat to go dark; the Allow card says when it last signed.
 
 use super::*;
 use crate::commons::binding::Request;
+use crate::commons::bootstrap::Device;
+use crate::commons::journal::Trust;
 use crate::members::bundle::{Handed, Reader};
 use crate::members::desk::{Handing, Handout};
 use crate::members::{Allowed, Bundle};
 use crate::membership_log::{
-    self, Entrant, EpochAudience, Log, OpenedAudienceEntries, Record, RecordId, Signer,
-    admission_audiences, encode_records,
+    self, Entrant, EpochAudience, Log, OpenedAudienceEntries, Record, RecordId, SeatAudience,
+    Signer, admission_audiences, encode_records,
 };
 
 /// What the membership log says of an Allow ([`admit_by_phrase`]).
@@ -159,15 +167,20 @@ pub(super) fn kept_out_with_node(
     node: [u8; 32],
     restore: bool,
 ) -> Option<String> {
-    kept_out_with_node_at(log, binding, node, restore, true)
+    kept_out_with_node_at(log, binding, node, restore, true, false)
 }
 
+/// [`kept_out_with_node`], reading the epoch-omission rule only where `check_epoch_omission`, and
+/// with `moving` where a person's Allow judges a move of the seat that holds `node`
+/// ([`super::readmit::allowed_seat_move`]): a seat holding the node key keeps nothing out here,
+/// as the move says whether that seat moves.
 fn kept_out_with_node_at(
     log: &Log,
     binding: &crate::commons::binding::Binding,
     node: [u8; 32],
     restore: bool,
     check_epoch_omission: bool,
+    moving: bool,
 ) -> Option<String> {
     let member = binding.actor();
     let recipient = binding.recipient();
@@ -213,6 +226,7 @@ fn kept_out_with_node_at(
                         && m.binding != *binding)
                         || (node != [0; 32]
                             && m.node_key == Some(node)
+                            && !moving
                             && (*actor != member || m.binding != *binding)))
             })
             .then(|| {
@@ -251,11 +265,53 @@ fn kept_out_with_node_at(
                     && m.binding != *binding)
                     || (node != [0; 32]
                         && m.node_key == Some(node)
+                        && !moving
                         && (*actor != member || m.binding != *binding)))
         })
         .then(|| {
             "this Mac's key is already bound to a different seat in the membership log".to_owned()
         })
+}
+
+/// What the log says of a person's Allow of the Mac `binding` names, showing the node key `node`
+/// (`restore`: they pressed "Allow again"; `node_proven`: the Mac signed with that node key on
+/// the desk's challenge, `members::desk::Handing::node_proven`; `book`: the fleet book's word):
+/// why it keeps the Mac
+/// out ([`kept_out_with_node`]: a removal, a quorum's whatever is pressed, the epoch-omission
+/// rule, a key bound to another seat), else the live seat the Allow moves to it under its node
+/// key, as its cutoff and label (one-mesh A15, [`super::readmit::allowed_seat_move`]: a key two
+/// seats hold, a retired key, a seat held out and the 0.148 gate still refuse), else `None`: a
+/// plain admission.
+pub(super) fn allowed(
+    log: &Log,
+    binding: &crate::commons::binding::Binding,
+    node: [u8; 32],
+    (restore, node_proven): (bool, bool),
+    book: Book,
+) -> Result<Option<(crate::membership_log::MemberId, RecordId, String)>, String> {
+    let seat_move = (!log.membership().contains(&binding.actor()))
+        .then(|| super::readmit::allowed_seat_move(log, binding, node, book))
+        .flatten();
+    // Whether or not the seat may move now, its holding the node key is the move's to judge, so
+    // the person reads why it does not move.
+    if let Some(why) = kept_out_with_node_at(log, binding, node, restore, true, seat_move.is_some())
+    {
+        return Err(why);
+    }
+    match seat_move {
+        Some(Err(why)) => Err(why),
+        // An ask names its node key unproven: a seat moves only to the Mac that signed with it.
+        Some(Ok(super::readmit::Decision::Replace { label, .. })) if !node_proven => Err(format!(
+            "this Mac names {label}'s node key but did not prove it holds it on this member: a \
+             Mac rebuilt with its node key kept proves it before it asks"
+        )),
+        Some(Ok(super::readmit::Decision::Replace {
+            seat,
+            cutoff,
+            label,
+        })) => Ok(Some((seat, cutoff, label))),
+        Some(Ok(_)) | None => Ok(None),
+    }
 }
 
 /// Whether the log removed the Mac `binding` names, by its actor or its device's writer key under
@@ -397,7 +453,9 @@ fn trusted_log_keeps_out(
     let Some((log, current)) = evidence else {
         return Ok(None);
     };
-    Ok(kept_out_with_node_at(&log, binding, node, restore, current))
+    Ok(kept_out_with_node_at(
+        &log, binding, node, restore, current, false,
+    ))
 }
 
 /// The log, keys and opened entries the member at `paths` admits from: its vault's log where the
@@ -446,7 +504,15 @@ pub fn admit_by_phrase(
     name: &str,
     now_ms: u64,
 ) -> crate::Result<ByLog> {
-    log_path(paths, request, node, name, now_ms, (None, false), None)
+    log_path(
+        paths,
+        request,
+        node,
+        name,
+        now_ms,
+        (None, false, (Book::default(), false)),
+        None,
+    )
 }
 
 /// [`admit_by_phrase`] for a local request or a log reader; a files reader asks only whether
@@ -454,13 +520,13 @@ pub fn admit_by_phrase(
 /// without the state lock (the records file is written whole), for a new Mac that takes F10's
 /// files: [`ByLog::KeptOut`] or [`ByLog::NotHere`]. Signing takes the state lock, unless `held`
 /// holds it already for this run (a member's desk took it before the run touched its phrase).
-fn log_path(
+pub(super) fn log_path(
     paths: &Paths,
     request: &Request,
     node: [u8; 32],
     name: &str,
     now_ms: u64,
-    (reader, restore): (Option<Reader>, bool),
+    (reader, restore, (book, node_proven)): (Option<Reader>, bool, (Book, bool)),
     held: Option<&super::HandoverHold>,
 ) -> crate::Result<ByLog> {
     let held = held.filter(|held| held.holds(paths));
@@ -496,9 +562,11 @@ fn log_path(
     if let Some(reader) = reader.filter(|reader| !reader.can_take(source)) {
         return Err(Error::new(reader.refusal(source)));
     }
-    if let Some(why) = kept_out_with_node(&log, request.binding(), node, restore) {
-        return Ok(ByLog::KeptOut(why));
-    }
+    let seat_move = match allowed(&log, request.binding(), node, (restore, node_proven), book) {
+        Ok(seat_move) => seat_move,
+        Err(why) => return Ok(ByLog::KeptOut(why)),
+    };
+    let moving = seat_move.as_ref().map(|moved| moved.0);
     if !restoring(&log, request.binding(), node, restore)
         && let Some(why) =
             roster_keeps_out(paths, Some(&opened), request.binding(), node, Some(lock))?
@@ -524,6 +592,12 @@ fn log_path(
     let Some(audiences) = held_audiences(&log, &opened, &actor) else {
         return Ok(ByLog::NotHere);
     };
+    if let Some(seat) = &moving
+        && let Some(why) =
+            super::readmit::seat_move_refusal(&log, &opened, &audiences, &actor, seat)
+    {
+        return Ok(ByLog::KeptOut(why));
+    }
 
     let member = request.binding().actor();
     let recipient = request.binding().recipient();
@@ -539,6 +613,29 @@ fn log_path(
             // the new Mac takes as it would this Mac's): only the Wraps it lacks.
             let signed = wraps_lacking(&mut log, &opened, &audiences, &signer, &member, now_ms)?;
             return Ok((already.entry, already.label.clone(), signed));
+        }
+        if let Some((seat, cutoff, label)) = &seat_move {
+            let entrant = Entrant {
+                request: request.clone(),
+                node_key: node,
+                name: name.to_owned(),
+                label: label.clone(),
+            };
+            let signed = super::readmit::sign_seat_move(
+                &mut log,
+                &opened,
+                &audiences,
+                &signer,
+                (*seat, *cutoff),
+                entrant,
+                now_ms,
+            )?;
+            let admit = signed
+                .iter()
+                .find(|r| matches!(r.body(), membership_log::Body::Admit { .. }))
+                .map(|r| *r.id())
+                .ok_or_else(|| Error::new("the seat move signed no Admit"))?;
+            return Ok((admit, label.clone(), signed));
         }
         // A Mac "Allow again" restores keeps the label it had, where no member holds it now.
         let restored = restore
@@ -591,6 +688,21 @@ fn log_path(
         Ok((*signed[0].id(), label, signed))
     })?;
     let (admit, label, signed) = signed;
+    // The evaluator, over what was signed, must seat the moved Mac under the old seat's label
+    // with its node key, the old seat out: else nothing is kept.
+    if let Some(seat) = &moving {
+        let after = log.membership();
+        let seated = after.get(&member);
+        if seated.is_none_or(|m| m.label != label || m.entry != admit)
+            || after.node(&node) != membership_log::NodeStanding::Member(member)
+            || after.contains(seat)
+        {
+            return Ok(ByLog::KeptOut(format!(
+                "the membership log would not seat this Mac as {label} after the move, so \
+                 nothing was kept",
+            )));
+        }
+    }
     if !signed.is_empty() {
         store.ingest(&encode_records(&signed))?;
         if signed
@@ -628,16 +740,16 @@ pub(super) fn held_audiences(
     log: &Log,
     opened: &OpenedAudienceEntries,
     actor: &crate::membership_log::MemberId,
-) -> Option<Vec<EpochAudience>> {
-    let holds = |audience: &EpochAudience| {
+) -> Option<Vec<SeatAudience>> {
+    let holds = |audience: &SeatAudience| {
         Log::admission_epochs(opened, std::slice::from_ref(audience))
             .iter()
             .all(|(_, epoch)| {
                 opened.unwrapped_keys.contains_key(epoch) || log.is_wrap_gap(opened, epoch, actor)
             })
     };
-    if !holds(&EpochAudience::Everyone)
-        || !Log::admission_epochs(opened, &[EpochAudience::Everyone])
+    if !holds(&SeatAudience::Everyone)
+        || !Log::admission_epochs(opened, &[SeatAudience::Everyone])
             .iter()
             .any(|(_, epoch)| opened.unwrapped_keys.contains_key(epoch))
     {
@@ -657,7 +769,7 @@ pub(super) fn held_audiences(
 pub(super) fn wraps_lacking(
     log: &mut Log,
     opened: &OpenedAudienceEntries,
-    audiences: &[EpochAudience],
+    audiences: &[SeatAudience],
     signer: &Signer<'_>,
     member: &crate::membership_log::MemberId,
     now_ms: u64,
@@ -689,27 +801,126 @@ pub(super) fn wraps_lacking(
     Ok(signed)
 }
 
+/// How long [`admits_by_log`] waits for a vault pass that holds this Mac's state: as long as a
+/// member's desk waits for one in its other reads (`members::desk::Local::of`).
+const SEAT_READ: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Whether this Mac admits through the membership log ([`admit_by_phrase`]): its vault has a log
-/// its pin trusts, holding epochs, and the log seats this Mac's device key.
+/// its pin trusts, holding epochs, and the log seats this Mac's device key ([`log_seat`]). A vault
+/// pass that holds this Mac's state is waited for, [`SEAT_READ`] at most: a member's desk asks
+/// this whether it can allow right after a Commons read that waits for such a pass, so a pass that
+/// takes the state between the two delays the answer rather than leaving a seated member unable
+/// to allow anyone in. A pass still holding the state then reads as no seat, as an unreadable
+/// state does.
 #[must_use]
 pub fn admits_by_log(paths: &Paths) -> bool {
-    (|| -> crate::Result<bool> {
-        let Some(config) = config(paths)? else {
-            return Ok(false);
-        };
-        let Some(pin) = config.signer else {
-            return Ok(false);
-        };
-        let Some((store, _)) = log_entries::trusted_seeded_store(paths, &config, &pin, &[])? else {
-            return Ok(false);
-        };
-        let Some(log) = store.log() else {
-            return Ok(false);
-        };
-        Ok(log_entries::open_local_member_signer(paths, log)?
-            .is_some_and(|(actor, _, _)| !log.audience_left_out(&EpochAudience::Everyone, &actor)))
-    })()
-    .unwrap_or(false)
+    admits_by_log_until(paths, Instant::now() + SEAT_READ)
+}
+
+/// [`admits_by_log`], waiting for a pass until `deadline` rather than [`SEAT_READ`]: a test's
+/// read waits under the hang detector while a real pass runs.
+#[must_use]
+pub(crate) fn admits_by_log_until(paths: &Paths, deadline: Instant) -> bool {
+    log_seat(paths, Some(deadline)).is_ok_and(|seat| seat.is_some())
+}
+
+/// This Mac's seat in its vault's membership log, as [`admit_by_phrase`] signs from it: the
+/// Commons device whose binding a log its pin trusts (holding epochs) seats, not removed, not left
+/// out of `[everyone]` and denied nowhere here ([`log_entries::open_local_member_signer`]), and the
+/// root that log's genesis binds every seat to. `None` where it holds no such seat: no vault, no
+/// trusted log, or a log that does not seat this device. With a `deadline`, a vault pass that
+/// holds this Mac's state and its device custody are waited for until then at most
+/// ([`log_entries::observe_signer_until`]), and the log is read once the pass has ended, under the
+/// observation that judges the seat, so a pass that brought records in is read with them; with
+/// none, a busy vault is an error at once. An existing device is opened and none is created.
+///
+/// # Errors
+/// Local state cannot be read, the vault state is busy (at `deadline`, where one is given), or
+/// `deadline` passed.
+fn log_seat(
+    paths: &Paths,
+    deadline: Option<Instant>,
+) -> crate::Result<Option<(Device, membership_log::Root)>> {
+    // A Mac with no vault, or no pinned signer, holds no seat and waits for nothing.
+    if config(paths)?.and_then(|config| config.signer).is_none() {
+        return Ok(None);
+    }
+    // With a deadline the pass that holds the state is waited for first, and everything the seat
+    // is judged by is read under that observation: a log read before it is behind what the pass
+    // wrote.
+    let observed = deadline
+        .map(|deadline| log_entries::observe_signer_until(paths, deadline))
+        .transpose()?;
+    let Some(config) = config(paths)? else {
+        return Ok(None);
+    };
+    let Some(pin) = config.signer else {
+        return Ok(None);
+    };
+    let Some((store, _)) = log_entries::trusted_seeded_store(paths, &config, &pin, &[])? else {
+        return Ok(None);
+    };
+    let Some(log) = store.log() else {
+        return Ok(None);
+    };
+    let membership_log::Body::Genesis { root, .. } = log.genesis().body() else {
+        return Ok(None);
+    };
+    let seat = match &observed {
+        Some(lock) => log_entries::open_local_member_signer_held_until(paths, log, lock, deadline)?,
+        None => log_entries::open_local_member_signer(paths, log)?,
+    };
+    Ok(seat
+        .filter(|(actor, _, _)| !log.audience_left_out(&EpochAudience::Everyone, actor))
+        .map(|(_, device, _)| (device, *root)))
+}
+
+/// This Mac as a member by its membership log alone, whatever the current Commons epochs say of
+/// its control (owner, 2026-11-02: membership is the log; Commons control governs application
+/// data): the device its log seats ([`log_seat`]) and the trust anchor it pinned when it first
+/// opened Commons control from its authenticated vault
+/// ([`crate::commons::bootstrap::established_trust`]), which must name the root that log binds
+/// every seat to. `None` where the log seats this Mac nowhere, or it pinned no anchor. Nothing here
+/// creates custody, founds a network, puts another anchor in place of the pinned one, or grants,
+/// writes or claims Commons control. With a `deadline`, a vault pass that holds this Mac's state
+/// and its device custody are waited for until then at most, as [`log_seat`] waits.
+///
+/// # Errors
+/// Local state cannot be read, the vault state is busy (at `deadline`, where one is given),
+/// `deadline` passed, the pinned anchor's custody is damaged, or the anchor names another root
+/// than the log's.
+pub(crate) fn seated_member(
+    paths: &Paths,
+    deadline: Option<Instant>,
+) -> crate::Result<Option<(Device, Trust)>> {
+    let Some((device, root)) = log_seat(paths, deadline)? else {
+        return Ok(None);
+    };
+    let Some(trust) = crate::commons::bootstrap::established_trust(paths)? else {
+        return Ok(None);
+    };
+    if root
+        != (membership_log::Root {
+            network: trust.network,
+            authority: trust.authority,
+        })
+    {
+        return Err(Error::new(
+            "this Mac's pinned Commons anchor names another network than its membership log",
+        ));
+    }
+    Ok(Some((device, trust)))
+}
+
+/// Whether this Mac is a member by its membership log alone ([`seated_member`]), read at once: its
+/// log seats its device and it pinned the anchor that log's root names. Where
+/// `members::desk::Local::of` found no desk while Commons control is not this Mac's, it has left
+/// only where this is `false`: a vault pass that holds the state is an error here, not a departure.
+///
+/// # Errors
+/// As [`seated_member`] with no deadline: a busy vault included.
+pub fn member_by_log(paths: &Paths) -> crate::Result<bool> {
+    Ok(seated_member(paths, None)?.is_some())
 }
 
 /// The members the trusted membership log at `paths` currently lets in (`Body::Genesis` founders
@@ -760,13 +971,29 @@ pub fn log_admitted_actors(paths: &Paths) -> BTreeSet<crate::membership_log::Mem
 /// [`super::HANDOVER_LOCK_WAIT`] where the desk holds none for the run ([`ByLog::Busy`]), or
 /// the receiver cannot hold the whole log, or neither path can hand a bundle from this Mac's state.
 pub fn hand_over(paths: &Paths, handing: &Handing<'_>) -> crate::Result<Handout> {
+    hand_over_with(paths, handing, Book::default())
+}
+
+/// [`hand_over`] with what this member's fleet book says of the fleet (`book`, as the caller that
+/// holds the book read it, `aterm_agent::vault_join::book_word`): a person's Allow of a Mac whose
+/// node key a live seat holds under another binding moves that seat to it only where
+/// [`Book::moved_seats_read`] holds ([`super::readmit::allowed_seat_move`]). [`hand_over`] reads
+/// the book that lets no seat move.
+///
+/// # Errors
+/// As [`hand_over`].
+pub fn hand_over_with(paths: &Paths, handing: &Handing<'_>, book: Book) -> crate::Result<Handout> {
     match log_path(
         paths,
         handing.request,
         handing.node,
         handing.name,
         aterm_time::unix_millis().unwrap_or(0),
-        (Some(handing.reader), handing.restore),
+        (
+            Some(handing.reader),
+            handing.restore,
+            (book, handing.node_proven),
+        ),
         handing.held,
     )? {
         ByLog::Admitted(admission) => {
@@ -896,8 +1123,34 @@ pub(super) fn post_records_to_servers_by(paths: &Paths, by: Instant) -> crate::R
 /// # Errors
 /// This Mac is already in a vault, the bundle is not a log bundle for this Mac's key, any check
 /// above fails, the source capacity is incompatible, the whole offered and retained history
-/// cannot fit, or a write failed. A required crossed mark is stored before any new custody.
+/// cannot fit, the history this Mac acknowledged refuses the bundle's records under the bundle's
+/// configuration (`checked_log_bundle`), or a write failed. Each of these but the last refuses
+/// before anything is written. A required crossed mark is stored before any new custody.
 pub fn write_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report> {
+    write_log_bundle(paths, bundle, Moving::Allowed)
+}
+
+/// [`write_from_log_bundle`] of the bundle a proof with nobody's Allow brought
+/// (`members::join::prove_first`): it readmits this Mac to the vault it is configured for and
+/// never moves it to another. Under the same state lock, a bundle that would start another vault
+/// afresh (`checked_log_bundle`: another log than the one this Mac holds, or with none here,
+/// another name or key line) is refused before anything is written, where a vault is configured.
+/// Only a person's phrase, or `aterm secrets join`, moves a Mac to another vault.
+///
+/// # Errors
+/// As [`write_from_log_bundle`], and the bundle is another vault's than the one configured.
+pub fn readmit_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report> {
+    write_log_bundle(paths, bundle, Moving::Refused)
+}
+
+/// Whether a log bundle's write may move this Mac to another vault ([`readmit_from_log_bundle`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Moving {
+    Allowed,
+    Refused,
+}
+
+fn write_log_bundle(paths: &Paths, bundle: &Bundle, moving: Moving) -> crate::Result<Report> {
     let _lock = StateLock::take(paths)?;
     let CheckedLog {
         config,
@@ -906,12 +1159,32 @@ pub fn write_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Re
         entries,
         digest,
         requires_crossed_mark,
+        afresh,
     } = checked_log_bundle(paths, bundle)?;
+    if afresh && moving == Moving::Refused && super::config(paths)?.is_some() {
+        return Err(Error::new(
+            "the member's records are another vault's: a proof lets this Mac back into its own vault only, and only a person's phrase moves it to another",
+        ));
+    }
     let publish = || {
         let mut state = state;
         super::records_file_for_write(paths, &store)?;
+        // A bundle of another vault than the one this Mac's state holds (one that let it go, or
+        // one it waits to be let into) starts that vault afresh before its records are written,
+        // so their write acknowledges them as the new vault's first history. Every check of that
+        // write ran on these same inputs before (`checked_log_bundle`), so once the floor is
+        // forgotten only a write that fails stops it.
+        if afresh {
+            super::forget_vault_left(&mut state);
+            prepare_materialization(paths, &mut state)?;
+        }
         save_config(paths, &config)?;
         super::write_records(paths, &store)?;
+        if afresh {
+            // The vault left's version goes only now: until the records are written, the
+            // history's checks read the cached envelope as `checked_log_bundle` read it.
+            crate::fsx::wipe_and_remove(&paths.cache_file())?;
+        }
         let report = apply_entries(paths, &mut state, &entries)?;
         state.membership = Stored::In;
         state.failed = apply_failed(&report);
@@ -955,9 +1228,18 @@ struct CheckedLog {
     entries: Vec<Entry>,
     digest: [u8; 32],
     requires_crossed_mark: bool,
+    /// The bundle configures another vault than the one this Mac's state holds, and its write
+    /// starts that vault afresh (`client::forget_vault_left`).
+    afresh: bool,
 }
 
-/// [`write_from_log_bundle`]'s checks, writing nothing.
+/// [`write_from_log_bundle`]'s checks, writing nothing. The bundle moves this Mac to another vault
+/// (`afresh`) where its log is another than the one this Mac holds, by their genesis, or, where
+/// this Mac holds none, where its configuration is another vault's (`client::moves_vault`). The
+/// history this Mac acknowledged then judges the bundle's records under the bundle's
+/// configuration, as the write's acknowledgement will (`retained_history::validate_configured`),
+/// so a store that history refuses under it (one whose genesis it holds under another vault name,
+/// or another genesis of a vault it holds) is refused here, before anything is written.
 fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLog> {
     let Handed::Log {
         source,
@@ -1010,6 +1292,7 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
         .ok_or_else(|| Error::new("the member's bundle names no vault server"))?;
     let config = Config {
         source: Source::Url(server),
+        mirrors: Vec::new(),
         name: bundle.vault.clone(),
         signer: Some(bundle.signer),
         followed: bundle.followed.clone(),
@@ -1125,6 +1408,11 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
     let digest = log_entries::records_heads_digest(log);
     let requires_crossed_mark =
         (crossed_source && learned_complete) || crate::crossing::past_legacy(log.held_count());
+    let afresh = match previous.log() {
+        Some(own) => own.network() != log.network(),
+        None => super::moves_vault(current.as_ref(), &config),
+    };
+    super::retained_history::validate_configured(paths, &config, &store, afresh)?;
     Ok(CheckedLog {
         config,
         state,
@@ -1132,6 +1420,7 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
         entries,
         digest,
         requires_crossed_mark,
+        afresh,
     })
 }
 

@@ -30,7 +30,7 @@ fn directory_id(path: &Path) -> Result<String, String> {
 fn read_record(path: &Path) -> Result<Option<String>, String> {
     let mut file = match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
     {
         Ok(f) => f,
@@ -64,11 +64,7 @@ fn write_new(path: &Path, text: &str) -> Result<(), String> {
     if text.len() as u64 > RECORD_MAX {
         return Err("ownership receipt is too large; retained".into());
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
+    let mut file = crate::util::create_new_regular_file(path, 0o600)
         .map_err(|e| format!("{}: {e}; retained", path.display()))?;
     file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
     // Losing an ownership receipt cannot authorize adoption after a power loss.

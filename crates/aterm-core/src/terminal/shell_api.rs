@@ -269,10 +269,9 @@ mod tests {
     }
 
     /// `started_command_seq` counts each C the A→B→C→D gate accepts, block or
-    /// no block, and nothing takes one back: RIS drops the blocks (and the
-    /// running command's D, which `completed_command_seq` then never counts),
-    /// ED 3 and Cmd-K the ones wholly in the history they erase (a running
-    /// `clear` keeps its own), and a checkpoint round trip carries it.
+    /// no block, and nothing takes one back: RIS, ED 3 and Cmd-K drop the blocks
+    /// wholly in the history they erase (a running `reset` or `clear` keeps its
+    /// own, and its D is counted), and a checkpoint round trip carries it.
     #[test]
     fn started_command_seq_counts_every_accepted_c_and_no_clear_takes_one() {
         let prompt = b"\x1b]133;A\x07$ \x1b]133;B\x07";
@@ -285,10 +284,15 @@ mod tests {
         term.process(prompt);
         term.process(b"reset\r\n\x1b]133;C\x07\x1bc\x1b]133;D;0\x07");
         assert_eq!(term.started_command_seq(), 2);
-        assert_eq!(term.completed_command_seq(), 1, "the RIS swallowed the D");
-        assert!(
-            term.all_blocks().next().is_none(),
-            "the RIS took the blocks"
+        assert_eq!(
+            term.completed_command_seq(),
+            2,
+            "the D after the RIS counts"
+        );
+        assert_eq!(
+            term.all_blocks().count(),
+            3,
+            "the RIS took none of the blocks on the screen (a, the refused C's prompt, reset)"
         );
         term.process(prompt);
         term.process(b"clear\r\n\x1b]133;C\x07\x1b[3J\x1b]133;D;0\x07");
@@ -417,6 +421,77 @@ mod tests {
         control.process(b"P> pushed");
         control.process(&signed("B"));
         assert_eq!(cell(&control), None, "a word is the prompt's own");
+    }
+
+    /// A reset takes the input region's start: it named a cell of the screen
+    /// the reset erased, and only the shell's next `B` names one again, while
+    /// the prompt it kept stays in front.
+    /// NEGATIVE CONTROL: with `ShellIntegrationState::reset` keeping
+    /// `input_start_attested`, `` host reset false: the erased cell is no
+    /// start `` fails.
+    #[test]
+    fn a_reset_takes_the_input_regions_start() {
+        for host in [false, true] {
+            let mut t = at_signed_prompt();
+            assert_eq!(cell(&t), Some((0, 2)), "PRECONDITION: the signed B");
+            if host {
+                t.reset();
+            } else {
+                t.process(b"\x1bc");
+            }
+            assert_eq!(
+                cell(&t),
+                None,
+                "host reset {host}: the erased cell is no start"
+            );
+            assert!(
+                t.prompt_in_front().is_some(),
+                "host reset {host}: the prompt is still in front"
+            );
+            t.process(&signed("A"));
+            t.process(b"$ ");
+            t.process(&signed_b());
+            assert_eq!(
+                cell(&t),
+                Some((0, 2)),
+                "host reset {host}: the shell's next B names one"
+            );
+        }
+    }
+
+    /// A reset leaves the phase as stale as it found it: the prompt it kept is
+    /// still not the shell's last word until the shell's next prompt.
+    /// NEGATIVE CONTROL: with `ShellIntegrationState::reset` clearing
+    /// `phase_stale`, `` still not the shell's last word `` fails.
+    #[test]
+    fn a_reset_keeps_a_stale_phase_stale() {
+        for host in [false, true] {
+            let mut t = at_signed_prompt();
+            t.authorize_shell_integration_on_first_mark(NEW_KEY);
+            t.process(&signed_with(NEW_KEY, "B;aterm_input=start"));
+            assert_eq!(
+                t.prompt_in_front(),
+                None,
+                "PRECONDITION: the phase is stale"
+            );
+            if host {
+                t.reset();
+            } else {
+                t.process(b"\x1bc");
+            }
+            assert_eq!(
+                t.prompt_in_front(),
+                None,
+                "host reset {host}: still not the shell's last word"
+            );
+            t.process(&signed_with(NEW_KEY, "A"));
+            t.process(b"$ ");
+            t.process(&signed_with(NEW_KEY, "B;aterm_input=start"));
+            assert!(
+                t.prompt_in_front().is_some(),
+                "host reset {host}: the shell's next prompt is in front"
+            );
+        }
     }
 
     /// In the window of a re-key the shell has not taken, the marks it signs

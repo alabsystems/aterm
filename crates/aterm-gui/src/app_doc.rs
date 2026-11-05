@@ -62,6 +62,9 @@ pub(crate) enum DocAnswer {
     Text(DocText),
     /// No live document is the one asked for.
     Unknown,
+    /// `doc read` of a private edit's document
+    /// ([`crate::native_document_journal::private_uri`]), whose text the editor never serves.
+    Refused,
 }
 
 /// One live document, as `doc ls` lists it.
@@ -148,13 +151,23 @@ impl App {
                     DocNames::Id(id) => document.get() == *id,
                     DocNames::Uri(spellings) => self.document_spelled(**document, spellings),
                 })
-                .and_then(|document| self.document_store.snapshot(*document))
-                .map_or(DocAnswer::Unknown, |snapshot| {
-                    DocAnswer::Text(DocText {
-                        doc: snapshot.id.get(),
-                        seq: snapshot.seq.0,
-                        text: snapshot.text,
-                    })
+                .map_or(DocAnswer::Unknown, |document| {
+                    if self
+                        .document_store
+                        .canonical_uri(*document)
+                        .is_some_and(crate::native_document_journal::private_uri)
+                    {
+                        return DocAnswer::Refused;
+                    }
+                    self.document_store
+                        .snapshot(*document)
+                        .map_or(DocAnswer::Unknown, |snapshot| {
+                            DocAnswer::Text(DocText {
+                                doc: snapshot.id.get(),
+                                seq: snapshot.seq.0,
+                                text: snapshot.text,
+                            })
+                        })
                 }),
         }
     }
@@ -405,6 +418,7 @@ mod tests {
             create: false,
             for_word: None,
             wait: true,
+            read_only: false,
         };
         app.begin_edit(EditCall {
             ticket,
@@ -681,5 +695,48 @@ mod tests {
             assert_eq!(doc(&app, &rest), answer, "doc {rest}");
         }
         assert!(doc(&app, &format!("read {known}")).starts_with("OK "));
+    }
+
+    #[test]
+    fn doc_read_refuses_a_private_edit_s_document_and_reads_an_ordinary_one() {
+        let text = "name\thunter2\n";
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-doc-private-")
+            .tempdir()
+            .unwrap();
+        let folder = dir.path().join("att-edit-t.private.noindex");
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("address.tsv");
+        std::fs::write(&path, text).unwrap();
+        let private = Fixture {
+            uri: crate::native_document_host::path_to_file_uri(&path).unwrap(),
+            path,
+            _dir: dir,
+        };
+        let plain = fixture("address.tsv", text.as_bytes());
+        let mut app = app();
+        let shown = open(&mut app, &private);
+        let secret = document_of(&app, shown).get();
+        for rest in [
+            format!("read {secret}"),
+            format!("read doc={secret} lines=1"),
+            format!("read {}", private.uri),
+            format!("read {}", canonical(&private.path)),
+        ] {
+            assert_eq!(doc(&app, &rest), "ERR refused private doc\n", "doc {rest}");
+        }
+        let listed = doc(&app, "ls");
+        assert_eq!(rows(&listed).len(), 1, "`ls` still lists it");
+        assert!(!listed.contains("hunter2"), "{listed}");
+
+        // The negative control: the same text outside a private edit's folder is read.
+        let shown = open(&mut app, &plain);
+        let ordinary = document_of(&app, shown).get();
+        for rest in [format!("read {ordinary}"), format!("read {}", plain.uri)] {
+            let reply = doc(&app, &rest);
+            let (id, body) = body(&reply);
+            assert_eq!(id, ordinary);
+            assert!(body.contains("hunter2"), "doc {rest}: {reply}");
+        }
     }
 }

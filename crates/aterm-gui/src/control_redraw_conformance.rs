@@ -30,7 +30,11 @@ const SID: u64 = 0;
 const SIBLING_SID: u64 = 1;
 
 const WARMUP: Duration = Duration::from_millis(500);
-const DELIVERY_BUDGET: Duration = Duration::from_secs(2);
+/// How long a redraw `select` posted has to reach the event loop: the one-minute hang detector
+/// (`aterm_spec::wait::MUST_HAPPEN`, a dev-dependency this library cannot name), since the wake is
+/// queued before the pump starts and a loaded machine only delays it. The pump returns at the
+/// first delivery, so a pass waits no longer.
+const DELIVERY_HANG: Duration = Duration::from_secs(60);
 const QUIET: Duration = Duration::from_millis(250);
 
 /// Every `Wake` the loop delivered. The harness asserts on delivery, never on
@@ -114,7 +118,7 @@ pub(super) fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> 
         temporal: Arc::new(Mutex::new(crate::temporal::TemporalRecorder::new())),
         byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
         turns: observed.turns,
-        meta: Mutex::new(crate::session_timeline::SessionMeta::default()),
+        meta: Arc::default(),
         timeline: observed.timeline,
         fabric: std::sync::Arc::default(),
         idem: Default::default(),
@@ -136,6 +140,7 @@ pub(super) fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> 
         witness: Default::default(),
         fenced_writes: Default::default(),
         native_policy: Default::default(),
+        spawn_mark: Default::default(),
     });
     SessionHandle {
         sid,
@@ -231,7 +236,7 @@ pub fn run_redraw_conformance() -> i32 {
             redraw_failures += 1;
             continue;
         }
-        let landed = pump_for_redraws(&mut event_loop, &mut delivered, SID, 1, DELIVERY_BUDGET);
+        let landed = pump_for_redraws(&mut event_loop, &mut delivered, SID, 1, DELIVERY_HANG);
         if landed == 0 {
             eprintln!(
                 "  FAIL select {form}: OK on the wire, but no Wake::Output reached the event loop"

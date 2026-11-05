@@ -757,7 +757,16 @@ fn clear_sink(file: &Path, sink: Sink) {
             let _ = std::fs::remove_file(file);
         }
         Sink::Dest => {
-            if let Ok(open) = std::fs::OpenOptions::new().write(true).open(file) {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+            }
+            if let Ok(open) = opts.open(file)
+                && open.metadata().is_ok_and(|m| m.is_file())
+            {
                 let _ = open.set_len(0);
             }
         }
@@ -1475,16 +1484,20 @@ fn read_capped(path: &Path, cap: u64, url: &str) -> Result<Vec<u8>, HttpError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(HttpError::Transport(format!("read vendor body: {e}"))),
     };
-    if !file
+    let meta = file
         .metadata()
-        .map_err(|e| HttpError::Transport(format!("read vendor body: {e}")))?
-        .is_file()
-    {
+        .map_err(|e| HttpError::Transport(format!("read vendor body: {e}")))?;
+    if !meta.is_file() {
         return Err(HttpError::Transport(
             "read vendor body: not a regular file".to_string(),
         ));
     }
-    let mut bytes = Vec::new();
+    if meta.len() > cap {
+        return Err(HttpError::VendorRefused(format!(
+            "vendor document {url} exceeds its {cap}-byte cap"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
     file.take(cap.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| HttpError::Transport(format!("read vendor body: {e}")))?;

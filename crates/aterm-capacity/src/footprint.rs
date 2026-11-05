@@ -8,8 +8,11 @@
 //! directories claims what the last ones of it there wrote ([`Footprints::need`]): a `-p` run's
 //! small growth is never what a whole-tree run claims, nor a whole-tree run's what a `-p` run
 //! claims. A scope never measured here claims its kind's cold budget, less what its directories
-//! already hold, and no run claims more than that budget for writing again what its directories
-//! held at a peak: a peak further above what they hold now held more than one run writes.
+//! already hold, or, for a kind whose directories are each checkout's own, less where runs in
+//! this machine's other checkouts bound it lower ([`Estimate::or_machine`],
+//! [`crate::MachineFootprints`]); and no run claims more than that budget for writing again what
+//! its directories held at a peak: a peak further above what they hold now held more than one
+//! run writes.
 
 use std::fmt;
 use std::io::{self, Write as _};
@@ -48,29 +51,12 @@ pub fn allocated(paths: &[PathBuf]) -> u64 {
 pub fn allocated_until(paths: &[PathBuf], stopped: &dyn Fn() -> bool) -> u64 {
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     let mut total = 0u64;
-    let mut stack: Vec<PathBuf> = paths.to_vec();
-    while let Some(path) = stack.pop() {
-        if stopped() {
-            break;
-        }
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if meta.is_dir() {
-            stack.extend(
-                std::fs::read_dir(&path)
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .map(|e| e.path()),
-            );
-            continue;
-        }
+    let mut account = |meta: &std::fs::Metadata| {
         #[cfg(unix)]
         let bytes = {
             use std::os::unix::fs::MetadataExt as _;
             if meta.nlink() > 1 && !seen.insert((meta.dev(), meta.ino())) {
-                continue;
+                return;
             }
             meta.blocks().saturating_mul(512)
         };
@@ -80,6 +66,44 @@ pub fn allocated_until(paths: &[PathBuf], stopped: &dyn Fn() -> bool) -> u64 {
             meta.len()
         };
         total = total.saturating_add(bytes);
+    };
+    let mut dirs: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    for path in paths {
+        if stopped() {
+            return total;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            dirs.push(path.clone());
+        } else {
+            account(&meta);
+        }
+    }
+    while let Some(dir) = dirs.pop() {
+        if stopped() {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if stopped() {
+                return total;
+            }
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                dirs.push(entry.path());
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_dir() {
+                    dirs.push(entry.path());
+                } else {
+                    account(&meta);
+                }
+            }
+        }
     }
     total
 }
@@ -128,7 +152,8 @@ pub struct Estimate {
     /// Bytes.
     pub bytes: u64,
     /// The runs it was read from, those measured on the run's own directories
-    /// ([`Footprint::measured_on`]); `0`: the cold budget less what the directories hold.
+    /// ([`Footprint::measured_on`]); `0` with no [`Self::machine`]: the cold budget less what the
+    /// directories hold.
     pub runs: usize,
     /// What the run's directories hold now.
     pub holds: u64,
@@ -137,10 +162,58 @@ pub struct Estimate {
     /// Whether [`Self::cold`] is the figure because it capped a kept run's peak beyond what the
     /// directories hold now: they held more than one run writes then ([`Footprints::need`]).
     pub capped: bool,
+    /// What runs in this machine's checkouts bound the run to, where that is the figure
+    /// ([`Self::or_machine`]): no run of its scope was measured on its directories, and they bound
+    /// it below the cold budget less what its directories hold.
+    pub machine: Option<crate::Cover>,
+}
+
+impl Estimate {
+    /// This estimate, or what this machine's runs bound the run to ([`crate::MachineFootprints::cover`])
+    /// where no run of its scope was measured on its directories ([`Self::runs`] 0, so its figure
+    /// is the cold budget less what they hold) and that bound is less: runs measured on the
+    /// directories themselves say more of what a run writes there than runs elsewhere, and the
+    /// machine's record only ever lowers a claim, never raises one above what it was before it
+    /// was kept.
+    #[must_use]
+    pub fn or_machine(self, cover: Option<crate::Cover>) -> Estimate {
+        match cover {
+            Some(c) if self.runs == 0 && c.bytes < self.bytes => Estimate {
+                bytes: c.bytes,
+                machine: Some(c),
+                ..self
+            },
+            _ => self,
+        }
+    }
 }
 
 impl fmt::Display for Estimate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(c) = self.machine {
+            let read = if c.exact {
+                "the most a run of it".to_owned()
+            } else if c.selections == 1 {
+                "the most a run of the same checks over crates holding its".to_owned()
+            } else {
+                format!(
+                    "summed over {} selections of the same checks whose crates together hold its, \
+                     the most a run of each",
+                    c.selections
+                )
+            };
+            return write!(
+                f,
+                "{}, {read} in this machine's checkouts wrote, or held at its peak beyond {} (the \
+                 least any run the record keeps began from, or these directories hold now, {}), \
+                 of {} run(s) the machine's record keeps: no run of it measured on these \
+                 directories",
+                size(self.bytes),
+                size(c.floor),
+                size(self.holds),
+                c.runs
+            );
+        }
         if self.runs == 0 && self.holds == 0 {
             write!(
                 f,
@@ -256,22 +329,29 @@ impl Footprints {
     /// where none is kept.
     #[must_use]
     pub fn need(&self, holds: u64, cold: u64, dirs: u64, scope: Option<u64>) -> Estimate {
-        let here = || {
-            self.runs
-                .iter()
-                .filter(|r| r.measured_on(dirs) && r.of_scope(scope))
-        };
-        let rewrite = |r: &Footprint| r.peak.saturating_sub(holds);
-        let bytes = here()
-            .map(|r| r.grew.max(rewrite(r).min(cold)))
-            .max()
-            .unwrap_or_else(|| cold.saturating_sub(holds));
+        let mut max_bytes: Option<u64> = None;
+        let mut runs = 0usize;
+        let mut any_over_cold = false;
+        for r in &self.runs {
+            if !r.measured_on(dirs) || !r.of_scope(scope) {
+                continue;
+            }
+            runs += 1;
+            let rewrite = r.peak.saturating_sub(holds);
+            if rewrite > cold {
+                any_over_cold = true;
+            }
+            let b = r.grew.max(rewrite.min(cold));
+            max_bytes = Some(max_bytes.map_or(b, |m| m.max(b)));
+        }
+        let bytes = max_bytes.unwrap_or_else(|| cold.saturating_sub(holds));
         Estimate {
             bytes,
-            runs: here().count(),
+            runs,
             holds,
             cold,
-            capped: bytes == cold && here().any(|r| rewrite(r) > cold),
+            capped: bytes == cold && any_over_cold,
+            machine: None,
         }
     }
 
@@ -360,13 +440,16 @@ impl Footprints {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600).custom_flags(libc::O_CLOEXEC);
+            open.mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         }
         let mut file = open.open(&staged)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
         }
         file.write_all(self.encode().as_bytes())?;
         drop(file);

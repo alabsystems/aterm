@@ -897,6 +897,7 @@ impl Fold {
     ) -> BusFacts {
         let bus_by = |by: Actor| match by {
             Actor::Sid(sid) => alias(&sid).map_or(Actor::Nobody, Actor::sid),
+            Actor::Fleet(_) => Actor::Nobody,
             other => other,
         };
         BusFacts {

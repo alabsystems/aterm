@@ -194,14 +194,18 @@ pub fn scan_listener_holders(path: &std::path::Path, skip: &[u32]) -> io::Result
     listener_scan(path, skip, SCAN_DEADLINE)
 }
 
-/// [`scan_listener_holders`] whose connection to `path` is waited for at most `hang` in place of
-/// [`SCAN_DEADLINE`]: an integration test whose own broker serves `path` passes the one-minute
-/// hang detector, since a loaded machine can keep the spawn lock's holder and the broker from
-/// running for longer than the scan's 10 s.
+/// [`scan_listener_holders`] whose connection to `path` (macOS) or whole scan (Linux) is waited
+/// for at most `hang` in place of [`SCAN_DEADLINE`]: a test whose own broker serves `path`
+/// passes the one-minute hang detector, and a debug `aterm fabric` the bound its seam names,
+/// since a loaded machine can keep the spawn lock's holder and the broker, or Linux's table
+/// reads, from finishing within the scan's 10 s.
 ///
 /// # Errors
-/// [`scan_listener_holders`]'s, with the connection's `TimedOut` once `hang` is up.
-#[cfg(all(target_vendor = "apple", any(test, debug_assertions)))]
+/// [`scan_listener_holders`]'s, with `TimedOut` once `hang` is up.
+#[cfg(all(
+    any(target_vendor = "apple", target_os = "linux"),
+    any(test, debug_assertions)
+))]
 #[doc(hidden)]
 pub fn scan_listener_holders_within(
     path: &std::path::Path,
@@ -542,12 +546,22 @@ fn listener_holders(
 /// also leaves ownership unknown.
 #[cfg(target_os = "linux")]
 pub fn scan_listener_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<HolderScan> {
+    listener_scan(path, skip, SCAN_DEADLINE)
+}
+
+/// [`scan_listener_holders`], its reads waited for at most `hang` ([`within`]).
+#[cfg(target_os = "linux")]
+fn listener_scan(
+    path: &std::path::Path,
+    skip: &[u32],
+    hang: std::time::Duration,
+) -> io::Result<HolderScan> {
     use std::os::unix::fs::MetadataExt as _;
     // SAFETY: `geteuid` is a side-effect-free getter.
     let me = unsafe { libc::geteuid() };
     let (path, skip) = (path.to_path_buf(), skip.to_vec());
-    within(SCAN_DEADLINE, TABLES, HUNG, move || {
-        let listeners = diag::unix_listeners(SCAN_DEADLINE)?;
+    within(hang, TABLES, HUNG, move || {
+        let listeners = diag::unix_listeners(hang)?;
         let target = SocketPath::of(&path);
         let placed = listener_target_inode(
             std::fs::symlink_metadata(&path).map(|m| (m.ino(), m.file_type().is_symlink())),

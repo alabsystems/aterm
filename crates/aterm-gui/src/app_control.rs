@@ -206,6 +206,23 @@ pub(crate) fn parse_open(rest: &str) -> Result<OpenRequest, String> {
     }
 }
 
+/// What `inspect` and the visible-text snapshot print in place of a private document's view.
+pub(crate) const PRIVATE_VIEW_WITHHELD: &str = "withheld: a private document's text is not served";
+
+/// What `text`, `screen`, `image`, `window`, `video`, `pointer` and `invoke` answer while a private
+/// document's view is the front tab's content or one of its panes, and `act` on that view: as
+/// `doc read` refuses the document, a capture of the frame or a read of the front would carry the
+/// same values, and a press, click or menu action there would select, copy or close them for a
+/// controller.
+pub(crate) const PRIVATE_VIEW_REFUSED: &str =
+    "refused private view: the front tab shows a private document";
+
+/// What `hwkey` answers while any tab of the front window holds a private document's view: a
+/// burst reads the front once per turn, so a key that switches tabs could otherwise carry the
+/// burst's later keys into that view before the next read.
+pub(crate) const PRIVATE_WINDOW_REFUSED: &str =
+    "refused private view: the front window holds a private document";
+
 fn parse_view(view: WireViewId<'_>) -> Result<ViewId, String> {
     let raw = view
         .as_str()
@@ -252,6 +269,10 @@ impl App {
                     .header_line(),
                     inspected.source_line(),
                 ];
+                if self.view_is_private(view) {
+                    lines.push(PRIVATE_VIEW_WITHHELD.to_owned());
+                    return Ok(lines);
+                }
                 lines.extend(match projection {
                     InspectionProjection::Text => semantic_text_lines(&inspected.compiled),
                     InspectionProjection::Controls => semantic_controls_lines(&inspected.compiled),
@@ -277,6 +298,9 @@ impl App {
             return Err(refusal);
         }
         let (wid, _) = self.locate_native_view(request.view)?;
+        if self.view_is_private(request.view) {
+            return Err(PRIVATE_VIEW_REFUSED.to_owned());
+        }
 
         let mut inspected = self.compile_view(request.view)?;
         let key = UiKey::new(request.ui_key.clone());
@@ -408,6 +432,82 @@ impl App {
                 self.open_document_tab(crate::native_app::AppKind::Editor, &uri)
             }
         }
+    }
+
+    /// Whether `view` edits a private document
+    /// ([`crate::native_document_journal::private_uri`]): `inspect` and the visible-text snapshot
+    /// withhold its text, as `doc read` refuses it.
+    pub(crate) fn view_is_private(&self, view: ViewId) -> bool {
+        let Some(View::Native(native)) = self.view_store.get(view).copied() else {
+            return false;
+        };
+        self.native_runtime
+            .document_id(native.instance)
+            .and_then(|document| self.document_store.canonical_uri(document))
+            .is_some_and(crate::native_document_journal::private_uri)
+    }
+
+    /// Whether a frame laid out by `plan` shows a private document's view
+    /// ([`Self::view_is_private`]) in any pane.
+    pub(crate) fn plan_shows_private(&self, plan: &crate::tab_model::VisibleLeafPlan) -> bool {
+        plan.leaves
+            .iter()
+            .any(|leaf| self.view_is_private(leaf.view))
+    }
+
+    /// Whether `window`'s focused content is a private document's view.
+    pub(crate) fn front_view_is_private(&self, window: WindowId) -> bool {
+        self.active_native_view(window)
+            .is_some_and(|(_, view)| self.view_is_private(view))
+    }
+
+    /// Why a controller's `event`, aimed at `window`'s front (`session` `None`), is refused: the
+    /// focused content is a private document's view, which no controller types into, pastes into
+    /// or copies from. A geometry or focus event touches none of its text.
+    pub(crate) fn controller_input_refusal(
+        &self,
+        window: WindowId,
+        session: Option<u64>,
+        event: &crate::input::InputEvent,
+    ) -> Option<&'static str> {
+        use crate::input::InputEvent;
+        (session.is_none()
+            && !matches!(
+                event,
+                InputEvent::Resize { .. }
+                    | InputEvent::ResizeWindowPx { .. }
+                    | InputEvent::Focus(_)
+            )
+            && self.front_view_is_private(window))
+        .then_some(PRIVATE_VIEW_REFUSED)
+    }
+
+    /// Whether `window`'s front tab shows a private document's view in any pane.
+    pub(crate) fn window_shows_private(&self, window: WindowId) -> bool {
+        self.active_visible_leaf_plan(window)
+            .is_some_and(|plan| self.plan_shows_private(&plan))
+    }
+
+    /// What a controller's `invoke` answers while the front window's front tab shows a private
+    /// document's view in any pane ([`Self::window_shows_private`]): a menu action there would
+    /// select, copy or close its values for the controller.
+    pub(crate) fn invoke_private_refusal(&self) -> Option<&'static str> {
+        self.frontmost_window
+            .is_some_and(|window| self.window_shows_private(window))
+            .then_some(PRIVATE_VIEW_REFUSED)
+    }
+
+    /// Whether any tab of `window`, in front or not, parked or not, holds a private document's
+    /// view.
+    pub(crate) fn window_holds_private(&self, window: WindowId) -> bool {
+        self.windows.get(&window).is_some_and(|ws| {
+            ws.tab_set.tabs().iter().any(|tab| {
+                tab.root
+                    .leaves()
+                    .into_iter()
+                    .any(|view| self.view_is_private(view))
+            })
+        })
     }
 
     pub(crate) fn locate_native_view(
@@ -1519,7 +1619,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, "bidi = \"sideways\"\n").unwrap();
+        crate::test_scratch::write_config(&path, "bidi = \"sideways\"\n");
 
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
 
@@ -2299,10 +2399,12 @@ mod tests {
     /// A PERSON-ONLY BUTTON TAKES A PERSON'S OWN PRESS: Settings ▸ Security's Full Disk Access
     /// button pressed through the window's accessibility tree (a tab's program reaches it with
     /// aterm's own Accessibility grant) is refused by the list `act` refuses it by, and so is a
-    /// control client's key or click on it, the page left as it was. The refusal stands where
-    /// every input meets the page's reducer, so the action dispatched as a palette command
-    /// dispatches it, under either mark, is refused too.
-    /// NEGATIVE CONTROL: the person's own press of it is taken.
+    /// control client's key or click on it, and a key or click another process posted into the
+    /// window (`InputOrigin::Relayed`), the page left as it was. The refusal stands where every
+    /// input meets the page's reducer, so the action dispatched as a palette command dispatches
+    /// it, under any of those marks, is refused too.
+    /// NEGATIVE CONTROL: the person's own press of it is taken. With the relayed mark left out of
+    /// `App::gesture_unvouched`, the relayed press met no refusal.
     #[cfg(a11y_tree)]
     #[test]
     fn a_person_only_button_is_pressed_by_no_accessibility_or_control_client() {
@@ -2312,10 +2414,11 @@ mod tests {
         enum By {
             Assistive,
             Controller,
+            Relayed,
             Person,
         }
         let wid = WindowId(0);
-        for by in [By::Assistive, By::Controller, By::Person] {
+        for by in [By::Assistive, By::Controller, By::Relayed, By::Person] {
             let mut app = App::headless_for_test();
             if let Some(window) = app.windows.get_mut(&wid) {
                 window.cols = 160;
@@ -2377,6 +2480,14 @@ mod tests {
                     assert!(refusal.is_some(), "the list names the button");
                     assert_eq!(app.with_controller_mark(true, press).err(), refusal);
                     assert_eq!(app.with_controller_mark(true, command).err(), refusal);
+                }
+                By::Relayed => {
+                    use aterm_window::event::InputOrigin::Relayed;
+                    let refusal =
+                        app.with_origin_mark(Relayed, |app| app.person_only_press_refusal(&id));
+                    assert!(refusal.is_some(), "the list names the button");
+                    assert_eq!(app.with_origin_mark(Relayed, press).err(), refusal);
+                    assert_eq!(app.with_origin_mark(Relayed, command).err(), refusal);
                 }
                 By::Person => {
                     assert_eq!(app.person_only_press_refusal(&id), None);

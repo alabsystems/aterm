@@ -201,6 +201,10 @@ pub(crate) struct EpState {
     log: Option<String>,
     /// Every request line, cut, for the trace.
     pub(crate) requests: Vec<String>,
+    /// The `deliver` lines that came in one write with another (`Bridge::send_rows`).
+    pub(crate) deliveries_pipelined: u64,
+    /// The `outbox sent` lines that came in one write with another (`Bridge::retire_on_the_lane`).
+    pub(crate) retires_pipelined: u64,
     /// The node mirrors its sessions' logs.
     pub(crate) mirror: bool,
     /// How many torn state files the bridges said they set aside (`link set-aside files=<n>`).
@@ -354,6 +358,7 @@ impl Write for Answered {
             ));
         }
         self.asked.extend_from_slice(buf);
+        let (mut delivers, mut retires) = (0, 0);
         while let Some(end) = self.asked.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.asked.drain(..=end).collect();
             let request = std::str::from_utf8(&line[..end]).map_err(|_| {
@@ -362,10 +367,18 @@ impl Write for Answered {
                     "a request line that is not UTF-8",
                 )
             })?;
+            delivers += u64::from(request.starts_with("deliver "));
+            retires += u64::from(request.starts_with("outbox sent "));
             let reply = self.ep.answer(request);
             if !self.read_shut {
                 self.replies.extend(reply.as_bytes());
             }
+        }
+        if delivers > 1 {
+            lock(&self.ep.state).deliveries_pipelined += delivers;
+        }
+        if retires > 1 {
+            lock(&self.ep.state).retires_pipelined += retires;
         }
         Ok(buf.len())
     }

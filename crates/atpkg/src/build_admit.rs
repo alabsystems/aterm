@@ -561,6 +561,15 @@ pub struct Held {
 }
 
 impl Held {
+    #[cfg(target_os = "macos")]
+    fn into_epoch_parts(self) -> (Claim, Ended) {
+        let Held {
+            claim, key, own, ..
+        } = self;
+        let claimed = claim.record().need.mem;
+        (claim, Ended { claimed, key, own })
+    }
+
     /// The claim.
     #[must_use]
     pub const fn claim(&self) -> &Claim {

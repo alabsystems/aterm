@@ -169,7 +169,18 @@ pub fn stock_location(path: &Path) -> Option<&'static str> {
 
 /// Ok when the file opens as a native object (Mach-O or ELF), else why not.
 fn native_head(path: &Path) -> Result<(), String> {
-    let head = crate::metadata_io::read_head(path, 8).map_err(|e| format!("cannot read: {e}"))?;
+    let head = match crate::metadata_io::read_head(path, 8) {
+        Ok(head) => head,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::IsADirectory
+            ) =>
+        {
+            return Err("is not a regular file".to_string());
+        }
+        Err(e) => return Err(format!("cannot read: {e}")),
+    };
     if crate::macho::is_macho_header(&head) || head.starts_with(b"\x7fELF") {
         Ok(())
     } else if head.starts_with(b"#!") {
@@ -199,13 +210,6 @@ fn admit_file(path: &Path, what: &str, refusals: &mut Vec<String>) -> Option<Pat
         ));
         return None;
     }
-    if !std::fs::metadata(&canonical).is_ok_and(|m| m.is_file()) {
-        refusals.push(format!(
-            "{what} {} is not a regular file",
-            canonical.display()
-        ));
-        return None;
-    }
     if let Err(why) = native_head(&canonical) {
         refusals.push(format!("{what} {} {why}", canonical.display()));
         return None;
@@ -219,13 +223,13 @@ fn find_driver(root: &Path, refusals: &mut Vec<String>) -> Option<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(&lib)
         .map(|rd| {
             rd.filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                .filter(|e| {
+                    e.file_name().to_str().is_some_and(|n| {
                         n.starts_with("librustc_driver-")
                             && (n.ends_with(".dylib") || n.ends_with(".so"))
                     })
                 })
+                .map(|e| e.path())
                 .collect()
         })
         .unwrap_or_default();
@@ -459,8 +463,7 @@ pub fn admit_lineage(
         });
     }
     if std::fs::symlink_metadata(&seed_mint).is_ok() {
-        let mut refusals = seed_mint_refusals_inner(&c.root, &c.version.commit, true);
-        let receipt = read_receipt(&seed_mint);
+        let (receipt, mut refusals) = seed_mint_refusals_inner(&c.root, &c.version.commit, true);
         let receipt_sha256 = receipt
             .as_ref()
             .map(|r| r.sha256.clone())
@@ -563,26 +566,46 @@ fn inside(root: &Path, rel: &str) -> Option<PathBuf> {
 /// The seal's SEED-MINT refusals, one line each; empty when `<seal>/SEED-MINT` is a double-compile-backed re-pin receipt of `commit` whose every compared file and link is in `<seal>` as compared — so it describes THIS seal.
 #[must_use]
 pub fn seed_mint_refusals(seal: &Path, commit: &str) -> Vec<String> {
-    seed_mint_refusals_inner(seal, commit, true)
+    seed_mint_refusals_inner(seal, commit, true).1
 }
 
-fn seed_mint_refusals_inner(seal: &Path, commit: &str, compare_files: bool) -> Vec<String> {
+fn seed_mint_refusals_inner(
+    seal: &Path,
+    commit: &str,
+    compare_files: bool,
+) -> (Option<Receipt>, Vec<String>) {
     let path = seal.join(SEED_MINT_FILE);
-    if std::fs::symlink_metadata(&path).is_err() {
-        return vec![
-            "the seal carries no SEED-MINT, so it was not cut by the trust repo's \
-             scripts/mint_and_prove_seed.sh (built from the src/stage0 pin, double-compiled \
-             against another compiler, re-pinned). Cut it there, seal its \
-             build/pack-mint-*/<host>/stage2 with scripts/promote-toolchain.sh, and point \
-             SEAL at that seal"
-                .to_string(),
-        ];
-    }
     let Some(r) = read_receipt(&path) else {
-        return vec![format!(
-            "SEED-MINT is not a readable regular file of at most {RECEIPT_LIMIT} bytes"
-        )];
+        if std::fs::symlink_metadata(&path).is_err() {
+            return (
+                None,
+                vec![
+                    "the seal carries no SEED-MINT, so it was not cut by the trust repo's \
+                     scripts/mint_and_prove_seed.sh (built from the src/stage0 pin, double-compiled \
+                     against another compiler, re-pinned). Cut it there, seal its \
+                     build/pack-mint-*/<host>/stage2 with scripts/promote-toolchain.sh, and point \
+                     SEAL at that seal"
+                        .to_string(),
+                ],
+            );
+        }
+        return (
+            None,
+            vec![format!(
+                "SEED-MINT is not a readable regular file of at most {RECEIPT_LIMIT} bytes"
+            )],
+        );
     };
+    let out = seed_mint_refusals_for_receipt(seal, &r, commit, compare_files);
+    (Some(r), out)
+}
+
+fn seed_mint_refusals_for_receipt(
+    seal: &Path,
+    r: &Receipt,
+    commit: &str,
+    compare_files: bool,
+) -> Vec<String> {
     let mut out = Vec::new();
     if r.field("schema") != SEED_MINT_SCHEMA {
         out.push(format!(
@@ -635,17 +658,17 @@ fn seed_mint_refusals_inner(seal: &Path, commit: &str, compare_files: bool) -> V
     }
     let mut bad: Vec<&str> = Vec::new();
     for (want, rel) in &r.files {
-        let got = inside(seal, rel)
-            .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
-            .and_then(|p| crate::tree::sha256_file(&p).ok());
+        // sha256_file opens with O_NOFOLLOW and fstats a regular file,
+        // avoiding a separate lstat before reading.
+        let got = inside(seal, rel).and_then(|p| crate::tree::sha256_file(&p).ok());
         if got.as_deref() != Some(want.as_str()) {
             bad.push(rel);
         }
     }
     for (want, rel) in &r.links {
-        let got = inside(seal, rel)
-            .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
-            .and_then(|p| std::fs::read_link(p).ok());
+        // read_link inspects the link itself and fails on non-symlinks,
+        // avoiding a separate lstat before reading the link target.
+        let got = inside(seal, rel).and_then(|p| std::fs::read_link(p).ok());
         if got.as_deref() != Some(Path::new(want)) {
             bad.push(rel);
         }
@@ -711,7 +734,12 @@ fn lineage_record_refusals(c: &CompilerContent) -> Result<(String, String), Vec<
     let relation = rec.field("ddc_seed_relation");
     match read_receipt(&c.root.join(SEED_MINT_FILE)) {
         Some(mint) if mint.sha256 == receipt_sha256 => {
-            out.extend(seed_mint_refusals_inner(&c.root, &c.version.commit, false));
+            out.extend(seed_mint_refusals_for_receipt(
+                &c.root,
+                &mint,
+                &c.version.commit,
+                false,
+            ));
             if mint.field("ddc_seed_relation") != relation {
                 out.push(format!(
                     "{LINEAGE_FILE} records ddc_seed_relation '{relation}' but its SEED-MINT \
@@ -796,6 +824,68 @@ pub fn scan_object(path: &Path, admitted: &str) -> std::io::Result<BTreeMap<Evid
     scan_file(path, admitted, false).map(|(hits, _)| hits)
 }
 
+/// Whether `path` has a compiled-output filename extension or `.so.` suffix.
+fn has_compiled_name(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e,
+            "rlib" | "rmeta" | "a" | "o" | "so" | "dylib" | "dll" | "wasm"
+        )
+    }) || path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains(".so."))
+}
+
+/// Whether `head` starts with a compiled-output magic header.
+fn has_compiled_header(head: &[u8]) -> bool {
+    crate::macho::is_macho_header(head)
+        || head.starts_with(b"\x7fELF")
+        || head.starts_with(b"MZ")
+        || head.starts_with(b"\0asm")
+        || head.starts_with(b"!<arch>\n")
+        || head.starts_with(b"rust\0\0\0")
+}
+
+/// Scan `path` when its name or 8-byte header identifies it as compiled output, reusing the
+/// same opened descriptor when the header check admits it.
+///
+/// # Errors
+/// A named compiled object cannot be opened or read, or an unnamed file admitted by its header
+/// cannot be rewound or scanned.
+pub fn scan_if_compiled_object(
+    path: &Path,
+    admitted: &str,
+) -> std::io::Result<Option<BTreeMap<Evidence, usize>>> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    if has_compiled_name(path) {
+        return scan_object(path, admitted).map(Some);
+    }
+    let Ok((mut f, meta)) = crate::metadata_io::open_regular_with_meta(path) else {
+        return Ok(None);
+    };
+    if meta.len() < 2 {
+        return Ok(None);
+    }
+    let mut head = [0u8; 8];
+    let mut n = 0usize;
+    while n < head.len() {
+        match f.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Ok(None),
+        }
+    }
+    if !has_compiled_header(&head[..n]) {
+        return Ok(None);
+    }
+    f.seek(SeekFrom::Start(0))?;
+    let chunk = usize::try_from(meta.len())
+        .map_or(CHUNK, |len| len.saturating_add(1).clamp(TAIL * 2, CHUNK));
+    scan_stream(f, admitted, false, chunk).map(|(hits, _)| Some(hits))
+}
+
 /// The sha256 of the receipt at `path` (a `SEED-MINT`), as a `LINEAGE` record names it: `None` when it is not a readable regular file of at most the receipt limit.
 #[must_use]
 pub fn receipt_sha256(path: &Path) -> Option<String> {
@@ -816,8 +906,8 @@ fn scan_file(
     admitted: &str,
     hash: bool,
 ) -> std::io::Result<(BTreeMap<Evidence, usize>, Option<String>)> {
-    let f = crate::metadata_io::open_regular(path)?;
-    let len = f.metadata()?.len();
+    let (f, meta) = crate::metadata_io::open_regular_with_meta(path)?;
+    let len = meta.len();
     let chunk = usize::try_from(len).map_or(CHUNK, |n| n.saturating_add(1).clamp(TAIL * 2, CHUNK));
     scan_stream(f, admitted, hash, chunk)
 }

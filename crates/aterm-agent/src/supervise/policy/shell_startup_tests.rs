@@ -394,6 +394,202 @@ fn what_runs_before_every_command_besides_the_snapshot_is_read() {
     assert!(why.contains("`ZDOTDIR`"), "{why}");
 }
 
+/// A glob may meet a name's leading dot wherever the startup may turn `GLOB_DOTS` or `dotglob` on
+/// unseen: a line at either snapshot's top level this check does not read, a `.zshenv` not proven
+/// to set no option, a shell the Bash tool may run with no snapshot of its own read, and bash
+/// with `GLOBIGNORE` in its environment. A snapshot whose every top-level line is read leaves it
+/// off, as does a bash worker's read with no `GLOBIGNORE` (bash reads no `.zshenv`, which keeps a
+/// host's `/etc/zshenv` out of it).
+#[test]
+fn a_glob_may_meet_a_leading_dot_wherever_the_startup_may_set_it_unseen() {
+    let parsed = |kind: Kind, snapshot: &str| {
+        let mut state = ShellStartup::default();
+        parse_snapshot(kind, snapshot, "s", &mut state).expect("read");
+        state
+    };
+    let zsh = parsed(Kind::Zsh, &zsh_snapshot("options[globdots]=on\n", "", ""));
+    assert!(zsh.may_dot_glob() && zsh.may_extended_glob(), "{zsh:?}");
+    let bash = parsed(Kind::Bash, &bash_snapshot(&[], "GLOBIGNORE=zz\n", "", ""));
+    assert!(bash.may_dot_glob() && !bash.may_extended_glob(), "{bash:?}");
+    let s = Scratch::new("dotglob-zshenv");
+    s.snapshot("zsh", 1, &zsh_snapshot("", "", ""));
+    std::fs::write(s.home().join(".zshenv"), "typeset -U path\n").expect("zshenv");
+    let state = s.read(&s.worker("/bin/zsh", &[])).expect("read");
+    assert!(state.may_dot_glob(), "an unproven .zshenv: {state:?}");
+    let s = Scratch::new("dotglob-env");
+    s.snapshot("bash", 1, &bash_snapshot(&[], "", "", ""));
+    let state = s
+        .read(&s.worker("/bin/bash", &["GLOBIGNORE=zz"]))
+        .expect("read");
+    assert!(state.may_dot_glob(), "GLOBIGNORE: {state:?}");
+    for (snapshot, worker) in [
+        ("bash", ["/bin/zsh", "CLAUDE_CODE_SHELL=/bin/bash"]),
+        ("zsh", ["/bin/bash", "CLAUDE_CODE_SHELL=/bin/zsh"]),
+    ] {
+        let s = Scratch::new("dotglob-unseen");
+        let text = if snapshot == "zsh" {
+            zsh_snapshot("", "", "")
+        } else {
+            bash_snapshot(&[], "", "", "")
+        };
+        s.snapshot(snapshot, 1, &text);
+        let state = s.read(&s.worker(worker[0], &worker[1..])).expect("read");
+        assert!(
+            state.may_dot_glob(),
+            "only a {snapshot} snapshot read: {state:?}"
+        );
+    }
+    // NEGATIVE CONTROL
+    for state in [
+        parsed(
+            Kind::Zsh,
+            &zsh_snapshot("f () {\n\tsetopt globdots\n}\n", "", ""),
+        ),
+        parsed(Kind::Zsh, &zsh_snapshot("", "", "alias -- ll='ls -l'\n")),
+        parsed(
+            Kind::Bash,
+            &bash_snapshot(
+                &[("extglob", true)],
+                "eval $'rm () \\n{ \\n    command rm -i \"$@\"\\n}' > /dev/null 2>&1\n",
+                "set -o noclobber\n",
+                "alias -- ll='ls -l'\n",
+            ),
+        ),
+    ] {
+        assert!(!state.may_dot_glob(), "{state:?}");
+    }
+    let s = Scratch::new("dotglob-clean");
+    s.snapshot("bash", 1, &bash_snapshot(&[], "", "", ""));
+    let state = s.read(&s.worker("/bin/bash", &[])).expect("read");
+    assert!(!state.may_dot_glob() && !state.may_run_zsh(), "{state:?}");
+}
+
+/// zsh's `EXTENDED_GLOB` may be on wherever the startup may set it unseen: a zsh snapshot's
+/// `setopt extendedglob` in any spelling zsh reads, a line at the snapshot's top level this check
+/// does not read, a `.zshenv` not proven to set no option, or zsh running with no snapshot of its
+/// own read. A snapshot whose every top-level line is read and sets it nowhere, and a `.zshenv`
+/// of plain assignments, leave it off (judged by the parts themselves, which a host's
+/// `/etc/zshenv` does not reach).
+#[test]
+fn extended_glob_may_be_on_wherever_the_startup_may_set_it_unseen() {
+    let read = |snapshot: &str, zshenv: Option<&str>| {
+        let s = Scratch::new("xglob");
+        s.snapshot("zsh", 1, snapshot);
+        if let Some(text) = zshenv {
+            std::fs::write(s.home().join(".zshenv"), text).expect("zshenv");
+        }
+        s.read(&s.worker("/bin/zsh", &[]))
+            .expect("a startup this check reads")
+    };
+    for spelling in [
+        "extendedglob",
+        "EXTENDED_GLOB",
+        "extended_glob",
+        "Extended_Glob",
+    ] {
+        let state = read(&zsh_snapshot("", &format!("setopt {spelling}\n"), ""), None);
+        assert!(state.may_extended_glob(), "{spelling}");
+    }
+    for top in [
+        "options[extendedglob]=on\n",
+        "options+=(extendedglob on)\n",
+        "turn_it_on\n",
+        "export X=1\n",
+    ] {
+        let state = read(&zsh_snapshot(top, "", ""), None);
+        assert!(state.may_extended_glob(), "a top-level line: {top:?}");
+    }
+    for zshenv in [
+        "typeset -U path\n",
+        "X=$(id -u)\n",
+        "export X=\"a b\"\n",
+        "ZDOTDIR=$HOME/.zsh\n",
+        "[[ -n $SSH_TTY ]] && export X=1\n",
+        "x=1 tool\n",
+        "N=${#PATH}\n",
+    ] {
+        let state = read(&zsh_snapshot("", "", ""), Some(zshenv));
+        assert!(state.may_extended_glob(), "a .zshenv: {zshenv:?}");
+    }
+    let s = Scratch::new("xglob-bash");
+    s.snapshot("bash", 1, &bash_snapshot(&[], "", "", ""));
+    let state = s
+        .read(&s.worker("/bin/zsh", &["CLAUDE_CODE_SHELL=/bin/bash"]))
+        .expect("bash's snapshot");
+    assert!(
+        state.may_run_zsh() && state.may_extended_glob(),
+        "zsh may run with none of its own snapshots read: {state:?}"
+    );
+    // NEGATIVE CONTROL
+    for snapshot in [
+        zsh_snapshot("", "", ""),
+        zsh_snapshot("", "setopt noextendedglob\nsetopt NO_EXTENDED_GLOB\n", ""),
+        zsh_snapshot("f () {\n\tsetopt localoptions extendedglob\n}\n", "", ""),
+        zsh_snapshot("", "", "alias -- ll='ls -l'\n"),
+    ] {
+        let mut state = ShellStartup::default();
+        parse_snapshot(Kind::Zsh, &snapshot, "s", &mut state).expect("read");
+        assert!(
+            state.may_run_zsh() && !state.may_extended_glob(),
+            "{snapshot:?}"
+        );
+    }
+    for zshenv in [
+        "",
+        "# setopt extendedglob\n\nexport PATH=\"$HOME/bin:${PATH}\"\n",
+        "export LANG=en_US.UTF-8 EDITOR\nX=1 # a note\nexport GOPATH=$HOME/go\n",
+    ] {
+        assert_eq!(zshenv_hazard(zshenv), None, "{zshenv:?}");
+        assert!(zshenv_sets_no_option(zshenv), "{zshenv:?}");
+    }
+}
+
+/// A `.zshenv` that names `options` or `histchars` (`HISTCHARS`) as a parameter, or holds a
+/// parameter flag, may set an option or move the comment character unseen, so it fails every
+/// line. MEASURED 2026-11-05 with zsh 5.9, each in a `.zshenv` a `zsh -c` read: the first three
+/// rows, the `(P)` pair and the `print -v` row set `EXTENDED_GLOB`, and the three `histchars`
+/// rows made `#c` no comment, so the command after it on that line ran
+/// (`docs/measured/classifier-zsh-glob-2026-11-05.md`). A value that only spells the word is no
+/// parameter.
+#[test]
+fn a_zshenv_naming_options_or_histchars_or_a_parameter_flag_fails_every_line() {
+    for (text, verdict) in [
+        ("options+=(extendedglob on)", "its line 1 names `options`"),
+        ("options=(extendedglob on)", "its line 1 names `options`"),
+        (
+            "export A=1\noptions[extendedglob]=on",
+            "its line 2 runs `options`",
+        ),
+        (
+            "n=options\\[extendedglob\\]; : ${(P)n::=on}",
+            "its line 1 holds a parameter flag `${(`",
+        ),
+        ("histchars='!^x'", "its line 1 names `histchars`"),
+        ("HISTCHARS='!^x'", "its line 1 names `HISTCHARS`"),
+        ("typeset histchars=x", "its line 1 names `histchars`"),
+        (
+            "print -v 'options[extendedglob]' on",
+            "its line 1 runs `options`",
+        ),
+    ] {
+        assert_eq!(zshenv_hazard(text).as_deref(), Some(verdict), "{text}");
+    }
+    let s = Scratch::new("zshenv-names");
+    s.snapshot("zsh", 1, &zsh_snapshot("", "", ""));
+    std::fs::write(s.home().join(".zshenv"), "options+=(globsubst on)\n").expect("zshenv");
+    let why = s.read(&s.worker("/bin/zsh", &[])).expect_err("options");
+    assert!(why.contains("its line 1 names `options`"), "{why}");
+    // NEGATIVE CONTROL
+    for text in [
+        "export GREP_OPTIONS=\"--exclude-options\"",
+        "export MY_OPTIONS=1 LESSHISTFILE=-",
+        "N=${#PATH}",
+        "export PATH=\"$HOME/bin:${PATH}\"",
+    ] {
+        assert_eq!(zshenv_hazard(text), None, "{text}");
+    }
+}
+
 #[test]
 fn a_word_is_named_only_whole() {
     for (line, hit) in [

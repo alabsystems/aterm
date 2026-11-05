@@ -116,6 +116,7 @@ developer_tools = ["aterm"]
 
 /// The SHA-256 of every earlier [`DEFAULT_BASELINE`], as `init` wrote it.
 pub const EARLIER_DEFAULT_BASELINES: &[&str] = &[
+    // The shipped starter before the aCaffeine spelling correction, with the vault server on.
     "cde13089544c52e4e8746fe671b083d4483482637c84221d9539303b3fd74363",
     "74dcb0817721f664b3a2b1d4c349e07cd110b6b76e5963f75a0fddc5586323e8",
     "e38407721722b11a0faac79954f4906f57eb92d4760bae3f092a00737380a11a",

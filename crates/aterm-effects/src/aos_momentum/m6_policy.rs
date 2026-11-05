@@ -22,7 +22,7 @@ pub const RANKER_POLICY_VERSION: u32 = 1;
 
 /// The digest of [`RankerPolicy::v1`]'s artifact, pinned, which only a reviewed source commit moves.
 pub const M6_POLICY_V1_DIGEST: Digest =
-    hex_digest("435576b89393611eb37d06ee286dbb2ec4ae711c35f1bc3c4af829008f75d8f3");
+    hex_digest("7072ba8a33d3905426bbf9102eb87b019750fb7dd35d64dd331c40a8ba07653f");
 
 /// The digest of every set v1 draws ([`sets_digest`]), pinned.
 pub const M6_SETS_V1_DIGEST: Digest =

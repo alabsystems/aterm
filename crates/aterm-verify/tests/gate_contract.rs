@@ -30,7 +30,6 @@ fn land() -> Vec<Check> {
                     | Check::Browser
                     | Check::Measure
                     | Check::Checkers
-                    | Check::GpuOracle
                     | Check::CodexAlab
                     | Check::Linux
             )

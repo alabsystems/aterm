@@ -31,6 +31,21 @@ use super::{Kind, MAX_RECORDS_STREAM};
 pub const MAX_WEIGHED_RECORDS: usize = 4096;
 /// The most keyed records (every kind [`Kind::weighed`] is not) a [`Log`](super::Log) holds.
 pub const MAX_KEYED_RECORDS: usize = 12_288;
+/// The keyed records past which an automatic batch no writer waits on waits for checkpoints
+/// (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §8, "The 8,500 stop"): the ranked tender's re-key
+/// of an audience that no held `Remove` made due (a coalesce of concurrent heads after no
+/// removal, an F21 reseal's re-`Put`s) is not signed where the log's keyed records and the
+/// batch's planned ones together would pass it, and stays due. A heal, a person's act and every
+/// batch a held `Remove` made due never wait: writers wait on those (one-mesh M4), and their room
+/// is kept instead, as each way a person removes a Mac (`members remove`, `secrets revoke`, a
+/// `code-only` line) refuses up front where its own batch and the worst-case re-keys it makes
+/// due would pass [`MAX_KEYED_RECORDS`] (`client/remove.rs`'s `RemovalFill`), and a seat move is
+/// signed only below the proof-admission stop. The stop leaves 3,788 keyed records under that bound,
+/// about 57 removals' worth at the 66 records one costs once the fold lands; the proof-admission
+/// stop (`client/readmit.rs`'s `PROVEN_FILL` of the keyed budget, 9,216) lies between.
+/// [`RecordBudgets::automatic_keyed_stop`] scales it to a test's smaller budgets.
+pub const AUTOMATIC_KEYED_STOP: usize = 8_500;
+const _: () = assert!(AUTOMATIC_KEYED_STOP < MAX_KEYED_RECORDS);
 /// The most records a 0.146-0.152 build takes: it reads a records stream (a pull's answer, a
 /// POST, a records file) and a Commons control inventory (`commons::journal::MAX_NODES`) of at
 /// most this many, and refuses a longer one whole.
@@ -217,6 +232,15 @@ impl RecordBudgets {
         );
         let _restore = Restore(WITHIN.with(|within| within.replace(Some(self))));
         run()
+    }
+
+    /// [`AUTOMATIC_KEYED_STOP`] scaled to this keyed budget as it is to [`MAX_KEYED_RECORDS`],
+    /// rounded down: exactly 8,500 under [`RecordBudgets::PRODUCTION`], and the same share of a
+    /// test's smaller budget ([`RecordBudgets::within`]), so the stop lies as far below the hard
+    /// bound there as it does in the lab.
+    #[must_use]
+    pub const fn automatic_keyed_stop(self) -> usize {
+        self.keyed.saturating_mul(AUTOMATIC_KEYED_STOP) / MAX_KEYED_RECORDS
     }
 
     /// The first budget `more` records past `held` would pass, the held total first; `None` where

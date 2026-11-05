@@ -99,6 +99,9 @@ pub(crate) trait NudgeWorld {
     ) -> PtyGuard;
     fn log(&mut self, line: String);
     fn mark_tried(&mut self, session: u64, epoch: u64);
+    /// The attempt for `epoch` held and the program answered no size: a repaint after it is the
+    /// program's own (`by=app`), never the nudge's.
+    fn unrepaired(&mut self, session: u64, epoch: u64);
     fn stamp(&mut self, session: u64, phase: &'static str, nudged: u32);
     fn publish(&mut self, session: u64);
     fn give_up(&mut self, session: u64, epoch: u64, why: GiveUp);
@@ -503,7 +506,7 @@ impl NudgeHost {
             Act::Dropped(_) => {}
             Act::GaveUp(why) => {
                 if matches!(why, GiveUp::NoAnswer) {
-                    w.mark_tried(sid, epoch);
+                    w.unrepaired(sid, epoch);
                 }
                 w.give_up(sid, epoch, why);
             }
@@ -770,6 +773,16 @@ impl NudgeWorld for AppWorld<'_> {
         self.gave_up.push((session, epoch, why));
     }
 
+    fn unrepaired(&mut self, session: u64, epoch: u64) {
+        if let Some(s) = self.app.pool.get(session) {
+            s.ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .note_resize_unrepaired(epoch);
+        }
+    }
+
     fn superseded(&mut self, session: u64, epoch: u64) {
         if let Some(s) = self.app.pool.get(session) {
             s.ctx
@@ -1015,6 +1028,9 @@ mod tests {
         }
         fn give_up(&mut self, session: u64, epoch: u64, why: GiveUp) {
             self.s.borrow_mut().gave_up.push((session, epoch, why));
+        }
+        fn unrepaired(&mut self, session: u64, epoch: u64) {
+            self.s.borrow_mut().tried.push((session, epoch));
         }
         fn superseded(&mut self, session: u64, epoch: u64) {
             self.s.borrow_mut().superseded.push((session, epoch));

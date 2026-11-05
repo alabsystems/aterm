@@ -5,9 +5,49 @@ use super::*;
 use aterm_secrets::{client, commons::roster::Grant, text::Audience};
 use std::time::Duration;
 
+#[test]
+fn account_targets_wait_for_a_writer_instead_of_admitting_a_denied_peer() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let paths = &lab.paths[0];
+    let mut roster = client::admin_seed_swarm_roster(paths, &[]).unwrap();
+    roster.deny_labels.push("m2".to_owned());
+    let admin = client::admin_open(paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Everyone,
+        client::SWARM_ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(paths, &admin, &doc).unwrap();
+    client::sync(paths, None).unwrap();
+    let bootstrap = lab.bootstrap(0);
+    let peer = lab.bootstrap(1).request().unwrap().binding().actor();
+    let session = Session::observe(&bootstrap).unwrap();
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(Some(
+        client::test_hold_state_lock(paths).unwrap(),
+    )));
+    let old = client::test_without_roster_wait(|| session.observed_account_targets()).unwrap();
+    assert!(
+        old.iter().any(|binding| binding.actor() == peer),
+        "negative control admits the denied peer"
+    );
+    let release = writer.clone();
+    let targets = client::test_with_denied_nodes_busy(
+        move || drop(release.borrow_mut().take()),
+        || session.observed_account_targets(),
+    )
+    .unwrap();
+    assert!(!targets.iter().any(|binding| binding.actor() == peer));
+    assert!(
+        writer.borrow().is_none(),
+        "the check observed the writer before release"
+    );
+}
+
 pub(crate) use super::fixture::{
-    Lab, NETWORK, repair_commons, repair_commons_among, repair_commons_among_first,
-    repair_commons_at, repair_commons_first, repair_commons_reports,
+    Lab, NETWORK, repair_commons, repair_commons_among_first, repair_commons_at,
+    repair_commons_first, repair_commons_reports,
 };
 
 /// One Commons round between Macs `a` (initiator) and `b` (responder), each with its ring windows
@@ -223,10 +263,11 @@ fn writers_are_the_members_each_peer_writer_check_accepts() {
     let session = Session::observe(&bootstrap).unwrap();
     let accepted = session
         .members()
+        .unwrap()
         .into_iter()
         .filter(|binding| session.peer_writer(binding.actor()).is_ok())
         .collect::<Vec<_>>();
-    assert_eq!(session.writers(), accepted);
+    assert_eq!(session.writers().unwrap(), accepted);
     assert_eq!(
         accepted,
         vec![bootstrap.request().unwrap().binding().clone()]
@@ -355,6 +396,75 @@ fn rotation_preserves_old_read_evidence_and_demotion_does_not_grant_writes() {
         "past authorship is evidence, not a current write grant"
     );
     assert!(session.seal(scope, causal(), b"denied").is_err());
+}
+
+#[test]
+fn observed_session_keeps_its_read_view_and_refuses_other_custody_or_a_writer() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    drop(lab.bootstrap(0));
+    let deadline = crate::admission::deadline();
+    let (bootstrap, journal) =
+        Bootstrap::established_with_journal_until(&lab.paths[0], deadline).unwrap();
+    assert!(!journal.is_writer());
+    let expected = journal.inventory().copied().collect::<Vec<_>>();
+    let held = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap();
+    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline)).unwrap();
+    assert_eq!(
+        session.journal.inventory().copied().collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        session.actor(),
+        bootstrap.request().unwrap().binding().actor()
+    );
+    assert!(
+        session.writer().is_err(),
+        "an observed writer role grants no writer lock"
+    );
+    drop(session);
+    let error = Session::from_observed_journal(&bootstrap, held, Some(deadline))
+        .err()
+        .expect("an exclusively locked journal cannot become a read-only session");
+    assert!(error.to_string().contains("read-only journal"));
+
+    let other = lab.bootstrap(1);
+    let foreign = Journal::read_existing(other.journal_dir(), other.trust()).unwrap();
+    assert_eq!(other.trust(), bootstrap.trust());
+    let error = Session::from_observed_journal(&bootstrap, foreign, Some(deadline))
+        .err()
+        .expect("equal network trust does not identify the observed local custody");
+    assert!(error.to_string().contains("another custody directory"));
+}
+
+#[test]
+fn observed_session_applies_revocation_in_the_supplied_history() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let retained = lab.bootstrap(1);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let deadline = crate::admission::deadline();
+    let (bootstrap, mut journal) = Bootstrap::cached_with_journal_until(&lab.paths[0], deadline)
+        .unwrap()
+        .unwrap();
+    let revocation = admin
+        .prepare_commons_rotation(
+            &journal,
+            vec![Grant::recorded(
+                "m2",
+                retained.request().unwrap().binding().clone(),
+                Role::Writer,
+            )],
+        )
+        .unwrap();
+    journal.ingest(revocation.bytes()).unwrap();
+    drop(journal);
+    let observed = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap();
+    let error = Session::from_observed_journal(&bootstrap, observed, Some(deadline))
+        .err()
+        .expect("observing an existing prefix cannot restore a revoked grant");
+    assert!(
+        error.to_string().contains("could not be decrypted"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -537,6 +647,71 @@ fn waiting_session_revalidates_source_identity_and_device_custody() {
         assert_eq!(waited.get(), 1);
         assert!(error.to_string().contains("custody"), "{error}");
     }
+}
+
+#[test]
+fn a_bounded_flat_session_keeps_its_deadline_without_expiring_an_admitted_session() {
+    use crate::{catalog::Descriptor, table::store::Store};
+    use std::time::Instant;
+
+    let lab = Lab::new(&[Role::Writer; 3]);
+    let bootstrap = lab.bootstrap(0);
+    let directory = crate::catalog::Directory::new(&lab.paths[0], bootstrap.trust());
+    let scope = {
+        let session = Session::open(&bootstrap).unwrap();
+        let descriptor =
+            Descriptor::application(bootstrap.trust(), "bounded-flat", "records", 1).unwrap();
+        let scope = directory.publish(&session, &descriptor).unwrap();
+        Store::open(&session, &directory.path(scope).unwrap(), scope)
+            .unwrap()
+            .commit_catalog(&session, b"retained before bounded access")
+            .unwrap();
+        scope
+    };
+    let path = directory.path(scope).unwrap();
+    let retained = std::fs::read(path.join("table.astream")).unwrap();
+    {
+        let admitted =
+            Session::open_until(&bootstrap, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+                .unwrap();
+        assert!(admitted.generation_deadline.is_none());
+        admitted.writer().unwrap();
+        admitted.mutation_guard().unwrap();
+        assert_eq!(
+            Store::open(&admitted, &path, scope)
+                .unwrap()
+                .inventory(&admitted)
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+    let journal = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap();
+    let mut bounded = Session::from_admitted_journal_until(
+        &bootstrap,
+        journal,
+        Some(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+    )
+    .unwrap();
+    assert!(bounded.generation.is_none());
+    bounded.generation_deadline = Some(Instant::now() - Duration::from_secs(1));
+    assert!(
+        bounded
+            .require_current_application_generation(Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+            .is_err(),
+        "a fresh caller deadline cannot extend the retained session bound"
+    );
+    let refused = (
+        bounded.writer().is_err(),
+        bounded.mutation_guard().is_err(),
+        Store::open(&bounded, &path, scope).is_err(),
+    );
+    assert_eq!(std::fs::read(path.join("table.astream")).unwrap(), retained);
+    assert_eq!(
+        refused,
+        (true, true, true),
+        "the retained bound covers every mutation entry"
+    );
 }
 
 #[test]

@@ -678,7 +678,9 @@ impl TapeSink {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
         }
         let mut file = options.open(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -1000,6 +1002,7 @@ impl TapeSink {
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
             .open(&partial)
             .map_err(|e| fault("a body file could not be made in", &e))?;
         let gone = |fault: StoreFault| {
@@ -1082,21 +1085,13 @@ pub(crate) struct DigestReader {
     latch: Arc<Mutex<Option<Error>>>,
 }
 
-/// `path` opened to read when its entry is a regular file and the handle is that entry: the
-/// entry is judged unfollowed (`symlink_metadata`), the open does not wait (`O_NONBLOCK`), and
-/// the handle's device and inode must be the entry's, so an entry swapped between the two is
-/// refused too. `None` for anything else.
+/// `path` opened to read when its entry is a regular file and the handle is that entry: opened
+/// unfollowed (`O_NOFOLLOW`) without waiting (`O_NONBLOCK`), and verified by `fstat` (`is_file`).
+/// `None` for anything else.
 #[cfg(unix)]
 fn open_regular(path: &Path) -> Option<std::fs::File> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let entry = std::fs::symlink_metadata(path).ok()?;
-    if !entry.is_file() {
-        return None;
-    }
-    let file = crate::download::open_nonblocking(path).ok()?;
-    let held = file.metadata().ok()?;
-    (held.is_file() && held.dev() == entry.dev() && held.ino() == entry.ino()).then_some(file)
+    let file = crate::download::open_regular_dest_nonblocking(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
 }
 
 #[cfg(unix)]

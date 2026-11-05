@@ -739,11 +739,12 @@ fn may_fix(env: &Env, row: &Row) -> Result<(), String> {
 }
 
 fn ask_line(question: &str) -> Option<String> {
+    use std::io::{BufRead as _, Read as _};
     let mut err = io::stderr();
     let _ = write!(err, "{question}");
     let _ = err.flush();
     let mut line = String::new();
-    io::stdin().read_line(&mut line).ok()?;
+    io::stdin().lock().take(4096).read_line(&mut line).ok()?;
     Some(line)
 }
 
@@ -1459,12 +1460,67 @@ fn parse_review(args: &[String]) -> Result<ReviewArgs, String> {
     Ok(r)
 }
 
+/// Whether this review, a person's command that will start its Codex reviewer but for a wall on
+/// record, lifted that wall: the facts read only the records, and a launch reads the row it starts
+/// on before it is refused ([`crate::harness::accounts_pool::lift_lone_wall`]). It runs once the
+/// review has passed its refusals, for the reviewer `cands` would ask first
+/// ([`review::first_wave_but_for_its_limit`]): the read holds an account in use, so a review that
+/// starts nothing on it reads nothing of it.
+fn lifted_for_review(
+    env: &Env,
+    l: &Look,
+    cands: &[(&Row, Option<String>)],
+    count: usize,
+    level: Level,
+    read: crate::harness::accounts_pool::ReadUsage<'_>,
+) -> bool {
+    use crate::harness::accounts::Cli;
+    let codex = connector::CODEX.id;
+    if !review::first_wave_but_for_its_limit(cands, codex, count, level, env.now) {
+        return false;
+    }
+    let fact = l.facts.iter().find(|f| f.connector.id == codex);
+    let Some(pool) = fact
+        .and_then(|f| f.pool.as_ref())
+        .filter(|pool| pool.launch_refused.is_some())
+    else {
+        return false;
+    };
+    let (Some(config_dir), Some(state), Some(home)) = (
+        pool.roster.parent(),
+        env.harness_state.as_deref(),
+        env.home.as_deref(),
+    ) else {
+        return false;
+    };
+    let seat = crate::harness::accounts_pool::Seat {
+        config_dir,
+        state,
+        home,
+        now: env.now,
+    };
+    crate::harness::accounts_pool::lift_lone_wall(&seat, Cli::Codex, read, pool.program.as_deref())
+}
+
 fn review_verb(
     env: &Env,
     runner: &dyn Runner,
     args: &[String],
     out: &mut dyn Write,
     err: &mut dyn Write,
+) -> ExitCode {
+    let read = crate::harness::accounts_pool::LiveUsage;
+    review_reading(env, runner, args, out, err, &read)
+}
+
+/// [`review_verb`], with what reads a row's usage.
+pub(super) fn review_reading(
+    env: &Env,
+    runner: &dyn Runner,
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    read: crate::harness::accounts_pool::ReadUsage<'_>,
 ) -> ExitCode {
     let refuse = |err: &mut dyn Write, why: &str| {
         let _ = writeln!(err, "aterm ai review: {why}");
@@ -1598,12 +1654,16 @@ fn review_verb(
         Ok(c) => c,
         Err(change::Refused(why)) => return refuse(err, &why),
     };
-    let cands = review::candidates(&pool, asked.as_deref(), asker, &l.rows, env.now);
+    let on_record = review::candidates(&pool, asked.as_deref(), asker, &l.rows, env.now);
     let count = if asked.is_some() {
-        cands.len()
+        on_record.len()
     } else {
         usize::from(s.review_count.0)
     };
+    let looked_again =
+        lifted_for_review(env, &l, &on_record, count, level, read).then(|| look(env));
+    let l = looked_again.as_ref().unwrap_or(&l);
+    let cands = review::candidates(&pool, asked.as_deref(), asker, &l.rows, env.now);
     let budget = Duration::from_secs(u64::from(a.timeout.unwrap_or(s.review_timeout_s.0)));
     let id = review::new_id();
     let now = || crate::supervise::limit::unix_now();
@@ -1678,7 +1738,7 @@ fn secret_of(path: &Path) -> Result<Vec<u8>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK);
+        open.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
     let file = open
         .open(path)
@@ -1691,7 +1751,11 @@ fn secret_of(path: &Path) -> Result<Vec<u8>, String> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        // SAFETY: `geteuid` reads this process's effective uid; it cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err("owned by another user".to_string());
+        }
         if meta.permissions().mode() & 0o077 != 0 {
             return Err("its group or others have access to it: `chmod 600` it first".to_string());
         }
@@ -1815,7 +1879,8 @@ fn fleet_keygen(path: &Path, out: &mut dyn Write) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let wrote = open
         .open(path)
@@ -1860,13 +1925,12 @@ fn fleet_sign(doc: &Path, key: &Path, out: &mut dyn Write) -> Result<(), String>
     scrub_vec(secret);
     let (sig, public) = signed?;
     let to = sig_path(doc);
-    crate::harness::upgrade_models::write_atomic_ordered(&to, &format!("{sig}\n"))
-        .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o644));
-    }
+    crate::harness::upgrade_models::write_atomic_ordered_mode(
+        &to,
+        &format!("{sig}\n"),
+        Some(0o644),
+    )
+    .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
     let _ = writeln!(
         out,
         "signed {} → {} (signer {}…)",

@@ -70,6 +70,11 @@ pub(crate) const STOP_BOUND: Duration = Duration::from_millis(500);
 pub(crate) const COLD_AFTER: Duration = Duration::from_secs(3);
 /// Spacing between a cold pull's two readings.
 pub(crate) const COLD_PAIR: Duration = Duration::from_millis(500);
+/// How often the CPU lens samples CPU Stats: every other lens reading (A2 §6.4).
+pub(crate) const LENS_HARDWARE_PERIOD: Duration = Duration::from_secs(1);
+/// The recorder keeps its frames at least this far apart (`aterm_vitals::hardware`), so its CPU
+/// Stats period is never finer.
+const RECORDER_HARDWARE_FLOOR: Duration = Duration::from_secs(1);
 
 /// An edge's readings with no window showing the bars come at most this often.
 pub(crate) const JOBS_FLOOR: Duration = Duration::from_secs(2);
@@ -91,6 +96,10 @@ const WHY_FIXTURE_SEAM: &str = "ATERM_DEV_WHY_FIXTURE";
 
 /// Pulls that arm the split set (`sys why`).
 pub(crate) static SPLIT_ARMED: Arming = Arming::new();
+/// Queries that print CPU hardware (`sys cores`, `sys report`, a forced `sys why`): a pull that
+/// begins while one waits takes a CPU Stats sample ([`Request::hardware`]), which no other
+/// reading of the deck takes (A2 §6.4).
+pub(crate) static HARDWARE_ARMED: Arming = Arming::new();
 /// Pulls that arm the stuck engine (`sys jobs`): such a pull's reading makes a new jobs view
 /// inside the engine's cadence, which every other pull keeps.
 pub(crate) static JOBS_ARMED: Arming = Arming::new();
@@ -345,6 +354,11 @@ pub(crate) struct Request {
     /// A control worker's pull ([`Msg::Pull`]; the thread sets it): it reads
     /// the split set only while a `sys why` arms it ([`SPLIT_ARMED`]).
     pub(crate) pull: bool,
+    /// A pull that a `sys cores`, `sys report` or forced `sys why` had armed when it began
+    /// ([`HARDWARE_ARMED`]; the thread sets it): its readings take a CPU Stats sample. The pull
+    /// reads the arming once, so a reading begun before a query armed takes none, and the query
+    /// answers from its own pull's pair.
+    pub(crate) hardware: bool,
     /// A window in view shows the bars, as the Deck or the Sill (the Fleet Monitor tab alone shows
     /// none): only then is the bars' reading a split tick ([`split_due`]). The Sill draws no cause
     /// clause, but a close-up opens from it as from the Deck, and a close-up's causes are the
@@ -354,6 +368,9 @@ pub(crate) struct Request {
     pub(crate) tokens: Vec<TokenRow>,
     /// The front tab's plan usage, while current.
     pub(crate) plan: Option<PlanFact>,
+    /// The rows whose lens a window holds open: the CPU lens's asks each reading for CPU Stats
+    /// ([`HardwareDemand::Lens`]).
+    pub(crate) lenses: Vec<aterm_vitals::Resource>,
     /// Discontinuity gaps queued on the host to record on the next reading.
     pub(crate) note_gaps: Vec<aterm_vitals::TimeGap>,
     /// Strip events (crash, restart, sleep/wake, spike) queued on the host.
@@ -742,6 +759,9 @@ pub(crate) struct VitalsHost {
     /// The closed tabs whose leftovers a `proc.left` record told, among those the adopted view
     /// holds: each close is told once ([`crate::message_reporters::newly_left`]).
     left_told: std::collections::BTreeSet<u64>,
+    /// The dangling links a `proc.link` record told, by path
+    /// ([`crate::message_reporters::newly_dangling`]).
+    links_told: std::collections::VecDeque<String>,
 }
 
 impl Default for VitalsHost {
@@ -798,6 +818,7 @@ impl Default for VitalsHost {
                 &PROC_EDGE
             },
             left_told: std::collections::BTreeSet::new(),
+            links_told: std::collections::VecDeque::new(),
         }
     }
 }
@@ -1104,6 +1125,15 @@ trait Source {
     fn split_cold(&self) -> bool {
         false
     }
+    /// Whether a query that prints hardware arms a pull beginning now ([`HARDWARE_ARMED`]).
+    fn hardware_armed(&self) -> bool {
+        false
+    }
+    /// Whether no CPU Stats sample is warm for a pull, so a pull that prints hardware reads its
+    /// pair [`COLD_PAIR`] apart and the second sample's delta is the first's.
+    fn hardware_cold(&self) -> bool {
+        false
+    }
     /// Whether a `sys jobs` waiting on a pull arms the stuck engine for its reading
     /// ([`JOBS_ARMED`]).
     fn jobs_armed(&self) -> bool {
@@ -1152,6 +1182,14 @@ impl Source for Reader {
     fn split_cold(&self) -> bool {
         let now = Instant::now();
         self.split.cold(now) || self.gpu.cold(now)
+    }
+
+    fn hardware_armed(&self) -> bool {
+        self.hardware_armed.armed()
+    }
+
+    fn hardware_cold(&self) -> bool {
+        (self.hardware_read.cold)(&self.hardware, HardwareDemand::Pull.period(Duration::ZERO))
     }
 
     fn jobs_armed(&self) -> bool {
@@ -1462,11 +1500,15 @@ fn pull(
     if let Some(t) = last_whole {
         std::thread::sleep(MIN_WINDOW.saturating_sub(t.elapsed()));
     }
-    let cold = last_whole.is_none_or(|t| t.elapsed() > COLD_AFTER) || source.split_cold();
+    let hardware = source.hardware_armed();
+    let cold = last_whole.is_none_or(|t| t.elapsed() > COLD_AFTER)
+        || source.split_cold()
+        || (hardware && source.hardware_cold());
     let mut pull = req.clone();
     pull.machine_only = false;
     pull.jobs_now = false;
     pull.pull = true;
+    pull.hardware = hardware;
     pull.cadence_ms = duration_ms(if cold { COLD_PAIR } else { COLD_AFTER }).max(req.cadence_ms);
     let warm = cold.then(|| {
         pull.reread_words();
@@ -1484,6 +1526,16 @@ fn pull(
     }
     req.ttys = pull.ttys;
     snap
+}
+
+/// The process group leader of the agent `publication` names, where it names one reading the
+/// screen ([`crate::harness_host::identified_agent`]) and a group: the leftover pass reads its unique
+/// id as the tab's agent start ([`crate::vitals_left`]).
+fn agent_leader(publication: &crate::session_timeline::AgentPublication) -> Option<u32> {
+    crate::harness_host::identified_agent(publication)?;
+    u32::try_from(publication.program_pgid)
+        .ok()
+        .filter(|&pgid| pgid > 1)
 }
 
 fn duration_ms(d: Duration) -> u32 {
@@ -1547,16 +1599,131 @@ fn hand_over_allocation(
 /// The thermal level and Low Power Mode probe.
 pub(crate) type ThermalProbe = fn() -> Option<Thermal>;
 
-/// The hardware reader is injected so headless tests do not open native services.
-type HardwareProbe =
-    fn(&mut aterm_sysprobe::cpu_hardware::Probe, &Sample) -> aterm_sysprobe::cpu_hardware::Sample;
+/// The CPU Stats reader, injected so headless tests open no native service: a sample after the
+/// reading's machine and process counters, under its demands' gap, whether a sample now would
+/// read `warming` under a gap ([`aterm_sysprobe::cpu_hardware::Probe::cold`]), and whether a
+/// sample costs nothing because no source answers ([`aterm_sysprobe::cpu_hardware::SOURCE`]).
+#[derive(Clone, Copy)]
+struct HardwareProbe {
+    sample: fn(
+        &mut aterm_sysprobe::cpu_hardware::Probe,
+        &Sample,
+        Duration,
+    ) -> aterm_sysprobe::cpu_hardware::Sample,
+    cold: fn(&aterm_sysprobe::cpu_hardware::Probe, Duration) -> bool,
+    free: bool,
+}
 
-fn attach_hardware(
-    sample: &mut Sample,
+impl HardwareProbe {
+    /// The machine's IOReport reader.
+    const NATIVE: Self = Self {
+        sample: native_hardware,
+        cold: aterm_sysprobe::cpu_hardware::Probe::cold,
+        free: !aterm_sysprobe::cpu_hardware::SOURCE,
+    };
+    /// A unit test's: every sample unavailable, never cold, and a source that could answer, as
+    /// on macOS.
+    const INERT: Self = Self {
+        sample: |_, _, _| aterm_sysprobe::cpu_hardware::Sample::unavailable("not_sampled"),
+        cold: |_, _| false,
+        free: false,
+    };
+}
+
+fn native_hardware(
     probe: &mut aterm_sysprobe::cpu_hardware::Probe,
-    read: HardwareProbe,
-) {
-    sample.hardware = Some(hardware_sample(read(probe, sample)));
+    _: &Sample,
+    gap: Duration,
+) -> aterm_sysprobe::cpu_hardware::Sample {
+    probe.sample(gap)
+}
+
+/// What asks a whole reading for a CPU Stats sample (A2 §6.4). The deck's and a hidden window's
+/// readings ask none: the deck draws nothing from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HardwareDemand {
+    /// The CPU lens is open, whose Hardware & limits section prints it.
+    Lens,
+    /// The E-busy, P-idle recorder is pending ([`aterm_vitals::Vitals::cpu_recorder_pending`]),
+    /// whose frames copy it.
+    Recorder,
+    /// A pull that prints it ([`Request::hardware`]).
+    Pull,
+    /// No source answers here (off macOS): the sample reads nothing and says `unsupported`, so
+    /// every whole reading carries it and `sys cores` finds it held instead of pulling for it.
+    Free,
+}
+
+impl HardwareDemand {
+    /// How often it samples at the reading cadence `cadence`: the lens every
+    /// [`LENS_HARDWARE_PERIOD`], the recorder every reading but never more often than its frames
+    /// stand apart, and a pull at every pull reading, its sample warm within [`COLD_AFTER`], past
+    /// which a pull already reads twice.
+    fn period(self, cadence: Duration) -> Duration {
+        match self {
+            Self::Lens => LENS_HARDWARE_PERIOD,
+            Self::Recorder => cadence.max(RECORDER_HARDWARE_FLOOR),
+            Self::Pull => COLD_AFTER,
+            Self::Free => Duration::ZERO,
+        }
+    }
+
+    /// The gap rule's threshold: a sample more than 2.5 periods after the previous one would
+    /// average over the gap, so it reads `warming` and starts the next interval.
+    fn gap(self, cadence: Duration) -> Duration {
+        self.period(cadence).saturating_mul(5) / 2
+    }
+}
+
+/// The demands on whole reading `req`'s CPU Stats sample: the CPU lens open, the recorder
+/// pending (`recorder`), a pull a hardware query armed, and a source that costs nothing (`free`).
+fn hardware_demands(req: &Request, recorder: bool, free: bool) -> Vec<HardwareDemand> {
+    [
+        req.lenses
+            .contains(&aterm_vitals::Resource::Cpu)
+            .then_some(HardwareDemand::Lens),
+        recorder.then_some(HardwareDemand::Recorder),
+        req.hardware.then_some(HardwareDemand::Pull),
+        free.then_some(HardwareDemand::Free),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// What a reading does about CPU Stats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HardwarePlan {
+    /// No demand: the reading carries none.
+    None,
+    /// Demands stand but none is due: the reading carries the last sample.
+    Carry,
+    /// A sample, under this gap: the widest of the demands'.
+    Sample(Duration),
+}
+
+/// The plan for a reading at `now` at cadence `cadence` under `demands`, the last sample taken
+/// at `last`. A pull is due at every pull reading, a free source at every reading; the lens and
+/// the recorder once their period has passed, less half a reading's slack, so a lens reading
+/// every 500 ms samples every other.
+fn hardware_plan(
+    demands: &[HardwareDemand],
+    cadence: Duration,
+    last: Option<Instant>,
+    now: Instant,
+) -> HardwarePlan {
+    let Some(gap) = demands.iter().map(|d| d.gap(cadence)).max() else {
+        return HardwarePlan::None;
+    };
+    let since = last.map(|t| now.saturating_duration_since(t));
+    let due = demands.iter().any(|d| {
+        *d == HardwareDemand::Pull || since.is_none_or(|s| s + cadence / 2 >= d.period(cadence))
+    });
+    if due {
+        HardwarePlan::Sample(gap)
+    } else {
+        HardwarePlan::Carry
+    }
 }
 
 fn hardware_sample(s: aterm_sysprobe::cpu_hardware::Sample) -> aterm_vitals::hardware::Sample {
@@ -1813,15 +1980,6 @@ fn name_and_birth(r: aterm_sysprobe::kproc::Record) -> Option<(String, i64)> {
     Some((r.comm, ms))
 }
 
-fn names_the_same(record: &str, swept: &str) -> bool {
-    const SHORT: usize = 15;
-    record == swept
-        || record
-            .as_bytes()
-            .get(..SHORT)
-            .is_some_and(|cut| String::from_utf8_lossy(cut) == swept)
-}
-
 /// A process's birth as read, under the name, kernel start and pid version
 /// it was read for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2050,7 +2208,9 @@ impl SplitReader {
             Some(table) => table.get(&p.pid).cloned(),
             None => (self.probe.birth)(p.pid),
         };
-        let Some((_, ms)) = read.filter(|(name, _)| names_the_same(name, &p.name)) else {
+        let Some((_, ms)) =
+            read.filter(|(name, _)| aterm_vitals::model::same_process_name(name, &p.name))
+        else {
             self.births.remove(&p.pid);
             return None;
         };
@@ -2306,6 +2466,12 @@ pub(crate) struct Reader {
     probe: aterm_sysprobe::Probe,
     hardware: aterm_sysprobe::cpu_hardware::Probe,
     hardware_read: HardwareProbe,
+    /// The queries that arm a pull's CPU Stats ([`HARDWARE_ARMED`]; a unit test's reader has its
+    /// own), read once as each pull begins ([`Request::hardware`]).
+    hardware_armed: &'static Arming,
+    /// The last CPU Stats sample and when it was taken: a reading whose demands stand but none is
+    /// due carries it ([`HardwarePlan::Carry`]).
+    hardware_last: Option<(Instant, aterm_vitals::hardware::Sample)>,
     clusters: Vec<ClusterSpec>,
     vitals: aterm_vitals::Vitals,
     jobs: crate::vitals_jobs::JobsPass,
@@ -2464,10 +2630,16 @@ impl Reader {
             probe: aterm_sysprobe::Probe::new(),
             hardware: aterm_sysprobe::cpu_hardware::Probe::default(),
             hardware_read: if cfg!(test) {
-                |_, _| aterm_sysprobe::cpu_hardware::Sample::unavailable("not_sampled")
+                HardwareProbe::INERT
             } else {
-                |probe, _| probe.sample()
+                HardwareProbe::NATIVE
             },
+            hardware_armed: if cfg!(test) {
+                Box::leak(Box::new(Arming::new()))
+            } else {
+                &HARDWARE_ARMED
+            },
+            hardware_last: None,
             clusters,
             vitals: aterm_vitals::Vitals::new(),
             jobs: crate::vitals_jobs::JobsPass::new(),
@@ -2619,9 +2791,7 @@ impl Reader {
         }
         // Preserve the existing core/process capture window: optional native
         // discovery can be slow, so it runs only after those readings finish.
-        if req.deck || req.pull {
-            attach_hardware(&mut sample, &mut self.hardware, self.hardware_read);
-        }
+        self.attach_hardware(&mut sample, req);
         let scene = self
             .fixture
             .as_mut()
@@ -2694,7 +2864,6 @@ impl Reader {
         let mut sample = self.machine_sample(req, unix_ms_now());
         sample.machine_only = true;
         sample.timeline = self.split.timeline();
-        attach_hardware(&mut sample, &mut self.hardware, self.hardware_read);
         let scene = self
             .fixture
             .as_mut()
@@ -2724,6 +2893,29 @@ impl Reader {
         }
         self.watch_jobs(&mut snap);
         self.fixture_snapshot(snap)
+    }
+
+    /// Attaches CPU Stats to whole reading `sample` where a demand asks for it (A2 §6.4): a
+    /// sample when one is due, else the last one while a demand stands, else none.
+    fn attach_hardware(&mut self, sample: &mut Sample, req: &Request) {
+        let demands = hardware_demands(
+            req,
+            self.vitals.cpu_recorder_pending(),
+            self.hardware_read.free,
+        );
+        let cadence = Duration::from_millis(u64::from(req.cadence_ms));
+        let now = (self.clock)();
+        let last = self.hardware_last.as_ref().map(|(at, _)| *at);
+        sample.hardware = match hardware_plan(&demands, cadence, last, now) {
+            HardwarePlan::None => None,
+            HardwarePlan::Carry => self.hardware_last.as_ref().map(|(_, h)| h.clone()),
+            HardwarePlan::Sample(gap) => {
+                let read = (self.hardware_read.sample)(&mut self.hardware, sample, gap);
+                let read = hardware_sample(read);
+                self.hardware_last = Some((now, read.clone()));
+                Some(read)
+            }
+        };
     }
 
     fn fixture_snapshot(&self, snap: Snapshot) -> Snapshot {
@@ -3964,14 +4156,17 @@ impl crate::App {
                 .values()
                 .filter(|ws| crate::stats_deck::stats_drawn_on(ws))
         };
-        let in_view = self.allocation_visible()
+        let page = self.allocation_visible() || self.tabs_page_on_screen();
+        let in_view = page
             || self.deck_in_view()
             || (self.tabs_page_shown() && self.windows.values().any(|ws| !ws.occluded));
-        // A resting window reads as one in the background ([`crate::window_rest`]).
+        // The rest slows the one shared stream only while no page reads it
+        // ([`crate::window_rest`]): a resting window reads as one in the background unless a page
+        // on screen reads the stream, which keeps the cadence a focused window gives it.
         let focused = self
             .windows
             .values()
-            .any(|ws| ws.focused && !ws.rest.resting());
+            .any(|ws| ws.focused && (page || !ws.rest.resting()));
         Audience::of(in_view, bars && drawing().next().is_some(), focused)
     }
 
@@ -4095,13 +4290,6 @@ impl crate::App {
             self.vitals.pending_cpu_policy = Some(report);
             self.service_vitals(Instant::now());
         }
-    }
-
-    /// Asks the thread for a reading: false when its queue was full or the thread is gone.
-    pub(crate) fn resample_cpu_diagnostics(&mut self) -> bool {
-        // Same queue and minimum observation window as normal readings; no new
-        // worker, subprocess, policy write, or repeated retry.
-        self.ask_reading(Instant::now(), crate::stats_lens::LENS_PERIOD, false, false)
     }
 
     /// Asks the thread for a reading: false when its queue was full or the thread is gone.
@@ -4346,6 +4534,7 @@ impl crate::App {
         self.post_jobs_reading();
         self.note_held_episode(before.as_deref());
         self.note_left_tabs();
+        self.note_leftovers();
         if !audience.in_view() {
             if self
                 .vitals
@@ -4383,6 +4572,32 @@ impl crate::App {
         };
         for tab in crate::message_reporters::newly_left(&mut self.vitals.left_told, &after) {
             let _ = self.post_message(crate::message_reporters::left_record(tab, &after));
+        }
+    }
+
+    /// States the `leftovers` Entries the view just adopted makes, the family's whole answer
+    /// ([`crate::message_reporters::leftovers_entries`]; none ends those it held), and records
+    /// each dangling link it is the first to hold ([`crate::message_reporters::newly_dangling`]).
+    /// A view that names none while the digest holds none states nothing.
+    pub(crate) fn note_leftovers(&mut self) {
+        use aterm_messages::exceptions::Family;
+        let Some(view) = self.vitals.snapshot.as_ref().and_then(|s| s.left.clone()) else {
+            return;
+        };
+        let entries = crate::message_reporters::leftovers_entries(
+            &view,
+            crate::message_reporters::left_entry_after_ms(),
+        );
+        if !entries.is_empty()
+            || !self
+                .messages
+                .digest_keys_under(&Family::Vitals.prefix())
+                .is_empty()
+        {
+            self.except_replace(Family::Vitals, &entries);
+        }
+        for link in crate::message_reporters::newly_dangling(&mut self.vitals.links_told, &view) {
+            let _ = self.post_message(crate::message_reporters::link_record(link));
         }
     }
 
@@ -4463,6 +4678,12 @@ impl crate::App {
     }
 
     fn post_jobs_reading(&self) {
+        self.vitals.board.post_left(
+            self.vitals
+                .snapshot
+                .as_ref()
+                .and_then(|snap| snap.left.clone()),
+        );
         let Some(view) = self
             .vitals
             .snapshot
@@ -4669,6 +4890,7 @@ impl crate::App {
                                 label: name.clone(),
                                 program: tl.agent().program.clone().unwrap_or_default(),
                                 tab_id: Some(tab.id.get()),
+                                agent_leader: agent_leader(tl.agent()),
                             });
                         }
                         layout.push(PaneFact {
@@ -4699,6 +4921,7 @@ impl crate::App {
             }
         }
         let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+        let windowless = tabs.len();
         let mut session_ids = Vec::new();
         for handle in store.live_handles() {
             let Some(session) = self.pool.get(handle.local_id) else {
@@ -4718,11 +4941,23 @@ impl crate::App {
                     label: format!("Session {}", handle.local_id),
                     program: String::new(),
                     tab_id: None,
+                    agent_leader: None,
                 });
             }
             session_ids.push((handle.local_id, handle.sid.as_str().to_string()));
         }
         drop(store);
+        for root in &mut tabs[windowless..] {
+            root.agent_leader = self.pool.get(root.key).and_then(|s| {
+                agent_leader(
+                    s.ctx
+                        .timeline
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .agent(),
+                )
+            });
+        }
         let tty_sources: Vec<TtySource> = tabs
             .iter()
             .filter_map(|t| {
@@ -4756,9 +4991,11 @@ impl crate::App {
             machine_only,
             jobs_now: false,
             pull: false,
+            hardware: false,
             deck: self.deck_in_view(),
             tokens: each_session_once(tokens),
             plan: front_plan.and_then(|p| plan_fact(&p, &accounts, now)),
+            lenses: self.open_lens_rows(),
             note_gaps: Vec::new(),
             note_events: Vec::new(),
         }

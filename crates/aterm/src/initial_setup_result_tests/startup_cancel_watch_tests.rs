@@ -239,10 +239,12 @@ fn startup_cancel_watch_an_older_cancel_of_a_staged_offer_cannot_run_on_a_late_s
         sent,
         |how| maintain(root.path(), &looks, how),
     );
-    assert_eq!(script().runs, [revision]);
-    assert_eq!(chosen.snapshot().unwrap().plan, plan);
-    assert_eq!(looks.get(), 0, "a person's chosen plan is never widened");
-    clear_setup_run(revision);
+    let expanded = chosen.snapshot().unwrap();
+    assert_eq!(script().runs, [revision, expanded.revision]);
+    assert_eq!(expanded.plan.selection, Selection::all());
+    assert_eq!(expanded.plan.vault_url, plan.vault_url);
+    assert_eq!(looks.get(), 1, "resumed setup expands for fleet membership");
+    clear_setup_run(expanded.revision);
 }
 
 /// An older aterm's Cancel holds until the person asks again: the launch that reads it offers
@@ -300,10 +302,11 @@ fn startup_cancel_watch_set_up_now_after_an_older_cancel_applies_the_plan_its_re
         }
         let snapshot = first.setup.snapshot().unwrap();
         assert!(!snapshot.cancelled, "{group:?}: the Cancel gave way");
-        // Neither Set up now nor a group press asks for macOS's grants: they are on offer.
-        assert!(
-            !snapshot.permissions_allowed,
-            "{group:?}: aterm's permission steps wait for a person's press for them"
+        assert_eq!(
+            snapshot.permissions_allowed,
+            saved
+                .selection
+                .contains(aterm_types::macos_setup::Setting::Permissions)
         );
     }
 }

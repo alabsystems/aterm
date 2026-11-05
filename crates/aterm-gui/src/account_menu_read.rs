@@ -379,7 +379,7 @@ fn read_rows(input: Input) -> ResultRows {
     let roster = accounts::Roster::load(&path)?;
     let store = accounts::Store::at(&state_dir);
     let roster = store.bound(&roster, now)?;
-    let (state, _) = store.load(now)?;
+    let (state, _) = store.load_judged(now, &roster)?;
     let enrolled = accounts::enrolled(&roster);
     Ok(crate::fact_menu::account_menu_rows_from(
         &roster,

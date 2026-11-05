@@ -9,6 +9,7 @@
 //! file's tests with `targo --unverified test -p aterm-models-gui --test suite -- <file>::`.
 
 mod derived_autopilot_timer;
+mod derived_herald_told_once;
 mod derived_isolation;
 mod derived_menu_viewport;
 mod derived_slash;

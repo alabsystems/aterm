@@ -156,10 +156,13 @@ pub struct Rooms {
 impl Rooms {
     /// Returns the meter for volume `key`, creating one when there is room.
     pub fn meter(&mut self, key: &str) -> Option<&mut RoomMeter> {
-        if !self.meters.contains_key(key) && self.meters.len() >= MAX_ROOMS {
-            return None;
+        if !self.meters.contains_key(key) {
+            if self.meters.len() >= MAX_ROOMS {
+                return None;
+            }
+            self.meters.insert(key.to_owned(), RoomMeter::default());
         }
-        Some(self.meters.entry(key.to_owned()).or_default())
+        self.meters.get_mut(key)
     }
 
     /// Returns the room of volume `key` at `now_s` on a volume of `total` bytes.
@@ -246,13 +249,16 @@ impl Rooms {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600).custom_flags(libc::O_CLOEXEC);
+            open.mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         }
         let mut file = open.open(&staged)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
         }
         file.write_all(self.encode().as_bytes())?;
         aterm_durable::ordered(&file)?;

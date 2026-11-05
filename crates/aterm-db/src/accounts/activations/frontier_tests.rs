@@ -6,12 +6,13 @@ use crate::{
     database::{Change, Command},
     table::tests::{
         Lab,
-        frontier::{receive, wide_lab, wires},
+        frontier::{first_records, receive, wide_lab, wires},
     },
 };
 use astream_wire::sync::MAX_PARENTS;
 use aterm_json::json;
 use aterm_secrets::commons::roster::Role;
+use std::cell::RefCell;
 
 fn stopped(account: Digest) -> Request {
     Request {
@@ -22,22 +23,45 @@ fn stopped(account: Digest) -> Request {
     }
 }
 
+/// Three writers issue through the product path, the last past `LEGACY_MAX_MEMBERS`; the writers
+/// between them seal the same first record ([`first_records`]), so the frontier still holds
+/// `MAX_PARENTS + 1` heads for the bounded append and its retry.
+/// GAP: those 62 Macs stop running `issue_in` on an empty table (table creation, `History::read`
+/// and the append), so a defect only on a middle Mac is not seen; three Macs still run them.
 #[test]
 fn activation_history_keeps_root_decisions_after_many_writers() {
     let writers = MAX_PARENTS + 1;
+    let last = writers - 1;
     let lab = wide_lab(writers);
     let admin = aterm_secrets::client::admin_open(&lab.paths[0]).unwrap();
+    let account = |writer: usize| [u8::try_from(writer + 1).unwrap(); 32];
     let mut expected = BTreeMap::new();
-    for (writer, paths) in lab.paths.iter().enumerate() {
-        let account = [u8::try_from(writer + 1).unwrap(); 32];
-        let (decision, _) = Activations::at(paths.clone())
-            .issue(&admin, [1; 16], stopped(account))
+    for writer in [0, 1, last] {
+        let (decision, _) = Activations::at(lab.paths[writer].clone())
+            .issue(&admin, [1; 16], stopped(account(writer)))
             .unwrap();
-        expected.insert(account, State::Stopped(decision.id()));
+        expected.insert(account(writer), State::Stopped(decision.id()));
     }
     let scope = descriptor(&lab.bootstrap(0)).unwrap().scope;
-    let incoming = (1..writers)
-        .flat_map(|writer| wires(&lab, writer, scope))
+    let sealed = RefCell::new(Vec::new());
+    let far = first_records(&lab, 2..last, scope, |writer, session| {
+        let decision = session
+            .issue_account(&admin, stopped(account(writer)))
+            .unwrap();
+        sealed
+            .borrow_mut()
+            .push((account(writer), State::Stopped(decision.id())));
+        // The bytes `Activations::issue` appends.
+        let mut payload = b"AAOP1".to_vec();
+        payload.extend_from_slice(&[1; 16]);
+        payload.extend_from_slice(decision.bytes());
+        payload
+    });
+    expected.extend(sealed.into_inner());
+    let incoming = wires(&lab, 1, scope)
+        .into_iter()
+        .chain(far)
+        .chain(wires(&lab, last, scope))
         .collect::<Vec<_>>();
     receive(&lab, 0, scope, &incoming);
     let db = Activations::at(lab.paths[0].clone());

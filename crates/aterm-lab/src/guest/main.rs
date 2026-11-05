@@ -245,11 +245,22 @@ struct Out(std::sync::Mutex<std::fs::File>);
 
 impl Out {
     fn open(path: &str) -> Result<Out, String> {
+        use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
-            .map(|f| Out(std::sync::Mutex::new(f)))
+            .and_then(|f| {
+                if f.metadata()?.is_file() {
+                    Ok(Out(std::sync::Mutex::new(f)))
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "not a regular file",
+                    ))
+                }
+            })
             .map_err(|e| format!("{path}: {e}"))
     }
 
@@ -772,9 +783,9 @@ fn reopen_pressed(pressed: &BTreeMap<String, Instant>) -> Option<Instant> {
 /// quits: macOS asks the app to quit as the sheet goes, and the app asks at once.
 const QUIT_ASKED_WITHIN: Duration = Duration::from_secs(60);
 
-/// The question the app asks before it quits (`aterm_gui::quit_safety::confirm_prompt`'s title
-/// for a quit), as its alert's text reads.
-const QUIT_QUESTION: &str = "Are you sure you want to quit aterm?";
+/// The question the app asks before it quits (`aterm_gui::quit_safety::QUIT_TITLE`), as its
+/// sheet's text reads.
+const QUIT_QUESTION: &str = "Quit aterm?";
 
 /// The word of the person's press on [`QUIT_QUESTION`]'s Quit, as its `click` line carries it
 /// (`mac_nux_guest::QUIT_CONFIRM`).
@@ -2989,9 +3000,9 @@ mod tests {
     }
 
     /// The app's alert with `words` and `buttons` (each a title and whether it is enabled), in its
-    /// own window (an `AXWindow`, as `NSAlert`'s modal run shows it), beside the app's terminal
-    /// window. The words are `quit_safety::confirm_prompt`'s for a quit, not a recording: no row
-    /// had read the alert before this fixture was written.
+    /// own window (an `AXWindow`), beside the app's terminal window. Not a recording: no row had
+    /// read the alert before this fixture was written, and its body is longer than [`describe`]
+    /// keeps, to show the cut.
     fn quit_fixture(words: &str, buttons: &[(&str, bool)]) -> Vec<ax::Node> {
         let mut nodes = vec![
             node("AXWindow", "AXStandardWindow", "aterm", usize::MAX),
@@ -3004,8 +3015,7 @@ mod tests {
             node(
                 "AXStaticText",
                 "",
-                "Every shell ends and its scrollback is lost; windows and tabs come back when \
-                 aterm starts.",
+                "A body longer than describe keeps: terminal sessions will end, and windows and tabs reopen next time.",
                 2,
             ),
         ];
@@ -3031,9 +3041,8 @@ mod tests {
         );
         assert_eq!(
             describe(&asked, found.dialog.clone(), &who),
-            "AXWindow/AXDialog; AXImage; AXStaticText \"Are you sure you want to quit aterm?\"; \
-             AXStaticText \"Every shell ends and its scrollback is lost; windows and tabs come back \
-             when ate\"; AXButton \"Quit\"; AXButton \"Cancel\"",
+            "AXWindow/AXDialog; AXImage; AXStaticText \"Quit aterm?\"; AXStaticText \"A body longer than describe keeps: termi\
+             nal sessions will end, and windows and t\"; AXButton \"Quit\"; AXButton \"Cancel\"",
             "each control's text cut at 80 characters"
         );
         let mut twice = quit_fixture(QUIT_QUESTION, &[("Cancel", true), ("quit", true)]);
@@ -3063,12 +3072,12 @@ mod tests {
             ),
             (
                 "another question",
-                "A process is still running in this window.",
+                "Close this window?",
                 &[("Quit", true), ("Cancel", true)][..],
             ),
             (
                 "more words than the question",
-                "Are you sure you want to quit aterm? It is not.",
+                "Quit aterm? It is not.",
                 &[("Quit", true), ("Cancel", true)][..],
             ),
             (

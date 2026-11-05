@@ -3,21 +3,25 @@
 
 //! The compiled schemas of `alab/registry` (docs/DESIGN-alab-lab-model-2026-11-01.md §4), the
 //! catalog table that holds the owner's data: providers and their CLIs, plans, Mac models,
-//! machines, login addresses, the mailboxes those deliver to (by name, never by login), phones
-//! (last four digits only), accounts, sub-accounts, sign-in routes and the accounts machines
+//! machines, login addresses, the mailboxes those deliver to (each keyed by its login address),
+//! phones, accounts, sub-accounts, sign-in routes and the accounts machines
 //! prefer, plus two small
 //! collections each Mac states about itself (`machine-facts`, `mailbox-obs`) under the per-Mac
 //! quota.
 //!
-//! **Secrets stay out.** Passwords, TOTP seeds, recovery codes, full phone numbers, tokens and
-//! **mailbox logins and their `receives` patterns** stay in the vault (`ai-mailbox.toml`, whose
-//! audience is admins) or on each Mac: a column whose name says secret must be a vault
-//! reference (checked at compile time), and the registry holds only vault entry names. The one
-//! column typed `email` is `address.addr`, masked on every surface; every other address is a
-//! reference to its `address` row. A mailbox and a phone have random keys, never a digest of
-//! the login or the number. An imported note's text goes in the row's `note` only when the note
-//! guard passes it (design §0); a refused note and every losing value stay coordinates in
-//! `notes_src`.
+//! **Secrets are `Secret` cells** (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.7, §4.8): an
+//! address's `password` and a phone's `number` (version 2) hold an authenticated inner seal,
+//! masked on every surface and opened only through the audited reveal
+//! ([`crate::alab::secret::reveal`]); a column whose name says secret must be `Secret` (checked
+//! at compile time). A row whose `protected` cell is true holds no `Secret` cell
+//! ([`crate::typed::check::protected`]). The one column typed `email` is `address.addr`, masked
+//! on every surface; every other address is a reference to its `address` row, a mailbox's
+//! `login` included, and a mailbox's key derives from that login's key
+//! ([`keys::mailbox_pk`]). A phone's key is random, never a digest of the number: the importer
+//! finds a phone by opening its `number` cell. The version-1 `vault_ref` columns of `mailbox`
+//! and `phone` stay, unwritten, until every Mac reads version 2. An imported note's text goes in
+//! the row's `note` only when the note guard passes it (design §0); a refused note and every
+//! losing value stay coordinates in `notes_src`.
 
 use crate::{
     Error, Result,
@@ -231,9 +235,14 @@ crate::att_collection!(
             )
             .null(),
             Column::new("model", Ty::Ref("model")).null().writer(Writer::Birth),
+            Column::new("make", Ty::Text(32)).null(),
+            Column::new("arch", Ty::Text(16)).null(),
+            Column::new("os", Ty::Text(32)).null(),
             Column::new("chip", Ty::Text(32)).null(),
             Column::new("ram_gb", Ty::Uint).null(),
             Column::new("disk_gb", Ty::Uint).null(),
+            Column::new("nickname", Ty::Text(64)).null(),
+            Column::new("nickname_aliases", Ty::List(&Ty::Text(64), 8)).null(),
             Column::new("clis", Ty::Set(&Ty::Ref("cli"))),
             Column::new("location", Ty::Text(64)).null(),
             Column::new("fleet_node", Ty::Hex(32)).null().writer(Writer::Birth),
@@ -290,11 +299,11 @@ crate::att_collection!(
 
 crate::att_collection!(
     /// A login or mail address, keyed `ad-<16hex>` from the address, which is the one value
-    /// typed `email` in the registry. An address that is the login of a receiving mailbox (one
-    /// not used to sign in anywhere) never enters Commons (§4.9), so `kind` has no word for it.
+    /// typed `email` in the registry. Version 2 adds its mailbox `password`, a `Secret`, which
+    /// a `protected` row never holds.
     pub ADDRESS = Collection {
         name: "address",
-        version: 1,
+        version: 2,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "ad",
@@ -303,6 +312,18 @@ crate::att_collection!(
             Column::new("addr", Ty::Email).writer(Writer::Birth),
             Column::new("domain", Ty::Text(253)).writer(Writer::Birth),
             Column::new("kind", Ty::Enum(&["alias", "standalone", "unknown"])).null(),
+            Column::new(
+                "status",
+                Ty::Enum(&["active", "suspended", "disabled", "unknown"])
+            )
+            .null(),
+            Column::new(
+                "provider",
+                Ty::Enum(&["proton", "gmail", "google", "outlook", "privateemail", "other"])
+            )
+            .null(),
+            Column::new("phone", Ty::Ref("phone")).null(),
+            Column::new("protected", Ty::Bool).null(),
             // The owner's word: wins over discovery.
             Column::new("mailbox", Ty::Ref("mailbox")).null(),
             // A guess, used only when nothing else exists.
@@ -310,13 +331,22 @@ crate::att_collection!(
             Column::new("alias_of", Ty::Ref("address")).null(),
             Column::new(
                 "origin",
-                Ty::Enum(&["sheet", "logins-csv", "harness", "discovered", "owner"])
+                Ty::Enum(&[
+                    "sheet",
+                    "logins-csv",
+                    "emails-csv",
+                    "harness",
+                    "discovered",
+                    "owner",
+                    "fleet-db",
+                ])
             )
             .writer(Writer::Birth),
             row().writer(Writer::Birth),
             note(),
             src(),
             notes_src(),
+            Column::new("password", Ty::Secret).null().since(2),
         ],
         unique: &[&["addr"]],
         max_row: 0,
@@ -324,15 +354,22 @@ crate::att_collection!(
 );
 
 crate::att_collection!(
-    /// A mailbox that receives codes, keyed `mb-<16 random hex>`. Its login and `receives`
-    /// patterns stay in the vault entry this row names; it holds only what members may see.
+    /// A mailbox that receives codes, keyed `mb-<16hex>` from its login address's key
+    /// ([`keys::mailbox_pk`]). Version 2 adds `login`, that address row, whose own `password`
+    /// is the mailbox's login password (one fact, one cell); the `Secret`s `mailbox_password`
+    /// (a two-password webmail's second) and `totp` (the login's RFC 6238 seed or `otpauth://`
+    /// URI); and what `ai-mailbox.toml`'s `receives` said it receives: `receives`, the exact
+    /// addresses, and `receives_domains`, each `*@<domain>` as its domain and `*` as itself
+    /// (`harness/mailbox_routes.rs`); and its `imap_url` and `http_url`, `imap` and `http`, which
+    /// hold no user part. The version-1 `vault_ref` stays unwritten until every Mac reads
+    /// version 2.
     pub MAILBOX = Collection {
         name: "mailbox",
-        version: 1,
+        version: 2,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "mb",
-        derive: Derive::Random,
+        derive: Derive::Composite,
         columns: &[
             // A plain name the owner picks (`proton-1`), never an address.
             Column::new("label", Ty::Text(32)),
@@ -341,10 +378,23 @@ crate::att_collection!(
                 "code_path",
                 Ty::Enum(&["proton-api", "imap", "webmail", "relay", "manual"])
             ),
-            Column::new("vault_ref", Ty::SecretRef),
+            Column::new("vault_ref", Ty::SecretRef).null(),
             Column::new("webmail", Ty::Url).null(),
             row(),
             note(),
+            Column::new("login", Ty::Ref("address")).null().since(2),
+            Column::new("mailbox_password", Ty::Secret).null().since(2),
+            Column::new("totp", Ty::Secret).null().since(2),
+            Column::new("receives", Ty::Set(&Ty::Ref("address"))).since(2),
+            // A domain is no set element (its dots break the cell key's grammar): a list.
+            Column::new("receives_domains", Ty::List(&Ty::Text(253), 64))
+                .null()
+                .since(2),
+            // `imaps://imap.example.test:993`, a local Bridge's `imap://127.0.0.1:1143`, a mail
+            // API's `http://127.0.0.1:8025`: `Url` takes only `https`, and the importer refuses
+            // one naming a user.
+            Column::new("imap", Ty::Text(512)).null().since(2),
+            Column::new("http", Ty::Text(512)).null().since(2),
         ],
         unique: &[&["label"]],
         max_row: 0,
@@ -380,11 +430,12 @@ crate::att_collection!(
 
 crate::att_collection!(
     /// A phone, keyed `ph-<16 random hex>`, never a digest of the number: with the country
-    /// code and the last four digits known, an unkeyed hash falls to about 10⁶ guesses. The
-    /// full number lives in the vault entry this row names.
+    /// code and the last four digits known, an unkeyed hash falls to about 10⁶ guesses.
+    /// Version 2 holds the full number as a `Secret` (`number`, digits only); the importer
+    /// finds a phone by opening it, and `check` lists two rows holding one number by key.
     pub PHONE = Collection {
         name: "phone",
-        version: 1,
+        version: 2,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "ph",
@@ -392,9 +443,15 @@ crate::att_collection!(
         columns: &[
             Column::new("last4", Ty::Digits(4)),
             Column::new("label", Ty::Text(64)).null(),
-            Column::new("vault_ref", Ty::SecretRef),
+            Column::new("carrier", Ty::Text(64)).null(),
+            Column::new("line_type", Ty::Text(32)).null(),
+            Column::new("device", Ty::Text(64)).null(),
+            Column::new("vault_ref", Ty::SecretRef).null(),
             row(),
             note(),
+            src(),
+            notes_src(),
+            Column::new("number", Ty::Secret).null().since(2),
         ],
         unique: &[],
         max_row: 0,
@@ -568,10 +625,13 @@ crate::att_collection!(
 
 crate::att_collection!(
     /// One import run's provenance, keyed by a digest of the source's bytes, so a re-run
-    /// collapses. `name` is a file name only.
+    /// collapses. `name` is a file name only. Version 2 adds the `fleet-db` kind (a replica's
+    /// dump, one source per table) and `differs`: the cells this source stated differently from
+    /// the registry when it was imported, by row key and column only, never a value, which the
+    /// table view shows until the owner settles them (one-mesh design §8).
     pub SOURCE = Collection {
         name: "source",
-        version: 1,
+        version: 2,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "sr",
@@ -582,6 +642,9 @@ crate::att_collection!(
                 Ty::Enum(&[
                     "vault-sheet",
                     "logins-csv",
+                    "computers-csv",
+                    "emails-csv",
+                    "phones-csv",
                     "fleet-accounts",
                     "accounts-toml",
                     "ai-pool",
@@ -590,6 +653,7 @@ crate::att_collection!(
                     "swarm-roster",
                     "commons-members",
                     "proposals",
+                    "fleet-db",
                 ])
             ),
             Column::new("name", Ty::Text(128)),
@@ -599,11 +663,117 @@ crate::att_collection!(
             Column::new("by", Ty::Ref("machine")).null(),
             Column::new("counts", Ty::Json(1024)).null(),
             row(),
+            Column::new("differs", Ty::List(&Ty::Struct(DIFFERS), MAX_DIFFERS))
+                .null()
+                .since(2),
         ],
         unique: &[],
         max_row: 0,
     }
 );
+
+/// The most differing cells one source row names; past it the import's report says how many
+/// more.
+pub const MAX_DIFFERS: usize = 256;
+
+/// The collections an import writes, as a differing cell names them.
+pub const DIFFER_COLLECTIONS: &[&str] = &[
+    "address",
+    "account",
+    "machine",
+    "preference",
+    "mailbox",
+    "phone",
+];
+
+/// The columns of [`DIFFER_COLLECTIONS`] by name: a column is a name, never free text, so a
+/// `Secret` column's name passes where the free-text guard would refuse it. A column added
+/// later and not named here is reported by the import and left out of the source row.
+pub const DIFFER_COLUMNS: &[&str] = &[
+    "account",
+    "addr",
+    "alias_of",
+    "aliases",
+    "arch",
+    "billing",
+    "browser",
+    "carrier",
+    "chip",
+    "clis",
+    "code_path",
+    "device",
+    "disk_gb",
+    "domain",
+    "fleet_node",
+    "flow",
+    "hosts",
+    "identity",
+    "kind",
+    "label",
+    "last4",
+    "legacy_label",
+    "line_type",
+    "location",
+    "login",
+    "machine",
+    "mailbox",
+    "mailbox_hint",
+    "make",
+    "merged_into",
+    "method",
+    "model",
+    "nickname",
+    "nickname_aliases",
+    "note",
+    "number",
+    "origin",
+    "os",
+    "password",
+    "phone",
+    "plan",
+    "plan_since",
+    "protected",
+    "provider",
+    "ram_gb",
+    "rank",
+    "realm",
+    "region",
+    "renews",
+    "role",
+    "row",
+    "service",
+    "services",
+    "since",
+    "status",
+    "vault_ref",
+    "webmail",
+    "why",
+];
+
+/// One cell a source stated differently from the registry: where, never what. A set's element
+/// is `elem`.
+pub const DIFFERS: &[Member] = &[
+    Member {
+        name: "collection",
+        ty: Ty::Enum(DIFFER_COLLECTIONS),
+        null: false,
+    },
+    Member {
+        name: "pk",
+        ty: Ty::Text(32),
+        null: false,
+    },
+    Member {
+        name: "column",
+        ty: Ty::Enum(DIFFER_COLUMNS),
+        null: false,
+    },
+    Member {
+        name: "elem",
+        ty: Ty::Text(64),
+        null: true,
+    },
+];
 
 /// The largest earlier record an archived row carries: its padded base64 and the row's key fit
 /// one record's 64 KiB body.
@@ -746,8 +916,8 @@ pub const REGISTRY_2: Table = Table {
 pub const GENERATIONS: [&Table; 2] = [&REGISTRY, &REGISTRY_2];
 
 /// The key a new grid row of `collection` is born under (design §5, §8), from the typed values
-/// the owner gave its cells: a random key for a mailbox or a phone, never a digest of what it
-/// guards; an address's digest; **the canonical account key** from the account's realm and the
+/// the owner gave its cells: a mailbox's from its login address's key; a random key for a
+/// phone, never a digest of its number; an address's digest; **the canonical account key** from the account's realm and the
 /// address of its identity, else its login (`keys::claims_email`), read from `cells`; a
 /// sub-account from its account and observed key; a sign-in route from its account and method;
 /// a preference from its machine and account; a planned machine from its label, the sheet
@@ -786,7 +956,7 @@ pub fn birth(
             })
     };
     match collection.name {
-        "mailbox" => keys::random_pk(keys::Random::Mailbox),
+        "mailbox" => keys::mailbox_pk(need("login")?),
         "phone" => keys::random_pk(keys::Random::Phone),
         "address" => keys::address_pk(need("addr")?),
         "machine" => Ok(keys::machine_pk(need("label")?)),

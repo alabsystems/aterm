@@ -112,7 +112,10 @@ impl Fixture {
             &self.path,
             self.raw.clone(),
             &accounts::Logins::default(),
-            self.raw.rows[0].clone(),
+            (
+                self.raw.rows[0].clone(),
+                crate::harness::sign_in_ladder::asked_fixture(Cli::Claude, &self.raw.rows[0].label),
+            ),
             (Some(self.request.clone()), true),
             NOW,
             guard,

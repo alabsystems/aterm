@@ -313,9 +313,10 @@ fn open_private(path: &Path, append: bool) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
-    let file = open.open(path)?;
+    let file: std::fs::File = aterm_uds::kept_out(|| open.open(path))?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -592,7 +593,7 @@ struct Stamp {
 }
 
 fn stamp_of(path: &Path) -> Option<Stamp> {
-    let meta = std::fs::metadata(path)
+    let meta = std::fs::symlink_metadata(path)
         .ok()
         .filter(std::fs::Metadata::is_file)?;
     #[cfg(unix)]

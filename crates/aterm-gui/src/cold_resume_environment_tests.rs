@@ -97,6 +97,7 @@ fn trial_program(case: i64, carried: i64, custom_home: bool, supported: bool) ->
         SESSION.into(),
     ];
     let restore = AgentRestore {
+        claude_auth: None,
         pid: 4242,
         start: "fixture".into(),
         // The recorded self-claim's argv, not this outer process label, is executed.

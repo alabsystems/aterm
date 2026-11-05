@@ -259,23 +259,25 @@ impl NetworkId {
     #[must_use]
     pub fn of(route: &RouteFacts) -> Option<Self> {
         let hw = route.gateway_hw.as_deref()?;
-        let mut seed = b"aterm-netplace/1 strong\0".to_vec();
-        seed.extend_from_slice(hw);
-        seed.push(0);
-        seed.extend_from_slice(route.subnet_words().as_bytes());
-        Some(Self(format!("n{:016x}", aterm_hash::fnv1a_64(&seed))))
+        let mut h = aterm_hash::Fnv1a64::new();
+        h.write(b"aterm-netplace/1 strong\0");
+        h.write(hw);
+        h.write_u8(0);
+        h.write(route.subnet_words().as_bytes());
+        Some(Self(format!("n{:016x}", h.finish())))
     }
 
     /// The weak id of `route`: its subnet and gateway address, never remembered.
     #[must_use]
     pub fn weak(route: &RouteFacts) -> Self {
-        let mut seed = b"aterm-netplace/1 weak\0".to_vec();
-        seed.extend_from_slice(route.subnet_words().as_bytes());
-        seed.push(0);
+        let mut h = aterm_hash::Fnv1a64::new();
+        h.write(b"aterm-netplace/1 weak\0");
+        h.write(route.subnet_words().as_bytes());
+        h.write_u8(0);
         if let Some(gateway) = route.gateway {
-            seed.extend_from_slice(&gateway.octets());
+            h.write(&gateway.octets());
         }
-        Self(format!("w{:016x}", aterm_hash::fnv1a_64(&seed)))
+        Self(format!("w{:016x}", h.finish()))
     }
 
     /// Whether this id came from the gateway's hardware address.
@@ -310,10 +312,11 @@ impl NetworkId {
 /// A member's key in the evidence: a short hash of its lane and id, so the file holds no node id.
 #[must_use]
 pub fn member_key(lane: Lane, id: &str) -> String {
-    let mut seed = lane.word().as_bytes().to_vec();
-    seed.push(0);
-    seed.extend_from_slice(id.as_bytes());
-    format!("{:016x}", aterm_hash::fnv1a_64(&seed))
+    let mut h = aterm_hash::Fnv1a64::new();
+    h.write(lane.word().as_bytes());
+    h.write_u8(0);
+    h.write(id.as_bytes());
+    format!("{:016x}", h.finish())
 }
 
 /// The kind of a network this Mac is on.
@@ -619,11 +622,12 @@ impl Stay {
         let Some(route) = facts.route.as_ref() else {
             return self.subnet.is_none();
         };
-        let same_place = self.subnet.as_deref() == Some(route.subnet_words().as_str())
-            && self.gateway == route.gateway;
         match (NetworkId::of(route), &self.network) {
             (Some(id), Some(network)) if network.is_strong() => *network == id,
-            _ => same_place,
+            _ => {
+                self.gateway == route.gateway
+                    && self.subnet.as_deref() == Some(route.subnet_words().as_str())
+            }
         }
     }
 }

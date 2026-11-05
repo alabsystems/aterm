@@ -498,7 +498,7 @@ pub fn profile_holder(profile: &Path) -> Option<Holder> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(profile.join(PROFILE_LOCK_FILE))
         .ok()?;
     match ProfileLock::try_take(file) {
@@ -617,10 +617,9 @@ impl ProfileLock {
             use std::os::unix::fs::OpenOptionsExt as _;
             options
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
-        let file = options
-            .open(profile.join(PROFILE_LOCK_FILE))
+        let file = aterm_uds::kept_out(|| options.open(profile.join(PROFILE_LOCK_FILE)))
             .map_err(Refusal::Unlockable)?;
         match Self::try_take(file).map_err(Refusal::Unlockable)? {
             Ok(lock) => {

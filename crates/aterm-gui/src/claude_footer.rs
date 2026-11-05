@@ -2610,6 +2610,18 @@ fn forget(
     walled.remove(&session);
 }
 
+struct FooterUseHost<'a> {
+    identity: &'a Identity,
+    argv: &'a [String],
+    env: &'a [String],
+}
+
+impl aterm_agent::harness::provider_read::FooterHost for FooterUseHost<'_> {
+    fn owns(&self, argv: &[String], env: &[String]) -> bool {
+        self.identity.pid > 0 && self.argv == argv && self.env == env
+    }
+}
+
 /// What the resolver knows about one Claude Code process for its whole life
 /// ([`footer::launch_facts_of`], [`login_of_args`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3221,7 +3233,16 @@ fn resolve_facts_at_with_cwd(
                 && let (Some(args), Some(home)) = (args.as_ref(), home.as_deref())
             {
                 if let Some(read) = aterm_agent::harness::profile::muse_subscription_for(
-                    &args.argv, &args.env, home, &sub, clock.now,
+                    &args.argv,
+                    &args.env,
+                    home,
+                    &sub,
+                    clock.now,
+                    &FooterUseHost {
+                        identity,
+                        argv: &args.argv,
+                        env: &args.env,
+                    },
                 ) {
                     sub = read;
                 }
@@ -3260,6 +3281,11 @@ fn resolve_facts_at_with_cwd(
                     &sub,
                     prev_card_model.as_deref().or(model.as_deref()),
                     clock.now,
+                    &FooterUseHost {
+                        identity,
+                        argv: &args.argv,
+                        env: &args.env,
+                    },
                 ) {
                     sub = read;
                 }

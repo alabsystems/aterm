@@ -694,6 +694,32 @@ fn gate_trend_at(
     recorded: &[&str],
     tree: &str,
 ) -> LaneRun {
+    gate_trend_using(
+        path,
+        aliases_path,
+        me,
+        samples,
+        lanes_ok,
+        recorded,
+        tree,
+        super::publication::publish,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the publication seam preserves the existing trend gate inputs"
+)]
+fn gate_trend_using(
+    path: &std::path::Path,
+    aliases_path: &std::path::Path,
+    me: &MachineId,
+    samples: &[TrendSample],
+    lanes_ok: bool,
+    recorded: &[&str],
+    tree: &str,
+    publish: super::publication::Publisher,
+) -> LaneRun {
     let aliases = match read_trend_input(aliases_path) {
         Ok(text) => text,
         Err(error) => {
@@ -855,7 +881,7 @@ fn gate_trend_at(
                 recorded,
             ),
         );
-        if let Err(e) = std::fs::write(path, &text) {
+        if let Err(e) = publish(path, &text) {
             run.add_failure(format!(
                 "could not append trend ledger {}: {e}",
                 path.display()
@@ -906,6 +932,31 @@ mod tests {
 
     fn rows_for(date: &str, sha: &str, key: &str, samples: &[TrendSample]) -> String {
         trend_rows(date, sha, &box_id(key), samples, &[])
+    }
+
+    #[test]
+    fn interrupted_trend_publication_preserves_history() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("trend.tsv");
+        let aliases = dir.path().join("boxes.tsv");
+        let me = box_id("m21");
+        let samples = [sample("throughput", "median_mbps", 1000.0)];
+        gate_trend_at(&path, &aliases, &me, &samples, true, &[], "test-tree");
+        let old = std::fs::read(&path).unwrap();
+        assert!(
+            gate_trend_using(
+                &path,
+                &aliases,
+                &me,
+                &samples,
+                true,
+                &[],
+                "test-tree",
+                super::super::publication::interrupted
+            )
+            .failed()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), old);
     }
 
     #[test]

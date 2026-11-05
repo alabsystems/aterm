@@ -92,7 +92,8 @@ pub struct Server {
     companions_taken: u64,
     /// Why the last dial was refused unchecked.
     unchecked_said: Option<String>,
-    /// Frames read after their writer's exit had already arrived.
+    /// Frames [`Server::drain_pid`] handed the core behind their writer's exit: those the turn's
+    /// own read had not taken when the exit watch delivered.
     frames_behind_exit: u64,
     /// Frames the keeper could not write to their peer ([`Server::send`]).
     replies_lost: u64,
@@ -111,6 +112,11 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const TICK_MS: i32 = 250;
 const CHECK_TICK_MS: i32 = 5;
 const DIAL_CHECKS_MAX: usize = 16;
+/// The most frames one connection's read takes at a time ([`Server::read_waiting`]): in a turn
+/// whose poll found it readable, and behind a peer's exit. A turn costs a poll over every
+/// connection and exit watch and a look at each watch, so taking one frame a turn made a
+/// window's burst (a recovery's REGISTER, COMPANION and SYNCs for each of its sessions) cost
+/// sessions × watches.
 const DRAIN_MAX_FRAMES: usize = 1024;
 
 struct Env<'a> {
@@ -352,6 +358,22 @@ impl Server {
     /// # Errors
     /// Returns an error if `poll` fails for a reason other than `EINTR`.
     pub fn step(&mut self, timeout_ms: i32) -> io::Result<()> {
+        self.turn(timeout_ms, || {})
+    }
+
+    /// A test seam: [`Server::step`], calling `park` once the turn's poll has returned and before
+    /// the turn reads anything. What a peer does while it is parked (writes its frames and exits)
+    /// lands after the poll and before the turn's sweep of its exit watches, so the turn's own
+    /// read skips that connection and only [`Server::drain_pid`] reads those frames before the
+    /// death is judged.
+    /// # Errors
+    /// Returns an error if `poll` fails for a reason other than `EINTR`.
+    #[cfg(any(test, debug_assertions))]
+    pub fn step_parked(&mut self, timeout_ms: i32, park: impl FnOnce()) -> io::Result<()> {
+        self.turn(timeout_ms, park)
+    }
+
+    fn turn(&mut self, timeout_ms: i32, park: impl FnOnce()) -> io::Result<()> {
         let accepting = self.dialing.len() < self.dial_checks_max;
         let mut fds = vec![PollFd {
             fd: self.listener.as_raw_fd(),
@@ -379,6 +401,7 @@ impl Server {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
+        park();
         let ready = |pfd: &PollFd| pfd.revents & (POLLIN | POLLHUP | POLLERR) != 0;
         if accepting && ready(&fds[0]) {
             self.accept_all();
@@ -386,7 +409,7 @@ impl Server {
         self.admit_checked();
         for (i, id) in conn_ids.iter().enumerate() {
             if ready(&fds[1 + i]) {
-                self.read_conn(*id);
+                self.read_waiting(*id, DRAIN_MAX_FRAMES);
             }
         }
         for (i, pid) in watch_pids.iter().enumerate() {
@@ -394,6 +417,7 @@ impl Server {
                 self.read_watch(*pid);
             }
         }
+        // An exit that arrived after the poll: its connections' frames since are drained there.
         for pid in self.watches.keys().copied().collect::<Vec<_>>() {
             self.read_watch(pid);
         }
@@ -543,6 +567,10 @@ impl Server {
         self.apply(outs);
     }
 
+    /// Hands the core every complete frame `pid` wrote that the turn's own read has not taken, on
+    /// each of its connections, before [`Server::read_watch`] judges its exit: a REGISTER or BYE
+    /// that arrived after the turn's poll, beside an exit the sweep found, is never read as
+    /// coming after the death. Each counts in `frames_behind_exit`.
     fn drain_pid(&mut self, pid: u32) {
         let ids: Vec<ConnId> = self
             .conns
@@ -551,26 +579,38 @@ impl Server {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            for _ in 0..DRAIN_MAX_FRAMES {
-                let Some(conn) = self.conns.get(&id) else {
-                    break;
-                };
-                let mut pfd = [PollFd {
-                    fd: conn.stream.as_raw_fd(),
-                    events: POLLIN,
-                    revents: 0,
-                }];
-                match sys::poll(&mut pfd, 0) {
-                    Ok(n) if n > 0 && pfd[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 => {
-                        if self.read_conn(id) {
-                            self.frames_behind_exit += 1;
-                        }
+            let read = self.read_waiting(id, DRAIN_MAX_FRAMES);
+            self.frames_behind_exit = self
+                .frames_behind_exit
+                .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// Read and handle the frames already waiting on connection `id`, up to `max` of them, in
+    /// order: until a look finds nothing more to read or the connection is gone. Returns how
+    /// many it handled.
+    fn read_waiting(&mut self, id: ConnId, max: usize) -> usize {
+        let mut read = 0;
+        for _ in 0..max {
+            let Some(conn) = self.conns.get(&id) else {
+                break;
+            };
+            let mut pfd = [PollFd {
+                fd: conn.stream.as_raw_fd(),
+                events: POLLIN,
+                revents: 0,
+            }];
+            match sys::poll(&mut pfd, 0) {
+                Ok(n) if n > 0 && pfd[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 => {
+                    if self.read_conn(id) {
+                        read += 1;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    _ => break,
                 }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                _ => break,
             }
         }
+        read
     }
 
     fn read_conn(&mut self, id: ConnId) -> bool {
@@ -1092,6 +1132,81 @@ mod tests {
         assert_eq!(rec.claimants, vec![*conn]);
         assert!(server.holds(rdev), "and its descriptor kept");
         assert!(server.conns.is_empty(), "the EOF dropped the connection");
+        drop(server);
+    }
+
+    /// A turn whose poll found a connection readable handles every frame already waiting on it,
+    /// in order: a window's burst of SYNCs is answered in that one turn, not one a turn, each turn
+    /// a poll over every connection and exit watch (`DRAIN_MAX_FRAMES`). Negative control: a
+    /// turn taking one frame answers the HELLO and none of the SYNCs behind it.
+    #[test]
+    fn a_turn_answers_every_frame_already_waiting_on_a_connection() {
+        let scratch = crate::test_scratch_dir("burst");
+        let mut server = Server::bind(ServeConfig {
+            socket: scratch.path().join("k.sock"),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: "test".into(),
+            test_drop_custody: false,
+        })
+        .expect("bind");
+        let client = CtlStream::connect(server.socket()).expect("connect");
+        server.step(0).expect("turn");
+        assert_eq!(server.conns.len(), 1, "accepted");
+        const SYNCS: u64 = 96;
+        write_frame(&client, &hello_app(), None).expect("write the HELLO");
+        for seq in 1..=SYNCS {
+            write_frame(&client, &Frame::Sync { seq }, None).expect("write a SYNC");
+        }
+        let fd = server
+            .conns
+            .values()
+            .next()
+            .expect("the connection")
+            .stream
+            .as_raw_fd();
+        let started = Instant::now();
+        loop {
+            let mut pfd = [PollFd {
+                fd,
+                events: POLLIN,
+                revents: 0,
+            }];
+            let _ = sys::poll(&mut pfd, 0);
+            if pfd[0].revents & POLLIN != 0 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "never readable"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        server.step(0).expect("the one turn");
+        let mut answered = Vec::new();
+        let mut welcomed = false;
+        loop {
+            let mut pfd = [PollFd {
+                fd: client.as_raw_fd(),
+                events: POLLIN,
+                revents: 0,
+            }];
+            let _ = sys::poll(&mut pfd, 0);
+            if pfd[0].revents & POLLIN == 0 {
+                break;
+            }
+            match read_frame(&client).expect("a frame").expect("open").frame {
+                Frame::Welcome { .. } => welcomed = true,
+                Frame::Sync { seq } => answered.push(seq),
+                other => panic!("an unexpected frame: {other:?}"),
+            }
+        }
+        assert!(welcomed, "the HELLO was answered");
+        assert_eq!(
+            answered,
+            (1..=SYNCS).collect::<Vec<_>>(),
+            "every SYNC waiting behind it was answered in the same turn, in order"
+        );
         drop(server);
     }
 

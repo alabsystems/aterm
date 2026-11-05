@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use aterm_agent::harness::contract::Scope;
 use aterm_agent::harness::native_act::{
-    Binding, CancelPrepare, ClaimOutcome, Constructor, Decision, Image, ImagePhase, NativePlan,
-    Prepare, Process, Request, RestartCommand, Retirement,
+    Binding, CancelPrepare, ClaimOutcome, ColdEnvironmentFacts, ColdIntent, Constructor, Decision,
+    Image, ImagePhase, NativePlan, Prepare, Process, Request, RestartCommand, Retirement,
 };
 
 use crate::session_timeline::{
@@ -28,6 +28,14 @@ mod tests;
 #[path = "native_closed_restart.rs"]
 mod closed_restart;
 use closed_restart::ClosedRestart;
+
+#[path = "native_account_continuation.rs"]
+mod account_continuation;
+use account_continuation::AccountContinuation;
+
+#[path = "native_preparation.rs"]
+mod preparation;
+use preparation::{Preparation, Preparing, finish_preparation, retry_preparation};
 
 #[path = "native_observe_control.rs"]
 mod observe_control;
@@ -112,6 +120,7 @@ pub(crate) fn serve_codex_exec_handoff(_: &Arc<crate::SessionCtx>, _: i32, _: &s
 
 const DENIED: &str = "ERR denied native operation authority\n";
 const UNKNOWN: &str = "OK native-act state=unknown\n";
+const NOEXEC: &str = "OK native-act state=retired reason=no-exec-grant\n";
 #[cfg(test)]
 const COMMITTED: &str = "OK native-act state=committed claim=lost revision=-\n";
 const ROLLBACK_SAFE: &str = "OK native-act state=rollback-safe\n";
@@ -182,6 +191,7 @@ pub(crate) struct Operations {
     builtin_coordinated: bool,
     reservations: std::collections::BTreeSet<String>,
     cancelled: BTreeMap<String, CancelledPrepare>,
+    receipt_flights: BTreeMap<String, usize>,
 }
 
 /// A data-only seal for a preparation that had not published an operation. The original
@@ -206,6 +216,22 @@ impl Operations {
             )
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NoExecFlight",
+            action = "Reclaim",
+            project = "native_act::tests::receipts::flight_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "NoExecFlight",
+            action = "Expire",
+            reason = "The injected monotonic clock passes the closed operation deadline"
+        )
+    )]
     fn reclaim(&mut self, now_us: u64) -> Vec<Arc<Mutex<Operation>>> {
         let expired_seals = self
             .cancelled
@@ -222,6 +248,9 @@ impl Operations {
             .completed
             .iter()
             .filter_map(|id| {
+                if self.receipt_flights.contains_key(id) {
+                    return None;
+                }
                 let operation = self.by_id.get(id)?;
                 let op = operation.try_lock().ok()?;
                 (op.request.deadline_us <= now_us
@@ -251,6 +280,99 @@ struct PrepareSlot<'a> {
     ctx: &'a crate::SessionCtx,
     id: String,
     published: bool,
+}
+
+/// Transient data-only pin, installed under the same table lock as reclamation
+/// before looking up the operation. Drop releases it on every return path.
+struct ReceiptFlight<'a> {
+    ctx: &'a crate::SessionCtx,
+    id: String,
+}
+
+impl<'a> ReceiptFlight<'a> {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NoExecFlight",
+            action = "BeginA",
+            project = "native_act::tests::receipts::flight_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NoExecFlight",
+            action = "BeginB",
+            project = "native_act::tests::receipts::flight_transition"
+        )
+    )]
+    fn begin(ctx: &'a crate::SessionCtx, request: &Request) -> Result<Option<Self>, ()> {
+        let id = match request {
+            Request::Prepare(prepare) if matches!(prepare.plan, NativePlan::Restart { .. }) => {
+                &prepare.id
+            }
+            // Cancellation applies only to OwnImage and cannot produce a
+            // restart NoExec receipt. Its expired-history sweep must run.
+            Request::Prepare(_) | Request::CancelPrepare(_) => return Ok(None),
+            Request::Precommit(binding, _)
+            | Request::Commit(binding, _, _)
+            | Request::Query(binding)
+            | Request::Abort(binding)
+            | Request::Recover(binding)
+            | Request::Signal(binding)
+            | Request::Resume(binding, _, _, _)
+            | Request::Attach(binding, _)
+            | Request::Resolve(binding, _, _)
+            | Request::Execute(binding, _)
+            | Request::ExecFailed(binding, _, _)
+            | Request::Reconcile(binding) => &binding.id,
+            _ => return Ok(None),
+        };
+        let mut table = ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let count = table.receipt_flights.entry(id.clone()).or_default();
+        *count = count.checked_add(1).ok_or(())?;
+        Ok(Some(Self {
+            ctx,
+            id: id.clone(),
+        }))
+    }
+}
+
+impl Drop for ReceiptFlight<'_> {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NoExecFlight",
+            action = "EndA",
+            project = "native_act::tests::receipts::flight_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NoExecFlight",
+            action = "EndB",
+            project = "native_act::tests::receipts::flight_transition"
+        )
+    )]
+    fn drop(&mut self) {
+        let mut table = self
+            .ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = table.receipt_flights.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                table.receipt_flights.remove(&self.id);
+            }
+        }
+    }
 }
 
 impl<'a> PrepareSlot<'a> {
@@ -330,8 +452,18 @@ struct Authority {
     caller: SupervisorInputCaller,
     builtin: bool,
     renewal: Option<renewal::Seal>,
+    account: Option<AccountContinuation>,
     actor: Option<Process>,
     conversation: Option<Conversation>,
+}
+
+impl Authority {
+    fn continuation(&self) -> Option<&Arc<ClosedRestart>> {
+        self.account
+            .as_ref()
+            .map(AccountContinuation::proof)
+            .or_else(|| self.renewal.as_ref().and_then(|seal| seal.continuation()))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -388,6 +520,8 @@ struct Operation {
     authority: Authority,
     custody: Option<Arc<NativeCustody>>,
     phase: Phase,
+    preparation: Preparation,
+    grant_record: GrantRecord,
     signal_sent: bool,
     signal_accepted: Option<bool>,
     resume_sent: bool,
@@ -408,6 +542,84 @@ struct Operation {
     source_death: Option<Arc<SharedDeath>>,
     closed_restart: Option<Arc<ClosedRestart>>,
     resume_only: bool,
+    cold_facts: Option<ColdEnvironmentFacts>,
+    cold_resolving: bool,
+    resolved_cold: Option<Arc<ResolvedCold>>,
+}
+
+trait ColdProof: std::fmt::Debug + Send + Sync {
+    fn current(&self) -> bool;
+}
+
+impl ColdProof for crate::harness_host::ColdCommandProof {
+    fn current(&self) -> bool {
+        crate::harness_host::ColdCommandProof::current(self)
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedCold {
+    command: RestartCommand,
+    facts: ColdEnvironmentFacts,
+    proof: Arc<dyn ColdProof>,
+}
+
+/// Operation-wide evidence survives child-slot changes. An uncertain append
+/// never becomes absence merely because no child has received its grant yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrantRecord {
+    None,
+    Writing(u64),
+    Uncertain(u64),
+    Recorded,
+}
+
+impl GrantRecord {
+    fn begin(&mut self) -> Option<u64> {
+        let attempt = match *self {
+            Self::None => 1,
+            Self::Uncertain(previous) => previous.checked_add(1)?,
+            Self::Writing(_) | Self::Recorded => return None,
+        };
+        *self = Self::Writing(attempt);
+        Some(attempt)
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "IssuerGrant",
+            action = "Ack",
+            project = "native_act::tests::issuer::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "IssuerGrant",
+            action = "Fail",
+            project = "native_act::tests::issuer::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "IssuerGrant",
+            action = "OldCleanup",
+            project = "native_act::tests::issuer::transition"
+        )
+    )]
+    fn finish(&mut self, attempt: u64, recorded: bool) -> bool {
+        if *self != Self::Writing(attempt) {
+            return false;
+        }
+        *self = if recorded {
+            Self::Recorded
+        } else {
+            Self::Uncertain(attempt)
+        };
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -598,12 +810,18 @@ const fn phase_index(phase: ImagePhase) -> usize {
 
 fn command_for(op: &Operation, phase: ImagePhase) -> Option<&RestartCommand> {
     let NativePlan::Restart {
-        forward, rollback, ..
+        forward,
+        rollback,
+        cold,
+        ..
     } = &op.request.plan
     else {
         return None;
     };
     match phase {
+        ImagePhase::Forward if cold.is_some() => {
+            op.resolved_cold.as_ref().map(|resolved| &resolved.command)
+        }
         ImagePhase::Forward => Some(forward),
         ImagePhase::Rollback => rollback.as_deref(),
     }
@@ -622,9 +840,11 @@ struct Completion {
 
 impl Operation {
     fn continuation_pending(&self) -> bool {
-        self.closed_restart
-            .as_ref()
-            .is_some_and(|proof| proof.pinned())
+        !self.preparation.recorded
+            || self
+                .closed_restart
+                .as_ref()
+                .is_some_and(|proof| proof.pinned())
             || (self.resume_only
                 && matches!(
                     self.phase,
@@ -638,6 +858,9 @@ impl Operation {
     }
 
     fn seal_without_effect(&mut self, kernel: &dyn Kernel) -> Option<Completion> {
+        if !self.preparation.can_publish() || self.grant_record != GrantRecord::None {
+            return None;
+        }
         if self.resume_only && retirement(self, kernel) == Some(Retirement::NotGranted) {
             self.seal_retirement(Retirement::NotGranted, kernel)
         } else {
@@ -645,7 +868,20 @@ impl Operation {
         }
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ContinuationPhase",
+            action = "RetireChild",
+            project = "native_act::tests::continuation_phase::transition"
+        )
+    )]
     fn seal_retirement(&mut self, reason: Retirement, kernel: &dyn Kernel) -> Option<Completion> {
+        if !self.preparation.can_publish()
+            || (reason == Retirement::NotGranted && self.grant_record != GrantRecord::None)
+        {
+            return None;
+        }
         if !matches!(self.phase, Phase::Completed(_)) {
             self.closed_restart = ClosedRestart::capture(self, reason, kernel).map(Arc::new);
         }
@@ -653,11 +889,22 @@ impl Operation {
     }
 
     fn seal_completion(&mut self, decision: Decision) -> Option<Completion> {
+        if !self.preparation.can_publish()
+            || matches!(self.grant_record, GrantRecord::Writing(_))
+            || (matches!(self.grant_record, GrantRecord::Uncertain(_))
+                && decision != Decision::Unknown)
+        {
+            return None;
+        }
         if matches!(self.phase, Phase::Completed(_)) {
             return None;
         }
         self.phase = Phase::Completed(decision);
-        self.completion_drain = self.custody.as_ref().map(|custody| custody.drain());
+        self.completion_drain = self
+            .custody
+            .as_ref()
+            .map(|custody| custody.drain())
+            .or_else(|| self.completion_drain.take());
         Some(Completion {
             id: self.request.id.clone(),
             custody: self.custody.take(),
@@ -681,6 +928,34 @@ enum Phase {
 /// Process/image facts are injected in conformance tests; the production arm reads the
 /// kernel, never a caller's holder, argv text, pathname alone or status-as-permission.
 trait Kernel {
+    fn record_prepared(&self, prepare: &Prepare, binding: &Binding) -> bool;
+    fn record_successor(
+        &self,
+        predecessor: &Prepare,
+        predecessor_binding: &Binding,
+        prepare: &Prepare,
+        binding: &Binding,
+    ) -> bool;
+    fn record_may_execute(&self, prepare: &Prepare, binding: &Binding) -> bool;
+    fn record_sealed(&self, prepare: &Prepare, binding: &Binding) -> bool;
+    /// The private control worker calls this after sealing and draining, outside
+    /// every native/GUI lock. It is never an execution or successor grant.
+    fn record_noexec(&self, prepare: &Prepare, binding: &Binding) -> bool;
+    /// Authenticated read-only history; absent, damaged or unavailable is false.
+    fn historical_noexec(&self, request: &Request) -> bool;
+    fn recorded_operation(&self, id: &str) -> Result<bool, ()>;
+    fn account_admission(
+        &self,
+        _: &aterm_agent::harness::accounts_pool::ExecutionIntent,
+    ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
+        Err(())
+    }
+    fn account_execution(
+        &self,
+        command: &RestartCommand,
+        pid: u32,
+        cold: Option<&ColdEnvironmentFacts>,
+    ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()>;
     fn constructor_enabled(&self, kind: Constructor) -> bool;
     fn clock(&self) -> Clock;
     fn process(&self, pid: u32) -> Option<Process>;
@@ -697,6 +972,21 @@ trait Kernel {
     fn record_guard(&self, ctx: &crate::SessionCtx) -> Option<Conversation> {
         self.record_key(ctx).map(Conversation::Host)
     }
+    fn resolve_cold(
+        &self,
+        _ctx: &crate::SessionCtx,
+        _intent: &ColdIntent,
+        _seed: &RestartCommand,
+        _facts: &ColdEnvironmentFacts,
+    ) -> Result<(RestartCommand, Arc<dyn ColdProof>), String> {
+        Err("cold resolution is unavailable".into())
+    }
+    fn cold_current(&self, proof: &dyn ColdProof) -> bool {
+        proof.current()
+    }
+    fn cold_controls_current(&self, _intent: &ColdIntent) -> bool {
+        false
+    }
     fn preparing(&self) {}
     fn reserved(&self) {}
     fn completion_sealed(&self) {}
@@ -705,6 +995,208 @@ trait Kernel {
 struct System<'a>(&'a crate::native_session_policy::SessionPolicy, bool);
 
 impl Kernel for System<'_> {
+    fn resolve_cold(
+        &self,
+        _ctx: &crate::SessionCtx,
+        intent: &ColdIntent,
+        seed: &RestartCommand,
+        facts: &ColdEnvironmentFacts,
+    ) -> Result<(RestartCommand, Arc<dyn ColdProof>), String> {
+        crate::harness_host::resolve_cold_command(seed, intent, facts)
+            .map(|(command, proof)| (command, Arc::new(proof) as Arc<dyn ColdProof>))
+    }
+    fn cold_controls_current(&self, intent: &ColdIntent) -> bool {
+        crate::harness_host::cold_intent_current(intent)
+    }
+    fn record_prepared(&self, prepare: &Prepare, binding: &Binding) -> bool {
+        #[cfg(unix)]
+        {
+            aterm_agent::harness::native_receipts::prepared(prepare, binding).is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (prepare, binding);
+            false
+        }
+    }
+    fn record_successor(
+        &self,
+        predecessor: &Prepare,
+        predecessor_binding: &Binding,
+        prepare: &Prepare,
+        binding: &Binding,
+    ) -> bool {
+        #[cfg(unix)]
+        {
+            aterm_agent::harness::native_receipts::prepared_successor(
+                predecessor,
+                predecessor_binding,
+                prepare,
+                binding,
+            )
+            .is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (predecessor, predecessor_binding, prepare, binding);
+            false
+        }
+    }
+    fn record_may_execute(&self, prepare: &Prepare, binding: &Binding) -> bool {
+        #[cfg(unix)]
+        {
+            aterm_agent::harness::native_receipts::may_execute(prepare, binding).is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (prepare, binding);
+            false
+        }
+    }
+    fn record_sealed(&self, prepare: &Prepare, binding: &Binding) -> bool {
+        #[cfg(unix)]
+        {
+            aterm_agent::harness::native_receipts::seal(prepare, binding).is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (prepare, binding);
+            false
+        }
+    }
+    fn recorded_operation(&self, id: &str) -> Result<bool, ()> {
+        #[cfg(unix)]
+        {
+            aterm_agent::harness::native_receipts::contains_operation(id).map_err(|_| ())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = id;
+            Ok(false)
+        }
+    }
+    fn record_noexec(&self, prepare: &Prepare, binding: &Binding) -> bool {
+        #[cfg(unix)]
+        {
+            aterm_agent::harness::native_receipts::noexec(prepare, binding).is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (prepare, binding);
+            false
+        }
+    }
+    fn historical_noexec(&self, request: &Request) -> bool {
+        #[cfg(unix)]
+        {
+            use aterm_agent::harness::native_receipts;
+            match request {
+                Request::Prepare(prepare) => native_receipts::observe_prepare(prepare),
+                Request::Query(binding) | Request::Reconcile(binding) => {
+                    native_receipts::observe(binding)
+                }
+                _ => return false,
+            }
+            .is_ok_and(|receipt| receipt.is_some())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = request;
+            false
+        }
+    }
+    fn account_admission(
+        &self,
+        intent: &aterm_agent::harness::accounts_pool::ExecutionIntent,
+    ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
+        use aterm_agent::harness::{accounts, accounts_pool};
+        if !matches!(intent, accounts_pool::ExecutionIntent::Stored { .. }) {
+            return Err(());
+        }
+        let home = aterm_primer::home_dir().ok_or(())?;
+        let roster = accounts::default_roster_path().ok_or(())?;
+        let state = crate::harness_host::harness_state().ok_or(())?;
+        let seat = accounts_pool::Seat {
+            config_dir: roster.parent().ok_or(())?,
+            state: &state,
+            home: &home,
+            now: aterm_time::unix_secs()
+                .and_then(|now| i64::try_from(now).ok())
+                .ok_or(())?,
+        };
+        accounts_pool::admit_execution(&seat, accounts::Cli::Claude, intent)
+            .map(Some)
+            .map_err(|_| ())
+    }
+    fn account_execution(
+        &self,
+        command: &RestartCommand,
+        pid: u32,
+        cold: Option<&ColdEnvironmentFacts>,
+    ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
+        use aterm_agent::harness::{accounts, accounts_pool};
+        if let Some(facts) = cold {
+            return cold_account_execution(command, facts);
+        }
+        let intent = command.account_intent.as_deref().ok_or(())?;
+        let args = atpkg::caller_shell::process_args(pid).ok_or(())?;
+        let who = accounts::ProcessLogin::of_exec_env(&args.env).ok_or(())?;
+        let home = aterm_primer::home_dir().ok_or(())?;
+        let actual_home = args.env_var(accounts::HOMEDIR_ENV).ok_or(())?;
+        let same_user_home = std::path::Path::new(actual_home) == home
+            || std::fs::canonicalize(actual_home)
+                .ok()
+                .zip(std::fs::canonicalize(&home).ok())
+                .is_some_and(|(actual, expected)| actual == expected);
+        if !intent.matches_process(&who, same_user_home) {
+            return Err(());
+        }
+        if matches!(intent, accounts_pool::ExecutionIntent::External { .. }) {
+            if !who.stored_login {
+                return Ok(None);
+            }
+            let mut directories = Vec::new();
+            if let Some(custom) = args
+                .env_var(accounts::HOME_ENV)
+                .filter(|path| !path.is_empty())
+            {
+                directories.push(std::path::PathBuf::from(custom));
+            } else if !same_user_home {
+                directories.push(
+                    std::path::Path::new(actual_home)
+                        .join(accounts::Cli::Claude.accounts().default_home),
+                );
+            }
+            if let Some(login) = who.login.as_deref() {
+                directories.push(std::path::PathBuf::from(login));
+            }
+            for directory in &mut directories {
+                if directory.is_relative() {
+                    *directory = aterm_sysprobe::process_cwd(pid)
+                        .ok_or(())?
+                        .join(&*directory);
+                }
+            }
+            let roster = accounts::default_roster_path().ok_or(())?;
+            let state = crate::harness_host::harness_state().ok_or(())?;
+            let seat = accounts_pool::Seat {
+                config_dir: roster.parent().ok_or(())?,
+                state: &state,
+                home: &home,
+                now: aterm_time::unix_secs()
+                    .and_then(|now| i64::try_from(now).ok())
+                    .ok_or(())?,
+            };
+            return accounts_pool::admit_external_execution(
+                &seat,
+                accounts::Cli::Claude,
+                &directories,
+            )
+            .map(Some)
+            .map_err(|_| ());
+        }
+        self.account_admission(intent)
+    }
     fn constructor_enabled(&self, kind: Constructor) -> bool {
         self.0.constructor_enabled(kind)
             || (self.1
@@ -798,6 +1290,13 @@ impl Kernel for System<'_> {
     }
 }
 
+fn cold_account_execution(
+    command: &RestartCommand,
+    facts: &ColdEnvironmentFacts,
+) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
+    crate::harness_host::cold_execution_guard(command, facts).map_err(|_| ())
+}
+
 #[cfg(unix)]
 fn image_exists(image: &Image) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -826,11 +1325,17 @@ fn capture_native_authority(
     conversation: Option<Conversation>,
     now_us: u64,
     renewal: Option<renewal::Seal>,
+    account: Option<AccountContinuation>,
+    kernel: &dyn Kernel,
 ) -> Result<Authority, String> {
     let snapshot = meta.supervisor_authority(now_us);
     if !matches!(request.duty, Scope::Upgrade | Scope::Relaunch)
         || request.revision != snapshot.revision()
         || caller.connection.is_none()
+        || (renewal.is_some() && account.is_some())
+        || account
+            .as_ref()
+            .is_some_and(|account| !account.current(ctx, request, caller, kernel))
         || renewal
             .as_ref()
             .is_some_and(|seal| !seal.admits(&snapshot, request))
@@ -869,6 +1374,7 @@ fn capture_native_authority(
         caller: caller.clone(),
         builtin,
         renewal,
+        account,
         actor,
         conversation,
     })
@@ -911,19 +1417,22 @@ fn validate_plan(
             socket,
             forward,
             rollback,
+            cold,
         } => {
             authority.builtin
+                && cold.as_ref().is_none_or(|intent| {
+                    request.duty == Scope::Relaunch
+                        && authority.renewal.is_none()
+                        && rollback.is_none()
+                        && intent.encode().is_some()
+                })
                 && authority.renewal.as_ref().is_none_or(|seal| seal.current())
                 && process.pid != shell.pid
                 && process.group == process.pid
                 && process.parent == shell.pid
                 && process.session == shell.session
-                && if let Some(proof) = authority
-                    .renewal
-                    .as_ref()
-                    .and_then(|seal| seal.continuation())
-                {
-                    proof.predecessor.plan == request.plan
+                && if let Some(proof) = authority.continuation() {
+                    (authority.account.is_some() || proof.predecessor.plan == request.plan)
                         && proof.quiescent(kernel)
                         && kernel.foreground(master) == Some(shell.group)
                 } else if observation.is_some() {
@@ -1130,12 +1639,113 @@ fn cancel_prepare(
     cancelled(&request, &original_actor)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Both continuation authority classes are checked before predecessor persistence."
+)]
+fn persist_noexec_predecessor(
+    ctx: &crate::SessionCtx,
+    master: i32,
+    request: &Prepare,
+    caller: &SupervisorInputCaller,
+    renewal: Option<&renewal::Seal>,
+    account: Option<&AccountContinuation>,
+    kernel: &dyn Kernel,
+) -> Result<(), &'static str> {
+    let Some(proof) = account
+        .map(AccountContinuation::proof)
+        .or_else(|| renewal.and_then(|seal| seal.continuation()))
+    else {
+        return Ok(());
+    };
+    // Knowing a staged candidate ID does not authorize a caller to make the
+    // host write on its behalf. Check the same current authority and exact
+    // continuation recipe as admission before any predecessor persistence.
+    // Normal admission repeats this check after the unlocked write below.
+    {
+        let actor = caller.peer.and_then(|pid| kernel.process(pid));
+        let conversation = kernel.record_guard(ctx);
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let authority = capture_native_authority(
+            ctx,
+            &meta,
+            request,
+            caller,
+            actor,
+            conversation,
+            crate::metrics::now_us(),
+            renewal.cloned(),
+            account.cloned(),
+            kernel,
+        )
+        .map_err(|_| DENIED)?;
+        if !validate_plan(request, &authority, master, kernel, false) {
+            return Err(DENIED);
+        }
+    }
+    let _flight = ReceiptFlight::begin(ctx, &Request::prepare(proof.predecessor.clone()))
+        .map_err(|()| UNKNOWN)?;
+    let previous = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_id
+        .get(&proof.predecessor.id)
+        .cloned()
+        .ok_or(UNKNOWN)?;
+    let record = {
+        let op = previous.lock().unwrap_or_else(|p| p.into_inner());
+        if op.phase != Phase::Completed(Decision::Retired(Retirement::NotGranted)) {
+            return Ok(());
+        }
+        if op.request != proof.predecessor
+            || op.grant_record != GrantRecord::None
+            || !op
+                .closed_restart
+                .as_ref()
+                .is_some_and(|actual| Arc::ptr_eq(actual, proof))
+            || !proof.available()
+            || !proof.quiescent(kernel)
+            || op
+                .completion_drain
+                .as_ref()
+                .is_some_and(|drain| !drain.is_drained())
+        {
+            return Err(UNKNOWN);
+        }
+        (op.request.clone(), op.binding.clone())
+    };
+    // A sweep may have closed the operation without a control response. Finish
+    // publishing its positive NoExec before consuming the in-memory successor
+    // slot. A failed write leaves that slot available for an exact retry.
+    let _handoff = aterm_types::update_boundary::Boundary::process()
+        .try_hold(aterm_types::update_boundary::GuardedItem::HarnessNativeMutation)
+        .ok_or(UNKNOWN)?;
+    if kernel.record_noexec(&record.0, &record.1) {
+        Ok(())
+    } else {
+        Err(UNKNOWN)
+    }
+}
+
 fn prepare(
     ctx: &crate::SessionCtx,
     master: i32,
     request: Prepare,
     caller: SupervisorInputCaller,
     kernel: &dyn Kernel,
+) -> String {
+    prepare_inner(ctx, master, request, caller, kernel, None)
+}
+
+fn prepare_inner(
+    ctx: &crate::SessionCtx,
+    master: i32,
+    request: Prepare,
+    caller: SupervisorInputCaller,
+    kernel: &dyn Kernel,
+    account: Option<AccountContinuation>,
 ) -> String {
     let renewal = ctx
         .fenced_writes
@@ -1179,7 +1789,16 @@ fn prepare(
         .cloned();
     if let Some(previous) = previous {
         let op = previous.lock().unwrap_or_else(|p| p.into_inner());
-        return if op.request == request && same_actor(&op, &caller, kernel) {
+        let same_relation = match (&op.authority.account, &account) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_relation(b),
+            _ => false,
+        };
+        return if op.request == request && same_relation && same_actor(&op, &caller, kernel) {
+            if op.phase == Phase::Queued || !op.preparation.recorded {
+                drop(op);
+                return retry_preparation(ctx, master, previous, &caller, kernel, true);
+            }
             match op.phase {
                 Phase::Started | Phase::Precommitted(_) => admitted(&op.binding),
                 Phase::Committing(_) => UNKNOWN.into(),
@@ -1187,10 +1806,7 @@ fn prepare(
                     drop(op);
                     completed_reply(&previous)
                 }
-                Phase::Queued => format!(
-                    "OK native-act state=pending id={} cap={}\n",
-                    op.binding.id, op.binding.capability
-                ),
+                Phase::Queued => preparation::preparation_pending_reply(&op),
             }
         } else {
             DENIED.into()
@@ -1217,6 +1833,17 @@ fn prepare(
     {
         return "ERR native operation deadline\n".into();
     }
+    if let Err(refusal) = persist_noexec_predecessor(
+        ctx,
+        master,
+        &request,
+        &caller,
+        renewal.as_ref(),
+        account.as_ref(),
+        kernel,
+    ) {
+        return refusal.into();
+    }
     let crash = matches!(
         &request.plan,
         NativePlan::Restart {
@@ -1228,6 +1855,16 @@ fn prepare(
         Ok(slot) => slot,
         Err(refusal) => return refusal,
     };
+    // Reserve the ID first, then read durable history outside all native/GUI
+    // locks. An in-flight receipt cannot be reclaimed; an acknowledged one is
+    // here forever, even after its in-memory operation was reclaimed.
+    if matches!(request.plan, NativePlan::Restart { .. }) {
+        match kernel.recorded_operation(&request.id) {
+            Ok(false) => {}
+            Ok(true) => return DENIED.into(),
+            Err(()) => return UNKNOWN.into(),
+        }
+    }
     let Some(capability) = capability() else {
         return "ERR native entropy unavailable\n".into();
     };
@@ -1235,10 +1872,15 @@ fn prepare(
     // Arm the original process while its complete identity still matches. The
     // later plan validation brackets this kernel watch before any Signal can
     // be admitted; a disk journal or a later missing PID cannot replace it.
-    let resume_only = renewal
+    let resume_only = account.is_some()
+        || renewal
+            .as_ref()
+            .is_some_and(|seal| seal.continuation().is_some());
+    let source_death = if let Some(proof) = account
         .as_ref()
-        .is_some_and(|seal| seal.continuation().is_some());
-    let source_death = if let Some(proof) = renewal.as_ref().and_then(|seal| seal.continuation()) {
+        .map(AccountContinuation::proof)
+        .or_else(|| renewal.as_ref().and_then(|seal| seal.continuation()))
+    {
         Some(proof.source_watch())
     } else {
         match &request.plan {
@@ -1322,6 +1964,14 @@ fn prepare(
         }
     };
     // Declared before Meta so refused passive proof cannot close its watch under a guard.
+    let account_guard = match account
+        .as_ref()
+        .map(|account| account.admit(kernel))
+        .transpose()
+    {
+        Ok(guard) => guard,
+        Err(()) => return DENIED.into(),
+    };
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let authority = match capture_native_authority(
         ctx,
@@ -1332,6 +1982,8 @@ fn prepare(
         conversation,
         crate::metrics::now_us(),
         renewal,
+        account,
+        kernel,
     ) {
         Ok(authority) => authority,
         Err(refusal) => return refusal,
@@ -1383,16 +2035,27 @@ fn prepare(
     if table.by_id.contains_key(&request.id) {
         return "ERR busy native operation prepare\n".into();
     }
-    let continuation = authority
+    if authority
         .renewal
         .as_ref()
-        .and_then(|seal| seal.continuation())
-        .cloned();
+        .is_some_and(|seal| !seal.intent_active())
+    {
+        return DENIED.into();
+    }
+    let continuation = authority.continuation().cloned();
+    let mut noexec_predecessor = None;
     if let Some(proof) = &continuation {
         let Some(previous) = table.by_id.get(&proof.predecessor.id).cloned() else {
             return UNKNOWN.into();
         };
         let previous = previous.lock().unwrap_or_else(|p| p.into_inner());
+        if authority.account.is_some()
+            && (previous.phase != Phase::Completed(Decision::Retired(Retirement::NotGranted))
+                || previous.grant_record != GrantRecord::None
+                || !proof.noexec())
+        {
+            return DENIED.into();
+        }
         if !matches!(previous.phase, Phase::Completed(Decision::Retired(_)))
             && !(previous.resume_only
                 && previous.phase == Phase::Completed(Decision::ProvenNotCommittedRollbackSafe))
@@ -1408,6 +2071,14 @@ fn prepare(
             || !proof.quiescent(kernel)
         {
             return DENIED.into();
+        }
+        // Only this terminal class has a durable NoExec receipt. A rollback-safe
+        // continuation and an exited child retain their separate live-evidence
+        // path; an opaque journal seal must never be relabeled by a later read.
+        if previous.phase == Phase::Completed(Decision::Retired(Retirement::NotGranted))
+            && proof.noexec()
+        {
+            noexec_predecessor = Some((previous.request.clone(), previous.binding.clone()));
         }
     }
     let Some(boundary) = aterm_types::update_boundary::Boundary::process()
@@ -1436,7 +2107,6 @@ fn prepare(
         drop(custody);
         return UNKNOWN.into();
     }
-    let deadline_us = request.deadline_us;
     let actor_history = authority
         .actor
         .as_ref()
@@ -1449,12 +2119,18 @@ fn prepare(
     let human_seq = request
         .expected_human_seq
         .unwrap_or_else(|| ctx.human_input.seq());
+    let preparation = Preparation::new(
+        matches!(request.plan, NativePlan::Restart { .. }),
+        noexec_predecessor,
+    );
     let operation = Arc::new(Mutex::new(Operation {
         request,
         binding,
         authority,
         custody: Some(Arc::clone(&custody)),
         phase: Phase::Queued,
+        preparation,
+        grant_record: GrantRecord::None,
         signal_sent: false,
         signal_accepted: None,
         resume_sent: false,
@@ -1465,7 +2141,9 @@ fn prepare(
         claim_outcome,
         commit_version: None,
         completion_drain: None,
-        resume_phase: None,
+        resume_phase: continuation
+            .as_ref()
+            .and_then(|proof| proof.initial_resume_phase()),
         children: [None, None],
         effect_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         clock,
@@ -1475,6 +2153,9 @@ fn prepare(
         source_death,
         closed_restart: None,
         resume_only,
+        cold_facts: None,
+        cold_resolving: false,
+        resolved_cold: None,
     }));
     slot.publish(&mut table, Arc::clone(&operation));
     {
@@ -1491,55 +2172,14 @@ fn prepare(
     }
     drop(table);
     drop(meta);
+    drop(account_guard);
+    let attempt = Preparing {
+        operation,
+        serial: 1,
+        initial_custody: Some(custody),
+    };
     kernel.reserved();
-    // This is a control worker, never the GUI. The marker prevents new revision work from
-    // starving this exact predecessor drain while already-started suffixes finish normally.
-    let ready = custody.await_predecessors(deadline_us);
-    drop(custody);
-    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-    let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
-    if matches!(op.phase, Phase::Completed(_)) {
-        drop(op);
-        drop(meta);
-        return completed_reply(&operation);
-    }
-    let unchanged = meta.supervisor_authority(crate::metrics::now_us()) == op.authority.snapshot;
-    let crash_proven = op.observation.as_ref().is_some_and(|proof| {
-        observe_control::context(ctx, &meta, &caller, kernel).is_some_and(|context| {
-            proof.reprove_with(
-                &context,
-                master,
-                op.clock.now_us().unwrap_or(u64::MAX),
-                &ObservationKernel(kernel),
-            )
-        })
-    });
-    let kernel_unchanged = validate_plan(&op.request, &op.authority, master, kernel, crash_proven);
-    let conversation_current = op
-        .authority
-        .conversation
-        .as_ref()
-        .is_none_or(|guard| guard.current(ctx));
-    if !ready
-        || op.channel_closed
-        || !kernel.constructor_enabled(op.request.plan.constructor())
-        || !unchanged
-        || !kernel_unchanged
-        || !conversation_current
-        || op.clock.remaining(op.request.deadline_us).is_none()
-    {
-        let completion = op.seal_without_effect(kernel);
-        drop(meta);
-        drop(op);
-        kernel.completion_sealed();
-        return finish(ctx, &operation, completion);
-    }
-    op.phase = Phase::Started;
-    if matches!(op.request.plan, NativePlan::OwnImage { .. }) {
-        op.effect_started
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-    admitted(&op.binding)
+    finish_preparation(ctx, master, attempt, &caller, kernel, true)
 }
 
 fn lookup(ctx: &crate::SessionCtx, binding: &Binding) -> Option<Arc<Mutex<Operation>>> {
@@ -1663,18 +2303,56 @@ fn finish(
     completed_reply(operation)
 }
 
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "TerminalPublication",
+        action = "Capture",
+        project = "aterm_gui::native_act::tests::publication::transition"
+    )
+)]
 fn completed_reply(operation: &Arc<Mutex<Operation>>) -> String {
     let op = operation.lock().unwrap_or_else(|p| p.into_inner());
     let phase = op.phase;
     let claim = op.claim_outcome;
     let drain = op.completion_drain.clone();
     let observation = op.completed_observation.clone();
+    let cold = matches!(op.request.plan, NativePlan::Restart { cold: Some(_), .. });
+    let account_intent = cold
+        .then(|| {
+            op.resolved_cold
+                .as_ref()
+                .and_then(|resolved| resolved.command.account_intent.as_deref())
+                .cloned()
+        })
+        .flatten();
     drop(op);
     if drain.is_some_and(|drain| !drain.is_drained()) {
         return UNKNOWN.into();
     }
     match phase {
         Phase::Completed(Decision::Committed) => {
+            if cold {
+                let Some(intent) = account_intent else {
+                    return UNKNOWN.into();
+                };
+                let Ok(encoded_intent) = aterm_json::to_string(&intent.to_value()) else {
+                    return UNKNOWN.into();
+                };
+                let mut reply = format!(
+                    "{} account-intent={}",
+                    committed(claim).trim_end(),
+                    aterm_codec::hex::encode_lower(encoded_intent.as_bytes())
+                );
+                if let Some(encoded) = observation.and_then(|observation| observation.encode()) {
+                    reply.push_str(&format!(
+                        " observation={}",
+                        aterm_codec::hex::encode_lower(encoded.as_bytes())
+                    ));
+                }
+                reply.push('\n');
+                return reply;
+            }
             if claim == ClaimOutcome::Builtin
                 && let Some(encoded) = observation.and_then(|observation| observation.encode())
             {
@@ -1746,13 +2424,85 @@ fn finish_restart(
     finish(ctx, operation, completion)
 }
 
-#[cfg_attr(
-    not(any(target_vendor = "apple", target_os = "linux", test)),
-    expect(
-        unreachable_code,
-        reason = "no DeathWatch can exist here, so an attach past the armed watch never runs"
+fn registered_launcher(
+    _ctx: &crate::SessionCtx,
+    master: i32,
+    op: &Operation,
+    phase: ImagePhase,
+    caller: &SupervisorInputCaller,
+    kernel: &dyn Kernel,
+) -> bool {
+    let NativePlan::Restart {
+        shell, launcher, ..
+    } = &op.request.plan
+    else {
+        return false;
+    };
+    let Some(actual) = caller.peer.and_then(|pid| kernel.process(pid)) else {
+        return false;
+    };
+    caller.principal == crate::control::Principal::Instance
+        && op.authority.builtin
+        && op.phase == Phase::Started
+        && op.resume_phase == Some(phase)
+        && op.resume_sent
+        && actual.parent == shell.pid
+        && actual.group == actual.pid
+        && actual.session == shell.session
+        && actual.image == *launcher
+        && kernel.process(shell.pid).as_ref() == Some(shell)
+        && kernel.foreground(master) == Some(actual.group)
+        && op.children[phase_index(phase)]
+            .as_ref()
+            .is_some_and(|child| {
+                child.process == actual && Some(child.connection) == caller.connection
+            })
+}
+
+fn launcher_guards_current(
+    ctx: &crate::SessionCtx,
+    op: &Operation,
+    authority_current: bool,
+    kernel: &dyn Kernel,
+) -> bool {
+    op.clock.remaining(op.request.deadline_us).is_some()
+        && kernel.constructor_enabled(op.request.plan.constructor())
+        && op.authority.account.as_ref().is_none_or(|account| {
+            account.current(ctx, &op.request, &op.authority.caller, kernel)
+                && account.proof().claimed_by(&op.request)
+        })
+        && op
+            .authority
+            .renewal
+            .as_ref()
+            .is_none_or(|seal| seal.current())
+        && ctx.human_input.seq() == op.human_seq
+        && op
+            .authority
+            .conversation
+            .as_ref()
+            .is_some_and(|guard| guard.current(ctx))
+        && (op.effect_started.load(std::sync::atomic::Ordering::Acquire) || authority_current)
+        && match &op.request.plan {
+            NativePlan::Restart {
+                cold: Some(intent), ..
+            } => kernel.cold_controls_current(intent),
+            _ => true,
+        }
+}
+
+fn resolved_reply(command: &RestartCommand, deadline_us: u64) -> String {
+    command.encode().map_or_else(
+        || DENIED.into(),
+        |encoded| {
+            format!(
+                "OK native-act state=resolved-launch deadline-us={deadline_us} command={}\n",
+                aterm_codec::hex::encode_lower(encoded.as_bytes())
+            )
+        },
     )
-)]
+}
+
 fn serve_launcher(
     ctx: &Arc<crate::SessionCtx>,
     master: i32,
@@ -1761,11 +2511,162 @@ fn serve_launcher(
     operation: &Arc<Mutex<Operation>>,
     kernel: &dyn Kernel,
 ) -> String {
+    if !matches!(request, Request::Execute(..)) {
+        return serve_launcher_step(
+            ctx,
+            master,
+            request,
+            caller,
+            operation,
+            kernel,
+            GrantStep::Other,
+        );
+    }
+    let reply = serve_launcher_step(
+        ctx,
+        master,
+        request,
+        caller,
+        operation,
+        kernel,
+        GrantStep::Reserve,
+    );
+    if reply != JOURNAL_GRANT {
+        return reply;
+    }
+    let (prepare, binding, handoff, attempt) = {
+        let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        let GrantRecord::Writing(attempt) = op.grant_record else {
+            return UNKNOWN.into();
+        };
+        (
+            op.request.clone(),
+            op.binding.clone(),
+            op.custody.as_ref().map(|custody| custody.handoff_guard()),
+            attempt,
+        )
+    };
+    let _writing = GrantWriting {
+        operation: Arc::clone(operation),
+        attempt,
+    };
+    // The precheck reserved Writing under the operation lock. Retirement and
+    // child replacement cannot mistake this unlocked append for an unused grant.
+    let recorded = handoff.is_some() && kernel.record_may_execute(&prepare, &binding);
+    {
+        let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        if !op.grant_record.finish(attempt, recorded) {
+            return UNKNOWN.into();
+        }
+    }
+    if !recorded {
+        return UNKNOWN.into();
+    }
+    // This reacquires the account guard and repeats every kernel, conversation,
+    // image, authority and deadline check. No pre-append permission is cached.
+    serve_launcher_step(
+        ctx,
+        master,
+        request,
+        caller,
+        operation,
+        kernel,
+        GrantStep::Deliver,
+    )
+}
+
+const JOURNAL_GRANT: &str = "\0native grant journal";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrantStep {
+    Other,
+    Reserve,
+    Deliver,
+}
+
+struct GrantWriting {
+    operation: Arc<Mutex<Operation>>,
+    attempt: u64,
+}
+
+impl Drop for GrantWriting {
+    fn drop(&mut self) {
+        let mut op = self.operation.lock().unwrap_or_else(|p| p.into_inner());
+        op.grant_record.finish(self.attempt, false);
+    }
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "IssuerGrant",
+        action = "Reserve",
+        project = "native_act::tests::issuer::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "IssuerGrant",
+        action = "Grant",
+        project = "native_act::tests::issuer::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "IssuerGrant",
+        action = "Invalidate",
+        reason = "The injected conversation authority becomes stale"
+    )
+)]
+#[cfg_attr(
+    not(any(target_vendor = "apple", target_os = "linux", test)),
+    expect(
+        unreachable_code,
+        reason = "no DeathWatch can exist here, so an attach past the armed watch never runs"
+    )
+)]
+fn serve_launcher_step(
+    ctx: &Arc<crate::SessionCtx>,
+    master: i32,
+    request: &Request,
+    caller: &SupervisorInputCaller,
+    operation: &Arc<Mutex<Operation>>,
+    kernel: &dyn Kernel,
+    step: GrantStep,
+) -> String {
     let phase = match request {
         Request::Attach(_, phase)
+        | Request::Resolve(_, phase, _)
         | Request::Execute(_, phase)
         | Request::ExecFailed(_, phase, _) => *phase,
         _ => return DENIED.into(),
+    };
+    // Authenticate the retained helper and current fast guards before any policy I/O.
+    // Retain the exact resolution here; validate its metadata after account admission,
+    // whose writer wait must not outlive that observation. Neither read holds Meta/Operation.
+    let retained_cold = if matches!(request, Request::Execute(..) | Request::Resolve(..)) {
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        if !registered_launcher(ctx, master, &op, phase, caller, kernel)
+            || !launcher_guards_current(
+                ctx,
+                &op,
+                meta.supervisor_authority(crate::metrics::now_us()) == op.authority.snapshot,
+                kernel,
+            )
+            || matches!(request, Request::Resolve(_, _, facts)
+                if op.cold_facts.as_ref().is_some_and(|old| old != facts))
+        {
+            return DENIED.into();
+        }
+        let resolved = op.resolved_cold.clone();
+        drop(op);
+        drop(meta);
+        resolved
+    } else {
+        None
     };
     // Watch creation may acquire spawn/CLOEXEC synchronization. Arm it before either
     // predicate; after locking, the exact complete process identity is read again.
@@ -1777,9 +2678,51 @@ fn serve_launcher(
     } else {
         None
     };
+    // The account writer is outside Meta/Operation, then retained through the
+    // exact first-exec grant below. The immutable command is checked again under
+    // the operation predicate; already granted children retain their outcome.
+    let account_command = if matches!(request, Request::Execute(..)) {
+        let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        if op.authority.renewal.is_none()
+            && op.children[phase_index(phase)]
+                .as_ref()
+                .is_none_or(|child| !child.execute_sent)
+        {
+            match command_for(&op, phase) {
+                Some(command) => Some((
+                    command.clone(),
+                    op.resolved_cold
+                        .as_ref()
+                        .map(|resolved| resolved.facts.clone()),
+                )),
+                None => return DENIED.into(),
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _account_guard = match account_command
+        .as_ref()
+        .map(|(command, facts)| {
+            caller
+                .peer
+                .ok_or(())
+                .and_then(|pid| kernel.account_execution(command, pid, facts.as_ref()))
+        })
+        .transpose()
+    {
+        Ok(guard) => guard,
+        Err(()) => return DENIED.into(),
+    };
+    let checked_cold = retained_cold.map(|resolved| {
+        let valid = kernel.cold_current(resolved.proof.as_ref());
+        (resolved, valid)
+    });
     // Only Execute grants the first exec effect. Attach is observation: even after a guard
     // lapses, recording the already launched child's birth/witness is needed to retire it.
-    let meta = matches!(request, Request::Execute(..))
+    let meta = matches!(request, Request::Execute(..) | Request::Resolve(..))
         .then(|| ctx.meta.lock().unwrap_or_else(|p| p.into_inner()));
     let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
     let NativePlan::Restart {
@@ -1836,6 +2779,28 @@ fn serve_launcher(
     }
     match request {
         Request::Attach(..) => {
+            if let NativePlan::Restart {
+                cold: Some(intent),
+                forward,
+                ..
+            } = &op.request.plan
+            {
+                if phase != ImagePhase::Forward {
+                    return DENIED.into();
+                }
+                let Some(seed) = forward.encode() else {
+                    return DENIED.into();
+                };
+                let Some(intent) = intent.encode() else {
+                    return DENIED.into();
+                };
+                return format!(
+                    "OK native-act state=need-environment deadline-us={} seed={} intent={}\n",
+                    op.request.deadline_us,
+                    aterm_codec::hex::encode_lower(seed.as_bytes()),
+                    aterm_codec::hex::encode_lower(intent.as_bytes()),
+                );
+            }
             let Some(command) = command_for(&op, phase).and_then(RestartCommand::encode) else {
                 return DENIED.into();
             };
@@ -1845,11 +2810,117 @@ fn serve_launcher(
                 aterm_codec::hex::encode_lower(command.as_bytes())
             )
         }
+        Request::Resolve(_, _, facts) => {
+            let Some(meta) = meta else {
+                return DENIED.into();
+            };
+            if phase != ImagePhase::Forward
+                || !launcher_guards_current(
+                    ctx,
+                    &op,
+                    meta.supervisor_authority(crate::metrics::now_us()) == op.authority.snapshot,
+                    kernel,
+                )
+                || facts.encode().is_none()
+                || op.cold_facts.as_ref().is_some_and(|old| old != facts)
+            {
+                return DENIED.into();
+            }
+            let NativePlan::Restart {
+                cold: Some(intent),
+                forward: seed,
+                ..
+            } = &op.request.plan
+            else {
+                return DENIED.into();
+            };
+            if let Some(resolved) = &op.resolved_cold {
+                return if checked_cold.as_ref().is_some_and(|(checked, valid)| {
+                    *valid && Arc::ptr_eq(checked, resolved) && resolved.facts == *facts
+                }) {
+                    resolved_reply(&resolved.command, op.request.deadline_us)
+                } else {
+                    DENIED.into()
+                };
+            }
+            if op.cold_resolving {
+                return UNKNOWN.into();
+            }
+            if op.cold_facts.is_some() {
+                // This helper's first resolution was refused. A duplicate observation
+                // cannot select again; only lawful retirement and Resume start a new helper.
+                return DENIED.into();
+            }
+            let intent = intent.clone();
+            let seed = seed.clone();
+            op.cold_facts = Some(facts.clone());
+            op.cold_resolving = true;
+            drop(op);
+            drop(meta);
+            let resolution =
+                kernel
+                    .resolve_cold(ctx, &intent, &seed, facts)
+                    .ok()
+                    .filter(|(command, proof)| {
+                        seed.cold_resolution_agrees(command)
+                            && command.encode().is_some()
+                            && kernel.image(&command.image)
+                            && kernel.cold_current(proof.as_ref())
+                    });
+            let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+            let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
+            if !registered_launcher(ctx, master, &op, phase, caller, kernel) {
+                return DENIED.into();
+            }
+            op.cold_resolving = false;
+            if !launcher_guards_current(
+                ctx,
+                &op,
+                meta.supervisor_authority(crate::metrics::now_us()) == op.authority.snapshot,
+                kernel,
+            ) || op.cold_facts.as_ref() != Some(facts)
+                || op.resolved_cold.is_some()
+            {
+                return DENIED.into();
+            }
+            let Some((command, proof)) = resolution else {
+                return DENIED.into();
+            };
+            let reply = resolved_reply(&command, op.request.deadline_us);
+            op.resolved_cold = Some(Arc::new(ResolvedCold {
+                command,
+                facts: facts.clone(),
+                proof,
+            }));
+            reply
+        }
         Request::Execute(..) => {
             let Some(meta) = meta else {
                 return DENIED.into();
             };
-            if op.clock.remaining(op.request.deadline_us).is_none()
+            let cold_valid = match &op.request.plan {
+                NativePlan::Restart { cold: Some(_), .. } => {
+                    op.resolved_cold.as_ref().is_some_and(|resolved| {
+                        checked_cold.as_ref().is_some_and(|(checked, valid)| {
+                            *valid && Arc::ptr_eq(checked, resolved)
+                        })
+                    })
+                }
+                _ => true,
+            };
+            if !cold_valid
+                || !launcher_guards_current(
+                    ctx,
+                    &op,
+                    meta.supervisor_authority(crate::metrics::now_us()) == op.authority.snapshot,
+                    kernel,
+                )
+                || op.clock.remaining(op.request.deadline_us).is_none()
+                || account_command.as_ref().is_some_and(|(expected, facts)| {
+                    command_for(&op, phase) != Some(expected)
+                        || op.resolved_cold.as_ref().map(|resolved| &resolved.facts)
+                            != facts.as_ref()
+                })
                 || op
                     .authority
                     .renewal
@@ -1869,6 +2940,20 @@ fn serve_launcher(
                     .is_some_and(|child| child.exec_errno.is_some())
             {
                 return DENIED.into();
+            }
+            match (step, op.grant_record) {
+                (_, GrantRecord::Writing(_))
+                | (GrantStep::Deliver, GrantRecord::Uncertain(_) | GrantRecord::None) => {
+                    return UNKNOWN.into();
+                }
+                (GrantStep::Reserve, GrantRecord::None | GrantRecord::Uncertain(_)) => {
+                    if op.grant_record.begin().is_none() {
+                        return UNKNOWN.into();
+                    }
+                    return JOURNAL_GRANT.into();
+                }
+                (GrantStep::Reserve | GrantStep::Deliver, GrantRecord::Recorded) => {}
+                _ => return UNKNOWN.into(),
             }
             op.children[index].as_mut().unwrap().execute_sent = true;
             op.effect_started
@@ -1890,7 +2975,43 @@ fn serve_launcher(
     }
 }
 
+/// Positive proof that this attempt's helper can neither receive nor use an exec
+/// grant. A missing child or an unread death/group/queue fact is not that proof.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "IssuerGrant",
+        action = "ProbeReplacement",
+        project = "native_act::tests::issuer::transition"
+    )
+)]
+fn launch_unissued(op: &Operation, phase: ImagePhase, kernel: &dyn Kernel) -> bool {
+    op.grant_record == GrantRecord::None
+        && op.authority.builtin
+        && op.resume_sent
+        && op.resume_phase == Some(phase)
+        && op.children[phase_index(phase)]
+            .as_ref()
+            .is_some_and(|child| {
+                !child.execute_sent
+                    && child.death.exited()
+                    && kernel.group_gone(child.process.group) == Some(true)
+            })
+        && op
+            .resume_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.settled())
+}
+
 fn retirement(op: &Operation, kernel: &dyn Kernel) -> Option<Retirement> {
+    if matches!(
+        op.grant_record,
+        GrantRecord::Writing(_) | GrantRecord::Uncertain(_)
+    ) || (op.grant_record == GrantRecord::Recorded
+        && !op.children.iter().flatten().any(|child| child.execute_sent))
+    {
+        return None;
+    }
     match &op.request.plan {
         NativePlan::OwnImage { child, .. } => op
             .authority
@@ -1935,6 +3056,36 @@ fn retirement(op: &Operation, kernel: &dyn Kernel) -> Option<Retirement> {
             )
         }
     }
+}
+
+/// An attempted or acknowledged append without a grant remains an unknown
+/// execution outcome. Once every involved cohort and input attempt is positively
+/// quiet, the host may revoke the capability and reclaim memory without NoExec.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "IssuerGrant",
+        action = "Close",
+        project = "native_act::tests::issuer::transition"
+    )
+)]
+fn uncertain_quiescent(op: &Operation, kernel: &dyn Kernel) -> bool {
+    let NativePlan::Restart { process, .. } = &op.request.plan else {
+        return false;
+    };
+    (matches!(op.grant_record, GrantRecord::Uncertain(_))
+        || (op.grant_record == GrantRecord::Recorded
+            && !op.children.iter().flatten().any(|child| child.execute_sent)))
+        && kernel.birth_alive(process) == Some(false)
+        && kernel.group_gone(process.group) == Some(true)
+        && op.source_death.as_ref().is_none_or(|watch| watch.exited())
+        && op
+            .resume_attempt
+            .as_ref()
+            .is_none_or(|attempt| attempt.settled())
+        && op.children.iter().flatten().all(|child| {
+            child.death.exited() && kernel.group_gone(child.process.group) == Some(true)
+        })
 }
 
 /// Whether `ctx` may hold an operation not yet completed: a table this could not read counts, so
@@ -2067,7 +3218,7 @@ pub(crate) fn fixture_operation_state(
         "resumeOnly":op.resume_only,"deadlineUs":op.request.deadline_us,"monotonicUs":op.clock.now_us(),
         "expectedHumanSeq":op.request.expected_human_seq,
         "logicalRoot":op.authority.renewal.as_ref().map(|seal|seal.receipt_id()),
-        "nativePredecessor":op.authority.renewal.as_ref().and_then(|seal|seal.continuation()).map(|proof|proof.predecessor.id.as_str())}),
+        "nativePredecessor":op.authority.continuation().map(|proof|proof.predecessor.id.as_str())}),
     )
 }
 
@@ -2116,6 +3267,13 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
             }
         };
         if !abandoned {
+            continue;
+        }
+        if uncertain_quiescent(&op, kernel) {
+            let completion = op.seal_completion(Decision::Unknown);
+            drop(op);
+            let _ = finish(ctx, &operation, completion);
+            ctx.watchers.ring_watchers();
             continue;
         }
         if op.authority.builtin
@@ -2172,6 +3330,7 @@ pub(crate) fn serve(
         | Request::Signal(binding)
         | Request::Resume(binding, _, _, _)
         | Request::Attach(binding, _)
+        | Request::Resolve(binding, _, _)
         | Request::Execute(binding, _)
         | Request::ExecFailed(binding, _, _)
         | Request::Reconcile(binding) => Some(binding.id.as_str()),
@@ -2195,7 +3354,266 @@ pub(crate) fn serve(
     )
 }
 
+fn request_operation(ctx: &crate::SessionCtx, request: &Request) -> Option<Arc<Mutex<Operation>>> {
+    match request {
+        Request::Prepare(prepare) => ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_id
+            .get(&prepare.id)
+            .cloned(),
+        Request::CancelPrepare(cancel) => ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_id
+            .get(&cancel.prepare.id)
+            .cloned(),
+        Request::Query(binding)
+        | Request::Reconcile(binding)
+        | Request::Abort(binding)
+        | Request::Recover(binding)
+        | Request::Signal(binding)
+        | Request::Precommit(binding, _)
+        | Request::Commit(binding, _, _)
+        | Request::Resume(binding, _, _, _)
+        | Request::Attach(binding, _)
+        | Request::Resolve(binding, _, _)
+        | Request::Execute(binding, _)
+        | Request::ExecFailed(binding, _, _) => lookup(ctx, binding),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalRecord {
+    NoExec,
+    Sealed,
+}
+
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "TerminalPublication",
+        action = "MayExecute",
+        reason = "Possible execution is established by the issuer grant protocol before terminal publication"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "TerminalPublication",
+        action = "CloseNoExec",
+        reason = "Positive process quiescence and zero grants are premises checked by ClosedRestart and IssuerGrant"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "TerminalPublication",
+        action = "CloseUnknown",
+        reason = "An opaque terminal fact is supplied by the separately checked completion protocol"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "TerminalPublication",
+        action = "Drain",
+        reason = "External input producers finish; the real NativeDrain is checked before selecting a record"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "TerminalPublication",
+        action = "CaptureUnknown",
+        reason = "Other native request handlers can return Unknown for an already terminal operation"
+    )
+)]
+fn terminal_record(op: &Operation, reply: &str) -> Option<TerminalRecord> {
+    if !op.preparation.can_publish()
+        || matches!(op.request.plan, NativePlan::OwnImage { .. })
+        || !matches!(op.phase, Phase::Completed(_))
+        || op
+            .completion_drain
+            .as_ref()
+            .is_some_and(|drain| !drain.is_drained())
+    {
+        return None;
+    }
+    let record = match op.phase {
+        Phase::Completed(Decision::Retired(Retirement::NotGranted)) => {
+            if op.grant_record != GrantRecord::None {
+                return None;
+            }
+            TerminalRecord::NoExec
+        }
+        _ => TerminalRecord::Sealed,
+    };
+    (reply != NOEXEC || record == TerminalRecord::NoExec).then_some(record)
+}
+
+/// The reply may have been captured before the drain settled. Its text cannot
+/// choose the durable fact, and a failed or lost append acknowledgement cannot
+/// publish a positive observation.
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "TerminalPublication",
+        action = "PublishAck",
+        project = "aterm_gui::native_act::tests::publication::transition"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "TerminalPublication",
+        action = "PublishLostAck",
+        project = "aterm_gui::native_act::tests::publication::transition"
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "TerminalPublication",
+        action = "PublishFailed",
+        project = "aterm_gui::native_act::tests::publication::transition"
+    )
+)]
+fn publish_terminal(
+    reply: String,
+    record: Option<TerminalRecord>,
+    append: impl FnOnce(TerminalRecord) -> bool,
+) -> String {
+    if record.is_some_and(append) {
+        reply
+    } else {
+        UNKNOWN.into()
+    }
+}
+
 fn serve_by(
+    ctx: &Arc<crate::SessionCtx>,
+    master: i32,
+    request: Request,
+    caller: SupervisorInputCaller,
+    kernel: &dyn Kernel,
+    resume: &mut dyn FnMut(&str) -> String,
+) -> String {
+    let historical_reader = caller.principal == crate::control::Principal::Harness
+        && caller.peer.and_then(|pid| kernel.process(pid)).is_some()
+        && matches!(
+            request,
+            Request::Prepare(_) | Request::Query(_) | Request::Reconcile(_)
+        );
+    serve_with_publication(ctx, request, kernel, historical_reader, |request| {
+        serve_request(ctx, master, request, caller, kernel, resume)
+    })
+}
+
+/// Every admission entry shares the same transient pin, handoff hold and
+/// terminal publication boundary, including the private account transaction.
+fn serve_with_publication(
+    ctx: &crate::SessionCtx,
+    request: Request,
+    kernel: &dyn Kernel,
+    historical_reader: bool,
+    execute: impl FnOnce(Request) -> String,
+) -> String {
+    let _flight = match ReceiptFlight::begin(ctx, &request) {
+        Ok(flight) => flight,
+        Err(()) => return UNKNOWN.into(),
+    };
+    let saved = request.clone();
+    let operation = request_operation(ctx, &request);
+    // Clone only the existing app hold, not the input marker: a terminal seal
+    // can then drain input without opening a handoff window before persistence.
+    let mut receipt_handoff = operation.as_ref().and_then(|operation| {
+        operation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .custody
+            .as_ref()
+            .map(|custody| custody.handoff_guard())
+    });
+    let reply = execute(request);
+    if reply == UNKNOWN
+        || reply == ROLLBACK_SAFE
+        || reply.starts_with("OK native-act state=committed ")
+        || reply.starts_with("OK native-act state=retired ")
+    {
+        let operation = operation.or_else(|| request_operation(ctx, &saved));
+        let evidence = operation.as_ref().and_then(|operation| {
+            let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+            terminal_record(&op, &reply)
+                .map(|record| (op.request.clone(), op.binding.clone(), record))
+        });
+        if reply == UNKNOWN && evidence.is_none() {
+            return reply;
+        }
+        if operation.as_ref().is_some_and(|operation| {
+            matches!(
+                operation
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .request
+                    .plan,
+                NativePlan::OwnImage { .. }
+            )
+        }) {
+            return reply;
+        }
+        // No acknowledged receipt may escape before the durable append. This
+        // worker owns no Meta, operation or table lock across the journal I/O.
+        // A GUI sweep may have sealed it before this request arrived. In that
+        // case acquire a fresh hold or defer to an already pending handoff.
+        if receipt_handoff.is_none() {
+            receipt_handoff = aterm_types::update_boundary::Boundary::process()
+                .try_hold(aterm_types::update_boundary::GuardedItem::HarnessNativeMutation)
+                .map(Arc::new);
+        }
+        if receipt_handoff.is_none() {
+            return UNKNOWN.into();
+        }
+        return publish_terminal(
+            reply,
+            evidence.as_ref().map(|(_, _, record)| *record),
+            |record| {
+                let (prepare, binding, _) = evidence.as_ref().expect("selected terminal evidence");
+                match record {
+                    TerminalRecord::NoExec => kernel.record_noexec(prepare, binding),
+                    TerminalRecord::Sealed => kernel.record_sealed(prepare, binding),
+                }
+            },
+        );
+    }
+    // Keep the request pin through this read too. Account relations need their
+    // own durable envelope before they can use ordinary historical fallback.
+    if historical_reader
+        && (reply == DENIED
+            || reply == "ERR native host epoch changed\n"
+            || reply == "ERR native operation deadline\n"
+            || reply == "ERR native constructor disabled\n")
+        && !(matches!(saved, Request::Prepare(_))
+            && request_operation(ctx, &saved).is_some_and(|op| {
+                op.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .authority
+                    .account
+                    .is_some()
+            }))
+        && kernel.historical_noexec(&saved)
+    {
+        return NOEXEC.into();
+    }
+    reply
+}
+
+fn serve_request(
     ctx: &Arc<crate::SessionCtx>,
     master: i32,
     request: Request,
@@ -2229,6 +3647,7 @@ fn serve_by(
         | Request::Signal(b)
         | Request::Resume(b, _, _, _)
         | Request::Attach(b, _)
+        | Request::Resolve(b, _, _)
         | Request::Execute(b, _)
         | Request::ExecFailed(b, _, _)
         | Request::Reconcile(b) => b,
@@ -2236,9 +3655,19 @@ fn serve_by(
     let Some(operation) = lookup(ctx, binding) else {
         return DENIED.into();
     };
+    if matches!(request, Request::Reconcile(_)) {
+        let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        if !same_actor(&op, &caller, kernel) {
+            return DENIED.into();
+        }
+        if op.phase == Phase::Queued {
+            drop(op);
+            return retry_preparation(ctx, master, operation, &caller, kernel, false);
+        }
+    }
     if matches!(
         request,
-        Request::Attach(..) | Request::Execute(..) | Request::ExecFailed(..)
+        Request::Attach(..) | Request::Resolve(..) | Request::Execute(..) | Request::ExecFailed(..)
     ) {
         if let Request::Execute(_, phase) = &request
             && !renewal::execute_recorded(&operation, *phase)
@@ -2282,6 +3711,7 @@ fn serve_by(
     // Retry disposal is deferred beyond both predicates, including early refusal paths.
     let mut retired_children = Vec::new();
     let mut retired_witnesses = Vec::new();
+    let mut retired_resolutions = Vec::new();
     let mutation_meta = matches!(
         request,
         Request::Signal(_) | Request::Resume(..) | Request::Commit(..)
@@ -2340,6 +3770,11 @@ fn serve_by(
             if op.phase == Phase::Queued {
                 return UNKNOWN.into();
             }
+            if uncertain_quiescent(&op, kernel) {
+                let completion = op.seal_completion(Decision::Unknown);
+                drop(op);
+                return finish(ctx, &operation, completion);
+            }
             let Some(reason) = retirement(&op, kernel) else {
                 return UNKNOWN.into();
             };
@@ -2351,6 +3786,16 @@ fn serve_by(
             Phase::Completed(_) => {
                 drop(op);
                 completed_reply(&operation)
+            }
+            Phase::Started
+                if op
+                    .resume_phase
+                    .is_some_and(|phase| launch_unissued(&op, phase, kernel)) =>
+            {
+                format!(
+                    "OK native-act state=unissued phase={}\n",
+                    op.resume_phase.unwrap().word()
+                )
             }
             Phase::Started
                 if op.authority.builtin
@@ -2569,6 +4014,12 @@ fn serve_by(
             }
         }
         Request::Resume(_, phase, generation, expected_human_seq) => {
+            if matches!(
+                op.grant_record,
+                GrantRecord::Writing(_) | GrantRecord::Uncertain(_)
+            ) {
+                return UNKNOWN.into();
+            }
             if !op.authority.builtin
                 || !matches!(op.phase, Phase::Started | Phase::Precommitted(_))
                 || (!op.signal_sent && op.observation.is_none() && !op.resume_only)
@@ -2579,6 +4030,13 @@ fn serve_by(
                 return DENIED.into();
             }
             if phase == ImagePhase::Rollback && op.resume_phase != Some(ImagePhase::Rollback) {
+                if op.grant_record == GrantRecord::Recorded
+                    && !op.children[0]
+                        .as_ref()
+                        .is_some_and(|child| child.execute_sent)
+                {
+                    return UNKNOWN.into();
+                }
                 if op.children[0].as_ref().is_some_and(|child| {
                     child.execute_sent
                         && (!child.death.exited()
@@ -2606,19 +4064,11 @@ fn serve_by(
                 {
                     op.resume_sent = false;
                     op.resume_attempt = None;
-                } else if op.children[phase_index(phase)]
-                    .as_ref()
-                    .is_some_and(|child| {
-                        !child.execute_sent
-                            && child.death.exited()
-                            && kernel.group_gone(child.process.group) == Some(true)
-                    })
-                    && op
-                        .resume_attempt
-                        .as_ref()
-                        .is_some_and(|attempt| attempt.settled())
-                {
+                } else if launch_unissued(&op, phase, kernel) {
                     retired_children.extend(op.children[phase_index(phase)].take());
+                    retired_resolutions.extend(op.resolved_cold.take());
+                    op.cold_facts = None;
+                    op.cold_resolving = false;
                     op.resume_sent = false;
                     op.resume_attempt = None;
                 } else {
@@ -2630,6 +4080,8 @@ fn serve_by(
                 shell,
                 launcher,
                 socket,
+                cold,
+                forward,
                 ..
             } = &op.request.plan
             else {
@@ -2638,6 +4090,10 @@ fn serve_by(
             // Missing/unread facts are not proof of exit. The exact old birth must be gone,
             // while the original shell and its foreground still agree before any bytes start.
             if kernel.birth_alive(process) != Some(false)
+                || op.authority.account.as_ref().is_some_and(|account| {
+                    !account.current(ctx, &op.request, &caller, kernel)
+                        || !account.proof().claimed_by(&op.request)
+                })
                 || kernel.group_gone(process.group) != Some(true)
                 || kernel.process(shell.pid).as_ref() != Some(shell)
                 || kernel.foreground(master) != Some(shell.group)
@@ -2655,9 +4111,26 @@ fn serve_by(
             {
                 return DENIED.into();
             }
-            let Some(line) = command_for(&op, phase).and_then(|command| {
-                command.launcher_line(launcher, socket, ctx.self_id.as_str(), &op.binding, phase)
-            }) else {
+            let line = if cold.is_some() && phase == ImagePhase::Forward {
+                forward.cold_launcher_line(
+                    launcher,
+                    socket,
+                    ctx.self_id.as_str(),
+                    &op.binding,
+                    phase,
+                )
+            } else {
+                command_for(&op, phase).and_then(|command| {
+                    command.launcher_line(
+                        launcher,
+                        socket,
+                        ctx.self_id.as_str(),
+                        &op.binding,
+                        phase,
+                    )
+                })
+            };
+            let Some(line) = line else {
                 return DENIED.into();
             };
             let turn = format!("if-gen={generation} idle=1 timeout=1000 {line}");
@@ -2699,6 +4172,7 @@ fn serve_by(
         | Request::CancelSupport
         | Request::CancelPrepare(_)
         | Request::Attach(..)
+        | Request::Resolve(..)
         | Request::Execute(..)
         | Request::ExecFailed(..) => unreachable!(),
     }

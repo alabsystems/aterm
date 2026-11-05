@@ -5,3 +5,4 @@
 
 mod base64;
 mod inflate_stream;
+mod zip;

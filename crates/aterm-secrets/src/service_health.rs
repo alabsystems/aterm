@@ -433,6 +433,7 @@ mod tests {
         let seed = [37; 32];
         let config = client::Config {
             source: crate::transport::Source::Path(PathBuf::from("/unused/repair-health.vault")),
+            mirrors: Vec::new(),
             name: "repair-health".to_owned(),
             signer: Some(crate::envelope::signer_public(&seed).unwrap()),
             followed: Vec::new(),

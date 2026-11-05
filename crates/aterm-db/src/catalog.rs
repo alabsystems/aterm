@@ -238,11 +238,8 @@ impl Directory {
         scope(self.trust)
     }
     /// The identities of this lab's reserved tables ([`reserved`]).
-    fn reserved_ids(&self) -> BTreeSet<Digest> {
-        reserved(self.trust)
-            .iter()
-            .map(|descriptor| descriptor.scope.digest())
-            .collect()
+    fn reserved_ids(&self) -> [Digest; RESERVED_SLOTS] {
+        reserved(self.trust).map(|descriptor| descriptor.scope.digest())
     }
     /// Whether `descriptor` is one of this lab's reserved tables, exactly.
     fn is_reserved(&self, descriptor: &Descriptor) -> bool {
@@ -324,14 +321,20 @@ impl Directory {
     /// (all of them, where the storage root is not made yet).
     fn has_room(&self, scope: Scope) -> Result<bool> {
         let path = self.path(scope)?;
-        if !path.try_exists()? && self.root.try_exists()? {
+        if !path.try_exists()? {
             // Count every retained directory, not merely the current selection.
             // Repeated catalog churn cannot accumulate unbounded old stores.
-            for (count, entry) in std::fs::read_dir(&self.root)?.enumerate() {
-                entry?;
-                if count >= MAX_TABLES {
-                    return Ok(false);
+            match std::fs::read_dir(&self.root) {
+                Ok(entries) => {
+                    for (count, entry) in entries.enumerate() {
+                        entry?;
+                        if count >= MAX_TABLES {
+                            return Ok(false);
+                        }
+                    }
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
             }
         }
         Ok(true)
@@ -471,14 +474,14 @@ impl Directory {
         session: &Session<'_>,
         snapshot: &Snapshot,
         descriptor: &Descriptor,
-    ) -> Vec<[u8; 16]> {
+    ) -> Result<Vec<[u8; 16]>> {
         let declared = snapshot
             .entries
             .get(&descriptor.scope.digest())
             .map(|entry| entry.declarations.as_slice())
             .unwrap_or_default();
-        session
-            .writers()
+        Ok(session
+            .writers()?
             .into_iter()
             .filter(|binding| {
                 !declared
@@ -486,7 +489,7 @@ impl Directory {
                     .any(|d| d.descriptor == *descriptor && d.actor == binding.actor())
             })
             .map(|binding| *binding.machine())
-            .collect()
+            .collect())
     }
     /// Opens work immediately on one offline machine, with the same identity
     /// when another machine independently opens this application role.

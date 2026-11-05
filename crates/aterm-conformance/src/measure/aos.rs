@@ -99,7 +99,7 @@ pub fn measure(rig: &Rig, row: &AosRow) -> Result<AosReport, CouldNotRun> {
     }
     let world = World::prepare(scratch.path(), GLOW_ON)
         .map_err(|e| CouldNotRun::Refused(format!("cannot lay out the scratch world: {e}")))?;
-    std::fs::write(world.home.join(".shrc"), TYPED_INTO)
+    super::write_fresh(world.home.join(".shrc"), TYPED_INTO)
         .map_err(|e| CouldNotRun::Refused(format!("cannot write the scratch shell's rc: {e}")))?;
     let inst = Instance::launch(&rig.aterm, &world, budget)?;
     let ctl = &inst.ctl;

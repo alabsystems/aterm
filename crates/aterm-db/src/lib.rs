@@ -12,8 +12,6 @@ use std::fmt;
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
-#[cfg(test)]
-aterm_secrets::memoized_x25519_in_tests!();
 
 pub mod accounts;
 #[cfg(unix)]
@@ -35,6 +33,8 @@ pub mod credentials;
 pub mod crypto;
 pub mod database;
 mod documents;
+#[cfg(unix)]
+pub mod fleet_db;
 #[cfg(unix)]
 mod generation;
 #[cfg(unix)]
@@ -124,6 +124,10 @@ pub struct Error(pub String, FailureKind);
 enum FailureKind {
     Other,
     Busy,
+    SnapshotChanged,
+    Repair(aterm_types::network_state::RepairCause),
+    #[cfg(unix)]
+    EnrollmentPending,
 }
 
 impl fmt::Debug for Error {
@@ -134,7 +138,22 @@ impl fmt::Debug for Error {
 /// What [`Error::busy`] says.
 const BUSY: &str = "another local writer holds this table; nothing changed, retry shortly";
 const SNAPSHOT_CHANGED: &str = "table witness advanced during observation; reopen and verify";
+#[cfg(unix)]
+const ENROLLMENT_PENDING: &str = "table enrollment is not yet complete";
 impl Error {
+    pub(crate) fn repair(reason: &str, cause: aterm_types::network_state::RepairCause) -> Self {
+        Self(reason.into(), FailureKind::Repair(cause))
+    }
+    pub(crate) fn repair_cause(&self) -> aterm_types::network_state::RepairCause {
+        use aterm_types::network_state::RepairCause;
+        match self.1 {
+            FailureKind::Repair(cause) => cause,
+            FailureKind::Busy | FailureKind::SnapshotChanged => RepairCause::NotReady,
+            #[cfg(unix)]
+            FailureKind::EnrollmentPending => RepairCause::NotReady,
+            FailureKind::Other => RepairCause::Other,
+        }
+    }
     pub(crate) fn new(reason: &str) -> Self {
         Self(reason.into(), FailureKind::Other)
     }
@@ -144,11 +163,26 @@ impl Error {
     }
     /// A newer witness needs fresh verification; the changed handle refuses reads.
     pub(crate) fn snapshot_changed() -> Self {
-        Self(SNAPSHOT_CHANGED.into(), FailureKind::Busy)
+        Self(SNAPSHOT_CHANGED.into(), FailureKind::SnapshotChanged)
+    }
+    /// A valid first enrollment has not published ready storage yet.
+    #[cfg(unix)]
+    pub(crate) fn enrollment_pending() -> Self {
+        Self(ENROLLMENT_PENDING.into(), FailureKind::EnrollmentPending)
+    }
+    /// Whether an observation met a validated enrollment still in progress.
+    #[cfg(unix)]
+    pub(crate) fn is_enrollment_pending(&self) -> bool {
+        matches!(self.1, FailureKind::EnrollmentPending)
     }
     /// Whether local contention or a newer snapshot requires a fresh observation.
     pub(crate) fn is_busy(&self) -> bool {
-        matches!(self.1, FailureKind::Busy)
+        matches!(self.1, FailureKind::Busy | FailureKind::SnapshotChanged)
+    }
+    /// Whether what a read observed moved on while it read: nothing is wrong with the store, and
+    /// a fresh observation is the answer.
+    pub(crate) fn is_snapshot_changed(&self) -> bool {
+        matches!(self.1, FailureKind::SnapshotChanged)
     }
 
     /// Add local diagnostic context without changing the failure's classification.
@@ -165,7 +199,10 @@ impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         // An I/O WouldBlock can be a network timeout, not local writer contention.
-        Self(value.to_string(), FailureKind::Other)
+        Self(
+            value.to_string(),
+            FailureKind::Repair(aterm_types::network_state::RepairCause::Io),
+        )
     }
 }
 impl From<aterm_secrets::Error> for Error {
@@ -175,6 +212,12 @@ impl From<aterm_secrets::Error> for Error {
             | aterm_secrets::ErrorKind::CustodyBusy
             | aterm_secrets::ErrorKind::VaultBusy
             | aterm_secrets::ErrorKind::VaultChanged => FailureKind::Busy,
+            aterm_secrets::ErrorKind::MembershipCapacity => {
+                FailureKind::Repair(aterm_types::network_state::RepairCause::Quota)
+            }
+            aterm_secrets::ErrorKind::MembershipHistoryUnavailable => {
+                FailureKind::Repair(aterm_types::network_state::RepairCause::NotReady)
+            }
             _ => FailureKind::Other,
         };
         Self(value.to_string(), kind)

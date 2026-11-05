@@ -34,6 +34,48 @@ pub const LINES_MAX: usize = 512;
 /// open does not hold the sign-in to [`HANG`].
 const OUTPUT_GRACE: Duration = Duration::from_secs(2);
 
+#[cfg(test)]
+thread_local! {
+    static OUTPUT_GRACE_SET: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// While held, this thread's [`drive`] reads a sign-in's output for the grace it was set with
+/// once the child exited. Its drop, a panic's unwind included, puts back the grace it replaced.
+#[cfg(test)]
+struct GraceSet(Option<Duration>);
+
+#[cfg(test)]
+impl GraceSet {
+    fn set(grace: Duration) -> Self {
+        Self(OUTPUT_GRACE_SET.replace(Some(grace)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for GraceSet {
+    fn drop(&mut self) {
+        OUTPUT_GRACE_SET.set(self.0);
+    }
+}
+
+/// How long [`drive`] reads output once its child exited: [`OUTPUT_GRACE`]. The unit tests'
+/// stand-ins leave no pipe open past their exit, so there it is the hang detector, which waits
+/// for a reader thread a loaded machine starves, unless a test set a grace on this thread
+/// ([`GraceSet`]).
+fn output_grace() -> Duration {
+    #[cfg(not(test))]
+    {
+        OUTPUT_GRACE
+    }
+    #[cfg(test)]
+    {
+        OUTPUT_GRACE_SET
+            .get()
+            .unwrap_or(aterm_spec::wait::MUST_HAPPEN)
+    }
+}
+
 /// The shortest and longest code a grammar admits ([`is_code`]).
 const CODE_LEN: std::ops::RangeInclusive<usize> = 4..=16;
 
@@ -778,6 +820,7 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
     let mut host = None;
     let mut status = None;
     let mut exited_at: Option<Instant> = None;
+    let grace = output_grace();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -880,7 +923,7 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
         if open == 0 && status.is_some() {
             break;
         }
-        if exited_at.is_some_and(|at| at.elapsed() >= OUTPUT_GRACE) {
+        if exited_at.is_some_and(|at| at.elapsed() >= grace) {
             break;
         }
     }
@@ -1113,7 +1156,13 @@ pub const NO_DESK: &str = concat!(
 const SANDBOX_PROBE: &str = "/usr/bin/true";
 
 /// How long that try may take.
+#[cfg(not(test))]
 const SANDBOX_PROBE_WAIT: Duration = Duration::from_secs(20);
+/// How long that try may take: the unit tests try the real `sandbox-exec`, which runs
+/// `/usr/bin/true` and exits, so a try a loaded machine holds is waited for by the hang detector,
+/// not read as a refusal.
+#[cfg(test)]
+const SANDBOX_PROBE_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// Why `sandbox` cannot run a child under [`NO_DESK`] here: it is tried on [`SANDBOX_PROBE`],
 /// and anything but its exit 0 within [`SANDBOX_PROBE_WAIT`] is a refusal. `sandbox-exec` exits

@@ -160,7 +160,7 @@ pub(super) fn sign_genesis(
     let roster = super::roster::load_or_seed_swarm_roster_with_log(
         &admin,
         doc,
-        &super::roster::log_labels(paths),
+        &super::roster::log_labels(paths)?,
     )?;
     let labels = roster
         .members

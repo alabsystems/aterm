@@ -7,7 +7,7 @@
 use aterm_agent::supervise::policy::login::{
     RULE_LOGIN_BACK_OUT, RULE_LOGIN_DONE, RULE_LOGIN_METHOD,
 };
-use aterm_agent::supervise::policy::notice::{LOGIN_CANCELLED, LOGIN_CHOOSE};
+use aterm_agent::supervise::policy::notice::{LOGIN_CANCELLED, LOGIN_CHOOSE, LOGIN_LEFT};
 use aterm_agent::supervise::policy::turn_end::{self, RULE_LOGIN};
 
 use super::*;
@@ -117,6 +117,7 @@ fn expired() -> Seen {
             login: Some(Played {
                 control: Some(true),
                 stored: false,
+                forced: false,
                 opened_before: Some(String::new()),
                 picked_ms: Some(T0 + PICK),
                 no_pick: None,
@@ -978,6 +979,132 @@ fn on_the_stored_login_the_picker_rule_slice_12a_changed_is_reached_or_unobserve
         p.stored = false;
     }
     assert_eq!(gone(&s, "claude").0, "PASS");
+}
+
+/// [`expired`] under settings that pin the sign-in method (`--forced-login`, the post-landing
+/// review 2026-11-02): aterm types no `/login`, tells the person once with `login-not-run`
+/// naming the pin (its escalation yields to the notice), and the person types `/login`
+/// themselves, which hands the sign-in to the inert browser on their key.
+fn expired_pinned() -> Seen {
+    let mut s = expired();
+    s.journal.retain(|(_, l)| !l.starts_with("TYPED "));
+    for (_, l) in &mut s.journal {
+        if l.starts_with("EXCEPTION ") {
+            *l = "EXCEPTION seq=2 kind=login when=now notice=login-not-run Claude's login \
+                  expired. => Type /login in the tab and sign in."
+                .to_string();
+        }
+    }
+    push(
+        &mut s,
+        TOLD,
+        &format!(
+            "NOT ESCALATED seq=2 the notice login-not-run stands: the login is gone, type /login \
+             ({}): Please run /login",
+            aterm_agent::supervise::policy::notice::WHY_PINNED
+        ),
+        None,
+    );
+    s.ledger.retain(|r| r.rule != RULE_LOGIN);
+    s.band = s
+        .band
+        .iter()
+        .map(|(t, l)| {
+            (
+                *t,
+                l.replace(
+                    LOGIN_CHOOSE.title,
+                    aterm_agent::supervise::policy::notice::LOGIN_NOT_RUN.title,
+                ),
+            )
+        })
+        .collect();
+    if let Some(p) = s.cover.login.as_mut() {
+        p.stored = true;
+        p.forced = true;
+    }
+    s
+}
+
+/// ON A PINNED SIGN-IN METHOD aterm types no `/login`: Claude Code would draw no picker and open
+/// the browser one tick past its Enter. THE MAIN ARM (bin-w4, before the post-landing review of
+/// 2026-11-02) typed it, so the browser ran on aterm's key.
+#[test]
+fn on_a_pinned_sign_in_method_aterm_types_no_login_and_tells_once() {
+    let (w, why) = gone(&expired_pinned(), "claude");
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains("no /login typed")
+            && why.contains("the settings pin the method (claudeai)")
+            && why.contains("the need names the pin")
+            && why.contains("told once at +128.3 s (login-not-run"),
+        "{why}"
+    );
+    // The main arm: its /login, and the browser it opened before the person came.
+    let mut s = expired_pinned();
+    push(
+        &mut s,
+        LOGIN_AT,
+        &format!("TYPED seq=2 rule={RULE_LOGIN} /login"),
+        Some(typed(LOGIN_AT, RULE_LOGIN, "/login")),
+    );
+    if let Some(p) = s.cover.login.as_mut() {
+        p.opened_before = Some("11:47:03 open https://claude.ai/oauth/authorize\n".into());
+    }
+    let (w, why) = gone(&s, "claude");
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("/login TYPED OVER THE PINNED SIGN-IN METHOD")
+            && why.contains("THE BROWSER RAN ON ATERM'S KEY"),
+        "{why}"
+    );
+    // A need that names no pin is not the pin's.
+    let mut s = expired_pinned();
+    s.journal.retain(|(_, l)| !l.starts_with("NOT ESCALATED "));
+    push(
+        &mut s,
+        TOLD,
+        "NOT ESCALATED seq=2 the notice login-not-run stands: the login is gone (aterm's /login \
+         budget is spent)",
+        None,
+    );
+    let (w, why) = gone(&s, "claude");
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("THE NEED NAMES NO PIN"), "{why}");
+    // The person's own /login is their hand-off: the sign-in judge reads it as their pick.
+    assert_eq!(signed(&expired_pinned(), "claude").0, "PASS");
+}
+
+/// ON A PINNED SIGN-IN METHOD THE PERSON'S ESC DRAWS THEIR OWN `login-left`: the `/login` was
+/// theirs (aterm typed none), so their Esc on it is a sign-in they left, as `login-cancelled` is
+/// over aterm's `/login`; on a pinned method the cancelled notice of a `/login` aterm never typed
+/// is aterm's own word over the person. The lab's first pinned run (rv2cf, 2026-11-02) drew
+/// `login-left` at the person's Esc. Negative control: the judge taking `login-cancelled` alone
+/// as the Esc's notice fails the `login-left` case.
+#[test]
+fn on_a_pinned_sign_in_method_the_persons_esc_draws_their_own_login_left() {
+    let esc = |notice: &str| {
+        let mut s = expired_pinned();
+        push(
+            &mut s,
+            LEFT + 700,
+            &format!(
+                "EXCEPTION seq=4 kind=login when=now notice={notice} Claude Code's sign-in was \
+                 cancelled before it finished."
+            ),
+            None,
+        );
+        signed(&s, "claude")
+    };
+    let (w, why) = esc(LOGIN_LEFT.id);
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains(&format!("the person's Esc drew {} at +", LOGIN_LEFT.id)),
+        "{why}"
+    );
+    let (w, why) = esc(LOGIN_CANCELLED.id);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("TOLD PAST THE PERSON'S PICK"), "{why}");
 }
 
 /// Between the person's pick and their prompt aterm's `login-done@v1` (its Enter at `Login

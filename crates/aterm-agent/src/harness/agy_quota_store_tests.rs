@@ -5,7 +5,37 @@ use std::cell::Cell;
 
 use super::*;
 
-const ASKED: crate::harness::provider_read::InUse = crate::harness::provider_read::InUse::Asked;
+fn current_fixture(
+    store: &Store,
+    source: &dyn Source,
+    now: i64,
+    low: f64,
+    force: bool,
+) -> Result<(Reading, Got), String> {
+    let token =
+        provider_read::Use::fixture(provider_read::Read::AgyUsage, Path::new(&store.key), None);
+    super::current(store, source, now, low, force, &mut Asking::new(token))
+}
+
+#[cfg(unix)]
+fn read(source: &Agy) -> Result<String, String> {
+    let home = source
+        .env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == super::super::upgrade_agy::HOME_ENV)
+        .map(|(_, value)| value.as_str());
+    let key = launch_key(home, &source.flags);
+    let token = provider_read::Use::fixture(provider_read::Read::AgyUsage, Path::new(&key), None);
+    let permit = token
+        .begin(
+            provider_read::Account::in_home(provider_read::Read::AgyUsage, Path::new(&key), None),
+            NOW,
+            None,
+        )
+        .unwrap();
+    source.read(&permit)
+}
 
 fn tmp(tag: &str) -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
@@ -37,12 +67,12 @@ impl Recorded {
 }
 
 impl Source for Recorded {
-    fn read(&self) -> Result<String, String> {
+    fn read(&self, _: &provider_read::Permit) -> Result<String, String> {
         self.reads.set(self.reads.get() + 1);
         self.doc.clone()
     }
 
-    fn default_model(&self) -> Result<String, String> {
+    fn default_model(&self, _: &provider_read::Permit) -> Result<String, String> {
         self.default
             .map(str::to_owned)
             .ok_or_else(|| "no default".to_owned())
@@ -52,21 +82,41 @@ impl Source for Recorded {
 const NOW: i64 = 1_792_803_313;
 
 #[test]
+fn another_home_token_is_refused_even_when_the_requested_reading_is_cached() {
+    let tmp = tmp("token-home");
+    let store = Store::new(tmp.path(), "right-home");
+    let source = Recorded::new(Ok(doc(1.0, 1.0, 1.0)));
+    current_fixture(&store, &source, NOW, 0.1, false).unwrap();
+    let token =
+        provider_read::Use::fixture(provider_read::Read::AgyUsage, Path::new("wrong-home"), None);
+    let (result, probes) = provider_read::captured(|| {
+        super::current(&store, &source, NOW, 0.1, false, &mut Asking::new(token))
+    });
+    assert!(result.is_err());
+    assert!(probes.is_empty());
+    assert_eq!(
+        source.reads.get(),
+        1,
+        "a refused token makes no second source read"
+    );
+}
+
+#[test]
 fn a_fresh_reading_is_kept_and_a_stale_one_read_again() {
     let dir = tmp("fresh");
     let store = Store::new(dir.path(), "home");
     let agy = Recorded::new(Ok(doc(0.8, 0.9, 0.9)));
-    let (r, got) = current(&store, &agy, NOW, 0.1, false, ASKED).unwrap();
+    let (r, got) = current_fixture(&store, &agy, NOW, 0.1, false).unwrap();
     assert_eq!((got, agy.reads.get(), r.as_of), (Got::Read, 1, NOW));
-    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S - 1, 0.1, false, ASKED).unwrap();
+    let (_, got) = current_fixture(&store, &agy, NOW + FRESH_OPEN_S - 1, 0.1, false).unwrap();
     assert_eq!(
         (got, agy.reads.get()),
         (Got::Kept, 1),
         "every pool open: 15 minutes current"
     );
-    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S, 0.1, false, ASKED).unwrap();
+    let (_, got) = current_fixture(&store, &agy, NOW + FRESH_OPEN_S, 0.1, false).unwrap();
     assert_eq!((got, agy.reads.get()), (Got::Read, 2));
-    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S, 0.1, true, ASKED).unwrap();
+    let (_, got) = current_fixture(&store, &agy, NOW + FRESH_OPEN_S, 0.1, true).unwrap();
     assert_eq!(
         (got, agy.reads.get()),
         (Got::Read, 3),
@@ -80,8 +130,8 @@ fn a_tight_pool_is_read_more_often_and_a_passed_refill_at_once() {
     let dir = tmp("tight");
     let store = Store::new(dir.path(), "home");
     let agy = Recorded::new(Ok(doc(0.0, 0.9, 0.9)));
-    current(&store, &agy, NOW, 0.1, false, ASKED).unwrap();
-    let (_, got) = current(&store, &agy, NOW + FRESH_TIGHT_S, 0.1, false, ASKED).unwrap();
+    current_fixture(&store, &agy, NOW, 0.1, false).unwrap();
+    let (_, got) = current_fixture(&store, &agy, NOW + FRESH_TIGHT_S, 0.1, false).unwrap();
     assert_eq!(got, Got::Read, "a spent pool: 5 minutes current");
     let reset = aterm_types::rfc3339::parse_utc_fractional("2026-10-28T00:19:03Z").unwrap();
     let r = store.last().unwrap();
@@ -92,7 +142,7 @@ fn a_tight_pool_is_read_more_often_and_a_passed_refill_at_once() {
     let low_store = Store::new(dir.path(), "low-refill");
     let reset_5h = aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z").unwrap();
     let low_agy = Recorded::new(Ok(doc(0.9, 0.9, 0.05)));
-    current(&low_store, &low_agy, reset_5h - 30, 0.1, false, ASKED).unwrap();
+    current_fixture(&low_store, &low_agy, reset_5h - 30, 0.1, false).unwrap();
     let low_r = low_store.last().unwrap();
     assert!(
         low_r.fresh(reset_5h + RESET_SETTLE_S - 1, 0.1),
@@ -110,19 +160,18 @@ fn a_failed_read_falls_back_to_the_last_kept_one() {
     let store = Store::new(dir.path(), "home");
     let bad = Recorded::new(Err("`agy -p /usage` exited 1".to_owned()));
     assert_eq!(
-        current(&store, &bad, NOW, 0.1, false, ASKED).unwrap_err(),
+        current_fixture(&store, &bad, NOW, 0.1, false).unwrap_err(),
         "`agy -p /usage` exited 1"
     );
-    current(
+    current_fixture(
         &store,
         &Recorded::new(Ok(doc(0.5, 0.5, 0.5))),
         NOW,
         0.1,
         true,
-        ASKED,
     )
     .unwrap();
-    let (r, got) = current(&store, &bad, NOW + FRESH_OPEN_S, 0.1, false, ASKED).unwrap();
+    let (r, got) = current_fixture(&store, &bad, NOW + FRESH_OPEN_S, 0.1, false).unwrap();
     assert_eq!((got, r.as_of), (Got::Stale, NOW));
 }
 
@@ -131,18 +180,18 @@ fn a_failed_read_is_not_retried_until_its_backoff_passes() {
     let dir = tmp("backoff");
     let store = Store::new(dir.path(), "home");
     let bad = Recorded::new(Err("signed out".to_owned()));
-    assert!(current(&store, &bad, NOW, 0.1, false, ASKED).is_err());
-    let again = current(&store, &bad, NOW + 60, 0.1, false, ASKED).unwrap_err();
+    assert!(current_fixture(&store, &bad, NOW, 0.1, false).is_err());
+    let again = current_fixture(&store, &bad, NOW + 60, 0.1, false).unwrap_err();
     assert!(
         again.contains("signed out") && again.contains("waits"),
         "{again}"
     );
     assert_eq!(bad.reads.get(), 1, "inside the backoff agy is not asked");
-    let _ = current(&store, &bad, NOW + 60, 0.1, true, ASKED);
+    let _ = current_fixture(&store, &bad, NOW + 60, 0.1, true);
     assert_eq!(bad.reads.get(), 2, "a forced read asks anyway");
     let good = Recorded::new(Ok(doc(0.5, 0.5, 0.5)));
     assert_eq!(
-        current(&store, &good, NOW + FAIL_BACKOFF_S + 60, 0.1, false, ASKED)
+        current_fixture(&store, &good, NOW + FAIL_BACKOFF_S + 60, 0.1, false)
             .unwrap()
             .1,
         Got::Read
@@ -157,19 +206,18 @@ fn a_failed_read_is_not_retried_until_its_backoff_passes() {
 fn a_held_lock_hands_out_the_kept_reading_and_asks_agy_nothing() {
     let dir = tmp("lock");
     let store = Store::new(dir.path(), "home");
-    current(
+    current_fixture(
         &store,
         &Recorded::new(Ok(doc(0.5, 0.5, 0.5))),
         NOW,
         0.1,
         false,
-        ASKED,
     )
     .unwrap();
     let held = store.try_lock().expect("the first lock");
     assert!(store.try_lock().is_none(), "one reader at a time");
     let agy = Recorded::new(Ok(doc(0.4, 0.4, 0.4)));
-    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S, 0.1, true, ASKED).unwrap();
+    let (_, got) = current_fixture(&store, &agy, NOW + FRESH_OPEN_S, 0.1, true).unwrap();
     assert_eq!((got, agy.reads.get()), (Got::Stale, 0));
     drop(held);
     assert!(
@@ -195,13 +243,12 @@ fn the_history_gives_each_limit_its_burn_and_when_it_runs_out() {
     let store = Store::new(dir.path(), "home");
     for (i, left) in [0.50, 0.45, 0.40].iter().enumerate() {
         let at = NOW + i as i64 * 1_800;
-        current(
+        current_fixture(
             &store,
             &Recorded::new(Ok(doc(0.9, 0.9, *left))),
             at,
             0.1,
             true,
-            ASKED,
         )
         .unwrap();
     }
@@ -313,7 +360,7 @@ fn a_launch_rotates_off_the_spent_pool_on_the_kept_reading() {
 
     let spent = Recorded::new(Ok(doc(0.0, 0.0, 0.0)));
     let spent_store = Store::new(dir.path(), "spent");
-    let (reading, _) = current(&spent_store, &spent, NOW, r.low, false, ASKED).unwrap();
+    let (reading, _) = current_fixture(&spent_store, &spent, NOW, r.low, false).unwrap();
     let reset = reading
         .quota
         .groups
@@ -333,7 +380,7 @@ fn a_launch_rotates_off_the_spent_pool_on_the_kept_reading() {
         None,
         "a failed refresh after refill leaves launch availability unknown"
     );
-    let (shown, got) = current(&spent_store, &mute, settled, r.low, false, ASKED).unwrap();
+    let (shown, got) = current_fixture(&spent_store, &mute, settled, r.low, false).unwrap();
     assert_eq!((got, shown.as_of), (Got::Stale, NOW));
     assert_eq!(
         shown.quota, reading.quota,
@@ -344,7 +391,7 @@ fn a_launch_rotates_off_the_spent_pool_on_the_kept_reading() {
     // a stale launch pick still rotates off the weekly-spent pool onto the open pool.
     let partial_store = Store::new(dir.path(), "partial-stale");
     let partial = Recorded::new(Ok(doc(0.0, 0.9, 0.0)));
-    let _ = current(&partial_store, &partial, NOW, r.low, false, ASKED).unwrap();
+    let _ = current_fixture(&partial_store, &partial, NOW, r.low, false).unwrap();
     let stale_rot = rotate_launch(asked, &partial_store, &mute, &r, settled)
         .expect("weekly-spent pool still rotates to the pool whose 5h refill settled");
     assert_eq!(stale_rot.got, Got::Stale);
@@ -590,7 +637,7 @@ fn store_rejects_fifos_and_replaces_them_atomically() {
         .expect("non-regular lock file is treated as stale and replaced");
     drop(lock);
     let agy = Recorded::new(Ok(doc(0.75, 0.9, 0.9)));
-    let (r, got) = current(&store, &agy, NOW, 0.1, false, ASKED).unwrap();
+    let (r, got) = current_fixture(&store, &agy, NOW, 0.1, false).unwrap();
     assert_eq!((got, r.as_of), (Got::Read, NOW));
     assert_eq!(store.history().len(), 1);
     assert!(!r.fresh(i64::MAX, 0.1));
@@ -781,4 +828,407 @@ fn failed_wall_reads_spend_the_wall_budget_without_repolling_after_backoff() {
     )
     .expect("CONTROL: once WALL_READ_SPENT_S elapses, the next look reads again");
     assert_eq!((after_hour.got, recovered.reads.get()), (Got::Read, 1));
+}
+
+/// The SSH-style environment that selects agy's native file backend, as `aterm harness agy login`
+/// and its account workers run it.
+#[cfg(unix)]
+const FILE_BACKEND: (&str, &str) = ("SSH_CONNECTION", "127.0.0.1 1 127.0.0.1 22");
+
+/// A stand-in agy at `<dir>/agy` (already run once, so a bounded read meets an assessed file)
+/// that marks `<dir>/agy.ran` whenever a read runs it, then does `body`.
+#[cfg(unix)]
+fn stand_in_agy(dir: &Path, body: &str) -> (PathBuf, PathBuf) {
+    let agy = dir.join("agy");
+    let ran = dir.join("agy.ran");
+    crate::harness::stand_in::proven(&agy, &format!(": > \"$0.ran\"\n{body}"));
+    (agy, ran)
+}
+
+#[cfg(unix)]
+fn agy_at(program: &Path, env: &[(&str, &str)], flags: &[String]) -> Agy {
+    Agy {
+        program: program.as_os_str().to_owned(),
+        env: env
+            .iter()
+            .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+            .collect(),
+        flags: flags.to_vec(),
+        budget: LAUNCH_READ_BUDGET,
+        inherited_home: std::env::var(crate::harness::upgrade_agy::HOME_ENV).ok(),
+        credentials_set: Vec::new(),
+    }
+}
+
+#[cfg(unix)]
+fn put_grant(config: &Path) {
+    std::fs::create_dir_all(config).unwrap();
+    // A stand-in grant: what agy keeps there is never read, only whether the file is there.
+    std::fs::write(config.join(crate::harness::upgrade_agy::GRANT_FILE), b"{}").unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_signed_out_file_profile_answers_at_once_and_never_runs_agy() {
+    let dir = tmp("signed-out");
+    let profile = dir.path().join("profile");
+    let home = profile.display().to_string();
+    let (program, ran) = stand_in_agy(dir.path(), &format!("printf '%s' '{}'", doc(0.8, 0.9, 0.9)));
+    let agy = agy_at(&program, &[("HOME", &home), FILE_BACKEND], &[]);
+    let why = read(&agy).expect_err("no grant file, no reading");
+    assert!(why.starts_with("signed-out: agy is signed out"), "{why}");
+    assert!(why.contains("antigravity-oauth-token"), "{why}");
+    assert!(why.contains("aterm harness agy login <account>"), "{why}");
+    assert!(is_signed_out(&why));
+
+    let store = Store::new(dir.path(), &launch_key(Some(home.as_str()), &[]));
+    let (model, probes) = provider_read::captured(|| {
+        default_model(&store, &agy, &mut Asking::new(token_for(&store)), NOW)
+    });
+    assert_eq!(
+        model,
+        Err(why.clone()),
+        "the default model is answered locally"
+    );
+    assert!(probes.is_empty(), "a local answer notes no probe");
+    let got = current_fixture(&store, &agy, NOW, 0.1, true);
+    assert_eq!(
+        got.map(|_| ()),
+        Err(why.clone()),
+        "a forced read is answered the same"
+    );
+    assert!(
+        store.recent_failure(NOW).is_none(),
+        "a local answer sets no backoff"
+    );
+    let rotation = agy_quota::Rotation::default();
+    assert_eq!(
+        rotate_launch_at(None, &store, &agy, &rotation, NOW, false),
+        None,
+        "a worker launch on a signed-out profile launches as asked, at once"
+    );
+
+    // An empty grant file is no grant, and neither is a directory where it should be.
+    let config = profile.join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join(crate::harness::upgrade_agy::GRANT_FILE), b"").unwrap();
+    assert!(agy.signed_out().is_some(), "an empty grant file");
+    std::fs::remove_file(config.join(crate::harness::upgrade_agy::GRANT_FILE)).unwrap();
+    std::fs::create_dir(config.join(crate::harness::upgrade_agy::GRANT_FILE)).unwrap();
+    assert!(
+        agy.signed_out().is_some(),
+        "a directory named like the grant"
+    );
+    assert!(!ran.exists(), "agy ran on a profile with no grant");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_profile_with_its_grant_reads_as_before() {
+    let dir = tmp("signed-in");
+    let profile = dir.path().join("profile");
+    let home = profile.display().to_string();
+    put_grant(&profile.join(".gemini/antigravity-cli"));
+    let (program, ran) = stand_in_agy(dir.path(), &format!("printf '%s' '{}'", doc(0.8, 0.9, 0.9)));
+    let agy = agy_at(&program, &[("HOME", &home), FILE_BACKEND], &[]);
+    assert_eq!(agy.signed_out(), None);
+    let wrong = provider_read::Use::fixture(
+        provider_read::Read::AgyUsage,
+        Path::new("another-home"),
+        None,
+    )
+    .begin(
+        provider_read::Account::in_home(
+            provider_read::Read::AgyUsage,
+            Path::new("another-home"),
+            None,
+        ),
+        NOW,
+        None,
+    )
+    .unwrap();
+    assert!(agy.read(&wrong).is_err());
+    assert!(
+        !ran.exists(),
+        "a permit for another home cannot run the provider"
+    );
+    let store = Store::new(dir.path(), &launch_key(Some(home.as_str()), &[]));
+    let (reading, got) = current_fixture(&store, &agy, NOW, 0.1, true).expect("it reads");
+    assert_eq!((got, reading.as_of), (Got::Read, NOW));
+    assert!(ran.exists(), "the read ran agy");
+}
+
+fn token_for(store: &Store) -> provider_read::Use {
+    provider_read::Use::fixture(provider_read::Read::AgyUsage, Path::new(&store.key), None)
+}
+
+/// A signed-in file-backend home whose stand-in agy answers `/usage` with a doc and `/model`
+/// with a default model, marking `<dir>/agy.model` whenever `/model` runs.
+#[cfg(unix)]
+fn model_rig(tag: &str) -> (aterm_tempfile::TempDir, Agy, Store, PathBuf) {
+    let dir = tmp(tag);
+    let profile = dir.path().join("profile");
+    let home = profile.display().to_string();
+    put_grant(&profile.join(".gemini/antigravity-cli"));
+    let model =
+        r#"{"status":"SUCCESS","command":{"name":"model","data":{"id":"gemini-4-argon-high"}}}"#;
+    let (program, _) = stand_in_agy(
+        dir.path(),
+        &format!(
+            "case \"$2\" in\n/model) : > \"$0.model\"; printf '%s' '{model}' ;;\n*) printf '%s' '{}' ;;\nesac",
+            doc(0.0, 1.0, 1.0)
+        ),
+    );
+    let marker = dir.path().join("agy.model");
+    let agy = agy_at(&program, &[("HOME", &home), FILE_BACKEND], &[]);
+    let store = Store::new(dir.path(), &launch_key(Some(home.as_str()), &[]));
+    (dir, agy, store, marker)
+}
+
+fn agy_probe(why: provider_read::InUse) -> provider_read::ProbeEvent {
+    provider_read::ProbeEvent {
+        at: NOW,
+        read: provider_read::Read::AgyUsage,
+        account: None,
+        login: None,
+        why,
+    }
+}
+
+/// A launch on a kept reading still asks agy its default model: that ask spends the launch's
+/// use of the home and is on record as its probe.
+#[cfg(unix)]
+#[test]
+fn a_launchs_default_model_read_spends_its_use_and_notes_its_probe() {
+    let (_dir, agy, store, marker) = model_rig("model-kept");
+    current_fixture(
+        &store,
+        &Recorded::new(Ok(doc(0.8, 0.9, 0.9))),
+        NOW,
+        0.1,
+        false,
+    )
+    .unwrap();
+    let rotation = agy_quota::Rotation::default();
+    let (pick, probes) =
+        provider_read::captured(|| rotate_launch(None, &store, &agy, &rotation, NOW));
+    let pick = pick.expect("a pick from the kept reading and the default read now");
+    assert_eq!((pick.got, pick.named), (Got::Kept, false));
+    assert!(marker.exists(), "the default model was read from agy");
+    assert_eq!(probes, vec![agy_probe(provider_read::InUse::Launching)]);
+    assert_eq!(
+        store.kept_default(NOW).as_deref(),
+        Some("gemini-4-argon-high")
+    );
+}
+
+/// One use that asks agy twice (`/usage`, then `/model`) notes two probes.
+#[cfg(unix)]
+#[test]
+fn a_model_read_after_the_usage_read_notes_its_own_probe() {
+    let (_dir, agy, store, marker) = model_rig("model-after-usage");
+    let rotation = agy_quota::Rotation::default();
+    let (pick, probes) =
+        provider_read::captured(|| rotate_launch(None, &store, &agy, &rotation, NOW));
+    assert_eq!(pick.map(|p| p.got), Some(Got::Read));
+    assert!(marker.exists());
+    assert_eq!(
+        probes,
+        vec![
+            agy_probe(provider_read::InUse::Launching),
+            agy_probe(provider_read::InUse::Launching)
+        ]
+    );
+}
+
+/// CONTROL: with a later ask riding the first ask's probe, the two-ask use is on record once,
+/// so `a_model_read_after_the_usage_read_notes_its_own_probe` fails.
+#[cfg(unix)]
+#[test]
+fn control_a_model_read_riding_the_usage_probe_is_missing_from_the_record() {
+    let (_dir, agy, store, marker) = model_rig("model-control");
+    let rotation = agy_quota::Rotation::default();
+    UNNOTED_LATER_ASK.set(true);
+    let (pick, probes) =
+        provider_read::captured(|| rotate_launch(None, &store, &agy, &rotation, NOW));
+    UNNOTED_LATER_ASK.set(false);
+    assert_eq!(pick.map(|p| p.got), Some(Got::Read));
+    assert!(marker.exists(), "agy was asked its default model");
+    assert_eq!(probes, vec![agy_probe(provider_read::InUse::Launching)]);
+}
+
+/// The `/model` read never runs agy without this home's authority: not for a token of another
+/// home, not for a spent use, not for another home's permit.
+#[cfg(unix)]
+#[test]
+fn the_model_read_never_runs_agy_without_this_homes_authority() {
+    let (_dir, agy, store, marker) = model_rig("model-token");
+    let (model, probes) = provider_read::captured(|| {
+        let other = provider_read::Use::fixture(
+            provider_read::Read::AgyUsage,
+            Path::new("another-home"),
+            None,
+        );
+        let refused = default_model(&store, &agy, &mut Asking::new(other), NOW);
+        let spent = default_model(&store, &agy, &mut Asking::spent(), NOW);
+        (refused, spent)
+    });
+    assert!(model.0.is_err() && model.1.is_err(), "{model:?}");
+    assert!(probes.is_empty(), "a refused ask notes no probe");
+    let wrong = provider_read::Use::fixture(
+        provider_read::Read::AgyUsage,
+        Path::new("another-home"),
+        None,
+    )
+    .begin_home(
+        provider_read::Read::AgyUsage,
+        Path::new("another-home"),
+        NOW,
+    )
+    .unwrap();
+    assert!(agy.default_model(&wrong).is_err());
+    assert!(
+        !marker.exists(),
+        "agy's /model ran without this home's authority"
+    );
+
+    let (model, probes) = provider_read::captured(|| {
+        default_model(&store, &agy, &mut Asking::new(token_for(&store)), NOW)
+    });
+    assert_eq!(model.as_deref(), Ok("gemini-4-argon-high"));
+    assert_eq!(probes, vec![agy_probe(provider_read::InUse::Launching)]);
+    assert!(marker.exists(), "CONTROL: this home's token runs /model");
+}
+
+/// A signed-out file-backend home never runs agy for its default model, at a launch or a wall:
+/// the missing grant answers here, and nothing is on record.
+#[cfg(unix)]
+#[test]
+fn a_signed_out_home_never_runs_agy_for_its_default_model() {
+    let (dir, agy, store, marker) = model_rig("model-signed-out");
+    current_fixture(
+        &store,
+        &Recorded::new(Ok(doc(0.0, 1.0, 1.0))),
+        NOW,
+        0.1,
+        false,
+    )
+    .unwrap();
+    std::fs::remove_file(
+        dir.path()
+            .join("profile/.gemini/antigravity-cli")
+            .join(crate::harness::upgrade_agy::GRANT_FILE),
+    )
+    .unwrap();
+    assert!(agy.signed_out().is_some());
+    let rotation = agy_quota::Rotation::default();
+    let (picks, probes) = provider_read::captured(|| {
+        (
+            rotate_launch_at(None, &store, &agy, &rotation, NOW, false),
+            rotate_launch_at(None, &store, &agy, &rotation, NOW, true),
+        )
+    });
+    assert_eq!(picks, (None, None), "no default model is known here");
+    assert!(probes.is_empty(), "{probes:?}");
+    assert!(!marker.exists(), "agy ran on a signed-out home");
+    assert!(!dir.path().join("agy.ran").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_carried_gemini_dir_names_the_grant_it_reads() {
+    let dir = tmp("gemini-dir");
+    let profile = dir.path().join("profile");
+    let home = profile.display().to_string();
+    let alt = dir.path().join("alt-gemini");
+    put_grant(&profile.join(".gemini/antigravity-cli"));
+    let flags = [format!("--gemini_dir={}", alt.display())];
+    let agy = agy_at(
+        Path::new("/no/such/agy"),
+        &[("HOME", &home), FILE_BACKEND],
+        &flags,
+    );
+    assert_eq!(
+        agy.grant_file(),
+        Some(alt.join("antigravity-cli/antigravity-oauth-token"))
+    );
+    let why = agy
+        .signed_out()
+        .expect("the home's grant is not the carried dir's");
+    assert!(
+        why.contains(&alt.join("antigravity-cli").display().to_string()),
+        "{why}"
+    );
+    put_grant(&alt.join("antigravity-cli"));
+    assert_eq!(agy.signed_out(), None);
+}
+
+/// Only agy's file backend makes the grant file the answer: under the OS keyring (no
+/// `SSH_CONNECTION`), or with another credential or an unplaced config, agy is asked.
+#[cfg(unix)]
+#[test]
+fn without_the_file_backend_a_missing_grant_file_says_nothing() {
+    let dir = tmp("keyring");
+    let profile = dir.path().join("profile");
+    let home = profile.display().to_string();
+    let (program, ran) = stand_in_agy(dir.path(), &format!("printf '%s' '{}'", doc(0.8, 0.9, 0.9)));
+    let keyring = agy_at(&program, &[("HOME", &home)], &[]);
+    assert_eq!((keyring.grant_file(), keyring.signed_out()), (None, None));
+    read(&keyring).expect("a keyring profile is read");
+    assert!(ran.exists());
+    for other in [
+        ("GEMINI_API_KEY", "k"),
+        ("AGY_LLM_GATEWAY_URL", "http://127.0.0.1:1"),
+        ("AGY_CLI_CONFIG_DIR", "/elsewhere"),
+    ] {
+        let agy = agy_at(&program, &[("HOME", &home), FILE_BACKEND, other], &[]);
+        assert_eq!(agy.signed_out(), None, "{other:?}");
+    }
+    let blank = agy_at(&program, &[("HOME", &home), ("SSH_CONNECTION", " ")], &[]);
+    assert_eq!(
+        blank.grant_file(),
+        None,
+        "a blank SSH_CONNECTION selects nothing"
+    );
+}
+
+/// A grant agy no longer accepts: agy prints its sign-in prompt and would wait a minute for a
+/// person; the read stops at the prompt and says signed-out (expired).
+#[cfg(unix)]
+#[test]
+fn a_sign_in_prompt_ends_the_read_as_signed_out() {
+    let dir = tmp("expired");
+    let profile = dir.path().join("profile");
+    let home = profile.display().to_string();
+    put_grant(&profile.join(".gemini/antigravity-cli"));
+    let parked = aterm_spec::wait::PARKED_SECS;
+    let (program, ran) = stand_in_agy(
+        dir.path(),
+        &format!(
+            "printf 'Authentication required. Please visit the URL to log in: https://accounts.example.invalid/\\n'\n\
+             printf 'Waiting for authentication (timeout 60s)...\\n' >&2\n\
+             exec /bin/sleep {parked}"
+        ),
+    );
+    let agy = agy_at(&program, &[("HOME", &home), FILE_BACKEND], &[]);
+    // A read that waited for the parked stand-in would end at its budget, saying so.
+    let why = read(&agy).expect_err("a prompt is no reading");
+    assert!(ran.exists(), "the read ran agy");
+    assert!(why.starts_with("signed-out (expired):"), "{why}");
+
+    // Under the keyring the same prompt (here on stderr) is plain signed-out.
+    let keyring = dir.path().join("keyring");
+    std::fs::create_dir(&keyring).unwrap();
+    let (program, _) = stand_in_agy(
+        &keyring,
+        &format!(
+            "printf 'Authentication required. Please visit the URL to log in:\\n' >&2\n\
+             exec /bin/sleep {parked}"
+        ),
+    );
+    let why = read(&agy_at(&program, &[("HOME", &home)], &[])).expect_err("a prompt is no reading");
+    assert!(
+        why.starts_with("signed-out: agy asked for a Google sign-in"),
+        "{why}"
+    );
 }

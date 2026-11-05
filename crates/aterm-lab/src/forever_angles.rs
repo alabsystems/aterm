@@ -98,7 +98,7 @@ pub fn other_worktree(dir: &Path) -> PathBuf {
 pub fn lay_others(home: &Path, dir: &Path) -> Result<(), String> {
     let g = |args: &[&str]| git(home, dir, args);
     g(&["switch", "-q", "-c", OTHER_BRANCH])?;
-    std::fs::write(dir.join("other.txt"), "another session's parser draft\n")
+    crate::util::write_fresh(&dir.join("other.txt"), "another session's parser draft\n")
         .map_err(|e| format!("other.txt: {e}"))?;
     g(&["add", "other.txt"])?;
     g(&["commit", "-q", "-m", OTHER_SUBJECT])?;
@@ -112,8 +112,8 @@ pub fn lay_others(home: &Path, dir: &Path) -> Result<(), String> {
         OTHER_WORKTREE_BRANCH,
         &wt.to_string_lossy(),
     ])?;
-    std::fs::write(
-        dir.join("README.md"),
+    crate::util::write_fresh(
+        &dir.join("README.md"),
         "# The forever lab\n\nAnother session's draft.\n",
     )
     .map_err(|e| format!("README.md: {e}"))?;

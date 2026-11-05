@@ -5295,6 +5295,76 @@ folder_key() { # <dir>
 	printf '%s%s\n' "${dir%/}" "$rest"
 }
 
+# atpkg's record that this machine declined the ALab toolset: `declined` in
+# atpkg's prefix, which follows HOME (store.rs `declined`, platform/unix.rs
+# `default_prefix`). `aterm pkg uninstall --all` and Settings ▸ Packages write it,
+# an explicit `aterm pkg install --default-set` lifts it, and while it stands
+# atpkg's seed installs nothing, here or on the app's first launch (cmd_seed).
+toolset_decline_path() {
+	if [[ "$(uname -s)" == Darwin ]]; then
+		echo "$HOME/Library/Application Support/aterm/pkg/declined"
+	else
+		echo "$HOME/.local/share/aterm/pkg/declined"
+	fi
+}
+
+# The aterm.toml whose consent decides this run's toolset: the app's first launch
+# reads ~/.config's (aterm_config_paths), and a seed here reads this shell's.
+toolset_consent_path() {
+	if [[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 ]]; then
+		echo "$HOME/.config/aterm/aterm.toml"
+	else
+		aterm_config_path
+	fi
+}
+
+# The line of <cfg> that withholds atpkg's install consent, printed, when one does
+# (status 1 and nothing when none does): under [packages], `auto_install` when it
+# is there, else its retired spelling `seed_install`, set to false (config.rs
+# `auto_install`). --no-toolchain persists this, and a later run without the flag
+# keeps it. no_toolchain_plan's line rules; a form they cannot read counts as consent.
+toolset_consent_off() { # <cfg>
+	[[ -f "$1" ]] || return 1
+	awk '
+		function strip(s) { sub(/[ \t]*#.*$/, "", s); sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+		{
+			line = strip($0)
+			if (line ~ /^\[/) { inpk = (line ~ /^\[[ \t]*packages[ \t]*\]$/); next }
+			if (!inpk) next
+			if (line ~ /^auto_install[ \t]*=/) auto = line
+			else if (line ~ /^seed_install[ \t]*=/) seed = line
+		}
+		END {
+			have = (auto != "" ? auto : seed)
+			v = have
+			sub(/^[^=]*=[ \t]*/, "", v)
+			if (v != "false") exit 1
+			print have
+		}' "$1" 2>/dev/null
+}
+
+# Why atpkg's seed will install no toolset here, whatever this run asks, in the
+# order its seed reads them (adoption.rs `adoption_with`), or nothing when it will.
+# Every line this script prints about the toolset arriving asks this. A pinned
+# pre-lean DMG's atpkg honours the decline but predates the consent key. Two more
+# withhold it and are not read here, so the plan can still promise too much: a
+# `[packages] prefix` atpkg ignores, and an aterm.toml it cannot parse.
+toolset_withheld() {
+	local cfg line home="$HOME/.config/aterm/aterm.toml"
+	if [[ -f "$(toolset_decline_path)" ]]; then
+		echo "this machine declined the ALab toolset ($(toolset_decline_path)); \`aterm pkg install --default-set\` puts it back"
+	elif [[ "${CONTAINER_KIND:-}" != dmg ]]; then
+		cfg="$(toolset_consent_path)"
+		if line="$(toolset_consent_off "$cfg")"; then
+			if [[ "$cfg" == "$home" ]] || toolset_consent_off "$home" >/dev/null; then
+				echo "$cfg says \`$line\`: $NO_TOOLCHAIN_EFFECT"
+			else
+				echo "$cfg says \`$line\`, but an aterm opened outside this shell reads $home, which does not: that launch can still install it"
+			fi
+		fi
+	fi
+}
+
 # What persisting the exclusion would do to <cfg>, one word (then detail):
 #   create   no file — it would be created with the key
 #   append   a file with no [packages] table — the table would be appended
@@ -5952,7 +6022,7 @@ cli_path_hint() {
 # … is on PATH and no ALab toolset is installed"), so the plan promises no
 # block then (round 12: it promised one, and the run made none).
 path_step_plan() {
-	if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
+	if [[ "$DO_TOOLCHAIN" -eq 1 && -z "$(toolset_withheld)" ]]; then
 		echo "appends at most ONE marker-fenced block to your shell profile — the toolset hook + $BIN_DIR"
 		return 0
 	fi
@@ -6076,7 +6146,7 @@ print_install_plan() {
 	# source build, or nothing; with nothing placed, the toolset and PATH halves
 	# drive what is already installed, as install_toolchain and wire_shell_path
 	# will.
-	local into="" unsealed="" cli_none=0 driver
+	local into="" unsealed="" cli_none=0 driver withheld
 	[[ "$DO_APP" -eq 0 || -n "$APP_SKIP" || -n "$APP_ALREADY" || "$LINUX_RELEASE" -eq 1 ]] || into="$DEST"
 	if [[ "$DO_CLI" -eq 0 ]]; then
 		echo "install.sh: cli: excluded (--no-cli)"
@@ -6127,6 +6197,8 @@ print_install_plan() {
 		# Root, for someone not at this Mac's console: never seeded as root
 		# (toolset_deferral).
 		echo "install.sh: toolset: $ROOT_TOOLSET_LINE"
+	elif withheld="$(toolset_withheld)" && [[ -n "$withheld" ]]; then
+		echo "install.sh: toolset: none installs — $withheld"
 	elif [[ "$cli_none" -eq 1 && "${TOOLCHAIN_DEFERRED:-0}" -ne 1 && "${CONTAINER_KIND:-}" != zip ]] &&
 		driver="$(toolset_driver)" && [[ "$driver" != "run "* ]]; then
 		echo "install.sh: toolset: would be SKIPPED: ${driver#skip }"
@@ -6191,8 +6263,9 @@ print_install_plan() {
 # one group, and bash executes none of a group before its closing brace has
 # arrived: a cut anywhere inside it is bash's syntax error and runs nothing,
 # and a cut in the comments above it runs nothing either. Do not remove it.
-# Tested at every unindented line, every byte of each one's first word, and
-# every byte of the last line by crates/aterm-update/tests/install_sh.
+# Tested at every unindented line, the bytes of each one's first word that can
+# decide anything, and every byte of the last line by
+# crates/aterm-update/tests/install_sh.
 # Neither main's body nor the file's group is indented ON PURPOSE:
 # re-indenting would be mechanical churn and risk pushing literal tabs into
 # multi-line strings.
@@ -6714,7 +6787,9 @@ install_app() {
 		# "nothing else is downloaded" promise below still holds for it.
 		echo "install.sh: downloading $ASSET_NAME — $((ASSET_SIZE / 1000000)) MB"
 		echo "  the ALab toolset rides inside the app, so nothing else is downloaded to install it."
-		if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
+		if [[ "$DO_TOOLCHAIN" -eq 1 && -n "$(toolset_withheld)" ]]; then
+			echo "  then: aterm.app -> $DEST"
+		elif [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
 			echo "  then: aterm.app -> $DEST, and the toolset unpacks to ${TOOLSET_SIZE:-a size shown before download}${TOOLSET_SIZE:+ under your home directory}."
 			echo "  the app reclaims its ~1 GB copy of the payload as soon as the toolset is in place."
 		else
@@ -6722,7 +6797,7 @@ install_app() {
 		fi
 	else
 		echo "install.sh: downloading $ASSET_NAME — $((ASSET_SIZE / 1000000)) MB"
-		if [[ "$LEAN_REASON" == default && "${TOOLSET_NO_WINDOW:-0}" -eq 1 ]]; then
+		if [[ "$LEAN_REASON" == default && "${TOOLSET_NO_WINDOW:-0}" -eq 1 && -z "$(toolset_withheld)" ]]; then
 			# No window follows (toolset_deferral): the toolset installs here.
 			echo "  then: aterm.app -> $DEST, and the toolset installs here (${TOOLSET_SIZE:-a size shown before download}${TOOLSET_SIZE:+ under your home directory}): you are not at this Mac's console, so no aterm window will"
 		elif [[ "$LEAN_REASON" == default ]]; then
@@ -6968,7 +7043,13 @@ install_toolchain() {
 	# One line on every lane: where the builds come from (a pinned pre-v0.63
 	# app's sealed payload, else the signed network index) and whether this
 	# machine has any is `pkg seed`'s to decide and to say.
-	echo "install.sh: installing the ALab toolset (aterm pkg seed)"
+	local why
+	why="$(toolset_withheld)"
+	if [[ -n "$why" ]]; then
+		echo "install.sh: toolset: none installs — $why"
+	else
+		echo "install.sh: installing the ALab toolset (aterm pkg seed)"
+	fi
 	local rc=0
 	"$aterm_bin" pkg seed || rc=$?
 	if [[ $rc -eq $ATPKG_CONTENDED_EXIT ]]; then
@@ -7034,7 +7115,7 @@ install_toolchain() {
 # below says what to add.
 wire_shell_path() {
 	local aterm args=(pkg shell-setup --path --bin-dir "$BIN_DIR")
-	[[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 ]] && args+=(--toolset-coming)
+	[[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 && -z "$(toolset_withheld)" ]] && args+=(--toolset-coming)
 	aterm="$(setup_aterm shell-setup "$BIN_DIR" "$STORE_DIR" ${DEST:+"$DEST"})"
 	if [[ -z "$aterm" ]]; then
 		echo "install.sh: NOTE: no installed aterm can wire your shell profile — run \`aterm pkg shell-setup --path\` once one is installed" >&2
@@ -7086,14 +7167,17 @@ if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
 		# lane (--no-app, an already-current app, a pinned pre-lean DMG,
 		# Linux, an install over SSH) runs install_toolchain here. A root run
 		# for someone else stays deferred: no toolset is ever seeded as root.
+		TOOLSET_WHY="$(toolset_withheld)"
 		if [[ "${TOOLSET_AS_ROOT:-0}" -eq 1 ]]; then
 			echo "install.sh: toolset: $ROOT_TOOLSET_LINE"
+		elif [[ -n "$TOOLSET_WHY" ]]; then
+			echo "install.sh: toolset: none installs — $TOOLSET_WHY"
 		elif [[ -z "$APP_TO_OPEN" ]]; then
 			# An app this run opens says it in open_installed_app's line.
 			echo "install.sh: toolset: installs on aterm's first launch (from a terminal instead: aterm pkg install --default-set)"
 		fi
 	else
-		if [[ "${TOOLSET_NO_WINDOW:-0}" -eq 1 ]]; then
+		if [[ "${TOOLSET_NO_WINDOW:-0}" -eq 1 && -z "$(toolset_withheld)" ]]; then
 			echo "install.sh: toolset: you are not at this Mac's console, so no aterm window will install it — installing it here"
 		fi
 		install_toolchain
@@ -7122,7 +7206,7 @@ if [[ "$CLI_PATH_HINT_WANTED" -eq 1 && "$PATH_BLOCK_WROTE" -eq 0 ]]; then
 fi
 if [[ -n "$APP_TO_OPEN" ]]; then
 	open_installed_app "$APP_TO_OPEN" \
-		"$([[ "$DO_TOOLCHAIN" -eq 1 && "${TOOLCHAIN_DEFERRED:-0}" -eq 1 ]] && echo 1 || echo 0)"
+		"$([[ "$DO_TOOLCHAIN" -eq 1 && "${TOOLCHAIN_DEFERRED:-0}" -eq 1 && -z "$(toolset_withheld)" ]] && echo 1 || echo 0)"
 	APP_TO_OPEN=""
 fi
 if [[ "$INSTALLED_ANY" -eq 0 ]]; then

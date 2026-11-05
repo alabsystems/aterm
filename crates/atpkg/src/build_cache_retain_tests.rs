@@ -257,9 +257,7 @@ fn an_ordinary_pending_deep_retirement_does_not_revoke_its_own_fence() {
     registered::stage_for_process_test(&world.home, &world.target, &stage);
     let receipt = registered::read(&world.path()).unwrap();
     let pending = receipt.pending.as_ref().unwrap();
-    let result =
-        registered::remove_pending(&world.path(), &receipt, pending, None, &Fence::default())
-            .unwrap();
+    let result = registered::remove_pending(&world.path(), &receipt, pending, None).unwrap();
     assert!(result.whole());
     assert!(!stage.exists());
     assert_eq!(registered::read(&world.path()).unwrap(), receipt);

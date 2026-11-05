@@ -354,6 +354,7 @@ mod macos {
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(crate::atomic_file::LOCK_OPEN_FLAGS)
             .open(&report)?;
         let began = Instant::now();
         let mut command = crate::spawnfd::command("/usr/bin/sample");

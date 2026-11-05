@@ -444,30 +444,12 @@ impl Fx {
         }
     }
 
-    /// A file's bytes, bounded regular-file read.
+    /// A file's bytes: a final link is followed (a `rules_file` in a dotfiles checkout), and what
+    /// it ends at must be a regular file of at most 16 MiB. The open does not block.
     pub(crate) fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
-            use std::io::Read as _;
             const MAX_FX_FILE_BYTES: u64 = 16 * 1024 * 1024;
-            let (file, meta) = aterm_uds::regular_file::open(path)?;
-            if meta.len() > MAX_FX_FILE_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "file exceeds size limit",
-                ));
-            }
-            let cap = usize::try_from(meta.len().min(MAX_FX_FILE_BYTES))
-                .unwrap_or(0)
-                .saturating_add(1);
-            let mut bytes = Vec::with_capacity(cap);
-            file.take(MAX_FX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_FX_FILE_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "file exceeds size limit",
-                ));
-            }
-            Ok(bytes)
+            aterm_uds::atomic_file::read_regular(path, MAX_FX_FILE_BYTES).map(|(bytes, _)| bytes)
         }
         let core = match &self.mode {
             Mode::Live => return read_bounded(path),

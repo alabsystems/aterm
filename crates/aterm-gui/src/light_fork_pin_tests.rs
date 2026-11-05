@@ -4,16 +4,17 @@
 //! The host unreachability pin (`docs/design/PRISM-GLASS.md` §15.1 P0.9, §15.0.3): no dark
 //! ground reaches the light fork through the app's own frame.
 //!
-//! Each dark ground ([`Ground::dark`]: the terminal's own colours with no theme admitted, which
-//! the renderer's input carries as `COLOR_UNSET`; each dark built-in; each dark pack theme),
-//! under each page a program lays over it ([`Page`]: none, DECSCNM, OSC 11 `#ffffff`, OSC 11
-//! `#f6f7f9`), wherever it stands ([`Stand`]: a dark instance; a light instance's front tab
-//! wearing it as its own theme; that tab split, its pane focused beside a light pane), is typed
-//! on and drawn through each of the host's two entries to the cursor frame ([`Entry`]): the live
-//! present, whose single-pane redraw reaches `cursor_frame_for_present` and which `lab
-//! trail-diff`'s dump draws by, and the windowless capture path. Every frame must draw by main's
-//! rule ([`breaks`]), which this file restates rather than calls, so a later change to the rule
-//! fails here, and a tab or pane wearing the ground must lay the caret its dark twin lays
+//! Dark grounds ([`Ground::dark`]: the terminal's own colours with no theme admitted, which the
+//! renderer's input carries as `COLOR_UNSET`; each dark built-in; each dark pack theme), under each
+//! page a program lays over them ([`Page`]: none, DECSCNM, OSC 11 `#ffffff`, OSC 11 `#f6f7f9`),
+//! wherever they stand ([`Stand`]: a dark instance; a light instance's front tab wearing the ground
+//! as its own theme; that tab split, its pane focused beside a light pane), are typed on and drawn
+//! through each of the host's two entries to the cursor frame ([`Entry`]): the live present, whose
+//! single-pane redraw reaches `cursor_frame_for_present` and which `lab trail-diff`'s dump draws
+//! by, and the windowless capture path. Every ground runs on its plain page; the whole matrix runs
+//! on the grounds that stand for the rest ([`whole_matrix_grounds`]). Every frame must draw by
+//! main's rule ([`breaks`]), which this file restates rather than calls, so a later change to the
+//! rule fails here, and a tab or pane wearing the ground must lay the caret its dark twin lays
 //! ([`fill_breaks`]). Each phase that adds a light symbol adds its "absent on every dark ground"
 //! assert to [`light_symbols_absent`] (§15.0.3). The Settings preview's producer has its
 //! companion pin in `settings_preview` (`the_preview_draws_every_dark_theme_by_mains_rule`).
@@ -118,6 +119,15 @@ enum Page {
 
 impl Page {
     const ALL: [Self; 4] = [Self::Plain, Self::Decscnm, Self::White, Self::Paper];
+
+    /// The live background OSC 11 lays, where it lays one.
+    const fn osc_11(self) -> Option<u32> {
+        match self {
+            Self::Plain | Self::Decscnm => None,
+            Self::White => Some(0x00FF_FFFF),
+            Self::Paper => Some(0x00F6_F7F9),
+        }
+    }
 
     const fn bytes(self) -> &'static [u8] {
         match self {
@@ -724,11 +734,73 @@ fn run_at(
     (rig, frames)
 }
 
-/// Every dark ground, under every page, wherever it stands, through both of the host's entries
-/// to the cursor frame, on a scale-2 display (whose face the glass draws under) and at the dump's
-/// own 1x (whose face draws none, `host::PageFacts::glass`): every frame draws by main's rule,
-/// and none reaches a light symbol. Each ground under each page at each scale runs on a core of
-/// its own, its stands in order (its twin first), each run on a rig of its own.
+/// The grounds of `grounds` that run the whole matrix, by the class each stands for: light reaches
+/// a frame only through the latch's key, `scheme_light` of the configured background, and the live
+/// page's `raw_light`, which reads a ground's ink too. A dark ground's live page reads as light by
+/// two roads: DECSCNM, whose swapped pair does on every dark scheme today, its ink the live page,
+/// and which every ground here runs; and an OSC 11 page, only where the ground's own ink is dark
+/// enough under it. The grounds: [`Ground::Unset`], which has no scheme; the lightest and the
+/// darkest by `theme_is_dark`'s own measure, a drift of its threshold reaching the lightest first;
+/// the first pack theme, whose scheme comes by another road; and every ground whose ink `raw_light`
+/// reads as light under an OSC 11 page: Solarized Dark today, under `#ffffff`, and it must stay at
+/// least one, or no run asks the latch by that road.
+///
+/// Each other ground runs its plain page in its own instance, through both entries, at 2×: a fork
+/// keyed on it fires there. Its DECSCNM and OSC 11 pages, a light instance's tab or split and 1×
+/// are not run, though its DECSCNM page asks the latch as these grounds' do. So those grounds no
+/// longer show a fork keyed on one named theme, or on a colour other than its background and ink,
+/// that opens only there, nor a caret that differs from its twin on one such ground alone
+/// ([`fill_breaks`]).
+fn whole_matrix_grounds(grounds: &[Ground]) -> std::collections::BTreeSet<usize> {
+    assert!(
+        matches!(grounds[0], Ground::Unset),
+        "COLOR_UNSET heads the grounds"
+    );
+    let scheme = |at: usize| grounds[at].scheme().expect("a theme names its scheme");
+    let measure = |at: usize| {
+        let [_, r, g, b] = pack(scheme(at).background).to_be_bytes();
+        aterm_messages::ink::contrast([0, 0, 0], [r, g, b])
+    };
+    let by_measure = |one: &usize, other: &usize| measure(*one).total_cmp(&measure(*other));
+    let themed = 1..grounds.len();
+    let lightest = themed.clone().max_by(by_measure).expect("a dark scheme");
+    let darkest = themed.clone().min_by(by_measure).expect("a dark scheme");
+    let first_pack = themed
+        .clone()
+        .find(|at| matches!(grounds[*at], Ground::Pack { .. }))
+        .expect("a dark pack theme");
+    let ink_reads_light: Vec<usize> = themed
+        .filter(|at| {
+            let ink = pack(scheme(*at).foreground);
+            Page::ALL
+                .iter()
+                .filter_map(|page| page.osc_11())
+                .any(|page| {
+                    aterm_effects::host::light_latch::raw_light(
+                        ink,
+                        page,
+                        aterm_render::theme_is_dark(page),
+                    )
+                })
+        })
+        .collect();
+    assert!(
+        !ink_reads_light.is_empty(),
+        "some dark ground's ink reads as light under an OSC 11 page, or no run asks the latch by \
+         that road"
+    );
+    let mut whole: std::collections::BTreeSet<usize> =
+        [0, lightest, darkest, first_pack].into_iter().collect();
+    whole.extend(ink_reads_light);
+    whole
+}
+
+/// Every dark ground on its plain page, and the grounds that stand for the rest
+/// ([`whole_matrix_grounds`]) under every page, wherever they stand, through both of the host's
+/// entries to the cursor frame, on a scale-2 display (whose face the glass draws under) and at the
+/// dump's own 1x (whose face draws none, `host::PageFacts::glass`): every frame draws by main's
+/// rule, and none reaches a light symbol. Each ground under each page at each scale runs on a core
+/// of its own, its stands in order (its twin first), each run on a rig of its own.
 #[test]
 fn the_light_fork_is_unreachable_on_every_dark_ground() {
     let grounds = Ground::dark();
@@ -748,22 +820,29 @@ fn the_light_fork_is_unreachable_on_every_dark_ground() {
         "{} dark schemes swept",
         grounds.len() - 1
     );
-    let cases: Vec<(Ground, Page, f64)> = grounds
+    let whole = whole_matrix_grounds(&grounds);
+    let cases: Vec<(Ground, bool, Page, f64)> = grounds
         .iter()
-        .flat_map(|&ground| {
+        .enumerate()
+        .flat_map(|(at, &ground)| {
+            let whole = whole.contains(&at);
             Page::ALL
                 .into_iter()
-                .flat_map(move |page| [2.0, 1.0].map(|scale| (ground, page, scale)))
+                .flat_map(move |page| [2.0, 1.0].map(move |scale| (ground, whole, page, scale)))
         })
+        .filter(|&(_, whole, page, scale)| whole || (matches!(page, Page::Plain) && scale == 2.0))
         .collect();
-    let swept = aterm_spec::check::each(&cases, |&(ground, page, scale)| {
+    let swept = aterm_spec::check::each(&cases, |&(ground, whole, page, scale)| {
         let (mut runs, mut frames, mut twinned) = (0, 0, 0);
         // Which polarities main's rule read: dark on a plain page, light under DECSCNM and OSC 11.
         let mut polarity = [false; 2];
         let mut failures = Vec::new();
         // Each entry's dark twin: the instance stand, which runs first.
         let mut twins: [Vec<Drawn>; Entry::ALL.len()] = Default::default();
-        for stand in Stand::ALL.into_iter().filter(|stand| stand.takes(ground)) {
+        for stand in Stand::ALL
+            .into_iter()
+            .filter(|stand| stand.takes(ground) && (whole || matches!(stand, Stand::Instance)))
+        {
             for (e, entry) in Entry::ALL.into_iter().enumerate() {
                 let case = format!("{ground} {page:?} {stand:?} {entry:?} at {scale}x");
                 let (_, drawn) = run_at(ground, page, stand, entry, "", (None, "", scale));
@@ -810,12 +889,13 @@ fn the_light_fork_is_unreachable_on_every_dark_ground() {
         failures.len(),
         failures.join("\n")
     );
-    let tab_stands = Stand::ALL.len() - 1;
+    let matrix = 2 * Page::ALL.len() * Entry::ALL.len();
     assert_eq!(
         runs,
-        2 * Page::ALL.len() * Entry::ALL.len() * (1 + (grounds.len() - 1) * (1 + tab_stands)),
-        "every ground ran under every page, at every stand that takes it, through both entries, \
-         at both scales"
+        matrix * (1 + (whole.len() - 1) * Stand::ALL.len())
+            + (grounds.len() - whole.len()) * Entry::ALL.len(),
+        "each whole ground ran under every page, at every stand that takes it, through both \
+         entries, at both scales, and each other ground on its plain page through both entries"
     );
     assert_eq!(polarity, [true, true], "main's rule read both polarities");
     assert!(twinned > 0, "caret fills were held to their twins");

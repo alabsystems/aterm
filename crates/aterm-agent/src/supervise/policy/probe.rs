@@ -720,17 +720,26 @@ impl TapeValue for Result<GitView, String> {
     }
 }
 
-/// A shell's startup as a tape holds it.
-pub(crate) type ShellWire = (Vec<(String, String, bool)>, bool);
+/// A shell's startup as a tape holds it: its names, whether zsh may run, whether
+/// `EXTENDED_GLOB` may be on and whether a glob may meet a leading dot
+/// ([`ShellStartup::of_parts`]).
+pub(crate) type ShellWire = (Vec<(String, String, bool)>, bool, bool, bool);
 
 impl TapeValue for Result<ShellStartup, String> {
     fn to_tape(&self) -> Vec<u8> {
-        answer(self, |s| (s.names().to_vec(), s.may_run_zsh()))
+        answer(self, |s| {
+            (
+                s.names().to_vec(),
+                s.may_run_zsh(),
+                s.may_extended_glob(),
+                s.may_dot_glob(),
+            )
+        })
     }
 
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
-        answer_of(bytes, |(names, zsh): ShellWire| {
-            Ok(ShellStartup::of_parts(names, zsh))
+        answer_of(bytes, |(names, zsh, extended_glob, dot_glob): ShellWire| {
+            Ok(ShellStartup::of_parts(names, zsh, extended_glob, dot_glob))
         })
     }
 }

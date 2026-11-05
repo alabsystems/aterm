@@ -300,6 +300,11 @@ struct ConnState {
     /// It asked to be gap-fenced (`Request::FenceGaps`), on a broker that offers it: only
     /// then does a refused publish of it fence its later ones ([`ConnState::fences`]).
     fence_asked: bool,
+    /// The bytes of answers its client has read ([`SimStream`]'s read): where each answer ends
+    /// in the stream is this plus what [`ConnState::out`] holds once it is there.
+    read: u64,
+    /// The refusals for the rate in [`ConnState::out`], each until its client reads past it.
+    rate_marks: VecDeque<RateMark>,
 }
 
 impl ConnState {
@@ -315,8 +320,35 @@ impl ConnState {
             told: None,
             fences: BTreeMap::new(),
             fence_asked: false,
+            read: 0,
+            rate_marks: VecDeque::new(),
         }
     }
+
+    /// `rate`, the refusal for the rate whose frame [`ConnState::out`] ends with now.
+    fn mark_rate(&mut self, rate: Option<RateMark>) {
+        if let Some(mut mark) = rate {
+            mark.end = self.read + self.out.len() as u64;
+            self.rate_marks.push_back(mark);
+        }
+    }
+
+    /// Every held answer, sent ([`ConnState::held`]).
+    fn send_held(&mut self) {
+        while let Some(h) = self.held.pop_front() {
+            self.out.extend(h.frame);
+            self.mark_rate(h.rate);
+        }
+    }
+}
+
+/// A REFUSAL FOR THE RATE ON ITS WAY TO ITS CLIENT (critic item E06): the producer it refused,
+/// the wait it named, and the byte of its connection's stream it ends at.
+#[derive(Clone, Copy, Debug)]
+struct RateMark {
+    end: u64,
+    producer: u64,
+    wait_ms: u64,
 }
 
 /// One answer the broker holds ([`ConnState::held`]).
@@ -326,6 +358,8 @@ struct Held {
     ack_of: Option<u64>,
     /// The framed answer.
     frame: Vec<u8>,
+    /// A refusal for the rate's ([`RateMark`]).
+    rate: Option<RateMark>,
 }
 
 /// What one tail was TOLD of the records retention gave up below it, as astream's
@@ -470,7 +504,147 @@ pub(crate) struct State {
     /// Every retire since the world last read them: `(its offset, its subject, the
     /// newest record's body it took out of the index)` ([`Broker::take_retired`]).
     retired: Vec<(u64, String, Vec<u8>)>,
+    /// THE RATE LIMIT every open sets (critic item E06), as `aterm link broker` sets
+    /// `broker_rules::rate_limit` ([`Broker::limit_every_open`]; `None`: none).
+    pub(crate) limit_at_open: Option<astream_broker::RateLimit>,
+    /// Its buckets, since the open ([`Limiter`]).
+    limiter: Limiter,
+    /// Publishes the limit refused since the open, each counted where astream counts it
+    /// (`BrokerStats::rate_limited`, a count of the open's): one behind a fence included.
+    pub(crate) rate_limited: u64,
+    /// And in every open of the run.
+    pub(crate) rate_limited_total: u64,
+    /// The refusal for the rate the request being served made, until [`State::answer`] puts it
+    /// on its connection ([`RateMark`]).
+    rate_pending: Option<RateMark>,
+    /// `(process, producer) -> until`, in ms: a refusal for the rate the process READ, and the
+    /// end of the wait it named from the read, capped at the bridge's
+    /// [`crate::rate_hold::PRODUCER_HOLD_MAX`] ([`State::rate_laws`]).
+    rate_read: BTreeMap<(u64, u64), u64>,
+    /// THE LAW OF THE LIMIT'S WAIT (critic item E06): a process that has read a refusal for the
+    /// rate publishes nothing more of its producer before the wait it named is over, capped at
+    /// [`crate::rate_hold::PRODUCER_HOLD_MAX`] (a byte bucket's wait may be hours: its sender
+    /// waits it, the producer's other sessions go on). What it had sent before it read one is
+    /// in flight, and refused or landed as the bucket says. Retried at once, the refused post
+    /// meets the empty bucket again ([`Broker::take_rate_laws`]).
+    rate_laws: Vec<String>,
+    /// The world's clock at the request being served, in ms ([`SimStream`]'s write).
+    now_ms: u64,
     notes: Vec<String>,
+}
+
+/// ASTREAM'S PER-PRODUCER TOKEN BUCKET (`broker.rs`'s `RateLimiterState`, critic item E06), on
+/// the world's clock: a bucket of records and one of `subject + body` bytes, each in thousandths,
+/// refilled by the time since the producer's last publish and capped at its burst, a record past
+/// the byte burst refused at every try. A refusal spends nothing and names the wait to the next
+/// token (`retry-after-ms=`). NOT modelled: astream's cap of 4,096 buckets held at once.
+#[derive(Debug, Default)]
+struct Limiter {
+    limit: Option<astream_broker::RateLimit>,
+    buckets: BTreeMap<u64, Bucket>,
+    clock_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Bucket {
+    records: u64,
+    bytes: u64,
+    last_ms: u64,
+}
+
+impl Limiter {
+    fn new(limit: Option<astream_broker::RateLimit>) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
+
+    /// astream's `set_limit`: none clears every bucket; a limit caps each at its bursts, its
+    /// refill since its last use given up.
+    fn set(&mut self, limit: Option<astream_broker::RateLimit>, now_ms: u64) {
+        self.clock_ms = self.clock_ms.max(now_ms);
+        self.limit = limit;
+        match limit {
+            None => self.buckets.clear(),
+            Some(lim) => {
+                for b in self.buckets.values_mut() {
+                    b.records = b.records.min(lim.burst_records * 1_000);
+                    b.bytes = b.bytes.min(lim.burst_bytes * 1_000);
+                    b.last_ms = b.last_ms.max(self.clock_ms);
+                }
+            }
+        }
+    }
+
+    /// One publish of `producer`'s, `wire` bytes, at `now_ms`: `Err((retry_ms, why))` refused.
+    fn acquire(
+        &mut self,
+        producer: u64,
+        wire: usize,
+        now_ms: u64,
+    ) -> Result<(), (u64, &'static str)> {
+        self.clock_ms = self.clock_ms.max(now_ms);
+        let now = self.clock_ms;
+        let Some(lim) = self.limit else {
+            return Ok(());
+        };
+        let wait = |deficit: u64, per_sec: u64| deficit.div_ceil(per_sec).max(1);
+        let wire = wire.max(1) as u64;
+        if lim.bytes_per_sec > 0 && wire > lim.burst_bytes {
+            return Err((
+                wait((wire - lim.burst_bytes) * 1_000, lim.bytes_per_sec),
+                "record bytes exceed burst_bytes",
+            ));
+        }
+        let cur = self.buckets.get(&producer).copied().unwrap_or(Bucket {
+            records: lim.burst_records * 1_000,
+            bytes: lim.burst_bytes * 1_000,
+            last_ms: now,
+        });
+        let elapsed = now.saturating_sub(cur.last_ms);
+        let records = cur
+            .records
+            .saturating_add(elapsed.saturating_mul(lim.records_per_sec))
+            .min(lim.burst_records * 1_000);
+        let bytes = if lim.bytes_per_sec > 0 {
+            cur.bytes
+                .saturating_add(elapsed.saturating_mul(lim.bytes_per_sec))
+                .min(lim.burst_bytes * 1_000)
+        } else {
+            0
+        };
+        let refilled = Bucket {
+            records,
+            bytes,
+            last_ms: now,
+        };
+        if records < 1_000 {
+            self.buckets.insert(producer, refilled);
+            return Err((
+                wait(1_000 - records, lim.records_per_sec),
+                "record rate exceeded",
+            ));
+        }
+        let cost = wire * 1_000;
+        if lim.bytes_per_sec > 0 && bytes < cost {
+            self.buckets.insert(producer, refilled);
+            return Err((wait(cost - bytes, lim.bytes_per_sec), "byte rate exceeded"));
+        }
+        self.buckets.insert(
+            producer,
+            Bucket {
+                records: records - 1_000,
+                bytes: if lim.bytes_per_sec > 0 {
+                    bytes - cost
+                } else {
+                    0
+                },
+                last_ms: now,
+            },
+        );
+        Ok(())
+    }
 }
 
 /// A SESSION REVIVED BETWEEN A SWEEP'S READ AND ITS RETIRE: when the node's conditional
@@ -587,6 +761,12 @@ pub(crate) enum ArmMutant {
     NoNameBound,
     /// A refused subscribe leaves its connection open.
     RefusedSubscribeLives,
+    /// No publish is refused for the rate, whatever limit the broker was set (critic item E06).
+    NoRateLimit,
+    /// A publish behind its producer's gap fence neither spends a token nor is counted refused.
+    RateSkipsTheFenced,
+    /// A publish refused for the rate latches no gap fence on a connection that asked.
+    RateLatchesNoFence,
 }
 
 /// One visible record as the oracle reads it: `(offset, subject, body, producer key)`.
@@ -683,6 +863,14 @@ impl Broker {
                 journal: None,
                 revive: None,
                 retired: Vec::new(),
+                limit_at_open: Some(crate::broker_rules::rate_limit()),
+                limiter: Limiter::new(Some(crate::broker_rules::rate_limit())),
+                rate_limited: 0,
+                rate_limited_total: 0,
+                rate_pending: None,
+                rate_read: BTreeMap::new(),
+                rate_laws: Vec::new(),
+                now_ms: 0,
                 notes: Vec::new(),
             }),
         }
@@ -693,6 +881,36 @@ impl Broker {
     fn retaining(self, rules: Option<Retention>) -> Self {
         self.retain(rules);
         self
+    }
+
+    /// LIMIT BY `limit` at every open from this one on (`None`: never), as `aterm link broker`
+    /// does (`broker_rules::limit`, critic item E06): set now, every bucket full.
+    pub(crate) fn limit_every_open(&self, limit: Option<astream_broker::RateLimit>) {
+        let mut s = lock(&self.state);
+        s.limit_at_open = limit;
+        s.limiter = Limiter::new(limit);
+    }
+
+    /// THE RATE LIMIT SET NOW, until the next open (astream's `Broker::set_rate_limit`).
+    pub(crate) fn set_rate_limit(&self, limit: Option<astream_broker::RateLimit>) {
+        let mut s = lock(&self.state);
+        let now = s.now_ms;
+        s.limiter.set(limit, now);
+    }
+
+    /// Publishes the limit refused since the open (astream's `BrokerStats::rate_limited`).
+    pub(crate) fn rate_limited(&self) -> u64 {
+        lock(&self.state).rate_limited
+    }
+
+    /// Publishes the limit refused in every open of the run.
+    pub(crate) fn rate_limited_total(&self) -> u64 {
+        lock(&self.state).rate_limited_total
+    }
+
+    /// What broke the law of the limit's wait since the last take ([`State::rate_laws`]).
+    pub(crate) fn take_rate_laws(&self) -> Vec<String> {
+        std::mem::take(&mut lock(&self.state).rate_laws)
     }
 
     /// RETAIN BY `rules` at every open from this one on (`None`: never), as `aterm link
@@ -856,9 +1074,7 @@ impl Broker {
         let mut sent = 0;
         for c in s.conns.values_mut().filter(|c| c.open) {
             sent += c.held.len();
-            for h in c.held.drain(..) {
-                c.out.extend(h.frame);
-            }
+            c.send_held();
         }
         if sent > 0 {
             s.notes.push(format!("broker answers {sent} held"));
@@ -1038,6 +1254,9 @@ impl Broker {
         for i in latest {
             s.fire_will(i);
         }
+        // So is the rate limit, its buckets the open's own, every one full.
+        s.limiter = Limiter::new(s.limit_at_open);
+        s.rate_limited = 0;
         // The rules are set after the open's own writes, as aterm sets them.
         let older = instead.is_some();
         let rules = instead.or_else(|| s.retain.clone()).filter(|_| !unretained);
@@ -1795,6 +2014,7 @@ impl State {
             conns,
             holds,
             held_total,
+            rate_pending,
             ..
         } = self;
         let Some(c) = conns.get_mut(&conn) else {
@@ -1805,6 +2025,14 @@ impl State {
                 Response::PublishAck { offset, .. } => Some(*offset),
                 _ => None,
             };
+            let rate = match r {
+                Response::Error { code, .. }
+                    if *code == astream_broker::proto::ERR_RATE_LIMITED =>
+                {
+                    rate_pending.take()
+                }
+                _ => None,
+            };
             let hold = !c.held.is_empty()
                 || (ack_of.is_some() && holds.as_mut().is_some_and(|rng| rng.chance(1, 3)));
             if hold {
@@ -1813,10 +2041,12 @@ impl State {
                 c.held.push_back(Held {
                     ack_of,
                     frame: Vec::from(frame),
+                    rate,
                 });
                 *held_total += 1;
             } else {
                 put(&mut c.out, r);
+                c.mark_rate(rate);
             }
         }
     }
@@ -2218,14 +2448,16 @@ impl State {
                 } else {
                     astream_broker::Lineage::from_steps(&self.lineage)
                 },
-                // astream's whole set, as its `Hello` says it: the broker times and the stats
-                // (astream 93ec213) are asked for by no bridge, and answered here as not simulated.
+                // astream's whole set, as its `Hello` says it: the broker times, the stats, the burst
+                // marks and the relay are asked for by no bridge, and answered here as not simulated.
                 requests: Some(
                     astream_broker::REQUEST_RETIRE
                         | astream_broker::REQUEST_GAP_NOTICES
                         | astream_broker::REQUEST_TOLD_FETCH
                         | astream_broker::REQUEST_BROKER_TIMES
                         | astream_broker::REQUEST_STATS
+                        | astream_broker::REQUEST_BURST_MARKS
+                        | astream_broker::REQUEST_RELAY
                         | if self.gap_fences {
                             astream_broker::REQUEST_GAP_FENCES
                         } else {
@@ -2314,6 +2546,40 @@ impl State {
                 // A retire is no producer's write in sequence: astream neither fences nor
                 // latches one.
                 let fenced = subject != astream_broker::RETIRE_SUBJECT;
+                let pid = self.conns.get(&conn).map_or(0, |c| c.pid);
+                if let Some(until) = self
+                    .rate_read
+                    .get(&(pid, producer_id))
+                    .copied()
+                    .filter(|until| fenced && self.now_ms < *until)
+                {
+                    self.rate_laws.push(format!(
+                        "rate: pid {pid} published {producer_id}:{producer_seq} {subject} {} ms \
+                         before the wait of a refusal for the rate it had read was over",
+                        until - self.now_ms
+                    ));
+                }
+                // THE RATE LIMIT is astream's connection thread's, after the subject's check and
+                // ahead of the writer's fence and dedup (critic item E06): a publish behind a
+                // fence, or a resend the dedup answers, spends a token or is counted refused,
+                // and the fence answers the one behind it.
+                let limited = if fenced
+                    && subject_error(&subject).is_none()
+                    && self.mutant != ArmMutant::NoRateLimit
+                    && !(self.mutant == ArmMutant::RateSkipsTheFenced
+                        && self.fence_of(conn, producer_id, producer_seq).is_some())
+                {
+                    let now = self.now_ms;
+                    self.limiter
+                        .acquire(producer_id, subject.len() + body.len(), now)
+                        .err()
+                } else {
+                    None
+                };
+                if limited.is_some() {
+                    self.rate_limited += 1;
+                    self.rate_limited_total += 1;
+                }
                 if let Some(fence) = self
                     .fence_of(conn, producer_id, producer_seq)
                     .filter(|_| fenced)
@@ -2327,6 +2593,27 @@ impl State {
                         msg: astream_broker::sticky_fence::format_gap_fenced_msg(
                             fence,
                             producer_seq,
+                        ),
+                    }];
+                }
+                if let Some((retry_ms, why)) = limited {
+                    self.notes.push(format!(
+                        "publish c{conn} seq={producer_seq} {subject} rate-limited \
+                         retry={retry_ms}ms"
+                    ));
+                    if self.mutant != ArmMutant::RateLatchesNoFence {
+                        self.fence_on(conn, producer_id, producer_seq, false);
+                    }
+                    self.rate_pending = Some(RateMark {
+                        end: 0,
+                        producer: producer_id,
+                        wait_ms: retry_ms,
+                    });
+                    return vec![Response::Error {
+                        code: astream_broker::proto::ERR_RATE_LIMITED,
+                        msg: format!(
+                            "{}{retry_ms} ({why})",
+                            astream_broker::proto::RATE_LIMITED_PREFIX
                         ),
                     }];
                 }
@@ -2832,6 +3119,8 @@ pub(crate) struct SimStream {
 impl Read for SimStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let broker = &self.process.core.broker;
+        // The world's clock, read before the broker's lock: when a refusal for the rate is read.
+        let now_ms = u64::try_from(self.process.core.elapsed().as_millis()).unwrap_or(u64::MAX);
         let mut s = lock(&broker.state);
         let up = s.up;
         let (mut out_empty, open, sub) = match s.conns.get(&self.conn) {
@@ -2891,9 +3180,7 @@ impl Read for SimStream {
                     if trying {
                         *tries_not_yet += 1;
                     } else {
-                        for h in c.held.drain(..) {
-                            c.out.extend(h.frame);
-                        }
+                        c.send_held();
                         out_empty = false;
                     }
                 }
@@ -2914,6 +3201,19 @@ impl Read for SimStream {
         let n = buf.len().min(c.out.len());
         for (slot, byte) in buf.iter_mut().zip(c.out.drain(..n)) {
             *slot = byte;
+        }
+        c.read += n as u64;
+        let pid = c.pid;
+        let mut read = Vec::new();
+        while c.rate_marks.front().is_some_and(|m| m.end <= c.read) {
+            read.extend(c.rate_marks.pop_front());
+        }
+        let cap =
+            u64::try_from(crate::rate_hold::PRODUCER_HOLD_MAX.as_millis()).unwrap_or(u64::MAX);
+        for mark in read {
+            let until = now_ms.saturating_add(mark.wait_ms.min(cap));
+            let had = s.rate_read.entry((pid, mark.producer)).or_insert(until);
+            *had = (*had).max(until);
         }
         Ok(n)
     }
@@ -2987,8 +3287,11 @@ impl std::io::Write for SimStream {
         for payload in frames {
             self.process.step("bus-before");
             let req = decode_request(&payload);
+            // The world's clock, read before the broker's lock: what its rate limit refills by.
+            let now_ms = u64::try_from(self.process.core.elapsed().as_millis()).unwrap_or(u64::MAX);
             {
                 let mut s = lock(&self.process.core.broker.state);
+                s.now_ms = now_ms;
                 let subscribing = matches!(
                     req,
                     Some(Request::Subscribe { .. } | Request::SubscribeGroup { .. })

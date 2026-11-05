@@ -556,10 +556,22 @@ impl Vm {
     /// Boot it with no window, the share read-only, and wait for the guest agent ([`ATTEMPT`] at a
     /// time).
     pub(crate) fn boot(&mut self) -> Result<(), Fail> {
+        use std::os::unix::fs::OpenOptionsExt as _;
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&self.log)
+            .and_then(|f| {
+                if f.metadata()?.is_file() {
+                    Ok(f)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "not a regular file",
+                    ))
+                }
+            })
             .map_err(|e| format!("{}: {e}", self.log.display()))?;
         let err = log.try_clone().map_err(|e| format!("tart run log: {e}"))?;
         let child = aterm_uds::spawnfd::command(&self.tart)
@@ -828,7 +840,8 @@ struct Build {
 impl Build {
     fn start(run: &Path) -> Result<Build, Fail> {
         let json = run.join("build.json");
-        let out = std::fs::File::create(&json).map_err(|e| format!("{}: {e}", json.display()))?;
+        let out = crate::util::create_stdio_file(&json)
+            .map_err(|e| format!("{}: {e}", json.display()))?;
         let mut args = vec!["--unverified", "bench", "--quiet", "--profile", "test"];
         args.extend(BENCHES.iter().flat_map(|(package, _)| ["-p", *package]));
         args.extend([
@@ -1108,7 +1121,8 @@ pub fn cmd_dmg(args: &[String]) -> Res {
                 "the build named no dmg_acceptance bench of {package}"
             ))
         })?;
-        std::fs::copy(exe, share.join(name)).map_err(|e| format!("{}: {e}", exe.display()))?;
+        crate::util::copy_regular_file(exe, share.join(name))
+            .map_err(|e| format!("{}: {e}", exe.display()))?;
     }
     vm.sh(
         &format!(

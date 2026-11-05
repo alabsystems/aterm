@@ -4,7 +4,7 @@
 //! Native Linux worker and immutable handoff to the one release cutter.
 
 use aterm_uds::spawnfd::{Command, command};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -144,9 +144,9 @@ pub fn static_verifier_file(
     size: u64,
     sha256: &str,
 ) -> Result<(), String> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|e| format!("inspect {}: {e}", path.display()))?;
-    if !metadata.file_type().is_file() || metadata.len() != size {
+    let (file, metadata) = crate::durable::open_regular_file_with_meta(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    if metadata.len() != size {
         return Err(format!(
             "Linux bootstrap verifier is not a regular file of the claimed size: {}",
             path.display()
@@ -157,8 +157,8 @@ pub fn static_verifier_file(
             .unwrap_or(0)
             .saturating_add(1),
     );
-    open_regular_nonblock(path)
-        .and_then(|file| file.take(pin::MAX_ASSET + 1).read_to_end(&mut bytes))
+    file.take(pin::MAX_ASSET + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
     target.validate_elf_header(bytes.get(..64).unwrap_or(&bytes))?;
     if !names_no_interpreter(&bytes) {
@@ -315,9 +315,11 @@ pub fn write_pin(root: &Path, record: &pin::Record) -> Result<Pin, String> {
     let script = record.pin().rewrite(&read(&install)?)?;
     let body = record.to_toml();
     let pinned = pin::check(&script, Some(&body), &ledger)?;
-    fs::write(&install, script).map_err(|e| format!("{}: {e}", install.display()))?;
+    crate::durable::write_atomic_durable(&install, script.as_bytes(), 0o755)
+        .map_err(|e| format!("{}: {e}", install.display()))?;
     let at = root.join(pin::RECORD);
-    fs::write(&at, body).map_err(|e| format!("{}: {e}", at.display()))?;
+    crate::durable::write_atomic_durable(&at, body.as_bytes(), 0o644)
+        .map_err(|e| format!("{}: {e}", at.display()))?;
     Ok(pinned)
 }
 
@@ -416,12 +418,6 @@ fn pair_is_current(
 ) -> bool {
     let name = target.asset_name(version);
     let receipt = directory.join(format!("{name}.handoff.toml"));
-    let Ok(metadata) = fs::symlink_metadata(&receipt) else {
-        return false;
-    };
-    if !metadata.file_type().is_file() || metadata.len() > 65536 {
-        return false;
-    }
     let Ok(text) = crate::durable::read_regular_text(&receipt, 65536) else {
         return false;
     };
@@ -761,20 +757,28 @@ impl Artifact {
     }
 
     pub fn verify_file(&self, path: &Path) -> Result<(), String> {
-        let metadata =
-            fs::symlink_metadata(path).map_err(|e| format!("inspect {}: {e}", path.display()))?;
-        if !metadata.file_type().is_file() || metadata.len() != self.size {
+        let (mut file, metadata) = crate::durable::open_regular_file_with_meta(path)
+            .map_err(|e| format!("open {}: {e}", path.display()))?;
+        if metadata.len() != self.size {
             return Err(format!(
                 "Linux artifact is not a regular file of the claimed size: {}",
                 path.display()
             ));
         }
         let mut header = [0u8; 64];
-        open_regular_nonblock(path)
-            .and_then(|mut file| file.read_exact(&mut header))
-            .map_err(|e| e.to_string())?;
+        file.read_exact(&mut header).map_err(|e| e.to_string())?;
         target(&self.target)?.validate_elf_header(&header)?;
-        if sha256_file(path)? != self.sha256 {
+        let mut hasher = aterm_digest::Sha256::new();
+        hasher.update(header);
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        if aterm_codec::hex::encode_lower(&hasher.finalize()) != self.sha256 {
             return Err(format!("Linux artifact hash changed: {}", path.display()));
         }
         Ok(())
@@ -944,20 +948,25 @@ impl Handoff {
             let target = target(requested)?;
             let name = target.asset_name(version);
             let receipt_path = self.directory.join(format!("{name}.handoff.toml"));
-            let metadata = fs::symlink_metadata(&receipt_path).map_err(|_| format!(
-                "Linux worker output missing for {}. On that native host at commit {commit}, run: \
-                 targo --unverified ship linux-build --version {version} --build-number {build} \
-                 --commit {commit} --out <handoff-directory>; copy its pair into {} and resume the \
-                 cut (or name the host with --linux-worker on the next cut, and the cutter runs it)",
-                target.triple(), self.directory.display()))?;
-            if !metadata.file_type().is_file() || metadata.len() > 65536 {
-                return Err("unsafe or oversized Linux handoff receipt".into());
-            }
-            let artifact: Artifact = aterm_toml::from_str(
-                &crate::durable::read_regular_text(&receipt_path, 65536)
-                    .map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| format!("parse Linux handoff: {e}"))?;
+            let receipt_text = match crate::durable::read_regular_text(&receipt_path, 65536) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(format!(
+                        "Linux worker output missing for {}. On that native host at commit {commit}, run: \
+                         targo --unverified ship linux-build --version {version} --build-number {build} \
+                         --commit {commit} --out <handoff-directory>; copy its pair into {} and resume the \
+                         cut (or name the host with --linux-worker on the next cut, and the cutter runs it)",
+                        target.triple(),
+                        self.directory.display()
+                    ));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(e.to_string());
+                }
+                Err(_) => return Err("unsafe or oversized Linux handoff receipt".into()),
+                Ok(text) => text,
+            };
+            let artifact: Artifact = aterm_toml::from_str(&receipt_text)
+                .map_err(|e| format!("parse Linux handoff: {e}"))?;
             artifact.validate(version, build, commit)?;
             if artifact.target != target.triple() {
                 return Err("Linux handoff architecture does not match its filename".into());
@@ -1006,7 +1015,7 @@ impl Handoff {
             let target = target(requested)?;
             let name = pin::asset_name(version, target.arch());
             let receipt_path = self.directory.join(format!("{name}.handoff.toml"));
-            match fs::symlink_metadata(&receipt_path) {
+            let receipt_text = match crate::durable::read_regular_text(&receipt_path, 65536) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     println!(
                         "==> no static bootstrap verifier for {}: this release publishes none \
@@ -1015,17 +1024,16 @@ impl Handoff {
                     );
                     continue;
                 }
-                Err(e) => return Err(format!("inspect {}: {e}", receipt_path.display())),
-                Ok(metadata) if !metadata.file_type().is_file() || metadata.len() > 65536 => {
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(e.to_string());
+                }
+                Err(_) => {
                     return Err("unsafe or oversized Linux bootstrap verifier receipt".into());
                 }
-                Ok(_) => {}
-            }
-            let verifier: VerifierArtifact = aterm_toml::from_str(
-                &crate::durable::read_regular_text(&receipt_path, 65536)
-                    .map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| format!("parse Linux bootstrap verifier receipt: {e}"))?;
+                Ok(text) => text,
+            };
+            let verifier: VerifierArtifact = aterm_toml::from_str(&receipt_text)
+                .map_err(|e| format!("parse Linux bootstrap verifier receipt: {e}"))?;
             verifier.validate(version, build, commit)?;
             if verifier.target != target.triple() {
                 return Err(
@@ -1160,10 +1168,7 @@ fn private_directory(_path: &Path) -> Result<(), String> {
 fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
     let temp = destination.with_extension(format!("stage-{}", std::process::id()));
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
+    let mut output = crate::durable::open_create_new(&temp)
         .map_err(|e| format!("create Linux artifact stage: {e}"))?;
     let result = (|| {
         std::io::copy(
@@ -1257,8 +1262,10 @@ pub fn run_worker(
     }
     let compiler_hash = sha256_file(&compiler)?;
     let driver_hash = sha256_file(&driver)?;
-    let provenance_hash = sha256_file(&provenance)?;
     let provenance_text = crate::durable::read_text(&provenance).map_err(|e| e.to_string())?;
+    let mut provenance_digest = aterm_digest::Sha256::new();
+    provenance_digest.update(provenance_text.as_bytes());
+    let provenance_hash = aterm_codec::hex::encode_lower(&provenance_digest.finalize());
     let seal_field = |key: &str| -> Result<String, String> {
         let prefix = format!("{key}=");
         let values: Vec<_> = provenance_text
@@ -1339,6 +1346,7 @@ pub fn run_worker(
             "Linux executable does not report the exact clean source/build/target identity".into(),
         );
     }
+    let (sha256, size) = crate::dmg::sha256_and_size(&binary)?;
     let artifact = Artifact {
         schema: 1,
         version: version.into(),
@@ -1346,8 +1354,8 @@ pub fn run_worker(
         commit: commit.into(),
         target: native.triple().into(),
         asset: name.clone(),
-        sha256: sha256_file(&binary)?,
-        size: fs::metadata(&binary).map_err(|e| e.to_string())?.len(),
+        sha256,
+        size,
         source_fingerprint: take.snapshot.digest.clone(),
         compiler_sha256: compiler_hash,
         driver_sha256: driver_hash,
@@ -1387,10 +1395,7 @@ pub fn run_worker(
 
 /// A receipt at `path`, written once and synced.
 fn write_receipt(path: &Path, text: &str) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+    let mut file = crate::durable::open_create_new(path)
         .map_err(|e| format!("create {}: {e}", path.display()))?;
     file.write_all(text.as_bytes())
         .and_then(|()| crate::durable::sync_all(&file))
@@ -1439,6 +1444,7 @@ fn build_bootstrap_verifier(
         ));
     }
     let name = pin::asset_name(version, native.arch());
+    let (sha256, size) = crate::dmg::sha256_and_size(&binary)?;
     let verifier = VerifierArtifact {
         schema: 1,
         version: version.into(),
@@ -1446,8 +1452,8 @@ fn build_bootstrap_verifier(
         commit: commit.into(),
         target: native.triple().into(),
         asset: name.clone(),
-        sha256: sha256_file(&binary)?,
-        size: fs::metadata(&binary).map_err(|e| e.to_string())?.len(),
+        sha256,
+        size,
         source_fingerprint: take.snapshot.digest.clone(),
         compiler_version: super::stable_rustc_version()?,
     };

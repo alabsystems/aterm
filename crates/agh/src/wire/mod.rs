@@ -468,6 +468,8 @@ pub struct WireRequest<'a> {
     /// pipeline live and under every tape. A replay loads no credential, so `auth` is `None`
     /// there, and this field still names the profile the recording spoke as.
     pub(crate) as_profile: Option<&'a str>,
+    /// A typed atomic-ref call's exact-body capability, absent for raw requests.
+    pub(crate) atomic_refs: Option<&'a crate::github::refs::AtomicRefWrite>,
 }
 
 impl<'a> WireRequest<'a> {
@@ -490,6 +492,7 @@ impl<'a> WireRequest<'a> {
             permit: None,
             body_digest: None,
             as_profile: None,
+            atomic_refs: None,
         }
     }
 }

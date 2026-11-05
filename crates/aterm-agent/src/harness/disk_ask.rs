@@ -3012,16 +3012,13 @@ pub fn lock_within(dir: &Path, ladder: &[Duration]) -> io::Result<Option<LeaseLo
         use std::os::windows::fs::OpenOptionsExt as _;
         opts.custom_flags(super::win::FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = opts.open(dir.join(LOCK_FILE))?;
+    let file: std::fs::File = aterm_uds::kept_out(|| opts.open(dir.join(LOCK_FILE)))?;
     #[cfg(unix)]
-    {
-        if !file.metadata()?.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "lease lock is not a regular file",
-            ));
-        }
-        aterm_uds::keep_out_of_children(&file)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lease lock is not a regular file",
+        ));
     }
     let mut pauses = ladder.iter();
     loop {
@@ -3104,8 +3101,9 @@ pub struct Line<'a> {
     pub projected: Option<Projection>,
 }
 
-/// The harness's mark and whose fact the line is.
-const HEAD: &str = concat!(harness_mark!(), " aterm: ");
+/// The head of every [`line`]: the harness's mark, whose fact the line is, and its volume, aterm's
+/// own words where a person's gesture leaves it unsent in the composer (`upgrade::own_draft`).
+pub const LINE_HEAD: &str = concat!(harness_mark!(), " aterm: the volume this tab works on (");
 
 /// What is safe to remove, a constant.
 const SAFE: &str = "Free what nobody uses: builds you no longer need (`targo clean` in their \
@@ -3199,7 +3197,7 @@ fn said_within(l: &Line<'_>, pct: u64, below: &str, why: &str, cap: usize) -> St
     let volume = plain(&l.mount.display().to_string()).unwrap_or_else(|| UNSAID_VOLUME.to_owned());
     let said_on = |volume: &str, named: &str| {
         format!(
-            "{HEAD}the volume this tab works on ({volume}) is {pct}% full, {} free, {below}, and \
+            "{LINE_HEAD}{volume}) is {pct}% full, {} free, {below}, and \
              {why}.{named} {SAFE} {CONFIRM} (rule {RULE_DISK_FREE})",
             human_bytes(l.free),
         )

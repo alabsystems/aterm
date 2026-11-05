@@ -1808,6 +1808,47 @@ fn every_face_says_a_hold_and_a_need_where_its_harness_explains() {
     }
 }
 
+/// A LANDED CHIP SAYS THE NEED WAITS ON THE PERSON, AS ITS TITLE DOES (the post-landing review,
+/// 2026-11-02): the description speaks the entry's own tail ([`crate::needs::NeedTail`], the one
+/// source the title's `need_head` reads), so a need beside a landing is heard as waiting, not as
+/// work that goes on. Negative control: `need_spoken`'s literal `Carrying on.` (`origin/main`
+/// `21b1e42025`) speaks "Carrying on." where the title says "waits on you".
+#[test]
+fn a_landed_chip_speaks_its_needs_own_tail() {
+    use crate::needs::{HarnessAsk, NeedTail};
+    let glass = told(TaskFace::Landed);
+    let face = ChipFace::of(AutopilotView::Land, &glass);
+    assert_eq!(face, ChipFace::Landed);
+    for (tail, not) in [
+        (NeedTail::WaitsOnYou, NeedTail::CarryingOn),
+        (NeedTail::CarryingOn, NeedTail::WaitsOnYou),
+    ] {
+        let (said, not) = (tail.sentence(), not.sentence());
+        let ask = HarnessAsk {
+            first: "rotate the deploy key".to_string(),
+            more: 0,
+            others: Vec::new(),
+            program: aterm_phase::Program::Claude,
+            tail,
+            entry_first: None,
+        };
+        let words = TitleWords {
+            need: Some(&ask),
+            ..TitleWords::default()
+        };
+        let spoken = autopilot_description(face, &glass, words, Some(TODAY), None)
+            .expect("a landed chip speaks");
+        assert!(
+            spoken.ends_with(&format!("Needs you: rotate the deploy key. {said}")),
+            "{tail:?}: {spoken}"
+        );
+        assert!(!spoken.contains(&not), "{tail:?}: {spoken}");
+        let (title, _) = autopilot_title(AutopilotView::Land, &glass, "", Some(TODAY), words);
+        assert!(title.contains(tail.words()), "{tail:?} title: {title}");
+        assert!(spoken.is_ascii(), "glyph-free: {spoken}");
+    }
+}
+
 #[test]
 fn a_need_in_the_title_keeps_its_cut_marks() {
     use crate::harness_glass::PauseGlass;
@@ -1819,6 +1860,7 @@ fn a_need_in_the_title_keeps_its_cut_marks() {
         others: Vec::new(),
         program: aterm_phase::Program::Claude,
         tail: crate::needs::NeedTail::CarryingOn,
+        entry_first: None,
     };
     let written = crate::needs::HarnessAsk {
         first: "sign 0.48.0, last: the release credential, on this Mac, click: approve".to_string(),

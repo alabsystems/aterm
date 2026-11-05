@@ -1968,6 +1968,9 @@ impl App {
         let Some(wid) = self.frontmost_window else {
             return Err("no window".into());
         };
+        if self.window_shows_private(wid) {
+            return Err(crate::app_control::PRIVATE_VIEW_REFUSED.into());
+        }
         if matches!(
             action,
             PointerAction::Move { .. }
@@ -2526,7 +2529,7 @@ impl App {
 
     fn band_banner_at(&self, wid: WindowId, px: f64, py: f64) -> Option<bool> {
         let paste_up = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid);
-        let close_up = self.close_banner.as_ref().is_some_and(|p| p.wid == wid);
+        let close_up = self.close_band(wid).is_some();
         if !(paste_up || close_up) {
             return None;
         }
@@ -4638,7 +4641,7 @@ impl App {
         let Some(session) = self.pool.get(owner.session) else {
             return;
         };
-        crate::app_input::write_ui_report(
+        crate::app_input::write_ui_pointer_report(
             &session.term,
             &session.ctx.modes,
             &session.ctx.sink,
@@ -4654,6 +4657,7 @@ impl App {
                 suppress_copy_on_select: false,
                 px_off: owner.px_off,
             },
+            &session.ctx.ui_waiting,
         );
     }
 
@@ -5256,9 +5260,15 @@ impl App {
         };
         #[cfg(target_os = "linux")]
         if pressed && button == WinitMouseButton::Middle {
-            let tracking = self
-                .route_term(wid, press_route)
-                .is_some_and(|t| term_lock(&t).mouse_tracking_enabled());
+            let tracking = self.route_term(wid, press_route).is_some_and(|t| {
+                let tl = match self.pool.ui_waiting_of(&t) {
+                    Some(waiting) => {
+                        crate::term_lock_ui(&t, &waiting, crate::metrics::TermWaitSite::Mouse)
+                    }
+                    None => term_lock(&t),
+                };
+                tl.mouse_tracking_enabled()
+            });
             if !tracking {
                 if self.front_pane_for_local_press(wid, press_route) {
                     self.paste_primary_into(wid);
@@ -5302,8 +5312,13 @@ impl App {
                 Some(session) => self.pool.shown_term(session),
                 None => self.route_term(wid, press_route),
             };
+            let ui_waiting = term.as_ref().and_then(|t| self.pool.ui_waiting_of(t));
             let (tracking, selection) = term.as_ref().map_or((false, None), |t| {
-                let tl = term_lock(t);
+                let site = crate::metrics::TermWaitSite::Mouse;
+                let tl = match &ui_waiting {
+                    Some(waiting) => crate::term_lock_ui(t, waiting, site),
+                    None => term_lock(t),
+                };
                 (
                     tl.mouse_tracking_enabled() && rewound.is_none(),
                     tl.selection_to_string().filter(|s| !s.is_empty()),
@@ -5352,7 +5367,13 @@ impl App {
                     }
                     if let (Some(text), Some(t)) = (selection, term.as_ref()) {
                         let _ = control::pbcopy(&text);
-                        term_lock(t).text_selection_mut().clear();
+                        let site = crate::metrics::TermWaitSite::Mouse;
+                        let mut tl = match &ui_waiting {
+                            Some(waiting) => crate::term_lock_ui(t, waiting, site),
+                            None => term_lock(t),
+                        };
+                        tl.text_selection_mut().clear();
+                        drop(tl);
                         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
                         {
                             w.request_redraw();
@@ -5429,13 +5450,15 @@ impl App {
         }
         let mut click_count: u8 = 1;
         if button == WinitMouseButton::Left {
-            let Some(term) = self
+            let Some((term, ui_waiting)) = self
                 .front_terminal(wid)
-                .map(|terminal| terminal.term.clone())
+                .map(|terminal| (terminal.term.clone(), terminal.ui_waiting.clone()))
             else {
                 return native_press;
             };
-            let tracking = term_lock(&term).mouse_tracking_enabled();
+            let tracking =
+                crate::term_lock_ui(&term, &ui_waiting, crate::metrics::TermWaitSite::Mouse)
+                    .mouse_tracking_enabled();
             let option_held = mods_state.alt_key();
             if pressed && press_starts_selection(tracking, tracking_bypass_held(mods_state)) {
                 // Cmd-click (macOS) / Ctrl-click (elsewhere) on a link opens it (safe
@@ -5776,11 +5799,13 @@ impl App {
         else {
             return;
         };
-        let Some((term, modes)) = self
-            .pool
-            .get(session)
-            .map(|owner| (owner.term.clone(), owner.ctx.modes.clone()))
-        else {
+        let Some((term, modes, ui_waiting)) = self.pool.get(session).map(|owner| {
+            (
+                owner.term.clone(),
+                owner.ctx.modes.clone(),
+                owner.ctx.ui_waiting.clone(),
+            )
+        }) else {
             return;
         };
         if self.rewrap_in_flight(session) {
@@ -5801,7 +5826,8 @@ impl App {
         let viewport = if same {
             None
         } else {
-            let t = term_lock(&term);
+            let site = crate::metrics::TermWaitSite::Mouse;
+            let t = crate::term_lock_ui(&term, &ui_waiting, site);
             if crate::input::wheel_route_for(&t, mods) != crate::input::WheelRoute::Viewport {
                 return;
             }

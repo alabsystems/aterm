@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn only_a_complete_measure_only_failure_can_be_accepted() {
-        let report = "ok fmt\nok forge\nok libc\nok lint\nok census\nok doc\nok test\nok gpu-oracle\nok spec\nok checkers\nok appkit\nFAIL measure\nverify: FAIL — measure failed; 11 ok in 40m\n";
+        let report = "ok fmt\nok forge\nok libc\nok lint\nok census\nok doc\nok test\nok spec\nok appkit\nFAIL measure\nverify: FAIL — measure failed; 9 ok in 40m\n";
         assert!(report_is_measure_only(report));
         assert!(!report_is_measure_only(
             &report.replace("ok test", "FAIL test")

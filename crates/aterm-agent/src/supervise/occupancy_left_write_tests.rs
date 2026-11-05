@@ -1145,14 +1145,19 @@ fn a_line_left_with_its_caret_home_stands() {
 }
 
 /// A LINE LEFT THEN CLEARED SETTLES UNDER A SUGGESTION AT HOME (the review of `367dfeea26`, on base as
-/// well): a wait nudge left unsent, then gone, a grey suggestion at home in its place, on one row with
-/// the cursor home or a row under it, or on two rows. Every reader of that screen calls it no draft (the
-/// loop's and the door's `composer_draft`, each upgrade gate), so it settles as cleared and the next
-/// due line is typed. A line standing past its text asks no cell, however long it stands.
-/// NEGATIVE CONTROLS: `left_seen` answering by `typed_draft_in`, which takes the two rows and the row
-/// under for typed with no cell asked, as on `367dfeea26`, and those arms never settle, the next line
-/// never typed; `left_seen` asking the door's cell whatever the rows say, and a standing line asks one
-/// cell at each look.
+/// well; finding 7 of the review of the draft-hold work): a wait nudge left unsent, then gone, a grey
+/// suggestion at home in its place, on one row with the cursor home or a row under it. Home, its first
+/// glyph's cell is Claude Code's drawn caret (inverse) and the next dim, as measured
+/// (`docs/measured/composer-cells-2026-11-03.md`); a row under, the caret is drawn there and the glyph
+/// reads dim. Every reader of that screen calls it no draft (the loop's and the door's
+/// `composer_draft`, each upgrade gate), so it settles as cleared and the next due line is typed. A
+/// line standing past its text asks no cell, however long it stands. No suggestion wraps (measured
+/// there too), so none on two rows is read.
+/// NEGATIVE CONTROLS: `left_seen` answering by `typed_draft_in`, which takes the row under for typed
+/// with no cell asked, as on `367dfeea26`, and that arm never settles, the next line never typed;
+/// `left_seen` asking the door's cell whatever the rows say, and a standing line asks one cell at each
+/// look; `composer_glyph_cell` reading the inverse caret's cell for the glyph's, and the home arm never
+/// settles.
 #[test]
 fn a_line_left_then_cleared_settles_under_a_suggestion_at_home() {
     let line = templates::wait_nudge(31 * MIN);
@@ -1161,12 +1166,14 @@ fn a_line_left_then_cleared_settles_under_a_suggestion_at_home() {
         .iter()
         .position(|r| r.starts_with("❯ keep"))
         .expect("the caret");
-    let mut two = lone.clone();
-    two.insert(caret + 1, "  and then the rest of it".to_string());
-    for (what, shown, row) in [
-        ("one row, home", lone.clone(), caret),
-        ("two rows, home", two, caret),
-        ("one row, a row under", lone.clone(), caret + 1),
+    let home = [
+        ((caret, 2), "OK k 111318 d0d0d0 inverse"),
+        ((caret, 3), "OK e 999999 111318 dim"),
+    ];
+    let under = [((caret, 2), "OK k 999999 111318 dim")];
+    for (what, row, cells) in [
+        ("one row, home", caret, &home[..]),
+        ("one row, a row under", caret + 1, &under[..]),
     ] {
         let at_s = vec![0, 31 * 60, 32 * 60, 33 * 60, 60 * 60, 90 * 60];
         let script = Script {
@@ -1185,10 +1192,12 @@ fn a_line_left_then_cleared_settles_under_a_suggestion_at_home() {
                 submits(s, 5);
             }
             if i == 3 {
-                s.ctl.m.screens = vec![shown.clone()];
+                s.ctl.m.screens = vec![lone.clone()];
                 s.ctl.m.served = 0;
-                s.ctl.m.cell_attrs = "dim";
-                s.ctl.m.dim_past = true;
+                s.ctl.m.cells = cells
+                    .iter()
+                    .map(|(at, r)| (*at, (*r).to_string()))
+                    .collect();
                 s.ctl.m.cursor_on_caret = false;
                 s.ctl.m.cursor_row = Some(row);
                 s.ctl.m.screen_cols.insert(0, 2);

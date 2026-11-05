@@ -48,6 +48,18 @@ pub(crate) struct Counter {
 }
 
 impl Counter {
+    /// The scopes completed so far, unless a count overflowed.
+    #[cfg(test)]
+    pub(crate) fn calls(&self) -> Option<u64> {
+        self.calls.value()
+    }
+
+    /// The work the completed scopes counted, unless one counted none or the sum overflowed.
+    #[cfg(test)]
+    pub(crate) fn work(&self) -> Option<u64> {
+        self.work.value()
+    }
+
     fn finish(&self, from: Stamp, to: Stamp, work: Option<u64>) {
         self.calls.add(Some(1));
         self.work.add(work);
@@ -87,9 +99,11 @@ pub(crate) struct Costs {
     pub(crate) parse: Counter,
     pub(crate) record: Counter,
     pub(crate) witness: Counter,
+    /// The readers' rekey captures of the live engine (`capture_keyframe` in `SpineMark::rekey`), each one capture. A slice's rekey runs inside its `record` scope; a host step's (`SpineMark::flush_host`) runs outside it, as does the closing witness such a rekey sends.
+    pub(crate) rekey: Counter,
     pub(crate) apply: Counter,
-    pub(crate) mint: Counter,
-    pub(crate) commit: Counter,
+    /// The shared writer's idle judging passes, their work the slice bytes each folded.
+    pub(crate) judge: Counter,
 }
 
 impl Costs {
@@ -100,7 +114,7 @@ impl Costs {
             recording_cost_clock_scope=cpu_includes_boundary_probes,wall_excludes_them \
             recording_cost_reader_lock_scope=acquisition_only \
             recording_cost_parse_scope=launch_process_call \
-            recording_cost_nesting=ingest(copy,reader_lock,parse,record(witness));writer(apply,mint,commit)",
+            recording_cost_nesting=ingest(copy,reader_lock,parse,record(witness,rekey));writer(apply,judge)",
         );
         self.ingest.fields(&mut out, "ingest", "input_bytes");
         self.copy.fields(&mut out, "copy", "input_bytes");
@@ -108,9 +122,9 @@ impl Costs {
         self.parse.fields(&mut out, "parse", "input_bytes");
         self.record.fields(&mut out, "record", "input_bytes");
         self.witness.fields(&mut out, "witness", "attempts");
+        self.rekey.fields(&mut out, "rekey", "captures");
         self.apply.fields(&mut out, "apply", "messages");
-        self.mint.fields(&mut out, "mint", "plan_steps");
-        self.commit.fields(&mut out, "commit", "attempts");
+        self.judge.fields(&mut out, "judge", "bytes");
         out
     }
 }
@@ -128,6 +142,12 @@ impl Default for Owner {
 }
 
 impl Owner {
+    /// Costs kept whatever the opt-in reads, for a test that reads them.
+    #[cfg(test)]
+    pub(crate) fn on() -> Self {
+        Self(Some(Arc::default()))
+    }
+
     pub(crate) fn handle(&self) -> Option<Arc<Costs>> {
         self.0.clone()
     }
@@ -165,6 +185,13 @@ pub(crate) struct Scope<'a, F: FnMut(bool) -> Stamp> {
     from: Stamp,
     work: Option<u64>,
     probe: F,
+}
+
+impl<F: FnMut(bool) -> Stamp> Scope<'_, F> {
+    /// Count `work` for this scope instead of what it began with: for a scope whose work is known only once it ran.
+    pub(crate) const fn set_work(&mut self, work: Option<u64>) {
+        self.work = work;
+    }
 }
 
 impl<F: FnMut(bool) -> Stamp> Drop for Scope<'_, F> {

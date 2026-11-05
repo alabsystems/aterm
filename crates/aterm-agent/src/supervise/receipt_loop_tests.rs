@@ -705,3 +705,75 @@ fn the_same_reply_again_marks_failed_and_types_nothing_new() {
     assert!(marks.is_empty(), "{marks:?}");
     assert_eq!(turns, 2, "{lines:#?}");
 }
+
+/// What the loop asked for at the weekly wall two days off ([`weekly_limited`], the test clock's
+/// Sep 17 against its Sep 19 reset), with the record `task` under `policy`: its marks, how many
+/// turns it typed, and the attention it set.
+fn run_at_far_wall(
+    tag: &str,
+    task: Option<(u64, String)>,
+    policy: impl FnOnce(SupervisorConfig) -> SupervisorConfig,
+) -> (Vec<String>, usize, Vec<String>, Vec<String>) {
+    let root = crate::supervise::ScratchDir::new("usage-wall", tag);
+    let host = Receipts::over(on_main(HEAD), None);
+    let mut m = mock(vec![busy_screen(), weekly_limited()], Vec::new());
+    m.task = task;
+    let base = opts_for(&host, None);
+    let opts = SuperviseOpts {
+        tasks: Some(root.join(tag)),
+        policy: policy(base.policy.clone()),
+        ..base
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |_| {});
+    let marks = m
+        .task_requests
+        .iter()
+        .filter(|r| r.starts_with("task mark "))
+        .cloned()
+        .collect();
+    let told = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("meta set attention"))
+        .cloned()
+        .collect();
+    (marks, count(&m, "turn"), told, lines)
+}
+
+/// A MANAGED WORKER'S USAGE WALL PAST THE HORIZON ENDS ITS WORK AND TELLS NO PERSON (owner,
+/// 2026-11-04: the claim workers sat a day at a weekly wall, their tabs blocked on screen): the
+/// weekly limit two days off marks the record `failed why=usage-limit`, types nothing, and raises
+/// no `limited:` badge, also where `resume_limits` is off. NEGATIVE CONTROL: the same wall in a
+/// session with no task record marks nothing and types nothing, and with `resume_limits` off,
+/// where its decision types nothing at the wall too, it is told the limit (`limited:`).
+#[test]
+fn a_managed_workers_far_usage_wall_marks_failed_and_tells_no_person() {
+    let limited = |told: &[String]| told.iter().any(|t| t.contains(ATTENTION_PREFIX));
+    for resumes in [true, false] {
+        let policy = |p: SupervisorConfig| SupervisorConfig {
+            resume_limits: resumes,
+            ..p
+        };
+        let tag = if resumes { "managed" } else { "managed-kept" };
+        let (marks, turns, told, lines) = run_at_far_wall(tag, working_task(), policy);
+        let [mark] = marks.as_slice() else {
+            panic!("resume_limits={resumes}: one mark: {marks:?}: {lines:#?}");
+        };
+        assert!(
+            mark.starts_with(&format!("task mark failed why={USAGE_LIMIT_WHY}")),
+            "{mark}"
+        );
+        assert_eq!(turns, 0, "resume_limits={resumes}: {lines:#?}");
+        assert!(!limited(&told), "resume_limits={resumes}: {told:?}");
+
+        let tag = if resumes { "person" } else { "person-kept" };
+        let (marks, turns, told, lines) = run_at_far_wall(tag, None, policy);
+        assert!(marks.is_empty(), "CONTROL {marks:?}");
+        assert_eq!(turns, 0, "CONTROL: {lines:#?}");
+        assert_eq!(
+            limited(&told),
+            !resumes,
+            "CONTROL resume_limits={resumes}: {told:?}"
+        );
+    }
+}

@@ -255,16 +255,17 @@ fn written(dir: &Path, since: SystemTime, times: Times) -> Option<PathBuf> {
         if at != dir && named("HEAD") && named("objects") && named("refs") {
             continue;
         }
-        let counted = times == Times::All || !meta.is_dir();
-        if counted && meta.modified().is_ok_and(|m| m >= since) {
+        let fresh = |m: &std::fs::Metadata| m.modified().is_ok_and(|t| t >= since);
+        if (times == Times::All || !meta.is_dir()) && fresh(&meta) {
             return Some(at);
         }
-        stack.extend(
-            children
-                .iter()
-                .filter(|e| e.file_name() != ".git")
-                .map(std::fs::DirEntry::path),
-        );
+        for e in children.into_iter().filter(|e| e.file_name() != ".git") {
+            if e.file_type().is_ok_and(|ft| ft.is_dir()) {
+                stack.push(e.path());
+            } else if e.metadata().as_ref().is_ok_and(fresh) {
+                return Some(e.path());
+            }
+        }
     }
     None
 }
@@ -617,13 +618,12 @@ fn in_main(git: &dyn Git, checkout: &Path, head: &str) -> Result<String, String>
 /// Whether a process holds the gate's machine lock in `dir`: `Some(true)` held, `Some(false)` free
 /// or no lock file, `None` unreadable.
 fn lock_held(dir: &Path) -> Option<bool> {
-    let file = match crate::metadata_io::open_regular(&dir.join("lock")) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
-        Err(_) => return None,
-    };
-    #[cfg(unix)]
-    let _ = aterm_uds::keep_out_of_children(&file);
+    let file: std::fs::File =
+        match aterm_uds::kept_out(|| crate::metadata_io::open_regular(&dir.join("lock"))) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
+            Err(_) => return None,
+        };
     #[expect(
         clippy::disallowed_methods,
         reason = "a probe of the retired gate's lock: let go at once below"

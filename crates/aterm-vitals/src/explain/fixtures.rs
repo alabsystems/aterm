@@ -499,6 +499,7 @@ pub fn tab(key: u64, shell_pid: u32) -> TabRoot {
         shell_pid,
         label: format!("Tab {key}"),
         program: String::new(),
+        agent_leader: None,
     }
 }
 

@@ -243,7 +243,8 @@ fn write_blocks(path: &Path, bytes: u64) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let mut f = opts.open(path)?;
     #[cfg(windows)]
@@ -251,6 +252,7 @@ fn write_blocks(path: &Path, bytes: u64) -> std::io::Result<()> {
     let chunk = vec![0xa5_u8; 1024 * 1024];
     let mut left = bytes;
     while left > 0 {
+        aterm_uds::progress::tick();
         let n = usize::try_from(left.min(chunk.len() as u64)).unwrap_or(chunk.len());
         f.write_all(&chunk[..n])?;
         left -= n as u64;
@@ -346,16 +348,13 @@ pub fn take_pass(path: &Path) -> std::io::Result<Option<PassLock>> {
         use std::os::windows::fs::OpenOptionsExt as _;
         opts.custom_flags(super::win::FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file: std::fs::File = opts.open(path)?;
+    let file: std::fs::File = aterm_uds::kept_out(|| opts.open(path))?;
     #[cfg(unix)]
-    {
-        if !file.metadata()?.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "pass lock is not a regular file",
-            ));
-        }
-        aterm_uds::keep_out_of_children(&file)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pass lock is not a regular file",
+        ));
     }
     #[cfg(windows)]
     {

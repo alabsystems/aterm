@@ -460,6 +460,24 @@ pub enum Ime {
     Disabled,
 }
 
+/// Where a window input event came from, as the application classified the native event it was
+/// generated from (`platform::macos::set_window_input_classifier`).
+///
+/// LOCAL PATCH (aterm): added. The window layer retains the application's verdict through
+/// deferred delivery and assigns it no input authority. The variants are ordered by how little
+/// they vouch for a person's hand, so `max` of two is the one a composed result keeps.
+#[derive(Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub enum InputOrigin {
+    /// No process posted it: a person's hand, or a callback no native input event caused.
+    #[default]
+    Person,
+    /// Another process posted it into the window (`CGEventPost`, System Events, a remote or
+    /// on-screen keyboard): a person may have relayed it, or a program made it.
+    Relayed,
+    /// The application posted it itself, for one of its control clients.
+    Posted,
+}
+
 /// Describes touch-screen input state.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 pub enum TouchPhase {

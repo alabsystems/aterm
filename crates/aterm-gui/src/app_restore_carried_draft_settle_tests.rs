@@ -40,6 +40,7 @@ fn settings_window(drafts: &[(&str, &str)]) -> WindowLayout {
             focused_path: Vec::new(),
             zoomed: false,
             parked: false,
+            ephemeral: false,
         }],
     }
 }

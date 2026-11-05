@@ -297,7 +297,7 @@ impl Captures {
                     })
                     .and_then(|bytes| {
                         let here = dir.join(file);
-                        std::fs::write(&here, &bytes)
+                        crate::util::write_fresh(&here, &bytes)
                             .map_err(|e| format!("{}: {e}", here.display()))
                             .map(|()| here)
                     })

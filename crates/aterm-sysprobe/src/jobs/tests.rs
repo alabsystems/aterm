@@ -2013,3 +2013,49 @@ fn exiting_reads_a_running_child_and_this_process_as_not_exiting() {
     assert_eq!(exiting(std::process::id()), Some(false), "this process");
     assert_eq!(exiting(99_999_999), None, "a pid no process holds");
 }
+
+/// A child is listed while it lives and gone once reaped; a pid no process holds lists none.
+#[cfg(target_os = "macos")]
+#[test]
+fn child_pids_lists_a_live_child_until_it_is_reaped() {
+    let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep starts");
+    let pid = child.id();
+    let live = child_pids(std::process::id());
+    let _ = child.kill();
+    let _ = child.wait();
+    let reaped = child_pids(std::process::id());
+    let live = live.expect("this process's children read");
+    assert!(live.contains(&pid), "{pid} missing from {live:?}");
+    assert!(live.windows(2).all(|w| w[0] < w[1]), "sorted: {live:?}");
+    let reaped = reaped.expect("this process's children read");
+    assert!(!reaped.contains(&pid), "{pid} still listed: {reaped:?}");
+    assert_eq!(child_pids(0), None, "no pid 0");
+}
+
+/// A process's counters read whole: its own CPU and its peak footprint, and a child it reaped
+/// adds that child's time to its reaped children's; a pid no process holds, and pid 0, read none.
+#[cfg(target_os = "macos")]
+#[test]
+fn counters_of_reads_a_process_and_grows_by_the_child_it_reaped() {
+    let before = counters_of(std::process::id()).expect("this process's counters");
+    assert!(
+        before.peak_footprint.is_some_and(|peak| peak > 0),
+        "{before:?}"
+    );
+    let status = aterm_uds::spawnfd::command("/bin/sh")
+        .args(["-c", "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done"])
+        .status()
+        .expect("the shell runs");
+    assert!(status.success());
+    let after = counters_of(std::process::id()).expect("this process's counters");
+    assert!(
+        after.child_cpu_ns > before.child_cpu_ns,
+        "the reaped child's time: {before:?} then {after:?}"
+    );
+    assert!(after.cpu_ns >= before.cpu_ns);
+    assert_eq!(counters_of(99_999_999), None, "a pid no process holds");
+    assert_eq!(counters_of(0), None, "no pid 0");
+}

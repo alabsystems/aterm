@@ -327,6 +327,56 @@ fn prefilled_foreign_backlog_cannot_replace_the_parents_endpoint() {
     leave(&plan);
 }
 
+/// A stopped or unscheduled instance stops accepting and its queue fills, and a full queue refuses
+/// (macOS) or sleeps a blocking connect (Linux). Another launch's sweep and an explicit bind on the
+/// same path must both leave it alone, until the owner lock says it has gone.
+#[test]
+fn a_live_owner_that_refuses_connects_keeps_its_socket_token_and_entries() {
+    use aterm_session::LaunchNonce;
+    use std::os::fd::AsRawFd;
+    let (_dir, plan) = fixture();
+    let sock_dir = control_auth::dir_of_socket(&plan.sock_path);
+    let (sid, nonce) = (SessionId::generate(), LaunchNonce::generate());
+    let mut bound = bind_control_listener(&plan, None, |_| true, |_| false, None).unwrap();
+    let owner = bound.take_owner();
+    assert!(owner.is_some(), "a bound instance holds its socket");
+    let (listener, _token) = bound.into_parts();
+    crate::proxy::write_graph_entry(&sock_dir, &sid, &plan.sock_path, &nonce);
+    // SAFETY: this test owns the listener whose accept queue it shrinks.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+    let queued: Vec<_> = (0..128)
+        .filter_map(|_| control_auth::connect_socket_nonblocking(&plan.sock_path).ok())
+        .collect();
+    assert!(
+        control_auth::connect_socket_nonblocking(&plan.sock_path).is_err(),
+        "PRECONDITION: the owner's queue is full"
+    );
+    let before = std::fs::read(&plan.token_path).unwrap();
+    let entry = || crate::proxy::read_graph_entry(&sock_dir, crate::proxy::sid_of(&sid));
+
+    assert!(control_auth::socket_is_live(&plan.sock_path));
+    crate::proxy::sweep_stale_graph(&sock_dir);
+    assert!(entry().is_some(), "the sweep kept a live owner's entry");
+    assert!(
+        bind_control_listener(&plan, None, |_| true, |_| false, None).is_none(),
+        "an explicit launch runs socketless rather than take the path"
+    );
+    assert_eq!(std::fs::read(&plan.token_path).unwrap(), before);
+
+    drop((queued, listener, owner));
+    assert!(
+        !control_auth::socket_is_live(&plan.sock_path),
+        "with the owner gone, the refusing file is stale"
+    );
+    crate::proxy::sweep_stale_graph(&sock_dir);
+    assert!(entry().is_none(), "and the sweep removes its entry");
+    let (again, _token) = bind_control_listener(&plan, None, |_| true, |_| false, None)
+        .unwrap()
+        .into_parts();
+    drop(again);
+    leave(&plan);
+}
+
 #[test]
 fn a_failed_handoff_bind_never_retries_over_a_foreign_full_backlog() {
     use std::os::fd::AsRawFd;

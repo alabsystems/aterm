@@ -357,14 +357,13 @@ impl Store {
             open.mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
         }
-        let file = open.open(self.dir.join(LOCK_FILE))?;
+        let file: std::fs::File = aterm_uds::kept_out(|| open.open(self.dir.join(LOCK_FILE)))?;
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "ai.lock is not a regular file",
             ));
         }
-        aterm_uds::keep_out_of_children(&file)?;
         loop {
             #[expect(
                 clippy::disallowed_methods,

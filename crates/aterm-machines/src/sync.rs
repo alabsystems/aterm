@@ -562,9 +562,11 @@ pub enum PeersDone {
 
 /// What the pass reads and changes, each through one port so a test runs it inert.
 pub trait Ports: Sync {
-    /// Lower this pass's scheduling to background work ([`background_self`]): a runner a window
-    /// or the subscriber spawned does not inherit their QoS, so it lowers its own as it starts.
-    fn background(&self);
+    /// Hold this pass's scheduling as background work as it starts, `trigger`'s pass where its
+    /// starter ran it: a runner a window or the subscriber spawned does not inherit their QoS
+    /// class, and the subscriber's leaves its band (`aterm_secrets::converge::runner`), so it
+    /// lowers its own.
+    fn background(&self, trigger: Trigger);
     /// Whether this process runs as its account's own login, in its home (not root, a private
     /// state root or another home): a pass refuses otherwise, as `aterm init` does.
     fn own_account(&self) -> bool;
@@ -878,17 +880,6 @@ pub trait Ports: Sync {
     /// # Errors
     /// It could not be started or waited for.
     fn run_elsewhere(&self, program: &Path, args: &[String]) -> Result<Option<i32>, String>;
-}
-
-/// Lower the calling thread, and the threads it starts after, to the utility QoS class (macOS;
-/// elsewhere nothing): the pass is work nobody waits on, so it yields to a person's typing.
-pub fn background_self() {
-    #[cfg(target_os = "macos")]
-    // SAFETY: sets this thread's own QoS class. Takes no pointers and mutates no shared state,
-    // so there is nothing for another thread to observe.
-    unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
-    }
 }
 
 /// One sync kind's item over [`Ports`].

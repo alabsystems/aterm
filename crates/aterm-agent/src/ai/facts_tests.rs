@@ -2129,3 +2129,261 @@ fn held_by_rows_are_excluded_from_due_next_and_next_sign_in() {
         "held comes first, and is not next"
     );
 }
+
+/// `aterm ai login` TAKES NO ROW OF ANOTHER MAC'S (`ATERM-KI-1105-9`): what it signs in next, a
+/// pool's `next` and `next_sign_in` and Claude Code's `next_sign_in`, leaves out a row whose account
+/// the sheet gives m22, since nobody named it and that command also runs with nobody at the Mac.
+/// `CONTROL`: the sheet naming this Mac.
+#[test]
+fn the_next_sign_in_is_never_another_macs_account() {
+    use crate::harness::accounts;
+    let sheet = |home: &Path, computer: &str, cells: &str| {
+        let secrets = home.join(".secrets");
+        aterm_types::fs_restricted::ensure_private_dir(&secrets).expect("secrets");
+        std::fs::write(
+            secrets.join(crate::harness::accounts_sync::ACCOUNTS_CSV_FILE),
+            format!(
+                "m,email,computer,,claude,Open AI,xai,kimi,google,meta,Payment,notes\n\
+                 ,other@example.test,{computer},,{cells},,,,\n"
+            ),
+        )
+        .expect("sheet");
+    };
+
+    let pool = DoctorPool::new(true, None);
+    let work = pool.b.home.join(".aterm/logins/codex/work");
+    let other = pool.b.home.join(".aterm/logins/codex/other");
+    std::fs::write(
+        pool.config.join("aterm.toml"),
+        "[fleet]\nmachine = \"m16\"\n",
+    )
+    .expect("config");
+    std::fs::write(
+        &pool.roster,
+        format!(
+            "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {:?}\n\
+             email = \"work@example.test\"\n\n\
+             [[account]]\nlabel = \"other\"\nclass = \"dedicated\"\ndir = {:?}\n\
+             email = \"other@example.test\"\n",
+            work.display().to_string(),
+            other.display().to_string(),
+        ),
+    )
+    .expect("codex roster");
+    pool.state(|state| {
+        accounts::note_wall(
+            state,
+            "work",
+            "five_hour",
+            Some(DoctorPool::NOW + 3600),
+            DoctorPool::NOW,
+            DoctorPool::NOW,
+        );
+    });
+    let next = |computer: &str| {
+        sheet(&pool.b.home, computer, ",1,,");
+        let facts = pool.facts();
+        let p = facts.pool.expect("codex pool");
+        (p.next, p.next_sign_in)
+    };
+    let (next_row, next_sign_in) = next("m16");
+    assert_eq!(next_row.as_deref(), Some("other"), "CONTROL: this Mac's");
+    assert_eq!(
+        next_sign_in.as_deref(),
+        Some("other"),
+        "CONTROL: this Mac's"
+    );
+    assert_eq!(next("m22"), (None, None), "another Mac's");
+
+    let b = machine(&["claude"]);
+    let now = 1_800_000_000_i64;
+    let h_state = b.dir.path().join("harness-state");
+    let store = accounts::Store::at(&h_state);
+    let other_dir = store.login_dir("other").expect("other dir");
+    std::fs::create_dir_all(&other_dir).expect("mkdir other");
+    let roster_path = b.dir.path().join("accounts.toml");
+    std::fs::write(
+        b.dir.path().join("aterm.toml"),
+        "[fleet]\nmachine = \"m16\"\n",
+    )
+    .expect("config");
+    let roster_toml = format!(
+        "[[account]]\nlabel = \"own\"\nclass = \"dedicated\"\nemail = \"own@example.test\"\n\n\
+         [[account]]\nlabel = \"other\"\nclass = \"dedicated\"\ndir = {:?}\n\
+         email = \"other@example.test\"\n",
+        other_dir.display().to_string(),
+    );
+    std::fs::write(&roster_path, &roster_toml).expect("roster");
+    let mut note = None;
+    store
+        .transact_logins(now, &mut note, |state, _| {
+            let _ = accounts::note_wall(state, "own", "weekly", Some(now + 86_400), now, now);
+            Ok(Vec::new())
+        })
+        .expect("wall");
+    let home_str = b.home.display().to_string();
+    let var = |k: &str| (k == "HOME").then(|| home_str.clone());
+    let m = Machine {
+        now,
+        home: Some(b.home.clone()),
+        var: &var,
+        pkg: Some(b.pkg.clone()),
+        exclude: Vec::new(),
+        records: Records::default(),
+        harness_state: Some(h_state.clone()),
+        roster: Some(roster_path.clone()),
+        accounts_mode: None,
+        config: None,
+    };
+    let next = |computer: &str| {
+        sheet(&b.home, computer, "1,,,");
+        gather(&m, &CLAUDE)
+            .accounts
+            .expect("accounts view")
+            .next_sign_in
+    };
+    assert_eq!(next("m16").as_deref(), Some("other"), "CONTROL: this Mac's");
+    assert_eq!(next("m22"), None, "another Mac's");
+}
+
+/// The refusal names the verb that signs that CLI's row in, which is `login` for Grok Build, whose
+/// renewal stops at a block page.
+#[test]
+fn another_macs_refusal_names_each_clis_own_sign_in() {
+    use crate::harness::accounts::Cli;
+    let words = |cli| another_macs_refusal(cli, "row", Some("m22")).expect("a refusal");
+    assert!(
+        words(Cli::Grok).contains("accounts login row"),
+        "{}",
+        words(Cli::Grok)
+    );
+    assert!(
+        words(Cli::Codex).contains("accounts renew row"),
+        "{}",
+        words(Cli::Codex)
+    );
+    assert_eq!(another_macs_refusal(Cli::Codex, "row", None), None);
+}
+
+/// `aterm ai login`'S FALLBACK IS NOT ANOTHER MAC'S EITHER: a roster with no row on the default
+/// login serves its first, as three Macs' do with `m22`, so with nothing else to sign in that row
+/// would be the target. It is refused instead, naming whose it is and the verb that borrows it,
+/// for Claude Code and a pool. `CONTROL`: a person's pin is that person naming the row, and the
+/// sheet naming this Mac leaves it the target.
+#[test]
+fn a_serving_row_of_another_macs_is_refused_unless_a_person_pinned_it() {
+    use crate::harness::accounts;
+    let sheet = |home: &Path, computer: &str, cells: &str| {
+        let secrets = home.join(".secrets");
+        aterm_types::fs_restricted::ensure_private_dir(&secrets).expect("secrets");
+        std::fs::write(
+            secrets.join(crate::harness::accounts_sync::ACCOUNTS_CSV_FILE),
+            format!(
+                "m,email,computer,,claude,Open AI,xai,kimi,google,meta,Payment,notes\n\
+                 ,other@example.test,{computer},,{cells},,,,\n"
+            ),
+        )
+        .expect("sheet");
+    };
+
+    let b = machine(&["claude"]);
+    let now = 1_800_000_000_i64;
+    let h_state = b.dir.path().join("harness-state");
+    let store = accounts::Store::at(&h_state);
+    let other_dir = store.login_dir("other").expect("other dir");
+    std::fs::create_dir_all(&other_dir).expect("mkdir other");
+    let roster_path = b.dir.path().join("accounts.toml");
+    std::fs::write(
+        b.dir.path().join("aterm.toml"),
+        "[fleet]\nmachine = \"m16\"\n",
+    )
+    .expect("config");
+    std::fs::write(
+        &roster_path,
+        format!(
+            "[[account]]\nlabel = \"other\"\nclass = \"dedicated\"\ndir = {:?}\n\
+             email = \"other@example.test\"\n",
+            other_dir.display().to_string(),
+        ),
+    )
+    .expect("roster");
+    let home_str = b.home.display().to_string();
+    let var = |k: &str| (k == "HOME").then(|| home_str.clone());
+    let m = Machine {
+        now,
+        home: Some(b.home.clone()),
+        var: &var,
+        pkg: Some(b.pkg.clone()),
+        exclude: Vec::new(),
+        records: Records::default(),
+        harness_state: Some(h_state.clone()),
+        roster: Some(roster_path.clone()),
+        accounts_mode: None,
+        config: None,
+    };
+    let view = |computer: &str| {
+        sheet(&b.home, computer, "1,,,");
+        let view = gather(&m, &CLAUDE).accounts.expect("accounts view");
+        (view.next_sign_in, view.sign_in_refused)
+    };
+    let (target, refused) = view("m16");
+    assert_eq!(target.as_deref(), Some("other"), "CONTROL: this Mac's");
+    assert_eq!(refused, None, "CONTROL: this Mac's");
+    let (target, refused) = view("m22");
+    assert_eq!(target, None);
+    let refused = refused.expect("a refusal");
+    assert!(
+        refused.contains("gives it to m22") && refused.contains("accounts renew other"),
+        "{refused}"
+    );
+    let mut note = None;
+    store
+        .transact_logins(now, &mut note, |state, _| {
+            state.active = Some("other".to_owned());
+            state.pinned = true;
+            Ok(Vec::new())
+        })
+        .expect("pin");
+    let (target, refused) = view("m22");
+    assert_eq!(target.as_deref(), Some("other"), "a person pinned it");
+    assert_eq!(refused, None, "a person pinned it");
+
+    let pool = DoctorPool::new(true, None);
+    let other = pool.b.home.join(".aterm/logins/codex/other");
+    std::fs::write(
+        pool.config.join("aterm.toml"),
+        "[fleet]\nmachine = \"m16\"\n",
+    )
+    .expect("config");
+    std::fs::write(
+        &pool.roster,
+        format!(
+            "[[account]]\nlabel = \"other\"\nclass = \"dedicated\"\ndir = {:?}\n\
+             email = \"other@example.test\"\n",
+            other.display().to_string(),
+        ),
+    )
+    .expect("codex roster");
+    let view = |computer: &str| {
+        sheet(&pool.b.home, computer, ",1,,");
+        let p = pool.facts().pool.expect("codex pool");
+        (p.next, p.sign_in_refused)
+    };
+    let (target, refused) = view("m16");
+    assert_eq!(target.as_deref(), Some("other"), "CONTROL: this Mac's");
+    assert_eq!(refused, None, "CONTROL: this Mac's");
+    let (target, refused) = view("m22");
+    assert_eq!(target, None);
+    let refused = refused.expect("a refusal");
+    assert!(
+        refused.contains("gives it to m22") && refused.contains("accounts renew other"),
+        "{refused}"
+    );
+    pool.state(|state| {
+        state.active = Some("other".to_owned());
+        state.pinned = true;
+    });
+    let (target, refused) = view("m22");
+    assert_eq!(target.as_deref(), Some("other"), "a person pinned it");
+    assert_eq!(refused, None, "a person pinned it");
+}

@@ -18,7 +18,7 @@ pub(super) fn before_commit() {
     });
 }
 
-struct ResetHook;
+pub(super) struct ResetHook;
 
 impl Drop for ResetHook {
     fn drop(&mut self) {
@@ -26,7 +26,7 @@ impl Drop for ResetHook {
     }
 }
 
-fn install_hook(hook: impl FnMut() + 'static) -> ResetHook {
+pub(super) fn install_hook(hook: impl FnMut() + 'static) -> ResetHook {
     BEFORE_COMMIT.with(|slot| {
         assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
     });
@@ -109,8 +109,9 @@ fn prepare(root: &Path, bounded: bool, store: &Store) -> Paths {
         &paths,
         &Config {
             source: Source::Path(paths.home.join("test.vault")),
+            mirrors: Vec::new(),
             name: "author-batch".into(),
-            signer: None,
+            signer: Some(envelope::signer_public(&[0x58; 32]).unwrap()),
             followed: Vec::new(),
             host: "m1".into(),
         },
@@ -234,5 +235,44 @@ fn complete_local_batches_accept_known_records_and_promote_children() {
         assert_eq!(on_disk.inventory(), after.inventory());
         // A wholly known batch is also a successful no-op, even though it adds no records.
         author(&paths, bounded, |_| Ok((batch.clone(), ()))).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "signed authoring observation measurement; run explicitly with --ignored --nocapture"]
+fn signed_authoring_observation_cost() {
+    use std::hint::black_box;
+    const SAMPLES: usize = 32;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (mut store, writer) = rooted();
+    for n in 1..=1024 {
+        if n > 1 {
+            let record = writer.name(store.log().unwrap(), 1_000 + n);
+            store.insert(record).unwrap();
+        }
+        if ![1, 128, 1024].contains(&n) {
+            continue;
+        }
+        for bounded in [false, true] {
+            let paths = prepare(&root.path().join(n.to_string()), bounded, &store);
+            super::super::retained_history::acknowledge(&paths, &store).unwrap();
+            let expected = store.log().unwrap().heads();
+            author(&paths, bounded, |_| Ok((Vec::new(), ()))).unwrap();
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                let (_, snapshot, ()) =
+                    black_box(author(&paths, bounded, |_| Ok((Vec::new(), ())))).unwrap();
+                samples.push(started.elapsed().as_nanos());
+                assert_eq!(snapshot.log().unwrap().heads(), expected);
+            }
+            samples.sort_unstable();
+            eprintln!(
+                "AUTHOR-OBSERVATION records={n} bounded={bounded} samples={SAMPLES} p50_ns={} p95_ns={} p99_ns={}",
+                samples[SAMPLES / 2],
+                samples[30],
+                samples[31],
+            );
+        }
     }
 }

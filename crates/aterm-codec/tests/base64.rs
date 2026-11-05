@@ -3,7 +3,10 @@
 
 //! Standard and strict base64 encoding and decoding tests.
 
-use aterm_codec::base64::{decode, decode_strict, encode, encode_into, encoded_len};
+use aterm_codec::base64::{
+    DecodeError, decode, decode_strict, decode_url, encode, encode_into, encode_url_into,
+    encoded_len,
+};
 use aterm_spec::rng::XorShift;
 
 /// Strict accepts `text` iff lenient decode succeeds and re-encoding reproduces `text`.
@@ -174,5 +177,63 @@ fn fuzz_both_directions() {
         let slen = rng.index(24);
         let text: Vec<u8> = (0..slen).map(|_| *rng.pick(NEAR)).collect();
         strict_is_canonical(&text);
+    }
+}
+
+fn url(raw: &[u8]) -> String {
+    let mut out = String::new();
+    encode_url_into(&mut out, raw).expect("encode within MAX_INPUT_LEN");
+    out
+}
+
+#[test]
+fn url_safe_spells_rfc4648_vectors_unpadded() {
+    for (raw, text) in [
+        (&b""[..], ""),
+        (b"f", "Zg"),
+        (b"fo", "Zm8"),
+        (b"foo", "Zm9v"),
+        (b"foob", "Zm9vYg"),
+        (b"fooba", "Zm9vYmE"),
+        (b"foobar", "Zm9vYmFy"),
+        (&[0xfb, 0xff][..], "-_8"),
+    ] {
+        assert_eq!(url(raw), text);
+        assert_eq!(decode_url(text).as_deref(), Ok(raw), "{text}");
+    }
+}
+
+#[test]
+fn url_safe_decodes_only_its_own_spelling() {
+    assert_eq!(decode_url("Zg=="), Err(DecodeError::InvalidByte(2, b'=')));
+    assert_eq!(decode_url("+_8"), Err(DecodeError::InvalidByte(0, b'+')));
+    assert_eq!(decode_url("-/8"), Err(DecodeError::InvalidByte(1, b'/')));
+    assert_eq!(decode_url("Zm9vY"), Err(DecodeError::InvalidLength(5)));
+    assert_eq!(
+        decode_url("Zh"),
+        Err(DecodeError::InvalidLastSymbol(1, b'h'))
+    );
+    assert_eq!(
+        decode_url("Zm9"),
+        Err(DecodeError::InvalidLastSymbol(2, b'9'))
+    );
+    assert_eq!(decode_url("Zg").as_deref(), Ok(&b"f"[..]), "control");
+
+    let mut rng = XorShift::new(0x0b64_0002);
+    for len in 0..96_usize {
+        let raw: Vec<u8> = (0..len).map(|_| rng.next_u64().to_le_bytes()[0]).collect();
+        let text = url(&raw);
+        assert!(!text.contains(['+', '/', '=']), "{text}");
+        assert_eq!(text.len(), (len * 4).div_ceil(3), "unpadded length");
+        assert_eq!(decode_url(&text).as_ref(), Ok(&raw), "{text}");
+        // The standard alphabet's spelling of the same bytes decodes only where it is the
+        // same text.
+        let standard = encode(&raw).expect("encodes");
+        let trimmed = standard.trim_end_matches('=');
+        assert_eq!(
+            decode_url(trimmed).is_ok(),
+            !trimmed.contains(['+', '/']),
+            "{trimmed}"
+        );
     }
 }

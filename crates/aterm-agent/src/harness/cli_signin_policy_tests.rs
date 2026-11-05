@@ -566,7 +566,10 @@ fn vendor_policy_is_rechecked_before_queued_authentication_starts() {
                 &host,
                 &world.store,
                 (rows.row("main").unwrap(), &world.path, &logins),
-                world.raw.rows[0].dir.as_deref(),
+                (
+                    world.raw.rows[0].dir.as_deref(),
+                    crate::harness::sign_in_ladder::asked_fixture(cli, "main"),
+                ),
                 &mut Vec::new(),
                 &mut Vec::new(),
             );
@@ -691,7 +694,10 @@ fn run_observation(world: &World, host: &ObservationHost<'_>) -> bool {
         host,
         &world.store,
         (rows.row("main").unwrap(), &world.path, &logins),
-        world.raw.rows[0].dir.as_deref(),
+        (
+            world.raw.rows[0].dir.as_deref(),
+            crate::harness::sign_in_ladder::asked_fixture(world.cli, "main"),
+        ),
         &mut Vec::new(),
         &mut Vec::new(),
     );

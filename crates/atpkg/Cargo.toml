@@ -66,7 +66,8 @@ libc = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
 # `fs_restricted::dir_safe_for_private_write` for the floor file's directory, shared with
-# the updater so the two agree on what "private" means.
+# the updater so the two agree on what "private" means; `reach`, the person's ports, which
+# a private aterm's toolset peers neither listen on nor dial (`peers`), the fleet's rule.
 aterm-types = { workspace = true }
 # The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin).
 aterm-time = { workspace = true }

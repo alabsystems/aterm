@@ -307,8 +307,44 @@ pub(crate) fn setup_area(setup: &Setup) -> Option<Area> {
                 .filter(|stage| stage.status == "stopped")
                 .map(|stage| stage.name.as_str())
                 .collect();
-            if stopped.is_empty() {
-                Area::ok(NAME, format!("finished ({} steps)", stages.len()))
+            let unfinished: Vec<&StageRow> = stages
+                .iter()
+                .filter(|stage| {
+                    !matches!(
+                        stage.status.as_str(),
+                        "ok" | "done" | "applied" | "not-applicable"
+                    )
+                })
+                .collect();
+            if !unfinished.is_empty() && stopped.is_empty() {
+                let automatic = unfinished
+                    .iter()
+                    .all(|stage| stage.name == "AI account provisioning");
+                let reasons: Vec<String> = unfinished
+                    .iter()
+                    .map(|stage| {
+                        if stage.detail.trim().is_empty() {
+                            stage.name.clone()
+                        } else {
+                            format!("{}: {}", stage.name, stage.detail)
+                        }
+                    })
+                    .collect();
+                Area::due(
+                    NAME,
+                    format!("unfinished: {}", reasons.join("; ")),
+                    if automatic { Who::Aterm } else { Who::Agent },
+                    if automatic {
+                        "automatic provisioning resumes when the synced account roster changes"
+                    } else {
+                        "aterm init"
+                    },
+                )
+            } else if stopped.is_empty() {
+                Area::ok(
+                    NAME,
+                    format!("selected setup completed ({} steps)", stages.len()),
+                )
             } else {
                 Area::off(
                     NAME,
@@ -361,6 +397,11 @@ pub(crate) fn membership_area(standing: &Standing, setup: &Setup) -> Area {
     let says = standing.line();
     match standing {
         Standing::Member(_) => Area::ok(NAME, says),
+        Standing::Seatless => Area::working(
+            NAME,
+            says,
+            "its vault subscriber asks a member for a seat with the keys it holds",
+        ),
         Standing::Allowed { fix: None, .. } => {
             Area::working(NAME, says, "the vault records this Mac by itself")
         }
@@ -804,58 +845,62 @@ pub(crate) fn agents_area(agents: &Agents) -> Area {
 /// `text` with every email address in it replaced by `<email>`: a word with a local part, an
 /// `@` and a dotted domain. `@self`, `user@host` and a lone `@` stay.
 pub(crate) fn scrub(text: &str) -> String {
-    let local = |c: char| c.is_ascii_alphanumeric() || "._%+-".contains(c);
-    let domain = |c: char| c.is_ascii_alphanumeric() || ".-".contains(c);
-    let chars: Vec<char> = text.chars().collect();
+    if !text.contains('@') {
+        return text.to_owned();
+    }
+    let local = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-');
+    let domain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-');
+    let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '@' {
-            let start = out
-                .char_indices()
-                .rev()
-                .take_while(|(_, c)| local(*c))
-                .last()
-                .map_or(out.len(), |(at, _)| at);
-            let end = chars[i + 1..]
+    while i < bytes.len() {
+        let Some(rel) = bytes[i..].iter().position(|&b| b == b'@') else {
+            out.push_str(&text[i..]);
+            break;
+        };
+        let at = i + rel;
+        out.push_str(&text[i..at]);
+        let start = out.len()
+            - out
+                .as_bytes()
                 .iter()
-                .position(|c| !domain(*c))
-                .map_or(chars.len(), |n| i + 1 + n);
-            let host: String = chars[i + 1..end].iter().collect();
-            let host = host.trim_end_matches('.');
-            let dotted = host
-                .split_once('.')
-                .is_some_and(|(name, tld)| !name.is_empty() && !tld.is_empty());
-            if start < out.len() && dotted {
-                out.truncate(start);
-                out.push_str("<email>");
-                i = i + 1 + host.chars().count();
-                continue;
-            }
+                .rev()
+                .take_while(|&&b| local(b))
+                .count();
+        let end = bytes[at + 1..]
+            .iter()
+            .position(|&b| !domain(b))
+            .map_or(bytes.len(), |n| at + 1 + n);
+        let host = text[at + 1..end].trim_end_matches('.');
+        let dotted = host
+            .split_once('.')
+            .is_some_and(|(name, tld)| !name.is_empty() && !tld.is_empty());
+        if start < out.len() && dotted {
+            out.truncate(start);
+            out.push_str("<email>");
+            i = at + 1 + host.len();
+        } else {
+            out.push('@');
+            i = at + 1;
         }
-        out.push(chars[i]);
-        i += 1;
     }
     out
 }
 
 /// The text report: one line an area, and its step under it.
 pub(crate) fn render_text(areas: &[Area]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::from("aterm status: this machine, read now (nothing was changed)\n");
     for area in areas {
-        out.push_str(&format!(
-            "{:<11} {:<8} {}\n",
+        let _ = writeln!(
+            out,
+            "{:<11} {:<8} {}",
             area.name,
             area.level.word(),
             area.says
-        ));
+        );
         if let Some(step) = &area.next {
-            out.push_str(&format!(
-                "{:<20} next, {}: {}\n",
-                "",
-                step.who.word(),
-                step.act
-            ));
+            let _ = writeln!(out, "{:<20} next, {}: {}", "", step.who.word(), step.act);
         }
     }
     scrub(&out)
@@ -908,11 +953,8 @@ fn bounded<T: Send + 'static>(
 fn read_setup() -> Setup {
     use aterm_cli::macos_doctor::{InitialSetupSnapshotError, initial_setup_snapshot_read_only};
     match initial_setup_snapshot_read_only() {
-        Ok(snapshot) => Setup::Read {
-            begun: snapshot.begun,
-            finished: snapshot.finished,
-            cancelled: snapshot.cancelled,
-            stages: snapshot
+        Ok(snapshot) => {
+            let mut stages: Vec<StageRow> = snapshot
                 .rows
                 .into_iter()
                 .map(|row| StageRow {
@@ -920,8 +962,35 @@ fn read_setup() -> Setup {
                     status: row.status,
                     detail: row.detail,
                 })
-                .collect(),
-        },
+                .collect();
+            if snapshot
+                .plan
+                .selection
+                .contains(aterm_types::macos_setup::Setting::Secrets)
+            {
+                let account = crate::doctor::ai_accounts_setup_observation();
+                stages.push(StageRow {
+                    name: "AI account provisioning".to_owned(),
+                    status: if matches!(
+                        account.standing,
+                        aterm_types::macos_setup::Standing::InPlace
+                            | aterm_types::macos_setup::Standing::NotNeeded
+                    ) {
+                        "applied"
+                    } else {
+                        "waiting"
+                    }
+                    .to_owned(),
+                    detail: account.note.unwrap_or_default(),
+                });
+            }
+            Setup::Read {
+                begun: snapshot.begun,
+                finished: snapshot.finished,
+                cancelled: snapshot.cancelled,
+                stages,
+            }
+        }
         Err(InitialSetupSnapshotError::Updating) => Setup::Changing,
         Err(InitialSetupSnapshotError::Newer) => Setup::Newer,
         Err(InitialSetupSnapshotError::Read(why)) => Setup::Unread(why),

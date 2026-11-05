@@ -9,7 +9,7 @@
 
 use super::super::eval::{self, MUTANT, Mutant, WEIGHINGS};
 use super::reach::live_shape;
-use super::weigh::{GENERATED, corpus, generated_log};
+use super::weigh::{corpus, generated_logs};
 use super::*;
 
 /// Every record `log` holds, the genesis first.
@@ -159,9 +159,9 @@ fn padded_logs() -> &'static [Padded] {
 /// the padded logs, each as its held records.
 fn every_log() -> Vec<(String, Vec<Record>)> {
     let mut logs: Vec<(String, Vec<Record>)> = corpus()
-        .into_iter()
-        .chain((1..=GENERATED).map(|seed| (format!("generated {seed}"), generated_log(seed))))
-        .map(|(name, log)| (name, held(&log)))
+        .iter()
+        .chain(generated_logs())
+        .map(|(name, log)| (name.clone(), held(log)))
         .collect();
     logs.push(("the live shape".into(), held(live_shape())));
     for Padded { name, padded, .. } in padded_logs() {
@@ -312,11 +312,8 @@ fn replay(log: &Log, every: usize, membership: bool) -> (Replayed, Log) {
 /// holds a weighing that differs from a fresh one and shares it where it should weigh again.
 #[test]
 fn a_log_weighs_again_only_after_it_holds_a_weighed_record() {
-    let logs = corpus()
-        .into_iter()
-        .chain((1..=GENERATED).map(|seed| (format!("generated {seed}"), generated_log(seed))));
-    for (name, log) in logs {
-        let (found, _) = replay(&log, 1, true);
+    for (name, log) in corpus().iter().chain(generated_logs()) {
+        let (found, _) = replay(log, 1, true);
         assert_eq!(found.weighings, found.weighed, "{name}");
         assert_eq!(
             (found.stale, found.kept_wrong, found.membership),

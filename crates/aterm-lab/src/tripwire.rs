@@ -3,7 +3,7 @@
 
 //! Keychain tripwire shim (`security`) that logs requests and never touches a keychain.
 
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 
 /// What one call asked: `(sub-command, account, service)`, `-` for one not given.
 #[must_use]
@@ -64,20 +64,28 @@ pub fn main(args: &[String]) -> i32 {
     let ts = crate::util::hms(crate::util::now_secs());
     let (pid, ppid) = (std::process::id(), crate::sys::getppid());
     let say = |via: &str, cmd: &str, acct: &str, svc: &str| {
+        use std::os::unix::fs::OpenOptionsExt as _;
         let line = format!(
             "{ts} {cmd} account=\"{acct}\" service=\"{svc}\" via={via} pid={pid} ppid={ppid}\n"
         );
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&log)
         {
             let _ = f.write_all(line.as_bytes());
         }
     };
     if args.first().map(String::as_str) == Some("-i") {
+        const MAX_STDIN_BYTES: u64 = 1 << 20;
         let mut last = 0;
-        for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+        for line in std::io::stdin()
+            .lock()
+            .take(MAX_STDIN_BYTES)
+            .lines()
+            .map_while(Result::ok)
+        {
             if line.is_empty() {
                 continue;
             }

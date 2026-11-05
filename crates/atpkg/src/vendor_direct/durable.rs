@@ -108,7 +108,7 @@ fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = opts.open(path)?;
     if !file.metadata()?.is_file() {
@@ -154,22 +154,8 @@ fn stage_with(
 }
 
 /// Create `tmp` exclusively: an existing file of that name is never written through.
-#[cfg(unix)]
 fn create_temp(tmp: &Path) -> io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .open(tmp)
-}
-
-#[cfg(not(unix))]
-fn create_temp(tmp: &Path) -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)
+    crate::platform::open_create_new_write(tmp, 0o644)
 }
 
 /// Read `path` as TOML of type `T`.

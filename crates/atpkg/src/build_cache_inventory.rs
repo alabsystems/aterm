@@ -75,6 +75,7 @@ fn walk(
     seen.newest = seen.newest.max(before.modified()?);
     let mut listing = fd::Dir::new(directory)?;
     while let Some(entry) = listing.next() {
+        aterm_uds::progress::tick();
         let entry = entry?;
         let name = entry.file_name();
         if matches!(name.to_bytes(), b"." | b"..") {
@@ -132,6 +133,7 @@ fn scan_with(root: &Path, mut left: usize, depth: usize) -> std::io::Result<Seen
         }
         seen.newest = seen.newest.max(before.modified()?);
         for entry in std::fs::read_dir(path)? {
+            aterm_uds::progress::tick();
             let entry = entry?;
             *left = left.checked_sub(1).ok_or_else(uncertain)?;
             if is_lock(&entry.file_name()) {
@@ -165,6 +167,20 @@ fn scan_with(root: &Path, mut left: usize, depth: usize) -> std::io::Result<Seen
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// AN INVENTORY SAYS IT IS STILL GOING: it reads up to a million entries, and one that says
+    /// nothing while it does reads as a hang to whatever waits on the pass.
+    #[test]
+    fn an_inventory_ticks_for_each_entry() {
+        const ENTRIES: usize = 5;
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        for i in 0..ENTRIES {
+            std::fs::write(scratch.path().join(i.to_string()), b"").unwrap();
+        }
+        let before = aterm_uds::progress::ticks_here();
+        scan(scratch.path()).unwrap();
+        assert!(aterm_uds::progress::ticks_here() - before >= ENTRIES);
+    }
 
     #[test]
     fn incomplete_inventories_never_certify_a_lock_free_prefix() {

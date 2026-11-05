@@ -1782,7 +1782,7 @@ impl App {
             });
         }
 
-        if let Some(pending) = self.close_banner.as_ref().filter(|p| p.wid == wid) {
+        if let Some(pending) = self.close_band(wid) {
             out.push(GridMessage {
                 message: ChromeMessage::CloseConfirm,
                 context: None,

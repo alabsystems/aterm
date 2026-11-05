@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The in-window close/quit confirmation banner.
+//! The close/quit confirmation: one standing question, its replay, and its wire answers. A Mac
+//! window shows it as a native sheet ([`crate::close_sheet`]); everywhere else, and wherever no
+//! sheet could be built, it is the in-window band [`banner_rows`] paints.
 
 use aterm_core::terminal::RenderCell;
 #[cfg(test)]
@@ -58,6 +60,9 @@ pub(crate) struct PendingClose {
     pub(crate) asked_by: ExitActor,
     /// This question's serial, never `0` (`App::question_key`).
     serial: u64,
+    /// The native sheet presenting this question; dropping the question ends it.
+    #[cfg(target_os = "macos")]
+    pub(crate) sheet: Option<crate::close_sheet::CloseSheet>,
 }
 
 /// The banner is two rows: the question with the answer keys, then the body.
@@ -146,6 +151,20 @@ impl PendingClose {
             replay,
             asked_by,
             serial: crate::paste_banner::next_question_serial(),
+            #[cfg(target_os = "macos")]
+            sheet: None,
+        }
+    }
+
+    /// Whether the window draws this question as its band: no native sheet presents it.
+    pub(crate) const fn in_window(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.sheet.is_none()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
         }
     }
 
@@ -162,7 +181,7 @@ impl PendingClose {
     /// Whether the wire's `confirm yes|no` answers this question.
     pub(crate) const fn wire_may_answer(&self) -> bool {
         match &self.asked_by {
-            ExitActor::Sid(_) | ExitActor::Ctl | ExitActor::Harness => true,
+            ExitActor::Sid(_) | ExitActor::Ctl | ExitActor::Harness | ExitActor::Fleet(_) => true,
             #[cfg(any(unix, test))]
             ExitActor::Bridge => true,
             ExitActor::Human | ExitActor::Unknown => false,
@@ -321,14 +340,11 @@ mod tests {
             assert_eq!(row.len(), 100, "every row must be exactly cols wide");
         }
         let row0 = text_of(&rows[0]);
-        assert!(
-            row0.contains("Are you sure you want to quit aterm?"),
-            "{row0}"
-        );
+        assert!(row0.contains(quit_prompt().title), "{row0}");
         assert!(row0.contains("Enter quits"), "{row0}");
         assert!(row0.contains("Esc cancels"), "{row0}");
         let row1 = text_of(&rows[1]);
-        assert!(row1.contains("A running process ends"), "{row1}");
+        assert!(row1.contains(quit_prompt().body), "{row1}");
 
         let rows = banner_rows(&close_prompt(), 100, BANNER_ROWS, Theme::default());
         let row0 = text_of(&rows[0]);
@@ -430,7 +446,7 @@ mod tests {
             "{line}"
         );
         assert!(
-            line.contains("title=\"Are you sure you want to quit aterm?\""),
+            line.contains(&format!("title=\"{}\"", quit_prompt().title)),
             "{line}"
         );
         assert!(line.contains("proceed=Quit"), "{line}");

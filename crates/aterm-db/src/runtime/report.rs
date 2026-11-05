@@ -41,6 +41,8 @@ pub struct RepairRound {
     pub membership_error: Option<String>,
     pub application: Option<crate::replica::Report>,
     pub application_error: Option<String>,
+    /// Closed diagnostic category, with no error text or payload.
+    pub application_cause: Option<aterm_types::network_state::RepairCause>,
     /// Lower bounds observed before an application error. These are not a
     /// completed round or proof that the peer received local receipts.
     pub application_interrupted: Option<crate::replica::Report>,
@@ -164,6 +166,23 @@ impl RepairRound {
         Some((
             actor,
             RepairObservation {
+                cause: self
+                    .application_cause
+                    .or_else(|| {
+                        self.application_deferral
+                            .as_ref()
+                            .and_then(|why| why.local_cause)
+                    })
+                    .or_else(|| {
+                        self.application_batch_deferral
+                            .as_ref()
+                            .map(|why| why.cause)
+                    })
+                    .or_else(|| {
+                        self.application_error
+                            .as_ref()
+                            .map(|_| aterm_types::network_state::RepairCause::Other)
+                    }),
                 completed_at_ms: self.completed_at_ms,
                 outbound: self.target.is_some(),
                 stage,
@@ -384,6 +403,7 @@ impl RepairRound {
             membership_error: None,
             application: None,
             application_error: None,
+            application_cause: None,
             application_interrupted: None,
             application_deferral: None,
             application_batch_deferral: None,
@@ -461,6 +481,44 @@ fn stage(phase: crate::control::Phase) -> aterm_types::network_state::RepairStag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    macro_rules! cause_test {
+        ($name:ident, $cause:ident, $word:literal) => {
+            #[test]
+            fn $name() {
+                use aterm_types::network_state::{RepairCause, RepairOutcome};
+                let mut repair = crate::control::Repair::default();
+                repair.application_failed(crate::Error::repair(
+                    "private path, key and record fixture",
+                    RepairCause::$cause,
+                ));
+                let mut round = attempted();
+                round.application_error = repair.application_error().map(str::to_owned);
+                round.application_cause = repair.application_cause();
+                let (_, observation, _) = round.observation().unwrap();
+                assert_eq!(observation.outcome, RepairOutcome::Failed);
+                assert_eq!(observation.cause.unwrap().word(), $word);
+                assert!(!format!("{observation:?}").contains("private"));
+                repair.begin_round();
+                assert!(repair.application_cause().is_none());
+            }
+        };
+    }
+    cause_test!(
+        records_legacy_past_crossing,
+        LegacyPastCrossing,
+        "legacy-past-crossing"
+    );
+    cause_test!(
+        records_table_undeclared,
+        TableUndeclared,
+        "table-undeclared"
+    );
+    cause_test!(records_quota, Quota, "quota");
+    cause_test!(records_io, Io, "io");
+    cause_test!(records_decode, Decode, "decode");
+    cause_test!(records_not_ready, NotReady, "not-ready");
+    cause_test!(records_needs_update, NeedsUpdate, "needs-update");
 
     fn attempted() -> RepairRound {
         let mut round = RepairRound::panicked(Some("127.0.0.1:41384".parse().unwrap()));

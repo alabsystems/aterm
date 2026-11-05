@@ -66,8 +66,10 @@ fn self_entry_if(
     if !is_host(host) || port == 0 || version_word(version).is_none() {
         return Err(invalid("invalid local fleet endpoint"));
     }
-    let cached = read_self_entry(dir)?;
-    let latest = local_floor(dir, me, cached.as_ref())?;
+    let judged = aterm_uds::private_file::JudgedDir::judge(dir)
+        .map_err(|why| io::Error::other(format!("{SELF_ENTRY_FILE}: {why}")))?;
+    let cached = read_self_entry(&judged)?;
+    let latest = local_floor(&judged, me, cached.as_ref())?;
     // Optional naming remains optional even when its file is unavailable or malformed.
     let name = read_primary_name(dir).ok().flatten();
     let mut peer = if let Some(known) = latest.as_ref().filter(|known| {
@@ -141,7 +143,9 @@ impl HeldBook<'_> {
         entries: impl Iterator<Item = Peer>,
     ) -> io::Result<()> {
         check_identity(self.dir, me)?;
-        let cached = read_self_entry(self.dir)?;
+        let judged = aterm_uds::private_file::JudgedDir::judge(self.dir)
+            .map_err(|why| io::Error::other(format!("{SELF_ENTRY_FILE}: {why}")))?;
+        let cached = read_self_entry(&judged)?;
         let latest = newest(me, cached.as_ref().into_iter().cloned().chain(entries));
         if let Some(latest) = latest {
             commit_if_changed(self.dir, cached.as_ref(), &canonical(latest))?;
@@ -164,8 +168,8 @@ fn check_identity(dir: &Path, me: &NodeIdentity) -> io::Result<()> {
     }
 }
 
-fn read_self_entry(dir: &Path) -> io::Result<Option<Peer>> {
-    let bytes = match read_private(dir, SELF_ENTRY_FILE, RECORD_MAX) {
+fn read_self_entry(judged: &aterm_uds::private_file::JudgedDir<'_>) -> io::Result<Option<Peer>> {
+    let bytes = match judged.read(SELF_ENTRY_FILE, RECORD_MAX) {
         Ok(bytes) => bytes,
         Err(PrivateFileError::Missing) => return Ok(None),
         Err(why) => return Err(io::Error::other(format!("{SELF_ENTRY_FILE}: {why}"))),
@@ -179,10 +183,14 @@ fn read_self_entry(dir: &Path) -> io::Result<Option<Peer>> {
     Ok(Some(canonical(peer)))
 }
 
-fn local_floor(dir: &Path, me: &NodeIdentity, cached: Option<&Peer>) -> io::Result<Option<Peer>> {
+fn local_floor(
+    judged: &aterm_uds::private_file::JudgedDir<'_>,
+    me: &NodeIdentity,
+    cached: Option<&Peer>,
+) -> io::Result<Option<Peer>> {
     let mut candidates: Vec<Peer> = cached.into_iter().cloned().collect();
     for file in [PEERS_FILE, ISSUER_BOOK_FILE] {
-        let bytes = match read_private(dir, file, PEERS_FILE_MAX) {
+        let bytes = match judged.read(file, PEERS_FILE_MAX) {
             Ok(bytes) => bytes,
             Err(PrivateFileError::Missing) => continue,
             Err(why) => return Err(io::Error::other(format!("{file}: {why}"))),
@@ -206,12 +214,17 @@ fn newest(me: &NodeIdentity, candidates: impl Iterator<Item = Peer>) -> Option<P
         .max_by_key(|peer| peer.signed.map(|signed| signed.seq))
 }
 
+/// The descriptor as this node keeps it: what a copy observed of it cleared, and no name record.
+/// Neither the entry signature nor the record's covers the other, so any member can append
+/// record words to a copy of this node's entry at its current seq; the record this node
+/// publishes comes from its own state alone (`docs/DESIGN-machine-names-2026-11-04.md` §3.2).
 fn canonical(mut peer: Peer) -> Peer {
     peer.addr = None;
     peer.key_from = None;
     peer.seen_ms = None;
     peer.via = Via::Joined;
     peer.fleet = None;
+    peer.signed = peer.signed.map(|signed| signed.with_record(None));
     peer
 }
 

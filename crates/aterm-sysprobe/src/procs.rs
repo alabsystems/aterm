@@ -28,6 +28,43 @@ pub struct Scheduling {
     pub qos_cpu_ns: Option<Result<[u64; 7], i32>>,
 }
 
+/// The mark that ends a process name no reader holds whole ([`whole_name`]): the name may go on
+/// past it.
+pub const CUT_MARK: char = '\u{2026}';
+
+/// A process's name as a person reads it. `short` is the kernel's short name, the bytes its
+/// reader gave, and `limit` the length that reader cuts names to: a name of any other length is
+/// taken whole (a longer one came past that reader's cut). One exactly `limit` long may be cut, so
+/// it is the first of `longer` (each another reader's name for the process and the length that
+/// reader cuts to, `None` where it cuts none) that begins with `short` and is shorter than its own
+/// cut. Where none is, the longest that begins with `short`, or `short` itself, ends in
+/// [`CUT_MARK`] after its UTF-8 prefix. `longer` is pulled only as far as that needs, so its
+/// readers cost nothing for a name below `limit`.
+#[must_use]
+pub fn whole_name<I>(short: &[u8], limit: usize, longer: I) -> String
+where
+    I: IntoIterator<Item = Option<(Vec<u8>, Option<usize>)>>,
+{
+    if short.len() != limit {
+        return String::from_utf8_lossy(short).into_owned();
+    }
+    let mut cut: Option<Vec<u8>> = None;
+    for (name, its_limit) in longer.into_iter().flatten() {
+        if !name.starts_with(short) {
+            continue;
+        }
+        if its_limit.is_none_or(|l| name.len() < l) {
+            return String::from_utf8_lossy(&name).into_owned();
+        }
+        if cut.as_ref().is_none_or(|c| name.len() > c.len()) {
+            cut = Some(name);
+        }
+    }
+    let mut marked = crate::utf8_prefix(cut.as_deref().unwrap_or(short)).to_owned();
+    marked.push(CUT_MARK);
+    marked
+}
+
 /// `getpriority` may successfully return -1; only errno distinguishes that from failure.
 pub fn priority_result(value: i32, errno: i32) -> Result<i32, i32> {
     if errno == 0 { Ok(value) } else { Err(errno) }
@@ -64,7 +101,11 @@ pub struct ProcessReading {
     pub disk_read: Option<u64>,
     /// Bytes it has written to disk since it started (macOS `ri_diskio_byteswritten`: what reached storage, not every `write(2)`); `None` where refused, and on Linux. An unreaped zombie keeps its final count, its start, its `disk_read` and its CPU times (macOS), though not its footprint.
     pub disk_written: Option<u64>,
-    /// Its short name (`p_comm`, 16 bytes at most on macOS; Linux `comm`; Windows the image name less `.exe`).
+    /// Its name, whole where any reader holds it whole ([`whole_name`]): on macOS `p_comm` (15
+    /// bytes through the short BSD info, 16 through a zombie's kernel record), else `p_name` (31)
+    /// or its image's basename; on Linux
+    /// `comm` (15), else its `exe` link's or its `argv[0]`'s file name; on Windows the image name
+    /// less `.exe`. One no reader holds whole ends in [`CUT_MARK`].
     pub name: String,
     /// Its process group (0 where unread).
     pub pgid: u32,
@@ -294,6 +335,50 @@ pub(crate) mod imp {
         (n == size).then_some(info)
     }
 
+    /// The bytes of `p_comm` the short BSD info keeps: 15, its 16th the kernel's NUL.
+    const SHORT_COMM_CUT: usize = 15;
+
+    /// The bytes of `p_comm` the kernel record (`kinfo_proc`) keeps: 16 (`MAXCOMLEN`).
+    const KINFO_COMM_CUT: usize = 16;
+
+    /// The bytes of `p_name` `PROC_PIDTBSDINFO` keeps: 31, its 32nd the kernel's NUL.
+    const P_NAME_CUT: usize = 31;
+
+    /// `pid`'s `p_name` (`PROC_PIDTBSDINFO`): the name of the file it last exec'd, as `p_comm` is,
+    /// cut at 31 bytes rather than 15. Only the process's own user (or root) may read it.
+    fn p_name(pid: c_int) -> Option<Vec<u8>> {
+        // SAFETY: plain integers and bytes; all-zero is valid.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as c_int;
+        // SAFETY: `info` is `size` writable bytes of the flavor's layout.
+        let n = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+        };
+        if n != size {
+            return None;
+        }
+        let name = info.pbi_name.map(|c| c.cast_unsigned());
+        let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+        Some(name[..end].to_vec())
+    }
+
+    /// `pid`'s image's basename (`proc_pidpath`, which any process may read of any other, and
+    /// which cuts nothing).
+    fn image_name(pid: c_int) -> Option<Vec<u8>> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = crate::process_path(u32::try_from(pid).ok()?)?;
+        Some(path.file_name()?.as_bytes().to_vec())
+    }
+
+    /// `pid`'s longer names for [`super::whole_name`], each read only once pulled: its `p_name`
+    /// (0.5 to 0.9 µs each, measured 2026-11-04 over 290 names at the cut, but refused for another
+    /// user's process), then its image's basename (2.5 to 6.5 µs each).
+    fn longer_names(pid: c_int) -> impl Iterator<Item = Option<(Vec<u8>, Option<usize>)>> {
+        std::iter::once_with(move || p_name(pid).map(|n| (n, Some(P_NAME_CUT)))).chain(
+            std::iter::once_with(move || image_name(pid).map(|n| (n, None))),
+        )
+    }
+
     /// `PROC_PIDUNIQIDENTIFIERINFO` (`sys/proc_info.h`).
     const PROC_PIDUNIQIDENTIFIERINFO: c_int = 17;
 
@@ -484,6 +569,7 @@ pub(crate) mod imp {
             // SAFETY: a plain syscall on an integer.
             let sid = unsafe { libc::getsid(pid) };
             let end = info.comm.iter().position(|b| *b == 0).unwrap_or(16);
+            let name = super::whole_name(&info.comm[..end], SHORT_COMM_CUT, longer_names(pid));
             procs.push(ProcessReading {
                 scheduling: Some(scheduling),
                 pid: pid as u32,
@@ -495,7 +581,7 @@ pub(crate) mod imp {
                 resident: usage.map(|u| u.ri_resident_size),
                 disk_read: usage.map(|u| u.ri_diskio_bytesread),
                 disk_written: usage.map(|u| u.ri_diskio_byteswritten),
-                name: String::from_utf8_lossy(&info.comm[..end]).into_owned(),
+                name,
                 pgid: info.pgid,
                 uid: Some(info.uid),
                 state: RunState::from_bsd(info.status),
@@ -535,7 +621,7 @@ pub(crate) mod imp {
                 footprint: None,
                 disk_read: last.map(|u| u.ri_diskio_bytesread),
                 disk_written: last.map(|u| u.ri_diskio_byteswritten),
-                name: k.comm,
+                name: super::whole_name(k.comm.as_bytes(), KINFO_COMM_CUT, longer_names(pid)),
                 pgid: k.pgid,
                 uid: Some(k.uid),
                 state: RunState::from_bsd(k.stat),
@@ -661,6 +747,72 @@ pub(crate) mod stopped_spinner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name at its reader's cut is the first longer name that begins with it and is below its
+    /// own cut; one below the cut is whole and pulls no longer reader; a longer reader's name that
+    /// does not begin with the cut one (another program's) is passed over; and one no reader
+    /// holds whole ends in the mark, after the longest cut name read, whole characters only.
+    /// NEGATIVE CONTROL: the cut name the Memory lens once showed as whole, with no longer reader,
+    /// is marked.
+    #[test]
+    fn a_name_at_its_readers_cut_is_read_whole_or_marked() {
+        type Longer = Option<(Vec<u8>, Option<usize>)>;
+        let named = |n: &str, cut: Option<usize>| -> Longer { Some((n.as_bytes().to_vec(), cut)) };
+        let never = || -> Longer { panic!("a whole name pulls no longer reader") };
+        let webkit = "com.apple.WebKit.WebContent";
+        assert_eq!(
+            whole_name(&webkit.as_bytes()[..15], 15, [named(webkit, Some(31))]),
+            webkit
+        );
+        assert_eq!(
+            whole_name(b"WindowServer", 15, std::iter::once_with(never)),
+            "WindowServer"
+        );
+        let fifteen = "SetStoreUpdate1";
+        assert_eq!(
+            whole_name(fifteen.as_bytes(), 15, [named(fifteen, None)]),
+            fifteen,
+            "a reader that cuts nothing says a name at the cut is whole"
+        );
+        let long = "aterm_sysprobe-0123456789abcdef0123";
+        let image = named(long, None);
+        assert_eq!(
+            whole_name(
+                &long.as_bytes()[..15],
+                15,
+                [None, named(&long[..31], Some(31)), image.clone()]
+            ),
+            long,
+            "past a refused reader and a cut one, the image's basename"
+        );
+        assert_eq!(
+            whole_name(
+                &long.as_bytes()[..15],
+                15,
+                [named(&long[..31], Some(31)), None]
+            ),
+            format!("{}\u{2026}", &long[..31]),
+            "the longest cut name read, marked"
+        );
+        assert_eq!(
+            whole_name(b"averyverylongsy", 15, [named("sleep", None)]),
+            "averyverylongsy\u{2026}",
+            "another program's name is passed over"
+        );
+        let cyrillic = "Приложение";
+        let at_cut = &cyrillic.as_bytes()[..15];
+        assert_eq!(whole_name(at_cut, 15, [named(cyrillic, None)]), cyrillic);
+        assert_eq!(
+            whole_name(at_cut, 15, std::iter::empty()),
+            "Приложе\u{2026}",
+            "a character the cut split is dropped before the mark"
+        );
+        assert_eq!(
+            whole_name(&webkit.as_bytes()[..15], 15, std::iter::empty()),
+            "com.apple.WebKi\u{2026}",
+            "CONTROL"
+        );
+    }
 
     #[test]
     fn priority_minus_one_is_a_value_only_without_errno() {
@@ -1573,6 +1725,12 @@ mod tests {
         assert!(!mine.name.is_empty());
         if cfg!(unix) {
             assert!(mine.uid.is_some(), "{mine:?}");
+            // A test binary's name, `aterm_sysprobe-<16 hex>`, runs past every short name's cut
+            // (and to `p_name`'s 31 bytes on macOS), so only its image says it whole.
+            let exe = std::env::current_exe().expect("this test binary's path");
+            let file = exe.file_name().and_then(|n| n.to_str()).expect("its name");
+            assert!(file.len() > 16, "{file}");
+            assert_eq!(mine.name, file);
         }
         assert!(mine.read_at.is_some(), "{mine:?}");
         if cfg!(target_os = "macos") {

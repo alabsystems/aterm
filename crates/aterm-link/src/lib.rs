@@ -64,6 +64,8 @@ mod pipeline;
 pub mod presence;
 /// The live view of who advertises which session.
 pub mod presence_view;
+/// The broker's rate limit, waited out (critic item E06).
+mod rate_hold;
 pub mod render;
 /// The deterministic fabric simulation (test builds): one real bridge, its
 /// doors answered by a seeded world.

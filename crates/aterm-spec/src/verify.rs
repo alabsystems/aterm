@@ -89,12 +89,20 @@ fn checker(bin: &str, locate: fn() -> Option<Located>) -> Option<PathBuf> {
     if !checkers_required() {
         return None;
     }
-    Some(locate().map(|l| l.path).unwrap_or_else(|| {
-        let (state, tail) = missing_tool_tail(bin);
-        panic!(
-            "VERIFICATION GATE: the external checkers were asked for, and Trust `{bin}` {state}.{tail}"
-        )
-    }))
+    Some(
+        locate()
+            .map(|l| l.path)
+            .unwrap_or_else(|| missing_checker(bin)),
+    )
+}
+
+/// End the calling test COULD NOT RUN: the machine has no `bin`, which says nothing of the tree.
+#[cfg_attr(trust_verify, trust::skip)]
+fn missing_checker(bin: &str) -> ! {
+    let (state, tail) = missing_tool_tail(bin);
+    crate::host::could_not_run(format!(
+        "VERIFICATION GATE: the external checkers were asked for, and Trust `{bin}` {state}.{tail}"
+    ))
 }
 
 /// The discovery tier that answered, in precedence order.
@@ -373,6 +381,13 @@ fn store_copies_in(store_root: &Path, exe: &str) -> Vec<StoreCopy> {
     let mut copies: Vec<StoreCopy> = entries
         .flatten()
         .filter_map(|e| {
+            if !e
+                .file_type()
+                .map(|ft| ft.is_dir() || ft.is_symlink())
+                .unwrap_or(true)
+            {
+                return None;
+            }
             let build_dir = std::fs::canonicalize(e.path().join("current")).ok()?;
             let path = build_dir.join("bin").join(exe);
             if !path.is_file() || is_pending_stub(&path) {
@@ -1087,8 +1102,8 @@ pub(crate) fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> 
     std::fs::create_dir_all(&dir).expect("mk tempdir");
     let spec = dir.join(format!("{}.tla", m.name));
     let cfgp = dir.join(format!("{}.cfg", m.name));
-    std::fs::write(&spec, m.to_tla()).expect("write derived spec");
-    std::fs::write(&cfgp, cfg).expect("write derived cfg");
+    write_scratch(&spec, m.to_tla()).expect("write derived spec");
+    write_scratch(&cfgp, cfg).expect("write derived cfg");
     let out = TyCommand::check(ty, &spec, &cfgp)
         .output()
         .unwrap_or_else(|e| panic!("run ty check for {label}: {e}"));
@@ -1113,6 +1128,22 @@ pub(crate) fn scratch_dir(kind: &str, model: &str) -> PathBuf {
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))
+}
+
+/// Write `bytes` to a scratch file at `path` (unlinking any existing entry first and creating
+/// exclusively with `create_new(true)`).
+#[cfg_attr(trust_verify, trust::skip)]
+pub(crate) fn write_scratch(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    opts.open(path)?.write_all(bytes.as_ref())
 }
 
 const WHOLE_SPACE: [&str; 10] = [
@@ -1259,6 +1290,17 @@ pub(crate) fn ty_states_explored(evidence: &str) -> Option<u64> {
             let n = n.trim();
             (!n.starts_with('+')).then(|| n.parse().ok()).flatten()
         })
+}
+
+/// The law `ty`'s evidence reports violated. Every failed run exits non-zero, a parse error or an
+/// evaluation error as much as a counterexample, so only this line is a refutation.
+#[cfg_attr(trust_verify, trust::skip)]
+pub(crate) fn ty_violated_law(evidence: &str) -> Option<&str> {
+    evidence.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("Error: Invariant ")?
+            .strip_suffix(" is violated.")
+    })
 }
 
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1766,10 +1808,10 @@ pub fn deadlock_free_and_catches_tiered(
             let dir = scratch_dir("aterm-dl", m.name);
             std::fs::create_dir_all(&dir).expect("mk tempdir");
             let spec = dir.join(format!("{}.tla", m.name));
-            std::fs::write(&spec, m.to_tla()).expect("write spec");
+            write_scratch(&spec, m.to_tla()).expect("write spec");
             let run = |cfg_name: &str, cfg: String| -> (bool, String) {
                 let cfgp = dir.join(cfg_name);
-                std::fs::write(&cfgp, cfg).expect("write cfg");
+                write_scratch(&cfgp, cfg).expect("write cfg");
                 let out = TyCommand::check(&ty, &spec, &cfgp)
                     .output()
                     .expect("run ty check");
@@ -1969,8 +2011,8 @@ pub(crate) fn ty_check_liveness(
     std::fs::create_dir_all(&dir).expect("mk tempdir");
     let spec = dir.join(format!("{}.tla", m.name));
     let cfgp = dir.join(format!("{}.cfg", m.name));
-    std::fs::write(&spec, module).expect("write liveness spec");
-    std::fs::write(&cfgp, cfg).expect("write liveness cfg");
+    write_scratch(&spec, module).expect("write liveness spec");
+    write_scratch(&cfgp, cfg).expect("write liveness cfg");
     let out = TyCommand::check(ty, &spec, &cfgp)
         .output()
         .unwrap_or_else(|e| panic!("run ty check for {label}: {e}"));
@@ -2188,9 +2230,9 @@ fn ty_trace_per_process(
     let spec = dir.join(format!("{model}.tla"));
     let cfg = dir.join(format!("{model}.cfg"));
     let trace = dir.join("t.json");
-    std::fs::write(&spec, spec_text).expect("write spec");
-    std::fs::write(&cfg, cfg_text).expect("write cfg");
-    std::fs::write(&trace, trace_text).expect("write trace");
+    write_scratch(&spec, spec_text).expect("write spec");
+    write_scratch(&cfg, cfg_text).expect("write cfg");
+    write_scratch(&trace, trace_text).expect("write trace");
     let out = TyCommand::trace_validate(ty, &trace, &spec, &cfg)
         .output()
         .unwrap_or_else(|e| panic!("run ty trace validate for {label}: {e}"));
@@ -2393,10 +2435,25 @@ impl CasesChild {
         let spec_path = dir.join(format!("{model}.tla"));
         let cfg_path = dir.join(format!("{model}.cfg"));
         let stderr_path = dir.join("stderr");
-        std::fs::write(&spec_path, spec).map_err(io)?;
-        std::fs::write(&cfg_path, cfg).map_err(io)?;
-        let stderr = std::fs::File::create(&stderr_path).map_err(io)?;
-        let stderr_reader = std::fs::File::open(&stderr_path).map_err(io)?;
+        write_scratch(&spec_path, spec).map_err(io)?;
+        write_scratch(&cfg_path, cfg).map_err(io)?;
+        let _ = std::fs::remove_file(&stderr_path);
+        let mut stderr_opts = std::fs::OpenOptions::new();
+        stderr_opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            stderr_opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let stderr = stderr_opts.open(&stderr_path).map_err(io)?;
+        let mut reader_opts = std::fs::OpenOptions::new();
+        reader_opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            reader_opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let stderr_reader = reader_opts.open(&stderr_path).map_err(io)?;
         let mut cmd = aterm_uds::spawnfd::command(ty);
         cmd.arg("trace")
             .arg("validate")
@@ -2416,11 +2473,32 @@ impl CasesChild {
         };
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            use std::io::BufRead as _;
-            for line in std::io::BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
+            use std::io::{BufRead as _, Read as _};
+            const MAX_TY_LINE_BYTES: u64 = 16 * 1024 * 1024;
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match (&mut reader)
+                    .take(MAX_TY_LINE_BYTES + 1)
+                    .read_until(b'\n', &mut buf)
+                {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) if u64::try_from(n).unwrap_or(u64::MAX) > MAX_TY_LINE_BYTES => break,
+                    Ok(_) => {
+                        if buf.ends_with(b"\n") {
+                            buf.pop();
+                            if buf.ends_with(b"\r") {
+                                buf.pop();
+                            }
+                        }
+                        let Ok(line) = String::from_utf8(std::mem::take(&mut buf)) else {
+                            break;
+                        };
+                        if tx.send(line).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -2529,14 +2607,25 @@ impl CasesChild {
 
     #[cfg_attr(trust_verify, trust::skip)]
     fn failure(&mut self, why: &str) -> String {
-        use std::io::Read as _;
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        const MAX_STDERR_TAIL: u64 = 64 * 1024;
         let _ = self.child.kill();
         let status = self
             .child
             .wait()
             .map_or_else(|e| e.to_string(), |s| s.to_string());
-        let mut stderr = String::new();
-        let _ = self.stderr.read_to_string(&mut stderr);
+        let cap = if let Ok(meta) = self.stderr.metadata() {
+            let _ = self
+                .stderr
+                .seek(SeekFrom::Start(meta.len().saturating_sub(MAX_STDERR_TAIL)));
+            usize::try_from(meta.len().min(MAX_STDERR_TAIL).saturating_add(1)).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut stderr = String::with_capacity(cap);
+        let _ = (&self.stderr)
+            .take(MAX_STDERR_TAIL)
+            .read_to_string(&mut stderr);
         let lines: Vec<&str> = stderr.lines().collect();
         let tail = lines[lines.len().saturating_sub(20)..].join("\n");
         format!(
@@ -2613,7 +2702,19 @@ pub fn sweep_faults(configs: &[Model]) -> Vec<String> {
     let Some(m) = configs.first() else {
         return Vec::new();
     };
-    let mut faults = m.malformed_bounds();
+    let mut faults = Vec::new();
+    for (i, config) in configs.iter().enumerate() {
+        for finding in config.malformed_bounds() {
+            faults.push(if i == 0 {
+                finding
+            } else {
+                format!(
+                    "{finding}, in the scenario {:?}",
+                    config_overrides(m, config)
+                )
+            });
+        }
+    }
     if m.is_function_valued() {
         return faults;
     }

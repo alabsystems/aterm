@@ -70,10 +70,10 @@ pub fn src_holds_a_doctest(src: &Path) -> bool {
                 return true;
             };
             let path = entry.path();
-            let Ok(meta) = std::fs::metadata(&path) else {
+            let Ok(ft) = entry.file_type() else {
                 return true;
             };
-            if meta.is_dir() {
+            if ft.is_dir() || (ft.is_symlink() && path.is_dir()) {
                 let key = path.canonicalize().unwrap_or_else(|_| normalized(&path));
                 if seen_dirs.insert(key) {
                     dirs.push(path);

@@ -149,7 +149,7 @@ pub fn raise(dirs: &Dirs, need: &Need) -> std::io::Result<()> {
             ));
         }
         // Redacted before any cut, so a cut never leaves part of a token the Redactor would
-        // no longer see; each build redacts again, so a cut's own text is judged too.
+        // no longer see; each cut redacts the shortened text again so its own text is judged too.
         let mut texts = [
             Redactor::shapes(&need.what),
             Redactor::shapes(&need.why),
@@ -160,17 +160,19 @@ pub fn raise(dirs: &Dirs, need: &Need) -> std::io::Result<()> {
             let mut object = Map::new();
             object.insert("at_secs".into(), Value::from(need.at_secs));
             object.insert("key".into(), Value::from(need.key.as_str()));
-            object.insert("then".into(), Value::from(Redactor::shapes(then)));
+            object.insert("then".into(), Value::from(then.as_str()));
             object.insert("v".into(), Value::from(1u64));
-            object.insert("what".into(), Value::from(Redactor::shapes(what)));
-            object.insert("why".into(), Value::from(Redactor::shapes(why)));
+            object.insert("what".into(), Value::from(what.as_str()));
+            object.insert("why".into(), Value::from(why.as_str()));
             let text = aterm_json::to_string(&Value::Object(object))
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             if text.len() <= NEED_MAX {
                 break text;
             }
-            let longest = texts.iter_mut().max_by_key(|t| t.len());
-            if !longest.is_some_and(halve) {
+            let Some(longest) = texts.iter_mut().max_by_key(|t| t.len()) else {
+                unreachable!()
+            };
+            if !halve(longest) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
@@ -179,6 +181,7 @@ pub fn raise(dirs: &Dirs, need: &Need) -> std::io::Result<()> {
                     ),
                 ));
             }
+            *longest = Redactor::shapes(longest);
         };
         let dir = dirs.needs();
         crate::config::make_state_subdir(dirs, &dir)?;
@@ -236,6 +239,7 @@ pub fn list(dirs: &Dirs) -> std::io::Result<Vec<Need>> {
             Err(e) => return Err(e),
         };
         let mut needs = Vec::new();
+        let judged = aterm_uds::private_file::JudgedDir::judge(&dir).ok();
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
@@ -248,7 +252,11 @@ pub fn list(dirs: &Dirs) -> std::io::Result<Vec<Need>> {
             if !key_ok(stem) {
                 continue;
             }
-            if let Some(need) = read_need(&dir, name).filter(|need| need.key == stem) {
+            if let Some(need) = judged
+                .as_ref()
+                .and_then(|judged| read_need(judged, name))
+                .filter(|need| need.key == stem)
+            {
                 needs.push(need);
             }
         }
@@ -265,9 +273,9 @@ pub fn list(dirs: &Dirs) -> std::io::Result<Vec<Need>> {
 /// The v1 need in `dir/name`, or `None` for a file that is not one, is over `NEED_MAX`, or
 /// does not pass `read_private`.
 #[cfg(unix)]
-fn read_need(dir: &std::path::Path, name: &str) -> Option<Need> {
+fn read_need(judged: &aterm_uds::private_file::JudgedDir<'_>, name: &str) -> Option<Need> {
     use aterm_json::Value;
-    let bytes = aterm_uds::private_file::read_private(dir, name, NEED_MAX).ok()?;
+    let bytes = judged.read(name, NEED_MAX).ok()?;
     let value: Value = aterm_json::from_slice(&bytes).ok()?;
     if value.get("v").and_then(Value::as_u64) != Some(1) {
         return None;

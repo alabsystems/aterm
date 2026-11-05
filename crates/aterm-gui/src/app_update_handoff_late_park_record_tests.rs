@@ -68,6 +68,7 @@ fn parked_record(attempt_id: u64, mode: ApplyMode) -> crate::PendingUpdateHandof
         target_build: 0,
         target_commit: String::new(),
         layout: crate::restore::RestoreManifest::new(Vec::new()),
+        carry_lone_lists: false,
         layout_digest: [0; 32],
         screen_digest: [0; 32],
         activity_epoch: 0,
@@ -96,6 +97,54 @@ fn completion(attempt_id: u64) -> crate::UpdateHandoffCompletion {
         input_drain_spins: 0,
         child_death: crate::ChildDeathEvidence::Unobserved,
     }
+}
+
+/// The Commit captures as its park did. Read with no list after a park that carried one, the
+/// capture would differ on every attempt, and the Commit would stand down for good. It goes by the
+/// park's own choice, not by what its layout reads: a fold can leave a carried list out of that.
+#[test]
+fn a_commit_reads_the_lone_workers_list_its_park_carried() {
+    let exact = |app: &mut App| {
+        app.collect_handoff_commit_facts(None, true, true, true, None)
+            .unwrap()
+            .0
+            .exact_layout
+    };
+    let parked = |app: &App, layout, carry_lone_lists| {
+        let mut pending = parked_record(9, ApplyMode::Automatic);
+        pending.live = Vec::new();
+        pending.layout = layout;
+        pending.carry_lone_lists = carry_lone_lists;
+        pending.activity_epoch = app.update_handoff_activity_epoch;
+        pending.hold_serials = app.hold_serials();
+        pending
+    };
+    let mut app = crate::app_workers_tests::app_with_a_lone_list();
+    let layout = app.capture_handoff_layout_for(true);
+    assert!(layout.carries_lone_workers_list(), "PRECONDITION");
+    app.pending_update_handoff = Some(parked(&app, layout, true));
+    assert!(exact(&mut app), "the list the park carried is still there");
+
+    let without = app.capture_handoff_layout();
+    app.pending_update_handoff = Some(parked(&app, without.clone(), false));
+    assert!(
+        exact(&mut app),
+        "CONTROL: a park that carried none compares with none"
+    );
+
+    app.pending_update_handoff = Some(parked(&app, without, true));
+    assert!(
+        !exact(&mut app),
+        "the choice is the park's: a layout with no row does not make the Commit drop the list"
+    );
+
+    let layout = app.capture_handoff_layout_for(true);
+    app.pending_update_handoff = Some(parked(&app, layout, true));
+    crate::app_workers_tests::person_tab(&mut app);
+    assert!(
+        !exact(&mut app),
+        "a tab opened after the park retires the list and moves the topology"
+    );
 }
 
 #[test]

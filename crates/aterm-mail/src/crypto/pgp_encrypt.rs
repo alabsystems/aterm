@@ -82,21 +82,26 @@ impl EncryptedBody {
         }
         let mut session = Zeroizing::new([0u8; 32]);
         aterm_uds::rand::fill(session.as_mut()).map_err(|_| "Could not generate message key")?;
-        let mut body = Zeroizing::new(vec![0u8; 16]);
+        let mut body = Zeroizing::new(Vec::with_capacity(18 + 6 + 6 + plaintext.len() + 22));
+        body.resize(16, 0);
         aterm_uds::rand::fill(&mut body).map_err(|_| "Could not generate message prefix")?;
         body.extend_from_within(14..16);
-        let mut literal = Zeroizing::new(vec![b'u', 0, 0, 0, 0, 0]);
-        literal.extend_from_slice(plaintext);
-        body.extend_from_slice(&frame(11, &literal));
+        let literal_len = (6 + plaintext.len()) as u32;
+        body.extend_from_slice(&[0xc0 | 11, 255]);
+        body.extend_from_slice(&literal_len.to_be_bytes());
+        body.extend_from_slice(&[b'u', 0, 0, 0, 0, 0]);
+        body.extend_from_slice(plaintext);
         body.extend_from_slice(&[0xd3, 0x14]);
         let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &body);
         body.extend_from_slice(digest.as_ref());
-        let mut encrypted = vec![1];
-        encrypted.extend_from_slice(&aes::encrypt_cfb(session.as_ref(), &[0u8; 16], &body)?);
-        Ok(Self {
-            session,
-            data: frame(18, &encrypted),
-        })
+        let cfb = aes::encrypt_cfb(session.as_ref(), &[0u8; 16], &body)?;
+        let enc_len = (1 + cfb.len()) as u32;
+        let mut data = Vec::with_capacity(6 + 1 + cfb.len());
+        data.extend_from_slice(&[0xc0 | 18, 255]);
+        data.extend_from_slice(&enc_len.to_be_bytes());
+        data.push(1);
+        data.extend_from_slice(&cfb);
+        Ok(Self { session, data })
     }
     pub fn key_packet(&self, recipient: &Recipient) -> Result<Vec<u8>, String> {
         let mut ephemeral = Zeroizing::new([0u8; 32]);
@@ -116,7 +121,8 @@ impl EncryptedBody {
         digest.update(b"Anonymous Sender    ");
         digest.update(&recipient.fingerprint);
         let derived = Zeroizing::new(digest.finish().as_ref().to_vec());
-        let mut plain = Zeroizing::new(vec![9]);
+        let mut plain = Zeroizing::new(Vec::with_capacity(40));
+        plain.push(9);
         plain.extend_from_slice(self.session.as_ref());
         let sum = self
             .session
@@ -126,7 +132,8 @@ impl EncryptedBody {
         let padding = 8 - plain.len() % 8;
         plain.extend(std::iter::repeat_n(padding as u8, padding));
         let wrapped = aes::wrap(&derived[..key_len(recipient.cipher)?], &plain)?;
-        let mut packet = vec![3];
+        let mut packet = Vec::with_capacity(14 + 32 + wrapped.len());
+        packet.push(3);
         packet.extend_from_slice(&recipient.id);
         packet.extend_from_slice(&[18, 1, 7, 64]);
         packet.extend_from_slice(&public);
@@ -139,7 +146,8 @@ impl EncryptedBody {
         bytes.extend_from_slice(&self.data);
         let encoded =
             aterm_codec::base64::encode(&bytes).map_err(|_| "Could not encode encrypted mail")?;
-        let mut out = String::from("-----BEGIN PGP MESSAGE-----\n\n");
+        let mut out = String::with_capacity(encoded.len() + encoded.len() / 64 + 64);
+        out.push_str("-----BEGIN PGP MESSAGE-----\n\n");
         for line in encoded.as_bytes().chunks(64) {
             out.push_str(std::str::from_utf8(line).map_err(|_| "Invalid encoded mail")?);
             out.push('\n');

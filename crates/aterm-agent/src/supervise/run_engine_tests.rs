@@ -298,7 +298,7 @@ fn err_halted_parks_until_the_hold_lifts_and_the_loop_goes_on() {
     assert!(rows[0].contains("\"decision\":\"deferred\""), "{rows:?}");
     assert!(rows[1].contains("\"decision\":\"approved\""), "{rows:?}");
     assert!(
-        rows[1].contains("\"rule_id\":\"read-only@classify-v11\""),
+        rows[1].contains("\"rule_id\":\"read-only@classify-v12\""),
         "{rows:?}"
     );
     let _ = std::fs::remove_dir_all(&jdir);
@@ -509,7 +509,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
 }
 
 /// THE RM BREAKER'S TOO-MANY BOX OVER A PROVEN READ IS PRESSED AND LEDGERED UNDER
-/// `breaker-read-only@v11`, in a bypass session, under the safe rules alone: Claude Code 2.1.307
+/// `breaker-read-only@v12`, in a bypass session, under the safe rules alone: Claude Code 2.1.307
 /// draws that box over any command with more than 64 command substitutions, rm or none
 /// (MEASURED). The box is the MEASURED one with its command made thirteen barred lines of `echo`
 /// and five `$(true)`; the press is guarded by its first command row, and the one ledger row is
@@ -543,7 +543,7 @@ fn the_too_many_breaker_over_a_proven_read_is_ledgered_under_its_rule() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v11\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v12\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -604,7 +604,7 @@ fn breaker_run(
     (lines, m, rows, host.asks())
 }
 
-/// A TOO-MANY BOX READS NO TRANSCRIPT AND WAITS FOR NONE (`breaker-read-only@v11`): breaker-4's
+/// A TOO-MANY BOX READS NO TRANSCRIPT AND WAITS FOR NONE (`breaker-read-only@v12`): breaker-4's
 /// lane read the agent's transcript for every too-many box the screen did not prove, retried
 /// it while it named no call and waited a 1 s settle, and the call it found could only add a
 /// reading, so it decided nothing. Now the measured box (one line of `echo` and 65 `$(true)`,
@@ -653,7 +653,7 @@ fn a_too_many_box_reads_no_transcript_and_waits_for_none() {
     assert_eq!(m.presses().len(), 1, "{:?}", m.requests);
     assert!(out[0].starts_with("APPROVED seq=102 "), "{out:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v11\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v12\""),
         "{rows:?}"
     );
     assert_eq!(asks, 0, "a proven box asks the transcript nothing");
@@ -3977,7 +3977,7 @@ impl IdleHost for TestHost {
         &self,
         why: &crate::supervise::policy::turn_end::Restart,
         ask: &crate::supervise::policy::turn_end::RestartAsk,
-    ) -> Option<String> {
+    ) -> Option<crate::supervise::policy::turn_end::RestartAnswer> {
         self.restarted.lock().unwrap().push(why.word());
         self.restart_asks
             .lock()
@@ -3994,7 +3994,7 @@ impl IdleHost for TestHost {
         } else {
             self.memory_once_made.store(made, Ordering::SeqCst);
         }
-        step.map(str::to_string)
+        step.map(crate::supervise::policy::turn_end::RestartAnswer::unread)
     }
     fn can_restart(&self) -> bool {
         self.restartable.load(Ordering::SeqCst) || !self.restarts.lock().unwrap().is_empty()
@@ -8572,9 +8572,10 @@ fn the_reset_in_a_description_question_is_answered_under_land_without_the_person
         m.requests
     );
     let rows = ledger_rows(&ledger);
+    // Land's own rule since 2026-11-05: the recommended answer stands in for its text.
     assert!(
         rows.iter().any(|r| r.contains("\"decision\":\"approved\"")
-            && r.contains("\"rule_id\":\"answer-recommended@v1\"")),
+            && r.contains("\"rule_id\":\"answer-land@v1\"")),
         "{rows:?}"
     );
     assert!(
@@ -9854,7 +9855,7 @@ fn q_projected(
         rows,
         priority,
         memory.then_some(priority),
-        false,
+        (false, false),
         crate::supervise::policy::question::Pane::of(rows),
     ) {
         Decision::Approve {
@@ -14220,6 +14221,7 @@ fn a_retry_mark_with_any_signed_stamp_can_be_taken_up_by_the_session() {
                 ups: 1,
                 since_ms,
                 down: false,
+                witnessed: false,
             }),
             said: Default::default(),
             said_reset_ms: None,
@@ -14288,6 +14290,7 @@ fn a_retry_mark_read_measured_down_is_taken_up_and_handed_on_by_the_session() {
                 ups: 0,
                 since_ms: now_ms - 60_000,
                 down,
+                witnessed: false,
             }),
             ..Carried::streak(2)
         };
@@ -14308,6 +14311,56 @@ fn a_retry_mark_read_measured_down_is_taken_up_and_handed_on_by_the_session() {
         let track = s.turn_end.retry_track().expect("the recorded retry track");
         assert_eq!((track.0, track.4), (kind, down));
         assert_eq!(s.carried().retry.map(|m| m.down), Some(down), "handed on");
+    }
+}
+
+/// AN OUTAGE THAT RESUMED ON A WITNESS STAYS LATCHED ACROSS A LOOP THAT FOLLOWS (the
+/// post-landing review, 2026-11-02): the session seeds the wall's track from its retry mark's
+/// ` witnessed=yes`, so a witness after a restart does not resume the same outage at once a
+/// second time (the ladder tries it until the agent works again), and hands the latch on in its
+/// own books. Negative control: the seed's `seed_retry_witnessed` call out of `run.rs` leaves a
+/// restarted loop's track unlatched (`retry_witnessed` false where the mark says yes).
+#[test]
+fn a_retry_mark_whose_outage_resumed_on_a_witness_is_taken_up_and_handed_on() {
+    use crate::supervise::approvals::{Carried, Outcome, RULE_POINT, RetryMark, Row, point_reason};
+    let dir = crate::supervise::ScratchDir::new("retry-mark", "witnessed");
+    let path = dir.join("books.jsonl");
+    let now_ms = 1_790_000_000_000_i64;
+    let kind = aterm_phase::WallKind::Overloaded;
+    for witnessed in [true, false] {
+        let carried = Carried {
+            retry: Some(RetryMark {
+                kind,
+                attempts: 1,
+                ups: 0,
+                since_ms: now_ms - 60_000,
+                down: false,
+                witnessed,
+            }),
+            ..Carried::streak(0)
+        };
+        let reason = point_reason(carried, false);
+        assert_eq!(reason.contains(" witnessed=yes"), witnessed, "{reason}");
+        let body = Row {
+            rule_id: RULE_POINT,
+            outcome: Outcome::Waiting,
+            command: "",
+            reason: &reason,
+            box_seq: 1,
+        }
+        .to_json(now_ms - 1_000, Some("@s-9"));
+        let mut ctl = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut ctl, Some("@s-9".to_string()));
+        assert!(
+            s.seed_from_ledger_text(&path, &body, now_ms, false)
+                .is_none()
+        );
+        assert_eq!(s.turn_end.retry_witnessed(), witnessed, "taken up");
+        assert_eq!(
+            s.carried().retry.map(|m| m.witnessed),
+            Some(witnessed),
+            "handed on"
+        );
     }
 }
 

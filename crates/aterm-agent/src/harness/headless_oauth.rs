@@ -185,6 +185,52 @@ pub struct MailboxConfig {
     pub routed: bool,
     /// On such a view of an entry that is not ready, why it is never tried.
     pub unready: Option<&'static str>,
+    /// On such a view of an entry the lab registry describes, that mailbox: what the view's
+    /// value getters reveal where the entry itself holds no value.
+    pub registry: Option<super::mailbox_routes::Registered>,
+    /// What this discovery revealed from the registry, shared by every view made of it, so one
+    /// sign-in reveals each credential once ([`super::alab_roster::reveal`]).
+    pub revealed: Revealed,
+}
+
+/// The registry values one discovery revealed, each `(mailbox key, part)` once: a memo every
+/// clone and routed view shares, never configuration (two are always equal), dropped with the
+/// discovery and zeroized then.
+#[derive(Clone, Default)]
+pub struct Revealed(std::sync::Arc<std::sync::Mutex<RevealedParts>>);
+
+/// Each `(mailbox key, part)` a discovery asked for, and what it revealed (`None`: withheld).
+type RevealedParts =
+    BTreeMap<(String, super::alab_roster::Part), Option<zeroize::Zeroizing<String>>>;
+
+impl PartialEq for Revealed {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Revealed {}
+
+impl Revealed {
+    /// `part` of registry mailbox `mailbox`: revealed at its first ask, the memo after. A failed
+    /// reveal is remembered too, so a polling sign-in asks once.
+    fn value(&self, mailbox: &str, part: super::alab_roster::Part) -> Option<String> {
+        let mut held = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.entry((mailbox.to_owned(), part))
+            .or_insert_with(|| match super::alab_roster::reveal(mailbox, part) {
+                Ok(value) if !value.is_empty() => Some(value),
+                Ok(_) => None,
+                Err(why) => {
+                    aterm_log::debug!("mailbox credential from the lab registry: {why}");
+                    None
+                }
+            })
+            .as_ref()
+            .map(|value| String::clone(value))
+    }
 }
 
 impl std::fmt::Debug for MailboxConfig {
@@ -205,6 +251,75 @@ impl MailboxConfig {
     ) -> Option<super::mailbox_routes::MailboxRoute> {
         super::mailbox_routes::resolve(&self.mailboxes, target_email)
             .map(|route| self.completed_route(route, target_email))
+    }
+
+    /// `route`'s `part`: its own value, else the lab registry's, revealed once per discovery
+    /// ([`Revealed`]); `None` where it holds neither.
+    fn route_value(
+        &self,
+        route: &super::mailbox_routes::MailboxRoute,
+        part: super::alab_roster::Part,
+    ) -> Option<String> {
+        use super::alab_roster::Part;
+        let own = match part {
+            Part::Password => &route.password,
+            Part::MailboxPassword => &route.mailbox_password,
+            Part::Totp => &route.totp_secret,
+        };
+        if let Some(value) = own.as_deref().filter(|v| !v.is_empty()) {
+            return Some(value.to_owned());
+        }
+        let registered = route.registry.as_ref().filter(|r| r.holds(part))?;
+        self.revealed.value(&registered.mailbox, part)
+    }
+
+    /// On a routed view of a registry mailbox ([`MailboxConfig::registry`]), its `part`,
+    /// revealed once per discovery; `None` elsewhere, or while the entry is not ready.
+    fn routed_registry_value(&self, part: super::alab_roster::Part) -> Option<String> {
+        let registered = self
+            .registry
+            .as_ref()
+            .filter(|r| self.routed && self.unready.is_none() && r.holds(part))?;
+        self.revealed.value(&registered.mailbox, part)
+    }
+
+    /// Whether `target_email`'s sign-in holds `part` here: as the value getters answer, but
+    /// never revealing anything, so an upkeep's look at a row reads no registry value.
+    #[must_use]
+    pub fn holds_for(&self, part: super::alab_roster::Part, target_email: Option<&str>) -> bool {
+        use super::alab_roster::Part;
+        if let Some(route) = self.route_for(target_email) {
+            let own = match part {
+                Part::Password => &route.password,
+                Part::MailboxPassword => &route.mailbox_password,
+                Part::Totp => &route.totp_secret,
+            };
+            return route.ready()
+                && (own.as_deref().is_some_and(|v| !v.is_empty()) || route.registry_holds(part));
+        }
+        let (values, default, component) = match part {
+            Part::Password => (
+                &self.passwords,
+                self.password.as_ref(),
+                aterm_secrets::mailbox_component::Part::Password,
+            ),
+            Part::MailboxPassword => (
+                &self.mailbox_passwords,
+                self.mailbox_password.as_ref(),
+                aterm_secrets::mailbox_component::Part::SecondPassword,
+            ),
+            Part::Totp => (
+                &self.totp_secrets,
+                self.totp_secret.as_ref(),
+                aterm_secrets::mailbox_component::Part::Totp,
+            ),
+        };
+        self.credential_for(values, default, target_email).is_some()
+            || self
+                .registry
+                .as_ref()
+                .is_some_and(|r| self.routed && self.unready.is_none() && r.holds(part))
+            || super::mailbox_needs::default_component(self, component).is_some()
     }
 
     /// Whether `login` is this configuration's top-level `user` (trimmed, any case).
@@ -338,9 +453,14 @@ impl MailboxConfig {
             imap_url: self.effective_imap_url(target_email),
             webmail_url: self.effective_webmail_url(target_email),
             user: self.webmail_user_for(target_email),
-            password: self.password_for(target_email),
-            mailbox_password: self.mailbox_password_for(target_email),
-            totp_secret: self.totp_secret_for(target_email),
+            // The route's own values; a registry mailbox's are revealed by the view's getters,
+            // only when a sign-in types them, so a look at the view reveals nothing.
+            password: route.password.clone().filter(|p| ready && !p.is_empty()),
+            mailbox_password: route
+                .mailbox_password
+                .clone()
+                .filter(|p| ready && !p.is_empty()),
+            totp_secret: route.totp_secret.clone().filter(|p| ready && !p.is_empty()),
             passwords: BTreeMap::new(),
             mailbox_passwords: BTreeMap::new(),
             totp_secrets: BTreeMap::new(),
@@ -362,6 +482,8 @@ impl MailboxConfig {
                 .then(|| route.unready_words())
                 .flatten()
                 .map(super::mailbox_routes::static_words),
+            registry: route.registry.clone(),
+            revealed: self.revealed.clone(),
         })
     }
 
@@ -449,9 +571,8 @@ impl MailboxConfig {
                         || self.effective_imap_url(target_email).is_some()
                         || self.effective_webmail_url(target_email).is_some()));
         }
-        let has_pw_or_unscoped = target_email.is_none()
-            || self.passwords.is_empty()
-            || self.password_for(target_email).is_some();
+        let has_pw = self.holds_for(super::alab_roster::Part::Password, target_email);
+        let has_pw_or_unscoped = target_email.is_none() || self.passwords.is_empty() || has_pw;
         let imap_has_embedded_pw = self
             .imap_url
             .as_deref()
@@ -461,7 +582,7 @@ impl MailboxConfig {
             || self.http_url.is_some()
             || (self.imap_url.is_some() && (has_pw_or_unscoped || imap_has_embedded_pw))
             || (self.webmail_url.is_some() && has_pw_or_unscoped)
-            || self.password_for(target_email).is_some()
+            || has_pw
             || (target_email.is_none() && !self.passwords.is_empty())
             || (self.relay_enabled && target_email.is_some())
     }
@@ -486,10 +607,13 @@ impl MailboxConfig {
     #[must_use]
     pub fn password_for(&self, target_email: Option<&str>) -> Option<String> {
         if let Some(route) = self.route_for(target_email) {
-            let ready = route.ready();
-            return route.password.filter(|_| ready);
+            return route
+                .ready()
+                .then(|| self.route_value(&route, super::alab_roster::Part::Password))
+                .flatten();
         }
         self.credential_for(&self.passwords, self.password.as_ref(), target_email)
+            .or_else(|| self.routed_registry_value(super::alab_roster::Part::Password))
             .or_else(|| {
                 super::mailbox_needs::default_component(
                     self,
@@ -502,14 +626,17 @@ impl MailboxConfig {
     #[must_use]
     pub fn mailbox_password_for(&self, target_email: Option<&str>) -> Option<String> {
         if let Some(route) = self.route_for(target_email) {
-            let ready = route.ready();
-            return route.mailbox_password.filter(|_| ready);
+            return route
+                .ready()
+                .then(|| self.route_value(&route, super::alab_roster::Part::MailboxPassword))
+                .flatten();
         }
         self.credential_for(
             &self.mailbox_passwords,
             self.mailbox_password.as_ref(),
             target_email,
         )
+        .or_else(|| self.routed_registry_value(super::alab_roster::Part::MailboxPassword))
         .or_else(|| {
             super::mailbox_needs::default_component(
                 self,
@@ -522,10 +649,13 @@ impl MailboxConfig {
     #[must_use]
     pub fn totp_secret_for(&self, target_email: Option<&str>) -> Option<String> {
         if let Some(route) = self.route_for(target_email) {
-            let ready = route.ready();
-            return route.totp_secret.filter(|_| ready);
+            return route
+                .ready()
+                .then(|| self.route_value(&route, super::alab_roster::Part::Totp))
+                .flatten();
         }
         self.credential_for(&self.totp_secrets, self.totp_secret.as_ref(), target_email)
+            .or_else(|| self.routed_registry_value(super::alab_roster::Part::Totp))
             .or_else(|| {
                 super::mailbox_needs::default_component(
                     self,
@@ -642,7 +772,7 @@ impl MailboxConfig {
         if self.routed {
             return self.imap_url.clone();
         }
-        let has_pw = self.password_for(target_email).is_some();
+        let has_pw = self.holds_for(super::alab_roster::Part::Password, target_email);
         if let Some(url) = &self.imap_url {
             let has_embedded_pw = parse_imap_url(url).is_some_and(|p| p.password.is_some());
             if target_email.is_none() || self.passwords.is_empty() || has_pw || has_embedded_pw {
@@ -676,7 +806,7 @@ impl MailboxConfig {
         if self.routed {
             return self.webmail_url.clone();
         }
-        let has_pw = self.password_for(target_email).is_some();
+        let has_pw = self.holds_for(super::alab_roster::Part::Password, target_email);
         if let Some(url) = &self.webmail_url {
             if target_email.is_none() || self.passwords.is_empty() || has_pw {
                 return Some(url.clone());
@@ -1744,8 +1874,7 @@ fn discover_mailbox_config_sources(
     );
     cfg.contested_labels = contested_labels(&aliases);
     for path in toml_candidates {
-        if path.is_file()
-            && let Some(text) = super::ai_pool::read_bounded_text(&path, 2 * 1024 * 1024)
+        if let Some(text) = super::ai_pool::read_bounded_text(&path, 2 * 1024 * 1024)
             && let Some(parsed) = MailboxConfig::parse_toml(&text, home)
         {
             cfg.merge_from(parsed);
@@ -1755,6 +1884,13 @@ fn discover_mailbox_config_sources(
     super::ai_signin::load_local_ai_signin_into(home, store_dir, config_path, &mut cfg);
     #[cfg(not(unix))]
     let _ = (store_dir, config_path);
+    // The lab registry's mailboxes first (one-mesh design step A9): each `[[mailboxes]]` entry of
+    // a file for the same login only fills what the registry leaves empty, until B13 deletes the
+    // files' entry.
+    cfg.mailboxes = super::mailbox_routes::merge_lab(
+        std::mem::take(&mut cfg.mailboxes),
+        &super::alab_roster::mail(),
+    );
     if let Some(h) = home {
         let secrets_dir = h.join(".secrets");
         if secrets_dir.is_dir() {
@@ -2597,7 +2733,7 @@ fn write_profile_unproven(dir: &Path) -> std::io::Result<()> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(dir.join(PROFILE_UNPROVEN_MARK))?;
     file.write_all(b"1\n")
 }
@@ -3935,9 +4071,12 @@ fn record_seen_digest(seen_file: Option<&Path>, seen: &mut BTreeSet<String>, dig
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
-    if let Ok(mut f) = open.open(path) {
+    if let Ok(mut f) = open.open(path)
+        && f.metadata().is_ok_and(|m| m.is_file())
+    {
         let _ = writeln!(f, "{digest}");
     }
 }
@@ -4082,7 +4221,8 @@ fn imap_read_until_tag(reader: &mut impl BufRead, tag: &str) -> Option<(bool, Ve
     let mut continuing_untagged = false;
     for _ in 0..MAX_PROTOCOL_LINES {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).ok()?;
+        let rem = max_bytes.saturating_sub(total_bytes).saturating_add(1) as u64;
+        let n = (&mut *reader).take(rem).read_line(&mut line).ok()?;
         if n == 0 {
             return None;
         }
@@ -4244,7 +4384,7 @@ fn fetch_imap_tcp_credential(
     let mut reader = BufReader::new(stream);
 
     let mut greeting = String::new();
-    if reader.read_line(&mut greeting).ok()? == 0 {
+    if (&mut reader).take(8192).read_line(&mut greeting).ok()? == 0 || !greeting.ends_with('\n') {
         return None;
     }
     auth_budget_ready(deadline)?;
@@ -4725,16 +4865,17 @@ pub fn plaintext_credential_refusal(
         let credentialed = url_has_embedded_userinfo(url)
             || cfg.bearer_token.as_deref().is_some_and(|t| !t.is_empty())
             || (cfg.webmail_user_for(target_email).is_some()
-                && cfg.password_for(target_email).is_some());
+                && cfg.holds_for(super::alab_roster::Part::Password, target_email));
         if credentialed && let Some(why) = cleartext_refusal(url) {
             return Some(why);
         }
     }
     if let Some(wurl) = cfg.effective_webmail_url(target_email) {
+        use super::alab_roster::Part;
         let credentialed = url_has_embedded_userinfo(&wurl)
-            || cfg.password_for(target_email).is_some()
-            || cfg.mailbox_password_for(target_email).is_some()
-            || cfg.totp_secret_for(target_email).is_some();
+            || [Part::Password, Part::MailboxPassword, Part::Totp]
+                .into_iter()
+                .any(|part| cfg.holds_for(part, target_email));
         if credentialed && let Some(why) = cleartext_refusal(&wurl) {
             return Some(why);
         }
@@ -5375,9 +5516,13 @@ fn scan_maildir_once_by(
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::OpenOptionsExt as _;
-                            open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+                            open.mode(0o600).custom_flags(
+                                libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                            );
                         }
-                        if let Ok(mut f) = open.open(target) {
+                        if let Ok(mut f) = open.open(target)
+                            && f.metadata().is_ok_and(|m| m.is_file())
+                        {
                             let _ = f.write_all(b"1\n");
                         }
                     };
@@ -5508,6 +5653,8 @@ fn poll_non_webmail_once(
             super::ai_signin::MAIL_CODE_DIAL_WITHIN,
             deadline,
         )
+        .ok()
+        .flatten()
         && let Some(accepted) = accept_relay_credential(
             cred,
             target_email,
@@ -5705,6 +5852,7 @@ fn poll_mailbox_config_by(
                     super::ai_signin::MAIL_CODE_DIAL_WITHIN,
                     deadline,
                 )
+                .map_err(|_| "swarm roster busy or unread; sign-in deferred")?
                 && let Some(accepted) = accept_relay_credential(
                     cred,
                     target_email,
@@ -7337,9 +7485,10 @@ fn drive_cdp_oauth_flow_until(
         .and_then(|config| {
             if let Some(route) = config.route_for(email.as_deref()) {
                 let login = route.login.trim();
-                route
-                    .totp_secret
-                    .filter(|s| !login.is_empty() && !s.trim().is_empty())
+                (!login.is_empty())
+                    .then(|| config.route_value(&route, super::alab_roster::Part::Totp))
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
             } else {
                 config.totp_secret_for(email.as_deref())
             }
@@ -10156,5 +10305,238 @@ mod credential_debug_tests {
             assert!(!output.contains(marker));
             assert!(output.contains("MailboxConfig"));
         }
+    }
+}
+
+/// The mailbox readers resolve from the lab registry's rows (one-mesh design step A9), with no
+/// `ai-mailbox.toml`, sheet or `~/.secrets` file present. Every value is a synthetic fixture.
+#[cfg(test)]
+pub(super) mod registry_tests {
+    use super::super::alab_roster::{self, LabMailbox, Part};
+    use super::*;
+
+    /// RFC 6238's SHA-1 test seed, `12345678901234567890` in Base32.
+    pub(in super::super) const SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"; // gitleaks:allow
+
+    /// The registry's mailbox `mb-fixture`: login `owner@example.test`, webmail only, receiving
+    /// `ai1@example.test` and all of `pm.example.test`, its three credentials held.
+    pub(in super::super) fn mailbox() -> LabMailbox {
+        LabMailbox {
+            pk: "mb-fixture".into(),
+            login: "owner@example.test".into(),
+            service: Some("other".into()),
+            webmail: Some("https://mail.example.test/inbox".into()),
+            receives: vec!["ai1@example.test".into(), "*@pm.example.test".into()],
+            held: vec![Part::Password, Part::MailboxPassword, Part::Totp],
+        }
+    }
+
+    /// What the registry's cells open to for [`mailbox`].
+    pub(in super::super) fn secrets() -> Vec<((&'static str, Part), &'static str)> {
+        vec![
+            (("mb-fixture", Part::Password), "fixture-login-pass"), // gitleaks:allow
+            (("mb-fixture", Part::MailboxPassword), "fixture-second-pass"), // gitleaks:allow
+            (("mb-fixture", Part::Totp), SEED),
+        ]
+    }
+
+    /// An empty HOME: no mailbox file, no sheet, no `~/.secrets`.
+    fn bare_home() -> aterm_tempfile::TempDir {
+        let home = aterm_tempfile::tempdir().unwrap();
+        assert!(!home.path().join(".secrets").exists());
+        home
+    }
+
+    /// With no file present, discovery finds the registry's mailbox for the addresses it
+    /// receives, by its login; the value getters reveal its login password, second password and
+    /// TOTP seed, each once per discovery, and the seed yields the sign-in code RFC 6238 gives.
+    /// NEGATIVE CONTROL: with `merge_lab` left out of `discover_mailbox_config_sources`, the
+    /// discovery is not configured (`None`) and the first assertion fails.
+    #[test]
+    fn a_registry_mailbox_resolves_its_login_passwords_and_totp_code_with_no_file() {
+        let home = bare_home();
+        alab_roster::with_mail(vec![mailbox()], secrets(), || {
+            let cfg = discover_mailbox_config_files(Some(home.path()), None, None)
+                .expect("the registry's mailbox configures discovery");
+            for email in [
+                "ai1@example.test",
+                "ai1+grok@example.test",
+                "x@pm.example.test",
+            ] {
+                let target = Some(email);
+                assert_eq!(
+                    cfg.webmail_user_for(target).as_deref(),
+                    Some("owner@example.test"),
+                    "{email}"
+                );
+                assert!(cfg.is_configured_for(target), "{email}");
+                assert_eq!(
+                    cfg.effective_webmail_url(target).as_deref(),
+                    Some("https://mail.example.test/inbox")
+                );
+            }
+            assert_eq!(
+                alab_roster::reveals(),
+                0,
+                "routing and presence reveal nothing"
+            );
+            let target = Some("ai1@example.test");
+            assert_eq!(
+                cfg.password_for(target).as_deref(),
+                Some("fixture-login-pass")
+            );
+            assert_eq!(
+                cfg.mailbox_password_for(target).as_deref(),
+                Some("fixture-second-pass")
+            );
+            let seed = cfg.totp_secret_for(target).unwrap();
+            assert_eq!(generate_totp_at(&seed, 59).as_deref(), Some("287082"));
+            assert_eq!(alab_roster::reveals(), 3);
+            // A poller reads the routed view, as the webmail reader does each step.
+            let view = cfg.routed_for(target);
+            for _ in 0..3 {
+                assert_eq!(
+                    view.password_for(target).as_deref(),
+                    Some("fixture-login-pass")
+                );
+                assert_eq!(
+                    view.totp_secret_for(target)
+                        .and_then(|seed| generate_totp_at(&seed, 59)),
+                    Some("287082".to_owned())
+                );
+            }
+            assert_eq!(
+                alab_roster::reveals(),
+                3,
+                "one discovery reveals each part once"
+            );
+            assert!(
+                cfg.route_for(Some("stranger@other.test")).is_none(),
+                "an address the registry's mailbox does not receive has no route"
+            );
+        });
+    }
+
+    /// The upkeep's look at a row (`route_for`, `routed_for`, `is_configured_for`,
+    /// `masked_login_for`, `holds_for`, the cleartext refusal) reveals nothing; a part the
+    /// registry does not hold is none; a mailbox whose password the registry lacks is unready
+    /// and never tried.
+    /// NEGATIVE CONTROL: with `routed_for` filling its password from `self.password_for`, the
+    /// first `reveals() == 0` assertion reads 3.
+    #[test]
+    fn looking_at_a_registry_mailbox_reveals_nothing() {
+        let home = bare_home();
+        let mut partial = mailbox();
+        partial.held = vec![Part::Password];
+        alab_roster::with_mail(vec![partial], secrets(), || {
+            let cfg = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
+            let target = Some("ai1@example.test");
+            let route = cfg.route_for(target).expect("routed");
+            assert!(route.ready() && route.registry.is_some());
+            let view = cfg.routed_for(target);
+            assert!(view.is_configured_for(target));
+            assert!(view.masked_login_for(target).is_some());
+            assert!(cfg.holds_for(Part::Password, target));
+            assert!(!cfg.holds_for(Part::Totp, target));
+            assert!(plaintext_credential_refusal(&cfg, target).is_none());
+            assert_eq!(alab_roster::reveals(), 0);
+            assert_eq!(cfg.totp_secret_for(target), None, "a part not held is none");
+            assert_eq!(alab_roster::reveals(), 0);
+        });
+        let mut unready = mailbox();
+        unready.held.clear();
+        alab_roster::with_mail(vec![unready], Vec::new(), || {
+            let cfg = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
+            let target = Some("ai1@example.test");
+            assert!(!cfg.is_configured_for(target));
+            assert_eq!(
+                cfg.unready_words(target),
+                Some("mailbox ow…@… has no password yet")
+            );
+            assert_eq!(cfg.password_for(target), None);
+            assert_eq!(alab_roster::reveals(), 0);
+        });
+    }
+
+    /// The registry decides before a file: an `ai-mailbox.toml` entry for the same login fills
+    /// only what the registry leaves empty, and an entry for another login stays a fallback for
+    /// the addresses only it receives (until B13).
+    /// NEGATIVE CONTROL: with `merge_lab` appending the registry's routes after the files', the
+    /// shared address `ai1@example.test` resolves to the file's other mailbox.
+    #[test]
+    fn the_registry_decides_before_the_mailbox_file() {
+        let home = bare_home();
+        let secrets_dir = home.path().join(".secrets");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        std::fs::write(
+            secrets_dir.join(SECRETS_MAILBOX_TOML_FILE),
+            "[[mailboxes]]\n\
+             login = \"other@example.test\"\n\
+             password = \"fixture-file-other\"\n\
+             webmail_url = \"https://other.example.test/inbox\"\n\
+             receives = [\"ai1@example.test\", \"ai2@example.test\"]\n\
+             [[mailboxes]]\n\
+             login = \"OWNER@example.test\"\n\
+             password = \"fixture-file-owner\"\n\
+             totp_secret = \"fixture-file-seed\"\n\
+             receives = [\"ai3@example.test\"]\n", // gitleaks:allow
+        )
+        .unwrap();
+        let mut registry = mailbox();
+        registry.held = vec![Part::Password];
+        alab_roster::with_mail(vec![registry], secrets(), || {
+            let cfg = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
+            assert_eq!(
+                cfg.webmail_user_for(Some("ai1@example.test")).as_deref(),
+                Some("owner@example.test"),
+                "the registry's route comes first among equal patterns"
+            );
+            assert_eq!(
+                cfg.password_for(Some("ai1@example.test")).as_deref(),
+                Some("fixture-login-pass"),
+                "the registry's held password, not the file's"
+            );
+            assert_eq!(
+                cfg.totp_secret_for(Some("ai1@example.test")).as_deref(),
+                Some("fixture-file-seed"),
+                "a part the registry holds no cell for falls back to the file's entry"
+            );
+            assert_eq!(
+                cfg.webmail_user_for(Some("ai2@example.test")).as_deref(),
+                Some("other@example.test"),
+                "an address only the file routes keeps its route"
+            );
+            assert_eq!(
+                cfg.mailboxes
+                    .iter()
+                    .filter(|m| m.login.eq_ignore_ascii_case("owner@example.test"))
+                    .count(),
+                1,
+                "one login is one route"
+            );
+        });
+    }
+
+    /// `VendorApprover::new`, which every sign-in driver (`login_drive`, `grok_signin`) builds,
+    /// finds the registry's mailbox for its row with no file present.
+    #[test]
+    fn a_vendor_sign_in_takes_the_registry_mailbox() {
+        let home = bare_home();
+        let shared = home.path().join("store");
+        alab_roster::with_mail(vec![mailbox()], secrets(), || {
+            let approver = VendorApprover::new(
+                super::super::accounts::Cli::Claude,
+                "claude-1",
+                Some("ai1@example.test"),
+                &shared,
+                Some(home.path()),
+            );
+            let mailbox = approver.mailbox.as_ref().expect("a mailbox for the row");
+            assert_eq!(
+                mailbox.password_for(Some("ai1@example.test")).as_deref(),
+                Some("fixture-login-pass")
+            );
+            assert_eq!(approver.mailbox_unready, None);
+        });
     }
 }

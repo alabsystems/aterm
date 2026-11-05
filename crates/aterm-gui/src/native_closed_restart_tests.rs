@@ -42,6 +42,7 @@ pub(super) fn fixture_on(
     request.expected_human_seq = Some(ctx.human_input.seq());
     request.duty = Scope::Relaunch;
     request.plan = NativePlan::Restart {
+        cold: None,
         process: source,
         shell,
         observation: None,

@@ -3236,7 +3236,7 @@ fn a_refused_palette_set_is_one_line_naming_the_setting() {
 fn turning_palette_sets_on_clears_the_refusal_line() {
     fn apply(app: &mut App, dir: &std::path::Path, text: &str) {
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, text).expect("write config");
+        crate::test_scratch::write_config(&path, text);
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .expect("observe");

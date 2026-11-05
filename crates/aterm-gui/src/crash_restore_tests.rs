@@ -35,7 +35,7 @@ impl Rig {
         rows: u16,
         cols: u16,
         cfg: Option<aterm_core::config::TerminalConfig>,
-        accepted: Option<Arc<AtomicBool>>,
+        accepted: Option<Arc<aterm_keeper::client::ReadObserver>>,
     ) -> Self {
         let term = Arc::new(Mutex::new(crate::spawn::new_live_terminal(
             rows,
@@ -3738,8 +3738,8 @@ fn every_minted_turn_id_is_in_every_live_region_before_it_is_anyone_s() {
 
 #[test]
 fn a_crash_restore_continues_past_ids_no_carry_named() {
-    let accepted = Arc::new(AtomicBool::new(false));
-    let unplaced = Arc::new(AtomicBool::new(false));
+    let accepted = Arc::new(aterm_keeper::client::ReadObserver::default());
+    let unplaced = Arc::new(aterm_keeper::client::ReadObserver::default());
     let one =
         crate::keeper_link::RecoveryCountAdmission::from_retained(vec![Arc::clone(&accepted)]);
     let all = crate::keeper_link::RecoveryCountAdmission::from_retained(vec![

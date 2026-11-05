@@ -52,16 +52,8 @@ const ASIDE_DIGEST: usize = 16;
 
 /// Lowercase hex SHA-256 of `bytes`: a manifest digest.
 pub fn digest_hex(bytes: &[u8]) -> String {
-    let digest = aterm_digest::Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 15)]));
-    }
-    out
+    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
 }
-
-const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// Where entry `name` lands under `home`.
 pub fn target_path(home: &Path, name: &str) -> crate::Result<PathBuf> {
@@ -466,32 +458,32 @@ fn to_write(
 ) -> Pending {
     entries
         .iter()
-        .filter(|entry| {
-            let Ok(target) = target_path(places.home, &entry.name) else {
-                return false;
-            };
-            if entry.if_absent {
-                standings.get(entry.name.as_str()) == Some(&Standing::Vaults)
-            } else {
-                places.reachable(&entry.name)
-                    && matches!(
-                        fsx::kind(&target),
-                        Ok(Kind::Missing | Kind::File | Kind::Symlink)
-                    )
-            }
-        })
         .filter_map(|entry| {
+            let target = target_path(places.home, &entry.name).ok()?;
+            let (kind, id) = if entry.if_absent {
+                if standings.get(entry.name.as_str()) != Some(&Standing::Vaults) {
+                    return None;
+                }
+                (None, None)
+            } else {
+                if !places.reachable(&entry.name) {
+                    return None;
+                }
+                let (kind, id) = fsx::kind_and_id(&target).ok()?;
+                if !matches!(kind, Kind::Missing | Kind::File | Kind::Symlink) {
+                    return None;
+                }
+                (Some(kind), id)
+            };
             let digest = digest_hex(entry.value.as_slice());
-            let target = target_path(places.home, &entry.name).ok();
             let wrote = held.files.get(&entry.name).or_else(|| {
-                target
-                    .as_deref()
-                    .and_then(fsx::file_id)
+                id.or_else(|| fsx::file_id(&target))
                     .and_then(|id| history.get(&id).copied())
             });
-            let adopted = target
-                .as_deref()
-                .is_some_and(|target| adoptable(target, entry, wrote));
+            let adopted = !entry.if_absent
+                && wrote.is_none()
+                && kind == Some(Kind::File)
+                && holds(&target, entry.value.as_slice());
             (wrote != Some(&digest) && !adopted).then(|| (entry.name.clone(), digest))
         })
         .collect()
@@ -616,11 +608,11 @@ fn place(
     claimed: &BTreeMap<(u64, u64), String>,
     report: &mut Report,
 ) -> Result<Placed, String> {
-    if let Some(other) = fsx::file_id(target).and_then(|id| claimed.get(&id)) {
+    let (kind, id) = fsx::kind_and_id(target).map_err(|error| error.0)?;
+    if let Some(other) = id.and_then(|id| claimed.get(&id)) {
         return Err(format!("lands on the same file as entry `{other}`"));
     }
     let value = entry.value.as_slice();
-    let kind = fsx::kind(target).map_err(|error| error.0)?;
     if entry.if_absent {
         return fill(target, kind, value, held, standing);
     }
@@ -700,23 +692,22 @@ fn standings<'a>(
     let mut standings: BTreeMap<&str, Standing> = BTreeMap::new();
     for entry in entries.iter().filter(|entry| entry.if_absent) {
         let standing = match target_path(places.home, &entry.name) {
-            Ok(target) if places.reachable(&entry.name) => match fsx::kind(&target) {
-                Ok(Kind::Missing) => Standing::Vaults,
-                Ok(Kind::File) => {
+            Ok(target) if places.reachable(&entry.name) => match fsx::kind_and_id(&target) {
+                Ok((Kind::Missing, _)) => Standing::Vaults,
+                Ok((Kind::File, id)) => {
                     let wrote = held
                         .files
                         .get(&entry.name)
-                        .or_else(|| fsx::file_id(&target).and_then(|id| history.get(&id).copied()));
+                        .or_else(|| id.and_then(|id| history.get(&id).copied()));
                     if wrote.is_some_and(|digest| {
-                        file_digest(&target).as_deref() == Some(digest.as_str())
-                    }) || (wrote.is_some() && holds(&target, entry.value.as_slice()))
-                    {
+                        holds_or_digest(&target, entry.value.as_slice(), digest)
+                    }) {
                         Standing::Vaults
                     } else {
                         Standing::Own
                     }
                 }
-                Ok(Kind::Symlink | Kind::Dir | Kind::Other) => Standing::Own,
+                Ok((Kind::Symlink | Kind::Dir | Kind::Other, _)) => Standing::Own,
                 Err(_) => Standing::Unseen,
             },
             _ => Standing::Unseen,
@@ -760,11 +751,17 @@ fn holds(target: &Path, value: &[u8]) -> bool {
         .is_some_and(|bytes| aterm_digest::ct_eq(SecretBytes::new(bytes).as_slice(), value))
 }
 
+fn holds_or_digest(target: &Path, value: &[u8], digest: &str) -> bool {
+    fsx::read_public(target, text::MAX_VALUE)
+        .ok()
+        .flatten()
+        .is_some_and(|bytes| {
+            let bytes = SecretBytes::new(bytes);
+            digest_hex(bytes.as_slice()) == digest || aterm_digest::ct_eq(bytes.as_slice(), value)
+        })
+}
+
 fn judge(target: &Path, value: &[u8], held: Option<&String>) -> Judged {
-    let len = std::fs::symlink_metadata(target).map_or(u64::MAX, |meta| meta.len());
-    if len > u64::try_from(text::MAX_VALUE).unwrap_or(u64::MAX) {
-        return Judged::Foreign;
-    }
     match fsx::read_public(target, text::MAX_VALUE) {
         Ok(Some(bytes)) => {
             let current = SecretBytes::new(bytes);
@@ -781,17 +778,11 @@ fn judge(target: &Path, value: &[u8], held: Option<&String>) -> Judged {
     }
 }
 
-fn file_digest(target: &Path) -> Option<String> {
-    let bytes = fsx::read_public(target, text::MAX_VALUE).ok()??;
-    let bytes = SecretBytes::new(bytes);
-    Some(digest_hex(bytes.as_slice()))
-}
-
 fn narrow(target: &Path) -> Result<(), String> {
     let at = |error: std::io::Error| format!("{}: {error}", target.display());
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(target)
         .map_err(at)?;
     let meta = file.metadata().map_err(at)?;
@@ -816,28 +807,28 @@ fn parents(home: &Path, rel: &str) -> Vec<PathBuf> {
 
 fn make_parents(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Result<(), String> {
     for dir in parents(home, rel) {
-        match fsx::kind(&dir).map_err(|error| error.0)? {
-            Kind::Dir if own.is_some() && fsx::file_id(&dir) == own => {
+        match fsx::kind_and_id(&dir).map_err(|error| error.0)? {
+            (Kind::Dir, id) if own.is_some() && id == own => {
                 return Err(format!(
                     "{}: is aterm's own key and state directory; refusing to write in it",
                     dir.display()
                 ));
             }
-            Kind::Dir => {}
-            Kind::Missing => match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            (Kind::Dir, _) => {}
+            (Kind::Missing, _) => match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => {}
                 Err(error)
                     if error.kind() == std::io::ErrorKind::AlreadyExists
                         && fsx::kind(&dir).is_ok_and(|kind| kind == Kind::Dir) => {}
                 Err(error) => return Err(format!("{}: {error}", dir.display())),
             },
-            Kind::Symlink => {
+            (Kind::Symlink, _) => {
                 return Err(format!(
                     "{}: is a symlink; refusing to write through it",
                     dir.display()
                 ));
             }
-            Kind::File | Kind::Other => {
+            (Kind::File | Kind::Other, _) => {
                 return Err(format!("{}: not a directory", dir.display()));
             }
         }
@@ -888,10 +879,10 @@ pub fn is_gap(home: &Path, name: &str) -> bool {
 
 fn refused_dir(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Option<PathBuf> {
     for dir in parents(home, rel) {
-        match fsx::kind(&dir) {
-            Ok(Kind::Dir) if own.is_none() || fsx::file_id(&dir) != own => {}
-            Ok(Kind::Dir | Kind::Symlink) => return Some(dir),
-            Ok(Kind::Missing | Kind::File | Kind::Other) | Err(_) => return None,
+        match fsx::kind_and_id(&dir) {
+            Ok((Kind::Dir, id)) if own.is_none() || id != own => {}
+            Ok((Kind::Dir | Kind::Symlink, _)) => return Some(dir),
+            Ok((Kind::Missing | Kind::File | Kind::Other, _)) | Err(_) => return None,
         }
     }
     None
@@ -913,12 +904,13 @@ fn sweep_temps(target: &Path, digest: &str) {
         return;
     };
     let prefix = format!(".{}.tmp.", file.to_string_lossy());
-    for temp in listing
+    for item in listing
         .flatten()
         .filter(|item| item.file_name().to_string_lossy().starts_with(&prefix))
-        .map(|item| item.path())
     {
-        let linked = std::fs::symlink_metadata(&temp)
+        let temp = item.path();
+        let linked = item
+            .metadata()
             .is_ok_and(|meta| meta.file_type().is_file() && meta.nlink() > 1);
         if linked {
             let _ = std::fs::remove_file(&temp);
@@ -1339,6 +1331,45 @@ mod tests {
         assert_eq!(report.removed, ["other"]);
         assert!(!secrets.join("other").exists());
         assert_eq!(read(&secrets.join("token")), b"hand-made");
+    }
+
+    /// Release detach (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.9, §10): the pass that drops
+    /// a kept entry is handed a manifest without it (`aterm secrets keep`), and the file the
+    /// vault wrote survives with its digest unchanged; the file the vault wrote and that was not
+    /// kept is taken back (the control).
+    #[test]
+    fn a_kept_file_survives_its_entrys_removal_and_an_unkept_one_does_not() {
+        let home = scratch();
+        let secrets = home.path().join(".secrets");
+        let kept = ["~/.aterm/release-ring/machine.key", "signing"];
+        let entries = [
+            entry(kept[0], b"ring key"),
+            entry(kept[1], b"developer id"),
+            entry("token", b"dev token"),
+        ];
+        let (mut held, report) =
+            apply(home.path(), &entries, &Manifest::default(), 1).expect("written");
+        assert_eq!(report.written.len(), 3, "{report:?}");
+        let ring = home.path().join(".aterm/release-ring/machine.key");
+        let before = [
+            digest_hex(&read(&ring)),
+            digest_hex(&read(&secrets.join("signing"))),
+        ];
+        for name in kept {
+            held.files.remove(name).expect("the vault wrote it");
+        }
+        let (manifest, report) = apply(home.path(), &[], &held, 2).expect("deleted");
+        assert_eq!(report.removed, ["token"], "{report:?}");
+        assert!(
+            !secrets.join("token").exists(),
+            "the unkept file is taken back"
+        );
+        assert!(manifest.files.is_empty(), "{manifest:?}");
+        let after = [
+            digest_hex(&read(&ring)),
+            digest_hex(&read(&secrets.join("signing"))),
+        ];
+        assert_eq!(after, before, "each kept file is unchanged");
     }
 
     #[test]

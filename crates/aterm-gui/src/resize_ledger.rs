@@ -909,6 +909,11 @@ impl ResizeLedger {
         self.epochs.note_superseded(id);
     }
 
+    /// [`crate::resize_epoch::EpochBook::note_unrepaired`].
+    pub(crate) fn note_unrepaired(&mut self, id: u64) {
+        self.epochs.note_unrepaired(id);
+    }
+
     /// [`crate::resize_epoch::EpochBook::take_returned`].
     pub(crate) fn take_returned(&mut self) -> Option<u64> {
         self.epochs.take_returned()
@@ -3342,6 +3347,33 @@ mod tests {
         assert_eq!(payloads, ["healed epoch=1 after_ms=1900 by=nudge"]);
         assert!(epoch_lines(&ledger)[0].contains("verdict=healed by=nudge tried=1"));
         assert_eq!(ledger.render(), Render::Ok);
+
+        // The same repaint first seen at the next resize (no reading came between them) closes
+        // the epoch by the same rule: the attempt's.
+        let mut late = ResizeLedger::default();
+        late.set_agent(true);
+        split_flap(&mut late, 1_000);
+        late.evaluate(
+            owing(2, 16, -1, (24, 80)),
+            1_000 + LATE_GROW + RISK_AFTER_MS + 5,
+        );
+        late.note_tried(1);
+        let mut drag = report(3, 24, 23, true, (20, 21));
+        drag.full_clears = 2;
+        let after = EngineProbe {
+            full_clears: 2,
+            ..owing(3, 21, 0, (23, 80))
+        };
+        late.ingest(
+            &copy_of(&[drag], after),
+            Some(here()),
+            1_000 + LATE_GROW + RISK_AFTER_MS + 900,
+        );
+        let lines = epoch_lines(&late);
+        assert!(
+            lines[0].contains("verdict=healed by=nudge tried=1"),
+            "{lines:?}"
+        );
     }
 
     #[test]

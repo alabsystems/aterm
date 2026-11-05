@@ -115,6 +115,7 @@ impl Proc {
                 logical_writes: Some(0),
                 runnable_ns: Some(0),
                 pageins: Some(0),
+                peak_footprint: None,
             },
             refused: false,
             fds: Vec::new(),
@@ -644,6 +645,7 @@ impl World {
                 aterm: p.aterm || self.descends_from(p.pid, 100),
                 wait: p.wait,
                 tab: p.tie,
+                job: None,
                 started_ms: p.born,
             })
             .collect()

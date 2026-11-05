@@ -722,6 +722,19 @@ pub fn connect_google_mail(home: &Path, account: &str, within: Duration) -> Resu
 
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     aterm_uds::secret::no_core_dumps();
+    #[cfg(unix)]
+    if args.first().is_some_and(|arg| arg == "--transport-owner") {
+        return match args.as_slice() {
+            [_, home, account] => account
+                .to_str()
+                .ok_or_else(|| "Invalid mailbox identity".to_owned())
+                .and_then(|account| {
+                    super::mail_browser::owner_main(std::path::Path::new(home), account)
+                })
+                .map_or(ExitCode::FAILURE, |()| ExitCode::SUCCESS),
+            _ => ExitCode::FAILURE,
+        };
+    }
     let result = (|| {
         let args: Vec<String> = args
             .into_iter()

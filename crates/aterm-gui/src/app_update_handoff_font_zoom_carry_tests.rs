@@ -41,6 +41,7 @@ fn a_zoomed_font_crosses_the_handoff() {
         mirror_dropped: Vec::new(),
         mirror_served: false,
         machine_names: Vec::new(),
+        retired_workers: Vec::new(),
     };
     let wire = handoff(unzoomed).to_toml().expect("serializes");
     assert!(!wire.contains("font_"), "no key for no zoom: {wire}");
@@ -184,6 +185,7 @@ fn a_zoom_out_after_a_handoff_restores_the_window_it_zoomed_in() {
         mirror_dropped: Vec::new(),
         mirror_served: false,
         machine_names: Vec::new(),
+        retired_workers: Vec::new(),
     }
     .to_toml()
     .expect("serializes");

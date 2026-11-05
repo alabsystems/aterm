@@ -31,10 +31,19 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
                                          new version; on an admin of a <url> vault, also
                                          the approver, which lets in a machine allowed on
                                          any member or one that types the join password
+  aterm secrets mirrors [add|remove <url>...]
+                                         this Mac's other addresses of its vault (source.toml's
+                                         mirrors): read beside its url under the same pin;
+                                         no join, request, put-back or admin publish goes
+                                         to a mirror
   aterm secrets ls [--describe | --json]  the names this machine holds; descriptions and
                                          file pointers with --describe, metadata JSON
                                          with --json; neither prints secret values
   aterm secrets get <name>               print one value to stdout
+  aterm secrets keep <name>...           make each file the vault wrote here this Mac's own
+                                         (confirmed by digest), so the removal of its entry
+                                         leaves the file; prints kept, or why not, per
+                                         name, never a value
   aterm secrets need ls [--all] [--json] this machine's needs (a credential it lacks, asked
                                          of the lab's Macs or a person), --all every request
                                          in the lab's table; need <want> raises one by hand,
@@ -213,11 +222,17 @@ enum Command {
         diagnostic: bool,
     },
     Watch,
+    /// `mirrors`: list them, or with `Some(add)` add or remove these.
+    Mirrors {
+        change: Option<bool>,
+        urls: Vec<String>,
+    },
     Ls {
         describe: bool,
         json: bool,
     },
     Get(String),
+    Keep(Vec<String>),
     GitCredential {
         dev_user: Option<String>,
         /// The dev token's file in place of `~/.secrets/gh_access_token` (absolute).
@@ -817,6 +832,22 @@ fn parse(words: &[String]) -> Result<Command, String> {
             no_operands(&flags(rest, &[], &[])?, "watch")?;
             Ok(Command::Watch)
         }
+        "mirrors" => {
+            let f = flags(rest, &[], &[])?;
+            match f.operands.split_first() {
+                None => Ok(Command::Mirrors {
+                    change: None,
+                    urls: Vec::new(),
+                }),
+                Some((verb, urls)) if (verb == "add" || verb == "remove") && !urls.is_empty() => {
+                    Ok(Command::Mirrors {
+                        change: Some(verb == "add"),
+                        urls: urls.to_vec(),
+                    })
+                }
+                _ => Err("mirrors takes nothing, add <url>... or remove <url>...".into()),
+            }
+        }
         "ls" => {
             let f = flags(rest, &[], &["--describe", "--json"])?;
             no_operands(&f, "ls")?;
@@ -831,6 +862,13 @@ fn parse(words: &[String]) -> Result<Command, String> {
                 [name] => Ok(Command::Get(name.clone())),
                 _ => Err("get takes one name".into()),
             }
+        }
+        "keep" => {
+            let f = flags(rest, &[], &[])?;
+            if f.operands.is_empty() {
+                return Err("keep takes one or more names".into());
+            }
+            Ok(Command::Keep(f.operands))
         }
         "git-credential" => {
             let f = flags(rest, &["--dev-user", "--token-file", "--token-key"], &[])?;
@@ -1152,7 +1190,7 @@ mod unix {
     };
     use crate::service::{self, Job};
     use crate::text::Audience;
-    use crate::transport::Source;
+    use crate::transport::{Source, describe};
     use crate::{Error, SecretBytes, envelope, fsx, join, text};
     use std::cell::Cell;
     use std::io::{IsTerminal, Read, Write};
@@ -1254,12 +1292,14 @@ mod unix {
                 })?;
                 Ok(ExitCode::SUCCESS)
             }
+            Command::Mirrors { change, urls } => mirrors(&paths, change, &urls),
             Command::Ls { describe, json } => {
                 let names = client::registered_names(&paths)?;
                 print!("{}", super::inventory::listing(&names, describe, json)?);
                 Ok(ExitCode::SUCCESS)
             }
             Command::Get(name) => get(&paths, &name),
+            Command::Keep(names) => keep(&paths, &names),
             Command::GitCredential { .. } => unreachable!(),
             Command::Create {
                 source,
@@ -1613,11 +1653,16 @@ mod unix {
 
     /// One line from the terminal itself (never stdin), echo on.
     fn ask(prompt: &str) -> Option<String> {
+        use std::os::unix::fs::OpenOptionsExt as _;
         let mut tty = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open("/dev/tty")
             .ok()?;
+        if !std::io::IsTerminal::is_terminal(&tty) {
+            return None;
+        }
         tty.write_all(prompt.as_bytes()).ok()?;
         let mut line = Vec::new();
         let mut byte = [0u8; 1];
@@ -1682,11 +1727,16 @@ mod unix {
     /// Read one line typed at the terminal without echo (`None` with no terminal; Ctrl-C exits
     /// 130 after restoring terminal settings).
     fn ask_hidden(prompt: &str) -> Option<SecretBytes> {
+        use std::os::unix::fs::OpenOptionsExt as _;
         let mut tty = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open("/dev/tty")
             .ok()?;
+        if !std::io::IsTerminal::is_terminal(&tty) {
+            return None;
+        }
         let quiet = Quiet::new(&tty)?;
         tty.write_all(prompt.as_bytes()).ok()?;
         let mut line: Vec<u8> = Vec::with_capacity(HIDDEN_MAX);
@@ -2104,6 +2154,14 @@ mod unix {
             }
             Some(config) => {
                 println!("vault: {} at {}", config.name, source_text(&config.source));
+                if !config.mirrors.is_empty() {
+                    let shown: Vec<String> =
+                        config.mirrors.iter().map(|url| describe(url)).collect();
+                    println!("mirrors: {}", shown.join(", "));
+                }
+                for note in client::mirror_notes(paths) {
+                    println!("mirror {note}");
+                }
                 match &config.signer {
                     Some(signer) => println!(
                         "signer: {} (pinned), key {}",
@@ -2137,6 +2195,15 @@ mod unix {
                         retype(&config.source, named, false)
                     });
                 println!("{}", pending_membership(&approve, hint.as_deref()));
+            }
+            // A locker opened, but no seat of the log binds this Mac: it is no member, and its
+            // subscriber asks for a seat (one-mesh S1).
+            Membership::In { seq, heard } if client::seat_asks(paths) => {
+                println!(
+                    "membership: {}, seq {seq}, last heard {}",
+                    client::Seat::SEATLESS,
+                    ago(heard)
+                );
             }
             Membership::In { seq, heard } => {
                 println!("membership: in, seq {seq}, last heard {}", ago(heard));
@@ -2195,6 +2262,11 @@ mod unix {
                 }
             }
             Err(error) => println!("read while out: unreadable ({error})"),
+        }
+        match client::lab_set_aside(paths) {
+            Ok(Some(set)) => println!("{}", set.status_line()),
+            Ok(None) => {}
+            Err(error) => println!("set aside: unreadable ({error})"),
         }
         match crate::need::peek(paths) {
             Ok(needs) => {
@@ -2409,6 +2481,82 @@ mod unix {
         Ok((outcome, put_back))
     }
 
+    /// `aterm secrets mirrors`: list this Mac's other addresses of its vault, after adding or
+    /// removing (`change`) the `typed` ones. An added mirror is read once first: one serving a
+    /// version this Mac's pin does not verify is refused, and nothing is saved.
+    pub(super) fn mirrors(
+        paths: &Paths,
+        change: Option<bool>,
+        typed: &[String],
+    ) -> crate::Result<ExitCode> {
+        let config = client::config(paths)?.ok_or_else(|| {
+            Error::new("no vault configured: run aterm secrets join <url> (or aterm init)")
+        })?;
+        let config = match change {
+            None => config,
+            Some(add) => {
+                let mut list = config.mirrors.clone();
+                let mut heard = Vec::new();
+                for typed in typed {
+                    let at = |list: &[String], url: &str| {
+                        list.iter()
+                            .position(|kept| crate::discover::same_endpoint(kept, url))
+                    };
+                    if add {
+                        let url = client::mirror_typed(&config, typed)?;
+                        if at(&list, &url).is_some() {
+                            heard.push(format!("{}: listed already", describe(&url)));
+                            continue;
+                        }
+                        let said = match client::probe_mirror(&config, &url)? {
+                            client::MirrorProbe::Serves(seq) => format!("serves seq {seq}"),
+                            client::MirrorProbe::Empty => {
+                                "holds no version of the vault yet; it is read once its server does"
+                                    .to_owned()
+                            }
+                            client::MirrorProbe::Unreached(why) => {
+                                format!("did not answer ({why})")
+                            }
+                        };
+                        heard.push(format!("{}: {said}", describe(&url)));
+                        list.push(url);
+                    } else {
+                        let base = typed.split_once('#').map_or(typed.as_str(), |(b, _)| b);
+                        let Some(found) = at(&list, base.trim()) else {
+                            return Err(Error::new(format!(
+                                "{}: not a mirror of this vault",
+                                describe(typed.trim())
+                            )));
+                        };
+                        list.remove(found);
+                    }
+                }
+                let saved = client::set_mirrors(paths, &config, &list)?;
+                for line in heard {
+                    println!("{line}");
+                }
+                saved
+            }
+        };
+        match &config.source {
+            Source::Url(url) => println!(
+                "url: {} (the source: joins and admin publishes start here)",
+                describe(url)
+            ),
+            Source::Path(path) => println!("path: {} (a path has no mirrors)", path.display()),
+        }
+        for url in &config.mirrors {
+            println!("mirror: {} (read, never written to)", describe(url));
+        }
+        if config.mirrors.is_empty() && matches!(config.source, Source::Url(_)) {
+            println!("no mirrors: aterm secrets mirrors add <url> lists one");
+        }
+        for note in client::mirror_notes(paths) {
+            println!("mirror {note}");
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+
     fn sync(paths: &Paths, diagnostic: bool) -> crate::Result<ExitCode> {
         if diagnostic {
             let outcome = sync_diagnostic(paths);
@@ -2480,6 +2628,24 @@ mod unix {
                 Ok(ExitCode::FAILURE)
             }
         }
+    }
+
+    fn keep(paths: &Paths, names: &[String]) -> crate::Result<ExitCode> {
+        let mut all = true;
+        for (name, kept) in client::keep(paths, names)? {
+            match kept {
+                client::Kept::Kept => println!("kept {name}"),
+                client::Kept::Not(why) => {
+                    all = false;
+                    println!("not kept: {why}");
+                }
+            }
+        }
+        Ok(if all {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        })
     }
 
     fn get(paths: &Paths, name: &str) -> crate::Result<ExitCode> {
@@ -2970,6 +3136,13 @@ mod unix {
     /// The command a person pastes on a new Mac to join the vault at `url` signed by `signer`:
     /// `url` as the other Macs reach it, a loopback host named by `lan` (this Mac's LAN name).
     pub(super) fn join_command(url: &str, signer: &str, lan: Option<&str>) -> String {
+        // Query parameters may carry credentials. A template keeps those out of stdout
+        // without suggesting that a stripped endpoint is a usable replacement.
+        if url.contains('?') || url.contains('#') || aterm_http::Uri::parse(url).is_none() {
+            return format!(
+                "aterm secrets join <vault-url>#{signer} (replace <vault-url> with the full configured URL)"
+            );
+        }
         let reached = match (aterm_http::Uri::parse(url), lan) {
             (Some(uri), Some(lan))
                 if matches!(uri.host(), "127.0.0.1" | "localhost" | "[::1]" | "::1") =>
@@ -2989,7 +3162,8 @@ mod unix {
             .map(|uri| uri.port())
             .ok_or_else(|| {
                 Error::new(format!(
-                    "--serve serves the vault from this Mac: {source} is not a vault URL"
+                    "--serve serves the vault from this Mac: {} is not a vault URL",
+                    describe(source)
                 ))
             })?;
         let mut serve = Vec::new();
@@ -3019,6 +3193,19 @@ mod unix {
     const ANSWER_LOOK: Duration = Duration::from_secs(1);
     const ANSWER_STEP: Duration = Duration::from_millis(50);
 
+    #[cfg(test)]
+    #[test]
+    fn server_start_errors_omit_invalid_url_credentials() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(root.path());
+        let credential = "synthetic-server-url-credential";
+        let url = format!("https://user:{credential}@vault.example/v1/team");
+        let create_error = serve_here(&paths, &url).unwrap_err().to_string();
+        assert!(!create_error.contains(credential));
+        let timeout_error = answering(&url, Duration::ZERO).unwrap_err().to_string();
+        assert!(!timeout_error.contains(credential));
+    }
+
     /// Wait until the server `serve`'s flags set up answers a GET on this Mac, so a vault can be
     /// made or joined there the moment `server on` returns.
     fn until_answering(serve: &[String]) -> crate::Result<()> {
@@ -3037,7 +3224,8 @@ mod unix {
                 Ok(_) => return Ok(()),
                 Err(error) if left <= ANSWER_STEP => {
                     return Err(Error::new(format!(
-                        "the server did not answer at {url} within {}s: {error}",
+                        "the server did not answer at {} within {}s: {error}",
+                        describe(url),
                         hang.as_secs()
                     )));
                 }
@@ -4236,6 +4424,156 @@ mod tests {
         assert!(parse(&["sync".into(), "--diagnostic".into(), "extra".into()]).is_err());
     }
 
+    #[test]
+    fn mirrors_lists_or_adds_or_removes_urls() {
+        assert_eq!(
+            parse(&words("mirrors")),
+            Ok(Command::Mirrors {
+                change: None,
+                urls: Vec::new()
+            })
+        );
+        assert_eq!(
+            parse(&words("mirrors add http://a:1/v1/x http://b:1/v1/x")),
+            Ok(Command::Mirrors {
+                change: Some(true),
+                urls: words("http://a:1/v1/x http://b:1/v1/x")
+            })
+        );
+        assert_eq!(
+            parse(&words("mirrors remove http://a:1/v1/x")),
+            Ok(Command::Mirrors {
+                change: Some(false),
+                urls: words("http://a:1/v1/x")
+            })
+        );
+        for refused in [
+            "mirrors add",
+            "mirrors remove",
+            "mirrors list",
+            "mirrors x y",
+        ] {
+            assert!(parse(&words(refused)).is_err(), "{refused}");
+        }
+    }
+
+    /// `aterm secrets mirrors add` saves a mirror of this vault that does not answer yet, refuses
+    /// one of another vault and one serving bytes this Mac's pin does not verify, saving nothing,
+    /// and `remove` takes one off.
+    ///
+    /// NEGATIVE CONTROL: save what `add` is given without reading it first (no `probe_mirror`):
+    /// fails "a vault this pin does not verify is refused".
+    #[cfg(unix)]
+    #[test]
+    fn mirrors_add_refuses_what_is_no_address_of_this_vault() {
+        use crate::client;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = client::Paths::for_home(&root.path().join("admin"));
+        let serve = |store: std::path::PathBuf| {
+            crate::server::start(
+                std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+                &crate::server::Options {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    store,
+                    advertise: None,
+                    pins: Vec::new(),
+                    hold: std::time::Duration::from_millis(200),
+                    keep_awake: false,
+                },
+            )
+            .unwrap()
+        };
+        let server = serve(root.path().join("store"));
+        let url = format!("http://{}/v1/team", server.addr);
+        client::create(&paths, &url, None, Some("admin")).unwrap();
+        let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unanswered = format!("http://{}/v1/team", gone.local_addr().unwrap());
+        drop(gone);
+        assert_eq!(
+            unix::mirrors(&paths, Some(true), std::slice::from_ref(&unanswered)).unwrap(),
+            std::process::ExitCode::SUCCESS
+        );
+        assert_eq!(
+            client::config(&paths).unwrap().unwrap().mirrors,
+            std::slice::from_ref(&unanswered)
+        );
+        let other = format!("http://{}/v1/other", server.addr);
+        assert!(
+            unix::mirrors(&paths, Some(true), &[other]).is_err(),
+            "another vault's address is refused"
+        );
+        // An address serving bytes no pin of this vault verifies: the other vault's store.
+        let foreign_root = root.path().join("foreign");
+        let foreign = client::Paths::for_home(&foreign_root);
+        let foreign_server = serve(foreign_root.join("store"));
+        let foreign_url = format!("http://{}/v1/team", foreign_server.addr);
+        client::create(&foreign, &foreign_url, None, Some("other")).unwrap();
+        assert!(
+            unix::mirrors(&paths, Some(true), std::slice::from_ref(&foreign_url)).is_err(),
+            "a vault this pin does not verify is refused"
+        );
+        assert_eq!(
+            client::config(&paths).unwrap().unwrap().mirrors,
+            std::slice::from_ref(&unanswered),
+            "nothing saved"
+        );
+        assert!(unix::mirrors(&paths, Some(false), std::slice::from_ref(&url)).is_err());
+        assert_eq!(
+            unix::mirrors(&paths, Some(false), &[unanswered]).unwrap(),
+            std::process::ExitCode::SUCCESS
+        );
+        assert!(client::config(&paths).unwrap().unwrap().mirrors.is_empty());
+        foreign_server.stop();
+        server.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_an_unknown_mirror_never_echoes_url_credentials() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = crate::client::Paths::for_home(root.path());
+        crate::fsx::ensure_private_dir(&paths.dir).unwrap();
+        crate::fsx::write_atomic(
+            &paths.dir.join("source.toml"),
+            b"url = 'https://vault.example/v1/team'\nname = 'team'\nhost = 'test'\n",
+            0o600,
+        )
+        .unwrap();
+        let credential = "synthetic-unlisted-mirror-credential";
+        for url in [
+            format!("https://mirror.example/v1/team?token={credential}"),
+            format!("https://mirror.example/v1/team#{credential}"),
+            format!("https://user:{credential}@mirror.example/v1/team"),
+        ] {
+            let error = unix::mirrors(&paths, Some(false), &[url]).unwrap_err();
+            let shown = error.to_string();
+            assert!(!shown.contains(credential));
+            assert!(shown.contains("not a mirror of this vault"));
+        }
+        assert!(
+            crate::client::config(&paths)
+                .unwrap()
+                .unwrap()
+                .mirrors
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn keep_takes_one_or_more_names_and_no_flag() {
+        assert_eq!(
+            parse(&[
+                "keep".into(),
+                "signing".into(),
+                "~/.aterm/machine.key".into()
+            ])
+            .unwrap(),
+            Command::Keep(vec!["signing".into(), "~/.aterm/machine.key".into()])
+        );
+        assert!(parse(&["keep".into()]).is_err());
+        assert!(parse(&["keep".into(), "--all".into()]).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn sync_diagnostic_reports_a_real_config_failure_without_its_path_or_contents() {
@@ -4431,6 +4769,23 @@ mod tests {
             "create a --name",
         ] {
             assert!(parse(&words(refused)).is_err(), "{refused}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_join_line_never_prints_private_url_parts() {
+        let credential = "synthetic-join-url-credential";
+        for url in [
+            format!("https://vault.example/v1/team?token={credential}"),
+            format!("http://127.0.0.1:7484/v1/team?token={credential}"),
+            format!("https://user:{credential}@vault.example/v1/team"),
+            format!("https://vault.example/v1/team#{credential}"),
+        ] {
+            let hint = unix::join_command(&url, "age1signer", Some("test.local"));
+            assert!(!hint.contains(credential));
+            assert!(hint.contains("<vault-url>#age1signer"));
+            assert!(hint.contains("full configured URL"));
         }
     }
 
@@ -6042,6 +6397,7 @@ mod tests {
         let waiting = |source| Status {
             config: Some(Config {
                 source,
+                mirrors: Vec::new(),
                 name: "home".into(),
                 signer: Some([3; 32]),
                 followed: Vec::new(),
@@ -6441,6 +6797,7 @@ mod tests {
         use crate::transport::Source;
         let config = |signer: Option<[u8; 32]>| crate::client::Config {
             source: Source::Path("/v/team.vault".into()),
+            mirrors: Vec::new(),
             name: "team".to_string(),
             signer,
             followed: Vec::new(),

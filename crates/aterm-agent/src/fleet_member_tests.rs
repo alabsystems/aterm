@@ -125,6 +125,9 @@ fn peer_scans_refresh_reachability_without_admission_evidence() {
 #[path = "fleet_member_tests/deny_wait.rs"]
 mod deny_wait;
 
+#[path = "fleet_member_tests/unread_log.rs"]
+mod unread_log;
+
 #[test]
 fn automatic_join_uses_a_local_lan_address_and_reserves_its_port() {
     let local = "192.168.1.102".parse().unwrap();
@@ -170,17 +173,23 @@ fn giving_a_node_better_names_keeps_its_temporary_alias() {
     name_machine(&world.places, &args(&["set", "m62"])).unwrap();
     let node = own_node(&world.places).unwrap();
     let alias = member::temporary_name(&node);
-    assert_eq!(names_this_machine(&world.places, "m62"), Some(node.clone()));
     assert_eq!(
-        names_this_machine(&world.places, &alias),
+        names_this_machine(&world.places, "m62").unwrap(),
+        Some(node.clone())
+    );
+    assert_eq!(
+        names_this_machine(&world.places, &alias).unwrap(),
         Some(node.clone())
     );
     name_machine(&world.places, &args(&["set", "studio"])).unwrap();
     assert_eq!(
-        names_this_machine(&world.places, "studio"),
+        names_this_machine(&world.places, "studio").unwrap(),
         Some(node.clone())
     );
-    assert_eq!(names_this_machine(&world.places, &alias), Some(node));
+    assert_eq!(
+        names_this_machine(&world.places, &alias).unwrap(),
+        Some(node)
+    );
     assert!(name_machine(&world.places, &args(&["set", &alias])).is_err());
     assert!(name_machine(&world.places, &args(&["set", "../escape"])).is_err());
     assert_eq!(
@@ -303,6 +312,45 @@ fn the_fleet_name_follows_a_changed_identity_name_it_wrote_itself() {
     );
     follow_fleet_name_at(&world.places, "m42", &no).unwrap();
     assert_eq!(name().as_deref(), Some("den"));
+}
+
+/// A Mac the roster relabelled (`m58` to `m176`, keeping no alias) whose fleet name is the old
+/// label, which an older aterm's follow wrote with no record of the write, signs the roster's label
+/// after the next follow, as it does where a person set that `m<N>`; a name of the person's own is
+/// kept. NEGATIVE CONTROL: where the name followed is not the label the roster gives this Mac (the
+/// person's `[identity] name`), the old label is kept.
+#[test]
+fn a_stale_swarm_label_follows_the_rosters_label_and_a_persons_name_is_kept() {
+    let gives = |word: &str| word == "m176";
+    let world = World::new("follow-relabel");
+    member::ensure_private_dir(&world.places.state).unwrap();
+    let name = || member::read_primary_name(&world.places.state).unwrap();
+    write_private(&world.places.state, member::NAME_FILE, b"m58\n").unwrap();
+    assert_eq!(followed_name(&world.places.state), None);
+    assert_eq!(
+        fleet_name_at(&world.places, "studio", &gives).unwrap(),
+        FleetName::Kept("m58".to_owned())
+    );
+    assert_eq!(
+        fleet_name_at(&world.places, "m176", &gives).unwrap(),
+        FleetName::Due {
+            from: "m58".to_owned()
+        }
+    );
+    follow_fleet_name_at(&world.places, "m176", &gives).unwrap();
+    assert_eq!(name().as_deref(), Some("m176"));
+
+    name_machine(&world.places, &args(&["set", "m58"])).unwrap();
+    follow_fleet_name_at(&world.places, "m176", &gives).unwrap();
+    assert_eq!(name().as_deref(), Some("m176"));
+
+    name_machine(&world.places, &args(&["set", "studio"])).unwrap();
+    assert_eq!(
+        fleet_name_at(&world.places, "m176", &gives).unwrap(),
+        FleetName::Kept("studio".to_owned())
+    );
+    follow_fleet_name_at(&world.places, "m176", &gives).unwrap();
+    assert_eq!(name().as_deref(), Some("studio"));
 }
 
 /// A follow writes only over the fleet name it read: a name the person set between its read and
@@ -555,7 +603,7 @@ impl World {
 
     fn write_config(&self, text: &str) {
         std::fs::create_dir_all(self.places.config.parent().unwrap()).unwrap();
-        std::fs::write(&self.places.config, text).unwrap();
+        aterm_uds::atomic_file::write(&self.places.config, text.as_bytes(), 0o600).unwrap();
     }
 
     fn lock_config(&self) -> std::path::PathBuf {
@@ -1800,6 +1848,58 @@ fn a_join_again_of_the_same_fleet_is_answered_by_any_member_that_serves_it() {
     assert_eq!(
         read_key_file(&member.places.state).unwrap(),
         FleetSecret::new(&secret).unwrap()
+    );
+    // The seed `other` minted at its own init is signed for another secret: refused from it, so
+    // the root's stays (machine names §3.3).
+    let root_seed = member::fleet_seed::read(&issuer.places.state)
+        .unwrap()
+        .expect("minted at init");
+    assert_eq!(
+        member::fleet_seed::read(&member.places.state).unwrap(),
+        Some(root_seed)
+    );
+    // A relay of the root's seed by a member that did not mint it waits for a book read that
+    // binds the root's key.
+    member::hold_book(&other.places.state)
+        .unwrap()
+        .keep_seed(Some(&root_seed))
+        .unwrap();
+    let fresh = World::new("any-fresh");
+    let fresh_opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&fresh.places, &fresh_opts, &there));
+    assert_eq!(member::fleet_seed::read(&fresh.places.state).unwrap(), None);
+    // Its next read of the book it joined through relays the root's seed in the reply's
+    // trailer, which waits while that book binds no key to the root, and is adopted once it
+    // carries the root's own signed entry, as a heartbeat of the root's would record it.
+    with_peers_answering(|| ok(peers(&fresh.places, &[])));
+    assert_eq!(
+        member::fleet_seed::read(&fresh.places.state).unwrap(),
+        None,
+        "no book here binds the root"
+    );
+    let root = member::read_node_identity(&issuer.places.state)
+        .unwrap()
+        .unwrap();
+    member::hold_book(&other.places.state)
+        .unwrap()
+        .update(|book| {
+            book.push(Peer::own(
+                &root,
+                ("127.0.0.1", closed_port(), "0.160.0"),
+                aterm_netplace::unix_ms_now(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+    with_peers_answering(|| ok(peers(&fresh.places, &[])));
+    assert_eq!(
+        member::fleet_seed::read(&fresh.places.state).unwrap(),
+        Some(root_seed),
+        "relayed by the member it joined through"
     );
 }
 
@@ -4698,6 +4798,74 @@ fn peers_add_rm_and_leave() {
 }
 
 #[test]
+fn an_init_mints_the_seed_a_rotate_keeps_and_a_leave_keeps_its_digest() {
+    let world = World::new("leave-seed");
+    let made = ok(init(
+        &world.places,
+        &args(&["--host", "m7.local", "--port", "7300"]),
+    ));
+    assert!(made.contains("  seed       "), "{made}");
+    let me = member::node_identity(&world.places.state).unwrap();
+    let mark = || {
+        aterm_net::fleet::read_key_file(&world.places.state)
+            .unwrap()
+            .mark()
+    };
+    let seed = member::fleet_seed::read(&world.places.state)
+        .unwrap()
+        .expect("the root mints its fleet's seed at init");
+    let founded = mark();
+    assert!(
+        seed.verifies(&me.key(), founded),
+        "bound to the fleet's key"
+    );
+    let rotated = ok(init(&world.places, &args(&["--rotate"])));
+    assert!(
+        rotated.contains("signed again for the new secret"),
+        "{rotated}"
+    );
+    let kept = member::fleet_seed::read(&world.places.state)
+        .unwrap()
+        .expect("a rotate keeps the seed");
+    assert_eq!(kept.digest(), seed.digest(), "the same seed");
+    assert_ne!(mark(), founded, "a new secret");
+    assert!(
+        kept.verifies(&me.key(), mark()) && !kept.verifies(&me.key(), founded),
+        "signed again for it"
+    );
+    let seed = kept;
+    let refused = world.places.state.join(member::fleet_seed::CONFLICT_FILE);
+    write_private(
+        &world.places.state,
+        member::fleet_seed::CONFLICT_FILE,
+        member::fleet_seed::conflict_line(&seed, 1).as_bytes(),
+    )
+    .unwrap();
+    let left = ok(leave(&world.places, &[]));
+    assert!(left.contains("the fleet seed's digest"), "{left}");
+    assert!(left.contains("(the fleet seed)"), "{left}");
+    assert!(
+        !refused.exists(),
+        "its conflict record goes too, unreported"
+    );
+    assert_eq!(member::fleet_seed::read(&world.places.state).unwrap(), None);
+    assert_eq!(
+        member::fleet_seed::read_digest(&world.places.state).unwrap(),
+        Some(seed.digest()),
+        "Floor still verifies this node's records"
+    );
+    let again = ok(leave(&world.places, &[]));
+    assert!(
+        !again.contains("fleet seed"),
+        "nothing more to keep: {again}"
+    );
+    assert_eq!(
+        member::fleet_seed::read_digest(&world.places.state).unwrap(),
+        Some(seed.digest())
+    );
+}
+
+#[test]
 fn a_leave_says_only_what_its_write_ended() {
     const UNLISTENS: &str = "stops listening";
     const UNTOLD: &str = "The issuer is not told";
@@ -6950,14 +7118,23 @@ fn a_join_of_another_fleet_keeps_no_drive_grant() {
         (world, code, serving)
     };
     let (first, first_code, _first) = issuer_of("grant-first");
-    let (_other, other_code, _other_serving) = issuer_of("grant-other");
+    let (other, other_code, _other_serving) = issuer_of("grant-other");
     let member = World::new("grant-member");
     let opts = Opts {
         port: Some(closed_port()),
         host: Some("127.0.0.1".to_owned()),
         ..Opts::default()
     };
-    ok(join(&member.places, &opts, &first_code));
+    let joined = ok(join(&member.places, &opts, &first_code));
+    let seed = member::fleet_seed::read(&first.places.state)
+        .unwrap()
+        .expect("the root minted one at init");
+    assert_eq!(
+        member::fleet_seed::read(&member.places.state).unwrap(),
+        Some(seed),
+        "the join adopts its root's seed (machine names §3.3)"
+    );
+    assert!(joined.contains("the fleet's, from its root"), "{joined}");
     let issuer_node = member::node_id(&first.places.state).unwrap();
     ok(allow(
         &member.places,
@@ -6973,8 +7150,23 @@ fn a_join_of_another_fleet_keeps_no_drive_grant() {
         granted,
         "a join again of the same fleet keeps its grants"
     );
+    assert_eq!(
+        member::fleet_seed::read(&member.places.state).unwrap(),
+        Some(seed),
+        "and its seed"
+    );
 
     let moved = ok(join(&member.places, &opts, &other_code));
+    assert_eq!(
+        member::fleet_seed::read(&member.places.state).unwrap(),
+        member::fleet_seed::read(&other.places.state).unwrap(),
+        "another fleet's join takes that fleet's seed in place of the old one"
+    );
+    assert_eq!(
+        member::fleet_seed::read_digest(&member.places.state).unwrap(),
+        Some(seed.digest()),
+        "and keeps its digest, as a leave does"
+    );
     assert!(
         moved.contains("no Mac drives this one")
             && moved.contains("still reads it at content, which `aterm fleet allow facts` lowers"),
@@ -7284,7 +7476,7 @@ fn a_join_of_another_fleet_whose_key_cannot_be_written_leaves_the_book_as_it_was
         let serving = Listener::serve(listener, &world.places.state);
         (world, code, serving)
     };
-    let (_first, first_code, _first_serving) = issuer_of("unkeyed-first");
+    let (first, first_code, _first_serving) = issuer_of("unkeyed-first");
     let (other, other_code, _other_serving) = issuer_of("unkeyed-other");
     let member = World::new("unkeyed-member");
     let opts = Opts {
@@ -7293,6 +7485,14 @@ fn a_join_of_another_fleet_whose_key_cannot_be_written_leaves_the_book_as_it_was
         ..Opts::default()
     };
     ok(join(&member.places, &opts, &first_code));
+    let seed = member::fleet_seed::read(&first.places.state)
+        .unwrap()
+        .expect("the root minted one at init");
+    assert_eq!(
+        member::fleet_seed::read(&member.places.state).unwrap(),
+        Some(seed),
+        "adopted from its root"
+    );
     let book_before = read_peers(&member.places.state).unwrap();
     assert!(
         book_before.iter().any(|peer| peer.via == Via::Issuer),
@@ -7309,6 +7509,11 @@ fn a_join_of_another_fleet_whose_key_cannot_be_written_leaves_the_book_as_it_was
     };
     assert!(failed.contains("has recorded this machine"), "{failed}");
     assert_eq!(read_peers(&other.places.state).unwrap().len(), 1);
+    assert_eq!(
+        member::fleet_seed::read(&member.places.state).unwrap(),
+        Some(seed),
+        "the old fleet's seed is put back with its key"
+    );
 
     std::fs::remove_dir(&key).unwrap();
     write_private(&member.places.state, KEY_FILE, &held).unwrap();
@@ -8316,6 +8521,7 @@ fn a_read_that_ends_after_a_leave_keeps_nothing_of_the_fleet() {
         peers: Vec::new(),
         at: IpAddr::from(Ipv4Addr::LOCALHOST),
         proven: true,
+        seed: None,
     });
     let own = member::node_id(&member.places.state).unwrap();
     assert_eq!(
@@ -11438,9 +11644,15 @@ fn fleet_machine_in_aterm_toml_names_this_machine_and_survives_join_allow_and_le
     ok(join(&member.places, &sync_here(), &code));
 
     let own = own_node(&member.places).expect("joined node");
-    assert_eq!(names_this_machine(&member.places, "m32"), Some(own.clone()));
-    assert_eq!(names_this_machine(&member.places, "M32"), Some(own));
-    assert_eq!(names_this_machine(&member.places, "m33"), None);
+    assert_eq!(
+        names_this_machine(&member.places, "m32").unwrap(),
+        Some(own.clone())
+    );
+    assert_eq!(
+        names_this_machine(&member.places, "M32").unwrap(),
+        Some(own)
+    );
+    assert_eq!(names_this_machine(&member.places, "m33").unwrap(), None);
 
     ok(allow(&member.places, &args(&["content"])));
     assert_eq!(
@@ -11755,7 +11967,7 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
     aterm_secrets::client::admin_publish(&paths, &adm, &doc).expect("publish roster");
     aterm_secrets::client::sync(&paths, None).expect("sync local copy");
 
-    let ids = roster_identities(&member.places);
+    let ids = roster_identities(&member.places).unwrap();
     // m100 is excluded because its alias `m4` is on `deny_labels`; m99 is excluded by `deny_nodes`.
     assert_eq!(
         ids.iter()
@@ -11786,7 +11998,7 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
     // Even if `[fleet] machine = "m4"` is in `aterm.toml`, `names_this_machine` must reject it.
     std::fs::create_dir_all(member.places.config.parent().unwrap()).unwrap();
     std::fs::write(&member.places.config, "[fleet]\nmachine = \"m4\"\n").unwrap();
-    assert_eq!(names_this_machine(&member.places, "m4"), None);
+    assert_eq!(names_this_machine(&member.places, "m4").unwrap(), None);
 
     // Once the denied alias is removed from m100's aliases, both `m100` and alias `m32` name this machine.
     // And if surviving member `m25` has a legacy `vault_name` (`"m4-2"`) colliding with denied `"m4"`,
@@ -11804,7 +12016,7 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
     .expect("set roster");
     aterm_secrets::client::admin_publish(&paths, &adm2, &doc2).expect("publish roster");
     aterm_secrets::client::sync(&paths, None).expect("sync local copy");
-    let clean_ids = roster_identities(&member.places);
+    let clean_ids = roster_identities(&member.places).unwrap();
     let m25_after = clean_ids
         .iter()
         .find(|i| i.label.as_deref() == Some("m25"))
@@ -11812,14 +12024,14 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
     assert_eq!(m25_after.vault_name, None);
     assert_eq!(m25_after.host, None);
     assert_eq!(
-        names_this_machine(&member.places, "m100"),
+        names_this_machine(&member.places, "m100").unwrap(),
         Some(own.node().to_owned())
     );
     assert_eq!(
-        names_this_machine(&member.places, "m32"),
+        names_this_machine(&member.places, "m32").unwrap(),
         Some(own.node().to_owned())
     );
-    assert_eq!(names_this_machine(&member.places, "m4"), None);
+    assert_eq!(names_this_machine(&member.places, "m4").unwrap(), None);
 
     // `drive_grants` and `drive_fleet_in` must refuse a peer whose node_key is denied in
     // `aterm-swarm-roster`, while `join_places` and `issuer_copies` filter it out.

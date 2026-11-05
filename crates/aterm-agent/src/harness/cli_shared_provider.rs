@@ -557,7 +557,7 @@ fn read_staged_bytes(
 ) -> Result<Option<aterm_uds::secret::Secret>, String> {
     #[cfg(unix)]
     {
-        use aterm_uds::private_file::{PrivateFileError, read_owned_into, read_private_into};
+        use aterm_uds::private_file::{PrivateFileError, read_owned, read_private};
         let parent = path
             .parent()
             .ok_or("staged evidence has no private parent")?;
@@ -565,17 +565,14 @@ fn read_staged_bytes(
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or("invalid staged evidence name")?;
-        let mut bytes = vec![0; 2 * 1024 * 1024];
+        let max = 2 * 1024 * 1024;
         let result = if private {
-            read_private_into(parent, name, bytes.len(), &mut bytes).map(|read| read.len)
+            read_private(parent, name, max)
         } else {
-            read_owned_into(parent, name, bytes.len(), &mut bytes).map(|read| read.len)
+            read_owned(parent, name, max)
         };
         match result {
-            Ok(len) => {
-                bytes.truncate(len);
-                Ok(Some(aterm_uds::secret::Secret::from_vec(bytes)))
-            }
+            Ok(bytes) => Ok(Some(aterm_uds::secret::Secret::from_vec(bytes))),
             Err(PrivateFileError::Missing) => Ok(None),
             Err(_) => Err("staged evidence is not private, owned, or intact".into()),
         }
@@ -587,7 +584,8 @@ fn read_staged_bytes(
     }
 }
 
-fn wipe_json(value: Value) {
+/// Scrubs every string of `value` as it drops it ([`aterm_uds::secret::Secret`]).
+pub(crate) fn wipe_json(value: Value) {
     match value {
         Value::String(text) => {
             drop(aterm_uds::secret::Secret::from_vec(text.into_bytes()));

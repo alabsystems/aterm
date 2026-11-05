@@ -255,6 +255,7 @@ fn every_host_answer_reads_back_as_written() {
             as_of_ms: i64::MIN,
             no_progress: vec![call(task, wait, birth), call(None, None, Some(1))],
             held: None,
+            left: None,
         }));
     }
     same(None::<crate::supervise::FactsReading>);
@@ -262,6 +263,7 @@ fn every_host_answer_reads_back_as_written() {
         as_of_ms: 1_760_000_000_000,
         no_progress: Vec::new(),
         held: None,
+        left: None,
     }));
     for programs in [
         Vec::new(),
@@ -285,6 +287,19 @@ fn every_host_answer_reads_back_as_written() {
                 as_of_ms: i64::MIN,
                 programs,
             }),
+            left: None,
+        }));
+    }
+    for oldest_ms in [None, Some(u64::MAX)] {
+        same(Some(crate::supervise::FactsReading {
+            as_of_ms: 1_760_000_000_000,
+            no_progress: Vec::new(),
+            held: None,
+            left: Some(crate::supervise::LeftoverReading {
+                as_of_ms: i64::MIN,
+                count: u32::MAX,
+                oldest_ms,
+            }),
         }));
     }
     let before_held = br#"{"as-of-ms":5,"no-progress":[]}"#;
@@ -295,8 +310,9 @@ fn every_host_answer_reads_back_as_written() {
             as_of_ms: 5,
             no_progress: Vec::new(),
             held: None,
+            left: None,
         })),
-        "a tape from before the held programs were read reads back without them"
+        "a tape from before the held programs and the left rows were read reads back without them"
     );
     let before_exec_version = br#"{"as-of-ms":5,"no-progress":[],"held":{"as-of-ms":4,"programs":[{"pid":601,"held-ms":1140000}]}}"#;
     assert_eq!(
@@ -316,6 +332,7 @@ fn every_host_answer_reads_back_as_written() {
                     held_ms: 1_140_000,
                 }],
             }),
+            left: None,
         })),
         "a historical answer keeps its wait without inventing an actual exec version"
     );
@@ -1009,6 +1026,51 @@ fn needs_standing_is_a_taped_notification() {
     assert_eq!(d.door.as_deref(), Some("host.needs_standing"), "{d:?}");
 }
 
+/// THE LEFTOVER DOOR'S ANSWER ON A TAPE: every answer reads back as itself, tokens in either
+/// kernel's shape; a token that is none does not read back; and a door newer than the tape reads
+/// nothing asked.
+#[test]
+fn a_left_read_round_trips_its_tape() {
+    use crate::harness::leftover::{LeftRead, token_of};
+    for read in [
+        None,
+        Some(LeftRead::NotAsked),
+        Some(LeftRead::Unchecked),
+        Some(LeftRead::Rows(Vec::new())),
+        Some(LeftRead::Rows(
+            ["2606@1792098840004410:3", "2607@1792098840014410"]
+                .iter()
+                .map(|t| token_of(t).expect("a token"))
+                .collect(),
+        )),
+    ] {
+        assert_eq!(
+            <Option<LeftRead> as TapeValue>::from_tape(&read.to_tape()).ok(),
+            Some(read.clone()),
+            "{read:?}"
+        );
+    }
+    assert!(<Option<LeftRead> as TapeValue>::from_tape(br#"{"rows":["2606"]}"#).is_err());
+    assert_eq!(
+        <Option<LeftRead> as TapeValue>::absent(),
+        Some(Some(LeftRead::NotAsked))
+    );
+}
+
+/// A HOLD NO ROW HELD IS TAPED AS BEFORE THE LEFT LEG: its request names no left count, so a tape
+/// recorded before compares as it was; one rows held names them.
+#[test]
+fn a_hold_with_no_left_row_is_taped_as_before() {
+    let none = crate::harness::acts::LandHeld {
+        left: 0,
+        ..a_full_hold()
+    };
+    let text = String::from_utf8(request(&[("held", &Some(none))])).expect("utf-8");
+    assert!(text.ends_with("sub_unpushed: 5, parked: 6 })"), "{text}");
+    let text = String::from_utf8(request(&[("held", &Some(a_full_hold()))])).expect("utf-8");
+    assert!(text.ends_with("parked: 6, left: 7 })"), "{text}");
+}
+
 fn a_full_hold() -> crate::harness::acts::LandHeld {
     use crate::harness::acts::{HoldLeg, LandHeld, OpenWord};
     LandHeld {
@@ -1029,6 +1091,7 @@ fn a_full_hold() -> crate::harness::acts::LandHeld {
         unlanded: u16::MAX,
         sub_unpushed: 5,
         parked: 6,
+        left: 7,
     }
 }
 
@@ -2178,4 +2241,62 @@ fn land_said_is_a_taped_notification() {
     assert!(told.is_err(), "the replay halts at the divergence");
     let d = core.diverged().expect("latched");
     assert_eq!(d.door.as_deref(), Some("host.land_said"), "{d:?}");
+}
+
+/// A TAPE WITHOUT THE OVERLAP DOOR REPLAYS NONE: a replay whose header names a recording build's
+/// doors without `host.overlap` answers no reading there and diverges nothing. NEGATIVE CONTROL:
+/// a tape whose header lists the door replays its recorded reading. And an overlap reading reads
+/// back as written (none, one with no peer, one with two), while a tape whose peer word is no
+/// minted sid does not read back.
+#[test]
+fn a_tape_without_the_overlap_door_replays_none() {
+    use crate::supervise::IdleHost;
+    use crate::supervise::overlap::OverlapReading;
+    use crate::supervise::run::host_door::HOST_DOORS;
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::TAPE_ID;
+    use astream_effects::EffectRecord;
+    let reading = OverlapReading::new(
+        1_760_000_000_000,
+        2,
+        &["s-ffeeddccbbaa99887766", "s-0a1b2c3d4e5f60718293"],
+    )
+    .expect("a reading");
+    let replayed = |listed: bool| {
+        let records = if listed {
+            vec![EffectRecord::Exchange {
+                door: "host.overlap".to_string(),
+                request: Vec::new(),
+                reply: Some(reading.clone()).to_tape(),
+            }]
+        } else {
+            Vec::new()
+        };
+        let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
+        core.recorded_doors(
+            HOST_DOORS
+                .iter()
+                .filter(|door| listed || **door != "host.overlap")
+                .map(ToString::to_string)
+                .collect(),
+        );
+        let host = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+        let answer = IdleHost::overlap(&host);
+        (answer, core.diverged().is_none())
+    };
+    assert_eq!(replayed(false), (None, true), "no door, no reading");
+    assert_eq!(
+        replayed(true),
+        (Some(reading.clone()), true),
+        "CONTROL: the door listed, its recorded reading"
+    );
+    same(None::<OverlapReading>);
+    same(Some(reading.clone()));
+    same(OverlapReading::new(5, 0, &[]));
+    let planted = br#"{"as-of-ms":5,"files":1,"peers":["/Users//x/repo/src/lib.rs"]}"#;
+    assert!(
+        <Option<OverlapReading> as HostReply>::take(planted, Instant::now()).is_err(),
+        "a path in a peer's place does not read back"
+    );
 }

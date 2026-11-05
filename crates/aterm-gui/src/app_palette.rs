@@ -456,6 +456,8 @@ impl App {
                 .and_then(|ws| ws.tab_set.active())
                 .is_some_and(|tab| tab.root.len() > 1),
             can_rewind: wid.is_some_and(|wid| self.front_can_rewind(wid)),
+            aos_attached: window.is_some_and(|ws| ws.fx.cursor().momentum.aos_attached()),
+            aos_unseen: wid.is_some_and(|wid| self.aos_unseen_on(wid)),
             multi_tab,
             native_tab_active,
             terminal_front,
@@ -526,6 +528,10 @@ impl App {
             kitty_favourited: self.kitty_log.is_favourite(promotable),
             front_tab_split: self.front_tab_split(),
             can_rewind: front.is_some_and(|wid| self.front_can_rewind(wid)),
+            aos_attached: self
+                .front()
+                .is_some_and(|ws| ws.fx.cursor().momentum.aos_attached()),
+            aos_unseen: front.is_some_and(|wid| self.aos_unseen_on(wid)),
         });
         crate::menu::set_stats_bars_form(self.stats_bars_form());
         crate::menu::set_deck_size_pref(self.deck_size_pref());

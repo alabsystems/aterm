@@ -24,10 +24,12 @@ fn a_previous_round_actor_is_not_a_new_authenticated_contact() {
     repair.data.deferral = Some(crate::replica::InventoryDeferral {
         inventory: "conflicts",
         local_error: Some("previous store refused".into()),
+        local_cause: None,
         retaining_primary_conflicts: false,
         peer_unavailable: false,
     });
     repair.data.batch_deferral = Some(crate::replica::BatchDeferral {
+        cause: aterm_types::network_state::RepairCause::Other,
         batch: "operations",
         stage: "ingest",
         reason: "previous batch refused".into(),
@@ -2394,9 +2396,10 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
     };
     assert_eq!(final_journal_ids, expected_journal_ids);
 
-    // Narrowing `aterm-commons-control-v1` on `m1` to exclude `m4` rotates `EpochAudience::Commons`
-    // in `m1`'s membership log without a `Body::Remove` record; `m1` must refuse `m4`'s `ACX2`
-    // handshake (`verify_peer_against_local_log`) even before `m4` receives the rotated epoch!
+    // Revoking `m4` on `m1` signs its `Body::Remove`; `m1` must refuse `m4`'s `ACX2` handshake
+    // (`verify_peer_against_local_log`) even before `m4` receives the record. Narrowing the
+    // control entry's audience alone no longer excludes anyone: an omitted Wrap is a gap the
+    // holders heal, and only an explicit Remove, a node removal or a roster deny revokes a seat.
     let b4_before = Bootstrap::required(&m4).unwrap();
     let e4_before = Endpoint::from_bootstrap(&b4_before)
         .unwrap()
@@ -2405,22 +2408,8 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
         .unwrap();
     {
         let admin = admin_open(&m1).unwrap();
-        let mut doc = admin.doc.clone();
-        let ctrl_bytes = doc
-            .entries()
-            .into_iter()
-            .find(|e| e.name == aterm_secrets::commons::ENTRY)
-            .unwrap()
-            .value
-            .as_slice()
-            .to_vec();
-        doc.set_entry(
-            &aterm_secrets::text::Audience::Hosts(vec!["m1".to_owned(), "m2".to_owned()]),
-            aterm_secrets::commons::ENTRY,
-            &ctrl_bytes,
-        )
-        .unwrap();
-        aterm_secrets::client::admin_publish(&m1, &admin, &doc).unwrap();
+        let revoked = aterm_secrets::client::admin_revoke(&m1, &admin, "m4", false).unwrap();
+        assert!(revoked.retirement.is_some_and(|retired| retired.changed));
     }
     {
         let b1 = Bootstrap::required(&m1).unwrap();
@@ -3278,7 +3267,7 @@ fn log_witness_and_acx2_handle_restored_seats_rotated_node_keys_and_denied_write
         .expect("Endpoint::from_bootstrap succeeds for restored + node-rotated member")
         .expect("endpoint present");
     let peer_request = Request::decode(&ep2.hello[84..HELLO_FIXED]).unwrap();
-    verify_peer_against_local_log(Some(&m1), trust, &peer_request, Some(&peer_log))
+    verify_peer_against_local_log(Custody::Log(&m1), trust, &peer_request, Some(&peer_log))
         .expect("restored + node-rotated member must pass verify_peer_against_local_log");
 
     // 3. Direct writer-key denial in `verify_peer_against_local_log`:
@@ -3305,8 +3294,9 @@ fn log_witness_and_acx2_handle_restored_seats_rotated_node_keys_and_denied_write
         admin_publish(&m1, &admin, &doc).unwrap();
     }
 
-    let err = verify_peer_against_local_log(Some(&m1), trust, &peer_request, Some(&peer_log))
-        .expect_err("peer whose writer key is in deny_nodes must be refused");
+    let err =
+        verify_peer_against_local_log(Custody::Log(&m1), trust, &peer_request, Some(&peer_log))
+            .expect_err("peer whose writer key is in deny_nodes must be refused");
     assert!(
         err.to_string()
             .contains("Commons peer was removed from the membership log"),
@@ -3491,9 +3481,41 @@ fn a_last_read_answers_none_until_a_read_then_keeps_it_per_folder() {
     assert_eq!(last.keep(a, None), None, "the oldest folder made room");
 }
 
-/// A roster read that gives none (`Ok(None)`: a vault sync applying, or a vault with no roster
+#[test]
+fn a_busy_roster_never_uses_an_older_permissive_peer_verdict() {
+    use aterm_secrets::client;
+    let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
+    let paths = &lab.paths[0];
+    let primed = roster_or_last_until(paths, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+        .expect("an authoritative fixture roster, including its absence");
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(Some(
+        client::test_hold_state_lock(paths).unwrap(),
+    )));
+    assert!(
+        roster_or_last_until(paths, Instant::now()).is_none(),
+        "a peer check refuses a busy roster even after a prior answer"
+    );
+    let old = client::test_without_roster_wait(|| roster_or_last_until(paths, Instant::now()));
+    assert_eq!(
+        old,
+        Some(primed.clone()),
+        "negative control passes the old permissive answer"
+    );
+    let release = writer.clone();
+    let fresh = client::test_with_denied_nodes_busy(
+        move || drop(release.borrow_mut().take()),
+        || roster_or_last_until(paths, Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+    );
+    assert_eq!(fresh, Some(primed));
+    assert!(
+        writer.borrow().is_none(),
+        "the reader observed the writer before release"
+    );
+}
+
+/// A settled roster read that gives none (`Ok(None)`: an incomplete copy, or no roster
 /// entry) keeps the roster read before it, so a Mac that roster removed stays refused through the
-/// sync; with none read before it is no roster, which a failed read after it keeps. A failed read
+/// copy; with none read before it is no roster, which a failed read after it keeps. A failed read
 /// with nothing read before is `None`, which table repair refuses.
 ///
 /// NEGATIVE CONTROL (2026-11-01): with `roster_after` answering no roster on `Ok(None)` (the

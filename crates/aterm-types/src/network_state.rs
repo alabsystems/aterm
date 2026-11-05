@@ -132,6 +132,8 @@ pub enum RepairOutcome {
 /// Reads retain its original timestamp and never make it current or authorize access.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepairObservation {
+    /// Value-free local refusal category. No diagnostic text is published.
+    pub cause: Option<RepairCause>,
     /// Original worker completion time, milliseconds since Unix epoch.
     pub completed_at_ms: u64,
     /// True when this owner dialled the peer; false for an incoming connection.
@@ -148,6 +150,43 @@ pub struct RepairObservation {
     pub received: Option<u64>,
     /// Offered positive records without a durable acknowledgement in this attempt.
     pub deferred: Option<u64>,
+}
+
+/// Closed vocabulary for repair refusals; never contains wire or filesystem data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairCause {
+    /// The local membership log is past an older protocol's fence.
+    LegacyPastCrossing,
+    /// The selected application table was not provisioned here.
+    TableUndeclared,
+    /// A bounded record or byte budget is exhausted.
+    Quota,
+    /// A filesystem or stream operation failed.
+    Io,
+    /// A frame or stored record could not be decoded.
+    Decode,
+    /// Membership or local custody is not ready for table access.
+    NotReady,
+    /// The peer's protocol cannot complete this exchange.
+    NeedsUpdate,
+    /// A refusal without a more specific typed category.
+    Other,
+}
+
+impl RepairCause {
+    /// Stable diagnostic word shared by persisted and command observations.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::LegacyPastCrossing => "legacy-past-crossing",
+            Self::TableUndeclared => "table-undeclared",
+            Self::Quota => "quota",
+            Self::Io => "io",
+            Self::Decode => "decode",
+            Self::NotReady => "not-ready",
+            Self::NeedsUpdate => "needs-update",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// One retained authenticated machine, in stable first-observed slot order.

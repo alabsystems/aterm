@@ -8,21 +8,24 @@ use crate::tab_model::{TabId, View, ViewId};
 use crate::{App, WindowId};
 
 impl App {
+    /// Whether an Allocation view is on screen ([`Self::view_on_screen`]).
     pub(crate) fn allocation_visible(&self) -> bool {
-        self.windows.values().any(|window| !window.occluded && window.tab_set.active().is_some_and(|tab| {
-            tab.root.leaves().into_iter().any(|view| matches!(self.view_store.get(view), Some(View::Native(native))
-                if self.native_runtime.app(native.instance).is_some_and(|app| app.kind() == AppKind::Allocation)
-                && (!tab.zoomed || tab.focus == view)))
-        }))
+        self.view_on_screen(|view| {
+            matches!(self.view_store.get(view), Some(View::Native(native))
+                if self.native_runtime.app(native.instance).is_some_and(|app| app.kind() == AppKind::Allocation))
+        })
     }
 
     pub(crate) fn open_allocation(&mut self, split: bool) -> Result<(), String> {
         let wid = self.frontmost_window.ok_or("No window for Allocation")?;
-        let shared_terminal = self
+        // Beside a lone terminal only. A native view keeps its window's whole view, the one the
+        // window's least size is measured for: split, a focused Settings stood in half its least
+        // width, and a shared session is never split.
+        let lone_terminal = self
             .focused_session_id(wid)
-            .is_some_and(|session| self.pool.views(session).is_some_and(|views| views > 1));
+            .is_some_and(|session| self.pool.views(session).is_none_or(|views| views <= 1));
         let split = split
-            && !shared_terminal
+            && lone_terminal
             && self.focused_pane_cells(wid).is_some_and(|(rows, cols)| {
                 crate::pane::split_fits_in(crate::pane::SplitDir::Vertical, rows, cols)
             });
@@ -203,6 +206,36 @@ mod tests {
         drop(term);
         app.open_allocation(false).unwrap();
         assert_eq!(app.windows[&wid].tab_set.active_id(), original_tab);
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// A split request on a focused Settings tab opens Allocation in a tab of its own, so Settings
+    /// keeps the whole view its window's least size holds for it. It split the Settings tab, and
+    /// Settings stood in about half its least width.
+    #[test]
+    fn an_allocation_split_request_leaves_a_focused_settings_tab_whole() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let settings = app.windows[&wid].tab_set.active_id().unwrap();
+        app.open_allocation(true).unwrap();
+        assert_eq!(
+            app.windows[&wid]
+                .tab_set
+                .get(settings)
+                .unwrap()
+                .root
+                .leaves()
+                .len(),
+            1,
+            "the Settings tab keeps its one leaf"
+        );
+        assert_ne!(app.windows[&wid].tab_set.active_id(), Some(settings));
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        assert_eq!(
+            app.native_runtime.app(instance).unwrap().kind(),
+            AppKind::Allocation
+        );
         assert!(app.structural_invariants_ok());
     }
 

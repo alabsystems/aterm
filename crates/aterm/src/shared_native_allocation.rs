@@ -47,15 +47,12 @@ pub(super) fn request(
 fn label(roster: &aterm_secrets::swarm_roster::SwarmRoster, binding: &Binding) -> Option<String> {
     let row = roster.member_by_recipient(&binding.recipient().to_bech32())?;
     (!roster.is_member_denied(row)
-        && roster
-            .members
-            .iter()
-            .filter(|other| other.label == row.label && !roster.is_member_denied(other))
-            .map(|other| other.recipient.as_str())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            == 1)
-        .then(|| row.label.clone())
+        && !roster.members.iter().any(|other| {
+            other.label == row.label
+                && !roster.is_member_denied(other)
+                && other.recipient != row.recipient
+        }))
+    .then(|| row.label.clone())
 }
 
 fn available(
@@ -364,7 +361,7 @@ pub(super) fn step_at(
         }
         let prepared = available(paths, &admin.config, assignment.subject, deadline)?;
         let roster = with_custody(paths, &admin.config, deadline, |active, _| {
-            client::swarm_roster(active)
+            client::swarm_roster_until(active, deadline)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "native allocation roster is unavailable".into())
         })?;

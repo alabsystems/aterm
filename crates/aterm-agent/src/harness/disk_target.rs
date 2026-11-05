@@ -522,7 +522,7 @@ pub fn foreign_walk(dir: &Path, max: usize, wall: Duration) -> Option<String> {
                     return unruled(format!("{} could not be listed", d.display()));
                 };
                 seen += 1;
-                super::beat::tick(1);
+                aterm_uds::progress::tick();
                 if seen > max {
                     return unruled(format!("it holds more than {max} entries"));
                 }
@@ -845,10 +845,21 @@ fn locks_held_with(profile: &Path, hook: &mut dyn FnMut(&Path)) -> Option<String
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Some(format!("{} could not be probed: {e}", path.display())),
         }
-        let file = match std::fs::File::open(&path) {
+        let mut open = std::fs::OpenOptions::new();
+        open.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let file = match aterm_uds::kept_out(|| open.open(&path)) {
             Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Some(format!("{} could not be probed: {e}", path.display())),
         };
+        if !file.metadata().is_ok_and(|m| m.is_file()) {
+            return Some(format!("{} is not a plain file", path.display()));
+        }
         match HeldLock::try_take(file) {
             Ok(Some(held)) => {
                 hook(&path);
@@ -1513,7 +1524,7 @@ mod fd {
             };
             let names: Vec<OsString> = entries.iter().map(|c| c.name.clone()).collect();
             self.entries = self.entries.saturating_add(names.len());
-            super::super::beat::tick(names.len());
+            aterm_uds::progress::tick();
             if self.entries > self.budget.entries {
                 self.cut = Some(format!(
                     "it holds more than {} entries outside its caches",
@@ -1675,7 +1686,7 @@ mod fd {
         fn names(&mut self, fd: &OwnedFd) -> Option<Vec<OsString>> {
             let names = names(fd).ok()?;
             self.entries = self.entries.checked_add(names.len())?;
-            super::super::beat::tick(names.len());
+            aterm_uds::progress::tick();
             (self.entries <= self.budget.entries && self.started.elapsed() < self.budget.wall)
                 .then_some(names)
         }
@@ -1858,7 +1869,7 @@ mod fd {
                     .push(format!("{}: {}", here.display(), io::Error::from(e)));
             }
         };
-        super::super::beat::tick(1);
+        aterm_uds::progress::tick();
         let Some(fd) = dir else {
             let freed = open_file(parent, name)
                 .and_then(|f| f.metadata().ok())
@@ -1935,7 +1946,7 @@ mod fd {
         if child.kind.is_foreign_reparse() {
             return keep(out, Errno::FOREIGN_REPARSE);
         }
-        super::super::beat::tick(1);
+        aterm_uds::progress::tick();
         if !child.kind.is_dir() {
             let freed = if child.kind.is_link() {
                 0
@@ -2606,6 +2617,7 @@ mod fd {
             let mut left_bytes = [0u8; 8192];
             let mut right_bytes = [0u8; 8192];
             while at < a.size {
+                aterm_uds::progress::tick();
                 let count = (a.size - at).min(left_bytes.len() as u64) as usize;
                 if !read_exact_at(left, &mut left_bytes[..count], at)
                     || !read_exact_at(right, &mut right_bytes[..count], at)
@@ -2636,6 +2648,7 @@ mod fd {
             let mut left_bytes = [0u8; 8192];
             let mut right_bytes = [0u8; 8192];
             while at < a.len() {
+                aterm_uds::progress::tick();
                 let count = (a.len() - at).min(left_bytes.len() as u64) as usize;
                 if left.read_exact_at(&mut left_bytes[..count], at).is_err()
                     || right.read_exact_at(&mut right_bytes[..count], at).is_err()
@@ -2836,6 +2849,7 @@ mod fd {
                 .unwrap_or_default();
             let mut order: Vec<Child> = Vec::new();
             for entry in entries {
+                aterm_uds::progress::tick();
                 if CARGO_LOCKS.iter().any(|l| entry.name == *l) {
                     continue;
                 }
@@ -3226,7 +3240,7 @@ mod fd {
                     return;
                 }
                 self.seen += 1;
-                super::super::beat::tick(1);
+                aterm_uds::progress::tick();
                 if self.seen > self.walk.max {
                     return self.cut(format!("it holds more than {} entries", self.walk.max));
                 }

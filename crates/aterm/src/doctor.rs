@@ -994,10 +994,7 @@ fn run_pkg(
             stdout: out.stdout,
             stderr: out.stderr,
         }),
-        Err(aterm_uds::deadline::RunError::TimedOut) => Err(RunFailed::TimedOut(budget)),
-        Err(aterm_uds::deadline::RunError::Spawn(e) | aterm_uds::deadline::RunError::Wait(e)) => {
-            Err(RunFailed::Spawn(e.to_string()))
-        }
+        Err(error) => Err(RunFailed::from_child(error, budget)),
     }
 }
 
@@ -1031,6 +1028,72 @@ fn targo() -> Result<std::path::PathBuf, String> {
 /// during `aterm init` when a fleet accounts source is configured or discoverable.
 #[cfg(unix)]
 struct AiAccountsItem;
+
+/// The same account provisioning init performs, presented to System State as current evidence.
+/// A completed workstation run does not establish that its independent base layer succeeded.
+#[cfg(target_os = "macos")]
+pub(crate) fn ai_accounts_setup_observation() -> aterm_types::macos_setup::Observation {
+    use aterm_converge::Probe;
+    use aterm_types::macos_setup::{Observation, Standing, Subject, SyncKind};
+    let env = aterm_agent::harness::cli::Env::from_process();
+    let probe = env.as_ref().map_or_else(
+        |why| Probe::Unusable { why: why.clone() },
+        ai_accounts_probe,
+    );
+    let (standing, now, note) = match probe {
+        Probe::Ok { now } => (Standing::InPlace, now, None),
+        Probe::NotApplicable { why } => {
+            (Standing::NotNeeded, "Not configured".to_owned(), Some(why))
+        }
+        Probe::Change { from, to } => {
+            let mut why = format!("{from}; waiting for automatic provisioning to finish: {to}");
+            if let Ok(env) = &env
+                && !ai_accounts_others_only(env)
+                && aterm_agent::harness::accounts_sync::configured_source(
+                    env.config.as_deref(),
+                    env.accounts_roster().as_deref(),
+                )
+                .is_none_or(|source| {
+                    let source = source.source();
+                    !source.starts_with("https://") && !source.starts_with("http://")
+                })
+                && let Ok(fleet) = aterm_agent::harness::accounts_sync::load_fleet_source(env, None)
+                && let Some(machine) = fleet.alab.clone().or_else(|| {
+                    aterm_agent::harness::accounts_sync::detect_machine_id(
+                        None,
+                        env.config.as_deref(),
+                    )
+                })
+                && fleet.accounts_for_machine(&machine).is_empty()
+            {
+                why = format!(
+                    "No active Claude account is assigned to {machine}. Automatic provisioning resumes when the synced account roster changes."
+                );
+            }
+            (Standing::Waiting, "Not provisioned".to_owned(), Some(why))
+        }
+        other => {
+            let why = match other {
+                Probe::Blocked { why }
+                | Probe::Deferred { why }
+                | Probe::Unusable { why }
+                | Probe::Waits { why, .. } => why,
+                Probe::Person { how, .. } => how,
+                _ => "Account provisioning has not been confirmed".to_owned(),
+            };
+            (Standing::Waiting, "Not provisioned".to_owned(), Some(why))
+        }
+    };
+    Observation {
+        subject: Subject::Sync(SyncKind::Accounts),
+        standing,
+        now: Some(now),
+        after_login: None,
+        wanted: "Provisioned".to_owned(),
+        note,
+        detail: None,
+    }
+}
 
 #[cfg(unix)]
 impl Item for AiAccountsItem {

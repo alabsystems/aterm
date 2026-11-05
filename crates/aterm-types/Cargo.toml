@@ -42,6 +42,10 @@ aterm-log = { workspace = true }
 # Clock seam: std::time on native, the JS clock on wasm32 (std's panics there).
 aterm-time = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
+# The machine-number anchors on `settle`, `choose` and `check`: `#[cfg_attr(any(test,
+# debug_assertions), aterm_spec_anchor::refines(…))]` expands in every test and debug build;
+# release strips it.
+aterm-spec-anchor = { workspace = true }
 
 # A Cargo test binary's own per-user root (`aterm_uds::test_binary`): in a test the
 # state, data, log and config folders (`dirs`) answer under it, never the person's.
@@ -51,6 +55,8 @@ aterm-uds = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
+# The machine-number models `machine_name::model_tests` holds `settle`, `choose` and `check` to.
+aterm-models-swarm = { workspace = true }
 # Test-only: a serializer for the `serde` feature's round-trip tests.
 aterm-json = { workspace = true }
 

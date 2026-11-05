@@ -231,13 +231,9 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
             .then_some(())
             .ok_or("this column holds lower-case hex of its length")
         }
-        Ty::Email => {
-            let address = text()?;
-            match keys::address(address) {
-                Ok(canonical) if canonical == address => Ok(()),
-                _ => Err("an address is stored lower-case and trimmed"),
-            }
-        }
+        Ty::Email => keys::is_stored_address(text()?)
+            .then_some(())
+            .ok_or("an address is stored lower-case and trimmed"),
         Ty::Url => {
             let url = text()?;
             let rest = url.strip_prefix("https://").ok_or("a URL is https")?;
@@ -250,6 +246,9 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
             }
             guard::word(url).map_err(guard::Refusal::rule)
         }
+        Ty::Secret => super::secret::is_sealed(text()?)
+            .then_some(())
+            .ok_or("a secret cell holds an authenticated opaque token"),
         Ty::SecretRef => {
             let object = x.as_object().ok_or("a vault reference names its entry")?;
             let names = |key: &str| {
@@ -328,30 +327,33 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
             if size > *max {
                 return Err("this value is larger than its column allows");
             }
-            json_strings(x).try_for_each(|text| {
-                if text.contains('@') {
-                    Err(guard::Refusal::Address.rule())
-                } else if guard::phone_shaped(text) {
-                    Err(guard::Refusal::Phone.rule())
-                } else {
-                    guard::word(text).map_err(guard::Refusal::rule)
-                }
-            })
+            check_json_strings(x)
         }
     }
 }
 
-fn json_strings(value: &Value) -> Box<dyn Iterator<Item = &str> + '_> {
+fn check_json_str(text: &str) -> std::result::Result<(), &'static str> {
+    if text.contains('@') {
+        Err(guard::Refusal::Address.rule())
+    } else if guard::phone_shaped(text) {
+        Err(guard::Refusal::Phone.rule())
+    } else {
+        guard::word(text).map_err(guard::Refusal::rule)
+    }
+}
+
+fn check_json_strings(value: &Value) -> std::result::Result<(), &'static str> {
     match value {
-        Value::String(text) => Box::new(std::iter::once(text.as_str())),
-        Value::Array(items) => Box::new(items.iter().flat_map(json_strings)),
-        Value::Object(object) => Box::new(
-            object
-                .keys()
-                .map(String::as_str)
-                .chain(object.values().flat_map(json_strings)),
-        ),
-        _ => Box::new(std::iter::empty()),
+        Value::String(text) => check_json_str(text),
+        Value::Array(items) => items.iter().try_for_each(check_json_strings),
+        Value::Object(object) => {
+            for (k, v) in object {
+                check_json_str(k)?;
+                check_json_strings(v)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -364,7 +366,7 @@ fn check_elem(column: &Column, elem: &str) -> std::result::Result<(), &'static s
         Ty::Enum(words) if !words.contains(&elem) => Err("this word is not one the column knows"),
         Ty::Label if !keys::is_label(elem) => Err("a machine label is m<N> or m<N>-xxxx"),
         _ if !pk_grammar(elem) => Err("a set element breaks the key grammar"),
-        Ty::Enum(_) | Ty::Label => guard::word(elem).map_err(guard::Refusal::rule),
+        Ty::Enum(_) | Ty::Label | Ty::Ref(_) => guard::word(elem).map_err(guard::Refusal::rule),
         _ => check(inner, &Value::String(elem.to_owned()), false),
     }
 }
@@ -477,6 +479,15 @@ impl Field {
             Self::Value(candidate) => Some(&candidate.value.x),
             Self::Conflict { provisional, .. } => provisional.as_ref(),
             Self::Set(_) => None,
+        }
+    }
+
+    /// Every candidate's value of a register: one, or each of a conflict's; none for a set.
+    pub fn candidates_x(&self) -> Vec<&Value> {
+        match self {
+            Self::Value(candidate) => vec![&candidate.value.x],
+            Self::Conflict { candidates, .. } => candidates.iter().map(|c| &c.value.x).collect(),
+            Self::Set(_) => Vec::new(),
         }
     }
 

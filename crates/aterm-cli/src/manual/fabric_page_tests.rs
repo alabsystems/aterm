@@ -187,6 +187,7 @@ fn field_ok(key: Key, v: &str) -> bool {
         Cap::I => v.parse::<i64>().is_ok(),
         Cap::Id => ShortId::new(v).is_some(),
         Cap::Tok(..) | Cap::Text(_) => !v.is_empty(),
+        Cap::Sample => v == aterm_slog::UNAVAILABLE || v.parse::<u64>().is_ok(),
     }
 }
 

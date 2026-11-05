@@ -17,6 +17,22 @@ fn locked(path: &Path, bytes: &[u8]) -> RecordLock {
     RecordLock::try_lock(file, RECORD_MAX).unwrap()
 }
 
+/// Lay `bytes` over the start of `guard`'s record through the holder's own handle, as only the
+/// holder writes a held record: Windows locks the range from [`RECORD_MAX`] on against every
+/// other handle, so another handle's write that reaches it (or truncates the file) is refused.
+fn rewrite(guard: &mut Laid, bytes: &[u8]) {
+    guard.lock.seek(SeekFrom::Start(0)).unwrap();
+    guard.lock.write_all(bytes).unwrap();
+}
+
+/// `guard`'s record as its holder reads it, for the same reason.
+fn contents(guard: &mut Laid) -> Vec<u8> {
+    guard.lock.seek(SeekFrom::Start(0)).unwrap();
+    let mut bytes = Vec::new();
+    guard.lock.read_to_end(&mut bytes).unwrap();
+    bytes
+}
+
 #[test]
 fn legacy_locked_unreadable_headers_are_not_empty_observations() {
     for suffix in ["claim", "wait"] {
@@ -108,31 +124,31 @@ fn legacy_unlocked_bad_files_do_not_block_admission() {
 fn legacy_locked_oversized_records_are_not_accepted_by_their_prefix() {
     let temp = aterm_tempfile::tempdir().unwrap();
     let ledger = Ledger::at(temp.path());
-    let (_, guard) = ledger
+    let (_, mut guard) = ledger
         .lay(&Need::new("live 24 GiB reservation").mem_gib(24), 1)
         .unwrap();
-    let mut bytes = std::fs::read(guard.path()).unwrap();
+    let mut bytes = contents(&mut guard);
     bytes.resize(RECORD_MAX as usize + 1, b' ');
-    std::fs::write(guard.path(), &bytes).unwrap();
+    rewrite(&mut guard, &bytes);
     assert!(matches!(ledger.list(), Err(error)
         if error.kind() == io::ErrorKind::InvalidData));
-    assert_eq!(std::fs::read(guard.path()).unwrap(), bytes);
+    assert_eq!(contents(&mut guard), bytes);
 }
 
 #[test]
 fn legacy_locked_records_accept_the_exact_size_bound() {
     let temp = aterm_tempfile::tempdir().unwrap();
     let ledger = Ledger::at(temp.path());
-    let (record, guard) = ledger
+    let (record, mut guard) = ledger
         .lay(&Need::new("record at the readable limit").mem_gib(24), 1)
         .unwrap();
-    let mut bytes = std::fs::read(guard.path()).unwrap();
+    let mut bytes = contents(&mut guard);
     bytes.resize(RECORD_MAX as usize, b'\n');
-    std::fs::write(guard.path(), &bytes).unwrap();
+    rewrite(&mut guard, &bytes);
     let observed = ledger.list().unwrap();
     assert_eq!(observed.len(), 1);
     assert_eq!(observed[0].need.mem, record.need.mem);
-    assert_eq!(std::fs::read(guard.path()).unwrap(), bytes);
+    assert_eq!(contents(&mut guard), bytes);
 }
 
 #[cfg(unix)]

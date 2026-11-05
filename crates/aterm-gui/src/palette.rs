@@ -257,6 +257,10 @@ pub(crate) struct PaletteLive {
     pub front_tab_split: bool,
     /// Whether the focused pane records its screen, so Rewind can open on it.
     pub can_rewind: bool,
+    /// Whether the front window's glow is recorded, so Record Keys Not Echoed… can grant.
+    pub aos_attached: bool,
+    /// Whether the front window's recording carries the person's grant.
+    pub aos_unseen: bool,
     /// Whether the front window has more than one tab.
     pub multi_tab: bool,
     /// Whether the active tab is a native app rather than a terminal pane tree.
@@ -656,6 +660,10 @@ impl PaletteState {
                 | MenuAction::ExportPaneHistory
                 | MenuAction::ForgetPaneHistory => {
                     row.enabled = live.terminal_front && live.can_rewind;
+                }
+                MenuAction::RecordUnseenKeys => {
+                    row.enabled = live.terminal_front && live.aos_attached;
+                    row.checked = Some(live.aos_unseen);
                 }
                 MenuAction::ToggleStatsLens => {
                     row.enabled = live

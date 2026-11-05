@@ -43,11 +43,13 @@ pub fn authenticate(
     calculate(password, version, salt, &modulus, server_ephemeral, None)
 }
 
-fn expand(data: &[u8]) -> Zeroizing<[u8; 256]> {
+fn expand(slices: &[&[u8]]) -> Zeroizing<[u8; 256]> {
     let mut result = Zeroizing::new([0u8; 256]);
     for (id, chunk) in result.as_chunks_mut::<64>().0.iter_mut().enumerate() {
         let mut hash = ring::digest::Context::new(&ring::digest::SHA512);
-        hash.update(data);
+        for slice in slices {
+            hash.update(slice);
+        }
         hash.update(&[id as u8]);
         chunk.copy_from_slice(hash.finish().as_ref());
     }
@@ -91,15 +93,14 @@ fn calculate(
     full_salt[..10].copy_from_slice(&salt);
     full_salt[10..].copy_from_slice(b"proton");
     let hashed = Zeroizing::new(super::bcrypt::hash(password.as_bytes(), &full_salt));
-    let mut password_input = Zeroizing::new(hashed.as_bytes().to_vec());
-    password_input.extend_from_slice(modulus);
-    let x = Zeroizing::new(U2048::from_le_slice(expand(&password_input).as_ref()));
+    let x = Zeroizing::new(U2048::from_le_slice(
+        expand(&[hashed.as_bytes(), modulus]).as_ref(),
+    ));
     let params = DynResidueParams::new(&n);
     let generator = U2048::from_u32(2);
     let g = DynResidue::new(&generator, params);
-    let mut k_input = generator.to_le_bytes().to_vec();
-    k_input.extend_from_slice(modulus);
-    let k = U2048::from_le_slice(expand(&k_input).as_ref()).rem(&n);
+    let generator_bytes = generator.to_le_bytes();
+    let k = U2048::from_le_slice(expand(&[&generator_bytes, modulus]).as_ref()).rem(&n);
     if k <= U2048::ONE || k >= *n_minus_one {
         return Err("Invalid SRP multiplier".into());
     }
@@ -125,9 +126,9 @@ fn calculate(
     }
     let a = Zeroizing::new(U2048::from_le_slice(secret.as_ref()));
     let public = g.pow(&a).retrieve();
-    let mut scramble_input = public.to_le_bytes().to_vec();
-    scramble_input.extend_from_slice(&server.to_le_bytes());
-    let u = U2048::from_le_slice(expand(&scramble_input).as_ref());
+    let public_bytes = public.to_le_bytes();
+    let server_bytes = server.to_le_bytes();
+    let u = U2048::from_le_slice(expand(&[&public_bytes, &server_bytes]).as_ref());
     if bool::from(u.rem(&n_minus_one).is_zero()) {
         return Err("Invalid SRP scramble".into());
     }
@@ -135,18 +136,16 @@ fn calculate(
     let (ux, _) = U2048::const_rem_wide(x.mul_wide(&u), &n_minus_one);
     let exponent = Zeroizing::new(a.add_mod(&ux, &n_minus_one));
     let shared = Zeroizing::new(base.pow(&exponent).retrieve());
-    let mut evidence = Zeroizing::new(public.to_le_bytes().to_vec());
-    evidence.extend_from_slice(&server.to_le_bytes());
-    evidence.extend_from_slice(&shared.to_le_bytes());
-    let client_proof = expand(&evidence);
-    let mut expected = Zeroizing::new(public.to_le_bytes().to_vec());
-    expected.extend_from_slice(client_proof.as_ref());
-    expected.extend_from_slice(&shared.to_le_bytes());
+    let shared_bytes = Zeroizing::new(shared.to_le_bytes());
+    let client_proof = expand(&[&public_bytes, &server_bytes, shared_bytes.as_ref()]);
     Ok(Proof {
-        client_ephemeral: aterm_codec::base64::encode(&public.to_le_bytes())
-            .map_err(|e| e.to_string())?,
+        client_ephemeral: aterm_codec::base64::encode(&public_bytes).map_err(|e| e.to_string())?,
         client_proof: aterm_codec::base64::encode(client_proof.as_ref())
             .map_err(|e| e.to_string())?,
-        expected_server_proof: expand(&expected),
+        expected_server_proof: expand(&[
+            &public_bytes,
+            client_proof.as_ref(),
+            shared_bytes.as_ref(),
+        ]),
     })
 }

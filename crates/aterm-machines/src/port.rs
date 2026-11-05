@@ -373,6 +373,9 @@ impl Ran {
 pub enum RunFailed {
     /// The program could not be started.
     Spawn(String),
+    /// A child was started but no usable result was established. It may have acted;
+    /// this cause alone does not establish that cleanup or reaping completed.
+    AfterStart(String),
     /// The deadline passed; the process group was killed.
     TimedOut(Duration),
     /// The port refused the run before starting it (such as `as_user` without root).
@@ -383,8 +386,46 @@ impl std::fmt::Display for RunFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn(why) => write!(f, "could not start: {why}"),
+            Self::AfterStart(why) => write!(f, "failed after start: {why}"),
             Self::TimedOut(d) => write!(f, "no answer within {}s", d.as_secs()),
             Self::Refused(why) => write!(f, "refused: {why}"),
+        }
+    }
+}
+
+impl RunFailed {
+    /// Keep a collector's post-start failures distinct from a failure to spawn a child.
+    #[must_use]
+    pub fn from_child(error: aterm_uds::deadline::RunError, budget: Duration) -> Self {
+        use aterm_uds::deadline::RunError;
+        match error {
+            RunError::Spawn(error) => Self::Spawn(error.to_string()),
+            RunError::Capture(error) => {
+                Self::AfterStart(format!("output capture setup failed: {error}"))
+            }
+            RunError::Wait(error) => Self::AfterStart(format!("wait failed: {error}")),
+            RunError::TimedOut => Self::TimedOut(budget),
+        }
+    }
+
+    /// Preserve the dispatch phase when complete stdout could not be established.
+    #[must_use]
+    pub fn from_complete_output(
+        error: aterm_uds::deadline::CompleteOutputError,
+        budget: Duration,
+    ) -> Self {
+        use aterm_uds::deadline::CompleteOutputError;
+        match error {
+            CompleteOutputError::Run(error) => Self::from_child(error, budget),
+            CompleteOutputError::StdoutRead(error) => {
+                Self::AfterStart(format!("complete stdout read failed: {error}"))
+            }
+            CompleteOutputError::StdoutTooLarge { limit } => {
+                Self::AfterStart(format!("complete stdout exceeds {limit} bytes"))
+            }
+            CompleteOutputError::StdoutIncomplete => {
+                Self::AfterStart("complete stdout did not reach EOF".into())
+            }
         }
     }
 }
@@ -473,6 +514,26 @@ impl aterm_types::clt_mark::Files for NoCltMark {
     fn lock(&self, _path: &Path) -> io::Result<aterm_types::clt_mark::Held> {
         Err(io::ErrorKind::Unsupported.into())
     }
+}
+
+/// One current path observation for the retained installer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstallNetworkReading {
+    /// Changes when the native path observation changes, including away and back.
+    pub revision: u64,
+    /// The path can carry traffic; this does not promise Apple's service answers.
+    pub available: bool,
+    /// Low Data Mode currently holds downloads.
+    pub constrained: bool,
+}
+
+/// A network observer owned by one authorized install, cancelled when dropped.
+pub trait InstallNetworkWatch {
+    /// Latest observation, or unknown before its first update.
+    fn reading(&self) -> Option<InstallNetworkReading>;
+
+    /// Wait for a revision other than the caller's, or the bounded timer. Return time spent.
+    fn wait(&mut self, revision: Option<u64>, budget: Duration) -> Duration;
 }
 
 /// The operating system, as items see it.
@@ -794,6 +855,11 @@ pub trait System: Sync {
     /// Whether the network this Mac uses now is in Low Data Mode, as macOS's network path
     /// reads it, in this process; `None` when it cannot tell (no network path, or none read).
     fn low_data_mode(&self) -> Option<bool> {
+        None
+    }
+
+    /// Retain a network observer for an authorized installer. No packet or consent request.
+    fn install_network(&self) -> Option<Box<dyn InstallNetworkWatch + '_>> {
         None
     }
 
@@ -1160,7 +1226,7 @@ impl Live {
         let open = |staged: &Staged<'_>| {
             std::fs::OpenOptions::new()
                 .write(true)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(staged.path())
                 .map_err(failed)
         };
@@ -1187,14 +1253,18 @@ impl Live {
                 }
                 Err(e) => {
                     end_group(&mut child);
-                    return Err(RunFailed::Spawn(e.to_string()));
+                    return Err(RunFailed::AfterStart(format!("wait failed: {e}")));
                 }
             }
         };
         Ok(Ran {
             status,
-            stdout: kept_tail(out.path()).map_err(failed)?,
-            stderr: kept_tail(err.path()).map_err(failed)?,
+            stdout: kept_tail(out.path()).map_err(|error| {
+                RunFailed::AfterStart(format!("stdout capture read failed: {error}"))
+            })?,
+            stderr: kept_tail(err.path()).map_err(|error| {
+                RunFailed::AfterStart(format!("stderr capture read failed: {error}"))
+            })?,
         })
     }
 }
@@ -1478,15 +1548,11 @@ impl System for Live {
                 stdout: out.stdout,
                 stderr: out.stderr,
             }),
-            Err(aterm_uds::deadline::RunError::TimedOut) => Err(RunFailed::TimedOut(cmd.budget)),
-            Err(
-                aterm_uds::deadline::RunError::Spawn(e) | aterm_uds::deadline::RunError::Wait(e),
-            ) => Err(RunFailed::Spawn(e.to_string())),
+            Err(error) => Err(RunFailed::from_child(error, cmd.budget)),
         }
     }
 
     fn run_complete_stdout(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
-        use aterm_uds::deadline::{CompleteOutputError, RunError};
         if cmd.keep_on_timeout {
             return Err(RunFailed::Refused(
                 "complete stdout cannot keep timed-out partial output".into(),
@@ -1504,21 +1570,7 @@ impl System for Live {
         let deadline = deadline_after(cmd.budget);
         let out =
             aterm_uds::deadline::output_until_complete_stdout_from(&mut child, stdin, deadline)
-                .map_err(|error| match error {
-                    CompleteOutputError::Run(RunError::TimedOut) => RunFailed::TimedOut(cmd.budget),
-                    CompleteOutputError::Run(RunError::Spawn(e) | RunError::Wait(e)) => {
-                        RunFailed::Spawn(e.to_string())
-                    }
-                    CompleteOutputError::StdoutRead(e) => {
-                        RunFailed::Refused(format!("complete stdout read failed: {e}"))
-                    }
-                    CompleteOutputError::StdoutTooLarge { limit } => {
-                        RunFailed::Refused(format!("complete stdout exceeds {limit} bytes"))
-                    }
-                    CompleteOutputError::StdoutIncomplete => {
-                        RunFailed::Refused("complete stdout did not reach EOF".into())
-                    }
-                })?;
+                .map_err(|error| RunFailed::from_complete_output(error, cmd.budget))?;
         Ok(Ran {
             status: out.status.code(),
             stdout: out.stdout,
@@ -1546,14 +1598,17 @@ impl System for Live {
             child.current_dir(dir);
         }
         let status = owning_terminal(|| {
-            child
+            let mut started = child
                 .args(&args)
                 .stdin(aterm_uds::spawnfd::Stdio::inherit())
                 .stdout(aterm_uds::spawnfd::Stdio::inherit())
                 .stderr(aterm_uds::spawnfd::Stdio::inherit())
-                .status()
-        })
-        .map_err(|e| RunFailed::Spawn(e.to_string()))?;
+                .spawn()
+                .map_err(|error| RunFailed::Spawn(error.to_string()))?;
+            started
+                .wait()
+                .map_err(|error| RunFailed::AfterStart(format!("wait failed: {error}")))
+        })?;
         Ok(status.code())
     }
 
@@ -1584,10 +1639,7 @@ impl System for Live {
                 stdout: out.stdout,
                 stderr: out.stderr,
             }),
-            Err(aterm_uds::deadline::RunError::TimedOut) => Err(RunFailed::TimedOut(cmd.budget)),
-            Err(
-                aterm_uds::deadline::RunError::Spawn(e) | aterm_uds::deadline::RunError::Wait(e),
-            ) => Err(RunFailed::Spawn(e.to_string())),
+            Err(error) => Err(RunFailed::from_child(error, cmd.budget)),
         }
     }
 
@@ -1613,11 +1665,14 @@ impl System for Live {
     }
 
     fn has_tty(&self) -> bool {
+        use std::io::IsTerminal as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open("/dev/tty")
-            .is_ok()
+            .is_ok_and(|tty| tty.is_terminal())
     }
 
     fn person_present(&self) -> bool {
@@ -1661,15 +1716,18 @@ impl System for Live {
         &aterm_types::clt_mark::Live
     }
 
-    /// Opened by [`aterm_uds::nofollow::open_reader`] (`O_NOFOLLOW_ANY | O_NONBLOCK`, then
-    /// `fstat`), so a link on `path` answers `ELOOP` and a FIFO is refused without waiting for a
-    /// writer; `Unsupported` off macOS.
+    /// Opened by [`aterm_uds::nofollow::open_reader_with_identity`] (`O_NOFOLLOW_ANY | O_NONBLOCK`,
+    /// then `fstat`), so a link on `path` answers `ELOOP` and a FIFO is refused without waiting;
+    /// `Unsupported` off macOS.
     fn read_head(&self, path: &Path, max: usize) -> io::Result<Vec<u8>> {
-        use std::io::Read as _;
-        let mut bytes = Vec::new();
-        std::fs::File::from(aterm_uds::nofollow::open_reader(path)?)
-            .take(u64::try_from(max).unwrap_or(u64::MAX))
-            .read_to_end(&mut bytes)?;
+        let (fd, id) = aterm_uds::nofollow::open_reader_with_identity(path)?;
+        let cap = usize::try_from(id.size)
+            .unwrap_or(max)
+            .min(max)
+            .saturating_add(1);
+        let mut bytes = Vec::with_capacity(cap);
+        let mut reader = std::io::Read::take(std::fs::File::from(fd), max as u64);
+        std::io::Read::read_to_end(&mut reader, &mut bytes)?;
         Ok(bytes)
     }
 
@@ -1751,7 +1809,7 @@ impl System for Live {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)?;
         let meta = file.metadata()?;
         if !meta.file_type().is_file() || meta.nlink() != 1 {
@@ -1795,8 +1853,14 @@ impl System for Live {
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut f = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)?;
+        if !f.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
         let mut hasher = aterm_digest::Sha256::new();
         let mut buf = vec![0_u8; 1 << 20];
         loop {
@@ -1824,13 +1888,19 @@ impl System for Live {
         let tmp = scratch.path().join("payload");
         let mut src = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(from)?;
+        if !src.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", from.display()),
+            ));
+        }
         let mut dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&tmp)?;
         std::io::copy(&mut src, &mut dst)?;
         dst.set_permissions(std::fs::Permissions::from_mode(mode))?;
@@ -1886,6 +1956,17 @@ impl System for Live {
         #[cfg(target_os = "macos")]
         {
             low_data::read(low_data::PATIENCE)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    fn install_network(&self) -> Option<Box<dyn InstallNetworkWatch + '_>> {
+        #[cfg(target_os = "macos")]
+        {
+            low_data::watch().map(|watch| Box::new(watch) as Box<dyn InstallNetworkWatch>)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1972,13 +2053,20 @@ impl System for Live {
         }
         let (program, args) = self.argv(cmd)?;
         let open_log = || {
-            std::fs::OpenOptions::new()
+            let f = std::fs::OpenOptions::new()
                 .append(true)
                 .create(true)
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(log)
-                .map_err(|e| RunFailed::Spawn(format!("{}: {e}", log.display())))
+                .map_err(|e| RunFailed::Spawn(format!("{}: {e}", log.display())))?;
+            if !f.metadata().is_ok_and(|m| m.is_file()) {
+                return Err(RunFailed::Spawn(format!(
+                    "{}: not a regular file",
+                    log.display()
+                )));
+            }
+            Ok(f)
         };
         let mut child = aterm_uds::spawnfd::command(&program);
         child
@@ -2051,7 +2139,7 @@ impl System for Live {
             .write(true)
             .create_new(true)
             .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&tmp)?;
         let copied = std::io::copy(from, &mut f)?;
         f.set_permissions(std::fs::Permissions::from_mode(mode))?;
@@ -2063,14 +2151,22 @@ impl System for Live {
 
     fn exclusive(&self, path: &Path, limit: Duration) -> io::Result<Box<dyn std::any::Any>> {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
+        let file = aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(path)
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
         Ok(Box::new(Exclusive::within(file, limit, path)?))
     }
 
@@ -2210,7 +2306,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         .write(true)
         .create_new(true)
         .mode(mode)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(&tmp)?;
     f.write_all(bytes)?;
     f.set_permissions(std::fs::Permissions::from_mode(mode))?;
@@ -2301,6 +2397,7 @@ mod fake {
         pub stop_after: Option<usize>,
         /// The [`System::stopped`] readings so far (a deferral's end reads once more).
         stop_readings: Arc<Mutex<usize>>,
+        requested_stop: Arc<Mutex<Option<i32>>>,
         /// What [`System::ask`] answers, in order ([`Fake::answer`]).
         answers: Mutex<std::collections::VecDeque<Option<String>>>,
         /// Each [`System::run_fed`] run's key and the bytes it was fed ([`Fake::fed`]).
@@ -2337,8 +2434,10 @@ mod fake {
         identity: Mutex<Option<super::Identity>>,
         /// What a [`System::sleep`] does besides recording itself ([`Fake::on_sleep`]).
         on_sleep: Mutex<Option<SleepHook>>,
+        on_owned_read: Mutex<Option<OwnedReadHook>>,
         /// What [`System::low_data_mode`] answers: unknown unless a test sets it.
         pub low_data: Option<bool>,
+        install_path: Mutex<Option<super::InstallNetworkReading>>,
         /// What [`System::service`] answers, one look each, the last repeating
         /// ([`Fake::services`]): none running when none is scripted.
         services: Mutex<Vec<aterm_uds::services::Look>>,
@@ -2387,6 +2486,7 @@ mod fake {
         std::collections::BTreeMap<String, Vec<Result<Vec<crate::items::person::TccRow>, String>>>;
 
     type SleepHook = Arc<dyn Fn(&Fake, std::time::Duration) + Send + Sync>;
+    type OwnedReadHook = Arc<dyn Fn(&Fake, &Path) + Send + Sync>;
 
     #[derive(Clone)]
     enum Output {
@@ -2558,6 +2658,24 @@ mod fake {
     }
 
     impl Fake {
+        /// Interleave a filesystem change after an admitted read snapshot was copied.
+        pub fn on_owned_read(&self, hook: impl Fn(&Fake, &Path) + Send + Sync + 'static) -> &Self {
+            *self.on_owned_read.lock().unwrap() = Some(Arc::new(hook));
+            self
+        }
+
+        /// Model an explicit Stop at an event boundary, without counting internal reads.
+        pub fn stop_now(&self) -> &Self {
+            *self.requested_stop.lock().unwrap() = Some(libc::SIGINT);
+            self
+        }
+
+        /// Publish a network update to a retained install's observer.
+        pub fn install_path(&self, reading: super::InstallNetworkReading) -> &Self {
+            *self.install_path.lock().unwrap() = Some(reading);
+            self
+        }
+
         /// Script the native session's current scroll direction without touching HID.
         pub fn scroll_state(&self, natural: bool) -> &Self {
             *self.scroll_natural.lock().unwrap() = Some(natural);
@@ -3428,12 +3546,19 @@ mod fake {
             if stat.len > max as u64 {
                 return Err(io::ErrorKind::InvalidData.into());
             }
-            let files = self.files.lock().unwrap();
-            let (bytes, _) = files.get(path).ok_or(io::ErrorKind::NotFound)?;
-            if bytes.len() > max {
-                return Err(io::ErrorKind::InvalidData.into());
+            let bytes = {
+                let files = self.files.lock().unwrap();
+                let (bytes, _) = files.get(path).ok_or(io::ErrorKind::NotFound)?;
+                if bytes.len() > max {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                bytes.clone()
+            };
+            let hook = self.on_owned_read.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(self, path);
             }
-            Ok(bytes.clone())
+            Ok(bytes)
         }
 
         fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
@@ -3827,6 +3952,10 @@ mod fake {
             self.low_data
         }
 
+        fn install_network(&self) -> Option<Box<dyn super::InstallNetworkWatch + '_>> {
+            Some(Box::new(InstallWatch(self)))
+        }
+
         /// Recorded as `identity`, the in-process reading; answered as [`Fake::logged_in`] set.
         fn identity(&self) -> Result<super::Identity, String> {
             self.calls.lock().unwrap().push("identity".into());
@@ -3984,12 +4113,14 @@ mod fake {
             Box::new(Deferred {
                 calls: Arc::clone(&self.calls),
                 readings: Arc::clone(&self.stop_readings),
+                requested: Arc::clone(&self.requested_stop),
                 stop_after: self.stop_after,
             })
         }
 
         fn stopped(&self) -> Option<i32> {
-            read_stop(&self.stop_readings, self.stop_after)
+            let requested = *self.requested_stop.lock().unwrap();
+            requested.or_else(|| read_stop(&self.stop_readings, self.stop_after))
         }
 
         fn ignore_hangups(&self) {
@@ -4017,6 +4148,23 @@ mod fake {
         }
     }
 
+    struct InstallWatch<'a>(&'a Fake);
+
+    impl super::InstallNetworkWatch for InstallWatch<'_> {
+        fn reading(&self) -> Option<super::InstallNetworkReading> {
+            *self.0.install_path.lock().unwrap()
+        }
+
+        fn wait(
+            &mut self,
+            _revision: Option<u64>,
+            budget: std::time::Duration,
+        ) -> std::time::Duration {
+            self.0.sleep(budget);
+            budget
+        }
+    }
+
     /// One [`System::stopped`] reading: `SIGINT` once more than `stop_after` were taken.
     fn read_stop(readings: &Mutex<usize>, stop_after: Option<usize>) -> Option<i32> {
         let mut readings = readings.lock().unwrap();
@@ -4031,13 +4179,15 @@ mod fake {
     struct Deferred {
         calls: Arc<Mutex<Vec<String>>>,
         readings: Arc<Mutex<usize>>,
+        requested: Arc<Mutex<Option<i32>>>,
         stop_after: Option<usize>,
     }
 
     impl Drop for Deferred {
         fn drop(&mut self) {
             self.calls.lock().unwrap().push("stops restored".into());
-            if let Some(sig) = read_stop(&self.readings, self.stop_after) {
+            let requested = *self.requested.lock().unwrap();
+            if let Some(sig) = requested.or_else(|| read_stop(&self.readings, self.stop_after)) {
                 self.calls
                     .lock()
                     .unwrap()
@@ -4077,6 +4227,49 @@ mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_failures_preserve_spawn_post_start_and_timeout_phases() {
+        use aterm_uds::deadline::{CompleteOutputError, RunError};
+        let budget = Duration::from_secs(60);
+        assert!(matches!(
+            RunFailed::from_child(RunError::Spawn(io::ErrorKind::NotFound.into()), budget),
+            RunFailed::Spawn(_)
+        ));
+        for error in [
+            RunError::Capture(io::ErrorKind::NotFound.into()),
+            RunError::Wait(io::ErrorKind::NotFound.into()),
+        ] {
+            let failed = RunFailed::from_child(error, budget);
+            assert!(matches!(failed, RunFailed::AfterStart(_)), "{failed:?}");
+            assert!(failed.to_string().starts_with("failed after start:"));
+        }
+        assert_eq!(
+            RunFailed::from_child(RunError::TimedOut, budget),
+            RunFailed::TimedOut(budget)
+        );
+        for error in [
+            CompleteOutputError::StdoutRead(io::ErrorKind::UnexpectedEof.into()),
+            CompleteOutputError::StdoutTooLarge { limit: 3 },
+            CompleteOutputError::StdoutIncomplete,
+        ] {
+            assert!(matches!(
+                RunFailed::from_complete_output(error, budget),
+                RunFailed::AfterStart(_)
+            ));
+        }
+        assert!(matches!(
+            RunFailed::from_complete_output(
+                CompleteOutputError::Run(RunError::Spawn(io::ErrorKind::NotFound.into())),
+                budget
+            ),
+            RunFailed::Spawn(_)
+        ));
+        assert_eq!(
+            RunFailed::from_complete_output(CompleteOutputError::Run(RunError::TimedOut), budget),
+            RunFailed::TimedOut(budget)
+        );
+    }
 
     /// The window's walk takes a sign-out's Accessibility ask only when its answer names that
     /// page; `OK declined` or a `not-now:accessibility` word is the owner's Not now on it; a walk

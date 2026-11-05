@@ -16,7 +16,7 @@ pub const READ_CAP: u64 = 1024 * 1024;
 /// Build a message by concatenation — deliberately not `format!`.
 #[must_use]
 pub fn concat(parts: &[&str]) -> String {
-    let mut s = String::new();
+    let mut s = String::with_capacity(parts.iter().map(|p| p.len()).sum());
     for p in parts {
         s.push_str(p);
     }
@@ -49,10 +49,22 @@ pub fn read_bytes(path: &str) -> std::io::Result<Vec<u8>> {
 /// [`read_bytes`] with a caller's bound, for a release's `SHA256SUMS`.
 pub fn read_bytes_up_to(path: &str, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
+    let over_cap = || {
+        let mib = 1024 * 1024;
+        let limit = if cap >= mib && cap.is_multiple_of(mib) {
+            concat(&[&(cap / mib).to_string(), " MiB"])
+        } else {
+            concat(&[&cap.to_string(), "-byte"])
+        };
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            concat(&[path, " exceeds the ", &limit, " read cap"]),
+        )
+    };
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
     #[cfg(unix)]
-    open.custom_flags(libc::O_NONBLOCK);
+    open.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     let f = open.open(path)?;
     let meta = f.metadata()?;
     let ft = meta.file_type();
@@ -64,20 +76,14 @@ pub fn read_bytes_up_to(path: &str, cap: u64) -> std::io::Result<Vec<u8>> {
             ", not a regular file",
         ])));
     }
+    if meta.len() > cap {
+        return Err(over_cap());
+    }
     let mut bytes =
         Vec::with_capacity(usize::try_from(meta.len().min(cap).saturating_add(1)).unwrap_or(0));
     f.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > cap {
-        let mib = 1024 * 1024;
-        let limit = if cap >= mib && cap.is_multiple_of(mib) {
-            concat(&[&(cap / mib).to_string(), " MiB"])
-        } else {
-            concat(&[&cap.to_string(), "-byte"])
-        };
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            concat(&[path, " exceeds the ", &limit, " read cap"]),
-        ));
+        return Err(over_cap());
     }
     Ok(bytes)
 }
@@ -144,6 +150,7 @@ fn stage_sibling_temp_with_mode(path: &str, bytes: &[u8], mode: u32) -> std::io:
             .append(true)
             .create_new(true)
             .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&tmp)
         {
             Ok(file) => break (tmp, file),
@@ -181,7 +188,7 @@ pub fn sync_parent(path: &str) -> std::io::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    aterm_durable::durable(&std::fs::File::open(parent)?)
+    aterm_durable::Flush::Durable.dir(parent)
 }
 
 /// [`sync_parent`], only ORDERED ([`aterm_durable::ordered`]).
@@ -193,7 +200,7 @@ pub fn sync_parent_ordered(path: &str) -> std::io::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    aterm_durable::ordered(&std::fs::File::open(parent)?)
+    aterm_durable::Flush::Ordered.dir(parent)
 }
 
 /// Create every missing directory above `path`.

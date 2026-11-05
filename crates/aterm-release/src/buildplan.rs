@@ -167,8 +167,8 @@ pub(crate) fn open_release_directory(
             path.display()
         ));
     }
-    let directory =
-        File::open(path).map_err(|error| format!("open {what} {}: {error}", path.display()))?;
+    let directory = atpkg::platform::open_for_sync(path)
+        .map_err(|error| format!("open {what} {}: {error}", path.display()))?;
     let opened = directory
         .metadata()
         .map_err(|error| format!("inspect opened {what} {}: {error}", path.display()))?;
@@ -188,21 +188,18 @@ pub(crate) fn open_release_directory(
             path.display()
         ));
     }
-    if private {
+    if private && opened.mode() & 0o7777 != 0o700 {
         let mut permissions = opened.permissions();
         permissions.set_mode(0o700);
         directory
             .set_permissions(permissions)
             .map_err(|error| format!("make {what} private {}: {error}", path.display()))?;
     }
-    let after = directory
-        .metadata()
-        .map_err(|error| format!("reinspect opened {what} {}: {error}", path.display()))?;
     let published = std::fs::symlink_metadata(path)
         .map_err(|error| format!("reinspect {what} {}: {error}", path.display()))?;
     if !published.file_type().is_dir()
         || published.uid() != expected_uid
-        || (published.dev(), published.ino()) != (after.dev(), after.ino())
+        || (published.dev(), published.ino()) != (opened.dev(), opened.ino())
         || private && published.mode() & 0o777 != 0o700
         || !private && published.mode() & 0o022 != 0
     {
@@ -316,14 +313,8 @@ fn validate_release_rustup_shim_dir(
                 path.display()
             ));
         }
-        let file = crate::durable::open_regular_file(&path)
+        let (_, opened) = crate::durable::open_regular_file_with_meta(&path)
             .map_err(|error| format!("open release {tool} shim {}: {error}", path.display()))?;
-        let opened = file.metadata().map_err(|error| {
-            format!(
-                "inspect opened release {tool} shim {}: {error}",
-                path.display()
-            )
-        })?;
         if !opened.file_type().is_file()
             || opened.uid() != expected_uid
             || (opened.dev(), opened.ino()) != (before.dev(), before.ino())
@@ -759,7 +750,8 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
     let ship_dir = ship_stage(&take.stage);
     snapshot::private_dir(&ship_dir, "release ship stage")?;
     let shipped = ship_dir.join("aterm");
-    std::fs::copy(&fat, &shipped).map_err(|e| format!("copy {}: {e}", fat.display()))?;
+    crate::durable::copy_regular_fresh(&fat, &shipped)
+        .map_err(|e| format!("copy {}: {e}", fat.display()))?;
     make_executable(&shipped)?;
     let _ = command(aterm_uds::os_path!("strip"))
         .arg("-x")
@@ -780,7 +772,7 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         .current_dir(&plan.repo_root)
         .output();
     if probed.as_ref().is_ok_and(|out| out.status.code().is_some()) {
-        let _ = std::fs::write(ship_dir.join(aterm_uds::deadline::RAN), "");
+        let _ = aterm_uds::deadline::try_mark_ran(&ship_dir);
     }
     let diagnose = match probed {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -862,7 +854,7 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
     let _ = std::fs::remove_dir_all(&scratch);
     let report = probed?;
     let record = symbol_out.join(x86_64_probe_asset_name(&plan.short_version));
-    std::fs::write(
+    crate::durable::write_fresh(
         &record,
         x86_64_probe_transcript(&plan.short_version, &report),
     )
@@ -1189,7 +1181,8 @@ fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Buil
         target.map(|t| format!("--target {t} ")).unwrap_or_default()
     );
     if let Some(log) = log {
-        let mut file = File::create(log).map_err(|e| format!("create {}: {e}", log.display()))?;
+        let mut file = crate::durable::create_fresh(log)
+            .map_err(|e| format!("create {}: {e}", log.display()))?;
         std::io::Write::write_all(&mut file, format!("{banner}\n").as_bytes())
             .map_err(|e| format!("write {}: {e}", log.display()))?;
         let err = file
@@ -1209,9 +1202,7 @@ fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Buil
     println!("{event}");
     if let Some(log) = log {
         use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(log)
+        let mut file = crate::durable::open_append(log, false)
             .map_err(|e| format!("append {}: {e}", log.display()))?;
         writeln!(file, "{event}").map_err(|e| format!("append {}: {e}", log.display()))?;
     }
@@ -1548,19 +1539,9 @@ fn parse_thin_macho_update_pin<R: Read + Seek>(
 }
 
 fn read_thin_macho_update_pin(path: &Path) -> Result<String, String> {
-    let mut file = crate::durable::open_regular_file(path)
+    let (mut file, meta) = crate::durable::open_regular_file_with_meta(path)
         .map_err(|error| format!("open architecture slice {}: {error}", path.display()))?;
-    let meta = file
-        .metadata()
-        .map_err(|error| format!("stat architecture slice {}: {error}", path.display()))?;
-    if !meta.is_file() {
-        return Err(format!(
-            "architecture slice {}: not a regular file",
-            path.display()
-        ));
-    }
-    let file_len = meta.len();
-    parse_thin_macho_update_pin(&mut file, file_len)
+    parse_thin_macho_update_pin(&mut file, meta.len())
         .map_err(|error| format!("architecture slice {}: {error}", path.display()))
 }
 
@@ -1978,7 +1959,7 @@ pub(crate) fn slice_drives_a_session(
             .map_err(|error| format!("create {}: {error}", dir.display()))?;
     }
     let toml = config.join("aterm").join("aterm.toml");
-    std::fs::write(
+    crate::durable::write_fresh(
         &toml,
         "[update]\nenabled = false\n[packages]\nenabled = false\n",
     )
@@ -2144,7 +2125,8 @@ fn lipo_or_copy(slices: &[PathBuf], out: &Path) -> Result<(), String> {
     match slices {
         [] => Err("no architecture built".into()),
         [one] => {
-            std::fs::copy(one, out).map_err(|e| format!("copy {}: {e}", one.display()))?;
+            crate::durable::copy_regular_fresh(one, out)
+                .map_err(|e| format!("copy {}: {e}", one.display()))?;
             make_executable(out)
         }
         many => {
@@ -2187,8 +2169,8 @@ fn extract_dsym(
         .output();
 
     let dwarf = dsym.join("Contents/Resources/DWARF/aterm");
-    let ok = std::fs::metadata(&dwarf)
-        .map(|m| m.len() > 0)
+    let ok = std::fs::symlink_metadata(&dwarf)
+        .map(|m| m.is_file() && m.len() > 0)
         .unwrap_or(false);
     if !ok {
         println!("    WARNING: .dSYM empty/failed (crash reports won't symbolicate)");
@@ -2250,11 +2232,16 @@ fn dwarf_uuids(path: &Path) -> Option<Vec<String>> {
 #[cfg(unix)]
 fn make_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .permissions();
-    perms.set_mode(perms.mode() | 0o755);
-    std::fs::set_permissions(path, perms).map_err(|e| format!("chmod {}: {e}", path.display()))
+    let (file, meta) = crate::durable::open_regular_file_with_meta(path)
+        .map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let mut perms = meta.permissions();
+    let mode = perms.mode();
+    if mode & 0o755 == 0o755 {
+        return Ok(());
+    }
+    perms.set_mode(mode | 0o755);
+    file.set_permissions(perms)
+        .map_err(|e| format!("chmod {}: {e}", path.display()))
 }
 
 /// Windows: executability comes from the file extension; no mode bits to set.
@@ -2932,6 +2919,13 @@ mod tests {
             .expect("crates/")
             .flatten()
         {
+            if !entry
+                .file_type()
+                .map(|ft| ft.is_dir() || ft.is_symlink())
+                .unwrap_or(true)
+            {
+                continue;
+            }
             let path = entry.path().join("Cargo.toml");
             if path.is_file() {
                 manifests.push(path);

@@ -12,7 +12,7 @@ use aterm_types::control_verbs::Input;
 use aterm_window::event_loop::EventLoopProxy;
 
 use super::post_input_reply;
-use crate::input::{Delivery, InputEvent, InputOutcome, ScrollIntent, Source};
+use crate::input::{Delivery, InputEvent, InputOutcome, Source};
 use crate::{ReadOn, SessionCtx, TabAction, Wake, term_lock, term_lock_whole_when};
 
 /// `scroll <up|down|top|bottom|prev-prompt|next-prompt|N>` -> move the viewport and answer `OK <display_offset> <scrollback_lines>`.
@@ -21,27 +21,9 @@ pub(crate) fn cmd_scroll(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
 ) -> String {
-    let intent = match rest.trim() {
-        "" => ScrollIntent::By(0),
-        "top" => ScrollIntent::Top,
-        "bottom" => ScrollIntent::Bottom,
-        "up" => ScrollIntent::Up,
-        "down" => ScrollIntent::Down,
-        "prev-prompt" => ScrollIntent::PrevPrompt,
-        "next-prompt" => ScrollIntent::NextPrompt,
-        n => {
-            let s = n.strip_prefix('-').unwrap_or(n);
-            match (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| n.parse::<i32>().ok())
-                .flatten()
-            {
-                Some(d) => ScrollIntent::By(d),
-                None => {
-                    return "ERR usage: scroll <up|down|top|bottom|prev-prompt|next-prompt|N>\n"
-                        .to_string();
-                }
-            }
-        }
+    let intent = match super::parse_scroll_intent(rest) {
+        Ok(intent) => intent,
+        Err(usage) => return usage,
     };
     match post_input_reply(proxy, vec![InputEvent::ScrollView(intent)]) {
         Ok(_) => {}

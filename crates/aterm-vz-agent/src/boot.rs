@@ -67,7 +67,7 @@ pub fn refresh_unit(path: &Path, carried: &str) -> io::Result<bool> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            opts.mode(0o644);
+            opts.mode(0o644).custom_flags(crate::NONBLOCK_OPEN_FLAG);
         }
         let mut f = opts.open(&partial)?;
         f.write_all(carried.as_bytes())?;
@@ -81,7 +81,7 @@ pub fn refresh_unit(path: &Path, carried: &str) -> io::Result<bool> {
     }
     std::fs::rename(&partial, path)?;
     #[cfg(unix)]
-    if let Ok(dir_file) = std::fs::File::open(parent) {
+    if let Ok(dir_file) = crate::open_nonblock(parent) {
         #[expect(
             clippy::disallowed_methods,
             reason = "std-only for the musl guest build: aterm-durable is not in its graph; the parent directory is synced after the rename"

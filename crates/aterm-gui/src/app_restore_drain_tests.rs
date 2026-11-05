@@ -64,6 +64,7 @@ fn window(titles: &[&str], front: usize) -> restore::WindowLayout {
                 focused_path: Vec::new(),
                 zoomed: false,
                 parked: false,
+                ephemeral: false,
             })
             .collect(),
     }
@@ -422,6 +423,7 @@ fn tabs_landing_behind_the_front_one_leave_its_find_bar_open() {
 
 fn carried_agent(session: &str) -> Box<restore::AgentRestore> {
     Box::new(restore::AgentRestore {
+        claude_auth: None,
         pid: 4242,
         start: "Sat Sep 27 01:02:03 2026".to_string(),
         program: "/opt/claude/bin/claude".to_string(),
@@ -522,6 +524,8 @@ fn a_system_quit_inside_the_drain_keeps_each_owed_tabs_own_agent_and_hold() {
     }
     let sid = app.session_sid(b).expect("B's sid");
     let published = aterm_agent::harness::relaunch::Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: sid.clone(),
@@ -641,7 +645,7 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
     ] {
         let mut app = App::headless_for_test();
         let host = crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(
-            |_, _, _, _| "wait:shell-prompt".to_string(),
+            |_, _, _, _, _| "wait:shell-prompt".to_string(),
         ));
         app.harness = Some(host.clone());
         let records = app.messages.log().records().count();
@@ -893,4 +897,42 @@ fn a_cold_drain_opens_the_list_for_the_workers_it_brings_back() {
             app.structural_invariant_violation().unwrap_or_default()
         );
     }
+}
+
+/// A COLD RESTORE'S TABS OPEN AS THE RESTORE'S, PARKED AS IT PLACED THEM: a restored worker's
+/// open says `by=harness why=restored parked=1`, decided once its tab is parked, not before.
+/// NEGATIVE CONTROL: the person's tab the same drain restored opens `parked=0`.
+#[test]
+fn a_cold_drain_opens_each_restored_tab_parked_as_it_placed_it() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let mut wl = window(&["A", "W1"], 0);
+    parked_at(&mut wl, &[1]);
+    app.pending_restore = Some(restore::RestoreManifest::new(vec![wl]));
+    drain(&mut app);
+    let open_of = |tab: &crate::tab_model::Tab| -> Option<String> {
+        let session = app
+            .view_store
+            .get(tab.focus)
+            .copied()
+            .and_then(crate::tab_model::View::terminal_session)?;
+        let ctx = std::sync::Arc::clone(&app.pool.get(session)?.ctx);
+        let log = crate::control::cmd_log(&ctx, "kinds=tab");
+        log.lines().nth(1).map(str::to_string)
+    };
+    let ws = &app.windows[&wid];
+    let parked: Vec<String> = ws.tab_set.parked().iter().filter_map(open_of).collect();
+    assert_eq!(parked.len(), 1, "{parked:?}");
+    for want in [" act=open why=restored ", " parked=1 ", " by=harness "] {
+        assert!(parked[0].contains(want), "{want}: {}", parked[0]);
+    }
+    let shown: Vec<String> = ws
+        .tab_set
+        .tabs()
+        .iter()
+        .filter(|tab| !tab.parked)
+        .filter_map(open_of)
+        .collect();
+    assert_eq!(shown.len(), 1, "the person's tab: {shown:?}");
+    assert!(shown[0].contains(" parked=0 "), "CONTROL: {}", shown[0]);
 }

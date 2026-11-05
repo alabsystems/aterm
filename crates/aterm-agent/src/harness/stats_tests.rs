@@ -906,6 +906,7 @@ fn sweep_opts(home: &Path, harness_state: &Path) -> Opts {
     Opts {
         home: home.to_path_buf(),
         state: harness_state.to_path_buf(),
+        account_roster: None,
         sock: None,
         token: None,
         only_sid: None,
@@ -1759,6 +1760,11 @@ fn the_join_lists_each_choice_made_in_the_persons_name() {
         chose_why(&[], "recommended"),
         "Question priority is Recommended",
         "CONTROL: with no key, the why is the policy's word"
+    );
+    assert_eq!(
+        chose_why(&["unproven: policy land: the worker decides"], "land"),
+        "Autopilot is Land: the worker took the option that lands the work soonest",
+        "a dialog answered by Land's text says Land, never a priority word no person set"
     );
     let passed = format!(
         "unproven: {CHOSE_FIRST_SAFE}: option 1 would reset, so option 2, the first that names \

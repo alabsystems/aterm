@@ -7,39 +7,52 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::aos_repair::{CONFIG, fields, parse_status};
+use aterm_effects::aos_momentum::{MomentumEvent, MomentumTrace};
+
+use crate::aos_repair::{CONFIG, fields, parse_status, trace_file};
 use crate::instance::{self, Instance, Launch, World, take_flag, take_value};
 use crate::stop::{self, Stopped};
 use crate::{Fail, Res};
 
 /// The verb's own help (`aos-cadence --help`).
 pub const HELP: &str = "\
-usage: targo --unverified lab aos-cadence --a PATH --b PATH [--no-attach] [--keep]
+usage: targo --unverified lab aos-cadence --a PATH --b PATH [--no-attach] [--silent] [--keep]
 
 OPENS ONE WINDOW AT A TIME, four in all. Each take is a fresh private windowed aterm whose tab runs a program that
 reads raw with the tty's echo off and echoes each byte itself (`stty -icanon -echo && exec cat`), the momentum glow
-on. The take attaches a recording (`aos attach`), so every typed key is held for the proof of its own echo, then types
-the same 158 keys (four lines of words, each ended by Enter) at a person's cadence: `key <c>` on one held control
-connection, the gaps drawn from a fixed seed between 100 and 240 ms. It then reads `aos status`, `aos trace` and
-`metrics percentiles`, and stops the instance by its pid. The takes run builds A, B, B, A, in that order.
+on. Once that tab has stayed in front for 3 s (a take whose instance put a tab of its own in front of it stops: a
+build from dc29c1d34f to before f55438b7ed opens Mac Setup's automatic tab in a scratch world), the take attaches a
+recording (`aos attach`), so every typed key is held for the proof of its own echo, then types the same 158 keys (four
+lines of words, each ended by Enter) at a person's cadence: `key <c>` on one held control connection, the gaps drawn
+from a fixed seed between 100 and 240 ms. It then reads `aos status`, `aos trace` and `metrics percentiles`, and stops
+the instance by its pid. The takes run builds A, B, B, A, in that order.
 
-Each take prints one MEASURED line: its build, whether the recording was still attached and the keys it logged, and
-n_present, present_p50/p95/p99_ms (PTY output to glass) and n_input, input_p50/p95/p99_ms (key to the next content
-present). The figures are measurements, never gates.
+Each take prints one MEASURED line: its build and program, whether the recording was still attached and the keys it
+logged, n_present, present_p50/p95/p99_ms (PTY output to glass), n_input, input_p50/p95/p99_ms (key to the next
+content present) and, attached, held_p50/p95/p99_ms: each logged key's instant in the exported trace (`aos trace hex`)
+less its press, the time the key waited for its echo before it reached the glow (each press is dated by its request's
+send, the epoch by the attach's, so a figure is good to about one request's round trip). The figures are
+measurements, never gates.
 
   --a PATH     build A, run first and last (an aterm executable; a release build with --features dev-seams times
                the shipped code)
   --b PATH     build B, run second and third
   --no-attach  the control: the same takes with no recording attached, so no key is ever held
+  --silent     the tab's program reads raw and echoes nothing (`stty -icanon -echo && exec cat >/dev/null`), so an
+               attached recording must stop (`detached why=raw_key`) and log none of its keys
   --keep       keep each take's scratch world
 
-exit: 0 every take typed its keys and, attached, kept its recording to the end; 1 a take failed or a step never
-happened (a one-minute hang detector); 2 usage; 3 not run
+exit: 0 every take typed its keys and, attached, kept its recording to the end (stopped it, with --silent); 1 a take
+failed or a step never happened (a one-minute hang detector); 2 usage; 3 not run
 ";
 
 /// The tab's program: it reads raw with the tty's echo off and echoes each byte itself, as a
 /// line editor does. Output processing stays on, so the Enter it echoes starts a line.
 const PROGRAM: &str = "stty -icanon -echo && exec /bin/cat";
+
+/// `--silent`'s program: it reads raw with the tty's echo off and shows nothing, as a password
+/// reader does.
+const SILENT: &str = "stty -icanon -echo && exec /bin/cat >/dev/null";
 
 /// What a take types: four lines of words, each ended by Enter, all short of the grid's margin
 /// (an echo that wraps stops a recording).
@@ -111,7 +124,7 @@ pub fn key_body(c: char) -> String {
 }
 
 /// What one take read.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Take {
     /// `aos status`'s `attached` after the last key (always false with no recording).
     pub attached: bool,
@@ -119,26 +132,84 @@ pub struct Take {
     pub logged: Option<u64>,
     /// [`FIGURES`]' values as `metrics percentiles` printed them (`?` where it printed none).
     pub figures: Vec<String>,
+    /// Attached, the p50, p95 and p99 of [`held_ns`], in ms.
+    pub held: Option<(f64, f64, f64)>,
 }
 
 /// One take's MEASURED line.
 #[must_use]
-pub fn measured(take: usize, build: char, attach: bool, typed: usize, t: &Take) -> String {
+pub fn measured(
+    take: usize,
+    build: char,
+    (attach, silent): (bool, bool),
+    typed: usize,
+    t: &Take,
+) -> String {
     let mut line = format!(
-        "MEASURED take={take} build={build} attach={attach} typed={typed} attached={} logged={}",
+        "MEASURED take={take} build={build} program={} attach={attach} typed={typed} attached={} logged={}",
+        if silent { "silent" } else { "echo" },
         t.attached,
         t.logged.map_or_else(|| "-".to_owned(), |k| k.to_string())
     );
     for (name, value) in FIGURES.iter().zip(&t.figures) {
         line.push_str(&format!(" {name}={value}"));
     }
+    match t.held {
+        Some((p50, p95, p99)) => line.push_str(&format!(
+            " held_p50_ms={p50:.1} held_p95_ms={p95:.1} held_p99_ms={p99:.1}"
+        )),
+        None => line.push_str(" held_p50_ms=- held_p95_ms=- held_p99_ms=-"),
+    }
     line
 }
 
-/// Whether a take is good: with a recording, it was still attached after the last key.
+/// Whether a take is good: with a recording, it was still attached after the last key, or, with
+/// `--silent`, stopped.
 #[must_use]
-pub fn take_ok(attach: bool, t: &Take) -> bool {
-    !attach || t.attached
+pub fn take_ok((attach, silent): (bool, bool), t: &Take) -> bool {
+    !attach || t.attached != silent
+}
+
+/// How long each logged key waited before it was logged, and so reached the glow, in ns: a logged
+/// key's instant (`logged`, ns after the attach, oldest first) less its press, `sent` after the
+/// attach. The log holds the newest keys, so the last of `logged` is the last printable key of
+/// `keys` (an Enter is never logged); a key logged before its send reads 0.
+#[must_use]
+pub fn held_ns(logged: &[i128], keys: &[char], sent: &[Duration]) -> Vec<u64> {
+    let pressed: Vec<Duration> = keys
+        .iter()
+        .zip(sent)
+        .filter(|(c, _)| **c != '\n')
+        .map(|(_, at)| *at)
+        .collect();
+    logged
+        .iter()
+        .rev()
+        .zip(pressed.iter().rev())
+        .map(|(&at, press)| {
+            let press = i128::try_from(press.as_nanos()).unwrap_or(i128::MAX);
+            u64::try_from(at.saturating_sub(press).max(0)).unwrap_or(u64::MAX)
+        })
+        .rev()
+        .collect()
+}
+
+/// The `Key` instants of an `aos trace hex` reply's log, ns after the attach, oldest first.
+fn logged_keys(line: &str) -> Result<Vec<i128>, String> {
+    let file = trace_file(line)?;
+    let trace = MomentumTrace::decode(&file).map_err(|e| format!("the trace file: {e}"))?;
+    let read = trace
+        .read(Instant::now())
+        .map_err(|e| format!("the trace: {e}"))?;
+    Ok(read
+        .log
+        .inputs()
+        .iter()
+        .filter_map(|e| match *e {
+            MomentumEvent::Key { at, .. } => Some(at),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Why a take ended early.
@@ -171,13 +242,34 @@ fn ask(
     })
 }
 
-/// Reads `status` until the tab's program is `cat` (the `stty` before it ran): a hang detector.
+/// How long the program's tab must stay in front before a take types: longer than the keyboard
+/// quiet (2.5 s) after which a window opens an automatic tab by itself, so one would show first.
+const SETTLED: Duration = Duration::from_secs(3);
+
+/// Reads `status` until the front tab is the program's (session 0) and its program is `cat` (the
+/// `stty` before it ran), unchanged for [`SETTLED`]: a hang detector. A tab the instance opened
+/// by itself in front of it would take the keys, so the take stops: a scratch world opens none
+/// since f55438b7ed, and a build from dc29c1d34f to before it opens Mac Setup's automatic tab
+/// there on a Mac whose root steps are owed.
 fn await_cat(wire: &mut aterm_agent::RelayClient<aterm_uds::CtlStream>) -> Result<(), Halt> {
     let start = Instant::now();
+    let mut front_since = None;
     loop {
         let reply = ask(wire, "status")?;
-        if fields(&reply).get("program") == Some(&"cat") {
-            return Ok(());
+        let f = fields(&reply);
+        if f.get("sid").is_some_and(|sid| *sid != "0") {
+            return Err(Halt::Broke(format!(
+                "the instance put a tab of its own in front of the program's, which would take the \
+                 keys (a build from dc29c1d34f to before f55438b7ed opens Mac Setup's tab in a \
+                 scratch world): {reply}"
+            )));
+        }
+        if f.get("program") == Some(&"cat") {
+            if front_since.get_or_insert_with(Instant::now).elapsed() >= SETTLED {
+                return Ok(());
+            }
+        } else {
+            front_since = None;
         }
         if start.elapsed() >= HANG {
             return Err(Halt::Broke(format!(
@@ -195,6 +287,7 @@ fn drive(
     attach: bool,
 ) -> Result<Take, Halt> {
     await_cat(wire)?;
+    let attached_at = Instant::now();
     if attach {
         let reply = ask(wire, "aos attach")?;
         if !parse_status(&reply).is_ok_and(|s| s.attached) {
@@ -205,6 +298,7 @@ fn drive(
     let gaps = gaps(keys.len());
     let start = Instant::now();
     let mut due = start;
+    let mut sent = Vec::with_capacity(keys.len());
     for (c, gap) in keys.iter().zip(std::iter::once(Duration::ZERO).chain(gaps)) {
         due += gap;
         let now = Instant::now();
@@ -212,6 +306,7 @@ fn drive(
             stop::sleep(due - now)?;
         }
         let request = format!("key {}", key_body(*c));
+        sent.push(attached_at.elapsed());
         let reply = ask(wire, &request)?;
         if !reply.starts_with("OK") {
             return Err(Halt::Broke(format!("{request} refused: {reply}")));
@@ -222,11 +317,15 @@ fn drive(
     let attached = parse_status(&status)
         .map_err(|e| Halt::Broke(format!("aos status: {e}: {status}")))?
         .attached;
-    let logged = if attached {
+    let (logged, held) = if attached {
         let trace = ask(wire, "aos trace")?;
-        fields(&trace).get("keys").and_then(|k| k.parse().ok())
+        let logged = fields(&trace).get("keys").and_then(|k| k.parse().ok());
+        let file = ask(wire, "aos trace hex")?;
+        let at = logged_keys(&file).map_err(|e| Halt::Broke(format!("aos trace hex: {e}")))?;
+        let held = crate::bench_stats::percentiles(&held_ns(&at, &keys, &sent));
+        (logged, held)
     } else {
-        None
+        (None, None)
     };
     let line = ask(wire, "metrics percentiles")?;
     let f = fields(&line);
@@ -238,11 +337,13 @@ fn drive(
         attached,
         logged,
         figures,
+        held,
     })
 }
 
-/// One take of `aterm`: a fresh windowed instance, driven, then stopped by its pid.
-fn take(aterm: &Path, attach: bool, keep: bool) -> Result<Take, Halt> {
+/// One take of `aterm`: a fresh windowed instance whose tab runs [`PROGRAM`] (or [`SILENT`]),
+/// driven, then stopped by its pid.
+fn take(aterm: &Path, (attach, silent): (bool, bool), keep: bool) -> Result<Take, Halt> {
     let top: Vec<String> = CONFIG.iter().map(|l| (*l).to_string()).collect();
     let config = format!(
         "{}{}",
@@ -254,7 +355,8 @@ fn take(aterm: &Path, attach: bool, keep: bool) -> Result<Take, Halt> {
         world.keep();
     }
     let mut args: Vec<String> = GRID.iter().map(|s| (*s).to_string()).collect();
-    args.extend(["-e", "/bin/sh", "-c", PROGRAM].map(str::to_string));
+    let program = if silent { SILENT } else { PROGRAM };
+    args.extend(["-e", "/bin/sh", "-c", program].map(str::to_string));
     let mut inst = Instance::start(
         &world,
         Launch {
@@ -288,8 +390,19 @@ fn take(aterm: &Path, attach: bool, keep: bool) -> Result<Take, Halt> {
             let mut wire = inst.connect().map_err(Halt::Broke)?;
             drive(&mut wire, attach)
         });
-    inst.stop();
-    result
+    match (result, inst.stop()) {
+        (Ok(take), Ok(())) => Ok(take),
+        (Ok(_), Err(why)) => Err(Halt::Broke(format!("instance cleanup failed: {why}"))),
+        (Err(Halt::Broke(primary)), Err(cleanup)) => Err(Halt::Broke(format!(
+            "{primary}; instance cleanup failed: {cleanup}"
+        ))),
+        (Err(primary), cleanup) => {
+            if let Err(why) = cleanup {
+                eprintln!("aos-cadence: instance cleanup failed: {why}");
+            }
+            Err(primary)
+        }
+    }
 }
 
 /// `aos-cadence`.
@@ -306,6 +419,7 @@ pub fn cmd_aos_cadence(args: &[String]) -> Res {
     let build_a = take_value(&mut a, "--a")?;
     let build_b = take_value(&mut a, "--b")?;
     let attach = !take_flag(&mut a, "--no-attach");
+    let silent = take_flag(&mut a, "--silent");
     let keep = take_flag(&mut a, "--keep");
     if let Some(extra) = a.first() {
         return Err(Fail::usage(format!(
@@ -323,10 +437,10 @@ pub fn cmd_aos_cadence(args: &[String]) -> Res {
     let mut ok = true;
     for (i, build) in ORDER.iter().enumerate() {
         let aterm = if *build == 'A' { &build_a } else { &build_b };
-        match take(aterm, attach, keep) {
+        match take(aterm, (attach, silent), keep) {
             Ok(t) => {
-                println!("{}", measured(i + 1, *build, attach, typed, &t));
-                ok &= take_ok(attach, &t);
+                println!("{}", measured(i + 1, *build, (attach, silent), typed, &t));
+                ok &= take_ok((attach, silent), &t);
             }
             Err(Halt::Stopped(sig)) => {
                 return Err(Fail::die(format!(

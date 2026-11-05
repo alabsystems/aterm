@@ -24,7 +24,9 @@ pub(crate) use imp::our_uid;
 #[cfg(all(unix, any(target_os = "macos", test)))]
 pub(crate) use imp::peer_uid;
 pub(crate) use imp::pid_alive;
-pub(crate) use imp::{ensure_private_dir, lock_socket_file, peer_check, provision_token};
+pub(crate) use imp::{
+    SocketOwner, ensure_private_dir, lock_socket_file, peer_check, provision_token,
+};
 
 /// Atomically point the `latest` alias at this instance's socket ([`aterm_uds::latest::publish`]).
 pub(crate) fn publish_latest_link(link: &Path, sock_path: &str) {
@@ -1634,7 +1636,9 @@ fn open_private_namespace_lock(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     #[cfg(windows)]
     {
@@ -1663,7 +1667,7 @@ fn open_private_namespace_lock(
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         let opened = file.metadata()?;
         if opened.dev() != path_metadata.dev()
             || opened.ino() != path_metadata.ino()
@@ -1674,17 +1678,22 @@ fn open_private_namespace_lock(
                 "namespace lock identity changed or has multiple names",
             ));
         }
+        if std::fs::canonicalize(&path)?.parent() != Some(namespace.as_path()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "namespace lock redirects outside its namespace",
+            ));
+        }
+        if opened.permissions().mode() & 0o7777 != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
     }
+    #[cfg(not(unix))]
     if std::fs::canonicalize(&path)?.parent() != Some(namespace.as_path()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "namespace lock redirects outside its namespace",
         ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(file)
 }
@@ -3245,10 +3254,18 @@ pub(crate) fn read_token(sock_path: &str) -> Option<String> {
     if t.is_empty() { None } else { Some(t) }
 }
 
-/// Whether the control socket at `path` has a live listener (fail-safe true on error).
+/// Whether the control socket at `path` has a live owner: a held [`SocketOwner`] lock on its token
+/// file answers yes with no connect, since a refusal never proves a socket stale (a stopped
+/// owner's full queue refuses too) and a blocking connect to one can sleep. Otherwise a connect
+/// decides, fail-safe true on an error that says neither refused nor absent.
 #[must_use]
 pub(crate) fn socket_is_live(path: &str) -> bool {
+    use aterm_uds::ownerlock::{Owner, probe};
     use std::io::ErrorKind;
+    if std::fs::symlink_metadata(path).is_ok() && probe(&token_path_for_socket(path)) == Owner::Live
+    {
+        return true;
+    }
     match CtlStream::connect(path) {
         Ok(_) => true,
         Err(e) => !matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound),
@@ -3275,19 +3292,22 @@ pub(crate) fn connect_socket_nonblocking(path: &str) -> std::io::Result<CtlStrea
     let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let kind = libc::SOCK_STREAM;
-    // SAFETY: socket returns a fresh descriptor, owned immediately on success.
-    let raw = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    // SAFETY: both operations target this live, exclusively owned descriptor.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
-        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
+    let fd = aterm_uds::kept_out(|| {
+        // SAFETY: socket returns a fresh descriptor, owned immediately on success.
+        let raw = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: both operations target this live, exclusively owned descriptor.
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(fd)
+    })?;
     // SAFETY: initialized sockaddr_un with a checked, NUL-terminated path.
     let result = unsafe {
         libc::connect(

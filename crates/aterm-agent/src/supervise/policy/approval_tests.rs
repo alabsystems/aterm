@@ -453,7 +453,7 @@ fn under_zsh_only_a_plain_line_is_a_proven_read() {
         reason(&d).starts_with("runs export (space reading)"),
         "{d:?}"
     );
-    assert!(plain_zsh_line(line).is_err(), "not plain under zsh");
+    assert!(plain_zsh_line(line, false).is_err(), "not plain under zsh");
     for line in [
         "git log --oneline -5 --format='%h %s' 2>/dev/null | head -3",
         "grep -rn \"TODO\" src && wc -l ~/notes.txt",
@@ -2873,7 +2873,7 @@ fn a_too_many_box_is_judged_by_its_screens_readings_alone() {
     };
     let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
                  analyze; the command need not name rm)";
-    let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true));
+    let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true, false, false));
     for (text, base) in [
         (BOX_RM_TOO_MANY_NO_RM_2_1_307, ctx()),
         (BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307, bypass()),
@@ -3152,7 +3152,7 @@ fn note_box(name: &str) -> Vec<String> {
 
 #[test]
 fn the_no_rule_note_alone_is_lifted_by_the_read_only_proof_under_its_own_rule() {
-    let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true));
+    let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true, false, false));
     for name in [
         "n01-awk-read",
         "n03-compound-outside",
@@ -3965,6 +3965,7 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
         home,
         Start::Unplaced,
         &|_| false,
+        LeadingDot::Any,
     )
     .expect_err("a secret");
     assert!(r.contains("a read of a secret"), "{r}");
@@ -4288,15 +4289,32 @@ fn a_file_a_sed_script_or_an_awk_program_names_is_held_to_the_secrets() {
     }
 }
 
-/// Under zsh, `^` and a `#` inside a word glob when the startup sets `EXTENDED_GLOB` (`^x` any
-/// name but `x`, `g#h` any run of `g` then `h`), which the secret check does not read: a line
-/// holding one unquoted proves no box. MEASURED 2026-10-29: `/bin/zsh -f` with `setopt
+/// Under zsh, `^` and a `#` inside a word glob where the startup may set `EXTENDED_GLOB` (`^x`
+/// any name but `x`, `g#h` any run of `g` then `h`), which the secret check does not read: there a
+/// line holding one unquoted proves no box. MEASURED 2026-10-29: `/bin/zsh -f` with `setopt
 /// extendedglob` expands `~/.config/^x/hosts.yml` and `~/.s#h/config` to `.config/gh/hosts.yml`
-/// and `.ssh/config`. Under bash both are literal names.
+/// and `.ssh/config`. Where the snapshot is read whole and sets it nowhere, zsh reads both as
+/// text, as bash does, and the reads are approved: MEASURED 2026-11-05, under `setopt
+/// NO_EXTENDED_GLOB` zsh 5.9 prints each of these words as written
+/// (`docs/measured/classifier-zsh-glob-2026-11-05.md`). A line that would set the option itself
+/// is no read.
 #[test]
-fn an_extended_glob_operator_under_zsh_proves_no_box() {
-    let zsh = zsh_startup("", "setopt extendedglob\n");
-    assert!(zsh.as_ref().is_ok_and(ShellStartup::may_run_zsh), "{zsh:?}");
+fn an_extended_glob_operator_under_zsh_proves_no_box_only_where_the_startup_may_set_it() {
+    let set = zsh_startup("", "setopt extendedglob\n");
+    let unseen = zsh_startup("turn_it_on\n", "");
+    let free = zsh_startup("", "");
+    for may in [&set, &unseen] {
+        assert!(
+            may.as_ref()
+                .is_ok_and(|s| s.may_run_zsh() && s.may_extended_glob()),
+            "{may:?}"
+        );
+    }
+    assert!(
+        free.as_ref()
+            .is_ok_and(|s| s.may_run_zsh() && !s.may_extended_glob()),
+        "{free:?}"
+    );
     let under = |shell: &Result<ShellStartup, String>| ApprovalCtx {
         shell: shell.clone(),
         ..git_host(ctx())
@@ -4308,12 +4326,31 @@ fn an_extended_glob_operator_under_zsh_proves_no_box() {
         "cat ~/.config/g#h/hosts.yml",
         "cat ~/.s#h/config",
         "git show HEAD^",
+        "grep -n ^fn src",
     ] {
         for rows in boxes(line) {
-            let r = reason(&on_screen(&rows, &under(&zsh))).to_string();
-            assert!(r.contains("not a plain line under zsh"), "{line}: {r}");
-            let d = on_screen(&rows, &under(&bash));
-            assert!(approved(&d).is_some(), "under bash {line}: {d:?}");
+            for may in [&set, &unseen] {
+                let r = reason(&on_screen(&rows, &under(may))).to_string();
+                assert!(r.contains("not a plain line under zsh"), "{line}: {r}");
+            }
+            for read in [&free, &bash] {
+                let d = on_screen(&rows, &under(read));
+                assert!(approved(&d).is_some(), "{line}: {d:?}");
+            }
+        }
+    }
+    for line in [
+        "setopt extendedglob; cat ~/.config/^x/hosts.yml",
+        "set -o extendedglob; cat ~/.s#h/config",
+        "emulate -L zsh -o extendedglob; git show HEAD^",
+        "unsetopt noextendedglob; cat ~/.s#h/config",
+        "options[extendedglob]=on; cat ~/.s#h/config",
+        "print -v 'options[extendedglob]' on; cat ~/.s#h/config",
+        "printf -v 'options[extendedglob]' on; cat ~/.s#h/config",
+    ] {
+        for rows in boxes(line) {
+            let d = on_screen(&rows, &under(&free));
+            assert!(approved(&d).is_none(), "the line sets it: {line}: {d:?}");
         }
     }
     // NEGATIVE CONTROL
@@ -4324,8 +4361,131 @@ fn an_extended_glob_operator_under_zsh_proves_no_box() {
         "cat ~/notes/a.txt",
     ] {
         for rows in boxes(line) {
-            let d = on_screen(&rows, &under(&zsh));
+            let d = on_screen(&rows, &under(&set));
             assert!(approved(&d).is_some(), "{line}: {d:?}");
+        }
+    }
+}
+
+/// In the Bash tool's shell, whose read startup holds neither bash's `dotglob` nor zsh's
+/// `GLOB_DOTS`, a glob meets a name's leading dot only by a literal `.` ([`LeadingDot`],
+/// MEASURED 2026-11-05 with bash 3.2.57 and zsh 5.9): `cat *.json` reads no `.credentials.json`
+/// and `head src/*env` no `.env`, so both are reads. The advisory word knows no shell's options,
+/// so it still takes a `*` to a leading dot; a glob opening with a literal dot, and one a
+/// non-dot rule meets, is held to the rules as before.
+#[test]
+fn a_glob_meets_a_leading_dot_only_by_a_literal_one_under_a_read_startup() {
+    let home = Path::new("/Users/_owner");
+    let boxes = |line: &str| [folder_box_with(line), no_rule_box(line)];
+    let word = |line: &str| readings_read_only_at(&[line.to_string()], &[], Some(home));
+    let zsh = zsh_startup("", "");
+    let bash = Ok(ShellStartup::default());
+    let under = |shell: &Result<ShellStartup, String>| ApprovalCtx {
+        shell: shell.clone(),
+        ..git_host(ctx())
+    };
+    for line in [
+        "cat *.json",
+        "cat ?credentials.json",
+        "cat [.]netrc",
+        "head src/*env",
+        "cat ~/proj/*.json",
+    ] {
+        for rows in boxes(line) {
+            for shell in [&zsh, &bash] {
+                let d = on_screen(&rows, &under(shell));
+                assert!(approved(&d).is_some(), "{line}: {d:?}");
+            }
+        }
+        let r = word(line).expect_err(line);
+        assert!(r.contains("a read of a secret"), "the word: {line}: {r}");
+    }
+    // A line that would turn a dot glob on itself is no read: an assignment, `export` and `env` on
+    // the walk to a program fail proof_gaps_clear, `printf -v` assigns, and `shopt`, `set`,
+    // `setopt` and `print` are no read-only program.
+    for line in [
+        "GLOBIGNORE=zz; cat *.json",
+        "export GLOBIGNORE=zz && cat *.json",
+        "printf -v GLOBIGNORE zz && cat *.json",
+        "shopt -s dotglob; cat *.json",
+        "set -o globdots; cat *.json",
+        "setopt globdots; cat *.json",
+        "print -v 'options[globdots]' on; cat *.json",
+    ] {
+        for rows in boxes(line) {
+            for shell in [&zsh, &bash] {
+                let d = on_screen(&rows, &under(shell));
+                assert!(approved(&d).is_none(), "the line sets it: {line}: {d:?}");
+            }
+        }
+    }
+    // NEGATIVE CONTROL
+    for line in [
+        "cat .*.json",
+        "cat ~/.s*/config",
+        "cat src/.en?",
+        "cat ~/*/Preferences/x.plist",
+    ] {
+        for rows in boxes(line) {
+            for shell in [&zsh, &bash] {
+                let r = reason(&on_screen(&rows, &under(shell))).to_string();
+                assert!(r.contains("a read of a secret"), "{line}: {r}");
+            }
+        }
+    }
+    let literal = LeadingDot::Literal;
+    assert!(!component_meets("*", ".ssh", literal));
+    assert!(!component_meets("?ssh", ".ssh", literal));
+    assert!(!component_meets("[.]ssh", ".ssh", literal));
+    assert!(component_meets(".s*", ".ssh", literal));
+    assert!(component_meets("*", "Keychains", literal));
+    assert!(
+        component_meets("@(.ssh|x)", ".ssh", literal),
+        "an extended-glob group may name any name"
+    );
+    assert!(component_meets("*", ".ssh", LeadingDot::Any));
+    assert!(!basename_meets("*.json", ".credentials.json", literal));
+    assert!(basename_meets(".*.json", ".credentials.json", literal));
+    assert!(basename_meets(
+        "*.json",
+        ".credentials.json",
+        LeadingDot::Any
+    ));
+    assert!(basename_meets("a.pe?", "*.pem", literal));
+}
+
+/// A startup that may turn `GLOB_DOTS`, `dotglob` or `GLOBIGNORE` on unseen
+/// ([`ShellStartup::may_dot_glob`]) leaves a glob free to meet a leading dot: a zsh snapshot's
+/// top-level line this check does not read, and a bash startup read as one that may (as
+/// `GLOBIGNORE` in its environment leaves it), refuse the reads a proven startup approves.
+#[test]
+fn a_startup_that_may_set_a_dot_glob_unseen_meets_any_leading_dot() {
+    let boxes = |line: &str| [folder_box_with(line), no_rule_box(line)];
+    let under = |shell: &Result<ShellStartup, String>| ApprovalCtx {
+        shell: shell.clone(),
+        ..git_host(ctx())
+    };
+    let unseen_zsh = zsh_startup("turn_it_on\n", "");
+    assert!(
+        unseen_zsh.as_ref().is_ok_and(ShellStartup::may_dot_glob),
+        "{unseen_zsh:?}"
+    );
+    let unseen_bash = Ok(ShellStartup::of_parts(Vec::new(), false, false, true));
+    for line in ["cat *.json", "cat ?credentials.json", "head src/*env"] {
+        for rows in boxes(line) {
+            for shell in [&unseen_zsh, &unseen_bash] {
+                let r = reason(&on_screen(&rows, &under(shell))).to_string();
+                assert!(r.contains("a read of a secret"), "{line} unseen: {r}");
+            }
+        }
+    }
+    // NEGATIVE CONTROL: the same lines under the startups proven free of one.
+    for line in ["cat *.json", "cat ?credentials.json", "head src/*env"] {
+        for rows in boxes(line) {
+            for shell in [&zsh_startup("", ""), &Ok(ShellStartup::default())] {
+                let d = on_screen(&rows, &under(shell));
+                assert!(approved(&d).is_some(), "{line}: {d:?}");
+            }
         }
     }
 }
@@ -5254,7 +5414,7 @@ fn the_too_many_breaker_over_a_proven_read_is_approved_under_its_rule() {
         bypass_mode: true,
         ..safe_warn()
     };
-    let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true));
+    let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true, false, false));
     let lines = sixty_five(&[]);
     for bypass_box in [false, true] {
         let rows = too_many_box(&lines, bypass_box);
@@ -5303,6 +5463,8 @@ fn the_too_many_breaker_over_a_proven_read_is_approved_under_its_rule() {
     }
     let alias = ShellStartup::of_parts(
         vec![("echo".into(), "an alias in a snapshot".into(), true)],
+        false,
+        false,
         false,
     );
     let mut refused: Vec<(&str, Vec<String>, ApprovalCtx, &str)> = vec![
@@ -10965,14 +11127,18 @@ fn a_claim_workers_chrome_action_on_its_claim_page_is_pressed_once() {
     );
 }
 
-/// A CLAIM WORKER'S CHROME ACTION OFF ITS CLAIM PAGES GOES TO A PERSON: a page on another host,
-/// on a host that only begins with the vendor's, behind a user name, over `http://`, on a named
-/// port, or whose path or query names billing, an upgrade or usage, and a box whose title names
-/// another site, are none the fence keeps; Claude in Chrome's box has no `No` to amend, so nothing
-/// is pressed and a person decides. CONTROL: every one of them is pressed at full power for a
-/// session that is no claim worker.
+/// A CLAIM WORKER'S CHROME ACTION OFF ITS CLAIM PAGES IS REFUSED ON THE BOX'S OWN ESC, NEVER A
+/// PERSON'S (the 2026-11-04 claim workers each waited on a person at this box): a page on
+/// another host, on a host that only begins with the vendor's, behind a user name, over
+/// `http://`, on a named port, or whose path or query names billing, an upgrade or usage, a box
+/// whose title names another site, and a box that names no page at all, are none the fence keeps;
+/// Claude in Chrome's box has no `No` to amend, so its `Deny (esc)` is pressed on the focused row
+/// ([`CLAIM_WORKER_ESC`]), typing nothing. CONTROL: every one of them is pressed at full power for
+/// a session that is no claim worker; the same box on a claim page keeps the rules' one-shot
+/// allow. NEGATIVE CONTROL: a box the reader does not vouch for, and one whose `Deny` takes no
+/// Esc, are pressed on nothing and handed over.
 #[test]
-fn a_claim_workers_chrome_action_off_its_claim_pages_goes_to_a_person() {
+fn a_claim_workers_chrome_action_off_its_claim_pages_is_refused_on_its_esc() {
     for (host, url, why) in [
         (
             "github.com",
@@ -11012,46 +11178,153 @@ fn a_claim_workers_chrome_action_off_its_claim_pages_goes_to_a_person() {
             "`usage`",
         ),
         ("evil.com", CLAIM_LINK, "names evil.com as the site"),
+        ("claude.ai", "", "names no page"),
     ] {
-        let rows = chrome_box(host, url);
+        let rows = if url.is_empty() {
+            chrome_box(host, CLAIM_LINK)
+                .into_iter()
+                .filter(|row| row.trim() != CLAIM_LINK)
+                .collect()
+        } else {
+            chrome_box(host, url)
+        };
         assert_eq!(
             approved(&on_screen(&rows, &full())),
             Some(RULE_ALLOW_ONCE),
             "CONTROL {url}: an ordinary session's press"
         );
         let d = on_screen(&rows, &claim_worker(full()));
-        let reason = reason(&d);
-        for want in [RULE_CLAIM_WORKER, why, "no `No` to amend"] {
-            assert!(reason.contains(want), "{url}: {want}: {reason}");
-        }
-    }
-}
-
-/// A CLAIM WORKER'S QUESTION IS A PERSON'S: under `answer_questions = true` (the default) a
-/// question is answered with its recommended option for every session, and handed to a person
-/// for a claim worker, at full power and under `approve = "none"` alike.
-#[test]
-fn a_claim_workers_question_goes_to_a_person_whatever_answer_questions_says() {
-    let rows = phase_fixtures::screen(phase_fixtures::QUESTION_RECOMMENDED_SECOND);
-    for base in [full(), ctx(), none(full())] {
-        assert!(base.answer_questions, "the default answers questions");
+        let (rule, choice, guard, subject, unproven) = approval(&d);
+        assert_eq!(rule, RULE_CLAIM_WORKER, "{url}: {d:?}");
         assert_eq!(
-            approved(&on_screen(&rows, &base)),
-            Some(RULE_ANSWER_RECOMMENDED),
-            "CONTROL under {:?}: an ordinary session's answer",
-            base.approve
+            *choice,
+            Choice::FocusKey {
+                steps: 0,
+                label: "Allow".to_string(),
+                key: "esc",
+            },
+            "{url} ({why}): the box's Esc, on the row that has the focus"
         );
-        let d = on_screen(&rows, &claim_worker(base));
-        let reason = reason(&d);
-        assert!(
-            reason.contains(RULE_CLAIM_WORKER) && reason.contains("the person's to answer"),
-            "{reason}"
+        assert_eq!(
+            *guard,
+            row_guard(
+                rows.iter()
+                    .find(|r| r.contains("❯ 1. Allow"))
+                    .expect("the focused row")
+            ),
+            "{url}"
         );
+        assert!(subject.ends_with(CLAIM_WORKER_ESC), "{url}: {subject}");
+        assert!(unproven.is_none(), "{url}");
+    }
+    let page = chrome_box("claude.ai", CLAIM_LINK);
+    assert_eq!(
+        approved(&on_screen(&page, &claim_worker(full()))),
+        Some(RULE_ALLOW_ONCE),
+        "CONTROL a claim page"
+    );
+    // The rules hand an unvouched box over themselves, so the fence has no approval to refuse.
+    let off = chrome_box("github.com", "https://github.com/x");
+    let mut unvouched = aterm_phase::read(Some("claude"), &off, None);
+    unvouched.phase_authoritative = false;
+    let d = decide(&unvouched, &off, &claim_worker(full()));
+    let why = reason(&d);
+    assert!(why.contains("no box the reader vouches for"), "{why}");
+    let mut no_esc = aterm_phase::read(Some("claude"), &off, None);
+    if let Some(p) = no_esc.prompt.as_mut() {
+        assert!(p.cancel.is_some(), "PRECONDITION: the box's `Deny (esc)`");
+        p.cancel = None;
+    }
+    let d = decide(&no_esc, &off, &claim_worker(full()));
+    let why = reason(&d);
+    for want in [
+        RULE_CLAIM_WORKER,
+        "no `No` to amend",
+        "no `Esc` that refuses it",
+    ] {
+        assert!(why.contains(want), "{want}: {why}");
     }
 }
 
-/// A CLAIM WORKER'S OTHER TOOL BOXES ARE DECLINED ON THEIR `No`: a Bash read, an `rm`, another
-/// MCP server's tool and a file write, at `safe` and at full power, with
+/// A CLAIM WORKER'S QUESTION IS DECLINED, NEVER A PERSON'S: its fence presses the dialog's own
+/// Esc on the focused row (one Esc declines the whole dialog, nothing chosen), whatever
+/// `answer_questions` and `approve` say, at full power, at `safe`, under `approve = "none"` and
+/// with answers off alike; no person is asked. CONTROL: the same question in a session that is no
+/// claim worker follows `answer_questions` (its recommended option, or a person's with answers
+/// off). NEGATIVE CONTROLS: a dialog the reader does not vouch for, and one whose footer offers
+/// no `Esc to cancel`, are pressed on nothing and handed over, as an unread box is.
+#[test]
+fn a_claim_workers_question_is_declined_whatever_answer_questions_says() {
+    let rows = phase_fixtures::screen(phase_fixtures::QUESTION_RECOMMENDED_SECOND);
+    let off = |base: ApprovalCtx| ApprovalCtx {
+        answer_questions: false,
+        ..base
+    };
+    for base in [full(), ctx(), none(full()), off(full())] {
+        let ordinary = on_screen(&rows, &base);
+        if base.answer_questions {
+            assert_eq!(
+                approved(&ordinary),
+                Some(RULE_ANSWER_RECOMMENDED),
+                "CONTROL under {:?}: an ordinary session's answer",
+                base.approve
+            );
+        } else {
+            assert!(
+                reason(&ordinary).contains("answer_questions is off"),
+                "CONTROL with answers off: {ordinary:?}"
+            );
+        }
+        let d = on_screen(&rows, &claim_worker(base.clone()));
+        let (rule, choice, guard, subject, unproven) = approval(&d);
+        assert_eq!(rule, RULE_CLAIM_WORKER, "{d:?}");
+        assert_eq!(
+            *choice,
+            Choice::FocusKey {
+                steps: 0,
+                label: "Built-in runner".to_string(),
+                key: "esc",
+            },
+            "the dialog's Esc, on the row that has the focus: {d:?}"
+        );
+        assert_eq!(
+            *guard,
+            row_guard(
+                rows.iter()
+                    .find(|r| r.contains("❯ 1. Built-in runner"))
+                    .expect("the focused row")
+            )
+        );
+        assert!(subject.ends_with(CLAIM_WORKER_QUESTION), "{subject}");
+        assert!(unproven.is_none(), "{d:?}");
+    }
+    let mut unvouched = aterm_phase::read(Some("claude"), &rows, None);
+    unvouched.phase_authoritative = false;
+    let d = decide(&unvouched, &rows, &claim_worker(full()));
+    let why = reason(&d);
+    assert!(
+        why.contains(RULE_CLAIM_WORKER) && why.contains("no box the reader vouches for"),
+        "{why}"
+    );
+    let mut no_esc = aterm_phase::read(Some("claude"), &rows, None);
+    if let Some(p) = no_esc.prompt.as_mut() {
+        assert!(
+            p.cancel.is_some(),
+            "PRECONDITION: the footer's `Esc to cancel`"
+        );
+        p.cancel = None;
+    }
+    let d = decide(&no_esc, &rows, &claim_worker(full()));
+    let why = reason(&d);
+    assert!(
+        why.contains(RULE_CLAIM_WORKER) && why.contains("no `Esc` that refuses it"),
+        "{why}"
+    );
+}
+
+/// A CLAIM WORKER'S OTHER TOOL BOXES ARE DECLINED ON THEIR `No`: a Bash read, an `rm`, a lone
+/// `sleep` (the worker has no Bash, `credit_offers::CLAIM_TOOLS`, so even a wait is no box its
+/// fence passes), another MCP server's tool and a file write, at `safe` and at full power, with
 /// [`CLAIM_WORKER_TOOLS`]. CONTROL: an ordinary session's read and full-power presses; under
 /// `approve = "none"` every box stays the owner's, and the folder-trust dialog is decided as for
 /// every session.
@@ -11059,12 +11332,14 @@ fn a_claim_workers_question_goes_to_a_person_whatever_answer_questions_says() {
 fn a_claim_workers_other_tool_boxes_are_declined_on_their_no() {
     let read = bash_box(&["ls -la ~/.cargo"], None);
     let rm = bash_box(&["rm -rf ~/x"], None);
+    let sleep = bash_box(&["sleep 60"], None);
     let tool = phase_fixtures::screen(phase_fixtures::BOX_TOOL);
     let write = phase_fixtures::screen(phase_fixtures::BOX_WRITE_CREATE_2_1_309);
     assert_eq!(approved(&on_screen(&read, &ctx())), Some(RULE_READ_ONLY));
     for (name, rows) in [
         ("read", &read),
         ("rm", &rm),
+        ("sleep", &sleep),
         ("github tool", &tool),
         ("write", &write),
     ] {
@@ -11078,7 +11353,8 @@ fn a_claim_workers_other_tool_boxes_are_declined_on_their_no() {
             assert!(
                 text.starts_with(DECLINE_PREFIX)
                     && text.contains(CLAIM_WORKER_TOOLS)
-                    && text.contains("Nothing left: NOT CLAIMED:"),
+                    && text.contains("first line is `Could not finish: NOT CLAIMED:`")
+                    && !text.contains("starting `Nothing left:"),
                 "{name} {level}: {text}"
             );
         }

@@ -143,7 +143,52 @@ fn counters(pid: c_int, task: Option<&libc::proc_taskinfo>) -> Option<Counters> 
         logical_writes: Some(u.ri_logical_writes),
         runnable_ns: Some(ns(u.ri_runnable_time)),
         pageins: Some(u.ri_pageins),
+        peak_footprint: Some(u.ri_lifetime_max_phys_footprint),
     })
+}
+
+/// [`super::cpu_with_reaped_ns`] on macOS.
+pub(super) fn cpu_with_reaped_ns(pid: u32) -> Option<u64> {
+    let c = counters_of(pid)?;
+    Some(c.cpu_ns.saturating_add(c.child_cpu_ns?))
+}
+
+/// [`super::counters_of`] on macOS.
+pub(super) fn counters_of(pid: u32) -> Option<Counters> {
+    counters(c_int::try_from(pid).ok().filter(|p| *p > 0)?, None)
+}
+
+unsafe extern "C" {
+    /// libproc's `proc_listchildpids` (`libproc.h`): `ppid`'s children into `buffer`, how many.
+    fn proc_listchildpids(ppid: c_int, buffer: *mut c_void, buffersize: c_int) -> c_int;
+}
+
+/// [`super::child_pids`] on macOS.
+pub(super) fn child_pids(pid: u32) -> Option<Vec<u32>> {
+    const ROOM: usize = 256;
+    let pid = c_int::try_from(pid).ok().filter(|p| *p > 0)?;
+    let mut kids = vec![0 as libc::pid_t; ROOM];
+    let size = c_int::try_from(kids.len() * std::mem::size_of::<libc::pid_t>()).ok()?;
+    // SAFETY: `kids` is `size` writable bytes of pid slots; libproc writes at most that many.
+    // `__error` supplies this thread's live errno slot; capture it with the zero-or-failed call.
+    let (n, errno) = unsafe {
+        *libc::__error() = 0;
+        let n = proc_listchildpids(pid, kids.as_mut_ptr().cast(), size);
+        (n, *libc::__error())
+    };
+    let n = usize::try_from(crate::machine::owned_count(
+        i64::from(n),
+        errno,
+        kids.len(),
+    )?)
+    .ok()?;
+    let mut out: Vec<u32> = kids[..n]
+        .iter()
+        .filter_map(|k| u32::try_from(*k).ok())
+        .filter(|k| *k > 0)
+        .collect();
+    out.sort_unstable();
+    Some(out)
 }
 
 /// `pid`'s thread handles, at most `room` of them (`PROC_PIDLISTTHREADS`); `None` when refused.
@@ -404,9 +449,6 @@ pub(super) fn settled(flags: u32, execd_then: bool, age_us: Option<u64>) -> bool
 /// children's stdin, and one that skipped a spawner with a child under 100 µs old read as often
 /// and broke none (92 at 1 µs).
 fn spawning(pid: c_int, now_us: u64) -> bool {
-    unsafe extern "C" {
-        fn proc_listchildpids(ppid: c_int, buffer: *mut c_void, buffersize: c_int) -> c_int;
-    }
     const MAX_CHILDREN: usize = 256;
     if bsd_info(pid).is_none_or(|b| b.pbi_flags & darwin::PROC_FLAG_INEXIT != 0) {
         return true;
@@ -700,7 +742,16 @@ fn close_all(fds: &[c_int]) {
 fn own_pipe() -> Option<[c_int; 2]> {
     let mut fds = [0 as c_int; 2];
     // SAFETY: `fds` is two writable descriptors' room.
-    (unsafe { libc::pipe(fds.as_mut_ptr()) } == 0).then_some(fds)
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    for fd in fds {
+        // SAFETY: `fd` is a fresh pipe descriptor owned here.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+    Some(fds)
 }
 
 /// L6: this process's own kqueue, watching one pipe for reading, lists that

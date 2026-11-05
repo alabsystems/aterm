@@ -38,7 +38,6 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::SpecCheck => spec_check(ctx, &mut r),
         StageId::CheckersCompile => checkers_compile(ctx, &mut r),
         StageId::SpecCheckers => spec_checkers(ctx, &mut r),
-        StageId::GpuOracle => gpu_oracle(ctx, &mut r),
         StageId::MeasurePrebuild => measure_prebuild(ctx, &mut r),
         #[cfg(unix)]
         StageId::GuiSmoke => smoke_stages::gui_typing_smoke(ctx, &mut r),
@@ -260,6 +259,73 @@ pub fn tippy_args(scope: &Scope) -> Vec<String> {
     a
 }
 
+/// The lint's ordinary passes. A cone (no `-p`, no `--all`) has up to two: `--all-targets` for what
+/// the change touched ([`crate::scope::Changed::all_targets`]), and each crate's default targets,
+/// its library and binaries, for the rest that link the change. What the cone holds only by a dev
+/// edge is in neither ([`crate::scope::Changed::unlinted`]), since its library and binaries link
+/// nothing that changed; a root manifest row, a lock row other than a touched member's own entry,
+/// or a fork keeps it in the first pass with the whole cone. `test` compiles the test targets of
+/// all of those, so an error in one still stops the run. GAP: the benches and examples of unchanged
+/// dependents (at most the workspace's 104 targets, 19 of them with macOS arms, on 2026-11-04) have
+/// no compile for this machine in this run, only a pulled cell's type-check on another OS, and a
+/// lint that fires only in one of them or in such a crate's test target waits for `verify lint -p`
+/// or `--all`, though a rustc warning there (a `#[must_use]` newly discarded) reds a pulled cell
+/// that judges test-target warnings ([`crate::cells::leaves_test_warnings`]).
+#[must_use]
+pub fn tippy_passes(scope: &Scope) -> Vec<TippyPass> {
+    let Scope::Changed(cone) = scope else {
+        return vec![TippyPass {
+            label: scope.label(),
+            args: tippy_args(scope),
+        }];
+    };
+    if cone.crates.is_empty() {
+        return vec![TippyPass {
+            label: scope.label(),
+            args: tippy_args(scope),
+        }];
+    }
+    let (every, rest): (Vec<&String>, Vec<&String>) = cone.linted().partition(|spec| {
+        crate::scope::spec_name(spec).is_none_or(|name| cone.all_targets.iter().any(|n| n == name))
+    });
+    let pass = |specs: &[&String], all_targets: bool| {
+        let selection: Vec<String> = specs
+            .iter()
+            .flat_map(|spec| ["-p".to_string(), (*spec).clone()])
+            .collect();
+        let mut args = selection.clone();
+        args.extend(
+            LINT_TAIL
+                .iter()
+                .filter(|flag| all_targets || **flag != "--all-targets")
+                .map(ToString::to_string),
+        );
+        TippyPass {
+            label: format!(
+                "{}{}",
+                selection.join(" "),
+                if all_targets { " --all-targets" } else { "" }
+            ),
+            args,
+        }
+    };
+    let mut passes = Vec::new();
+    if !every.is_empty() {
+        passes.push(pass(&every, true));
+    }
+    if !rest.is_empty() {
+        passes.push(pass(&rest, false));
+    }
+    passes
+}
+
+/// One [`tippy_passes`] invocation: its arguments and how the report names its selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TippyPass {
+    pub label: String,
+    pub args: Vec<String>,
+}
+
 /// What both lint passes end with: cargo's coverage flags, then the lint driver's arguments, which reach workspace members only (targo-tippy hands them to `tippy-driver`, cargo's `RUSTC_WORKSPACE_WRAPPER`), so the dependencies stay fresh.
 pub const LINT_TAIL: [&str; 5] = ["--all-targets", "--keep-going", "--", "-D", "warnings"];
 
@@ -457,8 +523,9 @@ pub const OBJC_DRIVES: [ObjcDrive; 7] = [
         package: "aterm-gui",
         example: "objc_window_drive",
         code3: Code3::None,
-        no_status: Severity::CouldNotRun,
-        pass: "the real window answered every question — title, style mask, geometry, limits, theme, drag-and-drop, close and fullscreen",
+        // A death by a signal is a crash in the window code the drive runs: a finding. Closing an answered NSAlert's glass child window at exit (aterm 0.110.0 on macOS 27.2) died by SIGSEGV in the exit turn's pool pop.
+        no_status: Severity::GateFailed,
+        pass: "the real window answered every question — title, style mask, geometry, limits, theme, drag-and-drop, close and fullscreen — and the exit, in the turn a click answered a real NSAlert, closed only winit's own window and none of the alert's",
     },
     ObjcDrive {
         package: "aterm-gui",
@@ -556,11 +623,13 @@ pub fn objc_drive_outcome_with_transcript(
                 if code3 == Code3::None { "0/1/2" } else { "0/1/2/3" }
             ),
         ),
-        (None, _) => (
+        (None, code3) => (
             Outcome::Fail(drive.no_status),
-            match drive.no_status {
-                Severity::GateFailed => "ABORTED — the driver died by a signal its trap could not convert, which is still the finding it exists to make".to_string(),
-                Severity::CouldNotRun => "no exit status — killed by a signal".to_string(),
+            match (drive.no_status, code3) {
+                // Only an `AbortFinding` driver traps signals.
+                (Severity::GateFailed, Code3::AbortFinding) => "ABORTED — the driver died by a signal its trap could not convert, which is still the finding it exists to make".to_string(),
+                (Severity::GateFailed, _) => "CRASHED — the driver died by a signal (it traps none): a crash in the code it drives, a finding".to_string(),
+                (Severity::CouldNotRun, _) => "no exit status — killed by a signal".to_string(),
             },
         ),
     };
@@ -630,9 +699,12 @@ fn run_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
 
 fn run_tests_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
     let env = crate::findings::rerun_env(cmd, ctx.test_thread_override());
+    let features = crate::testrun::feature_args(cmd);
     let cmd = &cmd.clone().counting_waits();
     run_child(ctx, r, label, cmd, |r, run, label| {
-        r.decide_test_child(run, label, &env);
+        let mut run = run.clone();
+        crate::testrun::serial_feature_reruns(&mut run, &features);
+        r.decide_test_child(&run, label, &env);
     })
 }
 
@@ -1021,8 +1093,10 @@ fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
     };
     let (k, v) = TRAIL_LAWS_FULL;
     [
-        cmd(test_compile_args(&ctx.scope)).demoted(),
-        cmd(test_run_args(&ctx.scope)).env(k, v).counting_waits(),
+        cmd(with_checkers(ctx, test_compile_args(&ctx.scope))).demoted(),
+        cmd(with_checkers(ctx, test_run_args(&ctx.scope)))
+            .env(k, v)
+            .counting_waits(),
     ]
 }
 
@@ -1211,6 +1285,7 @@ struct MeasuringCounts {
     failed: usize,
     refused: usize,
     unanswered: usize,
+    undecided: usize,
 }
 
 impl MeasuringCounts {
@@ -1230,6 +1305,7 @@ impl MeasuringCounts {
             failed: count("failed=")?,
             refused: count("refused=")?,
             unanswered: count("unanswered=")?,
+            undecided: count("undecided=")?,
         };
         fields.next().is_none().then_some(counts)
     }
@@ -1241,18 +1317,64 @@ impl MeasuringCounts {
                 .checked_add(self.failed)
                 .and_then(|n| n.checked_add(self.refused))
                 .and_then(|n| n.checked_add(self.unanswered))
+                .and_then(|n| n.checked_add(self.undecided))
                 == Some(self.planned)
     }
 }
 
 /// Each `measure row: <target>::<row> UNANSWERED` in `output`, with the first line of its reason.
 fn unanswered_rows(output: &str) -> Vec<String> {
+    rows_marked(output, " UNANSWERED")
+}
+
+/// Each `measure row: <target>::<row> UNDECIDED` in `output` (a row that measured, whose takes
+/// are no evidence either way on this machine's load), with the first line of its reason.
+fn undecided_rows(output: &str) -> Vec<String> {
+    rows_marked(output, " UNDECIDED")
+}
+
+/// What a passing measure stage states beside its pass: each undecided row, and each target
+/// that ran without a qualified quiet admission (`measure <target>: unqualified — <why>`). Both
+/// are stated, never a finding (owner ruling 2026-11-05: a busy machine never blocks a release).
+fn stated_note(output: &str) -> String {
+    let rows = undecided_rows(output);
+    let mut note = String::new();
+    if !rows.is_empty() {
+        note.push_str(&format!(
+            "; undecided, stated and not a finding: {}",
+            rows.join("; ")
+        ));
+    }
+    let unqualified = unqualified_targets(output);
+    if !unqualified.is_empty() {
+        note.push_str(&format!(
+            "; ran without a qualified quiet admission (stated, not a finding): {}",
+            unqualified.join("; ")
+        ));
+    }
+    note
+}
+
+/// Each `measure <target>: unqualified — <why>` line, as `<target> — <why>`.
+fn unqualified_targets(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            MEASURING_TARGETS.iter().find_map(|target| {
+                line.strip_prefix(&format!("measure {target}: unqualified — "))
+                    .map(|why| format!("{target} — {why}"))
+            })
+        })
+        .collect()
+}
+
+fn rows_marked(output: &str, status: &str) -> Vec<String> {
     let mut lines = output.lines();
     let mut rows = Vec::new();
     while let Some(line) = lines.next() {
         if let Some(row) = line
             .strip_prefix("measure row: ")
-            .and_then(|l| l.strip_suffix(" UNANSWERED"))
+            .and_then(|l| l.strip_suffix(status))
         {
             rows.push(format!("{row} ({})", lines.next().unwrap_or("").trim()));
         }
@@ -1269,6 +1391,7 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject:
     let mut incomplete = Vec::new();
     let mut refused = Vec::new();
     let mut any_failed = false;
+    let mut any_undecided = false;
     let mut all_reported = true;
     for target in MEASURING_TARGETS {
         let prefix = format!("measure result: {target} ");
@@ -1278,6 +1401,7 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject:
         match counts {
             Some(counts) => {
                 any_failed |= counts.failed != 0;
+                any_undecided |= counts.undecided != 0;
                 if !counts.complete() {
                     incomplete.push(target);
                 }
@@ -1294,7 +1418,15 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject:
     if any_failed {
         r.record_child(run, Outcome::Fail(Severity::GateFailed), label);
     } else if !incomplete.is_empty()
-        && (run.ok || all_reported || run.output.contains("measure: COULD NOT RUN —"))
+        && (run.ok
+            || all_reported
+            || run.output.contains("measure: COULD NOT RUN —")
+            // Each incomplete target refused its own admission or entry: one that crashed
+            // without saying so keeps the child's verdict below.
+            || incomplete.iter().all(|target| {
+                run.output
+                    .contains(&format!("measure {target}: COULD NOT RUN — "))
+            }))
     {
         r.cannot_run(format!(
             "{label} — {}: no complete nonempty measurement matrix",
@@ -1302,11 +1434,27 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject:
         ));
     } else if incomplete.is_empty() && !refused.is_empty() {
         r.cannot_run(format!(
-            "{label} — {}: the instrument could not decide every row",
+            "{label} — {}: the instrument could not run every row",
             refused.join(", ")
         ));
     } else if incomplete.is_empty() && !unanswered.is_empty() {
-        r.pass(format!("{label} — every row the subject answered"));
+        r.pass(format!(
+            "{label} — every row the subject answered{}",
+            stated_note(&run.output)
+        ));
+    } else if incomplete.is_empty()
+        && run.ok
+        && (any_undecided || !unqualified_targets(&run.output).is_empty())
+    {
+        // A row whose takes are no evidence either way on this machine's load, and a matrix that
+        // ran without a qualified quiet admission, are stated beside the pass, never a finding
+        // and never a refusal (owner ruling 2026-11-05: a busy machine never blocks a release).
+        // The runner exits 0 there, so a crash or a lost timing protection after the summaries
+        // still fails below, and a row that could not measure at all stays `refused` above.
+        r.pass(format!(
+            "{label} — no row failed{}",
+            stated_note(&run.output)
+        ));
     } else {
         r.decide_child(run, label);
     }
@@ -1355,7 +1503,7 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
 }
 
 fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Cmd {
-    let cmd = main_targo(ctx, doctest_args(&ctx.scope));
+    let cmd = main_targo(ctx, with_checkers(ctx, doctest_args(&ctx.scope)));
     let stand_in = ctx
         .test_recorder()
         .filter(|_| !skip.is_empty())
@@ -1469,12 +1617,14 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         return;
     };
     let borrowed = crate::fmt::borrowed_suffix(ctx, crate::toolchain::TIPPY);
-    run_scoped(
-        ctx,
-        r,
-        &format!("tippy {} -D warnings{borrowed}", ctx.scope.label()),
-        &tippy_cmd(ctx, &bin, tippy_args(&ctx.scope)),
-    );
+    for pass in tippy_passes(&ctx.scope) {
+        run_scoped(
+            ctx,
+            r,
+            &format!("tippy {} -D warnings{borrowed}", pass.label),
+            &tippy_cmd(ctx, &bin, pass.args),
+        );
+    }
     if ctx.release
         && let Some(args) = tippy_gated_args(&ctx.scope, &gated_lint_features(&ctx.root))
     {
@@ -1722,33 +1872,34 @@ pub fn spec_checkers_scope(scope: &Scope) -> Scope {
     }
 }
 
+/// The feature that turns on per-step checker agreement. A release's test children carry it
+/// ([`crate::Ctx::checkers_in_tests`]), so its one run of the suite is the tiered tests' under `ty`.
+/// ACCEPTED: nothing in a release then runs the tests with the feature off. The feature is read
+/// only through `cfg!` in `aterm_spec::verify::checkers_required`, which only test code reaches
+/// (aterm-spec's helpers and tests in aterm-spec, aterm-agent, aterm-db and aterm-gui; `spec-check`
+/// turns the checkers on before it asks), so a test that fails only with it off is a test defect
+/// and not a product one, and it waits for a bare `verify` over its cone. ALSO ACCEPTED: the
+/// spec-check helper and the appkit drivers' Objective-C examples (through aterm-gui's
+/// dev-dependencies) stay without the feature, so a release compiles aterm-spec and the
+/// `aterm-models*` crates a second time in the main lane. The redraw harness and measure's prebuild
+/// have neither in their graphs.
+pub const CHECKERS_FEATURE: [&str; 2] = ["--features", "aterm-spec/checkers"];
+
+/// `args` with [`CHECKERS_FEATURE`] when this run's test children carry it.
+fn with_checkers(ctx: &Ctx, mut args: Vec<String>) -> Vec<String> {
+    if ctx.checkers_in_tests {
+        args.extend(CHECKERS_FEATURE.map(String::from));
+    }
+    args
+}
+
 /// The selected tests and shared runtime with per-step checker agreement enabled.
 #[must_use]
 pub fn spec_checkers_args(scope: &Scope) -> Vec<String> {
     let mut a = test_base_args(&spec_checkers_scope(scope));
-    a.extend(["--features".into(), "aterm-spec/checkers".into()]);
+    a.extend(CHECKERS_FEATURE.map(String::from));
     a.extend(TEST_TARGETS.map(String::from));
     a
-}
-
-/// `targo --unverified test -p aterm-gpu --lib --no-fail-fast frame_record_tests`: the
-/// `gpu-oracle` check's child, this host's arm against its CPU twins and the record of
-/// wgpu's frames ([`crate::checks::GOLDEN`]).
-#[must_use]
-pub fn gpu_oracle_args() -> Vec<String> {
-    let (pkg, test) = crate::checks::GOLDEN;
-    let module = test.split_once("::").map_or(test, |(m, _)| m);
-    [
-        "--unverified",
-        "test",
-        "-p",
-        pkg,
-        "--lib",
-        "--no-fail-fast",
-        module,
-    ]
-    .map(String::from)
-    .into()
 }
 
 fn checkers_compile(ctx: &Ctx, r: &mut Report) {
@@ -1804,55 +1955,29 @@ fn spec_checkers(ctx: &Ctx, r: &mut Report) {
     crate::testrun::run_tests(ctx, r, &label, &spec_checkers_cmd(ctx));
 }
 
-/// Did a passing gpu-oracle child not pass the oracle's test ([`crate::checks::GOLDEN`])?
-/// Its filter then matched no test, so no frame was held to its twin.
+/// Did a passing test run not run [`crate::checks::GOLDEN`]'s test? A release's run reads this over
+/// every binary's output ([`crate::testrun::run_tests`], the serial fallback included): no frame
+/// was then held to its twin. In a passing run a test libtest names and did not ignore passed, and
+/// its `ok` need not share the line: this test writes to stderr past libtest's capture, so one
+/// libtest thread ends its name's line with that, and the `ok` comes on a line of its own. Nor need
+/// the name open the line: the log is one file both streams write, and another test's unfinished
+/// stderr line can come before it (`aterm-gpu: test …`).
 #[must_use]
-pub fn gpu_oracle_compared_nothing(run: &exec::Run) -> bool {
+pub fn compared_no_frame(run: &exec::Run) -> bool {
     if !run.ok {
         return false;
     }
     let (_, test) = crate::checks::GOLDEN;
     let log = crate::libtest::strip_ansi(&run.output);
     !log.lines().any(|line| {
-        line.strip_prefix("test ")
-            .and_then(|rest| rest.split_once(" ... "))
-            .is_some_and(|(name, verdict)| name.ends_with(test) && verdict.starts_with("ok"))
+        line.match_indices("test ").any(|(at, word)| {
+            line[at + word.len()..]
+                .split_once(" ... ")
+                .is_some_and(|(name, verdict)| {
+                    name.ends_with(test) && !verdict.starts_with("ignored")
+                })
+        })
     })
-}
-
-fn gpu_oracle(ctx: &Ctx, r: &mut Report) {
-    const LABEL: &str = "targo test -p aterm-gpu --lib frame_record_tests";
-    if !ctx.tools.have_targo() {
-        r.skip("gpu oracle (no targo)");
-        return;
-    }
-    let cmd = main_targo(ctx, gpu_oracle_args());
-    let env = crate::findings::rerun_env(&cmd, ctx.test_thread_override());
-    run_child(ctx, r, LABEL, &cmd, |r, run, label| {
-        if gpu_oracle_compared_nothing(run) {
-            r.cannot_run(format!(
-                "{label} — {} did not run, so no frame was held to its twin",
-                crate::checks::GOLDEN.1
-            ));
-            return;
-        }
-        match gpu_oracle_verdict(run) {
-            Some(verdict) => r.decide_test_child(run, format!("{label} — {verdict}"), &env),
-            None => r.decide_test_child(run, label, &env),
-        }
-    });
-}
-
-/// The gpu-oracle child's verdict line (`frame-record: verdict: …`, the last one): how many
-/// frames it held to their twins on which adapter, how many strayed, the widest margin, and
-/// how many of the record's rows moved there.
-#[must_use]
-pub fn gpu_oracle_verdict(run: &exec::Run) -> Option<String> {
-    crate::libtest::strip_ansi(&run.output)
-        .lines()
-        .rev()
-        .find_map(|line| line.trim().strip_prefix("frame-record: verdict: "))
-        .map(str::to_owned)
 }
 
 /// How the ladder reads one harness exit code (`0` pass / `1` fail / `2` not run, declared in aterm-gui's `control_redraw_conformance.rs`).
@@ -2219,17 +2344,7 @@ fn wasm_glue(ctx: &Ctx, r: &mut Report) {
         r,
         "wasm-glue (the generator on aterm-wasm-abi's toy, in a browser)",
         "the toy",
-        {
-            let (root, work) = (root.clone(), work.clone());
-            move |log| crate::wasm_glue::toy::gate(&root, &work, false, log)
-        },
-    );
-    glue_row(
-        ctx,
-        r,
-        "wasm-glue oracle (the toy's goldens and driver against wasm-bindgen 0.2.108)",
-        "the oracle",
-        move |log| crate::wasm_glue::oracle::gate(&root, &work.join("oracle"), log),
+        move |log| crate::wasm_glue::toy::gate(&root, &work, false, log),
     );
 }
 
@@ -2307,6 +2422,92 @@ mod tests {
     use super::*;
     use crate::EnvSnapshot;
     use std::path::PathBuf;
+
+    /// A cone lints all the targets of what the change touched and the default targets of the rest,
+    /// matching by package name whichever spec the cone holds it by. CONTROL: `-p`, `--all`, an
+    /// empty cone, a cone where everything is touched (a lock row's) stay one `--all-targets` pass;
+    /// and a list that matches nothing never reaches [`Scope::args`], which would answer
+    /// `--workspace`.
+    #[test]
+    fn a_cone_lints_all_the_targets_of_what_the_change_touched() {
+        let spec = "path+file:///r/crates/aterm-x#x@1.0.0";
+        let crates = vec![
+            "aterm-gui".to_string(),
+            "aterm-uds".to_string(),
+            "getrandom@0.2.17".to_string(),
+            spec.to_string(),
+        ];
+        let cone = |touched: &[&str]| {
+            Scope::changed("main", crates.clone(), true)
+                .with_all_targets(touched.iter().map(ToString::to_string).collect())
+        };
+        let tail = |all: bool| -> Vec<String> {
+            let tail: &[&str] = if all {
+                &LINT_TAIL
+            } else {
+                &["--keep-going", "--", "-D", "warnings"]
+            };
+            tail.iter().map(ToString::to_string).collect()
+        };
+        let select = |names: &[&str]| -> Vec<String> {
+            names
+                .iter()
+                .flat_map(|name| ["-p".to_string(), (*name).to_string()])
+                .collect()
+        };
+        let args = |scope: &Scope| -> Vec<Vec<String>> {
+            tippy_passes(scope).into_iter().map(|p| p.args).collect()
+        };
+        assert_eq!(
+            args(&cone(&["aterm-uds", "getrandom", "x"])),
+            [
+                [select(&["aterm-uds", "getrandom@0.2.17", spec]), tail(true)].concat(),
+                [select(&["aterm-gui"]), tail(false)].concat(),
+            ]
+        );
+        let passes = tippy_passes(&cone(&["aterm-uds"]));
+        assert_eq!(passes[0].label, "-p aterm-uds --all-targets");
+        assert!(
+            passes[1]
+                .label
+                .starts_with("-p aterm-gui -p getrandom@0.2.17")
+        );
+        assert!(!passes[1].label.contains("--all-targets"), "{passes:?}");
+        // What the cone holds only by a dev edge is in neither pass, matched by package name.
+        let left_out = |names: &[&str]| {
+            cone(&["aterm-uds"]).with_unlinted(names.iter().map(ToString::to_string).collect())
+        };
+        assert_eq!(
+            args(&left_out(&["aterm-gui", "getrandom"])),
+            [
+                [select(&["aterm-uds"]), tail(true)].concat(),
+                [select(&[spec]), tail(false)].concat(),
+            ]
+        );
+        assert_eq!(
+            args(&left_out(&["aterm-gui", "getrandom", "x"])),
+            [[select(&["aterm-uds"]), tail(true)].concat()],
+            "with none of the rest left, no second pass"
+        );
+        // The whole cone: a lock row the change reached.
+        let whole = Scope::changed("main", crates.clone(), true);
+        assert_eq!(args(&whole), [tippy_args(&whole)]);
+        for scope in [Scope::workspace(), Scope::crate_only("aterm-gui")] {
+            assert_eq!(args(&scope), [tippy_args(&scope)], "{scope:?}");
+        }
+        let empty = Scope::changed("main", Vec::new(), false);
+        assert!(empty.selects_nothing());
+        assert_eq!(args(&empty), [tippy_args(&empty)]);
+        assert_eq!(
+            args(&cone(&[])),
+            [[
+                select(&["aterm-gui", "aterm-uds", "getrandom@0.2.17", spec]),
+                tail(false)
+            ]
+            .concat()],
+            "no list that matches nothing widens to --workspace"
+        );
+    }
 
     #[test]
     fn a_versioned_package_keeps_its_required_feature_lint_pass() {
@@ -2521,8 +2722,8 @@ mod tests {
             "{label}"
         );
         let (outcome, label) = row(crate::perf::LaneRun::skip(
-            "wasm-bindgen 0.2.108 is not on PATH",
-            "targo --unverified verify provision --record",
+            "no stable toolchain",
+            "targo --unverified verify provision",
         ));
         assert_eq!(outcome, Outcome::Skip, "{label}");
         let (outcome, label) =
@@ -2949,6 +3150,10 @@ mod tests {
             .unwrap();
             std::fs::write(package.join("src/lib.rs"), "").unwrap();
         }
+        // Only the selected package has the target a rerun names, as in a real rerun: cargo takes
+        // `-p selected --test t -p aterm-spec` though aterm-spec has no target `t`.
+        std::fs::create_dir_all(root.join("selected/tests")).unwrap();
+        std::fs::write(root.join("selected/tests/t.rs"), "").unwrap();
         let mut c = ctx(Scope::crate_only("selected"));
         c.root = root.to_owned();
         c.scratch = root.join("scratch");
@@ -2962,12 +3167,45 @@ mod tests {
             exec::run(&cmd, c.exec_env())
         };
         let mut missing_runtime = test_base_args(&c.scope);
-        missing_runtime.extend(["--features".into(), "aterm-spec/checkers".into()]);
+        missing_runtime.extend(CHECKERS_FEATURE.map(String::from));
         missing_runtime.extend(TEST_TARGETS.map(String::from));
         assert!(
             !query(missing_runtime).ok,
             "the fixture must require a feature provider"
         );
+        let provider_alone = ["--unverified", "test", "-p", "aterm-spec", "--test", "t"];
+        assert!(
+            !query(provider_alone.map(String::from).to_vec()).ok,
+            "the feature's provider has no target `t`"
+        );
+        // A failing test's rerun, as the run's findings print it, is a command cargo takes.
+        let features = crate::testrun::feature_args(&spec_checkers_cmd(&c));
+        for spec in ["-p selected --lib", "-p selected --test t"] {
+            let mut failed = exec::Run {
+                ok: false,
+                output: format!(
+                    "running 1 test\ntest t::broke ... FAILED\n\nfailures:\n\n---- t::broke stdout \
+                     ----\nboom\n\nfailures:\n    t::broke\n\ntest result: FAILED. 0 passed; 1 \
+                     failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\nerror: test \
+                     failed, to rerun pass `{spec}`\n"
+                ),
+                code: Some(101),
+                spawn_error: None,
+            };
+            crate::testrun::serial_feature_reruns(&mut failed, &features);
+            let findings = crate::findings::test_findings("test", &failed.output, &[]);
+            let rerun = findings[0].rerun.as_deref().expect("a rerun");
+            let (command, filter) = rerun.split_once(" -- ").expect("a test filter");
+            assert_eq!(filter, "t::broke --exact");
+            let args = command
+                .strip_prefix("targo ")
+                .expect("the driver")
+                .split(' ')
+                .map(String::from)
+                .collect();
+            let answer = query(args);
+            assert!(answer.ok, "{rerun}: {}", answer.output);
+        }
         let output = query(spec_checkers_args(&c.scope));
         assert!(output.ok, "{}", output.output);
         let graph = output
@@ -3041,7 +3279,6 @@ mod tests {
             measuring_args(),
             measure_prebuild_args(),
             spec_checkers_args(&Scope::workspace()),
-            gpu_oracle_args(),
         ] {
             assert!(has(&argv, "--no-fail-fast"), "{argv:?}");
         }
@@ -3054,7 +3291,7 @@ mod tests {
     }
 
     #[test]
-    fn the_gpu_oracle_passes_only_when_its_test_ran_and_names_the_verdict() {
+    fn a_run_compared_a_frame_only_when_the_golden_test_passed() {
         let run = |ok: bool, tests: &[&str]| {
             let mut output = format!(
                 "     Running unittests src/lib.rs (target/debug/deps/aterm_gpu-1)\n\nrunning {} \
@@ -3072,30 +3309,125 @@ mod tests {
             }
         };
         let compared = "renderer::frame_record_tests::armed_frames_hold_to_their_cpu_twins";
-        assert!(!gpu_oracle_compared_nothing(&run(true, &[compared])));
-        assert_eq!(gpu_oracle_verdict(&run(true, &[compared])), None);
-        let mut decided = run(true, &[compared]);
-        decided.output.push_str(
-            "frame-record: verdict: 118 of 127 frames compared with their CPU twins on Apple M5 \
-             Max (aarch64), 0 off, the widest 10.0 codes off (fire/readback/0); the record holds \
-             no Apple M5 Max block\n",
+        assert!(!compared_no_frame(&run(true, &[compared])));
+        let mut one_thread = run(true, &[]);
+        one_thread.output.push_str(&format!(
+            "test {compared} ... frame-record: the video take's format is bgra8\nok\n"
+        ));
+        assert!(
+            !compared_no_frame(&one_thread),
+            "what one libtest thread prints"
         );
-        assert_eq!(
-            gpu_oracle_verdict(&decided).as_deref(),
-            Some(
-                "118 of 127 frames compared with their CPU twins on Apple M5 Max (aarch64), 0 off, \
-                 the widest 10.0 codes off (fire/readback/0); the record holds no Apple M5 Max block"
-            )
+        let mut behind_a_line = run(true, &[]);
+        behind_a_line
+            .output
+            .push_str(&format!("aterm-gpu: test {compared} ... ok\n"));
+        assert!(
+            !compared_no_frame(&behind_a_line),
+            "another test's unfinished stderr line before the name"
         );
-        assert!(gpu_oracle_compared_nothing(&run(true, &[])));
-        assert!(gpu_oracle_compared_nothing(&run(
+        let mut ignored = run(true, &[]);
+        ignored
+            .output
+            .push_str(&format!("test {compared} ... ignored\n"));
+        assert!(compared_no_frame(&ignored));
+        let mut ignored_behind_a_line = run(true, &[]);
+        ignored_behind_a_line
+            .output
+            .push_str(&format!("aterm-gpu: test {compared} ... ignored\n"));
+        assert!(compared_no_frame(&ignored_behind_a_line));
+        assert!(compared_no_frame(&run(
+            true,
+            &[
+                "renderer::frame_record_tests::armed_frames_hold_to_their_cpu_twins_on_bundled_faces"
+            ]
+        )));
+        assert!(compared_no_frame(&run(true, &[])));
+        assert!(compared_no_frame(&run(
             true,
             &["renderer::frame_record_tests::a_neighbour"]
         )));
         assert!(
-            !gpu_oracle_compared_nothing(&run(false, &[])),
+            !compared_no_frame(&run(false, &[])),
             "a failed child is the test's verdict"
         );
+    }
+
+    /// A release's test children, compile, run and doctests, carry the feature in the main lane,
+    /// and so do `--as-release`'s, which compile and rerun them. CONTROL: a plain run's carry nothing.
+    #[test]
+    fn a_release_runs_its_tests_with_the_checkers_in_the_main_lane() {
+        let carries = |args: &[std::ffi::OsString]| {
+            args.windows(2)
+                .any(|w| w[0] == "--features" && w[1] == "aterm-spec/checkers")
+        };
+        let plain = ctx(Scope::workspace());
+        let release = ctx(Scope::workspace()).with_release(true);
+        let as_release = ctx(Scope::workspace()).with_checkers_in_tests(true);
+        assert!(release.checkers_in_tests && !plain.checkers_in_tests);
+        for bind in [false, true] {
+            for cmd in test_cmds(&plain, bind) {
+                assert!(!carries(&cmd.args), "{:?}", cmd.args);
+            }
+            for c in [&release, &as_release] {
+                for cmd in test_cmds(c, bind) {
+                    assert!(carries(&cmd.args), "{:?}", cmd.args);
+                    assert!(
+                        cmd.argv().iter().any(|a| a == "--workspace"),
+                        "{:?}",
+                        cmd.args
+                    );
+                }
+            }
+        }
+        let doc = |c: &Ctx| doctest_cmd(c, &DocDriver::BarePath, &[]);
+        assert!(carries(&doc(&release).args) && !carries(&doc(&plain).args));
+        assert!(carries(&doc(&as_release).args));
+    }
+
+    /// A failing doctest's own rerun names the feature its run carried, and the package that holds
+    /// it. CONTROL: a run with no feature keeps cargo's spelling.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_doctests_rerun_carries_what_its_run_carried() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        let targo = tmp.path().join("targo");
+        std::fs::write(
+            &targo,
+            "#!/bin/sh\n\
+             printf 'running 1 test\\ntest src/lib.rs - x (line 1) ... FAILED\\n\\nfailures:\\n\\n'\n\
+             printf -- '---- src/lib.rs - x (line 1) stdout ----\\nboom\\n\\nfailures:\\n'\n\
+             printf '    src/lib.rs - x (line 1)\\n\\ntest result: FAILED. 0 passed; 1 failed; 0 \
+             ignored; 0 measured; 0 filtered out; finished in 0.00s\\n\\n'\n\
+             printf 'error: doctest failed, to rerun pass `-p x --doc`\\n'\n\
+             exit 101\n",
+        )
+        .expect("the stand-in");
+        std::fs::set_permissions(&targo, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let rerun = |cmd: Cmd| {
+            let mut c = ctx(Scope::workspace());
+            tmp.path().clone_into(&mut c.root);
+            tmp.path().clone_into(&mut c.scratch);
+            let mut report = Report::new("doc");
+            assert!(!run_tests_labeled(&c, &mut report, "doc", &cmd));
+            let found = report.entries.iter().find_map(|entry| match entry {
+                crate::ladder::Entry::Ladder { findings, .. } => findings.first().cloned(),
+                _ => None,
+            });
+            found
+                .unwrap_or_else(|| panic!("no finding: {:?}", report.entries))
+                .rerun
+                .expect("a rerun")
+        };
+        let feature = rerun(Cmd::new(&targo).args(CHECKERS_FEATURE));
+        assert!(
+            feature.contains("-p x --doc -p aterm-spec --features aterm-spec/checkers"),
+            "{feature}"
+        );
+        let plain = rerun(Cmd::new(&targo));
+        assert!(plain.contains("test -p x --doc -- "), "{plain}");
     }
 
     #[test]
@@ -3786,14 +4118,13 @@ mod tests {
             "{label}"
         );
 
-        let dependent: [fn(&Ctx, &mut Report); 10] = [
+        let dependent: [fn(&Ctx, &mut Report); 9] = [
             test,
             measuring_tests,
             measure_prebuild,
             doctests,
             spec_check,
             spec_checkers,
-            gpu_oracle,
             export,
             libc_oracle,
             redraw_conformance,
@@ -4140,7 +4471,7 @@ mod tests {
     ) -> String {
         format!(
             "measure result: {target} planned={planned} passed={passed} \
-             failed={failed} refused={refused} unanswered=0\n"
+             failed={failed} refused={refused} unanswered=0 undecided=0\n"
         )
     }
 
@@ -4204,7 +4535,133 @@ mod tests {
         assert_eq!(
             decide(false, result("paint", 23, 22, 0, 1) + &spin).0,
             could_not_run,
-            "an undecided take is not a finding about paint"
+            "a row that could not run is not a finding about paint"
+        );
+        let undecided = |rows: &str| -> String {
+            rows.split(',')
+                .map(|row| {
+                    format!(
+                        "measure row: rewind::{row} UNDECIDED\n\
+                         REWIND COST UNPROVED: the interval holds the bound\n"
+                    )
+                })
+                .collect()
+        };
+        let spread = |passed: usize, undecided: usize| {
+            format!(
+                "measure result: rewind planned=2 passed={passed} failed=0 refused=0 \
+                 unanswered=0 undecided={undecided}\n"
+            )
+        };
+        let base = paint.clone() + &result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0);
+        let one = undecided("cost") + &spread(1, 1);
+        let (outcome, label) = decide(true, base.clone() + &one);
+        assert_eq!(
+            outcome,
+            Outcome::Ok,
+            "an undecided row beside passes is stated, not a refusal"
+        );
+        assert!(
+            label.ends_with(
+                "undecided, stated and not a finding: rewind::cost \
+                 (REWIND COST UNPROVED: the interval holds the bound)"
+            ),
+            "{label}"
+        );
+        assert_eq!(
+            decide(false, base.clone() + &one).0,
+            Outcome::Fail(Severity::GateFailed),
+            "the runner exits 0 there, so a crash after the summaries still fails"
+        );
+        let all_undecided = result("paint", 23, 0, 0, 0).replace("undecided=0", "undecided=23")
+            + &result("spin", 2, 0, 0, 0).replace("undecided=0", "undecided=2")
+            + &result("aos", 1, 0, 0, 0).replace("undecided=0", "undecided=1")
+            + &undecided("cost,steps")
+            + &spread(0, 2);
+        let (outcome, label) = decide(true, all_undecided.clone());
+        assert_eq!(
+            outcome,
+            Outcome::Ok,
+            "a wholly undecided matrix on a busy machine is stated, never a refusal"
+        );
+        assert!(label.contains("rewind::steps"), "{label}");
+        assert_eq!(
+            decide(false, all_undecided).0,
+            Outcome::Fail(Severity::GateFailed),
+            "the runner exits 0 there, so a nonzero exit after the summaries still fails"
+        );
+        let loaded = "measure paint: unqualified — admitted loaded at its patience bound: CPU \
+                      63.0% busy over 2.0s (quiet is under 25%), load 41.2 (quiet is at most \
+                      28.0)\n";
+        let all = base.clone() + &spread(2, 0);
+        let (outcome, label) = decide(true, all.clone() + loaded);
+        assert_eq!(
+            outcome,
+            Outcome::Ok,
+            "a loaded matrix that failed nothing passes"
+        );
+        assert!(
+            label.contains(
+                "ran without a qualified quiet admission (stated, not a finding): paint — \
+                 admitted loaded at its patience bound"
+            ),
+            "{label}"
+        );
+        let (outcome, label) = decide(true, all.clone());
+        assert_eq!(outcome, Outcome::Ok);
+        assert!(!label.contains("qualified quiet"), "{label}");
+        assert_eq!(
+            decide(
+                true,
+                result("paint", 23, 22, 1, 0)
+                    + &result("spin", 2, 2, 0, 0)
+                    + &result("aos", 1, 1, 0, 0)
+                    + &spread(2, 0)
+                    + loaded
+            )
+            .0,
+            Outcome::Fail(Severity::GateFailed),
+            "a failed row on a loaded machine is still a finding"
+        );
+        let refused = "measure paint: COULD NOT RUN — cannot acquire its exclusive timing \
+                       claim: timing not qualified: no CPU window formed at its patience bound\n";
+        let rest = result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &spread(2, 0);
+        assert_eq!(
+            decide(false, rest.clone() + refused).0,
+            could_not_run,
+            "a bench that refused its own admission could not run, never a finding"
+        );
+        assert_eq!(
+            decide(false, rest.clone()).0,
+            Outcome::Fail(Severity::GateFailed),
+            "a missing summary with no refusal and a nonzero exit is the child's failure"
+        );
+        let crashed = result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + refused;
+        assert_eq!(
+            decide(false, crashed).0,
+            Outcome::Fail(Severity::GateFailed),
+            "one bench's refusal never hides another's crash"
+        );
+        assert_eq!(
+            decide(
+                false,
+                result("paint", 23, 22, 1, 0)
+                    + &result("spin", 2, 2, 0, 0)
+                    + &result("aos", 1, 1, 0, 0)
+                    + &one
+            )
+            .0,
+            Outcome::Fail(Severity::GateFailed),
+            "a failed row outweighs an undecided one"
+        );
+        assert_eq!(
+            decide(
+                false,
+                base.clone() + &result("rewind", 2, 0, 0, 1).replace("undecided=0", "undecided=1")
+            )
+            .0,
+            could_not_run,
+            "a row that could not run outweighs an undecided one"
         );
         assert_eq!(
             decide(
@@ -4257,9 +4714,9 @@ mod tests {
         let paint = measured_result("paint", 23, 23, 0, 0);
         let spin = "measure row: spin::an_idle_open_rewind_view_arms_no_timer UNANSWERED\n\
                     ctl rewind open: the subject does not know `rewind` (ERR unknown verb)\n\
-                    measure result: spin planned=3 passed=2 failed=0 refused=0 unanswered=1\n";
+                    measure result: spin planned=3 passed=2 failed=0 refused=0 unanswered=1 undecided=0\n";
         let aos = "measure row: aos::a_repair UNANSWERED\naos repair named no main_us=\n\
-                   measure result: aos planned=1 passed=0 failed=0 refused=0 unanswered=1\n";
+                   measure result: aos planned=1 passed=0 failed=0 refused=0 unanswered=1 undecided=0\n";
         let rewind = measured_result("rewind", 2, 2, 0, 0);
         let output = paint.clone() + spin + aos + &rewind;
         let named = "spin::an_idle_open_rewind_view_arms_no_timer (ctl rewind open: the subject \

@@ -751,7 +751,7 @@ fn session(
         r.raw(say(timing_line("worker (aterm-gpu-web)", w)));
     }
     let record = dir.join("timings.json");
-    match aterm_json::to_string(&timings).map(|t| std::fs::write(&record, t + "\n")) {
+    match aterm_json::to_string(&timings).map(|t| crate::write_fresh(&record, t + "\n")) {
         Ok(Ok(())) => r.raw(say(format!("timings in {}", record.display()))),
         _ => r.raw(say(format!("could not write {}", record.display()))),
     }
@@ -1028,14 +1028,14 @@ fn assemble(root: &Path, modules: &Path, site: &Path) -> Result<(), String> {
     .into_iter()
     .chain([(font, site.join("font.ttf"))]);
     for (from, to) in copies {
-        std::fs::copy(&from, &to)
+        crate::copy_regular_fresh(&from, &to)
             .map_err(|e| format!("could not copy {} to {}: {e}", from.display(), to.display()))?;
     }
     let spec_path = site.join("spec.json");
     aterm_json::to_string(&spec())
         .map_err(|e| format!("could not encode the spec: {e}"))
         .and_then(|text| {
-            std::fs::write(&spec_path, text)
+            crate::write_fresh(&spec_path, text)
                 .map_err(|e| format!("could not write {}: {e}", spec_path.display()))
         })?;
     for (module, dir) in [("aterm_wasm.wasm", "cpu"), ("aterm_gpu_web.wasm", "gpu")] {
@@ -1075,7 +1075,7 @@ fn log_tail(log: &Path) -> String {
 
 /// The browser's log at `log`, as its stdout and stderr.
 fn log_stdio(log: &Path) -> Result<(ChildStdio, ChildStdio), Stop> {
-    let out = std::fs::File::create(log)
+    let out = crate::create_stdio_file(log)
         .map_err(|e| Stop::CouldNotRun(format!("could not create {}: {e}", log.display())))?;
     let err = out
         .try_clone()

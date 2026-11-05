@@ -306,7 +306,7 @@ fn states(mtm: MainThread, out: Option<&Path>, findings: &mut Findings) {
                     println!("{ME}: {at}: {w}x{h} px");
                     if let Some(dir) = out {
                         let file = dir.join(format!("devtools-helper-{name}-{look}.png"));
-                        match std::fs::write(&file, &png) {
+                        match aterm_uds::atomic_file::write(&file, &png, 0o644) {
                             Ok(()) => println!("{ME}: wrote {}", file.display()),
                             Err(e) => {
                                 findings.check(false, || format!("{at}: {}: {e}", file.display()))

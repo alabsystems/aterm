@@ -18,7 +18,9 @@
 //! stops every server, keeps no unit and starts no server, a foreground one included, until
 //! `serve-units --on` ([`turn_on`]). Where serving stands is [`Serves`], read whole for the
 //! doctor's row ([`sharing`]) and from the two store records alone for aterm's `status`
-//! ([`serves`]).
+//! ([`serves`]). [`DEFAULT_PORT`] is one of the person's ports: a private aterm (a test, an
+//! isolated instance) neither listens on nor dials it at any address ([`aterm_types::reach`]),
+//! however a peer or a listen names it.
 
 use std::io::{self, BufRead as _, Read, Write as _};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -27,10 +29,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use aterm_types::reach::Reach;
+
 use crate::store::Layout;
 
-/// The port a peer named without one is reached on, and every server listens on by default.
-pub const DEFAULT_PORT: u16 = 7487;
+/// The port a peer named without one is reached on, and every server listens on by default: one
+/// of the person's ports, which a private aterm neither listens on nor dials
+/// ([`aterm_types::reach`]).
+pub const DEFAULT_PORT: u16 = aterm_types::reach::TOOLSET_PORT;
 
 /// [`SERVE_SWITCH`]'s words, spelled once for it and the lines that `concat!` them (the pattern
 /// `adoption::UPDATES_SWITCH` uses): a macro, because `concat!` takes literals, not consts.
@@ -152,7 +158,11 @@ pub(crate) const UNIT_SUFFIX: &str = ".unit";
 const UNIT_PATH: &str = "/unit/";
 
 /// How long a peer may take to accept the connection: a LAN peer answers at once or not at all.
+#[cfg(not(test))]
 const PEER_CONNECT: Duration = Duration::from_millis(750);
+/// Unit tests: the hang detector, since every peer these tests dial is listening.
+#[cfg(test)]
+const PEER_CONNECT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// No byte from a peer for this long ends its transfer, and the release host's goes on.
 const PEER_IDLE: Duration = Duration::from_secs(2);
@@ -208,13 +218,13 @@ const SERVE_PACE: Pace = Pace {
 /// most until the deadline and at most the pace's idle time, and one at or past the deadline
 /// fails as timed out.
 struct Paced<'a> {
-    conn: &'a TcpStream,
+    conn: &'a dyn UnitConn,
     until: Option<Instant>,
     idle: Duration,
 }
 
 impl<'a> Paced<'a> {
-    fn new(conn: &'a TcpStream, within: Duration, idle: Duration) -> Self {
+    fn new(conn: &'a dyn UnitConn, within: Duration, idle: Duration) -> Self {
         Self {
             conn,
             until: Instant::now().checked_add(within),
@@ -252,22 +262,118 @@ fn timed_out(e: io::Error) -> io::Error {
 impl Read for Paced<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.conn.set_read_timeout(Some(self.wait()?))?;
-        let mut conn = self.conn;
-        conn.read(buf).map_err(timed_out)
+        self.conn.read_unit(buf).map_err(timed_out)
     }
 }
 
 impl io::Write for Paced<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.conn.set_write_timeout(Some(self.wait()?))?;
-        let mut conn = self.conn;
-        conn.write(buf).map_err(timed_out)
+        self.conn.write_unit(buf).map_err(timed_out)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut conn = self.conn;
-        conn.flush()
+        self.conn.flush_unit()
     }
+}
+
+/// A connection a unit moves on: a TCP socket on [`DEFAULT_PORT`], or a stream of the mesh's
+/// `Units` op (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4), which `aterm` supplies
+/// ([`set_units_dialer`]) since atpkg holds no TLS and reads no membership. Each call takes
+/// `&self`, as a socket's do, so one reader and one writer share it.
+pub trait UnitConn: Send + Sync {
+    /// Read what has arrived, as [`Read::read`].
+    /// # Errors
+    /// The connection's own; a timeout as [`io::ErrorKind::WouldBlock`] or
+    /// [`io::ErrorKind::TimedOut`].
+    fn read_unit(&self, buf: &mut [u8]) -> io::Result<usize>;
+    /// Write some of `buf`, as [`io::Write::write`].
+    /// # Errors
+    /// The connection's own.
+    fn write_unit(&self, buf: &[u8]) -> io::Result<usize>;
+    /// Flush what was written.
+    /// # Errors
+    /// The connection's own.
+    fn flush_unit(&self) -> io::Result<()>;
+    /// Bound each read (`None`: no bound).
+    /// # Errors
+    /// The connection's own.
+    fn set_read_timeout(&self, within: Option<Duration>) -> io::Result<()>;
+    /// Bound each write (`None`: no bound).
+    /// # Errors
+    /// The connection's own.
+    fn set_write_timeout(&self, within: Option<Duration>) -> io::Result<()>;
+}
+
+impl UnitConn for TcpStream {
+    fn read_unit(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut conn = self;
+        conn.read(buf)
+    }
+
+    fn write_unit(&self, buf: &[u8]) -> io::Result<usize> {
+        let mut conn = self;
+        io::Write::write(&mut conn, buf)
+    }
+
+    fn flush_unit(&self) -> io::Result<()> {
+        let mut conn = self;
+        io::Write::flush(&mut conn)
+    }
+
+    fn set_read_timeout(&self, within: Option<Duration>) -> io::Result<()> {
+        Self::set_read_timeout(self, within)
+    }
+
+    fn set_write_timeout(&self, within: Option<Duration>) -> io::Result<()> {
+        Self::set_write_timeout(self, within)
+    }
+}
+
+/// Opens a `Units` stream to the fleet member at an address a download dials, or `None` where
+/// none opens (no member there, a member that does not speak the mesh): the download then dials
+/// [`DEFAULT_PORT`] there, the fallback kept until the mesh is the only transport (§11 D3).
+pub type UnitsDialer = fn(IpAddr) -> Option<Box<dyn UnitConn>>;
+
+/// Where a download opens a `Units` stream first ([`set_units_dialer`]).
+static UNITS: OnceLock<UnitsDialer> = OnceLock::new();
+
+/// Name how a download opens a mesh `Units` stream to a member ([`UnitsDialer`]). The `aterm`
+/// binary sets it once as it starts; with none set, each peer is dialed at its `host:port`
+/// alone. A second call is ignored.
+pub fn set_units_dialer(dialer: UnitsDialer) {
+    let _ = UNITS.set(dialer);
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNITS_FOR_TEST: std::cell::Cell<Option<UnitsDialer>> = const { std::cell::Cell::new(None) };
+}
+
+/// `f` with `dialer` as this thread's [`UnitsDialer`].
+#[cfg(test)]
+pub(crate) fn with_units_dialer<R>(dialer: UnitsDialer, f: impl FnOnce() -> R) -> R {
+    let was = UNITS_FOR_TEST.with(|held| held.replace(Some(dialer)));
+    let ran = f();
+    UNITS_FOR_TEST.with(|held| held.set(was));
+    ran
+}
+
+fn units_dialer() -> Option<UnitsDialer> {
+    #[cfg(test)]
+    return UNITS_FOR_TEST.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    UNITS.get().copied()
+}
+
+/// Answer one `Units` request on `conn`, a stream the mesh's listener already admitted, from the
+/// units `layout` keeps: as a [`DEFAULT_PORT`] server answers one, at its pace. A store whose
+/// person turned sharing off answers none (`404`).
+/// # Errors
+/// The connection's own, or a request slower than the pace.
+pub fn answer_unit(conn: &dyn UnitConn, layout: &Layout) -> io::Result<()> {
+    let units = units_dir(layout);
+    answer(conn, (!turned_off(layout)).then_some(&*units), &SERVE_PACE)
 }
 
 /// The files an archive's bytes may arrive in while it downloads, in the order a reader looks:
@@ -371,11 +477,13 @@ fn race_paced(
     let part = suffixed(dest, PEER_PART_SUFFIX);
     let cdn_stop = AtomicBool::new(false);
     let peer_stop = AtomicBool::new(false);
+    // Read on this thread: where a download opens a mesh stream is this caller's.
+    let units = units_dialer();
     std::thread::scope(|scope| {
         let from_peer = std::thread::Builder::new()
             .name("atpkg-peer-unit".into())
             .spawn_scoped(scope, || {
-                let got = from_peers(peers, &sha256, size, &part, &peer_stop, pace);
+                let got = from_peers(peers, (&sha256, size), &part, &peer_stop, (pace, units));
                 if got.is_some() {
                     cdn_stop.store(true, Ordering::Release);
                 }
@@ -414,17 +522,16 @@ fn race_paced(
 /// first.
 fn from_peers(
     peers: &[String],
-    sha256: &str,
-    size: u64,
+    (sha256, size): (&str, u64),
     part: &Path,
     stop: &AtomicBool,
-    pace: &Pace,
+    (pace, units): (&Pace, Option<UnitsDialer>),
 ) -> Option<String> {
     for peer in peers {
         if stop.load(Ordering::Acquire) {
             break;
         }
-        match from_peer(peer, sha256, size, part, stop, pace) {
+        match from_peer(peer, (sha256, size), part, stop, (pace, units)) {
             Ok(()) => return Some(peer.clone()),
             Err(PeerMiss::Other(got)) => {
                 eprintln!(
@@ -450,15 +557,14 @@ enum PeerMiss {
 
 fn from_peer(
     peer: &str,
-    sha256: &str,
-    size: u64,
+    (sha256, size): (&str, u64),
     part: &Path,
     stop: &AtomicBool,
-    pace: &Pace,
+    (pace, units): (&Pace, Option<UnitsDialer>),
 ) -> Result<(), PeerMiss> {
-    let conn = connect(peer).ok_or(PeerMiss::Unavailable)?;
     let unavailable = |_| PeerMiss::Unavailable;
-    let mut paced = Paced::new(&conn, pace.head, pace.idle);
+    let conn = connect(peer, units).map_err(unavailable)?;
+    let mut paced = Paced::new(&*conn, pace.head, pace.idle);
     write!(
         paced,
         "GET {UNIT_PATH}{sha256} HTTP/1.1\r\nHost: {peer}\r\nConnection: close\r\n\r\n"
@@ -504,12 +610,51 @@ fn from_peer(
     }
 }
 
-/// A connection to `peer` (`host:port`), each of its addresses tried within [`PEER_CONNECT`].
-fn connect(peer: &str) -> Option<TcpStream> {
+/// A connection to `peer` (`host:port`): a mesh `Units` stream to the member at one of its
+/// addresses ([`set_units_dialer`]), else a TCP one to the address itself, each tried within
+/// [`PEER_CONNECT`] that a private aterm may dial ([`aterm_types::reach::check`]; a `Units`
+/// stream dials the member's fleet listener, which the fleet's own guard judges).
+///
+/// # Errors
+/// `peer` names no address, or the last address's refusal or failed connect.
+fn connect(peer: &str, dialer: Option<UnitsDialer>) -> io::Result<Box<dyn UnitConn>> {
+    connect_by(peer, dialer, |addr| {
+        aterm_uds::connect_tcp(addr, PEER_CONNECT)
+    })
+}
+
+/// [`connect`] with `dial` making each TCP connection, asked only of an address the rule lets
+/// this process dial: a test hands it one that makes no socket, so a rule that let the person's
+/// port through would fail it before any connect(2) reached the person's server.
+///
+/// # Errors
+/// As [`connect`]'s, the last failure being `dial`'s.
+fn connect_by(
+    peer: &str,
+    dialer: Option<UnitsDialer>,
+    dial: impl Fn(&SocketAddr) -> io::Result<TcpStream>,
+) -> io::Result<Box<dyn UnitConn>> {
     use std::net::ToSocketAddrs as _;
-    peer.to_socket_addrs()
-        .ok()?
-        .find_map(|addr| aterm_uds::connect_tcp(&addr, PEER_CONNECT).ok())
+    let addrs: Vec<SocketAddr> = peer.to_socket_addrs()?.collect();
+    if let Some(stream) = addrs
+        .iter()
+        .find_map(|addr| dialer.and_then(|units| units(addr.ip())))
+    {
+        return Ok(stream);
+    }
+    let mut last = None;
+    for addr in &addrs {
+        match aterm_types::reach::check(Reach::Dial(*addr)).and_then(|()| dial(addr)) {
+            Ok(conn) => return Ok(Box::new(conn)),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("LAN peer {peer} has no address"),
+        )
+    }))
 }
 
 /// Read a response head from `conn`: the body's `Content-Length` when the status is 200 and
@@ -615,7 +760,7 @@ fn sweep(units: &Path) {
         return;
     };
     for entry in entries.flatten() {
-        if let Ok(meta) = std::fs::symlink_metadata(entry.path())
+        if let Ok(meta) = entry.metadata()
             && (!meta.is_file() || links(&meta) < 2)
         {
             let _ = std::fs::remove_file(entry.path());
@@ -843,8 +988,8 @@ pub fn sharing(layout: &Layout, written: Option<&[String]>) -> Sharing {
         .flatten()
         .flatten()
     {
-        if let Ok(meta) = std::fs::symlink_metadata(entry.path())
-            && meta.is_file()
+        if entry.file_type().is_ok_and(|t| t.is_file())
+            && let Ok(meta) = entry.metadata()
             && links(&meta) >= 2
         {
             kept = (kept.0.saturating_add(1), kept.1.saturating_add(meta.len()));
@@ -1025,7 +1170,8 @@ pub fn share(layout: &Layout, how: &Share<'_>) {
 /// only [`turn_on`] lifts it.
 ///
 /// # Errors
-/// The person's off stands, `listen` could not be bound, or `units/` could not be made.
+/// The person's off stands, `listen` is one of the person's ports and this is a private aterm
+/// ([`aterm_types::reach::check`]), `listen` could not be bound, or `units/` could not be made.
 pub fn serve(
     layout: &Layout,
     listen: SocketAddr,
@@ -1048,8 +1194,10 @@ pub fn serve(
 
 /// Bind `listen`, non-blocking and kept out of every child, then make `units/` (sweeping what
 /// no build holds): a store whose bind fails makes nothing. A store not made yet is left to
-/// the pass that makes it.
+/// the pass that makes it, and a private aterm binds none of the person's ports
+/// ([`aterm_types::reach::check`]).
 fn open(layout: &Layout, listen: SocketAddr) -> io::Result<TcpListener> {
+    aterm_types::reach::check(Reach::Listen(listen))?;
     if !layout.prefix.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -1118,7 +1266,7 @@ fn answer_until(
         let spawned = std::thread::Builder::new()
             .name("atpkg-serve-unit".into())
             .spawn(move || {
-                let _ = answer(&conn, &dir, &SERVE_PACE);
+                let _ = answer(&conn, Some(&dir), &SERVE_PACE);
                 // The slot is free before the client hears the close.
                 held.give(ip);
                 drop(conn);
@@ -1130,7 +1278,8 @@ fn answer_until(
 }
 
 /// Answer one connection's request ([`answer_until`]), held to `pace`.
-fn answer(conn: &TcpStream, units: &Path, pace: &Pace) -> io::Result<()> {
+/// `units` is `None` for a store that serves none now: each request is read and answered `404`.
+fn answer(conn: &dyn UnitConn, units: Option<&Path>, pace: &Pace) -> io::Result<()> {
     let mut reader =
         io::BufReader::new(Paced::new(conn, pace.head, pace.idle).take(REQUEST_HEAD_MAX));
     let mut line = String::new();
@@ -1153,21 +1302,25 @@ fn answer(conn: &TcpStream, units: &Path, pace: &Pace) -> io::Result<()> {
     if method != "GET" {
         return status(&mut out, "405 Method Not Allowed");
     }
-    let Some(sha256) = target.strip_prefix(UNIT_PATH).filter(|s| is_unit_name(s)) else {
+    let (Some(units), Some(sha256)) = (
+        units,
+        target.strip_prefix(UNIT_PATH).filter(|s| is_unit_name(s)),
+    ) else {
         return status(&mut out, "404 Not Found");
     };
     let path = units.join(sha256);
-    let mut opened = crate::metadata_io::open_regular(&path)
+    let mut opened = crate::metadata_io::open_regular_with_meta(&path)
         .ok()
-        .and_then(|file| {
-            let meta = file.metadata().ok()?;
-            (meta.is_file() && links(&meta) >= 2).then_some((file, meta.len()))
+        .and_then(|(file, meta)| {
+            if links(&meta) >= 2 {
+                Some((file, meta.len()))
+            } else {
+                // A unit no build holds any more is swept as it is missed.
+                let _ = std::fs::remove_file(&path);
+                None
+            }
         });
     let Some((file, len)) = opened.as_mut() else {
-        // A unit no build holds any more is swept as it is missed.
-        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
-            let _ = std::fs::remove_file(&path);
-        }
         return status(&mut out, "404 Not Found");
     };
     write!(

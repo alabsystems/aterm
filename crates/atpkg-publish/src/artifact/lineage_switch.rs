@@ -222,7 +222,20 @@ fn note_live(repo: &Path, live: &str) {
     }
     let seq = SWITCH_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = note.with_extension(format!("{}.{seq}", std::process::id()));
-    if std::fs::write(&tmp, format!("{live}\n")).is_err() || std::fs::rename(&tmp, &note).is_err() {
+    let _ = std::fs::remove_file(&tmp);
+    let wrote = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(format!("{live}\n").as_bytes())
+    })();
+    if wrote.is_err() || std::fs::rename(&tmp, &note).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -324,7 +337,8 @@ fn sweep_quarantines(od: &Path) {
 fn adopt(q: &Path, od: &Path) -> std::io::Result<()> {
     let qpack = q.join("pack");
     if qpack.is_dir() {
-        std::fs::create_dir_all(od.join("pack"))?;
+        let od_pack = od.join("pack");
+        std::fs::create_dir_all(&od_pack)?;
         let mut names: Vec<String> = std::fs::read_dir(&qpack)?
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -335,29 +349,48 @@ fn adopt(q: &Path, od: &Path) -> std::io::Result<()> {
             .filter(|n| n.starts_with("pack-") && n.ends_with(".idx"))
         {
             let base = idx.strip_suffix(".idx").unwrap_or(idx);
-            if od.join("pack").join(idx).exists() {
+            if od_pack.join(idx).exists() {
                 continue;
             }
             for other in names
                 .iter()
                 .filter(|n| *n != idx && n.strip_prefix(base).is_some_and(|r| r.starts_with('.')))
             {
-                std::fs::rename(qpack.join(other), od.join("pack").join(other))?;
+                std::fs::rename(qpack.join(other), od_pack.join(other))?;
             }
-            std::fs::rename(qpack.join(idx), od.join("pack").join(idx))?;
+            std::fs::rename(qpack.join(idx), od_pack.join(idx))?;
         }
     }
     for e in std::fs::read_dir(q)?.flatten() {
         let dir = e.file_name().to_string_lossy().into_owned();
-        if dir.len() != 2 || !dir.bytes().all(|b| b.is_ascii_hexdigit()) || !e.path().is_dir() {
+        if dir.len() != 2 || !dir.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
+        let is_dir = e
+            .file_type()
+            .map(|ft| ft.is_dir() || (ft.is_symlink() && e.path().is_dir()))
+            .unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let od_dir = od.join(&dir);
+        let mut created_dir = false;
         for f in std::fs::read_dir(e.path())?.flatten() {
             let n = f.file_name().to_string_lossy().into_owned();
             let loose = matches!(n.len(), 38 | 62) && n.bytes().all(|b| b.is_ascii_hexdigit());
-            let dest = od.join(&dir).join(&n);
-            if loose && f.path().is_file() && !dest.exists() {
-                std::fs::create_dir_all(od.join(&dir))?;
+            if !loose {
+                continue;
+            }
+            let is_file = f
+                .file_type()
+                .map(|ft| ft.is_file() || (ft.is_symlink() && f.path().is_file()))
+                .unwrap_or(false);
+            let dest = od_dir.join(&n);
+            if is_file && !dest.exists() {
+                if !created_dir {
+                    std::fs::create_dir_all(&od_dir)?;
+                    created_dir = true;
+                }
                 std::fs::rename(f.path(), dest)?;
             }
         }

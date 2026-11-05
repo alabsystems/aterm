@@ -7,7 +7,7 @@ use crate::ai::testing::{Box3, FakeFetcher, FakeRunner, machine, ran};
 
 fn env_of(b: &Box3, config: &str, extra: &[(&str, &str)], tty: bool) -> Env {
     let cfg = b.dir.path().join("aterm.toml");
-    std::fs::write(&cfg, config).expect("config");
+    aterm_uds::atomic_file::write(&cfg, config.as_bytes(), 0o600).expect("config");
     // The system's own directories, never the host's PATH: a CLI someone installed by hand
     // there (a `~/.grok/bin/grok`) would read as one aterm does not manage.
     let mut vars = vec![
@@ -433,9 +433,10 @@ const FLEET_URL: &str = "https://fleet.example/ai-fleet.toml";
 
 fn fleet_machine(b: &Box3) -> (Env, PathBuf, String) {
     let secret = b.dir.path().join("fleet.key");
+    let keygen_env = env_of(b, "", &[], false);
     let recording = aterm_durable::seam::Recording::start();
     let (code, out, err) = run_cli(
-        &env_of(b, "", &[], false),
+        &keygen_env,
         &FakeRunner::quiet(),
         &["fleet", "keygen", secret.to_str().expect("utf8")],
     );

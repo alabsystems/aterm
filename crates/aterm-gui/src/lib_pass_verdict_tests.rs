@@ -484,6 +484,7 @@ fn a_lanes_pass_is_told_its_stderr_is_the_logs() {
         None,
         false,
         &|_: crate::Wake| {},
+        &|_| {},
     )
     .expect("the stub runs");
     assert_eq!(

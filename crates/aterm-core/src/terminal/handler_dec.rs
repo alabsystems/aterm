@@ -214,6 +214,14 @@ impl TerminalHandler<'_> {
                     }
                 }
                 2031 => {
+                    // What this read's output did to the scheme before the mode moves is settled
+                    // under the mode it was done under, as a read that ended here would settle it.
+                    super::state_accessors::settle_color_scheme_after_output(
+                        self.modes,
+                        self.color,
+                        self.policy,
+                        self.transient,
+                    );
                     self.modes.report_color_scheme = set;
                 }
                 2048 => {
@@ -286,7 +294,11 @@ impl TerminalHandler<'_> {
         let restored = self.grid.display_offset();
         if restored > 0 {
             self.grid.pin_viewport_to_live_for_output_batch();
-            self.transient.alt_restore_pin = Some((restored, self.grid.absolute_row_counter()));
+            self.transient.alt_restore_pin = Some((
+                restored,
+                self.grid.absolute_row_counter(),
+                self.grid.scrollback_clear_gen(),
+            ));
         }
         debug_assert_eq!(
             self.grid.display_offset(),

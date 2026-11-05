@@ -10,7 +10,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aterm_uds::spawnfd::Stdio;
@@ -97,6 +97,13 @@ fn job_pid(dir: &Path) -> i32 {
     })
 }
 
+/// `dir` by its real path: `band-launch` writes the lab's own scratch through no link
+/// (`util::atomic_write`), and the folder Cargo names for a test's scratch may lie under one (a
+/// checkout's `target -> target.noindex`).
+fn real_path(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).expect("the scratch world's real path")
+}
+
 /// The go `lab instance` gives its job once it has read the job's pid: a byte in the lifeline.
 fn go(mut held: &File) {
     held.write_all(b"g").expect("the go");
@@ -128,7 +135,7 @@ fn band_launch(dir: &Path, label: &str, program: &[&str]) {
 fn an_app_band_job_runs_its_program_as_an_app_in_its_own_coalition_and_is_removed_once_it_ends() {
     let owned_world = aterm_tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("exclusive scratch world");
-    let dir = owned_world.path().to_path_buf();
+    let dir = real_path(owned_world.path());
     let held = world(&dir);
     let label = format!(
         "aterm-lab.test.band.{}",
@@ -241,7 +248,7 @@ impl KeptJob {
     fn start(tag: &str, disclaim: bool) -> KeptJob {
         let owned_world = aterm_tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR"))
             .expect("exclusive scratch world");
-        let dir = owned_world.path().to_path_buf();
+        let dir = real_path(owned_world.path());
         let held = world(&dir);
         let label = format!(
             "aterm-lab.test.band-{tag}.{}",
@@ -386,7 +393,7 @@ fn a_keeper_jobs_program_killed_by_its_pid_ends_the_job() {
 fn a_job_whose_launcher_is_gone_before_its_go_never_starts_its_program() {
     let owned_world = aterm_tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("exclusive scratch world");
-    let dir = owned_world.path().to_path_buf();
+    let dir = real_path(owned_world.path());
     let held = world(&dir);
     let label = format!(
         "aterm-lab.test.band-gone.{}",

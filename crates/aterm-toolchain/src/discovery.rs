@@ -41,7 +41,7 @@ fn is_pending_stub(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let Ok(file) = options.open(path) else {
         return false;
@@ -131,6 +131,13 @@ fn take_hex_scalar(chars: &mut std::str::Chars<'_>, digits: usize) -> Option<cha
 }
 
 fn parse_toml_string(rhs: &str) -> Option<String> {
+    let (value, rest) = take_toml_string(rhs)?;
+    let tail = rest.trim_start();
+    (tail.is_empty() || tail.starts_with('#')).then_some(value)
+}
+
+/// One single-line TOML string at the head of `rhs`, and the text after its closing quote.
+fn take_toml_string(rhs: &str) -> Option<(String, &str)> {
     if !rhs.starts_with("'''")
         && let Some(body) = rhs.strip_prefix('\'')
     {
@@ -141,8 +148,7 @@ fn parse_toml_string(rhs: &str) -> Option<String> {
         {
             return None;
         }
-        let tail = rest.trim_start();
-        return (tail.is_empty() || tail.starts_with('#')).then(|| value.to_string());
+        return Some((value.to_string(), rest));
     }
     if rhs.starts_with("\"\"\"") {
         return None;
@@ -152,10 +158,7 @@ fn parse_toml_string(rhs: &str) -> Option<String> {
     let mut out = String::new();
     while let Some(ch) = chars.next() {
         match ch {
-            '"' => {
-                let tail = chars.as_str().trim_start();
-                return (tail.is_empty() || tail.starts_with('#')).then_some(out);
-            }
+            '"' => return Some((out, chars.as_str())),
             '\\' => match chars.next()? {
                 '"' => out.push('"'),
                 '\\' => out.push('\\'),
@@ -173,6 +176,31 @@ fn parse_toml_string(rhs: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A TOML array of single-line strings at the head of `rhs` (it may run over several lines, with
+/// comments between elements), or `None` when it is anything else.
+fn parse_toml_string_array(rhs: &str) -> Option<Vec<String>> {
+    let mut rest = rhs.strip_prefix('[')?;
+    let mut out = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if let Some(comment) = rest.strip_prefix('#') {
+            rest = comment.split_once('\n').map_or("", |(_, next)| next);
+            continue;
+        }
+        if rest.starts_with(']') {
+            return Some(out);
+        }
+        let (value, after) = take_toml_string(rest)?;
+        out.push(value);
+        rest = after.trim_start();
+        if let Some(next) = rest.strip_prefix(',') {
+            rest = next;
+        } else if !rest.starts_with(']') && !rest.starts_with('#') {
+            return None;
+        }
+    }
 }
 
 /// Extract the `channel = "..."` value from `rust-toolchain.toml` text (under `[toolchain]` or before any table header).
@@ -206,7 +234,7 @@ fn read_bounded_text(path: &Path, max_bytes: usize) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = options.open(path).ok()?;
     let meta = file.metadata().ok()?;
@@ -253,7 +281,7 @@ fn pinned_sysroot(dir: &Path, channel: &str, probe: &mut Probe<'_>) -> Option<Pa
         .into_iter()
         .map(|n| dir.join(tool_file(&n)))
         .find(|p| is_executable_file(p) && !is_pending_stub(p))?;
-    let sysroot = probe.stdout(&driver, &["--print", "sysroot"], DATE_PROBE_BOUND)?;
+    let sysroot = probe.stdout(&driver, &["--print", "sysroot"], probe_bound())?;
     let sysroot = sysroot.trim();
     (!sysroot.is_empty() && Path::new(sysroot).join("lib/rustlib").is_dir())
         .then(|| PathBuf::from(sysroot))
@@ -348,12 +376,84 @@ pub fn store_stage2_bin(prefix: &Path) -> PathBuf {
 
 const STORE_CHANNEL: &str = "trust";
 
+/// The `bin` holding the build atpkg's shim for `tool` runs: the directory of `tool` in the
+/// checkout `<prefix>/links/trust` dev-links (`aterm pkg which targo` says `dev-linked`), when
+/// the marker links `tool` (one of its `bins`) from an absolute checkout outside the prefix that
+/// has a `lib`, else [`store_stage2_bin`]. A dev link moves the shims of the bins it names and
+/// pauses the store's updates, leaving `current` on a build those shims no longer run, so
+/// discovery reads this rather than `current` alone.
+#[must_use]
+pub fn answering_bin(prefix: &Path, tool: &str) -> PathBuf {
+    linked_tool_bin(prefix, tool).unwrap_or_else(|| store_stage2_bin(prefix))
+}
+
+fn linked_tool_bin(prefix: &Path, tool: &str) -> Option<PathBuf> {
+    let marker = read_bounded_text(&prefix.join("links").join(STORE_CHANNEL), 64 << 10)?;
+    let mut checkout = None;
+    let mut bins = None;
+    let mut lines = marker.lines();
+    while let Some(line) = lines.next() {
+        let line = line.trim();
+        if let Some(rhs) = strip_toml_key(line, "checkout") {
+            checkout = parse_toml_string(rhs).filter(|value| !value.is_empty());
+        } else if let Some(rhs) = strip_toml_key(line, "bins") {
+            let mut text = rhs.to_string();
+            for more in lines.clone() {
+                text.push('\n');
+                text.push_str(more);
+            }
+            bins = parse_toml_string_array(&text);
+        }
+    }
+    let checkout = PathBuf::from(checkout?);
+    let file = tool_file(tool);
+    let rel = bins?.into_iter().map(PathBuf::from).find(|rel| {
+        rel.file_name() == Some(OsStr::new(&file))
+            && rel
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+    })?;
+    let inside_prefix = std::fs::canonicalize(&checkout).is_ok_and(|c| {
+        c.starts_with(std::fs::canonicalize(prefix).unwrap_or_else(|_| prefix.into()))
+    });
+    let dir = checkout.join(rel).parent()?.to_path_buf();
+    (checkout.is_absolute() && !inside_prefix && dir.is_dir() && checkout.join("lib").is_dir())
+        .then_some(dir)
+}
+
 #[cfg(not(test))]
 const DATE_PROBE_BOUND: Duration = Duration::from_secs(5);
 /// A unit test's drivers are stand-ins that print and exit: their answer must come, so the
 /// probe waits on the hang detector.
 #[cfg(test)]
 const DATE_PROBE_BOUND: Duration = aterm_spec::wait::MUST_HAPPEN;
+
+/// The bound a test set on each driver probe, in milliseconds (0: none set).
+#[cfg(any(test, debug_assertions))]
+static PROBE_BOUND_FOR_TEST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bound each driver probe (`--print sysroot`, `-vV`) by `bound` instead of the product's 5 s,
+/// for this process.
+///
+/// Another crate's test whose stand-in drivers print and exit sets the hang detector here: their
+/// answer must come, and a loaded machine that outlasts 5 s would otherwise read a pinned
+/// toolchain as missing and a borrowed tool as gone.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn set_probe_bound_for_test(bound: Duration) {
+    let ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX).max(1);
+    PROBE_BOUND_FOR_TEST_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `DATE_PROBE_BOUND`, or the bound a test set with [`set_probe_bound_for_test`].
+fn probe_bound() -> Duration {
+    #[cfg(any(test, debug_assertions))]
+    match PROBE_BOUND_FOR_TEST_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        ms => return Duration::from_millis(ms),
+    }
+    DATE_PROBE_BOUND
+}
 
 /// A rustup `trust` toolchain ranked below the `atpkg` store because its `commit-date` is older
 /// than the store build's.
@@ -418,7 +518,7 @@ fn commit_date(bin: &Path, probe: &mut Probe<'_>) -> Option<String> {
         .map(|n| bin.join(tool_file(n)))
         .filter(|p| is_executable_file(p) && !is_pending_stub(p))
         .find_map(|driver| {
-            let text = probe.stdout(&driver, &["-vV"], DATE_PROBE_BOUND)?;
+            let text = probe.stdout(&driver, &["-vV"], probe_bound())?;
             let date = text
                 .lines()
                 .find_map(|l| l.strip_prefix("commit-date: "))?
@@ -527,25 +627,7 @@ fn view_presents(entry: &Path, store_prefix: &Path) -> Option<PathBuf> {
     if !resolved.starts_with(&views) {
         return None;
     }
-    let store = || Some(store_stage2_bin(store_prefix));
-    let Some(marker) = read_bounded_text(&store_prefix.join("links").join(STORE_CHANNEL), 64 << 10)
-    else {
-        return store();
-    };
-    let Some(checkout) = marker.lines().find_map(|line| {
-        let rhs = strip_toml_key(line.trim(), "checkout")?;
-        let value = parse_toml_string(rhs)?;
-        (!value.is_empty()).then(|| PathBuf::from(value))
-    }) else {
-        return store();
-    };
-    let prefix = std::fs::canonicalize(store_prefix).unwrap_or_else(|_| store_prefix.into());
-    let inside = std::fs::canonicalize(&checkout).is_ok_and(|c| c.starts_with(&prefix));
-    if !inside && checkout.join("bin").is_dir() && checkout.join("lib").is_dir() {
-        Some(checkout.join("bin"))
-    } else {
-        store()
-    }
+    Some(answering_bin(store_prefix, "targo"))
 }
 
 /// Resolved Trust toolchain paths and discovery diagnostics.
@@ -566,7 +648,8 @@ pub struct Toolchain {
     pub borrowed: Vec<(&'static str, PathBuf)>,
     /// First candidate directory containing `targo` that failed the pinned-toolchain check.
     pub refused: Option<PathBuf>,
-    /// `<prefix>/store/trust/current/bin` (`None` when `$TRUST_STAGE2_BIN` is set).
+    /// The build atpkg's `targo` shim runs ([`answering_bin`]: a dev-linked checkout's `bin`, else
+    /// `<prefix>/store/trust/current/bin`); `None` when `$TRUST_STAGE2_BIN` is set.
     pub store_bin: Option<PathBuf>,
     /// Rustup `trust` entry demoted below the store when another candidate won.
     pub demoted: Option<Demoted>,
@@ -672,7 +755,7 @@ impl Toolchain {
             let rustup = store_prefix
                 .and_then(|prefix| view_presents(&entry, prefix))
                 .unwrap_or_else(|| entry.join("bin"));
-            let store_bin = store_prefix.map(store_stage2_bin);
+            let store_bin = store_prefix.map(|prefix| answering_bin(prefix, "targo"));
             let rustup_targo = rustup.join(&targo);
             let stale = store_prefix
                 .filter(|_| pinned.unwrap_or(STORE_CHANNEL) == STORE_CHANNEL)
@@ -921,7 +1004,7 @@ fn managed_tool_guarded(
     probe: &mut Probe<'_>,
 ) -> Option<PathBuf> {
     store_prefix
-        .map(store_stage2_bin)
+        .map(|prefix| answering_bin(prefix, name))
         .into_iter()
         .chain(std::env::split_paths(path_env))
         .find_map(|dir| {
@@ -1497,6 +1580,102 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
+    /// A dev link answers each tool it links over the store's `current`: discovery reports the
+    /// build atpkg's shim for that tool runs (m20, 2026-11-05: with no rustup `trust` entry the
+    /// shims ran the linked 9178 while verify compiled and linted with `current`'s 9192), and a
+    /// tool the winner lacks is borrowed from the build its own shim runs. NEGATIVE CONTROLS: a
+    /// marker that links only `trustc`, names a relative checkout or one without a `lib`, or no
+    /// marker at all, and the store's `current` answers.
+    #[cfg(unix)]
+    #[test]
+    fn a_dev_linked_checkout_answers_over_the_stores_current() {
+        let home = mktemp_dir("atv-linked").expect("mktemp");
+        let prefix = default_atpkg_prefix(&home);
+        let store = dated_bin(&home, &prefix.join("store/trust/9192"), "2026-09-18");
+        exec_stub(&store.join(TIPPY));
+        std::os::unix::fs::symlink(
+            prefix.join("store/trust/9192"),
+            prefix.join("store/trust/current"),
+        )
+        .expect("ln current");
+        let checkout = home.join("trust-packs/4d9a20e3daf");
+        let linked = dated_bin(&home, &checkout, "2026-09-27");
+        exec_stub(&linked.join(TIPPY));
+        fs::create_dir_all(prefix.join("links")).expect("mkdir links");
+        let mark = |at: &str, bins: &str| {
+            fs::write(
+                prefix.join("links/trust"),
+                format!("schema = 1\nprogram = \"trust\"\ncheckout = {at}\nbins = {bins}\n"),
+            )
+            .expect("marker");
+        };
+        let at = format!("\"{}\"", checkout.display());
+        let every =
+            "[\n    \"bin/targo\", # the driver\n    'bin/trustc',\n    \"bin/targo-tippy\",\n]";
+        mark(&at, every);
+        let found = || {
+            Toolchain::discover_with_store(
+                None,
+                &home.join(".rustup"),
+                Some(&prefix),
+                OsStr::new(""),
+                Some("trust"),
+            )
+        };
+
+        let t = found();
+        assert!(t.have_targo());
+        assert_eq!(t.stage2_dir, linked, "the dev-linked build answers");
+        assert_eq!(t.store_bin, Some(checkout.join("bin")));
+        assert_eq!(t.tippy, Some(linked.join(TIPPY)), "its own tippy");
+        assert!(t.borrowed.is_empty(), "{:?}", t.borrowed);
+
+        let sealed = pinned_bin(&home.join("sealed/bin"));
+        fs::create_dir_all(home.join(".rustup/toolchains")).expect("mkdir");
+        let entry = home.join(".rustup/toolchains/trust");
+        std::os::unix::fs::symlink(home.join("sealed"), &entry).expect("ln rustup");
+        let t = found();
+        assert_eq!(t.stage2_dir, sealed, "a rustup entry still ranks first");
+        assert_eq!(
+            t.borrowed(TIPPY),
+            Some(linked.join(TIPPY).as_path()),
+            "the tippy its shim runs, never the store build the link left behind"
+        );
+        fs::remove_file(&entry).expect("rm rustup");
+
+        for (at, bins, why) in [
+            (at.as_str(), "[\"bin/trustc\"]", "a link of trustc alone"),
+            ("\"trust-packs/4d9a20e3daf\"", every, "a relative checkout"),
+            (at.as_str(), "\"bin/targo\"", "bins that are no array"),
+        ] {
+            mark(at, bins);
+            let t = found();
+            assert_eq!(t.stage2_dir, store, "{why}: the store answers targo");
+            assert_eq!(
+                t.tippy,
+                Some(store.join(TIPPY)),
+                "{why}: the store's own tippy"
+            );
+        }
+
+        mark(&at, every);
+        fs::remove_dir_all(checkout.join("lib")).expect("rm lib");
+        assert_eq!(
+            found().stage2_dir,
+            store,
+            "a link to no toolchain: the store"
+        );
+
+        fs::remove_file(prefix.join("links/trust")).expect("rm marker");
+        let t = found();
+        assert_eq!(t.stage2_dir, store, "no link: the store's current");
+        assert_eq!(
+            t.store_bin.as_deref(),
+            Some(store_stage2_bin(&prefix).as_path())
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
     /// An `atpkg` rustup view resolves through to the store build or dev-linked checkout it
     /// presents.
     #[cfg(unix)]
@@ -1542,7 +1721,7 @@ mod tests {
         fs::write(
             prefix.join("links/trust"),
             format!(
-                "program = \"trust\"\ncheckout = '{}' # literal with comment\n",
+                "program = \"trust\"\ncheckout = '{}' # literal with comment\nbins = [\"bin/targo\"]\n",
                 checkout.display()
             ),
         )

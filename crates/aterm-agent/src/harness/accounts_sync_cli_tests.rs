@@ -693,7 +693,12 @@ impl Bed {
         let (home, config) = (root.join("home"), root.join("config"));
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&config).unwrap();
-        fs::write(config.join("aterm.toml"), "[fleet]\nmachine = \"m16\"\n").unwrap();
+        aterm_uds::atomic_file::write(
+            &config.join("aterm.toml"),
+            b"[fleet]\nmachine = \"m16\"\n",
+            0o600,
+        )
+        .unwrap();
         Self {
             _dir: dir,
             home,
@@ -908,7 +913,10 @@ fn background_signins_refuse_unknown_records_before_dispatch_or_locks() {
                 &bed.roster(cli),
                 roster,
                 &accounts::Logins::default(),
-                row,
+                (
+                    row.clone(),
+                    crate::harness::sign_in_ladder::asked_fixture(cli, &row.label),
+                ),
                 (None, true),
                 NOW,
                 &guard,
@@ -1677,16 +1685,27 @@ fn harness_accounts_off_turns_every_automatic_sync_off() {
 }
 
 /// Signs `label` of Kimi's pool in here (a placeholder login file) and marks it signed out, so
-/// its renewal is due.
-fn signed_out_kimi_login(bed: &Bed, label: &str) {
+/// its renewal is due; a session here ran on it an hour before `now` and has ended, so this Mac
+/// uses it ([`accounts::used_here`]).
+fn signed_out_kimi_login(bed: &Bed, label: &str, now: i64) {
     let login = bed.home.join(".aterm/logins/kimi").join(label);
     fs::create_dir_all(login.join("credentials")).unwrap();
     fs::write(login.join("credentials/kimi-code.json"), "{}").unwrap();
     let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
-    let (mut state, _) = store.load(NOW).unwrap_or_default();
+    let (mut state, _) = store.load(now).unwrap_or_default();
     let mut logins = accounts::Logins::default();
     let _ = accounts::note_login_end(&mut state, &mut logins, label, NOW);
+    used_here(&mut state, label, now);
     store.save(&state).unwrap();
+}
+
+/// A session here ran on `label` an hour before `now` and has ended: this Mac uses its login
+/// ([`accounts::used_here`]), so the upkeep may renew it when it is due.
+fn used_here(state: &mut accounts::State, label: &str, now: i64) {
+    let _ = accounts::note_session(state, &format!("ran-{label}"), label, None, now - 3600);
+    state
+        .sessions
+        .retain(|sid, _| *sid != format!("ran-{label}"));
 }
 
 #[test]
@@ -1717,7 +1736,7 @@ fn a_kept_pools_due_login_renews_unless_its_sign_ins_are_off() {
         panic!("a kept roster syncs at init: {init:?}");
     };
     assert_eq!(synced.added, ["kimi-1"]);
-    signed_out_kimi_login(&bed, "kimi-1");
+    signed_out_kimi_login(&bed, "kimi-1", NOW);
     assert_eq!(
         upkeep_over(&bed, UpkeepStep::Both),
         1,
@@ -2017,7 +2036,7 @@ fn codex_by_default_writes_nothing_where_the_fleet_lists_no_row_of_this_macs() {
 fn an_unlisted_mac_syncs_codex_again_only_once_its_inputs_change() {
     let bed = Bed::new("codex-unlisted-quiet");
     let dotfile = bed.home.join("dotfiles-aterm.toml");
-    fs::write(&dotfile, "[fleet]\nmachine = \"m9\"\n").unwrap();
+    aterm_uds::atomic_file::write(&dotfile, b"[fleet]\nmachine = \"m9\"\n", 0o600).unwrap();
     fs::remove_file(bed.aterm_toml()).unwrap();
     std::os::unix::fs::symlink(&dotfile, bed.aterm_toml()).unwrap();
     bed.secret(ACCOUNTS_CSV_FILE, SHEET);
@@ -2159,8 +2178,8 @@ fn a_mac_that_removed_its_codex_roster_stays_out_of_the_pool() {
 }
 
 /// `accounts sync --cli` names the sign-in of each row it added by the verb that signs it in
-/// (`Cli::sign_in_verb`): a Kimi row's renewal, which aterm runs by itself once a session needs
-/// it, and a Grok row's `accounts login`, since its renewals stop at accounts.x.ai's block page.
+/// (`Cli::sign_in_verb`): a Kimi row's renewal, once a person has opened its browser, and a Grok
+/// row's `accounts login`, since its renewals stop at accounts.x.ai's block page.
 #[test]
 fn a_sync_names_each_added_rows_sign_in_by_its_verb() {
     const GROK_FLEET: &str = "\
@@ -2194,6 +2213,7 @@ machines = [\"m16\"]
         );
         assert_eq!(code, ExitCode::SUCCESS, "{cli:?}: {err}");
         assert!(out.contains(step), "{cli:?}: {out}");
+        assert!(!out.contains("by itself"), "{cli:?}: {out}");
         assert!(
             out.contains(if cli == Cli::Kimi { "kimi-1" } else { "grok-1" }),
             "{cli:?}: {out}"
@@ -2707,7 +2727,7 @@ region = \"global\"
     // ahead of `wrong_at` rows (`kimi-2`).
     fs::remove_file(&mailbox_toml).unwrap();
     for label in ["kimi-1", "kimi-2", "kimi-3"] {
-        signed_out_kimi_login(&bed, label);
+        signed_out_kimi_login(&bed, label, now);
     }
     let mut note = None;
     store
@@ -2786,7 +2806,7 @@ region = \"global\"
     .unwrap()
         + 1_000;
     assert!(matches!(bed.sync(Cli::Kimi, None), Ok(CliSync::Synced(_))));
-    signed_out_kimi_login(&bed, "kimi-1");
+    signed_out_kimi_login(&bed, "kimi-1", now);
     let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
@@ -2945,7 +2965,10 @@ fn kimi_renewal_ending(
         &EndsOn { outcome, now },
         &store,
         (&row, &roster_path, &candidates.records.logins),
-        own_dir.as_deref(),
+        (
+            own_dir.as_deref(),
+            crate::harness::sign_in_ladder::asked_fixture(Cli::Kimi, label),
+        ),
         &mut io::sink(),
         &mut io::sink(),
     )
@@ -3056,7 +3079,7 @@ region = \"global\"
         .unwrap()
             + 1_000;
         assert!(matches!(bed.sync(Cli::Kimi, None), Ok(CliSync::Synced(_))));
-        signed_out_kimi_login(&bed, "kimi-1");
+        signed_out_kimi_login(&bed, "kimi-1", now);
         let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
         if bound {
             store
@@ -3194,7 +3217,7 @@ region = \"global\"
         .unwrap()
             + 1_000;
         assert!(matches!(bed.sync(Cli::Kimi, None), Ok(CliSync::Synced(_))));
-        signed_out_kimi_login(&bed, "kimi-1");
+        signed_out_kimi_login(&bed, "kimi-1", now);
         assert_eq!(
             kimi_renewal_ending(&bed, "kimi-1", kimi_bot_check(), now),
             Renewal::BotCheck
@@ -3313,7 +3336,7 @@ region = \"global\"
 
     // 2. `renew_pool_due` runs ready rows (`kimi-2`) ahead of person-parked rows (`kimi-1`).
     for label in ["kimi-1", "kimi-2", "kimi-3"] {
-        signed_out_kimi_login(&bed, label);
+        signed_out_kimi_login(&bed, label, now);
     }
     let mut note = None;
     store
@@ -3531,8 +3554,13 @@ region = \"global\"
     );
 }
 
+/// A WALLED VENDOR POOL SIGNS IN NO SUCCESSOR NOBODY HERE USES (§4.15 rule 4): with `main` at a
+/// wall and `kimi-1` limited, the upkeep leaves unenrolled `kimi-2` alone, since no session here
+/// runs on it and it is no due login this Mac uses; a launch meanwhile refuses a row not signed
+/// in here. Once a session here runs on `kimi-2` and its login is signed out, the upkeep signs it
+/// in (CONTROL).
 #[test]
-fn walled_or_low_vendor_pool_enrolls_unenrolled_successor_ahead_of_due_rows() {
+fn a_walled_vendor_pool_leaves_an_unused_successor_to_a_session_or_a_person() {
     let bed = Bed::new("vendor-wall-recovery");
     fake_headless_browser(&bed.home);
     bed.keep_roster(Cli::Kimi);
@@ -3622,10 +3650,9 @@ region = \"global\"
         "CONTROL: unwalled `renew --cli kimi --due` finds nothing due"
     );
 
-    // Enroll `kimi-1` and mark it rate-limited + signed-out (`renew_due`, limited), while `kimi-2`
-    // remains `NotEnrolled` with an older historical `wrong_at`. When `main` hits a weekly wall,
-    // `renew_pool_due` must enroll `kimi-2` (tier 0) rather than stalling on limited `kimi-1`.
-    signed_out_kimi_login(&bed, "kimi-1");
+    // `kimi-1` enrolled, used here, rate-limited and signed out (`renew_due`, limited); `kimi-2`
+    // `NotEnrolled` with an older historical `wrong_at`; `main` at a weekly wall.
+    signed_out_kimi_login(&bed, "kimi-1", now);
     let mut note = None;
     store
         .transact_logins(now, &mut note, |state, logins| {
@@ -3658,12 +3685,39 @@ region = \"global\"
         run_attempt: None,
         shared: shared_renewal::Effects::default(),
     };
+    assert!(
+        !renew_pool_due(
+            Cli::Kimi,
+            &bed.home,
+            &bed.state,
+            &bed.roster(Cli::Kimi),
+            now,
+            &wall_fx,
+        ),
+        "a wall is no use of kimi-2, and limited kimi-1 waits for its wall"
+    );
+    assert!(wall_guard.lock().unwrap().last_attempt.is_empty());
+    assert_eq!(*spawned.lock().unwrap(), 0);
+
+    // CONTROL: a session here runs on `kimi-2`, whose login is signed out here.
+    store
+        .transact(now + 10, &mut None, |state| {
+            let mut events = accounts::note_session(state, "s-kimi-2", "kimi-2", None, now + 10);
+            events.extend(accounts::note_auth(
+                state,
+                "kimi-2",
+                accounts::Auth::SignedOut,
+                now + 10,
+            ));
+            Ok(events)
+        })
+        .unwrap();
     assert!(renew_pool_due(
         Cli::Kimi,
         &bed.home,
         &bed.state,
         &bed.roster(Cli::Kimi),
-        now,
+        now + 10,
         &wall_fx,
     ));
     let keys: Vec<String> = wall_guard
@@ -3676,33 +3730,7 @@ region = \"global\"
     assert_eq!(
         keys,
         ["kimi:kimi-2"],
-        "walled vendor pool must enroll unenrolled kimi-2 ahead of limited due rows"
-    );
-
-    // CONTROL 2: once an enrolled ready successor exists (`kimi-1` signed in and unwalled),
-    // `needed_renew_candidates_for` stops emitting tier-0 `NotEnrolled` rows.
-    let mut ready_note = None;
-    store
-        .transact_logins(now + 10, &mut ready_note, |state, _logins| {
-            state.accounts.remove("kimi-1");
-            let _ = accounts::note_auth(state, "kimi-1", accounts::Auth::Ok, now + 10);
-            Ok(Vec::new())
-        })
-        .unwrap();
-    let roster = Roster::load_for(Cli::Kimi, &bed.roster(Cli::Kimi)).unwrap();
-    let (ready_state, _) = store.load(now + 10).unwrap();
-    let (ready_logins, _) = store.load_logins(now + 10).unwrap();
-    assert!(
-        needed_renew_candidates_for(
-            Cli::Kimi,
-            Some(&store),
-            &roster,
-            &ready_state,
-            &ready_logins,
-            now + 10,
-        )
-        .is_empty(),
-        "CONTROL: ready enrolled kimi-1 satisfies wall recovery without enrolling kimi-2"
+        "the row a session here runs on is signed in"
     );
 }
 
@@ -3935,7 +3963,7 @@ fn harness_accounts_off_stops_window_upkeep_sign_ins_as_well_as_sync() {
         let claude_roster = bed.config.join(accounts::ACCOUNTS_FILE);
         assert!(sync_accounts_for_init(&bed.home, &bed.state, &claude_roster, NOW).is_ok());
         let _ = sync_cli_accounts_for_init(&bed.home, &bed.state, &claude_roster, NOW);
-        signed_out_kimi_login(&bed, "kimi-1");
+        signed_out_kimi_login(&bed, "kimi-1", NOW);
         let claude_store = accounts::Store::at(&bed.state);
         fs::create_dir_all(
             claude_store
@@ -4099,4 +4127,357 @@ fn published_kimi_refresh_schedules_without_a_browser_and_keeps_identity_retry_h
             usize::from(matches!(case, 1 | 2 | 4))
         );
     }
+}
+
+/// The sheet whose one line gives `address`'s account of `cli` to `computer`.
+fn sheet_giving(cli: Cli, address: &str, computer: &str) -> String {
+    let cells = match cli {
+        Cli::Claude => "1,,,",
+        Cli::Codex => ",1,,",
+        Cli::Grok => ",,1,",
+        _ => ",,,global",
+    };
+    format!(
+        "m,email,computer,,claude,Open AI,xai,kimi,google,meta,Payment,notes\n\
+         ,{address},{computer},,{cells},,,,\n"
+    )
+}
+
+/// `cli`'s roster with this Mac's own login (`main`) and a row `other` for `other@example.test`,
+/// no login of it made: what m159 keeps of m22's account.
+fn keep_a_row_with_no_login(bed: &Bed, cli: Cli) {
+    let dir = bed.home.join(".aterm/logins").join(cli.id()).join("other");
+    let region = if cli == Cli::Kimi {
+        "region = \"global\"\n"
+    } else {
+        ""
+    };
+    fs::write(
+        bed.roster(cli),
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
+             label = \"other\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             email = \"other@example.test\"\n{region}",
+            dir.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// What [`rows_of_other_macs_at`] reads of `cli`'s roster in `bed`.
+fn other_macs_of(bed: &Bed, cli: Cli) -> BTreeMap<String, String> {
+    let roster = bed.roster(cli);
+    let records = accounts::Store::at_for(&bed.state, cli, &bed.home)
+        .read_account_records(Some(&roster), NOW)
+        .unwrap();
+    rows_of_other_macs_at(
+        cli,
+        (&bed.home, &bed.state),
+        &roster,
+        (&records.raw_roster, &records.logins),
+        NOW,
+    )
+}
+
+/// The row `other`, held by `machine`.
+fn other_held_by(machine: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([("other".to_owned(), machine.to_owned())])
+}
+
+/// ANOTHER MAC'S ACCOUNT (`ATERM-KI-1105-9`): a row with no login here whose account the source
+/// gives other Macs alone reads as theirs on every CLI, follows the sheet's next edit since nothing
+/// is kept, and stores no hold that would refuse a person naming it. The controls are everything
+/// else: no source, an account the source does not know, and the source naming this Mac.
+#[test]
+fn a_row_its_source_gives_other_macs_alone_reads_as_theirs() {
+    for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let bed = Bed::new("other-macs");
+        keep_a_row_with_no_login(&bed, cli);
+        assert!(
+            other_macs_of(&bed, cli).is_empty(),
+            "{cli:?}: CONTROL: no source says nothing"
+        );
+        bed.secret(
+            ACCOUNTS_CSV_FILE,
+            &sheet_giving(cli, "other@example.test", "m22"),
+        );
+        assert_eq!(other_macs_of(&bed, cli), other_held_by("m22"), "{cli:?}");
+        let records = accounts::Store::at_for(&bed.state, cli, &bed.home)
+            .read_account_records(Some(&bed.roster(cli)), NOW)
+            .unwrap();
+        assert_eq!(
+            records.raw_roster.row("other").unwrap().held_by,
+            None,
+            "{cli:?}: nothing is kept that would refuse a person naming the row"
+        );
+        bed.secret(
+            ACCOUNTS_CSV_FILE,
+            &sheet_giving(cli, "someone@example.test", "m22"),
+        );
+        assert!(
+            other_macs_of(&bed, cli).is_empty(),
+            "{cli:?}: CONTROL: an account it does not know"
+        );
+        bed.secret(
+            ACCOUNTS_CSV_FILE,
+            &sheet_giving(cli, "other@example.test", "m16"),
+        );
+        assert!(
+            other_macs_of(&bed, cli).is_empty(),
+            "{cli:?}: CONTROL: the source names this Mac"
+        );
+    }
+}
+
+/// [`only_another_machine`]: a machine among others is still named, whichever spelling the
+/// machine goes by, and an account the source gives nobody is not another Mac's.
+#[test]
+fn an_account_named_for_this_mac_among_others_is_not_another_macs() {
+    let row = Row {
+        email: Some("other@example.test".into()),
+        ..Row::default()
+    };
+    let fleet = |machines: &[&str]| FleetRoster {
+        accounts: vec![FleetAccount {
+            label: "other".into(),
+            machines: machines.iter().map(|m| (*m).to_owned()).collect(),
+            class: Class::Pool,
+            email: "OTHER@example.test".into(),
+            browser: None,
+            vendor: accounts::Vendor::default(),
+        }],
+        ..FleetRoster::default()
+    };
+    let of = |machines: &[&str], me: &str| {
+        only_another_machine(Cli::Claude, &fleet(machines), &[machine_spelling(me)], &row)
+            .map(str::to_owned)
+    };
+    assert_eq!(of(&["m22", "m29"], "m16").as_deref(), Some("m22"));
+    assert_eq!(of(&["m22", "m16"], "m16"), None);
+    assert_eq!(of(&["m22", "m16"], "M16"), None);
+    assert_eq!(of(&[], "m16"), None);
+}
+
+/// A LOGIN ALREADY HERE IS THIS MAC'S, whoever the source gives it to: a person's own borrowing
+/// keeps working once made, signed out included.
+#[test]
+fn a_login_already_here_is_this_macs_whoever_the_source_gives_it_to() {
+    let bed = Bed::new("other-macs-login");
+    keep_a_row_with_no_login(&bed, Cli::Kimi);
+    bed.secret(
+        ACCOUNTS_CSV_FILE,
+        &sheet_giving(Cli::Kimi, "other@example.test", "m22"),
+    );
+    assert_eq!(
+        other_macs_of(&bed, Cli::Kimi),
+        other_held_by("m22"),
+        "CONTROL"
+    );
+    signed_out_kimi_login(&bed, "other", NOW);
+    assert!(other_macs_of(&bed, Cli::Kimi).is_empty());
+}
+
+/// A ROW ON THIS MAC'S DEFAULT LOGIN IS THIS MAC'S WHILE A LOGIN STANDS THERE, whoever the sheet
+/// gives its account to. With no login there it has none here at all, as `aterm ai` reads it, and
+/// is another Mac's like any other row.
+#[test]
+fn the_row_on_the_default_login_is_this_macs_while_its_login_stands() {
+    let bed = Bed::new("other-macs-default");
+    fs::write(
+        bed.roster(Cli::Kimi),
+        "[[account]]\nlabel = \"own\"\nclass = \"dedicated\"\n\
+         email = \"other@example.test\"\nregion = \"global\"\n",
+    )
+    .unwrap();
+    bed.secret(
+        ACCOUNTS_CSV_FILE,
+        &sheet_giving(Cli::Kimi, "other@example.test", "m22"),
+    );
+    assert_eq!(
+        other_macs_of(&bed, Cli::Kimi),
+        BTreeMap::from([("own".to_owned(), "m22".to_owned())])
+    );
+    let login = bed
+        .home
+        .join(Cli::Kimi.accounts().default_home)
+        .join("credentials/kimi-code.json");
+    fs::create_dir_all(login.parent().unwrap()).unwrap();
+    fs::write(&login, "{}").unwrap();
+    assert!(other_macs_of(&bed, Cli::Kimi).is_empty());
+}
+
+/// CLAUDE CODE READS WHOSE AN ACCOUNT IS FROM THE SOURCE ITS SYNC READS, a fleet file beside its
+/// roster where no sheet stands. `CONTROL`: the same file naming this Mac.
+#[test]
+fn a_fleet_file_beside_claude_codes_roster_says_whose_an_account_is() {
+    let bed = Bed::new("other-macs-beside");
+    keep_a_row_with_no_login(&bed, Cli::Claude);
+    let other_macs = |machine: &str| {
+        fs::write(
+            bed.config.join(FLEET_ROSTER_FILE),
+            format!(
+                "opt_in = \"named\"\n\n[[account]]\nlabel = \"other\"\n\
+                 email = \"other@example.test\"\nmachines = [\"{machine}\"]\n"
+            ),
+        )
+        .unwrap();
+        other_macs_of(&bed, Cli::Claude)
+    };
+    assert_eq!(other_macs("m22"), other_held_by("m22"));
+    assert!(other_macs("m16").is_empty(), "CONTROL: this Mac's");
+}
+
+/// UNDER A POOL FILE THIS MAC GOES BY THE NAME THE POOL RESOLVES: `m100`, its roster's label, though
+/// `aterm.toml` calls it by its alias `m32`, so an account warm on `m100` is its own and one warm on
+/// `m9` alone is another Mac's, for each CLI whose sync reads a pool.
+#[cfg(unix)]
+#[test]
+fn under_a_pool_file_this_mac_goes_by_the_name_the_pool_resolves() {
+    for cli in [Cli::Claude, Cli::Codex] {
+        let bed = Bed::new("other-macs-pool");
+        keep_a_row_with_no_login(&bed, cli);
+        fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m32\"\n").unwrap();
+        super::super::ai_pool::tests::seed_local_swarm_roster(&bed.home, "m100", &["m32"]);
+        let other_macs = |warm: &str| {
+            bed.secret(
+                super::super::ai_pool::AI_POOL_FILE,
+                &format!(
+                    "version = 1\n\n[last_heard]\nm100 = \"2026-10-27\"\n\n[[account]]\n\
+                     provider = \"{}\"\nemail = \"other@example.test\"\nwarm = [\"{warm}\"]\n",
+                    cli.id()
+                ),
+            );
+            other_macs_of(&bed, cli)
+        };
+        assert!(other_macs("m100").is_empty(), "{cli:?}: this Mac's");
+        assert_eq!(other_macs("m9"), other_held_by("m9"), "{cli:?}");
+    }
+}
+
+/// A SOURCE `[fleet] accounts_source` NAMES says whose an account is, a relative path read from
+/// the config's folder as a sync reads it. One only a network could read says nothing: no report
+/// fetches. `CONTROL`: the same sheet naming this Mac.
+#[test]
+fn a_configured_source_says_whose_an_account_is() {
+    let bed = Bed::new("other-macs-key");
+    keep_a_row_with_no_login(&bed, Cli::Claude);
+    fs::write(
+        bed.aterm_toml(),
+        "[fleet]\nmachine = \"m16\"\naccounts_source = \"sheet.csv\"\n",
+    )
+    .unwrap();
+    let sheet = bed.config.join("sheet.csv");
+    fs::write(
+        &sheet,
+        sheet_giving(Cli::Claude, "other@example.test", "m22"),
+    )
+    .unwrap();
+    assert_eq!(other_macs_of(&bed, Cli::Claude), other_held_by("m22"));
+    fs::write(
+        &sheet,
+        sheet_giving(Cli::Claude, "other@example.test", "m16"),
+    )
+    .unwrap();
+    assert!(other_macs_of(&bed, Cli::Claude).is_empty(), "CONTROL");
+    fs::write(
+        bed.aterm_toml(),
+        "[fleet]\nmachine = \"m16\"\naccounts_source = \"https://example.test/sheet.csv\"\n",
+    )
+    .unwrap();
+    assert!(other_macs_of(&bed, Cli::Claude).is_empty(), "a network's");
+}
+
+/// Sheet rows that conflict over an address say whose it is as one row would. Each names another
+/// Mac: the sheet moved it off this one ([`carry_conflicting`]), so the first it names holds it.
+/// `CONTROL`: one of them names this Mac, and the row stays this Mac's while they disagree.
+#[test]
+fn sheet_rows_that_conflict_over_an_account_say_whose_it_is() {
+    let bed = Bed::new("other-macs-conflict");
+    keep_a_row_with_no_login(&bed, Cli::Claude);
+    fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
+    let conflict = |first: &str, second: &str| {
+        bed.secret(
+            ACCOUNTS_CSV_FILE,
+            &format!(
+                "m,email,computer,,claude,Open AI,xai,kimi,google,meta,Payment,notes\n\
+                 ,other@example.test,{first},,1,,,,,,,\n\
+                 ,other@example.test,{second},,1,,,,,,,\n\
+                 ,mine@example.test,m16,,1,,,,,,,\n"
+            ),
+        );
+        other_macs_of(&bed, Cli::Claude)
+    };
+    assert_eq!(conflict("m20", "m22"), other_held_by("m20"));
+    assert!(conflict("m16", "m22").is_empty(), "CONTROL: names this Mac");
+}
+
+/// A NAME THIS MAC HAD IS STILL THIS MAC'S: its swarm roster row is `m100` with the alias `m32`,
+/// and a sheet naming `m32` does not make the account another Mac's. `CONTROL`: the sheet naming
+/// `m22` does.
+#[cfg(unix)]
+#[test]
+fn a_sheet_naming_a_name_this_mac_had_gives_it_to_this_mac() {
+    let bed = Bed::new("other-macs-alias");
+    keep_a_row_with_no_login(&bed, Cli::Claude);
+    fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m100\"\n").unwrap();
+    super::super::ai_pool::tests::seed_local_swarm_roster(&bed.home, "m100", &["m32"]);
+    let named = |computer: &str| {
+        bed.secret(
+            ACCOUNTS_CSV_FILE,
+            &sheet_giving(Cli::Claude, "other@example.test", computer),
+        );
+        other_macs_of(&bed, Cli::Claude)
+    };
+    assert_eq!(named("m22"), other_held_by("m22"), "CONTROL");
+    assert!(named("m32").is_empty(), "its own old name");
+}
+
+/// A LAB THAT COULD NOT BE READ MAY NAME THIS MAC, so what a sync would refuse to read meanwhile
+/// says nothing. `CONTROL`: the same fleet file says whose it is once the lab is not pending.
+#[test]
+fn a_pending_lab_says_nothing_of_whose_an_account_is() {
+    let bed = Bed::new("other-macs-pending");
+    keep_a_row_with_no_login(&bed, Cli::Claude);
+    fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
+    fs::write(
+        bed.config.join(FLEET_ROSTER_FILE),
+        "opt_in = \"named\"\n\n[[account]]\nlabel = \"other\"\n\
+         email = \"other@example.test\"\nmachines = [\"m22\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        other_macs_of(&bed, Cli::Claude),
+        other_held_by("m22"),
+        "CONTROL"
+    );
+    let pending = crate::harness::alab_roster::while_pending(|| other_macs_of(&bed, Cli::Claude));
+    assert!(pending.is_empty(), "{pending:?}");
+}
+
+/// A SYNC'S RECEIPT LISTS NO SIGN-IN OF ANOTHER MAC'S ACCOUNT: under a fleet discovery made, whose
+/// sync keeps the rows a roster has, its `needs_renew` leaves the row out. `CONTROL`: it lists the
+/// row while the fleet names this Mac.
+#[test]
+fn a_syncs_receipt_lists_no_sign_in_of_another_macs_account() {
+    let needs = |machine: &str| {
+        let bed = Bed::new("other-macs-receipt");
+        keep_a_row_with_no_login(&bed, Cli::Claude);
+        fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
+        fs::write(
+            bed.config.join(FLEET_ROSTER_FILE),
+            format!(
+                "opt_in = \"discovered\"\n\n[[account]]\nlabel = \"other\"\n\
+                 email = \"other@example.test\"\nmachines = [\"{machine}\"]\n"
+            ),
+        )
+        .unwrap();
+        let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_accounts_sync(&env, None, None, true, &mut out, &mut err);
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+        let doc: Value = aterm_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
+        doc["needs_renew"].as_array().unwrap().len()
+    };
+    assert_eq!(needs("m16"), 1, "CONTROL");
+    assert_eq!(needs("m22"), 0);
 }

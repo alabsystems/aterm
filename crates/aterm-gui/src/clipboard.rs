@@ -68,7 +68,21 @@ fn file_copy(path: &Path, text: &str) -> bool {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let tmp = path.with_file_name(tmp_name);
-    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    if opts
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
+        .is_ok()
+        && std::fs::rename(&tmp, path).is_ok()
+    {
         return true;
     }
     let _ = std::fs::remove_file(&tmp);

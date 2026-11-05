@@ -121,6 +121,15 @@ pub const WHY_TASK_LANDED: &str = "the task in this tab is landed";
 /// …a person's own exchange left to them: the reply is theirs to answer, and nothing is typed until the next turn ends.
 pub const WHY_TURN_YOURS: &str = "the last reply in this tab is yours to answer";
 
+/// …Claude Code's settings in the tab pick its sign-in method (`super::login::LoginPin::Method`): its `/login` would open the browser at once, over the person's work.
+pub const WHY_PINNED: &str = "Claude Code's settings make it open your browser";
+
+/// …Claude Code's settings in the tab sign in through a gateway (`super::login::LoginPin::Gateway`): its `/login` draws the gateway's form, which is the person's to fill in.
+pub const WHY_GATEWAY: &str = "Claude Code's settings sign in through a gateway";
+
+/// …aterm could not read the tab's Claude Code settings (`super::login::LoginPin::Unread`), so it cannot tell whether `/login` would open the browser at once.
+pub const WHY_PIN_UNREAD: &str = "aterm could not read whether it opens your browser";
+
 /// Every clause [`LOGIN_NOT_RUN`]'s `{why}` is filled with.
 pub const WHYS: &[&str] = &[
     WHY_RETRY_OFF,
@@ -128,6 +137,9 @@ pub const WHYS: &[&str] = &[
     WHY_NO_TASK,
     WHY_TASK_LANDED,
     WHY_TURN_YOURS,
+    WHY_PINNED,
+    WHY_GATEWAY,
+    WHY_PIN_UNREAD,
 ];
 
 /// The `/login` aterm typed reached its browser sign-in (the hand-off read on the screen), the person having picked the method at its picker (aterm never presses that pick, which brings the browser forward: `super::login::pick_method`): the sign-in in the browser is the one step left, and only the owner can take it. Only over a login no roster row names (`login_label`: none lists the login, its row has no email, or `logins` is off) and no move put the session on: aterm's sign-in ladder has no row to sign in there, and the host's discovery, asked once before `/login` is typed (`IdleHost::login_discover`: the upkeep's sync, which adopts the default login's address), named none, or named it only after the hand-off was decided (and then aterm backs out of it, `super::login::backs_out`).
@@ -302,8 +314,9 @@ pub const RENEWED_DRAFT: NoticeText = NoticeText {
 
 /// A ROSTER ROW WITH NO EMAIL IS SIGNED OUT, its recorded error: aterm's sign-in ladder
 /// (`crate::harness::sign_in_ladder`) signs a row in by its email, so no route exists for this
-/// one, and no session is moved onto it. A row with an email is never this notice's: the ladder
-/// signs it in by itself, and records each route tried where none can.
+/// one, and no session is moved onto it. A row with an email is never this notice's: the report
+/// names its sign-in, the ladder makes it where a session here runs on the row or a person asks,
+/// and records each route tried where none can.
 pub const ACCOUNT_SIGNED_OUT: NoticeText = NoticeText {
     id: "account-signed-out",
     code: "so",
@@ -313,7 +326,7 @@ pub const ACCOUNT_SIGNED_OUT: NoticeText = NoticeText {
     did: "aterm can sign in only a row with an email, and {label} has none.",
     todo: "Run aterm harness accounts",
     todo_as: None,
-    expect: "aterm switches no session to it, and signs it in once its row has an email.",
+    expect: "aterm switches no session to it until it is signed in, which needs an email on its row.",
     expect_reset: None,
     undo: None,
     whys: &[],
@@ -353,10 +366,9 @@ const LIMIT_NEXT_RESET: &str =
 
 /// What follows a step after which aterm names the one that moves the tab to
 /// another account, whichever that is: the account [`LIMIT_ROSTER`] asks to
-/// be added (a row with an email, which aterm's sign-in ladder signs in by
-/// itself, and once it is ready the tab moves, or the notice that follows
-/// names what does), or the lines of aterm.toml [`LIMIT_STAY_HELD`] asks to
-/// be set.
+/// be added (once it is signed in and ready the tab moves, or the notice
+/// that follows names what does), or the lines of aterm.toml
+/// [`LIMIT_STAY_HELD`] asks to be set.
 const LIMIT_NEXT_ANY: &str = "aterm then names the next step to move this tab to another account.";
 
 /// What follows a usage limit's notice where aterm continues nothing
@@ -425,7 +437,7 @@ pub const LIMIT_DRAFT_OWN: NoticeText = NoticeText {
     ..LIMIT_DRAFT
 };
 
-/// [`LIMIT_DRAFT`] where something stands over the prompt (`super::turn_end::Composer::Diverted`): Claude Code's open completion menu, whose Enter runs or completes its highlighted entry (`/clear` for a `/cl` left standing), not the draft (`super::turn_end::MENU_DIVERTS`), or its prompt-history search, whose Enter sends the old prompt it found and under which the prompt may hold nothing (`super::turn_end::SEARCH_DIVERTS`). Once it is closed the prompt is read again: a draft left there raises [`LIMIT_DRAFT`].
+/// [`LIMIT_DRAFT`] where something stands over the prompt (`super::turn_end::Composer::Diverted`): Claude Code's open completion menu, whose Enter runs or completes its highlighted entry (`/clear` for a `/cl` left standing), not the draft (`super::turn_end::MENU_DIVERTS`), or its prompt-history search, whose Enter sends the old prompt it found and under which the prompt may hold nothing (`super::turn_end::SEARCH_DIVERTS`), or the old prompt the search left there unedited when Esc closed it (`super::turn_end::RECALL_STANDS`). Once that goes the prompt is read again: a draft left there raises [`LIMIT_DRAFT`].
 pub const LIMIT_DRAFT_MENU: NoticeText = NoticeText {
     id: "limit-draft-menu",
     code: "lm",
@@ -435,11 +447,27 @@ pub const LIMIT_DRAFT_MENU: NoticeText = NoticeText {
     ..LIMIT_DRAFT
 };
 
+/// [`LIMIT_DRAFT`] where the draft is a command its program would run on Enter (`super::turn_end::Composer::Command`, v6 §14.17.5.8): a person's, which aterm never sends for them, so the step is theirs either way.
+pub const LIMIT_DRAFT_COMMAND: NoticeText = NoticeText {
+    id: "limit-draft-command",
+    code: "lb",
+    happened: "Claude Code hit this account's usage limit, and the tab has a command in its prompt.",
+    did: "aterm does not switch the tab to {label} while it has an unsent command.",
+    todo: COMMAND_TODO,
+    ..LIMIT_DRAFT
+};
+
+/// What a person does with a command of theirs left in the prompt that holds a notice's step
+/// ([`LIMIT_DRAFT_COMMAND`], [`RENEWED_DRAFT`] over a command): aterm sends no command for them,
+/// and their sending it moves the step on as well, which one action names no second of.
+pub const COMMAND_TODO: &str = "Clear the command from the tab's prompt.";
+
 /// The notices a draft in the prompt, or what stands over it, alone raises, whose step is its going: the point each stands at is decided again the moment the prompt reads otherwise, sent, cleared or closed.
 pub const DRAFT_HOLDS: &[&str] = &[
     LIMIT_DRAFT.id,
     LIMIT_DRAFT_OWN.id,
     LIMIT_DRAFT_MENU.id,
+    LIMIT_DRAFT_COMMAND.id,
     RENEWED_DRAFT.id,
 ];
 
@@ -590,6 +618,7 @@ pub const ALL: &[NoticeText] = &[
     LIMIT_DRAFT,
     LIMIT_DRAFT_OWN,
     LIMIT_DRAFT_MENU,
+    LIMIT_DRAFT_COMMAND,
     LIMIT_UNMADE,
     LIMIT_STAY,
     LIMIT_STAY_HELD,

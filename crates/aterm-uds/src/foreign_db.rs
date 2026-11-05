@@ -131,13 +131,6 @@ pub fn immutable_uri(db: &Path) -> String {
     uri
 }
 
-/// Open `p`'s regular final component for reading, refusing a link there.
-/// Ancestor directories may still be links.
-#[cfg(all(test, unix))]
-fn open_no_link(p: &Path) -> std::io::Result<std::fs::File> {
-    crate::regular_file::open(p).map(|(file, _)| file)
-}
-
 /// Read `from` into memory with plain reads (no lock of any kind), bounded by `max_bytes`.
 fn slurp_unlocked(from: &Path, was: &Identity, max_bytes: u64) -> Result<Vec<u8>, Unread> {
     if !was.regular || was.len > max_bytes {
@@ -252,9 +245,11 @@ pub mod witness {
             let mut open = None;
             while !reading.is_finished() && caught.is_none() {
                 if open.is_none() {
+                    use std::os::unix::fs::OpenOptionsExt as _;
                     open = std::fs::OpenOptions::new()
                         .read(true)
                         .write(true)
+                        .custom_flags(crate::atomic_file::LOCK_OPEN_FLAGS)
                         .open(file)
                         .ok();
                 }

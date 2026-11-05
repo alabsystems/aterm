@@ -9,7 +9,7 @@ use super::{binding::Binding, journal::Trust};
 use crate::{Error, Result, SecretBytes, age};
 use astream_wire::sync::{Digest, MAX_PARENTS};
 use aterm_digest::Sha256;
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use zeroize::Zeroize;
 
 const DOMAIN: &[u8] = b"aterm/commons/account-decision/1\0";
@@ -250,9 +250,13 @@ impl Record {
             return Err(Error::new("account decision exceeds its wire bounds"));
         }
         let signed = wire.len() - 64;
-        UnparsedPublicKey::new(&ED25519, trust.authority)
-            .verify(&[DOMAIN, &wire[..signed]].concat(), &wire[signed..])
-            .map_err(|_| Error::new("account decision signature failed"))?;
+        if !crate::ed25519::verifies(
+            &trust.authority,
+            &[DOMAIN, &wire[..signed]].concat(),
+            &wire[signed..],
+        ) {
+            return Err(Error::new("account decision signature failed"));
+        }
         let mut r = Reader {
             bytes: &wire[..signed],
             at: 0,

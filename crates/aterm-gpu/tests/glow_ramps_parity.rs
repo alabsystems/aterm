@@ -6,7 +6,8 @@
 //! read so by the letter guard, draw on the CPU and on the GPU arm exactly
 //! the frames their legacy stream
 //! (every row a quad, `CursorGlow::set_glow_ramps(false)`) draws, damage-cached
-//! frame after frame, with and without bloom, on a dark and a light page;
+//! frame after frame, with the bloom on and, on each frame it reads, off
+//! ([`Bloom`]), on a dark and a light page;
 //! each stream counts every lit ramp row as its quad and marks the same rows.
 //! A stream whose lights from its first ramp on all add draws its quads ahead
 //! of its ramps on the GPU, and one with an `over` light among them in order;
@@ -252,10 +253,16 @@ struct Seen {
     apart: usize,
     ordered: usize,
     shimmered: usize,
-    /// The frames whose bloom read the additive stream's ramps (its item
-    /// list), and the presents whose crown did.
+    /// The presents of the additive stream's ramps (its item list) the bloom changed: the same
+    /// frame with the bloom off ([`Bloom::Toggled`]) presented other bytes.
     bloomed: usize,
-    crowned: usize,
+    /// Whether the crown changed a present of those ramps: the same frame with the crown off
+    /// presented other bytes. A scene stops asking at the first, so this does not say on how many
+    /// it drew: one more present of every such frame cost 11.6% of this file. A dark page gives the
+    /// crown its budget; on [`LIGHT`] the additive stream carried no ramps in any scene here.
+    crowned: bool,
+    /// The frames also drawn with the bloom off ([`Bloom::Toggled`]).
+    toggled: usize,
     /// The GPU frames whose ramps rode an fx stream that also drew the
     /// frame's art, and those whose measured-cost ramps beside art drew as
     /// their quads or rode it.
@@ -277,7 +284,8 @@ impl std::ops::AddAssign for Seen {
         self.ordered += o.ordered;
         self.shimmered += o.shimmered;
         self.bloomed += o.bloomed;
-        self.crowned += o.crowned;
+        self.crowned |= o.crowned;
+        self.toggled += o.toggled;
         self.beside_art += o.beside_art;
         self.art_shut += o.art_shut;
         self.art_opened += o.art_opened;
@@ -428,13 +436,51 @@ fn art(origin: (usize, usize), (cw, ch): (usize, usize), prompt_row: usize) -> V
     ]
 }
 
-/// Run `script` in `style` (and its classic face) on `theme` with bloom
-/// `bloom` over `page`, every frame drawn by each arm's CPU and GPU from the
-/// ramps and from the legacy stream, and carrying the fx art of [`art`]
-/// beside its glow where `with_art`.
+/// How a scene holds the GPU's bloom. The switch reaches a frame only through
+/// `enable_bloom && bloom_source_live(input)` (the renderer's readback and present, on every
+/// arm), so a frame with no live source draws one thing either way, and a CPU draw or an effect
+/// pipeline reads no switch at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bloom {
+    /// On throughout, every assert judged there; and on each frame whose source is live, off for
+    /// one more pair of draws and presents on windows of their own, where the ramps must draw as
+    /// their quads. Off, the measured cost's ramps, the ramps drawn as glow instances and the
+    /// `drawn` shapes are not judged: a fault only those would show with the bloom off, and no
+    /// halo masking it, goes unseen.
+    Toggled,
+    /// Off from the first frame, every assert judged there: renderer state that builds up only
+    /// under a switch never on, which [`Self::Toggled`]'s frames cannot see. The cheapest case
+    /// holds it ([`typed_ribbon_ramps_draw_their_quads_on_every_arm`]). It cannot say the switch
+    /// kept the bloom out: `bloom_source_live_for_test` reads the frame and never the switch, and
+    /// no present here has the bloom on to compare with. [`Self::Toggled`]'s frames read that
+    /// ([`Seen::bloomed`]).
+    NeverOn,
+}
+
+/// The RGBA of `input` through `win`'s virtual present, its ease reset.
+fn presented(
+    gpu: &mut aterm_gpu::GpuRenderer,
+    win: &mut aterm_gpu::WindowGpu,
+    input: &RenderInput,
+    (arm, tick): (&str, usize),
+) -> Vec<u8> {
+    gpu.reset_glow_ease_for_test(win);
+    assert!(
+        gpu.present_virtual(win, input, false, None, None),
+        "{arm} frame {tick}: the virtual present cannot drop"
+    );
+    gpu.virtual_presented_snapshot_current(win, win.resident_input_epoch(), tick as u64 + 1)
+        .and_then(aterm_gpu::video_tap::RawCapture::convert)
+        .expect("the presented frame")
+        .rgba
+}
+
+/// Run `script` in `style` (and its classic face) on `theme`, its bloom held as `bloom` says,
+/// over `page`, every frame drawn by each arm's CPU and GPU from the ramps and from the legacy
+/// stream, and carrying the fx art of [`art`] beside its glow where `with_art`.
 fn scene(
     theme: Theme,
-    bloom: bool,
+    bloom: Bloom,
     (script, page): (Script, Page),
     style: (GlowStyle, bool),
     with_art: bool,
@@ -443,7 +489,7 @@ fn scene(
     let (cw, ch) = arms[0].1.cell_size();
     for (_, cpu, gpu) in &mut arms {
         cpu.debug_block_on_lazy_fallbacks();
-        gpu.set_bloom(bloom);
+        gpu.set_bloom(bloom == Bloom::Toggled);
         gpu.set_shimmer_phase_for_test(Some(SHIMMER_PHASE));
         gpu.set_sdr_glow_boost(CROWN);
     }
@@ -503,8 +549,20 @@ fn scene(
                     aterm_gpu::WindowGpu::new(),
                     aterm_gpu::WindowGpu::new(),
                 ],
-                // The presents of the ramps and of the legacy stream.
-                [aterm_gpu::WindowGpu::new(), aterm_gpu::WindowGpu::new()],
+                // The presents of the ramps and of the legacy stream, and the ramps' with the crown
+                // off.
+                [
+                    aterm_gpu::WindowGpu::new(),
+                    aterm_gpu::WindowGpu::new(),
+                    aterm_gpu::WindowGpu::new(),
+                ],
+                // The ramps' and the legacy stream's draws and presents with the bloom off.
+                [
+                    aterm_gpu::WindowGpu::new(),
+                    aterm_gpu::WindowGpu::new(),
+                    aterm_gpu::WindowGpu::new(),
+                    aterm_gpu::WindowGpu::new(),
+                ],
             )
         })
         .collect();
@@ -589,8 +647,9 @@ fn scene(
             seen.shimmered += 1;
         }
         let items = !r.cursor_glow_add_ramps.is_empty();
-        seen.bloomed += usize::from(bloom && items);
-        for ((arm, cpu, gpu), (cwins, gwins, pwins)) in arms.iter_mut().zip(&mut wins) {
+        let toggled =
+            bloom == Bloom::Toggled && aterm_gpu::GpuRenderer::bloom_source_live_for_test(r);
+        for ((arm, cpu, gpu), (cwins, gwins, pwins, owins)) in arms.iter_mut().zip(&mut wins) {
             let [cr, cm, cl] = cwins;
             let a = cpu.render_input_cached(cr, r).pixels().to_vec();
             let am = cpu.render_input_cached(cm, m).pixels().to_vec();
@@ -669,32 +728,49 @@ fn scene(
                 seen.opened += 1;
                 seen.art_opened += usize::from(drawn_l.fx.0 > 0);
             }
+            let mut present = None;
             if items {
                 gpu.set_ramps_fx_for_test(None);
-                let [pr, pl] = pwins;
-                let mut present = |win: &mut aterm_gpu::WindowGpu, input: &RenderInput| {
-                    gpu.reset_glow_ease_for_test(win);
-                    assert!(
-                        gpu.present_virtual(win, input, false, None, None),
-                        "{arm} frame {tick}: the virtual present cannot drop"
-                    );
-                    gpu.virtual_presented_snapshot_current(
-                        win,
-                        win.resident_input_epoch(),
-                        tick as u64 + 1,
-                    )
-                    .and_then(aterm_gpu::video_tap::RawCapture::convert)
-                    .expect("the presented frame")
-                    .rgba
-                };
-                let (a, b) = (present(pr, r), present(pl, l));
+                let [pr, pl, pc] = pwins;
+                let a = presented(gpu, pr, r, (arm, tick));
+                let b = presented(gpu, pl, l, (arm, tick));
                 assert!(
                     a == b,
                     "{arm} frame {tick}: the present's bloom and crown draw the ramps as their \
                      quads (first diff byte {:?})",
                     a.iter().zip(&b).position(|(x, y)| x != y)
                 );
-                seen.crowned += 1;
+                if !seen.crowned {
+                    gpu.set_sdr_glow_boost(0.0);
+                    seen.crowned = presented(gpu, pc, r, (arm, tick)) != a;
+                    gpu.set_sdr_glow_boost(CROWN);
+                }
+                present = Some(a);
+            }
+            if toggled {
+                gpu.set_bloom(false);
+                let [ora, orb, opa, opb] = owins;
+                gpu.set_ramps_fx_for_test(Some(RampsFx::Always));
+                let a = gpu.render_input(ora, r, None).pixels;
+                gpu.set_ramps_fx_for_test(None);
+                let b = gpu.render_input(orb, l, None).pixels;
+                assert!(
+                    a == b,
+                    "{arm} frame {tick}: with the bloom off the GPU draws the ramps as their quads"
+                );
+                if items {
+                    let a = presented(gpu, opa, r, (arm, tick));
+                    let b = presented(gpu, opb, l, (arm, tick));
+                    assert!(
+                        a == b,
+                        "{arm} frame {tick}: with the bloom off the present's crown draws the \
+                         ramps as their quads (first diff byte {:?})",
+                        a.iter().zip(&b).position(|(x, y)| x != y)
+                    );
+                    seen.bloomed += usize::from(present.as_ref().is_some_and(|on| *on != a));
+                }
+                seen.toggled += 1;
+                gpu.set_bloom(true);
             }
         }
     }
@@ -744,25 +820,21 @@ impl Case {
     }
 }
 
-/// Run every case on both pages with and without bloom, its scenes on every
+/// Run every case on both pages ([`Bloom::Toggled`]), its scenes on every
 /// core ([`aterm_spec::check::each`]; each scene builds its own arms,
 /// pipelines and windows), returning what each case's scenes showed
 /// ([`Seen`], summed), in case order. Each scene that finished prints its
 /// summary line, in scene order, before a scene's panic is raised again.
 fn holds_all(cases: &[Case]) -> Vec<Seen> {
-    let scenes: Vec<(usize, Theme, bool)> = (0..cases.len())
-        .flat_map(|c| {
-            [Theme::default(), LIGHT]
-                .into_iter()
-                .flat_map(move |theme| [false, true].map(|bloom| (c, theme, bloom)))
-        })
+    let scenes: Vec<(usize, Theme)> = (0..cases.len())
+        .flat_map(|c| [Theme::default(), LIGHT].map(|theme| (c, theme)))
         .collect();
-    let shown = aterm_spec::check::each(&scenes, |&(c, theme, bloom)| {
+    let shown = aterm_spec::check::each(&scenes, |&(c, theme)| {
         let case = &cases[c];
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             scene(
                 theme,
-                bloom,
+                Bloom::Toggled,
                 (case.script, case.page),
                 case.style,
                 case.with_art,
@@ -771,24 +843,21 @@ fn holds_all(cases: &[Case]) -> Vec<Seen> {
     });
     let mut all: Vec<Seen> = cases.iter().map(|_| Seen::default()).collect();
     let mut failed = None;
-    for (&(c, theme, bloom), seen) in scenes.iter().zip(shown) {
+    for (&(c, theme), seen) in scenes.iter().zip(shown) {
         let seen = match seen {
             Ok(seen) => seen,
             Err(panic) => {
-                eprintln!(
-                    "{} (bg {:06x}, bloom {bloom}) failed",
-                    cases[c].what, theme.bg
-                );
+                eprintln!("{} (bg {:06x}) failed", cases[c].what, theme.bg);
                 failed.get_or_insert(panic);
                 continue;
             }
         };
         eprintln!(
-            "{} (bg {:06x}, bloom {bloom}): {} frames, up to {} ramps ({} runs, {} under \
+            "{} (bg {:06x}): {} frames, up to {} ramps ({} runs, {} under \
              the measured cost) a frame, {} guarded, {} streams drawn apart, {} in order, \
-             {} shimmered, measured ramps {} times in fx, {} times as quads, {} bloomed \
-             and {} crowned from the ramps, {} drawn in fx beside art, {} \
-             measured beside art as quads, {} in fx",
+             {} shimmered, measured ramps {} times in fx, {} times as quads, {} bloomed from \
+             the ramps, crown drawn: {}, {} also drawn with the bloom off, {} drawn in fx \
+             beside art, {} measured beside art as quads, {} in fx",
             cases[c].what,
             theme.bg,
             seen.frames,
@@ -803,6 +872,7 @@ fn holds_all(cases: &[Case]) -> Vec<Seen> {
             seen.shut,
             seen.bloomed,
             seen.crowned,
+            seen.toggled,
             seen.beside_art,
             seen.art_shut,
             seen.art_opened
@@ -814,12 +884,22 @@ fn holds_all(cases: &[Case]) -> Vec<Seen> {
     }
     for (case, all) in cases.iter().zip(&all) {
         assert!(all.ramps > 0, "{}: the scenes laid ramps", case.what);
+        assert!(
+            all.toggled > 0,
+            "{}: the bloom was off for a frame whose source is live",
+            case.what
+        );
+        assert!(
+            all.crowned,
+            "{}: the crown changed the bytes of a present of the ramps",
+            case.what
+        );
     }
     all
 }
 
-/// Run `script` in `style` on both pages with and without bloom, returning
-/// what the scenes showed ([`Seen`], summed).
+/// Run `script` in `style` on both pages, returning what the scenes showed
+/// ([`Seen`], summed).
 fn holds(script: Script, what: &str, style: (GlowStyle, bool)) -> Seen {
     let case = Case {
         page: Page::Listing,
@@ -855,9 +935,20 @@ fn typed_ribbon_ramps_draw_their_quads_on_every_arm() {
     );
     assert!(
         seen.bloomed > 0,
-        "typing: the bloom read the ribbon's ramps"
+        "typing: the bloom read the ribbon's ramps, and the switch off took it out of the present"
     );
-    assert!(seen.crowned > 0, "typing: the present's crown read them");
+    let never = scene(
+        Theme::default(),
+        Bloom::NeverOn,
+        (Script::Type, Page::Listing),
+        KITTY,
+        false,
+    );
+    assert!(
+        never.ramps > 0 && never.crowned,
+        "typing with the bloom never on: the ramps were laid, and the crown changed the bytes of \
+         a present of them"
+    );
 }
 
 /// Meteors hopping along the prompt's row.
@@ -891,17 +982,20 @@ fn streak_bed_ramps_draw_their_quads_on_every_arm() {
 }
 
 /// The comet slabs' columns, a run each core: the comet, the laser's beam and
-/// bolts, the classic comet and the fire streak with its meteors, typed and
-/// leapt, the guard cutting the comet's and the laser's runs.
+/// bolts and the classic comet, typed and leapt, the guard cutting the comet's
+/// and the laser's runs.
 /// The same scenes lay the comet's and the laser's streak beds under the
 /// letters (their ink bodies on the light page), each checked for ramps.
+/// The fire streak's runs ride [`fire_heat_shimmer_reads_the_ramps_on_every_arm`]'s open page
+/// instead. Over a page of letters it is not drawn in this file: a fire-only difference between
+/// a guard-cut ramp and its quad, its heat shimmer's haze over a page of letters, and its leaps
+/// across rows of letters go unseen.
 #[test]
 fn comet_slab_runs_draw_their_quads_on_every_arm() {
     let styles = [
         ((GlowStyle::Comet, false), "comet", true),
         ((GlowStyle::Laser, false), "laser", true),
         ((GlowStyle::Classic, false), "classic", false),
-        ((GlowStyle::Fire, false), "fire", false),
     ];
     let cases: Vec<Case> = styles
         .iter()
@@ -931,6 +1025,7 @@ fn fire_heat_shimmer_reads_the_ramps_on_every_arm() {
         false,
     );
     let seen: Seen = holds_all(&cases).into_iter().sum();
+    assert!(seen.runs > 0, "fire: the slabs' cores rode runs");
     assert!(
         seen.shimmered > 0,
         "fire: the heat shimmer read frames whose glow rode ramps"
@@ -2053,24 +2148,29 @@ fn assert_byte_exact_both(
     );
 }
 
-/// The typist's ribbon (its ramps under the ink) and the comet (its slabs'
-/// additive ramps, read by the bloom and its crowns on the dark page) beside
-/// the frame's own fx art: ramps drawn in the fx stream the art opens draw
-/// the legacy stream's bytes on every arm, typed and leapt, with and without
-/// bloom, on both pages; and on Metal the measured rule draws them as the
-/// glow instances they stand for.
+/// The typist's ribbon typed (its ramps under the ink, its over light in order) and the comet
+/// leapt (its slabs' additive ramps, read by the bloom and its crowns on the dark page) beside
+/// the frame's own fx art: ramps drawn in the fx stream the art opens draw the legacy stream's
+/// bytes on every arm, on both pages; and on Metal the measured rule draws them as the glow
+/// instances they stand for. Those two reach both glow streams and both draw routes; the route
+/// reads whether the frame has fx instances and whether its ramps commute, not the style or the
+/// script. A meteor's trains and a comet's typed slabs are not drawn beside art: a fault that
+/// needs the dark trains' order and art in one frame goes unseen.
 #[test]
 fn ramps_beside_fx_art_draw_their_quads_on_every_arm() {
-    let styles = [(KITTY, "typing"), ((GlowStyle::Comet, false), "comet")];
-    let cases: Vec<Case> = styles
-        .iter()
-        .flat_map(|&(style, what)| {
-            Case::typed_and_leapt(Page::Listing, what, " beside art", style, true)
-        })
-        .collect();
-    let mut shown = holds_all(&cases).into_iter();
-    for (_, what) in styles {
-        let seen: Seen = shown.by_ref().take(TYPED_AND_LEAPT.len()).sum();
+    let beside_art = |script, what: &str, style| Case {
+        page: Page::Listing,
+        script,
+        what: format!("{what} beside art"),
+        style,
+        with_art: true,
+    };
+    let cases = [
+        beside_art(Script::Type, "typing", KITTY),
+        beside_art(Script::Hop, "comet leapt", (GlowStyle::Comet, false)),
+    ];
+    for (case, seen) in cases.iter().zip(holds_all(&cases)) {
+        let what = &case.what;
         assert!(
             seen.beside_art > 0,
             "{what}: ramps rode the fx stream beside the art"
@@ -2082,10 +2182,6 @@ fn ramps_beside_fx_art_draw_their_quads_on_every_arm() {
         assert_eq!(
             seen.art_opened, 0,
             "{what}: no arm's measured costs send ramps beside art into fx"
-        );
-        assert!(
-            seen.crowned > 0,
-            "{what}: the present read the ramps beside art"
         );
     }
 }

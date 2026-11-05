@@ -632,6 +632,102 @@ mod tests {
         assert!(!term.drain_bell(), "flag is cleared after draining");
     }
 
+    /// After the host's reset the program's frame is whole, as after a batch that ends with RIS,
+    /// so the next unfinished DEC 2026 frame's hang clock starts at its own batch, not at the frame
+    /// before the reset (whose deadline had passed, so a half-drawn frame read as whole).
+    /// NEGATIVE CONTROL: with `Terminal::reset` leaving `frame_unfinished_since`, `` host reset
+    /// true: the next frame's own clock `` fails.
+    #[test]
+    fn a_reset_restarts_the_unfinished_frames_hang_clock() {
+        use crate::terminal::{ClockReading, FRAME_HANG};
+        use std::time::Duration;
+
+        let t0 = ClockReading::now();
+        let at = |s: u64| ClockReading {
+            monotonic: t0.monotonic + Duration::from_secs(s),
+            wall_ms: None,
+        };
+        for host in [false, true] {
+            let mut term = Terminal::new(4, 20);
+            term.process_at(b"\x1b[?2026hA", at(0));
+            assert!(term.frame_unfinished_at(at(0).monotonic), "PRECONDITION");
+            if host {
+                term.reset();
+            } else {
+                term.process_at(b"\x1bc", at(1));
+            }
+            term.process_at(b"\x1b[?2026hB", at(61));
+            assert_eq!(
+                term.frame_hang_deadline(),
+                Some(at(61).monotonic + FRAME_HANG),
+                "host reset {host}: the next frame's own clock"
+            );
+            assert!(
+                term.frame_unfinished_at(at(61).monotonic),
+                "host reset {host}"
+            );
+        }
+    }
+
+    /// A full reset (RIS, or the host's `Terminal::reset`) keeps what the program sent before it
+    /// that a polling host has not drained yet: the bell, and every app event (OSC 7's cwd, the
+    /// OSC 133 marks with the rows they were made on, D's exit), as `clear` keeps them.
+    /// NEGATIVE CONTROLS: with `TransientState::reset` clearing `bell_pending` again, `` the BEL
+    /// before the RIS still drains `` fails; with it clearing `osc_events`, or keeping only the
+    /// events that name no row, `` RIS: the events before it `` fails.
+    #[test]
+    fn a_reset_keeps_what_the_program_sent_before_it() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x07\x1bc");
+        assert_eq!(term.bell_total(), 1, "the BEL counted");
+        assert!(term.drain_bell(), "the BEL before the RIS still drains");
+        assert!(!term.drain_bell(), "and only once");
+        let mut across = Terminal::new(24, 80);
+        across.process(b"\x07");
+        across.process(b"\x1bc");
+        assert!(
+            across.drain_bell(),
+            "an undrained BEL outlives a RIS in a later batch"
+        );
+        let mut host = Terminal::new(24, 80);
+        host.process(b"\x07");
+        host.reset();
+        assert!(
+            host.drain_bell(),
+            "an undrained BEL outlives the host's reset"
+        );
+
+        let sent: &[u8] = b"\x1b]7;file:///tmp\x07\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07\x1b]133;D;0\x07";
+        let drain =
+            |term: &mut Terminal| std::iter::from_fn(|| term.take_osc_event()).collect::<Vec<_>>();
+        let mut unreset = Terminal::new(24, 80);
+        unreset.process(sent);
+        let all = drain(&mut unreset);
+        let has = |code: u32, part: &str| {
+            all.iter()
+                .any(|(c, payload)| *c == code && payload.contains(part))
+        };
+        assert!(
+            has(7, "/tmp") && has(133, ";row=") && has(133, "D;"),
+            "PRECONDITION: a cwd, a mark that names a row and an exit: {all:?}"
+        );
+        for (case, erase) in [
+            ("RIS", Some(&b"\x1bc"[..])),
+            ("clear", Some(&b"\x1b[H\x1b[2J\x1b[3J"[..])),
+            ("the host's reset", None),
+        ] {
+            let mut term = Terminal::new(24, 80);
+            match erase {
+                Some(bytes) => term.process(&[sent, bytes].concat()),
+                None => {
+                    term.process(sent);
+                    term.reset();
+                }
+            }
+            assert_eq!(drain(&mut term), all, "{case}: the events before it");
+        }
+    }
+
     #[test]
     fn bels_ring_at_most_once_per_hundred_ms() {
         use std::sync::Arc;

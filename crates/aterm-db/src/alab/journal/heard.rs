@@ -171,7 +171,9 @@ fn canonical_day(name: &str) -> Option<u64> {
 /// Remove days older than [`HEARD_DAYS`], then the oldest while the archive passes
 /// [`HEARD_MAX`].
 fn prune(dir: &Path, now: u64) -> io::Result<()> {
+    let today = now / DAY;
     let mut days: Vec<(u64, String, u64)> = Vec::new();
+    let mut total: u64 = 0;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -181,7 +183,23 @@ fn prune(dir: &Path, now: u64) -> io::Result<()> {
         let Some(day) = canonical_day(name_str) else {
             continue;
         };
-        let meta = match std::fs::symlink_metadata(entry.path()) {
+        let is_file = match entry.file_type() {
+            Ok(kind) => kind.is_file(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !is_file {
+            continue;
+        }
+        if day.saturating_add(HEARD_DAYS) < today {
+            match std::fs::remove_file(dir.join(name_str)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            continue;
+        }
+        let meta = match entry.metadata() {
             Ok(meta) => meta,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
@@ -189,13 +207,16 @@ fn prune(dir: &Path, now: u64) -> io::Result<()> {
         if !meta.is_file() {
             continue;
         }
-        days.push((day, name_str.to_owned(), meta.len()));
+        let len = meta.len();
+        total = total.saturating_add(len);
+        days.push((day, name_str.to_owned(), len));
+    }
+    if total <= HEARD_MAX {
+        return Ok(());
     }
     days.sort_unstable();
-    let today = now / DAY;
-    let mut total: u64 = days.iter().map(|(_, _, len)| len).sum();
-    for (day, file_name, len) in days {
-        if day.saturating_add(HEARD_DAYS) >= today && total <= HEARD_MAX {
+    for (_, file_name, len) in days {
+        if total <= HEARD_MAX {
             break;
         }
         match std::fs::remove_file(dir.join(file_name)) {

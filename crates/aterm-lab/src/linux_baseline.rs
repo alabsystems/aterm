@@ -2269,8 +2269,8 @@ impl Session<'_> {
         }
         self.stop_unit(&proxy.name);
         let wire = self.sh(&["cat".into(), log]);
-        let _ = std::fs::write(
-            self.results.join(format!(
+        let _ = crate::util::write_fresh(
+            &self.results.join(format!(
                 "{}-{}-xtrace.txt",
                 self.arch.name(),
                 self.screen.name()
@@ -3082,8 +3082,8 @@ impl Session<'_> {
             done?;
             self.gui.stop();
             let wire = self.sh(&["cat".into(), log.clone()]);
-            let _ = std::fs::write(
-                self.results.join(format!(
+            let _ = crate::util::write_fresh(
+                &self.results.join(format!(
                     "{}-{}-wayland-debug.txt",
                     self.arch.name(),
                     self.screen.name()
@@ -3140,8 +3140,8 @@ impl Session<'_> {
 
     fn keep_wire(&self, log: &str, what: &str) -> String {
         let wire = self.sh(&["cat".into(), log.into()]).text;
-        let _ = std::fs::write(
-            self.results.join(format!(
+        let _ = crate::util::write_fresh(
+            &self.results.join(format!(
                 "{}-{}-{what}.txt",
                 self.arch.name(),
                 self.screen.name()
@@ -3439,8 +3439,8 @@ impl Session<'_> {
             "shell-wire".into(),
             shell_log.clone(),
         ]);
-        let _ = std::fs::write(
-            self.results.join(format!(
+        let _ = crate::util::write_fresh(
+            &self.results.join(format!(
                 "{}-{}-ime-shell-wayland-debug.txt",
                 self.arch.name(),
                 self.screen.name()
@@ -3943,8 +3943,8 @@ impl Session<'_> {
         seat.stop(self);
         self.gui.stop();
         let wire = self.sh(&["cat".into(), log]);
-        let _ = std::fs::write(
-            self.results.join(format!(
+        let _ = crate::util::write_fresh(
+            &self.results.join(format!(
                 "{}-{}-wayland-debug-frame.txt",
                 self.arch.name(),
                 self.screen.name()
@@ -4599,7 +4599,7 @@ impl Baseline {
     ) -> proof::Row {
         let file = file_name(arch, screen);
         let fresh = rec.render();
-        let _ = std::fs::write(self.results.join(&file), &fresh);
+        let _ = crate::util::write_fresh(&self.results.join(&file), &fresh);
         let secs = started.elapsed().as_secs_f64();
         let target = self.committed.join(&file);
         let old = crate::util::read_regular_text(&target)
@@ -4613,7 +4613,7 @@ impl Baseline {
         };
         if self.record {
             let wrote = std::fs::create_dir_all(&self.committed)
-                .and_then(|()| std::fs::write(&target, &fresh));
+                .and_then(|()| crate::util::write_fresh(&target, &fresh));
             let moved = match &old {
                 Some(Ok(o)) => {
                     let d = compare(o, rec);
@@ -4774,7 +4774,7 @@ pub fn cmd_baseline(args: &[String]) -> Res {
     );
     print!("\n{report}");
     let path = results.join("report.txt");
-    if let Err(e) = std::fs::write(&path, &report) {
+    if let Err(e) = crate::util::write_fresh(&path, &report) {
         eprintln!("aterm-lab: linux: {}: {e}", path.display());
     } else {
         println!("report and fresh recordings: {}", results.display());

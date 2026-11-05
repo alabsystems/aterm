@@ -664,3 +664,188 @@ fn an_agent_whose_directory_is_not_known_has_its_project_reported() {
         }
     }
 }
+
+/// WHAT THE AGENT'S SETTINGS MAKE OF `/login` (the post-landing review, 2026-11-02): a
+/// `forceLoginMethod` that names a method in any document of the chain, the managed file, the
+/// project's, the user's under its own `CLAUDE_CONFIG_DIR` or the server-managed copy beside it,
+/// pins the sign-in (`/login` opens the browser at once); a gateway is a pin of its own; a
+/// document there that cannot be read, a managed preference domain included, leaves aterm unable
+/// to tell; a chain with none of them draws the picker. Negative control: [`login_pin`] reading
+/// no source (main's guard, which read no pin) answers the picker for every case.
+#[test]
+fn the_chains_pinned_sign_in_method_is_read_wherever_claude_code_reads_it() {
+    use super::super::login::LoginPin;
+    let s = ScratchDir::new("claude-settings", "login-pin");
+    let claude = s.join("claude");
+    let proj = s.join("proj");
+    let managed = s.join("managed");
+    let prefs = s.join("prefs");
+    std::fs::create_dir_all(&proj).expect("proj");
+    std::fs::create_dir_all(&prefs).expect("prefs");
+    let worker = WorkerEnv::hermetic(None)
+        .with(&format!("CLAUDE_CONFIG_DIR={}", claude.display()))
+        .with("USER=me");
+    let pin = || login_pin_under(&worker, &proj, Some(&managed), &prefs, None);
+    assert_eq!(pin(), LoginPin::Picker, "nothing written yet");
+    let user = claude.join("settings.json");
+    write(&user, r#"{"model":"opus","forceLoginMethod":""}"#);
+    assert_eq!(pin(), LoginPin::Picker, "an empty method pins nothing");
+    for (at, text, want) in [
+        (
+            &user,
+            r#"{"forceLoginMethod":"claudeai"}"#,
+            LoginPin::Method,
+        ),
+        (&user, r#"{"forceLoginMethod":"console"}"#, LoginPin::Method),
+        (
+            &user,
+            r#"{"forceLoginMethod":"gateway"}"#,
+            LoginPin::Gateway,
+        ),
+        (
+            &user,
+            r#"{"forceLoginGatewayUrl":"https://gw.example.test"}"#,
+            LoginPin::Gateway,
+        ),
+        (
+            &proj.join(".claude/settings.local.json"),
+            r#"{"forceLoginMethod":"console"}"#,
+            LoginPin::Method,
+        ),
+        (
+            &managed.join("managed-settings.json"),
+            r#"{"forceLoginMethod":"claudeai","forceLoginOrgUUID":"x"}"#,
+            LoginPin::Method,
+        ),
+        (
+            &claude.join("remote-settings.json"),
+            r#"{"settings":{"forceLoginMethod":"claudeai"}}"#,
+            LoginPin::Method,
+        ),
+        (&user, "{not json", LoginPin::Unread),
+    ] {
+        write(at, text);
+        assert_eq!(pin(), want, "{} = {text}", at.display());
+        std::fs::remove_file(at).expect("rm");
+        assert_eq!(pin(), LoginPin::Picker, "{} gone", at.display());
+    }
+    write(&prefs.join("me").join(MANAGED_PREFERENCES_FILE), "plist");
+    assert_eq!(
+        pin(),
+        LoginPin::Unread,
+        "a managed preference domain is unread"
+    );
+    write(&user, r#"{"forceLoginMethod":"claudeai"}"#);
+    assert_eq!(pin(), LoginPin::Method, "a method read beats one unread");
+    assert_eq!(login_pin(&[]), LoginPin::Picker);
+}
+
+/// A PIN THE STATIC DOCUMENTS CANNOT SHOW IS READ ON THE SAFE SIDE (the post-landing review,
+/// 2026-11-02): a managed document that names a policy helper (whose output, which may pin the
+/// method, aterm never runs) reads unread unless a static document pins a method; a managed folder
+/// or a server-managed copy the agent's environment names in place of Claude Code's own is read
+/// too (2.1.316 compiles both overrides out; a build that honours them pins there); and an agent
+/// started on a cloud session (`--cloud`, `--remote`, `--teleport`, `--attach-serve`), whose
+/// `/login` is claude.ai's alone, is pinned whatever its settings say. CONTROL: none of them
+/// draws the picker; a flag past `--` is no flag. Negative controls: [`login_pin`] without the
+/// helper keys, [`login_pin_under`] without its environment's paths, or without the cloud flags,
+/// reads [`LoginPin::Picker`] where Claude Code's `/login` opens the browser at once.
+#[test]
+fn a_pin_the_static_documents_cannot_show_is_read_on_the_safe_side() {
+    use super::super::login::LoginPin;
+    let s = ScratchDir::new("claude-settings", "login-pin-hidden");
+    let claude = s.join("claude");
+    let proj = s.join("proj");
+    let managed = s.join("managed");
+    let prefs = s.join("prefs");
+    let other = s.join("other-managed");
+    let copy = s.join("copy.json");
+    std::fs::create_dir_all(&proj).expect("proj");
+    std::fs::create_dir_all(&prefs).expect("prefs");
+    let base = WorkerEnv::hermetic(None)
+        .with(&format!("CLAUDE_CONFIG_DIR={}", claude.display()))
+        .with("USER=me");
+    let pin = |worker: &WorkerEnv| login_pin_under(worker, &proj, Some(&managed), &prefs, None);
+    assert_eq!(pin(&base), LoginPin::Picker, "CONTROL: nothing written");
+    let file = managed.join("managed-settings.json");
+    for helper in [
+        r#"{"policyHelper":{"path":"/usr/local/bin/corp-claude-policy"}}"#,
+        r#"{"policyHelpers":{"macos":{"path":"/usr/local/bin/corp-claude-policy"}}}"#,
+    ] {
+        write(&file, helper);
+        assert_eq!(pin(&base), LoginPin::Unread, "{helper}");
+    }
+    write(&file, r#"{"policyHelper":null}"#);
+    assert_eq!(pin(&base), LoginPin::Picker, "CONTROL: a helper unset");
+    write(
+        &file,
+        r#"{"policyHelper":{"path":"/x"},"forceLoginMethod":"console"}"#,
+    );
+    assert_eq!(
+        pin(&base),
+        LoginPin::Method,
+        "a static method beside a helper"
+    );
+    std::fs::remove_file(&file).expect("rm");
+    let named = base.clone().with(&format!(
+        "CLAUDE_CODE_MANAGED_SETTINGS_PATH={}",
+        other.display()
+    ));
+    assert_eq!(
+        pin(&named),
+        LoginPin::Picker,
+        "CONTROL: the named folder empty"
+    );
+    write(
+        &other.join("managed-settings.d").join("10-login.json"),
+        r#"{"forceLoginMethod":"claudeai"}"#,
+    );
+    assert_eq!(
+        pin(&named),
+        LoginPin::Method,
+        "a drop-in of the named folder"
+    );
+    assert_eq!(
+        pin(&base),
+        LoginPin::Picker,
+        "CONTROL: a folder nothing names"
+    );
+    let remote = base.clone().with(&format!(
+        "CLAUDE_CODE_REMOTE_SETTINGS_PATH={}",
+        copy.display()
+    ));
+    assert_eq!(pin(&remote), LoginPin::Picker, "CONTROL: no copy there");
+    write(&copy, r#"{"settings":{"forceLoginMethod":"claudeai"}}"#);
+    assert_eq!(
+        pin(&remote),
+        LoginPin::Method,
+        "the named server-managed copy"
+    );
+    let relative = base
+        .clone()
+        .with("CLAUDE_CODE_REMOTE_SETTINGS_PATH=copy.json");
+    assert_eq!(pin(&relative), LoginPin::Unread, "a path it cannot place");
+    for argv in [
+        &["claude", "--cloud", "fix the build"][..],
+        &["claude", "--remote=abc"],
+        &["claude", "--teleport"],
+        &["claude", "--attach-serve", "s1"],
+    ] {
+        assert_eq!(
+            pin(&base.clone().launched_with(argv)),
+            LoginPin::Method,
+            "{argv:?}"
+        );
+    }
+    for argv in [
+        &["claude", "--", "--cloud"][..],
+        &["claude", "--remote-control"],
+        &["claude", "--resume"],
+    ] {
+        assert_eq!(
+            pin(&base.clone().launched_with(argv)),
+            LoginPin::Picker,
+            "CONTROL: {argv:?}"
+        );
+    }
+}

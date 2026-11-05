@@ -6,6 +6,14 @@
 use super::*;
 use crate::harness::disk::tests::Tmp;
 
+#[test]
+fn writing_the_reserve_ticks_for_each_block() {
+    let tmp = Tmp::new("reserve-ticks");
+    let before = aterm_uds::progress::ticks_here();
+    write_blocks(&tmp.path().join("reserve"), 3 << 20).expect("written");
+    assert_eq!(aterm_uds::progress::ticks_here() - before, 3);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn a_lifetime_pass_guard_refuses_changed_file_privacy_and_read_write_access() {

@@ -25,7 +25,7 @@ pub struct Run {
     pub env_remove: Vec<String>,
     /// Variables set for it.
     pub env: Vec<(String, OsString)>,
-    /// A hang detector: the child (and its process group) is killed past it.
+    /// A hang detector: the runner owns termination and cleanup past it.
     pub deadline: Option<Duration>,
 }
 
@@ -110,9 +110,12 @@ impl Ran {
 /// Why a child produced no [`Ran`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunError {
-    /// It could not be started.
+    /// Preparation or spawning failed before an owned child was returned.
     Spawn(String),
-    /// It did not finish within its deadline (killed and reaped).
+    /// A child was started but no usable result was established. It may have acted;
+    /// this cause alone does not establish that cleanup or reaping completed.
+    AfterStart(String),
+    /// The collection deadline expired; cleanup follows the runner's contract.
     TimedOut,
 }
 
@@ -120,7 +123,31 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn(e) => write!(f, "could not start: {e}"),
+            Self::AfterStart(e) => write!(f, "failed after start: {e}"),
             Self::TimedOut => write!(f, "did not finish within {} s", HANG.as_secs()),
+        }
+    }
+}
+
+impl RunError {
+    fn from_collector(error: aterm_uds::deadline::RunError) -> Self {
+        use aterm_uds::deadline::RunError;
+        match error {
+            error @ RunError::Spawn(_) => Self::Spawn(error.to_string()),
+            error @ (RunError::Capture(_) | RunError::Wait(_)) => {
+                Self::AfterStart(error.to_string())
+            }
+            RunError::TimedOut => Self::TimedOut,
+        }
+    }
+
+    fn from_complete_collector(error: aterm_uds::deadline::CompleteOutputError) -> Self {
+        use aterm_uds::deadline::CompleteOutputError;
+        match error {
+            CompleteOutputError::Run(error) => Self::from_collector(error),
+            error @ (CompleteOutputError::StdoutRead(_)
+            | CompleteOutputError::StdoutTooLarge { .. }
+            | CompleteOutputError::StdoutIncomplete) => Self::AfterStart(error.to_string()),
         }
     }
 }
@@ -129,8 +156,29 @@ impl std::fmt::Display for RunError {
 pub trait Tools {
     /// Run a child to completion ([`RunError`]).
     /// # Errors
-    /// [`RunError`] when it could not start or outran its deadline.
+    /// [`RunError`] when preparation, spawning or post-start collection failed, or its
+    /// deadline expired.
     fn run(&self, run: &Run) -> Result<Ran, RunError>;
+
+    /// Run a metadata query whose stdout must be complete within `limit`, not a retained tail.
+    /// Injected runners return complete `Ran` data; the native runner enforces EOF and size.
+    /// Limits above the native hard maximum refuse before dispatch.
+    /// # Errors
+    /// Child refusal, deadline, incomplete stdout or the complete-output bound.
+    fn run_complete(&self, run: &Run, limit: usize) -> Result<Ran, RunError> {
+        if limit > aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES {
+            return Err(RunError::Spawn(
+                "complete stdout limit exceeds hard bound".into(),
+            ));
+        }
+        let output = self.run(run)?;
+        if output.stdout.len() > limit {
+            return Err(RunError::AfterStart(
+                "complete stdout exceeds its bound".into(),
+            ));
+        }
+        Ok(output)
+    }
 
     /// Drop symbols from one object in place.
     /// # Errors
@@ -214,38 +262,65 @@ impl HostTools {
     }
 }
 
+fn host_command(run: &Run) -> aterm_uds::spawnfd::Command {
+    let mut cmd = aterm_uds::spawnfd::command(&run.program);
+    cmd.args(&run.args);
+    if run.clear_env {
+        cmd.env_clear();
+    }
+    for k in &run.env_remove {
+        cmd.env_remove(k);
+    }
+    for (k, v) in &run.env {
+        cmd.env(k, v);
+    }
+    if let Some(dir) = &run.cwd {
+        cmd.current_dir(dir);
+    }
+    cmd
+}
+
 impl Tools for HostTools {
     fn run(&self, run: &Run) -> Result<Ran, RunError> {
-        let mut cmd = aterm_uds::spawnfd::command(&run.program);
-        cmd.args(&run.args);
-        if run.clear_env {
-            cmd.env_clear();
-        }
-        for k in &run.env_remove {
-            cmd.env_remove(k);
-        }
-        for (k, v) in &run.env {
-            cmd.env(k, v);
-        }
-        if let Some(dir) = &run.cwd {
-            cmd.current_dir(dir);
-        }
+        let mut cmd = host_command(run);
         let out = match run.deadline {
             Some(limit) => {
                 let now = Instant::now();
                 let until = now
                     .checked_add(limit)
                     .unwrap_or_else(|| now + Duration::from_secs(365 * 86_400));
-                aterm_uds::deadline::output_until(&mut cmd, until).map_err(|e| match e {
-                    aterm_uds::deadline::RunError::TimedOut => RunError::TimedOut,
-                    other => RunError::Spawn(other.to_string()),
-                })?
+                aterm_uds::deadline::output_until(&mut cmd, until)
+                    .map_err(RunError::from_collector)?
             }
-            None => cmd
-                .stdin(aterm_uds::spawnfd::Stdio::null())
-                .output()
-                .map_err(|e| RunError::Spawn(e.to_string()))?,
+            None => {
+                // Match Command::output's stdio and collection, keeping the owned-child
+                // boundary visible: a capture or wait failure cannot mean no dispatch.
+                let child = cmd
+                    .stdin(aterm_uds::spawnfd::Stdio::null())
+                    .stdout(aterm_uds::spawnfd::Stdio::piped())
+                    .stderr(aterm_uds::spawnfd::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| RunError::Spawn(e.to_string()))?;
+                child
+                    .wait_with_output()
+                    .map_err(|e| RunError::AfterStart(e.to_string()))?
+            }
         };
+        Ok(Ran {
+            code: out.status.code(),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
+    }
+
+    fn run_complete(&self, run: &Run, limit: usize) -> Result<Ran, RunError> {
+        let mut cmd = host_command(run);
+        let out = aterm_uds::deadline::output_until_complete_stdout_with_limit(
+            &mut cmd,
+            Instant::now() + run.deadline.unwrap_or(HANG),
+            limit,
+        )
+        .map_err(RunError::from_complete_collector)?;
         Ok(Ran {
             code: out.status.code(),
             stdout: out.stdout,
@@ -291,8 +366,8 @@ impl Tools for HostTools {
             .tempdir()
             .map_err(|e| e.to_string())?;
         let (ca, cb) = (tmp.path().join("a"), tmp.path().join("b"));
-        std::fs::copy(a, &ca).map_err(|e| e.to_string())?;
-        std::fs::copy(b, &cb).map_err(|e| e.to_string())?;
+        crate::identity::copy_regular_file(a, &ca).map_err(|e| e.to_string())?;
+        crate::identity::copy_regular_file(b, &cb).map_err(|e| e.to_string())?;
         for c in [&ca, &cb] {
             self.checked(
                 &Run::new(
@@ -334,5 +409,69 @@ impl Tools for HostTools {
 
     fn compressor(&self) -> &dyn super::tarwrite::Compressor {
         &super::tarwrite::Zstd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RunError;
+    use aterm_uds::deadline::{CompleteOutputError, RunError as CollectorError};
+
+    #[test]
+    fn collector_failures_keep_dispatch_phase_timeout_and_original_cause() {
+        let cause = || std::io::Error::other("publisher-collector-marker");
+        for (error, started) in [
+            (CollectorError::Spawn(cause()), false),
+            (CollectorError::Capture(cause()), true),
+            (CollectorError::Wait(cause()), true),
+        ] {
+            let why = error.to_string();
+            let mapped = RunError::from_collector(error);
+            assert_eq!(
+                mapped,
+                if started {
+                    RunError::AfterStart(why)
+                } else {
+                    RunError::Spawn(why)
+                }
+            );
+        }
+        assert_eq!(
+            RunError::from_collector(CollectorError::TimedOut),
+            RunError::TimedOut
+        );
+    }
+
+    #[test]
+    fn complete_collection_failure_keeps_dispatch_phase_and_timeout() {
+        let error = CompleteOutputError::Run(CollectorError::Spawn(std::io::Error::other(
+            "publisher-spawn-marker",
+        )));
+        let why = error.to_string();
+        assert_eq!(
+            RunError::from_complete_collector(error),
+            RunError::Spawn(why)
+        );
+        assert_eq!(
+            RunError::from_complete_collector(CompleteOutputError::Run(CollectorError::TimedOut)),
+            RunError::TimedOut
+        );
+        for error in [
+            CompleteOutputError::Run(CollectorError::Capture(std::io::Error::other(
+                "publisher-capture-marker",
+            ))),
+            CompleteOutputError::Run(CollectorError::Wait(std::io::Error::other(
+                "publisher-wait-marker",
+            ))),
+            CompleteOutputError::StdoutRead(std::io::Error::other("publisher-read-marker")),
+            CompleteOutputError::StdoutTooLarge { limit: 3 },
+            CompleteOutputError::StdoutIncomplete,
+        ] {
+            let why = error.to_string();
+            assert_eq!(
+                RunError::from_complete_collector(error),
+                RunError::AfterStart(why)
+            );
+        }
     }
 }

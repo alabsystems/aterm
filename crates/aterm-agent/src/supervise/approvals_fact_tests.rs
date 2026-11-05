@@ -205,18 +205,6 @@ fn a_fact_line_keeps_a_carry_ended() {
 }
 
 #[test]
-fn a_fact_line_keeps_a_relaunch_waiting() {
-    let waits = row_at(
-        1_000,
-        RULE_MODEL_FALLBACK,
-        Outcome::Waiting,
-        "",
-        &relaunch_waits_reason(5),
-    );
-    invisible(&[waits], |b| relaunch_waiting_in(b, Some(SID)));
-}
-
-#[test]
 fn a_fact_line_keeps_a_done_check_owed() {
     let check = row_at(
         1_000,

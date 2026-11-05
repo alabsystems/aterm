@@ -33,6 +33,9 @@ const MAX_PROOFS: usize = MAX_RECORDS * 2 + aterm_secrets::commons::constraints:
 const BATCH: usize = 16;
 /// A full batch may continue before the ordinary table scan resumes.
 const TABLE_BURST: usize = 4;
+/// How many times a round reads its local state before state that keeps moving is its answer
+/// ([`Round::local`]).
+const LOCAL_READS: usize = 4;
 const PROBE: &[u8] = b"ACTP3";
 const READY: &[u8] = b"ACTA3";
 
@@ -49,8 +52,14 @@ enum ProbeMismatch {
 impl ProbeMismatch {
     fn error(self) -> Error {
         match self {
-            Self::Malformed => Error::new("invalid application repair greeting"),
-            Self::Protocol => Error::new("unsupported application repair protocol greeting"),
+            Self::Malformed => Error::repair(
+                "invalid application repair greeting",
+                aterm_types::network_state::RepairCause::Decode,
+            ),
+            Self::Protocol => Error::repair(
+                "unsupported application repair protocol greeting",
+                aterm_types::network_state::RepairCause::NeedsUpdate,
+            ),
             Self::History {
                 head_matches,
                 basis_matches,
@@ -369,6 +378,8 @@ pub struct InventoryDeferral {
     pub inventory: &'static str,
     /// The local store's refusal, without application values or ciphertext.
     pub local_error: Option<String>,
+    /// Sanitized category of the local refusal; a peer's unavailable inventory has no cause.
+    pub local_cause: Option<aterm_types::network_state::RepairCause>,
     /// Local negative evidence must finish moving into the recovery store first.
     pub retaining_primary_conflicts: bool,
     /// The peer sent an unavailable inventory; its reason is not on the wire.
@@ -379,6 +390,8 @@ pub struct InventoryDeferral {
 /// ciphertext is retained here, and the reason is limited to 128 characters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchDeferral {
+    /// Closed local failure category, independent of the bounded diagnostic string.
+    pub cause: aterm_types::network_state::RepairCause,
     /// The received batch: `operations` or `conflicts`.
     pub batch: &'static str,
     /// Local storage opening, ingestion, or receipt validation.
@@ -387,8 +400,9 @@ pub struct BatchDeferral {
     pub reason: String,
 }
 impl BatchDeferral {
-    fn new(batch: &'static str, stage: &'static str, reason: impl std::fmt::Display) -> Self {
+    fn new(batch: &'static str, stage: &'static str, reason: Error) -> Self {
         Self {
+            cause: reason.repair_cause(),
             batch,
             stage,
             reason: reason.to_string().chars().take(128).collect(),
@@ -1053,8 +1067,43 @@ impl Round<'_> {
         })
     }
 
-    fn local<T>(&self, peer: Actor, run: impl FnOnce(&Session<'_>) -> Result<T>) -> Result<T> {
+    /// One admitted read of this Mac's state. A store's observer refuses a witness that advances
+    /// while it reads ([`Error::snapshot_changed`]). Another of this Mac's rounds ingesting into
+    /// that table does just that, as does one ingesting into the catalog, which a Commons round's
+    /// admission reads once it has selected an application table outside the ring window
+    /// ([`Self::check_table_policy`]). A fresh admission and read is the answer, where giving up
+    /// would cost both peers this round. [`LOCAL_READS`] bounds the reads: no sleep separates
+    /// them, though each still waits for its own admission.
+    fn local<T>(&self, peer: Actor, mut run: impl FnMut(&Session<'_>) -> Result<T>) -> Result<T> {
+        for _ in 1..LOCAL_READS {
+            match self.admit(peer, false, &mut run) {
+                Err(error) if error.is_snapshot_changed() => {}
+                result => return result,
+            }
+        }
         self.admit(peer, false, run)
+    }
+
+    /// A [`Self::local`] read's result where the round sends an inventory next: a table that kept
+    /// advancing through every read is deferred with `refusal`, as any other store this side
+    /// cannot read now, and the round goes on, because an inventory can say it is unavailable and
+    /// the peer defers on that too. That covers these reads' own admissions, whose read of a
+    /// catalog that keeps advancing refuses the same way. No other read defers like this. A batch
+    /// cannot say so ([`Self::send_batch`]), and a bare admission, such as the authorize that runs
+    /// next, refuses what it could not authorize, so each of those still costs both peers the round.
+    fn table_read<T>(
+        result: Result<Option<T>>,
+        refusal: &mut Option<String>,
+        cause: &mut Option<aterm_types::network_state::RepairCause>,
+    ) -> Result<Option<T>> {
+        match result {
+            Err(error) if error.is_snapshot_changed() => {
+                *refusal = Some(error.to_string());
+                *cause = Some(error.repair_cause());
+                Ok(None)
+            }
+            result => result,
+        }
     }
 
     fn local_write<T>(
@@ -1331,12 +1380,12 @@ impl Round<'_> {
                 if chosen.is_empty() {
                     None
                 } else {
-                    Some(
-                        chosen
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| Error::new("invalid selected table"))?,
-                    )
+                    Some(chosen.as_slice().try_into().map_err(|_| {
+                        Error::repair(
+                            "invalid selected table",
+                            aterm_types::network_state::RepairCause::Decode,
+                        )
+                    })?)
                 }
             }
         };
@@ -1365,7 +1414,10 @@ impl Round<'_> {
             return Ok(());
         };
         if !common.contains(&id) {
-            return Err(Error::new("peer selected an unprovisioned table"));
+            return Err(Error::repair(
+                "peer selected an unprovisioned table",
+                aterm_types::network_state::RepairCause::TableUndeclared,
+            ));
         }
         // A peer chooses inbound tables. Preserve our outgoing scan so its
         // restarted scan cannot keep rewinding ours to the first table.
@@ -1507,7 +1559,12 @@ impl Round<'_> {
                     )?;
                     keys.push((*source, Some(key)));
                 }
-                _ => return Err(Error::new("invalid historical key response")),
+                _ => {
+                    return Err(Error::repair(
+                        "invalid historical key response",
+                        aterm_types::network_state::RepairCause::Decode,
+                    ));
+                }
             }
         }
         // One bounded, fully buffered batch. Validate current membership after
@@ -1536,14 +1593,17 @@ impl Round<'_> {
         peer: Actor,
         id: Digest,
         refusal: &mut Option<String>,
+        cause: &mut Option<aterm_types::network_state::RepairCause>,
     ) -> Result<Option<Inventory>> {
-        self.local(peer, |session| {
+        let read = self.local(peer, |session| {
             let sampled_at = Instant::now();
             let observed_at_ms = aterm_time::unix_millis().unwrap_or(0);
             let store = match self.store(session, id) {
                 Ok(store) => store,
+                Err(error) if error.is_snapshot_changed() => return Err(error),
                 Err(error) => {
                     *refusal = Some(error.to_string());
+                    *cause = Some(error.repair_cause());
                     return Ok(None);
                 }
             };
@@ -1561,7 +1621,8 @@ impl Round<'_> {
                 known,
                 offered: store.replication_inventory(session)?.copied().collect(),
             }))
-        })
+        });
+        Self::table_read(read, refusal, cause)
     }
 
     fn matching_inventory(
@@ -1574,7 +1635,10 @@ impl Round<'_> {
         if report.local_known != report.peer_known || report.deferred != 0 {
             return None;
         }
-        let after = self.inventory(peer, id, &mut None).ok()??.observation;
+        let after = self
+            .inventory(peer, id, &mut None, &mut None)
+            .ok()??
+            .observation;
         MatchingInventory::from_observations(report, before, after)
     }
     #[cfg_attr(
@@ -1594,23 +1658,31 @@ impl Round<'_> {
         repair: &mut Repair,
         report: &mut Report,
     ) -> Result<bool> {
-        let ready = self.retain_primary(peer, id)?;
-        report.recovery |= !ready;
         let mut local_error = None;
+        let mut local_cause = None;
+        let ready = Self::table_read(
+            self.retain_primary(peer, id).map(Some),
+            &mut local_error,
+            &mut local_cause,
+        )?;
+        report.recovery |= ready == Some(false);
         let local = self.local(peer, |session| {
-            if !ready {
+            if ready != Some(true) {
                 return Ok(None);
             }
             let store = match self.store(session, id) {
                 Ok(store) => store,
+                Err(error) if error.is_snapshot_changed() => return Err(error),
                 Err(error) => {
                     local_error = Some(error.to_string());
+                    local_cause = Some(error.repair_cause());
                     return Ok(None);
                 }
             };
             report.recovery |= store.is_recovery();
             store.proof_inventory(session).map(Some)
-        })?;
+        });
+        let local = Self::table_read(local, &mut local_error, &mut local_cause)?;
         let remote = exchange_inventory(stream, side, local.as_ref(), MAX_PROOFS, || {
             self.local(peer, |_| Ok(()))
         })?;
@@ -1619,7 +1691,8 @@ impl Round<'_> {
             repair.deferral = Some(InventoryDeferral {
                 inventory: "conflicts",
                 local_error,
-                retaining_primary_conflicts: !ready,
+                local_cause,
+                retaining_primary_conflicts: ready == Some(false),
                 peer_unavailable,
             });
             report.deferred += 1;
@@ -1704,8 +1777,9 @@ impl Round<'_> {
         }
         // Reopen after negative evidence is durably applied in both directions.
         let mut local_error = None;
+        let mut local_cause = None;
         let local = self
-            .inventory(peer, id, &mut local_error)
+            .inventory(peer, id, &mut local_error, &mut local_cause)
             .map_err(|error| at("operation inventory", error))?;
         let remote = exchange_inventory(
             stream,
@@ -1720,6 +1794,7 @@ impl Round<'_> {
             repair.deferral = Some(InventoryDeferral {
                 inventory: "operations",
                 local_error,
+                local_cause,
                 retaining_primary_conflicts: false,
                 peer_unavailable,
             });
@@ -1777,11 +1852,17 @@ impl Round<'_> {
         report.caught_up = whole && report.sent - sent == ids.len();
         Ok(())
     }
+    /// Send a batch this side prepares and read its receipts. A table that keeps advancing through
+    /// every read of the batch fails the round here rather than deferring: the wire has no
+    /// unavailable batch, and an empty one tells the peer this side holds nothing more it lacks.
+    /// The peer's round would then read as leaving nothing to fetch
+    /// ([`crate::runtime::RepairRound::drained_table`]), and as exchanged with nothing to bring
+    /// to the wait before a first import (`empty_view_wait`).
     fn send_batch(
         &self,
         stream: &mut (impl Read + Write),
         peer: Actor,
-        prepare: impl FnOnce(&Session<'_>) -> Result<Vec<Vec<u8>>>,
+        prepare: impl Fn(&Session<'_>) -> Result<Vec<Vec<u8>>>,
         kind: BatchKind,
         report: &mut Report,
     ) -> Result<()> {
@@ -1803,7 +1884,10 @@ impl Round<'_> {
             let mut receipt = [0; 33];
             stream.read_exact(&mut receipt)?;
             if receipt[..32] != Sha256::digest(wire) || receipt[32] > 1 {
-                return Err(Error::new("invalid table receipt"));
+                return Err(Error::repair(
+                    "invalid table receipt",
+                    aterm_types::network_state::RepairCause::Decode,
+                ));
             }
             if receipt[32] == 1 {
                 match kind {
@@ -1827,7 +1911,10 @@ impl Round<'_> {
     ) -> Result<()> {
         let n = control::read_u32(stream)? as usize;
         if n > BATCH {
-            return Err(Error::new("table batch exceeds its bound"));
+            return Err(Error::repair(
+                "table batch exceeds its bound",
+                aterm_types::network_state::RepairCause::Quota,
+            ));
         }
         let mut wires = Vec::with_capacity(n);
         let mut ids = BTreeSet::new();
@@ -1877,7 +1964,10 @@ impl Round<'_> {
                                 refusal = Some(BatchDeferral::new(
                                     batch,
                                     "receipt",
-                                    "table receipt did not name the received operation",
+                                    Error::repair(
+                                        "table receipt did not name the received operation",
+                                        aterm_types::network_state::RepairCause::Decode,
+                                    ),
                                 ));
                             }
                             false
@@ -2055,7 +2145,10 @@ fn receive_inventory<const N: usize>(
     match ready[0] {
         0 => Ok(None),
         1 => Ok(Some(receive_ids(stream, maximum)?)),
-        _ => Err(Error::new("invalid table inventory state")),
+        _ => Err(Error::repair(
+            "invalid table inventory state",
+            aterm_types::network_state::RepairCause::Decode,
+        )),
     }
 }
 

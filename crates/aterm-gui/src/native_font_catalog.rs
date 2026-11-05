@@ -670,7 +670,7 @@ mod tests {
             .tempdir()
             .unwrap();
         let path = dir.path().join("aterm.toml");
-        std::fs::write(&path, text).unwrap();
+        crate::test_scratch::write_config(&path, text);
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .unwrap();

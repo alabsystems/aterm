@@ -185,7 +185,7 @@ pub(crate) fn lay(run: &mut Run, repo: &Path) -> Result<(), String> {
     write_offset(run, 0)?;
     if hardened(&codesign_dv(Path::new(&run.claude_bin))?) {
         // until `up` starts it, the clone goes with the lab at once
-        let _ = fs::write(run.run.join(crate::lab::CLOCK_UNSTARTED), "");
+        let _ = crate::util::atomic_write(&run.run.join(crate::lab::CLOCK_UNSTARTED), b"");
         crate::sys::put(&l.claude, 0o755, &PutSrc::File(Path::new(&run.claude_bin)))
             .map_err(|e| format!("cannot clone Claude Code into {}: {e}", l.claude.display()))?;
         let signed = aterm_uds::spawnfd::command("/usr/bin/codesign")

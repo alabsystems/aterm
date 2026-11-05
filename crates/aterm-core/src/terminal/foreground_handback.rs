@@ -202,6 +202,12 @@ impl Terminal {
         if bytes.is_empty() {
             return None;
         }
+        if reverted.contains(&"color-scheme-reports") {
+            // The `?2031l` is the host's, not the program's: a push the program was owed (one the
+            // reply gate refused) is latched quietly, so the settle at that `?2031l` sends the
+            // shell nothing.
+            self.modes.color_scheme = self.color.reported_scheme().0;
+        }
         self.process_at(&bytes, clock);
         if owned {
             let rows = self.grid.rows();

@@ -500,7 +500,7 @@ pub fn route_decode(bytes: &[u8]) -> Result<Decision> {
     Ok(decision)
 }
 
-/// A git run's canonical bytes: `git {op} {owner}/{repo}` (`clone`, `fetch`, `fetch-main`,
+/// A git run's canonical bytes: `git {op} {owner}/{repo}` (`clone`, `clone-mirror`, `fetch`, `fetch-main`,
 /// `ls-remote`, `push-delete`), then the op's own words, one per line (`depth {n}`,
 /// `into {ref}`, `ref {name}`, `expect {sha}`). Never the URL (the tape's header names the endpoints), the environment,
 /// the grant's nonce or a path.
@@ -508,6 +508,7 @@ pub fn route_decode(bytes: &[u8]) -> Result<Decision> {
 pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
     let slug = &run.slug;
     let text = match &run.op {
+        GitOp::Mirror { .. } => format!("git clone-mirror {slug}"),
         GitOp::Clone { depth, .. } => match depth {
             Some(depth) => format!("git clone {slug}\ndepth {depth}"),
             None => format!("git clone {slug}"),

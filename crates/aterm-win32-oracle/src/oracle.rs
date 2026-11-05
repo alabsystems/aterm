@@ -1,6 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //! Owned compiler/inspection probes.
+//!
+//! STOCK EXCEPTION: [`cargo`] runs the absolute stock Cargo and rustc the driver resolved,
+//! because Trust ships no Windows std. It compiles and reads import tables: no Windows
+//! program runs.
 use crate::model::Model;
 use crate::plants::PLANTS;
 use crate::{Result, TRIPLES, Tools, read, run_status};
@@ -343,7 +347,21 @@ pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
         if kind.is_dir() {
             copy_tree(&e.path(), &to.join(e.file_name()))?
         } else if kind.is_file() {
-            std::fs::copy(e.path(), to.join(e.file_name())).map_err(|e| e.to_string())?;
+            let (mut reader, meta) =
+                aterm_uds::regular_file::open(&e.path()).map_err(|e| e.to_string())?;
+            let dst = to.join(e.file_name());
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+            }
+            let mut writer = opts.open(&dst).map_err(|e| e.to_string())?;
+            std::io::copy(&mut reader, &mut writer).map_err(|e| e.to_string())?;
+            writer
+                .set_permissions(meta.permissions())
+                .map_err(|e| e.to_string())?;
         } else {
             return Err(format!(
                 "refusing nonregular oracle input {}",
@@ -371,7 +389,7 @@ pub fn plant(krate: &Path, p: &Plant) -> Result<()> {
             path.display()
         ));
     }
-    std::fs::write(path, text.replacen(p.old, p.new, 1)).map_err(|e| e.to_string())
+    crate::write_fresh(&path, text.replacen(p.old, p.new, 1)).map_err(|e| e.to_string())
 }
 pub fn gate(root: &Path, model: &Model, tools: &Tools, target: &Path) -> Result<u8> {
     let mut runner = System;

@@ -236,7 +236,7 @@ fn rustup_proxy(target: &Path, canonical: &Path) -> Option<PathBuf> {
     })
 }
 
-fn open_regular_nonblocking(path: &Path) -> Option<std::fs::File> {
+fn open_regular_nonblocking(path: &Path) -> Option<(std::fs::File, std::fs::Metadata)> {
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -248,7 +248,8 @@ fn open_regular_nonblocking(path: &Path) -> Option<std::fs::File> {
     };
     #[cfg(not(unix))]
     let file = std::fs::File::open(path).ok()?;
-    file.metadata().ok()?.is_file().then_some(file)
+    let meta = file.metadata().ok()?;
+    meta.is_file().then_some((file, meta))
 }
 
 fn files_equal_bounded(a: &Path, b: &Path, expected_len: u64) -> bool {
@@ -257,10 +258,14 @@ fn files_equal_bounded(a: &Path, b: &Path, expected_len: u64) -> bool {
     if expected_len > MAX_PROXY_BYTES {
         return false;
     }
-    let (Some(mut fa), Some(mut fb)) = (open_regular_nonblocking(a), open_regular_nonblocking(b))
+    let (Some((mut fa, ma)), Some((mut fb, mb))) =
+        (open_regular_nonblocking(a), open_regular_nonblocking(b))
     else {
         return false;
     };
+    if ma.len() != expected_len || mb.len() != expected_len {
+        return false;
+    }
     let (mut ba, mut bb) = ([0u8; 8192], [0u8; 8192]);
     let mut total = 0u64;
     loop {
@@ -555,21 +560,26 @@ impl CacheKey {
         if bin.file_name()? != "bin" {
             return None;
         }
-        let head = crate::metadata_io::read_head(real, 8).ok()?;
+        let (head, real_meta) = crate::metadata_io::read_head_with_meta(real, 8).ok()?;
         if !(crate::macho::is_macho_header(&head) || head.starts_with(b"\x7fELF")) {
             return None;
         }
         let path = real.to_str()?.to_string();
-        let mut stamp = stamp_of(&std::fs::metadata(real).ok()?)?;
+        let mut stamp = stamp_of(&real_meta)?;
         let mut drivers: Vec<(String, String)> = std::fs::read_dir(bin.parent()?.join("lib"))
             .ok()?
             .flatten()
             .filter_map(|entry| {
-                let name = entry.file_name().to_str()?.to_string();
-                if !name.starts_with("librustc_driver") {
-                    return None;
-                }
-                Some((name, stamp_of(&std::fs::metadata(entry.path()).ok()?)?))
+                let file_name = entry.file_name();
+                let name = file_name
+                    .to_str()
+                    .filter(|name| name.starts_with("librustc_driver"))?
+                    .to_string();
+                let meta = match entry.metadata().ok()? {
+                    meta if meta.is_symlink() => std::fs::metadata(entry.path()).ok()?,
+                    meta => meta,
+                };
+                Some((name, stamp_of(&meta)?))
             })
             .collect();
         if drivers.is_empty() {

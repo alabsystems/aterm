@@ -397,6 +397,7 @@ fn publish_chunked_pass(
                 policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
                 grant_chunks: true,
                 grant_empty: false,
+                grant_desk: false,
             },
             crate::running_build_number(),
             "the test candidate",
@@ -561,6 +562,7 @@ fn park_with_no_live_session(
                     policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
                     grant_chunks: false,
                     grant_empty,
+                    grant_desk: false,
                 },
                 crate::running_build_number(),
                 "the test candidate",
@@ -611,6 +613,59 @@ fn a_sessionless_attempt_parks_only_for_a_launched_reader_of_its_grant() {
             expected,
             "{label}: (stood down, handed over)"
         );
+    }
+}
+
+/// The park's own capture carries a lone Workers list for a target this build knows rebuilds it:
+/// a same-image successor, or an artifact whose read passed declaring desk1. For any other it
+/// carries none, so the worker's guard on the wire never has to refuse what the park just made.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_park_carries_a_lone_workers_list_only_for_a_target_that_declares_it() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    for (label, declared, carried) in [
+        ("same image", None, true),
+        ("desk1 declared", Some(true), true),
+        ("desk1 undeclared", Some(false), false),
+    ] {
+        let mut app = crate::app_workers_tests::app_with_a_lone_list();
+        assert!(app.handoff_live_sessions().is_empty(), "PRECONDITION");
+        let (mut record, transferred) = prelaunched(31, ApplyMode::Immediate, FreezeSeed::Default);
+        record.sessionless = true;
+        if let Some(grant_desk) = declared {
+            let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+                7,
+                "",
+                &"ab".repeat(32),
+            );
+            super::PreverifyPublisher::for_attempt(&app.handoff_preverified, Some(&ticket))
+                .expect("an attempt names its artifact")
+                .publish_pass(
+                    &aterm_update::HandoffCandidateFacts {
+                        policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
+                        grant_chunks: false,
+                        grant_empty: true,
+                        grant_desk,
+                    },
+                    crate::running_build_number(),
+                    "the test candidate",
+                );
+            record.apply_attempt = Some(ticket);
+            record.same_image = None;
+        }
+        app.update_handoff_prelaunch = Some(record);
+        app.on_update_handoff_awaiting_park(31, Some(4242), None);
+        let job = transferred
+            .try_recv()
+            .expect("the park handed its capture over");
+        assert_eq!(
+            job.capture.layout.carries_lone_workers_list(),
+            carried,
+            "{label}"
+        );
+        drop(job);
+        app.pending_update_handoff = None;
+        app.update_handoff_prelaunch = None;
     }
 }
 

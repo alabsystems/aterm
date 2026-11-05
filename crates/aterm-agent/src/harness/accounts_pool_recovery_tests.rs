@@ -5,7 +5,7 @@ use super::*;
 use crate::harness::accounts_overlay::model_provider;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-fn pending_renewal(world: &World, cli: Cli, staging: &Path, create: bool) {
+pub(super) fn pending_renewal(world: &World, cli: Cli, staging: &Path, create: bool) {
     let store = world.seat().store(cli);
     let path = world.cfg.join(cli.accounts().roster_file);
     let witness = store.state_witness_file();

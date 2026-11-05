@@ -20,16 +20,53 @@ mod input_unix;
 mod input_windows;
 
 mod complete;
+#[cfg(unix)]
+mod custody;
 pub use complete::{
-    CompleteOutputError, output_until_complete_stdout, output_until_complete_stdout_from,
-    output_until_complete_stdout_from_observed, output_until_complete_stdout_observed,
+    CompleteOutputError, MAX_COMPLETE_STDOUT_BYTES, output_until_complete_stdout,
+    output_until_complete_stdout_from, output_until_complete_stdout_from_observed,
+    output_until_complete_stdout_observed, output_until_complete_stdout_with_limit,
 };
+#[cfg(unix)]
+pub use complete::{RetainedOutputError, output_until_complete_stdout_retained};
+#[cfg(unix)]
+pub use custody::{ChildCompletion, ChildCustody};
 
 /// Maximum duration macOS may hold the first exec of a new binary in `syspolicyd`.
 pub const FIRST_EXEC_HANG: Duration = Duration::from_secs(10 * 60);
 
 /// Marker filename written by a fresh copy immediately after exec.
 pub const RAN: &str = "ran";
+
+/// Writes the [`RAN`] marker inside `home` only into a regular file (`O_NOFOLLOW | O_NONBLOCK |
+/// O_CLOEXEC` and mode `0o600` on Unix).
+/// # Errors
+/// [`RAN`] inside `home` could not be opened or is not a regular file.
+pub fn try_mark_ran(home: &std::path::Path) -> std::io::Result<()> {
+    let ran_path = home.join(RAN);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&ran_path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", ran_path.display()),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&ran_path, b"")
+    }
+}
 
 /// Marker filename written by [`stamp_exec`] before exec with the awake-clock reading.
 pub const EXEC_STAMP: &str = "exec";
@@ -64,7 +101,7 @@ pub fn try_stamp_exec(home: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let mut file = options.open(&path)?;
     let metadata = file.metadata()?;
@@ -368,14 +405,22 @@ impl<T> std::fmt::Debug for Pending<T> {
     }
 }
 
-/// Reason [`output_until`] failed to produce output.
+/// Why a collector could not produce output, independently of child completion.
+///
+/// `Spawn` is a refusal before an owned Child was returned. `Capture` and `Wait` occur after
+/// process creation, so child effects may already exist. Cleanup follows each collector's
+/// contract: the legacy single-child collector can wait without a reap bound, while bounded
+/// collectors can hand an unreaped child to the reaper. These causes are not reap receipts.
 #[derive(Debug)]
 pub enum RunError {
-    /// Child process or stream reader thread could not be spawned.
+    /// Command setup or process creation failed before an owned Child was returned.
     Spawn(io::Error),
-    /// Waiting for the child failed; the child was killed and reaped.
+    /// A Child was created, but preparing its capture or resuming it failed. Dispatch may
+    /// already have occurred; this is not a no-child spawn refusal.
+    Capture(io::Error),
+    /// Waiting for the created child failed; cleanup is collector-specific.
     Wait(io::Error),
-    /// Child did not finish before the deadline and was killed and reaped.
+    /// The collection deadline or stop condition expired; this alone proves no reap.
     TimedOut,
 }
 
@@ -383,6 +428,10 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn(e) => write!(f, "could not start: {e}"),
+            Self::Capture(e) => write!(
+                f,
+                "capture could not be prepared after process creation: {e}"
+            ),
             Self::Wait(e) => write!(f, "could not be waited for: {e}"),
             Self::TimedOut => f.write_str("did not finish in time"),
         }
@@ -508,7 +557,8 @@ pub fn output_with_input_until(
 /// `deadline`.
 ///
 /// # Errors
-/// Returns [`RunError::Spawn`], [`RunError::Wait`], or [`RunError::TimedOut`].
+/// Returns [`RunError::Spawn`] before a Child is returned, [`RunError::Capture`] after
+/// process creation when capture setup fails, [`RunError::Wait`], or [`RunError::TimedOut`].
 pub fn output_until(cmd: &mut Command, deadline: Instant) -> Result<Output, RunError> {
     output_until_from(cmd, Stdio::null(), deadline)
 }
@@ -756,7 +806,7 @@ fn drained_by<C: Waited>(
         (Ok(stdout), Ok(stderr)) => (stdout, stderr),
         (Err(e), _) | (_, Err(e)) => {
             child.end();
-            return Err(RunError::Spawn(e));
+            return Err(RunError::Capture(e));
         }
     };
     let mut exit = ExitWait::on_pid(child.pid());
@@ -985,7 +1035,7 @@ impl Held {
         if let Err(error) = child.resume() {
             children::kill_group(&mut child);
             reap_within(&mut child, None, saturating_after(Instant::now(), reap));
-            return Err(RunError::Spawn(error));
+            return Err(RunError::Capture(error));
         }
         children::output_of_until(child, deadline, reap)
     }
@@ -1020,6 +1070,31 @@ impl Drain {
     }
 }
 
+#[cfg(test)]
+type DrainStartFailure = Box<dyn FnOnce() -> io::Error>;
+
+#[cfg(test)]
+thread_local! {
+    static DRAIN_START_FAILURE: std::cell::RefCell<Option<DrainStartFailure>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct DrainStartFailureGuard(Option<DrainStartFailure>);
+
+#[cfg(test)]
+impl Drop for DrainStartFailureGuard {
+    fn drop(&mut self) {
+        DRAIN_START_FAILURE.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+#[cfg(test)]
+fn fail_next_drain_start(failure: impl FnOnce() -> io::Error + 'static) -> DrainStartFailureGuard {
+    let previous = DRAIN_START_FAILURE.with(|slot| slot.borrow_mut().replace(Box::new(failure)));
+    DrainStartFailureGuard(previous)
+}
+
 /// Read `stream` to its end on a thread of its own, keeping the tail; `pipe` is its
 /// [`PipeEnd`].
 #[cfg(not(target_arch = "wasm32"))]
@@ -1028,6 +1103,10 @@ fn drain(
     pipe: Option<PipeEnd>,
     which: &str,
 ) -> io::Result<Drain> {
+    #[cfg(test)]
+    if let Some(failure) = DRAIN_START_FAILURE.with(|slot| slot.borrow_mut().take()) {
+        return Err(failure());
+    }
     let tail = Arc::new(Mutex::new(Vec::new()));
     let theirs = Arc::clone(&tail);
     let (tx, ended) = mpsc::sync_channel(1);
@@ -1832,6 +1911,64 @@ mod tests {
             ),
             Err(RunError::Spawn(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_capture_failure_after_a_child_effect_is_not_a_spawn_refusal() {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let touch = super::stand_in(std::path::Path::new("/usr/bin/touch"));
+        let marker = world.path().join("child-ran");
+        let observed = marker.clone();
+        let witnessed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let callback_witness = std::rc::Rc::clone(&witnessed);
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let callback_calls = std::rc::Rc::clone(&calls);
+        let failure = super::fail_next_drain_start(move || {
+            callback_calls.set(callback_calls.get() + 1);
+            let until = Instant::now() + HANG;
+            while !observed.is_file() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            callback_witness.set(observed.is_file());
+            std::io::Error::other("injected legacy reader-start failure")
+        });
+
+        let mut missing = crate::spawnfd::command(world.path().join("no-executable"));
+        assert!(matches!(
+            output_until(&mut missing, Instant::now() + HANG),
+            Err(RunError::Spawn(_))
+        ));
+        assert_eq!(
+            calls.get(),
+            0,
+            "a no-child refusal never initializes a reader"
+        );
+
+        let mut child = crate::spawnfd::command(&touch);
+        child.arg(&marker);
+        let result = output_until(&mut child, Instant::now() + HANG);
+        assert!(
+            witnessed.get(),
+            "the real child must demonstrate its file effect before injection"
+        );
+        assert!(marker.is_file());
+        assert!(matches!(result, Err(RunError::Capture(error))
+            if error.kind() == std::io::ErrorKind::Other
+                && error.to_string() == "injected legacy reader-start failure"));
+        assert_eq!(calls.get(), 1);
+
+        let following = world.path().join("following-child-ran");
+        let mut next = crate::spawnfd::command(&touch);
+        next.arg(&following);
+        assert!(
+            output_until(&mut next, Instant::now() + HANG)
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(following.is_file(), "the injection was consumed once");
+        drop(failure);
     }
 
     /// A shell running `script` with `args` as `$0`, `$1`, ….

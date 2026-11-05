@@ -1464,10 +1464,17 @@ impl KeeperCore {
                 || (*c < conn
                     && me.is_some_and(|me| peers.get(c).is_some_and(|p| (p.pid, p.birth) == me)))
         };
-        let allowed = self.records.get(&rdev).is_some_and(|rec| {
-            rec.claimants.iter().any(mine) || rec.state == RecordState::Offered { to: conn }
-        });
-        if !allowed {
+        // A master the keeper holds no record of is told apart from one it keeps for another
+        // claim: a window retiring an old journal reads NoSuchRecord as that journal gone with its
+        // record, and NotClaimant as one the keeper may still offer.
+        let Some(rec) = self.records.get(&rdev) else {
+            return vec![Out::Refused {
+                conn,
+                code: RefuseCode::NoSuchRecord,
+                rdev,
+            }];
+        };
+        if !(rec.claimants.iter().any(mine) || rec.state == RecordState::Offered { to: conn }) {
             return vec![Out::Refused {
                 conn,
                 code: RefuseCode::NotClaimant,
@@ -2822,6 +2829,15 @@ mod tests {
             "no claim left"
         );
         assert_eq!(k.release(2, 10), vec![Out::Close(10)]);
+        assert_eq!(
+            k.release(2, 10),
+            vec![Out::Refused {
+                conn: 2,
+                code: RefuseCode::NoSuchRecord,
+                rdev: 10
+            }],
+            "a master with no record is told apart from one held for another claim"
+        );
     }
 
     #[test]

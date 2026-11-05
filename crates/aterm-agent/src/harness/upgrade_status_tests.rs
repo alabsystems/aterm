@@ -9,10 +9,37 @@ use std::path::PathBuf;
 const NOW: u64 = 1_790_311_076;
 const TAB: &str = "s-b5cf2faabac5ce5127bd";
 
+#[test]
+fn a_retired_unissued_row_stays_quiet_and_reports_its_hold() {
+    for phase in [
+        Phase::Exiting { at_s: 1 },
+        Phase::Relaunched { at_s: 1 },
+        Phase::Done,
+    ] {
+        let st = St {
+            native_retired_unissued: true,
+            phase,
+            ..St::default()
+        };
+        let row = Row::of("held", &st, NOW);
+        assert_eq!(row.attention(NOW), Attention::Quiet);
+        assert!(!row.moving(NOW));
+        assert_eq!(row.stall(NOW), None);
+        assert!(row.column(NOW).starts_with("held/"));
+        assert_eq!(
+            row.to_json(NOW)
+                .get("native_retired_unissued")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+}
+
 fn opts(dir: &std::path::Path) -> Opts {
     Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: Some(dir.join("no.sock").to_string_lossy().into_owned()),
         token: None,
         only_sid: None,

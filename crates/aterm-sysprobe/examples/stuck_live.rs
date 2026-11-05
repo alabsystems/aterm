@@ -254,6 +254,7 @@ impl Host {
                     aterm: true,
                     wait: p.start_wait?,
                     tab: None,
+                    job: None,
                     started_ms: None,
                 })
             })
@@ -468,6 +469,7 @@ fn job_proc(p: &ProcFacts) -> JobProc {
             logical_writes: c.logical_writes,
             runnable_ns: c.runnable_ns,
             pageins: c.pageins,
+            peak_footprint: c.peak_footprint,
         }),
         threads: p.threads.as_ref().map(|ts| {
             ts.iter()

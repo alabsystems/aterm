@@ -144,8 +144,11 @@ impl Accounts {
     #[must_use]
     pub fn parse_passwd(text: &[u8]) -> Option<Vec<Account>> {
         entries(text)
-            .map(|fields| {
-                let [name, _, uid, gid, ..] = fields.as_slice() else {
+            .map(|line| {
+                let mut fields = line?.split(|b| *b == b':');
+                let (Some(name), Some(_), Some(uid), Some(gid)) =
+                    (fields.next(), fields.next(), fields.next(), fields.next())
+                else {
                     return None;
                 };
                 Some(Account {
@@ -161,8 +164,11 @@ impl Accounts {
     #[must_use]
     pub fn parse_group(text: &[u8]) -> Option<Vec<Group>> {
         entries(text)
-            .map(|fields| {
-                let [name, _, gid, members, ..] = fields.as_slice() else {
+            .map(|line| {
+                let mut fields = line?.split(|b| *b == b':');
+                let (Some(name), Some(_), Some(gid), Some(members)) =
+                    (fields.next(), fields.next(), fields.next(), fields.next())
+                else {
                     return None;
                 };
                 Some(Group {
@@ -281,17 +287,11 @@ fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io:
     Ok(bytes)
 }
 
-fn entries(text: &[u8]) -> impl Iterator<Item = Vec<&[u8]>> {
+fn entries(text: &[u8]) -> impl Iterator<Item = Option<&[u8]>> {
     text.split(|b| *b == b'\n')
-        .map(|line| line.trim_ascii_start())
+        .map(<[u8]>::trim_ascii_start)
         .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
-        .map(|line| {
-            if line.starts_with(b"+") || line.starts_with(b"-") {
-                Vec::new()
-            } else {
-                line.split(|b| *b == b':').collect()
-            }
-        })
+        .map(|line| (!line.starts_with(b"+") && !line.starts_with(b"-")).then_some(line))
 }
 
 fn number(field: &[u8]) -> Option<u32> {

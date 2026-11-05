@@ -526,7 +526,7 @@ impl Journal {
         if let JournalEnd::Fault { at, why } = &end {
             return Err(self.fault(*at, why));
         }
-        Ok(views(&records).into_iter().find(|v| &v.intent.id == id))
+        Ok(view_of(&records, id))
     }
 
     /// Append `Retracted` for an open intent.
@@ -545,8 +545,7 @@ impl Journal {
         let at_secs = self.fx.wall_secs()?;
         let mut moot = false;
         let retracted = self.append_with(|records, _| {
-            let view = views(records).into_iter().find(|v| &v.intent.id == id);
-            let Some(view) = view else {
+            let Some(view) = view_of(records, id) else {
                 moot = true;
                 return Err(Error::new(Kind::NotFound, self.not_in(id)).with_repo(self.repo()));
             };
@@ -1062,11 +1061,10 @@ impl IntentStore for Journal {
     fn settle(&self, id: &IntentId, outcome: &Settled) -> Result<()> {
         let outcome = bounded(outcome);
         self.append_with(|records, _| {
-            self.holds(records, id)?;
-            let settled = views(records)
-                .into_iter()
-                .any(|v| &v.intent.id == id && v.settled.is_some());
-            if settled {
+            let Some(view) = view_of(records, id) else {
+                return Err(Error::usage(self.not_in(id)).with_repo(self.repo()));
+            };
+            if view.settled.is_some() {
                 return Err(Error::usage(format!(
                     "intent {id} is settled already: agh settles an intent once"
                 ))
@@ -1116,10 +1114,13 @@ impl IntentStore for Journal {
         if let JournalEnd::Fault { at, why } = &end {
             return Err(self.fault(*at, why));
         }
-        Ok(views(&records)
-            .into_iter()
-            .rev()
-            .find(|v| v.intent.op == op && v.intent.key == key))
+        let Some(id) = records.iter().rev().find_map(|(_, r)| match r {
+            JournalRecord::Intent(i) if i.op == op && i.key == key => Some(&i.id),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        Ok(view_of(&records, id))
     }
 }
 
@@ -1246,16 +1247,13 @@ fn may_use_reserve(record: &JournalRecord, records: &[(u64, JournalRecord)]) -> 
         } => (intent, true),
         JournalRecord::Intent(_) | JournalRecord::Observed { found: None, .. } => return false,
     };
-    views(records)
-        .into_iter()
-        .find(|v| &v.intent.id == intent)
-        .is_some_and(|v| {
-            if while_open {
-                v.open
-            } else {
-                v.settled.is_none()
-            }
-        })
+    view_of(records, intent).is_some_and(|v| {
+        if while_open {
+            v.open
+        } else {
+            v.settled.is_none()
+        }
+    })
 }
 
 /// `settle` cuts an `Unknown`'s why to `WHY_MAX` (512) bytes on a character boundary and
@@ -1384,6 +1382,48 @@ pub(crate) fn views(records: &[(u64, JournalRecord)]) -> Vec<IntentView> {
     views
 }
 
+/// The view of `id` from one pass over `records`, without cloning unrelated intents.
+pub(crate) fn view_of(records: &[(u64, JournalRecord)], id: &IntentId) -> Option<IntentView> {
+    let mut view: Option<IntentView> = None;
+    for (_, record) in records {
+        match record {
+            JournalRecord::Intent(intent) if &intent.id == id && view.is_none() => {
+                view = Some(IntentView {
+                    intent: (**intent).clone(),
+                    settled: None,
+                    observed: Vec::new(),
+                    retracted: None,
+                    open: true,
+                });
+            }
+            JournalRecord::Settled { intent, outcome } if intent == id => {
+                if let Some(view) = &mut view {
+                    view.settled.get_or_insert_with(|| outcome.clone());
+                }
+            }
+            JournalRecord::Observed {
+                intent,
+                found,
+                at_secs,
+            } if intent == id => {
+                if let Some(view) = &mut view {
+                    view.observed.push((*found, *at_secs));
+                }
+            }
+            JournalRecord::Retracted { intent, at_secs } if intent == id => {
+                if let Some(view) = &mut view {
+                    view.retracted.get_or_insert(*at_secs);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(view) = &mut view {
+        view.open = closed_state(view).is_none();
+    }
+    view
+}
+
 /// An intent and what the journal recorded of it since.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1431,26 +1471,25 @@ pub fn journals(dirs: &Dirs) -> Result<Vec<(Slug, PathBuf)>> {
     let mut found = Vec::new();
     for owner in owners {
         let owner = owner.map_err(|e| listed(&root, &e))?;
-        let is_dir = owner.file_type().is_ok_and(|t| t.is_dir());
         let name = owner.file_name();
-        let Some(owner_name) = name
-            .to_str()
-            .filter(|n| is_dir && crate::config::is_owner_name(n))
-        else {
+        let Some(owner_name) = name.to_str().filter(|n| crate::config::is_owner_name(n)) else {
             continue;
         };
+        if !owner.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
         let dir = owner.path();
         let files = std::fs::read_dir(&dir).map_err(|e| listed(&dir, &e))?;
         for file in files {
             let file = file.map_err(|e| listed(&dir, &e))?;
-            if !file.file_type().is_ok_and(|t| t.is_file()) {
-                continue;
-            }
             let name = file.file_name();
             let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".steps")) else {
                 continue;
             };
-            if let Ok(slug) = Slug::parse(&format!("{owner_name}/{stem}")) {
+            let Ok(slug) = Slug::parse(&format!("{owner_name}/{stem}")) else {
+                continue;
+            };
+            if file.file_type().is_ok_and(|t| t.is_file()) {
                 found.push((slug, file.path()));
             }
         }

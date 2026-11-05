@@ -24,7 +24,7 @@ use super::{
 };
 use crate::{Error, Result, fsx};
 use astream_wire::sync::Actor;
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::collections::BTreeMap;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -113,9 +113,11 @@ pub fn reported(wire: &[u8], network: [u8; 16], actor: &Actor) -> Result<Version
     }
     let word = |at: usize| u32::from_le_bytes(wire[at..at + 4].try_into().unwrap());
     let version = Version(word(4), word(8), word(12));
-    UnparsedPublicKey::new(&ED25519, &actor[..32])
-        .verify(&signed(network, actor, version), &wire[16..])
-        .map_err(|_| Error::new("Commons version report signature did not verify"))?;
+    if !crate::ed25519::verifies(&actor[..32], &signed(network, actor, version), &wire[16..]) {
+        return Err(Error::new(
+            "Commons version report signature did not verify",
+        ));
+    }
     Ok(version)
 }
 

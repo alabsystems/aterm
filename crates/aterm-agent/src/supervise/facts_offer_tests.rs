@@ -39,6 +39,7 @@ fn reading(as_of_ms: i64, calls: &[BackgroundCall]) -> FactsReading {
         as_of_ms,
         no_progress: calls.to_vec(),
         held: None,
+        left: None,
     }
 }
 

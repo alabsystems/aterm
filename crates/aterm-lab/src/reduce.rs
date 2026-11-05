@@ -2235,10 +2235,7 @@ fn reduce_verb(args: &[String], by: fn(&str, Program) -> Result<Reduction, Strin
         .map_err(|e| Fail::die(format!("reduce: {file}: its reduction: {e}")))?;
     match &out {
         Some(path) => {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
+            let mut f = crate::util::create_new_regular_file(std::path::Path::new(path), 0o644)
                 .map_err(|e| {
                     Fail::die(format!(
                         "reduce: {path}: {e} (a reduction is never written over a file)"

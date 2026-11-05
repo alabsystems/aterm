@@ -6,8 +6,9 @@
 //! cone ([`crate::changed`]). The driver flags and the label derive from one
 //! value, so a check can never print `--workspace` while running `-p`.
 
-/// The change cone: the crates whose files changed since `base`, closed under
-/// reverse dependency.
+/// The change cone: the crates whose files changed since `base`, what builds on them over normal
+/// and build edges, and the dev dependents of those. A dev edge is the last hop, so a normal
+/// dependent of a crate the cone holds by a dev edge is not in it ([`crate::changed::Reach`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Changed {
     /// The ref the diff was taken against.
@@ -18,6 +19,26 @@ pub struct Changed {
     /// Does any selected crate have a library target? `cargo test --doc` is an
     /// error on an all-binary selection.
     pub any_lib: bool,
+    /// The packages the change itself touched, by `-p` spec: a member's files, a
+    /// `Cargo.lock` or `[workspace.dependencies]` row, a vendored fork
+    /// ([`crate::changed::select`]). Not all are in `crates`; the rest of `crates` is
+    /// there only because it depends on one or a test of its reads a changed file.
+    pub seeds: Vec<String>,
+    /// The packages, by name, whose test, bench and example targets the cone's lint compiles
+    /// ([`Selection::Narrowed`](crate::changed::Selection::Narrowed)'s `all_targets`).
+    pub all_targets: Vec<String>,
+    /// The packages, by name, the cone's lint leaves out
+    /// ([`Selection::Narrowed`](crate::changed::Selection::Narrowed)'s `unlinted`).
+    pub unlinted: Vec<String>,
+}
+
+impl Changed {
+    /// The selected crates the lint compiles, by `-p` spec: all but [`Changed::unlinted`].
+    pub fn linted(&self) -> impl Iterator<Item = &String> {
+        self.crates.iter().filter(|spec| {
+            spec_name(spec).is_none_or(|name| !self.unlinted.iter().any(|n| n == name))
+        })
+    }
 }
 
 /// What a selection-reading check runs over.
@@ -51,13 +72,53 @@ impl Scope {
         Self::Packages(vec![name.into()])
     }
 
+    /// A cone that knows no more than its crates: each counts as touched and has all its targets
+    /// linted, what asks the most of the checks that read [`Changed::seeds`],
+    /// [`Changed::all_targets`] and [`Changed::unlinted`]. [`crate::changed::cone`] says which they
+    /// are.
     #[must_use]
     pub fn changed(base: impl Into<String>, crates: Vec<String>, any_lib: bool) -> Self {
         Self::Changed(Changed {
             base: base.into(),
+            seeds: crates.clone(),
+            all_targets: crates
+                .iter()
+                .filter_map(|spec| spec_name(spec).map(str::to_string))
+                .collect(),
+            unlinted: Vec::new(),
             crates,
             any_lib,
         })
+    }
+
+    /// This cone with the packages the change touched ([`Changed::seeds`]); any other scope as it
+    /// is.
+    #[must_use]
+    pub fn with_seeds(mut self, seeds: Vec<String>) -> Self {
+        if let Self::Changed(changed) = &mut self {
+            changed.seeds = seeds;
+        }
+        self
+    }
+
+    /// This cone with the packages whose every target the lint compiles
+    /// ([`Changed::all_targets`]); any other scope as it is.
+    #[must_use]
+    pub fn with_all_targets(mut self, all_targets: Vec<String>) -> Self {
+        if let Self::Changed(changed) = &mut self {
+            changed.all_targets = all_targets;
+        }
+        self
+    }
+
+    /// This cone with the packages its lint leaves out ([`Changed::unlinted`]); any other scope as
+    /// it is.
+    #[must_use]
+    pub fn with_unlinted(mut self, unlinted: Vec<String>) -> Self {
+        if let Self::Changed(changed) = &mut self {
+            changed.unlinted = unlinted;
+        }
+        self
     }
 
     #[must_use]
@@ -101,6 +162,20 @@ impl Scope {
         }
     }
 
+    /// What the lint compiles: [`Scope::label`], but for the crates a cone's lint leaves out
+    /// ([`Changed::linted`]), so its row never names a crate it did not run on.
+    #[must_use]
+    pub fn lint_label(&self) -> String {
+        match self {
+            Self::Changed(c) if !c.unlinted.is_empty() => c
+                .linted()
+                .flat_map(|n| ["-p", n.as_str()])
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => self.label(),
+        }
+    }
+
     /// The driver flags. The empty cone answers `--workspace`, never an empty
     /// list: a dropped [`Scope::selects_nothing`] guard then builds too much and
     /// is noticed, rather than building everything under a narrow label.
@@ -113,6 +188,19 @@ impl Scope {
             .iter()
             .flat_map(|n| ["-p".to_string(), n.clone()])
             .collect()
+    }
+
+    /// Did the change itself touch the package `name`, rather than a dependency of it? Only a cone
+    /// can tell; for any other scope, whether the selection names it ([`Scope::includes_crate`]).
+    #[must_use]
+    pub fn touches(&self, name: &str) -> bool {
+        match self {
+            Self::Changed(changed) => changed
+                .seeds
+                .iter()
+                .any(|seed| spec_name(seed) == Some(name)),
+            _ => self.includes_crate(name),
+        }
     }
 
     /// Would this selection compile the bare package `name`? A spec the cone
@@ -199,7 +287,33 @@ mod tests {
             Scope::workspace().spec_of("getrandom").as_deref(),
             Some("getrandom")
         );
+        // A cone says what the change touched by package name, whichever spec names it, and a
+        // crate only there for its dependency is not touched; a cone built from its crates alone
+        // counts each one.
+        let seeded = changed(&["aterm-gui", "aterm-uds"])
+            .with_seeds(vec!["aterm-uds".into(), "ring@0.17.14".into()]);
+        assert!(seeded.touches("aterm-uds") && seeded.touches("ring"));
+        assert!(!seeded.touches("aterm-gui") && seeded.includes_crate("aterm-gui"));
+        assert!(changed(&["aterm-gui"]).touches("aterm-gui"));
+        assert!(Scope::crate_only("aterm-gui").touches("aterm-gui"));
+        assert!(Scope::workspace().touches("aterm-gui"));
         assert!(Scope::crate_only("aterm-lab").has_lib_target());
         assert!(!Scope::changed("main", vec!["aterm-lab".into()], false).has_lib_target());
+        // What a cone's lint leaves out goes from the lint's label alone, by package name whichever
+        // spec names it. CONTROL: with nothing left out, it reads as every other check's.
+        let pair = changed(&["aterm-gui", "aterm-uds", "getrandom@0.2.17"]);
+        assert_eq!(pair.lint_label(), pair.label());
+        let some = pair.with_unlinted(vec!["getrandom".into(), "aterm-gui".into()]);
+        assert_eq!(some.lint_label(), "-p aterm-uds");
+        assert_eq!(
+            some.label(),
+            "-p aterm-gui -p aterm-uds -p getrandom@0.2.17"
+        );
+        assert_eq!(
+            Scope::workspace()
+                .with_unlinted(vec!["aterm-gui".into()])
+                .lint_label(),
+            "--workspace"
+        );
     }
 }

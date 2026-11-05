@@ -11,6 +11,15 @@
 //! before anything more is logged, as a no-echo key does, and taints the glow so the next attach
 //! starts it from rest.
 //!
+//! Under the person's grant for the live attach (`aos_host::UnseenGrant`, D12), a held key no
+//! frame proves is logged [`KeyEcho::Unseen`](aterm_effects::aos_momentum::KeyEcho) at the frame
+//! that settles it ([`unseen_verdict`]) instead of stopping the recording, unless a mask glyph
+//! shows where it was typed. A key that shows text is always held with its cells, so that check
+//! can read them, or the recording stops; only a key that shows nothing (each of its chars a
+//! control, zero-width or combining one, or an alternate-screen Shift-Enter) is held blind. A key
+//! typed over its own glyph is held with its cells but never logged as seen: the screen showed it
+//! before the program printed anything.
+//!
 //! The held characters live in memory only, for at most [`ECHO_PROOF_BOUND`]: no `Debug`, log,
 //! trace or `aos` reply carries one.
 
@@ -41,6 +50,14 @@ thread_local! {
     /// Whether a test releases a held run on a frame that proves nothing: the claim-2 binding's
     /// mutant.
     pub(crate) static RELEASE_ON_PENDING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Whether a test holds every raw key as one the person's grant covers, grant or none: the
+    /// claim-2 binding's mutant of `UnseenOnlyWithOptIn`.
+    pub(crate) static UNSEEN_WITHOUT_GRANT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Whether a test logs a granted hold unseen over a mask: the claim-2 binding's mutant of
+    /// `MaskedKeyNeverLogged`.
+    pub(crate) static UNSEEN_OVER_MASK: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -77,6 +94,18 @@ pub(crate) struct EchoHold {
     keys: Vec<EchoKey>,
     /// The proven run's last cells, left of `start`, which must still show as typed.
     run: Vec<char>,
+    /// Opened under the person's grant for its press's attach, and so for its whole life: what no
+    /// frame proves is logged unseen ([`unseen_verdict`]) unless a mask shows in its cells.
+    unseen_ok: bool,
+    /// Whether the grant held one of its keys over that key's own glyph: the screen showed its
+    /// cell before the program printed anything, so no frame proves the echo, and no key of the
+    /// hold is logged as seen.
+    own_glyph: bool,
+    /// Keys with no cells it keeps under the grant (counted, never watched): while any is held no
+    /// key of the hold is logged as seen.
+    blind: u16,
+    /// The first such key's press.
+    blind_at: Option<Instant>,
 }
 
 impl std::fmt::Debug for EchoHold {
@@ -84,6 +113,9 @@ impl std::fmt::Debug for EchoHold {
         f.debug_struct("EchoHold")
             .field("session", &self.session)
             .field("keys", &self.keys.len())
+            .field("unseen_ok", &self.unseen_ok)
+            .field("own_glyph", &self.own_glyph)
+            .field("blind", &self.blind)
             .finish_non_exhaustive()
     }
 }
@@ -164,6 +196,9 @@ pub(crate) enum Echo {
     Pending,
     /// The keys cannot be proven: stop the recording.
     Refute,
+    /// The keys cannot be proven, the person's grant covers them and no mask shows where they were
+    /// typed: log them all unseen now ([`unseen_verdict`]).
+    Unseen,
 }
 
 /// What a typed key's press saw, under the press's terminal lock.
@@ -255,16 +290,32 @@ pub(crate) enum KeyRoute {
     Private(&'static str),
 }
 
+/// What a typed key's echo would show, per column ([`typed_echo_cells`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypedCells {
+    /// Every char takes one or two columns: its cells were pushed.
+    Cells,
+    /// No char takes a column (a control char, a zero-width or combining one, or no text): the
+    /// key shows nothing a mask could stand for.
+    Blind,
+    /// A char takes a column but another takes none (a variation selector, a joiner, a combining
+    /// mark after its base): it shows a glyph aterm cannot lay out as cells.
+    Unplaced,
+}
+
 /// Pushes the cells a typed key's echo shows, per column, onto `cells` (the lead char, then
-/// `'\0'` for a wide glyph's second column), and returns whether it has any: a control char, a
-/// zero-width or combining one, or text that holds one has none.
+/// `'\0'` for a wide glyph's second column), and says whether it has them all
+/// ([`TypedCells::Cells`]), shows nothing ([`TypedCells::Blind`]: every char is a control,
+/// zero-width or combining one) or shows a glyph it cannot lay out ([`TypedCells::Unplaced`]: one
+/// such char beside one that takes a column). Only [`TypedCells::Cells`] leaves any pushed.
 pub(crate) fn typed_echo_cells(
     typed: Option<char>,
     ime: Option<&str>,
     ambiguous_width_double: bool,
     cells: &mut Vec<char>,
-) -> bool {
+) -> TypedCells {
     let from = cells.len();
+    let (mut shown, mut unshown) = (false, false);
     let mut push = |ch: char| {
         let width = if ambiguous_width_double {
             aterm_grapheme::char_width_cjk(ch)
@@ -272,39 +323,55 @@ pub(crate) fn typed_echo_cells(
             aterm_grapheme::char_width(ch)
         };
         if ch.is_control() || !(1..=2).contains(&width) {
-            return false;
+            unshown = true;
+            return;
         }
+        shown = true;
         cells.push(ch);
         if width == 2 {
             cells.push('\0');
         }
-        true
     };
-    let all = match (ime, typed) {
-        (Some(text), _) => !text.is_empty() && text.chars().all(&mut push),
+    match (ime, typed) {
+        (Some(text), _) => text.chars().for_each(&mut push),
         (None, Some(ch)) => push(ch),
-        (None, None) => false,
-    };
-    if !all {
-        cells.truncate(from);
+        (None, None) => {}
     }
-    all
+    match (shown, unshown) {
+        (true, false) => TypedCells::Cells,
+        (false, _) => TypedCells::Blind,
+        (true, true) => {
+            cells.truncate(from);
+            TypedCells::Unplaced
+        }
+    }
 }
 
 /// Routes a typed key whose privacy verdict is `verdict` ([`super::key_privacy`]): a no-echo key
 /// or Secure Keyboard Entry is private; a key aterm sees echoed, or one that carries no text, is
 /// recorded at its press unless keys are held, which it then joins (a key with no text has no
 /// cells, so it cannot, and is refused); a raw key is held while the recording runs, the press was
-/// on the live screen (no deferred wrap, no scrolled-back viewport), it has cells, none of the
-/// columns its echo would take already shows its glyph ([`PressRow`]), and it fits the open hold
-/// (its session, coordinates and screen, at most [`HOLD_CAP`] columns). Opening a hold asks the
-/// host to hold the recording until the key's bound.
+/// on the live screen (no deferred wrap, no scrolled-back viewport), it has cells
+/// ([`TypedCells::Cells`]), none of the columns its echo would take already shows its glyph
+/// ([`PressRow`]), and it fits the open hold (its session, coordinates and screen, at most
+/// [`HOLD_CAP`] columns). Opening a hold asks the host to hold the recording until the key's bound.
+///
+/// `covered` is the person's grant for this press ([`super::unseen_covers`]). Under it a key that
+/// shows nothing ([`TypedCells::Blind`]) is held blind (counted, with no cell to watch: it shows
+/// no text a mask could stand for), and a key typed over its own glyph is held with its cells,
+/// since a mask there still refutes, and marks its hold as one no frame can prove
+/// ([`unseen_verdict`]).
+/// Every other refusal stands: a key that shows text is held with its cells or stops the
+/// recording (a glyph it cannot lay out as cells, [`TypedCells::Unplaced`], stops it), never
+/// recorded without a cell to read a mask from. A granted hold and an ungranted one never share
+/// keys.
 pub(crate) fn admit_key(
     aos: &mut AosWindow,
     momentum: &mut aterm_effects::aos_momentum::MomentumHost,
     verdict: Option<&'static str>,
     press: &Press,
-    cells: impl FnOnce(&mut Vec<char>) -> bool,
+    cells: impl FnOnce(&mut Vec<char>) -> TypedCells,
+    covered: bool,
 ) -> KeyRoute {
     match verdict {
         Some(why) if why != RAW_KEY => return KeyRoute::Private(why),
@@ -315,6 +382,8 @@ pub(crate) fn admit_key(
     if ECHO_HOLD_OFF.with(std::cell::Cell::get) {
         return KeyRoute::Record;
     }
+    #[cfg(test)]
+    let covered = covered || UNSEEN_WITHOUT_GRANT.with(std::cell::Cell::get);
     let refused = KeyRoute::Private(RAW_KEY);
     if !momentum.aos_attached()
         || momentum.aos_paused()
@@ -324,28 +393,38 @@ pub(crate) fn admit_key(
         return refused;
     }
     let mut typed = Vec::new();
-    if !cells(&mut typed) {
-        return refused;
+    match cells(&mut typed) {
+        TypedCells::Cells => {}
+        TypedCells::Blind if covered => return join_blind(aos, momentum, press),
+        TypedCells::Blind | TypedCells::Unplaced => return refused,
     }
     let site = if aos.hold.is_some() {
         next_site(aos)
     } else {
         Some(press.cursor)
     };
-    if site.is_none() || press.row.at != site || press.row.shows_any(&typed) {
+    let own_glyph = press.row.shows_any(&typed);
+    if site.is_none() || press.row.at != site || (own_glyph && !covered) {
         return refused;
     }
     let width = |n: usize| u16::try_from(n).ok();
     match aos.hold.as_mut() {
         Some(h) => {
             let total = h.cells.len() + typed.len();
-            let Some(end) = width(total).filter(|_| total <= HOLD_CAP) else {
+            let Some(end) = width(total)
+                .filter(|_| total <= HOLD_CAP && h.keys.len() + usize::from(h.blind) < HOLD_CAP)
+            else {
                 return refused;
             };
-            if h.session != press.session || h.coord_gen != press.coord_gen || h.alt != press.alt {
+            if h.session != press.session
+                || h.coord_gen != press.coord_gen
+                || h.alt != press.alt
+                || h.unseen_ok != covered
+            {
                 return refused;
             }
             let joins = h.keys.last().is_some_and(|k| k.epoch == press.epoch);
+            h.own_glyph |= own_glyph;
             h.cells.extend_from_slice(&typed);
             h.keys.push(EchoKey {
                 end,
@@ -388,6 +467,10 @@ pub(crate) fn admit_key(
                     joins: !run.is_empty(),
                 }],
                 run,
+                unseen_ok: covered,
+                own_glyph,
+                blind: 0,
+                blind_at: None,
             });
             momentum.aos_hold(press.at + ECHO_PROOF_BOUND);
         }
@@ -395,10 +478,67 @@ pub(crate) fn admit_key(
     KeyRoute::Hold
 }
 
-/// Notes the session's input epoch once the newest held key's bytes were written.
+/// Holds a key with no cells under the person's grant: it joins the open hold's blind count (a
+/// hold the grant opened, of its session, under [`HOLD_CAP`] keys), or opens a blind hold at the
+/// press's cursor until its bound. A blind key shows no text, so no mask can hide one; only the
+/// stops before the grant (a swallowing tty, Secure Keyboard Entry) apply to it.
+fn join_blind(
+    aos: &mut AosWindow,
+    momentum: &mut aterm_effects::aos_momentum::MomentumHost,
+    press: &Press,
+) -> KeyRoute {
+    match aos.hold.as_mut() {
+        Some(h) => {
+            if !h.unseen_ok
+                || h.session != press.session
+                || h.keys.len() + usize::from(h.blind) >= HOLD_CAP
+            {
+                return KeyRoute::Private(RAW_KEY);
+            }
+            h.blind += 1;
+            h.blind_at.get_or_insert(press.at);
+        }
+        None => {
+            aos.echo_run = None;
+            let (row, start) = press.cursor;
+            aos.hold = Some(EchoHold {
+                session: press.session,
+                row,
+                start,
+                coord_gen: press.coord_gen,
+                alt: press.alt,
+                cells: Vec::new(),
+                keys: Vec::new(),
+                run: Vec::new(),
+                unseen_ok: true,
+                own_glyph: false,
+                blind: 1,
+                blind_at: Some(press.at),
+            });
+            momentum.aos_hold(press.at + ECHO_PROOF_BOUND);
+        }
+    }
+    KeyRoute::Hold
+}
+
+/// Notes the session's input epoch once the newest held key's bytes were written (a blind hold's
+/// keys never continue a run, so it notes nothing).
 pub(crate) fn note_written(aos: &mut AosWindow, epoch: InputEpoch) {
-    if let Some(key) = aos.hold.as_mut().and_then(|h| h.keys.last_mut()) {
+    if let Some(key) = aos
+        .hold
+        .as_mut()
+        .filter(|h| h.blind == 0)
+        .and_then(|h| h.keys.last_mut())
+    {
         key.epoch = epoch;
+    }
+}
+
+/// The press of a hold's first key, watched or blind.
+fn first_press(hold: &EchoHold) -> Option<Instant> {
+    match (hold.keys.first().map(|k| k.at), hold.blind_at) {
+        (Some(watched), Some(blind)) => Some(watched.min(blind)),
+        (watched, blind) => watched.or(blind),
     }
 }
 
@@ -406,18 +546,21 @@ pub(crate) fn note_written(aos: &mut AosWindow, epoch: InputEpoch) {
 pub(crate) fn hold_deadline(aos: &AosWindow) -> Option<Instant> {
     aos.hold
         .as_ref()
-        .and_then(|h| h.keys.first())
-        .map(|k| k.at + ECHO_PROOF_BOUND)
+        .and_then(first_press)
+        .map(|at| at + ECHO_PROOF_BOUND)
 }
 
-/// Whether `run` holds at least two distinct chars that are neither a wide continuation, a blank
-/// nor a mask glyph.
+/// Whether a held cell showing `c` can corroborate an echo: it is neither a wide continuation, a
+/// blank nor a mask glyph. A blank shows the same whether or not the program printed it, and a
+/// mask is what a password prompt prints for any key.
+fn corroborates(c: char) -> bool {
+    c != '\0' && c != ' ' && !MASK_GLYPHS.contains(&c)
+}
+
+/// Whether `run` holds at least two distinct chars that [`corroborates`] accepts.
 fn two_distinct(run: &[char]) -> bool {
     let mut first = None;
-    for &c in run {
-        if c == '\0' || c == ' ' || MASK_GLYPHS.contains(&c) {
-            continue;
-        }
+    for &c in run.iter().filter(|&&c| corroborates(c)) {
         match first {
             None => first = Some(c),
             Some(f) if f != c => return true,
@@ -437,9 +580,10 @@ fn two_distinct(run: &[char]) -> bool {
 ///   run's tail still shows just left of it;
 /// - the terminal printed since the last of them was pressed (and no column of theirs showed its
 ///   glyph at its press: [`admit_key`] refuses such a key);
-/// - the cells are corroborated: two distinct typed glyphs that are not mask glyphs, or keys that
-///   each continue the proven run, no other input reaching the session between them, with a
-///   glyph that is not one.
+/// - the cells are corroborated ([`corroborates`]): two distinct typed glyphs that are neither
+///   blanks nor mask glyphs, or keys that each continue the proven run, no other input reaching
+///   the session between them, with at least one such glyph, so a blank that only continues a
+///   run waits for a glyph after it.
 ///
 /// A mask glyph where one of those cells should be refutes at once; any other mismatch (a torn
 /// redraw) waits. Past [`ECHO_PROOF_BOUND`] from the first key's press, what is not proven is
@@ -479,9 +623,7 @@ pub(crate) fn echo_verdict(hold: &EchoHold, view: &EchoView, now: Instant) -> Ec
                 let printed = shown == Some(cells) && visible && tail && view.print_seq > last.seq;
                 let continues = !hold.run.is_empty()
                     && hold.keys[..n].iter().all(|k| k.joins)
-                    && cells
-                        .iter()
-                        .any(|&c| c != '\0' && !MASK_GLYPHS.contains(&c));
+                    && cells.iter().any(|&c| corroborates(c));
                 if printed && (continues || two_distinct(cells)) {
                     return Echo::Release(n);
                 }
@@ -506,11 +648,68 @@ pub(crate) fn echo_verdict(hold: &EchoHold, view: &EchoView, now: Instant) -> Ec
     }
 }
 
+/// Whether a mask glyph shows in any of `hold`'s cells on `view`'s live row, other than the char
+/// typed there, wherever the cursor is: the view must be the hold's session, coordinates and
+/// screen, so the row is the one the keys were typed on.
+fn masked_anywhere(hold: &EchoHold, view: &EchoView) -> bool {
+    if view.session != hold.session || view.coord_gen != hold.coord_gen || view.alt != hold.alt {
+        return false;
+    }
+    view.chars
+        .get(usize::from(hold.start)..)
+        .is_some_and(|shown| {
+            shown
+                .iter()
+                .zip(&hold.cells)
+                .any(|(&got, &want)| got != want && MASK_GLYPHS.contains(&got))
+        })
+}
+
+/// What `view` proves of a hold the person's grant opened (`unseen_ok`), at `now`: a mask glyph in
+/// any of its cells refutes, on every frame and wherever the cursor is ([`masked_anywhere`]).
+/// Otherwise a hold with no blind key and none typed over its own glyph takes [`echo_verdict`]'s
+/// release or wait, and its refute (no proof by the bound, or the view moved off the hold's
+/// session, coordinates or screen, a mask being excluded) becomes [`Echo::Unseen`]; a hold with a
+/// blind key or one typed over its own glyph is never released as seen, and is [`Echo::Unseen`]
+/// once its first key's bound has passed or the view moved, else [`Echo::Pending`].
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        reason = "a mask is the program's output, which aterm only reads: this verdict is what the model's Mask guard sees of it",
+        machine = "AosKeyHold",
+        action = "Mask"
+    )
+)]
+pub(crate) fn unseen_verdict(hold: &EchoHold, view: &EchoView, now: Instant) -> Echo {
+    #[cfg(test)]
+    let over_mask = UNSEEN_OVER_MASK.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let over_mask = false;
+    if !over_mask && masked_anywhere(hold, view) {
+        return Echo::Refute;
+    }
+    if hold.blind == 0 && !hold.own_glyph {
+        return match echo_verdict(hold, view, now) {
+            Echo::Refute => Echo::Unseen,
+            other => other,
+        };
+    }
+    let moved =
+        view.session != hold.session || view.coord_gen != hold.coord_gen || view.alt != hold.alt;
+    match first_press(hold) {
+        Some(first) if !moved && now.saturating_duration_since(first) < ECHO_PROOF_BOUND => {
+            Echo::Pending
+        }
+        _ => Echo::Unseen,
+    }
+}
+
 /// Settles `ws`'s hold on the frame at `now` that read `view` (`None` when the frame could not
 /// read the live screen: its lock busy, the pane rewound): a hold the host dropped by itself hands
 /// its keys to the glow unrecorded; a proven run is logged at `now`; a refuted one stops the
-/// recording. With no view nothing is settled: [`crate::App::aos_watch_via`] refutes once the bound and
-/// a frame have passed.
+/// recording; one the person's grant opened, still live, takes [`unseen_verdict`], and is logged
+/// unseen at `now` when nothing proved it and no mask showed. With no view nothing is settled:
+/// [`crate::App::aos_watch_via`] refutes once the bound and a frame have passed.
 pub(crate) fn settle_hold(ws: &mut crate::WindowState, view: Option<&EchoView>, now: Instant) {
     let Some(hold) = ws.aos.hold.as_ref() else {
         return;
@@ -523,11 +722,37 @@ pub(crate) fn settle_hold(ws: &mut crate::WindowState, view: Option<&EchoView>, 
     let Some(view) = view else {
         return;
     };
-    match echo_verdict(hold, view, now) {
+    #[cfg(test)]
+    let ungranted_mutant = UNSEEN_WITHOUT_GRANT.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let ungranted_mutant = false;
+    let granted = hold.unseen_ok
+        && (ungranted_mutant || super::unseen_live(&ws.aos, &ws.fx.cursor().momentum));
+    let verdict = if granted {
+        unseen_verdict(hold, view, now)
+    } else {
+        echo_verdict(hold, view, now)
+    };
+    match verdict {
         Echo::Release(n) => release(ws, n, now),
         Echo::Refute => super::private_key(ws, RAW_KEY, now),
+        Echo::Unseen => release_unseen(ws, now),
         Echo::Pending => {}
     }
+}
+
+/// Logs every key of `ws`'s hold, watched and blind, as unseen at `now` (the host taints the glow,
+/// so the next attach starts from rest), and ends it: no proven run continues from it.
+fn release_unseen(ws: &mut crate::WindowState, now: Instant) {
+    let Some(hold) = ws.aos.hold.take() else {
+        return;
+    };
+    ws.aos.echo_run = None;
+    let keys = u32::try_from(hold.keys.len() + usize::from(hold.blind)).unwrap_or(u32::MAX);
+    ws.fx
+        .cursor_mut()
+        .momentum
+        .aos_release_unseen(now, keys, MOMENTUM_GLOW_TAU_S);
 }
 
 /// Logs the hold's oldest `n` keys at `now` and keeps the rest waiting until their own bound.
@@ -578,15 +803,23 @@ pub(crate) fn hand_over(ws: &mut crate::WindowState, hold: Option<EchoHold>, now
     };
     let momentum = &mut ws.fx.cursor_mut().momentum;
     momentum.taint();
-    for _ in &hold.keys {
+    for _ in 0..hold.keys.len() + usize::from(hold.blind) {
         momentum.on_key(now, MOMENTUM_GLOW_TAU_S);
     }
 }
 
-/// How many typed keys `aos`'s hold keeps waiting.
+/// How many typed keys `aos`'s hold keeps waiting, watched and blind.
 #[cfg(test)]
 pub(crate) fn held_keys(aos: &AosWindow) -> usize {
-    aos.hold.as_ref().map_or(0, |h| h.keys.len())
+    aos.hold
+        .as_ref()
+        .map_or(0, |h| h.keys.len() + usize::from(h.blind))
+}
+
+/// Whether `aos`'s hold was opened under the person's grant.
+#[cfg(test)]
+pub(crate) fn hold_is_granted(aos: &AosWindow) -> bool {
+    aos.hold.as_ref().is_some_and(|h| h.unseen_ok)
 }
 
 #[cfg(test)]

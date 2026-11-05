@@ -28,18 +28,31 @@ pub fn root(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join("Library/Caches/aterm/tooling.noindex"))
 }
 
-fn last_used(path: &Path, depth: usize) -> Option<SystemTime> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
+fn meta_used(meta: &std::fs::Metadata) -> Option<SystemTime> {
     let mut newest = meta.modified().ok()?;
     if meta.is_file()
         && let Ok(read) = meta.accessed()
     {
         newest = newest.max(read);
     }
+    Some(newest)
+}
+
+fn last_used(path: &Path, depth: usize) -> Option<SystemTime> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    let mut newest = meta_used(&meta)?;
     if meta.is_dir() && depth > 0 {
         for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-            if let Some(used) = last_used(&entry.path(), depth - 1) {
-                newest = newest.max(used);
+            if let Ok(emeta) = entry.metadata() {
+                if let Some(used) = meta_used(&emeta) {
+                    newest = newest.max(used);
+                }
+                if emeta.is_dir()
+                    && depth > 1
+                    && let Some(used) = last_used(&entry.path(), depth - 1)
+                {
+                    newest = newest.max(used);
+                }
             }
         }
     }
@@ -118,10 +131,9 @@ pub fn plan(root: &Path, now: SystemTime) -> Vec<Planned> {
 }
 
 /// Remove what nobody uses from the tooling cache `root` at `now` ([`why`]), `record` asked first
-/// for each (`false` keeps it); each removed whole ([`super::remove::tree_while`]) is returned with
-/// why, a stage some entry of which stayed with what stayed ([`Unused::Stayed`]), for the next
-/// pass, a stage whose walk a custody marker stopped with what went ([`Unused::Revoked`]), for the
-/// next pass too, and an entry whose intent is on record and nothing of which went (its rename aside refused
+/// for each (`false` keeps it); each removed whole ([`super::remove::tree`]) is returned with why,
+/// a stage some entry of which stayed with what stayed ([`Unused::Stayed`]), for the next pass,
+/// and an entry whose intent is on record and nothing of which went (its rename aside refused
 /// after the check, or a process came to use it since; one in a stage by then is returned as the
 /// stage, [`super::Refusal::Staged`]) with [`Unused::Refused`], so every intent on record closes
 /// with an outcome. Each stage is visited once a pass, as the one listing of
@@ -202,22 +214,7 @@ pub(super) fn reclaim_on(
             intents.stop();
             continue;
         }
-        let told = || {
-            fence.working();
-            true
-        };
-        let left = match super::remove::tree_while(&stage, &told) {
-            Ok(left) => left,
-            Err(revoked) => {
-                intents.outcome(
-                    stage,
-                    Unused::Revoked {
-                        freed: revoked.freed,
-                    },
-                );
-                continue;
-            }
-        };
+        let left = super::remove::tree(&stage);
         if left.whole() {
             intents.outcome(entry, why);
         } else {

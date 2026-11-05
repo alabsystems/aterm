@@ -4,16 +4,20 @@
 //! The restore measurement's grammar, std-only: the words of one run in `RESTORE_BENCH`, which
 //! `verify perf restore-e2e` mounts to refuse what the bench would before it builds anything.
 //!
-//! `out=<dir>` (required) · `sessions=1,8,32` (rising, each at most [`SESSIONS_MAX`]) ·
+//! Output is the OS-native `RESTORE_BENCH_OUT` path. Knobs: `sessions=1,8,32` (rising, each at
+//! most [`SESSIONS_MAX`]) ·
 //! `rounds=3` (crashes and recoveries per session count, at most [`ROUNDS_MAX`]) · `lines=5000`
 //! (the history each session prints, at most [`LINES_MAX`]) · `arm=clean|copy|lookalike` ·
 //! `lookalike_kib=6912` (the look-alike arm's plant, at most [`LOOKALIKE_KIB_MAX`]; only with
 //! `arm=lookalike`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The environment variable a run's words arrive in.
 pub const ENV: &str = "RESTORE_BENCH";
+
+/// The OS-native output directory, separate from measurement knobs.
+pub const OUT_ENV: &str = "RESTORE_BENCH_OUT";
 /// The most sessions one crash takes down.
 pub const SESSIONS_MAX: u32 = 64;
 /// The most crashes per session count.
@@ -123,8 +127,8 @@ pub struct Spec {
 }
 
 impl Spec {
-    /// The run's words as the report spells them (every knob, defaults included; `out=` left
-    /// out, a scratch path).
+    /// The run's measurement knobs as the report spells them, defaults included. The output
+    /// directory is supplied separately and is not part of the workload.
     #[must_use]
     pub fn words(&self) -> String {
         let sessions: Vec<String> = self.sessions.iter().map(u32::to_string).collect();
@@ -153,9 +157,11 @@ fn bounded(key: &str, raw: &str, max: u32) -> Result<u32, String> {
 ///
 /// # Errors
 /// An unknown or repeated word, a value out of its bounds, a session list that does not rise,
-/// `lookalike_kib=` beside another arm, or no `out=`.
-pub fn parse(words: &str) -> Result<Spec, String> {
-    let mut out = None;
+/// `lookalike_kib=` beside another arm, or an empty output path.
+pub fn parse(words: &str, out: &Path) -> Result<Spec, String> {
+    if out.as_os_str().is_empty() {
+        return Err(format!("{OUT_ENV} names the report's folder"));
+    }
     let mut sessions = None;
     let mut rounds = None;
     let mut lines = None;
@@ -166,7 +172,6 @@ pub fn parse(words: &str) -> Result<Spec, String> {
             .split_once('=')
             .ok_or_else(|| format!("`{word}` is not key=value"))?;
         let fresh = match key {
-            "out" => out.replace(PathBuf::from(value)).is_none(),
             "sessions" => {
                 let list = value
                     .split(',')
@@ -194,7 +199,7 @@ pub fn parse(words: &str) -> Result<Spec, String> {
         return Err("`lookalike_kib` is the lookalike arm's".to_string());
     }
     Ok(Spec {
-        out: out.ok_or("`out=` names the report's folder")?,
+        out: out.to_path_buf(),
         sessions: sessions.unwrap_or_else(|| vec![1, 8, 32]),
         rounds: rounds.unwrap_or(3),
         lines: lines.unwrap_or(5_000),
@@ -206,10 +211,12 @@ pub fn parse(words: &str) -> Result<Spec, String> {
 /// The run [`ENV`] names.
 ///
 /// # Errors
-/// [`ENV`] unset, or words [`parse`] refuses.
+/// Missing knobs or output path, non-Unicode knobs, or input [`parse`] refuses.
 pub fn from_env() -> Result<Spec, String> {
-    let words = std::env::var(ENV).map_err(|_| {
-        format!("{ENV} is unset: `targo --unverified verify perf restore-e2e` runs this bench")
+    let words = std::env::var(ENV).map_err(|error| {
+        format!("{ENV} is required (`verify perf restore-e2e` sets it): {error}")
     })?;
-    parse(&words)
+    let out = std::env::var_os(OUT_ENV)
+        .ok_or_else(|| format!("{OUT_ENV} is required (`verify perf restore-e2e` sets it)"))?;
+    parse(&words, Path::new(&out))
 }

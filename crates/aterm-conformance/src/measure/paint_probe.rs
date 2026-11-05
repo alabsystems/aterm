@@ -265,7 +265,7 @@ fn keep_ledger(capture: &Captured, cell: Cell, typed_row: Option<TypedRow>) {
     let mut wrote = Ok(());
     if let Some(rows) = &capture.rows {
         let text: String = rows.iter().map(|r| format!("{}\n", r.0)).collect();
-        wrote = wrote.and(std::fs::write(dir.join("trail-status.rows"), text));
+        wrote = wrote.and(super::write_fresh(dir.join("trail-status.rows"), text));
     }
     let take = format!(
         "cell_w={} cell_h={} row_bottom={} frame_w={} frame_h={}\n",
@@ -275,7 +275,7 @@ fn keep_ledger(capture: &Captured, cell: Cell, typed_row: Option<TypedRow>) {
         typed_row.map_or_else(|| "none".to_string(), |r| r.frame_w.to_string()),
         typed_row.map_or_else(|| "none".to_string(), |r| r.frame_h.to_string()),
     );
-    wrote = wrote.and(std::fs::write(dir.join("take.txt"), take));
+    wrote = wrote.and(super::write_fresh(dir.join("take.txt"), take));
     match wrote {
         Ok(()) => eprintln!("measure: kept the take's ledger beside {}", dir.display()),
         Err(e) => eprintln!(

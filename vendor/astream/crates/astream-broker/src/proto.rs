@@ -24,6 +24,8 @@
 //! | 10   | [`ERR_SUBJECT_BOUND`]  | lands only once the subject enters the index   |
 //! | 11   | [`ERR_RETIRE_REFUSED`] | lands once the retire guard condition lifts    |
 //! | 12   | [`ERR_RATE_LIMITED`]   | lands once the producer's token bucket refills |
+//! | 13   | [`ERR_ORIGIN_REFUSED`] | a relayed record's origin is revoked or unknown, or its signature is bad |
+//! | 14   | [`ERR_RELAY_NOT_READY`] | lands once this broker has been given origin keys |
 //!
 //! Codes 2, 3, 7, 8 and 9 are PERMANENT for the request that drew them: sent again,
 //! unchanged, on the same connection, it is refused again, so a retry is a loop.
@@ -265,6 +267,17 @@ pub const RETIRE_CUT_PREFIX: &str = "cut: ";
 /// older client that does not know code 12 reads it as non-permanent (`!is_permanent()`).
 pub const ERR_RATE_LIMITED: u8 = 12;
 
+/// A relayed record was refused for what it is, not for who carried it: its subject names no
+/// owner or another producer's, its origin is revoked or not among the broker's origin keys, or
+/// its signature does not verify. Nothing was appended. A bridge counts it and carries on: the
+/// next record is not this one's fault, and one forged record must not stop an edge.
+pub const ERR_ORIGIN_REFUSED: u8 = 13;
+
+/// A relayed record was refused because of this broker, not the record: it holds no origin keys
+/// yet, or was built without the `relay` feature. A bridge stops and commits nothing, so what it
+/// was carrying is still there when the keys come.
+pub const ERR_RELAY_NOT_READY: u8 = 14;
+
 /// Fixed prefix for every [`ERR_RATE_LIMITED`] refusal, followed immediately by the
 /// minimum millisecond wait `<ms>` (`>= 1`) before the bucket refills enough to admit
 /// the request (or, if a single record exceeds `burst_bytes`, the burst-deficit hint).
@@ -307,6 +320,9 @@ const TAG_BROKER_TIMES: u8 = 0x12;
 const TAG_STATS: u8 = 0x13;
 const TAG_CLEAR_GAP_FENCES: u8 = 0x14;
 const TAG_FENCE_GAPS: u8 = 0x15;
+const TAG_BURST_MARKS: u8 = 0x16;
+const TAG_RELAY: u8 = 0x17;
+const TAG_ORIGIN_STAMPS: u8 = 0x18;
 const TAG_ACK: u8 = 0x81;
 const TAG_DELIVERY: u8 = 0x82;
 const TAG_ERROR: u8 = 0x83;
@@ -357,6 +373,13 @@ pub const REQUEST_STATS: u64 = 1 << 4;
 /// it. A broker opened without the option leaves the bit clear, refuses the ask, and still
 /// answers `ClearGapFences` (it clears nothing).
 pub const REQUEST_GAP_FENCES: u64 = 1 << 5;
+
+/// Bit 6 of [`NonceExt::requests`]: the broker accepts [`Request::BurstMarks`] (`0x16`).
+pub const REQUEST_BURST_MARKS: u64 = 1 << 6;
+
+/// Bit 7 of [`NonceExt::requests`]: the broker accepts [`Request::Relay`] (`0x17`) and
+/// [`Request::OriginStamps`] (`0x18`).
+pub const REQUEST_RELAY: u64 = 1 << 7;
 
 const STATS_MAX_ITEMS: usize = 65_536;
 
@@ -726,6 +749,28 @@ pub enum Request {
     /// On a guarded broker, any unexpired capability permits it. Announced by
     /// [`REQUEST_BROKER_TIMES`].
     BrokerTimes,
+    /// Ask this connection's `Subscribe` and `SubscribeGroup` tails for a `Mark` each time they
+    /// catch up after delivering, and once as they first catch up: the boundary of a burst, with
+    /// no timer on either side. A reader that batches work per burst (a federation bridge's
+    /// commit) waits on it instead of on a clock. Answered with a `Mark`.
+    /// [`REQUEST_BURST_MARKS`].
+    BurstMarks,
+    /// Append a record that ORIGINATED ELSEWHERE, under its origin's `(producer_id, producer_seq)`:
+    /// the exactly-once ingest of [`Publish`](Self::Publish), so the key is the same on every
+    /// broker it reaches, whichever path it took, and a record relayed around a cycle stops at the
+    /// first broker that holds it. Charged to the origin's subject budget. On a guarded broker it
+    /// needs a relay grant, and `subject`'s owner must derive `producer_id`
+    /// (`astream_cap::grants_relay`). [`REQUEST_RELAY`].
+    Relay {
+        producer_id: u64,
+        producer_seq: u64,
+        subject: String,
+        body: Vec<u8>,
+    },
+    /// Stamp this connection's `Delivery` frames with each record's own
+    /// `(producer_id, producer_seq)`, which a [`Relay`](Self::Relay) carries on. Answered with a
+    /// `Mark`. [`REQUEST_RELAY`].
+    OriginStamps,
     /// Attach-gated operator status query (`REQUIREMENTS` R5): broker start time,
     /// listeners, attached producers (principal, transport, attach time, last publish
     /// `bt=`), record and byte counts per face prefix matching `filter`, `oldest`/`head`,
@@ -1934,6 +1979,20 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::IdleMarks => p[1] = TAG_IDLE_MARKS,
         Request::GapNotices => p[1] = TAG_GAP_NOTICES,
         Request::BrokerTimes => p[1] = TAG_BROKER_TIMES,
+        Request::BurstMarks => p[1] = TAG_BURST_MARKS,
+        Request::OriginStamps => p[1] = TAG_ORIGIN_STAMPS,
+        Request::Relay {
+            producer_id,
+            producer_seq,
+            subject,
+            body,
+        } => {
+            p[1] = TAG_RELAY;
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_id));
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_seq));
+            put_str(&mut p, subject);
+            put_bytes(&mut p, body);
+        }
         Request::ClearGapFences => p[1] = TAG_CLEAR_GAP_FENCES,
         Request::FenceGaps => p[1] = TAG_FENCE_GAPS,
         Request::Stats { filter } => {
@@ -2131,6 +2190,14 @@ pub(crate) fn decode_request_with_bt(p: &[u8]) -> Option<(Request, Option<u64>)>
         TAG_IDLE_MARKS => Request::IdleMarks,
         TAG_GAP_NOTICES => Request::GapNotices,
         TAG_BROKER_TIMES => Request::BrokerTimes,
+        TAG_BURST_MARKS => Request::BurstMarks,
+        TAG_ORIGIN_STAMPS => Request::OriginStamps,
+        TAG_RELAY => Request::Relay {
+            producer_id: r.u64()?,
+            producer_seq: r.u64()?,
+            subject: r.string()?,
+            body: r.bytes()?,
+        },
         TAG_CLEAR_GAP_FENCES => Request::ClearGapFences,
         TAG_FENCE_GAPS => Request::FenceGaps,
         TAG_STATS => Request::Stats {
@@ -2321,7 +2388,18 @@ fn put_delivery(p: &mut Vec<u8>, offset: u64, subject: &str, body: &[u8]) {
 }
 
 fn put_publish(p: &mut Vec<u8>, producer_id: u64, producer_seq: u64, subject: &str, body: &[u8]) {
-    p.extend_from_slice(&[PROTO_VERSION, TAG_PUBLISH]);
+    put_keyed(p, TAG_PUBLISH, producer_id, producer_seq, subject, body);
+}
+
+fn put_keyed(
+    p: &mut Vec<u8>,
+    tag: u8,
+    producer_id: u64,
+    producer_seq: u64,
+    subject: &str,
+    body: &[u8],
+) {
+    p.extend_from_slice(&[PROTO_VERSION, tag]);
     p.extend_from_slice(&encode_u64_le_bytes(producer_id));
     p.extend_from_slice(&encode_u64_le_bytes(producer_seq));
     put_str(p, subject);
@@ -2393,6 +2471,22 @@ pub(crate) fn append_publish_frame(
     out.extend_from_slice(&[0u8; HEADER_SIZE]);
     let payload_start = out.len();
     put_publish(out, producer_id, producer_seq, subject, body);
+    let _ = finish_framed(out, start, payload_start, None)?;
+    Ok(())
+}
+
+/// Append one framed `Relay` to `out`, assembled in place as [`append_publish_frame`] is.
+pub(crate) fn append_relay_frame(
+    out: &mut Vec<u8>,
+    producer_id: u64,
+    producer_seq: u64,
+    subject: &str,
+    body: &[u8],
+) -> io::Result<()> {
+    let start = out.len();
+    out.extend_from_slice(&[0u8; HEADER_SIZE]);
+    let payload_start = out.len();
+    put_keyed(out, TAG_RELAY, producer_id, producer_seq, subject, body);
     let _ = finish_framed(out, start, payload_start, None)?;
     Ok(())
 }
@@ -2479,18 +2573,48 @@ pub(crate) fn append_delivery_frame_stamped(
     subject: &str,
     body: &[u8],
     bt_ms: Option<u64>,
+    origin: Option<(u64, u64)>,
 ) -> io::Result<()> {
-    let Some(bt) = bt_ms else {
+    if bt_ms.is_none() && origin.is_none() {
         return append_delivery_frame(out, offset, subject, body);
-    };
+    }
     let start = out.len();
     out.extend_from_slice(&[0u8; HEADER_SIZE]);
     let payload_start = out.len();
     put_delivery(out, offset, subject, body);
-    out.push(crate::brecord::BT_TAG);
-    out.extend_from_slice(&encode_u64_le_bytes(bt));
+    if let Some(bt) = bt_ms {
+        out.push(crate::brecord::BT_TAG);
+        out.extend_from_slice(&encode_u64_le_bytes(bt));
+    }
+    if let Some((producer_id, producer_seq)) = origin {
+        out.push(crate::brecord::ORIGIN_TAG);
+        out.extend_from_slice(&encode_u64_le_bytes(producer_id));
+        out.extend_from_slice(&encode_u64_le_bytes(producer_seq));
+    }
     let _ = finish_framed(out, start, payload_start, None)?;
     Ok(())
+}
+
+/// The `(producer_id, producer_seq)` a `Delivery` payload's origin trailer carries
+/// ([`Request::OriginStamps`]); `None` for any other payload, or a delivery without one.
+#[must_use]
+pub fn decode_delivery_origin(p: &[u8]) -> Option<(u64, u64)> {
+    let mut r = Reader { b: p };
+    if r.u8()? != PROTO_VERSION || r.u8()? != TAG_DELIVERY {
+        return None;
+    }
+    r.u64()?;
+    let subject = r.u32()?;
+    r.b = r.b.get(subject..)?;
+    let body = r.u32()?;
+    r.b = r.b.get(body..)?;
+    if r.b.first() == Some(&crate::brecord::BT_TAG) {
+        r.b = r.b.get(9..)?;
+    }
+    if r.u8()? != crate::brecord::ORIGIN_TAG {
+        return None;
+    }
+    Some((r.u64()?, r.u64()?))
 }
 
 /// Append one framed `Delivery` to `out`, reusing `precomputed_crc` when `Some` so a
@@ -2889,6 +3013,7 @@ mod tests {
             "/f/alpha/pub/n1/s1/ev",
             b"body",
             Some(1_700_000_000_456),
+            None,
         )
         .unwrap();
         let payload = read_frame(&mut &framed[..]).unwrap().unwrap();
@@ -3014,7 +3139,7 @@ mod tests {
     /// retention gave up, broker-stamped wall times (`bt=`), read-grant-gated operator
     /// `Stats`, and a gap fence a connection asks for and its producer lifts once it read
     /// its answers — rides on TWENTY-ONE request tags and EIGHT response tags. This test is
-    /// the budget: it enumerates every byte and fails if a twenty-second request tag or a
+    /// the budget: it enumerates every byte and fails if an undeclared request tag or a
     /// ninth response tag ever decodes, and it pins each tag's NUMBER, so a renumbering that
     /// would silently re-interpret an old client's frames breaks the build instead.
     /// `Keepalive` at 0x0D, `IdleMarks` at 0x0E, `Budget` at 0x0F, `Retire` at 0x10,
@@ -3024,7 +3149,34 @@ mod tests {
     /// decoded: an older broker refuses each request as malformed and keeps the connection,
     /// and never sends the reply. Additions, not reinterpretations; no version change.
     #[test]
-    fn the_tag_budget_is_twenty_one_requests_and_eight_responses() {
+    fn a_delivery_carries_its_origin_alongside_or_without_a_broker_time() {
+        for bt_ms in [None, Some(1_700_000_000_456)] {
+            let mut framed = Vec::new();
+            append_delivery_frame_stamped(
+                &mut framed,
+                9,
+                "/m/n-a/x",
+                b"body",
+                bt_ms,
+                Some((u64::MAX, 7)),
+            )
+            .unwrap();
+            let p = &framed[HEADER_SIZE..];
+            assert_eq!(decode_delivery_origin(p), Some((u64::MAX, 7)));
+            let (resp, bt) = decode_response_with_bt(p).unwrap();
+            assert_eq!(bt, bt_ms);
+            assert!(matches!(resp, Response::Delivery { offset: 9, .. }));
+        }
+        let mut framed = Vec::new();
+        append_delivery_frame_stamped(&mut framed, 9, "/m/n-a/x", b"body", Some(5), None).unwrap();
+        assert_eq!(decode_delivery_origin(&framed[HEADER_SIZE..]), None);
+        let mut framed = Vec::new();
+        append_delivery_frame(&mut framed, 9, "/m/n-a/x", b"body").unwrap();
+        assert_eq!(decode_delivery_origin(&framed[HEADER_SIZE..]), None);
+    }
+
+    #[test]
+    fn the_tag_budget_is_the_declared_requests_and_eight_responses() {
         // Version 2: `Attach` kept its tag (0x07) and its wire SHAPE (a str then a
         // byte string) while its MEANING changed (`{grant, proof}`, answered with a
         // Mark), so under an unchanged version byte a version-1 Attach would decode
@@ -3042,7 +3194,7 @@ mod tests {
         );
 
         // Every tag's NUMBER, pinned against the variant that carries it.
-        let request_tags: [(u8, Request); 21] = [
+        let request_tags: [(u8, Request); 24] = [
             (
                 0x01,
                 Request::Publish {
@@ -3163,6 +3315,17 @@ mod tests {
             ),
             (0x14, Request::ClearGapFences),
             (0x15, Request::FenceGaps),
+            (0x16, Request::BurstMarks),
+            (
+                0x17,
+                Request::Relay {
+                    producer_id: 0,
+                    producer_seq: 0,
+                    subject: String::new(),
+                    body: Vec::new(),
+                },
+            ),
+            (0x18, Request::OriginStamps),
         ];
         for (tag, req) in &request_tags {
             let bytes = encode_request(req);
@@ -3265,7 +3428,7 @@ mod tests {
         }
         assert_eq!(
             decodable_requests, declared_requests,
-            "exactly twenty-one request tags decode, and no other byte does"
+            "exactly the declared request tags decode, and no other byte does"
         );
         assert_eq!(
             decodable_responses, declared_responses,

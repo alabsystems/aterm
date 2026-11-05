@@ -432,7 +432,7 @@ pub mod fake {
             let mut out = self.answer_for(&[guest_path.to_string()]);
             match self.files.get(guest_path) {
                 Some(bytes) => {
-                    if let Err(e) = std::fs::write(host_path, bytes) {
+                    if let Err(e) = crate::util::write_fresh(host_path, bytes) {
                         out.code = Some(1);
                         out.text = e.to_string();
                     }

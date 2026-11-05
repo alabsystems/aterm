@@ -202,7 +202,13 @@ fn write_durably(
     path: &Path,
     write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    let file = std::fs::File::create(path).map_err(|e| io("create", path, &e))?;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| io("create", path, &e))?;
     let mut out = std::io::BufWriter::new(file);
     write(&mut out).map_err(|e| match e {
         Error::Io(why) => Error::Io(format!("{}: {why}", path.display())),

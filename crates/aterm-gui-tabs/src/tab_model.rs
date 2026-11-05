@@ -113,6 +113,12 @@ impl<I: StableId> IdAllocator<I> {
         self.next = raw.checked_add(1).ok_or(IdExhausted)?;
         Ok(I::from_raw(raw))
     }
+
+    /// Leaves no identity to mint, for a test of what an exhausted allocator refuses.
+    #[cfg(any(test, debug_assertions))]
+    pub const fn exhaust_for_test(&mut self) {
+        self.next = u64::MAX;
+    }
 }
 
 /// A terminal view's typed link into the process-wide session pool.
@@ -1563,6 +1569,10 @@ pub struct Tab {
     /// are a suffix of their [`TabSet`], which keeps that across every change; write this only
     /// before a [`TabSet::push`].
     pub parked: bool,
+    /// A tab a task opened for itself, never a person's: it goes once its task has concluded, and
+    /// only [`TabSet::keep`] makes it a person's. Every parked tab is one, and the mark outlives
+    /// any other way off the parked tabs.
+    pub ephemeral: bool,
 }
 
 impl Tab {
@@ -1575,6 +1585,7 @@ impl Tab {
             zoomed: false,
             presentation,
             parked: false,
+            ephemeral: false,
         }
     }
 
@@ -1593,6 +1604,7 @@ impl Tab {
             zoomed,
             presentation,
             parked: false,
+            ephemeral: false,
         }
     }
 
@@ -1939,15 +1951,21 @@ impl TabSet {
         Ok(at)
     }
 
-    /// Take a tab off the suffix: it becomes the last shown tab, keeping which tab is active.
-    /// Its new canonical index, or `None` when it is absent or not parked.
-    pub fn unpark(&mut self, id: TabId) -> Option<usize> {
+    /// A person keeps a worker's tab as their own: it loses its [`Tab::ephemeral`] mark and, where
+    /// it is parked, leaves the suffix to become the last shown tab, keeping which tab is active.
+    /// Its canonical index, or `None` when it is absent or no worker's (neither parked nor marked).
+    pub fn keep(&mut self, id: TabId) -> Option<usize> {
         let from = self
             .tabs
             .iter()
-            .position(|tab| tab.id == id && tab.parked)?;
+            .position(|tab| tab.id == id && (tab.parked || tab.ephemeral))?;
+        if !self.tabs[from].parked {
+            self.tabs[from].ephemeral = false;
+            return Some(from);
+        }
         let mut tab = self.tabs.remove(from);
         tab.parked = false;
+        tab.ephemeral = false;
         let to = self.shown_len();
         self.tabs.insert(to, tab);
         Some(to)
@@ -2127,6 +2145,7 @@ mod tests {
             let id = ids.allocate().expect("finite test id space");
             let mut tab = Tab::new(id, view, TabPresentation::terminal(format!("t{index}")));
             tab.parked = index >= shown;
+            tab.ephemeral = tab.parked;
             assert_eq!(set.push(tab).expect("fresh id"), index);
             tabs.push(id);
         }
@@ -2302,16 +2321,23 @@ mod tests {
     }
 
     #[test]
-    fn unparking_makes_the_worker_the_last_shown_tab_and_keeps_the_front() {
+    fn keeping_makes_the_worker_the_last_shown_tab_a_persons_and_keeps_the_front() {
         let (mut set, store, tabs) = parked_set(2, 3);
         assert!(set.switch_to(tabs[0]));
-        assert_eq!(set.unpark(tabs[3]), Some(2));
+        assert_eq!(set.keep(tabs[3]), Some(2));
         assert_eq!(set.tabs()[2].id, tabs[3]);
         assert!(!set.tabs()[2].parked);
+        assert!(!set.tabs()[2].ephemeral, "it is a person's now");
         assert_eq!(set.shown_len(), 3);
         assert_eq!(set.active_id(), Some(tabs[0]));
         assert!(set.invariant_holds(&store));
-        assert_eq!(set.unpark(tabs[0]), None, "only a parked tab comes out");
+        assert_eq!(set.keep(tabs[0]), None, "a person's tab is kept already");
+        // A worker's tab off the parked tabs keeps its mark until it is kept, where it stands.
+        set.tab_at_mut(1).expect("a tab").ephemeral = true;
+        assert_eq!(set.keep(tabs[1]), Some(1));
+        assert!(!set.tabs()[1].ephemeral);
+        assert_eq!(set.tabs()[1].id, tabs[1]);
+        assert!(set.invariant_holds(&store));
     }
 
     #[test]

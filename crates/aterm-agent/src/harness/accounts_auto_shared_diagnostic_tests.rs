@@ -149,7 +149,11 @@ impl Fixture {
     fn background(&self) -> crate::harness::cli::shared_renewal::BackgroundRenewal {
         let records = self.records();
         let row = records.roster.row("shared").unwrap();
-        let signin = self.bed.store.signin_now().unwrap().unwrap();
+        let signin = crate::harness::sign_in_ladder::begun_fixture(
+            self.bed.store.signin_now().unwrap().unwrap(),
+            Cli::Claude,
+            "shared",
+        );
         let env = quiet_env(
             &self.bed.home,
             &self.bed.state,
@@ -194,7 +198,7 @@ fn failed_policy(fixture: &Fixture) -> FailedPolicy {
     let clock = Instant::now();
     let mut guard = fixture.guard.lock().unwrap();
     let retries = guard.ladder.retry_at("shared", clock).is_some();
-    guard.ladder.peer_heard(clock);
+    guard.ladder.moved(clock);
     FailedPolicy {
         generation: attempt.intent.generation,
         outcome: attempt.outcome,

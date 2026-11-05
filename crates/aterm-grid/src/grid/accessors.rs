@@ -72,6 +72,14 @@ impl Grid {
         self.storage.display_offset()
     }
 
+    /// How many times this grid's history was erased ([`Self::erase_scrollback`]): a reading
+    /// position taken at one count names rows that are gone at a later one.
+    #[must_use]
+    #[inline]
+    pub const fn scrollback_clear_gen(&self) -> u64 {
+        self.storage.scrollback_clear_gen
+    }
+
     /// Take the accumulated content scroll delta, resetting it to 0.
     #[inline]
     pub const fn take_content_scroll_delta(&mut self) -> i32 {
@@ -484,7 +492,6 @@ impl Grid {
     /// Make an inline-image ref a cell's only image.
     #[inline]
     pub fn set_cell_image(&mut self, row: u16, col: u16, image: crate::ImageRef) {
-        crate::history_reads::note();
         self.storage.cell_extra_mut(row, col);
         let coord = CellCoord::new(row, col);
         self.storage.extras_mut().set_image(coord, image);
@@ -493,7 +500,6 @@ impl Grid {
     /// Stack an inline-image ref onto a cell's images in draw order.
     #[inline]
     pub fn stack_cell_image(&mut self, row: u16, col: u16, image: crate::ImageRef) {
-        crate::history_reads::note();
         self.storage.cell_extra_mut(row, col);
         let coord = CellCoord::new(row, col);
         self.storage.extras_mut().stack_image(coord, image);

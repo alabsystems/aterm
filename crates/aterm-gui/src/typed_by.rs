@@ -247,6 +247,9 @@ struct Stamps {
     last: Option<Typed>,
     /// When a caller other than aterm's own ([`Who::is_aterms_own`]) last typed.
     driven_at_unix_ms: Option<u64>,
+    /// A caller other than aterm's own was admitted to type here, set before its bytes are
+    /// written ([`TypedStamp::admit`]) and never cleared.
+    driver_admitted: bool,
 }
 
 impl Who {
@@ -263,6 +266,7 @@ impl TypedStamp {
         let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if !by.who.is_aterms_own() {
             slot.driven_at_unix_ms = Some(at_unix_ms);
+            slot.driver_admitted = true;
         }
         let (by, moved) = match slot.last.take() {
             Some(last) if last.by.covers(&by.who) => {
@@ -272,6 +276,27 @@ impl TypedStamp {
         };
         slot.last = Some(Typed { by, at_unix_ms });
         moved
+    }
+
+    /// Note that `by` was admitted to type here, before its bytes are written: `reveal` reads
+    /// [`TypedStamp::driver_admitted`] from the admission on, so a process the write starts cannot
+    /// ask before the driver counts.
+    pub(crate) fn admit(&self, by: &Caller) {
+        if !by.who.is_aterms_own() {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .driver_admitted = true;
+        }
+    }
+
+    /// Whether a caller other than aterm's own has ever been admitted to type into the session
+    /// ([`TypedStamp::admit`], or a [`TypedStamp::stamp`] without one).
+    pub(crate) fn driver_admitted(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .driver_admitted
     }
 
     pub(crate) fn last(&self) -> Option<Typed> {
@@ -326,6 +351,17 @@ fn shell_tab(lineage: &[(i32, Option<i32>)], shells: &[(u64, i32)]) -> Option<(u
     lineage.iter().enumerate().find_map(|(up, &(pid, pgid))| {
         crate::consent_observer::owning_session(pid, pgid, shells).map(|tab| (up, tab))
     })
+}
+
+/// The tab (session local id) of `who`'s process: the session in `shells` whose shell is that
+/// process or its nearest ancestor ([`shell_tab`]). An edge's client is its tab's own; any other
+/// caller is in no tab.
+pub(crate) fn tab_session_of(who: &Who, shells: &[(u64, i32)]) -> Option<u64> {
+    match who {
+        Who::Process { lineage, .. } => shell_tab(lineage, shells).map(|(_, tab)| tab),
+        Who::Edge { client, .. } => tab_session_of(client, shells),
+        Who::Aterm | Who::Bridge | Who::Word(_) => None,
+    }
 }
 
 /// THE NAME of `who` (main thread).

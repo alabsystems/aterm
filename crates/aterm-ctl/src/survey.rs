@@ -264,6 +264,11 @@ pub(crate) struct Survey {
     /// The pools whose rows its instance could not read (`accounts_unread=`), which a reader
     /// takes as unknown, never as none.
     pub(crate) unread: Vec<String>,
+    /// One record per checkout aterm's setup cloned into the instance's home (`repo` lines), as
+    /// its last read found them, where its header counts them (`repos=<n>`) and the lines that
+    /// came are that many; `None` from an aterm that says nothing of them, one that read none yet
+    /// (`repos=-`), or a reply whose lines a cap cut: unknown, never none.
+    pub(crate) repos: Option<Vec<Fields>>,
 }
 
 /// A record's `key=value` fields in wire order, values decoded.
@@ -300,6 +305,7 @@ pub(crate) fn parse_reply(lines: &[String]) -> Result<Survey, String> {
     let mut survey = Survey::default();
     let mut header = false;
     let mut accounts = Vec::new();
+    let mut repos = Vec::new();
     for line in lines {
         if line.starts_with("instance ") {
             survey.header = Fields::of(line);
@@ -308,9 +314,21 @@ pub(crate) fn parse_reply(lines: &[String]) -> Result<Survey, String> {
             survey.sessions.push(Fields::of(line));
         } else if line.starts_with("account ") {
             accounts.push(Fields::of(line));
+        } else if line.starts_with("repo ") {
+            repos.push(Fields::of(line));
         }
     }
-    survey.accounts = survey.header.number("accounts").map(|_| accounts);
+    // Rows count only as many as the header says came: a reply cap drops every extra line at
+    // once, and a header whose rows did not all come says nothing of them.
+    let counted = |key: &str, rows: Vec<Fields>| {
+        survey
+            .header
+            .number(key)
+            .filter(|&n| usize::try_from(n).is_ok_and(|n| n == rows.len()))
+            .map(|_| rows)
+    };
+    survey.accounts = counted("accounts", accounts);
+    survey.repos = counted("repos", repos);
     survey.unread = survey
         .header
         .get("accounts_unread")
@@ -627,6 +645,19 @@ fn account_said(row: &Fields, at_ms: Option<u64>, remote: bool) -> String {
     match condition {
         Some("low") => said.push_str(" low"),
         Some("limited") if !figures => said.push_str(" wall ended"),
+        // Figures on an unseen row are old ones: say how old, so none reads as what it uses now.
+        Some("unseen") if figures => {
+            match row
+                .number("read_at")
+                .map(|s| s.saturating_mul(1000))
+                .zip(at_ms)
+            {
+                Some((read, at)) if read <= at => {
+                    said.push_str(&format!(" read {} ago", age(at - read)));
+                }
+                _ => said.push_str(" unseen"),
+            }
+        }
         Some(word) if !figures => {
             said.push(' ');
             said.push_str(if !remote || is_word(word) { word } else { "?" });
@@ -670,6 +701,105 @@ fn accounts_line(survey: &Survey, remote: bool) -> Option<String> {
         &format!("  accounts: {}", pools.join(" \u{b7} ")),
         LINE_CHARS,
     ))
+}
+
+/// Free space as a line shows it: whole GiB from 1 GiB, else MiB.
+pub(crate) fn size_shown(mb: u64) -> String {
+    if mb >= 1024 {
+        format!("{} GiB", mb / 1024)
+    } else {
+        format!("{mb} MiB")
+    }
+}
+
+/// What one checkout row says, for [`home_lines`]: its name, branch and commit, how far behind
+/// its origin's main it is as of its last fetch, how long ago that was (on its Mac's clock,
+/// `at_ms`), and whether it is dirty (`trust main@0123456789ab 3 behind origin/main, fetched 2h
+/// ago, dirty`).
+fn repo_said(row: &Fields, at_ms: Option<u64>) -> String {
+    let name = shown(row.get("name").unwrap_or("?"), 32);
+    let head = row
+        .get("head")
+        .filter(|head| head.len() >= 12 && head.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|head| &head[..12]);
+    let at = match (row.get("branch"), head) {
+        (Some(branch), Some(head)) => format!(" {}@{head} ", shown(branch, 24)),
+        (None, Some(head)) => format!(" @{head} "),
+        (_, None) => ", no HEAD read, ".to_owned(),
+    };
+    let behind = match (row.number("behind"), row.get("main")) {
+        (Some(n), Some(main)) => format!("{n} behind {}", shown(main, 24)),
+        (Some(n), None) => format!("{n} behind"),
+        (None, Some(main)) => format!("? behind {}", shown(main, 24)),
+        (None, None) => "no origin main".to_owned(),
+    };
+    let fetched = match (row.number("fetched_at"), at_ms) {
+        (Some(fetched), Some(at)) => format!(", fetched {} ago", age(at.saturating_sub(fetched))),
+        (Some(_), None) => String::new(),
+        (None, _) => ", never fetched".to_owned(),
+    };
+    let dirty = match row.get("dirty") {
+        Some("1") => ", dirty",
+        Some("0") => "",
+        _ => ", status unread",
+    };
+    format!("{name}{at}{behind}{fetched}{dirty}")
+}
+
+/// The most checkouts a block's text lists ([`home_lines`]); `--json` carries every one.
+const CHECKOUTS_SHOWN: usize = 16;
+
+/// The lines a block's header is followed by where its instance says where its home is: the
+/// home, the free space on its volume and when its checkouts were read (`  home /Users//a, 812 GiB
+/// free · checkouts read 3m ago`), then each checkout aterm's setup cloned into it as that read
+/// found it (`    trust main@0123456789ab 3 behind origin/main, fetched 2h ago, dirty`), at most
+/// [`CHECKOUTS_SHOWN`], each cut to [`LINE_CHARS`]; none where it says nothing of its home (an
+/// aterm before the field).
+fn home_lines(survey: &Survey) -> Vec<String> {
+    let h = &survey.header;
+    let Some(home) = h.get("home") else {
+        return Vec::new();
+    };
+    let at_ms = h.number("at_ms");
+    let mut head = format!("  home {}", shown(home, 64));
+    if let Some(mb) = h.number("home_free_mb") {
+        head.push_str(&format!(", {} free", size_shown(mb)));
+    }
+    head.push_str(" \u{b7} ");
+    let Some(rows) = &survey.repos else {
+        // A count whose rows did not all come is a reply a cap cut, not a read not made.
+        head.push_str(if h.number("repos").is_some() {
+            "checkouts cut from this reply (--json has none either)"
+        } else {
+            "checkouts not read yet"
+        });
+        return vec![fit(&head, LINE_CHARS)];
+    };
+    match h.number("repos_at").zip(at_ms) {
+        Some((read, at)) => head.push_str(&format!(
+            "checkouts read {} ago",
+            age(at.saturating_sub(read))
+        )),
+        None => head.push_str("checkouts read"),
+    }
+    let cut = h.number("repos_cut").filter(|&cut| cut > 0);
+    if rows.is_empty() && cut.is_none() {
+        head.push_str(": none");
+    }
+    let mut lines = vec![fit(&head, LINE_CHARS)];
+    for row in rows.iter().take(CHECKOUTS_SHOWN) {
+        lines.push(fit(&format!("    {}", repo_said(row, at_ms)), LINE_CHARS));
+    }
+    if rows.len() > CHECKOUTS_SHOWN {
+        lines.push(format!(
+            "    +{} more (--json lists each)",
+            rows.len() - CHECKOUTS_SHOWN
+        ));
+    }
+    if let Some(cut) = cut {
+        lines.push(format!("    +{cut} past the most a read lists, not read"));
+    }
+    lines
 }
 
 fn header_line(reply: &HostReply, survey: &Survey) -> String {
@@ -1387,14 +1517,15 @@ fn blocks_of(replies: &[HostReply], own: Option<&str>) -> Blocks {
                     })
                     .collect();
                 entries.sort_by_key(|entry| entry.class);
-                let header = header_line(reply, survey);
-                Ok(Block {
-                    header: match accounts_line(survey, reply.remote) {
-                        Some(accounts) => format!("{header}\n{accounts}"),
-                        None => header,
-                    },
-                    entries,
-                })
+                let mut header = header_line(reply, survey);
+                for line in accounts_line(survey, reply.remote)
+                    .into_iter()
+                    .chain(home_lines(survey))
+                {
+                    header.push('\n');
+                    header.push_str(&line);
+                }
+                Ok(Block { header, entries })
             }
             Err(why) => Err(unanswered_line(&reply.label, why)),
         })
@@ -1652,7 +1783,7 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
             );
             match &reply.answer {
                 Ok(survey) => format!(
-                    "{{{head},\"instance\":{},\"accounts\":{},\"sessions\":[{}]}}",
+                    "{{{head},\"instance\":{},\"accounts\":{},\"repos\":{},\"sessions\":[{}]}}",
                     object(&survey.header),
                     survey.accounts.as_ref().map_or_else(
                         || "null".to_owned(),
@@ -1662,6 +1793,13 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
                                 .map(|row| object_masking(row, "id"))
                                 .collect::<Vec<_>>()
                                 .join(",")
+                        )
+                    ),
+                    survey.repos.as_ref().map_or_else(
+                        || "null".to_owned(),
+                        |rows| format!(
+                            "[{}]",
+                            rows.iter().map(object).collect::<Vec<_>>().join(",")
                         )
                     ),
                     survey

@@ -1294,9 +1294,9 @@ fn dump_all(
                         return;
                     };
                     let ran = (|| -> Result<(), String> {
-                        let stdout = std::fs::File::create(path(side, i, "dump"))
+                        let stdout = crate::util::create_stdio_file(&path(side, i, "dump"))
                             .map_err(|e| e.to_string())?;
-                        let stderr = std::fs::File::create(path(side, i, "err"))
+                        let stderr = crate::util::create_stdio_file(&path(side, i, "err"))
                             .map_err(|e| e.to_string())?;
                         let status = aterm_uds::spawnfd::command(bins[side])
                             .arg(&scripts[i])
@@ -1442,7 +1442,7 @@ pub fn cmd_trail_diff(args: &[String]) -> Res {
                 file.display()
             ))
         })?;
-        std::fs::write(&file, planted)
+        crate::util::write_fresh(&file, planted)
             .map_err(|e| not_run(format!("the plant: {}: {e}", file.display())))?;
     }
     if a.control == Some(Control::DarkArm) {
@@ -1455,7 +1455,7 @@ pub fn cmd_trail_diff(args: &[String]) -> Res {
                 file.display()
             ))
         })?;
-        std::fs::write(&file, planted)
+        crate::util::write_fresh(&file, planted)
             .map_err(|e| not_run(format!("the dark-arm plant: {}: {e}", file.display())))?;
     }
 

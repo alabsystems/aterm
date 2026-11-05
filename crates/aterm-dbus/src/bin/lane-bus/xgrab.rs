@@ -48,7 +48,8 @@ pub(crate) fn run(window: u32, out: &Path) -> Result<(), Error> {
         let p = u32_at(data, i * 4).ok_or_else(|| fault("a short pixel"))?;
         ppm.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
     }
-    let mut f = std::fs::File::create(out).map_err(|e| fault(format!("{}: {e}", out.display())))?;
+    let mut f =
+        crate::unix::create_fresh(out).map_err(|e| fault(format!("{}: {e}", out.display())))?;
     f.write_all(&ppm)
         .map_err(|e| fault(format!("{}: {e}", out.display())))?;
     println!("{width}x{height} depth {depth}");

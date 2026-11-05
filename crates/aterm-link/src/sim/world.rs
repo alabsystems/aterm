@@ -108,6 +108,9 @@ pub(crate) enum Mutant {
     RetireEveryEarlierIncarnation,
     /// The inbox group is committed through a record before it is delivered.
     CommitBeforeDelivery,
+    /// A local refusal's notice goes out ahead of the `deliver` lines its inbox run queued
+    /// before it (`Bridge::refuse_locally`), which are sent after it.
+    RefusalAheadOfQueuedRows,
     /// The inbox commit a round held rides the next publish unclamped: past the first
     /// record still owed to a session or left unaccounted (`Bridge::take_held_commit`).
     HeldCommitPastTheFloor,
@@ -129,6 +132,24 @@ pub(crate) enum Mutant {
     /// before critic item E04 (`Bridge::mirror_rides_nothing`): a sender's snapshot of its own
     /// post's mail count lands in a writer batch of its own, ahead of the delivery's commit.
     MirrorSendsAnUnowedSlotAtOnce,
+    /// The take after a landing whose take left a backlog is held for a commit to carry like any
+    /// other, as E04 first landed (`Bridge::mirror_rides_nothing`, `MirrorRun::drains`): a drain
+    /// waits up to the grace before each batch after its first.
+    MirrorHoldsADrainingTake,
+    /// The round's settle dates the inbox commit's hold from the settle, after the mirror's
+    /// pass, as E04 first landed (`Bridge::mirror_pass_then_settle`): a take that comes back
+    /// empty puts its ctl round trip ahead of the commit's grace.
+    CommitGraceFromTheSettle,
+    /// The bus mirror's take inside the endpoint's rate hold goes the round it falls due with
+    /// an inbox commit owed, as E04's review left it (`Bridge::mirror_behind_the_commit`): its
+    /// ctl round trip, which comes back empty, runs ahead of the round's settle and the
+    /// commit's write.
+    RateHeldTakeAheadOfTheCommit,
+    /// The bus mirror's take inside the endpoint's rate hold waits for the commit's write
+    /// whichever session woke it, as E04c first landed (`Bridge::mirror_behind_the_commit`,
+    /// `MirrorRun::unheld`): the hold is per session, so a take another session's snapshot
+    /// owes goes behind the commit, and the commit and the snapshot go in two writes.
+    RateHoldCoversEverySession,
     /// The bus mirror's first pass after an attach runs ahead of what the loop holds queued
     /// while the open has yet to make the pin's fence, as before critic item D06
     /// (`Bridge::mirror_yields`): the first delivery an attach or a handoff finds waiting
@@ -172,6 +193,24 @@ pub(crate) enum Mutant {
     /// A post goes out though an answer read since its drain reached it held its sender
     /// (`Bridge::unsendable`).
     SendPastAHeldSender,
+    /// A post the broker's rate limit refused is retired at the door, as one refused for good
+    /// (`Bridge::post_refused`, critic item E06): it is lost.
+    RateLimitedIsForGood,
+    /// A rate-limited refusal holds nothing (`Bridge::rate`, critic item E06): the refused post
+    /// and every other publish of the producer go again at the next drain, into the same empty
+    /// bucket.
+    RetryRateLimitedAtOnce,
+    /// An `undeliverable` notice the rate limit held back is dropped, as one refused for good
+    /// (`Bridge::notices_held`, critic item E06's review): the inbox commit passes its record
+    /// and the remote sender is never told.
+    NoticeHeldIsDropped,
+    /// A post the rate limit refused holds only the producer, not its sender for the whole wait
+    /// the refusal named (`RateHold::hold_sender`, critic item E06's review): a byte-limited
+    /// post whose wait is long is sent again after every producer hold, into the same refusal.
+    SenderWaitsOnlyTheProducerHold,
+    /// A quit's withdrawal publishes each `state=exited` row once, a hold behind the rate limit
+    /// waited out by none (`Bridge::withdraw`, critic item E06's review): the rows stay `live`.
+    WithdrawalWaitsNothing,
     /// Every read of an owed ack waits for it (`Bridge::try_settle_one`).
     WaitForEveryAck,
     /// At an idle moment the loop reads an owed post's answer only once it has arrived.
@@ -208,6 +247,10 @@ pub(crate) enum Mutant {
     CleanStopOverAnOwedRecovery,
     /// Each try of the recovery's moves publishes a copy of every file again.
     CopyOnEveryTry,
+    /// A recovery remembers one quarantine copy per source, whatever its prefix
+    /// (`StateDir::quarantine_try`): the retired copy of the record the journal holds at a torn
+    /// file's sequence ends the memory of that file's copy, and the next try makes a second.
+    OneQuarantineMemoryPerSource,
     /// The sweep gives no departed session's subject back (`Bridge::reclaim_subjects`).
     NoSubjectRetire,
     /// The sweep gives a subject back with the unconditional `/a/retire`, whatever landed on it since it read it.
@@ -301,6 +344,15 @@ pub(crate) enum Mutant {
     /// again at its pin without reading it back, and past a cut that dropped its key a post or
     /// a receipt lands twice.
     HandOffWithoutTheHeads,
+    /// A clean stop vouches for a hand-off's files and leaves the heads it kept beside them
+    /// unflushed (`StateDir::a_clean_stop_flushes`): a power cut after the stop keeps the files
+    /// and takes the heads, and the next bridge publishes each record in flight again at its pin
+    /// without reading it back, a second copy past a cut that dropped its key.
+    StopLeavesTheHeadsUnflushed,
+    /// A post with an in-flight entry is sent behind its sender's post to another lane, which has
+    /// none, with that one's answer unread (`Bridge::settle_unjournaled_ahead`): a kill leaves
+    /// the entry, the attach's replay lands it, and that post's retry lands behind it.
+    EntryAheadOfAPostWithNone,
     /// An attach takes its incarnation before it takes a stop's hand-off's files into the
     /// journal, as before item F4 (`StateDir::name_attach_in_posts`): one that stops between
     /// the two leaves the hand-off's heads stale for the next attach, whose replay publishes each
@@ -316,9 +368,28 @@ pub(crate) enum Mutant {
     /// answer or `expired` the asker holds once retention gave that record up.
     DeliverOverAnUnwrittenSettle,
     /// A post whose deadline the disk refused to write is retired all the same, as before item
-    /// F4 (`Bridge::post_landed`): a bridge killed before the table is written again leaves
+    /// F4 (`Bridge::landing_line`): a bridge killed before the table is written again leaves
     /// the next one no deadline to sweep, and the ask never expires.
     RetireOverAnUnwrittenDeadline,
+    /// A landed post's in-flight entry ends ahead of its offset in the self-lane log
+    /// (`Bridge::land_group`, critic item E07): a bridge killed between leaves the next one an
+    /// own record neither in flight nor known as its own, which it refuses as forged.
+    LandedBeforeAcked,
+    /// A landed post's reservation is forgotten ahead of aterm's `outbox sent`
+    /// (`Bridge::land_group`, critic item E07): a bridge killed between leaves the next one a
+    /// post aterm still lists and no pin holds, which goes out again at a fresh sequence.
+    RetireBeforeOutboxSent,
+    /// A landed post's in-flight entry ends at its ack, ahead of aterm's `outbox sent`, as every
+    /// build before critic item E07 ended it (`Bridge::land_group`): a bridge killed between
+    /// leaves the next one its own record to deliver while the post stands queued, and the
+    /// drain's retry at the pin, past a cut that gave the record up, appends a second copy.
+    LandedBeforeOutboxSent,
+    /// A landed post's in-flight entry ends at any answer to its `outbox sent` and at a hold,
+    /// as critic item E07's first cut ended it (`Bridge::land_group`): an answer that leaves
+    /// the post queued (aterm's `ERR busy update-committing`), or a key or a deadline the disk
+    /// refused, lets the record be delivered while the post stands queued, and the drain's
+    /// retry at the pin, past a cut that gave the record up, appends a second copy.
+    LandedWhileThePostStaysQueued,
     /// A post's deadline is armed again over the settle the asks journal remembers, as before
     /// item C04 (`Bridge::note_deadline`): a held ask's retry, by the bridge that held it or by
     /// the next after a kill, arms the deadline its answer or `expired` settled while it was
@@ -341,8 +412,19 @@ pub(crate) enum Mutant {
     /// Every presence row reads its session's screen (`@<sid> text --json`) as it is published,
     /// as before critic item D03 (`Bridge::publish_session_presence`). Its control is a bridge
     /// unit test on the scripted verb lane
-    /// (`an_attach_of_ready_sessions_reads_one_status_batch_a_meta_each_and_no_screen`).
+    /// (`an_attach_of_ready_sessions_reads_one_status_batch_and_no_meta_or_screen`).
     ReadTheScreenEveryRow,
+    /// A session's meaning fields are read by its own `@<sid> meta`, as before critic item E05:
+    /// a `sessions status` row's `role= attention= user_title=` and a watch ack's are left
+    /// unread (`Bridge::status_into_presence`, `Bridge::refresh_meta`). Its control is a bridge
+    /// unit test on the scripted verb lane
+    /// (`an_attach_of_ready_sessions_reads_one_status_batch_and_no_meta_or_screen`).
+    ReadMetaPerSession,
+    /// A local event ends the reconnect back-off's wait (`wait_for_retry_or_aterm_close`), as a
+    /// wait that dials again on any input would: a busy aterm turns the back-off into a rapid
+    /// dial loop. Its control is a bridge unit test on a clock the test holds (critic item E04e,
+    /// `busy_local_events_cannot_accelerate_a_failed_broker_retry`).
+    EventEndsTheBackoff,
 }
 
 /// What one run is.
@@ -433,6 +515,10 @@ pub(crate) struct Opts {
     /// The state dir stands off the boot volume (item RZ2): its page cache vouches for no lease
     /// ([`crate::state::StateDir::trusted_boot`]), so every attach flushes `inc`.
     pub(crate) off_boot_volume: bool,
+    /// THE RATE LIMIT every open of the broker sets (critic item E06): aterm's
+    /// (`broker_rules::rate_limit`), which the worlds' traffic never reaches, or one low enough
+    /// to bind ([`BINDING_RATE`]); `None`: none.
+    pub(crate) rate_limit: Option<astream_broker::RateLimit>,
 }
 
 /// The deadlines an ask draws ([`Opts::deadlines`]), in ms: from one that passes before its
@@ -462,6 +548,24 @@ pub(crate) const SCALED: (u64, u64, u64) = (2 * 1024, 3 * 1024, 12 * 1024);
 /// a tick has yet to cut, waits, and goes on once one has (one under the rule's bytes would
 /// wait on the age alone, a week).
 pub(crate) const SCALED_WINDOW: u64 = 1024;
+
+/// A RATE LIMIT LOW ENOUGH TO BIND (critic item E06, [`Opts::rate_limit`]): ten records a second
+/// and a burst of four, so a drain's posts, a round's presence and `ev` rows, or the mirror's
+/// slots run past it in every committed seed, gap-fenced too, while a settle's half hour still
+/// has room for every world's log.
+///
+/// E06 bound a burst of three, because one of four reached, at seed 78, a hole the limit only
+/// widens: a bridge killed between a post's ack (its in-flight entry ended with its `acked`
+/// write) and the `outbox sent` that retires it left the next bridge an own record it delivered
+/// while the post stood queued; once the commit passed it and retention gave it up, the drain's
+/// retry at the pin found no copy and appended a second (`dup delivery`), the limit's hold
+/// delaying that drain past a kill. Critic item E07 closed it (the entry stands until the post
+/// left aterm's outbox, `Bridge::land_group`), and seed 78 is among the committed
+/// seeds here (`Mutant::LandedBeforeOutboxSent` brings the hole back).
+pub(crate) fn binding_rate() -> astream_broker::RateLimit {
+    astream_broker::RateLimit::records(10, 4)
+        .unwrap_or_else(|| unreachable!("astream takes ten records a second, a burst of four"))
+}
 
 /// A CHANGE OF RULES NO ATERM BUILD MAKES (sim item B05): aterm's at the world's bytes, but each
 /// lane's receipts keep their last value only, a class no aterm rules ever had (every retaining
@@ -545,6 +649,7 @@ impl Opts {
             topics: false,
             handoffs: false,
             off_boot_volume: false,
+            rate_limit: Some(crate::broker_rules::rate_limit()),
         }
     }
 
@@ -643,6 +748,11 @@ pub(crate) struct Stats {
     pub(crate) receipts: u64,
     pub(crate) halts: u64,
     pub(crate) delivered: u64,
+    /// The `deliver` lines a bridge sent in one write with another (`Bridge::send_rows`).
+    pub(crate) deliveries_pipelined: u64,
+    /// The `outbox sent` lines a bridge sent in one write with another
+    /// (`Bridge::retire_on_the_lane`, critic item E07).
+    pub(crate) retires_pipelined: u64,
     pub(crate) exits: u64,
     pub(crate) log_records: u64,
     /// Ghost rows the bridge retired (`presence-retired … reason=unhosted`).
@@ -689,6 +799,8 @@ pub(crate) struct Stats {
     /// ([`bus::Broker::fence_counts`]).
     pub(crate) gap_fenced: u64,
     pub(crate) fences_lifted: u64,
+    /// Publishes the broker's rate limit refused in every open ([`bus::Broker::rate_limited_total`]).
+    pub(crate) rate_limited: u64,
     /// WRITE errors the device injected ([`Opts::write_errors`], [`super::device::WriteErrors`]).
     pub(crate) writes_failed: u64,
     pub(crate) unlinks_failed: u64,
@@ -1056,6 +1168,7 @@ impl World {
         let broker = bus::Broker::new(tier, table);
         lock(&broker.state).mutant = opts.arm;
         lock(&broker.state).gap_fences = opts.gap_fences;
+        broker.limit_every_open(opts.rate_limit);
         broker.retain(opts.rules());
         if opts.journal {
             broker.keep_journal();
@@ -3668,6 +3781,8 @@ impl World {
                 .map(|x| x.rows.len() as u64)
                 .sum()
         };
+        self.stats.deliveries_pipelined = lock(&self.ep.state).deliveries_pipelined;
+        self.stats.retires_pipelined = lock(&self.ep.state).retires_pipelined;
         for b in bad {
             if !self.violations.contains(&b) {
                 self.violations.push(b);
@@ -3816,6 +3931,10 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
     ) = w.core.broker.held_counts();
     (w.stats.commits_corked, w.stats.commits_alone) = w.core.broker.commit_writes();
     (w.stats.gap_fenced, w.stats.fences_lifted) = w.core.broker.fence_counts();
+    w.stats.rate_limited = w.core.broker.rate_limited_total();
+    // THE LAW OF THE LIMIT'S WAIT (critic item E06, `bus::State::rate_laws`): judged at the door,
+    // where a bridge that retried a refusal for the rate at once meets it.
+    w.violations.extend(w.core.broker.take_rate_laws());
     {
         let s = lock(&w.core.broker.state);
         w.stats.retention_ticks = s.ret.ticks;

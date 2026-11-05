@@ -19,6 +19,10 @@ mod transport_tests;
 mod observation;
 pub(super) use observation::observe_live;
 
+#[cfg(all(test, unix))]
+#[path = "native_retirement_debt_tests.rs"]
+mod retirement_debt_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Recovery {
     Legacy,
@@ -26,10 +30,14 @@ pub(super) enum Recovery {
     Cancelled,
     Completed,
     Retired,
+    Held,
 }
+
+pub(super) const WAIT_RETIRED_UNISSUED: &str = "wait:native-retired-unissued";
 
 pub(super) fn coordinated(st: &St) -> bool {
     st.native_coordination
+        || st.native_retired_unissued
         || st.native.is_some()
         || !st.native_prepare.is_empty()
         || st.native_completed_prepare.is_some()
@@ -39,6 +47,18 @@ pub(super) fn coordinated(st: &St) -> bool {
 pub(super) fn constructor_enabled(client: &mut Client, tab: &str) -> bool {
     matches!(native_act::exchange(client, tab, &Request::Constructors),
         Ok(Reply::Constructors(enabled)) if enabled.contains(&Constructor::PrivateRestart))
+}
+
+fn require_cold_constructor(opts: &Opts, client: &mut Client, st: &St) -> Result<(), &'static str> {
+    if opts.token.is_none() {
+        return Err("native-cold-requires-owned-launcher");
+    }
+    if matches!(native_act::exchange(client,&st.tab,&Request::Constructors),Ok(Reply::Constructors(enabled)) if enabled.contains(&Constructor::ColdRestart))
+    {
+        Ok(())
+    } else {
+        Err("native-cold-constructor-disabled")
+    }
 }
 
 fn legacy_before_prepare(opts: &Opts, client: &mut Client, st: &St) -> Result<bool, &'static str> {
@@ -59,10 +79,65 @@ fn legacy_before_prepare(opts: &Opts, client: &mut Client, st: &St) -> Result<bo
     }
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeRetirementDebt",
+        action = "NotGranted",
+        project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeRetirementDebt",
+        action = "Exited",
+        project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeRetirementDebt",
+        action = "Completed",
+        project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeRetirementDebt",
+        action = "Replay",
+        project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+    )
+)]
 fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
+    // A terminal no-grant hold cannot be revived by a later receipt or host epoch.
+    if st.native_retired_unissued {
+        return Some(Recovery::Held);
+    }
+    if matches!(
+        reply,
+        Reply::Decision(Decision::Retired(native_act::Retirement::NotGranted))
+    ) {
+        st.native_retired_unissued = true;
+        return Some(Recovery::Held);
+    }
+    if matches!(reply, Reply::ColdRestartCommitted { .. })
+        && !matches!(Request::parse(&st.native_prepare),
+            Some(Request::Prepare(prepare))
+                if matches!(prepare.plan, NativePlan::Restart { cold: Some(_), .. }))
+        && !st.native_completed_prepare.as_ref().is_some_and(|prepare| {
+            matches!(prepare.plan, NativePlan::Restart { cold: Some(_), .. })
+        })
+    {
+        return None;
+    }
     let outcome = match reply {
         Reply::Decision(Decision::ProvenNotCommittedRollbackSafe) => Recovery::Cancelled,
-        Reply::Committed(_) | Reply::RestartCommitted(_) => Recovery::Completed,
+        Reply::Committed(_) | Reply::RestartCommitted(_) | Reply::ColdRestartCommitted { .. } => {
+            Recovery::Completed
+        }
         Reply::Decision(Decision::Retired(_)) => Recovery::Retired,
         _ => return None,
     };
@@ -72,8 +147,12 @@ fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
         }
         st.native_observation = match reply {
             Reply::RestartCommitted(observation) => Some((**observation).clone()),
+            Reply::ColdRestartCommitted { observation, .. } => observation.as_deref().cloned(),
             _ => None,
         };
+        if let Reply::ColdRestartCommitted { intent, .. } = reply {
+            st.account_intent = Some((**intent).clone());
+        }
     }
     st.native = None;
     st.native_prepare.clear();
@@ -98,6 +177,14 @@ fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
     Some(outcome)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeRetirementDebt",
+        action = "Unknown",
+        project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+    )
+)]
 fn recover_reply(st: &mut St, reply: Reply) -> Result<Recovery, &'static str> {
     if let Some(outcome) = terminal_reply(st, &reply) {
         return Ok(outcome);
@@ -124,7 +211,7 @@ pub(super) fn begin(
     rollback: Option<&super::relaunch::PlannedCommand>,
 ) -> Result<Recovery, &'static str> {
     begin_plan(
-        opts, client, st, session, duty, target, command, rollback, None,
+        opts, client, st, session, duty, target, command, rollback, None, None,
     )
 }
 
@@ -135,8 +222,14 @@ pub(super) fn begin_crash(
     session: &str,
     snap: &super::relaunch::Snapshot,
     command: Option<&super::relaunch::PlannedCommand>,
+    cold: Option<&super::native_act::ColdIntent>,
 ) -> Result<Recovery, &'static str> {
-    if legacy_before_prepare(opts, client, st)? {
+    if st.native_retired_unissued {
+        return Ok(Recovery::Held);
+    }
+    if cold.is_some() {
+        require_cold_constructor(opts, client, st)?;
+    } else if legacy_before_prepare(opts, client, st)? {
         return Ok(Recovery::Legacy);
     }
     let observed = if st.native_prepare.is_empty() {
@@ -155,6 +248,7 @@ pub(super) fn begin_crash(
         command,
         None,
         observed,
+        cold,
     )
 }
 
@@ -167,6 +261,9 @@ pub(super) fn begin_completed_rollback(
     st: &mut St,
     session: &str,
 ) -> Result<Recovery, &'static str> {
+    if st.native_retired_unissued {
+        return Ok(Recovery::Held);
+    }
     if legacy_before_prepare(opts, client, st)? {
         return Ok(Recovery::Legacy);
     }
@@ -207,6 +304,7 @@ pub(super) fn begin_completed_rollback(
         cwd: back.cwd.clone(),
         heal: back.heal.as_ref().map(std::path::PathBuf::from),
         dialect: back.dialect,
+        account_intent: back.account_intent.as_deref().cloned(),
     };
     if command.capture().as_ref() != Some(back.as_ref()) {
         return Err("native-completed-target-changed");
@@ -224,6 +322,7 @@ pub(super) fn begin_completed_rollback(
         Some(&command),
         None,
         Some((observed.registration, observed.binding)),
+        None,
     )
 }
 
@@ -241,10 +340,16 @@ fn begin_plan(
         super::native_observe::Registration,
         super::native_observe::ObservationBinding,
     )>,
+    cold: Option<&super::native_act::ColdIntent>,
 ) -> Result<Recovery, &'static str> {
+    if st.native_retired_unissued {
+        return Ok(Recovery::Held);
+    }
     // CLI/operator constructors preserve their independent legacy authority. Only the real
     // private host opts contain this token; holder/as=person words never select this branch.
-    if legacy_before_prepare(opts, client, st)? {
+    if cold.is_some() {
+        require_cold_constructor(opts, client, st)?;
+    } else if legacy_before_prepare(opts, client, st)? {
         return Ok(Recovery::Legacy);
     }
     if st.native.is_some() || !st.native_prepare.is_empty() {
@@ -337,17 +442,15 @@ fn begin_plan(
                 launcher,
                 socket,
                 forward: Box::new(forward),
+                cold: cold.cloned().map(Box::new),
                 rollback: rollback.map(Box::new),
             },
         });
         st.native_prepare = request.encode().ok_or("native-plan")?;
         st.native_coordination = true;
-        // Persist the original id/plan/deadline BEFORE the first prepare dispatch. A lost
-        // prepare ACK can recover that same operation without inventing another mutation.
-        upgrade_drive::save_checked(opts, session, st).map_err(|_| "native-unsaved")?;
     }
     let tab = st.tab.clone();
-    let recovered = recover(client, &tab, st)?;
+    let recovered = recover(opts, session, client, &tab, st)?;
     if recovered == Recovery::Completed {
         // A local record failure cannot turn a positively completed operation back into an
         // unsent constructor. The saved original prepare still replays the same completion.
@@ -362,15 +465,75 @@ fn begin_plan(
     }
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeReplayPublication",
+        action = "FailBarrier",
+        reason = "The injected filesystem refuses the directory durability barrier"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeReplayPublication",
+        action = "RepairBarrier",
+        reason = "The injected filesystem resumes acknowledging directory durability"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeReplayPublication",
+        action = "DryRun",
+        reason = "The caller supplies options that forbid native dispatch"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeReplayPublication",
+        action = "LiveRun",
+        reason = "The caller supplies ordinary execution options"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeReplayPublication",
+        action = "Hold",
+        reason = "A positive retirement receipt has established the retained hold"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeReplayPublication",
+        action = "Attempt",
+        project = "aterm_agent::harness::native_restart::transport_tests::replay_model::transition"
+    )
+)]
 pub(super) fn recover(
+    opts: &Opts,
+    session: &str,
     client: &mut Client,
     tab: &str,
     st: &mut St,
 ) -> Result<Recovery, &'static str> {
+    if st.native_retired_unissued {
+        return Ok(Recovery::Held);
+    }
+    if opts.dry_run {
+        return Err("native-dry-run");
+    }
     let request = Request::parse(&st.native_prepare).ok_or("native-plan")?;
     let Request::Prepare(prepare) = &request else {
         return Err("native-plan");
     };
+    // Prepare replay can admit an operation whose earlier request never arrived.
+    // Reconfirm persistence on every attempt, including after a lost directory
+    // barrier acknowledgement; a visible or in-memory record is insufficient.
+    upgrade_drive::save_checked(opts, session, st).map_err(|_| "native-unsaved")?;
     let reply = native_act::exchange(client, tab, &request).map_err(|_| "native-unknown")?;
     if matches!(&reply, Reply::Admitted(binding) | Reply::Pending(binding) if binding.id != prepare.id)
     {
@@ -379,10 +542,17 @@ pub(super) fn recover(
     recover_reply(st, reply)
 }
 
-pub(super) fn abort(client: &mut Client, tab: &str, st: &mut St) -> bool {
-    match recover(client, tab, st) {
+pub(super) fn abort(
+    opts: &Opts,
+    session: &str,
+    client: &mut Client,
+    tab: &str,
+    st: &mut St,
+) -> bool {
+    match recover(opts, session, client, tab, st) {
         Ok(Recovery::Cancelled) => return true,
-        Ok(Recovery::Completed | Recovery::Retired | Recovery::Legacy) | Err(_) => return false,
+        Ok(Recovery::Completed | Recovery::Retired | Recovery::Held | Recovery::Legacy)
+        | Err(_) => return false,
         Ok(Recovery::Admitted) => {}
     }
     let Some(binding) = st.native.as_ref() else {
@@ -423,6 +593,48 @@ pub(super) fn resume(
     }
 }
 
+fn query_observation(
+    client: &mut Client,
+    tab: &str,
+    st: &mut St,
+) -> Result<Option<Reply>, &'static str> {
+    if st.native_retired_unissued {
+        return Ok(None);
+    }
+    let Some(binding) = st.native.clone() else {
+        return Ok(None);
+    };
+    let reply = native_act::exchange(client, tab, &Request::Query(binding))
+        .map_err(|_| "native-recovery")?;
+    // Even a probe for a different condition has received this irreversible
+    // observation. Do not discard it and later consume the debt on a timeout.
+    if matches!(
+        reply,
+        Reply::Decision(Decision::Retired(native_act::Retirement::NotGranted))
+    ) {
+        let _outcome = terminal_reply(st, &reply);
+    }
+    Ok(Some(reply))
+}
+
+pub(super) fn refresh_retirement_hold(
+    client: &mut Client,
+    tab: &str,
+    st: &mut St,
+) -> Result<bool, &'static str> {
+    let _observation = query_observation(client, tab, st)?;
+    Ok(st.native_retired_unissued)
+}
+
+pub(super) fn launch_unissued(
+    client: &mut Client,
+    tab: &str,
+    st: &mut St,
+) -> Result<bool, &'static str> {
+    Ok(matches!(query_observation(client, tab, st)?,
+        Some(Reply::Unissued(unissued)) if unissued == phase(st)))
+}
+
 pub(super) fn complete(
     opts: &Opts,
     session: &str,
@@ -430,6 +642,9 @@ pub(super) fn complete(
     tab: &str,
     st: &mut St,
 ) -> bool {
+    if st.native_retired_unissued {
+        return false;
+    }
     let Some(binding) = st.native.clone() else {
         return st.native_prepare.is_empty();
     };
@@ -465,20 +680,30 @@ pub(super) fn complete(
     // Precommit may be Unknown because an earlier identical Commit was received but its
     // kernel observation failed. Replaying the same sealed phase/version only completes it;
     // the server never admits another native mutation through this request.
-    let _proof = native_act::exchange(client, tab, &Request::Precommit(binding.clone(), phase));
+    if let Ok(reply) =
+        native_act::exchange(client, tab, &Request::Precommit(binding.clone(), phase))
+        && let Some(outcome) = terminal_reply(st, &reply)
+    {
+        if outcome == Recovery::Cancelled {
+            st.stop("native-cancelled-before-mutation", upgrade_drive::now_s());
+        }
+        return outcome == Recovery::Completed;
+    }
     native_act::exchange(client, tab, &Request::Commit(binding, phase, st.to.clone()))
         .ok()
         .and_then(|reply| terminal_reply(st, &reply))
         == Some(Recovery::Completed)
 }
 
-pub(super) fn resume_observed(client: &mut Client, tab: &str, st: &St) -> bool {
-    st.native.as_ref().is_some_and(|binding| {
-        match native_act::exchange(client, tab, &Request::Query(binding.clone())) {
-            Ok(Reply::Resumed(done)) => done == phase(st),
-            Ok(Reply::Committed(_) | Reply::RestartCommitted(_)) => true,
-            _ => false,
-        }
+pub(super) fn resume_observed(
+    client: &mut Client,
+    tab: &str,
+    st: &mut St,
+) -> Result<bool, &'static str> {
+    Ok(match query_observation(client, tab, st)? {
+        Some(Reply::Resumed(done)) => done == phase(st),
+        Some(reply) => terminal_reply(st, &reply) == Some(Recovery::Completed),
+        _ => false,
     })
 }
 
@@ -499,7 +724,26 @@ pub(super) fn human_seq(status: &str) -> Option<u64> {
     (values.next().is_none() && parsed.to_string() == text).then_some(parsed)
 }
 
-pub(super) fn retire(client: &mut Client, tab: &str, st: &mut St) -> bool {
+pub(super) fn retire(
+    opts: &Opts,
+    session: &str,
+    client: &mut Client,
+    tab: &str,
+    st: &mut St,
+) -> bool {
+    if st.native_retired_unissued {
+        return false;
+    }
+    if st.native.is_none() && !st.native_prepare.is_empty() {
+        // A lost Prepare reply can leave only the saved exact request. Replay
+        // that request to recover its binding before reconciling; never mint a
+        // replacement id or signal/resume a command merely to close it.
+        match recover(opts, session, client, tab, st) {
+            Ok(Recovery::Admitted) => {}
+            Ok(Recovery::Retired | Recovery::Cancelled) => return true,
+            _ => return false,
+        }
+    }
     let Some(binding) = st.native.clone() else {
         return st.native_prepare.is_empty();
     };

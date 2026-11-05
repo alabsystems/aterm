@@ -193,7 +193,7 @@ pub fn read_owner_command(home: &Path) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = open.open(path).ok()?;
     let meta = file.metadata().ok()?;
@@ -622,7 +622,7 @@ fn read_regular(path: &Path) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = open.open(path).ok()?;
     let meta = file.metadata().ok()?;
@@ -646,7 +646,8 @@ fn write_reading(dir: &Path, name: &str, text: &str) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let mut file = open.open(&tmp)?;
     let written = file.write_all(text.as_bytes());
@@ -823,7 +824,7 @@ pub fn chain_command(cmd: &str, payload: &[u8]) -> io::Result<aterm_uds::spawnfd
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path)?;
     let _ = std::fs::remove_file(&path);
     file.write_all(payload)?;

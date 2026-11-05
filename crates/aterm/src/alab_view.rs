@@ -15,6 +15,8 @@
 //! path, so typing never waits on it. `[alab] roster = false` in `aterm.toml` turns the source
 //! off on this Mac. A test, a debug build and a build tool's run hold no lab (inert, as the other
 //! lab hooks are), so no test reads this Mac's registry.
+//! Every getter admits current local policy before exposing a held projection. Unavailable
+//! policy hides the projection and blocks automatic fallback without erasing its history.
 //!
 //! [`round`] records, per registry table, that an authenticated peer reported exactly this Mac's
 //! retained registry operations in a round that completed (`RepairRound::matching_inventory`, the
@@ -30,11 +32,11 @@ use aterm_agent::{
     ai::connector::{Flow, Region},
     harness::{
         accounts::{Cli, Vendor},
-        alab_roster::{self, Lab, LabAccount, Placements},
+        alab_roster::{self, Lab, LabAccount, LabMailbox, Part, Placements},
     },
 };
 use aterm_db::alab::{
-    Inventory, LabRead, Registry, import::MailboxKeys, journal::place::Places, view::LabView,
+    Inventory, LabRead, Registry, journal::place::Places, mail, secret::Journal, view::LabView,
 };
 use aterm_secrets::client::Paths;
 use std::collections::BTreeMap;
@@ -66,18 +68,41 @@ fn lab_hooks_on(release: bool, var: impl Fn(&str) -> Option<std::ffi::OsString>)
         && var("CI").is_none()
 }
 
-/// Whether `aterm.toml` at `config` turns the roster source off (`[alab] roster = false`).
-pub(crate) fn turned_off(config: &Path) -> bool {
-    let Ok(Some(bytes)) = aterm_secrets::fsx::read_aterm_config(config, 1024 * 1024) else {
-        return false;
+/// Current local authority for exposing a cached lab projection.
+pub(crate) enum LocalRosterPolicy {
+    Enabled,
+    Disabled,
+    Unavailable,
+}
+
+/// Read current policy through the common ownership and size admission boundary.
+/// Only a missing file or key inherits the enabled default; an unreadable or invalid policy
+/// cannot authorize either the cached lab or an automatic fallback source.
+pub(crate) fn roster_policy(config: &Path) -> LocalRosterPolicy {
+    let text = match aterm_types::dirs::read_aterm_config_text(config) {
+        Ok(None) => return LocalRosterPolicy::Enabled,
+        Ok(Some(text)) => text,
+        Err(_) => return LocalRosterPolicy::Unavailable,
     };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return false;
+    let Ok(table) = aterm_toml::from_str::<aterm_toml::Table>(&text) else {
+        return LocalRosterPolicy::Unavailable;
     };
-    aterm_toml::from_str::<aterm_toml::Table>(text)
-        .ok()
-        .and_then(|table| table.get("alab")?.get("roster")?.as_bool())
-        == Some(false)
+    let Some(alab) = table.get("alab") else {
+        return LocalRosterPolicy::Enabled;
+    };
+    let Some(alab) = alab.as_table() else {
+        return LocalRosterPolicy::Unavailable;
+    };
+    match alab.get("roster") {
+        None | Some(aterm_toml::Value::Boolean(true)) => LocalRosterPolicy::Enabled,
+        Some(aterm_toml::Value::Boolean(false)) => LocalRosterPolicy::Disabled,
+        Some(_) => LocalRosterPolicy::Unavailable,
+    }
+}
+
+/// Whether admitted local policy explicitly turns the roster source off.
+fn turned_off(config: &Path) -> bool {
+    matches!(roster_policy(config), LocalRosterPolicy::Disabled)
 }
 
 /// The private directory recording which registry table's inventory a peer matched.
@@ -167,39 +192,63 @@ fn witness_table(
     (held() == Some(table)).then_some(table)
 }
 
-/// Each mailbox key this Mac can name the login of, to that login lower-cased: a login of
-/// `ai-mailbox.toml` (`logins`) whose digest the importer's mailbox keys hold (`keys`). Only an
-/// admin Mac that imported holds both; elsewhere it is empty.
-fn mailbox_logins(keys: &MailboxKeys, logins: &[String]) -> BTreeMap<String, String> {
+/// Each mailbox key a login of `ai-mailbox.toml` (`logins`) derives
+/// (`keys::mailbox_pk` of its address key), to that login lower-cased.
+fn mailbox_logins(logins: &[String]) -> BTreeMap<String, String> {
     logins
         .iter()
         .filter_map(|login| {
+            let address = aterm_db::typed::keys::address_pk(login.trim()).ok()?;
             Some((
-                keys.pk_of(login)?.to_owned(),
+                aterm_db::typed::keys::mailbox_pk(&address).ok()?,
                 login.trim().to_ascii_lowercase(),
             ))
         })
         .collect()
 }
 
-/// What this Mac reads to name a mailbox key's login ([`mailbox_logins`]): the importer's keys
-/// beside the vault state, and the logins of `~/.secrets/ai-mailbox.toml`. Nothing where either
-/// is missing or unreadable.
+/// What this Mac reads to name a mailbox key's login ([`mailbox_logins`]): the logins of
+/// `~/.secrets/ai-mailbox.toml`, the fallback for a mailbox the registry names no login of
+/// (a version-1 row) until B13. Nothing where it is missing or unreadable.
 fn mailbox_names(paths: &Paths) -> BTreeMap<String, String> {
-    let Ok(keys) = aterm_db::alab::command::read_keys(paths) else {
-        return BTreeMap::new();
-    };
-    if keys.is_empty() {
-        return BTreeMap::new();
-    }
     let file = paths
         .home
         .join(".secrets")
         .join(aterm_agent::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE);
-    mailbox_logins(
-        &keys,
-        &aterm_agent::harness::mailbox_routes::mailbox_logins(&file),
-    )
+    mailbox_logins(&aterm_agent::harness::mailbox_routes::mailbox_logins(&file))
+}
+
+/// The registry's mailboxes as the harness reads them ([`LabMailbox`]): never a value.
+pub(crate) fn lab_mail(mailboxes: &[mail::Mailbox]) -> Vec<LabMailbox> {
+    mailboxes
+        .iter()
+        .map(|m| LabMailbox {
+            pk: m.pk.clone(),
+            login: m.login.to_ascii_lowercase(),
+            service: m.service.clone(),
+            webmail: m.webmail.clone(),
+            receives: m.receives.clone(),
+            held: m
+                .held
+                .iter()
+                .map(|which| match which {
+                    mail::Credential::Password => Part::Password,
+                    mail::Credential::MailboxPassword => Part::MailboxPassword,
+                    mail::Credential::Totp => Part::Totp,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Each mailbox key to its login: the registry's own `login` (one-mesh design step A9), and
+/// `toml`'s for a key the registry names none of.
+fn logins_of(mail: &[LabMailbox], toml: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut out = toml.clone();
+    for mailbox in mail {
+        out.insert(mailbox.pk.clone(), mailbox.login.clone());
+    }
+    out
 }
 
 /// Each address of `placed` (address to the mailbox key the lab places it in) whose mailbox
@@ -287,6 +336,8 @@ struct Held {
     /// mailbox logins are named again at every look ([`mailbox_names`]), so a mailbox added to
     /// or removed from `ai-mailbox.toml` is seen with the registry unchanged.
     placed: BTreeMap<String, String>,
+    /// The held projection's registry mailboxes ([`lab_mail`]), read with it.
+    mail: Vec<LabMailbox>,
     inventory: Option<Inventory>,
     looked: Option<Instant>,
     /// The last read failed or found this Mac's history of the registry partial, no projection
@@ -303,7 +354,7 @@ fn look(
     held: &mut Held,
     read: Result<Option<LabRead>, String>,
     settled: bool,
-    logins: &BTreeMap<String, String>,
+    toml_logins: &BTreeMap<String, String>,
     named: impl FnOnce() -> bool,
     now: Instant,
 ) -> bool {
@@ -317,11 +368,13 @@ fn look(
         Ok(Some(LabRead::Projected(view, inventory))) => {
             held.inventory = Some(inventory);
             held.placed = view.mailboxes();
-            held.lab = Some(Arc::new(harness_lab(&view, settled, logins)));
+            let logins = logins_of(&held.mail, toml_logins);
+            held.lab = Some(Arc::new(harness_lab(&view, settled, &logins)));
             view.my_label().is_some()
         }
         Ok(Some(LabRead::Unchanged)) => {
-            let mailboxes = named_mailboxes(&held.placed, logins);
+            let logins = logins_of(&held.mail, toml_logins);
+            let mailboxes = named_mailboxes(&held.placed, &logins);
             if let Some(lab) = held
                 .lab
                 .as_mut()
@@ -336,6 +389,7 @@ fn look(
         Ok(None) => {
             held.inventory = None;
             held.placed.clear();
+            held.mail.clear();
             held.lab = None;
             false
         }
@@ -363,22 +417,55 @@ struct Cache {
 }
 
 impl Cache {
+    fn current_projection(&self) -> Option<Arc<Lab>> {
+        if !matches!(roster_policy(&self.config), LocalRosterPolicy::Enabled) {
+            return None;
+        }
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lab
+            .clone()
+    }
+
+    fn source_pending(&self) -> bool {
+        match roster_policy(&self.config) {
+            LocalRosterPolicy::Unavailable => return true,
+            LocalRosterPolicy::Disabled => return false,
+            LocalRosterPolicy::Enabled => {}
+        }
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failed
+    }
+
     /// Project again where the inventory moved since the held projection; where it did not,
     /// only the held lab's `settled` is brought up to date.
     fn refresh(&self) {
+        let policy = roster_policy(&self.config);
+        if matches!(policy, LocalRosterPolicy::Unavailable) {
+            return;
+        }
         let registry = Registry::at(self.paths.clone());
         let was = self
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .inventory;
-        let read = if turned_off(&self.config) {
+        let read = if matches!(policy, LocalRosterPolicy::Disabled) {
             Ok(None)
         } else {
             registry
                 .lab(&self.config, was)
                 .map_err(|why| why.to_string())
         };
+        // A new projection reads the registry's mailboxes too: names and patterns, never a value
+        // (`mail::sign_in_mailboxes`). One that does not read keeps the held ones.
+        let mail = matches!(read, Ok(Some(LabRead::Projected(..))))
+            .then(|| mail::sign_in_mailboxes(&registry).ok())
+            .flatten()
+            .map(|found| lab_mail(&found));
         let settled = settled(&registry);
         let logins = mailbox_names(&self.paths);
         let mut held = self
@@ -386,6 +473,9 @@ impl Cache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let named = || settled_dir().is_some_and(|dir| named_in(&dir));
+        if let Some(mail) = mail {
+            held.mail = mail;
+        }
         if look(&mut held, read, settled, &logins, named, Instant::now())
             && let Some(dir) = settled_dir()
         {
@@ -420,22 +510,95 @@ impl alab_roster::Source for &'static Cache {
             self.refresh();
             self.start_refresher();
         }
-        self.held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .lab
-            .clone()
+        self.current_projection()
     }
 
     fn pending(&self) -> bool {
-        self.held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .failed
+        self.source_pending()
     }
 
     fn turned_off(&self) -> bool {
         turned_off(&self.config)
+    }
+
+    fn mail(&self) -> Vec<LabMailbox> {
+        if self.lab().is_none() {
+            return Vec::new();
+        }
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mail
+            .clone()
+    }
+
+    fn reveal_bound(
+        &self,
+        expected: &LabMailbox,
+        parts: &[Part],
+        consume: &mut dyn FnMut(Part, &str),
+    ) -> Result<(), &'static str> {
+        if self.lab().is_none() {
+            return Err("no lab registry is held here");
+        }
+        let journal = Journal::local().map_err(|_| "the local reveal journal is unavailable")?;
+        let which: Vec<_> = parts
+            .iter()
+            .map(|part| match part {
+                Part::Password => mail::Credential::Password,
+                Part::MailboxPassword => mail::Credential::MailboxPassword,
+                Part::Totp => mail::Credential::Totp,
+            })
+            .collect();
+        let result = mail::reveal_bound(
+            &Registry::at(self.paths.clone()),
+            &journal,
+            &expected.pk,
+            &which,
+            aterm_time::unix_millis().unwrap_or(0),
+            |found| {
+                lab_mail(std::slice::from_ref(found)).as_slice() == std::slice::from_ref(expected)
+            },
+            |values| {
+                for (part, value) in parts.iter().zip(values) {
+                    consume(*part, value.as_str().expect("registry Secret is UTF-8"));
+                }
+            },
+        );
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(why)) => Err(why.words()),
+            Err(_) => Err("registry binding or secret changed or is unavailable"),
+        }
+    }
+
+    fn reveal(
+        &self,
+        mailbox: &str,
+        part: Part,
+        consume: &mut dyn FnMut(&str),
+    ) -> Result<(), &'static str> {
+        if self.lab().is_none() {
+            return Err("no lab registry is held here");
+        }
+        let journal = Journal::local().map_err(|_| "the local reveal journal is unavailable")?;
+        let which = match part {
+            Part::Password => mail::Credential::Password,
+            Part::MailboxPassword => mail::Credential::MailboxPassword,
+            Part::Totp => mail::Credential::Totp,
+        };
+        let ask = mail::Ask {
+            mailbox,
+            which,
+            when_ms: aterm_time::unix_millis().unwrap_or(0),
+        };
+        match mail::reveal(&Registry::at(self.paths.clone()), &journal, ask, |value| {
+            consume(value);
+        }) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(withheld)) => Err(withheld.words()),
+            Err(_) => Err("the registry's cell did not open or journal here"),
+        }
     }
 }
 
@@ -460,6 +623,7 @@ pub(crate) fn install() {
         held: Mutex::new(Held {
             lab: None,
             placed: BTreeMap::new(),
+            mail: Vec::new(),
             inventory: None,
             looked: None,
             failed: false,
@@ -473,24 +637,21 @@ pub(crate) fn install() {
 mod tests {
     use super::*;
 
-    /// A mailbox key names its login only where the importer's keys record that login and the
-    /// mailbox config lists it: each listed login the keys know maps its key to the login,
-    /// lower-cased, and a login the keys do not know, or a key no listed login has, maps nothing.
-    /// NEGATIVE CONTROL: with `mailbox_logins` keeping logins whose `pk_of` is `None` (keyed by
-    /// the login itself), the unknown login is mapped (`left: 2 right: 1`).
+    /// A mailbox key names its login by derivation: each listed login maps the key its address
+    /// key derives to the login, lower-cased, and a line that is no address maps nothing.
+    /// NEGATIVE CONTROL: with `mailbox_logins` keying by the login itself, the lookup by the
+    /// derived key finds nothing.
     #[test]
-    fn a_mailbox_key_names_only_a_login_the_importer_recorded() {
-        let mut keys = MailboxKeys::default();
-        keys.record("hub@example.test", "mb-0000000000000001", "hub");
-        keys.record("away@example.test", "mb-0000000000000002", "away");
-        let logins = [
-            "Hub@Example.test".to_owned(),
-            "other@example.test".to_owned(),
-        ];
-        let named = mailbox_logins(&keys, &logins);
+    fn a_mailbox_key_names_the_login_it_derives_from() {
+        let logins = ["Hub@Example.test".to_owned(), "not an address".to_owned()];
+        let named = mailbox_logins(&logins);
         assert_eq!(named.len(), 1);
+        let key = aterm_db::typed::keys::mailbox_pk(
+            &aterm_db::typed::keys::address_pk("hub@example.test").unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            named.get("mb-0000000000000001").map(String::as_str),
+            named.get(&key).map(String::as_str),
             Some("hub@example.test")
         );
     }
@@ -502,14 +663,108 @@ mod tests {
         assert!(!holds());
     }
 
+    /// The registry names a mailbox key's login by its own `login` row (step A9), with no
+    /// `ai-mailbox.toml`; the file's logins name only a key the registry names none of, and an
+    /// address the lab places in a registry mailbox gets that mailbox's login.
+    /// NEGATIVE CONTROL: with `logins_of` letting the file's login win, the registry key reads
+    /// `old@example.test` and the first assertion fails.
+    #[test]
+    fn a_registry_mailbox_names_its_own_login() {
+        let mailboxes = [aterm_db::alab::mail::Mailbox {
+            pk: "mb-registry".into(),
+            label: "proton-1".into(),
+            login: "Owner@example.test".into(),
+            login_pk: "ad-0000000000000000".into(),
+            service: Some("proton".into()),
+            code_path: Some("webmail".into()),
+            webmail: None,
+            receives: vec!["*".into()],
+            held: vec![mail::Credential::Password, mail::Credential::Totp],
+        }];
+        let mail = lab_mail(&mailboxes);
+        assert_eq!(mail[0].login, "owner@example.test");
+        assert_eq!(mail[0].held, [Part::Password, Part::Totp]);
+        let toml = BTreeMap::from([
+            ("mb-registry".to_owned(), "old@example.test".to_owned()),
+            ("mb-file".to_owned(), "file@example.test".to_owned()),
+        ]);
+        let logins = logins_of(&mail, &toml);
+        assert_eq!(logins["mb-registry"], "owner@example.test");
+        assert_eq!(logins["mb-file"], "file@example.test");
+        let placed = BTreeMap::from([("ai1@example.test".to_owned(), "mb-registry".to_owned())]);
+        assert_eq!(
+            named_mailboxes(&placed, &logins_of(&mail, &BTreeMap::new()))["ai1@example.test"],
+            "owner@example.test"
+        );
+    }
+
     fn nothing_held() -> Held {
         Held {
             lab: None,
             placed: BTreeMap::new(),
+            mail: Vec::new(),
             inventory: None,
             looked: None,
             failed: false,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_local_policy_withholds_a_cached_projection_without_erasing_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let config = dir.path().join("aterm.toml");
+        aterm_uds::atomic_file::write(&config, b"[alab]\nroster = true\n", 0o600).unwrap();
+        let mut held = nothing_held();
+        look(
+            &mut held,
+            Ok(Some(naming(Some("m3")))),
+            false,
+            &BTreeMap::new(),
+            || false,
+            Instant::now(),
+        );
+        let cache = Cache {
+            paths: Paths::for_home(dir.path()),
+            config: config.clone(),
+            held: Mutex::new(held),
+            refresher: OnceLock::new(),
+        };
+        let original = cache.current_projection().unwrap();
+        let inventory = cache.held.lock().unwrap().inventory;
+        assert!(!cache.source_pending());
+
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(
+            cache.current_projection().is_none(),
+            "an unavailable current policy must not expose the cached lab"
+        );
+        assert!(
+            cache.source_pending(),
+            "unknown policy cannot select a sheet instead"
+        );
+        assert!(Arc::ptr_eq(
+            cache.held.lock().unwrap().lab.as_ref().unwrap(),
+            &original
+        ));
+        assert_eq!(cache.held.lock().unwrap().inventory, inventory);
+
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for invalid in ["[alab", "[alab]\nroster = 'off'\n"] {
+            std::fs::write(&config, invalid).unwrap();
+            assert!(cache.current_projection().is_none());
+            assert!(cache.source_pending());
+        }
+        std::fs::write(&config, "[alab]\nroster = false\n").unwrap();
+        assert!(cache.current_projection().is_none());
+        assert!(!cache.source_pending(), "explicit off is a known policy");
+        std::fs::write(&config, "[alab]\nroster = true\n").unwrap();
+        assert!(Arc::ptr_eq(&cache.current_projection().unwrap(), &original));
+        assert!(!cache.source_pending());
+        std::fs::remove_file(&config).unwrap();
+        assert!(Arc::ptr_eq(&cache.current_projection().unwrap(), &original));
+        assert!(!cache.source_pending(), "real absence keeps its defaults");
     }
 
     /// A projection whose facts row binds this Mac to a machine labelled `label` (`None`: the
@@ -715,13 +970,13 @@ mod tests {
         assert!(!lab_hooks_on(false, env(&[])), "a debug build");
     }
 
-    /// `[alab] roster = false` turns the source off; anything else, or no file, leaves it on.
+    /// Only admitted `[alab] roster = false` is an explicit Off switch.
     #[test]
     fn the_roster_source_is_on_unless_turned_off() {
         let dir = aterm_tempfile::TempDir::new().unwrap();
         let config = dir.path().join("aterm.toml");
         assert!(!turned_off(&config));
-        std::fs::write(&config, "[alab]\nroster = true\n").unwrap();
+        aterm_uds::atomic_file::write(&config, b"[alab]\nroster = true\n", 0o600).unwrap();
         assert!(!turned_off(&config));
         std::fs::write(&config, "[alab]\nroster = false\n").unwrap();
         assert!(turned_off(&config));

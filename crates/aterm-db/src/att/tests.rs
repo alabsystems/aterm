@@ -15,7 +15,7 @@ use crate::{
         Registry,
         registry::{ADDRESS, MACHINE},
     },
-    table::tests::{Lab, repair_commons},
+    table::tests::{Lab, repair_commons_first},
     typed::{
         grid::{
             self as sheet,
@@ -61,6 +61,26 @@ fn no_birth(_: &Collection, _: &BTreeMap<String, Value>) -> Result<String> {
     Err(Error::new("no births here"))
 }
 
+/// What a push does when Mac 0 first writes the registry: the catalog, which tells Mac 1 of the
+/// table, then the table, each by name.
+fn repair_new_registry(lab: &Lab) {
+    let catalog = crate::catalog::scope(lab.bootstrap(0).trust()).digest();
+    repair_commons_first(lab, 1, catalog);
+    repair_registry(lab, 1);
+}
+
+/// `rounds` rounds of repair naming the registry's table, as a push names the table that moved. The
+/// tests here assert what that one table holds after a repair, not how the repair reached it, and
+/// a push moves records with the same exchange and admissions as a scan's lap.
+/// GAP: these tests see no regular-scan table choice and no idle laps, so a defect only when the
+/// registry is reached by the scan's rotation is not seen here;
+/// `alab::roll::tests::a_roll_restates_everything_and_releases_the_sealed_generation` and
+/// `replica::tests`' table scan keep those.
+fn repair_registry(lab: &Lab, rounds: usize) {
+    let table = REGISTRY.descriptor(lab.bootstrap(0).trust()).unwrap().scope;
+    repair_commons_first(lab, rounds, table.digest());
+}
+
 /// A grid save on one Mac never overwrites what another Mac wrote after the export: of the
 /// owner's two edits, the one to a cell a peer changed meanwhile is held back as stale and the
 /// other is written, in one owner record that spends none of the per-Mac quota.
@@ -73,12 +93,12 @@ fn a_grid_save_never_overwrites_a_peer_edit_made_after_the_export() {
     let owner = Registry::at(lab.paths[0].clone());
     owner.open().unwrap();
     owner.write(vec![machine(MC)]).unwrap();
-    repair_commons(&lab, 6);
+    repair_new_registry(&lab);
     let exported = export_machines(&lab.paths[0]);
     Registry::at(lab.paths[1].clone())
         .write(vec![vec![put(&MACHINE, MC, "status", json!("parked"))]])
         .unwrap();
-    repair_commons(&lab, 6);
+    repair_registry(&lab, 1);
     let row = record(&exported.text, MC);
     let saved = type_in(
         &type_in(&exported.text, row, "status", "lost"),
@@ -120,7 +140,7 @@ fn a_peers_refused_record_never_holds_a_grid_save_back() {
     let owner = Registry::at(lab.paths[0].clone());
     owner.open().unwrap();
     owner.write(vec![machine(MC)]).unwrap();
-    repair_commons(&lab, 6);
+    repair_new_registry(&lab);
     // A write that stops a cell: `att::decode` refuses it on every Mac.
     Registry::at(lab.paths[1].clone())
         .write(vec![vec![crate::database::Change {
@@ -129,7 +149,7 @@ fn a_peers_refused_record_never_holds_a_grid_save_back() {
             value: None,
         }]])
         .unwrap();
-    repair_commons(&lab, 6);
+    repair_registry(&lab, 1);
     let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
     let view = handle.view().unwrap();
     assert_eq!(view.refused.len(), 1);
@@ -183,9 +203,17 @@ fn an_edit_session_reopens_on_a_bad_cell_then_writes_and_leaves_no_scratch() {
             std::fs::write(path, type_in(&held, row, "status", value)).unwrap();
             Ok(())
         };
-        edit::edit(&handle, &MACHINE, &[], false, &mut open, &mut |line| {
-            reports.push(line.to_owned());
-        })
+        edit::edit(
+            &handle,
+            &MACHINE,
+            &[],
+            false,
+            None,
+            &mut open,
+            &mut |line| {
+                reports.push(line.to_owned());
+            },
+        )
         .unwrap()
     };
     assert_eq!(edited.rounds, 2);
@@ -213,6 +241,7 @@ fn an_edit_session_reopens_on_a_bad_cell_then_writes_and_leaves_no_scratch() {
         &MACHINE,
         &[],
         false,
+        None,
         &mut |path: &Path, _| {
             rounds += 1;
             if rounds == 1 {
@@ -402,7 +431,7 @@ fn export_and_apply_round_trip_a_file_and_show_a_stale_cell() {
     let owner = Registry::at(lab.paths[0].clone());
     owner.open().unwrap();
     owner.write(vec![machine(MC)]).unwrap();
-    repair_commons(&lab, 6);
+    repair_new_registry(&lab);
     let scratch = aterm_tempfile::tempdir().unwrap();
     let file = scratch.path().join("machine.tsv");
     let word = file.to_str().unwrap();
@@ -413,7 +442,7 @@ fn export_and_apply_round_trip_a_file_and_show_a_stale_cell() {
     Registry::at(lab.paths[1].clone())
         .write(vec![vec![put(&MACHINE, MC, "status", json!("parked"))]])
         .unwrap();
-    repair_commons(&lab, 6);
+    repair_registry(&lab, 1);
     let held = std::fs::read_to_string(&file).unwrap();
     let row = record(&held, MC);
     let saved = type_in(
@@ -487,7 +516,7 @@ fn quota_revert_pair(owner_first: bool) -> (Lab, Handle, Digest, Digest) {
     if owner_first {
         owner.write(vec![change.clone()]).unwrap();
     }
-    repair_commons(&lab, 6);
+    repair_new_registry(&lab);
     let automatic = |column: &str, value: Value| {
         cell::change(
             &MACHINE,
@@ -505,10 +534,11 @@ fn quota_revert_pair(owner_first: bool) -> (Lab, Handle, Digest, Digest) {
         .collect();
     records.push(vec![automatic("location", json!("over quota"))]);
     Registry::at(lab.paths[1].clone()).write(records).unwrap();
-    repair_commons(&lab, 6);
+    // `SELF_QUOTA + 1` records at `BATCH` a round.
+    repair_registry(&lab, 2);
     if !owner_first {
         owner.write(vec![change.clone()]).unwrap();
-        repair_commons(&lab, 6);
+        repair_registry(&lab, 1);
     }
     let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
     let view = handle.view().unwrap();
@@ -534,7 +564,7 @@ fn assert_quota_revert(owner_first: bool) {
         view.project(&MACHINE).rows[MC].get("location"),
         Some(&json!("rack a"))
     );
-    repair_commons(&lab, 6);
+    repair_registry(&lab, 1);
     let peer = Handle::at(lab.paths[1].clone(), &REGISTRY).view().unwrap();
     assert_eq!(view.cells, peer.cells);
     assert!(peer.quota.over.contains(&excess));
@@ -776,7 +806,7 @@ fn filtered_edit_reopen_keeps_a_stale_row_that_left_the_filter() {
     let owner = Registry::at(lab.paths[0].clone());
     owner.open().unwrap();
     owner.write(vec![machine(MC)]).unwrap();
-    repair_commons(&lab, 6);
+    repair_new_registry(&lab);
     let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
     let filters = [sheet::Where::parse("status=active").unwrap()];
     let mut reopened = String::new();
@@ -786,6 +816,7 @@ fn filtered_edit_reopen_keeps_a_stale_row_that_left_the_filter() {
         &MACHINE,
         &filters,
         false,
+        None,
         &mut |path: &Path, line: usize| {
             rounds += 1;
             let held = std::fs::read_to_string(path).unwrap();
@@ -793,7 +824,7 @@ fn filtered_edit_reopen_keeps_a_stale_row_that_left_the_filter() {
                 Registry::at(lab.paths[1].clone())
                     .write(vec![vec![put(&MACHINE, MC, "status", json!("parked"))]])
                     .unwrap();
-                repair_commons(&lab, 6);
+                repair_registry(&lab, 1);
                 let row = record(&held, MC);
                 std::fs::write(path, type_in(&held, row, "status", "lost")).unwrap();
             } else {
@@ -962,7 +993,7 @@ fn scan_refuses_owned_filters_and_grid_reads_refuse_symlinks_and_stale_retiremen
     let owner = Registry::at(lab.paths[0].clone());
     owner.open().unwrap();
     owner.write(vec![machine(MC)]).unwrap();
-    repair_commons(&lab, 6);
+    repair_new_registry(&lab);
 
     let filter_words: Vec<String> = [
         "scan",
@@ -1010,7 +1041,7 @@ fn scan_refuses_owned_filters_and_grid_reads_refuse_symlinks_and_stale_retiremen
     Registry::at(lab.paths[1].clone())
         .write(vec![vec![put(&MACHINE, MC, "row", json!("retired"))]])
         .unwrap();
-    repair_commons(&lab, 6);
+    repair_registry(&lab, 1);
     let header_only = format!(
         "{}\n",
         std::fs::read_to_string(&file)
@@ -1033,7 +1064,7 @@ fn scan_refuses_owned_filters_and_grid_reads_refuse_symlinks_and_stale_retiremen
     Registry::at(lab.paths[0].clone())
         .write(vec![vec![put(&MACHINE, MC, "row", json!("live"))]])
         .unwrap();
-    repair_commons(&lab, 6);
+    repair_registry(&lab, 1);
     run(
         &lab.paths[0],
         &["export", "alab/registry", "machine", "--tsv", word],
@@ -1041,7 +1072,7 @@ fn scan_refuses_owned_filters_and_grid_reads_refuse_symlinks_and_stale_retiremen
     Registry::at(lab.paths[1].clone())
         .write(vec![vec![put(&MACHINE, MC, "row", json!("live"))]])
         .unwrap();
-    repair_commons(&lab, 6);
+    repair_registry(&lab, 1);
     let header_only = format!(
         "{}\n",
         std::fs::read_to_string(&file)

@@ -4,7 +4,7 @@
 //! Opt-in stacks of an owned, unreaped build front. Sampling uses the readiness deadline;
 //! killing and reaping the sampler is separate safety cleanup and can finish after it.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -112,11 +112,11 @@ fn capture_using(
     let spawn = || -> io::Result<Child> {
         // Truncate stale output before the attempt, so a successful empty capture cannot
         // accidentally inherit evidence from a previous invocation.
-        drop(File::create(output)?);
+        drop(crate::util::create_stdio_file(output)?);
         let mut cmd = make_sampler(pid, output)?;
         cmd.stdin(Stdio::null())
-            .stdout(File::create(&stdout)?)
-            .stderr(File::create(&stderr)?)
+            .stdout(crate::util::create_stdio_file(&stdout)?)
+            .stderr(crate::util::create_stdio_file(&stderr)?)
             .process_group(0)
             .setsid(true);
         if interrupted() || Instant::now() >= ready_by {

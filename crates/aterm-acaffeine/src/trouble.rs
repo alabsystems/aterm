@@ -94,7 +94,7 @@ fn read_at(path: &Path) -> Option<Trouble> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = options.open(path).ok()?;
     let meta = file.metadata().ok()?;

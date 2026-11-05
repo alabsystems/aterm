@@ -574,17 +574,29 @@ mod grant_watch {
             if unsafe { pthread_atfork(None, None, Some(forked)) } != 0 {
                 return None;
             }
-            let mut ends = [0 as libc::c_int; 2];
-            // SAFETY: `ends` is two writable descriptor slots, which `pipe` fills on success.
-            if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-                return None;
-            }
-            // SAFETY: both ends were just opened by this call; the write end is closed at once,
-            // the read end kept for the process's life and made close-on-exec.
-            unsafe {
-                libc::close(ends[1]);
-                libc::fcntl(ends[0], libc::F_SETFD, libc::FD_CLOEXEC);
-            }
+            let sentinel = {
+                use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
+                aterm_uds::kept_out(|| {
+                    let mut ends = [0 as libc::c_int; 2];
+                    // SAFETY: `ends` is two writable descriptor slots, which `pipe` fills on success.
+                    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // SAFETY: both ends were just opened by this call; the write end is closed at once,
+                    // the read end kept for the process's life and made close-on-exec.
+                    let sentinel = unsafe {
+                        libc::close(ends[1]);
+                        let sentinel = OwnedFd::from_raw_fd(ends[0]);
+                        if libc::fcntl(sentinel.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        sentinel
+                    };
+                    Ok(sentinel)
+                })
+                .ok()?
+                .into_raw_fd()
+            };
             let dog: &'static Dog = Box::leak(Box::new(Dog {
                 watched: Mutex::new(Watched {
                     watches: Vec::new(),
@@ -592,7 +604,7 @@ mod grant_watch {
                     begun: false,
                 }),
                 wake: Condvar::new(),
-                sentinel: ends[0],
+                sentinel,
             }));
             std::thread::Builder::new()
                 .name("aterm-pty-grant-watch".to_owned())
@@ -947,9 +959,15 @@ fn open_exec_status_fifo() -> io::Result<(libc::c_int, libc::c_int)> {
             }
             return Err(last);
         }
-        // SAFETY: `path` is the fifo we just created; `chmod` only sets its mode.
+        // SAFETY: `path` is the fifo we just created; `fchmodat` with `AT_SYMLINK_NOFOLLOW`
+        // only sets its mode without following a symlink.
         unsafe {
-            libc::chmod(path.as_ptr(), 0o600);
+            libc::fchmodat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                0o600,
+                libc::AT_SYMLINK_NOFOLLOW,
+            );
         }
         // SAFETY: `path` is a valid NUL-terminated fifo path read by `open`.
         let rd = unsafe {
@@ -1701,7 +1719,6 @@ const END_KILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(20)
 /// Read the nonblocking master `fd`, each read's bytes to `said`, until it has nothing more now
 /// or sixteen reads have: `true` at its end (no process holds the slave: `read` answers 0 on
 /// Apple, `EIO` on Linux), `false` while its slave is open.
-#[cfg(any(test, debug_assertions))]
 #[cfg_attr(trust_verify, trust::skip)]
 fn drain_master(fd: libc::c_int, said: &mut dyn FnMut(&[u8])) -> io::Result<bool> {
     let mut buf = [0_u8; 4096];
@@ -2864,24 +2881,32 @@ pub fn reap(pid: i32) {
     reap_shell(ShellIdentity::from_parts(pid, None, true));
 }
 
-/// Reaps a session's shell on the teardown thread after [`hangup_shell`].
+/// Reaps a session's shell on the teardown thread, asking [`ignores_hangup`] as it starts.
 pub fn reap_shell(identity: ShellIdentity) {
     reap_shell_scheduled(
         identity,
         Some(REAP_KILL_AT),
         REAP_DEADLINE,
         InGrace::enter(),
+        ignores_hangup(&identity),
     );
 }
 
-/// [`reap_shell`] on a thread of its own, so the UI thread never waits.
-pub fn reap_shell_in_background(identity: ShellIdentity) {
+/// [`reap_shell`] on a thread of its own, so the UI thread never waits. `ignored_hangup` is
+/// [`ignores_hangup`]'s answer from before the hang-up.
+pub fn reap_shell_in_background(identity: ShellIdentity, ignored_hangup: bool) {
     if identity.pid <= 1 {
         return;
     }
     let grace = InGrace::enter();
     std::thread::spawn(move || {
-        reap_shell_scheduled(identity, Some(REAP_KILL_AT), REAP_DEADLINE, grace);
+        reap_shell_scheduled(
+            identity,
+            Some(REAP_KILL_AT),
+            REAP_DEADLINE,
+            grace,
+            ignored_hangup,
+        );
     });
 }
 
@@ -2889,7 +2914,52 @@ fn reap_shell_scheduled(
     identity: ShellIdentity,
     kill_at: Option<u32>,
     deadline: u32,
+    grace: InGrace,
+    ignored_hangup: bool,
+) {
+    reap_shell_draining(identity, kill_at, deadline, grace, ignored_hangup, None);
+}
+
+/// Retain and drain the terminal while its shell handles the original hang-up.
+/// The existing reap deadlines still bound ownership of the descriptor.
+///
+/// # Errors
+/// Returns an error before hanging up if the nonblocking master cannot be retained.
+pub fn hangup_and_reap_shell(identity: ShellIdentity, master: i32) -> io::Result<ShellHangup> {
+    // SAFETY: fcntl borrows the caller's master; neither operation changes its flags.
+    let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::O_NONBLOCK == 0 {
+        return Err(io::Error::other(
+            "PTY teardown requires a nonblocking master",
+        ));
+    }
+    let held = dup_fd(master)?;
+    let ignored = ignores_hangup(&identity);
+    let hung = hangup_shell(&identity, master);
+    let grace = InGrace::enter();
+    std::thread::spawn(move || {
+        reap_shell_draining(
+            identity,
+            Some(REAP_KILL_AT),
+            REAP_DEADLINE,
+            grace,
+            ignored,
+            Some(held),
+        )
+    });
+    Ok(hung)
+}
+
+fn reap_shell_draining(
+    identity: ShellIdentity,
+    mut kill_at: Option<u32>,
+    deadline: u32,
     mut grace: InGrace,
+    ignored_hangup: bool,
+    mut master: Option<std::os::fd::OwnedFd>,
 ) {
     let pid = identity.pid;
     if pid <= 1 {
@@ -2898,6 +2968,11 @@ fn reap_shell_scheduled(
     const POLL: std::time::Duration = REAP_POLL;
     let mut status: libc::c_int = 0;
     for tick in 0..deadline {
+        if let Some(held) = master.as_ref() {
+            use std::os::fd::AsRawFd;
+            // The existing bounded drain cannot let a noisy job postpone the kill tick.
+            let _ = drain_master(held.as_raw_fd(), &mut |_| {});
+        }
         // Distinct branch.
         if !identity.verify() {
             return;
@@ -2907,9 +2982,18 @@ fn reap_shell_scheduled(
         if r == pid {
             return;
         }
+        // Alive at the holdout tick is not "ignored SIGHUP": a shell handling its hang-up is
+        // alive too, so only one that ignored the signal before it came keeps this tick.
+        if Some(tick) == kill_at && tick < REAP_HANDLER_KILL_AT && !ignored_hangup {
+            kill_at = Some(REAP_HANDLER_KILL_AT);
+        }
         #[cfg(any(test, debug_assertions))]
         if Some(tick) == kill_at {
             while HOLD_REAP_KILLS.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(held) = master.as_ref() {
+                    use std::os::fd::AsRawFd;
+                    let _ = drain_master(held.as_raw_fd(), &mut |_| {});
+                }
                 std::thread::sleep(POLL);
             }
         }
@@ -2930,6 +3014,7 @@ fn reap_shell_scheduled(
             REAP_KILL_TICK.with(|t| t.set(Some(tick)));
         }
         if Some(tick) == kill_at {
+            drop(master.take());
             grace.leave();
         }
         #[cfg(test)]
@@ -2939,6 +3024,16 @@ fn reap_shell_scheduled(
     if identity.own_child && identity.verify() {
         aterm_uds::reaper::hand_off(move || straggler_settled(&identity));
     }
+}
+
+/// Whether the kernel says the shell ignores `SIGHUP` now. Asked before the hang-up, this is the
+/// one state in which a shell alive after it is a holdout: it chose to outlive the signal. Asked
+/// after, a handler that ignores `SIGHUP` for its own cleanup would read the same. A mask nothing
+/// can read says no, so no shell is cut early without the kernel's word.
+#[must_use]
+pub fn ignores_hangup(identity: &ShellIdentity) -> bool {
+    aterm_uds::process::ignored_signals(identity.pid)
+        .is_some_and(|mask| mask & (1 << (libc::SIGHUP - 1)) != 0)
 }
 
 fn straggler_settled(identity: &ShellIdentity) -> bool {
@@ -3017,7 +3112,19 @@ impl Drop for ReapKillHold {
 
 const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 const REAP_KILL_AT: u32 = 25;
+/// The tick that kills a shell alive at [`REAP_KILL_AT`] that did not ignore `SIGHUP` (~1.5 s).
+const REAP_HANDLER_KILL_AT: u32 = 150;
 const REAP_DEADLINE: u32 = 200;
+/// The [`wait_for_reaps`] bound of a process about to exit or `exec`, which ends any reap still
+/// running: past the give-up tick, with 40 ms per tick of the handler's grace for ticks a busy
+/// machine stretches. A slot held longer than this is one whose group kill still has a member
+/// left ([`aterm_uds::process::kill_group_until_empty`]), its first `SIGKILL` already sent.
+pub const REAP_GRACE_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+const _: () = assert!(
+    REAP_KILL_AT < REAP_HANDLER_KILL_AT
+        && REAP_HANDLER_KILL_AT < REAP_DEADLINE
+        && REAP_POLL.as_millis() * (REAP_DEADLINE as u128) < REAP_GRACE_WAIT.as_millis()
+);
 
 #[cfg(test)]
 thread_local! {
@@ -3352,6 +3459,18 @@ pub fn fd_is_tty(fd: i32) -> bool {
     // is a valid `winsize` out-param on success.
     let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
     rc == 0
+}
+
+/// The process group that leads `fd`'s terminal's foreground (`tcgetpgrp`), or `None` when the
+/// read fails or names no group.
+#[must_use]
+pub fn foreground_group(fd: i32) -> Option<i32> {
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` may be any integer: `tcgetpgrp` fails cleanly (-1) on a bad or non-tty fd.
+    let group = unsafe { libc::tcgetpgrp(fd) };
+    (group > 0).then_some(group)
 }
 
 /// Reads the slave's `ECHO`, `ICANON`, and `ISIG` signal characters via `fd` ([`crate::TtyEcho`]).

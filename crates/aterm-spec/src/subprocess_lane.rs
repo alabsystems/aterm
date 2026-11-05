@@ -3,9 +3,9 @@
 
 //! Cross-binary and in-process admission for tests that spawn multi-process trees.
 //!
-//! Live integration suites (`headless_boot`, `fabric_world`, `aos_workers`) spawn a
-//! headless `aterm` instance or a multi-worker coordinator per test, each bringing
-//! four to six OS processes with it. `libtest` counts only in-process test threads,
+//! Live integration suites (`headless_boot`, `fabric_world`) spawn a headless `aterm`
+//! instance per test, four to six OS processes each, and `aos_search` a threaded search.
+//! `libtest` counts only in-process test threads,
 //! and `aterm-verify`'s `testrun` pool runs several test binaries side by side, so
 //! uncoordinated binaries can stack hundreds of runnable processes on one host and
 //! push live waits past their one-minute hang detectors (`ATERM-KI-1103-3`).
@@ -164,8 +164,12 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
     builder.create(dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)?
+            .set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -176,7 +180,8 @@ fn create_slot_file(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = opts.open(path)?;
     #[cfg(unix)]
@@ -197,7 +202,8 @@ fn create_count_file(path: &Path, count: usize) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
+        opts.mode(0o600)
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
     }
     let mut file = opts.open(path)?;
     #[cfg(unix)]

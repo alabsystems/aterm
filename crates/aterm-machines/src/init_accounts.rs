@@ -264,23 +264,16 @@ impl Item for SignOut {
             signout_cmd(&self.user, self.service, &labels),
             Some(deadline),
         )?;
-        // A person stage (init-on-by-default design §6.4): presence is read fresh right before
-        // this sign-out's clicks, each sign-out its own, since the stage's own reading came
-        // before the other sign-out's minute of clicks. The clicks are not repeated safely, so
-        // they hold the update boundary (§6.7); a wait there for an update's handoff, up to
-        // minutes, reads presence again before they start.
-        if !sys.person_present() {
-            self.stand(Some(aterm_converge::StoodAside::Waiting(away())));
-            return Ok(());
-        }
+        // The admitted setup runs automatically. Keep the update boundary through the click
+        // sequence, so an update cannot interrupt an operation that is unsafe to repeat.
         let ran = {
-            let Ok(_boundary) = sys.update_boundary().hold(
-                aterm_types::update_boundary::GuardedItem::SignOutSequence,
-                || sys.person_present().then_some(()).ok_or(()),
-            ) else {
-                self.stand(Some(aterm_converge::StoodAside::Waiting(away())));
-                return Ok(());
-            };
+            let _boundary = sys
+                .update_boundary()
+                .hold(
+                    aterm_types::update_boundary::GuardedItem::SignOutSequence,
+                    || Ok::<(), std::convert::Infallible>(()),
+                )
+                .unwrap_or_else(|never| match never {});
             sys.run_complete_stdout(&command)
         }
         .map_err(|_| format!("{} sign-out could not run", self.service.name()))?;
@@ -1267,7 +1260,7 @@ mod tests {
     /// and the sign-out stands aside, calmly, in the words the page looks for the person's
     /// return by. Before, it clicked at once on the presence its stage read before the wait.
     #[test]
-    fn a_sign_out_that_waited_for_a_handoff_reads_presence_again_before_it_clicks() {
+    fn an_admitted_sign_out_continues_after_a_handoff_without_a_presence_gate() {
         use std::sync::atomic::Ordering;
         let (sys, ctx, item) = fixture();
         sys.trusts(&[true]);
@@ -1279,17 +1272,11 @@ mod tests {
         .expect("standing aside is no failure");
         assert_eq!(
             count(&sys, &clicking(&item)),
-            0,
-            "the sign-out clicked with nobody at this Mac after waiting for the handoff: {:?}",
+            1,
+            "the admitted sign-out continues after the handoff: {:?}",
             sys.calls()
         );
-        let Some(aterm_converge::StoodAside::Waiting(why)) = item.stood_aside() else {
-            panic!("{:?}", item.stood_aside());
-        };
-        assert!(
-            why.ends_with(aterm_types::macos_setup::StageRow::WAITS_FOR_A_PERSON),
-            "{why}"
-        );
+        assert_eq!(item.stood_aside(), None);
         assert_eq!(sys.boundary.any_held(), None, "it took no guard");
         // CONTROL: the person stays, and the clicks go once the handoff is refused.
         let (sys, ctx, item) = fixture();
@@ -1306,7 +1293,7 @@ mod tests {
     /// FaceTime's gets no FaceTime clicks. Before, the Accounts stage read presence once for
     /// both.
     #[test]
-    fn each_sign_out_reads_presence_right_before_its_own_clicks() {
+    fn each_admitted_sign_out_runs_even_after_the_person_walks_away() {
         use std::sync::atomic::Ordering;
         let (sys, ctx, messages) = fixture();
         let facetime = SignOut {
@@ -1324,23 +1311,17 @@ mod tests {
         assert_eq!(count(&sys, &clicking(&messages)), 1, "{:?}", sys.calls());
         // The person walks away during Messages' clicks.
         sys.away.store(true, Ordering::SeqCst);
+        signed_in_for(&sys, &facetime, 1);
         facetime
             .apply(&sys, &ctx)
             .expect("standing aside is no failure");
         assert_eq!(
             count(&sys, &clicking(&facetime)),
-            0,
-            "FaceTime clicked with nobody at this Mac: {:?}",
+            1,
+            "FaceTime completes its admitted setup: {:?}",
             sys.calls()
         );
-        assert!(
-            matches!(
-                facetime.stood_aside(),
-                Some(aterm_converge::StoodAside::Waiting(why)) if why == away()
-            ),
-            "{:?}",
-            facetime.stood_aside()
-        );
+        assert_eq!(facetime.stood_aside(), None);
     }
 
     /// Away from a terminal (System State, which asks for Accessibility itself) a sign-out

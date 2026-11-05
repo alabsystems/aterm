@@ -605,3 +605,85 @@ fn recycling_preserves_flooded_scrollback_content() {
         "flooded history must be intact and ordered"
     );
 }
+
+/// The staged image-row count, which lets `any_image` skip a text-only backlog, stays exact
+/// whichever history mutation adds or removes an image; text and surviving spans stay intact.
+#[test]
+fn lazy_buffer_image_row_count_tracks_images_across_history_mutations() {
+    use crate::grid::scroll_convert::LazyBuffer;
+    use crate::{ImageData, ImageFormat, ImageScaling};
+    use aterm_scrollback::ImageSpan;
+
+    let image = Arc::new(ImageData {
+        bytes: vec![7; 256],
+        format: ImageFormat::Png,
+        cols: 1,
+        rows: 1,
+        z_index: 0,
+        band_lift_px: 0,
+        cell_offset_px: (0, 0),
+        scaling: ImageScaling::Fit,
+        source_rect: None,
+    });
+    let span = || ImageSpan::new(0, 1, 0, 0, Arc::clone(&image));
+    let mut rb = RowBuilder::new();
+    let row = rb.build(&[Cell::from_ascii_fast(b'x')], 80, false);
+    let mut buf = LazyBuffer::new();
+    for _ in 0..4 {
+        buf.push_row(&row, ScrolledRowExtras::default());
+    }
+    let check = |buf: &LazyBuffer, text_only: bool| {
+        buf.assert_running_sums();
+        assert_eq!(buf.any_image(&|_| true), !text_only);
+    };
+    check(&buf, true);
+    assert!(buf.set_line_images(1, vec![span(), span()]));
+    assert!(buf.set_line_images(3, vec![span()]));
+    check(&buf, false);
+    assert!(!buf.any_image(&|_| false));
+    assert!(buf.set_line_images(1, vec![]));
+    check(&buf, false);
+    assert_eq!(buf.drain_back(1).count(), 1);
+    check(&buf, true);
+
+    assert!(buf.set_line_images(0, vec![span()]));
+    assert!(buf.set_line_images(2, vec![span()]));
+    let mut moved = buf.take_staged();
+    check(&buf, true);
+    check(&moved, false);
+    let first = moved.drain_front(1).next().expect("oldest row");
+    assert_eq!(first.to_string(), "x");
+    check(&moved, false);
+    assert!(moved.retain_images(&mut |_| false));
+    check(&moved, true);
+    assert!(!moved.retain_images(&mut |_| false));
+    assert!(moved.set_line_images(0, vec![span()]));
+    assert_eq!(moved.drain_all().count(), 2);
+    check(&moved, true);
+    moved.push_row(&row, ScrolledRowExtras::default());
+    assert!(moved.set_line_images(0, vec![span()]));
+    moved.clear();
+    check(&moved, true);
+
+    let mut extras = ScrolledRowExtras::default();
+    extras.images.push(span());
+    extras.images.push(span());
+    moved.push_row(&row, extras);
+    moved.push_row(&row, ScrolledRowExtras::default());
+    check(&moved, false);
+    let mut visits = 0;
+    assert!(moved.retain_images(&mut |_| {
+        visits += 1;
+        visits == 1
+    }));
+    check(&moved, false);
+    assert_eq!(moved.drop_oldest(1), 1);
+    moved.assert_running_sums();
+    assert!(!moved.any_image(&|_| true));
+    assert!(!moved.set_line_images(0, vec![span()]));
+    assert!(moved.set_line_images(1, vec![span()]));
+    assert_eq!(moved.drain_front(1).count(), 1); // Only the marker leaves.
+    check(&moved, false);
+    assert_eq!(moved.shed_oldest(1, 0), 0);
+    check(&moved, true);
+}

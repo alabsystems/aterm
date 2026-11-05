@@ -285,14 +285,26 @@ fn write_store(pairs: &StorePairs) -> Result<(), String> {
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("abrew: cannot create {}: {e}", dir.display()))?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                use std::os::unix::fs::{
+                    DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _,
+                };
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&dir)
+                    .map_err(|e| format!("abrew: cannot create {}: {e}", dir.display()))?;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&dir)
+                    .and_then(|f| f.set_permissions(std::fs::Permissions::from_mode(0o700)))
                     .map_err(|e| format!("abrew: cannot chmod {}: {e}", dir.display()))?;
             }
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("abrew: cannot create {}: {e}", dir.display()))?;
         }
         Err(e) => return Err(format!("abrew: cannot inspect {}: {e}", dir.display())),
     }
@@ -323,14 +335,33 @@ fn write_store(pairs: &StorePairs) -> Result<(), String> {
     }
     let text = format!("{}\n", pretty_pairs(pairs));
     let tmp = dir.join(format!(".trust.json.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, text)
-        .map_err(|e| format!("abrew: cannot write {}: {e}", tmp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::remove_file(&tmp);
+    let wrote = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut f = opts.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(text.as_bytes())
+    })();
+    if let Err(e) = wrote {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("abrew: cannot write {}: {e}", tmp.display()));
     }
-    std::fs::rename(&tmp, &path).map_err(|e| format!("abrew: cannot write {}: {e}", path.display()))
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("abrew: cannot write {}: {e}", path.display())
+    })
 }
 
 /// Run `f` under the trust-store lock (brew `flock`s the
@@ -347,11 +378,7 @@ fn with_store_lock<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String
     let lock_path = PathBuf::from(format!("{}.lock", path.display()));
     let mut lock_file = None;
     for _ in 0..200 {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
+        match crate::platform::open_create_new_write(&lock_path, 0o600) {
             Ok(file) => {
                 lock_file = Some(file);
                 break;
@@ -728,13 +755,20 @@ impl TapRef {
                 return;
             };
             for entry in entries.flatten() {
-                let path = entry.path();
-                if recursive && path.is_dir() {
-                    walk(&path, recursive, out);
-                } else if path.extension().is_some_and(|e| e == "rb")
-                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                {
-                    out.push(stem.to_owned());
+                let ft = entry.file_type().ok();
+                let is_dir = ft
+                    .map(|ft| ft.is_dir() || (ft.is_symlink() && entry.path().is_dir()))
+                    .unwrap_or(false);
+                if recursive && is_dir {
+                    walk(&entry.path(), recursive, out);
+                } else {
+                    let name = entry.file_name();
+                    let name_path = Path::new(&name);
+                    if name_path.extension().is_some_and(|e| e == "rb")
+                        && let Some(stem) = name_path.file_stem().and_then(|s| s.to_str())
+                    {
+                        out.push(stem.to_owned());
+                    }
                 }
             }
         }
@@ -773,8 +807,8 @@ impl TapRef {
         entries
             .flatten()
             .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                name.strip_prefix("brew-").map(|cmd| {
+                let name = e.file_name();
+                name.to_str()?.strip_prefix("brew-").map(|cmd| {
                     cmd.strip_suffix(".rb")
                         .or_else(|| cmd.strip_suffix(".sh"))
                         .unwrap_or(cmd)

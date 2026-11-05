@@ -17,7 +17,9 @@
 //!
 //! A cut at a period inside parentheses, a code span or a quote (`(its journal.`) leaves
 //! what it opened open, and a cut that adds its own period leaves an article or conjunction
-//! before it (`…, or.`), so every paragraph is also read whole at its end for either. A
+//! before it (`…, or.`), so every paragraph is also read whole at its end for either. A `]` no
+//! `[` opened closes a half-open interval's parenthesis (`(t, next]`), and the tail of a
+//! hyphenated or numbered name is no article (`FNV-1a.`, `pool-a.`). A
 //! `// SAFETY:` note, the proof its `unsafe` block stands on, is read the same way, and so is
 //! every other `//` comment on lines of its own (a URL's tail copied out of a string,
 //! `// 127.0.0.1:9".into()`, is one). A SAFETY note with no word outside its code spans
@@ -195,12 +197,24 @@ fn open(text: &str) -> bool {
         return true;
     };
     let prose = unquoted(&prose);
-    prose.matches('(').count() > prose.matches(')').count()
+    let half_open = prose
+        .matches(']')
+        .count()
+        .saturating_sub(prose.matches('[').count());
+    prose.matches('(').count() > prose.matches(')').count() + half_open
         || prose.matches('"').count() % 2 == 1
-        || text
-            .strip_suffix('.')
-            .and_then(|text| text.rsplit(|c: char| !c.is_ascii_alphabetic()).next())
-            .is_some_and(|word| BEFORE_NO_PERIOD.contains(&word))
+        || text.strip_suffix('.').is_some_and(ends_on_joiner)
+}
+
+/// Whether `text`, a paragraph without its last period, ends on a word a period never follows,
+/// and not on the tail of a name that word only looks like (`FNV-1a`, `pool-a`).
+fn ends_on_joiner(text: &str) -> bool {
+    let word = text
+        .rsplit(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default();
+    BEFORE_NO_PERIOD.contains(&word)
+        && !text[..text.len() - word.len()].ends_with(|c: char| c == '-' || c.is_ascii_digit())
 }
 
 /// Whether a SAFETY note, `text`, has no word outside its code spans: it names what it is about
@@ -403,11 +417,25 @@ mod tests {
                     // The ids in `(lo, head]`, then `ESC ( B`.\n\
                     g();\n\
                     // 127.0.0.1:9\".into()\n\
+                    }\n\
+                    /// The keys of the half-open run (t, next].\n\
+                    fn half_open() {}\n\
+                    /// A cut with a list after it (t, [next].\n\
+                    fn bracketed() {}\n\
+                    /// Hashed with FNV-1a.\n\
+                    fn hashed() {}\n\
+                    /// Named pool-a.\n\
+                    fn pooled() {}\n\
+                    /// Whether it ends on the.\n\
+                    fn article() {}\n\
+                    fn h() {\n\
+                    // SAFETY: the pointer outlives the.\n\
+                    unsafe { g() };\n\
                     }\n";
         let found = run(&DOC_SENTENCE, &[("crates/aterm-x/src/lib.rs", rust)]);
         assert_eq!(
             spots(&found),
-            [1, 3, 5, 7, 15, 20, 22, 26, 30, 34]
+            [1, 3, 5, 7, 15, 20, 22, 26, 30, 34, 38, 44, 47]
                 .map(|no| format!("crates/aterm-x/src/lib.rs:{no}"))
         );
         assert_eq!(

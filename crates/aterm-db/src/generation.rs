@@ -192,9 +192,10 @@ impl Selection {
 
 fn trust(bootstrap: &Bootstrap) -> String {
     let trust = bootstrap.trust();
-    let mut bytes = Vec::from(trust.network);
-    bytes.extend_from_slice(&trust.authority);
-    bytes.extend_from_slice(&trust.genesis);
+    let mut bytes = [0u8; 16 + 32 + 32];
+    bytes[..16].copy_from_slice(&trust.network);
+    bytes[16..48].copy_from_slice(&trust.authority);
+    bytes[48..80].copy_from_slice(&trust.genesis);
     aterm_codec::hex::encode_lower(&bytes)
 }
 
@@ -212,19 +213,28 @@ fn claims(paths: &Paths) -> Result<Vec<(Region, Digest, Vec<u8>)>> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
-        private_file::check_private_dir(&dir)?;
+        let judged = private_file::JudgedDir::judge(&dir).map_err(|_| fail())?;
+        if !judged.is_private() {
+            return Err(fail());
+        }
         for entry in entries {
             let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str().and_then(|name| name.strip_suffix(".claim")) else {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(name) = file_name.strip_suffix(".claim") else {
                 continue;
             };
             let id = crate::database::decode_hex(name)?;
-            if name != aterm_codec::hex::encode_lower(&id) || out.len() >= 128 {
+            if !name
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || out.len() >= 128
+            {
                 return Err(fail());
             }
-            let bytes = private_file::read_private(&dir, &format!("{name}.claim"), 4096)
-                .map_err(|_| fail())?;
+            let bytes = judged.read(file_name, 4096).map_err(|_| fail())?;
             out.push((region, id, bytes));
         }
     }
@@ -404,23 +414,42 @@ impl Observation {
     }
 
     pub(crate) fn capture(paths: &Paths, deadline: Instant) -> Result<Self> {
-        Self::capture_in(paths, deadline, false)
+        Self::capture_in(paths, deadline, &|| deadline, false)
     }
 
     pub(crate) fn observe(paths: &Paths, deadline: Instant) -> Result<Self> {
-        Self::capture_in(paths, deadline, true)
+        Self::observe_within(paths, deadline, &|| deadline)
     }
 
-    fn capture_in(paths: &Paths, deadline: Instant, observe_only: bool) -> Result<Self> {
+    /// Observe under two bounds, for a read given longer to read than any holder should be given.
+    /// `read_by` only refuses a read that has run out of its own time. `wait` is asked as each
+    /// stage that waits for a predecessor's vault or custody locks starts, and says when that
+    /// stage's waits end, the reading between them included. The wait for a predecessor's device
+    /// lock runs with its exclusive `commons.lock` held, so waiting can refuse the writers who need
+    /// that custody for that long; the reads made under that lock come on top, with no bound.
+    pub(crate) fn observe_within(
+        paths: &Paths,
+        read_by: Instant,
+        wait: &dyn Fn() -> Instant,
+    ) -> Result<Self> {
+        Self::capture_in(paths, read_by, wait, true)
+    }
+
+    fn capture_in(
+        paths: &Paths,
+        read_by: Instant,
+        wait: &dyn Fn() -> Instant,
+        observe_only: bool,
+    ) -> Result<Self> {
         let mut child = paths.clone();
         let mut ancestors = Vec::new();
         while let Some(selection) = linked(&child)? {
-            if ancestors.len() == MAX_GENERATIONS || Instant::now() >= deadline {
+            if ancestors.len() == MAX_GENERATIONS || Instant::now() >= read_by {
                 return Err(fail());
             }
             let bootstrap = if observe_only {
                 let (bootstrap, _) =
-                    Bootstrap::established_with_journal_until(&selection.original, deadline)
+                    Bootstrap::established_with_journal_until(&selection.original, wait())
                         .map_err(crate::table::failure)?;
                 bootstrap
                     .revalidate_custody()
@@ -432,7 +461,7 @@ impl Observation {
                 }
                 bootstrap
             } else {
-                selection.authorize_until(deadline)?
+                selection.authorize_until(wait())?
             };
             let journal = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust())
                 .map_err(crate::table::failure)?;
@@ -464,7 +493,7 @@ impl Observation {
             paths: paths.clone(),
             ancestors,
         };
-        observation.check(false, false, deadline)?;
+        observation.check(false, false, read_by)?;
         Ok(observation)
     }
 
@@ -606,15 +635,28 @@ pub(crate) fn selected_until(paths: &Paths, deadline: Instant) -> Result<Paths> 
 /// Select a completed generation without repairing current or ancestor custody.
 /// The same completion, policy and current membership checks still apply.
 pub(crate) fn observed_paths_until(paths: &Paths, deadline: Instant) -> Result<Paths> {
-    Ok(observed_selection_until(paths, deadline)?.paths)
+    observed_paths_within(paths, deadline, &|| deadline)
 }
 
-fn observed_selection_until(paths: &Paths, deadline: Instant) -> Result<Observation> {
+/// [`observed_paths_until`] under [`Observation::observe_within`]'s two bounds.
+pub(crate) fn observed_paths_within(
+    paths: &Paths,
+    read_by: Instant,
+    wait: &dyn Fn() -> Instant,
+) -> Result<Paths> {
+    Ok(observed_selection_within(paths, read_by, wait)?.paths)
+}
+
+fn observed_selection_within(
+    paths: &Paths,
+    read_by: Instant,
+    wait: &dyn Fn() -> Instant,
+) -> Result<Observation> {
     // Ordinary recovery may repair local files; a public observation uses
     // only established custody, including every predecessor in the chain.
     let mut selected = paths.clone();
     for depth in 0..=MAX_GENERATIONS {
-        if Instant::now() >= deadline {
+        if Instant::now() >= read_by {
             return Err(fail());
         }
         if Selection::read(&selected)?.is_none() {
@@ -625,8 +667,8 @@ fn observed_selection_until(paths: &Paths, deadline: Instant) -> Result<Observat
         }
         selected = candidate(&selected);
     }
-    let observation = Observation::observe(&selected, deadline)?;
-    observation.check(true, false, deadline)?;
+    let observation = Observation::observe_within(&selected, read_by, wait)?;
+    observation.check(true, false, read_by)?;
     Ok(observation)
 }
 
@@ -634,7 +676,7 @@ pub(crate) fn lineage_until(
     paths: &Paths,
     deadline: Instant,
 ) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
-    let observation = observed_selection_until(paths, deadline)?;
+    let observation = observed_selection_within(paths, deadline, &|| deadline)?;
     let selected = observation.paths.clone();
     let (bootstrap, journal) = Bootstrap::established_with_journal_until(&selected, deadline)
         .map_err(crate::table::failure)?;
@@ -861,7 +903,7 @@ pub(crate) fn observed_logical_paths_until(paths: &Paths, deadline: Instant) -> 
 }
 
 fn logical_paths_in(paths: &Paths, observe_only: bool, deadline: Instant) -> Result<Paths> {
-    let observation = Observation::capture_in(paths, deadline, observe_only)?;
+    let observation = Observation::capture_in(paths, deadline, &|| deadline, observe_only)?;
     Ok(observation.ancestors.last().map_or_else(
         || paths.clone(),
         |ancestor| ancestor.selection.original.clone(),
@@ -1138,6 +1180,42 @@ pub(crate) fn advance_while(
     advance_at(paths, config, 0, &budget)
 }
 
+fn recovery_required(session: &Session<'_>, reserved: bool) -> Result<bool> {
+    let paths = session.paths();
+    let tables = if reserved {
+        vec![
+            Directory::new(paths, session.trust())
+                .catalog_scope()
+                .digest(),
+        ]
+    } else {
+        // Application tables can predate a healthy catalog. Check every retained
+        // primary claim, including one the current catalog does not declare.
+        claims(paths)?
+            .into_iter()
+            .filter_map(|(region, table, _)| (region == Region::Primary).then_some(table))
+            .collect()
+    };
+    for table in tables {
+        if !reserved && !custody::directory_binding_lost(session, table)? {
+            continue;
+        }
+        let evidence = custody::inspect(session, table)?;
+        if !reserved
+            && !evidence
+                .directory
+                .is_some_and(|e| e.binding_error.is_some())
+        {
+            continue;
+        }
+        if !matches!(evidence.prefix, Some(Ok(_))) {
+            return Err(fail());
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -> Result<Paths> {
     budget.check()?;
     if depth > MAX_GENERATIONS {
@@ -1168,17 +1246,8 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
             // this automatic enrollment policy belongs only to default ALab.
             return Ok(paths.clone());
         }
-        let directory = Directory::new(paths, bootstrap.trust());
-        let evidence = custody::inspect(&session, directory.catalog_scope().digest())?;
-        if !recovering
-            && !evidence
-                .directory
-                .is_some_and(|e| e.binding_error.is_some())
-        {
+        if !recovery_required(&session, recovering)? {
             return Ok(paths.clone());
-        }
-        if !matches!(evidence.prefix, Some(Ok(_))) {
-            return Err(fail());
         }
     }
     drop(session);

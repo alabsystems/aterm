@@ -496,6 +496,23 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
     atomic_write(shim, super::cmd_tombstone_content(message).as_bytes())
 }
 
+/// What a single read of `shim` ([`super::ShimRead`]) learns.
+#[must_use]
+pub fn read_shim(shim: &Path) -> super::ShimRead {
+    match crate::metadata_io::read_bounded_regular_utf8(shim, super::MAX_SHIM_BYTES) {
+        Ok(body) => super::ShimRead {
+            target: super::parse_cmd_shim_target(&body),
+            env: super::parse_cmd_shim_env(&body),
+            body: Some(body),
+        },
+        Err(_) => super::ShimRead {
+            target: None,
+            env: crate::shim_env::ShimEnv::NONE,
+            body: None,
+        },
+    }
+}
+
 /// Resolve the store/checkout target a `bin/<tool>.cmd` shim forwards to, or `None`.
 #[must_use]
 pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {

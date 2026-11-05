@@ -321,6 +321,7 @@ impl crate::App {
         }
         let (order, booking) = self.summary_spawn_in(summary_folder().as_deref())?;
         let plan = self.resolve_spawn(crate::control::SpawnAim::Front, Some(order))?;
+        let _act = crate::tab_marks::ActScope::gesture("summarize");
         self.book_spawn(
             plan,
             booking,
@@ -614,6 +615,28 @@ mod tests {
         ctx.meta.lock().unwrap().role = Some("operator".to_string());
         assert_eq!(app.summarize_in_new_tab(), Ok(()));
         assert!(said(&app).is_some());
+    }
+
+    /// A SUMMARIZE A CONTROL CLIENT INVOKES (`invoke agents.summarize`) IS BOOKED BY THAT CLIENT,
+    /// whose session its tab's open names once it lands. CONTROL: the menu's own press is the
+    /// person's.
+    #[test]
+    fn a_summarize_a_control_client_invokes_is_booked_by_that_client() {
+        use crate::session_store::ExitActor;
+        let manager = ExitActor::Sid("s-0123456789abcdef0123".to_string());
+        let mut app = workers_app();
+        app.tab_spawns.unsent = true;
+        let invoked = app.invoke_attributed(manager.clone(), |app| {
+            app.summarize_in_new_tab().map(|()| String::new())
+        });
+        assert_eq!(invoked, Ok(String::new()));
+        let booked = crate::tab_spawn::test_support::booked_act(&app).expect("booked");
+        assert_eq!((booked.by, booked.why), (manager, Some("summarize")));
+        let mut app = workers_app();
+        app.tab_spawns.unsent = true;
+        assert_eq!(app.summarize_in_new_tab(), Ok(()));
+        let booked = crate::tab_spawn::test_support::booked_act(&app).expect("booked");
+        assert_eq!(booked.by, ExitActor::Human, "CONTROL");
     }
 
     #[test]

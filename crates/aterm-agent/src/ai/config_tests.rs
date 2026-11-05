@@ -341,15 +341,18 @@ fn only_text_that_is_not_toml_or_another_schema_refuses_a_document() {
 fn load_reads_the_named_document_or_the_one_beside_aterm_toml() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let config = dir.path().join("aterm.toml");
-    std::fs::write(dir.path().join(FLEET_FILE), FLEET).expect("fleet");
-    std::fs::write(&config, "[ai]\nmachine = \"m7\"\n").expect("config");
+    aterm_uds::atomic_file::write(&dir.path().join(FLEET_FILE), FLEET.as_bytes(), 0o600)
+        .expect("fleet");
+    aterm_uds::atomic_file::write(&config, b"[ai]\nmachine = \"m7\"\n", 0o600).expect("config");
     let s = load(Some(&config));
     assert_eq!(s.preferred.0.id, "muse");
     let other = dir.path().join("elsewhere.toml");
-    std::fs::write(&other, "schema = 1\npreferred = \"codex\"\n").expect("other");
-    std::fs::write(
+    aterm_uds::atomic_file::write(&other, b"schema = 1\npreferred = \"codex\"\n", 0o600)
+        .expect("other");
+    aterm_uds::atomic_file::write(
         &config,
-        format!("[ai]\nfleet = {:?}\n", other.display().to_string()),
+        format!("[ai]\nfleet = {:?}\n", other.display().to_string()).as_bytes(),
+        0o600,
     )
     .expect("config");
     let s = load(Some(&config));

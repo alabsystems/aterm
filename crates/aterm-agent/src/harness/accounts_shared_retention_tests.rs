@@ -65,6 +65,7 @@ fn a_non_home_warm_grant_wakes_a_sync_to_release_prepared_execution() {
         let pool = super::super::ai_pool::Pool::from_toml(&source, "fixture").unwrap();
         let identity =
             super::super::ai_pool::resolve_local_pool_identity(Some(&home), Some(&config), None)
+                .unwrap()
                 .unwrap();
         let ctx = PoolSyncCtx { pool, identity };
         let row = Row {

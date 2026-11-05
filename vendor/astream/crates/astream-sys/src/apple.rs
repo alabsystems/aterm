@@ -18,6 +18,10 @@ const SIGHUP: c_int = 1;
 /// `F_BARRIERFSYNC` from `<sys/fcntl.h>`: "fsync + issue barrier to drive".
 const F_BARRIERFSYNC: c_int = 85;
 
+/// `CLOCK_UPTIME_RAW` from `<time.h>` (Darwin's `clockid_t` is an unsigned enum): the clock
+/// `mach_absolute_time` counts, which std's `Instant` reads on Apple.
+const CLOCK_UPTIME_RAW: c_uint = 8;
+
 /// `F_GETFD`, `F_SETFD` and the descriptor flags from `<sys/fcntl.h>`.
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
@@ -41,6 +45,7 @@ unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: c_uint, timeout: c_int) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn fsync(fd: c_int) -> c_int;
+    fn clock_gettime_nsec_np(clock_id: c_uint) -> u64;
     fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
     fn sysctlbyname(
         name: *const c_char,
@@ -107,6 +112,11 @@ pub(crate) fn plain_fsync(file: &File) -> io::Result<()> {
             Ok(())
         }
     })
+}
+
+/// `CLOCK_UPTIME_RAW` now, in nanoseconds ([`crate::clock_ns`]).
+pub(crate) fn uptime_raw_ns() -> u64 {
+    apple_ffi!(uptime_raw_ns(CLOCK_UPTIME_RAW))
 }
 
 /// The raw `kern.bootsessionuuid` answer (the UUID text and its NUL), or `None` when

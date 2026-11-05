@@ -688,8 +688,19 @@ impl Gallery {
                 );
             }
         }
-        live.inst.stop();
-        let _ = std::fs::copy(
+        if let Err(why) = live.inst.stop() {
+            live._world.keep();
+            for name in &names {
+                let cleanup = format!("instance cleanup failed: {why}");
+                if let Some((_, primary)) = self.missed.iter_mut().find(|(n, _)| n == name) {
+                    primary.push_str(&format!("; {cleanup}"));
+                    eprintln!("system-state-gallery: [{name}] {cleanup}");
+                } else {
+                    self.miss(name.clone(), cleanup);
+                }
+            }
+        }
+        let _ = crate::util::copy_regular_file(
             &live.inst.log,
             self.out
                 .join(format!("{fixture}.{}.{scale}x.gui.log", look.name())),
@@ -724,7 +735,7 @@ impl Gallery {
         let (png, meta, layout) = settled_frame(inst, view.id)?;
         let write = |suffix: &str, bytes: &[u8]| {
             let path = self.out.join(format!("{name}.{suffix}"));
-            std::fs::write(&path, bytes)
+            crate::util::write_fresh(&path, bytes)
                 .map_err(|e| Miss::Failed(format!("{}: {e}", path.display())))
         };
         write("png", &png)?;
@@ -1061,7 +1072,7 @@ fn report(
     let totals = totals(&judged, unjudged.len());
     println!("{totals}");
     text.push(totals.clone());
-    std::fs::write(out.join("report.txt"), text.join("\n") + "\n")
+    crate::util::write_out(&out.join("report.txt"), (text.join("\n") + "\n").as_bytes())
         .map_err(|e| format!("report.txt: {e}"))?;
     let json = J::obj([
         ("aterm", J::s(aterm)),
@@ -1093,9 +1104,9 @@ fn report(
         ),
         ("totals", J::s(totals.as_str())),
     ]);
-    std::fs::write(
-        out.join("report.json"),
-        crate::trail_contrast::render(&json, 0) + "\n",
+    crate::util::write_out(
+        &out.join("report.json"),
+        (crate::trail_contrast::render(&json, 0) + "\n").as_bytes(),
     )
     .map_err(|e| format!("report.json: {e}"))?;
     Ok(unjudged.is_empty() && judged.iter().all(Judged::pass))
@@ -1192,7 +1203,7 @@ pub fn cmd_system_state_gallery(args: &[String]) -> Res {
             format!("system-state-gallery: cannot make {}: {e}", out.display()),
         )
     })?;
-    let pids = std::fs::File::create(out.join("gallery.pids")).ok();
+    let pids = crate::util::create_regular_file(&out.join("gallery.pids")).ok();
     let mut g = Gallery {
         out: out.clone(),
         aterm: aterm.clone(),

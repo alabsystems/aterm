@@ -5,7 +5,7 @@
 
 use super::json::Jv;
 use super::view::Line;
-use crate::jobs::wire::{exe_word, phi_text};
+use crate::jobs::wire::{exe_word, phi_text, verdict_summary};
 use crate::jobs::{Class, Findings, JobRow, JobsView, Verdict};
 use crate::model::Snapshot;
 
@@ -84,9 +84,8 @@ pub fn summary(rows: &[&JobRow]) -> String {
         parts.push(format!("{run} running"));
     }
     for v in SAID {
-        let n = rows.iter().filter(|r| r.verdict == v).count();
-        if n > 0 {
-            parts.push(format!("{n} {}", v.word()));
+        if let Some(condition) = verdict_summary(rows.iter().copied(), v) {
+            parts.push(condition);
         }
     }
     let described = worst(rows);

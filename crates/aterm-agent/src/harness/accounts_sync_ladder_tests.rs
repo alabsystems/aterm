@@ -103,8 +103,26 @@ impl Bench {
     }
 }
 
+/// A session here runs on `label`, and its login is signed out here: the upkeep's door for a
+/// sign-in (`upkeep_sign_in`, `DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4).
+fn runs_signed_out(desk: &Desk, label: &str, at: i64) {
+    desk.store()
+        .transact(at, &mut None, |state| {
+            let mut events = accounts::note_session(state, &format!("s-{label}"), label, None, at);
+            events.extend(accounts::note_auth(
+                state,
+                label,
+                accounts::Auth::SignedOut,
+                at,
+            ));
+            Ok(events)
+        })
+        .unwrap();
+}
+
 /// A roster written by hand: the default login `main`, and `w3`, a row with an email and an
-/// empty login directory, its desk browser profile named where `desk_browser` asks.
+/// empty login directory that a session here runs on, signed out ([`runs_signed_out`]), its desk
+/// browser profile named where `desk_browser` asks.
 fn hand_roster(desk: &Desk, desk_browser: bool) {
     let store = desk.store();
     let w3_dir = store.logins_dir().join("w3");
@@ -131,6 +149,7 @@ fn hand_roster(desk: &Desk, desk_browser: bool) {
         .map(|row| accounts::row_text(row).unwrap() + "\n")
         .collect();
     fs::write(desk.roster(), text).unwrap();
+    runs_signed_out(desk, "w3", NOW - 60);
 }
 
 fn attempt_of(desk: &Desk, label: &str) -> Option<accounts::SignInAttempt> {
@@ -140,6 +159,141 @@ fn attempt_of(desk: &Desk, label: &str) -> Option<accounts::SignInAttempt> {
         .0
         .get(label)
         .and_then(|b| b.sign_in_attempt.clone())
+}
+
+/// A PAGE'S STOP HOLDS ITS ROW FOR SIX HOURS, counted from its last try and on record: past a
+/// restart, which forgets the ladder's own wait, a changed secret, which ends that wait as a new
+/// input, and a move, which is heard at every launch. CONTROL: a person's signed-in browser window
+/// ends the hold, and six hours do, in a process that holds its own wait too.
+#[cfg(unix)]
+#[test]
+fn a_page_stop_holds_its_row_until_six_hours_or_a_persons_window() {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, false);
+    let store = desk.store();
+    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+        &store.dir,
+        Some("w3"),
+    ))
+    .unwrap();
+    let aterm = || Bench {
+        browser: true,
+        ..Bench::ending(Renewal::Failed)
+    };
+    let stop = |at: i64| {
+        store
+            .transact_pool_logins_within(&[], &desk.roster(), at, &mut None, |_, _, logins| {
+                accounts::admit_workflow(logins, "w3")?;
+                Ok(accounts::note_sign_in_attempt(
+                    logins,
+                    "w3",
+                    accounts::AttemptOutcome::Blocked,
+                    "profile: it met a bot check",
+                    at,
+                ))
+            })
+            .unwrap();
+    };
+    let window = |at: i64| {
+        store
+            .transact_pool_logins_within(&[], &desk.roster(), at, &mut None, |_, _, logins| {
+                accounts::admit_workflow(logins, "w3")?;
+                Ok(vec![
+                    accounts::Event::new(at, accounts::Kind::SignIn, "w3")
+                        .because("claude.ai window done session-kept"),
+                ])
+            })
+            .unwrap();
+    };
+    // The process that met the page. Its own wait stands under the row's real inputs, since `held`
+    // drops one under any others. It counts uptime, so a sleeping Mac's outlasts the record's, and
+    // it hears of no other process's window.
+    let met_page = |at: i64| {
+        let bench = aterm();
+        assert!(bench.pass(&desk, at), "the try");
+        stop(at);
+        bench
+            .guard
+            .lock()
+            .unwrap()
+            .ladder
+            .page_stopped("w3", Instant::now() + 2 * PERSON_BACKOFF);
+        bench.cool();
+        bench
+    };
+    let hold = PERSON_BACKOFF_SECS;
+
+    stop(NOW);
+    let restarted = aterm();
+    assert!(!restarted.pass(&desk, NOW + 60), "a restart");
+    let secrets = desk.home.join(".secrets");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::write(secrets.join("synced-from-the-vault"), "new").unwrap();
+    assert!(!restarted.pass(&desk, NOW + 120), "a changed secret");
+    restarted.guard.lock().unwrap().ladder.moved(Instant::now());
+    assert!(!restarted.pass(&desk, NOW + 180), "a move");
+    assert!(!aterm().pass(&desk, NOW + 240), "another restart");
+    assert!(restarted.handed().is_empty());
+
+    let last_try = NOW + hold - 60;
+    stop(last_try);
+    let (logins, _) = store.load_logins(last_try).unwrap();
+    let same = logins.get("w3").unwrap().sign_in_attempt.clone().unwrap();
+    assert_eq!(
+        (same.since, same.tried_at),
+        (NOW, last_try),
+        "an unchanged stop keeps when it was first recorded, and is saved with its last try"
+    );
+    assert!(!aterm().pass(&desk, NOW + hold), "counts from the last try");
+
+    let met_at = last_try + hold;
+    let live = met_page(met_at);
+    assert!(!live.pass(&desk, met_at + 60), "both hold");
+    assert!(
+        live.pass(&desk, met_at + hold),
+        "CONTROL: six hours end it, and its process's own wait with it"
+    );
+
+    let met_at = met_at + 2 * hold;
+    let live = met_page(met_at);
+    assert!(!live.pass(&desk, met_at + 1), "both hold");
+    window(met_at + 2);
+    assert!(
+        live.pass(&desk, met_at + 3),
+        "CONTROL: a person's signed-in window ends it, and its process's own wait with it"
+    );
+}
+
+/// A wait a page did not set stands whatever the record says: a failed sign-in waits on its own
+/// backoff, as a `Blocked` record's end says nothing of it.
+#[cfg(unix)]
+#[test]
+fn a_failed_sign_in_keeps_its_own_short_wait() {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, false);
+    let store = desk.store();
+    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+        &store.dir,
+        Some("w3"),
+    ))
+    .unwrap();
+    let bench = Bench {
+        browser: true,
+        ..Bench::ending(Renewal::Failed)
+    };
+    assert!(bench.pass(&desk, NOW), "the first try");
+    assert_eq!(
+        attempt_of(&desk, "w3").unwrap().outcome,
+        accounts::AttemptOutcome::Failed
+    );
+    bench.cool();
+    assert!(!bench.pass(&desk, NOW + 60), "its own wait");
+    bench.guard.lock().unwrap().ladder.moved(Instant::now());
+    bench.cool();
+    assert!(
+        bench.pass(&desk, NOW + 120),
+        "CONTROL: a move ends that one"
+    );
 }
 
 #[cfg(unix)]
@@ -263,7 +417,10 @@ fn a_repaired_profile_reopens_non_ladder_admission_inside_the_wrong_account_wait
             &desk.roster(),
             raw,
             &logins,
-            row,
+            (
+                row.clone(),
+                crate::harness::sign_in_ladder::asked_fixture(Cli::Claude, &row.label),
+            ),
             (None, false),
             NOW + 2,
             &guard,
@@ -1063,6 +1220,8 @@ fn a_row_only_a_credential_names_is_not_signed_in_before_a_session_needs_it() {
             .join(crate::harness::open_url::DEFAULT_MAILBOX_DIR),
     )
     .unwrap();
+    // CONTROL: the row a session here runs on, signed out, is signed in.
+    runs_signed_out(&desk, &sun, NOW + 5);
     let bench = Bench::ending(Renewal::AuthFailed);
     assert!(bench.pass(&desk, NOW + 10));
     assert_eq!(bench.handed().len(), 1);
@@ -1085,9 +1244,10 @@ fn a_person_turning_logins_off_stops_the_ladder() {
     for logins in ["off", "renew"] {
         let desk = Desk::new("m30");
         hand_roster(&desk, false);
-        fs::write(
-            desk.config.join("aterm.toml"),
-            format!("[fleet]\nmachine = \"m30\"\n\n[harness]\nlogins = \"{logins}\"\n"),
+        aterm_uds::atomic_file::write(
+            &(desk.config.join("aterm.toml")),
+            (format!("[fleet]\nmachine = \"m30\"\n\n[harness]\nlogins = \"{logins}\"\n")).as_ref(),
+            0o600,
         )
         .unwrap();
         let store = desk.store();

@@ -113,7 +113,7 @@ fn endpoint_at(dir: &Path, path: &Path) -> io::Result<listener::ListenerId> {
     {
         return Err(refused());
     }
-    listener::listener_read(path)?.ok_or_else(refused)
+    listener::ListenerId::from_metadata(&metadata).ok_or_else(refused)
 }
 
 /// The single worker bounds work even when a client stops reading or writing.
@@ -132,8 +132,8 @@ struct BoundSocket {
 
 impl Drop for BoundSocket {
     fn drop(&mut self) {
-        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.file_type().is_socket())
-            && listener::names_now(&self.path, self.identity) == listener::Named::Same
+        if std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|m| listener::ListenerId::from_metadata(&m) == Some(self.identity))
         {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -174,7 +174,6 @@ impl Server {
                 if !aterm_uds::connect::until(&path, Instant::now() + EXCHANGE)
                     .is_err_and(|error| stale(&error))
                     || endpoint_at(dir, &path)? != previous
-                    || listener::names_now(&path, previous) != listener::Named::Same
                 {
                     return Err(refused());
                 }
@@ -185,7 +184,8 @@ impl Server {
         }
         let socket = aterm_uds::kept_out(|| CtlListener::bind(&path))?;
         let bound = BoundSocket {
-            identity: listener::listener_read(&path)?.ok_or_else(refused)?,
+            identity: listener::ListenerId::from_metadata(&std::fs::symlink_metadata(&path)?)
+                .ok_or_else(refused)?,
             path: path.clone(),
         };
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
@@ -402,7 +402,6 @@ fn read_at(
         decode_publication(&wire, now, requested).map_err(|error| context("snapshot", error))?;
     if aterm_uds::process::read_birth(native_pid) != Some(birth)
         || endpoint_at(dir, path).map_err(|error| context("endpoint-recheck", error))? != bound
-        || listener::names_now(path, bound) != listener::Named::Same
     {
         return Err(refused_at("endpoint-changed"));
     }
@@ -932,6 +931,7 @@ mod tests {
         use aterm_types::network_state::{RepairObservation, RepairOutcome, RepairStage};
         let mut state = current();
         state.peers[0].last_repair = Some(RepairObservation {
+            cause: None,
             completed_at_ms: state.observed_at_ms - 60_000,
             outbound: false,
             stage: Some(RepairStage::Application),

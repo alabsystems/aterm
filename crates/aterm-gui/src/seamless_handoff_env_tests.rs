@@ -720,7 +720,7 @@ fn a_config_edit_during_the_hold_is_warmed_again_before_any_carried_present() {
     let path = dir.path().join("aterm.toml");
     let save = |text: &str| {
         let staged = dir.path().join(".aterm.toml.save");
-        std::fs::write(&staged, text).expect("stage the save");
+        crate::test_scratch::write_config(&staged, text);
         std::fs::rename(&staged, &path).expect("rename it over aterm.toml");
     };
     let font_px = |service: &VersionedConfigService| service.snapshot().config.font_px;
@@ -783,7 +783,7 @@ fn a_theme_file_edit_during_the_hold_is_warmed_again() {
     let themes = dir.path().join("aterm").join("themes");
     std::fs::create_dir_all(&themes).expect("the theme dir");
     let path = dir.path().join("aterm").join("aterm.toml");
-    std::fs::write(&path, "theme = \"hold-theme\"\n").expect("the config");
+    crate::test_scratch::write_config(&path, "theme = \"hold-theme\"\n");
     let save_theme = |background: &str| {
         let staged = themes.join(".hold-theme.conf.save");
         std::fs::write(

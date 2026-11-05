@@ -395,6 +395,18 @@ pub fn bmc(m: &Model) -> Result<usize, (State, &'static str)> {
     bmc_fired(m).0
 }
 
+/// A separate, explicit work budget for a reduced proof target. Exhaustion still refuses.
+#[cfg_attr(trust_verify, trust::skip)]
+pub(crate) fn bmc_with_limit(m: &Model, limit: usize) -> Result<usize, (State, &'static str)> {
+    assert!(limit > 0, "a model-check budget must be positive");
+    assert!(
+        names_are_unique(m),
+        "{}: duplicate action/invariant name",
+        m.name
+    );
+    walk!(bmc_on(m, limit)).0
+}
+
 /// A bmc verdict, beside the actions that fired in the space walked to reach it.
 pub type BmcFired = (Result<usize, (State, &'static str)>, BTreeSet<&'static str>);
 
@@ -408,7 +420,7 @@ pub fn bmc_fired(m: &Model) -> BmcFired {
         "{}: duplicate action/invariant name",
         m.name
     );
-    let (verdict, fired) = walk!(bmc_on(m));
+    let (verdict, fired) = walk!(bmc_on(m, MAX_STATES));
     let fired = m
         .actions
         .iter()
@@ -419,12 +431,16 @@ pub fn bmc_fired(m: &Model) -> BmcFired {
 }
 
 #[cfg_attr(trust_verify, trust::skip)]
-fn bmc_on<W: Walker>(m: &Model, w: &W) -> (Result<usize, (State, &'static str)>, Vec<bool>) {
+fn bmc_on<W: Walker>(
+    m: &Model,
+    w: &W,
+    limit: usize,
+) -> (Result<usize, (State, &'static str)>, Vec<bool>) {
     let mut fired = vec![false; m.actions.len()];
     let mut walk = Walk::new(w);
     while walk.pop(w) {
         assert!(
-            walk.expanded < MAX_STATES,
+            walk.expanded < limit,
             "{} state space unexpectedly large — tighten bounds",
             m.name
         );
@@ -577,11 +593,12 @@ pub fn violation_steps(m: &Model, actions: &[&str]) -> Vec<Option<bool>> {
 }
 
 /// What the non-vacuity sweep asks of one mutant, in one walk where asking each costs a walk of
-/// its own: the invariants some reachable state violates ([`violated_invariants`], but that past
-/// [`MAX_STATES`] it answers for the states walked so far), and [`violation_steps`] of `actions`.
+/// its own: the invariants some reachable state violates ([`violated_invariants`]), and
+/// [`violation_steps`] of `actions`. At the search limit, claim witnesses remain valid but an
+/// unresolved bound is not a verdict.
 /// # Panics
 /// If `m` declares no action named one of `actions`, if its reachable space exceeds [`MAX_STATES`]
-/// while one of them has not yet landed lawful, whose verdict the walk then cannot give, or on an
+/// while a bound cannot be proved by its closed projection or an action has not yet landed lawful, or on an
 /// expression the interpreter cannot evaluate (a function-valued model).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -605,8 +622,9 @@ fn watched_actions(m: &Model, actions: &[&str]) -> Vec<usize> {
 
 /// [`mutant_report`], where `laws` says whether to read the invariants' side at all. The walk stops
 /// early only once neither reader has anything left to learn (every law seen broken, every watched
-/// action landed lawful), or at [`MAX_STATES`] once every watched action has landed lawful: the
-/// laws then answer for the states walked so far.
+/// action landed lawful). At [`MAX_STATES`] unresolved bounds need a complete closed-projection
+/// proof; action verdicts must already be known. Claims return the witnesses found so far, which
+/// the caller can combine across mutants.
 #[cfg_attr(trust_verify, trust::skip)]
 fn mutant_report_on<W: Walker>(
     m: &Model,
@@ -636,6 +654,14 @@ fn mutant_report_on<W: Walker>(
                 "{} state space unexpectedly large — tighten bounds",
                 m.name
             );
+            for &i in &live {
+                let law = &m.invariants[i];
+                if law.kind == crate::derive::InvariantKind::Bound
+                    && !crate::bound_projection::holds(m, law)
+                {
+                    violated.insert(law.name);
+                }
+            }
             break;
         }
         let st = walk.held.borrow();
@@ -1790,8 +1816,7 @@ mod tests {
         }
     }
 
-    /// Past the budget a walk answers for what it walked, unless a watched action has no verdict
-    /// yet, which it cannot give.
+    /// An unbounded walk with one early claim witness and another claim never settled by one.
     fn runaway() -> Model {
         crate::ty_model! {
             Runaway {
@@ -1806,11 +1831,34 @@ mod tests {
     }
 
     #[test]
-    fn a_mutant_report_past_the_budget_answers_for_what_it_walked() {
+    fn a_mutant_report_past_the_budget_keeps_only_witnessed_claims() {
         assert_eq!(
             mutant_report(&runaway(), &["Up"]),
             (BTreeSet::from(["Unbroken"]), vec![Some(false)])
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "state space unexpectedly large")]
+    fn a_mutant_report_past_the_budget_with_a_bound_open_cannot_answer() {
+        let mut model = runaway();
+        model.invariants[1].kind = crate::derive::InvariantKind::Bound;
+        let _ = mutant_report(&model, &["Up"]);
+    }
+
+    #[test]
+    fn a_closed_projection_proves_a_bound_despite_unrelated_unbounded_state() {
+        let model = crate::ty_model! {
+            UnrelatedGrowth {
+                var count = 0;
+                var noise = 0;
+                action Count when (3 > count) { count = count + 1; }
+                action Noise { noise = noise + 1; }
+                invariant Quiet: noise == 0;
+                bound CountBounded: count <= 3;
+            }
+        };
+        assert_eq!(mutant_report(&model, &[]).0, BTreeSet::from(["Quiet"]));
     }
 
     #[test]
@@ -1904,7 +1952,12 @@ mod tests {
     fn assert_walks_agree(m: &Model) {
         let c = Compiled::new(m).expect("a model whose updates write declared variables");
         let by = ByName(m);
-        assert_eq!(bmc_on(m, &c), bmc_on(m, &by), "{}: bmc", m.name);
+        assert_eq!(
+            bmc_on(m, &c, MAX_STATES),
+            bmc_on(m, &by, MAX_STATES),
+            "{}: bmc",
+            m.name
+        );
         assert_eq!(
             fired_actions_on(m, &c),
             fired_actions_on(m, &by),
@@ -2268,7 +2321,7 @@ mod tests {
             invariants: vec![],
         };
         assert!(Compiled::new(&m).is_none());
-        assert_eq!(bmc(&m), bmc_on(&m, &ByName(&m)).0);
+        assert_eq!(bmc(&m), bmc_on(&m, &ByName(&m), MAX_STATES).0);
         assert_eq!(reachable_states(&m), reachable_on(&m, &ByName(&m)));
     }
 

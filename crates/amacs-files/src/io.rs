@@ -11,6 +11,14 @@ use std::sync::Arc;
 use amacs::store::{DocumentId, DocumentSnapshot};
 use aterm_buffer::Seq;
 
+mod journal_steps;
+pub use journal_steps::{
+    FRAME_HEAD as JOURNAL_FRAME_HEAD, JournalTail, frame_record, journal_tail,
+};
+
+/// Format 1, every record its own `ATDJ` head and checksum: read ([`decode_journal`]), and
+/// written only where an open republishes a format-1 journal ([`encode_journal_image_v1`]);
+/// format 2 is [`journal_steps`].
 const JOURNAL_MAGIC: [u8; 4] = *b"ATDJ";
 const JOURNAL_VERSION: u16 = 1;
 const JOURNAL_HEADER_LEN: usize = 40;
@@ -821,9 +829,18 @@ pub enum JournalError {
     InvalidUtf8,
     InvalidEdit,
     NumericOverflow,
+    /// A format-2 image whose step records astream's scan finds damaged inside, out of their
+    /// place, or of a layout this build does not read: not what a crash leaves, so the image
+    /// is refused and kept, never cut ([`journal_steps`]).
+    Fault(astream_wire::steps::StepFault),
+    /// A format-2 image with no header frame first, or a second one.
+    NoHeader,
+    /// A format-2 frame written after other bytes than the ones before it.
+    PrefixMismatch,
 }
 
-/// Encode a single independently checksummed append record.
+/// Encode a single independently checksummed format-1 record, as an aterm before format 2
+/// wrote it ([`encode_journal_v1`]).
 pub(crate) fn encode_journal_record(record: &JournalRecord) -> Result<Vec<u8>, JournalError> {
     validate_record_shape(record)?;
     let (kind, payload) = encode_payload(&record.payload)?;
@@ -852,8 +869,11 @@ pub(crate) fn encode_journal_record(record: &JournalRecord) -> Result<Vec<u8>, J
     Ok(encoded)
 }
 
-/// Encode a complete bounded journal image.
-pub fn encode_journal(records: &[JournalRecord]) -> Result<Vec<u8>, JournalError> {
+/// A complete format-1 image of `records`, as an aterm before format 2 wrote it and reads it.
+///
+/// # Errors
+/// A record or the image past its bound.
+pub fn encode_journal_v1(records: &[JournalRecord]) -> Result<Vec<u8>, JournalError> {
     if records.len() > MAX_JOURNAL_RECORDS {
         return Err(JournalError::TooManyRecords);
     }
@@ -872,7 +892,61 @@ pub fn encode_journal(records: &[JournalRecord]) -> Result<Vec<u8>, JournalError
     Ok(encoded)
 }
 
-/// Decode every record or return one error.
+/// A complete bounded image of `records`, every one of one document, in format 2
+/// ([`journal_steps`]).
+///
+/// # Errors
+/// No record, records of two documents, or a record or image past its bound.
+pub fn encode_journal(records: &[JournalRecord]) -> Result<Vec<u8>, JournalError> {
+    encode_journal_image(records).map(|(image, _)| image)
+}
+
+/// [`encode_journal`], with the tail an appender to the image holds.
+///
+/// # Errors
+/// [`encode_journal`]'s.
+pub fn encode_journal_image(
+    records: &[JournalRecord],
+) -> Result<(Vec<u8>, JournalTail), JournalError> {
+    journal_steps::encode_image(records)
+}
+
+/// A complete format-1 image of `records` ([`encode_journal_v1`]), with the tail its holder
+/// keeps: one that names the image's bytes and that nothing appends to in place, so the first
+/// append after it compacts the image into format 2 ([`JournalTail::appends_in_place`]).
+///
+/// An open republishes a format-1 journal this way ([`journal_is_format_1`]): in an update
+/// from an aterm before format 2, the outgoing aterm reads the journal back after the
+/// successor opened it, and it reads format 1 alone.
+///
+/// # Errors
+/// No record, and [`encode_journal_v1`]'s.
+pub fn encode_journal_image_v1(
+    records: &[JournalRecord],
+) -> Result<(Vec<u8>, JournalTail), JournalError> {
+    if records.is_empty() {
+        return Err(JournalError::Empty);
+    }
+    let image = encode_journal_v1(records)?;
+    let tail = JournalTail::format_1(&image, records.len() as u64);
+    Ok((image, tail))
+}
+
+/// Whether `bytes` start with a format-1 record's head (`ATDJ`, version 1), as every image an
+/// aterm before format 2 wrote does.
+#[must_use]
+pub fn journal_is_format_1(bytes: &[u8]) -> bool {
+    bytes.strip_prefix(&JOURNAL_MAGIC).is_some_and(|rest| {
+        rest.first_chunk::<2>()
+            .is_some_and(|version| u16::from_le_bytes(*version) == JOURNAL_VERSION)
+    })
+}
+
+/// Every whole record of a format-2 image ([`journal_steps`], a torn append dropped) or of a
+/// format-1 one, or one error.
+///
+/// # Errors
+/// Anything but a torn format-2 tail: a fault, a record that does not decode, a bound passed.
 pub fn decode_journal(bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalError> {
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(JournalError::TooLarge);
@@ -880,13 +954,21 @@ pub fn decode_journal(bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalError> 
     if bytes.is_empty() {
         return Err(JournalError::Empty);
     }
+    if bytes.starts_with(&journal_steps::MAGIC) {
+        return journal_steps::decode_image(bytes).map(|image| image.records);
+    }
+    decode_journal_v1(bytes)
+}
+
+/// Every record of a format-1 image, or one error: a damaged record refuses the whole image.
+fn decode_journal_v1(bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalError> {
     let mut records = Vec::new();
     let mut offset = 0;
     while offset < bytes.len() {
         if records.len() == MAX_JOURNAL_RECORDS {
             return Err(JournalError::TooManyRecords);
         }
-        let (record, consumed) = decode_record(&bytes[offset..])?;
+        let (record, consumed) = decode_record_v1(&bytes[offset..])?;
         offset = offset
             .checked_add(consumed)
             .ok_or(JournalError::NumericOverflow)?;
@@ -937,11 +1019,52 @@ pub fn recover_journal_for(
     key: JournalDocumentKey,
     bytes: &[u8],
 ) -> Result<StoredJournalRecovery, JournalError> {
-    let records = decode_journal(bytes)?;
+    recover_journal_image_for(key, bytes).map(|(recovered, _)| recovered)
+}
+
+/// Recover an image and retain its format-2 boundary, so a host can preserve any
+/// uninterpreted tail before replacing the file. Format 1 has no partial recovery.
+///
+/// # Errors
+/// [`recover_journal_for`]'s.
+pub fn recover_journal_image_for(
+    key: JournalDocumentKey,
+    bytes: &[u8],
+) -> Result<(StoredJournalRecovery, Option<JournalTail>), JournalError> {
+    if bytes.starts_with(&journal_steps::MAGIC) {
+        let image = journal_steps::decode_image(bytes)?;
+        Ok((replay_journal(key, &image.records)?, Some(image.tail)))
+    } else {
+        Ok((replay_journal(key, &decode_journal(bytes)?)?, None))
+    }
+}
+
+/// [`recover_journal_for`] through format 1's decoder alone: what an aterm before format 2
+/// reads back of an image (its Commit check of a carried draft, its rollback's re-seat).
+///
+/// # Errors
+/// Any image that is not format 1, and [`recover_journal_for`]'s.
+#[cfg(any(test, debug_assertions, feature = "test-support"))]
+pub fn recover_journal_v1_for(
+    key: JournalDocumentKey,
+    bytes: &[u8],
+) -> Result<StoredJournalRecovery, JournalError> {
+    if bytes.is_empty() {
+        return Err(JournalError::Empty);
+    }
+    replay_journal(key, &decode_journal_v1(bytes)?)
+}
+
+/// Replay decoded `records`: a snapshot sets the text, and a delta applies to the record
+/// before it (its base is that record's sequence, and its own sequence is later).
+fn replay_journal(
+    key: JournalDocumentKey,
+    records: &[JournalRecord],
+) -> Result<StoredJournalRecovery, JournalError> {
     let mut text: Option<String> = None;
     let mut base_content = None;
     let mut durable_seq = Seq(0);
-    for record in &records {
+    for record in records {
         if !record.belongs_to_key(key) {
             return Err(JournalError::WrongDocument);
         }
@@ -958,14 +1081,7 @@ pub fn recover_journal_for(
             }
             JournalPayload::Delta(edits) => {
                 let current = text.as_mut().ok_or(JournalError::MissingSnapshot)?;
-                if record.base_seq != durable_seq
-                    || record.seq.0
-                        != record
-                            .base_seq
-                            .0
-                            .checked_add(1)
-                            .ok_or(JournalError::InvalidSequence)?
-                {
+                if record.base_seq != durable_seq || record.seq <= record.base_seq {
                     return Err(JournalError::InvalidSequence);
                 }
                 apply_journal_edits(current, edits)?;
@@ -981,18 +1097,23 @@ pub fn recover_journal_for(
     })
 }
 
-/// Bound an append stream without losing its disk-baseline witness or latest durable draft.
+/// Bound an append stream without losing its disk-baseline witness or latest durable draft:
+/// the image `bytes` with `appended` (a record's bytes, as a plan carries them) after it, as
+/// the image of its first snapshot and, when the draft is not that, its latest text, with the
+/// tail an appender to it holds. The record is taken apart from the image, so an append that
+/// would take the image past [`MAX_JOURNAL_BYTES`] compacts as any other does.
+///
+/// # Errors
+/// The image and record do not recover ([`recover_journal_for`]), or the compacted image
+/// passes a bound.
 pub fn compact_journal(
     key: JournalDocumentKey,
     bytes: &[u8],
-    record_limit: usize,
-    byte_limit: usize,
-) -> Result<Vec<u8>, JournalError> {
-    let records = decode_journal(bytes)?;
-    if records.len() <= record_limit && bytes.len() <= byte_limit {
-        return Ok(bytes.to_vec());
-    }
-    let recovered = recover_journal_for(key, bytes)?;
+    appended: &[u8],
+) -> Result<(Vec<u8>, JournalTail), JournalError> {
+    let mut records = decode_journal(bytes)?;
+    records.push(journal_steps::decode_record(key.0, appended)?);
+    let recovered = replay_journal(key, &records)?;
     let first = records
         .iter()
         .find_map(|record| match &record.payload {
@@ -1008,7 +1129,7 @@ pub fn compact_journal(
     if first.seq == recovered.durable_seq
         && matches!(&first.payload, JournalPayload::Snapshot(text) if text == &recovered.text)
     {
-        return encode_journal(&[first]);
+        return encode_journal_image(&[first]);
     }
     let latest = JournalRecord {
         document_raw: key.0,
@@ -1016,7 +1137,7 @@ pub fn compact_journal(
         seq: recovered.durable_seq,
         payload: JournalPayload::Snapshot(recovered.text),
     };
-    encode_journal(&[first, latest])
+    encode_journal_image(&[first, latest])
 }
 
 /// A journal an aterm from before wrote under the unkeyed name.
@@ -1128,24 +1249,57 @@ pub struct JournalAppendPlan {
     pub generation: JournalGeneration,
     pub base_durable: Seq,
     pub target_seq: Seq,
-    /// Exact durable journal image observed by the host that scheduled this plan.
-    pub expected_image: Option<ContentFingerprint>,
+    /// The image the host that scheduled this plan last published, which the append extends.
+    pub expected_tail: Option<JournalTail>,
     /// A legacy journal the host must retire before this append publishes ([`LegacyJournal`]).
     pub retire_legacy: Option<LegacyJournal>,
-    /// Named on the image this append publishes.
+    /// Named on the image the append leaves: the owner mark an append in place rewrites to
+    /// name it alone, or the image a compaction publishes.
     pub owner: Option<JournalOwnerId>,
+    /// The record, unframed: the host frames it after [`Self::expected_tail`] ([`frame_record`]).
     pub bytes: Arc<[u8]>,
     pub encoded_fingerprint: ContentFingerprint,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JournalAppendProof {
-    pub appended_len: usize,
+    /// The length of the record the append wrote, unframed.
+    pub record_len: usize,
     pub encoded_fingerprint: ContentFingerprint,
-    pub published_image: ContentFingerprint,
+    /// The image the journal holds after the append.
+    pub published: JournalTail,
+    /// The written bytes were flushed as [`Self::landing`] says.
     pub file_synced: bool,
-    pub renamed_over_journal: bool,
-    pub directory_synced: bool,
+    pub landing: JournalLanding,
+}
+
+/// How an append reached the journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalLanding {
+    /// Written in place after the image's last whole record, then durably flushed before
+    /// acknowledging the checkpoint. A read drops a torn tail from an interrupted append.
+    Appended,
+    /// The image passed a compaction bound: a compacted image was renamed over the journal,
+    /// it and its folder durable.
+    Rewritten {
+        renamed_over_journal: bool,
+        directory_synced: bool,
+    },
+}
+
+impl JournalLanding {
+    /// Whether the landing finished every step it names.
+    #[inline]
+    #[must_use]
+    pub const fn complete(self) -> bool {
+        match self {
+            Self::Appended => true,
+            Self::Rewritten {
+                renamed_over_journal,
+                directory_synced,
+            } => renamed_over_journal && directory_synced,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1288,9 +1442,8 @@ impl DraftJournalReducer {
         match result {
             JournalAppendResult::Committed(proof) => {
                 let proof_complete = proof.file_synced
-                    && proof.renamed_over_journal
-                    && proof.directory_synced
-                    && proof.appended_len == plan.bytes.len()
+                    && proof.landing.complete()
+                    && proof.record_len == plan.bytes.len()
                     && proof.encoded_fingerprint == plan.encoded_fingerprint;
                 if !proof_complete {
                     return self.fail(
@@ -1326,14 +1479,14 @@ impl DraftJournalReducer {
         let generation = JournalGeneration(self.allocate_generation()?);
         let base_durable = self.durable_seq;
         let target_seq = record.seq;
-        let encoded = encode_journal_record(&record).map_err(JournalPlanError::Record)?;
+        let encoded = journal_steps::encode_record(&record).map_err(JournalPlanError::Record)?;
         let bytes: Arc<[u8]> = Arc::from(encoded);
         let plan = JournalAppendPlan {
             document: self.document,
             generation,
             base_durable,
             target_seq,
-            expected_image: None,
+            expected_tail: None,
             retire_legacy: None,
             owner: None,
             encoded_fingerprint: ContentFingerprint::of(&bytes),
@@ -1378,14 +1531,10 @@ fn validate_record_shape(record: &JournalRecord) -> Result<(), JournalError> {
                 return Err(JournalError::TooLarge);
             }
         }
+        // A delta may span several commits: the store plans one edit from the durable text to
+        // the head however many commits coalesced behind an append in flight.
         JournalPayload::Delta(edits) => {
-            if record.seq.0
-                != record
-                    .base_seq
-                    .0
-                    .checked_add(1)
-                    .ok_or(JournalError::InvalidSequence)?
-            {
+            if record.seq <= record.base_seq {
                 return Err(JournalError::InvalidSequence);
             }
             validate_edits_shape(edits)?;
@@ -1475,7 +1624,7 @@ fn encode_payload(payload: &JournalPayload) -> Result<(u8, Vec<u8>), JournalErro
     }
 }
 
-fn decode_record(bytes: &[u8]) -> Result<(JournalRecord, usize), JournalError> {
+fn decode_record_v1(bytes: &[u8]) -> Result<(JournalRecord, usize), JournalError> {
     if bytes.len() < JOURNAL_HEADER_LEN + JOURNAL_CHECKSUM_LEN {
         return Err(JournalError::Truncated);
     }
@@ -1704,13 +1853,19 @@ mod tests {
     }
 
     fn append_proof(plan: &JournalAppendPlan) -> JournalAppendProof {
+        let (_, tail) = encode_journal_image(&[JournalRecord {
+            document_raw: 1,
+            base_seq: plan.target_seq,
+            seq: plan.target_seq,
+            payload: JournalPayload::Snapshot(String::new()),
+        }])
+        .unwrap();
         JournalAppendProof {
-            appended_len: plan.bytes.len(),
+            record_len: plan.bytes.len(),
             encoded_fingerprint: plan.encoded_fingerprint,
-            published_image: ContentFingerprint::of(&plan.bytes),
+            published: tail,
             file_synced: true,
-            renamed_over_journal: true,
-            directory_synced: true,
+            landing: JournalLanding::Appended,
         }
     }
 
@@ -2113,7 +2268,7 @@ mod tests {
     }
 
     #[test]
-    fn checksum_corruption_rejects_the_whole_journal_not_a_valid_prefix() {
+    fn format_1_checksum_corruption_rejects_the_whole_journal_not_a_valid_prefix() {
         let (_store, id, snapshot) = snapshot("draft");
         let first = JournalRecord::snapshot(&snapshot);
         let second = JournalRecord::delta(
@@ -2126,7 +2281,7 @@ mod tests {
             }],
         )
         .unwrap();
-        let mut bytes = encode_journal(&[first, second]).unwrap();
+        let mut bytes = encode_journal_v1(&[first, second]).unwrap();
         let last_payload_byte = bytes.len() - JOURNAL_CHECKSUM_LEN - 1;
         bytes[last_payload_byte] ^= 0x40;
         assert_eq!(decode_journal(&bytes), Err(JournalError::ChecksumMismatch));
@@ -2251,6 +2406,35 @@ mod tests {
             }
         ));
         assert_eq!(reducer.durable_seq(), Seq(0));
+
+        // A compaction is durable only once renamed over the journal with its folder synced.
+        for (renamed_over_journal, directory_synced) in [(false, true), (true, false)] {
+            let plan = reducer.plan_snapshot(&snapshot).unwrap();
+            let mut proof = append_proof(&plan);
+            proof.landing = JournalLanding::Rewritten {
+                renamed_over_journal,
+                directory_synced,
+            };
+            assert!(matches!(
+                reducer.complete(plan.generation, JournalAppendResult::Committed(proof)),
+                JournalReduction::Failed {
+                    stage: JournalStage::VerifyProof,
+                    ..
+                }
+            ));
+            assert_eq!(reducer.durable_seq(), Seq(0));
+        }
+        let plan = reducer.plan_snapshot(&snapshot).unwrap();
+        let mut proof = append_proof(&plan);
+        proof.landing = JournalLanding::Rewritten {
+            renamed_over_journal: true,
+            directory_synced: true,
+        };
+        assert!(matches!(
+            reducer.complete(plan.generation, JournalAppendResult::Committed(proof)),
+            JournalReduction::Durable { .. }
+        ));
+        assert_eq!(reducer.durable_seq(), snapshot.seq);
     }
 
     #[test]

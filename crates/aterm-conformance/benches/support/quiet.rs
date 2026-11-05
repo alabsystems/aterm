@@ -9,7 +9,11 @@ use std::process::ExitCode;
 
 /// Run `matrix` after its own measured admission and fresh postcompile CPU observation.
 /// An ancestor can cover resources, never supply this matrix's CPU evidence. Forced or
-/// immediate admission cannot qualify an acceptance callback.
+/// immediate admission cannot qualify an acceptance callback. A machine that stays busy through
+/// its patience, or a timing hold that ends before the matrix does, runs it unqualified: each
+/// reason is a `measure <target>: unqualified — <why>` line and the rows' own verdict stands
+/// (owner ruling 2026-11-05: a busy machine never blocks a release). Blind, unknown or forced
+/// admission takes no row.
 /// A ledger that cannot be used refuses the run before any row opens a window.
 /// A bad `--admit` is a usage error (2); an interrupt that ends the wait is
 /// COULD NOT RUN (3), no row taken.
@@ -24,7 +28,7 @@ pub fn run(target: &str, matrix: impl FnOnce() -> ExitCode) -> ExitCode {
     if std::env::args().any(|arg| arg == "--list") {
         return matrix();
     }
-    let need = aterm_capacity::Need::timing(format!("measure {target}"));
+    let need = aterm_capacity::Need::timing(format!("measure {target}")).runs_loaded();
     let mut quiet = match aterm_capacity::admit(need, mode) {
         Ok(claim) => claim,
         Err(e @ aterm_capacity::Error::Stopped { .. }) => {
@@ -42,8 +46,8 @@ pub fn run(target: &str, matrix: impl FnOnce() -> ExitCode) -> ExitCode {
     };
     // The benchmark executable is already compiled. This sample belongs to the matrix entry,
     // never to an ancestor's earlier build/admission window.
-    let window = match quiet.measurement_entry() {
-        Ok(window) => window,
+    let entry = match quiet.stated_entry() {
+        Ok(entry) => entry,
         Err(why) => {
             eprintln!(
                 "measure {target}: COULD NOT RUN — {why}; no acceptance callback was invoked"
@@ -51,6 +55,7 @@ pub fn run(target: &str, matrix: impl FnOnce() -> ExitCode) -> ExitCode {
             return ExitCode::from(3);
         }
     };
+    let window = entry.window;
     let evidence = quiet.record().timing;
     let expires = evidence
         .admitted_ms
@@ -66,14 +71,31 @@ pub fn run(target: &str, matrix: impl FnOnce() -> ExitCode) -> ExitCode {
         evidence.entry_load1,
         evidence.admitted_ms
     );
+    for why in &entry.unqualified {
+        eprintln!("{}", unqualified(target, why));
+    }
     let verdict = matrix();
-    if let Err(why) = quiet.timing_admission() {
-        eprintln!(
-            "measure {target}: COULD NOT RUN — timing protection ended before completion: {why}; matrix cannot qualify"
-        );
-        return ExitCode::from(3);
+    match quiet.timing_protection() {
+        Ok(_) => {}
+        Err(aterm_capacity::TimingIssue::Expired) => {
+            eprintln!(
+                "{}",
+                unqualified(target, &aterm_capacity::Unqualified::Lapsed)
+            );
+        }
+        Err(why) => {
+            eprintln!(
+                "measure {target}: COULD NOT RUN — timing protection ended before completion: {why}; matrix cannot qualify"
+            );
+            return ExitCode::from(3);
+        }
     }
     verdict
+}
+
+/// The line that states why `target`'s matrix ran unqualified; verify's measure stage reads it.
+fn unqualified(target: &str, why: &aterm_capacity::Unqualified) -> String {
+    format!("measure {target}: unqualified — {why}")
 }
 
 /// Read admission mode and return the bench's own arguments without `--admit` or Cargo's

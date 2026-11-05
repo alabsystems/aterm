@@ -214,9 +214,10 @@ fn case(state: &aterm_spec::interp::State, legacy: bool, replaying: bool) -> Cas
     }
 }
 
-pub(crate) fn identity_transition(
+fn transition(
     state: &aterm_spec::interp::State,
     action: &str,
+    legacy: bool,
 ) -> aterm_spec::interp::State {
     let mut next = state.clone();
     match action {
@@ -245,11 +246,7 @@ pub(crate) fn identity_transition(
             let replay = action == "Replay";
             let retry = action == "Retry" || (replay && state["phase"] == 3);
             let replaying = action != "Complete";
-            let result = run(case(state, false, replaying), poll, retry, replay);
-            assert_eq!(
-                result,
-                run(case(state, true, replaying), poll, retry, replay)
-            );
+            let result = run(case(state, legacy, replaying), poll, retry, replay);
             for (field, value) in result {
                 next.insert(field, value);
             }
@@ -275,6 +272,83 @@ pub(crate) fn identity_transition(
     next
 }
 
+pub(crate) fn identity_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    transition(state, action, false)
+}
+
+/// The steps the conformance test takes, as `(state, action, legacy)`.
+///
+/// A step that builds no world runs as it is. A world step costs a whole accounts world, and in the
+/// correct model `before` only multiplies states, so each decision (all a step's state but
+/// `before`) runs at two of its three: `d`, `before`'s distance from what is at the writer mod 3,
+/// at 0 and 1, one `legacy` form at each, so every decision meets both forms.
+///
+/// Why the step left out is implied. A writer that uses what it reads at the writer takes one
+/// decision at any `before`, and one that does not is caught where its read is stale. The two
+/// identities are interchangeable here (each is an email of this file's, the roster alias stands
+/// for either), so a stale read at `d` 2 is one at `d` 1 with the two swapped. What is not implied,
+/// and would be missed: a fault asymmetric between the two identities at `d` 2, or one that needs
+/// one `legacy` form at one specific `d`.
+fn identity_steps(
+    model: &aterm_spec::derive::Model,
+) -> Vec<(aterm_spec::interp::State, &'static str, bool)> {
+    let mut steps = Vec::new();
+    let mut decisions: std::collections::BTreeMap<_, std::collections::BTreeSet<_>> =
+        std::collections::BTreeMap::new();
+    for state in aterm_spec::interp::reachable_states(model) {
+        for action in &model.actions {
+            if !model.action_enabled(action.name, &state) {
+                continue;
+            }
+            if !matches!(action.name, "Complete" | "Poll" | "Retry" | "Replay") {
+                steps.push((state.clone(), action.name, false));
+                continue;
+            }
+            let c = case(&state, false, action.name != "Complete");
+            let d = (c.before - c.current).rem_euclid(3);
+            if d == 2 {
+                continue;
+            }
+            let legacy =
+                (d + state["expected"] + state["credential"] + state["default"] + state["mode"])
+                    % 2
+                    == 1;
+            decisions
+                .entry((
+                    action.name,
+                    [
+                        "expected",
+                        "credential",
+                        "denied",
+                        "default",
+                        "mode",
+                        "phase",
+                        "polls",
+                        "pending",
+                        "written",
+                        "moved",
+                        "notified",
+                        "preserved",
+                        "struck",
+                        "quiet",
+                    ]
+                    .map(|field| state[field]),
+                ))
+                .or_default()
+                .insert(legacy);
+            steps.push((state.clone(), action.name, legacy));
+        }
+    }
+    assert!(!decisions.is_empty(), "CONTROL: world steps run");
+    for (decision, forms) in &decisions {
+        assert_eq!(forms.len(), 2, "{decision:?} meets both legacy forms");
+    }
+    steps
+}
+
 #[test]
 fn landing_identity_conforms_and_correction_completes_once() {
     let model = aterm_models_harness::account_landing_identity_model();
@@ -282,19 +356,12 @@ fn landing_identity_conforms_and_correction_completes_once() {
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     // Each step builds its own accounts world, little but file system work, so the steps run on
     // the file system lane's workers ([`aterm_spec::fs_lane::PLACES`]).
-    let mut steps = Vec::new();
-    for state in aterm_spec::interp::reachable_states(&model) {
-        for action in &model.actions {
-            if model.action_enabled(action.name, &state) {
-                steps.push((state.clone(), action.name));
-            }
-        }
-    }
+    let steps = identity_steps(&model);
     aterm_spec::check::each_on(
         aterm_spec::fs_lane::PLACES,
         &steps,
-        |&(ref state, action)| {
-            let next = identity_transition(state, action);
+        |&(ref state, action, legacy)| {
+            let next = transition(state, action, legacy);
             assert!(
                 model.successors(action, state).contains(&next),
                 "{action}: {state:?} -> {next:?}"

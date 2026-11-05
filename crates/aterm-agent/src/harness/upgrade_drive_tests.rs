@@ -13,6 +13,7 @@ use super::super::relaunch::{
 use super::super::upgrade::Dialect;
 use super::*;
 use crate::supervise::ScratchDir;
+use crate::supervise::policy::turn_end::RestartClaim;
 use aterm_uds::spawnfd::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -1322,6 +1323,152 @@ fn scratch(name: &str) -> ScratchDir {
     ScratchDir::new("upgrade", name)
 }
 
+#[test]
+#[cfg(unix)]
+fn an_orphan_observes_retirement_before_applying_its_expired_clock() {
+    for mode in ["query", "reconcile", "error"] {
+        let dir = scratch("newly-retired-orphan");
+        let mut opts = drive(&dir);
+        let (socket, requests) = crate::harness::fake_instance(
+            &dir.join("retirement.sock"),
+            "retirement-orphan",
+            move |line| {
+                if line == "version" {
+                    "OK fixture".into()
+                } else if line.contains(" native-act query ") {
+                    match mode {
+                        "query" => "OK native-act state=retired reason=no-exec-grant",
+                        "error" => "ERR unavailable",
+                        _ => "OK native-act state=unknown",
+                    }
+                    .into()
+                } else if line.contains(" native-act reconcile ") {
+                    "OK native-act state=retired reason=no-exec-grant".into()
+                } else {
+                    panic!("orphan retirement must not dispatch {line}")
+                }
+            },
+        );
+        opts.sock = Some(socket);
+        opts.token = Some(HarnessToken::new("retirement-orphan"));
+        let st = St {
+            phase: Phase::Exiting { at_s: 1 },
+            tab: "retained-tab".into(),
+            native_coordination: true,
+            native_prepare: "original predecessor".into(),
+            native: Some(super::super::native_act::Binding {
+                id: "ab".repeat(16),
+                capability: "cd".repeat(32),
+            }),
+            ..St::default()
+        };
+        save_checked(&opts, SESSION, &st).unwrap();
+        let reports = orphans(&opts, &[], None);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].step,
+            if mode == "error" {
+                "wait:native-recovery"
+            } else {
+                super::super::native_restart::WAIT_RETIRED_UNISSUED
+            }
+        );
+        let saved = load(&opts, SESSION).unwrap();
+        assert_eq!(saved.native_retired_unissued, mode != "error");
+        assert_eq!(saved.phase, st.phase);
+        assert_eq!(saved.native_prepare, st.native_prepare);
+        assert_eq!(ledger_lines(&opts), 0);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains(" native-act query "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains(" native-act reconcile "))
+                .count(),
+            usize::from(mode == "reconcile")
+        );
+    }
+}
+
+#[test]
+fn retained_retirements_are_quiet_orphans_and_do_not_schedule_upgrade_work() {
+    let dir = scratch("retired-orphan");
+    let opts = drive(&dir);
+    let mut st = St {
+        phase: Phase::Exiting { at_s: 1 },
+        tab: "retained-tab".into(),
+        native_retired_unissued: true,
+        native_coordination: true,
+        native_prepare: "original predecessor".into(),
+        ..St::default()
+    };
+    let original = st.clone();
+    assert!(!st.seen_gone(u64::MAX));
+    assert!(!st.carried_through_hand(u64::MAX));
+    assert_eq!(st, original);
+    save_checked(&opts, SESSION, &st).unwrap();
+    assert!(in_flight(&opts).is_empty());
+    for _ in 0..2 {
+        let reports = orphans(&opts, &[], None);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].step,
+            super::super::native_restart::WAIT_RETIRED_UNISSUED
+        );
+    }
+    assert_eq!(ledger_lines(&opts), 0);
+    assert!(load(&opts, SESSION).unwrap().native_retired_unissued);
+}
+
+#[test]
+#[cfg(unix)]
+fn checked_native_state_refuses_an_unavailable_directory_barrier_and_retries() {
+    use std::io::ErrorKind;
+
+    for kind in [ErrorKind::Unsupported, ErrorKind::PermissionDenied] {
+        let dir = scratch("native-state-directory-barrier");
+        let opts = drive(&dir);
+        let mut state = St {
+            native_coordination: true,
+            native_prepare: "retained immutable predecessor".into(),
+            native: Some(super::super::native_act::Binding {
+                id: "ab".repeat(16),
+                capability: "cd".repeat(32),
+            }),
+            ..St::default()
+        };
+        save_checked(&opts, SESSION, &state).unwrap();
+        state.native_retired_unissued = true;
+
+        let fault = aterm_durable::seam::FailingDirs::with_kind(kind);
+        assert_eq!(
+            save_checked(&opts, SESSION, &state).unwrap_err().kind(),
+            kind
+        );
+        drop(fault);
+
+        // Rename can have succeeded even though its acknowledgement failed.
+        // Keep that record and the same capability; absence is not inferred.
+        let visible = load(&opts, SESSION).unwrap();
+        assert!(visible.native_retired_unissued);
+        assert_eq!(visible.native, state.native);
+        assert_eq!(visible.native_prepare, state.native_prepare);
+        save_checked(&opts, SESSION, &state).unwrap();
+        let confirmed = load(&opts, SESSION).unwrap();
+        assert_eq!(confirmed.native, state.native);
+        assert!(confirmed.native_retired_unissued);
+    }
+}
+
 /// The models report's settings read never waits on or swallows whatever stands at
 /// `.claude/settings.json`: an ordinary file parses; an oversized file and a fifo read
 /// as no settings (the fifo is the control — an unbounded read would not return).
@@ -1690,6 +1837,7 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
             &[],
         )
         .map(|line| Plan {
+            cold: None,
             shell: 1,
             dialect: Dialect::Zsh,
             line,
@@ -2636,6 +2784,7 @@ fn drive(dir: &Path) -> Opts {
     Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: Some(dir.join("config/accounts.toml")),
         sock: Some(dir.join("no.sock").to_string_lossy().into_owned()),
         token: None,
         only_sid: None,
@@ -3052,15 +3201,7 @@ const FULL_EMPTY: &str =
 #[cfg(unix)]
 #[test]
 fn continuation_poll_confirms_an_empty_tail_with_the_full_screen() {
-    let (mut c, server) = fake_tab(vec![
-        TAIL_EMPTY,
-        "OK %20 d0d0d0 111318 none",
-        FULL_DRAFT,
-        TAIL_EMPTY,
-        "OK %20 d0d0d0 111318 none",
-        FULL_EMPTY,
-        "OK %20 d0d0d0 111318 none",
-    ]);
+    let (mut c, server) = fake_tab(vec![TAIL_EMPTY, FULL_DRAFT, TAIL_EMPTY, FULL_EMPTY]);
     let mut tail_available = true;
     assert!(
         !continuation_composer_empty(&mut c, "s-x", &mut tail_available),
@@ -3076,8 +3217,28 @@ fn continuation_poll_confirms_an_empty_tail_with_the_full_screen() {
         server.join().expect("server"),
         vec![
             "@s-x text --json tail=20",
-            "@s-x cell 57 2",
             "@s-x text --json",
+            "@s-x text --json tail=20",
+            "@s-x text --json",
+        ],
+        "a blank composer is judged by its rows: no cell is asked"
+    );
+    // Claude Code 2.1.318's suggestion with the terminal unfocused, no caret drawn: its first glyph
+    // `r 999999 111318 dim` at column 2 (docs/measured/composer-cells-2026-11-03.md), the one cell
+    // a read of it asks, at the tail's row and then at the full screen's.
+    const TAIL_SUGGESTED: &str = r#"OK {"rows":["────────────","❯ run the tests","────────────"],"cursor":{"row":57,"col":2},"first":56}"#;
+    const FULL_SUGGESTED: &str = r#"OK {"rows":["────────────","❯ run the tests","────────────"],"cursor":{"row":1,"col":2},"first":0}"#;
+    const DIM: &str = "OK r 999999 111318 dim";
+    let (mut c, server) = fake_tab(vec![TAIL_SUGGESTED, DIM, FULL_SUGGESTED, DIM]);
+    assert!(continuation_composer_empty(
+        &mut c,
+        "s-x",
+        &mut tail_available
+    ));
+    drop(c);
+    assert_eq!(
+        server.join().expect("server"),
+        vec![
             "@s-x text --json tail=20",
             "@s-x cell 57 2",
             "@s-x text --json",
@@ -3158,6 +3319,44 @@ fn continuation_poll_falls_back_on_an_unreadable_or_inconclusive_tail() {
     );
 }
 
+/// Claude Code 2.1.318's empty composer at rest, as measured (`claude-2.1.318-footer-auto-idle`, the
+/// cursor home at column 2 over an inverse space, a plain one after it:
+/// docs/measured/composer-cells-2026-11-03.md) is an empty composer to the gate by its rows alone,
+/// so nothing is asked of its cells. NEGATIVE CONTROL: `composer_dim_row` naming the caret row on a
+/// blank first line asks `cell 6 2`, then `cell 6 3` past the drawn caret.
+#[cfg(unix)]
+#[test]
+fn a_measured_empty_composer_asks_the_gate_no_cell() {
+    let rows: Vec<String> =
+        include_str!("../../../aterm-phase/src/fixtures/claude-2.1.318-footer-auto-idle.txt")
+            .lines()
+            .skip(1)
+            .map(str::to_string)
+            .collect();
+    let caret = rows
+        .iter()
+        .position(|r| r.starts_with('❯'))
+        .expect("the composer");
+    let scr = Screen {
+        rows,
+        cursor: Some((caret, 2)),
+        seq: 1,
+        first: 0,
+        generation: None,
+        human: HumanInput::Never,
+        title: None,
+        human_seq: None,
+    };
+    let (mut c, server) = fake_tab(vec![
+        "OK %20 111318 d0d0d0 inverse",
+        "OK %20 d0d0d0 111318 none",
+    ]);
+    assert_eq!(upgrade::composer_dim_row(&scr.rows, scr.cursor), None);
+    assert!(composer_empty(&mut c, "s-x", &scr));
+    drop(c);
+    assert_eq!(server.join().expect("server"), Vec::<String>::new());
+}
+
 /// A grid displaced by a net-zero re-grid never makes a placeholder a draft.
 #[cfg(unix)]
 #[test]
@@ -3172,13 +3371,13 @@ fn a_displaced_grid_never_makes_a_placeholder_a_draft() {
         generation: None,
         human: HumanInput::Never,
         title: None,
+        human_seq: None,
     };
     let screen = |cursor: Option<(usize, usize)>| typed(text, cursor);
     let (mut c, server) = fake_tab(vec![
         "OK p 999999 111318 dim",
         "OK p d0d0d0 111318 none",
         "ERR out of range",
-        "OK %20 d0d0d0 111318 none",
     ]);
     assert!(
         composer_empty(&mut c, "s-x", &screen(Some((2, 2)))),
@@ -3206,12 +3405,12 @@ fn a_displaced_grid_never_makes_a_placeholder_a_draft() {
     );
     assert!(
         composer_empty(&mut c, "s-x", &typed("", Some((2, 2)))),
-        "a blank composer, its cell plain"
+        "a blank composer: its rows decide, nothing is asked"
     );
     drop(c);
     assert_eq!(
         server.join().expect("server"),
-        vec!["@s-x cell 55 2"; 4],
+        vec!["@s-x cell 55 2"; 3],
         "always the caret row, never the cursor's"
     );
 }
@@ -3962,6 +4161,8 @@ struct Answers {
     prompt: Option<Prompt>,
     /// The `native-act …` reply, to every request of a native restart's operation.
     native: &'static str,
+    /// A process that dies as the `await` for its first idle arrives, before that is answered.
+    dies_at_await: Option<std::sync::Arc<std::sync::Mutex<Option<aterm_uds::spawnfd::Child>>>>,
 }
 
 /// What [`Answers::prompt`]'s stand-in prompt holds and how it is drawn.
@@ -4024,6 +4225,7 @@ impl Default for Answers {
             who: None,
             prompt: None,
             native: "ERR unscripted",
+            dies_at_await: None,
         }
     }
 }
@@ -4069,6 +4271,13 @@ fn instance_for(
             .split_whitespace()
             .find(|w| !w.starts_with('@'))
             .unwrap_or("");
+        if verb == "await"
+            && let Some(dying) = &answers.dies_at_await
+            && let Some(mut child) = dying.lock().expect("the dying process").take()
+        {
+            child.kill().expect("kill");
+            child.wait().expect("reap");
+        }
         match verb {
             "sessions" => format!("OK 1\nlocal {tab} 0 idle claude {}", answers.row),
             "text" if prompt.is_some() => {
@@ -6384,6 +6593,8 @@ fn a_crashs_relaunch_moves_only_onto_a_build_proved_to_start() {
         .expect("the crash's record");
         let program = versions.join("2.1.281");
         let snap = Snapshot {
+            launch_env: None,
+            auth_observed: true,
             tab: TAB.to_string(),
             pid: dead,
             start: start.to_string(),
@@ -7931,7 +8142,16 @@ const ROWS_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [if-gen=<epoc
 const CAP_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [cadence=<ms>] [cap=<n>] \
                         [yield=<floor>] [if-gen=<epoch>.<seq>] ...";
 
-/// The Claude notice fences on its input box where the host's `help turn` names `if-rows=`.
+/// A host's `help turn` that names the rows fence and the person's (`if-rows=`, `if-human=`).
+const HUMAN_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [if-gen=<epoch>.<seq>] \
+                          [if-rows=<first>-<last>:<hex16>] [if-human=<n>] ...";
+
+/// The Claude notice fences on its input box where the host's `help turn` names `if-rows=`, and on
+/// the person's input count its read took where it names `if-human=` (finding 1 of the review of the
+/// draft-hold work: a key that moves no fenced row, Shift+Tab's mode row, measured, is seen by that
+/// count alone). A host that names no `if-human=` is sent none: it would type the word as text.
+/// NEGATIVE CONTROL: `turn_takes_human` answering yes whatever the help says, and the line to the
+/// `ROWS_HELP` host carries `if-human=`.
 #[cfg(unix)]
 #[test]
 fn the_claude_notice_fences_on_its_input_box_where_the_host_takes_if_rows() {
@@ -7944,7 +8164,7 @@ fn the_claude_notice_fences_on_its_input_box_where_the_host_takes_if_rows() {
             "  ".to_string()
         };
         format!(
-            r#"{{"rows":["✻ Pondering… (3s)","{edge}","❯ ","{edge}"],"cursor":{{"row":2,"col":2}},"seq":77,"first":0,"gen":"4.77","human_ms":null}}"#
+            r#"{{"rows":["✻ Pondering… (3s)","{edge}","❯ ","{edge}"],"cursor":{{"row":2,"col":2}},"seq":77,"first":0,"gen":"4.77","human_ms":null,"human_seq":7}}"#
         )
     };
     let turn_line = |help: &'static str, framed: bool, name: &str| -> String {
@@ -7963,8 +8183,16 @@ fn the_claude_notice_fences_on_its_input_box_where_the_host_takes_if_rows() {
             ..drive(&dir)
         };
         let mut c = connect(&opts, TAB).expect("control connection");
-        let (fence, _) = claude_fence(&mut c, TAB).expect("empty composer");
-        turn_fenced(&mut c, TAB, "[aterm harness] hi", fence.as_deref()).expect("typed");
+        let (fence, read) = claude_fence(&mut c, TAB).expect("empty composer");
+        assert_eq!(read.human_seq, Some(7));
+        turn_fenced(
+            &mut c,
+            TAB,
+            "[aterm harness] hi",
+            fence.as_deref(),
+            read.human_seq,
+        )
+        .expect("typed");
         drop(c);
         let line = asked
             .lock()
@@ -7984,6 +8212,12 @@ fn the_claude_notice_fences_on_its_input_box_where_the_host_takes_if_rows() {
     let narrow = turn_line(ROWS_HELP, true, "fence-rows");
     assert!(narrow.contains(&format!("if-rows={want} ")), "{narrow}");
     assert!(!narrow.contains("if-gen="), "{narrow}");
+    assert!(!narrow.contains("if-human="), "{narrow}");
+    let person = turn_line(HUMAN_HELP, true, "fence-rows-person");
+    assert!(
+        person.contains(&format!("if-rows={want} if-human=7 ")),
+        "{person}"
+    );
     let older = turn_line(FENCED_HELP, true, "fence-rows-older");
     assert!(
         older.contains("if-gen=4.77 ") && !older.contains("if-rows="),
@@ -8036,22 +8270,44 @@ fn the_fenced_notice_asks_nothing_between_its_read_and_its_turn() {
         turn: vec!["OK 0 id=2 submitted=1 status=settled"],
         ..Answers::default()
     };
-    let (dir, mut c, asked) = rig("fence-order", answers(None));
-    for _ in 0..2 {
-        let generation = typing_fence(&mut c, TAB).expect("empty composer");
-        assert_eq!(generation.as_deref(), Some("4.77"));
-        turn_fenced(&mut c, TAB, "[aterm harness] hi", generation.as_deref()).expect("typed");
+    // A blank composer is judged by its rows: one read, then the turn. A suggestion at home is
+    // judged by its glyph's cell, and the screen is read again after it, last before the turn.
+    for (name, answers, want) in [
+        (
+            "fence-order",
+            answers(None),
+            &["help", "text", "turn", "text", "turn"][..],
+        ),
+        (
+            "fence-order-cell",
+            Answers {
+                screen: at(2, "try the tests"),
+                cell: "OK t 999999 111318 dim",
+                ..answers(None)
+            },
+            &[
+                "help", "text", "cell", "text", "turn", "text", "cell", "text", "turn",
+            ][..],
+        ),
+    ] {
+        let (dir, mut c, asked) = rig(name, answers);
+        for _ in 0..2 {
+            let (generation, human) = typing_fence(&mut c, TAB).expect("empty composer");
+            assert_eq!(generation.as_deref(), Some("4.77"));
+            turn_fenced(
+                &mut c,
+                TAB,
+                "[aterm harness] hi",
+                generation.as_deref(),
+                human,
+            )
+            .expect("typed");
+        }
+        drop(c);
+        let got = verbs(&asked);
+        assert_eq!(got, want, "{name}: {got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
-    drop(c);
-    let got = verbs(&asked);
-    assert_eq!(
-        got,
-        [
-            "help", "text", "cell", "text", "turn", "text", "cell", "text", "turn"
-        ],
-        "{got:?}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
     let (dir, mut c, asked) = rig(
         "fence-no-cell",
         Answers {
@@ -8099,7 +8355,10 @@ fn the_fence_judges_the_composer_row_not_the_cursors_row() {
         ..Answers::default()
     };
     let (dir, mut c, asked) = rig("displaced-dim", base("try the tests", dim));
-    assert_eq!(typing_fence(&mut c, TAB), Ok(Some("4.77".to_string())));
+    assert_eq!(
+        typing_fence(&mut c, TAB).map(|(generation, _)| generation),
+        Ok(Some("4.77".to_string()))
+    );
     drop(c);
     assert_eq!(asked_cells(&asked), [format!("@{TAB} cell 2 2")]);
     let _ = std::fs::remove_dir_all(&dir);
@@ -9108,6 +9367,8 @@ fn a_build_the_conversations_record_holds_it_off_is_no_relaunch_target() {
     .expect("the crash's record");
     let program = versions.join("2.1.281");
     let snap = Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: TAB.to_string(),
@@ -9687,6 +9948,8 @@ fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
     let mut shell = stand_in_shell();
     let shell_pid = shell.id();
     let snap = |pid: u32, start: &str, session: Option<&str>| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: TAB.to_string(),
@@ -9847,6 +10110,8 @@ impl DeadAgent {
         let shell = stand_in_shell();
         let dead = dead_pid();
         let snap = Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: TAB.to_string(),
@@ -10849,6 +11114,8 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
     wait_exec(agent.id());
     let start = kernel_start(agent.id()).expect("lstart");
     let snap = |argv: &[&str]| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: TAB.to_string(),
@@ -10874,6 +11141,7 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
             &ask_of(&Restart::Memory),
             Err("no-foreground")
         )
+        .report
         .step,
         "wait:no-foreground"
     );
@@ -10884,6 +11152,7 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
             &ask_of(&Restart::Memory),
             Ok(snap(&claude))
         )
+        .report
         .step,
         "wait:no-session-record"
     );
@@ -10893,7 +11162,8 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
         &Restart::Memory,
         &ask_of(&Restart::Memory),
         Ok(snap(&claude)),
-    );
+    )
+    .report;
     assert_eq!(
         (r.step.as_str(), r.session.as_str(), r.to.as_str()),
         ("would-restart", SESSION, "1.0.0(same)"),
@@ -10910,6 +11180,7 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
             &ask_of(&Restart::Memory),
             Ok(other)
         )
+        .report
         .step,
         "wait:tab-identity-conflict"
     );
@@ -10920,6 +11191,7 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
             &ask_of(&Restart::Memory),
             Ok(snap(&["/opt/claude/bin/claude", "-p", "hi"]))
         )
+        .report
         .step,
         "refused:one-shot"
     );
@@ -10940,6 +11212,7 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
             &ask_of(&Restart::Memory),
             Ok(snap(&claude))
         )
+        .report
         .step,
         "would-resume:exiting"
     );
@@ -10965,6 +11238,8 @@ fn answer_at(model: &str, at: &str) -> String {
 #[cfg(unix)]
 fn users_agent(session: &str) -> Snapshot {
     Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: TAB.to_string(),
@@ -11026,6 +11301,8 @@ fn a_memory_restart_asks_no_hand_chosen_model_of_a_launch_that_named_none() {
     wait_exec(agent.id());
     let start = kernel_start(agent.id()).expect("lstart");
     let snap = |argv: &[&str]| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: TAB.to_string(),
@@ -11056,6 +11333,7 @@ fn a_memory_restart_asks_no_hand_chosen_model_of_a_launch_that_named_none() {
             &ask_of(&Restart::Memory),
             Ok(snap(&["/opt/claude/bin/claude", "--verbose"]))
         )
+        .report
         .step,
         "would-restart"
     );
@@ -11467,7 +11745,7 @@ fn restart_saved_until(
     let (r, saved, _) = restart_driven(
         name, why, launch, prior, hand, login, roster, answers, false, cancel_at,
     );
-    (r, saved)
+    (r.report, saved)
 }
 
 /// [`restart_saved_until`], with a directory standing at the conversation's record when
@@ -11486,7 +11764,7 @@ fn restart_driven(
     answers: Answers,
     claim_blocked: bool,
     cancel_at: Option<usize>,
-) -> (Report, Option<St>, Vec<String>) {
+) -> (crate::harness::relaunch::Restarted, Option<St>, Vec<String>) {
     let dir = scratch(name);
     let (sock, asked) = instance_with(&dir, answers);
     let opts = Opts {
@@ -11514,6 +11792,8 @@ fn restart_driven(
         chose_by_hand(&opts, hand);
     }
     let snap = Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: Some(live_profile(&opts, login)),
         tab: TAB.to_string(),
@@ -11594,7 +11874,12 @@ fn a_restart_in_place_signals_only_once_its_claim_is_written() {
         true,
         None,
     );
-    assert_eq!(blocked.step, "wait:claim-unwritten", "{blocked:?}");
+    assert_eq!(blocked.report.step, "wait:claim-unwritten", "{blocked:?}");
+    assert_eq!(
+        blocked.claim,
+        RestartClaim::Unclaimed,
+        "an unwritten claim holds none: {blocked:?}"
+    );
     assert!(
         !asked.iter().any(|l| l.contains(" signal ")),
         "nothing signalled: {asked:#?}"
@@ -11614,6 +11899,11 @@ fn a_restart_in_place_signals_only_once_its_claim_is_written() {
     assert!(
         asked.iter().any(|l| l.contains(" signal ")),
         "control: signalled once claimed: {written:?} {asked:#?}"
+    );
+    assert_eq!(
+        written.claim,
+        RestartClaim::Taken,
+        "the claim written is said taken: {written:?}"
     );
     let saved = saved.unwrap_or_else(|| panic!("the claim: {written:?}"));
     assert_eq!(saved.line_grace_s, Some(120), "the gate's whole grace");
@@ -11674,7 +11964,7 @@ fn restart_over(
         runs,
     } = restart_asked(name, |agent| vec![(why(agent), Scene::default())], prior);
     let (r, saved) = said.pop().expect("the one ask");
-    (r, saved, asked, runs)
+    (r.report, saved, asked, runs)
 }
 
 /// What the stand-in host's world holds for one ask of [`restart_asked`] while it runs: the
@@ -11695,8 +11985,8 @@ struct Scene {
 /// What [`restart_asked`] saw.
 #[cfg(unix)]
 struct Asks {
-    /// Each ask's report, and the record saved after it.
-    said: Vec<(Report, Option<St>)>,
+    /// Each ask's answer (its report and its claim), and the record saved after it.
+    said: Vec<(crate::harness::relaunch::Restarted, Option<St>)>,
     /// The requests the tab's stand-in was asked, over every ask.
     asked: Vec<String>,
     /// Whether the agent still runs after the last ask.
@@ -11740,6 +12030,8 @@ fn restart_asked_with(
     let launch = "claude-opus-5-5";
     write_transcript(&opts.home, &[answer_at(launch, "2099-01-01T00:00:00Z")]);
     let snap = Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: Some(live_profile(&opts, None)),
         tab: TAB.to_string(),
@@ -11999,16 +12291,31 @@ fn a_nameless_lost_lines_restart_deferred_before_its_claim_is_made_of_its_asker_
             let claimed = saved.as_ref().is_some_and(|st| {
                 st.cause == "input-lost"
                     && st.ask == line_word(LINE_B)
-                    && st.pid == again.pid
-                    && again.pid != 0
+                    && st.pid == again.report.pid
+                    && again.report.pid != 0
             });
-            let truthful = !runs || again.step.starts_with("wait:");
-            if first.step != deferred || !stood || signals != 1 || !claimed || !truthful {
+            let before = if deferral == "sweep" {
+                RestartClaim::Unread
+            } else {
+                RestartClaim::Unclaimed
+            };
+            let said_claim = first.claim == before && again.claim == RestartClaim::Taken;
+            let truthful = !runs || again.report.step.starts_with("wait:");
+            if first.report.step != deferred
+                || !stood
+                || signals != 1
+                || !claimed
+                || !said_claim
+                || !truthful
+            {
                 wrong.push(format!(
                     "{name}: first {:?} (the earlier line's record stands: {stood}), again {:?} \
-                     signals={signals} claimed={claimed} runs={runs} saved={:?}",
-                    first.step,
-                    again.step,
+                     signals={signals} claimed={claimed} (said: first {:?}, again {:?}) runs={runs} \
+                     saved={:?}",
+                    first.report.step,
+                    again.report.step,
+                    first.claim,
+                    again.claim,
                     saved
                         .as_ref()
                         .map(|st| (&st.phase, &st.cause, &st.ask, st.pid))
@@ -12180,12 +12487,15 @@ fn no_restart_but_the_memory_restart_signals_over_the_agents_own_work_its_screen
                 let right = if signals {
                     signalled
                 } else {
-                    !signalled && r.step == "wait:changed" && saved.is_none()
+                    !signalled
+                        && r.report.step == "wait:changed"
+                        && saved.is_none()
+                        && r.claim == RestartClaim::Unclaimed
                 };
                 if !right {
                     wrong.push(format!(
                         "{name}: {:?} signalled={signalled} saved={:?}",
-                        r.step,
+                        r.report,
                         saved.map(|st| (st.phase, st.cause))
                     ));
                 }
@@ -12300,6 +12610,165 @@ fn a_restart_asked_again_over_its_own_record_carries_it() {
     assert!(
         wrong.is_empty(),
         "each re-ask carries its own record, ending nothing: {wrong:#?}"
+    );
+}
+
+/// A RESTART ASKED AGAIN OVER ITS OWN RECORD ALREADY CARRIED ON IS MADE (ATERM-KI-1101-3): the
+/// restart's relaunch answered a wait once its signal had gone (`wait:resume`, the process it
+/// started not registered within the held wait; `wait:exiting`; `wait:shell-prompt`), so the
+/// loop asks it again under the same ask (on its back-off, or for a move put off to a quiet
+/// moment at a later turn end), and before that ask the sweep carried the relaunch on, booking
+/// the record `Done`. Only a record in flight was carried (`St::in_flight`), so this one fell
+/// through to a fresh restart: the process the restart's own relaunch had started was signalled
+/// again, a second relaunch for one restart (a memory restart's, a lost line's whose line named
+/// no process), or a model's move and its way back went past the record to their own path, which
+/// this stand-in's profile refuses for billing (`refused:model-…`). Now a `Done` record that is
+/// the asked restart's own ([`crate::harness::relaunch::its_own`]: of its cause, claimed by an
+/// ask of it) and landed in the asker (adopted, `relaunched_pid`, or the process its line started
+/// by its parent, up by the time the record was carried on) answers
+/// [`crate::harness::relaunch::ALREADY_MADE`], nothing signalled, the record as it stood, its claim
+/// held ([`RestartClaim::Held`]). CONTROLS: a `Done` record of its cause that another run's ask
+/// claimed (another line's, for a lost line's restart) is restarted over as before, and so is its
+/// own record whose relaunch landed in another process than the asker, and its own record whose
+/// asker, a child of the record's shell on the same conversation, started after the record was
+/// carried on (`claude -c` typed once the relaunch ended: another launch, not the relaunch, which
+/// was made of it on that code); each restarted over takes the claim where it signals, and holds
+/// none where it is refused (the record as it stood, the old code saying it claimed).
+#[cfg(unix)]
+#[test]
+fn a_restart_asked_again_over_its_own_record_already_carried_on_is_made() {
+    use crate::harness::relaunch::ALREADY_MADE;
+    let mut wrong = Vec::new();
+    for (tag, cause) in [
+        ("memory", "memory"),
+        ("model", "model:claude-fable-5-2"),
+        ("model-back", "model-back:claude-opus-5-5"),
+        ("input-lost", "input-lost"),
+    ] {
+        let of = |line| match tag {
+            "memory" => Restart::Memory,
+            "model" => Restart::Model {
+                to: "claude-fable-5-2".to_string(),
+            },
+            "input-lost" => Restart::InputLost {
+                of: (None, None),
+                line,
+            },
+            _ => Restart::ModelBack { to: None },
+        };
+        let why = of(LINE_A);
+        let own = ask_of(&why);
+        let other = match tag {
+            "input-lost" => ask_of(&of(LINE_B)),
+            _ => RestartAsk::of(&why, RUN_AT - 600),
+        };
+        for (case, ask, adopted, ours, carried_ago, made) in [
+            ("adopted", &own, true, true, 5, true),
+            ("landed", &own, false, true, 5, true),
+            ("another-run", &other, true, true, 5, false),
+            ("elsewhere", &own, false, false, 5, false),
+            ("launched-after", &own, false, true, 600, false),
+        ] {
+            let name = format!("own-done-{tag}-{case}");
+            let Asks {
+                mut said,
+                asked,
+                runs,
+            } = restart_asked(
+                &name,
+                |_| vec![(why.clone(), Scene::default())],
+                |agent, _| St {
+                    phase: Phase::Done,
+                    pid: dead_pid(),
+                    shell: if ours { std::process::id() } else { 1 },
+                    tab: TAB.to_string(),
+                    cause: cause.to_string(),
+                    ask: ask.word().to_string(),
+                    exited_at: now_s() - carried_ago - 25,
+                    relaunched_pid: if adopted { agent } else { 0 },
+                    done_at: now_s() - carried_ago,
+                    ..St::default()
+                },
+            );
+            let (r, saved) = said.pop().expect("the one ask");
+            let signalled = asked.iter().any(|l| l.contains(" signal "));
+            let ok = if made {
+                r.report.step == ALREADY_MADE
+                    && !signalled
+                    && runs
+                    && r.claim == RestartClaim::Held
+                    && saved.as_ref().is_some_and(|st| {
+                        st.phase == Phase::Done && st.ask == own.word() && st.cause == cause
+                    })
+            } else {
+                let refused = r.report.step.starts_with("refused:model-");
+                r.report.step != ALREADY_MADE
+                    && (signalled || refused)
+                    && r.claim
+                        == if signalled {
+                            RestartClaim::Taken
+                        } else {
+                            RestartClaim::Unclaimed
+                        }
+            };
+            if !ok {
+                wrong.push(format!(
+                    "{name}: {:?} {:?} signalled={signalled} runs={runs} saved={:?}",
+                    r.report.step,
+                    r.claim,
+                    saved.map(|st| (st.phase, st.cause, st.ask, st.relaunched_pid))
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "each re-ask over its own record carried on in the asker is made, and no other: {wrong:#?}"
+    );
+}
+
+/// A RESTART ASKED WHILE ITS CONVERSATION'S RECORD IS IN FLIGHT IN ANOTHER TAB HOLDS NO CLAIM
+/// (ATERM-KI-1101-3): the record is the asked restart's own by its ask and cause, its relaunch in
+/// flight, but in another tab than the asker's. The restart carries nothing there and answers
+/// `wait:conversation-in-other-tab`, the record as it stood, and its answer says it holds no live
+/// claim of the asker's ([`RestartClaim::Unclaimed`]): a loop that read it as held would keep the
+/// move's run past its acts for a relaunch it does not own. NEGATIVE CONTROL by mutation: that
+/// answer said held, as the record's ask and cause alone would say.
+#[cfg(unix)]
+#[test]
+fn a_restart_asked_over_its_own_record_in_another_tab_holds_no_claim() {
+    let why = Restart::Model {
+        to: "claude-fable-5-2".to_string(),
+    };
+    let Asks { said, asked, .. } = restart_asked(
+        "own-record-other-tab",
+        |_| vec![(why.clone(), Scene::default())],
+        |_, _| St {
+            phase: Phase::Relaunched { at_s: now_s() },
+            pid: dead_pid(),
+            shell: std::process::id(),
+            tab: "s-another-tab".to_string(),
+            cause: "model:claude-fable-5-2".to_string(),
+            ask: ask_of(&why).word().to_string(),
+            exited_at: now_s() - 3,
+            ..St::default()
+        },
+    );
+    let [(r, saved)] = said.as_slice() else {
+        panic!("one ask: {said:?}");
+    };
+    assert_eq!(
+        (r.report.step.as_str(), r.claim),
+        ("wait:conversation-in-other-tab", RestartClaim::Unclaimed),
+        "{r:?}"
+    );
+    assert!(
+        saved.as_ref().is_some_and(|st| st.tab == "s-another-tab"),
+        "the record as it stood: {saved:?}"
+    );
+    assert!(
+        !asked.iter().any(|l| l.contains(" signal ")),
+        "nothing signalled: {asked:#?}"
     );
 }
 
@@ -12449,14 +12918,14 @@ fn a_restart_asked_over_a_landed_native_record_goes_its_own_way_at_its_next_ask(
             let completed = after_first
                 .as_ref()
                 .is_some_and(|st| st.native.is_none() && st.native_prepare.is_empty());
-            let deferred = first.step == crate::harness::relaunch::NATIVE_CARRIED;
-            let own_way = second.step == "wait:native-coordinated-unavailable";
+            let deferred = first.report.step == crate::harness::relaunch::NATIVE_CARRIED;
+            let own_way = second.report.step == "wait:native-coordinated-unavailable";
             if !(deferred && completed && own_way && !signalled && runs) {
                 wrong.push(format!(
                     "{name}: first {:?} (native completed {completed}), then {:?} \
                      signalled={signalled} runs={runs} saved={:?}",
-                    first.step,
-                    second.step,
+                    first.report.step,
+                    second.report.step,
                     after_second.as_ref().map(|st| (
                         st.phase.clone(),
                         st.cause.clone(),
@@ -13227,6 +13696,8 @@ fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place()
     let work = dir.join("work");
     let claude_dir = work.join(RELATIVE);
     let snap = Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: TAB.to_string(),
@@ -13251,9 +13722,12 @@ fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place()
         &ask_of(&Restart::Memory),
         Ok(snap.clone()),
     )
+    .report
     .step;
     record(&claude_dir, agent.id(), &start, &dir.join("elsewhere"));
-    let moved = restart_from(&opts, &Restart::Memory, &ask_of(&Restart::Memory), Ok(snap)).step;
+    let moved = restart_from(&opts, &Restart::Memory, &ask_of(&Restart::Memory), Ok(snap))
+        .report
+        .step;
     let _ = agent.kill();
     let _ = agent.wait();
     let _ = shell.kill();
@@ -13291,6 +13765,8 @@ fn a_restart_in_place_records_the_directory_a_relative_homes_agent_files_under()
     register_running_in(&claude_dir, agent.id(), &start, &work);
     file_transcript_in(&claude_dir, "-work");
     let snap = Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: TAB.to_string(),
@@ -13391,6 +13867,8 @@ fn a_restart_in_place_types_the_usage_tap_under_the_switch_and_writes_no_setting
         register_running_in(&claude_dir, agent.id(), &start, &work);
         file_transcript_in(&claude_dir, "-work");
         let snap = Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: true,
             profile: None,
             tab: TAB.to_string(),
@@ -13810,6 +14288,7 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
     let reset = named_limit_reset(&opts.home, &snap);
     let running = look_at_exit(&opts.home, &snap).running;
     let launch = Launch {
+        auth_observed: true,
         session: SESSION,
         resume: true,
         cwd: &snap.cwd,
@@ -13822,6 +14301,7 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         homedir: None,
         login: None,
         stored_login: false,
+        launch_env: None,
         billing: crate::harness::relaunch::ModelBilling::Keep,
     };
     let planned = match plan(&opts, &launch, NO_SHELL, &[]) {
@@ -13836,6 +14316,7 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         Ok(snap.clone()),
         &execd,
     )
+    .report
     .step;
     let dry = Opts {
         dry_run: true,
@@ -13855,6 +14336,7 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         Ok(with_shell.clone()),
         &PaneProgram::under(pid, shell.id()),
     )
+    .report
     .step;
     agent.end();
     let look = look_at_exit(&opts.home, &snap);
@@ -15767,6 +16249,8 @@ fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
             &[answer_at("claude-opus-5", "2099-01-01T00:00:00Z")],
         );
         let snap = Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: TAB.to_string(),
@@ -15829,6 +16313,7 @@ fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
                 Ok(snap.clone()),
                 &Script::new(shell.id(), usize::MAX, None),
             )
+            .report
         };
         let mut r = restart();
         assert!(
@@ -15903,6 +16388,418 @@ fn an_upgrade_relaunch_that_ended_as_it_started_is_an_agent_down_at_once() {
             })
         })
         .collect(),
+    );
+}
+
+/// A Claude relaunch of some cause in flight since just now, its old agent gone, its line typed at
+/// this test process's shell, and a process that registered the conversation under that shell and
+/// is no process now.
+#[cfg(unix)]
+struct FoundGone {
+    opts: Opts,
+    st: St,
+    gone: u32,
+    _instance: crate::harness::FakeInstanceLog,
+    dir: ScratchDir,
+}
+
+#[cfg(unix)]
+impl FoundGone {
+    fn new(name: &str, cause: &str, answers: Answers) -> Self {
+        let dir = scratch(name);
+        let (sock, instance) = instance_with(&dir, answers);
+        let opts = Opts {
+            sock: Some(sock),
+            only_sid: Some(TAB.to_string()),
+            hand_back: true,
+            background: false,
+            press: None,
+            timings: crate::harness::Timings {
+                held: PAST_ENDED,
+                ..drive(&dir).timings
+            },
+            ..drive(&dir)
+        };
+        std::fs::create_dir_all(state_dir(&opts)).expect("state");
+        let gone = dead_pid();
+        register_born(&opts.home.join(".claude"), gone, SESSION, "gone");
+        let st = St {
+            phase: Phase::Relaunched { at_s: now_s() },
+            pid: dead_pid(),
+            shell: std::process::id(),
+            tab: TAB.to_string(),
+            to: "9.9.9".to_string(),
+            source: "same".to_string(),
+            cause: cause.to_string(),
+            exited_at: now_s() - 3,
+            ..St::default()
+        };
+        save(&opts, SESSION, &st);
+        Self {
+            opts,
+            st,
+            gone,
+            _instance: instance,
+            dir,
+        }
+    }
+
+    /// One [`await_new`] step, its record saved as its callers save it.
+    fn step(&mut self, k: &dyn Kernel) -> Report {
+        let _waits = crate::harness::relaunch::virtual_waits();
+        save(&self.opts, SESSION, &self.st);
+        let mut c = connect(&self.opts, TAB).expect("control connection");
+        let r = Report {
+            pid: self.st.pid,
+            tab: TAB.to_string(),
+            session: SESSION.to_string(),
+            from: "9.9.9".to_string(),
+            to: "9.9.9(same)".to_string(),
+            step: String::new(),
+        };
+        let r = await_new(&self.opts, r, &mut self.st, &mut c, SESSION, k);
+        save(&self.opts, SESSION, &self.st);
+        r
+    }
+
+    /// [`Self::step`] where the look reads the found process's parent as the line's shell.
+    fn found_step(&mut self) -> Report {
+        let me = std::process::id();
+        self.step(&Script::new(me, 0, Some(me)))
+    }
+
+    /// The found process's own record gone: what its exit may have taken with it.
+    fn forget_record(&self) {
+        std::fs::remove_file(
+            self.opts
+                .home
+                .join(format!(".claude/sessions/{}.json", self.gone)),
+        )
+        .expect("its record");
+    }
+}
+
+/// A restart that ended its own agent, whose relaunch registered the conversation and was gone
+/// before it came up, stops at once: `failed:no-resume`, and the carry of the old agent's exit
+/// reads that stop, so the host says it. An upgrade's owner row, the only kind that keeps one, is
+/// `agent-down` with the line that resumes it. Nothing is adopted. The ledger tells this end from
+/// one that never registered.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_that_registered_and_ended_before_it_came_up_is_an_agent_down_at_once() {
+    use super::super::relaunch::{
+        CAUSE_MEMORY, CAUSE_UPGRADE_FRESH, Outcome, carry_restart, outcome,
+    };
+    side_by_side(
+        [
+            (
+                "gone-upgrade",
+                "",
+                Some(format!("claude --resume {SESSION}")),
+            ),
+            (
+                "gone-fresh",
+                CAUSE_UPGRADE_FRESH,
+                Some("claude".to_string()),
+            ),
+            ("gone-memory", CAUSE_MEMORY, None),
+        ]
+        .into_iter()
+        .map(|(name, cause, command)| -> Box<dyn FnOnce() + Send> {
+            Box::new(move || {
+                let mut a = FoundGone::new(name, cause, Answers::default());
+                let r = a.found_step();
+                assert_eq!(r.step, "failed:no-resume", "{cause:?}: {r:?}");
+                assert_eq!(
+                    (&a.st.phase, a.st.relaunched_pid),
+                    (&Phase::Failed("no-resume".to_string()), 0),
+                    "{cause:?}"
+                );
+                let carried = carry_restart(&a.opts, upgrade::Agent::Claude, Some(a.st.pid), false);
+                assert_eq!(
+                    outcome(&carried.step),
+                    Outcome::Cannot("no-resume".to_string()),
+                    "{cause:?}: {carried:?}"
+                );
+                let shown = super::rows(&a.opts);
+                let row = shown.iter().find(|row| row.session == SESSION);
+                match (command, row.map(|row| row.attention(now_s()))) {
+                    (Some(command), Some(Attention::Interrupt(need))) => {
+                        assert_eq!(need.kind, "agent-down", "{cause:?}");
+                        assert_eq!(need.command, Some(command), "{cause:?}");
+                    }
+                    (None, None) => {}
+                    (_, other) => panic!("{cause:?}: {other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&a.dir);
+            })
+        })
+        .collect(),
+    );
+    let mut found = FoundGone::new("gone-words", "", Answers::default());
+    found.found_step();
+    let mut never = FoundGone::new("never-words", "", Answers::default());
+    never.forget_record();
+    never.step(&ShellHolds::new(RAN));
+    let (found_row, never_row) = (
+        ledger_details(&found.opts, "failed:no-resume"),
+        ledger_details(&never.opts, "failed:no-resume"),
+    );
+    assert_eq!((found_row.len(), never_row.len()), (1, 1));
+    assert_ne!(found_row, never_row, "two ends, each said as it was");
+    let _ = std::fs::remove_dir_all(&found.dir);
+    let _ = std::fs::remove_dir_all(&never.dir);
+}
+
+/// A move onto a build whose start registered the conversation and ended is taken back onto the
+/// build it ran, as one that never registered is.
+#[cfg(unix)]
+#[test]
+fn a_move_whose_relaunch_registered_and_ended_is_taken_back_onto_the_build_it_ran() {
+    let mut a = FoundGone::new("gone-back", "", Answers::default());
+    a.st.from = "1.0.0".to_string();
+    a.st.source = "managed".to_string();
+    a.st.back_line = " '/opt/claude/versions/1.0.0' '--resume' 'x'".to_string();
+    let r = a.found_step();
+    assert!(matches!(a.st.phase, Phase::Exiting { .. }), "{r:?}");
+    assert_eq!((a.st.source.as_str(), a.st.to.as_str()), ("same", "1.0.0"));
+    assert!(a.st.back_line.is_empty(), "taken once: {:?}", a.st);
+    assert!(
+        a.st.failed_start()
+            .is_some_and(|f| f.to == "9.9.9" && f.source == "managed"),
+        "the failure is the build's: {:?}",
+        a.st
+    );
+    assert_eq!(ledger_details(&a.opts, "failed:no-resume").len(), 1);
+    let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// A process found gone stays adopted where another rule retries it, so the exit's relaunch reads
+/// it through the record ([`after_exit`]), and the restored lane's look reads it gone
+/// ([`adopted_gone`](super::super::relaunch::adopted_gone)).
+#[cfg(unix)]
+#[test]
+fn a_relaunch_found_gone_on_exit_or_after_aterm_ended_keeps_its_retry() {
+    use super::super::relaunch::{CAUSE_FRESH, CAUSE_STALL, adopted_gone};
+    use crate::harness::restart_stamp::Cause;
+    let step = |a: &DeadAgent, cause: &str| {
+        let _waits = crate::harness::relaunch::virtual_waits();
+        let (sock, _instance) = instance(&a.dir);
+        let opts = Opts {
+            dry_run: false,
+            sock: Some(sock),
+            hand_back: true,
+            background: false,
+            press: None,
+            ..a.opts.clone()
+        };
+        std::fs::create_dir_all(state_dir(&opts)).expect("state");
+        let gone = dead_pid();
+        register_born(&opts.home.join(".claude"), gone, SESSION, "gone");
+        let mut st = St {
+            phase: Phase::Relaunched { at_s: now_s() },
+            pid: a.snap.pid,
+            shell: a.snap.shell,
+            tab: TAB.to_string(),
+            cause: cause.to_string(),
+            exited_at: now_s() - 3,
+            ..St::default()
+        };
+        save(&opts, SESSION, &st);
+        let mut c = connect(&opts, TAB).expect("control connection");
+        let r = Report {
+            pid: st.pid,
+            tab: TAB.to_string(),
+            session: SESSION.to_string(),
+            from: "9.9.9".to_string(),
+            to: "9.9.9(same)".to_string(),
+            step: String::new(),
+        };
+        let k = Script::new(a.snap.shell, 0, Some(a.snap.shell));
+        let r = await_new(&opts, r, &mut st, &mut c, SESSION, &k);
+        save(&opts, SESSION, &st);
+        (r, st, gone)
+    };
+    for (cause, asked) in [
+        (CAUSE_EXIT, None),
+        (CAUSE_STALL, Some(Cause::Stall)),
+        (CAUSE_ASKED, Some(Cause::Asked)),
+    ] {
+        let a = DeadAgent::new(&format!("gone-on-{cause}"));
+        let (r, st, gone) = step(&a, cause);
+        assert_eq!(r.step, "adopted", "{cause}: {r:?}");
+        assert_eq!(st.relaunched_pid, gone, "{cause}");
+        assert!(matches!(st.phase, Phase::Relaunched { .. }), "{cause}");
+        assert_eq!(
+            after_exit(&a.opts, &a.snap, &ExitRecord::Unread, true, asked).step,
+            "would-relaunch",
+            "{cause}: its exit's relaunch is made again"
+        );
+    }
+    let a = DeadAgent::new("gone-on-exit-fresh");
+    let (r, st, _) = step(&a, CAUSE_FRESH);
+    assert_eq!(r.step, "done:fresh", "{r:?}");
+    assert_eq!(st.phase, Phase::Done);
+    let a = DeadAgent::new("gone-on-host");
+    let (r, st, gone) = step(&a, CAUSE_HOST);
+    assert_eq!(r.step, "adopted", "{r:?}");
+    assert_eq!(st.relaunched_pid, gone);
+    assert_eq!(
+        adopted_gone(&a.opts, TAB, SESSION),
+        Some(true),
+        "the restored lane's look reads it gone, and makes its relaunch again"
+    );
+}
+
+/// A process an earlier step adopted that is gone by a later step is its own end: this step writes
+/// nothing, and the carry of the old agent's exit closes the move as one that landed.
+/// The trigger itself: a process alive when the look finds it, which dies in the first-idle wait.
+/// A guard asked any earlier sees it alive and adopts it.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_that_dies_in_its_first_idle_wait_is_not_adopted() {
+    let child = aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sleep")))
+        .arg("60")
+        .spawn()
+        .expect("spawn");
+    let pid = child.id();
+    let dying = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let mut a = FoundGone::new(
+        "dies-in-wait",
+        "",
+        Answers {
+            dies_at_await: Some(dying.clone()),
+            ..Answers::default()
+        },
+    );
+    a.forget_record();
+    register_born(&a.opts.home.join(".claude"), pid, SESSION, "gone");
+    a.gone = pid;
+    let r = a.found_step();
+    assert!(
+        dying.lock().expect("the dying process").is_none(),
+        "the wait is what ended it: {r:?}"
+    );
+    assert_eq!(r.step, "failed:no-resume", "{r:?}");
+    assert_eq!(a.st.relaunched_pid, 0, "{:?}", a.st);
+    let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// A new line is a new round: an end read from the last round's process is not its end.
+#[cfg(unix)]
+#[test]
+fn a_typed_relaunch_line_clears_the_last_rounds_found_gone() {
+    let a = FoundGone::new("typed-clears", "", Answers::default());
+    let mut st = St {
+        found_gone: true,
+        ..St::default()
+    };
+    super::super::relaunch::typed_recorded(&a.opts, &mut st, SESSION, None, |_| {});
+    assert!(!st.found_gone, "{st:?}");
+    let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_adopted_relaunch_found_gone_is_its_own_end() {
+    use super::super::relaunch::carry_restart;
+    let mut a = FoundGone::new("adopted-then-gone", "", Answers::default());
+    a.st.relaunched_pid = a.gone;
+    let r = a.found_step();
+    assert_eq!(r.step, "adopted", "{r:?}");
+    assert!(matches!(a.st.phase, Phase::Relaunched { .. }), "{:?}", a.st);
+    assert_eq!(ledger_lines(&a.opts), 0, "adopted once, said once");
+    let carried = carry_restart(&a.opts, upgrade::Agent::Claude, Some(a.st.pid), false);
+    assert_eq!(carried.step, "landed", "{carried:?}");
+    let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// A native operation that does not retire at the step that found the process gone leaves the
+/// relaunch in flight. No look can find that process again, and with no block known no shell can
+/// prove the line ended, so the next step reads the end from the record: the operation retires,
+/// and the move stops as the first step would have stopped it.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_found_gone_waits_for_its_native_retirement_and_then_stops() {
+    let mut a = FoundGone::new(
+        "gone-native",
+        "",
+        Answers {
+            native: "OK native-act state=unknown",
+            ..Answers::default()
+        },
+    );
+    a.st.native = Some(crate::harness::native_act::Binding {
+        id: "ab".repeat(16),
+        capability: "cd".repeat(32),
+    });
+    let r = a.found_step();
+    assert_eq!(r.step, "wait:native-retirement", "{r:?}");
+    assert!(matches!(a.st.phase, Phase::Relaunched { .. }), "{:?}", a.st);
+    assert_eq!(a.st.relaunched_pid, 0, "never adopted");
+    assert_eq!(ledger_lines(&a.opts), 0);
+    a.forget_record();
+    let me = std::process::id();
+    let waiting = load(&a.opts, SESSION).expect("the record");
+    a.st = waiting.clone();
+    a.st.stop("no-resume", now_s());
+    a.st.reopen_landed(now_s());
+    let r = a.step(&Script::new(me, 0, None));
+    assert_eq!(r.step, "wait:resume", "a stop closes that end: {r:?}");
+    save(&a.opts, SESSION, &waiting);
+    let retires = scratch("gone-native-retires");
+    let (sock, _instance) = instance_with(
+        &retires,
+        Answers {
+            native: "OK native-act state=retired reason=cohort-exited",
+            ..Answers::default()
+        },
+    );
+    a.opts.sock = Some(sock);
+    a.st = waiting;
+    let r = a.step(&Script::new(me, 0, None));
+    assert_eq!(r.step, "failed:no-resume", "{r:?}");
+    assert_eq!(a.st.phase, Phase::Failed("no-resume".to_string()));
+    assert_eq!(a.st.native, None);
+    assert_eq!(ledger_details(&a.opts, "failed:no-resume").len(), 1);
+    let _ = std::fs::remove_dir_all(&retires);
+    let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unissued_retirement_preserves_the_conversation_instead_of_no_resume_failure() {
+    let mut a = FoundGone::new("gone-native-unissued", "", Answers::default());
+    a.st.native = Some(crate::harness::native_act::Binding {
+        id: "ab".repeat(16),
+        capability: "cd".repeat(32),
+    });
+    a.st.native_prepare = "exact predecessor recipe".into();
+    let retires = aterm_tempfile::tempdir().unwrap();
+    let (sock, _instance) = instance_with(
+        retires.path(),
+        Answers {
+            native: "OK native-act state=retired reason=no-exec-grant",
+            ..Answers::default()
+        },
+    );
+    a.opts.sock = Some(sock);
+    let phase = a.st.phase.clone();
+    let recipe = a.st.native_prepare.clone();
+    let r = a.found_step();
+    assert_eq!(r.step, super::super::native_restart::WAIT_RETIRED_UNISSUED);
+    assert_eq!(a.st.phase, phase);
+    assert_eq!(a.st.native_prepare, recipe);
+    assert!(a.st.native_retired_unissued);
+    assert!(load(&a.opts, SESSION).unwrap().native_retired_unissued);
+    assert_eq!(ledger_details(&a.opts, "failed:no-resume").len(), 0);
+    assert!(super::super::relaunch::expired(&a.st, u64::MAX).is_none());
+    let kept = a.st.clone();
+    let r = a.found_step();
+    assert_eq!(r.step, super::super::native_restart::WAIT_RETIRED_UNISSUED);
+    assert_eq!(
+        a.st, kept,
+        "a later sweep cannot consume the held conversation"
     );
 }
 
@@ -16609,7 +17506,9 @@ fn a_relaunch_into_the_shells_own_directory_spelled_another_way_needs_no_cd() {
         let cwd = cwd.to_str().expect("utf-8").to_owned();
         let argv = vec!["claude".to_string()];
         let launch = crate::harness::relaunch::Launch {
+            auth_observed: true,
             stored_login: false,
+            launch_env: None,
             billing: crate::harness::relaunch::ModelBilling::Keep,
             session: SESSION,
             resume: true,
@@ -16669,7 +17568,9 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
     let value = tap::settings_value(exe).expect("an admissible path");
     let planned_under = |opts: &Opts, argv: &[String], stored: bool, homedir: Option<&str>| {
         let launch = crate::harness::relaunch::Launch {
+            auth_observed: true,
             stored_login: stored,
+            launch_env: None,
             billing: crate::harness::relaunch::ModelBilling::Keep,
             session: SESSION,
             resume: true,
@@ -16727,8 +17628,10 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
             ..opts.clone()
         };
         let launch = crate::harness::relaunch::Launch {
+            auth_observed: true,
             login: Some(renewed),
             stored_login: true,
+            launch_env: None,
             billing: crate::harness::relaunch::ModelBilling::Keep,
             session: SESSION,
             resume: true,
@@ -16917,7 +17820,9 @@ fn a_failed_model_on_the_launch_line_is_dropped_by_a_relaunch_asking_none() {
     );
     let planned = || {
         let launch = crate::harness::relaunch::Launch {
+            auth_observed: true,
             stored_login: false,
+            launch_env: None,
             billing: crate::harness::relaunch::ModelBilling::Keep,
             session: SESSION,
             resume: true,
@@ -18536,7 +19441,7 @@ fn only_the_agents_own_words_are_pressed_where_the_host_takes_cap() {
         |_, _, _| true,
     );
     assert_eq!(got, Ok(()));
-    let generation = typing_fence(&mut c, TAB).expect("empty composer");
+    let (generation, _) = typing_fence(&mut c, TAB).expect("empty composer");
     notice_fenced(&mut c, TAB, "[aterm harness] notice", generation.as_deref()).expect("typed");
     drop(c);
     let turns: Vec<String> = asked
@@ -18610,7 +19515,7 @@ fn a_pressed_notices_turn_waits_out_a_late_echo_as_a_hang() {
         ..drive(&dir)
     };
     let mut c = connect(&opts, TAB).expect("control connection");
-    turn_fenced(&mut c, TAB, "'/pkg/claude' '--resume' 'x'", None).expect("pasted");
+    turn_fenced(&mut c, TAB, "'/pkg/claude' '--resume' 'x'", None, None).expect("pasted");
     notice_fenced(&mut c, TAB, &notice, None).expect("pressed");
     drop(c);
     let turns: Vec<String> = asked
@@ -18750,6 +19655,7 @@ fn a_labelled_top_rule_is_the_input_box_the_notice_fences_on() {
             generation: Some("4.77".to_string()),
             human: HumanInput::Unknown,
             title: None,
+            human_seq: None,
         };
         let fence = composer_rows(&scr).unwrap_or_else(|| panic!("{name}: the box"));
         assert_eq!((fence.first, fence.last), (caret - 1, caret + 1), "{name}");
@@ -19126,7 +20032,7 @@ fn a_turn_begun_since_the_look_takes_no_notice_and_no_release_under_the_rows_fen
     assert_eq!(h.visit().step, "announced:1");
     assert_eq!(h.typed().len(), 1);
     assert!(h.typed()[0].contains(" if-rows="), "{:?}", h.typed());
-    let look = text_reads(&h) - 2;
+    let look = text_reads(&h) - 1;
     drop(h);
     let h = Parked::new(
         "rows-turn-begun",
@@ -19153,7 +20059,7 @@ fn a_turn_begun_since_the_look_takes_no_notice_and_no_release_under_the_rows_fen
     owing(&h);
     assert_eq!(h.visit().step, "released:gave-up");
     assert_eq!(h.typed().len(), 1);
-    let look = text_reads(&h) - 2;
+    let look = text_reads(&h) - 1;
     drop(h);
     let h = Parked::new(
         "rows-release-begun",
@@ -19829,6 +20735,33 @@ fn a_continuation_on_a_screen_that_keeps_moving_is_still_typed() {
     assert_eq!(rig.typed().len(), 1);
 }
 
+/// A continuation the person's gesture stopped (`turn … reason=person`, nothing put) keeps the
+/// carry owed on their grace (`wait:held`), the next step's to wait out: never a retry a moment on,
+/// which would type it inside the grace in the mode their key just changed (finding 1 of the
+/// draft-hold review: Claude Code's Shift+Tab redraws no fenced row).
+/// NEGATIVE CONTROL: `turn_verdict` reading `reason=person` as a yield, as before, and the retry
+/// types the continuation.
+#[cfg(unix)]
+#[test]
+fn a_continuation_the_persons_gesture_stopped_waits_their_grace_out() {
+    let before = [
+        user_row("prepare"),
+        turn_by("claude-opus-5-5", "Saved.\\nATERM-UPGRADE-READY-0badf00d"),
+    ];
+    let rig = Rig::with(
+        "continue-person",
+        &before,
+        fenced_answers(vec![
+            "OK 0 turn skipped reason=person submitted=0 seq=78 id=1",
+            "OK 0 id=2 submitted=1 status=settled",
+        ]),
+    );
+    let mut st = rig.st.clone();
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "wait:held", "{r:?}");
+    assert_eq!(rig.typed().len(), 1, "{:#?}", rig.typed());
+}
+
 /// A fenced relaunch line that parks past the turn's timeout on a person's typing
 /// (`ERR yield timeout`) waits `yield`.
 #[cfg(unix)]
@@ -20255,6 +21188,7 @@ fn typing_that_wraps_at_the_bottom_of_the_screen_is_still_typing() {
         generation: None,
         human: HumanInput::Never,
         title: None,
+        human_seq: None,
     };
     let mark = PromptMark::of(&at(&["out", "~/p % "], 1, 6)).expect("mark");
     assert_eq!(mark.at(&at(&["out", "~/p % "], 1, 6)), AtPrompt::Same);
@@ -20541,6 +21475,7 @@ fn a_caret_moved_home_over_a_half_typed_command_is_typing() {
         generation: None,
         human: HumanInput::Never,
         title: None,
+        human_seq: None,
     };
     let clock = PromptMark::of(&at("~/proj %            12:34:56", 9)).expect("mark");
     assert_eq!(clock.right, Some(20));
@@ -25461,7 +26396,9 @@ fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() 
             login: None,
             home: None,
             stored_login: false,
+            auth_observed: true,
             profile: None,
+            launch_env: None,
         };
         let report = Report {
             pid: h.sf.pid,
@@ -25718,7 +26655,10 @@ fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
         )
         .expect("catalog");
         let snap = Snapshot {
-            stored_login: false,
+            launch_env: None,
+            auth_observed: true,
+            // The profile below names this fixture's default stored login.
+            stored_login: true,
             profile: Some(live_profile(&opts, None)),
             tab: TAB.to_string(),
             pid,
@@ -25759,6 +26699,7 @@ fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
                 Ok(snap.clone()),
                 &Script::new(shell.id(), usize::MAX, None),
             )
+            .report
         };
         let mut r = restart();
         if let Some(ended) = &ended {
@@ -29160,6 +30101,8 @@ fn the_window_hosts_limit_and_wall_readers_read_the_agents_own_claude_home() {
     };
     let work = dir.join("work");
     let snap = |home: Option<&str>, claude_dir: Option<PathBuf>| Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: TAB.to_string(),
@@ -29465,6 +30408,8 @@ fn the_transcript_is_found_under_the_live_processs_own_config_dir() {
             "{\"the\":\"home tail\"}\n",
         );
         let snap = Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: TAB.to_string(),
@@ -29687,6 +30632,8 @@ fn the_walls_tail_is_the_transcript_its_agent_writes_now() {
             .expect("transcript");
         }
         let tail = snapshot_transcript_tail(&Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: TAB.to_string(),
@@ -30234,6 +31181,8 @@ fn the_clis_sweep_reads_the_tabs_of_every_instance_it_is_given() {
         pids.sort_unstable();
         pids
     };
+    // Every instance answers `who`: each roster read waits the hang detector, not CLAIMS_WAIT.
+    let _answered = crate::AnsweredBut::set(|_| false);
     let both = read(socks.clone());
     let one = read(socks[..1].to_vec());
     let none = read(Vec::new());
@@ -30700,6 +31649,8 @@ fn a_crash_is_never_moved_onto_a_newer_build_not_proved_to_start() {
         .expect("the crash's record");
         let program = versions.join("2.1.281");
         let snap = Snapshot {
+            launch_env: None,
+            auth_observed: true,
             tab: TAB.to_string(),
             pid: dead,
             start: start.to_string(),
@@ -31898,10 +32849,13 @@ fn agy_limit_reset_aligns_with_live_screen_model_and_unnamed_refill() {
         default: &'static str,
     }
     impl Source for FixedUsage {
-        fn read(&self) -> Result<String, String> {
+        fn read(&self, _: &crate::harness::provider_read::Permit) -> Result<String, String> {
             Ok(self.doc.clone())
         }
-        fn default_model(&self) -> Result<String, String> {
+        fn default_model(
+            &self,
+            _: &crate::harness::provider_read::Permit,
+        ) -> Result<String, String> {
             Ok(self.default.to_owned())
         }
     }

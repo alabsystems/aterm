@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the claim act ([`super::step`]): its gate, its ledger and its worker's order. No
-//! spawn, no network and no browser: the act's `start` is a recorder.
+//! Tests for the claim act ([`super::step`]): its gate, its ledger, the links its workers hold,
+//! its quota and readiness holds, and its worker's order. No spawn, no network and no browser:
+//! the act's `start` is a recorder, and its seams are the fixture's own.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::time::Duration;
 
@@ -13,6 +14,10 @@ use aterm_agent::harness::profile::NoProfile;
 use aterm_agent::supervise::Autopilot;
 
 use super::*;
+use crate::worker_reaper::tests::{
+    claim_folder, in_front, live, new_tab, of, set_task, worker_tab,
+};
+use crate::worker_reaper::{Ending, LINGER};
 
 const ORG: &str = "0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a";
 
@@ -22,10 +27,24 @@ const NOW_MS: i64 = 1_792_022_400_000;
 
 /// A profile whose cloud session credit is live (or claimed, where `claimed`).
 fn profile_text(claimed: bool) -> String {
+    profile_of("acct-1", claimed, false)
+}
+
+/// A profile of account `account` whose cloud session credit is live (or claimed, where
+/// `claimed`), and, where `api`, the plan's API credits too.
+fn profile_of(account: &str, claimed: bool, api: bool) -> String {
+    let (api_flag, api_status) = if api {
+        (
+            r#","tengu_snug_storm":{"text":"Your Max plan includes $200 a month in API credits. Claim them at https://clau.de/api-credits"}"#.to_string(),
+            format!(r#","apiCreditLinkStatusCache":{{"{ORG}":{{"eligibleSince":1792022400000}}}}"#),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     format!(
-        r#"{{"oauthAccount":{{"accountUuid":"acct-1","organizationUuid":"{ORG}","emailAddress":"owner@example.com"}},
-"cachedGrowthBookFeatures":{{"tengu_swift_lynx":{{"endpoint":"/v1/code/promo/cloud_credit","webPath":"/code/claim-credit","claimLinkIncludesOrganization":true,"startup":{{"claimPageLine":"Claim your $250 cloud session credit"}}}}}},
-"promoStartupStatusCache":{{"accountUuid":"acct-1","endpoint":"/v1/code/promo/cloud_credit","eligible":true,"claimed":{claimed}}}}}"#
+        r#"{{"oauthAccount":{{"accountUuid":"{account}","organizationUuid":"{ORG}","emailAddress":"owner@example.com"}},
+"cachedGrowthBookFeatures":{{"tengu_swift_lynx":{{"endpoint":"/v1/code/promo/cloud_credit","webPath":"/code/claim-credit","claimLinkIncludesOrganization":true,"startup":{{"claimPageLine":"Claim your $250 cloud session credit"}}}}{api_flag}}},
+"promoStartupStatusCache":{{"accountUuid":"{account}","endpoint":"/v1/code/promo/cloud_credit","eligible":true,"claimed":{claimed}}}{api_status}}}"#
     )
 }
 
@@ -34,15 +53,24 @@ const OPEN: Gate = Gate {
     claude: true,
     autopilot: Autopilot::Land,
     claim_credits: true,
+    own_worker: false,
 };
 
-/// A scratch home: its profile and the harness state the ledger goes under.
+/// A scratch home: its profile and the harness state the ledger goes under, and the look's
+/// other seams: the claims it holds, the live claim workers, the worker's login's wall and what
+/// the claim waits on, each read counted.
 struct Fixture {
     _dir: aterm_tempfile::TempDir,
     profile: std::path::PathBuf,
     ledger: std::path::PathBuf,
     cache: ProfileCache,
     parses: Cell<u32>,
+    claims: Claims,
+    workers: RefCell<Vec<ClaimWorker>>,
+    walled: Cell<Option<i64>>,
+    left: RefCell<Option<String>>,
+    holds_read: Cell<u32>,
+    t0: Instant,
 }
 
 impl Fixture {
@@ -57,26 +85,78 @@ impl Fixture {
             ledger,
             cache: ProfileCache::new(),
             parses: Cell::new(0),
+            claims: Claims::new(),
+            workers: RefCell::new(Vec::new()),
+            walled: Cell::new(None),
+            left: RefCell::new(None),
+            holds_read: Cell::new(0),
+            t0: Instant::now(),
         }
     }
 
     /// One look under `gate` at `now_ms`, and the offers it started.
     fn look(&self, gate: Gate, now_ms: i64) -> (Stepped, Vec<Offer>) {
+        self.look_in(&self.claims, gate, now_ms, self.t0)
+    }
+
+    /// [`Self::look`] holding links in `claims`, at `now` on the monotonic clock.
+    fn look_in(
+        &self,
+        claims: &Claims,
+        gate: Gate,
+        now_ms: i64,
+        now: Instant,
+    ) -> (Stepped, Vec<Offer>) {
         let read = |path: &Path| -> Result<Vec<Offer>, NoProfile> {
             self.parses.set(self.parses.get() + 1);
             credit_offers::read(path)
+        };
+        let workers = || self.workers.borrow().clone();
+        let walled = || {
+            self.holds_read.set(self.holds_read.get() + 1);
+            self.walled.get()
+        };
+        let left = || {
+            self.holds_read.set(self.holds_read.get() + 1);
+            self.left.borrow().clone()
+        };
+        let seams = Seams {
+            cache: &self.cache,
+            read: &read,
+            claims,
+            workers: &workers,
+            walled: &walled,
+            left: &left,
         };
         let mut started = Vec::new();
         let stepped = step(
             gate,
             &self.profile,
-            &self.cache,
-            &read,
             &self.ledger,
             now_ms,
+            now,
+            &seams,
             &mut |offer| started.push(offer),
         );
         (stepped, started)
+    }
+
+    /// Each offer in `started` as a worker whose tab landed and whose task has since ended, as
+    /// [`App::claim_worker_landed`] and the worker's own end leave it: its link is free again.
+    #[cfg(unix)]
+    fn finish(&self, started: &[Offer]) {
+        let mut workers = self.workers.borrow_mut();
+        for offer in started {
+            let session = 1000 + u64::try_from(workers.len()).expect("few workers");
+            self.claims.spawned(offer.id, &offer.url, session);
+            workers.push(ended(session));
+        }
+    }
+
+    /// The ledger file's bytes, or `None` where none was written.
+    #[cfg(unix)]
+    fn ledger_bytes(&self) -> Option<Vec<u8>> {
+        std::fs::read(self.ledger.join("attempts")).ok()
     }
 }
 
@@ -85,6 +165,10 @@ fn a_shut_gate_looks_at_nothing_and_starts_nothing() {
     let fx = Fixture::new(&profile_text(false));
     for gate in [
         Gate { on: false, ..OPEN },
+        Gate {
+            own_worker: true,
+            ..OPEN
+        },
         Gate {
             autopilot: Autopilot::Off,
             ..OPEN
@@ -104,6 +188,7 @@ fn a_shut_gate_looks_at_nothing_and_starts_nothing() {
     }
     assert_eq!(fx.parses.get(), 0, "no profile read under a shut gate");
     assert!(!fx.ledger.exists(), "no ledger written");
+    assert_eq!(fx.holds_read.get(), 0, "no hold read");
     for autopilot in [Autopilot::Cruise, Autopilot::Land] {
         assert!(Gate { autopilot, ..OPEN }.open(), "{autopilot:?}");
     }
@@ -136,6 +221,7 @@ fn a_live_offer_is_recorded_before_its_worker_and_tried_once() {
         assert_eq!(mode(&fx.ledger.join("attempts")), 0o600);
         assert_eq!(mode(&fx.ledger), 0o700);
     }
+    fx.finish(&started);
     let (stepped, started) = fx.look(OPEN, NOW_MS + DAY_MS);
     assert_eq!(stepped, Stepped::NothingDue);
     assert!(started.is_empty(), "already tried");
@@ -152,11 +238,14 @@ fn a_live_offer_is_recorded_before_its_worker_and_tried_once() {
 #[test]
 fn an_offer_is_tried_again_once_after_a_week_while_it_stands() {
     let fx = Fixture::new(&profile_text(false));
-    assert_eq!(fx.look(OPEN, NOW_MS).1.len(), 1);
+    let first = fx.look(OPEN, NOW_MS).1;
+    assert_eq!(first.len(), 1);
+    fx.finish(&first);
     let (stepped, _) = fx.look(OPEN, NOW_MS + 7 * DAY_MS - 1);
     assert_eq!(stepped, Stepped::NothingDue, "not before the week is out");
     let (_, again) = fx.look(OPEN, NOW_MS + 7 * DAY_MS);
     assert_eq!(again.len(), 1, "the one retry");
+    fx.finish(&again);
     let book = read_ledger(&fx.ledger).expect("a ledger");
     assert_eq!(book.rows[0].count, 2);
     assert_eq!(book.rows[0].first_ms, NOW_MS);
@@ -363,9 +452,11 @@ fn a_claim_worker_is_claude_code_with_the_browser_and_the_guarded_task() {
     assert!(task.contains("never turn on extra usage"), "{task}");
     assert!(task.contains("Never ask a question."), "{task}");
     assert!(
-        task.contains("End with one reply starting `Nothing left:`"),
+        task.contains("end with one reply starting `Nothing left: CLAIMED:")
+            && task.contains("first line is `Could not finish: NOT CLAIMED: <why>`"),
         "{task}"
     );
+    assert!(!task.contains("sleep"), "no command to wait with: {task}");
 
     struct Present;
     impl crate::task_launch::ProgramStore for Present {
@@ -384,31 +475,56 @@ fn a_claim_worker_is_claude_code_with_the_browser_and_the_guarded_task() {
     let admitted =
         crate::task_launch::admit_worker(claude, claude.plain(), None, &|_| {}, &|| (), &Present)
             .expect("admitted");
-    let line = aterm_agent::harness::worker::line(
-        claude,
-        aterm_agent::harness::upgrade::Dialect::Zsh,
-        &admitted,
-        &crate::task_launch::worker_fresh(None, false, order.chrome),
-    )
-    .expect("a line");
-    assert!(line.contains(" '--chrome' "), "{line}");
+    use aterm_agent::supervise::config::Approve;
+    let line_of = |chrome: bool, approve: Approve| {
+        aterm_agent::harness::worker::line(
+            claude,
+            aterm_agent::harness::upgrade::Dialect::Zsh,
+            &admitted,
+            &crate::task_launch::worker_fresh(None, false, chrome, approve),
+        )
+        .expect("a line")
+    };
+    for approve in [Approve::All, Approve::Safe] {
+        let line = line_of(order.chrome, approve);
+        assert!(line.contains(" '--chrome' "), "{line}");
+        assert!(
+            line.contains(" '--permission-mode' 'auto' "),
+            "auto mode, whatever the person's Claude Code settings (owner, 2026-11-04): {line}"
+        );
+        assert!(
+            line.contains(" '--tools' 'ToolSearch' "),
+            "no built-in tool that acts or asks, in any mode: {line}"
+        );
+        assert!(
+            line.contains(&format!(
+                " '--settings' '{}' ",
+                credit_offers::claim_settings()
+            )),
+            "auto mode's classifier reads the claim's hard rules: {line}"
+        );
+    }
+    let held = line_of(order.chrome, Approve::None);
     assert!(
-        line.contains(" '--permission-mode' 'default' "),
-        "every box raised, whatever the person's settings: {line}"
+        held.contains(" '--permission-mode' 'default' ") && !held.contains("'auto'"),
+        "CONTROL: `approve = \"none\"` keeps every box the person's: {held}"
     );
-    assert_eq!(
-        crate::task_launch::worker_fresh(None, false, true).permission_mode,
-        Some("default")
-    );
-    let plain = aterm_agent::harness::worker::line(
-        claude,
-        aterm_agent::harness::upgrade::Dialect::Zsh,
-        &admitted,
-        &crate::task_launch::worker_fresh(None, false, false),
-    )
-    .expect("a line");
+    assert!(held.contains(" '--tools' 'ToolSearch' "), "{held}");
+    for approve in [Approve::All, Approve::Safe, Approve::None] {
+        let mode = crate::task_launch::claim_worker_mode(approve);
+        assert!(
+            aterm_agent::harness::worker::CLAUDE_PERMISSION_MODE
+                .modes
+                .contains(&mode),
+            "a mode Claude Code's flag takes: {mode}"
+        );
+    }
+    let plain = line_of(false, Approve::All);
     assert!(
-        !plain.contains("--chrome") && !plain.contains("--permission-mode"),
+        !plain.contains("--chrome")
+            && !plain.contains("--permission-mode")
+            && !plain.contains("--tools")
+            && !plain.contains("--settings"),
         "CONTROL, only a claim worker's: {plain}"
     );
 }
@@ -419,11 +535,7 @@ fn a_claim_worker_is_claude_code_with_the_browser_and_the_guarded_task() {
 #[test]
 fn a_claim_worker_runs_out_of_its_time_by_its_record() {
     assert_eq!(WORKER_FOR, Duration::from_secs(30 * 60));
-    let claim = format!(
-        "/state/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        credit_offers::CLAIM_FOLDER
-    );
+    let claim = claim_folder();
     let moment = Duration::from_millis(1);
     assert!(ran_out(Some(&claim), WORKER_FOR));
     assert!(!ran_out(Some(&claim), WORKER_FOR - moment));
@@ -431,10 +543,11 @@ fn a_claim_worker_runs_out_of_its_time_by_its_record() {
     assert!(!ran_out(None, WORKER_FOR));
 }
 
-/// A WORKER STANDS FROM ITS START, AND ITS TAB FROM ITS EXIT: no later state moves the first, a
-/// person's typing moves both, and an exit leaves the last reply its time to be read.
+/// A CLAIM WORKER'S TIME COUNTS FROM ITS START: no later state moves it, an exit neither (a
+/// concluded worker's tab goes by its own linger, `crate::worker_reaper::over`), and a person's
+/// typing does.
 #[test]
-fn a_workers_time_counts_from_its_start_its_exit_and_a_persons_typing() {
+fn a_workers_time_counts_from_its_start_and_a_persons_typing() {
     use crate::task_record::TaskMark;
     let t0 = Instant::now();
     let later = |secs| t0 + Duration::from_secs(secs);
@@ -450,584 +563,7 @@ fn a_workers_time_counts_from_its_start_its_exit_and_a_persons_typing() {
         Duration::from_secs(5)
     );
     let (exited, _) = TaskMark::new(TaskState::Exited).apply(Some(&back), false, later(600), 4_000);
-    assert_eq!(stood(&exited, later(660), None), Duration::from_secs(60));
-}
-
-/// A WORKER'S END TAKES NOTHING FROM ANYONE AND ASKS NOTHING OF A PERSON: a tab in someone's hand
-/// and a job that is not the worker's are left, a running program is asked to end and then made
-/// to before its pane closes (a job in a closing pane raises a confirmation), its task is marked
-/// `exited` once its program is gone so its tab stays to be read, as does a program's someone ran
-/// there since, and a window's last tab stays once its program has ended.
-#[test]
-fn a_worker_ends_without_raising_a_confirmation() {
-    use Ending::{ClosePane, Kill, Leave, MarkExited, Term};
-    let running = Stand {
-        in_hand: false,
-        exited: false,
-        job: true,
-        worker: true,
-        ends_window: false,
-        updating: false,
-        deaf: false,
-        reading: false,
-    };
-    let last = Stand {
-        ends_window: true,
-        ..running
-    };
-    let deaf = Stand {
-        deaf: true,
-        ..running
-    };
-    let ended = Stand {
-        job: false,
-        ..running
-    };
-    assert_eq!(ending(running), Term);
-    assert_eq!(ending(last), Term, "even its last tab");
-    assert_eq!(ending(deaf), Kill);
-    assert_eq!(
-        ending(Stand {
-            in_hand: true,
-            ..deaf
-        }),
-        Leave
-    );
-    assert_eq!(
-        ending(Stand {
-            exited: true,
-            ..deaf
-        }),
-        Leave,
-        "not the worker's job"
-    );
-    assert_eq!(
-        ending(Stand {
-            worker: false,
-            ..deaf
-        }),
-        Leave,
-        "another program's job"
-    );
-    assert_eq!(ending(ended), MarkExited, "its reading time starts");
-    assert_eq!(
-        ending(Stand {
-            ends_window: true,
-            ..ended
-        }),
-        MarkExited,
-        "a mark closes nothing"
-    );
-    let read = Stand {
-        exited: true,
-        ..ended
-    };
-    assert_eq!(ending(read), ClosePane);
-    for (stand, why) in [
-        (
-            Stand {
-                in_hand: true,
-                ..ended
-            },
-            "someone has it",
-        ),
-        (
-            Stand {
-                in_hand: true,
-                ..read
-            },
-            "someone has it",
-        ),
-        (
-            Stand {
-                ends_window: true,
-                ..read
-            },
-            "a last tab asks",
-        ),
-        (
-            Stand {
-                reading: true,
-                ..read
-            },
-            "the output of a program someone ran there is still to be read",
-        ),
-        (
-            Stand {
-                updating: true,
-                ..read
-            },
-            "a close calls it off",
-        ),
-        (
-            Stand {
-                updating: true,
-                ..ended
-            },
-            "a mark waits on its fence",
-        ),
-    ] {
-        assert_eq!(ending(stand), Leave, "{why}");
-    }
-}
-
-/// A live session's handle.
-fn live(app: &crate::App, session: u64) -> crate::session_store::SessionHandle {
-    let store = app.store.read().unwrap_or_else(PoisonError::into_inner);
-    store
-        .live_handles()
-        .find(|h| h.local_id == session)
-        .cloned()
-        .expect("a live session")
-}
-
-/// Marks `session` a worker trusted with `folder`, and returns when its record began.
-fn set_task(app: &crate::App, session: u64, folder: &str) -> Instant {
-    let h = live(app, session);
-    crate::task_record::mark_session_task(
-        &h.ctx,
-        h.local_id,
-        &crate::task_record::TaskMark::new(TaskState::Working),
-    )
-    .expect("unfenced");
-    let mut timeline = h
-        .ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    timeline.set_task_worker(aterm_phase::Program::Claude, Some(folder.to_owned()));
-    timeline.task().expect("its record").started
-}
-
-/// The steps a look took for `session` alone.
-fn of(steps: Vec<(u64, Ending)>, session: u64) -> Vec<(u64, Ending)> {
-    steps.into_iter().filter(|(s, _)| *s == session).collect()
-}
-
-/// Publishes `program` as the one in front of `session`'s tab, as the program reader does.
-fn in_front(app: &crate::App, session: u64, program: &str) {
-    let handle = live(app, session);
-    let mut timeline = handle
-        .ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let group = 4_000 + i32::try_from(session).expect("a small session");
-    timeline.note_foreground_group(group);
-    timeline.set_program(group, Some(program.to_owned()));
-}
-
-/// `session`'s task state and when it entered it.
-fn record(app: &crate::App, session: u64) -> (TaskState, Instant) {
-    let task = live(app, session)
-        .ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .task()
-        .cloned()
-        .expect("its record");
-    (task.state, task.since)
-}
-
-/// Who the session log says closed `session`.
-fn closed_by(app: &crate::App, session: u64) -> String {
-    use aterm_slog::{Node, Op};
-    let source = app
-        .store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .closed_logs()
-        .by_local(session)
-        .expect("its closed log")
-        .source();
-    let log = source.into_log().expect("its log");
-    let close = log
-        .window()
-        .rev()
-        .find(|r| r.op == Op::Close && r.node == Node::SESSION)
-        .expect("its close");
-    close.by.word().to_string()
-}
-
-/// A new stub tab in the window.
-fn new_tab(app: &mut crate::App) -> u64 {
-    let session = app.next_session_id;
-    app.push_stub_tab(crate::WindowId(0), crate::stub_session(session));
-    session
-}
-
-/// THE LOOK ENDS A WORKER WHOSE PROCESS NEVER KNEW IT: once its record has stood its time the
-/// worker's program is asked to end (`SIGTERM` first, however long a hand held it past its time;
-/// `SIGKILL` follows only one that reached it, which a stub tab's never does); with its program
-/// gone and no hand having marked its task, its task is marked `exited`, and its tab goes in the
-/// harness's name once that mark has stood its time. CONTROL: a moment before each; a tab a
-/// driver has; a `SIGTERM` the verb refused; a tab of another folder; a window's last tab.
-#[test]
-fn the_look_closes_a_claim_workers_tab_once_its_job_ended() {
-    use Ending::{ClosePane, Leave, MarkExited, Term};
-    let claim = format!(
-        "/state/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        credit_offers::CLAIM_FOLDER
-    );
-    let (time, deaf) = (WORKER_FOR, DEAF_FOR);
-    let moment = Duration::from_millis(1);
-    let mut app = crate::App::headless_for_test();
-    let front = 0;
-    let worker = new_tab(&mut app);
-    let other = new_tab(&mut app);
-    let since = set_task(&app, worker, &claim);
-    let project = set_task(&app, other, "/Users//me/project");
-    crate::feed_session_for_test(
-        &app,
-        worker,
-        b"\x1b]133;A\x07PS> \x1b]133;B\x07claude\n\x1b]133;C\x07",
-    );
-    assert_eq!(
-        app.end_claim_workers(since + time),
-        [(worker, Leave)],
-        "a job no reader named yet is not signalled"
-    );
-    in_front(&app, worker, "claude");
-
-    assert_eq!(app.end_claim_workers(since + time - moment), []);
-    let driven = live(&app, worker);
-    let drive = |on: bool| {
-        *driven
-            .ctx
-            .turn_lease
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = on.then(|| crate::Lease::Drive {
-            holder: crate::harness_host::holder(),
-            expires_us: u64::MAX,
-            conn: None,
-            hard: true,
-            here: false,
-            holder_pid: None,
-        });
-    };
-    drive(true);
-    assert_eq!(
-        app.end_claim_workers(since + time + deaf),
-        [(worker, Leave)]
-    );
-    drive(false);
-    assert_eq!(
-        app.end_claim_workers(since + time + deaf),
-        [(worker, Term)],
-        "a program's first signal is SIGTERM, however long a hand held it past its time"
-    );
-    // A stub tab has no process group, so the verb refused that SIGTERM: no time to end counts
-    // (a delivered one: `the_looks_delivered_sigterm_starts_the_time_its_sigkill_waits_for`).
-    assert_eq!(
-        app.end_claim_workers(since + time + 3 * deaf),
-        [(worker, Term)],
-        "a SIGTERM never delivered starts no time to end"
-    );
-    assert!(app.claim_termed.is_empty());
-    assert!(
-        app.pool.get(worker).is_some(),
-        "a job's pane stays: closing it would raise a confirmation"
-    );
-
-    crate::feed_session_for_test(&app, worker, b"\x1b]133;D;0\x07");
-    assert_eq!(app.end_claim_workers(since + time - moment), []);
-    assert_eq!(app.end_claim_workers(since + time), [(worker, MarkExited)]);
-    let (state, exited) = record(&app, worker);
-    assert_eq!(state, TaskState::Exited);
-    assert_eq!(
-        app.end_claim_workers(exited + time - moment),
-        [],
-        "its tab stays to be read"
-    );
-    assert!(app.pool.get(worker).is_some());
-    assert_eq!(app.end_claim_workers(exited + time), [(worker, ClosePane)]);
-    assert!(
-        app.pool.get(worker).is_none(),
-        "its job ended, its tab went"
-    );
-    assert_eq!(closed_by(&app, worker), "harness");
-
-    assert_eq!(app.end_claim_workers(project + time), []);
-    assert!(app.pool.get(other).is_some(), "a tab of another folder");
-
-    let second = set_task(&app, other, &claim);
-    assert_eq!(app.end_claim_workers(second + time), [(other, MarkExited)]);
-    let (_, exited) = record(&app, other);
-    assert_eq!(app.end_claim_workers(exited + time), [(other, ClosePane)]);
-    let last = set_task(&app, front, &claim);
-    assert_eq!(app.end_claim_workers(last + time), [(front, MarkExited)]);
-    let (_, exited) = record(&app, front);
-    assert_eq!(app.end_claim_workers(exited + time), [(front, Leave)]);
-    assert!(app.pool.get(front).is_some(), "a window's last tab asks");
-}
-
-/// A PERSON'S TAB IS THEIRS: their typing gives a worker its time again, its Autopilot goes Off
-/// even with the tab left in front, and a job in the tab of a worker whose program exited is
-/// theirs and never signalled, nor is another program's job in a worker's tab that nothing
-/// marked exited.
-#[test]
-fn the_look_leaves_what_a_person_has_in_a_workers_tab() {
-    use Ending::Leave;
-    let claim = format!(
-        "/state/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        credit_offers::CLAIM_FOLDER
-    );
-    let mut app = crate::App::headless_for_test();
-    let typed = new_tab(&mut app);
-    let since = set_task(&app, typed, &claim);
-    live(&app, typed)
-        .ctx
-        .human_input
-        .note(crate::metrics::now_us(), crate::human_input::Gesture::Typed);
-    assert_eq!(app.end_claim_workers(since + WORKER_FOR), []);
-
-    let exited = new_tab(&mut app);
-    set_task(&app, exited, &claim);
-    let h = live(&app, exited);
-    crate::task_record::mark_session_task(
-        &h.ctx,
-        h.local_id,
-        &crate::task_record::TaskMark::new(TaskState::Exited),
-    )
-    .expect("unfenced");
-    crate::feed_session_for_test(
-        &app,
-        exited,
-        b"\x1b]133;A\x07PS> \x1b]133;B\x07make\n\x1b]133;C\x07",
-    );
-    let at = h
-        .ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .task()
-        .expect("its record")
-        .since;
-    assert_eq!(app.end_claim_workers(at + WORKER_FOR), [(exited, Leave)]);
-
-    let taken = new_tab(&mut app);
-    let began = set_task(&app, taken, &claim);
-    crate::feed_session_for_test(
-        &app,
-        taken,
-        b"\x1b]133;A\x07PS> \x1b]133;B\x07npm run dev\n\x1b]133;C\x07",
-    );
-    // npm's leader names itself `node`, and the worker's last Claude Code frame, still on the
-    // screen, names the reader.
-    in_front(&app, taken, "node");
-    {
-        let handle = live(&app, taken);
-        let mut timeline = handle
-            .ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        timeline.publish_agent(
-            "idle",
-            None,
-            None,
-            Some(aterm_phase::Program::Claude),
-            crate::session_timeline::AgentStamp {
-                generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
-                fp: 1,
-            },
-        );
-        assert_eq!(
-            crate::harness_host::identified_agent(timeline.agent()),
-            Some(aterm_phase::Program::Claude),
-            "PRECONDITION: the screen names Claude Code for the runtime in front"
-        );
-    }
-    assert_eq!(
-        of(app.end_claim_workers(began + WORKER_FOR + DEAF_FOR), taken),
-        [(taken, Leave)],
-        "a person's own job, with nothing marked exited before it and the worker's frame on screen"
-    );
-    assert_eq!(record(&app, taken).0, TaskState::Working);
-    let autopilot = h
-        .ctx
-        .meta
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .autopilot_word();
-    assert_eq!(autopilot, Some(Autopilot::Off));
-}
-
-/// A LANDED WORKER KEEPS ITS RESULT, AND A DEADLINE'S ASK GOES WITH ITS PROGRAM: the look's exit
-/// mark carries a done record's result as the harness's own exit mark does, so `result` still
-/// answers while its tab stays to be read, and takes down the held ask a program that ended no
-/// longer owes. CONTROL: a record that moved since the look read it is not marked.
-#[test]
-fn the_looks_exit_mark_keeps_a_result_and_takes_down_a_held_ask() {
-    let claim = format!(
-        "/state/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        credit_offers::CLAIM_FOLDER
-    );
-    let mut app = crate::App::headless_for_test();
-    let landed = new_tab(&mut app);
-    let began = set_task(&app, landed, &claim);
-    let h = live(&app, landed);
-    let mut done = crate::task_record::TaskMark::new(TaskState::Done);
-    done.why = Some(crate::task_record::WHY_LANDED);
-    done.result_bytes = 17;
-    done.result_path = Some(std::path::PathBuf::from("/s/tasks/s-1-1.result.md"));
-    crate::task_record::mark_session_task(&h.ctx, landed, &done).expect("unfenced");
-    assert_eq!(
-        app.end_claim_workers(began + WORKER_FOR),
-        [(landed, Ending::MarkExited)]
-    );
-    let after = h
-        .ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .task()
-        .cloned()
-        .expect("its record");
-    assert_eq!(after.state, TaskState::Exited);
-    assert_eq!(after.result_bytes, 17);
-    assert_eq!(
-        after.result_path.as_deref(),
-        Some(Path::new("/s/tasks/s-1-1.result.md"))
-    );
-
-    // A failed conclusion's reply is kept as a landing's is, and its `why=` with it.
-    let failed = new_tab(&mut app);
-    let began = set_task(&app, failed, &claim);
-    let h = live(&app, failed);
-    let mut gave_up = crate::task_record::TaskMark::new(TaskState::Failed);
-    gave_up.why = Some(crate::task_record::WHY_REPEATED);
-    gave_up.result_bytes = 23;
-    gave_up.result_path = Some(std::path::PathBuf::from("/s/tasks/s-2-1.result.md"));
-    crate::task_record::mark_session_task(&h.ctx, failed, &gave_up).expect("unfenced");
-    assert_eq!(
-        of(app.end_claim_workers(began + WORKER_FOR), failed),
-        [(failed, Ending::MarkExited)]
-    );
-    let after = h
-        .ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .task()
-        .cloned()
-        .expect("its record");
-    assert_eq!(
-        (after.state, after.why, after.result_bytes),
-        (
-            TaskState::Exited,
-            Some(crate::task_record::WHY_REPEATED),
-            23
-        )
-    );
-    assert_eq!(
-        after.result_path.as_deref(),
-        Some(Path::new("/s/tasks/s-2-1.result.md"))
-    );
-
-    let held = new_tab(&mut app);
-    let began = set_task(&app, held, &claim);
-    let h = live(&app, held);
-    let mut stalled = crate::task_record::TaskMark::new(TaskState::Stalled);
-    stalled.why = Some("held");
-    let ask = format!("{}a box", aterm_agent::supervise::HELD_HEAD);
-    crate::task_record::mark_session_task_with(
-        &h.ctx,
-        held,
-        Some(&stalled),
-        crate::task_record::AttentionEdit::Raise(&ask),
-        Duration::ZERO,
-        |_, _| true,
-    )
-    .expect("unfenced");
-    let attention = |ctx: &crate::SessionCtx| {
-        ctx.meta
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .attention_owners
-            .get(crate::harness_host::ATTENTION_OWNER)
-            .map(str::to_owned)
-    };
-    assert_eq!(
-        attention(&h.ctx).as_deref(),
-        Some(ask.as_str()),
-        "PRECONDITION"
-    );
-    assert_eq!(
-        of(app.end_claim_workers(began + WORKER_FOR), held),
-        [(held, Ending::MarkExited)]
-    );
-    assert_eq!(attention(&h.ctx), None, "the ask went with its program");
-    let ended = live(&app, held)
-        .ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .task()
-        .cloned()
-        .expect("its record");
-    assert_eq!(
-        (ended.state, ended.why),
-        (TaskState::Exited, Some("held")),
-        "it ended where it stalled, and its report says so"
-    );
-    assert_eq!(
-        crate::task_record::failed_words(ended.state, ended.why),
-        "held at a screen aterm does not know"
-    );
-
-    let moved = new_tab(&mut app);
-    set_task(&app, moved, &claim);
-    let h = live(&app, moved);
-    let read = h
-        .ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .task()
-        .cloned()
-        .expect("its record");
-    let mut turn = crate::task_record::TaskMark::new(TaskState::Working);
-    turn.why = Some("turn");
-    crate::task_record::mark_session_task(&h.ctx, moved, &turn).expect("unfenced");
-    assert_eq!(super::mark_ended(&h.ctx, moved, &read), Ok(None));
-    assert_eq!(record(&app, moved).0, TaskState::Working);
-}
-
-/// A WORKER YOU CAN SEE IS LEFT ALONE: in a focused window, a claim worker in a split beside the
-/// focused pane is on screen and is not ended. CONTROL: the same worker in a tab behind.
-#[test]
-fn a_claim_worker_in_a_visible_split_is_left_alone() {
-    let claim = format!(
-        "/state/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        credit_offers::CLAIM_FOLDER
-    );
-    let mut app = crate::App::headless_for_test();
-    let window = crate::WindowId(0);
-    let ws = app.windows.get_mut(&window).expect("its window");
-    ws.focused = true;
-    ws.os_window_for_test = true;
-    let worker = 0;
-    let began = set_task(&app, worker, &claim);
-    let beside = app.split_active_stub_tab(window);
-    assert_eq!(app.focused_session_id(window), Some(beside), "PRECONDITION");
-    assert_eq!(
-        app.end_claim_workers(began + WORKER_FOR),
-        [(worker, Ending::Leave)]
-    );
-
-    let behind = new_tab(&mut app);
-    let began = set_task(&app, behind, &claim);
-    app.switch_tab_in(window, 0);
-    assert_eq!(
-        of(app.end_claim_workers(began + WORKER_FOR), behind),
-        [(behind, Ending::MarkExited)]
-    );
+    assert_eq!(stood(&exited, later(660), None), Duration::from_secs(660));
 }
 
 /// A RESTORE GIVES A WORKER ITS LIMIT BACK: the record that held its time did not cross, so a
@@ -1037,13 +573,9 @@ fn a_claim_worker_in_a_visible_split_is_left_alone() {
 #[test]
 fn a_restored_claim_worker_has_a_limit_again() {
     use crate::harness_host::StartupState;
-    let claim = format!(
-        "/state/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        credit_offers::CLAIM_FOLDER
-    );
+    let claim = claim_folder();
     let mut app = crate::App::headless_for_test();
-    let worker = new_tab(&mut app);
+    let worker = worker_tab(&mut app);
     let ctx = live(&app, worker).ctx;
     let task = |ctx: &crate::SessionCtx| {
         ctx.timeline
@@ -1074,7 +606,7 @@ fn a_restored_claim_worker_has_a_limit_again() {
     );
     assert_eq!(claim_worker(&ctx), Some((claim.clone(), false)));
     assert_eq!(
-        app.end_claim_workers(record.started + WORKER_FOR),
+        app.reap_workers(record.started + WORKER_FOR),
         [(worker, Ending::MarkExited)]
     );
     assert_eq!(claim_worker(&ctx), Some((claim, true)), "its worker ended");
@@ -1085,24 +617,20 @@ fn a_restored_claim_worker_has_a_limit_again() {
 /// worker's tab an `exited` record, not a new worker's time, an agent on its leaf or not (the
 /// restore's own path: `app_restore_tests::a_restored_claim_worker_gets_a_task_record`), and a
 /// Claude Code found or brought back there is not signalled; the tab closes once that mark has
-/// stood its time and that Claude Code was last seen running [`WORKER_FOR`] ago. CONTROL: the
+/// stood its linger and that Claude Code was last seen running [`LINGER`] ago. CONTROL: the
 /// layout of a running worker's tab names its folder and nothing ended; a tab with no worker and
 /// a task that ended in another folder name none.
 #[test]
 fn a_restore_leaves_a_program_in_an_ended_workers_tab() {
     use Ending::{ClosePane, Leave};
-    let claim = format!(
-        "/state/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        credit_offers::CLAIM_FOLDER
-    );
+    let claim = claim_folder();
     let mut app = crate::App::headless_for_test();
     let front = 0;
-    let running = new_tab(&mut app);
-    let ended = new_tab(&mut app);
+    let running = worker_tab(&mut app);
+    let ended = worker_tab(&mut app);
     let began = set_task(&app, ended, &claim);
     assert_eq!(
-        app.end_claim_workers(began + WORKER_FOR),
+        app.reap_workers(began + WORKER_FOR),
         [(ended, Ending::MarkExited)],
         "PRECONDITION"
     );
@@ -1122,6 +650,8 @@ fn a_restore_leaves_a_program_in_an_ended_workers_tab() {
     let hosted = |session: u64| {
         let sid = live(&app, session).sid.as_str().to_string();
         let agent = aterm_agent::harness::relaunch::Snapshot {
+            launch_env: None,
+            auth_observed: true,
             stored_login: false,
             profile: None,
             tab: sid.clone(),
@@ -1179,7 +709,7 @@ fn a_restore_leaves_a_program_in_an_ended_workers_tab() {
          claim folder that is no worker's"
     );
 
-    let restored = new_tab(&mut app);
+    let restored = worker_tab(&mut app);
     let ctx = live(&app, restored).ctx;
     note_restored_worker(&ctx, restored, &claim, true);
     let record = ctx
@@ -1200,326 +730,360 @@ fn a_restore_leaves_a_program_in_an_ended_workers_tab() {
     );
     in_front(&app, restored, "claude");
     assert_eq!(
-        of(
-            app.end_claim_workers(record.since + WORKER_FOR + DEAF_FOR),
-            restored
-        ),
+        of(app.reap_workers(record.since + WORKER_FOR), restored),
         [(restored, Leave)],
         "a person's Claude Code in a tab whose worker had ended"
     );
     crate::feed_session_for_test(&app, restored, b"\x1b]133;D;0\x07");
-    let seen = record.since + WORKER_FOR + DEAF_FOR;
+    let seen = record.since + WORKER_FOR;
     assert_eq!(
         of(
-            app.end_claim_workers(seen + WORKER_FOR - Duration::from_secs(1)),
+            app.reap_workers(seen + LINGER - Duration::from_secs(1)),
             restored
         ),
         [(restored, Leave)],
         "its output is still to be read"
     );
     assert_eq!(
-        of(app.end_claim_workers(seen + WORKER_FOR), restored),
+        of(app.reap_workers(seen + LINGER), restored),
         [(restored, ClosePane)]
     );
 }
 
-/// A PROGRAM SOMEONE RUNS IN AN ENDED WORKER'S TAB KEEPS ITS OUTPUT TO BE READ: every look sees it
-/// running, its tab's time out or not, and the tab closes only [`WORKER_FOR`] after the last look
-/// that saw it, not as soon as it ends. CONTROL: a tab with nothing run there closes once its exit
-/// mark has stood that time.
+/// A running claim worker in session `session`.
+const fn running(session: u64) -> ClaimWorker {
+    ClaimWorker {
+        session,
+        ended: false,
+    }
+}
+
+/// A claim worker in session `session` whose task is marked `exited`.
+const fn ended(session: u64) -> ClaimWorker {
+    ClaimWorker {
+        session,
+        ended: true,
+    }
+}
+
+/// A HARNESS WORKER'S OWN SESSION NEVER RUNS THE ACT: a tab whose task record trusts a claim
+/// folder or the disk worker's folder is one of aterm's own workers, and so is a session the
+/// store no longer holds (fail closed). NEGATIVE CONTROL: a person's tab with no record, and a
+/// worker trusted a repository, run it.
 #[test]
-fn a_program_run_in_an_ended_workers_tab_keeps_its_output_to_be_read() {
-    use Ending::{ClosePane, Leave, MarkExited};
-    let claim = format!(
+fn a_harness_workers_own_session_never_runs_the_act() {
+    let mut app = crate::App::headless_for_test();
+    let person = new_tab(&mut app);
+    let claim = new_tab(&mut app);
+    let disk = new_tab(&mut app);
+    let repo = new_tab(&mut app);
+    set_task(&app, claim, &claim_folder());
+    let disk_folder = format!(
         "/state/{}/{}",
         aterm_agent::harness::cli::HARNESS,
-        credit_offers::CLAIM_FOLDER
+        aterm_agent::harness::disk::fence::WORKER_FOLDER
     );
-    let minutes = |n: u64| Duration::from_secs(n * 60);
-    let mut app = crate::App::headless_for_test();
-    let used = new_tab(&mut app);
-    let idle = new_tab(&mut app);
-    let began = set_task(&app, used, &claim);
-    let idle_began = set_task(&app, idle, &claim);
-    let marked = app.end_claim_workers(began.max(idle_began) + WORKER_FOR);
-    for tab in [used, idle] {
-        assert_eq!(of(marked.clone(), tab), [(tab, MarkExited)], "PRECONDITION");
-    }
-    let exited = record(&app, used).1;
-    let idle_exited = record(&app, idle).1;
-    crate::feed_session_for_test(
-        &app,
-        used,
-        b"\x1b]133;A\x07PS> \x1b]133;B\x07make\n\x1b]133;C\x07",
+    set_task(&app, disk, &disk_folder);
+    set_task(&app, repo, "/Users//me/project");
+    let sid = |session| live(&app, session).sid.as_str().to_owned();
+    assert!(own_worker(&app.store, &sid(claim)), "a claim worker");
+    assert!(own_worker(&app.store, &sid(disk)), "the disk worker");
+    assert!(
+        own_worker(&app.store, "s-0000000000000000dead"),
+        "a session the store lacks"
     );
-    assert_eq!(
-        of(app.end_claim_workers(exited + minutes(5)), used),
-        [],
-        "its time is not out, and the look sees the program"
+    assert!(
+        !own_worker(&app.store, &sid(person)),
+        "CONTROL: a person's tab"
     );
-    crate::feed_session_for_test(&app, used, b"\x1b]133;D;0\x07");
-    let steps = app.end_claim_workers(exited.max(idle_exited) + WORKER_FOR);
-    assert_eq!(
-        of(steps.clone(), used),
-        [(used, Leave)],
-        "ended within its time: its output is still to be read"
+    assert!(
+        !own_worker(&app.store, &sid(repo)),
+        "CONTROL: a worker in a repository"
     );
     assert_eq!(
-        of(steps, idle),
-        [(idle, ClosePane)],
-        "CONTROL: nothing run there"
-    );
-    assert_eq!(
-        of(
-            app.end_claim_workers(exited + minutes(5) + WORKER_FOR),
-            used
-        ),
-        [(used, ClosePane)]
+        claim_workers(&app.store),
+        [running(claim)],
+        "the one claim worker, running"
     );
 }
 
-/// A CLICK IS NOT TYPING: the worker's time starts again when a person types in its tab, not when
-/// they click or scroll there, after a seamless update from a build that carried no awake typing
-/// row too, and the typing age is awake time, as the record's is, a typing carried across a
-/// seamless update after the Mac slept too. CONTROL: a key press.
+/// A LINK A LIVE CLAIM WORKER COVERS STARTS NO SECOND WORKER, WHATEVER THE ACCOUNT: the incident
+/// of 2026-11-04, where the default login moved between two looks, so the same link was a new
+/// offer key and the ledger tried it again while its first worker still ran. Covered while it is
+/// asked for, and while its worker runs; once that worker ended, the new account's key is due.
+/// NEGATIVE CONTROL: the account change does make a new key for the same link, so the ledger
+/// alone would have started it.
+#[cfg(unix)]
 #[test]
-fn only_typing_gives_a_claim_worker_its_time_again() {
-    use crate::human_input::Gesture;
-    let claim = format!(
-        "/state/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        credit_offers::CLAIM_FOLDER
-    );
-    let mut app = crate::App::headless_for_test();
-    for (gesture, after) in [
-        (Gesture::Other, vec![Ending::MarkExited]),
-        (Gesture::Typed, vec![]),
-    ] {
-        let tab = new_tab(&mut app);
-        let since = set_task(&app, tab, &claim);
-        live(&app, tab)
-            .ctx
-            .human_input
-            .note(crate::metrics::now_us(), gesture);
-        assert_eq!(
-            of(app.end_claim_workers(since + WORKER_FOR), tab)
-                .into_iter()
-                .map(|(_, step)| step)
-                .collect::<Vec<_>>(),
-            after,
-            "{gesture:?}"
-        );
-    }
-    // Carried across a seamless update that followed a night's sleep: the gesture and typing ages
-    // the outgoing process carried (the typing's counting the sleep), its awake typing row where
-    // it wrote one, and a gesture made here; the worker's record crossed on awake time.
-    const SLEPT_MS: u64 = 8 * 3600 * 1000;
-    let minutes = |n: u64| n * 60_000;
-    let mut carried =
-        |gesture_ms: u64, typed_ms: u64, awake_ms: Option<u64>, here: Option<Gesture>| {
-            let tab = new_tab(&mut app);
-            let since = set_task(&app, tab, &claim);
-            let now_us = crate::metrics::now_us();
-            let input = &live(&app, tab).ctx.human_input;
-            input.carry(gesture_ms, now_us);
-            input.carry_typed_at(typed_ms + SLEPT_MS, now_us, None);
-            if let Some(awake_ms) = awake_ms {
-                input.carry_typed_awake(awake_ms, now_us);
-            }
-            if let Some(gesture) = here {
-                input.note(now_us, gesture);
-            }
-            of(app.end_claim_workers(since + WORKER_FOR), tab)
-                .into_iter()
-                .map(|(_, step)| step)
-                .collect::<Vec<_>>()
-        };
+fn a_link_a_live_claim_worker_covers_starts_no_second_worker_whatever_the_account() {
+    let fx = Fixture::new(&profile_of("acct-1", false, false));
+    let (stepped, first) = fx.look(OPEN, NOW_MS);
+    assert_eq!(stepped, Stepped::Started(first.clone()));
+    assert_eq!(first.len(), 1);
+    std::fs::write(&fx.profile, profile_of("acct-2", false, false)).expect("the login moved");
+    let moved = credit_offers::read(&fx.profile).expect("reads").remove(0);
+    assert_ne!(moved.key, first[0].key, "CONTROL: another account's key");
+    assert_eq!(moved.url, first[0].url, "for the same link");
+    assert_eq!(moved.id, first[0].id);
+
+    let ledger = fx.ledger_bytes();
+    let (stepped, started) = fx.look(OPEN, NOW_MS + 1);
+    assert_eq!(stepped, Stepped::Covered, "its worker is asked for");
+    assert!(started.is_empty());
+    assert_eq!(fx.ledger_bytes(), ledger, "no try recorded");
+
+    fx.claims.spawned(moved.id, &moved.url, 7);
+    *fx.workers.borrow_mut() = vec![running(7)];
     assert_eq!(
-        carried(minutes(1), minutes(1), Some(minutes(1)), None),
-        [],
-        "typed a minute ago in awake time, whatever the sleep before the update"
+        fx.look(OPEN, NOW_MS + 2).0,
+        Stepped::Covered,
+        "its worker runs"
     );
+    assert_eq!(fx.ledger_bytes(), ledger);
+
+    *fx.workers.borrow_mut() = vec![ended(7)];
+    let (stepped, started) = fx.look(OPEN, NOW_MS + 3);
     assert_eq!(
-        carried(10_000, minutes(31), Some(minutes(31)), None),
-        [Ending::MarkExited],
-        "a click younger than the typing: the awake row, not the click, ends the worker"
+        stepped,
+        Stepped::Started(started.clone()),
+        "its worker ended"
     );
-    assert_eq!(
-        carried(10_000, minutes(31), None, None),
-        [],
-        "CONTROL: no awake row (an older outgoing build): the typing is bounded by the click it \
-         carried, so the worker lives longer, never ends early"
-    );
-    assert_eq!(
-        carried(minutes(31), minutes(31), None, Some(Gesture::Other)),
-        [Ending::MarkExited],
-        "a click made here after an older build's carry is no typing"
-    );
-    assert_eq!(
-        carried(minutes(31), minutes(31), None, Some(Gesture::Typed)),
-        [],
-        "CONTROL: typing here"
-    );
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].key, moved.key);
 }
 
-/// `SIGKILL` IS NEVER A PROGRAM'S FIRST SIGNAL: the time to end counts from the first `SIGTERM`
-/// the verb delivered to the process group now in front, for the record now standing. CONTROL:
-/// a refused one records nothing; a later one to the same group keeps the first; another
-/// program come to the front, or a new record, starts again; no foreground group is never deaf.
+/// ONLY THE SAME OFFER'S SAME LINK IS COVERED, AND A REFUSED SPAWN GIVES IT BACK. NEGATIVE
+/// CONTROLS: a row for the other offer, or for another link, covers nothing; a row of a worker
+/// that ended, or is gone, covers nothing, and the look drops it.
 #[test]
-fn the_time_to_end_counts_from_the_first_delivered_sigterm() {
-    let mut termed = super::TermedBySession::new();
+fn only_the_same_offers_same_link_is_covered_and_a_refused_spawn_frees_it() {
+    let claims = Claims::new();
     let t0 = Instant::now();
-    let (record, newer) = (t0, t0 + Duration::from_secs(1));
-    let at = t0 + WORKER_FOR;
-    let moment = Duration::from_millis(1);
-    let deaf = |termed: &super::TermedBySession, session, record, group, now| {
-        super::deaf(termed.get(&session), record, group, now)
-    };
-    super::note_term(
-        &mut termed,
-        7,
-        record,
-        at,
-        "ERR no foreground process group\n",
-    );
-    assert!(termed.is_empty(), "a refused SIGTERM");
-    assert!(!deaf(&termed, 7, record, 4001, at + DEAF_FOR * 9));
-
-    super::note_term(
-        &mut termed,
-        7,
-        record,
-        at,
-        "OK signalled pgrp 4001 discarded=3\n",
-    );
-    super::note_term(
-        &mut termed,
-        7,
-        record,
-        at + DEAF_FOR / 2,
-        "OK signalled pgrp 4001\n",
-    );
-    assert_eq!(
-        termed.get(&7),
-        Some(&super::Termed {
-            record,
-            group: 4001,
-            at
-        })
-    );
-    assert!(!deaf(&termed, 7, record, 4001, at + DEAF_FOR - moment));
+    let url = "https://clau.de/api-credits";
+    claims.asked(OfferId::ApiCredits, url, t0);
+    assert!(claims.covers(OfferId::ApiCredits, url, &[], t0));
     assert!(
-        deaf(&termed, 7, record, 4001, at + DEAF_FOR),
-        "from the first"
+        !claims.covers(OfferId::CloudCredit, url, &[], t0),
+        "CONTROL: the other offer"
     );
     assert!(
-        !deaf(&termed, 8, record, 4001, at + DEAF_FOR),
-        "another tab"
+        !claims.covers(OfferId::ApiCredits, "https://clau.de/other", &[], t0),
+        "CONTROL: another link"
     );
+    claims.refused(OfferId::ApiCredits, url);
     assert!(
-        !deaf(&termed, 7, newer, 4001, at + DEAF_FOR),
-        "a new record's program was sent nothing"
-    );
-    assert!(
-        !deaf(&termed, 7, record, 4002, at + DEAF_FOR),
-        "another program came to the front: it was sent nothing"
-    );
-    assert!(
-        !deaf(&termed, 7, record, -1, at + DEAF_FOR),
-        "no foreground group"
+        !claims.covers(OfferId::ApiCredits, url, &[], t0),
+        "given back"
     );
 
-    let later = at + DEAF_FOR * 3;
-    super::note_term(&mut termed, 7, record, later, "OK signalled pgrp 4002\n");
-    assert!(!deaf(&termed, 7, record, 4002, later + DEAF_FOR - moment));
+    claims.asked(OfferId::ApiCredits, url, t0);
+    claims.spawned(OfferId::ApiCredits, url, 4);
+    claims.refused(OfferId::ApiCredits, url);
     assert!(
-        deaf(&termed, 7, record, 4002, later + DEAF_FOR),
-        "the new program's own first SIGTERM"
+        claims.covers(OfferId::ApiCredits, url, &[running(4)], t0),
+        "a landed worker's hold is no refusal's to take"
     );
-    super::note_term(&mut termed, 7, newer, later, "OK signalled pgrp 4002\n");
-    assert!(deaf(&termed, 7, newer, 4002, later + DEAF_FOR));
-    assert!(!deaf(&termed, 7, record, 4002, later + DEAF_FOR));
-    super::note_term(&mut termed, 7, newer, later, "OK signalled pid 4003\n");
-    assert_eq!(
-        termed.get(&7).map(|sent| sent.group),
-        Some(4002),
-        "a reply that names no group records nothing"
+    assert!(
+        !claims.covers(OfferId::ApiCredits, url, &[ended(4)], t0),
+        "CONTROL: its worker ended"
+    );
+    claims.spawned(OfferId::CloudCredit, "https://claude.ai/cloud", 5);
+    claims.asked(OfferId::ApiCredits, url, t0);
+    claims.spawned(OfferId::ApiCredits, url, 6);
+    assert!(
+        !claims.covers(OfferId::ApiCredits, url, &[running(5)], t0),
+        "CONTROL: its worker gone"
     );
 }
 
-/// THE LOOK'S OWN DELIVERED SIGTERM STARTS THE TIME ITS SIGKILL WAITS FOR: against a real pty
-/// whose foreground program ignores `SIGTERM`, the look sends `SIGTERM` first and records the
-/// group it reached, sends it again until [`DEAF_FOR`] has passed since, then `SIGKILL`, which
-/// ends it; once a person types in the tab, nothing of that signal stays.
+/// A RUNNING CLAIM WORKER NO ROW NAMES COVERS EVERY LINK: one a restore or a seamless update
+/// brought back, whose offer this process never knew. CONTROL: once it ended, both offers start.
+#[cfg(unix)]
 #[test]
-#[cfg(target_os = "macos")]
-fn the_looks_delivered_sigterm_starts_the_time_its_sigkill_waits_for() {
-    use Ending::{Kill, Term};
-    let claim = format!(
-        "/state/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        credit_offers::CLAIM_FOLDER
+fn a_running_claim_worker_no_row_names_covers_every_link() {
+    let fx = Fixture::new(&profile_of("acct-1", false, true));
+    *fx.workers.borrow_mut() = vec![running(9)];
+    let (stepped, started) = fx.look(OPEN, NOW_MS);
+    assert_eq!(stepped, Stepped::Covered);
+    assert!(started.is_empty());
+    assert_eq!(fx.ledger_bytes(), None, "nothing recorded");
+    *fx.workers.borrow_mut() = vec![ended(9)];
+    let (stepped, started) = fx.look(OPEN, NOW_MS);
+    assert_eq!(stepped, Stepped::Started(started.clone()), "CONTROL");
+    assert_eq!(
+        started.iter().map(|o| o.id).collect::<Vec<_>>(),
+        [OfferId::CloudCredit, OfferId::ApiCredits]
     );
-    let (master, slave, mut job, group) =
-        crate::input_stall::tests::ready_job("trap '' TERM; printf R; exec /bin/sleep 120");
-    let mut app = crate::App::headless_for_test();
-    let worker = app.next_session_id;
-    let mut stub = crate::stub_session_with_sink(
-        worker,
-        std::sync::Arc::new(aterm_session::sink::SinkWriter::new(master)),
-    );
-    stub.master = master;
-    app.push_stub_tab(crate::WindowId(0), stub);
-    assert_eq!(live(&app, worker).master, master, "PRECONDITION");
-    let since = set_task(&app, worker, &claim);
-    crate::feed_session_for_test(
-        &app,
-        worker,
-        b"\x1b]133;A\x07PS> \x1b]133;B\x07claude\n\x1b]133;C\x07",
-    );
-    in_front(&app, worker, "claude");
-    let moment = Duration::from_millis(1);
+}
 
-    let termed = since + WORKER_FOR;
-    assert_eq!(app.end_claim_workers(termed), [(worker, Term)]);
-    assert_eq!(
-        app.claim_termed.get(&worker),
-        Some(&super::Termed {
-            record: since,
-            group,
-            at: termed
-        }),
-        "the group the SIGTERM reached"
-    );
-    assert_eq!(
-        job.0.try_wait().expect("its state"),
-        None,
-        "it ignores SIGTERM"
-    );
-    assert_eq!(
-        app.end_claim_workers(termed + DEAF_FOR - moment),
-        [(worker, Term)]
-    );
-    assert_eq!(app.end_claim_workers(termed + DEAF_FOR), [(worker, Kill)]);
-    let ended = job.0.wait().expect("reaped");
-    assert_eq!(
-        std::os::unix::process::ExitStatusExt::signal(&ended),
-        Some(libc::SIGKILL)
-    );
-
-    live(&app, worker)
-        .ctx
-        .human_input
-        .note(crate::metrics::now_us(), crate::human_input::Gesture::Typed);
-    assert_eq!(app.end_claim_workers(termed + DEAF_FOR), []);
+/// TWO SESSIONS, ONE LINK, ONE WORKER: two tabs on two accounts' profiles, one link, looking one
+/// after the other (the ledger's lock orders any two looks, and the first's hold is written under
+/// it before it returns), start one worker between them. CONTROL: with no shared hold, each
+/// account's ledger would start its own.
+#[cfg(unix)]
+#[test]
+fn two_sessions_one_link_start_one_worker() {
+    let claims = Claims::new();
+    let a = Fixture::new(&profile_of("acct-1", false, false));
+    let b = Fixture::new(&profile_of("acct-2", false, false));
+    let (first, _) = a.look_in(&claims, OPEN, NOW_MS, a.t0);
+    let (second, _) = b.look_in(&claims, OPEN, NOW_MS, a.t0);
     assert!(
-        app.claim_termed.is_empty(),
-        "a worker a person typed back into its time owes no signal"
+        matches!(first, Stepped::Started(ref s) if s.len() == 1),
+        "{first:?}"
     );
-    // SAFETY: the test's own pty fds, open until here and used by nothing after.
-    unsafe {
-        libc::close(slave);
-        libc::close(master);
+    assert_eq!(second, Stepped::Covered);
+    let (alone, _) = b.look_in(&Claims::new(), OPEN, NOW_MS, a.t0);
+    assert!(
+        matches!(alone, Stepped::Started(ref s) if s.len() == 1),
+        "CONTROL: {alone:?}"
+    );
+}
+
+/// AN ASK WHOSE TAB NEVER LANDED STOPS HOLDING ITS LINK after [`WORKER_FOR`]: a spawn that never
+/// answered keeps no link forever. CONTROL: a moment before, it still covers.
+#[test]
+fn an_ask_whose_tab_never_landed_holds_its_link_for_the_workers_time() {
+    let claims = Claims::new();
+    let t0 = Instant::now();
+    let url = "https://claude.ai/code/claim-credit/6/x";
+    claims.asked(OfferId::CloudCredit, url, t0);
+    let moment = Duration::from_millis(1);
+    assert!(
+        claims.covers(OfferId::CloudCredit, url, &[], t0 + WORKER_FOR - moment),
+        "CONTROL"
+    );
+    assert!(!claims.covers(OfferId::CloudCredit, url, &[], t0 + WORKER_FOR));
+}
+
+/// A WALLED LOGIN SPENDS NO TRY: where the login a worker would start on is at a usage limit, the
+/// look starts nothing, writes no ledger, holds no link and says until when; a look once it
+/// runs again starts the claim. NEGATIVE CONTROL: the same look unwalled records a try.
+#[cfg(unix)]
+#[test]
+fn a_walled_login_spends_no_try() {
+    let fx = Fixture::new(&profile_text(false));
+    fx.walled.set(Some(1_792_100_000));
+    let (stepped, started) = fx.look(OPEN, NOW_MS);
+    assert_eq!(stepped, Stepped::Walled(1_792_100_000));
+    assert!(started.is_empty());
+    assert_eq!(fx.ledger_bytes(), None, "no try spent");
+    let offer = credit_offers::read(&fx.profile).expect("reads").remove(0);
+    assert!(
+        !fx.claims.covers(offer.id, &offer.url, &[], fx.t0),
+        "no link held"
+    );
+    fx.walled.set(None);
+    let (stepped, started) = fx.look(OPEN, NOW_MS + DAY_MS);
+    assert_eq!(stepped, Stepped::Started(started.clone()), "CONTROL");
+    assert_eq!(read_ledger(&fx.ledger).expect("a ledger").rows.len(), 1);
+}
+
+/// A CLAIM NOT READY SPENDS NO TRY AND OPENS NO TAB: where Chrome or its extension is not in
+/// place, the look says what is left, starts nothing, writes no ledger and holds no link; the
+/// next look checks again. NEGATIVE CONTROL: ready, the same look records its try and starts.
+#[cfg(unix)]
+#[test]
+fn a_claim_not_ready_spends_no_try_and_opens_no_tab() {
+    let fx = Fixture::new(&profile_text(false));
+    *fx.left.borrow_mut() = Some("Left: sign in to claude.ai in Chrome.".to_string());
+    for at in 0..2 {
+        let (stepped, started) = fx.look(OPEN, NOW_MS + at);
+        assert_eq!(
+            stepped,
+            Stepped::NotReady("Left: sign in to claude.ai in Chrome.".to_string())
+        );
+        assert!(started.is_empty());
     }
+    assert_eq!(fx.ledger_bytes(), None, "no try spent");
+    *fx.left.borrow_mut() = None;
+    let (stepped, started) = fx.look(OPEN, NOW_MS + 2);
+    assert_eq!(stepped, Stepped::Started(started.clone()), "CONTROL");
+    assert_eq!(started.len(), 1);
+}
+
+/// THE HOLDS ARE READ ONLY FOR A DUE OFFER: a covered look and one with nothing due read neither
+/// the accounts nor the machine. CONTROL: a due one reads both.
+#[cfg(unix)]
+#[test]
+fn the_holds_are_read_only_for_a_due_offer() {
+    let fx = Fixture::new(&profile_text(false));
+    assert!(matches!(fx.look(OPEN, NOW_MS).0, Stepped::Started(_)));
+    assert_eq!(
+        fx.holds_read.get(),
+        2,
+        "CONTROL: the wall and the readiness"
+    );
+    assert_eq!(fx.look(OPEN, NOW_MS + 1).0, Stepped::Covered);
+    let offer = credit_offers::read(&fx.profile).expect("reads").remove(0);
+    fx.claims.refused(offer.id, &offer.url);
+    assert_eq!(fx.look(OPEN, NOW_MS + 2).0, Stepped::NothingDue);
+    assert_eq!(fx.holds_read.get(), 2, "neither read again");
+}
+
+/// A CLAIM WORKER IS NAMED FOR ITS OFFER AS IT LANDS: its tab's role, which the Workers chip and
+/// every message read, so none reads the line its shell types; and it holds its link by its
+/// session. CONTROL: before, the chip read no such name.
+#[test]
+fn a_landed_claim_worker_is_named_for_its_offer_and_holds_its_link() {
+    let mut app = crate::App::headless_for_test();
+    let session = app.next_session_id;
+    app.next_session_id += 1;
+    let parent = app.new_tab_parent(crate::WindowId(0));
+    app.install_tab_session_parked(crate::WindowId(0), crate::stub_session(session), parent);
+    app.sync_window(crate::WindowId(0));
+    let sid = live(&app, session).sid.as_str().to_owned();
+    let offer = credit_offers::parse(profile_text(false).as_bytes())
+        .expect("parses")
+        .remove(0);
+    let before = app.upgrade_spot(&sid).place;
+    assert!(!before.contains("Claim cloud credit"), "CONTROL: {before}");
+    app.claim_worker_landed(&sid, &offer);
+    let place = app.upgrade_spot(&sid).place;
+    assert!(place.contains("Workers ▸ Claim cloud credit"), "{place}");
+    assert_eq!(app.tab_label_of_session(session), "Claim cloud credit");
+    assert_eq!(worker_role(OfferId::ApiCredits), "Claim API credit");
+    let now = Instant::now();
+    assert!(CLAIMS.covers(offer.id, &offer.url, &[running(session)], now));
+    assert!(
+        !CLAIMS.covers(offer.id, &offer.url, &[ended(session)], now),
+        "its hold goes with it"
+    );
+}
+
+/// WHAT A CLAIM WAITS ON IS ONE RECORD IN MESSAGES: the same words again record nothing, and new
+/// words reword that record rather than add one. Never an alert: it is a record.
+#[test]
+fn what_a_claim_waits_on_is_one_record_reworded_not_repeated() {
+    let mut app = crate::App::headless_for_test();
+    let ours = |app: &crate::App| -> Vec<(String, Vec<String>)> {
+        app.messages
+            .log()
+            .records()
+            .filter(|r| {
+                r.key.as_deref() == Some(crate::message_reporters::CREDIT_CLAIM_NOT_READY_KEY)
+            })
+            .map(|r| (r.title.clone(), r.detail.clone()))
+            .collect()
+    };
+    let first = "In place: Google Chrome.\nLeft: open Chrome and enable the Claude extension it \
+                 adds; sign in to claude.ai in Chrome.";
+    app.credit_claim_not_ready(first);
+    app.credit_claim_not_ready(first);
+    let records = ours(&app);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0].1.len(),
+        2,
+        "a line for what is in place, one for what is left"
+    );
+    assert!(app.messages.live_rows().all(|row| {
+        row.msg.key.as_deref() != Some(crate::message_reporters::CREDIT_CLAIM_NOT_READY_KEY)
+    }));
+    let second = "Left: Google Chrome, which atpkg's brew is installing now; sign in to \
+                  claude.ai in Chrome.";
+    app.credit_claim_not_ready(second);
+    let records = ours(&app);
+    assert_eq!(records.len(), 1, "reworded, not repeated: {records:?}");
+    assert_eq!(records[0].1, [second.to_string()]);
 }

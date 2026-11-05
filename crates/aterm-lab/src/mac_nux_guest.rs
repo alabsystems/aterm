@@ -1331,7 +1331,7 @@ mod tests {
     fn the_quit_confirms_are_the_persons_quit_on_the_apps_question_and_nothing_else() {
         let p = read_person(
             "click 300 120 System Settings Quit_&_Reopen\n\
-             sheet 5900 793 aterm (dev): AXWindow/AXDialog; AXStaticText \"Are you sure you want to quit aterm?\"\n\
+             sheet 5900 793 aterm (dev): AXWindow/AXDialog; AXStaticText \"Quit aterm?\"\n\
              click 6000 793 aterm (dev) quit-confirm\n",
         );
         assert_eq!(quit_confirms(&p), [6000]);

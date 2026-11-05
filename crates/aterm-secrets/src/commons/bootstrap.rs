@@ -84,6 +84,45 @@ pub(crate) fn validate_established_root(paths: &Paths, trust: Trust) -> Result<J
     Journal::read_existing(&paths.dir.join("commons/control"), trust)
 }
 
+/// The trust anchor this installation pinned when it first opened Commons control from a
+/// descriptor its authenticated vault delivered: `commons/default.pin`, which only that first
+/// observation writes and no later one replaces. Its `commons.claim` and the control journal's own
+/// anchor must name the same anchor ([`validate_established_root`]'s checks). It is read whether
+/// or not the current Commons epochs still give this installation control, and reading it creates,
+/// repairs and ingests nothing and grants no control. `None` where no pin is held: this
+/// installation never opened Commons control, or lost its pin, and either way has no anchor here
+/// to trust.
+///
+/// # Errors
+/// The pin is malformed, or the established custody beside it is incomplete, not privately held,
+/// or names another anchor.
+pub(crate) fn established_trust(paths: &Paths) -> Result<Option<Trust>> {
+    let Some(pin) = fsx::read_private(&paths.dir.join("commons/default.pin"), PIN_LEN)? else {
+        return Ok(None);
+    };
+    let bytes = pin.as_slice();
+    if bytes.len() != PIN_LEN || &bytes[..4] != b"ACP1" {
+        return Err(Error::new("Commons network pin is malformed"));
+    }
+    let trust = Trust {
+        network: bytes[4..20].try_into().unwrap(),
+        authority: bytes[20..52].try_into().unwrap(),
+        genesis: bytes[52..84].try_into().unwrap(),
+    };
+    established_files(paths)?;
+    let claim = fsx::read_private(&paths.dir.join("commons.claim"), PIN_LEN)?;
+    if claim
+        .as_ref()
+        .is_none_or(|kept| kept.as_slice() != claim_bytes(trust))
+    {
+        return Err(Error::new(
+            "Commons network pin differs from its retained history claim",
+        ));
+    }
+    Journal::read_existing(&paths.dir.join("commons/control"), trust)?;
+    Ok(Some(trust))
+}
+
 /// How long an observation waits for another local holder of `commons.lock`.
 /// Holders do no network I/O and finish in milliseconds, so one that outlasts
 /// this is stuck or one of many back to back: the observation is refused as busy.
@@ -153,7 +192,7 @@ impl CustodyLock {
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(&path)
             {
                 Ok(file) => {
@@ -356,6 +395,8 @@ pub struct Device {
     machine: [u8; 16],
     incarnation: [u8; 16],
     seed: SecretBytes,
+    /// The lab mark of the identity file this device was opened from ([`Device::lab`]).
+    lab: Option<crate::LabMark>,
 }
 
 impl Device {
@@ -431,6 +472,17 @@ impl Device {
             return Ok(None);
         };
         Self::open_identity(paths, identity, false).map(Some)
+    }
+
+    /// The lab mark of the secrets identity this device was opened from
+    /// (`docs/DESIGN-alab-one-mesh-2026-11-05.md` A12): its file's, or, for an identity an older
+    /// build made unmarked, `VirtualMachine` when this process runs in a virtual machine
+    /// (`client::wire_mark`). A joiner's `ask`, `run` and `prove` lines carry it, and a desk on
+    /// the live ALab genesis refuses them. `None` for a device made from an identity in hand
+    /// rather than a file.
+    #[must_use]
+    pub const fn lab(&self) -> Option<crate::LabMark> {
+        self.lab
     }
 
     pub(crate) fn open_existing(paths: &Paths) -> Result<Self> {
@@ -583,13 +635,15 @@ impl Device {
             CustodyLock::acquire_until(paths, "commons-device.lock", true, deadline)?
         };
         validate()?;
-        if client::read_identity(paths)?
-            .is_none_or(|current| current.recipient() != identity.recipient())
-        {
+        // The identity's lab mark comes from the same read that proves the file still holds this
+        // key: the mark stays the one its file was made with.
+        let Some((_, lab)) = client::read_identity_marked(paths)?
+            .filter(|(current, _)| current.recipient() == identity.recipient())
+        else {
             return Err(Error::new(
                 "Commons secrets identity changed while acquiring device custody",
             ));
-        }
+        };
         // The secrets installer flushes identity contents before publishing its
         // name. Order that name before any ciphertext depending on this key.
         aterm_durable::durable_dir(&paths.dir)?;
@@ -628,7 +682,7 @@ impl Device {
                 ));
             }
         }
-        let device = match encrypted {
+        let mut device = match encrypted {
             Some(encrypted) => Self::decode(identity, encrypted.as_slice())?,
             None => {
                 let candidate = Self::generate(identity)?;
@@ -643,6 +697,7 @@ impl Device {
                 Self::decode(candidate.identity, kept.as_slice())?
             }
         };
+        device.lab = client::wire_mark(lab, crate::Making::now());
         let expected = device.claim();
         if claim
             .as_ref()
@@ -681,6 +736,7 @@ impl Device {
             machine: bytes.as_slice()[..16].try_into().unwrap(),
             incarnation: bytes.as_slice()[16..32].try_into().unwrap(),
             seed: SecretBytes::from(&bytes.as_slice()[32..]),
+            lab: None,
         };
         // Binding validation also rejects zero identifiers and unusable keys.
         device.request([1; 16], [2; 32])?;
@@ -712,6 +768,7 @@ impl Device {
             machine: bytes[36..52].try_into().unwrap(),
             incarnation: bytes[52..68].try_into().unwrap(),
             seed: SecretBytes::from(&bytes[68..]),
+            lab: None,
         };
         device.request([1; 16], [2; 32])?;
         Ok(device)

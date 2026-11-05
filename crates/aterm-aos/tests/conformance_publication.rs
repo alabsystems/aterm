@@ -1007,6 +1007,28 @@ fn negative_control_mixed_a_commit_stopped_after_any_store_never_shows_new_code_
     assert_eq!(kinds, BTreeSet::from([Left::Old, Left::New, Left::Done]));
 }
 
+/// Dial 5 holds an input past capacity. The real boundary overflows to the old pair instead,
+/// including when the configured queue has no slots.
+#[test]
+fn negative_control_a_full_queue_cannot_hold_another_input() {
+    let healthy = aos_boundary_publication_model();
+    for (cap, path) in [
+        (0usize, ["Pause"].as_slice()),
+        (2, ["Pause", "Hold", "Hold"].as_slice()),
+    ] {
+        let model = interp::with_consts(&healthy, &[("Cap", index(cap))]);
+        let overbooked = interp::with_buggy(&model, 5);
+        let mut w = scripted(&model, cap, path);
+        let wrong = successor(&overbooked, "Hold", &w.st);
+        assert!(!model.check_invariant("QueueBounded", &wrong));
+        assert_eq!(interp::admits(&model, &w.st, &wrong), None);
+        let step = w.take(Move::Act("Overflow"));
+        assert_eq!(step.got["queued"], 0);
+        assert_eq!(step.got["paused"], 0);
+        assert_ne!(step.got, wrong);
+    }
+}
+
 /// Dial 3 resumes the old pair on a reject but drops the queue. The real reject delivers every
 /// queued input to the old pair, which the mutant does not admit.
 #[test]

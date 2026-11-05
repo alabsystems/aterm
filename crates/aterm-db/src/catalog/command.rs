@@ -3,7 +3,7 @@
 
 use super::*;
 use aterm_json::{Value, json};
-use aterm_secrets::commons::bootstrap::Bootstrap;
+use aterm_secrets::commons::{bootstrap::Bootstrap, journal::Journal};
 
 pub(crate) fn run(command: &str, mut options: BTreeMap<&str, &str>) -> Result<Value> {
     let paths = Paths::live().map_err(crate::table::failure)?;
@@ -19,10 +19,23 @@ fn run_at(
 ) -> Result<Value> {
     // Parse all arguments before consulting or creating local custody.
     if matches!(command, "commons-inventory" | "commons-custody") {
-        let encoded = options
-            .remove("--table")
-            .ok_or_else(|| Error::new("missing --table"))?;
-        let table = inspection_digest(encoded, "--table")?;
+        let table = options.remove("--table");
+        let batch = options.remove("--tables");
+        let tables = match (table, batch) {
+            (Some(encoded), None) => vec![inspection_digest(encoded, "--table")?],
+            (None, Some(encoded)) if command == "commons-inventory" => {
+                let mut tables = Vec::new();
+                for encoded in encoded.split(',') {
+                    let table = inspection_digest(encoded, "--tables")?;
+                    if tables.len() == MAX_TABLES + 1 || tables.contains(&table) {
+                        return Err(Error::new("--tables requires 1 to 64 distinct digests"));
+                    }
+                    tables.push(table);
+                }
+                tables
+            }
+            _ => return Err(Error::new("specify exactly one of --table or --tables")),
+        };
         let page = if command == "commons-inventory" {
             RecordPage::take(options)?
         } else {
@@ -31,17 +44,36 @@ fn run_at(
         if !options.is_empty() {
             return Err(Error::new("unknown Commons inspection option"));
         }
+        if batch.is_some() && page.is_some() {
+            return Err(Error::new("record pages require a single --table"));
+        }
         let deadline = crate::admission::deadline();
         if command == "commons-custody" {
-            return custody_inspection(paths, config, table, deadline);
+            return custody_inspection(paths, config, tables[0], deadline);
         }
-        return retained_inventory(
-            &crate::generation::observed_paths_until(paths, deadline)?,
-            config,
-            table,
-            page,
-            deadline,
-        );
+        let selected = crate::generation::observed_paths_until(paths, deadline)?;
+        if batch.is_some() {
+            let results =
+                retained_inventories_admitted(&selected, config, &tables, None, deadline, || {})?;
+            let ok = results.iter().all(Result::is_ok);
+            let results: Vec<_> = tables
+                .into_iter()
+                .zip(results)
+                .map(|(table, result)| {
+                    result.unwrap_or_else(|error| {
+                        json!({
+                            "table":aterm_codec::hex::encode_lower(&table),
+                            "storage":"unavailable", "known":null, "eligible":null,
+                            "error":error.to_string(),
+                        })
+                    })
+                })
+                .collect();
+            return Ok(json!({"kind":"commons-inventory-batch", "ok":ok,
+                "scope":"local-retained-operation-ids", "tables":results,
+                "atomic":false, "writer_resume_authorized":false}));
+        }
+        return retained_inventory(&selected, config, tables[0], page, deadline);
     }
     if command == "commons-status" {
         if !options.is_empty() {
@@ -51,6 +83,19 @@ fn run_at(
         let recovery = crate::generation::status(paths, deadline)?;
         let chosen = crate::generation::observed_paths_until(paths, deadline);
         let mut value = readiness(chosen.as_ref().unwrap_or(paths), config, deadline)?;
+        let repairs = match crate::network_state::read_live_observation(config) {
+            Ok(observation) => crate::network_state::value(&observation),
+            Err(_) => match crate::network_state::read_history(config) {
+                Ok(observation) => crate::network_state::value(&observation),
+                Err(error) => {
+                    json!({"visibility":"Unavailable", "peers":[], "cause":error.repair_cause().word()})
+                }
+            },
+        };
+        value
+            .as_object_mut()
+            .ok_or_else(|| Error::new("invalid Commons status"))?
+            .insert("repairs".into(), repairs);
         let history = membership_history(chosen.as_ref().unwrap_or(paths), deadline);
         value
             .as_object_mut()
@@ -125,8 +170,8 @@ fn run_at(
     let deadline = crate::admission::deadline();
     let selected = crate::generation::observed_paths_until(paths, deadline)?;
     let paths = &selected;
-    let bootstrap = observed_bootstrap(paths, deadline)?;
-    let session = Session::observe_until(&bootstrap, deadline)?;
+    let (bootstrap, journal) = observed_bootstrap(paths, deadline)?;
+    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline))?;
     let directory = Directory::new(paths, bootstrap.trust());
     let policy = Policy::read(config)?;
     let snapshot = directory.observe_with_policy(&session, &policy)?;
@@ -198,12 +243,12 @@ fn custody_inspection(
     if !policy.enabled || policy.excluded.contains(&table) {
         return Ok(excluded());
     }
-    let bootstrap = observed_bootstrap(paths, deadline)?;
+    let (bootstrap, journal) = observed_bootstrap(paths, deadline)?;
     let directory = Directory::new(paths, bootstrap.trust());
     if !policy.includes(directory.catalog_scope().digest(), table) {
         return Ok(excluded());
     }
-    let session = Session::observe_until(&bootstrap, deadline)?;
+    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline))?;
     Ok(crate::table::store::custody::inspect(&session, table)?.json())
 }
 
@@ -340,33 +385,76 @@ fn retained_inventory_admitted(
     deadline: std::time::Instant,
     after_admission: impl FnOnce(),
 ) -> Result<Value> {
-    use crate::replica::InventorySummary;
+    retained_inventories_admitted(paths, config, &[table], page, deadline, after_admission)?
+        .pop()
+        .ok_or_else(|| Error::new("inventory response is missing"))?
+}
 
+/// Reuse one authenticated custody and policy observation across bounded local
+/// reads. Individual table failures remain failures, never empty inventories.
+fn retained_inventories_admitted(
+    paths: &Paths,
+    config: &Path,
+    tables: &[Digest],
+    page: Option<RecordPage>,
+    deadline: std::time::Instant,
+    after_admission: impl FnOnce(),
+) -> Result<Vec<Result<Value>>> {
     // Keep the current and ancestor vault sources stable for this one local
     // query, from session admission through both verified inventory summaries.
     // No source guard escapes this function or crosses network I/O.
     let _sources = crate::generation::local_source_reads_until(paths, deadline)?;
-    let bootstrap = observed_bootstrap(paths, deadline)?;
-    let session = Session::observe_until(&bootstrap, deadline)?;
+    let (bootstrap, journal) = observed_bootstrap(paths, deadline)?;
+    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline))?;
     after_admission();
     let directory = Directory::new(paths, bootstrap.trust());
-    let catalog = directory.catalog_scope();
     let policy = Policy::read(config)?;
+    let now = aterm_time::unix_millis().map(|ms| ms / 1000);
+    let mut snapshot = None;
+    // Resolve all scopes before reading any table. A failed common catalog
+    // observation cannot be mistaken for successful partial enumeration.
+    let targets = tables
+        .iter()
+        .map(|&table| {
+            inventory_scope(&session, &directory, &policy, table, &mut snapshot, now)
+                .map(|(subscription, scope)| (table, subscription, scope))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(targets
+        .into_iter()
+        .map(|(table, subscription, scope)| {
+            inventory_value(&session, &directory, table, subscription, scope, page)
+        })
+        .collect())
+}
+
+fn inventory_scope(
+    session: &Session<'_>,
+    directory: &Directory,
+    policy: &Policy,
+    table: Digest,
+    snapshot: &mut Option<Snapshot>,
+    now: Option<u64>,
+) -> Result<(&'static str, Option<Scope>)> {
+    let catalog = directory.catalog_scope();
     let (subscription, scope) = if !policy.includes(catalog.digest(), table) {
         ("excluded", None)
     } else if table == catalog.digest() {
         ("catalog", Some(catalog))
     } else if let Some((_, _, scope)) = directory.ring_of(
-        &session,
+        session,
         table,
-        aterm_time::unix_millis()
-            .map(|ms| ms / 1000)
-            .ok_or_else(|| Error::new("system clock cannot place the ring tables"))?,
+        now.ok_or_else(|| Error::new("system clock cannot place the ring tables"))?,
     )? {
         ("ring", Some(scope))
     } else {
-        let snapshot = directory.observe_with_config(&session, config)?;
-        match snapshot.entries.get(&table) {
+        if snapshot.is_none() {
+            *snapshot = Some(directory.observe_with_policy(session, policy)?);
+        }
+        match snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.entries.get(&table))
+        {
             None => ("undeclared", None),
             Some(entry) => match entry.state {
                 State::Subscribed => ("subscribed", Some(entry.scope)),
@@ -377,6 +465,19 @@ fn retained_inventory_admitted(
             },
         }
     };
+    Ok((subscription, scope))
+}
+
+fn inventory_value(
+    session: &Session<'_>,
+    directory: &Directory,
+    table: Digest,
+    subscription: &str,
+    scope: Option<Scope>,
+    page: Option<RecordPage>,
+) -> Result<Value> {
+    use crate::replica::InventorySummary;
+
     let summary = |inventory: InventorySummary| {
         json!({"count":inventory.count,
             "sha256":aterm_codec::hex::encode_lower(&inventory.fingerprint)})
@@ -387,7 +488,7 @@ fn retained_inventory_admitted(
      -> Result<Value> {
         let mut value = json!({
             "kind":"commons-inventory", "scope":"local-retained-operation-ids",
-            "network_id":aterm_codec::hex::encode_lower(&bootstrap.trust().network),
+            "network_id":aterm_codec::hex::encode_lower(&directory.trust().network),
             "table":aterm_codec::hex::encode_lower(&table), "subscription":subscription,
             "storage":storage, "known":inventories.map(|(known,_)|summary(known)),
             "eligible":inventories.map(|(_,eligible)|summary(eligible)),
@@ -404,11 +505,11 @@ fn retained_inventory_admitted(
     let Some(scope) = scope else {
         return reply("not-observed", None, false);
     };
-    let Some(store) = directory.observe_table_if_exists(&session, scope)? else {
+    let Some(store) = directory.observe_table_if_exists(session, scope)? else {
         return reply("missing", None, false);
     };
-    let known: BTreeSet<_> = store.inventory(&session)?.copied().collect();
-    let eligible: BTreeSet<_> = store.replication_inventory(&session)?.copied().collect();
+    let known: BTreeSet<_> = store.inventory(session)?.copied().collect();
+    let eligible: BTreeSet<_> = store.replication_inventory(session)?.copied().collect();
     let mut value = reply(
         "present",
         Some((
@@ -427,7 +528,7 @@ fn retained_inventory_admitted(
 }
 
 /// Preserve the vault's unavailable reason before requiring existing local custody.
-fn observed_bootstrap(paths: &Paths, deadline: std::time::Instant) -> Result<Bootstrap> {
+fn observed_bootstrap(paths: &Paths, deadline: std::time::Instant) -> Result<(Bootstrap, Journal)> {
     if let aterm_secrets::commons::Observation::Unavailable(reason) =
         aterm_secrets::commons::observe_until(paths, deadline).map_err(crate::table::failure)?
     {
@@ -439,9 +540,7 @@ fn observed_bootstrap(paths: &Paths, deadline: std::time::Instant) -> Result<Boo
             },
         );
     }
-    Bootstrap::established_with_journal_until(paths, deadline)
-        .map(|(bootstrap, _)| bootstrap)
-        .map_err(crate::table::failure)
+    Bootstrap::established_with_journal_until(paths, deadline).map_err(crate::table::failure)
 }
 
 fn authority(paths: &Paths) -> Result<Value> {
@@ -872,6 +971,7 @@ mod tests {
         assert_eq!(value["ready"].as_bool(), Some(false));
         assert_eq!(value["can_initialize_network"].as_bool(), Some(false));
         assert_eq!(value["membership_history"]["state"], json!("unavailable"));
+        assert!(value["repairs"]["peers"].is_array());
         assert!(!paths.home.exists());
     }
 
@@ -1114,6 +1214,195 @@ mod tests {
             );
             assert!(!paths.home.exists());
         }
+        let duplicate = format!("{valid},{valid}");
+        let too_many = (0..65u8)
+            .map(|n| aterm_codec::hex::encode_lower(&[n; 32]))
+            .collect::<Vec<_>>()
+            .join(",");
+        for mut options in [
+            BTreeMap::from([("--tables", "")]),
+            BTreeMap::from([("--tables", duplicate.as_str())]),
+            BTreeMap::from([("--tables", too_many.as_str())]),
+            BTreeMap::from([("--tables", valid.as_str()), ("--table", valid.as_str())]),
+            BTreeMap::from([("--tables", valid.as_str()), ("--records", "1")]),
+        ] {
+            assert!(
+                run_at(
+                    "commons-inventory",
+                    &mut options,
+                    &paths,
+                    &paths.home.join("config")
+                )
+                .is_err()
+            );
+            assert!(!paths.home.exists());
+        }
+    }
+
+    #[test]
+    fn inventory_batch_shares_custody_and_keeps_each_table_outcome() {
+        use aterm_secrets::commons::roster::Role;
+        use aterm_uds::private_file::PrivateLock;
+
+        let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+        let paths = &lab.paths[0];
+        let config = paths.home.join("config");
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let directory = Directory::new(paths, bootstrap.trust());
+        let descriptors: Vec<_> = ["present", "missing", "excluded", "damaged"]
+            .into_iter()
+            .map(|role| {
+                Descriptor::application(bootstrap.trust(), "batch-inventory", role, 1).unwrap()
+            })
+            .collect();
+        {
+            let mut catalog = directory.catalog(&session).unwrap();
+            for descriptor in &descriptors {
+                catalog
+                    .commit_catalog(&session, &descriptor.encode().unwrap())
+                    .unwrap();
+            }
+        }
+        let receipt = directory
+            .enroll(&session, descriptors[0].scope)
+            .unwrap()
+            .commit_catalog(&session, b"private batch inventory sentinel")
+            .unwrap();
+        for descriptor in &descriptors[2..] {
+            drop(directory.enroll(&session, descriptor.scope).unwrap());
+            std::fs::write(
+                directory
+                    .path(descriptor.scope)
+                    .unwrap()
+                    .join("table.anchor"),
+                b"damaged",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            &config,
+            format!(
+                "[commons]\nexclude_tables = [\"{}\"]\n",
+                aterm_codec::hex::encode_lower(&descriptors[2].scope.digest())
+            ),
+        )
+        .unwrap();
+        let now = aterm_time::unix_millis().unwrap() / 1000;
+        let ring_scope = ring::CLAIMS
+            .scope(bootstrap.trust(), now / ring::CLAIMS.period_s)
+            .unwrap();
+        let tables: Vec<_> = descriptors
+            .iter()
+            .map(|d| d.scope.digest())
+            .chain([
+                directory.catalog_scope().digest(),
+                ring_scope.digest(),
+                [9; 32],
+            ])
+            .collect();
+        let before = crate::tests::files(lab._home.path());
+        let held = std::cell::RefCell::new(None);
+        let results = retained_inventories_admitted(
+            paths,
+            &config,
+            &tables,
+            None,
+            crate::admission::deadline(),
+            || {
+                *held.borrow_mut() = Some(
+                    PrivateLock::take(
+                        &paths.dir,
+                        "commons.lock",
+                        aterm_spec::wait::MUST_HAPPEN,
+                        "test custody held",
+                    )
+                    .unwrap(),
+                );
+            },
+        )
+        .unwrap();
+        // Reopening bootstrap for a later table would contend with this held lock.
+        assert!(
+            PrivateLock::take(
+                &paths.dir,
+                "commons.lock",
+                std::time::Duration::ZERO,
+                "test custody held"
+            )
+            .is_err()
+        );
+        assert_eq!(results.len(), tables.len());
+        let present = results[0].as_ref().unwrap();
+        assert_eq!(present["storage"], json!("present"));
+        assert_eq!(present["known"]["count"], json!(1));
+        let expected = crate::replica::InventorySummary::of(&BTreeSet::from([receipt.id]));
+        assert_eq!(
+            present["known"]["sha256"],
+            json!(aterm_codec::hex::encode_lower(&expected.fingerprint))
+        );
+        assert_eq!(results[1].as_ref().unwrap()["storage"], json!("missing"));
+        assert_eq!(
+            results[2].as_ref().unwrap()["subscription"],
+            json!("excluded")
+        );
+        assert_eq!(
+            results[2].as_ref().unwrap()["storage"],
+            json!("not-observed")
+        );
+        assert!(results[3].is_err());
+        assert_eq!(results[4].as_ref().unwrap()["known"]["count"], json!(4));
+        assert_eq!(results[5].as_ref().unwrap()["storage"], json!("missing"));
+        assert_eq!(
+            results[6].as_ref().unwrap()["subscription"],
+            json!("undeclared")
+        );
+        drop(held.into_inner());
+
+        let healthy = tables
+            .iter()
+            .filter(|id| **id != descriptors[3].scope.digest())
+            .map(|id| aterm_codec::hex::encode_lower(id))
+            .collect::<Vec<_>>()
+            .join(",");
+        let healthy = run_at(
+            "commons-inventory",
+            &mut BTreeMap::from([("--tables", healthy.as_str())]),
+            paths,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(healthy["ok"], json!(true));
+        assert_eq!(
+            healthy["tables"].as_array().unwrap().len(),
+            tables.len() - 1
+        );
+
+        let request = tables
+            .iter()
+            .map(|id| aterm_codec::hex::encode_lower(id))
+            .collect::<Vec<_>>()
+            .join(",");
+        let response = run_at(
+            "commons-inventory",
+            &mut BTreeMap::from([("--tables", request.as_str())]),
+            paths,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(response["ok"], json!(false));
+        assert_eq!(response["atomic"], json!(false));
+        assert_eq!(response["tables"][0]["known"], present["known"]);
+        assert_eq!(response["tables"][3]["storage"], json!("unavailable"));
+        assert!(response["tables"][3]["known"].is_null());
+        assert!(response["tables"][3]["error"].as_str().is_some());
+        assert!(
+            !response
+                .to_string()
+                .contains("private batch inventory sentinel")
+        );
+        assert_eq!(crate::tests::files(lab._home.path()), before);
+        assert!(!directory.path(descriptors[1].scope).unwrap().exists());
     }
 
     #[test]

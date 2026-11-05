@@ -30,14 +30,14 @@ use super::bundle::Reader;
 use super::wire::{self, Line};
 use super::{Allowed, PhraseState};
 use crate::client::{self, Paths};
+use crate::commons::Unavailable;
 use crate::commons::binding::{Pending, Request};
-use crate::commons::bootstrap::{Bootstrap, Device};
+use crate::commons::bootstrap::{Availability, Bootstrap, Device};
 use crate::commons::journal::Trust;
 use crate::pake::{ChannelId, MemberSession, Nonce, PhraseId, Phrases, Share, Tag};
 use crate::{Error, Result, SecretBytes};
 use aterm_time::Instant;
 use aterm_types::MutexExt;
-use ring::signature::{ED25519, UnparsedPublicKey};
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -67,6 +67,10 @@ pub const ASKED_AGAIN_AFTER: Duration = Duration::from_secs(30);
 pub const STILL_ASKING: Duration = Duration::from_secs(32 * 60);
 /// The CPace runs one source address may start a minute.
 pub const RUNS_PER_MINUTE: usize = 3;
+/// Why a member on the live ALab genesis refuses a lab identity's ask, run or proof
+/// (`docs/DESIGN-alab-one-mesh-2026-11-05.md` A12): it names no key, label or digest.
+pub const LAB_REFUSED: &str = "this member is on the live ALab genesis, and a lab identity never \
+                               joins it: a lab identity founds its own lab";
 pub(super) const DONE_DOMAIN: &[u8] = b"aterm/alab/join-done/1\0";
 pub(super) const RUN_DOMAIN: &[u8] = b"aterm/alab/join-run/1\0";
 /// The bytes of the challenge a member's greeting carries, fresh on each connection.
@@ -185,7 +189,9 @@ fn source_of(from: IpAddr) -> IpAddr {
 
 /// This Mac as a member: its Commons device, the network it belongs to, its name, and whether
 /// it can allow: the membership log seats its device key (F15), or the current Commons roster
-/// binds its writer key, which an admin's approver needs to check its `Allowed` (F10).
+/// binds its writer key, which an admin's approver needs to check its `Allowed` (F10). A log seat
+/// under the anchor it pinned makes a member ([`Local::of`]), whether or not Commons control is
+/// this Mac's.
 pub struct Local {
     device: Device,
     request: Request,
@@ -193,9 +199,12 @@ pub struct Local {
     can_allow: bool,
     name: String,
     removed: client::RemovedNotes,
+    /// The live seats by their fleet node keys ([`client::kept_seats`]): a Mac that asks with
+    /// one of them under another vault key is that seat's Mac rebuilt, and its row says so.
+    kept: std::collections::BTreeMap<[u8; 32], client::KeptSeat>,
     admitted: std::collections::BTreeSet<crate::membership_log::MemberId>,
     /// The writer keys the current Commons roster binds: a Mac an approver enrolled from an
-    /// `Allowed` (F10) is bound here once let in.
+    /// `Allowed` (F10) is bound here once let in. Empty where Commons control is not this Mac's.
     bound: std::collections::BTreeSet<[u8; 32]>,
     /// The pinned default ALab vault served at a URL: a Mac on this member's home ALab LAN that
     /// proves itself is let in ([`Local::automatically_admits`], [`Proving::lan`]), and the
@@ -206,6 +215,9 @@ pub struct Local {
     /// This member's home ALab LAN when it read its place (`crate::home_lan::home_net`): only a
     /// host on it is let in by its proof.
     home: Option<crate::home_lan::HomeNet>,
+    /// Its vault is the live ALab's by its genesis ([`client::on_live_genesis`]): a lab identity's
+    /// ask and run are refused here ([`LAB_REFUSED`]), and its proof is by the caller's decision.
+    live_genesis: bool,
     /// Where this Mac keeps its vault state ([`Local::of`]): a run takes that state
     /// ([`client::take_handover_hold`]) before it touches a phrase. `None` for a test's member
     /// ([`Local::with`]), whose runs hold nothing.
@@ -213,34 +225,55 @@ pub struct Local {
 }
 
 impl Local {
-    /// This Mac as a member of the network its applied vault names, `None` when it holds no
-    /// Commons control (no vault, or not in it yet).
+    /// This Mac as a member of the network its applied vault names. Where it holds Commons
+    /// control, that control's descriptor names the network and its roster the writer keys it
+    /// binds. Membership is the membership log (owner, 2026-11-02), not Commons control: where the
+    /// current signed Commons epochs leave this Mac out of control, or no control entry is
+    /// addressed to it, while its vault is otherwise applied and admits it, it is a member still
+    /// wherever its log seats its Commons device under the trust anchor it pinned
+    /// ([`client::seated_member`]). Such a member binds no writer key, allows by its log seat, and
+    /// lets a Mac in through the log alone. `None` with no vault, or a vault not yet applied, not
+    /// admitting this Mac or still busy at the read's deadline; and, where Commons control is not
+    /// its own, for a Mac its log removed or does not seat, or one that never pinned an anchor
+    /// ([`client::member_by_log`] tells those from a busy vault). Where Commons control is not its
+    /// own, reading creates no custody, founds no network and claims no control.
     ///
     /// # Errors
-    /// Unreadable or corrupt local Commons state.
+    /// Unreadable or corrupt local Commons state, a pinned anchor that names another network than
+    /// the membership log, or a vault still busy at the read's deadline while a seat is read.
     pub fn of(paths: &Paths) -> Result<Option<Self>> {
-        let Some(bootstrap) = Bootstrap::cached_until(
-            paths,
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-        )?
-        else {
-            return Ok(None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (device, trust, bound, can_allow) = match Bootstrap::observe_until(paths, deadline)? {
+            Availability::Available(bootstrap) => {
+                let Some(device) = Device::open(paths)? else {
+                    return Ok(None);
+                };
+                let access = bootstrap.access();
+                let bound = match &access {
+                    Ok(Some(access)) => access
+                        .members()
+                        .iter()
+                        .map(|member| *member.binding().writer())
+                        .collect(),
+                    _ => std::collections::BTreeSet::new(),
+                };
+                let can_allow = matches!(access, Ok(Some(_))) || client::admits_by_log(paths);
+                (device, bootstrap.trust(), bound, can_allow)
+            }
+            // Only Commons control is not this Mac's: its vault is applied and admits it. What
+            // only control gives degrades (no roster binds a writer key here); the log seat is
+            // what lets it allow, and what lets a new Mac in.
+            Availability::Unavailable(
+                Unavailable::ControlExcluded | Unavailable::ControlNotVisible,
+            ) => {
+                let Some((device, trust)) = client::seated_member(paths, Some(deadline))? else {
+                    return Ok(None);
+                };
+                (device, trust, std::collections::BTreeSet::new(), true)
+            }
+            Availability::Unavailable(_) => return Ok(None),
         };
-        let Some(device) = Device::open(paths)? else {
-            return Ok(None);
-        };
-        let access = bootstrap.access();
-        let bound = match &access {
-            Ok(Some(access)) => access
-                .members()
-                .iter()
-                .map(|member| *member.binding().writer())
-                .collect(),
-            _ => std::collections::BTreeSet::new(),
-        };
-        let can_allow = matches!(access, Ok(Some(_))) || client::admits_by_log(paths);
         let admitted = client::log_admitted_actors(paths);
-        let trust = bootstrap.trust();
         let request = device.request(trust.network, trust.authority)?;
         let config = client::config(paths)?;
         let automatic_lan = config.as_ref().is_some_and(|config| {
@@ -250,8 +283,9 @@ impl Local {
         // A removed Mac that asks again shows as removed, not new (F16): from the log this Mac
         // holds, read without the state lock (the records file is written whole).
         let removed = client::removed_notes(paths).unwrap_or_default();
+        let kept = client::kept_seats(paths).unwrap_or_default();
         let admitted_recipients = if automatic_lan {
-            client::swarm_roster(paths)?.map_or_else(Default::default, |roster| {
+            client::swarm_roster_until(paths, deadline)?.map_or_else(Default::default, |roster| {
                 roster
                     .members
                     .iter()
@@ -275,11 +309,13 @@ impl Local {
             can_allow,
             name,
             removed,
+            kept,
             admitted,
             bound,
             automatic_lan,
             admitted_recipients,
             home,
+            live_genesis: client::on_live_genesis(paths),
             paths: Some(paths.clone()),
         }))
     }
@@ -299,11 +335,13 @@ impl Local {
             can_allow,
             name: name.to_owned(),
             removed: client::RemovedNotes::default(),
+            kept: std::collections::BTreeMap::new(),
             admitted: std::collections::BTreeSet::new(),
             bound: std::collections::BTreeSet::new(),
             automatic_lan: false,
             admitted_recipients: Default::default(),
             home: None,
+            live_genesis: false,
             paths: None,
         })
     }
@@ -324,6 +362,29 @@ impl Local {
         Self { removed, ..self }
     }
 
+    /// This member with `kept` as its log's live seats by node key ([`client::kept_seats`]): the
+    /// seam a test gives a desk built by [`Local::with`] its log's seats with.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_kept(self, kept: std::collections::BTreeMap<[u8; 32], client::KeptSeat>) -> Self {
+        Self { kept, ..self }
+    }
+
+    /// This member with `admitted` as the seats its membership log admits ([`Local::of`]'s
+    /// `client::log_admitted_actors`): the seam a test gives a desk built by [`Local::with`]
+    /// its log's seats with.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_admitted(
+        self,
+        admitted: impl IntoIterator<Item = crate::membership_log::MemberId>,
+    ) -> Self {
+        Self {
+            admitted: admitted.into_iter().collect(),
+            ..self
+        }
+    }
+
     /// Supply authenticated LAN policy and admitted recipients in an isolated fixture, this member
     /// on the test home network ([`crate::home_lan::HomeNet::test`], `192.168.1.0/24`).
     #[cfg(any(test, debug_assertions))]
@@ -335,6 +396,24 @@ impl Local {
             home: Some(crate::home_lan::HomeNet::test()),
             ..self
         }
+    }
+
+    /// This member on the live ALab genesis (`true`) or another (`false`): the seam a test puts a
+    /// scratch member on the genesis this build compiles with ([`Local::on_live_genesis`]).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_live_genesis(self, live_genesis: bool) -> Self {
+        Self {
+            live_genesis,
+            ..self
+        }
+    }
+
+    /// Whether this member's vault is the live ALab's by its genesis, where a lab identity's ask
+    /// and run are refused ([`LAB_REFUSED`]).
+    #[must_use]
+    pub const fn on_live_genesis(&self) -> bool {
+        self.live_genesis
     }
 
     /// This member on the home ALab LAN `home`, or on none: the seam a test moves it with.
@@ -355,11 +434,17 @@ impl Local {
         self.automatic_lan && self.home.is_some_and(|home| home.holds(from))
     }
 
+    /// Whether the vault's signed swarm roster names `request`'s recipient as a member here, so
+    /// its ask closes at once. Where this member's log seats anyone, the log must seat the
+    /// asking Mac too: a seatless recipient the roster still names (one an approver let in
+    /// through the envelope alone) asks for a seat, and its row stays for a person's Allow
+    /// (one-mesh S1).
     fn knows_recipient(&self, request: &Request) -> bool {
         self.automatic_lan
             && self
                 .admitted_recipients
                 .contains(&request.binding().recipient().to_bech32())
+            && (self.admitted.is_empty() || self.admitted.contains(&request.binding().actor()))
     }
 
     /// The writer key this member's greeting names and its `CI` binds.
@@ -421,6 +506,11 @@ pub struct Row {
     pub removed: Option<client::RemovedNote>,
     /// A person pressed "Allow again": the run restores the Mac a plain removal took out.
     pub restore: bool,
+    /// A live seat holds the node key this Mac asks with, under another vault key: the Mac is
+    /// that seat's, rebuilt with its node key kept, and a person's Allow moves the seat to it
+    /// (one-mesh A15). [`client::KeptSeat::title`] is the card's words: when the old key last
+    /// signed, and that it reads no newer secret once Allowed. `None` for a removed Mac's row.
+    pub moves: Option<client::KeptSeat>,
 }
 
 struct Heard {
@@ -502,6 +592,11 @@ pub struct Desk {
     phrases: Phrases,
     invites: Vec<PhraseId>,
     runs: Vec<(IpAddr, Instant)>,
+    /// The node keys requests proved on this desk ([`Desk::begin_proof`]: a signature by the node
+    /// key over this member's fresh challenge and the request), by [`row_id`], with when: a
+    /// person's Allow moves a seat to a Mac by its node key only where the Mac proved it here
+    /// ([`Desk::node_proven`]). At most [`MAX_HEARD`]; each lapses [`STILL_ASKING`] after.
+    proven: Vec<(u64, [u8; 32], Instant)>,
     /// This Mac's network as [`Desk::on_network`] was last told it.
     network: Option<String>,
 }
@@ -513,6 +608,8 @@ struct RunLine {
     name: String,
     nonce: Nonce,
     signature: [u8; 64],
+    /// The line carries the lab mark ([`wire::marked`]).
+    lab: bool,
 }
 
 /// The fields of a `prove` line, as [`Desk::begin_proof`] checks them.
@@ -531,6 +628,8 @@ struct Running {
     name: String,
     reader: Reader,
     restore: bool,
+    /// The Mac proved its node key on this desk ([`Desk::node_proven`]).
+    node_proven: bool,
     /// The new Mac acknowledges its bundle (`ack=1`): the row closes only on that.
     acks: bool,
 }
@@ -545,6 +644,7 @@ impl Desk {
             phrases: Phrases::new(),
             invites: Vec::new(),
             runs: Vec::new(),
+            proven: Vec::new(),
             network: None,
         }
     }
@@ -785,6 +885,21 @@ impl Desk {
     /// The request is not a valid self-signed one for this member's network, its name or model
     /// is no such thing, its signature is not its writer key's over them, or no row can go.
     pub fn hear(&mut self, asking: &Asking<'_>, from: IpAddr, now: Instant) -> Result<Answer> {
+        self.hear_marked(asking, false, from, now)
+    }
+
+    /// [`Desk::hear`] of an ask that carries the lab mark (`lab`): on the live ALab genesis it is
+    /// refused ([`LAB_REFUSED`]) once its signature checks, and shows no row.
+    ///
+    /// # Errors
+    /// As [`Desk::hear`], or `lab` on this member's live genesis.
+    pub fn hear_marked(
+        &mut self,
+        asking: &Asking<'_>,
+        lab: bool,
+        from: IpAddr,
+        now: Instant,
+    ) -> Result<Answer> {
         let Asking {
             wire,
             node,
@@ -803,9 +918,14 @@ impl Desk {
             return Err(Error::new("that Mac names no model"));
         }
         let message = ask_message(self.local.key(), &node, name, model, request.bytes());
-        UnparsedPublicKey::new(&ED25519, request.binding().writer())
-            .verify(&message, signature)
-            .map_err(|_| Error::new("that ask is not signed by the Mac whose request it names"))?;
+        if !astream_aead::signature::verify(request.binding().writer(), &message, signature) {
+            return Err(Error::new(
+                "that ask is not signed by the Mac whose request it names",
+            ));
+        }
+        if lab && self.local.live_genesis {
+            return Err(Error::new(LAB_REFUSED));
+        }
         self.expire(now);
         if self.local.knows_recipient(&request)
             && self
@@ -872,8 +992,26 @@ impl Desk {
                 state: heard.state,
                 removed: self.removed_note(heard).cloned(),
                 restore: heard.restore,
+                moves: self.kept_seat(heard, now).cloned(),
             })
             .collect()
+    }
+
+    /// The live seat whose node key `heard` asks with under another vault key, where one does,
+    /// the Mac proved that node key on this desk ([`Desk::node_proven`]) and the log did not
+    /// remove it. An ask names its node key unproven: a Mac that only names a seat's key is a new
+    /// Mac here.
+    fn kept_seat(&self, heard: &Heard, now: Instant) -> Option<&client::KeptSeat> {
+        if self.removed_note(heard).is_some()
+            || heard.node == [0; 32]
+            || !self.node_proven(&heard.request, &heard.node, now)
+        {
+            return None;
+        }
+        self.local
+            .kept
+            .get(&heard.node)
+            .filter(|kept| kept.seat != heard.request.binding().actor())
     }
 
     /// Why this Mac's log keeps out the Mac `heard` binds, where it does.
@@ -1069,6 +1207,7 @@ impl Desk {
             name,
             nonce,
             signature,
+            lab,
         } = line;
         let (node, name) = (*node, name.as_str());
         self.expire(now);
@@ -1082,9 +1221,15 @@ impl Desk {
         self.runs.push((source, now));
         let request = self.checked(wire)?;
         let message = run_message(self.local.key(), challenge, nonce, &node, request.bytes());
-        UnparsedPublicKey::new(&ED25519, request.binding().writer())
-            .verify(&message, signature)
-            .map_err(|_| Error::new("that run is not signed by the Mac whose request it names"))?;
+        if !astream_aead::signature::verify(request.binding().writer(), &message, signature) {
+            return Err(Error::new(
+                "that run is not signed by the Mac whose request it names",
+            ));
+        }
+        // Before any phrase is touched: a lab identity's run spends none here.
+        if *lab && self.local.live_genesis {
+            return Err(Error::new(LAB_REFUSED));
+        }
         if self
             .find(&request)
             .is_some_and(|at| self.heard[at].state == RowState::Closed)
@@ -1115,6 +1260,7 @@ impl Desk {
             }
         }
         let (run, nonce) = self.phrases.begin(phrase, &ci, nonce, now)?;
+        let node_proven = self.node_proven(&request, &node, now);
         Ok((
             Running {
                 phrase,
@@ -1123,6 +1269,7 @@ impl Desk {
                 name,
                 reader: Reader::Files,
                 restore,
+                node_proven,
                 acks: false,
             },
             run,
@@ -1209,18 +1356,44 @@ impl Desk {
             ));
         }
         let message = prove_message(self.local.key(), challenge, &line.node, request.bytes());
-        UnparsedPublicKey::new(&ED25519, request.binding().writer())
-            .verify(&message, &line.signature)
-            .map_err(|_| {
-                Error::new("that proof is not signed by the Mac whose request it names")
-            })?;
-        UnparsedPublicKey::new(&ED25519, &line.node)
-            .verify(
-                &[PROVE_RECORD_PREFIX, &message].concat(),
-                &line.node_signature,
-            )
-            .map_err(|_| Error::new("that proof is not signed by the node key it names"))?;
+        if !astream_aead::signature::verify(request.binding().writer(), &message, &line.signature) {
+            return Err(Error::new(
+                "that proof is not signed by the Mac whose request it names",
+            ));
+        }
+        if !astream_aead::signature::verify(
+            &line.node,
+            &[PROVE_RECORD_PREFIX, &message].concat(),
+            &line.node_signature,
+        ) {
+            return Err(Error::new(
+                "that proof is not signed by the node key it names",
+            ));
+        }
+        self.proven.retain(|(id, _, _)| *id != row_id(&request));
+        if self.proven.len() >= MAX_HEARD {
+            self.proven.remove(0);
+        }
+        self.proven.push((row_id(&request), line.node, now));
         Ok(request)
+    }
+
+    /// Whether the Mac whose request is `request` proved the node key `node` on this desk within
+    /// [`STILL_ASKING`] of `now` ([`Desk::begin_proof`]). A Mac rebuilt with its node key kept
+    /// proves it first (`join::prove_first`), and is refused there while its old seat signed
+    /// within the day; its plain ask that follows shows the seat it takes back only so.
+    fn node_proven(&self, request: &Request, node: &[u8; 32], now: Instant) -> bool {
+        let id = row_id(request);
+        self.proven.iter().any(|(proved, key, at)| {
+            *proved == id && key == node && now.saturating_duration_since(*at) < STILL_ASKING
+        })
+    }
+
+    /// The seam a test proves a request's node key on this desk with, as [`Desk::begin_proof`]
+    /// records it.
+    #[cfg(any(test, debug_assertions))]
+    pub fn with_proven_node(&mut self, request: &Request, node: [u8; 32], now: Instant) {
+        self.proven.push((row_id(request), node, now));
     }
 
     /// The new Mac's own word that it was let in (`done`), signed by its writer key over this
@@ -1228,9 +1401,11 @@ impl Desk {
     fn done(&mut self, wire: &[u8], signature: &[u8; 64]) -> Result<()> {
         let request = self.checked(wire)?;
         let message = [DONE_DOMAIN, self.local.key(), request.bytes()].concat();
-        UnparsedPublicKey::new(&ED25519, request.binding().writer())
-            .verify(&message, signature)
-            .map_err(|_| Error::new("that Mac's word that it was let in did not verify"))?;
+        if !astream_aead::signature::verify(request.binding().writer(), &message, signature) {
+            return Err(Error::new(
+                "that Mac's word that it was let in did not verify",
+            ));
+        }
         self.close(&request);
         Ok(())
     }
@@ -1340,6 +1515,9 @@ pub struct Handing<'a> {
     /// A person pressed "Allow again" for it: the log removed it, and a plain removal does not
     /// keep it out of this run (F16).
     pub restore: bool,
+    /// It proved `node` on this desk by a signature of the node key ([`Desk::begin_proof`]): only
+    /// then does an Allow move the seat that holds that key to it (one-mesh A15).
+    pub node_proven: bool,
     /// This Mac's vault state, which the desk took before the run touched its phrase
     /// ([`client::take_handover_hold`]): [`client::hand_over`] builds the bundle under it and
     /// takes the state no second time. `None` where the desk holds nothing (a test's member).
@@ -1404,6 +1582,9 @@ pub struct Proving<'a> {
     /// ([`Local::automatically_admits`]): physical access to that LAN is proof enough to let a
     /// new Mac in (owner ruling 2026-11-02).
     pub lan: bool,
+    /// Its line carried the lab mark ([`wire::marked`]): a member on the live ALab genesis refuses
+    /// it (`client::refuses_before_possession`, `client::prove_at`).
+    pub lab: bool,
     /// Set by [`Proof::refuses`] once it read the vault's newest records on this connection, so
     /// [`Proof::decide`] after the possession challenge reads them no second time: the whole
     /// exchange runs inside the fleet listener's handshake watchdog
@@ -1487,6 +1668,7 @@ pub fn serve_with_request_policy<S: Read + Write + ?Sized>(
             ask(desk, &parsed, from).and_then(|answer| answer_line(desk, &parsed, &greeted, answer))
         }
         "done" => done(desk, &parsed).map(|()| format!("OK state={}", Answer::Closed.word())),
+        "node" => node(desk, &parsed).map(|taken| format!("OK state={}", taken.word())),
         "run" => return run(desk, stream, &parsed, from, &challenge, bundle),
         "prove" if let Some(proof) = proof => {
             return prove(desk, stream, &parsed, from, &challenge, proof).map(|()| None);
@@ -1518,13 +1700,187 @@ fn ask(desk: &Mutex<Desk>, line: &Line<'_>, from: IpAddr) -> Result<Answer> {
         model: &model,
         signature: &line.hex::<64>("sig")?,
     };
-    desk.lock_or_recover().hear(&asking, from, Instant::now())
+    let lab = wire::marked(line)?;
+    desk.lock_or_recover()
+        .hear_marked(&asking, lab, from, Instant::now())
 }
 
 fn done(desk: &Mutex<Desk>, line: &Line<'_>) -> Result<()> {
     let wire = line.b64("request")?;
     let signature = line.hex::<64>("sig")?;
     desk.lock_or_recover().done(&wire, &signature)
+}
+
+/// What a member's desk did with a seat's `Node` record ([`offer_node`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeTaken {
+    /// Its log now holds the record and binds the node key to the seat that signed it. Its
+    /// admission grants from the history it acknowledged, so the key passes there once a vault
+    /// pass acknowledges the record, as every record it takes.
+    Bound,
+    /// Its log already bound the node key to that seat.
+    Already,
+    /// It keeps the record, which waits on a parent its log does not hold yet: the key is bound
+    /// once the log takes that parent.
+    Waiting,
+    /// Its log took the record, and a later `Node` record of the same seat it already held (one
+    /// that waited on this one) replaces the key: the seat's current key is that record's.
+    Replaced,
+}
+
+impl NodeTaken {
+    /// The word a desk answers it with (`OK state=<word>`).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            NodeTaken::Bound => "bound",
+            NodeTaken::Already => "already",
+            NodeTaken::Waiting => "waiting",
+            NodeTaken::Replaced => "replaced",
+        }
+    }
+
+    fn of_word(word: &str) -> Option<Self> {
+        [
+            NodeTaken::Bound,
+            NodeTaken::Already,
+            NodeTaken::Waiting,
+            NodeTaken::Replaced,
+        ]
+        .into_iter()
+        .find(|taken| taken.word() == word)
+    }
+}
+
+/// The verb a Mac sends a seat's `Node` record under ([`offer_node`]).
+const NODE_VERB: &str = "node record=";
+
+// The largest `Node` record a log takes fits a desk's line in base64.
+const _: () = assert!(
+    NODE_VERB.len() + crate::membership_log::Kind::Node.most_bytes().div_ceil(3) * 4
+        < wire::MAX_LINE
+);
+
+/// Why a member that keeps no log refuses a `Node` record.
+const NODE_NO_LOG: &str = "this Mac keeps no membership log to bind a node key in";
+
+/// Why a member whose vault state a pass holds refuses a `Node` record for now.
+const NODE_BUSY: &str =
+    "a vault pass on this Mac holds its state for now; send the Node record again in a moment";
+
+/// Take a seated member's signed `Node` record from a Mac whose node key no record binds yet
+/// (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4: the four seats with no `Node` record), so
+/// that Mac can bind its key and join `atm/1`. The record verifies by itself ([`Record::decode`]
+/// checks the seat's signature and the node key's own proof over this network and signer, so no
+/// Mac binds a key it does not hold). This log must hold its network, seat its signer, and bind
+/// its key to no one: a key bound to another seat, to a Mac now out or retired by a rotation is
+/// refused, and one already bound to the signer is [`NodeTaken::Already`]. A seat's key no record
+/// binds, a rotation's new key included, is taken into this Mac's store under its vault state,
+/// held for at most [`client::HANDOVER_LOCK_WAIT`] as a run holds it; the log's own evaluation
+/// then judges the record as it judges any other.
+///
+/// [`Record::decode`]: crate::membership_log::Record::decode
+fn node(desk: &Mutex<Desk>, line: &Line<'_>) -> Result<NodeTaken> {
+    use crate::membership_log::{Body, NodeStanding, Record};
+    let record = Record::decode(&line.b64("record")?)?;
+    let Body::Node { node_key, .. } = record.body() else {
+        return Err(Error::new("that membership record is not a Node record"));
+    };
+    let paths = desk
+        .lock_or_recover()
+        .local
+        .paths
+        .clone()
+        .ok_or_else(|| Error::new(NODE_NO_LOG))?;
+    let Some(_held) = client::take_handover_hold(&paths)? else {
+        return Err(Error::of_kind(crate::ErrorKind::MemberBusy, NODE_BUSY));
+    };
+    let store = client::load_records(&paths)?;
+    let log = store.log().ok_or_else(|| Error::new(NODE_NO_LOG))?;
+    if record.network() != log.network() {
+        return Err(Error::new(
+            "that Node record is of another network than this Mac's log",
+        ));
+    }
+    let membership = log.membership();
+    if !membership.contains(record.actor()) {
+        return Err(Error::new(
+            "that Node record's signer holds no seat in this Mac's log",
+        ));
+    }
+    match membership.node(node_key) {
+        NodeStanding::Unknown => {}
+        NodeStanding::Member(actor) if actor == *record.actor() => return Ok(NodeTaken::Already),
+        NodeStanding::Member(_) | NodeStanding::Contested => {
+            return Err(Error::new(
+                "this Mac's log binds that node key to another seat",
+            ));
+        }
+        NodeStanding::Removed(_) => {
+            return Err(Error::new(
+                "this Mac's log binds that node key to a Mac now out",
+            ));
+        }
+        NodeStanding::Retired(_) => {
+            return Err(Error::new(
+                "this Mac's log holds that node key as one its seat replaced",
+            ));
+        }
+    }
+    let encoded = crate::membership_log::store::encode_records([&record]);
+    client::save_records_unlocked(&paths, &encoded)?;
+    let store = client::load_records(&paths)?;
+    if !store.holds(record.id()) {
+        return Ok(NodeTaken::Waiting);
+    }
+    match store.log().map(|log| log.membership().node(node_key)) {
+        Some(NodeStanding::Member(actor)) if actor == *record.actor() => Ok(NodeTaken::Bound),
+        Some(NodeStanding::Retired(actor)) if actor == *record.actor() => Ok(NodeTaken::Replaced),
+        _ => Err(Error::new(
+            "this Mac's log took that Node record but does not bind its key to its seat",
+        )),
+    }
+}
+
+/// Offer a member's desk `record`, this Mac's seat's signed `Node` record ([`node_record`]), on
+/// `stream` (an `atf-ask/1` connection, which a Mac whose key no log binds may still open): the
+/// desk's greeting, the record, and its answer ([`NodeTaken`]).
+///
+/// # Errors
+/// The stream fails, the other end is not a member, or its desk refuses the record (of kind
+/// [`crate::ErrorKind::MemberBusy`] while a vault pass there holds its state).
+pub fn offer_node<S: Read + Write + ?Sized>(stream: &mut S, record: &[u8]) -> Result<NodeTaken> {
+    super::joiner::greeting(stream)?;
+    wire::write_line(stream, &format!("{NODE_VERB}{}", wire::b64(record)))?;
+    let line = wire::read_line(stream)?;
+    let answer = wire::answer(&line)?;
+    NodeTaken::of_word(answer.get("state")?)
+        .ok_or_else(|| Error::new("the member answered an unknown state for a Node record"))
+}
+
+/// The record in this Mac's log that binds `node_key` to this Mac's seat, as [`offer_node`]
+/// sends it: `None` where the log holds none (no log, another seat's key, or a key this Mac's
+/// seat has not bound; `client::publish_local_node_key` authors one).
+///
+/// # Errors
+/// This Mac's store cannot be read.
+pub fn node_record(paths: &Paths, node_key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+    use crate::membership_log::{Body, NodeStanding};
+    let store = client::load_records(paths)?;
+    let Some(log) = store.log() else {
+        return Ok(None);
+    };
+    let NodeStanding::Member(actor) = log.membership().node(node_key) else {
+        return Ok(None);
+    };
+    Ok(log
+        .records()
+        .filter(|record| {
+            record.actor() == &actor
+                && matches!(record.body(), Body::Node { node_key: bound, .. } if bound == node_key)
+        })
+        .last()
+        .map(|record| record.bytes().to_vec()))
 }
 
 /// The machine name an Allowed carries for a request asking under `asked`.
@@ -1576,6 +1932,7 @@ fn run<S: Read + Write + ?Sized>(
             name: allowed_name(&first.text("name")?),
             nonce: first.hex::<{ crate::pake::NONCE_LEN }>("nonce")?,
             signature: first.hex::<64>("sig")?,
+            lab: wire::marked(first)?,
         };
         let reader = reader(first)?;
         if reader.reads_log()
@@ -1668,6 +2025,7 @@ fn steps<S: Read + Write + ?Sized>(
         allowed: &allowed,
         reader: running.reader,
         restore: running.restore,
+        node_proven: running.node_proven,
         held: held.as_ref(),
     })?;
     // The bundle is built: a vault pass may take the state while it travels.
@@ -1755,6 +2113,7 @@ fn prove<S: Read + Write + ?Sized>(
             reader,
             fleet: proof.fleet.is_some_and(|fleet| fleet.current),
             lan,
+            lab: wire::marked(first)?,
             fresh: &fresh,
         };
         // Before any possession challenge: a Mac this member refuses whatever it proves next is told

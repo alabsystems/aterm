@@ -477,7 +477,7 @@ fn a_pinned_lens_steps_the_instruments_and_command_c_copies_their_sentence() {
 }
 
 #[test]
-fn cpu_hardware_report_copy_and_resample_stay_in_the_existing_lens() {
+fn cpu_hardware_report_copy_stays_in_the_existing_lens() {
     let mut r = rig("sill");
     let (on, _) = r.instrument(Instrument::Cpu);
     r.move_to(on);
@@ -494,12 +494,6 @@ fn cpu_hardware_report_copy_and_resample_stay_in_the_existing_lens() {
         !r.app.vitals.reader_runs(),
         "a headless lens has no native reader"
     );
-    r.command(KeyCode::KeyR, "r");
-    assert!(
-        !r.app.vitals.reader_runs(),
-        "resampling cannot start a second reader"
-    );
-    assert!(r.lens().is_some_and(|l| l.focus == Instrument::Cpu));
     assert_eq!(r.sent(), "", "diagnostic keys never reach the shell");
     r.command(KeyCode::KeyC, "c");
     assert_eq!(

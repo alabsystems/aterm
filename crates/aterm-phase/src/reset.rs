@@ -758,6 +758,157 @@ fn walled_line(text: &str) -> Option<(ResetKind, u32)> {
     })
 }
 
+/// What a screen shows of the reset program ([`reset_sighting`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetSight {
+    /// The usage-limit dialog (`What do you want to do?`) with no row that uses or spends a reset.
+    Dialog,
+    /// The usage-limit dialog with a row that uses or spends a reset on offer (a grant row, the
+    /// once-a-week row).
+    Offer,
+    /// A reset's confirmation (`Use a {kind}?`).
+    Confirmation,
+    /// Another box with a row that uses or spends a reset (the chooser a typed `/limit-reset`
+    /// opens).
+    Chooser,
+    /// A line drawn while a reset is looked up or claimed ([`reset_pending`]).
+    Pending(ResetPending),
+    /// The answer on the `⎿` row under a `/rate-limit-options` or `/limit-reset` command row,
+    /// as [`reset_line`] reads it (the wait row's answer and every line it does not know read
+    /// [`ResetLine::Other`]).
+    Answer(ResetLine),
+}
+
+impl ResetSight {
+    /// The sight's word in a capture (`dialog`, `offer`, `confirmation`, `chooser`, `checking`,
+    /// `resetting`, `answer`).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Dialog => "dialog",
+            Self::Offer => "offer",
+            Self::Confirmation => "confirmation",
+            Self::Chooser => "chooser",
+            Self::Pending(ResetPending::Checking) => "checking",
+            Self::Pending(ResetPending::Resetting) => "resetting",
+            Self::Answer(_) => "answer",
+        }
+    }
+}
+
+/// A screen's sight of the reset program ([`reset_sighting`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetSighting {
+    /// What the screen shows.
+    pub sight: ResetSight,
+    /// The rows that show it, trimmed and joined by `\n`: the same sight drawn again (another
+    /// read, the screen scrolled) has the same key, and a change to any of its rows (another
+    /// row focused, another count, a reworded answer) gives another.
+    pub key: String,
+    /// The first row a capture of the sight keeps: the first of the rows that show it, or the
+    /// rule drawn right over them. The rows from it to the screen's foot are sighted as the same
+    /// sight with the same key; the transcript above it is none of the sight's.
+    pub top: usize,
+}
+
+/// What `rows` show of the reset program, where they show any of it: a pending line first, then
+/// a box (the usage-limit dialog, with a reset on offer or none, a confirmation, the chooser),
+/// then the answer under the newest `/rate-limit-options` or `/limit-reset` command row while it
+/// is the newest thing drawn (nothing but blank rows between it and the composer). A reply or a
+/// tool's output that quotes the program's words is none of these.
+#[must_use]
+pub fn reset_sighting(rows: &[String]) -> Option<ResetSighting> {
+    let seen = |sight: ResetSight, from: usize, to: usize| {
+        let key = rows
+            .get(from..=to)
+            .unwrap_or_default()
+            .iter()
+            .map(|row| crate::text::trim(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ruled = from
+            .checked_sub(1)
+            .filter(|&over| is_panel_rule(&rows[over]) || is_rule(&rows[over]));
+        ResetSighting {
+            sight,
+            key,
+            top: ruled.unwrap_or(from),
+        }
+    };
+    if let Some((pending, row)) = reset_pending(rows) {
+        let title = (0..row)
+            .rev()
+            .find(|&i| !crate::text::trim(&rows[i]).is_empty());
+        return Some(seen(
+            ResetSight::Pending(pending),
+            title.unwrap_or(row),
+            row,
+        ));
+    }
+    if let Some(p) = crate::prompt::parse_prompt_v2(rows) {
+        let uses = p
+            .options
+            .iter()
+            .any(|o| spends_reset(&o.label) || uses_a_reset(&o.label));
+        let sight = if p.kind == PromptKind::UsageLimit {
+            Some(if uses {
+                ResetSight::Offer
+            } else {
+                ResetSight::Dialog
+            })
+        } else if reset_title(&p.title).is_some() {
+            Some(ResetSight::Confirmation)
+        } else if uses {
+            Some(ResetSight::Chooser)
+        } else {
+            None
+        };
+        if let Some(sight) = sight {
+            let (top, bottom) = p.span;
+            return Some(seen(sight, top.saturating_sub(1), bottom));
+        }
+    }
+    let (command, answer, last) = reset_answer(rows)?;
+    let foot = crate::phase::composer_frame(rows).map_or(rows.len(), |frame| frame.top);
+    let newest = rows
+        .get(last + 1..foot)
+        .unwrap_or_default()
+        .iter()
+        .all(|row| crate::text::trim(row).is_empty());
+    newest.then(|| seen(ResetSight::Answer(reset_line(&answer)), command, last))
+}
+
+/// The newest `/rate-limit-options` or `/limit-reset` command row with a `⎿` row under it: the
+/// command's row, the answer's words (its wrapped rows joined) and the answer's last row.
+fn reset_answer(rows: &[String]) -> Option<(usize, String, usize)> {
+    let dialog = crate::anchor!("wall.limit_dialog");
+    let dialog = dialog.strip_prefix('/').unwrap_or(dialog);
+    let reset = crate::anchor!("reset.command");
+    let command = rows.iter().rposition(|row| {
+        leading_spaces(row) == 0
+            && crate::text::trim(row)
+                .strip_prefix('❯')
+                .map(crate::text::trim)
+                .and_then(|typed| typed.strip_prefix('/'))
+                .and_then(|typed| typed.split_whitespace().next())
+                .is_some_and(|name| name == dialog || name == reset)
+    })?;
+    let first = (command + 1..rows.len()).find(|&i| !crate::text::trim(&rows[i]).is_empty())?;
+    let head = crate::text::trim(&rows[first]).strip_prefix('⎿')?;
+    let column = leading_spaces(&rows[first]);
+    let mut words = vec![crate::text::trim(head)];
+    let mut last = first;
+    for row in &rows[first + 1..] {
+        let t = crate::text::trim(row);
+        if t.is_empty() || leading_spaces(row) <= column || t.starts_with('⎿') {
+            break;
+        }
+        words.push(t);
+        last += 1;
+    }
+    Some((command, words.join(" "), last))
+}
+
 /// The reset program's screens, as rows.
 #[doc(hidden)]
 pub mod fixtures {
@@ -2979,5 +3130,149 @@ mod tests {
         assert_eq!(worker_phase(&quoted), Phase::Idle);
         assert_eq!(parse_prompt_v2(&quoted), None);
         assert_eq!(reset_pending(&quoted), None);
+    }
+
+    /// Every screen of the reset program is sighted as what it shows: each dialog with a reset row
+    /// as an offer, and the usage-limit dialog with no reset row on offer as a dialog (the 2.1.304
+    /// dialog MEASURED 2026-10-19, and the panel form). The rows from a sighting's `top` to the
+    /// screen's foot are sighted the same, with the same key, and the transcript above it is cut
+    /// (each fixture's first row of reply, banner or turn).
+    /// NEGATIVE CONTROLS: the worker's tool output and reply quoting 2.1.312's answer and row
+    /// (`QUOTED_2_1_312`, its `⎿` rows under a Bash call), a wall with the wait armed and no
+    /// dialog, a `/limit-reset` typed into the composer and not sent, a confirmation's title in a
+    /// tool's output (with the composer drawn and with it cut), and an answer a later reply was
+    /// drawn under are no sighting.
+    #[test]
+    fn each_screen_of_the_reset_program_is_sighted_as_what_it_shows() {
+        let spent = ResetSight::Answer(ResetLine::Spent {
+            kind: ResetKind::Session,
+            left: Some(1),
+            asks: false,
+        });
+        for (name, text) in fixtures::ALL {
+            let want = match name {
+                "quoted-2.1.312" => None,
+                "checking" => Some(ResetSight::Pending(ResetPending::Checking)),
+                "resetting" => Some(ResetSight::Pending(ResetPending::Resetting)),
+                "done-weekly-row-2.1.312" => Some(ResetSight::Answer(ResetLine::Other)),
+                "spent-session-2.1.312" => Some(spent),
+                n if n.starts_with("dialog-") => Some(ResetSight::Offer),
+                n if n.starts_with("confirm") => Some(ResetSight::Confirmation),
+                other => panic!("no sight is written down for {other}"),
+            };
+            let rows = screen(text);
+            let got = reset_sighting(&rows);
+            assert_eq!(got.as_ref().map(|s| s.sight), want, "{name}: {got:?}");
+            let Some(got) = got else { continue };
+            assert!(got.top > 0, "{name}: the transcript over the sight is cut");
+            assert_eq!(
+                reset_sighting(&rows[got.top..]),
+                Some(ResetSighting {
+                    top: 0,
+                    ..got.clone()
+                }),
+                "{name}"
+            );
+        }
+        for (name, text) in [
+            (
+                "2.1.304 measured",
+                include_str!("fixtures/claude-2.1.304-limit-dialog-no-reset-rows.txt"),
+            ),
+            ("dialog", LIMIT_OPTIONS_DIALOG),
+            ("panel", LIMIT_OPTIONS_PANEL),
+        ] {
+            let got = reset_sighting(&screen(text)).map(|s| s.sight);
+            assert_eq!(got, Some(ResetSight::Dialog), "{name}");
+        }
+        let armed = screen(include_str!(
+            "fixtures/claude-2.1.296-wall-session-auto-continue-armed.txt"
+        ));
+        assert_eq!(reset_sighting(&armed), None);
+        let mut typed = screen(fixtures::QUOTED_2_1_312);
+        let composer = typed
+            .iter()
+            .rposition(|row| row.trim() == "❯")
+            .expect("the composer row");
+        typed[composer] = "❯ /limit-reset".to_string();
+        assert_eq!(reset_sighting(&typed), None);
+        let mut quoted = screen(fixtures::QUOTED_2_1_312);
+        let output = quoted
+            .iter()
+            .position(|row| row.trim() == "Reset your 5-hour limit now")
+            .expect("the tool's output row");
+        quoted.insert(output + 1, "     Use a weekly reset?".to_string());
+        assert_eq!(reset_sighting(&quoted), None);
+        let bare: Vec<String> = quoted
+            .iter()
+            .take_while(|row| !row.starts_with("✻"))
+            .cloned()
+            .collect();
+        assert_eq!(reset_sighting(&bare), None);
+        let mut later = screen(fixtures::SPENT_SESSION_2_1_312);
+        let answer = later
+            .iter()
+            .position(|row| row.trim_start().starts_with("⎿  5-hour limit reset"))
+            .expect("the answer row");
+        later.insert(answer + 2, "⏺ Back at work on the suites.".to_string());
+        assert_eq!(reset_sighting(&later), None);
+        later.remove(answer + 2);
+        assert!(reset_sighting(&later).is_some());
+    }
+
+    /// A sighting's key is its own rows: the same dialog under more transcript has the same key,
+    /// and the cursor on another row, or another answer, gives another. The answer under a typed
+    /// `/limit-reset <kind>` is read with its wrapped rows. NEGATIVE CONTROL: an answer row with
+    /// no command row over it (the command row cut) is no sighting.
+    #[test]
+    fn a_sightings_key_is_its_own_rows() {
+        let rows = screen(fixtures::DIALOG_KINDS);
+        let first = reset_sighting(&rows).expect("the dialog");
+        let mut more = rows.clone();
+        more.insert(0, "⏺ An earlier reply.".to_string());
+        assert_eq!(reset_sighting(&more).expect("the dialog").key, first.key);
+        let moved: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                row.replace("   ❯ 1. Stop", "     1. Stop")
+                    .replace("     2. Use a 5-hour", "   ❯ 2. Use a 5-hour")
+            })
+            .collect();
+        assert_ne!(moved, rows);
+        let moved = reset_sighting(&moved).expect("the dialog");
+        assert_eq!(moved.sight, ResetSight::Offer);
+        assert_ne!(moved.key, first.key);
+        let spent = screen(fixtures::SPENT_SESSION_2_1_312);
+        let command = spent
+            .iter()
+            .position(|row| row == "❯ /rate-limit-options")
+            .expect("the command row");
+        let mut typed = spent.clone();
+        typed[command] = "❯ /limit-reset weekly".to_string();
+        typed[command + 1] = "  ⎿  Weekly limits reset · your weekly reset day stays Oct 9 at \
+                              5am ·"
+            .to_string();
+        typed.insert(command + 2, "     1 weekly reset left".to_string());
+        typed.remove(0);
+        let got = reset_sighting(&typed).expect("the answer");
+        assert_eq!(
+            got.sight,
+            ResetSight::Answer(ResetLine::Spent {
+                kind: ResetKind::Weekly,
+                left: Some(1),
+                asks: false,
+            }),
+            "{got:?}"
+        );
+        assert!(
+            got.key.starts_with("❯ /limit-reset weekly\n⎿  Weekly"),
+            "{got:?}"
+        );
+        assert!(got.key.ends_with("\n1 weekly reset left"), "{got:?}");
+        let spent_key = reset_sighting(&spent).expect("the answer").key;
+        assert_ne!(got.key, spent_key);
+        let mut cut = spent.clone();
+        cut.remove(command);
+        assert_eq!(reset_sighting(&cut), None);
     }
 }

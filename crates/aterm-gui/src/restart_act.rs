@@ -31,6 +31,41 @@ fn grace() -> Duration {
 /// The act's deadline in any case.
 pub(crate) const DEADLINE: Duration = Duration::from_secs(30);
 
+/// The deadline an escalation started on this thread waits by: [`DEADLINE`], unless a unit test
+/// set its own.
+fn deadline() -> Duration {
+    #[cfg(test)]
+    if let Some(deadline) = DEADLINE_FOR_TEST.with(std::cell::Cell::get) {
+        return deadline;
+    }
+    DEADLINE
+}
+
+#[cfg(test)]
+thread_local! {
+    static DEADLINE_FOR_TEST: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// This test thread's escalation deadline until the guard drops: a test whose stand-in must end on
+/// its `SIGTERM` waits for that by the hang detector, not by [`DEADLINE`].
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct DeadlineForTest(Option<Duration>);
+
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn deadline_for_test(deadline: Duration) -> DeadlineForTest {
+    DeadlineForTest(DEADLINE_FOR_TEST.with(|slot| slot.replace(Some(deadline))))
+}
+
+#[cfg(test)]
+impl Drop for DeadlineForTest {
+    fn drop(&mut self) {
+        DEADLINE_FOR_TEST.with(|slot| slot.set(self.0));
+    }
+}
+
 /// The verb's arguments.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Ask {
@@ -815,10 +850,11 @@ fn spawn_escalation(ctx: Weak<SessionCtx>, state: &std::path::Path, pgrp: i32, s
         );
         return;
     };
+    let deadline = deadline();
     let spawned = std::thread::Builder::new()
         .name(format!("aterm-restart-{pgrp}"))
         .spawn(move || {
-            let said = escalate(&ctx, &watch, grace(), DEADLINE);
+            let said = escalate(&ctx, &watch, grace(), deadline);
             aterm_log::info!("restart: pid {pgrp} (cause={}): {said}", cause.word());
         });
     if let Err(e) = spawned {
@@ -1268,6 +1304,8 @@ mod tests {
         let other = aterm_tempfile::TempDir::new().expect("another home");
         let snap =
             |claude_dir: Option<std::path::PathBuf>| aterm_agent::harness::relaunch::Snapshot {
+                launch_env: None,
+                auth_observed: true,
                 tab: String::new(),
                 pid: 0x3fff_ff01,
                 start: "t".to_string(),
@@ -1385,6 +1423,8 @@ mod tests {
                     })
                 };
                 let snap = aterm_agent::harness::relaunch::Snapshot {
+                    launch_env: None,
+                    auth_observed: true,
                     tab: ctx.self_id.as_str().to_string(),
                     pid: 0x3fff_ff21,
                     start: "t".to_string(),
@@ -1472,6 +1512,8 @@ mod tests {
             let ctx = crate::session_store::test_handle_on(7700 + n, -1).ctx;
             let sid = ctx.self_id.as_str().to_string();
             let snap = aterm_agent::harness::relaunch::Snapshot {
+                launch_env: None,
+                auth_observed: true,
                 tab: sid.clone(),
                 pid,
                 start: "t".to_string(),

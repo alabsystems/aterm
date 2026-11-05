@@ -72,8 +72,8 @@ pub(crate) struct Family {
     /// fold reads each through `anchor!`): GONE holds a build to them, and NEW-KEY refuses a new
     /// one. Each family's tests hold the table to the fold itself: a key whose removal from a
     /// committed reduction changes what the fold makes of it must be here
-    /// (`keys_the_fold_reads`), and aterm-agent's step tests hold `TRANSCRIPT_KEYS` to the keys
-    /// the fold's projections keep (`the_fold_reads_what_the_transcript_keys_name`).
+    /// (`unheld_keys_the_fold_reads`), and aterm-agent's step tests hold `TRANSCRIPT_KEYS` to the
+    /// keys the fold's projections keep (`the_fold_reads_what_the_transcript_keys_name`).
     pub read: &'static [Anchor],
     /// Whether the fold acts on no row of the record kind `kind` (`<type>/<…>`): a new key or
     /// record kind there is only noted.
@@ -408,26 +408,33 @@ fn keys_of(v: &Value, out: &mut BTreeSet<String>) {
     }
 }
 
-/// The keys of `text`'s rows that `f`'s step fold reads, as the fold itself says: those whose
-/// removal from every object of every row changes the steps it makes of them, what it lost or
-/// dropped, or the chain's end after each row. Both readings are of the rows serialized again,
-/// so only the key differs. GONE holds a build only to the keys [`Family::read`] names, so each
-/// of these must be one of them.
+/// The keys of `text`'s rows that `f`'s step fold reads and [`Family::read`] does not name, as the
+/// fold itself says: those whose removal from every object of every row changes the steps it makes
+/// of them, what it lost or dropped, or the chain's end after each row. Both readings are of the
+/// rows serialized again, so only the keys differ. GONE holds a build only to the keys
+/// [`Family::read`] names, so this must be empty.
+///
+/// Every such key is first stripped at once, one fold of the reduction; only a difference walks
+/// them one at a time to name the key. The gap is two keys whose removals cancel: a fold that reads
+/// `a && !b`, on a reduction where every row with `a` also has `b`, reads the same with both gone.
 /// # Errors
 /// A row is no JSON value.
 #[cfg(test)]
-pub(crate) fn keys_the_fold_reads(f: &Family, text: &str) -> Result<BTreeSet<String>, String> {
-    fn without(v: &mut Value, key: &str) {
+pub(crate) fn unheld_keys_the_fold_reads(
+    f: &Family,
+    text: &str,
+) -> Result<BTreeSet<String>, String> {
+    fn without(v: &mut Value, keys: &BTreeSet<String>) {
         match v {
             Value::Object(m) => {
-                m.remove(key);
+                m.retain(|k, _| !keys.contains(k));
                 for v in m.values_mut() {
-                    without(v, key);
+                    without(v, keys);
                 }
             }
             Value::Array(a) => {
                 for v in a {
-                    without(v, key);
+                    without(v, keys);
                 }
             }
             _ => {}
@@ -439,38 +446,39 @@ pub(crate) fn keys_the_fold_reads(f: &Family, text: &str) -> Result<BTreeSet<Str
             aterm_json::from_str::<Value>(row).map_err(|e| format!("row {}: {e}", n + 1))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let fold = |drop: Option<&str>| {
+    let fold = |drop: &BTreeSet<String>| {
         let mut again = String::new();
         for v in &parsed {
             let mut v = v.clone();
-            if let Some(k) = drop {
-                without(&mut v, k);
-            }
+            without(&mut v, drop);
             again.push_str(&aterm_json::to_string(&v).expect("a parsed row serializes"));
             again.push('\n');
         }
         let r = reduce::readings(&again, f.program);
         (r.steps, r.lost, r.overflow, r.end, r.ends)
     };
-    let base = fold(None);
-    Ok(Shows::of(f, text)?
-        .keys
+    let base = fold(&BTreeSet::new());
+    let mut unheld = Shows::of(f, text)?.keys;
+    unheld.retain(|k| !f.read.iter().any(|a| a.text == k));
+    if fold(&unheld) == base {
+        return Ok(BTreeSet::new());
+    }
+    Ok(unheld
         .into_iter()
-        .filter(|k| fold(Some(k)) != base)
+        .filter(|k| fold(&BTreeSet::from([k.clone()])) != base)
         .collect())
 }
 
-/// Every key the step fold of `f` reads of a committed reduction in `steps` ([`keys_the_fold_reads`])
-/// that [`Family::read`] does not name, with the reductions that show it: what GONE would let a
-/// build drop unrefused.
+/// Every key the step fold of `f` reads of a committed reduction in `steps` that
+/// [`Family::read`] does not name ([`unheld_keys_the_fold_reads`]), with the reductions that show
+/// it: what GONE would let a build drop unrefused.
 #[cfg(test)]
 pub(crate) fn read_but_not_held(f: &Family, steps: &Path) -> Vec<String> {
     let mut missed: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for r in committed(f, steps).expect("the step testdata") {
-        for k in keys_the_fold_reads(f, &r.text).expect("a committed reduction is JSON rows") {
-            if !f.read.iter().any(|a| a.text == k) {
-                missed.entry(k).or_default().push(r.name.clone());
-            }
+        for k in unheld_keys_the_fold_reads(f, &r.text).expect("a committed reduction is JSON rows")
+        {
+            missed.entry(k).or_default().push(r.name.clone());
         }
     }
     missed
@@ -938,9 +946,11 @@ impl Written {
             // Listed for the hard exit under the same lock as the open, so a second interrupt
             // meets every file this made.
             let mut made = made();
+            use std::os::unix::fs::OpenOptionsExt as _;
             let f = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(path)
                 .map_err(|e| format!("{}: {e} (never written over)", path.display()))?;
             made.push(path.to_path_buf());

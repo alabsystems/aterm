@@ -152,7 +152,7 @@ fn read_ledger_text_checked(path: &std::path::Path) -> std::io::Result<Option<St
     if !metadata.is_file() || metadata.len() > MAX_LEDGER_BYTES {
         return Ok(None);
     }
-    let Ok(initial_capacity) = usize::try_from(metadata.len()) else {
+    let Ok(initial_capacity) = usize::try_from(metadata.len().saturating_add(1)) else {
         return Ok(None);
     };
     let mut bytes = Vec::with_capacity(initial_capacity);
@@ -355,6 +355,35 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
     )
 }
 
+/// The build newer than `current_build` that a fresh start of this installed copy would run: one
+/// staged and ready for a boot apply ([`apply_staged_if_ready_preserving_fds_exact`]), or one
+/// another process already installed in this image's place. `None` where neither stands, and
+/// for a copy outside an installed bundle (a dev build), whose start applies nothing. The node
+/// service asks it to decide whether to end its run so launchd starts it again
+/// (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13). It reads the stage's marker and the
+/// installed bundle's `Info.plist`, and never the network.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn newer_build_for_a_start(current_build: u64) -> Option<u64> {
+    let installed = bundle::resolve()?;
+    let staged = paths::Staging::resolve()
+        .and_then(|staging| manifest::Ready::read_publishable(&staging))
+        .map(|ready| ready.build_number);
+    let replaced = installed_build_observed(&installed.app_root).ok();
+    staged
+        .into_iter()
+        .chain(replaced)
+        .filter(|build| *build > current_build)
+        .max()
+}
+
+/// Off macOS no start of this process applies a stage this way.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn newer_build_for_a_start(_current_build: u64) -> Option<u64> {
+    None
+}
+
 /// The parent's swap before it asks LaunchServices for a seamless successor.
 #[cfg(target_os = "macos")]
 pub fn swap_staged_for_launch(
@@ -529,6 +558,9 @@ pub struct HandoffCandidateFacts {
     pub grant_chunks: bool,
     /// The candidate's sealed `Info.plist` declares the sessionless rendezvous grant.
     pub grant_empty: bool,
+    /// The candidate's sealed `Info.plist` declares it rebuilds a window that held only an empty
+    /// Workers list.
+    pub grant_desk: bool,
 }
 
 impl HandoffCandidateFacts {
@@ -539,6 +571,7 @@ impl HandoffCandidateFacts {
             aterm_update_core::handoff_policy::read_from_bundle(app_root),
             bundle::declares_grant_chunks(app_root),
             bundle::declares_grant_empty(app_root),
+            bundle::declares_grant_desk(app_root),
         )
     }
 
@@ -548,6 +581,7 @@ impl HandoffCandidateFacts {
         policy: aterm_update_core::handoff_policy::PolicyRead,
         grant_chunks: Result<bool, String>,
         grant_empty: Result<bool, String>,
+        grant_desk: Result<bool, String>,
     ) -> Result<Self, String> {
         if let aterm_update_core::handoff_policy::PolicyRead::Unread(why) = &policy {
             return Err(verify::mark_passing(format!(
@@ -563,18 +597,21 @@ impl HandoffCandidateFacts {
         };
         let grant_chunks = grant_chunks.map_err(plist_unread)?;
         let grant_empty = grant_empty.map_err(plist_unread)?;
+        let grant_desk = grant_desk.map_err(plist_unread)?;
         Ok(Self {
             policy,
             grant_chunks,
             grant_empty,
+            grant_desk,
         })
     }
 }
 
 #[cfg(target_os = "macos")]
 pub use bundle::{
-    HANDOFF_GRANT_CHUNKS_KEY, HANDOFF_GRANT_CHUNKS_TOKEN, HANDOFF_GRANT_EMPTY_KEY,
-    HANDOFF_GRANT_EMPTY_TOKEN, plist_declares_grant_chunks, plist_declares_grant_empty,
+    HANDOFF_GRANT_CHUNKS_KEY, HANDOFF_GRANT_CHUNKS_TOKEN, HANDOFF_GRANT_DESK_KEY,
+    HANDOFF_GRANT_DESK_TOKEN, HANDOFF_GRANT_EMPTY_KEY, HANDOFF_GRANT_EMPTY_TOKEN,
+    plist_declares_grant_chunks, plist_declares_grant_desk, plist_declares_grant_empty,
     plist_marks_dev_build,
 };
 
@@ -590,6 +627,7 @@ pub fn preverify_staged_for_handoff(
         policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
         grant_chunks: false,
         grant_empty: false,
+        grant_desk: false,
     })
 }
 
@@ -5263,7 +5301,7 @@ mod handoff_candidate_facts_tests {
              (os error 24)"
                 .into(),
         );
-        let refused = HandoffCandidateFacts::admitted(unread, Ok(false), Ok(false))
+        let refused = HandoffCandidateFacts::admitted(unread, Ok(false), Ok(false), Ok(false))
             .expect_err("an unread policy is not a pass");
         assert!(is_passing_refusal(&refused), "{refused}");
         for policy in [
@@ -5272,11 +5310,12 @@ mod handoff_candidate_facts_tests {
             PolicyRead::Parsed(PolicyFile::default()),
         ] {
             assert_eq!(
-                HandoffCandidateFacts::admitted(policy.clone(), Ok(true), Ok(true)),
+                HandoffCandidateFacts::admitted(policy.clone(), Ok(true), Ok(true), Ok(true)),
                 Ok(HandoffCandidateFacts {
                     policy: policy.clone(),
                     grant_chunks: true,
                     grant_empty: true,
+                    grant_desk: true,
                 }),
                 "{policy:?}"
             );
@@ -5292,18 +5331,35 @@ mod handoff_candidate_facts_tests {
             bundle::grant_chunks_judged(plist, Err(std::io::Error::from_raw_os_error(errno)))
         };
         for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EIO] {
-            let refused =
-                HandoffCandidateFacts::admitted(PolicyRead::Absent, read(errno), Ok(false))
-                    .expect_err("a moment's read of the Info.plist is not a pass");
+            let refused = HandoffCandidateFacts::admitted(
+                PolicyRead::Absent,
+                read(errno),
+                Ok(false),
+                Ok(false),
+            )
+            .expect_err("a moment's read of the Info.plist is not a pass");
             assert!(is_passing_refusal(&refused), "errno {errno}: {refused}");
-            let refused =
-                HandoffCandidateFacts::admitted(PolicyRead::Absent, Ok(false), read(errno))
-                    .expect_err("a moment's read of the sessionless grant is not a pass");
+            let refused = HandoffCandidateFacts::admitted(
+                PolicyRead::Absent,
+                Ok(false),
+                read(errno),
+                Ok(false),
+            )
+            .expect_err("a moment's read of the sessionless grant is not a pass");
+            assert!(is_passing_refusal(&refused), "errno {errno}: {refused}");
+            let refused = HandoffCandidateFacts::admitted(
+                PolicyRead::Absent,
+                Ok(false),
+                Ok(false),
+                read(errno),
+            )
+            .expect_err("a moment's read of the desk grant is not a pass");
             assert!(is_passing_refusal(&refused), "errno {errno}: {refused}");
         }
         assert_eq!(
             HandoffCandidateFacts::admitted(
                 PolicyRead::Absent,
+                read(libc::EACCES),
                 read(libc::EACCES),
                 read(libc::EACCES)
             ),
@@ -5311,6 +5367,7 @@ mod handoff_candidate_facts_tests {
                 policy: PolicyRead::Absent,
                 grant_chunks: false,
                 grant_empty: false,
+                grant_desk: false,
             })
         );
         assert_eq!(
@@ -5330,9 +5387,12 @@ mod handoff_candidate_facts_tests {
         let contents = root.join("aterm.app/Contents");
         std::fs::create_dir_all(&contents).unwrap();
         let app = root.join("aterm.app");
+        let grants = |read: Result<HandoffCandidateFacts, String>| {
+            read.map(|facts| (facts.grant_chunks, facts.grant_empty, facts.grant_desk))
+        };
         assert_eq!(
-            HandoffCandidateFacts::read(&app).map(|facts| (facts.grant_chunks, facts.grant_empty)),
-            Ok((false, false))
+            grants(HandoffCandidateFacts::read(&app)),
+            Ok((false, false, false))
         );
         std::fs::write(
             contents.join("Info.plist"),
@@ -5348,14 +5408,17 @@ mod handoff_candidate_facts_tests {
         )
         .unwrap();
         let both = HandoffCandidateFacts::read(&app);
+        std::fs::write(
+            contents.join("Info.plist"),
+            "<plist><dict><key>ATermHandoffGrantChunks</key><string>chunks1</string>\
+             <key>ATermHandoffGrantEmpty</key><string>empty1</string>\
+             <key>ATermHandoffGrantDesk</key><string>desk1</string></dict></plist>",
+        )
+        .unwrap();
+        let all = HandoffCandidateFacts::read(&app);
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(
-            chunks_only.map(|facts| (facts.grant_chunks, facts.grant_empty)),
-            Ok((true, false))
-        );
-        assert_eq!(
-            both.map(|facts| (facts.grant_chunks, facts.grant_empty)),
-            Ok((true, true))
-        );
+        assert_eq!(grants(chunks_only), Ok((true, false, false)));
+        assert_eq!(grants(both), Ok((true, true, false)));
+        assert_eq!(grants(all), Ok((true, true, true)));
     }
 }

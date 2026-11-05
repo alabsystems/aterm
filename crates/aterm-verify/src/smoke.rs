@@ -218,7 +218,7 @@ pub fn activate_macos_gui_pid(pid: u32) -> bool {
         return false;
     };
     let script = dir.path().join("activate.swift");
-    if std::fs::write(&script, ACTIVATE_SWIFT).is_err() {
+    if crate::write_fresh(&script, ACTIVATE_SWIFT).is_err() {
         return false;
     }
     Command::new(SWIFT)

@@ -229,6 +229,12 @@ fn all_e_busy_p_idle(s: &Snapshot) -> Option<bool> {
 }
 
 impl Recorder {
+    /// Whether an E-busy, P-idle observation is pending: the host's demand for a CPU Stats sample
+    /// with each reading while it holds (A2 §6.4), so the frames after its first carry hardware.
+    pub(crate) const fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub(crate) fn observe(&mut self, s: &Snapshot, counters: Option<&[Ticks]>) -> Option<Bundle> {
         let Some(anomaly) = all_e_busy_p_idle(s) else {
             self.pending = None;
@@ -411,7 +417,12 @@ mod tests {
     #[test]
     fn unknown_or_discontinuous_observations_do_not_certify_sustained_anomaly() {
         let mut r = Recorder::default();
+        assert!(!r.pending(), "nothing observed: no demand for CPU Stats");
         assert!(r.observe(&anomaly(1), None).is_none());
+        assert!(
+            r.pending(),
+            "the first anomalous reading asks for CPU Stats"
+        );
         assert!(
             r.observe(&anomaly(50), None).is_none(),
             "a gap is not sustained evidence"
@@ -423,6 +434,7 @@ mod tests {
             r.pending.is_none(),
             "unknown E-core data cannot certify the anomaly"
         );
+        assert!(!r.pending(), "and asks for no CPU Stats");
     }
 
     #[test]

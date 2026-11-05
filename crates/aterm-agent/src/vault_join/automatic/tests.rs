@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 const HANG: Duration = Duration::from_secs(60);
 
+mod excluded;
 mod recovery;
 mod recovery_invalidation;
 mod request_policy;

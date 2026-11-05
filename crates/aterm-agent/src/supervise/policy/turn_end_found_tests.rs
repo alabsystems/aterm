@@ -17,15 +17,15 @@ fn matched(f: &Found) -> &str {
     &f.said[f.matched.clone()]
 }
 
-/// Every find on each form a reader is given of `reply` (the reply, its defense's body and the
-/// reply without its needs), read laxly, strictly and as Land reads it at a yield.
-fn finds(reply: &str) -> Vec<Found> {
+/// Every find on each form Land's readers are given of `reply` (the reply, its defense's body and
+/// the reply without its needs): every word a hold names, whichever arm [`land_open_found`] takes
+/// (a wrong choice of arm rests on [`the_open_phrase_is_the_sentence_that_held_it`] and the
+/// labelled corpus tests, since this reads both).
+fn strict_finds(reply: &str) -> Vec<Found> {
     let land = Some(&LAND_FAMILIES[..]);
-    let mut all = open_work_found(reply, None, true);
-    all.extend(open_work_found(reply, land, true));
+    let mut all = open_work_found(reply, land, true);
     all.extend(open_work_found(&needs::defense_body(reply), land, true));
     all.extend(open_work_found(&needs::without_needs(reply), land, false));
-    all.extend(land_open_found(Some(reply)));
     all
 }
 
@@ -48,16 +48,28 @@ fn broken(f: &Found) -> bool {
 // `the_open_work_readers_over_the_corpora` holds them to another tree's.
 #[test]
 fn every_phrase_keeps_its_contract_on_every_corpus_row() {
-    let rows = super::corpora::corpus_rows();
+    let mut rows = super::corpora::corpus_rows();
+    let needs_rows = needs::needs_table().into_iter().enumerate();
+    rows.extend(needs_rows.map(|(n, (_, reply))| ("needs-table", n, reply)));
     let rows = &rows;
-    let read: Vec<(Vec<String>, usize)> = std::thread::scope(|scope| {
+    let read: Vec<(Vec<String>, usize, Vec<&'static str>, usize)> = std::thread::scope(|scope| {
         let readers: Vec<_> = (0..4)
             .map(|first| {
                 scope.spawn(move || {
                     let mut broke = Vec::new();
-                    let mut n = 0;
+                    let mut unindexed = Vec::new();
+                    let (mut n, mut named) = (0, 0);
                     for (corpus, row, reply) in rows.iter().skip(first).step_by(4) {
-                        let found = finds(reply);
+                        let strict = strict_finds(reply);
+                        named += strict.len();
+                        unindexed.extend(
+                            strict
+                                .iter()
+                                .map(|f| f.word)
+                                .filter(|&w| !OpenWord::of(w).is_some_and(|i| i.word() == w)),
+                        );
+                        let mut found = open_work_found(reply, None, true);
+                        found.extend(strict);
                         n += found.len();
                         broke.extend(
                             found
@@ -66,7 +78,7 @@ fn every_phrase_keeps_its_contract_on_every_corpus_row() {
                                 .map(|f| format!("{corpus}#{row}: {f:?}")),
                         );
                     }
-                    (broke, n)
+                    (broke, n, unindexed, named)
                 })
             })
             .collect();
@@ -75,13 +87,22 @@ fn every_phrase_keeps_its_contract_on_every_corpus_row() {
             .map(|reader| reader.join().expect("a reader of the rows"))
             .collect()
     });
-    let finds: usize = read.iter().map(|(_, n)| n).sum();
-    let broke: Vec<&String> = read.iter().flat_map(|(b, _)| b).collect();
+    let finds: usize = read.iter().map(|(_, n, ..)| n).sum();
+    let named: usize = read.iter().map(|(.., named)| named).sum();
+    let broke: Vec<&String> = read.iter().flat_map(|(b, ..)| b).collect();
     assert!(
         rows.len() > 600 && finds > 600,
         "{} rows, {finds} finds",
         rows.len()
     );
+    assert!(named > 200, "{named} words named");
+    let mut unindexed: Vec<&str> = read
+        .iter()
+        .flat_map(|(_, _, u, _)| u.iter().copied())
+        .collect();
+    unindexed.sort_unstable();
+    unindexed.dedup();
+    assert!(unindexed.is_empty(), "no index: {unindexed:?}");
     assert!(
         broke.is_empty(),
         "{}:\n{}",

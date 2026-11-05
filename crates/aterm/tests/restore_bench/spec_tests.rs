@@ -3,9 +3,15 @@
 
 //! The restore measurement's grammar ([`crate::spec`]), checked.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::spec::*;
+
+#[test]
+fn an_output_path_is_required_separately_from_the_knobs() {
+    assert!(parse("", Path::new("")).is_err());
+    assert!(parse("out=/retired", Path::new("/typed-output")).is_err());
+}
 
 #[test]
 fn an_arm_needs_every_observed_application_and_no_refusals() {
@@ -47,7 +53,7 @@ fn an_arm_needs_every_observed_application_and_no_refusals() {
 
 #[test]
 fn the_defaults_are_the_lane_s_and_every_knob_reads_back() {
-    let spec = parse("out=/s").expect("parses");
+    let spec = parse("", Path::new("/s")).expect("parses");
     assert_eq!(
         spec,
         Spec {
@@ -63,8 +69,11 @@ fn the_defaults_are_the_lane_s_and_every_knob_reads_back() {
         spec.words(),
         "sessions=1,8,32 rounds=3 lines=5000 arm=clean"
     );
-    let spec = parse("out=/s sessions=2,4 rounds=1 lines=10 arm=lookalike lookalike_kib=64")
-        .expect("parses");
+    let spec = parse(
+        "sessions=2,4 rounds=1 lines=10 arm=lookalike lookalike_kib=64",
+        Path::new("/s"),
+    )
+    .expect("parses");
     assert_eq!(
         spec.words(),
         "sessions=2,4 rounds=1 lines=10 arm=lookalike lookalike_kib=64"
@@ -77,32 +86,31 @@ fn the_defaults_are_the_lane_s_and_every_knob_reads_back() {
 #[test]
 fn a_word_out_of_bounds_repeated_or_unknown_is_refused() {
     for bad in [
-        "",
-        "sessions=1",
-        "out=/s sessions=8,1",
-        "out=/s sessions=1,1",
-        "out=/s sessions=0",
-        "out=/s sessions=65",
-        "out=/s sessions=1,,8",
-        "out=/s rounds=0",
-        "out=/s rounds=21",
-        "out=/s lines=x",
-        "out=/s arm=Clean",
-        "out=/s arm=lookalike lookalike_kib=0",
-        "out=/s arm=lookalike lookalike_kib=8193",
-        "out=/s lookalike_kib=64",
-        "out=/s arm=copy lookalike_kib=64",
-        "out=/s out=/t",
-        "out=/s arm=copy arm=clean",
-        "out=/s warmup=3",
-        "out=/s sessions",
+        "sessions=8,1",
+        "sessions=1,1",
+        "sessions=0",
+        "sessions=65",
+        "sessions=1,,8",
+        "rounds=0",
+        "rounds=21",
+        "lines=x",
+        "arm=Clean",
+        "arm=lookalike lookalike_kib=0",
+        "arm=lookalike lookalike_kib=8193",
+        "lookalike_kib=64",
+        "arm=copy lookalike_kib=64",
+        "out=/t",
+        "arm=copy arm=clean",
+        "warmup=3",
+        "sessions",
     ] {
-        assert!(parse(bad).is_err(), "{bad:?}");
+        assert!(parse(bad, Path::new("/s")).is_err(), "{bad:?}");
     }
     assert!(
-        parse(&format!(
-            "out=/s sessions=1,{SESSIONS_MAX} rounds={ROUNDS_MAX} lines={LINES_MAX}"
-        ))
+        parse(
+            &format!("sessions=1,{SESSIONS_MAX} rounds={ROUNDS_MAX} lines={LINES_MAX}"),
+            Path::new("/s")
+        )
         .is_ok()
     );
 }

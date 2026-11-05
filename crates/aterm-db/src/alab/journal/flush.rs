@@ -171,7 +171,7 @@ pub(crate) fn pass_with(
     let session = Session::from_admitted_journal(&bootstrap, journal)?;
     session.writer()?;
     let me = session
-        .members()
+        .members()?
         .iter()
         .find(|binding| binding.actor() == session.actor())
         .map(|binding| *binding.machine())

@@ -406,6 +406,7 @@ fn an_invisible_echo_never_proves() {
 
 #[test]
 fn a_scrolled_back_viewport_never_proves() {
+    // The scrolled arm differs from the control in the scroll alone.
     let t0 = Instant::now();
     for scrolled in [false, true] {
         let mut app = raw_app(t0);
@@ -426,18 +427,23 @@ fn a_scrolled_back_viewport_never_proves() {
                 "history shows 'ab' at the hold's row"
             );
         }
-        crate::term_lock(&term).process(if scrolled { b"**" } else { b"ab" });
-        let last = t + ms(40);
-        app.redraw_window_at(WID, last);
+        crate::term_lock(&term).process(b"ab");
+        app.redraw_window_at(WID, t + ms(40));
         if !scrolled {
-            assert_eq!(key_times(&app, t0).len(), 2, "negative control: recorded");
+            assert_eq!(
+                key_times(&app, t0).len(),
+                2,
+                "control: recorded at its echo"
+            );
             continue;
         }
-        app.redraw_window_at(WID, t + ECHO_PROOF_BOUND);
         assert!(
-            !status(&app).attached,
-            "never proven: stopped by the bound at the latest"
+            status(&app).attached && held_keys(&app.windows[&WID].aos) == 2,
+            "the live row shows the echo, but no proof is read under a scrolled viewport"
         );
+        assert_eq!(status(&app).log_len, 0, "and nothing is logged");
+        app.redraw_window_at(WID, t + ECHO_PROOF_BOUND);
+        assert!(!status(&app).attached, "never proven: stopped by the bound");
         assert!(detached_for(&app, "raw_key"));
     }
 }
@@ -514,6 +520,67 @@ fn a_run_continues_only_where_the_last_echo_ended() {
         !status(&app).attached,
         "a '*' where 'c' should show refutes at once"
     );
+}
+
+#[test]
+fn a_space_no_typed_glyph_follows_stops_the_recording_at_its_bound() {
+    // A blank never corroborates a run, so an echoed space waits for a typed glyph after it. A
+    // key that sends no text never reaches the hold, so after Tab (completion printed past the
+    // space), Enter or an arrow the space stays unproven. Each arm differs from the control in
+    // the key typed after the space.
+    let t0 = Instant::now();
+    let named = |k| Some(pressed(Key::Named(k), Modifiers::empty()));
+    for (arm, next, shown) in [
+        ("control: 'c'", None, &b"c"[..]),
+        ("Tab, completion printed", named(NamedKey::Tab), b"cd/"),
+        ("Enter", named(NamedKey::Enter), b"\r\n"),
+        ("an arrow", named(NamedKey::ArrowLeft), b"\x1b[D"),
+    ] {
+        let mut app = raw_app(t0);
+        let at = type_echoed(&mut app, "ab", same, t0 + ms(100), ms(30), ms(5));
+        assert_eq!(key_times(&app, t0).len(), 2, "{arm}: 'ab' released");
+        let space = at + ms(30);
+        press(
+            &mut app,
+            pressed(Key::Named(NamedKey::Space), Modifiers::empty()),
+            space,
+        );
+        feed(&app, b" ");
+        app.redraw_window_at(WID, space + ms(5));
+        assert_eq!(
+            held_keys(&app.windows[&WID].aos),
+            1,
+            "{arm}: the echoed space waits"
+        );
+        let then = space + ms(30);
+        match next {
+            Some(ev) => press(&mut app, ev, then),
+            None => key(&mut app, 'c', then),
+        }
+        feed(&app, shown);
+        app.redraw_window_at(WID, then + ms(5));
+        if arm.starts_with("control") {
+            assert_eq!(
+                key_times(&app, t0).len(),
+                4,
+                "{arm}: the glyph proves the space before it"
+            );
+            assert!(status(&app).attached, "{arm}");
+            continue;
+        }
+        assert!(status(&app).attached, "{arm}: still waiting");
+        assert_eq!(
+            key_times(&app, t0).len(),
+            2,
+            "{arm}: the space is not logged"
+        );
+        app.redraw_window_at(WID, space + ECHO_PROOF_BOUND);
+        assert!(
+            !status(&app).attached,
+            "{arm}: refuted at the space's bound"
+        );
+        assert!(detached_for(&app, "raw_key"), "{arm}");
+    }
 }
 
 #[test]
@@ -748,16 +815,26 @@ fn an_attach_or_detach_while_a_key_waits_starts_the_next_glow_from_rest() {
     }
 }
 
-/// The claim-2 binding (`OnlyEchoedKeysLogged`): random GUI moves, each followed by the model
-/// admitting the projected step in at most two actions. The harness computes `echoed` from the
-/// bytes it fed, never from the code; `unproven` is a logged key the harness never echoed. The
-/// fixture is on the alternate screen, where Shift-Enter (`Bare`) carries no text: a press the log
-/// gains one key at, with nothing held, is the model's `Key`.
+/// The claim-2 binding (`OnlyEchoedKeysLogged`) and the person's grant (D12's
+/// `UnseenOnlyWithOptIn`, `MaskedKeyNeverLogged`, `OptInEndsWithItsAttach`): random GUI moves, each
+/// followed by the model admitting the projected step in the actions the harness names. The harness
+/// computes `echoed` and `masked` from the bytes it fed, never from the code; `unproven` is a key
+/// logged as seen that the harness never echoed, `unseen` keys logged unseen while the window held
+/// no grant, `exposed` keys logged from a hold the harness masked. The fixture is on the alternate
+/// screen, where Shift-Enter (`Bare`) carries no text: a press the log gains one key at, with
+/// nothing held, is the model's `Key`, and one typed while keys wait under the grant is held blind.
 mod claim2 {
     use super::*;
+    use crate::aos_host::FRONT_GROUP;
+    use crate::aos_host::echo::{UNSEEN_OVER_MASK, UNSEEN_WITHOUT_GRANT};
+    use aterm_effects::aos_momentum::KeyEcho;
+
+    /// The foreground group the fixture's session reports, and another program's.
+    const GROUP: i32 = 100;
+    const OTHER_GROUP: i32 = 200;
 
     /// One move of the walk.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Move {
         Type,
         Echo,
@@ -768,10 +845,15 @@ mod claim2 {
         Attach,
         Detach,
         Bare,
+        /// The person's yes for the live attach.
+        OptIn,
+        /// The grant's end before its attach's: the person's stop, or a raw key while another
+        /// program leads the tab, in turn.
+        Lapse,
     }
 
     /// The moves, weighted so a walk often gets as far as a proven pair.
-    const MOVES: [Move; 16] = [
+    const MOVES: [Move; 18] = [
         Move::Type,
         Move::Type,
         Move::Type,
@@ -788,12 +870,16 @@ mod claim2 {
         Move::Attach,
         Move::Detach,
         Move::Bare,
+        Move::OptIn,
+        Move::Lapse,
     ];
 
-    /// A key the harness saw held: its press, and whether the harness fed its echo in place.
+    /// A key the harness saw held: its press, whether the harness fed its echo in place, and
+    /// whether it was held blind (no cells).
     struct HeldKey {
         at: Instant,
         echoed: bool,
+        blind: bool,
     }
 
     struct Gui {
@@ -804,7 +890,12 @@ mod claim2 {
         pending: Vec<char>,
         /// A mask or newline was fed since the hold opened: later echoes are out of place.
         spoiled: bool,
+        /// A mask the harness fed shows where an unechoed held key should.
+        masked: i64,
         unproven: i64,
+        unseen: i64,
+        exposed: i64,
+        lapses: u64,
         rng: u64,
         next_char: usize,
     }
@@ -812,6 +903,7 @@ mod claim2 {
     impl Gui {
         fn new(seed: u64) -> Self {
             let t0 = Instant::now();
+            FRONT_GROUP.with(|g| g.set(Some(GROUP)));
             Self {
                 app: raw_alt_app(t0),
                 now: t0,
@@ -819,7 +911,11 @@ mod claim2 {
                 queue: Vec::new(),
                 pending: Vec::new(),
                 spoiled: false,
+                masked: 0,
                 unproven: 0,
+                unseen: 0,
+                exposed: 0,
+                lapses: 0,
                 rng: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
                 next_char: 0,
             }
@@ -836,12 +932,33 @@ mod claim2 {
             status(&self.app).attached
         }
 
-        fn keys_logged(&self) -> usize {
-            if self.attached() {
-                key_times(&self.app, self.epoch).len()
-            } else {
-                0
+        fn optin(&self) -> bool {
+            self.app.aos_unseen_on(WID)
+        }
+
+        /// The keys the live recording logged, and how many of them unseen.
+        fn keys_logged(&self) -> (usize, usize) {
+            if !self.attached() {
+                return (0, 0);
             }
+            let log = exported_log(&self.app, self.epoch);
+            let keys = log
+                .iter()
+                .filter(|e| matches!(e, MomentumEvent::Key { .. }))
+                .count();
+            let unseen = log
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        MomentumEvent::Key {
+                            echo: KeyEcho::Unseen,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            (keys, unseen)
         }
 
         fn project(&self) -> State {
@@ -853,7 +970,7 @@ mod claim2 {
                 "the host holds exactly while the window does"
             );
             assert_eq!(held, self.queue.len(), "the harness saw every hold");
-            let echoed = self.queue.iter().take_while(|k| k.echoed).count();
+            let echoed = self.echoed_prefix();
             let mut s = State::new();
             for (name, v) in [
                 ("att", i64::from(self.attached())),
@@ -864,42 +981,64 @@ mod claim2 {
                 ("unproven", self.unproven),
                 ("gap", 0),
                 ("dirty", 0),
+                ("optin", i64::from(self.optin())),
+                ("masked", self.masked),
+                ("unseen", self.unseen),
+                ("exposed", self.exposed),
             ] {
                 s.insert(name, v);
             }
             s
         }
 
+        /// The next char the walk types.
+        fn next(&mut self) -> char {
+            let c = ['a', 'b', 'c', 'a', 'd'][self.next_char % 5];
+            self.next_char += 1;
+            c
+        }
+
         /// Makes `m`'s GUI calls, reconciles the harness's queue with what the window did, and
-        /// names the model's actions for what the harness saw: a key held or refused, an echo it
-        /// fed in place, keys the log gained, a recording that stopped or started.
+        /// names the model's actions for what the harness saw: a key held or refused, an echo or
+        /// a mask it fed in place, keys the log gained (seen or unseen), a grant given or ended, a
+        /// recording that stopped or started.
         fn act(&mut self, m: Move) -> Vec<&'static str> {
             self.now += ms(7);
             let now = self.now;
             let was_attached = self.attached();
-            let logged_before = self.keys_logged();
+            let optin_before = self.optin();
+            let (logged_before, unseen_before) = self.keys_logged();
             let held_before = held_keys(&self.app.windows[&WID].aos);
             let echoed_before = self.echoed_prefix();
+            let blinded = self.queue.iter().any(|k| k.blind);
+            let mut seen = Vec::new();
+            let mut lapse_key = false;
+            let mut bare = false;
             match m {
                 Move::Type if was_attached && self.queue.len() >= 2 => {}
                 Move::Type => {
-                    let c = ['a', 'b', 'c', 'a', 'd'][self.next_char % 5];
-                    self.next_char += 1;
+                    let c = self.next();
                     key(&mut self.app, c, now);
                     self.pending.push(c);
                 }
+                Move::Echo if blinded => {}
                 Move::Echo => {
-                    let echoed = self.queue.iter().take_while(|k| k.echoed).count();
-                    if let Some(&c) = self.pending.get(echoed) {
+                    if let Some(&c) = self.pending.get(echoed_before) {
                         feed(&self.app, c.to_string().as_bytes());
                         if !self.spoiled {
-                            self.queue[echoed].echoed = true;
+                            self.queue[echoed_before].echoed = true;
                         }
                     }
                 }
+                Move::Mask if blinded => {}
                 Move::Mask => {
                     if !self.queue.is_empty() {
                         feed(&self.app, b"*");
+                        // In place, the '*' lands on the first unechoed key's cell.
+                        if !self.spoiled && self.masked == 0 && echoed_before < self.queue.len() {
+                            self.masked = 1;
+                            seen.push("Mask");
+                        }
                         self.spoiled = true;
                     }
                 }
@@ -927,24 +1066,53 @@ mod claim2 {
                         let _ = self.app.aos_detach_now(now).expect("detaches");
                     }
                 }
-                Move::Bare => press(&mut self.app, shift_enter(), now),
+                // Under the grant a held run takes blind keys too, up to the model's cap.
+                Move::Bare if optin_before && self.queue.len() >= 2 => {}
+                Move::Bare => {
+                    press(&mut self.app, shift_enter(), now);
+                    bare = true;
+                }
+                Move::OptIn => {
+                    if !optin_before && self.app.aos_grant_for_test(WID).is_ok() {
+                        seen.push("OptIn");
+                    }
+                }
+                Move::Lapse if !optin_before => {}
+                Move::Lapse => {
+                    self.lapses += 1;
+                    seen.push(if held_before > 0 { "Refute" } else { "Lapse" });
+                    if self.lapses % 2 == 1 {
+                        self.app.aos_unseen_stop(WID, now);
+                    } else {
+                        FRONT_GROUP.with(|g| g.set(Some(OTHER_GROUP)));
+                        let c = self.next();
+                        key(&mut self.app, c, now);
+                        self.pending.push(c);
+                        FRONT_GROUP.with(|g| g.set(Some(GROUP)));
+                        lapse_key = true;
+                    }
+                }
             }
             let held = held_keys(&self.app.windows[&WID].aos);
             let attached = self.attached();
-            let mut seen = Vec::new();
-            let typed = matches!(m, Move::Type) && self.pending.len() > self.queue.len();
-            let bare = matches!(m, Move::Bare);
+            let (logged, unseen) = self.keys_logged();
+            let typed =
+                (matches!(m, Move::Type) || lapse_key) && self.pending.len() > self.queue.len();
             // Logged at its own press: the log gained one key, with nothing held before or after.
             let at_press = (typed || bare)
                 && was_attached
                 && attached
                 && held_before == 0
                 && held == 0
-                && self.keys_logged() == logged_before + 1;
-            if typed && held == held_before + 1 {
+                && logged == logged_before + 1;
+            if (typed || bare) && held == held_before + 1 {
+                if bare {
+                    self.pending.push('\0');
+                }
                 self.queue.push(HeldKey {
                     at: now,
                     echoed: false,
+                    blind: bare,
                 });
                 seen.push("Hold");
             } else if at_press {
@@ -966,9 +1134,25 @@ mod claim2 {
                 seen.push("Echo");
             }
             if was_attached && attached && !matches!(m, Move::Attach) {
-                let released = self
-                    .keys_logged()
-                    .saturating_sub(logged_before + usize::from(at_press));
+                let gained_unseen = unseen.saturating_sub(unseen_before);
+                if gained_unseen > 0 {
+                    assert_eq!(
+                        gained_unseen,
+                        self.queue.len(),
+                        "an unseen release logs the whole hold"
+                    );
+                    if !optin_before {
+                        self.unseen = 1;
+                    }
+                    if self.masked == 1 {
+                        self.exposed = 1;
+                    }
+                    self.queue.clear();
+                    self.pending.clear();
+                    seen.push("Unproven");
+                }
+                let released =
+                    logged.saturating_sub(logged_before + usize::from(at_press) + gained_unseen);
                 for k in self.queue.drain(..released.min(self.queue.len())) {
                     if !k.echoed {
                         self.unproven = 1;
@@ -987,6 +1171,7 @@ mod claim2 {
                 self.queue.clear();
                 self.pending.clear();
                 self.spoiled = false;
+                self.masked = 0;
             }
             seen
         }
@@ -1004,14 +1189,14 @@ mod claim2 {
         steps.iter().all(|a| model.fire(a, &mut st)).then_some(st)
     }
 
-    /// Walks `seed`'s moves, checking that `model` takes each step the harness saw, by name, to the
-    /// window's projection; returns the actions taken.
-    fn walk(model: &Model, seed: u64, steps: usize) -> BTreeSet<&'static str> {
+    /// Walks `seed`'s moves drawn from `moves`, checking that `model` takes each step the harness
+    /// saw, by name, to the window's projection; returns the actions taken.
+    fn walk(model: &Model, seed: u64, steps: usize, moves: &[Move]) -> BTreeSet<&'static str> {
         let mut gui = Gui::new(seed);
         let mut st = gui.project();
         let mut fired = BTreeSet::new();
         for i in 0..steps {
-            let m = MOVES[gui.below(MOVES.len())];
+            let m = moves[gui.below(moves.len())];
             let seen = gui.act(m);
             let got = gui.project();
             assert_eq!(
@@ -1030,15 +1215,34 @@ mod claim2 {
         let model = aos_key_hold_model();
         let mut fired = BTreeSet::new();
         for seed in 1..=64 {
-            fired.extend(walk(&model, seed, 40));
+            fired.extend(walk(&model, seed, 40, &MOVES));
         }
         for action in [
-            "Attach", "Detach", "Key", "Private", "Hold", "Echo", "Release", "Refute",
+            "Attach", "Detach", "Key", "Private", "Hold", "Echo", "Release", "Refute", "OptIn",
+            "Lapse", "Mask", "Unproven",
         ] {
             assert!(
                 fired.contains(action),
                 "the walk took `{action}`: {fired:?}"
             );
+        }
+    }
+
+    /// Rule 4's binding: with no grant ever given, the walk never logs a key unseen and keeps the
+    /// old laws, every stop where it was.
+    #[test]
+    fn without_a_grant_the_window_keeps_the_proof_it_had() {
+        let model = aos_key_hold_model();
+        let ungranted: Vec<Move> = MOVES.into_iter().filter(|&m| m != Move::OptIn).collect();
+        let mut fired = BTreeSet::new();
+        for seed in 1..=64 {
+            fired.extend(walk(&model, seed, 40, &ungranted));
+        }
+        for action in ["OptIn", "Lapse", "Unproven"] {
+            assert!(!fired.contains(action), "{action}: {fired:?}");
+        }
+        for action in ["Hold", "Release", "Refute", "Mask"] {
+            assert!(fired.contains(action), "{action}: {fired:?}");
         }
     }
 
@@ -1091,5 +1295,105 @@ mod claim2 {
             "Buggy 5 takes it"
         );
         assert!(!mutant.check_invariant("OnlyEchoedKeysLogged", &got));
+    }
+
+    /// The healthy model refuses `steps` from `prev` to `got`, dial `dial`'s mutant takes them, and
+    /// its state breaks `law`.
+    fn only_the_mutant_takes(
+        dial: i64,
+        law: &str,
+        prev: &State,
+        steps: &[&'static str],
+        got: &State,
+    ) {
+        let model = aos_key_hold_model();
+        let mutant = interp::with_buggy(&model, dial);
+        assert_ne!(
+            take(&model, prev, steps).as_ref(),
+            Some(got),
+            "the healthy model refuses {steps:?} to {got:?}"
+        );
+        assert_eq!(
+            take(&mutant, prev, steps).as_ref(),
+            Some(got),
+            "Buggy {dial} takes {steps:?}"
+        );
+        assert!(!mutant.check_invariant(law, got), "Buggy {dial}: {law}");
+    }
+
+    #[test]
+    fn negative_control_an_unseen_release_without_a_grant() {
+        let mut gui = Gui::new(1);
+        UNSEEN_WITHOUT_GRANT.with(|on| on.set(true));
+        let held = gui.act(Move::Type);
+        let prev = gui.project();
+        let seen = gui.act(Move::Late);
+        UNSEEN_WITHOUT_GRANT.with(|on| on.set(false));
+        let got = gui.project();
+        assert_eq!(held, ["Hold"]);
+        assert_eq!(seen, ["Unproven"], "the log gained the key unseen");
+        assert_eq!((got["unseen"], got["optin"]), (1, 0), "with no grant");
+        only_the_mutant_takes(6, "UnseenOnlyWithOptIn", &prev, &seen, &got);
+
+        let mut gui = Gui::new(1);
+        assert_eq!(gui.act(Move::Type), ["Hold"]);
+        assert_eq!(
+            gui.act(Move::Late),
+            ["Refute"],
+            "negative control: the same keys without the mutant stop the recording"
+        );
+    }
+
+    #[test]
+    fn negative_control_an_unseen_release_over_a_mask() {
+        let mut gui = Gui::new(1);
+        assert_eq!(gui.act(Move::OptIn), ["OptIn"]);
+        assert_eq!(gui.act(Move::Type), ["Hold"]);
+        assert_eq!(gui.act(Move::Mask), ["Mask"]);
+        let prev = gui.project();
+        UNSEEN_OVER_MASK.with(|on| on.set(true));
+        let seen = gui.act(Move::Frame);
+        UNSEEN_OVER_MASK.with(|on| on.set(false));
+        let got = gui.project();
+        assert_eq!(seen, ["Unproven"], "the masked key was logged unseen");
+        assert_eq!(got["exposed"], 1);
+        only_the_mutant_takes(7, "MaskedKeyNeverLogged", &prev, &seen, &got);
+
+        let mut gui = Gui::new(1);
+        for (m, want) in [
+            (Move::OptIn, "OptIn"),
+            (Move::Type, "Hold"),
+            (Move::Mask, "Mask"),
+        ] {
+            assert_eq!(gui.act(m), [want]);
+        }
+        assert_eq!(
+            gui.act(Move::Frame),
+            ["Refute"],
+            "negative control: the healthy grant stops at the mask"
+        );
+    }
+
+    #[test]
+    fn negative_control_a_grant_that_outlives_its_attach() {
+        let mut gui = Gui::new(1);
+        assert_eq!(gui.act(Move::OptIn), ["OptIn"]);
+        let prev = gui.project();
+        crate::aos_host::GRANT_OUTLIVES_ATTACH.with(|on| on.set(true));
+        let seen = gui.act(Move::Detach);
+        let got = gui.project();
+        crate::aos_host::GRANT_OUTLIVES_ATTACH.with(|on| on.set(false));
+        assert_eq!(seen, ["Detach"]);
+        assert_eq!((got["att"], got["optin"]), (0, 1), "the grant outlived it");
+        only_the_mutant_takes(8, "OptInEndsWithItsAttach", &prev, &seen, &got);
+
+        let mut gui = Gui::new(1);
+        assert_eq!(gui.act(Move::OptIn), ["OptIn"]);
+        assert_eq!(gui.act(Move::Detach), ["Detach"]);
+        assert_eq!(
+            gui.project()["optin"],
+            0,
+            "negative control: a healthy detach ends the grant"
+        );
     }
 }

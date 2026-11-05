@@ -727,8 +727,15 @@ fn a_removed_mac_naming_another_listed_founders_recipient_does_not_block_its_cha
     }
 }
 
+/// One-mesh M3 and M5: only a `Remove` revokes. Admin A mints epoch 2 wrapped to A and B but
+/// not to unproved founder L while B, concurrently, seats L on its possession proof. After the
+/// heal L is a current seat that epoch 2 omits: still left out until a holder wraps it (the
+/// `left_out` predicates stay), and a wrap gap a holder closes, never a revocation.
+///
+/// NEGATIVE CONTROL: with `OLD_GAP_RULE` on (0.154.0's rule, an omitted seat the minter knew is
+/// revoked) L is no gap and `wrap_gaps` names nobody, which this test asserts too.
 #[test]
-fn a_listed_founder_revoked_by_epoch_rotation_is_not_rewrapped_after_concurrent_challenge() {
+fn a_listed_founder_omitted_by_an_epoch_rotation_is_rewrapped_after_concurrent_challenge() {
     use crate::membership_log::EpochAudience;
     use crate::text::Audience;
 
@@ -798,8 +805,7 @@ fn a_listed_founder_revoked_by_epoch_rotation_is_not_rewrapped_after_concurrent_
         .unwrap();
     side_b.insert(admit_l).unwrap();
 
-    // After healing, L's concurrent `Evidence::Listed` challenge must not override epoch 2's
-    // revocation or cause `wrap_gaps` to re-wrap epoch 2 to L.
+    // After healing, L holds a seat no `Remove` names, so epoch 2's omission of it is a gap.
     let mut healed = side_a;
     healed.merge(&side_b).unwrap();
     let opened = healed
@@ -809,12 +815,30 @@ fn a_listed_founder_revoked_by_epoch_rotation_is_not_rewrapped_after_concurrent_
     assert!(healed.audience_left_out_recipient(&EpochAudience::Everyone, &L.recipient()));
     assert!(healed.audience_left_out(&EpochAudience::Everyone, &L.id()));
     assert!(healed.left_out(&opened, &EpochAudience::Everyone, &L.id()));
-    assert!(!healed.is_wrap_gap(&opened, &epoch2_id, &L.id()));
     assert!(
         healed
-            .wrap_gaps(&opened, &[EpochAudience::Everyone])
-            .iter()
-            .all(|gap| gap.member != L.id() && gap.recipient != L.recipient()),
-        "revoked listed founder L must not receive epoch 2 via wrap_gaps"
+            .current_recipients(&EpochAudience::Everyone)
+            .contains(&L.recipient()),
+        "L holds a current seat"
+    );
+    assert!(healed.is_wrap_gap(&opened, &epoch2_id, &L.id()));
+    let gaps = healed.wrap_gaps(&opened, &[crate::membership_log::SeatAudience::Everyone]);
+    assert_eq!(
+        gaps.iter()
+            .map(|gap| (gap.epoch, gap.member, gap.recipient))
+            .collect::<Vec<_>>(),
+        vec![(epoch2_id, L.id(), L.recipient())],
+        "a holder closes epoch 2's gap to L, and only that"
+    );
+
+    // NEGATIVE CONTROL: 0.154.0's rule read the omission as a revocation.
+    crate::membership_log::admission::OLD_GAP_RULE.with(|on| on.set(true));
+    let old_gap = healed.is_wrap_gap(&opened, &epoch2_id, &L.id());
+    let old_gaps = healed.wrap_gaps(&opened, &[crate::membership_log::SeatAudience::Everyone]);
+    crate::membership_log::admission::OLD_GAP_RULE.with(|on| on.set(false));
+    assert!(!old_gap, "the old rule reads L as revoked");
+    assert!(
+        old_gaps.is_empty(),
+        "the old rule closes no gap: {old_gaps:?}"
     );
 }

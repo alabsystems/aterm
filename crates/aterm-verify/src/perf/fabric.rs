@@ -16,14 +16,14 @@ use super::{LaneRun, workspace_root};
 /// `crate::toolchain` is shared with atpkg: the lane refuses exactly what the
 /// bench would — before the build, as a usage error, never as a red lane after
 /// one — and no bound (`BURST_MAX`, `ATTACH_MAX`, the rising list) is kept in
-/// two places to drift.
+/// two places to drift. The `fabric-counts` lane composes its worlds in it too.
 #[path = "../../../aterm/tests/fabric_bench/spec.rs"]
 #[expect(
     dead_code,
-    reason = "the lane validates with `parse`; the knobs a run reads back and `from_env` are the \
+    reason = "the lanes validate with `parse`; the knobs a run reads back and `from_env` are the \
               bench's"
 )]
-mod bench_spec;
+pub(super) mod bench_spec;
 
 use bench_build::bench_profile::Profile;
 
@@ -36,6 +36,9 @@ pub(crate) struct Arm {
     /// Whether the arm's logs are sealed at rest (`--at-rest`), as a fabric root's are: on unless
     /// a run names it off.
     pub at_rest: bool,
+    /// Where the arm's brokers run (`--broker-process`): in the bench's process unless a run
+    /// names the shipped job's band (`background`) or an `Interactive` job's (`interactive`).
+    pub broker_process: bench_spec::BrokerProcess,
 }
 
 impl Arm {
@@ -46,6 +49,7 @@ impl Arm {
             horizon_ms: (tier == bench_spec::Tier::Ordered)
                 .then_some(bench_spec::ORDERED_HORIZON_MS),
             at_rest: true,
+            broker_process: bench_spec::BrokerProcess::Inproc,
         }
     }
 
@@ -57,6 +61,9 @@ impl Arm {
         if !self.at_rest {
             words.push("at_rest=off".to_string());
         }
+        if self.broker_process.outside() {
+            words.push(format!("broker_process={}", self.broker_process.word()));
+        }
         words
     }
 
@@ -67,6 +74,9 @@ impl Arm {
         }
         if !self.at_rest {
             flags.push_str(" --at-rest off");
+        }
+        if self.broker_process.outside() {
+            flags.push_str(&format!(" --broker-process {}", self.broker_process.word()));
         }
         flags
     }
@@ -92,6 +102,8 @@ pub(crate) struct Args {
     pub profile: Profile,
     /// Broker log retention override (`--retention on|off`).
     pub retention: Option<bool>,
+    /// Broker rate limit override (`--rate-limit on|off`).
+    pub rate_limit: Option<bool>,
     /// Bridge bus mirror mode (`--log auto|off`).
     pub log: Option<bench_spec::Log>,
     /// Retaining broker tick interval override in milliseconds (`--retention-interval-ms`).
@@ -137,6 +149,7 @@ impl Args {
         let mut tiers: Vec<bench_spec::Tier> = Vec::new();
         let mut horizons: Vec<u64> = Vec::new();
         let mut at_rest: Vec<bool> = Vec::new();
+        let mut processes: Vec<bench_spec::BrokerProcess> = Vec::new();
         for (flag, raw) in options {
             match *flag {
                 "--at-rest" => {
@@ -148,6 +161,19 @@ impl Args {
                             _ => Err(format!(
                                 "`--at-rest` takes on or off, comma-separated, not `{raw}`"
                             )),
+                        })
+                        .collect::<Result<_, _>>()?;
+                }
+                "--broker-process" => {
+                    processes = raw
+                        .split(',')
+                        .map(|word| {
+                            bench_spec::BrokerProcess::parse(word).map_err(|_| {
+                                format!(
+                                    "`--broker-process` takes inproc, background or \
+                                     interactive, comma-separated, not `{raw}`"
+                                )
+                            })
                         })
                         .collect::<Result<_, _>>()?;
                 }
@@ -211,6 +237,15 @@ impl Args {
                         "off" => false,
                         _ => {
                             return Err(format!("`--retention` takes on or off, not `{raw}`"));
+                        }
+                    });
+                }
+                "--rate-limit" => {
+                    a.rate_limit = Some(match raw.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            return Err(format!("`--rate-limit` takes on or off, not `{raw}`"));
                         }
                     });
                 }
@@ -288,17 +323,20 @@ impl Args {
                         tier,
                         horizon_ms: Some(ms),
                         at_rest: true,
+                        broker_process: bench_spec::BrokerProcess::Inproc,
                     }));
                 }
                 bench_spec::Tier::Ordered => a.arms.push(Arm {
                     tier,
                     horizon_ms: Some(bench_spec::ORDERED_HORIZON_MS),
                     at_rest: true,
+                    broker_process: bench_spec::BrokerProcess::Inproc,
                 }),
                 _ => a.arms.push(Arm {
                     tier,
                     horizon_ms: None,
                     at_rest: true,
+                    broker_process: bench_spec::BrokerProcess::Inproc,
                 }),
             }
         }
@@ -313,8 +351,24 @@ impl Args {
                 .flat_map(|arm| at_rest.iter().map(move |&at_rest| Arm { at_rest, ..arm }))
                 .collect();
         }
+        if !processes.is_empty() {
+            let arms = if a.arms.is_empty() {
+                vec![Arm::shipped()]
+            } else {
+                std::mem::take(&mut a.arms)
+            };
+            a.arms = arms
+                .into_iter()
+                .flat_map(|arm| {
+                    processes.iter().map(move |&broker_process| Arm {
+                        broker_process,
+                        ..arm
+                    })
+                })
+                .collect();
+        }
         for arm in a.plan() {
-            bench_spec::parse(&a.bench_words(Path::new("/scratch"), arm))
+            bench_spec::parse(&a.bench_words(arm), Path::new("/scratch"))
                 .map_err(|why| format!("the fabric bench refuses this run: {why}"))?;
         }
         if a.json_out.is_some() && a.plan().len() > 1 {
@@ -345,9 +399,9 @@ impl Args {
             .collect()
     }
 
-    /// Format the `FABRIC_BENCH` environment string for `arm` writing to `out`.
-    pub(crate) fn bench_words(&self, out: &Path, arm: Arm) -> String {
-        let mut words = vec![format!("out={}", out.display())];
+    /// Format the `FABRIC_BENCH` measurement knobs for `arm`.
+    pub(crate) fn bench_words(&self, arm: Arm) -> String {
+        let mut words = Vec::new();
         if self.scenario != bench_spec::Scenario::All {
             words.push(format!("scenario={}", self.scenario.word()));
         }
@@ -369,6 +423,9 @@ impl Args {
         }
         if let Some(on) = self.retention {
             words.push(format!("retention={}", if on { "on" } else { "off" }));
+        }
+        if let Some(on) = self.rate_limit {
+            words.push(format!("rate_limit={}", if on { "on" } else { "off" }));
         }
         if let Some(log) = self.log {
             words.push(format!("log={}", log.word()));
@@ -429,6 +486,9 @@ impl Args {
         if let Some(on) = self.retention {
             line.push_str(&format!(" --retention {}", if on { "on" } else { "off" }));
         }
+        if let Some(on) = self.rate_limit {
+            line.push_str(&format!(" --rate-limit {}", if on { "on" } else { "off" }));
+        }
         if let Some(log) = self.log {
             line.push_str(&format!(" --log {}", log.word()));
         }
@@ -475,7 +535,6 @@ impl Args {
     }
 }
 
-const BENCH_ENV: &str = "FABRIC_BENCH";
 const PROGRESS: &str = "fabric bench:";
 
 /// Run the `fabric` performance lane.
@@ -526,14 +585,15 @@ fn run_arm(
         .prefix("aterm-fabric-")
         .tempdir()
         .map_err(|e| format!("could not make a scratch directory: {e}"))?;
-    let words = args.bench_words(scratch.path(), arm);
+    let words = args.bench_words(arm);
     bench_build::run_bench(
         targo,
         &args.build_args(),
-        BENCH_ENV,
-        &words,
+        (bench_spec::ENV, &words),
+        (bench_spec::OUT_ENV, scratch.path()),
         PROGRESS,
         "the fabric bench",
+        bench_build::Entry::Timed,
     )?;
     let read = |name: &str| {
         let path = scratch.path().join(name);
@@ -565,7 +625,7 @@ fn run_arm(
 
     let date = super::trend::utc_date();
     let header = Provenance {
-        heading: &heading(args.scenario),
+        heading: &heading(args.scenario, arm.broker_process),
         protocol: "docs/measured/fabric/README.md",
         date: &date,
         machine: &arena::chip(),
@@ -592,9 +652,9 @@ fn run_arm(
     }
     .render();
     let (md_path, json_path) = ledger_paths(ledger_dir, &date, "fabric");
-    std::fs::write(&md_path, format!("{header}\n{tables}\n"))
+    crate::write_fresh(&md_path, format!("{header}\n{tables}\n"))
         .map_err(|e| format!("could not write {}: {e}", md_path.display()))?;
-    std::fs::write(&json_path, &json)
+    crate::write_fresh(&json_path, &json)
         .map_err(|e| format!("could not write {}: {e}", json_path.display()))?;
     eprintln!(
         "ledger entry written: {} (+ {}) — commit both to record the run",
@@ -602,27 +662,60 @@ fn run_arm(
         json_path.display()
     );
     if let Some(out) = &args.json_out {
-        std::fs::write(out, &json)
+        crate::write_fresh(out, &json)
             .map_err(|e| format!("could not write {}: {e}", out.display()))?;
         eprintln!("json written: {}", out.display());
     }
     Ok(md_path)
 }
 
-/// An entry's title: the scenarios it measured.
-fn heading(scenario: bench_spec::Scenario) -> String {
-    let scenarios = match scenario {
-        bench_spec::Scenario::All => {
+/// An entry's title: the scenarios it measured, and the broker's process when it ran in one of
+/// its own, whose `all` is the messaging world without its burst, the ping-pong and the attach
+/// (`run/outside.rs`).
+fn heading(scenario: bench_spec::Scenario, process: bench_spec::BrokerProcess) -> String {
+    let scenarios = match (scenario, process.outside()) {
+        (bench_spec::Scenario::All, false) => {
             "post -> deliver, burst, ping-pong, attach, handoff, ask, cross-node"
         }
-        selected => selected.word(),
+        (bench_spec::Scenario::All, true) => "post -> deliver, ping-pong, attach",
+        (selected, _) => selected.word(),
     };
-    format!("Fabric: {scenarios}")
+    if process.outside() {
+        format!(
+            "Fabric: {scenarios}, on `aterm link broker` as {}",
+            process.runs_as()
+        )
+    } else {
+        format!("Fabric: {scenarios}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_output_path_round_trip(out: PathBuf) {
+        let args = Args::default();
+        let plain = Path::new("/scratch/plain");
+        let control = bench_spec::parse(&args.bench_words(Arm::shipped()), plain).unwrap();
+        assert_eq!(control.out, plain);
+        let decoded = bench_spec::parse(&args.bench_words(Arm::shipped()), &out).unwrap();
+        assert_eq!(decoded.out, out);
+    }
+
+    #[test]
+    fn output_path_with_spaces_round_trips() {
+        assert_output_path_round_trip(PathBuf::from("/scratch/with spaces"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_path_with_non_utf8_bytes_round_trips() {
+        use std::os::unix::ffi::OsStringExt as _;
+        assert_output_path_round_trip(
+            std::ffi::OsString::from_vec(b"/scratch/non-utf8-\xff".to_vec()).into(),
+        );
+    }
 
     #[test]
     fn options_become_the_bench_words_and_bad_values_are_refused() {
@@ -638,6 +731,7 @@ mod tests {
             tier: bench_spec::Tier::Ordered,
             horizon_ms: Some(bench_spec::ORDERED_HORIZON_MS),
             at_rest: true,
+            broker_process: bench_spec::BrokerProcess::Inproc,
         };
         assert_eq!(
             a.plan(),
@@ -645,8 +739,8 @@ mod tests {
             "aterm's default for its guarded broker"
         );
         assert_eq!(
-            a.bench_words(Path::new("/s"), shipped),
-            "out=/s samples=50 attach=1,4,16 durability=ordered horizon_ms=100"
+            a.bench_words(shipped),
+            "samples=50 attach=1,4,16 durability=ordered horizon_ms=100"
         );
         assert_eq!(
             a.command_line(shipped),
@@ -659,11 +753,12 @@ mod tests {
             tier: bench_spec::Tier::Relaxed,
             horizon_ms: None,
             at_rest: true,
+            broker_process: bench_spec::BrokerProcess::Inproc,
         };
         assert_eq!(a.plan(), [relaxed]);
         assert_eq!(
-            a.bench_words(Path::new("/s"), relaxed),
-            "out=/s samples=50 attach=1,4,16 durability=relaxed"
+            a.bench_words(relaxed),
+            "samples=50 attach=1,4,16 durability=relaxed"
         );
         assert!(
             a.command_line(relaxed).ends_with(" --durability relaxed"),
@@ -674,8 +769,8 @@ mod tests {
         let a = Args::from_options(&o).expect("parses");
         assert_eq!(a.pingpong, Some(40));
         assert_eq!(
-            a.bench_words(Path::new("/s"), relaxed),
-            "out=/s samples=50 pingpong=40 attach=1,4,16 durability=relaxed"
+            a.bench_words(relaxed),
+            "samples=50 pingpong=40 attach=1,4,16 durability=relaxed"
         );
         assert!(
             a.command_line(relaxed).contains(" --pingpong-rounds 40 "),
@@ -685,21 +780,18 @@ mod tests {
         assert_eq!(
             Args::from_options(&BTreeMap::new())
                 .expect("parses")
-                .bench_words(Path::new("/s"), shipped),
-            "out=/s durability=ordered horizon_ms=100"
+                .bench_words(shipped),
+            "durability=ordered horizon_ms=100"
         );
         for word in ["all", "messaging", "pingpong", "attach", "handoff", "ask"] {
             let mut selected = BTreeMap::new();
             selected.insert("--scenario", word.to_string());
             let a = Args::from_options(&selected).expect(word);
             let spec =
-                bench_spec::parse(&a.bench_words(Path::new("/s"), shipped)).expect("bench words");
+                bench_spec::parse(&a.bench_words(shipped), Path::new("/s")).expect("bench words");
             assert_eq!(spec.scenario.word(), word);
             if word == "all" {
-                assert_eq!(
-                    a.bench_words(Path::new("/s"), shipped),
-                    "out=/s durability=ordered horizon_ms=100"
-                );
+                assert_eq!(a.bench_words(shipped), "durability=ordered horizon_ms=100");
                 assert!(!a.command_line(shipped).contains("--scenario"));
             } else {
                 assert!(
@@ -753,8 +845,8 @@ mod tests {
             (Some(true), Some(bench_spec::Log::Off))
         );
         assert_eq!(
-            a.bench_words(Path::new("/s"), shipped),
-            "out=/s retention=on log=off durability=ordered horizon_ms=100"
+            a.bench_words(shipped),
+            "retention=on log=off durability=ordered horizon_ms=100"
         );
         assert_eq!(
             a.command_line(shipped),
@@ -765,8 +857,8 @@ mod tests {
         o.insert("--retention-interval-ms", "1000".to_string());
         let a = Args::from_options(&o).expect("parses");
         assert_eq!(
-            a.bench_words(Path::new("/s"), shipped),
-            "out=/s retention_interval_ms=1000 durability=ordered horizon_ms=100"
+            a.bench_words(shipped),
+            "retention_interval_ms=1000 durability=ordered horizon_ms=100"
         );
         assert!(
             a.command_line(shipped)
@@ -787,6 +879,34 @@ mod tests {
         }
     }
 
+    /// `--rate-limit off` reaches the bench as `rate_limit=off` and the ledger as the flag that
+    /// reproduces it (critic item E06); a word other than on or off is refused.
+    #[test]
+    fn the_rate_limit_reaches_the_bench_and_the_ledger() {
+        let shipped = Arm::shipped();
+        let mut o = BTreeMap::new();
+        o.insert("--rate-limit", "off".to_string());
+        let a = Args::from_options(&o).expect("parses");
+        assert_eq!(a.rate_limit, Some(false));
+        assert_eq!(
+            a.bench_words(shipped),
+            "rate_limit=off durability=ordered horizon_ms=100"
+        );
+        assert_eq!(
+            a.command_line(shipped),
+            "targo --unverified verify perf fabric --rate-limit off --durability ordered \
+             --horizon-ms 100"
+        );
+        assert!(
+            bench_spec::parse(&a.bench_words(shipped), Path::new("/scratch"))
+                .is_ok_and(|spec| !spec.rate_limit),
+            "the bench reads the word back"
+        );
+        let mut o = BTreeMap::new();
+        o.insert("--rate-limit", "yes".to_string());
+        assert!(Args::from_options(&o).is_err());
+    }
+
     /// `--at-rest off,on --passes 2` is an A B B A set, each arm reproducible alone, and a plain run
     /// measures what ships: a sealed log.
     #[test]
@@ -799,17 +919,16 @@ mod tests {
         let sealed: Vec<bool> = plan.iter().map(|arm| arm.at_rest).collect();
         assert_eq!(sealed, [false, true, true, false]);
         assert!(
-            a.bench_words(Path::new("/s"), plan[0])
-                .ends_with("at_rest=off"),
+            a.bench_words(plan[0]).ends_with("at_rest=off"),
             "{}",
-            a.bench_words(Path::new("/s"), plan[0])
+            a.bench_words(plan[0])
         );
-        assert!(!a.bench_words(Path::new("/s"), plan[1]).contains("at_rest"));
+        assert!(!a.bench_words(plan[1]).contains("at_rest"));
         assert!(a.command_line(plan[0]).ends_with(" --at-rest off"));
         assert!(!a.command_line(plan[1]).contains("--at-rest"));
         let bare = Args::from_options(&BTreeMap::new()).expect("bare");
         assert!(bare.plan()[0].at_rest, "a bare run measures what ships");
-        let spec = bench_spec::parse(&bare.bench_words(Path::new("/s"), bare.plan()[0]))
+        let spec = bench_spec::parse(&bare.bench_words(bare.plan()[0]), Path::new("/s"))
             .expect("the bench reads it");
         assert!(spec.at_rest, "and the bench is told so");
         let mut o = BTreeMap::new();
@@ -821,6 +940,84 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_broker_process_arms_reach_the_bench_and_the_ledger() {
+        use bench_spec::BrokerProcess;
+        let mut o = BTreeMap::new();
+        o.insert("--broker-process", "background,interactive".to_string());
+        o.insert("--passes", "2".to_string());
+        o.insert("--attach-sessions", "8,32".to_string());
+        let a = Args::from_options(&o).expect("parses");
+        let plan = a.plan();
+        let processes: Vec<BrokerProcess> = plan.iter().map(|arm| arm.broker_process).collect();
+        assert_eq!(
+            processes,
+            [
+                BrokerProcess::Background,
+                BrokerProcess::Interactive,
+                BrokerProcess::Interactive,
+                BrokerProcess::Background
+            ],
+            "one invocation is an A B B A set"
+        );
+        assert_eq!(
+            a.bench_words(plan[0]),
+            "attach=8,32 durability=ordered horizon_ms=100 broker_process=background"
+        );
+        assert!(
+            a.command_line(plan[1])
+                .ends_with(" --durability ordered --horizon-ms 100 --broker-process interactive"),
+            "{}",
+            a.command_line(plan[1])
+        );
+        for arm in &plan {
+            let spec = bench_spec::parse(&a.bench_words(*arm), Path::new("/s"))
+                .expect("the bench reads it");
+            assert_eq!(
+                spec.broker_process, arm.broker_process,
+                "and the bench is told so"
+            );
+            // The entry's title names only the worlds `run/outside.rs` measures, and the arm.
+            let title = heading(a.scenario, arm.broker_process);
+            assert!(
+                ["burst", "handoff", "ask", "cross-node"]
+                    .iter()
+                    .all(|world| !title.contains(world))
+                    && title.contains(arm.broker_process.word()),
+                "{title}"
+            );
+        }
+        assert!(
+            heading(bench_spec::Scenario::All, BrokerProcess::Inproc).contains("burst"),
+            "the in-process arm's `all` measures every world"
+        );
+        let bare = Args::from_options(&BTreeMap::new()).expect("bare");
+        assert_eq!(bare.plan()[0].broker_process, BrokerProcess::Inproc);
+        assert!(!bare.bench_words(bare.plan()[0]).contains("broker_process"));
+        assert!(
+            !bare
+                .command_line(bare.plan()[0])
+                .contains("--broker-process")
+        );
+        let mut o = BTreeMap::new();
+        o.insert("--broker-process", "launchd".to_string());
+        assert!(
+            Args::from_options(&o)
+                .unwrap_err()
+                .contains("`--broker-process` takes inproc, background or interactive")
+        );
+        let mut o = BTreeMap::new();
+        o.insert("--broker-process", "background".to_string());
+        o.insert("--scenario", "ask".to_string());
+        assert!(
+            Args::from_options(&o)
+                .unwrap_err()
+                .contains("the fabric bench refuses this run"),
+            "the bench's own refusal comes before the build"
+        );
+    }
+
     #[test]
     fn the_bystanders_reach_the_bench_and_the_ledger() {
         let shipped = Arm::shipped();
@@ -829,8 +1026,8 @@ mod tests {
             o.insert("--bystanders", n.to_string());
             let a = Args::from_options(&o).expect("parses");
             assert_eq!(
-                a.bench_words(Path::new("/s"), shipped),
-                format!("out=/s bystanders={n} durability=ordered horizon_ms=100")
+                a.bench_words(shipped),
+                format!("bystanders={n} durability=ordered horizon_ms=100")
             );
             assert!(
                 a.command_line(shipped)
@@ -840,10 +1037,7 @@ mod tests {
             );
         }
         let a = Args::from_options(&BTreeMap::new()).expect("bare");
-        assert!(
-            !a.bench_words(Path::new("/s"), shipped)
-                .contains("bystanders")
-        );
+        assert!(!a.bench_words(shipped).contains("bystanders"));
         for bad in ["-1", "many", "999"] {
             let mut o = BTreeMap::new();
             o.insert("--bystanders", bad.to_string());
@@ -863,8 +1057,8 @@ mod tests {
             o.insert("--scenario", "attach".to_string());
             let a = Args::from_options(&o).expect("parses");
             assert_eq!(
-                a.bench_words(Path::new("/s"), shipped),
-                format!("out=/s scenario=attach backlog={n} durability=ordered horizon_ms=100")
+                a.bench_words(shipped),
+                format!("scenario=attach backlog={n} durability=ordered horizon_ms=100")
             );
             assert!(
                 a.command_line(shipped)
@@ -874,7 +1068,7 @@ mod tests {
             );
         }
         let a = Args::from_options(&BTreeMap::new()).expect("bare");
-        assert!(!a.bench_words(Path::new("/s"), shipped).contains("backlog"));
+        assert!(!a.bench_words(shipped).contains("backlog"));
         for (scenario, bad) in [
             ("attach", "-1"),
             ("attach", "many"),
@@ -901,8 +1095,8 @@ mod tests {
             o.insert("--scenario", "ask".to_string());
             let a = Args::from_options(&o).expect("parses");
             assert_eq!(
-                a.bench_words(Path::new("/s"), shipped),
-                format!("out=/s scenario=ask asked_prefill={n} durability=ordered horizon_ms=100")
+                a.bench_words(shipped),
+                format!("scenario=ask asked_prefill={n} durability=ordered horizon_ms=100")
             );
             assert!(
                 a.command_line(shipped)
@@ -912,10 +1106,7 @@ mod tests {
             );
         }
         let a = Args::from_options(&BTreeMap::new()).expect("bare");
-        assert!(
-            !a.bench_words(Path::new("/s"), shipped)
-                .contains("asked_prefill")
-        );
+        assert!(!a.bench_words(shipped).contains("asked_prefill"));
         for (scenario, bad) in [
             ("ask", "-1"),
             ("ask", "+5"),
@@ -942,10 +1133,8 @@ mod tests {
             o.insert("--scenario", "messaging".to_string());
             let a = Args::from_options(&o).expect("parses");
             assert_eq!(
-                a.bench_words(Path::new("/s"), shipped),
-                format!(
-                    "out=/s scenario=messaging paced_notes={n} durability=ordered horizon_ms=100"
-                )
+                a.bench_words(shipped),
+                format!("scenario=messaging paced_notes={n} durability=ordered horizon_ms=100")
             );
             assert!(
                 a.command_line(shipped)
@@ -955,10 +1144,7 @@ mod tests {
             );
         }
         let a = Args::from_options(&BTreeMap::new()).expect("bare");
-        assert!(
-            !a.bench_words(Path::new("/s"), shipped)
-                .contains("paced_notes")
-        );
+        assert!(!a.bench_words(shipped).contains("paced_notes"));
         for (scenario, bad) in [
             ("messaging", "-1"),
             ("messaging", "many"),
@@ -982,9 +1168,9 @@ mod tests {
         o.insert("--tally", String::new());
         o.insert("--scenario", "attach".to_string());
         let a = Args::from_options(&o).expect("parses");
-        let words = a.bench_words(Path::new("/s"), shipped);
+        let words = a.bench_words(shipped);
         assert!(
-            bench_spec::parse(&words)
+            bench_spec::parse(&words, Path::new("/s"))
                 .expect("the bench reads them")
                 .tally
         );
@@ -994,8 +1180,12 @@ mod tests {
             "{line}"
         );
         let bare = Args::from_options(&BTreeMap::new()).expect("bare");
-        let words = bare.bench_words(Path::new("/s"), shipped);
-        assert!(!bench_spec::parse(&words).expect("bare words").tally);
+        let words = bare.bench_words(shipped);
+        assert!(
+            !bench_spec::parse(&words, Path::new("/s"))
+                .expect("bare words")
+                .tally
+        );
         assert!(
             !bare
                 .command_line(shipped)
@@ -1016,12 +1206,12 @@ mod tests {
         o.insert("--asks", "40".to_string());
         o.insert("--mix-every", "5".to_string());
         let a = Args::from_options(&o).expect("parses");
-        let words = a.bench_words(Path::new("/s"), shipped);
+        let words = a.bench_words(shipped);
         assert_eq!(
             words,
-            "out=/s scenario=ask asks=40 mix_every=5 durability=ordered horizon_ms=100"
+            "scenario=ask asks=40 mix_every=5 durability=ordered horizon_ms=100"
         );
-        let spec = bench_spec::parse(&words).expect("the bench reads them");
+        let spec = bench_spec::parse(&words, Path::new("/s")).expect("the bench reads them");
         assert_eq!((spec.asks, spec.mix_every), (40, 5));
         let line = a.command_line(shipped);
         assert!(
@@ -1029,7 +1219,7 @@ mod tests {
             "{line}"
         );
         let bare = Args::from_options(&BTreeMap::new()).expect("bare");
-        assert!(!bare.bench_words(Path::new("/s"), shipped).contains("asks"));
+        assert!(!bare.bench_words(shipped).contains("asks"));
         for (flag, bad) in [("--asks", "0"), ("--asks", "x"), ("--mix-every", "0")] {
             let mut o = BTreeMap::new();
             o.insert(flag, bad.to_string());
@@ -1044,6 +1234,7 @@ mod tests {
             tier,
             horizon_ms,
             at_rest: true,
+            broker_process: bench_spec::BrokerProcess::Inproc,
         };
         let mut o = BTreeMap::new();
         o.insert("--durability", "strict,ordered,relaxed".to_string());
@@ -1056,10 +1247,7 @@ mod tests {
             arm(Tier::Relaxed, None),
         );
         assert_eq!(a.plan(), [s, o1, o2, r]);
-        assert_eq!(
-            a.bench_words(Path::new("/s"), o2),
-            "out=/s durability=ordered horizon_ms=100"
-        );
+        assert_eq!(a.bench_words(o2), "durability=ordered horizon_ms=100");
         assert_eq!(
             a.command_line(o2),
             "targo --unverified verify perf fabric --durability ordered --horizon-ms 100"
@@ -1131,8 +1319,8 @@ mod tests {
              --horizon-ms 100"
         );
         assert_eq!(
-            opt.bench_words(Path::new("/s"), Arm::shipped()),
-            "out=/s burst=150 durability=ordered horizon_ms=100"
+            opt.bench_words(Arm::shipped()),
+            "burst=150 durability=ordered horizon_ms=100"
         );
 
         let mut o = BTreeMap::new();

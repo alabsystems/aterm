@@ -182,6 +182,7 @@ fn snapshot(
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(into)?;
     let mut sha = aterm_digest::Sha256::new();
     let mut copied = 0_u64;

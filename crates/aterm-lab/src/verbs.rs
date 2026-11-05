@@ -121,7 +121,11 @@ pub fn custom_mode_name(m: &str) -> Result<String, Fail> {
     Ok(name)
 }
 
-fn allow_sleep(run: &Run) -> Result<(), Fail> {
+/// Allow `Bash(sleep …)` in the scratch settings, so a `bg` mode's background `sleep` runs with
+/// no permission box.
+/// # Errors
+/// The settings could not be read or written.
+pub(crate) fn allow_sleep(run: &Run) -> Result<(), Fail> {
     let p = run.settings();
     let text = read_scratch(&p)?;
     let mut d = J::parse(&text).map_err(Fail::die)?;
@@ -1107,7 +1111,7 @@ pub fn record_launch(run: &Run, sid: &str, launcher: &str) -> Result<(), Fail> {
         fs::create_dir_all(dir)
             .map_err(|e| Fail::die(format!("cannot make {}: {e}", dir.display())))?;
     }
-    atomic_write(&path, launcher.as_bytes())
+    crate::util::atomic_write_mode(&path, launcher.as_bytes(), 0o755)
         .map_err(|e| Fail::die(format!("cannot write {}: {e}", path.display())))
 }
 
@@ -1373,7 +1377,8 @@ pub fn write_fixture_rows_in(
     }
     let out = dir.join(format!("{full}.txt"));
     let body = format!("{}\n{}\n", fixture_header(run, door, what), rows.join("\n"));
-    fs::write(&out, body).map_err(|e| Fail::die(format!("cannot write {}: {e}", out.display())))?;
+    crate::util::atomic_write(&out, body.as_bytes())
+        .map_err(|e| Fail::die(format!("cannot write {}: {e}", out.display())))?;
     Ok((out, png(door, dir, &full)))
 }
 
@@ -1445,7 +1450,7 @@ pub fn capture_on(
         fixture_header_on(run, &door, tab, what),
         body.stdout.trim_end_matches('\n')
     );
-    fs::write(&out, &text).map_err(|e| Fail::die(e.to_string()))?;
+    crate::util::atomic_write(&out, text.as_bytes()).map_err(|e| Fail::die(e.to_string()))?;
     let png = png_on(&door, tab, &paths().state.join("captures"), &full);
     let host = aterm_uds::spawnfd::command("/bin/hostname")
         .arg("-s")

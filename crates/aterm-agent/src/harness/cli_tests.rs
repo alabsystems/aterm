@@ -20,6 +20,9 @@ mod asked;
 #[path = "cli_report_read_tests.rs"]
 mod report_read;
 
+#[path = "cli_lapsed_login_tests.rs"]
+mod lapsed_login;
+
 #[path = "cli_live_version_tests.rs"]
 mod live_version;
 
@@ -216,7 +219,12 @@ fn pending_kimi_env(tag: &str) -> (Tmp, Env) {
     let env = env_at(&tmp);
     let home = env.home.as_ref().unwrap();
     std::fs::create_dir_all(home.join(".secrets")).unwrap();
-    std::fs::write(env.config.as_ref().unwrap(), "[fleet]\nmachine = \"m16\"\n").unwrap();
+    aterm_uds::atomic_file::write(
+        env.config.as_ref().unwrap(),
+        ("[fleet]\nmachine = \"m16\"\n").as_ref(),
+        0o600,
+    )
+    .unwrap();
     std::fs::write(
         home.join(".secrets/ai-accounts.csv"),
         "email,computer,kimi\npending@example.test,m16,1\n",
@@ -3427,9 +3435,10 @@ fn the_verb_applies_cargo_targets_with_the_same_unit() {
         now: idle_now(),
         ..env_at(&tmp)
     };
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_ref().expect("config"),
-        "[disk]\napply = true\n",
+        ("[disk]\napply = true\n").as_ref(),
+        0o600,
     )
     .expect("write");
     let cmd = Cmd::Disk {
@@ -3510,9 +3519,10 @@ fn the_verb_removes_nothing_whose_intent_it_cannot_journal() {
         now: idle_now(),
         ..env_at(&tmp)
     };
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_ref().expect("config"),
-        "[disk]\napply = true\n",
+        ("[disk]\napply = true\n").as_ref(),
+        0o600,
     )
     .expect("write");
     std::fs::create_dir_all(env.disk_ledger()).expect("a directory where the ledger goes");
@@ -3547,9 +3557,10 @@ fn the_verb_json_carries_what_each_row_went_kept_and_why() {
         now: idle_now(),
         ..env_at(&tmp)
     };
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_ref().expect("config"),
-        "[disk]\napply = true\n",
+        ("[disk]\napply = true\n").as_ref(),
+        0o600,
     )
     .expect("write");
     let cmd = Cmd::Disk {
@@ -3643,7 +3654,7 @@ fn the_disk_knobs_are_read_from_aterm_toml() {
     let env = env_at(&tmp);
     let path = env.config.clone().expect("a config path");
     let read = |text: &str| {
-        std::fs::write(&path, text).expect("write");
+        aterm_uds::atomic_file::write(&path, (text).as_ref(), 0o600).expect("write");
         let reading = disk_config(&env);
         (reading.config, reading.notes)
     };
@@ -3928,7 +3939,8 @@ fn an_unreadable_aterm_toml_grants_no_removal_and_the_verb_says_so() {
     let tmp = tmp_dir("disk-unreadable");
     let env = env_at(&tmp);
     let path = env.config.clone().expect("a config path");
-    std::fs::write(&path, b"[disk]\napply = true\n# \xff\n").expect("write");
+    aterm_uds::atomic_file::write(&path, (b"[disk]\napply = true\n# \xff\n").as_ref(), 0o600)
+        .expect("write");
     let DiskReading {
         config: cfg,
         floor_gib,
@@ -3953,7 +3965,8 @@ fn an_unreadable_aterm_toml_grants_no_removal_and_the_verb_says_so() {
     assert!(notes.iter().any(|n| n.contains(&named)), "{notes:?}");
     std::fs::remove_dir(&path).expect("remove");
 
-    std::fs::write(&path, "disk = { auto_free_gib = \"off\" }\n").expect("write");
+    aterm_uds::atomic_file::write(&path, b"disk = { auto_free_gib = \"off\" }\n", 0o600)
+        .expect("write");
     let cmd = Cmd::Disk {
         targets: vec![disk::tests::lay_target(&tmp.path().join("repo/target"))],
         apply: None,
@@ -3971,9 +3984,10 @@ fn a_kill_switch_written_below_another_header_still_reads_off() {
     let env = env_at(&tmp);
     std::fs::create_dir_all(tmp.path().join("home/.claude/sessions")).expect("home");
     let config = env.config.clone().expect("config path");
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         &config,
-        "font_px = 14\n[theme]\nname = \"x\"\nharness.enabled = false\n",
+        ("font_px = 14\n[theme]\nname = \"x\"\nharness.enabled = false\n").as_ref(),
+        0o600,
     )
     .expect("write config");
     assert!(!SupervisorConfig::from_path(Some(&config)).0.enabled);
@@ -3981,7 +3995,8 @@ fn a_kill_switch_written_below_another_header_still_reads_off() {
     assert!(ok, "{out}{err}");
     assert!(out.contains(UPGRADE_BYPASSED), "{out}");
     assert!(err.contains("theme.harness.enabled"), "{err}");
-    std::fs::write(&config, "[harness]\nenabled = false\n").expect("write config");
+    aterm_uds::atomic_file::write(&config, ("[harness]\nenabled = false\n").as_ref(), 0o600)
+        .expect("write config");
     assert!(!SupervisorConfig::from_path(Some(&config)).0.enabled);
     let (_, out, err) = go(&upgrade_cmd(true, false), &env);
     assert!(out.contains(UPGRADE_BYPASSED), "{out}");
@@ -4014,7 +4029,8 @@ fn a_hand_run_upgrade_stands_down_while_the_master_switch_is_off() {
     std::fs::create_dir_all(tmp.path().join("home/.claude/sessions")).expect("home");
     let lock = env.state.join("upgrade").join("sweep.lock");
     let config = env.config.clone().expect("config path");
-    std::fs::write(&config, "[harness]\nenabled = false\n").expect("write config");
+    aterm_uds::atomic_file::write(&config, ("[harness]\nenabled = false\n").as_ref(), 0o600)
+        .expect("write config");
 
     let (code, out, err) = go_code(&upgrade_cmd(false, false), &env);
     assert_eq!(code, format!("{:?}", ExitCode::from(1)), "{out}{err}");
@@ -4031,7 +4047,8 @@ fn a_hand_run_upgrade_stands_down_while_the_master_switch_is_off() {
     assert!(out.contains("step=refused:bypassed"), "{out}");
     assert!(!lock.exists(), "a dry run takes no lock");
 
-    std::fs::write(&config, "[harness]\nenabled = true\n").expect("write config");
+    aterm_uds::atomic_file::write(&config, ("[harness]\nenabled = true\n").as_ref(), 0o600)
+        .expect("write config");
     let (ok, out, err) = go(&upgrade_cmd(false, false), &env);
     assert!(ok, "{out}{err}");
     assert!(out.is_empty(), "no session, nothing to report: {out}");
@@ -4063,7 +4080,7 @@ fn a_hand_run_upgrade_leaves_out_an_agent_whose_switch_is_off() {
     )
     .expect("write state");
     let swept = |toml: &str| {
-        std::fs::write(&config, toml).expect("write config");
+        aterm_uds::atomic_file::write(&config, (toml).as_ref(), 0o600).expect("write config");
         let (ok, out, err) = go(&upgrade_cmd(true, false), &env);
         assert!(ok, "{toml}: {out}{err}");
         (out.contains(&format!("session={SESSION} ")), err)
@@ -4092,9 +4109,10 @@ fn a_hand_run_upgrade_leaves_out_an_agent_whose_switch_is_off() {
     assert!(carried);
     assert!(!err.contains("reads off"), "{err}");
 
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         &config,
-        "[harness]\nenabled = false\n[harness.claude]\nenabled = false\n",
+        ("[harness]\nenabled = false\n[harness.claude]\nenabled = false\n").as_ref(),
+        0o600,
     )
     .expect("write config");
     let (code, out, err) = go_code(&upgrade_cmd(false, false), &env);
@@ -4135,7 +4153,7 @@ fn a_hand_run_upgrade_arms_the_tap_by_the_shared_block() {
     env.accounts_store().save_logins(&logins).expect("logins");
     let exe = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
     let armed = |toml: &str| {
-        std::fs::write(&config, toml).expect("write config");
+        aterm_uds::atomic_file::write(&config, (toml).as_ref(), 0o600).expect("write config");
         let (policy, _) = SupervisorConfig::from_path(Some(config.as_path()));
         upgrade_opts(&env, "", &policy, || Some(exe.clone()))
             .expect("opts")
@@ -4493,9 +4511,10 @@ fn the_worst_give_up_row_fits_its_cut_whole() {
 fn an_incomplete_upgrade_status_never_reports_an_empty_all_clear() {
     let tmp = tmp_dir("upgrade-status-incomplete");
     let env = env_at(&tmp);
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_deref().expect("config path"),
-        "[harness]\nusage_tap = false\n",
+        ("[harness]\nusage_tap = false\n").as_ref(),
+        0o600,
     )
     .expect("private config");
     for json in [false, true] {
@@ -4647,7 +4666,7 @@ fn an_unwatched_upgrade_says_so_and_a_switch_off_says_why() {
         ),
         ("[harness.codex]\nenabled = false\n", None),
     ] {
-        std::fs::write(&config, toml).expect("write config");
+        aterm_uds::atomic_file::write(&config, (toml).as_ref(), 0o600).expect("write config");
         let (ok, out, err) = go(&status, &env);
         assert!(ok, "{toml}: {out}{err}");
         assert!(out.contains(" stalled=unwatched "), "{toml}: {out}");
@@ -4705,7 +4724,12 @@ fn a_tab_another_supervisor_claims_reads_so_unless_a_switch_is_off() {
     };
     let now = u64::try_from(env.now).expect("now");
     pin_awake_since(now - 86_400);
-    std::fs::write(&config, "[harness]\nenabled = true\nupgrade = true\n").expect("config");
+    aterm_uds::atomic_file::write(
+        &config,
+        ("[harness]\nenabled = true\nupgrade = true\n").as_ref(),
+        0o600,
+    )
+    .expect("config");
     let (ok, out, err) = go(&status, &env);
     assert!(ok, "{out}{err}");
     for field in [
@@ -4721,7 +4745,7 @@ fn a_tab_another_supervisor_claims_reads_so_unless_a_switch_is_off() {
         ("[harness]\nupgrade = false\n", "`[harness] upgrade`"),
         ("[harness]\nenabled = false\n", "`[harness] enabled`"),
     ] {
-        std::fs::write(&config, toml).expect("config");
+        aterm_uds::atomic_file::write(&config, (toml).as_ref(), 0o600).expect("config");
         let (ok, out, err) = go(&status, &env);
         assert!(ok, "{toml}: {out}{err}");
         assert!(out.contains(" stalled=unwatched "), "{toml}: {out}");
@@ -4747,7 +4771,12 @@ fn a_conversation_resumed_outside_aterm_is_never_told_unwatched() {
     let env = env_at(&tmp);
     let tab = "s-b5cf2faabac5ce5127bd";
     let config = env.config.clone().expect("config path");
-    std::fs::write(&config, "[harness]\nenabled = true\nupgrade = true\n").expect("config");
+    aterm_uds::atomic_file::write(
+        &config,
+        ("[harness]\nenabled = true\nupgrade = true\n").as_ref(),
+        0o600,
+    )
+    .expect("config");
     record_upgrade(&env, "03396a15", tab, "");
     let home = env.home.clone().expect("home");
     let status = Cmd::UpgradeOwner {
@@ -4812,7 +4841,7 @@ fn an_owners_word_on_a_tab_whose_agent_is_off_names_its_switch() {
         } else {
             record_upgrade(&env, &codex_record, tab, r#","agent":"codex""#);
         }
-        std::fs::write(&config, toml).expect("write config");
+        aterm_uds::atomic_file::write(&config, (toml).as_ref(), 0o600).expect("write config");
         let (ok, out, err) = go(&now(tab), &env);
         assert!(ok, "{tab} {toml}: {out}{err}");
         assert!(
@@ -6509,6 +6538,459 @@ fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
     );
 }
 
+/// A survey says when a pool rotated and when a session proved it, from its ledger. A canary's
+/// event names one row twice and moved nothing; a rotation struck is an attempt and no move, which
+/// is how a move onto a row with no login reads; a row proved with no rotation, or that a person's
+/// `use` chose, moved nothing. A ledger it cannot read says nothing, which is not "never".
+#[cfg(unix)]
+#[test]
+fn a_survey_reads_a_pools_rotations_off_its_ledger() {
+    use accounts::{Event, Kind};
+    let tmp = tmp_dir("accounts-survey-moves");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    reported_state(&env);
+    let now = env.now;
+    let config = env.config.clone().expect("a config path");
+    let places = (config.as_path(), env.state.as_path(), env.home.as_deref());
+    assert_eq!(
+        survey_accounts(Cli::Claude, places, now).unwrap().moves,
+        Some(PoolMoves::default()),
+        "none on record"
+    );
+    let store = env.accounts_store();
+    store
+        .append(&[
+            Event::new(now - 90, Kind::Proven, "main"),
+            Event::new(now - 80, Kind::Rotate, "main").with_to("work-2"),
+            Event::new(now - 75, Kind::Rotate, "work-2").with_to("work-2"),
+            Event::new(now - 70, Kind::Proven, "work-2"),
+            Event::new(now - 65, Kind::Proven, "work-2"),
+            Event::new(now - 60, Kind::Rotate, "work-2").with_to("pool-a"),
+            Event::new(now - 55, Kind::Struck, "pool-a").because("signed-out"),
+            Event::new(now - 50, Kind::Proven, "work-2"),
+            Event::new(now - 40, Kind::Rotate, "work-2").with_to("main"),
+            Event::new(now - 35, Kind::Use, "main"),
+            Event::new(now - 30, Kind::Proven, "main"),
+            Event::new(now - 20, Kind::Wall, "main"),
+        ])
+        .unwrap();
+    assert_eq!(
+        survey_accounts(Cli::Claude, places, now).unwrap().moves,
+        Some(PoolMoves {
+            tried: vec![now - 80, now - 60, now - 40],
+            proven: vec![now - 70],
+        })
+    );
+    let ledger = store.ledger_path();
+    std::fs::remove_file(&ledger).unwrap();
+    std::fs::create_dir(&ledger).unwrap();
+    assert_eq!(
+        survey_accounts(Cli::Claude, places, now).unwrap().moves,
+        None,
+        "a ledger it cannot read"
+    );
+}
+
+/// WHAT A SURVEY SAYS OF A ROW IS WHAT ITS FIGURES CAN SUPPORT. A window read full with its reset
+/// ahead is a wall, written or not; `usable` on no reading, or on one too old to trust, is
+/// `unseen`; a fresh reading makes an `unseen` row `usable`. What the harness knows for certain
+/// stands. NEGATIVE CONTROL: before, a row last read at 1% a week ago said `usable` while Codex
+/// stopped on it at a weekly wall (m21), and `--host any` chose it first.
+#[test]
+fn a_survey_says_only_what_a_rows_figures_support() {
+    use accounts::Condition as C;
+    const NOW: i64 = 1_793_130_000;
+    let read = |week, five_hour, age| RowReading {
+        week,
+        five_hour,
+        read_at: Some(NOW - age),
+    };
+    let ahead = NOW + 3600;
+    let wall = |reset| C::Limited {
+        until: reset + accounts::RESET_GRACE_S,
+    };
+    let fresh = SURVEY_READ_FRESH_S;
+    for (base, reading, says) in [
+        (C::Usable, read(Some((42, ahead)), None, 60), C::Usable),
+        (C::Usable, read(Some((42, ahead)), None, fresh), C::Usable),
+        (
+            C::Usable,
+            read(Some((42, ahead)), None, fresh + 1),
+            C::Unseen,
+        ),
+        (C::Usable, RowReading::default(), C::Unseen),
+        (C::Unseen, read(Some((42, ahead)), None, 60), C::Usable),
+        (C::Unseen, read(None, None, fresh + 1), C::Unseen),
+        (C::Unseen, RowReading::default(), C::Unseen),
+        (C::Low, read(Some((97, ahead)), None, fresh + 1), C::Low),
+        // Full, whatever the condition word and however old the reading: until its reset.
+        (C::Usable, read(Some((100, ahead)), None, 60), wall(ahead)),
+        (
+            C::Low,
+            read(Some((100, ahead)), None, fresh + 1),
+            wall(ahead),
+        ),
+        (C::Unseen, read(None, Some((100, ahead)), 60), wall(ahead)),
+        (
+            C::Usable,
+            read(Some((100, ahead)), Some((100, ahead + 60)), 60),
+            wall(ahead + 60),
+        ),
+        // A full window that has reset says nothing.
+        (C::Usable, read(Some((100, NOW)), None, 60), C::Usable),
+        (C::Usable, read(Some((99, ahead)), None, 60), C::Usable),
+        // What the harness knows for certain stands.
+        (
+            C::NotEnrolled,
+            read(Some((100, ahead)), None, 60),
+            C::NotEnrolled,
+        ),
+        (
+            C::SignedOut,
+            read(Some((100, ahead)), None, 60),
+            C::SignedOut,
+        ),
+        (
+            wall(NOW + 5),
+            read(Some((100, ahead)), None, 60),
+            wall(NOW + 5),
+        ),
+    ] {
+        assert_eq!(
+            survey_condition(base, &reading, NOW),
+            says,
+            "{base:?} on {reading:?}"
+        );
+    }
+}
+
+/// A row's own rollouts stand in for a provider's answer a survey does not ask for: newer figures
+/// replace the record's, a window they do not name stays, and older ones change nothing.
+#[test]
+fn a_rollouts_newer_figures_replace_a_rows_and_older_ones_do_not() {
+    const NOW: i64 = 1_793_130_000;
+    let ahead = NOW + 3600;
+    let held = RowReading {
+        week: Some((1, ahead)),
+        five_hour: Some((9, ahead)),
+        read_at: Some(NOW - 7 * 86_400),
+    };
+    let sample = |at| accounts::Sample {
+        week_pct: Some(100),
+        week_reset: Some(ahead),
+        at,
+        ..accounts::Sample::default()
+    };
+    assert_eq!(
+        held.with_newer(&sample(NOW - 60), NOW),
+        RowReading {
+            week: Some((100, ahead)),
+            five_hour: Some((9, ahead)),
+            read_at: Some(NOW - 60),
+        }
+    );
+    assert_eq!(held.with_newer(&sample(NOW - 7 * 86_400), NOW), held);
+    let gone = accounts::Sample {
+        week_reset: Some(NOW),
+        ..sample(NOW - 60)
+    };
+    assert_eq!(
+        held.with_newer(&gone, NOW).week,
+        held.week,
+        "a window that has reset names nothing"
+    );
+}
+
+/// THE WALL A LONG-RUNNING CODEX SESSION HIT REACHES THE SURVEY with no provider read: its rollout
+/// under this row's login says 100%, and the row says `limited` until that week resets. CONTROL:
+/// the same rollout under another login leaves the row's stale figure, which says `unseen`, and
+/// no reader of the provider is reached at all (a survey is no account in use).
+///
+/// A ROLLOUT NAMES ONLY THE LOGIN THAT OPENED IT, and the pool resumes one on another row, so its
+/// figures speak for a row only where no other login could have written them: with a second row's
+/// login made here they speak for neither row, so a free row is not refused for a wall its
+/// neighbour met. A second row with no login here takes nothing from it (m22's roster). The same
+/// holds of a row with a home of its own beside a default login that is not its own.
+#[test]
+fn a_survey_reads_a_codex_rows_wall_from_its_own_rollouts() {
+    let tmp = tmp_dir("accounts-survey-rollout");
+    let env = env_at(&tmp);
+    let home = env.home.clone().expect("a home");
+    let codex_home = home.join(Cli::Codex.accounts().default_home);
+    let now = env.now;
+    let week = now + 300_000;
+    let config = env.config.clone().expect("a config path");
+    std::fs::create_dir_all(config.parent().expect("a folder")).expect("mkdir");
+    std::fs::write(
+        accounts::roster_beside_for(&config, Cli::Codex).expect("a roster"),
+        "[[account]]\nlabel='main'\nclass='dedicated'\n",
+    )
+    .expect("write roster");
+    let token = crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
+        "email": "a@example.test",
+        "https://api.openai.com/auth": {
+            "chatgpt_user_id": "user-lab",
+            "chatgpt_account_id": "acct-lab-1",
+        }
+    }));
+    std::fs::create_dir_all(&codex_home).expect("mkdir");
+    std::fs::write(
+        codex_home.join("auth.json"),
+        aterm_json::to_vec(&aterm_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"id_token": token, "access_token": token, "account_id": "acct-lab-1"}
+        }))
+        .expect("JSON"),
+    )
+    .expect("write auth");
+    let day = codex_home.join("sessions/2026/10/16");
+    std::fs::create_dir_all(&day).expect("mkdir");
+    let thread = "01900000-0000-7000-8000-000000000001";
+    let rollout = day.join(format!("rollout-2026-10-16T08-00-00-{thread}.jsonl"));
+    let write_under = |login: (&str, &str)| {
+        use crate::harness::codex_rollout::fixtures::{meta_as, rate};
+        let at_ms = (now - 60) * 1000;
+        let body = [
+            meta_as(
+                at_ms - 1_000,
+                thread,
+                thread,
+                None,
+                Some(crate::harness::codex_rollout::PAGINATED),
+                Some(login),
+            ),
+            rate(at_ms, "codex", None, Some((100.0, 10_080, week))),
+        ]
+        .concat();
+        std::fs::write(&rollout, body).expect("write rollout");
+    };
+    let places = (config.as_path(), env.state.as_path(), Some(home.as_path()));
+
+    write_under(("acct-lab-1", "user-lab"));
+    let (rows, reads) = crate::harness::provider_read::captured(|| {
+        survey_accounts(Cli::Codex, places, now)
+            .expect("the pool reads")
+            .rows
+    });
+    assert_eq!(reads, [], "a survey asks no provider");
+    let [row] = rows.as_slice() else {
+        panic!("one row: {rows:?}");
+    };
+    assert_eq!(
+        (
+            row.condition,
+            row.seven_day_pct,
+            row.week_reset,
+            row.read_at
+        ),
+        (
+            accounts::Condition::Limited {
+                until: week + accounts::RESET_GRACE_S
+            },
+            Some(100),
+            Some(week),
+            Some(now - 60),
+        )
+    );
+
+    // The owner's `accounts use` cleared the row after that reading, so the reading no longer
+    // speaks for it. CONTROL: one written after the clearing does.
+    let store = accounts::Store::at_for(&env.state, Cli::Codex, &home);
+    let cleared = |at: Option<i64>| {
+        store
+            .transact(now, &mut None, |state| {
+                state
+                    .accounts
+                    .entry("main".to_owned())
+                    .or_default()
+                    .cleared_at = at;
+                Ok(Vec::new())
+            })
+            .expect("write the record");
+        let rows = survey_accounts(Cli::Codex, places, now)
+            .expect("the pool reads")
+            .rows;
+        let [row] = rows.as_slice() else {
+            panic!("one row: {rows:?}");
+        };
+        (row.condition, row.seven_day_pct)
+    };
+    assert_eq!(
+        cleared(Some(now - 30)),
+        (accounts::Condition::Unseen, None),
+        "a pin after the reading"
+    );
+    assert_eq!(
+        cleared(Some(now - 120)),
+        (
+            accounts::Condition::Limited {
+                until: week + accounts::RESET_GRACE_S
+            },
+            Some(100)
+        ),
+        "CONTROL: a reading after the pin"
+    );
+    cleared(None);
+
+    // A later rollout's lower share leaves the window's largest where it was, so the full reading
+    // from before the pin must go before a pick, or it stands over what was read since.
+    let later = day.join(format!(
+        "rollout-2026-10-16T09-00-00-{}.jsonl",
+        "01900000-0000-7000-8000-000000000002"
+    ));
+    {
+        use crate::harness::codex_rollout::fixtures::{meta_as, rate};
+        let thread = "01900000-0000-7000-8000-000000000002";
+        let at_ms = (now - 10) * 1000;
+        let body = [
+            meta_as(
+                at_ms - 1_000,
+                thread,
+                thread,
+                None,
+                Some(crate::harness::codex_rollout::PAGINATED),
+                Some(("acct-lab-1", "user-lab")),
+            ),
+            rate(at_ms, "codex", None, Some((5.0, 10_080, week))),
+        ]
+        .concat();
+        std::fs::write(&later, body).expect("write rollout");
+    }
+    assert_eq!(
+        cleared(None),
+        (
+            accounts::Condition::Limited {
+                until: week + accounts::RESET_GRACE_S
+            },
+            Some(100)
+        ),
+        "CONTROL: with nothing between them the larger share stands"
+    );
+    assert_eq!(
+        cleared(Some(now - 30)),
+        (accounts::Condition::Usable, Some(5)),
+        "the full reading is from before the pin, and the newer one is read as it stands"
+    );
+    cleared(None);
+    std::fs::remove_file(&later).expect("remove the later rollout");
+    // A read that showed room outranks a full reading as a pin does.
+    store
+        .transact(now, &mut None, |state| {
+            state.accounts.entry("main".to_owned()).or_default().sample = Some(accounts::Sample {
+                week_pct: Some(30),
+                week_reset: Some(week),
+                at: now - 30,
+                ..accounts::Sample::default()
+            });
+            Ok(Vec::new())
+        })
+        .expect("write the record");
+    let rows = survey_accounts(Cli::Codex, places, now)
+        .expect("the pool reads")
+        .rows;
+    let [row] = rows.as_slice() else {
+        panic!("one row: {rows:?}");
+    };
+    assert_eq!(
+        (row.condition, row.seven_day_pct),
+        (accounts::Condition::Usable, Some(30)),
+        "a read with room after the full reading"
+    );
+    store
+        .transact(now, &mut None, |state| {
+            state.accounts.entry("main".to_owned()).or_default().sample = None;
+            Ok(Vec::new())
+        })
+        .expect("write the record");
+
+    write_under(("acct-lab-2", "user-lab"));
+    let rows = survey_accounts(Cli::Codex, places, now)
+        .expect("the pool reads")
+        .rows;
+    let [row] = rows.as_slice() else {
+        panic!("one row: {rows:?}");
+    };
+    assert_eq!(
+        (row.condition, row.seven_day_pct, row.read_at),
+        (accounts::Condition::Unseen, None, None),
+        "another login's rollout says nothing of this one"
+    );
+
+    write_under(("acct-lab-1", "user-lab"));
+    let work_home = tmp.path().join("work-login");
+    let roster_path = accounts::roster_beside_for(&config, Cli::Codex).expect("a roster");
+    let two_rows = format!(
+        "[[account]]\nlabel='main'\nclass='dedicated'\n\
+         [[account]]\nlabel='work'\nclass='dedicated'\ndir='{}'\n",
+        work_home.display()
+    );
+    std::fs::write(&roster_path, &two_rows).expect("write roster");
+    let main_row = || {
+        survey_accounts(Cli::Codex, places, now)
+            .expect("the pool reads")
+            .rows
+            .into_iter()
+            .find(|row| row.label == "main")
+            .expect("main")
+    };
+    assert!(
+        matches!(main_row().condition, accounts::Condition::Limited { .. }),
+        "`work`'s login is not made here, so only `main` could have written it"
+    );
+    let auth_of = |account: &str| {
+        let token = crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
+            "email": "w@example.test",
+            "https://api.openai.com/auth": {
+                "chatgpt_user_id": "user-lab",
+                "chatgpt_account_id": account,
+            }
+        }));
+        aterm_json::to_vec(&aterm_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"id_token": token, "access_token": token, "account_id": account}
+        }))
+        .expect("JSON")
+    };
+    std::fs::create_dir_all(&work_home).expect("mkdir");
+    std::fs::write(work_home.join("auth.json"), auth_of("acct-lab-3")).expect("write auth");
+    let row = main_row();
+    assert_eq!(
+        (row.condition, row.seven_day_pct, row.read_at),
+        (accounts::Condition::Unseen, None, None),
+        "with two logins here, the rollout could be either's"
+    );
+
+    std::fs::write(
+        &roster_path,
+        format!(
+            "[[account]]\nlabel='work'\nclass='dedicated'\ndir='{}'\n",
+            work_home.display()
+        ),
+    )
+    .expect("write roster");
+    write_under(("acct-lab-3", "user-lab"));
+    let work_row = || {
+        survey_accounts(Cli::Codex, places, now)
+            .expect("the pool reads")
+            .rows
+            .into_iter()
+            .find(|row| row.label == "work")
+            .expect("work")
+    };
+    assert_eq!(
+        work_row().seven_day_pct,
+        None,
+        "the default home's own login could have resumed a rollout there"
+    );
+    std::fs::remove_file(codex_home.join("auth.json")).expect("remove auth");
+    assert_eq!(
+        work_row().seven_day_pct,
+        Some(100),
+        "CONTROL: with no other login here, it is that row's"
+    );
+}
+
 #[test]
 fn a_survey_reads_each_row_as_the_report_does() {
     let tmp = tmp_dir("accounts-survey");
@@ -6576,7 +7058,13 @@ fn a_survey_reads_each_row_as_the_report_does() {
 
     // A pool with no roster has no rows, and is no refusal.
     let codex = survey_accounts(Cli::Codex, places, now).expect("no roster reads");
-    assert_eq!(codex, SurveyPool::default());
+    assert_eq!(
+        codex,
+        SurveyPool {
+            moves: Some(PoolMoves::default()),
+            ..SurveyPool::default()
+        }
+    );
 }
 
 #[test]
@@ -7326,9 +7814,10 @@ fn usage_takes_the_usage_cache_only_as_the_default_logins_own_account() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
     let mut env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_ref().expect("a config"),
-        "[harness]\nusage_tap = true\n",
+        ("[harness]\nusage_tap = true\n").as_ref(),
+        0o600,
     )
     .expect("config");
     env.sid = "s-1a2b".to_owned();
@@ -7574,9 +8063,10 @@ fn a_figure_held_only_in_the_sample_is_shown_by_both_views() {
         Value::from("no-reading"),
         "the tap ships on"
     );
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_ref().expect("a config"),
-        "[harness]\nusage_tap = false\n",
+        ("[harness]\nusage_tap = false\n").as_ref(),
+        0o600,
     )
     .expect("config");
     assert_eq!(
@@ -8243,9 +8733,10 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
     std::fs::create_dir_all(&home).expect("home");
     std::fs::write(home.join(".claude.json"), stats_profile()).expect("profile");
     let mut env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_ref().expect("a config"),
-        "[harness]\nusage_tap = true\n",
+        ("[harness]\nusage_tap = true\n").as_ref(),
+        0o600,
     )
     .expect("config");
     let five_end = env.now + 85 * 60;
@@ -8355,9 +8846,10 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
     std::fs::create_dir_all(&qhome).expect("home");
     std::fs::write(qhome.join(".claude.json"), stats_profile()).expect("profile");
     let off = stats_env(&quiet, qhome.join(".claude"), qhome.join(".claude.json"));
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         off.config.as_ref().expect("a config"),
-        "[harness]\nusage_tap = false\n",
+        ("[harness]\nusage_tap = false\n").as_ref(),
+        0o600,
     )
     .expect("config");
     let doc = stats(&off);
@@ -8379,7 +8871,12 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
         "[harness]\nenabled = false\n",
         "[harness.claude]\nenabled = false\n",
     ] {
-        std::fs::write(off.config.as_ref().expect("a config"), config).expect("config");
+        aterm_uds::atomic_file::write(
+            off.config.as_ref().expect("a config"),
+            (config).as_ref(),
+            0o600,
+        )
+        .expect("config");
         assert_eq!(
             stats(&off)["accounts"][0]["windows"][0]["missing"]["reason"],
             Value::from("usage-tap-off"),
@@ -8403,9 +8900,10 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
     let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_ref().expect("a config"),
-        "[harness]\nusage_tap = true\n",
+        ("[harness]\nusage_tap = true\n").as_ref(),
+        0o600,
     )
     .expect("config");
     let reset = env.now + 3_600;
@@ -8762,9 +9260,10 @@ fn a_window_the_tap_never_records_says_so() {
     std::fs::create_dir_all(&home).expect("home");
     std::fs::write(home.join(".claude.json"), stats_profile()).expect("profile");
     let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_ref().expect("a config"),
-        "[harness]\nusage_tap = true\n",
+        ("[harness]\nusage_tap = true\n").as_ref(),
+        0o600,
     )
     .expect("config");
     let roster = env.accounts_roster().expect("a roster path");
@@ -8871,9 +9370,10 @@ fn under_several_accounts_the_default_homes_profile_keys_no_row() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
     let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_ref().expect("a config"),
-        "[harness]\nusage_tap = true\n",
+        ("[harness]\nusage_tap = true\n").as_ref(),
+        0o600,
     )
     .expect("config");
     let roster = env.accounts_roster().expect("a roster path");
@@ -9167,7 +9667,7 @@ fn a_compressed_reserve_folder_is_refused_and_journalled_once() {
 
 #[test]
 fn the_sweep_rows_say_why_each_build_cache_went() {
-    use atpkg::build_cache::{RECLAIM_GONE, RECLAIM_STALE, Unused};
+    use atpkg::build_cache::{RECLAIM_STALE, Unused};
     let tmp = tmp_dir("sweep-why");
     let state = tmp.path().join("state");
     let path = Path::new("/c/ws/.cargo-build");
@@ -9175,9 +9675,8 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
         (
             Unused::Gone {
                 idle: std::time::Duration::from_secs(26 * 3_600),
-                after: RECLAIM_GONE,
             },
-            &["26h", "24h"],
+            &["26h", "workspace is gone"],
         ),
         (
             Unused::Idle {
@@ -9306,7 +9805,7 @@ fn a_stage_a_removal_could_not_finish_is_journalled_with_what_stayed() {
 /// CONTROL: the intent row alone reads as one in flight, in both.
 #[test]
 fn an_intent_closed_by_a_kept_row_is_not_in_flight() {
-    use atpkg::build_cache::{RECLAIM_GONE, Refusal, Unused};
+    use atpkg::build_cache::{Refusal, Unused};
     use disk::SweepAction;
     let tmp = tmp_dir("sweep-kept");
     let state = tmp.path().join("state");
@@ -9314,7 +9813,6 @@ fn an_intent_closed_by_a_kept_row_is_not_in_flight() {
     let leaf = Path::new("/c/ws/.cargo-build");
     let gone = Unused::Gone {
         idle: std::time::Duration::from_secs(26 * 3_600),
-        after: RECLAIM_GONE,
     };
     let by = Refusal::Rename(std::io::ErrorKind::PermissionDenied);
     let rows = || -> Vec<String> {
@@ -9788,11 +10286,11 @@ struct AgyStandIn {
 }
 
 impl super::super::agy_quota_store::Source for AgyStandIn {
-    fn read(&self) -> Result<String, String> {
+    fn read(&self, _: &super::super::provider_read::Permit) -> Result<String, String> {
         self.doc.map(str::to_owned).map_err(str::to_owned)
     }
 
-    fn default_model(&self) -> Result<String, String> {
+    fn default_model(&self, _: &super::super::provider_read::Permit) -> Result<String, String> {
         Ok(self.default.to_owned())
     }
 }
@@ -9804,7 +10302,12 @@ fn agy_env(tag: &str) -> (Tmp, Env) {
     (dir, env)
 }
 
-fn agy_go(env: &Env, what: &AgyWhat, json: bool, source: &AgyStandIn) -> (ExitCode, String) {
+fn agy_go(
+    env: &Env,
+    what: &AgyWhat,
+    json: bool,
+    source: &dyn super::super::agy_quota_store::Source,
+) -> (ExitCode, String) {
     let mut out = Vec::new();
     let code = run_agy(env, what, false, json, source, &mut out);
     (code, String::from_utf8(out).unwrap())
@@ -9877,9 +10380,10 @@ fn harness_agy_pick_rotates_off_the_spent_pool() {
         (v["pick"].as_str(), v["model"].as_str()),
         (Some("keep"), Some("claude-sonnet-5-5-low"))
     );
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         env.config.as_ref().unwrap(),
-        "[harness.agy]\nrotate = false\n",
+        ("[harness.agy]\nrotate = false\n").as_ref(),
+        0o600,
     )
     .unwrap();
     let (_, json) = agy_go(&env, &AgyWhat::Pick(None), true, &GEMINI_DEFAULT);
@@ -9888,6 +10392,65 @@ fn harness_agy_pick_rotates_off_the_spent_pool() {
         (v["pick"].as_str(), v["rotate"].as_bool()),
         (Some("keep"), Some(false))
     );
+}
+
+/// `agy pick` with no model asks agy twice under the person's one use of the home (`/usage`,
+/// then `/model`), each on record; a second pick on the kept reading and default asks nothing.
+#[test]
+fn harness_agy_pick_reads_the_default_model_under_the_commands_use() {
+    use super::super::provider_read::{self, InUse, ProbeEvent, Read};
+    let (_dir, env) = agy_env("agy-pick-probe");
+    let probe = ProbeEvent {
+        at: env.now,
+        read: Read::AgyUsage,
+        account: None,
+        login: None,
+        why: InUse::Asked,
+    };
+    let ((code, _), probes) =
+        provider_read::captured(|| agy_go(&env, &AgyWhat::Pick(None), false, &GEMINI_DEFAULT));
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(probes, vec![probe.clone(), probe]);
+    let ((code, _), probes) =
+        provider_read::captured(|| agy_go(&env, &AgyWhat::Pick(None), false, &GEMINI_DEFAULT));
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(probes.is_empty(), "{probes:?}");
+}
+
+/// A home signed out here answers `agy pick`'s default model locally: the source's `/model` is
+/// never asked and nothing is on record.
+#[test]
+fn harness_agy_pick_on_a_signed_out_home_never_asks_the_default_model() {
+    struct SignedOut(std::cell::Cell<u32>);
+    impl super::super::agy_quota_store::Source for SignedOut {
+        fn signed_out(&self) -> Option<String> {
+            Some(format!(
+                "{}: no grant here",
+                super::super::agy_quota_store::SIGNED_OUT
+            ))
+        }
+        fn read(&self, _: &super::super::provider_read::Permit) -> Result<String, String> {
+            Err("signed out".to_owned())
+        }
+        fn default_model(&self, _: &super::super::provider_read::Permit) -> Result<String, String> {
+            self.0.set(self.0.get() + 1);
+            Ok("gemini-4-argon-high".to_owned())
+        }
+    }
+    let (_dir, env) = agy_env("agy-pick-signed-out");
+    let (code, _) = agy_go(&env, &AgyWhat::Quota, false, &GEMINI_DEFAULT);
+    assert_eq!(code, ExitCode::SUCCESS, "a reading is kept");
+    let source = SignedOut(std::cell::Cell::new(0));
+    let ((code, text), probes) = super::super::provider_read::captured(|| {
+        agy_go(&env, &AgyWhat::Pick(None), false, &source)
+    });
+    assert_eq!(code, ExitCode::FAILURE, "{text}");
+    assert!(
+        text.contains("default model is unread: signed-out"),
+        "{text}"
+    );
+    assert_eq!(source.0.get(), 0, "the signed-out home's /model was asked");
+    assert!(probes.is_empty(), "{probes:?}");
 }
 
 #[test]
@@ -9976,6 +10539,155 @@ fn an_unreadable_agy_quota_says_why_and_fails() {
     assert!(v["error"].as_str().unwrap().contains("not JSON"), "{json}");
 }
 
+/// A signed-out file-backend profile answers `signed-out` in text and `--json` (`reason`) without
+/// running agy: the command's agy is built from the person's environment as `aterm harness agy`
+/// builds it ([`crate::harness::agy_quota_store::Agy::of_person`]), whose `SSH_CONNECTION`
+/// selects agy's file backend, and its stand-in marks any run.
+#[cfg(unix)]
+#[test]
+fn a_signed_out_agy_says_so_without_running_it() {
+    let (dir, env) = agy_env("agy-signed-out");
+    let (source, profile, ran) = person_agy(dir.path(), &[SSH]);
+    let mut out = Vec::new();
+    let code = run_agy(&env, &AgyWhat::Quota, false, false, &source, &mut out);
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(code, ExitCode::FAILURE);
+    assert_eq!(
+        text,
+        format!(
+            "agy quota unread: signed-out: agy is signed out on this machine (no usable \
+             antigravity-oauth-token in {}); `aterm harness agy login <account>` signs it in\n",
+            profile.join(".gemini").join("antigravity-cli").display()
+        )
+    );
+    let mut out = Vec::new();
+    let _ = run_agy(&env, &AgyWhat::Quota, true, true, &source, &mut out);
+    let json = String::from_utf8(out).unwrap();
+    let v: Value = aterm_json::from_str(&json).unwrap();
+    assert_eq!(v["reason"].as_str(), Some("signed-out"), "{json}");
+    assert!(!ran.exists(), "agy ran although its grant file is missing");
+}
+
+/// What a file-backend session's environment says: an SSH login.
+#[cfg(unix)]
+const SSH: (&str, &str) = ("SSH_CONNECTION", "127.0.0.1 1 127.0.0.1 22");
+
+/// The command's agy ([`crate::harness::agy_quota_store::Agy::of_person`]) for an environment
+/// of `vars` and a scratch `HOME` holding no grant, run as a stand-in that marks its run (the
+/// returned path) with the `SSH_CONNECTION` it saw and prints [`AGY_USAGE`]: the source, the
+/// profile, the mark.
+#[cfg(unix)]
+fn person_agy(
+    dir: &Path,
+    vars: &[(&str, &str)],
+) -> (crate::harness::agy_quota_store::Agy, PathBuf, PathBuf) {
+    let profile = dir.join("profile");
+    let doc = dir.join("usage.json");
+    std::fs::write(&doc, AGY_USAGE).unwrap();
+    let program = dir.join("agy");
+    crate::harness::stand_in::proven(
+        &program,
+        &format!(
+            "printf '%s' \"$SSH_CONNECTION\" > \"$0.ran\"\ncat '{}'",
+            doc.display()
+        ),
+    );
+    let home = profile.display().to_string();
+    let vars = vars
+        .iter()
+        .copied()
+        .chain([("HOME", home.as_str()), ("PATH", "/usr/bin:/bin")])
+        .map(|(n, v)| (OsString::from(n), OsString::from(v)));
+    let mut agy = crate::harness::agy_quota_store::Agy::of_person(vars);
+    agy.program = program.clone().into_os_string();
+    agy.budget = crate::harness::agy_quota_store::LAUNCH_READ_BUDGET;
+    (agy, profile, program.with_extension("ran"))
+}
+
+/// The negative control of [`a_signed_out_agy_says_so_without_running_it`]: built blind to the
+/// person's environment, as the command's agy once was, the same signed-out profile is not
+/// answered locally and agy runs.
+#[cfg(unix)]
+#[test]
+fn an_agy_blind_to_the_persons_environment_runs_on_a_signed_out_profile() {
+    let (dir, env) = agy_env("agy-signed-out-control");
+    let (source, _, ran) =
+        crate::harness::agy_quota_store::with_person_env_dropped(|| person_agy(dir.path(), &[SSH]));
+    assert_eq!(
+        source.grant_file(),
+        None,
+        "no file backend, no local answer"
+    );
+    let mut out = Vec::new();
+    let code = run_agy(&env, &AgyWhat::Quota, true, true, &source, &mut out);
+    let json = String::from_utf8(out).unwrap();
+    assert_eq!(code, ExitCode::SUCCESS, "{json}");
+    assert!(ran.exists(), "the control must run agy: {json}");
+}
+
+/// The read agy runs on the backend it was checked on: with its grant file in place, the
+/// command's agy runs and sees the person's `SSH_CONNECTION`.
+#[cfg(unix)]
+#[test]
+fn the_persons_agy_reads_on_the_backend_it_was_checked_on() {
+    let (dir, env) = agy_env("agy-signed-in-ssh");
+    let (source, profile, ran) = person_agy(dir.path(), &[SSH]);
+    let config = profile.join(".gemini").join("antigravity-cli");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join(crate::harness::upgrade_agy::GRANT_FILE), b"{}").unwrap();
+    assert_eq!(
+        crate::harness::agy_quota_store::Source::signed_out(&source),
+        None
+    );
+    let mut out = Vec::new();
+    let code = run_agy(&env, &AgyWhat::Quota, true, true, &source, &mut out);
+    let json = String::from_utf8(out).unwrap();
+    assert_eq!(code, ExitCode::SUCCESS, "{json}");
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), SSH.1);
+}
+
+/// A credential variable beside the grant keeps the answer with agy, and is kept by name alone:
+/// its value is neither stored nor passed to agy.
+#[cfg(unix)]
+#[test]
+fn a_credential_in_the_persons_environment_is_kept_by_name_alone() {
+    let dir = tmp_dir("agy-person-credential");
+    let secret = "not-a-real-key-7f3a";
+    let (source, _, _) = person_agy(
+        dir.path(),
+        &[
+            SSH,
+            ("GEMINI_API_KEY", secret),
+            ("GOOGLE_API_KEY", " "),
+            ("AGY_UNRELATED", "x"),
+        ],
+    );
+    assert_eq!(source.credentials_set, ["GEMINI_API_KEY"]);
+    assert_eq!(source.env, [(SSH.0.to_owned(), SSH.1.to_owned())]);
+    assert_eq!(
+        source.grant_file(),
+        None,
+        "another credential: no local answer"
+    );
+    assert_eq!(
+        crate::harness::agy_quota_store::Source::signed_out(&source),
+        None
+    );
+}
+
+/// A person's `AGY_CLI_CONFIG_DIR` moves their agy off the default home's config: the command
+/// keeps it by name and never passes it, so its read stays the default home's (the store and
+/// token it books under), and the moved config gives no local answer.
+#[cfg(unix)]
+#[test]
+fn a_moved_agy_config_is_kept_by_name_and_never_passed_to_the_read() {
+    let dir = tmp_dir("agy-person-moved");
+    let (source, _, _) = person_agy(dir.path(), &[SSH, ("AGY_CLI_CONFIG_DIR", "/elsewhere")]);
+    assert_eq!(source.credentials_set, ["AGY_CLI_CONFIG_DIR"]);
+    assert_eq!(source.env, [(SSH.0.to_owned(), SSH.1.to_owned())]);
+    assert_eq!(source.grant_file(), None, "a moved config: no local answer");
+}
+
 #[test]
 fn the_agy_verb_parses_its_forms() {
     let p = |line: &str| parse(&words(line)).map(|(cmd, _)| cmd);
@@ -10035,6 +10747,53 @@ fn harness_agy_login_fails_closed_without_reading_home_quota() {
     assert!(value["error"].as_str().is_some());
     assert!(!env.state.join("agy-quota").exists());
     assert!(!env.state.join("agy-logins").exists());
+}
+
+/// `harness agy login <account>` and `signin --cli grok` are a person's sign-in
+/// (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15, [`person_begin`]): it starts under the machine's
+/// sign-in lock, which it holds through the flow, and records its start on the Mac's spacing
+/// clock under the account it names; while another sign-in holds the lock it waits only as
+/// `again` says, then runs and records nothing. CONTROL: with the lock free the same call
+/// begins, and a person's named sign-in is not held by another account's start a minute before.
+#[test]
+fn a_persons_named_sign_in_starts_under_the_machines_lock() {
+    use crate::harness::sign_in_ladder::{Started, last_started};
+    let (_dir, env) = agy_env("agy-login-door");
+    let store = env.accounts_store_for(Cli::Agy).unwrap();
+    let held = store.signin_now().unwrap().expect("the lock is free");
+    let asked = std::cell::Cell::new(0);
+    let again = |tried: u32| {
+        asked.set(asked.get() + 1);
+        tried < 2
+    };
+    let refused = person_begin(&store, (Cli::Agy, "primary"), env.now, &again).unwrap_err();
+    assert!(refused.starts_with("held: "), "{refused}");
+    assert_eq!(
+        asked.get(),
+        3,
+        "waited twice, as `again` said, then gave up"
+    );
+    assert_eq!(last_started(&store).unwrap(), None, "nothing recorded");
+    drop(held);
+    let begun = person_begin(&store, (Cli::Agy, "primary"), env.now, &|_| false)
+        .expect("CONTROL: the lock is free");
+    assert!(begun.names(Cli::Agy, "primary"));
+    assert_eq!(
+        last_started(&store).unwrap(),
+        Some(Started::new(Cli::Agy, "primary", env.now))
+    );
+    assert!(
+        person_begin(&store, (Cli::Agy, "second"), env.now, &|_| false).is_err(),
+        "the flow holds the lock until it ends"
+    );
+    drop(begun);
+    let second = person_begin(&store, (Cli::Grok, "second"), env.now + 60, &|_| false)
+        .expect("a person's ask");
+    assert!(second.names(Cli::Grok, "second"));
+    assert_eq!(
+        last_started(&store).unwrap(),
+        Some(Started::new(Cli::Grok, "second", env.now + 60))
+    );
 }
 
 #[test]
@@ -10525,9 +11284,10 @@ fn accounts_report_reads_rotation_from_parsed_config_and_names_running_sessions(
     state.rotations.push(env.now - 30);
     env.accounts_store().save(&state).expect("save");
     let cfg_path = env.config.as_ref().expect("config path");
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         cfg_path,
-        "[harness]\naccounts = \"wall\"\nlimit_reset = true\n",
+        b"[harness]\naccounts = \"wall\"\nlimit_reset = true\n",
+        0o600,
     )
     .expect("write config");
     let (text, doc) = read_both(&env);
@@ -10548,9 +11308,10 @@ fn accounts_report_reads_rotation_from_parsed_config_and_names_running_sessions(
     assert_eq!(doc["rotation"]["observed"], Value::from(true));
 
     // 4. `[harness] accounts = "off"` turns rotation switches off while keeping `observed = true`.
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         cfg_path,
-        "[harness]\naccounts = \"off\"\nlimit_reset = false\n",
+        b"[harness]\naccounts = \"off\"\nlimit_reset = false\n",
+        0o600,
     )
     .expect("write config");
     let (_, doc) = read_both(&env);
@@ -10562,9 +11323,10 @@ fn accounts_report_reads_rotation_from_parsed_config_and_names_running_sessions(
     assert_eq!(doc["rotation"]["observed"], Value::from(true));
 
     // 5. `[harness.claude] enabled = false` turns every Claude rotation switch off too.
-    std::fs::write(
+    aterm_uds::atomic_file::write(
         cfg_path,
-        "[harness]\naccounts = \"early\"\nlimit_reset = true\n[harness.claude]\nenabled = false\n",
+        b"[harness]\naccounts = \"early\"\nlimit_reset = true\n[harness.claude]\nenabled = false\n",
+        0o600,
     )
     .expect("write config");
     let (_, doc) = read_both(&env);
@@ -10727,4 +11489,32 @@ fn codex_of_env_takes_the_last_duplicate_thread_and_tab_session_entries() {
     let (thread, login) = codex_of_env(vars);
     assert_eq!(thread.as_deref(), Some(valid));
     assert_eq!(login.and_then(|l| l.login), Some(abs("/work/codex-new")));
+}
+
+/// Disk cleanup reads a linked `aterm.toml`, rather than turning off as if the file were at fault.
+#[cfg(unix)]
+#[test]
+fn a_linked_aterm_toml_does_not_turn_disk_cleanup_off() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let real = dir.path().join("dotfiles.toml");
+    aterm_uds::atomic_file::write(&real, b"", 0o600).unwrap();
+    let link = dir.path().join("aterm.toml");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let reading = disk_config_read(Some(&link));
+    assert!(!reading.off_by_fault, "{:?}", reading.notes);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refused_config_turns_disk_removals_off() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("aterm.toml");
+    aterm_uds::atomic_file::write(&path, b"[disk]\napply = true\n", 0o600).unwrap();
+    assert!(!disk_config_read(Some(&path)).off_by_fault);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+    let reading = disk_config_read(Some(&path));
+    assert!(reading.off_by_fault);
+    assert!(!reading.config.apply);
+    assert!(reading.floor_gib.is_none());
 }

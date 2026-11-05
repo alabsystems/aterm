@@ -297,7 +297,17 @@ const MAX_REPLY: usize = 64 * 1024;
 const MAX_MESSAGES: usize = 64;
 const WITHIN: Duration = Duration::from_secs(2);
 
+/// When a LAN observation begun now must end (an admission, a recheck, a listener's bind and
+/// listen, and the cap on every route query's own deadline): [`WITHIN`] from now, or in a test
+/// binary (a crate's unit tests, or a `tests/*.rs` binary, which links this library without
+/// `cfg(test)`) the hang detector from now, since its routes, sockets and listeners are this
+/// machine's kernel's, which always answer however loaded the machine is.
 pub(super) fn deadline() -> Instant {
+    #[cfg(debug_assertions)]
+    if aterm_uds::test_binary::scratch_root().is_some() {
+        // The hang detector (`aterm_spec::wait::MUST_HAPPEN`), which this library cannot name.
+        return Instant::now() + Duration::from_secs(60);
+    }
     Instant::now() + WITHIN
 }
 pub(super) fn within(until: Instant) -> io::Result<()> {
@@ -326,23 +336,24 @@ impl Socket {
                 return Err(io::Error::last_os_error());
             }
             // SAFETY: this is the fresh, uniquely owned successful socket descriptor.
-            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            #[cfg(not(target_os = "linux"))]
+            {
+                // SAFETY: F_GETFL takes no extra argument on this live fd.
+                let status = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+                if status < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // Before the mark, as F_SETFD replaces every descriptor flag.
+                // SAFETY: the setters take an integer flag argument on this live fd.
+                if unsafe { libc::fcntl(raw, libc::F_SETFL, status | libc::O_NONBLOCK) } < 0
+                    || unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(fd)
         })?;
-        let raw = fd.as_raw_fd();
-        // SAFETY: both fcntl getters take no extra argument on this live fd.
-        let status = unsafe { libc::fcntl(raw, libc::F_GETFL) };
-        // SAFETY: as above.
-        let descriptor = unsafe { libc::fcntl(raw, libc::F_GETFD) };
-        if status < 0 || descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the setters take an integer flag argument on this live fd.
-        if unsafe { libc::fcntl(raw, libc::F_SETFL, status | libc::O_NONBLOCK) } < 0
-            // SAFETY: as above, these are the descriptor flags from its getter.
-            || unsafe { libc::fcntl(raw, libc::F_SETFD, descriptor | libc::FD_CLOEXEC) } < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
         Ok(Self(fd))
     }
     fn readable(&self, until: Instant) -> io::Result<()> {

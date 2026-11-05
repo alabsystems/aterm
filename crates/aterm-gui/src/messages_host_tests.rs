@@ -1623,6 +1623,7 @@ pub(crate) fn parked() -> crate::PendingUpdateHandoff {
         target_build: 0,
         target_commit: String::new(),
         layout: crate::restore::RestoreManifest::new(Vec::new()),
+        carry_lone_lists: false,
         layout_digest: [0; 32],
         screen_digest: [0; 32],
         activity_epoch: 0,
@@ -3564,6 +3565,104 @@ fn a_harness_note_is_recorded_and_never_takes_a_row() {
     );
 }
 
+/// A codex-alab act record as `appnotice harness` carries it: exactly 512 bytes, the act's words
+/// first and `tail` (its fact, its why and its turn) whole at its end.
+fn act_record(tail: &str) -> String {
+    let head = "codex-alab @s-7a87fc5eca87be9d2ffb: typed \"[aterm harness] Autopilot is Cruise: \
+                keep going. Finish, verify and land the work, then find the next improvement. ";
+    let mut text = head.to_string();
+    while text.len() + tail.len() < 512 {
+        text.push_str("Decide and record why for later AI review. ");
+    }
+    text.truncate(512 - tail.len());
+    text.push_str(tail);
+    text
+}
+
+/// THE MESSAGES LOG KEEPS A HARNESS NOTE WHOLE (gap 23): a 512-byte codex-alab act record whose
+/// rider sits past the title's cut is on record whole, its title the note cut to `TITLE_CAP`
+/// characters with an ellipsis (its first 119 and `…`) and its detail the whole text in lines of
+/// at most `DETAIL_LINE_CAP` characters that join back into it. A note the title holds whole gets no detail. NEGATIVE CONTROL: the title
+/// alone does not carry the rider.
+#[test]
+fn a_harness_note_longer_than_its_title_is_recorded_whole() {
+    let mut app = App::headless_for_test();
+    let rider = " (aterm: a background call (pid 74736) has made no progress for 4 min)";
+    let text = act_record(&format!(
+        "{rider}\" (continue@v1 at a turn end; turn 019a5f3c-7d21-7c43-9e0b-2f6a1d4c8e90)"
+    ));
+    assert_eq!(text.len(), 512);
+    assert!(
+        text.find(rider)
+            .is_some_and(|at| at > aterm_messages::TITLE_CAP)
+    );
+    assert!(app.record_harness_note(&text));
+    let rec = app
+        .messages
+        .log()
+        .records()
+        .rfind(|r| r.tag.as_str() == "harness")
+        .expect("the note's record");
+    let kept: String = text.chars().take(aterm_messages::TITLE_CAP - 1).collect();
+    assert_eq!(rec.title, format!("{kept}\u{2026}"));
+    assert!(!rec.title.contains(rider), "the title alone is cut");
+    assert_eq!(rec.detail.concat(), text, "the detail is the whole note");
+    assert_eq!(rec.detail.len(), 3);
+    assert!(
+        rec.detail
+            .iter()
+            .all(|l| l.chars().count() <= aterm_messages::DETAIL_LINE_CAP)
+    );
+    assert!(app.record_harness_note("aterm harness idle"));
+    let short = app
+        .messages
+        .log()
+        .records()
+        .rfind(|r| r.tag.as_str() == "harness")
+        .expect("the short note's record");
+    assert_eq!(
+        (short.title.as_str(), short.detail.len()),
+        ("aterm harness idle", 0)
+    );
+}
+
+/// A REPEAT IS JUDGED BY THE WHOLE NOTE: two act records whose titles match (every Cruise
+/// continuation's do) and whose tails differ are two records; a note identical to the last one
+/// recorded is not written again, and one identical to an earlier note but not the last is (A,
+/// B, A writes A twice). NEGATIVE CONTROL: the two share their title.
+#[test]
+fn harness_notes_that_differ_past_their_title_are_two_records() {
+    let mut app = App::headless_for_test();
+    let harness = |app: &App| {
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.tag.as_str() == "harness")
+            .count()
+    };
+    let plain = act_record("\" (continue@v1 at a turn end; turn 019a5f3c-0001)");
+    let ridden = act_record(
+        " (aterm: a background call (pid 74736) has made no progress for 4 min)\" \
+         (continue@v1 at a turn end; turn 019a5f3c-0002)",
+    );
+    assert_eq!(
+        crate::message_reporters::harness_note(&plain).title,
+        crate::message_reporters::harness_note(&ridden).title
+    );
+    let before = harness(&app);
+    assert!(app.record_harness_note(&plain));
+    assert!(app.record_harness_note(&ridden));
+    assert_eq!(harness(&app), before + 2, "two acts, two records");
+    assert!(!app.record_harness_note(&ridden));
+    assert_eq!(
+        harness(&app),
+        before + 2,
+        "an identical repeat is not written again"
+    );
+    assert!(app.record_harness_note(&plain), "A, B, A writes A twice");
+    assert_eq!(harness(&app), before + 3);
+}
+
 #[test]
 fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
     let mut app = App::headless_for_test();
@@ -3770,7 +3869,7 @@ fn r44_host2_a_reload_that_never_rederived_the_font_family_leaves_its_row() {
 fn r44_review_a_reload_whose_font_work_admits_the_family_closes_its_rejection() {
     fn reload(app: &mut App, dir: &std::path::Path, warnings: Vec<String>) {
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, "# font_family cleared\n").expect("write config");
+        crate::test_scratch::write_config(&path, "# font_family cleared\n");
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .expect("observe");

@@ -1258,6 +1258,11 @@ fn identified_usage_uses_the_shared_configuration_and_the_selected_auth_file() {
         Duration::from_secs(60),
         now,
         Some("selected@example.test"),
+        super::super::provider_read::Use::fixture(
+            super::super::provider_read::Read::CodexEndpoint,
+            &auth_home,
+            None,
+        ),
     )
     .expect("shared route");
     server.join().unwrap();
@@ -3361,7 +3366,18 @@ fn credential_context_tracks_semantic_material_and_route_without_read_side_effec
         )
         .unwrap();
         assert!(current_context(&home, root.path()).is_none());
-        let observed = observed_in_home(&home, root.path(), Duration::ZERO, 1_790_000_000, None);
+        let observed = observed_in_home(
+            &home,
+            root.path(),
+            Duration::ZERO,
+            1_790_000_000,
+            None,
+            super::super::provider_read::Use::fixture(
+                super::super::provider_read::Read::CodexEndpoint,
+                &home,
+                None,
+            ),
+        );
         assert_eq!(observed.reading, Reading::Unread);
         assert!(observed.context.is_none());
     }
@@ -3461,9 +3477,12 @@ fn a_login_the_provider_refused_reads_signed_out_and_a_failed_refresh_reads_noth
 /// sign-out that would end the owner's pin. The rotation lands only after aterm has read the
 /// refusal, while it looks for one, and the provider serves the usage to the rotated access
 /// token alone, as the real one does: the refused token still reads `401`. Its usage is read
-/// with the rotation, and the spent token is not sent again.
+/// with the rotation, and the spent token is not sent again. The writer is this test's own
+/// thread, so the look waits the hang detector for it ([`SignedOutLook`]), inside a read deadline
+/// past that look.
 #[test]
 fn a_refresh_refused_as_reused_reads_the_rotation_another_program_wrote() {
+    let _look = SignedOutLook::set(aterm_spec::wait::MUST_HAPPEN);
     let now = 1_790_000_000;
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
     let home = tmp.path().join("login");
@@ -3523,7 +3542,7 @@ fn a_refresh_refused_as_reused_reads_the_rotation_another_program_wrote() {
         &home,
         &format!("http://127.0.0.1:{port}/backend-api/wham/usage"),
         &format!("http://127.0.0.1:{port}/oauth/token"),
-        aterm_spec::wait::MUST_HAPPEN,
+        aterm_spec::wait::MUST_HAPPEN * 2,
         now,
         None,
     );

@@ -161,7 +161,7 @@ fn an_earlier_need_the_checks_turn_retracted_lands() {
                    fix or delete tests/test_clock.sh.";
     let last = format!("NEEDS YOU: nothing\n{LANDED_WORD}");
     assert_eq!(
-        land_check::land_check_answer(&last, Some(interim), false),
+        land_check::land_check_answer(&last, Some(interim.into()), false),
         CheckAnswer::Landed
     );
     let (mut st, now) = instructed(t0());
@@ -734,7 +734,7 @@ fn the_checks_turn_may_name_what_it_then_landed() {
         "the strict reader reads it open"
     );
     assert_eq!(
-        land_check::land_check_answer(LANDED_WORD, Some(working), false),
+        land_check::land_check_answer(LANDED_WORD, Some(working.into()), false),
         CheckAnswer::Landed
     );
     let (mut st, now) = instructed(t0());
@@ -811,33 +811,77 @@ const RETRACTED_BEFORE: &str = "./check.sh fails on main in tests/test_clock.sh.
                                 whether to fix or delete tests/test_clock.sh.\n\nThe flake was \
                                 mine: fixed it, committed and pushed. NEEDS YOU: nothing";
 
-/// A RETRACTION IN AN EARLIER MESSAGE OF THE CHECK'S TURN IS ITS LAST WORD (the second review,
-/// 2026-11-01): the check asks for `LANDED` alone, so an agent that obeys says its `NEEDS YOU:
-/// nothing` in a message before it; the turn lands, rests on nothing, and the need a point before
-/// it raised comes down. A need said after the retraction still stands, and rests.
-/// Negative control: `needs::standing_before` reading the last message alone (the first round's
-/// rule) rests on the retracted need and keeps it on the menu bar.
+/// A RETRACTION IN AN EARLIER MESSAGE OF THE CHECK'S TURN RETRACTS THE NEEDS OF ITS OWN MESSAGE
+/// (the second review, 2026-11-01; the review of 2026-11-02): the check asks for `LANDED` alone,
+/// so an agent that obeys says its `NEEDS YOU: nothing` in a message before it; where that
+/// message named the need before its none, the turn lands, rests on nothing, and the need a point
+/// before it raised comes down. A none in a message of its own retracts nothing another message
+/// named (a relayed worker's closing line reads so): the need stands, and the answer rests on it
+/// until the agent's last word says none, which lands. A need said after any retraction stands,
+/// and rests. Negative controls: `needs::standing_before` reading the last message alone (this
+/// branch's first cut) rests on the need its own message retracted; reading the earlier messages
+/// from the last none paragraph across message bounds (`origin/main` `21b1e42025`) lands on a
+/// none in a message of its own and takes the need off the menu bar.
 #[test]
 fn a_need_an_earlier_message_of_the_checks_turn_retracted_lands() {
-    assert_eq!(
-        land_check::land_check_answer(LANDED_WORD, Some(RETRACTED_BEFORE), false),
-        CheckAnswer::Landed
-    );
     let defense =
         format!("{DEFENSE}\nNEEDS YOU: decide whether to fix or delete tests/test_clock.sh.");
-    let (mut st, now) = instructed(t0());
-    let r = worked(&defense);
-    let a = at(&mut st, &r, now);
-    assert_eq!(a.rule_id(), Some(RULE_LAND_CHECK), "{a:?}");
+    let raised = || {
+        let (mut st, now) = instructed(t0());
+        let r = worked(&defense);
+        let a = at(&mut st, &r, now);
+        assert_eq!(a.rule_id(), Some(RULE_LAND_CHECK), "{a:?}");
+        assert_eq!(
+            st.standing_needs().len(),
+            1,
+            "raised at the defense: {st:?}"
+        );
+        st.acted(&a, &r, now);
+        (st, now)
+    };
     assert_eq!(
-        st.standing_needs().len(),
-        1,
-        "raised at the defense: {st:?}"
+        land_check::land_check_answer(LANDED_WORD, Some(RETRACTED_BEFORE.into()), false),
+        CheckAnswer::Landed
     );
-    st.acted(&a, &r, now);
+    let (mut st, now) = raised();
     let answer = TurnEndReading {
         turn_said: Some(RETRACTED_BEFORE.into()),
         ..worked(LANDED_WORD)
+    };
+    let (b, _) = decided(&mut st, &answer, now + 4 * MIN);
+    assert_eq!(b, TurnEndAction::Nothing, "{st:?}");
+    assert!(st.landed() && !st.land_resting(), "{st:?}");
+    assert!(st.standing_needs().is_empty(), "{:?}", st.standing_needs());
+    // The none in a message of its own: the need of the message before it stands.
+    let (need, none) = RETRACTED_BEFORE.split_once("\n\n").expect("two paragraphs");
+    let (said, said_breaks) = needs::joined(Some(vec![need.to_string(), none.to_string()]));
+    let apart = TurnEndReading {
+        turn_said: said,
+        turn_breaks: needs::Breaks {
+            said: said_breaks,
+            lines: Vec::new(),
+        },
+        ..worked(LANDED_WORD)
+    };
+    assert_eq!(
+        land_check::land_check_answer(LANDED_WORD, apart.before(), false),
+        CheckAnswer::Needs { rest_landed: true },
+        "a none in a message of its own is no word on another's need"
+    );
+    let (mut st, now) = raised();
+    let (b, _) = decided(&mut st, &apart, now + 4 * MIN);
+    assert_eq!(b, TurnEndAction::Nothing, "{st:?}");
+    assert!(!st.landed() && st.land_resting(), "{st:?}");
+    assert!(
+        matches!(st.standing_needs(), [need] if need.starts_with("decide whether to fix")),
+        "{st:?}"
+    );
+    // The last message's own none retracts every need the turn named before it, and lands.
+    let (mut st, now) = raised();
+    let answer = TurnEndReading {
+        turn_said: apart.turn_said.clone(),
+        turn_breaks: apart.turn_breaks.clone(),
+        ..worked(&format!("{LANDED_WORD}\nNEEDS YOU: nothing"))
     };
     let (b, _) = decided(&mut st, &answer, now + 4 * MIN);
     assert_eq!(b, TurnEndAction::Nothing, "{st:?}");
@@ -858,6 +902,76 @@ fn a_need_an_earlier_message_of_the_checks_turn_retracted_lands() {
     assert_eq!(b, TurnEndAction::Nothing, "{st:?}");
     assert!(!st.landed() && st.land_resting(), "{st:?}");
     assert_eq!(st.standing_needs(), ["rotate the deploy key"], "{st:?}");
+}
+
+/// A NONE THAT IS NOT THE AGENT'S OWN LAST WORD TAKES DOWN NO NEED AN EARLIER POINT RAISED (the
+/// review of fix/landed-review-2, 2026-11-02): a relayed worker's quoted `NEEDS YOU: nothing` in
+/// an earlier message, its unquoted closing line in a message of the lead's, or a quoted one in the
+/// last message, leaves the need the defense raised standing on the menu bar, under Land and under
+/// Cruise. CONTROL: the last message's own none takes it down. Negative control: the fold
+/// clearing the needs wherever the turn's words say none (`fold_needs` on `says_no_needs` of the
+/// joined words, `origin/main` `21b1e42025` and the branch's first cut) loses the need.
+#[test]
+fn a_none_not_the_agents_own_last_word_keeps_an_earlier_points_need() {
+    let need = "decide whether to fix or delete tests/test_clock.sh.";
+    let defense = format!("{DEFENSE}\nNEEDS YOU: {need}");
+    let went_on = "Moving on to the docs while that waits.";
+    let quoted = "@s-a reported:\n> Landed the fix on origin/main.\n> NEEDS YOU: nothing";
+    let turns = [
+        (Some(quoted), went_on.to_string()),
+        (
+            Some("@s-a reported:\n\nNEEDS YOU: nothing"),
+            went_on.to_string(),
+        ),
+        (
+            None,
+            format!("Worker s-a says:\n> NEEDS YOU: nothing\n\n{went_on}"),
+        ),
+    ];
+    let stands = |st: &TurnEndState| st.standing_needs() == [need];
+    for (before, last) in &turns {
+        let (mut st, now) = instructed(t0());
+        let r = worked(&defense);
+        let a = at(&mut st, &r, now);
+        assert_eq!(a.rule_id(), Some(RULE_LAND_CHECK), "{a:?}");
+        st.acted(&a, &r, now);
+        assert!(stands(&st), "raised at the defense: {st:?}");
+        let answer = TurnEndReading {
+            turn_said: before.map(str::to_string),
+            ..worked(last)
+        };
+        let _ = decided(&mut st, &answer, now + 4 * MIN);
+        assert!(
+            stands(&st),
+            "Land, {before:?} / {last:?}: {:?}",
+            st.standing_needs()
+        );
+        let mut st = TurnEndState::default();
+        let _ = act(&mut st, &idle(&defense, Some(3 * MIN)), t0());
+        assert!(stands(&st), "Cruise raised it: {st:?}");
+        let r = TurnEndReading {
+            turn_said: before.map(str::to_string),
+            ..idle(last, Some(3 * MIN))
+        };
+        let _ = act(&mut st, &r, t0() + 4 * MIN);
+        assert!(
+            stands(&st),
+            "Cruise, {before:?} / {last:?}: {:?}",
+            st.standing_needs()
+        );
+    }
+    let mut st = TurnEndState::default();
+    let _ = act(&mut st, &idle(&defense, Some(3 * MIN)), t0());
+    let r = TurnEndReading {
+        turn_said: Some(quoted.to_string()),
+        ..idle(&format!("{went_on}\n\nNEEDS YOU: nothing"), Some(3 * MIN))
+    };
+    let _ = act(&mut st, &r, t0() + 4 * MIN);
+    assert!(
+        st.standing_needs().is_empty(),
+        "CONTROL: the last message's own none: {:?}",
+        st.standing_needs()
+    );
 }
 
 /// AN OFF NO PERSON SET KEEPS LAND'S REST ON A NEED (the second review, 2026-11-01): a lead's

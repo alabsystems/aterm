@@ -61,13 +61,8 @@ pub(crate) fn validate_args(args: &[String]) -> Result<(), Fail> {
 
 fn retain(dir: &Path, name: &str, text: &str) -> Result<(), String> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     let path = dir.join(name);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
+    let mut file = crate::util::create_new_regular_file(&path, 0o600)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     file.write_all(text.as_bytes())
         .and_then(|()| aterm_durable::durable(&file))
@@ -493,7 +488,8 @@ impl Scenario<'_> {
             return Err(format!("client pixels not retained: {}", copied.tail(3)));
         }
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600))
+        aterm_uds::regular_file::open(&local)
+            .and_then(|(f, _)| f.set_permissions(std::fs::Permissions::from_mode(0o600)))
             .map_err(|e| e.to_string())?;
         // Guest evidence is removed only after the host copy and its directory
         // entry are durable, including captures copied by the external transport.

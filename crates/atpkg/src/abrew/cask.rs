@@ -471,14 +471,13 @@ fn install_inner(
         let wants_exec = artifacts.iter().any(|(_, _, _, exec)| *exec);
         #[cfg(unix)]
         if wants_exec {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&staged_file, std::fs::Permissions::from_mode(0o755))
+            crate::metadata_io::set_regular_mode(&staged_file, 0o755)
                 .map_err(|e| format!("abrew: {e}"))?;
             for (relative, _, _, exec) in &artifacts {
                 if *exec {
                     let f = payload.join(relative);
                     if f.is_file() {
-                        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755))
+                        crate::metadata_io::set_regular_mode(&f, 0o755)
                             .map_err(|e| format!("abrew: {e}"))?;
                     }
                 }
@@ -1144,15 +1143,7 @@ fn stage_wrappers(
             script.push_str(&shell_quote(&argument));
         }
         script.push_str(" \"$@\"\n");
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o755);
-        }
-        let mut writer = options
-            .open(directory.join(file))
+        let mut writer = crate::platform::open_create_new_write(&directory.join(file), 0o755)
             .map_err(|error| format!("abrew: cannot stage wrapper: {error}"))?;
         #[cfg(unix)]
         {
@@ -1866,9 +1857,16 @@ fn artifact_directories(
         for entry in entries {
             let entry = entry
                 .map_err(|error| format!("abrew: cannot survey legacy artifact entry: {error}"))?;
-            let metadata = std::fs::symlink_metadata(entry.path())
+            let kind = entry
+                .file_type()
                 .map_err(|error| format!("abrew: cannot inspect legacy artifact entry: {error}"))?;
-            if metadata.file_type().is_dir() && !crate::platform::is_reparse(&metadata) {
+            if !kind.is_dir() {
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .map_err(|error| format!("abrew: cannot inspect legacy artifact entry: {error}"))?;
+            if !crate::platform::is_reparse(&metadata) {
                 pending.push((entry.path(), depth - 1));
             }
         }
@@ -1965,11 +1963,8 @@ fn glob_walk(base: &Path, segments: &[&str], out: &mut Vec<PathBuf>) {
         if let Ok(entries) = std::fs::read_dir(base) {
             let mut names: Vec<PathBuf> = entries
                 .flatten()
+                .filter(|e| segment_matches(first, &e.file_name().to_string_lossy()))
                 .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .is_some_and(|n| segment_matches(first, &n.to_string_lossy()))
-                })
                 .collect();
             names.sort();
             for path in names {
@@ -2156,24 +2151,26 @@ fn zap_rmdir(prefix: &Prefix, paths: &[String]) {
         let Ok(entries) = std::fs::read_dir(path) else {
             return false;
         };
-        let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        children.sort();
-        if !children.iter().all(|child| {
-            child.is_dir() && !child.is_symlink()
-                || child.file_name().is_some_and(|n| n == ".DS_Store")
+        let mut children: Vec<(PathBuf, Option<std::fs::FileType>)> = entries
+            .flatten()
+            .map(|e| (e.path(), e.file_type().ok()))
+            .collect();
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+        if !children.iter().all(|(child, ft)| {
+            ft.is_some_and(|ft| ft.is_dir()) || child.file_name().is_some_and(|n| n == ".DS_Store")
         }) {
             return false;
         }
         if let Some(ds) = children
             .iter()
-            .position(|child| child.file_name().is_some_and(|n| n == ".DS_Store"))
+            .position(|(child, _)| child.file_name().is_some_and(|n| n == ".DS_Store"))
         {
-            let ds = children.remove(ds);
+            let (ds, _) = children.remove(ds);
             if std::fs::remove_file(&ds).is_err() {
                 return false;
             }
         }
-        if !children.iter().all(|child| recursive(child, home)) {
+        if !children.iter().all(|(child, _)| recursive(child, home)) {
             return false;
         }
         std::fs::remove_dir(path).is_ok()
@@ -2383,8 +2380,6 @@ impl UninstallPlan {
             // never surveyed through. Other directory aliases still refuse below.
             if recorded.iter().any(|(version, paths)| {
                 paths.contains(dir)
-                    && std::fs::symlink_metadata(dir)
-                        .is_ok_and(|metadata| metadata.file_type().is_symlink())
                     && std::fs::read_link(dir).is_ok_and(|target| {
                         link_target_points_into(dir, &target, &plan.base.join(version))
                     })
@@ -2415,12 +2410,12 @@ impl UninstallPlan {
             plan.parents.insert(dir.clone(), identity);
             for entry in std::fs::read_dir(dir).map_err(|e| format!("abrew: {e}"))? {
                 let entry = entry.map_err(|e| format!("abrew: {e}"))?;
-                let path = entry.path();
-                let identity =
-                    std::fs::symlink_metadata(&path).map_err(|e| format!("abrew: {e}"))?;
-                if !identity.file_type().is_symlink() {
+                let kind = entry.file_type().map_err(|e| format!("abrew: {e}"))?;
+                if !kind.is_symlink() {
                     continue;
                 }
+                let path = entry.path();
+                let identity = entry.metadata().map_err(|e| format!("abrew: {e}"))?;
                 let target = std::fs::read_link(&path).map_err(|e| format!("abrew: {e}"))?;
                 if plan.payloads.keys().any(|version| {
                     link_target_points_into(&path, &target, &plan.base.join(version))

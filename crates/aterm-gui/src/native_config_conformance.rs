@@ -180,7 +180,7 @@ fn settings_manual_handoff_conforms_for_selection_fallback_reuse_and_path_author
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("aterm.toml");
     let source = "theme = \"Nord\"\n";
-    std::fs::write(&path, source).unwrap();
+    crate::test_scratch::write_config(&path, source);
 
     let model = manual_config_handoff_model();
     let initial = model.init_state();
@@ -544,7 +544,7 @@ fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() 
     let model = config_file_commit_cas_model();
 
     let path = root.join("manual-wins.toml");
-    std::fs::write(&path, "theme = \"Default\"\n").unwrap();
+    crate::test_scratch::write_config(&path, "theme = \"Default\"\n");
     let mut app = App::headless_for_test();
     app.native_config_service = VersionedConfigService::load_path(&path).unwrap();
     let (manual_document, manual_view) = prepare_manual(&mut app, &path, "theme = \"Dracula\"\n");
@@ -593,7 +593,7 @@ fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() 
     assert!(!model.check_invariant("NoStalePublication", &blind));
 
     let path = root.join("settings-wins.toml");
-    std::fs::write(&path, "theme = \"Default\"\n").unwrap();
+    crate::test_scratch::write_config(&path, "theme = \"Default\"\n");
     let mut app = App::headless_for_test();
     app.native_config_service = VersionedConfigService::load_path(&path).unwrap();
     let (manual_document, manual_view) = prepare_manual(&mut app, &path, "theme = \"Dracula\"\n");
@@ -638,8 +638,8 @@ fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() 
         let target = root.join("managed.toml");
         let replacement = root.join("replacement.toml");
         let logical = root.join("linked.toml");
-        std::fs::write(&target, "theme = \"Default\"\n").unwrap();
-        std::fs::write(&replacement, "theme = \"Dracula\"\n").unwrap();
+        crate::test_scratch::write_config(&target, "theme = \"Default\"\n");
+        crate::test_scratch::write_config(&replacement, "theme = \"Dracula\"\n");
         symlink(&target, &logical).unwrap();
         let mut service = VersionedConfigService::load_path(&logical).unwrap();
         let base = service.snapshot().revision;

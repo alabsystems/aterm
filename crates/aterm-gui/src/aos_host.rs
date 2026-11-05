@@ -72,15 +72,192 @@ pub(crate) fn key_privacy(
     }
 }
 
-/// Routes a typed key with privacy verdict `verdict` ([`echo::admit_key`]) through `ws`'s hold.
+/// Routes a typed key with privacy verdict `verdict` ([`echo::admit_key`]) through `ws`'s hold, at
+/// `now`. The person's grant is consulted ([`unseen_covers`], with `group` the press's session's
+/// foreground group, read only then) only for a raw key, or a key with no verdict while keys are
+/// held: a no-echo key or Secure Keyboard Entry never reaches it, so the grant can neither lapse
+/// before nor soften their stop.
 pub(crate) fn admit_key(
     ws: &mut crate::WindowState,
     verdict: Option<&'static str>,
     press: &echo::Press,
-    cells: impl FnOnce(&mut Vec<char>) -> bool,
+    cells: impl FnOnce(&mut Vec<char>) -> echo::TypedCells,
+    group: impl FnOnce() -> Option<i32>,
+    now: Instant,
 ) -> echo::KeyRoute {
+    let covered = match verdict {
+        Some(why) if why != RAW_KEY => false,
+        None if ws.aos.hold.is_none() => false,
+        _ => unseen_covers(ws, press.session, group, now),
+    };
     let momentum = &mut ws.fx.cursor_mut().momentum;
-    echo::admit_key(&mut ws.aos, momentum, verdict, press, cells)
+    echo::admit_key(&mut ws.aos, momentum, verdict, press, cells, covered)
+}
+
+/// Why the person's grant to record keys aterm cannot see echoed ended before its attach did: the
+/// person's own stop.
+pub(crate) const UNSEEN_BY_PERSON: &str = "person";
+
+/// Why the grant ended before its attach did: a raw key went to its session while another process
+/// group led that session's foreground.
+pub(crate) const UNSEEN_PROGRAM_LEFT: &str = "program left";
+
+/// The grant's refusal of a gesture no person at the window is known to have made.
+pub(crate) const UNSEEN_PERSON_ONLY: &str =
+    "Recording keys aterm cannot see echoed is the person's own choice at the window.";
+/// The grant's refusal with no terminal in front.
+pub(crate) const UNSEEN_NO_TERMINAL: &str =
+    "Nothing was changed: no terminal is in front of this window.";
+/// The grant's refusal with no recording attached.
+pub(crate) const UNSEEN_NOT_RECORDING: &str =
+    "Nothing was changed: no recording is attached in this window (aterm ctl aos attach).";
+/// The grant's refusal while keys are held for their echo.
+pub(crate) const UNSEEN_HELD: &str =
+    "Nothing was changed: keys wait for their echo; try again once they settle.";
+/// The grant's refusal when the tab's foreground group cannot be read.
+pub(crate) const UNSEEN_NO_GROUP: &str =
+    "Nothing was changed: aterm cannot read which program leads this tab.";
+/// The grant's refusal once the attach it was asked for has ended.
+pub(crate) const UNSEEN_GONE: &str =
+    "Nothing was changed: the recording it was asked for has ended.";
+/// The grant's refusal when another process group leads the tab after the alert.
+pub(crate) const UNSEEN_MOVED: &str =
+    "Nothing was changed: another program leads this tab now than the one aterm asked about.";
+/// The grant's refusal when the person declined.
+pub(crate) const UNSEEN_DECLINED: &str = "Nothing was changed.";
+
+/// The owner alert's title for the grant.
+pub(crate) const UNSEEN_ALERT_TITLE: &str = "Record keys aterm cannot see echoed?";
+
+/// The owner alert's proceed button for the grant.
+pub(crate) const UNSEEN_ALERT_PROCEED: &str = "Record Them";
+
+/// The owner alert's words for the grant over `program`: what is recorded, until when, and which
+/// stops still apply.
+pub(crate) fn unseen_alert_body(program: &str) -> String {
+    format!(
+        "This window's recording will also keep when you type each key that {program} does not \
+         show, until the recording ends or {program} leaves the front of this tab: how many keys \
+         in each burst, and one instant per burst. That includes a password typed where nothing \
+         shows it, such as a remote sudo through ssh (ssh, mosh and tmux pass on other programs' \
+         prompts). aterm still stops the recording at a password prompt it can see: a local one, \
+         one that shows * or \u{2022} as you type, and Secure Keyboard Entry."
+    )
+}
+
+/// The person's yes in aterm's alert to record keys aterm cannot see echoed (ATERM-KI-1025-1's D12):
+/// for attach `attach` of this window's glow, while process group `group` leads session
+/// `session`'s foreground. Built only by [`App::aos_unseen_grant`], from an `OwnerYes` that only
+/// aterm's alert mints; it lives in memory only, and no config, handoff or verb carries one.
+#[derive(Debug)]
+pub(crate) struct UnseenGrant {
+    attach: u64,
+    session: u64,
+    group: i32,
+    program: String,
+    _yes: crate::native_settings::OwnerYes,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether a test lets the grant outlive its attach (no check of its attach, no clear when the
+    /// attach ends): the claim-2 binding's mutant of `OptInEndsWithItsAttach`.
+    pub(crate) static GRANT_OUTLIVES_ATTACH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The foreground group a test's sessions report: fixture masters are not terminals.
+    pub(crate) static FRONT_GROUP: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the grant outlives its attach: never, but under a test's mutant.
+fn grant_outlives_attach() -> bool {
+    #[cfg(test)]
+    {
+        GRANT_OUTLIVES_ATTACH.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// The process group that leads `sink`'s foreground: the one reader of it the press path and the
+/// grant's handler share (a test's [`FRONT_GROUP`] stands in for a fixture's sessions).
+pub(crate) fn front_group(sink: &aterm_session::sink::SinkWriter) -> Option<i32> {
+    #[cfg(test)]
+    {
+        let _ = sink;
+        FRONT_GROUP.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        sink.foreground_group()
+    }
+}
+
+/// Drops `aos`'s grant as its attach ends (every place an attach ends calls it).
+fn end_grant(aos: &mut AosWindow) {
+    if !grant_outlives_attach() {
+        aos.unseen = None;
+    }
+}
+
+/// Whether `aos` holds the person's grant for its live attach: its ordinal is the window's latest,
+/// an epoch is set and the glow is attached.
+pub(crate) fn unseen_live(
+    aos: &AosWindow,
+    momentum: &aterm_effects::aos_momentum::MomentumHost,
+) -> bool {
+    aos.unseen.as_ref().is_some_and(|g| {
+        grant_outlives_attach()
+            || (g.attach == aos.attaches && aos.epoch.is_some() && momentum.aos_attached())
+    })
+}
+
+/// Whether a press to `session` falls under `ws`'s grant. A stale grant is dropped. A press to
+/// another session is not covered and lapses nothing. A grant whose session's foreground group
+/// (`group()`, read only after the cheaper checks) is no longer its own lapses: a timeline row
+/// `unseen=off why=program_left` and a log line, and a hold it opened is refuted
+/// ([`private_key`] for [`RAW_KEY`]).
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AosKeyHold",
+        action = "Lapse",
+        project = "aterm_gui::aos_echo_tests::claim2::Gui::project"
+    )
+)]
+pub(crate) fn unseen_covers(
+    ws: &mut crate::WindowState,
+    session: u64,
+    group: impl FnOnce() -> Option<i32>,
+    now: Instant,
+) -> bool {
+    if !unseen_live(&ws.aos, &ws.fx.cursor().momentum) {
+        ws.aos.unseen = None;
+        return false;
+    }
+    let Some(grant) = ws.aos.unseen.as_ref() else {
+        return false;
+    };
+    if grant.session != session {
+        return false;
+    }
+    if group() == Some(grant.group) {
+        return true;
+    }
+    if let Some(grant) = ws.aos.unseen.take() {
+        aterm_log::info!(
+            "aos: the recording's grant to keep keys aterm cannot see echoed ended: {} left the front of its tab",
+            grant.program
+        );
+    }
+    ws.aos.timeline.push(Row::Unseen {
+        on: false,
+        why: UNSEEN_PROGRAM_LEFT,
+    });
+    if ws.aos.hold.is_some() {
+        private_key(ws, RAW_KEY, now);
+    }
+    false
 }
 
 /// What the verb keeps per window between its calls.
@@ -115,6 +292,8 @@ pub(crate) struct AosWindow {
     echo_run: Option<echo::EchoRun>,
     /// The frame's read of the hold's session, kept to reuse its buffers.
     view: echo::EchoView,
+    /// The person's grant for the live attach to keep keys aterm cannot see echoed (RAM only).
+    unseen: Option<UnseenGrant>,
 }
 
 impl AosWindow {
@@ -191,6 +370,8 @@ pub(crate) struct Exported {
     pub(crate) identity: Digest,
     /// [`MomentumTrace::encode`]'s bytes.
     pub(crate) bytes: Vec<u8>,
+    /// How many keys it holds that were logged unseen ([`MomentumTrace::unseen_keys`]).
+    pub(crate) unseen: u32,
 }
 
 /// A plan's publication as the window keeps it, since its bundle cannot be recomputed once the commit has replaced the log: the bundle, and the code and revision [`App::aos_bundle_now`] checks the glow still runs.
@@ -321,6 +502,8 @@ pub(crate) struct TraceSummary {
     pub(crate) log_bytes: usize,
     /// How many keys, resets, ticks and queries the decoded log holds.
     pub(crate) counts: EventCounts,
+    /// How many keys the trace holds that were logged unseen: its checkpoint's count and its log's.
+    pub(crate) unseen: u32,
 }
 
 impl App {
@@ -354,8 +537,10 @@ impl App {
         let build = aterm_types::version::build_id();
         let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
         refute_hold(ws, now);
-        // A run proven under the last recording corroborates nothing in this one.
+        // A run proven under the last recording corroborates nothing in this one, and its grant
+        // ends with it.
         ws.aos.echo_run = None;
+        end_grant(&mut ws.aos);
         ws.aos.attaches = ws.aos.attaches.saturating_add(1);
         ws.aos.epoch = Some(now);
         #[cfg(debug_assertions)]
@@ -628,6 +813,7 @@ impl App {
             }
             if let Some(why) = ws.fx.cursor_mut().momentum.aos_take_detached() {
                 ws.aos.epoch = None;
+                end_grant(&mut ws.aos);
                 #[cfg(debug_assertions)]
                 {
                     ws.aos.published = None;
@@ -743,17 +929,23 @@ impl App {
     pub(crate) fn aos_export_now(&self, kept: Option<u64>) -> Result<Exported, AosRefusal> {
         let id = self.aos_front()?;
         let ws = self.windows.get(&id).ok_or(AosRefusal::NoWindow)?;
-        let (log_epoch, trace) = match kept {
-            Some(n) => ws
-                .aos
-                .kept
-                .iter()
-                .find(|k| k.id == n)
-                .map(|k| (k.log_epoch, k.trace.clone()))
-                .ok_or(AosRefusal::NoKept(n))?,
+        let (log_epoch, trace, unseen) = match kept {
+            Some(n) => {
+                let (log_epoch, trace) = ws
+                    .aos
+                    .kept
+                    .iter()
+                    .find(|k| k.id == n)
+                    .map(|k| (k.log_epoch, k.trace.clone()))
+                    .ok_or(AosRefusal::NoKept(n))?;
+                let unseen = trace
+                    .unseen_keys(Instant::now())
+                    .map_err(|f| AosRefusal::Decode(f.to_string()))?;
+                (log_epoch, trace, unseen)
+            }
             None => {
                 let (summary, trace) = self.aos_trace_export()?;
-                (summary.log_epoch, trace)
+                (summary.log_epoch, trace, summary.unseen)
             }
         };
         Ok(Exported {
@@ -762,6 +954,7 @@ impl App {
             log_epoch,
             identity: trace.identity.digest(),
             bytes: trace.encode(),
+            unseen,
         })
     }
 
@@ -883,6 +1076,7 @@ impl App {
         ws.aos.orphans.extend(retired);
         let held = ws.aos.hold.take();
         echo::hand_over(ws, held, now);
+        end_grant(&mut ws.aos);
         let status = ws.fx.cursor().momentum.aos_status();
         ws.aos.epoch = None;
         #[cfg(debug_assertions)]
@@ -970,6 +1164,10 @@ impl App {
                 )));
             }
         }
+        let start: aterm_effects::aos_momentum::MomentumState = checkpoint
+            .restore(&schema, &trace.identity)
+            .map_err(|e| AosRefusal::Decode(format!("checkpoint: {e}")))?;
+        let counts = EventCounts::of(log.inputs());
         let (first, end) = (log.header().first_cursor, log.end_cursor());
         let summary = TraceSummary {
             window: id,
@@ -983,9 +1181,174 @@ impl App {
             broken: log.broken(),
             checkpoint_bytes: trace.checkpoint.len(),
             log_bytes: trace.log.len(),
-            counts: EventCounts::of(log.inputs()),
+            counts,
+            unseen: start
+                .unseen()
+                .saturating_add(u32::try_from(counts.unseen).unwrap_or(u32::MAX)),
         };
         Ok((summary, trace))
+    }
+
+    /// Whether window `id`'s live recording carries the person's grant to keep keys aterm cannot
+    /// see echoed.
+    pub(crate) fn aos_unseen_on(&self, id: WindowId) -> bool {
+        self.windows
+            .get(&id)
+            .is_some_and(|ws| unseen_live(&ws.aos, &ws.fx.cursor().momentum))
+    }
+
+    /// Stores the person's grant `yes` (aterm's alert, [`crate::native_settings::owner_confirms_with`])
+    /// for window `wid`'s attach `attach`, while process group `group` (`program`) leads session
+    /// `session`'s foreground. It runs after the alert's modal loop, so it checks everything again:
+    /// the window, its glow attached under that same attach with an epoch, no key held, and the
+    /// group still in front. Granted, the timeline gains `unseen=on why=person` and aterm.log a
+    /// line; refused, the yes is spent and nothing changes.
+    ///
+    /// # Errors
+    /// Why the grant was not stored.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AosKeyHold",
+            action = "OptIn",
+            project = "aterm_gui::aos_echo_tests::claim2::Gui::project"
+        )
+    )]
+    pub(crate) fn aos_unseen_grant(
+        &mut self,
+        wid: WindowId,
+        attach: u64,
+        session: u64,
+        group: i32,
+        program: String,
+        yes: crate::native_settings::OwnerYes,
+    ) -> Result<(), &'static str> {
+        let front = self
+            .pool
+            .get(session)
+            .and_then(|s| front_group(&s.ctx.sink));
+        let ws = self.windows.get_mut(&wid).ok_or(UNSEEN_GONE)?;
+        let momentum = &ws.fx.cursor().momentum;
+        if !momentum.aos_attached() || ws.aos.epoch.is_none() || ws.aos.attaches != attach {
+            return Err(UNSEEN_GONE);
+        }
+        if ws.aos.hold.is_some() {
+            return Err(UNSEEN_HELD);
+        }
+        if front != Some(group) {
+            return Err(UNSEEN_MOVED);
+        }
+        aterm_log::info!(
+            "aos: window {}'s recording (log epoch {attach}) keeps keys aterm cannot see echoed while {program} leads its tab, by the person's yes in aterm's alert",
+            wid.0
+        );
+        ws.aos.unseen = Some(UnseenGrant {
+            attach,
+            session,
+            group,
+            program,
+            _yes: yes,
+        });
+        ws.aos.timeline.push(Row::Unseen {
+            on: true,
+            why: UNSEEN_BY_PERSON,
+        });
+        self.aos_reconcile(wid);
+        Ok(())
+    }
+
+    /// The person's own stop of window `wid`'s grant, at `now`: with keys held under it the hold is
+    /// refuted first ([`private_key`] for [`RAW_KEY`]), which ends the recording; otherwise the grant
+    /// ends and the timeline gains `unseen=off why=person`. Anyone may make a recording safer, as
+    /// `aos detach` can, so it asks nothing.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AosKeyHold",
+            action = "Lapse",
+            project = "aterm_gui::aos_echo_tests::claim2::Gui::project"
+        )
+    )]
+    pub(crate) fn aos_unseen_stop(&mut self, wid: WindowId, now: Instant) {
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        if ws.aos.hold.is_some() {
+            private_key(ws, RAW_KEY, now);
+            return;
+        }
+        if ws.aos.unseen.take().is_some() {
+            aterm_log::info!(
+                "aos: window {}'s recording no longer keeps keys aterm cannot see echoed: the person stopped it",
+                wid.0
+            );
+            ws.aos.timeline.push(Row::Unseen {
+                on: false,
+                why: UNSEEN_BY_PERSON,
+            });
+        }
+        self.aos_reconcile(wid);
+    }
+
+    /// View ▸ Record Keys Not Echoed…: with the front window's grant live, the person's stop
+    /// ([`Self::aos_unseen_stop`]); otherwise, for a person's own gesture only (a control client's
+    /// or an accessibility client's is refused before anything is asked), aterm's owner alert for
+    /// the program that leads the front terminal's foreground, whose yes alone grants
+    /// ([`Self::aos_unseen_grant`]). A headless instance's alert is nobody's, so it never grants.
+    pub(crate) fn toggle_unseen_keys(&mut self) {
+        let now = Instant::now();
+        let Ok(wid) = self.aos_front() else {
+            return;
+        };
+        if self.aos_unseen_on(wid) {
+            self.aos_unseen_stop(wid, now);
+            return;
+        }
+        if let Some(who) = self.gesture_unvouched() {
+            aterm_log::info!(
+                "aos: refused a gesture by {who:?} to keep keys aterm cannot see echoed: only the person at the window grants it"
+            );
+            self.pending_action_refusal = Some(UNSEEN_PERSON_ONLY.to_owned());
+            return;
+        }
+        let Some(front) = self.front_terminal(wid).cloned() else {
+            self.pending_action_refusal = Some(UNSEEN_NO_TERMINAL.to_owned());
+            return;
+        };
+        let Some(ws) = self.windows.get(&wid) else {
+            return;
+        };
+        if !ws.fx.cursor().momentum.aos_attached() || ws.aos.epoch.is_none() {
+            self.pending_action_refusal = Some(UNSEEN_NOT_RECORDING.to_owned());
+            return;
+        }
+        if ws.aos.hold.is_some() {
+            self.pending_action_refusal = Some(UNSEEN_HELD.to_owned());
+            return;
+        }
+        let attach = ws.aos.attaches;
+        let Some(group) = front_group(&front.sink) else {
+            self.pending_action_refusal = Some(UNSEEN_NO_GROUP.to_owned());
+            return;
+        };
+        let program = crate::quit_safety::process_name(group)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "the program in front".to_owned());
+        let body = unseen_alert_body(&program);
+        let answer = crate::native_settings::owner_confirms_with(
+            &self.aos_quiet,
+            &self.consent_gestures,
+            UNSEEN_ALERT_TITLE,
+            &body,
+            UNSEEN_ALERT_PROCEED,
+        );
+        self.pending_action_refusal = match answer {
+            crate::native_settings::OwnerAnswer::Yes(yes) => self
+                .aos_unseen_grant(wid, attach, front.session, group, program, yes)
+                .err()
+                .map(str::to_owned),
+            other => Some(other.refusal(UNSEEN_DECLINED).to_owned()),
+        };
     }
 
     /// The `Wake::Aos` handler: `ask` at `now`, answered as the verb's line, where a plan to publish arrives evaluated and a bare [`crate::aos_verb::Asked::Publish`] is refused.
@@ -1016,11 +1379,13 @@ impl App {
             }
         };
         let answer = match asked {
-            Asked::Status => self.aos_status_now().map(|(id, s)| status_line(id.0, &s)),
+            Asked::Status => self
+                .aos_status_now()
+                .map(|(id, s)| status_line(id.0, &s, self.aos_unseen_on(id))),
             Asked::Ls => Ok(self.aos_ls_now().join("\n")),
             Asked::Attach(code) => self
                 .aos_attach_at(code, now)
-                .map(|(id, s)| status_line(id.0, &s)),
+                .map(|(id, s)| status_line(id.0, &s, self.aos_unseen_on(id))),
             Asked::Pause => self.aos_pause_at(now).map(|(id, h)| pause_line(id.0, &h)),
             Asked::Repair(code) => self.aos_repair_at(code, now).map(|r| repair_line(&r)),
             Asked::Publish(_) => return Err(UNEVALUATED.to_string()),
@@ -1033,13 +1398,53 @@ impl App {
             Asked::Resume => self.aos_resume_now().map(|r| resume_line(&r)),
             Asked::Detach => self
                 .aos_detach_now(now)
-                .map(|(id, s)| status_line(id.0, &s)),
+                .map(|(id, s)| status_line(id.0, &s, self.aos_unseen_on(id))),
             Asked::Trace => self.aos_trace_now().map(|t| trace_line(&t)),
             Asked::TraceHex => self
                 .aos_trace_file_now()
                 .map(|(t, file)| trace_file_line(&t, &file)),
         };
         answer.map_err(|refusal| refusal.to_string())
+    }
+}
+
+#[cfg(test)]
+impl App {
+    /// The grant a person's yes in aterm's alert makes, for window `wid`'s front terminal and live
+    /// attach, while the test's [`FRONT_GROUP`] leads it ([`Self::aos_unseen_grant`]).
+    pub(crate) fn aos_grant_for_test(&mut self, wid: WindowId) -> Result<(), &'static str> {
+        let session = self
+            .front_terminal(wid)
+            .map(|t| t.session)
+            .ok_or(UNSEEN_NO_TERMINAL)?;
+        let attach = self
+            .windows
+            .get(&wid)
+            .map(|ws| ws.aos.attaches)
+            .ok_or(UNSEEN_GONE)?;
+        let group = FRONT_GROUP
+            .with(std::cell::Cell::get)
+            .ok_or(UNSEEN_NO_GROUP)?;
+        self.aos_unseen_grant(
+            wid,
+            attach,
+            session,
+            group,
+            "the test's program".to_owned(),
+            crate::native_settings::OwnerYes::for_test(),
+        )
+    }
+
+    /// Window `wid`'s attach count: the ordinal its live attach's grant names.
+    pub(crate) fn aos_attaches_for_test(&self, wid: WindowId) -> u64 {
+        self.windows.get(&wid).map_or(0, |ws| ws.aos.attaches)
+    }
+
+    /// Whether window `wid` holds a grant at all, live or stale.
+    pub(crate) fn aos_holds_grant_for_test(&self, wid: WindowId) -> bool {
+        self.windows
+            .get(&wid)
+            .is_some_and(|ws| ws.aos.unseen.is_some())
     }
 }
 
@@ -1104,6 +1509,7 @@ pub(crate) fn privacy_detach(ws: &mut crate::WindowState, why: &'static str, now
         return;
     }
     let held = ws.aos.hold.take();
+    end_grant(&mut ws.aos);
     let momentum = &mut ws.fx.cursor_mut().momentum;
     if !momentum.aos_attached() {
         echo::hand_over(ws, held, now);

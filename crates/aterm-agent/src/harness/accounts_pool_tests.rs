@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
+#[path = "accounts_execution_tests.rs"]
+mod execution;
+
 #[path = "accounts_pool_quota_tests.rs"]
 mod quota;
 
@@ -22,6 +25,20 @@ const HOUR: i64 = 3600;
 // production Result directly, including the distinction from an unmanaged launch.
 fn launch_env(seat: &Seat<'_>, cli: Cli, read: ReadUsage<'_>) -> Option<LoginEnv> {
     super::launch_env(seat, cli, read).ok().flatten()
+}
+
+// Older selection fixtures assert only the optional replacement. Admission fixtures
+// call the production Result directly and distinguish a refusal from unchanged routing.
+fn cold_launch_env(
+    seat: &Seat<'_>,
+    cli: Cli,
+    env: &[(&str, &str)],
+    read: ReadUsage<'_>,
+    program: Option<&Path>,
+) -> Option<LoginEnv> {
+    super::cold_launch_env(seat, cli, env, read, program)
+        .ok()
+        .flatten()
 }
 
 // Pool-only fixtures have no concurrently replaced GUI process. Runtime callers
@@ -94,6 +111,9 @@ mod canary;
 
 #[path = "accounts_pool_cold_resume_tests.rs"]
 mod cold_resume_capability;
+
+#[path = "accounts_pool_cold_admission_tests.rs"]
+mod cold_admission;
 
 #[path = "accounts_pool_claims_tests.rs"]
 mod claims;
@@ -598,9 +618,10 @@ fn mode_off_records_every_clis_limits_and_moves_none() {
         let world = World::new(&format!("off-{}", cli.id()));
         world.two(cli);
         world.on_main(cli, &[]);
-        std::fs::write(
-            world.cfg.join("aterm.toml"),
-            "[harness]\naccounts = 'off'\n",
+        aterm_uds::atomic_file::write(
+            &(world.cfg.join("aterm.toml")),
+            ("[harness]\naccounts = 'off'\n").as_ref(),
+            0o600,
         )
         .unwrap();
         let moved = session_move(
@@ -904,7 +925,8 @@ fn the_harness_switch_and_a_clis_own_switch_turn_its_launch_rotation_off() {
         world.two(Cli::Codex);
         world.on_main(Cli::Codex, &[]);
         wall(&world, Cli::Codex, "main", NOW + HOUR);
-        std::fs::write(world.cfg.join("aterm.toml"), config).expect("aterm.toml");
+        aterm_uds::atomic_file::write(&(world.cfg.join("aterm.toml")), (config).as_ref(), 0o600)
+            .expect("aterm.toml");
         assert_eq!(world.seat().mode_for(Cli::Codex), Mode::Off, "{config}");
         assert_eq!(
             launch_env(&world.seat(), Cli::Codex, &read),
@@ -913,9 +935,10 @@ fn the_harness_switch_and_a_clis_own_switch_turn_its_launch_rotation_off() {
         );
     }
     let world = World::new("launch-other-cli-on");
-    std::fs::write(
-        world.cfg.join("aterm.toml"),
-        "[harness.codex]\nenabled = false\n",
+    aterm_uds::atomic_file::write(
+        &(world.cfg.join("aterm.toml")),
+        ("[harness.codex]\nenabled = false\n").as_ref(),
+        0o600,
     )
     .expect("aterm.toml");
     assert_eq!(
@@ -931,9 +954,10 @@ fn accounts_off_places_a_launch_on_the_owners_pin_alone() {
     let work = world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
     wall(&world, Cli::Codex, "main", NOW + HOUR);
-    std::fs::write(
-        world.cfg.join("aterm.toml"),
-        "[harness]\naccounts = \"off\"\n",
+    aterm_uds::atomic_file::write(
+        &(world.cfg.join("aterm.toml")),
+        ("[harness]\naccounts = \"off\"\n").as_ref(),
+        0o600,
     )
     .expect("aterm.toml");
     assert_eq!(world.seat().mode_for(Cli::Codex), Mode::Off);
@@ -1634,18 +1658,15 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
         Condition::Limited { .. }
     ));
 
-    // 3. CONTROL: an unpinned lone default row (`[main]`) neither reads usage nor rewrites launch
-    //    env, whereas pinning that lone default row honours the owner's pin.
+    // 3. CONTROL: an unpinned lone default row (`[main]`) rewrites no launch env, whereas pinning
+    //    that lone default row honours the owner's pin.
     let lone = World::new("lone-default-pin");
     std::fs::write(
         lone.cfg.join("accounts-codex.toml"),
         "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
     )
     .expect("lone roster");
-    let panic_read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
-        panic!("unpinned lone default row must not read usage")
-    };
-    assert_eq!(launch_env(&lone.seat(), Cli::Codex, &panic_read), None);
+    assert_eq!(launch_env(&lone.seat(), Cli::Codex, &no_usage), None);
     pin(&lone, Cli::Codex, "main").expect("pin main");
     let pinned_pick =
         launch_env(&lone.seat(), Cli::Codex, &no_usage).expect("pinned lone default row");
@@ -1682,7 +1703,17 @@ struct Readings<'a> {
 }
 
 impl UsageReader for Readings<'_> {
-    fn read(&self, _: Cli, home: &Path, _: Option<&str>, _: i64) -> Reading {
+    fn read(
+        &self,
+        _: Cli,
+        home: &Path,
+        _: Option<&str>,
+        now: i64,
+        use_token: provider_read::Use,
+    ) -> Reading {
+        use_token
+            .begin_home(provider_read::Read::CodexEndpoint, home, now)
+            .unwrap();
         self.readings
             .iter()
             .find(|(at, _)| at == home)
@@ -1695,12 +1726,13 @@ impl UsageReader for Readings<'_> {
         home: &Path,
         expected_email: Option<&str>,
         now: i64,
+        use_token: provider_read::Use,
     ) -> UsageObservation {
         let context = (cli == Cli::Codex)
             .then(|| crate::harness::codex_app_login::current_context(home, self.user_home))
             .flatten();
         UsageObservation {
-            reading: self.read(cli, home, expected_email, now),
+            reading: self.read(cli, home, expected_email, now, use_token),
             context,
         }
     }
@@ -1716,7 +1748,21 @@ fn observe_signed_out(world: &World, label: &str) {
         user_home: &world.home,
         readings: vec![(home, Reading::SignedOut)],
     };
-    poll_usage(&seat, Cli::Codex, &before, row, &read).unwrap();
+    poll_fixture(&seat, Cli::Codex, &before, row, &read).unwrap();
+}
+
+fn poll_fixture(
+    seat: &Seat<'_>,
+    cli: Cli,
+    before: &PoolSnapshot,
+    row: &Row,
+    read: ReadUsage<'_>,
+) -> Result<(accounts::State, bool), String> {
+    let mut launch = provider_read::Launch::launch_use(LaunchUse(()));
+    let token =
+        provider_read::Use::launch_read_use(&mut launch, row_read_account(cli, row, seat.home))
+            .ok_or("fixture launch allowance spent")?;
+    super::poll_usage(seat, cli, before, row, read, token)
 }
 
 #[test]
@@ -1748,9 +1794,10 @@ fn a_login_the_provider_refused_is_signed_out_and_launches_leave_it_until_it_rea
     };
     assert_eq!(launch_opening(&world.seat(), Cli::Codex, None), Some(until));
     // With rotation switched off the launch starts on its own login: it waits on no row.
-    std::fs::write(
-        world.cfg.join("aterm.toml"),
-        "[harness]\naccounts = \"off\"\n",
+    aterm_uds::atomic_file::write(
+        &(world.cfg.join("aterm.toml")),
+        ("[harness]\naccounts = \"off\"\n").as_ref(),
+        0o600,
     )
     .expect("aterm.toml");
     assert_eq!(launch_opening(&world.seat(), Cli::Codex, None), None, "off");
@@ -1846,8 +1893,7 @@ fn a_cold_relaunch_leaves_a_row_that_no_longer_serves_and_keeps_one_that_does() 
 /// walled, or hold a reading of it younger than five minutes, `work` is not read again (the
 /// owner's no-polling rule: only the row a relaunch is about to start on is read, and only when
 /// due); a conversation on a home of its own reads no row's usage at all; on a Codex program that
-/// keeps no row's login its own, a conversation on `work` reads nothing, and one on this machine's
-/// own login reads that row alone.
+/// keeps no row's login its own, only this machine's default login may be read or selected.
 #[test]
 fn a_cold_relaunch_reads_the_row_it_ran_on_before_it_judges_it() {
     let world = World::new("cold-read");
@@ -1970,17 +2016,28 @@ fn a_cold_relaunch_reads_the_row_it_ran_on_before_it_judges_it() {
             &default_alone,
             Some(&old)
         ),
-        None
+        Some(LoginEnv {
+            label: "main".into(),
+            var: "CODEX_AUTH_PATH",
+            value: None
+        })
     );
-    assert!(homes.lock().unwrap().is_empty(), "{homes:?}");
+    assert_eq!(
+        *homes.lock().unwrap(),
+        [unkept.home.join(Cli::Codex.accounts().default_home)],
+        "an unsupported named login is replaced only by the default login"
+    );
     assert_eq!(
         cold_launch_env(&unkept.seat(), Cli::Codex, &[], &default_alone, Some(&old)),
         None
     );
     assert_eq!(
         *homes.lock().unwrap(),
-        [unkept.home.join(Cli::Codex.accounts().default_home)],
-        "CONTROL: this machine's own login, due, is read"
+        [
+            unkept.home.join(Cli::Codex.accounts().default_home),
+            unkept.home.join(Cli::Codex.accounts().default_home)
+        ],
+        "both relaunches read only the default login"
     );
 }
 
@@ -2138,7 +2195,8 @@ fn a_default_row_a_sign_in_moved_is_named_as_moved_on_a_program_that_ignores_cod
     // The way back it names: with rotation off and no pin, the launch takes no row, so Codex
     // runs on this machine's own login; and that switch does what the words say besides.
     let config = world.cfg.join("aterm.toml");
-    std::fs::write(&config, "[harness]\naccounts = \"off\"\n").expect("aterm.toml");
+    aterm_uds::atomic_file::write(&config, ("[harness]\naccounts = \"off\"\n").as_ref(), 0o600)
+        .expect("aterm.toml");
     assert_eq!(
         super::launch_env_for(&world.seat(), Cli::Codex, &no_usage, Some(&old)),
         Ok(None),
@@ -2185,7 +2243,8 @@ fn accounts_off_moves_no_cold_relaunch_onto_the_owners_pin() {
         let moved = cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None)
             .map(|pick| pick.label);
         assert_eq!(moved.as_deref(), Some("main"), "{config}");
-        std::fs::write(world.cfg.join("aterm.toml"), config).expect("aterm.toml");
+        aterm_uds::atomic_file::write(&(world.cfg.join("aterm.toml")), (config).as_ref(), 0o600)
+            .expect("aterm.toml");
         assert_eq!(world.seat().mode_for(Cli::Codex), Mode::Off, "{config}");
         assert_eq!(
             cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None),

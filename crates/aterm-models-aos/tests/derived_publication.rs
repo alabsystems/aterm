@@ -10,11 +10,12 @@ use aterm_spec::derive::{InvariantKind, Model};
 use aterm_spec::interp::{self, State};
 
 /// Each dial and the one law it is written to break.
-const DIALS: [(i64, &str); 4] = [
+const DIALS: [(i64, &str); 5] = [
     (1, "StaleNeverCommitted"),
     (2, "NeverMixed"),
     (3, "EachInputOnce"),
     (4, "DeliveredToTheLivePair"),
+    (5, "QueueBounded"),
 ];
 
 /// The state after firing `steps` in order from the initial state, each of which must be enabled.
@@ -112,6 +113,10 @@ fn a_full_queue_rejects_the_update_and_delivers_everything_to_the_old_pair() {
     let model = aos_boundary_publication_model();
     let s = walk(&model, &["Pause", "PrepareA", "Hold", "Hold"]);
     assert!(!model.action_enabled("Hold", &s));
+    let overbooked = interp::with_buggy(&model, 5);
+    let mut wrong = s.clone();
+    assert!(overbooked.fire("Hold", &mut wrong));
+    assert!(!model.check_invariant("QueueBounded", &wrong));
     let s = walk(
         &model,
         &["Pause", "PrepareA", "Hold", "Hold", "Overflow", "Pause"],

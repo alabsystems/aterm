@@ -948,6 +948,11 @@ fn chose_why(reasons: &[&str], policy: &str) -> String {
             let word = match policy {
                 "long-term" => "Long-term",
                 "short-term" => "Short-term",
+                "land" => {
+                    return "Autopilot is Land: the worker took the option that lands the work \
+                            soonest"
+                        .to_string();
+                }
                 _ => "Recommended",
             };
             format!("Question priority is {word}")
@@ -1578,7 +1583,6 @@ fn drive_files(drive: &Path, since_ms: i64) -> Vec<Listed> {
     };
     let mut out: Vec<Listed> = entries
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .filter_map(|e| {
             let name = e.file_name();
             let name = name.to_str()?;
@@ -1589,28 +1593,38 @@ fn drive_files(drive: &Path, since_ms: i64) -> Vec<Listed> {
             } else {
                 return None;
             };
+            if !e.file_type().is_ok_and(|t| t.is_file()) {
+                return None;
+            }
+            let modified_ms = e.metadata().ok().and_then(meta_modified_ms);
+            if untouched(modified_ms, since_ms) {
+                return None;
+            }
             let sid = name.strip_suffix(kind.suffix()).unwrap_or(name).to_string();
-            let path = e.path();
-            let modified_ms = modified_ms(&path);
             Some(Listed {
-                path,
+                path: e.path(),
                 kind,
                 sid,
                 modified_ms,
             })
         })
-        .filter(|file| !untouched(file.modified_ms, since_ms))
         .collect();
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
-fn modified_ms(path: &Path) -> Option<i64> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
+fn meta_modified_ms(meta: std::fs::Metadata) -> Option<i64> {
+    meta.is_file()
+        .then(|| meta.modified().ok())
+        .flatten()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|d| i64::try_from(d.as_millis()).ok())
+}
+
+fn modified_ms(path: &Path) -> Option<i64> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .and_then(meta_modified_ms)
 }
 
 fn untouched(modified_ms: Option<i64>, since_ms: i64) -> bool {

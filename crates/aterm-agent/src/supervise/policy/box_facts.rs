@@ -72,6 +72,8 @@ pub struct QuestionFacts {
     pub own: Option<QuestionPriority>,
     /// Whether the loop already fell back to the recommended option on this tab.
     pub fell_back: bool,
+    /// Whether a person gave input since the loop's first policy text on this dialog.
+    pub person: bool,
 }
 
 /// Every field name carried by serialized `BoxFacts`.
@@ -161,6 +163,7 @@ impl ApprovalCtx {
                 ctx.question_priority = q.priority;
                 ctx.question_own = q.own;
                 ctx.question_fell_back = q.fell_back;
+                ctx.question_person = q.person;
             }
         }
         ctx.box_call = facts.box_call.clone();
@@ -211,6 +214,8 @@ struct QuestionWire {
     priority: String,
     own: Option<String>,
     fell_back: bool,
+    #[serde(default)]
+    person: bool,
 }
 
 impl BoxFacts {
@@ -234,7 +239,12 @@ impl BoxFacts {
             }),
             shell_cwds: self.shell_cwds.iter().map(|p| text(p)).collect(),
             shell: self.shell.as_ref().map(|s| match s {
-                Ok(s) => Answer::Ok((s.names().to_vec(), s.may_run_zsh())),
+                Ok(s) => Answer::Ok((
+                    s.names().to_vec(),
+                    s.may_run_zsh(),
+                    s.may_extended_glob(),
+                    s.may_dot_glob(),
+                )),
                 Err(why) => Answer::Err(why.clone()),
             }),
             owner_asks: self.owner_asks.as_ref().map(|a| match a {
@@ -248,6 +258,7 @@ impl BoxFacts {
                 priority: q.priority.word().to_string(),
                 own: q.own.map(|o| o.word().to_string()),
                 fell_back: q.fell_back,
+                person: q.person,
             }),
             box_call: self.box_call.clone(),
             login_carry: self.login_carry,
@@ -282,7 +293,7 @@ impl BoxFacts {
             aterm_json::from_value(value).map_err(|e| format!("facts that do not read: {e}"))?;
         let path = |t: &str| roots_decode(t.as_bytes());
         let priority = |w: &str| {
-            QuestionPriority::parse(w).ok_or_else(|| format!("a question priority {w:?}"))
+            QuestionPriority::of_fact(w).ok_or_else(|| format!("a question priority {w:?}"))
         };
         let facts = Self {
             program: wire.program,
@@ -325,7 +336,9 @@ impl BoxFacts {
                 .map(|p| path(p))
                 .collect::<Result<_, _>>()?,
             shell: wire.shell.map(|s| match s {
-                Answer::Ok((names, zsh)) => Ok(ShellStartup::of_parts(names, zsh)),
+                Answer::Ok((names, zsh, extended_glob, dot_glob)) => {
+                    Ok(ShellStartup::of_parts(names, zsh, extended_glob, dot_glob))
+                }
                 Answer::Err(why) => Err(why),
             }),
             owner_asks: wire
@@ -350,6 +363,7 @@ impl BoxFacts {
                         priority: priority(&q.priority)?,
                         own: q.own.as_deref().map(priority).transpose()?,
                         fell_back: q.fell_back,
+                        person: q.person,
                     })
                 })
                 .transpose()?,

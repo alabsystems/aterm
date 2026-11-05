@@ -2491,3 +2491,24 @@ fn clt_a_missing_toolchain_waits_for_the_tabs_own_install() {
     app.note_c_toolchain(atpkg::cli::C_TOOLCHAIN_MISSING);
     assert!(app.owes_exception(&key), "nothing installs them");
 }
+
+/// A QUEUED PRESS'S TAB IS THE PERSON'S, THE AUTOMATIC ONE aterm's: the install's booking names
+/// `by=human` for a press that waited out a macOS dialog, `by=harness` for the launch's own
+/// opening, both `why=install`, which the tab's open says once it lands.
+/// NEGATIVE CONTROL: the two differ only in the queued press.
+#[test]
+fn clt_landing_a_queued_press_books_its_tab_by_the_person_and_the_automatic_one_by_aterm() {
+    for (queued, by) in [
+        (true, crate::session_store::ExitActor::Human),
+        (false, crate::session_store::ExitActor::Harness),
+    ] {
+        let (mut app, _) = page();
+        app.tab_spawns.unsent = true;
+        if queued {
+            app.workstation_setup.developer_tools = Install::PressedQueued { wanted: Some(4) };
+        }
+        app.open_developer_tools_install(aterm);
+        let booked = test_support::booked_act(&app).expect("booked");
+        assert_eq!((booked.by, booked.why), (by, Some("install")), "{queued}");
+    }
+}

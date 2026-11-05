@@ -415,7 +415,7 @@ pub fn install_with(
         .map_err(|e| Error::io("create a fresh lane snapshot", &e))?;
     let snapshot = snapshot_dir.path().to_path_buf();
     let binary = snapshot.join(BINARY);
-    std::fs::copy(&built.binary, &binary)
+    crate::identity::copy_regular_file(&built.binary, &binary)
         .map_err(|e| Error::io(format!("copy into {}", snapshot.display()), &e))?;
     set_mode(&binary, 0o755)?;
     let sha256 = atpkg::tree::sha256_file(&binary)
@@ -549,7 +549,7 @@ pub fn install_with(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     for dir in stamped.iter().filter(|d| **d != out.snapshot) {
-        if let Err(e) = std::fs::write(dir.join(RETIRED), &armed_name) {
+        if let Err(e) = write_regular_file(&dir.join(RETIRED), armed_name.as_bytes()) {
             tx.warn(format!("cannot mark {} retired: {e}", ctx.shown(dir)));
         }
     }
@@ -588,14 +588,12 @@ pub fn install_with(
         .map_err(|e| Error::io(format!("read {}", ctx.state_dir.display()), &e))?
         .flatten()
     {
-        let p = entry.path();
         let is_snapshot = entry.file_name().to_string_lossy().starts_with("lane.");
-        if is_snapshot
-            && !is_symlink(&p)
-            && p.is_dir()
-            && p != out.snapshot
-            && Some(&p) != out.previous.as_ref()
-        {
+        if !is_snapshot || !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let p = entry.path();
+        if p != out.snapshot && Some(&p) != out.previous.as_ref() {
             match aterm_uds::deadline::copy_wait_left(&p, now) {
                 None => {
                     let _ = std::fs::remove_dir_all(&p);
@@ -750,17 +748,16 @@ fn retired_by(dir: &Path, state_dir: &Path) -> Option<PathBuf> {
 fn stamp_at_bootout(state_dir: &Path) -> Vec<PathBuf> {
     let mut stamped = Vec::new();
     for entry in std::fs::read_dir(state_dir).into_iter().flatten().flatten() {
-        let p = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if (name == "lane" || name.starts_with("lane."))
-            && !is_symlink(&p)
-            && p.is_dir()
-            && !p.join(aterm_uds::deadline::RAN).exists()
-            && !p.join(RETIRED).exists()
+            && entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
         {
-            aterm_uds::deadline::stamp_exec(&p);
-            stamped.push(p);
+            let p = entry.path();
+            if !p.join(aterm_uds::deadline::RAN).exists() && !p.join(RETIRED).exists() {
+                aterm_uds::deadline::stamp_exec(&p);
+                stamped.push(p);
+            }
         }
     }
     stamped
@@ -803,8 +800,7 @@ fn symlink(_target: &Path, at: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    crate::identity::set_regular_mode(path, mode)
         .map_err(|e| Error::io(format!("chmod {}", path.display()), &e))
 }
 
@@ -853,8 +849,29 @@ impl SnapshotBuilder for TargoBuild {
             ))
         })?;
         let trustc_v = version(&self.bin.join("trustc"), &["-V"]).unwrap_or_default();
-        let log_file = std::fs::File::create(log)
-            .map_err(|e| Error::io(format!("create {}", log.display()), &e))?;
+        let log_file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(log)
+                .map_err(|e| Error::io(format!("create {}", log.display()), &e))?;
+            if !file
+                .metadata()
+                .map_err(|e| Error::io(format!("stat {}", log.display()), &e))?
+                .is_file()
+            {
+                return Err(Error::refused(format!(
+                    "{}: not a regular file",
+                    log.display()
+                )));
+            }
+            file.set_len(0)
+                .map_err(|e| Error::io(format!("truncate {}", log.display()), &e))?;
+            file
+        };
         let err_file = log_file
             .try_clone()
             .map_err(|e| Error::io(format!("open {}", log.display()), &e))?;
@@ -951,6 +968,26 @@ impl ServiceManager for Launchd {
     }
 }
 
+fn write_regular_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut f = opts.open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    f.set_len(0)?;
+    f.write_all(bytes)
+}
+
 impl Launchd {
     fn arm_with(
         &self,
@@ -962,7 +999,7 @@ impl Launchd {
         for p in paths {
             let domain = format!("gui/{uid}/{}", units::LAUNCHD_LABEL);
             let _ = run(&["bootout", &domain]);
-            let _ = std::fs::write(self.state_dir.join("alab.launchd.log"), b"");
+            let _ = write_regular_file(&self.state_dir.join("alab.launchd.log"), b"");
             let out = run(&["bootstrap", &format!("gui/{uid}"), &p.display().to_string()])?;
             if !out.status.success() {
                 return Err(Error::refused(format!(
@@ -1040,23 +1077,29 @@ fn listed_label(text: &str, wanted: &str) -> Option<bool> {
         return None;
     }
     let mut lines = text.lines();
-    if lines.next()?.split_whitespace().collect::<Vec<_>>() != ["PID", "Status", "Label"] {
+    if !lines
+        .next()?
+        .split_whitespace()
+        .eq(["PID", "Status", "Label"])
+    {
         return None;
     }
     let mut labels = std::collections::BTreeSet::new();
     for line in lines {
-        let row = line.split_whitespace().collect::<Vec<_>>();
-        let [pid, status, label] = row.as_slice() else {
+        let mut words = line.split_whitespace();
+        let (Some(pid), Some(status), Some(label), None) =
+            (words.next(), words.next(), words.next(), words.next())
+        else {
             return None;
         };
         let status_digits = status.strip_prefix('-').unwrap_or(status);
-        if (*pid != "-"
+        if (pid != "-"
             && !(pid.bytes().all(|b| b.is_ascii_digit())
                 && pid.parse::<u32>().is_ok_and(|n| n > 0)))
             || status_digits.is_empty()
             || !status_digits.bytes().all(|b| b.is_ascii_digit())
             || status.parse::<i32>().is_err()
-            || !labels.insert(*label)
+            || !labels.insert(label)
         {
             return None;
         }

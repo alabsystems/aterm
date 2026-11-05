@@ -216,12 +216,17 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             Family::FleetUnreadable,
             Family::HugeDir,
             Family::ServiceMemory,
+            Family::Vitals,
             Family::Secrets,
             Family::Agh,
             Family::Join,
             Family::NetworkPlace
         ]
     );
+    // The leftovers' stem sits beside the two vitals families built before it, which a bare
+    // `vitals` stem would shadow (and a level pass of it would sweep).
+    assert_eq!(Family::Vitals.stem(), "vitals.proc");
+    assert_eq!(Family::Vitals.tag(), tags::SYSTEM);
     // The asking Macs' entries are the members desk's, filed apart from the need ledger's.
     assert_eq!(Family::Join.stem(), "members.join");
     assert_eq!(Family::Join.tag(), tags::PRIVACY);

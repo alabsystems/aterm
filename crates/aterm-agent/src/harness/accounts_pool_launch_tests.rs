@@ -126,20 +126,14 @@ fn intentional_unmanaged_launches_are_successful_no_ops() {
     let off = World::new("launch-off-result");
     off.two(Cli::Codex);
     off.on_main(Cli::Codex, &[]);
-    std::fs::write(off.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n").unwrap();
-    assert_eq!(
-        super::super::launch_env(&off.seat(), Cli::Codex, &no_read),
-        Ok(None)
-    );
-
-    let lone = World::new("launch-lone-result");
-    std::fs::write(
-        lone.cfg.join("accounts-codex.toml"),
-        "[[account]]\nlabel='main'\nclass='dedicated'\n",
+    aterm_uds::atomic_file::write(
+        &(off.cfg.join("aterm.toml")),
+        ("[harness]\naccounts='off'\n").as_ref(),
+        0o600,
     )
     .unwrap();
     assert_eq!(
-        super::super::launch_env(&lone.seat(), Cli::Codex, &no_read),
+        super::super::launch_env(&off.seat(), Cli::Codex, &no_read),
         Ok(None)
     );
 
@@ -170,9 +164,10 @@ fn a_lone_default_held_elsewhere_refuses_a_managed_launch() {
         for mode in [Mode::Early, Mode::Wall] {
             for held in [false, true] {
                 let world = World::new("launch-lone-held");
-                std::fs::write(
-                    world.cfg.join("aterm.toml"),
-                    format!("[harness]\naccounts='{}'\n", mode.as_str()),
+                aterm_uds::atomic_file::write(
+                    &(world.cfg.join("aterm.toml")),
+                    (format!("[harness]\naccounts='{}'\n", mode.as_str())).as_ref(),
+                    0o600,
                 )
                 .unwrap();
                 let holder = if held { "held_by='m2'\n" } else { "" };
@@ -231,9 +226,10 @@ fn pins_refuse_bad_rows_and_new_walls_release_the_override() {
                     Ok(Vec::new())
                 })
                 .unwrap();
-            std::fs::write(
-                world.cfg.join("aterm.toml"),
-                format!("[harness]\naccounts='{mode}'\n"),
+            aterm_uds::atomic_file::write(
+                &(world.cfg.join("aterm.toml")),
+                (format!("[harness]\naccounts='{mode}'\n")).as_ref(),
+                0o600,
             )
             .unwrap();
             let no_read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
@@ -277,9 +273,10 @@ fn pins_refuse_bad_rows_and_new_walls_release_the_override() {
             ),
             Condition::Limited { .. }
         ));
-        std::fs::write(
-            world.cfg.join("aterm.toml"),
-            format!("[harness]\naccounts='{mode}'\n"),
+        aterm_uds::atomic_file::write(
+            &(world.cfg.join("aterm.toml")),
+            (format!("[harness]\naccounts='{mode}'\n")).as_ref(),
+            0o600,
         )
         .unwrap();
         let selected = super::super::launch_env(&later, Cli::Codex, &no_usage)

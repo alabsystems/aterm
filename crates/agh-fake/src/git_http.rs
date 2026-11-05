@@ -50,20 +50,33 @@ impl Service {
     }
 }
 
-/// The repository `owner/name` (any `.git` suffix dropped) and the endpoint a path names.
-fn parse(path: &str) -> Option<(String, Endpoint)> {
-    let segs: Vec<&str> = path
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    let (owner, name, endpoint) = match segs.as_slice() {
+/// Raw segments `(owner, name, endpoint)` of a git endpoint path, without allocation.
+fn parse_raw(path: &str) -> Option<(&str, &str, Endpoint)> {
+    let mut segs = [""; 4];
+    let mut count = 0;
+    for s in path.trim_start_matches('/').split('/') {
+        if s.is_empty() {
+            continue;
+        }
+        if count >= 4 {
+            return None;
+        }
+        segs[count] = s;
+        count += 1;
+    }
+    let (owner, name, endpoint) = match &segs[..count] {
         [o, r, "info", "refs"] => (*o, *r, Endpoint::InfoRefs),
         [o, r, "git-receive-pack"] => (*o, *r, Endpoint::ReceivePack),
         [o, r, "git-upload-pack"] => (*o, *r, Endpoint::UploadPack),
         _ => return None,
     };
     let name = name.strip_suffix(".git").unwrap_or(name);
+    Some((owner, name, endpoint))
+}
+
+/// The repository `owner/name` (any `.git` suffix dropped) and the endpoint a path names.
+fn parse(path: &str) -> Option<(String, Endpoint)> {
+    let (owner, name, endpoint) = parse_raw(path)?;
     Some((
         format!(
             "{}/{}",
@@ -76,7 +89,7 @@ fn parse(path: &str) -> Option<(String, Endpoint)> {
 
 /// Whether `req` reaches a git endpoint of the web origin.
 pub(crate) fn is_git(req: &Request) -> bool {
-    req.origin == FakeOrigin::Web && parse(req.path()).is_some()
+    req.origin == FakeOrigin::Web && parse_raw(req.path()).is_some()
 }
 
 /// Whether header `name: value` is the Basic credential a git path of the web origin takes,
@@ -134,7 +147,14 @@ const _: () = assert!(REF_NAME_MAX + 256 <= PKT_PAYLOAD_MAX);
 /// report line names a ref of at most [`REF_NAME_MAX`] bytes, and `advertise` refuses a
 /// fixture ref too long for one.
 fn pkt(out: &mut Vec<u8>, payload: &[u8]) {
-    out.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let n = payload.len() + 4;
+    out.extend_from_slice(&[
+        HEX[(n >> 12) & 0xF],
+        HEX[(n >> 8) & 0xF],
+        HEX[(n >> 4) & 0xF],
+        HEX[n & 0xF],
+    ]);
     out.extend_from_slice(payload);
 }
 

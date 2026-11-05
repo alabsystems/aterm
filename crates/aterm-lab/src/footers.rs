@@ -3,7 +3,7 @@
 
 //! Records Claude Code footer screens across modes and settings for fixture verification.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::door::Door;
 use crate::lab::{Launch, UpOpts};
@@ -62,6 +62,15 @@ pub struct Opts {
     pub turn: bool,
     /// Without `--no-bypass`.
     pub bypass: bool,
+    /// Without `--no-walk`: the first launch walks its ring, which can record an acceptance.
+    pub walk: bool,
+    /// `--walk-relaunch`: the relaunch walks its ring too, for a ring a resumed line holds.
+    pub walk_relaunch: bool,
+    /// `--probe`: run one scripted command in the mode the last launch rests in, and say whether
+    /// it raised a box and whether it ran.
+    pub probe: bool,
+    /// `--probe-call '<json>'`: the tool call `--probe` runs, for one that is not its command.
+    pub probe_call: Option<String>,
     /// `--columns` (80).
     pub cols: String,
     /// `--lines` (24).
@@ -70,6 +79,11 @@ pub struct Opts {
     pub subscriber: bool,
     /// `--settings '<json>'`: merged into the scratch settings before the first launch.
     pub settings: Option<J>,
+    /// `--launch-args '<flags>'`: the first launch's flags, split on blanks (none by default).
+    pub launch_args: Vec<String>,
+    /// `--relaunch-args '<flags>'`: a further launch after the first ends, for the mode that
+    /// launch lands in. `{session}` is the first launch's conversation (`--resume {session}`).
+    pub relaunch_args: Option<Vec<String>>,
 }
 
 impl Opts {
@@ -82,10 +96,16 @@ impl Opts {
             out: None,
             turn: true,
             bypass: true,
+            walk: true,
+            walk_relaunch: false,
+            probe: false,
+            probe_call: None,
             cols: "80".into(),
             lines: "24".into(),
             subscriber: false,
             settings: None,
+            launch_args: Vec::new(),
+            relaunch_args: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -98,6 +118,13 @@ impl Opts {
                 "--out" => o.out = Some(PathBuf::from(crate::paths::from_caller(&val()?))),
                 "--no-turn" => o.turn = false,
                 "--no-bypass" => o.bypass = false,
+                "--no-walk" => o.walk = false,
+                "--walk-relaunch" => o.walk_relaunch = true,
+                "--probe" => o.probe = true,
+                "--probe-call" => {
+                    o.probe = true;
+                    o.probe_call = Some(val()?);
+                }
                 "--columns" => o.cols = val()?,
                 "--lines" => o.lines = val()?,
                 "--subscriber" => o.subscriber = true,
@@ -109,6 +136,8 @@ impl Opts {
                     }
                     o.settings = Some(j);
                 }
+                "--launch-args" => o.launch_args = split_flags(&val()?),
+                "--relaunch-args" => o.relaunch_args = Some(split_flags(&val()?)),
                 other => return Err(Fail::usage(format!("footers: unknown argument {other}"))),
             }
         }
@@ -123,6 +152,10 @@ impl Opts {
             None => "the lab's default settings".into(),
         }
     }
+}
+
+fn split_flags(flags: &str) -> Vec<String> {
+    flags.split_whitespace().map(str::to_string).collect()
 }
 
 /// Which cycle [`Rec::walk_cycle`] walks.
@@ -171,6 +204,66 @@ struct Rec<'a> {
 }
 
 impl Rec<'_> {
+    /// One scripted command in the mode the session rests in: whether it asks, and whether it ran.
+    fn probe_command(&mut self, call: Option<&str>) -> Result<(), Fail> {
+        const MARKER: &str = "probe-ran.txt";
+        const BOXES: [&str; 2] = ["Do you want to proceed", "Enter plan mode?"];
+        const NOTICE: &str = "Enter to continue";
+        let mode = self.mode_or_unread();
+        let command = format!(
+            r#"{{"name": "Bash", "input": {{"command": "touch @PROJ@/{MARKER}", "description": "Touch a marker"}}}}"#
+        );
+        let call = call.unwrap_or(&command);
+        crate::verbs::set_tool(self.run, &format!(r#"[{call}, {{"text": "Probe over."}}]"#))?;
+        crate::verbs::turn(&self.door, "toolstart probe")?;
+        let answered = format!("{}|Probe over|{NOTICE}", BOXES.join("|").replace('?', "."));
+        let mut settled = self.door.await_match(&answered, 30)?;
+        if settled && self.text().contains(NOTICE) {
+            println!("probe in {mode}: pressed through Claude's auto-mode billing notice");
+            self.door.await_idle(SETTLE_MS, 30)?;
+            let _ = self.door.ctl(&["key", "enter"])?;
+            let answered = format!("{}|Probe over", BOXES.join("|").replace('?', "."));
+            settled = self.door.await_match(&answered, 30)?;
+        }
+        let text = self.text();
+        let boxed = settled && BOXES.iter().any(|b| text.contains(b));
+        let ran = Path::new(&self.run.proj).join(MARKER).exists();
+        println!(
+            "probe in {mode}: raised a box: {boxed}; ran: {ran} · {}",
+            self.variant
+        );
+        self.snap(
+            "footer-probe",
+            "one scripted command in the mode the session rests in",
+        )?;
+        if boxed {
+            let _ = self.door.ctl(&["key", "escape"])?;
+        }
+        crate::verbs::set_mode(self.run, "ok")?;
+        Ok(())
+    }
+
+    /// A slow turn, typed to its done row at rest. `mid`: snap the launch mode's mid-turn row.
+    fn slow_turn(&mut self, mid: bool) -> Result<(), Fail> {
+        crate::verbs::set_mode(self.run, "slow")?;
+        crate::verbs::turn(&self.door, "count from 1 to 30")?;
+        let busy = aterm_phase::anchors::guard_prefix("busy.interrupt", 3);
+        if self.door.await_match(&busy, 30)? && mid {
+            self.snap(
+                "footer-busy",
+                &format!(
+                    "mid-turn in the launch mode: {} on the mode row",
+                    aterm_phase::anchor!("busy.interrupt")
+                ),
+            )?;
+        }
+        self.door.await_gone(&busy, 120)?;
+        self.door.await_match(DONE_ROW, 30)?;
+        self.settle()?;
+        crate::verbs::set_mode(self.run, "ok")?;
+        Ok(())
+    }
+
     fn text(&self) -> String {
         self.door.out(&["text"])
     }
@@ -256,13 +349,17 @@ fn launch(run: &Run, door: &Door<'_>, subscriber: bool, args: &[&str]) -> Result
     if door.await_match("shift.tab|for.agents|shortcuts|Yes,.I.accept", 60)?
         && door.out(&["text"]).contains("Yes, I accept")
     {
+        println!("launch {args:?} raised the bypass warning; pressed through it");
         let _ = door.ctl(&["key", "down"]);
         let _ = door.ctl(&["key", "enter"]);
     }
     if !door.await_match("shift.tab|for.agents|shortcuts", 60)? {
         return Err(Fail::exit(
             3,
-            "footers: Claude Code drew no footer within 60 s",
+            format!(
+                "footers: Claude Code drew no footer within 60 s; the screen:\n{}",
+                door.out(&["text"])
+            ),
         ));
     }
     door.await_match("⏵⏵.|⏸.", 15)?;
@@ -281,6 +378,57 @@ fn quit(door: &Door<'_>) -> Result<(), Fail> {
     Ok(())
 }
 
+/// `--relaunch-args`' word for the first launch's conversation.
+const SESSION: &str = "{session}";
+
+/// The newest conversation's transcript under the run's scratch home.
+fn newest_transcript(run: &Run) -> Option<PathBuf> {
+    let projects = run.w.join("home/.claude/projects");
+    let mut found = Vec::new();
+    crate::util::walk_files(&projects, &mut found);
+    found
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .filter(|p| p.parent().and_then(Path::parent) == Some(projects.as_path()))
+        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+}
+
+/// `args` with [`SESSION`] replaced by the newest conversation's id.
+fn with_session(run: &Run, args: &[String]) -> Result<Vec<String>, Fail> {
+    if !args.iter().any(|a| a == SESSION) {
+        return Ok(args.to_vec());
+    }
+    let id = newest_transcript(run)
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .ok_or_else(|| Fail::die("footers: {session}: the first launch left no transcript"))?;
+    Ok(args
+        .iter()
+        .map(|a| if a == SESSION { id.clone() } else { a.clone() })
+        .collect())
+}
+
+/// The `permission-mode` rows of a transcript, oldest first: what a restart with no pill reads.
+fn mode_rows_in(transcript: &str) -> Vec<String> {
+    transcript
+        .lines()
+        .filter(|l| l.contains("\"permission-mode\""))
+        .filter_map(|l| J::parse(l).ok())
+        .filter(|row| row.get("type").and_then(J::as_str) == Some("permission-mode"))
+        .filter_map(|row| {
+            row.get("permissionMode")
+                .and_then(J::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// [`mode_rows_in`] of the newest conversation.
+fn mode_rows(run: &Run) -> Vec<String> {
+    newest_transcript(run)
+        .and_then(|p| crate::util::read_regular_text(&p).ok())
+        .map_or_else(Vec::new, |t| mode_rows_in(&t))
+}
+
 fn record(run: &Run, o: &Opts, out: PathBuf) -> Res {
     if let Some(patch) = &o.settings {
         crate::verbs::settings_merge(run, patch)?;
@@ -292,8 +440,10 @@ fn record(run: &Run, o: &Opts, out: PathBuf) -> Res {
         variant: o.variant(),
         unread: 0,
     };
-    launch(run, &rec.door, o.subscriber, &[])?;
+    let flags: Vec<&str> = o.launch_args.iter().map(String::as_str).collect();
+    launch(run, &rec.door, o.subscriber, &flags)?;
     let start = rec.mode_or_unread();
+    println!("launch {flags:?} starts in {start} · {}", rec.variant);
     rec.snap(
         &format!("footer-{start}-idle"),
         "the launch mode, idle, empty composer: the mode row the footer rewrites and the lights read",
@@ -309,7 +459,7 @@ fn record(run: &Run, o: &Opts, out: PathBuf) -> Res {
     let _ = rec.door.ctl(&["key", "ctrl+u"])?;
     rec.door.await_gone("draft.text", 10)?;
     rec.settle()?;
-    let mut whole = rec.walk_cycle(&start, Cycle::Launch)?;
+    let mut whole = !o.walk || rec.walk_cycle(&start, Cycle::Launch)?;
     if o.turn {
         for _ in 0..6 {
             if mode_word(&rec.text()).map(str::to_string).as_ref() == Some(&start) {
@@ -319,25 +469,52 @@ fn record(run: &Run, o: &Opts, out: PathBuf) -> Res {
                 break;
             }
         }
-        crate::verbs::set_mode(run, "slow")?;
-        crate::verbs::turn(&rec.door, "count from 1 to 30")?;
-        let busy = aterm_phase::anchors::guard_prefix("busy.interrupt", 3);
-        if rec.door.await_match(&busy, 30)? {
-            rec.snap(
-                "footer-busy",
-                &format!(
-                    "mid-turn in the launch mode: {} on the mode row",
-                    aterm_phase::anchor!("busy.interrupt")
-                ),
-            )?;
-        }
-        rec.door.await_gone(&busy, 120)?;
-        rec.door.await_match(DONE_ROW, 30)?;
-        rec.settle()?;
+        rec.slow_turn(true)?;
         rec.snap("footer-after-turn", "idle after a turn in the launch mode")?;
-        crate::verbs::set_mode(run, "ok")?;
+    }
+    if o.relaunch_args.is_some() {
+        println!(
+            "transcript mode rows before the first launch ends: {:?}",
+            mode_rows(run)
+        );
+    } else if o.probe {
+        rec.probe_command(o.probe_call.as_deref())?;
     }
     quit(&rec.door)?;
+    if let Some(args) = &o.relaunch_args {
+        println!(
+            "transcript mode rows after the first launch: {:?}",
+            mode_rows(run)
+        );
+        let args = with_session(run, args)?;
+        let flags: Vec<&str> = args.iter().map(String::as_str).collect();
+        launch(run, &rec.door, o.subscriber, &flags)?;
+        let landed = rec.mode_or_unread();
+        println!("relaunch {flags:?} lands in {landed} · {}", rec.variant);
+        println!(
+            "transcript mode rows at its first rest: {:?}",
+            mode_rows(run)
+        );
+        rec.snap(
+            &format!("footer-relaunch-{landed}"),
+            "the mode a further launch lands in after the first ended",
+        )?;
+        if o.walk_relaunch {
+            whole &= rec.walk_cycle(&landed, Cycle::Launch)?;
+        }
+        if o.turn {
+            rec.slow_turn(false)?;
+            println!(
+                "transcript mode rows after its first turn: {:?}",
+                mode_rows(run)
+            );
+        }
+        if o.probe {
+            rec.probe_command(o.probe_call.as_deref())?;
+        }
+        quit(&rec.door)?;
+        println!("transcript mode rows after it ends: {:?}", mode_rows(run));
+    }
     if o.bypass {
         launch(
             run,
@@ -493,6 +670,17 @@ mod tests {
     }
 
     #[test]
+    fn mode_rows_are_read_oldest_first() {
+        let transcript = concat!(
+            "{\"type\":\"user\",\"note\":\"permission-mode\"}\n",
+            "{\"type\":\"permission-mode\",\"permissionMode\":\"auto\"}\n",
+            "not json \"permission-mode\"\n",
+            "{\"type\":\"permission-mode\",\"permissionMode\":\"bypassPermissions\"}\n",
+        );
+        assert_eq!(mode_rows_in(transcript), ["auto", "bypassPermissions"]);
+    }
+
+    #[test]
     fn the_variant_is_parsed_and_named() {
         let a = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
         let o = Opts::parse(&a(&[])).unwrap();
@@ -507,6 +695,23 @@ mod tests {
         .unwrap();
         assert!(o.subscriber && !o.turn);
         assert_eq!(o.variant(), r#"settings {"effortLevel":"xhigh"}"#);
+        let o = Opts::parse(&a(&[
+            "--launch-args",
+            "--allow-dangerously-skip-permissions  --permission-mode plan",
+            "--relaunch-args",
+            "--continue",
+        ]))
+        .unwrap();
+        assert_eq!(
+            o.launch_args,
+            a(&[
+                "--allow-dangerously-skip-permissions",
+                "--permission-mode",
+                "plan"
+            ])
+        );
+        assert_eq!(o.relaunch_args, Some(a(&["--continue"])));
+        assert!(Opts::parse(&a(&[])).unwrap().relaunch_args.is_none());
         assert_eq!(Opts::parse(&a(&["--settings", "[1]"])).unwrap_err().code, 2);
         assert_eq!(Opts::parse(&a(&["--settings"])).unwrap_err().code, 2);
         assert_eq!(Opts::parse(&a(&["--bogus"])).unwrap_err().code, 2);

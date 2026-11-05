@@ -91,8 +91,11 @@ pub fn validate_details(value: &Value) -> Result<()> {
             "private-key",
         ]
         .iter()
-        .any(|word| key.to_ascii_lowercase().contains(word))
-            && kind != Some("secret-ref")
+        .any(|word| {
+            key.as_bytes()
+                .windows(word.len())
+                .any(|w| w.eq_ignore_ascii_case(word.as_bytes()))
+        }) && kind != Some("secret-ref")
         {
             return Err(Error::new("credential detail must be a secret reference"));
         }

@@ -146,6 +146,10 @@ pub(super) struct Hints {
     established_cursor: Option<SocketAddr>,
     follow_up: VecDeque<SocketAddr>,
     follow_up_left: usize,
+    /// An incompatible build is not retried because time passed or a beacon repeated.
+    needs_update: BTreeMap<astream_wire::sync::Actor, Option<String>>,
+    versions: BTreeMap<astream_wire::sync::Actor, String>,
+    addresses: BTreeMap<IpAddr, astream_wire::sync::Actor>,
 }
 impl Hints {
     pub(super) fn new(own: [u8; 32]) -> Self {
@@ -160,11 +164,56 @@ impl Hints {
             established_cursor: None,
             follow_up: VecDeque::new(),
             follow_up_left: FOLLOW_UP_BURST,
+            needs_update: BTreeMap::new(),
+            versions: BTreeMap::new(),
+            addresses: BTreeMap::new(),
         }
     }
     pub(super) fn rotate(&mut self, own: [u8; 32]) {
         self.previous = Some(self.own);
         self.own = own;
+    }
+    /// Only signed advertised builds from the local fleet book reach this method. A missing
+    /// entry is no evidence of an update. The clock is supplied by the transport or test.
+    pub(super) fn advertised_versions(
+        &mut self,
+        advertisements: BTreeMap<astream_wire::sync::Actor, (IpAddr, String)>,
+        now: Instant,
+    ) {
+        let versions: BTreeMap<_, _> = advertisements
+            .iter()
+            .map(|(actor, (_, version))| (*actor, version.clone()))
+            .collect();
+        // A missing cache entry does not erase the last seat bound to an address. A new
+        // authenticated advertisement can move that seat or assign the address to another.
+        self.addresses
+            .retain(|_, actor| !advertisements.contains_key(actor));
+        self.addresses.extend(
+            advertisements
+                .into_iter()
+                .map(|(actor, (ip, _))| (ip, actor)),
+        );
+        self.needs_update.retain(|actor, blocked| {
+            if blocked.is_none() {
+                // Learning a previously unknown build is not a version change.
+                *blocked = versions.get(actor).cloned();
+                return true;
+            }
+            let changed = versions
+                .get(actor)
+                .is_some_and(|version| blocked.as_ref() != Some(version));
+            if changed {
+                for (address, peer) in &mut self.peers {
+                    if self.addresses.get(&address.ip()) == Some(actor)
+                        || peer.repair.actor() == Some(*actor)
+                    {
+                        peer.next = now;
+                    }
+                }
+            }
+            !changed
+        });
+        self.versions.extend(versions);
     }
     pub(super) fn wire(&self, port: u16) -> Vec<u8> {
         let mut wire = Vec::with_capacity(WIRE_LEN);
@@ -334,6 +383,14 @@ impl Hints {
         allow_discovery: bool,
     ) -> Option<(SocketAddr, Repair)> {
         self.expire(now);
+        // A new port, a push or expired address metadata must not evade a build hold.
+        self.peers.retain(|address, peer| {
+            self.addresses
+                .get(&address.ip())
+                .copied()
+                .or_else(|| peer.repair.actor())
+                .is_none_or(|actor| !self.needs_update.contains_key(&actor))
+        });
         self.follow_up
             .retain(|address| self.peers.contains_key(address));
         let eligible = |p: &Peer| !p.busy && p.next <= now && (allow_discovery || p.established());
@@ -436,6 +493,20 @@ impl Hints {
         let Some(peer) = self.peers.get_mut(&address) else {
             return;
         };
+        if matches!(
+            repair.application_cause(),
+            Some(
+                aterm_types::network_state::RepairCause::NeedsUpdate
+                    | aterm_types::network_state::RepairCause::LegacyPastCrossing
+            )
+        ) && self.needs_update.len() < MAX_PEERS
+            && let Some(actor) = repair
+                .authenticated_actor()
+                .or_else(|| self.addresses.get(&address.ip()).copied())
+        {
+            self.needs_update
+                .insert(actor, self.versions.get(&actor).cloned());
+        }
         // A slow exchange may have outlived the delay chosen at its start.
         // Start the quiet interval at completion so paired owners cannot keep
         // immediately redialing and colliding on their local custody locks;
@@ -545,6 +616,77 @@ mod admission_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn needs_update_waits_for_an_advertised_version_change() {
+        use aterm_types::network_state::RepairCause;
+        let mut hints = hints();
+        let address = SocketAddr::from(([10, 1, 1, 1], 1234));
+        let now = Instant::now();
+        let old = BTreeMap::from([([7; 48], (address.ip(), "0.153.0".to_owned()))]);
+        hints.advertised_versions(old.clone(), now);
+        hints.observe(&wire(address.port()), address, now);
+        let (_, mut repair) = hints.next(now).unwrap();
+        repair.application_failed(crate::Error::repair(
+            "old protocol",
+            RepairCause::NeedsUpdate,
+        ));
+        hints.finish(
+            address,
+            repair,
+            Outcome::Repaired { transferred: false },
+            now,
+        );
+        // A day passing, pushes and repeated advertisements cannot redial an incompatible build.
+        let later = now + Duration::from_secs(86_400);
+        hints.hurry(later);
+        hints.observe(&wire(address.port()), address, later);
+        hints.advertised_versions(old, later);
+        assert!(hints.next(later).is_none());
+        hints.observe(&wire(address.port() + 1), address, later);
+        assert!(
+            hints.next(later).is_none(),
+            "a listener port change is no build change"
+        );
+        hints.advertised_versions(BTreeMap::new(), later);
+        hints.observe(&wire(address.port()), address, later);
+        assert!(hints.next(later).is_none(), "missing metadata is no update");
+        hints.advertised_versions(
+            BTreeMap::from([([7; 48], (address.ip(), "0.155.0".to_owned()))]),
+            later,
+        );
+        hints.observe(&wire(address.port()), address, later);
+        assert_eq!(hints.next(later).unwrap().0, address);
+    }
+    #[test]
+    fn an_incompatible_seats_hold_does_not_follow_an_ip_to_another_seat() {
+        use aterm_types::network_state::RepairCause;
+        let mut hints = hints();
+        let address = SocketAddr::from(([10, 1, 1, 1], 1234));
+        let now = Instant::now();
+        hints.advertised_versions(
+            BTreeMap::from([([7; 48], (address.ip(), "0.153.0".into()))]),
+            now,
+        );
+        hints.observe(&wire(address.port()), address, now);
+        let (_, mut repair) = hints.next(now).unwrap();
+        repair.application_failed(crate::Error::repair(
+            "old protocol",
+            RepairCause::NeedsUpdate,
+        ));
+        hints.finish(
+            address,
+            repair,
+            Outcome::Repaired { transferred: false },
+            now,
+        );
+        assert!(hints.next(now).is_none());
+        hints.advertised_versions(
+            BTreeMap::from([([8; 48], (address.ip(), "0.153.0".into()))]),
+            now,
+        );
+        hints.observe(&wire(address.port()), address, now);
+        assert_eq!(hints.next(now).unwrap().0, address);
+    }
     fn hints() -> Hints {
         Hints::new([4; 32])
     }

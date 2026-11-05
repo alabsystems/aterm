@@ -467,8 +467,9 @@ impl Ladder {
 
     /// Whether `label`'s ladder waits out its backoff at `now`: it does while the wait set at its
     /// last failure stands and the machine reads as it did then (`inputs`); a new mailbox, a
-    /// browser installed, a vault delivery or a profile made ends the wait at once. Once a
-    /// different input is observed, returning to the previous input cannot restore its wait.
+    /// browser installed, a vault delivery or a profile made ends the wait at once, though a row a
+    /// page stopped is held on record before it gets here. Once a different input is observed,
+    /// returning to the previous input cannot restore its wait.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(
@@ -548,12 +549,22 @@ impl Ladder {
         wait
     }
 
-    /// Notes that a page stopped `label`'s last failure: Cloudflare's check judges this Mac's
-    /// address and browser, which a peer's return changes neither of, so no peer ends this wait
-    /// ([`Self::peer_heard`]) while a move ([`Self::moved`]) does.
-    pub(super) fn page_stopped(&mut self, label: &str) {
+    /// Notes that a page stopped `label`'s last failure, which it waits on until `until`: no move
+    /// ends this wait ([`Self::moved`]), and the saved record says when it is over
+    /// ([`Self::page_ended`]).
+    pub(super) fn page_stopped(&mut self, label: &str, until: Instant) {
         if let Some(backoff) = self.backoff.get_mut(label) {
             backoff.page_stopped = true;
+            backoff.next = backoff.next.max(until);
+        }
+    }
+
+    /// The saved record no longer holds `label`, so a wait [`Self::page_stopped`] set ends: the
+    /// record counts wall-clock time and hears of a person's browser window, which this process's
+    /// uptime clock does not.
+    pub(super) fn page_ended(&mut self, label: &str) {
+        if self.backoff.get(label).is_some_and(|b| b.page_stopped) {
+            self.backoff.remove(label);
         }
     }
 
@@ -679,7 +690,10 @@ impl Ladder {
     /// vault a refresh could not reach may answer now, so the vault's wait ends and its clock
     /// starts again from the first wait, and each row's backoff ends, keeping its step, so a row
     /// that fails again the same way waits longer. A refresh running now runs on, and its
-    /// result cannot delay the next refresh on the changed network.
+    /// result cannot delay the next refresh on the changed network. A row a page stopped waits on
+    /// ([`Self::page_stopped`]): most of what counts as a move has no new address behind it (macOS's
+    /// Local Network answer soon after most launches, a fleet's peers all day), and ending that wait
+    /// on each would load the page back to back.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -689,18 +703,6 @@ impl Ladder {
         )
     )]
     pub(super) fn moved(&mut self, now: Instant) {
-        self.invalidate_vault_result();
-        for backoff in self.backoff.values_mut() {
-            backoff.next = backoff.next.min(now);
-        }
-    }
-
-    /// A peer was heard at `now`, on a beacon or a browse row: what this Mac reaches through a peer
-    /// (the vault, a relay's stewards) may answer now, so the waits end as at a move
-    /// ([`Self::moved`]), and the upkeep can reach a vault a row's own wait held it from. A row a
-    /// page stopped waits on ([`Self::page_stopped`]): a fleet's peers come and go all day, and
-    /// ending its wait on each would load that page back to back.
-    pub(super) fn peer_heard(&mut self, now: Instant) {
         self.invalidate_vault_result();
         for backoff in self.backoff.values_mut().filter(|b| !b.page_stopped) {
             backoff.next = backoff.next.min(now);
@@ -731,6 +733,397 @@ impl Ladder {
     }
 }
 
+// THE SIGN-IN DOOR (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4). A provider is
+// signed in to for an account only on a Mac using that account, only because it is in use, and
+// never in a burst. Every sign-in this harness starts takes a [`SignIn`], minted by one of these:
+// a row a session here runs on whose login is signed out here (and the row a launch here starts
+// on, whose login was refused), a person naming the account, and one due login this Mac uses
+// ([`super::accounts::renew_due`]). A timer holds none of that evidence, so it can mint nothing.
+// The token starts its sign-in under the machine-wide sign-in lock, and an automatic one only
+// [`SPACING_S`] after another account's: the spacing clock is a file beside the lock, so every
+// process on this Mac keeps one spacing.
+
+/// The least time, in seconds, between the starts of two sign-ins of different accounts on this
+/// Mac. Logins made together expire together, and a burst of them from one Mac looks like a
+/// sweep to the provider.
+pub(super) const SPACING_S: i64 = 10 * 60;
+
+/// The file beside [`super::accounts::SIGNIN_LOCK_FILE`] in [`super::accounts::Store::shared_dir`]
+/// that keeps the last sign-in this Mac started. It is read for an automatic sign-in and written
+/// at every start, each only while the sign-in lock is held.
+pub(super) const SIGNIN_SPACING_FILE: &str = "signin-spacing";
+
+/// The first line of [`SIGNIN_SPACING_FILE`].
+const SPACING_HEAD: &str = "aterm-signin-spacing-v1";
+
+/// The last sign-in this Mac started: its CLI's id, its label and when (Unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Started {
+    cli: String,
+    label: String,
+    at: i64,
+}
+
+impl Started {
+    /// The record of `cli`'s `label` starting at `at`.
+    pub(super) fn new(cli: super::accounts::Cli, label: &str, at: i64) -> Self {
+        Self {
+            cli: cli.id().to_owned(),
+            label: label.to_owned(),
+            at,
+        }
+    }
+
+    /// Reads [`Self::text`]; anything else is no record.
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        if lines.next()? != SPACING_HEAD {
+            return None;
+        }
+        let mut words = lines.next()?.split(' ');
+        let started = Self {
+            cli: words.next()?.to_owned(),
+            label: words.next()?.to_owned(),
+            at: words.next()?.parse().ok()?,
+        };
+        (words.next().is_none()
+            && lines.next().is_none()
+            && super::accounts::admissible_label(&started.label))
+        .then_some(started)
+    }
+
+    /// The file's text: the head line, then `<cli> <label> <at>`.
+    fn text(&self) -> String {
+        format!("{SPACING_HEAD}\n{} {} {}\n", self.cli, self.label, self.at)
+    }
+}
+
+/// THE SPACING LAW. An automatic sign-in of `cli`'s `label` at `now` waits until the returned
+/// time when `last` is another account's start within [`SPACING_S`] of `now`, either way: a clock
+/// set back holds it at most [`SPACING_S`] past the record, never longer. The same account's
+/// own retries are the ladder's backoff's to space ([`backoff_after`]), not this law's.
+#[must_use]
+pub(super) fn spaced_until(
+    last: Option<&Started>,
+    cli: super::accounts::Cli,
+    label: &str,
+    now: i64,
+) -> Option<i64> {
+    let last = last.filter(|last| last.cli != cli.id() || last.label != label)?;
+    (now.abs_diff(last.at) < SPACING_S.unsigned_abs()).then(|| last.at.saturating_add(SPACING_S))
+}
+
+/// Where `store`'s Mac keeps its last sign-in start ([`SIGNIN_SPACING_FILE`]).
+fn spacing_path(store: &super::accounts::Store) -> std::path::PathBuf {
+    store.shared_dir().join(SIGNIN_SPACING_FILE)
+}
+
+/// The last sign-in `store`'s Mac started, where its record reads as one.
+///
+/// # Errors
+///
+/// The record exists and could not be read.
+pub(super) fn last_started(store: &super::accounts::Store) -> std::io::Result<Option<Started>> {
+    Ok(super::accounts::read_bounded(&spacing_path(store), 4096)?
+        .as_deref()
+        .and_then(Started::parse))
+}
+
+/// Why this Mac may start one sign-in. There is no other reason to start one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Why {
+    /// A session on this Mac runs on the row, or a launch here starts on it, and its login is
+    /// signed out here.
+    Session,
+    /// A person named the account: `accounts login|renew <label>`, `harness agy login
+    /// <account>`, `signin --cli grok` (the default home, whose device code goes to them), or a
+    /// selection saved from the window's account menu.
+    Asked,
+    /// One due login this Mac uses ([`super::accounts::renew_due`]).
+    Due,
+    /// An account a root approved for this Mac's first custody (a shared adoption).
+    Granted,
+}
+
+impl Why {
+    /// Whether a sign-in for this reason keeps [`SPACING_S`] from another account's start. A
+    /// person's sign-in of the one account they named starts when they ask, and still sets the
+    /// clock the automatic ones keep.
+    #[must_use]
+    pub(super) const fn spaced(self) -> bool {
+        !matches!(self, Self::Asked)
+    }
+}
+
+/// One sign-in this Mac may start for one account. Its fields are private and it is neither
+/// `Clone` nor `Copy`: only the doors below mint one, and [`SignIn::begin`] consumes it.
+#[derive(Debug)]
+#[must_use]
+pub(super) struct SignIn {
+    cli: super::accounts::Cli,
+    label: String,
+    why: Why,
+}
+
+/// Why [`SignIn::begin`] started nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Refused {
+    /// The token names another account.
+    Another,
+    /// Another account's sign-in started here within [`SPACING_S`]; not before this time.
+    Spaced {
+        /// Unix seconds.
+        until: i64,
+    },
+    /// The spacing record could not be read or written.
+    Record(String),
+}
+
+impl Refused {
+    /// Its words at `now`, for a person's terminal or a log line.
+    #[must_use]
+    pub(super) fn words(&self, now: i64) -> String {
+        match self {
+            Self::Another => "its sign-in token names another account".to_owned(),
+            Self::Spaced { until } => format!(
+                "another account's sign-in started on this Mac less than {} minutes ago, and two \
+                 start at least that far apart, so this one may start in {} minutes",
+                SPACING_S / 60,
+                until.saturating_sub(now).max(0).saturating_add(59) / 60
+            ),
+            Self::Record(why) => format!("the sign-in spacing record could not be kept: {why}"),
+        }
+    }
+}
+
+/// Whether a session on this Mac runs on `row`, whose login is signed out here, and no other
+/// Mac's warm set holds it: what [`SignIn::session_sign_in`] admits, for a ranking that mints
+/// nothing.
+#[must_use]
+pub(super) fn session_signed_out(
+    row: &super::accounts::Row,
+    state: &super::accounts::State,
+) -> bool {
+    row.held_by.is_none()
+        && state.sessions.values().any(|s| s.account == row.label)
+        && state
+            .accounts
+            .get(&row.label)
+            .is_some_and(|a| a.current_auth(row) == super::accounts::Auth::SignedOut)
+}
+
+impl SignIn {
+    /// The upkeep's door for a row a session on this Mac runs on whose login is signed out here
+    /// (and that no other Mac's warm set holds): [`session_signed_out`].
+    #[must_use]
+    pub(super) fn session_sign_in(
+        cli: super::accounts::Cli,
+        row: &super::accounts::Row,
+        state: &super::accounts::State,
+    ) -> Option<Self> {
+        session_signed_out(row, state).then(|| Self {
+            cli,
+            label: row.label.clone(),
+            why: Why::Session,
+        })
+    }
+
+    /// The renewal door: `label` is one of the due logins [`super::accounts::renew_due`] lists
+    /// over `roster` (bound), `logins`, `state` and `enrolled`, so this Mac ran on it within a
+    /// week and holds its senior claim, or no Mac claims it.
+    #[must_use]
+    pub(super) fn renewal_sign_in(
+        cli: super::accounts::Cli,
+        label: &str,
+        (roster, logins, state, enrolled): (
+            &super::accounts::Roster,
+            &super::accounts::Logins,
+            &super::accounts::State,
+            &std::collections::BTreeSet<String>,
+        ),
+        now: i64,
+    ) -> Option<Self> {
+        super::accounts::renew_due(roster, logins, state, enrolled, now)
+            .iter()
+            .any(|due| due == label)
+            .then(|| Self {
+                cli,
+                label: label.to_owned(),
+                why: Why::Due,
+            })
+    }
+
+    /// A person's command naming the account ([`super::cli::AskedSignIn`]).
+    pub(super) fn asked_sign_in(asked: super::cli::AskedSignIn) -> Self {
+        let (cli, label) = asked.account();
+        Self {
+            cli,
+            label,
+            why: Why::Asked,
+        }
+    }
+
+    /// A person's selection from the window's account menu, saved as `state`'s pending request
+    /// and served by the upkeep or the menu's own thread: `request` must be the one `state` holds.
+    #[must_use]
+    pub(super) fn selected_sign_in(
+        cli: super::accounts::Cli,
+        request: &super::accounts::PinRequest,
+        state: &super::accounts::State,
+    ) -> Option<Self> {
+        (state.pending_pin.as_ref() == Some(request)).then(|| Self {
+            cli,
+            label: request.label().to_owned(),
+            why: Why::Asked,
+        })
+    }
+
+    /// The row a launch on this Mac starts on, whose login its own check refused. Only a Unix
+    /// launch renews a refused login ([`super::accounts_pool::prepare_google_worker`]).
+    #[cfg(unix)]
+    pub(super) fn launch_sign_in(
+        _door: impl super::provider_read::LaunchDoor,
+        cli: super::accounts::Cli,
+        label: &str,
+    ) -> Self {
+        Self {
+            cli,
+            label: label.to_owned(),
+            why: Why::Session,
+        }
+    }
+
+    /// The first local custody of an account a root approved for this Mac: the grant is a
+    /// person's decision naming the account, made elsewhere, so it is spaced as the upkeep's own
+    /// sign-ins are.
+    pub(super) fn granted_sign_in(
+        _grant: &super::cli::shared_renewal::Grant,
+        cli: super::accounts::Cli,
+        label: &str,
+    ) -> Self {
+        Self {
+            cli,
+            label: label.to_owned(),
+            why: Why::Granted,
+        }
+    }
+
+    /// Fixture authority for an isolated account. No release build exposes it.
+    #[cfg(test)]
+    pub(super) fn fixture(cli: super::accounts::Cli, label: &str, why: Why) -> Self {
+        Self {
+            cli,
+            label: label.to_owned(),
+            why,
+        }
+    }
+
+    /// Whether it names `cli`'s `label`.
+    #[must_use]
+    pub(super) fn names(&self, cli: super::accounts::Cli, label: &str) -> bool {
+        self.cli == cli && self.label == label
+    }
+
+    /// When it may start, where not now ([`spaced_until`]), as `store`'s record reads: a check
+    /// a caller makes before it claims anything else, so a spaced sign-in costs nothing. A
+    /// person's sign-in is never spaced.
+    ///
+    /// # Errors
+    ///
+    /// An automatic sign-in's record could not be read: it starts nothing ([`Refused::Record`]).
+    pub(super) fn spaced(
+        &self,
+        store: &super::accounts::Store,
+        now: i64,
+    ) -> Result<Option<i64>, Refused> {
+        if !self.why.spaced() {
+            return Ok(None);
+        }
+        let last = last_started(store).map_err(|e| Refused::Record(e.to_string()))?;
+        Ok(spaced_until(last.as_ref(), self.cli, &self.label, now))
+    }
+
+    /// Starts this sign-in of `cli`'s `label` under the sign-in lock `signin` took from `store`
+    /// ([`super::accounts::Store::signin_now`], [`super::accounts::Store::signin_within`]):
+    /// it refuses a token for another account, and an automatic sign-in within [`SPACING_S`] of
+    /// another account's start, then records this start for the next one. The lock moves into
+    /// the [`Begun`] the provider flow holds until it ends.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused`]: nothing was recorded and nothing may start.
+    pub(super) fn begin(
+        self,
+        cli: super::accounts::Cli,
+        label: &str,
+        signin: super::accounts::Lock,
+        store: &super::accounts::Store,
+        now: i64,
+    ) -> Result<Begun, Refused> {
+        if !self.names(cli, label) {
+            return Err(Refused::Another);
+        }
+        if let Some(until) = self.spaced(store, now)? {
+            return Err(Refused::Spaced { until });
+        }
+        super::upgrade_models::write_atomic(
+            &spacing_path(store),
+            &Started::new(cli, label, now).text(),
+        )
+        .map_err(|e| Refused::Record(e.to_string()))?;
+        Ok(Begun {
+            signin,
+            cli: self.cli,
+            label: self.label,
+        })
+    }
+}
+
+/// A sign-in [`SignIn::begin`] started: it holds the sign-in lock until the provider flow ends.
+/// The functions that start a provider's login take one.
+#[derive(Debug)]
+#[must_use]
+pub(super) struct Begun {
+    signin: super::accounts::Lock,
+    cli: super::accounts::Cli,
+    label: String,
+}
+
+impl Begun {
+    /// The sign-in lock it holds.
+    #[must_use]
+    pub(super) fn lock(&self) -> &super::accounts::Lock {
+        &self.signin
+    }
+
+    /// Whether it is `cli`'s `label`'s sign-in.
+    #[must_use]
+    pub(super) fn names(&self, cli: super::accounts::Cli, label: &str) -> bool {
+        self.cli == cli && self.label == label
+    }
+}
+
+/// A person's sign-in of `cli`'s `label`, for a test that drives one sign-in.
+#[cfg(test)]
+pub(super) fn asked_fixture(cli: super::accounts::Cli, label: &str) -> SignIn {
+    SignIn::fixture(cli, label, Why::Asked)
+}
+
+/// A started sign-in of `cli`'s `label` under `signin`, for a test that drives the provider flow
+/// below [`SignIn::begin`]; it records no start.
+#[cfg(test)]
+pub(super) fn begun_fixture(
+    signin: super::accounts::Lock,
+    cli: super::accounts::Cli,
+    label: &str,
+) -> Begun {
+    Begun {
+        signin,
+        cli,
+        label: label.to_owned(),
+    }
+}
+
 /// The `aterm.log` line one attempt of `label`'s ladder writes: how it ended and the routes.
 pub(super) fn log_line(label: &str, outcome: &str, words: &str) -> String {
     format!(
@@ -750,3 +1143,60 @@ mod row_context_tests;
 #[cfg(test)]
 #[path = "vault_refresh_context_tests.rs"]
 mod vault_context_tests;
+
+/// The ladder reads a row's mailbox from the lab registry (one-mesh design step A9).
+#[cfg(test)]
+mod registry_tests {
+    use super::super::{
+        accounts::Row,
+        accounts_sync::mailbox_offer,
+        alab_roster,
+        headless_oauth::{discover_mailbox_config_files, registry_tests as fixture},
+    };
+    use super::*;
+
+    /// With no mailbox file or sheet present, the upkeep's offer for a row whose email the
+    /// registry's webmail mailbox receives is that mailbox with the row's password, its login
+    /// masked, and the ladder routes the sign-in through it, all without revealing a value; a
+    /// registry mailbox with no password held is named as such and never tried.
+    /// NEGATIVE CONTROL: with `mailbox_offer` asking `password_for` again instead of
+    /// `holds_for`, the `reveals() == 0` assertion reads 1.
+    #[test]
+    fn the_ladder_routes_a_row_through_its_registry_mailbox_without_a_reveal() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let row = Row {
+            label: "claude-1".to_owned(),
+            email: Some("ai1@example.test".to_owned()),
+            ..Row::default()
+        };
+        let offer = |mail| {
+            alab_roster::with_mail(mail, fixture::secrets(), || {
+                let cfg = discover_mailbox_config_files(Some(home.path()), None, None);
+                (mailbox_offer(false, cfg, &row), alab_roster::reveals())
+            })
+        };
+        let ((mailbox, login), reveals) = offer(vec![fixture::mailbox()]);
+        assert_eq!(mailbox, Mailbox::WebmailOnly);
+        assert_eq!(login.as_deref(), Some("ow…@…"));
+        assert_eq!(reveals, 0, "the upkeep's look reveals nothing");
+        let read = Read {
+            profile: Profile::None,
+            mailbox,
+            mailbox_login: login,
+            vault: None,
+            browser: true,
+            row_browser: false,
+            hosts: 0,
+        };
+        assert_eq!(read.route(), Some(Route::Mailbox));
+        assert!(read.holds_mailbox());
+
+        let mut unheld = fixture::mailbox();
+        unheld.held.clear();
+        let ((mailbox, login), _) = offer(vec![unheld]);
+        assert_eq!(
+            (mailbox, login.as_deref()),
+            (Mailbox::SharedNoPassword, Some("ow…@…"))
+        );
+    }
+}

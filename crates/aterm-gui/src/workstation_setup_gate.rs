@@ -203,6 +203,7 @@ impl PermissionGate {
 
     /// Whether the selected plan is this window's own admission. An automatic admission
     /// remains a valid setup decision without granting a permission-prompt capability.
+    #[cfg(test)]
     pub(super) fn own_admission_stands(&self) -> bool {
         self.allowed()
             && self
@@ -211,8 +212,8 @@ impl PermissionGate {
                 .is_some_and(|(policy, (_, revision))| revision == policy.revision)
     }
 
-    /// Whether this revision has an explicit person's permission choice.
-    pub(super) fn person_admission_stands(&self) -> bool {
-        self.own_admission_stands() && self.own.is_some_and(|(by, _)| by == AdmittedBy::Person)
+    /// An admitted setup revision starts its permission steps automatically.
+    pub(super) fn steps_admitted(&self) -> bool {
+        self.allowed()
     }
 }

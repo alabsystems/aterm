@@ -306,7 +306,17 @@ fn every_lens_holds_its_frame_at_every_size() {
                         let input = input(snap, dark_inks());
                         for &lw in widths {
                             for &lh in heights {
-                                for how in [Opened::Pinned, Opened::Keyboard, Opened::Hover] {
+                                // How a lens was opened reaches its layout only as the key hint
+                                // on line 1, whose room reads the width alone: the keyboard's and
+                                // the hover's forms run at the least height and the tallest. A
+                                // head that came to lay a hint on another row, or let how it was
+                                // opened move what is under it, would escape between them.
+                                let hows: &[Opened] = if lh == 90.0 || lh == 250.0 {
+                                    &[Opened::Pinned, Opened::Keyboard, Opened::Hover]
+                                } else {
+                                    &[Opened::Pinned]
+                                };
+                                for &how in hows {
                                     let lens = Lens {
                                         how,
                                         ..pinned(focus)
@@ -1589,6 +1599,79 @@ fn line_one_fits_its_longest_forms() {
     assert_eq!(narrow, ["Disk", "as of 10:42:17", "esc closes"]);
     let hover = line1(1024.0, Opened::Hover);
     assert_eq!(hover.last().map(String::as_str), Some("click pins it"));
+}
+
+/// The CPU lens's ⌘⇧P line is drawn whole wherever its section shows it: one row in the 476 pt
+/// column of the lens a 1036.5 pt Folded deck opens (988.5 pt wide), wrapped at the narrowest
+/// two-column lens (640 pt) and in one column down to the narrowest lens (160 pt), none of its
+/// rows cut and no form ending inside it. NEGATIVE CONTROL: the line it replaced is wider than
+/// that 476 pt column, which cut it mid-sentence.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_cpu_policy_line_is_drawn_whole_at_every_width() {
+    let mut snap = lens_scene(Scene::Calm);
+    snap.authorized_cpu_policy = Some(Arc::new(aterm_vitals::sys::json::Jv::obj([(
+        "state",
+        aterm_vitals::sys::json::Jv::s("ok"),
+    )])));
+    let m = FaceMetrics::helvetica_neue();
+    let input = input(&snap, dark_inks());
+    let drawn = |lw: f64| -> (Vec<String>, Vec<String>) {
+        let (_, cw) = columns(lw);
+        let rows = wrap(&m, CPU_POLICY_KEY, cw, BODY_PT);
+        let texts: Vec<String> = lay_lens(
+            &shell(lw, 250.0, 2.0),
+            &input,
+            &pinned(Instrument::Cpu),
+            &m,
+            false,
+        )
+        .boxes
+        .into_iter()
+        .map(|b| b.text)
+        .collect();
+        (rows, texts)
+    };
+    for lw in [988.5, 640.0, 639.0, 400.0, 160.0] {
+        let (rows, texts) = drawn(lw);
+        assert!(
+            rows.iter().all(|r| !r.ends_with('\u{2026}')),
+            "{lw} pt: {rows:?}"
+        );
+        assert_eq!(
+            rows.concat().replace(' ', ""),
+            CPU_POLICY_KEY.replace(' ', ""),
+            "{lw} pt"
+        );
+        let at = texts.iter().position(|t| *t == rows[0]);
+        if lw >= 640.0 {
+            assert!(at.is_some(), "{lw} pt: shown, {texts:?}");
+        }
+        if let Some(at) = at {
+            assert_eq!(
+                texts.get(at..at + rows.len()),
+                Some(&rows[..]),
+                "{lw} pt: whole"
+            );
+        }
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("\u{2318}\u{21e7}P") && t.ends_with('\u{2026}')),
+            "{lw} pt: {texts:?}"
+        );
+    }
+    assert_eq!(
+        drawn(988.5).0.len(),
+        1,
+        "one row at the 1036.5 pt Folded deck"
+    );
+    let replaced = "\u{2318}\u{21e7}P authorizes one bounded, read-only CPU policy collection in \
+                    aterm's password sheet. No policy changes or credential cache.";
+    assert!(
+        m.width(replaced, BODY_PT, false) > columns(988.5).1,
+        "CONTROL"
+    );
 }
 
 #[test]

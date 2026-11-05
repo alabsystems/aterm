@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "ALab's mesh logs and their relay: tables.log and metrics.log in the node service, each record signed by its origin and pushed once to every Mac over the neighbour links"
+
+# The node service that hosts the mesh is unix-only (`crates/aterm-gui/src/node_serve.rs`), and so
+# is every crate this one reads: the root is `#![cfg(unix)]`, and its dependencies are too.
+[target.'cfg(unix)'.dependencies]
+# The two logs and their relay: a guarded broker (`cap`) sealed at rest (`at-rest`) whose metrics
+# log is retained (`retention`); `relay` gives the origin-signed envelope (`origin`), the origin
+# keys and the relayed publish; `stream` gives the adopted neighbour stream (`serve_stream`) and
+# the bridge that dials one (`StreamDial`, `FederationWire::Stream`). `identity` stays off: it
+# brings ed25519-dalek, and `relay` signs with ring.
+astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["at-rest", "cap", "retention", "relay", "stream"] }
+# The grants each log's guard checks (`mint`) and the producer id an origin's records carry
+# (`producer_id_of`).
+astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
+# The incarnation lease each log's sequence numbers come from (`state::StateDir`), and the rules a
+# log is sealed at rest by (`at_rest`), the tiers and the boot reading (`durability`).
+aterm-link = { path = "../aterm-link" }
+# The metrics log's retention (`rules::rules`) and the relay filter of every row a Mac shares.
+aterm-metrics = { path = "../aterm-metrics" }
+# The neighbour links the relay rides (`fleet::link`), their `Bus` streams and the node key's file.
+aterm-net = { workspace = true }
+# The membership log, whose current seats are the origins and whose removed and retired keys are
+# revoked (`membership_log`, `client::load_acknowledged_and_ahead`).
+aterm-secrets = { workspace = true }
+# The private folder and secret files, the OS entropy and the node key's reader.
+aterm-uds = { workspace = true }
+# Lowercase hex for the node key's file and the grants a Bus stream carries.
+aterm-codec = { workspace = true }
+# The one switch's negative-control reader (`negative_control::on`).
+aterm-types = { workspace = true }
+# The node service's journal lines.
+aterm-log = { workspace = true }
+# The flush a test may skip (`plain_durable_flushes_in_tests!`).
+aterm-durable = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Scratch folders for each test Mac.
+aterm-tempfile.workspace = true
+# The one-minute hang detector every wait in a test is.
+aterm-spec.workspace = true
+
+[lints]
+workspace = true

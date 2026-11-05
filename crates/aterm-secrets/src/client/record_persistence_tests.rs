@@ -493,7 +493,10 @@ fn a_mac_stores_its_mark_before_its_records_file_holds_its_4097th_record() {
 /// writes what a crossed log's server sent ([`super::write_taught_by_crossed`]), `MacPullDies`
 /// the same with the Mac dying between its mark and its file (`Faults::dies_between`),
 /// `MacTakes` as every other write does ([`super::write_records`]), and `MacTakeFails` the same
-/// where the mark cannot be stored (`Faults::fail_store`).
+/// where the mark cannot be stored (`Faults::fail_store`). Every run lays the same base file: one
+/// base ingested and encoded once a process, not once a run, so a defect in writing the base shows
+/// in the first run alone. Its count of the batch is the last write's own reading (`held`), so a
+/// defect that changed the file after that write would go unread; nothing runs between them.
 struct MacRun {
     _home: aterm_tempfile::TempDir,
     paths: super::Paths,
@@ -501,26 +504,39 @@ struct MacRun {
     mutant: crate::crossing::Faults,
     /// Whether the file took records a crossed log's server sent (the model's `nx`).
     taught: bool,
+    /// How many of the removal batch's records its file held as the last write left it, read back
+    /// from the file; `None` before the first.
+    held: Option<usize>,
 }
 
 impl MacRun {
     fn start(mutant: crate::crossing::Faults) -> Self {
         use crate::crossing::fixture::{Batch, VAULT};
 
+        static BASE_FILE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
         let home = aterm_tempfile::tempdir().expect("tempdir");
         let paths = super::Paths::for_home(home.path());
         std::fs::create_dir_all(&paths.dir).expect("the secrets dir");
-        let mut store = crate::membership_log::Store::for_vault(VAULT).expect("store");
-        let _ = store
-            .ingest_records(Batch::get().base.clone())
-            .expect("the base");
-        super::write_records(&paths, &store).expect("the base file");
+        let base = BASE_FILE.get_or_init(|| {
+            let built = aterm_tempfile::tempdir().expect("tempdir");
+            let built = super::Paths::for_home(built.path());
+            std::fs::create_dir_all(&built.dir).expect("the secrets dir");
+            let mut store = crate::membership_log::Store::for_vault(VAULT).expect("store");
+            let _ = store
+                .ingest_records(Batch::get().base.clone())
+                .expect("the base");
+            super::write_records(&built, &store).expect("the base file");
+            std::fs::read(built.records_data_file().expect("the records layout"))
+                .expect("the base file")
+        });
+        crate::fsx::write_atomic(&paths.records_file(), base, 0o600).expect("the base file");
         crate::crossing::inject(super::crossing_mark(&paths).path(), mutant);
         Self {
             _home: home,
             paths,
             mutant,
             taught: false,
+            held: None,
         }
     }
 
@@ -534,7 +550,11 @@ impl MacRun {
 
     /// How many of the removal batch's records its file holds.
     fn batch_held(&self) -> usize {
-        let store = self.store();
+        Self::batch_in(&self.store())
+    }
+
+    /// How many of the removal batch's records `store` holds.
+    fn batch_in(store: &crate::membership_log::Store) -> usize {
         crate::crossing::fixture::Batch::get()
             .removal
             .iter()
@@ -545,8 +565,8 @@ impl MacRun {
     /// The removal batch taken and written, from a crossed log's server where `crossed`, the
     /// write suffering `fault` beside the run's mutant.
     fn write(&mut self, crossed: bool, fault: crate::crossing::Faults) {
-        let before = self.batch_held();
         let mut store = self.store();
+        let before = Self::batch_in(&store);
         let _ = store
             .ingest_records(crate::crossing::fixture::Batch::get().removal.clone())
             .expect("the batch");
@@ -567,9 +587,11 @@ impl MacRun {
         };
         crate::crossing::inject(mark.path(), self.mutant);
         assert_eq!(written.is_err(), failing, "{written:?}");
-        if crossed && self.batch_held() > before {
+        let held = self.batch_held();
+        if crossed && held > before {
             self.taught = true;
         }
+        self.held = Some(held);
     }
 
     fn apply(&mut self, action: &str) {
@@ -618,7 +640,7 @@ fn records_capacity_mac(run: &MacRun) -> aterm_spec::interp::State {
         ("last", 0),
         ("lw", 0),
         ("lk", 0),
-        ("nr", count(run.batch_held())),
+        ("nr", count(run.held.unwrap_or_else(|| run.batch_held()))),
         ("nx", i64::from(run.taught)),
         (
             "mark",

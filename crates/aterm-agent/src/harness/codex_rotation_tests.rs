@@ -20,7 +20,15 @@ impl UsageReader for Reader {
         _: Option<&str>,
         _: i64,
         wait: Duration,
+        use_token: crate::harness::provider_read::Use,
     ) -> Option<IdentifiedUsage> {
+        use_token
+            .begin_home(
+                crate::harness::provider_read::Read::CodexEndpoint,
+                path,
+                NOW,
+            )
+            .ok()?;
         assert!(!wait.is_zero());
         self.calls.borrow_mut().push(path.to_owned());
         self.answers.get(path).cloned()
@@ -818,9 +826,10 @@ fn disabled_rotation_and_an_expired_budget_make_no_provider_requests() {
     for disabled in [false, true] {
         let (world, reader) = fixture("quota-proposal-disabled");
         if disabled {
-            std::fs::write(
-                world.cfg.join("aterm.toml"),
-                "[harness]\naccounts = 'off'\n",
+            aterm_uds::atomic_file::write(
+                &(world.cfg.join("aterm.toml")),
+                ("[harness]\naccounts = 'off'\n").as_ref(),
+                0o600,
             )
             .unwrap();
         }

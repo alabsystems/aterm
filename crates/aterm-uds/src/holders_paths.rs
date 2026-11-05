@@ -50,6 +50,7 @@ pub fn scan_path_users_of(pids: &[u32], dirs: &[PathBuf], skip: &[u32]) -> io::R
         if skip.contains(&pid) {
             continue;
         }
+        crate::progress::tick();
         scan.scanned += 1;
         match mac::uses(pid, dirs) {
             Ok(Some(found)) if !unexeced_fork(pid, skip) => scan.users.push(found),
@@ -151,13 +152,18 @@ fn own_program() -> Option<PathBuf> {
 fn own_image_machine() -> Option<u16> {
     use std::io::Read as _;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-    let dir = std::fs::File::open(format!("/proc/{}", std::process::id())).ok()?;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(format!("/proc/{}", std::process::id()))
+        .ok()?;
     // SAFETY: `dir` is open for the call and the name is NUL-terminated.
     let fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
             c"exe".as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
@@ -253,8 +259,13 @@ fn parent_of(pid: u32) -> Option<u32> {
 pub fn exe_of(pid: u32) -> Exe {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     let gone = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH));
-    let dir = match std::fs::File::open(format!("/proc/{pid}")) {
+    let dir = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(format!("/proc/{pid}"))
+    {
         Ok(dir) => dir,
         Err(e) if gone(&e) => return Exe::Exited,
         Err(_) => return Exe::Unnamed,
@@ -539,6 +550,7 @@ pub fn scan_path_users_of(pids: &[u32], dirs: &[PathBuf], skip: &[u32]) -> io::R
         if skip.contains(&pid) {
             continue;
         }
+        crate::progress::tick();
         let proc_dir = PathBuf::from(format!("/proc/{pid}"));
         if std::fs::symlink_metadata(&proc_dir).is_err() {
             // Distinct branch.
@@ -638,6 +650,7 @@ fn scan_naming(pids: &[u32], dirs: &[PathBuf], skip: &[u32], mut namer: win::Nam
         let handles = win::file_handles();
         pids.iter()
             .map(|&pid| {
+                crate::progress::tick();
                 let pid_handles = handles
                     .as_ref()
                     .map(|h| h.get(&pid).map_or(&[][..], Vec::as_slice));
@@ -1244,6 +1257,7 @@ mod win {
         }
 
         fn name(&mut self, key: (u32, Of), query: Query) -> HandlePath {
+            crate::progress::tick();
             if STUCK
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -1495,8 +1509,6 @@ pub fn write_open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
 /// See the macOS twin.
 #[cfg(target_os = "linux")]
 pub fn write_open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
-    use std::io::Read as _;
-
     const O_ACCMODE: u32 = 0o3;
     let proc_dir = PathBuf::from(format!("/proc/{pid}"));
     let rd = match std::fs::read_dir(proc_dir.join("fd")) {
@@ -1507,7 +1519,13 @@ pub fn write_open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name();
-        let Ok(file) = std::fs::File::open(proc_dir.join("fdinfo").join(&name)) else {
+        let Ok(file) = ({
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(proc_dir.join("fdinfo").join(&name))
+        }) else {
             // Distinct branch.
             continue; // closed since the listing
         };
@@ -3763,5 +3781,39 @@ mod win_tests {
             "some process of this account besides this one (skipped, so not counted) is scanned"
         );
         let _ = std::fs::remove_dir_all(&empty);
+    }
+}
+
+/// A SCAN SAYS IT IS STILL GOING AS IT GOES: nothing bounds how long one takes (it asks the kernel
+/// about each mapped region of each process), and whoever waits on it reads silence as a hang.
+#[cfg(all(test, any(target_vendor = "apple", target_os = "linux", windows)))]
+mod progress_tests {
+    use super::scan_path_users_of;
+    use crate::progress::ticks_here;
+
+    /// No process has this id, so a tick for it is the per-process one alone.
+    const NONE: u32 = 2_000_000_000;
+
+    /// NEGATIVE CONTROL: a process the scan skips is not read, so it does not tick.
+    #[test]
+    fn a_scan_ticks_for_each_process_it_reads_and_none_it_skips() {
+        let dirs = [std::env::temp_dir()];
+        let before = ticks_here();
+        scan_path_users_of(&[NONE, NONE], &dirs, &[]).expect("scanned");
+        assert!(ticks_here() - before >= 2);
+        let me = std::process::id();
+        let before = ticks_here();
+        scan_path_users_of(&[me], &dirs, &[me]).expect("scanned");
+        assert_eq!(ticks_here(), before);
+    }
+
+    /// One process can hold thousands of regions, each a question to the kernel.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_scan_ticks_for_each_mapped_region_of_a_process() {
+        let dirs = [std::env::temp_dir().join("aterm-progress-nothing-maps-this")];
+        let before = ticks_here();
+        scan_path_users_of(&[std::process::id()], &dirs, &[]).expect("scanned");
+        assert!(ticks_here() - before > 1, "more than the process's own");
     }
 }

@@ -45,6 +45,9 @@ amacs-protocol = { workspace = true }
 # where it is (`survey::fleet_note_at`), in the words every reporter uses. First-party, low (it
 # depends on no aterm-ctl).
 aterm-netplace = { workspace = true }
+# The board records a worker's brief by its SHA-256, never its text (`board::brief_digest`).
+# First-party: astream-digest's SHA-256, which has no dependencies.
+aterm-digest = { workspace = true }
 
 # The census's process table (`kproc::records`), read in-process instead of running `ps`.
 # First-party, and so is each crate it brings (its `libc` is aterm-libc).
@@ -54,6 +57,9 @@ aterm-sysprobe = { workspace = true }
 [dev-dependencies]
 # Scratch directories for the tests' sockets, removed on drop.
 aterm-tempfile = { workspace = true }
+# The board's tests write rows durably: their flushes are the plain ones in a test binary
+# (`plain_durable_flushes_in_tests!`). Already in the graph through aterm-uds.
+aterm-durable = { workspace = true }
 
 # tests/terminal_output.rs puts the CLI's stdout or stderr on a real pty.
 [target.'cfg(unix)'.dev-dependencies]

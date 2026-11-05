@@ -159,21 +159,39 @@ fn adoption_records_a_birth_only_for_the_ptys_session_leader() {
     assert!(!stranger.verify(), "and so it never verifies");
 }
 
-#[test]
-fn a_verified_hup_ignoring_shell_is_still_hung_up_and_force_killed() {
-    let sh = parked_session("trap '' HUP; printf 'UP\\n'; exec sleep 30");
+/// Hangs up and reaps a parked `script`, recorded the adopted way so the escalation is authorized
+/// by the start time alone, and requires that it died by the `SIGKILL` escalation. Answers its
+/// poll waits and the tick of its `SIGKILL`.
+fn hang_up_and_force_kill(script: &str) -> (u32, Option<u32>) {
+    hang_up_and_force_kill_once(script, |_| {})
+}
+
+/// [`hang_up_and_force_kill`] in teardown's order, with `settled` run between the hang-up and the
+/// reap.
+fn hang_up_and_force_kill_once(script: &str, settled: impl FnOnce(i32)) -> (u32, Option<u32>) {
+    let sh = parked_session(script);
     let identity = record_adopted_shell(sh.pid, sh.master);
     assert!(identity.verify(), "the live leader verifies");
+    let ignored_hangup = ignores_hangup(&identity);
     let hung = hangup_shell(&identity, sh.master);
+    settled(sh.pid);
     let polls_before = reap_polls();
     let _ = take_reap_kill_tick();
-    reap_shell(identity);
+    reap_shell_scheduled(
+        identity,
+        Some(REAP_KILL_AT),
+        REAP_DEADLINE,
+        InGrace::enter(),
+        ignored_hangup,
+    );
     let polls = reap_polls() - polls_before;
     let kill_tick = take_reap_kill_tick();
+    // Reading the terminal meanwhile: a shell's last words, unread, hold its exit in the tty drain.
     let mut status: libc::c_int = 0;
     let mut collected = 0;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + HANG_DETECTOR;
     while collected == 0 && Instant::now() < deadline {
+        let _ = read(sh.master, &mut [0u8; 256]);
         // SAFETY: non-blocking wait on the test's own child.
         collected = unsafe { libc::waitpid(sh.pid, &mut status, libc::WNOHANG) };
         if collected == 0 {
@@ -189,19 +207,222 @@ fn a_verified_hup_ignoring_shell_is_still_hung_up_and_force_killed() {
     );
     assert!(
         collected == sh.pid && libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
-        "the HUP-ignoring shell must have died by the SIGKILL escalation \
+        "the shell must have died by the SIGKILL escalation \
          (waitpid={collected}, status=0x{status:x})"
     );
+    (polls, kill_tick)
+}
+
+/// One shell the kernel says ignores `SIGHUP` and one whose trap never returns, the escalation
+/// counted in the reaper's own ticks. The first row is what proves the mask reads true: a wrong
+/// offset or an unread record reads as "not ignoring" and moves it to the handler tick.
+#[test]
+fn a_verified_shell_is_hung_up_and_force_killed_only_past_its_grace() {
+    let (polls, kill_tick) = hang_up_and_force_kill("trap '' HUP; printf 'UP\\n'; exec sleep 30");
     assert_eq!(
         kill_tick,
         Some(REAP_KILL_AT),
-        "the SIGKILL escalation goes out at the ~250 ms tick"
+        "a HUP-ignoring holdout is SIGKILLed at the holdout tick"
     );
     assert!(
         polls > REAP_KILL_AT && polls < REAP_DEADLINE,
         "the escalation, not the give-up, ended the wait \
          ({polls} poll waits, kill at {REAP_KILL_AT}, give-up at {REAP_DEADLINE})"
     );
+    let (polls, kill_tick) =
+        hang_up_and_force_kill("trap 'read go; exit 0' HUP; printf 'UP\\n'; sleep 30; exit 0");
+    assert_eq!(
+        kill_tick,
+        Some(REAP_HANDLER_KILL_AT),
+        "a shell still running its SIGHUP handler is SIGKILLed only once the handler's grace \
+         is spent, never at the holdout tick"
+    );
+    assert!(
+        polls > REAP_HANDLER_KILL_AT && polls < REAP_DEADLINE,
+        "the escalation, not the give-up, ended the wait \
+         ({polls} poll waits, kill at {REAP_HANDLER_KILL_AT}, give-up at {REAP_DEADLINE})"
+    );
+}
+
+/// A handler that ignores `SIGHUP` for its own cleanup, as `tools/install.sh`'s does, reads as
+/// ignoring by the holdout tick. What it did before the hang-up is what names a holdout.
+#[test]
+fn a_handler_that_ignores_sighup_for_its_own_cleanup_is_no_holdout() {
+    let (_, kill_tick) = hang_up_and_force_kill_once(
+        "trap 'trap \"\" HUP; read go; exit 0' HUP; printf 'UP\\n'; sleep 30 & wait",
+        |pid| {
+            let deadline = Instant::now() + HANG_DETECTOR;
+            while !aterm_uds::process::ignored_signals(pid)
+                .is_some_and(|mask| mask & (1 << (libc::SIGHUP - 1)) != 0)
+            {
+                assert!(Instant::now() < deadline, "the handler never ran");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        },
+    );
+    assert_eq!(kill_tick, Some(REAP_HANDLER_KILL_AT));
+}
+
+/// A real shell at its prompt with a hang-up handler: what runs it, and the rc file that sets the
+/// handler to do `work` before writing `marker`.
+#[cfg(target_os = "macos")]
+fn handler_row(
+    scratch: &std::path::Path,
+    name: &str,
+    work: &str,
+    marker: &std::path::Path,
+) -> (String, std::path::PathBuf, String) {
+    let marker = marker.display();
+    let dir = scratch.join(name);
+    std::fs::create_dir_all(&dir).expect("the row's folder");
+    match name {
+        "zsh-trap" => (
+            format!("ZDOTDIR='{}' exec /bin/zsh -d -i", dir.display()),
+            dir.join(".zshrc"),
+            format!("trap '{work}; print done > {marker}; exit 0' HUP\nprint UP\n"),
+        ),
+        "zsh-zshexit" => (
+            format!("ZDOTDIR='{}' exec /bin/zsh -d -i", dir.display()),
+            dir.join(".zshrc"),
+            format!("zshexit() {{ {work}; print done > {marker} }}\nprint UP\n"),
+        ),
+        "bash-exit-trap" => (
+            format!(
+                "exec /bin/bash --noprofile --rcfile '{}/rc' -i",
+                dir.display()
+            ),
+            dir.join("rc"),
+            // Announce readiness from the first prompt, after Bash has installed its
+            // interactive signal handlers. An `echo` in the rc file races that setup.
+            format!("unset HISTFILE\ntrap '{work}; echo done > {marker}' EXIT\nPS1=UP\n"),
+        ),
+        other => panic!("no row {other}"),
+    }
+}
+
+/// Alive at the holdout tick is not "ignored `SIGHUP`". The handler's work waits on a line this
+/// test writes only once a schedule that ends just past that tick has returned, so a shell cut
+/// there is counted, never raced.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_real_shell_finishes_its_hang_up_handler_past_the_holdout_tick() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let mut cut = Vec::new();
+    for name in ["zsh-trap", "zsh-zshexit", "bash-exit-trap"] {
+        let go = scratch.path().join(format!("{name}.go"));
+        let fifo = std::ffi::CString::new(go.as_os_str().as_bytes()).expect("a path has no NUL");
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+        // Read and write, so neither end's open waits for the other.
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        let gate = unsafe { libc::open(fifo.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        assert!(gate >= 0, "the go line's fifo opens");
+        let marker = scratch.path().join(format!("{name}.marker"));
+        let work = format!("read line < {}", go.display());
+        let (script, rc, text) = handler_row(scratch.path(), name, &work, &marker);
+        std::fs::write(rc, text).expect("the rc file");
+        let sh = parked_session(&script);
+        let identity = record_adopted_shell(sh.pid, sh.master);
+        assert!(identity.verify(), "the live leader verifies");
+        let hung = hangup_shell(&identity, sh.master);
+        assert_eq!(hung, ShellHangup::Shell(sh.pid), "{name} is hung up");
+        reap_shell_scheduled(
+            identity,
+            Some(REAP_KILL_AT),
+            REAP_KILL_AT + 1,
+            InGrace::enter(),
+            false,
+        );
+        // SAFETY: writing a few bytes from a valid buffer to the fifo this test opened.
+        let wrote = unsafe { libc::write(gate, b"go\n".as_ptr().cast(), 3) };
+        assert_eq!(wrote, 3, "the go line reaches the fifo");
+        // Until the marker or the shell's end: zsh at its prompt runs a trap's `exit` only on
+        // its next input, which never comes.
+        let mut status: libc::c_int = 0;
+        let mut collected = 0;
+        let deadline = Instant::now() + HANG_DETECTOR;
+        while collected == 0 && !marker.exists() && Instant::now() < deadline {
+            let _ = read(sh.master, &mut [0u8; 256]);
+            // SAFETY: non-blocking wait on the test's own child.
+            collected = unsafe { libc::waitpid(sh.pid, &mut status, libc::WNOHANG) };
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !marker.exists() {
+            cut.push(format!("{name} (status=0x{status:x})"));
+        }
+        // SAFETY: closing the descriptors this test owns, then ending and reaping its own child
+        // if it is still there.
+        unsafe {
+            libc::close(gate);
+            libc::close(sh.master);
+            if collected == 0 {
+                libc::kill(sh.pid, libc::SIGKILL);
+                libc::waitpid(sh.pid, std::ptr::null_mut(), 0);
+            }
+        }
+    }
+    assert!(
+        cut.is_empty(),
+        "the reaper cut these shells mid-handler at the holdout tick, their markers unwritten: \
+         {cut:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn closing_the_original_master_keeps_exit_handlers_and_drains_their_output() {
+    use std::os::unix::ffi::OsStrExt;
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    for name in ["zsh-zshexit", "bash-exit-trap"] {
+        let hold = hold_reap_kills_for_test();
+        let gate_path = scratch.path().join(format!("{name}.fifo"));
+        let path = std::ffi::CString::new(gate_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: this test creates and owns its FIFO and descriptor.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let gate = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        assert!(gate >= 0);
+        let entered = scratch.path().join(format!("{name}.entered"));
+        let marker = scratch.path().join(format!("{name}.done"));
+        let work = format!(
+            "echo entered > {}; read line < {}; printf '%s' '{}'",
+            entered.display(),
+            gate_path.display(),
+            "x".repeat(128 * 1024)
+        );
+        let (script, rc, text) = handler_row(scratch.path(), name, &work, &marker);
+        std::fs::write(rc, text).unwrap();
+        let sh = parked_session(&script);
+        let identity = record_spawned_shell(sh.pid);
+        assert!(identity.verify());
+        hangup_and_reap_shell(identity, sh.master).expect("retain terminal before hang-up");
+        // SAFETY: the foreground test owns the original master; teardown owns its duplicate.
+        unsafe {
+            libc::close(sh.master);
+        }
+        let deadline = Instant::now() + HANG_DETECTOR;
+        while !entered.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            entered.exists(),
+            "{name} entered its cleanup with the original master closed"
+        );
+        // SAFETY: write the gate only after the handler proved it entered cleanup.
+        assert_eq!(unsafe { libc::write(gate, b"go\n".as_ptr().cast(), 3) }, 3);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        unsafe {
+            libc::close(gate);
+        }
+        assert!(
+            marker.exists(),
+            "{name} completed output beyond the tty buffer"
+        );
+        drop(hold);
+        assert!(wait_for_reaps(HANG_DETECTOR), "teardown completed");
+    }
 }
 
 #[test]
@@ -281,7 +502,7 @@ fn a_shell_stuck_exiting_on_unread_output_is_reaped_not_left_a_zombie() {
 fn a_shell_alive_past_the_deadline_is_reaped_when_it_exits() {
     let sh = parked_session("printf 'UP\\n'; read go; exit 0");
     let identity = record_spawned_shell(sh.pid);
-    reap_shell_scheduled(identity, None, 2, InGrace::enter());
+    reap_shell_scheduled(identity, None, 2, InGrace::enter(), false);
     let alive_at_return = process_birth(sh.pid).is_some();
     let go = b"go\n";
     // SAFETY: writing a few bytes from a valid buffer to the master this test owns.
@@ -310,20 +531,36 @@ fn a_shell_alive_past_the_deadline_is_reaped_when_it_exits() {
     );
 }
 
-/// Set only on the child [`a_quit_after_wait_for_reaps_leaves_no_hup_ignoring_shell`] starts.
+/// Set only on the child [`a_quit_leaves_no_shell`] starts.
 #[cfg(target_os = "macos")]
 const QUITTING: &str = "ATERM_PTY_TEST_QUITTING";
 
 #[cfg(target_os = "macos")]
 #[test]
 fn a_quit_after_wait_for_reaps_leaves_no_hup_ignoring_shell() {
+    a_quit_leaves_no_shell("trap '' HUP; printf 'UP\\n'; exec sleep 600");
+}
+
+/// Its grace slot follows the escalation to the handler tick: given back at the holdout tick, the
+/// quitting process would exit with this shell still running.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_quit_after_wait_for_reaps_leaves_no_shell_that_caught_its_hang_up_and_carried_on() {
+    a_quit_leaves_no_shell("trap : HUP; printf 'UP\\n'; while :; do /bin/sleep 600; done");
+}
+
+/// A process hangs up a shell running `script`, waits for its reap and exits; the shell must not
+/// outlive it. The calling test runs twice, as that process and as the one watching it.
+#[cfg(target_os = "macos")]
+fn a_quit_leaves_no_shell(script: &str) {
     if std::env::var_os(QUITTING).is_some() {
-        let sh = parked_session("trap '' HUP; printf 'UP\\n'; exec sleep 600");
+        let sh = parked_session(script);
         let identity = record_spawned_shell(sh.pid);
         let birth = identity.birth.expect("a live child reads a birth");
         println!("HOLDOUT {} {birth}", sh.pid);
+        let ignored_hangup = ignores_hangup(&identity);
         let _ = hangup_shell(&identity, sh.master);
-        reap_shell_in_background(identity);
+        reap_shell_in_background(identity, ignored_hangup);
         let settled = wait_for_reaps(HANG_DETECTOR);
         std::process::exit(if settled { 0 } else { 3 });
     }
@@ -376,8 +613,7 @@ fn a_quit_after_wait_for_reaps_leaves_no_hup_ignoring_shell() {
     );
     assert!(
         gone.is_some(),
-        "the HUP-ignoring shell outlived the process that quit after hanging it up \
-         ({holdout:?})"
+        "the shell outlived the process that quit after hanging it up ({holdout:?})"
     );
 }
 
@@ -395,8 +631,12 @@ fn a_close_ends_a_plain_foreground_job_and_leaves_one_that_ignores_sighup() {
         let shell = record_spawned_shell(sh.pid);
         let own_group = foreground > 1 && foreground != sh.pid && job.verify();
         if own_group {
-            let _ = hangup_shell(&shell, sh.master);
-            reap_shell(shell);
+            hangup_and_reap_shell(shell, sh.master).expect("retain the closing terminal");
+        }
+        // SAFETY: close the original now, matching Session disposal while teardown owns its copy.
+        unsafe { libc::close(sh.master) };
+        if own_group {
+            assert!(wait_for_reaps(HANG_DETECTOR));
         }
         let survived = own_group && !is_unreaped_child(sh.pid) && job.verify();
         let died = own_group
@@ -416,8 +656,6 @@ fn a_close_ends_a_plain_foreground_job_and_leaves_one_that_ignores_sighup() {
                 libc::waitpid(sh.pid, std::ptr::null_mut(), 0);
             }
         }
-        // SAFETY: closing the master this test owns.
-        unsafe { libc::close(sh.master) };
         assert!(
             own_group,
             "PRECONDITION: the job is the terminal's foreground group, not the \

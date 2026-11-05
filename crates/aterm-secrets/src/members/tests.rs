@@ -834,6 +834,47 @@ fn a_row_closes_once_the_commons_roster_binds_its_mac() {
     );
 }
 
+/// A recipient the vault's signed swarm roster names but no seat of the member's log binds (a
+/// seatless recipient, one-mesh S1) asks for a seat: its ask shows a row for a person's Allow
+/// rather than closing at once as a member's would, and it closes once the log seats it.
+/// NEGATIVE CONTROL: `Local::knows_recipient` reading the roster alone closes S's first ask and
+/// the first assert fails.
+#[test]
+fn a_seatless_recipient_the_roster_names_shows_a_row_until_the_log_seats_it() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (_, s) = mac(root.path(), "s");
+    let request = s.request(TRUST.network, TRUST.authority).unwrap();
+    let recipient = request.binding().recipient().to_bech32();
+    let (_, m1_device) = mac(root.path(), "m1");
+    let m1_actor = m1_device
+        .request(TRUST.network, TRUST.authority)
+        .unwrap()
+        .binding()
+        .actor();
+    let local = |device: Device, seats: Vec<crate::membership_log::MemberId>| {
+        Local::with(device, TRUST, true, "m1")
+            .expect("member")
+            .with_automatic_lan([recipient.clone()])
+            .with_admitted(seats)
+    };
+    let m1 = Mutex::new(Desk::new(local(m1_device, vec![m1_actor])));
+    let now = Instant::now();
+    assert_eq!(
+        hear_at(&m1, &s, "s", address(41), now),
+        Answer::Asking,
+        "a seatless recipient's ask shows a row"
+    );
+    let (_, again) = mac(root.path(), "m1");
+    m1.lock()
+        .unwrap()
+        .refresh(local(again, vec![m1_actor, request.binding().actor()]));
+    assert_eq!(
+        states(&m1),
+        [RowState::Closed],
+        "the log seats S: its row closes"
+    );
+}
+
 /// A host that copied a Mac's request from its `ask` cannot show it under another node key,
 /// name or model: an ask is signed by the request's writer key over them, so a phrase a person
 /// allows is bound to the node key the real Mac runs with, under the name it asked for.
@@ -1766,6 +1807,80 @@ fn a_replayed_or_borrowed_proof_proves_nothing() {
     );
 }
 
+/// A prove line naming a node key of small order proves no node key: the identity's forgery,
+/// which ring alone takes for every message, is refused at the prove line, and the Mac takes no
+/// bundle.
+///
+/// NEGATIVE CONTROL: `Desk::begin_proof` checking the node key's signature through ring's
+/// `UnparsedPublicKey`: the desk serves the proof to its end, refusing nothing.
+#[test]
+fn a_small_order_node_key_proves_nothing_at_the_desk() {
+    use crate::ed25519::{FORGED, SMALL_ORDER_KEY};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (m_paths, device) = mac(root.path(), "m");
+    let desk = Mutex::new(Desk::new(
+        Local::with(device, TRUST, true, "m").expect("member"),
+    ));
+    let (_, j_device) = mac(root.path(), "j");
+    let decide = hands(&m_paths, "v");
+    let j = joining(&j_device, SMALL_ORDER_KEY, "m7");
+    let forge = |_: &[u8]| FORGED;
+    let (served, got) = proving(&desk, None, &decide, |stream| {
+        let greeting = joiner::greeting(stream)?;
+        joiner::prove(stream, &greeting, &j, &forge, &mut false)
+    });
+    let refused = served.map(|_| ()).unwrap_err().to_string();
+    assert!(
+        refused.contains("not signed by the node key it names"),
+        "{refused}"
+    );
+    assert!(got.is_err(), "a small-order node key took a bundle");
+}
+
+/// A member's answer signed under a greeting key of small order proves nothing: the identity's
+/// forgery, which ring alone takes for every message, is no signed answer.
+///
+/// NEGATIVE CONTROL: `joiner::ask_checked` through ring's `UnparsedPublicKey`: the forged answer
+/// is heard as `Signed::Verified`.
+#[test]
+fn a_small_order_greeting_key_signs_no_answer() {
+    use super::wire;
+    use crate::ed25519::{FORGED, SMALL_ORDER_KEY};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (_, device) = mac(root.path(), "j");
+    let j = joining(&device, [7; 32], "j");
+    let greeting = joiner::Greeting {
+        key: SMALL_ORDER_KEY,
+        network: TRUST.network,
+        authority: TRUST.authority,
+        genesis: TRUST.genesis,
+        name: "m5".to_owned(),
+        can_allow: true,
+        invite: false,
+        challenge: [0; desk::CHALLENGE_LEN],
+    };
+    let (mut member, mut ours) = UnixStream::pair().expect("pair");
+    for end in [&member, &ours] {
+        end.set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("timeout");
+    }
+    let asked = std::thread::scope(|scope| {
+        let answered = scope.spawn(move || -> Result<()> {
+            wire::read_line(&mut member)?;
+            let answer = format!("OK state=allowed gsig={}", wire::hex(&FORGED));
+            wire::write_line(&mut member, &answer)
+        });
+        let asked = joiner::ask_checked(&mut ours, &greeting, &j);
+        answered.join().expect("member").expect("answered");
+        asked
+    });
+    let error = asked.map(|_| ()).unwrap_err().to_string();
+    assert!(
+        error.contains("not signed by the member its greeting names"),
+        "{error}"
+    );
+}
+
 /// A proof that came over the fleet's channel (`vault-join`) must name the node key that
 /// channel proved, and only then is it a proof of the fleet's key too.
 ///
@@ -2212,5 +2327,279 @@ fn an_old_member_and_a_new_one_that_both_show_a_phrase_are_both_named() {
     assert!(
         said.contains("m3 at 10.0.0.3:7100") && said.contains("m5 at 10.0.0.5:7100"),
         "{said}"
+    );
+}
+
+/// A Mac whose machine key a release build made on a Mac's own hardware: unmarked, whatever binary
+/// opens it later (A12).
+fn release_mac(root: &Path, name: &str) -> (Paths, Device) {
+    let paths = Paths::for_home(&root.join(name));
+    client::machine_identity_as(&paths, crate::Making::default()).expect("identity");
+    let device = Device::open(&paths).expect("device").expect("an identity");
+    (paths, device)
+}
+
+/// A joiner's end that keeps every byte it writes, so a test reads the lines it sent.
+struct Tap<'a> {
+    stream: &'a mut UnixStream,
+    sent: Vec<u8>,
+}
+
+impl std::io::Read for Tap<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(self.stream, bytes)
+    }
+}
+
+impl std::io::Write for Tap<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let wrote = std::io::Write::write(self.stream, bytes)?;
+        self.sent.extend_from_slice(&bytes[..wrote]);
+        Ok(wrote)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(self.stream)
+    }
+}
+
+/// A12: an identity this test binary made is a lab identity, its Commons device says so, and its
+/// `ask` line carries `lab=1`; an identity a release build made carries nothing, opened by the same
+/// binary.
+#[test]
+fn a_test_binarys_ask_carries_the_lab_mark_and_a_release_identitys_does_not() {
+    let root = aterm_tempfile::tempdir().expect("temp");
+    let m1 = member(root.path(), "m1");
+    let (_, lab) = mac(root.path(), "lab");
+    let (_, release) = release_mac(root.path(), "release");
+    assert_eq!(lab.lab(), Some(crate::LabMark::TestBinary));
+    assert_eq!(release.lab(), None);
+    for (device, marked) in [(&lab, true), (&release, false)] {
+        let joining = joining(device, [7; 32], "m9");
+        let (_, sent) = exchange(&m1, address(9), "", |stream| {
+            let mut tap = Tap {
+                stream,
+                sent: Vec::new(),
+            };
+            let greeting = joiner::greeting(&mut tap).expect("greeting");
+            joiner::ask(&mut tap, &greeting, &joining).expect("asked");
+            String::from_utf8(tap.sent).expect("ASCII")
+        });
+        let line = sent.lines().next().expect("the ask line");
+        assert!(line.starts_with("ask "), "{line}");
+        assert_eq!(line.ends_with(" lab=1"), marked, "{line}");
+    }
+}
+
+/// A12: a member on the live ALab genesis refuses a lab identity's ask once its signature checks,
+/// showing no row; a member on another genesis (a lab's) admits the same ask, and the live member
+/// admits a release identity's. The pair shows the refusal bites and keys on the mark alone.
+#[test]
+fn a_member_on_the_live_genesis_refuses_a_lab_identitys_ask_and_one_on_another_admits_it() {
+    let root = aterm_tempfile::tempdir().expect("temp");
+    let (_, m1) = mac(root.path(), "m1");
+    let live = Mutex::new(Desk::new(
+        Local::with(m1, TRUST, true, "m1")
+            .expect("member")
+            .with_live_genesis(true),
+    ));
+    let other = member(root.path(), "m2");
+    assert!(live.lock().unwrap().local().on_live_genesis());
+    assert!(!other.lock().unwrap().local().on_live_genesis());
+    let (_, lab) = mac(root.path(), "lab");
+    let lab_joining = joining(&lab, [7; 32], "m9");
+
+    let (served, said) = exchange(&live, address(9), "", |stream| {
+        let greeting = joiner::greeting(stream)?;
+        joiner::ask(stream, &greeting, &lab_joining)
+    });
+    assert_eq!(
+        said.expect_err("refused").to_string(),
+        desk::LAB_REFUSED,
+        "the joiner reads the member's refusal"
+    );
+    assert!(served.is_err());
+    assert!(states(&live).is_empty(), "a refused ask shows no row");
+
+    assert_eq!(ask(&other, address(9), &lab_joining), Answer::Asking);
+    assert_eq!(states(&other), [RowState::Asking]);
+
+    let (_, release) = release_mac(root.path(), "release");
+    assert_eq!(
+        ask(&live, address(10), &joining(&release, [8; 32], "m10")),
+        Answer::Asking
+    );
+    assert_eq!(states(&live), [RowState::Asking]);
+}
+
+/// A12: a lab identity's run with an invite on the live genesis is refused before the phrase is
+/// touched, so the invite stays live, and a release identity's run with the same words is let in.
+#[test]
+fn a_lab_identitys_run_on_the_live_genesis_spends_no_phrase() {
+    let root = aterm_tempfile::tempdir().expect("temp");
+    let (_, m1) = mac(root.path(), "m1");
+    let live = Mutex::new(Desk::new(
+        Local::with(m1, TRUST, true, "m1")
+            .expect("member")
+            .with_live_genesis(true),
+    ));
+    let now = Instant::now();
+    let (phrase, words) = {
+        let mut desk = live.lock().unwrap();
+        let phrase = desk.invite(now).expect("invite");
+        (phrase, desk.words(phrase, now).expect("live").join(" "))
+    };
+    let (_, lab) = mac(root.path(), "lab");
+    let (served, got) = run(&live, address(9), &joining(&lab, [7; 32], "m9"), &words, "");
+    assert_eq!(got.expect_err("refused").to_string(), desk::LAB_REFUSED);
+    assert!(served.is_err());
+    assert_eq!(
+        live.lock().unwrap().phrase_state(phrase),
+        Some(crate::pake::PhraseState::Live),
+        "the refusal spent no phrase"
+    );
+
+    let (_, release) = release_mac(root.path(), "release");
+    let value = token();
+    let (served, got) = run(
+        &live,
+        address(10),
+        &joining(&release, [8; 32], "m10"),
+        &words,
+        &value,
+    );
+    served.expect("served");
+    got.expect("a release identity's run is let in");
+}
+
+/// A Mac that asks with the node key a live seat holds, under another vault key, is that seat's
+/// Mac rebuilt with its node key kept (one-mesh A15): its row names the seat it takes back, the
+/// card says when the old key last signed and that it reads no newer secret once Allowed, and a
+/// plain Allow (no "Allow again") gives it a phrase. Only a Mac that proved the node key on this
+/// desk shows so (an ask names it unproven). The seat's own Mac asking again is no move, and a
+/// Mac with another node key is a new one.
+///
+/// NEGATIVE CONTROL: `Desk::kept_seat` reading only `self.local.kept.get(&heard.node)` (the seat
+/// filter cut): the seat's own Mac reads as moving its own seat and the `own` assert fails.
+#[test]
+fn a_rebuilt_macs_row_names_the_seat_it_takes_back_and_when_it_last_signed() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (_, m1_device) = mac(root.path(), "m1");
+    let (_, old_device) = mac(root.path(), "m10-old");
+    let (_, rebuilt_device) = mac(root.path(), "m10");
+    let (_, stranger_device) = mac(root.path(), "stranger");
+    let node = [0x10; 32];
+    let old_seat = old_device
+        .request(TRUST.network, TRUST.authority)
+        .unwrap()
+        .binding()
+        .actor();
+    // 2026-11-05 14:02 UTC.
+    let signed = 1_793_887_320_000;
+    let kept = client::KeptSeat {
+        seat: old_seat,
+        label: "m10".to_owned(),
+        last_signed_ms: Some(signed),
+    };
+    let desk = Mutex::new(Desk::new(
+        Local::with(m1_device, TRUST, true, "m1")
+            .unwrap()
+            .with_kept(std::collections::BTreeMap::from([(node, kept.clone())])),
+    ));
+    for (device, name, node) in [
+        (&rebuilt_device, "m10", node),
+        (&old_device, "m10-old", node),
+        (&stranger_device, "stranger", [0x11; 32]),
+    ] {
+        assert_eq!(
+            ask(&desk, address(10), &joining(device, node, name)),
+            Answer::Asking
+        );
+    }
+    // An ask names its node key unproven: until the Mac proves it here, it is a new Mac.
+    let now = Instant::now();
+    let unproven = desk.lock().unwrap().rows(now);
+    assert!(unproven.iter().all(|r| r.moves.is_none()), "{unproven:?}");
+    for device in [&rebuilt_device, &old_device] {
+        let request = device.request(TRUST.network, TRUST.authority).unwrap();
+        desk.lock().unwrap().with_proven_node(&request, node, now);
+    }
+    let rows = desk.lock().unwrap().rows(now);
+    let row = |name: &str| rows.iter().find(|r| r.name == name).unwrap().clone();
+    let rebuilt = row("m10");
+    assert_eq!(rebuilt.moves.as_ref(), Some(&kept));
+    assert!(rebuilt.removed.is_none());
+    assert_eq!(
+        kept.title(),
+        "m10 is back with a new vault key. Its old key last signed on Nov 5 at 14:02 UTC; once \
+         you Allow this, that key reads no newer secret"
+    );
+    assert!(
+        row("m10-old").moves.is_none(),
+        "own: no move of its own seat"
+    );
+    assert!(row("stranger").moves.is_none());
+    desk.lock()
+        .unwrap()
+        .allow(rebuilt.id, now)
+        .expect("a plain Allow moves the seat");
+}
+
+/// End to end on one desk: a Mac rebuilt with its node key kept proves that key first
+/// (`join::prove_first`), and the member refuses it before possession while its old seat signed
+/// within the day; its plain ask that follows shows the seat it takes back, and its run hands the
+/// bundle builder `node_proven`. Another Mac that asks naming the same node key, with no proof,
+/// shows as a new Mac.
+///
+/// NEGATIVE CONTROL: `Desk::begin_proof` not recording the proven node (its `self.proven.push`
+/// cut): the rebuilt Mac's row shows no move and the `moves` assert fails.
+#[test]
+fn a_refused_proof_of_a_kept_node_key_lets_the_ask_that_follows_show_the_move() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (_, m1_device) = mac(root.path(), "m1");
+    let (_, rebuilt_device) = mac(root.path(), "m10");
+    let (_, namer_device) = mac(root.path(), "namer");
+    let (sign_node, node) = node_signer(0x61);
+    let kept = client::KeptSeat {
+        seat: m1_device
+            .request(TRUST.network, TRUST.authority)
+            .unwrap()
+            .binding()
+            .actor(),
+        label: "m10".to_owned(),
+        last_signed_ms: None,
+    };
+    let desk = Mutex::new(Desk::new(
+        Local::with(m1_device, TRUST, true, "m1")
+            .unwrap()
+            .with_kept(std::collections::BTreeMap::from([(node, kept)])),
+    ));
+    let rebuilt = joining(&rebuilt_device, node, "m10");
+    let refused = |_: &desk::Proving<'_>| {
+        Some("the seat this node key names signed a record in the last day".to_owned())
+    };
+    let never = |_: &desk::Proving<'_>| -> Result<SecretBytes> {
+        panic!("a refused proof decides nothing")
+    };
+    let (_, said) = proving_checked(&desk, (None, address(10)), &refused, &never, |stream| {
+        let greeting = joiner::greeting(stream)?;
+        joiner::prove(stream, &greeting, &rebuilt, &sign_node, &mut false)
+    });
+    assert!(said.is_err(), "the proof is refused");
+    assert_eq!(ask(&desk, address(10), &rebuilt), Answer::Asking);
+    assert_eq!(
+        ask(&desk, address(11), &joining(&namer_device, node, "namer")),
+        Answer::Asking
+    );
+    let rows = desk.lock().unwrap().rows(Instant::now());
+    let row = |name: &str| rows.iter().find(|r| r.name == name).unwrap().clone();
+    assert_eq!(
+        row("m10").moves.map(|kept| kept.label),
+        Some("m10".to_owned()),
+        "moves: the proven Mac's row names the seat"
+    );
+    assert!(
+        row("namer").moves.is_none(),
+        "an unproven name moves nothing"
     );
 }

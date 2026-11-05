@@ -214,10 +214,12 @@ fn hostnames() -> Vec<String> {
 /// # Errors
 /// No home directory is set, or a name is refused by the scrub rules.
 pub fn machine_scrub() -> Result<(Scrub, PathBuf), String> {
-    machine_scrub_of(paths())
+    machine_scrub_of(paths(), &hostnames())
 }
 
-fn machine_scrub_of(p: &crate::paths::Paths) -> Result<(Scrub, PathBuf), String> {
+/// [`machine_scrub`] of the paths `p` and the machine's host names `hosts`, which a test names
+/// rather than this machine's.
+fn machine_scrub_of(p: &crate::paths::Paths, hosts: &[String]) -> Result<(Scrub, PathBuf), String> {
     let home = PathBuf::from(p.need_home()?);
     let mut scrub = Scrub::new();
     scrub.path(&p.state, token::STATE)?;
@@ -231,8 +233,8 @@ fn machine_scrub_of(p: &crate::paths::Paths) -> Result<(Scrub, PathBuf), String>
         scrub.path(Path::new(&tmp), token::TMP)?;
     }
     scrub.word(&p.user, token::USER)?;
-    for host in hostnames() {
-        scrub.word(&host, token::HOST)?;
+    for host in hosts {
+        scrub.host(host, &p.user)?;
     }
     Ok((scrub, home))
 }
@@ -585,9 +587,10 @@ fn jailed(bin: &Path, allowed: &Path, asked: &Path) -> Result<Jailed, Fail> {
 
 fn drain<P: io::Read + Send + 'static>(pipe: Option<P>) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
+        use std::io::Read as _;
         let mut text = String::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_string(&mut text);
+        if let Some(pipe) = pipe {
+            let _ = pipe.take(16 * 1024 * 1024).read_to_string(&mut text);
         }
         text
     })
@@ -608,7 +611,8 @@ pub fn cmd_replay_jailed(args: &[String]) -> Res {
     std::fs::create_dir_all(&scratch)
         .map_err(|e| Fail::die(format!("{}: {e}", scratch.display())))?;
     let copy = physical_tape(&scratch)?.join(format!("control-{}.atape.txt", std::process::id()));
-    std::fs::copy(&first, &copy).map_err(|e| Fail::die(format!("{}: {e}", copy.display())))?;
+    crate::util::copy_regular_file(&first, &copy)
+        .map_err(|e| Fail::die(format!("{}: {e}", copy.display())))?;
     let control = jailed(&bin, &first, &copy);
     let _ = std::fs::remove_file(&copy);
     let control = control?;
@@ -811,6 +815,22 @@ mod scrub_tests {
     use super::*;
 
     #[test]
+    fn a_machine_whose_host_name_is_under_a_words_floor_still_scrubs() {
+        let top = aterm_tempfile::Builder::new()
+            .prefix("lab-scrub-")
+            .tempdir()
+            .expect("scratch");
+        let home = std::fs::canonicalize(top.path()).expect("physical");
+        let p = crate::paths::Paths::resolve_with(Some(home.clone()), Some(home.into()));
+        let (scrub, _) = machine_scrub_of(&p, &["m8".to_string()]).expect("scrub");
+        let user = &p.user;
+        assert_eq!(
+            scrub.text(&format!("{user}@m8 ~ % ssh m8.local m80")),
+            format!("{}@{h} ~ % ssh {h}.local m80", token::USER, h = token::HOST)
+        );
+    }
+
+    #[test]
     fn under_a_scratch_home_the_account_home_is_scrubbed_too() {
         let top = aterm_tempfile::Builder::new()
             .prefix("lab-scrub-")
@@ -828,7 +848,8 @@ mod scrub_tests {
         );
         let p =
             crate::paths::Paths::resolve_with(Some(account.clone()), Some(scratch.clone().into()));
-        let (scrub, home) = machine_scrub_of(&p).expect("scrub");
+        let hosts = ["lab-scrub-host".to_string()];
+        let (scrub, home) = machine_scrub_of(&p, &hosts).expect("scrub");
         assert_eq!(home, account);
         assert_eq!(
             scrub.text(&text),
@@ -838,7 +859,7 @@ mod scrub_tests {
             )
         );
         let own = crate::paths::Paths::resolve_with(Some(account.clone()), Some(account.into()));
-        let (scrub, _) = machine_scrub_of(&own).expect("scrub");
+        let (scrub, _) = machine_scrub_of(&own, &hosts).expect("scrub");
         let left = scrub.text(&text);
         assert!(
             left.starts_with(&format!("{}/Library", token::HOME)),

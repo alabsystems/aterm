@@ -599,8 +599,11 @@ impl RunClaim {
         if let Some(holder) = live_holder(path, started_of) {
             if holder.step.is_none() && holder.handed && ancestors.contains(&holder.pid) {
                 let next = dir.join(format!("{RUNNING_FILE}.adopted"));
-                std::fs::write(&next, &body)
+                crate::durable::write_fresh(&next, &body)
                     .and_then(|()| std::fs::rename(&next, path))
+                    .inspect_err(|_| {
+                        let _ = std::fs::remove_file(&next);
+                    })
                     .map_err(|e| Err(format!("take over {}: {e}", path.display())))?;
                 return Ok(claim(true));
             }
@@ -614,10 +617,7 @@ impl RunClaim {
             std::fs::rename(path, &aside)
                 .map_err(|e| Err(format!("move the stale {} aside: {e}", path.display())))?;
         }
-        let created = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
+        let created = crate::durable::open_create_new(path)
             .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()));
         match created {
             Ok(()) => Ok(claim(false)),
@@ -661,9 +661,7 @@ impl RunClaim {
         if !self.names_this_run() {
             return Err(format!("{} does not name this run", self.path.display()));
         }
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&self.path)
+        crate::durable::open_append(&self.path, false)
             .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{HANDED}\n").as_bytes()))
             .map_err(|e| format!("write {}: {e}", self.path.display()))
     }
@@ -3717,7 +3715,7 @@ impl Run<'_> {
             code => Refusal::new(
                 format!(
                     "`verify release` could not run every check for {r} (exit {code}: {}) — \
-                     nothing failed, and a release needs every check",
+                     a release needs every check; its log retains completed results",
                     match code {
                         3 => "a check could not run or was skipped",
                         2 => "its command line was refused",

@@ -4,7 +4,7 @@
 //! The `wasm-glue` check (`verify wasm-glue`): STOCK EXCEPTION (`wasm32-unknown-unknown`).
 //! Builds the toy in a scratch workspace ([`stage`]), refuses a module carrying a host path
 //! ([`host_paths`]), compares its glue with the goldens and drives it in a page
-//! ([`crate::wasm_page`]); the check's second row is [`super::oracle`].
+//! ([`crate::wasm_page`]).
 
 use aterm_uds::output::CommandOutput as _;
 use std::fmt::Write as _;
@@ -97,7 +97,7 @@ fn run(
         .map_err(|e| failed(format!("could not create {}: {e}", out.display())))?;
     let golden = golden_dir(root);
     for (name, contents) in super::glue(&bytes, STEM).map_err(failed)? {
-        std::fs::write(out.join(&name), &contents)
+        crate::write_fresh(out.join(&name), &contents)
             .map_err(|e| failed(format!("could not write {name}: {e}")))?;
         if !is_text(&name) {
             continue;
@@ -106,7 +106,7 @@ fn run(
         if record {
             std::fs::create_dir_all(&golden)
                 .map_err(|e| failed(format!("could not create {}: {e}", golden.display())))?;
-            std::fs::write(&path, &contents)
+            crate::write_fresh(&path, &contents)
                 .map_err(|e| failed(format!("could not write {}: {e}", path.display())))?;
             continue;
         }
@@ -128,7 +128,7 @@ fn run(
     }
     if record {
         let fixture = fixture(root);
-        std::fs::write(&fixture, &bytes)
+        crate::write_fresh(&fixture, &bytes)
             .map_err(|e| failed(format!("could not write {}: {e}", fixture.display())))?;
         let _ = writeln!(log, "  recorded the goldens and {}", fixture.display());
     }
@@ -150,7 +150,7 @@ fn run(
                 .replace("return ret$ >>> 0;", "return ret$;")
                 .into_bytes();
         }
-        std::fs::write(planted.join(entry.file_name()), contents)
+        crate::write_fresh(planted.join(entry.file_name()), contents)
             .map_err(|e| failed(e.to_string()))?;
     }
 
@@ -202,11 +202,14 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     for entry in std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
         let (src, dst) = (entry.path(), to.join(entry.file_name()));
-        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+        let ft = entry.file_type().map_err(|e| e.to_string())?;
+        if ft.is_dir() {
             copy_tree(&src, &dst)?;
-        } else {
-            std::fs::copy(&src, &dst)
+        } else if ft.is_file() {
+            crate::copy_regular_fresh(&src, &dst)
                 .map_err(|e| format!("could not copy {}: {e}", src.display()))?;
+        } else {
+            return Err(format!("refusing nonregular file {}", src.display()));
         }
     }
     Ok(())
@@ -224,7 +227,7 @@ pub(super) fn stage(root: &Path, dir: &Path) -> Result<PathBuf, String> {
         let from = root.join("crates").join(name);
         let to = dir.join("crates").join(name);
         copy_tree(&from.join("src"), &to.join("src"))?;
-        std::fs::copy(from.join("Cargo.toml"), to.join("Cargo.toml"))
+        crate::copy_regular_fresh(from.join("Cargo.toml"), to.join("Cargo.toml"))
             .map_err(|e| format!("could not copy {name}'s manifest: {e}"))?;
     }
     let ws = crate::read_regular_text(root.join("Cargo.toml"))
@@ -262,7 +265,7 @@ pub(super) fn stage(root: &Path, dir: &Path) -> Result<PathBuf, String> {
         .replace("path = \"../..\"", "path = \"crates/aterm-wasm-abi\"")
         .replace("\n[workspace]\n", &format!("\n{workspace}"));
     let path = dir.join("Cargo.toml");
-    std::fs::write(&path, manifest)
+    crate::write_fresh(&path, manifest)
         .map_err(|e| format!("could not write the staged manifest: {e}"))?;
     Ok(path)
 }
@@ -367,7 +370,7 @@ pub(super) fn start_page(
     std::fs::create_dir_all(&into)
         .map_err(|e| Refused::Failed(format!("could not create {}: {e}", into.display())))?;
     let driver = toy_dir(root).join("drive.mjs");
-    std::fs::copy(&driver, into.join("drive.mjs"))
+    crate::copy_regular_fresh(&driver, into.join("drive.mjs"))
         .map_err(|e| Refused::Failed(format!("could not copy {}: {e}", driver.display())))?;
     Page::start(browser, site, &work.join("browser"))
 }

@@ -21,7 +21,7 @@ fn recommended_answer(p: &aterm_phase::PromptV2, rows: &[String]) -> Decision {
         rows,
         QuestionPriority::Recommended,
         None,
-        false,
+        (false, false),
         Pane::of(rows),
     )
 }
@@ -586,7 +586,7 @@ fn the_reset_in_a_description_incident_is_answered_under_every_priority() {
     let rows = screen(f::QUESTION_RESET_IN_DESCRIPTION_2_1_310);
     let p = parse_prompt_v2(&rows).expect("the dialog");
     for priority in QuestionPriority::ALL {
-        let d = answer_question(&p, &rows, priority, None, false, Pane::of(&rows));
+        let d = answer_question(&p, &rows, priority, None, (false, false), Pane::of(&rows));
         let Decision::Approve {
             choice: Choice::Answer(Answer::FocusEnter { steps, target }),
             ..
@@ -887,7 +887,7 @@ fn muses_question_is_answered_by_the_cursor_and_enter() {
         &rows,
         QuestionPriority::LongTerm,
         None,
-        false,
+        (false, false),
         Pane::of(&rows),
     );
     assert!(

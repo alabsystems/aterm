@@ -458,7 +458,12 @@ pub fn all_runs(state: &Path) -> Vec<String> {
     };
     let mut tags: Vec<String> = rd
         .flatten()
-        .filter(|e| e.path().join("env.sh").is_file())
+        .filter(|e| {
+            e.file_type()
+                .map(|ft| ft.is_dir() || ft.is_symlink())
+                .unwrap_or(true)
+                && e.path().join("env.sh").is_file()
+        })
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     tags.sort();

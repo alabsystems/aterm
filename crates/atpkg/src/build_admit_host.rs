@@ -359,20 +359,50 @@ impl Jobs {
     /// # Errors
     /// Foreign process owner or native readiness failure.
     pub fn wait(&self, control: BorrowedFd<'_>, until: Instant) -> io::Result<Wake> {
+        self.wait_with(control, &[], false, until)
+    }
+
+    /// Add owned subsystems' opaque read/write interests to the existing control,
+    /// cancellation and child-state wait. Buffered work returns a job hint at
+    /// once while still checking native control and cancellation readiness.
+    /// The caller bounds extras and shortens `until` for paced retries.
+    /// Nothing here reads protocol bytes or establishes resource completion.
+    /// # Errors
+    /// Foreign process owner or native readiness failure.
+    pub fn wait_with(
+        &self,
+        control: BorrowedFd<'_>,
+        extra: &[aterm_uds::ready::Watch<'_>],
+        immediate: bool,
+        until: Instant,
+    ) -> io::Result<Wake> {
+        use aterm_uds::ready::{Interest, Watch};
         self.check_owner()?;
-        let mut fds = vec![control, self.wake.as_fd()];
+        let mut fds = vec![
+            Watch::new(control, Interest::Read),
+            Watch::new(self.wake.as_fd(), Interest::Read),
+        ];
         let mut deadline = until;
         for job in self.jobs.values() {
-            fds.push(job.cancellation.inbox());
+            fds.push(Watch::new(job.cancellation.inbox(), Interest::Read));
             if let Some(at) = job.cancellation.deadline() {
                 deadline = deadline.min(at);
             }
         }
-        let ready = aterm_uds::ready::any_until(&fds, deadline)?;
+        fds.extend_from_slice(extra);
+        let ready = if immediate {
+            aterm_uds::ready::any_interests_now(&fds)?
+        } else {
+            aterm_uds::ready::any_interests_until(&fds, deadline)?
+        };
         Ok(Wake {
             control_ready: ready.contains(&0),
-            jobs_hint: ready.iter().any(|&i| i != 0),
-            deadline: ready.is_empty(),
+            jobs_hint: immediate || ready.iter().any(|&i| i != 0),
+            deadline: if immediate {
+                Instant::now() >= deadline
+            } else {
+                ready.is_empty()
+            },
         })
     }
 }

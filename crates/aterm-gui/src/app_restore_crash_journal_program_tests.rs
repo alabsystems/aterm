@@ -201,6 +201,7 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
 
     let mut manifest = app.capture_restore_manifest();
     let hosted = restore::AgentRestore {
+        claude_auth: None,
         word: String::new(),
         pid: u32::try_from(fg_group).unwrap_or(0),
         start: "Sat Sep 27 01:02:03 2026".into(),
@@ -347,6 +348,8 @@ fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
             .to_string()
     };
     let agent = aterm_agent::harness::relaunch::Snapshot {
+        launch_env: None,
+        auth_observed: true,
         stored_login: false,
         profile: None,
         tab: sid.clone(),

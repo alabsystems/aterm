@@ -25,20 +25,21 @@ pub use initial::{
     LocalNetworkHeard, ParkWatch, PermissionSteps, SETUP_BUSY, SetAside, SetupHooks, SetupNext,
     SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, Watches, alab_mac, apply_initial_setup,
     apply_initial_setup_observed, automatic_plan, bring_forward_restored_setup,
-    bring_forward_restored_setup_observing, check_initial_setup, check_initial_setup_observed,
-    forget_set_aside_setup, initial_setup_access_revision, initial_setup_access_step,
-    initial_setup_admission, initial_setup_finished, initial_setup_holds,
-    initial_setup_keeps_vault_sync, initial_setup_observation, initial_setup_owes_secrets_stage,
-    initial_setup_park_mark, initial_setup_permission_steps, initial_setup_review_revision,
-    initial_setup_revision, initial_setup_snapshot, initial_setup_snapshot_read_only,
-    local_network_first_use, local_network_heard, local_network_question_is_own,
-    look_for_the_alab_vault, note_person_asked_for_access, note_setup_interrupted,
-    observe_initial_setup, probe_local_network_again, provisional_setup_widened,
-    provisional_setup_widens, put_back_held_initial_setup, request_initial_setup_stop,
-    restart_initial_setup, restart_initial_setup_observed, retry_parked_setup_stages,
-    run_initial_setup_pass, set_aside_unreadable_setup, set_aside_unreadable_setup_observing,
-    setup_is_newer, setup_ledger_environment, setup_records_held, take_back_setup_interrupted,
-    validate_initial_setup_plan, vault_config_unread, with_initial_setup_vault_sync,
+    bring_forward_restored_setup_observing, check_background_workstation, check_initial_setup,
+    check_initial_setup_observed, forget_set_aside_setup, initial_setup_access_revision,
+    initial_setup_access_step, initial_setup_admission, initial_setup_finished,
+    initial_setup_holds, initial_setup_keeps_vault_sync, initial_setup_observation,
+    initial_setup_owes_secrets_stage, initial_setup_park_mark, initial_setup_permission_steps,
+    initial_setup_review_revision, initial_setup_revision, initial_setup_snapshot,
+    initial_setup_snapshot_read_only, local_network_first_use, local_network_heard,
+    local_network_question_is_own, look_for_the_alab_vault, note_person_asked_for_access,
+    note_setup_interrupted, observe_initial_setup, probe_local_network_again,
+    provisional_setup_widened, provisional_setup_widens, put_back_held_initial_setup,
+    request_initial_setup_stop, restart_initial_setup, restart_initial_setup_observed,
+    retry_parked_setup_stages, run_initial_setup_pass, set_aside_unreadable_setup,
+    set_aside_unreadable_setup_observing, setup_is_newer, setup_ledger_environment,
+    setup_records_held, take_back_setup_interrupted, validate_initial_setup_plan,
+    vault_config_unread, with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
@@ -1785,11 +1786,12 @@ struct HeldLock(std::fs::File);
 impl HeldLock {
     fn profile_active(root: &Path) -> Result<bool, String> {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
-            .open(root.join("profile.lock"))
-        {
+        let file: std::fs::File = match aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+                .open(root.join("profile.lock"))
+        }) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(format!("doctor profile lock: {error}")),
@@ -1802,8 +1804,6 @@ impl HeldLock {
         {
             return Err("doctor profile lock is not a regular file".into());
         }
-        aterm_uds::keep_out_of_children(&file)
-            .map_err(|error| format!("doctor profile lock: {error}"))?;
         #[expect(
             clippy::disallowed_methods,
             reason = "HeldLock::drop releases the shared observation by LOCK_UN, including child-spawn paths"
@@ -1916,15 +1916,17 @@ impl HeldLock {
         #[cfg(test)]
         aterm_spec::fs_lane::join();
         std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
-            .open(root.join(name))
-            .map_err(|e| format!("doctor lock: {e}"))?;
+        let file = aterm_uds::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+                .open(root.join(name))
+        })
+        .map_err(|e| format!("doctor lock: {e}"))?;
         if !file
             .metadata()
             .map_err(|e| format!("doctor lock: {e}"))?
@@ -1933,7 +1935,6 @@ impl HeldLock {
         {
             return Err("doctor lock is not a regular file".into());
         }
-        aterm_uds::keep_out_of_children(&file).map_err(|e| format!("doctor lock: {e}"))?;
         Ok(file)
     }
 }
@@ -7787,7 +7788,11 @@ mod tests {
                         .filter(|row| row.status != "applied")
                         .map(|row| row.name.as_str())
                         .collect();
-                    let mut expected = vec!["Spotlight and Rust documentation", "Secrets vault"];
+                    let mut expected = vec![
+                        "Spotlight and Rust documentation",
+                        "Secrets vault",
+                        "GitHub repositories",
+                    ];
                     if stopped == "restored" {
                         expected.insert(1, "aterm permissions");
                     }
@@ -9849,9 +9854,8 @@ mod tests {
             let in_scope = initial::plan_in_scope(root.path(), || alab);
             for setting in [Setting::Secrets, Setting::Spotlight, Setting::Repositories] {
                 assert!(!holds.holds(setting), "{alab} {setting:?}: {holds:?}");
-                assert_eq!(
+                assert!(
                     in_scope.contains(setting),
-                    alab || setting != Setting::Repositories,
                     "{alab} {setting:?}: {in_scope:?}"
                 );
             }

@@ -36,10 +36,7 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Package
     let _ = std::fs::remove_dir_all(&stage); // cleanup on success AND failure
     result?;
 
-    let size_bytes = std::fs::metadata(&dmg)
-        .map_err(|e| format!("stat {}: {e}", dmg.display()))?
-        .len();
-    let sha256 = sha256_file(&dmg)?;
+    let (sha256, size_bytes) = sha256_and_size(&dmg)?;
     println!(
         "==> done: {} ({:.1} MB)",
         dmg.display(),
@@ -68,10 +65,7 @@ pub fn create_zip(app: &Path, out_dir: &Path, short_version: &str) -> Result<Pac
     archive_app(app, &zip)?;
     assert_zip_has_no_metadata(&zip)?;
 
-    let size_bytes = std::fs::metadata(&zip)
-        .map_err(|e| format!("stat {}: {e}", zip.display()))?
-        .len();
-    let sha256 = sha256_file(&zip)?;
+    let (sha256, size_bytes) = sha256_and_size(&zip)?;
     println!(
         "==> done: {} ({:.1} MB)",
         zip.display(),
@@ -187,9 +181,14 @@ fn build_in_stage(_app: &Path, _stage: &Path, _volname: &str, _dmg: &Path) -> Re
 
 /// Computes the streaming SHA-256 of `path` as lowercase hex.
 pub fn sha256_file(path: &Path) -> Result<String, String> {
+    sha256_and_size(path).map(|(sha256, _)| sha256)
+}
+
+/// Computes the streaming SHA-256 of `path` as lowercase hex together with its descriptor size.
+pub fn sha256_and_size(path: &Path) -> Result<(String, u64), String> {
     use aterm_digest::Sha256;
     use std::io::Read;
-    let mut f = crate::durable::open_regular_file(path)
+    let (mut f, meta) = crate::durable::open_regular_file_with_meta(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
@@ -202,7 +201,10 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(aterm_codec::hex::encode_lower(&hasher.finalize()))
+    Ok((
+        aterm_codec::hex::encode_lower(&hasher.finalize()),
+        meta.len(),
+    ))
 }
 
 fn run_quiet(cmd: &mut Command, what: &str) -> Result<(), String> {

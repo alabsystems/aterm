@@ -460,3 +460,16 @@ fn the_loops_derived_doors_answer_live_and_tape_each_look() {
         [(b"9".to_vec(), b"-25200".to_vec())]
     );
 }
+
+/// A `rules_file` that is a link (`CLAUDE.md` to `AGENTS.md`, a dotfiles checkout) is read; a
+/// lost read would drop the person's standing rules with no word.
+#[cfg(unix)]
+#[test]
+fn a_linked_file_reads_through_its_link() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let real = dir.path().join("AGENTS.md");
+    std::fs::write(&real, "the rules").unwrap();
+    let link = dir.path().join("CLAUDE.md");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(Fx::os().read_text(&link).as_deref(), Some("the rules"));
+}

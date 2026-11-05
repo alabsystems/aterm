@@ -102,6 +102,14 @@ pub enum Row {
         /// Why.
         why: &'static str,
     },
+    /// The person's grant to record keys aterm cannot see echoed began (`on`), or ended before
+    /// its attach did, for the named reason.
+    Unseen {
+        /// Whether the grant began.
+        on: bool,
+        /// Why.
+        why: &'static str,
+    },
 }
 
 impl Row {
@@ -124,6 +132,11 @@ impl Row {
                 kept.map_or_else(|| "no".to_owned(), |k| k.to_string())
             ),
             Row::Detached { why } => format!("detached why={}", why.replace(' ', "_")),
+            Row::Unseen { on, why } => format!(
+                "unseen={} why={}",
+                if *on { "on" } else { "off" },
+                why.replace(' ', "_")
+            ),
         }
     }
 }

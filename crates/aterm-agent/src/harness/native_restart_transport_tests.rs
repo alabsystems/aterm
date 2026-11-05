@@ -12,7 +12,502 @@ use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
+#[path = "native_replay_model_tests.rs"]
+mod replay_model;
+
 const SID: &str = "s-native-transport";
+
+#[test]
+fn retired_unissued_recipe_survives_disk_reload_without_any_further_dispatch() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(world.path());
+    let command = planned();
+    let (mut st, _) = state(&command);
+    let (mut client, worker) = endpoint(|line| {
+        common(line).or_else(|| match request(line) {
+            Request::Prepare(_) => {
+                Some("OK native-act state=retired reason=no-exec-grant\n".into())
+            }
+            other => panic!("unissued retirement never dispatches {other:?}"),
+        })
+    });
+    assert_eq!(
+        begin(
+            &opts,
+            &mut client,
+            &mut st,
+            "conversation",
+            Scope::Upgrade,
+            &command.target,
+            Some(&command),
+            Some(&command)
+        ),
+        Ok(Recovery::Held)
+    );
+    let mut kept = st.clone();
+    let mut loaded = upgrade_drive::load(&opts, "conversation").unwrap();
+    // The storage layer stamps its own progress clock. It is deliberately not
+    // the command/debt clock, all of whose fields must still compare exactly.
+    assert!(loaded.progress_at > 0 && !loaded.progress_key.is_empty());
+    kept.progress_at = loaded.progress_at;
+    kept.progress_key.clone_from(&loaded.progress_key);
+    assert_eq!(
+        loaded, kept,
+        "the exact recipe, debt age and retirement hold persist"
+    );
+    assert!(loaded.native_retired_unissued);
+    let Request::Prepare(original) = Request::parse(&loaded.native_prepare).unwrap() else {
+        panic!("retained preparation")
+    };
+    assert!(original.deadline_us > 0);
+    assert_eq!(
+        recover(&opts, "conversation", &mut client, SID, &mut loaded),
+        Ok(Recovery::Held)
+    );
+    assert!(!abort(&opts, "conversation", &mut client, SID, &mut loaded));
+    assert!(!complete(
+        &opts,
+        "conversation",
+        &mut client,
+        SID,
+        &mut loaded
+    ));
+    assert!(!retire(
+        &opts,
+        "conversation",
+        &mut client,
+        SID,
+        &mut loaded
+    ));
+    assert!(!launch_unissued(&mut client, SID, &mut loaded).unwrap());
+    assert!(!resume_observed(&mut client, SID, &mut loaded).unwrap());
+    assert_eq!(loaded, kept);
+    // Renewal shares this client. Its direct connection driver also receives
+    // retained bindings, and must return before attempting Signal or Resume.
+    let mut renewal = loaded.clone();
+    renewal.native = Some(Binding {
+        id: original.id.clone(),
+        capability: binding().capability,
+    });
+    let (renewal_client, renewal_worker) =
+        endpoint(|_| panic!("held renewal dispatched a request"));
+    assert!(
+        super::super::codex_renewal::drive_connection(
+            &opts,
+            SID,
+            &original,
+            renewal.clone(),
+            renewal_client,
+            true
+        )
+        .is_none()
+    );
+    assert!(renewal_worker.join().unwrap().is_empty());
+    let saved = upgrade_drive::load(&opts, &format!("renewal-{}", original.id)).unwrap();
+    renewal.progress_at = saved.progress_at;
+    renewal.progress_key.clone_from(&saved.progress_key);
+    assert_eq!(saved, renewal);
+    drop(client);
+    let seen = worker.join().unwrap();
+    assert_eq!(
+        seen.iter()
+            .filter(|line| matches!(actual_request(line), Some(Request::Prepare(_))))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn retirement_at_precommit_is_retained_without_sending_commit() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(world.path());
+    let command = planned();
+    let (mut st, _) = state(&command);
+    let (mut client, worker) = endpoint(|line| {
+        common(line).or_else(|| match request(line) {
+            Request::Prepare(plan) => Some(format!(
+                "OK native-act state=admitted id={} cap={}\n",
+                plan.id,
+                binding().capability
+            )),
+            Request::Query(_) => Some("OK native-act state=unknown\n".into()),
+            Request::Precommit(..) => {
+                Some("OK native-act state=retired reason=no-exec-grant\n".into())
+            }
+            other => panic!("retirement must precede any further request: {other:?}"),
+        })
+    });
+    assert_eq!(
+        begin(
+            &opts,
+            &mut client,
+            &mut st,
+            "conversation",
+            Scope::Upgrade,
+            &command.target,
+            Some(&command),
+            Some(&command)
+        ),
+        Ok(Recovery::Admitted)
+    );
+    let original = st.clone();
+    assert!(!complete(&opts, "conversation", &mut client, SID, &mut st));
+    assert!(st.native_retired_unissued);
+    assert_eq!(st.native_prepare, original.native_prepare);
+    assert_eq!(st.native, original.native);
+    assert_eq!(st.phase, original.phase);
+    upgrade_drive::save_checked(&opts, "conversation", &st).unwrap();
+    let mut loaded = upgrade_drive::load(&opts, "conversation").unwrap();
+    assert_eq!(
+        recover(&opts, "conversation", &mut client, SID, &mut loaded),
+        Ok(Recovery::Held)
+    );
+    drop(client);
+    let seen = worker.join().unwrap();
+    assert_eq!(
+        seen.iter()
+            .filter(|line| matches!(actual_request(line), Some(Request::Precommit(..))))
+            .count(),
+        1
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|line| matches!(actual_request(line), Some(Request::Commit(..))))
+    );
+}
+
+/// The first Prepare reached the host, but its reply did not reach the client.
+/// Return exactly what the client durably recorded before that dispatch.
+fn lost_prepare(opts: &Opts, command: &PlannedCommand) -> St {
+    let (mut st, _) = state(command);
+    let (mut client, worker) = endpoint(|line| {
+        common(line).or_else(|| match request(line) {
+            Request::Prepare(_) => None,
+            other => panic!("lost Prepare never dispatches {other:?}"),
+        })
+    });
+    assert!(
+        begin(
+            opts,
+            &mut client,
+            &mut st,
+            "conversation",
+            Scope::Upgrade,
+            &command.target,
+            Some(command),
+            Some(command),
+        )
+        .is_err()
+    );
+    drop(client);
+    let seen = worker.join().unwrap();
+    assert_eq!(
+        seen.iter()
+            .filter(|line| matches!(actual_request(line), Some(Request::Prepare(_))))
+            .count(),
+        1
+    );
+    let saved = upgrade_drive::load(opts, "conversation").unwrap();
+    assert_eq!(saved.native_prepare, st.native_prepare);
+    assert!(saved.native.is_none() && !saved.native_retired_unissued);
+    saved
+}
+
+#[test]
+fn every_prepare_replay_waits_for_its_state_barrier() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let mut opts = opts(world.path());
+    let mut st = lost_prepare(&opts, &planned());
+    let original = st.clone();
+    let expected = Request::parse(&st.native_prepare).unwrap();
+    let (mut client, worker) = endpoint(move |line| {
+        let request = request(line);
+        assert_eq!(
+            request, expected,
+            "the exact retained candidate must be replayed"
+        );
+        let Request::Prepare(plan) = request else {
+            unreachable!()
+        };
+        Some(format!(
+            "OK native-act state=admitted id={} cap={}\n",
+            plan.id,
+            binding().capability
+        ))
+    });
+
+    opts.dry_run = true;
+    assert_eq!(
+        recover(&opts, "conversation", &mut client, SID, &mut st),
+        Err("native-dry-run")
+    );
+    opts.dry_run = false;
+    let fault = aterm_durable::seam::FailingDirs::with_kind(std::io::ErrorKind::Unsupported);
+    for _ in 0..2 {
+        assert_eq!(
+            recover(&opts, "conversation", &mut client, SID, &mut st),
+            Err("native-unsaved")
+        );
+        assert!(!abort(&opts, "conversation", &mut client, SID, &mut st));
+        assert!(!retire(&opts, "conversation", &mut client, SID, &mut st));
+        assert_eq!(st, original);
+    }
+    drop(fault);
+    assert_eq!(
+        recover(&opts, "conversation", &mut client, SID, &mut st),
+        Ok(Recovery::Admitted)
+    );
+    assert_eq!(st.native_prepare, original.native_prepare);
+    drop(client);
+    assert_eq!(
+        worker.join().unwrap().len(),
+        1,
+        "nothing was dispatched while persistence was unavailable"
+    );
+}
+
+#[test]
+fn a_model_seeded_upgrade_directory_can_persist_before_native_dispatch() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    for mode in [0o700, 0o755] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let opts = opts(world.path());
+        let directory = opts.state.join("upgrade");
+        let models = directory.join("models.json");
+        super::super::upgrade_models::load_or_seed(&models, 1).unwrap();
+        let model_bytes = std::fs::read(&models).unwrap();
+        // The shared model writer permits an existing owned directory. Pin its
+        // historical readable mode independently of this test process's umask.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o777, mode);
+        let command = planned();
+        let (mut st, _) = state(&command);
+        let saved_path = directory.join("conversation.json");
+        let (mut client, worker) = endpoint(move |line| {
+            common(line).or_else(|| match request(line) {
+                Request::Prepare(plan) => {
+                    assert!(saved_path.is_file(), "persistence precedes dispatch");
+                    Some(format!(
+                        "OK native-act state=admitted id={} cap={}\n",
+                        plan.id,
+                        binding().capability
+                    ))
+                }
+                other => panic!("preparation never dispatches {other:?}"),
+            })
+        });
+        let result = begin(
+            &opts,
+            &mut client,
+            &mut st,
+            "conversation",
+            Scope::Upgrade,
+            &command.target,
+            Some(&command),
+            Some(&command),
+        );
+        drop(client);
+        let seen = worker.join().unwrap();
+        assert_eq!(
+            result,
+            Ok(Recovery::Admitted),
+            "owned upgrade mode {mode:o}"
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|line| matches!(actual_request(line), Some(Request::Prepare(_))))
+                .count(),
+            1
+        );
+        assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read(&models).unwrap(), model_bytes);
+        let mut loaded = upgrade_drive::load(&opts, "conversation").unwrap();
+        assert_eq!(loaded.native_prepare, st.native_prepare);
+        let expected = Request::parse(&loaded.native_prepare).unwrap();
+        let (mut client, worker) = endpoint(move |line| {
+            let actual = request(line);
+            assert_eq!(actual, expected, "recovery preserves the exact preparation");
+            let Request::Prepare(plan) = actual else {
+                unreachable!()
+            };
+            Some(format!(
+                "OK native-act state=admitted id={} cap={}\n",
+                plan.id,
+                binding().capability
+            ))
+        });
+        assert_eq!(
+            recover(&opts, "conversation", &mut client, SID, &mut loaded),
+            Ok(Recovery::Admitted)
+        );
+        drop(client);
+        assert_eq!(worker.join().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn private_native_persistence_never_follows_a_link_or_replaces_a_non_directory() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    for symlink in [true, false] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let opts = opts(world.path());
+        std::fs::create_dir_all(&opts.state).unwrap();
+        let directory = opts.state.join("upgrade");
+        let target = world.path().join("outside-upgrade");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(target.join("sentinel"), b"untouched").unwrap();
+        if symlink {
+            std::os::unix::fs::symlink(&target, &directory).unwrap();
+        } else {
+            std::fs::write(&directory, b"not a directory").unwrap();
+        }
+        let command = planned();
+        let (mut st, _) = state(&command);
+        let (mut client, worker) = endpoint(|line| {
+            common(line).or_else(|| panic!("refused storage dispatched a native request"))
+        });
+        let result = begin(
+            &opts,
+            &mut client,
+            &mut st,
+            "conversation",
+            Scope::Upgrade,
+            &command.target,
+            Some(&command),
+            Some(&command),
+        );
+        drop(client);
+        let seen = worker.join().unwrap();
+        assert_eq!(result, Err("native-unsaved"));
+        assert!(
+            !seen
+                .iter()
+                .any(|line| matches!(actual_request(line), Some(Request::Prepare(_))))
+        );
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o755);
+        assert_eq!(
+            std::fs::read(target.join("sentinel")).unwrap(),
+            b"untouched"
+        );
+        if symlink {
+            assert!(
+                std::fs::symlink_metadata(&directory)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        } else {
+            assert_eq!(std::fs::read(&directory).unwrap(), b"not a directory");
+        }
+    }
+}
+
+#[test]
+fn retirement_replays_a_lost_prepare_ack_without_launching_its_command() {
+    for already_retired in [false, true] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let opts = opts(world.path());
+        let command = planned();
+        let mut st = lost_prepare(&opts, &command);
+        let original = st.clone();
+        let expected = Request::parse(&st.native_prepare).unwrap();
+        let Request::Prepare(plan) = &expected else {
+            panic!("saved Prepare")
+        };
+        let recovered = Binding {
+            id: plan.id.clone(),
+            capability: binding().capability,
+        };
+        let recovered_copy = recovered.clone();
+        let (mut client, worker) = endpoint(move |line| match request(line) {
+            Request::Prepare(plan) => {
+                assert_eq!(Request::Prepare(plan), expected, "only the exact replay");
+                Some(if already_retired {
+                    "OK native-act state=retired reason=no-exec-grant\n".into()
+                } else {
+                    format!(
+                        "OK native-act state=admitted id={} cap={}\n",
+                        recovered.id, recovered.capability
+                    )
+                })
+            }
+            Request::Reconcile(binding) => {
+                assert!(!already_retired);
+                assert_eq!(binding, recovered);
+                Some("OK native-act state=retired reason=no-exec-grant\n".into())
+            }
+            other => panic!("retirement recovery never dispatches {other:?}"),
+        });
+        assert!(!retire(&opts, "conversation", &mut client, SID, &mut st));
+        assert!(st.native_retired_unissued);
+        let mut expected_state = original;
+        expected_state.native_retired_unissued = true;
+        if !already_retired {
+            expected_state.native = Some(recovered_copy);
+        }
+        assert_eq!(st, expected_state, "all original debt survives");
+        upgrade_drive::save_checked(&opts, "conversation", &st).unwrap();
+        let mut loaded = upgrade_drive::load(&opts, "conversation").unwrap();
+        assert!(loaded.native_retired_unissued);
+        assert!(!retire(
+            &opts,
+            "conversation",
+            &mut client,
+            SID,
+            &mut loaded
+        ));
+        drop(client);
+        let seen = worker.join().unwrap();
+        assert_eq!(seen.len(), if already_retired { 1 } else { 2 });
+    }
+}
+
+#[test]
+fn unresolved_prepare_replay_preserves_debt_and_cannot_reconcile_another_id() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(world.path());
+    let command = planned();
+    let original = lost_prepare(&opts, &command);
+    let expected = Request::parse(&original.native_prepare).unwrap();
+    let Request::Prepare(plan) = &expected else {
+        panic!("saved Prepare")
+    };
+    let different_id = format!(
+        "{}{}",
+        if plan.id.starts_with('f') { '0' } else { 'f' },
+        &plan.id[1..]
+    );
+    for response in [
+        None,
+        Some("ERR native host epoch changed\n".to_string()),
+        Some("OK native-act state=unknown\n".to_string()),
+        Some(format!(
+            "OK native-act state=pending id={} cap={}\n",
+            plan.id,
+            binding().capability
+        )),
+        Some(format!(
+            "OK native-act state=admitted id={} cap={}\n",
+            different_id,
+            binding().capability
+        )),
+    ] {
+        let mut st = original.clone();
+        let expected = expected.clone();
+        let (mut client, worker) = endpoint(move |line| {
+            assert_eq!(request(line), expected, "only the exact Prepare may leave");
+            response.clone()
+        });
+        assert!(!retire(&opts, "conversation", &mut client, SID, &mut st));
+        assert_eq!(st, original);
+        drop(client);
+        assert_eq!(worker.join().unwrap().len(), 1);
+    }
+}
 
 fn binding() -> Binding {
     Binding {
@@ -92,6 +587,7 @@ fn opts(dir: &Path) -> Opts {
     Opts {
         home: dir.join("home"),
         state: dir.join("state"),
+        account_roster: None,
         sock: Some(dir.join("native.sock").to_string_lossy().into_owned()),
         token: Some(HarnessToken::new("private-memory-fixture-token")),
         only_sid: Some(SID.into()),
@@ -115,6 +611,7 @@ fn opts(dir: &Path) -> Opts {
 
 fn planned() -> PlannedCommand {
     PlannedCommand {
+        account_intent: None,
         dialect: Dialect::Zsh,
         heal: None,
         cwd: None,
@@ -122,6 +619,90 @@ fn planned() -> PlannedCommand {
         argv: Vec::new(),
         env: Vec::new(),
         unset: None,
+    }
+}
+
+#[test]
+fn a_cold_completion_keeps_the_selected_intent_and_the_original_seed_with_or_without_observation() {
+    use super::super::native_act::{ClaimOutcome, ColdBilling, ColdIntent};
+    use super::super::native_observe::{ObservationBinding, Registration, SavedObservation};
+    let vendor = Process::observe(std::process::id()).unwrap();
+    let mut shell = vendor.clone();
+    shell.pid = if vendor.pid == 2 { 3 } else { 2 };
+    shell.group = shell.pid;
+    let original = Prepare {
+        id: "ab".repeat(16),
+        host_epoch: "ef".repeat(16),
+        holder: "aterm-harness@fixture".into(),
+        revision: 1,
+        expected_human_seq: Some(0),
+        deadline_us: 1_000_000,
+        duty: Scope::Relaunch,
+        plan: NativePlan::Restart {
+            process: vendor.clone(),
+            shell: shell.clone(),
+            launcher: vendor.image.clone(),
+            socket: "/fixture-native.sock".into(),
+            forward: Box::new(planned().capture().unwrap()),
+            rollback: None,
+            observation: None,
+            cold: Some(Box::new(ColdIntent {
+                login: None,
+                home: None,
+                auth_observed: true,
+                stored_login: true,
+                conversation: None,
+                profile: None,
+                mode: super::super::accounts::Mode::Wall,
+                billing: ColdBilling::Keep,
+            })),
+        },
+    };
+    let intent = super::super::accounts_pool::ExecutionIntent::Stored {
+        namespace: "11".repeat(32),
+        login: Some("/selected-account".into()),
+        owner: Some("work".into()),
+        generation: "22".repeat(32),
+    };
+    let observed = SavedObservation {
+        registration: Registration {
+            id: "98".repeat(16),
+            host_epoch: original.host_epoch.clone(),
+            vendor,
+            shell,
+        },
+        binding: ObservationBinding {
+            id: "98".repeat(16),
+            host_epoch: original.host_epoch.clone(),
+            capability: "76".repeat(32),
+        },
+    };
+    for observation in [None, Some(Box::new(observed))] {
+        let encoded = Request::prepare(original.clone()).encode().unwrap();
+        let mut st = St {
+            native_prepare: encoded,
+            native: Some(binding()),
+            phase: Phase::Exiting { at_s: 1 },
+            ..St::default()
+        };
+        assert!(st.account_intent.is_none());
+        let receipt = Reply::ColdRestartCommitted {
+            claim: ClaimOutcome::Builtin,
+            observation: observation.clone(),
+            intent: Box::new(intent.clone()),
+        };
+        assert_eq!(terminal_reply(&mut st, &receipt), Some(Recovery::Completed));
+        assert_eq!(st.account_intent.as_ref(), Some(&intent));
+        assert_eq!(st.native_completed_prepare.as_deref(), Some(&original));
+        assert_eq!(st.native_observation.as_ref(), observation.as_deref());
+        assert!(st.native.is_none() && st.native_prepare.is_empty());
+        let completed = st.clone();
+        assert_eq!(terminal_reply(&mut st, &receipt), Some(Recovery::Completed));
+        assert_eq!(st.account_intent, completed.account_intent);
+        assert_eq!(
+            st.native_completed_prepare,
+            completed.native_completed_prepare
+        );
     }
 }
 
@@ -319,7 +900,10 @@ fn private_token_constructor_retains_both_plans_and_original_budget_through_roll
     st.relaunched(3);
     assert!(st.roll_back(4, 0));
     assert!(st.native_rollback);
-    assert_eq!(recover(&mut client, SID, &mut st), Ok(Recovery::Admitted));
+    assert_eq!(
+        recover(&opts, "conversation", &mut client, SID, &mut st),
+        Ok(Recovery::Admitted)
+    );
     assert_eq!(
         st.native_prepare, prepared,
         "rollback never creates another id or deadline"
@@ -403,7 +987,7 @@ fn queued_prepare_safe_receipt_restores_unsent_but_unknown_keeps_original_dispat
         Err("native-predecessors")
     );
     assert!(!st.native_prepare.is_empty());
-    assert!(abort(&mut client, SID, &mut st));
+    assert!(abort(&opts, "conversation", &mut client, SID, &mut st));
     st.unsent(back);
     assert_eq!(st.phase, Phase::Announced { at_s: 1, asks: 1 });
     assert!(st.native.is_none() && st.native_prepare.is_empty());
@@ -427,7 +1011,10 @@ fn queued_prepare_safe_receipt_restores_unsent_but_unknown_keeps_original_dispat
         Err("native-unknown")
     );
     let before = st.clone();
-    assert_eq!(recover(&mut client, SID, &mut st), Err("native-unknown"));
+    assert_eq!(
+        recover(&opts, "conversation", &mut client, SID, &mut st),
+        Err("native-unknown")
+    );
     assert_eq!(st, before);
     drop(client);
     worker.join().unwrap();

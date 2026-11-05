@@ -1786,7 +1786,11 @@ fn l3_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 /// need that stands beside the landing, since a `LANDED` retracts no need (the post-landing
 /// review, 2026-11-01): `needs you: …; waits on you · landed <time> · …`, for nothing
 /// carries on after a landing (the second review, 2026-11-01), the page's words read off the
-/// entry's own tail ([`aterm_agent::harness::hold_said::NeedTail`]).
+/// entry's own tail ([`aterm_agent::harness::hold_said::NeedTail`]); and where the landed chip
+/// is drawn with that need in its accessibility description, the description speaks the same tail
+/// (`Waits on you.`, never `Carrying on.`: the post-landing review, 2026-11-02). A need beside
+/// the landing whose chip no description spoke (a headless run draws no landed chip in front, and
+/// speaks only with assistive technology on) is named in the verdict's words as not judged.
 fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
         return Verdict::Unobserved("no landing (L5's records)".into());
@@ -1830,6 +1834,33 @@ fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
             at(cx.t0, t)
         ));
     }
+    let [waits_spoken, carrying_spoken] = [
+        aterm_agent::harness::hold_said::NeedTail::WaitsOnYou,
+        aterm_agent::harness::hold_said::NeedTail::CarryingOn,
+    ]
+    .map(aterm_agent::harness::hold_said::NeedTail::sentence);
+    let spoken: Vec<(i64, String)> = chips_in(seen, *d, i64::MAX)
+        .into_iter()
+        .map(|(t, _, l)| (t, l))
+        .chain(w.front.iter().filter(|(t, _)| t >= d).cloned())
+        .filter(|(_, l)| chip(l).face == "landed")
+        .filter_map(|(t, l)| Some((t, quoted(&l, "description")?)))
+        .filter(|(_, said)| said.contains("Needs you: "))
+        .collect();
+    if let Some((t, said)) = spoken
+        .iter()
+        .find(|(_, said)| !said.contains(&waits_spoken) || said.contains(&carrying_spoken))
+    {
+        bad.push(format!(
+            "+{} the landed chip's description says \"{said}\", not \"… {waits_spoken}\"",
+            at(cx.t0, *t)
+        ));
+    }
+    let described = match (spoken.last(), need_beside) {
+        (Some((t, s)), _) => format!("; description +{} {}", at(cx.t0, *t), one_line(s, 100)),
+        (None, Some(_)) => format!("; {L5_UNSPOKEN}"),
+        (None, None) => String::new(),
+    };
     let mut unread = Vec::new();
     if standing(&w.page, *d, i64::MAX)
         .iter()
@@ -1846,7 +1877,7 @@ fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
         ));
     }
     let said = format!(
-        "chip {}; page {}",
+        "chip {}; page {}{described}",
         face.map_or_else(
             || "-".to_string(),
             |(t, _, l)| format!("+{} {}", at(cx.t0, t), one_line(&l, 100))
@@ -1862,6 +1893,11 @@ fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     );
     told(said, &bad, &unread)
 }
+
+/// What L5 says where a need stood beside the landing and no landed chip's description spoke it
+/// ([`l5_landed`]): that check was not judged.
+pub(crate) const L5_UNSPOKEN: &str =
+    "the landed chip's description was not drawn (its tail not judged)";
 
 /// L7: the worker's row under Done for you, `✓ land-e — landed #`, after its landing.
 fn l7_rows(seen: &Seen, cx: &Ctx<'_>) -> Verdict {

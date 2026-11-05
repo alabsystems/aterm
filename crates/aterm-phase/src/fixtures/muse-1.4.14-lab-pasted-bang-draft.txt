@@ -1,0 +1,51 @@
+# Muse Code 1.4.14 · MEASURED 2026-11-02, `aterm ctl text` of a private headless aterm (144x50) running the real Muse Code under aterm-lab's stub (scratch HOME, no login): `!echo pasted-probe` pasted as one bracketed paste once Esc had cleared the line typed before it (the footer's `Draft cleared · press ↑ to restore`). Muse Code takes a pasted `!` into its shell mode too: the caret row `! echo pasted-probe`, no `❯` composer.
+
+  Muse Code 1.4.14
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+! echo pasted-probe
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.XXXX/proj · Auto-review                                                   Draft cleared · press ↑ to restore
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -21,25 +21,24 @@ pub fn which(layout: &Layout, tool: &str) -> Option<PathBuf> {
     crate::platform::resolve_shim(&layout.shim(&ToolName::new(tool)?))
 }
 
-/// File to exec for `tool` without its shim ([`which`], [`crate::compat::route_for_shim`]).
-fn exec_path(layout: &Layout, tool: &str) -> Option<PathBuf> {
-    let shim = layout.shim(&ToolName::new(tool)?);
-    let target = crate::platform::resolve_shim(&shim)?;
-    Some(crate::compat::route_for_shim(&shim, &target).unwrap_or(target))
-}
-
 /// Env for `tool` ([`crate::shim_env::read_sidecar`], [`crate::activate::reassert_shim_env`]).
+#[cfg(all(test, unix))]
 fn exec_env(layout: &Layout, tool: &str) -> crate::shim_env::ShimEnv {
     let Some(name) = ToolName::new(tool) else {
         return crate::shim_env::ShimEnv::NONE;
     };
-    let shim = layout.shim(&name);
-    let declared = crate::platform::resolve_shim(&shim)
-        .and_then(|target| store_build_of(&layout.prefix, &target))
+    exec_env_from(layout, &crate::platform::read_shim(&layout.shim(&name)))
+}
+
+fn exec_env_from(layout: &Layout, read: &crate::platform::ShimRead) -> crate::shim_env::ShimEnv {
+    let declared = read
+        .target
+        .as_deref()
+        .and_then(|target| store_build_of(&layout.prefix, target))
         .map(|(program, build)| crate::shim_env::read_sidecar(&layout.build_dir(&program, build)))
         .unwrap_or_default();
     if declared.is_empty() {
-        crate::platform::shim_env_of(&shim)
+        read.env.clone()
     } else {
         declared
     }
@@ -57,9 +56,21 @@ pub struct Managed {
 /// [`Managed`] for `tool`, or `None` when no shim of it forwards to a build.
 #[must_use]
 pub fn managed(layout: &Layout, tool: &str) -> Option<Managed> {
+    let shim = layout.shim(&ToolName::new(tool)?);
+    let read = crate::platform::read_shim(&shim);
+    managed_from_read(layout, &shim, &read)
+}
+
+pub(crate) fn managed_from_read(
+    layout: &Layout,
+    shim: &Path,
+    read: &crate::platform::ShimRead,
+) -> Option<Managed> {
+    let target = read.target.as_ref()?;
+    let env = exec_env_from(layout, read);
     Some(Managed {
-        target: exec_path(layout, tool)?,
-        env: exec_env(layout, tool),
+        target: crate::compat::route_for_shim(shim, target).unwrap_or_else(|| target.clone()),
+        env,
     })
 }
 
@@ -110,10 +121,15 @@ impl BinScan {
 
 /// Parse `(program, build)` out of a shim target like `…/store/<program>/<build>/bin/<tool>`.
 pub(crate) fn program_build_of_target(target: &Path) -> Option<(String, u64)> {
-    let comps: Vec<&std::ffi::OsStr> = target.iter().collect();
-    let i = comps.iter().position(|c| *c == "store")?;
-    let program = comps.get(i + 1)?.to_str()?.to_string();
-    let build = build_in_path(comps.get(i + 2)?)?;
+    let (program, build) = program_build_ref_of_target(target)?;
+    Some((program.to_string(), build))
+}
+
+fn program_build_ref_of_target(target: &Path) -> Option<(&str, u64)> {
+    let mut comps = target.iter();
+    let _ = comps.find(|c| *c == "store")?;
+    let program = comps.next()?.to_str()?;
+    let build = build_in_path(comps.next()?)?;
     Some((program, build))
 }
 
@@ -207,18 +223,18 @@ pub fn installed_exposes(layout: &Layout, program: &str) -> Option<Vec<String>> 
     let shims = read_bin_dir(layout).ok()?;
     let mut out = Vec::new();
     for shim in shims.flatten() {
-        let Some(target) = crate::platform::resolve_shim(&shim.path()) else {
-            continue;
-        };
-        let Some((owner, _build)) = program_build_of_target(&target) else {
-            continue;
-        };
-        if owner != program {
-            continue;
-        }
         let name = shim.file_name().to_string_lossy().into_owned();
         let tool = ToolName::from_shim_file(&name);
         if tool.as_ref().is_some_and(ToolName::is_alias) {
+            continue;
+        }
+        let Some(target) = crate::platform::resolve_shim(&shim.path()) else {
+            continue;
+        };
+        let Some((owner, _build)) = program_build_ref_of_target(&target) else {
+            continue;
+        };
+        if owner != program {
             continue;
         }
         out.push(tool.map_or(name, |tool| tool.as_str().to_string()));
@@ -231,11 +247,39 @@ pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
     active_builds_in(&BinScan::capture(layout))
 }
 
+/// The active build of `program`, when one of its `bin/` shims resolves to a present build.
+#[must_use]
+pub fn active_build_of(layout: &Layout, program: &str) -> Option<u64> {
+    let shims = read_bin_dir(layout).ok()?;
+    let mut found = None;
+    for shim in shims.flatten() {
+        let Some(target) = crate::platform::resolve_shim(&shim.path()) else {
+            continue;
+        };
+        let Some((owner, build)) = program_build_ref_of_target(&target) else {
+            continue;
+        };
+        if owner != program || found == Some(build) {
+            continue;
+        }
+        if !crate::store::presence(&target).is_absent() {
+            found = Some(build);
+        }
+    }
+    found
+}
+
 /// [`active_builds`] over a listing already taken ([`active_tools_in`]).
 #[must_use]
 pub(crate) fn active_builds_in(scan: &BinScan) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     for target in scan.targets() {
+        let Some((program, build)) = program_build_ref_of_target(target) else {
+            continue;
+        };
+        if out.get(program) == Some(&build) {
+            continue;
+        }
         // A shim that names a build is not a build that is there, so the target is stat'd
         // and `list`, `which` and `doctor` agree. Only proved absence drops it: a store this
         // user may execute but not stat (EACCES, EPERM, EIO) is still there
@@ -243,9 +287,7 @@ pub(crate) fn active_builds_in(scan: &BinScan) -> BTreeMap<String, u64> {
         if crate::store::presence(target).is_absent() {
             continue;
         }
-        if let Some((program, build)) = program_build_of_target(target) {
-            out.insert(program, build);
-        }
+        out.insert(program.to_string(), build);
     }
     out
 }
@@ -272,10 +314,8 @@ pub fn active_aliases(layout: &Layout, program: &str, build: u64) -> Vec<ToolNam
 fn active_names_in(scan: &BinScan, program: &str, build: u64, aliases: bool) -> Vec<ToolName> {
     let mut out = Vec::new();
     for (tool, target) in scan.tools() {
-        if let Some((p, b)) = program_build_of_target(target)
-            && p == program
-            && b == build
-            && tool.is_alias() == aliases
+        if tool.is_alias() == aliases
+            && program_build_ref_of_target(target) == Some((program, build))
         {
             out.push(tool.clone());
         }
@@ -300,20 +340,55 @@ pub fn list_installed(layout: &Layout) -> Vec<(String, u64)> {
         let Some(pname) = pname_os.to_str().map(str::to_string) else {
             continue;
         };
-        if let Ok(builds) = std::fs::read_dir(prog.path()) {
-            for b in builds.flatten() {
-                let bname_os = b.file_name();
-                if let Some(n) = bname_os.to_str().and_then(crate::store::parse_build_name) {
-                    // Only complete builds count: a tree a crash left partial has no
-                    // marker, and counting it would report up to date and never repair it.
-                    if crate::store::build_is_complete(&b.path()) {
-                        out.push((pname.clone(), n));
-                    }
+        for n in installed_builds_in(&prog.path()) {
+            out.push((pname.clone(), n));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// List installed builds for `program` by walking `store/<program>/<build>/`.
+#[must_use]
+pub fn list_installed_for(layout: &Layout, program: &str) -> Vec<u64> {
+    if uninstall_name_shape(program).is_err() {
+        return Vec::new();
+    }
+    let dir = layout.prefix.join("store").join(program);
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_dir()) {
+        return Vec::new();
+    }
+    let mut out = installed_builds_in(&dir);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Whether `(program, build)` is an installed complete build in `layout`.
+#[must_use]
+pub fn is_build_installed(layout: &Layout, program: &str, build: u64) -> bool {
+    if uninstall_name_shape(program).is_err() {
+        return false;
+    }
+    let prog_dir = layout.prefix.join("store").join(program);
+    std::fs::symlink_metadata(&prog_dir).is_ok_and(|m| m.file_type().is_dir())
+        && crate::store::build_is_complete(&prog_dir.join(build.to_string()))
+}
+
+fn installed_builds_in(dir: &Path) -> Vec<u64> {
+    let mut out = Vec::new();
+    if let Ok(builds) = std::fs::read_dir(dir) {
+        for b in builds.flatten() {
+            let bname_os = b.file_name();
+            if let Some(n) = bname_os.to_str().and_then(crate::store::parse_build_name) {
+                // Only complete builds count: a tree a crash left partial has no
+                // marker, and counting it would report up to date and never repair it.
+                if crate::store::build_is_complete(&b.path()) {
+                    out.push(n);
                 }
             }
         }
     }
-    out.sort();
     out
 }
 
@@ -524,6 +599,7 @@ mod tests {
             Some(17),
             "precondition: a real install is live"
         );
+        assert_eq!(active_build_of(&l, "ay"), Some(17));
         std::fs::remove_dir_all(l.build_dir("ay", 17)).unwrap();
         assert!(
             crate::platform::resolve_shim(&l.shim(&tool("ay"))).is_some(),
@@ -533,6 +609,7 @@ mod tests {
             !active_builds(&l).contains_key("ay"),
             "a shim whose target no longer exists must not be reported live"
         );
+        assert_eq!(active_build_of(&l, "ay"), None);
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -566,6 +643,7 @@ mod tests {
             "the fixture must fail the stat for the reason under test"
         );
         let live = active_builds(&l).get("ay").copied();
+        let live_one = active_build_of(&l, "ay");
         std::fs::set_permissions(&holder, saved).unwrap();
         let _ = std::fs::remove_dir_all(&l.prefix);
         assert_eq!(
@@ -573,6 +651,7 @@ mod tests {
             Some(17),
             "a target we merely could not LOOK at is not a target that is gone"
         );
+        assert_eq!(live_one, Some(17));
     }
 
     #[test]
@@ -586,6 +665,8 @@ mod tests {
 
         assert!(list_installed(&l).contains(&("ay".to_string(), 18)));
         assert_eq!(active_builds(&l).get("ay").copied(), Some(17));
+        assert_eq!(active_build_of(&l, "ay"), Some(17));
+        assert_eq!(active_build_of(&l, "nope"), None);
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

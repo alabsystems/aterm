@@ -154,13 +154,11 @@ impl Slot {
             }
             let entry = if matches!(name, GATE | RECEIPT | COMPACTED) {
                 let file = open(&slot.directory, name, false, false)?;
-                if file.metadata()?.mode() & 0o7777 != 0o400 {
+                let stamp = Stamp::read(&file)?;
+                if stamp.mode() & 0o7777 != 0o400 {
                     return Err(bad("archive metadata is not sealed read-only"));
                 }
-                Entry::File {
-                    stamp: Stamp::read(&file)?,
-                    file,
-                }
+                Entry::File { stamp, file }
             } else if name == HISTORY {
                 let file = open(&slot.directory, name, false, true)?;
                 Entry::Directory {

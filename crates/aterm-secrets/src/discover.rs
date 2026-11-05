@@ -450,6 +450,60 @@ pub struct Advert {
     pub txt: Vec<(String, String)>,
 }
 
+impl Advert {
+    /// Parse the mesh protocol's node hint. This never proves identity or membership.
+    /// Duplicate keys, an invalid principal or a TXT port unlike the SRV port are refused.
+    #[must_use]
+    pub fn mesh_node(&self) -> Option<&str> {
+        let one = |name: &str| {
+            let mut values = self.txt.iter().filter(|(key, _)| key == name);
+            let value = values.next()?.1.as_str();
+            values.next().is_none().then_some(value)
+        };
+        if one("v")? != "2" || one("port")?.parse::<u16>().ok()? != self.port || self.port == 0 {
+            return None;
+        }
+        let node = one("id")?;
+        let principal = node.strip_prefix("n-")?;
+        (principal.len() == 16
+            && principal
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then_some(node)
+    }
+}
+
+#[cfg(test)]
+mod mesh_hint_tests {
+    use super::*;
+
+    #[test]
+    fn mesh_txt_is_only_a_well_formed_dial_hint() {
+        let mut advert = Advert {
+            instance: "opaque".into(),
+            host: "peer.local".into(),
+            port: 7100,
+            txt: vec![
+                ("v".into(), "2".into()),
+                ("id".into(), "n-0123456789abcdef".into()),
+                ("port".into(), "7100".into()),
+            ],
+        };
+        assert_eq!(advert.mesh_node(), Some("n-0123456789abcdef"));
+        advert.txt.push(("id".into(), "n-fedcba9876543210".into()));
+        assert_eq!(advert.mesh_node(), None);
+        advert.txt.pop();
+        advert.port = 7101;
+        assert_eq!(advert.mesh_node(), None);
+        advert.port = 7100;
+        advert.txt[0].1 = "1".into();
+        assert_eq!(advert.mesh_node(), None);
+        advert.txt[0].1 = "2".into();
+        advert.txt[1].1 = "arbitrary-host".into();
+        assert_eq!(advert.mesh_node(), None);
+    }
+}
+
 /// Parse `instance`'s advert from a `dns-sd -L <instance> <service> local.` transcript: the first
 /// line that says `instance` can be reached, its full name as `dns-sd` prints it (a space as
 /// `\032`, a dot as `\.`), and the TXT line under it, if any. `None` with no such line, or with
@@ -648,7 +702,9 @@ pub fn candidate_urls(
     out
 }
 
-fn same_endpoint(a: &str, b: &str) -> bool {
+/// Whether `a` and `b` name one server's vault (scheme, host and port, and path), whatever the
+/// case of their letters ([`transport::describe`]).
+pub(crate) fn same_endpoint(a: &str, b: &str) -> bool {
     transport::describe(a).eq_ignore_ascii_case(&transport::describe(b))
 }
 

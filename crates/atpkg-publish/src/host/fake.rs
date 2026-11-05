@@ -466,11 +466,24 @@ impl FakeHost {
             .ok_or_else(|| HostError::Refused(format!("{} names no file", path.display())))
     }
 
+    fn write_fresh(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let _ = std::fs::remove_file(path);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        opts.open(path)?.write_all(bytes)
+    }
+
     fn read_files(files: &[PathBuf]) -> Result<Vec<(String, Vec<u8>)>, HostError> {
         files
             .iter()
             .map(|f| {
-                let bytes = std::fs::read(f)
+                let (bytes, _) = aterm_uds::atomic_file::read_regular(f, 512 * 1024 * 1024)
                     .map_err(|e| HostError::Refused(format!("read {}: {e}", f.display())))?;
                 Ok((Self::file_name(f)?, bytes))
             })
@@ -509,7 +522,7 @@ impl FakeHost {
         {
             return Probe::Unknown(format!("mkdir {}: {e}", parent.display()));
         }
-        match std::fs::write(dest, bytes) {
+        match Self::write_fresh(dest, &bytes) {
             Ok(()) => Probe::Present,
             Err(e) => Probe::Unknown(format!("write {}: {e}", dest.display())),
         }
@@ -588,7 +601,7 @@ impl ReleaseHost for FakeHost {
             }
             drop(s);
             let bytes = release.assets.get(*name).ok_or(HostError::NotFound)?;
-            std::fs::write(dir.join(name), bytes)
+            Self::write_fresh(&dir.join(name), bytes)
                 .map_err(|e| HostError::Refused(format!("write {name}: {e}")))?;
         }
         Ok(())

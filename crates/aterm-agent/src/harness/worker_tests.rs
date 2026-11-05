@@ -9,7 +9,7 @@ use super::super::host_path::abs;
 fn native_worker_keeps_exact_custom_config_off_and_explicit_local_profile() {
     let temp = aterm_tempfile::tempdir().unwrap();
     let config = temp.path().join("custom.toml");
-    std::fs::write(&config, "[harness]\naccounts = 'off'\n").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[harness]\naccounts = 'off'\n", 0o600).unwrap();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = calls.clone();
     let expected = config.clone();
@@ -38,7 +38,7 @@ fn native_worker_keeps_exact_custom_config_off_and_explicit_local_profile() {
             .unwrap();
             assert!(!line.contains("native-run"));
             assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
-            std::fs::write(&config, "").unwrap();
+            aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
             let line = line_of(
                 cli,
                 Dialect::Zsh,
@@ -189,6 +189,8 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             trusted_here: true,
             permission_mode: None,
             chrome: false,
+            tools: None,
+            settings: None,
         };
         let line =
             line(cli, Dialect::Zsh, &starter, &fresh).unwrap_or_else(|e| panic!("{agent:?}: {e}"));
@@ -285,6 +287,8 @@ fn model_and_the_trust_are_each_clis_own() {
             trusted_here,
             permission_mode: None,
             chrome: false,
+            tools: None,
+            settings: None,
         };
         let named = line(cli, Dialect::Zsh, &plain, &fresh(Some("big-1"), false)).expect("a line");
         assert!(named.contains(" '--model' 'big-1' "), "{named}");
@@ -313,10 +317,11 @@ fn model_and_the_trust_are_each_clis_own() {
     }
 }
 
-/// A PERMISSION MODE IS CLAUDE CODE'S `--permission-mode <m>` (the disk-free worker's
-/// `default`, `docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4), after the model, and only a mode
-/// Claude Code takes. CONTROL: no mode named, no flag rides; a mode it does not take, and any
-/// mode for a CLI whose line has no such flag, start no worker.
+/// A PERMISSION MODE IS CLAUDE CODE'S `--permission-mode <m>` (a credit claim worker's,
+/// [`super::super::credit_offers::claim_task`], which no floor moves), after the model, and only
+/// a mode Claude Code takes. CONTROL: no mode named, no flag rides, so a starter no Claude Code
+/// lent types the bare word with no posture marker and atpkg's twin decides its posture; a mode
+/// it does not take, and any mode for a CLI whose line has no such flag, start no worker.
 #[test]
 fn a_permission_mode_is_claude_codes_own_flag() {
     let fresh = |mode| Fresh {
@@ -371,6 +376,125 @@ fn the_browser_is_claude_codes_own_flag() {
         let err =
             line(cli, Dialect::Zsh, &cli.plain(), &with).expect_err("a CLI with no browser flag");
         assert!(err.contains("no browser flag"), "{:?}: {err}", cli.agent);
+    }
+}
+
+/// A WORKER HANDED A SETTINGS DOCUMENT CARRIES CLAUDE CODE'S `--settings` once, before the task (a
+/// credit claim worker's auto-mode rules, [`super::super::credit_offers::claim_settings`]), and a
+/// line carrying it is one aterm's usage tap stands aside for (only the last `--settings` on a
+/// line is read). CONTROL: not handed one, no flag rides; handed one by a CLI with no such flag,
+/// or handed text that is no JSON object, no worker starts.
+#[test]
+fn a_settings_document_is_claude_codes_own_flag_and_the_tap_stands_aside() {
+    let claude = row(Program::Claude);
+    let doc = r#"{"autoMode":{"hard_deny":["Opening a billing page"]}}"#;
+    let handed = |settings| Fresh {
+        settings,
+        ..Fresh::default()
+    };
+    let typed = line(claude, Dialect::Zsh, &claude.plain(), &handed(Some(doc))).expect("a line");
+    assert!(
+        typed.contains(&format!(" '--settings' '{doc}' ")),
+        "{typed}"
+    );
+    assert_eq!(typed.matches("--settings").count(), 1, "{typed}");
+    assert!(
+        typed.find("'--settings'") < typed.find(" -- "),
+        "before the task: {typed}"
+    );
+    let argv: Vec<String> = ["claude", "--settings", doc].map(String::from).to_vec();
+    assert!(
+        !super::super::tap::launch_admits(&argv),
+        "the tap stands aside: {argv:?}"
+    );
+    let plain = line(claude, Dialect::Zsh, &claude.plain(), &Fresh::default()).expect("a line");
+    assert!(!plain.contains("--settings"), "CONTROL: {plain}");
+    for bad in ["", "[]", "hard_deny", "{\"a\":1"] {
+        let err = line(claude, Dialect::Zsh, &claude.plain(), &handed(Some(bad)))
+            .expect_err("no JSON object");
+        assert!(err.contains("no JSON object"), "{bad:?}: {err}");
+    }
+    for cli in WORKERS.iter().filter(|w| w.agent != Program::Claude) {
+        let err = line(cli, Dialect::Zsh, &cli.plain(), &handed(Some(doc)))
+            .expect_err("a CLI with no settings flag");
+        assert!(
+            err.contains("no settings document"),
+            "{:?}: {err}",
+            cli.agent
+        );
+    }
+}
+
+/// A CLAIM WORKER'S WHOLE LINE FITS macOS's TERMINAL LINE with room to spare: Claude Code by its
+/// store path under a long home, a roster login's directory, auto mode, the browser, its one tool
+/// and its auto-mode rules ([`super::super::credit_offers::claim_settings`]). CONTROL: the same
+/// line with an 800-byte rule does not fit, so the budget is the one this reads.
+#[test]
+fn a_claim_workers_line_fits_the_terminal_with_its_rules() {
+    let claude = row(Program::Claude);
+    let home = "/Users//a-twenty-char-user";
+    let starter = Starter {
+        exe: PathBuf::from(format!(
+            "{home}/Library/Application Support/aterm/pkg/store/claude/1000002000001000318/bin/claude"
+        )),
+        env: vec![(
+            super::super::accounts::HOME_ENV.to_string(),
+            format!("{home}/Library/Application Support/aterm/accounts/claude/login-m9-2"),
+        )],
+        args: Ok(Vec::new()),
+        unset: Vec::new(),
+    };
+    let settings = super::super::credit_offers::claim_settings();
+    let claim = |settings| Fresh {
+        permission_mode: Some("auto"),
+        chrome: true,
+        tools: Some(super::super::credit_offers::CLAIM_TOOLS),
+        settings: Some(settings),
+        ..Fresh::default()
+    };
+    let typed = line(claude, Dialect::Zsh, &starter, &claim(settings)).expect("a line");
+    assert!(typed.len() + 150 <= 1000, "{} bytes: {typed}", typed.len());
+    let long = format!(r#"{{"autoMode":{{"hard_deny":["{}"]}}}}"#, "x".repeat(800));
+    let err = line(claude, Dialect::Zsh, &starter, &claim(&long)).expect_err("CONTROL: too long");
+    assert!(err.contains("bytes (max"), "{err}");
+}
+
+/// A WORKER HELD TO A TOOL LIST CARRIES CLAUDE CODE'S `--tools`, comma-joined, before the task
+/// (a credit claim worker's, [`super::super::credit_offers::CLAIM_TOOLS`]). CONTROL: not asked,
+/// no list rides; asked of a CLI with no such flag, an empty list, or a name that is not one word
+/// (a flag, a comma), no worker starts.
+#[test]
+fn a_tool_list_is_claude_codes_own_flag_and_one_word_a_tool() {
+    let claude = row(Program::Claude);
+    fn held<'a>(tools: &'a [&'a str]) -> Fresh<'a> {
+        Fresh {
+            tools: Some(tools),
+            ..Fresh::default()
+        }
+    }
+    let typed = line(
+        claude,
+        Dialect::Zsh,
+        &claude.plain(),
+        &held(&["ToolSearch", "Read"]),
+    )
+    .expect("a line");
+    assert!(typed.contains(" '--tools' 'ToolSearch,Read' "), "{typed}");
+    assert!(
+        typed.find("'--tools'") < typed.find(" -- "),
+        "before the task: {typed}"
+    );
+    let plain = line(claude, Dialect::Zsh, &claude.plain(), &Fresh::default()).expect("a line");
+    assert!(!plain.contains("--tools"), "CONTROL: {plain}");
+    let bad: [&[&str]; 4] = [&[], &["-p"], &["Read,Bash"], &[""]];
+    for bad in bad {
+        let err = line(claude, Dialect::Zsh, &claude.plain(), &held(bad)).expect_err("refused");
+        assert!(err.contains("not one word"), "{bad:?}: {err}");
+    }
+    for cli in WORKERS.iter().filter(|w| w.agent != Program::Claude) {
+        let err = line(cli, Dialect::Zsh, &cli.plain(), &held(&["Read"]))
+            .expect_err("a CLI with no tools flag");
+        assert!(err.contains("no tool list"), "{:?}: {err}", cli.agent);
     }
 }
 
@@ -605,9 +729,8 @@ fn a_starters_program_rides_only_where_it_runs_the_same_cli() {
     }
 }
 
-/// A WORKER RUNS WITH ITS PARENT'S PERMISSIONS (owner ruling 2026-11-02): a Claude Code starter's
-/// mode rides, by argv until its screen shows another, and a claim worker's named mode is the
-/// caller's choice beside it.
+/// A CLAUDE CODE STARTER LENDS ITS WORKER THE MODE IT RUNS IN, by argv until its screen shows
+/// another, which [`a_claude_worker_never_starts_below_auto`] holds to the floor.
 #[test]
 fn a_claude_starters_permissions_ride_its_workers_line() {
     let cli = row(Program::Claude);
@@ -660,46 +783,375 @@ fn a_claude_starters_permissions_ride_its_workers_line() {
     );
     assert_eq!(flags(&["claude"]), Vec::<String>::new());
 
-    let rule = "\u{2500}".repeat(38);
-    let started_bypassed = Starter {
-        args: Ok(vec!["--dangerously-skip-permissions".to_string()]),
-        ..cli.plain()
+    // The pill read through a route that keeps the starter's mode, so no floor moves it.
+    let gateway = super::super::netwatch::RouteFacts {
+        env: Some(strings(&[
+            "HOME=/Users//u",
+            "ANTHROPIC_BASE_URL=https://gateway.invalid",
+        ])),
+        settings: Vec::new(),
     };
-    let shown = with_shown_mode(
-        started_bypassed.clone(),
-        &[
-            rule.clone(),
-            "\u{276F} ".to_string(),
-            rule.clone(),
-            "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)".to_string(),
-        ],
-    );
+    let bypassed = strings(&["claude", "--dangerously-skip-permissions"]);
+    let lent = |rows: Option<&[String]>| {
+        claude_starter_args(cli, &bypassed, rows, std::slice::from_ref(&gateway)).expect("read")
+    };
     assert_eq!(
-        shown.args,
-        Ok(vec!["--permission-mode".to_string(), "auto".to_string()]),
+        lent(Some(&pill(
+            "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)"
+        ))),
+        ["--permission-mode", "auto"],
         "the pill is the mode it runs in now"
     );
     assert_eq!(
-        with_shown_mode(started_bypassed.clone(), &["no pill here".to_string()]).args,
-        started_bypassed.args,
+        lent(Some(&["no pill here".to_string()])),
+        ["--dangerously-skip-permissions"],
         "CONTROL: a screen with no pill leaves the argv's"
     );
     assert_eq!(
-        with_shown_mode(
-            started_bypassed.clone(),
-            &[
-                rule.clone(),
-                "\u{276F} ".to_string(),
-                rule.clone(),
-                "  \u{23F8} plan mode on (shift+tab to cycle)".to_string(),
-            ],
-        )
-        .args,
-        started_bypassed.args,
+        lent(None),
+        ["--dangerously-skip-permissions"],
+        "CONTROL: no screen read leaves the argv's"
+    );
+    assert_eq!(
+        lent(Some(&pill("  \u{23F8} plan mode on (shift+tab to cycle)"))),
+        ["--dangerously-skip-permissions"],
         "a parent planning lends what it may do, not what it is doing"
     );
+    let started_bypassed = Starter {
+        args: Ok(lent(None)),
+        ..cli.plain()
+    };
     let typed = line(cli, Dialect::Zsh, &started_bypassed, &Fresh::default()).expect("a line");
     assert!(typed.contains("--dangerously-skip-permissions"), "{typed}");
+}
+
+/// A screen whose prompt shows the permission pill `row`.
+fn pill(row: &str) -> Vec<String> {
+    let rule = "\u{2500}".repeat(38);
+    vec![rule.clone(), "\u{276F} ".to_string(), rule, row.to_string()]
+}
+
+fn strings(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| (*w).to_string()).collect()
+}
+
+/// A CLAUDE CODE WORKER NEVER STARTS BELOW AUTO (owner, 2026-11-04: "these workers likely need to
+/// be started in auto / yolo mode!", which supersedes, for this floor, the 2026-11-02 ruling that
+/// a worker runs with its parent's permissions): a starter in manual or `acceptEdits`, or one
+/// whose argv names no mode or plans, lends `auto`, and its worker's line types it; one in auto,
+/// `dontAsk` or bypass lends its own, so none is raised to bypass. CONTROL: a starter whose
+/// requests go through a gateway or a cloud provider lends its own mode, whatever it is, as every
+/// starter did before the floor.
+#[test]
+fn a_claude_worker_never_starts_below_auto() {
+    use super::super::netwatch::RouteFacts;
+    let cli = row(Program::Claude);
+    let via = |env: &[&str]| RouteFacts {
+        env: Some(strings(env)),
+        settings: Vec::new(),
+    };
+    let first_party = via(&["HOME=/Users//u", "HTTPS_PROXY=http://127.0.0.1:9"]);
+    let lent = |argv: &[&str], facts: &RouteFacts| {
+        claude_starter_args(cli, &strings(argv), None, std::slice::from_ref(facts)).expect("read")
+    };
+    let auto = ["--permission-mode", "auto"];
+    let bypass = ["--dangerously-skip-permissions"];
+    for argv in [
+        &["claude", "--permission-mode", "default"][..],
+        &["claude", "--permission-mode=default"],
+        &["claude", "--permission-mode", "acceptEdits"],
+        &["claude"],
+        &["claude", "--permission-mode", "plan"],
+        &["claude", "--permission-mode", "auto"],
+    ] {
+        assert_eq!(lent(argv, &first_party), auto, "{argv:?}");
+    }
+    for argv in [
+        &["claude", "--dangerously-skip-permissions"][..],
+        &["claude", "--permission-mode", "bypassPermissions"],
+        &[
+            "claude",
+            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "plan",
+        ],
+    ] {
+        assert_eq!(lent(argv, &first_party), bypass, "{argv:?}");
+    }
+    assert_eq!(
+        lent(&["claude", "--permission-mode", "dontAsk"], &first_party),
+        ["--permission-mode", "dontAsk"]
+    );
+    let floored = Starter {
+        args: Ok(lent(
+            &["claude", "--permission-mode", "default"],
+            &first_party,
+        )),
+        ..cli.plain()
+    };
+    let typed = line(cli, Dialect::Zsh, &floored, &Fresh::default()).expect("a line");
+    assert!(typed.contains(" '--permission-mode' 'auto' "), "{typed}");
+
+    for route in [
+        "ANTHROPIC_BASE_URL=https://gateway.invalid",
+        "CLAUDE_CODE_USE_BEDROCK=1",
+        "CLAUDE_CODE_USE_VERTEX=1",
+    ] {
+        let routed = via(&["HOME=/Users//u", route]);
+        assert_eq!(
+            lent(&["claude", "--permission-mode", "default"], &routed),
+            ["--permission-mode", "default"],
+            "CONTROL: {route}"
+        );
+        assert_eq!(
+            lent(&["claude", "--permission-mode", "acceptEdits"], &routed),
+            ["--permission-mode", "acceptEdits"],
+            "CONTROL: {route}"
+        );
+        assert!(lent(&["claude"], &routed).is_empty(), "CONTROL: {route}");
+        assert!(
+            lent(&["claude", "--permission-mode", "plan"], &routed).is_empty(),
+            "CONTROL: {route}"
+        );
+        assert_eq!(
+            lent(&["claude", "--dangerously-skip-permissions"], &routed),
+            bypass,
+            "{route}"
+        );
+        let kept = Starter {
+            args: Ok(lent(&["claude", "--permission-mode", "default"], &routed)),
+            ..cli.plain()
+        };
+        let typed = line(cli, Dialect::Zsh, &kept, &Fresh::default()).expect("a line");
+        assert!(typed.contains(" '--permission-mode' 'default' "), "{typed}");
+    }
+}
+
+/// THE PILL IS HELD TO THE FLOOR AS THE ARGV IS, BY THE ROUTE ALONE: where the starter's route is
+/// Anthropic's own, a pill showing manual or `acceptEdits` lends `auto`, and one showing bypass,
+/// `dontAsk` or auto its own, whatever the argv names. CONTROL: where the route keeps the
+/// starter's mode (a gateway), the pill's mode is lent as it is, whatever the argv names, a
+/// bypass argv among them (atpkg's twin starts Claude Code in bypass): a person who moved a
+/// gateway starter to `acceptEdits` lends `acceptEdits`, never `auto` behind the gateway.
+#[test]
+fn a_claude_starters_pill_is_held_to_its_floor() {
+    use super::super::netwatch::RouteFacts;
+    let cli = row(Program::Claude);
+    let manual = pill("  \u{23F8} manual mode on (shift+tab to cycle)");
+    let edits = pill("  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)");
+    let dont_ask = pill("  \u{23F5}\u{23F5} don't ask on");
+    let bypassed = pill("  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)");
+    let auto = pill("  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)");
+    let via = |env: &[&str]| RouteFacts {
+        env: Some(strings(env)),
+        settings: Vec::new(),
+    };
+    let first_party = via(&["HOME=/Users//u"]);
+    let gateway = via(&[
+        "HOME=/Users//u",
+        "ANTHROPIC_BASE_URL=https://gateway.invalid",
+    ]);
+    let shown = |argv: &[&str], rows: &[String], route: &RouteFacts| {
+        claude_starter_args(cli, &strings(argv), Some(rows), std::slice::from_ref(route))
+            .expect("read")
+    };
+    for argv in [
+        &["claude", "--permission-mode", "auto"][..],
+        &["claude", "--permission-mode", "default"],
+        &["claude", "--dangerously-skip-permissions"],
+        &["claude"],
+    ] {
+        let floored = |rows: &[String]| shown(argv, rows, &first_party);
+        assert_eq!(floored(&manual), ["--permission-mode", "auto"], "{argv:?}");
+        assert_eq!(floored(&edits), ["--permission-mode", "auto"], "{argv:?}");
+        assert_eq!(floored(&dont_ask), ["--permission-mode", "dontAsk"]);
+        assert_eq!(floored(&bypassed), ["--dangerously-skip-permissions"]);
+        assert_eq!(floored(&auto), ["--permission-mode", "auto"]);
+        let kept = |rows: &[String]| shown(argv, rows, &gateway);
+        assert_eq!(
+            kept(&manual),
+            ["--permission-mode", "default"],
+            "CONTROL {argv:?}"
+        );
+        assert_eq!(
+            kept(&edits),
+            ["--permission-mode", "acceptEdits"],
+            "CONTROL {argv:?}: a gateway starter in bypass that moved to accept edits"
+        );
+        assert_eq!(kept(&auto), ["--permission-mode", "auto"], "{argv:?}");
+        assert_eq!(kept(&bypassed), ["--dangerously-skip-permissions"]);
+    }
+}
+
+/// A ROUTE THE WORKER'S OWN FOLDER NAMES KEEPS THE STARTER'S MODE TOO: a worker spawned with
+/// `cwd=` into a project whose settings set a gateway reads them where its starter's folder did
+/// not, so the floor holds only where every folder's route is Anthropic's own. CONTROL: the same
+/// two readings with neither folder naming a route floor the mode.
+#[test]
+fn a_route_the_workers_folder_names_keeps_the_starters_mode() {
+    use super::super::netwatch::{RouteFacts, Source};
+    let cli = row(Program::Claude);
+    let at = |text: &str| RouteFacts {
+        env: Some(strings(&["HOME=/Users//u"])),
+        settings: vec![(
+            "/work/corp/.claude/settings.json".to_string(),
+            Source::Text(text.to_string()),
+        )],
+    };
+    let quiet = at(r#"{"model":"big-1"}"#);
+    let corp = at(r#"{"env":{"ANTHROPIC_BASE_URL":"https://gw.corp.invalid"}}"#);
+    let argv = strings(&["claude", "--permission-mode", "default"]);
+    let lent = |routes: &[RouteFacts]| claude_starter_args(cli, &argv, None, routes).expect("read");
+    assert_eq!(
+        lent(&[quiet.clone(), corp.clone()]),
+        ["--permission-mode", "default"]
+    );
+    assert_eq!(
+        lent(&[corp, quiet.clone()]),
+        ["--permission-mode", "default"]
+    );
+    assert_eq!(
+        lent(&[quiet.clone(), quiet.clone()]),
+        ["--permission-mode", "auto"],
+        "CONTROL"
+    );
+    assert_eq!(lent(&[quiet]), ["--permission-mode", "auto"], "CONTROL");
+}
+
+/// A STARTER'S ROUTE KEEPS ITS MODE only where its requests leave Anthropic's own API: a
+/// gateway's base URL or a cloud provider's switch, set in its environment or in a settings
+/// document's `env`, or a source that could not be read or parsed, which leaves the route
+/// untold. CONTROL: a blank variable, a proxy (which carries requests to the same API), a
+/// variable of no route, a settings document that names none and one that is not there keep
+/// the floor.
+#[test]
+fn a_route_off_anthropics_api_keeps_the_starters_mode() {
+    use super::super::netwatch::{RouteFacts, Source};
+    let facts = |env: &[&str], settings: Vec<(String, Source)>| RouteFacts {
+        env: Some(strings(env)),
+        settings,
+    };
+    let kept = |facts: &RouteFacts| claude_route_kept(facts);
+    assert_eq!(kept(&facts(&["HOME=/u"], Vec::new())), None);
+    for (pair, key) in [
+        (
+            "ANTHROPIC_BASE_URL=https://gateway.invalid",
+            "ANTHROPIC_BASE_URL",
+        ),
+        ("CLAUDE_CODE_USE_BEDROCK=1", "CLAUDE_CODE_USE_BEDROCK"),
+        ("CLAUDE_CODE_USE_VERTEX=1", "CLAUDE_CODE_USE_VERTEX"),
+        ("CLAUDE_CODE_USE_FOUNDRY=1", "CLAUDE_CODE_USE_FOUNDRY"),
+    ] {
+        let why = kept(&facts(&["HOME=/u", pair], Vec::new())).expect(pair);
+        assert_eq!(why, format!("{key} in its environment"));
+    }
+    for pair in [
+        "ANTHROPIC_BASE_URL=",
+        "ANTHROPIC_BASE_URL=  ",
+        "HTTPS_PROXY=http://127.0.0.1:9",
+        "ALL_PROXY=socks5://127.0.0.1:9",
+        "CLAUDE_CODE_USE_COWORK_PLUGINS=1",
+    ] {
+        assert_eq!(
+            kept(&facts(&["HOME=/u", pair], Vec::new())),
+            None,
+            "CONTROL: {pair}"
+        );
+    }
+    let at = "/u/.claude/settings.json".to_string();
+    let source = |source: Source| vec![(at.clone(), source)];
+    let text = |text: &str| source(Source::Text(text.to_string()));
+    assert_eq!(
+        kept(&facts(
+            &["HOME=/u"],
+            text(r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:4100"}}"#)
+        )),
+        Some(format!("ANTHROPIC_BASE_URL in {at}"))
+    );
+    assert_eq!(
+        kept(&facts(
+            &["HOME=/u"],
+            text(r#"{"env":{"HTTPS_PROXY":"http://127.0.0.1:9"},"model":"big-1"}"#)
+        )),
+        None,
+        "CONTROL: a proxy in the settings"
+    );
+    assert_eq!(
+        kept(&facts(&["HOME=/u"], source(Source::Missing))),
+        None,
+        "CONTROL"
+    );
+    assert_eq!(
+        kept(&facts(&["HOME=/u"], source(Source::Unreadable))),
+        Some(format!("{at} could not be read"))
+    );
+    assert_eq!(
+        kept(&facts(&["HOME=/u"], text("[1, 2]"))),
+        Some(format!("{at} could not be parsed"))
+    );
+    assert_eq!(
+        kept(&RouteFacts {
+            env: None,
+            settings: Vec::new()
+        }),
+        Some("its environment could not be read".to_string())
+    );
+}
+
+/// A STARTER'S ROUTE IS READ WHERE CLAUDE CODE READS IT: its user settings (under its
+/// `CLAUDE_CONFIG_DIR`) and its project's, beside its environment; a starter whose folder is not
+/// known has project settings that cannot be found, so its route is untold. CONTROL: the same
+/// documents naming no route leave it Anthropic's own.
+#[test]
+fn a_starters_settings_name_its_route() {
+    let d = crate::supervise::ScratchDir::new("claude", "worker-route");
+    let home = d.join("home");
+    let config = home.join(".claude-work");
+    let project = d.join("project");
+    let (managed, prefs) = (d.join("managed"), d.join("prefs"));
+    for dir in [&config, &project.join(".claude"), &managed, &prefs] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    let user = config.join("settings.json");
+    let shared = project.join(".claude/settings.json");
+    let quiet = r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#;
+    std::fs::write(&user, quiet).expect("user settings");
+    std::fs::write(&shared, quiet).expect("project settings");
+    let process = ProcArgs {
+        argv: strings(&["claude"]),
+        env: vec![
+            format!("HOME={}", home.display()),
+            format!("CLAUDE_CONFIG_DIR={}", config.display()),
+            "USER=u".to_string(),
+        ],
+        ..ProcArgs::default()
+    };
+    let read = |cwd: Option<&Path>| {
+        claude_route_kept(&claude_route_facts(
+            &process,
+            cwd,
+            &home,
+            Some(&managed),
+            &prefs,
+        ))
+    };
+    assert_eq!(read(Some(&project)), None, "CONTROL");
+    std::fs::write(
+        &user,
+        r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.invalid"}}"#,
+    )
+    .expect("user settings");
+    let why = read(Some(&project)).expect("the user's gateway");
+    assert!(why.starts_with("ANTHROPIC_BASE_URL in "), "{why}");
+    std::fs::write(&user, quiet).expect("user settings");
+    std::fs::write(&shared, r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#)
+        .expect("project settings");
+    let why = read(Some(&project)).expect("the project's provider");
+    assert!(why.starts_with("CLAUDE_CODE_USE_BEDROCK in "), "{why}");
+    std::fs::write(&shared, quiet).expect("project settings");
+    assert_eq!(read(Some(&project)), None, "CONTROL");
+    let why = read(None).expect("no folder");
+    assert!(why.contains("could not be read"), "{why}");
 }
 
 /// A CODEX STARTER IS codex-alab, its package's ALab bytes ([`super::super::codex_alab::alab_bytes`]):
@@ -971,4 +1423,85 @@ fn a_muse_worker_runs_the_default_model_with_contributor_mode_off() {
     assert!(named.contains(" '--model' 'big-1' "), "{named}");
     assert!(!named.contains("muse-wonder-full-1.0"), "{named}");
     assert!(named.contains(" '--contributor-mode' 'off' "), "{named}");
+}
+
+#[test]
+fn a_parents_empty_flags_type_the_build_the_twin_execs_never_the_twin() {
+    let cli = row(Program::Claude);
+    let admitted = |args: Vec<String>| Admitted {
+        starter: Starter {
+            args: Ok(args),
+            ..cli.plain()
+        },
+        readiness: Readiness::Present,
+    };
+    let build = PathBuf::from("/store/claude/2.1.318/claude");
+    let word = PathBuf::from("claude");
+
+    let past = admitted(Vec::new()).past_the_twin_by(cli, None, || Some(build.clone()));
+    assert_eq!(
+        past.starter().exe,
+        build,
+        "no marker: the twin would add yolo"
+    );
+
+    let flags = vec!["--dangerously-skip-permissions".to_string()];
+    let kept = admitted(flags).past_the_twin_by(cli, None, || Some(build.clone()));
+    assert_eq!(kept.starter().exe, word, "its flags are a marker");
+
+    let modelled = admitted(Vec::new()).past_the_twin_by(cli, Some("opus"), || Some(build.clone()));
+    assert_eq!(
+        modelled.starter().exe,
+        word,
+        "the twin runs `--model` as typed"
+    );
+
+    let no_twin = admitted(Vec::new()).past_the_twin_by(cli, None, || None);
+    assert_eq!(no_twin.starter().exe, word, "no twin to pass");
+
+    let other = row(Program::Codex);
+    let codex = Admitted {
+        starter: other.plain(),
+        readiness: Readiness::Present,
+    }
+    .past_the_twin_by(other, None, || Some(build.clone()));
+    assert_eq!(
+        codex.starter().exe,
+        PathBuf::from(other.word),
+        "Claude Code's rule only"
+    );
+}
+
+/// The real twin reader: the build a laid `sh` twin execs.
+#[cfg(unix)]
+#[test]
+fn past_the_twin_reads_the_build_a_laid_twin_execs() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let agents = dir.path().join("agents");
+    std::fs::create_dir_all(&agents).expect("agents");
+    let store = dir.path().join("store/claude");
+    let build = store.join("1000002000001000318/bin/claude");
+    std::fs::create_dir_all(build.parent().expect("bin")).expect("the build's folder");
+    std::fs::write(&build, "a build").expect("build");
+    std::fs::write(
+        store.join("1000002000001000318.shim-env"),
+        "DISABLE_AUTOUPDATER=1\n",
+    )
+    .expect("the build's shim record");
+    let body = format!("#!/bin/sh\nexec '{}' \"$@\"\n", build.display());
+    std::fs::write(agents.join("claude"), body).expect("twin");
+    let cli = row(Program::Claude);
+    let admitted = || Admitted {
+        starter: cli.plain(),
+        readiness: Readiness::Present,
+    };
+    super::super::upgrade_drive::AGENTS_DIR.with(|d| *d.borrow_mut() = Some(agents.clone()));
+    let past = admitted().past_the_twin(cli, None);
+    super::super::upgrade_drive::AGENTS_DIR.with(|d| *d.borrow_mut() = None);
+    assert_eq!(past.starter().exe, build);
+    let line = super::line(cli, Dialect::Zsh, &past, &Fresh::default()).expect("a line");
+    assert!(
+        line.contains("DISABLE_AUTOUPDATER=1"),
+        "past the twin, its updater stays off: {line}"
+    );
 }

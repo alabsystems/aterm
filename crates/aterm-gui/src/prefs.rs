@@ -5638,7 +5638,7 @@ mod save_words_tests {
             ConfigKeyEdit, ConfigPatchRequest, ConfigPatchResult, ExpectedValue,
             VersionedConfigService,
         };
-        std::fs::write(path, "theme = \"Default\"\n").unwrap();
+        crate::test_scratch::write_config(path, "theme = \"Default\"\n");
         let mut service = VersionedConfigService::load_path(path).unwrap();
         let ConfigPatchResult::Applied { snapshot, .. } = service.patch(ConfigPatchRequest {
             base_revision: service.snapshot().revision,
@@ -6424,11 +6424,10 @@ mod edit_tests {
 
         let scratch = aterm_tempfile::tempdir().expect("scratch folder");
         let dir = scratch.path();
-        std::fs::write(
-            dir.join(aterm_agent::ai::config::FLEET_FILE),
+        crate::test_scratch::write_config(
+            &dir.join(aterm_agent::ai::config::FLEET_FILE),
             "schema = 1\npreferred = \"codex\"\n[muse]\nuse = false\n",
-        )
-        .expect("the fleet document");
+        );
         let over = |text: &str| {
             let mut cfg = Config::parse(text).expect("parses");
             cfg.ai = AiPolicy::read_beside(text, Some(dir));

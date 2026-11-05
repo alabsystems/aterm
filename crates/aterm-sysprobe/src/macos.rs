@@ -588,6 +588,11 @@ pub(crate) fn core_ticks() -> Option<Vec<CoreTicks>> {
     cores
 }
 
+/// [`crate::machine_model`] on macOS: `hw.model`.
+pub(crate) fn machine_model() -> Option<String> {
+    sysctl_text(c"hw.model")
+}
+
 /// [`crate::machine_words`] on macOS: `machdep.cpu.brand_string` and `kern.osproductversion`.
 pub(crate) fn machine_words() -> crate::MachineWords {
     crate::MachineWords {

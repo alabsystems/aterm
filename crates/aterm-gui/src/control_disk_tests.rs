@@ -482,7 +482,10 @@ fn a_stalled_watch_is_reported_only_while_it_runs() {
     let Some(old) = Instant::now().checked_sub(STALL + Duration::from_secs(1)) else {
         aterm_spec::host::could_not_run("the monotonic clock here cannot reach back a stall");
     };
-    shelf.publish(|b| b.watch = Watch::Running { beat: old });
+    shelf.publish(|b| {
+        b.watch = Watch::Running { beat: old };
+        b.look_in_flight = true;
+    });
     let reply = run_in(&shelf, "sys free>=30GiB timeout=600000", &owner(), &world);
     assert_eq!(reply, "ERR unavailable free why=watch-stalled\n");
     shelf.publish(|b| b.watch = Watch::Suspended);
@@ -490,6 +493,222 @@ fn a_stalled_watch_is_reported_only_while_it_runs() {
     assert_eq!(reply, "OK timeout\n");
     shelf.publish(|b| b.watch = Watch::Running { beat: old });
     let reply = run_in(&shelf, "sys disk=ok timeout=50", &owner(), &world);
+    assert_eq!(reply, "OK timeout\n");
+}
+
+/// A STALL IS A HUNG LOOK, OR A LOOK THAT NEVER BEGINS ONCE THIS WAIT HAS POKED THAT LONG.
+/// NEGATIVE CONTROL: each is one fact short of it.
+#[test]
+fn a_watch_stalls_on_a_hung_look_or_on_one_that_never_begins() {
+    let young = STALL - Duration::from_secs(1);
+    assert!(stalled(true, STALL, Duration::ZERO), "a hung look");
+    assert!(stalled(false, STALL, STALL), "no look began");
+    assert!(!stalled(true, young, STALL), "a look with a young beat");
+    assert!(!stalled(false, STALL, young), "this wait's poke may yet");
+    assert!(!stalled(false, young, STALL), "a look ended just now");
+}
+
+/// A stall ago, on the monotonic clock.
+fn a_stall_ago() -> Instant {
+    let Some(old) = Instant::now().checked_sub(STALL + Duration::from_secs(1)) else {
+        aterm_spec::host::could_not_run("the monotonic clock here cannot reach back a stall");
+    };
+    old
+}
+
+/// A pass that ended just now on this volume, for `demand`, with more it could have freed.
+fn pass_for(demand: Option<u64>) -> PassSummary {
+    PassSummary {
+        key: key(),
+        ended_at: Instant::now(),
+        free_after: Some(20 * GIB),
+        tiers: vec![1],
+        freed: 0,
+        demand,
+        ran_out: false,
+        spent: false,
+        held_back: false,
+        hogs: 0,
+        largest: 0,
+        left: Vec::new(),
+        ended_at_unix: None,
+    }
+}
+
+/// What a wait armed at `armed` answers within `patience`, its demand first poked for at `poked`.
+fn parked_since(shelf: &Shelf, armed: Instant, poked: Instant, patience: Duration) -> String {
+    let w = parse("sys free>=30GiB timeout=50").expect("parses");
+    let read = |_: &Path| Ok(reading(20 * GIB));
+    let env = Env {
+        read: &read,
+        poke: &|_| {},
+        settings: &|| (false, false, false),
+        lines: &default_lines,
+        hung_up: &|| false,
+        exited: &|| false,
+    };
+    park(
+        shelf,
+        &w,
+        &key(),
+        Path::new("/"),
+        (Some(30 * GIB), Some(Demanded { id: 1, poked }), None),
+        armed,
+        Instant::now() + patience,
+        &env,
+    )
+}
+
+/// A LOOK THAT NEVER BEGINS REACHES THE WAIT THAT HAS POKED FOR IT THAT LONG: the thread for it could
+/// not be started, say, so nothing will free space, and only the time of this wait's first poke says
+/// so.
+#[test]
+fn a_wait_that_poked_as_long_ago_as_the_beat_answers_stalled_with_no_look_in_flight() {
+    let shelf = shelf_at(20 * GIB);
+    let old = a_stall_ago();
+    shelf.publish(|b| b.watch = Watch::Running { beat: old });
+    assert_eq!(
+        parked_since(&shelf, old, old, Duration::from_secs(60)),
+        "ERR unavailable free why=watch-stalled\n"
+    );
+}
+
+/// POKING COUNTS FROM THE FIRST POKE, NOT THE ARM: a wait whose own read of the volume took two
+/// minutes has not yet asked for a look when that read returns. NEGATIVE CONTROL: the test above.
+#[test]
+fn a_wait_that_only_just_poked_is_no_stall_however_long_ago_it_armed() {
+    let shelf = shelf_at(20 * GIB);
+    let old = a_stall_ago();
+    shelf.publish(|b| b.watch = Watch::Running { beat: old });
+    assert_eq!(
+        parked_since(&shelf, old, Instant::now(), Duration::from_millis(50)),
+        "OK timeout\n"
+    );
+}
+
+/// A PASS THAT TOOK THIS WAIT'S DEMAND ENDS ITS POKES, SO IT CANNOT SPEAK FOR A LOOK THAT DOES NOT
+/// BEGIN: looks then come from the host's tick alone, whose restart can put the next one past the
+/// beat's two minutes with nothing wrong. NEGATIVE CONTROL: the same wait with a look in flight is
+/// stalled.
+#[test]
+fn a_wait_whose_demand_a_pass_took_answers_stalled_only_for_a_look_in_flight() {
+    let shelf = shelf_at(20 * GIB);
+    let old = a_stall_ago();
+    shelf.publish(|b| {
+        b.watch = Watch::Running { beat: old };
+        b.last_pass = Some(pass_for(Some(30 * GIB)));
+    });
+    assert_eq!(
+        parked_since(&shelf, old, old, Duration::from_millis(50)),
+        "OK timeout\n"
+    );
+    shelf.publish(|b| b.look_in_flight = true);
+    assert_eq!(
+        parked_since(&shelf, old, old, Duration::from_secs(60)),
+        "ERR unavailable free why=watch-stalled\n"
+    );
+}
+
+/// A PASS THAT DID NOT TAKE THE DEMAND LEAVES THE WAIT POKING, SO IT STILL SPEAKS FOR A LOOK THAT DOES
+/// NOT BEGIN. NEGATIVE CONTROL: the test above, whose pass took it.
+#[test]
+fn a_wait_whose_demand_no_pass_took_answers_stalled_with_no_look_in_flight() {
+    for pass_demand in [None, Some(10 * GIB)] {
+        let shelf = shelf_at(20 * GIB);
+        let old = a_stall_ago();
+        shelf.publish(|b| {
+            b.watch = Watch::Running { beat: old };
+            b.last_pass = Some(pass_for(pass_demand));
+        });
+        assert_eq!(
+            parked_since(&shelf, old, old, Duration::from_secs(60)),
+            "ERR unavailable free why=watch-stalled\n",
+            "{pass_demand:?}"
+        );
+    }
+}
+
+/// How many pokes a wait makes for 30 GiB, due a poke at once, after a pass for `pass_demand`, within
+/// `patience`, with `watched` as it is before and after the wait's read of the volume. The row starts
+/// old and a poke ages it again, so the wait reads rather than parks for ten seconds, and `exited`
+/// ends it after that poke.
+fn pokes_after(pass_demand: Option<u64>, watched: (bool, bool), patience: Duration) -> u32 {
+    let long = a_stall_ago();
+    let shelf = shelf_at(20 * GIB);
+    shelf.publish(|b| {
+        b.volumes[0].as_of = long;
+        b.last_pass = Some(pass_for(pass_demand));
+        b.watched = watched.0;
+    });
+    let pokes = AtomicU32::new(0);
+    let w = parse("sys free>=30GiB timeout=50").expect("parses");
+    let read = |_: &Path| {
+        shelf.publish(|b| b.watched = watched.1);
+        Ok(reading(20 * GIB))
+    };
+    let poke = |_: u64| {
+        pokes.fetch_add(1, Ordering::SeqCst);
+        shelf.publish(|b| b.volumes[0].as_of = long);
+    };
+    let exited = || pokes.load(Ordering::SeqCst) > 0;
+    let env = Env {
+        read: &read,
+        poke: &poke,
+        settings: &|| (false, false, false),
+        lines: &default_lines,
+        hung_up: &|| false,
+        exited: &exited,
+    };
+    let demand = Demanded { id: 1, poked: long };
+    park(
+        &shelf,
+        &w,
+        &key(),
+        Path::new("/"),
+        (Some(30 * GIB), Some(demand), None),
+        long,
+        Instant::now() + patience,
+        &env,
+    );
+    pokes.load(Ordering::SeqCst)
+}
+
+/// ONLY A PASS FOR THIS DEMAND ENDS ITS POKES: a pass for no need, or for a smaller one, took nothing
+/// for it, and a poke that lost to that look is gone. NEGATIVE CONTROL: a pass for a need at least as
+/// large.
+#[test]
+fn only_a_pass_for_the_demand_ends_its_pokes() {
+    let (hang, brief) = (Duration::from_secs(60), Duration::from_millis(50));
+    let on = (true, true);
+    assert_eq!(pokes_after(None, on, hang), 1, "a pass for no need");
+    assert_eq!(pokes_after(Some(10 * GIB), on, hang), 1, "for less");
+    assert_eq!(pokes_after(Some(30 * GIB), on, brief), 0, "for this");
+    assert_eq!(pokes_after(Some(40 * GIB), on, brief), 0, "for more");
+}
+
+/// WITH NOTHING WATCHED A WAIT DOES NOT POKE: no pass then adopts a demand, so its pokes would only
+/// force a pass every ten seconds. It asks when it would poke, because a change of the flag wakes no
+/// wait. NEGATIVE CONTROL: the same pass with the watch on, above, and one turned on as it waited.
+#[test]
+fn a_wait_with_nothing_watched_does_not_poke() {
+    let (hang, brief) = (Duration::from_secs(60), Duration::from_millis(50));
+    assert_eq!(pokes_after(None, (false, false), brief), 0, "off");
+    assert_eq!(pokes_after(None, (true, false), brief), 0, "turned off");
+    assert_eq!(pokes_after(None, (false, true), hang), 1, "turned on");
+}
+
+/// AN OLD BEAT WITH NO LOOK IN FLIGHT IS NO STALL TO A WAIT JUST ARMED: it says only that no look has
+/// started, and this wait's poke starts one. NEGATIVE CONTROL: the same beat with a look in flight,
+/// above.
+#[test]
+fn an_old_beat_with_no_look_in_flight_is_no_stall() {
+    let shelf = shelf_at(20 * GIB);
+    let world = World::new(20 * GIB);
+    let Some(old) = Instant::now().checked_sub(STALL + Duration::from_secs(1)) else {
+        aterm_spec::host::could_not_run("the monotonic clock here cannot reach back a stall");
+    };
+    shelf.publish(|b| b.watch = Watch::Running { beat: old });
+    let reply = run_in(&shelf, "sys free>=30GiB timeout=50", &owner(), &world);
     assert_eq!(reply, "OK timeout\n");
 }
 

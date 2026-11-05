@@ -736,6 +736,9 @@ pub(crate) enum ClipboardRecipient {
 pub(crate) struct ImeComposition {
     recipient: ImeRecipient,
     cancelled: bool,
+    /// Where the input that composed it came from, the least vouched of its preedits' marks
+    /// (`App::gesture_origin`): a key an `hwkey` burst or another process posted.
+    by: aterm_window::event::InputOrigin,
 }
 
 #[inline]
@@ -2163,6 +2166,28 @@ pub(crate) mod paste_order {
         report_ordered_or_inline_routed(ui_writes_can_block(), term, modes, sink, ev)
     }
 
+    /// [`report_ordered_or_inline`] for a pointer report the UI thread makes: its terminal wait
+    /// registers in `ui_waiting` and books as a mouse wait
+    /// ([`crate::input::seam_egress_receipt_ui`]).
+    pub(crate) fn pointer_report_on_ui(
+        term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
+        sink: &Arc<SinkWriter>,
+        ev: &InputEvent,
+        ui_waiting: &std::sync::atomic::AtomicU32,
+    ) -> crate::input::EgressReceipt {
+        report_route(
+            ui_writes_can_block(),
+            term,
+            modes,
+            sink,
+            ev,
+            false,
+            Some(ui_waiting),
+        )
+        .0
+    }
+
     /// [`report_ordered_or_inline`] with the platform's routing fact explicit.
     pub(super) fn report_ordered_or_inline_routed(
         ui_writes_can_block: bool,
@@ -2171,7 +2196,7 @@ pub(crate) mod paste_order {
         sink: &Arc<SinkWriter>,
         ev: &InputEvent,
     ) -> crate::input::EgressReceipt {
-        report_route(ui_writes_can_block, term, modes, sink, ev, false).0
+        report_route(ui_writes_can_block, term, modes, sink, ev, false, None).0
     }
 
     /// [`report_ordered_or_inline`] for a control lane's mouse report into a session not on screen.
@@ -2181,7 +2206,7 @@ pub(crate) mod paste_order {
         sink: &Arc<SinkWriter>,
         ev: &InputEvent,
     ) -> (crate::input::EgressReceipt, Option<Written>) {
-        report_route(ui_writes_can_block(), term, modes, sink, ev, true)
+        report_route(ui_writes_can_block(), term, modes, sink, ev, true, None)
     }
 
     /// The report route's one body.
@@ -2192,18 +2217,22 @@ pub(crate) mod paste_order {
         sink: &Arc<SinkWriter>,
         ev: &InputEvent,
         written: bool,
+        ui_waiting: Option<&std::sync::atomic::AtomicU32>,
     ) -> (crate::input::EgressReceipt, Option<Written>) {
         if !(ui_writes_can_block || is_ordering(sink)) {
-            let receipt = crate::input::seam_egress_receipt(
-                term,
-                modes,
-                sink,
-                ev,
-                crate::input::EgressMode::Interactive,
-            );
+            let mode = crate::input::EgressMode::Interactive;
+            let receipt = match ui_waiting {
+                Some(waiting) => {
+                    crate::input::seam_egress_receipt_ui(term, modes, sink, ev, mode, waiting)
+                }
+                None => crate::input::seam_egress_receipt(term, modes, sink, ev, mode),
+            };
             return (receipt, None);
         }
-        let (egress, bytes) = crate::input::seam_encode(term, modes, sink, ev);
+        let (egress, bytes) = match ui_waiting {
+            Some(waiting) => crate::input::seam_encode_ui(term, modes, sink, ev, waiting),
+            None => crate::input::seam_encode(term, modes, sink, ev),
+        };
         if bytes.is_empty() {
             return (crate::input::EgressReceipt::unwritten(egress), None);
         }
@@ -3732,6 +3761,16 @@ pub(crate) fn revoke_failed_delivery(
     }
 }
 
+/// What a UI-thread pointer report goes through: its session's terminal, mode mirror and byte
+/// sink, and the count of UI-thread terminal waiters its wait registers in.
+#[derive(Clone, Copy)]
+struct PointerPath<'a> {
+    term: &'a Arc<Mutex<Terminal>>,
+    modes: &'a Arc<ModeMirror>,
+    sink: &'a Arc<SinkWriter>,
+    ui_waiting: &'a std::sync::atomic::AtomicU32,
+}
+
 /// A mouse, wheel or focus report refused because its session's input queue is full
 /// ([`paste_order::report_ordered_or_inline`]).
 fn note_refused_report(receipt: input::EgressReceipt) {
@@ -3748,6 +3787,20 @@ pub(crate) fn write_ui_report(
     ev: &InputEvent,
 ) {
     note_refused_report(paste_order::report_ordered_or_inline(term, modes, sink, ev));
+}
+
+/// [`write_ui_report`] for a pointer report: the UI thread's wait for the terminal registers in
+/// `ui_waiting` ([`paste_order::pointer_report_on_ui`]).
+pub(crate) fn write_ui_pointer_report(
+    term: &Arc<Mutex<Terminal>>,
+    modes: &Arc<ModeMirror>,
+    sink: &Arc<SinkWriter>,
+    ev: &InputEvent,
+    ui_waiting: &std::sync::atomic::AtomicU32,
+) {
+    note_refused_report(paste_order::pointer_report_on_ui(
+        term, modes, sink, ev, ui_waiting,
+    ));
 }
 
 /// Why a person's input did not reach the session.
@@ -5029,14 +5082,21 @@ impl App {
                                 at: input_now,
                                 row,
                             };
-                            let route = crate::aos_host::admit_key(ws, verdict, &press, |cells| {
-                                crate::aos_host::echo::typed_echo_cells(
-                                    typed.filter(|_| !enter_like),
-                                    ime,
-                                    ambiguous_width_double,
-                                    cells,
-                                )
-                            });
+                            let route = crate::aos_host::admit_key(
+                                ws,
+                                verdict,
+                                &press,
+                                |cells| {
+                                    crate::aos_host::echo::typed_echo_cells(
+                                        typed.filter(|_| !enter_like),
+                                        ime,
+                                        ambiguous_width_double,
+                                        cells,
+                                    )
+                                },
+                                || crate::aos_host::front_group(&sink),
+                                input_now,
+                            );
                             held_press = route == crate::aos_host::echo::KeyRoute::Hold;
                             if let crate::aos_host::echo::KeyRoute::Private(why) = route {
                                 crate::aos_host::private_key(ws, why, input_now);
@@ -5598,7 +5658,13 @@ impl App {
             }
             ev @ InputEvent::MouseButton { .. } => {
                 let fronted = self.session_is_front(wid, session);
-                self.input_mouse_button(wid, &ev, &term, &modes, &sink, fronted)
+                let path = PointerPath {
+                    term: &term,
+                    modes: &modes,
+                    sink: &sink,
+                    ui_waiting: &ui_waiting,
+                };
+                self.input_mouse_button(wid, &ev, path, fronted)
             }
             ev @ InputEvent::MouseMove { .. } => {
                 let (row, col, side) = if let InputEvent::MouseMove { row, col, side, .. } = ev {
@@ -5614,7 +5680,8 @@ impl App {
                     self.drag_selection(wid, row, col);
                     return InputOutcome::Ok;
                 }
-                let receipt = paste_order::report_ordered_or_inline(&term, &modes, &sink, &ev);
+                let receipt =
+                    paste_order::pointer_report_on_ui(&term, &modes, &sink, &ev, &ui_waiting);
                 note_refused_report(receipt);
                 if self.session_is_front(wid, session)
                     && (receipt.accepted_order().is_some()
@@ -5630,7 +5697,13 @@ impl App {
                 receipt_outcome(receipt)
             }
             ev @ InputEvent::Wheel { .. } => {
-                self.input_wheel(wid, session, &ev, &term, &modes, &sink)
+                let path = PointerPath {
+                    term: &term,
+                    modes: &modes,
+                    sink: &sink,
+                    ui_waiting: &ui_waiting,
+                };
+                self.input_wheel(wid, session, &ev, path)
             }
             InputEvent::ScrollView(intent) => {
                 // Toward history: a person reaching for scrollback that a rewrap
@@ -5696,9 +5769,12 @@ impl App {
         &mut self,
         wid: WindowId,
         ev: &InputEvent,
-        term: &Arc<Mutex<Terminal>>,
-        modes: &Arc<ModeMirror>,
-        sink: &Arc<SinkWriter>,
+        PointerPath {
+            term,
+            modes,
+            sink,
+            ui_waiting,
+        }: PointerPath<'_>,
         fronted: bool,
     ) -> InputOutcome {
         self.fence_pointer_license(wid);
@@ -5728,7 +5804,7 @@ impl App {
             } else {
                 unreachable!()
             };
-        let receipt = paste_order::report_ordered_or_inline(term, modes, sink, ev);
+        let receipt = paste_order::pointer_report_on_ui(term, modes, sink, ev, ui_waiting);
         note_refused_report(receipt);
         let egress = receipt.egress;
         if let input::Egress::TrackingOff { .. } = egress
@@ -5754,9 +5830,12 @@ impl App {
         wid: WindowId,
         session: u64,
         ev: &InputEvent,
-        term: &Arc<Mutex<Terminal>>,
-        modes: &Arc<ModeMirror>,
-        sink: &Arc<SinkWriter>,
+        PointerPath {
+            term,
+            modes,
+            sink,
+            ui_waiting,
+        }: PointerPath<'_>,
     ) -> InputOutcome {
         self.fence_pointer_license(wid);
         if let Some(rain) = self.windows.get_mut(&wid).and_then(|ws| ws.fx.rain_mut())
@@ -5773,7 +5852,7 @@ impl App {
             self.scroll_wheel_animated_with(wid, term, 0, None, Some(dy_px));
             return InputOutcome::Ok;
         }
-        let receipt = paste_order::report_ordered_or_inline(term, modes, sink, ev);
+        let receipt = paste_order::pointer_report_on_ui(term, modes, sink, ev, ui_waiting);
         note_refused_report(receipt);
         let egress = receipt.egress;
         if let input::Egress::TrackingOff {
@@ -5794,7 +5873,8 @@ impl App {
                 if self.rewrap_in_flight(session) {
                     let now = std::time::Instant::now();
                     self.settle_scroll_motion_at_target(wid, now);
-                    term_lock(term).scroll_display(delta);
+                    crate::term_lock_ui(term, ui_waiting, crate::metrics::TermWaitSite::Mouse)
+                        .scroll_display(delta);
                     if let Some(ws) = self.windows.get_mut(&wid) {
                         ws.scroll_pill.touch(now);
                         if let Some(w) = ws.os_window.as_ref() {
@@ -5989,7 +6069,14 @@ impl App {
                 return;
             }
             self.settle_scroll_motion_at_target(wid, now);
-            term_lock(term).scroll_display(delta_rows);
+            let site = crate::metrics::TermWaitSite::Mouse;
+            let ui_waiting = self.pool.ui_waiting_of(term);
+            let mut shown = match &ui_waiting {
+                Some(waiting) => crate::term_lock_ui(term, waiting, site),
+                None => term_lock(term),
+            };
+            shown.scroll_display(delta_rows);
+            drop(shown);
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.scroll_pill.touch(now);
                 if let Some(w) = ws.os_window.as_ref() {
@@ -6021,7 +6108,12 @@ impl App {
             ),
             (None, Some((engine_row, max_rows)), Some(_)) => (engine_row, max_rows),
             (None, _, _) => {
-                let t = term_lock(term);
+                let site = crate::metrics::TermWaitSite::Mouse;
+                let ui_waiting = self.pool.ui_waiting_of(term);
+                let t = match &ui_waiting {
+                    Some(waiting) => crate::term_lock_ui(term, waiting, site),
+                    None => term_lock(term),
+                };
                 (
                     i64::try_from(t.grid().display_offset()).unwrap_or(i64::MAX),
                     i64::try_from(t.grid().scrollback_lines()).unwrap_or(i64::MAX),
@@ -7647,7 +7739,10 @@ impl App {
             self.note_press_disposition(wid, &ev, None);
             return;
         }
-        if self.close_banner.as_ref().is_some_and(|p| p.wid == wid) {
+        // Only the band answers here: a sheet answers through its own buttons and key watch, and
+        // a key that reaches the window once its sheet has ended (typed right after Cancel,
+        // before the sheet's answer is served) is the shell's, never an answer.
+        if self.close_band(wid).is_some() {
             let (chars, code) = match &ev.logical_key {
                 Key::Named(NamedKey::Enter) => (Some("\r"), 0),
                 Key::Named(NamedKey::Escape) => (Some("\u{1b}"), 0),
@@ -9012,11 +9107,21 @@ impl App {
                     cancelled: recipient.surface == PreeditOwner::Native
                         && recipient.native.is_none(),
                     recipient: recipient.clone(),
+                    by: aterm_window::event::InputOrigin::Person,
                 })
             });
             if let Some(previous) = previous {
                 self.cancel_ime_projection(&previous.recipient);
             }
+        }
+        let origin = self.gesture_origin();
+        if !text.is_empty()
+            && let Some(composition) = self
+                .windows
+                .get_mut(&wid)
+                .and_then(|window| window.ime_recipient.as_mut())
+        {
+            composition.by = composition.by.max(origin);
         }
         let accepted = self.check_ime_recipient(wid);
         let mut changed = false;
@@ -9502,6 +9607,18 @@ impl App {
         }
     }
 
+    /// Where the input that composed window `wid`'s composition in flight came from (a key an
+    /// `hwkey` burst or another process posted reached its preedit), whoever's key commits it
+    /// ([`App::dispatch_ime_event`]).
+    pub(crate) fn ime_composed_from(&self, wid: WindowId) -> aterm_window::event::InputOrigin {
+        self.windows
+            .get(&wid)
+            .and_then(|window| window.ime_recipient.as_ref())
+            .map_or(aterm_window::event::InputOrigin::Person, |composition| {
+                composition.by
+            })
+    }
+
     /// A focus change retires this sequence until Commit, rather than giving
     /// its remaining preedit or committed text to the new recipient.
     fn check_ime_recipient(&mut self, wid: WindowId) -> bool {
@@ -9923,6 +10040,7 @@ impl App {
             MenuAction::ForgetAllHistory => {
                 let _ = self.forget_all_history();
             }
+            MenuAction::RecordUnseenKeys => self.toggle_unseen_keys(),
             MenuAction::CloseTab => {
                 // As Cmd-W; the window closes when its last tab did.
                 if let Some(closed) = self.close_active_tab() {
@@ -10206,9 +10324,9 @@ impl App {
                     aterm_log::info!("show {}: {e}", peer_sid.as_str());
                 }
             }
-            ConnVerb::MoveToTab => {
-                if !self.unpark_session(local) {
-                    aterm_log::info!("move to tab {}: not parked", peer_sid.as_str());
+            ConnVerb::KeepAsTab => {
+                if !self.keep_as_tab(local) {
+                    aterm_log::info!("keep as tab {}: no worker's tab", peer_sid.as_str());
                 }
             }
             ConnVerb::StopWorker => {
@@ -10436,6 +10554,7 @@ mod forwarded_release_handoff_activity_tests {
             target_build: 0,
             target_commit: String::new(),
             layout: crate::restore::RestoreManifest::new(Vec::new()),
+            carry_lone_lists: false,
             layout_digest: [0; 32],
             screen_digest: [0; 32],
             activity_epoch: app.update_handoff_activity_epoch,

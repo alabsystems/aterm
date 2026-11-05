@@ -733,9 +733,11 @@ impl Story {
 fn call(e: &MomentumEvent) -> Result<Call, String> {
     let at = |t: i128| u64::try_from(t).map_err(|_| format!("a call at {t} ns, before the origin"));
     match *e {
-        MomentumEvent::Key { at: t, tau_bits } if tau_bits == TAU.to_bits() => {
-            Ok(Call::Key { at: at(t)? })
-        }
+        MomentumEvent::Key {
+            at: t,
+            tau_bits,
+            echo: aterm_effects::aos_momentum::KeyEcho::Seen,
+        } if tau_bits == TAU.to_bits() => Ok(Call::Key { at: at(t)? }),
         MomentumEvent::Reset => Ok(Call::Reset),
         MomentumEvent::Tick {
             cur: Some(cur),
@@ -763,6 +765,7 @@ fn event(call: &Call) -> MomentumEvent {
         Call::Key { at } => MomentumEvent::Key {
             at: i128::from(at),
             tau_bits: TAU.to_bits(),
+            echo: aterm_effects::aos_momentum::KeyEcho::Seen,
         },
         Call::Reset => MomentumEvent::Reset,
         Call::Tick { at, cur, cfg } => MomentumEvent::Tick {

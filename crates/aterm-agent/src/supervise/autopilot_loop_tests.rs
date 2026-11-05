@@ -169,6 +169,79 @@ fn a_persons_greeting_under_land_is_left_to_them() {
     );
 }
 
+/// A MANAGED WORKER'S OPENING MESSAGE IS ITS TASK, NEVER A PERSON'S EXCHANGE (2026-11-04): the
+/// same quick first turn, a person's gesture inside it, in a session whose task record a manager
+/// waits on, writes no `LEFT` row, and Land types its instruction: the record is read before the
+/// loop judges its first point (`Session::task_ahead`), so that point already knows the session
+/// is managed. NEGATIVE CONTROL: [`a_persons_greeting_under_land_is_left_to_them`], the same
+/// screens and gesture with no task record, left to the person.
+#[test]
+fn a_managed_workers_first_turn_under_land_is_never_left_to_a_person() {
+    let greeting = "Hi! What would you like me to work on?";
+    let mut quick = rows(&[&format!("⏺ {greeting}"), ""]);
+    quick.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+    let policy = SupervisorConfig {
+        human_grace_s: 0,
+        ..owners_policy()
+    };
+    let (dir, journal) = journal_file("autopilot-land-managed-exchange");
+    let mut m = Mock::new(vec![busy_screen(), quick]);
+    m.autopilot = Some("land");
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(8);
+    m.human = vec!["2000"];
+    m.task = Some((
+        1,
+        "state=working from=s-0a1b since_ms=0 result_bytes=0".to_string(),
+    ));
+    let opts = SuperviseOpts {
+        policy,
+        journal: Some(journal.clone()),
+        tasks: Some(dir.join("tasks")),
+        ..auto(1)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            short_backoff: Duration::from_millis(30),
+            short_backoff_max: Duration::from_millis(60),
+            ..TurnEndTiming::default()
+        });
+    });
+    let records: Vec<String> = journal_records(&journal)
+        .0
+        .into_iter()
+        .map(|r| r.line)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !records.iter().any(|l| l.starts_with("LEFT ")),
+        "{records:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(&format!("rule={RULE_LAND} "))),
+        "{lines:#?}"
+    );
+    let verb = |r: &str| {
+        let mut words = r.split_whitespace().skip_while(|w| w.starts_with('@'));
+        (words.next().map(str::to_string), words.next().is_none())
+    };
+    let first_task = m
+        .order
+        .iter()
+        .position(|(r, _)| verb(r) == (Some("task".to_string()), true));
+    let first_turn = m
+        .order
+        .iter()
+        .position(|(r, _)| verb(r).0.as_deref() == Some("turn"));
+    assert!(
+        first_task.is_some() && first_task < first_turn,
+        "the record is read before the first point's act: {:#?}",
+        m.order
+    );
+}
+
 /// The window's host's word on how it started the loop
 /// ([`IdleHost::lifted_off`]): as the session's Off lifted, or not.
 #[derive(Debug)]

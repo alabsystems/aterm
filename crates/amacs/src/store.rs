@@ -127,6 +127,9 @@ pub enum DocumentCloseReadiness {
 #[derive(Clone, Debug)]
 struct Document {
     directory: Option<DirectoryListing>,
+    /// Opened to be read and never changed ([`DocumentStore::set_read_only`]): every transaction
+    /// is refused, as a directory listing's is.
+    read_only: bool,
     id: DocumentId,
     canonical_uri: String,
     surface: Surface,
@@ -219,6 +222,7 @@ impl DocumentStore {
         let text_rope = crate::text::TextRope::from(projection.as_ref());
         let document = Document {
             directory: None,
+            read_only: false,
             id,
             canonical_uri: canonical_uri.clone(),
             surface,
@@ -245,6 +249,29 @@ impl DocumentStore {
 
     pub fn directory(&self, id: DocumentId) -> Option<&DirectoryListing> {
         self.documents.get(&id)?.directory.as_ref()
+    }
+
+    /// Make document `id` read-only for the rest of its life: from now on every transaction on
+    /// it is refused ([`DocumentError::ReadOnly`]). Nothing clears it: opening its URI again
+    /// reuses the read-only document.
+    ///
+    /// # Errors
+    /// No such document.
+    pub fn set_read_only(&mut self, id: DocumentId) -> Result<(), DocumentError> {
+        self.documents
+            .get_mut(&id)
+            .ok_or(DocumentError::UnknownDocument)?
+            .read_only = true;
+        Ok(())
+    }
+
+    /// Whether document `id` refuses every change: a directory listing, or a document made
+    /// read-only ([`Self::set_read_only`]).
+    #[must_use]
+    pub fn read_only(&self, id: DocumentId) -> bool {
+        self.documents
+            .get(&id)
+            .is_some_and(|document| document.directory.is_some() || document.read_only)
     }
 
     /// Replace a generated listing without making it a user edit or a dirty buffer.
@@ -401,7 +428,7 @@ impl DocumentStore {
         let Some(document) = self.documents.get_mut(&id) else {
             return DocumentTxnOutcome::Rejected(DocumentError::UnknownDocument);
         };
-        if document.directory.is_some() {
+        if document.directory.is_some() || document.read_only {
             return DocumentTxnOutcome::Rejected(DocumentError::ReadOnly);
         }
         if !matches!(
@@ -767,6 +794,47 @@ mod tests {
         let again = store.open("mem://readme".into(), "ignored".into());
         assert_eq!(again, id);
         assert_eq!(store.snapshot(id).unwrap().text.as_ref(), "hello\nworld");
+    }
+
+    /// A read-only document refuses every transaction, a replacement included, keeps its text and
+    /// sequence, and stays read-only when its URI is opened again.
+    /// NEGATIVE CONTROL: with `transact` checking only `directory`, the edit commits:
+    /// `` read-only: Committed { .. } ``.
+    #[test]
+    fn a_read_only_document_refuses_every_change() {
+        let (mut store, id) = open();
+        assert!(!store.read_only(id));
+        store.set_read_only(id).unwrap();
+        assert!(store.read_only(id));
+        let base = store.snapshot(id).unwrap().seq;
+        let outcome = store.transact(
+            id,
+            base,
+            vec![TextEdit {
+                range: 0..5,
+                insert: "secret".into(),
+            }],
+        );
+        assert!(
+            matches!(
+                outcome,
+                DocumentTxnOutcome::Rejected(DocumentError::ReadOnly)
+            ),
+            "read-only: {outcome:?}"
+        );
+        assert!(matches!(
+            store.replace_text(id, base, "replaced"),
+            DocumentTxnOutcome::Rejected(DocumentError::ReadOnly)
+        ));
+        let snapshot = store.snapshot(id).unwrap();
+        assert_eq!(snapshot.text.as_ref(), "hello\nworld");
+        assert_eq!(snapshot.seq, base);
+        assert_eq!(store.open("mem://readme".into(), "again".into()), id);
+        assert!(store.read_only(id), "reopening keeps it read-only");
+        assert_eq!(
+            store.set_read_only(DocumentId(NonZeroU64::new(99).unwrap())),
+            Err(DocumentError::UnknownDocument)
+        );
     }
 
     #[test]

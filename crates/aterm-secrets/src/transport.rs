@@ -175,7 +175,25 @@ pub(crate) const EXCHANGE: Duration = Duration::from_secs(120);
 /// The deadline of a join verdict's one-line exchange ([`post_verdict`], [`list_verdicts`]):
 /// a waiting subscriber reads it before each long-poll, and the approver posts it within its
 /// pass, so neither waits out a [`EXCHANGE`] on a vault that does not answer.
+#[cfg(not(test))]
 const VERDICT_EXCHANGE: Duration = Duration::from_secs(10);
+/// A unit test's is its one-minute hang detector: every vault it posts a verdict to or reads
+/// verdicts from is one it started on loopback, which answers.
+#[cfg(test)]
+const VERDICT_EXCHANGE: Duration = aterm_spec::wait::MUST_HAPPEN;
+
+/// [`VERDICT_EXCHANGE`], or a test's hang detector where longer: the bound a test holds on this
+/// thread for the vault servers it started (`client::ServersAnswering`), which answer.
+fn verdict_exchange() -> Duration {
+    #[cfg(unix)]
+    {
+        VERDICT_EXCHANGE.max(crate::client::servers_within(VERDICT_EXCHANGE))
+    }
+    #[cfg(not(unix))]
+    {
+        VERDICT_EXCHANGE
+    }
+}
 /// The largest answer read from a PUT or a join POST (a one-line reason).
 const REASON_BODY: usize = 64 * 1024;
 /// The largest join queue read (256 lines of under 256 bytes, with room to spare).
@@ -2159,6 +2177,7 @@ impl PublishLock {
                 .write(true)
                 .create_new(true)
                 .mode(0o644)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(&lock)
             {
                 Ok(mut file) => {
@@ -2225,7 +2244,7 @@ fn remove_dead(lock: &std::path::Path) -> bool {
     // Never waits: a FIFO there would hold the server's state lock until a writer came.
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(lock)
     else {
         return false;
@@ -2560,7 +2579,7 @@ pub fn post_verdict(url: &str, recipient: &str, tag: &str) -> crate::Result<()> 
         return Err(Error::new("a verdict is `age1… refused <16 hex digits>`"));
     }
     let target = verdict_url(url);
-    let response = client(VERDICT_EXCHANGE)
+    let response = client(verdict_exchange())
         .post(&target)
         .header("Content-Type", "text/plain; charset=utf-8")
         .limit(REASON_BODY)
@@ -2580,13 +2599,14 @@ pub fn post_verdict(url: &str, recipient: &str, tag: &str) -> crate::Result<()> 
 /// `GET <url>/join/verdict`: each `(age1…, tag)` an admin Mac refused ([`post_verdict`]). A
 /// server that keeps no verdicts (an older one answers `404`) has none.
 pub fn list_verdicts(url: &str) -> crate::Result<Vec<(String, String)>> {
-    list_verdicts_within(url, VERDICT_EXCHANGE)
+    list_verdicts_within(url, verdict_exchange())
 }
 
-/// [`list_verdicts`], the whole exchange within `total` (at most [`VERDICT_EXCHANGE`]).
+/// [`list_verdicts`], the whole exchange within `total` (at most [`VERDICT_EXCHANGE`], or the
+/// hang detector a test holds on this thread).
 pub fn list_verdicts_within(url: &str, total: Duration) -> crate::Result<Vec<(String, String)>> {
     let target = verdict_url(url);
-    let response = client(total.min(VERDICT_EXCHANGE))
+    let response = client(total.min(verdict_exchange()))
         .get(&target)
         .limit(JOINS_BODY)
         .send(&[])

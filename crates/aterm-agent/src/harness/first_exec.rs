@@ -309,7 +309,7 @@ fn register_target(holds: &Path, target: &Path, store: Option<&Path>) -> std::io
             use std::os::unix::fs::OpenOptionsExt as _;
             options
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
         let mut file = options.open(&path)?;
         file.write_all(target.as_os_str().as_encoded_bytes())?;

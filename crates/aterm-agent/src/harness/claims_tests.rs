@@ -234,6 +234,13 @@ fn a_preparation_refusal_survives_an_unreadable_claim_table() {
             panic!("a refused claim cannot write");
         }
     }
+    assert!(
+        with_table(std::sync::Arc::new(Unread), || read_book(
+            std::path::Path::new("/unused")
+        ))
+        .is_err(),
+        "an unreadable claims table must not become an absent claims book"
+    );
     let mut state = State::default();
     state.prepared_accounts.insert("pool-a".into());
     state.home_accounts.insert("pool-a".into());

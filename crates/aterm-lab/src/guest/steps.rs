@@ -164,8 +164,12 @@ pub(crate) fn arrivals(args: &[String], out: &mut dyn std::io::Write) -> Result<
     }
     for file in files {
         let landed = Path::new(joiner).join(file);
-        let line = match std::fs::metadata(&landed).and_then(|m| m.modified()) {
-            Ok(at) => {
+        let line = match std::fs::symlink_metadata(&landed)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| m.modified().ok())
+        {
+            Some(at) => {
                 let held = match (
                     read_regular_file(&landed),
                     read_regular_file(&Path::new(seed).join(file)),
@@ -175,7 +179,7 @@ pub(crate) fn arrivals(args: &[String], out: &mut dyn std::io::Write) -> Result<
                 };
                 format!("{file} {} {held}", epoch_secs(at))
             }
-            Err(_) => format!("{file} none absent"),
+            None => format!("{file} none absent"),
         };
         writeln!(out, "{line}").map_err(|e| format!("arrivals: {e}"))?;
     }

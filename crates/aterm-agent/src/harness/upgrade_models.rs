@@ -268,11 +268,22 @@ pub(super) fn write_atomic_before_publish(
 /// # Errors
 /// As [`write_atomic`].
 pub fn write_atomic_ordered(path: &Path, text: &str) -> std::io::Result<()> {
+    write_atomic_ordered_mode(path, text, None)
+}
+
+/// [`write_atomic_ordered`], with the replacement's permission bits (unix) where `mode` names them.
+/// # Errors
+/// As [`write_atomic_mode`].
+pub fn write_atomic_ordered_mode(
+    path: &Path,
+    text: &str,
+    mode: Option<u32>,
+) -> std::io::Result<()> {
     use std::io::Write as _;
     write_atomic_using(
         path,
         text,
-        None,
+        mode,
         Flush::Ordered,
         |file, bytes| file.write_all(bytes),
         || Ok(()),
@@ -301,7 +312,8 @@ fn write_atomic_using(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600);
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let mut file = open.open(&staged)?;
     #[cfg(unix)]
@@ -500,14 +512,23 @@ pub fn read_evidence(config_dir: &Path, claude_json: &Path) -> Evidence {
     let served = std::fs::read_dir(config_dir.join("cache").join("model-catalog"))
         .ok()
         .and_then(|rd| {
-            let mut files: Vec<PathBuf> = rd
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.to_string_lossy().ends_with("-cc.json"))
-                .collect();
-            files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-            files.last().and_then(|p| {
-                super::accounts::read_bounded(p, 4 * 1024 * 1024)
+            let mut best: Option<(Option<std::time::SystemTime>, PathBuf)> = None;
+            for e in rd.filter_map(Result::ok) {
+                if !e
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with("-cc.json"))
+                    || !e.file_type().is_ok_and(|t| t.is_file())
+                {
+                    continue;
+                }
+                let mtime = e.metadata().and_then(|m| m.modified()).ok();
+                if best.as_ref().is_none_or(|(have, _)| mtime >= *have) {
+                    best = Some((mtime, e.path()));
+                }
+            }
+            best.and_then(|(_, p)| {
+                super::accounts::read_bounded(&p, 4 * 1024 * 1024)
                     .ok()
                     .flatten()
             })

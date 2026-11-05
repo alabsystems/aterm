@@ -34,8 +34,12 @@ fn prepared_launch_refuses_a_login_renewed_in_the_same_directory() {
                 .unwrap();
             if off {
                 pin(&world, cli, "work").unwrap();
-                std::fs::write(world.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n")
-                    .unwrap();
+                aterm_uds::atomic_file::write(
+                    &(world.cfg.join("aterm.toml")),
+                    ("[harness]\naccounts='off'\n").as_ref(),
+                    0o600,
+                )
+                .unwrap();
             }
             let result =
                 super::super::launch_env_using(&world.seat(), cli, &no_usage, None, |row| {
@@ -110,7 +114,12 @@ fn run_case(cli: Cli, off: bool, case: i64) -> (bool, bool) {
     }
     if off {
         pin(&world, cli, "work").unwrap();
-        std::fs::write(world.cfg.join("aterm.toml"), "[harness]\naccounts='off'\n").unwrap();
+        aterm_uds::atomic_file::write(
+            &(world.cfg.join("aterm.toml")),
+            ("[harness]\naccounts='off'\n").as_ref(),
+            0o600,
+        )
+        .unwrap();
     }
     let files = [
         store.state_file(),
@@ -242,13 +251,15 @@ fn run_case(cli: Cli, off: bool, case: i64) -> (bool, bool) {
             16 => std::fs::write(store.state_file(), "not JSON").unwrap(),
             17 => std::fs::rename(store.logins_file(), world.root.join("kept-logins")).unwrap(),
             18 => held = Some(store.acquire().unwrap()),
-            19 => std::fs::write(
-                world.cfg.join("aterm.toml"),
-                if off {
+            19 => aterm_uds::atomic_file::write(
+                &(world.cfg.join("aterm.toml")),
+                (if off {
                     "[harness]\naccounts='early'\n"
                 } else {
                     "[harness]\naccounts='off'\n"
-                },
+                })
+                .as_ref(),
+                0o600,
             )
             .unwrap(),
             20 => {

@@ -2,7 +2,7 @@
 name: supervise-agent
 description: Run other Claude Code, codex-alab, agy or Muse Code sessions in aterm tabs as workers — start each on a task, wait for them in the background, read each one's result and check it against ground truth (tests, diff, exit codes) — or oversee another program (a codex-alab, a REPL, a long build) in an aterm session. Use when asked to hand work to other sessions or windows, run work in parallel in aterm, say what every aterm session or machine is doing, manage or babysit another agent, or act as a lead over workers.
 ---
-<!-- aterm skill v28 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v29 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Workers: other aterm sessions doing the work
 
@@ -28,8 +28,10 @@ under `cruise`, no report ends it).
 
 - Autopilot defaults to `land` unless `autopilot=cruise` is set: `land` carries the worker
   until its work is on the remote main branch, its reply defends that in a few lines
-  starting `Nothing left:`, and it answers aterm's short land check with only `LANDED`,
-  which is its `done`. `cruise` continues indefinitely (prompting
+  starting `Nothing left:`, nothing it started for its own checks still runs (`aterm ctl
+  @self sys left`; one it was asked to run it keeps with a `keep <token>` line under
+  `Nothing left:`), and it answers aterm's short land check with only `LANDED`, which is
+  its `done`. `cruise` continues indefinitely (prompting
   to find more after every report) and never reaches `done`; inspect it with `status` and
   `survey`, or switch it with `aterm ctl @<sid> meta set autopilot land`.
 - `ERR unsupervised: <switch>` means the harness would not carry the worker (`[harness]
@@ -40,6 +42,14 @@ under `cruise`, no report ends it).
   path there> - < task`, then `aterm ctl --host <h> await task @<w> since=0` (`aterm help
   workers`, ON ANOTHER MAC). Without a drive grant, read fleet sessions with `aterm ctl
   survey --fleet`.
+- Every worker this Mac starts, here or with `--host`, gets a row on this Mac's board:
+  its Mac, state, conclusion, landing and a digest of its task, never the task's text. Name
+  it with `label=<word>` on the spawn (`aterm ctl --host <h> spawn agent=claude
+  label=EW-24 … - < task`); `aterm ctl board` lists the rows, `aterm ctl --host <h> board`
+  another Mac's. After losing context, `aterm ctl await task board since=0` waits on every
+  open row where its worker runs, with no sid to remember; from another Mac, `aterm ctl --host
+  <h> await task board since=0` does the same for the board of `<h>`, the Mac that started
+  them (`aterm help workers`, THE BOARD).
 
 Start every worker first, then wait for them together.
 
@@ -75,8 +85,10 @@ and old news never fires twice.
   repository has no remote, and reads nothing in a folder that is not a repository or one
   it may not read), and the worker answered the land check (what counts as not landed: a
   change off the remote main, a check skipped, flaky, failing or not run, work deferred,
-  partial or on another branch, a `NEEDS YOU:` line) with only `LANDED`; codex-alab runs
-  its own check.
+  partial or on another branch, a `NEEDS YOU:` line) with only `LANDED`; each process it
+  started that still ran was ended or kept by a `keep <token>` line (`task`'s `left=` says
+  what the landing read: `0`, `kept:<n>`, `<n>` or `unchecked`); codex-alab runs its own
+  check.
 - `failed`: the work ended unfinished with its agent still there, and `why=` says how:
   `could-not-finish` (the first line of its reply starts `Could not finish: <why>`, the word a
   worker under Autopilot Land ends with when it cannot finish; `result` is that reply; codex-alab
@@ -88,8 +100,11 @@ and old news never fires twice.
 - `exited`: the agent exited and nothing relaunches it: `conclusion=finished` if the task had
   finished, whatever word finished it (a landing keeps `why=landed`), else `conclusion=failed`.
 - `stalled`: its shell ended or a person used it before its first prompt (`why=shell`), no
-  composer within 2 minutes, a shell still drawing no prompt included (`why=startup`), or 2
-  minutes at a screen the harness could not handle (`why=held`).
+  composer within 2 minutes, a shell still drawing no prompt or a launch held for its account
+  pool included, an install that makes no progress for 45 minutes, or sooner where its launcher
+  gave up (`why=startup`, with the cause and, where known, the member in `attention=`: place the
+  next worker elsewhere), or 2 minutes at a screen
+  the harness could not handle (`why=held`).
 - `attention=`: something the harness could not settle, or a `NEEDS YOU:` line from the
   worker (`owner=needs`, raised immediately while the host keeps the worker going); inspect
   with `aterm ctl @<sid> text tail=40 trim`.

@@ -601,6 +601,7 @@ pub fn read(root: &Path, pid: u32, want_fds: bool, hz: u64) -> Option<ProcFacts>
             logical_writes: io.wchar,
             runnable_ns: sched.map(|(run, wait)| run.saturating_add(wait)),
             pageins: Some(stat.majflt),
+            peak_footprint: None,
         });
     }
     facts.wchan = read_text(&dir.join("wchan")).and_then(|w| parse_wchan(&w));

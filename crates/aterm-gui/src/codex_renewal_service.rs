@@ -117,6 +117,14 @@ pub(super) fn poll_cancellation(ctx: &crate::SessionCtx, id: &str) -> Result<boo
 }
 
 pub(super) fn observe_terminal(ctx: &crate::SessionCtx, id: &str) -> bool {
+    observe_terminal_by(ctx, id, &System(&ctx.native_policy, false))
+}
+
+pub(in crate::native_act) fn observe_terminal_by(
+    ctx: &crate::SessionCtx,
+    id: &str,
+    kernel: &dyn Kernel,
+) -> bool {
     let service = ctx
         .fenced_writes
         .native
@@ -131,6 +139,9 @@ pub(super) fn observe_terminal(ctx: &crate::SessionCtx, id: &str) -> bool {
         return false;
     };
     if root.phase != Phase::Committing {
+        if !settle_terminal_native(ctx, &service.seed, kernel) {
+            return false;
+        }
         if !cleanup_terminal_pool(ctx, &env, &root) {
             return false;
         }
@@ -161,6 +172,49 @@ pub(super) fn observe_terminal(ctx: &crate::SessionCtx, id: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Logical cancellation cannot discard pending native publication or its
+/// closing reservation. Settle every operation this service actually owns.
+pub(in crate::native_act) fn settle_terminal_native(
+    ctx: &crate::SessionCtx,
+    seed: &Seal,
+    kernel: &dyn Kernel,
+) -> bool {
+    super::super::reconcile_extinct_by(ctx, kernel);
+    let operations = {
+        let table = ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // A writer that captured authority can still be between reservation
+        // and publication. Retain its cleanup service until it exits that gap.
+        if table.renewal_seals.iter().any(|(id, seal)| {
+            Arc::ptr_eq(&seal.intent, &seed.intent) && table.reservations.contains(id)
+        }) {
+            return false;
+        }
+        table
+            .by_id
+            .values()
+            .filter(|operation| {
+                operation
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .authority
+                    .renewal
+                    .as_ref()
+                    .is_some_and(|seal| Arc::ptr_eq(&seal.intent, &seed.intent))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut settled = true;
+    for operation in operations {
+        settled &= super::super::preparation::settle_retired(ctx, operation, kernel);
+    }
+    settled
 }
 
 // Completion persistence can follow the restored process's first status call.
@@ -343,6 +397,32 @@ fn unstarted_completion(ctx: &crate::SessionCtx, root: &Receipt) -> Unstarted {
     Unstarted::Proven
 }
 
+/// A first-leg preparation can expire without ever signalling its live source.
+/// Close its logical root only after the native operation positively completed.
+pub(in crate::native_act) fn retire_unstarted(
+    ctx: &crate::SessionCtx,
+    env: &Env,
+    root: &Receipt,
+) -> bool {
+    if root.phase != Phase::Committing
+        || root.current_attempt.is_some()
+        || root.launch_attempted
+        || unstarted_completion(ctx, root) != Unstarted::Proven
+    {
+        return false;
+    }
+    renewal::with_receipt_writer(env, |_| {
+        if renewal::read_receipt(env, &root.id).as_ref() != Some(root) {
+            return Err("unstarted-root-changed");
+        }
+        let mut closed = root.clone();
+        closed.phase = Phase::Retired;
+        renewal::write_receipt(env, &closed)?;
+        Ok(true)
+    })
+    .is_ok_and(|closed| closed == Some(true))
+}
+
 fn retire_pins(ctx: &crate::SessionCtx, intent: &Arc<IntentFence>) {
     let operations = ctx
         .fenced_writes
@@ -454,6 +534,10 @@ fn run_closed(
             // This invokes production reconciliation through the same private
             // protocol. Missing/stale files never establish a closed witness.
             renewal::reconcile_restart(opts, &root.sid, &prepare);
+            if retire_unstarted(&ctx, &env, &root) {
+                drop(ctx);
+                continue;
+            }
             let _attempt = append_child(
                 &ctx,
                 &service,

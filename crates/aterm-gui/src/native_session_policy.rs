@@ -2,14 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! One session's catalog and native constructor policy. Production uses the shipping
-//! roster and disables generic constructors. The sealed Codex renewal service is limited
-//! to its qualified host target; only an explicit debug Rust factory supplies fixtures.
+//! roster and disables generic constructors. Sealed cold relaunch and Codex renewal are
+//! limited to Apple Silicon macOS; only an explicit debug Rust factory supplies fixtures.
 
 use aterm_agent::harness::contract::{self, Row, Words};
 #[cfg(all(unix, any(test, debug_assertions)))]
 use aterm_agent::harness::native_act::Process;
 use aterm_agent::harness::native_act::{Constructor, Image};
 use aterm_agent::supervise::SupervisorConfig;
+
+pub(crate) const fn cold_restart_qualified() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+}
 
 #[derive(Default)]
 pub(crate) struct SessionPolicy {
@@ -40,7 +44,7 @@ impl SessionPolicy {
             .append(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(root.join("native-signal-effects.jsonl"))
             .expect("fixture actual signal effect trace");
         let mut bytes = aterm_json::to_vec(&event).expect("fixture actual signal effect encoding");
@@ -65,7 +69,7 @@ impl SessionPolicy {
             .append(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(root.join("renewal-control-trace.jsonl"))
             .expect("fixture completed control trace");
         let mut bytes = aterm_json::to_vec(event).expect("fixture completed trace encoding");
@@ -100,8 +104,9 @@ impl SessionPolicy {
         if let Some(fixture) = &self.fixture {
             return fixture.constructors.enabled(kind);
         }
-        let _ = kind;
-        false
+        // ColdRestart still requires the built-in Relaunch authority, a captured cold
+        // intent, no renewal/rollback, and owned-helper resolution before any exec grant.
+        matches!(kind, Constructor::ColdRestart) && cold_restart_qualified()
     }
 
     /// Qualification gate for the sealed same-account service. Generic native
@@ -265,6 +270,7 @@ impl FixtureConstructors {
         match kind {
             Constructor::OwnImage => 1,
             Constructor::PrivateRestart => 2,
+            Constructor::ColdRestart => 4,
         }
     }
 

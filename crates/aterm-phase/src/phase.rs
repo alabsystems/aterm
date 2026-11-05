@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 11, "0.11");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 12, "0.12");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,15 +214,12 @@ pub fn busy_signal(rows: &[String]) -> Option<Busy> {
     let block = status_block(rows, frame.top);
     let line = block.line(rows);
     let status = line.as_deref();
-    let under = &rows[block.from..frame.top];
     let footer = &rows[frame.bottom + 1..];
     status
         .and_then(status_busy)
         .map(|rule| Busy::hard(Zone::Status, rule))
         .or_else(|| {
-            under
-                .iter()
-                .any(|r| r.contains("Still working"))
+            still_working(rows, block.from, frame.top)
                 .then(|| Busy::hard(Zone::Hint, "Still working"))
         })
         .or_else(|| {
@@ -280,16 +277,17 @@ fn carried_row(rows: &[String], top: usize) -> Option<usize> {
     let width = crate::question::screen_width(rows);
     let i = glyph_above(rows, top)?;
     let end = status_line_end(rows, i, top, width).unwrap_or(i);
-    let text = status_text(&rows[i..=end]);
+    let text = status_words(rows, i, end);
     (status_busy(&text).is_some_and(|rule| WAITING.contains(&rule))
-        && !waited_out(&text, &rows[end + 1..top]))
+        && !waited_out(&text, rows, end + 1, top))
     .then_some(i)
 }
 
 /// WHETHER EVERY DYNAMIC WORKFLOW A CARRIED WAIT NAMES ENDED UNDER IT: the waiting row's words
 /// `text` name dynamic workflows and nothing else (`Waiting for N dynamic workflow(s) to
-/// finish`), and the rows drawn between it and the composer, `below`, hold a `⏺ Dynamic workflow
-/// "…" completed` row for each of them and for each workflow launched there (`⏺ Workflow(…)`).
+/// finish`), and the rows drawn between it and the composer, `rows[from..until]`, hold a
+/// `⏺ Dynamic workflow "…" completed` row for each of them and for each workflow launched there
+/// (`⏺ Workflow(…)`), its words read up to the side panel's rule ([`wrapped_item`]).
 /// That row is the wake a workflow's end opens a turn with, measured on 2.1.304
 /// (`claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`, and the walled wake of
 /// `idle-after-limit-and-model-switch.txt`), each followed there by a done row; where no done row
@@ -302,13 +300,13 @@ fn carried_row(rows: &[String], top: usize) -> Option<usize> {
 /// background agent to finish` while the one agent counted still runs
 /// (`claude-2.1.304-agents-panel-long-bash-4m57s-120col.txt`). No completion row of other work is
 /// measured.
-fn waited_out(text: &str, below: &[String]) -> bool {
+fn waited_out(text: &str, rows: &[String], from: usize, until: usize) -> bool {
     let Some(waited) = workflows_waited(text) else {
         return false;
     };
     let mut ended = 0usize;
     let mut launched = 0usize;
-    for (i, row) in below.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate().take(until).skip(from) {
         let Some(said) = row.strip_prefix('⏺').or_else(|| row.strip_prefix('●')) else {
             continue;
         };
@@ -316,7 +314,7 @@ fn waited_out(text: &str, below: &[String]) -> bool {
         if said.starts_with("Workflow(") {
             launched += 1;
         } else if said.starts_with("Dynamic workflow \"")
-            && wrapped_item(&below[i..]).contains("\" completed")
+            && wrapped_item(rows, i, until).contains("\" completed")
         {
             ended += 1;
         }
@@ -334,14 +332,20 @@ fn workflows_waited(text: &str) -> Option<usize> {
     .then_some(n)
 }
 
-/// A transcript item's words, its first row `rows[0]` joined with the indented rows its text
-/// wrapped onto, up to the first blank row.
-fn wrapped_item(rows: &[String]) -> String {
-    let mut item = rows.first().cloned().unwrap_or_default();
-    for row in rows
+/// A transcript item's words, its first row `rows[first]` joined with the rows its text wrapped
+/// onto: each row under it, short of row `until`, up to a blank row or one that opens a block of
+/// its own ([`opens_block`]: a `⏺` or `⎿` row, a glyph row, a rule), each cut at the side panel's
+/// rule beside the item's first row ([`panel_cut`]), so the panel's text is no word of the item
+/// and a row blank up to the rule ends it. Claude Code wraps a long `⏺ Dynamic workflow "…"
+/// completed` row at column 0, not at its text's column (measured on 2.1.302 at 175 columns,
+/// `claude-2.1.302-login-handoff-over-weekly-limit.txt`: `pushed)" completed · 2h 1m 12s`).
+fn wrapped_item(rows: &[String], first: usize, until: usize) -> String {
+    let rule = panel_rule(rows, first, first);
+    let mut item = panel_cut(&rows[first], rule).to_string();
+    for row in rows[first + 1..until]
         .iter()
-        .skip(1)
-        .take_while(|r| r.starts_with(' ') && !crate::text::trim(r).is_empty())
+        .map(|r| panel_cut(r, rule))
+        .take_while(|r| !crate::text::trim(r).is_empty() && !opens_block(r))
     {
         item.push(' ');
         item.push_str(crate::text::trim(row));
@@ -391,30 +395,39 @@ fn left_running(row: &str) -> bool {
     })
 }
 
-/// A done row's ` · ` items after the first, read up to the side panel's rule: Claude Code 2.1.310
-/// and later pad each row of the live zone out to a `│` and draw the panel's own text after it
-/// (`claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt`), and no done row's own
-/// words hold one.
+/// A done row's ` · ` items after the first, `row` a status line ([`StatusBlock::line`]), which
+/// ends at the side panel's rule ([`status_words`]).
 fn done_items(row: &str) -> impl Iterator<Item = &str> {
-    row.split_once('│')
-        .map_or(row, |(live, _)| live)
-        .split(" · ")
-        .skip(1)
+    row.split(" · ").skip(1)
 }
 
-/// A footer row whose pill counts background work under any label.
+/// A footer row whose pill counts background work under any label: some item ([`row_items`])
+/// counts work ([`work_count`]).
 fn counts_work(row: &str) -> bool {
+    row_items(row).any(work_count)
+}
+
+/// An item ([`row_items`]) that counts background work under any label: a count ([`counted`])
+/// whose label's last word is a kind of work, whatever words qualify it (`1 MCP task`, `1 Artifact
+/// comment monitor`, `◇ 1 cloud session`, `2 background tasks`, `1 shell`).
+fn work_count(item: &str) -> bool {
     const WORK: [&str; 7] = [
         "shell", "monitor", "task", "agent", "workflow", "session", "team",
     ];
-    row_items(row).any(|item| {
-        let digits = item.chars().take_while(char::is_ascii_digit).count();
-        digits > 0
-            && item[digits..]
-                .strip_prefix(' ')
-                .and_then(|label| label.rsplit(' ').next())
-                .is_some_and(|noun| WORK.contains(&noun.strip_suffix('s').unwrap_or(noun)))
+    counted(item).is_some_and(|(_, label)| {
+        label
+            .rsplit(' ')
+            .next()
+            .is_some_and(|noun| WORK.contains(&singular(noun)))
     })
+}
+
+/// An item ([`row_items`], or a part of a done row's label) that counts the work the process
+/// table names: `N shell(s)` or `N monitor(s)` with no word qualifying it ([`item_count`]).
+fn process_count(item: &str) -> bool {
+    item_count(item, "shell")
+        .or_else(|| item_count(item, "monitor"))
+        .is_some()
 }
 
 /// The rules of [`busy_signal`] that are the agent's own background work with its turn over (a dynamic workflow, a background agent or other task it waits for, a shell or a monitor it left running, a workflow's progress line), never a live turn's (a spinner, `esc to interrupt`, `Still working`, a foreground command's `ctrl+b to run in background`).
@@ -549,15 +562,15 @@ fn asked_in_prose(rows: &[String]) -> bool {
     })
 }
 
-/// How many background shells Claude Code's screen counts.
+/// How many background shells Claude Code's screen counts, on its status line
+/// ([`StatusBlock::line`]) or a footer row.
 #[must_use]
 pub fn shells_running(rows: &[String]) -> Option<u32> {
     let frame = composer_frame(rows)?;
-    let status = status_block(rows, frame.top)
-        .status
-        .map(|i| rows[i].as_str());
+    let line = status_block(rows, frame.top).line(rows);
     let footer = &rows[frame.bottom + 1..];
-    let counted = status
+    let counted = line
+        .as_deref()
         .into_iter()
         .chain(footer.iter().map(String::as_str))
         .flat_map(row_items)
@@ -571,7 +584,7 @@ pub fn shells_running(rows: &[String]) -> Option<u32> {
 /// `claude-2.1.283-wall-session-wrapup-waiting-measured.txt`; `· 13 shells, 3 monitors` on
 /// 2.1.316, `claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt`), each trimmed and
 /// without the `·` of a row that opens or ends on one or its leading `◇ `. The one item reader
-/// of [`footer_count`], [`shells_running`] and [`counts_work`].
+/// of [`footer_count`], [`shells_running`], [`counts_work`] and [`footer_work`].
 fn row_items(row: &str) -> impl Iterator<Item = &str> {
     row.split(" · ")
         .flat_map(|item| item.split("   "))
@@ -584,17 +597,40 @@ fn row_items(row: &str) -> impl Iterator<Item = &str> {
         })
 }
 
-/// The count one item ([`row_items`]) names of `noun`: `N <noun>` or `N <noun>s`, alone or
-/// followed by ` still running`.
-fn item_count(item: &str, noun: &str) -> Option<u32> {
+/// THE COUNT ONE ITEM NAMES ([`row_items`], or a part of a done row's label): `N <label>`, alone
+/// or followed by ` still running`, `N` ASCII digits that fit a `u32`, with `label` the words
+/// after it. The one reading of a count that [`item_count`] (and through it [`process_count`])
+/// and [`work_count`] share.
+fn counted(item: &str) -> Option<(u32, &str)> {
     let item = item.strip_suffix(" still running").unwrap_or(item);
-    let (count, named) = item.split_once(' ')?;
-    if named.strip_suffix('s').unwrap_or(named) != noun
-        || !count.bytes().all(|b| b.is_ascii_digit())
-    {
+    let (count, label) = item.split_once(' ')?;
+    if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    count.parse().ok()
+    Some((count.parse().ok()?, label))
+}
+
+/// `noun` without a plural `s`.
+fn singular(noun: &str) -> &str {
+    noun.strip_suffix('s').unwrap_or(noun)
+}
+
+/// The count one item ([`row_items`], or a part of a done row's label) names of `noun`: `N
+/// <noun>` or `N <noun>s` ([`counted`]), the noun alone, with no word qualifying it.
+fn item_count(item: &str, noun: &str) -> Option<u32> {
+    counted(item)
+        .filter(|&(_, label)| singular(label) == noun)
+        .map(|(n, _)| n)
+}
+
+/// CLAUDE CODE'S `Still working` HINT, A LIVE TURN'S: some row between the status block and the
+/// composer's top rule, rows `from..top`, where Claude Code draws its right-aligned hints, says
+/// `Still working` up to the side panel's rule beside it ([`row_words`]), so text the panel draws
+/// there is none, but for a row no row beside draws the rule at ([`panel_cut`]: the one row of a
+/// live zone at the screen's top), read whole and so busy by the panel's words too. The one
+/// reader of that hint, [`busy_signal`]'s and [`no_live_turn`]'s.
+fn still_working(rows: &[String], from: usize, top: usize) -> bool {
+    (from..top).any(|i| row_words(rows, i).contains("Still working"))
 }
 
 /// No signal of a live turn on the screen.
@@ -609,9 +645,7 @@ fn no_live_turn(rows: &[String]) -> bool {
         .as_deref()
         .and_then(status_busy)
         .is_some_and(live);
-    let hint = rows[block.from..frame.top]
-        .iter()
-        .any(|r| r.contains("Still working"));
+    let hint = still_working(rows, block.from, frame.top);
     let footer = rows[frame.bottom + 1..]
         .iter()
         .any(|r| footer_busy(r).is_some_and(live));
@@ -632,9 +666,10 @@ pub fn background_wait(rows: &[String]) -> Option<&'static str> {
 /// The [`BACKGROUND_RULES`] of work Claude Code runs in its own process (a dynamic workflow, a
 /// background agent, other work it waits for), which its status row names only while that work
 /// is pending: `Waiting for …`, the wait it carries above its own wake ([`carried_wait`]) and a
-/// done row's `… still running`. A footer's progress row or count is not one: measured on
-/// 2.1.304, a workflow's progress row stays drawn at its full bar after the workflow ended
-/// (`claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`).
+/// done row's `… still running`. No footer rule is one: a workflow's progress row stays drawn at
+/// its full bar after the workflow ended (measured on 2.1.304,
+/// `claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`), and the work the footer's pill
+/// counts is read beside it where a restart would end it ([`unlisted_work`], [`work_running`]).
 pub const IN_PROCESS_RULES: [&str; 4] = [
     "waiting for a dynamic workflow",
     "waiting for a background agent",
@@ -670,19 +705,61 @@ pub fn in_process_work(rows: &[String]) -> Option<&'static str> {
 }
 
 /// THE AGENT'S OWN WORK RUNNING UNDER A TURN'S END THAT A RESTART IN PLACE WOULD END, AS CLAUDE
-/// CODE'S SCREEN NAMES IT: the work it runs in its own process ([`in_process_work`]: its `Waiting
-/// for …`, the wait it carries above its own wake until the workflows it waits for completed
-/// under it, a done row's `… still running` naming more than shells and monitors), which no
-/// process row names, else a shell or a monitor the turn left running, which the process table
-/// names too ([`shell_or_monitor_left`], read wherever the screen names one). Never a footer's workflow progress row or count alone: measured on 2.1.304, a
-/// workflow's progress row stays drawn at its full bar after the workflow ended
+/// CODE'S SCREEN NAMES IT, in [`busy_signal`]'s words: the work it runs in its own process
+/// ([`in_process_work`]: its `Waiting for …`, the wait it carries above its own wake until the
+/// workflows it waits for completed under it, a done row's `… still running` naming more than
+/// shells and monitors), which no process row names; else a shell or a monitor the turn left
+/// running, which the process table names too ([`shell_or_monitor_left`], read wherever the screen
+/// names one); else any other work the footer's pill counts, which no process row names either
+/// ([`footer_work`]: `1 MCP task`, `2 background tasks`, `◇ 1 cloud session`, `1 Artifact
+/// comment monitor`, as `background work running`). The first and the last together are
+/// [`unlisted_work`], which a reader of the process table (the upgrade's) reads beside that
+/// table. Never a footer's workflow progress row alone: measured on 2.1.304, a workflow's progress
+/// row stays drawn at its full bar after the workflow ended
 /// (`claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`), so a restart held on it would
 /// be held for as long as the row stays drawn, while a workflow still running is named by its
 /// status row's `Waiting for …`. `None` with no composer frame or a message submitted under the
 /// status row ([`background_wait`]'s bounds).
 #[must_use]
 pub fn work_running(rows: &[String]) -> Option<&'static str> {
-    in_process_work(rows).or_else(|| shell_or_monitor_left(rows))
+    in_process_work(rows)
+        .or_else(|| shell_or_monitor_left(rows))
+        .or_else(|| footer_work(rows))
+}
+
+/// THE AGENT'S OWN WORK RUNNING UNDER A TURN'S END THAT NO PROCESS ROW NAMES, AS CLAUDE CODE'S
+/// SCREEN NAMES IT, in [`busy_signal`]'s words: the work it runs in its own process
+/// ([`in_process_work`]: its `Waiting for …`, the wait it carries above its own wake until the
+/// workflows it waits for completed under it, a done row's `… still running` naming more than
+/// shells and monitors); else any work the footer's pill counts that is no shell or monitor
+/// counted alone ([`footer_work`]: `1 MCP task`, `2 background tasks`, `◇ 1 cloud session`, `1
+/// Artifact comment monitor`): [`work_running`] without the shells and monitors the turn left,
+/// which the process table names too, so a reader of that table (the upgrade's) reads this and
+/// the table and never a shell or a monitor off the screen. `None` with no composer frame or a
+/// message submitted under the status row ([`background_wait`]'s bounds).
+#[must_use]
+pub fn unlisted_work(rows: &[String]) -> Option<&'static str> {
+    in_process_work(rows).or_else(|| footer_work(rows))
+}
+
+/// THE WORK THE FOOTER'S PILL COUNTS THAT NO PROCESS ROW NAMES: some item counts work
+/// ([`work_count`]) and is no shell or monitor counted alone ([`process_count`]), as
+/// [`busy_signal`]'s footer rule for it names it, `background work running`, with
+/// [`background_wait`]'s bounds. The pill is a count of what runs now, redrawn as it changes (`·
+/// 10 shells, 1 monitor`, then `· 13 shells, 3 monitors` 17 minutes later in 2.1.316's
+/// captures), and with no done row drawn (`showTurnDuration` off) or one that names none of its
+/// work, the one place the screen names that work. A cloud session runs elsewhere, and whether a
+/// restart in place ends it or its wake was not established, so it holds a restart as the rest do
+/// (fail closed).
+fn footer_work(rows: &[String]) -> Option<&'static str> {
+    let frame = composer_frame(rows)?;
+    let unlisted = |item: &str| work_count(item) && !process_count(item);
+    (!turn_just_begun(rows)
+        && rows[frame.bottom + 1..]
+            .iter()
+            .flat_map(|r| row_items(r))
+            .any(unlisted))
+    .then_some("background work running")
 }
 
 /// A SHELL OR A MONITOR THE TURN LEFT RUNNING, read off each place the screen names one, in
@@ -719,23 +796,18 @@ fn shell_or_monitor_left(rows: &[String]) -> Option<&'static str> {
 
 /// A done row that says work other than shells and monitors (the process table's) is `still
 /// running`: some ` · ` item's label ([`done_items`]) is more than `N shell(s)` and `N
-/// monitor(s)` parts.
+/// monitor(s)` parts ([`process_count`]), a qualified monitor (`1 Artifact comment monitor`)
+/// among the rest.
 fn left_in_process(row: &str) -> bool {
-    let process_work = |part: &str| {
-        crate::text::trim(part)
-            .split_once(' ')
-            .is_some_and(|(count, noun)| {
-                !count.is_empty()
-                    && count.bytes().all(|b| b.is_ascii_digit())
-                    && matches!(noun, "shell" | "shells" | "monitor" | "monitors")
-            })
-    };
     done_items(row).any(|item| {
         crate::text::trim_end(item)
             .strip_suffix(" still running")
             .is_some_and(|label| {
                 let label = crate::text::trim(label);
-                !label.is_empty() && !label.split(", ").all(process_work)
+                !label.is_empty()
+                    && !label
+                        .split(", ")
+                        .all(|part| process_count(crate::text::trim(part)))
             })
     })
 }
@@ -1023,25 +1095,27 @@ pub struct ApiRetryRow {
     /// flight is the retry after it, which the row does not time. `None` where the row cut the
     /// count, and for every other class.
     pub failed_wait_s: Option<u64>,
-    /// The row's text past its spinner glyph.
+    /// The row's text past its spinner glyph, up to the side panel's rule ([`panel_cut`]).
     pub text: String,
     /// A `key if=` guard that matches this row while it stands, whatever glyph its spinner shows:
     /// the glyph's column, then, where the row counts down, the lead and the retry clause's words
     /// as literals and nothing after them (the countdown and the attempt move), and for a
-    /// no-response row, which does not move while its retry waits, its whole text to the end, so
-    /// a press never lands on the row of a later try.
+    /// no-response row, which does not move while its retry waits, its whole text to the end of
+    /// the row or to the side panel's rule, whatever the panel draws after it, so a press never
+    /// lands on the row of a later try, and holds the row beside the panel and with none alike.
     pub guard: String,
 }
 
 /// Claude Code's live API-retry status row, where it names a network or no-response class
-/// ([`RetryCause`]) and sits on one row directly above the composer's frame; `None` for every
-/// other status row, a retry row of another class, or one wrapped across rows.
+/// ([`RetryCause`]) and sits on one row directly above the composer's frame, read up to the side
+/// panel's rule beside it ([`panel_cut`]); `None` for every other status row, a retry row of
+/// another class, or one wrapped across rows.
 #[must_use]
 pub fn api_retry_row(rows: &[String]) -> Option<ApiRetryRow> {
     let frame = composer_frame(rows)?;
     let block = status_block(rows, frame.top);
     let at = block.status.filter(|&i| block.end == i)?;
-    let row = rows[at].as_str();
+    let row = row_words(rows, at);
     if !is_activity_row(row) {
         return None;
     }
@@ -1083,9 +1157,10 @@ pub fn api_retry_row(rows: &[String]) -> Option<ApiRetryRow> {
         RetryCause::Unreachable | RetryCause::Stalled => None,
     };
     // A countdown row moves every second past its retry clause's words; a no-response row
-    // stands as drawn while its retry waits, so the guard holds all of it.
+    // stands as drawn while its retry waits, so the guard holds all of it, up to the side
+    // panel's rule where the panel is drawn beside it.
     let (fixed, end) = match cause {
-        RetryCause::NoResponse => (text.to_string(), "\\s*$"),
+        RetryCause::NoResponse => (text.to_string(), "\\s*(?:│.*)?$"),
         RetryCause::Unreachable | RetryCause::Stalled => (format!("{lead} · {clause}"), ""),
     };
     let literal: String = fixed
@@ -1390,13 +1465,171 @@ pub(crate) struct StatusBlock {
 }
 
 impl StatusBlock {
-    /// The status row's text, its line read across the rows Ink wrapped it onto, joined with one space ([`crate::wrap::rejoined`]).
+    /// The status row's text, its line read across the rows Ink wrapped it onto, joined with one space ([`crate::wrap::rejoined`]), up to the side panel's rule ([`status_words`]).
     pub(crate) fn line<'a>(&self, rows: &'a [String]) -> Option<Cow<'a, str>> {
-        let status = self.status?;
-        Some(if self.end > status {
-            Cow::Owned(status_text(&rows[status..=self.end]))
-        } else {
-            Cow::Borrowed(rows[status].as_str())
+        Some(status_words(rows, self.status?, self.end))
+    }
+}
+
+/// THE WORDS OF A STATUS LINE drawn on rows `first..=end` (rejoined by [`status_text`] where Ink
+/// wrapped it), each of its rows cut at the side panel's rule beside the line ([`panel_cut`]).
+/// [`StatusBlock::line`] and the wait Claude Code carries ([`carried_row`]) read their lines here,
+/// and every reader of those lines reads these words.
+fn status_words(rows: &[String], first: usize, end: usize) -> Cow<'_, str> {
+    let rule = panel_rule(rows, first, end);
+    if end == first {
+        return Cow::Borrowed(panel_cut(&rows[first], rule));
+    }
+    if rule.is_none() {
+        return Cow::Owned(status_text(&rows[first..=end]));
+    }
+    let cut: Vec<String> = rows[first..=end]
+        .iter()
+        .map(|row| panel_cut(row, rule).to_string())
+        .collect();
+    Cow::Owned(status_text(&cut))
+}
+
+/// ONE ROW OF A BLOCK THE SIDE PANEL IS DRAWN BESIDE, CUT AT THE PANEL'S RULE: `rule` is the
+/// rule's cell column beside the block ([`panel_rule`]), and the row's words are those before the
+/// `│` it draws at that column, the padding before it trimmed; with no rule beside the block, or
+/// none drawn at that column, the row whole, so a `│` of its own words is one of them. THE ONE
+/// CUT OF THE PANEL OFF THE ROWS IT IS DRAWN BESIDE: a status line ([`status_words`]) and the rows
+/// it is wrapped onto ([`status_line_end`]), the status row ([`status_row`]) and the API retry row
+/// ([`api_retry_row`]), a hint row ([`still_working`]), a transcript item's rows
+/// ([`wrapped_item`]) and the transcript its readers read ([`Transcript`]: what the agent last
+/// said, the person's stop, where it ends, the rows an idle compaction drew, the notice a turn
+/// ended on, the walks up to a usage limit, a hint over the composer, the cards parked over it) are
+/// read through it, so beside a rule
+/// [`panel_rule`] finds the panel's text is none of the agent's words and a row blank up to the
+/// rule is a blank row. A block no row beside draws the rule at is read whole, the panel's text
+/// with it: the one row of a live zone at the screen's top, over the composer's top rule, which
+/// the panel is not drawn across (no capture draws the panel beside such a row).
+pub(crate) fn panel_cut(row: &str, rule: Option<usize>) -> &str {
+    let Some(rule) = rule else {
+        return row;
+    };
+    rule_cells(row)
+        .find(|&(cell, _)| cell == rule)
+        .map_or(row, |(_, at)| crate::text::trim_end(&row[..at]))
+}
+
+/// Row `i` cut at the side panel's rule beside it ([`panel_cut`], the rule [`panel_rule`] reads
+/// beside that row alone).
+fn row_words(rows: &[String], i: usize) -> &str {
+    panel_cut(&rows[i], panel_rule(rows, i, i))
+}
+
+/// THE SIDE PANEL'S RULE BESIDE A BLOCK drawn on rows `first..=end` (a status line, or one row),
+/// as the cell column ([`crate::question::cells`]) of a `│` its first row draws where a row
+/// beside the block, the one above it or the one under it, draws a `│` too. With that panel open,
+/// Claude Code 2.1.310 and later pad each row it is drawn beside out to the panel's rule and draw
+/// the panel's own text after it, so the rows above and under a row draw the rule at its column
+/// (`claude-2.1.310-waiting-3-workflows-turn-over-panel.txt`,
+/// `claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt`,
+/// `claude-2.1.316-inferring-over-shells-and-agents-panel.txt`: every row from the screen's top
+/// down to the composer's top rule, the transcript's and the live zone's), while a `│` the
+/// block's own words hold (the spinner row draws an in-progress todo's words, the model's) has
+/// none beside it at its column. `None`: no panel's rule beside the block.
+pub(crate) fn panel_rule(rows: &[String], first: usize, end: usize) -> Option<usize> {
+    let beside = |cell: usize| {
+        [first.checked_sub(1), end.checked_add(1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|i| rows.get(i))
+            .any(|row| rule_cells(row).any(|(at, _)| at == cell))
+    };
+    rule_cells(&rows[first])
+        .map(|(cell, _)| cell)
+        .find(|&cell| beside(cell))
+}
+
+/// Each `│` `row` draws in a cell of its own, as its cell column (the grid's layout of the row,
+/// [`crate::question::Columns`]) and its byte offset.
+fn rule_cells(row: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut columns = crate::question::Columns::default();
+    let drawn = row.rfind('│').map_or(0, |last| last + '│'.len_utf8());
+    row[..drawn].char_indices().filter_map(move |(at, c)| {
+        let cell = columns.column();
+        (columns.step(c) && c == '│').then_some((cell, at))
+    })
+}
+
+/// THE TRANSCRIPT AS ITS READERS READ IT BESIDE THE SIDE PANEL: the screen with each row above
+/// the composer's top rule cut at the panel's rule ([`panel_cut`]), the rule [`panel_rule`] finds
+/// beside the live zone's last row, the one over that top rule, and the room those rows are laid
+/// out in ([`Transcript::room`]). Claude Code 2.1.310 and later draw the panel beside every row
+/// from the screen's top down to the composer's top rule and beside none of the composer's rows or
+/// the rows under it (each measured panel capture, `panel_rule`'s), so the rule beside that last
+/// row is the rule of every row above it, and a `│` standing anywhere else (a table's, a box's)
+/// is none of the panel's. Every reader of what the agent last said ([`last_said_index`],
+/// [`last_said_row`] and so [`asked_in_prose`], [`last_said_line`], the `said_*` and `turn_*`
+/// readers of [`crate::turn`], the idle compaction's walk, [`crate::wall::login_restored`]), of
+/// the person's stop ([`crate::turn::interrupted`]: an Esc, a declined question), of where the
+/// transcript ends over a composer with no status line ([`transcript_end`]), of the notice the
+/// turn ended on ([`notice`], and so [`limit_notice`] and [`crate::wall::wall`],
+/// with the turn's own notice that names a generic banner, [`crate::wall::named_by_the_turn`], and
+/// [`last_said_notice`]), the walks up to the newest usage limit and what was said under it
+/// ([`crate::wall::since_limit`], [`crate::wall::auto_continue_end`], [`crate::wall::left_wall`],
+/// [`crate::wall::limit_words_above`]) and of a right-edge hint over the composer
+/// ([`crate::turn::goal_active`], [`crate::wall::memory_wall`], [`crate::wall::login_expires_in`],
+/// [`crate::credits::in_use`] and [`crate::credits::usage_warning`], each against the rule's room)
+/// and of the cards parked over the composer ([`crate::survey::parked_span`], which the status
+/// walk, [`transcript_end`] and the last-said walk step over, and [`crate::survey::survey_block`],
+/// which [`survey_open`] reads, each against the rule's room) reads the transcript's rows here;
+/// with no composer frame, or no rule beside that row, the screen is read whole.
+pub(crate) struct Transcript<'a> {
+    /// The screen's rows, each above the composer's top rule cut at the rule, the rest whole.
+    pub(crate) rows: Cow<'a, [String]>,
+    /// The rule's cell column, `None` with no panel drawn.
+    rule: Option<usize>,
+}
+
+impl<'a> Transcript<'a> {
+    /// The transcript of `rows`.
+    pub(crate) fn of(rows: &'a [String]) -> Self {
+        let rule = composer_frame(rows).and_then(|frame| {
+            let last = frame.top.checked_sub(1)?;
+            panel_rule(rows, last, last).map(|rule| (frame.top, rule))
+        });
+        let Some((top, rule)) = rule else {
+            return Self {
+                rows: Cow::Borrowed(rows),
+                rule: None,
+            };
+        };
+        let rows = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                if i < top {
+                    panel_cut(row, Some(rule)).to_string()
+                } else {
+                    row.clone()
+                }
+            })
+            .collect();
+        Self {
+            rows: Cow::Owned(rows),
+            rule: Some(rule),
+        }
+    }
+
+    /// The cells the rows above the composer are laid out in: beside the panel, the rule's
+    /// column, as wide as Claude Code lays those rows out and wraps them (the measured 2.1.316
+    /// captures wrap the transcript's prose at the rule; [`status_line_end`] reads a status line
+    /// so), and the right edge its hints there stand against; with no panel, `width`, the
+    /// composer's or the screen's, as the reader measures it.
+    pub(crate) fn room(&self, width: usize) -> usize {
+        self.rule.unwrap_or(width)
+    }
+
+    /// How many cells short of the screen's widest row ([`crate::question::screen_width`]) the
+    /// rows above the composer end, [`crate::wrap::said_lines`]'s margin: beside the panel, the
+    /// cells from its rule to that edge; with none, none.
+    pub(crate) fn margin(&self) -> usize {
+        self.rule.map_or(0, |rule| {
+            crate::question::screen_width(&self.rows).saturating_sub(rule)
         })
     }
 }
@@ -1430,8 +1663,28 @@ pub(crate) fn status_block(rows: &[String], top: usize) -> StatusBlock {
     }
 }
 
-/// The status row's line, wrapped in a narrow pane.
+/// The last row of the status line row `i` opens, short of row `until`, in a pane `width` cells
+/// wide ([`line_end_in`]). Beside the side panel the line is read on its rows cut at the panel's
+/// rule ([`panel_cut`]) in a pane as wide as the rule's column: Claude Code lays the rows it
+/// draws beside the panel out that wide and wraps them there (the measured 2.1.316 captures wrap
+/// the transcript's prose and the spinner's tip at the rule), and the wrap readers take no row
+/// that draws the rule.
 fn status_line_end(rows: &[String], i: usize, until: usize, width: usize) -> Option<usize> {
+    if !crate::text::trim(&rows[i]).starts_with(is_spinner_glyph) {
+        return None;
+    }
+    let Some(rule) = panel_rule(rows, i, i) else {
+        return line_end_in(rows, i, until, width);
+    };
+    let cut: Vec<String> = rows[i..until.max(i + 1)]
+        .iter()
+        .map(|row| panel_cut(row, Some(rule)).to_string())
+        .collect();
+    line_end_in(&cut, 0, cut.len(), rule).map(|end| i + end)
+}
+
+/// The status row's line, wrapped in a narrow pane.
+fn line_end_in(rows: &[String], i: usize, until: usize, width: usize) -> Option<usize> {
     let row = rows[i].as_str();
     let t = crate::text::trim(row);
     let mut cs = t.chars();
@@ -1723,12 +1976,13 @@ fn context_reading(t: &str) -> Option<u8> {
     digits.parse::<u8>().ok().filter(|&n| n <= 100)
 }
 
-/// The status row: walking up from the composer's top rule.
+/// The status row, walking up from the composer's top rule: the first row of its line, cut at the
+/// side panel's rule beside the line as the line is ([`panel_cut`]).
 pub fn status_row(rows: &[String]) -> Option<&str> {
     let frame = composer_frame(rows)?;
-    status_block(rows, frame.top)
-        .status
-        .map(|i| rows[i].as_str())
+    let block = status_block(rows, frame.top);
+    let i = block.status?;
+    Some(panel_cut(&rows[i], panel_rule(rows, i, block.end)))
 }
 
 /// The status row's line ([`status_row`]).
@@ -2012,27 +2266,29 @@ pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
 /// suggestion), the cursor stands after the query on the search's row, keys type into the query, and
 /// Enter sends the match. In a narrow window the label wraps in its own column beside the query
 /// ([`search_label_at`]), each row at the label's indent: by whole words at 60 and 44 columns
-/// (`search` / `prompts:`, `no matching` / `prompt:`) and at 34 (`no` / `matching` / `prompt:`), and
-/// within its words at 26 (`searc` / `h pro` / `mpts:`) and 22 (`sear` / `ch` / `prom` / `pts:`)
-/// (`claude-2.1.318-history-search{,-no-match}-{60,44,26}col`, `-no-match-34col`, `-22col`). Only
-/// the footer is read: a person's draft is drawn between the rules (a row after its first indented,
-/// so never a rule), and the transcript above them.
+/// (`search` / `prompts:`, `no matching` / `prompt:`) and at 34 (`no` / `matching` / `prompt:`),
+/// within its words at 26 (`searc` / `h pro` / `mpts:`) and 22 (`sear` / `ch` / `prom` / `pts:`),
+/// and, its column two cells wide at 14 and 12, with the space between two of its words a blank row
+/// of its own (`se` / `ar` / `ch` / blank / `pr` / `om` / `pt` / `s:`, `no` / blank / `ma` / …), which
+/// ends no footer the label goes on under
+/// (`claude-2.1.318-history-search{,-no-match}-{60,44,26,12}col`, `-no-match-{34,22,14}col`,
+/// `-14col`, `-narrow-14col`). Only the footer is read: a person's draft is drawn between the rules
+/// (a row after its first indented, so never a rule), and the transcript above them.
 #[must_use]
 pub fn history_search(rows: &[String]) -> bool {
     composer_frame(rows).is_some_and(|f| {
-        let footer: Vec<&str> = rows
+        let under: Vec<&str> = rows.iter().skip(f.bottom + 1).map(String::as_str).collect();
+        let footer = under
             .iter()
-            .skip(f.bottom + 1)
             .take_while(|row| !row.trim().is_empty())
-            .map(String::as_str)
-            .collect();
-        (0..footer.len()).any(|at| {
+            .count();
+        (0..footer).any(|at| {
             [
                 crate::anchor!("history.search"),
                 crate::anchor!("history.no_match"),
             ]
             .into_iter()
-            .any(|label| search_label_at(&footer[at..], label))
+            .any(|label| search_label_at(&under[at..], label))
         })
     })
 }
@@ -2040,23 +2296,47 @@ pub fn history_search(rows: &[String]) -> bool {
 /// Whether the search's `label` is spelled from `rows[0]` on: its letters, the spaces between its
 /// words aside, are the leading words of `rows[0]` and of each row after it at the same indent, each
 /// row giving at least one, until none is owed ([`label_spelled`]). Wrapped in its own column, the
-/// label leaves a row by a whole word or, its column narrower than a word, within one; the words
-/// after its part on a row (the query, the mode) are read only where they could still be the
-/// label's, and every split is tried, so a query that starts with the label's next letters (`p`)
-/// does not hide it.
+/// label leaves a row by a whole word or, its column narrower than a word, within one, and a column
+/// two cells wide gives the space between two words a blank row of its own; the words after its
+/// part on a row (the query, the mode) are read only where they could still be the label's, and
+/// every split is tried, so a query that starts with the label's next letters (`p`) does not hide
+/// it.
 fn search_label_at(rows: &[&str], label: &str) -> bool {
     let letters: String = label.split_whitespace().collect();
-    rows.first()
-        .is_some_and(|first| label_spelled(rows, &letters, indent_of(first)))
+    // What is owed where a word of the label starts, past its first: the bytes of its letters
+    // from there on.
+    let words: Vec<&str> = label.split_whitespace().collect();
+    let starts: Vec<usize> = (1..words.len())
+        .map(|i| words[i..].iter().map(|w| w.len()).sum())
+        .collect();
+    rows.first().is_some_and(|first| {
+        label_spelled(
+            rows,
+            &letters,
+            &Spell {
+                at: indent_of(first),
+                starts: &starts,
+            },
+        )
+    })
+}
+
+/// How [`label_spelled`] reads the label's column: the indent `at` every row of it stands at, and
+/// what is owed (`starts`, in bytes) where one of its words starts, past its first, which one blank
+/// row may stand before.
+struct Spell<'a> {
+    at: usize,
+    starts: &'a [usize],
 }
 
 /// Whether `owed` is spelled by the leading words of `rows[0]`, then, where it is not yet whole, by
-/// those of the rows after it, each at the indent `at` and giving at least one word.
-fn label_spelled(rows: &[&str], owed: &str, at: usize) -> bool {
+/// those of the rows after it, each at the indent `spell.at` and giving at least one word, one blank
+/// row standing before a word of the label (`spell.starts`).
+fn label_spelled(rows: &[&str], owed: &str, spell: &Spell<'_>) -> bool {
     let Some((row, below)) = rows.split_first() else {
         return false;
     };
-    if indent_of(row) != at {
+    if indent_of(row) != spell.at {
         return false;
     }
     let mut rest = owed;
@@ -2065,7 +2345,14 @@ fn label_spelled(rows: &[&str], owed: &str, at: usize) -> bool {
             return false;
         };
         rest = after;
-        if rest.is_empty() || label_spelled(below, rest, at) {
+        if rest.is_empty() || label_spelled(below, rest, spell) {
+            return true;
+        }
+        if spell.starts.contains(&rest.len())
+            && below.split_first().is_some_and(|(blank, under)| {
+                blank.trim().is_empty() && label_spelled(under, rest, spell)
+            })
+        {
             return true;
         }
     }
@@ -2111,28 +2398,62 @@ pub(crate) fn is_hint(row: &str, width: Option<usize>) -> bool {
     end > lead && (lead >= HINT_COLUMN || (lead >= 6 && width.is_some_and(|w| end + 3 >= w)))
 }
 
-/// The last row the worker said (see [`last_said_index`]).
+/// The last row the worker said (see [`last_said_index`]), its words up to the side panel's rule
+/// ([`Transcript`]): beside the panel, the row's padding, the rule and the panel's text are none
+/// of them, so a question's `?` ends the row.
 pub fn last_said_row(rows: &[String]) -> Option<&str> {
-    last_said_index(rows).map(|i| rows[i].as_str())
+    let transcript = Transcript::of(rows);
+    let i = last_said_in(rows, &transcript)?;
+    Some(panel_cut(&rows[i], transcript.rule))
 }
 
-/// The index of the last thing said above the composer.
+/// The index of the last thing said above the composer, each row read by its words up to the side
+/// panel's rule and its room the rule's ([`Transcript`]): read whole, a row beside the panel's own
+/// `───` reads as a separator and an indented row whose panel text runs to the screen's edge as a
+/// hint ([`is_hint`]), neither as said.
 pub fn last_said_index(rows: &[String]) -> Option<usize> {
+    last_said_in(rows, &Transcript::of(rows))
+}
+
+/// The line the last said row ([`last_said_index`]) ends: that row with the rows Ink wrapped its
+/// line from in a pane `width` cells wide ([`crate::line_start`]; `None`, the row alone),
+/// each trimmed and joined by a space. Each row is read up to the side panel's rule and the wrap in
+/// its room ([`Transcript`]), so beside the panel the line holds none of the rows' padding, the
+/// rule or the panel's text.
+#[must_use]
+pub fn last_said_line(rows: &[String], width: Option<usize>) -> Option<String> {
+    let transcript = Transcript::of(rows);
+    let last = last_said_in(rows, &transcript)?;
+    let said = &transcript.rows;
+    let first = width.map_or(last, |w| {
+        crate::wrap::line_start(said, last, transcript.room(w))
+    });
+    Some(
+        said[first..=last]
+            .iter()
+            .map(|r| crate::text::trim(r))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// [`last_said_index`] on `rows`, whose transcript ([`Transcript::of`]) the caller holds.
+pub(crate) fn last_said_in(rows: &[String], transcript: &Transcript<'_>) -> Option<usize> {
     let (end, width) = match composer_frame(rows) {
         Some(f) => (
             status_block(rows, f.top).status.unwrap_or(f.top),
-            Some(crate::text::trim_end(&rows[f.bottom]).chars().count()),
+            Some(transcript.room(crate::text::trim_end(&rows[f.bottom]).chars().count())),
         ),
         None => (composer_index(rows).unwrap_or(rows.len()), None),
     };
-    last_said_before(rows, end, width)
+    last_said_before(&transcript.rows, end, width)
 }
 
-/// The index of the last thing said above row `end` (`width`: the composer's, so that its
-/// right-edge hints are not read as said), passing over the vendor's own `⏺` notice paragraphs
-/// ([`vendor_paragraph`]). A `/goal` echo's cause is read from above the echo's own row this way:
-/// a person's `❯` prompt above the echo is a row of the transcript, never the composer
-/// ([`composer_index`]) to read above.
+/// The index of the last thing said above row `end` (`width`: the composer's, or beside the side
+/// panel its rule's column ([`Transcript::room`]), so that its right-edge hints are not read as
+/// said), passing over the vendor's own `⏺` notice paragraphs ([`vendor_paragraph`]). A `/goal`
+/// echo's cause is read from above the echo's own row this way: a person's `❯` prompt above the
+/// echo is a row of the transcript, never the composer ([`composer_index`]) to read above.
 fn last_said_before(rows: &[String], end: usize, width: Option<usize>) -> Option<usize> {
     let parked = crate::survey::parked_span(rows);
     let mut i = end;
@@ -2168,8 +2489,17 @@ pub(crate) fn vendor_paragraph(rows: &[String], i: usize) -> Option<usize> {
     NOTICES.iter().any(|n| text.starts_with(n)).then_some(open)
 }
 
-/// Where the transcript ends on the screen, by position.
+/// Where the transcript ends on the screen, by position: under a done status line, at a live one,
+/// and with none above what Claude Code parks between the transcript and the composer (a blank
+/// row, a survey, a tip, a hint against the right edge), each row read on the transcript, cut at
+/// the side panel's rule and against its room ([`Transcript`]), so a row blank up to the rule is a
+/// blank row.
 pub fn transcript_end(rows: &[String]) -> usize {
+    transcript_end_in(rows, &Transcript::of(rows))
+}
+
+/// [`transcript_end`] on `rows`, whose transcript ([`Transcript::of`]) the caller holds.
+pub(crate) fn transcript_end_in(rows: &[String], transcript: &Transcript<'_>) -> usize {
     let Some(frame) = composer_frame(rows) else {
         return rows
             .iter()
@@ -2184,11 +2514,12 @@ pub fn transcript_end(rows: &[String]) -> usize {
             status
         };
     }
-    let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+    let width = transcript.room(crate::text::trim_end(&rows[frame.bottom]).chars().count());
+    let said: &[String] = &transcript.rows;
     let mut end = frame.top;
-    let parked = crate::survey::parked_span(rows);
+    let parked = crate::survey::parked_span(said);
     while end > 0
-        && (is_parked_above_composer(&rows[end - 1], width)
+        && (is_parked_above_composer(&said[end - 1], width)
             || parked.is_some_and(|(a, b)| (a..=b).contains(&(end - 1))))
     {
         end -= 1;
@@ -2233,15 +2564,20 @@ pub fn limit_notice(rows: &[String]) -> Option<(String, Option<String>)> {
         .map(|w| (w.message, w.reset))
 }
 
-/// The notice the worker's last turn ended on, placed as [`crate::wall::wall`] places it.
+/// The notice the worker's last turn ended on, placed as [`crate::wall::wall`] places it, each row
+/// of it over the composer read up to the side panel's rule in its room ([`Transcript`]): read
+/// whole, its message carried each row's padding, the rule and the panel's text after it, and a
+/// line Ink wrapped at the rule was read as its first row.
 pub(crate) fn notice(rows: &[String]) -> Option<Wall> {
-    let mut found = notice_placed(rows)?;
+    let transcript = Transcript::of(rows);
+    let mut found = notice_placed(rows, &transcript)?;
     if let Some(frame) = composer_frame(rows) {
         let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+        let (said, room) = (&*transcript.rows, transcript.room(width));
         let above = found.row + 1..frame.top;
         let below = frame.bottom + 1..rows.len();
         if let Some(toast) = above
-            .map(|i| line_at(rows, i, frame.top, width).1)
+            .map(|i| line_at(said, i, frame.top, room).1)
             .chain(below.map(|i| line_at(rows, i, rows.len(), width).1))
             .map(|line| crate::text::trim(&line).to_string())
             .find(|t| says_the_vendor_goes_on(t) && !found.message.contains(t.as_str()))
@@ -2260,26 +2596,32 @@ fn says_the_vendor_goes_on(row: &str) -> bool {
         || find_ascii_ci(&flat, "available again \u{b7} continuing now").is_some()
 }
 
-fn notice_placed(rows: &[String]) -> Option<Wall> {
+/// [`notice`] on `rows`, its rows over the composer read on their transcript ([`Transcript`]),
+/// the footer's whole: the side panel is drawn beside none of the footer's rows.
+fn notice_placed(rows: &[String], transcript: &Transcript<'_>) -> Option<Wall> {
+    let last = last_said_in(rows, transcript);
+    let said: &[String] = &transcript.rows;
     if let Some(frame) = composer_frame(rows) {
         let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
+        let from = last.map_or(0, |i| i + 1);
         if let Some(found) = footer_notice(rows, frame.bottom + 1, width)
-            .or_else(|| banner_notice(rows, frame.top, width))
+            .or_else(|| banner_notice(said, from, frame.top, transcript.room(width)))
         {
-            return Some(crate::wall::named_by_the_turn(rows, found));
+            return Some(crate::wall::named_by_the_turn(rows, transcript, found));
         }
     }
-    let last = last_said_index(rows)?;
-    if let Some(echo) = goal_echo_open(rows, last)
-        && let Some(prev) = last_said_before(&rows[..echo], echo, None)
-        && let Some(mut cause) = notice_at(rows, prev)
-        && let text = goal_echo_text(rows, echo, last)
+    let last = last?;
+    let width = transcript.room(crate::question::screen_width(rows));
+    if let Some(echo) = goal_echo_open(said, last)
+        && let Some(prev) = last_said_before(&said[..echo], echo, None)
+        && let Some(mut cause) = notice_at(said, prev, width)
+        && let text = goal_echo_text(said, echo, last)
         && echo_names_the_cause_of(&text, cause.kind)
     {
         cause.message = format!("{} \u{2014} {text}", cause.message);
         return Some(cause);
     }
-    notice_at(rows, last)
+    notice_at(said, last, width)
 }
 
 /// Whether a `/goal` echo's own reason can come from a wall of `cause`'s kind.
@@ -2332,9 +2674,10 @@ fn goal_echo_text(rows: &[String], open: usize, last: usize) -> String {
         .join(" ")
 }
 
-/// The wall the last thing said (ending at `last`) is, by placement.
-fn notice_at(rows: &[String], last: usize) -> Option<Wall> {
-    if let Some(found) = error_row_notice(rows, last) {
+/// The wall the last thing said (ending at `last`) is, by placement, its rows wrapped in a pane
+/// `width` cells wide.
+fn notice_at(rows: &[String], last: usize, width: usize) -> Option<Wall> {
+    if let Some(found) = error_row_notice(rows, last, width) {
         return Some(found);
     }
     let open = gutter_open(rows, last)?;
@@ -2349,7 +2692,6 @@ fn notice_at(rows: &[String], last: usize) -> Option<Wall> {
         Block::UnderCall => true,
         Block::Vendors | Block::Unowned => false,
     };
-    let width = crate::question::screen_width(rows);
     let mut lines: Vec<String> = Vec::new();
     let mut i = open;
     while i <= last {
@@ -2381,11 +2723,11 @@ const ERROR_ROWS: usize = 3;
 /// How many columns short of the pane Claude Code draws the text of its own `⏺` rows.
 const NOTICE_MARGIN: usize = 10;
 
-/// The rows the vendor's `⏺` notice on rows `open..=end` would take at 80 columns.
-fn notice_rows_at_80(rows: &[String], open: usize, end: usize) -> Option<usize> {
+/// The rows the vendor's `⏺` notice on rows `open..=end`, drawn in a pane `width` cells wide,
+/// would take at 80 columns.
+fn notice_rows_at_80(rows: &[String], open: usize, end: usize, width: usize) -> Option<usize> {
     use crate::question::cells;
     const ROW_AT_80: usize = 80 - NOTICE_MARGIN;
-    let width = crate::question::screen_width(rows);
     if width >= 80 {
         return None;
     }
@@ -2451,8 +2793,8 @@ pub(crate) fn line_at(rows: &[String], i: usize, until: usize, width: usize) -> 
 /// What the vendor adds under a message past 1000 characters.
 const EXPAND_HINT: &str = "(ctrl+o to expand)";
 
-/// The vendor's error row the last turn ended on.
-fn error_row_notice(rows: &[String], last: usize) -> Option<Wall> {
+/// The vendor's error row the last turn ended on, in a pane `width` cells wide.
+fn error_row_notice(rows: &[String], last: usize, width: usize) -> Option<Wall> {
     let mut open = last;
     while !rows[open].starts_with(['⏺', '●']) {
         if !in_message(&rows[open]) {
@@ -2477,7 +2819,7 @@ fn error_row_notice(rows: &[String], last: usize) -> Option<Wall> {
     parts.retain(|p| !p.is_empty());
     let text = parts.join(" ");
     let short = end - open < ERROR_ROWS
-        || notice_rows_at_80(rows, open, end).is_some_and(|n| n <= ERROR_ROWS);
+        || notice_rows_at_80(rows, open, end, width).is_some_and(|n| n <= ERROR_ROWS);
     let remedy = short && (text.contains(" · ") || text.contains(" ∙ "));
     if !(head.starts_with("API Error") || remedy) {
         return None;
@@ -2508,11 +2850,14 @@ pub struct SaidNotice {
     pub hook_words: bool,
 }
 
-/// The last thing said, where claude code draws its own notices.
+/// The last thing said, where claude code draws its own notices, its rows read up to the side
+/// panel's rule in its room ([`Transcript`]).
 #[must_use]
 pub fn last_said_notice(rows: &[String]) -> Option<SaidNotice> {
-    let last = last_said_index(rows)?;
-    let width = crate::question::screen_width(rows);
+    let transcript = Transcript::of(rows);
+    let last = last_said_in(rows, &transcript)?;
+    let width = transcript.room(crate::question::screen_width(rows));
+    let rows: &[String] = &transcript.rows;
     let mut open = last;
     while !rows[open].starts_with(['⏺', '●']) && in_message(&rows[open]) {
         open = open.checked_sub(1)?;
@@ -2526,7 +2871,7 @@ pub fn last_said_notice(rows: &[String]) -> Option<SaidNotice> {
         let text = crate::text::trim(&line).trim_start_matches(['⏺', '●']);
         let text = crate::text::trim(text.strip_suffix(EXPAND_HINT).unwrap_or(text));
         let short = end - open < ERROR_ROWS
-            || notice_rows_at_80(rows, open, end).is_some_and(|n| n <= ERROR_ROWS);
+            || notice_rows_at_80(rows, open, end, width).is_some_and(|n| n <= ERROR_ROWS);
         let remedy = short && (text.contains(" · ") || text.contains(" ∙ "));
         return Some(SaidNotice {
             shaped: text.starts_with("API Error") || remedy,
@@ -2879,9 +3224,9 @@ pub(crate) fn footer_end(rows: &[String], from: usize) -> usize {
         .unwrap_or(rows.len())
 }
 
-/// A notice on a banner row under the last thing said.
-fn banner_notice(rows: &[String], top: usize, width: usize) -> Option<Wall> {
-    let from = last_said_index(rows).map_or(0, |i| i + 1);
+/// A notice on a banner row under the last thing said, rows `from..top`, in a pane `width` cells
+/// wide.
+fn banner_notice(rows: &[String], from: usize, top: usize, width: usize) -> Option<Wall> {
     (from..top).rev().find_map(|i| {
         let row = &rows[i];
         let t = crate::text::trim(row);
@@ -3176,10 +3521,12 @@ mod tests {
     /// CLAUDE CODE'S PROMPT-HISTORY SEARCH IS READ ON THE FOOTER ALONE (measured on 2.1.318): open
     /// over its match, over nothing and over a grey suggestion, under a status line, where it heads
     /// the footer's second row, in vim mode, where it takes the mode's row, and in windows of 60, 44,
-    /// 34, 26 and 22 columns, where its label wraps in its own column, by whole words or within
-    /// them. A wrapped label is read only whole and leading its row: its rest gone, at another
-    /// indent, other words in its place, a row between, or another word before it, and it is
-    /// closed; a query that starts with its next letters (`p`, `prompts`) leaves it open. The same
+    /// 34, 26, 22, 14 and 12 columns, where its label wraps in its own column, by whole words or
+    /// within them, and a column two cells wide gives the space between two words a blank row. A
+    /// wrapped label is read only whole and leading its row: its rest gone, at another indent, other
+    /// words in its place, a row between, another word before it, a blank row within a word or two
+    /// blank rows, and it is closed; a query that starts with its next letters (`p`, `prompts`)
+    /// leaves it open. The same
     /// screen with its footer row back is closed, and the search's words are read nowhere else: on a
     /// person's draft's first row or a later one, in the transcript, or past the footer's end.
     /// NEGATIVE CONTROLS: `history_search` reading the footer's first row alone, and the status
@@ -3187,16 +3534,22 @@ mod tests {
     /// reads it open; the label read only whole on one row (`fcf2daa1f8`'s parent), and every
     /// narrow screen reads closed; read by whole words (`fcf2daa1f8`), and the 26 and 22 column
     /// screens read closed; skipping a word that is not the label's, and a label after another word
-    /// reads open; taking a row's words greedily, no split tried again, and the query `p` hides it.
+    /// reads open; taking a row's words greedily, no split tried again, and the query `p` hides it;
+    /// the footer ending at its first blank row, as before, and the 12-column match and the four
+    /// frames with a blank row read closed; a blank row read anywhere in the label, and one within
+    /// a word reads open.
     #[test]
     fn the_history_search_is_read_on_the_footer_alone() {
         use crate::prompt::fixtures::{
-            HISTORY_SEARCH_2_1_318, HISTORY_SEARCH_22COL_2_1_318, HISTORY_SEARCH_26COL_2_1_318,
-            HISTORY_SEARCH_44COL_2_1_318, HISTORY_SEARCH_60COL_2_1_318,
-            HISTORY_SEARCH_NO_MATCH_2_1_318, HISTORY_SEARCH_NO_MATCH_26COL_2_1_318,
-            HISTORY_SEARCH_NO_MATCH_34COL_2_1_318, HISTORY_SEARCH_NO_MATCH_44COL_2_1_318,
-            HISTORY_SEARCH_NO_MATCH_60COL_2_1_318, HISTORY_SEARCH_OVER_SUGGESTION_2_1_318,
-            HISTORY_SEARCH_UNDER_STATUSLINE_2_1_318, screen as fx,
+            HISTORY_SEARCH_2_1_318, HISTORY_SEARCH_12COL_2_1_318, HISTORY_SEARCH_14COL_2_1_318,
+            HISTORY_SEARCH_14COL_LONG_QUERY_2_1_318, HISTORY_SEARCH_22COL_2_1_318,
+            HISTORY_SEARCH_26COL_2_1_318, HISTORY_SEARCH_44COL_2_1_318,
+            HISTORY_SEARCH_60COL_2_1_318, HISTORY_SEARCH_NO_MATCH_2_1_318,
+            HISTORY_SEARCH_NO_MATCH_12COL_2_1_318, HISTORY_SEARCH_NO_MATCH_14COL_2_1_318,
+            HISTORY_SEARCH_NO_MATCH_26COL_2_1_318, HISTORY_SEARCH_NO_MATCH_34COL_2_1_318,
+            HISTORY_SEARCH_NO_MATCH_44COL_2_1_318, HISTORY_SEARCH_NO_MATCH_60COL_2_1_318,
+            HISTORY_SEARCH_OVER_SUGGESTION_2_1_318, HISTORY_SEARCH_UNDER_STATUSLINE_2_1_318,
+            screen as fx,
         };
         let open = fx(HISTORY_SEARCH_2_1_318);
         for (name, rows) in [
@@ -3224,8 +3577,42 @@ mod tests {
                 fx(HISTORY_SEARCH_NO_MATCH_26COL_2_1_318),
             ),
             ("its match, 22 columns", fx(HISTORY_SEARCH_22COL_2_1_318)),
+            ("its match, 14 columns", fx(HISTORY_SEARCH_14COL_2_1_318)),
+            (
+                "its match, 14 columns, a long query",
+                fx(HISTORY_SEARCH_14COL_LONG_QUERY_2_1_318),
+            ),
+            (
+                "nothing, 14 columns",
+                fx(HISTORY_SEARCH_NO_MATCH_14COL_2_1_318),
+            ),
+            ("its match, 12 columns", fx(HISTORY_SEARCH_12COL_2_1_318)),
+            (
+                "nothing, 12 columns",
+                fx(HISTORY_SEARCH_NO_MATCH_12COL_2_1_318),
+            ),
         ] {
             assert!(history_search(&rows), "over {name}: {rows:#?}");
+        }
+        // A blank row stands in the label only where its column gives the space between two words
+        // one: once, never within a word.
+        let two_wide = fx(HISTORY_SEARCH_12COL_2_1_318);
+        let label = composer_bottom(&two_wide).expect("the frame") + 1;
+        assert_eq!(
+            two_wide[label..label + 8]
+                .iter()
+                .map(|r| r.trim())
+                .collect::<Vec<_>>(),
+            ["se … ⏵⏵", "ar", "ch", "", "pr", "om", "pt", "s:"],
+            "{two_wide:#?}"
+        );
+        let mut within = two_wide.clone();
+        within.insert(label + 2, String::new());
+        within.remove(label + 4);
+        let mut twice = two_wide.clone();
+        twice.insert(label + 3, String::new());
+        for (name, rows) in [("within a word", within), ("twice", twice)] {
+            assert!(!history_search(&rows), "a blank row {name}: {rows:#?}");
         }
         // A narrow window's wrapped label is read only whole: its rest leads the next footer row at
         // the same indent.
@@ -5573,7 +5960,7 @@ mod tests {
         assert_eq!(
             r.guard,
             "^\\s*[^\\s⏺●⎿❯⏵◯]\\s+No.response.from.the.API.after.30s.·.retrying,.waiting.up.to.\
-             10m.·.attempt.1/2\\s*$",
+             10m.·.attempt.1/2\\s*(?:│.*)?$",
             "a no-response row stands as drawn while its retry waits: the guard holds all of it"
         );
         assert_eq!(wait_secs("1m…"), None, "a cut wait");
@@ -5657,7 +6044,7 @@ mod tests {
         assert_eq!(
             r.guard,
             "^\\s*[^\\s⏺●⎿❯⏵◯]\\s+No.response.from.the.API.after.13s.·.retrying.once,.waiting.up.\
-             to.10m\\s*$"
+             to.10m\\s*(?:│.*)?$"
         );
         let narrow = measured(API_NO_RESPONSE_QUEUED_60_2_1_310);
         assert_eq!(
@@ -6186,6 +6573,98 @@ mod tests {
         }
     }
 
+    /// A COMPLETED ROW WHOSE TITLE WRAPS STILL ENDS THE WAIT IT ANSWERS: Claude Code wraps a long
+    /// `⏺ Dynamic workflow "…" completed` row at column 0, not at its text's column (measured on
+    /// 2.1.302 at 175 columns, five rows of `claude-2.1.302-login-handoff-over-weekly-limit.txt` and
+    /// `claude-2.1.302-login-interrupted-over-weekly-limit-continuing-shortly.txt`, and kept so in
+    /// the retitled `claude-2.1.283-wall-session-goal-checkin-shell-measured.txt`), and
+    /// [`waited_out`] read only the rows indented under it, so a workflow whose title wrapped was
+    /// never counted as ended. Where no done row follows (`showTurnDuration` off), the wait carried
+    /// above it then stood as work for as long as its row did, and held a lost line's restart and
+    /// every restart but the memory one. Every measured wrapped completion now counts. The screen
+    /// read whole is CONSTRUCTED from the measured rows: 2.1.302's from `✻ Waiting for 2 dynamic
+    /// workflows to finish` through its second, wrapped completion, then a reply and a composer
+    /// (the capture has a `/login` dialog in the composer's place and a done row under them). The
+    /// controls: the wrapped completion cut to its first row (no ` completed` drawn) and a wait for
+    /// one more workflow than completed still wait.
+    #[test]
+    fn a_completed_row_whose_title_wraps_still_ends_the_wait_it_answers() {
+        use crate::prompt::fixtures::{
+            LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302, LOGIN_INTERRUPTED_OVER_WEEKLY_LIMIT_2_1_302,
+            screen as captured,
+        };
+        const LEFT: &str = "background work still running";
+        let mut wraps = 0;
+        for fixture in [
+            LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302,
+            LOGIN_INTERRUPTED_OVER_WEEKLY_LIMIT_2_1_302,
+            include_str!("fixtures/claude-2.1.283-wall-session-goal-checkin-shell-measured.txt"),
+        ] {
+            let measured = captured(fixture);
+            for (i, row) in measured.iter().enumerate() {
+                let wrapped = row.starts_with("⏺ Dynamic workflow \"")
+                    && !row.contains("\" completed")
+                    && measured.get(i + 1).is_some_and(|next| {
+                        next.contains("\" completed") && !next.starts_with(' ')
+                    });
+                if wrapped {
+                    wraps += 1;
+                    let one = "✻ Waiting for 1 dynamic workflow to finish";
+                    assert!(waited_out(one, &measured, i, i + 2), "{row}");
+                    assert!(
+                        !waited_out(one, &measured, i, i + 1),
+                        "cut to its first row: {row}"
+                    );
+                }
+            }
+        }
+        assert_eq!(wraps, 6, "the measured column-0 wraps");
+
+        let measured = captured(LOGIN_HANDOFF_OVER_WEEKLY_LIMIT_2_1_302);
+        let from = measured
+            .iter()
+            .position(|r| r == "✻ Waiting for 2 dynamic workflows to finish")
+            .expect("the wait");
+        let wrapped = from
+            + measured[from..]
+                .iter()
+                .position(|r| r.starts_with("⏺ Dynamic workflow \"Swap fix round 5"))
+                .expect("the wrapped completion");
+        let width = crate::question::screen_width(&measured);
+        let carried = |waiting: &str, last: usize| {
+            let mut r = vec![waiting.to_string()];
+            r.extend_from_slice(&measured[from + 1..=last]);
+            r.extend(rows(&[
+                "",
+                "⏺ Both lanes are in; nothing else is pending.",
+                "",
+            ]));
+            r.extend([
+                "─".repeat(width),
+                "❯".to_string(),
+                "─".repeat(width),
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+            ]);
+            r
+        };
+        let ended = carried(&measured[from], wrapped + 1);
+        assert_eq!(busy_signal(&ended), None, "{ended:#?}");
+        assert_eq!(in_process_work(&ended), None);
+        assert_eq!(work_running(&ended), None);
+        assert_eq!(worker_phase(&ended), Phase::Idle);
+        for (name, r) in [
+            ("cut to its first row", carried(&measured[from], wrapped)),
+            (
+                "one more waited",
+                carried("✻ Waiting for 3 dynamic workflows to finish", wrapped + 1),
+            ),
+        ] {
+            assert_eq!(in_process_work(&r), Some(LEFT), "{name}: {r:#?}");
+            assert_eq!(work_running(&r), Some(LEFT), "{name}");
+            assert!(carried_wait_alone(&r), "{name}");
+        }
+    }
+
     /// A WAIT FOR A BACKGROUND AGENT STANDS OVER AN AGENT'S FINISHED ROW ITS COUNT DOES NOT NAME
     /// (measured on 2.1.304, `claude-2.1.304-agents-panel-long-bash-4m57s-120col.txt`): a
     /// background agent's completion row is measured (`⏺ Agent "…" finished · 3m 20s`, the wake
@@ -6381,6 +6860,1556 @@ mod tests {
             assert_eq!(worker_phase(&done), Phase::Idle, "│{side}");
             assert_eq!(in_process_work(&done), None, "│{side}");
         }
+    }
+
+    /// THE SIDE PANEL'S TEXT IS NO WORD OF THE STATUS LINE, WHATEVER IT SAYS: the status line is
+    /// read up to the panel's rule `│` ([`StatusBlock::line`]), as a done row's items were alone
+    /// before, so no reader of it (the status row's busy rules, its shells and monitors still
+    /// running, its `Waiting for …`, its shell count) reads the panel's text as the agent's. In
+    /// every measured panel capture (2.1.310, two of 2.1.316) the panel draws its text beside the
+    /// upper rows of the live zone and none beside the status row, so these screens are
+    /// CONSTRUCTED from the measured 2.1.316 one: its status row replaced by a done row padded to
+    /// the measured rule, the panel's text after it, and its footer bare. Read whole before, text
+    /// there that said `2 shells still running` or `Waiting for 1 dynamic workflow` named work that
+    /// held a lost line's restart while it stood, and an ellipsis read a live spinner, a turn
+    /// running with no point. The wait carried above a wake reads its line the same way: an
+    /// ellipsis beside it hid the wait, and the work it names, from every reader. CONTROL: the
+    /// panel with no text beside the done row rests, and the carried wait beside none waits.
+    #[test]
+    fn the_side_panels_text_is_no_word_of_the_status_line() {
+        use crate::prompt::fixtures::{WAITING_AGENTS_WORKFLOWS_2_1_316, screen as captured};
+        const QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        const DONE: &str = "✻ Worked for 3m 20s · done 4:57 PM";
+        let panel = captured(WAITING_AGENTS_WORKFLOWS_2_1_316);
+        let at = panel
+            .iter()
+            .rposition(|x| x.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let (head, side) = panel[at].split_once('│').expect("the panel's rule");
+        assert_eq!(side, "", "the status row's panel text as captured");
+        let width = head.chars().count();
+        let pad = |text: &str, side: &str| format!("{text:<width$}│{side}");
+        let quiet = |mut s: Vec<String>| {
+            let frame = composer_frame(&s).expect("the frame");
+            s[frame.top + 1] = "❯".to_string();
+            s.truncate(frame.bottom + 1);
+            s.extend([String::new(), QUIET.to_string()]);
+            s
+        };
+        let beside = |side: &str| {
+            let mut s = panel.clone();
+            s[at] = pad(DONE, side);
+            quiet(s)
+        };
+        let rested = beside("");
+        assert_eq!(busy_signal(&rested), None, "{rested:#?}");
+        assert_eq!(worker_phase(&rested), Phase::Idle);
+        assert_eq!(work_running(&rested), None);
+        assert_eq!(shells_running(&rested), Some(0));
+        for side in [
+            "  turn left 2 shells still running under it",
+            "  Waiting for 1 dynamic workflow to finish",
+            "  the build is still going… check back later",
+            "   · 5 shells · 1 monitor still running",
+        ] {
+            let r = beside(side);
+            assert_eq!(status_line(&r).as_deref(), Some(DONE), "│{side}");
+            assert_eq!(busy_signal(&r), None, "│{side}");
+            assert_eq!(worker_phase(&r), Phase::Idle, "│{side}");
+            assert_eq!(in_process_work(&r), None, "│{side}");
+            assert_eq!(work_running(&r), None, "│{side}");
+            assert_eq!(shells_running(&r), Some(0), "│{side}");
+        }
+
+        let carried = |side: &str| {
+            let mut s = panel[..at].to_vec();
+            s.extend([
+                pad("✻ Waiting for 1 dynamic workflow to finish", side),
+                pad("", ""),
+                pad("⏺ Monitor event: \"lander\"", ""),
+                pad("", ""),
+                pad("⏺ Restarted it.", ""),
+            ]);
+            s.extend_from_slice(&panel[at + 1..]);
+            quiet(s)
+        };
+        for side in ["", "  the build is still going… check back later"] {
+            let r = carried(side);
+            assert_eq!(
+                in_process_work(&r),
+                Some("background work still running"),
+                "│{side}: {r:#?}"
+            );
+            assert_eq!(work_running(&r), Some("background work still running"));
+            assert!(carried_wait_alone(&r), "│{side}");
+        }
+    }
+
+    /// A `│` OF THE STATUS LINE'S OWN WORDS IS ONE OF THEM: the status line ends at the side
+    /// panel's rule, the `│` drawn at the column the rows beside the line draw theirs
+    /// ([`panel_rule`]), never at the first `│` it holds. The spinner row draws an in-progress
+    /// todo's words, the model's text, so one may stand there; no measured capture draws one, so
+    /// these screens are CONSTRUCTED from the measured 2.1.316 live turn: its spinner row's words
+    /// replaced by ones holding a `│`, its footer bare, with its side panel as captured, with the
+    /// panel's text beside the spinner row, and with every row cut at the panel's rule (no panel).
+    /// Cut at its first `│` (found in the review of the stack review's fixes, 2026-11-04), the
+    /// line read `✻ Fixing the`, a done row, so the live turn read as over and idle, the panel
+    /// drawn or not. CONTROL: the measured spinner row, the panel beside it, reads up to the rule.
+    #[test]
+    fn a_rule_in_the_status_lines_own_words_is_one_of_them() {
+        use crate::prompt::fixtures::{INFERRING_OVER_BACKGROUND_2_1_316, screen as captured};
+        const QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        const SPINNER: &str = "✻ Inferring… (1m 35s · ↓ 2.9k tokens)";
+        const OWN: &str = "✻ Fixing the │ rule in the panel… (1m 35s · ↓ 2.9k tokens)";
+        let live = captured(INFERRING_OVER_BACKGROUND_2_1_316);
+        let at = live
+            .iter()
+            .position(|x| x.starts_with(SPINNER))
+            .expect("the spinner row");
+        let (head, side) = live[at].split_once('│').expect("the panel's rule");
+        assert_eq!(side, "", "the spinner row's panel text as captured");
+        let width = head.chars().count();
+        let quiet = |mut s: Vec<String>| {
+            let frame = composer_frame(&s).expect("the frame");
+            s.truncate(frame.bottom + 1);
+            s.extend([String::new(), QUIET.to_string()]);
+            s
+        };
+        let measured = quiet(live.clone());
+        assert_eq!(status_line(&measured).as_deref(), Some(SPINNER));
+        assert_eq!(signal(&measured).as_deref(), Some("status row: spinner"));
+        assert_eq!(worker_phase(&measured), Phase::Busy);
+
+        let beside = |side: &str| {
+            let mut s = live.clone();
+            s[at] = format!("{OWN:<width$}│{side}");
+            quiet(s)
+        };
+        let mut alone: Vec<String> = live
+            .iter()
+            .map(|r| {
+                r.split_once('│')
+                    .map_or(r.as_str(), |(left, _)| crate::text::trim_end(left))
+                    .to_string()
+            })
+            .collect();
+        alone[at] = OWN.to_string();
+        for (name, r) in [
+            ("no panel", quiet(alone)),
+            ("beside the panel", beside("")),
+            (
+                "beside the panel's text",
+                beside("  turn left 2 shells still running"),
+            ),
+        ] {
+            assert_eq!(worker_phase(&r), Phase::Busy, "{name}");
+            assert!(!done_row_drawn(&r), "{name}");
+            assert_eq!(signal(&r).as_deref(), Some("status row: spinner"), "{name}");
+            assert_eq!(status_line(&r).as_deref(), Some(OWN), "{name}: {r:#?}");
+        }
+    }
+
+    /// THE STATUS ROW BESIDE THE SIDE PANEL IS READ UP TO ITS RULE, as the status line is
+    /// ([`panel_cut`]): every measured panel capture (2.1.310's, both of 2.1.316's) pads its status
+    /// row out to the panel's rule `│`, and [`status_row`] read the row whole, its padding and the
+    /// rule with it, and the panel's text after it wherever the panel draws some there.
+    #[test]
+    fn the_status_row_beside_the_side_panel_is_read_up_to_its_rule() {
+        use crate::prompt::fixtures::{
+            INFERRING_OVER_BACKGROUND_2_1_316, WAITING_AGENTS_WORKFLOWS_2_1_316,
+            WAITING_WORKFLOWS_2_1_310, screen as captured,
+        };
+        for fixture in [
+            WAITING_WORKFLOWS_2_1_310,
+            WAITING_AGENTS_WORKFLOWS_2_1_316,
+            INFERRING_OVER_BACKGROUND_2_1_316,
+        ] {
+            let measured = captured(fixture);
+            let line = status_line(&measured).expect("the status line");
+            assert!(!line.contains('│'), "{line}");
+            assert_eq!(status_row(&measured), Some(&*line), "{measured:#?}");
+        }
+    }
+
+    /// THE API RETRY ROW BESIDE THE SIDE PANEL IS READ UP TO ITS RULE ([`panel_cut`]):
+    /// [`api_retry_row`] read the status row whole, so the rule the panel pads it out to, and any
+    /// text the panel draws after it, ran into the row's last item: no retry row read beside the
+    /// panel, and a turn the Mac slept through in the vendor's retry got no Esc there. No capture
+    /// draws a retry row beside the panel, so these screens are CONSTRUCTED from the measured
+    /// 2.1.316 live turn: its spinner row replaced by each measured 2.1.310 retry row that fits
+    /// left of the rule (the no-response, dropped and stalled rows), padded to the measured rule,
+    /// with no panel text beside it (as captured) and with the panel's measured heading. Each
+    /// reads as the same row read in its own capture, with the same guard, which holds the row
+    /// beside the panel and with none; a no-response row's guard still holds its whole text, so
+    /// no row whose words run on past it.
+    #[test]
+    fn the_api_retry_row_beside_the_side_panel_is_read_up_to_its_rule() {
+        use crate::prompt::fixtures::{
+            API_DROPPED_QUEUED_2_1_310, API_NO_RESPONSE_2_1_310, API_STALLED_QUEUED_2_1_310,
+            INFERRING_OVER_BACKGROUND_2_1_316, screen as captured,
+        };
+        const SPINNER: &str = "✻ Inferring… (1m 35s · ↓ 2.9k tokens)";
+        const DIFF: &str = "1 file changed                                source: Current ▾";
+        let live = captured(INFERRING_OVER_BACKGROUND_2_1_316);
+        let at = live
+            .iter()
+            .position(|x| x.starts_with(SPINNER))
+            .expect("the spinner row");
+        let (head, side) = live[at].split_once('│').expect("the panel's rule");
+        assert_eq!(side, "", "the spinner row's panel text as captured");
+        let width = head.chars().count();
+        let mut read = 0;
+        for fixture in [
+            API_NO_RESPONSE_2_1_310,
+            API_DROPPED_QUEUED_2_1_310,
+            API_STALLED_QUEUED_2_1_310,
+        ] {
+            let alone = captured(fixture);
+            let own = api_retry_row(&alone).expect("PRECONDITION: the measured retry row");
+            let row = crate::text::trim_end(&alone[own.row]);
+            assert!(row.chars().count() < width, "PRECONDITION: {row} fits");
+            for side in ["", DIFF] {
+                let mut r = live.clone();
+                r[at] = format!("{row:<width$}│{side}");
+                let beside = api_retry_row(&r).unwrap_or_else(|| panic!("{row} │{side}: {r:#?}"));
+                assert_eq!(
+                    (
+                        beside.row,
+                        beside.cause,
+                        beside.next_try_s,
+                        beside.failed_wait_s
+                    ),
+                    (at, own.cause, own.next_try_s, own.failed_wait_s),
+                    "{row} │{side}"
+                );
+                assert_eq!(beside.text, own.text, "{row} │{side}");
+                assert_eq!(beside.guard, own.guard, "{row} │{side}");
+                let guard = aterm_regex::Regex::new(&beside.guard).expect("the guard compiles");
+                assert!(guard.is_match(&r[at]), "{row} │{side}: {}", beside.guard);
+                assert!(guard.is_match(&alone[own.row]), "{row}: with no panel");
+                if own.cause == RetryCause::NoResponse {
+                    let on = format!("{row} · attempt 2/2");
+                    assert!(!guard.is_match(&on), "{on}");
+                    assert!(
+                        !guard.is_match(&format!("{on:<width$}│{side}")),
+                        "{on} │{side}"
+                    );
+                }
+                assert_eq!(status_row(&r), Some(row), "{row} │{side}");
+                assert_eq!(worker_phase(&r), Phase::Busy, "{row} │{side}");
+                read += 1;
+            }
+        }
+        assert_eq!(read, 6, "each retry row, beside the panel's text and none");
+    }
+
+    /// A STATUS LINE INK WRAPS BESIDE THE SIDE PANEL IS READ WHOLE: beside the panel Claude Code
+    /// lays its rows out as wide as the panel's rule's column, and wraps there (the measured
+    /// 2.1.316 captures wrap the transcript's prose and the spinner's tip at the rule), so a status
+    /// line longer than that wraps at the rule, its rest at the text's column as a done row wraps
+    /// in a narrow pane (measured on 2.1.299 at 26 and 34 columns). Those rows carry the rule, and
+    /// the wrap readers take no row that draws a box glyph and measured the room by the screen's
+    /// width, so the line read as its first row alone: a done row naming agents, shells and
+    /// monitors still running read `… still` and no work ran, which a restart in place would end.
+    /// No measured status line is long enough to wrap beside the panel, so the screen is
+    /// CONSTRUCTED from the measured 2.1.316 one: its status row replaced by a done row whose words
+    /// join 2.1.283's measured done row and 2.1.316's measured pill counts with the `2 agents` this
+    /// crate's tests construct, wrapped at the measured rule, its footer bare. CONTROL: the same
+    /// words cut to its first row (no wrap drawn) name no work, as they say none.
+    #[test]
+    fn a_status_line_wrapped_beside_the_side_panel_is_read_whole() {
+        use crate::prompt::fixtures::{WAITING_AGENTS_WORKFLOWS_2_1_316, screen as captured};
+        const LEFT: &str = "background work still running";
+        const QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        const DONE: &str = "✻ Sautéed for 1d 2h 58m · done 12:19 PM · 2 agents, 13 shells, 3 monitors \
+                            still running";
+        let panel = captured(WAITING_AGENTS_WORKFLOWS_2_1_316);
+        let at = panel
+            .iter()
+            .rposition(|x| x.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let width = panel[at]
+            .split_once('│')
+            .expect("the rule")
+            .0
+            .chars()
+            .count();
+        assert!(DONE.chars().count() > width, "PRECONDITION: it wraps");
+        let split = DONE
+            .char_indices()
+            .take(width - 1)
+            .filter(|&(_, c)| c == ' ')
+            .last()
+            .map(|(i, _)| i)
+            .expect("a space to wrap at");
+        let (first, rest) = (&DONE[..split], &DONE[split + 1..]);
+        let wrapped = |rows: &[&str]| {
+            let mut s = panel[..at].to_vec();
+            s.extend(rows.iter().map(|row| format!("{row:<width$}│")));
+            s.extend_from_slice(&panel[at + 1..]);
+            let frame = composer_frame(&s).expect("the frame");
+            s[frame.top + 1] = "❯".to_string();
+            s.truncate(frame.bottom + 1);
+            s.extend([String::new(), QUIET.to_string()]);
+            s
+        };
+        let r = wrapped(&[first, &format!("  {rest}")]);
+        assert_eq!(status_line(&r).as_deref(), Some(DONE), "{r:#?}");
+        assert_eq!(status_row(&r), Some(first));
+        assert_eq!(in_process_work(&r), Some(LEFT));
+        assert_eq!(work_running(&r), Some(LEFT));
+        assert_eq!(background_wait(&r), Some("a monitor still running"));
+        let cut = wrapped(&[first]);
+        assert_eq!(status_line(&cut).as_deref(), Some(first));
+        assert_eq!(work_running(&cut), None, "{cut:#?}");
+    }
+
+    /// THE SIDE PANEL'S TEXT IS NO HINT: the rows between the status line and the composer's top
+    /// rule, where Claude Code draws its right-aligned hints (`Still working`, [`still_working`]),
+    /// are read up to the side panel's rule ([`panel_cut`]), as the status line is. Read whole
+    /// before, a `Still working` the panel drew beside such a row (a diff of a file holding those
+    /// words) read as a live turn: the measured 2.1.316 turn over under its own background work
+    /// gave no rest, and a turn over read busy, for as long as the panel showed it. No capture
+    /// draws panel text beside those rows, nor the `Still working` hint at all, so these screens
+    /// are CONSTRUCTED from the measured 2.1.316 one: the panel's text beside the row under its
+    /// status row, which is the one row above the top rule there, its status row as captured or a
+    /// done row padded to the measured rule over a bare footer. CONTROL: the crate's constructed
+    /// hint drawn left of the rule, right-aligned to it, still reads as a live turn, with the
+    /// panel's text beside it or none.
+    #[test]
+    fn the_side_panels_text_is_no_hint() {
+        use crate::prompt::fixtures::{WAITING_AGENTS_WORKFLOWS_2_1_316, screen as captured};
+        const QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        const DONE: &str = "✻ Worked for 3m 20s · done 4:57 PM";
+        const SAYS: &str = "+        .any(|r| r.contains(\"Still working\"))";
+        const HINT: &str = "Still working. Check in from your phone · /remote";
+        let panel = captured(WAITING_AGENTS_WORKFLOWS_2_1_316);
+        let at = panel
+            .iter()
+            .rposition(|x| x.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let (head, side) = panel[at + 1].split_once('│').expect("the rule under it");
+        assert_eq!((crate::text::trim(head), side), ("", ""), "as captured");
+        let width = head.chars().count();
+        assert_eq!(composer_frame(&panel).map(|f| f.top), Some(at + 2));
+        let under = |r: &[String], row: String| {
+            let mut s = r.to_vec();
+            s[at + 1] = row;
+            s
+        };
+        let says = format!("{:width$}│{SAYS}", "");
+        assert_eq!(background_rest(&panel), Some(Phase::Idle), "as captured");
+        let rests = under(&panel, says.clone());
+        assert!(background_only(&rests), "{rests:#?}");
+        assert_eq!(background_rest(&rests), Some(Phase::Idle));
+
+        let mut done = panel.clone();
+        done[at] = format!("{DONE:<width$}│");
+        let frame = composer_frame(&done).expect("the frame");
+        done[frame.top + 1] = "❯".to_string();
+        done.truncate(frame.bottom + 1);
+        done.extend([String::new(), QUIET.to_string()]);
+        assert_eq!(busy_signal(&done), None, "{done:#?}");
+        let idle = under(&done, says);
+        assert_eq!(busy_signal(&idle), None, "{idle:#?}");
+        assert_eq!(worker_phase(&idle), Phase::Idle);
+
+        for side in ["", SAYS] {
+            let hint = format!("{HINT:>width$}│{side}");
+            let live = under(&done, hint.clone());
+            assert_eq!(
+                signal(&live).as_deref(),
+                Some("hint: Still working"),
+                "│{side}"
+            );
+            assert_eq!(worker_phase(&live), Phase::Busy, "│{side}");
+            let live = under(&panel, hint);
+            assert!(!background_only(&live), "│{side}: a live turn");
+            assert_eq!(background_rest(&live), None, "│{side}");
+        }
+    }
+
+    /// THE SIDE PANEL'S TEXT IS NO WORD OF A COMPLETED WORKFLOW'S ROW: a `⏺ Dynamic workflow "…"`
+    /// row's words, joined across the rows Claude Code wrapped it onto ([`wrapped_item`]), are
+    /// read up to the side panel's rule ([`panel_cut`]), as the status line is, and end at a row
+    /// blank up to it. Read whole before, a row blank but for the rule and the panel's text after
+    /// it was no blank row, so the item's words ran on through the panel's text beside each row
+    /// down to the next block, and a `" completed` the panel drew there (a diff of a test holding
+    /// such a row) counted as completed a workflow no row said was: the wait carried above it
+    /// ended, and the work it waits for read as none, which a restart in place would end. No
+    /// capture draws a completion beside the panel, so these screens are CONSTRUCTED from the
+    /// measured 2.1.316 one: under its rows, a carried wait for one workflow, a completion row
+    /// (the hand-built one of `claude-2.1.283-wall-fable-goal-rate-limited-shell.txt`, the measured
+    /// one of `idle-after-limit-and-model-switch.txt` with its title shortened to fit left of the
+    /// rule), and that measured row with its title whole, wrapped at the measured rule at column 0,
+    /// as 2.1.302 wraps one (`claude-2.1.302-login-handoff-over-weekly-limit.txt`), each padded to
+    /// the rule, the panel's text beside the row under each or none, then a reply and the capture's
+    /// own rows. Each completion ends the wait; the long one cut to
+    /// its first row (no ` completed` drawn, as in
+    /// `a_completed_row_whose_title_wraps_still_ends_the_wait_it_answers`) ends none.
+    #[test]
+    fn the_side_panels_text_is_no_word_of_a_completed_row() {
+        use crate::prompt::fixtures::{WAITING_AGENTS_WORKFLOWS_2_1_316, screen as captured};
+        const LEFT: &str = "background work still running";
+        const QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        const WAIT: &str = "✻ Waiting for 1 dynamic workflow to finish";
+        const SHORT: &str = "⏺ Dynamic workflow \"Second review pass (read-only)\" completed · 5s";
+        const LONG: &str = "⏺ Dynamic workflow \"Second review pass on the reworked \
+                            cache-eviction change (read-only)\" completed · 5s";
+        const SAYS: &str = "+  \"⏺ Dynamic workflow \\\"Review\\\" completed · 5s\",";
+        let panel = captured(WAITING_AGENTS_WORKFLOWS_2_1_316);
+        let at = panel
+            .iter()
+            .rposition(|x| x.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let width = panel[at]
+            .split_once('│')
+            .expect("the rule")
+            .0
+            .chars()
+            .count();
+        let pad = |text: &str, side: &str| format!("{text:<width$}│{side}");
+        let split = LONG
+            .char_indices()
+            .take(width + 1)
+            .filter(|&(_, c)| c == ' ')
+            .last()
+            .map(|(i, _)| i)
+            .expect("a space to wrap at");
+        let (first, rest) = (&LONG[..split], &LONG[split + 1..]);
+        assert!(first.chars().count() <= width && !first.contains(" completed"));
+        let carried = |item: &[&str], side: &str| {
+            let mut s = panel[..at].to_vec();
+            s.extend([pad(WAIT, ""), pad("", "")]);
+            s.extend(item.iter().map(|row| pad(row, "")));
+            s.extend([
+                pad("", side),
+                pad("⏺ The review is in; nothing to fix.", ""),
+            ]);
+            s.extend_from_slice(&panel[at + 1..]);
+            let frame = composer_frame(&s).expect("the frame");
+            s[frame.top + 1] = "❯".to_string();
+            s.truncate(frame.bottom + 1);
+            s.extend([String::new(), QUIET.to_string()]);
+            s
+        };
+        for side in ["", SAYS] {
+            for item in [vec![SHORT], vec![first, rest]] {
+                let r = carried(&item, side);
+                assert_eq!(in_process_work(&r), None, "{item:?} │{side}: {r:#?}");
+                assert_eq!(work_running(&r), None, "{item:?} │{side}");
+                assert_eq!(worker_phase(&r), Phase::Idle, "{item:?} │{side}");
+            }
+            let cut = carried(&[first], side);
+            assert_eq!(in_process_work(&cut), Some(LEFT), "│{side}: {cut:#?}");
+            assert_eq!(work_running(&cut), Some(LEFT), "│{side}");
+            assert!(carried_wait_alone(&cut), "│{side}");
+        }
+    }
+
+    /// THE ROWS AN IDLE COMPACTION DREW BESIDE THE SIDE PANEL ARE READ UP TO ITS RULE: the walk up
+    /// over them to the done row they stand under ([`crate::turn::idle_compaction_from`], which
+    /// [`turn_end_line`] reads) reads the transcript's rows ([`Transcript`]), each cut at the rule
+    /// [`panel_rule`] finds beside the row over the composer's top rule. Read whole before (found
+    /// in the review of the KI-1101-3 panel fixes, 2026-11-04), a blank row beside the panel was no
+    /// blank row and the restored `⏺ Task "…" still running in background` row ended in its padding
+    /// and the rule, so the walk stopped under that row and no done row spoke for the turn:
+    /// background agents a done row there names still running, which no process row names, were no
+    /// work, and with no shell counted beside them nothing held a restart in place that would end
+    /// them. No capture draws an idle compaction beside the panel, so the screens are CONSTRUCTED:
+    /// the measured 2.1.316 capture's rows above its last waiting row (measured beside the panel),
+    /// then the measured 2.1.312 capture's rows from its done row down to its composer, each
+    /// wrapped at the measured rule as the 2.1.316 captures wrap a `⏺` row (at column 2) and a `⎿`
+    /// row (at column 5) there ([`crate::prompt::fixtures::ink_wrap`]) and padded to it, with no
+    /// panel text beside them or the panel's measured heading, and the 2.1.312 capture's composer
+    /// and footer. Its done row names `1 shell, 2 agents still running` (as
+    /// `the_work_a_done_row_names_above_an_idle_compaction_holds_the_restart` constructs it), or `2
+    /// agents still running` over a footer whose `· 1 shell` is dropped, or is as captured (`· 1
+    /// shell still running`), which names no work but the process table's. CONTROL: the same rows
+    /// with no panel (each cut at the rule) read the same.
+    #[test]
+    fn the_rows_an_idle_compaction_drew_beside_the_side_panel_are_read_up_to_its_rule() {
+        use crate::prompt::fixtures::{
+            IDLE_COMPACTED_OVER_A_SHELL_2_1_312, WAITING_AGENTS_WORKFLOWS_2_1_316,
+            screen as captured,
+        };
+        const LEFT: &str = "background work still running";
+        const DONE: &str = "✻ Worked for 23s · done 4:57 PM";
+        const DIFF: &str = "1 file changed                                source: Current ▾";
+        let compacted = captured(IDLE_COMPACTED_OVER_A_SHELL_2_1_312);
+        let done = compacted
+            .iter()
+            .position(|r| r.starts_with(DONE))
+            .expect("the done row");
+        let top = composer_frame(&compacted).expect("the frame").top;
+        let pill = compacted.len() - 1;
+        assert!(compacted[pill].ends_with(" · 1 shell"), "{compacted:#?}");
+        let panel = captured(WAITING_AGENTS_WORKFLOWS_2_1_316);
+        let at = panel
+            .iter()
+            .rposition(|x| x.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let width = panel[at]
+            .split_once('│')
+            .expect("the rule")
+            .0
+            .chars()
+            .count();
+        let beside = |done_row: &str, shell: bool, side: &str| -> Vec<String> {
+            let mut s = panel[..at].to_vec();
+            for (i, row) in compacted.iter().enumerate().take(top).skip(done) {
+                let row = if i == done { done_row } else { row.as_str() };
+                s.extend(
+                    wrapped_at_rule(row, width)
+                        .iter()
+                        .map(|r| format!("{r:<width$}│{side}")),
+                );
+            }
+            s.extend_from_slice(&compacted[top..]);
+            if !shell {
+                let last = s.len() - 1;
+                s[last] = compacted[pill].replace(" · 1 shell", "");
+            }
+            s
+        };
+        let alone = |r: &[String]| -> Vec<String> {
+            r.iter()
+                .map(|row| {
+                    row.split_once('│')
+                        .map_or(row.as_str(), |(left, _)| crate::text::trim_end(left))
+                        .to_string()
+                })
+                .collect()
+        };
+        for side in ["", DIFF] {
+            for (said, shell) in [
+                ("1 shell, 2 agents still running", true),
+                ("2 agents still running", false),
+            ] {
+                let agents = beside(&format!("{DONE} · {said}"), shell, side);
+                assert!(
+                    agents.iter().any(|r| r.starts_with("  \"idleCompaction\"")),
+                    "PRECONDITION: the notice wraps at the rule: {agents:#?}"
+                );
+                for (name, r) in [
+                    ("beside the panel", agents.clone()),
+                    ("no panel", alone(&agents)),
+                ] {
+                    assert!(crate::turn::idle_compacted(&r), "{said}, {name} │{side}");
+                    assert!(done_row_drawn(&r), "{said}, {name} │{side}: {r:#?}");
+                    assert_eq!(in_process_work(&r), Some(LEFT), "{said}, {name} │{side}");
+                    assert_eq!(unlisted_work(&r), Some(LEFT), "{said}, {name} │{side}");
+                    assert_eq!(work_running(&r), Some(LEFT), "{said}, {name} │{side}");
+                }
+            }
+            let shell = beside(&compacted[done], true, side);
+            for (name, r) in [
+                ("beside the panel", shell.clone()),
+                ("no panel", alone(&shell)),
+            ] {
+                assert!(done_row_drawn(&r), "{name} │{side}");
+                assert_eq!(in_process_work(&r), None, "{name} │{side}");
+                assert_eq!(unlisted_work(&r), None, "{name} │{side}");
+            }
+        }
+    }
+
+    /// The measured 2.1.316 panel capture and the cell column of its rule.
+    fn panel_capture_2_1_316() -> (Vec<String>, usize) {
+        use crate::prompt::fixtures::{WAITING_AGENTS_WORKFLOWS_2_1_316, screen as captured};
+        let panel = captured(WAITING_AGENTS_WORKFLOWS_2_1_316);
+        let rule = panel[0]
+            .split_once('│')
+            .expect("the panel's rule")
+            .0
+            .chars()
+            .count();
+        (panel, rule)
+    }
+
+    /// `rows` with no side panel: each row cut at its first `│`, the panel's rule in these screens.
+    fn no_panel(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .map(|row| {
+                row.split_once('│')
+                    .map_or(row.as_str(), |(left, _)| crate::text::trim_end(left))
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A QUESTION ASKED BESIDE THE SIDE PANEL READS AS A QUESTION: the last row the agent said
+    /// ([`last_said_row`], which [`asked_in_prose`] reads for [`worker_phase`] and
+    /// [`background_rest`]) is its words up to the panel's rule ([`Transcript`]). Read whole
+    /// before (KI-1101-3), the row ended in its padding and the rule, or the panel's text after
+    /// it, never in its `?`, so a turn that asks the person something read as `Idle`, a turn over
+    /// (and the turn it ended over the agent's own background work rested as `Idle`), and the
+    /// harness could take it as a turn to carry on rather than one waiting on its answer; where the
+    /// panel's text is its own `───` rule, the question's row read as a separator and was no said
+    /// row at all. No capture draws a question beside the panel, so these screens are CONSTRUCTED
+    /// from the measured 2.1.316 capture: its last message's last row (`NEEDS YOU: an xAI account
+    /// …`) replaced by a question padded to the measured rule, with no panel text after it, the
+    /// panel's measured heading (its second row's) or its measured `───` (its sixth row's), under
+    /// the capture's own waiting row (two background agents and three workflows) or a done row
+    /// padded to the rule, the composer empty and the footer bare. CONTROL: the same rows with no
+    /// panel (each cut at the rule) read the same, and the measured row, a statement, asks nothing.
+    #[test]
+    fn a_question_asked_beside_the_side_panel_reads_as_a_question() {
+        const ASK: &str =
+            "  Should I take the 71 rows myself rather than leave them to the ship step?";
+        const DONE: &str = "✻ Worked for 3m 20s · done 4:57 PM";
+        const QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        let (panel, rule) = panel_capture_2_1_316();
+        let pad = |text: &str, side: &str| format!("{text:<rule$}│{side}");
+        let said = panel
+            .iter()
+            .rposition(|r| r.starts_with("  NEEDS YOU: an xAI account"))
+            .expect("the last said row");
+        let at = panel
+            .iter()
+            .rposition(|r| r.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let heading = panel[1].split_once('│').expect("the heading").1;
+        let ruled = panel[5].split_once('│').expect("the panel's rule row").1;
+        assert!(ruled.starts_with("────") && heading.starts_with("1 file changed"));
+        let screen = |row: &str, side: &str, done: bool| {
+            let mut s = panel.clone();
+            s[said] = pad(row, side);
+            if done {
+                s[at] = pad(DONE, "");
+                let frame = composer_frame(&s).expect("the frame");
+                s[frame.top + 1] = "❯".to_string();
+                s.truncate(frame.bottom + 1);
+                s.extend([String::new(), QUIET.to_string()]);
+            }
+            s
+        };
+        for side in ["", heading, ruled] {
+            for done in [false, true] {
+                let asks = screen(ASK, side, done);
+                for (name, r) in [
+                    ("beside the panel", asks.clone()),
+                    ("no panel", no_panel(&asks)),
+                ] {
+                    let what = format!("{name}, done {done}, │{side}");
+                    let (phase, rest) = if done {
+                        (Phase::Question, None)
+                    } else {
+                        (Phase::Busy, Some(Phase::Question))
+                    };
+                    assert_eq!(background_rest(&r), rest, "{what}");
+                    assert_eq!(worker_phase(&r), phase, "{what}");
+                    assert_eq!(last_said_row(&r), Some(ASK), "{what}");
+                    assert_eq!(last_said_index(&r), Some(said), "{what}");
+                    let tail = crate::turn::said_tail(&r).expect("the last message");
+                    assert!(tail.ends_with(ASK.trim_start()), "{what}: {tail}");
+                    assert!(crate::turn::asks(&tail), "{what}");
+                }
+            }
+        }
+        let measured = panel[said].clone();
+        let told = crate::text::trim_end(measured.split_once('│').expect("the rule").0);
+        for done in [false, true] {
+            let tells = screen(told, "", done);
+            for (name, r) in [
+                ("beside the panel", tells.clone()),
+                ("no panel", no_panel(&tells)),
+            ] {
+                let what = format!("CONTROL {name}, done {done}");
+                assert_eq!(last_said_row(&r), Some(told), "{what}");
+                let (phase, rest) = if done {
+                    (Phase::Idle, None)
+                } else {
+                    (Phase::Busy, Some(Phase::Idle))
+                };
+                assert_eq!(worker_phase(&r), phase, "{what}");
+                assert_eq!(background_rest(&r), rest, "{what}");
+            }
+        }
+    }
+
+    /// THE NOTICE A TURN ENDED ON BESIDE THE SIDE PANEL IS READ UP TO ITS RULE: the notice
+    /// [`notice`] places (and so [`limit_notice`], [`crate::wall::wall`] and the `Limited` phase)
+    /// and the last said notice ([`last_said_notice`]) are read on the transcript's rows, each cut
+    /// at the panel's rule and wrapped in its room ([`Transcript`]). Read whole before
+    /// (KI-1101-3), the message carried each row's padding, the rule and the panel's text after
+    /// it (four `│` in the limit's), and the `/goal` echo the last said notice reads ended in its
+    /// padding and the rule. No capture draws a notice beside the panel, so these screens are
+    /// CONSTRUCTED: the measured 2.1.316 panel capture's rows above its last waiting row, then the
+    /// measured 2.1.283 weekly wall's rows from its completed workflow down to its done row, each
+    /// wrapped at the measured rule as the 2.1.316 captures wrap a `⏺` row (at column 2) and a
+    /// `⎿` row (at column 5) there ([`crate::prompt::fixtures::ink_wrap`]) and padded to it, with
+    /// no panel text beside them or the panel's measured heading, then the 2.1.316 composer's
+    /// rules around the 2.1.283 composer's and footer's rows. CONTROL: the same rows with no panel
+    /// (each cut at the rule) read the same, and the wall reads as measured: its kind, its reset
+    /// and its message.
+    #[test]
+    fn the_notice_a_turn_ended_on_beside_the_side_panel_is_read_up_to_its_rule() {
+        use crate::prompt::fixtures::screen as captured;
+        const MESSAGE: &str = "You've hit your weekly limit · resets 4pm (America/Los_Angeles) \
+            Use your limit reset to reset it now: clau.de/reset /usage-credits to finish what \
+            you’re working on. — Goal paused · usage limit reached · send a message after it \
+            resets to continue";
+        const ECHO: &str =
+            "Goal paused · usage limit reached · send a message after it resets to continue";
+        const RESET: &str = "4pm (America/Los_Angeles)";
+        let wall = captured(include_str!(
+            "fixtures/claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt"
+        ));
+        let measured = limit_notice(&wall);
+        assert_eq!(
+            measured,
+            Some((MESSAGE.to_string(), Some(RESET.to_string()))),
+            "PRECONDITION: the wall as measured"
+        );
+        let from = wall
+            .iter()
+            .position(|r| r.starts_with("⏺ Dynamic workflow"))
+            .expect("the completed workflow");
+        let done = wall
+            .iter()
+            .position(|r| r.starts_with("✻ Sautéed"))
+            .expect("the done row");
+        let frame = composer_frame(&wall).expect("the frame");
+        let (panel, rule) = panel_capture_2_1_316();
+        let at = panel
+            .iter()
+            .rposition(|r| r.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let top = composer_frame(&panel).expect("the panel's frame").top;
+        let heading = panel[1].split_once('│').expect("the heading").1;
+        for side in ["", heading] {
+            let mut beside = panel[..at].to_vec();
+            for row in wall
+                .iter()
+                .take(done + 1)
+                .skip(from)
+                .chain([&String::new()])
+            {
+                beside.extend(
+                    wrapped_at_rule(row, rule)
+                        .iter()
+                        .map(|r| format!("{r:<rule$}│{side}")),
+                );
+            }
+            beside.extend([
+                panel[top].clone(),
+                wall[frame.top + 1].clone(),
+                panel[top + 2].clone(),
+                wall[frame.bottom + 1].clone(),
+            ]);
+            assert!(
+                beside
+                    .iter()
+                    .any(|r| r.starts_with("  second and a third row of the ")),
+                "PRECONDITION: the completed workflow wraps at the rule: {beside:#?}"
+            );
+            for (name, r) in [
+                ("beside the panel", beside.clone()),
+                ("no panel", no_panel(&beside)),
+            ] {
+                let what = format!("{name} │{side}");
+                assert_eq!(limit_notice(&r), measured, "{what}: {r:#?}");
+                let w = crate::wall::wall(&r).expect("the wall");
+                assert_eq!(
+                    (w.kind, w.message.as_str(), w.reset.as_deref()),
+                    (WallKind::UsageWeekly, MESSAGE, Some(RESET)),
+                    "{what}"
+                );
+                assert_eq!(
+                    worker_phase(&r),
+                    Phase::Limited {
+                        message: MESSAGE.to_string(),
+                        reset: Some(RESET.to_string()),
+                    },
+                    "{what}"
+                );
+                let said = last_said_notice(&r).expect("the last said notice");
+                assert_eq!((said.text.as_str(), said.shaped), (ECHO, true), "{what}");
+            }
+        }
+    }
+
+    /// THE SIDE PANEL'S TEXT IS NO WORD OF THE LIMIT A CANCEL LEFT: the walks up the transcript
+    /// that read the newest usage limit and what was served since it
+    /// ([`crate::wall::since_limit`]), how Claude Code's own auto-continue ended ([`crate::wall::auto_continue_end`]), the limit a
+    /// cancel left ([`crate::wall::left_wall`]) and the row such a reader read for want of the rows
+    /// above ([`crate::wall::limit_words_above`]) read the transcript's rows, each cut at the
+    /// panel's rule ([`Transcript`]), and wrap them in its room. Read whole before (KI-1101-3),
+    /// each row's items, split at its wide gaps, took the panel's text after the padding as one of
+    /// them: a limit notice the panel drew (a diff of a capture holding one) beside a row under
+    /// the cancel or beside its done row read as the newest limit, its kind and reset the panel's,
+    /// and the cancel's limit read as none; and the vendor's word that it went on by itself drawn
+    /// there read as the auto-continue's end, so the cancel's limit read as none. No capture draws
+    /// a limit beside the panel, so these screens are CONSTRUCTED: the measured 2.1.316 panel
+    /// capture's rows above its last waiting row, then the measured 2.1.302 cancelled
+    /// auto-continue's rows from its prompt down to its cancel and a blank row, each wrapped at
+    /// the measured rule ([`wrapped_at_rule`]) and padded to it, with no panel text beside them or
+    /// the measured 2.1.283 weekly notice's row or the measured 2.1.296 `⏺ Usage limit reset ·
+    /// continuing automatically` beside one row, then the 2.1.316 composer's rules around the
+    /// 2.1.302 composer's and footer's rows. CONTROL: the same rows in a pane as wide as the rule
+    /// with no panel (each cut at the rule, the composer's rules that wide) read the same, and the
+    /// limit as measured: its kind, reset and placement, its message the notice's and the
+    /// countdown's (in the rule's room the wrap reader also joins the notice's `/upgrade …` row,
+    /// as it does in a pane that wide with no panel). NEGATIVE CONTROL: the vendor's words drawn as
+    /// a row of the transcript under the cancel end the auto-continue, and the cancel leaves no
+    /// limit.
+    #[test]
+    fn the_side_panels_text_is_no_word_of_the_limit_a_cancel_left() {
+        use crate::prompt::fixtures::{
+            WALL_SONNET_BUCKET_AUTO_CONTINUE_CANCELLED_2_1_302, screen as captured,
+        };
+        use crate::wall::{
+            AutoContinue, auto_continue_end, left_wall, limit_words_above, since_limit,
+        };
+        const NOTICE: &str = "You've hit your Sonnet limit · resets 10:06am (America/Los_Angeles)";
+        const COUNTDOWN: &str =
+            " — Usage limit reached · continuing automatically at 10:06am · esc to cancel";
+        let weekly = captured(include_str!(
+            "fixtures/claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt"
+        ));
+        let weekly = weekly
+            .iter()
+            .find(|r| r.contains("You've hit your weekly limit"))
+            .expect("the weekly notice");
+        let fired = captured(crate::prompt::fixtures::WALL_SESSION_RESUMED_BY_ITSELF_MEASURED);
+        let fired = fired
+            .iter()
+            .find(|r| r.starts_with("⏺ Usage limit reset · continuing automatically"))
+            .expect("the vendor's own continue");
+        let cancelled = captured(WALL_SONNET_BUCKET_AUTO_CONTINUE_CANCELLED_2_1_302);
+        let measured = (
+            since_limit(&cancelled),
+            auto_continue_end(&cancelled),
+            limit_words_above(&cancelled),
+            left_wall(&cancelled).expect("the measured cancel's limit"),
+        );
+        assert_eq!(
+            measured.3.message,
+            format!("{NOTICE}{COUNTDOWN}"),
+            "PRECONDITION: the limit as measured"
+        );
+        let from = cancelled
+            .iter()
+            .position(|r| r.starts_with("❯ carry on with the task"))
+            .expect("the prompt");
+        let cancel = cancelled
+            .iter()
+            .position(|r| r.starts_with("⏺ Automatic continue cancelled"))
+            .expect("the cancel");
+        let done = cancelled
+            .iter()
+            .rposition(|r| r.starts_with("✻ Sautéed for 0s"))
+            .expect("the done row");
+        let frame = composer_frame(&cancelled).expect("the frame");
+        let (panel, rule) = panel_capture_2_1_316();
+        let at = panel
+            .iter()
+            .rposition(|r| r.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let top = composer_frame(&panel).expect("the panel's frame").top;
+        let beside = |side: &str, by: usize, under: Option<&str>| {
+            let mut s = panel[..at].to_vec();
+            let rows = cancelled[from..=cancel]
+                .iter()
+                .map(String::as_str)
+                .chain(under)
+                .chain([""]);
+            for (i, row) in (from..).zip(rows) {
+                let side = if i == by { side } else { "" };
+                s.extend(
+                    wrapped_at_rule(row, rule)
+                        .iter()
+                        .map(|r| format!("{r:<rule$}│{side}")),
+                );
+            }
+            s.extend([
+                panel[top].clone(),
+                cancelled[frame.top + 1].clone(),
+                panel[top + 2].clone(),
+                cancelled[frame.bottom + 1].clone(),
+            ]);
+            s
+        };
+        let narrow = |s: &[String]| {
+            let mut v = no_panel(s);
+            let frame = composer_frame(&v).expect("the frame");
+            v[frame.top] = "─".repeat(rule);
+            v[frame.bottom] = "─".repeat(rule);
+            v
+        };
+        let mut misread = Vec::new();
+        for (name, side, by) in [
+            ("no panel text", "", usize::MAX),
+            (
+                "the weekly notice under the cancel",
+                weekly.as_str(),
+                cancel + 1,
+            ),
+            (
+                "the vendor's continue under the cancel",
+                fired.as_str(),
+                cancel + 1,
+            ),
+            (
+                "the weekly notice beside the done row",
+                weekly.as_str(),
+                done,
+            ),
+        ] {
+            for (pane, r) in [
+                ("beside the panel", beside(side, by, None)),
+                (
+                    "CONTROL as wide as the rule",
+                    narrow(&beside(side, by, None)),
+                ),
+            ] {
+                let left = left_wall(&r);
+                let read = (
+                    since_limit(&r),
+                    auto_continue_end(&r),
+                    limit_words_above(&r),
+                    left.as_ref()
+                        .map(|w| (w.kind, w.reset.clone(), w.placement)),
+                );
+                let wanted = (
+                    measured.0.clone(),
+                    measured.1,
+                    measured.2,
+                    Some((
+                        measured.3.kind,
+                        measured.3.reset.clone(),
+                        measured.3.placement,
+                    )),
+                );
+                let message = left.as_ref().map(|w| w.message.as_str());
+                if read != wanted
+                    || !message.is_some_and(|m| m.starts_with(NOTICE) && m.ends_with(COUNTDOWN))
+                    || left != left_wall(&narrow(&beside("", usize::MAX, None)))
+                {
+                    misread.push(format!("{pane}, {name}: {read:?} {message:?}"));
+                }
+            }
+        }
+        assert!(misread.is_empty(), "{misread:#?}");
+        let went_on = beside("", usize::MAX, Some(fired.as_str()));
+        assert_eq!(
+            (auto_continue_end(&went_on), left_wall(&went_on)),
+            (Some(AutoContinue::Fired), None),
+            "NEGATIVE CONTROL"
+        );
+    }
+
+    /// THE TRANSCRIPT ENDS ABOVE THE ROWS BLANK UP TO THE SIDE PANEL'S RULE: with no status line
+    /// over the composer, [`transcript_end`] walks up over what Claude Code parks between the
+    /// transcript and the composer (a blank row, a survey, a tip, a hint against the right edge) on
+    /// the transcript's rows, each cut at the panel's rule and against its room ([`Transcript`]).
+    /// Read whole before (KI-1101-3), a row blank but for its padding and the rule was no blank
+    /// row, so beside the panel the transcript ended under them, the rows of the worker's report
+    /// ([`transcript_end`]'s, in aterm-agent) ran on through them, and only panel text reaching
+    /// the screen's edge made such a row parked, as a hint against the composer's edge. No capture
+    /// draws the live zone with no status line beside the panel, so these screens are CONSTRUCTED
+    /// from the measured 2.1.316 waiting capture: its waiting row blank up to its rule, with no
+    /// panel text beside the rows under the last said row, the panel's measured heading (it
+    /// reaches the screen's edge) or its measured `crates/target-iceb` (it does not), or a hint
+    /// against the rule over the composer. CONTROL: the same rows in a pane as wide as the rule
+    /// with no panel (each cut at the rule, the composer's rules that wide) end there too, and the
+    /// last said row and the person's stop read the same both ways.
+    #[test]
+    fn the_transcript_ends_above_the_rows_blank_up_to_the_side_panels_rule() {
+        const HINT: &str = "◎ /goal active (3h)";
+        let (panel, rule) = panel_capture_2_1_316();
+        let at = panel
+            .iter()
+            .rposition(|r| r.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let said = last_said_index(&panel).expect("the last said row");
+        let top = composer_frame(&panel).expect("the frame").top;
+        assert!(
+            said < at && (said + 1..top).all(|i| panel[i].ends_with('│')),
+            "PRECONDITION: each row from the last said one to the composer is padded to the rule"
+        );
+        let heading = panel[1].split_once('│').expect("the heading").1;
+        let path = panel[3].split_once('│').expect("the path").1;
+        assert_eq!(
+            path, "crates/target-iceb",
+            "PRECONDITION: the panel's measured words"
+        );
+        let narrow = |s: &[String]| {
+            let mut v = no_panel(s);
+            v[top] = "─".repeat(rule);
+            v[top + 2] = "─".repeat(rule);
+            v
+        };
+        let mut misread = Vec::new();
+        for (name, side, hint) in [
+            ("no panel text", "", false),
+            ("the panel's heading", heading, false),
+            ("the panel's path", path, false),
+            ("a hint against the rule", "", true),
+        ] {
+            let mut s = panel.clone();
+            for row in &mut s[said + 1..top] {
+                *row = format!("{:rule$}│{side}", "");
+            }
+            if hint {
+                s[top - 1] = format!("{HINT:>edge$}  │", edge = rule - 2);
+            }
+            for (pane, r) in [
+                ("beside the panel", s.clone()),
+                ("CONTROL as wide as the rule", narrow(&s)),
+            ] {
+                let read = (
+                    transcript_end(&r),
+                    last_said_index(&r),
+                    crate::turn::interrupted(&r),
+                );
+                if read != (said + 1, Some(said), false) {
+                    misread.push(format!("{pane}, {name}: {read:?}"));
+                }
+            }
+        }
+        assert!(misread.is_empty(), "{misread:#?}");
+    }
+
+    /// A CARD PARKED OVER THE COMPOSER BESIDE THE SIDE PANEL IS PARKED: the cards Claude Code
+    /// parks between the transcript and the composer (the rating cards,
+    /// [`crate::survey::survey_block`], the drafts card, the ask cards and the rating's own
+    /// aftermath, [`crate::survey::parked_span`]) are read on the transcript's rows, each cut at the
+    /// panel's rule and laid out in its room ([`Transcript`]), so the readers that step over them
+    /// (the status walk, [`transcript_end`], the last-said walk and so [`crate::turn::interrupted`])
+    /// step over them beside the panel as with none, and [`survey_open`] reads the open rating card
+    /// there. Read whole before (found in review, 2026-11-05), each card row ended in its padding
+    /// and the rule, so beside the panel no card was found (the session survey's rows only by
+    /// [`transcript_end`]'s own survey-row check): the transcript ended under every other card, a
+    /// person's Esc above the plugin survey or the ask read as a turn that ended by itself (the
+    /// last block was the card's head), and no rating card read as open. No capture draws a card
+    /// beside the panel, so these screens are CONSTRUCTED from the
+    /// measured 2.1.316 waiting capture: its rows under the last said row replaced by each card's
+    /// rows as its fixture draws them over the composer (the real session survey of
+    /// `survey-open.txt` and the measured 2.1.286 aftermath steps; the plugin survey, the transcript-share ask
+    /// and the drafts card hand-built from the 2.1.284 render code), under no status line or a
+    /// done row, with no stop above them or the measured Esc of the 2.1.301 watchdog capture
+    /// (`⏺ Bash(sleep 12)` and its `⎿  Interrupted` row), each row padded to the rule. CONTROL:
+    /// the same rows in a pane as wide as the rule with no panel (each cut at the rule, the
+    /// composer's rules that wide) read the same.
+    #[test]
+    fn a_card_parked_over_the_composer_beside_the_side_panel_is_parked() {
+        use crate::prompt::fixtures::{WALL_WATCHDOG_MIDTURN_ESC_2_1_301, screen as captured};
+        const DONE: &str = "✻ Worked for 3m 20s · done 4:57 PM";
+        let (panel, rule) = panel_capture_2_1_316();
+        let said = last_said_index(&panel).expect("the last said row");
+        let top = composer_frame(&panel).expect("the frame").top;
+        let esc = {
+            let r = captured(WALL_WATCHDOG_MIDTURN_ESC_2_1_301);
+            let at = r
+                .iter()
+                .position(|x| x.starts_with("⏺ Bash(sleep 12)"))
+                .expect("the stopped call");
+            r[at..at + 3].to_vec()
+        };
+        assert!(
+            esc[2].contains("Interrupted · What should Claude do instead?"),
+            "PRECONDITION: the measured stop: {esc:#?}"
+        );
+        let card = |text: &str| {
+            let r = captured(text);
+            let done = r
+                .iter()
+                .rposition(|x| x.starts_with('✻') && x.contains(" · done "))
+                .expect("the done row over the card");
+            let below = composer_frame(&r).expect("the frame").top;
+            r[done + 1..below]
+                .iter()
+                .filter(|x| leading_spaces(x) < 20)
+                .cloned()
+                .collect::<Vec<String>>()
+        };
+        let at_rule = |s: &[String]| {
+            let mut v: Vec<String> = s
+                .iter()
+                .map(|row| {
+                    if row.chars().nth(rule) == Some('│') {
+                        crate::text::trim_end(&row.chars().take(rule).collect::<String>())
+                            .to_string()
+                    } else {
+                        row.clone()
+                    }
+                })
+                .collect();
+            let frame = composer_frame(&v).expect("the frame");
+            v[frame.top] = "─".repeat(rule);
+            v[frame.bottom] = "─".repeat(rule);
+            v
+        };
+        let mut misread = Vec::new();
+        for (name, text, rating) in [
+            (
+                "the session survey",
+                include_str!("fixtures/survey-open.txt"),
+                true,
+            ),
+            (
+                "the plugin survey",
+                include_str!("fixtures/claude-2.1.284-survey-plugin.txt"),
+                true,
+            ),
+            (
+                "the rating's pending step",
+                include_str!("fixtures/claude-2.1.286-survey-after-1-pending.txt"),
+                false,
+            ),
+            (
+                "the rating's thanks",
+                include_str!("fixtures/claude-2.1.286-survey-after-1-thanks.txt"),
+                false,
+            ),
+            (
+                "the transcript-share ask",
+                include_str!("fixtures/claude-2.1.284-share-ask-idle.txt"),
+                false,
+            ),
+            (
+                "the drafts card",
+                include_str!("fixtures/claude-2.1.284-drafts-card.txt"),
+                false,
+            ),
+        ] {
+            let card = card(text);
+            assert!(
+                card.iter().any(|r| !crate::text::trim(r).is_empty())
+                    && card.iter().all(|r| r.chars().count() < rule),
+                "PRECONDITION: {name}'s rows fit beside the rule: {card:#?}"
+            );
+            for stopped in [false, true] {
+                for status in [&[][..], &["", DONE][..]] {
+                    let mut under: Vec<String> = Vec::new();
+                    if stopped {
+                        under.push(String::new());
+                        under.extend(esc.iter().cloned());
+                    }
+                    under.extend(status.iter().map(ToString::to_string));
+                    let end = said + 1 + under.len();
+                    under.extend(card.iter().cloned());
+                    let mut s = panel[..=said].to_vec();
+                    s.extend(under.iter().map(|x| format!("{x:<rule$}│")));
+                    s.extend(panel[top..].iter().cloned());
+                    let what =
+                        format!("{name}, stopped {stopped}, done row {}", !status.is_empty());
+                    let control = at_rule(&s);
+                    let read = |r: &[String]| {
+                        (
+                            transcript_end(r),
+                            crate::turn::interrupted(r),
+                            survey_open(r),
+                            last_said_index(r),
+                            worker_phase(r),
+                        )
+                    };
+                    let wanted = (end, stopped, rating);
+                    for (pane, r) in [
+                        ("beside the panel", &s),
+                        ("CONTROL as wide as the rule", &control),
+                    ] {
+                        let got = read(r);
+                        if (got.0, got.1, got.2) != wanted || got != read(&control) {
+                            misread.push(format!("{pane}, {what}: {got:?} wanted {wanted:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(misread.is_empty(), "{misread:#?}");
+    }
+
+    /// A HINT OVER THE COMPOSER BESIDE THE SIDE PANEL STANDS AGAINST ITS RULE: the right-edge
+    /// hint readers ([`crate::turn::goal_active`], [`crate::wall::memory_wall`],
+    /// [`crate::credits::in_use`], [`crate::wall::login_expires_in`]) read a row over the
+    /// composer on the transcript ([`Transcript`]), up to the panel's rule and against its room.
+    /// The measured captures draw these hints on the row over the composer's top rule (the goal
+    /// mark on 2.1.283's three and 2.1.302's, the credits notice on 2.1.300's full-screen ones),
+    /// two cells short of the composer's edge, or in the footer; each measured panel capture draws
+    /// the panel's rule on that row and on none under the composer. Read against the composer's
+    /// width before (KI-1101-3), a hint drawn left of the rule was no hint, and the panel's own
+    /// text reaching the screen's edge was read where a hint stands. No capture draws a hint beside
+    /// the panel, so these screens are CONSTRUCTED from the measured 2.1.316 capture: the row over
+    /// its composer's top rule replaced by each hint's measured words (the goal mark of
+    /// `claude-goal-active-suggestion.txt`, the banner row of `memory-banner-busy.txt`, the notice
+    /// of `claude-2.1.300-credits-in-use-fullscreen.txt`; the login's from its anchors, which no
+    /// capture draws), ending two cells short of the measured rule and padded to it, with no panel
+    /// text beside it or the panel's measured heading. CONTROL: the same rows in a pane as wide as
+    /// the rule with no panel (each row cut at the rule, the composer's rules that wide) read the
+    /// same; NEGATIVE CONTROL: the same words drawn as the panel's text, reaching the screen's
+    /// edge beside a blank row, are no hint (the banner's are wider than the panel).
+    #[test]
+    fn a_hint_over_the_composer_beside_the_side_panel_stands_against_its_rule() {
+        const GOAL: &str = "◎ /goal active (3h)";
+        const MEMORY: &str =
+            "Critical memory usage (140.4GB) — restart and resume with claude --continue";
+        const CREDITS: &str = "Now using usage credits";
+        const LOGIN: &str = "Your login expires in 2 days · run /login to renew";
+        let (panel, rule) = panel_capture_2_1_316();
+        let at = panel
+            .iter()
+            .rposition(|r| r.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let top = composer_frame(&panel).expect("the frame").top;
+        assert_eq!(
+            top,
+            at + 2,
+            "PRECONDITION: one row between the status row and the rule"
+        );
+        let heading = panel[1].split_once('│').expect("the heading").1;
+        let hinted = |hint: &str, side: &str| {
+            let mut s = panel.clone();
+            s[at + 1] = format!("{hint:>edge$}  │{side}", edge = rule - 2);
+            s
+        };
+        let narrow = |s: &[String]| {
+            let mut v = no_panel(s);
+            let frame = composer_frame(&v).expect("the frame");
+            v[frame.top] = "─".repeat(rule);
+            v[frame.bottom] = "─".repeat(rule);
+            v
+        };
+        let read = |s: &[String]| {
+            (
+                crate::turn::goal_active(s),
+                crate::wall::memory_wall(s).map(|w| w.message),
+                crate::credits::in_use(s).is_some(),
+                crate::wall::login_expires_in(s),
+            )
+        };
+        for side in ["", heading] {
+            for (hint, wanted) in [
+                (GOAL, (true, None, false, None)),
+                (MEMORY, (false, Some(MEMORY.to_string()), false, None)),
+                (CREDITS, (false, None, true, None)),
+                (LOGIN, (false, None, false, Some(2))),
+            ] {
+                let s = hinted(hint, side);
+                assert_eq!(read(&s), wanted, "beside the panel: {hint} │{side}");
+                assert_eq!(read(&narrow(&s)), wanted, "CONTROL {hint} │{side}");
+            }
+        }
+        for hint in [GOAL, CREDITS, LOGIN] {
+            let mut s = panel.clone();
+            let room = panel[0].chars().count() - rule - 1;
+            s[at + 1] = format!("{:rule$}│{hint:>room$}", "");
+            assert_eq!(
+                s[at + 1].chars().count(),
+                panel[0].chars().count(),
+                "PRECONDITION: the panel's text reaches the screen's edge"
+            );
+            assert_eq!(
+                read(&s),
+                (false, None, false, None),
+                "NEGATIVE CONTROL {hint}"
+            );
+        }
+    }
+
+    /// `row` as the 2.1.316 panel captures wrap a transcript row at the panel's rule, `rule`
+    /// cells: a `⏺` row's words at column 2, a `⎿` row's at column 5
+    /// ([`crate::prompt::fixtures::ink_wrap`]); any other row fits as it is.
+    fn wrapped_at_rule(row: &str, rule: usize) -> Vec<String> {
+        let (lead, on) = if row.starts_with('⏺') {
+            (2, "  ")
+        } else if crate::text::trim_start(row).starts_with('⎿') {
+            (5, "     ")
+        } else {
+            assert!(row.chars().count() <= rule, "PRECONDITION: {row} fits");
+            return vec![row.to_string()];
+        };
+        let split = row.char_indices().nth(lead).map_or(row.len(), |(i, _)| i);
+        let (head, text) = row.split_at(split);
+        crate::prompt::fixtures::ink_wrap(text, rule - lead)
+            .into_iter()
+            .enumerate()
+            .map(|(k, r)| format!("{}{r}", if k == 0 { head } else { on }))
+            .collect()
+    }
+
+    /// A QUESTION DECLINED BESIDE THE SIDE PANEL IS THE PERSON'S STOP: [`crate::turn::interrupted`]
+    /// (Claude Code's reader's `interrupted`, which tells a person's Esc from a turn's own end)
+    /// reads the last block's head row on the transcript ([`Transcript`]), its words up to the
+    /// panel's rule. Read whole before (found in the review of the KI-1101-3 said-row fixes,
+    /// 2026-11-05), `⏺ User declined to answer questions` ended in its padding and the rule and
+    /// was no longer the anchor `question.declined`, so a person's Esc on a question dialog read
+    /// as no stop and the turn as one that ended by itself. No capture draws a declined question
+    /// beside the panel, so these screens are CONSTRUCTED: the measured 2.1.316 panel capture's
+    /// rows above its last waiting row, then the measured 2.1.282 Esc capture's rows from its
+    /// declined row down to its done row and a blank row, each wrapped at the measured rule
+    /// ([`wrapped_at_rule`]) and padded to it, with no panel text beside them or the panel's
+    /// measured heading, then the 2.1.316 composer's rules around the 2.1.282 composer's and
+    /// footer's rows. CONTROL: the same rows with no panel (each cut at the rule) read the same;
+    /// NEGATIVE CONTROL: the agent's own `⏺ Done.` beside panel text that holds the declined
+    /// words is no stop.
+    #[test]
+    fn a_question_declined_beside_the_side_panel_is_the_persons_stop() {
+        use crate::prompt::fixtures::{QUESTION_DECLINED_ESC, screen as captured};
+        use crate::reader::Program;
+        const DECLINED: &str = "User declined to answer questions";
+        let declined = captured(QUESTION_DECLINED_ESC);
+        let from = declined
+            .iter()
+            .position(|r| r.starts_with('⏺') && r.ends_with(DECLINED))
+            .expect("the declined row");
+        let done = declined
+            .iter()
+            .position(|r| r.starts_with("✻ Crunched for 3s"))
+            .expect("the done row");
+        let frame = composer_frame(&declined).expect("the frame");
+        let (panel, rule) = panel_capture_2_1_316();
+        let at = panel
+            .iter()
+            .rposition(|r| r.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let top = composer_frame(&panel).expect("the panel's frame").top;
+        let heading = panel[1].split_once('│').expect("the heading").1;
+        let beside = |head: &str, side: &str| {
+            let mut s = panel[..at].to_vec();
+            for (i, row) in declined
+                .iter()
+                .enumerate()
+                .take(done + 1)
+                .skip(from)
+                .chain([(usize::MAX, &String::new())])
+            {
+                let row = if i == from { head } else { row.as_str() };
+                let side = if i == from { side } else { "" };
+                s.extend(
+                    wrapped_at_rule(row, rule)
+                        .iter()
+                        .map(|r| format!("{r:<rule$}│{side}")),
+                );
+            }
+            s.extend([
+                panel[top].clone(),
+                declined[frame.top + 1].clone(),
+                panel[top + 2].clone(),
+                declined[frame.bottom + 1].clone(),
+            ]);
+            s
+        };
+        for side in ["", heading] {
+            let stop = beside(&declined[from], side);
+            assert!(
+                stop.iter().any(|r| r.starts_with("     High contrast)")),
+                "PRECONDITION: the question's row wraps at the rule: {stop:#?}"
+            );
+            for (name, r) in [
+                ("beside the panel", stop.clone()),
+                ("no panel", no_panel(&stop)),
+            ] {
+                let what = format!("{name} │{side}");
+                assert!(crate::turn::interrupted(&r), "{what}: {r:#?}");
+                assert!(Program::Claude.reader().interrupted(&r), "{what}");
+                assert_eq!(worker_phase(&r), Phase::Idle, "{what}");
+            }
+        }
+        let told = beside(&declined[from].replace(DECLINED, "Done."), DECLINED);
+        assert!(!crate::turn::interrupted(&told), "NEGATIVE CONTROL");
+    }
+
+    /// A QUESTION BESIDE THE SIDE PANEL ON A ROW THAT HOLDS AN EMOJI READS AS A QUESTION: the cut
+    /// at the panel's rule ([`panel_cut`]) finds the rule's `│` by its cell column, which counts
+    /// each character in the cells aterm's grid draws it in ([`crate::question::cells`]); Claude
+    /// Code pads each row by those cells (string-width, as the grid draws an emoji, two cells), so
+    /// the rule stands at its column on a row that holds one. Counted one cell before (found in
+    /// the review of the KI-1101-3 said-row fixes, 2026-11-05), `✅` (U+2705), `⭐` (U+2B50),
+    /// `🚀` (U+1F680) and `🫡` (U+1FAE1) put the rule's `│` a cell short of its column, so the
+    /// row was not cut, ended in its padding and the rule, and the question read as `Idle`. No
+    /// capture draws an emoji beside the panel, so these screens are CONSTRUCTED from the measured
+    /// 2.1.316 capture as [`a_question_asked_beside_the_side_panel_reads_as_a_question`] builds
+    /// them: its last message's last row replaced by a question that holds an emoji, padded to
+    /// the measured rule by the grid's widths (`aterm_grapheme::char_width`), under the capture's
+    /// waiting row or a done row. CONTROL: the same rows with no panel read the same, and so does
+    /// the question with CJK words, which were counted two cells before too.
+    #[test]
+    fn a_question_beside_the_side_panel_on_a_row_with_an_emoji_reads_as_a_question() {
+        const DONE: &str = "✻ Worked for 3m 20s · done 4:57 PM";
+        const QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        let (panel, rule) = panel_capture_2_1_316();
+        let pad = |text: &str| {
+            let drawn: usize = text.chars().map(aterm_grapheme::char_width).sum();
+            format!("{text}{}│", " ".repeat(rule - drawn))
+        };
+        let said = panel
+            .iter()
+            .rposition(|r| r.starts_with("  NEEDS YOU: an xAI account"))
+            .expect("the last said row");
+        let at = panel
+            .iter()
+            .rposition(|r| r.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let screen = |row: &str, done: bool| {
+            let mut s = panel.clone();
+            s[said] = pad(row);
+            if done {
+                s[at] = pad(DONE);
+                let frame = composer_frame(&s).expect("the frame");
+                s[frame.top + 1] = "❯".to_string();
+                s.truncate(frame.bottom + 1);
+                s.extend([String::new(), QUIET.to_string()]);
+            }
+            s
+        };
+        for ask in [
+            "  ✅ Tests and lint pass. Should I push to main?",
+            "  ⭐ The bench is 4% faster. Should I record it?",
+            "  🚀 The release is staged. Should I promote it?",
+            "  🫡 Noted. Should I take the 71 rows myself?",
+            "  日本語の見出しは直しました。Should I push to main?",
+        ] {
+            for done in [false, true] {
+                let asks = screen(ask, done);
+                assert!(
+                    asks[said].ends_with('│'),
+                    "PRECONDITION: padded to the rule"
+                );
+                for (name, r) in [
+                    ("beside the panel", asks.clone()),
+                    ("no panel", no_panel(&asks)),
+                ] {
+                    let what = format!("{name}, done {done}: {ask}");
+                    let (phase, rest) = if done {
+                        (Phase::Question, None)
+                    } else {
+                        (Phase::Busy, Some(Phase::Question))
+                    };
+                    assert_eq!(last_said_row(&r), Some(ask), "{what}");
+                    assert_eq!(background_rest(&r), rest, "{what}");
+                    assert_eq!(worker_phase(&r), phase, "{what}");
+                }
+            }
+        }
+    }
+
+    /// A QUESTION BESIDE THE SIDE PANEL ON A ROW THAT HOLDS WHAT THE GRID DRAWS IN NO CELL OF ITS
+    /// OWN READS AS A QUESTION: the rule's `│` is found by its cell column, counted as aterm's grid
+    /// lays the row out ([`crate::question::cells`], the walk of `aterm_grapheme::GridColumns`,
+    /// which aterm-core's `grid_columns_agree_with_what_the_grid_paints` holds to the painted
+    /// grid): a variation selector, a zero-width joiner and a combining mark are stored in the
+    /// cell before them, a VS16 widens a one-cell emoji to two (`❤️`), and the grid folds an emoji
+    /// after a joiner, a skin tone after its base and a flag's second regional indicator into the
+    /// cell before. Counted before as one cell or two a character, none of them zero (named in
+    /// KI-1101-3, 2026-11-05), `✅️` (U+2705 U+FE0F), a ZWJ sequence, a skin tone, a flag, a
+    /// keycap and a combining mark put the rule's `│` past its column, so the row was not cut,
+    /// ended in its padding and the rule, and the question read as `Idle`. Counted then as the
+    /// grid's write path lays a row out (found in review, 2026-11-05), a VS15 after a two-cell
+    /// character (`✅︎`, `中︎`) put the rule a cell past its column, because the grid empties
+    /// that cell's right half and reads it back as a space. No capture draws these beside the
+    /// panel, so these screens are CONSTRUCTED from the measured 2.1.316 capture as
+    /// [`a_question_beside_the_side_panel_on_a_row_with_an_emoji_reads_as_a_question`] builds
+    /// them, each question padded to the measured rule by the grid's own layout
+    /// (`aterm_grapheme::str_grid_columns`) and read as the grid reads that row back
+    /// ([`crate::question::read_back`]). CONTROL: the same rows with no panel read the same, and
+    /// so does `❤️` (U+2764 U+FE0F), a one-cell emoji its VS16 widens, which the per-character
+    /// count put in its two cells too.
+    #[test]
+    fn a_question_beside_the_side_panel_on_a_row_the_grid_joins_reads_as_a_question() {
+        const DONE: &str = "✻ Worked for 3m 20s · done 4:57 PM";
+        const QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        let (panel, rule) = panel_capture_2_1_316();
+        let pad = |text: &str| {
+            let drawn = aterm_grapheme::str_grid_columns(text);
+            crate::question::read_back(&format!("{text}{}│", " ".repeat(rule - drawn)))
+        };
+        let said = panel
+            .iter()
+            .rposition(|r| r.starts_with("  NEEDS YOU: an xAI account"))
+            .expect("the last said row");
+        let at = panel
+            .iter()
+            .rposition(|r| r.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let screen = |row: &str, done: bool| {
+            let mut s = panel.clone();
+            s[said] = pad(row);
+            if done {
+                s[at] = pad(DONE);
+                let frame = composer_frame(&s).expect("the frame");
+                s[frame.top + 1] = "❯".to_string();
+                s.truncate(frame.bottom + 1);
+                s.extend([String::new(), QUIET.to_string()]);
+            }
+            s
+        };
+        let mut misread = Vec::new();
+        for (ask, joined) in [
+            (
+                "  \u{2705}\u{FE0F} Tests and lint pass. Should I push to main?",
+                true,
+            ),
+            (
+                "  \u{1F469}\u{200D}\u{1F4BB} The review is done. Should I push to main?",
+                true,
+            ),
+            (
+                "  \u{2705}\u{FE0F} Tests pass, \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \
+                 drawn whole. Should I push to main?",
+                true,
+            ),
+            (
+                "  \u{1F44D}\u{1F3FD} Agreed. Should I take the 71 rows myself?",
+                true,
+            ),
+            (
+                "  \u{1F1EF}\u{1F1F5} The locale is set. Should I push to main?",
+                true,
+            ),
+            (
+                "  1\u{FE0F}\u{20E3} The first step is done. Should I start the second?",
+                true,
+            ),
+            (
+                "  The re\u{301}sume\u{301} is updated. Should I push it?",
+                true,
+            ),
+            (
+                "  \u{2705}\u{FE0E} Tests and lint pass. Should I push to main?",
+                true,
+            ),
+            (
+                "  \u{4E2D}\u{FE0E} The heading is fixed. Should I push to main?",
+                true,
+            ),
+            (
+                "  \u{2764}\u{FE0F} Thanks for the review. Should I record it?",
+                false,
+            ),
+        ] {
+            let each: usize = ask
+                .chars()
+                .map(|c| aterm_grapheme::char_width(c).max(1))
+                .sum();
+            assert_eq!(
+                aterm_grapheme::str_grid_columns(ask) != each,
+                joined,
+                "PRECONDITION: the grid lays {ask:?} out in other cells than a cell or two a \
+                 character, or (the CONTROL) in as many"
+            );
+            for done in [false, true] {
+                let asks = screen(ask, done);
+                for (name, r) in [
+                    ("beside the panel", asks.clone()),
+                    ("no panel", no_panel(&asks)),
+                ] {
+                    let said = crate::question::read_back(ask);
+                    let wanted = if done {
+                        (Some(said.as_str()), None, Phase::Question)
+                    } else {
+                        (Some(said.as_str()), Some(Phase::Question), Phase::Busy)
+                    };
+                    let read = (last_said_row(&r), background_rest(&r), worker_phase(&r));
+                    if read != wanted {
+                        misread.push(format!("{name}, done {done}: {read:?}"));
+                    }
+                }
+            }
+        }
+        assert!(misread.is_empty(), "{misread:#?}");
     }
 
     #[test]
@@ -6981,6 +9010,137 @@ mod tests {
         }
     }
 
+    /// EVERY WORK THE FOOTER'S PILL COUNTS IS WORK A RESTART IN PLACE WOULD END
+    /// ([`work_running`]): Claude Code counts what still runs in its footer's pill, one label for
+    /// each kind (2.1.286, read from its source: `1 Artifact comment monitor`, `1 MCP task`, `2
+    /// background tasks`, `◇ 1 cloud session`; no capture draws one of them), and with no done row
+    /// (`showTurnDuration` off) or one that names none of it, the pill is the one place the screen
+    /// names that work. [`work_running`] read only a shell or a monitor counted alone there, so a
+    /// question or a limit's notice, each read ahead of the soft busy, read at rest over the work,
+    /// and a line lost there was restarted in place over it. The screens are `wait_bg17.out` with
+    /// its monitor labels removed and its last reply turned into a question (CONSTRUCTED), each
+    /// label in the footer: under a done row that names none, with no done row, and with no done
+    /// row under a limit's notice (the measured Fable one). CONTROLS: the label on the done row,
+    /// read before as well; the footer counting nothing, or a count of no work (`10 files
+    /// changed`).
+    #[test]
+    fn every_work_the_footers_pill_counts_is_work_a_restart_would_end() {
+        const FABLE: &str = "  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.";
+        let said = "⏺ Two runs in, both binaries agree and every checksum verifies. Waiting for the next events.";
+        let done_row = "✻ Cogitated for 2s · done 8:50 PM";
+        let asked: Vec<String> = waiter_capture(include_str!("fixtures/wait_bg17.out"))
+            .iter()
+            .map(|row| {
+                row.replace(" · 1 monitor still running", "")
+                    .replace(" · 1 monitor ·", " ·")
+                    .replace(
+                        said,
+                        "⏺ Two runs in, both binaries agree and every checksum verifies. Shall I \
+                         compare the next runs too?",
+                    )
+            })
+            .collect();
+        let at = asked
+            .iter()
+            .rposition(|row| row == done_row)
+            .expect("done row");
+        let mut undone = asked.clone();
+        undone.remove(at);
+        let mut walled = undone.clone();
+        walled.insert(at, FABLE.to_string());
+        let footer = |rows: &[String], label: &str| {
+            with_footer(
+                rows.to_vec(),
+                &format!("  ⏵⏵ auto mode on · {label} · ← for agents · ↓ to manage"),
+            )
+        };
+        for (place, rows) in [("under a done row", &asked), ("with no done row", &undone)] {
+            assert_eq!(worker_phase(rows), Phase::Question, "{place}");
+            assert_eq!(work_running(rows), None, "{place}: nothing counted");
+            let files = footer(rows, "10 files changed");
+            assert_eq!(work_running(&files), None, "{place}: no work counted");
+        }
+        assert!(matches!(worker_phase(&walled), Phase::Limited { .. }));
+        assert_eq!(work_running(&walled), None, "a limit over nothing counted");
+        for label in [
+            "1 Artifact comment monitor",
+            "1 MCP task",
+            "2 background tasks",
+            "◇ 1 cloud session",
+        ] {
+            for (place, rows) in [
+                ("under a done row", &asked),
+                ("with no done row", &undone),
+                ("under a limit's notice", &walled),
+            ] {
+                let r = footer(rows, label);
+                let phase = worker_phase(&r);
+                assert!(
+                    matches!(phase, Phase::Question | Phase::Limited { .. }),
+                    "{label} {place}: {phase:?}"
+                );
+                assert_eq!(
+                    work_running(&r),
+                    Some("background work running"),
+                    "{label} {place}"
+                );
+            }
+            let mut named = asked.clone();
+            named[at] = format!("{done_row} · {label} still running");
+            assert_eq!(
+                work_running(&named),
+                Some("background work still running"),
+                "{label} on the done row"
+            );
+        }
+    }
+
+    /// THE WORK NO PROCESS ROW NAMES ([`unlisted_work`]) LEAVES THE SHELLS AND MONITORS TO THE
+    /// PROCESS TABLE: any work the footer's pill counts (2.1.286's labels, read from its source; no
+    /// capture draws one), alone or joined with a shell, but never a shell or a monitor, named on a
+    /// done row or counted alone in the pill, which [`work_running`] reads too. The screens are
+    /// `wait_bg17.out` (its done rows and pill name `1 monitor`) and, CONSTRUCTED from it, the same
+    /// screen with the done rows' monitor dropped and the pill counting each item instead.
+    #[test]
+    fn the_work_no_process_row_names_leaves_the_shells_and_monitors_to_the_table() {
+        let saved = waiter_capture(include_str!("fixtures/wait_bg17.out"));
+        assert_eq!(work_running(&saved), Some("a monitor still running"));
+        assert_eq!(unlisted_work(&saved), None, "its monitor");
+        let pill = |count: &str| -> Vec<String> {
+            saved
+                .iter()
+                .map(|row| {
+                    row.replace(" · 1 monitor still running", "")
+                        .replace("· 1 monitor ·", &format!("· {count} ·"))
+                })
+                .collect()
+        };
+        for (count, running) in [
+            ("2 shells", "a shell running"),
+            ("1 monitor", "a monitor running"),
+            ("1 shell, 1 monitor", "a shell running"),
+        ] {
+            let r = pill(count);
+            assert_eq!(unlisted_work(&r), None, "{count}");
+            assert_eq!(work_running(&r), Some(running), "{count}");
+        }
+        for (count, running) in [
+            ("1 MCP task", "background work running"),
+            ("2 background tasks", "background work running"),
+            ("◇ 1 cloud session", "background work running"),
+            ("1 Artifact comment monitor", "background work running"),
+            ("1 shell, 1 MCP task", "a shell running"),
+        ] {
+            let r = pill(count);
+            assert_eq!(
+                unlisted_work(&r),
+                Some("background work running"),
+                "{count}"
+            );
+            assert_eq!(work_running(&r), Some(running), "{count}");
+        }
+    }
+
     const MANAGER_FOOTER: &str = "  ⏵⏵ bypass permissions on · 1 monitor";
     const MANAGER_FOOTER_QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
     const ARTIFACT_BAR: &str = "  ⧉  name · name";
@@ -7515,7 +9675,7 @@ mod tests {
             "  ⎿  You've hit your Sonnet limit · resets 4pm (America/Los_Angeles)",
             GENERIC,
         );
-        let read = notice_placed(&bucket).expect("a wall");
+        let read = notice_placed(&bucket, &Transcript::of(&bucket)).expect("a wall");
         assert_eq!(
             (read.kind, read.placement, read.reset.as_deref()),
             (
@@ -7541,7 +9701,8 @@ mod tests {
                 WallKind::Spend,
             ),
         ] {
-            let read = notice_placed(&walled(row, footer));
+            let r = walled(row, footer);
+            let read = notice_placed(&r, &Transcript::of(&r));
             assert_eq!(read.map(|w| w.kind), Some(kind), "{row}");
         }
         const WEEKLY: &str =
@@ -7575,7 +9736,7 @@ mod tests {
             "  ⚠ You've hit your session limit · resets 4pm",
         );
         for r in [&session, &named] {
-            let read = notice_placed(r).expect("a wall");
+            let read = notice_placed(r, &Transcript::of(r)).expect("a wall");
             assert_eq!(
                 (read.kind, read.placement),
                 (WallKind::UsageSession, Placement::Footer),
@@ -7602,7 +9763,7 @@ mod tests {
             ("continued", &continued),
             ("asked", &asked),
         ] {
-            let read = notice_placed(r).expect("a wall");
+            let read = notice_placed(r, &Transcript::of(r)).expect("a wall");
             assert_eq!(
                 (read.kind, read.placement, read.reset.as_deref()),
                 (WallKind::UsageSession, Placement::Footer, Some("4pm")),
@@ -7628,7 +9789,7 @@ mod tests {
                 String::new(),
             ],
         );
-        let read = notice_placed(&own).expect("a wall");
+        let read = notice_placed(&own, &Transcript::of(&own)).expect("a wall");
         assert_eq!(
             (read.kind, read.placement),
             (WallKind::ModelBucket { consent: false }, Placement::Footer),

@@ -154,14 +154,17 @@ fn sibling_targets() -> Vec<(u32, String)> {
     let mut targets: Vec<(u32, String)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Some(pid) = aterm_types::control_socket::instance_pid(&name) else {
+            let file_name = e.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(pid) = aterm_types::control_socket::instance_pid(name) else {
                 continue;
             };
             if !name.ends_with(".sock") || pid == own_pid {
                 continue;
             }
-            let sock = dir.join(&name).to_string_lossy().into_owned();
+            let sock = dir.join(name).to_string_lossy().into_owned();
             if remember(&mut seen, &sock) {
                 targets.push((pid, sock));
             }
@@ -169,6 +172,9 @@ fn sibling_targets() -> Vec<(u32, String)> {
     }
     if let Ok(entries) = std::fs::read_dir(dir.join("graph")) {
         for e in entries.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
             let Ok(body) = crate::proxy::read_private_text(&e.path()) else {
                 continue;
             };

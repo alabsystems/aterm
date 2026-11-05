@@ -490,6 +490,79 @@ mod tests {
         assert_eq!(logical, vec!['\u{05D0}', '\u{05D1}', '\u{05D2}']);
     }
 
+    /// RIS, DECSTR and the host's reset return BiDi to the host's configured mode and direction
+    /// (`bidi = "disabled"`, which no program can choose), never to the power-on Implicit/Auto, so
+    /// Hebrew sent after the reset stays in logical order and an unchanged reload has nothing to
+    /// restore. A program's own change (BDSM, `CSI 8 l`) is undone by the reset as before.
+    /// NEGATIVE CONTROL: with `reset_modes` leaving BiDi to `TerminalModes::new()` (or DECSTR
+    /// writing Implicit/Auto), `` keeps the host's BiDi `` fails for that reset.
+    #[test]
+    fn every_reset_returns_bidi_to_the_hosts_configured_mode() {
+        const HEBREW: &str = "\u{05D0}\u{05D1}\u{05D2}";
+        let logical = vec!['\u{05D0}', '\u{05D1}', '\u{05D2}'];
+        let row0 = |t: &mut Terminal| -> Vec<char> {
+            t.cell_frame(4, 16).cells[0]
+                .iter()
+                .take(3)
+                .map(|cell| cell.ch)
+                .collect()
+        };
+        let mut config = TerminalConfig::default();
+        config.bidi.mode = BiDiMode::Disabled;
+        config.bidi.direction = aterm_types::ParagraphDirection::Rtl;
+        let host = || {
+            let mut t = Terminal::new(4, 16);
+            assert!(t.apply_config(&config).contains(&ConfigChange::BiDi));
+            // The program's own change, which a reset undoes.
+            t.process(b"\x1b[8l");
+            assert_eq!(
+                t.modes().bidi_mode,
+                BiDiMode::Explicit,
+                "PRECONDITION: BDSM"
+            );
+            t
+        };
+        let resets: [(&str, fn(&mut Terminal)); 3] = [
+            ("RIS", |t| t.process(b"\x1bc")),
+            ("DECSTR", |t| t.process(b"\x1b[!p")),
+            ("the host's reset", Terminal::reset),
+        ];
+        for (name, reset) in resets {
+            let mut t = host();
+            reset(&mut t);
+            assert_eq!(
+                (t.modes().bidi_mode, t.modes().bidi_direction),
+                (BiDiMode::Disabled, aterm_types::ParagraphDirection::Rtl),
+                "{name} keeps the host's BiDi"
+            );
+            t.process(HEBREW.as_bytes());
+            assert_eq!(
+                row0(&mut t),
+                logical,
+                "{name}: Hebrew stays in logical order"
+            );
+            assert!(
+                !t.apply_config(&config).contains(&ConfigChange::BiDi),
+                "{name}: an unchanged reload has nothing to restore"
+            );
+        }
+        let mut same_batch = host();
+        same_batch.process(format!("\x1bc{HEBREW}").as_bytes());
+        assert_eq!(
+            row0(&mut same_batch),
+            logical,
+            "RIS and the text in one batch"
+        );
+
+        // The default config still reorders after a reset.
+        let (mut implicit, _) = clean_terminal_with_defaults();
+        implicit.process(format!("\x1bc{HEBREW}").as_bytes());
+        assert_eq!(
+            row0(&mut implicit),
+            vec!['\u{05D2}', '\u{05D1}', '\u{05D0}']
+        );
+    }
+
     fn settle(term: &mut Terminal) -> u64 {
         term.take_damage();
         assert!(!term.has_damage());

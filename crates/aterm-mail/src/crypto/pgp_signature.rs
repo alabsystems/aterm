@@ -7,7 +7,7 @@ pub fn signing_keys(private: &str, password: &[u8]) -> Result<Vec<[u8; 32]>, Str
     if private.len() > 1024 * 1024 {
         return Err("Private key exceeds limit".into());
     }
-    let bytes = armor(private, "PRIVATE KEY BLOCK")?;
+    let bytes = zeroize::Zeroizing::new(armor(private, "PRIVATE KEY BLOCK")?);
     let mut rest = bytes.as_slice();
     let mut keys = Vec::new();
     while !rest.is_empty() {
@@ -96,11 +96,10 @@ pub fn verify(data: &[u8], signature: &str, keys: &[[u8; 32]]) -> Result<(), Str
     if !aterm_digest::ct_eq(prefix, &digest.as_ref()[..2]) {
         return Err("Address-token signature mismatch".into());
     }
-    if keys.iter().any(|key| {
-        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
-            .verify(digest.as_ref(), &raw)
-            .is_ok()
-    }) {
+    if keys
+        .iter()
+        .any(|key| astream_aead::signature::verify(key, digest.as_ref(), &raw))
+    {
         Ok(())
     } else {
         Err("Address-token signature did not verify".into())

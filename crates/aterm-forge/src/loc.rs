@@ -157,13 +157,19 @@ fn registry_srcs() -> &'static [PathBuf] {
         let mut out = Vec::new();
         if let Ok(entries) = std::fs::read_dir(home.join("registry").join("src")) {
             for entry in entries.flatten() {
-                let path = entry.path();
-                let is_index = path
+                if !entry
                     .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("index.crates.io-"));
-                if is_index && path.is_dir() {
-                    out.push(path);
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("index.crates.io-"))
+                {
+                    continue;
+                }
+                let is_dir = entry
+                    .file_type()
+                    .map(|ft| ft.is_dir() || (ft.is_symlink() && entry.path().is_dir()))
+                    .unwrap_or(false);
+                if is_dir {
+                    out.push(entry.path());
                 }
             }
         }

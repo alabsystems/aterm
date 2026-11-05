@@ -66,6 +66,8 @@ fn every_seed_holds_every_law() {
         total.receipts += s.receipts;
         total.halts += s.halts;
         total.delivered += s.delivered;
+        total.deliveries_pipelined += s.deliveries_pipelined;
+        total.retires_pipelined += s.retires_pipelined;
         total.exits += s.exits;
         total.log_records += s.log_records;
         total.mirrored += s.mirrored;
@@ -159,6 +161,14 @@ fn every_seed_holds_every_law() {
             total.gap_fenced,
         ),
         ("gap fences the bridge lifted", total.fences_lifted),
+        (
+            "`deliver` lines sent in one write with another",
+            total.deliveries_pipelined,
+        ),
+        (
+            "`outbox sent` lines sent in one write with another",
+            total.retires_pipelined,
+        ),
         ("kills while an inbox commit was held", total.kills_holding),
         ("state-dir writes failed", total.writes_failed),
         (
@@ -231,6 +241,159 @@ fn every_seed_holds_every_law_against_a_broker_that_does_not_gap_fence() {
     );
 }
 
+/// A world of the committed seeds under a rate limit that binds ([`super::world::binding_rate`],
+/// critic item E06).
+fn rate_bound(seed: u64) -> Opts {
+    let mut o = Opts::seed(seed);
+    o.rate_limit = Some(super::world::binding_rate());
+    o
+}
+
+/// THE COMMITTED SEEDS UNDER A RATE LIMIT THAT BINDS (critic item E06): every law holds, `dup
+/// post`, `order:` and the law of the limit's wait (`rate:`, `bus::State::rate_laws`: a bridge
+/// that read a refusal for the rate sends nothing more until its wait is over) among them, on a
+/// broker that refuses the bridge's publishes for the rate in every seed, gap-fenced too, while
+/// aterm's own limit refuses none of the committed sweep's. NEGATIVE CONTROLS: a bridge that
+/// takes a refusal for the rate for good loses a post, and one that retries it at once publishes
+/// inside the wait.
+#[test]
+fn every_seed_holds_every_law_under_a_rate_limit_that_binds() {
+    let outs = run_all(&rate_bound, 1..=COMMITTED_SEEDS);
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} seeds break a law under a rate limit that binds:\n{}",
+        failures.len(),
+        outs.len(),
+        failures.join("\n")
+    );
+    let limited = outs.iter().filter(|out| out.stats.rate_limited > 0).count();
+    let fenced = outs
+        .iter()
+        .filter(|out| out.stats.rate_limited > 0 && out.stats.gap_fenced > 0)
+        .count();
+    eprintln!(
+        "rate-limited in {limited} of {} seeds, {fenced} of them gap-fenced too",
+        outs.len()
+    );
+    assert!(
+        limited == outs.len() && fenced > 0,
+        "the limit bound in {limited} of {} seeds, gap-fenced in {fenced}: not every seed it \
+         judges",
+        outs.len()
+    );
+    let refused: u64 = committed().iter().map(|out| out.stats.rate_limited).sum();
+    assert_eq!(refused, 0, "aterm's own limit refused the committed sweep");
+
+    for (mutant, law, witness) in [
+        (Mutant::RateLimitedIsForGood, "retired unlanded|lost", 2),
+        (Mutant::RetryRateLimitedAtOnce, "rate:", 1),
+    ] {
+        let off = breaking_at(
+            &move |s| rate_bound(s).with(mutant),
+            law,
+            witness,
+            CONTROL_SEEDS,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "NEGATIVE CONTROL: with {mutant:?}, no seed within {CONTROL_SEEDS} breaks `{law}`"
+            )
+        });
+        eprintln!(
+            "{mutant:?} at seed {}: {}",
+            off.seed,
+            off.violations
+                .iter()
+                .find(|v| breaks(v, law))
+                .map_or("", String::as_str)
+        );
+        assert!(
+            !breaks_law(&run(&rate_bound(off.seed)), law),
+            "with the rule on, the same seed keeps `{law}`"
+        );
+    }
+}
+
+/// A LANDED POST'S BOOKKEEPING, ONE GROUP OVER ITS ACK PASS (critic item E07,
+/// `Bridge::land_group`): the self-lane log's offset, then the post's own records, then aterm's
+/// `outbox sent`, then the in-flight entry's end and the reservation's, each step's posts at
+/// once, and every law holds across a kill between any two of them (the committed sweeps hold
+/// them; here, the order's three controls). The hole E06 recorded is closed for a post (a
+/// receipt's entry still ends at its ack): under ten records a second and a burst of four
+/// ([`super::world::binding_rate`]), seed 78 ended a post's entry at its ack, killed the bridge
+/// before its `outbox sent`, and left the next one the record to deliver while the post stood
+/// queued; once retention gave the record up, the drain's retry at the pin appended a second
+/// copy. NEGATIVE CONTROLS: the entry ended at the ack, as on main, delivers twice there; the
+/// entry ended ahead of the self-lane log's offset leaves the next bridge an own record it takes
+/// for forged; the reservation ended ahead of aterm's `outbox sent` leaves a post aterm lists and
+/// no pin holds, published again at a fresh sequence. The sim's endpoint answers `outbox sent`
+/// with `OK` or `ERR no such session` alone, so the paths that keep a post queued past an answer
+/// (`ERR busy`) or a hold are the unit test's
+/// (`bridge::tests::a_post_aterm_keeps_queued_is_held_until_its_retry_so_a_move_delivers_it_once`).
+#[test]
+fn a_landed_posts_entry_stands_until_its_post_left_aterms_outbox() {
+    let fixed = run(&rate_bound(78));
+    assert!(
+        fixed.violations.is_empty(),
+        "seed 78 under ten records a second and a burst of four: {}",
+        report(&fixed)
+    );
+    type Switch = Box<dyn Fn(u64) -> Opts + Sync>;
+    let controls: Vec<(Mutant, Switch, &str, u64)> = vec![
+        (
+            Mutant::LandedBeforeOutboxSent,
+            Box::new(|s| rate_bound(s).with(Mutant::LandedBeforeOutboxSent)),
+            "dup delivery",
+            78,
+        ),
+        (
+            Mutant::LandedBeforeAcked,
+            Box::new(|s| Opts::seed(s).with(Mutant::LandedBeforeAcked)),
+            "forged-self",
+            26,
+        ),
+        (
+            Mutant::RetireBeforeOutboxSent,
+            Box::new(|s| Opts::seed(s).with(Mutant::RetireBeforeOutboxSent)),
+            "dup post",
+            2,
+        ),
+    ];
+    let shown = aterm_spec::check::each(&controls, |(_, opts, law, witness)| {
+        let off = breaking_at(opts.as_ref(), law, *witness, COMMITTED_SEEDS);
+        let on = off
+            .as_ref()
+            .map(|out| run(&with_every_rule(opts(out.seed))));
+        (off, on)
+    });
+    for ((mutant, _, law, _), (off, on)) in controls.iter().zip(&shown) {
+        let (Some(off), Some(on)) = (off, on) else {
+            panic!(
+                "NEGATIVE CONTROL: with {mutant:?}, no seed within {COMMITTED_SEEDS} breaks `{law}`"
+            );
+        };
+        eprintln!(
+            "{mutant:?} at seed {}: {}",
+            off.seed,
+            off.violations
+                .iter()
+                .find(|v| breaks(v, law))
+                .map_or("", String::as_str)
+        );
+        assert!(
+            !breaks_law(on, law),
+            "with the rule on, seed {} still breaks `{law}`: {}",
+            off.seed,
+            report(on)
+        );
+    }
+}
+
 #[test]
 fn the_loop_goes_on_without_its_acks_and_a_waiting_loop_never_does() {
     let held: Vec<&Outcome> = committed()
@@ -243,7 +406,33 @@ fn the_loop_goes_on_without_its_acks_and_a_waiting_loop_never_does() {
     );
     let tried: u64 = held.iter().map(|out| out.stats.tries_not_yet).sum();
     assert!(tried > 0, "the loop never went on without an answer");
-    let seeds: Vec<u64> = held.iter().map(|out| out.seed).collect();
+    // A seed whose loop never met an un-acked delivery makes no choice a waiting loop would make
+    // otherwise, so the waiting runs take, by the seed's world bits, the first held seed of each
+    // kind of world that met one. One seed's count changing moves only the picks it was first for.
+    // A law only a waiting loop on a seed left out breaks goes unseen, and no shipped build waits.
+    type Kind = (&'static str, fn(&Opts) -> bool);
+    let kinds: [Kind; 7] = [
+        ("power cuts", |o| o.power_cuts),
+        ("bus losses", |o| o.bus_losses),
+        ("a mirror", |o| o.mirror),
+        ("write errors", |o| o.write_errors),
+        ("scaled rules", |o| o.retained && o.scaled),
+        ("no retention", |o| !o.retained),
+        ("an `auto` mirror", |o| o.mirror && o.auto),
+    ];
+    let mut seeds: Vec<u64> = kinds
+        .iter()
+        .map(|&(kind, is)| {
+            held.iter()
+                .find(|out| out.stats.tries_not_yet > 0 && is(&Opts::seed(out.seed)))
+                .unwrap_or_else(|| {
+                    panic!("PRECONDITION: no held seed with {kind} met an un-acked delivery")
+                })
+                .seed
+        })
+        .collect();
+    seeds.sort_unstable();
+    seeds.dedup();
     let waiting = aterm_spec::check::each(&seeds, |&seed| {
         run(&Opts::seed(seed).with(Mutant::WaitForEveryAck))
     });
@@ -485,7 +674,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "model:",
-            122,
+            66,
         ),
         (
             "the endpoint forgets the offsets a move took (no loss)",
@@ -499,7 +688,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "lost:",
-            240,
+            304,
         ),
         (
             "the endpoint forgets the offsets a move took (receipts)",
@@ -590,13 +779,13 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "dup post",
-            6,
+            39,
         ),
         (
             "the bridge lifts the gap fences its refused writes set",
             Box::new(|s| Opts::seed(s).with(Mutant::KeepGapFences)),
             "liveness",
-            8,
+            29,
         ),
         (
             "a drain sends no listed post that was in flight at its peek",
@@ -628,7 +817,7 @@ fn each_rule_switched_off_is_caught() {
                 )
             }),
             "cap-compromised",
-            46058,
+            64594,
         ),
         (
             "a move of the log drops the mirror's pinned batch",
@@ -639,7 +828,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "mirror:",
-            320,
+            306,
         ),
         (
             "a replaced log forgets the mirror's cursors (aterm-gui's `forget_landed`)",
@@ -654,7 +843,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "mirror:",
-            26,
+            24,
         ),
         (
             "a relaunched bridge republishes the mirror's pinned batch at its sequences",
@@ -671,7 +860,7 @@ fn each_rule_switched_off_is_caught() {
             "`session-exited` publishes the session's `exited` row",
             Box::new(|s| Opts::seed(s).with(Mutant::SkipExitedRow)),
             "presence:",
-            36,
+            194,
         ),
         (
             "a session's exit moves the roster's count",
@@ -702,7 +891,7 @@ fn each_rule_switched_off_is_caught() {
             "the attach records the predecessor's will it read",
             Box::new(|s| Opts::with_a_sibling(s).with(Mutant::IgnoreWitnessedWill)),
             "presence:",
-            25,
+            32,
         ),
         (
             "a lower incarnation's row under another state dir's mark is not its own",
@@ -720,13 +909,13 @@ fn each_rule_switched_off_is_caught() {
             "an offset below the self-lane window is not added to it",
             Box::new(|s| Opts::seed(s).with(Mutant::RememberBelowTheWindow)),
             "forged-self",
-            92,
+            108,
         ),
         (
             "the recovery a write error stopped is done before the run record",
             Box::new(|s| Opts::seed(s).with(Mutant::BeginRunPastAFailedRecovery)),
             "liveness",
-            171,
+            59,
         ),
         (
             "the mirror judges its pin once the recovery reconciled it",
@@ -750,19 +939,24 @@ fn each_rule_switched_off_is_caught() {
             "a mirror floor covers a batch only once this open made it durable",
             Box::new(|s| Opts::seed(s).with(Mutant::TrustTheFloorThatReads)),
             "mirror total",
-            2315,
+            443,
         ),
         (
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            158,
+            7324,
         ),
+        // Critic item E07's grouped landing moved this rule's first seed in the world with write
+        // errors and quits past 20,000 (to 27907); where power is lost both ways a recovery is
+        // owed more often, and its first seed is 9538.
         (
             "a run whose recovery is owed makes no clean stop",
-            Box::new(|s| erring_quitting(s).with(Mutant::CleanStopOverAnOwedRecovery)),
+            Box::new(|s| {
+                both_ways_erring_quitting(s).with(Mutant::CleanStopOverAnOwedRecovery)
+            }),
             "mirror",
-            19155,
+            9538,
         ),
         (
             "a recovery tried again moves each file once",
@@ -836,13 +1030,13 @@ fn each_rule_switched_off_is_caught() {
             "the inbox's gap notice moves no commit past the held records in it",
             Box::new(|s| scaled(s).with(Mutant::CommitPastTheGap)),
             "model:",
-            5,
+            10,
         ),
         (
             "the inbox's gap notice is told to aterm",
             Box::new(|s| scaled(s).with(Mutant::TellNoGap)),
             "given up untold",
-            114,
+            190,
         ),
         (
             "the mirror's window takes the broker's oldest=",
@@ -854,7 +1048,7 @@ fn each_rule_switched_off_is_caught() {
             "a read back that meets its subject's floor reads again told",
             Box::new(|s| Opts::seed(s).with(Mutant::ReadBackWithoutTheHeld)),
             "dup post",
-            239,
+            106,
         ),
         (
             "a read of one offset below its filter's oldest reads again told (F3)",
@@ -866,31 +1060,31 @@ fn each_rule_switched_off_is_caught() {
             "the deadline sweep reads on from a floor retention raised (F4)",
             Box::new(|s| asking(s).with(Mutant::SweepWithAPlainFetch)),
             "neither answered nor expired",
-            4,
+            20,
         ),
         (
             "a topic replay reads on from a floor retention raised (F4)",
             Box::new(|s| asking(s).with(Mutant::TopicReplayWithAPlainFetch)),
             "topic:",
-            13,
+            5,
         ),
         (
             "a topic replay tells aterm what retention gave up of the topic (F4)",
             Box::new(|s| asking(s).with(Mutant::TopicReplayTellsNoGap)),
             "silent skip",
-            13,
+            14,
         ),
         (
             "a topic catch-up tells the uncounted notice below the first broadcast it delivers (F4)",
             Box::new(|s| asking(s).with(Mutant::TopicReplayDropsAnUncountedNotice)),
             "silent skip",
-            443,
+            583,
         ),
         (
             "the broadcast face's gap notice hands its cursors to the catch-up (F4)",
             Box::new(|s| asking(s).with(Mutant::SayFaceGapUntold)),
             "silent skip",
-            13,
+            14,
         ),
         (
             "the deadline sweep reads the asker's lane for an answer (F4)",
@@ -908,25 +1102,25 @@ fn each_rule_switched_off_is_caught() {
             "an answer is delivered only once the deadline it settles is off the disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::DeliverOverAnUnwrittenSettle)),
             "was handed",
-            1170,
+            606,
         ),
         (
             "an attach takes a hand-off's files before its incarnation (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptAfterTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            2212,
+            660,
         ),
         (
             "an adoption names the attach of the hand-off it takes (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptWithoutTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            5132,
+            205,
         ),
         (
             "a post retires only once its deadline is on disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::RetireOverAnUnwrittenDeadline)),
             "neither answered nor expired",
-            45,
+            13,
         ),
     ];
     // The replay's drain rule (a record the attach published again is delivered once its
@@ -1096,198 +1290,72 @@ const FOUND: &[(u64, usize, &str)] = &[
     (7963, 400, "a refused `exited` row nothing wrote again"),
 ];
 
+/// A bug [`FOUND_RULES`] can switch back on keeps at most one row per world, here and in the lists
+/// below: a seed that holds every law with its rule on and reaches the bug with it off, which
+/// [`each_found_bug_is_reached_again_with_its_rule_off`] checks. A change that moves the seed off
+/// its bug replaces the row with a seed that reaches it. A bug no [`Mutant`] re-creates (each of
+/// [`FOUND`]'s, and 1844's below) keeps every row it found, since nothing says when one of them
+/// leaves it.
 const FOUND_ERRING: &[(u64, usize, &str)] = &[
-    // A sequential plain Opts::seed search of 1..=60000 at ff5a34af25 first reached the
-    // retained-head readback bug at 558 (400 steps); the same seed with every rule on held
-    // every law. This bucket replays that exact plain world.
+    // The E07 review's fix (a landed post's entry stands until the post left aterm's outbox; a
+    // read back ends the entry it finds standing) moved 171 and 187 off their bugs (each holds
+    // every law still). Each replacement is the first seed to 60,000 that breaks its law with the
+    // rule off and holds all with it on ([`found_again`]).
     (
-        558,
-        400,
-        "an entry read back from its head on a log a move continued below it",
-    ),
-    // R6's proof (a successor's start that writes nothing) moved 558's, 4067's and 36319's
-    // trajectories off this bug (each holds every law still); the first seed of a plain search
-    // to 60,000 that reaches it with its rule off.
-    (
-        9002,
-        400,
-        "an entry read back from its head on a log a move continued below it",
-    ),
-    // The post journal (B19) and its review (each attach named in the journal) moved every
-    // seed's writes, so not every row reaches its bug with the rule off any more; each rule
-    // keeps one that does (each_found_bug_is_reached_again_with_its_rule_off), 31 added for
-    // the sweep's when the review moved 93, 125 and 185 off it.
-    // The asks journal (C04) moved every seed's writes again: an ask is one append where it was
-    // two replaces, and no reach of these four rules survived on the rows below. Each row here
-    // is the first seed of a plain search to 60,000 that reaches its bug with its rule off, and
-    // holds every law with the rule on.
-    (
-        14,
-        400,
-        "a record delivered while its in-flight entry stood",
-    ),
-    (
-        299,
-        400,
-        "a sweep a write error stopped, closed by the run record",
-    ),
-    (494, 400, "a record dropped while the disk refused the drop"),
-    (
-        22702,
-        400,
-        "an entry read back from its head on a log a move continued below it",
-    ),
-    (28, 400, "a deduped replay moved the self-lane window down"),
-    (
-        31,
+        59,
         400,
         "a sweep a write error stopped, closed by the run record",
     ),
     (
-        75,
+        15,
         400,
         "a pin judged before the reconcile a write error stopped",
     ),
-    (92, 400, "a deduped replay moved the self-lane window down"),
-    (
-        93,
-        400,
-        "a sweep a write error stopped, closed by the run record",
-    ),
-    (
-        95,
-        400,
-        "a pin judged before the reconcile a write error stopped",
-    ),
-    (
-        107,
-        400,
-        "a pin judged before the reconcile a write error stopped",
-    ),
-    (122, 400, "a deduped replay moved the self-lane window down"),
-    (
-        125,
-        400,
-        "a sweep a write error stopped, closed by the run record",
-    ),
-    (142, 400, "a deduped replay moved the self-lane window down"),
-    (154, 400, "a deduped replay moved the self-lane window down"),
-    (168, 400, "a deduped replay moved the self-lane window down"),
-    (
-        171,
-        400,
-        "a pin judged before the reconcile a write error stopped",
-    ),
-    (
-        185,
-        400,
-        "a sweep a write error stopped, closed by the run record",
-    ),
-    // D06's first-pass hold (the mirror's first pass after an attach held for the deliveries
-    // the attach owes), in its first form (behind what the loop held queued), moved 299's, 31's,
-    // 93's, 125's and 185's trajectories off this bug (each holds every law still; 299 reached
-    // it again with the hold off); 171, the first seed of a plain search to 60,000 that reached
-    // it then with its rule off, reaches it under the hold as it stands too.
-    (
-        171,
-        400,
-        "a sweep a write error stopped, closed by the run record",
-    ),
-    (
-        187,
-        400,
-        "a pin judged before the reconcile a write error stopped",
-    ),
-    (
-        191,
-        400,
-        "a pin judged before the reconcile a write error stopped",
-    ),
+    // After composing grouped landing with the power-cut repairs, 1435 no longer reaches it.
+    // Explicit discovery returned this first witness in the same world and 60,000-seed bound.
     (443, 400, "a floor whose flush failed trusted as it read"),
-    (
-        746,
-        400,
-        "a record delivered while its in-flight entry stood",
-    ),
-    (
-        1240,
-        400,
-        "a record delivered while its in-flight entry stood",
-    ),
-    (
-        1530,
-        400,
-        "a record delivered while its in-flight entry stood",
-    ),
     // Sim item B05: a cut dropped the dedup key of a record an in-flight entry named.
     (
         12,
         400,
         "an entry published again at its pin after a cut dropped its key",
     ),
+    // Grouped landing moved 31196 off it, and the E07 review's fix 12556; the first replacement in
+    // this world to 60,000. A bridge unit test holds the rule with no seed:
+    // `bridge::tests::an_entry_a_replay_published_on_a_moved_generation_is_read_back_from_the_fork`.
     (
-        24,
-        400,
-        "an entry published again at its pin after a cut dropped its key",
-    ),
-    (
-        45,
-        400,
-        "an entry published again at its pin after a cut dropped its key",
-    ),
-    (
-        92,
-        400,
-        "an entry published again at its pin after a cut dropped its key",
-    ),
-    // B19's review: the post journal's drop the disk refused stayed in the open, and the
-    // re-attach of the same process published it after the sender's later post.
-    (
-        10236,
-        400,
-        "a record dropped while the disk refused the drop",
-    ),
-    (
-        8680,
-        400,
-        "a record dropped while the disk refused the drop",
-    ),
-    // R6's proof moved 10236's and 8680's trajectories off this bug (each holds every law
-    // still); the first seed of this world that reaches it with its rule off.
-    (
-        1851,
-        400,
-        "a record dropped while the disk refused the drop",
-    ),
-    // D06's first-pass hold, in its first form, moved 494's, 10236's, 8680's and 1851's
-    // trajectories off this bug (each holds every law still; 494 reached it again with the hold
-    // off); 23209, the first seed of this world to 60,000 that reached it then with its rule off,
-    // reaches it under the hold as it stands too.
-    (
-        23209,
-        400,
-        "a record dropped while the disk refused the drop",
-    ),
-    // D06's first-pass hold, as it stands (held for a post the attach's drain listed), moved
-    // 558's, 9002's and 22702's trajectories off this bug (each holds every law still); the
-    // first seed of a plain search to 60,000 that reaches it with its rule off.
-    (
-        31196,
+        26926,
         400,
         "an entry read back from its head on a log a move continued below it",
+    ),
+    // Composing grouped landing with main moved 106 and 13 off their bugs, and the E07 review's
+    // fix 28. Each replacement is the first seed to 60,000 that breaks its law with the rule off
+    // and holds all with it on.
+    (108, 400, "a deduped replay moved the self-lane window down"),
+    (
+        14,
+        400,
+        "a record delivered while its in-flight entry stood",
+    ),
+    // Critic item E07's grouped landing (a landed post's entry stands until aterm answers its
+    // `outbox sent`; an ack pass's landings are one write each) moved every seed's journal and lane
+    // steps, and every row of this bug off it (each holds every law still); the first seed
+    // of a plain search to 60,000 that reaches it with its rule off, and holds every law with it
+    // on ([`found_again`]).
+    (
+        25964,
+        400,
+        "a record dropped while the disk refused the drop",
     ),
 ];
 
 const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
+    // Grouped landing moved 3273 off it, and the E07 review's fix 558; the first replacement in
+    // this world to 60,000.
     (
-        1482,
+        7324,
         400,
-        "an attach delivered on a new log whose witness it could not write",
-    ),
-    (
-        7470,
-        400,
-        "an attach delivered on a log with no witness, one a power cut tore",
+        "an attach delivered on a log the state dir's witness does not name",
     ),
 ];
 
@@ -1297,61 +1365,24 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
         400,
         "a record the attach published again delivered while its post was queued",
     ),
+    // Critic item E07's grouped landing (a landed post's entry stands until aterm answers its
+    // `outbox sent`; an ack pass's landings are one write each) moved every seed's journal and lane
+    // steps, and 6751's, 7755's, 735's, 2270's, 3018's and 6371's trajectories off this bug (each
+    // holds every law still); the first seed of this world to 60,000 that reaches it with its
+    // rule off ([`found_again`]).
     (
-        6751,
+        210,
         400,
         "a move an `auto` mirror met before its hello left its pinned batch to recover",
     ),
+    // The read-back bug (`an entry read back from its head`) has no row here: grouped landing
+    // moved 4067 and 36319 off it to 16088, and the E07 review's fix (a read back ends the entry
+    // it finds standing) moved 16088 off it, and no seed of this world to 60,000 reaches it with
+    // its rule off since. `FOUND_ERRING`'s row and a bridge unit test hold it.
+    // Main replaced the obsolete carried-cut seed 31508 with 1179. Grouped landing moved that
+    // row too, and the E07 review's fix 462; this is the first replacement in this world to 60,000.
     (
-        7755,
-        400,
-        "a move an `auto` mirror met before its hello left its pinned batch to recover",
-    ),
-    // R6's proof moved 6751's and 7755's trajectories off this bug (each holds every law
-    // still); the first seed of this world that reaches it with its rule off.
-    (
-        735,
-        400,
-        "a move an `auto` mirror met before its hello left its pinned batch to recover",
-    ),
-    // Critic item C13's mirror burst, which carries the inbox commit a round holds or would
-    // hold, moved 6751's, 7755's and 735's trajectories off this bug; the first seed of a
-    // search to 60,000 that reaches it with its rule off.
-    (
-        2270,
-        400,
-        "a move an `auto` mirror met before its hello left its pinned batch to recover",
-    ),
-    // D06's first-pass hold, as it stands, moved 6751's, 7755's, 735's and 2270's trajectories
-    // off this bug (each holds every law still); the first seed of this world to 60,000 that
-    // reaches it with its rule off.
-    (
-        3018,
-        400,
-        "a move an `auto` mirror met before its hello left its pinned batch to recover",
-    ),
-    // Critic item E04's hold of a take nothing would carry moved 6751's, 7755's, 735's, 2270's
-    // and 3018's trajectories off this bug (each holds every law still); the first seed of this
-    // world to 60,000 that reaches it with its rule off.
-    (
-        6371,
-        400,
-        "a move an `auto` mirror met before its hello left its pinned batch to recover",
-    ),
-    (
-        4067,
-        400,
-        "an entry read back from its head on a log a move continued below it",
-    ),
-    // Critic item B08's held inbox commit moved 4067's trajectory off this bug (it holds every
-    // law still); the first seed of a search to 60,000 that reaches it with its rule off.
-    (
-        36319,
-        400,
-        "an entry read back from its head on a log a move continued below it",
-    ),
-    (
-        31508,
+        931,
         400,
         "a read back that went on at the floor missed the record a hold rule carried below it",
     ),
@@ -1361,21 +1392,6 @@ type FoundIn = (fn(u64) -> Opts, u64, usize, &'static str);
 
 /// Found seeds of the retained worlds that are none of the lists above (aterm-link B05 review).
 const FOUND_RETAINED: &[FoundIn] = &[
-    (
-        windowed,
-        3924,
-        400,
-        "a hello's judge that said the mirror runs kept the wait it no longer showed",
-    ),
-    // D06's first-pass hold, in its first form, moved 3924's trajectory off this bug (it holds
-    // every law still, and reached it again with the hold off); 3834, the first windowed seed to
-    // 60,000 that reached it then with its rule off, reaches it under the hold as it stands too.
-    (
-        windowed,
-        3834,
-        400,
-        "a hello's judge that said the mirror runs kept the wait it no longer showed",
-    ),
     // Critic item E04's hold of a take nothing would carry moved 3924's and 3834's trajectories
     // off this bug (each holds every law still); the first windowed seed to 60,000 that reaches
     // it with its rule off.
@@ -1388,37 +1404,40 @@ const FOUND_RETAINED: &[FoundIn] = &[
 ];
 
 const FOUND_QUITTING: &[FoundIn] = &[
-    (
-        erring_quitting,
-        41,
-        400,
-        "a post retried at its pin after a cut dropped its key",
-    ),
-    // R6's proof moved 41's trajectory off this bug (it holds every law still); the first seed
-    // of this world that reaches it with its rule off.
+    // The first seed of this world that reached it with its rule off after R6's proof.
     (
         erring_quitting,
         46,
         400,
         "a post retried at its pin after a cut dropped its key",
     ),
+    // Grouped landing moved 15410 off it; the first replacement in this world to 60,000.
     (
-        erring_quitting,
-        863,
+        both_ways_erring_quitting,
+        9538,
         400,
-        "a clean stop over a recovery owed vouched for an unreconciled pin",
+        "a clean stop over a recovery owed vouched for what nobody reconciled or set aside",
+    ),
+    // These rare bugs were found scanning the quitting world, which no regular sweep runs.
+    // Grouped landing moved 3362 and 31710 off their bugs; their replacements below are the first
+    // to 60,000 that break their law with the rule off and hold every law with it on. 5951 remains.
+    (
+        both_ways_erring_quitting,
+        3306,
+        400,
+        "a clean stop left the heads it kept unflushed",
     ),
     (
         both_ways_erring_quitting,
-        406,
+        5951,
         400,
-        "a clean stop over a recovery owed vouched for a torn pin",
+        "an entry sent ahead of a post of its sender's with none",
     ),
     (
         both_ways_erring_quitting,
-        1682,
+        13679,
         400,
-        "a clean stop over a recovery owed vouched for a torn file",
+        "a retired record's copy ended the memory of its torn file's",
     ),
 ];
 
@@ -1539,6 +1558,41 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
         "order",
     ),
     (
+        "a floor whose flush failed trusted as it read",
+        Mutant::TrustTheFloorThatReads,
+        "mirror total",
+    ),
+    (
+        "an attach delivered on a log the state dir's witness does not name",
+        Mutant::AttachPastAnUnwrittenWitness,
+        "dup delivery",
+    ),
+    (
+        "a clean stop over a recovery owed vouched for what nobody reconciled or set aside",
+        Mutant::CleanStopOverAnOwedRecovery,
+        "mirror",
+    ),
+    (
+        "a read back that went on at the floor missed the record a hold rule carried below it",
+        Mutant::ReadBackWithoutTheHeld,
+        "dup post",
+    ),
+    (
+        "a clean stop left the heads it kept unflushed",
+        Mutant::StopLeavesTheHeadsUnflushed,
+        "dup post",
+    ),
+    (
+        "an entry sent ahead of a post of its sender's with none",
+        Mutant::EntryAheadOfAPostWithNone,
+        "order",
+    ),
+    (
+        "a retired record's copy ended the memory of its torn file's",
+        Mutant::OneQuarantineMemoryPerSource,
+        "quarantine copies:",
+    ),
+    (
         "a follow judged on a log its session had yet to be told",
         Mutant::FollowOnTheBrokersLog,
         "it follows it from",
@@ -1546,10 +1600,14 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
 ];
 
 /// **NEGATIVE CONTROL: EACH BUG A FOUND SEED PINS IS REACHED AGAIN WITH ITS
-/// RULE OFF** ([`FOUND_RULES`]), by one of its seeds at the world and steps
+/// RULE OFF** ([`FOUND_RULES`]), by its row at the world and steps
 /// [`the_seeds_that_broke_a_law_hold_every_law`] replays it at. A change to a
-/// world moves its trajectories; one that moved every seed of a bug off it
-/// would leave that replay holding nothing for the bug.
+/// world moves its trajectories, and one that moved a row off its bug would
+/// leave that replay holding nothing for the bug.
+///
+/// One row holds a bug, so a regression only another seed's trajectory would meet goes unseen: no
+/// test runs a seed past its fixed ranges and these rows. Explicit discovery searches for a
+/// replacement in the failing row's own world; another world's witness cannot replace it.
 #[test]
 fn each_found_bug_is_reached_again_with_its_rule_off() {
     let found = found();
@@ -1572,24 +1630,54 @@ fn each_found_bug_is_reached_again_with_its_rule_off() {
         o.steps = steps;
         (i, seed, breaks_law(&run(&o), law))
     });
-    let missed: Vec<String> = FOUND_RULES
+    let missed: Vec<String> = reached
         .iter()
-        .enumerate()
-        .filter(|&(i, _)| !reached.iter().any(|&(j, _, hit)| j == i && hit))
-        .map(|(i, (what, rule, law))| {
-            let seeds: Vec<u64> = reached
-                .iter()
-                .filter(|&&(j, _, _)| j == i)
-                .map(|&(_, seed, _)| seed)
-                .collect();
-            format!("{what}: {rule:?} breaks no `{law}` at seeds {seeds:?}")
+        .filter(|&&(_, _, hit)| !hit)
+        .map(|&(i, seed, _)| {
+            let (what, rule, law) = FOUND_RULES[i];
+            let mut line = format!("{what}: {rule:?} breaks no `{law}` at seed {seed}");
+            if witness_mode() == WitnessMode::Discover {
+                let (_, row) = runs
+                    .iter()
+                    .find(|(j, row)| *j == i && row.1 == seed)
+                    .unwrap();
+                line.push_str(&found_again(*row, rule, law));
+                eprintln!("{line}");
+            }
+            line
         })
         .collect();
     assert!(
         missed.is_empty(),
-        "no found seed reaches these bugs with their rule off:\n  {}",
+        "found rows that no longer reach their bug with its rule off; replace each with a seed \
+         that does:\n  {}",
         missed.join("\n  ")
     );
+}
+
+/// How far explicit discovery searches for a found bug's next seed: the bound the searches
+/// recorded beside [`FOUND`]'s rows ran to.
+const FOUND_SEARCH: u64 = 60_000;
+
+/// EXPLICIT DISCOVERY OF A FOUND BUG'S NEXT SEED ([`each_found_bug_is_reached_again_with_its_rule_off`]):
+/// the first seed to [`FOUND_SEARCH`] of the world and steps of the failing row that
+/// breaks `law` with `rule` off and holds every law with it on, said for the row to record.
+fn found_again((world, last, steps, _): FoundIn, rule: Mutant, law: &str) -> String {
+    let at = |seed: u64| Opts {
+        steps,
+        ..world(seed)
+    };
+    let next = first_within(&|seed| at(seed).with(rule), FOUND_SEARCH, &|out| {
+        breaks_law(out, law) && run(&at(out.seed)).violations.is_empty()
+    });
+    match next {
+        Some(out) => format!(
+            "; record seed {} at {steps} steps in the list of seed {last}'s world, the first to \
+             {FOUND_SEARCH} that reaches it with its rule off and holds every law with it on",
+            out.seed
+        ),
+        None => format!("; no seed of seed {last}'s world to {FOUND_SEARCH} reaches it"),
+    }
 }
 
 #[test]
@@ -1650,7 +1738,7 @@ fn a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on() {
         torn.iter().map(|out| out.stats.set_aside).sum::<u64>()
     );
     let refusing = |s| Opts::seed(s).with(Mutant::RefuseTornAfterPowerCut);
-    let wedged = breaking_at(&refusing, "liveness", 13, CONTROL_SEEDS)
+    let wedged = breaking_at(&refusing, "liveness", 7, CONTROL_SEEDS)
         .expect("NEGATIVE CONTROL: with the old refusal, a torn file wedges some seed's attach");
     eprintln!(
         "the old refusal at seed {}: {}",
@@ -1718,7 +1806,10 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
         o.torn_device = false;
         o
     };
-    for out in run_all(&untorn, 1..=SEEDS) {
+    // Only a world with a mirror (`seed / 2` odd) and a power cut (`seed` odd) can tear a pin. A pin
+    // stop with another cause, in a world that lacks either, goes unseen here.
+    let tearable: Vec<u64> = (1..=SEEDS).filter(|s| s % 4 == 3).collect();
+    for out in aterm_spec::check::each(&tearable, |&seed| run(&untorn(seed))) {
         assert!(
             !breaks_law(&out, "stopped for its pin"),
             "seed {}: with the torn pin kept, on a device that never tears, the mirror stopped \
@@ -1732,7 +1823,7 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
         "the same seed with the torn pin kept, on a device that never tears, breaks no law"
     );
     for (mutant, law, witness) in [
-        (Mutant::KeyInThePinAlone, "alias keys", 7),
+        (Mutant::KeyInThePinAlone, "alias keys", 19),
         (Mutant::TotalInThePinAlone, "mirror total", 3),
     ] {
         let off = breaking_at(
@@ -3006,13 +3097,39 @@ fn no_copy_of_the_dir_nor_restore_over_it_proves_anything_under_a_power_cut() {
         st.take_incarnation(0).expect("its incarnation");
         st.raise_logfloor(floor).expect("its floor");
     };
-    for (control, rule) in [
-        ("", ProofRule::Ships),
-        ("any_directory", ProofRule::AnyDirectory),
-        ("this_directory", ProofRule::ThisDirectory),
-        ("this_inode", ProofRule::ThisInode),
+    let held = |&(starts, raises, lost): &(u64, u64, u64)| (starts, raises, lost) == (0, 0, 0);
+    let lied = |&(starts, raises, lost): &(u64, u64, u64)| starts + raises > 0 && lost > 0;
+    // Under each rule the arms before `lies_from` hold on all 32 schedules. Each arm from it on
+    // lies, and stops at the schedule that shows it, since one is all that claim needs.
+    for (control, rule, lies_from, law) in [
+        (
+            "",
+            ProofRule::Ships,
+            ARMS.len(),
+            "a copy's or a restore's proof vouched",
+        ),
+        (
+            "any_directory",
+            ProofRule::AnyDirectory,
+            0,
+            "CONTROL any_directory: some copy's proof never vouched for what the cut took",
+        ),
+        (
+            "this_directory",
+            ProofRule::ThisDirectory,
+            2,
+            "CONTROL this_directory: a copy elsewhere proves nothing, what lands on the dir that \
+             made the proof does",
+        ),
+        (
+            "this_inode",
+            ProofRule::ThisInode,
+            3,
+            "CONTROL this_inode: a new inode proves nothing, bytes written into the old one do",
+        ),
     ] {
         let mut counts = [(0u64, 0u64, 0u64); ARMS.len()];
+        let mut schedules = [0u64; ARMS.len()];
         for (arm, count) in counts.iter_mut().enumerate() {
             for seed in 1..=32u64 {
                 let scratch = |prefix: &str| {
@@ -3067,37 +3184,23 @@ fn no_copy_of_the_dir_nor_restore_over_it_proves_anything_under_a_power_cut() {
                 count.0 += u64::from(began.proven);
                 count.1 += u64::from(!raise_flushed);
                 count.2 += u64::from(!open_reads || floor < sent_under);
+                schedules[arm] = seed;
+                if arm >= lies_from && lied(count) {
+                    break;
+                }
             }
         }
-        for (arm, (starts, raises, lost)) in ARMS.iter().zip(counts) {
+        for ((arm, (starts, raises, lost)), ran) in ARMS.iter().zip(counts).zip(schedules) {
             eprintln!(
-                "a copy or a restore, control {control:?}, {arm}: 32 schedules, the proof admitted \
-                 {starts} starts and {raises} floors, {lost} lost the OPEN or the floor at the cut"
+                "a copy or a restore, control {control:?}, {arm}: {ran} schedules, the proof \
+                 admitted {starts} starts and {raises} floors, {lost} lost the OPEN or the floor \
+                 at the cut"
             );
         }
-        let held = |&(starts, raises, lost): &(u64, u64, u64)| (starts, raises, lost) == (0, 0, 0);
-        let lied = |&(starts, raises, lost): &(u64, u64, u64)| starts + raises > 0 && lost > 0;
-        match control {
-            "" => assert!(
-                counts.iter().all(held),
-                "a copy's or a restore's proof vouched: {counts:?}"
-            ),
-            "any_directory" => assert!(
-                counts.iter().all(lied),
-                "CONTROL {control}: some copy's proof never vouched for what the cut took: \
-                 {counts:?}"
-            ),
-            "this_directory" => assert!(
-                held(&counts[0]) && held(&counts[1]) && counts[2..].iter().all(lied),
-                "CONTROL {control}: a copy elsewhere proves nothing, what lands on the dir that \
-                 made the proof does: {counts:?}"
-            ),
-            _ => assert!(
-                counts[..3].iter().all(held) && counts[3..].iter().all(lied),
-                "CONTROL {control}: a new inode proves nothing, bytes written into the old one \
-                 do: {counts:?}"
-            ),
-        }
+        assert!(
+            counts[..lies_from].iter().all(held) && counts[lies_from..].iter().all(lied),
+            "{law}: {counts:?}"
+        );
     }
 }
 
@@ -3131,6 +3234,96 @@ fn rewrite_every_torn_kind(st: &crate::state::StateDir) {
         &std::collections::BTreeMap::from([("t".to_string(), 3), ("u".to_string(), 5)]),
     )
     .expect("a refill floor rewritten");
+}
+
+/// **THE HEADS A CLEAN STOP KEPT STAND THROUGH A POWER CUT** (publication-exactly-once): a stop
+/// hands a record in flight to the files a build before the journal reads and keeps its heads
+/// beside them, its record then vouching for what it wrote. Over every cut drawn, the next boot's
+/// attach takes the record with the head it reads it back from. NEGATIVE CONTROL
+/// (`stop_leaves_the_heads_unflushed`, as before): the clean record stands, so the record is not
+/// retired, and a cut that took the heads leaves it to be published again at its pin unread, a
+/// second copy past a cut that dropped its key (`FOUND_QUITTING`).
+#[test]
+fn the_heads_a_clean_stop_kept_stand_through_a_power_cut() {
+    use crate::state::{InFlight, PublishPin, StateDir};
+    let boot = |n| crate::state::IncSeam {
+        boot: Some(Some(crate::durability::test_boot(n))),
+        off_volume: false,
+        kill_at: None,
+        mutant: 0,
+        span: None,
+    };
+    let head_after = |unflushed: bool, cut: u64| -> Option<u64> {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("sim-handed-heads")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let mut device = Device::new(root);
+        device.tears = true;
+        let core = super::Core::new(
+            cut,
+            bus::Broker::new(Tier::Strict, Escalation::aterm()),
+            device,
+        );
+        let open = |n: u8| {
+            let process = super::Process::new(std::sync::Arc::clone(&core), u64::from(n));
+            let st = StateDir::open_on(root, crate::fx::Disk::Sim(process))
+                .expect("the state dir on the device");
+            st.set_inc_seam(boot(n));
+            st
+        };
+        let st = open(1);
+        st.stop_leaves_the_heads_unflushed(unflushed);
+        st.begin_run().expect("an open run");
+        st.take_incarnation(0).expect("an attach");
+        let entry = InFlight {
+            pin: PublishPin {
+                seq: 7,
+                via_key: false,
+                identity: None,
+                original: None,
+                original_off: None,
+                owner: None,
+                at: Some(40),
+            },
+            subject: "/f/sim/in/n-1/s-a/n-1/note".to_string(),
+            body: b"v=1 t=5 text=hello".to_vec(),
+            log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
+            at: Some(50),
+        };
+        st.set_post_pin("s-a", 1, &entry.pin).expect("reserved");
+        st.set_in_flight(&entry).expect("in flight");
+        assert_eq!(st.hand_posts_to_files().expect("handed"), 2);
+        st.end_run_clean().expect("a clean stop");
+        drop(st);
+        let _ = core.device.power_cut(&mut Rng::new(cut));
+        let next = open(2);
+        assert!(
+            next.last_run().expect("reads").is_some_and(|run| run.clean),
+            "the clean stop's record is on the media"
+        );
+        next.begin_run().expect("the next boot's run");
+        next.take_incarnation(0).expect("its attach");
+        let entries = next.in_flight().expect("reads");
+        assert_eq!(
+            entries.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            [7],
+            "cut {cut}: a clean stop's record in flight is not retired"
+        );
+        entries[0].1.at
+    };
+    for cut in 0..32 {
+        assert_eq!(
+            head_after(false, cut),
+            Some(50),
+            "cut {cut}: the record is read back from its head"
+        );
+    }
+    assert!(
+        (0..32).any(|cut| head_after(true, cut).is_none()),
+        "NEGATIVE CONTROL: unflushed, some cut takes the heads and keeps the file"
+    );
 }
 
 #[test]
@@ -3706,7 +3899,7 @@ fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
         o
     };
     let republishing = move |s: u64| world(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
-    let out = breaking_at(&republishing, "order:", 85, RARE_SEEDS)
+    let out = breaking_at(&republishing, "order:", 173, RARE_SEEDS)
         .expect("NEGATIVE CONTROL: the old republish puts some post out of its sender's order");
     eprintln!(
         "the old republish at seed {}: {}",
@@ -3774,7 +3967,7 @@ fn the_round_refines_its_exactly_once_model() {
         o.mirror = false;
         o
     };
-    let taken = witnessed(&lossy, 183, RARE_SEEDS, &|out| {
+    let taken = witnessed(&lossy, 105, RARE_SEEDS, &|out| {
         out.model.2.contains("DeliverTaken")
     })
     .expect("some run delivered a record a move took");
@@ -3841,9 +4034,13 @@ fn the_round_refines_its_exactly_once_model() {
 }
 
 /// An aterm that names no roster count (`EpRules::names_roster`, an older build) is read before
-/// every drain as it always was, and every law holds against it.
+/// every drain as it always was, and every law holds against it, on eight seeds spread over the
+/// world bits of [`Opts::seed`] (51 and 52 unretained, 64 `auto`). 23 is the one seed of the first
+/// 128 where a bridge that trusts a stale count there breaks a law (routing). The arm itself is
+/// held by `bridge_roster_tests`; a law it breaks only on a seed left out goes unseen here.
 #[test]
 fn an_aterm_that_names_no_roster_count_holds_every_law() {
+    const SPREAD: [u64; 8] = [23, 25, 30, 42, 45, 51, 52, 64];
     let older = |s| {
         let mut o = Opts::seed(s);
         o.ep = EpRules {
@@ -3852,15 +4049,16 @@ fn an_aterm_that_names_no_roster_count_holds_every_law() {
         };
         o
     };
-    let broke: Vec<String> = run_all(&older, 1..=SEEDS)
+    let broke: Vec<String> = aterm_spec::check::each(&SPREAD, |&seed| run(&older(seed)))
         .iter()
         .filter(|out| !out.violations.is_empty())
         .map(report)
         .collect();
     assert!(
         broke.is_empty(),
-        "{} of {SEEDS} seeds broke a law:\n{}",
+        "{} of {} seeds broke a law:\n{}",
         broke.len(),
+        SPREAD.len(),
         broke.join("\n")
     );
 }

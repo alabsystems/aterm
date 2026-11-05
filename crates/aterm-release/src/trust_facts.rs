@@ -829,8 +829,9 @@ impl Measured {
         let mut buf = Vec::new();
         let mut log = log;
         loop {
+            use std::io::Read as _;
             buf.clear();
-            match log.read_until(b'\n', &mut buf) {
+            match (&mut log).take(1024 * 1024).read_until(b'\n', &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
@@ -4345,7 +4346,7 @@ fn write_floor_files(files: &[(&Path, Option<&str>)]) -> std::result::Result<(),
             .tempdir_in(parent)
             .map_err(|e| format!("could not stage {}: {e}", path.display()))?;
         let file = scratch.path().join("data");
-        fs::write(&file, text).map_err(|e| {
+        crate::durable::write_fresh(&file, text).map_err(|e| {
             format!(
                 "could not write {} (for {}): {e}",
                 file.display(),
@@ -4537,11 +4538,15 @@ fn write_host_obs(path: &Path, plan: &Plan, verdict: &Verdict) -> std::io::Resul
         fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension(format!("tsv.{}", std::process::id()));
-    fs::write(&tmp, text)
+    write_new_temp(&tmp, text.as_bytes())
         .and_then(|()| fs::rename(&tmp, path))
         .inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
         })
+}
+
+fn write_new_temp(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    crate::durable::write_fresh(tmp, bytes)
 }
 
 /// Atomically writes `facts` into `store` under its provenance key.
@@ -4555,7 +4560,7 @@ pub fn file_record(store: &Path, facts: &Facts) -> std::result::Result<PathBuf, 
     let path = store.join(format!("{FACTS_PREFIX}{key}"));
     let tmp = store.join(format!(".{FACTS_PREFIX}{key}.{}", std::process::id()));
     fs::create_dir_all(store)
-        .and_then(|()| fs::write(&tmp, facts.to_record()))
+        .and_then(|()| write_new_temp(&tmp, facts.to_record().as_bytes()))
         .and_then(|()| fs::rename(&tmp, &path))
         .map_err(|e| {
             let _ = fs::remove_file(&tmp);

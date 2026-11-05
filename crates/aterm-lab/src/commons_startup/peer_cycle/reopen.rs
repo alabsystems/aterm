@@ -80,8 +80,8 @@ pub(super) fn bundle(executable: &Path) -> Result<Bundle, String> {
     {
         return Err("Info.plist escapes its canonical bundle".into());
     }
-    let size =
-        std::fs::metadata(&info).map_err(|error| format!("read Info.plist metadata: {error}"))?;
+    let size = std::fs::symlink_metadata(&info)
+        .map_err(|error| format!("read Info.plist metadata: {error}"))?;
     if !size.is_file() || size.len() > MAX_PLIST_BYTES {
         return Err("app Info.plist is not a bounded regular file".into());
     }

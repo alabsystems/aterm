@@ -6,7 +6,6 @@
 
 use super::binding::{BINDING_LEN, Binding};
 use crate::{Error, Result};
-use ring::signature::{ED25519, UnparsedPublicKey};
 
 const DOMAIN: &[u8] = b"aterm/commons/member-certificate/1\0";
 /// Exact bounded certificate wire size, including its authority signature.
@@ -66,9 +65,9 @@ impl Certificate {
         }
         let mut signed = DOMAIN.to_vec();
         signed.extend_from_slice(&wire[..CERTIFICATE_LEN - 64]);
-        UnparsedPublicKey::new(&ED25519, authority)
-            .verify(&signed, &wire[CERTIFICATE_LEN - 64..])
-            .map_err(|_| Error::new("Commons certificate signature failed"))?;
+        if !crate::ed25519::verifies(&authority, &signed, &wire[CERTIFICATE_LEN - 64..]) {
+            return Err(Error::new("Commons certificate signature failed"));
+        }
         Ok(Self {
             binding,
             issued_on,

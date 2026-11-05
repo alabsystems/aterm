@@ -1076,7 +1076,13 @@ mod tests {
             }
         }
 
-        for policy in 0..3 {
+        // `[commons] exclude_tables` is no arm of its own: `Policy::includes` gives the same false
+        // as `enabled=false` for these tables, and renewal reads no `[commons]`. A renewal path
+        // that read `exclude_tables` otherwise than `enabled=false` would go unseen here.
+        for (policy, config) in ["[commons]\n", "[commons]\nenabled=false\n"]
+            .into_iter()
+            .enumerate()
+        {
             for stop in [false, true] {
                 let (home, approved, row) = fixture();
                 let env = environment(home.path());
@@ -1091,18 +1097,12 @@ mod tests {
                     .initialize()
                     .unwrap()
                     .digest();
-                let config = match policy {
-                    0 => "[commons]\n".to_owned(),
-                    1 => "[commons]\nenabled=false\n".to_owned(),
-                    _ => {
-                        format!(
-                            "[commons]\nexclude_tables=['{}','{}']\n",
-                            aterm_codec::hex::encode_lower(&proposals),
-                            aterm_codec::hex::encode_lower(&activations)
-                        )
-                    }
-                };
-                std::fs::write(env.config.as_ref().unwrap(), &config).unwrap();
+                aterm_uds::atomic_file::write(
+                    env.config.as_ref().unwrap(),
+                    config.as_bytes(),
+                    0o600,
+                )
+                .unwrap();
                 {
                     let bootstrap = Bootstrap::required(&approved.paths).unwrap();
                     let session = aterm_db::table::Session::open(&bootstrap).unwrap();

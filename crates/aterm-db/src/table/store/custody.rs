@@ -110,6 +110,19 @@ pub fn inspect(session: &Session<'_>, table: Digest) -> Result<Inspection> {
     inspect_with(session, table, || {})
 }
 
+/// Check retained directory custody without reading its data journal. This is
+/// only a recovery trigger: a displaced table still needs a verified prefix
+/// before succession, and missing or pending claims establish no displacement.
+///
+/// # Errors
+/// Membership is stale, retained custody is malformed or unreadable, or the
+/// directory binding changes during observation.
+pub(crate) fn directory_binding_lost(session: &Session<'_>, table: Digest) -> Result<bool> {
+    Ok(inspect_parts(session, table, false, || {})?
+        .directory
+        .is_some_and(|evidence| evidence.binding_error.is_some()))
+}
+
 /// An independently witnessed prefix for import into a different, normally
 /// admitted writer. This carries no authority to reuse the source actor.
 #[cfg(any(test, debug_assertions))]
@@ -305,6 +318,15 @@ fn inspect_with(
     table: Digest,
     after_prefix: impl FnOnce(),
 ) -> Result<Inspection> {
+    inspect_parts(session, table, true, after_prefix)
+}
+
+fn inspect_parts(
+    session: &Session<'_>,
+    table: Digest,
+    verify_prefix: bool,
+    after_prefix: impl FnOnce(),
+) -> Result<Inspection> {
     session.context(crate::catalog::scope(session.bootstrap.trust()))?;
     let claim_dir = claim_dir(session)?;
     let claim_name = format!("{}.claim", aterm_codec::hex::encode_lower(&table));
@@ -358,7 +380,7 @@ fn inspect_with(
         volume_witness_present: volume.is_some(),
         binding_error,
     };
-    let prefix = inspect_prefix(&dir, &claim).map_err(reason);
+    let prefix = verify_prefix.then(|| inspect_prefix(&dir, &claim).map_err(reason));
     after_prefix();
     session.context(scope)?;
     if private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN)
@@ -374,7 +396,7 @@ fn inspect_with(
         table,
         claim: Claim::Ready,
         directory: Some(directory_evidence),
-        prefix: Some(prefix),
+        prefix,
     })
 }
 

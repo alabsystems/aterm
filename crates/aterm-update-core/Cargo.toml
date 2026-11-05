@@ -31,14 +31,18 @@ aterm-toml = { workspace = true }
 # Ed25519 verification of the master-signed MACHINE ROSTER (src/roster.rs). The chain
 # lives here rather than in aterm-update because BOTH sides need it: the client verifies
 # it, and the owner-side minting tool emits and signs it through the very same type. Two
-# spellings of one verifier is the drift this crate exists to prevent.
+# spellings of one verifier is the drift this crate exists to prevent. The check is
+# astream's strict verify, which refuses the small-order keys and commitments ring alone
+# takes. astream-aead's own dependencies are ring, zeroize and getrandom: ring and
+# getrandom were in this crate's graph already; zeroize is new to it (and so to atpkg's),
+# though not to aterm's, which seals its bus at rest through the same crate.
+astream-aead = { path = "../../vendor/astream/crates/astream-aead", default-features = false, features = ["signature"] }
 #
-# No features (the workspace row turns ring's defaults off) is deliberate and matches
-# atpkg's edge: VERIFICATION needs neither RNG nor alloc, so the client's crypto surface
-# stays minimal. ring is already a direct dependency of atpkg, aterm-update and
-# aterm-release, so this adds an edge, not a crate — and the `deny.toml` version floor
-# already covers it. Its `digest` (no feature needed) is also the macOS arm of
-# `hash::sha256_file`: the CPU's SHA-256 instructions, as atpkg's bulk hash uses.
+# ring with no features (the workspace row turns ring's defaults off), as atpkg's edge has
+# it: its `digest` (no feature needed) is the macOS arm of `hash::sha256_file`, the CPU's
+# SHA-256 instructions, as atpkg's bulk hash uses. ring is already a direct dependency of
+# atpkg, aterm-update and aterm-release, so this adds an edge, not a crate — and the
+# `deny.toml` version floor already covers it.
 ring = { workspace = true }
 # Decode the base64 master + machine Ed25519 public keys (32 raw bytes each).
 # Standard padded Base64 — first-party; its one dependency is astream-wire
